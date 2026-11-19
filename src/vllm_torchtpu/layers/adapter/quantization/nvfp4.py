@@ -74,7 +74,12 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
-from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu.layers.adapter import (
+    moe_redundant,
+    moe_route_trace,
+    moe_routing,
+    token_padding,
+)
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -350,6 +355,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         layer.params_dtype = params_dtype
+        # Redundant experts (VLLM_TPU_MOE_REDUNDANT_EXPERTS): extra local slots
+        # for copies of other ranks' experts; 0 when off.
+        num_experts += moe_redundant.prepare(layer)
         ModelOptNvFp4FusedMoE.create_weights(
             self,
             layer,
@@ -375,6 +383,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 getattr(layer, name),
                 {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value},
             )
+        moe_redundant.wrap_weight_loaders(layer)
 
     def _resolve_tpu_activation(self, layer) -> str:
         activation_str = super()._resolve_tpu_activation(layer)
@@ -426,6 +435,13 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             )
         else:
             op, requant_block = _prebuild_w4a8(layer, activation_str, configured_block)
+        if op is not None and getattr(layer, "_rx_plan", None) is not None:
+            # USE_MOE_FUSED_EP_KERNEL may be set while this layer stays on the
+            # GMM path (op None); an admitted fused EP layer would need the
+            # physical expert map, which it does not take.
+            raise NotImplementedError(
+                "VLLM_TPU_MOE_REDUNDANT_EXPERTS with an admitted fused EP MoE layer"
+            )
         weights, mode = _prepare_moe_weights(
             layer, w13_scale_f, w2_scale_f, requant_block
         )
@@ -487,6 +503,10 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+        moe_redundant.install(layer)
+        moe_route_trace.register(layer)
+        if envs.TPU_MOE_NVFP4_SKIP_PADDED and envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            _log_skip_padded_once()
         if not self._use_adaptive_fused_moe:
             prebuild_fused_moe_kernel(
                 topk=layer.moe_config.experts_per_token,
@@ -559,6 +579,18 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         # passes `layer` uniformly, which fixes that -- flagging separately as
         # it's a behavior change, not just a refactor.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        if moe_route_trace.ENABLED:
+            moe_route_trace.record(layer, topk_ids)
+        if envs.TPU_MOE_NVFP4_SKIP_PADDED and envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            # Padded rows get zero weights, so the grouped matmul skips them
+            # (skip_padded_tokens) instead of reading their experts' weights.
+            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids, topk_weights
+            )
+        if moe_redundant.ENABLED:
+            # Logical -> physical slot ids (identity for layers without
+            # replicas); experts_start below is then rank * slots.
+            topk_ids = moe_redundant.to_physical(layer, topk_ids, topk_weights)
         kwargs = {
             "hidden_states": x,
             "w1": layer.w13_weight,
@@ -577,6 +609,19 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)
+
+
+_skip_padded_logged = False
+
+
+def _log_skip_padded_once() -> None:
+    global _skip_padded_logged
+    if not _skip_padded_logged:
+        _skip_padded_logged = True
+        logger.info(
+            "TPU_MOE_NVFP4_SKIP_PADDED=1: NVFP4 GMM MoE skips padded rows "
+            "(zero routing weights)"
+        )
 
 
 class _NullInputQuantKernel:

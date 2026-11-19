@@ -45,10 +45,31 @@ DEFAULT_BLOCK_Q = 16
 # an 8-token verify group then fills a tile alone instead of sharing a
 # 16-token tile (and its page union) with the next request. Twin, c64 verify
 # (32 req x 8 tokens): 416 -> 350 us per call (j-cae78264 vs j-2c36aed7);
-# prefill chunks keep 16 (8 is 7% slower there, j-3eb5e8aa).
+# non-DCP prefill chunks keep 16 (8 is 7% slower there, j-3eb5e8aa).
 SMALL_BATCH_TOKENS = 1024
+# Prefill / mixed-step tiles of the DCP LSE calls over 8/16-bit caches: a
+# page's fixed per-visit cost (DMA, unpacking) spreads over twice the rows, and
+# neighbouring tokens share most of their pages. Served c4 xprof, every
+# 8192-token call of one capture timed at 8/16/32-token tiles on the same
+# selections (j-4396c8a5): 11.8 / 7.7 / 5.5 ms in total; twin c4 mixed step
+# 332.8 -> 328.0 ms (j-e1f0a4fa). 4-bit caches take `PREFILL_BLOCK_Q_4BIT`.
+# Outputs change by accumulation order only.
+PREFILL_BLOCK_Q = 32
 SMALL_BATCH_BLOCK_Q = 8
 DEFAULT_PAGES_PER_STEP = 16
+# Prefill / mixed-step tiles of the DCP LSE calls over 4-bit caches: 8-token
+# tiles and 32-page groups. A kernel step costs ~0.7 us besides its score work
+# (unpack, selection compares, loop and scratch traffic: timing-only removal
+# arms, j-aec3278d), so fewer, wider groups win, and an 8-token tile's union is
+# small enough to fit one. Standalone call, 8192 tokens with served-c48-like
+# dispersion (5.0 us per 16-token tile as served, j-da859161): 2.60 -> 2.00 ms
+# (j-ac9898cc).
+PREFILL_BLOCK_Q_4BIT = 8
+PREFILL_PAGES_PER_STEP_4BIT = 32
+# 8/16-bit prefill / mixed-step groups: 32 pages, with the 24-page step width
+# (`msa_attention_lse._STEP_WIDTHS`). Standalone fp8 32-token tiles: 1.62-1.66
+# -> 1.55 ms (moderate dispersion), 0.886 -> 0.870 ms (low; j-492a1bb9).
+PREFILL_PAGES_PER_STEP = 32
 DEFAULT_KERNEL = "v2"
 # Tokens per kernel call. The work list lives in SMEM, sized for the worst
 # case of tokens * topk pages.
@@ -358,8 +379,11 @@ _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
 
 
 # `_work_list` builds small batches' unions from dense compares when the
-# pairwise array (tiles x union^2) is at most this.
-_DENSE_WORK_LIST_ELEMS = 1 << 20
+# pairwise array (tiles x union^2) is at most this. Past it two row sorts
+# cost less: 4 heads x 64 decode tiles of 8 tokens (c64 b56, 2^20 elements
+# per call) took 31.5 us per layer dense against 17.6 sorted (twins
+# j-8b8e2662, j-dcfd577a).
+_DENSE_WORK_LIST_ELEMS = 1 << 18
 
 
 def _dense_unions(per_tile: jax.Array) -> jax.Array:
@@ -388,21 +412,12 @@ def _sorted_unions(per_tile: jax.Array) -> jax.Array:
     `_NO_PAGE`, which the second sort moves past the distinct pages. No
     scatter or gather (`jnp.unique` compacts with both, SparseCore offloads
     of ~25 us per call in the c4 prefill twin, j-3c651507)."""
-    if UNSTABLE_UNION_SORT:
-        # Unstable: equal pages are indistinguishable, and a stable sort
-        # (jnp.sort) carries an iota operand through both sorts as its
-        # tie-breaker. Same result.
-        sort = functools.partial(jax.lax.sort, dimension=1, is_stable=False)
-    else:
-        sort = functools.partial(jnp.sort, axis=1)
+    # Unstable: equal pages are indistinguishable, and a stable sort (jnp.sort)
+    # carries an iota operand through both sorts as its tie-breaker.
+    sort = functools.partial(jax.lax.sort, dimension=1, is_stable=False)
     s = sort(per_tile)
     dup = jnp.pad(s[:, 1:] == s[:, :-1], ((0, 0), (1, 0)))
     return sort(jnp.where(dup, _NO_PAGE, s))
-
-
-# r6: sort the page unions without a stability tie-breaker (bit-identical
-# unions). Set from key minimax_msa_unstable_sort by the attention layer.
-UNSTABLE_UNION_SORT = False
 
 
 def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):

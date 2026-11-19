@@ -27,6 +27,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import tight_vmem
 
+
 DEFAULT_BLOCK_ROWS = 256
 _NEG_INF = float("-inf")
 _FORCED_LOCAL_SCORE = 1e29

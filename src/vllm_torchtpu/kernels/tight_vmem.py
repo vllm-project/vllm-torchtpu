@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Smallest compiling ``vmem_limit_bytes`` for a pallas_call (key tight_vmem).
+"""Smallest compiling ``vmem_limit_bytes`` for a pallas_call (TPU_TIGHT_VMEM=1).
 
 On v7x a pallas_call's VMEM limit costs time even when the kernel does not use
 the VMEM: a limit of 56 MiB or more adds ~2.5 us per call, and limits above
@@ -19,17 +19,15 @@ the VMEM: a limit of 56 MiB or more adds ~2.5 us per call, and limits above
 trivial and a DMA-only kernel, same body, only the limit changed). Kernels that
 ask for 48 MiB or 0.9 x capacity "to be safe" pay this on every call.
 
-`pallas_call` is a drop-in for `pl.pallas_call`. With `--additional-config`
-key tight_vmem (`set_options`, before the model's first trace) and a limit
-above the smallest candidate, the first call per (kernel name, argument
+`pallas_call` is a drop-in for `pl.pallas_call`. With TPU_TIGHT_VMEM=1 and a
+limit above the smallest candidate, the first call per (kernel name, argument
 shapes, limit) compiles the kernel alone at each smaller candidate limit, in
 increasing order, and keeps the first that compiles. Only the limit changes,
-so the kernel body, tiling and results are unchanged. Key
-tight_vmem_candidates_mib ("<MiB>,<MiB>,..."; default "32,40,48,52") sets the
-candidates. Off (the default), `pallas_call` is `pl.pallas_call`.
+so the kernel body, tiling and results are unchanged.
 """
 
 import dataclasses
+import os
 from typing import Any
 
 import jax
@@ -40,25 +38,16 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _MIB = 1 << 20
-DEFAULT_CANDIDATES_MIB = (32, 40, 48, 52)
-ENABLED = False
-_CANDIDATES = tuple(v * _MIB for v in DEFAULT_CANDIDATES_MIB)
+_CANDIDATES = tuple(
+    int(v) * _MIB
+    for v in os.environ.get("TPU_TIGHT_VMEM_CANDIDATES_MIB", "32,40,48,52").split(",")
+    if v
+)
 _picked: dict[Any, int] = {}
 
 
-def set_options(enabled: bool, candidates_mib: str = "") -> None:
-    """Keys tight_vmem / tight_vmem_candidates_mib ("" = the default list)."""
-    global ENABLED, _CANDIDATES
-    mib = (
-        tuple(int(v) for v in candidates_mib.replace("/", ",").split(",") if v.strip())
-        if candidates_mib.strip()
-        else DEFAULT_CANDIDATES_MIB
-    )
-    if not mib or any(v <= 0 for v in mib):
-        raise ValueError(f"tight_vmem_candidates_mib: bad list {candidates_mib!r}")
-    ENABLED = bool(enabled)
-    _CANDIDATES = tuple(sorted(v * _MIB for v in mib))
-    _picked.clear()
+def _enabled() -> bool:
+    return os.environ.get("TPU_TIGHT_VMEM", "0") not in ("", "0", "false", "False")
 
 
 def _aval(a):
@@ -86,16 +75,16 @@ def _pick(kernel, kw, compiler_params, args) -> int:
             break
         cp = dataclasses.replace(compiler_params, vmem_limit_bytes=cand)
         try:
-            jax.jit(
-                lambda *a, cp=cp: pl.pallas_call(kernel, compiler_params=cp, **kw)(*a)
-            ).lower(*avals).compile()
+            jax.jit(lambda *a, cp=cp: pl.pallas_call(kernel, compiler_params=cp, **kw)(*a)).lower(
+                *avals
+            ).compile()
         except Exception:  # noqa: BLE001 - VMEM OOM at this limit: try the next one
             continue
         chosen = cand
         break
     _picked[key] = chosen
     logger.info(
-        "tight_vmem: %s vmem_limit %d -> %d MiB",
+        "TPU_TIGHT_VMEM=1: %s vmem_limit %d -> %d MiB",
         kw.get("name") or key[1],
         limit // _MIB,
         chosen // _MIB,
@@ -105,7 +94,7 @@ def _pick(kernel, kw, compiler_params, args) -> int:
 
 def pallas_call(kernel, *, compiler_params=None, **kw):
     limit = getattr(compiler_params, "vmem_limit_bytes", None)
-    if not ENABLED or limit is None or limit <= _CANDIDATES[0]:
+    if not _enabled() or limit is None or limit <= _CANDIDATES[0]:
         return pl.pallas_call(kernel, compiler_params=compiler_params, **kw)
 
     def run(*args):

@@ -99,16 +99,6 @@ class FakeBlockStatus(enum.Enum):
     SHARED_STORAGE = 5
 
 
-@dataclass(frozen=True)
-class FakeRaidenId:
-    """A peer's id. Compares by value, as Raiden's RaidenId does."""
-
-    job_name: str = "peer"
-    job_replica_id: str = ""
-    data_name: str = ""
-    data_replica_idx: int = 0
-
-
 class FakeRaidenBlockId:
     def __init__(
         self,
@@ -172,8 +162,6 @@ class FakeKVCacheStore:
         # Refuse to launch a read_remote call that includes storage slices;
         # a call with only peer slices is unaffected.
         self.fail_storage_read = False
-        # Peers whose read_remote launch is refused.
-        self.fail_read_remote_peers: set[object] = set()
         # Queued terminal outcomes drained asynchronously by poll methods.
         self._save_done: list[bytes] = []
         self._save_failed: list[bytes] = []
@@ -315,7 +303,7 @@ class FakeKVCacheStore:
         # needs no pin. It only needs a REMOTE or SHARED_STORAGE slice naming
         # the source, and one destination device block per hash. One call may
         # mix storage slices with REMOTE slices, but the REMOTE ones must all
-        # name the same peer (RaidenId compares by value).
+        # name the same peer.
         if len(slices) != len(block_hashes) or len(device_block_ids) != len(
             block_hashes
         ):
@@ -323,8 +311,10 @@ class FakeKVCacheStore:
         readable = (FakeBlockStatus.REMOTE, FakeBlockStatus.SHARED_STORAGE)
         if any(sl is None or sl.status not in readable for sl in slices):
             return False
-        peers = {sl.raiden_id for sl in slices if sl.status == FakeBlockStatus.REMOTE}
-        if len(peers) > 1 or peers & self.fail_read_remote_peers:
+        peers = {
+            id(sl.raiden_id) for sl in slices if sl.status == FakeBlockStatus.REMOTE
+        }
+        if len(peers) > 1:
             return False
         storage = {
             h
@@ -485,12 +475,11 @@ def seed_global_entries(
     device_block_size_factor: int = 4,
     key_namespace: bytes = b"",
     ns: bytes = b"",
-    raiden_id: object | None = None,
 ) -> None:
     """Publish a peer's REMOTE slices for `key` in the fake registry: one peer
-    owns the whole key, `raiden_id` or else a peer of its own."""
+    owns the whole key."""
     prefix = key_namespace or ns
-    peer = raiden_id if raiden_id is not None else object()
+    peer = object()
     for i, sub_hash in enumerate(sub_hashes(key, device_block_size_factor, prefix)):
         store.global_entries[sub_hash] = FakeRaidenBlockId(
             raiden_id=peer, host_block_id=100 + i, status=FakeBlockStatus.REMOTE
@@ -1999,99 +1988,6 @@ class TestRemoteReadFlow(unittest.TestCase):
         (finished_job,) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
 
-    def test_remote_reads_group_interleaved_sub_hashes_by_peer(self):
-        local_key, remote_key = _key(1), _key(2)
-        seed_host_entries(self.store, local_key)
-        seed_global_entries(self.store, remote_key)
-        remote_hashes = sub_hashes(remote_key)
-        # Each slice carries its own id object; equal ids name the same peer.
-        for i, sub_hash in enumerate(remote_hashes):
-            self.store.global_entries[sub_hash].raiden_id = FakeRaidenId(
-                data_replica_idx=i % 2
-            )
-        for key in (local_key, remote_key):
-            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
-        self.manager.prepare_load([local_key, remote_key], _ctx())
-        self.manager.submit_load_job(7, [local_key, remote_key], [5, 6], "req")
-
-        first, second = self.store.calls_named("read_remote")
-        self.assertEqual(first.args[0], remote_hashes[::2])
-        self.assertEqual(first.args[2], [24, 26])
-        self.assertEqual(second.args[0], remote_hashes[1::2])
-        self.assertEqual(second.args[2], [25, 27])
-        self.assertEqual(
-            self.manager.lookup(remote_key, _ctx()), LookupResult.HIT_PENDING
-        )
-
-        self.store.complete_remote_read(second.args[0])
-        self.store.complete_load(sub_hashes(local_key))
-        self.assertEqual(self.manager.poll_finished_jobs(), [])
-        self.store.complete_remote_read(first.args[0])
-        (finished_job,) = self.manager.poll_finished_jobs()
-        self.assertTrue(finished_job.success)
-        self.assertEqual(self.store.pinned_hashes(), {})
-        self.assertEqual(self.manager._hash_to_admission, {})
-        self.assertFalse(self.manager.has_pending_work())
-
-    def test_later_peer_launch_failure_waits_for_started_transfers(self):
-        keys = [_key(i) for i in range(1, 5)]
-        seed_host_entries(self.store, keys[0])
-        peers = [FakeRaidenId(job_replica_id=str(i)) for i in range(3)]
-        for key, peer in zip(keys[1:], peers):
-            seed_global_entries(self.store, key, raiden_id=peer)
-        for key in keys:
-            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
-        self.manager.prepare_load(keys, _ctx())
-        self.store.fail_read_remote_peers.add(peers[1])
-        self.manager.submit_load_job(7, keys, [5, 6, 7, 8], "req")
-
-        # The first peer's read launched; the second peer's was refused, so
-        # the third peer's was never tried.
-        self.assertEqual(len(self.store.calls_named("read_remote")), 2)
-        self.assertEqual(self.store._remote_reading, sub_hashes(keys[1]))
-        self.assertEqual(
-            self.manager._admissions[7].pending,
-            set(sub_hashes(keys[0]) + sub_hashes(keys[1])),
-        )
-        self.assertEqual(
-            set(self.manager._admissions[7].failed_sub_hashes),
-            set(sub_hashes(keys[2]) + sub_hashes(keys[3])),
-        )
-        # The open job holds the keys it never read too.
-        for key in keys[1:]:
-            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT_PENDING)
-        self.assertEqual(self.manager.poll_finished_jobs(), [])
-        self.store.complete_load(sub_hashes(keys[0]))
-        self.assertEqual(self.manager.poll_finished_jobs(), [])
-        self.store.complete_remote_read(sub_hashes(keys[1]))
-        (finished_job,) = self.manager.poll_finished_jobs()
-        self.assertFalse(finished_job.success)
-        self.assertEqual(finished_job.failed_device_block_ids, [5, 6, 7, 8])
-        self.assertEqual(self.store.pinned_hashes(), {})
-        self.assertEqual(self.manager._hash_to_admission, {})
-        self.assertFalse(self.manager.has_pending_work())
-        self.assertEqual(self.manager.poll_finished_jobs(), [])
-
-    def test_remote_failure_waits_for_other_peer(self):
-        keys = [_key(1), _key(2)]
-        for i, key in enumerate(keys):
-            seed_global_entries(
-                self.store, key, raiden_id=FakeRaidenId(job_replica_id=str(i))
-            )
-            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
-        self.manager.prepare_load(keys, _ctx())
-        self.manager.submit_load_job(7, keys, [5, 6], "req")
-
-        self.store.complete_remote_read(sub_hashes(keys[0]), success=False)
-        self.assertEqual(self.manager.poll_finished_jobs(), [])
-        self.assertTrue(self.manager.has_pending_work())
-        self.store.complete_remote_read(sub_hashes(keys[1]))
-        (finished_job,) = self.manager.poll_finished_jobs()
-        self.assertFalse(finished_job.success)
-        self.assertEqual(finished_job.failed_device_block_ids, [5, 6])
-        self.assertEqual(self.manager._hash_to_admission, {})
-        self.assertFalse(self.manager.has_pending_work())
-
     def test_remote_failure_leaves_nothing_behind(self):
         key = _key(1)
         seed_global_entries(self.store, key)
@@ -2697,35 +2593,28 @@ class TestStorageTierRemoteReads(unittest.TestCase):
         self.assertEqual(self.store.calls_named("release"), [])
         self.assertEqual(self.store.entries, {})
 
-    def test_two_peers_and_storage_in_one_job_read_per_peer(self):
-        # The store takes one peer per read_remote call, plus any storage
-        # slices: a job with blocks on two peers and in storage makes two
-        # calls, the storage slices going with the first peer's.
-        local_key, key_a, storage_key, key_b = (_key(n) for n in range(4))
+    def test_two_peers_in_one_job_fail_launch_cleanly(self):
+        # The store takes one peer per read_remote call, so a job whose blocks
+        # live on two peers has its read refused at launch. The local load it
+        # already launched keeps the job open until that lands; then the job
+        # fails once, owing nothing, and the blocks recompute.
+        local_key, key_a, key_b = _key(0), _key(1), _key(2)
         seed_host_entries(self.store, local_key)
         seed_global_entries(self.store, key_a)
-        seed_storage_entries(self.store, storage_key)
         seed_global_entries(self.store, key_b)
-        keys = [local_key, key_a, storage_key, key_b]
-        for key in keys:
-            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        for key in (local_key, key_a, key_b):
+            self.manager.lookup(key, _ctx())
+        keys = [local_key, key_a, key_b]
         self.manager.prepare_load(keys, _ctx())
-        self.manager.submit_load_job(7, keys, [4, 5, 6, 7], "req")
-
-        first, second = self.store.calls_named("read_remote")
-        self.assertEqual(first.args[0], sub_hashes(key_a) + sub_hashes(storage_key))
-        self.assertEqual(first.args[2], list(range(20, 28)))
-        self.assertEqual(second.args[0], sub_hashes(key_b))
-        self.assertEqual(second.args[2], list(range(28, 32)))
-        self.store.complete_load(sub_hashes(local_key))
-        self.store.complete_remote_read(first.args[0])
+        self.manager.submit_load_job(7, keys, [4, 5, 6], "req")
+        self.assertEqual(len(self.store.calls_named("read_remote")), 1)
+        self.assertEqual(self.store._remote_reading, [])
         self.assertEqual(self.manager.poll_finished_jobs(), [])
-        self.store.complete_remote_read(second.args[0])
+        self.store.complete_load(sub_hashes(local_key))
         (finished_job,) = self.manager.poll_finished_jobs()
-        self.assertTrue(finished_job.success)
+        self.assertFalse(finished_job.success)
+        self.assertEqual(finished_job.failed_device_block_ids, [4, 5, 6])
         self.assertEqual(self.store.pinned_hashes(), {})
-        self.assertEqual(self.manager._hash_to_admission, {})
-        self.assertFalse(self.manager.has_pending_work())
 
 
 class TestNamespace(unittest.TestCase):
@@ -3029,71 +2918,6 @@ class TestRaidenStoreWorkerStub(unittest.TestCase):
 
         self.assertEqual(create_conn.call_count, 2)
         self.assertEqual(len(kcm_calls), 1)
-        self.assertEqual(worker._mgr, "registered-manager")
-
-    def _registering_worker(self):
-        import threading
-
-        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
-
-        worker = object.__new__(RaidenStoreOffloadingWorker)
-        worker._device_tensors = []
-        worker._host_blocks_to_allocate = 4
-        worker._controller_address = "127.0.0.1:28800"
-        worker._rank = 0
-        worker._mgr = None
-        worker._backend_configs = []
-        worker._stop_registration = threading.Event()
-        return worker
-
-    def test_register_loop_stops_after_host_pinning_failure(self):
-        # A second KVCacheManager after a failed host pinning segfaults the
-        # worker, so the loop must not retry it.
-        from vllm_torchtpu.offload import raiden_store as raiden_store_module
-
-        worker = self._registering_worker()
-        calls: list[dict[str, object]] = []
-
-        def failing_manager(**kwargs: object) -> str:
-            calls.append(kwargs)
-            raise RuntimeError(
-                "Host allocator failed for size: 298254336, error: "
-                "INTERNAL: DmaMap failed: "
-            )
-
-        with (
-            patch.object(worker, "_controller_reachable", return_value=True),
-            patch.object(worker._stop_registration, "wait", return_value=False),
-            _fake_tpu_sync(FAKE_STORAGE_IMPL, kv_cache_manager_cls=failing_manager),
-            patch.object(raiden_store_module.logger, "error") as log_error,
-        ):
-            worker._register_loop()
-
-        self.assertEqual(len(calls), 1)
-        self.assertIsNone(worker._mgr)
-        log_error.assert_called_once()
-        self.assertIn("cannot pin its host KV pool", log_error.call_args.args[0])
-
-    def test_register_loop_retries_other_registration_errors(self):
-        worker = self._registering_worker()
-        results: list[object] = [
-            RuntimeError("Failed to register worker with controller"),
-            "registered-manager",
-        ]
-
-        def flaky_manager(**kwargs: object) -> object:
-            result = results.pop(0)
-            if isinstance(result, Exception):
-                raise result
-            return result
-
-        with (
-            patch.object(worker, "_controller_reachable", return_value=True),
-            patch.object(worker._stop_registration, "wait", return_value=False),
-            _fake_tpu_sync(FAKE_STORAGE_IMPL, kv_cache_manager_cls=flaky_manager),
-        ):
-            worker._register_loop()
-
         self.assertEqual(worker._mgr, "registered-manager")
 
     def test_get_ephemeral_port_range_parses_procfs_and_falls_back(self):
@@ -4417,148 +4241,3 @@ class TestDenseDpIndex(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class TestExternalPrefixProbe(unittest.TestCase):
-    """count_resident_prefix and the scheduler's side-effect-free peek."""
-
-    def setUp(self):
-        self.store = FakeKVCacheStore()
-        self.manager = make_manager(self.store)
-
-    def test_counts_leading_host_keys_without_pins(self):
-        for n in (0, 1, 3):
-            seed_host_entries(self.store, _key(n))
-        keys = [_key(n) for n in range(4)]
-        self.assertEqual(self.manager.count_resident_prefix(keys), 2)
-        self.assertEqual(self.manager.count_resident_prefix([]), 0)
-        self.assertTrue(all(e.pin_count == 0 for e in self.store.entries.values()))
-        lookups = [c for c in self.store.calls if c.name == "lookup"]
-        self.assertEqual(len(lookups), 1)
-        self.assertFalse(lookups[0].args[2])  # pin_found=False
-
-    def test_save_in_flight_counts_and_failed_residue_stops(self):
-        for h in sub_hashes(_key(0)):
-            self.store.entries[h] = _Entry(status=FakeBlockStatus.HBM)
-            self.manager._hash_to_admission[h] = object()
-        for h in sub_hashes(_key(1)):
-            self.store.entries[h] = _Entry(status=FakeBlockStatus.HBM)
-        seed_host_entries(self.store, _key(2))
-        keys = [_key(0), _key(1), _key(2)]
-        self.assertEqual(self.manager.count_resident_prefix(keys), 1)
-
-    def test_partial_key_is_not_counted(self):
-        seed_host_entries(self.store, _key(0))
-        seed_host_entries(self.store, _key(1))
-        del self.store.entries[sub_hashes(_key(1))[3]]
-        self.assertEqual(self.manager.count_resident_prefix([_key(0), _key(1)]), 1)
-
-    def _scheduler(self, groups):
-        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
-
-        sched = object.__new__(TPURaidenOffloadingScheduler)
-        sched.config = SimpleNamespace(kv_group_configs=groups)
-        sched._raiden_manager = self.manager
-        return sched
-
-    @staticmethod
-    def _group(group_idx=0, sliding=None, eagle=False):
-        return SimpleNamespace(
-            group_idx=group_idx,
-            tokens_per_chunk=128,
-            hashes_per_chunk=1,
-            sliding_window_size_in_chunks=sliding,
-            is_eagle_group=eagle,
-        )
-
-    @staticmethod
-    def _request(num_tokens, num_hashes, skip=False):
-        return SimpleNamespace(
-            num_tokens=num_tokens,
-            block_hashes=[_key(n) for n in range(num_hashes)],
-            skip_reading_prefix_cache=skip,
-        )
-
-    def test_peek_counts_from_local_boundary(self):
-        # Keys are (block hash, group) as the offloading scheduler builds them.
-        for n in range(6):
-            seed_host_entries(self.store, _group_key(n, 0))
-        sched = self._scheduler([self._group()])
-        req = self._request(num_tokens=8 * 128 + 5, num_hashes=8)
-        # Local hit covers 2 chunks; host holds chunks 2..5 -> 4 chunks more.
-        self.assertEqual(sched.peek_external_prefix_tokens(req, 256), 4 * 128)
-        # Local hit already past the host run.
-        self.assertEqual(sched.peek_external_prefix_tokens(req, 7 * 128), 0)
-        self.assertTrue(all(e.pin_count == 0 for e in self.store.entries.values()))
-
-    def test_peek_caps_at_num_tokens_minus_one(self):
-        for n in range(4):
-            seed_host_entries(self.store, _group_key(n, 0))
-        sched = self._scheduler([self._group()])
-        req = self._request(num_tokens=4 * 128, num_hashes=4)
-        self.assertEqual(sched.peek_external_prefix_tokens(req, 0), 4 * 128 - 1)
-
-    def test_peek_conservative_cases(self):
-        for n in range(4):
-            seed_host_entries(self.store, _group_key(n, 0))
-        req = self._request(num_tokens=1000, num_hashes=4)
-        sliding = self._scheduler([self._group(), self._group(1, sliding=4)])
-        self.assertEqual(sliding.peek_external_prefix_tokens(req, 0), 0)
-        eagle_only = self._scheduler([self._group(eagle=True)])
-        self.assertEqual(eagle_only.peek_external_prefix_tokens(req, 0), 0)
-        skip = self._request(num_tokens=1000, num_hashes=4, skip=True)
-        full = self._scheduler([self._group()])
-        self.assertEqual(full.peek_external_prefix_tokens(skip, 0), 0)
-        # Two prefix groups: the shorter run bounds the hit.
-        seed_host_entries(self.store, _group_key(0, 1))
-        two = self._scheduler([self._group(), self._group(1)])
-        self.assertEqual(two.peek_external_prefix_tokens(req, 0), 128)
-
-    def test_connector_implements_protocol(self):
-        from vllm_torchtpu.core.external_prefix_probe import ExternalPrefixProbe
-        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
-
-        conn = object.__new__(TPURaidenOffloadingConnector)
-        self.assertIsInstance(conn, ExternalPrefixProbe)
-        conn.connector_scheduler = None
-        self.assertEqual(conn.peek_external_prefix_tokens(object(), 0), 0)
-
-
-class TestHostPoolCgroupCheck(unittest.TestCase):
-    """check_host_pool_fits_cgroup: fail before pinning instead of OOM-kill."""
-
-    GiB = 1 << 30
-
-    def _cgroup(self, limit, anon, shmem, file=0):
-        import tempfile
-
-        d = tempfile.mkdtemp()
-        with open(os.path.join(d, "memory.max"), "w") as f:
-            f.write(f"{limit}\n" if isinstance(limit, int) else f"{limit}\n")
-        with open(os.path.join(d, "memory.stat"), "w") as f:
-            f.write(f"anon {anon}\nfile {file}\nshmem {shmem}\nkernel 123\n")
-        return d
-
-    def test_fits(self):
-        from vllm_torchtpu.offload.raiden_store import check_host_pool_fits_cgroup
-
-        d = self._cgroup(900 * self.GiB, 300 * self.GiB, 50 * self.GiB, 400 * self.GiB)
-        # Page cache (file) does not count: 350 + 480 <= 873.
-        check_host_pool_fits_cgroup(480 * self.GiB, d)
-
-    def test_does_not_fit_raises_with_numbers(self):
-        from vllm_torchtpu.offload.raiden_store import check_host_pool_fits_cgroup
-
-        d = self._cgroup(900 * self.GiB, 350 * self.GiB, 100 * self.GiB)
-        with self.assertRaisesRegex(ValueError, r"480\.0 GiB on top of 450\.0 GiB"):
-            check_host_pool_fits_cgroup(480 * self.GiB, d)
-
-    def test_unlimited_or_unreadable_is_skipped(self):
-        from vllm_torchtpu.offload.raiden_store import check_host_pool_fits_cgroup
-
-        check_host_pool_fits_cgroup(10**15, self._cgroup("max", 0, 0))
-        check_host_pool_fits_cgroup(10**15, "/nonexistent-cgroup-dir")
-        d = self._cgroup(900 * self.GiB, 0, 0)
-        with open(os.path.join(d, "memory.stat"), "w") as f:
-            f.write("file 1\n")  # no anon/shmem keys
-        check_host_pool_fits_cgroup(10**15, d)

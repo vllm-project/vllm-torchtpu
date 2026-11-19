@@ -23,10 +23,20 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
+from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import (
+    can_use_dense_expert_fp4,
+    dense_expert_moe_fp4,
+)
+from vllm_torchtpu.kernels.megablox import tc_combine as tc_combine_mod
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     get_packing_factor,
     gmm_v2,
     gmm_v2_mlp,
+)
+from vllm_torchtpu.kernels.megablox.moe_onehot_bounded import (
+    bounded_onehot_combine,
+    bounded_onehot_permute,
+    can_use_bounded_onehot,
 )
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
@@ -76,64 +86,38 @@ def _select_ragged_gather_reduce(version: str):
 # RAGGED_GATHER_REDUCE_VERSION=v3 to select the destination-major kernel for EP.
 # The non-EP combine in moe_gmm selects that kernel directly.
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
-# Opt-in MoE row movement for large EP steps, set from --additional-config
-# before the model's first trace (`set_row_movement`; all off by default):
-#   moe_tc_combine_min_tokens: EP steps of at least this many tokens combine
-#     the expert outputs on the TensorCore (moe_tc_combine.tc_slab_combine:
-#     aligned 16-row slab DMAs plus a 0/1 selection matmul, then the f32
-#     top-k-order sum of the SparseCore v3 combine) instead of the SparseCore
-#     gather-reduce. Needs tokens divisible by 256. 0 = never.
-#   moe_v3_payload_sort: the v3 combine (RAGGED_GATHER_REDUCE_VERSION=v3)
-#     builds its per-block route metadata with one multi-operand TensorCore
-#     sort instead of an argsort plus four gathers. Same values.
-#   moe_flat_routing_min_tokens: EP steps of at least this many tokens flatten
-#     the [tokens, top_k] routing ids and weights once (behind an optimization
-#     barrier) before the routing prep, so the lane-padded [T, top_k] arrays
-#     are read once instead of being relaid out for every consumer shape.
-#     Same values. 0 = off.
-_TC_COMBINE_MIN_TOKENS = 0
-_V3_PAYLOAD_SORT = False
-_FLAT_ROUTING_MIN_TOKENS = 0
-
-
-def set_row_movement(
-    tc_combine_min_tokens: int = 0,
-    v3_payload_sort: bool = False,
-    flat_routing_min_tokens: int = 0,
-) -> None:
-    """Keys moe_tc_combine_min_tokens / moe_v3_payload_sort /
-    moe_flat_routing_min_tokens."""
-    global _TC_COMBINE_MIN_TOKENS, _V3_PAYLOAD_SORT, _FLAT_ROUTING_MIN_TOKENS
-    if tc_combine_min_tokens < 0 or flat_routing_min_tokens < 0:
-        raise ValueError(
-            "moe_tc_combine_min_tokens / moe_flat_routing_min_tokens must be >= 0"
-        )
-    _TC_COMBINE_MIN_TOKENS = int(tc_combine_min_tokens)
-    _V3_PAYLOAD_SORT = (
-        bool(v3_payload_sort) and envs.RAGGED_GATHER_REDUCE_VERSION == "v3"
+_V3_PAYLOAD_SORT = (
+    envs.TPU_MOE_V3_PAYLOAD_SORT and envs.RAGGED_GATHER_REDUCE_VERSION == "v3"
+)
+if _V3_PAYLOAD_SORT:
+    ragged_gather_reduce = functools.partial(
+        ragged_gather_reduce_v3, payload_sort=True
     )
-    _FLAT_ROUTING_MIN_TOKENS = int(flat_routing_min_tokens)
-    if _TC_COMBINE_MIN_TOKENS or _V3_PAYLOAD_SORT or _FLAT_ROUTING_MIN_TOKENS:
-        logger.info(
-            "MoE row movement: moe_tc_combine_min_tokens=%d "
-            "moe_v3_payload_sort=%s moe_flat_routing_min_tokens=%d",
-            _TC_COMBINE_MIN_TOKENS,
-            _V3_PAYLOAD_SORT,
-            _FLAT_ROUTING_MIN_TOKENS,
-        )
-
-
-def _ep_combine():
-    """The EP combine `ragged_gather_reduce`, with the v3 payload sort under
-    moe_v3_payload_sort."""
-    if _V3_PAYLOAD_SORT:
-        return functools.partial(ragged_gather_reduce_v3, payload_sort=True)
-    return ragged_gather_reduce
-
+# Fixed at import: EP steps of at least this many tokens combine the expert
+# outputs on the TensorCore (0 = never). See moe_tc_combine.
+_TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
+_FLAT_ROUTING_MIN_TOKENS = envs.TPU_MOE_FLAT_ROUTING_MIN_TOKENS
+# Skip padded rows (skip_padded_tokens) only in batches of at least this many
+# routes (T * top_k). Below it the rows still run, so the grouped matmul and the
+# one-hot permute see the same layout as with the skip off and real rows come
+# out bitwise identical; their zero routing weights only drop them from the
+# combine. 0 = skip at every size.
+_SKIP_PADDED_MIN_ROUTES = envs.TPU_MOE_SKIP_PADDED_MIN_ROUTES
+if _TC_COMBINE_MIN_TOKENS or _V3_PAYLOAD_SORT or _FLAT_ROUTING_MIN_TOKENS:
+    logger.info(
+        "MoE row movement: TPU_MOE_TC_COMBINE_MIN_TOKENS=%d "
+        "TPU_MOE_V3_PAYLOAD_SORT=%d TPU_MOE_FLAT_ROUTING_MIN_TOKENS=%d",
+        _TC_COMBINE_MIN_TOKENS,
+        int(_V3_PAYLOAD_SORT),
+        _FLAT_ROUTING_MIN_TOKENS,
+    )
 
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
+_DENSE_FP4_MAX_TOKENS = envs.TPU_MOE_DENSE_FP4_MAX_TOKENS
+# Fixed at import: one-hot permute/combine over the valid prefix only.
+_BOUNDED_ONEHOT = envs.TPU_MOE_BOUNDED_ONEHOT
 # Fixed at import: build the MoE permutation from one packed sort.
 _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # Fixed at import: let the counting sort replace the comparison sorts on the
@@ -385,6 +369,18 @@ def _counting_sort_positions(
     return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
 
 
+def _zero_non_finite(x: jax.Array) -> jax.Array:
+    return jnp.where(jnp.isfinite(x), x, 0)
+
+
+def _use_bounded_onehot(num_tokens: int, num_slots: int, rows: jax.Array) -> bool:
+    return (
+        _BOUNDED_ONEHOT
+        and rows.dtype == jnp.bfloat16
+        and can_use_bounded_onehot(num_tokens, num_slots, rows.shape[1])
+    )
+
+
 def _single_sort_permutation(
     sort_keys: jax.Array, topk: int, flat_bits: int
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -517,11 +513,22 @@ def prepare_routed_gmm_inputs(
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
             # Use one-hot matmul for permutation, which can be faster for small
-            # batch size. When `argsort_revert_indices` came from the counting
-            # sort, build the `[M, T]` permutation directly from it so
-            # `fused_moe_gmm` does not depend on `token_indices_sorted` (letting
-            # XLA DCE its scatter unless owner-output combine uses it).
-            if bucket_counts is not None:
+            # batch size. Non-finite hidden states are zeroed first (every
+            # branch, the bounded kernel in VMEM): the matmul would spread them
+            # to every slot (0 * NaN == NaN). When `argsort_revert_indices` came
+            # from the counting sort, build the `[M, T]` permutation directly
+            # from it so `fused_moe_gmm` does not depend on `token_indices_sorted`
+            # (letting XLA DCE its scatter unless owner-output combine uses it).
+            # The bounded kernel runs only the valid local prefix of slots.
+            if bucket_counts is not None and _use_bounded_onehot(
+                num_tokens_local, argsort_revert_indices.size, hidden_states_local
+            ):
+                x = bounded_onehot_permute(
+                    hidden_states_local,
+                    argsort_revert_indices,
+                    group_sizes_local.sum(dtype=jnp.int32)[None],
+                )
+            elif bucket_counts is not None:
                 onehot = (
                     jax.nn.one_hot(
                         argsort_revert_indices.reshape(num_tokens_local, topk),
@@ -531,13 +538,14 @@ def prepare_routed_gmm_inputs(
                     .sum(axis=1)
                     .T
                 )
+                x = onehot @ _zero_non_finite(hidden_states_local)
             else:
                 onehot = jax.nn.one_hot(
                     token_indices_sorted,
                     num_tokens_local,
                     dtype=hidden_states_local.dtype,
                 )
-            x = onehot @ hidden_states_local
+                x = onehot @ _zero_non_finite(hidden_states_local)
         else:
             # Match uLLM/reference EP routing: materialize the valid local
             # expert prefix through SparseCore ragged_gather. Invalid
@@ -616,6 +624,7 @@ def moe_gmm(
             fuse_act=activation,
             preferred_element_type=x.dtype,
             maybe_quantize_lhs=False,
+            max_group_size=num_tokens,
         )
     else:
         gmm1_res = gmm_wrapper(
@@ -723,6 +732,17 @@ def moe_gmm(
                     valid_count,
                     num_tokens=num_tokens,
                 ).astype(x.dtype)
+            # The dense combine one-hot takes the weights' dtype; the kernel
+            # multiplies in the routed rows' dtype.
+            if topk_weights.dtype == gmm2_res.dtype and _use_bounded_onehot(
+                num_tokens, argsort_revert_indices.size, gmm2_res
+            ):
+                return bounded_onehot_combine(
+                    gmm2_res,
+                    argsort_revert_indices,
+                    jnp.where(valid_mask, topk_weights, 0),
+                    valid_count,
+                ).astype(x.dtype)
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
@@ -738,8 +758,20 @@ def moe_gmm(
                 axis=1
             )
             return (combine @ gmm2_res).astype(x.dtype)
+        if envs.TPU_MOE_TC_COMBINE and tc_combine_mod.supported(
+            num_tokens, gmm2_res.shape[-1], topk, group_sizes.shape[0], gmm2_res.dtype
+        ):
+            return tc_combine_mod.tc_combine(
+                gmm2_res,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+                group_sizes,
+                topk=topk,
+            ).astype(x.dtype)
+
         def sc_combine():
-            return _ep_combine()(
+            return ragged_gather_reduce(
                 gmm2_res,
                 argsort_revert_indices,
                 topk_weights_flat,
@@ -754,7 +786,7 @@ def moe_gmm(
             and tc_slab_combine_ok(num_tokens, gmm2_res.shape[-1])
         ):
             logger.info_once(
-                "moe_tc_combine_min_tokens=%d: TensorCore MoE combine "
+                "TPU_MOE_TC_COMBINE_MIN_TOKENS=%d: TensorCore MoE combine "
                 "(tc_slab_combine) armed",
                 _TC_COMBINE_MIN_TOKENS,
             )
@@ -854,12 +886,15 @@ def fused_moe_func(
     # and `where` propagate appropriately.
     topk_weights = topk_weights.astype(_get_topk_weights_dtype(hidden_states.dtype))
 
-    if use_ep and use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold:
+    onehot_permute = (
+        use_ep and use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold
+    )
+    if onehot_permute:
         # The one-hot permute and unpermute are matmuls across all tokens, and
         # 0 * NaN == NaN: one token with a non-finite hidden state or routing
         # weight would turn every token's output into NaN. Zero those values
-        # so the damage stays with that token.
-        hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
+        # so the damage stays with that token (the permute zeroes the hidden
+        # states, see prepare_routed_gmm_inputs).
         topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
 
     if use_ep and experts_start is not None:
@@ -867,6 +902,9 @@ def fused_moe_func(
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    if skip_padded_tokens and num_tokens * topk < _SKIP_PADDED_MIN_ROUTES:
+        skip_padded_tokens = False
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
@@ -883,10 +921,36 @@ def fused_moe_func(
         skip_padded_tokens=skip_padded_tokens,
     ):
         logger.info_once("Selected experimental dense-expert decode MoE")
+        if onehot_permute:
+            hidden_states = _zero_non_finite(hidden_states)
         return dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
 
+    # Decode under EP: a core holds few routed rows per expert and weight
+    # streaming binds, so the permutation-free kernel skips the routing sort,
+    # permute and combine around the GMM.
+    if (
+        use_ep
+        and 0 < num_tokens <= _DENSE_FP4_MAX_TOKENS
+        and rhs_quant_dtype is None
+        and w1_bias is None
+        and w2_bias is None
+        and can_use_dense_expert_fp4(
+            hidden_states, w1, w2, w1_scale, w2_scale, activation=activation
+        )
+    ):
+        logger.info_once("Selected dense-expert fp4 decode MoE")
+        return dense_expert_moe_fp4(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+        )
     if (
         _FLAT_ROUTING_MIN_TOKENS
         and num_tokens >= _FLAT_ROUTING_MIN_TOKENS
@@ -897,7 +961,7 @@ def fused_moe_func(
         # so every later view (flat, counting-sort blocks, v3 blocks) is a
         # cheap reshape of dense data instead of another padded relayout.
         logger.info_once(
-            "moe_flat_routing_min_tokens=%d: flat MoE routing armed",
+            "TPU_MOE_FLAT_ROUTING_MIN_TOKENS=%d: flat MoE routing armed",
             _FLAT_ROUTING_MIN_TOKENS,
         )
         ids_flat, weights_flat = jax.lax.optimization_barrier(

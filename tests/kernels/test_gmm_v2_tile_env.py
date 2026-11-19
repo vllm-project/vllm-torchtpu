@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests of the opt-in gmm_v2 tile overrides (additional_config keys
-gmm_v2_prefill_tiles / gmm_v2_decode_w13, `gmm_v2.set_tile_overrides`)."""
+"""CPU tests of the opt-in gmm_v2 tile overrides (TPU_GMM_V2_*)."""
 
 from types import SimpleNamespace
 
@@ -39,9 +38,11 @@ def _tpu7x(monkeypatch):
             get_sublane_tiling=lambda dtype: 16,
         ),
     )
-    G.set_tile_overrides()
+    for name in (G._PREFILL_TILES_ENV, G._DECODE_W13_ENV):
+        monkeypatch.delenv(name, raising=False)
+    G._tile_env.cache_clear()
     yield
-    G.set_tile_overrides()
+    G._tile_env.cache_clear()
 
 
 def _cfgs(size_k):
@@ -67,7 +68,7 @@ def _tiles(size_m, gate_up):
 
 @pytest.mark.parametrize("size_m", [128, 2048, 4096, 32768])
 @pytest.mark.parametrize("gate_up", [True, False])
-def test_unset_keys_keep_default_tiles(size_m, gate_up):
+def test_unset_env_keeps_default_tiles(size_m, gate_up):
     assert _tiles(size_m, gate_up) == G._calculate_tiling(
         *_args(size_m, gate_up)
     )
@@ -84,8 +85,8 @@ def _args(size_m, gate_up):
 
 
 @pytest.mark.parametrize("gate_up", [True, False])
-def test_prefill_tiles_apply_above_decode_max(gate_up):
-    G.set_tile_overrides(prefill_tiles="256:128/256")
+def test_prefill_tiles_apply_above_decode_max(monkeypatch, gate_up):
+    monkeypatch.setenv(G._PREFILL_TILES_ENV, "256:128/256")
     for size_m in (4096, 32768):
         t = _tiles(size_m, gate_up)
         assert (t.tile_m, t.bucket_base, t.bucket_sizes) == (256, 128, (128, 256))
@@ -96,19 +97,20 @@ def test_prefill_tiles_apply_above_decode_max(gate_up):
     assert _tiles(2048, gate_up) == G._calculate_tiling(*_args(2048, gate_up))
 
 
-def test_prefill_tiles_max_size_m():
-    G.set_tile_overrides(prefill_tiles="256:128/256@12288")
+def test_prefill_tiles_max_size_m(monkeypatch):
+    monkeypatch.setenv(G._PREFILL_TILES_ENV, "256:128/256@12288")
     assert _tiles(12288, True).bucket_sizes == (128, 256)
     assert _tiles(16384, True) == G._calculate_tiling(*_args(16384, True))
 
 
-def test_prefill_tiles_bad_spec():
-    with pytest.raises(ValueError, match=G.PREFILL_TILES_KEY):
-        G.set_tile_overrides(prefill_tiles="256:128")
+def test_prefill_tiles_bad_spec(monkeypatch):
+    monkeypatch.setenv(G._PREFILL_TILES_ENV, "256:128")
+    with pytest.raises(ValueError):
+        _tiles(4096, True)
 
 
-def test_decode_w13_small_and_large_decode():
-    G.set_tile_overrides(decode_w13="3072:2:2")
+def test_decode_w13_small_and_large_decode(monkeypatch):
+    monkeypatch.setenv(G._DECODE_W13_ENV, "3072:2:2")
     for size_m in (32, 512):
         t = _tiles(size_m, True)
         d = G._calculate_tiling(*_args(size_m, True))
@@ -125,15 +127,15 @@ def test_decode_w13_small_and_large_decode():
     assert _tiles(4096, True) == G._calculate_tiling(*_args(4096, True))
 
 
-def test_decode_w13_default_down_depth():
-    G.set_tile_overrides(decode_w13="3072:2")
+def test_decode_w13_default_down_depth(monkeypatch):
+    monkeypatch.setenv(G._DECODE_W13_ENV, "3072:2")
     assert _tiles(512, False) == G._calculate_tiling(*_args(512, False))
     assert _tiles(512, True).tile_n == 3072
 
 
-def test_decode_w13_over_vmem_falls_back():
+def test_decode_w13_over_vmem_falls_back(monkeypatch):
     # three 18.9 MB gate_up blocks do not fit
-    G.set_tile_overrides(decode_w13="3072:3")
+    monkeypatch.setenv(G._DECODE_W13_ENV, "3072:3")
     assert _tiles(512, True) == G._calculate_tiling(*_args(512, True))
 
 
@@ -144,12 +146,3 @@ def test_vmem_estimate_counts_rhs_buffers():
         32, 3072, H, lhs_cfgs=lhs, rhs_cfgs=rhs, fuse_act="swigluoai", rhs_buffer_count=2
     )
     assert e3 - e2 == 2 * G.rhs_weight_block_bytes(H, 3072, rhs)
-
-
-def test_comma_buckets_and_reset():
-    G.set_tile_overrides(prefill_tiles="256:128,256")
-    assert G.tile_overrides_active()
-    assert _tiles(4096, True).bucket_sizes == (128, 256)
-    G.set_tile_overrides()
-    assert not G.tile_overrides_active()
-    assert _tiles(4096, True) == G._calculate_tiling(*_args(4096, True))

@@ -592,49 +592,6 @@ def _random_rejection_sample_with_segment(
     draft_probs: torch.Tensor | None = None,
     apply_top_k: bool = True,
 ) -> torch.Tensor:
-    """Compiled `_random_rejection_sample_with_segment_impl`."""
-    return _random_rejection_sample_with_segment_impl(
-        draft_token_ids,
-        target_logits,
-        num_draft_tokens,
-        bonus_token_ids,
-        segment_ids,
-        group_indices,
-        max_draft_tokens,
-        temperatures,
-        top_k,
-        top_p,
-        accept_u,
-        recover_u,
-        synthetic_conditional_rates,
-        synthetic_mode,
-        topk_candidates,
-        apply_topk_topp,
-        draft_probs,
-        apply_top_k,
-    )
-
-
-def _random_rejection_sample_with_segment_impl(
-    draft_token_ids: torch.Tensor,
-    target_logits: torch.Tensor,
-    num_draft_tokens: torch.Tensor,
-    bonus_token_ids: torch.Tensor,
-    segment_ids: torch.Tensor,
-    group_indices: torch.Tensor,
-    max_draft_tokens: int,
-    temperatures: torch.Tensor,
-    top_k: torch.Tensor,
-    top_p: torch.Tensor,
-    accept_u: torch.Tensor,
-    recover_u: torch.Tensor,
-    synthetic_conditional_rates: torch.Tensor | None,
-    synthetic_mode: bool,
-    topk_candidates: int = 0,
-    apply_topk_topp: bool = True,
-    draft_probs: torch.Tensor | None = None,
-    apply_top_k: bool = True,
-) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch.
 
     With `draft_probs` (the distribution q each draft token x was sampled
@@ -854,8 +811,7 @@ def _random_rejection_sample_with_segment_impl(
 # ---------------------------------------------------------------------------
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def synthetic_verify_rows(
+def _synthetic_verify_rows_impl(
     draft_token_ids: torch.Tensor,
     num_draft_tokens: torch.Tensor,
     segment_ids: torch.Tensor,
@@ -917,8 +873,7 @@ def synthetic_verify_rows(
     return accepted_count, rows, recover_draft
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def synthetic_sample_and_assemble(
+def _synthetic_sample_and_assemble_impl(
     logits: torch.Tensor,
     recover_draft: torch.Tensor,
     accepted_count: torch.Tensor,
@@ -943,8 +898,6 @@ def synthetic_sample_and_assemble(
     removed (`_recover_tokens`, draft one-hot); a bonus row (`recover_draft`
     -1) samples the full target distribution, as the bonus sampler does.
     """
-    batch_size = num_draft_tokens.shape[0]
-    device = draft_token_ids.device
     sampled = _recover_tokens(
         logits,
         recover_draft,
@@ -957,6 +910,91 @@ def synthetic_sample_and_assemble(
         None,
         apply_top_k=apply_top_k,
     )
+    return _assemble_synthetic(
+        sampled,
+        accepted_count,
+        draft_token_ids,
+        num_draft_tokens,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+    )
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def synthetic_sample_rows_and_assemble(
+    logit_rows: torch.Tensor,
+    rank: torch.Tensor,
+    recover_draft: torch.Tensor,
+    accepted_count: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    recover_u: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    topk_candidates: int = 0,
+    apply_topk_topp: bool = True,
+    apply_top_k: bool = True,
+) -> torch.Tensor:
+    """`synthetic_sample_and_assemble` with the requests' rows split over the
+    TP ranks: ``logit_rows`` holds this rank's block of them (block ``rank``
+    of ``tp``, full vocabulary). Each rank samples its block, the ranks
+    all-gather the sampled tokens and every rank lays out the whole batch.
+    Same tokens: sampling is row-wise and every row sees the same inputs."""
+    from vllm.distributed import tensor_model_parallel_all_gather
+
+    per_rank = logit_rows.shape[0]
+
+    def rows(x: torch.Tensor) -> torch.Tensor:
+        # One block index, so a slice of the block rather than a row gather
+        # (which read all of `recover_u [rows, vocab]`, ~27 us at 64 rows).
+        blocks = x.reshape(-1, per_rank, *x.shape[1:])
+        return blocks.index_select(0, rank.view(-1)).view(per_rank, *x.shape[1:])
+
+    sampled_rows = _recover_tokens(
+        logit_rows,
+        rows(recover_draft),
+        rows(temperatures),
+        rows(top_k),
+        rows(top_p),
+        rows(recover_u),
+        topk_candidates,
+        apply_topk_topp,
+        None,
+        apply_top_k=apply_top_k,
+    )
+    # Exchanged as float32, which holds every id below 2**24 exactly, as the
+    # vocab-parallel argmax exchanges its ids.
+    sampled = tensor_model_parallel_all_gather(sampled_rows.float(), dim=0)
+    sampled = sampled.to(torch.int32)
+    return _assemble_synthetic(
+        sampled,
+        accepted_count,
+        draft_token_ids,
+        num_draft_tokens,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+    )
+
+
+def _assemble_synthetic(
+    sampled: torch.Tensor,
+    accepted_count: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+) -> torch.Tensor:
+    """``[padded_num_reqs, 1 + K]``: each request's accepted drafts, then its
+    sampled token, then placeholders."""
+    batch_size = num_draft_tokens.shape[0]
+    device = draft_token_ids.device
     # Gathers from per-request tables and the scatter into the output lower to
     # select chains on TPU (~200 us at 64 requests); masked reductions over
     # [requests, slots] do the same work vectorized. The [R, 1 + K, T] mask is
@@ -982,3 +1020,140 @@ def synthetic_sample_and_assemble(
         drafts,
     )
     return selected_tokens
+
+
+synthetic_verify_rows = torch.compile(backend="tpu", fullgraph=True, dynamic=False)(
+    _synthetic_verify_rows_impl
+)
+synthetic_sample_and_assemble = torch.compile(
+    backend="tpu", fullgraph=True, dynamic=False
+)(_synthetic_sample_and_assemble_impl)
+
+
+# ---------------------------------------------------------------------------
+# In-graph uniforms for the synthetic one-row verify
+#
+# The synthetic path draws two uniform tensors per verify chunk. Drawn with
+# eager torch.rand on the sampling generator they are two extra programs per
+# step, and the recovery draw is a [rows, vocab] f32 tensor written to HBM and
+# read back by the sampler. Drawing them inside the compiled sampler programs
+# needs a random source the graph can take as an input: a device int32
+# counter. Each draw hashes (counter, element index) with two keyed rounds of
+# the murmur3 32-bit finalizer, which is a bijection of the 32-bit words, so
+# the words of one draw are distinct and successive counters give
+# independent-looking draws. The top 24 bits become the float32 uniform in
+# [0, 1), the resolution torch.rand has. Every TP rank holds the same counter
+# and runs the same programs, so the ranks draw the same uniforms (the
+# property the sampling generator gives the eager path).
+# ---------------------------------------------------------------------------
+
+_FMIX_C1 = -2048144789  # 0x85EBCA6B as int32
+_FMIX_C2 = -1028477387  # 0xC2B2AE35 as int32
+_GOLDEN = -1640531527  # 0x9E3779B9 as int32
+_KEY2_SALT = 0x5BD1E995
+
+
+def _fmix32(x: torch.Tensor) -> torch.Tensor:
+    """murmur3 fmix32 on int32 words (wrapping multiply, logical shifts)."""
+    x = x ^ ((x >> 16) & 0xFFFF)
+    x = x * _FMIX_C1
+    x = x ^ ((x >> 13) & 0x7FFFF)
+    x = x * _FMIX_C2
+    x = x ^ ((x >> 16) & 0xFFFF)
+    return x
+
+
+def counter_uniform(shape: tuple[int, ...], counter: torch.Tensor) -> torch.Tensor:
+    """float32 uniforms in [0, 1) of ``shape`` for one int32 counter value
+    (a 0-d device tensor)."""
+    numel = 1
+    for d in shape:
+        numel *= d
+    k1 = _fmix32(counter * _GOLDEN)
+    k2 = _fmix32(counter ^ _KEY2_SALT)
+    idx = torch.arange(numel, dtype=torch.int32, device=counter.device)
+    h = _fmix32(_fmix32(idx ^ k1) + k2)
+    u = ((h >> 8) & 0xFFFFFF).to(torch.float32) * (1.0 / 16777216.0)
+    return u.view(shape)
+
+
+def initial_rng_counter(seed: int) -> int:
+    """The counter's start value for a seed, as an int32."""
+    x = (int(seed) * 0x9E3779B9 + 0x7F4A7C15) & 0xFFFFFFFF
+    return x - (1 << 32) if x >= (1 << 31) else x
+
+
+def _synthetic_verify_rows_rng_impl(
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    final_logits_indices: torch.Tensor,
+    rng_counter: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`synthetic_verify_rows` with accept_u drawn in-graph from
+    ``rng_counter``; also returns the advanced counter."""
+    accept_u = counter_uniform(tuple(draft_token_ids.shape), rng_counter)
+    accepted_count, rows, recover_draft = _synthetic_verify_rows_impl(
+        draft_token_ids,
+        num_draft_tokens,
+        segment_ids,
+        group_indices,
+        target_logits_indices,
+        bonus_logits_indices,
+        final_logits_indices,
+        accept_u,
+        synthetic_conditional_rates,
+    )
+    return accepted_count, rows, recover_draft, rng_counter + 1
+
+
+def _synthetic_sample_and_assemble_rng_impl(
+    logits: torch.Tensor,
+    recover_draft: torch.Tensor,
+    accepted_count: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    rng_counter: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    topk_candidates: int = 0,
+    apply_topk_topp: bool = True,
+    apply_top_k: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`synthetic_sample_and_assemble` with recover_u drawn in-graph from
+    ``rng_counter``; also returns the advanced counter."""
+    recover_u = counter_uniform(tuple(logits.shape), rng_counter)
+    out = _synthetic_sample_and_assemble_impl(
+        logits,
+        recover_draft,
+        accepted_count,
+        temperatures,
+        top_k,
+        top_p,
+        recover_u,
+        draft_token_ids,
+        num_draft_tokens,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+        topk_candidates,
+        apply_topk_topp,
+        apply_top_k,
+    )
+    return out, rng_counter + 1
+
+
+synthetic_verify_rows_rng = torch.compile(
+    backend="tpu", fullgraph=True, dynamic=False
+)(_synthetic_verify_rows_rng_impl)
+synthetic_sample_and_assemble_rng = torch.compile(
+    backend="tpu", fullgraph=True, dynamic=False
+)(_synthetic_sample_and_assemble_rng_impl)

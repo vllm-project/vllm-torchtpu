@@ -26,12 +26,13 @@ lives on rank ``b % dcp``, whole, and every block-level step stays local:
    ``(score, block)`` under the selection's own order (forced blocks first,
    then score, ties to the lower block). The global top-k is a subset of the
    union of the ranks' local top-k, so exchanging ``dcp * topk`` candidates
-   per token (an all-gather of ``[2 * topk, T]`` int32, `to_slots`) gives
-   the exact non-DCP selection.
+   per token (an all-gather of ``[T, 2 * topk]`` f32, block ids as values)
+   gives the exact non-DCP selection.
 2. `msa_attend_dcp`: each rank merges the candidates into that selection,
    attends every query head of the KV head over the selected blocks it
    holds and returns the partial output with its log-sum-exp; the caller
-   merges the ranks' partials (`ops.msa.merge_head_partials`).
+   merges the ranks' partials (`attend_and_merge` runs both, or
+   `ops.msa.merge_head_partials` merges over several KV heads).
 
 A DCP group wider than a KV head's TP replicas (e.g. DCP 8 at TP 8 with 4
 KV heads) spans ``G = dcp / replicas`` KV heads: every rank then stores all
@@ -52,10 +53,10 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_attention,
     msa_attention_lse,
-    msa_attention_lse_r6,
     msa_fp4,
     msa_indexer,
     msa_select,
+    msa_write,
 )
 
 _NEG_INF = float("-inf")
@@ -65,13 +66,26 @@ _MIN_CANDIDATE_WIDTH = 128
 _MIN_CANDIDATE_TOKENS = 1024
 
 # Up to this many tokens (`msa_attention.SMALL_BATCH_TOKENS` is the non-DCP
-# limit) an 8-token verify group fills an attention tile alone
-# (no padding rows, half the page union of a 16-token tile). Larger decode
-# batches keep 16-token tiles: at 48-64 tiles of 8 the per-tile work list and
-# kernel steps cost more than the smaller unions save (c48 b39 decode twin
-# 108.4 -> 116.7 ms per step, c64 DCP8 b57 147.8 -> 191.1 ms; j-82660a13 vs
-# j-8a29ceb0, j-c0fd0e40 vs j-11d1908c).
-DCP_SMALL_BATCH_TOKENS = 128
+# limit; every decode bucket) an 8-token verify group fills an attention tile
+# alone: a 16-token tile holds two requests' disjoint page unions, so its
+# groups score twice the rows over the same pages (AOT, 4-bit 16-page step:
+# ~1,450 bundles at 8 tokens vs ~2,240 at 16). With the twins' selections
+# dispersed as served (int4 index-scale fill), c48 b37 decode attention was
+# 223 us per layer in 16-token tiles (j-52ca6e4b). Before that fill, the
+# twins' tiles were nearly empty and 8-token ones lost on per-tile cost
+# (c48 b39 108.4 -> 116.7 ms per step, j-82660a13 vs j-8a29ceb0).
+DCP_SMALL_BATCH_TOKENS = 1024
+# Pages per kernel step of those 8-token tiles in batches of more than
+# `_WIDE_GROUP_MIN_TOKENS` tokens: a tile's 128 query rows keep a 32-page
+# score tile the size of a 16-token tile's 16-page one (AOT: 32 pages ~3,000
+# bundles vs 2 x ~1,700 for two 16-page steps). Batches of up to 128 tokens
+# (c4 / c16 decode) keep 16-page groups: there the 32-page ones saved at most
+# 1.4 us per layer (c16 b6, j-5eda23f9 vs j-c93c225d), and their other
+# accumulation order re-rolled the twin's dummy-weight expert routing into a
+# reproducibly worse MoE balance at c4 b1 p90-100 (+0.58 ms per step, every
+# core's MSA ops flat, j-eb9a7c1a vs j-fbcd168a).
+_SMALL_BATCH_PAGES_PER_STEP = 32
+_WIDE_GROUP_MIN_TOKENS = 129
 
 
 def rank_array(rank: int | jax.Array) -> jax.Array:
@@ -185,7 +199,6 @@ def _candidates_kernel_t(
     dcp,
     widths,
     pretransposed=False,
-    fine_widths=False,
 ):
     """`_candidates_kernel` with the row block transposed in VMEM: columns
     on sublanes, rows on lanes (``pos_ref [1, rows]``, outputs ``[topk,
@@ -212,57 +225,35 @@ def _candidates_kernel_t(
         s = jnp.where(
             visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
         )
-        if fine_widths:
-            _pick_looped(s, cols, width, score_out_ref, block_out_ref, topk, dcp, rank)
-            return
-        picked_scores, picked_blocks = [], []
-        for _ in range(topk):
+        # Column ids as f32 (exact below 2**24): the first of a pick's ties is
+        # one f32 min, where an int32 min takes a compare and a select.
+        col_ids = cols.astype(jnp.float32)
+
+        def pick(k, s):
             best_score = jnp.max(s, axis=0, keepdims=True)
             best = jnp.min(
-                jnp.where(s == best_score, cols, width), axis=0, keepdims=True
+                jnp.where(s == best_score, col_ids, float(width)),
+                axis=0,
+                keepdims=True,
             )
-            picked_scores.append(best_score)
-            picked_blocks.append(
-                jnp.where(best_score > _NEG_INF, best * dcp + rank, -1)
+            score_out_ref[pl.ds(k, 1), :] = best_score
+            block_out_ref[pl.ds(k, 1), :] = jnp.where(
+                best_score > _NEG_INF, best.astype(jnp.int32) * dcp + rank, -1
             )
-            s = jnp.where(cols == best, _NEG_INF, s)
-        score_out_ref[...] = jnp.concatenate(picked_scores, axis=0)
-        block_out_ref[...] = jnp.concatenate(picked_blocks, axis=0)
+            return jnp.where(col_ids == best, _NEG_INF, s)
+
+        if width <= _UNROLLED_WIDTH:
+            for k in range(topk):
+                s = pick(k, s)
+        else:
+            jax.lax.fori_loop(0, topk, pick, s, unroll=_PICK_UNROLL)
 
     for width in widths:
         pl.when(width_now == width)(functools.partial(select, width))
 
 
-def _pick_looped(s, cols, width, score_out_ref, block_out_ref, topk, dcp, rank):
-    """`_candidates_kernel_t`'s picks for `FINE_SCAN_WIDTHS` (r6): each pick
-    stores its row as it goes, ties resolve on f32 column ids (exact below
-    2**24: one f32 min instead of an int32 compare and select), and blocks
-    wider than `_UNROLLED_WIDTH` loop over the picks instead of unrolling
-    them. Same picks as the unrolled loop."""
-    col_ids = cols.astype(jnp.float32)
-
-    def pick(k, s):
-        best_score = jnp.max(s, axis=0, keepdims=True)
-        best = jnp.min(
-            jnp.where(s == best_score, col_ids, float(width)),
-            axis=0,
-            keepdims=True,
-        )
-        score_out_ref[pl.ds(k, 1), :] = best_score
-        block_out_ref[pl.ds(k, 1), :] = jnp.where(
-            best_score > _NEG_INF, best.astype(jnp.int32) * dcp + rank, -1
-        )
-        return jnp.where(col_ids == best, _NEG_INF, s)
-
-    if width <= _UNROLLED_WIDTH:
-        for k in range(topk):
-            s = pick(k, s)
-    else:
-        jax.lax.fori_loop(0, topk, pick, s, unroll=_PICK_UNROLL)
-
-
-# r6 (opt-in, `FINE_SCAN_WIDTHS`): scan widths step by this many
-# pretransposed columns up to `_FINE_WIDTH_LIMIT`, then by 128.
+# Scan widths step by this many pretransposed columns up to
+# `_FINE_WIDTH_LIMIT`, then by 128.
 _FINE_WIDTH_STEP = 32
 _FINE_WIDTH_LIMIT = 256
 # Up to this width a block's picks unroll; past it they loop two at a time:
@@ -274,17 +265,19 @@ _PICK_UNROLL = 2
 # Past this width the scan widths step by half of it (bounding the
 # kernel's bodies: 20 at 4,096 columns).
 _COARSE_WIDTH_FROM = 1024
-# Set from key minimax_dcp_fine_scan_widths by the attention layer.
-FINE_SCAN_WIDTHS = False
+
+# Row blocks of a multiple of this many rows (a vreg's lanes) pick
+# transposed (`_candidates_kernel_t`, `_merge_kernel_t`); smaller decode
+# blocks would fill few lanes of each vreg.
+_TRANSPOSED_ROWS = 128
 
 
 def _scan_widths(num_cols: int, pretransposed: bool) -> list[int]:
-    """`local_candidates`' scan widths up to `num_cols` with
-    `FINE_SCAN_WIDTHS`. A pick costs per scanned column, so widths step
-    finely: by `_FINE_WIDTH_STEP` columns (sublanes of the pretransposed
-    scores) up to `_FINE_WIDTH_LIMIT`, then by a vreg's 128 lanes (powers of
-    two cost ~25% more scan on average: c64's 146-column blocks scanned
-    256)."""
+    """`local_candidates`' scan widths up to `num_cols`. A pick costs per
+    scanned column, so widths step finely: by `_FINE_WIDTH_STEP` columns
+    (sublanes of the pretransposed scores) up to `_FINE_WIDTH_LIMIT`, then by
+    a vreg's 128 lanes (powers of two cost ~25% more scan on average: c64's
+    146-column blocks scanned 256)."""
     step = _FINE_WIDTH_STEP if pretransposed else _MIN_CANDIDATE_WIDTH
     widths = list(range(step, min(num_cols, _FINE_WIDTH_LIMIT) + 1, step))
     # Then steps of 128 up to _COARSE_WIDTH_FROM, and of half of that
@@ -300,12 +293,6 @@ def _scan_widths(num_cols: int, pretransposed: bool) -> list[int]:
     return widths
 
 
-# Row blocks of a multiple of this many rows (a vreg's lanes) pick
-# transposed (`_candidates_kernel_t`, `_merge_kernel_t`); smaller decode
-# blocks would fill few lanes of each vreg.
-_TRANSPOSED_ROWS = 128
-
-
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -315,7 +302,6 @@ _TRANSPOSED_ROWS = 128
         "local_blocks",
         "dcp",
         "block_rows",
-        "live_select",
         "interpret",
     ),
 )
@@ -331,17 +317,12 @@ def local_candidates(
     dcp: int,
     block_rows: int = msa_select.DEFAULT_BLOCK_ROWS,
     live_rows: jax.Array | None = None,
-    live_select: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """This rank's top-k ``(scores [T, topk] f32, blocks [T, topk] i32)``.
 
     With `live_rows` (a traced count), only the row blocks holding rows
     ``[0, live_rows)`` are picked; the other rows' results are unset.
-
-    With `live_select`, a batch that would scan the full width (at most
-    `_MIN_CANDIDATE_TOKENS` rows) copies in and scans only the columns its
-    row block sees (`_live_candidates_kernel`), with the same picks.
 
     ``scores [T, 1, P]`` are this rank's block scores (column ``c`` is global
     block ``c * dcp + rank``), or ``[P, T]`` transposed (the large tiles'
@@ -364,25 +345,27 @@ def local_candidates(
     if pretransposed:
         block_rows = -(-block_rows // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS
     pad = -num_tokens % block_rows
-    if pretransposed:
-        s = jnp.pad(scores, ((0, 0), (0, pad)))
-    else:
-        s = jnp.pad(scores[:, 0], ((0, pad), (0, 0)))
+    s = scores if pretransposed else scores[:, 0]
+    if pad and (live_rows is None or num_tokens < block_rows):
+        s = jnp.pad(s, ((0, 0), (0, pad)) if pretransposed else ((0, pad), (0, 0)))
+    # Without `live_rows` every row block runs, so a last block past the
+    # scores always reads past them: in the c48 decode twin (384 tokens, DCP 2,
+    # 4-bit) that halted every chip at warmup (j-433e936a). A class's grid
+    # stops at its live rows, so its scores keep no padded copy (~17 us per
+    # layer for the c48 mixed step's small tiles, j-c22c589e); its last block
+    # reads past them only when the live rows reach it. Padding rows pick from
+    # garbage and are dropped, as the kernels reduce within a row only.
     p = jnp.pad(pos, (0, pad))[:, None]
-    # Static scan widths: 128 x powers of two below the full width, and the
-    # full width (one kernel body each); each row block takes the narrowest
-    # one holding every block its rows see (a rank's blocks below n are among
-    # its first ceil(n / dcp) columns). A decode batch scans the full width:
-    # its scan is a few us, and picking a width would cost more.
-    fine_widths = FINE_SCAN_WIDTHS
-    if fine_widths and num_tokens > _MIN_CANDIDATE_TOKENS:
-        widths = _scan_widths(num_cols, pretransposed)
-    else:
-        widths = [num_cols]
-        while widths[0] > _MIN_CANDIDATE_WIDTH and num_tokens > _MIN_CANDIDATE_TOKENS:
-            widths.insert(
-                0, max(_MIN_CANDIDATE_WIDTH, 1 << (widths[0] - 1).bit_length() - 1)
-            )
+    # Static scan widths (`_scan_widths`, one kernel body each); each row
+    # block takes the narrowest one holding every block its rows see (a
+    # rank's blocks below n are among its first ceil(n / dcp) columns). A
+    # decode batch scans the full width: its scan is a few us, and picking a
+    # width would cost more.
+    widths = (
+        _scan_widths(num_cols, pretransposed)
+        if num_tokens > _MIN_CANDIDATE_TOKENS
+        else [num_cols]
+    )
     num_blocks = (num_tokens + pad) // block_rows
     if len(widths) == 1:
         row_widths = jnp.full((num_blocks,), num_cols, jnp.int32)
@@ -392,30 +375,8 @@ def local_candidates(
         w = jnp.asarray(widths, jnp.int32)
         row_widths = jnp.min(jnp.where(w >= needed[:, None], w, num_cols), axis=1)
     transposed = block_rows % _TRANSPOSED_ROWS == 0
-    if live_select and len(widths) == 1 and _live_fits(num_cols, pretransposed):
-        picked_scores, picked_blocks = _live_candidates(
-            s,
-            p.T if transposed else p,
-            rank_array(rank),
-            num_blocks=num_blocks,
-            block_rows=block_rows,
-            transposed=transposed,
-            pretransposed=pretransposed,
-            block_size=block_size,
-            topk=topk,
-            init_blocks=init_blocks,
-            local_blocks=local_blocks,
-            dcp=dcp,
-            live_rows=live_rows,
-            interpret=interpret,
-        )
-        if transposed:
-            picked_scores, picked_blocks = picked_scores.T, picked_blocks.T
-        return picked_scores[:num_tokens], picked_blocks[:num_tokens]
     if transposed:
-        kernel = functools.partial(
-            _candidates_kernel_t, pretransposed=pretransposed, fine_widths=fine_widths
-        )
+        kernel = functools.partial(_candidates_kernel_t, pretransposed=pretransposed)
         pos_spec = pl.BlockSpec((1, block_rows), lambda i: (0, i))
         p = p.T
         out_spec = pl.BlockSpec((topk, block_rows), lambda i: (0, i))
@@ -467,273 +428,6 @@ def local_candidates(
     return picked_scores[:num_tokens], picked_blocks[:num_tokens]
 
 
-# Set from `--additional-config '{"minimax_msa_live_select": true}'` at layer
-# init (`attention.live_select_enabled`); read at trace time. Off by default.
-LIVE_SELECT_ENABLED = False
-
-# Columns a `_live_candidates_kernel` loop step scans when they sit on
-# sublanes (8 vregs of a 128-row block), and columns per copy when the
-# scores keep them on lanes.
-_LIVE_CHUNK = 64
-_LANES = 128
-_NO_COL = jnp.iinfo(jnp.int32).max
-
-
-def _live_fits(num_cols: int, pretransposed: bool) -> bool:
-    """Whether `_live_candidates` takes scores of `num_cols` columns: whole
-    vregs per copy (8 sublanes or 128 lanes)."""
-    return num_cols % (8 if pretransposed else _LANES) == 0
-
-
-def _live_columns(
-    pos: jax.Array, rank: jax.Array, *, block_size: int, dcp: int, num_cols: int
-) -> jax.Array:
-    """Columns any row of each row block of ``pos [blocks, rows]`` sees: the
-    rank's blocks below ``n`` are its first ``ceil((n - rank) / dcp)``
-    columns, so this is the local page count (`local_seq_lens`) of the
-    block's longest request."""
-    num_visible = jnp.max(pos, axis=1) // block_size + 1
-    return jnp.clip(-(-(num_visible - rank) // dcp), 0, num_cols)
-
-
-def _live_chunks(need, cols: int):
-    """Loop steps of `cols` columns that cover the first `need` columns."""
-    return (need + cols - 1) // cols
-
-
-def _live_candidates_kernel(
-    # Scalar prefetch
-    counts_ref,  # [2] rank, grid steps
-    need_ref,  # [row blocks] columns any row of the block sees
-    # In
-    scores_hbm,  # [T, P] (or [P, T] pretransposed) scores in HBM
-    pos_ref,  # [rows, 1] (or [1, rows] transposed)
-    # Out
-    score_out_ref,  # [rows, topk] (or [topk, rows] transposed)
-    block_out_ref,
-    # Scratch
-    buf_ref,  # [2, rows, P] (or [2, P, rows] pretransposed): two blocks
-    sems,  # DMA semaphores, one per buffer
-    masked_ref,  # [rows, P] (or [P, rows] transposed): masked scores
-    *,
-    block_size,
-    topk,
-    init_blocks,
-    local_blocks,
-    dcp,
-    col_axis,
-    src_axis,
-    copy_cols,
-    scan_cols,
-):
-    """`_candidates_kernel` (``col_axis`` 1) or `_candidates_kernel_t`
-    (``col_axis`` 0) over the first ``need_ref[i]`` columns of row block
-    ``i`` only, with the same picks: a column past every row's last visible
-    block is ``-inf`` for all of them, so it only ever ties a pick that is
-    already a miss ``(-inf, -1)``.
-
-    The block's live columns are copied in ``copy_cols`` at a time (the next
-    block's while this one picks). Each pick scans ``scan_cols`` at a time
-    and keeps a running max and its first column per vreg slot (strict ``>``
-    over columns in increasing order keeps the lowest of equal scores), then
-    reduces the slots once; the previous pick is cleared on the same scan."""
-    i = pl.program_id(0)
-    rank, steps = counts_ref[0], counts_ref[1]
-    slot = i % 2
-    num_visible = pos_ref[...] // block_size + 1
-    rows = num_visible.shape[1 - col_axis]
-    unit = 8 if col_axis == 0 else _LANES
-    slot_shape = (unit, rows) if col_axis == 0 else (rows, unit)
-    slot_col = jax.lax.broadcasted_iota(jnp.int32, slot_shape, col_axis)
-
-    def num_chunks(block, cols):
-        return _live_chunks(need_ref[block], cols)
-
-    def copy_block(block, buf, op):
-        def body(c, carry):
-            cols = pl.ds(pl.multiple_of(c * copy_cols, copy_cols), copy_cols)
-            block_rows = pl.ds(pl.multiple_of(block * rows, rows), rows)
-            src, dst = (
-                (scores_hbm.at[cols, block_rows], buf_ref.at[buf, cols])
-                if src_axis == 0
-                else (scores_hbm.at[block_rows, cols], buf_ref.at[buf, :, cols])
-            )
-            getattr(pltpu.make_async_copy(src, dst, sems.at[buf]), op)()
-            return carry
-
-        jax.lax.fori_loop(0, num_chunks(block, copy_cols), body, 0)
-
-    @pl.when(i == 0)
-    def _first():
-        copy_block(0, 0, "start")
-
-    @pl.when(i + 1 < steps)
-    def _next():
-        copy_block(i + 1, 1 - slot, "start")
-
-    copy_block(i, slot, "wait")
-
-    def chunk_cols(base, n):
-        shape = (n, rows) if col_axis == 0 else (rows, n)
-        return jax.lax.broadcasted_iota(jnp.int32, shape, col_axis) + base
-
-    def masked_at(base, n):
-        cols = pl.ds(pl.multiple_of(base, n), n)
-        return masked_ref.at[cols] if col_axis == 0 else masked_ref.at[:, cols]
-
-    def accumulate(best, s, base):
-        m, col = best
-        for k in range(s.shape[col_axis] // unit):
-            v = jax.lax.slice_in_dim(s, k * unit, (k + 1) * unit, axis=col_axis)
-            gt = v > m
-            m = jnp.where(gt, v, m)
-            col = jnp.where(gt, slot_col + (base + k * unit), col)
-        return m, col
-
-    def first_scan(c, best):
-        base = c * copy_cols
-        cols = pl.ds(pl.multiple_of(base, copy_cols), copy_cols)
-        s = buf_ref[slot, cols] if src_axis == 0 else buf_ref[slot, :, cols]
-        if src_axis != col_axis:
-            s = s.T
-        blocks = chunk_cols(base, copy_cols) * dcp + rank
-        visible = blocks < num_visible
-        s = jnp.where(visible, s, _NEG_INF)
-        s = jnp.where(
-            visible & (blocks >= num_visible - local_blocks),
-            msa_select._FORCED_LOCAL_SCORE,
-            s,
-        )
-        s = jnp.where(
-            visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
-        )
-        masked_at(base, copy_cols)[...] = s
-        return accumulate(best, s, base)
-
-    def later_scan(picked):
-        def body(c, best):
-            base = c * scan_cols
-            ref = masked_at(base, scan_cols)
-            s = jnp.where(chunk_cols(base, scan_cols) == picked, _NEG_INF, ref[...])
-            ref[...] = s
-            return accumulate(best, s, base)
-
-        return body
-
-    init = (
-        jnp.full(slot_shape, _NEG_INF, jnp.float32),
-        jnp.full(slot_shape, _NO_COL, jnp.int32),
-    )
-    scan, trips = first_scan, num_chunks(i, copy_cols)
-    picked_scores, picked_blocks = [], []
-    for _ in range(topk):
-        m, col = jax.lax.fori_loop(0, trips, scan, init)
-        best_score = jnp.max(m, axis=col_axis, keepdims=True)
-        best = jnp.min(
-            jnp.where(m == best_score, col, _NO_COL), axis=col_axis, keepdims=True
-        )
-        picked_scores.append(best_score)
-        picked_blocks.append(jnp.where(best_score > _NEG_INF, best * dcp + rank, -1))
-        scan, trips = later_scan(best), num_chunks(i, scan_cols)
-    score_out_ref[...] = jnp.concatenate(picked_scores, axis=col_axis)
-    block_out_ref[...] = jnp.concatenate(picked_blocks, axis=col_axis)
-
-
-def _live_candidates(
-    s: jax.Array,
-    p: jax.Array,
-    rank: jax.Array,
-    *,
-    num_blocks: int,
-    block_rows: int,
-    transposed: bool,
-    pretransposed: bool,
-    block_size: int,
-    topk: int,
-    init_blocks: int,
-    local_blocks: int,
-    dcp: int,
-    live_rows: jax.Array | None,
-    interpret: bool,
-) -> tuple[jax.Array, jax.Array]:
-    """`local_candidates`' pick of padded scores ``s`` (``[T, P]``, or
-    ``[P, T]`` pretransposed) and positions ``p`` (``[T, 1]``, or ``[1, T]``
-    when `transposed`) with `_live_candidates_kernel`: picks ``[T, topk]``
-    (``[topk, T]`` when `transposed`)."""
-    num_cols = s.shape[0] if pretransposed else s.shape[1]
-    col_axis = 0 if transposed else 1
-    src_axis = 0 if pretransposed else 1
-    if src_axis == 0:
-        copy_cols = _select_chunk(num_cols)
-    else:
-        copy_cols = _LANES
-    scan_cols = min(_LIVE_CHUNK, copy_cols) if col_axis == 0 else _LANES
-    need = _live_columns(
-        p.reshape(num_blocks, block_rows),
-        rank[0],
-        block_size=block_size,
-        dcp=dcp,
-        num_cols=num_cols,
-    )
-    steps = (
-        num_blocks
-        if live_rows is None
-        else jnp.clip(-(-live_rows // block_rows), 1, num_blocks).astype(jnp.int32)
-    )
-    if transposed:
-        pos_spec = pl.BlockSpec((1, block_rows), lambda i, *_: (0, i))
-        out_spec = pl.BlockSpec((topk, block_rows), lambda i, *_: (0, i))
-        out_dims = (topk, num_blocks * block_rows)
-    else:
-        pos_spec = pl.BlockSpec((block_rows, 1), lambda i, *_: (i, 0))
-        out_spec = pl.BlockSpec((block_rows, topk), lambda i, *_: (i, 0))
-        out_dims = (num_blocks * block_rows, topk)
-    buf_block = (num_cols, block_rows) if src_axis == 0 else (block_rows, num_cols)
-    masked_block = (num_cols, block_rows) if col_axis == 0 else (block_rows, num_cols)
-    kernel = functools.partial(
-        _live_candidates_kernel,
-        block_size=block_size,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
-        dcp=dcp,
-        col_axis=col_axis,
-        src_axis=src_axis,
-        copy_cols=copy_cols,
-        scan_cols=scan_cols,
-    )
-    return pl.pallas_call(
-        kernel,
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
-            grid=(steps,),
-            in_specs=[pl.BlockSpec(memory_space=pl.ANY), pos_spec],
-            out_specs=[out_spec, out_spec],
-            scratch_shapes=[
-                pltpu.VMEM((2, *buf_block), s.dtype),
-                pltpu.SemaphoreType.DMA((2,)),
-                pltpu.VMEM(masked_block, s.dtype),
-            ],
-        ),
-        out_shape=[
-            jax.ShapeDtypeStruct(out_dims, jnp.float32),
-            jax.ShapeDtypeStruct(out_dims, jnp.int32),
-        ],
-        compiler_params=pltpu.CompilerParams(
-            # The next block's copy starts in this block's step.
-            dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=msa_select._VMEM_LIMIT_BYTES,
-        ),
-        interpret=interpret,
-        name="minimax_m3_msa_dcp_live_candidates",
-    )(
-        jnp.stack([rank[0], jnp.asarray(steps, jnp.int32)]),
-        need.astype(jnp.int32),
-        s,
-        p,
-    )
-
-
 def pack_candidates(scores: jax.Array, blocks: jax.Array) -> jax.Array:
     """``[T, 2 * topk]`` f32: scores, then the block ids as f32 values, so one
     all-gather moves both.
@@ -746,29 +440,6 @@ def pack_candidates(scores: jax.Array, blocks: jax.Array) -> jax.Array:
     return jnp.concatenate([scores, blocks.astype(jnp.float32)], axis=-1)
 
 
-def _slot_bits(picks: jax.Array, topk: int) -> jax.Array:
-    """Packed candidates as columns, ``[2 * topk, N]`` f32 (`pack_candidates`
-    transposed) -> int32: the scores' bit patterns, then the block ids."""
-    scores = jax.lax.bitcast_convert_type(picks[:topk], jnp.int32)
-    return jnp.concatenate([scores, picks[topk:].astype(jnp.int32)], axis=0)
-
-
-def to_slots(packed: jax.Array, topk: int) -> jax.Array:
-    """`pack_candidates` rows of ``G`` heads, ``[T, G * 2 * topk]`` (head-major
-    per token) -> the all-gather layout ``[2 * topk, T * G]`` int32.
-
-    Column ``t * G + h`` holds head ``h`` of token ``t``: rows ``[0, topk)``
-    the scores' f32 bit patterns, rows ``[topk, 2 * topk)`` the block ids
-    (``-1``: none). The collective moves int32, so nothing canonicalizes the
-    bits, and with the ``T * G`` columns on lanes the payload is not padded:
-    ``[T, 2 * topk]`` rows pad to 128 lanes, 2-4x the bytes, and the
-    all-gather's time follows the padded bytes (DCP4, 8192 tokens: f32 [T,
-    32] and [T, 64] both ~145-150 us, j-1597224e).
-    """
-    rows = packed.reshape(-1, 2 * topk)
-    return _slot_bits(rows.T, topk)
-
-
 def merge_candidates(candidates: jax.Array, topk: int) -> jax.Array:
     """Global selection ``[T, topk]`` (``-1`` padded) from every rank's
     packed candidates ``[dcp, T, 2 * topk]``, in `msa_select.select_blocks`'s
@@ -776,209 +447,112 @@ def merge_candidates(candidates: jax.Array, topk: int) -> jax.Array:
     dcp, num_tokens, _ = candidates.shape
     scores = candidates[..., :topk]
     blocks = candidates[..., topk:].astype(jnp.int32)
-    s = scores.transpose(0, 2, 1).reshape(dcp * topk, num_tokens)
-    b = blocks.transpose(0, 2, 1).reshape(dcp * topk, num_tokens)
-    return _rank_merge(s, b, topk).T
-
-
-def _rank_merge(s: jax.Array, b: jax.Array, topk: int) -> jax.Array:
-    """`merge_candidates` of candidates ``(s, b) [n, N]`` (candidate ``i`` of
-    column ``c``) -> ``[topk, N]``."""
+    s = scores.transpose(1, 0, 2).reshape(num_tokens, dcp * topk)
+    b = blocks.transpose(1, 0, 2).reshape(num_tokens, dcp * topk)
     # The real candidates (score > -inf) are distinct blocks: a rank picks
     # distinct columns and ranks hold disjoint blocks. So each one's place in
     # the order is the number of real candidates ahead of it, and the merge
     # is two dense compare-reduce fusions instead of topk dependent steps.
-    # Their [n, n, N] operands stay fused into the reductions.
+    # Their [rows, dcp * topk, dcp * topk] operands stay fused into the
+    # reductions (dcp * topk <= 128 lanes per row at the served shapes).
     real = s > _NEG_INF
-    s_i, b_i = s[:, None, :], b[:, None, :]
-    s_j, b_j = s[None, :, :], b[None, :, :]
-    ahead = real[None, :, :] & ((s_j > s_i) | ((s_j == s_i) & (b_j < b_i)))
-    place = jnp.where(real, jnp.sum(ahead, axis=1, dtype=jnp.int32), topk)
-    slot = jnp.arange(topk, dtype=jnp.int32)[None, :, None]
-    return jnp.max(jnp.where(place[:, None, :] == slot, b_i, -1), axis=0)
+    s_i, b_i = s[:, :, None], b[:, :, None]
+    s_j, b_j = s[:, None, :], b[:, None, :]
+    ahead = real[:, None, :] & ((s_j > s_i) | ((s_j == s_i) & (b_j < b_i)))
+    place = jnp.where(real, jnp.sum(ahead, axis=2, dtype=jnp.int32), topk)
+    slot = jnp.arange(topk, dtype=jnp.int32)[None, None, :]
+    return jnp.max(jnp.where(place[:, :, None] == slot, b_i, -1), axis=1)
 
 
-def _merge_kernel_t(c_ref, o_ref, *, topk: int, sub: int):
-    """`merge_candidates` of a block of columns, in VMEM, `sub` columns at a
-    time: ``topk`` steps of (best score, lowest block among its ties) over
-    the ``dcp * topk`` candidates. Candidate slots on sublanes and columns on
-    lanes, so a column's candidates are whole vreg rows of the ranks' blocks
-    (no lane shuffles) and each pick reduces across vregs and sublanes on
-    the VPU instead of across lanes on the XLU. ``c_ref [dcp, 2 * topk,
-    Bc]`` (`to_slots` of each rank), ``o_ref [Bc, topk]``."""
-    dcp, _, block_c = c_ref.shape
+def _merge_kernel(c_ref, o_ref, *, topk: int):
+    """`merge_candidates` of a block of tokens, every head, in VMEM: ``topk``
+    steps of (best score, lowest block among its ties) over the ``dcp *
+    topk`` candidates. ``c_ref [dcp, Bt, G * 2 * topk]``, ``o_ref [Bt, G *
+    topk]``."""
+    dcp, block_t, width = c_ref.shape
+    lane = jax.lax.broadcasted_iota(jnp.int32, (block_t, topk), 1)
     no_block = jnp.iinfo(jnp.int32).max
-
-    def body(i, carry):
-        cols = pl.ds(pl.multiple_of(i * sub, sub), sub)
+    for g in range(width // (2 * topk)):
+        base = g * 2 * topk
         s = jnp.concatenate(
-            [
-                jax.lax.bitcast_convert_type(c_ref[r, :topk, cols], jnp.float32)
-                for r in range(dcp)
-            ],
-            axis=0,
+            [c_ref[r, :, base : base + topk] for r in range(dcp)], axis=1
         )
-        b = jnp.concatenate([c_ref[r, topk:, cols] for r in range(dcp)], axis=0)
-        out = []
+        b = jnp.concatenate(
+            [c_ref[r, :, base + topk : base + 2 * topk] for r in range(dcp)], axis=1
+        ).astype(jnp.int32)
+        out = jnp.full((block_t, topk), -1, jnp.int32)
+        for k in range(topk):
+            best_score = jnp.max(s, axis=1, keepdims=True)
+            best = jnp.min(
+                jnp.where(s == best_score, b, no_block), axis=1, keepdims=True
+            )
+            out = jnp.where(lane == k, jnp.where(best_score > _NEG_INF, best, -1), out)
+            s = jnp.where(b == best, _NEG_INF, s)
+        o_ref[:, g * topk : (g + 1) * topk] = out
+
+
+def _merge_kernel_t(c_ref, o_ref, *, topk: int):
+    """`_merge_kernel` with each rank's block transposed in VMEM: candidate
+    slots on sublanes, tokens on lanes, so a head's ``dcp * topk``
+    candidates are whole vreg rows of the ranks' blocks (no lane shuffles)
+    and each pick reduces across vregs and sublanes on the VPU instead of
+    across lanes on the XLU. ``c_ref [dcp, Bt, G * 2 * topk]``, ``o_ref
+    [Bt, G * topk]``."""
+    dcp, block_t, width = c_ref.shape
+    ranks = [c_ref[r].T for r in range(dcp)]  # [width, Bt] each
+    no_block = jnp.iinfo(jnp.int32).max
+    out = []
+    for g in range(width // (2 * topk)):
+        base = g * 2 * topk
+        s = jnp.concatenate([c[base : base + topk] for c in ranks], axis=0)
+        b = jnp.concatenate(
+            [c[base + topk : base + 2 * topk] for c in ranks], axis=0
+        ).astype(jnp.int32)
         for _ in range(topk):
-            best_score = jnp.max(s, axis=0, keepdims=True)  # [1, sub]
+            best_score = jnp.max(s, axis=0, keepdims=True)  # [1, Bt]
             best = jnp.min(
                 jnp.where(s == best_score, b, no_block), axis=0, keepdims=True
             )
             out.append(jnp.where(best_score > _NEG_INF, best, -1))
             s = jnp.where(b == best, _NEG_INF, s)
-        o_ref[cols, :] = jnp.concatenate(out, axis=0).T
-        return carry
-
-    jax.lax.fori_loop(0, block_c // sub, body, 0)
+    o_ref[...] = jnp.concatenate(out, axis=0).T
 
 
-def _sublane_partner(x: jax.Array, d: int) -> jax.Array:
-    """``x[i ^ d]`` over the 8 sublanes of ``x [8, N]`` (``d`` in 1, 2, 4)."""
-    row = jax.lax.broadcasted_iota(jnp.int32, x.shape, 0)
-    return jnp.where(row & d, pltpu.roll(x, d, 0), pltpu.roll(x, 8 - d, 0))
-
-
-def _beats(sa, ba, sb, bb):
-    """Candidate a ahead of b in the selection order: higher score, ties to
-    the lower block."""
-    return (sa > sb) | ((sa == sb) & (ba < bb))
-
-
-def _merge_sorted(a, b):
-    """Top ``8 m`` of two candidate lists, each sorted (score descending,
-    ties to the lower block) as ``m`` groups ``(s, b) [8, N]`` of 8 slots
-    (slot ``8 j + i`` is sublane ``i`` of group ``j``), sorted the same way:
-    a bitonic half-cleaner against ``b`` reversed, then a bitonic sort."""
-    m = len(a)
-
-    def reverse(x):
-        for d in (4, 2, 1):
-            x = _sublane_partner(x, d)
-        return x
-
-    rb = [(reverse(s), reverse(k)) for s, k in b[::-1]]
-    out = []
-    for (sa, ka), (sb, kb) in zip(a, rb):
-        take = _beats(sa, ka, sb, kb)
-        out.append((jnp.where(take, sa, sb), jnp.where(take, ka, kb)))
-    # Bitonic clean-up: slot i against slot i + d, i with bit d clear keeps
-    # the leader.
-    d = 4 * m
-    while d >= 8:
-        g = d // 8
-        for j in range(m):
-            if j & g:
-                continue
-            (s0, k0), (s1, k1) = out[j], out[j + g]
-            take = _beats(s0, k0, s1, k1)
-            out[j] = (jnp.where(take, s0, s1), jnp.where(take, k0, k1))
-            out[j + g] = (jnp.where(take, s1, s0), jnp.where(take, k1, k0))
-        d //= 2
-    while d >= 1:
-        for j in range(m):
-            s, k = out[j]
-            ps, pk = _sublane_partner(s, d), _sublane_partner(k, d)
-            row = jax.lax.broadcasted_iota(jnp.int32, s.shape, 0)
-            take = _beats(s, k, ps, pk) == ((row & d) == 0)
-            out[j] = (jnp.where(take, s, ps), jnp.where(take, k, pk))
-        d //= 2
-    return out
-
-
-def _merge_network_kernel(c_ref, o_ref, *, topk: int, sub: int):
-    """`_merge_kernel_t` for per-rank lists that come sorted (score
-    descending, ties to the lower block; every candidate kernel picks in
-    that order): a tree of `_merge_sorted` over the ranks instead of
-    ``topk`` max-extractions over all ``dcp * topk`` candidates, ~3x fewer
-    vector ops at DCP 4, and no cross-sublane reduction."""
-    dcp, _, block_c = c_ref.shape
-
-    def body(i, carry):
-        cols = pl.ds(pl.multiple_of(i * sub, sub), sub)
-        lists = []
-        for r in range(dcp):
-            s = jax.lax.bitcast_convert_type(c_ref[r, :topk, cols], jnp.float32)
-            b = c_ref[r, topk:, cols]
-            lists.append([(s[j : j + 8], b[j : j + 8]) for j in range(0, topk, 8)])
-        while len(lists) > 1:
-            merged = [
-                _merge_sorted(lists[k], lists[k + 1])
-                for k in range(0, len(lists) - 1, 2)
-            ]
-            lists = merged + lists[len(lists) - len(lists) % 2 :]
-        s = jnp.concatenate([g[0] for g in lists[0]], axis=0)
-        b = jnp.concatenate([g[1] for g in lists[0]], axis=0)
-        o_ref[cols, :] = jnp.where(s > _NEG_INF, b, -1).T
-        return carry
-
-    jax.lax.fori_loop(0, block_c // sub, body, 0)
-
-
-def _network_merge(topk: int) -> bool:
-    """Whether `_merge_network_kernel` merges lists of `topk`: whole groups
-    of 8 slots, a power of two of them."""
-    groups = topk // 8
-    return topk % 8 == 0 and groups & (groups - 1) == 0
-
-
-# Merges of more than this many candidates per column (DCP 8: 128) run
-# `_merge_kernel_t`: `merge_candidates`' [n, n, columns] ranking costs ~3 ms
-# per layer in the c64 mixed step (32768 columns; j-c1444339). Narrower
-# merges keep the dense ranking, cheap at n = 32. A `_network_merge` topk
-# runs `_merge_network_kernel` at every DCP size (one merge at DCP 2).
+# Merges of more than this many candidates per token (DCP 8: 128) run
+# `_merge_kernel`: `merge_candidates`' [rows, n, n] ranking and the relayouts
+# of the [dcp, rows, 2 * topk] candidates into rows cost ~3 ms per layer in the
+# c64 mixed step (32768 rows; j-c1444339). Narrower merges (DCP 2, as c4/c16/c48
+# serve) keep the dense ranking, cheap at n = 32.
 _KERNEL_MERGE_MIN_CANDIDATES = 64
-# Columns per grid step, and per loop step inside it (as many as the
-# previous 256-token blocks of G heads held, with a head's live values).
-_MERGE_BLOCK_COLUMNS = 1024
-# DCP sizes the network merge serves (below the min, the dense ranking).
-_NETWORK_MERGE_MIN_DCP = 2
-_NETWORK_MERGE_MAX_DCP = 8
-_MERGE_SUB_COLUMNS = 256
+_MERGE_BLOCK_TOKENS = 256
 
 
 def merge_head_candidates(
-    candidates: jax.Array, topk: int, num_heads: int = 1, interpret: bool = False
+    candidates: jax.Array, topk: int, interpret: bool = False
 ) -> jax.Array:
-    """`merge_candidates` per KV head: every rank's `to_slots` candidates,
-    ``[dcp, 2 * topk, T * G]`` int32 -> selection ``[T, G, topk]``."""
-    dcp, _, num_cols = candidates.shape
-    network = _network_merge(topk) and dcp <= _NETWORK_MERGE_MAX_DCP
-    if dcp * topk < _KERNEL_MERGE_MIN_CANDIDATES and not (
-        network and dcp >= _NETWORK_MERGE_MIN_DCP
-    ):
-        s = jax.lax.bitcast_convert_type(candidates[:, :topk], jnp.float32)
-        b = candidates[:, topk:]
-        merged = _rank_merge(
-            s.reshape(dcp * topk, num_cols), b.reshape(dcp * topk, num_cols), topk
-        )
-        return merged.T.reshape(-1, num_heads, topk)
-    lanes = -(-num_cols // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS
-    # The network holds every rank's list live: 128 columns at a time.
-    sub = min(_TRANSPOSED_ROWS if network else _MERGE_SUB_COLUMNS, lanes)
-    block_c = min(_MERGE_BLOCK_COLUMNS, -(-lanes // sub) * sub)
-    pad = -num_cols % block_c
-    c = jnp.pad(candidates, ((0, 0), (0, 0), (0, pad)))
+    """`merge_candidates` per KV head: ``[dcp, T, G * 2 * topk]`` (each
+    rank's `pack_candidates` of its ``G`` heads, head-major) -> selection
+    ``[T, G, topk]``."""
+    dcp, num_tokens, width = candidates.shape
+    num_heads = width // (2 * topk)
+    if dcp * topk < _KERNEL_MERGE_MIN_CANDIDATES:
+        rows = candidates.reshape(dcp, num_tokens * num_heads, 2 * topk)
+        return merge_candidates(rows, topk).reshape(num_tokens, num_heads, topk)
+    block_t = min(_MERGE_BLOCK_TOKENS, -(-num_tokens // 8) * 8)
+    pad = -num_tokens % block_t
+    c = jnp.pad(candidates, ((0, 0), (0, pad), (0, 0)))
+    kernel = _merge_kernel_t if block_t % _TRANSPOSED_ROWS == 0 else _merge_kernel
     out = pl.pallas_call(
-        functools.partial(
-            _merge_network_kernel if network else _merge_kernel_t, topk=topk, sub=sub
-        ),
-        grid=((num_cols + pad) // block_c,),
-        in_specs=[pl.BlockSpec((dcp, 2 * topk, block_c), lambda i: (0, 0, i))],
-        out_specs=pl.BlockSpec((block_c, topk), lambda i: (i, 0)),
-        out_shape=jax.ShapeDtypeStruct((num_cols + pad, topk), jnp.int32),
+        functools.partial(kernel, topk=topk),
+        grid=((num_tokens + pad) // block_t,),
+        in_specs=[pl.BlockSpec((dcp, block_t, width), lambda i: (0, i, 0))],
+        out_specs=pl.BlockSpec((block_t, num_heads * topk), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((num_tokens + pad, num_heads * topk), jnp.int32),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         interpret=interpret,
         name="minimax_m3_msa_dcp_merge",
     )(c)
-    return out[:num_cols].reshape(-1, num_heads, topk)
-
-
-def _per_tile(tile_seq: jax.Array, table: jax.Array) -> jax.Array:
-    """``table[tile_seq]`` for a per-request table, by a one-hot over the
-    requests (a gather from a small table lowers to a compare chain)."""
-    onehot = tile_seq[:, None] == jnp.arange(table.shape[0], dtype=jnp.int32)
-    return jnp.sum(jnp.where(onehot, table[None, :], 0), axis=1)
+    return out[:num_tokens].reshape(num_tokens, num_heads, topk)
 
 
 def _class_candidates(
@@ -1025,6 +599,7 @@ def _class_candidates(
         scale_cache=scale_cache,
         scale_row=scale_row,
         interpret=interpret,
+        fp8_q=msa_indexer.fp8_queries_enabled(),
     )
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     max_num_seqs = q_lens.shape[0]
@@ -1036,7 +611,7 @@ def _class_candidates(
     ):
         # A column's query row sits at offset o of its request's folded rows,
         # token o mod q_len of it: position = len - q_len + o mod q_len.
-        per_tile = functools.partial(_per_tile, scored.tile_seq)
+        per_tile = functools.partial(msa_indexer.lookup, index=scored.tile_seq)
         row = scored.tile_row0[:, None] + jnp.arange(block_q, dtype=jnp.int32)[None, :]
         offset = row - per_tile(folded_cu[:-1])[:, None]
         q_len = jnp.maximum(per_tile(q_lens), 1)[:, None]
@@ -1072,421 +647,95 @@ def _class_candidates(
     )
 
 
-# Steps of at least this many tokens (prefill buckets) take
-# `_tile_candidates`: index heads folded token-major (a free reshape, no
-# `msa.fold_index_heads` scatter), and both tile classes' picks written
-# straight into the all-gather's slots by `_tile_select_kernel`. Decode steps keep `_class_candidates` /
-# the row path.
-TILE_SELECT_MIN_TOKENS = 1024
-
-
-# Set from `--additional-config '{"minimax_msa_tile_select": true}'` at layer
-# init (`attention.tile_select_enabled`); read at trace time. Off by default.
-TILE_SELECT_ENABLED = False
-
-
-def tile_select(num_tokens: int, num_heads: int = 1) -> bool:
-    """Whether a step of `num_tokens` tokens and `num_heads` KV heads per
-    rank picks its candidates with `_tile_candidates`."""
-    return (
-        TILE_SELECT_ENABLED
-        and num_tokens >= TILE_SELECT_MIN_TOKENS
-        and num_heads & (num_heads - 1) == 0
-    )
-
-
-_NO_ROW = jnp.iinfo(jnp.int32).max
-# The bit pattern of a -inf f32 score (a missing pick).
-_NEG_INF_BITS = -(1 << 23)
-
-
-def _select_chunk(num_pages: int) -> int:
-    """Pages per loop step of `_tile_select_kernel`: whole vregs (8 sublanes)
-    that divide the class's padded page count."""
-    for chunk in (64, 32, 16, 8):
-        if num_pages % chunk == 0:
-            return chunk
-    raise ValueError(f"padded pages {num_pages} are not a multiple of 8")
-
-
-def _place(out_ref, values, src0, dst, n):
-    """Copy lanes ``[src0, src0 + n)`` of ``values [rows, W]`` (``W`` a
-    multiple of 128, ``src0 + n <= W``) to columns ``[dst, dst + n)`` of the
-    VMEM ``out_ref [rows, cols]`` and leave every other column as it is.
-    Requests start at any column and a store's lane offset must be
-    128-aligned, so the values are rotated into the aligned window of ``W +
-    128`` columns that holds ``[dst, dst + n)`` and selected against its
-    current contents."""
-    rows, width = values.shape
-    window = width + 128
-    base = jnp.minimum(dst // 128 * 128, out_ref.shape[1] - window)
-    base = pl.multiple_of(base, 128)
-    off = dst - base
-    ext = jnp.concatenate([values, jnp.zeros((rows, 128), values.dtype)], axis=1)
-    moved = pltpu.roll(ext, (off - src0 + window) % window, 1)
-    lane = jax.lax.broadcasted_iota(jnp.int32, (rows, window), 1)
-    keep = (lane >= off) & (lane < off + n)
-    out_ref[:, pl.ds(base, window)] = jnp.where(
-        keep, moved, out_ref[:, pl.ds(base, window)]
-    )
-
-
-def _tile_rows(row0, block_q, seq_row0_ref, seq):
-    """The folded rows ``[lo, hi)`` of request `seq` in the tile of
-    `block_q` rows from `row0`: a tile may start below its request's first
-    row (`msa_indexer` aligns tile starts) and end past its last."""
-    lo = jnp.maximum(row0, seq_row0_ref[seq])
-    return lo, jnp.maximum(jnp.minimum(row0 + block_q, seq_row0_ref[seq + 1]), lo)
-
-
-def _tile_select_kernel(
-    # Scalar prefetch
-    tile_seq_ref,  # [tiles] request of each large tile
-    tile_row0_ref,  # [tiles] first (folded) query row of each large tile
-    small_seq_ref,  # [small tiles] request of each small tile
-    small_row0_ref,  # [small tiles] first folded query row of each small tile
-    seq_row0_ref,  # [max_num_seqs + 1] first folded query row of each request
-    first_pos_ref,  # [max_num_seqs] position of each request's first token
-    seq_pages_ref,  # [max_num_seqs] this rank's pages of each request
-    counts_ref,  # [3] rank, live large tiles, live small tiles
-    # In
-    scores_hbm,  # [P, tiles * Bq] transposed block scores of the large class
-    small_ref,  # [2 * topk, small columns] the small class's slots
-    # Out
-    out_ref,  # [2 * topk, columns] slots of every folded row (VMEM resident)
-    # Scratch
-    scores_ref,  # [2, P, Bq] two tiles' live pages
-    sems,  # DMA semaphores, one per buffer
-    masked_ref,  # [P, Bq]
+def _write_tokens(
+    k: jax.Array,
+    v: jax.Array,
+    index_k: jax.Array,
+    kv_cache: jax.Array,
+    index_cache: jax.Array,
+    scale_cache: jax.Array | None,
+    pages: jax.Array,
+    pos: jax.Array,
     *,
-    heads_shift,
-    block_size,
-    topk,
-    init_blocks,
-    local_blocks,
-    dcp,
-    chunk,
-    small_q,
-    small_width,
-):
-    """The step's slots ``[2 * topk, T * G]`` (`to_slots`; column = folded
-    row ``t * G + h``), written in place: at the first step every column is
-    set to none and the small class's picks (`local_candidates`, tile-major
-    columns) are moved to their rows' columns; each step then runs
-    `_candidates_kernel_t` for every query row (lane) of one large tile and
-    writes its rows' columns. Only the request's own pages on this rank are
-    scanned, `chunk` at a time; each pick keeps a per-sublane running max and
-    its first page, then reduces the 8 sublanes once. A tile's scores are
-    copied in for its live pages only (the class pads every tile to the
-    longest request's pages), the next tile's while this one picks; its
-    picks stay in vregs and are written once."""
-    tile = pl.program_id(0)
-    rank = counts_ref[0]
-    _, num_pages, block_q = scores_ref.shape
-    slot = tile % 2
-
-    def live_chunks(t):
-        pages = jnp.minimum(seq_pages_ref[tile_seq_ref[t]], num_pages)
-        return (pages + chunk - 1) // chunk
-
-    def copy_tile(t, buf, op):
-        def body(c, carry):
-            rows = pl.ds(pl.multiple_of(c * chunk, chunk), chunk)
-            copy = pltpu.make_async_copy(
-                scores_hbm.at[rows, pl.ds(pl.multiple_of(t * block_q, block_q), block_q)],
-                scores_ref.at[buf, rows],
-                sems.at[buf],
-            )
-            getattr(copy, op)()
-            return carry
-
-        jax.lax.fori_loop(0, live_chunks(t), body, 0)
-
-    @pl.when((tile == 0) & (counts_ref[1] > 0))
-    def _first():
-        copy_tile(0, 0, "start")
-
-    @pl.when(tile + 1 < counts_ref[1])
-    def _next():
-        copy_tile(tile + 1, 1 - slot, "start")
-
-    @pl.when(tile == 0)
-    def _init():
-        none = jnp.full((topk, out_ref.shape[1]), _NEG_INF_BITS, jnp.int32)
-        out_ref[:topk, :] = none
-        out_ref[topk:, :] = jnp.full_like(none, -1)
-
-        def place_small(t, carry):
-            row0, seq = small_row0_ref[t], small_seq_ref[t]
-            lo, hi = _tile_rows(row0, small_q, seq_row0_ref, seq)
-            src = t * small_q + lo - row0
-            group = pl.multiple_of(t * small_q // 128 * 128, 128)
-            values = small_ref[:, pl.ds(group, small_width)]
-            _place(out_ref, values, src - group, lo, hi - lo)
-            return carry
-
-        jax.lax.fori_loop(0, counts_ref[2], place_small, 0)
-
-    @pl.when(tile < counts_ref[1])
-    def _select():
-        seq = tile_seq_ref[tile]
-        row0 = tile_row0_ref[tile]
-        lane = jax.lax.broadcasted_iota(jnp.int32, (1, block_q), 1)
-        # Folded rows are token-major: row = token * heads + head.
-        tok = (row0 + lane - seq_row0_ref[seq]) >> heads_shift
-        num_visible = (first_pos_ref[seq] + tok) // block_size + 1
-        num_chunks = live_chunks(tile)
-        sub = jax.lax.broadcasted_iota(jnp.int32, (8, block_q), 0)
-        copy_tile(tile, slot, "wait")
-
-        def accumulate(best, s, base):
-            # Strict > over pages visited in increasing order keeps, per
-            # sublane slot, the lowest page among equal scores.
-            m, page = best
-            for k in range(chunk // 8):
-                v = s[k * 8 : (k + 1) * 8]
-                gt = v > m
-                m = jnp.where(gt, v, m)
-                page = jnp.where(gt, sub + (base + k * 8), page)
-            return m, page
-
-        def first_pass(c, best):
-            base = pl.multiple_of(c * chunk, chunk)
-            s = scores_ref[slot, pl.ds(base, chunk), :]
-            pages = jax.lax.broadcasted_iota(jnp.int32, (chunk, block_q), 0) + base
-            blocks = pages * dcp + rank
-            visible = blocks < num_visible
-            s = jnp.where(visible, s, _NEG_INF)
-            s = jnp.where(
-                visible & (blocks >= num_visible - local_blocks),
-                msa_select._FORCED_LOCAL_SCORE,
-                s,
-            )
-            s = jnp.where(
-                visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
-            )
-            masked_ref[pl.ds(base, chunk), :] = s
-            return accumulate(best, s, base)
-
-        def later_pass(picked):
-            def body(c, best):
-                base = pl.multiple_of(c * chunk, chunk)
-                s = masked_ref[pl.ds(base, chunk), :]
-                pages = jax.lax.broadcasted_iota(jnp.int32, (chunk, block_q), 0) + base
-                s = jnp.where(pages == picked, _NEG_INF, s)
-                masked_ref[pl.ds(base, chunk), :] = s
-                return accumulate(best, s, base)
-
-            return body
-
-        init = (
-            jnp.full((8, block_q), _NEG_INF, jnp.float32),
-            jnp.full((8, block_q), _NO_ROW, jnp.int32),
-        )
-        body = first_pass
-        # Pick i is sublane i % 8 of group i // 8.
-        groups = -(-topk // 8)
-        score_bits = [jnp.full((8, block_q), _NEG_INF_BITS, jnp.int32)] * groups
-        picked_blocks = [jnp.full((8, block_q), -1, jnp.int32)] * groups
-        for i in range(topk):
-            m, page = jax.lax.fori_loop(0, num_chunks, body, init)
-            best = jnp.max(m, axis=0, keepdims=True)
-            picked = jnp.min(jnp.where(m == best, page, _NO_ROW), axis=0, keepdims=True)
-            g, here = i // 8, sub == i % 8
-            score_bits[g] = jnp.where(
-                here, jax.lax.bitcast_convert_type(best, jnp.int32), score_bits[g]
-            )
-            picked_blocks[g] = jnp.where(
-                here, jnp.where(best > _NEG_INF, picked * dcp + rank, -1), picked_blocks[g]
-            )
-            body = later_pass(picked)
-        picks = jnp.concatenate(
-            [
-                jnp.concatenate(score_bits, axis=0)[:topk],
-                jnp.concatenate(picked_blocks, axis=0)[:topk],
-            ],
-            axis=0,
-        )
-        lo, hi = _tile_rows(row0, block_q, seq_row0_ref, seq)
-        _place(out_ref, picks, lo - row0, lo, hi - lo)
-
-
-def _tile_select(
-    large: "msa_indexer.ClassScores",
-    small: "msa_indexer.ClassScores",
-    small_slots: jax.Array,
-    seq_row0: jax.Array,
-    first_pos: jax.Array,
-    seq_pages: jax.Array,
-    rank: jax.Array,
-    *,
-    num_rows: int,
-    large_q: int,
-    small_q: int,
-    heads: int,
-    block_size: int,
-    topk: int,
-    init_blocks: int,
-    local_blocks: int,
-    dcp: int,
+    max_num_seqs: int,
     interpret: bool,
-) -> jax.Array:
-    """`_tile_select_kernel` over the live tiles of the large (transposed)
-    class ``large.scores [P, tiles * large_q]``: the slots ``[2 * topk,
-    num_rows]`` of every folded row, the small class's ``small_slots [2 *
-    topk, small columns]`` (column ``t * small_q + i``: row ``i`` of small
-    tile ``t``) moved into place."""
-    num_pages = large.scores.shape[0]
-    # Each small tile's columns sit in one aligned group of `small_width`.
-    small_width = -(-small_q // 128) * 128
-    if (128 % small_q) if small_q < 128 else (small_q % 128):
-        raise ValueError(f"small tiles of {small_q} rows do not tile 128 lanes")
-    # Lane-aligned and wide enough for one placement window.
-    cols = max(-(-num_rows // 128) * 128, large_q + 128)
-    small_slots = jnp.pad(small_slots, ((0, 0), (0, -small_slots.shape[1] % 128)))
-    kernel = functools.partial(
-        _tile_select_kernel,
-        heads_shift=heads.bit_length() - 1,
-        block_size=block_size,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
-        dcp=dcp,
-        chunk=_select_chunk(num_pages),
-        small_q=small_q,
-        small_width=small_width,
-    )
-    counts = jnp.stack([rank.reshape(()), large.num_tiles, small.num_tiles]).astype(
-        jnp.int32
-    )
-    out = pl.pallas_call(
-        kernel,
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=8,
-            # Live tiles only: the class pads to its worst-case tile count.
-            grid=(jnp.maximum(large.num_tiles, 1),),
-            in_specs=[
-                pl.BlockSpec(memory_space=pl.ANY),
-                pl.BlockSpec(small_slots.shape, lambda t, *_: (0, 0)),
-            ],
-            out_specs=pl.BlockSpec((2 * topk, cols), lambda t, *_: (0, 0)),
-            scratch_shapes=[
-                pltpu.VMEM((2, num_pages, large_q), jnp.float32),
-                pltpu.SemaphoreType.DMA((2,)),
-                pltpu.VMEM((num_pages, large_q), jnp.float32),
-            ],
-        ),
-        out_shape=jax.ShapeDtypeStruct((2 * topk, cols), jnp.int32),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=msa_select._VMEM_LIMIT_BYTES,
-        ),
+) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+    """Write a step's K/V rows and index keys at their owner `pages`
+    (4-bit caches with `scale_cache`): ``(kv_cache, index_cache,
+    scale_cache)``."""
+    if scale_cache is not None:
+        return msa.write_fp4(
+            kv_cache,
+            index_cache,
+            scale_cache,
+            k,
+            v,
+            index_k,
+            pages,
+            pos,
+            max_num_seqs=max_num_seqs,
+            interpret=interpret,
+        )
+    kv_rows = jnp.concatenate([k, v], axis=-1).reshape(k.shape[0], -1)
+    kv_cache, index_cache = msa.write_caches(
+        [msa_write.Rows(kv_cache, kv_rows), msa_write.Rows(index_cache, index_k)],
+        pages,
+        pos,
+        max_num_seqs=max_num_seqs,
         interpret=interpret,
-        name="minimax_m3_msa_tile_select",
-    )(
-        large.tile_seq,
-        jnp.clip(large.tile_row0, 0, None),
-        small.tile_seq,
-        jnp.clip(small.tile_row0, 0, None),
-        seq_row0,
-        first_pos,
-        seq_pages,
-        counts,
-        large.scores,
-        small_slots,
     )
-    return out if cols == num_rows else out[:, :num_rows]
+    return kv_cache, index_cache, None
 
 
-def _tile_candidates(
-    index_q: jax.Array,
+def msa_write_dcp(
+    k: jax.Array,
+    v: jax.Array,
+    index_k: jax.Array,
+    kv_cache: jax.Array,
     index_cache: jax.Array,
     seq_lens: jax.Array,
-    local_lens: jax.Array,
     block_tables: jax.Array,
     cu_q_lens: jax.Array,
-    num_seqs: jax.Array,
-    rank: jax.Array,
     *,
-    block_size: int,
-    topk: int,
-    init_blocks: int,
-    local_blocks: int,
+    rank: int | jax.Array,
     dcp: int,
-    interpret: bool,
-    scale_cache: jax.Array | None,
-    scale_row: int | None,
-) -> jax.Array:
-    """`to_slots` of `_class_candidates` of a prefill step, bit for bit on
-    every real token, with less glue: the ``G`` index heads fold token-major
-    (row ``t * G + h``, a reshape; `msa_indexer` scores any row order of a
-    request's rows alike), so folded row ``t * G + h`` is slot column ``t *
-    G + h``. The small class picks with `local_candidates`; one
-    `_tile_select_kernel` call picks the large class per tile and writes
-    both classes' picks straight into the ``[2 * topk, T * G]`` slots (no
-    packed buffer, transpose or column gather). Padding tokens get no
-    candidate."""
-    num_tokens, num_heads, head_dim = index_q.shape
-    num_rows = num_tokens * num_heads
-    folded_cu = num_heads * cu_q_lens
-    plan = msa_indexer.class_plan(
-        index_q.reshape(num_rows, 1, head_dim),
-        index_cache,
-        local_lens,
-        block_tables,
-        folded_cu,
-        num_seqs,
-        **msa.block_score_options(num_heads),
-        scale_cache=scale_cache,
-        scale_row=scale_row,
-        interpret=interpret,
-    )
-    heads_shift = num_heads.bit_length() - 1
-    first_pos = seq_lens - (cu_q_lens[1:] - cu_q_lens[:-1])
-    seq_row0 = folded_cu[:-1]
-    # Small class (decode rows of the step): `local_candidates` in the layout
-    # it scored in, as `_class_candidates`.
-    small, block_q = plan.small(), plan.small_block_q
-    per_tile = functools.partial(_per_tile, small.tile_seq)
-    row = small.tile_row0[:, None] + jnp.arange(block_q, dtype=jnp.int32)[None, :]
-    col_pos = per_tile(first_pos)[:, None] + (
-        (row - per_tile(seq_row0)[:, None]) >> heads_shift
-    )
-    s, b = local_candidates(
-        small.scores[:, None, :] if plan.token_major else small.scores,
-        col_pos.reshape(-1),
+    scale_cache: jax.Array | None = None,
+    interpret: bool = False,
+) -> tuple[jax.Array, ...]:
+    """The writes of `msa_write_and_candidates_dcp` alone, the same cache
+    bytes, for a Shared layer of MSA index reuse (`index_reuse`: it attends
+    over a Full layer's selection, so it scores nothing). Returns
+    ``(kv_cache, index_cache[, scale_cache])``."""
+    num_tokens = k.shape[0]
+    rank = rank_array(rank)[0]
+    block_size = msa.page_size(kv_cache)
+    max_num_seqs = seq_lens.shape[0]
+    block_tables_2d = block_tables.reshape(max_num_seqs, -1)
+    seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
+    pages = owner_pages(
+        block_tables_2d,
+        seq_id,
+        pos,
+        valid,
         block_size=block_size,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
         rank=rank,
         dcp=dcp,
-        live_rows=small.num_tiles * block_q,
+    )
+    kv_cache, index_cache, scale_cache = _write_tokens(
+        k,
+        v,
+        index_k,
+        kv_cache,
+        index_cache,
+        scale_cache,
+        pages,
+        pos,
+        max_num_seqs=max_num_seqs,
         interpret=interpret,
     )
-    small_slots = jnp.concatenate(
-        [jax.lax.bitcast_convert_type(s, jnp.int32).T, b.T], axis=0
-    )
-    page_size = msa_indexer._page_tokens(index_cache.shape[1], index_cache.dtype)
-    return _tile_select(
-        plan.large(),
-        small,
-        small_slots,
-        folded_cu,
-        first_pos,
-        -(-local_lens // page_size),
-        rank_array(rank),
-        num_rows=num_rows,
-        large_q=plan.large_block_q,
-        small_q=block_q,
-        heads=num_heads,
-        block_size=block_size,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
-        dcp=dcp,
-        interpret=interpret,
-    )
+    if scale_cache is None:
+        return kv_cache, index_cache
+    return kv_cache, index_cache, scale_cache
 
 
 def msa_write_and_candidates_dcp(
@@ -1520,7 +769,8 @@ def msa_write_and_candidates_dcp(
     [T, G, D]``, cache rows ``[K_0 | V_0 | ... | K_G-1 | V_G-1]``, and the
     single index-key head shared by all. ``block_tables`` are vLLM's logical
     DCP blocks of ``dcp * block_size`` tokens. Returns ``(kv_cache,
-    index_cache, candidates [2 * topk, T * G] int32)``: `to_slots`.
+    index_cache, candidates [T, G * 2 * topk] f32)``: `pack_candidates` per
+    head, head-major.
     """
     num_tokens, num_heads, _ = k.shape
     rank = rank_array(rank)[0]
@@ -1539,31 +789,20 @@ def msa_write_and_candidates_dcp(
     )
     fp4 = scale_cache is not None
     scale_row = msa_fp4.index_scale_row(num_heads) if fp4 else None
+    kv_cache, index_cache, scale_cache = _write_tokens(
+        k,
+        v,
+        index_k,
+        kv_cache,
+        index_cache,
+        scale_cache,
+        pages,
+        pos,
+        max_num_seqs=max_num_seqs,
+        interpret=interpret,
+    )
     if fp4:
-        kv_cache, index_cache, scale_cache = msa.write_fp4(
-            kv_cache,
-            index_cache,
-            scale_cache,
-            k,
-            v,
-            index_k,
-            pages,
-            pos,
-            max_num_seqs=max_num_seqs,
-            interpret=interpret,
-        )
         index_q = msa_fp4.rotate_queries(index_q)
-    else:
-        kv_cache, index_cache = msa.write_kv_and_index(
-            kv_cache,
-            index_cache,
-            jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1),
-            index_k,
-            pages,
-            pos,
-            max_num_seqs=max_num_seqs,
-            interpret=interpret,
-        )
     local_lens = local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp)
     candidates = functools.partial(
         local_candidates,
@@ -1573,33 +812,10 @@ def msa_write_and_candidates_dcp(
         local_blocks=local_blocks,
         rank=rank,
         dcp=dcp,
-        live_select=LIVE_SELECT_ENABLED,
         interpret=interpret,
     )
-    if tile_select(num_tokens, num_heads):
-        packed = _tile_candidates(
-            index_q,
-            index_cache,
-            seq_lens,
-            local_lens,
-            block_tables,
-            cu_q_lens,
-            distribution[2],
-            rank,
-            block_size=block_size,
-            topk=topk,
-            init_blocks=init_blocks,
-            local_blocks=local_blocks,
-            dcp=dcp,
-            interpret=interpret,
-            scale_cache=scale_cache,
-            scale_row=scale_row,
-        )
-        if fp4:
-            return kv_cache, index_cache, scale_cache, packed
-        return kv_cache, index_cache, packed
     if msa_indexer.is_prefill_step(num_heads * num_tokens, max_num_seqs):
-        packed = to_slots(_class_candidates(
+        packed = _class_candidates(
             index_q,
             index_cache,
             seq_lens,
@@ -1612,7 +828,7 @@ def msa_write_and_candidates_dcp(
             interpret=interpret,
             scale_cache=scale_cache,
             scale_row=scale_row,
-        ), topk)
+        )
         if fp4:
             return kv_cache, index_cache, scale_cache, packed
         return kv_cache, index_cache, packed
@@ -1645,10 +861,10 @@ def msa_write_and_candidates_dcp(
         ).reshape(num_heads * num_tokens, 1, -1)
     cand_scores, cand_blocks = candidates(scores, jnp.tile(pos, num_heads))
     packed = pack_candidates(cand_scores, cand_blocks)  # [G * T, 2 * topk]
-    packed = to_slots(packed.reshape(num_heads, num_tokens, -1).transpose(1, 0, 2), topk)
+    packed = packed.reshape(num_heads, num_tokens, -1).transpose(1, 0, 2)
     if fp4:
-        return kv_cache, index_cache, scale_cache, packed
-    return kv_cache, index_cache, packed
+        return kv_cache, index_cache, scale_cache, packed.reshape(num_tokens, -1)
+    return kv_cache, index_cache, packed.reshape(num_tokens, -1)
 
 
 def msa_attend_dcp(
@@ -1664,8 +880,10 @@ def msa_attend_dcp(
     rank: int | jax.Array,
     dcp: int,
     scale_cache: jax.Array | None = None,
+    q_head_major: bool = False,
     interpret: bool = False,
-) -> tuple[jax.Array, jax.Array]:
+    return_selected: bool = False,
+) -> tuple[jax.Array, ...]:
     """Second half of the DCP forward: attend over the selected blocks this
     rank holds.
 
@@ -1675,22 +893,107 @@ def msa_attend_dcp(
     their own merged heads, a 1 / DCP share of the group's each).
 
     ``q [T, G * Hg, D]`` holds every query head of the group's ``G`` KV heads
-    (KV head ``h`` owns query heads ``[h * Hg, (h + 1) * Hg)``);
-    ``candidates [dcp, 2 * topk, T * G]`` every rank's `to_slots`. Returns
+    (KV head ``h`` owns query heads ``[h * Hg, (h + 1) * Hg)``), or ``[G * Hg,
+    T, D]`` with `q_head_major`; ``candidates [dcp, T, G * 2 * topk]`` every
+    rank's candidates. Returns
     the partial head-major, as the kernel writes it, ``(out [G * Hg, T, D],
     lse [G * Hg, T] f32)``: the LSE merge reduce-scatters heads along the
-    leading axis (`ops.msa.merge_head_partials`).
+    leading axis (`ops.msa.merge_head_partials`), or the merge's all-to-all
+    sends each rank its block (`attend_and_merge`). With `return_selected`
+    the merged selection ``[T, G, topk]`` int32 follows (MSA index reuse,
+    `index_reuse`).
     """
-    num_tokens = q.shape[0]
+    num_tokens = q.shape[1 if q_head_major else 0]
     rank = rank_array(rank)[0]
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
     pages_per_seq = block_tables_2d.shape[1]
     seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
-    selected = merge_head_candidates(
-        candidates, topk, candidates.shape[2] // num_tokens, interpret
-    )  # [T, G, topk]
+    selected = merge_head_candidates(candidates, topk, interpret)  # [T, G, topk]
+    out = _attend_selected(
+        q,
+        kv_cache,
+        selected,
+        block_tables,
+        (seq_id, pos, valid),
+        num_tokens=num_tokens,
+        rank=rank,
+        block_size=block_size,
+        pages_per_seq=pages_per_seq,
+        dcp=dcp,
+        sm_scale=sm_scale,
+        scale_cache=scale_cache,
+        q_head_major=q_head_major,
+        interpret=interpret,
+    )
+    if return_selected:
+        return (*out, selected)
+    return out
+
+
+def msa_attend_selected_dcp(
+    q: jax.Array,
+    kv_cache: jax.Array,
+    selected: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    *,
+    sm_scale: float,
+    rank: int | jax.Array,
+    dcp: int,
+    scale_cache: jax.Array | None = None,
+    q_head_major: bool = False,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """`msa_attend_dcp` after the candidate merge: attend over the merged
+    ``selected [T, G, topk]`` int32 (the same on every rank of the group; MSA
+    index reuse hands a Full layer's to the Shared layers after it)."""
+    num_tokens = q.shape[1 if q_head_major else 0]
+    rank = rank_array(rank)[0]
+    block_size = msa.page_size(kv_cache)
+    max_num_seqs = seq_lens.shape[0]
+    block_tables_2d = block_tables.reshape(max_num_seqs, -1)
+    pages_per_seq = block_tables_2d.shape[1]
+    seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
+    return _attend_selected(
+        q,
+        kv_cache,
+        selected,
+        block_tables,
+        (seq_id, pos, valid),
+        num_tokens=num_tokens,
+        rank=rank,
+        block_size=block_size,
+        pages_per_seq=pages_per_seq,
+        dcp=dcp,
+        sm_scale=sm_scale,
+        scale_cache=scale_cache,
+        q_head_major=q_head_major,
+        interpret=interpret,
+    )
+
+
+def _attend_selected(
+    q: jax.Array,
+    kv_cache: jax.Array,
+    selected: jax.Array,
+    block_tables: jax.Array,
+    tokens: tuple[jax.Array, jax.Array, jax.Array],
+    *,
+    num_tokens: int,
+    rank: jax.Array,
+    block_size: int,
+    pages_per_seq: int,
+    dcp: int,
+    sm_scale: float,
+    scale_cache: jax.Array | None,
+    q_head_major: bool,
+    interpret: bool,
+) -> tuple[jax.Array, jax.Array]:
+    """The attention of `msa_attend_dcp` over a merged selection."""
+    seq_id, pos, valid = tokens
     num_heads = selected.shape[1]
     own_block = pos // block_size
     local_key = jnp.where(
@@ -1702,27 +1005,80 @@ def msa_attend_dcp(
     # this rank holds, as `msa.sparse_attention`; [T, G, topk].
     mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
     keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
+    small = num_tokens <= DCP_SMALL_BATCH_TOKENS
+    if small:
+        block_q = msa_attention.SMALL_BATCH_BLOCK_Q
+        pages_per_step = (
+            _SMALL_BATCH_PAGES_PER_STEP
+            if num_tokens >= _WIDE_GROUP_MIN_TOKENS
+            else msa_attention.DEFAULT_PAGES_PER_STEP
+        )
+    elif scale_cache is not None:
+        block_q = msa_attention.PREFILL_BLOCK_Q_4BIT
+        pages_per_step = msa_attention.PREFILL_PAGES_PER_STEP_4BIT
+    else:
+        block_q = msa_attention.PREFILL_BLOCK_Q
+        pages_per_step = msa_attention.PREFILL_PAGES_PER_STEP
     common = dict(
         sm_scale=sm_scale,
-        block_q=(
-            msa_attention.SMALL_BATCH_BLOCK_Q
-            if num_tokens <= DCP_SMALL_BATCH_TOKENS
-            else msa_attention.DEFAULT_BLOCK_Q
-        ),
-        pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+        block_q=block_q,
+        pages_per_step=pages_per_step,
+        q_head_major=q_head_major,
         interpret=interpret,
     )
-    lse_kernel = msa_attention_lse
-    if msa_attention_lse.R6_KERNEL:
-        # r6's kernel (key minimax_msa_lse_r6) takes its opt-in prefill knobs
-        # on prefill-sized steps only; none is passed while they are unset.
-        lse_kernel = msa_attention_lse_r6
-        if num_tokens >= _MIN_CANDIDATE_TOKENS:
-            common.update(msa_attention_lse_r6.prefill_options(scale_cache is not None))
+    if num_tokens >= _MIN_CANDIDATE_TOKENS:  # prefill-sized steps only
+        common["step_widths"] = msa_attention_lse.PREFILL_STEP_WIDTHS
+        common["row_split"] = msa_attention_lse.PREFILL_ROW_SPLIT
+        if msa_attention_lse.PREFILL_BLOCK_Q:
+            common["block_q"] = msa_attention_lse.PREFILL_BLOCK_Q
+        if msa_attention_lse.PREFILL_PAGES_PER_STEP:
+            common["pages_per_step"] = msa_attention_lse.PREFILL_PAGES_PER_STEP
+        if scale_cache is not None:
+            common["page_cache_slots"] = msa_attention_lse.PREFILL_PAGE_CACHE_SLOTS
+            common["page_cache_bf16"] = msa_attention_lse.PREFILL_PAGE_CACHE_BF16
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
+    adaptive = (
+        msa_attention_lse.adaptive_prefill()
+        if scale_cache is not None
+        and num_tokens >= _MIN_CANDIDATE_TOKENS
+        and common.get("page_cache_slots")
+        else None
+    )
+    if adaptive is not None:
+        # Two kernel configurations in the program; each call runs one, by
+        # how wide its selections are (the other's outputs are not computed).
+        threshold, wide_block_q, wide_tile_pages = adaptive
+        msa_attention_lse._proof(
+            msa_attention_lse.ADAPTIVE_ENV,
+            f"MSA prefill tiles per call: > {threshold} pages per "
+            f"{common['block_q']}-token tile -> block_q {wide_block_q}, "
+            f"tile pages {wide_tile_pages}",
+        )
+        wide = dict(common, block_q=wide_block_q, page_cache_tile_pages=wide_tile_pages)
+
+        def attend(kw):
+            def run(operands):
+                q_, kv_, keys_, sc_, *args_ = operands
+                if num_heads == 1:
+                    return msa_attention_lse.msa_sparse_attention_lse(
+                        q_, kv_, keys_[:, 0], *args_, head=0, head_major=True,
+                        **kw, **msa._fp4_attention_kwargs(sc_),
+                    )
+                return msa_attention_lse.msa_sparse_attention_lse_heads(
+                    q_, kv_, keys_, *args_, head_major=True, **kw, scale_cache=sc_
+                )
+
+            return run
+
+        return jax.lax.cond(
+            msa_attention_lse.wide_selection(keys, common["block_q"], threshold),
+            attend(wide),
+            attend(common),
+            (q, kv_cache, keys, scale_cache, *args),
+        )
     if scale_cache is not None:
         if num_heads == 1:
-            return lse_kernel.msa_sparse_attention_lse(
+            return msa_attention_lse.msa_sparse_attention_lse(
                 q,
                 kv_cache,
                 keys[:, 0],
@@ -1733,14 +1089,280 @@ def msa_attend_dcp(
                 **msa._fp4_attention_kwargs(scale_cache),
             )
         # KV head h's K / V scales are scale-page rows 2h / 2h + 1.
-        return lse_kernel.msa_sparse_attention_lse_heads(
+        return msa_attention_lse.msa_sparse_attention_lse_heads(
             q, kv_cache, keys, *args, head_major=True, **common, scale_cache=scale_cache
         )
     if num_heads == 1:
-        return lse_kernel.msa_sparse_attention_lse(
+        return msa_attention_lse.msa_sparse_attention_lse(
             q, kv_cache, keys[:, 0], *args, head=0, head_major=True, **common
         )
     # One kernel for all the group's KV heads (the head is a kernel input).
-    return lse_kernel.msa_sparse_attention_lse_heads(
+    return msa_attention_lse.msa_sparse_attention_lse_heads(
         q, kv_cache, keys, *args, head_major=True, **common
     )
+
+
+_PARTIALS_BLOCK_TOKENS = 256
+
+
+def _merge_partials_kernel(lse_ref, parts_ref, *rest, rotated):
+    """One token block of `merge_partials`: ``lse_ref [dcp, Bt, Hl]``,
+    ``parts_ref [dcp, Hl, Bt, D]``, (``hadamard [D, D]``), ``o_ref [Bt,
+    Hl * D]``."""
+    o_ref = rest[-1]
+    dcp, num_heads, _, head_dim = parts_ref.shape
+    lse = lse_ref[...]
+    # torch.logsumexp over the ranks; a token no rank attended (every lse
+    # -inf) gets NaN weights, which the where below turns into zeros.
+    peak = jnp.max(lse, axis=0)
+    peak = jnp.where(jnp.isinf(peak), 0.0, peak)
+    total = peak + jnp.log(jnp.sum(jnp.exp(lse - peak[None]), axis=0))
+    weight = jnp.exp(lse - total[None])
+    weight = jnp.where(weight > 0, weight, 0.0)  # NaN (no rank attended) -> 0
+    for h in range(num_heads):
+        merged = None
+        for r in range(dcp):
+            w = jnp.broadcast_to(weight[r, :, h : h + 1], parts_ref.shape[2:])
+            # A plain product: a rank that attended nothing for a token has
+            # a zero partial (`msa_sparse_attention_lse`), never NaN, so no
+            # select guards it (a compare and a select per element, ~20% of
+            # the kernel's bundles).
+            term = parts_ref[r, h].astype(jnp.float32) * w
+            merged = term if merged is None else merged + term
+        merged = merged.astype(o_ref.dtype)
+        if rotated:
+            merged = jnp.dot(merged, rest[0][...], preferred_element_type=jnp.float32)
+            merged = (merged * (1.0 / head_dim)).astype(o_ref.dtype)
+        o_ref[:, h * head_dim : (h + 1) * head_dim] = merged
+
+
+@functools.partial(jax.jit, static_argnames=("block_tokens", "interpret"))
+def merge_partials(
+    parts: jax.Array,
+    lse: jax.Array,
+    hadamard: jax.Array | None = None,
+    *,
+    block_tokens: int = _PARTIALS_BLOCK_TOKENS,
+    interpret: bool = False,
+) -> jax.Array:
+    """The log-sum-exp merge of every DCP rank's partial attention output of
+    this rank's heads, token-major: ``parts [dcp, Hl, T, D]`` (rank ``r``'s
+    head-major partial), ``lse [dcp, T, Hl]`` f32 -> ``[T, Hl * D]``.
+
+    Weights and sum in f32, rounded once; a rank's partial of a token it
+    attended nothing for must be zero (as `msa_sparse_attention_lse` writes
+    it), not NaN. A 4-bit cache's partials (in the rotated basis) are
+    unrotated by its bf16 `hadamard` (``x @ H / D``, as
+    `ops.msa._rotate_heads`). One pass that writes the layout the output
+    projection reads: the reduce-scatter merge weighted the whole ``[dcp *
+    Hl, T, D]`` partial and XLA relaid it out for the token-major output
+    (~43 + 24 us per layer at 8K tokens, c4 twin j-db4e365d)."""
+    dcp, num_heads, num_tokens, head_dim = parts.shape
+    block_t = max(1, min(num_tokens, block_tokens))
+    rotated = hadamard is not None
+    return pl.pallas_call(
+        functools.partial(_merge_partials_kernel, rotated=rotated),
+        grid=(pl.cdiv(num_tokens, block_t),),
+        in_specs=[
+            pl.BlockSpec((dcp, block_t, num_heads), lambda i: (0, i, 0)),
+            pl.BlockSpec((dcp, num_heads, block_t, head_dim), lambda i: (0, 0, i, 0)),
+            *(
+                [pl.BlockSpec((head_dim, head_dim), lambda i: (0, 0))]
+                if rotated
+                else []
+            ),
+        ],
+        out_specs=pl.BlockSpec((block_t, num_heads * head_dim), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, num_heads * head_dim), parts.dtype),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_merge_partials",
+    )(lse.astype(jnp.float32), parts, *([hadamard] if rotated else []))
+
+
+def gather_by_permute(x: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Array:
+    """Every rank's `x` in rank order, ``[dcp, *x.shape]``, by ``dcp - 1``
+    collective permutes (rank ``r`` gets rank ``r + s``'s `x` from shift
+    ``s``). For decode-sized operands of a DCP pair (two cores of one
+    chip): each XLA all-gather there blocks the TensorCore for its latency
+    (3.2 us per layer at c4 b3, j-c71e5160). Across chips (DCP 8) the
+    permutes' starts cost more than the all-gather (c64 twin j-f92f5540)."""
+    out = jnp.zeros((dcp, *x.shape), x.dtype)
+    out = jax.lax.dynamic_update_index_in_dim(out, x, rank, 0)
+    for shift in range(1, dcp):
+        perm = [(src, (src - shift) % dcp) for src in range(dcp)]
+        received = jax.lax.ppermute(x, axis, perm)
+        out = jax.lax.dynamic_update_index_in_dim(
+            out, received, (rank + shift) % dcp, 0
+        )
+    return out
+
+
+def all_to_all_by_permute(
+    x: jax.Array, rank: jax.Array, axis: str, dcp: int
+) -> jax.Array:
+    """`jax.lax.all_to_all` of ``x [dcp, ...]`` along its leading axis (block
+    ``d`` goes to rank ``d``; block ``s`` of the result came from rank
+    ``s``), by `gather_by_permute`'s permutes. For decode-sized blocks: each
+    XLA all-to-all costs its latency on the TensorCore (~1.3 us per layer at
+    c4 decode, j-c71e5160)."""
+    out = jnp.zeros_like(x)
+    own = jax.lax.dynamic_index_in_dim(x, rank, 0, False)
+    out = jax.lax.dynamic_update_index_in_dim(out, own, rank, 0)
+    for shift in range(1, dcp):
+        perm = [(src, (src - shift) % dcp) for src in range(dcp)]
+        send = jax.lax.dynamic_index_in_dim(x, (rank - shift) % dcp, 0, False)
+        received = jax.lax.ppermute(send, axis, perm)
+        out = jax.lax.dynamic_update_index_in_dim(
+            out, received, (rank + shift) % dcp, 0
+        )
+    return out
+
+
+def _exchange_partials(
+    parts: jax.Array, lses: jax.Array, rank: jax.Array, axis: str, dcp: int
+) -> tuple[jax.Array, jax.Array]:
+    """`all_to_all_by_permute` of ``parts [dcp, Hl, T, D]`` and ``lses [dcp,
+    T, Hl]`` f32 in one set of permutes: the LSEs' bits ride as one more uint16
+    head row (a permute copies bytes; every permute start costs ~1 us on the
+    TensorCore at decode, c4 twin j-6bbe97e2)."""
+    num_ranks, num_heads, num_tokens, head_dim = parts.shape
+    if parts.dtype.itemsize != 2 or 2 * num_heads > head_dim:
+        raise ValueError(
+            f"16-bit partials with 2 * heads <= head_dim, got {parts.dtype} "
+            f"{parts.shape}"
+        )
+    # As 16-bit integers: float copies may canonicalize NaN or flush
+    # subnormal bit patterns (the LSE halves are arbitrary bits).
+    words = jax.lax.bitcast_convert_type(parts, jnp.uint16)
+    bits = jax.lax.bitcast_convert_type(lses, jnp.uint16)  # [dcp, T, Hl, 2]
+    bits = bits.reshape(num_ranks, 1, num_tokens, 2 * num_heads)
+    bits = jnp.pad(bits, ((0, 0), (0, 0), (0, 0), (0, head_dim - 2 * num_heads)))
+    both = all_to_all_by_permute(
+        jnp.concatenate([words, bits], axis=1), rank, axis, dcp
+    )
+    bits = both[:, num_heads, :, : 2 * num_heads].reshape(
+        num_ranks, num_tokens, num_heads, 2
+    )
+    return (
+        jax.lax.bitcast_convert_type(both[:, :num_heads], parts.dtype),
+        jax.lax.bitcast_convert_type(bits, lses.dtype),
+    )
+
+
+def _gather_heads(q: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Array:
+    """The group's head-major query heads ``[dcp * Hl, T, D]`` from this
+    rank's ``q [Hl, T, D]``. A pair swaps its halves by one collective
+    permute: XLA's all-gather of the 16 MB c4 / c16 queries took 158 us per
+    layer in the twin (j-094494a7), a permute plus the concatenation ~51 us
+    on the same core pair in a standalone bench (j-a7bf7869; all-gather ~90)."""
+    if dcp != 2:
+        return jax.lax.all_gather(q, axis, axis=0, tiled=True)
+    other = jax.lax.ppermute(q, axis, [(0, 1), (1, 0)])
+    # [q, other, q] from row `rank * Hl` is the pair's heads in rank order.
+    both = jnp.concatenate([q, other, q])
+    return jax.lax.dynamic_slice_in_dim(both, rank * q.shape[0], 2 * q.shape[0])
+
+
+# `attend_and_merge`'s `selection` (MSA index reuse, `index_reuse`):
+# "candidates" takes the local candidates (the default program), "return"
+# also returns the merged selection (a Full layer), "given" takes a merged
+# selection instead of candidates (a Shared layer).
+SELECTIONS = ("candidates", "return", "given")
+
+
+def attend_and_merge(
+    rank: jax.Array,
+    q: jax.Array,
+    kv_cache: jax.Array,
+    candidates: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    scale_cache: jax.Array | None = None,
+    hadamard: jax.Array | None = None,
+    *,
+    axis: str,
+    dcp: int,
+    sm_scale: float,
+    topk: int,
+    interpret: bool = False,
+    selection: str = "candidates",
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """The attention half of the DCP forward over one KV head, inside a
+    ``shard_map`` over `axis` (the DCP group): this rank's head-major query
+    heads ``q [Hl, T, D]`` (rotated for a 4-bit cache, then pass its
+    `scale_cache` and `hadamard`) and packed ``candidates [T, 2 * topk]`` ->
+    its heads' merged output ``[T, Hl * D]``.
+
+    The query heads and candidates are all-gathered, `msa_attend_dcp` runs
+    over the group's heads, and each rank's head block of the partial and
+    its LSEs go to their owner by all-to-all for `merge_partials`. As XLA
+    collectives in one program they move the head-major buffers as laid out;
+    torch's all-to-all of them cost ~890 us per layer at 8K tokens (c4 twin,
+    j-c60806bf).
+
+    MSA index reuse (`index_reuse`, `SELECTIONS`): with ``selection``
+    "return" this rank's copy of the merged selection ``[T, 1, topk]`` int32
+    follows the output (a Full layer); with "given", ``candidates`` is that
+    merged selection (the same on every rank) and is attended as it is (a
+    Shared layer: no candidate gather, no merge)."""
+    if selection not in SELECTIONS:
+        raise ValueError(f"selection must be one of {SELECTIONS}, got {selection!r}")
+    num_heads, num_tokens, head_dim = q.shape
+    rank = rank_array(rank)[0]
+    q_all = _gather_heads(q, rank, axis, dcp)
+    # Decode-sized operands of a pair move by permutes (latency); a prefill
+    # step's partials by XLA's all-to-all, which writes them in place.
+    small = dcp == 2 and num_tokens <= DCP_SMALL_BATCH_TOKENS
+    selected = None
+    if selection == "given":
+        out, lse = msa_attend_selected_dcp(
+            q_all,
+            kv_cache,
+            candidates,
+            seq_lens,
+            block_tables,
+            cu_q_lens,
+            sm_scale=sm_scale,
+            rank=rank,
+            dcp=dcp,
+            scale_cache=scale_cache,
+            q_head_major=True,
+            interpret=interpret,
+        )
+    else:
+        if small:
+            cand_all = gather_by_permute(candidates, rank, axis, dcp)
+        else:
+            cand_all = jax.lax.all_gather(candidates, axis, axis=0)
+        out, lse, *rest = msa_attend_dcp(
+            q_all,
+            kv_cache,
+            cand_all,
+            seq_lens,
+            block_tables,
+            cu_q_lens,
+            sm_scale=sm_scale,
+            topk=topk,
+            rank=rank,
+            dcp=dcp,
+            scale_cache=scale_cache,
+            q_head_major=True,
+            interpret=interpret,
+            return_selected=selection == "return",
+        )
+        if rest:
+            (selected,) = rest
+    # Block r of each result came from rank r: its partial of this rank's heads.
+    parts = out.reshape(dcp, num_heads, num_tokens, head_dim)
+    lses = lse.reshape(dcp, num_heads, num_tokens).transpose(0, 2, 1)
+    if small:
+        parts, lses = _exchange_partials(parts, lses, rank, axis, dcp)
+    else:
+        parts = jax.lax.all_to_all(parts, axis, 0, 0, tiled=True)
+        lses = jax.lax.all_to_all(lses, axis, 0, 0, tiled=True)
+    merged = merge_partials(parts, lses, hadamard, interpret=interpret)
+    if selected is not None:
+        return merged, selected
+    return merged

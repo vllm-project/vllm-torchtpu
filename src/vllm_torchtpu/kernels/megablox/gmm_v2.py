@@ -15,6 +15,7 @@
 import dataclasses
 import functools
 import math
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, cast
@@ -26,9 +27,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import tight_vmem
-from vllm_torchtpu.logger import init_logger
 
-logger = init_logger(__name__)
 
 # Util.
 
@@ -109,6 +108,11 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
         return acc
 
     acc_gate, acc_up = deinterleave_lane(acc)
+    return gate_up_act(acc_gate, acc_up, fuse_act)
+
+
+def gate_up_act(acc_gate: jax.Array, acc_up: jax.Array, fuse_act: str) -> jax.Array:
+    """The fused activation of apply_act_fn on separate gate and up values."""
     match fuse_act:
         case "silu":
             return jax.nn.silu(acc_gate) * acc_up
@@ -160,68 +164,18 @@ FP8_RHS_MAX_BUCKET_M = 48
 # Decode tile_m on the fp8 rhs feed (replaces tile_m 64): on tpu7x, rows up to
 # it cost no more than one row.
 FP8_RHS_TILE_M = 32
-
-# Skinny-m path of calls with fp4 rhs and an unquantized lhs, both scaling
-# after the matmul: "fp8_feed" (default) feeds the MXU the rhs as fp8
-# (`fp8_rhs_feed_dtype`, buckets up to FP8_RHS_MAX_BUCKET_M rows, and
-# gmm_v2_mlp's fused kernel); "bf16_after" keeps the bf16 per-block path
-# (`SKINNY_DEQUANT_AFTER_MATMUL_M`, `HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS`).
-# "fp8_feed_wide" is "fp8_feed" that also keeps the fp8 tiles (tile_m
-# FP8_RHS_TILE_M) up to FP8_RHS_WIDE_MAX_M rows when VMEM stopped tile_m's
-# growth: from 128 decode rows (T=32) "fp8_feed" grows tile_m past
-# FP8_RHS_MAX_BUCKET_M and drops every bucket to bf16 dequantize-before.
-# Set with --additional-config '{"moe_skinny_gmm": "bf16_after"}'
-# (`set_skinny_gmm_path`), before the model's first trace.
-SKINNY_GMM_PATHS = ("fp8_feed", "bf16_after", "fp8_feed_wide")
-FP8_RHS_WIDE_MAX_M = 2048
-_skinny_gmm_path = "fp8_feed"
-
-
-# r6 (opt-in, `set_fp8_decode_tiles`): decode-sized buffers past
-# FP8_RHS_TILE_M rows per tile take tile_m FP8_DECODE_TILE_M in the buckets
-# FP8_DECODE_BUCKETS (fp8 feed up to FP8_RHS_MAX_BUCKET_M rows, one bf16
-# bucket for the rest), or fp8-sized tiles up to FP8_SMALL_DECODE_MAX_M rows,
-# ahead of the skinny paths above; kernel_mlp fuses such tiles. Set with
-# key moe_gmm_fp8_decode_tiles before the model's first trace.
+# Decode buffers past FP8_RHS_TILE_M hold few rows per local expert (EP leaves
+# each core ~1/EP of size_m), so tiles keep the fp8 feed for small groups and
+# one bf16 bucket for the rest: bf16 rows are free until the weight push stops
+# binding, so finer bf16 buckets would only grow the program.
 FP8_DECODE_TILE_M = 128
 FP8_DECODE_BUCKETS = (16, 32, 48, FP8_DECODE_TILE_M)
+# Largest routed buffer given decode tiles (e.g. 64 requests x 8 tokens x
+# top-4); prefill chunks above it keep the MXU-bound tiling.
 FP8_DECODE_MAX_M = 2048
+# Up to this size_m local groups stay within FP8_RHS_TILE_M rows, so the
+# small-m tiles (2 fp8 buckets, a third of the program) serve them.
 FP8_SMALL_DECODE_MAX_M = 512
-_fp8_decode_tiles = False
-
-
-def set_fp8_decode_tiles(enabled: bool) -> None:
-    global _fp8_decode_tiles
-    _fp8_decode_tiles = bool(enabled)
-
-
-def set_skinny_gmm_path(path: str) -> None:
-    global _skinny_gmm_path
-    if path not in SKINNY_GMM_PATHS:
-        raise ValueError(f"moe_skinny_gmm must be one of {SKINNY_GMM_PATHS}, got {path!r}")
-    _skinny_gmm_path = path
-
-
-def skinny_gmm_path() -> str:
-    return _skinny_gmm_path
-
-
-# Tiles measured for fp4 (block-128) MoE weights with bf16 activations on the
-# fp8_feed_wide path (`tuned_tiles`). Set with
-# --additional-config '{"moe_gmm_tuned_tiles": true}' (`set_tuned_tiles`),
-# before the model's first trace.
-TUNED_TILES_KEY = "moe_gmm_tuned_tiles"
-_tuned_tiles = False
-
-
-def set_tuned_tiles(enabled: bool) -> None:
-    global _tuned_tiles
-    _tuned_tiles = bool(enabled)
-
-
-def tuned_tiles_enabled() -> bool:
-    return _tuned_tiles
-
 
 # Define data classes.
 
@@ -302,19 +256,18 @@ class TileSizes:
     tile_k: int
     tile_n: int
     bucket_base: int
-    # Row counts a tile can end at, ascending, the last one tile_m. None means
-    # every multiple of bucket_base.
-    buckets: tuple[int, ...] | None = None
+    # Ascending row counts a tile's matmul is compiled for, ending at tile_m;
+    # empty means the multiples of bucket_base.
+    buckets: tuple[int, ...] = ()
     # Weight blocks the rhs pipeline keeps in flight.
     rhs_buffer_count: int = 3
 
     @property
     def bucket_sizes(self) -> tuple[int, ...]:
-        if self.buckets is not None:
+        if self.buckets:
             return self.buckets
-        return tuple(
-            range(self.bucket_base, self.tile_m + 1, self.bucket_base)
-        )
+        num = self.tile_m // self.bucket_base
+        return tuple(self.bucket_base * (i + 1) for i in range(num))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -327,26 +280,6 @@ class Dimensions:
     size_lhs_sublane: int
 
 
-# Unquantized-lhs calls of at most this many rows (decode) scale each
-# `quant_block_size`-deep matmul partial ([m, tn]) instead of dequantizing the
-# weight tile ([tk, tn]) before one deep matmul. Below the MXU column size
-# the before-matmul path keeps the MXU deep, which matters at large m; at
-# skinny m it spends the step on the VPU converting and scaling every weight
-# element (NVFP4 block 128 on tpu7x, gate_up + down per MoE layer: 124 -> 86
-# us at 32 rows / 4 active experts, 210 -> 171 at 64 / 8, 410 -> 343 at
-# 256 / 16).
-SKINNY_DEQUANT_AFTER_MATMUL_M = 256
-# Blocks shallower than this make the per-block matmuls too small.
-MIN_DEQUANT_AFTER_MATMUL_BLOCK = 128
-# Larger calls keep the before-matmul path for full tiles but scale the
-# partials of tiles ending at or below this many rows. An EP decode call is
-# sized for every route (c64: 1024-2048 rows) while each local expert gets a
-# few (~8-16), so its tiles are skinny although size_m is not. Converting
-# each weight element once per tile, the after path is cheaper while the
-# per-block [rows, tn] epilogue stays under the weight-scale multiply.
-HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS = 64
-
-
 @dataclasses.dataclass(frozen=True)
 class InputConfigs:
     quant_dtype: jnp.dtype | None
@@ -354,13 +287,6 @@ class InputConfigs:
     dtype: jnp.dtype
     has_bias: bool = False
     has_scale: bool = False
-    # Scale each block's matmul partial instead of the dequantized weights
-    # (see `SKINNY_DEQUANT_AFTER_MATMUL_M`).
-    dequantize_after_matmul: bool = False
-    # Dequantize before the matmul, except in tiles ending at or below this
-    # many rows, which scale the partials (see
-    # `HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS`). 0 disables.
-    hybrid_after_max_rows: int = 0
 
     @property
     def should_unpack(self) -> bool:
@@ -371,7 +297,7 @@ class InputConfigs:
     @property
     def should_dequantize_before_matmul(self) -> bool:
         """Dequantize rhs before matmul if block size limits MXU utilization."""
-        if not self.has_scale or self.dequantize_after_matmul:
+        if not self.has_scale:
             return False
         assert self.quant_block_size is not None
         mxu_size = pltpu.get_tpu_info().mxu_column_size
@@ -396,8 +322,6 @@ def fp8_rhs_feed_dtype(
     Feeding it to the MXU (scale applied after the matmul) halves the weight
     pushes of the bf16 dequantize-before-matmul path, which bind at skinny m.
     """
-    if _skinny_gmm_path not in ("fp8_feed", "fp8_feed_wide"):
-        return None
     fp8 = jnp.float8_e4m3fn.dtype
     rhs_q = rhs_cfgs.quant_dtype
     tpu_info = pltpu.get_tpu_info()
@@ -495,6 +419,19 @@ class IndexMaps:
         return (pl.ds(row_start, row_size), 0, n_id)
 
 
+def _scale_buffering(tile_m: int) -> pl.Buffered:
+    """Decode tiles queue the scale blocks ahead of the weight stream.
+
+    A decode step is DMA-bound, and a scale block refetched only one step ahead
+    left the weight stream idle at every grid step: tpu7x, NVFP4 experts with
+    per-128 scales, 10.4 -> 9.5 us per touched expert (9.0 us of pure weight
+    streaming). Prefill tiles are MXU-bound and stay double-buffered.
+    """
+    if tile_m <= FP8_DECODE_TILE_M:
+        return pl.Buffered(buffer_count=3, use_lookahead=True)
+    return pl.Buffered(buffer_count=2)
+
+
 def generate_block_specs(
     metadata_ref: MetadataRef, cfgs: GmmConfigs
 ) -> tuple[tuple[pl.BlockSpec, WeightsRef], pl.BlockSpec]:
@@ -523,6 +460,7 @@ def generate_block_specs(
         rhs_scale_block_spec = pl.BlockSpec(
             (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
             index_map.rhs_scale_index_map,
+            pipeline_mode=_scale_buffering(cfgs.tiles.tile_m),
         )
 
     rhs_block_spec = WeightsRef(
@@ -598,17 +536,13 @@ def inner_kernel(
         # contracting dimmensions
         rhs_tile_n = tiled_rhs.shape[1]
         rhs_qbs = cfgs.rhs_cfgs.quant_block_size
+        dequant_after = cfgs.rhs_cfgs.should_dequantize_after_matmul
         fp8_rhs = cfgs.fp8_rhs_dtype(bucket_m)
-        dequant_before = (
-            fp8_rhs is None
-            and cfgs.rhs_cfgs.should_dequantize_before_matmul
-            and not (bucket_m <= cfgs.rhs_cfgs.hybrid_after_max_rows)
-        )
-        dequant_after = cfgs.rhs_cfgs.has_scale and not dequant_before
         if fp8_rhs is not None:
             # Skinny m: the MXU weight push binds, and fp8 halves it.
             tiled_rhs = tiled_rhs.astype(fp8_rhs)
-        elif dequant_before:
+            dequant_after = True
+        elif cfgs.rhs_cfgs.should_dequantize_before_matmul:
             tiled_rhs_scale = tiled_rhs_ref.get_scale(replicate_size=rhs_qbs).astype(
                 cfgs.lhs_cfgs.dtype
             )
@@ -709,7 +643,7 @@ def inner_kernel(
                     block_acc *= block_scale.astype(acc_ref.dtype)
 
                     # Apply rhs subchannel scale per quant block.
-                    if dequant_after:
+                    if cfgs.rhs_cfgs.should_dequantize_after_matmul:
                         b_id = start_k // rhs_qbs
                         rhs_scale_replicated = tiled_rhs_ref.get_scale(
                             replicate_size=bucket_m
@@ -771,7 +705,10 @@ def inner_kernel(
         else:
             acc_ref[:acc_m] = acc
 
-    def run_matmul_step(bucket_m: int):
+    bucket_sizes = cfgs.tiles.bucket_sizes
+
+    def run_matmul_step(bucket_idx: int):
+        bucket_m = bucket_sizes[bucket_idx]
 
         @jax.named_scope(f"bm{bucket_m}_first_last")
         def matmul_first_last():
@@ -804,18 +741,17 @@ def inner_kernel(
             # partial m is only invoked at last matmul.
             lax.cond(is_first_k_step, matmul_first_last, matmul_last)
 
-    bucket_sizes = cfgs.tiles.bucket_sizes
-    if cfgs.tiles.buckets is None:
-        # Smallest bucket covering rows [0, m_end_local); m_end_local >= 1.
-        bucket_idx = (m_end_local - 1) // cfgs.tiles.bucket_base
-    else:
-        # First bucket holding rows [0, m_end_local).
+    branches = [
+        functools.partial(run_matmul_step, bucket_idx=i)
+        for i in range(len(bucket_sizes))
+    ]
+    # Smallest bucket covering rows [0, m_end_local); m_end_local >= 1.
+    if cfgs.tiles.buckets:
         bucket_idx = sum(
             (m_end_local > b).astype(jnp.int32) for b in bucket_sizes[:-1]
         )
-    branches = [
-        functools.partial(run_matmul_step, bucket_m=b) for b in bucket_sizes
-    ]
+    else:
+        bucket_idx = (m_end_local - 1) // cfgs.tiles.bucket_base
     lax.switch(bucket_idx, branches)
 
 
@@ -1257,7 +1193,7 @@ def gmm_vmem_estimate(
         lhs_quant_bits = jax.dtypes.itemsize_bits(cast(jnp.dtype, lhs_cfgs.quant_dtype))
         lhs_vmem += tm * tk * (lhs_quant_bits // 8)
 
-    # 2. RHS tile (triple-buffered, includes scale and bias if present)
+    # 2. RHS tile (weights rhs_buffer_count-deep, scales per _scale_buffering)
     # If fuse_act is enabled, we have both gate and up weights,
     # so RHS memory is doubled.
     rhs_weight_vmem = rhs_weight_block_bytes(tk, tn, rhs_cfgs)
@@ -1268,8 +1204,11 @@ def gmm_vmem_estimate(
     rhs_bias_vmem = 0
     if rhs_cfgs.has_bias:
         rhs_bias_vmem = tn * 4
+    scale_buffers = _scale_buffering(tm).buffer_count
     rhs_vmem = fuse_act_factor * (
-        rhs_buffer_count * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
+        rhs_buffer_count * rhs_weight_vmem
+        + scale_buffers * rhs_scale_vmem
+        + 2 * rhs_bias_vmem
     )
 
     # 3. Accumulator
@@ -1284,86 +1223,69 @@ def gmm_vmem_estimate(
     return lhs_vmem + rhs_vmem + acc_vmem + out_vmem
 
 
-# Opt-in tile overrides for fp4-rhs (NVFP4 W4A16) calls on one k tile, set
-# from --additional-config before the model's first trace
-# (`set_tile_overrides`; default "" each: tiles unchanged).
-#   gmm_v2_prefill_tiles="<tile_m>:<bucket>/.../<tile_m>[@<max size_m>]":
-#     calls above FP8_DECODE_MAX_M rows (prefill / mixed steps). Buckets of
-#     at most FP8_RHS_MAX_BUCKET_M rows take the fp8 rhs feed (as decode tiles
-#     do); larger ones dequantize before the matmul. "256:128/256" (or
-#     "256:128,256") keeps every bucket on the default numerics. An optional
+# Opt-in tile overrides for fp4-rhs (NVFP4 W4A16) calls on one k tile, read
+# once per process (default off: tiles unchanged).
+#   TPU_GMM_V2_PREFILL_TILES="<tile_m>:<bucket>,...,<tile_m>": calls above
+#     FP8_DECODE_MAX_M rows (prefill / mixed steps). Buckets of at most
+#     FP8_RHS_MAX_BUCKET_M rows take the fp8 rhs feed (as decode tiles do);
+#     larger ones dequantize before the matmul. "256:128,256" (or
+#     "256:128/256") keeps every bucket on the default numerics. An optional
 #     "@<max size_m>" suffix limits it to calls of at most that many rows.
-#   gmm_v2_decode_w13="<tile_n>:<gate_up buffers>[:<down buffers>]":
+#   TPU_GMM_V2_DECODE_W13="<tile_n>:<gate_up buffers>[:<down buffers>]":
 #     decode-sized buffers. Up to FP8_SMALL_DECODE_MAX_M rows the gate_up
 #     (fused activation) call takes tile_n and its rhs pipeline depth and the
 #     down call its own depth; above it, up to FP8_DECODE_MAX_M rows, only
 #     the gate_up depth applies (a wider tile_n stops kernel_mlp's fusion,
 #     which costs more there than it saves).
-PREFILL_TILES_KEY = "gmm_v2_prefill_tiles"
-DECODE_W13_KEY = "gmm_v2_decode_w13"
-_prefill_tiles: tuple[int, tuple[int, ...], int | None] | None = None
-_decode_w13: tuple[int, int, int] | None = None
-_tile_override_specs: dict[str, str] = {}
+_PREFILL_TILES_ENV = "TPU_GMM_V2_PREFILL_TILES"
+_DECODE_W13_ENV = "TPU_GMM_V2_DECODE_W13"
 
 
-def _parse_prefill_tiles(raw: str) -> tuple[int, tuple[int, ...], int | None] | None:
-    raw = raw.strip()
-    if not raw:
-        return None
-    spec, _, max_m = raw.partition("@")
-    tm, _, bks = spec.partition(":")
-    # "," or "/" between buckets.
-    buckets = tuple(
-        sorted({int(b) for b in bks.replace("/", ",").split(",") if b.strip()})
-    )
-    if not buckets or buckets[-1] != int(tm):
-        raise ValueError(f"{PREFILL_TILES_KEY}={raw!r}: buckets must end at tile_m")
-    return int(tm), buckets, int(max_m) if max_m else None
+@functools.cache
+def _tile_env() -> (
+    tuple[tuple[int, tuple[int, ...], int | None] | None, tuple[int, int, int] | None]
+):
+    prefill = decode_w13 = None
+    raw = os.environ.get(_PREFILL_TILES_ENV, "").strip()
+    if raw:
+        spec, _, max_m = raw.partition("@")
+        tm, _, bks = spec.partition(":")
+        # "," or "/" between buckets ("/" fits comma-separated env lists).
+        buckets = tuple(
+            sorted({int(b) for b in bks.replace("/", ",").split(",") if b.strip()})
+        )
+        if not buckets or buckets[-1] != int(tm):
+            raise ValueError(f"{_PREFILL_TILES_ENV}={raw!r}: buckets must end at tile_m")
+        prefill = (int(tm), buckets, int(max_m) if max_m else None)
+    raw = os.environ.get(_DECODE_W13_ENV, "").strip()
+    if raw:
+        parts = [int(x) for x in raw.split(":")]
+        decode_w13 = (parts[0], *(parts[1:] + [3, 3])[:2])
+    return prefill, decode_w13
 
 
-def _parse_decode_w13(raw: str) -> tuple[int, int, int] | None:
-    raw = raw.strip()
-    if not raw:
-        return None
-    parts = [int(x) for x in raw.split(":")]
-    return (parts[0], *(parts[1:] + [3, 3])[:2])
+_tile_env_logged: set[str] = set()
 
 
-def set_tile_overrides(prefill_tiles: str = "", decode_w13: str = "") -> None:
-    """Keys gmm_v2_prefill_tiles / gmm_v2_decode_w13 ("" = off)."""
-    global _prefill_tiles, _decode_w13
-    _prefill_tiles = _parse_prefill_tiles(prefill_tiles)
-    _decode_w13 = _parse_decode_w13(decode_w13)
-    _tile_override_specs.clear()
-    _tile_override_specs.update(
-        {PREFILL_TILES_KEY: prefill_tiles, DECODE_W13_KEY: decode_w13}
-    )
-    _tile_override_logged.clear()
-
-
-def tile_overrides_active() -> bool:
-    return _prefill_tiles is not None or _decode_w13 is not None
-
-
-_tile_override_logged: set[str] = set()
-
-
-def _log_tile_override_once(name: str, dims: Dimensions, tiles: TileSizes) -> None:
-    if name in _tile_override_logged:
+def _log_tile_env_once(name: str, dims: Dimensions, tiles: TileSizes) -> None:
+    if name in _tile_env_logged:
         return
-    _tile_override_logged.add(name)
-    logger.info(
+    _tile_env_logged.add(name)
+    args = (
         "gmm_v2 tile override %s=%s applied (size_m=%d k=%d n=%d): %s",
-        name,
-        _tile_override_specs.get(name),
-        dims.size_m,
-        dims.size_k,
-        dims.size_n,
-        tiles,
+        name, os.environ.get(name), dims.size_m, dims.size_k, dims.size_n, tiles,
     )
+    try:
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(*args)
+    except ImportError:  # kernel-only use without vllm
+        import logging
+
+        logging.getLogger(__name__).info(*args)
 
 
-def _apply_tile_overrides(
+def _apply_tile_env(
     tiles: TileSizes,
     dims: Dimensions,
     lhs_cfgs: InputConfigs,
@@ -1371,7 +1293,7 @@ def _apply_tile_overrides(
     vmem_limit_bytes: int,
     fuse_act: str | None,
 ) -> TileSizes:
-    prefill, decode_w13 = _prefill_tiles, _decode_w13
+    prefill, decode_w13 = _tile_env()
     if (prefill is None and decode_w13 is None) or (
         tiles.tile_k != align_to(dims.size_k, pltpu.get_tpu_info().num_lanes)
         or fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is None
@@ -1387,7 +1309,7 @@ def _apply_tile_overrides(
             new = dataclasses.replace(
                 tiles, tile_m=tile_m, bucket_base=buckets[0], buckets=buckets
             )
-            name = PREFILL_TILES_KEY
+            name = _PREFILL_TILES_ENV
     elif decode_w13 is not None and dims.size_m <= FP8_DECODE_MAX_M:
         tile_n, buffers_gate_up, buffers_down = decode_w13
         if dims.size_m > FP8_SMALL_DECODE_MAX_M:
@@ -1399,7 +1321,7 @@ def _apply_tile_overrides(
             new = dataclasses.replace(
                 tiles, tile_n=tile_n, rhs_buffer_count=buffers_gate_up
             )
-        name = DECODE_W13_KEY
+        name = _DECODE_W13_ENV
     if new is None:
         return tiles
     est = gmm_vmem_estimate(
@@ -1413,7 +1335,7 @@ def _apply_tile_overrides(
     )
     if est > vmem_limit_bytes:
         return tiles
-    _log_tile_override_once(name, dims, new)
+    _log_tile_env_once(name, dims, new)
     return new
 
 
@@ -1425,11 +1347,13 @@ def calculate_tiling(
     fuse_act: str | None = None,
 ) -> TileSizes:
     """Calculate optimal tile sizes for GMM kernel."""
-    tiles = _calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
-    if not tile_overrides_active():
-        return tiles
-    return _apply_tile_overrides(
-        tiles, dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act
+    return _apply_tile_env(
+        _calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act),
+        dims,
+        lhs_cfgs,
+        rhs_cfgs,
+        vmem_limit_bytes,
+        fuse_act,
     )
 
 
@@ -1517,17 +1441,6 @@ def _calculate_tiling(
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
     max_num_buckets = 4
-    if rhs_cfgs.dequantize_after_matmul:
-        # Skinny (decode) calls: an expert holds a few rows, so let a tile end
-        # at the next lhs sublane block instead of running all tile_m rows
-        # through the matmul and the per-block scale epilogue.
-        sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
-        bucket_base = max(sublane, tile_m // max_num_buckets)
-        if tile_m % bucket_base:
-            bucket_base = tile_m
-        return TileSizes(
-            tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=bucket_base
-        )
     bucket_base = tile_m
     for _ in range(1, max_num_buckets):
         new_tile_m = tile_m + bucket_base
@@ -1537,148 +1450,12 @@ def _calculate_tiling(
             break
         tile_m = new_tile_m
 
-    buckets = None
-    max_after = rhs_cfgs.hybrid_after_max_rows
-    if max_after:
-        # Skinny tiles (scaled after the matmul) end at the next lhs sublane
-        # block; the rest at multiples of bucket_base.
-        sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
-        max_after = min(max_after, tile_m)
-        small = range(sublane, max_after + 1, sublane)
-        large = range(bucket_base, tile_m + 1, bucket_base)
-        buckets = tuple(sorted({*small, *(b for b in large if b > max_after)}))
-        if buckets[-1] != tile_m:
-            buckets = None
-    if _fp8_decode_tiles and buckets is None:
-        decode_tiles = _fp8_decode_tile_sizes(
-            dims, lhs_cfgs, rhs_cfgs, tile_m, tile_k, tile_n, bucket_base, num_k_tiles
-        )
-        if decode_tiles is not None:
-            return decode_tiles
-    # A small-size_m tile_m that did not grow makes every group pay for tile_m
-    # rows, and rows cost MXU time on the fp8 rhs feed: use fp8-sized tiles in
-    # two buckets. Two such tiles cost what one bf16 tile does, and more
-    # buckets would bloat the program (each bucket is a copy of the body).
-    # "fp8_feed_wide" takes them up to FP8_RHS_WIDE_MAX_M rows whether or not
-    # tile_m grew: a grown tile_m (buckets of bucket_base 64) or one that VMEM
-    # held at 64 would otherwise drop every bucket above FP8_RHS_MAX_BUCKET_M
-    # to the bf16 dequantize-before-matmul path.
+    # Decode-sized buffer (the average group, size_m / size_group rows, fits
+    # one tile): keep small groups on the fp8 feed instead of a >= 64-row
+    # bf16 bucket. Partial buckets assume a single k tile (run_matmul_step),
+    # and 16-row buckets a sublane tiling of at most 16 rows.
     sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
-    if fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None and (
-        (
-            bucket_base == tile_m
-            and dims.size_m < 2 * tile_m  # growth stopped by size_m, not VMEM
-        )
-        or (
-            _skinny_gmm_path == "fp8_feed_wide"
-            and buckets is None
-            and dims.size_m <= FP8_RHS_WIDE_MAX_M
-        )
-    ):
-        if tile_m > FP8_RHS_MAX_BUCKET_M and tile_m % FP8_RHS_TILE_M == 0:
-            tile_m = bucket_base = FP8_RHS_TILE_M
-        # Partial buckets assume a single k tile (run_matmul_step).
-        if num_k_tiles == 1 and tile_m == 2 * sublane:
-            bucket_base = sublane
-
-    tiles = TileSizes(
-        tile_m=tile_m,
-        tile_k=tile_k,
-        tile_n=tile_n,
-        bucket_base=bucket_base,
-        buckets=buckets,
-    )
-    if _tuned_tiles:
-        tiles = tuned_tiles(
-            tiles, dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act
-        )
-    return tiles
-
-
-# From this many rows, a decode gate_up gmm moves an expert's whole gate_up
-# width per grid step (one 2-deep weight stream, out of the fused MLP kernel):
-# at the MoE decode shapes (H 6144, I 3072, 16 local experts) nearly every
-# expert is hit, and halving the grid steps beats the fused kernel's
-# prefetched down block.
-TUNED_FULL_N_MIN_M = 256
-# Grown prefill tiles end at multiples of this many rows: 64-row buckets add
-# two more dequantize-before-matmul bodies to the program and cost 11-27% at
-# 4096-32768 rows, while 128-row tiles of a 64-row group cost no more.
-TUNED_PREFILL_BUCKET_M = 128
-
-
-def tuned_tiles(
-    tiles: TileSizes,
-    dims: Dimensions,
-    lhs_cfgs: InputConfigs,
-    rhs_cfgs: InputConfigs,
-    vmem_limit_bytes: int,
-    fuse_act: str | None,
-) -> TileSizes:
-    """moe_gmm_tuned_tiles: retile fp4-rhs, bf16-lhs calls.
-
-    Only the pipeline depth, tile_n and the bucket sizes change. tile_k stays
-    whole and a row's MXU feed (fp8 at <= FP8_RHS_MAX_BUCKET_M rows, else bf16
-    dequantize-before) is unchanged, so every output element is computed the
-    same way.
-    """
     if (
-        _skinny_gmm_path != "fp8_feed_wide"  # the tiles were measured on it
-        or fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is None
-        or tiles.tile_k != dims.size_k
-    ):
-        return tiles
-    if tiles.tile_m <= FP8_RHS_MAX_BUCKET_M:
-        # Decode fp8 tiles: gate_up only (down's fused-MLP window is 2-deep).
-        if fuse_act is None:
-            return tiles
-        new = dataclasses.replace(tiles, rhs_buffer_count=2)
-        if dims.size_m >= TUNED_FULL_N_MIN_M:
-            num_lanes = pltpu.get_tpu_info().num_lanes
-            full = dataclasses.replace(
-                new, tile_n=align_to(dims.size_n // 2, num_lanes)
-            )
-            block = rhs_weight_block_bytes(full.tile_k, full.tile_n, rhs_cfgs)
-            vmem = (
-                gmm_vmem_estimate(
-                    full.tile_m,
-                    full.tile_n,
-                    full.tile_k,
-                    lhs_cfgs=lhs_cfgs,
-                    rhs_cfgs=rhs_cfgs,
-                    fuse_act=fuse_act,
-                )
-                - 2 * block  # 2 weight blocks in flight, not 3 (gate and up)
-            )
-            if vmem <= vmem_limit_bytes:
-                new = full
-    elif (
-        tiles.buckets is None
-        and tiles.bucket_base < TUNED_PREFILL_BUCKET_M
-        and tiles.tile_m % TUNED_PREFILL_BUCKET_M == 0
-    ):
-        new = dataclasses.replace(tiles, bucket_base=TUNED_PREFILL_BUCKET_M)
-    else:
-        return tiles
-    logger.info_once(
-        "moe_gmm_tuned_tiles: gmm_v2 retiled (first: size_m %d, %s -> %s)",
-        dims.size_m,
-        tiles,
-        new,
-    )
-    return new
-
-
-def _fp8_decode_tile_sizes(
-    dims, lhs_cfgs, rhs_cfgs, tile_m, tile_k, tile_n, bucket_base, num_k_tiles
-) -> TileSizes | None:
-    """r6's decode tiles (`set_fp8_decode_tiles`): a decode-sized buffer (the
-    average group, size_m / size_group rows, fits one tile) keeps small
-    groups on the fp8 feed instead of a >= 64-row bf16 bucket. Partial
-    buckets assume a single k tile (run_matmul_step), and 16-row buckets a
-    sublane tiling of at most 16 rows. None where they do not apply."""
-    sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
-    if not (
         tile_m > bucket_base
         and tile_m >= FP8_DECODE_TILE_M
         and dims.size_m <= FP8_DECODE_TILE_M * dims.size_group
@@ -1687,20 +1464,38 @@ def _fp8_decode_tile_sizes(
         and FP8_DECODE_BUCKETS[0] % sublane == 0
         and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None
     ):
-        return None
-    if dims.size_m <= FP8_SMALL_DECODE_MAX_M:
+        if dims.size_m <= FP8_SMALL_DECODE_MAX_M:
+            return TileSizes(
+                tile_m=FP8_RHS_TILE_M,
+                tile_k=tile_k,
+                tile_n=tile_n,
+                bucket_base=FP8_RHS_TILE_M // 2,
+            )
         return TileSizes(
-            tile_m=FP8_RHS_TILE_M,
+            tile_m=FP8_DECODE_TILE_M,
             tile_k=tile_k,
             tile_n=tile_n,
-            bucket_base=FP8_RHS_TILE_M // 2,
+            bucket_base=FP8_DECODE_BUCKETS[0],
+            buckets=FP8_DECODE_BUCKETS,
         )
+
+    # A small-size_m tile_m that did not grow makes every group pay for tile_m
+    # rows, and rows cost MXU time on the fp8 rhs feed: use fp8-sized tiles in
+    # two buckets. Two such tiles cost what one bf16 tile does, and more
+    # buckets would bloat the program (each bucket is a copy of the body).
+    if (
+        bucket_base == tile_m
+        and dims.size_m < 2 * tile_m  # growth stopped by size_m, not VMEM
+        and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None
+    ):
+        if tile_m > FP8_RHS_MAX_BUCKET_M and tile_m % FP8_RHS_TILE_M == 0:
+            tile_m = bucket_base = FP8_RHS_TILE_M
+        # Partial buckets assume a single k tile (run_matmul_step).
+        if num_k_tiles == 1 and tile_m == 2 * sublane:
+            bucket_base = sublane
+
     return TileSizes(
-        tile_m=FP8_DECODE_TILE_M,
-        tile_k=tile_k,
-        tile_n=tile_n,
-        bucket_base=FP8_DECODE_BUCKETS[0],
-        buckets=FP8_DECODE_BUCKETS,
+        tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=bucket_base
     )
 
 
@@ -1837,37 +1632,13 @@ def make_gmm_configs(
         has_scale = False
         block_size = dims.size_k
 
-    after_matmul_ok = (
-        has_scale
-        and not maybe_quantize_lhs
-        and block_size >= MIN_DEQUANT_AFTER_MATMUL_BLOCK
-    )
-    skinny = after_matmul_ok and dims.size_m <= SKINNY_DEQUANT_AFTER_MATMUL_M
     rhs_cfgs = InputConfigs(
         quant_dtype=rhs_quant_dtype,
         quant_block_size=block_size,
         dtype=rhs.dtype,
         has_bias=rhs_bias is not None,
         has_scale=has_scale,
-        dequantize_after_matmul=skinny,
-        hybrid_after_max_rows=(
-            HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS
-            if after_matmul_ok and not skinny
-            else 0
-        ),
     )
-
-    if (after_matmul_ok or skinny) and fp8_rhs_feed_dtype(
-        InputConfigs(quant_dtype=None, quant_block_size=512, dtype=lhs.dtype),
-        dataclasses.replace(
-            rhs_cfgs, dequantize_after_matmul=False, hybrid_after_max_rows=0
-        ),
-    ) is not None:
-        # The fp8 rhs feed (`skinny_gmm_path`) takes the skinny buckets the
-        # bf16 after-matmul paths would.
-        rhs_cfgs = dataclasses.replace(
-            rhs_cfgs, dequantize_after_matmul=False, hybrid_after_max_rows=0
-        )
 
     lhs_q_dtype = None
     if maybe_quantize_lhs and rhs_cfgs.should_dequantize_after_matmul:
@@ -2128,26 +1899,17 @@ _HAS_PIPELINE_PREFETCH = "prefetched_count" in {
 } and hasattr(pltpu, "emit_pipeline_with_allocations")
 
 
-def _mlp_tiles(cfgs: GmmConfigs) -> bool:
-    """Decode-sized tiles kernel_mlp fuses: fp8 rhs feed at tile_m, or (with
-    `set_fp8_decode_tiles`, r6) up to FP8_DECODE_TILE_M rows whose smallest
-    bucket takes the fp8 feed."""
+def _decode_tiles(cfgs: GmmConfigs) -> bool:
+    """Decode-sized tiles whose smallest bucket takes the fp8 rhs feed."""
     tiles = cfgs.tiles
-    if _fp8_decode_tiles:
-        return (
-            tiles.tile_m <= FP8_DECODE_TILE_M
-            and cfgs.fp8_rhs_dtype(tiles.bucket_sizes[0]) is not None
-        )
-    return cfgs.fp8_rhs_dtype(tiles.tile_m) is not None
+    return (
+        tiles.tile_m <= FP8_DECODE_TILE_M
+        and cfgs.fp8_rhs_dtype(tiles.bucket_sizes[0]) is not None
+    )
 
 
 def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) -> bool:
     """Whether kernel_mlp can run both gmms on one fill_metadata layout."""
-
-    # The rhs pipeline depth counts only under the opt-in tile overrides
-    # (`set_tile_overrides`); otherwise every pipeline is estimated 3-deep.
-    def depth(t):
-        return t.rhs_buffer_count if tile_overrides_active() else 3
 
     def vmem(cfgs):
         t = cfgs.tiles
@@ -2158,7 +1920,7 @@ def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) ->
             lhs_cfgs=cfgs.lhs_cfgs,
             rhs_cfgs=cfgs.rhs_cfgs,
             fuse_act=cfgs.fuse_act,
-            rhs_buffer_count=depth(t),
+            rhs_buffer_count=t.rhs_buffer_count,
         )
 
     # The prefetch window (2 down weight blocks) lives through both pipelines;
@@ -2176,16 +1938,16 @@ def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) ->
 
     fits = (
         vmem(cfgs1) + scratch(cfgs2) + window <= vmem_limit_bytes
-        and vmem(cfgs2) - depth(t2) * block2 + scratch(cfgs1) + window
+        and vmem(cfgs2) - t2.rhs_buffer_count * block2 + scratch(cfgs1) + window
         <= vmem_limit_bytes
     )
     return (
         fits
         and
-        # Decode-sized (fp8 rhs feed) tiles only: the fused program holds both
-        # gmms' bucket bodies, and large ones would bloat it.
-        _mlp_tiles(cfgs1)
-        and _mlp_tiles(cfgs2)
+        # Decode-sized tiles only: the fused program holds both gmms' bucket
+        # bodies, and large ones would bloat it.
+        _decode_tiles(cfgs1)
+        and _decode_tiles(cfgs2)
         and not cfgs1.zero_init
         and not cfgs2.zero_init
         and cfgs1.tiles.tile_m == cfgs2.tiles.tile_m
@@ -2201,7 +1963,40 @@ def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) ->
     )
 
 
-@jax.jit(static_argnames=["fuse_act", "preferred_element_type", "maybe_quantize_lhs"])
+_stream_logged: set[int] = set()
+
+
+def _decode_stream_spec() -> tuple[int, int, int] | None:
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.kernels.megablox import gmm_decode_stream
+
+    return gmm_decode_stream.parse_spec(envs.TPU_GMM_V2_DECODE_STREAM)
+
+
+def _log_stream_once(size_m: int, chunk: int, slots: int, max_m: int) -> None:
+    if size_m in _stream_logged:
+        return
+    _stream_logged.add(size_m)
+    args = (
+        "TPU_GMM_V2_DECODE_STREAM=%s on: gmm_v2_mlp size_m=%d runs the streamed "
+        "decode MLP kernel (chunk rows %d, slots %d, max size_m %d)",
+        os.environ.get("TPU_GMM_V2_DECODE_STREAM"), size_m, chunk, slots, max_m,
+    )
+    try:
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(*args)
+    except ImportError:  # kernel-only use without vllm
+        import logging
+
+        logging.getLogger(__name__).info(*args)
+
+
+@jax.jit(
+    static_argnames=[
+        "fuse_act", "preferred_element_type", "maybe_quantize_lhs", "max_group_size"
+    ]
+)
 def gmm_v2_mlp(
     lhs: jax.Array,  # [size_m, size_k]
     rhs1: jax.Array,  # [size_group, size_k, size_n1]
@@ -2214,12 +2009,16 @@ def gmm_v2_mlp(
     fuse_act: str | None = None,
     preferred_element_type: jnp.dtype | None = None,
     maybe_quantize_lhs: bool = True,
+    max_group_size: int | None = None,
 ) -> jax.Array:
     """gmm_v2(gmm_v2(lhs, rhs1, fuse_act), rhs2) for an MoE expert MLP.
 
     For decode-sized tiles the two run in one kernel (kernel_mlp), which loads
     the second gmm's first weight block under the first gmm's compute: as two
     calls, each exposes its first block's DMA. Otherwise it is two gmm_v2 calls.
+    With TPU_GMM_V2_DECODE_STREAM, decode-sized fp4 calls run
+    gmm_decode_stream instead. max_group_size bounds the rows of one group
+    (the token count of a top-k routing); None means size_m.
     """
 
     def two_calls():
@@ -2252,6 +2051,32 @@ def gmm_v2_mlp(
         group_offset = jnp.array([0], dtype=jnp.int32)
     elif jnp.isscalar(group_offset):
         group_offset = group_offset[None]
+    stream = _decode_stream_spec()
+    if stream is not None:
+        from vllm_torchtpu.kernels.megablox import gmm_decode_stream
+
+        chunk, slots, max_m = stream
+        if (
+            gmm_decode_stream.eligible(
+                lhs, rhs1, rhs2, rhs1_scale, rhs2_scale, fuse_act, chunk, max_m
+            )
+            is None
+        ):
+            _log_stream_once(padded_size_m, chunk, slots, max_m)
+            return gmm_decode_stream.gmm_decode_stream_mlp(
+                lhs,
+                rhs1,
+                rhs2,
+                group_sizes,
+                rhs1_scale,
+                rhs2_scale,
+                group_offset,
+                fuse_act=fuse_act,
+                out_dtype=preferred_element_type,
+                chunk_rows=chunk,
+                slots=slots,
+                max_group_size=max_group_size,
+            )[:size_m]
     vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
 
     common = dict(

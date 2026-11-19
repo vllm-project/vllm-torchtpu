@@ -34,10 +34,14 @@ normalizes in one pass instead of merging bf16 partials.
 """
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_attention,
@@ -51,6 +55,111 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 # max_model_len 256K), which a step's query gather and merge exceed from
 # about 2K tokens (~0.16 us per token at c64 DCP 8, j-0a66fa2e).
 HEAD_PARALLEL_MIN_TOKENS = 2048
+# Tiles and pages per kernel step of the head-parallel calls (8 query heads
+# each, every rank's pages): wide groups amortize the kernel's per-step cost
+# (`msa_attention.PREFILL_BLOCK_Q_4BIT`). Standalone 8192-token call, 8 query
+# heads over all pages: 3.91 -> 2.49 ms at served-c48-like dispersion, 2.40 ->
+# 1.90 ms at lower (16-token tiles of 16 pages before; j-f7057d29).
+_BLOCK_Q = 8
+_PAGES_PER_STEP = 64
+
+# TPU_MINIMAX_M3_DCP_EARLY_Q_GATHER=1: on steps that take the DCP attention
+# for every row (`uses_dcp_attention`), the caller gathers the group's query
+# heads unrotated before the scoring op (`attend_and_merge(q_gathered=True)`)
+# instead of this program gathering the rotated heads after it, so the
+# gather (~7 MB per rank at c64 decode, DCP 8) can overlap the indexer and
+# the KV write. The rotation is per row and per head, so rotating after the
+# gather gives the same queries.
+EARLY_Q_GATHER_ENV = "TPU_MINIMAX_M3_DCP_EARLY_Q_GATHER"
+
+
+def early_q_gather_enabled() -> bool:
+    return os.environ.get(EARLY_Q_GATHER_ENV, "0") == "1"
+
+
+if early_q_gather_enabled():
+    init_logger(__name__).info(
+        "%s=1: MSA DCP query heads gathered ahead of the scoring op.",
+        EARLY_Q_GATHER_ENV,
+    )
+
+
+HP_PREFILL_CONFIG_ENV = "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG"
+_hp_config_logged = False
+
+
+def hp_prefill_kernel_kwargs() -> dict:
+    """Kernel config of the head-parallel prefill attention from
+    TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG ("<block_q>:<pages per step>:
+    <widths w/w/...>:<page cache slots>"); empty -> `_BLOCK_Q` /
+    `_PAGES_PER_STEP` and the kernel's widths, no page cache."""
+    global _hp_config_logged
+    from vllm_torchtpu import envs
+
+    spec = envs.TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG
+    if not spec:
+        return dict(block_q=_BLOCK_Q, pages_per_step=_PAGES_PER_STEP)
+    parts = spec.split(":")
+    if len(parts) != 4:
+        raise ValueError(f"{HP_PREFILL_CONFIG_ENV}={spec!r}: want bq:pps:widths:slots")
+    block_q, pages_per_step, widths, slots = parts
+    kw = dict(
+        block_q=int(block_q or _BLOCK_Q),
+        pages_per_step=int(pages_per_step or _PAGES_PER_STEP),
+    )
+    if widths:
+        kw["step_widths"] = tuple(sorted(int(w) for w in widths.split("/")))
+    if int(slots or 0):
+        kw["page_cache_slots"] = int(slots)
+        kw["page_cache_bf16"] = msa_attention_lse.PREFILL_PAGE_CACHE_BF16
+    if not _hp_config_logged:
+        _hp_config_logged = True
+        init_logger(__name__).warning(
+            "%s=%s: head-parallel MSA prefill attention kernel %s "
+            "(page cache tile pages %d).",
+            HP_PREFILL_CONFIG_ENV,
+            spec,
+            kw,
+            msa_attention_lse.PAGE_CACHE_TILE_PAGES,
+        )
+    return kw
+
+
+def uses_dcp_attention(
+    num_tokens: int,
+    max_num_seqs: int,
+    decode_rows: int,
+    head_parallel_min_tokens: int = HEAD_PARALLEL_MIN_TOKENS,
+) -> bool:
+    """Whether a step of `num_tokens` rows attends every row with the DCP
+    attention (query gather + merge) rather than head-parallel."""
+    return num_tokens < max(head_parallel_min_tokens, 2 * max_num_seqs * decode_rows)
+
+
+def decode_row_plan(
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    max_num_seqs: int,
+    decode_rows: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``(dcp_req, hp_req, cu_d, src_row)`` of a head-parallel step: the
+    decode-sized requests, the prefill ones, the decode requests' compacted
+    ``cu_q_lens`` and the step row of each of the static
+    ``max_num_seqs * decode_rows`` compacted rows."""
+    seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
+    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    live = (seq_idx < distribution[2]) & (q_lens > 0)
+    dcp_req = live & (q_lens <= decode_rows)
+    hp_req = live & (q_lens > decode_rows)
+    cu_d = jnp.concatenate(
+        [jnp.zeros((1,), jnp.int32), jnp.cumsum(jnp.where(dcp_req, q_lens, 0))]
+    ).astype(jnp.int32)
+    p = jnp.arange(max_num_seqs * decode_rows, dtype=jnp.int32)
+    # compare_all: the default scan lowers to a loop of small ops.
+    req = jnp.searchsorted(cu_d[1:], p, side="right", method="compare_all")
+    req = jnp.minimum(req, max_num_seqs - 1)
+    src_row = jnp.where(p < cu_d[-1], cu_q_lens[req] + p - cu_d[req], 0)
+    return dcp_req, hp_req, cu_d, src_row
 
 
 def merge_partials(
@@ -86,11 +195,16 @@ def _dcp_attend(
     topk,
     rs_out_precision,
     interpret,
+    q_gathered=False,
 ):
     """The DCP attention of rows ``q [R, Hl, D]`` (this rank's rotated query
-    heads) with this rank's candidate slots ``candidates [2 * topk, R * G]``
-    (`msa_dcp.to_slots`)."""
-    q_all = jax.lax.all_gather(q, axis, axis=1, tiled=True)
+    heads) with this rank's packed ``candidates [R, G * 2 * topk]``.
+    `q_gathered`: ``q`` is already the group's heads ``[R, dcp * Hl, D]``,
+    unrotated."""
+    if q_gathered:
+        q_all = msa_fp4.rotate_queries(q)
+    else:
+        q_all = jax.lax.all_gather(q, axis, axis=1, tiled=True)
     cand_all = jax.lax.all_gather(candidates, axis, axis=0)
     out, lse = msa_dcp.msa_attend_dcp(
         q_all,
@@ -116,15 +230,177 @@ def _per_token(seq_id: jax.Array, table: jax.Array) -> jax.Array:
     return jnp.sum(jnp.where(onehot, table[None, :].astype(jnp.int32), 0), axis=1)
 
 
-def _exchange_pages(kv_cache, scale_cache, pages, *, dcp, replicas, head_width, axis):
+# Pages whose head copies to every rank an exchange keeps in flight.
+_EXCHANGE_PAGES_IN_FLIGHT = 8
+# The exchange's barrier semaphore.
+_EXCHANGE_COLLECTIVE_ID = 0
+
+
+def live_part(live: jax.Array, replica, replicas: int, part: int) -> jax.Array:
+    """Live pages of replica `replica`'s part when the first `live` logical
+    blocks of a buffer are live and block ``l`` sits in part ``l % replicas``
+    at index ``l // replicas``."""
+    return jnp.clip((live - replica + replicas - 1) // replicas, 0, part)
+
+
+def exchange_head_pages(
+    kv_cache: jax.Array,
+    pages: jax.Array,
+    live: jax.Array,
+    rank: jax.Array,
+    *,
+    axis: str,
+    dcp: int,
+    replicas: int,
+    head_width: int,
+    interpret: bool = False,
+) -> jax.Array:
+    """Inside a ``shard_map`` over `axis`: every rank's pages of the KV head
+    this rank (``rank``, ``int32[1]``) owns, ``[replicas, dcp, L / replicas,
+    R, P, head_width]``: ``[j, src, i]`` is rank ``src``'s page ``pages[j *
+    L / replicas + i]``, for the `live_part` of ``live`` (``int32[1]``)
+    pages of each part ``j``; the others are left unset.
+
+    Rank ``src`` copies each live page's head-``h`` columns straight from its
+    cache into rank ``h * replicas + j``'s output by remote DMA (one copy
+    per page and destination, all destinations in flight at once), and
+    every rank forwards what it received to the other replicas of its head
+    (one chip's cores at c64). A static XLA gather, all-to-all and
+    all-gather moved the whole buffer whatever the context, relaid the pages
+    out around each collective and ran the all-to-all at one link's
+    bandwidth."""
+    _, rows, packing, _ = kv_cache.shape
+    num_pages = pages.shape[0]
+    part = num_pages // replicas
+    # Slots past the live pages stay unset: harmless while no key reaches
+    # them and while any byte pattern of the 4-bit cache dequantizes finite.
+    if kv_cache.dtype != jnp.uint8:
+        raise ValueError(f"4-bit (uint8) caches only, got {kv_cache.dtype}")
+
+    def remote(src, dst, send_sem, recv_sem, device):
+        return pltpu.make_async_remote_copy(
+            src,
+            dst,
+            send_sem,
+            recv_sem,
+            device_id={axis: device},
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+
+    def kernel(
+        pages_ref, live_ref, rank_ref, kv_ref, out_ref, send_sem, recv_sem, fwd_sem
+    ):
+        me = rank_ref[0]
+        replica = me % replicas
+        counts = [live_part(live_ref[0], j, replicas, part) for j in range(replicas)]
+        barrier = pltpu.get_barrier_semaphore()
+        for d in range(dcp):
+            pl.semaphore_signal(
+                barrier,
+                inc=1,
+                device_id={axis: jnp.int32(d)},
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+        # Every rank has entered the call: its output buffer is live.
+        pl.semaphore_wait(barrier, dcp)
+
+        def sends(i, op):
+            for d in range(dcp):
+                head, j = divmod(d, replicas)
+
+                def send(d=d, head=head, j=j):
+                    columns = pl.ds(head * head_width, head_width)
+                    src = kv_ref.at[pages_ref[j * part + i], :, :, columns]
+                    op(remote(src, out_ref.at[j, me, i], send_sem, recv_sem, d))
+
+                pl.when(i < counts[j])(send)
+
+        def pipelined(n, copies):
+            """Start ``copies(i, op)`` for ``i < n``, a bounded number in
+            flight (equal-sized copies on one semaphore: any wait retires
+            one)."""
+            ahead = _EXCHANGE_PAGES_IN_FLIGHT
+
+            def step(i, carry):
+                copies(i, lambda c: c.start())
+                pl.when(i >= ahead)(lambda: copies(i - ahead, lambda c: c.wait_send()))
+                return carry
+
+            def drain(i, carry):
+                copies(i, lambda c: c.wait_send())
+                return carry
+
+            jax.lax.fori_loop(0, n, step, 0)
+            jax.lax.fori_loop(jnp.maximum(n - ahead, 0), n, drain, 0)
+
+        pipelined(counts[0], sends)
+
+        def page_wait(sem):
+            def wait(i, carry):
+                page = out_ref.at[0, 0, 0]
+                pltpu.make_async_copy(page, page, sem).wait()
+                return carry
+
+            return wait
+
+        mine = jnp.where(replica == 0, counts[0], counts[-1])
+        for j in range(1, replicas - 1):
+            mine = jnp.where(replica == j, counts[j], mine)
+        jax.lax.fori_loop(0, mine * dcp, page_wait(recv_sem), 0)
+
+        # Forward the received pages to the head's other replicas.
+        def forwards(i, op):
+            for k in range(1, replicas):
+                peer = me - replica + (replica + k) % replicas
+                for src in range(dcp):
+                    page = out_ref.at[replica, src, i]
+                    op(remote(page, page, send_sem, fwd_sem, peer))
+
+        pipelined(mine, forwards)
+        theirs = sum(counts) - mine
+        jax.lax.fori_loop(0, theirs * dcp, page_wait(fwd_sem), 0)
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(1,),
+            in_specs=[pl.BlockSpec(memory_space=pl.ANY)],
+            out_specs=pl.BlockSpec(memory_space=pl.ANY),
+            scratch_shapes=[pltpu.SemaphoreType.DMA(())] * 3,
+        ),
+        out_shape=jax.ShapeDtypeStruct(
+            (replicas, dcp, part, rows, packing, head_width), kv_cache.dtype
+        ),
+        compiler_params=pltpu.CompilerParams(collective_id=_EXCHANGE_COLLECTIVE_ID),
+        interpret=pltpu.InterpretParams() if interpret else False,
+        name="minimax_m3_msa_dcp_exchange_head_pages",
+    )(pages, live, rank, kv_cache)
+
+
+def _exchange_pages(
+    kv_cache,
+    scale_cache,
+    pages,
+    live,
+    rank,
+    *,
+    dcp,
+    replicas,
+    head_width,
+    axis,
+    interpret,
+):
     """Every rank's ``pages [L]`` of the KV head each rank owns:
     ``(kv [L * dcp, S / 8, 4, 2 * D], scales [L * dcp, SCALE_ROWS, 128])``,
     rank ``src``'s page ``pages[j * L / replicas + i]`` at slot ``(j * dcp +
-    src) * L / replicas + i``.
+    src) * L / replicas + i``; only the pages `exchange_head_pages` calls
+    live (`live` logical blocks) are set.
 
-    The ``replicas`` ranks of a KV head each receive a ``1 / replicas`` part
-    of the pages over the all-to-all and share them with an all-gather
-    inside the replica group (one chip's cores at c64)."""
+    The pages move by `exchange_head_pages`. The ``replicas`` ranks of a KV
+    head each receive a ``1 / replicas`` part of the scales over an
+    all-to-all and share them with an all-gather inside the replica group
+    (one chip's cores at c64)."""
     num_pages = pages.shape[0]
     part = num_pages // replicas
     _, rows, packing, _ = kv_cache.shape
@@ -134,17 +410,26 @@ def _exchange_pages(kv_cache, scale_cache, pages, *, dcp, replicas, head_width, 
             f"cache rows {kv_cache.shape} do not hold {heads} KV heads of "
             f"{head_width} columns"
         )
-    kv = kv_cache[pages].reshape(replicas, part, rows, packing, heads, head_width)
+    recv = exchange_head_pages(
+        kv_cache,
+        pages,
+        live.reshape(1),
+        rank.reshape(1),
+        axis=axis,
+        dcp=dcp,
+        replicas=replicas,
+        head_width=head_width,
+        interpret=interpret,
+    )
     # Destination rank d = h * replicas + j gets part j of head h.
-    send = jnp.moveaxis(kv, 4, 0).reshape(dcp, part, rows, packing, head_width)
     sc = scale_cache[pages][:, : 2 * heads]  # K/V rows of every head
     sc = sc.reshape(replicas, part, heads, 2, sc.shape[-1])
-    send_sc = jnp.moveaxis(sc, 2, 0).reshape(dcp, part, 2, sc.shape[-1])
-    recv = jax.lax.all_to_all(send, axis, 0, 0, tiled=True)
+    # [dcp, part * 2, lanes]: a [.., 2, lanes] block pads its (8, 128) tiles
+    # four times over.
+    send_sc = jnp.moveaxis(sc, 2, 0).reshape(dcp, part * 2, sc.shape[-1])
     recv_sc = jax.lax.all_to_all(send_sc, axis, 0, 0, tiled=True)
     if replicas > 1:
         groups = [list(range(h * replicas, (h + 1) * replicas)) for h in range(heads)]
-        recv = jax.lax.all_gather(recv, axis, axis_index_groups=groups, tiled=True)
         recv_sc = jax.lax.all_gather(
             recv_sc, axis, axis_index_groups=groups, tiled=True
         )
@@ -154,47 +439,23 @@ def _exchange_pages(kv_cache, scale_cache, pages, *, dcp, replicas, head_width, 
     return recv, recv_sc
 
 
-def slots_per_head(candidates: jax.Array, heads: int) -> jax.Array:
-    """`msa_dcp.to_slots` slots ``[2 * topk, T * G]`` (column ``t * G + h``)
-    -> per head ``[G, T, 2 * topk]``."""
-    slots = candidates.shape[0]
-    return candidates.reshape(slots, -1, heads).transpose(2, 1, 0)
-
-
-def slot_rows(candidates: jax.Array, rows: jax.Array, heads: int) -> jax.Array:
-    """The slots of tokens ``rows`` (``[R]``): ``[2 * topk, R * G]``."""
-    slots = candidates.shape[0]
-    picked = candidates.reshape(slots, -1, heads)[:, rows]
-    return picked.reshape(slots, rows.shape[0] * heads)
-
-
-def merge_own(own: jax.Array, topk: int, interpret: bool = False) -> jax.Array:
-    """Selection ``[T, topk]`` of one KV head from every rank's per-token
-    slots ``own [dcp, T, 2 * topk]`` (`merge_head_candidates` takes them
-    as ``[dcp, 2 * topk, T]``)."""
-    return msa_dcp.merge_head_candidates(
-        own.transpose(0, 2, 1), topk, interpret=interpret
-    )[:, 0]
-
-
 def _own_selection(candidates, *, dcp, replicas, topk, axis, interpret):
     """The selection ``[T, topk]`` of this rank's KV head, from every rank's
-    candidate slots ``candidates [2 * topk, T * G]`` (`msa_dcp.to_slots`,
-    int32). Each replica of the head merges
+    packed ``candidates [T, G * 2 * topk]``. Each replica of the head merges
     the candidates of a ``1 / replicas`` share of the tokens (an all-to-all
     of that share) and the replicas all-gather the merged selections, which
     are 1/8 the candidates' bytes."""
+    num_tokens = candidates.shape[0]
     heads = dcp // replicas
-    per_head = slots_per_head(candidates, heads)
-    num_tokens = per_head.shape[1]
     split = replicas if num_tokens % replicas == 0 else 1
     part = num_tokens // split
+    per_head = candidates.reshape(num_tokens, heads, 2 * topk).transpose(1, 0, 2)
     # Destination rank d = h * replicas + j gets head h's tokens of share j
     # (every share, when the tokens do not split).
     send = per_head.reshape(heads, split, part, 2 * topk)
     send = jnp.repeat(send, replicas // split, axis=1).reshape(dcp, part, 2 * topk)
     own = jax.lax.all_to_all(send, axis, 0, 0, tiled=True)  # [dcp, T / split, 2K]
-    selected = merge_own(own, topk, interpret)
+    selected = msa_dcp.merge_head_candidates(own, topk, interpret)[:, 0]
     if split > 1:
         groups = [list(range(h * replicas, (h + 1) * replicas)) for h in range(heads)]
         selected = jax.lax.all_gather(
@@ -227,9 +488,9 @@ def _head_parallel_attend(
     rows are zero. ``tokens`` is `msa.token_positions` of the step.
 
     Requests are attended in rounds of at most ``pages_per_seq`` logical
-    blocks (one max-length request): each round exchanges one static page
-    buffer and attends the round's rows in windows of one kernel call."""
-    del rank  # every rank runs the same exchange
+    blocks (one max-length request): each round exchanges the live pages
+    of one page buffer and attends the round's rows in windows of one
+    kernel call."""
     num_tokens, num_q_heads, head_dim = q.shape
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
@@ -237,7 +498,6 @@ def _head_parallel_attend(
     capacity = block_tables_2d.shape[1]  # logical blocks per round
     replicas = kv_head_replicas
     part = -(-capacity // replicas)  # each replica's share of the buffer
-    buffer_pages = part * replicas
 
     selected = _own_selection(
         candidates,
@@ -252,19 +512,13 @@ def _head_parallel_attend(
     seq_blocks = -(-seq_lens // (block_size * dcp))
     blocks = jnp.where(hp_req, seq_blocks, 0)
     seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
-    page_table = jnp.arange(dcp * buffer_pages, dtype=jnp.int32)
     # Rows per kernel call (the caller pads tokens to a block_q multiple).
     window = min(num_tokens, msa_attention.MAX_TOKENS_PER_CALL)
     sel_block = jnp.maximum(selected, 0)
     own_block = pos // block_size
     limit = pos % block_size + 1
 
-    def slot(base, block):
-        # Logical block l = base + block // dcp of rank block % dcp.
-        logical = base + block // dcp
-        return ((logical // part) * dcp + block % dcp) * part + logical % part
-
-    def attend_round(first, acc, merge):
+    def plan_round(first):
         csum = jnp.cumsum(jnp.where(seq_idx >= first, blocks, 0))
         # A request never exceeds the buffer (the block table's width); always
         # admitting `first` keeps the rounds moving if that ever broke.
@@ -276,20 +530,37 @@ def _head_parallel_attend(
         nxt = jnp.min(
             jnp.where((seq_idx >= first) & ~in_round & hp_req, seq_idx, max_num_seqs)
         )
-        # Buffer page s: logical block s - base[q] of request q.
-        page = jnp.arange(buffer_pages, dtype=jnp.int32)
-        q_of = jnp.minimum(jnp.searchsorted(csum, page, side="right"), max_num_seqs - 1)
-        j = jnp.clip(page - base[q_of], 0, capacity - 1)
-        pages = jnp.where(page < total, block_tables_2d[q_of, j], 0)
+        return csum, in_round, base, total, nxt
+
+    def attend_round(plan, acc, merge):
+        csum, in_round, base, total, _ = plan
+        num_pages = part * replicas
+        # Buffer page b holds logical block l = b % part * replicas + b //
+        # part: logical block s - base[q] of request q.
+        buf = jnp.arange(num_pages, dtype=jnp.int32)
+        logical = buf % part * replicas + buf // part
+        q_of = jnp.searchsorted(csum, logical, side="right", method="compare_all")
+        q_of = jnp.minimum(q_of, max_num_seqs - 1)
+        j = jnp.clip(logical - base[q_of], 0, capacity - 1)
+        pages = jnp.where(logical < total, block_tables_2d[q_of, j], 0)
         kv, sc = _exchange_pages(
             kv_cache,
             scale_cache,
             pages,
+            total,
+            rank,
             dcp=dcp,
             replicas=replicas,
             head_width=2 * head_dim,
             axis=axis,
+            interpret=interpret,
         )
+
+        def slot(base, block):
+            # Logical block l = base + block // dcp of rank block % dcp.
+            logical = base + block // dcp
+            j = logical % replicas
+            return (j * dcp + block % dcp) * part + logical // replicas
 
         mine = valid & (_per_token(seq_id, in_round) > 0)
         tok_base = _per_token(seq_id, base)
@@ -299,12 +570,12 @@ def _head_parallel_attend(
         local = jnp.where(mine, slot(tok_base, own_block), -1)
         lo = cu[jnp.min(jnp.where(in_round, seq_idx, max_num_seqs - 1))]
         hi = cu[jnp.max(jnp.where(in_round, seq_idx + 1, 0))]
+        page_table = jnp.arange(dcp * num_pages, dtype=jnp.int32)
 
         attend = functools.partial(
             msa_attention_lse.msa_sparse_attention_lse,
             sm_scale=sm_scale,
-            block_q=msa_attention.DEFAULT_BLOCK_Q,
-            pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+            **hp_prefill_kernel_kwargs(),
             head=0,
             scale_cache=sc,
             k_scale_row=0,
@@ -317,7 +588,7 @@ def _head_parallel_attend(
             # its output in place; rows outside the round see no page and
             # come back zero (cheap empty tiles).
             out, _ = attend(q, kv, keys, local, limit, page_table)
-            return nxt, out
+            return out
 
         def window_body(i, acc):
             start = jnp.minimum(lo + i * window, num_tokens - window)
@@ -330,20 +601,21 @@ def _head_parallel_attend(
             out = jnp.where(sl(mine)[None, :, None], out, old)  # earlier rounds
             return jax.lax.dynamic_update_slice_in_dim(acc, out, start, 1)
 
-        acc = jax.lax.fori_loop(0, -(-(hi - lo) // window), window_body, acc)
-        return nxt, acc
+        return jax.lax.fori_loop(0, -(-(hi - lo) // window), window_body, acc)
 
     first = jnp.min(jnp.where(hp_req, seq_idx, max_num_seqs))
-    first, acc = attend_round(first, None, merge=False)
+    plan = plan_round(first)
+    acc = attend_round(plan, None, merge=False)
+    first = plan[4]
 
     # Further rounds sit under a cond: a while loop that reads the cache
     # makes XLA copy the whole cache ahead of it (0.45 ms per layer at c64).
     def more_rounds(state):
-        return jax.lax.while_loop(
-            lambda s: s[0] < max_num_seqs,
-            lambda s: attend_round(*s, merge=True),
-            state,
-        )
+        def body(s):
+            plan = plan_round(s[0])
+            return plan[4], attend_round(plan, s[1], merge=True)
+
+        return jax.lax.while_loop(lambda s: s[0] < max_num_seqs, body, state)
 
     _, acc = jax.lax.cond(first < max_num_seqs, more_rounds, lambda s: s, (first, acc))
     return acc
@@ -369,11 +641,17 @@ def attend_and_merge(
     rs_out_precision: bool,
     head_parallel_min_tokens: int = HEAD_PARALLEL_MIN_TOKENS,
     interpret: bool = False,
+    q_gathered: bool = False,
+    q_dec: jax.Array | None = None,
 ) -> jax.Array:
     """This rank's (``rank``, ``int32[1]``) attention output ``[T, Hl, D]``
-    (unrotated) for its rotated query heads ``q [T, Hl, D]`` and its
-    candidate slots ``candidates [2 * topk, T * G]``
-    (`msa_dcp.msa_write_and_candidates_dcp`, `msa_dcp.to_slots`); 4-bit caches.
+    (unrotated) for its rotated query heads ``q [T, Hl, D]`` and its packed
+    ``candidates [T, G * 2 * topk]`` (`msa_dcp.msa_write_and_candidates_dcp`);
+    4-bit caches. `q_gathered`: ``q`` is the group's unrotated query heads
+    ``[T, dcp * Hl, D]`` (`EARLY_Q_GATHER_ENV`); only for steps that
+    `uses_dcp_attention`. `q_dec`: on a head-parallel step, the group's
+    unrotated query heads of the compacted decode rows ``[max_num_seqs *
+    decode_rows, dcp * Hl, D]`` (`decode_row_plan`), gathered by the caller.
     Runs inside a ``shard_map`` over `axis` (the DCP group)."""
     num_tokens = q.shape[0]
     # The rank is an input: torch_tpu's SPMD partitioner refuses the
@@ -384,7 +662,14 @@ def attend_and_merge(
     )
     max_num_seqs = seq_lens.shape[0]
     rows = max_num_seqs * decode_rows
-    if num_tokens < max(head_parallel_min_tokens, 2 * rows):
+    small = uses_dcp_attention(
+        num_tokens, max_num_seqs, decode_rows, head_parallel_min_tokens
+    )
+    if q_gathered and not small:
+        raise ValueError(
+            f"q_gathered needs a DCP-attention step, got {num_tokens} tokens"
+        )
+    if small:
         return _dcp_attend(
             q,
             kv_cache,
@@ -394,30 +679,24 @@ def attend_and_merge(
             block_tables,
             cu_q_lens,
             rs_out_precision=rs_out_precision,
+            q_gathered=q_gathered,
             **common,
         )
-    seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
-    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    live = (seq_idx < distribution[2]) & (q_lens > 0)
-    dcp_req = live & (q_lens <= decode_rows)
-    hp_req = live & (q_lens > decode_rows)
-
     # The decode requests' rows, compacted: their own cu_q_lens.
-    cu_d = jnp.concatenate(
-        [jnp.zeros((1,), jnp.int32), jnp.cumsum(jnp.where(dcp_req, q_lens, 0))]
-    ).astype(jnp.int32)
+    _, hp_req, cu_d, src_row = decode_row_plan(
+        cu_q_lens, distribution, max_num_seqs, decode_rows
+    )
     p = jnp.arange(rows, dtype=jnp.int32)
-    req = jnp.minimum(jnp.searchsorted(cu_d[1:], p, side="right"), max_num_seqs - 1)
-    src_row = jnp.where(p < cu_d[-1], cu_q_lens[req] + p - cu_d[req], 0)
     dcp_out = _dcp_attend(
-        q[src_row],
+        q[src_row] if q_dec is None else q_dec,
         kv_cache,
         scale_cache,
-        slot_rows(candidates, src_row, candidates.shape[1] // num_tokens),
+        candidates[src_row],
         seq_lens,
         block_tables,
         cu_d,
         rs_out_precision=rs_out_precision,
+        q_gathered=q_dec is not None,
         **common,
     )
     tokens = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
@@ -435,6 +714,19 @@ def attend_and_merge(
         **common,
     )
     hp_out = msa_fp4.unrotate_output(hp_out.transpose(1, 0, 2))
-    # The decode rows go back to their places (the others are dropped).
-    dest = jnp.where(p < cu_d[-1], src_row, num_tokens)
-    return hp_out.at[dest].set(dcp_out, mode="drop")
+    num_decode = cu_d[-1]
+
+    def decode_prefix(out):
+        # The runner orders decodes ahead of prefills: the decode rows are
+        # then the step's first rows, one in-place update of `rows` rows.
+        head = jnp.where((p < num_decode)[:, None, None], dcp_out, out[:rows])
+        return jax.lax.dynamic_update_slice_in_dim(out, head, 0, 0)
+
+    def scatter(out):
+        # The decode rows go back to their places (the others are dropped):
+        # a scatter of `rows` rows.
+        dest = jnp.where(p < num_decode, src_row, num_tokens)
+        return out.at[dest].set(dcp_out, mode="drop")
+
+    prefix = jnp.all((p >= num_decode) | (src_row == p))
+    return jax.lax.cond(prefix, decode_prefix, scatter, hp_out)

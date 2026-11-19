@@ -20,7 +20,7 @@ blocks) into the selection, and keeps the ``topk`` best blocks. Attention then
 runs over the selected blocks only (`msa_attention.msa_sparse_attention`).
 """
 
-import functools
+from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -93,6 +93,37 @@ def write_rows_xla(
     )
 
 
+def write_caches(
+    targets: Sequence[msa_write.Rows | msa_write.SlotValues],
+    pages: jax.Array,
+    pos: jax.Array,
+    *,
+    max_num_seqs: int | None = None,
+    interpret: bool = False,
+) -> list[jax.Array]:
+    """Write one row (or slot values) per token into each packed cache of
+    `targets` in one `msa_write.write_runs` call; only the pages that
+    receive rows are rewritten. A request's tokens must be consecutive with
+    consecutive positions. `max_num_seqs` bounds the requests in the batch
+    (default: one per token)."""
+    num_tokens = pages.shape[0]
+    block_size = page_size(targets[0].cache)
+    max_runs = msa_write.max_write_runs(
+        num_tokens,
+        num_tokens if max_num_seqs is None else max_num_seqs,
+        block_size,
+    )
+    targets = [
+        t
+        if isinstance(t, msa_write.SlotValues) or msa_fp4.is_fp4(t.cache)
+        else t._replace(rows=_cache_rows(t.cache, t.rows))
+        for t in targets
+    ]
+    return msa_write.write_runs(
+        targets, pages, pos % block_size, max_runs=max_runs, interpret=interpret
+    )
+
+
 def write_rows(
     cache: jax.Array,
     rows: jax.Array,
@@ -103,29 +134,16 @@ def write_rows(
     scales: jax.Array | None = None,
     interpret: bool = False,
 ) -> jax.Array:
-    """Write one row per token into a packed ``[pages, S / p, p, W]`` cache.
-
-    Only the pages that receive rows are rewritten (`msa_write`). A request's
-    tokens must be consecutive with consecutive positions. `max_num_seqs`
-    bounds the requests in the batch (default: one per token).
-    """
-    num_tokens = rows.shape[0]
-    max_runs = msa_write.max_write_runs(
-        num_tokens,
-        num_tokens if max_num_seqs is None else max_num_seqs,
-        page_size(cache),
-    )
-    fp4 = msa_fp4.is_fp4(cache)
-    return msa_write.write_rows(
-        cache,
-        rows if fp4 else _cache_rows(cache, rows),
+    """`write_caches` of one cache (`msa_write.Rows`: `scales` only for a
+    4-bit cache with folded scales)."""
+    bits = 4 if msa_fp4.is_fp4(cache) else None
+    return write_caches(
+        [msa_write.Rows(cache, rows, bits, scales)],
         pages,
-        pos % page_size(cache),
-        max_runs=max_runs,
-        bits=4 if fp4 else None,
+        pos,
+        max_num_seqs=max_num_seqs,
         interpret=interpret,
-        **({} if scales is None else {"scales": scales}),
-    )
+    )[0]
 
 
 def write_fp4(
@@ -142,9 +160,8 @@ def write_fp4(
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Rotate, quantize and write one step's K/V (``[T, G, D]``) and index keys
-    (``[T, D]``) into 4-bit caches and their scale page (`msa_fp4`), all three
-    in one kernel (`msa_write.write_fp4_caches`) at the step's `pages` and
-    `pos` (as `write_rows`).
+    (``[T, D]``) into 4-bit caches and their scale page (`msa_fp4`), in one
+    `write_caches` call.
 
     Scale-page rows ``2h`` / ``2h + 1`` hold the K / V scales of head ``h``;
     the index-key scales are folded into the index pages' last word row
@@ -154,60 +171,20 @@ def write_fp4(
     k_nib, k_scale = msa_fp4.quantize(msa_fp4.rotate_keys(k))
     v_nib, v_scale = msa_fp4.quantize(msa_fp4.rotate_keys(v))
     i_nib, i_scale = msa_fp4.quantize(msa_fp4.rotate_keys(index_k))
+    kv_rows = jnp.concatenate([k_nib, v_nib], axis=-1).reshape(num_tokens, -1)
     scales = jnp.stack([k_scale, v_scale], axis=-1).reshape(num_tokens, -1)  # [T, 2G]
-    block_size = page_size(kv_cache)
-    return msa_write.write_fp4_caches(
-        kv_cache,
-        index_cache,
-        scale_cache,
-        jnp.concatenate([k_nib, v_nib], axis=-1).reshape(num_tokens, -1),
-        i_nib,
-        i_scale,
-        scales,
+    kv_cache, index_cache, scale_cache = write_caches(
+        [
+            msa_write.Rows(kv_cache, kv_rows, 4),
+            msa_write.Rows(index_cache, i_nib, 4, i_scale),
+            msa_write.SlotValues(scale_cache, scales),
+        ],
         pages,
-        pos % block_size,
-        max_runs=_max_runs(num_tokens, max_num_seqs, block_size),
+        pos,
+        max_num_seqs=max_num_seqs,
         interpret=interpret,
     )
-
-
-def write_kv_and_index(
-    kv_cache: jax.Array,
-    index_cache: jax.Array,
-    kv_rows: jax.Array,
-    index_rows: jax.Array,
-    pages: jax.Array,
-    pos: jax.Array,
-    *,
-    max_num_seqs: int | None = None,
-    interpret: bool = False,
-) -> tuple[jax.Array, jax.Array]:
-    """`write_rows` of the K/V and the index rows in one kernel
-    (`msa_write.write_rows_many`)."""
-    block_size = page_size(kv_cache)
-    fp4 = msa_fp4.is_fp4(kv_cache)
-    if fp4 != msa_fp4.is_fp4(index_cache):  # one bit width per kernel
-        write = functools.partial(
-            write_rows, pages=pages, pos=pos, max_num_seqs=max_num_seqs, interpret=interpret
-        )
-        return write(kv_cache, kv_rows), write(index_cache, index_rows)
-    return msa_write.write_rows_many(
-        (kv_cache, index_cache),
-        (kv_rows, index_rows)
-        if fp4
-        else (_cache_rows(kv_cache, kv_rows), _cache_rows(index_cache, index_rows)),
-        pages,
-        pos % block_size,
-        max_runs=_max_runs(kv_rows.shape[0], max_num_seqs, block_size),
-        bits=4 if fp4 else None,
-        interpret=interpret,
-    )
-
-
-def _max_runs(num_tokens: int, max_num_seqs: int | None, block_size: int) -> int:
-    return msa_write.max_write_runs(
-        num_tokens, num_tokens if max_num_seqs is None else max_num_seqs, block_size
-    )
+    return kv_cache, index_cache, scale_cache
 
 
 def sparse_attention(
@@ -318,16 +295,16 @@ _DECODE_ROWS = 8
 
 def block_score_options(index_heads: int = 1) -> dict[str, int]:
     """The tile sizes the MSA forward scores blocks with, for query rows that
-    fold `index_heads` heads per token. A folded 4-bit decode tile holds one
-    request's rows: its transposed scoring costs per tile row, and 32-row
+    fold `index_heads` heads per token. A transposed (folded 4-bit or fp8)
+    decode tile holds one request's rows: its scoring costs per tile row, and 32-row
     tiles for one head's 8 rows ran the c48 / c64 DCP 2 decode indexer 7%
     slower, bit-identical results (bench j-74f8b992)."""
     return dict(
         block_q=msa_indexer.DEFAULT_BLOCK_Q,
         large_block_q=msa_indexer.DEFAULT_LARGE_BLOCK_Q,
-        pages_per_step=msa_indexer.LARGE_PAGES_PER_STEP,
+        pages_per_step=msa_indexer.DEFAULT_PAGES_PER_STEP,
         small_pages_per_step=msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP,
-        folded_tile_q=min(_DECODE_ROWS * index_heads, msa_indexer.DEFAULT_BLOCK_Q),
+        transposed_tile_q=min(_DECODE_ROWS * index_heads, msa_indexer.DEFAULT_BLOCK_Q),
     )
 
 
@@ -414,11 +391,11 @@ def msa_forward(
         q = msa_fp4.rotate_queries(q)
         index_q = msa_fp4.rotate_queries(index_q)
     else:
-        kv_cache, index_cache = write_kv_and_index(
-            kv_cache,
-            index_cache,
-            jnp.concatenate([k, v], axis=-1)[:, 0],
-            index_k,
+        kv_cache, index_cache = write_caches(
+            [
+                msa_write.Rows(kv_cache, jnp.concatenate([k, v], axis=-1)[:, 0]),
+                msa_write.Rows(index_cache, index_k),
+            ],
             pages,
             pos,
             max_num_seqs=max_num_seqs,

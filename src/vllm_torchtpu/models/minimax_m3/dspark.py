@@ -57,19 +57,12 @@ from vllm.model_executor.models.qwen3_dspark import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter import cp_draft_attention
-from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
-from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-    VllmUnquantizedLinearMethod,
-)
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP
-from vllm_torchtpu.models.minimax_m3.quant import (
-    QUANT_METHOD,
-    MiniMaxM3Mxfp8LinearMethod,
-)
-from vllm_torchtpu.opt_in_config import option
+from vllm_torchtpu.models.minimax_m3.quant import QUANT_METHOD
 from vllm_torchtpu.spec_decode.vocab_parallel_argmax import (
     MAX_VOCAB_FOR_FLOAT_IDS,
     reduce_shard_argmax_pairs,
@@ -134,117 +127,6 @@ def configure_dspark_draft(speculative_config: "SpeculativeConfig") -> None:
 
 def _per_head_norm(x: torch.Tensor, norm: nn.Module, head_dim: int) -> torch.Tensor:
     return norm(x.reshape(-1, head_dim)).reshape(x.shape)
-
-
-def _rank_rows_blocker(model: nn.Module, dcp: int, kv_head_replicas: int) -> str | None:
-    """Why `store_context_kv_rank_rows` cannot reproduce the sharded write, or
-    None."""
-    for layer in model.layers:
-        attn = layer.self_attn
-        if getattr(attn.attn.impl, "sharded_draft_dcp", None) is None:
-            return "a draft layer keeps its KV replicated"
-        proj = attn.qkv_proj
-        if not isinstance(
-            proj.quant_method, (MiniMaxM3Mxfp8LinearMethod, VllmUnquantizedLinearMethod)
-        ) or not getattr(proj, WEIGHT_FLIPPED_ATTR, False):
-            return "qkv_proj is not a plain (k, n) matmul"
-        if getattr(proj, "bias", None) is not None:
-            return "qkv_proj has a bias"
-        if dcp > kv_head_replicas and attn.num_kv_heads != 1:
-            return f"{attn.num_kv_heads} local KV heads"
-    return None
-
-
-def prepare_rank_rows_context_kv(
-    model: nn.Module, group, dcp: int, kv_head_replicas: int
-) -> bool:
-    """Give each draft layer the K/V weight of all the DCP group's KV heads,
-    ``[hidden, 2 * G * D]`` (K heads, then V heads), for
-    `store_context_kv_rank_rows`. The heads are in `write_with_dcp`'s order:
-    every `kv_head_replicas`-th rank of the group supplies the next one, and a
-    group no wider than the replicas shares the rank's own heads. Call once
-    after the weights load and sharded draft DCP is enabled."""
-    blocker = _rank_rows_blocker(model, dcp, kv_head_replicas)
-    if blocker is not None:
-        logger.info("MiniMax DSpark: context K/V written from all rows because %s.", blocker)
-        model.rank_rows_context_kv = None
-        return False
-    for layer in model.layers:
-        attn = layer.self_attn
-        local = attn.qkv_proj.weight.data[:, attn.q_size :]  # [hidden, K | V]
-        if dcp > kv_head_replicas:
-            hidden = local.shape[0]
-            gathered = group.all_gather(local.contiguous(), dim=1)
-            heads = gathered.view(hidden, dcp, 2, attn.head_dim)[:, ::kv_head_replicas]
-            local = heads.permute(0, 2, 1, 3).reshape(hidden, -1)
-        attn.register_buffer("context_kv_weight", local.contiguous(), persistent=False)
-    model.rank_rows_context_kv = dict(dcp=dcp)
-    return True
-
-
-def store_context_kv_rank_rows(
-    model: nn.Module,
-    aux_hidden_states: list[torch.Tensor],
-    positions: torch.Tensor,
-    metadata: "tuple[AttentionMetadata, ...]",
-) -> torch.Tensor:
-    """`MiniMaxM3DSparkModel.store_context_kv` for DCP-sharded draft KV, with
-    the work split over the group by token rows instead of repeated per rank.
-
-    DCP rank ``r`` takes rows ``[r * n, (r + 1) * n)``, ``n = ceil(T / dcp)``:
-    the aux states' concat, fc and hidden norm on those rows only, then per
-    layer one matmul for the K/V of every KV head of the group (no Q
-    columns), the K norm and RoPE, and the cache bytes (`pack_rows`). One
-    all-gather of every layer's packed rows gives each rank all T rows, of
-    which it copies the tokens of its own blocks into its pages
-    (`write_owned_rows`). Each row runs through the same per-row ops as in
-    the replicated-rows path, so the cache bytes are the same.
-
-    Returns this rank's rows of the context.
-    """
-    from vllm_torchtpu.distributed.dcp import get_dcp_group
-
-    dcp = model.rank_rows_context_kv["dcp"]
-    first = model.layers[0].self_attn.attn
-    num_tokens = aux_hidden_states[0].shape[0]
-    per_rank = -(-num_tokens // dcp)
-    rows = first.draft_dcp_rank.to(torch.int64) * per_rank + torch.arange(
-        per_rank, device=positions.device
-    )
-    rows = rows.clamp(max=num_tokens - 1)
-    target = [h.index_select(0, rows) for h in aux_hidden_states]
-    target = target[0] if len(target) == 1 else torch.cat(target, dim=-1)
-    context = model.hidden_norm(model.fc(target))
-    positions = positions.index_select(0, rows)
-    packed = []
-    for layer in model.layers:
-        attn = layer.self_attn
-        kv = torch.matmul(context, attn.context_kv_weight)
-        k, v = kv.chunk(2, dim=-1)
-        k = _per_head_norm(k, attn.k_norm, attn.head_dim)
-        k, _ = attn.rotary_emb(positions, k, None)
-        ops = attn.attn.impl.sharded_draft_dcp["ops"]
-        packed.append(
-            ops["pack"](
-                attn.attn.kv_cache,
-                k.reshape(per_rank, -1, attn.head_dim),
-                v.reshape(per_rank, -1, attn.head_dim),
-            )
-        )
-    gathered = cp_draft_attention.gather_rows(torch.stack(packed, dim=1), get_dcp_group())
-    for i, (layer, layer_metadata) in enumerate(zip(model.layers, metadata, strict=True)):
-        attn = layer.self_attn.attn
-        ops = attn.impl.sharded_draft_dcp["ops"]
-        new_cache = ops["write_rows"](
-            attn.kv_cache,
-            gathered[:num_tokens, i].contiguous(),
-            layer_metadata.seq_lens,
-            layer_metadata.block_tables,
-            layer_metadata.query_start_loc,
-            attn.draft_dcp_rank,
-        )
-        attn.kv_cache.copy_(new_cache)
-    return context
 
 
 class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
@@ -323,11 +205,6 @@ class MiniMaxM3DSparkDecoderLayer(DFlashQwen3DecoderLayer):
         self.post_attention_layernorm = GemmaRMSNorm(hidden_size, eps=eps)
 
 
-# Set from additional_config minimax_dspark_split_fc by MiniMaxM3DSparkModel
-# before the first trace (`_column_parallel`, `_context_kv`).
-SPLIT_FC = False
-
-
 def _flipped_weight(linear: nn.Module, dtype: torch.dtype) -> torch.Tensor | None:
     """The ``[n_in, n_out]`` weight of a bias-free linear whose apply is a
     plain ``matmul(x, weight)`` (unquantized, or MXFP8 dequantized to
@@ -345,11 +222,8 @@ def _flipped_weight(linear: nn.Module, dtype: torch.dtype) -> torch.Tensor | Non
 
 
 def _column_parallel(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """``linear(x)`` for a TP-replicated linear: with additional_config
-    minimax_dspark_split_fc (r6), each rank computes 1/tp of the output
-    columns, reading 1/tp of the weight, then the ranks all-gather."""
-    if not SPLIT_FC:
-        return linear(x)
+    """``linear(x)`` for a TP-replicated linear: each rank computes 1/tp of the
+    output columns, reading 1/tp of the weight, then the ranks all-gather."""
     weight = _flipped_weight(linear, x.dtype)
     tp = get_tensor_model_parallel_world_size()
     if weight is None or tp == 1 or weight.shape[1] % tp:
@@ -363,25 +237,14 @@ def _column_parallel(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
 def _context_kv(attn: nn.Module, context: torch.Tensor):
     """A draft layer's K and V of the context tokens. Only the qkv_proj's K/V
     columns when its weight is a plain matrix: the Q columns would be
-    discarded (1024 of this rank's 1280 for MiniMax-M3's draft at TP8).
-    Only with additional_config minimax_dspark_split_fc (r6); else the whole
-    qkv_proj."""
-    weight = _flipped_weight(attn.qkv_proj, context.dtype) if SPLIT_FC else None
+    discarded (1024 of this rank's 1280 for MiniMax-M3's draft at TP8)."""
+    weight = _flipped_weight(attn.qkv_proj, context.dtype)
     if weight is None:
         qkv, _ = attn.qkv_proj(context)
         kv = qkv[:, attn.q_size :]
     else:
         kv = torch.matmul(context, weight[:, attn.q_size :])
     return kv.split([attn.kv_size, attn.kv_size], dim=-1)
-
-
-def set_split_fc(additional_config) -> None:
-    global SPLIT_FC
-    SPLIT_FC = bool(option(additional_config, "minimax_dspark_split_fc"))
-    if SPLIT_FC:
-        logger.info(
-            "MiniMax-M3 DSpark split fc on: additional_config.minimax_dspark_split_fc"
-        )
 
 
 class MiniMaxM3DSparkModel(Qwen3DSparkModel):
@@ -400,14 +263,70 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
         hidden_size, eps = self.config.hidden_size, self.config.rms_norm_eps
         self.hidden_norm = GemmaRMSNorm(hidden_size, eps=eps)
         self.norm = GemmaRMSNorm(hidden_size, eps=eps)
-        set_split_fc(vllm_config.additional_config)
+        # One write op for every layer's sharded context K/V
+        # (`cp_draft_attention.write_layers_op`), set by `prepare_draft_kv_write`.
+        self._one_kv_write_op = None
 
-    # Set by `prepare_rank_rows_context_kv` (sharded draft DCP only).
-    rank_rows_context_kv: dict | None = None
+    def prepare_draft_kv_write(self) -> None:
+        """With TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE, build the all-layer sharded
+        context K/V write (outside any compiled forward) when every layer
+        keeps its KV DCP-sharded with the same sharding."""
+        if not envs.TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE:
+            return
+        configs = set()
+        for layer in self.layers:
+            impl = layer.self_attn.attn.impl
+            cfg = getattr(impl, "sharded_draft_dcp", None)
+            if cfg is None or getattr(impl, "num_kv_heads", None) != 1:
+                configs.add(None)
+                continue
+            configs.add(
+                (
+                    cfg["dcp"],
+                    min(cfg["dcp"], cfg["kv_head_replicas"]),
+                    cfg["k_scale"],
+                    cfg["v_scale"],
+                )
+            )
+        if len(configs) != 1 or None in configs:
+            logger.info(
+                "MiniMax DSpark: TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE set but the "
+                "draft layers' KV is not uniformly DCP-sharded; per-layer writes."
+            )
+            return
+        self._one_kv_write_op = cp_draft_attention.write_layers_op(
+            *configs.pop(), len(self.layers)
+        )
+        logger.info(
+            "MiniMax DSpark: one sharded context K/V write for %d draft layers.",
+            len(self.layers),
+        )
+
+    def _write_context_kv_one_op(self, context, positions, metadata) -> None:
+        """Every layer's own-head context K/V through the one all-layer write."""
+        keys, values = [], []
+        for layer in self.layers:
+            attn = layer.self_attn
+            k, v = _context_kv(attn, context)
+            k = _per_head_norm(k, attn.k_norm, attn.head_dim)
+            k, _ = attn.rotary_emb(positions, k, None)
+            impl = attn.attn.impl
+            shape = (context.shape[0], impl.num_kv_heads, impl.head_size)
+            keys.append(k.reshape(shape))
+            values.append(v.reshape(shape))
+        attns = [layer.self_attn.attn for layer in self.layers]
+        cp_draft_attention.write_layers_with_dcp(
+            keys=torch.stack(keys),
+            values=torch.stack(values),
+            kv_caches=[attn.kv_cache for attn in attns],
+            attn_metadata=metadata,
+            dcp_rank=attns[0].draft_dcp_rank,
+            op=self._one_kv_write_op,
+        )
 
     def store_context_kv(
         self,
-        target_hidden_states: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+        target_hidden_states: torch.Tensor,
         positions: torch.Tensor,
         metadata: "tuple[AttentionMetadata, ...]",
     ) -> torch.Tensor:
@@ -415,20 +334,20 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
 
         context = Gemma-norm(fc(concat(aux states))); per layer, K/V are that
         layer's qkv_proj rows of the context, with K Gemma-normed per head and
-        roped at the context positions. Runs every projection through its
-        layer, so the MXFP8 linears keep their checkpoint numerics.
-        `target_hidden_states` is the aux states, or their concat.
+        roped at the context positions. fc and the K/V columns of qkv_proj
+        contract against their flipped weights directly when those are plain
+        matrices (`_flipped_weight`, the same matmul the layers apply), and run
+        through their layers otherwise.
         """
-        aux = (
-            list(target_hidden_states)
-            if isinstance(target_hidden_states, (list, tuple))
-            else [target_hidden_states]
-        )
-        if self.rank_rows_context_kv is not None:
-            return store_context_kv_rank_rows(self, aux, positions, metadata)
-        target_hidden_states = aux[0] if len(aux) == 1 else torch.cat(aux, dim=-1)
+        # fc's weight is replicated on every TP rank (360 MiB): split its
+        # columns over the ranks rather than read it whole on each.
         context = self.hidden_norm(_column_parallel(self.fc, target_hidden_states))
         num_tokens = context.shape[0]
+        if self._one_kv_write_op is not None and all(
+            m is metadata[0] for m in metadata
+        ):
+            self._write_context_kv_one_op(context, positions, metadata[0])
+            return context
         for layer, layer_metadata in zip(self.layers, metadata, strict=True):
             attn = layer.self_attn
             k, v = _context_kv(attn, context)
@@ -465,8 +384,6 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
     # Under DCP the draft's sliding-window KV is sharded over the group like
     # the target's (`layers/adapter/cp_draft_attention`), not whole per rank.
     shards_draft_kv_over_dcp = True
-    # `tpu_precompute_and_store_context_kv` takes the aux states unconcatenated.
-    tpu_context_kv_takes_aux_list = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
@@ -495,6 +412,8 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
         self.register_buffer("markov_w2_shard", None, persistent=False)
         self.register_buffer("vocab_shard_start", None, persistent=False)
         self.register_buffer("vocab_shard_pad_mask", None, persistent=False)
+        # The armed fused Markov kernel (TPU_DSPARK_MARKOV_KERNEL), or None.
+        self._fused_markov = None
 
     def _vocab_parallel_markov_blocker(self) -> str | None:
         """Why the shard argmax cannot reproduce the gathered argmax, or None."""
@@ -540,7 +459,8 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
             rows = rows.to(head_dtype)
         self.markov_w2_shard = F.pad(rows, (0, 0, 0, width - (end - start)))
         device = markov_w2.device
-        self.vocab_shard_start = torch.tensor(start, dtype=torch.int64, device=device)
+        # float32, as the (max, id) pairs carry ids (`shard_argmax_pair`).
+        self.vocab_shard_start = torch.tensor(start, dtype=torch.float32, device=device)
         if self.lm_head.org_vocab_size_padded == self.lm_head.org_vocab_size:
             self.vocab_shard_pad_mask = None
         else:
@@ -567,6 +487,51 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
             self.lm_head.num_embeddings_per_partition,
         )
         return True
+
+    def enable_fused_markov(self, k: int) -> bool:
+        """DSparkProposer opt-in (TPU_DSPARK_MARKOV_KERNEL), after the shard
+        path is on: arm one Pallas call for the K-step greedy chain. Collective
+        over the TP group. Returns False when the kernel's arithmetic (bf16
+        bias and scores, no pad columns inside the shard, ids = draft ids)
+        would not be this head's."""
+        blocker = None
+        if self.markov_w2_shard is None:
+            blocker = "the vocab-parallel Markov shard is off"
+        elif self.vocab_shard_pad_mask is not None:
+            blocker = "the LM head shard has pad columns"
+        elif self._markov_cast_dtype is not None:
+            blocker = "the logits processor casts to a head dtype"
+        elif self.draft_id_to_target_id is not None:
+            blocker = "draft ids are remapped to target ids"
+        elif self.markov_w2_shard.dtype != torch.bfloat16:
+            blocker = f"the Markov head is {self.markov_w2_shard.dtype}"
+        if blocker is not None:
+            logger.info("TPU_DSPARK_MARKOV_KERNEL=1 not armed: %s.", blocker)
+            return False
+        from vllm_torchtpu.spec_decode import markov_kernel_op
+
+        self._fused_markov = markov_kernel_op.arm(
+            self.model.markov_head.markov_w1.weight,
+            self.markov_w2_shard,
+            vs=self.lm_head.num_embeddings_per_partition,
+            vocab_start=int(self.vocab_shard_start),
+            k=k,
+        )
+        return self._fused_markov is not None
+
+    @property
+    def fused_markov_max_rows(self) -> int:
+        from vllm_torchtpu.kernels.collectives.markov_argmax import MAX_ROWS
+
+        return MAX_ROWS
+
+    def markov_draft_fused(
+        self, logits_3d: torch.Tensor, prev: torch.Tensor
+    ) -> torch.Tensor:
+        """``[rows, k]`` greedy drafts from the ``[rows, k, vs]`` logits shard
+        and each row's anchor id, equal to k steps of markov_argmax_shard."""
+        assert self._fused_markov is not None
+        return self._fused_markov.draft(logits_3d, prev)
 
     def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's vocab shard of ``compute_draft_logits`` (pad columns
@@ -598,17 +563,11 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
 
     def tpu_precompute_and_store_context_kv(
         self,
-        hidden_states: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+        hidden_states: torch.Tensor,
         positions: torch.Tensor,
         metadata: "tuple[AttentionMetadata, ...]",
     ) -> torch.Tensor:
         return self.model.store_context_kv(hidden_states, positions, metadata)
-
-    def prepare_sharded_context_kv(self, group, dcp: int, kv_head_replicas: int) -> bool:
-        """DSparkProposer hook once sharded draft DCP is enabled: split the
-        context K/V work over the DCP group by rows
-        (`store_context_kv_rank_rows`). Returns whether it did."""
-        return prepare_rank_rows_context_kv(self.model, group, dcp, kv_head_replicas)
 
     @staticmethod
     def _rename_checkpoint_weights(

@@ -73,13 +73,29 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
+    TPU_MINIMAX_M3_FP8_LINEARS: bool = True
+    TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS: int = 0
+    TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS: int = 0
+    TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE: bool = False
+    TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_COUNTING_SORT: bool = True
+    TPU_MOE_BOUNDED_ONEHOT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
+    TPU_MOE_TC_COMBINE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
+    TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
+    TPU_MOE_V3_PAYLOAD_SORT: bool = False
+    TPU_MOE_FLAT_ROUTING_MIN_TOKENS: int = 0
+    TPU_MOE_ROUTE_TRACE: int = 0
+    TPU_MOE_ROUTE_TRACE_EVERY: int = 8192
+    VLLM_TPU_MOE_REDUNDANT_EXPERTS: int = 0
+    TPU_MOE_NVFP4_SKIP_PADDED: bool = False
+    TPU_MOE_SKIP_PADDED_MIN_ROUTES: int = 0
+    VLLM_TPU_MOE_REDUNDANT_PLACEMENT: str = ""
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
@@ -126,6 +142,15 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
+    TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY: bool = True
+    TPU_DRAFT_BUCKET_STEP: int = 32
+    TPU_SPEC_SYNTHETIC_ROW_SPLIT: bool = True
+    TPU_SPEC_GLUE_FUSION: bool = False
+    TPU_SPEC_GATHER_IN_BOUNDS: bool = False
+    TPU_SPEC_SYNTHETIC_INGRAPH_RNG: bool = False
+    TPU_SPEC_SYNTHETIC_HEAD_FUSION: bool = False
+    TPU_SPEC_SUBST_EXTRACT_FUSION: bool = False
+    TPU_DSPARK_MARKOV_KERNEL: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -188,6 +213,18 @@ if TYPE_CHECKING:
     EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK: bool = False
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
+    VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB: int = 128
+    VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB: int = 64
+    TPU_RAIDEN_LRU_REFRESH: int = 0
+    TPU_HOST_HEAP_REPORT: int = 0
+    TPU_HOST_HEAP_USAGE_AFTER_S: int = 900
+    TPU_RELEASE_JAX_CACHES: bool = False
+    TPU_SPEC_PRECOMPILE_SYNTHETIC_VERIFY_ONLY: bool = False
+    TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS: str = ""
+    TPU_RAIDEN_OFFLOAD_STATS: bool = False
+    TPU_RAIDEN_FLUSH_REAL_REUSE: bool = False
+    TPU_RAIDEN_LOSS_TRACE: bool = False
+    TPU_RAIDEN_WB_DROP_COVERED: bool = False
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
@@ -207,6 +244,18 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_PREFILL_SPACING_FRAC: float = 0.5
+    VLLM_TPU_PREFILL_SPACING_MIN_TOKENS: int = 8192
+    VLLM_TPU_PREFILL_TPOT_TARGET_MS: float = 0.0
+    VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
+    TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
+    TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
+    TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
+    TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
+    TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
+    TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
+    TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
+    TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE: str = ""
 
 
 def env_with_choices(
@@ -695,6 +744,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
     ),
+    # MiniMax-M3 target-model MXFP8 linears run on e4m3 weights with a
+    # per-channel power-of-two scale (models/minimax_m3/quant.py); 0 restores
+    # the exact bf16 dequantization.
+    "TPU_MINIMAX_M3_FP8_LINEARS": env_bool("TPU_MINIMAX_M3_FP8_LINEARS", default=True),
+    # MiniMax-M3 e4m3 linears (TPU_MINIMAX_M3_FP8_LINEARS): token buckets of at
+    # most this many rows quantize the activations to e4m3 per token (dynamic
+    # abs-max scale) and run the matmul fp8 x fp8 on the MXU instead of
+    # upcasting the weights to bf16 (decode buckets: faster on v7x); larger
+    # buckets keep bf16 activations, where XLA's fp8 dot plus the quantization
+    # measured slower. Changes numerics. 0 (default) keeps bf16 activations.
+    "TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS", 0
+    ),
+    # Smallest token bucket TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS applies to.
+    "TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS", 0
+    ),
+    # MiniMax-M3 DSpark under DCP: write every draft layer's context K/V into
+    # its sharded (head-split) cache with one op instead of one op per layer,
+    # so the shared token layout, slots and runs are computed once
+    # (`cp_draft_attention.write_layers_op`). Applies only when all draft
+    # layers are DCP-sharded with one sharding and share one attention
+    # metadata; otherwise the per-layer writes run. Default off.
+    "TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE": env_bool(
+        "TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE", default=False
+    ),
+    # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
+    # permutation-free dense-expert kernel (kernels/experimental/
+    # moe_dense_expert_fp4.py) instead of sort + grouped GEMM + combine.
+    # 0 disables it.
+    "TPU_MOE_DENSE_FP4_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MOE_DENSE_FP4_MAX_TOKENS", 16
+    ),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
     # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after
@@ -719,6 +801,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # counting sort either way. A stand-down knob in case a libtpu release
     # miscompiles the rank contraction again.
     "TPU_MOE_COUNTING_SORT": env_bool("TPU_MOE_COUNTING_SORT", True),
+    # Run the EP one-hot MoE permute and combine as Pallas kernels that visit
+    # only the 128-slot blocks of the valid local prefix (about 1/EP of the
+    # routed slots) instead of dense one-hot matmuls over every slot, where
+    # the shapes allow (kernels/megablox/moe_onehot_bounded.py). A stand-down
+    # knob; the owner-output combine (TPU_MOE_OWNER_OUTPUT_MODE) takes
+    # precedence over this combine.
+    "TPU_MOE_BOUNDED_ONEHOT": env_bool("TPU_MOE_BOUNDED_ONEHOT", True),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
@@ -741,12 +830,76 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES", 0
     ),
+    # Expert-parallel MoE combine of large batches on the TensorCore
+    # (kernels/megablox/tc_combine.py) instead of the SparseCore
+    # gather-reduce, where its shape admits it.
+    "TPU_MOE_TC_COMBINE": env_bool("TPU_MOE_TC_COMBINE"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
     "RAGGED_GATHER_REDUCE_VERSION": env_with_choices(
         "RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2", "v3"]
     ),
+    # EP MoE steps of at least this many tokens combine the expert outputs on
+    # the TensorCore (kernels/megablox/moe_tc_combine.tc_slab_combine: aligned
+    # 16-row slab DMAs plus a 0/1 selection matmul, then the f32 top-k-order sum
+    # of the SparseCore v3 combine) instead of the SparseCore gather-reduce.
+    # 0 (default) keeps the SparseCore combine. Needs tokens divisible by 256.
+    "TPU_MOE_TC_COMBINE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MOE_TC_COMBINE_MIN_TOKENS", 0
+    ),
+    # Build the v3 combine's per-block route metadata with one multi-operand
+    # TensorCore sort instead of an argsort plus four gathers (which XLA
+    # offloads to the SparseCore ahead of the dispatch). Same values.
+    "TPU_MOE_V3_PAYLOAD_SORT": env_bool("TPU_MOE_V3_PAYLOAD_SORT"),
+    # EP MoE steps of at least this many tokens flatten the [tokens, top_k]
+    # routing ids and weights once (behind an optimization barrier) before the
+    # routing prep, so the [T, 4] arrays (32x lane-padded in HBM) are read once
+    # instead of being relaid out for every consumer shape. Same values. 0 = off.
+    "TPU_MOE_FLAT_ROUTING_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MOE_FLAT_ROUTING_MIN_TOKENS", 0
+    ),
+    # Diagnostics (layers/adapter/moe_route_trace.py): keep the per-expert
+    # routed-row counts of the last N forward steps of every MoE layer in a
+    # device ring buffer and log them from TP rank 0 every
+    # TPU_MOE_ROUTE_TRACE_EVERY model-runner steps. Adds an index_copy per MoE
+    # layer to the graph, so it is compile-hashed here. 0 = off.
+    "TPU_MOE_ROUTE_TRACE": env_nonnegative_int("TPU_MOE_ROUTE_TRACE", 0),
+    "TPU_MOE_ROUTE_TRACE_EVERY": env_nonnegative_int(
+        "TPU_MOE_ROUTE_TRACE_EVERY", 8192
+    ),
+    # NVFP4 GMM MoE: give padded rows of a token bucket zero routing weights
+    # (token_padding mask), so TPU_MOE_SKIP_PADDED_TOKENS drops them from the
+    # grouped matmul as the FP8 path already does. Their outputs are discarded,
+    # but today they route like real tokens and every expert they touch costs
+    # its weight read. Needs TPU_MOE_SKIP_PADDED_TOKENS=1. Default off.
+    "TPU_MOE_NVFP4_SKIP_PADDED": env_bool("TPU_MOE_NVFP4_SKIP_PADDED"),
+    # NVFP4 decode MoE: run gmm_v2_mlp calls of at most <max size_m> rows as
+    # one streamed kernel (kernels/megablox/gmm_decode_stream.py) that feeds
+    # every hit expert's gate_up then down weights as <chunk_rows>-row k-slices
+    # through <slots> VMEM slots, so one chunk (not one whole expert block per
+    # gmm) is exposed per call. "<chunk_rows>:<slots>[@<max size_m>]", "on" =
+    # 768:4@512. Same numerics as the fp8 rhs feed. Empty = off.
+    "TPU_GMM_V2_DECODE_STREAM": env_str("TPU_GMM_V2_DECODE_STREAM", ""),
+    # TPU_MOE_SKIP_PADDED_TOKENS drops padded rows from the grouped matmul only
+    # in batches of at least this many routes (T * top_k); smaller batches run
+    # them as with the skip off (bitwise for real rows). 0 = every size.
+    "TPU_MOE_SKIP_PADDED_MIN_ROUTES": env_nonnegative_int(
+        "TPU_MOE_SKIP_PADDED_MIN_ROUTES", 0
+    ),
+    # Redundant MoE experts on the grouped-matmul EP path
+    # (layers/adapter/moe_redundant.py): extra expert slots per EP rank per
+    # MoE layer, each holding a copy of another rank's expert, and a per-step
+    # router remap that moves work onto the replicas. 0 = off.
+    "VLLM_TPU_MOE_REDUNDANT_EXPERTS": env_nonnegative_int(
+        "VLLM_TPU_MOE_REDUNDANT_EXPERTS", 0
+    ),
+    # Which experts get the redundant slots: a JSON file path, inline JSON
+    # ('{"L3": [17, ...]}', hottest first), or "builtin:<name>". Empty = the
+    # built-in round-robin fill. Placement reaches the compiled graph as
+    # buffers, never as constants. Route-trace keys ("moe<i>", the i-th MoE
+    # layer) come from `python -m vllm_torchtpu.layers.adapter.moe_redundant LOG`.
+    "VLLM_TPU_MOE_REDUNDANT_PLACEMENT": env_str("VLLM_TPU_MOE_REDUNDANT_PLACEMENT", ""),
     # Capture one trace per inference phase instead of one continuous trace.
     # The trace directory and iteration limits come from `profiler_config`;
     # this only selects which profiler consumes them.
@@ -940,6 +1093,61 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # effect for models whose ops implement that pass (DeepSeek-V4); 0 keeps
     # every verify window on the mixed pass.
     "TPU_SPEC_STATIC_VERIFY": env_bool("TPU_SPEC_STATIC_VERIFY", default=True),
+    # Under synthetic rejection sampling, decide acceptance before the LM head
+    # and compute logits and sample on one row per request (its first
+    # rejected slot or its bonus slot) instead of every verify row.
+    "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY": env_bool(
+        "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY", default=True
+    ),
+    # Extra DFlash/DSpark draft-forward buckets above 64 tokens, this many
+    # apart (`DFlashProposer._fine_draft_buckets`; 0: the target's token
+    # buckets only). A draft is num_reqs * block tokens, which the target's
+    # coarse buckets pad by up to ~45 %.
+    "TPU_DRAFT_BUCKET_STEP": env_nonnegative_int("TPU_DRAFT_BUCKET_STEP", 32),
+    # Under the synthetic one-row verify, split the requests' rows over the TP
+    # ranks: an all-to-all of the LM head shards instead of an all-gather of
+    # the full logits, each rank samples its block, the tokens are gathered.
+    # Needs the model's compute_logits_shard; same tokens.
+    "TPU_SPEC_SYNTHETIC_ROW_SPLIT": env_bool(
+        "TPU_SPEC_SYNTHETIC_ROW_SPLIT", default=True
+    ),
+    # Run the async spec-decode glue between the draft and the next forward
+    # (substitution source, rejected count, the next step's seq_lens and
+    # positions correction) as two compiled programs instead of about eight
+    # eager ones. Integer ops only; same values.
+    "TPU_SPEC_GLUE_FUSION": env_bool("TPU_SPEC_GLUE_FUSION", default=False),
+    # Gather the non-greedy verify's bonus and target logits rows with one
+    # JAX op (in-bounds gathers) instead of torch index_select, which lowers
+    # to an out-of-bounds-filling gather that reassembles the [T, vocab]
+    # rows in vocab chunks (pad + maximum): 54 -> 9 us at T=48. Same values:
+    # the indices are always in bounds (padding rows use 0).
+    "TPU_SPEC_GATHER_IN_BOUNDS": env_bool("TPU_SPEC_GATHER_IN_BOUNDS", default=False),
+    # Under the synthetic one-row verify, draw the accept and recovery
+    # uniforms inside the two compiled sampler programs from a device counter
+    # (keyed counter-based hash, 24-bit uniforms like torch.rand) instead of
+    # two eager torch.rand calls on the sampling generator. Same distribution,
+    # different random stream.
+    "TPU_SPEC_SYNTHETIC_INGRAPH_RNG": env_bool(
+        "TPU_SPEC_SYNTHETIC_INGRAPH_RNG", default=False
+    ),
+    # With TPU_SPEC_SYNTHETIC_INGRAPH_RNG, run a decode-only step's synthetic
+    # one-row verify (accept decisions, LM head on the chosen rows, sampling
+    # and assembly) as one compiled program instead of three. Same functions
+    # in the same order; the step's logits stay inside the program.
+    "TPU_SPEC_SYNTHETIC_HEAD_FUSION": env_bool(
+        "TPU_SPEC_SYNTHETIC_HEAD_FUSION", default=False
+    ),
+    # Async spec, steady decode: when the next step's input_ids are the first
+    # rows of the parked substitution source (fast token substitution's
+    # identity case), build them and re-source the verify's draft ids in one
+    # compiled program instead of an eager slice plus an eager gather.
+    "TPU_SPEC_SUBST_EXTRACT_FUSION": env_bool(
+        "TPU_SPEC_SUBST_EXTRACT_FUSION", default=False
+    ),
+    # Run the DSpark greedy Markov chain over the vocab-parallel draft logits
+    # as one Pallas call (kernels/collectives/markov_argmax.py) instead of K
+    # steps of XLA matvec + argmax + all-gather. Same ids.
+    "TPU_DSPARK_MARKOV_KERNEL": env_bool("TPU_DSPARK_MARKOV_KERNEL", default=False),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
@@ -1174,6 +1382,86 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # How many times an offload save whose transfer failed is retried.
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES": env_int("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
+    # MiB of one worker's KV that offload loads may have in flight at once
+    # (0: no bound); the step's input uploads queue behind them.
+    "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB": env_int(
+        "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB", 128
+    ),
+    # MiB of one worker's KV that offload saves may have in flight at once
+    # (0: no bound); the next forward's KV write waits for them.
+    "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB": env_int(
+        "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB", 64
+    ),
+    # Raiden host-pool LRU refresh of chains a request already finds resident.
+    # The store skips a resident key without touching it, and a key served
+    # from HBM is never looked up on the host, so the head of a long-lived
+    # prefix ages out of the host LRU first and makes the whole chain
+    # unreachable. 0: off. 1: refresh resident keys a store skips (the
+    # flush that runs right before HBM evicts the chain). 2: also refresh
+    # the finished request's resident leading chain (vLLM's CPU offload
+    # manager touches at request finish). Scheduler-side, host-only.
+    "TPU_RAIDEN_LRU_REFRESH": env_int("TPU_RAIDEN_LRU_REFRESH", 0),
+    # Host-heap diagnostics at worker start-up (worker/host_heap_report.py):
+    # 1 = RSS / tcmalloc / anon mappings, 2 = + Python heap census,
+    # 3 = + measure dropping start-up-only references. Host-only.
+    # 4 = + per-precompile-pass heap and executable counts, and which of the
+    # compiled executables serving calls (logged TPU_HOST_HEAP_USAGE_AFTER_S
+    # seconds after warm-up, then every 10 min). Host-only.
+    "TPU_HOST_HEAP_REPORT": env_int("TPU_HOST_HEAP_REPORT", 0),
+    "TPU_HOST_HEAP_USAGE_AFTER_S": env_int("TPU_HOST_HEAP_USAGE_AFTER_S", 900),
+    # Spec decode with synthetic acceptance (SYNTHETIC_ACCEPTANCE_LENGTH, perf
+    # runs): warm only the synthetic one-row verify at each rejection-sampler
+    # bucket, not the full greedy / non-greedy rejection-sampler graphs that
+    # such steps never run. Saves their compile time and host memory; a step
+    # that needs the full path (logprobs, grammar, min_tokens) compiles it on
+    # first use. No effect on real-acceptance runs.
+    "TPU_SPEC_PRECOMPILE_SYNTHETIC_VERIFY_ONLY": env_bool(
+        "TPU_SPEC_PRECOMPILE_SYNTHETIC_VERIFY_ONLY", default=False
+    ),
+    # Which sampler variants of the synthetic one-row verify
+    # (synthetic_sample_and_assemble[_rng], synthetic_verify_head) warm-up
+    # compiles at each rejection-sampler bucket. Each step picks one of
+    # `full` (top-k and top-p), `no_topk_topp` (no request sets either),
+    # `top_p` (top-p set, no top-k) and `topk_candidates` from its requests'
+    # sampling params. Empty (default): all of them. `auto`: the one a batch
+    # of requests on the model's default sampling params (generation config)
+    # picks. Otherwise a comma list of names. A step that picks a variant not
+    # warmed compiles it on first use (logged once). Also warms the verify
+    # row selection on its runtime inputs. Host memory only; outputs
+    # unchanged.
+    "TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS": env_str(
+        "TPU_SPEC_PRECOMPILE_SAMPLER_VARIANTS", ""
+    ),
+    # Drop JAX's tracing / lowering caches once warm-up has compiled every
+    # bucket. The Pallas kernels are already lowered into the compiled
+    # programs; the cached jaxprs only serve a re-trace. Frees ~0.9 GiB host
+    # per worker on MiniMax-M3.1 c48 (~7 GiB per host). Host-only.
+    "TPU_RELEASE_JAX_CACHES": env_bool("TPU_RELEASE_JAX_CACHES", default=False),
+    # Periodic Raiden offload counters (stores offered/skipped/stored,
+    # refreshed entries, cancelled stores, write-back drops by cause, host
+    # lookups that miss a chain head while a later key is resident).
+    "TPU_RAIDEN_OFFLOAD_STATS": env_bool("TPU_RAIDEN_OFFLOAD_STATS", default=False),
+    # Flush (cancel a fence-pending / drain a launched) offload store only for
+    # blocks the block pool really handed out fresh this step. vLLM's offload
+    # scheduler counts a new request's prefix-HIT blocks as allocated too, so a
+    # prefix hit on a chain whose store is still parked cancels the whole store
+    # (the chain never reaches the host) or drains it synchronously. A hit
+    # block keeps its contents, so reading it later is safe. Scheduler-side.
+    "TPU_RAIDEN_FLUSH_REAL_REUSE": env_bool(
+        "TPU_RAIDEN_FLUSH_REAL_REUSE", default=False
+    ),
+    # Diagnostics: remember each offload key's last store/cancel/evict event
+    # and, for each request whose host lookup stops >= 8k tokens short of its
+    # prompt, log why the first missing key is missing; time store drains.
+    "TPU_RAIDEN_LOSS_TRACE": env_bool("TPU_RAIDEN_LOSS_TRACE", default=False),
+    # Write-back: a held (finished, not yet stored) request is dropped
+    # unstored only when the pool reallocates one of its blocks or one step's
+    # prefix hits cover all of its blocks (the conversation's next turn now
+    # holds the chain), not on any prefix hit. A subagent hitting a parent's
+    # shared prefix no longer drops the parent's chain. Scheduler-side.
+    "TPU_RAIDEN_WB_DROP_COVERED": env_bool(
+        "TPU_RAIDEN_WB_DROP_COVERED", default=False
+    ),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
@@ -1263,6 +1551,94 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # PrefillSpacingScheduler: decode-only time owed after a step that runs a
+    # chunk of a long prompt, as a fraction of that step's time (0 disables
+    # spacing; prefill chunks are still ordered shortest first).
+    "VLLM_TPU_PREFILL_SPACING_FRAC": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_SPACING_FRAC", 0.5
+    ),
+    # PrefillSpacingScheduler: a prompt is long, and its chunks are spaced,
+    # while at least this many of its prompt tokens are left to compute.
+    "VLLM_TPU_PREFILL_SPACING_MIN_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_PREFILL_SPACING_MIN_TOKENS", 8192
+    ),
+    # PrefillSpacingScheduler: TPOT target in ms. Prefill is deferred while a
+    # long-chunk step would push a decoding request that can still meet it past
+    # it (TPOT projected from max_tokens: only acts when clients set max_tokens
+    # with ignore_eos; 0 disables).
+    "VLLM_TPU_PREFILL_TPOT_TARGET_MS": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_TPOT_TARGET_MS", 0.0
+    ),
+    # PrefillSpacingScheduler: longest run of steps, in seconds, that the TPOT
+    # target alone may defer prefill for; the next step then runs prefill.
+    "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S", 10.0
+    ),
+    # MiniMax M3 DCP steps of at most this many tokens merge the attention
+    # partials with one packed all-to-all instead of an LSE all-gather plus an
+    # output reduce-scatter (`models.minimax_m3.dcp_pack`). 0 keeps the
+    # reduce-scatter. Exact on a DCP 2 pair.
+    "TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS", 0
+    ),
+    # MiniMax M3 DCP steps of at most this many tokens gather the query heads
+    # and the top-k candidates in one all-gather, after the scoring op,
+    # instead of two (`models.minimax_m3.dcp_pack`). 0 keeps two gathers.
+    "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS", 0
+    ),
+    # MiniMax M3 4-bit MSA prefill attention with a page cache:
+    # "<threshold>:<block_q>:<tile_pages>" runs a call whose selections hold
+    # more than <threshold> distinct pages per query tile on average with
+    # <block_q>-token tiles and <tile_pages> cached union pages, other calls
+    # with the configured tiles (`msa_attention_lse.adaptive_prefill`). Empty
+    # keeps one configuration.
+    "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE": env_str(
+        "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE", ""
+    ),
+    # MiniMax M3 head-parallel DCP prefill attention (`msa_dcp_heads`, steps of
+    # at least 2,048 tokens at DCP 8) kernel config, "<block_q>:<pages per
+    # step>:<step widths, '/'-separated>:<page cache slots>", e.g.
+    # "16:16:2/4/6/8/12:512". Empty keeps msa_dcp_heads' defaults (block_q
+    # 8, 64 pages per step, the kernel's widths, no page cache); the
+    # TPU_MINIMAX_M3_MSA_PREFILL_* flags apply only to `msa_attend_dcp`.
+    "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG": env_str(
+        "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG", ""
+    ),
+    # MiniMax M3 MSA prefill page cache table (`msa_attention_lse._page_cache`):
+    # how its sorts run. Empty keeps three stable sorts (two of two operands);
+    # "unstable" drops the stability; "packed" sorts one packed int32 operand
+    # per sort, unstable; "packed_search" also finds the distinct keys by a
+    # binary search instead of the second sort. Same table bit for bit.
+    "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT": env_str(
+        "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT", ""
+    ),
+    # MiniMax M3 MSA prefill page cache: narrower table widths below
+    # TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_TILE_PAGES, '/'-separated (e.g.
+    # "64/128"). Each layer's calls sort the narrowest width that holds their
+    # widest tile union (one branch of the same program). Same table bit for
+    # bit. Empty always sorts TILE_PAGES entries per tile.
+    "TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS": env_str(
+        "TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS", ""
+    ),
+    # MiniMax M3 MSA prefill attention on 4-bit caches (calls with the page
+    # cache): ','-separated precision levers, empty = exact incumbent.
+    # "qk8": fp8 queries x fp8 keys (int4 keys are exact in fp8) on the MXU;
+    # "pv8": fp8 probabilities (carrying the V scales) x fp8 int4 values.
+    # Not bit-identical.
+    "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION": env_str(
+        "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION", ""
+    ),
+    # MiniMax M3 MSA cross-layer block-selection reuse (IndexCache) on
+    # decode-sized steps under DCP (`models.minimax_m3.index_reuse`): the
+    # pattern of Full layers, which run the indexer; the other (Shared) layers
+    # attend over the nearest preceding Full layer's selection. "N" or
+    # "stride:N" (Full layers 0, N, 2N, ...), "full:0,a,b,..." (explicit Full
+    # list, must hold 0) or one F/S letter per layer. Empty (or "1") = off.
+    # Lossy. Prefill steps are unchanged.
+    "TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE": env_str(
+        "TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE", ""
     ),
 }
 

@@ -14,11 +14,11 @@
 """MiniMax Sparse Attention layer on TPU."""
 
 import functools
+from collections.abc import Callable
 
 import torch
 from torch import nn
 from transformers import PreTrainedConfig
-from vllm import ir
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -39,13 +39,17 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
-from vllm_torchtpu.models.minimax_m3 import kernel_toggles
-from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_fp4
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.minimax_m3 import index_reuse as msa_index_reuse
+from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_dcp_op,
     get_msa_op,
     get_msa_sharded_op,
 )
+from vllm_torchtpu.models.minimax_m3.ops.qk_norm_rope import get_qk_norm_rope_op
+
+logger = init_logger(__name__)
 
 
 class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
@@ -167,36 +171,6 @@ def shard_index_cache_enabled(vllm_config: VllmConfig) -> bool:
     return enabled
 
 
-# --additional-config key: pick DCP prefill candidates per query tile
-# (`kernels.msa_dcp._tile_candidates`). Part of the compile-cache key.
-TILE_SELECT_KEY = "minimax_msa_tile_select"
-
-
-def tile_select_enabled(vllm_config: VllmConfig) -> bool:
-    config = vllm_config.additional_config
-    if not isinstance(config, dict):
-        return False
-    enabled = config.get(TILE_SELECT_KEY, False)
-    if not isinstance(enabled, bool):
-        raise ValueError(f"additional_config.{TILE_SELECT_KEY} must be a bool")
-    return enabled
-
-
-# --additional-config key: DCP decode candidates scan only each row block's
-# live pages (`kernels.msa_dcp._live_candidates`). Part of the compile-cache key.
-LIVE_SELECT_KEY = "minimax_msa_live_select"
-
-
-def live_select_enabled(vllm_config: VllmConfig) -> bool:
-    config = vllm_config.additional_config
-    if not isinstance(config, dict):
-        return False
-    enabled = config.get(LIVE_SELECT_KEY, False)
-    if not isinstance(enabled, bool):
-        raise ValueError(f"additional_config.{LIVE_SELECT_KEY} must be a bool")
-    return enabled
-
-
 @functools.cache
 def _dcp_rank_tensor(rank: int, device: str) -> torch.Tensor:
     """One ``int32[1]`` rank tensor shared by every MSA layer's buffer.
@@ -234,18 +208,6 @@ def cache_dtype(cache_config: CacheConfig | None) -> torch.dtype:
     )
 
 
-def neox_swap_matrix(head_dim: int, rot: int, dtype: torch.dtype) -> torch.Tensor:
-    """``P`` with ``(x @ P)[j] = x[j + rot/2]``, ``(x @ P)[j + rot/2] = x[j]``
-    for ``j < rot/2`` and zero on the pass-through lanes: one term per
-    output, so a bf16 matmul is exact (up to the sign of a zero input)."""
-    half = rot // 2
-    p = [[0.0] * head_dim for _ in range(head_dim)]
-    for j in range(half):
-        p[j + half][j] = 1.0
-        p[j][j + half] = 1.0
-    return torch.tensor(p, dtype=dtype)
-
-
 def norm_rope_heads(
     qkv: torch.Tensor,
     positions: torch.Tensor,
@@ -254,76 +216,35 @@ def norm_rope_heads(
     head_dim: int,
     norms: tuple[GemmaRMSNorm, GemmaRMSNorm, GemmaRMSNorm, GemmaRMSNorm],
     rotary_emb: nn.Module,
-    swap: torch.Tensor,
+    op: Callable[..., tuple[torch.Tensor, ...]],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Split ``[q | k | v | index_q | index_k]`` and norm + rotate all but v.
-
-    ``swap`` is `neox_swap_matrix` for the rotary dims, in ``qkv``'s dtype.
+    """Split ``[q | k | v | index_q | index_k]`` and norm + rotate all but v
+    in one kernel, `op` (`ops.qk_norm_rope.get_qk_norm_rope_op` for these
+    head counts; it also fixes q's layout).
 
     The four Gemma RMSNorms differ only in their weights and RoPE acts on each
-    head alone, so one norm over all the stacked heads with a per-head
-    ``1 + w`` table, then one rotation, gives the same values as four norms
-    and two rotations in fewer, larger ops. The v heads go through the norm
-    and rotation too (their results are dropped and v is taken from `qkv`):
-    that avoids a concatenation that skips them, which kept XLA from fusing
-    the norm, the rotation and the pass-through lanes into one pass.
-
-    The rotation is `RotaryEmbedding.forward_static` with FP32 compute (the
-    TPU rotary op, `layers.adapter.rotary_embedding`) written without slices
-    or concatenations of the heads: ``x * cos2 + (x @ P) * sin2`` with the
-    half swap ``P`` on the MXU (exact in bf16, one term per output, as in
-    `vllm_torchtpu.omni.rope`) and ``-sin`` on the first half, the same bf16
-    cos/sin cache values and the same FP32 products and sums (``a + b * -s``
-    is ``a - b * s``), so the results are equal value for value. Only an
-    output that is exactly zero can differ, in the sign of that zero, when an
-    input lane is ``-0.0`` (the matmul sums it with ``+0.0``).
-
-    Returns ``(q, k, v, index_q, index_k)`` with shapes ``[T, num_heads * D]``,
-    ``[T, num_kv_heads * D]`` (x3) and ``[T, D]``.
+    head alone, so the kernel norms every head with its row of a per-head
+    ``1 + w`` table, then rotates it, with the numerics of the TPU
+    ``rms_norm`` provider and the FP32 rotary embedding.
     """
-    num_tokens = qkv.shape[0]
-    heads = qkv.view(num_tokens, -1, head_dim)
-    nq, nkv = num_heads, num_kv_heads
+    if not rotary_emb.is_neox_style or rotary_emb.head_size != head_dim:
+        raise NotImplementedError("MiniMax M3 rotates NeoX-style within each head.")
     q_norm, k_norm, index_q_norm, index_k_norm = norms
     weight = (
         torch.cat(
             [
-                q_norm.weight.expand(nq, head_dim),
-                k_norm.weight.expand(nkv, head_dim),
-                torch.zeros_like(k_norm.weight).expand(nkv, head_dim),
-                index_q_norm.weight.expand(nkv, head_dim),
+                q_norm.weight.expand(num_heads, head_dim),
+                k_norm.weight.expand(num_kv_heads, head_dim),
+                index_q_norm.weight.expand(num_kv_heads, head_dim),
                 index_k_norm.weight.expand(1, head_dim),
             ]
         ).float()
         + 1.0
     )
-    eps = q_norm.variance_epsilon
-    assert all(n.variance_epsilon == eps for n in norms)
-    x = ir.ops.rms_norm(heads, weight, eps)
-
-    assert rotary_emb.is_neox_style
-    rot = rotary_emb.rotary_dim
-    cos_sin = rotary_emb._match_cos_sin_cache_dtype(x).index_select(
-        0, positions.flatten()
-    )
-    cos, sin = cos_sin.float().chunk(2, dim=-1)  # [T, rot / 2] each
-    pass_lanes = head_dim - rot
-    ones = cos.new_ones(num_tokens, pass_lanes)
-    # -0.0 on the pass-through lanes: x * 1 + (+0) * (-0) is x, signed zeros too.
-    neg_zeros = cos.new_full((num_tokens, pass_lanes), -0.0)
-    cos2 = torch.cat([cos, cos, ones], dim=-1).unsqueeze(1)
-    sin2 = torch.cat([-sin, sin, neg_zeros], dim=-1).unsqueeze(1)
-    swapped = torch.matmul(x, swap.to(x.dtype))
-    x = (x.float() * cos2 + swapped.float() * sin2).to(x.dtype)
-    q, k, _, index_q, index_k = x.split([nq, nkv, nkv, nkv, 1], dim=1)
-    v = heads[:, nq + nkv : nq + 2 * nkv]
-    return (
-        q.reshape(num_tokens, -1),
-        k.reshape(num_tokens, -1),
-        v.reshape(num_tokens, -1),
-        index_q.reshape(num_tokens, -1),
-        index_k.reshape(num_tokens, -1),
-    )
+    assert all(n.variance_epsilon == q_norm.variance_epsilon for n in norms)
+    cos_sin = rotary_emb._match_cos_sin_cache_dtype(qkv)
+    cos_sin = cos_sin.index_select(0, positions.flatten())
+    return op(qkv, cos_sin, weight)
 
 
 class MiniMaxM3SparseAttention(nn.Module):
@@ -340,7 +261,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         quant_config: QuantizationConfig | None,
         cache_config: CacheConfig | None,
         prefix: str,
-        reduce_results: bool = True,
+        layer_id: int | None = None,
     ) -> None:
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
@@ -373,7 +294,6 @@ class MiniMaxM3SparseAttention(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
         eps = config.rms_norm_eps
@@ -389,18 +309,8 @@ class MiniMaxM3SparseAttention(nn.Module):
                 "partial_rotary_factor": config.partial_rotary_factor,
             },
         )
-        self.register_buffer(
-            "rope_swap",
-            neox_swap_matrix(
-                self.head_dim, self.rotary_emb.rotary_dim, torch.get_default_dtype()
-            ),
-            persistent=False,
-        )
         # With one index head per rank, each rank can keep a 1 / tp share of
         # the index keys (`kernels.msa` index-cache sharding).
-        msa_dcp.TILE_SELECT_ENABLED = tile_select_enabled(get_current_vllm_config())
-        msa_dcp.LIVE_SELECT_ENABLED = live_select_enabled(get_current_vllm_config())
-        kernel_toggles.apply(get_current_vllm_config().additional_config)
         shard = shard_index_cache_enabled(get_current_vllm_config())
         self.index_shards = tp_size if shard else 1
         if self.index_shards > 1 and tp_size != config.num_key_value_heads:
@@ -451,6 +361,24 @@ class MiniMaxM3SparseAttention(nn.Module):
             sparse_cfg.get("sparse_init_block", 0),
             sparse_cfg.get("sparse_local_block", 0),
         )
+        # Cross-layer reuse of the block selection on decode steps
+        # (`index_reuse`, TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE; lossy).
+        plan = (
+            msa_index_reuse.plan_from_env(config.num_hidden_layers)
+            if layer_id is not None
+            else None
+        )
+        if plan is not None and self.dcp_size == 1:
+            logger.warning_once(
+                "%s: MSA index reuse needs --decode-context-parallel-size > 1; "
+                "refused, every layer stays Full.",
+                msa_index_reuse.ENV,
+            )
+            plan = None
+        spec = vllm_config.speculative_config
+        # The most query rows of a decode request (`index_reuse.is_decode_step`).
+        self.decode_rows = 1 + (spec.num_speculative_tokens if spec else 0)
+        self.layer_id = layer_id
         if self.dcp_size > 1:
             from vllm_torchtpu.distributed.dcp import get_dcp_rank, get_dcp_world_size
 
@@ -459,14 +387,17 @@ class MiniMaxM3SparseAttention(nn.Module):
                     f"DCP group of {get_dcp_world_size()} ranks, expected "
                     f"{self.dcp_size}."
                 )
-            spec = vllm_config.speculative_config
+            reuse_kwargs = {"index_reuse": True} if plan is not None else {}
             self.msa_op = get_msa_dcp_op(
                 *msa_config,
                 self.dcp_size,
                 self.kv_head_replicas,
                 fp4=self.fp4,
-                decode_rows=1 + (spec.num_speculative_tokens if spec else 0),
+                decode_rows=self.decode_rows,
+                **reuse_kwargs,
             )
+            if plan is not None and not self.msa_op.index_reuse:
+                plan = None  # refused by the op's paths (logged there)
             # A buffer, not a Python int, so the rank is a graph input and
             # every DCP rank compiles the same program (see get_msa_dcp_op).
             self.register_buffer(
@@ -486,15 +417,27 @@ class MiniMaxM3SparseAttention(nn.Module):
             )
         else:
             self.msa_op = get_msa_op(*msa_config, fp4=self.fp4)
+        # Set only when reuse runs: whether this layer scores on decode steps.
+        self.index_reuse_full = None if plan is None else plan.is_full(layer_id)
+        # A DCP group over one KV head reads q head-major (`get_msa_dcp_op`).
+        self.q_head_major = self.dcp_size > 1 and self.dcp_kv_heads == 1
+        self.norm_rope_op = get_qk_norm_rope_op(
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            eps,
+            self.q_head_major,
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        attn_metadata: dict | None = None,
+        index_reuse: dict | None = None,
     ) -> torch.Tensor:
-        """``attn_metadata`` (per KV-cache prefix) replaces the forward
-        context's, for a call on part of the step's tokens."""
+        """``index_reuse`` (MSA index reuse on) is a dict the step's layers
+        share: on a decode step a Full layer leaves its selection in it for
+        the Shared layers after it."""
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
@@ -504,15 +447,18 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.head_dim,
             (self.q_norm, self.k_norm, self.index_q_norm, self.index_k_norm),
             self.rotary_emb,
-            self.rope_swap,
+            self.norm_rope_op,
         )
-
         num_tokens = hidden_states.shape[0]
-        metadata = attn_metadata or get_forward_context().attn_metadata
+        if not self.q_head_major:
+            q = q.view(num_tokens, self.num_heads, self.head_dim)
+        metadata = get_forward_context().attn_metadata
         kv_cache = self.kv_cache.kv_cache
         if not isinstance(metadata, dict) or kv_cache.numel() == 0:
             # Memory profiling runs before the caches are bound.
-            attn_output = q
+            attn_output = (q.transpose(0, 1) if self.q_head_major else q).reshape(
+                num_tokens, self.q_size
+            )
         else:
             layer_metadata = metadata[self.kv_cache.prefix]
             assert isinstance(layer_metadata, AttentionMetadata)
@@ -525,8 +471,17 @@ class MiniMaxM3SparseAttention(nn.Module):
                 extra["scale_cache"] = self.scale_cache.kv_cache
                 if self.dcp_size > 1:
                     extra["hadamard"] = self.hadamard
+            if (
+                index_reuse is not None
+                and self.index_reuse_full is not None
+                and msa_index_reuse.is_decode_step(
+                    num_tokens, layer_metadata.seq_lens.shape[0], self.decode_rows
+                )
+            ):
+                extra["index_reuse"] = index_reuse
+                extra["full"] = self.index_reuse_full
             attn_output = self.msa_op(
-                q.view(num_tokens, self.num_heads, self.head_dim),
+                q,
                 k.view(num_tokens, self.num_kv_heads, self.head_dim),
                 v.view(num_tokens, self.num_kv_heads, self.head_dim),
                 index_q,

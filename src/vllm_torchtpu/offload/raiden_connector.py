@@ -52,7 +52,7 @@ import dataclasses
 import os
 import time
 from collections import Counter, OrderedDict
-from collections.abc import Iterable, Mapping, Set
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -98,15 +98,6 @@ from vllm.v1.request import Request
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.offload.raiden_staging import (
-    StagedStepOutput,
-    StagedTransferScheduler,
-    StagingBuffer,
-    kv_cache_config_leaves,
-    layout_from_tensors,
-    padded_row_bytes,
-    staging_hbm_reserve_bytes,
-)
 from vllm_torchtpu.offload import contiguous_alloc
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
@@ -178,15 +169,6 @@ class RaidenOffloadingConnectorMetadata(OffloadingConnectorMetadata):
     # reported as failed_recving; the scheduler recomputes or fails them per
     # kv_load_failure_policy.
     failed_load_req_ids: set[str] = field(default_factory=set)
-    # Staged offload (`raiden_staging`) only. Part id -> (device blocks,
-    # staging rows) to pack before recording the save fence of that part
-    # (its id is in fence_job_ids).
-    staging_packs: dict[int, tuple[list[int], list[int]]] = field(default_factory=dict)
-    # Part id -> (staging rows, device blocks) of landed loads to unpack;
-    # acknowledged as `unpacked_jobs` once retired.
-    staging_unpacks: dict[int, tuple[list[int], list[int]]] = field(
-        default_factory=dict
-    )
 
 
 @dataclass
@@ -195,8 +177,6 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
     per-rank fence acks."""
 
     fenced_jobs: dict[int, int] = field(default_factory=dict)
-    # Staged offload: per-rank acks of retired unpacks, by part id.
-    unpacked_jobs: dict[int, int] = field(default_factory=dict)
 
     def aggregate(self, other):
         assert isinstance(other, RaidenOffloadingWorkerMetadata)
@@ -206,9 +186,6 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
         merged_fenced = dict(self.fenced_jobs)
         for job_id, v in other.fenced_jobs.items():
             merged_fenced[job_id] = merged_fenced.get(job_id, 0) + v
-        merged_unpacked = dict(self.unpacked_jobs)
-        for job_id, v in other.unpacked_jobs.items():
-            merged_unpacked[job_id] = merged_unpacked.get(job_id, 0) + v
         # completed_jobs and transfer_stats are inherited from vLLM base dataclass.
         return RaidenOffloadingWorkerMetadata(
             # pyrefly: ignore[unexpected-keyword]
@@ -216,7 +193,6 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
             # pyrefly: ignore[unexpected-keyword]
             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
             fenced_jobs=merged_fenced,
-            unpacked_jobs=merged_unpacked,
         )
 
 
@@ -238,10 +214,6 @@ class WriteBackPolicy:
     chunks only when they near eviction: once one of their blocks is within
     ``window_blocks`` of the head of the free queue (the next blocks to be
     reused), at most ``max_requests_per_step`` requests per step.
-
-    A held block that a new request takes as a prefix-cache hit keeps its
-    bytes: the hold (and any store job reading it) survives. Only a block
-    the pool hands out again with other content drops its holders.
     """
 
     window_blocks: int = 1024
@@ -282,6 +254,20 @@ def _allocated_block_ids(scheduler_output: SchedulerOutput) -> set[int]:
     return allocated
 
 
+def _prefix_hit_block_ids(scheduler_output: SchedulerOutput, config) -> set[int]:
+    """Blocks new requests this step reuse as prefix-cache hits (stats only):
+    the leading blocks covering each new request's computed tokens."""
+    hits: set[int] = set()
+    tokens_per_block = {
+        g.group_idx: g.tokens_per_block for g in config.kv_group_configs
+    }
+    for req in scheduler_output.scheduled_new_reqs:
+        for group_idx, group in enumerate(req.block_ids or ()):
+            n = req.num_computed_tokens // tokens_per_block.get(group_idx, 1 << 62)
+            hits.update(bid for bid in group[:n] if bid != 0)
+    return hits
+
+
 class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     """Scheduler for the store-backed offload path.
 
@@ -293,9 +279,16 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     # (class defaults also cover instances built without __init__).
     _write_back: WriteBackPolicy | None = None
     _block_pool = None
-    _wb_hits: Set[int] = frozenset()
-    _staged: StagedTransferScheduler | None = None
-    _contiguous_alloc_scan_factor = 1
+    _contiguous_alloc_scan_factor = 3
+    # TPU_RAIDEN_LRU_REFRESH == 2: refresh a finished request's resident chain.
+    _lru_refresh_on_finish = False
+    _offload_stats = False
+    # TPU_RAIDEN_FLUSH_REAL_REUSE / TPU_RAIDEN_LOSS_TRACE; `_fresh_block_ids`
+    # collects the blocks the pool hands out between two connector metas.
+    _flush_real_reuse = False
+    _wb_drop_covered = False
+    _loss_trace = False
+    _fresh_block_ids: set[int] | None = None
 
     def __init__(
         self,
@@ -311,9 +304,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._write_back = WriteBackPolicy.from_extra_config(extra_config)
         # How deep into the oldest free blocks an allocation of n blocks may
         # look for consecutive ids (`contiguous_alloc`); <= 1 turns it off.
-        # r6; default 1 (off) here: set the key to 3 for r6's behaviour.
         self._contiguous_alloc_scan_factor = int(
-            extra_config.get("contiguous_alloc_scan_factor", 1)
+            extra_config.get("contiguous_alloc_scan_factor", 3)
         )
         # Write-back state: finished requests whose chunks are not stored yet
         # (their finish is deferred), the blocks each one would store, and
@@ -321,37 +313,37 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._block_pool = None
         self._wb_blocks: OrderedDict[str, set[int]] = OrderedDict()
         self._wb_owners: dict[int, set[str]] = {}
-        # Pool hash of each watched block (held, or read by a write-back
-        # store job), taken while it still held the bytes it is keyed for.
-        # A block allocated again with this same hash is a prefix-cache hit
-        # whose bytes are unchanged; see `_wb_classify_allocated`.
-        self._wb_hash: dict[int, bytes] = {}
-        # Blocks of this step's allocation that are such hits; the base must
-        # not treat them as reallocated (no flush of their store jobs).
-        self._wb_hits: set[int] = set()
         self.wb_counters: Counter[str] = Counter()
-        # Staged multi-shape offload: the scheduler owns the staging rows.
-        staging_blocks = getattr(spec, "staging_blocks", 0)
-        if staging_blocks:
-            # The scheduler's KV cache config is flattened (no per-array
-            # pages), so the row size for the stats is the mean per-rank
-            # payload the host pool was sized with.
-            row_bytes = padded_row_bytes(
-                spec.bytes_per_block_all_ranks // spec.world_size
-            )
-            self._staged = StagedTransferScheduler(
-                self._raiden_manager,
-                staging_blocks,
-                self.config.num_workers,
-                row_bytes=row_bytes,
-            )
+        lru_refresh = tpu_envs.TPU_RAIDEN_LRU_REFRESH
+        self._lru_refresh_on_finish = lru_refresh >= 2
+        self._offload_stats = bool(tpu_envs.TPU_RAIDEN_OFFLOAD_STATS)
+        self._stats_last_log: float | None = None
+        if lru_refresh or self._offload_stats:
             logger.info(
-                "TPURaidenOffloadingConnector: staged offload on (scheduler): "
-                "%d staging rows of ~%d bytes per rank, parts of <= %d blocks; "
-                "transfer stats every 60 s",
-                staging_blocks,
-                row_bytes,
-                self._staged.max_part_rows,
+                "TPURaidenOffloadingConnector: TPU_RAIDEN_LRU_REFRESH=%d "
+                "(refresh resident keys on store: %s, on request finish: %s), "
+                "TPU_RAIDEN_OFFLOAD_STATS=%s",
+                lru_refresh,
+                lru_refresh >= 1,
+                lru_refresh >= 2,
+                self._offload_stats,
+            )
+        self._flush_real_reuse = bool(tpu_envs.TPU_RAIDEN_FLUSH_REAL_REUSE)
+        self._loss_trace = bool(tpu_envs.TPU_RAIDEN_LOSS_TRACE)
+        self._wb_drop_covered = bool(tpu_envs.TPU_RAIDEN_WB_DROP_COVERED)
+        self._traced_req_ids: set[str] = set()
+        if self._loss_trace:
+            self._raiden_manager.enable_loss_trace()
+        if self._flush_real_reuse or self._loss_trace or self._wb_drop_covered:
+            logger.info(
+                "TPURaidenOffloadingConnector: TPU_RAIDEN_FLUSH_REAL_REUSE=%s "
+                "(flush stores only for blocks the pool hands out fresh, not "
+                "prefix hits), TPU_RAIDEN_WB_DROP_COVERED=%s (write-back drops "
+                "a held request only on reallocation or full prefix-hit "
+                "cover), TPU_RAIDEN_LOSS_TRACE=%s",
+                self._flush_real_reuse,
+                self._wb_drop_covered,
+                self._loss_trace,
             )
 
     def attach_block_pool(self, block_pool) -> None:
@@ -371,6 +363,54 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 else WriteBackPolicy.window_blocks
             ),
         )
+        if (self._flush_real_reuse or self._wb_drop_covered) and not getattr(
+            block_pool, "_tpu_raiden_fresh_watch", False
+        ):
+            fresh: set[int] = set()
+            pool_get_new_blocks = block_pool.get_new_blocks
+
+            def get_new_blocks(num_blocks: int) -> list:
+                blocks = pool_get_new_blocks(num_blocks)
+                fresh.update(b.block_id for b in blocks)
+                return blocks
+
+            block_pool.get_new_blocks = get_new_blocks
+            block_pool._tpu_raiden_fresh_watch = True
+            self._fresh_block_ids = fresh
+
+    def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
+        """TPU_RAIDEN_FLUSH_REAL_REUSE: the blocks whose pending stores must be
+        flushed this step are the blocks the pool handed out fresh (their
+        contents are about to be overwritten), not every block a scheduled
+        request lists: a new request's prefix-hit blocks keep their contents,
+        and flushing on them cancels a parked store of the very chain that is
+        being reused, or drains a launched one synchronously."""
+        super()._update_req_states(scheduler_output)
+        fresh = self._fresh_block_ids
+        if fresh is None:
+            return
+        if not self._flush_real_reuse:
+            fresh.clear()
+            return
+        allocated = self._current_batch_allocated_block_ids
+        if self._offload_stats and self._block_id_to_pending_jobs:
+            pending = self._block_id_to_pending_jobs
+            real = {j for b in fresh if b in pending for j in pending[b]}
+            hit_only = {
+                j for b in allocated - fresh if b in pending for j in pending[b]
+            } - real
+            for job_id in hit_only:
+                parked = self._fence_pending.get(job_id)
+                if parked is not None:
+                    self.wb_counters["hitflush_skipped_parked"] += 1
+                    self.wb_counters["hitflush_skipped_parked_keys"] += len(
+                        parked.keys
+                    )
+                elif self._raiden_manager.is_job_launched(job_id):
+                    self.wb_counters["hitflush_skipped_launched"] += 1
+        # Every fresh block, including any the scheduler output does not list.
+        self._current_batch_allocated_block_ids = set(fresh)
+        fresh.clear()
 
     def _wb_unregister(self, req_id: str) -> None:
         for bid in self._wb_blocks.pop(req_id, ()):
@@ -379,58 +419,6 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 owners.discard(req_id)
                 if not owners:
                     del self._wb_owners[bid]
-
-    def _pool_block_hash(self, block_id: int) -> bytes | None:
-        """The block pool's current hash of ``block_id``; None if the pool
-        exposes no blocks (then no allocation counts as a hit)."""
-        blocks = getattr(self._block_pool, "blocks", None)
-        if blocks is None or not 0 <= block_id < len(blocks):
-            return None
-        return blocks[block_id].block_hash
-
-    def _wb_classify_allocated(self, allocated: set[int]) -> set[int]:
-        """The blocks of ``allocated`` that are prefix-cache hits on a
-        watched block: the pool still has the hash snapshotted while the
-        block held the bytes it is keyed for.
-
-        The pool drops a block's hash when it evicts the block for reuse
-        (`BlockPool._maybe_evict_cached_block`), and the new owner cannot
-        carry the same hash (its prefix lookup would have hit the cached
-        block instead). So a matching hash means the bytes were never
-        rewritten. Every other allocated block is overwritten, and its
-        snapshot goes.
-        """
-        hits: set[int] = set()
-        for bid in allocated:
-            snapshot = self._wb_hash.get(bid)
-            if snapshot is None:
-                continue
-            if self._pool_block_hash(bid) == snapshot:
-                hits.add(bid)
-            else:
-                del self._wb_hash[bid]
-        return hits
-
-    def _wb_gc_hashes(self) -> None:
-        """Forget the snapshots of blocks nobody watches any more (no holder
-        and no pending store job). Amortized: runs when the map has grown
-        well past the watched set."""
-        pending = getattr(self, "_block_id_to_pending_jobs", {})
-        if len(self._wb_hash) <= 2 * (len(self._wb_owners) + len(pending)) + 1024:
-            return
-        self._wb_hash = {
-            bid: block_hash
-            for bid, block_hash in self._wb_hash.items()
-            if bid in self._wb_owners or bid in pending
-        }
-
-    def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
-        super()._update_req_states(scheduler_output)
-        # Prefix-cache hits on watched blocks are not reallocations: their
-        # store jobs need neither a cancel (which would lose the store) nor
-        # a synchronous drain.
-        if self._wb_hits:
-            self._current_batch_allocated_block_ids -= self._wb_hits
 
     def _wb_drop(self, req_id: str) -> None:
         """Finish a held request without storing it (a block was reused)."""
@@ -444,20 +432,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         if not req_status.transfer_jobs:
             del self._req_status[req_id]
 
-    def _wb_register(self, req_id: str, allocated: Set[int] = frozenset()) -> bool:
+    def _wb_register(self, req_id: str) -> bool:
         """Hold a finished request for write-back; False if it has nothing
-        left to store. ``allocated`` is this step's allocation. It ran after
-        the request freed its blocks, so the pool's hash of such a block may
-        already be its new owner's, and it is not snapshotted."""
+        left to store."""
         req_status = self._req_status.get(req_id)
         if req_status is None:
             return False
-        if self._raiden_manager.refresh_lru:
-            # additional_config raiden_offload_refresh_lru: the request reused
-            # whatever of its prefix is host-resident; move that to the MRU end
-            # so a prefix that stays hot in HBM does not age out of the host.
-            for group_state in req_status.group_states:
-                self._raiden_manager.touch_prefix(group_state.offload_keys)
         blocks_per_chunk = self.config.blocks_per_chunk
         blocks: set[int] = set()
         for group_state in req_status.group_states:
@@ -471,14 +451,6 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._wb_blocks[req_id] = blocks
         for bid in blocks:
             self._wb_owners.setdefault(bid, set()).add(req_id)
-            if bid in allocated:
-                # Decided by a snapshot from before this step, if one exists.
-                continue
-            block_hash = self._pool_block_hash(bid)
-            if block_hash is None:
-                self._wb_hash.pop(bid, None)
-            else:
-                self._wb_hash[bid] = block_hash
         return True
 
     def _wb_near_eviction(self) -> list[str]:
@@ -519,19 +491,60 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             return
         c = self.wb_counters
         logger.info(
-            "KV write-back: %d steps, %.1f blocks allocated/step, %.1f prefix "
-            "hits/step on watched blocks (kept), %d requests "
+            "KV write-back: %d steps, %.1f blocks allocated/step, %d requests "
             "stored, %d dropped (blocks reused before the flush), %d held "
             "(%d blocks; free and still cached: holding defers only the "
             "connector's finish, never the blocks)",
             c["steps"],
             c["allocated_blocks"] / max(c["steps"], 1),
-            c["hit_blocks"] / max(c["steps"], 1),
             c["flushed_requests"],
             c["dropped_requests"],
             c["held_requests"],
             len(self._wb_owners),
         )
+        if self._offload_stats:
+            mgr_stats = getattr(self._raiden_manager, "_stats", None) or {}
+            logger.info(
+                "Raiden offload stats: drop blocks hit=%d fresh=%d | lookups "
+                "partial=%d stale_head=%d (%d tokens behind a missing head) | "
+                "store keys offered=%d resident=%d new=%d | jobs ok=%d failed=%d "
+                "cancelled=%d (%d keys) | refreshed entries=%d",
+                c["drop_blocks_hit"],
+                c["drop_blocks_fresh"],
+                c["lookup_partial"],
+                c["lookup_stale_head"],
+                c["lookup_stale_head_tokens"],
+                mgr_stats.get("store_keys_offered", 0),
+                mgr_stats.get("store_keys_resident", 0),
+                mgr_stats.get("store_keys_new", 0),
+                mgr_stats.get("store_jobs_ok", 0),
+                mgr_stats.get("store_jobs_failed", 0),
+                mgr_stats.get("store_jobs_cancelled", 0),
+                mgr_stats.get("store_keys_cancelled", 0),
+                mgr_stats.get("refreshed_entries", 0),
+            )
+            logger.info(
+                "Raiden offload flush stats: drains %d calls %d jobs %.1f ms | "
+                "hit-only flushes skipped: parked %d (%d keys) launched %d | "
+                "write-back covered drops %d, partial hits kept %d | "
+                "lookups missing >=8k tokens: %s",
+                c["drain_calls"],
+                c["drain_jobs"],
+                c["drain_us"] / 1e3,
+                c["hitflush_skipped_parked"],
+                c["hitflush_skipped_parked_keys"],
+                c["hitflush_skipped_launched"],
+                c["drop_covered"],
+                c["kept_partial_hit"],
+                " ".join(
+                    f"{k[len('miss8k_'):]}={c[k]}/{c['miss8k_tok_' + k[len('miss8k_'):]]}"
+                    for k in sorted(c)
+                    if k.startswith("miss8k_") and not k.startswith("miss8k_tok_")
+                )
+                or "-",
+            )
+            if mgr_stats:
+                mgr_stats.clear()
         held = c["held_requests"]
         c.clear()
         c["held_requests"] = held
@@ -542,28 +555,45 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         request stores (no write-through), newly finished requests are held
         (their finish deferred), and held requests near eviction finish now,
         so the base stores them through its normal finish path."""
-        # Blocks given to async loads this step reach only the base's set
-        # (update_state_after_alloc): their requests are not scheduled yet.
-        allocated = (
-            _allocated_block_ids(scheduler_output)
-            | self._current_batch_allocated_block_ids
-        )
-        # Prefix-cache hits on watched blocks (snapshots from before this
-        # step): their bytes are intact, so they drop and flush nothing.
-        hits = self._wb_classify_allocated(allocated)
-        self._wb_hits = hits
+        allocated = _allocated_block_ids(scheduler_output)
         self.wb_counters["steps"] += 1
-        self.wb_counters["allocated_blocks"] += len(allocated) - len(hits)
-        self.wb_counters["hit_blocks"] += len(hits)
+        self.wb_counters["allocated_blocks"] += len(allocated)
         finished = set(scheduler_output.finished_req_ids or ())
-        passed = {r for r in finished if not self._wb_register(r, allocated)}
+        passed = {r for r in finished if not self._wb_register(r)}
         # After registering: a request that finished last step may already
-        # have a block reused by this step's allocation. Without a snapshot
-        # from before this step, such a block counts as overwritten.
-        reused = (allocated - hits) & self._wb_owners.keys()
-        for req_id in {r for bid in reused for r in self._wb_owners.get(bid, ())}:
-            self._wb_drop(req_id)
-        self._wb_gc_hashes()
+        # have a block reused by this step's allocation.
+        reused = allocated & self._wb_owners.keys()
+        if reused and self._offload_stats:
+            hits = _prefix_hit_block_ids(scheduler_output, self.config)
+            self.wb_counters["drop_blocks_hit"] += len(reused & hits)
+            self.wb_counters["drop_blocks_fresh"] += len(reused - hits)
+        fresh = self._fresh_block_ids if self._wb_drop_covered else None
+        if fresh is None:
+            for req_id in {r for bid in reused for r in self._wb_owners.get(bid, ())}:
+                self._wb_drop(req_id)
+        else:
+            # Reallocated blocks lose their contents: drop their holders. A
+            # prefix hit keeps the contents: drop a holder only when this
+            # step's hits cover all of its blocks (its successor now holds the
+            # whole chain); a partial hit (a sibling sharing the prefix) keeps
+            # it held. Hit blocks stay registered, so their later reallocation
+            # still drops the holder before its store could read them.
+            realloc = reused & fresh
+            hit = reused - fresh
+            owners_of = lambda bids: {  # noqa: E731
+                r for bid in bids for r in self._wb_owners.get(bid, ())
+            }
+            for req_id in owners_of(realloc):
+                self._wb_drop(req_id)
+            for req_id in owners_of(hit):
+                blocks = self._wb_blocks.get(req_id)
+                if blocks is None:
+                    continue
+                if blocks <= allocated:
+                    self.wb_counters["drop_covered"] += 1
+                    self._wb_drop(req_id)
+                else:
+                    self.wb_counters["kept_partial_hit"] += 1
         flush = self._wb_near_eviction()
         for req_id in flush:
             self._wb_unregister(req_id)
@@ -583,8 +613,6 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             scheduler_output = self._write_back_output(scheduler_output)
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, OffloadingConnectorMetadata)
-        if self._staged is not None:
-            return self._build_staged_meta(meta, self._staged)
 
         manager = self._raiden_manager
 
@@ -647,7 +675,16 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 )
             elif manager.is_job_launched(job_id):
                 launched_flush_ids.add(job_id)
-        drained = manager.drain_jobs(launched_flush_ids) if launched_flush_ids else []
+        drained: list = []
+        if launched_flush_ids:
+            drain_start = time.perf_counter()
+            drained = manager.drain_jobs(launched_flush_ids)
+            if self._offload_stats:
+                self.wb_counters["drain_calls"] += 1
+                self.wb_counters["drain_jobs"] += len(launched_flush_ids)
+                self.wb_counters["drain_us"] += int(
+                    (time.perf_counter() - drain_start) * 1e6
+                )
 
         # Collect completed/drained jobs for the worker echo channel.
         for finished_job in list(drained) + manager.poll_finished_jobs():
@@ -669,49 +706,6 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             finished_store_job_ids=finished_store_ids,
             finished_load_jobs=finished_loads,
             failed_load_req_ids=failed_load_req_ids,
-        )
-
-    def _build_staged_meta(
-        self, meta: OffloadingConnectorMetadata, staged: StagedTransferScheduler
-    ) -> RaidenOffloadingConnectorMetadata:
-        """`build_connector_meta` with staging rows between HBM and Raiden.
-
-        Store jobs wait for rows, then ship a pack and a fence; their saves
-        launch from the rows once every rank acknowledges. Load jobs launch
-        into rows as soon as rows are free, and ship an unpack in the step
-        that echoes them finished. A flushed store needs no drain: once
-        launched it reads its own rows, never the reused blocks.
-        """
-        out = StagedStepOutput()
-        for job_id, job in meta.store_jobs.items():
-            src_spec, dst_spec = job.src_spec, job.dst_spec
-            assert isinstance(src_spec, GPULoadStoreSpec)
-            assert isinstance(dst_spec, RaidenLoadStoreSpec)
-            staged.add_store_job(job_id, dst_spec.keys, src_spec.block_ids.tolist())
-        for job_id, job in meta.load_jobs.items():
-            src_spec, dst_spec = job.src_spec, job.dst_spec
-            assert isinstance(src_spec, RaidenLoadStoreSpec)
-            assert isinstance(dst_spec, GPULoadStoreSpec)
-            staged.add_load_job(
-                job_id,
-                src_spec.keys,
-                dst_spec.block_ids.tolist(),
-                job.req_id,
-                pinned=src_spec.pinned,
-            )
-        staged.flush(set(meta.jobs_to_flush or ()), out)
-        staged.step(out)
-        return RaidenOffloadingConnectorMetadata(
-            load_jobs={},  # pyrefly: ignore[unexpected-keyword]
-            store_jobs={},  # pyrefly: ignore[unexpected-keyword]
-            # pyrefly: ignore[unexpected-keyword]
-            jobs_to_flush=meta.jobs_to_flush,
-            fence_job_ids=set(out.packs),
-            finished_store_job_ids=out.finished_store_job_ids,
-            finished_load_jobs=out.finished_load_jobs,
-            failed_load_req_ids=out.failed_load_req_ids,
-            staging_packs=out.packs,
-            staging_unpacks=out.unpacks,
         )
 
     def update_state_after_alloc(
@@ -770,6 +764,113 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             [b.block_id for b in aligned], dtype=dst_spec.block_ids.dtype
         )
 
+    def _prefix_offload_keys(self, request: Request, start_token: int):
+        """(tokens_per_chunk, keys) of the first prefix group's chunks from the
+        chunk holding `start_token` on; None without a prefix group."""
+        block_hashes = request.block_hashes
+        for group_config in self.config.kv_group_configs:
+            if group_config.is_eagle_group:
+                continue
+            if group_config.sliding_window_size_in_chunks is not None:
+                return None
+            hashes_per_chunk = group_config.hashes_per_chunk
+            start_chunk = start_token // group_config.tokens_per_chunk
+            keys = [
+                make_offload_key(block_hashes[idx], group_config.group_idx)
+                for idx in range(
+                    (start_chunk + 1) * hashes_per_chunk - 1,
+                    len(block_hashes),
+                    hashes_per_chunk,
+                )
+            ]
+            return group_config.tokens_per_chunk, keys
+        return None
+
+    def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int, *args, **kwargs):
+        result = super().get_num_new_matched_tokens(
+            request, num_computed_tokens, *args, **kwargs
+        )
+        if self._offload_stats and result[0] is not None:
+            self._count_stale_head(request, num_computed_tokens, result[0])
+        if self._loss_trace and result[0] is not None:
+            self._trace_miss(request, num_computed_tokens, result[0])
+        return result
+
+    _LOSS_TRACE_MIN_TOKENS = 8192
+
+    def _trace_miss(
+        self, request: Request, num_computed_tokens: int, num_hit_tokens: int
+    ) -> None:
+        """TPU_RAIDEN_LOSS_TRACE: once per request whose local + host hit stops
+        >= 8k tokens short of its prompt, log why the first missing key is
+        not on the host (never offered, store cancelled, evicted, ...)."""
+        req_id = request.request_id
+        if req_id in self._traced_req_ids:
+            return
+        self._traced_req_ids.add(req_id)
+        stop = num_computed_tokens + num_hit_tokens
+        missing = request.num_prompt_tokens - stop
+        if missing < self._LOSS_TRACE_MIN_TOKENS:
+            return
+        found = self._prefix_offload_keys(request, stop)
+        if found is None or not found[1]:
+            return
+        event, age, refreshed, stored = self._raiden_manager.explain_missing(
+            found[1][0]
+        )
+        c = self.wb_counters
+        c["miss8k_" + event] += 1
+        c["miss8k_tok_" + event] += missing
+        logger.info(
+            "Raiden loss trace: req %s prompt %d local %d host %d missing %d: "
+            "first missing key %s %.0fs ago (refreshed %.0fs, stored %.0fs ago)",
+            req_id,
+            request.num_prompt_tokens,
+            num_computed_tokens,
+            num_hit_tokens,
+            missing,
+            event,
+            age,
+            refreshed,
+            stored,
+        )
+
+    def _count_stale_head(
+        self, request: Request, num_computed_tokens: int, num_hit_tokens: int
+    ) -> None:
+        """Stats only: a host lookup that stopped short of the chain while its
+        last key is resident is a chain stranded behind a missing head."""
+        found = self._prefix_offload_keys(
+            request, num_computed_tokens + num_hit_tokens
+        )
+        if found is None:
+            return
+        tokens_per_chunk, keys = found
+        # The prompt's last token is never a hit; ignore a trailing one-chunk gap.
+        if len(keys) < 2:
+            return
+        self.wb_counters["lookup_partial"] += 1
+        if self._raiden_manager.count_resident_prefix(keys[-1:]):
+            self.wb_counters["lookup_stale_head"] += 1
+            self.wb_counters["lookup_stale_head_tokens"] += (
+                len(keys) * tokens_per_chunk
+            )
+
+    def request_finished(self, request: Request, *args, **kwargs):
+        traced = getattr(self, "_traced_req_ids", None)
+        if traced:
+            traced.discard(request.request_id)
+        if self._lru_refresh_on_finish:
+            req_status = self._req_status.get(request.request_id)
+            if req_status is not None:
+                for group_config, group_state in zip(
+                    self.config.kv_group_configs, req_status.group_states
+                ):
+                    if group_config.is_eagle_group or not group_state.offload_keys:
+                        continue
+                    self._raiden_manager.refresh_resident(group_state.offload_keys)
+        return super().request_finished(request, *args, **kwargs)
+
     def peek_external_prefix_tokens(
         self, request: Request, num_local_tokens: int
     ) -> int:
@@ -809,12 +910,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         meta = connector_output.kv_connector_worker_meta
-        if self._staged is not None and isinstance(
-            meta, RaidenOffloadingWorkerMetadata
-        ):
-            self._staged.on_unpacked(meta.unpacked_jobs)
-            self._staged.on_fenced(meta.fenced_jobs)
-        elif isinstance(meta, RaidenOffloadingWorkerMetadata) and meta.fenced_jobs:
+        if isinstance(meta, RaidenOffloadingWorkerMetadata) and meta.fenced_jobs:
             for job_id, count in meta.fenced_jobs.items():
                 parked = self._fence_pending.get(job_id)
                 if parked is None:
@@ -899,7 +995,6 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             offloading_config, vllm_config, kv_cache_config
         )
         self._skip_draft_kv = spec.skip_draft_kv
-        self._staging_blocks = getattr(spec, "staging_blocks", 0)
 
         # pyrefly: ignore[bad-override-mutable-attribute]
         self.connector_scheduler: TPURaidenOffloadingScheduler | None = None
@@ -924,11 +1019,6 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             # In-flight fence events awaiting device retirement before acknowledging
             # store jobs, recorded as pairs of (fence_job_ids, event).
             self._pending_fences: list[tuple[set[int], torch.Event]] = []
-            # Staged offload: the staging rows, retired-unpack acks for the
-            # scheduler, and unpack events awaiting retirement.
-            self._staging: StagingBuffer | None = None
-            self._unpacked_jobs: dict[int, int] = {}
-            self._pending_unpacks: list[tuple[set[int], torch.Event]] = []
 
     # -- scheduler-side hooks ----------------------------------------------
     def reset_cache(self) -> bool | None:
@@ -986,9 +1076,6 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         )
 
         pool_storages: dict[int, tuple[torch.UntypedStorage, torch.device]] = {}
-        # The first tensor seen on each storage, in its native shape and dtype
-        # (what the staging programs take).
-        pool_natives: dict[int, torch.Tensor] = {}
         skipped_storages: set[int] = set()
         for layer_name, layer_kv_cache in kv_caches.items():
             state_tensors = (
@@ -1002,7 +1089,6 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                     skipped_storages.add(storage.data_ptr())
                     continue
                 pool_storages.setdefault(storage.data_ptr(), (storage, tensor.device))
-                pool_natives.setdefault(storage.data_ptr(), tensor)
         shared = skipped_storages & pool_storages.keys()
         assert not shared, (
             "TPURaidenOffloadingConnector: skip_draft_kv needs the drafter's K/V "
@@ -1035,10 +1121,6 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         # Retain pool tensor references to dispatch their writes during save fences.
         self._pool_sync_tensors = [pool_tensor.tensor for pool_tensor in pool_tensors]
 
-        if getattr(self, "_staging_blocks", 0):
-            # Raiden sees only the staging rows: one array, one DMA per block.
-            pool_tensors = [self._init_staging(list(pool_natives.values()), num_blocks)]
-
         # One ref list per offloaded group, as vLLM's own registration builds:
         # groups that are not prefix-cacheable are not offloaded.
         group_data_refs = [
@@ -1056,88 +1138,6 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         self.connector_worker._init_worker(
             CanonicalKVCaches(tensors=pool_tensors, group_data_refs=group_data_refs)
         )
-
-    def _init_staging(
-        self, pools: list[torch.Tensor], num_blocks: int
-    ) -> CanonicalKVCacheTensor:
-        """Allocates the staging rows, compiles their programs, and returns
-        them as the one canonical tensor Raiden registers."""
-        for pool in pools:
-            storage_bytes = pool.untyped_storage().nbytes()
-            assert (
-                pool.is_contiguous()
-                and pool.storage_offset() == 0
-                and pool.numel() * pool.element_size() == storage_bytes
-            ), (
-                "TPURaidenOffloadingConnector: staging needs each KV array to "
-                f"own its storage; got shape {tuple(pool.shape)} over "
-                f"{storage_bytes} bytes"
-            )
-        # The KV cache budget reserved these rows before the pool was sized
-        # (`TPUModelRunner.post_profile_hbm_reserves`); rows bigger than the
-        # reserve would be uncounted HBM, so refuse them before allocating.
-        layout = layout_from_tensors(pools, num_blocks, self._staging_blocks)
-        assert self.connector_worker is not None
-        leaves = kv_cache_config_leaves(self.connector_worker.kv_cache_config)
-        reserved = staging_hbm_reserve_bytes(self._vllm_config, leaves)
-        allocated = layout.rows * layout.row_bytes
-        if allocated > reserved:
-            raise RuntimeError(
-                "TPURaidenOffloadingConnector: staging rows take "
-                f"{allocated} bytes of HBM but the KV cache budget reserved "
-                f"{reserved}; the rows would be uncounted"
-            )
-        staging = StagingBuffer(
-            pools,
-            num_blocks=num_blocks,
-            rows=self._staging_blocks,
-            device=pools[0].device,
-        )
-
-        from vllm_torchtpu.utils import synchronize_tensors
-
-        with torch.no_grad():
-            staging.precompile()
-        synchronize_tensors([staging.tensor, *pools])
-        self._staging = staging
-        logger.info(
-            "TPURaidenOffloadingConnector: staged offload on: %d staging rows "
-            "x %d bytes (%d payload), %.1f MiB HBM of %.1f MiB reserved in the "
-            "KV cache budget; %d KV arrays coalesced per block (1 DMA instead "
-            "of %d); layout %s",
-            layout.rows,
-            layout.row_bytes,
-            layout.payload_bytes,
-            allocated / (1 << 20),
-            reserved / (1 << 20),
-            len(pools),
-            len(pools),
-            layout.signature(),
-        )
-        return CanonicalKVCacheTensor(
-            tensor=staging.tensor.view(layout.rows, layout.row_bytes),
-            page_size_bytes=layout.row_bytes,
-        )
-
-    def _run_staging(self, meta: RaidenOffloadingConnectorMetadata) -> None:
-        """Unpacks the staging rows of landed loads into their blocks.
-
-        Enqueued after this step's forward and before this step echoes the
-        loads finished, so each request's first forward, in a later step,
-        runs behind its unpack. The rows go back to the scheduler only once
-        the unpack's event retires on every rank.
-        """
-        if not meta.staging_unpacks:
-            return
-        assert self._staging is not None
-        rows: list[int] = []
-        blocks: list[int] = []
-        for part_rows, part_blocks in meta.staging_unpacks.values():
-            rows.extend(part_rows)
-            blocks.extend(part_blocks)
-        self._staging.unpack(rows, blocks)
-        _enqueue_pool_writes(self._staging.pools)
-        self._pending_unpacks.append((set(meta.staging_unpacks), _record_fence_event()))
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         # Load failures only travel in get_transfer_results().failed_recving.
@@ -1159,8 +1159,6 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         meta = self._get_connector_metadata()
         assert isinstance(meta, RaidenOffloadingConnectorMetadata)
 
-        self._run_staging(meta)
-
         if meta.fence_job_ids:
             # Establish an asynchronous device fence before acknowledging store jobs:
             # 1. Dispatch any deferred pool writes so they precede the fence event.
@@ -1169,30 +1167,9 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 "KV pool tensors must be registered before the save fence"
             )
             _enqueue_pool_writes(self._pool_sync_tensors)
-            if meta.staging_packs:
-                # Staged stores: copy the blocks into their rows; the saves
-                # read the rows once the fence below retires.
-                assert self._staging is not None
-                blocks: list[int] = []
-                rows: list[int] = []
-                for part_blocks, part_rows in meta.staging_packs.values():
-                    blocks.extend(part_blocks)
-                    rows.extend(part_rows)
-                self._staging.pack(blocks, rows)
-                _enqueue_pool_writes([self._staging.tensor])
             self._pending_fences.append(
                 (set(meta.fence_job_ids), _record_fence_event())
             )
-
-        if getattr(self, "_pending_unpacks", None):
-            still_unpacking: list[tuple[set[int], torch.Event]] = []
-            for part_ids, event in self._pending_unpacks:
-                if _event_is_retired(event):
-                    for part_id in part_ids:
-                        self._unpacked_jobs[part_id] = 1
-                else:
-                    still_unpacking.append((part_ids, event))
-            self._pending_unpacks = still_unpacking
 
         if self._pending_fences:
             # Non-blockingly drain retired events and acknowledge completed fences.
@@ -1220,17 +1197,14 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         )
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
-        unpacked_jobs = getattr(self, "_unpacked_jobs", {})
-        if not (self._fenced_jobs or self._completed_jobs or unpacked_jobs):
+        if not (self._fenced_jobs or self._completed_jobs):
             return None
         # completed_jobs is inherited from vLLM base dataclass.
         meta = RaidenOffloadingWorkerMetadata(
             # pyrefly: ignore[unexpected-keyword]
             completed_jobs=self._completed_jobs,
             fenced_jobs=self._fenced_jobs,
-            unpacked_jobs=unpacked_jobs,
         )
         self._completed_jobs = {}
         self._fenced_jobs = {}
-        self._unpacked_jobs = {}
         return meta

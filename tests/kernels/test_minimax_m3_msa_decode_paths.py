@@ -11,20 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""r6 MSA lse kernel (`msa_attention_lse_r6`, key minimax_msa_lse_r6) paths
-behind default-off keys give the default path's bits: the decode work-list
-kernel (`_packed_work_kernel`, key minimax_msa_decode_work_list_kernel), one
-call for every KV head (key minimax_msa_decode_one_call), and the prefill
-knobs (page cache, tile-union cap, bf16 page cache, row split, step widths)."""
+"""MSA decode paths behind default-off switches give BASE's bits:
+the work-list kernel (`_packed_work_kernel`) and one call for every KV head."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
 from vllm_torchtpu.models.minimax_m3.kernels import (
-    msa_attention_lse_r6 as msa_attention_lse,
+    msa_attention,
+    msa_attention_lse,
+    msa_fp4,
 )
 
 TOPK = 16
@@ -108,15 +106,15 @@ def _attention_inputs(rng, heads, reqs, fp4):
 
 
 @pytest.mark.parametrize(
-    "flags,heads,reqs,fp4",
+    "env,heads,reqs,fp4",
     [
-        (("DECODE_WORK_LIST_KERNEL",), 1, 3, False),
-        (("DECODE_ONE_CALL",), 4, 2, True),
-        (("DECODE_ONE_CALL",), 2, 3, False),
-        (("DECODE_ONE_CALL", "DECODE_WORK_LIST_KERNEL"), 4, 3, True),
+        (msa_attention_lse.WORK_LIST_KERNEL_ENV, 1, 3, False),
+        (msa_attention_lse.ONE_CALL_ENV, 4, 2, True),
+        (msa_attention_lse.ONE_CALL_ENV, 2, 3, False),
+        (msa_attention_lse.ONE_CALL_ENV + "+W", 4, 3, True),
     ],
 )
-def test_decode_switch_same_bits(monkeypatch, flags, heads, reqs, fp4):
+def test_decode_switch_same_bits(monkeypatch, env, heads, reqs, fp4):
     q, kv, sel, local, limit, table, sc = _attention_inputs(
         np.random.default_rng(heads * 10 + reqs), heads, reqs, fp4
     )
@@ -128,62 +126,14 @@ def test_decode_switch_same_bits(monkeypatch, flags, heads, reqs, fp4):
             scale_cache=sc, interpret=True, head_major=True,
         )
 
-    for f in flags:
-        assert getattr(msa_attention_lse, f) is False
+    envs = env.replace("+W", "").split(",")
+    if env.endswith("+W"):
+        envs.append(msa_attention_lse.WORK_LIST_KERNEL_ENV)
+    for e in envs:
+        monkeypatch.delenv(e, raising=False)
     ref = run()
-    for f in flags:
-        monkeypatch.setattr(msa_attention_lse, f, True)
+    for e in envs:
+        monkeypatch.setenv(e, "1")
     got = run()
     for a, b in zip(ref, got):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
-
-
-@pytest.mark.parametrize(
-    "knobs",
-    [
-        dict(page_cache_slots=64),
-        dict(page_cache_slots=64, page_cache_bf16=True),
-        dict(page_cache_slots=64, tile_pages=64),
-        dict(page_cache_slots=4),  # too few slots: the call streams
-        dict(row_split=2),
-        dict(step_widths=(4, 8, 12)),
-        dict(step_widths=(2, 4, 6, 8, 12), page_cache_slots=64, row_split=2),
-    ],
-)
-def test_prefill_knobs_same_bits(monkeypatch, knobs):
-    """The prefill knobs `msa_dcp.msa_attend_dcp` passes (`prefill_options`)
-    keep the bits of the default call."""
-    heads, reqs = 2, 6
-    q, kv, sel, local, limit, table, sc = _attention_inputs(
-        np.random.default_rng(99), heads, reqs, True
-    )
-    knobs = dict(knobs)
-    tile_pages = knobs.pop("tile_pages", None)
-
-    def run(**kw):
-        jax.clear_caches()
-        return msa_attention_lse.msa_sparse_attention_lse_heads(
-            q, kv, sel, local, limit, table, sm_scale=D**-0.5, block_q=16,
-            scale_cache=sc, interpret=True, head_major=True, **kw,
-        )
-
-    ref = run()
-    if tile_pages is not None:
-        monkeypatch.setattr(msa_attention_lse, "PAGE_CACHE_TILE_PAGES", tile_pages)
-    got = run(**knobs)
-    for a, b in zip(ref, got):
-        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
-
-
-def test_prefill_options_empty_by_default(monkeypatch):
-    assert msa_attention_lse.prefill_options(True) == {}
-    assert msa_attention_lse.prefill_options(False) == {}
-    monkeypatch.setattr(msa_attention_lse, "PREFILL_PAGE_CACHE_SLOTS", 512)
-    monkeypatch.setattr(msa_attention_lse, "PREFILL_PAGE_CACHE_BF16", True)
-    monkeypatch.setattr(msa_attention_lse, "PREFILL_STEP_WIDTHS", (4, 8, 12))
-    assert msa_attention_lse.prefill_options(False) == {"step_widths": (4, 8, 12)}
-    assert msa_attention_lse.prefill_options(True) == {
-        "step_widths": (4, 8, 12),
-        "page_cache_slots": 512,
-        "page_cache_bf16": True,
-    }

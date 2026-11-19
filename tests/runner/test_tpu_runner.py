@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import collections
 import contextlib
 import copy
 import inspect
@@ -63,9 +62,6 @@ from vllm_torchtpu.layers.core.attention_metadata import (
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
-from vllm_torchtpu.runner.speculative_decoding_manager import (
-    SpeculativeDecodingManager,
-)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
@@ -90,11 +86,6 @@ def test_idle_dp_rank_encodes_before_decoder_pairing():
     assert order == ["encoder", ("decoder", 8), ("decoder", 8), ("draft", 2)]
 
 
-def _warmup_requests() -> collections.defaultdict:
-    """Runner request states for warmup stubs whose execute_model adds none."""
-    return collections.defaultdict(lambda: SimpleNamespace(output_token_ids=[0]))
-
-
 def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
     all_token_ids = tpu_runner._spec_warmup_all_token_ids(
         ["request-0", "request-1"], [7, 12]
@@ -104,36 +95,6 @@ def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
         "request-0": [0] * 8,
         "request-1": [0] * 13,
     }
-
-
-def test_spec_warmup_num_output_tokens_keeps_in_flight_placeholders():
-    """An async spec step appends 1 + K placeholders that the next step's
-    `_modify_prev_results` rolls back from `num_tokens_no_spec`. Upstream
-    `_update_states` truncates output_token_ids (and rewinds
-    num_tokens_no_spec) when the scheduler reports fewer outputs, so the
-    warmup must report the runner's own count, never a smaller one."""
-    K, P = 7, 4
-    # Prefill sampled one token, then decode step 0 left 1 + K placeholders.
-    output_token_ids = [11] + [0] * (1 + K)
-    requests = {"r0": SimpleNamespace(output_token_ids=output_token_ids)}
-    (reported,) = tpu_runner._spec_warmup_num_output_tokens(requests, ["r0"])
-    assert reported == len(output_token_ids)
-
-    def rollback_slice(num_output_tokens: int, accepted: int) -> range:
-        """Index math of _update_states then _modify_prev_results."""
-        num_tokens_no_spec = P + len(output_token_ids)
-        if num_output_tokens < len(output_token_ids):
-            num_tokens_no_spec = P + num_output_tokens
-        start = num_tokens_no_spec - (1 + K)
-        return range(start, start + accepted)
-
-    # The old warmup count (t + 1 = 2 at decode step 1) starts the roll-back
-    # before the request's first token: slice(-2, 0) of token_ids_cpu is empty.
-    old = rollback_slice(2, accepted=2)
-    assert old.start < 0
-    assert reported >= 2
-    new = rollback_slice(reported, accepted=2)
-    assert list(new) == [P + 1, P + 2]
 
 
 @pytest.mark.parametrize("dcp_size,expected_blocks", [(1, 65), (8, 9)])
@@ -158,7 +119,6 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
         sample_tokens=lambda _: None,
         take_draft_token_ids=lambda: None,
         _warmup_spec_decode_cleanup=lambda rids: True,
-        requests=_warmup_requests(),
     )
 
     assert TPUModelRunner._warmup_one_spec_request(runner, 8192, idx=0)
@@ -697,7 +657,6 @@ def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
         sample_tokens=lambda _: None,
         take_draft_token_ids=lambda: None,
         _warmup_spec_decode_cleanup=lambda rids: True,
-        requests=_warmup_requests(),
     )
 
     TPUModelRunner._warmup_spec_batch(runner, R, 16, short=True, mixed=True)
@@ -2247,27 +2206,6 @@ class TestMambaSlotReadOffsets:
         for block, expected in ((3, 2), (7, 0), (11, 2), (5, 0)):
             assert int(runner.mamba_slot_read_offsets[block]) == expected
 
-    @pytest.mark.parametrize("num_reqs", range(1, 9))
-    def test_rows_past_the_live_count_are_masked_not_sliced(self, num_reqs):
-        """The live count masks the offsets instead of slicing them (an
-        exact-count slice write compiled one program per count mid-serving,
-        j-c4171bd3 tt_jit_copy__as_strided_inverse). Padding rows of the
-        rejection output can hold tokens; their offsets must still be 0."""
-        runner = self._make_runner(num_blocks=16)
-        rows = 8
-        state_indices = torch.arange(1, rows + 1, dtype=torch.int32)
-        num_valid = torch.tensor([1, 2, 3, 4, 3, 2, 1, 4])
-        cols = torch.arange(4).unsqueeze(0)
-        next_tokens = torch.where(cols < num_valid.unsqueeze(1), 7, INVALID_TOKEN_ID)
-        # The sampler bucket can hold more rows than the state slots.
-        next_tokens = torch.cat([next_tokens, torch.full((4, 4), 7)])
-
-        runner._update_mamba_slot_read_offsets([state_indices], next_tokens, num_reqs)
-
-        expected = torch.zeros(16, dtype=torch.int32)
-        expected[1 : num_reqs + 1] = (num_valid[:num_reqs] - 1).to(torch.int32)
-        assert torch.equal(runner.mamba_slot_read_offsets, expected)
-
     def test_unified_empty_group_list_is_noop(self):
         runner = self._make_runner(num_blocks=8)
         runner._update_mamba_slot_read_offsets([], torch.tensor([[1, 2]]), 1)
@@ -3574,7 +3512,6 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         all_greedy=False,
         topk_candidates=0,
         apply_topk_topp=True,
-        apply_top_k=True,
     ):
         seen_u_dtypes.append(u.dtype)
         return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
@@ -3587,8 +3524,8 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     )
 
     # 1. _precompile_sample_from_logits: two graphs without speculative
-    # decoding, plus the no-top-k/top-p and top-p-only graphs with it.
-    for speculative_config, num_graphs in ((None, 2), (SimpleNamespace(), 4)):
+    # decoding, plus the no-top-k/top-p graph with it.
+    for speculative_config, num_graphs in ((None, 2), (SimpleNamespace(), 3)):
         precompile_runner = SimpleNamespace(
             num_reqs_paddings=[2],
             _hidden_states_dtype=torch.bfloat16,
@@ -3618,10 +3555,8 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         _build_padded_sampling_params=lambda start, end, logits: sampling_params,
         _sampler_topk_candidates=lambda start, end, grammar: 0,
         _sampler_applies_topk_topp=lambda: True,
-        _sampler_applies_top_k=lambda: True,
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
-        _fused_spec_sampler=False,
     )
     spec_runner.rejection_sampler = MagicMock(side_effect=fake_rejection_sampler)
     spec_runner.rejection_sampler.synthetic_mode = False
@@ -3705,7 +3640,6 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _build_padded_sampling_params=lambda start, end, logits: sampling_params,
             _sampler_topk_candidates=lambda start, end, grammar: 0,
             _sampler_applies_topk_topp=lambda: True,
-            _sampler_applies_top_k=lambda: True,
             sample_from_logits_func=fake_sample_from_logits,
             _update_mamba_slot_read_offsets=lambda *_args: None,
             _update_num_xla_graphs=lambda *_args: None,
@@ -3756,176 +3690,3 @@ def test_decode_metadata_cache_hit_updates_request_distribution_cpu():
         runner._request_distribution_cpu,
         torch.tensor([4, 4, 4], dtype=torch.int32),
     )
-
-
-# MiniMax-M3.1 DSpark at max_num_seqs 48 (j-69535209): K=7, the served token
-# buckets, a 8192-token budget.
-MINIMAX_PADDINGS = [4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 384, 512]
-MINIMAX_PADDINGS += [1024, 2048, 3072, 4096, 8192]
-
-
-def _glue_runner(chunk_reqs: int = 48, max_seqs: int = 48, K: int = 7):
-    runner = SimpleNamespace(
-        speculative_config=SimpleNamespace(num_speculative_tokens=K),
-        scheduler_config=SimpleNamespace(max_num_seqs=max_seqs, async_scheduling=True),
-        _is_async_drafter=True,
-        max_num_reqs=max(max_seqs, tpu_runner.MIN_NUM_SEQS),
-        num_reqs_max_model_len=chunk_reqs,
-        num_reqs_most_model_len=None,
-        most_model_len=None,
-        num_tokens_paddings=MINIMAX_PADDINGS,
-        uses_mrope=False,
-        device=torch.device("cpu"),
-        _precompile_timed=lambda name: contextlib.nullcontext(),
-    )
-    for name in (
-        "_chunk_request_capacities",
-        "_async_spec_source_rows",
-        "_async_spec_glue_shapes",
-    ):
-        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
-    return runner
-
-
-def _shapes(*tensors: torch.Tensor) -> tuple[tuple[int, ...], ...]:
-    return tuple(tuple(t.shape) for t in tensors)
-
-
-def test_async_spec_glue_precompile_covers_every_step(monkeypatch):
-    """Every step a served batch can take -- any verify request count next to
-    a prefill chunk landing in any token bucket -- hands the subtract and
-    extract glue a shape the precompile warmed. The real spec-decode warmup
-    pairs large token buckets with one request only (j-69535209 compiled
-    tt_jit_sub / tt_jit_index mid-serving)."""
-    runner = _glue_runner()
-    K = runner.speculative_config.num_speculative_tokens
-    pads = runner.num_tokens_paddings
-    warmed_subtract: set = set()
-    warmed_extract: set = set()
-
-    def record_subtract(*args):
-        warmed_subtract.add(_shapes(*args))
-        return args[0], args[1]
-
-    def record_extract(*args):
-        warmed_extract.add(_shapes(*args))
-        return args[1]
-
-    monkeypatch.setattr(tpu_runner, "_subtract_num_rejected_tokens", record_subtract)
-    monkeypatch.setattr(tpu_runner, "_extract_draft_token_ids", record_extract)
-    TPUModelRunner._precompile_async_spec_glue(runner)
-
-    manager_runner = MagicMock()
-    manager_runner.device = torch.device("cpu")
-    manager_runner.arange_np = np.arange(pads[-1] + 1, dtype=np.int32)
-    manager_runner.num_tokens_paddings = pads
-    manager_runner.input_ids_cpu = torch.zeros(pads[-1], dtype=torch.int32)
-    manager = SpeculativeDecodingManager(manager_runner)
-
-    rows = runner._async_spec_source_rows()
-    chunk_reqs = runner.num_reqs_max_model_len
-    counts = [11, 15, *range(20, 32), 34, 35, *range(38, 49), 1, 8, 33]
-    for num_verify in counts:
-        verify_tokens = num_verify * (1 + K)
-        # Decode-only, then a prefill chunk filling each larger token bucket.
-        totals = [verify_tokens] + [t for t in pads if t > verify_tokens]
-        for total in totals:
-            num_tokens = tpu_runner._get_padded_token_len(pads, total)
-            num_reqs = num_verify + (total > verify_tokens)
-            if num_reqs > runner.scheduler_config.max_num_seqs:
-                continue
-            md = manager.get_spec_decode_metadata(
-                num_draft_tokens=np.full(num_verify, K, dtype=np.int32),
-                cu_num_scheduled_tokens=np.cumsum(
-                    np.full(num_verify, 1 + K, dtype=np.int32)
-                ),
-                padded_num_reqs=tpu_runner._get_padded_num_reqs_with_upper_limit(
-                    num_reqs, runner.max_num_reqs
-                ),
-            )
-            logits_len = md.final_logits_indices.shape[0]
-            assert ((num_tokens,), (logits_len,), (logits_len,)) in warmed_extract, (
-                num_verify,
-                total,
-            )
-            assert (
-                (chunk_reqs,),
-                (num_tokens,),
-                (rows,),
-                (chunk_reqs,),
-                (num_tokens,),
-            ) in warmed_subtract, (num_verify, total)
-
-
-@pytest.mark.parametrize("chunk_reqs", [48, 33, 20, 9])
-def test_async_spec_source_rows_hold_every_chunk_split(chunk_reqs):
-    """The parked substitution source and rejected counts are padded to one
-    row count; it must hold every chunk split's padded rows, or a split step
-    parks an odd length and the next step compiles the glue mid-serving."""
-    runner = _glue_runner(chunk_reqs=chunk_reqs)
-    rows = runner._async_spec_source_rows()
-    max_seqs = runner.scheduler_config.max_num_seqs
-    for num_reqs in range(1, max_seqs + 1):
-        full, rest = divmod(num_reqs, chunk_reqs)
-        chunks = [chunk_reqs] * full + ([rest] if rest else [])
-        parked = sum(
-            tpu_runner._get_padded_num_reqs_with_upper_limit(n, runner.max_num_reqs)
-            for n in chunks
-        )
-        assert parked <= rows, (num_reqs, chunks)
-
-
-def test_precompile_runs_under_the_serving_global_state(monkeypatch):
-    """Dynamo guards each graph on grad mode and the torch thread count;
-    j-99bf94da retraced compute_selected_logits and the substitution at
-    every serving bucket because their precompile ran with grad on and
-    before the worker dropped to its serving thread count."""
-    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
-    before = torch.get_num_threads()
-    torch.set_num_threads(4)
-    try:
-        runner = SimpleNamespace(
-            check_recompilation=False, _update_num_xla_graphs=lambda name: None
-        )
-        assert torch.is_grad_enabled()
-        with TPUModelRunner._precompile_timed(runner, "x"):
-            assert not torch.is_grad_enabled()
-            assert torch.get_num_threads() == 1
-        assert torch.is_grad_enabled()
-        assert torch.get_num_threads() == 4
-    finally:
-        torch.set_num_threads(before)
-
-
-def test_compute_selected_logits_warms_verify_row_counts(monkeypatch):
-    """A verify step selects one logits row per verified token, a token
-    bucket up to max_num_reqs * (1 + K), not a request bucket (j-c4171bd3
-    retraced it at (1024 tokens, 64 rows) and every such pair)."""
-    warmed = set()
-    runner = SimpleNamespace(
-        model_config=SimpleNamespace(get_hidden_size=lambda: 4),
-        _hidden_states_dtype=torch.float32,
-        device=torch.device("cpu"),
-        num_tokens_paddings=MINIMAX_PADDINGS,
-        num_reqs_paddings=[8, 16, 32, 48],
-        max_num_reqs=48,
-        speculative_config=SimpleNamespace(num_speculative_tokens=7),
-        _precompile_timed=lambda name: contextlib.nullcontext(),
-        compute_selected_logits=lambda h, i: warmed.add((h.shape[0], i.shape[0])),
-    )
-    runner._spec_logits_lengths = TPUModelRunner._spec_logits_lengths.__get__(runner)
-    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
-
-    TPUModelRunner._precompile_compute_selected_logits(runner)
-
-    assert (1024, 64) in warmed and (8192, 384) in warmed and (64, 64) in warmed
-    assert (64, 96) not in warmed  # a verify step never selects more rows
-    assert max(rows for _, rows in warmed) == 384
-
-
-def test_sample_tokens_runs_without_grad():
-    """The sampling graphs are precompiled without grad; dynamo guards on
-    grad mode, so serving must sample without it too (j-c4171bd3 retraced
-    the rejection sampler at every bucket)."""
-    src = inspect.getsource(TPUModelRunner.sample_tokens)
-    assert "@torch.no_grad()" in src.split("def sample_tokens")[0]
