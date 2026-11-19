@@ -18,6 +18,7 @@ def _config(
     pcp=1,
     dp=1,
     ep=False,
+    hf_config=None,
 ):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -31,7 +32,7 @@ def _config(
         speculative_config=speculative,
         kv_transfer_config=kv_transfer,
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(layer_types=layer_types)
+            hf_text_config=hf_config or SimpleNamespace(layer_types=layer_types)
         ),
     )
 
@@ -228,3 +229,53 @@ def test_raiden_accepts_stages_of_sparse_attention_layers(monkeypatch):
     validate_pipeline_parallel_config(
         _config(pp=8, kv_transfer=RAIDEN, layer_types=["deepseek_sparse_attention"] * 8)
     )
+
+
+def _glm52(**overrides):
+    # GLM-5.2: 78 layers; layers 0-2 and every fourth from 6 run their indexer.
+    fields = dict(
+        layer_types=None,
+        num_hidden_layers=78,
+        index_topk=2048,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        index_topk_pattern=None,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def test_rejects_a_stage_starting_on_a_shared_topk_layer(monkeypatch):
+    # The default 39/39 split starts stage 1 at layer 39, which reuses layer
+    # 38's top-k.
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    with pytest.raises(
+        NotImplementedError,
+        match=r"reuses the top-k \(stage 1 starts at layer 39\)"
+        r".*VLLM_PP_LAYER_PARTITION",
+    ):
+        validate_pipeline_parallel_config(_config(pp=2, hf_config=_glm52()))
+
+
+@pytest.mark.parametrize("partition", ["42,36", "38,40"])
+def test_accepts_stages_starting_on_an_indexer_layer(monkeypatch, partition):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+    validate_pipeline_parallel_config(_config(pp=2, hf_config=_glm52()))
+
+
+def test_topk_pattern_overrides_the_frequency(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "2,2")
+    pattern = ["F", "S", "S", "F"]
+    with pytest.raises(NotImplementedError, match="starts at layer 2"):
+        validate_pipeline_parallel_config(
+            _config(
+                pp=2,
+                hf_config=_glm52(num_hidden_layers=4, index_topk_pattern=pattern),
+            )
+        )
+
+
+def test_models_without_an_indexer_skip_the_topk_check(monkeypatch):
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    plain = SimpleNamespace(layer_types=None, num_hidden_layers=78)
+    validate_pipeline_parallel_config(_config(pp=2, hf_config=plain))
