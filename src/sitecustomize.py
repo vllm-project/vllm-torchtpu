@@ -45,7 +45,7 @@ def maybe_run_experimental_rust() -> bool:
     import vllm.envs as vllm_envs
 
     # vLLM's Rust frontend keeps the Python engine; rvllm replaces both.
-    if getattr(vllm_envs, "VLLM_USE_RUST_FRONTEND", False):
+    if vllm_envs.VLLM_USE_RUST_FRONTEND:
         sys.stderr.write(
             "rvllm: error: VLLM_TPU_EXPERIMENTAL_USE_RUST and "
             "VLLM_USE_RUST_FRONTEND are both set; set only one\n"

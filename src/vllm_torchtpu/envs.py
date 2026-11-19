@@ -1337,7 +1337,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_EXPERIMENTAL_USE_RUST": env_bool(
         "VLLM_TPU_EXPERIMENTAL_USE_RUST", default=False
     ),
-    # Path or command name for the rvllm binary. When unset, falls back to PATH.
+    # The rvllm binary; takes the same values as the launcher's --rvllm-binary.
+    # When unset, rvllm is looked up on PATH.
     "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY": env_str(
         "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", default=""
     ),

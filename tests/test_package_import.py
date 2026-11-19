@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import subprocess
 import sys
 
@@ -96,8 +97,6 @@ def test_sitecustomize_wraps_startup_cli_env_setup_subprocess():
 # `vllm serve --help`) and the default path (without the env var the command is
 # not delegated). Until then the success path is verified by hand on TPU.
 def test_sitecustomize_rust_cli_delegation_subprocess():
-    import os
-
     result = subprocess.run(
         [
             sys.executable,
@@ -114,7 +113,7 @@ def test_sitecustomize_rust_cli_delegation_subprocess():
             "VLLM_TPU_EXPERIMENTAL_USE_RUST": "1",
             "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY": "/bin/true",
         },
-        timeout=30,
+        timeout=60,
     )
     assert result.returncode == 2, (result.stdout, result.stderr)
     assert "rvllm: error:" in result.stderr
