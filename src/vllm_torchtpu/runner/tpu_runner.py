@@ -1861,6 +1861,12 @@ class TPUModelRunner(GPUModelRunner):
         effective_num_reqs_padded = (
             num_reqs_padded if num_reqs_padded is not None else num_reqs
         )
+        if self.model_adapter is not None:
+            owned = self.model_adapter.build_attention_metadata(
+                ctx, effective_num_reqs_padded
+            )
+            if owned is not None:
+                return owned, None
 
         if ctx.staged_block_tables is None:
             # One batched H2D for every group's block table (zero-filled for

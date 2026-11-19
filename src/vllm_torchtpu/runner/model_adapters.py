@@ -20,8 +20,9 @@ selection returns None and the ordinary runner and cache paths are unchanged.
 An adapter subclasses `ModelAdapter`. It owns the input snapshot of each step,
 the dummy/profile forward and its KV cache lifecycle; the model forward then
 receives explicit kwargs rather than consulting runner state. The optional
-hooks (`bind_draft`, `precompile_fused_inputs`, `kv_cache_memory_budget`) are
-declared here with no-op defaults, so the runner calls them directly.
+hooks (`bind_draft`, `precompile_fused_inputs`, `kv_cache_memory_budget`,
+`build_attention_metadata`) are declared here with no-op defaults, so the
+runner calls them directly.
 """
 
 import abc
@@ -100,6 +101,18 @@ class ModelAdapter(abc.ABC):
         rows_options: Sequence[int | None],
     ) -> None:
         """Precompile the adapter's input programs (a row option may be None)."""
+
+    def build_attention_metadata(
+        self, ctx: Any, num_reqs_padded: int
+    ) -> dict[str, Any] | None:
+        """Per-layer attention metadata for the runner's current walk, if owned.
+
+        Called at the start of every `TPUModelRunner._build_attention_metadata`
+        (step chunks, dummy runs and draft walks) with the walk's
+        `AttentionMetadataBuilderContext` and padded request count. Returning
+        None (the default) keeps the runner's own group walk.
+        """
+        return None
 
     def kv_cache_memory_budget(self) -> int | None:
         """HBM bytes the KV cache takes, if the adapter sizes it itself.
