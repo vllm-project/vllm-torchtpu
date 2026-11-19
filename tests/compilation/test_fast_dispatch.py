@@ -21,12 +21,16 @@ entries.
 """
 
 import inspect
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from vllm_torchtpu import patch_registry
 from vllm_torchtpu.compilation import compile_options, fast_dispatch
 from vllm_torchtpu.compilation.compile_options import CompileOptions
 
@@ -86,7 +90,6 @@ def test_options_are_strict(raw, message):
 
 def test_hook_is_installed_at_platform_import():
     import vllm_torchtpu.platforms  # noqa: F401
-    from vllm_torchtpu import patch_registry
 
     assert "vllm_torchtpu.compilation.fast_dispatch:install" in patch_registry._applied
     assert fast_dispatch._INSTALLED
@@ -152,10 +155,6 @@ def test_hook_returns_the_function_when_dynamo_is_disabled():
 def test_decorated_modules_import_with_dynamo_disabled():
     """A module-level decorated site imports and runs with Dynamo disabled, as
     on main: the decorator leaves the plain function."""
-    import os
-    import subprocess
-    import sys
-
     code = """
 import torch
 import vllm_torchtpu.platforms  # installs the hook
