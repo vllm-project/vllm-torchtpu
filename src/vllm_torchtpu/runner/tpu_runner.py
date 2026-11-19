@@ -1674,12 +1674,15 @@ class TPUModelRunner(GPUModelRunner):
         finished_recving = transfer_results.finished_recving or None
         failed_recving = transfer_results.failed_recving
         invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
+        # vLLM's KVConnectorBase_V1 has no group index; only TPUConnector and
+        # TPUMultiConnector define one. A vLLM connector that reports load
+        # errors (NIXL or LMCache, say) reports them with no group, as vLLM's
+        # own runner does.
+        group_index = getattr(
+            kv_connector, "get_block_ids_with_load_errors_group_index", None
+        )
         invalid_block_group_index = (
-            getattr(
-                kv_connector, "get_block_ids_with_load_errors_group_index", lambda: None
-            )()
-            if invalid_block_ids
-            else None
+            group_index() if invalid_block_ids and group_index is not None else None
         )
         # vLLM >=0.21 job model: store completions (and load completions) are
         # reported to the scheduler via the worker meta's `completed_jobs`,
