@@ -21,6 +21,7 @@ the eager backend.
 from __future__ import annotations
 
 import builtins
+import contextlib
 import gc
 import sys
 import types
@@ -531,3 +532,125 @@ def test_the_runner_applies_the_rule_when_it_is_built():
         and [ast.unparse(a) for a in call.args] == ["self.vllm_config"]
         for call in calls
     )
+
+
+# --- The MTP drafter's calls under the rule -----------------------------------
+
+
+class _Program:
+    """A draft program stand-in that records its calls into `events`."""
+
+    def __init__(self, name, events):
+        self.name, self.events = name, events
+
+    def __call__(self, *args, **kwargs):
+        self.events.append(("run", self.name))
+        return torch.zeros(1)
+
+
+def _drafter_calls(monkeypatch, rule_on, fused):
+    """Run Eagle3Proposer's per-step draft forward (or its fused loop) on a
+    stand-in proposer; returns the recorded events in order."""
+    from vllm_torchtpu.spec_decode import eagle3
+
+    events = []
+
+    def recording(kind):
+        def make(attn_metadata, vllm_config, *, num_tokens, num_tokens_across_dp):
+            events.append((kind, vllm_config, num_tokens, num_tokens_across_dp))
+            return contextlib.nullcontext()
+
+        return make
+
+    monkeypatch.setattr(eagle3, "set_forward_context", recording("stock"))
+    monkeypatch.setattr(ffc, "fast_set_forward_context", recording("cached"))
+    monkeypatch.setattr(ffc, "enabled", lambda: rule_on)
+    monkeypatch.setattr(host_trims, "AOT_SKIP_GUARDS", rule_on)
+    monkeypatch.setattr(
+        host_trims,
+        "maybe_skip_aot_guards",
+        lambda module: events.append(("skip_guards", module.name)),
+    )
+    monkeypatch.setattr(
+        eagle3, "set_vllm_model_wrapper_context", lambda **_: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(eagle3, "set_model_tag", lambda _tag: contextlib.nullcontext())
+    draft_config = object()
+    seq_lens = torch.zeros(2, dtype=torch.int32)
+    proposer = types.SimpleNamespace(
+        draft_vllm_config=draft_config,
+        runner=types.SimpleNamespace(
+            mesh=None,
+            max_num_reqs=8,
+            _dp_num_tokens_across_dp=lambda n: ("across_dp", n),
+        ),
+        speculative_config=types.SimpleNamespace(method="mtp"),
+        _build_draft_attn_metadata=lambda **_: {
+            "layer": types.SimpleNamespace(seq_lens=seq_lens)
+        },
+        _draft_moe_ctx=contextlib.nullcontext,
+        _unwrap_model_out=lambda out: out,
+        _draft_md_cache={},
+        # What the MTP draft path's row gating and loop padding read (unused
+        # here): replicated rows, no loop padding state, 8-request buckets.
+        _draft_rows_sliced=lambda *args: False,
+        _mtp_fused_loop_max_p=0,
+        _draft_valid_tokens=lambda *args: 3,
+        _get_loop_token_padding_state=lambda: None,
+        _rank_padding_counts=lambda *args: (3, 3),
+        _loop_bucket=lambda num_reqs: 8,
+        _max_loop_bucket=lambda: 8,
+    )
+    input_ids = torch.zeros(3, dtype=torch.int32)
+    positions = torch.arange(3, dtype=torch.int32)
+    if fused:
+        proposer._mtp_fused_loop = _Program("fused_loop", events)
+        proposer._mtp_fused_loop_warm = False
+        eagle3.Eagle3Proposer._run_mtp_fused_loop(
+            proposer, None, input_ids, positions, None, None, None, None, None
+        )
+    else:
+        step = _Program("loop_step", events)
+        proposer._mtp_loop_model = step
+        proposer._mtp_loop_model_warm = False
+        proposer._draft_model_for_step = lambda _idx: step
+        eagle3.Eagle3Proposer._forward_draft(
+            proposer,
+            None,
+            input_ids,
+            positions,
+            None,
+            step_idx=1,
+            seq_lens_delta=1,
+            num_rejected_np=None,
+        )
+    return events, draft_config
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["draft_step", "fused_loop"])
+def test_the_drafter_takes_the_cached_context_and_skips_guards_after_the_run(
+    monkeypatch, fused
+):
+    events, draft_config = _drafter_calls(monkeypatch, rule_on=True, fused=fused)
+    name = "fused_loop" if fused else "loop_step"
+    # The first call traces and compiles, the repeat runs compiled; the guard
+    # skip comes only after both, on the program that ran.
+    assert events == [
+        ("cached", draft_config, 3, ("across_dp", 3)),
+        ("run", name),
+        ("run", name),
+        ("skip_guards", name),
+    ]
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["draft_step", "fused_loop"])
+def test_without_the_rule_the_drafter_keeps_vllms_context_and_guards(
+    monkeypatch, fused
+):
+    events, draft_config = _drafter_calls(monkeypatch, rule_on=False, fused=fused)
+    name = "fused_loop" if fused else "loop_step"
+    assert events == [
+        ("stock", draft_config, 3, ("across_dp", 3)),
+        ("run", name),
+        ("run", name),
+    ]
