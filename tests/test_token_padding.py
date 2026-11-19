@@ -53,6 +53,30 @@ def test_update_skips_the_copy_only_when_counts_repeat():
     assert len(copies) == 4
 
 
+def test_update_writes_the_zero_mask_once_across_unpadded_steps():
+    """An unpadded step after another unpadded one leaves the mask as it is;
+    the padded step after them still writes its own suffix."""
+    state = TokenPaddingState.create(8, device="cpu")
+    copies = []
+    real_copy = state.local_padding_mask.copy_
+
+    def counting_copy(src):
+        copies.append(src.clone())
+        return real_copy(src)
+
+    state.local_padding_mask.copy_ = counting_copy
+    writes = []
+    for valid, padded in [(3, 6), (4, 4), (5, 5), (2, 6), (6, 6)]:
+        before = len(copies)
+        state.update(valid, padded)
+        writes.append(len(copies) - before)
+        expected = torch.zeros(8, dtype=torch.bool)
+        expected[valid:padded] = True
+        assert torch.equal(state.local_padding_mask, expected), (valid, padded)
+    # (5, 5) follows the unpadded (4, 4), so it writes nothing.
+    assert writes == [1, 1, 0, 1, 1]
+
+
 def test_the_valid_count_is_kept_for_the_step():
     state = TokenPaddingState.create(8, device="cpu")
     assert token_padding.get_local_valid_tokens() is None
