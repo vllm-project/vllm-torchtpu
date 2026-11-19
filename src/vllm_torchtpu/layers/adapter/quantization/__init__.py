@@ -96,11 +96,10 @@ def get_tpu_quantization_config(
     # Set global config for this quantization class
     quant_config_cls.set_configs(vllm_config)
 
-    # vLLM uses config.json's quantization_config unless the method is
-    # "modelopt_mixed" and that config has no quantized_layers, in which case it
-    # reads hf_quant_config.json. The "tpu-" rename below breaks that name
-    # check, so drop a quantization_config with no quantized_layers (top level
-    # or under "quantization") to make the loader read the file.
+    # Some ModelOpt checkpoints keep the per-layer map only in hf_quant_config.json.
+    # vLLM falls back to that file only for the method name "modelopt_mixed", not
+    # for the "tpu-" name. Removing a quantization_config that lacks
+    # quantized_layers makes vLLM read the file instead.
     if quant_config_cls is VllmModelOptMixedConfig:
         for cfg_holder in (
             model_config.hf_config,

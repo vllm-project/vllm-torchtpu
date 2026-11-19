@@ -13,22 +13,23 @@
 # limitations under the License.
 """ModelOpt MIXED_PRECISION quantization support for TPU.
 
-A ModelOpt mixed-precision checkpoint (``quant_algo: MIXED_PRECISION``) names a
-quantization algorithm per layer in ``quantized_layers``, and vLLM resolves it
-to the ``modelopt_mixed`` method. This config reuses upstream's checkpoint
-parsing and gives each layer the TPU method that serves the same algorithm in a
-uniform checkpoint.
+A ModelOpt ``MIXED_PRECISION`` checkpoint names a quantization algorithm for
+each layer in ``quantized_layers``. vLLM detects these checkpoints as the
+``modelopt_mixed`` method. This config reuses upstream's checkpoint parsing.
+Each layer gets the TPU method that a single-algorithm checkpoint of the same
+algorithm would use.
 
 TPU supports ``FP8`` on linear layers, and ``NVFP4`` or ``W4A16_NVFP4`` on linear
 layers and routed experts. Layers that are excluded, marked ``"NONE"``, or
 absent from ``quantized_layers`` load unquantized. Any other layer and algorithm
-pair raises ``NotImplementedError``, and a fused projection or expert group
-whose entries disagree raises ``ValueError``.
+pair raises ``NotImplementedError``. A fused projection or expert group whose
+entries disagree raises ``ValueError``.
 
-TPU runs both ``NVFP4`` and ``W4A16_NVFP4`` layers as W4A16 (FP4 weights, bf16
-activations), so the two resolve to one ``NVFP4`` spec and may be mixed within a
-fused projection or an expert group. An NVFP4 entry without ``group_size`` uses
-the checkpoint's top-level ``group_size``, or ModelOpt's default of 16.
+By default, TPU runs both ``NVFP4`` and ``W4A16_NVFP4`` layers as W4A16, with
+FP4 weights and bf16 activations. The two therefore share one ``NVFP4`` spec and
+may be mixed within a fused projection or an expert group. An NVFP4 entry
+without ``group_size`` uses the checkpoint's top-level ``group_size``, or
+ModelOpt's default of 16.
 """
 
 from __future__ import annotations
@@ -119,14 +120,15 @@ def _normalize_layer_spec(
     return LayerSpec(algo, group_size)
 
 
-# vLLM picks a layer's weight loader by the method's class name, so a
-# subclass must register again or fused layers lose per-shard scale loading.
+# vLLM enables weight_loader_v2 for a method only if its class name is
+# registered. Without it, fused layers would not load their per-shard scales.
 @register_weight_loader_v2_supported_method
 class _ModelOptFp8LinearMethodTPU(VllmFp8LinearMethodTPU):
     """FP8 linear method that frees the checkpoint's unused static input scale.
 
     ``VllmFp8LinearMethodTPU`` quantizes activations dynamically and never reads
-    ``input_scale``, which is registered only so the checkpoint tensor loads.
+    ``input_scale``. The parameter exists only so the checkpoint tensor has
+    somewhere to load.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -159,15 +161,15 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
             mxfp8_config=mxfp8_config,
         )
         # ModelOpt FP8 linears store a per-tensor weight scale and a static
-        # input scale. The "static" scheme makes the method register
-        # input_scale so the checkpoint tensor has a parameter to load into.
+        # input scale. The "static" activation scheme makes the method register
+        # an input_scale parameter for that tensor to load into.
         self.tpu_fp8_config = VllmFp8Config(
             is_checkpoint_fp8_serialized=True,
             activation_scheme="static",
         )
-        # Upstream builds a single NVFP4 sub-config whose group_size comes from
-        # the top level or the first NVFP4 entry. Layers can use different
-        # group sizes, so TPU NVFP4 configs are cached per group_size.
+        # Upstream builds one NVFP4 sub-config with a single group_size. Layers
+        # can use different group sizes, so this config keeps one TPU NVFP4
+        # config per group_size.
         self._tpu_nvfp4_configs: dict[int, VllmNvfp4Config] = {}
         self._nvfp4_default_group_size = _NVFP4_DEFAULT_GROUP_SIZE
         self._child_specs, self._expert_proj_specs = self._build_spec_index()
@@ -178,11 +180,10 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> VllmModelOptMixedConfig:
-        # vLLM checks that a fallback hf_quant_config.json was written by
-        # ModelOpt only when the method is named "modelopt_mixed", and the
-        # "tpu-" prefix breaks that match, so the check is repeated here. That
-        # file nests its settings under "quantization" and has no
-        # "quant_method" key.
+        # vLLM rejects an hf_quant_config.json not produced by ModelOpt, but
+        # only for the method name "modelopt_mixed". The "tpu-" prefix skips
+        # that check, so it is repeated here. A config with a nested
+        # "quantization" section and no "quant_method" key came from that file.
         if "quantization" in config and "quant_method" not in config:
             producer = config.get("producer", {}).get("name")
             if producer != "modelopt":
@@ -214,9 +215,9 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
             **kwargs,
         )
         assert isinstance(cfg, VllmModelOptMixedConfig)
-        # Upstream fills a missing top-level group_size from the first NVFP4
-        # entry before constructing the config, so take the checkpoint's own
-        # value here, before that fallback.
+        # group_size is the checkpoint's top-level value, or None if it has
+        # none. Upstream fills None from the first NVFP4 entry, but an entry
+        # without its own group_size must use the top-level value or 16.
         if group_size is not None:
             cfg._nvfp4_default_group_size = group_size
             cfg._child_specs, cfg._expert_proj_specs = cfg._build_spec_index()
@@ -233,9 +234,10 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
     ) -> tuple[dict[str, set[LayerSpec]], dict[str, set[LayerSpec]]]:
         """Index the quantized_layers specs by ancestor module prefix.
 
-        Returns the specs of every entry under each module prefix, and the
-        specs of expert projections listed directly under each module (e.g.
-        ``...mlp.gate_proj`` indexed under ``...mlp``).
+        Returns two maps from module prefix to specs. The first holds every
+        entry under the module. The second holds only the expert projections
+        directly under the module, so ``...mlp.gate_proj`` is indexed under
+        ``...mlp``.
         """
         child_specs: dict[str, set[LayerSpec]] = {}
         expert_proj_specs: dict[str, set[LayerSpec]] = {}
@@ -325,9 +327,9 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
         if len(child_specs) == 1:
             return next(iter(child_specs))
 
-        # Some checkpoints list expert projections directly under the MoE block
-        # (e.g. "...moe.gate_proj"), while vLLM names RoutedExperts
-        # "...moe.experts".
+        # Some checkpoints list expert projections directly under the MoE
+        # block, such as "...moe.gate_proj". vLLM names the RoutedExperts
+        # module "...moe.experts", so its specs come from the parent block.
         if prefix.endswith(".experts"):
             for candidate in self._quantized_layer_prefix_candidates(prefix):
                 parent = candidate.rsplit(".experts", 1)[0]

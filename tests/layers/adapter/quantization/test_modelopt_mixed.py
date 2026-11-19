@@ -48,8 +48,8 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 LAYER = "model.layers.0"
-# A layer with no entries in the base quantized_layers, for tests that add their
-# own layout.
+# The base quantized_layers has no entries for this layer. Tests that need
+# their own layout add entries for it.
 LAYER1 = "model.layers.1"
 
 # This copies Qwen3_5ForCausalLMBase.packed_modules_mapping, which maps each
@@ -336,7 +336,8 @@ class TestDispatch:
                     f"{LAYER1}.mlp.gate_proj": _nvfp4(32),
                     f"{LAYER1}.mlp.up_proj": _nvfp4(32),
                     f"{LAYER1}.mlp.down_proj": _nvfp4(32),
-                    # Not an expert projection, so the experts ignore its spec.
+                    # The experts ignore this entry because it is not directly
+                    # under the MoE block.
                     f"{LAYER1}.mlp.shared_expert.down_proj": {"quant_algo": "FP8"},
                 },
                 32,
@@ -382,7 +383,7 @@ class TestDispatch:
         assert method.group_size == 16
 
     def test_missing_group_size_uses_nvfp4_default(self):
-        # The first NVFP4 entry sets upstream's shared group_size to 32; a layer
+        # The first NVFP4 entry sets upstream's shared group_size to 32. A layer
         # without its own group_size must still get ModelOpt's default of 16.
         cfg = _make_config(
             {
