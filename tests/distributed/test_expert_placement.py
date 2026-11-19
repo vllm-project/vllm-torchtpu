@@ -246,6 +246,9 @@ def test_ops_handed_to_jax_op_are_annotated_and_alias_nothing(monkeypatch):
     )
     lowered = jax.jit(count).lower(*avals)
     assert "aliasing_output" not in lowered.as_text()
+    # A compare-and-sum, not a scatter (which the TPU offloads to the
+    # SparseCore).
+    assert "scatter" not in lowered.as_text()
     assert "buffer_donor" not in lowered.as_text()
     assert "input_output_alias" not in lowered.compile().as_text()
 
@@ -268,3 +271,59 @@ def test_load_counts_accumulate_into_the_buffer(monkeypatch):
     assert getattr(mlp, moe_prefill_sp.LOAD_ATTR) is buf
     assert returned[0] is not buf
     assert torch.equal(buf, torch.arange(E, dtype=torch.int32) + 1)
+
+
+def test_active_validates_a_dumped_table_without_a_current_vllm_config(
+    tmp_path, monkeypatch
+):
+    # vLLM calls load_model with no current config; a config-less lookup of
+    # the EP x TP split answers 1, while the dump writes the served split.
+    from types import SimpleNamespace
+
+    import vllm.config
+
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    monkeypatch.setattr(
+        vllm.config, "get_current_vllm_config_or_none", lambda: None, raising=False
+    )
+    monkeypatch.setattr(moe_hierarchical, "_default_ep_tp", None)
+    monkeypatch.setattr(ep_place, "_PLACEMENT", {})
+    assert moe_hierarchical.ep_tp_size() == 1
+    parallel = SimpleNamespace(
+        enable_expert_parallel=True,
+        enable_eplb=False,
+        data_parallel_size=1,
+        prefill_context_parallel_size=1,
+        expert_placement_strategy="linear",
+        tensor_parallel_size=16,
+        use_sequence_parallel_moe=False,
+    )
+    hf = SimpleNamespace(
+        num_hidden_layers=5,
+        first_k_dense_replace=3,
+        architectures=["GlmMoeDsaForCausalLM"],
+    )
+    path = tmp_path / "table.json"
+    cfg = SimpleNamespace(
+        additional_config={ep_place.CONFIG_KEY: str(path)},
+        parallel_config=parallel,
+        load_config=SimpleNamespace(load_format="runai_streamer"),
+        model_config=SimpleNamespace(get_num_experts=lambda: E, hf_config=hf),
+    )
+    served = moe_hierarchical.ep_tp_size_for(cfg)
+    assert served == 2
+    slots = np.random.default_rng(6).permutation(E)
+    path.write_text(
+        json.dumps(
+            dict(
+                format=ep_place.TABLE_FORMAT,
+                num_experts=E,
+                ep_size=16,
+                ep_tp_size=served,
+                layers={"3": slots.tolist(), "4": list(range(E))},
+            )
+        )
+    )
+    place = ep_place.active(cfg)
+    assert np.array_equal(place.slots[3], slots) and len(place.slots) == 2

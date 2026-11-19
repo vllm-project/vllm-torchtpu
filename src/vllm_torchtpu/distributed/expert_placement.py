@@ -251,7 +251,7 @@ def _load(vllm_config: Any, path: str) -> ExpertPlacement:
         num_experts=vllm_config.model_config.get_num_experts(),
         moe_layers=moe_layer_indices(vllm_config.model_config.hf_config),
         ep_size=parallel.tensor_parallel_size,
-        ep_tp_size=moe_hierarchical.ep_tp_size(),
+        ep_tp_size=moe_hierarchical.ep_tp_size_for(vllm_config),
         digest=hashlib.sha256(raw).hexdigest(),
     )
 

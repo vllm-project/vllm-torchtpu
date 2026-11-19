@@ -53,6 +53,14 @@ def ep_tp_size() -> int:
     return _default_ep_tp
 
 
+def ep_tp_size_for(config) -> int:
+    """`ep_tp_size` decided from `config` itself, whether or not a vLLM
+    config is current (the same answer for the config being served)."""
+    if envs.is_set("TPU_MOE_EP_TP_SIZE"):
+        return envs.TPU_MOE_EP_TP_SIZE
+    return _default_ep_tp_for(config)
+
+
 def _default_ep_tp_for(config) -> int:
     default = envs.TPU_MOE_EP_TP_SIZE
     pc = config.parallel_config

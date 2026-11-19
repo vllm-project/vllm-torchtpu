@@ -5267,9 +5267,6 @@ class TPUModelRunner(GPUModelRunner):
             "Setting TPU quantization config for: %s", self.model_config.quantization
         )
         self.vllm_config.quant_config = get_tpu_quantization_config(self.vllm_config)
-        # Validates a placement table, and refuses a config it cannot serve,
-        # whatever the loader.
-        expert_placement.active(self.vllm_config)
 
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
@@ -5279,6 +5276,9 @@ class TPUModelRunner(GPUModelRunner):
             ),
             set_current_vllm_config(self.vllm_config),
         ):
+            # Validates a placement table, and refuses a config it cannot
+            # serve, whatever the loader.
+            expert_placement.active(self.vllm_config)
             load_model = cast(Callable[..., torch.nn.Module], model_loader.load_model)
             model = load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config
