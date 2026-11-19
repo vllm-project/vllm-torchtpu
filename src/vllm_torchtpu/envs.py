@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
+    VLLM_TPU_MOE_EARLY_REQUANT: bool | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
@@ -1032,6 +1033,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
     if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
     else None,
+    # When enabled (default: auto-on for FP4 MOE_REQUANTIZE_WEIGHT_DTYPE),
+    # requantize each RoutedExperts layer's weights as soon as all of its
+    # staged parameters land during checkpoint streaming, so FP8 expert weights
+    # never accumulate across all layers in HBM on 4-chip (8-TC) slices.
+    "VLLM_TPU_MOE_EARLY_REQUANT": env_optional_bool("VLLM_TPU_MOE_EARLY_REQUANT"),
     # TPU unified block-pool cache layout. Tri-state: an explicit 0/1 always
     # wins; unset defers to
     # platforms.tpu_block_size_utils.unified_kv_layout_enabled, which selects

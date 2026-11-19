@@ -145,6 +145,10 @@ if hasattr(torch, "float4_e2m1fn_x2"):
 
 _concat_fp4_ops: dict[int, object] = {}
 
+# Set on a RoutedExperts layer once its weights are requantized:
+# (requant_dtype_name, requant_block_size, scale_desc, force_fp8).
+MOE_REQUANT_RECORD_ATTR = "_tpu_moe_weights_requanted"
+
 
 def _is_mtp_moe_layer(prefix: str) -> bool:
     return prefix.startswith("mtp.") or ".mtp." in prefix
@@ -471,9 +475,11 @@ def _quantize_and_format_single_moe_weight(
             envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_ENABLE_W4A8
         )
         w_kmajor = fresh_buffer(w.transpose(1, 2).contiguous())
+        del w
         w_fp4, w_scale = quantize_native_fp4_kmajor(
             w_kmajor, block=block_size, pack=pack_for_gmm
         )
+        del w_kmajor
         return w_fp4, fresh_buffer(w_scale.contiguous())
 
     w, w_scale = quantize_tensor(
@@ -1089,16 +1095,15 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     def is_monolithic(self) -> bool:
         return True
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """
-        Process MoE weights into the runtime FP8 layout used by the GMM kernel.
+    def requantize_moe_layer_weights(self, layer: torch.nn.Module) -> bool:
+        """Requantize one RoutedExperts layer's weights and scales in place.
 
-        For FP8 checkpoints: dequantize block FP8 → float32, then requantize
-        to the GMM kernel's expected per-channel FP8 format.
-
-        For BF16 checkpoints (online quantization): quantize BF16 → FP8
-        directly using the same requantization path.
+        Pure per-rank tensor conversion (no cross-rank collectives), so it may
+        run either per layer during streaming load or at end-of-load. Returns
+        False if the layer was already requantized.
         """
+        if getattr(layer, MOE_REQUANT_RECORD_ATTR, None) is not None:
+            return False
         assert isinstance(layer, RoutedExperts)
         layer = cast("TpuRoutedExperts", layer)
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
@@ -1170,6 +1175,28 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             f"w13_scale={list(layer.w13_weight_scale_inv.shape)}, "
             f"w2_scale={list(layer.w2_weight_scale_inv.shape)}, "
             f"requant_block_size={scale_desc}"
+        )
+        # Read back by process_weights_after_loading, which may run long after
+        # this (at the end of loading) and must prebuild for these weights.
+        setattr(
+            layer,
+            MOE_REQUANT_RECORD_ATTR,
+            (requant_dtype_name, requant_block_size, scale_desc, force_fp8),
+        )
+        return True
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """
+        Process MoE weights into the runtime FP8/FP4 layout and prebuild ops.
+        """
+        assert isinstance(layer, RoutedExperts)
+        layer = cast("TpuRoutedExperts", layer)
+        self.requantize_moe_layer_weights(layer)
+        self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+        activation_str = self._tpu_activation_str
+        assert activation_str is not None
+        _, requant_block_size, scale_desc, force_fp8 = getattr(
+            layer, MOE_REQUANT_RECORD_ATTR
         )
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
