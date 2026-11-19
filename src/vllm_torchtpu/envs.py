@@ -252,6 +252,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
+    TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR: int = 1
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
@@ -1602,6 +1603,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_MINIMAX_M3_MSA_PREFILL_* flags apply only to `msa_attend_dcp`.
     "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG": env_str(
         "TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG", ""
+    ),
+    # MiniMax M3 head-parallel MSA prefill: page buffer of each attention
+    # round as this many max-length requests' blocks (default 1). A long
+    # step whose prefill requests' blocks exceed one buffer attends them in
+    # several rounds (an exchange, sorts and kernel calls each); 2 holds two
+    # (c64 8k chunks of ~140K-token contexts) in one round.
+    "TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR": env_nonnegative_int(
+        "TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR", 1
     ),
     # MiniMax M3 MSA prefill page cache table (`msa_attention_lse._page_cache`):
     # how its sorts run. Empty keeps three stable sorts (two of two operands);

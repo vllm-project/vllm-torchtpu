@@ -111,3 +111,13 @@ def test_numerics_vs_default(monkeypatch, spec):
         # Same 16-token tiles: widths and the page cache change only which
         # columns run, not the sums (bitwise, as on the msa_attend_dcp path).
         assert np.array_equal(o1, o0) and np.array_equal(l1, l0)
+
+
+def test_round_factor(monkeypatch):
+    env = msa_dcp_heads.HP_ROUND_FACTOR_ENV
+    monkeypatch.delenv(env, raising=False)
+    assert msa_dcp_heads.hp_round_factor() == 1
+    monkeypatch.setenv(env, "2")
+    assert msa_dcp_heads.hp_round_factor() == 2
+    monkeypatch.setenv(env, "0")
+    assert msa_dcp_heads.hp_round_factor() == 1

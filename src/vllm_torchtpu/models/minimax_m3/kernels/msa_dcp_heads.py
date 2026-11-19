@@ -474,6 +474,29 @@ def _own_selection(candidates, *, dcp, replicas, topk, axis, interpret):
     return selected
 
 
+HP_ROUND_FACTOR_ENV = "TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR"
+_round_factor_logged = False
+
+
+def hp_round_factor() -> int:
+    """Max-length requests' blocks per head-parallel round
+    (TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR, read at trace time through `envs`)."""
+    global _round_factor_logged
+    from vllm_torchtpu import envs
+
+    factor = max(1, int(envs.TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR))
+    if factor > 1 and not _round_factor_logged:
+        _round_factor_logged = True
+        init_logger(__name__).warning(
+            "%s=%d: head-parallel MSA prefill rounds of %d max-length "
+            "requests' blocks.",
+            HP_ROUND_FACTOR_ENV,
+            factor,
+            factor,
+        )
+    return factor
+
+
 def _head_parallel_attend(
     q,
     kv_cache,
@@ -505,7 +528,8 @@ def _head_parallel_attend(
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
-    capacity = block_tables_2d.shape[1]  # logical blocks per round
+    width = block_tables_2d.shape[1]  # a max-length request's blocks
+    capacity = width * hp_round_factor()  # logical blocks per round
     replicas = kv_head_replicas
     part = -(-capacity // replicas)  # each replica's share of the buffer
 
@@ -551,7 +575,7 @@ def _head_parallel_attend(
         logical = buf % part * replicas + buf // part
         q_of = jnp.searchsorted(csum, logical, side="right", method="compare_all")
         q_of = jnp.minimum(q_of, max_num_seqs - 1)
-        j = jnp.clip(logical - base[q_of], 0, capacity - 1)
+        j = jnp.clip(logical - base[q_of], 0, width - 1)
         pages = jnp.where(logical < total, block_tables_2d[q_of, j], 0)
         kv, sc = _exchange_pages(
             kv_cache,
