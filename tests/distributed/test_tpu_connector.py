@@ -8876,6 +8876,52 @@ class TestStage3LatePoll:
         assert "dst-a" not in worker._failed_recving
         assert worker.get_block_ids_with_load_errors() == set()
 
+    def test_a_follower_fans_out_an_uncertain_load_before_the_late_poll_sees_it(
+        self,
+    ):
+        # A follower TP rank marks the load accepted and sets its deadline
+        # from the leader's fan-out. A late poll that ran between the two
+        # would report the load and find no deadline to clear; the deadline
+        # set after it would then fail a load that succeeded.
+        worker = _make_raiden_worker(tp_rank=1, tp_size=2, is_producer=False)
+        engine = MagicMock()
+        engine.poll_stats.return_value = ([], ["src-a"], [])
+        worker._raiden_transfer_engine = engine
+        worker._stage3_destination_req_ids = {"src-a": "dst-a"}
+        worker._stage3_source_req_ids = {"dst-a": "src-a"}
+        worker._stage3_submitted_loads = {"dst-a": 1}
+        worker._stage3_submitted_load_tokens = {"dst-a": 10}
+        worker._stage3_tp_submits = {"dst-a"}
+        worker._stage3_inflight_submits = {"dst-a"}
+        reported: list[set[str]] = []
+        pollers: list[threading.Thread] = []
+
+        class LatePollOnAccept(set):
+            """Runs a late poll on another thread as each load is accepted."""
+
+            def add(self, req_id):
+                super().add(req_id)
+                poller = threading.Thread(
+                    target=lambda: reported.append(worker.late_poll_finished_recving())
+                )
+                poller.start()
+                # Long enough for an unblocked poll to finish.
+                poller.join(0.5)
+                pollers.append(poller)
+
+        worker._stage3_controller_accepted = LatePollOnAccept()
+        tp_group = MagicMock()
+        tp_group.broadcast_object.return_value = {"dst-a": "uncertain"}
+        with (
+            patch.object(worker, "_raiden_stage3_enabled", return_value=True),
+            patch(f"{_MOD}.get_tp_group", return_value=tp_group),
+        ):
+            worker._sync_stage3_tp_submit_states()
+            for poller in pollers:
+                poller.join(5.0)
+        assert reported == [{"dst-a"}]
+        assert worker._stage3_pending_controller_failures == {}
+
 
 def test_late_poll_is_refused_with_inline_load(monkeypatch):
     monkeypatch.setattr(f"{_MOD}.dist_utils.get_raiden_inline_load", lambda: True)
