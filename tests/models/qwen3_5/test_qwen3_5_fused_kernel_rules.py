@@ -156,14 +156,13 @@ def test_validation_points_are_present():
 
 
 @pytest.mark.parametrize("path", POINTS, ids=lambda p: p.stem)
-def test_every_entry_leg_keeps_both_fused_kernels(monkeypatch, path):
-    """Each point entry's prefill and decode legs (397B on TPU7x, TP1, TP2 or
-    TP8) are the measured model at measured head counts, so both kernels
-    still run there; the gate entries reuse these legs."""
-    monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
+def test_every_entry_leg_keeps_both_fused_kernels(path):
+    """Each point entry's prefill and decode legs run the 397B attention and
+    GDN layers at measured head counts (TP1, TP2 or TP8), so both kernels
+    still run there; the gate entries reuse these legs. The checkpoint is the
+    launcher's ``$MODEL``, which the entries do not name."""
     with path.open() as f:
         legs = yaml.safe_load(f)["legs"]
-    assert measured.is_measured_model(_model_config(QWEN35, SHAPE_397B))
     tps = []
     for leg in legs.values():
         args = leg["serve_args"]
