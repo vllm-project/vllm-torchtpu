@@ -1868,8 +1868,8 @@ def online_lse_combine_applies(
     token count and fail the compile.
     """
     from vllm_torchtpu.kernels.experimental.small_collectives.dcp_lse_combine import (
-        MAX_COMBINE_TOKENS,
         TILE_ROWS,
+        max_combine_tokens,
         online_lse_combine_geometry_supported,
     )
 
@@ -1886,7 +1886,7 @@ def online_lse_combine_applies(
     # buckets keep the existing send_layout / small-A2A path.
     if num_tokens <= envs.bucket_gate_edge(16):
         return False
-    if num_tokens > MAX_COMBINE_TOKENS or num_tokens % TILE_ROWS != 0:
+    if num_tokens > max_combine_tokens() or num_tokens % TILE_ROWS != 0:
         return False
     heads = int(num_heads) if num_heads is not None else 4 * world
     check_mode = "pairs" if req == "pairs" else "flat"

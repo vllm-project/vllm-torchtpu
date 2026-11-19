@@ -207,6 +207,31 @@ def test_geometry_supported_bounds_every_admitted_bucket():
     assert not comb.online_lse_combine_geometry_supported(64, 16, 512, mode="unknown")
 
 
+def test_token_cap_env(monkeypatch):
+    """TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS moves the token cap; unset it is
+    MAX_COMBINE_TOKENS."""
+    monkeypatch.delenv("TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS", raising=False)
+    assert comb.max_combine_tokens() == comb.MAX_COMBINE_TOKENS == 96
+    for tokens in (112, 128, 160, 192):
+        assert not comb.online_lse_combine_supported(tokens, 64, 16, 256)
+
+    monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS", "192")
+    assert comb.max_combine_tokens() == 192
+    for tokens in (*TOKEN_BUCKETS, 112, 128, 160, 192):
+        for mode in ("pairs", "flat"):
+            assert comb.online_lse_combine_supported(tokens, 64, 16, 256, mode=mode)
+    assert not comb.online_lse_combine_supported(208, 64, 16, 256)
+    assert comb.online_lse_combine_geometry_supported(64, 16, 256)
+    # 512-wide partials need 38 MB of buffers at 192 tokens, over the budget,
+    # so the whole ladder keeps the XLA merge.
+    assert not comb.online_lse_combine_geometry_supported(64, 16, 512)
+
+    for bad in ("0", "100"):
+        monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS", bad)
+        with pytest.raises(ValueError, match="multiple of 16"):
+            comb.max_combine_tokens()
+
+
 def test_trace_time_gate_keeps_the_token_count_dynamic():
     """MLA dispatch evaluates the gate inside vLLM's compile, which marks the
     token dimension dynamic. Token gates must not pin it (for example a lower
@@ -353,6 +378,29 @@ def test_adapter_env_gate_and_uv_compat(monkeypatch):
         assert not cp.vspace_fused_applies(
             t, True, num_heads=64, vdim=128, combine_dtype=torch.bfloat16
         )
+
+
+def test_adapter_gate_follows_token_cap_env(monkeypatch):
+    pytest.importorskip("torch")
+
+    from vllm_torchtpu.layers.adapter import cp_mla_attention as cp
+
+    fake_group = types.SimpleNamespace(
+        world_size=16, rank_in_group=0, ranks=list(range(16)), cpu_group=None
+    )
+    monkeypatch.setattr(cp, "get_dcp_group", lambda: fake_group)
+    monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "pairs")
+    monkeypatch.delenv("TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS", raising=False)
+    for t in (112, 128, 160, 192):
+        assert not cp.online_lse_combine_applies(t, True, num_heads=64, vdim=256)
+    assert cp.online_lse_combine_applies(96, True, num_heads=64, vdim=256)
+
+    monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS", "192")
+    for t in (16, 96, 112, 128, 160, 192):
+        assert cp.online_lse_combine_applies(t, True, num_heads=64, vdim=256)
+        assert not cp.online_lse_combine_applies(t, False, num_heads=64, vdim=256)
+    for t in (8, 120, 208, 256):
+        assert not cp.online_lse_combine_applies(t, True, num_heads=64, vdim=256)
 
 
 def test_adapter_gate_traces_under_torch_compile(monkeypatch):

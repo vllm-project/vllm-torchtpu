@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS: int = 0
     TPU_DCP_MLA_OUT_VMEM_MIB: int = 32
     TPU_DCP_ONLINE_LSE_COMBINE: str = ""
+    TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS: int = 96
     TPU_SMALL_COLL_HBM_OPERAND: bool = True
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 2
     TPU_DCP_MLA_MERGE_PIECES: int = 2
@@ -811,6 +812,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "",
         ["", "0", "1", "auto", "pairs", "flat"],
         case_sensitive=False,
+    ),
+    # Largest backbone bucket, in tokens, that TPU_DCP_ONLINE_LSE_COMBINE takes;
+    # larger buckets keep the XLA merge. A positive multiple of 16. The default
+    # is the bucket the kernel was validated at on TPU v7x
+    # (dcp_lse_combine.MAX_COMBINE_TOKENS). The kernel's VMEM check sizes its
+    # buffers at this cap, so a cap that does not fit keeps the XLA merge on
+    # every bucket. GLM-5.2 decode (DCP16, 64 heads, 256-wide partials) fits
+    # 192 (19.1 of the 25.6 MiB buffer budget).
+    "TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS": env_nonnegative_int(
+        "TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS", 96
     ),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.

@@ -68,6 +68,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.moe_tp_decode.all_reduce import (
     check_chip_pairs,
 )
@@ -86,12 +87,25 @@ TILE_ROWS = 16
 MAX_LIVE_STEPS = 8
 DEFAULT_VMEM_LIMIT_BYTES = 32 * 1024 * 1024
 # Largest decode bucket validated on TPU v7x (numerics, race detector and
-# Mosaic lowering at DCP8 and DCP16). Larger buckets keep the XLA all-gather +
-# reduce-scatter merge.
+# Mosaic lowering at DCP8 and DCP16), and the default token cap
+# (TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS, read by `max_combine_tokens`).
+# Buckets above the cap keep the XLA all-gather + reduce-scatter merge.
 MAX_COMBINE_TOKENS = 96
 # Share of the scoped VMEM limit that the kernel's buffers may take; the rest
 # is left for Mosaic temporaries.
 VMEM_BUFFER_FRACTION = 0.8
+
+
+def max_combine_tokens() -> int:
+    """Largest token bucket the combine takes, from
+    ``TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS`` (default ``MAX_COMBINE_TOKENS``)."""
+    cap = envs.TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS
+    if cap < TILE_ROWS or cap % TILE_ROWS != 0:
+        raise ValueError(
+            f"TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS={cap} must be a positive "
+            f"multiple of {TILE_ROWS}."
+        )
+    return cap
 
 
 def _vmem_buffer_bytes(
@@ -119,12 +133,13 @@ def online_lse_combine_geometry_supported(
     mode: str = "pairs",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> bool:
-    """Whether every 16-row bucket up to ``MAX_COMBINE_TOKENS`` fits the kernel
-    for ``num_heads`` x ``vdim`` over ``num_cores`` ranks in ``mode``.
+    """Whether every 16-row bucket up to ``max_combine_tokens()`` fits the
+    kernel for ``num_heads`` x ``vdim`` over ``num_cores`` ranks in ``mode``.
 
     Takes no token count, so trace-time dispatch can pair it with bucket-edge
     token gates without constraining the symbolic token count. Buffers grow
-    with the token count, so the largest bucket bounds them all.
+    with the token count, so the largest bucket bounds them all: a cap whose
+    buffers do not fit keeps the XLA merge on every bucket.
     """
     if mode not in ("pairs", "flat"):
         return False
@@ -139,13 +154,11 @@ def online_lse_combine_geometry_supported(
     if mode == "pairs" and (num_cores < 4 or num_cores % 2 != 0):
         return False
     local = num_heads // num_cores
-    if MAX_COMBINE_TOKENS * local > 8 * vdim:
+    cap = max_combine_tokens()
+    if cap * local > 8 * vdim:
         return False
     budget = int(vmem_limit_bytes * VMEM_BUFFER_FRACTION)
-    return (
-        _vmem_buffer_bytes(MAX_COMBINE_TOKENS, num_heads, num_cores, vdim, mode)
-        <= budget
-    )
+    return _vmem_buffer_bytes(cap, num_heads, num_cores, vdim, mode) <= budget
 
 
 def online_lse_combine_supported(
@@ -167,7 +180,7 @@ def online_lse_combine_supported(
         return False
     if (
         tokens < TILE_ROWS
-        or tokens > MAX_COMBINE_TOKENS
+        or tokens > max_combine_tokens()
         or tokens % TILE_ROWS != 0
         or num_cores < 2
         or num_heads < num_cores
