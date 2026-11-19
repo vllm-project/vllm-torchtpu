@@ -5027,7 +5027,7 @@ class TestPartialTailLookupWithRecency(unittest.TestCase):
         sched, status, probed = self._sched({4: hit, 2: hit})
         self.assertEqual(sched._lookup(status), 4)
         self.assertEqual(status.partial_tail_boundary, 4)
-        # Boundaries 6 (both groups probed, group 0 missed) then 4.
+        # Boundaries 6 (group 0 probed and missed) then 4.
         self.assertEqual(probed, [(0, 6), (0, 4), (1, 4)])
         self.assertEqual(sched._events_tracker.record_partial_lookup.call_count, 2)
 

@@ -104,13 +104,17 @@ class TestExternalHitEstimate(unittest.TestCase):
         self.assertIsNone(self.scheduler._step_region)
 
     def test_estimate_is_reused_for_its_ttl(self):
+        from vllm_torchtpu.offload.raiden_connector import (
+            _EXTERNAL_HIT_ESTIMATE_TTL_S as TTL,
+        )
+
         self._host_warm()
         with patch(f"{CONN}.time.monotonic", return_value=100.0):
             self.assertEqual(self._estimate(), 3 * self.BLOCK)
         tro.displace_entries(self.store, self._key(self.MAMBA, 3))
-        with patch(f"{CONN}.time.monotonic", return_value=100.2):
+        with patch(f"{CONN}.time.monotonic", return_value=100.0 + TTL / 2):
             self.assertEqual(self._estimate(), 3 * self.BLOCK)
-        with patch(f"{CONN}.time.monotonic", return_value=100.3):
+        with patch(f"{CONN}.time.monotonic", return_value=100.0 + TTL):
             self.assertEqual(self._estimate(), 0)
 
     def test_estimate_is_asked_again_for_another_local_hit(self):
