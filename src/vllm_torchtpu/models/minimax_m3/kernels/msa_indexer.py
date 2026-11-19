@@ -1131,6 +1131,15 @@ def _class_scores(
                 pltpu.VMEM((2 * block_q, chunk // 2 * page_size), jnp.float32),
                 pltpu.SMEM((3,), jnp.int32),
             ]
+            # Two output buffers, the page ring, the pending scores, margin.
+            ring = dopt.slots * pages_per_step * rows_per_page * head_dim * 4
+            params = pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                disable_bounds_checks=True,
+                vmem_limit_bytes=2 * out_shape.shape[0] * out_shape.shape[1] * 4
+                + ring
+                + (16 << 20),
+            )
         scores_t = pl.pallas_call(
             functools.partial(
                 _kernel_v3,
