@@ -14,6 +14,7 @@
 """Correctness tests for batched ragged paged attention."""
 
 from typing import Any
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +27,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs,
+    kernel,
     utils,
     wrapper,
 )
@@ -223,6 +225,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         nan_kv_seq_idx: int | None = None,
         nan_new_seq_idx: int | None = None,
         mask_invalid_v: bool | None = None,
+        check_unmasked_parity: bool = False,
     ):
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # Tokens live on the lane dim, so page_size must be a multiple of 128.
@@ -407,17 +410,38 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             batch_size=rpa_batch_size,
         )
 
-        output, updated_kv_cache = wrapper.ragged_paged_attention(
-            *jax.tree.map(lambda x: x.copy(), rpa_args),
-            **kwargs,
-            decode_block_sizes=decode_block_sizes,
-            prefill_block_sizes=prefill_block_sizes,
-            vmem_limit_bytes=vmem_limit_bytes,
-            kv_layout=kv_layout,
-            decode_query_size=decode_query_size,
-            mask_invalid_v=mask_invalid_v,
-        )
+        def run_rpa():
+            return wrapper.ragged_paged_attention(
+                *jax.tree.map(lambda x: x.copy(), rpa_args),
+                **kwargs,
+                decode_block_sizes=decode_block_sizes,
+                prefill_block_sizes=prefill_block_sizes,
+                vmem_limit_bytes=vmem_limit_bytes,
+                kv_layout=kv_layout,
+                decode_query_size=decode_query_size,
+                mask_invalid_v=mask_invalid_v,
+            )
+
+        output, updated_kv_cache = run_rpa()
         output = output[: cu_q_lens[distribution[-1]]]
+        if check_unmasked_parity:
+            # Steps that skip the mask must match the masked path bit for bit:
+            # a block wrongly judged fully visible would leak future tokens.
+            # The wrapper is jitted: retrace under the patch, then drop that trace.
+            jax.clear_caches()
+            try:
+                with mock.patch.object(
+                    kernel, "_all_items_unmasked", return_value=None
+                ):
+                    masked_output, _ = run_rpa()
+            finally:
+                jax.clear_caches()
+            np.testing.assert_array_equal(
+                np.asarray(output.astype(jnp.float32)),
+                np.asarray(
+                    masked_output[: cu_q_lens[distribution[-1]]].astype(jnp.float32)
+                ),
+            )
 
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # updated_kv_cache shape: [num_pages, num_kv_heads_x2,
@@ -472,10 +496,21 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
     def test_ragged_paged_attention_basic(
         self, dtype, block_sizes, kv_layout, page_size
     ):
-        seq_lens = [(192, 328), (128, 180), (64, 255)]
+        # Cached prefixes of bkv - 2 (bkv 48, 128, 256, 512) put a query block's
+        # first token one key before the end of a KV block: the edge of the
+        # unmasked path.
+        seq_lens = [
+            (192, 328),
+            (128, 180),
+            (64, 255),
+            (64, 110),
+            (64, 190),
+            (64, 318),
+            (64, 574),
+        ]
         num_heads = (32, 8)
         head_dim = 128
-        num_pages = 100
+        num_pages = 128
 
         bq_sz, bkv_sz, bq_csz = block_sizes
 
@@ -491,6 +526,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             bkv_sz=bkv_sz,
             bq_csz=bq_csz,
             kv_layout=kv_layout,
+            check_unmasked_parity=True,
         )
 
     @parameterized.product(
