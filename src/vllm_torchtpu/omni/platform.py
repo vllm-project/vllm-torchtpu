@@ -296,11 +296,18 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def _clear_visible_chips_env(cls) -> None:
-        """Clear TPU chip visibility, metrics ports, and rank-binding env vars."""
-        os.environ[cls.device_control_env_var] = ""
-        os.environ["TPU_VISIBLE_DEVICES"] = ""
-        os.environ["TPU_RUNTIME_METRICS_PORTS"] = ""
-        os.environ.pop("DEBUG_TPU_LOCAL_RANK_OFFSET", None)
+        """Unset TPU chip visibility, metrics ports, and rank-binding env vars.
+
+        libtpu and torch_tpu read an empty value the same as an unset one, so
+        the vars are removed instead of set to "".
+        """
+        for key in (
+            cls.device_control_env_var,
+            "TPU_VISIBLE_DEVICES",
+            "TPU_RUNTIME_METRICS_PORTS",
+            "DEBUG_TPU_LOCAL_RANK_OFFSET",
+        ):
+            os.environ.pop(key, None)
 
     @classmethod
     def _configure_stage_runtime_env(cls, chip_ids: Sequence[int]) -> None:
