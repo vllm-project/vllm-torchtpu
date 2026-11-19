@@ -73,6 +73,10 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
+from vllm_torchtpu.kernels.mla.fused_qb_absorb import (
+    fused_qb_rope_absorb_split,
+    supports_fused_qb_rope_absorb_split,
+)
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny, fp8_window_all_gather
 from vllm_torchtpu.layers.adapter import dcp_token_parallel_op, small_all_reduce_op
@@ -89,6 +93,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_SCALE,
     FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
+    PREQUANT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     _fp8_linear_pallas_hbm_pinned_jax,
     _fp8_linear_pallas_jax,
@@ -365,6 +370,58 @@ def _qb_overlap_operands(layer: Any) -> tuple[torch.Tensor, torch.Tensor] | None
     if getattr(layer, "gather_output", False):
         return None
     return layer.weight, layer.weight_scale
+
+
+def _fused_qb_operands(layer: Any) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return per-channel FP8 `(weight, weight_scale)` for fused q_b_proj, or None."""
+    weight = getattr(layer, "weight", None)
+    scale = getattr(layer, "weight_scale", None)
+    if (
+        weight is None
+        or scale is None
+        or not isinstance(weight, torch.Tensor)
+        or not isinstance(scale, torch.Tensor)
+    ):
+        return None
+    if (
+        weight.dtype != torch.float8_e4m3fn
+        or scale.ndim != 1
+        or scale.shape[0] != weight.shape[1]
+        or not getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+        or getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+        or getattr(layer, "bias", None) is not None
+        or getattr(layer, "gather_output", False)
+        or hasattr(layer, FP8_PALLAS_WEIGHT)
+        or getattr(layer, PREQUANT_ATTR, None) is not None
+    ):
+        return None
+    return weight, scale
+
+
+def _fake_fused_qb_rope_absorb_split(
+    q_c: torch.Tensor,
+    w_qb: torch.Tensor,
+    w_s: torch.Tensor,
+    w_uk_t: torch.Tensor,
+    cos_sin: torch.Tensor,
+    split_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del w_qb, w_s
+    heads, _, rank = w_uk_t.shape
+    total_tokens = q_c.shape[0]
+    d_pe = cos_sin.shape[1]
+    return (
+        q_c.new_empty((split_rows, heads, rank)),
+        q_c.new_empty((total_tokens - split_rows, heads, rank)),
+        q_c.new_empty((total_tokens, heads, d_pe)),
+    )
+
+
+# Registered at import: Dynamo cannot trace a lock-guarded registration.
+_FUSED_QB_ROPE_ABSORB_SPLIT_OP = pallas.jax_op(
+    "pallas::mla_fused_qb_rope_absorb_split", fused_qb_rope_absorb_split
+)
+_FUSED_QB_ROPE_ABSORB_SPLIT_OP.register_fake(_fake_fused_qb_rope_absorb_split)
 
 
 def _topk_rows_update_jax(buf: jax.Array, rows: jax.Array) -> jax.Array:
@@ -2410,6 +2467,64 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         permute_linear_output_channels(kv_layer, kv_index)
         self._rope_neox_permuted = True
 
+    def _fused_qb_rope_absorb_operands(
+        self,
+        q_c: torch.Tensor,
+        *,
+        q_rows: torch.Tensor | None,
+        llama_4_scaling: torch.Tensor | None,
+        num_kv_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor] | None:
+        if (
+            not envs.TPU_MLA_FUSED_QB_ROPE_ABSORB
+            or q_rows is None
+            or llama_4_scaling is not None
+            or not self.dcp_q_replicate
+            or not self.is_sparse
+            or self.rotary_emb is None
+            or not getattr(self, "_rope_neox_permuted", False)
+            or self.rotary_emb.rotary_dim != self.qk_rope_head_dim
+            or self.rotary_emb.head_size != self.qk_rope_head_dim
+            or q_c.device.type != "tpu"
+        ):
+            return None
+        tp_op = getattr(self.mla_attn, "sparse_mla_tp_op", None)
+        if (
+            tp_op is None
+            or not getattr(tp_op, "split_q_inputs", False)
+            or not dcp_token_parallel_op.applies(num_kv_tokens)
+        ):
+            return None
+        w_uk_t = getattr(self.mla_attn, "W_UK_T_dcp_qrep", None)
+        if w_uk_t is None or not isinstance(w_uk_t, torch.Tensor):
+            return None
+        if getattr(self.mla_attn, "W_UK_T_dcp_qrep_scale", None) is not None:
+            return None
+        qb_ops = _fused_qb_operands(self.q_b_proj)
+        if qb_ops is None:
+            return None
+        w_qb, s_qb = qb_ops
+        cos_sin_cache = (
+            self.rotary_emb.cos_sin_cache
+            if isinstance(self.rotary_emb, DeepseekScalingRotaryEmbedding)
+            else self.rotary_emb._match_cos_sin_cache_dtype(q_c)  # noqa: SLF001 -- upstream vLLM RotaryEmbedding cache helper
+        )
+        split_rows = tp_op.layout.split_rows
+        if not supports_fused_qb_rope_absorb_split(
+            tuple(q_c.shape),
+            q_c.dtype,
+            tuple(w_qb.shape),
+            w_qb.dtype,
+            tuple(s_qb.shape),
+            tuple(w_uk_t.shape),
+            (q_c.shape[0], cos_sin_cache.shape[-1]),
+            split_rows,
+            bfloat16_dtype=torch.bfloat16,
+            fp8_dtype=torch.float8_e4m3fn,
+        ):
+            return None
+        return w_qb, s_qb, w_uk_t, split_rows, cos_sin_cache
+
     def _q_proj_layer(self):
         """The projection that produces `q`, whichever of the two is wired."""
         return self.q_b_proj if self.q_lora_rank is not None else self.q_proj
@@ -2527,6 +2642,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             ):
                 indexer_qrows = q_rows
 
+        fused_qb_out: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         if self.kimi_preprocess is not None:
             assert self.fused_qkv_a_proj is not None
             assert self.q_a_layernorm is not None
@@ -2610,11 +2726,34 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 ):
                     q = self._project_local_q(q_c)
                 else:
-                    q = self.q_b_proj(
+                    q_c_for_q = (
                         q_c
                         if (q_rows is None or q_c.shape[0] == q_rows.shape[0])
                         else q_c.index_select(0, q_rows)
-                    )[0]
+                    )
+                    fused_ops = self._fused_qb_rope_absorb_operands(
+                        q_c_for_q,
+                        q_rows=q_rows,
+                        llama_4_scaling=llama_4_scaling,
+                        num_kv_tokens=positions.shape[0],
+                    )
+                    if fused_ops is not None:
+                        assert q_rows is not None
+                        w_qb, s_qb, w_uk_t, split_rows, cos_sin_cache = fused_ops
+                        cos_sin = cos_sin_cache.index_select(
+                            0, positions.index_select(0, q_rows)
+                        )
+                        fused_qb_out = _FUSED_QB_ROPE_ABSORB_SPLIT_OP(
+                            q_c_for_q,
+                            w_qb,
+                            s_qb,
+                            w_uk_t.to(q_c_for_q.dtype),
+                            cos_sin,
+                            split_rows,
+                        )
+                        q = None
+                    else:
+                        q = self.q_b_proj(q_c_for_q)[0]
             else:
                 assert q_rows is None, "token-parallel rows need the q_lora path"
                 assert self.kv_a_proj_with_mqa is not None, (
@@ -2632,53 +2771,67 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             )
             kv_c_normed = self.kv_a_layernorm(kv_c)
 
-        # `dcp_group_size` is 1 unless query replication is on, in which case
-        # the projection already returned the whole DCP group's heads.
-        q = q.view(-1, self.num_heads * self.dcp_group_size, self.qk_head_dim)
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
         q_rope_table = None
-        fold_q_rope = (
-            getattr(self, "decode_prologue", False)
-            and getattr(self, "_rope_neox_permuted", False)
-            and llama_4_scaling is None
-            and q_rows is None
-        )
-        if fold_q_rope:
-            # k_pe exactly as below (the unused q half is dead code to XLA);
-            # q_pe is roped in the attention kernel from the raw q head.
+        if fused_qb_out is not None:
             k_pe_dtype = k_pe.dtype
-            _, k_pe = rope_half_split(self.rotary_emb, positions, q_pe, k_pe)
-            assert k_pe is not None
-            k_pe = k_pe.to(dtype=k_pe_dtype)
-            q_rope_table = mla_q_rope_table(self.rotary_emb, positions, q)
-        elif self.rotary_emb is not None:
-            q_pe_dtype = q_pe.dtype
-            k_pe_dtype = k_pe.dtype
-            if getattr(self, "_rope_neox_permuted", False):
+            k_pe = rope_half_split(self.rotary_emb, kv_positions, k_pe, k_pe)[1].to(
+                dtype=k_pe_dtype
+            )
+            ql_head, ql_tail, q_pe_all = fused_qb_out
+            # Dead rank-local views matching baseline shape/dtype; sparse DCP
+            # reads only q_dcp_replicated.
+            q_nope = ql_head[:, : self.num_heads, : self.qk_nope_head_dim]
+            q_pe = q_pe_all[:, : self.num_heads, :]
+        else:
+            assert q is not None
+            # `dcp_group_size` is 1 unless query replication is on, in which case
+            # the projection already returned the whole DCP group's heads.
+            q = q.view(-1, self.num_heads * self.dcp_group_size, self.qk_head_dim)
+            q_nope, q_pe = q.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
 
-                def rope(pos, q_, k_):
-                    return rope_half_split(self.rotary_emb, pos, q_, k_)
-            else:
-                rope = self.rotary_emb
-            if q_rows is None:
-                q_pe, k_pe = rope(positions, q_pe, k_pe)
-            else:
-                # q exists for `q_rows` only; k is either full-step or rank-sharded.
-                q_pe = rope(
-                    positions.index_select(0, q_rows),
-                    q_pe,
-                    q_pe[:, :1, :] if kv_sharded else k_pe.index_select(0, q_rows),
-                )[0]
-                k_pe = rope(kv_positions, k_pe, k_pe)[1]
-            # RoPE caches/frequencies can be fp32 and promote the rotated
-            # tensors.  Dense MLA requires new KV values to exactly match the
-            # cache dtype, and queries should remain in the activation dtype.
-            q_pe = q_pe.to(dtype=q_pe_dtype)
-            k_pe = k_pe.to(dtype=k_pe_dtype)
+            fold_q_rope = (
+                getattr(self, "decode_prologue", False)
+                and getattr(self, "_rope_neox_permuted", False)
+                and llama_4_scaling is None
+                and q_rows is None
+            )
+            if fold_q_rope:
+                # k_pe exactly as below (the unused q half is dead code to XLA);
+                # q_pe is roped in the attention kernel from the raw q head.
+                k_pe_dtype = k_pe.dtype
+                _, k_pe = rope_half_split(self.rotary_emb, positions, q_pe, k_pe)
+                assert k_pe is not None
+                k_pe = k_pe.to(dtype=k_pe_dtype)
+                q_rope_table = mla_q_rope_table(self.rotary_emb, positions, q)
+            elif self.rotary_emb is not None:
+                q_pe_dtype = q_pe.dtype
+                k_pe_dtype = k_pe.dtype
+                if getattr(self, "_rope_neox_permuted", False):
+
+                    def rope(pos, q_, k_):
+                        return rope_half_split(self.rotary_emb, pos, q_, k_)
+                else:
+                    rope = self.rotary_emb
+                if q_rows is None:
+                    q_pe, k_pe = rope(positions, q_pe, k_pe)
+                else:
+                    # q exists for `q_rows` only; k is either full-step or rank-sharded.
+                    q_pe = rope(
+                        positions.index_select(0, q_rows),
+                        q_pe,
+                        q_pe[:, :1, :] if kv_sharded else k_pe.index_select(0, q_rows),
+                    )[0]
+                    k_pe = rope(kv_positions, k_pe, k_pe)[1]
+                # RoPE caches/frequencies can be fp32 and promote the rotated
+                # tensors.  Dense MLA requires new KV values to exactly match the
+                # cache dtype, and queries should remain in the activation dtype.
+                q_pe = q_pe.to(dtype=q_pe_dtype)
+                k_pe = k_pe.to(dtype=k_pe_dtype)
 
         topk_indices = None
         if self.is_sparse:
@@ -2711,8 +2864,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
         # Hand the group-wide q to the sparse DCP path, which would otherwise
         # all-gather the heads itself; everything else takes this rank's shard.
-        q_dcp_replicated = None
-        if self.dcp_q_replicate:
+        q_dcp_replicated: Any = None
+        if fused_qb_out is not None:
+            ql_head, ql_tail, q_pe_all = fused_qb_out
+            q_dcp_replicated = ((ql_head, ql_tail), q_pe_all)
+        elif self.dcp_q_replicate:
             if q_rope_table is not None:
                 # The raw q head view (q_pe un-roped) + the rope table.
                 q_dcp_replicated = (q_nope, q, q_rope_table)

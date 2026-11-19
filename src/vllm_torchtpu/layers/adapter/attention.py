@@ -2917,6 +2917,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Not in the MTP drafter under TPU_MTP_DCP_MERGE_SIZED: the drafter's
         # projected partial stays f32, and the sized merge only takes a 2-byte
         # partial, so it would silently fall back to the f32 reduce-scatter.
+        q_tokens = (
+            q_nope[0].shape[0] + q_nope[1].shape[0]
+            if isinstance(q_nope, tuple)
+            else q_nope.shape[0]
+        )
         uv_first = (
             use_qrep
             and getattr(layer, "W_UV_dcp_qrep", None) is not None
@@ -2925,7 +2930,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 or vllm_compilation_backends.model_tag == "backbone"
             )
             and _uv_before_merge_applies(
-                q_nope.shape[0], vllm_compilation_backends.model_tag == "backbone"
+                q_tokens, vllm_compilation_backends.model_tag == "backbone"
             )
         )
         pe_dim = q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim
@@ -2934,34 +2939,43 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
         tp_op = getattr(layer, "sparse_mla_tp_op", None)
-        use_tp_split_absorb = (
-            topk_indices is not None
-            and tp_op is not None
-            and use_qrep
-            and dcp_token_parallel_op.applies(num_kv_tokens)
-            and getattr(tp_op, "split_q_inputs", False)
-            and q_nope.device.type == "tpu"
-            and w_uk_t_scale is None
-        )
         ql_nope_split: tuple[torch.Tensor, torch.Tensor] | None = None
-        if use_tp_split_absorb:
-            assert tp_op is not None
-            ql_head, ql_tail = _absorb_q_split(
-                q_nope, w_uk_t_src.to(q_nope.dtype), tp_op.layout.split_rows
-            )
+        if isinstance(q_nope, tuple):
+            # Already absorbed and split by TPU_MLA_FUSED_QB_ROPE_ABSORB.
+            ql_head, ql_tail = q_nope
             ql_nope_split = (
                 ql_head.to(input_dtype).view(-1, attn_heads, layer.kv_lora_rank),
                 ql_tail.to(input_dtype).view(-1, attn_heads, layer.kv_lora_rank),
             )
             ql_nope = ql_nope_split[0]
-        elif q_nope.device.type == "tpu" and w_uk_t_scale is None:
-            ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
         else:
-            q_nope_t = q_nope.transpose(0, 1)
-            ql_nope = torch.bmm(q_nope_t, w_uk_t_src.to(q_nope_t.dtype))
-            if w_uk_t_scale is not None:
-                ql_nope = ql_nope * w_uk_t_scale
-            ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
+            use_tp_split_absorb = (
+                topk_indices is not None
+                and tp_op is not None
+                and use_qrep
+                and dcp_token_parallel_op.applies(num_kv_tokens)
+                and getattr(tp_op, "split_q_inputs", False)
+                and q_nope.device.type == "tpu"
+                and w_uk_t_scale is None
+            )
+            if use_tp_split_absorb:
+                assert tp_op is not None
+                ql_head, ql_tail = _absorb_q_split(
+                    q_nope, w_uk_t_src.to(q_nope.dtype), tp_op.layout.split_rows
+                )
+                ql_nope_split = (
+                    ql_head.to(input_dtype).view(-1, attn_heads, layer.kv_lora_rank),
+                    ql_tail.to(input_dtype).view(-1, attn_heads, layer.kv_lora_rank),
+                )
+                ql_nope = ql_nope_split[0]
+            elif q_nope.device.type == "tpu" and w_uk_t_scale is None:
+                ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
+            else:
+                q_nope_t = q_nope.transpose(0, 1)
+                ql_nope = torch.bmm(q_nope_t, w_uk_t_src.to(q_nope_t.dtype))
+                if w_uk_t_scale is not None:
+                    ql_nope = ql_nope * w_uk_t_scale
+                ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
 
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 

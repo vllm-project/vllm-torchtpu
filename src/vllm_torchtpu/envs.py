@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SEND_GROUP_ROWS: int = 8
     TPU_DCP_MLA_SEND_SMALL_A2A: bool = True
     TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS: int = 8
+    TPU_MLA_FUSED_QB_ROPE_ABSORB: bool = True
     TPU_MLA_FUSED_SMALL_A2A: bool = True
     TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB: int = 16
     TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS: int = 8
@@ -680,6 +681,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gate in the traced graph. 1 = every bucket the flag takes.
     "TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS": env_int(
         "TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS", 1
+    ),
+    # Fuse token-parallel prefill FP8 q_b_proj + NeoX q_pe RoPE + W_UK_T
+    # absorb_q_split in a single VMEM Pallas kernel (no HBM [T, H*(d_nope+d_pe)]
+    # intermediate). Bit-exact vs the unfused chain; 0 extra HBM.
+    "TPU_MLA_FUSED_QB_ROPE_ABSORB": env_bool(
+        "TPU_MLA_FUSED_QB_ROPE_ABSORB", default=True
     ),
     # With TPU_MLA_FUSED_SMALL_A2A: peers push into a VMEM receive scratch and
     # the kernel also runs the DCP merge (the unpack + `_merge_received`, term

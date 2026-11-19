@@ -1,0 +1,265 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Fused VMEM Pallas kernel for prefill MLA q_b_proj + q_pe RoPE + absorb_q_split."""
+
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+from jax import lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    quantize_tensor,
+    xla_quantized_matmul,
+)
+
+MIN_TOKENS = 128
+HEAD_BLOCK = 8
+TAIL_CHUNK_CANDIDATES = (512, 256, 128, 64)
+
+
+def select_tail_chunk(tail_rows: int) -> int | None:
+    """Return the largest supported tail token chunk dividing `tail_rows`, or None."""
+    if tail_rows <= 0:
+        return None
+    for candidate in TAIL_CHUNK_CANDIDATES:
+        if tail_rows % candidate == 0:
+            return candidate
+    return None
+
+
+def supports_fused_qb_rope_absorb_split(
+    q_c_shape: tuple[int, ...],
+    q_c_dtype: object,
+    w_qb_shape: tuple[int, ...],
+    w_qb_dtype: object,
+    w_s_shape: tuple[int, ...],
+    w_uk_t_shape: tuple[int, ...],
+    cos_sin_shape: tuple[int, ...],
+    split_rows: int,
+    *,
+    bfloat16_dtype: object,
+    fp8_dtype: object,
+) -> bool:
+    """Return whether shapes and dtypes satisfy the fused VMEM kernel contract."""
+    if len(q_c_shape) != 2 or len(w_qb_shape) != 2 or len(w_s_shape) != 1:
+        return False
+    if len(w_uk_t_shape) != 3 or len(cos_sin_shape) != 2:
+        return False
+    if q_c_dtype != bfloat16_dtype or w_qb_dtype != fp8_dtype:
+        return False
+    total_tokens, k_dim = q_c_shape
+    w_k, n_out = w_qb_shape
+    heads, d_nope, rank = w_uk_t_shape
+    cs_tokens, d_pe = cos_sin_shape
+    d_q = d_nope + d_pe
+    tail_rows = total_tokens - split_rows
+    if total_tokens < MIN_TOKENS or cs_tokens != total_tokens:
+        return False
+    if w_k != k_dim or w_s_shape[0] != n_out or n_out != heads * d_q:
+        return False
+    if split_rows <= 0 or split_rows % 8 != 0 or select_tail_chunk(tail_rows) is None:
+        return False
+    if heads % HEAD_BLOCK != 0 or k_dim % 128 != 0 or d_q % 128 != 0:
+        return False
+    return d_pe == 64 and rank % 128 == 0
+
+
+def fused_qb_rope_absorb_split_ref(
+    q_c: jax.Array,
+    w_qb: jax.Array,
+    w_s: jax.Array,
+    w_uk_t: jax.Array,
+    cos_sin: jax.Array,
+    split_rows: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Reference JAX chain: FP8 q_b_proj -> split -> NeoX q_pe RoPE + absorb_q_split."""
+    heads, d_nope, _ = w_uk_t.shape
+    d_pe = cos_sin.shape[1]
+    half_pe = d_pe // 2
+    q = xla_quantized_matmul(q_c, w_qb, w_s).reshape(q_c.shape[0], heads, d_nope + d_pe)
+    q_nope = q[:, :, :d_nope]
+    q_pe = q[:, :, d_nope:]
+    ql = jnp.einsum(
+        "thd,hdr->thr",
+        q_nope.astype(jnp.float32),
+        w_uk_t.astype(jnp.float32),
+        preferred_element_type=jnp.float32,
+    ).astype(q_c.dtype)
+    q_pe_f = q_pe.astype(jnp.float32)
+    cs_f = cos_sin.astype(jnp.float32)
+    cos = cs_f[:, None, :half_pe]
+    sin = cs_f[:, None, half_pe:]
+    x1 = q_pe_f[:, :, :half_pe]
+    x2 = q_pe_f[:, :, half_pe:]
+    q_pe_rot = jnp.concatenate(
+        [x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1
+    ).astype(q_c.dtype)
+    return ql[:split_rows], ql[split_rows:], q_pe_rot
+
+
+def fused_qb_rope_absorb_split(
+    q_c: jax.Array,
+    w_qb: jax.Array,
+    w_s: jax.Array,
+    w_uk_t: jax.Array,
+    cos_sin: jax.Array,
+    split_rows: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Map `[T, K]` q_c -> `(ql_head[s, H, R], ql_tail[T-s, H, R], q_pe[T, H, 64])`.
+
+    Fuses FP8 `q_b_proj`, NeoX half-split `q_pe` RoPE, and `W_UK_T` absorption
+    in VMEM per 8-head block so the `[T, H*(d_nope+d_pe)]` query tensor never
+    materializes in HBM. Requires `supports_fused_qb_rope_absorb_split` True.
+    """
+    total_tokens, k_dim = q_c.shape
+    heads, d_nope, rank = w_uk_t.shape
+    d_pe = cos_sin.shape[1]
+    half_pe = d_pe // 2
+    d_q = d_nope + d_pe
+    n_out = heads * d_q
+    tail_rows = total_tokens - split_rows
+    tail_chunk = select_tail_chunk(tail_rows)
+    if (
+        not supports_fused_qb_rope_absorb_split(
+            q_c.shape,
+            q_c.dtype,
+            w_qb.shape,
+            w_qb.dtype,
+            w_s.shape,
+            w_uk_t.shape,
+            cos_sin.shape,
+            split_rows,
+            bfloat16_dtype=jnp.bfloat16,
+            fp8_dtype=jnp.float8_e4m3fn,
+        )
+        or tail_chunk is None
+    ):
+        raise ValueError(
+            "Unsupported inputs for fused_qb_rope_absorb_split: "
+            f"q_c={q_c.shape}/{q_c.dtype}, w_qb={w_qb.shape}/{w_qb.dtype}, "
+            f"w_s={w_s.shape}, w_uk_t={w_uk_t.shape}, cos_sin={cos_sin.shape}, "
+            f"split_rows={split_rows}"
+        )
+
+    n_hblk = heads // HEAD_BLOCK
+    cols_blk = HEAD_BLOCK * d_q
+    n_tail_chunks = tail_rows // tail_chunk
+
+    x_q, x_s = quantize_tensor(q_c, w_qb.dtype)
+    # Pad row scale and packed [cos, sin] to 128 lanes for aligned VMEM loads.
+    x_s_128 = jnp.broadcast_to(x_s, (total_tokens, 128))
+    cos_sin_128 = jnp.pad(cos_sin.astype(jnp.float32), ((0, 0), (0, 128 - d_pe)))
+    w_s_2d = w_s.astype(jnp.float32).reshape(1, n_out)
+
+    def _kernel(
+        xq_ref,
+        xs_ref,
+        cs_ref,
+        wqb_ref,
+        ws_ref,
+        wuk_ref,
+        ql_head_ref,
+        ql_tail_ref,
+        qpe_ref,
+    ):
+        ws_v = ws_ref[0]
+
+        def _project_slice(t0, nrows: int) -> tuple[jax.Array, jax.Array]:
+            xq_sl = xq_ref[pl.ds(t0, nrows), :]
+            xs_sl = xs_ref[pl.ds(t0, nrows), :1]
+            c_sl = cs_ref[pl.ds(t0, nrows), :half_pe]
+            s_sl = cs_ref[pl.ds(t0, nrows), half_pe:d_pe]
+
+            # Avoid per-head q_b_proj GEMMs: projecting all 8 heads in one
+            # [nrows, K] @ [K, 8*d_q] matmul reuses xq_sl 8x across MXU tiles.
+            q_raw = lax.dot_general(
+                xq_sl,
+                wqb_ref[...],
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            q_raw = (q_raw * xs_sl * ws_v[None, :]).astype(q_c.dtype)
+
+            ql_list = []
+            qpe_list = []
+            for h in range(HEAD_BLOCK):
+                c0 = h * d_q
+                ql_h = lax.dot_general(
+                    q_raw[:, c0 : c0 + d_nope],
+                    wuk_ref[h],
+                    (((1,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                ).astype(q_c.dtype)
+                ql_list.append(ql_h)
+                x1 = q_raw[:, c0 + d_nope : c0 + d_nope + half_pe].astype(jnp.float32)
+                x2 = q_raw[:, c0 + d_nope + half_pe : c0 + d_q].astype(jnp.float32)
+                qpe_h = jnp.concatenate(
+                    [x1 * c_sl - x2 * s_sl, x2 * c_sl + x1 * s_sl],
+                    axis=-1,
+                ).astype(q_c.dtype)
+                qpe_list.append(qpe_h)
+
+            return (
+                pltpu.einshape("htd->thd", jnp.stack(ql_list)),
+                pltpu.einshape("htd->thd", jnp.stack(qpe_list)),
+            )
+
+        ql_h, qpe_h = _project_slice(0, split_rows)
+        ql_head_ref[...] = ql_h
+        qpe_ref[pl.ds(0, split_rows)] = qpe_h
+
+        if n_tail_chunks == 1:
+            ql_t, qpe_t = _project_slice(split_rows, tail_chunk)
+            ql_tail_ref[...] = ql_t
+            qpe_ref[pl.ds(split_rows, tail_chunk)] = qpe_t
+        else:
+            # Avoid Python-unrolling tail chunks: fori_loop keeps compile time
+            # constant across large prefill buckets (16K/32K+).
+            def _tail_body(c, _):
+                t0 = split_rows + c * tail_chunk
+                ql_t, qpe_t = _project_slice(t0, tail_chunk)
+                ql_tail_ref[pl.ds(c * tail_chunk, tail_chunk)] = ql_t
+                qpe_ref[pl.ds(t0, tail_chunk)] = qpe_t
+
+            lax.fori_loop(0, n_tail_chunks, _tail_body, None)
+
+    return pl.pallas_call(
+        _kernel,
+        grid=(n_hblk,),
+        in_specs=[
+            pl.BlockSpec(
+                (total_tokens, k_dim),
+                lambda hb: (0, 0),
+                pipeline_mode=pl.Buffered(1),
+            ),
+            pl.BlockSpec(
+                (total_tokens, 128),
+                lambda hb: (0, 0),
+                pipeline_mode=pl.Buffered(1),
+            ),
+            pl.BlockSpec(
+                (total_tokens, 128),
+                lambda hb: (0, 0),
+                pipeline_mode=pl.Buffered(1),
+            ),
+            pl.BlockSpec((k_dim, cols_blk), lambda hb: (0, hb)),
+            pl.BlockSpec((1, cols_blk), lambda hb: (0, hb)),
+            pl.BlockSpec((HEAD_BLOCK, d_nope, rank), lambda hb: (hb, 0, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((split_rows, HEAD_BLOCK, rank), lambda hb: (0, hb, 0)),
+            pl.BlockSpec((tail_rows, HEAD_BLOCK, rank), lambda hb: (0, hb, 0)),
+            pl.BlockSpec((total_tokens, HEAD_BLOCK, d_pe), lambda hb: (0, hb, 0)),
+        ],
+        out_shape=(
+            jax.ShapeDtypeStruct((split_rows, heads, rank), q_c.dtype),
+            jax.ShapeDtypeStruct((tail_rows, heads, rank), q_c.dtype),
+            jax.ShapeDtypeStruct((total_tokens, heads, d_pe), q_c.dtype),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes * 7 // 8,
+        ),
+    )(x_q, x_s_128, cos_sin_128, w_qb, w_s_2d, w_uk_t)
