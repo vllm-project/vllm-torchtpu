@@ -4,10 +4,11 @@
 
 Under MoE tensor parallelism vLLM runs the shared expert, scales and adds the
 routed output, and all-reduces the sum over the TP group. For an armed layer
-one torch op does all of it: at the token counts the kernel admits (16, 32 and 64)
-one Pallas call per rank covers routing, the shared expert, the routed experts
-and the all-reduce (counts below 16, and with TPU_MOE_TP_DECODE_PAD_ROWS counts
-between two of them, run it on the next count with trailing padding rows);
+one torch op does all of it: at the token counts the kernel admits (16, 32 and
+64, and 128 with TPU_MOE_TP_DECODE_ROWS_128) one Pallas call per rank covers
+routing, the shared expert, the routed experts and the all-reduce (counts
+below 16, and with TPU_MOE_TP_DECODE_PAD_ROWS counts between two of them, run
+it on the next count with trailing padding rows);
 every other count runs the usual TP path (router top-k, fused_moe_func, the
 shared expert's linears) and a psum in the same exported program. The token
 count is static there, so one torch op serves every bucket. The op's output
@@ -358,7 +359,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
     )
     rows = tuple(
         m
-        for m in kernel.ROW_BUCKETS
+        for m in kernel.row_buckets()
         if kernel.can_use_moe_tp_decode(
             jax.ShapeDtypeStruct((m, hidden), jnp.bfloat16),
             jax.ShapeDtypeStruct((m, experts), jnp.float32),
@@ -526,10 +527,11 @@ def _kernel_rows(n: int, pad_rows: bool) -> int:
     """The row count the kernel runs an n-row call on: n when the kernel has
     that size; the smallest size above n when n is below the smallest size,
     or, with pad_rows, between two sizes; otherwise n (the usual path)."""
-    larger = [m for m in kernel.ROW_BUCKETS if m > n]
-    if n in kernel.ROW_BUCKETS or not larger:
+    buckets = kernel.row_buckets()
+    larger = [m for m in buckets if m > n]
+    if n in buckets or not larger:
         return n
-    if n < kernel.ROW_BUCKETS[0] or pad_rows:
+    if n < buckets[0] or pad_rows:
         return larger[0]
     return n
 

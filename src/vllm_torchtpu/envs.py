@@ -1493,6 +1493,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # independent and padding rows get zero weight, so each row's output
     # equals the larger bucket's bit for bit. Default off.
     "TPU_MOE_TP_DECODE_PAD_ROWS": env_bool("TPU_MOE_TP_DECODE_PAD_ROWS", False),
+    # moe_tp_decode: also admit 128-row calls, so a 128-token decode step (e.g.
+    # 32 requests x 4 MTP tokens, or 24 x 4 = 96 padded to 128) runs the fused
+    # kernel instead of the grouped-matmul path and a psum. The 128-row kernel
+    # is the same kernel at m = 128; at GLM-5.2 TP16 shapes its VMEM plan asks
+    # for 47.7 MB of the 50.3 MB the kernel may request. The 16, 32 and 64-row
+    # kernels do not change. Default off.
+    "TPU_MOE_TP_DECODE_ROWS_128": env_bool("TPU_MOE_TP_DECODE_ROWS_128", False),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

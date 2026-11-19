@@ -4,7 +4,7 @@
 
 For DeepSeek-V3-style MoE layers served with MoE tensor parallelism (every
 rank holds all E experts with I = moe_intermediate_size / n columns each, and
-its slice of the shared expert), at decode row counts (ROW_BUCKETS). From the
+its slice of the shared expert), at decode row counts (row_buckets()). From the
 f32 router scores to the layer's bf16 [N, D] output, summed over the n ranks
 inside the kernel, so no XLA all-reduce follows:
 
@@ -77,6 +77,8 @@ from vllm_torchtpu.kernels.quantized_matmul.util import quantize_block
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = float(jnp.finfo(FP8).max)
 ROW_BUCKETS = (16, 32, 64)
+# TPU_MOE_TP_DECODE_ROWS_128: the row count admitted on top of ROW_BUCKETS.
+LARGE_ROWS = 128
 # router_topk's clamp floor, above the finfo.min that masks a pick.
 ROUTER_NEG = -3.0e38
 # _route_fast: routing keys are positive normal f32 bit patterns from here.
@@ -104,6 +106,16 @@ def exact_in_bf16(value: float) -> bool:
     """True if `value` is a bf16 number, so bf16 and f32 products agree."""
     rounded = np.asarray(value, dtype=jnp.bfloat16).astype(np.float32)
     return float(rounded) == float(value)
+
+
+def row_buckets() -> tuple[int, ...]:
+    """The row counts the kernel admits: ROW_BUCKETS, plus LARGE_ROWS when
+    TPU_MOE_TP_DECODE_ROWS_128 is set. Read at trace time."""
+    from vllm_torchtpu import envs
+
+    if envs.TPU_MOE_TP_DECODE_ROWS_128:
+        return (*ROW_BUCKETS, LARGE_ROWS)
+    return ROW_BUCKETS
 
 
 def _split_meta():
@@ -224,7 +236,7 @@ def can_use_moe_tp_decode(
     m, h = x.shape
     experts, i, out = w2.shape
     num_experts, shared_inter = scores.shape[1], shared_w2.shape[0]
-    if m not in ROW_BUCKETS or scores.shape != (m, num_experts):
+    if m not in row_buckets() or scores.shape != (m, num_experts):
         return False
     # This rank's experts are a linear block of the router's num_experts
     # (experts == num_experts under plain TP).

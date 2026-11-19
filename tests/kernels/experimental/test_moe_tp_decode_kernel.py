@@ -81,6 +81,12 @@ CHAIN_ROWS = 128
 # TPU_MOE_TP_DECODE_PAD_ROWS: the kernel runs on the next size (32, 64). 48:36
 # is a batch-9 decode step (9 requests x 4 tokens) in a 48-token bucket.
 PAD_CASES = ((24, 20), (48, 36))
+# TPU_MOE_TP_DECODE_ROWS_128 (kernel.LARGE_ROWS): the 128-row kernel called
+# directly on its fold (8), trim (16) and full-with-padding (65) paths, and
+# through the op body at LARGE_BODY_CASE. 123 valid rows of 128 is a step of
+# 31 requests x 4 tokens (MTP 3) after padding is skipped.
+LARGE_CASES = ((128, 8), (128, 16), (128, 65))
+LARGE_BODY_CASE = (128, 123)
 # Row 0 of OUTLIER_CASE gets OUTLIER at OUTLIER_COLUMN (inside the second
 # 512-column block), and every weight on that column is zeroed, so it moves
 # nothing but quantization scales.
@@ -160,6 +166,40 @@ def test_admits_the_decode_buckets_at_glm52_shapes(monkeypatch, rows, admitted):
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
     shapes = _glm52_shapes(rows)
     assert kernel.can_use_moe_tp_decode(*shapes, topk=8, n_ranks=N_RANKS) is admitted
+
+
+@pytest.mark.parametrize(
+    "rows, admitted",
+    [(16, True), (32, True), (64, True), (128, True), (96, False), (256, False)],
+)
+def test_admits_128_rows_with_the_env_at_glm52_shapes(monkeypatch, rows, admitted):
+    # At 128 rows the VMEM plan asks for 47,728,640 B, under the refusal
+    # threshold of 0.75 x 64 MiB = 50,331,648 B; 256 rows are above it.
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    monkeypatch.setattr(envs, "TPU_MOE_TP_DECODE_ROWS_128", True)
+    assert kernel.row_buckets() == (16, 32, 64, 128)
+    shapes = _glm52_shapes(rows)
+    assert kernel.can_use_moe_tp_decode(*shapes, topk=8, n_ranks=N_RANKS) is admitted
+    spec = all_reduce.make_spec(N_RANKS, 128, GLM52_TP16["h"])
+    need, limit = kernel_impl._vmem_plan(
+        128,
+        GLM52_TP16["h"],
+        GLM52_TP16["i"],
+        GLM52_TP16["e"],
+        GLM52_TP16["fs"],
+        _tpu7x(),
+        spec,
+    )
+    assert (need, limit) == (38182912, 47728640)
+
+
+def test_row_buckets_without_the_env(monkeypatch):
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "TPU_MOE_TP_DECODE_ROWS_128", False)
+    assert kernel.row_buckets() == kernel.ROW_BUCKETS == (16, 32, 64)
 
 
 @pytest.mark.parametrize(
@@ -276,10 +316,11 @@ def test_routed_x_scales_per_512_column_block_as_gmm_v2():
     assert np.array_equal(q_changed, changed)
 
 
-def _run_worker(part):
+def _run_worker(part, extra_env=None):
     flags = os.environ.get("XLA_FLAGS", "")
     env = dict(
         os.environ,
+        **(extra_env or {}),
         JAX_PLATFORMS="cpu",
         # bf16 rounded after every op in the interpreted kernel too, as on the
         # TPU and in _expected; XLA:CPU may otherwise keep f32 in between.
@@ -441,6 +482,41 @@ def test_op_body_pads_between_kernel_sizes_on_16_devices(
 
 def test_op_body_keeps_the_usual_path_between_sizes_by_default(on_16_devices_c):
     assert on_16_devices_c["pad_off_chain_exact"]
+
+
+# "d": the 128-row kernel, with TPU_MOE_TP_DECODE_ROWS_128 set in the worker.
+@pytest.fixture(scope="module")
+def on_16_devices_d():
+    return _run_worker("d", {"TPU_MOE_TP_DECODE_ROWS_128": "1"})
+
+
+@pytest.mark.parametrize("rows, n_valid", LARGE_CASES)
+def test_large_rows_kernel_on_16_devices(on_16_devices_d, rows, n_valid):
+    case = on_16_devices_d["cases"][f"{rows}:{n_valid}"]
+    assert case["ranks_identical"], case
+    assert case["padding_rows_positive_zero"], case
+    assert not case["races_found"], case
+    assert case["nan"] == 0, case
+    assert case["rel_l2"] <= TOLERANCE["rel_l2"], case
+    assert case["cos"] >= TOLERANCE["cos"], case
+    assert case["expected_rel_l2"] <= EXPECTED_REL_L2, case
+
+
+def test_op_body_runs_the_128_row_kernel_with_the_env(on_16_devices_d):
+    # The op body at 128 tokens takes the kernel, not the psum path: its output
+    # bits equal a direct 128-row kernel call on the same rows.
+    case = on_16_devices_d["body_kernel_128"]
+    assert case["bitwise_vs_kernel"], case
+    assert case["padding_rows_positive_zero"], case
+    assert case["rel_l2"] <= TOLERANCE["rel_l2"], case
+
+
+def test_large_rows_fault_fails_the_oracle(on_16_devices_d):
+    # Positive control: a combine that drops the routed scale (2.5 -> 1) at
+    # 128 rows must fail both accuracy checks above.
+    case = on_16_devices_d["fault_combine"]
+    assert case["rel_l2"] > TOLERANCE["rel_l2"], case
+    assert case["expected_rel_l2"] > EXPECTED_REL_L2, case
 
 
 def test_all_reduce_selftest_on_16_devices(on_16_devices_b):
@@ -875,6 +951,74 @@ def _worker(part):
         )
 
     result = {"cases": {}, "fast": {}}
+    if part == "d":
+        assert kernel.row_buckets()[-1] == kernel.LARGE_ROWS
+        for rows, n_valid in LARGE_CASES:
+            x, scores = inputs(rows)
+            operands = (
+                jnp.tile(x, (N_RANKS, 1)),
+                jnp.tile(scores, (N_RANKS, 1)),
+                bias,
+                jnp.asarray([n_valid], jnp.int32),
+                rank_ids,
+                *stacked,
+            )
+            start = time.monotonic()
+            out, races = _interpret(run, *put(operands, specs))
+            result["cases"][f"{rows}:{n_valid}"] = checks(
+                out, x, scores, rows, n_valid, races, start, rows
+            )
+        rows, n_valid = LARGE_BODY_CASE
+        x, scores = inputs(rows)
+        start = time.monotonic()
+        body_out, races = _interpret(run_body, *body_operands(x, scores, n_valid))
+        case = checks(body_out, x, scores, rows, n_valid, races, start, rows)
+        direct, _ = _interpret(
+            run,
+            *put(
+                (
+                    jnp.tile(x, (N_RANKS, 1)),
+                    jnp.tile(scores, (N_RANKS, 1)),
+                    bias,
+                    jnp.asarray([n_valid], jnp.int32),
+                    rank_ids,
+                    *stacked,
+                ),
+                specs,
+            ),
+        )
+        case["bitwise_vs_kernel"] = bool(
+            np.array_equal(
+                np.asarray(body_out).view(np.uint16), np.asarray(direct).view(np.uint16)
+            )
+        )
+        result["body_kernel_128"] = case
+        # Positive control: the same 128-row call with the routed scale dropped
+        # from the combine. jax.clear_caches() makes the jitted kernel retrace.
+        good_combine = kernel_impl._combine
+        kernel_impl._combine = lambda routed, shared, scale: good_combine(
+            routed, shared, 1.0
+        )
+        jax.clear_caches()
+        rows, n_valid = LARGE_CASES[-1]
+        x, scores = inputs(rows)
+        operands = (
+            jnp.tile(x, (N_RANKS, 1)),
+            jnp.tile(scores, (N_RANKS, 1)),
+            bias,
+            jnp.asarray([n_valid], jnp.int32),
+            rank_ids,
+            *stacked,
+        )
+        start = time.monotonic()
+        out, races = _interpret(run, *put(operands, specs))
+        result["fault_combine"] = checks(
+            out, x, scores, rows, n_valid, races, start, rows
+        )
+        kernel_impl._combine = good_combine
+        jax.clear_caches()
+        print("RESULT " + json.dumps(result))
+        return
     if part == "c":
         run_body_pad = jax.jit(
             jax.shard_map(
