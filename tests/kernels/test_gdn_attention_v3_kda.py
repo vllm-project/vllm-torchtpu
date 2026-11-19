@@ -1665,6 +1665,38 @@ class KdaTilingAndValidationTest(parameterized.TestCase):
                         atol=0.0,
                     )
 
+    def test_rejects_wide_value_heads_on_the_unified_pool(self):
+        """The unified pool's lane-row granules cannot hold d_v > 128."""
+        n_kq = n_v = 1
+        d_k, d_v = 256, 512
+        kernel_size = 4
+        dim_size = 2 * n_kq * d_k + n_v * d_v
+        with self.assertRaisesRegex(NotImplementedError, "d_v <= 128"):
+            wrapper.fused_conv1d_gdn(
+                qkv=jnp.zeros((8, dim_size)),
+                b=jnp.zeros((8, n_v)),
+                a=jnp.zeros((8, n_v * d_k)),
+                # fp32 unified pool: [blocks, granules, packing=1, lanes].
+                states=jnp.zeros((9, 64, 1, 128)),
+                conv_dtype=jnp.float32,
+                recurrent_dtype=jnp.float32,
+                conv_weight=jnp.zeros((dim_size, 1, kernel_size)),
+                conv_bias=None,
+                a_log=jnp.zeros((n_v,)),
+                dt_bias=jnp.zeros((n_v, d_k)),
+                query_start_loc=jnp.arange(9, dtype=jnp.int32),
+                state_indices=jnp.arange(1, 9),
+                distribution=jnp.array([8, 8, 8], dtype=jnp.int32),
+                seq_lens=jnp.ones((8,), dtype=jnp.int32),
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                attention_mode=config.AttentionMode.KDA,
+            )
+
+
 class KdaCustomOpWideValueHeadTest(parameterized.TestCase):
     """The fused KDA custom op, not just the kernel, with d_v != d_k and a
     beta scale: the relaxed ABI check, the `head_v_dim` output reshape, the
