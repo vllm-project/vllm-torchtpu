@@ -1492,6 +1492,41 @@ class TestFp4MoERequantization:
         )
 
 
+def test_concat_fp4_experts_op_has_annotated_signature():
+    """`pallas.jax_op` needs a `jax.Array` annotation on every argument of
+    the JAX function: the op that joins unpacked FP4 expert chunks cannot be
+    a `*xs` lambda."""
+    import inspect
+    import uuid
+
+    import jax
+    from torch_tpu._internal import pallas
+
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import _build_concat_fp4_fn
+
+    fn = _build_concat_fp4_fn(3)
+    sig = inspect.signature(fn)
+    assert list(sig.parameters) == ["x0", "x1", "x2"]
+    for param in sig.parameters.values():
+        assert param.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        assert param.annotation is jax.Array
+    assert sig.return_annotation is jax.Array
+    out = fn(
+        jnp.ones((2, 4), jnp.int8),
+        jnp.zeros((3, 4), jnp.int8),
+        jnp.ones((1, 4), jnp.int8),
+    )
+    assert out.shape == (6, 4)
+
+    suffix = uuid.uuid4().hex[:8]
+    with pytest.raises(ValueError, match="Missing argument type annotation"):
+        pallas.jax_op(
+            f"pallas::test_fp4_concat_lambda_{suffix}",
+            lambda *xs: jnp.concatenate(xs, axis=0),
+        )
+    pallas.jax_op(f"pallas::test_fp4_concat_typed_{suffix}", fn)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

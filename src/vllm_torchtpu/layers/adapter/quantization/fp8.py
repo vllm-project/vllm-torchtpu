@@ -167,8 +167,40 @@ def _mtp_moe_keeps_fp8(prefix: str) -> bool:
     )
 
 
-def _concat_fp4_experts(chunks: list[torch.Tensor]) -> torch.Tensor:
+def _build_concat_fp4_fn(arity: int) -> Callable:
+    """`jnp.concatenate` over `arity` expert chunks along axis 0.
+
+    `pallas.jax_op` reads the JAX function's signature and needs a
+    `jax.Array` annotation on every argument, which `*xs` cannot carry, so
+    the function gets `arity` explicit positional parameters.
+    """
+    import inspect
+
+    import jax
     import jax.numpy as jnp
+
+    def concat_fn(*xs):
+        return jnp.concatenate(xs, axis=0)
+
+    name = f"_fp4_concat_experts_{arity}"
+    concat_fn.__name__ = concat_fn.__qualname__ = name
+    concat_fn.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+        parameters=[
+            inspect.Parameter(
+                f"x{i}", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=jax.Array
+            )
+            for i in range(arity)
+        ],
+        return_annotation=jax.Array,
+    )
+    concat_fn.__annotations__ = {
+        **{f"x{i}": jax.Array for i in range(arity)},
+        "return": jax.Array,
+    }
+    return concat_fn
+
+
+def _concat_fp4_experts(chunks: list[torch.Tensor]) -> torch.Tensor:
     from torch_tpu._internal import pallas
 
     arity = len(chunks)
@@ -176,7 +208,7 @@ def _concat_fp4_experts(chunks: list[torch.Tensor]) -> torch.Tensor:
     if op is None:
         op = pallas.jax_op(
             f"pallas::fp4_concat_experts_{arity}",
-            lambda *xs: jnp.concatenate(xs, axis=0),
+            _build_concat_fp4_fn(arity),
         )
         _concat_fp4_ops[arity] = op
     return op(*chunks)  # type: ignore[misc]
