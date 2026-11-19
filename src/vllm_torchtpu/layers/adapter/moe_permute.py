@@ -175,11 +175,63 @@ def prepare(layer: Any) -> bool:
     return True
 
 
+def wrap_weight_loaders(layer: Any) -> None:
+    """Record which global experts' w13/w2 tensors reached this rank.
+
+    Call after ``create_weights``. A loader that streams only the linear
+    placement's experts (a filter computed outside the layer's expert map)
+    would leave permuted slots unwritten; ``install`` then refuses to run.
+    """
+    if getattr(layer, "_perm_logical_to_physical", None) is None:
+        return
+    loaded: dict[str, set[int]] = {}
+    layer._perm_loaded = loaded
+    for pname, param in list(layer.named_parameters(recurse=False)):
+        if not pname.startswith(("w13_weight", "w2_weight")):
+            continue
+        orig = getattr(param, "weight_loader", None)
+        if orig is None or getattr(orig, "_perm_wrapped", False):
+            continue
+
+        def loader(param, loaded_weight, weight_name, shard_id, expert_id,
+                   return_success=False, _orig=orig, _pname=pname):
+            ok = _orig(param, loaded_weight, weight_name, shard_id, expert_id,
+                       return_success=True)
+            if ok:
+                loaded.setdefault(_pname, set()).add(int(expert_id))
+            return ok if return_success else None
+
+        loader._perm_wrapped = True
+        param.weight_loader = loader
+
+
+def _dummy_weights() -> bool:
+    try:
+        from vllm.config import get_current_vllm_config
+
+        return get_current_vllm_config().load_config.load_format == "dummy"
+    except Exception:
+        return False
+
+
 def install(layer: Any) -> None:
     """Register the logical->physical routing table (after weights load)."""
     perm = getattr(layer, "_perm_logical_to_physical", None)
     if perm is None:
         return
+    loaded = getattr(layer, "_perm_loaded", None)
+    if loaded is not None and not _dummy_weights():
+        _, ep, rank = _layer_ep(layer)
+        local = len(perm) // ep
+        want = {e for e, p in enumerate(perm) if p // local == rank}
+        for pname in ("w13_weight", "w2_weight"):
+            missing = want - loaded.get(pname, set())
+            if missing:
+                raise RuntimeError(
+                    f"[moe-permute] {getattr(layer, 'layer_name', '?')}: experts "
+                    f"{sorted(missing)} of {pname} never reached this rank (a weight "
+                    "filter by linear placement? on exos set EXOS_WEIGHT_LOAD_FILTER=0)"
+                )
     device = layer.w13_weight.device
     layer.register_buffer(
         "_perm_table", torch.tensor(perm, dtype=torch.int32, device=device),

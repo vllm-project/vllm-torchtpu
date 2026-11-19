@@ -388,6 +388,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value},
             )
         moe_redundant.wrap_weight_loaders(layer)
+        moe_permute.wrap_weight_loaders(layer)
 
     def _resolve_tpu_activation(self, layer) -> str:
         activation_str = super()._resolve_tpu_activation(layer)
