@@ -83,6 +83,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasMLAttentionBackend,
     VllmTPUDeepseekV32IndexerBackend,
+    shared_pool_uses_seq_along_lane,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
 from vllm_torchtpu.logger import init_logger
@@ -1809,6 +1810,11 @@ class KVCacheManager:
                     num_blocks=kv_cache_config.num_blocks,
                     attn_backend=backend_cls,
                     device=self.runner.device,
+                    seq_along_lane=shared_pool_uses_seq_along_lane(
+                        backend_cls,
+                        self.runner.cache_config.get_resolved_kv_cache_layout(),
+                        [ls.head_size for _, ls in attention_specs],
+                    ),
                 )
             device_caches.extend(shared_attention_caches.values())
 

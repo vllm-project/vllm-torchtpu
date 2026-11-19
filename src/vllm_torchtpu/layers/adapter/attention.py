@@ -16,7 +16,7 @@ import dataclasses
 import functools
 import inspect
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, ClassVar, cast
 
 import jax
@@ -194,6 +194,36 @@ KV_LAYOUT_BY_VLLM_LAYOUT: dict[VllmKVCacheLayout, batched_rpa_configs.KVLayout] 
 }
 
 
+def _uses_seq_along_lane_page(
+    kv_layout: batched_rpa_configs.KVLayout | None,
+    head_size: int,
+) -> bool:
+    # The hd64 RPA kernel only supports HEAD_ALONG_SUBLANE pages.
+    return kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE and head_size != 64
+
+
+def shared_pool_uses_seq_along_lane(
+    backend_cls: Any,
+    resolved_layout: VllmKVCacheLayout,
+    head_sizes: Sequence[int],
+) -> bool:
+    """Return whether a 4D shared KV pool places `(packing, block_size)` last."""
+    if not (
+        isinstance(backend_cls, type)
+        and issubclass(backend_cls, PallasBatchedRPAAttentionBackend)
+    ):
+        return False
+    kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[resolved_layout]
+    per_layer = [_uses_seq_along_lane_page(kv_layout, hs) for hs in head_sizes]
+    if any(per_layer) and not all(per_layer):
+        raise NotImplementedError(
+            "Shared 4D KV cache pools under SEQ_ALONG_LANE "
+            "(VLLM_KV_CACHE_LAYOUT=HND) cannot mix head_dim==64 with "
+            "other head sizes."
+        )
+    return bool(per_layer) and all(per_layer)
+
+
 def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
     parallel = vllm_config.parallel_config
     if parallel.prefill_context_parallel_size > 1:
@@ -291,17 +321,14 @@ def _pallas_rpa_kernel_impl(
         kv_cache = kernel_view(kv_cache)
     packed_pool_shape = None
     if kv_cache.ndim == 4:
-        if (
-            kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
-            and query.shape[2] != 64
-        ):
+        if _uses_seq_along_lane_page(kv_layout, query.shape[2]):
             native_shape = rpa_batched_wrapper.get_kv_cache_shape(
                 total_num_pages=1,
-                page_size=pool_shape[1],
+                page_size=pool_shape[3],
                 actual_num_kv_heads=key.shape[1],
                 actual_head_dim=query.shape[2],
                 kv_dtype=kv_cache.dtype,
-                kv_layout=kv_layout,
+                kv_layout=batched_rpa_configs.KVLayout.SEQ_ALONG_LANE,
                 chip_version=get_chip_version(),
             )
         else:
