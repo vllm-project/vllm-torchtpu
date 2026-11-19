@@ -45,13 +45,13 @@ import contextlib
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
 from torch_tpu._internal.stream.streams import TpuEvent
 from vllm.distributed.kv_transfer import has_kv_transfer_group
-from vllm.v1.outputs import LogprobsLists, LogprobsTensors, ModelRunnerOutput
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 from vllm_torchtpu.layers.adapter import token_padding
@@ -85,7 +85,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
-    SpecLogprobsChunk,
+    LogprobsChunk,
 )
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
@@ -229,7 +229,7 @@ class SinkStageTiming(RunnerStageTiming):
     """`RunnerStageTiming` that records only when a KV connector can report
     the samples (#2723)."""
 
-    def __init__(self, rank: int | str):
+    def __init__(self, rank: int):
         super().__init__(rank)
         # Whether a KV connector exists to report samples through.
         self._sink = False
@@ -286,7 +286,7 @@ class Qwen38Runner(TPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # #2723: stage timings are recorded only with a KV connector sink.
-        self._stage_timing = SinkStageTiming(self._stage_timing._rank)
+        self._stage_timing = SinkStageTiming(int(self._stage_timing._rank))
 
     def load_model(self) -> None:
         super().load_model()
@@ -920,10 +920,9 @@ class Qwen38Runner(TPUModelRunner):
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         next_tokens_tpu_offset = 0
-        combined_logprobs: list[Any] = []
-        # Spec step only: per-chunk logprobs, filtered to the accepted tokens
-        # once they reach the host (AsyncTPUModelRunnerOutput.get_output).
-        spec_logprobs_chunks: list[SpecLogprobsChunk] = []
+        # Per-chunk logprobs, cut to each request's generated tokens once they
+        # reach the host (AsyncTPUModelRunnerOutput.get_output).
+        logprobs_chunks: list[LogprobsChunk] = []
 
         # True if the step has drafts to verify (a request carried drafts in
         # from the previous step). Not the same as self.speculative_config, the
@@ -987,8 +986,8 @@ class Qwen38Runner(TPUModelRunner):
                             md.draft_lengths,
                             md.final_logits_indices,
                         )
-                        spec_logprobs_chunks.append(
-                            SpecLogprobsChunk(
+                        logprobs_chunks.append(
+                            LogprobsChunk(
                                 tensors=self.gather_logprobs(logits, row_tokens),
                                 row_starts=np.concatenate(
                                     ([0], np.cumsum(md.draft_lengths_cpu + 1)[:-1])
@@ -1023,8 +1022,8 @@ class Qwen38Runner(TPUModelRunner):
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(padded)
                     if needs_logprobs:
-                        spec_logprobs_chunks.append(
-                            SpecLogprobsChunk(
+                        logprobs_chunks.append(
+                            LogprobsChunk(
                                 tensors=self.gather_logprobs(logprob_logits, selected),
                                 row_starts=np.arange(num_reqs),
                             )
@@ -1063,11 +1062,15 @@ class Qwen38Runner(TPUModelRunner):
                 # temperature scaling) for the top-k logprobs. We can't enforce it
                 # due to recompilations outside torch.compiled code, so just make
                 # sure `sample_from_logits` does not modify the logits in-place.
-                logprobs = (
-                    self.gather_logprobs(logprob_logits, selected_token_ids)
-                    if needs_logprobs
-                    else None
-                )
+                if needs_logprobs:
+                    logprobs_chunks.append(
+                        LogprobsChunk(
+                            tensors=self.gather_logprobs(
+                                logprob_logits, selected_token_ids
+                            ),
+                            row_starts=np.arange(num_reqs),
+                        )
+                    )
 
                 # Keep the bucketed (padded) tensor; trim happens on the host
                 # inside AsyncTPUCopyState to avoid per-`num_reqs` recompiles.
@@ -1080,15 +1083,6 @@ class Qwen38Runner(TPUModelRunner):
                             next_tokens_tpu_offset + req_idx - cur_start_idx
                         )
                     next_tokens_tpu_offset += selected_token_ids.shape[0]
-                if needs_logprobs:
-                    assert logprobs is not None
-                    sliced_logprobs = LogprobsTensors(
-                        logprobs.logprob_token_ids[:num_reqs],
-                        logprobs.logprobs[:num_reqs],
-                        logprobs.selected_token_ranks[:num_reqs],
-                        logprobs.cu_num_generated_tokens,
-                    )
-                    combined_logprobs.append(sliced_logprobs)
 
                 self._update_num_xla_graphs("decoding_step")
                 cur_start_idx = cur_end_idx
@@ -1097,28 +1091,6 @@ class Qwen38Runner(TPUModelRunner):
         # Those copies are blocking. Once they become async., kv_save
         # should be called right after each single forward pass,
         # instead of the forwards of the entire input batch.
-        logprobs = []
-        if needs_logprobs and len(combined_logprobs):
-            # TODO: concatenate the LogprobsTensors (torch) first, then
-            # call .tolists() once to match the GPU path and avoid the
-            # per-chunk numpy round-trip.
-            combined_logprobs_lists = []
-            for i in range(len(combined_logprobs)):
-                logprobs = combined_logprobs[i].tolists()
-                combined_logprobs_lists.append(logprobs)
-
-            logprobs_lists = LogprobsLists(
-                logprob_token_ids=np.concatenate(
-                    [lp.logprob_token_ids for lp in combined_logprobs_lists]
-                ),
-                logprobs=np.concatenate(
-                    [lp.logprobs for lp in combined_logprobs_lists]
-                ),
-                sampled_token_ranks=np.concatenate(
-                    [lp.sampled_token_ranks for lp in combined_logprobs_lists]
-                ),
-            )
-            logprobs = logprobs_lists
 
         discard_sampled_tokens_req_indices = []
         num_reqs = self.input_batch.num_reqs
@@ -1152,7 +1124,7 @@ class Qwen38Runner(TPUModelRunner):
                 copy_state = AsyncTPUCopyState.from_device_chunks(
                     combined_selected_tokens,
                     combined_selected_tokens_real_lens,
-                    spec_logprobs=spec_logprobs_chunks,
+                    logprobs=logprobs_chunks,
                 )
 
         # The previous step's sampled-token copy completes only behind this
@@ -1405,7 +1377,7 @@ class Qwen38Runner(TPUModelRunner):
                 # Snapshot of the req_id_to_index for the VLLM scheduler.
                 req_id_to_index=dict(self.input_batch.req_id_to_index),
                 sampled_token_ids=[],  # Filled in AsyncTPUModelRunnerOutput get_output
-                logprobs=logprobs,
+                logprobs=None,  # Filled in AsyncTPUModelRunnerOutput get_output
                 prompt_logprobs_dict=prompt_logprobs.emit(
                     state.prompt_logprobs_chunks,
                     self.requests,
