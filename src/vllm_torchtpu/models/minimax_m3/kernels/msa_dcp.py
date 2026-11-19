@@ -838,6 +838,7 @@ def msa_attend_dcp(
     mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
     keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
     small = num_tokens <= DCP_SMALL_BATCH_TOKENS
+    decode_opt = {}
     if small:
         block_q = msa_attention.SMALL_BATCH_BLOCK_Q
         pages_per_step = (
@@ -845,6 +846,12 @@ def msa_attend_dcp(
             if num_tokens >= _WIDE_GROUP_MIN_TOKENS
             else msa_attention.DEFAULT_PAGES_PER_STEP
         )
+        decode_opt = (
+            msa_attention_lse.decode_opt()
+            if num_tokens >= _WIDE_GROUP_MIN_TOKENS
+            else {}
+        )
+        pages_per_step = decode_opt.get("pages_per_step", pages_per_step)
     elif scale_cache is not None:
         block_q = msa_attention.PREFILL_BLOCK_Q_4BIT
         pages_per_step = msa_attention.PREFILL_PAGES_PER_STEP_4BIT
@@ -858,6 +865,8 @@ def msa_attend_dcp(
         q_head_major=q_head_major,
         interpret=interpret,
     )
+    if small and "step_widths" in decode_opt:
+        common["step_widths"] = decode_opt["step_widths"]
     if num_tokens >= _MIN_CANDIDATE_TOKENS:  # prefill-sized steps only
         common["step_widths"] = msa_attention_lse.PREFILL_STEP_WIDTHS
         common["row_split"] = msa_attention_lse.PREFILL_ROW_SPLIT

@@ -1466,6 +1466,29 @@ def _proof(flag: str, detail: str) -> None:
         print(f"{flag}=1: {detail}", flush=True)  # workers may log nowhere
 
 
+DECODE_OPT_ENV = "TPU_MINIMAX_M3_MSA_DECODE_OPT"
+
+
+def decode_opt() -> dict:
+    """`TPU_MINIMAX_M3_MSA_DECODE_OPT` (read when the program is traced) for
+    decode batches of 8-token tiles with wide groups (`msa_dcp`, more than
+    128 tokens), comma-separated: ``widths=<w/w/...>`` the step widths below
+    the full group; ``pps=<n>`` pages per group. Empty = off (the defaults)."""
+    spec = os.environ.get(DECODE_OPT_ENV, "").strip()
+    opt = {}
+    for item in filter(None, (x.strip() for x in spec.split(","))):
+        key, _, val = item.partition("=")
+        if key == "widths" and val:
+            opt["step_widths"] = tuple(sorted(int(w) for w in val.split("/")))
+        elif key == "pps" and val.isdigit() and int(val) >= 4:
+            opt["pages_per_step"] = int(val)
+        else:
+            raise ValueError(f"{DECODE_OPT_ENV}: unknown item {item!r} in {spec!r}")
+    if opt:
+        _proof(DECODE_OPT_ENV, f"MSA decode tiles run {opt}")
+    return opt
+
+
 # 4-bit prefill calls with a page cache pick their tiles per call from the
 # width of their selections (`adaptive_prefill`).
 ADAPTIVE_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE"
