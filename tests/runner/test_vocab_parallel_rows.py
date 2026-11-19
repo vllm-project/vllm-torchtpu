@@ -13,7 +13,11 @@ import pytest
 import torch
 
 from vllm_torchtpu.runner import tpu_runner
-from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.tpu_runner import (
+    TPUModelRunner,
+    _get_padded_num_reqs_with_upper_limit,
+    _get_padded_token_len,
+)
 
 HIDDEN, VOCAB = 8, 16
 # (max_num_reqs, token paddings, speculative tokens): the measured decode
@@ -86,3 +90,55 @@ def test_warmup_compiles_every_shape_the_padded_head_takes(monkeypatch, setup):
         assert rows in runner.calls.hidden
         for num_tokens in runner.num_tokens_paddings:
             assert (num_tokens, rows) in warmed
+
+
+@pytest.mark.parametrize("setup", SETUPS)
+def test_bound_covers_every_chunk_of_the_step(monkeypatch, setup):
+    """A chunk of n requests on any rank, under a DP-wide largest chunk of
+    max_reqs, has at most the bound's rows: the padded request count, and
+    padded_logits_length with speculative decoding."""
+    runner = _runner(monkeypatch, *setup)
+    paddings, spec = runner.num_tokens_paddings, runner.speculative_config
+    for max_reqs in range(1, runner.max_num_reqs + 1):
+        runner._dp_step_max_reqs = max_reqs
+        bound = runner._vocab_parallel_rows()
+        for n in range(1, max_reqs + 1):
+            counts = [_get_padded_num_reqs_with_upper_limit(n, runner.max_num_reqs)]
+            if spec is not None:
+                indices = min(n * (1 + spec.num_speculative_tokens), paddings[-1])
+                counts.append(_get_padded_token_len(paddings, indices))
+            for rows in counts:
+                assert runner._padded_logits_rows(rows) == bound
+
+
+def test_rows_over_the_bound_raise(monkeypatch):
+    runner = _runner(monkeypatch, *SETUPS[0])
+    runner._dp_step_max_reqs = 1
+    bound = runner._vocab_parallel_rows()
+    with pytest.raises(RuntimeError, match="would not pair"):
+        runner._padded_logits_rows(bound + 1)
+
+
+def test_padded_logits_equal_the_unpadded_call(monkeypatch):
+    runner = _runner(monkeypatch, *SETUPS[2])
+    runner._dp_step_max_reqs = 3
+    bound = runner._vocab_parallel_rows()
+    hidden = torch.randn(64, HIDDEN)
+    indices = torch.tensor([5, 0, 17, 63, 2], dtype=torch.int32)
+
+    got = runner._selected_logits(hidden, indices)
+    assert runner.calls.selected[-1] == (64, bound)
+    torch.testing.assert_close(got, runner.compute_selected_logits(hidden, indices))
+
+    rows = hidden[:5]
+    got = runner._logits_from_hidden(rows)
+    assert runner.calls.hidden[-1] == bound
+    torch.testing.assert_close(got, runner.compute_logits_from_hidden_states(rows))
+
+
+def test_whole_head_keeps_the_rows(monkeypatch):
+    runner = _runner(monkeypatch, *SETUPS[0])
+    runner.model.lm_head = SimpleNamespace()
+    assert runner._vocab_parallel_rows() is None
+    assert runner._vocab_parallel_row_counts() == []
+    assert runner._padded_logits_rows(7) == 7
