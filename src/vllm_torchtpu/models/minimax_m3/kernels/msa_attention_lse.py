@@ -747,6 +747,12 @@ def _kernel(
             keep `attend`, whose per-key scales are lane vectors there, and
             so do 8-token (decode) tiles: c4 b3 decode +0.4 ms per step
             transposed (twin j-fa6121d0 vs glue-only j-2abe5011)."""
+            if "z" in removed:  # benchmark only: streaming and loop, no body
+                n = num_heads * block_q
+                zero = (jnp.zeros((1, n), jnp.float32), jnp.ones((1, n), jnp.float32),
+                        jnp.zeros((head_dim, n), jnp.float32))
+                pl.when(last)(lambda: finish_t(*zero))
+                return
             row_slots = (
                 jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
                 if packing == 4
@@ -763,6 +769,9 @@ def _kernel(
                 limit = jnp.where(local_page == page, local_limit, page_size)
                 limit = jnp.where(page >= 0, limit * hit, 0)  # [1, Bq]
                 seen = jnp.max(limit)
+                if "h" in removed:  # benchmark only: no per-page hit / limit
+                    limit = jnp.full_like(limit, page_size)
+                    seen = page_size
                 if packing == 4 and "u" in removed:  # benchmark only: one relayout
                     if rows0 is None:
                         rows0 = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
@@ -783,9 +792,12 @@ def _kernel(
             mask = jnp.concatenate(masks, axis=0) if masks else None
             q = q_ref[...].reshape(num_heads * block_q, head_dim)
             q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
-            s = jax.lax.dot_general(
-                k, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-            )  # [W * S, rows]
+            if "q" in removed:  # benchmark only: an outer product, no QK dot
+                s = k[:, :1].astype(jnp.float32) * q[:, :1].astype(jnp.float32).T
+            else:
+                s = jax.lax.dot_general(
+                    k, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+                )  # [W * S, rows]
             if mask is not None:
                 s = jnp.where(mask, s, -jnp.inf)
             m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
