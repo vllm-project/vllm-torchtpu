@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import pkgutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -24,6 +25,7 @@ try:
     import jax.numpy as jnp
 
     from ..core import exec_spec, planner
+    from ..core import modules as core_modules
     from ..core import profile as core_profile
     from ..core.profiles import default as default_profiles
     from ..core.runtime import policy as runtime_policy
@@ -34,6 +36,7 @@ except (ImportError, RuntimeError):
     core_profile = None
     default_profiles = None
     runtime_policy = None
+    core_modules = None
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -45,7 +48,7 @@ if TYPE_CHECKING:
 from ..core.errors import MegakernelConfigError
 from .constants import CORE_LIMITS
 from .models import ModelProfile, finalize_model_profile
-from .specs import AdvisorReport, MoEMode, WorkloadSpec
+from .specs import CORE_MODULE_FAMILIES, AdvisorReport, MoEMode, WorkloadSpec
 from .verdict import advise
 
 
@@ -79,6 +82,7 @@ def verify_core_limits_sync() -> list[str]:
         or core_profile is None
         or default_profiles is None
         or runtime_policy is None
+        or core_modules is None
     ):
         msg = "Megakernel core package requires JAX to verify CORE_LIMITS sync."
         raise MegakernelPlannerUnavailableError(msg)
@@ -114,12 +118,34 @@ def verify_core_limits_sync() -> list[str]:
             CORE_LIMITS.default_verify_bucket_top,
             max(runtime_policy.DEFAULT_VERIFY_BUCKETS),
         ),
+        (
+            "core_module_families",
+            tuple(sorted(CORE_MODULE_FAMILIES)),
+            tuple(
+                sorted(
+                    info.name
+                    for info in pkgutil.iter_modules(core_modules.__path__)
+                    if info.ispkg
+                )
+            ),
+        ),
     )
-    return [
+    mismatches = [
         f"{name}: advisor={adv_val!r} != core={core_val!r}"
         for name, adv_val, core_val in checks
         if adv_val != core_val
     ]
+    advisor_top = max(
+        CORE_LIMITS.default_decode_bucket_top,
+        CORE_LIMITS.default_verify_bucket_top,
+    )
+    if advisor_top > runtime_policy.MAX_BUCKET_ROWS:
+        mismatches.append(
+            "default_bucket_tops_within_max_bucket_rows: "
+            f"advisor top {advisor_top} > core MAX_BUCKET_ROWS "
+            f"{runtime_policy.MAX_BUCKET_ROWS}"
+        )
+    return mismatches
 
 
 def _try_plan_spec(

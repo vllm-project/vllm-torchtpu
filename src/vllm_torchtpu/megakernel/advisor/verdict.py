@@ -64,7 +64,7 @@ from .specs import (
     WorkloadSpec,
     load_measurements,
 )
-from .support import exceeds_default_buckets
+from .support import classify_model_support_tier, exceeds_default_buckets
 from .vmem import _mesh_divisibility_reasons
 
 if TYPE_CHECKING:
@@ -1463,6 +1463,7 @@ def _assemble_advisor_report(
         else None
     )
 
+    support_tier, unmodeled_notes = classify_model_support_tier(profile)
     return AdvisorReport(
         model=profile.name,
         chip=chip_spec.name,
@@ -1500,6 +1501,8 @@ def _assemble_advisor_report(
             "decoder layer stack; excludes embedding, LM head, sampling, "
             "draft heads and modality towers"
         ),
+        support_tier=support_tier,
+        unmodeled_notes=unmodeled_notes,
     )
 
 
