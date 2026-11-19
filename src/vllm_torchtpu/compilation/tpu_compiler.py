@@ -270,10 +270,6 @@ _NATIVE_TPU_COMPILE_ENV_VARS = (
 )
 
 _RUNTIME_CACHE_KEY_PATHS = (
-    # Warmup and embedding assembly can change traced input dtypes.
-    "vllm_torchtpu/runner/tpu_runner.py",
-    "vllm_torchtpu/models/vllm/muse_spark/multimodal.py",
-    "vllm_torchtpu/models/vllm/muse_spark/expert_matmul.py",
     # Pallas implementations execute behind torch custom-op boundaries, so
     # Dynamo's traced-file validation cannot see their source changes.
     "vllm_torchtpu/kernels",
@@ -319,6 +315,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+    # Muse Spark's grouped expert matmul op (`pallas.jax_op` around gmm_v2).
+    "vllm_torchtpu/models/vllm/muse_spark/expert_matmul.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion

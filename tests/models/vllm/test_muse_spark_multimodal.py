@@ -19,20 +19,10 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_torchtpu.models.vllm.muse_spark.audio import DepthwiseCausalConv
 from vllm_torchtpu.models.vllm.muse_spark.layers import MuseRMSNorm
 from vllm_torchtpu.models.vllm.muse_spark.multimodal import (
     MuseSparkForConditionalGeneration,
 )
-
-
-def test_audio_causal_convolution_streaming_matches_prefill():
-    conv = DepthwiseCausalConv(3, 7)
-    x = torch.randn(1, 13, 3, generator=torch.Generator().manual_seed(8))
-    whole, _ = conv(x)
-    first, cache = conv(x[:, :5], torch.zeros(1, 3, 6))
-    rest, _ = conv(x[:, 5:], cache)
-    torch.testing.assert_close(torch.cat((first, rest), dim=1), whole)
 
 
 def _empty_omni():
@@ -177,7 +167,7 @@ def image_model(monkeypatch, cpu_vllm_config_context):
             self.model.vision_projection = vision.ColumnParallelLinear(
                 48, 48, bias=False, disable_tp=True
             )
-            self.normalize_tok_embeddings = False
+            self.perception_emb_norm = MuseRMSNorm(48, eps=1e-5, has_weight=False)
             self._vision_output_dtype = torch.float32
             self._use_vision_dp = False
             self._patch_height = self._patch_width = 2

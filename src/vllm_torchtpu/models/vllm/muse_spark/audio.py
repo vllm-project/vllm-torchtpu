@@ -61,7 +61,7 @@ class Patchifier(nn.Module):
 
 
 class DepthwiseCausalConv(nn.Module):
-    """Depthwise causal 1-D convolution with optional streaming cache."""
+    """Depthwise causal 1-D convolution."""
 
     def __init__(self, d_model: int, kernel_size: int) -> None:
         super().__init__()
@@ -78,26 +78,14 @@ class DepthwiseCausalConv(nn.Module):
         self.weight = conv.weight
         self.bias = conv.bias
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        cache: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Apply causal convolution to [B, T, D], returning output and cache."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply causal convolution to [B, T, D]."""
         x = x.permute(0, 2, 1)  # [B, D, T]
-
-        if cache is None:
-            x = F.pad(x, (self._kernel_size - 1, 0))
-            new_cache = None
-        else:
-            x = torch.cat((cache, x), dim=-1)
-            new_cache = x[:, :, -self._kernel_size + 1 :]
-
+        x = F.pad(x, (self._kernel_size - 1, 0))
         x = F.conv1d(x, self.weight, self.bias, groups=self.weight.shape[0])
 
         # RMSNorm requires contiguous output after the permutation.
-        x = x.permute(0, 2, 1).contiguous()  # [B, T, D]
-        return x, new_cache
+        return x.permute(0, 2, 1).contiguous()  # [B, T, D]
 
 
 class _AudioMLP(nn.Module):
@@ -147,18 +135,13 @@ class Block(nn.Module):
     def kernel_size(self) -> int:
         return self._kernel_size
 
-    def forward(
-        self,
-        inputs: torch.Tensor,
-        cache: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        x = inputs
-        x, cache = self.conv(x, cache)
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        x = self.conv(inputs)
         x = self.norm(x)
         x, _ = self.mlp.fc1(x)
         x = self.activation(x)
         x, _ = self.mlp.fc2(x)
-        return x + inputs, cache
+        return x + inputs
 
 
 class _AudioStage(nn.Module):
@@ -255,12 +238,12 @@ class AutoEncoder(nn.Module):
         return stage
 
     def _encode_prefill(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode waveforms without streaming context."""
+        """Encode waveforms."""
         for stage in self.layers:
             stage = cast(_AudioStage, stage)
             x = stage.patch_embedder(x)
             for block in stage.conv_blocks:
-                x, _ = block(x, None)
+                x = block(x)
         x = self.norm(x)
         x, _ = self.proj(x)
         x = self.post_proj_norm(x)

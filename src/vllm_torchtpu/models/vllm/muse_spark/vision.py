@@ -104,48 +104,6 @@ def _downsample_pixel_shuffle(
     return ds_x
 
 
-def _get_avg_pooling_perm(
-    cur_ds_idx: int,
-    grid_h: int,
-    grid_w: int,
-    downsample_factor: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, int]:
-    """Compute permutation indices for average-pooling downsampling."""
-    h = grid_h // downsample_factor
-    w = grid_w // downsample_factor
-    ds_perm = torch.arange(
-        cur_ds_idx,
-        cur_ds_idx + h * w,
-        device=device,
-    )
-    ds_perm = (
-        ds_perm.reshape(h, w)[:, None, :, None]
-        .expand(h, downsample_factor, w, downsample_factor)
-        .reshape(-1)
-    )
-    assert ds_perm.shape[0] == grid_h * grid_w
-    cur_ds_idx += h * w
-    return ds_perm, cur_ds_idx
-
-
-def _downsample_avg_pooling(
-    x: torch.Tensor,
-    batch_ds_perm: torch.Tensor,
-    downsample_factor: int,
-) -> torch.Tensor:
-    """Apply average-pooling downsampling."""
-    ds_x = x.new_empty(x.shape[0] // (downsample_factor**2), x.shape[1])
-    ds_x.index_reduce_(
-        dim=0,
-        index=batch_ds_perm,
-        source=x,
-        reduce="mean",
-        include_self=False,
-    )
-    return ds_x
-
-
 def _inv_perm_by_idx(perm_src: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     """Invert a permutation given by an index tensor."""
     inv_src = torch.empty_like(perm_src)
@@ -558,12 +516,10 @@ class NaViT(nn.Module):
         self.input_dtype = torch.get_default_dtype()
         self.patch_temporal = config.patch_temporal
         self.downsample_factor = config.merge_size
-        self.downsample_strategy = "ps"
         self.sparse_attention_factor = (
             4 if "window_attention" in config.layer_types else 1
         )
         self.grid_sample_mode = "bilinear"
-        self.use_cls_token = False
         self.use_rope = True
         norm_eps = config.layer_norm_eps
         use_data_parallel = is_vit_use_data_parallel(config.num_attention_heads)
@@ -581,16 +537,12 @@ class NaViT(nn.Module):
         self.rope_dim = latent_dim // num_heads
 
         max_num_image_tokens = 4096
-        if max_num_image_tokens is not None:
-            max_pre_ds_tokens = max_num_image_tokens * self.downsample_factor**2
-            max_grid_per_axis = int(math.sqrt(max_pre_ds_tokens)) + 1
-            max_grid_per_axis = max(
-                max_grid_per_axis,
-                self.pos_emb_grid_height,
-                self.pos_emb_grid_width,
-            )
-        else:
-            max_grid_per_axis = max(self.pos_emb_grid_height, self.pos_emb_grid_width)
+        max_pre_ds_tokens = max_num_image_tokens * self.downsample_factor**2
+        max_grid_per_axis = max(
+            int(math.sqrt(max_pre_ds_tokens)) + 1,
+            self.pos_emb_grid_height,
+            self.pos_emb_grid_width,
+        )
         self.max_rope_grid_h = max_grid_per_axis
         self.max_rope_grid_w = max_grid_per_axis
         self.register_buffer(
@@ -611,18 +563,6 @@ class NaViT(nn.Module):
             persistent=False,
         )
 
-        self.register_buffer(
-            "zero_freq",
-            torch.cat(
-                [
-                    torch.ones(1, self.rope_dim // 2, 1, dtype=self.rope_dtype),
-                    torch.zeros(1, self.rope_dim // 2, 1, dtype=self.rope_dtype),
-                ],
-                dim=-1,
-            ),
-            persistent=False,
-        )
-
         input_dim = 3 * self.patch_height * self.patch_width * self.patch_temporal
         self.patch_embedder = _NaViTPatchEmbedder()
         self.patch_embedder.patch_embedding = ColumnParallelLinear(
@@ -635,16 +575,9 @@ class NaViT(nn.Module):
             quant_config=quant_config,
         )
 
-        scale = latent_dim**-0.5
-        num_pos = self.pos_emb_grid_height * self.pos_emb_grid_width + int(
-            self.use_cls_token
+        self.patch_embedder.position_embedding_table = nn.Embedding(
+            self.pos_emb_grid_height * self.pos_emb_grid_width, latent_dim
         )
-        self.patch_embedder.position_embedding_table = nn.Embedding(num_pos, latent_dim)
-
-        if self.use_cls_token:
-            self.class_embedding = nn.Parameter(scale * torch.randn(latent_dim))
-        else:
-            self.class_embedding = None
 
         self.ln_pre = nn.LayerNorm(latent_dim, eps=norm_eps)
         self.ln_post = nn.LayerNorm(latent_dim, eps=norm_eps)
@@ -674,14 +607,12 @@ class NaViT(nn.Module):
             )
 
         device = visions[0].device
-        zero_freq = self.zero_freq.to(device=device)
 
         patch_list: list[torch.Tensor] = []
         pos_xy_list: list[torch.Tensor] = []
         img_slen_list: list[int] = []
         ds_perm_list: list[torch.Tensor] = []
         freq_cis_list: list[torch.Tensor] = []
-        cls_tok_idx: list[int] = []
 
         sp_perm_list: list[torch.Tensor] = []
         sp_slen_list: list[torch.Tensor] = []
@@ -773,18 +704,9 @@ class NaViT(nn.Module):
                     device=device,
                 )
 
-            if self.downsample_strategy == "ps":
-                ds_perm, cur_ds_idx = _get_pixel_shuffle_perm(
-                    cur_ds_idx, grid_h, grid_w, self.downsample_factor, device
-                )
-            elif self.downsample_strategy == "avg":
-                ds_perm, cur_ds_idx = _get_avg_pooling_perm(
-                    cur_ds_idx, grid_h, grid_w, self.downsample_factor, device
-                )
-            else:
-                raise ValueError(
-                    f"Unknown downsample strategy: {self.downsample_strategy}"
-                )
+            ds_perm, cur_ds_idx = _get_pixel_shuffle_perm(
+                cur_ds_idx, grid_h, grid_w, self.downsample_factor, device
+            )
 
             img_slen_list.append(grid_h * grid_w)
             patch_list.append(patches)
@@ -796,20 +718,6 @@ class NaViT(nn.Module):
                 assert sp_perm is not None and sp_slen is not None
                 sp_perm_list.append(sp_perm)
                 sp_slen_list.append(sp_slen)
-
-            if self.use_cls_token:
-                cls_tok_idx.append(sum(img_slen_list))
-                patch_list.append(patches.new_zeros(1, patches.shape[1]))
-                pos_xy_list.append(pos_xy.new_zeros(1, pos_xy.shape[1]))
-                freq_cis_list.append(zero_freq)
-
-                if self.sparse_attention_factor > 1:
-                    assert sp_perm is not None and sp_slen is not None
-                    sp_perm_list.append(sp_perm.new_full((1,), cur_sp_idx))
-                    sp_slen_list.append(sp_slen.new_ones(1))
-                    cur_sp_idx += 1
-
-                img_slen_list[-1] += 1
 
         batch_patch = torch.cat(patch_list, dim=0)
         batch_pos_xy = torch.cat(pos_xy_list, dim=0)
@@ -830,14 +738,10 @@ class NaViT(nn.Module):
 
         x, _ = self.patch_embedder.patch_embedding(batch_patch)
 
-        pos_emb_wei = self.patch_embedder.position_embedding_table.weight
-        cls_pos_emb_wei = None
-        if self.use_cls_token:
-            cls_pos_emb_wei = pos_emb_wei[-1]
-            pos_emb_wei = pos_emb_wei[:-1]
-
         pos_emb_wei = (
-            pos_emb_wei.reshape(self.pos_emb_grid_height, self.pos_emb_grid_width, -1)
+            self.patch_embedder.position_embedding_table.weight.reshape(
+                self.pos_emb_grid_height, self.pos_emb_grid_width, -1
+            )
             .permute(2, 0, 1)
             .unsqueeze(0)
         )
@@ -847,12 +751,6 @@ class NaViT(nn.Module):
             mode=self.grid_sample_mode,
             align_corners=False,
         )[0, :, 0, :].permute(1, 0)
-
-        batch_cls_tok_idx = None
-        if self.use_cls_token and self.class_embedding is not None:
-            assert cls_pos_emb_wei is not None
-            batch_cls_tok_idx = torch.tensor(cls_tok_idx, device=device)
-            x[batch_cls_tok_idx, :] = self.class_embedding + cls_pos_emb_wei
 
         x = self.ln_pre(x)
 
@@ -873,19 +771,7 @@ class NaViT(nn.Module):
             x = _inv_perm_by_idx(x, batch_sp_perm)
 
         x = self.ln_post(x)
-
-        if self.use_cls_token:
-            assert batch_cls_tok_idx is not None
-            non_cls_msk = torch.ones(x.shape[0], dtype=torch.bool, device=device)
-            non_cls_msk[batch_cls_tok_idx] = False
-            x = x[non_cls_msk]
-
-        if self.downsample_strategy == "ps":
-            x = _downsample_pixel_shuffle(x, batch_ds_perm, self.downsample_factor)
-        elif self.downsample_strategy == "avg":
-            x = _downsample_avg_pooling(x, batch_ds_perm, self.downsample_factor)
-
-        return x
+        return _downsample_pixel_shuffle(x, batch_ds_perm, self.downsample_factor)
 
 
 def get_navit_patch_count(

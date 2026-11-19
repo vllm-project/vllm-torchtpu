@@ -107,10 +107,8 @@ class MuseSparkForConditionalGeneration(
         hf_config = vllm_config.model_config.hf_config
         vision_config = hf_config.vision_config
         audio_config = hf_config.audio_config
-        self.normalize_tok_embeddings = True
         adapter_output_dim = hf_config.projector_hidden_size
         llm_hidden_size = hf_config.text_config.hidden_size
-        self.vllm_config = vllm_config
         self._vision_output_dtype = cast(torch.dtype, vllm_config.model_config.dtype)
         # FP32 vision avoids BF16 drift from bucket padding and graph fusion.
         vision_dtype = (
@@ -267,10 +265,7 @@ class MuseSparkForConditionalGeneration(
 
         h_vision = self.model.vision_adapter(h_vision)
         h_vision, _ = self.model.vision_projection(h_vision)
-
-        if self.normalize_tok_embeddings:
-            h_vision = self.perception_emb_norm(h_vision)
-        h_vision = h_vision.to(self._vision_output_dtype)
+        h_vision = self.perception_emb_norm(h_vision).to(self._vision_output_dtype)
 
         patch_counts = [self._get_patch_count(item) for item in vision_items]
         assert h_vision.shape[0] == sum(patch_counts), (
@@ -303,9 +298,7 @@ class MuseSparkForConditionalGeneration(
             else:
                 audio_embed = audio_embeds
             # Audio uses tok_embeddings_norm; perception norm applies only to vision.
-            if self.normalize_tok_embeddings:
-                audio_embed = self.model.language_model.tok_embeddings_norm(audio_embed)
-            results.append(audio_embed)
+            results.append(self.model.language_model.tok_embeddings_norm(audio_embed))
         return results
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:

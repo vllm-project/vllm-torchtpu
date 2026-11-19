@@ -179,7 +179,6 @@ class MuseVisionReplayMixin(SupportsEncoderCudaGraph):
     model: "_MuseModelComponents"
     config: "MuseSparkTextConfig"
     _use_vision_dp: bool
-    normalize_tok_embeddings: bool
     perception_emb_norm: "MuseRMSNorm"
     _vision_output_dtype: torch.dtype
 
@@ -196,9 +195,6 @@ class MuseVisionReplayMixin(SupportsEncoderCudaGraph):
         ) -> list[torch.Tensor]: ...
 
     def get_encoder_cudagraph_config(self):
-        vision = self.model.vision_tower
-        if vision.use_cls_token or vision.downsample_strategy != "ps":
-            raise ValueError("Muse image replay requires pixel shuffle without CLS")
         if self._use_vision_dp:
             raise ValueError("Muse image replay currently supports tensor parallelism")
         return EncoderCudaGraphConfig(
@@ -305,9 +301,7 @@ class MuseVisionReplayMixin(SupportsEncoderCudaGraph):
         x = image_encoder_forward(self.model.vision_tower, inputs)
         x = self.model.vision_adapter(x)
         x, _ = self.model.vision_projection(x)
-        if self.normalize_tok_embeddings:
-            x = self.perception_emb_norm(x)
-        return x.to(self._vision_output_dtype)
+        return self.perception_emb_norm(x).to(self._vision_output_dtype)
 
     def encoder_eager_forward(self, mm_kwargs, path="default"):
         return torch.cat(

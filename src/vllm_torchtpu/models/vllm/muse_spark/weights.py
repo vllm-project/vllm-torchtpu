@@ -103,26 +103,6 @@ def decode_expert_weight(parts: dict[str, torch.Tensor], name: str) -> torch.Ten
     return result
 
 
-def combine_nvfp4_scales(parts: dict[str, torch.Tensor], name: str) -> torch.Tensor:
-    """Keep the CPU decoder's FP32 scale product, including separate gate/up."""
-    scales = parts[name + "_weight_scale"].float()
-    global_scale = parts[name + "_weight_scale_2"].float()
-    if name == "gate_up_proj":
-        if global_scale.shape != (scales.shape[0], 2):
-            raise ValueError("Muse gate/up require separate per-expert global scales")
-        gate, up = scales.chunk(2, dim=1)
-        return torch.cat(
-            (
-                gate * global_scale[:, 0, None, None],
-                up * global_scale[:, 1, None, None],
-            ),
-            dim=1,
-        )
-    if global_scale.shape != (scales.shape[0],):
-        raise ValueError("Muse down projection requires one global scale per expert")
-    return scales * global_scale[:, None, None]
-
-
 def selected_packed_expert_outputs(
     x: torch.Tensor,
     ids: torch.Tensor,

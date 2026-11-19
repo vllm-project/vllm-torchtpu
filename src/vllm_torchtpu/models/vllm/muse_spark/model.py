@@ -39,7 +39,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.utils import make_empty_intermediate_tensors_factory
 from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
@@ -550,9 +549,6 @@ class MuseSparkForCausalLM(nn.Module):
         self.logits_processor.head_dtype = cast(torch.Tensor, self.lm_head.weight).dtype
         self.multiplier = config.output_multiplier
         self.soft_cap = config.final_logit_softcapping
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states"], config.hidden_size
-        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.language_model.embed_input_ids(input_ids)
