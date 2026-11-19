@@ -252,8 +252,10 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
     @classmethod
     def unset_device_control_env_var(cls) -> None:
         """Restore parent TPU env vars after spawning a stage subprocess."""
+        if cls._saved_spawn_env is None:
+            os.environ.pop(cls.device_control_env_var, None)
+            return
         cls._restore_spawn_env()
-        os.environ.pop(cls.device_control_env_var, None)
 
     @classmethod
     def _is_parent_spawn_env_restore(cls, devices: str | int | None) -> bool:
