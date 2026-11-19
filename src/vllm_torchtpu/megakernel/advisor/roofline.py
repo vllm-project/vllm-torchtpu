@@ -24,6 +24,9 @@ from ..advisor.models import (
     DeclaredCollectiveStep,
     InCallExpertMode,
     ModelProfile,
+    dsa_query_gather_dim,
+    has_dsa_profile,
+    indexer_record_bytes,
     resolve_model_profile,
 )
 from ..core import errors
@@ -38,6 +41,7 @@ from .constants import (
     COMPILED_XLA_GAP_P50_US,
     COMPILED_XLA_GAP_P90_US,
     CORES_PER_HOST,
+    DCP_LSE_MERGE_VEC_OPS,
     DECLARED_MOE_LAYOUTS,
     DEFAULT_DECLARED_CALLS_PER_LAYER,
     DEFAULT_LAUNCH_GAP_FLOOR_US,
@@ -45,17 +49,28 @@ from .constants import (
     DEFAULT_LAUNCH_GAP_VAL_US,
     DENSE_FFN_TILE_CAP,
     DENSE_SLOT_DEFAULT_BYTES,
+    DSA_OUTPUT_RESCALE_VEC_OPS,
+    DSA_SOFTMAX_VEC_OPS,
+    DSA_UNPACK_MASK_VEC_OPS,
     DTYPE_BYTES,
     EXPERT_SLOT_DEFAULT_BYTES,
     FIRST_SLOT_LAYER_WEIGHT_DIVISOR,
     FP32_BYTES,
     GDN_STREAMED_HEADS_CAP,
     GROUPED_MOE_MODES,
+    HBM_CACHELINE_BYTES,
+    INDEXER_HEAD_REDUCE_VEC_OPS,
+    INDEXER_RADIX_BUCKETS,
+    INDEXER_RADIX_PASS_VEC_OPS,
+    INDEXER_RADIX_PASSES,
+    INDEXER_SCALE_VEC_OPS,
     LSE_SCALARS_PER_HEAD,
     MIN_EFFICIENCY_FLOOR,
     MIN_FIRST_DMA_SLOT_BYTES,
     PER_OP_BASE_FFN_KERNELS_PER_LAYER,
     PER_OP_COLLECTIVE_CALL_FACTOR,
+    PER_OP_DSA_KV_ROUNDTRIP_FACTOR,
+    PER_OP_INDEXER_SCORE_ROUNDTRIP_BYTES,
     PER_OP_MIXER_KERNELS_PER_LAYER,
     PER_OP_SHARED_EXPERT_KERNELS_PER_LAYER,
     QUANTILE_DECIMALS,
@@ -528,7 +543,7 @@ def _compute_scope_collective_times(
         Mapping[str, object] | None,
         InCallExpertMode,
     ],
-) -> tuple[float, float, int, float, bool, int, int, bool, float]:
+) -> tuple[float, float, int, float, bool, int, int, bool, float, bool]:
     """Compute sync stage, comm time, xla factor, measured AR, and step hop/saving."""
     n_splits, workload, declaration, expert_mode = coll_cfg
     decl_coll = declared_collectives(declaration)
@@ -574,7 +589,8 @@ def _compute_scope_collective_times(
     if decl_coll is not None:
         steps_to_price = decl_coll.steps
     elif (
-        workload.dcp > 1
+        not scope_context.has_dsa
+        and workload.dcp > 1
         and (workload.dcp & (workload.dcp - 1)) == 0
         and workload.phase in ("decode", "verify")
     ):
@@ -591,6 +607,9 @@ def _compute_scope_collective_times(
     has_declared_routed = any(
         step.kind == "routed_transport" for step in steps_to_price
     )
+    has_declared_dcp = any(
+        step.kind in ("dcp_gather", "split_kv") for step in steps_to_price
+    )
     step_transfer_s = 0.0
     step_strict_s = 0.0
     step_hops = 0
@@ -604,7 +623,21 @@ def _compute_scope_collective_times(
         step_transfer_s += transfer_s
         step_strict_s += strict_egress_s
         step_hops += hops
-    step_coll_s = step_transfer_s + step_hops * lat_coll
+    price_dsa_dcp = (
+        scope_context.has_dsa
+        and scope_context.dcp_post_attn_hops > 0
+        and not has_declared_dcp
+    )
+    dcp_post_hops_total = (
+        n_splits * xla_ar_factor * scope_context.dcp_post_attn_hops
+        if price_dsa_dcp
+        else 0
+    )
+    step_hops += dcp_post_hops_total
+    dcp_post_transfer_s = (
+        scope_context.dcp_post_attn_transfer_s if price_dsa_dcp else 0.0
+    )
+    step_coll_s = step_transfer_s + dcp_post_transfer_s + step_hops * lat_coll
     is_fused_multi = scope in ("whole_step", "layer_group")
     overlapped_comm = is_fused_multi and n_splits == 1
     ar_and_pcp_s = (
@@ -662,6 +695,7 @@ def _compute_scope_collective_times(
         step_hops,
         has_declared_routed,
         step_strict_saving_s,
+        has_declared_dcp,
     )
 
 
@@ -670,13 +704,101 @@ def _routed_chain(
     routed_hbm_s: float,
     t_moe: float,
     t_vec_moe: float = 0.0,
+    *,
+    dsa_stage_s: float = 0.0,
 ) -> float:
-    """Return dense compute time plus the routed-expert stage that follows it.
+    """Return dense/DSA stage time plus the routed-expert stage that follows it.
 
     A layer requests its routed-expert weights only after its router runs, so
     that stream overlaps the MoE matmuls but not the dense compute before them.
     """
-    return t_dense + max(routed_hbm_s, t_moe, t_vec_moe)
+    return max(t_dense, dsa_stage_s) + max(routed_hbm_s, t_moe, t_vec_moe)
+
+
+def _dsa_stage_seconds(
+    scope_context: _ScopeContext,
+    workload: WorkloadSpec,
+    vec_terms: tuple[float, float],
+    stage_cfg: tuple[int, int, float, bool, bool, bool],
+    efficiencies: tuple[float, float, float] = (1.0, 1.0, 1.0),
+) -> float:
+    """Return 2-stage pre-DSA/indexer plus scattered-KV DSA critical-path seconds."""
+    if not scope_context.has_dsa:
+        return 0.0
+    vec_ops_dense, vec_rate = vec_terms
+    (
+        n_splits,
+        xla_ar_factor,
+        lat_coll_s,
+        bf16_upper,
+        strict,
+        has_declared_dcp,
+    ) = stage_cfg
+    eta_dense, eta_hbm, eta_ici = efficiencies
+    eff_vec_rate = VECTOR_MAX_ELEMENTS_PER_WORD * vec_rate if strict else vec_rate
+    vec_pre_dsa = max(0.0, vec_ops_dense - scope_context.vec_ops_dsa)
+    if strict:
+        vec_pre_dsa = max(0.0, vec_pre_dsa - scope_context.vec_ops_indexer_radix)
+    t_matmul_pre = (
+        (scope_context.flops_dense - scope_context.flops_kv) / scope_context.peak_w
+    ) / eta_dense
+    use_bf16 = scope_context.attn_is_bf16 or (
+        bf16_upper and workload.phase in ("prefill", "mixed")
+    )
+    kv_peak = scope_context.bf16_peak if use_bf16 else scope_context.peak_w
+    t_matmul_dsa = (
+        (scope_context.flops_kv / kv_peak) / eta_dense
+        if scope_context.flops_kv > 0
+        else 0.0
+    )
+    t_pre_dsa = max(t_matmul_pre, (vec_pre_dsa / eff_vec_rate) / eta_dense)
+    t_dsa_compute = max(
+        t_matmul_dsa,
+        (scope_context.vec_ops_dsa / eff_vec_rate) / eta_dense,
+    )
+    dcp_query_all_gather_s = (
+        (
+            scope_context.dcp_query_all_gather_transfer_s
+            + n_splits
+            * xla_ar_factor
+            * scope_context.dcp_query_all_gather_hops
+            * lat_coll_s
+        )
+        / eta_ici
+        if scope_context.dcp_query_all_gather_hops > 0 and not has_declared_dcp
+        else 0.0
+    )
+    dsa_bytes = (
+        scope_context.dsa_kv_strict_bytes
+        if strict
+        else scope_context.dsa_kv_gather_bytes
+    )
+    dsa_hbm_s = (dsa_bytes / scope_context.bw_hbm) / eta_hbm
+    return max(t_pre_dsa, dcp_query_all_gather_s) + max(t_dsa_compute, dsa_hbm_s)
+
+
+def _indexer_achievable_extra_hops(
+    scope: FusionScope,
+    scope_context: _ScopeContext,
+    n_splits: int,
+    *,
+    has_declared_dcp: bool,
+) -> int:
+    """Return extra fused radix-pass DCP sync hops charged in achievable scope."""
+    if (
+        scope == "per_op"
+        or has_declared_dcp
+        or not scope_context.has_dsa
+        or not scope_context.is_sparse_gather
+        or scope_context.dcp_hops <= 0
+    ):
+        return 0
+    return (
+        (INDEXER_RADIX_PASSES - 1)
+        * scope_context.l_indexer
+        * n_splits
+        * scope_context.dcp_hops
+    )
 
 
 def _core_time(hbm_s: float, chain_s: float, comm_s: float, *, fused: bool) -> float:
@@ -753,6 +875,8 @@ def _compute_scope_matmuls(
             + 4.0 * tokens * shared_inter_local * scope_context.l_moe
         )
         + subchannel_vec_dense
+        + scope_context.vec_ops_pre_dsa_extra
+        + scope_context.vec_ops_dsa
     )
 
     ep_tp = gcd(workload.ep, scope_context.eff_tp)
@@ -824,13 +948,20 @@ def _compute_achievable_upper_us(
         float,
         float,
     ],
-    aux_terms: tuple[tuple[float, float, float], float] = (
+    aux_terms: tuple[tuple[float, float, float], float, tuple[int, int, int, bool]] = (
         (0.0, 0.0, 1.0),
         0.0,
+        (1, 1, 0, False),
     ),
 ) -> float:
     """Compute achievable upper-bound step latency in microseconds."""
-    vector_terms, measured_in_comm_s = aux_terms
+    vector_terms, measured_in_comm_s, dsa_hops_cfg = aux_terms
+    (
+        n_splits,
+        xla_ar_factor,
+        indexer_achievable_extra_hops,
+        has_declared_dcp,
+    ) = dsa_hops_cfg
     bf16_attention_upper, n_ops, scope_host_head_us = flags
     (
         moe_pad_factor,
@@ -871,17 +1002,38 @@ def _compute_achievable_upper_us(
         t_matmul_dense_upper_ach,
         (vec_ops_dense / vec_rate) / eta_dense,
     )
+    indexer_achievable_extra_upper_s = (
+        indexer_achievable_extra_hops * scope_context.lat_coll_upper
+    )
     unmeasured_comm_s = max(0.0, comm_s - measured_in_comm_s)
-    t_comm_upper_ach = measured_in_comm_s + (unmeasured_comm_s + ar_extra_s) / eta_ici
+    t_comm_upper_ach = (
+        measured_in_comm_s
+        + (unmeasured_comm_s + ar_extra_s + indexer_achievable_extra_upper_s) / eta_ici
+    )
     t_moe_ach = (
         (moe_pad_factor * scope_context.flops_moe) / scope_context.peak_e
     ) / eta_moe
     t_vec_moe_ach = (vec_ops_moe / vec_rate) / eta_dense
+    dsa_stage_upper_ach_s = _dsa_stage_seconds(
+        scope_context,
+        workload,
+        (vec_ops_dense, vec_rate),
+        (
+            n_splits,
+            xla_ar_factor,
+            scope_context.lat_coll_upper,
+            bf16_attention_upper,
+            False,
+            has_declared_dcp,
+        ),
+        (eta_dense, eta_hbm, eta_ici),
+    )
     chain_upper_ach_s = _routed_chain(
         t_dense_upper_ach,
         routed_hbm_s / eta_hbm,
         t_moe_ach,
         t_vec_moe_ach,
+        dsa_stage_s=dsa_stage_upper_ach_s,
     )
     ach_upper_core_s = (
         max(t_hbm_ach, chain_upper_ach_s)
@@ -903,11 +1055,19 @@ def _compute_strict_step_floor(
     scope_context: _ScopeContext,
     profile: ModelProfile,
     workload: WorkloadSpec,
-    flags: tuple[bool, bool, bool, int, int],
+    flags: tuple[bool, bool, bool, int, int, int, bool],
     scalars: tuple[float, float, float, float, float, float],
 ) -> tuple[float, float]:
     """Compute strict balanced-routing weight bytes and step latency floor."""
-    one_weight_pass, is_fused_multi, overlapped_comm, n_splits, n_ops = flags
+    (
+        one_weight_pass,
+        is_fused_multi,
+        overlapped_comm,
+        n_splits,
+        n_ops,
+        xla_ar_factor,
+        has_declared_dcp,
+    ) = flags
     comm_s, pipeline_fill_drain_s, act_bytes, eff_state_bytes, base_ai, ar_saving = (
         scalars
     )
@@ -922,7 +1082,14 @@ def _compute_strict_step_floor(
         t_matmul_dense_strict + scope_context.flops_moe / scope_context.peak_e
     )
     weight_passes = 1 if one_weight_pass else n_splits
-    hbm_int_strict = weight_passes * w_step_strict + eff_state_bytes
+    eff_state_strict_bytes = (
+        eff_state_bytes
+        - scope_context.dsa_kv_gather_bytes
+        + scope_context.dsa_kv_strict_bytes
+        if scope_context.has_dsa
+        else eff_state_bytes
+    )
+    hbm_int_strict = weight_passes * w_step_strict + eff_state_strict_bytes
     hbm_time_strict_s = (hbm_int_strict + act_bytes) / scope_context.bw_hbm
     t_moe_strict = scope_context.flops_moe / scope_context.peak_e
     routed_strict_s = (
@@ -947,11 +1114,29 @@ def _compute_strict_step_floor(
     ) / strict_vec_rate + unpack_ops_strict / (
         VECTOR_SUB_BYTE_ELEMENTS_PER_WORD * vec_rate
     )
+    vec_ops_dense_strict = max(0.0, vec_ops_dense - scope_context.vec_ops_indexer_radix)
     t_dense_strict = max(
-        t_matmul_strict - t_moe_strict, vec_ops_dense / strict_vec_rate
+        t_matmul_strict - t_moe_strict, vec_ops_dense_strict / strict_vec_rate
+    )
+    dsa_stage_strict_s = _dsa_stage_seconds(
+        scope_context,
+        workload,
+        (vec_ops_dense, vec_rate),
+        (
+            n_splits,
+            xla_ar_factor,
+            scope_context.lat_coll,
+            False,
+            True,
+            has_declared_dcp,
+        ),
     )
     chain_strict_s = _routed_chain(
-        t_dense_strict, routed_strict_s, t_moe_strict, t_vec_moe_strict
+        t_dense_strict,
+        routed_strict_s,
+        t_moe_strict,
+        t_vec_moe_strict,
+        dsa_stage_s=dsa_stage_strict_s,
     )
     # The strict floor prices all-reduce transfer at the egress sum, the limit
     # for any algorithm. That transfer sits in comm_s, or in the sync stage of
@@ -1011,13 +1196,25 @@ def _compute_scope_achievable_step(
     workload: WorkloadSpec,
     scope_flags: tuple[bool, bool, int, float, float],
     timing_inputs: tuple[float, float, float, float, float, float, float, float],
-    aux_terms: tuple[tuple[float, float, float], tuple[float, float]] = (
+    aux_terms: tuple[
+        tuple[float, float, float],
+        tuple[float, float],
+        tuple[int, int, int, bool, bool],
+    ] = (
         (0.0, 0.0, 1.0),
         (0.0, 0.0),
+        (1, 1, 0, False, False),
     ),
 ) -> tuple[float, float, float, float, float]:
     """Compute achievable and upper-band step components for one FusionScope."""
-    vector_terms, measured_ar_split = aux_terms
+    vector_terms, measured_ar_split, dsa_ach_cfg = aux_terms
+    (
+        n_splits,
+        xla_ar_factor,
+        indexer_achievable_extra_hops,
+        bf16_attention_upper,
+        has_declared_dcp,
+    ) = dsa_ach_cfg
     is_fused_multi, grouped_moe, n_ops, routed_ach_ratio, scope_host_head_us = (
         scope_flags
     )
@@ -1061,19 +1258,37 @@ def _compute_scope_achievable_step(
     )
     routed_hbm_busiest_s = routed_hbm_s * routed_ach_ratio
     t_hbm_ach = (hbm_time_s + (routed_ach_ratio - 1.0) * routed_hbm_s) / eta_hbm
+    indexer_achievable_extra_s = indexer_achievable_extra_hops * scope_context.lat_coll
     unmeasured_comm_s = max(0.0, comm_s - measured_in_comm_s)
-    t_comm_ach = measured_in_comm_s + unmeasured_comm_s / eta_ici
+    t_comm_ach = (
+        measured_in_comm_s + (unmeasured_comm_s + indexer_achievable_extra_s) / eta_ici
+    )
     unmeasured_sync_s = max(0.0, sync_stage_s - measured_in_sync_s)
     sync_comm_extra_s = (
         unmeasured_sync_s * (1.0 / eta_ici - 1.0) if is_fused_multi else 0.0
     )
     t_moe_ach = (t_moe * routed_ach_ratio) / eta_moe
     t_vec_moe_ach = ((vec_ops_moe * routed_ach_ratio) / vec_rate) / eta_dense
+    dsa_stage_ach_s = _dsa_stage_seconds(
+        scope_context,
+        workload,
+        (vec_ops_dense, vec_rate),
+        (
+            n_splits,
+            xla_ar_factor,
+            scope_context.lat_coll,
+            False,
+            False,
+            has_declared_dcp,
+        ),
+        (eta_dense, eta_hbm, eta_ici),
+    )
     chain_ach_s = _routed_chain(
         t_dense_ach,
         routed_hbm_busiest_s / eta_hbm,
         t_moe_ach,
         t_vec_moe_ach,
+        dsa_stage_s=dsa_stage_ach_s,
     )
     step_ach_us = (
         (
@@ -1088,11 +1303,25 @@ def _compute_scope_achievable_step(
         + scope_host_head_us
     )
     t_dense_upper = t_matmul_upper - t_moe
+    dsa_stage_upper_s = _dsa_stage_seconds(
+        scope_context,
+        workload,
+        (vec_ops_dense, vec_rate),
+        (
+            n_splits,
+            xla_ar_factor,
+            scope_context.lat_coll_upper,
+            bf16_attention_upper,
+            False,
+            has_declared_dcp,
+        ),
+    )
     chain_upper_s = _routed_chain(
         t_dense_upper,
         routed_hbm_s,
         t_moe,
         vec_ops_moe / vec_rate,
+        dsa_stage_s=dsa_stage_upper_s,
     )
     return (
         eta_moe,
@@ -1181,7 +1410,15 @@ def _evaluate_single_scope(
     one_weight_pass = tiled or scope == "single_layer"
     weight_passes = 1 if one_weight_pass else n_splits
     # That per-layer residual traffic already holds the call-boundary activations.
-    act_bytes = max(act_bytes, extra_act)
+    act_bytes = max(act_bytes, extra_act) + (
+        PER_OP_INDEXER_SCORE_ROUNDTRIP_BYTES
+        * eval_ctx.l_indexer
+        * eval_ctx.active_tokens
+        * eval_ctx.indexer_ctx_local
+        + PER_OP_DSA_KV_ROUNDTRIP_FACTOR * eval_ctx.dsa_kv_gather_bytes
+        if scope == "per_op" and eval_ctx.has_dsa and eval_ctx.is_sparse_gather
+        else 0.0
+    )
     is_fused_multi = scope in ("whole_step", "layer_group")
     overlapped_comm = is_fused_multi and n_splits == 1
     (
@@ -1194,6 +1431,7 @@ def _evaluate_single_scope(
         step_hops,
         has_declared_routed,
         step_strict_saving_s,
+        has_declared_dcp,
     ) = _compute_scope_collective_times(
         scope,
         eval_ctx,
@@ -1201,8 +1439,9 @@ def _evaluate_single_scope(
         (n_splits, workload, declaration, expert_mode),
     )
     comm_in_core = overlapped_comm or not is_fused_multi
-    measured_in_comm_s = measured_ar_total_s if comm_in_core else 0.0
-    measured_in_sync_s = 0.0 if comm_in_core else measured_ar_total_s
+    measured_in_comm_s, measured_in_sync_s = (
+        (measured_ar_total_s, 0.0) if comm_in_core else (0.0, measured_ar_total_s)
+    )
     # Each tile boundary adds a sync hop per layer. The residual bytes moved
     # there are already in act_bytes.
     pipeline_fill_drain_s = _boundary_fill_drain_s(
@@ -1242,7 +1481,25 @@ def _evaluate_single_scope(
     t_moe = (moe_pad_factor * eval_ctx.flops_moe) / eval_ctx.peak_e
     t_dense = t_matmul - t_moe
     t_vec_moe = vec_ops_moe / vec_rate
-    chain_s = _routed_chain(t_dense, routed_hbm_s, t_moe, t_vec_moe)
+    chain_s = _routed_chain(
+        t_dense,
+        routed_hbm_s,
+        t_moe,
+        t_vec_moe,
+        dsa_stage_s=_dsa_stage_seconds(
+            eval_ctx,
+            in_call_workload,
+            (vec_ops_dense, vec_rate),
+            (
+                n_splits,
+                xla_ar_factor,
+                eval_ctx.lat_coll,
+                False,
+                False,
+                has_declared_dcp,
+            ),
+        ),
+    )
     roof_us = (
         _core_time(hbm_time_s, chain_s, comm_s, fused=is_fused_multi)
         + pipeline_fill_drain_s
@@ -1268,6 +1525,9 @@ def _evaluate_single_scope(
         in_call_workload,
         (n_ops, n_splits, sync_stage_s),
     )
+    indexer_achievable_extra_hops = _indexer_achievable_extra_hops(
+        scope, eval_ctx, n_splits, has_declared_dcp=has_declared_dcp
+    )
     (
         eta_moe,
         t_hbm_ach,
@@ -1291,6 +1551,13 @@ def _evaluate_single_scope(
         (
             (vec_ops_dense, vec_ops_moe, vec_rate),
             (measured_in_comm_s, measured_in_sync_s),
+            (
+                n_splits,
+                xla_ar_factor,
+                indexer_achievable_extra_hops,
+                bf16_attention_upper,
+                has_declared_dcp,
+            ),
         ),
     )
     ar_extra_s, a2a_extra_s = _upper_collective_extras(
@@ -1334,6 +1601,7 @@ def _evaluate_single_scope(
         (
             (vec_ops_dense, vec_ops_moe * routed_ach_ratio, vec_rate),
             measured_in_comm_s,
+            (n_splits, xla_ar_factor, indexer_achievable_extra_hops, has_declared_dcp),
         ),
     )
     ar_strict_saving_s = (
@@ -1345,7 +1613,15 @@ def _evaluate_single_scope(
         eval_ctx,
         profile,
         in_call_workload,
-        (one_weight_pass, is_fused_multi, overlapped_comm, n_splits, n_ops),
+        (
+            one_weight_pass,
+            is_fused_multi,
+            overlapped_comm,
+            n_splits,
+            n_ops,
+            xla_ar_factor,
+            has_declared_dcp,
+        ),
         (
             comm_s,
             pipeline_fill_drain_s,
@@ -1652,6 +1928,20 @@ class _ScopeContext:
     chip_spec: ChipSpec
     measured_ar_xla_s: float | None = None
     measured_ar_in_kernel_s: float | None = None
+    l_indexer: int = 0
+    has_dsa: bool = False
+    is_sparse_gather: bool = False
+    indexer_ctx_local: float = 0.0
+    dsa_kv_gather_bytes: float = 0.0
+    dsa_kv_strict_bytes: float = 0.0
+    vec_ops_pre_dsa_extra: float = 0.0
+    vec_ops_dsa: float = 0.0
+    vec_ops_indexer_radix: float = 0.0
+    dcp_query_all_gather_transfer_s: float = 0.0
+    dcp_query_all_gather_hops: int = 0
+    dcp_post_attn_transfer_s: float = 0.0
+    dcp_post_attn_hops: int = 0
+    dcp_hops: int = 0
 
 
 def _vmem_budget_bytes(workload: WorkloadSpec, chip_spec: ChipSpec) -> int:
@@ -1703,6 +1993,7 @@ class _LayerGeometry:
     chunk_tokens: int
     batch_local: int
     eff_ctx: int
+    l_indexer: int = 0
 
 
 @dataclass(frozen=True)
@@ -1726,6 +2017,15 @@ class _LayerWeightsAndFlops:
     gqa_scratch: int
     gdn_scratch: int
     ffn_scratch: int
+    resident_kv_bytes: float = 0.0
+    has_dsa: bool = False
+    is_sparse_gather: bool = False
+    indexer_ctx_local: float = 0.0
+    dsa_kv_gather_bytes: float = 0.0
+    dsa_kv_strict_bytes: float = 0.0
+    vec_ops_pre_dsa_extra: float = 0.0
+    vec_ops_dsa: float = 0.0
+    vec_ops_indexer_radix: float = 0.0
 
 
 def _compute_attention_params(
@@ -1760,22 +2060,175 @@ def _compute_attention_params(
     return nh_local, kvh_local, q_dim, attn_params
 
 
+@dataclass(frozen=True)
+class _DsaLayerTerms:
+    """Dynamic sparse attention and indexer weights, cache bytes, FLOPs, and ops."""
+
+    has_dsa: bool = False
+    is_sparse_gather: bool = False
+    raw_attn_ctx: float = 0.0
+    indexer_ctx_local: float = 0.0
+    attn_ctx: float = 0.0
+    indexer_query_proj_params: int = 0
+    indexer_key_weight_proj_params: int = 0
+    indexer_k_read_bytes: float = 0.0
+    indexer_k_resident_bytes: float = 0.0
+    dsa_kv_gather_bytes: float = 0.0
+    dsa_kv_strict_bytes: float = 0.0
+    flops_indexer_score: float = 0.0
+    vec_ops_pre_dsa_extra: float = 0.0
+    vec_ops_dsa: float = 0.0
+    vec_ops_indexer_radix: float = 0.0
+
+
+def _pad_cacheline_bytes(byte_count: float) -> float:
+    """Round `byte_count` up to a multiple of HBM_CACHELINE_BYTES."""
+    return float(ceil(byte_count / HBM_CACHELINE_BYTES) * HBM_CACHELINE_BYTES)
+
+
+def _pad_vector_lanes(element_count: float) -> float:
+    """Round `element_count` up to a multiple of the 128-lane tile width."""
+    return float(ceil(element_count / ATTN_TILE_TOKENS) * ATTN_TILE_TOKENS)
+
+
+def _compute_dsa_layer_terms(
+    profile: ModelProfile,
+    workload: WorkloadSpec,
+    geom: _LayerGeometry,
+    attn_dims: tuple[int, int, float],
+) -> _DsaLayerTerms:
+    """Compute DSA sparse-KV gather, indexer scan, FLOP, and vector-op terms."""
+    nh_local, kvh_local, bw_kv = attn_dims
+    t_prefill_part = {
+        "prefill": geom.active_tokens,
+        "mixed": geom.chunk_tokens,
+    }.get(workload.phase, 0)
+    prefix_ctx = max(0, geom.eff_ctx - t_prefill_part)
+    raw_attn_ctx = (
+        prefix_ctx + (t_prefill_part + 1) / 2.0
+        if workload.phase == "prefill" and t_prefill_part > 1
+        else float(geom.eff_ctx)
+    )
+    if not has_dsa_profile(profile):
+        return _DsaLayerTerms(
+            raw_attn_ctx=raw_attn_ctx,
+            attn_ctx=raw_attn_ctx * profile.kv_compress_factor,
+        )
+    kv_lora = profile.kv_lora_rank
+    qk_rope = profile.qk_rope_head_dim
+    head_dim = profile.head_dim
+    hidden = profile.hidden_size
+    dcp = max(1, workload.dcp)
+    is_sparse_gather = raw_attn_ctx > profile.index_topk
+    indexer_ctx_local = raw_attn_ctx / geom.kv_split
+    selected_topk = min(raw_attn_ctx, float(profile.index_topk))
+    local_selected_topk = selected_topk / geom.kv_split
+    indexer_query_proj_params = (
+        (profile.q_lora_rank or hidden) * profile.index_n_heads * profile.index_head_dim
+    )
+    indexer_key_weight_proj_params = hidden * (
+        profile.index_head_dim + profile.index_n_heads
+    )
+    indexer_key_record_bytes = float(indexer_record_bytes(profile.index_head_dim))
+    indexer_k_read_bytes = (
+        geom.l_indexer * geom.batch_local * indexer_ctx_local * indexer_key_record_bytes
+    )
+    indexer_k_resident_bytes = (
+        geom.l_indexer
+        * geom.batch_local
+        * (geom.eff_ctx / geom.kv_split)
+        * indexer_key_record_bytes
+    )
+    raw_kv_elements = (
+        float(kv_lora + qk_rope) if kv_lora > 0 else 2.0 * kvh_local * head_dim
+    )
+    dsa_entry_bytes = (
+        _pad_cacheline_bytes(kv_lora * bw_kv) + _pad_cacheline_bytes(qk_rope * bw_kv)
+        if kv_lora > 0
+        else _pad_cacheline_bytes(raw_kv_elements * bw_kv)
+    )
+    dsa_kv_strict_bytes = (
+        geom.l_attn
+        * geom.batch_local
+        * local_selected_topk
+        * raw_kv_elements
+        * bw_kv
+        * profile.kv_compress_factor
+    )
+    dsa_kv_gather_bytes = (
+        geom.l_attn * geom.active_tokens * local_selected_topk * dsa_entry_bytes
+        if is_sparse_gather
+        else dsa_kv_strict_bytes
+    )
+    flops_indexer_score = (
+        2.0
+        * geom.l_indexer
+        * geom.active_tokens
+        * profile.index_n_heads
+        * profile.index_head_dim
+        * indexer_ctx_local
+    )
+    vec_ops_indexer_radix = (
+        INDEXER_RADIX_PASSES
+        * INDEXER_RADIX_PASS_VEC_OPS
+        * geom.l_indexer
+        * geom.active_tokens
+        * indexer_ctx_local
+        if is_sparse_gather
+        else 0.0
+    )
+    vec_ops_pre_dsa_extra = (
+        INDEXER_HEAD_REDUCE_VEC_OPS * profile.index_n_heads + INDEXER_SCALE_VEC_OPS
+    ) * geom.l_indexer * geom.active_tokens * indexer_ctx_local + vec_ops_indexer_radix
+    selected_topk_padded = _pad_vector_lanes(local_selected_topk)
+    kv_elements_padded = _pad_vector_lanes(raw_kv_elements)
+    heads_with_dcp = nh_local * dcp
+    dsa_value_dim = kv_lora if kv_lora > 0 else head_dim
+    dcp_merge_ops = (
+        DCP_LSE_MERGE_VEC_OPS * dcp * nh_local * dsa_value_dim if dcp > 1 else 0.0
+    )
+    vec_ops_dsa = (
+        geom.l_attn
+        * geom.active_tokens
+        * (
+            DSA_UNPACK_MASK_VEC_OPS * selected_topk_padded * kv_elements_padded
+            + DSA_SOFTMAX_VEC_OPS * heads_with_dcp * selected_topk_padded
+            + DSA_OUTPUT_RESCALE_VEC_OPS * heads_with_dcp * dsa_value_dim
+            + dcp_merge_ops
+        )
+    )
+    return _DsaLayerTerms(
+        has_dsa=True,
+        is_sparse_gather=is_sparse_gather,
+        raw_attn_ctx=raw_attn_ctx,
+        indexer_ctx_local=indexer_ctx_local,
+        attn_ctx=selected_topk * profile.kv_compress_factor,
+        indexer_query_proj_params=indexer_query_proj_params,
+        indexer_key_weight_proj_params=indexer_key_weight_proj_params,
+        indexer_k_read_bytes=indexer_k_read_bytes,
+        indexer_k_resident_bytes=indexer_k_resident_bytes,
+        dsa_kv_gather_bytes=dsa_kv_gather_bytes,
+        dsa_kv_strict_bytes=dsa_kv_strict_bytes,
+        flops_indexer_score=flops_indexer_score,
+        vec_ops_pre_dsa_extra=vec_ops_pre_dsa_extra,
+        vec_ops_dsa=vec_ops_dsa,
+        vec_ops_indexer_radix=vec_ops_indexer_radix,
+    )
+
+
 def _compute_flops_and_scratches(
     profile: ModelProfile,
     workload: WorkloadSpec,
     geom: _LayerGeometry,
     counts: tuple[int, int, int, int, int, float],
+    dsa: _DsaLayerTerms,
 ) -> tuple[float, float, float, int, int, int]:
     """Compute attention/dense/MoE FLOPs and per-op VMEM scratchpad sizes."""
     nh_local, q_dim, vh_local, i_exp_local, routed_expert_params, base_dense_params = (
         counts
     )
     l_attn, l_moe, l_lin = geom.l_attn, geom.l_moe, geom.l_lin
-    active_tokens, chunk_tokens, eff_ctx = (
-        geom.active_tokens,
-        geom.chunk_tokens,
-        geom.eff_ctx,
-    )
+    active_tokens, chunk_tokens = geom.active_tokens, geom.chunk_tokens
     ep_dp = workload.ep // gcd(workload.ep, geom.eff_tp)
     experts_local = (profile.num_experts // workload.ep) * (l_moe > 0)
     kv_lora = profile.kv_lora_rank
@@ -1788,25 +2241,22 @@ def _compute_flops_and_scratches(
     d_mla = (active_tokens - t_prefill_part) * (
         2 * kv_lora + qk_rope
     ) + t_prefill_part * (qk_nope + qk_rope + head_dim)
-    # Causal prefill attention: each of T new tokens attends to prefix + (1..T),
-    # giving mean context prefix + (T + 1) / 2 instead of rectangular eff_ctx.
-    prefix_ctx = max(0, eff_ctx - t_prefill_part)
-    attn_ctx = (
-        prefix_ctx + (t_prefill_part + 1) / 2.0
-        if workload.phase == "prefill" and t_prefill_part > 1
-        else float(eff_ctx)
-    ) * profile.kv_compress_factor
     flops_kv = (
         2.0
         * l_attn
-        * attn_ctx
+        * dsa.attn_ctx
         * (nh_local * d_mla if kv_lora else 2.0 * active_tokens * q_dim)
     )
     flops_dense = (
         2.0
         * active_tokens
-        * (base_dense_params + l_moe * profile.hidden_size * profile.num_experts)
+        * (
+            base_dense_params
+            + l_moe * profile.hidden_size * profile.num_experts
+            + geom.l_indexer * dsa.indexer_key_weight_proj_params
+        )
         + flops_kv
+        + dsa.flops_indexer_score
     )
     flops_moe = (
         2.0
@@ -1877,14 +2327,21 @@ def _compute_layer_weights_and_flops(
     routed_expert_params = (
         3 * (profile.routed_expert_hidden_size or hidden) * i_exp_local
     )
+    dsa = _compute_dsa_layer_terms(
+        profile, workload, geom, (nh_local, kvh_local, bw_kv)
+    )
     base_dense_params = (
         geom.l_attn * attn_params
+        + geom.l_indexer * dsa.indexer_query_proj_params
         + geom.l_lin * linear_attn_params
         + (geom.layers_local - geom.l_moe) * dense_ffn_params
         + geom.l_moe * shared_expert_params
     )
+    # Indexer key and head-weight projections stay unquantized in BF16.
     w_static = (
-        base_dense_params * bw_w + geom.l_moe * hidden * profile.num_experts * 2.0
+        base_dense_params * bw_w
+        + geom.l_moe * hidden * profile.num_experts * float(BF16_BYTES)
+        + geom.l_indexer * dsa.indexer_key_weight_proj_params * float(BF16_BYTES)
     )
     exp_bytes = routed_expert_params * bw_e
     kv_bytes_per_tok = (
@@ -1897,8 +2354,18 @@ def _compute_layer_weights_and_flops(
         * profile.kv_compress_factor
         / geom.kv_split
     )
-    kv_cache_read_bytes = (
+    full_kv_cache_bytes = (
         geom.l_attn * geom.batch_local * geom.eff_ctx * kv_bytes_per_tok
+    )
+    resident_kv_bytes = (
+        full_kv_cache_bytes + dsa.indexer_k_resident_bytes
+        if dsa.has_dsa
+        else full_kv_cache_bytes
+    )
+    kv_cache_read_bytes = (
+        dsa.indexer_k_read_bytes + dsa.dsa_kv_gather_bytes
+        if dsa.has_dsa
+        else full_kv_cache_bytes
     )
     recurrent_state_rw_bytes = (
         2.0
@@ -1907,12 +2374,21 @@ def _compute_layer_weights_and_flops(
         * (z_dim * kd + qkv_lin * profile.linear_conv_kernel)
         * bw_st
     )
+    indexer_layer_dense_params = (
+        dsa.indexer_query_proj_params if geom.l_indexer > 0 else 0
+    )
+    indexer_layer_bf16_bytes = (
+        dsa.indexer_key_weight_proj_params * float(BF16_BYTES)
+        if geom.l_indexer > 0
+        else 0.0
+    )
     layer_dense_weight_bytes = int(
         (
-            max(attn_params, linear_attn_params)
+            max(attn_params + indexer_layer_dense_params, linear_attn_params)
             + (shared_expert_params if geom.l_moe > 0 else dense_ffn_params)
         )
         * bw_w
+        + indexer_layer_bf16_bytes
     )
     flops_kv, flops_dense, flops_moe, gqa_scratch, gdn_scratch, ffn_scratch = (
         _compute_flops_and_scratches(
@@ -1927,6 +2403,7 @@ def _compute_layer_weights_and_flops(
                 routed_expert_params,
                 base_dense_params,
             ),
+            dsa,
         )
     )
     return _LayerWeightsAndFlops(
@@ -1947,6 +2424,15 @@ def _compute_layer_weights_and_flops(
         gqa_scratch=gqa_scratch,
         gdn_scratch=gdn_scratch,
         ffn_scratch=ffn_scratch,
+        resident_kv_bytes=resident_kv_bytes,
+        has_dsa=dsa.has_dsa,
+        is_sparse_gather=dsa.is_sparse_gather,
+        indexer_ctx_local=dsa.indexer_ctx_local,
+        dsa_kv_gather_bytes=dsa.dsa_kv_gather_bytes,
+        dsa_kv_strict_bytes=dsa.dsa_kv_strict_bytes,
+        vec_ops_pre_dsa_extra=dsa.vec_ops_pre_dsa_extra,
+        vec_ops_dsa=dsa.vec_ops_dsa,
+        vec_ops_indexer_radix=dsa.vec_ops_indexer_radix,
     )
 
 
@@ -2037,6 +2523,14 @@ def _resolve_workload_token_geometry(
         layers_local - l_attn,
         ceil(profile.num_linear_layers * layers_local / profile.num_layers),
     )
+    l_indexer = (
+        min(
+            l_attn,
+            ceil(profile.num_indexer_layers * layers_local / profile.num_layers),
+        )
+        if has_dsa_profile(profile)
+        else 0
+    )
     token_residual_bytes = active_tokens * profile.hidden_size * 2.0
     geom = _LayerGeometry(
         eff_tp=eff_tp,
@@ -2049,11 +2543,73 @@ def _resolve_workload_token_geometry(
         chunk_tokens=chunk_tokens,
         batch_local=batch_local,
         eff_ctx=eff_ctx,
+        l_indexer=l_indexer,
     )
     layer_weights_flops = _compute_layer_weights_and_flops(
         profile, workload, geom, (bw_w, bw_e, bw_kv, bw_st)
     )
     return geom, layer_weights_flops, token_residual_bytes, eff_pcp, verify_tokens
+
+
+def _compute_dsa_dcp_collectives(
+    profile: ModelProfile,
+    workload: WorkloadSpec,
+    geom: _LayerGeometry,
+    layer_weights_flops: _LayerWeightsAndFlops,
+    chip_spec: ChipSpec,
+) -> tuple[float, int, float, int, int]:
+    """Compute cross-DCP query all-gather and partial O/LSE + indexer merge terms."""
+    if not layer_weights_flops.has_dsa or workload.dcp <= 1:
+        return 0.0, 0, 0.0, 0, 0
+    dcp = workload.dcp
+    dcp_hops = round(math.log2(dcp))
+    query_gather_dim = dsa_query_gather_dim(profile)
+    output_merge_dim = (
+        profile.kv_lora_rank if profile.kv_lora_rank > 0 else profile.head_dim
+    )
+    egress_bw = chip_spec.ici_egress_bw_bytes_per_s
+    dcp_query_all_gather_bytes = (
+        geom.l_attn
+        * (dcp - 1)
+        * geom.active_tokens
+        * layer_weights_flops.nh_local
+        * query_gather_dim
+        * float(BF16_BYTES)
+    )
+    dcp_partial_output_all_to_all_bytes = (
+        geom.l_attn
+        * (dcp - 1)
+        * geom.active_tokens
+        * layer_weights_flops.nh_local
+        * (output_merge_dim * float(BF16_BYTES) + float(FP32_BYTES))
+    )
+    indexer_min_exchange_elements = min(
+        profile.index_topk, INDEXER_RADIX_PASSES * INDEXER_RADIX_BUCKETS
+    )
+    dcp_indexer_min_bytes = (
+        geom.l_indexer
+        * (dcp - 1)
+        * geom.active_tokens
+        * indexer_min_exchange_elements
+        * float(FP32_BYTES)
+        if layer_weights_flops.is_sparse_gather
+        else 0.0
+    )
+    dcp_query_all_gather_transfer_s = dcp_query_all_gather_bytes / egress_bw
+    dcp_query_all_gather_hops = geom.l_attn * dcp_hops
+    dcp_post_attn_transfer_s = (
+        dcp_partial_output_all_to_all_bytes + dcp_indexer_min_bytes
+    ) / egress_bw
+    dcp_post_attn_hops = (
+        geom.l_attn + (geom.l_indexer if layer_weights_flops.is_sparse_gather else 0)
+    ) * dcp_hops
+    return (
+        dcp_query_all_gather_transfer_s,
+        dcp_query_all_gather_hops,
+        dcp_post_attn_transfer_s,
+        dcp_post_attn_hops,
+        dcp_hops,
+    )
 
 
 def _build_scope_context(
@@ -2108,6 +2664,15 @@ def _build_scope_context(
         / chip_spec.ici_link_bw_bytes_per_s
         if eff_pcp > 1 and geom.l_attn > 0
         else 0.0
+    )
+    (
+        dcp_query_all_gather_transfer_s,
+        dcp_query_all_gather_hops,
+        dcp_post_attn_transfer_s,
+        dcp_post_attn_hops,
+        dcp_hops,
+    ) = _compute_dsa_dcp_collectives(
+        profile, workload, geom, layer_weights_flops, chip_spec
     )
     return _ScopeContext(
         vmem_budget=vmem_budget,
@@ -2201,7 +2766,7 @@ def _build_scope_context(
             + geom.l_moe
             * layer_weights_flops.experts_local
             * layer_weights_flops.exp_bytes
-            + layer_weights_flops.kv_cache_read_bytes
+            + layer_weights_flops.resident_kv_bytes
             + 0.5 * layer_weights_flops.recurrent_state_rw_bytes
         ),
         no_whole_step=(
@@ -2219,6 +2784,20 @@ def _build_scope_context(
         measured_ar_in_kernel_s=(
             measured_in_kernel_us * 1e-6 if measured_in_kernel_us is not None else None
         ),
+        l_indexer=geom.l_indexer,
+        has_dsa=layer_weights_flops.has_dsa,
+        is_sparse_gather=layer_weights_flops.is_sparse_gather,
+        indexer_ctx_local=layer_weights_flops.indexer_ctx_local,
+        dsa_kv_gather_bytes=layer_weights_flops.dsa_kv_gather_bytes,
+        dsa_kv_strict_bytes=layer_weights_flops.dsa_kv_strict_bytes,
+        vec_ops_pre_dsa_extra=layer_weights_flops.vec_ops_pre_dsa_extra,
+        vec_ops_dsa=layer_weights_flops.vec_ops_dsa,
+        vec_ops_indexer_radix=layer_weights_flops.vec_ops_indexer_radix,
+        dcp_query_all_gather_transfer_s=dcp_query_all_gather_transfer_s,
+        dcp_query_all_gather_hops=dcp_query_all_gather_hops,
+        dcp_post_attn_transfer_s=dcp_post_attn_transfer_s,
+        dcp_post_attn_hops=dcp_post_attn_hops,
+        dcp_hops=dcp_hops,
     )
 
 
