@@ -55,7 +55,7 @@ SupportStatus = Literal["baseline", "within_core_limits", "declared", "hypotheti
 VALID_SOURCE_SCOPES: frozenset[str] = frozenset({"", *get_args(FusionScope)})
 
 SUPPORTED_ONCHIP_FAMILIES: frozenset[str] = frozenset(
-    {"gqa", "mla", "gdn", "kda", "dense_mlp", "moe"}
+    {"gqa", "mla", "dsa", "gdn", "kda", "dense_mlp", "moe"}
 )
 
 

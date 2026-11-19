@@ -337,8 +337,11 @@ MULTIMODAL_KEYS: tuple[str, ...] = (
 VALID_LAYER_TOKENS: frozenset[str] = frozenset(
     {
         "attention",
+        "compressed_sparse_attention",
         "csa",
+        "deepseek_sparse_attention",
         "dense_mlp",
+        "heavily_compressed_attention",
         "hca",
         "indexed_attention",
         "dsa",
@@ -580,3 +583,31 @@ LAYER_GROUP_PRICING_NOTE: str = (
     "model, layer_group cost depends on group count rather than individual "
     "group sizes."
 )
+
+# Sparse attention (DSA) and lightning indexer architectural constants.
+# 128 FP8 key elements share one 1-byte block scale in the packed indexer cache.
+INDEXER_SCALE_BLOCK_SIZE: int = 128
+# 32-bit word alignment (4 B) for packed FP8 + scale indexer records and int32 indices.
+WORD_ALIGN_BYTES: int = 4
+# 128-byte HBM burst/cacheline alignment for scattered sparse-KV row gathers.
+HBM_CACHELINE_BYTES: int = 128
+# 8 four-bit radix passes sort 32-bit FP32 indexer scores across 2^4 = 16 buckets.
+INDEXER_RADIX_PASSES: int = 8
+INDEXER_RADIX_BUCKETS: int = 16
+# Per-head ReLU + weight multiply-add (2 ops/head) plus block scale/bias (2 ops/key).
+INDEXER_HEAD_REDUCE_VEC_OPS: float = 2.0
+INDEXER_SCALE_VEC_OPS: float = 2.0
+# Per-pass 4-bit radix work: nibble extract, 16-bucket compare, prefix, scatter.
+INDEXER_RADIX_PASS_VEC_OPS: float = 36.0
+# Scattered KV unpack, 128-lane pad, tail mask, and sub-byte transpose ops per element.
+DSA_UNPACK_MASK_VEC_OPS: float = 10.0
+# Online softmax per (head, selected_key): max, sub, exp, sum, div, mask, and update.
+DSA_SOFTMAX_VEC_OPS: float = 8.0
+# Online output accumulator rescale + accumulation per (head, value_dim).
+DSA_OUTPUT_RESCALE_VEC_OPS: float = 4.0
+# Cross-DCP log-sum-exp partial merge: max, exp-weight, multiply-add, normalize.
+DCP_LSE_MERGE_VEC_OPS: float = 6.0
+# Unfused per_op out-of-core HBM traffic: FP32 score write+read (2 * 4 B = 8 B)
+# and gathered sparse-KV buffer write+read (2x) across standalone kernel boundaries.
+PER_OP_INDEXER_SCORE_ROUNDTRIP_BYTES: float = 2.0 * FP32_BYTES
+PER_OP_DSA_KV_ROUNDTRIP_FACTOR: float = 2.0

@@ -36,6 +36,72 @@ from vllm_torchtpu.megakernel.core import errors
 
 SOURCE_PREFIXES = ("FACT:", "DERIVED:", "ASSUMED:", "CHOSEN:")
 
+
+SHIPPED_PRESET_COUNT = 13
+
+# Shared HF config fixtures for custom architectures removed from models.json
+# (tested strictly via model_profile_from_hf_config / --model <config.json>).
+# 61 layers: 3 uncompressed dense-prefix layers + 58 sparse-CSA layers at ~1/12
+# KV retention gives average retention (3 + 58 * 0.08176) / 61 = 0.126921.
+DEEPSEEK_V4_CFG: dict[str, object] = {
+    "model_type": "deepseek_v4",
+    "num_hidden_layers": 61,
+    "first_k_dense_replace": 3,
+    "hidden_size": 7168,
+    "intermediate_size": 18432,
+    "moe_intermediate_size": 2048,
+    "shared_expert_intermediate_size": 2048,
+    "num_attention_heads": 128,
+    "num_key_value_heads": 1,
+    "head_dim": 512,
+    "v_head_dim": 512,
+    "num_experts": 256,
+    "num_experts_per_tok": 8,
+    "kv_compress_factor": 0.12692110655737704,
+    "mhc_num_streams": 4,
+}
+
+QWEN4_EXP_CFG: dict[str, object] = {
+    "model_type": "qwen4_exp",
+    "num_hidden_layers": 48,
+    "hidden_size": 2048,
+    "intermediate_size": 6144,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 4,
+    "head_dim": 128,
+    "full_attention_interval": 4,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 32,
+    "num_experts": 128,
+    "num_experts_per_tok": 8,
+    "moe_intermediate_size": 768,
+    "shared_expert_intermediate_size": 768,
+    "hc_mult": 4,
+}
+
+HOMOGENEOUS_DSA_CFG: dict[str, object] = {
+    "model_type": "glm_moe_dsa",
+    "num_hidden_layers": 32,
+    "first_k_dense_replace": 0,
+    "hidden_size": 4096,
+    "intermediate_size": 8192,
+    "moe_intermediate_size": 1024,
+    "n_shared_experts": 1,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 32,
+    "q_lora_rank": 1024,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128,
+    "n_routed_experts": 64,
+    "num_experts_per_tok": 8,
+    "index_topk": 2048,
+    "index_head_dim": 128,
+    "index_n_heads": 16,
+}
+
+
 DEEPSEEK_V3_CFG: dict[str, object] = {
     "model_type": "deepseek_v3",
     "num_hidden_layers": 61,
@@ -583,7 +649,7 @@ def test_custom_chip_spec_rejects_unsupported_megacore(tmp_path: Path) -> None:
 
 
 def test_all_preset_models_preserve_support_status() -> None:
-    """Verify all 15 preset models preserve within_core_limits vs hypothetical."""
+    """Verify all 13 preset models preserve within_core_limits vs hypothetical."""
     expected_within_core = {
         "qwen3.5-0.8b",
         "qwen3.5-397b",
@@ -595,7 +661,7 @@ def test_all_preset_models_preserve_support_status() -> None:
         "gpt-oss-120b",
         "qwen3-30b-a3b",
     }
-    total_presets = 15
+    total_presets = SHIPPED_PRESET_COUNT
     assert len(models.MODEL_PRESETS) == total_presets
     for name in models.MODEL_PRESETS:
         model_profile = models.resolve_model_profile(name)
@@ -863,3 +929,199 @@ def test_declared_collectives_and_expert_modes_validate_schema() -> None:
     )
     with pytest.raises(errors.MegakernelConfigError, match="Duplicate megakernel"):
         models.validate_declared_layouts("kimi-k3", duplicate_pcp_preset)
+
+
+def test_hf_config_autodiscovery_glm_moe_dsa_indexer_schedule() -> None:
+    """Verify glm_moe_dsa HF config parses DSA dimensions, schedules, and errors."""
+    num_layers = 78
+    num_full_indexers = 21
+    indexer_types = ["full"] * num_full_indexers + ["shared"] * (
+        num_layers - num_full_indexers
+    )
+    glm_config: dict[str, object] = {
+        "model_type": "glm_moe_dsa",
+        "num_hidden_layers": num_layers,
+        "first_k_dense_replace": 3,
+        "hidden_size": 6144,
+        "intermediate_size": 12288,
+        "moe_intermediate_size": 2048,
+        "n_shared_experts": 1,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 64,
+        "q_lora_rank": 2048,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 192,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 256,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 8,
+        "index_topk": 2048,
+        "index_head_dim": 128,
+        "index_n_heads": 32,
+        "indexer_types": indexer_types,
+        "quantization_config": {
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+        },
+    }
+    profile = models.model_profile_from_hf_config(glm_config, name="glm-5.2-hf")
+    assert not profile.architecture_unverified
+    assert models.has_dsa_profile(profile)
+    assert profile.num_indexer_layers == num_full_indexers
+    assert profile.index_topk == glm_config["index_topk"]
+    assert profile.index_head_dim == glm_config["index_head_dim"]
+    assert profile.index_n_heads == glm_config["index_n_heads"]
+    assert "dsa" in profile.layer_families
+    assert "dsa" in specs.SUPPORTED_ONCHIP_FAMILIES
+    assert not profile.is_periodic
+    expected_record_bytes = (
+        (
+            profile.index_head_dim
+            + (profile.index_head_dim // constants.INDEXER_SCALE_BLOCK_SIZE)
+            + constants.WORD_ALIGN_BYTES
+            - 1
+        )
+        // constants.WORD_ALIGN_BYTES
+    ) * constants.WORD_ALIGN_BYTES
+    assert models.indexer_record_bytes(profile.index_head_dim) == expected_record_bytes
+
+    # Numeric index_topk_pattern entries (>0 marks full, 0 marks shared).
+    numeric_layers = 4
+    numeric_config = {
+        **glm_config,
+        "num_hidden_layers": numeric_layers,
+        "first_k_dense_replace": 0,
+        "index_topk_pattern": [1, 0, 1, 0],
+    }
+    numeric_config.pop("indexer_types")
+    numeric_profile = models.model_profile_from_hf_config(
+        numeric_config, name="glm-dsa-numeric"
+    )
+    expected_numeric_full = numeric_layers // 2
+    assert numeric_profile.num_indexer_layers == expected_numeric_full
+    assert not numeric_profile.is_periodic
+
+    # Periodic frequency schedule with skip offset resolves scheduled layers.
+    freq_layers = 16
+    skip_offset = 4
+    topk_freq = 4
+    freq_config = {
+        **glm_config,
+        "num_hidden_layers": freq_layers,
+        "first_k_dense_replace": 0,
+        "index_topk_freq": topk_freq,
+        "index_skip_topk_offset": skip_offset,
+    }
+    freq_config.pop("indexer_types")
+    freq_profile = models.model_profile_from_hf_config(freq_config, name="glm-dsa-freq")
+    # Layers [4..15] have 12 active layers; every 4th (indices 7, 11, 15) is full.
+    expected_freq_layers = (freq_layers - skip_offset) // topk_freq
+    assert freq_profile.num_indexer_layers == expected_freq_layers
+    assert not freq_profile.is_periodic
+
+    # Malformed explicit schedules fail fast with UnsupportedArchitectureError.
+    with pytest.raises(models.UnsupportedArchitectureError):
+        models.model_profile_from_hf_config(
+            {**glm_config, "indexer_types": ["full", "shared"]},
+            name="glm-bad-len",
+        )
+    with pytest.raises(models.UnsupportedArchitectureError):
+        models.model_profile_from_hf_config(
+            {**glm_config, "indexer_types": ["typo"] * num_layers},
+            name="glm-bad-token",
+        )
+    with pytest.raises(models.UnsupportedArchitectureError):
+        models.model_profile_from_hf_config(
+            {**glm_config, "indexer_types": ["shared"] * num_layers},
+            name="glm-all-shared",
+        )
+
+
+def test_preset_glm52_matches_glm_moe_dsa_hf_config() -> None:
+    """Verify shipped glm-5.2 preset matches zai-org/GLM-5.2-FP8 geometry."""
+    profile = models.resolve_model_profile("glm-5.2")
+    # zai-org/GLM-5.2-FP8 config.json has 78 layers: 21 full + 57 shared indexers.
+    shared_indexer_layers = 57
+    assert profile.model_type == "glm_moe_dsa"
+    assert models.has_dsa_profile(profile)
+    assert profile.intermediate_size == 2 * profile.hidden_size
+    assert profile.q_lora_rank == 4 * profile.kv_lora_rank
+    assert profile.qk_nope_head_dim == 3 * profile.qk_rope_head_dim
+    assert profile.index_topk == 4 * profile.kv_lora_rank
+    assert profile.index_head_dim == constants.INDEXER_SCALE_BLOCK_SIZE
+    assert profile.index_n_heads == profile.num_attention_heads // 2
+    assert profile.num_indexer_layers == profile.num_layers - shared_indexer_layers
+    assert profile.weight_block_k == constants.INDEXER_SCALE_BLOCK_SIZE
+    assert "dsa" in profile.layer_families
+    assert "dense_prefix_moe" in profile.layer_families
+
+
+def test_all_shipped_presets_cite_retrievable_hf_config() -> None:
+    """Verify every shipped preset cites a concrete HuggingFace config.json."""
+    assert len(models.MODEL_PRESETS) == SHIPPED_PRESET_COUNT
+    for removed in ("deepseek-v4", "qwen4-exp"):
+        assert removed not in models.MODEL_PRESETS
+        assert removed not in models.REGISTERED_MODEL_ALIASES
+    for slug, source in models.MODEL_PRESET_SOURCES.items():
+        assert source.startswith("HuggingFace "), f"{slug}: {source}"
+        assert source.endswith("config.json"), f"{slug}: {source}"
+        assert "/" in source, f"{slug}: missing org/repo in {source}"
+
+
+def test_hf_config_deepseek_v4_compress_rates_mapping() -> None:
+    """Verify deepseek_v4 compress_rates dict, error paths, and qwen4_exp_text parse."""
+    csa_rate = 4.0
+    hca_rate = 128.0
+    num_test_layers = 4
+    deepseek_config: dict[str, object] = {
+        **DEEPSEEK_V3_CFG,
+        "model_type": "deepseek_v4",
+        "num_hidden_layers": num_test_layers,
+        "first_k_dense_replace": 0,
+        "layer_types": [
+            "compressed_sparse_attention",
+            "heavily_compressed_attention",
+            "deepseek_sparse_attention",
+            "sliding_attention",
+        ],
+        "compress_rates": {
+            "compressed_sparse_attention": csa_rate,
+            "heavily_compressed_attention": hca_rate,
+        },
+        "mhc_num_streams": 4,
+    }
+    profile = models.model_profile_from_hf_config(deepseek_config, name="ds-v4-custom")
+    # 1 layer at 1/4 + 1 layer at 1/128 + 2 uncompressed layers at 1.0, averaged over 4.
+    expected_factor = (1.0 / csa_rate + 1.0 / hca_rate + 1.0 + 1.0) / num_test_layers
+    assert profile.kv_compress_factor == pytest.approx(expected_factor, abs=1e-9)
+    assert "sparse_csa" in profile.layer_families
+    assert "hyper_connection" in profile.layer_families
+
+    # Without layer_types, compress_rates averages across mapped rate values.
+    no_layers_config = dict(deepseek_config)
+    no_layers_config.pop("layer_types")
+    no_layers_profile = models.model_profile_from_hf_config(
+        no_layers_config, name="ds-v4-no-layers"
+    )
+    expected_avg_rates = (1.0 / csa_rate + 1.0 / hca_rate) / 2.0
+    assert no_layers_profile.kv_compress_factor == pytest.approx(
+        expected_avg_rates, abs=1e-9
+    )
+
+    # Empty or non-positive compress_rates fail fast.
+    with pytest.raises(models.UnsupportedArchitectureError):
+        models.model_profile_from_hf_config(
+            {**deepseek_config, "compress_rates": {}}, name="ds-v4-empty-rates"
+        )
+    with pytest.raises(models.UnsupportedArchitectureError):
+        models.model_profile_from_hf_config(
+            {**deepseek_config, "compress_rates": {"compressed_sparse_attention": 0}},
+            name="ds-v4-zero-rate",
+        )
+
+    # Verify multimodal text sub-config model_type qwen4_exp_text is recognized.
+    qwen4_text_profile = models.model_profile_from_hf_config(
+        {**QWEN4_EXP_CFG, "model_type": "qwen4_exp_text"}, name="qwen4-text-hf"
+    )
+    assert not qwen4_text_profile.architecture_unverified
+    assert "hyper_connection" in qwen4_text_profile.layer_families
