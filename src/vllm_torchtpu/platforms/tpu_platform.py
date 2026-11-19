@@ -43,6 +43,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled,
     update_tpu_block_size_and_slot_config,
 )
+from vllm_torchtpu.runner import runner_options
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -864,6 +865,7 @@ class TpuPlatform(Platform):
 
         frontend_options.get(vllm_config)
         worker_options.check(vllm_config)
+        runner_options.get(vllm_config)
         # A malformed tpu_compile section fails here, where the config is first
         # known, not in each worker that arms the options.
         compile_options.get(vllm_config)
