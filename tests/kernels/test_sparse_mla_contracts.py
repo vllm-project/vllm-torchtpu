@@ -22,10 +22,15 @@ from unittest.mock import patch
 import jax
 import jax.numpy as jnp
 import pytest
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.mla.sparse import (
+    attention_body,
+    attention_kernel,
+    dcp_exchange,
+    dma,
     dsa_gather,
     index_prep,
     ref_registry,
@@ -65,6 +70,11 @@ from vllm_torchtpu.kernels.mla.sparse.gather_dispatch import (
     apply_dcp_skip_windows,
     gather_chunk_kv,
     prepare_attention_indices,
+)
+from vllm_torchtpu.kernels.mla.sparse.kernel_context import (
+    DoubleBufferState,
+    KernelGeometry,
+    compute_kv_rungs,
 )
 from vllm_torchtpu.kernels.mla.sparse.ref_registry import (
     AttentionRefs,
@@ -3200,3 +3210,805 @@ def test_gather_chunk_kv_dispatch_and_validation() -> None:
         assert gathered.nope.shape == (8, 64 * 4, 128)
         assert gathered.rope.shape == (8, 64, 64)
         assert gathered.live_views is None
+
+
+# ---------------------------------------------------------------------------
+# 8. kernel_context.py contract tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeRefAt:
+    """Fake `.at[...]` accessor recording subscript keys on a `_FakeRef`."""
+
+    def __init__(self, ref: _FakeRef) -> None:
+        self._ref = ref
+
+    def __getitem__(self, key: Any) -> tuple[str, str, Any]:
+        return ("ref_at", self._ref.name, key)
+
+
+class _FakeRef:
+    """Shape/dtype-bearing Pallas ref stand-in for CPU context and DMA tests."""
+
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        dtype: Any,
+        *,
+        values: Any = None,
+        name: str = "",
+    ) -> None:
+        self.shape = tuple(shape)
+        self.dtype = dtype
+        self.values = values
+        self.name = name
+        self.at = _FakeRefAt(self)
+
+    def __getitem__(self, key: Any) -> Any:
+        if self.values is not None:
+            return self.values[key]
+        return ("ref_get", self.name, key)
+
+
+def _bind_fake_attention_refs(
+    sc: _AttentionScenario,
+    overrides: dict[str, Any] | None = None,
+) -> AttentionRefs:
+    """Builds a real `AttentionRefs` populated with shape-bearing fake refs."""
+    inputs = _build_scenario_inputs(sc)
+    if overrides:
+        inputs.update(overrides)
+    registry, bounds_layout = build_attention_ref_registry(sc.cfg, **inputs)
+    layout = registry.layout
+    call_args = registry.call_args()
+    out_shapes = (
+        registry.out_shape
+        if isinstance(registry.out_shape, list)
+        else [registry.out_shape]
+    )
+    scratch_shapes = registry.build_grid_spec((1,)).scratch_shapes
+    raw_specs: list[Any] = [*call_args, *out_shapes, *scratch_shapes]
+
+    raw_refs: list[Any] = []
+    for slot in layout.bindings:
+        spec = raw_specs[slot.start]
+        if slot.name == "bounds":
+            raw_refs.append(spec)
+        elif slot.name == "kv_lens":
+            raw_refs.append(
+                _FakeRef(spec.shape, spec.dtype, values=spec, name="kv_lens")
+            )
+        elif slot.name == "sem_ids":
+            raw_refs.append([0, 0])
+        elif slot.name == "dma_sems":
+            raw_refs.append(_FakeSemaphoreRef())
+        else:
+            raw_refs.append(_FakeRef(spec.shape, spec.dtype, name=slot.name))
+
+    return AttentionRefs.from_bound(
+        layout.bind(*raw_refs), bounds_layout, return_lse=sc.cfg.return_lse
+    )
+
+
+def _eager_when(cond: Any) -> Any:
+    """CPU-compatible stand-in for `pl.when(cond)`."""
+
+    def _dec(fn: Any) -> Any:
+        if bool(cond):
+            return fn()
+        return None
+
+    return _dec
+
+
+@pytest.mark.parametrize(
+    ("bkv_sz", "expected"),
+    [
+        (512, (64, 128, 256, 512)),
+        (256, (64, 128, 256)),
+        (128, (64, 128)),
+        (64, (64,)),
+        (192, (192,)),
+        (96, (96,)),
+        (1024, (128, 256, 512, 1024)),
+    ],
+)
+def test_compute_kv_rungs(bkv_sz: int, expected: tuple[int, ...]) -> None:
+    assert compute_kv_rungs(bkv_sz) == expected
+
+
+def test_double_buffer_state_ping_pong_transitions() -> None:
+    assert int(DoubleBufferState.next_slot(jnp.int32(0))) == 1
+    assert int(DoubleBufferState.next_slot(jnp.int32(1))) == 0
+
+    sem_ids: list[Any] = [jnp.int32(0), jnp.int32(0)]
+    db = DoubleBufferState(sem_ids)
+    assert int(db.current_in_slot()) == 0
+
+    nxt = db.next_slot(db.current_in_slot())
+    db.flip_in_slot(nxt)
+    assert int(db.current_in_slot()) == 1
+    assert int(sem_ids[1]) == 0  # Input flip leaves output slot untouched.
+
+    out0 = db.acquire_out_slot()
+    out1 = db.acquire_out_slot()
+    out2 = db.acquire_out_slot()
+    assert [int(out0), int(out1), int(out2)] == [0, 1, 0]
+    assert int(sem_ids[1]) == 1
+    assert int(db.current_in_slot()) == 1  # Output flip leaves input slot untouched.
+
+
+def test_kernel_geometry_from_refs_modes() -> None:
+    # 1) TensorCore with preserve_suffix=True at program_id=1.
+    tc_sc = _AttentionScenario(
+        "tc_suffix",
+        AttentionKernelConfig(sm_scale=0.1, batch_size=4, preserve_suffix=True),
+        num_tokens=8,
+        topk_tile=256,
+    )
+    tc_refs = _bind_fake_attention_refs(tc_sc, {"token_end": jnp.int32(6)})
+    with patch.object(pl, "program_id", return_value=1, create=True):
+        tc_geom = KernelGeometry.from_refs(tc_refs, tc_sc.cfg)
+    assert tc_geom.num_tokens == 8
+    assert tc_geom.o_dim == 128
+    assert tc_geom.head_dim == 128
+    assert tc_geom.bkv_sz == 256
+    assert tc_geom.kv_rungs == (64, 128, 256)
+    assert tc_geom.nofill is False
+    assert tc_geom.prefix_end is not None and int(tc_geom.prefix_end) == 6
+    assert int(tc_geom.batch_start_seq_idx) == 4
+    assert int(tc_geom.batch_end_seq_idx) == 7
+
+    # 2) SparseCore split-q with q_rope and nofill (single-step vs multi-step).
+    sc_body = BodyOptimizationConfig.from_levers(("nofill",), mode="decode")
+    sc_single = _AttentionScenario(
+        "sc_split_nofill",
+        AttentionKernelConfig(
+            sm_scale=0.1,
+            batch_size=8,
+            sparsecore_layout=True,
+            capped_windows=4,
+            row_widths=(128, 256),
+            split_q=True,
+            q_rope=True,
+            return_lse=True,
+            lse_lane_dense=True,
+            lse_fill=True,
+            body=sc_body,
+        ),
+        num_tokens=8,
+        topk_tile=512,
+    )
+    with patch.object(pl, "program_id", return_value=0, create=True):
+        sc_geom = KernelGeometry.from_refs(
+            _bind_fake_attention_refs(sc_single), sc_single.cfg
+        )
+    assert sc_geom.o_dim == 128
+    assert sc_geom.head_dim == align_to(128 + Q_ROPE_DIM, 128)
+    assert sc_geom.bkv_sz == 512
+    assert sc_geom.kv_rungs == (64, 128, 256, 512)
+    assert sc_geom.nofill is True
+    assert sc_geom.prefix_end is None
+
+    sc_multi = dataclasses.replace(
+        sc_single,
+        cfg=dataclasses.replace(sc_single.cfg, batch_size=4),
+    )
+    with patch.object(pl, "program_id", return_value=0, create=True):
+        sc_multi_geom = KernelGeometry.from_refs(
+            _bind_fake_attention_refs(sc_multi), sc_multi.cfg
+        )
+    assert sc_multi_geom.nofill is False
+
+    # 3) Send-layout mode (no fused exchange; nofill forced False by send).
+    send_sc = _AttentionScenario(
+        "send_only",
+        AttentionKernelConfig(
+            sm_scale=0.1,
+            batch_size=4,
+            sparsecore_layout=True,
+            capped_windows=4,
+            row_widths=(128, 256),
+            split_q=True,
+            q_rope=True,
+            return_lse=True,
+            lse_lane_dense=True,
+            lse_fill=True,
+            send_world=4,
+            body=sc_body,
+        ),
+        num_tokens=8,
+        num_q_heads=16,
+    )
+    with patch.object(pl, "program_id", return_value=0, create=True):
+        send_geom = KernelGeometry.from_refs(
+            _bind_fake_attention_refs(send_sc), send_sc.cfg
+        )
+    assert send_geom.send_per == 4
+    assert send_geom.send_rows == 32
+    assert send_geom.send_lanes == send_layout_lanes(8, 16, 4)
+    assert send_geom.nofill is False
+    assert send_geom.xchg_rows == 0
+    assert send_geom.xchg_block == 0
+
+    # 4) Fused-exchange modes (both in_kernel_merge=False and True).
+    for merge in (False, True):
+        xchg_sc = _AttentionScenario(
+            f"xchg_merge_{merge}",
+            AttentionKernelConfig(
+                sm_scale=0.1,
+                batch_size=8,
+                sparsecore_layout=True,
+                split_q=True,
+                q_rope=True,
+                return_lse=True,
+                lse_lane_dense=True,
+                lse_fill=True,
+                send_world=4,
+                send_exchange=SendExchangeConfig(
+                    axis="dcp", lane_axis="tp", in_kernel_merge=merge
+                ),
+            ),
+            num_tokens=8,
+            num_q_heads=16,
+        )
+        with patch.object(pl, "program_id", return_value=0, create=True):
+            xchg_geom = KernelGeometry.from_refs(
+                _bind_fake_attention_refs(xchg_sc), xchg_sc.cfg
+            )
+        assert xchg_geom.send_per == 4
+        assert xchg_geom.send_rows == 32
+        assert xchg_geom.xchg_rows == SEND_SLAB_ROW0 + 32
+        assert xchg_geom.xchg_block == SEND_PAD_ROWS + 32
+
+
+# ---------------------------------------------------------------------------
+# 9. dma.py & dcp_exchange.py contract tests
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_bkv_batch_branch_dispatch() -> None:
+    # 1) Live-group -> dma.fetch_live_blocks.
+    live_sc = _AttentionScenario(
+        "dma_live",
+        AttentionKernelConfig(
+            sm_scale=0.1,
+            batch_size=4,
+            sparsecore_layout=True,
+            capped_windows=4,
+            has_group_tab=True,
+        ),
+        num_tokens=8,
+    )
+    live_refs = _bind_fake_attention_refs(live_sc)
+    with patch.object(pl, "program_id", return_value=0, create=True):
+        live_geom = KernelGeometry.from_refs(live_refs, live_sc.cfg)
+    with patch.object(dma, "fetch_live_blocks") as mock_blocks:
+        dma.fetch_bkv_batch(live_refs, live_sc.cfg, live_geom, 0, 1, wait=True)
+    mock_blocks.assert_called_once_with(
+        live_refs, live_sc.cfg, live_geom, 0, 1, wait=True
+    )
+
+    # 2) fetch_live_rows_only with rows -> dma.fetch_live_rows.
+    lrows_body = BodyOptimizationConfig.from_levers(("lrows",), mode="decode")
+    lrows_sc = _AttentionScenario(
+        "dma_lrows",
+        AttentionKernelConfig(
+            sm_scale=0.1,
+            batch_size=4,
+            sparsecore_layout=True,
+            capped_windows=4,
+            row_widths=(128, 256),
+            body=lrows_body,
+        ),
+        num_tokens=8,
+        topk_tile=512,
+    )
+    lrows_refs = _bind_fake_attention_refs(lrows_sc)
+    with patch.object(pl, "program_id", return_value=0, create=True):
+        lrows_geom = KernelGeometry.from_refs(lrows_refs, lrows_sc.cfg)
+    with patch.object(dma, "fetch_live_rows") as mock_lrows:
+        dma.fetch_bkv_batch(
+            lrows_refs, lrows_sc.cfg, lrows_geom, 0, 0, wait=False, rows=128
+        )
+    mock_lrows.assert_called_once_with(
+        lrows_refs, lrows_sc.cfg, lrows_geom, 0, 0, 128, wait=False
+    )
+
+    # 3) row_widths / explicit rows -> dma.fetch_bkv_slice.
+    slice_sc = _AttentionScenario(
+        "dma_slice",
+        AttentionKernelConfig(
+            sm_scale=0.1,
+            batch_size=4,
+            sparsecore_layout=True,
+            capped_windows=4,
+            is_dcp_mode=True,
+            row_widths=(128, 256),
+        ),
+        num_tokens=8,
+        topk_tile=512,
+    )
+    slice_refs = _bind_fake_attention_refs(slice_sc)
+    with patch.object(pl, "program_id", return_value=0, create=True):
+        slice_geom = KernelGeometry.from_refs(slice_refs, slice_sc.cfg)
+    with patch.object(dma, "fetch_bkv_slice") as mock_slice:
+        dma.fetch_bkv_batch(
+            slice_refs, slice_sc.cfg, slice_geom, 0, 0, wait=False, rows=256
+        )
+        dma.fetch_bkv_batch(
+            slice_refs, slice_sc.cfg, slice_geom, 0, 1, wait=True, rows=None
+        )
+    assert mock_slice.call_count == 2
+    assert mock_slice.call_args_list[0].args == (
+        slice_refs,
+        slice_sc.cfg,
+        slice_geom,
+        0,
+        0,
+        256,
+    )
+    assert mock_slice.call_args_list[1].args == (
+        slice_refs,
+        slice_sc.cfg,
+        slice_geom,
+        0,
+        1,
+        512,
+    )
+
+    # 4) DCP kv_rungs ladder (bkv_sz=512 -> rungs (64, 128, 256, 512)).
+    dcp_sc = _AttentionScenario(
+        "dma_dcp_rungs",
+        AttentionKernelConfig(
+            sm_scale=0.1,
+            batch_size=4,
+            sparsecore_layout=True,
+            is_dcp_mode=True,
+        ),
+        num_tokens=8,
+        topk_tile=512,
+    )
+    for max_kv, expected_rung in (
+        (0, None),
+        (1, 64),
+        (64, 64),
+        (65, 128),
+        (128, 128),
+        (129, 256),
+        (256, 256),
+        (300, 512),
+        (512, 512),
+    ):
+        kv_vals = jnp.array([0, 0, max_kv, 0, 0, 0, 0, 0], dtype=jnp.int32)
+        dcp_refs = _bind_fake_attention_refs(dcp_sc, {"kv_lens": kv_vals})
+        with patch.object(pl, "program_id", return_value=0, create=True):
+            dcp_geom = KernelGeometry.from_refs(dcp_refs, dcp_sc.cfg)
+        seen_rungs: list[int] = []
+
+        def _rec_slice(*args: Any, out: list[int] = seen_rungs, **_kw: Any) -> None:
+            out.append(args[5])
+
+        with (
+            patch.object(pl, "when", side_effect=_eager_when, create=True),
+            patch.object(dma, "fetch_bkv_slice", side_effect=_rec_slice),
+        ):
+            dma.fetch_bkv_batch(dcp_refs, dcp_sc.cfg, dcp_geom, 0, 0, wait=False)
+        assert seen_rungs == ([] if expected_rung is None else [expected_rung])
+
+    # 5) Non-DCP full tile -> direct dma.async_copy for nope and rope.
+    plain_sc = _AttentionScenario(
+        "dma_plain",
+        AttentionKernelConfig(sm_scale=0.1, batch_size=4, sparsecore_layout=True),
+        num_tokens=8,
+        topk_tile=128,
+    )
+    plain_refs = _bind_fake_attention_refs(plain_sc)
+    with patch.object(pl, "program_id", return_value=0, create=True):
+        plain_geom = KernelGeometry.from_refs(plain_refs, plain_sc.cfg)
+    for wait_flag in (False, True):
+        with patch.object(dma, "async_copy") as mock_copy:
+            dma.fetch_bkv_batch(
+                plain_refs, plain_sc.cfg, plain_geom, 0, 1, wait=wait_flag
+            )
+        assert mock_copy.call_count == 2
+        assert mock_copy.call_args_list[0].kwargs == {"wait": wait_flag}
+        assert mock_copy.call_args_list[1].kwargs == {"wait": wait_flag}
+        assert mock_copy.call_args_list[0].args[2] == ("sem_slot", (0, 1))
+        assert mock_copy.call_args_list[1].args[2] == ("sem_slot", (3, 1))
+
+
+@pytest.mark.parametrize(
+    ("kv_vals", "hooks", "expected_width"),
+    [
+        ([32, 128, 0, 0], NO_FAULT_HOOKS, 128),
+        ([64, 129, 0, 0], NO_FAULT_HOOKS, 256),
+        ([100, 256, 0, 0], NO_FAULT_HOOKS, 256),
+        ([10, 257, 0, 0], NO_FAULT_HOOKS, None),
+        (
+            [32, 128, 0, 0],
+            FaultHooks(prologue=PrologueFault.ROW_WIDTH_UNDERSIZE),
+            128,
+        ),
+        (
+            [64, 129, 0, 0],
+            FaultHooks(prologue=PrologueFault.ROW_WIDTH_UNDERSIZE),
+            128,
+        ),
+        (
+            [100, 256, 0, 0],
+            FaultHooks(prologue=PrologueFault.ROW_WIDTH_UNDERSIZE),
+            128,
+        ),
+        (
+            [10, 257, 0, 0],
+            FaultHooks(prologue=PrologueFault.ROW_WIDTH_UNDERSIZE),
+            256,
+        ),
+    ],
+)
+def test_with_row_width_ladder_normal_and_undersize_fault(
+    kv_vals: list[int],
+    hooks: FaultHooks,
+    expected_width: int | None,
+) -> None:
+    sc = _AttentionScenario(
+        "row_widths",
+        AttentionKernelConfig(
+            sm_scale=0.1,
+            batch_size=2,
+            sparsecore_layout=True,
+            capped_windows=4,
+            row_widths=(128, 256),
+        ),
+        num_tokens=4,
+    )
+    refs = _bind_fake_attention_refs(
+        sc, {"kv_lens": jnp.array(kv_vals, dtype=jnp.int32)}
+    )
+    chosen: list[int | None] = []
+    with patch.object(pl, "when", side_effect=_eager_when, create=True):
+        dma.with_row_width(refs, sc.cfg, hooks, 0, chosen.append)
+    assert chosen == [expected_width]
+
+    # Empty row_widths invokes callback directly with None.
+    empty_cfg = dataclasses.replace(sc.cfg, row_widths=())
+    direct: list[int | None] = []
+    dma.with_row_width(refs, empty_cfg, hooks, 0, direct.append)
+    assert direct == [None]
+
+
+def test_xchg_peer_with_and_without_lane_axis() -> None:
+    base_cfg = AttentionKernelConfig(
+        sm_scale=0.1,
+        batch_size=8,
+        sparsecore_layout=True,
+        split_q=True,
+        q_rope=True,
+        return_lse=True,
+        lse_lane_dense=True,
+        lse_fill=True,
+        send_world=4,
+        send_exchange=SendExchangeConfig(axis="dcp", lane_axis=None),
+    )
+    sc_no_lane = _AttentionScenario("xchg_no_lane", base_cfg, num_tokens=8)
+    refs_no_lane = _bind_fake_attention_refs(
+        sc_no_lane, {"send_peer": (jnp.int32(1), jnp.int32(3))}
+    )
+    peer_no_lane = dcp_exchange.xchg_peer(refs_no_lane, base_cfg, 2)
+    assert list(peer_no_lane.keys()) == ["dcp"]
+    assert int(peer_no_lane["dcp"]) == 2
+
+    lane_cfg = dataclasses.replace(
+        base_cfg,
+        send_exchange=SendExchangeConfig(axis="dcp", lane_axis="tp"),
+    )
+    sc_with_lane = _AttentionScenario("xchg_with_lane", lane_cfg, num_tokens=8)
+    refs_with_lane = _bind_fake_attention_refs(
+        sc_with_lane, {"send_peer": (jnp.int32(1), jnp.int32(3))}
+    )
+    peer_with_lane = dcp_exchange.xchg_peer(refs_with_lane, lane_cfg, 2)
+    assert set(peer_with_lane.keys()) == {"dcp", "tp"}
+    assert int(peer_with_lane["dcp"]) == 2
+    assert int(peer_with_lane["tp"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# 10. attention_body.py & attention_kernel.py contract tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("q_dtype", "k_scale"),
+    [
+        (jnp.float32, 1.0),
+        (jnp.float32, 0.5),
+        (jnp.bfloat16, 1.0),
+        (jnp.bfloat16, 0.5),
+    ],
+)
+def test_normalize_pv_output_dtypes_and_k_scale(q_dtype: Any, k_scale: float) -> None:
+    pv = jnp.array([[2.0, 4.0], [6.0, 8.0]], dtype=jnp.float32)
+    l_sum = jnp.array([[2.0], [4.0]], dtype=jnp.float32)
+
+    recip_calls: list[bool] = []
+    div_calls: list[int] = []
+    orig_div = lax.div
+
+    def _spy_recip(x: Any, approx: bool = False) -> Any:
+        recip_calls.append(approx)
+        return jnp.full(x.shape, 1.0, jnp.float32) / x
+
+    def _spy_div(a: Any, b: Any) -> Any:
+        div_calls.append(1)
+        return orig_div(a, b)
+
+    with (
+        patch.object(pl, "reciprocal", side_effect=_spy_recip, create=True),
+        patch.object(lax, "div", side_effect=_spy_div),
+    ):
+        out = attention_body.normalize_pv_output(
+            pv, l_sum, k_scale=k_scale, q_dtype=q_dtype
+        )
+
+    assert out.dtype == q_dtype
+    expected = [[1.0 * k_scale, 2.0 * k_scale], [1.5 * k_scale, 2.0 * k_scale]]
+    assert out.tolist() == pytest.approx(expected, rel=1e-2)
+    if q_dtype == jnp.float32:
+        assert len(div_calls) == 1
+        assert recip_calls == []
+    else:
+        assert recip_calls == [True]
+        assert div_calls == []
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected_target"),
+    [
+        (BodyExecutionStrategy.TOKEN_PIPELINED, "run_token_pipelined"),
+        (BodyExecutionStrategy.PAIR, "run_paired_softmax"),
+        (BodyExecutionStrategy.QUAD, "run_quad_softmax"),
+        (BodyExecutionStrategy.TRANSPOSED_QK, "run_transposed_qk"),
+    ],
+)
+def test_dispatch_attention_body_routes_all_strategies(
+    strategy: BodyExecutionStrategy, expected_target: str
+) -> None:
+    body_cfg = BodyOptimizationConfig(strategy=strategy)
+    sentinel_refs: Any = object()
+    sentinel_cfg: Any = object()
+    sentinel_geom: Any = object()
+
+    with (
+        patch.object(attention_body, "run_token_pipelined") as mock_pipe,
+        patch.object(attention_body, "run_paired_softmax") as mock_pair,
+        patch.object(attention_body, "run_quad_softmax") as mock_quad,
+        patch.object(attention_body, "run_transposed_qk") as mock_xqk,
+    ):
+        attention_body.dispatch_attention_body(
+            sentinel_refs,
+            sentinel_cfg,
+            sentinel_geom,
+            NO_FAULT_HOOKS,
+            0,
+            1,
+            128,
+            body_cfg,
+        )
+        mocks = {
+            "run_token_pipelined": mock_pipe,
+            "run_paired_softmax": mock_pair,
+            "run_quad_softmax": mock_quad,
+            "run_transposed_qk": mock_xqk,
+        }
+        for name, mock_fn in mocks.items():
+            if name == expected_target:
+                mock_fn.assert_called_once_with(
+                    sentinel_refs,
+                    sentinel_cfg,
+                    sentinel_geom,
+                    NO_FAULT_HOOKS,
+                    0,
+                    1,
+                    128,
+                    body_cfg,
+                )
+            else:
+                mock_fn.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("case_name", "cfg", "expected_decode"),
+    [
+        (
+            "decode_lse_fill",
+            AttentionKernelConfig(
+                sm_scale=0.1,
+                sparsecore_layout=True,
+                return_lse=True,
+                lse_lane_dense=True,
+                lse_fill=True,
+            ),
+            True,
+        ),
+        (
+            "decode_row_widths",
+            AttentionKernelConfig(
+                sm_scale=0.1,
+                sparsecore_layout=True,
+                capped_windows=4,
+                row_widths=(128, 256),
+            ),
+            True,
+        ),
+        (
+            "decode_send_world",
+            AttentionKernelConfig(
+                sm_scale=0.1,
+                sparsecore_layout=True,
+                split_q=True,
+                q_rope=True,
+                return_lse=True,
+                lse_lane_dense=True,
+                lse_fill=True,
+                send_world=4,
+            ),
+            True,
+        ),
+        (
+            "decode_send_exchange",
+            AttentionKernelConfig(
+                sm_scale=0.1,
+                sparsecore_layout=True,
+                split_q=True,
+                q_rope=True,
+                return_lse=True,
+                lse_lane_dense=True,
+                lse_fill=True,
+                send_world=4,
+                send_exchange=SendExchangeConfig(axis="dcp", in_kernel_merge=False),
+            ),
+            True,
+        ),
+        (
+            "decode_xchg_merge",
+            AttentionKernelConfig(
+                sm_scale=0.1,
+                sparsecore_layout=True,
+                split_q=True,
+                q_rope=True,
+                return_lse=True,
+                lse_lane_dense=True,
+                lse_fill=True,
+                send_world=4,
+                send_exchange=SendExchangeConfig(axis="dcp", in_kernel_merge=True),
+            ),
+            True,
+        ),
+        (
+            "mixed_group_tab_no_lse_fill",
+            AttentionKernelConfig(
+                sm_scale=0.1,
+                sparsecore_layout=True,
+                capped_windows=4,
+                has_group_tab=True,
+                live_widths=(128, 256),
+            ),
+            False,
+        ),
+        (
+            "mixed_group_tab_with_lse_fill",
+            AttentionKernelConfig(
+                sm_scale=0.1,
+                sparsecore_layout=True,
+                capped_windows=4,
+                has_group_tab=True,
+                return_lse=True,
+                lse_lane_dense=True,
+                lse_fill=True,
+            ),
+            False,
+        ),
+        (
+            "prefill_preserve_suffix",
+            AttentionKernelConfig(sm_scale=0.1, preserve_suffix=True),
+            False,
+        ),
+        (
+            "prefill_out_pieces",
+            AttentionKernelConfig(
+                sm_scale=0.1,
+                sparsecore_layout=True,
+                return_lse=True,
+                lse_lane_dense=True,
+                out_row_offset=8,
+                out_in=True,
+            ),
+            False,
+        ),
+        (
+            "prefill_standard_tc",
+            AttentionKernelConfig(sm_scale=0.1),
+            False,
+        ),
+        (
+            "prefill_standard_sc",
+            AttentionKernelConfig(sm_scale=0.1, sparsecore_layout=True),
+            False,
+        ),
+        (
+            "prefill_dcp",
+            AttentionKernelConfig(
+                sm_scale=0.1,
+                sparsecore_layout=True,
+                is_dcp_mode=True,
+                return_lse=True,
+                lse_lane_dense=True,
+            ),
+            False,
+        ),
+    ],
+)
+def test_is_decode_kernel_and_select_attention_kernel_matrix(
+    case_name: str, cfg: AttentionKernelConfig, expected_decode: bool
+) -> None:
+    del case_name
+    assert attention_kernel.is_decode_kernel(cfg) is expected_decode
+    expected_fn = (
+        attention_kernel._decode_attention_kernel
+        if expected_decode
+        else attention_kernel._mixed_prefill_attention_kernel
+    )
+    assert attention_kernel.select_attention_kernel(cfg) is expected_fn
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        AttentionKernelConfig(
+            sm_scale=0.1,
+            sparsecore_layout=True,
+            return_lse=True,
+            lse_lane_dense=True,
+            lse_fill=True,
+        ),
+        AttentionKernelConfig(
+            sm_scale=0.1,
+            sparsecore_layout=True,
+            capped_windows=4,
+            has_group_tab=True,
+        ),
+    ],
+)
+def test_attention_kernel_delegates_to_select_attention_kernel(
+    cfg: AttentionKernelConfig,
+) -> None:
+    recorded: dict[str, Any] = {}
+
+    def _fake_selected(*raw_refs: Any, **kw: Any) -> None:
+        recorded["raw_refs"] = raw_refs
+        recorded["kwargs"] = kw
+
+    sentinel_layout: Any = object()
+    sentinel_bounds: Any = object()
+    hooks = FaultHooks(prologue=PrologueFault.ROPE_SWAP)
+    with patch.object(
+        attention_kernel, "select_attention_kernel", return_value=_fake_selected
+    ) as mock_select:
+        attention_kernel._attention_kernel(
+            "r0",
+            "r1",
+            cfg=cfg,
+            ref_layout=sentinel_layout,
+            bounds_layout=sentinel_bounds,
+            hooks=hooks,
+        )
+
+    mock_select.assert_called_once_with(cfg)
+    assert recorded["raw_refs"] == ("r0", "r1")
+    assert recorded["kwargs"] == {
+        "cfg": cfg,
+        "ref_layout": sentinel_layout,
+        "bounds_layout": sentinel_bounds,
+        "hooks": hooks,
+    }
