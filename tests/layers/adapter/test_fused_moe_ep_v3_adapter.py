@@ -174,6 +174,51 @@ def test_an_unplaced_layer_is_unchanged(armed):
     assert armed["local_experts"] == 4
 
 
+def test_a_refused_contract_keeps_the_rank_and_the_expert_order(armed, monkeypatch):
+    """The second layer's top_k differs from the operation's, so it is refused
+    before it can replace the rank buffer or the expert order the first layer
+    set."""
+    order, other = torch.tensor([1, 0]), torch.tensor([0, 1])
+    monkeypatch.setattr(v3, "_expert_block_permutation", lambda ep, dev: order)
+    first = _layer(slots=4)
+    with patch.object(v3, "ep_mesh_index", return_value=1):
+        v3.prebuild_fused_moe_ep(first, topk=2, renormalize=True, activation="silu")
+    assert first._tpu_fused_ep_eligible
+    rank = v3._RANK_BUFFER
+    assert rank.item() == 1 and v3._EXPERT_ORDER is order
+
+    monkeypatch.setattr(v3, "_expert_block_permutation", lambda ep, dev: other)
+    second = _layer(slots=4)
+    with patch.object(v3, "ep_mesh_index", return_value=0):
+        v3.prebuild_fused_moe_ep(second, topk=4, renormalize=True, activation="silu")
+    assert not second._tpu_fused_ep_eligible
+    assert v3._RANK_BUFFER is rank and rank.item() == 1
+    assert v3._EXPERT_ORDER is order
+
+
+def test_an_ep_mesh_index_outside_the_mesh_is_refused(armed):
+    layer = _layer(slots=4)
+    with patch.object(v3, "ep_mesh_index", return_value=EP):
+        v3.prebuild_fused_moe_ep(layer, topk=2, renormalize=True, activation="silu")
+    assert not layer._tpu_fused_ep_eligible
+    assert v3._OP is None and v3._RANK_BUFFER is None
+
+
+def test_the_batch_floor_counts_one_scheduler_batch_per_dp_rank(armed, monkeypatch):
+    """Under TP with sequence parallelism the TP ranks of a DP rank split one
+    scheduler batch, so the batch floor sees ep // tp batches, not ep."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    batches = []
+    monkeypatch.setattr(v3, "_max_node_tokens", lambda n: batches.append(n) or 4096)
+    monkeypatch.setattr(v3, "_tensor_parallel_size", lambda: 2)
+    monkeypatch.setattr(sequence_parallel, "enabled", lambda: True)
+    layer = _layer(slots=4)
+    layer.moe_config.is_sequence_parallel = True
+    assert _prebuild(layer)
+    assert batches == [EP // 2]
+
+
 @pytest.mark.parametrize(
     "routing",
     [
