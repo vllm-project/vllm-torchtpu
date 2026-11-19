@@ -5330,15 +5330,8 @@ class TPUModelRunner(GPUModelRunner):
                     if input_ids.device.type == "tpu"
                     else extract_draft_token_ids
                 )
-                L = spec_decode_metadata.final_logits_indices.shape[0]
-                extract_input_ids = (
-                    input_ids[:L]
-                    if input_ids.shape[0] > L
-                    and getattr(spec_decode_metadata, "max_draft_input_index", L) < L
-                    else input_ids
-                )
                 spec_decode_metadata.draft_token_ids = extract_fn(
-                    extract_input_ids,
+                    _draft_extract_input_ids(input_ids, spec_decode_metadata),
                     spec_decode_metadata.final_logits_indices,
                     spec_decode_metadata.target_logits_indices,
                 )
@@ -10591,6 +10584,22 @@ def _get_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:
 def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
     res = MIN_NUM_SEQS if x <= MIN_NUM_SEQS else 1 << (x - 1).bit_length()
     return min(res, upper_limit)
+
+
+def _draft_extract_input_ids(
+    input_ids: torch.Tensor, spec_decode_metadata: SpecDecodeMetadata
+) -> torch.Tensor:
+    """`input_ids` cut to the logits length when every index the draft
+    extract reads lies below it, so the extract's input does not grow with a
+    step padded past this chunk's tokens. The cut is a copy: on TPU a prefix
+    view costs three as_strided programs before the extract."""
+    length = spec_decode_metadata.final_logits_indices.shape[0]
+    if (
+        input_ids.shape[0] > length
+        and spec_decode_metadata.max_draft_input_index < length
+    ):
+        return input_ids[:length].clone()
+    return input_ids
 
 
 def _get_padded_token_len(paddings: list[int], x: int) -> int:

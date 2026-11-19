@@ -27,6 +27,10 @@ if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
+def _max_index(indices: np.ndarray) -> int:
+    return int(indices.max()) if indices.size > 0 else 0
+
+
 @dataclass
 class SpecDecodeMetadata:
     """Metadata for speculative decoding on Torch/TPU, containing all
@@ -59,6 +63,10 @@ class SpecDecodeMetadata:
     # scheduling execute_model re-sources the drafts from the device and
     # uploads this only for a chunk with nothing substituted.
     deferred_draft_token_ids_cpu: np.ndarray | None = None
+    # Largest input_ids index extract_draft_token_ids reads
+    # (logits_indices[target_logits_indices + 1]); lets the caller slice
+    # input_ids to the logits length before the on-device extract.
+    max_draft_input_index: int = 0
 
     def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
         assert self.deferred_draft_token_ids_cpu is not None
@@ -311,7 +319,8 @@ class SpeculativeDecodingManager:
             # draft_token_ids depends on this step's input_ids_cpu content —
             # always re-extracted and re-transferred.
             all_token_ids = self.runner.input_ids_cpu.numpy()
-            draft_token_ids = all_token_ids[logits_indices[target_logits_indices + 1]]
+            draft_input_indices = logits_indices[target_logits_indices + 1]
+            draft_token_ids = all_token_ids[draft_input_indices]
             padded_draft_token_ids = np.zeros(padded_logits_length, dtype=np.int32)
             padded_draft_token_ids[: draft_token_ids.shape[0]] = draft_token_ids
             return SpecDecodeMetadata(
@@ -332,6 +341,7 @@ class SpeculativeDecodingManager:
                 deferred_draft_token_ids_cpu=(
                     padded_draft_token_ids if defer_draft_token_ids else None
                 ),
+                max_draft_input_index=_max_index(draft_input_indices),
             )
 
         # [num_reqs]
@@ -376,7 +386,8 @@ class SpeculativeDecodingManager:
 
         # Compute the draft token ids for validation.
         all_token_ids = self.runner.input_ids_cpu.numpy()
-        draft_token_ids = all_token_ids[logits_indices[target_logits_indices + 1]]
+        draft_input_indices = logits_indices[target_logits_indices + 1]
+        draft_token_ids = all_token_ids[draft_input_indices]
 
         # Padding
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
@@ -454,6 +465,7 @@ class SpeculativeDecodingManager:
             deferred_draft_token_ids_cpu=(
                 padded_draft_token_ids if defer_draft_token_ids else None
             ),
+            max_draft_input_index=_max_index(draft_input_indices),
         )
         # draft_lengths_cpu aliases the caller's array; copy so a later caller
         # mutation can't diverge the cache from its key.
