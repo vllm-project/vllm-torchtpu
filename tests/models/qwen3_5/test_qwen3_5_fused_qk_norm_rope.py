@@ -25,6 +25,8 @@ import numpy as np
 import pytest
 import torch
 import vllm.model_executor.custom_op as custom_op_mod
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch_tpu._internal import pallas
 from vllm.config import (
     CompilationConfig,
     CompilationMode,
@@ -161,6 +163,44 @@ def test_fused_projection_matches_the_eager_path(rows):
         assert a.shape == b.shape and a.dtype == b.dtype, name
         # The eager path rounds the normed q/k to bf16 before the rope.
         torch.testing.assert_close(a, b, atol=3e-2, rtol=3e-2, msg=name)
+
+
+def test_text_only_mrope_positions_take_the_first_row():
+    """M-RoPE positions arrive as [3, rows]; with text only the three rows
+    agree, and the fused projection equals the one on 1D positions."""
+    layer = _layer()
+    qkv, positions = _inputs(13)
+    want = fused.project_qkv_gate(layer, qkv, positions)
+    got = fused.project_qkv_gate(layer, qkv, positions.expand(3, -1).contiguous())
+    for name, a, b in zip(("q", "k", "v", "gate"), got, want):
+        torch.testing.assert_close(a, b, atol=0, rtol=0, msg=name)
+    first, second = _HostOp.calls
+    torch.testing.assert_close(second[4], first[4], atol=0, rtol=0)
+
+
+def test_the_op_registers_with_the_real_bridge_and_its_fake_gives_the_shapes(
+    monkeypatch,
+):
+    """The real ``pallas.jax_op`` (not the host stand-in) accepts the op, and
+    its fake gives the outputs' shapes and dtypes under FakeTensorMode."""
+    monkeypatch.setattr(fused, "pallas", pallas)
+    # A name no other test in the session registers.
+    monkeypatch.setattr(fused, "_ops", {("unused", i): None for i in range(901)})
+    key = (HEADS, KV_HEADS, HEAD_DIM, ROT, 1e-6)
+    fused._build_op(key)
+    op = fused._ops[key]
+    rows = 24
+    with FakeTensorMode():
+        q, k, gate = op(
+            torch.empty(rows, HEADS * 2 * HEAD_DIM, dtype=torch.bfloat16),
+            torch.empty(rows, KV_HEADS * HEAD_DIM, dtype=torch.bfloat16),
+            torch.empty(HEAD_DIM, dtype=torch.float32),
+            torch.empty(HEAD_DIM, dtype=torch.float32),
+            torch.empty(rows, ROT, dtype=torch.bfloat16),
+        )
+    assert (tuple(q.shape), q.dtype) == ((rows, HEADS * HEAD_DIM), torch.bfloat16)
+    assert (tuple(k.shape), k.dtype) == ((rows, KV_HEADS * HEAD_DIM), torch.bfloat16)
+    assert (tuple(gate.shape), gate.dtype) == ((rows, HEADS * HEAD_DIM), torch.bfloat16)
 
 
 def test_fused_projection_reads_the_hoisted_norm_weight():
