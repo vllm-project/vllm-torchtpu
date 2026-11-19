@@ -313,6 +313,8 @@ def _make_step_scheduler(running, monkeypatch, budget=8192):
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
     s._is_kv_consumer = True
     s.running = list(running)
+    s.waiting = FCFSRequestQueue()
+    s.kv_holding_waiting = FCFSRequestQueue()
     s.max_num_scheduled_tokens = budget
     return s, seen
 
@@ -366,6 +368,8 @@ def test_waiting_loop_stop_reason_and_admission_telemetry():
     s.kv_holding_waiting = []
     s.max_num_scheduled_tokens = 8192
     s.max_num_active_reqs = 32
+    s.num_waiting_for_streaming_input = 0
+    s.deferred_waiting = set()
     s.block_size = 640
     out = SimpleNamespace(total_num_scheduled_tokens=640, num_scheduled_tokens={})
 
