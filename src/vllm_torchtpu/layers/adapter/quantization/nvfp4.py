@@ -93,6 +93,10 @@ from vllm_torchtpu.layers.adapter.quantization.configs import (
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import resolve_online_fp8
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import map_online_fp8
+from vllm_torchtpu.layers.adapter.routing_moe import (
+    prebuild_routing_moe_kernel,
+    routing_moe_forward,
+)
 from vllm_torchtpu.layers.core.quant_methods import NVFP4, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import (
     dequantize_tensor,
@@ -310,6 +314,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
     """
 
     _use_adaptive_fused_moe: bool = False
+    _use_routing_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
 
     def __init__(self, quant_config: VllmNvfp4Config, moe_config):
@@ -420,7 +425,11 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         # Preserve main's explicit requantization recipe for the GMM path.
         # Automatic requantization is committed only for an admitted W4A8 op.
         configured_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
-        if self._use_adaptive_fused_moe:
+        self._use_routing_moe = bool(envs.VLLM_TPU_USE_ROUTING_MOE)
+        if self._use_routing_moe:
+            op = None
+            requant_block = 128 if configured_block is None else int(configured_block)
+        elif self._use_adaptive_fused_moe:
             op, requant_block = adaptive_moe.prebuild_adaptive_nvfp4(
                 layer, activation_str, configured_block
             )
@@ -487,7 +496,14 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
-        if not self._use_adaptive_fused_moe:
+        if self._use_routing_moe:
+            prebuild_routing_moe_kernel(
+                topk=layer.moe_config.experts_per_token,
+                global_num_experts=int(layer.global_num_experts),
+                activation=activation_str,
+                use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            )
+        elif not self._use_adaptive_fused_moe:
             prebuild_fused_moe_kernel(
                 topk=layer.moe_config.experts_per_token,
                 activation=activation_str,
@@ -575,6 +591,11 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         }
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
+        if self._use_routing_moe:
+            return routing_moe_forward(
+                **kwargs,
+                global_num_experts=int(layer.global_num_experts),
+            )
 
         return fused_moe_gmm(**kwargs)
 
