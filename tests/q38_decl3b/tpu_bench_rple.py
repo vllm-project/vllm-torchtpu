@@ -8,13 +8,18 @@ Kit pattern from DECODE-L3-INJMXU-2's tests/q38_decl3/tpu_bench_injmxu.py (credi
 K3DX for the all-TensorCore method and the launch-barrier rule) with a new body: the PLE op, its chain, its health and its
 engagement. The op and the ring / cond come from L1's PLE-WRDEFER and D07-b2 (credit L1).
 
-Rows (T tokens) 128 / 160 / 192 / 256, count (max-num-seqs rows) 40 / 40 / 48 / 64 (RM4096's decode MAX_NUM_SEQS is 40; the
-192 / 256 buckets need 48 / 64 rows to hold uniform windows), every live request a 4-token verify window (uniform k3), plus one
+Rows (T tokens) 128 / 160 / 192 / 256, count (max-num-seqs rows) 40 / 40 / 48 / 64: 128 / 160 at count 40 are RM4096's geometry
+(decode MAX_NUM_SEQS 40); 192 / 48 and 256 / 64 are T90m-style geometry, not RM4096 (the smallest counts that hold uniform windows;
+on RM4096 those buckets take the request path, where U falls back statically), descriptive for WU in the reader; every live
+request a 4-token verify window (uniform k3), plus one
 non-uniform row at 160 (one request of 1 token: pred False, the cond takes the stock branch). Pool pages of 512 tokens x
 1 x 4 x 256 f8e4m3fn (the served page geometry), 2048 pages per device.
 
 Chain: one call of the op per iteration, L calls per program (pool carried and donated, each call's output is the next call's
-x), L_LONG 24 / L_SHORT 4. Per-call us = (median long - median short) / (L_LONG - L_SHORT); split halves as a noise figure.
+x), L_LONG 24 / L_SHORT 4. Each dispatch records every TensorCore's completion time (polling its output shards' readiness)
+and the wall time. Per TensorCore: per-call us = (median long - median short) / (L_LONG - L_SHORT). The figure of record per
+case is the MAX over TensorCores (the served step waits for the slowest rank); the median over TensorCores and the wall-time
+figure are descriptive; split halves (max over TensorCores of each half) as a noise figure (DECODE-L3b ruling 2026-11-19).
 Order per row: base (A, R reps), then A / W / WU interleaved with a rotating order (R rounds), then base2 (A, R reps).
 Health (before timing, every row): one short-chain call per arm from the same pool: pool bytes and output bits of W and WU
 equal A's (computed on device). Pred witness: `pool.uniform_window_pred` on the row's metadata (True on uniform rows, False on
@@ -130,6 +135,22 @@ def halves(long_s, short_s, l_long=L_LONG, l_short=L_SHORT):
     return [per_call_us(long_s[:h], short_s[:hs], l_long, l_short), per_call_us(long_s[h:], short_s[hs:], l_long, l_short)]
 
 
+def combine_tc(long_tc, short_tc, l_long=L_LONG, l_short=L_SHORT):
+    """Per-TensorCore per-call us from per-rep, per-device completion times (seconds after the dispatch):
+    -> (max over TensorCores = the figure of record, since the served step waits for the slowest rank; median over
+    TensorCores, descriptive; the per-TensorCore list). None when a device has no samples."""
+    if not long_tc or not short_tc:
+        return None, None, None
+    n = len(long_tc[0])
+    per = []
+    for i in range(n):
+        v = per_call_us([r[i] for r in long_tc], [r[i] for r in short_tc], l_long, l_short)
+        if v is None:
+            return None, None, None
+        per.append(v)
+    return max(per), statistics.median(per), per
+
+
 def rotation(rnd: int, arms=ARMS):
     k = rnd % len(arms)
     return arms[k:] + arms[:k]
@@ -170,6 +191,11 @@ def _checks(verbose=True) -> int:
     chk("per_call_us empty", g["per_call_us"]([], [1.0]) is None)
     hv = g["halves"]([2.4e-3, 2.4e-3, 4.4e-3, 4.4e-3], [0.4e-3] * 4, 24, 4)
     chk("halves", hv is not None and [round(x, 6) for x in hv] == [100.0, 200.0])
+    mx, md, per = g["combine_tc"]([[2.4e-3, 4.4e-3], [2.4e-3, 4.4e-3], [2.4e-3, 4.4e-3]],
+                                  [[0.4e-3, 0.4e-3]] * 3, 24, 4)
+    chk("combine_tc max / median", per is not None and [round(x, 6) for x in per] == [100.0, 200.0]
+        and round(mx, 6) == 200.0 and round(md, 6) == 150.0)
+    chk("combine_tc empty", g["combine_tc"]([], [[1.0]]) == (None, None, None))
     chk("rotation", [g["rotation"](i) for i in range(4)] == [("A", "W", "WU"), ("W", "WU", "A"), ("WU", "A", "W"),
                                                              ("A", "W", "WU")])
     eg = g["engaged"]
@@ -198,6 +224,9 @@ _MUTANTS = {
     "nonuniform row is uniform": ("metadata", lambda T, count, uniform: [WINDOW] * min(T // WINDOW, count)
                                   + [0] * (count - min(T // WINDOW, count))),
     "halves swapped": ("halves", lambda l, s, a=L_LONG, b=L_SHORT: None),
+    "figure of record is the median over TensorCores": ("combine_tc", lambda lt, st, a=L_LONG, b=L_SHORT:
+        (lambda per: (statistics.median(per), statistics.median(per), per) if per else (None, None, None))(
+            [per_call_us([r[i] for r in lt], [r[i] for r in st], a, b) for i in range(len(lt[0]))] if lt and st else [])),
 }
 
 
@@ -457,16 +486,27 @@ def run(args) -> int:
             del res
             # timing
             state = {arm: pool0() for arm in ARMS}
-            samples = {c: {"long": [], "short": []} for c in CASES}
+            samples = {c: {"long": [], "short": [], "long_tc": [], "short_tc": []} for c in CASES}
 
             def timed(arm, case):
+                """One dispatch per chain length: the wall time (until every TensorCore is done) and each TensorCore's
+                completion time, read by polling its output shards' readiness."""
                 for length, tag in ((l_long, "long"), (l_short, "short")):
                     a_in = list(args_d)
                     a_in[2] = state[arm]
                     t0 = time.perf_counter()
                     p_out, x_out = compiled[(arm, length)](*a_in)
+                    ps = sorted(p_out.addressable_shards, key=lambda s: s.device.id)
+                    xs = sorted(x_out.addressable_shards, key=lambda s: s.device.id)
+                    done = [None] * len(ps)
+                    while any(d is None for d in done):
+                        for i in range(len(ps)):
+                            if done[i] is None and ps[i].data.is_ready() and xs[i].data.is_ready():
+                                done[i] = time.perf_counter() - t0
+                        time.sleep(0)  # yield the GIL (the CPU interpreter's kernel callbacks need it; ~1 us on TPU)
                     jax.block_until_ready((p_out, x_out))
                     samples[case][tag].append(time.perf_counter() - t0)
+                    samples[case][tag + "_tc"].append(done)
                     state[arm] = p_out
 
             for arm in ARMS:  # warm-up
@@ -484,10 +524,20 @@ def run(args) -> int:
                     timed(arm, arm)
             for _ in range(reps):
                 timed("A", "base2")
-            out["cases"][key] = {c: {"us_per_call": per_call_us(samples[c]["long"], samples[c]["short"], l_long, l_short),
-                                     "halves": halves(samples[c]["long"], samples[c]["short"], l_long, l_short),
-                                     "long_s": samples[c]["long"], "short_s": samples[c]["short"]} for c in CASES}
-            print("RPLE timing " + key + " " + json.dumps({c: out["cases"][key][c]["us_per_call"] for c in CASES}), flush=True)
+            cases = {}
+            for c in CASES:
+                lt, st = samples[c]["long_tc"], samples[c]["short_tc"]
+                mx, md, per = combine_tc(lt, st, l_long, l_short)
+                h = len(lt) // 2
+                halves_tc = ([combine_tc(lt[:h], st[:h], l_long, l_short)[0], combine_tc(lt[h:], st[h:], l_long, l_short)[0]]
+                             if h >= 1 else None)
+                cases[c] = {"us_per_call": mx, "us_per_call_median_tc": md, "us_per_tc": per, "halves": halves_tc,
+                            "us_per_call_wall": per_call_us(samples[c]["long"], samples[c]["short"], l_long, l_short),
+                            "long_s": samples[c]["long"], "short_s": samples[c]["short"],
+                            "long_tc_s": lt, "short_tc_s": st}
+            out["cases"][key] = cases
+            print("RPLE timing " + key + " max-over-TC " + json.dumps({c: cases[c]["us_per_call"] for c in CASES})
+                  + " median-TC " + json.dumps({c: cases[c]["us_per_call_median_tc"] for c in CASES}), flush=True)
             del state, compiled
         except Exception as e:  # noqa: BLE001  (one row failing must not lose the other rows; the reader VOIDs it)
             out["errors"].append(f"{key} run: {type(e).__name__}: {str(e)[:800]}")

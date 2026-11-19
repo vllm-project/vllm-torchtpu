@@ -4,8 +4,12 @@ PRE-STATED rules of the R-form PLE car (layers W and U of scratch/decl3b/rple_de
 q38_decl3/injmxu_read.py (credit DECODE-L3, DECODE-L3-INJMXU(-2)).
 
   Per-call us per case from the bench: base / base2 = arm A (RM4096's PLE flags) alone before and after; A / W / WU interleaved
-  (W = A + VLLM_TPU_PLE_WRDEFER=4; WU = W + VLLM_TPU_PLE_UNIFORM_COND=1). Rows 128 / 160 / 192 / 256 (uniform k3 windows,
-  count 40 / 40 / 48 / 64) and the non-uniform row 160nu (one request of 1 token; pred False, the cond's stock branch).
+  (W = A + VLLM_TPU_PLE_WRDEFER=4; WU = W + VLLM_TPU_PLE_UNIFORM_COND=1). The figure of record per case is the MAX over the 8
+  TensorCores of each TensorCore's per-call us (the served step waits for the slowest rank); the median over TensorCores is
+  descriptive (DECODE-L3b ruling 2026-11-19). Rows 128 / 160 at count 40 = RM4096's geometry (B2's served cap of 40 slots and
+  160 tokens); 192 / 48 and 256 / 64 = T90m-style geometry, not RM4096 (on RM4096 those buckets take the request path, where U
+  falls back statically): DESCRIPTIVE for WU; the non-uniform row 160nu (one request of 1 token; pred False, the cond's stock
+  branch).
   VOID rows (any one -> VERDICT VOID):
     PLAN        rows, counts, arms, cases, chain 24 / 4 or the non-uniform row differ from the plan
     COMPILE     any (row, arm) not compiled, or any planned timing case missing (base, A, W, WU, base2 at every row + 160nu)
@@ -14,9 +18,11 @@ q38_decl3/injmxu_read.py (credit DECODE-L3, DECODE-L3-INJMXU(-2)).
     PRED        pred not True at a uniform row, or not False at 160nu
     SPREAD      at any row, |base - base2| / min(base, base2) > 5 %
     BARRIER     the bench's final libtpu string does not carry exactly one --xla_tpu_use_enhanced_launch_barrier=false
-  KEEP W   iff W - A <= -50 us per call at 160, and W - A <= |base - base2| at 128, 192 and 256.
-  KEEP WU  iff WU - A <= -100 us per call at 160 AND 192, WU - A <= |base - base2| at 128 and 256, and at 160nu
-           WU - W <= |base - base2| (the cond's stock branch costs what W costs, within the row's spread).
+  KEEP W   iff W - A <= -50 us per call at 160, and W - A <= |base - base2| at 128, 192 and 256 (the writer runs on every
+           path, so its no-harm rows gate at every row).
+  KEEP WU  iff WU - A <= -100 us per call at 128 AND 160 (count 40), and at 160nu WU - W <= |base - base2| (with pred False WU
+           runs the stock branch plus W's writer, so the cond's cost shows as WU - W). WU - A at 192 / 256 and at 160nu is
+           descriptive only.
   Verdicts: 'VERDICT KEEP W+WU' / 'VERDICT KEEP W' / 'VERDICT KEEP WU (W bar missed)' / 'VERDICT NOT-KEEP' /
   'VERDICT VOID (<rows>)'. Descriptive only: every delta, the split halves, and the deltas against the prediction (I).
 Exit 0 for any KEEP / NOT-KEEP (a valid read), 1 for VERDICT VOID, 2 when there is no JSON.
@@ -39,9 +45,10 @@ W_KEEP_US = -50.0
 W_KEEP_ROWS = (160,)
 W_GUARD_ROWS = (128, 192, 256)
 WU_KEEP_US = -100.0
-WU_KEEP_ROWS = (160, 192)
-WU_GUARD_ROWS = (128, 256)
-PRED_US = {"W": {128: -69, 160: -87, 192: -105, 256: -140}, "WU": {160: (-227, -367)}}  # I, rple_design_v1 sections 2-3
+WU_KEEP_ROWS = (128, 160)
+WU_GUARD_ROWS = ()
+WU_DESCRIPTIVE_ROWS = (192, 256)
+PRED_US = {"W": {128: -69, 160: -87, 192: -105, 256: -140}, "WU": {160: (-227, -367)}}  # I, bench us per call, design 2-3
 LB = "--xla_tpu_use_enhanced_launch_barrier"
 KEYS = [str(r) for r in PLAN_ROWS] + [NU]
 
@@ -152,6 +159,11 @@ def verdict(d) -> tuple:
     return "VERDICT NOT-KEEP", 0
 
 
+def med(d, key, case):
+    v = (((d.get("cases") or {}).get(key) or {}).get(case) or {}).get("us_per_call_median_tc")
+    return float(v) if isinstance(v, (int, float)) else None
+
+
 def describe(d) -> list:
     out = []
     for k in KEYS:
@@ -161,8 +173,12 @@ def describe(d) -> list:
             continue
         r = int(k[:3])
         pw = PRED_US["W"].get(r) if k != NU else None
-        out.append(f"ROW {k}: base {b:.1f} A {a:.1f} W {w:.1f} WU {wu:.1f} base2 {b2:.1f} us/call; W-A {w - a:+.1f} "
+        tag = (" [T90m-style geometry, not RM4096; WU descriptive]" if r in WU_DESCRIPTIVE_ROWS and k != NU
+               else " [non-uniform: WU - W gates, WU - A descriptive]" if k == NU else " [RM4096 geometry]")
+        mdn = {c: med(d, k, c) for c in ("A", "W", "WU")}
+        out.append(f"ROW {k}{tag}: max-over-TC base {b:.1f} A {a:.1f} W {w:.1f} WU {wu:.1f} base2 {b2:.1f} us/call; W-A {w - a:+.1f} "
                    f"WU-A {wu - a:+.1f} WU-W {wu - w:+.1f} |base-base2| {abs(b - b2):.1f}"
+                   + (f"; median-over-TC A {mdn['A']:.1f} W {mdn['W']:.1f} WU {mdn['WU']:.1f}" if None not in mdn.values() else "")
                    + (f"; prediction (I) W-A {pw}" if pw is not None else "")
                    + (f", WU-A {PRED_US['WU'][r]}" if k == '160' else ""))
     return out
@@ -200,8 +216,11 @@ def _scenarios():
     d["cases"]["256"]["W"]["us_per_call"] = d["cases"]["256"]["A"]["us_per_call"] + 10.0  # W slower at a guard row
     s["W guard row"] = (d, "VERDICT KEEP WU (W bar missed)")
     d = _synthetic()
-    d["cases"]["192"]["WU"]["us_per_call"] = d["cases"]["192"]["A"]["us_per_call"] - 60.0  # WU bar missed at 192
-    s["WU bar at 192"] = (d, "VERDICT KEEP W")
+    d["cases"]["128"]["WU"]["us_per_call"] = d["cases"]["128"]["A"]["us_per_call"] - 60.0  # WU bar missed at 128
+    s["WU bar at 128"] = (d, "VERDICT KEEP W")
+    d = _synthetic()
+    d["cases"]["192"]["WU"]["us_per_call"] = d["cases"]["192"]["A"]["us_per_call"] + 50.0  # WU slower at a descriptive row
+    s["WU descriptive row 192"] = (d, "VERDICT KEEP W+WU")
     for name, mut in (("missing case", lambda x: x["cases"]["192"].pop("base2")),
                       ("not compiled", lambda x: x["engagement"]["128"]["WU"].update(compiled=False)),
                       ("not engaged", lambda x: x["engagement"][NU]["WU"].update(engaged=False)),
@@ -231,6 +250,7 @@ def selftest(mutants: bool) -> int:
         muts = {
             "W bar -30 us": ("W_KEEP_US", -30.0), "WU bar -50 us": ("WU_KEEP_US", -50.0),
             "WU keep rows 160 only": ("WU_KEEP_ROWS", (160,)), "no W guard rows": ("W_GUARD_ROWS", ()),
+            "WU gates at 192": ("WU_KEEP_ROWS", (128, 160, 192)),
             "spread 50 %": ("SPREAD_MAX", 0.5), "chain unchecked": ("PLAN_CHAIN", (8, 4)),
             "nu row ignored": ("keep_wu", lambda d: all(us(d, str(r), "WU") - us(d, str(r), "A") <= WU_KEEP_US
                                                         for r in WU_KEEP_ROWS)),
