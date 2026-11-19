@@ -246,6 +246,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     VLLM_TPU_PREFILL_SPACING_FRAC: float = 0.5
     VLLM_TPU_PREFILL_SPACING_MIN_TOKENS: int = 8192
+    VLLM_TPU_PREFILL_SPACING_DP_ALIGN: bool = False
     VLLM_TPU_PREFILL_TPOT_TARGET_MS: float = 0.0
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
@@ -1560,6 +1561,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_PREFILL_SPACING_MIN_TOKENS": env_nonnegative_int(
         "VLLM_TPU_PREFILL_SPACING_MIN_TOKENS", 8192
     ),
+    # PrefillSpacingScheduler under data parallelism: space prefill by vLLM's
+    # DP-synchronized cadence (--prefill-schedule-interval, the same step
+    # counter on every DP engine) instead of each engine's own decode-only debt
+    # and TPOT hold. An engine's long chunk stalls every engine's step (the EP
+    # MoE exchange syncs them each layer), so unaligned per-engine spacing makes
+    # each engine also wait out the other's chunks. Off: unchanged.
+    "VLLM_TPU_PREFILL_SPACING_DP_ALIGN": env_bool("VLLM_TPU_PREFILL_SPACING_DP_ALIGN"),
     # PrefillSpacingScheduler: TPOT target in ms. Prefill is deferred while a
     # long-chunk step would push a decoding request that can still meet it past
     # it (TPOT projected from max_tokens: only acts when clients set max_tokens

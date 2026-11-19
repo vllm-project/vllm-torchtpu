@@ -88,6 +88,19 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self.max_starved_steps = envs.VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS
         self.tpot_target_s = envs.VLLM_TPU_PREFILL_TPOT_TARGET_MS / 1e3
         self.max_hold_s = envs.VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S
+        vllm_config = getattr(self, "vllm_config", None)
+        self.dp_align = bool(
+            envs.VLLM_TPU_PREFILL_SPACING_DP_ALIGN
+            and vllm_config is not None
+            and vllm_config.parallel_config.data_parallel_size > 1
+        )
+        if self.dp_align:
+            logger.info(
+                "PrefillSpacingScheduler DP align (VLLM_TPU_PREFILL_SPACING_DP_ALIGN=1): "
+                "prefill only on DP-synchronized steps of --prefill-schedule-interval=%d; "
+                "per-engine debt and TPOT hold off.",
+                vllm_config.scheduler_config.prefill_schedule_interval,
+            )
         # Decoding request id -> when it was first scheduled to decode, and
         # its output tokens at the previous step (TPOT projection).
         self._decode_t0: dict[str, float] = {}
@@ -167,6 +180,10 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         spacing = self.spacing_frac > 0 and decoding and self._debt_s > 0
         if self.tpot_target_s > 0:
             spacing = self._hold_for_tpot(decoders, queue) or spacing
+        if self.dp_align:
+            # Every DP engine sees the same throttle on the same step, so all of
+            # them prefill (running chunks included) or none does.
+            spacing = throttle_prefills
         defer = throttle_prefills or spacing
         prefilling = [r for r in self.running if r.is_prefill_chunk]
         self._reserve = {} if defer else self._plan_reserve(prefilling)
