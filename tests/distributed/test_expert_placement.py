@@ -178,8 +178,12 @@ def test_physical_ids_map_selected_experts_through_the_slots():
     )
 
 
-def _check_annotated(name, fn, **_kw):
-    """torch_tpu's jax_op reads every operand's type from fn's annotations."""
+_HANDED: dict = {}
+
+
+def _check_annotated(name, fn, **kw):
+    """torch_tpu's jax_op reads every operand's type from fn's annotations;
+    no op on these paths donates or aliases an operand."""
     import functools
     import inspect
     from unittest.mock import MagicMock
@@ -188,24 +192,34 @@ def _check_annotated(name, fn, **_kw):
     params = inspect.signature(fn).parameters.values()
     missing = [p.name for p in params if p.annotation is inspect.Parameter.empty]
     assert not missing, (name, missing)
+    assert not kw.get("donate_argnums"), (name, kw)
+    _HANDED[name] = fn
     return MagicMock()
 
 
-def test_ops_handed_to_jax_op_are_fully_annotated(monkeypatch):
-    import jax
+def _adapters(monkeypatch):
     import vllm.envs
-    from jax.sharding import Mesh
 
     # moe_routing resolves its simulation strategy at import.
     monkeypatch.setattr(vllm.envs, "VLLM_MOE_ROUTING_SIMULATION_STRATEGY", "", False)
     from vllm_torchtpu.layers.adapter import fused_moe_ep, moe_prefill_sp, moe_tp_decode
 
+    return fused_moe_ep, moe_prefill_sp, moe_tp_decode
+
+
+def test_ops_handed_to_jax_op_are_annotated_and_alias_nothing(monkeypatch):
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh
+
+    fused_moe_ep, moe_prefill_sp, moe_tp_decode = _adapters(monkeypatch)
     monkeypatch.setattr(moe_prefill_sp, "jax_op", _check_annotated)
     monkeypatch.setattr(fused_moe_ep, "jax_op", _check_annotated)
     monkeypatch.setattr(moe_tp_decode.pallas, "jax_op", _check_annotated)
     monkeypatch.setattr(moe_prefill_sp, "_LOAD_OPS", {})
     monkeypatch.setattr(fused_moe_ep, "_OPS", {})
     monkeypatch.setattr(moe_tp_decode, "_OPS", {})
+    _HANDED.clear()
     moe_prefill_sp._build_load_op(8)
     mesh = Mesh(np.asarray(jax.devices()[:1]), ("d",))
     fused_moe_ep._build_op(
@@ -221,3 +235,36 @@ def test_ops_handed_to_jax_op_are_fully_annotated(monkeypatch):
         placed=True,
     )
     moe_tp_decode._get_op(mesh, statics)
+    assert len(_HANDED) == 3, sorted(_HANDED)
+    # The counter's program: no donated operand, no input/output alias.
+    (count,) = (f for n, f in _HANDED.items() if "load_counts" in n)
+    avals = (
+        jax.ShapeDtypeStruct((E,), jnp.int32),
+        jax.ShapeDtypeStruct((64, E), jnp.float32),
+        jax.ShapeDtypeStruct((E,), jnp.float32),
+        jax.ShapeDtypeStruct((64,), jnp.bool_),
+    )
+    lowered = jax.jit(count).lower(*avals)
+    assert "aliasing_output" not in lowered.as_text()
+    assert "buffer_donor" not in lowered.as_text()
+    assert "input_output_alias" not in lowered.compile().as_text()
+
+
+def test_load_counts_accumulate_into_the_buffer(monkeypatch):
+    # The op is functional (a new tensor, nothing donated); the buffer takes
+    # its value with copy_, so the update stays inside each traced graph.
+    _, moe_prefill_sp, _ = _adapters(monkeypatch)
+    mlp = torch.nn.Module()
+    mlp.register_buffer(moe_prefill_sp.LOAD_ATTR, torch.arange(E, dtype=torch.int32))
+    buf = getattr(mlp, moe_prefill_sp.LOAD_ATTR)
+    returned = []
+
+    def op(counts, *_args):
+        returned.append(counts + 1)
+        return returned[-1]
+
+    setattr(mlp, moe_prefill_sp.LOAD_OP, op)
+    moe_prefill_sp.accumulate_load(mlp, None, None, None)
+    assert getattr(mlp, moe_prefill_sp.LOAD_ATTR) is buf
+    assert returned[0] is not buf
+    assert torch.equal(buf, torch.arange(E, dtype=torch.int32) + 1)

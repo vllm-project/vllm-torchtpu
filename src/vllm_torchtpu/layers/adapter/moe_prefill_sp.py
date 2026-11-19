@@ -111,7 +111,9 @@ OP_ATTR = "_tpu_sp_moe_op"
 SCALE_ATTR = "_tpu_sp_routed_scale"
 # With --additional-config '{"moe_expert_load_stats": true}', on an armed
 # decoder layer's mlp: int32 [E] routed rows per expert over this rank's own
-# rows of every step the split served (padding excluded), and its op.
+# rows of every step the split served (padding excluded), and its op. A
+# buffer updated with copy_: a functionalized input mutation travels with
+# each bucket's executable, which a rebound attribute would not.
 LOAD_STATS_KEY = "moe_expert_load_stats"
 LOAD_ATTR = "_tpu_sp_expert_load"
 LOAD_OP = "_tpu_sp_expert_load_op"
@@ -401,9 +403,7 @@ def _moe(mlp: Any, x: torch.Tensor, num_tokens: int, tp: int) -> torch.Tensor:
             rank,
             tp,
         )
-        counts = getattr(mlp, LOAD_ATTR)
-        bias = experts.e_score_correction_bias
-        counts.copy_(getattr(mlp, LOAD_OP)(counts, router_logits, bias, valid))
+        accumulate_load(mlp, router_logits, experts.e_score_correction_bias, valid)
     if envs.TPU_MOE_SKIP_PADDED_TOKENS and token_padding._padding_state is not None:
         pad_mask = own_rows(
             token_padding._padding_state.local_padding_mask.narrow(0, 0, num_tokens),
@@ -574,8 +574,8 @@ _LOAD_OPS: dict[int, Any] = {}
 
 
 def _build_load_op(topk: int) -> Any:
-    """The expert-load counter (built at load, outside Dynamo). Its counts
-    operand is donated and written back with copy_: an in-place update."""
+    """The expert-load counter (built at load, outside Dynamo): a functional
+    op, counts in and new counts out, with no donation or aliasing."""
     if topk not in _LOAD_OPS:
         # jax_op reads the operand types from these annotations.
         def count(
@@ -583,9 +583,7 @@ def _build_load_op(topk: int) -> Any:
         ) -> jax.Array:
             return router_ops.expert_load_counts(counts, logits, bias, valid, topk=topk)
 
-        op = jax_op(
-            f"pallas::moe_expert_load_counts_k{topk}", count, donate_argnums=(0,)
-        )
+        op = jax_op(f"pallas::moe_expert_load_counts_k{topk}", count)
         op.register_fake(lambda counts, *_args, **_kw: torch.empty_like(counts))
         _LOAD_OPS[topk] = op
     return _LOAD_OPS[topk]
@@ -606,6 +604,15 @@ def _arm_load_stats(mlp: Any, experts: Any, topk: int) -> None:
     )
     mlp.register_buffer(LOAD_ATTR, counts, persistent=False)
     setattr(mlp, LOAD_OP, _build_load_op(topk))
+
+
+def accumulate_load(
+    mlp: Any, router_logits: torch.Tensor, bias: torch.Tensor, valid: torch.Tensor
+) -> None:
+    """One step's routed rows added to the layer's counts: the op returns a new
+    tensor (nothing donated) and the buffer takes it with copy_."""
+    counts = getattr(mlp, LOAD_ATTR)
+    counts.copy_(getattr(mlp, LOAD_OP)(counts, router_logits, bias, valid))
 
 
 def dump_expert_load(model: torch.nn.Module, stats_path: str, table_path: str) -> dict:
