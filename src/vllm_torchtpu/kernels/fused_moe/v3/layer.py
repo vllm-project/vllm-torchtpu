@@ -279,6 +279,27 @@ def check_tested(form, *, no_gate, has_bias, config):
         )
 
 
+def check_tested_routing(*, caller_routing, raw_weights, replicas):
+    """Raises NotImplementedError for a caller's routing, the router's raw
+    weights (renormalize=False) or a mesh with replica axes: no TPU reference
+    case covers any of them (see check_tested). The router's own renormalized
+    top-k on a mesh whose only axis is layout.MESH_AXIS is what the TPU test
+    runs."""
+    untested = []
+    if caller_routing:
+        untested.append("a caller's routing (routing=)")
+    if raw_weights:
+        untested.append("the router's raw weights (renormalize=False)")
+    if replicas != 1:
+        untested.append(f"a mesh with {replicas} replicas of the experts")
+    if untested:
+        raise NotImplementedError(
+            f"fused EP MoE v3: {', '.join(untested)} has no TPU test against "
+            "the reference yet. TODO: add the case to test_fused_ep_moe_v3.py "
+            "and lift the refusal in check_tested_routing"
+        )
+
+
 def pallas_pair_multiple(
     blocks_per_step=tables_kernel.BLOCKS_PER_STEP,
     gather_block_rows=GATHER_BLOCK_ROWS_DEFAULT,
@@ -696,6 +717,7 @@ def fused_ep_moe(
         float32. None when `routing` is given.
       routing: the caller's routing instead of the kernel's top-k:
         (indices [tokens, top_k] int32, weights [tokens, top_k] float).
+        Refused until a TPU reference case covers it (check_tested_routing).
         For routers the select kernel does not compute (sigmoid scoring,
         an expert bias, group-limited top-k): the serving stack selects
         and weights, the kernel moves rows and sums. An index outside
@@ -710,7 +732,8 @@ def fused_ep_moe(
       mesh: the mesh. The experts are split over its axis named
         layout.MESH_AXIS; every other axis holds a replica of them (data
         parallelism over the rest of the machine), and the token rows
-        split over all of them.
+        split over all of them. More than one replica is refused until a
+        TPU reference case covers it (check_tested_routing).
       tile_rows: rows per FFN tile, a multiple of 8.
       routing_block: pairs per routing block. Derived when None.
       routed_rows_per_shard: routed rows per shard. The no-drop bound
@@ -800,6 +823,11 @@ def fused_ep_moe(
             f"{tokens} tokens do not split over the mesh's "
             f"{num_shards * replicas} cores"
         )
+    check_tested_routing(
+        caller_routing=routing is not None,
+        raw_weights=routing is None and not renormalize,
+        replicas=replicas,
+    )
     if experts_per_shard is None:
         experts_per_shard = num_experts // num_shards
     elif num_experts < num_shards * experts_per_shard:
