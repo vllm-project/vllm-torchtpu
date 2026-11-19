@@ -86,11 +86,10 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
-    Patch(
-        "vllm_torchtpu:_patch_vllm_merge_dsv41_swa_groups",
-        _ENGINE,
-        refresh="vllm_torchtpu:_patch_vllm_merge_dsv41_swa_groups",
-    ),
+    # TODO(https://github.com/vllm-project/vllm/pull/67171): Remove this patch
+    # once the pinned vLLM rounds the packed state-group cap.
+    Patch("vllm_torchtpu:_patch_vllm_packed_state_group_anchor", _ENGINE),
+    Patch("vllm_torchtpu:_patch_vllm_dsv41_page_order", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),

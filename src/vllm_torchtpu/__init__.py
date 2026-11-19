@@ -1647,42 +1647,119 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     )
 
 
-def _patch_vllm_merge_dsv41_swa_groups() -> None:
-    """Give identical DeepSeek-V4.1 SWA layers one KV cache group.
+def _order_pages_by_size(groups: list) -> list:
+    """Place each group's pages largest first inside a block-outer block.
 
-    Upstream grouping assumes every group draws from one shared page pool and
-    so leaves each SWA layer in its own group. The scheduler then walks every
-    SWA manager for every request on every step, although the private pools
-    make those managers issue the same ids. See `swa_cache.merge_swa_groups`.
+    Upstream packs a group's pages in registration order. Main KV and SWA pages
+    are powers of two and the block stride is a multiple of the largest one, so
+    largest-first puts each on a multiple of its own size, as CSA2's whole-page
+    addressing needs. Indexer pages (132-byte records in 4 KiB units) are
+    smaller than every main page, so they come last.
     """
-    import functools
-    import sys
+    import dataclasses
+
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    ordered_groups = []
+    for group in groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            specs = dict(
+                sorted(
+                    spec.kv_cache_specs.items(),
+                    key=lambda item: -item[1].page_size_bytes,
+                )
+            )
+            group = dataclasses.replace(
+                group,
+                layer_names=list(specs),
+                kv_cache_spec=dataclasses.replace(spec, kv_cache_specs=specs),
+            )
+        ordered_groups.append(group)
+    return ordered_groups
+
+
+def _patch_vllm_packed_state_group_anchor() -> None:
+    """Size packed state groups by the stride-aligned block.
+
+    Backport of vllm-project/vllm#67171. Upstream caps sliding-window and other
+    state groups at the block size before `block_stride_alignment` rounds it
+    up, so part of every DeepSeek-V4.1 v2 SWA block stays empty and the SWA
+    layers take extra groups. Rewrites `_get_packed_kv_cache_groups` in place;
+    a no-op once upstream has the fix, and a warning if the source changed
+    without it.
+    """
+    import inspect
+    import textwrap
 
     from vllm.v1.core import kv_cache_utils
 
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
-        merge_swa_groups,
+    original = kv_cache_utils._get_packed_kv_cache_groups
+    if getattr(original, "_tpu_state_group_anchor_patch", False):
+        return
+    source = textwrap.dedent(inspect.getsource(original))
+    needle = "\n    groups = []\n    for spec, page_size_layers, balanced in bucketed:"
+    fix = """
+    anchor_bytes = round_up(
+        anchor_bytes,
+        math.lcm(*(s.block_stride_alignment or 1 for s in kv_cache_spec.values())),
+    )"""
+    if "anchor_bytes = round_up(" in source:
+        return
+    if source.count(needle) != 1:
+        logger.warning_once(
+            "TPU patch for vllm#67171 not applied: _get_packed_kv_cache_groups "
+            "changed without the fix; DeepSeek-V4.1 v2 SWA groups use fewer "
+            "layers and the KV cache holds fewer tokens."
+        )
+        return
+    namespace: dict = {}
+    exec(
+        compile(source.replace(needle, fix + needle), kv_cache_utils.__file__, "exec"),
+        kv_cache_utils.__dict__,
+        namespace,
+    )
+    patched = namespace["_get_packed_kv_cache_groups"]
+    patched._tpu_state_group_anchor_patch = True
+    kv_cache_utils._get_packed_kv_cache_groups = patched
+    logger.info(
+        "Applied TPU patch: packed state groups sized by the stride-aligned block."
     )
 
-    patched = kv_cache_utils.get_kv_cache_configs
-    if not getattr(patched, "_tpu_merge_swa_groups_patch", False):
-        original = patched
 
-        @functools.wraps(original)
-        def patched(vllm_config, kv_cache_specs, available_memory):
-            configs = original(vllm_config, kv_cache_specs, available_memory)
-            return [merge_swa_groups(config) for config in configs]
+def _patch_vllm_dsv41_page_order() -> None:
+    """Order DeepSeek-V4.1 v2 pages largest first within each cache group.
 
-        # pyrefly: ignore[missing-attribute]
-        patched._tpu_merge_swa_groups_patch = True
-        kv_cache_utils.get_kv_cache_configs = patched
-        logger.info("Applied TPU patch: one KV cache group per DeepSeek-V4.1 SWA spec.")
-    # EngineCore imports the function directly and may be imported after the
-    # first application, so rebind it on every refresh.
-    core = sys.modules.get("vllm.v1.engine.core")
-    if core is not None and hasattr(core, "get_kv_cache_configs"):
-        # pyrefly: ignore[missing-attribute]
-        core.get_kv_cache_configs = patched
+    See `_order_pages_by_size`. `get_kv_cache_configs` calls the module
+    attribute, so EngineCore's layout uses the reordered groups as well.
+    """
+    import functools
+
+    from vllm.v1.core import kv_cache_utils
+
+    original = kv_cache_utils.get_kv_cache_groups
+    if getattr(original, "_tpu_dsv41_page_order_patch", False):
+        return
+
+    @functools.wraps(original)
+    def get_kv_cache_groups(vllm_config, kv_cache_spec):
+        groups = original(vllm_config, kv_cache_spec)
+        model_config = getattr(vllm_config, "model_config", None)
+        architectures = (
+            getattr(getattr(model_config, "hf_config", None), "architectures", None)
+            or []
+        )
+        if (
+            "DeepseekV41ForCausalLM" not in architectures
+            or envs.TPU_DEEPSEEK_V41_IMPL != "v2"
+        ):
+            return groups
+        return _order_pages_by_size(groups)
+
+    # pyrefly: ignore[missing-attribute]
+    get_kv_cache_groups._tpu_dsv41_page_order_patch = True
+    kv_cache_utils.get_kv_cache_groups = get_kv_cache_groups
+    logger.info("Applied TPU patch: DeepSeek-V4.1 pages ordered largest first.")
 
 
 def _patch_vllm_vocab_parallel_embedding() -> None:

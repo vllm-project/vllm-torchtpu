@@ -1380,6 +1380,8 @@ def vmem_scratch_arrays(
     rhs_qb=QB4,
     has_w1_bias=False,
     has_w2_bias=False,
+    input_slots=OUT_PARITIES,
+    cache_layout_rows=None,
     pad_scale_rows=False,
 ):
     """The kernel's VMEM scratch buffers, as (name, shape, dtype).
@@ -1398,6 +1400,10 @@ def vmem_scratch_arrays(
     buffer results leave in, and whether the scale tables and the
     activation row scale exist at all.
 
+    `input_slots` controls raw inputs and their row scales independently of
+    `cache_layout_rows`, which adds a full-tile compute-layout buffer. The
+    row chunk bounds conversion temporaries, not that buffer's height.
+
     The staging buffers are three-dimensional on purpose. An eight-bit
     array's second-minor dimension tiles to 32 sublanes, so a flat
     [rows, hidden] buffer could only be sliced at row offsets that are
@@ -1406,6 +1412,12 @@ def vmem_scratch_arrays(
     offset legal. It does that for every element type, which is why a
     sixteen-bit wire takes the same geometry at twice the bytes.
     """
+    if input_slots not in (OUT_PARITIES, 3):
+        raise ValueError("input_slots must be two or three")
+    if cache_layout_rows is not None and (
+        cache_layout_rows <= 0 or capacity % cache_layout_rows
+    ):
+        raise ValueError("cache layout rows must be positive and divide capacity")
     form = weight_form(weight_format)
     lane_blocks = row_lane_blocks(hidden)
     # The tile height IS the capacity, and the out pair is in tile units.
@@ -1453,18 +1465,14 @@ def vmem_scratch_arrays(
         biases.append(("w1b_vm", (g_local, 2 * inter), jnp.float32))
     if has_w2_bias:
         biases.append(("w2b_vm", (g_local, hidden), jnp.float32))
-    # The activation row scale exists only where the rows were quantized.
-    # It rides per tile, so it is sized by the OUT-PARITY count: a tile's
-    # stream is issued into, waited on and read at the parity its results
-    # will be staged in, and never at any other index. nbuf is the depth the
-    # WEIGHT slabs need so a refill and the live readers of the prefetch
-    # distance's worth of earlier experts occupy distinct slots, which is a
-    # different question and a larger answer.
+    # Row scales follow the input DMA slots. Weight nbuf and output parities
+    # are independent: only input3 adds a third raw input/scale slot; only
+    # layout caching adds lhs_compute_vm below.
     act_scale = (
         [
             (
                 "ls_vm",
-                (OUT_PARITIES, act_scale_window_rows(capacity), HIDDEN_LANE_BLOCK),
+                (input_slots, act_scale_window_rows(capacity), HIDDEN_LANE_BLOCK),
                 jnp.float32,
             )
         ]
@@ -1473,10 +1481,10 @@ def vmem_scratch_arrays(
     )
     return [
         # The indirect form keeps each token row as one lane-block row.
-        # Parity-deep for the same reason ls_vm is.
+        # Input-slot-deep for the same reason ls_vm is.
         (
             "lhs_vm",
-            (OUT_PARITIES, capacity, lane_blocks, HIDDEN_LANE_BLOCK),
+            (input_slots, capacity, lane_blocks, HIDDEN_LANE_BLOCK),
             form.act_dtype,
         ),
         *weights,
@@ -1488,6 +1496,11 @@ def vmem_scratch_arrays(
             form.wire_dtype,
         ),
         ("oscl_vm", (OUT_PARITIES, 1, capacity), jnp.float32),
+        *(
+            [("lhs_compute_vm", (tile_m, hidden), form.act_dtype)]
+            if cache_layout_rows is not None
+            else []
+        ),
     ]
 
 
@@ -1568,6 +1581,9 @@ def vmem_estimate_bytes(
     has_w1_bias=False,
     has_w2_bias=False,
     info=None,
+    *,
+    input_slots=OUT_PARITIES,
+    cache_layout_rows=None,
 ):
     """VMEM one built kernel occupies, from the arrays it declares.
 
@@ -1593,6 +1609,8 @@ def vmem_estimate_bytes(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        input_slots=input_slots,
+        cache_layout_rows=cache_layout_rows,
     )
     arrays += vmem_tile_body_arrays(
         capacity, hidden, inter, weight_format=weight_format, rhs_qb=rhs_qb
@@ -1630,6 +1648,8 @@ def fit_weight_slots(
     rhs_qb=QB4,
     has_w1_bias=False,
     has_w2_bias=False,
+    input_slots=OUT_PARITIES,
+    cache_layout_rows=None,
     info=None,
     limit=None,
 ):
@@ -1673,6 +1693,8 @@ def fit_weight_slots(
                 rhs_qb=rhs_qb,
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
+                input_slots=input_slots,
+                cache_layout_rows=cache_layout_rows,
                 info=info,
             ),
             limit,

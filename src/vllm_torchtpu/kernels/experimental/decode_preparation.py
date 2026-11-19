@@ -44,9 +44,8 @@ INDEXER_TOKENS = frozenset({128, 256, 288, 384, 512})
 MHC_TOKENS = frozenset({288})
 CACHE_UNPACK_RECORDS = frozenset({12288, 36864})
 SWA_PACK_TOKENS = frozenset({96, 192, 288})
-# (tokens, requests): both regions build token x request matrices.
-SWA_BATCHES = frozenset({(96, 16), (192, 32), (288, 32), (288, 48)})
-MAIN_RECORD_BATCHES = SWA_BATCHES
+# (tokens, requests): the region builds token x request matrices.
+MAIN_RECORD_BATCHES = frozenset({(96, 16), (192, 32), (288, 32), (288, 48)})
 # The main-record kernel's one-hot gather costs O(T * requests * columns);
 # smaller page tables than the largest measured one are strictly cheaper.
 MAIN_RECORD_MAX_COLUMNS = 772
@@ -224,50 +223,6 @@ def _half_vmem() -> pltpu.CompilerParams:
     )
 
 
-def metadata_matrix(table, starts, positions, minimum):
-    """Keep explicit row/column dimensions through gather and reductions."""
-    tokens, requests = positions.shape[1], table.shape[0]
-    first = jnp.sum(
-        jnp.where(
-            jnp.arange(tokens)[None, :] == jnp.minimum(starts[:, :-1].T, tokens - 1),
-            positions,
-            0,
-        ),
-        axis=1,
-        keepdims=True,
-    )
-    count = (starts[:, 1:] - starts[:, :-1]).T
-    left = jnp.where(count > 0, jnp.maximum(first - 127, 0), 0)
-    right = jnp.where(count > 0, first + count, 0)
-    columns = (tokens + 128 + 63) // 64 + 1
-    logical = left // 64 + jnp.arange(columns)[None, :]
-    hit = (
-        jnp.arange(table.shape[1])[None, None, :]
-        == jnp.minimum(logical, table.shape[1] - 1)[:, :, None]
-    )
-    blocks = jnp.sum(jnp.where(hit, table[:, None, :], 0), axis=2)
-    visible = (count > 0) & (logical < table.shape[1]) & (logical * 64 < right)
-    metadata = jnp.concatenate(
-        (left // 64 * 64, minimum, jnp.where(visible, blocks, 0)), axis=1
-    )
-    index = jnp.arange(tokens)[None, :]
-    request = jnp.minimum(
-        jnp.sum(index >= starts[:, 1:].T, axis=0, keepdims=True), requests - 1
-    )
-    page_hit = (
-        logical[:, :, None]
-        == jnp.minimum(positions // 64, table.shape[1] - 1)[:, None, :]
-    )
-    per_request = jnp.sum(jnp.where(page_hit, blocks[:, :, None], 0), axis=1)
-    current = jnp.sum(
-        jnp.where(jnp.arange(requests)[:, None] == request, per_request, 0),
-        axis=0,
-        keepdims=True,
-    )
-    records = jnp.where(index < starts[:, -1:], current * 64 + positions % 64, -1)
-    return metadata, jnp.concatenate((left, right), axis=1), records
-
-
 def pack_matrix(records, values, *, base, capacity, padded):
     n = values.shape[0]
     local = jnp.where(
@@ -305,15 +260,45 @@ def pack_matrix(records, values, *, base, capacity, padded):
     masks = jnp.where(even, jnp.int32(65535), jnp.int32(0)) | jnp.where(
         odd, jnp.int32(-65536), jnp.int32(0)
     )
+    # Row-major [1, padded]: a [padded, 1] column spends a whole lane tile per
+    # id, and flattening it outside the region is a relayout.
+    pairs = jnp.pad(
+        jnp.where(boundary, pairs, -1), ((0, padded - n), (0, 0)), constant_values=-1
+    ).T
+    masks = jnp.broadcast_to(jnp.pad(masks, ((0, padded - n), (0, 0))), (padded, 128))
+    words = jnp.pad(words, ((0, padded - n), (0, 0)))
+    # Emit the publisher's 128-word rows segment-major: row j * padded + p is
+    # 128-word segment j of pair p. Each segment is a lane-aligned slice, so
+    # the rows leave the region in the layout the SparseCore writer reads; a
+    # pair-major [padded, 512] -> [4 * padded, 128] reshape outside it is a
+    # relayout copy per layer. The writer handles rows independently, and
+    # reads row r's mask at r % padded, so each pair's mask is written once.
     return (
-        jnp.pad(
-            jnp.where(boundary, pairs, -1),
-            ((0, padded - n), (0, 0)),
-            constant_values=-1,
+        jnp.concatenate(
+            [jnp.where(pairs >= 0, pairs * 4 + j, -1) for j in range(4)], axis=1
         ),
-        jnp.broadcast_to(jnp.pad(masks, ((0, padded - n), (0, 0))), (padded, 512)),
-        jnp.pad(words, ((0, padded - n), (0, 0))),
+        masks,
+        jnp.concatenate([words[:, 128 * j : 128 * (j + 1)] for j in range(4)], axis=0),
     )
+
+
+def swa_word_pool_pack(records, values, *, capacity, padded, interpret=False):
+    """Sort and pair SWA records for the word-pool publisher in one TC region.
+
+    Returns 128-word physical row ids (four per token pair, -1 when skipped)
+    and the packed words, padded to ``4 * padded`` rows, plus one BF16-half
+    mask row per pair (``padded`` rows; row r's mask is ``masks[r % padded]``).
+    Rows are segment-major (see `pack_matrix`), not ordered by row id.
+    """
+
+    def body(records, values):
+        return pack_matrix(records, values, base=0, capacity=capacity, padded=padded)
+
+    inputs = (records[None, :], values)
+    physical, masks, words = fuse_function(
+        body, inputs, name="decode_swa_sort_pack", interpret=interpret
+    )(*inputs)
+    return physical.reshape(-1), words, masks
 
 
 def main_records_call(xs, *, page_size):
@@ -400,87 +385,6 @@ def unpack_cache_words(words: jax.Array) -> jax.Array:
         out_shape=jax.ShapeDtypeStruct((2 * chunks, 1, n, width), jnp.bfloat16),
         name="decode_cache_word_unpack",
     )(words).reshape(2 * chunks, n, width)
-
-
-def _swa_capacities(banks):
-    info = pltpu.get_tpu_info().sparse_core
-    assert info is not None
-    lanes_cores = info.num_lanes * info.num_cores * info.num_subcores
-    return tuple(bank.shape[0] * bank.shape[1] for bank in banks), lanes_cores
-
-
-def swa_pack(banks, records, values):
-    capacities, lanes_cores = _swa_capacities(banks)
-    padded = (values.shape[0] + lanes_cores - 1) // lanes_cores * lanes_cores
-
-    def body(records, values):
-        result, base = [], 0
-        for capacity in capacities:
-            result.append(
-                pack_matrix(
-                    records, values, base=base, capacity=capacity, padded=padded
-                )
-            )
-            base += capacity
-        return tuple(result)
-
-    prepared = fuse_function(
-        body, (records[None, :], values), name="decode_swa_sort_pack"
-    )(records[None, :], values)
-    return tuple((p[0].reshape(-1), *p[1:]) for p in prepared)
-
-
-def swa_prepare_publish(banks, table, starts, positions, minimum, values):
-    from vllm_torchtpu.kernels.mla.paged_swa import write_swa_pages
-
-    # Shape dispatch belongs inside the JAX bridge. A Torch-side equality
-    # specializes dimensions that the model explicitly marks dynamic.
-    if not admit(
-        "swa_prepare",
-        tokens=(positions.shape[0], table.shape[0]),
-        buckets=SWA_BATCHES,
-    ):
-        from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import prepare_swa_metadata
-
-        metadata, bounds, records = prepare_swa_metadata(
-            table,
-            starts,
-            positions,
-            minimum,
-            page_size=64,
-            page_stride=64,
-            row_offset=0,
-        )
-        pages = banks if len(banks) == 2 else banks[0]
-        updated = write_swa_pages(pages, records, values)
-        owners = updated if isinstance(updated, tuple) else (updated,)
-        return (*owners, metadata, bounds, records)
-
-    capacities, lanes_cores = _swa_capacities(banks)
-    padded = (values.shape[0] + lanes_cores - 1) // lanes_cores * lanes_cores
-
-    def prepare(table, starts, positions, minimum, values):
-        metadata, bounds, records = metadata_matrix(table, starts, positions, minimum)
-        packed, base = [], 0
-        for capacity in capacities:
-            packed.append(
-                pack_matrix(
-                    records, values, base=base, capacity=capacity, padded=padded
-                )
-            )
-            base += capacity
-        return metadata, bounds, records, tuple(packed)
-
-    inputs = table, starts[None, :], positions[None, :], minimum[:, None], values
-    metadata, bounds, records, packed = fuse_function(
-        prepare, inputs, name="decode_swa_metadata_sort_pack"
-    )(*inputs)
-    records = records.reshape(-1)
-    packed = tuple((p[0].reshape(-1), *p[1:]) for p in packed)
-    pages = banks if len(banks) == 2 else banks[0]
-    updated = write_swa_pages(pages, records, values, prepared=packed)
-    owners = updated if isinstance(updated, tuple) else (updated,)
-    return (*owners, metadata, bounds, records)
 
 
 def compressor_inputs_problem(

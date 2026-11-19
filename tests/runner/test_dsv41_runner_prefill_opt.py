@@ -78,7 +78,9 @@ def _make_dummy_builder(
     runner.max_num_reqs = max_num_reqs
     runner.most_model_len = 1024
     runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
-    runner._block_table_stage_cpu = None
+    runner._unfenced_h2d_sources = []
+    runner._free_h2d_sources = {}
+    runner._registered_h2d_sources = set()
     runner._unified_kv_layout = False
 
     bt = MagicMock()
@@ -237,21 +239,24 @@ def test_builder_build_variants():
 
 
 def test_stage_block_table_uploads_allocation_and_override():
-    """Verify stage_block_table_uploads scratch buffer reuse and override path."""
+    """Each walk uploads from a host buffer it owns until the staging fence.
+
+    TorchTPU reads a non-blocking H2D source after the call returns, so the
+    dummy walk's zeroed table and the next walk's table must not share memory.
+    """
     builder, runner = _make_dummy_builder(max_num_reqs=4, max_num_blocks_per_req=32)
 
-    # position_ids_override is not None: scratch kept zeroed
+    # position_ids_override is not None: the staged buffer stays zeroed
     ctx_dummy = _make_ctx(
         position_ids_override=torch.ones(4, dtype=torch.int32),
         num_reqs=2,
     )
-    runner._block_table_stage_cpu = None
     stage_block_table_uploads(runner, ctx_dummy, 4)
-    assert runner._block_table_stage_cpu is not None
-    assert runner._block_table_stage_cpu.shape[0] == 4 * 32
+    dummy_src = runner._unfenced_h2d_sources[-1][0]
+    assert dummy_src.shape[0] == 4 * 32
+    assert int(dummy_src.abs().sum()) == 0
 
-    # Normal upload path reusing existing scratch
-    scratch_ref = runner._block_table_stage_cpu
+    # Normal upload path: a second, separately owned buffer
     ctx_normal = _make_ctx(
         position_ids_override=None,
         seq_lens_cpu=(32, 16),
@@ -259,7 +264,10 @@ def test_stage_block_table_uploads_allocation_and_override():
         start_index=0,
     )
     stage_block_table_uploads(runner, ctx_normal, 4)
-    assert runner._block_table_stage_cpu is scratch_ref
+    normal_src = runner._unfenced_h2d_sources[-1][0]
+    assert len(runner._unfenced_h2d_sources) == 2
+    assert normal_src.data_ptr() != dummy_src.data_ptr()
+    assert int(dummy_src.abs().sum()) == 0
 
 
 # ==============================================================================

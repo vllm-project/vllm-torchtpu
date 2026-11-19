@@ -62,7 +62,6 @@ from .host_engram import (
     gather_host_engram_hashes,
     install_host_engram_inputs,
 )
-from .indexer_bf16 import initialize_indexer
 from .ops import bind_device_ops, compact_rope_caches, device_hooks
 
 logger = init_logger(__name__)
@@ -1410,7 +1409,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         initialize_mhc_post()
         initialize_flat_collapse()
         initialize_paged_attention()
-        initialize_indexer()
         with (
             device_hooks(
                 upstream,

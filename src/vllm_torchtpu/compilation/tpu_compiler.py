@@ -156,6 +156,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
     # Host-side Dynamic EPLB controller/mover tuning knobs; only
     # TPU_MOE_EPLB_DYNAMIC alters the compiled program.
+    # Mode=off is reflected by the effective DYNAMIC flag above.
+    "TPU_MOE_EPLB_MODE",
     "TPU_MOE_EPLB_WINDOW_STEPS",
     "TPU_MOE_EPLB_MIN_GAIN",
     "TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB",

@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.attention_preprocessing import compress_rope
-from vllm_torchtpu.kernels.deepseek_v41.csa2 import cache
 from vllm_torchtpu.kernels.experimental import decode_preparation as prep
 
 
@@ -73,7 +72,7 @@ def test_admit_off_and_cpu_take_native(tpu, monkeypatch):
 
 
 def test_admit_tuple_buckets(tpu):
-    buckets = prep.SWA_BATCHES
+    buckets = prep.MAIN_RECORD_BATCHES
     assert prep.admit("swa", tokens=(288, 48), buckets=buckets)
     assert not prep.admit("swa", tokens=(288, 16), buckets=buckets)
     assert not prep.admit("swa", tokens=(1024, 48), buckets=buckets)
@@ -90,33 +89,6 @@ def test_tpu_version_problem(tpu, monkeypatch):
     assert prep.tpu_version_problem() is None
     monkeypatch.setattr(prep, "get_tpu_version", lambda: 6)
     assert "v6" in prep.tpu_version_problem()
-
-
-@pytest.mark.parametrize(
-    "tokens,requests,fused",
-    [
-        (96, 16, True),
-        (192, 32, True),
-        (288, 32, True),
-        (288, 48, True),
-        (96, 32, False),
-        (192, 16, False),
-        (288, 16, False),
-        (128, 16, False),
-    ],
-)
-def test_swa_bucket_dispatch(tpu, monkeypatch, tokens, requests, fused):
-    monkeypatch.setattr(cache, "prepare_swa_metadata", stop("fallback"))
-    monkeypatch.setattr(prep, "_swa_capacities", stop("fused"))
-    with pytest.raises(DispatchReached, match="^fused$" if fused else "^fallback$"):
-        prep.swa_prepare_publish(
-            (),
-            jax.ShapeDtypeStruct((requests, 8), jnp.int32),
-            None,
-            jax.ShapeDtypeStruct((tokens,), jnp.int32),
-            None,
-            None,
-        )
 
 
 @pytest.mark.parametrize(
@@ -252,3 +224,48 @@ def test_compressor_addresses_match_reference(tokens, requests, main_columns):
     np.testing.assert_array_equal(out[6], np.where(live & valid, rows, -1))
     live, block, slot = _reference_slots(kv, positions, index, 256, requests)
     np.testing.assert_array_equal(out[7], np.where(live, block * 256 + slot, -1))
+
+
+@pytest.mark.parametrize("tokens", sorted(prep.SWA_PACK_TOKENS))
+@pytest.mark.parametrize("case", ["unique", "pairs", "invalid", "shuffled"])
+def test_swa_word_pool_pack_matches_native(tokens, case):
+    from vllm_torchtpu.kernels.mla import paged_swa
+
+    capacity, padded = 4096, -(-tokens // 256) * 256
+    rng = np.random.default_rng(tokens)
+    records = np.arange(64, 64 + 2 * tokens, 2, dtype=np.int32)
+    if case == "pairs":
+        records = 64 + np.arange(tokens, dtype=np.int32)
+    elif case == "invalid":
+        records[::5] = -1
+        records[1::7] = 3  # null page
+        records[2::11] = capacity
+    elif case == "shuffled":
+        records = 64 + rng.permutation(tokens).astype(np.int32)
+    bits = rng.integers(0, 1 << 16, (tokens, 512), dtype=np.uint16)
+    values = jnp.asarray(bits.view(jnp.bfloat16))
+    records = jnp.asarray(records)
+
+    fused = prep.swa_word_pool_pack(
+        records, values, capacity=capacity, padded=padded, interpret=True
+    )
+    # Fused rows are segment-major (row j * padded + p); native rows are
+    # pair-major (row 4 * p + j). The publisher writes each row independently
+    # and reads row r's mask at r % padded, so expand the shared mask rows.
+    assert fused[2].shape == (padded, 128)
+    fused = (fused[0], fused[1], jnp.tile(fused[2], (4, 1)))
+    fused = tuple(
+        np.asarray(x).reshape(4, padded, -1).swapaxes(0, 1).reshape(4 * padded, -1)
+        for x in fused
+    )
+    ids, words, masks = paged_swa._pack_native(records, values, capacity, 64)
+    pad = 4 * padded - ids.size
+    native = (
+        jnp.pad(ids, (0, pad), constant_values=-1),
+        jnp.pad(words, ((0, pad), (0, 0))),
+        jnp.pad(masks, ((0, pad), (0, 0))),
+    )
+    keep = np.asarray(native[0]) >= 0
+    np.testing.assert_array_equal(fused[0].reshape(-1), np.asarray(native[0]))
+    for got, want in zip(fused[1:], native[1:]):
+        np.testing.assert_array_equal(got[keep], np.asarray(want)[keep])

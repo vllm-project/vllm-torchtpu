@@ -124,6 +124,14 @@ def _make_runner(
     runner._wait_input_staging_fence = types.MethodType(
         TPUModelRunner._wait_input_staging_fence, runner
     )
+    # _dummy_run records one itself (see _fake_tpu_events).
+    runner._unfenced_h2d_sources = []
+    runner._fenced_h2d_sources = []
+    runner._free_h2d_sources = {}
+    runner._registered_h2d_sources = set()
+    runner._record_input_staging_fence = types.MethodType(
+        TPUModelRunner._record_input_staging_fence, runner
+    )
     runner._cached_query_start_loc = None
     runner._cached_logits_indices = None
     runner._cached_request_distribution = None
@@ -393,7 +401,17 @@ def test_prepare_inputs_routes_reordered_verify_per_chunk(bucket, chunk_size, hy
         start = end
 
 
+def _fake_tpu_events(monkeypatch):
+    """Stand in for `torch.tpu.Event` so a CPU test can record the staging fence."""
+    event = SimpleNamespace(record=lambda: None, synchronize=lambda: None)
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=lambda: event), raising=False
+    )
+
+
 def _run_dummy_run(monkeypatch, runner, *, num_tokens=256, dp_lockstep=False):
+    _fake_tpu_events(monkeypatch)
+
     def capture_forward_context(attn_metadata, *_args, **_kwargs):
         runner._captured_dummy_attn_metadata = attn_metadata
         return contextlib.nullcontext()
@@ -699,12 +717,12 @@ def test_dummy_run_partial_layout_decode_like_metadata_routes_to_streaming(monke
     assert ctx.sequence_layout_descriptor.kind is SequenceLayoutKind.PARTIAL
     assert ctx.sequence_layout_descriptor.protocol == "pcp_streaming"
     torch.testing.assert_close(
-        ctx.request_distribution.cpu(), torch.tensor([8, 8, 8], dtype=torch.int32)
+        ctx.request_distribution.cpu(), torch.zeros(3, dtype=torch.int32)
     )
     torch.testing.assert_close(
-        ctx.query_start_loc.cpu(), torch.arange(9, dtype=torch.int32)
+        ctx.query_start_loc.cpu(), torch.zeros(9, dtype=torch.int32)
     )
-    torch.testing.assert_close(ctx.seq_lens.cpu(), torch.ones(8, dtype=torch.int32))
+    torch.testing.assert_close(ctx.seq_lens.cpu(), torch.zeros(8, dtype=torch.int32))
     assert runner.forward_model.call_args.kwargs["input_ids"].shape == (256,)
     torch.testing.assert_close(
         runner.forward_model.call_args.kwargs["positions"][:16].cpu(),
@@ -725,11 +743,10 @@ def test_dummy_run_marks_inactive_request_rows_after_cache_init(monkeypatch):
 
     assert ctx is not None
     torch.testing.assert_close(
-        md.query_start_loc.cpu(),
-        torch.tensor([0, 1, 2, 3, 3, 3, 3, 3, 3], dtype=torch.int32),
+        md.query_start_loc.cpu(), torch.zeros(9, dtype=torch.int32)
     )
     torch.testing.assert_close(
-        md.request_distribution.cpu(), torch.tensor([3, 3, 3], dtype=torch.int32)
+        md.request_distribution.cpu(), torch.zeros(3, dtype=torch.int32)
     )
 
 
@@ -748,11 +765,10 @@ def test_dummy_run_marks_inactive_request_rows_before_cache_init(monkeypatch):
 
     assert ctx is None
     torch.testing.assert_close(
-        md.query_start_loc.cpu(),
-        torch.tensor([0, 1, 2, 3, 3, 3, 3, 3, 3], dtype=torch.int32),
+        md.query_start_loc.cpu(), torch.zeros(9, dtype=torch.int32)
     )
     torch.testing.assert_close(
-        md.request_distribution.cpu(), torch.tensor([3, 3, 3], dtype=torch.int32)
+        md.request_distribution.cpu(), torch.zeros(3, dtype=torch.int32)
     )
     assert md.sequence_layout_kind == SequenceLayoutKind.PARTIAL.value
     assert md.sequence_layout_protocol == "pcp_streaming"

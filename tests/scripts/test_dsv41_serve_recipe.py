@@ -93,7 +93,7 @@ def test_quality_recipe_uses_c384_dspark_decode(model_uri):
         "num_speculative_tokens": 5,
         "model": model_uri or "deepseek-ai/DeepSeek-V4.1-Flash",
     }
-    assert "--block-size=16" in shlex.split(args)
+    assert "--block-size=256" in shlex.split(args)
 
 
 @pytest.mark.parametrize("limit", [None, "none", "384"])

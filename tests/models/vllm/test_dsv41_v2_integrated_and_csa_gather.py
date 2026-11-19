@@ -41,7 +41,6 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_select
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     ROW_WORDS,
-    gather_cache_page_values,
 )
 
 
@@ -413,7 +412,7 @@ class TestIntegratedEvenQuerySplit:
         mock_attn.has_fast_idx_offset = False
         mock_attn.candidate_block_buffer = None
         mock_attn.paged_index_block_buffer = None
-        mock_attn._project_index_q = lambda q, pos: q
+        mock_attn._project_index_q_unquantized = lambda q, pos: q
 
         captured_args = {}
 
@@ -540,26 +539,3 @@ class TestIntegratedAttentionKernelsDecode:
             scores_small, 64, bound=jnp.max(lengths), lengths=None, unordered=False
         )
         assert out_fallback.shape == (3, 64)
-
-
-# ==============================================================================
-# 5. v2/cache.py: gather_cache_page_values Coverage
-# ==============================================================================
-
-
-class TestGatherCachePageValuesFull:
-    """Verifies gather_cache_page_values layout guards, page gathers, and sentinels."""
-
-    def test_gather_cache_page_values_layout_and_math(self):
-        cache = jnp.arange(64 * ROW_WORDS, dtype=jnp.int32).reshape(64, ROW_WORDS)
-        page_records = 16
-        elements = 128
-
-        # Valid call
-        first_records = jnp.array([0, 16, -1], dtype=jnp.int32)
-        out = gather_cache_page_values(cache, first_records, page_records, elements)
-        assert out.shape == (3 * page_records, elements)
-
-        # Invalid row words coverage
-        with pytest.raises(ValueError, match="Pages must cover whole pool word rows"):
-            gather_cache_page_values(cache, first_records, page_records=5, elements=128)
