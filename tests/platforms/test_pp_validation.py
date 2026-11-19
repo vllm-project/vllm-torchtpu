@@ -151,7 +151,8 @@ def test_linear_attention_stages_are_fine_without_kv_transfer():
     validate_pipeline_parallel_config(_config(pp=8, layer_types=HYBRID_24))
 
 
-def test_rejects_tensor_parallel_stages():
+def test_rejects_tensor_parallel_stages_on_world_size_meshes(monkeypatch):
+    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: False)
     with pytest.raises(NotImplementedError, match="tensor-parallel-size 1"):
         validate_pipeline_parallel_config(_config(pp=2, tp=4))
 
@@ -160,6 +161,10 @@ def test_rejects_tensor_parallel_stages():
 def stage_meshes(monkeypatch):
     """A torch_tpu that builds meshes over a stage's process group."""
     monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: True)
+
+
+def test_accepts_tensor_parallel_stages(stage_meshes):
+    validate_pipeline_parallel_config(_config(pp=2, tp=4))
 
 
 def test_accepts_context_parallel_stages(stage_meshes):
