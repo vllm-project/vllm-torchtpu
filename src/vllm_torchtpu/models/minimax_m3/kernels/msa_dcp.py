@@ -867,6 +867,8 @@ def msa_attend_dcp(
     )
     if small and "step_widths" in decode_opt:
         common["step_widths"] = decode_opt["step_widths"]
+    if small and "row_split" in decode_opt:
+        common["row_split"] = decode_opt["row_split"]
     if num_tokens >= _MIN_CANDIDATE_TOKENS:  # prefill-sized steps only
         common["step_widths"] = msa_attention_lse.PREFILL_STEP_WIDTHS
         common["row_split"] = msa_attention_lse.PREFILL_ROW_SPLIT

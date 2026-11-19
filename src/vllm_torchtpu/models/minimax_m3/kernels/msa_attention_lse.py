@@ -402,6 +402,7 @@ def _kernel(
     tiles_per_head: int = 0,
     precision: frozenset = frozenset(),
     pair: bool = False,
+    chunk: int = 0,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -916,6 +917,90 @@ def _kernel(
 
                 pl.when(jnp.logical_not(last))(_carry)
 
+        def attend_chunked(width, single):
+            """`attend` for 4-bit decode tiles (`chunk`, row_split 1), page
+            by page: each page's K / V unpack, scores, mask and p @ v run on
+            its own [rows, S] block, and the max and sum fold the pages'
+            blocks elementwise before one lane reduction, so no [rows, W * S]
+            score or [W * S, 2D] unpacked block is live at once (the whole-
+            group body spills ~400 vregs a 8-page step, AOT). ``chunk == 2``
+            recomputes each page's scores in the second pass instead of
+            keeping them. Same scores, max and p as `attend`; the sum over
+            slots and the p @ v accumulation add per page (f32 rounding)."""
+            slots = jax.lax.broadcasted_iota(jnp.int32, (1, page_size), 1)
+            selected = selected_ref[...]
+            local_page = local_page_ref[...]
+            local_limit = local_limit_ref[...]
+            if fp4_rows == "head":
+                k_row = 2 * group_head(w)
+                v_row = k_row + 1
+            else:
+                k_row, v_row = fp4_rows
+            scale = sm_scale * _LOG2_E
+            rows_n = num_heads * block_q
+            q = q_ref[...].reshape(rows_n, head_dim)
+            pages = [group_page(g) for g in range(width)]
+
+            def page_mask(page):
+                is_selected = jnp.max(
+                    (selected == page).astype(jnp.int32), axis=1, keepdims=True
+                )
+                limit = jnp.where(local_page == page, local_limit, page_size)
+                limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
+                return jnp.concatenate([slots < limit] * num_heads, axis=0)
+
+            def scores(g, q=q):
+                page, kv_ref, scale_ref = pages[g]
+                sk, _ = _fp4_scales(scale_ref, k_row, v_row)
+                k = _fp4_rows(kv_ref)[:, :head_dim]
+                s_g = jax.lax.dot_general(
+                    q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+                )
+                s_g = s_g * (sk * scale)
+                return jnp.where(page_mask(page), s_g, -jnp.inf)
+
+            kept = []
+            mx = None
+            for g in range(width):
+                s_g = scores(g)
+                if chunk != 2:
+                    kept.append(s_g)
+                mx = s_g if mx is None else jnp.maximum(mx, s_g)
+            m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
+            m_new = jnp.maximum(m_prev, jnp.max(mx, axis=1, keepdims=True))
+            lsum = None
+            pv = None
+            # The recomputed scores read q through a select on m_new (always
+            # true: m_new >= _MASK_VALUE): the second pass's dots cannot be
+            # merged with the first's or hoisted above the max.
+            q2 = jnp.where(m_new >= msa_attention._MASK_VALUE, q, jnp.zeros_like(q))
+            for g in range(width):
+                s_g = kept[g] if chunk != 2 else scores(g, q2)
+                _, kv_ref, scale_ref = pages[g]
+                _, sv = _fp4_scales(scale_ref, k_row, v_row)
+                p = jnp.exp2(s_g - m_new)
+                lsum = p if lsum is None else lsum + p
+                v = _fp4_rows(kv_ref)[:, head_dim:]
+                pv_g = jax.lax.dot_general(
+                    (p * sv).astype(v.dtype), v, (((1,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+                pv = pv_g if pv is None else pv + pv_g
+            l_cur = jnp.sum(lsum, axis=1, keepdims=True)
+            if single:
+                finish(m_new, l_cur, pv)
+                return
+            alpha = jnp.exp2(m_prev - m_new)
+            l_new = alpha * l_ref[...] + l_cur
+            acc_new = alpha * acc_ref[...] + pv
+            pl.when(last)(functools.partial(finish, m_new, l_new, acc_new))
+
+            @pl.when(jnp.logical_not(last))
+            def _carry():
+                m_ref[...] = m_new
+                l_ref[...] = l_new
+                acc_ref[...] = acc_new
+
         # Slots past the group's pages hold stale bytes: their limits are 0, so
         # their scores are masked and their value rows zeroed.
         # Run at the narrowest width holding the group's pages (`_STEP_WIDTHS`;
@@ -930,6 +1015,8 @@ def _kernel(
                 if width < pages_per_step:
                     fits = fits & (count <= width)
                 body = attend_t if transposed else attend
+                if chunk and fp4 and not cached and row_split == 1 and not (qk8 or pv8):
+                    body = attend_chunked
                 if bf16_cache:  # the cache in use reads bf16 pages, a streaming call unpacks
                     for from_bf16, when in ((True, use_cache), (False, jnp.logical_not(use_cache))):
                         pl.when(fits & single & when)(
@@ -951,8 +1038,9 @@ def _kernel(
             )
 
         if mode != "full":
+            use_chunked = chunk and fp4 and not cached and row_split == 1 and not (qk8 or pv8)
             return types.SimpleNamespace(
-                attend=attend, count=count, single=first & last,
+                attend=attend_chunked if use_chunked else attend, count=count, single=first & last,
                 run_widths=run_widths, empty=empty,
             )
         run_widths()
@@ -1083,7 +1171,14 @@ def _pair_loop(
             o_ref[:, rows, :] = jnp.concatenate(
                 [outs[0].pop(), outs[1].pop()], axis=1
             ).astype(o_ref.dtype)
-        for k, width in enumerate(widths):
+        pair_max = decode_pair_max()
+        # `pairmax`: pairs up to the narrowest width holding pair_max pages;
+        # a wider pair runs one by one (below).
+        pair_widths = [
+            n for k, n in enumerate(widths)
+            if not pair_max or not k or widths[k - 1] < pair_max
+        ]
+        for k, width in enumerate(pair_widths):
             fits = count > (widths[k - 1] if k else 0)
             if width < pages_per_step:
                 fits = fits & (count <= width)
@@ -1100,6 +1195,14 @@ def _pair_loop(
             ga.empty()
             gb.empty()
             store()
+
+        if len(pair_widths) < len(widths):
+
+            @pl.when(count > pair_widths[-1])
+            def _one_by_one():
+                for g in (w, w + 1):
+                    single = group(g, mode="setup")
+                    single.run_widths()
 
         return carry
 
@@ -1169,6 +1272,7 @@ def _attention_call(
     tiles_per_head=0,
     precision=frozenset(),
     pair=False,
+    chunk=0,
 ):
     """One kernel call over the tiles ``tile_offset + [0, tiles)`` of the
     head-major ``q [G * Hg, T, D]``, ``selected [G, T, K]``, ``local_page``
@@ -1274,7 +1378,10 @@ def _attention_call(
         if bf16_cache
         else ()
     )
-    if row_split < 1 or num_heads % row_split or (num_heads // row_split * block_q) % 128:
+    # Decode tiles (8 rows a head) also split into 64-row parts: their lse
+    # rows are lane slices of one 128-lane row.
+    part_rows = num_heads // max(row_split, 1) * block_q
+    if row_split < 1 or num_heads % row_split or part_rows % (64 if block_q == 8 else 128):
         row_split = 1
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=4,
@@ -1334,6 +1441,7 @@ def _attention_call(
             tiles_per_head=tiles_per_head,
             precision=precision if fp4 else frozenset(),
             pair=pair,
+            chunk=chunk if fp4 and block_q == 8 and not cache_size else 0,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
@@ -1660,11 +1768,40 @@ def decode_opt() -> dict:
             opt["pages_per_step"] = int(val)
         elif key == "pair" and not val:
             opt["pair"] = True
+        elif key == "chunk" and val in ("", "1", "2"):
+            pass  # `decode_chunk`
+        elif key == "pairmax" and val.isdigit():
+            pass  # `decode_pair_max`
+        elif key == "split" and val.isdigit() and int(val) >= 1:
+            opt["row_split"] = int(val)
         else:
             raise ValueError(f"{DECODE_OPT_ENV}: unknown item {item!r} in {spec!r}")
     if opt:
         _proof(DECODE_OPT_ENV, f"MSA decode tiles run {opt}")
     return opt
+
+
+def decode_chunk() -> int:
+    """`TPU_MINIMAX_M3_MSA_DECODE_OPT` ``chunk`` (1) or ``chunk=2`` (2): 4-bit
+    decode tiles run `attend_chunked`; 0 = off."""
+    spec = os.environ.get(DECODE_OPT_ENV, "")
+    for x in spec.replace("+", ",").split(","):
+        key, _, val = x.strip().partition("=")
+        if key == "chunk":
+            return 2 if val == "2" else 1
+    return 0
+
+
+def decode_pair_max() -> int:
+    """`TPU_MINIMAX_M3_MSA_DECODE_OPT` ``pairmax=<n>``: `pair` runs two tiles
+    at once only when both hold at most n pages (one by one otherwise);
+    0 = always."""
+    spec = os.environ.get(DECODE_OPT_ENV, "")
+    for x in spec.replace("+", ",").split(","):
+        key, _, val = x.strip().partition("=")
+        if key == "pairmax" and val.isdigit():
+            return int(val)
+    return 0
 
 
 def decode_pair() -> bool:
@@ -1812,6 +1949,9 @@ def _chunked_call(
     align = _merged_store_rows(block_q, num_q_heads // num_heads, q.dtype)
     tiles_per_step = _tiles_per_step(num_tiles, block_q, align)
     decode = num_chunks == 1 and num_tokens <= _DECODE_MAX_TOKENS and not cache_size
+    if decode and decode_chunk():
+        _proof(DECODE_OPT_ENV, f"MSA decode tiles run page by page (chunk={decode_chunk()})")
+        call = functools.partial(call, chunk=decode_chunk())
     if decode and decode_pair():
         _proof(DECODE_OPT_ENV, "MSA decode tiles run two at a time (pair)")
         call = functools.partial(call, pair=True)
