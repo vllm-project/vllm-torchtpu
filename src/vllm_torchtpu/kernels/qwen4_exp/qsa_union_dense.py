@@ -656,7 +656,14 @@ def _walk_kernel(
     walk_pipe: bool = False,
     pipe_refs=None,
     dot16: bool = False,
+    vguard_none: bool = False,
 ):
+    # vguard_none (q38 UNION-BUILD, gathered walk only): no value guard at all (QA-1's vguard_lean keeps the `written` select).
+    #   Every live union rank's token is below the group's longest length (the union holds only groups some row of the group
+    #   sees), so `written` is true on every rank whose probability can be non-zero; the ranks it can turn off are padding
+    #   ranks past the union, whose probabilities are exactly 0 and whose gathered rows are finite pool rows (word 0 of the
+    #   group's page row). So on a pool whose read rows are finite (QA-1's precondition) the PV dot sees the same products:
+    #   bitwise. A non-finite value in a row the walk reads would reach the PV dot, as under vguard_lean.
     # dot16 (q38 UNION-BUILD, gathered walk only; union_walk_kernel(dot16=True)): both MXU dots take BF16 operands, as qk16 for
     #   QK (queries cast once per block, keys decoded straight to BF16) and for PV the values decoded straight to BF16 and the
     #   probabilities cast to BF16 at the dot. Mosaic's FP32 x FP32 dot here is one BF16 pass with round-to-nearest operands
@@ -1116,7 +1123,9 @@ def _walk_kernel(
             value = value.astype(jnp.bfloat16 if dot16 else jnp.float32)
             if not lean:
                 key = jnp.where(jnp.isfinite(key) & written, key, 0)
-            if vguard_lean:
+            if vguard_none:
+                pass
+            elif vguard_lean:
                 value = jnp.where(written, value, 0)
             else:
                 value = jnp.where(jnp.isfinite(value) & written, value, 0)
@@ -1180,7 +1189,9 @@ def _walk_kernel(
             value = value.astype(jnp.bfloat16 if dot16 else jnp.float32)
             if not lean:
                 key = jnp.where(jnp.isfinite(key) & written, key, 0)
-            if vguard_lean:
+            if vguard_none:
+                pass
+            elif vguard_lean:
                 value = jnp.where(written, value, 0)
             else:
                 value = jnp.where(jnp.isfinite(value) & written, value, 0)
@@ -1692,7 +1703,7 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
                       scan_list=False, line_matmul=False, fast_walk=False, scopes=0, walk_runs=0,
                       qk16=False, gathered=None, listed=None, listed_lines=None, run_tables=None,
                       group_offset=0, lean_gathered=False, mask_view=False, vguard_lean=False, walk_pipe=False,
-                      dot16=False):
+                      dot16=False, vguard_none=False):
     """The walking kernel alone, on a precomputed ``union_bits_plan`` (ungated bf16 output).
 
     ``walk_pipe`` (q38 UNION-BUILD; gathered walk only; see ``_walk_kernel``): the software-pipelined tile loop (stage A of
@@ -1756,6 +1767,8 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
         raise ValueError("mask_view / vguard_lean (QA-1) apply to the gathered walk only")
     if walk_pipe and gathered is None:
         raise ValueError("walk_pipe (the pipelined tile loop) applies to the gathered walk only")
+    if vguard_none and gathered is None:
+        raise ValueError("vguard_none applies to the gathered walk only")
     if dot16 and (gathered is None or math.frexp(query.shape[-1] ** -0.5 * k_scale)[0] != 0.5):
         raise ValueError("dot16 applies to the gathered walk with a power-of-two score scale (exactness)")
     if walk_pipe not in (False, True, 0, 1, 2):
@@ -1860,6 +1873,7 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
             gathered_cap_tiles=cap_tiles, **({"stage_ubits": False} if lean_gathered else {}),
             **({"mask_view": True} if mask_view else {}), **({"vguard_lean": True} if vguard_lean else {}),
             **({"walk_pipe": walk_pipe} if walk_pipe else {}), **({"dot16": True} if dot16 else {}),
+            **({"vguard_none": True} if vguard_none else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
@@ -1910,7 +1924,8 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
         + ("_gathered" if gathered is not None else "") + ("_listed" if listed is not None else "")
         + ("_lines" if listed_lines is not None else "") + ("_runs" if run_tables is not None else "")
         + ("_glean" if lean_gathered else "") + ("_mv" if mask_view else "") + ("_vg" if vguard_lean else "")
-        + ("_pipe" if walk_pipe == 1 else "_pipe2" if walk_pipe == 2 else "") + ("_d16" if dot16 else ""),
+        + ("_pipe" if walk_pipe == 1 else "_pipe2" if walk_pipe == 2 else "") + ("_d16" if dot16 else "")
+        + ("_vn" if vguard_none else ""),
     )(
         tiles,
         usize.astype(jnp.int32),
@@ -2084,10 +2099,11 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                        run_tables=False, max_run=8, lazy_share=False, gathered=None, gather_chunks=4,
                        gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem", sc_bitset=False,
                        in_place=False, sc_bits_plan=False, gathered_lean=False, mask_view=False, vguard_lean=False,
-                       align_gather=False, walk_pipe=False, dot16=False):
+                       align_gather=False, walk_pipe=False, dot16=False, vguard_none=False):
     """D2 union-walk attention for a packed prefill step; ``(gated bf16 output, cache)``.
 
-    q38 UNION-BUILD (default off): ``dot16`` reaches the gathered walk kernel only (BF16 operands for both dots; bitwise per
+    q38 UNION-BUILD (default off): ``vguard_none`` (no value guard; bitwise on finite read rows, QA-1's precondition; see
+    ``_walk_kernel``) and ``dot16`` reach the gathered walk kernel only (BF16 operands for both dots; bitwise per
     the T83m precision probe: Mosaic's f32 dot is one BF16 pass; see ``_walk_kernel``). ``walk_pipe`` reaches the gathered
     walk kernel only (the software-pipelined tile loop,
     the served per-tile math unchanged; see ``_walk_kernel``); one engagement line per trace.
@@ -2234,7 +2250,10 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
     )
 
     qa1 = {**({"mask_view": True} if mask_view else {}), **({"vguard_lean": True} if vguard_lean else {}),
-           **({"walk_pipe": int(walk_pipe)} if walk_pipe else {}), **({"dot16": True} if dot16 else {})}
+           **({"walk_pipe": int(walk_pipe)} if walk_pipe else {}), **({"dot16": True} if dot16 else {}),
+           **({"vguard_none": True} if vguard_none else {})}
+    if vguard_none and not gathered:
+        raise ValueError("vguard_none needs the gathered walk")
     if dot16:
         if not gathered:
             raise ValueError("dot16 needs the gathered walk (gathered='reference' or 'sparsecore')")
@@ -2628,7 +2647,7 @@ def gather_chunk_bounds(ngroups, chunks, growth=1.0):
 def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows, ids, *, gathered, chunks, group,
                      union_cap, kv_tile, ratio, k_scale, v_scale, lean, qk16, growth=1.0, gather_pool=None,
                      in_place=False, lean_gathered=False, mask_view=False, vguard_lean=False, walk_pipe=False,
-                     dot16=False):
+                     dot16=False, vguard_none=False):
     """``union_walk_prefill(gathered=...)``: per chunk of whole query groups, gather the chunk's union tiles from
     the list (``rows``/``ids``), then run the walk-free kernel on them; outputs concatenated in group order."""
     ngroups = ubits.shape[0]
@@ -2642,7 +2661,8 @@ def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows
     if lean_gathered and not in_place:
         raise ValueError("lean_gathered needs in_place")
     qa1 = {**({"mask_view": True} if mask_view else {}), **({"vguard_lean": True} if vguard_lean else {}),
-           **({"walk_pipe": int(walk_pipe)} if walk_pipe else {}), **({"dot16": True} if dot16 else {})}
+           **({"walk_pipe": int(walk_pipe)} if walk_pipe else {}), **({"dot16": True} if dot16 else {}),
+           **({"vguard_none": True} if vguard_none else {})}
     outs = []
     for g0, g1 in gather_chunk_bounds(ngroups, chunks, growth):
         sl, rs = slice(g0, g1), slice(g0 * group, g1 * group)
