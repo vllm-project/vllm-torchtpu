@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import numpy as np
 import pytest
@@ -24,6 +24,7 @@ from runner_output_test_utils import (
 )
 from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 
+from vllm_torchtpu.runner.routed_experts import PendingRoutedExperts
 from vllm_torchtpu.runner.tpu_runner import _spec_logprob_row_tokens
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
@@ -426,3 +427,28 @@ def test_deferred_logprobs_from_device_match_a_blocking_cpu_copy(
     assert out.sampled_token_ids == [
         [100 * i + j] for i, n in enumerate(real_rows) for j in range(n)
     ]
+
+
+def test_get_output_hands_each_requests_sampled_tokens_to_routed_experts():
+    """Routed experts get each request's sampled tokens, and an empty list for
+    a partial prefill whose token was discarded."""
+    routed_experts = create_autospec(PendingRoutedExperts, instance=True)
+    copy_state = AsyncTPUCopyState(
+        chunks_cpu=[torch.tensor([5, 6, 7], dtype=torch.int32)],
+        chunk_real_lens=[3],
+        copy_ready_event=None,
+        completed=True,
+    )
+    out = AsyncTPUModelRunnerOutput(
+        model_runner_output=ModelRunnerOutput(
+            req_ids=["a", "b", "c"],
+            req_id_to_index={"a": 0, "b": 1, "c": 2},
+            sampled_token_ids=[],
+        ),
+        copy_state=copy_state,
+        discard_sampled_tokens_req_indices=[1],
+        routed_experts=routed_experts,
+    ).get_output()
+
+    routed_experts.process_output.assert_called_once_with([[5], [], [7]])
+    assert out.aux_output_connector_output is routed_experts.process_output.return_value

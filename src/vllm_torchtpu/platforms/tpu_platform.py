@@ -420,6 +420,45 @@ def _validate_lora_config(vllm_config: "VllmConfig") -> None:
         )
 
 
+def _validate_routed_experts_config(vllm_config: "VllmConfig") -> None:
+    """Rejects `--enable-return-routed-experts` with the settings TPU capture
+    does not handle yet; vLLM rejects others itself
+    (`VllmConfig._verify_aux_output_compatibility`). `RoutedExpertsCapture`
+    rejects MoE layers armed with a fused kernel once they load."""
+    if not vllm_config.aux_output_config.enabled:
+        return
+    parallel_config = vllm_config.parallel_config
+    unsupported = {
+        # Each MoE layer sees the rows of every DP rank.
+        "data_parallel_size > 1": parallel_config.data_parallel_size > 1,
+        # Comes with fused EP v2, where SP pays off. With chunk pipelining or
+        # FP8 all-gather, `route()` would also see only this rank's tokens.
+        "MoE sequence parallelism (TPU_MOE_SEQUENCE_PARALLEL)": (
+            parallel_config.use_sequence_parallel_moe
+        ),
+        # Each stage captures only its own MoE layers.
+        "pipeline_parallel_size > 1": parallel_config.pipeline_parallel_size > 1,
+        # Experts are picked on this rank's share of the tokens.
+        "TPU_K3_SP_PREFILL": envs.TPU_K3_SP_PREFILL,
+        # The kernel picks experts itself, without `route()`.
+        "MOE_FUSED_EP_KERNEL_IMPL=adaptive": (
+            envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+        ),
+        # Placed layers pick expert slots, not checkpoint expert ids.
+        "TPU_EXPERT_PLACEMENT": bool(envs.TPU_EXPERT_PLACEMENT),
+        # Rows of rejected drafts are kept.
+        "speculative decoding": vllm_config.speculative_config is not None,
+        # Untested.
+        "kv_transfer_config": vllm_config.kv_transfer_config is not None,
+    }
+    rejected = [setting for setting, hit in unsupported.items() if hit]
+    if rejected:
+        raise NotImplementedError(
+            "--enable-return-routed-experts on TPU does not support "
+            f"{'; '.join(rejected)} yet. Change these settings or disable it."
+        )
+
+
 def _register_tpu_kv_connectors() -> None:
     """Register TPU-specific KV connectors in vLLM's factory name registry.
 
@@ -1107,6 +1146,7 @@ class TpuPlatform(Platform):
         # After the bfloat16 switch, so lora_dtype is checked against the
         # dtype the model runs in.
         _validate_lora_config(vllm_config)
+        _validate_routed_experts_config(vllm_config)
 
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
