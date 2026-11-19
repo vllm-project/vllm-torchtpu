@@ -88,6 +88,7 @@ def test_a_config_without_architectures_keeps_mains_arithmetic_and_code():
     assert util.RECIPROCAL_SCALE is False
     assert gmm_v2.RHS_STREAM is False
     assert gmm_v2.TUNED_FP8_MOE is False
+    assert fused_moe_gmm.NONEP_PERMUTE == "sorts"
 
 
 def test_waits_for_a_model_config():
