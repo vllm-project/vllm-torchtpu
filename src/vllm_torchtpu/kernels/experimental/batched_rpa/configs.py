@@ -209,6 +209,14 @@ class ServingConfigs:
     native_fp8: NativeFp8 = NATIVE_FP8_OFF
 
     def __post_init__(self):
+        if Fp8Operand.SPLIT in (self.native_fp8.qk, self.native_fp8.pv) and (
+            jnp.dtype(self.dtype_kv) == jnp.dtype(jnp.float8_e5m2)
+        ):
+            raise ValueError(
+                f"native_fp8={self.native_fp8} with an fp8_e5m2 KV cache: e5m2 "
+                "keeps 2 mantissa bits, so a SPLIT operand's residual half can "
+                "overflow to inf; use ROW, or an fp8_e4m3 KV cache."
+            )
         if self.mask_invalid_v is None:
             object.__setattr__(
                 self,

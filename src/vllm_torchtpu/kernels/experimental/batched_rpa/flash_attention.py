@@ -50,8 +50,11 @@ def _quantize_rows(
 
     With `split`, also quantizes the rounding residual and stacks it under the
     high part along axis -2: x ~= (hi + lo / _SPLIT_LO) * scale, which keeps
-    about 7 mantissa bits (bf16-like) at the cost of doubling the matmul's LHS
-    rows, which are nearly free in decode (16 of the MXU's rows are used).
+    about 7 mantissa bits (bf16-like) with e4m3 at the cost of doubling the
+    matmul's LHS rows, which are nearly free in decode (16 of the MXU's rows
+    are used). e4m3's largest residual times _SPLIT_LO is 256, inside its
+    range; with e5m2 it can exceed the range, so `ServingConfigs` refuses
+    SPLIT with an e5m2 KV cache.
     """
     x = x.astype(jnp.float32)
     fp8_max = float(jnp.finfo(dtype).max)
