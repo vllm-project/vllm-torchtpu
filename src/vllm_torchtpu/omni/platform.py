@@ -270,7 +270,14 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def _is_parent_spawn_env_restore(cls, devices: str | int | None) -> bool:
-        """Return True when scoped_spawn_device_env restores pre-set parent chips."""
+        """Return True when scoped_spawn_device_env restores pre-set parent chips.
+
+        scoped_spawn_device_env holds spawn_device_lock and follows every stage
+        pin with exactly one closing call, which clears _saved_spawn_env. A
+        stage pin therefore never sees a snapshot, even when the stage and the
+        parent use the same chips, so a match with the saved value identifies
+        the closing call.
+        """
         if cls._saved_spawn_env is None or not isinstance(devices, str):
             return False
         saved_chips = cls._saved_spawn_env.get(cls.device_control_env_var)
