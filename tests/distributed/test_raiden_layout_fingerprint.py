@@ -262,6 +262,67 @@ def test_glm_fingerprint_rejects_shape_divergence_within_tag():
         )
 
 
+def _glm_sparsecore_manifest():
+    # TPU_SPARSE_MLA_{NOPE,ROPE}_LAYOUT=sparsecore: uint32 word rows.
+    named = glm_named_kv_caches()
+    for idx in range(2):
+        named[f"model.layers.{idx}.self_attn.mla_attn"] = (
+            FakeTensor((16, 1024, 128), 4, dtype="torch.uint32"),
+            FakeTensor((16, 256, 128), 4, dtype="torch.uint32"),
+        )
+    return rpm.build_glm_mla_pool_manifest(
+        named_kv_caches=named, raw_tensors=(), block_size_tokens=1024
+    )
+
+
+def test_measured_glm_layout_fingerprint_accepts_sparsecore_rows():
+    fingerprint, payload = rlf.measured_glm_layout_fingerprint(
+        _glm_sparsecore_manifest(),
+        page_tokens=1024,
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions,
+    )
+
+    word_rows = {
+        "row_bytes": 512,
+        "minor_to_major": [2, 1, 0],
+        "tiles": [[8, 128]],
+        "element_size_in_bits": 32,
+    }
+    assert payload["layouts"]["mla.nope"] == word_rows | {"page_shape": [1024, 1, 128]}
+    assert payload["layouts"]["mla.rope"] == word_rows | {"page_shape": [256, 1, 128]}
+    # Same bytes per row, but a tensorcore peer must not pair with it.
+    tensorcore, _ = rlf.measured_glm_layout_fingerprint(
+        _glm_manifest(),
+        page_tokens=1024,
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions,
+    )
+    assert fingerprint != tensorcore
+
+
+@pytest.mark.parametrize(
+    ("layout", "page_tokens", "message"),
+    [
+        (([1, 2, 0], [[8, 128]], 0), 1024, "physical order"),
+        (([2, 1, 0], [[8, 256]], 0), 1024, "tile shape"),
+        (([2, 1, 0], [[3, 128]], 0), 1024, "tile shape"),
+        (([2, 1, 0], [[8, 128]], 0), 512, "page geometry"),
+    ],
+)
+def test_measured_glm_sparsecore_fingerprint_fails_closed(layout, page_tokens, message):
+    def getter(tensor):
+        return layout if len(tensor.shape) == 3 else _glm_layout_getter(tensor)
+
+    with pytest.raises(RuntimeError, match=message):
+        rlf.measured_glm_layout_fingerprint(
+            _glm_sparsecore_manifest(),
+            page_tokens=page_tokens,
+            layout_getter=getter,
+            package_version=lambda package: "unused",
+        )
+
+
 # ---------------------------------------------------------------------------
 # DeepSeek-V4 fingerprint (per-role page geometry).
 # ---------------------------------------------------------------------------

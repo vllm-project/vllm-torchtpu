@@ -90,6 +90,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_offload_fine_prefix_alignment", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_raiden_identity_keeps_cp_interleave", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
     Patch(
         "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
@@ -133,6 +134,8 @@ PATCHES = (
     ),
     # API-server prompt tokenization (VLLM_TPU_SEGMENT_TOKENIZE).
     Patch("vllm_torchtpu.segment_tokenize:patch_renderer_segment_tokenize", _ACTIVE),
+    # API-server detokenizer priming (VLLM_TPU_DETOK_PRIME_TOKENS).
+    Patch("vllm_torchtpu.detok_prime:patch_detokenizer_prime_tail", _ACTIVE),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.

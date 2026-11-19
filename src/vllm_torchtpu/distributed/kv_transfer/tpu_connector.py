@@ -389,8 +389,9 @@ class _Stage3LoadMeta:
     group_block_ids: list[list[int]] | None = None
     # Prefix-aware load: tokens satisfied by the decode-local prefix cache
     # and excluded from the transfer. local_block_ids then holds only the
-    # suffix pages; the source store clips its plan at
-    # skip_tokens * token_bytes of the FA global destination byte space.
+    # suffix pages; the source store clips its plan at the prefix's bytes
+    # of each tag's global destination byte space (FA: skip_tokens *
+    # token_bytes; GLM: the skipped pages times the tag's page bytes).
     skip_tokens: int = 0
     # Full local hit: nothing to transfer; the worker only releases the
     # producer's request-block registration instead of pulling.
@@ -410,9 +411,9 @@ class _Stage3PendingSubmit:
     registrations were not yet visible at the source controller.
 
     The registration travels out-of-band and reaches the producer workers
-    no later than the scheduler step after the finish response (a pipeline
-    producer registers in the prompt-completing step), so a consumer query
-    can legitimately arrive first. Instead of spinning the worker step
+    no later than the scheduler step after the finish response (a producer
+    that registers ahead does so in the prompt-completing step), so a
+    consumer query can legitimately arrive first. Instead of spinning the worker step
     in an inline poll, the request is re-attempted once per scheduler step
     from get_finished() until defer_deadline.
     """
@@ -463,7 +464,7 @@ class _Stage3SubmitOutcome:
     task: _Stage3SubmitTask
     error: BaseException | None
     submit_ms: float
-    # perf_counter() when the RPC was issued; paces re-attempts.
+    # Unix timestamp when the RPC was issued; paces re-attempts.
     attempted_at: float
 
 
@@ -686,6 +687,25 @@ def _resolved_reshard_controller_address(dp_rank: int) -> str:
 
 def _use_raiden_glm_admission() -> bool:
     return tpu_envs.use_raiden_glm_admission()
+
+
+def _raiden_glm_dcp_identity() -> bool:
+    """GLM TP/DCP producer -> TP/DCP decode, each rank shipping its own pages."""
+    return _use_raiden_glm_admission() and bool(tpu_envs.TPU_RAIDEN_GLM_DCP_IDENTITY)
+
+
+def _glm_indexer_seq_along_lane(vllm_config: VllmConfig) -> bool:
+    """Whether the GLM indexer K cache was allocated SEQ_ALONG_LANE, which
+    only the DCP identity transfer admits."""
+    if not _raiden_glm_dcp_identity():
+        return False
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        KVLayout,
+        indexer_kv_layout,
+    )
+
+    block_size = int(vllm_config.cache_config.block_size)
+    return indexer_kv_layout(block_size) == KVLayout.SEQ_ALONG_LANE
 
 
 def _use_raiden_dsv4_admission() -> bool:
@@ -1307,9 +1327,7 @@ class TPUConnectorScheduler:
         delay_free_blocks = len(computed_block_ids) > 0
         if delay_free_blocks:
             uuid = get_uuid()
-            expiration_time = (
-                time.perf_counter() + dist_utils.get_p2p_wait_pull_timeout()
-            )
+            expiration_time = time.time() + dist_utils.get_p2p_wait_pull_timeout()
             self.reqs_to_send[request.request_id] = SendMeta(
                 uuid=uuid,
                 local_block_ids=computed_block_ids,
@@ -1535,14 +1553,26 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
 
     def _stage3_register_ahead_enabled(self) -> bool:
         """Whether this producer publishes a request's Stage-3 send in the
-        step that completes its prompt (pipeline producers only)."""
+        step that completes its prompt.
+
+        Always for a pipeline producer, whose last stage would otherwise
+        register several steps late. By TPU_RAIDEN_STAGE3_REGISTER_AHEAD for
+        PCP, TP and DP producers: their finish-time registration rides the
+        step after the finish response, and under async scheduling that
+        step first waits for the next batch's forward (and, with a drafter,
+        for every KV write) before it registers, so the consumer's load
+        parks on the deferred-submit path for a whole prefill step. GLM,
+        DSv4 and Kimi-K3 producers keep finish-time registration."""
         return (
             self.is_producer
             and _use_raiden_stage3_transport()
             and not _use_raiden_glm_admission()
             and not _use_raiden_dsv4_admission()
             and not _uses_tp_stage3_source(self.vllm_config)
-            and _engine_is_pipeline(self.vllm_config)
+            and (
+                _engine_is_pipeline(self.vllm_config)
+                or dist_utils.get_stage3_register_ahead_enabled()
+            )
         )
 
     def on_new_request(self, request: "Request") -> None:
@@ -1631,6 +1661,25 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     f"dst_interleave_size={params.get('dst_interleave_size')!r}; "
                     f"engine tp={tp_size}, dcp={dcp_size}, "
                     f"interleave={interleave_size}"
+                )
+            # A DCP identity producer ships its rank k pages to rank k: both
+            # peers must run that mode over the same token shards.
+            src_dcp_size = _as_int(params.get("src_dcp_size"))
+            if _raiden_glm_dcp_identity() != (src_dcp_size is not None) or (
+                src_dcp_size is not None
+                and (
+                    src_dcp_size != dcp_size
+                    or _as_int(params.get("src_interleave_size")) != interleave_size
+                )
+            ):
+                return (
+                    "Stage-3 GLM DCP identity needs TPU_RAIDEN_GLM_DCP_IDENTITY "
+                    "on both peers and the producer's DCP/interleave to match "
+                    f"this engine: src_dcp_size={params.get('src_dcp_size')!r}, "
+                    "src_interleave_size="
+                    f"{params.get('src_interleave_size')!r}; engine "
+                    f"dcp={dcp_size}, interleave={interleave_size}, "
+                    f"identity={_raiden_glm_dcp_identity()}"
                 )
         bound_req_id = self._stage3_active_source_req_ids.get(source_req_id)
         if bound_req_id is not None and bound_req_id != request.request_id:
@@ -2088,9 +2137,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         return meta
 
     def _stage3_register_ahead(self, scheduler_output: SchedulerOutput) -> None:
-        """Publishes a pipeline producer's Stage-3 send in the step whose
-        chunk completes the prompt, so every stage registers its blocks
-        while executing that step.
+        """Publishes a producer's Stage-3 send in the step whose chunk
+        completes the prompt, so every transfer rank (pipeline stage, PCP
+        or TP rank, or the single DP rank) registers its blocks while
+        executing that step, before the finish response can reach a
+        consumer.
 
         Only requests that finish right after their prompt (max_tokens == 1,
         not resumable) are published here; the finish adopts the uuid through
@@ -2152,6 +2203,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 mamba_block_ids,
                 num_tokens,
                 computed_tokens=computed_tokens,
+                ahead=True,
             )
             if delay_free_blocks:
                 self._stage3_early_sends[req_id] = int(params["uuid"])
@@ -2260,9 +2312,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         *,
         computed_tokens: int,
         group_block_ids: list[list[int]] | None = None,
+        ahead: bool = False,
     ) -> tuple[bool, dict[str, Any]]:
         """Enqueues the request's Stage-3 SendMeta for the workers and
-        returns the consumer-facing transfer parameters."""
+        returns the consumer-facing transfer parameters. ``ahead`` marks a
+        send published in the prompt-completing step, before the finish."""
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
         if (
@@ -2303,15 +2357,22 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             else self.block_size
         )
 
+        # A DCP identity producer's scheduler block spans its DCP ranks' pages.
+        block_cp_size = pcp_size * (
+            int(parallel_config.decode_context_parallel_size or 1)
+            if _raiden_glm_dcp_identity()
+            else 1
+        )
+
         def _normalize(ids: Sequence[int], page_tokens: int) -> tuple[int, ...] | None:
             normalized = self._stage3_normalize_producer_blocks(
                 ids,
                 num_tokens=num_tokens,
                 page_tokens=page_tokens,
-                pcp_size=pcp_size,
+                pcp_size=block_cp_size,
             )
             if normalized is None:
-                scheduler_block_tokens = page_tokens * pcp_size
+                scheduler_block_tokens = page_tokens * block_cp_size
                 expected = (
                     num_tokens + scheduler_block_tokens - 1
                 ) // scheduler_block_tokens
@@ -2325,7 +2386,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     expected,
                     num_tokens,
                     page_tokens,
-                    pcp_size,
+                    block_cp_size,
                 )
             return normalized
 
@@ -2471,7 +2532,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 mamba_block_ids, self._stage3_mamba_num_speculative_blocks
             )
         uuid = get_uuid()
-        now = time.perf_counter()
+        now = time.time()
         expiration_time = now + dist_utils.get_p2p_wait_pull_timeout()
         self.reqs_to_send[request.request_id] = SendMeta(
             uuid=uuid,
@@ -2480,6 +2541,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             num_tokens=num_tokens,
             mamba_state_block_ids=mamba_state_block_ids,
             group_block_ids=normalized_group_block_ids,
+            registered_ahead=ahead,
         )
         params: dict[str, Any] = {
             "req_id": request.request_id,
@@ -2496,6 +2558,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if _use_raiden_glm_admission() and params["dst_dcp_size"] > 1:
             params["dst_interleave_size"] = _raiden_dst_interleave_tokens(
                 self.vllm_config
+            )
+        if _raiden_glm_dcp_identity():
+            # The decode checks it holds the same token shards per rank.
+            params["src_dcp_size"] = int(parallel_config.decode_context_parallel_size)
+            params["src_interleave_size"] = int(
+                parallel_config.cp_kv_cache_interleave_size
             )
         self._stage3_finished_sends[request.request_id] = (
             uuid,
@@ -2607,7 +2675,7 @@ class TPURaidenConnectorWorker:
         # native terminal (or was cancelled unclaimed) and is drained into
         # the scheduler report exactly once.
         self._stage3_send_outcomes: dict[str, str] = {}
-        # req_id -> next registry status probe time (perf_counter seconds).
+        # req_id -> next registry status probe time (Unix seconds).
         self._stage3_status_probe_next: dict[str, float] = {}
         # vLLM independently randomizes the internal request ID on the
         # prefill and decode engines. D5 and the controller/native transfer
@@ -3013,6 +3081,7 @@ class TPURaidenConnectorWorker:
             raw_tensors=raw_tensors,
             block_size_tokens=int(self.vllm_config.cache_config.block_size),
             per_layer_tags=_use_per_layer_pool_tags(),
+            indexer_seq_along_lane=_glm_indexer_seq_along_lane(self.vllm_config),
         )
         rpm.verify_storage_binding(
             manifest=manifest,
@@ -3096,10 +3165,35 @@ class TPURaidenConnectorWorker:
                     f"tensor_parallel_size={tp_size}, "
                     f"data_parallel_size={dp_size}"
                 )
+            if _raiden_glm_dcp_identity():
+                return self._glm_dcp_identity_producer_topology()
+            # A DCP producer holds a token shard, not a replica: only the
+            # identity lowering knows which tokens its pages hold.
+            if int(parallel_config.decode_context_parallel_size or 1) > 1:
+                raise ValueError(
+                    f"{supported}; a DCP producer needs "
+                    "TPU_RAIDEN_GLM_DCP_IDENTITY, got "
+                    "decode_context_parallel_size="
+                    f"{parallel_config.decode_context_parallel_size}"
+                )
             if _raiden_dst_dcp_size(self.vllm_config) > 1:
                 self._validate_glm_dcp_destination(supported)
             return f"tp{tp_size}_prefill"
         dcp_size = int(parallel_config.decode_context_parallel_size or 1)
+        if _raiden_glm_dcp_identity():
+            if not (dcp_size > 1 and tp_size % dcp_size == 0 and dp_size == 1):
+                raise ValueError(
+                    "TPU_RAIDEN_GLM_DCP_IDENTITY needs a decode with "
+                    "decode_context_parallel_size > 1 dividing "
+                    "tensor_parallel_size and data_parallel_size == 1, "
+                    f"got tensor_parallel_size={tp_size}, "
+                    f"decode_context_parallel_size={dcp_size}, "
+                    f"data_parallel_size={dp_size}"
+                )
+            # Rank k loads producer rank k's pages, so both legs must place
+            # rank k on the same token shard; _check_identity_dcp_rank pins it.
+            self._check_identity_dcp_rank(dcp_size)
+            return f"tp{tp_size}dcp{dcp_size}_decode"
         if tp_size > 1 and dcp_size == tp_size and dp_size == 1:
             # Every TP worker holds one DCP shard of the token positions, so
             # it must be the DCP rank its producer spans are routed to.
@@ -3119,6 +3213,62 @@ class TPURaidenConnectorWorker:
                 f"data_parallel_size={dp_size}"
             )
         return f"dp{dp_size}_decode"
+
+    def _glm_dcp_identity_producer_topology(self) -> str:
+        """Validates a TPU_RAIDEN_GLM_DCP_IDENTITY producer.
+
+        Its TP workers each hold one DCP shard of the token positions (TP / DCP
+        workers per shard), and the destination runs the same TP, DCP and
+        interleave, so producer rank k holds exactly the tokens of destination
+        rank k. Equal page sizes are checked by the layout fingerprint, which
+        carries page_tokens.
+        """
+        parallel_config = self.vllm_config.parallel_config
+        tp_size = int(self.tp_size)
+        dcp_size = int(parallel_config.decode_context_parallel_size or 1)
+        interleave = int(parallel_config.cp_kv_cache_interleave_size)
+        if _engine_is_pipeline(self.vllm_config) or not (
+            dcp_size > 1 and tp_size % dcp_size == 0
+        ):
+            raise ValueError(
+                "TPU_RAIDEN_GLM_DCP_IDENTITY needs a producer with "
+                "decode_context_parallel_size > 1 dividing tensor_parallel_size "
+                "and no pipeline parallelism, got pipeline_parallel_size="
+                f"{_pipeline_parallel_size(self.vllm_config)}, "
+                f"tensor_parallel_size={tp_size}, "
+                f"decode_context_parallel_size={dcp_size}"
+            )
+        dst_dcp_size = _raiden_dst_dcp_size(self.vllm_config)
+        dst_interleave = _raiden_dst_interleave_tokens(self.vllm_config)
+        if (
+            dst_dcp_size != dcp_size
+            or _raiden_dst_shards() != tp_size
+            or dst_interleave != interleave
+        ):
+            raise ValueError(
+                "TPU_RAIDEN_GLM_DCP_IDENTITY needs the destination's DCP size, "
+                "shard count and interleave to equal the producer's: "
+                f"destination_decode_context_parallel_size={dst_dcp_size}, "
+                f"TPU_RAIDEN_DST_SHARDS={_raiden_dst_shards()}, "
+                f"destination_cp_kv_cache_interleave_size={dst_interleave}; "
+                f"producer tp={tp_size}, dcp={dcp_size}, interleave={interleave}"
+            )
+        self._check_identity_dcp_rank(dcp_size)
+        return f"tp{tp_size}dcp{dcp_size}_prefill"
+
+    def _check_identity_dcp_rank(self, dcp_size: int) -> None:
+        """Rank k ships to (or loads from) the peer's rank k, so rank k must
+        hold the same token shard on both legs. vLLM forms DCP groups from
+        consecutive TP ranks, so tp_rank % dcp_size is the shard; checking it
+        on each leg pins the rank -> shard map both legs share."""
+        from vllm_torchtpu.distributed.dcp import get_dcp_rank
+
+        if get_dcp_rank() != self.tp_rank % dcp_size:
+            raise ValueError(
+                "Raiden GLM DCP identity requires dcp_rank == tp_rank % "
+                f"dcp_size: dcp_rank={get_dcp_rank()}, tp_rank={self.tp_rank}, "
+                f"dcp_size={dcp_size}"
+            )
 
     def _validate_glm_dcp_destination(self, supported: str) -> None:
         dst_dcp_size = _raiden_dst_dcp_size(self.vllm_config)
@@ -3326,18 +3476,20 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _measure_raiden_glm_layout(
-        manifest: Any, page_tokens: int
+        manifest: Any, page_tokens: int, indexer_seq_along_lane: bool = False
     ) -> tuple[str, dict[str, Any]]:
         from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
             measured_glm_layout_fingerprint,
         )
 
         # Pipeline stage may hold no indexer layer, so the indexer class stays out of
-        # the fingerprint on both sides.
+        # the fingerprint on both sides. A DCP identity peer holds every layer, and
+        # its indexer layout (packed rows or SEQ_ALONG_LANE) must match.
         return measured_glm_layout_fingerprint(
             manifest,
             page_tokens=page_tokens,
-            hash_indexer=not _use_per_layer_pool_tags(),
+            hash_indexer=not _use_per_layer_pool_tags() or _raiden_glm_dcp_identity(),
+            indexer_seq_along_lane=indexer_seq_along_lane,
         )
 
     def _measure_stage3_layout(self, manifest: Any) -> tuple[str, dict[str, Any], int]:
@@ -3379,7 +3531,9 @@ class TPURaidenConnectorWorker:
         if _use_raiden_glm_admission():
             page_tokens = int(self.vllm_config.cache_config.block_size)
             fingerprint, payload = self._measure_raiden_glm_layout(
-                manifest, page_tokens
+                manifest,
+                page_tokens,
+                indexer_seq_along_lane=_glm_indexer_seq_along_lane(self.vllm_config),
             )
             return fingerprint, payload, page_tokens
         if _raiden_seq_on_lane_layout():
@@ -3689,9 +3843,7 @@ class TPURaidenConnectorWorker:
         # Store mode: the store is brought up by this engine's rank-0
         # worker in parallel with the peer ranks' init — bounded retry
         # instead of the sidecar era's launcher-ordered readiness.
-        registration_deadline = time.perf_counter() + (
-            120.0 if _reshard_store_mode() else 0.0
-        )
+        registration_deadline = time.time() + (120.0 if _reshard_store_mode() else 0.0)
         while True:
             try:
                 facade.register_work_unit(
@@ -3706,7 +3858,7 @@ class TPURaidenConnectorWorker:
                 )
                 break
             except Exception as exc:  # noqa: BLE001 — retry-or-reraise
-                if time.perf_counter() >= registration_deadline:
+                if time.time() >= registration_deadline:
                     raise
                 logger.info(
                     "Raiden work-unit registration to %s not accepted yet "
@@ -3954,9 +4106,9 @@ class TPURaidenConnectorWorker:
     ) -> None:
         engine = self._ensure_raiden_transfer_engine()
         if self.is_producer:
-            if (
-                metadata.reqs_to_send
-                and self.vllm_config.speculative_config is not None
+            if self.vllm_config.speculative_config is not None and any(
+                getattr(req_meta, "registered_ahead", False) is not True
+                for req_meta in metadata.reqs_to_send.values()
             ):
                 # Publishing a source lets Raiden read its pinned buffers
                 # immediately, including on a no-forward scheduler step.
@@ -3964,6 +4116,10 @@ class TPURaidenConnectorWorker:
                 # materialize the model's typed KV views and wait before
                 # handing them to the external transfer engine. Admission's
                 # raw storage buffers alone do not express those writes.
+                # A send published ahead of the finish is registered before
+                # its own forward: the runner instead fences every KV write
+                # of that step under the sampled-token copy (sample_tokens),
+                # which the consumer's pull is gated on.
                 synchronize_tensors(self._flattened_kv_cache_tensors(), wait=True)
             if self._raiden_stage3_enabled():
                 if _use_raiden_dsv4_admission():
@@ -4076,9 +4232,11 @@ class TPURaidenConnectorWorker:
         widen the out-of-band registration race by delaying the producer's
         registration step, reproducing a saturated producer whose
         registration-carrying step runs long after the finish response.
-        On a pipeline producer the sleep runs before the prompt-completing
-        forward and delays the finish response by the same amount, so it
-        widens the race only for PCP and DP producers."""
+        On a producer that registers ahead the sleep runs before the
+        prompt-completing forward and delays the finish response by the
+        same amount, so it widens the race only for finish-time
+        registration (TPU_RAIDEN_STAGE3_REGISTER_AHEAD=0, GLM, DSv4,
+        Kimi-K3)."""
         delay_s = dist_utils.get_stage3_test_registration_delay_s()
         if delay_s > 0 and metadata.reqs_to_send:
             logger.warning(
@@ -4114,7 +4272,7 @@ class TPURaidenConnectorWorker:
             lowering_parallelism = parallelism // self.tp_size
             lowering_rank = transfer_rank // self.tp_size
 
-        now = time.perf_counter()
+        now = time.time()
         expired_terminal_req_ids = [
             req_id
             for req_id, registration in self._stage3_terminal_sends.items()
@@ -4307,7 +4465,7 @@ class TPURaidenConnectorWorker:
                 # is no local registration to complete or release. Retain a
                 # fresh local tombstone so metadata replay is idempotent, and
                 # contribute this rank's terminal vote to PCP aggregation.
-                tombstone_deadline = time.perf_counter() + float(
+                tombstone_deadline = time.time() + float(
                     dist_utils.get_p2p_wait_pull_timeout()
                 )
                 self._stage3_terminal_sends[req_id] = _Stage3RegisteredSend(
@@ -4325,12 +4483,19 @@ class TPURaidenConnectorWorker:
                     uuid,
                 )
                 continue
+            # Registered ahead of the scheduler's finish (every pipeline
+            # stage; a PCP, TP or DP rank for a send published in the
+            # prompt-completing step): no TTL and no status probe until
+            # finished_req_ids names the request.
+            registered_ahead = (
+                pipeline or getattr(req_meta, "registered_ahead", False) is True
+            )
             self._stage3_registered_sends[req_id] = _Stage3RegisteredSend(
                 uuid=uuid,
                 local_block_ids=local_ids,
                 num_tokens=num_tokens,
-                expiration_time=float("inf") if pipeline else expiration_time,
-                finish_pending=pipeline,
+                expiration_time=(float("inf") if registered_ahead else expiration_time),
+                finish_pending=registered_ahead,
             )
             if not any(reg.spans for reg in pool_spans):
                 # This PCP rank owns no physical page for the request. It has
@@ -4404,6 +4569,7 @@ class TPURaidenConnectorWorker:
         one complete source fragment for each KDA state group.
         """
         from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
+            lower_glm_dcp_identity_spans,
             lower_glm_dcp_row_spans,
             lower_glm_row_spans,
         )
@@ -4414,8 +4580,12 @@ class TPURaidenConnectorWorker:
         parallelism = self._raiden_transfer_parallelism()
         transfer_rank = self._local_raiden_transfer_rank()
         self._maybe_delay_stage3_registration_for_test(metadata)
+        # A DCP identity producer's transfer rank is its TP rank; it ships its
+        # own pages whole to the destination's same TP rank, whose DCP shard
+        # (tp_rank % dcp, checked at admission on both legs) is its own.
+        dcp_identity = _raiden_glm_dcp_identity()
 
-        now = time.perf_counter()
+        now = time.time()
         expired_terminal_req_ids = [
             req_id
             for req_id, registration in self._stage3_terminal_sends.items()
@@ -4433,8 +4603,8 @@ class TPURaidenConnectorWorker:
         pipeline = _engine_is_pipeline(self.vllm_config)
         lowering_parallelism = 1 if pipeline else parallelism
         lowering_rank = 0 if pipeline else transfer_rank
-        # A DCP destination (admitted for pipeline producers only) shards
-        # each page's tokens over its ranks.
+        # A DCP destination (admitted for pipeline producers and DCP identity
+        # producers) shards each page's tokens over its ranks.
         dst_dcp_size = (
             _raiden_dst_dcp_size(self.vllm_config) if _use_raiden_glm_admission() else 1
         )
@@ -4455,7 +4625,21 @@ class TPURaidenConnectorWorker:
                 int(block_id) for block_id in req_meta.local_block_ids
             )
             transfer_tags = ("fa",) if self._stage3_kimi else list(tag_geometry)
-            if dst_dcp_size > 1:
+            if dcp_identity:
+                pool_spans = [
+                    lower_glm_dcp_identity_spans(
+                        tag=tag,
+                        num_tokens=num_tokens,
+                        page_tokens=page_tokens,
+                        dcp_size=dst_dcp_size,
+                        dcp_rank=transfer_rank % dst_dcp_size,
+                        dst_unit=transfer_rank,
+                        live_bytes_per_block=tag_geometry[tag][0],
+                        block_ids=list(scheduler_ids),
+                    )
+                    for tag in transfer_tags
+                ]
+            elif dst_dcp_size > 1:
                 pool_spans = [
                     lower_glm_dcp_row_spans(
                         tag=tag,
@@ -4547,7 +4731,7 @@ class TPURaidenConnectorWorker:
             except (RuntimeError, ValueError) as exc:
                 if _STAGE3_REGISTRATION_CANCELLED_ERROR not in str(exc):
                     raise
-                tombstone_deadline = time.perf_counter() + float(
+                tombstone_deadline = time.time() + float(
                     dist_utils.get_p2p_wait_pull_timeout()
                 )
                 self._stage3_terminal_sends[req_id] = _Stage3RegisteredSend(
@@ -4652,7 +4836,7 @@ class TPURaidenConnectorWorker:
         parallelism = self._raiden_transfer_parallelism()
         transfer_rank = self._local_raiden_transfer_rank()
 
-        now = time.perf_counter()
+        now = time.time()
         for req_id in [
             req_id
             for req_id, registration in self._stage3_terminal_sends.items()
@@ -4730,7 +4914,7 @@ class TPURaidenConnectorWorker:
             except (RuntimeError, ValueError) as exc:
                 if _STAGE3_REGISTRATION_CANCELLED_ERROR not in str(exc):
                     raise
-                tombstone_deadline = time.perf_counter() + float(
+                tombstone_deadline = time.time() + float(
                     dist_utils.get_p2p_wait_pull_timeout()
                 )
                 self._stage3_terminal_sends[req_id] = _Stage3RegisteredSend(
@@ -5195,13 +5379,13 @@ class TPURaidenConnectorWorker:
 
         vLLM returns producer transfer parameters from update_from_output(),
         while the D5 block registrations reach producer workers no later than
-        the next scheduler step (a pipeline producer registers in the
-        prompt-completing step). The source controller fails before receiver
+        the next scheduler step (a producer that registers ahead does so in
+        the prompt-completing step). The source controller fails before receiver
         arming when those registrations are incomplete, so retry only that
         precise, side-effect-free error for a short bounded interval.
         """
         configured_timeout = float(dist_utils.get_p2p_wait_pull_timeout())
-        deadline = time.perf_counter() + min(
+        deadline = time.time() + min(
             max(configured_timeout, 0.0), _STAGE3_D5_REGISTRATION_WAIT_S
         )
         attempts = 0
@@ -5212,7 +5396,7 @@ class TPURaidenConnectorWorker:
             except RuntimeError as exc:
                 if (
                     "Missing producer block registration" not in str(exc)
-                    or time.perf_counter() >= deadline
+                    or time.time() >= deadline
                 ):
                     raise
                 if attempts == 1:
@@ -5463,7 +5647,7 @@ class TPURaidenConnectorWorker:
                     # records; only surface recompute after manager failure or
                     # a full post-RPC manager timeout.
                     self._stage3_controller_accepted.add(destination_req_id)
-                    deadline = time.perf_counter() + float(
+                    deadline = time.time() + float(
                         dist_utils.get_p2p_wait_pull_timeout()
                     )
                     self._stage3_pending_controller_failures[destination_req_id] = (
@@ -5522,7 +5706,7 @@ class TPURaidenConnectorWorker:
                 )
 
                 continue
-            now = time.perf_counter()
+            now = time.time()
             defer_wait_s = (
                 dist_utils.get_stage3_registration_wait_s()
                 if not synchronous and dist_utils.get_stage3_deferred_submit_enabled()
@@ -5591,6 +5775,38 @@ class TPURaidenConnectorWorker:
             )
             return skip_tokens * token_bytes
 
+    def _stage3_cache_skip_bytes(
+        self, cache_tags: list[str], skip_tokens: int
+    ) -> tuple[list[int], int]:
+        """Per-tag dst_skip_bytes of a prefix-aware suffix pull over the KV
+        cache tags, and the skip to log.
+
+        Every GLM lowering (replicated rows, DCP rows, DCP identity) puts a
+        request's destination page p at p * live_bytes_per_block of its tag's
+        global destination byte space, and one destination page holds one
+        scheduler block (block_size * dcp tokens). A GLM clip is then the
+        cached page count times each tag's own page bytes, which differ per
+        tag; the logged skip is their sum, the bytes each destination rank
+        does not pull. FA tags share one token-byte clip.
+        """
+        if not _use_raiden_glm_admission():
+            fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
+            return [fa_skip_bytes] * len(cache_tags), fa_skip_bytes
+        dcp_size = max(
+            int(self.vllm_config.parallel_config.decode_context_parallel_size), 1
+        )
+        page_tokens = int(self.vllm_config.cache_config.block_size) * dcp_size
+        if skip_tokens % page_tokens:
+            raise ValueError(
+                "GLM prefix must cover whole scheduler blocks: "
+                f"skip_tokens={skip_tokens}, page_tokens={page_tokens}"
+            )
+        prefix_pages = skip_tokens // page_tokens
+        tag_skips = [
+            prefix_pages * self._stage3_row_geometry[tag][0] for tag in cache_tags
+        ]
+        return tag_skips, sum(tag_skips)
+
     def _stage_stage3_submit_task(
         self, pending: _Stage3PendingSubmit, synchronous: bool
     ) -> _Stage3SubmitTask | None:
@@ -5657,17 +5873,19 @@ class TPURaidenConnectorWorker:
                     transfer_tags.append(tag)
                     dst_blocks.append(int(mamba_state_block_ids[ordinal]))
                     dst_counts.append(1)
-            # Prefix-aware suffix pull: clip the FA global destination
-            # byte space at the locally-cached prefix; GDN state classes
-            # are not prefix-decomposable and always transfer whole
-            # (skip 0). Omit the kwarg entirely when there is no clip so
-            # skip-free requests stay byte-identical on the wire.
+            # Prefix-aware suffix pull: clip each KV cache tag's global
+            # destination byte space at the locally-cached prefix; GDN
+            # state classes are not prefix-decomposable and always transfer
+            # whole (skip 0). Omit the kwarg entirely when there is no clip
+            # so skip-free requests stay byte-identical on the wire.
             skip_tokens = req_meta.skip_tokens
             fa_skip_bytes = 0
             clip_kwargs: dict[str, Any] = {}
             if skip_tokens > 0:
-                fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
-                clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
+                tag_skips, fa_skip_bytes = self._stage3_cache_skip_bytes(
+                    transfer_tags[:fa_tag_count], skip_tokens
+                )
+                clip_kwargs["dst_skip_bytes"] = tag_skips + [0] * (
                     len(transfer_tags) - fa_tag_count
                 )
             dst_mem_type = self._raiden_hbm_memory_type()
@@ -5782,7 +6000,7 @@ class TPURaidenConnectorWorker:
     def _stage3_source_unreachable(self, address: str) -> bool:
         with self._stage3_submit_lock:
             until = self._stage3_unreachable_sources.get(address, 0)
-        return time.perf_counter() < until
+        return time.time() < until
 
     @staticmethod
     def _stage3_source_down(address: str, exc: BaseException) -> bool:
@@ -5802,7 +6020,7 @@ class TPURaidenConnectorWorker:
         )
         with self._stage3_submit_lock:
             self._stage3_unreachable_sources[address] = (
-                time.perf_counter() + _STAGE3_UNREACHABLE_SOURCE_BACKOFF_S
+                time.time() + _STAGE3_UNREACHABLE_SOURCE_BACKOFF_S
             )
 
     def _execute_stage3_submit(self, task: _Stage3SubmitTask) -> _Stage3SubmitOutcome:
@@ -5813,6 +6031,7 @@ class TPURaidenConnectorWorker:
         completion is deliberately *not* inferred from that acknowledgement;
         get_finished polls the local manager.
         """
+        attempted_at = time.time()
         start_submit = time.perf_counter()
         if (
             task.pending.destination_req_id
@@ -5824,7 +6043,7 @@ class TPURaidenConnectorWorker:
                     "Missing producer block registration (aborted before submit)"
                 ),
                 submit_ms=0.0,
-                attempted_at=start_submit,
+                attempted_at=attempted_at,
             )
         address = str(task.call_kwargs["src_controller_address"])
         not_sent = f"Control RPC connection failed before sending request to {address}"
@@ -5833,7 +6052,7 @@ class TPURaidenConnectorWorker:
                 task=task,
                 error=RuntimeError(not_sent),
                 submit_ms=0.0,
-                attempted_at=start_submit,
+                attempted_at=attempted_at,
             )
         error: BaseException | None = None
         try:
@@ -5856,7 +6075,7 @@ class TPURaidenConnectorWorker:
             task=task,
             error=error,
             submit_ms=(time.perf_counter() - start_submit) * 1000,
-            attempted_at=start_submit,
+            attempted_at=attempted_at,
         )
 
     def _apply_stage3_submit_outcome(self, outcome: _Stage3SubmitOutcome) -> None:
@@ -5893,7 +6112,7 @@ class TPURaidenConnectorWorker:
                 missing_registration
                 and pending.defer_deadline is not None
                 and not aborted
-                and time.perf_counter() < pending.defer_deadline
+                and time.time() < pending.defer_deadline
             ):
                 # The precise pre-arm missing-registration result is
                 # side-effect free (registrations ride a later producer
@@ -5953,9 +6172,7 @@ class TPURaidenConnectorWorker:
             # records; only surface recompute after manager failure or
             # a full post-RPC manager timeout.
             self._stage3_controller_accepted.add(destination_req_id)
-            deadline = time.perf_counter() + float(
-                dist_utils.get_p2p_wait_pull_timeout()
-            )
+            deadline = time.time() + float(dist_utils.get_p2p_wait_pull_timeout())
             self._stage3_pending_controller_failures[destination_req_id] = deadline
             if self._stage3_fail_uncertain_loads_early:
                 self._failed_block_ids.update(pending.local_blocks)
@@ -5993,7 +6210,7 @@ class TPURaidenConnectorWorker:
             logger.info(
                 "Stage-3 deferred load submitted after %.2fs wait "
                 "req_id=%s destination_req_id=%s uuid=%d",
-                time.perf_counter() - pending.first_attempt_s,
+                time.time() - pending.first_attempt_s,
                 source_req_id,
                 destination_req_id,
                 uuid,
@@ -6054,8 +6271,7 @@ class TPURaidenConnectorWorker:
                 self._stage3_controller_accepted.add(req_id)
                 if state == "uncertain":
                     self._stage3_pending_controller_failures[req_id] = (
-                        time.perf_counter()
-                        + float(dist_utils.get_p2p_wait_pull_timeout())
+                        time.time() + float(dist_utils.get_p2p_wait_pull_timeout())
                     )
 
     def _drain_stage3_pending_submits(self, finished_req_ids: set[str] | None) -> None:
@@ -6087,7 +6303,7 @@ class TPURaidenConnectorWorker:
                     req_id,
                     pending.uuid,
                 )
-        now = time.perf_counter()
+        now = time.time()
         for destination_req_id in list(self._stage3_pending_submits):
             pending = self._stage3_pending_submits[destination_req_id]
             if (
@@ -6199,17 +6415,19 @@ class TPURaidenConnectorWorker:
                     transfer_tags.append(tag)
                     dst_blocks.append(int(mamba_state_block_ids[ordinal]))
                     dst_counts.append(1)
-            # Prefix-aware suffix pull: clip the FA global destination
-            # byte space at the locally-cached prefix; GDN state classes
-            # are not prefix-decomposable and always transfer whole
-            # (skip 0). Omit the kwarg entirely when there is no clip so
-            # skip-free requests stay byte-identical on the wire.
+            # Prefix-aware suffix pull: clip each KV cache tag's global
+            # destination byte space at the locally-cached prefix; GDN
+            # state classes are not prefix-decomposable and always transfer
+            # whole (skip 0). Omit the kwarg entirely when there is no clip
+            # so skip-free requests stay byte-identical on the wire.
             skip_tokens = int(getattr(req_meta, "skip_tokens", 0) or 0)
             fa_skip_bytes = 0
             clip_kwargs: dict[str, Any] = {}
             if skip_tokens > 0:
-                fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
-                clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
+                tag_skips, fa_skip_bytes = self._stage3_cache_skip_bytes(
+                    transfer_tags[:fa_tag_count], skip_tokens
+                )
+                clip_kwargs["dst_skip_bytes"] = tag_skips + [0] * (
                     len(transfer_tags) - fa_tag_count
                 )
             start_submit = time.perf_counter()
@@ -6287,7 +6505,7 @@ class TPURaidenConnectorWorker:
             # The scheduler finished these requests: their registrations
             # made ahead of the finish start the TTL clock and the status
             # probe.
-            now = time.perf_counter()
+            now = time.time()
             for req_id in finished_req_ids or ():
                 registration = self._stage3_registered_sends.get(req_id)
                 if registration is not None and registration.finish_pending:
@@ -6462,7 +6680,7 @@ class TPURaidenConnectorWorker:
             terminal_recvs = set(done_recving) | set(failed_recving)
             for req_id in terminal_recvs:
                 self._stage3_pending_controller_failures.pop(req_id, None)
-            now = time.perf_counter()
+            now = time.time()
             expired_uncertain = {
                 req_id
                 for req_id, deadline in self._stage3_pending_controller_failures.items()
@@ -6476,7 +6694,7 @@ class TPURaidenConnectorWorker:
             self._stage3_terminal_loads.update(failed_recving)
         if self.is_producer and self._raiden_stage3_enabled():
             facade, _ = self._require_stage3_controller()
-            now = time.perf_counter()
+            now = time.time()
             self._probe_stage3_registrations(facade, now)
             expired_candidates = {
                 req_id
@@ -6644,7 +6862,7 @@ class TPURaidenConnectorWorker:
                             uuid=registration.uuid,
                             unit=self._raiden_work_unit,
                         )
-                tombstone_deadline = time.perf_counter() + float(
+                tombstone_deadline = time.time() + float(
                     dist_utils.get_p2p_wait_pull_timeout()
                 )
                 self._stage3_terminal_sends[req_id] = _Stage3RegisteredSend(
@@ -6667,7 +6885,7 @@ class TPURaidenConnectorWorker:
         if not req_ids:
             return
         engine = self._ensure_raiden_transfer_engine()
-        deadline = time.perf_counter() + float(dist_utils.get_p2p_wait_pull_timeout())
+        deadline = time.time() + float(dist_utils.get_p2p_wait_pull_timeout())
         while True:
             finished = self._done_recving | self._failed_recving
             if req_ids <= finished:
@@ -6676,7 +6894,7 @@ class TPURaidenConnectorWorker:
             finished = self._done_recving | self._failed_recving
             if req_ids <= finished:
                 return
-            if time.perf_counter() >= deadline:
+            if time.time() >= deadline:
                 pending = sorted(req_ids - finished)
                 logger.warning(
                     "TPURaidenConnectorWorker rank%d --> timed out waiting "
@@ -6712,6 +6930,14 @@ class TPURaidenConnectorWorker:
         self, kv_caches: list[Any], *, num_slots: int | None = None
     ) -> "KVCacheManager":
         max_blocks = self._max_request_blocks()
+        # Under DCP a rank holds 1/dcp of every request's tokens, so a request
+        # spans at most ceil(max_model_len / (block_size * dcp)) of its blocks.
+        # Sizing for the whole request reserved dcp x the host memory per
+        # storage: at 1M tokens and DCP16 a full-mirror GLM storage covered
+        # 4096 blocks instead of its ~2,100-block pool (~27 GB more per rank).
+        dcp = int(self.vllm_config.parallel_config.decode_context_parallel_size or 1)
+        if dcp > 1:
+            max_blocks = max(1, -(-max_blocks // dcp))
         if num_slots is None:
             num_slots = self._num_raiden_slots(max_blocks)
         stage3_enabled = self._raiden_stage3_enabled()
@@ -6773,13 +6999,13 @@ class TPURaidenConnectorWorker:
 
         host, port_str = address.rsplit(":", 1)
         port = int(port_str)
-        deadline = time.perf_counter() + timeout_s
+        deadline = time.time() + timeout_s
         while True:
             try:
                 with socket.create_connection((host, port), timeout=0.5):
                     return
             except OSError as err:
-                if time.perf_counter() >= deadline:
+                if time.time() >= deadline:
                     raise TimeoutError(
                         f"Timed out waiting for address {address} to be ready"
                     ) from err
@@ -6843,8 +7069,12 @@ class TPURaidenConnectorWorker:
         disjoint ids. Every pool therefore reports the union for its whole
         storage: pages per max-length request for each full-attention group
         present plus one per GDN group present (a group's conv and ssm pools
-        address the same block). A storage holding a pool of unknown kind
-        reports 0, which keeps it on the full host mirror (see
+        address the same block). Under the GLM DCP identity transfer
+        (lower_glm_dcp_identity_spans) a request ships one page per scheduler
+        block of block_size * dcp tokens from every GLM pool, so those pools
+        report the pages of a max-length request at that block size. A storage
+        holding a pool of unknown kind, or a GLM pool under any other GLM
+        transfer, reports 0, which keeps it on the full host mirror (see
         RESHARD_BOUNDED_STAGING_DESIGN.md).
         """
         from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
@@ -6854,6 +7084,17 @@ class TPURaidenConnectorWorker:
             for layer_name in getattr(group, "layer_names", ()):
                 group_of_layer[str(layer_name)] = index
         fa_pages = int(self._max_request_blocks())
+        glm_pages = 0
+        if _raiden_glm_dcp_identity():
+            dcp_size = int(
+                self.vllm_config.parallel_config.decode_context_parallel_size
+            )
+            block_tokens = int(self.vllm_config.cache_config.block_size) * max(
+                dcp_size, 1
+            )
+            max_model_len = int(self.vllm_config.model_config.max_model_len)
+            glm_pages = max(1, (max_model_len + block_tokens - 1) // block_tokens)
+        glm_tags = (rpm.TAG_MLA_NOPE, rpm.TAG_MLA_ROPE, rpm.TAG_DSA_IDX)
         # storage -> {block table: blocks one transfer touches from it}
         tables_by_storage: dict[int, dict[Any, int]] = {}
         full_mirror: set[int] = set()
@@ -6864,6 +7105,8 @@ class TPURaidenConnectorWorker:
                 blocks = fa_pages
             elif tag.startswith(rpm.TAG_GDN_CONV) or tag.startswith(rpm.TAG_GDN_SSM):
                 blocks = 1
+            elif glm_pages and tag.startswith(glm_tags):
+                blocks = glm_pages
             else:
                 full_mirror.add(storage)
                 continue

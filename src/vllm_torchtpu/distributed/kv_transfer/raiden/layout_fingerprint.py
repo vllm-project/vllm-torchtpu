@@ -23,6 +23,7 @@ from .pool_manifest import (
     TAG_GDN_CONV,
     TAG_GDN_SSM,
     TAG_MLA_NOPE,
+    TAG_MLA_ROPE,
     PoolManifest,
 )
 from .tags import class_tag
@@ -269,6 +270,7 @@ def measured_glm_layout_fingerprint(
     layout_getter: Callable[[Any], Any] | None = None,
     package_version: Callable[[str], str] | None = None,
     hash_indexer: bool = True,
+    indexer_seq_along_lane: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Fingerprint of the admitted GLM cache layout, compared across peers.
 
@@ -279,12 +281,17 @@ def measured_glm_layout_fingerprint(
     pool is still validated): a pipeline stage whose layers reuse an earlier
     layer's top-k holds no indexer cache, yet must fingerprint identically to
     a destination holding every layer.
+
+    ``indexer_seq_along_lane`` checks the indexer page by its lane width (one
+    token per lane). Its page shape differs from the packed-row one, so the
+    two layouts never fingerprint alike.
     """
     layouts = _measure_packed_row_layouts(
         manifest,
         page_tokens=page_tokens,
         layout_getter=layout_getter,
         include_page_shape=True,
+        seq_along_lane_tag=TAG_DSA_IDX if indexer_seq_along_lane else None,
     )
     if not hash_indexer:
         layouts.pop(TAG_DSA_IDX, None)
@@ -329,6 +336,7 @@ def _measure_packed_row_layouts(
     page_tokens: int | None,
     layout_getter: Callable[[Any], Any] | None,
     include_page_shape: bool,
+    seq_along_lane_tag: str | None = None,
 ) -> dict[str, Any]:
     """Validate live packed-row storage for the model-specific fingerprints.
 
@@ -380,7 +388,14 @@ def _measure_packed_row_layouts(
         rows, width = shape[1], shape[-1]
         packing = 1 if word_rows else shape[2]
         if page_tokens is not None:
-            page_rows_tokens = rows if tag == TAG_MLA_NOPE else rows * packing
+            if tag == TAG_MLA_NOPE:
+                page_rows_tokens = rows
+            elif word_rows and tag == TAG_MLA_ROPE:
+                page_rows_tokens = rows * (page_tokens // rows) if rows else 0
+            elif tag == seq_along_lane_tag:
+                page_rows_tokens = width
+            else:
+                page_rows_tokens = rows * packing
             if page_rows_tokens != page_tokens:
                 raise RuntimeError(
                     f"{pool.tag} page geometry {rows}x{packing} does not "

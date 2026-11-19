@@ -41,13 +41,29 @@ Core mechanisms:
 - Memory reuse (jobs_to_flush): Handled entirely scheduler-side. Fence-pending
   stores are cancelled before launching, while active transfers are drained
   synchronously before shipping metadata, preventing torn reads upon block reuse.
+
+- Lazy offload (`"lazy_offload": true` in kv_connector_extra_config): blocks
+  are stored only on their way out of HBM instead of as they are computed.
+  Each step the scheduler scans the first `lazy_window_blocks` free HBM blocks
+  (the ones the allocator hands out next, evicting what they cache) and stores
+  every whole cached block the tier does not hold yet. The tier then holds
+  what HBM dropped rather than a copy of what HBM still has, so it adds its
+  capacity to HBM's even when smaller. A scanned block stays where it is in
+  the free queue (no pin): if the allocator takes it before its store
+  finishes, the memory-reuse flush above cancels or drains the store. Blocks
+  are stored as the HBM prefix cache holds them, so a tier hit serves what an
+  HBM hit on the same block would. A lookup refreshes only the tier's copies
+  past the request's HBM hit, so the tier's LRU order follows what HBM
+  dropped.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+import time
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -66,6 +82,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
+    RequestOffloadState,
+    TransferJobStatus,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
     OffloadingConnectorWorker,
@@ -73,14 +91,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
+from vllm.v1.core.kv_cache_utils import get_block_hash, get_group_id
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
     OffloadKey,
+    make_offload_key,
 )
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -95,8 +115,28 @@ from vllm_torchtpu.offload.raiden_store import (
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        SchedulerOffloadConfig,
+    )
+    from vllm.v1.core.block_pool import BlockPool
 
 logger = init_logger(__name__)
+
+# Lazy offload scans this many free HBM blocks by default: 64 DCP16 blocks
+# (4096 tokens each) cover a ~256K-token tier load, the largest allocation a
+# single prefill step makes in practice. A block the allocator takes before
+# its store completes is not offloaded, so the window must run ahead of a
+# step's allocations.
+_DEFAULT_LAZY_WINDOW_BLOCKS = 64
+# Lazy store jobs belong to no request; this stands in for the owner.
+_LAZY_JOB_OWNER = "raiden-lazy-offload"
+_LAZY_STATS_INTERVAL_S = 30.0
+
+
+def _as_bool(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 def _enqueue_pool_writes(pool_tensors: list[torch.Tensor]) -> None:
@@ -189,12 +229,77 @@ class _ParkedStore:
     acks: int = 0
 
 
+@dataclass
+class _LazyOffload:
+    """Lazy-offload state: HBM blocks are stored only as they near eviction."""
+
+    window_blocks: int
+    # Tokens per offload chunk (one HBM block) by KV cache group id.
+    chunk_tokens: dict[int, int]
+    gpu_block_pool: BlockPool | None = None
+    # In-flight lazy store jobs; they belong to no request.
+    jobs: set[int] = field(default_factory=set)
+    # Keys whose store failed, not offered again while their block waits in
+    # the window (a retry would most likely fail the same way).
+    failed_keys: set[OffloadKey] = field(default_factory=set)
+    # stored: jobs created; cancelled: flushed before launch (the block was
+    # reused first); drained: flushed in flight (waited for); failed.
+    stats: Counter = field(default_factory=Counter)
+    logged_stats: Counter = field(default_factory=Counter)
+    last_log: float = 0.0
+
+
+# TODO(vllm-project/vllm#52735): Remove TPU_OFFLOAD_KEEP_EAGLE_TAIL and
+# keep_unannotated_eagle_tail once the pinned vLLM includes
+# vllm-project/vllm#52771.
+def keep_unannotated_eagle_tail(
+    config: SchedulerOffloadConfig,
+    kv_cache_groups: Sequence[KVCacheGroupSpec],
+) -> tuple[SchedulerOffloadConfig, tuple[int, ...]]:
+    """Clears the drafter flag vLLM sets on unannotated offload groups.
+
+    Returns ``(config, cleared_group_ids)``. The pinned vLLM
+    (``SchedulerOffloadConfig.from_spec``) flags every KV cache group as an
+    EAGLE/MTP drafter group when speculative decoding is on and no group is
+    annotated as one. A tier lookup then pops the last chunk of each flagged
+    group's hit as a "volatile draft tail", and drops a one-chunk hit
+    entirely. GLM-5.2's MTP layer shares the target's single group, so every
+    tier hit recomputes one whole chunk (4096 tokens under DCP16). vLLM main
+    treats an unannotated group as a regular group (vllm-project/vllm#52771):
+    drafter KV served one chunk stale can only lower speculative acceptance,
+    because the target verifies every draft. On a P/D prefill leg the chunk is
+    not even stale: lazy offload stores only whole blocks written by prefills,
+    and a prefilled chunk's last draft input is the next prompt token.
+
+    Annotated drafter groups keep their flag.
+    """
+    groups = config.kv_group_configs
+    annotated = {
+        idx for idx, group in enumerate(kv_cache_groups) if group.is_eagle_group
+    }
+    cleared = tuple(
+        group.group_idx
+        for group in groups
+        if group.is_eagle_group and group.group_idx not in annotated
+    )
+    if not cleared:
+        return config, ()
+    new_groups = tuple(
+        group._replace(is_eagle_group=False) if group.group_idx in cleared else group
+        for group in groups
+    )
+    return config._replace(kv_group_configs=new_groups), cleared
+
+
 class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     """Scheduler for the store-backed offload path.
 
     Strips per-rank transfer jobs and orchestrates the store engine directly
     via RaidenOffloadingManager.
     """
+
+    # None unless kv_connector_extra_config sets lazy_offload.
+    _lazy: _LazyOffload | None = None
 
     def __init__(
         self,
@@ -203,9 +308,221 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         kv_cache_config: KVCacheConfig,
     ):
         super().__init__(spec, vllm_config, kv_cache_config)
+        if tpu_envs.TPU_OFFLOAD_KEEP_EAGLE_TAIL:
+            # Before any request: each RequestOffloadState copies self.config.
+            self.config, cleared = keep_unannotated_eagle_tail(
+                self.config, kv_cache_config.kv_cache_groups
+            )
+            logger.info(
+                "TPU_OFFLOAD_KEEP_EAGLE_TAIL: offload tier hits keep their last "
+                "chunk for KV cache groups %s; drafter groups left flagged: %s",
+                list(cleared),
+                [
+                    group.group_idx
+                    for group in self.config.kv_group_configs
+                    if group.is_eagle_group
+                ],
+            )
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+        if _as_bool(spec.extra_config.get("lazy_offload", False)):
+            self._lazy = self._init_lazy_offload(spec, vllm_config, kv_cache_config)
+
+    def _init_lazy_offload(
+        self,
+        spec: TPURaidenStoreOffloadingSpec,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+    ) -> _LazyOffload:
+        # A lazy store copies one HBM block under the key its cached hash
+        # names, so every group must offload whole blocks, one chunk each.
+        parallel_config = vllm_config.parallel_config
+        cp_size = int(parallel_config.decode_context_parallel_size or 1) * int(
+            parallel_config.prefill_context_parallel_size or 1
+        )
+        unsupported = [
+            group.group_idx
+            for group in self.config.kv_group_configs
+            if group.sliding_window_size_in_chunks is not None
+            or group.requires_cow_source
+            or group.tokens_per_chunk
+            != kv_cache_config.kv_cache_groups[group.group_idx].kv_cache_spec.block_size
+            * cp_size
+        ]
+        if self.config.blocks_per_chunk != 1 or unsupported:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: lazy_offload stores whole HBM "
+                "blocks, so it needs full-attention KV cache groups offloaded "
+                "one scheduler block per chunk; got blocks_per_chunk="
+                f"{self.config.blocks_per_chunk} and unsupported groups "
+                f"{unsupported}"
+            )
+        window_blocks = int(
+            spec.extra_config.get("lazy_window_blocks", _DEFAULT_LAZY_WINDOW_BLOCKS)
+        )
+        if window_blocks <= 0:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: lazy_window_blocks must be "
+                f"positive, got {window_blocks}"
+            )
+        self._raiden_manager.disable_request_stores()
+        chunk_tokens = {
+            group.group_idx: group.tokens_per_chunk
+            for group in self.config.kv_group_configs
+        }
+        logger.info(
+            "TPURaidenOffloadingConnector: lazy offload: storing HBM blocks only "
+            "as they near eviction (window %d blocks, %s tokens per block)",
+            window_blocks,
+            sorted(set(chunk_tokens.values())),
+        )
+        return _LazyOffload(window_blocks=window_blocks, chunk_tokens=chunk_tokens)
+
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        if self._lazy is not None:
+            self._lazy.gpu_block_pool = gpu_block_pool
+
+    def _touch(self, req_status: RequestOffloadState) -> None:
+        """Under lazy offload, refresh only the chunks past the HBM hit.
+
+        A lookup touches every key of the request, the prefix HBM serves
+        included. A lazy tier holds what HBM dropped, so refreshing its copies
+        of blocks HBM still serves would keep them at the Most Recently Used
+        end, and the tier would evict the blocks HBM actually dropped first.
+        The tier holds no partial-tail entries in lazy mode (request stores
+        are off), so there is no boundary key to refresh either.
+        """
+        if self._lazy is None:
+            super()._touch(req_status)
+            return
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            served = (
+                req_status.num_locally_computed_tokens // group_config.tokens_per_chunk
+            )
+            self.manager.touch(
+                group_state.offload_keys[served:], req_status.req_context
+            )
+
+    def _schedule_lazy_stores(self) -> set[int]:
+        """Park store jobs for the cached HBM blocks the allocator takes next.
+
+        Scans the first `window_blocks` blocks of the free queue in eviction
+        order and parks one store job per whole cached block the tier does
+        not hold yet. The block is left in place: a store job is watched
+        through `_block_id_to_pending_jobs`, so when the allocator takes the
+        block, `build_connector_meta` cancels the job if it has not launched
+        and drains it if it has, before the block is written.
+        """
+        lazy = self._lazy
+        assert lazy is not None
+        pool = lazy.gpu_block_pool
+        if pool is None:
+            return set()
+        keys: list[OffloadKey] = []
+        block_ids: list[int] = []
+        seen: set[OffloadKey] = set()
+        for position, block in enumerate(pool.free_block_queue.iter_blocks_after(None)):
+            if position >= lazy.window_blocks:
+                break
+            block_hash = block.block_hash
+            if (
+                block_hash is None
+                or block.is_null
+                or block.block_id in self._block_id_to_pending_jobs
+            ):
+                continue
+            chunk_tokens = lazy.chunk_tokens.get(get_group_id(block_hash))
+            num_tokens = block.block_hash_num_tokens
+            # A partial entry (a fine prefix hit ending inside the block) is
+            # no whole chunk; neither the lookup nor a load can use it.
+            if chunk_tokens is None or not num_tokens or num_tokens % chunk_tokens:
+                continue
+            key = make_offload_key(get_block_hash(block_hash), get_group_id(block_hash))
+            if key in lazy.failed_keys or key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+            block_ids.append(block.block_id)
+        if not keys:
+            return set()
+        store_output = self._raiden_manager.prepare_evicting_store(keys)
+        if store_output is None or not store_output.keys_to_store:
+            return set()
+        accepted = set(store_output.keys_to_store)
+        job_ids: set[int] = set()
+        for key, block_id in zip(keys, block_ids):
+            if key not in accepted:
+                continue
+            job_id = self._generate_job_id()
+            self._jobs[job_id] = TransferJobStatus(
+                req_id=_LAZY_JOB_OWNER,
+                pending_count=self.config.num_workers,
+                keys={key},
+                is_store=True,
+                fenced_block_ids=[block_id],
+            )
+            self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
+            self._fence_pending[job_id] = _ParkedStore(
+                keys=[key], device_block_ids=[block_id]
+            )
+            lazy.jobs.add(job_id)
+            job_ids.add(job_id)
+        lazy.stats["stored"] += len(job_ids)
+        return job_ids
+
+    def _complete_lazy_jobs(
+        self, connector_output: KVConnectorOutput, meta: OffloadingWorkerMetadata
+    ) -> KVConnectorOutput:
+        """Retire echoed lazy store jobs, and hand the rest to the base class,
+        which looks every job's request up and would find none for these."""
+        lazy = self._lazy
+        assert lazy is not None
+        others: dict[int, int] = {}
+        for job_id, count in meta.completed_jobs.items():
+            if job_id not in lazy.jobs:
+                others[job_id] = count
+                continue
+            job = self._jobs.get(job_id)
+            if job is None:
+                lazy.jobs.discard(job_id)
+                continue
+            job.pending_count -= count
+            assert job.pending_count >= 0, (job_id, job.pending_count)
+            if job.pending_count:
+                continue
+            self._remove_pending_job(job_id, job.fenced_block_ids)
+            del self._jobs[job_id]
+            lazy.jobs.discard(job_id)
+        if len(others) == len(meta.completed_jobs):
+            return connector_output
+        return replace(
+            connector_output,
+            kv_connector_worker_meta=replace(meta, completed_jobs=others),
+        )
+
+    def _maybe_log_lazy_stats(self) -> None:
+        lazy = self._lazy
+        assert lazy is not None
+        now = time.monotonic()
+        if (
+            lazy.stats == lazy.logged_stats
+            or now - lazy.last_log < _LAZY_STATS_INTERVAL_S
+        ):
+            return
+        lazy.last_log = now
+        lazy.logged_stats = Counter(lazy.stats)
+        logger.info(
+            "TPURaidenOffloadingConnector: lazy offload totals: stored=%d "
+            "cancelled=%d drained=%d failed=%d in_flight=%d",
+            lazy.stats["stored"],
+            lazy.stats["cancelled"],
+            lazy.stats["drained"],
+            lazy.stats["failed"],
+            len(lazy.jobs),
+        )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -259,6 +576,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         failed_load_block_ids: list[int] = []
         flush_ids = meta.jobs_to_flush or set()
         launched_flush_ids: set[int] = set()
+        lazy = self._lazy
         for job_id in flush_ids:
             parked = self._fence_pending.pop(job_id, None)
             if parked is not None:
@@ -266,6 +584,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 finished_store_ids.append(job_id)
                 # Avoid useless TPU sync if created and cancelled in the same step.
                 new_fence_ids.discard(job_id)
+                if lazy is not None and job_id in lazy.jobs:
+                    lazy.stats["cancelled"] += 1
                 logger.debug(
                     "TPURaidenOffloadingConnector: cancelled fence-pending "
                     "store job %d (source blocks reused)",
@@ -273,16 +593,35 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 )
             elif manager.is_job_launched(job_id):
                 launched_flush_ids.add(job_id)
+                if lazy is not None and job_id in lazy.jobs:
+                    lazy.stats["drained"] += 1
         drained = manager.drain_jobs(launched_flush_ids) if launched_flush_ids else []
 
         # Collect completed/drained jobs for the worker echo channel.
         for finished_job in list(drained) + manager.poll_finished_jobs():
             if finished_job.op == AdmissionOp.STORE:
                 finished_store_ids.append(finished_job.job_id)
+                if (
+                    lazy is not None
+                    and not finished_job.success
+                    and finished_job.job_id in lazy.jobs
+                ):
+                    lazy.stats["failed"] += 1
+                    job = self._jobs.get(finished_job.job_id)
+                    if job is not None:
+                        if len(lazy.failed_keys) > 4096:
+                            lazy.failed_keys.clear()
+                        lazy.failed_keys.update(job.keys)
             else:
                 assert finished_job.req_id is not None
                 finished_loads[finished_job.job_id] = finished_job.req_id
                 failed_load_block_ids.extend(finished_job.failed_device_block_ids)
+
+        if lazy is not None:
+            # After the flush above: every block this step allocated has left
+            # the free queue, so the scan sees only blocks still free.
+            new_fence_ids.update(self._schedule_lazy_stores())
+            self._maybe_log_lazy_stats()
 
         # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
         return RaidenOffloadingConnectorMetadata(
@@ -311,6 +650,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     self._raiden_manager.submit_store_job(
                         job_id, parked.keys, parked.device_block_ids
                     )
+        if (
+            self._lazy is not None
+            and isinstance(meta, OffloadingWorkerMetadata)
+            and meta.completed_jobs
+        ):
+            connector_output = self._complete_lazy_jobs(connector_output, meta)
         super().update_connector_output(connector_output)
 
 
@@ -390,6 +735,11 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             self._pending_fences: list[tuple[set[int], torch.Event]] = []
 
     # -- scheduler-side hooks ----------------------------------------------
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        # Lazy offload scans the pool's free queue for blocks near eviction.
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
+
     def reset_cache(self) -> bool | None:
         # External cache reset is unsupported by the Raiden store. Report
         # failure through the endpoint's documented channel instead of raising an

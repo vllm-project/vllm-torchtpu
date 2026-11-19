@@ -112,6 +112,15 @@ class AsyncTPUCopyState:
             _spec_logprobs_tpu=spec_logprobs_tpu,
         )
 
+    def fence_pending_device_work(self) -> None:
+        """Re-arms the ready event behind everything enqueued on the device
+        since the copy was issued. A torch.tpu.Event covers all work
+        enqueued before it is recorded, so wait() then also proves that
+        later work (a drafter's KV writes) has executed."""
+        event = torch.tpu.Event()
+        event.record()
+        self.copy_ready_event = event
+
     def wait(self) -> None:
         if self.completed:
             return
