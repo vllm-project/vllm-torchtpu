@@ -256,6 +256,25 @@ def test_validation_legs_take_the_levers_this_tree_gives_them(monkeypatch, path)
     assert _expert_parallel_size(legs["prefill"]["serve_args"]) == 1
 
 
+# Point entries whose decode leg is TP8 (their KV budget is the calibrated
+# one, which needs fused EP v3).
+TP8_POINTS = [p for p in POINTS if "-tp8-" in p.stem]
+
+
+@pytest.mark.parametrize("path", TP8_POINTS, ids=lambda p: p.stem)
+def test_tp8_decode_legs_read_fused_ep_v3_from_their_environment(monkeypatch, path):
+    """Through the real environment readers, not a patched attribute: each
+    TP8 decode leg's environment selects fused EP v3, the MoE kernel its KV
+    budget and its fused EP wiring were measured with."""
+    env = _legs(path)["decode"]["env"]
+    for name in ("USE_MOE_FUSED_EP_KERNEL", "MOE_FUSED_EP_KERNEL_IMPL"):
+        monkeypatch.delenv(name, raising=False)
+        if name in env:
+            monkeypatch.setenv(name, str(env[name]))
+    assert envs.USE_MOE_FUSED_EP_KERNEL is True
+    assert envs.MOE_FUSED_EP_KERNEL_IMPL == "v3"
+
+
 @pytest.mark.parametrize("path", POINTS, ids=lambda p: p.stem)
 def test_no_leg_arms_the_fused_moe_decode_kernels(path):
     """Neither leg sets the switches of the fused MoE decode kernel or the TP
