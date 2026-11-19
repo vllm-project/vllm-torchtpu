@@ -85,8 +85,8 @@ warning and keeps vLLM's page. When the prefill and decode block sizes differ
 transfer is refused with "Layout fingerprint mismatch". Give both engines the
 same page:
 `--additional-config '{"tpu_kv_transfer": {"kernel_page_tokens": 128}}'`.
-`Qwen/Qwen3.5-397B-A17B` engines with a KV transfer config and no prefill
-context parallelism default to 128.
+`Qwen/Qwen3.5-397B-A17B` engines with a KV transfer config, the
+seq-along-lane layout and no prefill context parallelism default to 128.
 
 ### Step 3: Launch Decode Instance (`kv_consumer`)
 

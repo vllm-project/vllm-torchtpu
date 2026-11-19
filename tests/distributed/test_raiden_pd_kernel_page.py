@@ -99,7 +99,10 @@ def _engine(
     was_cached = vllm_envs._is_envs_cache_enabled()
     vllm_envs.disable_envs_cache()
     try:
-        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", layout)
+        if layout is None:
+            monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", layout)
         # Building a VllmConfig runs the platform's check_and_update_config.
         # That applies the platform patches for the rest of the process (one
         # replaces torch_tpu's Pallas shape conversion, which later tests rely
@@ -328,6 +331,59 @@ def test_hook_sets_the_page_only_for_a_397b_engine_with_kv_transfer(monkeypatch)
     with _engine(monkeypatch, kv_role="kv_consumer", section=explicit) as config:
         assert _section(config) is explicit
         assert BATCHED.get_supported_kernel_block_sizes() == [256]
+
+
+@pytest.mark.parametrize(
+    "layout,page",
+    [
+        ("HND", 128),  # the measured legs' layout: the default is written
+        ("NHD", None),
+        (None, None),  # unset: the batched backend resolves to LBNHC
+    ],
+)
+def test_hook_writes_the_page_only_where_it_applies(monkeypatch, layout, page):
+    """The 128 default is written only for a seq-along-lane cache, so an
+    engine on another layout, whose user never set the page, gets no warning
+    from the platform's page check."""
+    logger = Mock()
+    with _engine(monkeypatch, kv_role="kv_consumer", layout=layout) as config:
+        resolved = config.cache_config.get_resolved_kv_cache_layout()
+        monkeypatch.setattr(attention, "logger", logger)
+        attention.check_kv_transfer_page(config, resolved)
+        section = _section(config)
+    assert section == (None if page is None else {"kernel_page_tokens": page})
+    logger.warning_once.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "layout,written", [("HND", True), ("NHD", False), (None, False)]
+)
+def test_hook_reads_the_layout_vllm_will_resolve(monkeypatch, layout, written):
+    """vLLM runs the hook before it resolves the layout, so the hook reads
+    VLLM_KV_CACHE_LAYOUT when the cache config holds none yet."""
+    if layout is None:
+        monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", layout)
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role="kv_producer"),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+        model_config=SimpleNamespace(
+            architectures=[QWEN35], hf_text_config=SimpleNamespace(**SHAPE_397B)
+        ),
+        cache_config=SimpleNamespace(kv_cache_layout=None),
+        additional_config={},
+    )
+    from vllm import envs as vllm_envs
+
+    was_cached = vllm_envs._is_envs_cache_enabled()
+    vllm_envs.disable_envs_cache()
+    try:
+        qwen3_5_hooks._apply_kv_transfer_page(config)
+    finally:
+        if was_cached:
+            vllm_envs.enable_envs_cache()
+    assert ("tpu_kv_transfer" in config.additional_config) is written
 
 
 def test_pcp_engine_honours_the_setting(monkeypatch):
