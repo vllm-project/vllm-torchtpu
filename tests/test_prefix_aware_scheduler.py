@@ -229,6 +229,26 @@ def test_coordinator_failure_falls_back_to_fcfs():
     assert s._paw_scoring_broken is True
 
 
+def test_a_failing_memo_recheck_falls_back_to_fcfs(monkeypatch):
+    """A cross-step memo reuse recomputes the lookup to verify it; if that
+    lookup fails, warmth scoring falls back to FCFS as a fresh lookup does."""
+    now = time.time()
+    r1 = _make_request("r1", num_tokens=1000, arrival_time=now - 10)
+    r2 = _make_request("r2", num_tokens=1000, arrival_time=now - 5)
+    s = _make_scheduler([r1, r2], {"r1": 0, "r2": 500}, raise_on_lookup=True)
+    monkeypatch.setattr(s, "_get_prefix_cache_epoch", lambda: 2)
+    monkeypatch.setattr(s, "_memo_still_exact", lambda cached, epoch: True)
+    s._memo_xstep = True
+    s._memo_verify_left = 64
+    for r in (r1, r2):
+        # A still-exact memo from epoch 1 for this request's lookup length.
+        r._paw_hit_cache = (1, 999, ({}, 500, 0), 500, frozenset(), 1)
+
+    q = s._select_waiting_queue_for_scheduling()
+    assert [r.request_id for r in q] == ["r1", "r2"]
+    assert s._paw_scoring_broken is True
+
+
 def test_epoch_cache_reuses_longest_cache_hit_and_invalidates_on_epoch_change(
     monkeypatch,
 ):
