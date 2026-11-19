@@ -11,6 +11,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 import vllm_torchtpu
 import vllm_torchtpu.runner.tpu_runner as runner_mod
+from vllm_torchtpu.runner.min_tokens import MinTokensTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.utils import tpu_bind_kv_cache
 
@@ -19,6 +20,7 @@ pytestmark = pytest.mark.cpu_test
 
 def _runner_with_raw_tensors(raw_tensors):
     runner = object.__new__(TPUModelRunner)
+    runner._min_tokens = MinTokensTracker()
     runner.requests = {}
     runner._mamba_state_pos = {}
     runner._mamba_offset_seeded = set()
@@ -283,6 +285,7 @@ def test_is_unified_pool_used():
     """Verify is_unified_pool_used checks whether kv_cache_raw_tensors
     is present and non-empty."""
     runner = object.__new__(TPUModelRunner)
+    runner._min_tokens = MinTokensTracker()
     # Attribute missing
     assert not runner.is_unified_pool_used()
 

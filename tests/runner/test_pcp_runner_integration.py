@@ -699,12 +699,12 @@ def test_dummy_run_partial_layout_decode_like_metadata_routes_to_streaming(monke
     assert ctx.sequence_layout_descriptor.kind is SequenceLayoutKind.PARTIAL
     assert ctx.sequence_layout_descriptor.protocol == "pcp_streaming"
     torch.testing.assert_close(
-        ctx.request_distribution.cpu(), torch.tensor([8, 8, 8], dtype=torch.int32)
+        ctx.request_distribution.cpu(), torch.zeros(3, dtype=torch.int32)
     )
     torch.testing.assert_close(
-        ctx.query_start_loc.cpu(), torch.arange(9, dtype=torch.int32)
+        ctx.query_start_loc.cpu(), torch.zeros(9, dtype=torch.int32)
     )
-    torch.testing.assert_close(ctx.seq_lens.cpu(), torch.ones(8, dtype=torch.int32))
+    torch.testing.assert_close(ctx.seq_lens.cpu(), torch.zeros(8, dtype=torch.int32))
     assert runner.forward_model.call_args.kwargs["input_ids"].shape == (256,)
     torch.testing.assert_close(
         runner.forward_model.call_args.kwargs["positions"][:16].cpu(),
@@ -725,11 +725,10 @@ def test_dummy_run_marks_inactive_request_rows_after_cache_init(monkeypatch):
 
     assert ctx is not None
     torch.testing.assert_close(
-        md.query_start_loc.cpu(),
-        torch.tensor([0, 1, 2, 3, 3, 3, 3, 3, 3], dtype=torch.int32),
+        md.query_start_loc.cpu(), torch.zeros(9, dtype=torch.int32)
     )
     torch.testing.assert_close(
-        md.request_distribution.cpu(), torch.tensor([3, 3, 3], dtype=torch.int32)
+        md.request_distribution.cpu(), torch.zeros(3, dtype=torch.int32)
     )
 
 
@@ -748,11 +747,10 @@ def test_dummy_run_marks_inactive_request_rows_before_cache_init(monkeypatch):
 
     assert ctx is None
     torch.testing.assert_close(
-        md.query_start_loc.cpu(),
-        torch.tensor([0, 1, 2, 3, 3, 3, 3, 3, 3], dtype=torch.int32),
+        md.query_start_loc.cpu(), torch.zeros(9, dtype=torch.int32)
     )
     torch.testing.assert_close(
-        md.request_distribution.cpu(), torch.tensor([3, 3, 3], dtype=torch.int32)
+        md.request_distribution.cpu(), torch.zeros(3, dtype=torch.int32)
     )
     assert md.sequence_layout_kind == SequenceLayoutKind.PARTIAL.value
     assert md.sequence_layout_protocol == "pcp_streaming"

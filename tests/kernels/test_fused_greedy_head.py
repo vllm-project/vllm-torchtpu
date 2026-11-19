@@ -10,6 +10,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import fused_greedy_head as kernel
 from vllm_torchtpu.layers.adapter.sample.fused_greedy_head import FusedGreedyHead
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import DeepseekV41ForCausalLM
+from vllm_torchtpu.runner.min_tokens import MinTokensTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -20,13 +21,16 @@ def _runner(weight):
     model.lm_head.weight = torch.nn.Parameter(weight, requires_grad=False)
     return SimpleNamespace(
         model=model,
+        _min_tokens=MinTokensTracker(),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1, pipeline_parallel_size=1
         ),
         speculative_config=SimpleNamespace(method="dspark", num_speculative_tokens=5),
         max_num_reqs=48,
         lora_config=None,
-        input_batch=SimpleNamespace(all_greedy=True, max_num_logprobs=None),
+        input_batch=SimpleNamespace(
+            all_greedy=True, max_num_logprobs=None, req_id_to_index={}
+        ),
     )
 
 

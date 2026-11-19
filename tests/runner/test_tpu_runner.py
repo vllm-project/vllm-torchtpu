@@ -330,6 +330,7 @@ def test_spec_warmup_clamps_circular_buffer_group_blocks():
         max_model_len=8192,
         max_num_tokens=2048,
         speculative_config=SimpleNamespace(num_speculative_tokens=5),
+        vllm_config=SimpleNamespace(num_lookahead_tokens=5),
         kv_cache_config=SimpleNamespace(
             num_blocks=100,
             kv_cache_groups=[attn_group, ring_group],
@@ -3050,6 +3051,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             spec_decode_manager=SimpleNamespace(
                 propose_draft_token_ids=lambda **kw: None
             ),
+            _min_tokens_batch_state=lambda: {},
             _get_sampling_generator=lambda: None,
             _build_padded_sampling_params=lambda start, end, logits: sampling_params,
             _sampler_topk_candidates=lambda start, end, grammar: 0,

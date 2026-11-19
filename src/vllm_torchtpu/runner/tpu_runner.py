@@ -126,6 +126,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
+from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -933,6 +934,7 @@ class TPUModelRunner(GPUModelRunner):
         self.mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         self.execute_model_state: ExecuteModelState | None = None
         self._pre_async_results: AsyncPreResults | None = None
+        self._min_tokens = min_tokens_mask.MinTokensTracker()
         # 1 on TP rank 0, else 0; built lazily on first use by
         # _sync_replicated_drafts_across_tp (needs the TP group initialized).
         self._tp_rank0_mask: torch.Tensor | None = None
@@ -2558,6 +2560,9 @@ class TPUModelRunner(GPUModelRunner):
             else scheduler_output
         )
         result = super()._update_states(base_output)
+        self._min_tokens.discard(scheduler_output.finished_req_ids)
+        for new_req in scheduler_output.scheduled_new_reqs:
+            self._min_tokens.add(new_req.req_id, new_req.sampling_params)
         self._record_replay_starts(scheduler_output)
         # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:
@@ -4443,6 +4448,67 @@ class TPUModelRunner(GPUModelRunner):
             all_greedy=True,
         )
 
+    def _min_tokens_batch_state(self) -> min_tokens_mask.MinTokensState:
+        """This step's batch rows still below min_tokens (empty if none)."""
+        if not self._min_tokens:
+            return {}
+        self._settle_draft_placeholders_for_min_tokens()
+        return self._min_tokens.batch_state(
+            self.input_batch.req_id_to_index, self._num_output_tokens
+        )
+
+    def _num_output_tokens(self, req_id: str) -> int | None:
+        req_state = self.requests.get(req_id)
+        return None if req_state is None else len(req_state.output_token_ids)
+
+    def _settle_draft_placeholders_for_min_tokens(self) -> None:
+        """Under async scheduling a request's output still ends with the
+        previous step's 1 + n optimistic placeholders, which overcount it by
+        the rejected drafts (0..n) until _modify_prev_results rolls them back.
+        Roll back now, before the mask, if that can change what a tracked
+        request in this batch masks this step. Far from min_tokens every row
+        is masked either way and nothing waits. (vLLM's MinTokens counts the
+        optimistic placeholders, so near min_tokens it can let a stop through
+        early under async spec decoding; this is stricter.)"""
+        pre = self._pre_async_results
+        if pre is None or not pre.num_draft_per_req:
+            return
+        tracked = self._min_tokens.requests
+        in_batch = self.input_batch.req_id_to_index
+        max_ahead = (
+            self.speculative_config.num_speculative_tokens
+            if self.speculative_config is not None
+            else 0
+        )
+        for req_idx, req_state, _seq_len, req_id in pre.request_seq_lens:
+            req = tracked.get(req_id)
+            num_draft = pre.num_draft_per_req.get(req_idx, 0)
+            if req is None or not num_draft or req_id not in in_batch:
+                continue
+            num_output = len(req_state.output_token_ids)
+            if num_output - num_draft < req.min_tokens <= num_output + max_ahead:
+                # Deliberate stall: this waits for the previous step's D2H copy
+                # before any of this step's sampling is enqueued. Bounded to the
+                # few steps per request where min_tokens falls in this window.
+                self._modify_prev_results()
+                self._pre_async_results = None
+                return
+
+    def _mask_min_tokens(
+        self,
+        logits: torch.Tensor,
+        rows: min_tokens_mask.StateRows,
+        min_toks: min_tokens_mask.MinTokensState,
+    ) -> torch.Tensor:
+        """Masks the stop tokens of the rows still below min_tokens; `rows` as
+        in `min_tokens.build_stop_table`. Returns `logits` when none is."""
+        if not rows:
+            return logits
+        table = min_tokens_mask.build_stop_table(min_toks, rows, logits.shape[0])
+        if table is None:
+            return logits
+        return min_tokens_mask.apply_stop_table(logits, *table)
+
     def _sample_spec_verify_chunk(
         self,
         logits: torch.Tensor | GreedyTokenIds,
@@ -4453,12 +4519,32 @@ class TPUModelRunner(GPUModelRunner):
         cur_end_idx: int,
         all_greedy: bool,
         sampling_generator: torch.Generator | None,
+        min_toks: min_tokens_mask.MinTokensState | None = None,
     ) -> torch.Tensor:
         """Bonus-token sampling + draft rejection for one spec-verify chunk.
 
         Returns the rejection sampler's [num_reqs, 1 + num_spec_tokens]
         selected tokens for the chunk.
         """
+        min_toks = min_toks or {}
+        min_tokens_rows = None
+        if min_toks and any(cur_start_idx <= i < cur_end_idx for i in min_toks):
+            assert isinstance(logits, torch.Tensor), (
+                "greedy IDs chosen below min_tokens"
+            )
+            draft_lengths = md.draft_lengths_cpu[: cur_end_idx - cur_start_idx]
+            if grammar_output is None:
+                logits = self._mask_min_tokens(
+                    logits,
+                    min_tokens_mask.verify_logits_rows(
+                        min_toks, cur_start_idx, draft_lengths.tolist()
+                    ),
+                    min_toks,
+                )
+            else:
+                min_tokens_rows = min_tokens_mask.verify_rows(
+                    min_toks, cur_start_idx, draft_lengths.tolist()
+                )
         req_temperatures = req_top_k = req_top_p = None
         if isinstance(logits, GreedyTokenIds):
             assert all_greedy and grammar_output is None
@@ -4519,6 +4605,12 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
                 assert target_logits is not None
+            if min_tokens_rows is not None:
+                target_rows, bonus_rows = min_tokens_rows
+                target_logits = self._mask_min_tokens(
+                    target_logits, target_rows, min_toks
+                )
+                bonus_logits = self._mask_min_tokens(bonus_logits, bonus_rows, min_toks)
             if all_greedy:
                 bonus_token_ids = self._greedy_sample(bonus_logits).view(-1)
             else:
@@ -4607,6 +4699,7 @@ class TPUModelRunner(GPUModelRunner):
         state = self.execute_model_state
         scheduler_output = state.scheduler_output
         self.execute_model_state = None
+        min_toks = self._min_tokens_batch_state()
 
         # Used to keep rand draws consistent across TP ranks.
         sampling_generator = self._get_sampling_generator()
@@ -4625,6 +4718,9 @@ class TPUModelRunner(GPUModelRunner):
                 "with the merged vLLM v1 sampler path yet."
             )
         needs_logprobs = max_num_logprobs is not None
+        assert not min_toks or not any(
+            isinstance(logits, GreedyTokenIds) for logits in state.logits_list
+        ), "greedy IDs chosen with a request below min_tokens"
 
         # Per-chunk bucketed (padded) tensors plus their real (unpadded)
         # request counts; kept at bucketed shapes so the async D2H copy hits
@@ -4677,6 +4773,7 @@ class TPUModelRunner(GPUModelRunner):
                             cur_end_idx,
                             all_greedy,
                             sampling_generator,
+                            min_toks,
                         )
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
@@ -4713,6 +4810,16 @@ class TPUModelRunner(GPUModelRunner):
                             None,
                             cur_start_idx,
                             cur_end_idx,
+                        )
+                    # Preserve raw logprobs before applying the stop-token mask.
+                    logprob_logits = logits
+                    if min_toks:
+                        logits = self._mask_min_tokens(
+                            logits,
+                            min_tokens_mask.plain_rows(
+                                min_toks, cur_start_idx, cur_end_idx
+                            ),
+                            min_toks,
                         )
                     with self._stage_timing.stage("sample"):
                         if all_greedy:
@@ -4753,7 +4860,7 @@ class TPUModelRunner(GPUModelRunner):
                     if needs_logprobs:
                         spec_logprobs_chunks.append(
                             SpecLogprobsChunk(
-                                tensors=self.gather_logprobs(logits, selected),
+                                tensors=self.gather_logprobs(logprob_logits, selected),
                                 row_starts=np.arange(num_reqs),
                             )
                         )
@@ -4780,6 +4887,16 @@ class TPUModelRunner(GPUModelRunner):
                     logits = self.structured_decoding_manager.mask_logits(
                         logits, grammar_output, cur_start_idx, cur_end_idx
                     )
+                # Preserve raw logprobs before applying the stop-token mask.
+                logprob_logits = logits
+                if min_toks:
+                    logits = self._mask_min_tokens(
+                        logits,
+                        min_tokens_mask.plain_rows(
+                            min_toks, cur_start_idx, cur_end_idx
+                        ),
+                        min_toks,
+                    )
                 with self._stage_timing.stage("sample"):
                     if all_greedy:
                         selected_token_ids = self._greedy_sample(logits)
@@ -4805,7 +4922,7 @@ class TPUModelRunner(GPUModelRunner):
                 # due to recompilations outside torch.compiled code, so just make
                 # sure `sample_from_logits` does not modify the logits in-place.
                 logprobs = (
-                    self.gather_logprobs(logits, selected_token_ids)
+                    self.gather_logprobs(logprob_logits, selected_token_ids)
                     if needs_logprobs
                     else None
                 )
@@ -5456,7 +5573,13 @@ class TPUModelRunner(GPUModelRunner):
             )
         else:
             input_ids = torch.zeros((num_tokens), dtype=torch.int32).to(self.device)
-            actual_num_reqs = min(num_tokens, num_reqs)
+            # Warmup and idle DP ranks own no request: every row is padding,
+            # as the padding state below records. Their zero block tables
+            # point at block 0, the null page of every cache group; under
+            # block-outer packing layers of different dtypes share it, so a
+            # dummy KV write there reads back as nonfinite values in other
+            # layers. Empty requests read and write no cache rows.
+            actual_num_reqs = 0
         inputs_embeds = None
         if self.uses_mrope:
             position_ids = torch.zeros((3, num_tokens), dtype=torch.int32).to(
@@ -5471,7 +5594,7 @@ class TPUModelRunner(GPUModelRunner):
         query_start_loc = torch.cumsum(
             torch.tensor([0] + query_lens, dtype=torch.int32), dim=0, dtype=torch.int32
         ).to(self.device)
-        seq_lens_cpu = torch.ones((num_reqs,), dtype=torch.int32)
+        seq_lens_cpu = torch.full((num_reqs,), int(profiling), dtype=torch.int32)
         if profiling:
             for i, q in enumerate(profile_query_lens):
                 seq_lens_cpu[i] = q
@@ -5967,19 +6090,7 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
-            # Prefill-only PCP MTP K1 skips _precompile_rejection_sampler(), so
-            # we skip it here as well.
-            if self.speculative_config is None or (
-                self._pcp_enabled and self._mtp_enabled
-            ):
-                return
-            # For spec decoding, target logits have padded_logits_length rows.
-            max_target_rows = (
-                self.structured_decoding_manager.target_grammar_bitmask_cpu.shape[0]
-            )
-            for num_tokens in self.num_tokens_paddings:
-                if num_tokens > max_target_rows:
-                    break
+            for num_tokens in self._verify_logits_paddings():
                 out = self.structured_decoding_manager.structured_decode(
                     self.structured_decoding_manager.require_structured_out_target_cpu[
                         :num_tokens
@@ -5992,6 +6103,38 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 synchronize_tensors(out)
                 logger.info("  -- target_logits_length: %d", num_tokens)
+
+    def _verify_logits_paddings(self) -> list[int]:
+        """Row counts a verify chunk's logits and its target rows are padded
+        to; empty when no step verifies drafts. Prefill-only MTP skips
+        _precompile_rejection_sampler(), so it has none either."""
+        if self.speculative_config is None or (self._pcp_enabled and self._mtp_enabled):
+            return []
+        max_target_rows = (
+            self.structured_decoding_manager.target_grammar_bitmask_cpu.shape[0]
+        )
+        return [n for n in self.num_tokens_paddings if n <= max_target_rows]
+
+    def _precompile_min_tokens_mask(self) -> None:
+        with self._precompile_timed("min_tokens_mask"):
+            row_counts = set(self.num_reqs_paddings)
+            row_counts.update(self._verify_logits_paddings())
+            for num_rows in sorted(row_counts):
+                logits = self._dummy_logits(num_rows)
+                out = min_tokens_mask.restore_all_masked_rows(
+                    logits,
+                    min_tokens_mask.mask_stop_tokens(
+                        logits,
+                        torch.full(
+                            (num_rows, min_tokens_mask.STOP_IDS_WIDTH),
+                            -1,
+                            dtype=torch.int32,
+                        ).to(self.device),
+                    ),
+                    torch.zeros((num_rows,), dtype=torch.bool).to(self.device),
+                )
+                synchronize_tensors(out)
+                logger.info("  -- num_rows: %d", num_rows)
 
     def _precompile_sample_from_logits(self) -> None:
         with self._precompile_timed("sample_from_logits"):
@@ -6355,6 +6498,7 @@ class TPUModelRunner(GPUModelRunner):
         ).uses_selected_logits_hidden_states:
             self._precompile_compute_logits_from_hidden_states()
         self._precompile_structured_decoding()
+        self._precompile_min_tokens_mask()
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
 
@@ -7031,7 +7175,10 @@ class TPUModelRunner(GPUModelRunner):
         # groups differ on hybrid models (mamba vs attention), and the
         # runner-level self.block_size predates the executor's post-load
         # block-size finalization.
-        max_pos = min(self.max_model_len, max([P] + decode_ncts) + (1 + K))
+        # The drafter writes num_lookahead_tokens past the verify window, as
+        # the scheduler reserves; an unallocated page maps to the null block.
+        lookahead = self.vllm_config.num_lookahead_tokens
+        max_pos = min(self.max_model_len, max([P] + decode_ncts) + (1 + K) + lookahead)
         top = int(self.kv_cache_config.num_blocks)
         block_ids_per_group = []
         max_nblk = 0
@@ -7575,6 +7722,7 @@ class TPUModelRunner(GPUModelRunner):
             and self.input_batch.all_greedy
             and not scheduler_output.has_structured_output_requests
             and self.input_batch.max_num_logprobs is None
+            and not self._min_tokens.any_in(self.input_batch.req_id_to_index)
         )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)

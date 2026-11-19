@@ -65,6 +65,7 @@ def _fake_runner(method, is_async, verify, propose):
     )
     async_source = ([torch.tensor([7, 8])], {0: 0}, None, {"r0": 1})
     runner = SimpleNamespace(
+        _min_tokens_batch_state=lambda: {},
         execute_model_state=SimpleNamespace(
             scheduler_output=scheduler_output,
             draft_chunks=[],

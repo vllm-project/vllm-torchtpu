@@ -10,6 +10,7 @@ import torch
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_torchtpu.runner.min_tokens import MinTokensTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -17,6 +18,7 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 @pytest.mark.parametrize("num_drafts", [0, 3])
 def test_async_results_do_not_overwrite_recomputed_request(transition, num_drafts):
     runner = object.__new__(TPUModelRunner)
+    runner._min_tokens = MinTokensTracker()
     stride = 1 + num_drafts
     invalid = transition != "continue"
     states = {
