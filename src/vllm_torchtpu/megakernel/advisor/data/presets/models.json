@@ -126,7 +126,7 @@
     "glm-5.2": {
       "num_layers": 78,
       "hidden_size": 6144,
-      "intermediate_size": 16384,
+      "intermediate_size": 12288,
       "num_attention_heads": 64,
       "num_kv_heads": 64,
       "head_dim": 256,
@@ -136,11 +136,16 @@
       "shared_expert_intermediate_size": 2048,
       "num_moe_layers": 75,
       "kv_lora_rank": 512,
-      "q_lora_rank": 1536,
-      "qk_nope_head_dim": 128,
+      "q_lora_rank": 2048,
+      "qk_nope_head_dim": 192,
       "qk_rope_head_dim": 64,
+      "index_topk": 2048,
+      "index_head_dim": 128,
+      "index_n_heads": 32,
+      "num_indexer_layers": 21,
       "weight_dtype": "fp8",
-      "model_type": "glm5",
+      "weight_block_k": 128,
+      "model_type": "glm_moe_dsa",
       "source": "HuggingFace zai-org/GLM-5.2-FP8 config.json"
     },
     "mistral-large": {
@@ -222,57 +227,6 @@
       "weight_dtype": "fp8",
       "model_type": "qwen3_moe",
       "source": "HuggingFace Qwen/Qwen3-30B-A3B-FP8 config.json"
-    },
-    "deepseek-v4": {
-      "num_layers": 61,
-      "hidden_size": 7168,
-      "intermediate_size": 18432,
-      "num_attention_heads": 128,
-      "num_kv_heads": 1,
-      "head_dim": 512,
-      "num_experts": 256,
-      "top_k": 8,
-      "moe_intermediate_size": 2048,
-      "shared_expert_intermediate_size": 2048,
-      "num_moe_layers": 58,
-      "weight_dtype": "fp8",
-      "model_type": "deepseek_v4",
-      "kv_compress_factor": 0.12692110655737704,
-      "residual_streams": 4,
-      "layer_families": [
-        "gqa",
-        "sparse_csa",
-        "moe",
-        "dense_mlp",
-        "dense_prefix_moe",
-        "hyper_connection"
-      ],
-      "source": "DeepSeek-V4 CSA + mHC architectural specification"
-    },
-    "qwen4-exp": {
-      "num_layers": 48,
-      "hidden_size": 2048,
-      "intermediate_size": 6144,
-      "num_attention_heads": 32,
-      "num_kv_heads": 4,
-      "head_dim": 128,
-      "num_linear_layers": 36,
-      "linear_key_heads": 16,
-      "linear_value_heads": 32,
-      "num_experts": 128,
-      "top_k": 8,
-      "moe_intermediate_size": 768,
-      "shared_expert_intermediate_size": 768,
-      "weight_dtype": "fp8",
-      "model_type": "qwen4_exp",
-      "residual_streams": 4,
-      "layer_families": [
-        "gqa",
-        "gdn",
-        "moe",
-        "hyper_connection"
-      ],
-      "source": "Qwen4-Exp HCA + hyper-connections architectural specification"
     }
   },
   "aliases": {
@@ -302,10 +256,6 @@
     "qwen3-30b-a3b": "qwen3-30b-a3b",
     "qwen3-30b-a3b-fp8": "qwen3-30b-a3b",
     "qwen3.8-2.4t-a95b": "qwen3.8-2.4t",
-    "glm5.2": "glm-5.2",
-    "deepseek-v4": "deepseek-v4",
-    "deepseek_v4": "deepseek-v4",
-    "qwen4-exp": "qwen4-exp",
-    "qwen4_exp": "qwen4-exp"
+    "glm5.2": "glm-5.2"
   }
 }

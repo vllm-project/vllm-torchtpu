@@ -19,7 +19,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from math import gcd
+from math import ceil, gcd
 from pathlib import Path
 from typing import Literal, cast
 
@@ -31,6 +31,7 @@ from .constants import (
     DECLARED_EXPERT_MODES,
     DEFAULT_DECLARED_CALLS_PER_LAYER,
     DEFAULT_DECLARED_PHASES,
+    INDEXER_SCALE_BLOCK_SIZE,
     KDA_MODEL_TYPES,
     MIN_COLLECTIVE_GROUP_SIZE,
     MIN_HEAD_DIM,
@@ -38,6 +39,7 @@ from .constants import (
     MULTIMODAL_KEYS,
     PRESETS_DIR,
     VALID_LAYER_TOKENS,
+    WORD_ALIGN_BYTES,
     CollectiveStepKind,
     DeclaredExpertMode,
 )
@@ -55,6 +57,7 @@ RECOGNIZED_MODEL_TYPES: frozenset[str] = frozenset(
         "glm4_moe",
         "glm5",
         "glm_moe",
+        "glm_moe_dsa",
         "gpt_oss",
         "kimi_k2",
         "kimi_k3",
@@ -76,6 +79,7 @@ RECOGNIZED_MODEL_TYPES: frozenset[str] = frozenset(
         "qwen3_moe",
         "qwen3_next",
         "qwen4_exp",
+        "qwen4_exp_text",
     }
 )
 
@@ -106,6 +110,10 @@ class ModelProfile:
     q_lora_rank: int = 0
     qk_nope_head_dim: int = 0
     qk_rope_head_dim: int = 0
+    index_topk: int = 0
+    index_head_dim: int = 0
+    index_n_heads: int = 0
+    num_indexer_layers: int = 0
     linear_key_dim: int = 128
     linear_value_dim: int = 128
     linear_conv_kernel: int = 4
@@ -135,13 +143,41 @@ def _non_homogeneous_reasons(num_layers: int, moe_layers: int) -> tuple[str, ...
     return ()
 
 
+def has_dsa_profile(profile: ModelProfile) -> bool:
+    """Return whether `profile` carries sparse attention and indexer geometry."""
+    return (
+        profile.index_topk > 0
+        and profile.index_n_heads > 0
+        and profile.index_head_dim > 0
+    )
+
+
+def dsa_query_gather_dim(profile: ModelProfile) -> int:
+    """Return per-head query width gathered across DCP ranks for DSA attention."""
+    if profile.kv_lora_rank > 0:
+        return profile.kv_lora_rank + profile.qk_rope_head_dim
+    return profile.head_dim
+
+
+def indexer_record_bytes(index_head_dim: int) -> int:
+    """Return packed 4-byte-aligned FP8 key plus block-scale indexer record bytes."""
+    if index_head_dim <= 0:
+        return 0
+    scale_bytes = ceil(index_head_dim / INDEXER_SCALE_BLOCK_SIZE)
+    raw_bytes = index_head_dim + scale_bytes
+    return ((raw_bytes + WORD_ALIGN_BYTES - 1) // WORD_ALIGN_BYTES) * WORD_ALIGN_BYTES
+
+
 def _derive_layer_families(
     profile: ModelProfile, *, attn_layers: int, moe_layers: int
 ) -> tuple[str, ...]:
     """Derive canonical layer families from resolved model layer counts."""
     families: list[str] = []
     if attn_layers > 0:
-        families.append("mla" if profile.kv_lora_rank > 0 else "gqa")
+        if has_dsa_profile(profile):
+            families.append("dsa")
+        else:
+            families.append("mla" if profile.kv_lora_rank > 0 else "gqa")
     if profile.num_linear_layers > 0:
         mtype = profile.model_type.strip().lower()
         families.append("kda" if mtype in KDA_MODEL_TYPES else "gdn")
@@ -170,7 +206,17 @@ def finalize_model_profile(profile: ModelProfile) -> ModelProfile:
         if profile.num_moe_layers < 0
         else profile.num_moe_layers
     )
-    periodic = profile.is_periodic and not (0 < resolved_moe_layers < num_layers)
+    if not has_dsa_profile(profile):
+        resolved_indexer_layers = 0
+    elif profile.num_indexer_layers <= 0:
+        resolved_indexer_layers = attn_layers
+    else:
+        resolved_indexer_layers = min(attn_layers, profile.num_indexer_layers)
+    periodic = (
+        profile.is_periodic
+        and not (0 < resolved_moe_layers < num_layers)
+        and not (0 < resolved_indexer_layers < attn_layers)
+    )
     moe_inter = profile.moe_intermediate_size or (
         profile.intermediate_size * has_experts
     )
@@ -194,6 +240,7 @@ def finalize_model_profile(profile: ModelProfile) -> ModelProfile:
         profile,
         num_attention_layers=attn_layers,
         num_moe_layers=resolved_moe_layers,
+        num_indexer_layers=resolved_indexer_layers,
         is_periodic=periodic,
         moe_intermediate_size=moe_inter,
         expert_dtype=exp_dt,
@@ -303,6 +350,10 @@ class _NormalizedHfConfig:
     residual_streams: int = 1
     has_quant_config: bool = False
     has_explicit_torch_dtype: bool = False
+    index_topk: int = 0
+    index_head_dim: int = 0
+    index_n_heads: int = 0
+    num_indexer_layers: int = 0
 
     def validate_supported(self, *, require_model_type: bool = False) -> None:
         """Validate that the configuration describes a supported causal LM."""
@@ -452,6 +503,10 @@ class _NormalizedHfConfig:
                 q_lora_rank=self.q_lora_rank,
                 qk_nope_head_dim=self.qk_nope_head_dim,
                 qk_rope_head_dim=self.qk_rope_head_dim,
+                index_topk=self.index_topk,
+                index_head_dim=self.index_head_dim,
+                index_n_heads=self.index_n_heads,
+                num_indexer_layers=self.num_indexer_layers,
                 linear_key_dim=self.linear_key_dim,
                 linear_value_dim=self.linear_value_dim,
                 linear_conv_kernel=self.linear_conv_kernel,
@@ -625,6 +680,87 @@ def _extract_quant_fields(
     )
 
 
+VALID_INDEXER_SCHEDULE_TOKENS: frozenset[str] = frozenset({"full", "shared", "none"})
+
+
+def _classify_indexer_schedule_entry(entry: object, layer_index: int) -> bool:
+    """Return whether one schedule token marks a full indexer layer, or raise."""
+    match entry:
+        case str() as raw_token:
+            normalized = raw_token.strip().lower()
+            if normalized not in VALID_INDEXER_SCHEDULE_TOKENS:
+                valid_tokens = sorted(VALID_INDEXER_SCHEDULE_TOKENS)
+                msg = (
+                    f"Invalid indexer schedule entry at layer {layer_index}: "
+                    f"{entry!r}; expected one of {valid_tokens}"
+                )
+                raise UnsupportedArchitectureError(msg)
+            return normalized == "full"
+        case _:
+            num = _as_scalar_number(entry)
+            if num is None or num < 0.0:
+                msg = (
+                    f"Invalid numeric indexer schedule entry at layer {layer_index}: "
+                    f"{entry!r}; expected >= 0"
+                )
+                raise UnsupportedArchitectureError(msg)
+            return num > 0.0
+
+
+def _resolve_indexer_layers(
+    text_cfg: Mapping[str, object],
+    num_layers: int,
+    attn_layers: int,
+    index_dims: tuple[int, int, int],
+) -> int:
+    """Resolve the count of full sparse-indexer layers from HF config keys."""
+    index_topk, index_head_dim, index_n_heads = index_dims
+    if index_topk <= 0 or index_head_dim <= 0 or index_n_heads <= 0:
+        return 0
+    explicit_count = _int_field(text_cfg, ("num_indexer_layers",))
+    if explicit_count > 0:
+        return min(attn_layers, explicit_count)
+    raw_schedule_obj = (
+        text_cfg.get("indexer_types")
+        if text_cfg.get("indexer_types") is not None
+        else text_cfg.get("index_topk_pattern")
+    )
+    if raw_schedule_obj is not None:
+        raw_schedule = _as_sequence(raw_schedule_obj)
+        if raw_schedule is None or len(raw_schedule) != num_layers:
+            msg = (
+                "Indexer schedule length must equal num_hidden_layers "
+                f"({num_layers}); got {raw_schedule_obj!r}"
+            )
+            raise UnsupportedArchitectureError(msg)
+        full_count = sum(
+            1
+            for layer_index, entry in enumerate(raw_schedule)
+            if _classify_indexer_schedule_entry(entry, layer_index)
+        )
+        if full_count <= 0:
+            msg = "Indexer schedule must include at least one full indexer layer"
+            raise UnsupportedArchitectureError(msg)
+        return min(attn_layers, full_count)
+    topk_freq = _int_field(text_cfg, ("index_topk_freq",), default=1)
+    skip_offset = _int_field(text_cfg, ("index_skip_topk_offset",), default=0)
+    if topk_freq > 1:
+        scheduled = sum(
+            1
+            for layer_index in range(num_layers)
+            if layer_index >= skip_offset
+            and (layer_index - skip_offset + 1) % topk_freq == 0
+        )
+        if scheduled <= 0:
+            msg = (
+                f"index_topk_freq={topk_freq} with index_skip_topk_offset="
+                f"{skip_offset} selects zero indexer layers across {num_layers} layers"
+            )
+            raise UnsupportedArchitectureError(msg)
+        return min(attn_layers, scheduled)
+    return attn_layers
+
+
 def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
     """Normalize a raw HuggingFace configuration mapping into a typed configuration."""
     tc, is_multimodal = _extract_text_subconfig(raw_cfg)
@@ -695,6 +831,16 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
         has_explicit_torch_dtype,
     ) = _extract_quant_fields(tc, raw_cfg)
     kv_compress = _extract_kv_compress_factor(tc)
+    index_topk = _int_field(tc, ("index_topk",))
+    index_head_dim = _int_field(tc, ("index_head_dim",))
+    index_n_heads = _int_field(tc, ("index_n_heads",))
+    attn_layers = max(0, num_layers - num_linear_layers)
+    num_indexer_layers = _resolve_indexer_layers(
+        tc,
+        num_layers,
+        attn_layers,
+        (index_topk, index_head_dim, index_n_heads),
+    )
 
     return _NormalizedHfConfig(
         model_type=mtype,
@@ -725,6 +871,10 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
         q_lora_rank=_int_field(tc, ("q_lora_rank",)),
         qk_nope_head_dim=_int_field(tc, ("qk_nope_head_dim",)),
         qk_rope_head_dim=_int_field(tc, ("qk_rope_head_dim",)),
+        index_topk=index_topk,
+        index_head_dim=index_head_dim,
+        index_n_heads=index_n_heads,
+        num_indexer_layers=num_indexer_layers,
         linear_key_dim=_int_field(
             merged, ("linear_key_head_dim", "key_head_dim", "head_k_dim"), default=128
         ),
@@ -761,6 +911,28 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
     )
 
 
+def _extract_compress_rates_factor(text_cfg: Mapping[str, object]) -> float:
+    """Compute mean KV retention ratio from a `compress_rates` mapping."""
+    raw_rates = _as_mapping(text_cfg.get("compress_rates"))
+    if raw_rates is None or not raw_rates:
+        msg = "compress_rates must be a non-empty mapping of positive numbers"
+        raise UnsupportedArchitectureError(msg)
+    parsed_rates: dict[str, float] = {}
+    for token, entry in raw_rates.items():
+        num = _as_scalar_number(entry)
+        if num is None or num <= 0.0:
+            msg = f"Invalid compress_rates[{token!r}]={entry!r}: expected > 0"
+            raise UnsupportedArchitectureError(msg)
+        parsed_rates[str(token)] = 1.0 / num if num > 1.0 else num
+    raw_layers = _as_sequence(text_cfg.get("layer_types"))
+    if raw_layers is not None and raw_layers:
+        per_layer = [
+            parsed_rates.get(str(layer_token), 1.0) for layer_token in raw_layers
+        ]
+        return min(1.0, sum(per_layer) / len(per_layer))
+    return min(1.0, sum(parsed_rates.values()) / len(parsed_rates))
+
+
 def _extract_kv_compress_factor(tc: Mapping[str, object]) -> float:
     """Extract average KV cache compression ratio in (0, 1] from HF config."""
     if "compress_ratios" in tc and tc["compress_ratios"] is not None:
@@ -776,6 +948,8 @@ def _extract_kv_compress_factor(tc: Mapping[str, object]) -> float:
                 raise UnsupportedArchitectureError(msg)
             vals.append(1.0 if num == 0.0 else (1.0 / num if num > 1.0 else num))
         return min(1.0, sum(vals) / len(vals))
+    if "compress_rates" in tc and tc["compress_rates"] is not None:
+        return _extract_compress_rates_factor(tc)
     if "kv_compress_factor" in tc and tc["kv_compress_factor"] is not None:
         raw_kcf = tc["kv_compress_factor"]
         num = _as_scalar_number(raw_kcf)
@@ -827,6 +1001,10 @@ def _load_model_presets() -> tuple[
                 q_lora_rank=int(entry.get("q_lora_rank", 0)),
                 qk_nope_head_dim=int(entry.get("qk_nope_head_dim", 0)),
                 qk_rope_head_dim=int(entry.get("qk_rope_head_dim", 0)),
+                index_topk=int(entry.get("index_topk", 0)),
+                index_head_dim=int(entry.get("index_head_dim", 0)),
+                index_n_heads=int(entry.get("index_n_heads", 0)),
+                num_indexer_layers=int(entry.get("num_indexer_layers", 0)),
                 routed_expert_hidden_size=int(
                     entry.get("routed_expert_hidden_size", 0)
                 ),
