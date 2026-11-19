@@ -15,7 +15,7 @@
 # 47f0d014a5458b5123be9efd1909f3e2f5658b3b, with its imports pointed at this copy.
 # It serves the Qwen3.5 MoE architectures only (gdn_kernel_wrapper in
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
-# Upstream v3 changes are not picked up automatically.
+# Changes to kernels/gdn/v3 are not picked up automatically.
 # Changes from the source:
 # - Own-line pyrefly ignores where jax's stubs are narrower than the runtime,
 #   and one where pyrefly cannot tell that out_act is set before the final
