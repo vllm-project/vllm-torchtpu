@@ -22,7 +22,7 @@ from typing import Any
 
 import jax
 import torch
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 
 
 @run_once

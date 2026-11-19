@@ -19,7 +19,7 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 from vllm.config import get_current_vllm_config_or_none
 
 import vllm_torchtpu.envs as envs

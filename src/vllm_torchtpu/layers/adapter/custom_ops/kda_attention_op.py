@@ -20,7 +20,7 @@ from typing import TypeVar
 import jax
 import jax.numpy as jnp
 import torch
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 from vllm.config import VllmConfig
 
 from vllm_torchtpu import envs as tpu_envs
