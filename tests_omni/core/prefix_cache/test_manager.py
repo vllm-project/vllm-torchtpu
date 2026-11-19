@@ -49,8 +49,8 @@ _NUM_BLOCKS = 8
 @pytest.mark.parametrize("block_size", [16, 32])
 @pytest.mark.xfail(
     strict=True,
-    raises=ValueError,
-    reason="TPUWorker has no omni model runner (vllm-torchtpu#2065)",
+    raises=AssertionError,
+    reason="TPUARModelRunner inherits TPUModelRunner, not PrefixCacheRunnerMixin",
 )
 def test_omni_stage_output_prefix_caching(block_size: int) -> None:
     """Omni Stage-Output Prefix Caching

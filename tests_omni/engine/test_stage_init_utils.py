@@ -48,9 +48,21 @@ pytestmark = [
 ]
 
 PARALLEL_CASES = [
-    (0, (2, 1, 2, True)),
-    (1, (1, 2, 1, False)),
-    (2, (2, 1, 1, False)),
+    pytest.param(0, (2, 1, 2, True), id="ar_tp2_dp2_ep"),
+    pytest.param(1, (1, 2, 1, False), id="ar_pp2"),
+    pytest.param(
+        2,
+        (2, 1, 1, False),
+        id="gen_tp2",
+        marks=pytest.mark.xfail(
+            strict=True,
+            raises=ValueError,
+            reason=(
+                "OmniTpuPlatform.get_omni_generation_worker_cls() returns "
+                "TPUWorker, which lacks OmniConnectorModelRunnerMixin"
+            ),
+        ),
+    ),
 ]
 
 
@@ -146,18 +158,9 @@ def _assert_env_snapshot(
         assert got == want, f"{label}: env[{key!r}]={got!r}, expected {want!r}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ValueError,
-    reason=(
-        "TPUWorker does not provide an Omni connector model runner "
-        "(tracked in vllm-torchtpu PR #2065)"
-    ),
-)
 @pytest.mark.parametrize(
     "stage_id,expected_degrees",
     PARALLEL_CASES,
-    ids=["ar_tp2_dp2_ep", "ar_pp2", "gen_tp2"],
 )
 def test_per_stage_tp_pp_dp_ep_ar_and_gen_stages(
     stage_id: int,
