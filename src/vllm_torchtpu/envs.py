@@ -133,6 +133,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR: bool = False
     VLLM_TPU_GDN_WINDOW_LOG: bool = False
+    VLLM_TPU_L6_SEED_SPEC: str = ""
     VLLM_TPU_GDN_WINDOW_FACTORED: bool = False
     VLLM_TPU_GDN_LEAN_GLUE: bool = False
     VLLM_TPU_GDN_PREFILL_BF16_QKV_2D: bool = False
@@ -167,6 +168,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QWEN4_FUSED_PREP_CHECK: str = ""
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFIX_SLICE: bool = False
+    VLLM_TPU_QSA_ZERO_PREFIX_FAST: bool = False
     VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
@@ -185,6 +187,9 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_GATHERED: str = ""
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS: int = 4
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
@@ -201,6 +206,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP_LOCAL_MERGE: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP_PACKED_GATHER: bool = False
+    VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD: bool = False
+    VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD_MIN_ROWS: int = 0
     VLLM_TPU_QSA_DCP_MERGE_SCORES: bool = False
     VLLM_TPU_RPA_SCHEDULE_HBM: bool = False
     VLLM_TPU_QSA_UNION_LEAN_GLUE: bool = False
@@ -676,6 +683,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # next step applies the first read-offset logged positions on load.
     # Refused with the megakernel and on any other leg.
     "VLLM_TPU_GDN_WINDOW_LOG": env_bool("VLLM_TPU_GDN_WINDOW_LOG"),
+    # q38 SEED-SPEC (HCDEC-HOSTADM, ported by BLSTACK-SEED; runner/l6_seedspec.py,
+    # core/l6_ab.py shim; host-only): unset / 0 off, 1 on; "ab:" is refused.
+    # On, a request whose last token of the step sits within the previous
+    # step's draft count past a GDN state-column edge no longer makes
+    # _collect_mamba_state_seed_copies wait for the previous step's sampled
+    # copy: in the canonical case (recorded column = the low side, all
+    # accepted = low + 1, speculative checkpoint seed) the seed is staged as
+    # for a crossing and the column is resolved at the next step from that
+    # copy. Same programs and shapes; never part of the compile key.
+    "VLLM_TPU_L6_SEED_SPEC": env_str("VLLM_TPU_L6_SEED_SPEC", ""),
     # With VLLM_TPU_GDN_WINDOW_LOG: the BATCHED GDN kernel runs the verify
     # window in factored form (one product of the window's keys and queries
     # with the stored state, the logged and window updates as vector work, one
@@ -877,6 +894,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Mixed QSA steps: move the decode prefix off the prefill rows with contiguous dynamic
     # slices instead of row gathers (same values; prefill chunks spent ~3 ms/8K on the gathers).
     "VLLM_TPU_QSA_PREFIX_SLICE": env_bool("VLLM_TPU_QSA_PREFIX_SLICE", default=False),
+    # Mixed QSA steps without a decode prefix (prefix 0: every step of a disaggregated prefill engine but a tiny
+    # leading request): the prefill kernel reads the step's rows in place, with no row gathers in and no gather /
+    # merge out; steps with a prefix route as before (with PREFIX_SLICE's slices if set). Same values (bitwise).
+    "VLLM_TPU_QSA_ZERO_PREFIX_FAST": env_bool("VLLM_TPU_QSA_ZERO_PREFIX_FAST", default=False),
     # QSA indexer cache updates: build each token's compression-group members from static
     # shifts and the ring / tag rows from a one-hot product instead of per-token row gathers
     # (same values; ~3 ms of gathers per 8K prefill chunk).
@@ -1054,6 +1075,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE": env_bool("VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE"),
     # SC_BITSET: the union plan's per-row bitset built on the SparseCore (the same bits), off the TensorCore.
     "VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET": env_bool("VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET"),
+    # IN_PLACE (with GATHERED=sparsecore): gather/walk chunks read the plan's bits, queries and lengths in place
+    # (static chunk offsets) instead of from sliced copies, and the walk stages no unused bitset block. Bitwise.
+    "VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE": env_bool("VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE"),
+    # SC_BITS_PLAN (with SC_BITSET; ignored without it): the SparseCore bitset kernel writes the plan layout
+    # [G * words, 128] itself (each 16-row slab into its 16 lanes of its group's rows), so the TensorCore regroup
+    # (reshape, copy and pad) is gone. The group's lanes are the same bits; lanes >= group are left unwritten (no reader
+    # uses them).
+    "VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN": env_bool("VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN"),
+    # GATHERED_LEAN (with IN_PLACE; ignored without it): the in-place gathered walk takes no union words and no page
+    # rows, which it never reads (no per-chunk union-word slices / padding / staging, no per-word pool bases). Bitwise.
+    "VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN"),
     # GATHERED ("", "reference", "sparsecore"; with LISTED): the walk-free kernel on chunked gathered tiles.
     "VLLM_TPU_QSA_PREFILL_UNION_GATHERED": env_str("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", ""),
     "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS": env_int("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", 4),
@@ -1115,6 +1147,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # one int32 buffer [T, 2k], in place of one all-gather each. Byte-exact.
     "VLLM_TPU_QSA_COMPRESSED_DCP_PACKED_GATHER": env_bool(
         "VLLM_TPU_QSA_COMPRESSED_DCP_PACKED_GATHER"
+    ),
+    # q38 BLSTACK-IDX. With VLLM_TPU_QSA_COMPRESSED_DCP and TP larger than
+    # VLLM_TPU_QSA_MAIN_KV_DCP: the target layers' decode/verify-shaped graphs
+    # split the owned-group indexer's rows over the TP / DCP groups as well
+    # (ranks r and r + DCP own the same compressed groups). Each group scores
+    # one contiguous token shard of the step with the decode indexer, one TP
+    # all-gather brings every group's local lists, and every rank merges and
+    # attends exactly as without it (the prefill token-sharded op of
+    # VLLM_TPU_QSA_INDEXER_TOKEN_SHARD, routed on decode steps). Same
+    # selection, same attended groups; per-rank scoring rows drop by TP / DCP.
+    # Off: every rank scores every row of the step over its owned groups.
+    "VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD": env_bool(
+        "VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD", default=False
+    ),
+    # With VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD: graphs of fewer token rows
+    # keep the unsharded owned-group indexer (0 = every decode-shaped graph).
+    "VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD_MIN_ROWS": env_nonnegative_int(
+        "VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD_MIN_ROWS", 0
     ),
     # With VLLM_TPU_QSA_COMPRESSED_DCP: the pair merge's boundary key comes
     # from the bits the merge top-k returns with its slots, instead of a

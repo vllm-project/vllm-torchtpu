@@ -37,6 +37,43 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+# q38 BLSTACK-IDX: one row-shard bind line per process (every TP rank logs its own).
+_Q38_ROWSHARD_LOGGED = False
+
+
+def _log_row_shard_bind(tp_rank: int, tp_size: int, dcp: int, min_rows: int) -> None:
+    global _Q38_ROWSHARD_LOGGED
+    if _Q38_ROWSHARD_LOGGED:
+        return
+    _Q38_ROWSHARD_LOGGED = True
+    logger.info(
+        "q38 BLSTACK-IDX compressed-DCP row shard: on (TP rank %d of %d, DCP %d, row shard "
+        "%d of %d, min rows %d; VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD)",
+        tp_rank,
+        tp_size,
+        dcp,
+        tp_rank // dcp,
+        tp_size // dcp,
+        min_rows,
+    )
+
+
+def compressed_row_shard_applies(
+    tokens: int, slots: int, shards: int, max_query_len: int, min_rows: int = 0
+) -> bool:
+    """q38 BLSTACK-IDX: whether a graph of ``tokens`` rows over ``slots``
+    request slots takes the row-sharded owned-group indexer
+    (VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD): decode / verify-shaped (at most
+    ``max_query_len`` rows per slot, the decode indexer's own routing in
+    ``select_blocks``), ``tokens`` divisible by the ``shards`` (TP / DCP), and
+    at least ``min_rows`` (0 = no gate). Static per graph."""
+    return (
+        shards > 1
+        and tokens % shards == 0
+        and tokens <= slots * max_query_len
+        and tokens >= min_rows
+    )
+
 
 @dataclass(frozen=True)
 class QSAMetadata:
@@ -454,6 +491,22 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 torch.full((1,), tp_rank, dtype=torch.int32, device=device),
                 persistent=False,
             )
+        # q38 BLSTACK-IDX (VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD): target layers
+        # split the owned-group decode indexer's rows over the TP / DCP groups.
+        self.compressed_row_shard = self._compressed_row_shard_mode(
+            self.main_kv_dcp, tp_size, self.pcp, prefix
+        )
+        if self.compressed_row_shard:
+            # The TP rank as an operand (the shard is rank // DCP), so every
+            # rank traces the same program; read once here, never in forward.
+            self.register_buffer(
+                "row_shard_index",
+                torch.full((1,), tp_rank, dtype=torch.int32, device=device),
+                persistent=False,
+            )
+            self.row_shard_min_rows = int(
+                envs.VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD_MIN_ROWS
+            )
         with torch.device(device or "cpu"):
             set_default_quant_scales(self, register_buffer=True)
         self.cache_owners: tuple[torch.Tensor, ...] = ()
@@ -466,6 +519,25 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             token_topk=self.token_topk,
             norm_eps=float(self.q_norm.variance_epsilon),
             rotary_dim=int(self.head_dim * config.partial_rotary_factor),
+        )
+
+    @staticmethod
+    def _compressed_row_shard_mode(main_kv_dcp, tp_size, pcp, prefix):
+        """q38 BLSTACK-IDX: whether this layer splits its owned-group decode
+        indexer's rows over the TP / DCP groups. Target QSA layers under
+        VLLM_TPU_QSA_COMPRESSED_DCP with more TP ranks than the DCP group only:
+        ranks ``r`` and ``r + DCP`` own the same compressed groups, so each
+        group scores one token shard. The MTP draft never does (it attends the
+        target's selection, and its single graph is traced once for every
+        bucket)."""
+        return bool(
+            envs.VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD
+            and envs.VLLM_TPU_QSA_COMPRESSED_DCP
+            and pcp == 1
+            and main_kv_dcp > 1
+            and tp_size > main_kv_dcp
+            and tp_size % main_kv_dcp == 0
+            and "mtp" not in prefix
         )
 
     @staticmethod
@@ -588,6 +660,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             )
         self._dcp_op = None
         self._token_shard_dcp_op = None
+        # q38 BLSTACK-IDX (VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD).
+        self._row_shard_dcp_op = None
+        self._row_plain_dcp_op = None
         # The pair-merge ops (not the PCP one) take `global_selection`.
         self._compressed_dcp = False
         if self.pcp > 1:
@@ -686,6 +761,37 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                     build(get_tp_group(), pair, self.main_kv_dcp),
                     kv_heads=self.num_kv_heads,
                     **keywords,
+                )
+            if compressed and getattr(self, "compressed_row_shard", False):
+                from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                    build_pooled_qsa_row_plain_compressed_dcp_op,
+                    build_pooled_qsa_token_shard_compressed_dcp_op,
+                )
+
+                # q38 BLSTACK-IDX: decode-shaped graphs at or above the min rows
+                # take the token-sharded owned-group op with the decode indexer;
+                # the module's other graphs take the plain op with the same
+                # shard operand (one input list for every compile range).
+                group = get_tp_group()
+                assert int(group.world_size) == self.tp_size
+                assert int(group.rank_in_group) == self.tp_rank
+                self._row_shard_dcp_op = partial(
+                    build_pooled_qsa_token_shard_compressed_dcp_op(
+                        group, pair, self.main_kv_dcp, decode_rows=True
+                    ),
+                    kv_heads=self.num_kv_heads,
+                    **keywords,
+                )
+                self._row_plain_dcp_op = partial(
+                    build_pooled_qsa_row_plain_compressed_dcp_op(pair, self.main_kv_dcp),
+                    kv_heads=self.num_kv_heads,
+                    **keywords,
+                )
+                _log_row_shard_bind(
+                    self.tp_rank,
+                    self.tp_size,
+                    self.main_kv_dcp,
+                    int(getattr(self, "row_shard_min_rows", 0)),
                 )
         # With VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP a single-graph module (the
         # MTP draft, traced once for every bucket including prefill chunks)
@@ -904,7 +1010,13 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         else:
             output = self.o_proj(output)
         if reduce and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output)
+            # q38 AR-FIX (VLLM_TPU_DECODE_TP_AR, default off): the same kernel as sequence_parallel.reduce.
+            from vllm_torchtpu.layers.adapter import tp_ar_decode
+
+            if tp_ar_decode.use_kernel(output):
+                output = tp_ar_decode.kernel_all_reduce(output)
+            else:
+                output = tensor_model_parallel_all_reduce(output)
         return output, selected
 
     def attend(self, hidden, positions, metadata: QSAMetadata):
@@ -981,6 +1093,16 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 op = partial(
                     self._token_shard_dcp_op,
                     shard_index=self.token_shard_index,
+                    dcp_rank=self.dcp_rank,
+                )
+            elif getattr(self, "_row_shard_dcp_op", None) is not None:
+                # q38 BLSTACK-IDX: the row-sharded owned-group indexer on
+                # decode-shaped graphs, else the plain op with the same operand.
+                op = partial(
+                    self._row_shard_dcp_op
+                    if self._row_shard_applies(hidden, metadata)
+                    else self._row_plain_dcp_op,
+                    shard_index=self.row_shard_index,
                     dcp_rank=self.dcp_rank,
                 )
             else:
@@ -1080,6 +1202,18 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             # runner to save on sampled steps (selection_dump.py).
             update_rows_(dump, selected[: dump.shape[0]])
         return output, selected
+
+    def _row_shard_applies(self, hidden, metadata: QSAMetadata) -> bool:
+        """q38 BLSTACK-IDX: whether this graph takes the row-sharded owned-group
+        indexer (static per graph). No import and no logging here (inside the
+        fullgraph Dynamo capture); the select step logs each traced shape."""
+        return compressed_row_shard_applies(
+            int(hidden.shape[0]),
+            int(metadata.context_lens.shape[0]),
+            self.tp_size // self.main_kv_dcp,
+            self.max_query_len,
+            int(getattr(self, "row_shard_min_rows", 0)),
+        )
 
     def select_for_kernel(self, hidden, positions, metadata: QSAMetadata):
         """Cache writes and the indexer only; the attention runs in the Qwen3.8

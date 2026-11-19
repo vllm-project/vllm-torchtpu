@@ -152,6 +152,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
 )
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner import host_phases
+from vllm_torchtpu.runner import l6_seedspec as _l6_seedspec
 from vllm_torchtpu.runner import pp_last_async_output
 from vllm_torchtpu.runner import host_admit_probe
 from vllm_torchtpu.runner import step_buckets
@@ -2234,10 +2235,18 @@ class TPUModelRunner(GPUModelRunner):
             else None
         )
         sampled_cpu: torch.Tensor | None = None
+        # q38 SEEDSPEC (runner/l6_seedspec.py, HCDEC-HOSTADM): columns of
+        # requests whose block-edge seed was staged without the copy wait at an
+        # earlier step, resolved from that step's (now landed) copy before any
+        # column is read; then requests met again against the same results.
+        _l6_seedspec.resolve(self, previous)
+        seedspec_pend = self.__dict__.get("_seedspec_pending")
         for i in range(num_reqs):
             row = start_index + i
             req_id = req_ids[row]
             assert req_id is not None
+            if seedspec_pend and req_id in seedspec_pend:
+                _l6_seedspec.settle(self, req_id, previous)
             computed = int(num_computed[row])
             scheduled = scheduler_output.num_scheduled_tokens[req_id]
             end_position = computed + scheduled - 1
@@ -2251,7 +2260,15 @@ class TPUModelRunner(GPUModelRunner):
                 # Host positions assume every previous draft was accepted.
                 # Only near a block edge can the correction change the seed
                 # destination; reuse the pending sampling copy in that case.
-                if end_position // col_stride != (end_position - drafts) // col_stride:
+                # q38 SEEDSPEC: with the lever on, a canonical edge keeps the
+                # all-accepted position instead (seed staged as for a crossing,
+                # column resolved at the next step; runner/l6_seedspec.py).
+                if end_position // col_stride != (end_position - drafts) // col_stride and not (
+                    sampled_cpu is None
+                    and _l6_seedspec.edge(
+                        self, req_id, previous, previous_row, drafts, end_position, col_stride
+                    )
+                ):
                     # previous_row counts the padded rows of earlier chunks;
                     # the draft map and the sampled copy agree with it only
                     # when the previous step ran as one chunk.
@@ -6258,6 +6275,11 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.layers.adapter.fused_moe_decode import arm_runner_models
 
             arm_runner_models(self)
+
+        # q38 AR-FIX (VLLM_TPU_DECODE_TP_AR, default off): a no-op unless set; raises if set and it cannot arm.
+        from vllm_torchtpu.layers.adapter import tp_ar_decode
+
+        tp_ar_decode.arm(self)
 
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache

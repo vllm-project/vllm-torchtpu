@@ -1585,6 +1585,28 @@ def _select_blocks(
     return selected.reshape(-1, *selected.shape[2:])[: len(query)]
 
 
+# q38 BLSTACK-W2: (tokens, request slots, main slot, decision) already logged by _log_fused_kv_write in this process.
+_Q38_FUSED_KV_WRITE_LOGGED: set = set()
+
+
+def _log_fused_kv_write(tokens: int, slots: int, main_slot: int, decode_rows: int, fused: bool) -> None:
+    """q38 BLSTACK-W2: one INFO line per distinct traced shape / decision and process when
+    VLLM_TPU_QSA_FUSED_KV_WRITE is set: 'ENGAGED' (fused_layer_write stores this layer's caches) or 'NOT ENGAGED'
+    (the separate writers: a prefill-sized step, or a geometry fused_write_supported refuses). Traced shapes only:
+    a compile-cache hit re-traces nothing and prints nothing."""
+    key = (tokens, slots, main_slot, fused)
+    if key in _Q38_FUSED_KV_WRITE_LOGGED:
+        return
+    _Q38_FUSED_KV_WRITE_LOGGED.add(key)
+    from vllm_torchtpu.logger import init_logger
+
+    init_logger(__name__).info(
+        "q38 BLSTACK fused KV write %s: tokens %d, request slots %d, main slot %d (decode-sized up to %d tokens; "
+        "VLLM_TPU_QSA_FUSED_KV_WRITE)",
+        "ENGAGED" if fused else "NOT ENGAGED", tokens, slots, main_slot, decode_rows,
+    )
+
+
 def qsa_cache_writes(
     pool: jax.Array,
     k: jax.Array,
@@ -1670,6 +1692,10 @@ def qsa_cache_writes(
             pool, len(k), len(ring_ids), main_slot if main_slot >= 0 else None
         )
     )
+    if envs.VLLM_TPU_QSA_FUSED_KV_WRITE and indexer_writes:
+        # q38 BLSTACK-W2 trace-time engagement line of the fused writer (log only: Python at trace time, nothing
+        # enters the traced program; once per distinct shape / decision and process).
+        _log_fused_kv_write(len(k), len(ring_ids), main_slot, len(context) * max_query_len, bool(fused))
     if fused and not main_write:
         raise ValueError("main_write=False needs the separate cache writers")
 
@@ -1813,6 +1839,7 @@ def _pooled_qsa(
     dcp: tuple[jax.Array, int] | None = None,
     compressed_dcp: bool = False,
     indexer_writes: bool = True,
+    token_shard_decode: bool = False,
 ) -> tuple[jax.Array, ...]:
     """One QSA layer over the unified pool.
 
@@ -1844,6 +1871,13 @@ def _pooled_qsa(
     returns the same tuple with that shard's ``[T / size, k]`` blocks in place
     of ``candidates``; all-gather them for ``pooled_qsa_shard_attend`` with
     ``merged``.
+
+    ``token_shard_decode`` (q38 BLSTACK-IDX, VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD;
+    ``compressed_dcp`` with ``token_shard`` only): the shard's rows keep the
+    step's ``max_query_len`` routing (the decode / verify indexer) instead of the
+    ragged prefill indexer. ``token_shard_step`` re-bases each request's start
+    and context to the shard, so every row is scored with the same query, keys
+    and causal length as in the unsharded step.
     """
     assert indexer_writes or shared is not None, "the layer's own indexer reads its ring"
     # Keep the Runner's flat group tables at the Torch boundary. Static JAX
@@ -1935,7 +1969,9 @@ def _pooled_qsa(
                 return jax.lax.dynamic_slice_in_dim(x, base, width)
 
             own_iq, own_lengths, own_req = own(iq), own(lengths), own(req)
-            query_len = 1
+            # q38 BLSTACK-IDX: a decode-shaped step's row shard keeps the decode
+            # indexer (VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD).
+            query_len = max_query_len if token_shard_decode else 1
         vals, pos = select_blocks(
             own_iq,
             pool,
@@ -2894,12 +2930,27 @@ def pooled_qsa_token_select_compressed_dcp_step(
     compressed_slot: int = 0,
     main_slot: int = -1,
     max_query_len: int = 1,
+    decode_rows: bool = False,
 ) -> tuple[
     jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array
 ]:
     """``pooled_qsa_compressed_dcp_select_step`` on token shard
     ``shard_index`` of ``shard_size`` (one shard per DCP pair): ``vals`` /
-    ``pos`` cover the shard's ``T / shard_size`` rows."""
+    ``pos`` cover the shard's ``T / shard_size`` rows.
+
+    ``decode_rows`` (q38 BLSTACK-IDX, VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD): a
+    decode / verify step's row shard, scored with the decode indexer
+    (``_pooled_qsa`` ``token_shard_decode``)."""
+    if decode_rows:
+        # q38 BLSTACK-IDX trace-time engagement line (once per traced shape and process).
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(
+            "q38 BLSTACK-IDX compressed-DCP row-shard select traced: tokens %d, slots %d, "
+            "shard rows %d (%d shards), DCP %d, rows per request %d",
+            qgate.shape[0], context.shape[0], qgate.shape[0] // shard_size, shard_size,
+            dcp_size, max_query_len,
+        )
     return _pooled_qsa(
         qgate,
         key,
@@ -2929,7 +2980,57 @@ def pooled_qsa_token_select_compressed_dcp_step(
         token_shard=(shard_index, shard_size),
         dcp=(dcp_rank, dcp_size),
         compressed_dcp=True,
+        token_shard_decode=decode_rows,
     )
+
+
+def pooled_qsa_row_plain_compressed_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    shard_index: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[
+    jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array
+]:
+    """q38 BLSTACK-IDX: ``pooled_qsa_compressed_dcp_select_step`` (every row
+    on every rank) for the graphs of a row-sharded module that do not take the
+    row shard (VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD below its min rows, or
+    steps that are not decode-shaped). ``shard_index`` is not used: it is an
+    operand in the row-shard select's position, so every compile range of the
+    module's graph takes the same inputs in the same order (``shape_variants``
+    hands compiled buckets between traces only then; q38 O1s G2 j-fa24a1ff)."""
+    del shard_index
+    return pooled_qsa_compressed_dcp_select_step(
+        qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig, pool, starts, context,
+        ring_ids, main_table, compressed_table, dcp_rank, compress_ratio, token_topk,
+        norm_eps, rotary_dim, dcp_size=dcp_size, k_scale=k_scale, v_scale=v_scale,
+        compressed_slot=compressed_slot, main_slot=main_slot, max_query_len=max_query_len,
+    )
+
 
 def pooled_qsa_compressed_dcp_attend_step(
     q: jax.Array,

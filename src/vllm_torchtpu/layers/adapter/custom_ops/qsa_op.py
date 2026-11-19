@@ -1456,7 +1456,7 @@ def _compressed_dcp_ops():
                           pool, starts, context, ring_ids, main_table, compressed_table,
                           shard_index, dcp_rank, compress_ratio, token_topk, norm_eps,
                           rotary_dim, shard_size, dcp_size=2, k_scale=1.0, v_scale=1.0,
-                          compressed_slot=0, main_slot=-1, max_query_len=1):
+                          compressed_slot=0, main_slot=-1, max_query_len=1, decode_rows=False):
         out = select_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig,
                           pool, starts, context, ring_ids, main_table, compressed_table,
                           dcp_rank, compress_ratio, token_topk, norm_eps, rotary_dim)
@@ -1464,6 +1464,44 @@ def _compressed_dcp_ops():
         return (*out[:6], out[6][:rows], out[7][:rows])
 
     return select, attend, token_select
+
+
+@functools.cache
+def _row_plain_compressed_dcp_op():
+    """q38 BLSTACK-IDX (VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD): the owned-group
+    select step of a row-sharded module's graphs that do not take the row shard,
+    with an unused ``shard_index`` operand where the row-shard select takes it
+    (``pooled_qsa_row_plain_compressed_dcp_step``)."""
+    from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
+        pooled_qsa_row_plain_compressed_dcp_step,
+    )
+
+    plain = pallas.jax_op(
+        "qwen4_exp::pooled_qsa_row_plain_compressed_dcp",
+        pooled_qsa_row_plain_compressed_dcp_step,
+        donate_argnums=(10,),
+    )
+
+    @plain.register_fake
+    def plain_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig, pool,
+                   starts, context, ring_ids, main_table, compressed_table, shard_index,
+                   dcp_rank, compress_ratio, token_topk, norm_eps, rotary_dim, dcp_size=2,
+                   k_scale=1.0, v_scale=1.0, compressed_slot=0, main_slot=-1, max_query_len=1):
+        tokens, head_dim = qgate.shape[0], nq.shape[0]
+        heads = qgate.shape[1] // (2 * head_dim)
+        k = token_topk // compress_ratio
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((tokens, heads, head_dim)),
+            qgate.new_empty((tokens, heads, head_dim)),
+            positions.new_empty((tokens,), dtype=torch.int32),
+            positions.new_empty((tokens,), dtype=torch.int32),
+            positions.new_empty((starts.shape[0],), dtype=torch.int32),
+            qgate.new_empty((tokens, k), dtype=torch.float32),
+            positions.new_empty((tokens, k), dtype=torch.int32),
+        )
+
+    return plain
 
 
 def _gathered_lists(vals, pos, group, size, tokens):
@@ -1547,13 +1585,20 @@ def build_pooled_qsa_compressed_dcp_op(pair_group, size: int):
     return run
 
 
-def build_pooled_qsa_token_shard_compressed_dcp_op(tp_group, pair_group, size: int):
+def build_pooled_qsa_token_shard_compressed_dcp_op(
+    tp_group, pair_group, size: int, decode_rows: bool = False
+):
     """``build_pooled_qsa_compressed_dcp_op`` for the prefill sequence-parallel
     graph: each DCP pair scores one token shard (``TP / size`` shards, both
     ranks over their owned groups), one TP all-gather brings every pair's
     local lists, and every rank merges all rows. Takes ``shard_index`` (the
-    TP rank), ``dcp_rank``, ``kv_heads`` and ``global_selection`` keywords."""
+    TP rank), ``dcp_rank``, ``kv_heads`` and ``global_selection`` keywords.
+
+    ``decode_rows`` (q38 BLSTACK-IDX, VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD): the
+    same op on the target layers' decode / verify-shaped graphs; each shard
+    keeps the decode indexer (``pooled_qsa_token_select_compressed_dcp_step``)."""
     world = int(tp_group.world_size)
+    row_kwargs = {"decode_rows": True} if decode_rows else {}
     _, attend, token_select = _compressed_dcp_ops()
     _, _, _, combine = _dcp_ops()
     merge = _dcp_merge_setup()
@@ -1572,7 +1617,7 @@ def build_pooled_qsa_token_shard_compressed_dcp_op(tp_group, pair_group, size: i
         pool = args[10]
         updated, q, gate, lengths, req, starts, vals, pos = token_select(
             *args, torch.div(shard_index, size, rounding_mode="floor"), dcp_rank,
-            shard_size=world // size, dcp_size=size, **kwargs,
+            shard_size=world // size, dcp_size=size, **row_kwargs, **kwargs,
         )
         pool.copy_(updated)
         vals_pair, pos_pair = _gathered_lists(vals, pos, tp_group, size, tokens)
@@ -1594,6 +1639,58 @@ def build_pooled_qsa_token_shard_compressed_dcp_op(tp_group, pair_group, size: i
         ), selected
 
     return run
+
+def build_pooled_qsa_row_plain_compressed_dcp_op(pair_group, size: int):
+    """q38 BLSTACK-IDX: ``build_pooled_qsa_compressed_dcp_op`` for the graphs
+    of a row-sharded module (VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD) that do not
+    take the row shard. Same keywords as the row-shard op
+    (``build_pooled_qsa_token_shard_compressed_dcp_op`` with ``decode_rows``):
+    ``shard_index`` goes through the same ``torch.div`` into the select step's
+    ``shard_index`` position, just before ``dcp_rank``, so both graphs first
+    use every input in the same order and their compile ranges share one input
+    list (``shape_variants``)."""
+    _, attend, _ = _compressed_dcp_ops()
+    select = _row_plain_compressed_dcp_op()
+    _, _, _, combine = _dcp_ops()
+    merge = _dcp_merge_setup()
+
+    def run(*args, shard_index, dcp_rank, kv_heads, global_selection=False, **kwargs):
+        check = kwargs.pop("merge_check", None)
+        group_qgate = kwargs.pop("group_qgate", False)
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15):
+            args[index] = args[index].to(torch.int32)
+        qgate = args[0]
+        tokens, head_dim = qgate.shape[0], args[4].shape[0]
+        qgate, args[0], extra = _pair_qgate(
+            qgate, pair_group, dcp_rank, size, group_qgate, kwargs, merge, head_dim
+        )
+        pool = args[10]
+        updated, q, gate, lengths, req, starts, vals, pos = select(
+            *args, torch.div(shard_index, size, rounding_mode="floor"), dcp_rank,
+            dcp_size=size, **kwargs,
+        )
+        pool.copy_(updated)
+        vals_pair, pos_pair = _gathered_lists(vals, pos, pair_group, size, tokens)
+        attend_kwargs = {
+            name: kwargs[name]
+            for name in ("k_scale", "v_scale", "main_slot", "max_query_len")
+            if name in kwargs
+        }
+        updated, out, lse, selected = attend(
+            q, gate, lengths, req, starts, args[14], args[12], pool, vals_pair, pos_pair,
+            dcp_rank, kv_heads=kv_heads, compress_ratio=kwargs["compress_ratio"],
+            token_topk=kwargs["token_topk"], dcp_size=size,
+            local_merge=_local_merge(global_selection), **attend_kwargs,
+        )
+        pool.copy_(updated)
+        return _dcp_finish(
+            out, lse, qgate, head_dim, dcp_rank, pair_group, combine, merge, args[0], check,
+            extra,
+        ), selected
+
+    return run
+
 
 def build_pooled_qsa_token_shard_dcp_op(tp_group, pair_group, size: int):
     """``build_pooled_qsa_token_shard_op`` with the DCP main-KV split."""
