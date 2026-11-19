@@ -1026,11 +1026,6 @@ def test_ltx2_per_batch_timestep_patch(monkeypatch):
         "_denoise_timestep_kwargs",
         _UPSTREAM_DENOISE_TIMESTEP_KWARGS,
     )
-    patches._patch_ltx2_per_batch_timestep()
-    patched = ltx2_runtime.LTXRuntime._denoise_timestep_kwargs
-    assert getattr(patched, patches._LTX2_PER_BATCH_TIMESTEP_PATCHED, False)
-    patches._patch_ltx2_per_batch_timestep()
-    assert ltx2_runtime.LTXRuntime._denoise_timestep_kwargs is patched
 
     class _DummyPipeline(LTXI2VConditioningMixin, ltx2_runtime.LTXRuntime):
         def __init__(self) -> None:
@@ -1039,11 +1034,24 @@ def test_ltx2_per_batch_timestep_patch(monkeypatch):
 
     pipe = _DummyPipeline()
     ts = torch.tensor([900.0, 900.0])
-
-    # Unconditioned T2V keeps 1-D (B,) timesteps instead of (B, T) token expansion.
     uncond_ctx = SimpleNamespace(
         conditioning_mask=None, conditioning_mask_for_model=None
     )
+
+    # Confirm upstream expands unconditioned timesteps to (B, T) before patching.
+    kw_upstream = pipe._denoise_timestep_kwargs(
+        ts, None, uncond_ctx, video_token_count=16, audio_token_count=4
+    )
+    assert kw_upstream["timestep"].shape == (2, 16)
+    assert kw_upstream["audio_timestep"].shape == (2, 4)
+
+    patches._patch_ltx2_per_batch_timestep()
+    patched = ltx2_runtime.LTXRuntime._denoise_timestep_kwargs
+    assert getattr(patched, patches._LTX2_PER_BATCH_TIMESTEP_PATCHED, False)
+    patches._patch_ltx2_per_batch_timestep()
+    assert ltx2_runtime.LTXRuntime._denoise_timestep_kwargs is patched
+
+    # Unconditioned T2V keeps 1-D (B,) timesteps instead of (B, T) token expansion.
     kw_uncond = pipe._denoise_timestep_kwargs(
         ts, None, uncond_ctx, video_token_count=16, audio_token_count=4
     )

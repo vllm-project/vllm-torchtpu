@@ -656,19 +656,33 @@ _LTX2_PER_BATCH_TIMESTEP_PATCHED = "_tpu_ltx2_per_batch_timestep_patched"
 
 
 def _patch_ltx2_per_batch_timestep() -> None:
-    """Keep unconditioned LTX-2 timesteps per-batch under sequence parallelism.
-
-    Upstream ``LTXRuntime._denoise_timestep_kwargs`` unconditionally passes
-    ``expand_for_sequence_parallel=True``, expanding scalar timesteps to
-    ``(B, T_video)`` and ``(B, T_audio)`` and materializing per-token AdaLN
-    modulation tables across all 48 DiT blocks (~226 MB + 96 MB per block under
-    Ulysses-4). When unconditioned (T2V, or unified T2V/I2V with
-    ``conditioning_mask is None``), all tokens share the same timestep; passing
-    1-D ``(B,)`` keeps ``temb`` at ``(B, 1, 9, D)`` so it broadcasts into each
-    block's norm modulation. Conditioned I2V requests with a
-    ``conditioning_mask`` still override ``timestep`` with the 2-D masked
-    tensor in ``LTXConditioningMixin._denoise_timestep_kwargs``.
-    """
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once vLLM-Omni's LTXRuntime._denoise_timestep_kwargs
+    # stops expanding unconditioned timesteps for sequence parallelism.
+    #
+    # Problem: In vllm-omni 0.32.0rc1
+    #   (vllm_omni/diffusion/models/ltx2/ltx2_runtime.py::
+    #   LTXRuntime._denoise_timestep_kwargs), the method discards forward_ctx
+    #   and denoise_ctx and calls guidance_executor.timestep_kwargs with
+    #   expand_for_sequence_parallel=True. That expands each sample's scalar
+    #   timestep to (B, T_video) and (B, T_audio), causing time_embed and every
+    #   transformer block to project and materialize per-token AdaLN modulation
+    #   tables even though all tokens share the same timestep.
+    # Fix: Replace LTXRuntime._denoise_timestep_kwargs (copied from vllm-omni
+    #   0.32.0rc1, since wrapping cannot override the hardcoded keyword
+    #   argument) to pass expand_for_sequence_parallel=False. Unconditioned
+    #   timesteps stay 1-D (B,), keeping temb at (B, 1, C) so it broadcasts
+    #   into each block's norm modulation.
+    # Scope:
+    #   - LTX2VideoTransformer3DModel._build_sp_plan declares
+    #     SequenceParallelInput(split_dim=1, expected_dims=2, split_output=False)
+    #     on timestep, so 1-D (B,) tensors skip sequence sharding and stay
+    #     replicated across SP ranks.
+    #   - Conditioned I2V requests with a conditioning_mask still override
+    #     timestep with the 2-D (B, T_video) masked tensor in
+    #     LTXI2VConditioningMixin._denoise_timestep_kwargs (which is sharded
+    #     by the SP plan), while keeping audio_timestep 1-D (B,).
+    # -------------------------------------------------------------------------
     from vllm_omni.diffusion.models.ltx2.ltx2_runtime import LTXRuntime
 
     if getattr(
@@ -701,4 +715,4 @@ def _patch_ltx2_per_batch_timestep() -> None:
         True,
     )
     LTXRuntime._denoise_timestep_kwargs = _per_batch_denoise_timestep_kwargs
-    logger.info("Applied TPU patch: per-batch LTX-2 T2V timestep under SP.")
+    logger.info("Applied TPU patch: per-batch LTX-2 unconditioned timestep.")
