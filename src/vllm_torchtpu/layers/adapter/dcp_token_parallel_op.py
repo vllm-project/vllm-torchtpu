@@ -358,6 +358,31 @@ def _after_reads(*caches: jax.Array, after: jax.Array) -> tuple[jax.Array, ...]:
     return lax.optimization_barrier((*caches, after))[:-1]
 
 
+def _tie_rank_to_partial(
+    partial: jax.Array, rank_ids: jax.Array, mesh: Any, sharded_spec: Any
+) -> jax.Array:
+    # Avoid scheduling the leading-row attention and its LSE/psum collectives
+    # serially after the main token-parallel attention: tying `rank_ids` with a
+    # NaN-safe zero-delta barrier from `partial` orders leading attention first
+    # so its collectives overlap the main attention kernel.
+    def _tie_local(part_local: jax.Array, rank_local: jax.Array) -> jax.Array:
+        bits = jax.lax.bitcast_convert_type(
+            part_local[0, 0, 0].astype(jnp.bfloat16), jnp.uint16
+        ).astype(jnp.int32)
+        zero = (jax.lax.optimization_barrier(bits) == jnp.int32(-1)).astype(
+            rank_local.dtype
+        )
+        return rank_local + zero
+
+    return jax.shard_map(
+        _tie_local,
+        mesh=mesh,
+        in_specs=(sharded_spec, sharded_spec),
+        out_specs=sharded_spec,
+        check_vma=False,
+    )(partial, rank_ids)
+
+
 def build_attention_op(
     layer: Any,
     impl: Any,
@@ -624,6 +649,11 @@ def build_attention_op(
             merge_pieces=False,
             skip_kv_write=True,
         )
+        own_rank_ids = (
+            _tie_rank_to_partial(partial, rank_ids, mesh, shd)
+            if w_o is not None and rank_ids is not None
+            else rank_ids
+        )
         _, _, tail_out = dcp_token_parallel.sparse_mla_attention(
             layout,
             mesh,
@@ -640,7 +670,7 @@ def build_attention_op(
             request_distribution,
             write_kv=None,
             attend=attend,
-            rank_ids=rank_ids,
+            rank_ids=own_rank_ids,
             q_own_rows=q_replicated,
             read_pages=read_pages,
             w_uv=w_uv,

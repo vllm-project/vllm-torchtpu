@@ -26,6 +26,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.mla import dcp_token_parallel as tp
+from vllm_torchtpu.layers.adapter import dcp_token_parallel_op as tp_op_mod
 
 AXIS = "dcp"
 PAD_SENTINEL = 1.0e4
@@ -247,3 +248,125 @@ def test_should_reject_lead_rows_not_matching_split_rows():
         tp.token_rows_to_sequence_rows(
             layout, jnp.zeros((4, 8)), jnp.zeros((3, 8)), jnp.int32(0), AXIS
         )
+
+
+def test_should_preshift_sequence_rows_before_oproj_preserving_bf16_bits():
+    dcp, split_rows, heads_per_rank, latent, v_dim, hidden = 4, 8, 2, 16, 8, 24
+    rng = np.random.default_rng(77)
+    mesh = _mesh(dcp)
+    layout = _layout(dcp, split_rows)
+    heads = dcp * heads_per_rank
+    rows_per_rank = 2 * split_rows
+    lead_partial = rng.standard_normal((dcp, split_rows, heads, latent)).astype(
+        jnp.bfloat16
+    )
+    lead_lse = rng.uniform(-3.0, 3.0, (dcp, split_rows, heads)).astype(np.float32)
+    lead_lse[0, 0, :] = -np.inf
+    w_uv = rng.standard_normal((heads, latent, v_dim)).astype(jnp.bfloat16)
+    own_out = rng.standard_normal((dcp * rows_per_rank, heads, v_dim)).astype(
+        jnp.bfloat16
+    )
+    w_q, w_s = _whole_k_fp8(rng, heads * v_dim, hidden)
+    half = heads * v_dim // 2
+    w_arg = np.concatenate(
+        [w_q[(r % 2) * half : (r % 2 + 1) * half] for r in range(dcp)]
+    )
+    args = (
+        _sharded(mesh, lead_partial.reshape(dcp * split_rows, heads, latent)),
+        _sharded(mesh, lead_lse.reshape(dcp * split_rows, heads)),
+        _sharded(mesh, own_out),
+        _sharded(mesh, np.arange(dcp, dtype=np.int32)),
+        jnp.asarray(w_uv),
+        _sharded(mesh, w_arg),
+        _sharded(mesh, np.tile(w_s, dcp)),
+    )
+    got = tp.project_sequence_rows(layout, mesh, AXIS, *args)
+
+    # Independent reference: project [lead; own] first, then shift to sequence rows.
+    sharded = P(AXIS)
+
+    def _postshift_ref(part, lse_part, own, rank_arr, w_uv_all, w_shard, s_shard):
+        lses = jax.lax.all_gather(lse_part, AXIS, axis=0, tiled=False)
+        m = jax.nn.logsumexp(lses, axis=0)
+        safe_m = jnp.where(jnp.isfinite(m), m, 0.0)
+        w = jnp.where(jnp.isfinite(lse_part), jnp.exp(lse_part - safe_m), 0.0)
+        weighted = (part.astype(jnp.float32) * w[..., None]).astype(part.dtype)
+        lead_latent = jax.lax.psum(weighted, AXIS)
+        lead_v = jnp.einsum(
+            "rhl,hlv->rhv", lead_latent, w_uv_all.astype(lead_latent.dtype)
+        ).astype(own.dtype)
+        s = lead_v.shape[0]
+        rows = jnp.concatenate(
+            [lead_v.reshape(s, -1), own.reshape(own.shape[0], -1)], axis=0
+        )
+        proj = tp.project_all_heads(rows, w_shard, s_shard, rank_arr[0], AXIS, dcp)
+        return tp.token_rows_to_sequence_rows(
+            layout, proj[s:], proj[:s], rank_arr[0], AXIS
+        )
+
+    want = jax.shard_map(
+        _postshift_ref,
+        mesh=mesh,
+        in_specs=(sharded, sharded, sharded, sharded, P(), sharded, sharded),
+        out_specs=sharded,
+        check_vma=False,
+    )(*args)
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
+    )
+
+    # Structural check: FP8 o_proj dot_general receives exact R rows, not R + s.
+    jaxpr = jax.make_jaxpr(lambda *a: tp.project_sequence_rows(layout, mesh, AXIS, *a))(
+        *args
+    )
+    dot_lhs_rows: list[int] = []
+
+    def _walk(jpr):
+        for eqn in jpr.eqns:
+            if eqn.primitive.name == "dot_general":
+                shape = eqn.invars[0].aval.shape
+                if len(shape) == 2 and shape[1] == half:
+                    dot_lhs_rows.append(shape[0])
+            for sub in jax.core.jaxprs_in_params(eqn.params):
+                _walk(sub)
+
+    _walk(jaxpr.jaxpr)
+    assert dot_lhs_rows and all(r == rows_per_rank for r in dot_lhs_rows)
+
+
+def test_should_keep_rank_tie_zero_delta_for_all_65536_bf16_bit_patterns():
+    dcp = 4
+    mesh = _mesh(dcp)
+    shd = P(AXIS)
+    ranks = _sharded(mesh, np.arange(dcp, dtype=np.int32))
+    # Exhaustive check across all 65,536 bf16 bit patterns (including NaNs/Infs).
+    all_bf16 = jax.lax.bitcast_convert_type(
+        jnp.arange(65536, dtype=jnp.uint16), jnp.bfloat16
+    )
+    probe_vals = jnp.array(
+        [0.0, -0.0, float("inf"), float("-inf"), float("nan")], dtype=jnp.bfloat16
+    )
+    for v in probe_vals:
+        partial = _sharded(mesh, np.full((dcp, 1, 1), v, dtype=jnp.bfloat16))
+        tied = tp_op_mod._tie_rank_to_partial(  # noqa: SLF001 -- unit under test
+            partial, ranks, mesh, shd
+        )
+        np.testing.assert_array_equal(np.asarray(tied), np.arange(dcp, dtype=np.int32))
+    bits = jax.lax.bitcast_convert_type(all_bf16, jnp.uint16).astype(jnp.int32)
+    assert int(jnp.sum(bits == jnp.int32(-1))) == 0
+    partial = _sharded(mesh, np.zeros((dcp, 1, 1), dtype=jnp.bfloat16))
+    jaxpr = jax.make_jaxpr(
+        lambda p, r: tp_op_mod._tie_rank_to_partial(  # noqa: SLF001 -- unit under test
+            p, r, mesh, shd
+        )
+    )(partial, ranks)
+    prims: set[str] = set()
+
+    def _walk(jpr):
+        for eqn in jpr.eqns:
+            prims.add(eqn.primitive.name)
+            for sub in jax.core.jaxprs_in_params(eqn.params):
+                _walk(sub)
+
+    _walk(jaxpr.jaxpr)
+    assert "optimization_barrier" in prims

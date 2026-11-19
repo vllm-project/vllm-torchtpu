@@ -624,15 +624,18 @@ def project_sequence_rows(
         lead_v = jnp.einsum(
             "rhl,hlv->rhv", lead_latent, w_uv_all.astype(lead_latent.dtype)
         ).astype(own.dtype)
-        s = lead_v.shape[0]
-        rows = jnp.concatenate(
-            [lead_v.reshape(s, -1), own.reshape(own.shape[0], -1)], axis=0
+        # Avoid projecting s + R rows (an extra partial tile) before shifting:
+        # shifting to each rank's R sequence rows first keeps quantize_rows and
+        # o_proj on exact R rows while remaining bit-exact.
+        seq_rows = token_rows_to_sequence_rows(
+            layout,
+            own.reshape(own.shape[0], -1),
+            lead_v.reshape(lead_v.shape[0], -1),
+            rank_arr[0],
+            axis_name,
         )
-        projected = project_all_heads(
-            rows, w_shard, s_shard, rank_arr[0], axis_name, layout.dcp_size
-        )
-        return token_rows_to_sequence_rows(
-            layout, projected[s:], projected[:s], rank_arr[0], axis_name
+        return project_all_heads(
+            seq_rows, w_shard, s_shard, rank_arr[0], axis_name, layout.dcp_size
         )
 
     return jax.shard_map(
