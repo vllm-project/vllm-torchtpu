@@ -36,6 +36,7 @@ from .constants import (
     WEIGHT_DTYPE_BYTES,
 )
 from .emit import (
+    build_solve_payload,
     emit_ceiling_rows,
     emit_launch_args,
 )
@@ -312,6 +313,7 @@ def _dispatch_solve(
     scen = _resolve_scenario(args, parser)
     if args.max_chips is None and args.max_instances is None:
         parser.error("Either --max-chips or --max-instances is required.")
+    src = args.model if args.model is not None else args.config
     dt_auto = dtypes_from_hf_config(cfg)
     splan = solve_serving_plan(
         from_hf_config(cfg),
@@ -330,7 +332,13 @@ def _dispatch_solve(
     if args.cmd == "emit":
         return _dispatch_emit(args, splan, dt_auto)
     if args.json:
-        sys.stdout.write(json.dumps(asdict(splan)) + "\n")
+        payload = build_solve_payload(
+            splan,
+            chip=CHIPS[args.chip],
+            dtypes=dt_auto,
+            model=src,
+        )
+        sys.stdout.write(json.dumps(payload) + "\n")
         return 0
     for warning in splan.warnings:
         sys.stdout.write(f"WARNING: {warning}\n")
