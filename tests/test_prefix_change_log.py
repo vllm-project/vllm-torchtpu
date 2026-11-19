@@ -49,7 +49,7 @@ _SCRIPT = textwrap.dedent(
 
     assert methods() == before, "importing the scheduler patched vLLM"
     assert not prefix_change_log.epoch_installed()
-    assert not prefix_change_log.install(), "change log without epoch counters"
+    assert prefix_change_log.install() is False, "change log without epoch counters"
     assert methods() == before
 
     targets = [
@@ -62,7 +62,7 @@ _SCRIPT = textwrap.dedent(
         "vllm_torchtpu.core.prefix_change_log:install",
     ], targets
     for target in targets:
-        assert patch_registry._invoke(target) is not False, target
+        assert patch_registry._invoke(target) is None, target
     after = methods()
     assert prefix_change_log.epoch_installed() and prefix_change_log.installed()
     assert after[3] is before[3] and after[5] is before[5]
