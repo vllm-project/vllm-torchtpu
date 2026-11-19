@@ -22,7 +22,6 @@ from .formats import (
     WEIGHT_FORMS,
     WeightFormat,
     weight_form,
-    weight_format_of_dtype,
 )
 from .layer import fused_ep_moe
 from .layout import LANES, MESH_AXIS, ROW_BLOCK
@@ -54,5 +53,4 @@ __all__ = [
     "routing_block",
     "supported_on",
     "weight_form",
-    "weight_format_of_dtype",
 ]
