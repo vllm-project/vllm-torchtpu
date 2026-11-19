@@ -72,7 +72,8 @@ def patched_pool():
     # The registry's order: the same-step patch, the epoch, the change log.
     vllm_torchtpu._patch_vllm_same_step_prefix_hits()
     prefix_change_log.install_epoch()
-    assert prefix_change_log.install()
+    assert prefix_change_log.install() is None
+    assert prefix_change_log.installed()
     init_none_hash(sha256)
     try:
         yield _begin_step
@@ -321,9 +322,9 @@ def test_memo_mismatch_turns_the_change_log_off(patched_pool):
 
 
 def test_change_log_install_is_idempotent_over_the_same_step_patch(patched_pool):
-    assert prefix_change_log.install()
+    assert prefix_change_log.install() is None
     wrapped = BlockPool._insert_block_hash
-    assert prefix_change_log.install()
+    assert prefix_change_log.install() is None
     assert BlockPool._insert_block_hash is wrapped
     # The plugin patch must not re-apply on top (it keys on get_cached_block).
     vllm_torchtpu._patch_vllm_same_step_prefix_hits()

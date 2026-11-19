@@ -45,6 +45,7 @@ Once ``enable(pool)`` has run, every event that can change the answer of
 """
 
 import functools
+from typing import Literal
 
 LOG = "_tpu_prefix_change_log"
 BASE = "_tpu_prefix_change_log_base"
@@ -160,7 +161,7 @@ def installed() -> bool:
     return bool(getattr(BlockPool._insert_block_hash, _MARK, False))
 
 
-def install() -> bool:
+def install() -> Literal[False] | None:
     """Wrap BlockPool/KVCacheManager to keep the change log of pools that
     ``enable`` opted in. A registry patch (engine core) after the plugin's
     same-step prefix-hit patch and ``install_epoch``; idempotent. Returns
@@ -170,7 +171,7 @@ def install() -> bool:
     from vllm.v1.core.kv_cache_manager import KVCacheManager
 
     if getattr(BlockPool._insert_block_hash, _MARK, False):
-        return True
+        return None
     if not getattr(
         BlockPool.get_cached_block, "_tpu_same_step_prefix_hit_patch", False
     ):
@@ -236,7 +237,7 @@ def install() -> bool:
     BlockPool._remove_cached_block_hashes = _remove_cached_block_hashes
     BlockPool.reset_prefix_cache = reset_prefix_cache
     KVCacheManager.new_step_starts = new_step_starts
-    return True
+    return None
 
 
 def enable_epoch(pool) -> bool:
