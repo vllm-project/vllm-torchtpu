@@ -261,7 +261,6 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
-    TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_FP8: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT: str = ""
 
 
@@ -1675,17 +1674,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "qk8": fp8 queries x fp8 keys (int4 keys are exact in fp8) on the MXU;
     # "pv8": fp8 probabilities (carrying the V scales) x fp8 int4 values.
     # Not bit-identical.
-    # MiniMax M3 MSA prefill attention on fp8 KV caches (DCP, one KV head per
-    # group): copy each distinct page of a prefill-sized call once into a VMEM
-    # page cache of this many slots (32 KB each) instead of once per query
-    # tile that selects it, as the 4-bit TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE.
-    # 0 = off (stream per group). Same outputs bit for bit.
-    "TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_FP8": env_nonnegative_int(
-        "TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_FP8", 0
-    ),
-    # MiniMax M3 MSA prefill attention on fp8 KV caches: comma list of
-    # "exp16" (softmax exp in bf16) and "qk8" (fp8 x fp8 score dot). Not
-    # bitwise; empty (default) = off.
+    # MiniMax M3 MSA prefill attention on fp8 KV caches: "exp16" runs the
+    # softmax exp in bf16 (p enters p @ v in bf16 anyway). Not bitwise; empty
+    # (default) = off.
     "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT": env_str(
         "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT", ""
     ),

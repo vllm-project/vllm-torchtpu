@@ -198,10 +198,10 @@ _PRECISION_LEVERS = ("qk8", "pv8")
 # TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT levers of 8-bit (fp8) pages on the
 # transposed prefill path (`_kernel.attend_t`), default off, not bitwise:
 # "exp16": p = exp2(s - m) in bf16 (p enters p @ v in bf16 anyway; l sums the
-# rounded p in f32). "qk8": K stays fp8 and the scaled query rounds to fp8, so
-# the score dot runs fp8 x fp8 and the page's K half needs no bf16 convert.
+# rounded p in f32). Standalone fp8 calls on served DCP 2 selections, block_q
+# 32 and 32-page groups: -2.6% (8,192 tokens), out rel-rms 3e-3 (j-662afb0e).
 FP8_OPT_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT"
-_FP8_LEVERS = ("exp16", "qk8")
+_FP8_LEVERS = ("exp16",)
 
 
 def fp8_prefill_levers(spec: str | None = None) -> frozenset:
@@ -480,7 +480,6 @@ def _kernel(
     qk8 = fp4 and "qk8" in precision
     pv8 = fp4 and "pv8" in precision
     exp16_t = not fp4 and "exp16" in precision
-    qk8_t = not fp4 and "qk8" in precision
     out_unit = 1.0 / _PV8_UNIT if pv8 else 1.0
 
     def group_head(w):
@@ -757,17 +756,7 @@ def _kernel(
                 limit = jnp.where(local_page == page, local_limit, page_size)
                 limit = jnp.where(page >= 0, limit * hit, 0)  # [1, Bq]
                 seen = jnp.max(limit)
-                if packing == 4 and qk8_t:
-                    rows8 = kv_ref[0].reshape(page_size, -1)
-                    values.append(
-                        jnp.where(
-                            row_slots < seen,
-                            rows8[:, head_dim:].astype(jnp.bfloat16),
-                            0,
-                        )
-                    )
-                    rows = rows8
-                elif packing == 4:
+                if packing == 4:
                     rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
                     values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
                 else:
@@ -780,9 +769,7 @@ def _kernel(
             v = jnp.concatenate(values, axis=0)
             mask = jnp.concatenate(masks, axis=0)
             q = q_ref[...].reshape(num_heads * block_q, head_dim)
-            q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(
-                k.dtype if qk8_t else q.dtype
-            )
+            q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
             s = jax.lax.dot_general(
                 k, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
             )  # [W * S, rows]
@@ -1400,16 +1387,6 @@ def _attention_call(
                     msa_attention._VMEM_LIMIT_BYTES + cache_size * rows_per_page * 8 * row_width * 2,
                 )
                 if bf16_cache
-                else min(
-                    63 * 1024 * 1024,
-                    msa_attention._VMEM_LIMIT_BYTES
-                    + cache_size
-                    * rows_per_page
-                    * packing
-                    * row_width
-                    * jnp.dtype(kv_cache.dtype).itemsize,
-                )
-                if cache_size and not fp4
                 else msa_attention._VMEM_LIMIT_BYTES
             ),
             # Every copy's page comes from the page table, so the checks only
@@ -1839,27 +1816,19 @@ def _chunked_call(
         step_widths=step_widths,
         row_split=row_split,
     )
-    # 4-bit caches; 8-bit ones when the caller asks
-    # (TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_FP8, `msa_dcp.msa_attend_dcp`).
-    cache_size = (
-        page_cache_slots
-        if scale_cache is not None or jnp.dtype(kv_cache.dtype).itemsize == 1
-        else 0
-    )
-    if cache_size and scale_cache is not None:
+    cache_size = page_cache_slots if scale_cache is not None else 0
+    if cache_size:
         call = functools.partial(
             call,
             cache_size=cache_size,
             cache_bf16=page_cache_bf16,
             precision=prefill_precision_levers(prefill_precision),
         )
-    elif scale_cache is None and (cache_size or prefill_precision):
+    elif scale_cache is None and prefill_precision:
         # 8-bit pages: `prefill_precision` names TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT
         # levers (`msa_dcp.msa_attend_dcp`).
         call = functools.partial(
-            call,
-            cache_size=cache_size,
-            precision=fp8_prefill_levers(prefill_precision or ""),
+            call, precision=fp8_prefill_levers(prefill_precision)
         )
     limit = msa_attention.MAX_TOKENS_PER_CALL
     step = min(num_tokens, max(block_q, limit - limit % block_q))
