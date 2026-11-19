@@ -11,16 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DeepSeek-V4 tokenizer that honors ``continue_final_message``.
+"""Tokenizer and renderer registrations.
 
-vLLM renders DeepSeek-V4 chat by calling the checkpoint's ``encode_messages``
-instead of a Jinja template, and builds its encode config from ``thinking_mode``,
-``drop_thinking`` and ``reasoning_effort`` alone. ``continue_final_message`` is
-dropped, so a trailing assistant turn is always rendered with ``eos_token`` and
-a request that prefills one asks the model to generate past end-of-sentence.
+``TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE``: a DeepSeek-V4 tokenizer that honors
+``continue_final_message``. vLLM renders DeepSeek-V4 chat by calling the
+checkpoint's ``encode_messages`` instead of a Jinja template, and builds its
+encode config from ``thinking_mode``, ``drop_thinking`` and
+``reasoning_effort`` alone. ``continue_final_message`` is dropped, so a
+trailing assistant turn is always rendered with ``eos_token`` and a request
+that prefills one asks the model to generate past end-of-sentence. The encoder
+reads a per-message ``wo_eos`` flag and has a template for that case; the
+registered tokenizer sets the flag.
 
-The encoder reads a per-message ``wo_eos`` flag and has a template for that
-case. This module registers a tokenizer that sets the flag.
+``VLLM_TPU_SEGMENT_TOKENIZE``: the ``hf`` renderer that tokenizes prompts
+piecewise with a cache (``segment_tokenize``).
 """
 
 import copy
@@ -72,6 +76,13 @@ class TpuDeepseekV4Tokenizer(TokenizerLike):
 
 def register_tokenizers() -> None:
     from vllm_torchtpu import envs
+
+    if envs.VLLM_TPU_SEGMENT_TOKENIZE:
+        from vllm.renderers.registry import RENDERER_REGISTRY
+
+        RENDERER_REGISTRY.register(
+            "hf", "vllm_torchtpu.segment_tokenize", "SegmentTokenizeHfRenderer"
+        )
 
     if not envs.TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE:
         return
