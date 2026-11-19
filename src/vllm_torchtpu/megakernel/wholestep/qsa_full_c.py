@@ -748,7 +748,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 for i in range(h):
                     nv_h = jnp.where(rid_h == i, ctx.extra[NVIS][lo + o + i], nv_h)
                 ids_h = ids[:h]
-                if self.select_nvis:
+                if self.nvis_thr:
                     with ctx.stream.sc("qsa_thr", 2):
                         thr, tmax = self._nvis_thresholds(
                             ctx, s0 + o, h, nv_h, nv_max(lo + o, h)
@@ -771,7 +771,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                         for k in ("qi_th", "qi_tm")
                     ]
                     ctx.comm.exchange(xs)
-            elif self.select_nvis:
+            elif self.nvis_thr:
                 with ctx.stream.sc("qsa_thr", 2):
                     thr, tmax = self._nvis_thresholds(ctx, s0, n, nv, nv_max(lo, n))
                 scr["qi_th"][pl.ds(lo, n)] = jnp.broadcast_to(thr, (n, 1, 128))
@@ -792,11 +792,11 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             if self.union_attn:
                 scr["qu_code"][...] = jnp.zeros((S, 128), I32)
 
-            if self.select_nvis:
+            if self.nvis_cmp:
                 nconsts = ix.chunk_consts(2 * self.nvis_rows[1], K)
 
             def row(r: Any, carry: Any) -> Any:
-                if self.select_nvis:
+                if self.nvis_cmp:
                     ga = ctx.extra[CTXQ][r // T] // 4
                     pos, sga, kept = self._nvis_row(ctx, r, lo, s0, ga, nconsts)
                     scr["qc_sga"][r] = sga
