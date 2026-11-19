@@ -28,11 +28,13 @@ Qwen3.5-397B-A17B on TPU7x, in the roles and layouts of the validation
 entries (``validation/``). Every other engine keeps main's behaviour.
 
 - ``kv_cache_memory_bytes``: a calibrated budget on a decode
-  (``kv_consumer``) leg at TP8 + DCP4 with expert parallelism and no pipeline
-  or prefill context parallelism (the entries' TP8 decode legs). Every other
-  engine stays on ``gpu_memory_utilization``, among them the DP4 x TP2 decode
-  layout (its entry passes ``--kv-cache-memory-bytes``) and main's nightly
-  TP1 x DP8 configs.
+  (``kv_consumer``) leg at TP8 + DCP4 with expert parallelism, no pipeline
+  or prefill context parallelism, and the fused EP MoE v3 kernel
+  (``MOE_FUSED_EP_KERNEL_IMPL=v3``): the entries' TP8 decode legs. Every
+  other engine stays on ``gpu_memory_utilization``, among them a leg with
+  fused EP v2 or the grouped-matmul MoE (their activations were never
+  measured beside this budget), the DP4 x TP2 decode layout (its entry passes
+  ``--kv-cache-memory-bytes``) and main's nightly TP1 x DP8 configs.
 - ``prefix_match_unit``: 128 tokens on a prefill (``kv_producer``) leg
   without prefill or decode context parallelism (the entries' PP8 prefill
   legs). Every other engine keeps the unit unset, so a PCP prefill leg
@@ -46,7 +48,7 @@ from typing import TYPE_CHECKING
 from jax.experimental.pallas import tpu as pltpu
 from vllm.model_executor.models.config import Qwen3_5ForConditionalGenerationConfig
 
-from vllm_torchtpu import additional_config_sections, tpu_info
+from vllm_torchtpu import additional_config_sections, envs, tpu_info
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.qwen3_5 import settings
 
@@ -68,6 +70,9 @@ _CALIBRATED_CHIP = pltpu.ChipVersion.TPU_7X.value
 # ran on the KV budget, with expert parallelism over their 8 ranks: the
 # validation entries' TP8 + DCP4 decode legs.
 _CALIBRATED_DECODE_LAYOUTS = frozenset({(8, 1, 4)})
+# The MoE kernel those legs ran (MOE_FUSED_EP_KERNEL_IMPL): its scratch is
+# part of the HBM the budget leaves for activations.
+_CALIBRATED_MOE_KERNEL = "v3"
 # The budget at 80 expert slots per rank (64 primary + 16 replicated slots),
 # reserving about 2.5 GiB of HBM for runtime activations and program-load
 # scratch buffers.
@@ -145,12 +150,21 @@ def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
     cache_config.prefix_match_unit = 128
 
 
+def _moe_kernel() -> str | None:
+    """The fused EP MoE implementation this process runs (``v2`` when the
+    switch is on without an implementation), or None without fused EP."""
+    if not envs.USE_MOE_FUSED_EP_KERNEL:
+        return None
+    return envs.MOE_FUSED_EP_KERNEL_IMPL or "v2"
+
+
 def _is_measured_kv_layout(vllm_config: VllmConfig) -> bool:
-    """Whether the engine's role and layout are those the KV budget was
-    measured on: a decode (kv_consumer) leg at TP8 + DCP4 with expert
-    parallelism and no pipeline or prefill context parallelism. There the
-    expert-slot credit counts each rank's slots and layers exactly; PP splits
-    the layers across stages and vLLM folds PCP into the EP size."""
+    """Whether the engine's role, layout and MoE kernel are those the KV
+    budget was measured on: a decode (kv_consumer) leg at TP8 + DCP4 with
+    expert parallelism, no pipeline or prefill context parallelism, and fused
+    EP MoE v3. There the expert-slot credit counts each rank's slots and
+    layers exactly; PP splits the layers across stages and vLLM folds PCP into
+    the EP size."""
     kv_cfg = vllm_config.kv_transfer_config
     parallel_config = vllm_config.parallel_config
     layout = (
@@ -165,6 +179,7 @@ def _is_measured_kv_layout(vllm_config: VllmConfig) -> bool:
         and parallel_config.enable_expert_parallel
         and parallel_config.pipeline_parallel_size == 1
         and parallel_config.prefill_context_parallel_size == 1
+        and _moe_kernel() == _CALIBRATED_MOE_KERNEL
     )
 
 
@@ -179,9 +194,9 @@ def _apply_kv_budget(vllm_config: VllmConfig, calibrated: bool) -> None:
             "Qwen3.5 kv_cache_memory_bytes left to gpu_memory_utilization: the "
             "calibrated budget was measured for Qwen3.5-397B-A17B decode "
             "(kv_consumer) legs on TPU7x at TP8 + DCP4 with expert "
-            "parallelism and no PP or PCP (this engine: calibrated checkpoint "
-            "and device=%s, kv_role=%s, tp=%d, dp=%d, dcp=%d, "
-            "expert_parallel=%s, pp=%d, pcp=%d).",
+            "parallelism, no PP or PCP and fused EP MoE v3 (this engine: "
+            "calibrated checkpoint and device=%s, kv_role=%s, tp=%d, dp=%d, "
+            "dcp=%d, expert_parallel=%s, pp=%d, pcp=%d, fused_ep=%s).",
             calibrated,
             None if kv_cfg is None else kv_cfg.kv_role,
             parallel_config.tensor_parallel_size,
@@ -190,6 +205,7 @@ def _apply_kv_budget(vllm_config: VllmConfig, calibrated: bool) -> None:
             parallel_config.enable_expert_parallel,
             parallel_config.pipeline_parallel_size,
             parallel_config.prefill_context_parallel_size,
+            _moe_kernel(),
         )
         return
     credit, slots = _expert_slot_kv_credit(vllm_config.model_config, parallel_config)
