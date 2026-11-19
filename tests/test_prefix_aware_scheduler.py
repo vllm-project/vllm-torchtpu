@@ -163,7 +163,8 @@ def _offload_connector(
 def test_default_knobs(monkeypatch):
     monkeypatch.delenv(_CAP_ENV, raising=False)
     assert PrefixAwareScheduler.WINDOW == 64
-    assert _make_scheduler([], {})._tier_probe_max_chunks == 256
+    assert _make_scheduler([], {})._tier_probe_max_chunks == 0
+    assert _make_scheduler([], {}, tier_warmth=True)._tier_probe_max_chunks == 256
 
 
 def test_promotes_warmest_within_window():
@@ -490,6 +491,13 @@ def test_tier_probe_cap_must_be_positive(monkeypatch, value):
     monkeypatch.setenv(_CAP_ENV, value)
     with pytest.raises(ValueError, match=f"{_CAP_ENV}: must be > 0"):
         _make_scheduler([], {}, tier_warmth=True)
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_tier_probe_cap_ignored_when_warmth_off(monkeypatch, value):
+    monkeypatch.setenv(_CAP_ENV, value)
+    s = _make_scheduler([], {}, tier_warmth=False)
+    assert s._tier_probe_max_chunks == 0
 
 
 def test_tier_probe_asks_for_the_chunks_past_the_hbm_hit():

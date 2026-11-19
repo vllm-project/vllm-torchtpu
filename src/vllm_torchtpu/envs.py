@@ -1731,16 +1731,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_PREFIX_AWARE_TIER_WARMTH", default=False
     ),
     # PrefixAwareScheduler: most offload-tier chunks the tier-warmth probe asks
-    # about per request. Past the cap, the rest of a long prompt the tier holds
-    # still ranks as cold. Must be > 0; TPU_PREFIX_AWARE_TIER_WARMTH=0 turns the
-    # probe off. 256 chunks is 1M tokens at 4096 tokens/chunk, which covers whole
+    # about per request (read only when TPU_PREFIX_AWARE_TIER_WARMTH=1; must be
+    # > 0). Past the cap, the rest of a long prompt the tier holds still ranks
+    # as cold. 256 chunks is 1M tokens at 4096 tokens/chunk, covering whole
     # prompts at GLM-5.2's max model length. On a GLM-5.2 P/D multi-turn coding
     # replay at concurrency 80, 256 gave 8.4% more tokens per dollar than 64 at
-    # flat requests/s: long sessions the tier held stopped waiting behind
-    # shorter requests. Cost: one batched store lookup per probed request (split
-    # only around chunks with a save in flight), cached for TIER_PROBE_TTL_S
-    # while the request's HBM hit is unchanged. Operators lower it only if
-    # scheduler step time shows the probe's cost.
+    # flat requests/s: >256K tier-held turns stopped starving behind <=256K
+    # turns (>256K p90 TTFT 42.6 -> 20.9 s; <=256K p90 TTFT 18.3 -> 21.2 s).
+    # Cost: one batched store lookup per probed request (split only around
+    # chunks with a save in flight), cached for TIER_PROBE_TTL_S while the
+    # request's HBM hit is unchanged. Operators lower it (e.g. to 64) if
+    # scheduler step time shows the probe's cost or to prioritize <=256K TTFT
+    # ahead of >256K sessions.
     "TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS": env_positive_int_or_none(
         "TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS", default=256
     ),

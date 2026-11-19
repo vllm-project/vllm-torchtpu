@@ -94,8 +94,11 @@ class PrefixAwareScheduler(AsyncScheduler):
     def _init_tier_warmth(self, enabled: bool) -> None:
         self._tier_warmth = bool(enabled)
         # Most tier chunks probed per request, bounding the store lookup on
-        # very long prompts.
-        self._tier_probe_max_chunks = envs.TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS
+        # very long prompts. Read only when warmth is on so an invalid/zero cap
+        # does not block a scheduler that never probes.
+        self._tier_probe_max_chunks = (
+            envs.TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS if self._tier_warmth else 0
+        )
         self._tier_resolved = False
         self._tier_scheduler: TPURaidenOffloadingScheduler | None = None
         self._tier_probe_broken = False
