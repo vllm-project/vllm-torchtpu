@@ -16,6 +16,7 @@ queues can be turned off (FCFS admission). Default on.
 """
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -73,10 +74,6 @@ def test_schedule_off_a_decode_leg_promotes_only_when_on(monkeypatch, on):
 
 
 def test_init_reads_the_option(monkeypatch):
-    from unittest.mock import MagicMock
-
-    from vllm_torchtpu.core import prefix_change_log
-
     def fake_init(self, *args, **kwargs):
         self.vllm_config = SimpleNamespace(
             kv_transfer_config=None,
@@ -86,6 +83,5 @@ def test_init_reads_the_option(monkeypatch):
         self.kv_cache_manager = MagicMock()
 
     monkeypatch.setattr(AsyncScheduler, "__init__", fake_init)
-    monkeypatch.setattr(prefix_change_log, "install_epoch", lambda: None)
     monkeypatch.setattr(PrefixAwareScheduler, "_enable_memo_xstep", lambda self: None)
     assert PrefixAwareScheduler()._promote_warmest_on() is False

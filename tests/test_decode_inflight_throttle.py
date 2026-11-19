@@ -21,7 +21,6 @@ import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 
-from vllm_torchtpu.core import prefix_change_log
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
 
 # ---------------- decode admission throttle ----------------
@@ -95,7 +94,6 @@ def _built(monkeypatch, options, kv_role="kv_consumer", dcp=4):
         self.dcp_world_size = dcp
 
     monkeypatch.setattr(AsyncScheduler, "__init__", fake_init)
-    monkeypatch.setattr(prefix_change_log, "install_epoch", lambda: None)
     monkeypatch.setattr(PrefixAwareScheduler, "_enable_memo_xstep", lambda self: None)
     return PrefixAwareScheduler()
 
