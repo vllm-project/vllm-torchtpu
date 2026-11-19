@@ -20,7 +20,11 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
-from runner_output_test_utils import _host_copy_state, _sample_tokens_runner
+from runner_output_test_utils import (
+    _host_copy_state,
+    _plain_step_runner,
+    _run_sample_tokens,
+)
 from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -556,6 +560,7 @@ def test_top_tokens_step_needs_the_full_logits_below_min_tokens():
     batch = SimpleNamespace(
         all_greedy=True,
         max_num_logprobs=None,
+        no_penalties=True,
         req_ids=["r0"],
         req_id_to_index={"r0": 0},
     )
@@ -569,31 +574,6 @@ def test_top_tokens_step_needs_the_full_logits_below_min_tokens():
     runner._min_tokens.discard(["r0"])
     runner._min_tokens.add("p", SamplingParams(min_tokens=3, stop_token_ids=[2]))
     assert runner._greedy_top_tokens_this_step()
-
-
-def _plain_step_runner(num_output, logits, req_id="r0"):
-    """The runner state sample_tokens reads for one greedy request in a plain
-    (non-speculative, synchronous) step, picking the argmax of what it gets,
-    with the runner's own min_tokens methods. With `num_output`, request
-    `req_id` has that many outputs, min_tokens 4 and stop token 3."""
-    runner = _sample_tokens_runner(
-        [logits], [1], _min_tokens=min_tokens.MinTokensTracker()
-    )
-    if num_output is not None:
-        runner._min_tokens.add(req_id, SamplingParams(min_tokens=4, stop_token_ids=[3]))
-        runner.requests[req_id] = SimpleNamespace(
-            num_computed_tokens=0, num_tokens=1, output_token_ids=[0] * num_output
-        )
-    for name in (
-        "_sample_chunk_logits",
-        "_sample_plain_chunk",
-        "_mask_min_tokens",
-        "_min_tokens_batch_state",
-        "_settle_draft_placeholders_for_min_tokens",
-        "_num_output_tokens",
-    ):
-        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
-    return runner
 
 
 @pytest.mark.parametrize(
@@ -773,19 +753,6 @@ def _spec_step_runner(num_output, logits_list, md_list, req_ids):
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     return runner
-
-
-def _run_sample_tokens(runner):
-    with (
-        patch(
-            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=False
-        ),
-        patch.object(
-            AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy_state
-        ),
-        torch.compiler.set_stance("force_eager"),
-    ):
-        return TPUModelRunner.sample_tokens(runner, None)
 
 
 def _one_request_verify_md():

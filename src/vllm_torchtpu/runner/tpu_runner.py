@@ -20,6 +20,7 @@ import bisect
 import contextlib
 import copy
 import dataclasses
+import itertools
 import math
 import os
 import time
@@ -133,6 +134,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
+from vllm_torchtpu.layers.adapter.sample import penalties as sampling_penalties
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
@@ -172,6 +174,7 @@ from vllm_torchtpu.runner import (
     thinking_budget_tracker,
 )
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
+from vllm_torchtpu.runner import penalties as runner_penalties
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
@@ -5319,6 +5322,79 @@ class TPUModelRunner(GPUModelRunner):
             return logits
         return min_tokens_mask.apply_stop_table(logits, *table)
 
+    def _penalties_batch_state(self) -> bool:
+        """Whether this step applies repetition / frequency / presence
+        penalties: a request in the batch sets one and no speculative config
+        is set (verify steps do not apply them yet, so with one the penalties
+        are skipped for every step). Side-effect free."""
+        if self.input_batch.no_penalties:
+            return False
+        if self.speculative_config is not None:
+            logger.warning_once(
+                "Repetition/frequency/presence penalties are not applied on TPU "
+                "while speculative decoding is enabled; requests that set them "
+                "are served without them."
+            )
+            return False
+        return True
+
+    def _apply_penalties(
+        self, logits: torch.Tensor, start: int, end: int
+    ) -> torch.Tensor:
+        """Penalizes the logits of batch rows ``start .. end - 1`` (logits
+        row ``i - start``); float32 out. Returns ``logits`` when none of those
+        rows uses a penalty."""
+        rows = runner_penalties.penalized_rows(self.input_batch, start, end)
+        if rows.size == 0:
+            return logits
+        # Penalties count every token so far, so the previous step's async
+        # placeholders must hold the real ids before the history is read (a
+        # host sync, only on steps where a chunk has a penalized row).
+        if self._pre_async_results is not None:
+            self._modify_prev_results()
+            self._pre_async_results = None
+        num_rows = int(logits.shape[0])
+        width = sampling_penalties.PENALTY_HISTORY_WIDTH
+        passes = runner_penalties.num_passes(self.input_batch, start, rows)
+        params_host = zeros_h2d_source(
+            self, num_rows * runner_penalties.NUM_PENALTY_PARAMS, torch.float32
+        )
+        runner_penalties.fill_params(
+            params_host.numpy().reshape(num_rows, -1), self.input_batch, start, rows
+        )
+        # One buffer per pass, so every pass reuses one compiled table shape.
+        tables_host = [
+            zeros_h2d_source(self, num_rows * width, torch.int32) for _ in range(passes)
+        ]
+        runner_penalties.fill_history_tables(
+            [t.numpy().reshape(num_rows, width) for t in tables_host],
+            self.input_batch,
+            start,
+            rows,
+        )
+        # Uploaded flat; the compiled graphs shape them (see penalties.py).
+        params = stage_h2d_upload(self, params_host)
+        tables = [stage_h2d_upload(self, t) for t in tables_host]
+        seen, counts = sampling_penalties.penalty_counts(logits, tables[0])
+        for table in tables[1:]:
+            seen, counts = sampling_penalties.add_penalty_counts(seen, counts, table)
+        return sampling_penalties.apply_penalty_counts(logits, seen, counts, params)
+
+    def _penalties_chunk(
+        self, start: int, end: int
+    ) -> runner_penalties.PenaltiesChunk | None:
+        """The ``chunk_processors.PlainChunkProcessor`` that penalizes batch
+        rows ``start .. end - 1``, or None when none of them uses a penalty.
+
+        The runner puts it before the other processors: vLLM's
+        ``Sampler.apply_logits_processors`` applies penalties after its logits
+        processors and before the thinking-token budget."""
+        if runner_penalties.penalized_rows(self.input_batch, start, end).size == 0:
+            return None
+        return runner_penalties.PenaltiesChunk(
+            lambda logits: self._apply_penalties(logits, start, end)
+        )
+
     def _sample_chunk_logits(
         self,
         logits: torch.Tensor,
@@ -5611,6 +5687,7 @@ class TPUModelRunner(GPUModelRunner):
         scheduler_output = state.scheduler_output
         self.execute_model_state = None
         min_toks = self._min_tokens_batch_state()
+        use_penalties = self._penalties_batch_state()
 
         # Used to keep rand draws consistent across TP ranks.
         sampling_generator = self._get_sampling_generator()
@@ -5631,8 +5708,14 @@ class TPUModelRunner(GPUModelRunner):
         needs_logprobs = max_num_logprobs is not None
         # step_eligible keeps grammar and logprobs steps on the full logits.
         assert not state.top_tokens or (
-            grammar_output is None and not needs_logprobs and not min_toks
-        ), "top_tokens chosen with grammar, logprobs or a request below min_tokens"
+            grammar_output is None
+            and not needs_logprobs
+            and not min_toks
+            and not use_penalties
+        ), (
+            "top_tokens chosen with grammar, logprobs, penalties or a request "
+            "below min_tokens"
+        )
 
         # Per-chunk bucketed (padded) tensors plus their real (unpadded)
         # request counts; kept at bucketed shapes so the async D2H copy hits
@@ -5763,6 +5846,17 @@ class TPUModelRunner(GPUModelRunner):
                             self.input_batch.req_ids, cur_start_idx, cur_end_idx
                         )
                     )
+                    # vLLM's order: penalties, then the thinking budget.
+                    chunk_procs = tuple(
+                        p
+                        for p in (
+                            self._penalties_chunk(cur_start_idx, cur_end_idx)
+                            if use_penalties
+                            else None,
+                            tb_chunk,
+                        )
+                        if p is not None
+                    )
                     selected, logprob_logits = self._sample_plain_chunk(
                         logits,
                         cur_start_idx=cur_start_idx,
@@ -5774,7 +5868,7 @@ class TPUModelRunner(GPUModelRunner):
                         scheduler_output=scheduler_output,
                         is_spec_step=True,
                         min_toks=min_toks,
-                        processors=(tb_chunk,) if tb_chunk is not None else (),
+                        processors=chunk_procs,
                     )
                     assert self.speculative_config is not None
                     padded = torch.full(
@@ -5819,6 +5913,17 @@ class TPUModelRunner(GPUModelRunner):
                         self.input_batch.req_ids, cur_start_idx, cur_end_idx
                     )
                 )
+                # vLLM's order: penalties, then the thinking budget.
+                chunk_procs = tuple(
+                    p
+                    for p in (
+                        self._penalties_chunk(cur_start_idx, cur_end_idx)
+                        if use_penalties
+                        else None,
+                        tb_chunk,
+                    )
+                    if p is not None
+                )
                 selected_token_ids, logprob_logits = self._sample_plain_chunk(
                     logits,
                     cur_start_idx=cur_start_idx,
@@ -5830,7 +5935,7 @@ class TPUModelRunner(GPUModelRunner):
                     scheduler_output=scheduler_output,
                     is_spec_step=False,
                     min_toks=min_toks,
-                    processors=(tb_chunk,) if tb_chunk is not None else (),
+                    processors=chunk_procs,
                 )
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it
@@ -7242,18 +7347,25 @@ class TPUModelRunner(GPUModelRunner):
             else 0
         )
         verify_logits_paddings = self._verify_logits_paddings()
+        # A penalized chunk hands the thinking budget float32 logits.
+        dtypes = _sampler_logits_dtypes(
+            self._hidden_states_dtype, self.speculative_config
+        )
         with self._precompile_timed("thinking_budget"):
-            self._thinking_budget.precompile(
-                num_reqs_paddings=_rotate_precompile_sweep(
-                    self.num_reqs_paddings, "thinking_budget"
-                ),
-                verify_logits_paddings=_rotate_precompile_sweep(
-                    verify_logits_paddings, "thinking_budget_verify_logits"
-                ),
-                max_draft_tokens=max_draft_tokens,
-                dummy_logits_fn=self._dummy_logits,
-                precompile_top_tokens=self._greedy_head_owner is not None,
-            )
+            for dtype in dtypes:
+                self._thinking_budget.precompile(
+                    num_reqs_paddings=_rotate_precompile_sweep(
+                        self.num_reqs_paddings, "thinking_budget"
+                    ),
+                    verify_logits_paddings=_rotate_precompile_sweep(
+                        verify_logits_paddings, "thinking_budget_verify_logits"
+                    ),
+                    max_draft_tokens=max_draft_tokens,
+                    dummy_logits_fn=lambda n, dtype=dtype: self._dummy_logits(n).to(
+                        dtype
+                    ),
+                    precompile_top_tokens=self._greedy_head_owner is not None,
+                )
 
     def _precompile_min_tokens_mask(self) -> None:
         with self._precompile_timed("min_tokens_mask"):
@@ -7276,15 +7388,45 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors(out)
                 logger.info("  -- num_rows: %d", num_rows)
 
+    def _precompile_penalties(self) -> None:
+        """The penalty graphs at every request bucket, with the one compiled
+        history width (penalties apply to one-row-per-request chunks only)."""
+        if self.speculative_config is not None:  # see _penalties_batch_state
+            return
+        width = sampling_penalties.PENALTY_HISTORY_WIDTH
+        with self._precompile_timed("penalties"):
+            for num_rows in self.num_reqs_paddings:
+                logits = self._dummy_logits(num_rows)
+                # Flat, as _apply_penalties uploads them.
+                table = torch.full(
+                    (num_rows * width,), sampling_penalties.PAD_TOKEN, dtype=torch.int32
+                ).to(self.device)
+                params = torch.zeros(
+                    (num_rows * runner_penalties.NUM_PENALTY_PARAMS,),
+                    dtype=torch.float32,
+                ).to(self.device)
+                seen, counts = sampling_penalties.penalty_counts(logits, table)
+                seen, counts = sampling_penalties.add_penalty_counts(
+                    seen, counts, table
+                )
+                out = sampling_penalties.apply_penalty_counts(
+                    logits, seen, counts, params
+                )
+                synchronize_tensors(out)
+                logger.info("  -- num_rows: %d", num_rows)
+
     def _precompile_sample_from_logits(self) -> None:
         with self._precompile_timed("sample_from_logits"):
-            for num_reqs in _rotate_precompile_sweep(
-                self.num_reqs_paddings, "sample_from_logits"
+            for num_reqs, dtype in itertools.product(
+                _rotate_precompile_sweep(self.num_reqs_paddings, "sample_from_logits"),
+                _sampler_logits_dtypes(
+                    self._hidden_states_dtype, self.speculative_config
+                ),
             ):
-                dummy_logits = self._dummy_logits(num_reqs)
-                dummy_temperatures = torch.ones(
-                    (num_reqs, 1), dtype=self._hidden_states_dtype
-                ).to(self.device)
+                dummy_logits = self._dummy_logits(num_reqs).to(dtype)
+                dummy_temperatures = torch.ones((num_reqs, 1), dtype=dtype).to(
+                    self.device
+                )
                 dummy_u = torch.rand_like(dummy_logits, dtype=torch.float32)
                 dummy_top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(
                     self.device
@@ -7315,7 +7457,7 @@ class TPUModelRunner(GPUModelRunner):
                         apply_topk_topp=apply_topk_topp,
                     )
                     synchronize_tensors(out)
-                logger.info("  -- num_seqs: %d", num_reqs)
+                logger.info("  -- num_seqs: %d, dtype: %s", num_reqs, dtype)
 
     def _precompile_gather_logprobs(self) -> None:
         with self._precompile_timed("gather_logprobs"):
@@ -7609,6 +7751,7 @@ class TPUModelRunner(GPUModelRunner):
         self._precompile_structured_decoding()
         self._precompile_min_tokens_mask()
         self._precompile_thinking_budget()
+        self._precompile_penalties()
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
 
@@ -9536,6 +9679,18 @@ class TPUModelRunner(GPUModelRunner):
             logprobs=logprobs,
             selected_token_ranks=token_ranks,
         )
+
+
+def _sampler_logits_dtypes(
+    hidden_states_dtype: torch.dtype, speculative_config: object
+) -> list[torch.dtype]:
+    """Logits dtypes the sampler sees: the model's, and float32 for a chunk
+    with a penalized request (penalties return float32, as vLLM's sampler),
+    which only happens without a speculative config (_penalties_batch_state).
+    """
+    if speculative_config is None and hidden_states_dtype != torch.float32:
+        return [hidden_states_dtype, torch.float32]
+    return [hidden_states_dtype]
 
 
 def _get_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:

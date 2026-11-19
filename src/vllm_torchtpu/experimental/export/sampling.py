@@ -21,6 +21,7 @@ from typing import Any
 import torch
 
 from vllm_torchtpu.experimental.export import api, random_sample, tpu_lowering
+from vllm_torchtpu.layers.adapter.sample.penalties import penalize_logits
 
 
 def greedy_tokens(logits: torch.Tensor) -> torch.Tensor:
@@ -124,28 +125,15 @@ def penalized_tokens(
     history: torch.Tensor,
     output_start: torch.Tensor,
 ) -> torch.Tensor:
-    """Samples one token id i64[R, 1] per row after applying penalties."""
-    logits = logits.to(torch.float32)
-    rows, vocab = int(logits.shape[0]), int(logits.shape[1])
-    hist_len = int(history.shape[1])
-    valid = history >= 0
-    ids = torch.where(valid, history, torch.zeros_like(history)).to(torch.int64)
-    col_idx = torch.arange(hist_len, device=logits.device, dtype=torch.int32).unsqueeze(
-        0
-    )
-    generated = valid & (col_idx >= output_start.to(torch.int32).unsqueeze(-1))
-    seen_acc = torch.zeros((rows, vocab), dtype=torch.float32, device=logits.device)
-    seen = seen_acc.scatter_add(1, ids, valid.to(torch.float32)) > 0
-    counts_acc = torch.zeros((rows, vocab), dtype=torch.float32, device=logits.device)
-    counts = counts_acc.scatter_add(1, ids, generated.to(torch.float32))
-    rep = repetition_penalty.to(torch.float32).unsqueeze(-1)
-    repeated = torch.where(logits > 0, logits / rep, logits * rep)
-    logits = torch.where(seen, repeated, logits)
-    logits = (
-        logits
-        - presence_penalty.to(torch.float32).unsqueeze(-1)
-        * (counts > 0).to(torch.float32)
-        - frequency_penalty.to(torch.float32).unsqueeze(-1) * counts
+    """Samples one token id i64[R, 1] per row after applying penalties
+    (``penalize_logits``, shared with the serving runner)."""
+    logits = penalize_logits(
+        logits,
+        history,
+        output_start,
+        repetition_penalty,
+        presence_penalty,
+        frequency_penalty,
     )
     return stochastic_tokens(logits, temperature, top_k, top_p, min_p, uniform)
 

@@ -338,6 +338,7 @@ def _make_sample_runner(
             all_greedy=all_greedy,
             no_top_k=True,
             no_top_p=True,
+            no_penalties=True,
             generators={},
             num_tokens_no_spec=[
                 len(requests[rid].prompt_token_ids)
@@ -382,6 +383,7 @@ def _make_sample_runner(
         vocab_size=vocab_size,
         _get_sampling_generator=lambda: torch.Generator().manual_seed(7),
         _greedy_sample=lambda x: torch.argmax(x, dim=-1, keepdim=True),
+        _penalties_batch_state=lambda: False,
         _sampler_topk_candidates=lambda *_a: 0,
         _update_mamba_slot_read_offsets=lambda *_args: None,
         _update_num_xla_graphs=lambda *_args: None,

@@ -133,3 +133,9 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
     "num_speculative_tokens": 5
   }'
 ```
+
+---
+
+## Limitations
+
+- **Sampling penalties:** `repetition_penalty`, `frequency_penalty` and `presence_penalty` (from the request or the model's `generation_config.json`) are not applied while `--speculative-config` is set: verify steps do not support them yet, so they are skipped on every step and a warning is logged once. Without a speculative config, they are applied as in vLLM.
