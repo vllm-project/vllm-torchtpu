@@ -23,8 +23,6 @@ Inputs, tiled along rows in VMEM:
 
 Returns q and k normed in f32 and rotated on their first R dims, and the
 pre-sigmoid gate, all in the input dtype.
-
-Fused Pallas kernel for Q/gate split, head-wise Q/K RMSNorm, and partial rotary embeddings.
 """
 
 import functools

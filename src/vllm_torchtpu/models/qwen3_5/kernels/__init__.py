@@ -11,5 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3.5 kernel copies; each file carries a provenance header naming its source
-path and commit."""
+"""Kernels the Qwen3.5 model rules run: the fused q/k norm + rope + gate and the
+GDN gated norm + FP8 quantization, with their custom-op bridges and the rule
+that says where they run."""
