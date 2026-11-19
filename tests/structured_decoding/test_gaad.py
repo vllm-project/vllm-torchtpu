@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_torchtpu.structured_decoding import gaad
 from vllm_torchtpu.structured_decoding.gaad import (
     DRAFT_FLAG_GRAMMAR as G,
 )
@@ -241,3 +242,61 @@ def test_plan_request_skips_a_terminated_grammar():
 def test_scheduled_flags_follow_the_scheduled_drafts():
     flags = scheduled_flags({"a": [G, G, M], "b": [G]}, {"a": [1, 2], "c": [5, 6]})
     assert flags == {"a": [G, G]}
+
+
+def _vllm_config(speculative_config=None, async_scheduling=True, gaad=None):
+    return SimpleNamespace(
+        speculative_config=speculative_config,
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+        additional_config={} if gaad is None else {"gaad": gaad},
+    )
+
+
+_DRAFTER = SimpleNamespace(method="mtp", model=None, num_speculative_tokens=7)
+
+
+def test_check_config_needs_a_speculative_config():
+    with pytest.raises(ValueError, match="speculative config"):
+        gaad.check_config(_vllm_config(gaad={}))
+
+
+@pytest.mark.parametrize(
+    ("options", "match"),
+    [
+        (True, "must be a dict"),
+        ({"draft_token": 3}, "Unknown"),
+        ({"draft_tokens": 0}, "from 1 to"),
+        ({"draft_tokens": 8}, "from 1 to"),
+        ({"draft_tokens": "3"}, "from 1 to"),
+        ({"draft_tokens": True}, "from 1 to"),
+    ],
+)
+def test_check_config_rejects_bad_options(options, match):
+    with pytest.raises(ValueError, match=match):
+        gaad.check_config(_vllm_config(_DRAFTER, gaad=options))
+
+
+def test_check_config_turns_async_scheduling_off():
+    config = _vllm_config(_DRAFTER, async_scheduling=True, gaad={"draft_tokens": 3})
+    gaad.check_config(config)
+    assert config.scheduler_config.async_scheduling is False
+
+
+def test_check_config_leaves_other_configs_alone():
+    config = _vllm_config(SimpleNamespace(method="ngram", model=None))
+    gaad.check_config(config)
+    assert config.scheduler_config.async_scheduling is True
+
+
+def test_the_drafter_fills_only_its_share_of_the_row():
+    assert gaad.draft_limit(_vllm_config(_DRAFTER, gaad={"draft_tokens": 1})) == 1
+    # The drafter's x after the forced run is past its share; the grammar
+    # still fills the row.
+    request = _request(spec_token_ids=[1, 2, 3, 7])
+    assert plan_request(request, _manager(), 7, 1) == [G, G, G]
+    assert request.spec_token_ids == [1, 2, 3]
+
+
+def test_draft_limit_is_the_row_without_draft_tokens():
+    assert gaad.draft_limit(_vllm_config(_DRAFTER)) == 7
+    assert gaad.draft_limit(_vllm_config(_DRAFTER, gaad={})) == 7
