@@ -51,7 +51,7 @@ logger = init_logger(__name__)
 
 # A wrong rank or mesh hangs the self-test's barrier: dump every stack and exit.
 SELFTEST_TIMEOUT_S = 300
-_SELFTEST_ROWS = (8, 24)
+_SELFTEST_ROWS = (8, 24, 32)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,21 +64,21 @@ class _Armed:
 _ARMED: _Armed | None = None
 
 
-def _body(n: int, max_bytes: int, axis: str):
+def _body(n: int, max_bytes: int, axis: str, direct_rows: int = 0):
     def body(x, rank):
         rows, hidden = x.shape
         if 0 < kernel.view_bytes(rows, hidden, n) <= max_bytes:
-            return kernel.all_reduce(x, rank, n)
+            return kernel.all_reduce(x, rank, n, direct_rows)
         return lax.psum(x, axis)
 
     return body
 
 
-def _make_op(mesh, max_bytes: int):
+def _make_op(mesh, max_bytes: int, direct_rows: int = 0):
     axis = mesh.axis_names[0]
     specs = (P(axis), P(axis))
     sharded = jax.shard_map(
-        _body(int(mesh.size), max_bytes, axis),
+        _body(int(mesh.size), max_bytes, axis, direct_rows),
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
@@ -191,7 +191,8 @@ def arm(hidden: int, device: torch.device) -> bool:
     if sorted(s["mesh_index"] for s in seen) != list(range(tp.world_size)):
         raise RuntimeError(f"tp_all_reduce: mesh indices are not 0..n-1: {seen}")
     n = int(mesh.size)
-    op = _make_op(mesh, max_bytes)
+    direct_rows = max(envs.TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS, 0)
+    op = _make_op(mesh, max_bytes, direct_rows)
     rank = torch.tensor([[mesh_index]], dtype=torch.int32, device=device)
     failures = _gather(_selftest(op, rank, mesh_index, n, hidden, device))
     if any(failures):
@@ -209,6 +210,13 @@ def arm(hidden: int, device: torch.device) -> bool:
         kernel.MAX_VIEW_BYTES,
         collective_flags(os.environ.get("LIBTPU_INIT_ARGS", "")),
     )
+    if direct_rows:
+        logger.info(
+            "tp_all_reduce: TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS=%d: rows that are a"
+            " multiple of it all-reduce on their own [rows, %d] layout (no view copy)",
+            direct_rows,
+            hidden,
+        )
     return True
 
 

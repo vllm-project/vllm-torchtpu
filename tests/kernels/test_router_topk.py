@@ -164,3 +164,22 @@ def test_kernel_ties_and_nan_match_the_reference():
 def test_grid_rounds_up_over_the_tuned_block(rows, grid):
     block = min(MAX_BLOCK_ROWS, rows)
     assert -(-rows // block) == grid
+
+
+@pytest.mark.parametrize("rows,experts,topk", [(8, 128, 4), (32, 128, 4), (48, 256, 8), (1040, 512, 10)])
+def test_select_values_is_select_then_gather(rows, experts, topk):
+    """`select_values` picks `select`'s ids on the biased scores and returns the
+    unbiased scores there bit for bit (the gather the router did after it)."""
+    from vllm_torchtpu.kernels.router_topk import select_values
+
+    rng = np.random.default_rng(rows + experts)
+    scores = 1 / (1 + np.exp(-rng.standard_normal((rows, experts)))).astype(np.float32)
+    scores = scores.astype(np.float32)
+    bias = (rng.standard_normal(experts) * 0.1).astype(np.float32)
+    biased = scores + bias
+    biased[0, :3] = biased[0, 5]  # ties go to the lowest id
+    _, ids = select(jnp.asarray(biased), topk, interpret=True)
+    want = np.take_along_axis(scores, np.asarray(ids), axis=-1)
+    w, i = select_values(jnp.asarray(biased), jnp.asarray(scores), topk, interpret=True)
+    np.testing.assert_array_equal(np.asarray(i), np.asarray(ids))
+    np.testing.assert_array_equal(np.asarray(w), want)

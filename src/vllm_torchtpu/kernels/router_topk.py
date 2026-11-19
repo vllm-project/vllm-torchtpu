@@ -98,3 +98,55 @@ def select(
 def router_topk(scores: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
     """``select`` with a jax_op-compatible signature (arrays, then statics)."""
     return select(scores, topk)
+
+
+def _select_values_kernel(x_ref, v_ref, w_ref, i_ref, *, topk: int, n: int):
+    """`_select_kernel` on ``x``, writing ``v`` at the picked columns instead
+    of ``x``'s maxima: one row's ``v`` at the picked column is the only value
+    the masked max can return, so the weights are ``v``'s bits. Unlike
+    `_select_kernel`, rows with no real maximum are not poisoned: the caller
+    used to gather ``v`` with the ids, which never yields NaN either."""
+    x = jnp.where(x_ref[...] > NEG, x_ref[...], NEG)
+    v = v_ref[...]
+    masked = jnp.finfo(x.dtype).min
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+    for j in range(topk):
+        m = jnp.max(x, axis=1, keepdims=True)
+        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
+        hit = iota == idx[:, None]
+        w_ref[:, j] = jnp.max(jnp.where(hit, v, -jnp.inf), axis=1)
+        i_ref[:, j] = idx.astype(jnp.int32)
+        x = jnp.where(hit, masked, x)
+
+
+def select_values(
+    scores: jax.Array, values: jax.Array, topk: int, interpret: bool = False
+) -> tuple[jax.Array, jax.Array]:
+    """Top-k columns of ``[rows, experts]`` f32 ``scores`` (as `select`: values
+    descending, ties to the lowest id), returning ``values`` at those columns
+    and the column ids: ``(values.gather(-1, ids), ids)`` in one kernel."""
+    rows, n = scores.shape
+    block = min(MAX_BLOCK_ROWS, rows)
+    spec = pl.BlockSpec((block, n), lambda i: (i, 0))
+    return pl.pallas_call(
+        functools.partial(_select_values_kernel, topk=topk, n=n),
+        grid=(pl.cdiv(rows, block),),
+        in_specs=[spec, spec],
+        out_specs=[
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((rows, topk), jnp.float32),
+            jax.ShapeDtypeStruct((rows, topk), jnp.int32),
+        ],
+        interpret=interpret,
+        name="router_topk_values",
+    )(scores, values)
+
+
+def router_topk_values(
+    scores: jax.Array, values: jax.Array, topk: int
+) -> tuple[jax.Array, jax.Array]:
+    """``select_values`` with a jax_op-compatible signature."""
+    return select_values(scores, values, topk)

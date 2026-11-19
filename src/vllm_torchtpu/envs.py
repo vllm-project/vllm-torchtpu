@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     TPU_MOE_BOUNDED_ONEHOT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
+    TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS: int = 0
     TPU_MOE_TC_COMBINE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
@@ -115,6 +116,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    TPU_MOE_ROUTER_TOPK_VALUES: bool = False
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
@@ -252,6 +254,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
+    TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT: bool = False
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
     TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR: int = 1
     TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: bool = False
@@ -826,6 +829,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES", 0
     ),
+    # Pallas TP all-reduce on the activation's own [rows, hidden] layout when
+    # rows is a multiple of this value (0, default: off). Off, the kernel runs
+    # on a [16, w] view, and the relayout into the view (and back) is a copy
+    # of the whole activation on each side of every decode all-reduce. Same
+    # bits either way (each element is summed in rank order).
+    "TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS": env_int(
+        "TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS", 0
+    ),
     # Expert-parallel MoE combine of large batches on the TensorCore
     # (kernels/megablox/tc_combine.py) instead of the SparseCore
     # gather-reduce, where its shape admits it.
@@ -969,6 +980,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
         "TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]
     ),
+    # With a score-correction bias and the "rowmax" router top-k, the top-k
+    # kernel also returns the unbiased scores of the picked experts, so the
+    # routing weights need no separate XLA gather (a ~1.1 us op per MoE layer
+    # at decode). Same values. Off by default.
+    "TPU_MOE_ROUTER_TOPK_VALUES": env_bool("TPU_MOE_ROUTER_TOPK_VALUES"),
     # Keep FusedMoE top-k routing weights in float32 precision instead of casting
     # to the activation dtype (e.g. bfloat16) in fused_moe_gmm. Improves numerical
     # parity with training frameworks (e.g. MaxText) in RL and distillation workloads.
@@ -1609,6 +1625,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keeps one configuration.
     "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE": env_str(
         "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE", ""
+    ),
+    # MiniMax M3 DCP candidate merge (`msa_dcp.merge_candidates`, the dense
+    # ranking used below 64 candidates per token, i.e. DCP 2) picks each
+    # output slot with a max over the candidate (lane) axis instead of over
+    # a middle axis. Same values; avoids a slow XLA layout at some row counts.
+    "TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT": env_bool(
+        "TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT", default=False
     ),
     # MiniMax M3 head-parallel DCP prefill attention (`msa_dcp_heads`, steps of
     # at least 2,048 tokens at DCP 8) kernel config, "<block_q>:<pages per
