@@ -589,10 +589,11 @@ class PrefixAwareScheduler(AsyncScheduler):
             return request.num_computed_tokens
         max_len = max(request.num_tokens - 1, 0)
         epoch = self._get_prefix_cache_epoch()
-        cached = self._memo_get(request, epoch, max_len)
-        if cached is not None:
-            return cached[3]
         try:
+            # A memo reuse can recompute the lookup to verify it.
+            cached = self._memo_get(request, epoch, max_len)
+            if cached is not None:
+                return cached[3]
             return self._memo_compute(request, epoch, max_len)[3]
         except Exception:
             if not self._paw_scoring_broken:
