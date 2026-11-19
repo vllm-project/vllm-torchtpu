@@ -248,6 +248,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._kv_prefetch_cap: int | None = None
         self._kv_prefetch_in_waiting = False
         self._kv_prefetch_cands: set[int] = set()
+        self._kv_prefetch_before: set[int] = set()
         self._kv_prefetch_started = 0
         self._kv_prefetch_steps = 0
         self._kv_prefetch_held_skips = 0
@@ -263,25 +264,20 @@ class PrefixAwareScheduler(AsyncScheduler):
 
     def _kv_prefetch_at_cap(self) -> bool:
         """Whether prefetch is enforcing the cap and the running set is full."""
-        cap = getattr(self, "_kv_prefetch_cap", None)
+        cap = self._kv_prefetch_cap
         if cap is None:
             return False
-        num_running = len(self.running) + int(
-            getattr(self, "num_waiting_for_streaming_input", 0) or 0
-        )
-        return num_running >= cap
+        return len(self.running) + self.num_waiting_for_streaming_input >= cap
 
     def _kv_prefetch_num_held(self) -> int:
         """Requests holding KV for an async load (loading or loaded) that have
         not run yet."""
         return sum(
-            1
-            for r in getattr(self, "_inflight_prefills", ())
-            if r.status != RequestStatus.RUNNING
+            1 for r in self._inflight_prefills if r.status != RequestStatus.RUNNING
         )
 
     def _handle_blocked_waiting_request(self, request: Request) -> bool:
-        if getattr(self, "_kv_prefetch_cap", None) is not None:
+        if self._kv_prefetch_cap is not None:
             self._kv_prefetch_in_waiting = True
             if self._kv_prefetch_at_cap():
                 if self._holds_kv_blocks(request):
@@ -294,12 +290,10 @@ class PrefixAwareScheduler(AsyncScheduler):
     def _kv_prefetch_begin_step(self) -> bool:
         """Lift the stock loop's cap for this step if prefetch could start a
         load. Returns whether it did."""
-        if not getattr(self, "_kv_prefetch_n", 0):
+        if not self._kv_prefetch_n:
             return False
-        cap = int(self.max_num_active_reqs)
-        num_running = len(self.running) + int(
-            getattr(self, "num_waiting_for_streaming_input", 0) or 0
-        )
+        cap = self.max_num_active_reqs
+        num_running = len(self.running) + self.num_waiting_for_streaming_input
         if num_running >= cap and (
             not self.waiting or self._kv_prefetch_num_held() >= self._kv_prefetch_n
         ):
@@ -321,7 +315,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._kv_prefetch_cap = None
         self._kv_prefetch_in_waiting = False
         self._kv_prefetch_steps += 1
-        before = getattr(self, "_kv_prefetch_before", set())
+        before = self._kv_prefetch_before
         cands = self._kv_prefetch_cands
         self._kv_prefetch_started += sum(
             1
@@ -355,7 +349,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             self._kv_prefetch_full_refusals,
             self._kv_prefetch_num_held(),
             len(self.running),
-            len(self.waiting) + len(getattr(self, "kv_holding_waiting", ())),
+            len(self.waiting) + len(self.kv_holding_waiting),
         )
 
     # ------------------------------------------------------------------
@@ -479,18 +473,11 @@ class PrefixAwareScheduler(AsyncScheduler):
 
     def _promote_warmest_on(self) -> bool:
         """``tpu_scheduler.promote_warmest`` (default on)."""
-        on = getattr(self, "_promote_warmest_switch", None)
-        if on is None:
-            on = True
-            self._promote_warmest_switch = on
-        return on
+        return self._promote_warmest_switch
 
     def _inflight_prefill_reserved_blocks(self) -> int:
         reserved = self._decode_inflight_reserved_blocks()
-        if (
-            getattr(self, "_kv_prefetch_in_waiting", False)
-            and self._kv_prefetch_at_cap()
-        ):
+        if self._kv_prefetch_in_waiting and self._kv_prefetch_at_cap():
             # The stock loop calls this only for an async load, right before
             # allocating it. At the cap that load is a prefetch.
             if self._kv_prefetch_num_held() >= self._kv_prefetch_n:
@@ -611,7 +598,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         waiting_at_start = len(self.waiting)
         if getattr(self, "_memo_xstep", False):
             self._memo_trim_log()
-        if getattr(self, "_kv_prefetch_n", 0):
+        if self._kv_prefetch_n:
             try:
                 self._kv_prefetch_begin_step()
             except Exception:
@@ -658,9 +645,9 @@ class PrefixAwareScheduler(AsyncScheduler):
                     )
             return out
         finally:
-            if getattr(self, "_kv_prefetch_cap", None) is not None:
+            if self._kv_prefetch_cap is not None:
                 self._kv_prefetch_end_step()
-            if getattr(self, "_kv_prefetch_n", 0):
+            if self._kv_prefetch_n:
                 self._kv_prefetch_maybe_log()
             self._step_wait_event = None
 
@@ -774,10 +761,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         num_computed_tokens: int,
         num_new_tokens: int,
     ) -> int:
-        if (
-            getattr(self, "_kv_prefetch_in_waiting", False)
-            and self._kv_prefetch_at_cap()
-        ):
+        if self._kv_prefetch_in_waiting and self._kv_prefetch_at_cap():
             # KV prefetch: this waiting request would join ``running`` without
             # an async load, past the cap. vLLM 0.33 requeues a request whose
             # chunk comes out 0 and keeps scanning; putting the real cap back
