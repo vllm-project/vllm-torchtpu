@@ -254,6 +254,10 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
     TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR: int = 1
+    TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: bool = False
+    TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT: int = 8
+    TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT: bool = False
+    TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC: bool = False
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
@@ -1622,6 +1626,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (c64 8k chunks of ~140K-token contexts) in one round.
     "TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR", 1
+    ),
+    # MiniMax M3 head-parallel MSA prefill: the replicas of a KV head split
+    # each kernel call's rows (alternate query tiles) instead of its query
+    # heads, so each kernel tile carries all the KV head's query heads over
+    # the same selected-page union (twice the rows per page at 2 replicas).
+    # The query heads and outputs move by an all-to-all inside the replica
+    # group (one chip's cores). Same outputs bit for bit.
+    "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT": env_bool(
+        "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT", default=False
+    ),
+    # MiniMax M3 head-parallel MSA prefill page exchange
+    # (`msa_dcp_heads.exchange_head_pages`): pages whose copies a rank keeps
+    # in flight (default 8), and DIRECT=1 copies every page straight to every
+    # replica of its KV head instead of forwarding inside the replica group.
+    "TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT": env_nonnegative_int(
+        "TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT", 8
+    ),
+    "TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT": env_bool(
+        "TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT", default=False
+    ),
+    # ASYNC=1: the first round's page copies start ahead of the decode rows'
+    # DCP attention and the selection merge and are retired after them
+    # (a start / wait pair of kernels), so the exchange overlaps that work.
+    "TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC": env_bool(
+        "TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC", default=False
     ),
     # MiniMax M3 MSA prefill page cache table (`msa_attention_lse._page_cache`):
     # how its sorts run. Empty keeps three stable sorts (two of two operands);
