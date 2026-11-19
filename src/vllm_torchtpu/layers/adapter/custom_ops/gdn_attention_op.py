@@ -67,7 +67,6 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
 )
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant_op
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
@@ -379,8 +378,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     _bm_kernel: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
     _checkpoint_alignment: int | None = None
-    # Set by `gated_norm_quant_op.install` (the Qwen3.5 rule, after loading).
-    fused_norm_quant: bool = False
+    # An output projection fused with the gated norm, called as
+    # fn(layer, core_attn_out, z) with z as [tokens, local value dim], or None
+    # for RMSNormGated followed by out_proj. A model rule sets it on the
+    # layers it serves once their weights are loaded.
+    fused_output_projection: Callable[..., torch.Tensor] | None = None
 
     # Narrowed to the layer that _create_conv1d installs.
     # pyrefly: ignore[bad-override-mutable-attribute]
@@ -1146,8 +1148,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         core_attn_out = core_attn_out.view(
             num_tokens, local_num_v_heads, self.head_v_dim
         )
-        if self.fused_norm_quant:
-            return gated_norm_quant_op.output_projection(self, core_attn_out, z)
+        if self.fused_output_projection is not None:
+            return self.fused_output_projection(self, core_attn_out, z)
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output, _ = self.out_proj(core_attn_out)
@@ -1227,7 +1229,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
             z, _ = self.in_proj_z(hidden_states)
-            if not self.fused_norm_quant:
+            if self.fused_output_projection is None:
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
@@ -1242,7 +1244,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
             z_size = self.value_dim // self.tp_size
             mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
-            if not self.fused_norm_quant:
+            if self.fused_output_projection is None:
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
