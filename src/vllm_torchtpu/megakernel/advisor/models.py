@@ -21,18 +21,25 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import gcd
 from pathlib import Path
+from typing import Literal, cast
 
 from ..core import errors
 from .constants import (
     BITS_FP4,
     BITS_FP8,
+    DECLARED_COLLECTIVE_KINDS,
+    DECLARED_EXPERT_MODES,
+    DEFAULT_DECLARED_CALLS_PER_LAYER,
     DEFAULT_DECLARED_PHASES,
     KDA_MODEL_TYPES,
+    MIN_COLLECTIVE_GROUP_SIZE,
     MIN_HEAD_DIM,
     MIN_INTERVAL,
     MULTIMODAL_KEYS,
     PRESETS_DIR,
     VALID_LAYER_TOKENS,
+    CollectiveStepKind,
+    DeclaredExpertMode,
 )
 
 
@@ -921,6 +928,285 @@ def _preset_int(raw: Mapping[str, object], key: str, default: int) -> int:
             raise errors.MegakernelConfigError(msg)
 
 
+InCallExpertMode = Literal["tp", "ep", "none"]
+
+
+def _decl_int(val: object, field_name: str) -> int:
+    """Parse an integer declaration field while rejecting bools and non-ints."""
+    match val:
+        case bool():
+            msg = f"{field_name} must be an integer, got bool"
+            raise errors.MegakernelConfigError(msg)
+        case int():
+            return val
+        case _:
+            msg = f"{field_name} must be an integer, got {type(val).__name__}"
+            raise errors.MegakernelConfigError(msg)
+
+
+def _decl_str(val: object, field_name: str) -> str:
+    """Parse a string declaration field while rejecting non-strings."""
+    if not isinstance(val, str):
+        msg = f"{field_name} must be a string, got {type(val).__name__}"
+        raise errors.MegakernelConfigError(msg)
+    return val
+
+
+@dataclass(frozen=True)
+class DeclaredCollectiveStep:
+    """One per-sublayer collective step declared inside a fused megakernel."""
+
+    kind: CollectiveStepKind
+    group_size: int
+    calls_per_layer: int = DEFAULT_DECLARED_CALLS_PER_LAYER
+
+    def __post_init__(self) -> None:
+        """Validate collective kind, power-of-two group size, and call count."""
+        if self.kind not in DECLARED_COLLECTIVE_KINDS:
+            msg = (
+                f"DeclaredCollectiveStep.kind must be one of "
+                f"{sorted(DECLARED_COLLECTIVE_KINDS)}, got {self.kind!r}"
+            )
+            raise errors.MegakernelConfigError(msg)
+        if (
+            isinstance(self.group_size, bool)
+            or not isinstance(self.group_size, int)
+            or self.group_size < MIN_COLLECTIVE_GROUP_SIZE
+            or (self.group_size & (self.group_size - 1)) != 0
+        ):
+            msg = (
+                "DeclaredCollectiveStep.group_size must be a power-of-two "
+                f"integer >= {MIN_COLLECTIVE_GROUP_SIZE}, got {self.group_size!r}"
+            )
+            raise errors.MegakernelConfigError(msg)
+        if (
+            isinstance(self.calls_per_layer, bool)
+            or not isinstance(self.calls_per_layer, int)
+            or self.calls_per_layer < 1
+        ):
+            msg = (
+                "DeclaredCollectiveStep.calls_per_layer must be an integer >= 1, "
+                f"got {self.calls_per_layer!r}"
+            )
+            raise errors.MegakernelConfigError(msg)
+
+
+@dataclass(frozen=True)
+class DeclaredCollectives:
+    """Per-step all-reduce count and collective steps declared for a megakernel."""
+
+    all_reduces: int | None = None
+    steps: tuple[DeclaredCollectiveStep, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Validate non-negative integer all_reduces override when set."""
+        if self.all_reduces is not None and (
+            isinstance(self.all_reduces, bool)
+            or not isinstance(self.all_reduces, int)
+            or self.all_reduces < 0
+        ):
+            msg = (
+                "DeclaredCollectives.all_reduces must be an integer >= 0, "
+                f"got {self.all_reduces!r}"
+            )
+            raise errors.MegakernelConfigError(msg)
+
+
+@dataclass(frozen=True)
+class ExpertModeRule:
+    """Row-count threshold rule selecting in-call TP or EP expert execution."""
+
+    max_rows: int
+    mode: DeclaredExpertMode
+
+    def __post_init__(self) -> None:
+        """Validate positive integer max_rows threshold and expert mode."""
+        if (
+            isinstance(self.max_rows, bool)
+            or not isinstance(self.max_rows, int)
+            or self.max_rows < 1
+        ):
+            msg = (
+                "ExpertModeRule.max_rows must be an integer >= 1, "
+                f"got {self.max_rows!r}"
+            )
+            raise errors.MegakernelConfigError(msg)
+        if self.mode not in DECLARED_EXPERT_MODES:
+            msg = (
+                f"ExpertModeRule.mode must be one of "
+                f"{sorted(DECLARED_EXPERT_MODES)}, got {self.mode!r}"
+            )
+            raise errors.MegakernelConfigError(msg)
+
+
+def _parse_declared_step_kind(raw_kind: object, field_name: str) -> CollectiveStepKind:
+    """Validate and narrow a collective step kind string."""
+    kind_str = _decl_str(raw_kind, field_name)
+    if kind_str in DECLARED_COLLECTIVE_KINDS:
+        return cast("CollectiveStepKind", kind_str)
+    msg = (
+        f"{field_name} must be one of {sorted(DECLARED_COLLECTIVE_KINDS)}, "
+        f"got {kind_str!r}"
+    )
+    raise errors.MegakernelConfigError(msg)
+
+
+def _parse_declared_expert_mode(
+    raw_mode: object, field_name: str
+) -> DeclaredExpertMode:
+    """Validate and narrow a declared expert execution mode string."""
+    mode_str = _decl_str(raw_mode, field_name)
+    if mode_str in DECLARED_EXPERT_MODES:
+        return cast("DeclaredExpertMode", mode_str)
+    msg = (
+        f"{field_name} must be one of {sorted(DECLARED_EXPERT_MODES)}, got {mode_str!r}"
+    )
+    raise errors.MegakernelConfigError(msg)
+
+
+def parse_declared_collectives(raw: object) -> DeclaredCollectives:
+    """Parse and validate a `megakernel.collectives` mapping."""
+    if isinstance(raw, DeclaredCollectives):
+        return raw
+    if not isinstance(raw, Mapping):
+        msg = f"megakernel.collectives must be a mapping, got {type(raw).__name__}"
+        raise errors.MegakernelConfigError(msg)
+    allowed_keys = {"all_reduces", "steps"}
+    unknown_keys = sorted(set(raw.keys()) - allowed_keys)
+    if unknown_keys:
+        msg = f"Unsupported keys in megakernel.collectives: {unknown_keys}"
+        raise errors.MegakernelConfigError(msg)
+    ar_raw = raw.get("all_reduces")
+    all_reduces = (
+        _decl_int(ar_raw, "megakernel.collectives.all_reduces")
+        if ar_raw is not None
+        else None
+    )
+    steps_raw = raw.get("steps")
+    steps: list[DeclaredCollectiveStep] = []
+    if steps_raw is not None:
+        if not isinstance(steps_raw, (list, tuple)):
+            msg = (
+                "megakernel.collectives.steps must be a list, "
+                f"got {type(steps_raw).__name__}"
+            )
+            raise errors.MegakernelConfigError(msg)
+        for idx, item in enumerate(steps_raw):
+            if not isinstance(item, Mapping):
+                msg = f"megakernel.collectives.steps[{idx}] must be a mapping"
+                raise errors.MegakernelConfigError(msg)
+            step_allowed = {"kind", "group_size", "calls_per_layer"}
+            step_unknown = sorted(set(item.keys()) - step_allowed)
+            if step_unknown:
+                msg = (
+                    f"Unsupported keys in megakernel.collectives.steps[{idx}]: "
+                    f"{step_unknown}"
+                )
+                raise errors.MegakernelConfigError(msg)
+            kind = _parse_declared_step_kind(
+                item.get("kind"), f"megakernel.collectives.steps[{idx}].kind"
+            )
+            group_size = _decl_int(
+                item.get("group_size"),
+                f"megakernel.collectives.steps[{idx}].group_size",
+            )
+            calls_per_layer = _decl_int(
+                item.get("calls_per_layer", DEFAULT_DECLARED_CALLS_PER_LAYER),
+                f"megakernel.collectives.steps[{idx}].calls_per_layer",
+            )
+            steps.append(
+                DeclaredCollectiveStep(
+                    kind=kind,
+                    group_size=group_size,
+                    calls_per_layer=calls_per_layer,
+                )
+            )
+    return DeclaredCollectives(all_reduces=all_reduces, steps=tuple(steps))
+
+
+def parse_expert_mode_rules(raw: object) -> tuple[ExpertModeRule, ...]:
+    """Parse strictly ascending row-threshold rules from `expert_mode_by_rows`."""
+    if not isinstance(raw, (list, tuple)) or not raw:
+        msg = "megakernel.expert_mode_by_rows must be a non-empty list of rules"
+        raise errors.MegakernelConfigError(msg)
+    rules: list[ExpertModeRule] = []
+    prev_max_rows = 0
+    for idx, item in enumerate(raw):
+        if isinstance(item, ExpertModeRule):
+            rule = item
+        elif isinstance(item, Mapping):
+            rule_allowed = {"max_rows", "mode"}
+            rule_unknown = sorted(set(item.keys()) - rule_allowed)
+            if rule_unknown:
+                msg = f"Unsupported keys in expert_mode_by_rows[{idx}]: {rule_unknown}"
+                raise errors.MegakernelConfigError(msg)
+            max_rows = _decl_int(
+                item.get("max_rows"), f"expert_mode_by_rows[{idx}].max_rows"
+            )
+            mode = _parse_declared_expert_mode(
+                item.get("mode"), f"expert_mode_by_rows[{idx}].mode"
+            )
+            rule = ExpertModeRule(max_rows=max_rows, mode=mode)
+        else:
+            msg = f"expert_mode_by_rows[{idx}] must be a mapping"
+            raise errors.MegakernelConfigError(msg)
+        if rule.max_rows <= prev_max_rows:
+            msg = (
+                "expert_mode_by_rows max_rows thresholds must be strictly "
+                f"ascending, got {rule.max_rows} after {prev_max_rows}"
+            )
+            raise errors.MegakernelConfigError(msg)
+        prev_max_rows = rule.max_rows
+        rules.append(rule)
+    return tuple(rules)
+
+
+def _validate_megakernel_declaration(
+    mk_map: Mapping[str, object],
+    *,
+    ep_size: int,
+) -> dict[str, object]:
+    """Validate and normalize a megakernel declaration mapping."""
+    if not str(mk_map.get("source", "")).strip():
+        msg = "megakernel declaration in deployments.json requires non-empty 'source'"
+        raise errors.MegakernelConfigError(msg)
+    normalized = dict(mk_map)
+    if "expert_owner_groups" in mk_map:
+        raw_groups = mk_map["expert_owner_groups"]
+        if (
+            isinstance(raw_groups, bool)
+            or not isinstance(raw_groups, int)
+            or not (1 <= raw_groups <= ep_size)
+            or ep_size % raw_groups != 0
+        ):
+            msg = (
+                "megakernel 'expert_owner_groups' must be an int in "
+                f"[1, ep={ep_size}] that divides ep={ep_size}, got {raw_groups!r}"
+            )
+            raise errors.MegakernelConfigError(msg)
+    if "collectives" in mk_map:
+        parsed_coll = parse_declared_collectives(mk_map["collectives"])
+        coll_dict: dict[str, object] = {
+            "steps": [
+                {
+                    "kind": step.kind,
+                    "group_size": step.group_size,
+                    "calls_per_layer": step.calls_per_layer,
+                }
+                for step in parsed_coll.steps
+            ]
+        }
+        if parsed_coll.all_reduces is not None:
+            coll_dict["all_reduces"] = parsed_coll.all_reduces
+        normalized["collectives"] = coll_dict
+    if "expert_mode_by_rows" in mk_map:
+        parsed_rules = parse_expert_mode_rules(mk_map["expert_mode_by_rows"])
+        normalized["expert_mode_by_rows"] = [
+            {"max_rows": rule.max_rows, "mode": rule.mode} for rule in parsed_rules
+        ]
+    return normalized
+
+
 def parse_parallel_layout(raw: Mapping[str, object]) -> ParallelLayout:
     """Parse a ParallelLayout mapping from deployments.json."""
     groups = _int_tuple(raw.get("layer_groups"), "layer_groups")
@@ -928,25 +1214,7 @@ def parse_parallel_layout(raw: Mapping[str, object]) -> ParallelLayout:
     mk_decl: Mapping[str, object] | None = None
     ep_size = _preset_int(raw, "ep", 1)
     if mk_map is not None:
-        if not str(mk_map.get("source", "")).strip():
-            msg = (
-                "megakernel declaration in deployments.json requires non-empty 'source'"
-            )
-            raise errors.MegakernelConfigError(msg)
-        if "expert_owner_groups" in mk_map:
-            raw_groups = mk_map["expert_owner_groups"]
-            if (
-                isinstance(raw_groups, bool)
-                or not isinstance(raw_groups, int)
-                or not (1 <= raw_groups <= ep_size)
-                or ep_size % raw_groups != 0
-            ):
-                msg = (
-                    "megakernel 'expert_owner_groups' must be an int in "
-                    f"[1, ep={ep_size}] that divides ep={ep_size}, got {raw_groups!r}"
-                )
-                raise errors.MegakernelConfigError(msg)
-        mk_decl = dict(mk_map)
+        mk_decl = _validate_megakernel_declaration(mk_map, ep_size=ep_size)
     return ParallelLayout(
         tp=_preset_int(raw, "tp", 1),
         ep=ep_size,
@@ -969,8 +1237,8 @@ def _declared_strings(raw: object) -> tuple[str, ...]:
 
 
 def validate_declared_layouts(slug: str, preset: DeploymentPreset) -> None:
-    """Validate non-duplicate megakernel declarations and expert-group divisibility."""
-    seen_keys: set[tuple[tuple[int, int, int, int, int], str, str]] = set()
+    """Validate non-duplicate 6-axis declarations and expert-group divisibility."""
+    seen_keys: set[tuple[tuple[int, int, int, int, int, int], str, str]] = set()
     all_layouts = (
         preset.decode,
         preset.prefill,
@@ -995,7 +1263,14 @@ def validate_declared_layouts(slug: str, preset: DeploymentPreset) -> None:
                     f"must divide num_experts ({model_profile.num_experts})"
                 )
                 raise errors.MegakernelConfigError(msg)
-        axis_key = (layout.tp, layout.ep, layout.dp, layout.pp, layout.dcp)
+        axis_key = (
+            layout.tp,
+            layout.ep,
+            layout.dp,
+            layout.pp,
+            layout.dcp,
+            layout.pcp,
+        )
         scopes = _declared_strings(declaration.get("scopes"))
         phases = _declared_strings(declaration.get("phases")) or DEFAULT_DECLARED_PHASES
         block_keys = {(axis_key, scope, phase) for scope in scopes for phase in phases}
