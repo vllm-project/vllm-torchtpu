@@ -460,3 +460,95 @@ def test_packed_fp8_index_pages_move_as_whole_owner_rows():
     assert _live_byte_ranges(idx, 2, 3, 256) == [
         (2 * PAGE_BYTES, 2 * PAGE_BYTES + page)
     ]
+
+
+def test_block_outer_shared_swa_and_uniform_ring_groups():
+    """Under the block-outer (BLHNC) layout (#3045), several SWA layers share a
+    single cache group whose block stride is multiple 64 KiB pages, and ring
+    state caches are wrapped in UniformTypeKVCacheSpecs."""
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, UniformTypeKVCacheSpecs
+
+    from vllm_torchtpu.distributed.kv_transfer import tpu_connector as tc
+
+    swa_page_rows = 64
+    swa_page_bytes = swa_page_rows * 1024
+    block_stride = 8 * swa_page_bytes  # 512 KiB block-outer stride
+    total_rows = (NUM_BLOCKS * block_stride) // 512
+    shared_raw = torch.zeros((total_rows, 128), dtype=torch.int32)
+    scale_raw = torch.zeros((total_rows,), dtype=torch.float32)
+
+    swa_l0 = "model.layers.0.self_attn.swa_cache"  # token-major
+    swa_l2 = "model.layers.2.self_attn.swa_cache"  # plane-major CSA2
+    swa_l3 = "model.layers.3.self_attn.swa_cache"  # plane-major CSA2
+    ring_l2 = "model.layers.2.self_attn.compressor.state_cache"
+    ring_l8 = "model.layers.8.self_attn.compressor.state_cache"
+
+    named = {
+        swa_l0: torch.zeros((NUM_BLOCKS, 1, swa_page_rows, 512), dtype=torch.bfloat16),
+        swa_l2: torch.zeros((NUM_BLOCKS, 1, swa_page_rows, 512), dtype=torch.bfloat16),
+        swa_l3: torch.zeros((NUM_BLOCKS, 1, swa_page_rows, 512), dtype=torch.bfloat16),
+        ring_l2: torch.zeros((NUM_BLOCKS, 1, 8, 1024), dtype=torch.float32),
+        ring_l8: torch.zeros((NUM_BLOCKS, 1, 8, 1024), dtype=torch.float32),
+    }
+    layouts = {
+        swa_l0: ((NUM_BLOCKS, swa_page_rows, 512), torch.bfloat16, block_stride, 0),
+        swa_l2: (
+            (NUM_BLOCKS, swa_page_rows, 512),
+            torch.bfloat16,
+            block_stride,
+            swa_page_bytes,
+        ),
+        swa_l3: (
+            (NUM_BLOCKS, swa_page_rows, 512),
+            torch.bfloat16,
+            block_stride,
+            2 * swa_page_bytes,
+        ),
+        ring_l2: ((NUM_BLOCKS, 8, 1024), torch.float32, block_stride, 0),
+        ring_l8: ((NUM_BLOCKS, 8, 1024), torch.float32, block_stride, 32768),
+    }
+    materialized = types.SimpleNamespace(
+        native_cache_layouts=layouts,
+        native_raw_cache=dict.fromkeys(named, shared_raw),
+        scale_pools={},
+        csa2_layers=frozenset({"model.layers.2.self_attn", "model.layers.3.self_attn"}),
+        swa_word_layers=frozenset({swa_l2, swa_l3}),
+    )
+    swa_spec = types.SimpleNamespace(
+        block_size=swa_page_rows, sliding_window=128, tokens_per_state=1
+    )
+    ring_leaf = CircularBufferSpec(
+        block_size=8, num_kv_heads=1, head_size=1024, head_size_v=0, dtype=torch.float32
+    )
+    ring_group_spec = UniformTypeKVCacheSpecs(
+        block_size=8, kv_cache_specs={ring_l2: ring_leaf, ring_l8: ring_leaf}
+    )
+    groups = [
+        types.SimpleNamespace(
+            kv_cache_spec=swa_spec, layer_names=[swa_l0, swa_l2, swa_l3]
+        ),
+        types.SimpleNamespace(
+            kv_cache_spec=ring_group_spec, layer_names=[ring_l2, ring_l8]
+        ),
+    ]
+
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=[shared_raw, scale_raw],
+        dsv41_materialized_kv=materialized,
+    )
+    # 1 token-major SWA pool + 2*2 plane-major SWA pools + 2 ring pools = 7 pools
+    assert len(manifest.pools) == 7
+    p0_entries = [p for p in manifest.pools if p.tag == "dsv4.swa.p0.g0"]
+    assert [p.base_offset_bytes for p in p0_entries] == [
+        swa_page_bytes,
+        2 * swa_page_bytes,
+    ]
+
+    tgroups = tc._stage3_transfer_groups(groups, multi_group=True)
+    assert len(tgroups) == 2
+    assert tgroups[0].window_tokens == 128 and not tgroups[0].slot
+    assert tgroups[1].slot is True and tgroups[1].window_tokens is None
+    assert tgroups[1].prefix_cacheable is False
+

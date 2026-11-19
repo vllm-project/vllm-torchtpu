@@ -314,13 +314,19 @@ def _stage3_recycled_transfer_pages(
     )
 
 
+def _stage3_unwrap_group_spec(group_spec: Any) -> Any:
+    """Unwrap a UniformTypeKVCacheSpecs wrapper to one representative leaf spec."""
+    specs = getattr(group_spec, "kv_cache_specs", None)
+    if specs:
+        return next(iter(specs.values()))
+    return group_spec
+
+
 def _stage3_group_window_tokens(group_spec: Any) -> int | None:
     """The sliding window of a cache group, or None if it is full attention."""
     # A UniformTypeKVCacheSpecs wrapper has no sliding_window of its own, and
     # its layers are uniform, so any one of them answers for the group.
-    specs = getattr(group_spec, "kv_cache_specs", None)
-    if specs:
-        group_spec = next(iter(specs.values()))
+    group_spec = _stage3_unwrap_group_spec(group_spec)
     window = getattr(group_spec, "sliding_window", None)
     return int(window) if window else None
 
@@ -351,16 +357,21 @@ def _stage3_transfer_groups(
             page_tokens=int(group.kv_cache_spec.block_size),
             window_tokens=(
                 None
-                if isinstance(group.kv_cache_spec, CircularBufferSpec)
+                if isinstance(leaf_spec, CircularBufferSpec)
                 else _stage3_group_window_tokens(group.kv_cache_spec)
             ),
-            slot=isinstance(group.kv_cache_spec, CircularBufferSpec),
+            slot=isinstance(leaf_spec, CircularBufferSpec),
             prefix_cacheable=bool(
-                getattr(group.kv_cache_spec, "prefix_cacheable", True)
+                getattr(
+                    leaf_spec,
+                    "prefix_cacheable",
+                    not isinstance(leaf_spec, CircularBufferSpec),
+                )
             ),
         )
         for index, group in enumerate(kv_cache_groups)
-        if not isinstance(group.kv_cache_spec, MambaSpec)
+        for leaf_spec in (_stage3_unwrap_group_spec(group.kv_cache_spec),)
+        if not isinstance(leaf_spec, MambaSpec)
     )
     if not groups:
         raise ValueError(
