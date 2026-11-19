@@ -282,6 +282,17 @@ class DecodeOpt(NamedTuple):
     # One body per count of scored chunks (1 .. all), not per power of two:
     # a group's partial last chunks are not scored.
     every_count: bool = False
+    # Score token-major with the query tile as the stationary MXU operand
+    # (pushed once per chunk) and the pages' keys streamed through it,
+    # instead of pushing every page's keys as MXU weights; slot scales are
+    # applied in f32 after the dot, as in the transposed scores
+    # (``tm``: keys widened to bf16, ``tm8``: keys as fp8, mixed dot).
+    token_scores: int = 0
+    # The maxima of a body's last scored chunk are taken in the next grid
+    # step's body (its scores wait in VMEM), where the lane maxima overlap
+    # that body's matmuls instead of draining after the last one; the
+    # scores stay resident in VMEM for the whole call.
+    defer: bool = False
 
 
 _DECODE_OPT_LOGGED = False
@@ -306,6 +317,10 @@ def decode_opt() -> DecodeOpt:
             opt = opt._replace(full=True)
         elif item == "counts":
             opt = opt._replace(every_count=True)
+        elif item == "defer":
+            opt = opt._replace(defer=True)
+        elif item in ("tm", "tm8"):
+            opt = opt._replace(token_scores=16 if item == "tm" else 8)
         elif item.startswith("tail") and item[4:] in ("4", "8", "16"):
             opt = opt._replace(tail=int(item[4:]))
         elif item.startswith("slots") and item[5:].isdigit() and int(item[5:]) >= 2:
@@ -318,7 +333,7 @@ def decode_opt() -> DecodeOpt:
         _DECODE_OPT_LOGGED = True
         logger.info(
             "TPU_MINIMAX_M3_INDEXER_DECODE_OPT=%s on: MSA indexer decode tiles run "
-            "issue=%s slots=%d quad=%s noclamp=%s full=%s tail=%d counts=%s.",
+            "issue=%s slots=%d quad=%s noclamp=%s full=%s tail=%d counts=%s tm=%d defer=%s.",
             spec,
             opt.issue,
             opt.slots,
@@ -327,6 +342,8 @@ def decode_opt() -> DecodeOpt:
             opt.full,
             opt.tail,
             opt.every_count,
+            opt.token_scores,
+            opt.defer,
         )
     return opt
 # Folded 4-bit and fp8 tiles of up to this many rows score transposed
@@ -415,7 +432,7 @@ def _transposed_keys(buf, p, live, dtype, folded, masked):
 
 
 def _chunk_maxima_t(
-    q_pair, buf, first, chunk, live, issue, *, dtype, folded
+    q_pair, buf, first, chunk, live, issue, *, dtype, folded, reduce=True
 ) -> jax.Array:
     """``[Bq, chunk]`` block maxima of the pages ``buf[first : first + chunk]``
     with the scores computed transposed, ``[2 Bq, tokens]``: the MXU result
@@ -450,6 +467,14 @@ def _chunk_maxima_t(
         left, right = (jnp.concatenate(r, axis=1) for r in scale_rows)
         row = jax.lax.broadcasted_iota(jnp.int32, s.shape, 0)
         s = s * jnp.where(row < block_q, left, right)
+    if not reduce:
+        return s
+    return _maxima_t(s, half, page_size)
+
+
+def _maxima_t(s, half, page_size) -> jax.Array:
+    """`_chunk_maxima_t`'s ``[2 Bq, half * S]`` scores -> ``[Bq, 2 half]``."""
+    block_q = s.shape[0] // 2
     m = jnp.max(s.reshape(2 * block_q, half, page_size), axis=2)  # [2 Bq, half]
     return jnp.concatenate([m[:block_q], m[block_q:]], axis=1)
 
@@ -529,7 +554,8 @@ def _kernel_v3(
     # Scratch
     buf,  # [R, G, S / p, D] ring of R groups of pages, as 32-bit words
     sems,  # DMA semaphores [R], one per ring slot
-    *,
+    *defer_refs,  # with `defer`: pending scores [2 Bq, chunk / 2 * S], SMEM [2]
+    defer=False,
     transposed=False,
     fp8_q=False,
     fast_issue=False,
@@ -538,6 +564,7 @@ def _kernel_v3(
     full_bodies=False,
     tail=0,
     every_count=False,
+    token_scores=0,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -649,9 +676,21 @@ def _kernel_v3(
     def _():
         for k in range(ahead):
             start(*ahead_group(k), range(pages_per_step), k)
+        if defer:
+            entry0 = work_ref[0]
+            defer_refs[0][...] = jnp.zeros(defer_refs[0].shape, jnp.float32)
+            defer_refs[1][0] = (entry0 >> _TILE_SHIFT) * block_q
+            defer_refs[1][1] = (entry0 & _GROUP_MASK) * pages_per_step
+            defer_refs[1][2] = 0
 
     base, live = group(step)
     next_base, next_live = ahead_group(step + ahead)
+    if defer:
+        # o_ref holds the whole [tiles * Bq, pages] output.
+        pend_ref, pend_pos = defer_refs
+        entry = work_ref[step]
+        row0 = pl.multiple_of((entry >> _TILE_SHIFT) * block_q, _ROW_ALIGN)
+        col0 = pl.multiple_of((entry & _GROUP_MASK) * pages_per_step, pages_per_step)
     if quad:
         q = q_ref[...].astype(jnp.float32)
         amax = jnp.max(jnp.abs(q), axis=1, keepdims=True)  # [Bq, 1]
@@ -676,7 +715,9 @@ def _kernel_v3(
     issue_chunks = min(_DMA_ISSUE_CHUNKS, num_chunks)
     per_pair = -(-pages_per_step // (issue_chunks * (chunk // 2)))
 
-    def score_chunk(slot, first, share, next_full=False, size=None, pair_off=0):
+    def score_chunk(
+        slot, first, share, next_full=False, size=None, pair_off=0, deferred=False
+    ):
         """Score pages ``[first, first + size)`` (default a chunk), issuing
         the ahead group's descriptors `share` among the first page pairs of
         the chunk (`start`); `pair_off` is the first page pair's index in
@@ -702,7 +743,7 @@ def _kernel_v3(
             else:
                 o_ref[pl.ds(first, chunk), :] = m.T
             return
-        if _scores_transposed(block_q, rows, cache_ref.dtype):
+        if not token_scores and _scores_transposed(block_q, rows, cache_ref.dtype):
             m = _chunk_maxima_t(
                 q_pair,
                 buf.at[slot],
@@ -712,7 +753,16 @@ def _kernel_v3(
                 issue,
                 dtype=cache_ref.dtype,
                 folded=folded,
+                reduce=not deferred,
             )  # [Bq, size]
+            if deferred:
+                pend_ref[...] = m
+                pend_pos[0] = row0
+                pend_pos[1] = col0
+                pend_pos[2] = first // chunk
+                return
+            if defer:
+                return m  # the body writes the group's block
             if row_scale is not None:
                 m = m * row_scale
             if transposed:
@@ -737,15 +787,17 @@ def _kernel_v3(
             scale_cols = jnp.where(
                 jnp.isfinite(scale_rows) & (page < live), scale_rows, 0.0
             ).T  # [S, chunk]
-            if not fp8_q:
+            if not fp8_q and not token_scores:
                 scale_cols = scale_cols.astype(jnp.bfloat16)
 
         def page_keys(j):
             issue(j)
             if folded:
                 k = pltpu.bitcast(buf[slot, first + j, : rows - 1], jnp.int4)
-                if fp8_q:  # exact (|k| <= 8); scaled after the dot
+                if fp8_q or token_scores == 8:  # exact (|k| <= 8); scaled after the dot
                     return k.astype(jnp.float8_e4m3fn)
+                if token_scores:  # exact; scaled after the dot
+                    return k.astype(jnp.bfloat16)
                 return k.astype(jnp.bfloat16) * scale_cols[:, j : j + 1]
             # A page past the request's end was never copied: its stale words
             # may be NaN or inf, which would reach its pair's score through
@@ -755,7 +807,10 @@ def _kernel_v3(
             return k if fp8_q else k.astype(jnp.bfloat16)
 
         m = _chunk_maxima(
-            q_pair, page_keys, chunk, scale_cols if folded and fp8_q else None
+            q_pair,
+            page_keys,
+            chunk,
+            scale_cols if folded and (fp8_q or token_scores) else None,
         )
         if row_scale is not None:
             m = m * row_scale.T
@@ -764,11 +819,28 @@ def _kernel_v3(
         else:
             o_ref[pl.ds(first, chunk), :] = m
 
+    def flush_pending():
+        """Write the pending chunk's maxima into its 128-lane group block
+        (a dynamic lane offset must be a multiple of 128): read, select the
+        chunk's lanes, write back."""
+        m = _maxima_t(pend_ref[...], chunk // 2, page_size)  # [Bq, chunk]
+        width = min(128, pages_per_step)
+        m = jnp.concatenate([m] * (width // chunk), axis=1) if width > chunk else m
+        rows_ = pl.ds(pl.multiple_of(pend_pos[0], _ROW_ALIGN), block_q)
+        lanes = pl.ds(pl.multiple_of(pend_pos[1] + 0, width), width)
+        lane = jax.lax.broadcasted_iota(jnp.int32, m.shape, 1)
+        hit = lane // chunk == pend_pos[2] % (width // chunk)
+        # The chunk's 128-lane block within the group.
+        blk = pend_pos[2] // (width // chunk)
+        lanes = pl.ds(pl.multiple_of(pend_pos[1] + blk * width, width), width)
+        o_ref[rows_, lanes] = jnp.where(hit, m, o_ref[rows_, lanes])
+
     share = per_pair * (chunk // 2)
     tail_split = (
         0 < tail < chunk
         and chunk % tail == 0
         and not quad
+        and not token_scores
         and _scores_transposed(block_q, rows, cache_ref.dtype)
     )
 
@@ -777,12 +849,21 @@ def _kernel_v3(
         request's last page (their scores are never read) and only issue
         their share of the ahead group's descriptors."""
         wait_pages(live, slot)
+        done = []
+        if defer:
+            # The previous step's last chunk (a dummy at step 0: chunk 0's
+            # own maxima overwrite it below).
+            flush_pending()
         for c in range(num_chunks):
             pages = range(
                 min(c * share, pages_per_step), min((c + 1) * share, pages_per_step)
             )
-            if c < scored - 1 or (c == scored - 1 and not tail_split):
-                score_chunk(slot, c * chunk, pages, next_full)
+            if defer and c == scored - 1 and c > 0:
+                score_chunk(slot, c * chunk, pages, next_full, deferred=True)
+            elif c < scored - 1 or (c == scored - 1 and not tail_split):
+                m = score_chunk(slot, c * chunk, pages, next_full)
+                if defer:
+                    done.append(m)
             elif c == scored - 1:
                 # The last scored chunk as `tail`-page dots: the maxima
                 # still to do after its last matmul are one small dot's.
@@ -797,6 +878,15 @@ def _kernel_v3(
                     )
             else:
                 start(next_base, next_live, pages, (slot + ahead) % slots, next_full)
+        if defer:
+            # Chunks scored here (the deferred one and those past the
+            # request's end are filled in later / never read).
+            blk = jnp.concatenate(
+                done
+                + [jnp.zeros((block_q, pages_per_step - len(done) * chunk), jnp.float32)],
+                axis=1,
+            ) if len(done) * chunk < pages_per_step else jnp.concatenate(done, axis=1)
+            o_ref[pl.ds(row0, block_q), pl.ds(col0, pages_per_step)] = blk
 
     # One straight-line body per slot and count of scored chunks, so that a
     # chunk's matmuls overlap the previous chunk's maxima.
@@ -816,6 +906,9 @@ def _kernel_v3(
             pl.when(cond & jnp.logical_not(next_is_full))(
                 functools.partial(body, slot, n)
             )
+    if defer:
+
+        pl.when(step == num_steps - 1)(flush_pending)
 
 
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
@@ -1022,6 +1115,22 @@ def _class_scores(
             dopt = decode_opt()
             if dopt.quad and chunk % 4:
                 dopt = dopt._replace(quad=False)
+            # The resident output must fit VMEM next to the ring.
+            if dopt.defer and (
+                not token_major
+                or dopt.quad
+                or dopt.tail
+                or dopt.token_scores
+                or out_shape.shape[0] * out_shape.shape[1] * 4 > (8 << 20)
+            ):
+                dopt = dopt._replace(defer=False)
+        defer_scratch = []
+        if dopt.defer:
+            out_specs = pl.BlockSpec(out_shape.shape, lambda w, *_: (0, 0))
+            defer_scratch = [
+                pltpu.VMEM((2 * block_q, chunk // 2 * page_size), jnp.float32),
+                pltpu.SMEM((3,), jnp.int32),
+            ]
         scores_t = pl.pallas_call(
             functools.partial(
                 _kernel_v3,
@@ -1034,6 +1143,8 @@ def _class_scores(
                 full_bodies=dopt.full,
                 tail=dopt.tail,
                 every_count=dopt.every_count,
+                token_scores=dopt.token_scores,
+                defer=dopt.defer,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=4,
@@ -1046,6 +1157,7 @@ def _class_scores(
                         jnp.uint32,
                     ),
                     pltpu.SemaphoreType.DMA((dopt.slots,)),
+                    *defer_scratch,
                 ],
             ),
             out_shape=out_shape,
