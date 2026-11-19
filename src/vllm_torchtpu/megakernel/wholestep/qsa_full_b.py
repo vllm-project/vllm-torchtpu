@@ -89,6 +89,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
         async_dma: bool = False,
         skip_idle: bool = False,
         xreq_prefetch: int = 0,
+        select_nvis: int = 0,
+        nvis_rows: tuple = (32, 64),
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -223,6 +225,20 @@ class QSAFullIndexedBlock(QSAFullBlock):
         assert (self.chunk_pages * GPK) % 128 == 0 and (max_groups // 128) % 8 == 0
         assert not self.mp or self.chunk_pages % self.mp == 0
         assert not compressed_dcp or self.n_chunks % self.dcp == 0, self.n_chunks
+        # `select_nvis` (VLLM_TPU_MK_QSA_SELECT_NVIS, the per-request selection): the
+        # threshold bisection and the row compaction scan only the score rows that hold
+        # visible groups (`nvis_rows` = (bisection chunk rows, compaction half-chunk rows))
+        # instead of all `max_groups / 128`; the rows past `n_vis` are invisible (-1) and
+        # add nothing, so thresholds, ids and order are unchanged.
+        self.select_nvis = bool(int(select_nvis)) and per_request_scores
+        # 2: also the union compaction (`qsa_ucompact`) over those rows.
+        self.select_nvis_union = self.select_nvis and int(select_nvis) >= 2 and union_attn
+        self.nvis_rows = tuple(int(x) for x in nvis_rows)
+        if self.select_nvis:
+            S, rs = max_groups // 128, max_groups // 128 // self.n_chunks
+            Sh = S // (self.dcp if compressed_dcp else 1)
+            for x in self.nvis_rows:
+                assert x % rs == 0 and Sh % x == 0, (self.nvis_rows, rs, Sh)
 
     @property
     def n_chunks(self) -> int:

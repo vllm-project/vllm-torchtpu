@@ -191,6 +191,83 @@ def compact_consts(S: int, K: int) -> tuple:
     )
 
 
+# ------------------------------------------- visible-chunk selection (`select_nvis`)
+# The functions below are `thresholds` / `compact_row` restricted to the sublane rows that
+# hold visible groups: every other row is all -1 (invisible) and adds nothing to any count,
+# so the same thresholds, ids and order come out of fewer passes over fewer rows.
+def thresholds_chunks(load_bits, load_ids, n_ch: Any, nv: jax.Array, K: int, G: int,
+                      shape: tuple):
+    """`thresholds` over `n_ch` (traced) score chunks: `load_bits(c)` / `load_ids(c)` give
+    chunk `c`'s bit patterns (-1 = invisible) / group ids, both `shape = [R, CH, 128]`; the
+    rows outside the chunks must be invisible. Integer counts: any summation order."""
+
+    def cnt(*fs):
+        def body(c: Any, accs: Any) -> Any:
+            return tuple(a + f(c).astype(I32) for a, f in zip(accs, fs))
+
+        accs = jax.lax.fori_loop(0, n_ch, body, tuple(jnp.zeros(shape, I32) for _ in fs))
+        return [jnp.sum(a, axis=(1, 2), keepdims=True) for a in accs]
+
+    over = nv > K
+    lo = jnp.zeros(nv.shape, I32)
+    for b in range(30, -1, -1):
+        cand = lo | (1 << b)
+        (n,) = cnt(lambda c, cand=cand: load_bits(c) >= cand)
+        lo = jnp.where(n >= K, cand, lo)
+    thr = jnp.where(over, lo, 0)
+    n_gt, n_eq = cnt(lambda c: load_bits(c) > thr, lambda c: load_bits(c) == thr)
+    need = K - n_gt
+    t = jnp.zeros(nv.shape, I32)
+    for b in range(int(G - 1).bit_length() - 1, -1, -1):
+        cand = t | (1 << b)
+        (n,) = cnt(lambda c, cand=cand: (load_bits(c) == thr) & (load_ids(c) < cand))
+        t = jnp.where(n < need, cand, t)
+    tmax = jnp.where(over & (n_eq > need), t, G)
+    return thr, tmax
+
+
+def chunk_consts(CR: int, K: int) -> tuple:
+    """Constants of `compact_chunk` for `CR`-row chunks: `U`, the in-chunk strict triangle
+    (`exclusive_prefix`'s 128-lane one at CR = 128), slot column, chunk row iota."""
+    li = jax.lax.broadcasted_iota(I32, (128, 128), 0)
+    lj = jax.lax.broadcasted_iota(I32, (128, 128), 1)
+    si = jax.lax.broadcasted_iota(I32, (CR, CR), 0)
+    sj = jax.lax.broadcasted_iota(I32, (CR, CR), 1)
+    return (
+        (li <= lj).astype(BF16),
+        (si < sj).astype(BF16),
+        jax.lax.broadcasted_iota(I32, (K, 1), 0),
+        jax.lax.broadcasted_iota(I32, (1, CR), 1),
+    )
+
+
+def compact_chunk(sel: jax.Array, tot: jax.Array, row_of, consts: tuple):
+    """One chunk of `compact_row`'s compaction (select-all of `sel`): the selected lanes of
+    the chunk's rows `sel [CR, 128]` take output slots `[tot, tot + count)` (`tot [1, 1]` f32:
+    the count of the chunks before it, which hold lower ids). Returns the lane-major `[1, K]`
+    f32 slot ids of those slots (0 elsewhere; chunks add up) and the new `tot`. `row_of(r)`:
+    the sublane row (id // 128) of the chunk's row `r [K, 1]`. Same integer arithmetic as
+    `compact_row` (BF16-exact counts <= 128, f32-exact offsets)."""
+    U, tri, jcol, srow = consts
+    CR, K = sel.shape[0], jcol.shape[0]
+    P = jnp.dot(sel.astype(F32).astype(BF16), U, preferred_element_type=F32)
+    c_row = jnp.transpose(jnp.broadcast_to(P[:, 127:128], (CR, 128)))[0:1, :]
+    O_row = jnp.dot(c_row.astype(BF16), tri, preferred_element_type=F32) + tot
+    E_row = O_row + c_row
+    jf = jcol.astype(F32)
+    r_j = jnp.sum((E_row <= jf).astype(I32), axis=1, keepdims=True)
+    oh = srow == r_j
+    Pg = jnp.dot(
+        oh.astype(F32).astype(BF16), P.astype(BF16), preferred_element_type=F32
+    )
+    O_rj = jnp.sum(jnp.where(oh, O_row, 0.0), axis=1, keepdims=True)
+    lane_j = jnp.sum((Pg <= jf - O_rj).astype(I32), axis=1, keepdims=True)
+    n = jnp.sum(c_row, axis=1, keepdims=True)
+    live = (jf >= tot) & (jf < tot + n)
+    idc = jnp.where(live, row_of(r_j) * 128 + lane_j, 0).astype(F32)
+    return jnp.transpose(jnp.broadcast_to(idc, (K, 128)))[0:1, :], tot + n
+
+
 # ---------------------------------------------------------------- reference
 def topk_reference(scores: np.ndarray, nvis: int, K: int) -> list[int]:
     """Stock selection: top-K by score, ties to the lower id, over ids < nvis."""

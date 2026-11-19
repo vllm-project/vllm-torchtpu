@@ -69,6 +69,22 @@ def union_consts(S: int, KU: int) -> tuple:
     )
 
 
+def union_chunk_consts(CR: int, KU: int) -> tuple:
+    """Constants of `compact_union_chunk` for `CR`-row chunks."""
+    W = min(KU, UNION_CHUNK)
+    li = jax.lax.broadcasted_iota(I32, (128, 128), 0)
+    lj = jax.lax.broadcasted_iota(I32, (128, 128), 1)
+    si = jax.lax.broadcasted_iota(I32, (CR, CR), 0)
+    sj = jax.lax.broadcasted_iota(I32, (CR, CR), 1)
+    return (
+        (li <= lj).astype(BF16),
+        (si < sj).astype(BF16),
+        jax.lax.broadcasted_iota(I32, (W, 1), 0),
+        jax.lax.broadcasted_iota(I32, (1, CR), 1),
+        jax.lax.broadcasted_iota(I32, (W, 128), 1),
+    )
+
+
 def compact_union(
     code: jax.Array, KU: int, consts: tuple
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -117,6 +133,50 @@ def compact_union(
         )
     cat = lambda xs: xs[0] if len(xs) == 1 else jnp.concatenate(xs, axis=1)  # noqa: E731
     return cat(ids_out), cat(codes_out), n
+
+
+def compact_union_chunk(code: jax.Array, tot: jax.Array, row_of, KU: int, consts: tuple,
+                        store) -> tuple:
+    """One row chunk of `compact_union` (`VLLM_TPU_MK_QSA_SELECT_NVIS`): the coded lanes of
+    `code [CR, 128]` take union slots `[tot, tot + count)` (`tot`: scalar int32 count of the
+    chunks before it, which hold lower ids). For each `UNION_CHUNK` slot window that meets
+    that range, `store(j0, ids, codes)` gets the window's `[1, W]` int32 ids / codes (0
+    outside the range; chunks add up). `row_of(r)`: sublane row of the chunk's row `r`.
+    Same integer arithmetic as `compact_union`. Returns the new `tot`."""
+    U, tri, jcol0, srow, lane = consts
+    CR, W = code.shape[0], jcol0.shape[0]
+    sel = code > 0
+    P = jnp.dot(sel.astype(F32).astype(BF16), U, preferred_element_type=F32)
+    c_row = jnp.transpose(jnp.broadcast_to(P[:, 127:128], (CR, 128)))[0:1, :]
+    totf = jnp.zeros((1, 1), F32) + tot.astype(F32)
+    O_row = jnp.dot(c_row.astype(BF16), tri, preferred_element_type=F32) + totf
+    E_row = O_row + c_row
+    Pb, codeb = P.astype(BF16), code.astype(F32).astype(BF16)
+    n = jnp.sum(sel.astype(I32))
+    for j0 in range(0, KU, W):
+
+        @pl.when((j0 < tot + n) & (j0 + W > tot))
+        def _(j0=j0):
+            jcol = jcol0 + j0
+            jf = jcol.astype(F32)
+            r_j = jnp.sum((E_row <= jf).astype(I32), axis=1, keepdims=True)
+            hit = srow == r_j
+            oh = hit.astype(F32).astype(BF16)
+            Pg = jnp.dot(oh, Pb, preferred_element_type=F32)
+            O_rj = jnp.sum(jnp.where(hit, O_row, 0.0), axis=1, keepdims=True)
+            lane_j = jnp.sum((Pg <= jf - O_rj).astype(I32), axis=1, keepdims=True)
+            Cg = jnp.dot(oh, codeb, preferred_element_type=F32)
+            code_j = jnp.sum(jnp.where(lane == lane_j, Cg, 0.0), axis=1, keepdims=True)
+            live = (jcol >= tot) & (jcol < tot + n)
+            ids = jnp.where(live, row_of(r_j) * 128 + lane_j, 0).astype(F32)
+            codes = jnp.where(live, code_j, 0.0)
+            store(
+                j0,
+                jnp.transpose(jnp.broadcast_to(ids, (W, 128)))[0:1, :].astype(I32),
+                jnp.transpose(jnp.broadcast_to(codes, (W, 128)))[0:1, :].astype(I32),
+            )
+
+    return tot + n
 
 
 def physical_ids(ids: jax.Array, tab: jax.Array, per_page: int, dcp: int = 1) -> jax.Array:

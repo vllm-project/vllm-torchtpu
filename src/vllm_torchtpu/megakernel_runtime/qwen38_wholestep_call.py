@@ -103,6 +103,7 @@ def indexed_options() -> dict:
         compressed_dcp=compressed_dcp(),
         async_dma=envs.VLLM_TPU_MK_QSEL_ASYNC,
         xreq_prefetch=envs.VLLM_TPU_MK_QSA_XREQ_PREFETCH,
+        select_nvis=envs.VLLM_TPU_MK_QSA_SELECT_NVIS,
     )
 
 

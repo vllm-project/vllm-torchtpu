@@ -352,6 +352,158 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         each(lambda d: d.wait_recv())
         each(lambda d: d.wait_send())
 
+    # ------------------------------------------- visible-chunk selection (`select_nvis`)
+    def _nvis_plan(self, ctx: Any, nv: Any, CH: int) -> tuple:
+        """(count, base row of chunk i) of the `CH`-row score chunks holding groups < `nv`
+        (scalar), in score-position order: under `compressed_dcp` rank 0's half's visible
+        prefix, then rank 1's."""
+        S, span = self.max_groups // 128, CH * 128
+        if not self.compressed_dcp:
+            return jnp.minimum((nv + span - 1) // span, S // CH), lambda i: i * CH
+        Sh = S // self.dcp
+        m0, m1 = (
+            jnp.minimum((self._cdcp_local_nv(ctx, nv, rk) + span - 1) // span, Sh // CH)
+            for rk in range(self.dcp)
+        )
+        return m0 + m1, lambda i: jnp.where(i < m0, i * CH, Sh + (i - m0) * CH)
+
+    def _nvis_slab(self, ctx: Any, r0: Any, n: int, base: Any, CH: int) -> Any:
+        """`qi_s` rows `[r0, r0 + n)`, score rows `[base, base + CH)` as `pl.ds` indices."""
+        rs = self.max_groups // 128 // self.n_chunks
+        return (pl.ds(r0, n), pl.ds(base // rs, CH // rs))
+
+    def _nvis_ids(self, ctx: Any, shape: tuple, base: Any) -> Any:
+        """Group ids of score rows `[base, base + shape[-2])` (`_cdcp_gid` order)."""
+        d = len(shape)
+        p = (jax.lax.broadcasted_iota(I32, shape, d - 2) + base) * 128 + (
+            jax.lax.broadcasted_iota(I32, shape, d - 1)
+        )
+        return self._cdcp_gid(ctx, p) if self.compressed_dcp else p
+
+    def _nvis_thresholds(self, ctx: Any, r0: Any, n: int, nv: Any, nv_max: Any) -> tuple:
+        """`ix.thresholds` of the `n` rows at `qi_s[r0 …]` (per-row `nv [n, 1, 1]`) over the
+        chunks holding groups < `nv_max` (scalar); none when no row has more than `budget`
+        visible groups (thresholds 0 / max_groups whatever the counts). Masks those chunks'
+        scores in place first (-1 past each row's `n_vis`; the compaction masks again)."""
+        CH, K, G = self.nvis_rows[0], self.budget, self.max_groups
+        rs = self.max_groups // 128 // self.n_chunks
+        m, base_of = self._nvis_plan(ctx, nv_max, CH)
+        m = jnp.where(nv_max > K, m, 0)
+        qs = ctx.scr["qi_s"]
+        shape = (n, CH, 128)
+
+        def mask(c: Any, carry: Any) -> Any:
+            base = base_of(c)
+            ix_ = self._nvis_slab(ctx, r0, n, base, CH)
+            sc = pltpu.bitcast(qs[ix_].reshape(shape), I32)
+            b = jnp.where(self._nvis_ids(ctx, shape, base) < nv, sc, -1)
+            qs[ix_] = pltpu.bitcast(b, F32).reshape(n, CH // rs, rs, 128)
+            return carry
+
+        jax.lax.fori_loop(0, m, mask, 0)
+
+        def bits(c: Any) -> Any:
+            ix_ = self._nvis_slab(ctx, r0, n, base_of(c), CH)
+            return pltpu.bitcast(qs[ix_].reshape(shape), I32)
+
+        return ix.thresholds_chunks(
+            bits, lambda c: self._nvis_ids(ctx, shape, base_of(c)), m, nv, K, G, shape
+        )
+
+    def _nvis_row(self, ctx: Any, r: Any, lo: Any, s0: Any, ga: Any, consts: tuple) -> tuple:
+        """`row`'s selection and compaction of row `r` over the score rows holding its
+        visible groups, two `CM`-row halves per compaction chunk (under `compressed_dcp` the
+        two halves may sit in the two ranks' score halves). Returns (ids `[1, K]` int32
+        positions, g_a selected, kept)."""
+        scr, K, CM = ctx.scr, self.budget, self.nvis_rows[1]
+        rs = self.max_groups // 128 // self.n_chunks
+        nvs = ctx.extra[NVIS][r]
+        m, base_of = self._nvis_plan(ctx, nvs, CM)
+        th, tm = scr["qi_th"][r][:, :1], scr["qi_tm"][r][:, :1]
+        ov = scr["qi_nv"][r][:, :1] > K
+        qs = scr["qi_s"]
+
+        def it(i: Any, carry: Any) -> Any:
+            acc, tot, sga, kept = carry
+            sels, bases = [], []
+            for k in range(2):
+                c = 2 * i + k
+                base = jnp.where(c < m, base_of(c), 0)
+                lid = self._nvis_ids(ctx, (CM, 128), base)
+                ix_ = (r - lo + s0, pl.ds(base // rs, CM // rs))
+                sc = pltpu.bitcast(qs[ix_].reshape(CM, 128), I32)
+                b = jnp.where(lid < jnp.where(c < m, nvs, 0), sc, -1)  # past m: none
+                sel = (ov & ((b > th) | ((b == th) & (lid <= tm)))) | (~ov & (b >= 0))
+                sga = sga + jnp.sum((sel & (lid == ga)).astype(I32))
+                s2 = sel & (lid < ga)
+                kept = kept + jnp.sum(s2.astype(I32))
+                if self.union_attn:  # row bit r - lo of every pool-path group it selects
+                    rows = pl.ds(pl.multiple_of(base, 8), CM)
+                    scr["qu_code"][rows] = scr["qu_code"][rows] | jnp.where(
+                        s2, jnp.left_shift(1, r - lo), 0
+                    )
+                sels.append(s2 & (b >= 0))
+                bases.append(base)
+
+            def row_of(rj: Any) -> Any:
+                return jnp.where(rj < CM, bases[0] + rj, bases[1] + rj - CM)
+
+            part, tot = ix.compact_chunk(jnp.concatenate(sels, axis=0), tot, row_of, consts)
+            return acc + part, tot, sga, kept
+
+        z = jnp.zeros((), I32)
+        acc, _, sga, kept = jax.lax.fori_loop(
+            0, (m + 1) // 2, it,
+            (jnp.zeros((1, K), F32), jnp.zeros((1, 1), F32), z, z),
+        )
+        return acc.astype(I32), sga, kept
+
+    def _nvis_union(self, ctx: Any, lo: Any, r: Any, KU: int, D: int, gpp: int,
+                    nv_max: Any) -> None:
+        """The `qsa_ucompact` union of request `lo // T` for pair rank `r` (its owned groups
+        under main-KV DCP) over the score rows holding groups < `nv_max` (no row's union code
+        is set past them), two `CM`-row halves per chunk; slot windows past the union are
+        skipped."""
+        scr, T, CM = ctx.scr, ctx.ex.T, self.nvis_rows[1]
+        q = lo // T
+        m, base_of = self._nvis_plan(ctx, nv_max, CM)
+        at = pl.multiple_of(r * KU, 128) if self.compressed_dcp else r * KU
+        consts = ua.union_chunk_consts(2 * CM, KU)
+        scr["qu_id"][q, :, pl.ds(at, KU)] = jnp.zeros((1, KU), I32)
+        scr["qu_cd"][q, :, pl.ds(at, KU)] = jnp.zeros((1, KU), I32)
+
+        def store(j0: int, ids: Any, codes: Any) -> None:
+            W = ids.shape[1]
+            for k, v in (("qu_id", ids), ("qu_cd", codes)):
+                ref = scr[k].at[q, :, pl.ds(at + j0, W)]
+                ref[...] = ref[...] + v
+
+        def it(i: Any, tot: Any) -> Any:
+            codes, bases = [], []
+            for k in range(2):
+                c = 2 * i + k
+                base = jnp.where(c < m, base_of(c), 0)
+                cd = scr["qu_code"][pl.ds(pl.multiple_of(base, 8), CM)]
+                keep = jnp.where(c < m, 1, 0)
+                if D > 1 and not self.compressed_dcp:
+                    gidx = self._nvis_ids(ctx, (CM, 128), base)
+                    cd = jnp.where(jax.lax.rem(gidx // gpp, D) == r, cd, 0)
+                codes.append(cd * keep)
+                bases.append(base)
+
+            def row_of(rj: Any) -> Any:
+                return jnp.where(rj < CM, bases[0] + rj, bases[1] + rj - CM)
+
+            return ua.compact_union_chunk(
+                jnp.concatenate(codes, axis=0), tot, row_of, KU, consts, store
+            )
+
+        n = jax.lax.fori_loop(0, (m + 1) // 2, it, jnp.zeros((), I32))
+        if self.compressed_dcp:
+            ref = scr["qu_id"].at[q, :, pl.ds(at, KU)]
+            ref[...] = self._cdcp_gid(ctx, ref[...])
+        scr["qu_n"][q, r] = n
+
     def _shard_scratch(self, ex: ExecSpec) -> list[ScratchReq]:
         _, rows, W = self._shard_rows(ex)
         n = max(ex.R - 1, 1)
@@ -575,6 +727,13 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             )
             if cdcp:
                 ids = self._cdcp_gid(ctx, ids)
+
+            def nv_max(r0: Any, k: int) -> Any:  # scalar max `n_vis` of rows [r0, r0 + k)
+                v = ctx.extra[NVIS][r0]
+                for i in range(1, k):
+                    v = jnp.maximum(v, ctx.extra[NVIS][r0 + i])
+                return v
+
             if cdcp and n % self.dcp == 0:
                 # Both pair ranks hold every row's scores: each finds the thresholds of its
                 # share of the rows (the bisection is most of the selection) and the pair swaps
@@ -586,9 +745,17 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 for i in range(h):
                     nv_h = jnp.where(rid_h == i, ctx.extra[NVIS][lo + o + i], nv_h)
                 ids_h = ids[:h]
-                sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0 + o, h)].reshape(h, S, 128), I32)
-                with ctx.stream.sc("qsa_thr", 2):
-                    thr, tmax = ix.thresholds(jnp.where(ids_h < nv_h, sc, -1), ids_h, nv_h, K, G)
+                if self.select_nvis:
+                    with ctx.stream.sc("qsa_thr", 2):
+                        thr, tmax = self._nvis_thresholds(
+                            ctx, s0 + o, h, nv_h, nv_max(lo + o, h)
+                        )
+                else:
+                    sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0 + o, h)].reshape(h, S, 128), I32)
+                    with ctx.stream.sc("qsa_thr", 2):
+                        thr, tmax = ix.thresholds(
+                            jnp.where(ids_h < nv_h, sc, -1), ids_h, nv_h, K, G
+                        )
                 scr["qi_th"][pl.ds(lo + o, h)] = jnp.broadcast_to(thr, (h, 1, 128))
                 scr["qi_tm"][pl.ds(lo + o, h)] = jnp.broadcast_to(tmax, (h, 1, 128))
                 with ctx.stream.sc("qsa_cdcp_thx", 2):
@@ -601,6 +768,11 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                         for k in ("qi_th", "qi_tm")
                     ]
                     ctx.comm.exchange(xs)
+            elif self.select_nvis:
+                with ctx.stream.sc("qsa_thr", 2):
+                    thr, tmax = self._nvis_thresholds(ctx, s0, n, nv, nv_max(lo, n))
+                scr["qi_th"][pl.ds(lo, n)] = jnp.broadcast_to(thr, (n, 1, 128))
+                scr["qi_tm"][pl.ds(lo, n)] = jnp.broadcast_to(tmax, (n, 1, 128))
             else:
                 sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0, n)].reshape(n, S, 128), I32)
                 bits = jnp.where(ids < nv, sc, -1)
@@ -617,7 +789,15 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             if self.union_attn:
                 scr["qu_code"][...] = jnp.zeros((S, 128), I32)
 
+            if self.select_nvis:
+                nconsts = ix.chunk_consts(2 * self.nvis_rows[1], K)
+
             def row(r: Any, carry: Any) -> Any:
+                if self.select_nvis:
+                    ga = ctx.extra[CTXQ][r // T] // 4
+                    pos, sga, kept = self._nvis_row(ctx, r, lo, s0, ga, nconsts)
+                    scr["qc_sga"][r] = sga
+                    return tail(r, pos, kept, carry)
                 nvr = scr["qi_nv"][r][:, :1]
                 ga = ctx.extra[CTXQ][r // T] // 4
                 b = jnp.where(
@@ -648,6 +828,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     b2, jnp.zeros((1, 1), I32), jnp.zeros((1, 1), I32) + G,
                     jnp.zeros((1, 1), I32) + kept, K, consts,
                 )
+                return tail(r, pos, kept, carry)
+
+            def tail(r: Any, pos: Any, kept: Any, carry: Any) -> Any:
                 scr["qi_id"][r] = self._cdcp_gid(ctx, pos) if cdcp else pos
                 cs = self._ids_copies(ctx, r)
                 for c in cs:
@@ -679,6 +862,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     # its own union (the one it attends), and `_exchange_unions` sends it to the
                     # ranks of the same pair rank.
                     for r in [jax.lax.rem(ctx.me, D)] if cdcp else range(D):
+                        if self.select_nvis_union:
+                            self._nvis_union(ctx, lo, r, KU, D, gpp, nv_max(lo, T))
+                            continue
                         code = code_all if D == 1 else jnp.where(
                             jax.lax.rem(gidx // gpp, D) == r, code_all, 0
                         )
