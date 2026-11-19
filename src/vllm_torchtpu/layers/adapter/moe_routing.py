@@ -27,9 +27,11 @@ logger = init_logger(__name__)
 _ROUTER_TOPK = envs.TPU_MOE_ROUTER_TOPK
 _ROUTER_TOPK_VALUES = envs.TPU_MOE_ROUTER_TOPK_VALUES and _ROUTER_TOPK == "rowmax"
 if _ROUTER_TOPK_VALUES:
-    logger.info(
-        "TPU_MOE_ROUTER_TOPK_VALUES=1: biased top-k returns the routing weights"
-        " from the router kernel (no XLA gather)"
+    # warning, not info: this module is imported before vLLM configures the
+    # worker's logging level, and the line is the flag's proof in run logs.
+    logger.warning(
+        "TPU_MOE_ROUTER_TOPK_VALUES=1 on: biased top-k returns the routing"
+        " weights from the router kernel (no XLA gather)"
     )
 
 
