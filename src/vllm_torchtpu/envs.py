@@ -76,6 +76,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_FP8_LINEARS: bool = True
     TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS: int = 0
     TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS: int = 0
+    TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS: int = 0
+    TPU_MINIMAX_M3_FP8_SPLIT_MIN_ROWS: int = 0
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -759,6 +761,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Smallest token bucket TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS applies to.
     "TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS": env_nonnegative_int(
         "TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS", 0
+    ),
+    # MiniMax-M3 e4m3 linears: token buckets of at most this many rows split
+    # the bf16 activations into two e4m3 terms (x ~ s * (hi + lo / 16), one
+    # power-of-two scale s per row) and run one fp8 x fp8 MXU matmul over the
+    # stacked [hi; lo] rows, instead of upcasting the whole e4m3 weight to bf16
+    # inside the dot fusion. The two terms keep ~8 mantissa bits, about bf16's
+    # rounding of the activations. 0 (default) keeps the upcast path.
+    "TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS", 0
+    ),
+    # Smallest token bucket TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS applies to.
+    "TPU_MINIMAX_M3_FP8_SPLIT_MIN_ROWS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_FP8_SPLIT_MIN_ROWS", 0
     ),
     # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
     # permutation-free dense-expert kernel (kernels/experimental/
