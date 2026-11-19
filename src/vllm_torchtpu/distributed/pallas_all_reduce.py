@@ -75,10 +75,13 @@ def _qdq(x: jax.Array) -> jax.Array:
     return qar.dequantize(*qar.quantize(xf))[:rows].astype(x.dtype)
 
 
-def _body(n: int, max_bytes: int, axis: str, qdq_min_rows: int = 0):
+def _body(n: int, max_bytes: int, axis: str, qdq_min_rows: int = 0,
+          qar_min_rows: int = 0, qar_tab: np.ndarray | None = None):
     def body(x, rank):
         rows, hidden = x.shape
         # Static per bucket: decided at trace time inside the op.
+        if qar_tab is not None and 0 < qar_min_rows <= rows:
+            return qar.all_reduce_v2(x, rank, qar_tab)
         qdq = 0 < qdq_min_rows <= rows
         if qdq:
             x = _qdq(x)
@@ -100,11 +103,12 @@ def _qdq_min_rows() -> int:
     return max(1, envs.TPU_TP_AR_QDQ_MIN_TOKENS)
 
 
-def _make_op(mesh, max_bytes: int, qdq_min_rows: int = 0):
+def _make_op(mesh, max_bytes: int, qdq_min_rows: int = 0, qar_min_rows: int = 0):
     axis = mesh.axis_names[0]
+    qar_tab = qar.layout_table(list(mesh.devices.flat)) if qar_min_rows else None
     specs = (P(axis), P(axis))
     sharded = jax.shard_map(
-        _body(int(mesh.size), max_bytes, axis, qdq_min_rows),
+        _body(int(mesh.size), max_bytes, axis, qdq_min_rows, qar_min_rows, qar_tab),
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
@@ -122,7 +126,9 @@ def _make_op(mesh, max_bytes: int, qdq_min_rows: int = 0):
     # annotation is narrower).
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
-        "pallas::tp_all_reduce" + ("_qdq" if qdq_min_rows else ""),
+        "pallas::tp_all_reduce"
+        + ("_qdq" if qdq_min_rows else "")
+        + ("_qar" if qar_min_rows else ""),
         fn,
         mesh=mesh,
         input_partition_specs=specs,
@@ -170,6 +176,19 @@ def _selftest(
     finally:
         faulthandler.cancel_dump_traceback_later()
     return failures
+
+
+def _qar_selftest(op, rank, n: int, hidden: int, device, rows: int) -> dict:
+    """One qar all-reduce of known partials: rel L2 against the exact sum and a
+    digest of the bits (the caller requires every rank's digest to agree)."""
+    gen = torch.Generator().manual_seed(1234)
+    parts = torch.randn((n, rows, hidden), generator=gen).to(torch.bfloat16)
+    me = int(rank.reshape(-1)[0].item())
+    out = op(parts[me].to(device), rank).float().cpu()
+    exact = parts.double().sum(0)
+    rel = float((out.double() - exact).norm() / exact.norm())
+    digest = float((out.double() * torch.arange(1, out.numel() + 1).view(out.shape)).sum())
+    return dict(rank=me, rel=rel, digest=digest)
 
 
 def _gather(obj) -> list:
@@ -224,8 +243,19 @@ def arm(hidden: int, device: torch.device) -> bool:
         raise RuntimeError(
             f"tp_all_reduce: self-test failed (rows per rank): {failures}"
         )
+    qar_min_rows = envs.TPU_TP_QAR_MIN_TOKENS
+    if qar_min_rows > 0:
+        op = _make_op(mesh, max_bytes, _qdq_min_rows(), qar_min_rows)
+        seen = _gather(_qar_selftest(op, rank, n, hidden, device, qar_min_rows))
+        if len({r["digest"] for r in seen}) != 1 or max(r["rel"] for r in seen) >= 0.03:
+            raise RuntimeError(f"qar_all_reduce: self-test failed: {seen}")
+        logger.info(
+            "tp_all_reduce: qar_all_reduce (int8 ICI payload) on all-reduces of >= %d"
+            " rows (TPU_TP_QAR_MIN_TOKENS); self-test passed",
+            qar_min_rows,
+        )
     qdq_min_rows = _qdq_min_rows()
-    if qdq_min_rows:
+    if qdq_min_rows and qar_min_rows <= 0:
         # The self-test checks exact sums; the emulation rounds, so it runs on
         # the plain op above and serving gets the rounding one.
         op = _make_op(mesh, max_bytes, qdq_min_rows)
