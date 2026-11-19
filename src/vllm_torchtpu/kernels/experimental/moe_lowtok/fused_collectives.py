@@ -829,6 +829,12 @@ def moe_lowtok_fused(
             "rank, so a rank's experts must not cross a block; serve this "
             "expert split with moe_lowtok's scores entry and XLA collectives"
         )
+    if logits.shape[1] != n_experts * dp * tp:
+        raise ValueError(
+            f"router logits over {logits.shape[1]} experts, but the {dp} x {tp} "
+            f"ranks of {n_experts} experts each hold {n_experts * dp * tp}; pass "
+            "every expert's logit, in rank order"
+        )
     lanes = pl.cdiv(logits.shape[1], LANE) * LANE
     rows_l = engine_rows(tokens)
     rows = rows_l * dp
