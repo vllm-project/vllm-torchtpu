@@ -1139,9 +1139,9 @@ def test_set_device_control_env_var_multi_chip_and_empty(monkeypatch):
     os.environ["TORCH_TPU_TOPOLOGY"] = "2x2x1"
     for empty_val in ("", "   ", None):
         OmniTpuPlatform.set_device_control_env_var(empty_val)
-        assert os.environ["TPU_VISIBLE_CHIPS"] == ""
-        assert os.environ["TPU_VISIBLE_DEVICES"] == ""
-        assert os.environ["TPU_RUNTIME_METRICS_PORTS"] == ""
+        assert "TPU_VISIBLE_CHIPS" not in os.environ
+        assert "TPU_VISIBLE_DEVICES" not in os.environ
+        assert "TPU_RUNTIME_METRICS_PORTS" not in os.environ
         assert "DEBUG_TPU_LOCAL_RANK_OFFSET" not in os.environ
         assert "WORLD_SIZE" not in os.environ
         assert "MASTER_ADDR" not in os.environ
