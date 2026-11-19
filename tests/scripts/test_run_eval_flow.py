@@ -97,8 +97,12 @@ def test_chip_without_baseline_reports_without_perf_gate(tmp_path):
     result = _run_eval_flow(tmp_path, "v6e-8", "uncalibrated-config")
     assert result.returncode == 3, result.stderr
     missing = _BENCHMARKING / "baselines/perf/v6e/uncalibrated-config.baseline.json"
-    expected = f"No perf baseline for v6e at {missing}; reporting without the perf gate"
-    assert f"{expected}\n" in result.stdout
+    # A ::warning:: line, so the run is not mistaken for a gated one.
+    expected = (
+        f"::warning::No perf baseline for v6e at {missing}; "
+        "reporting without the perf gate."
+    )
+    assert any(line.startswith(expected) for line in result.stdout.splitlines())
 
 
 def test_skip_perf_check_needs_no_chip(tmp_path):
