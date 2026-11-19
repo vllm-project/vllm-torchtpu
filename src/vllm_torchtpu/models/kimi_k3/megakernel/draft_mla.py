@@ -97,8 +97,86 @@ class MlaDraftState:
 
 def _settled(state: MlaDraftState) -> MlaDraftState:
     """Synchronize ``state.vector`` asynchronously on TPU devices."""
-    synchronize_tpu([state.vector])
+    if state.vector.device.type == "tpu":
+        synchronize_tpu([state.vector])
     return state
+
+
+def settle_tpu_anchor(
+    anchor: int | torch.Tensor,
+    dev: torch.device,
+) -> torch.Tensor:
+    """Return a synchronized ``(1,)`` int32 anchor tensor on ``dev``."""
+    if (
+        isinstance(anchor, torch.Tensor)
+        and anchor.device.type == "tpu"
+        and anchor.dtype == torch.int32
+        and anchor.shape == (1,)
+    ):
+        anchor_t = anchor
+    else:
+        anchor_t = (
+            anchor.reshape(1).to(dtype=torch.int32, device=dev)
+            if isinstance(anchor, torch.Tensor)
+            else torch.tensor([int(anchor)], dtype=torch.int32, device=dev)
+        )
+    synchronize_tpu([anchor_t])
+    return anchor_t
+
+
+def seed_draft_vector_jax(
+    anchor: jax.Array,
+    rows: int,
+    bonus_idx: int,
+) -> jax.Array:
+    """Seed a replicated ``[1, 128]`` int32 draft vector with ``anchor``."""
+    tok = anchor.reshape(-1)[0].astype(jnp.int32)
+    idx = jnp.arange(DRAFT_VECTOR_LEN, dtype=jnp.int32)
+    return jnp.where(
+        (idx < rows - 1) | (idx == bonus_idx),
+        tok,
+        jnp.int32(-1),
+    )[None, :]
+
+
+def seed_draft_vector_cpu(
+    anchor: int | torch.Tensor,
+    rows: int,
+    bonus_idx: int,
+    *,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Allocate and seed a ``[1, 128]`` int32 draft vector on ``device``."""
+    dev = torch.device(device)
+    vector = torch.full((1, DRAFT_VECTOR_LEN), -1, dtype=torch.int32, device=dev)
+    anchor_t = (
+        anchor.reshape(1).to(dtype=torch.int32, device=dev)
+        if isinstance(anchor, torch.Tensor)
+        else torch.tensor([int(anchor)], dtype=torch.int32, device=dev)
+    )
+    vector[0, : rows - 1] = anchor_t
+    vector[0, bonus_idx] = anchor_t[0]
+    # Indexed writes leave a flat backing buffer even after _settled; the clone has
+    # draft outputs' [1, 128] backing, so mixes of new and continuing states share
+    # an executable.
+    return vector.clone()
+
+
+def make_draft_state(
+    anchor: int | torch.Tensor,
+    *,
+    device: torch.device | str = "cpu",
+) -> MlaDraftState:
+    """Construct an initial ``MlaDraftState`` seeded with ``anchor``."""
+    (dspark,) = kernel_modules("dspark")
+    typed_dspark = cast("DsparkKernelProtocol", dspark)
+    vector = seed_draft_vector_cpu(
+        anchor,
+        int(typed_dspark.ROWS),
+        int(typed_dspark.OUT_BONUS),
+        device=device,
+    )
+    return _settled(MlaDraftState(vector))
 
 
 def _batched_fn(
@@ -397,18 +475,46 @@ class MlaDsparkDraft:
                 self._bridge.hbm(self.rank),
             )
 
-    def new_state(self, anchor: int | torch.Tensor) -> MlaDraftState:
-        """Return an initial draft state seeded with ``anchor`` token."""
-        vector = torch.full((1, DRAFT_VECTOR_LEN), -1, dtype=torch.int32).to("tpu")
-        anchor_t = (
-            anchor
-            if isinstance(anchor, torch.Tensor)
-            else torch.tensor([int(anchor)], dtype=torch.int32).to("tpu")
+    def _build_init_state(self) -> Callable[..., tuple[torch.Tensor, ...]]:
+        """Build or return the mesh-replicated cold state initializer custom op."""
+        key = ("init_state",)
+        if key in self._ops:
+            return cast("Callable[..., tuple[torch.Tensor, ...]]", self._ops[key])
+        rows = int(self.dspark.ROWS)
+        bonus_idx = int(self.dspark.OUT_BONUS)
+
+        def body(anchor: jax.Array) -> tuple[jax.Array]:
+            """Seed a replicated draft vector with ``anchor``."""
+            return (seed_draft_vector_jax(anchor, rows, bonus_idx),)
+
+        self._ops[key] = self._bridge.register_global_op(
+            "pallas::k3_dspark_mla_init_state",
+            self.mesh,
+            body,
+            self._bridge.OpRegistrationSpec(
+                in_specs=(P(),),
+                out_specs=(P(),),
+                export_key=repr(("dspark_mla_init_state", rows, bonus_idx)),
+            ),
         )
-        anchor_t = anchor_t.reshape(1).to(torch.int32)
-        vector[0, : self.dspark.ROWS - 1] = anchor_t
-        vector[0, self.dspark.OUT_BONUS] = anchor_t[0]
-        return _settled(MlaDraftState(vector.clone()))
+        return cast("Callable[..., tuple[torch.Tensor, ...]]", self._ops[key])
+
+    def new_state(self, anchor: int | torch.Tensor) -> MlaDraftState:
+        """Return an initial draft state seeded with ``anchor`` token.
+
+        The next verify starts with ``anchor`` followed by placeholder drafts.
+        """
+        if self.pools:
+            dev = self.pools[0].device
+        elif isinstance(anchor, torch.Tensor):
+            dev = anchor.device
+        else:
+            dev = torch.device("tpu")
+        if dev.type != "tpu":
+            return make_draft_state(anchor, device=dev)
+        anchor_t = settle_tpu_anchor(anchor, dev)
+        (vector,) = self._build_init_state()(anchor_t)
+        return _settled(MlaDraftState(vector))
 
     def from_ring(
         self,
@@ -820,4 +926,12 @@ class MlaDsparkDraft:
                 )
                 for index in self.parts(requests, self.attention_dp, spec_rows)
             )
+        calls.append(
+            CompileCall(
+                self._build_init_state(),
+                (torch.empty((1,), dtype=torch.int32),),
+                {},
+                priority=1,
+            )
+        )
         return calls

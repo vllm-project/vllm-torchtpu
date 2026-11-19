@@ -59,6 +59,7 @@ from .layout import (
     MLA_LAYERS,
     cache_layout,
 )
+from .runtime_shim.bridge import synchronize_tpu
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -614,6 +615,8 @@ class KdaImporter:
         """
         blocks_t = kda_blocks.to(dtype=torch.int32, device=conv.device).contiguous()
         slot_t = torch.tensor([slot], dtype=torch.int32, device=conv.device)
+        if conv.device.type == "tpu":
+            synchronize_tpu([blocks_t, slot_t])
         conv_out, rec_out = self._build()(
             conv,
             recurrent,
@@ -621,6 +624,8 @@ class KdaImporter:
             blocks_t,
             slot_t,
         )
+        if conv.device.type == "tpu":
+            synchronize_tpu([conv_out, rec_out])
         return conv_out, rec_out
 
     def import_ring(
@@ -677,11 +682,15 @@ class KdaImporter:
         dev = self.raw_pools[0].device
         blocks_t = kda_blocks.to(dtype=torch.int32, device=dev).contiguous()
         len_t = torch.tensor([length], dtype=torch.int32, device=dev)
+        if dev.type == "tpu":
+            synchronize_tpu([blocks_t, len_t])
         ring_out, pos_out = self._ring_op(
             *self.raw_pools,
             blocks_t,
             len_t,
         )
+        if dev.type == "tpu":
+            synchronize_tpu([ring_out, pos_out])
         return ring_out, pos_out
 
 
