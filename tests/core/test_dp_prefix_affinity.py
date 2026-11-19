@@ -251,6 +251,48 @@ def test_prefix_every_engine_holds_leaves_the_backlog_choice(monkeypatch):
     )
 
 
+def test_prefix_choice_adds_its_prompt_to_the_backlog_estimate(monkeypatch):
+    """With both switches on, a request the prefix choice routes adds its
+    prompt to that engine's pending prompt tokens, as one the backlog choice
+    routes does, and the next request's backlog choice sees it."""
+    stock = DPLBAsyncMPClient.get_core_engine_for_request
+    monkeypatch.setattr(
+        DPLBAsyncMPClient,
+        "lb_engines",
+        property(backlog._get_lb_engines, backlog._set_lb_engines),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        DPLBAsyncMPClient,
+        "get_core_engine_for_request",
+        affinity.make_router(
+            backlog.make_router(stock, margin=1.0), CHUNK, load_margin=2, capacity=4096
+        ),
+    )
+    client = Client()
+    prompt = list(range(8 * CHUNK))
+    first = client.get_core_engine_for_request(request("a", prompt))
+    owner = client.core_engines.index(first)
+    assert client._lb_pending[owner] == len(prompt)
+    client.finish("a")
+
+    client.lb_engines = [
+        [0, 0, 0.0] if idx == owner else [0, 2, 0.0] for idx in range(ENGINES)
+    ]
+    turn = prompt + [7]
+    assert client.get_core_engine_for_request(request("b", turn)) == first
+    assert client._lb_pending == [
+        len(turn) if idx == owner else 0 for idx in range(ENGINES)
+    ]
+
+    scores = affinity.load_scores(client)
+    assert scores.index(min(scores)) == owner
+    other_prompt = list(range(10**6, 10**6 + CHUNK))
+    moved = client.get_core_engine_for_request(request("c", other_prompt))
+    assert moved != first
+    assert client._lb_pending[client.core_engines.index(moved)] == len(other_prompt)
+
+
 @pytest.mark.parametrize("client_count", [1, 4])
 def test_load_scores_pick_what_the_stock_choice_picks(client_count):
     """load_scores repeats vLLM's load score; its lowest score is the engine
