@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The routing plan kernel against the sharded XLA plan, on CPU (interpret).
+"""The routing plan kernel against the sharded XLA plan, in interpret mode on
+CPU and lowered through Mosaic on one TPU chip.
 
 Every table the expert kernel and the combine read must hold the same
 integers as the XLA plan's, on every shard, for skewed routings and for rows
@@ -23,6 +24,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.fused_moe.v2 import layer
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
@@ -166,6 +169,7 @@ def test_plan_kernel_matches_the_sharded_xla_plan(kind, t_local, topk, e_total):
     _check_against_the_xla_plan(kind, t_local, topk, e_total, interpret=True)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("kind", ["uniform", "nowhere"])
 @pytest.mark.parametrize("t_local,topk,e_total", [(8, 6, 384), (40, 6, 384)])
 def test_plan_kernel_lowered_for_tpu_matches_the_sharded_xla_plan(
@@ -176,6 +180,24 @@ def test_plan_kernel_lowered_for_tpu_matches_the_sharded_xla_plan(
     if jax.default_backend() != "tpu":
         pytest.skip("lowers the plan kernel for TPU; needs a TPU")
     _check_against_the_xla_plan(kind, t_local, topk, e_total, interpret=False)
+
+
+def _plan_in_shard_map(shape, *, interpret):
+    """routing_plan inside a shard_map, as the layer calls it, so the TPU case
+    compiles the Mosaic module the layer compiles; a top-level call lowers a
+    slightly different one."""
+    mesh = Mesh(np.asarray(jax.devices()[:1]), axis_names=("ep",))
+    return jax.jit(
+        jax.shard_map(
+            lambda exchange, rank: routing_plan(
+                exchange, rank, shape, interpret=interpret
+            ),
+            mesh=mesh,
+            in_specs=(P(), P()),
+            out_specs=P(),
+            check_vma=False,
+        )
+    )
 
 
 def _check_against_the_xla_plan(kind, t_local, topk, e_total, *, interpret):
@@ -201,14 +223,13 @@ def _check_against_the_xla_plan(kind, t_local, topk, e_total, *, interpret):
             layer._pack_routing_exchange(local.reshape(-1), bits, hist.sum(0), layout)
         )
     exchange = jnp.stack(rows)
+    plan = _plan_in_shard_map(shape, interpret=interpret)
 
     for me in range(EP):
         want = _xla_plan(
             exchange, me, ids, layout, t_local, topk, e_total, block, stride
         )
-        got = routing_plan(
-            exchange, jnp.full((1, 1), me, jnp.int32), shape, interpret=interpret
-        )
+        got = plan(exchange, jnp.full((1, 1), me, jnp.int32))
         for k, (g, w) in enumerate(zip(got.kernel_tables, want["kernel_tables"])):
             np.testing.assert_array_equal(g, w, err_msg=f"shard {me} table {k}")
         np.testing.assert_array_equal(got.expert_rows, want["expert_rows"])
