@@ -1383,6 +1383,8 @@ def _attention_call(
     in_place = (pl.BlockSpec(memory_space=pl.ANY),) * 2 if aliased else ()
     fp4 = scale_rows is not None
     transposed = not fp4 and block_q >= msa_attention.DEFAULT_BLOCK_Q
+    if prefill_body and prefill_body.startswith("T"):  # transposed body at any tile size
+        transposed, prefill_body = not fp4, prefill_body[1:] or None
     scale_inputs = (scale_cache,) if fp4 else ()
     ring = 1 + (_FP4_PREFETCH if fp4 else 1)
     # `pair` (decode, streamed): two running groups + two in flight.
