@@ -25,9 +25,10 @@ Options:
   -s, --vllm-source DIR    Local vLLM source tree to install in editable mode
       --target TARGET      Dockerfile stage to build: prod, dev, ci, or omni (default: prod)
       --vllm-rs            Compile vLLM's Rust frontend (vllm-rs) into the image; takes minutes
-      --experimental-rvllm-url URL
-                           Include the native Rust serving runtime (rvllm),
-                           downloaded from URL (gs:// or https://)
+      --experimental-rvllm-url LOCATION
+                           Include the native Rust serving runtime (rvllm) from
+                           LOCATION (https:// or a public gs:// path) holding
+                           rvllm and its metadata.json; checked against its sha256
   -h, --help               Show this help and exit
 
 Examples:

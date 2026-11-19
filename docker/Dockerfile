@@ -82,27 +82,33 @@ WORKDIR /out
 FROM vllm-rs-${BUILD_VLLM_RS} AS vllm-rs
 
 # rvllm, the native Rust serving runtime, included when WITH_EXPERIMENTAL_RVLLM=true.
-# Off by default. When enabled, downloads the binary from EXPERIMENTAL_RVLLM_DOWNLOAD_URL.
+# Off by default. EXPERIMENTAL_RVLLM_DOWNLOAD_URL is a location holding `rvllm`
+# and its `metadata.json`, the same as the launcher's --rvllm-binary location
+# (src/vllm_torchtpu/experimental/rust/README.md). The binary is checked against
+# the sha256 in metadata.json and run once.
 FROM python:3.12-slim-bookworm AS rvllm-true
 
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
 ARG EXPERIMENTAL_RVLLM_DOWNLOAD_URL
 WORKDIR /out
-# TODO: verify the download against a sha256, and support private gs:// buckets
-# (a gs:// URL is fetched over public HTTPS).
-RUN if [ -z "${EXPERIMENTAL_RVLLM_DOWNLOAD_URL}" ]; then \
-      echo "EXPERIMENTAL_RVLLM_DOWNLOAD_URL must be set when WITH_EXPERIMENTAL_RVLLM=true" >&2; exit 1; \
-    fi && \
-    case "${EXPERIMENTAL_RVLLM_DOWNLOAD_URL}" in \
-      http://*|https://*) \
-        curl -fsSL "${EXPERIMENTAL_RVLLM_DOWNLOAD_URL}" -o /out/rvllm ;; \
-      gs://*) \
-        curl -fsSL "https://storage.googleapis.com/${EXPERIMENTAL_RVLLM_DOWNLOAD_URL#gs://}" -o /out/rvllm ;; \
-      *) \
-        echo "Unsupported EXPERIMENTAL_RVLLM_DOWNLOAD_URL scheme: ${EXPERIMENTAL_RVLLM_DOWNLOAD_URL}" >&2; exit 1 ;; \
-    esac && \
-    chmod 0755 /out/rvllm
+# TODO: support private gs:// buckets; a gs:// location is fetched over public
+# HTTPS.
+RUN set -e; \
+    url="${EXPERIMENTAL_RVLLM_DOWNLOAD_URL%/}"; \
+    case "${url}" in \
+      https://*) ;; \
+      gs://*) url="https://storage.googleapis.com/${url#gs://}" ;; \
+      "") echo "EXPERIMENTAL_RVLLM_DOWNLOAD_URL must be set when WITH_EXPERIMENTAL_RVLLM=true" >&2; exit 1 ;; \
+      *) echo "EXPERIMENTAL_RVLLM_DOWNLOAD_URL must be https:// or gs://: ${url}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "${url}/metadata.json" -o /tmp/rvllm-metadata.json; \
+    curl -fsSL "${url}/rvllm" -o /out/rvllm; \
+    sha="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["sha256"])' /tmp/rvllm-metadata.json)"; \
+    echo "${sha}  /out/rvllm" | sha256sum -c -; \
+    rm /tmp/rvllm-metadata.json; \
+    chmod 0755 /out/rvllm; \
+    /out/rvllm --version
 
 # WITH_EXPERIMENTAL_RVLLM=false: no rvllm binary.
 FROM python:3.12-slim-bookworm AS rvllm-false
