@@ -136,6 +136,7 @@ if TYPE_CHECKING:
     TPU_MOE_TP_DECODE_EXCHANGE_PIECES: int = 0
     TPU_MOE_TP_DECODE_PAD_ROWS: bool = False
     USE_MOE_TP_DECODE_NVFP4_KERNEL: bool = False
+    TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -1478,8 +1479,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Serve eligible NVFP4 TP or EP x TP (TPU_MOE_EP_TP_SIZE) MoE layers
     # (sigmoid + correction-bias top-k with renormalization, one FP8 shared
     # expert, W4A8 block-quantized routed weights) with one op covering
-    # routing, the shared expert, the routed experts and the all-reduce up to
-    # 64 tokens, and the GMM path plus a psum above that
+    # routing, the shared expert, the routed experts and the all-reduce at the
+    # decode kernel's row counts up to 64 (TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64
+    # adds the larger ones),
+    # and the GMM path plus a psum at other token counts
     # (layers/adapter/moe_tp_decode_nvfp4.py). Also clamps
     # MOE_REQUANTIZE_BLOCK_SIZE per matrix on non-EP-fused NVFP4 MoE layers
     # (b13=512, b2=min(512, I_rank): 512/512 at EP2xTP4, 512/256 at TP8) so TP
@@ -1487,6 +1490,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_MOE_SKIP_PADDED_TOKENS=1. Remove once the path is the default for
     # these layers or is folded into moe_tp_decode.
     "USE_MOE_TP_DECODE_NVFP4_KERNEL": env_bool("USE_MOE_TP_DECODE_NVFP4_KERNEL"),
+    # With USE_MOE_TP_DECODE_NVFP4_KERNEL: also run the NVFP4 decode kernel at
+    # its row counts above 64 (128, plus any the FP8 kernel adds, e.g. 80 / 96)
+    # on layers whose VMEM plan fits them; off, the op runs the kernel at up to
+    # 64 rows. Off by default: 65-128-token steps then move from the GMM path
+    # to the W4A8 kernel's numerics, which no accuracy run has covered yet.
+    # Remove once the larger row counts are the default.
+    "TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64": env_bool(
+        "TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64", default=False
+    ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

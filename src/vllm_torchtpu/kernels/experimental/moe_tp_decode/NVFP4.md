@@ -27,7 +27,7 @@ from vllm_torchtpu.kernels.experimental.moe_tp_decode.nvfp4 import (
 
 # Signature (call inside jax.shard_map over an n_ranks-device 1D mesh):
 def moe_tp_decode_nvfp4(
-    x,                        # [m, H] bf16, m in ROW_BUCKETS = (16, 32, 64), replicated
+    x,                        # [m, H] bf16, m in ROW_BUCKETS (FP8's plus 128), replicated
     scores,                   # [m, E] f32 post-sigmoid router scores, replicated
     bias,                     # [E] f32 router e_score_correction_bias, replicated
     n_valid,                  # int32[], valid token count in [0, m]
@@ -76,7 +76,9 @@ layers after model load when `USE_MOE_TP_DECODE_NVFP4_KERNEL=1` and
 
 - **Decode (`n <= 64`):** `n in (16, 32, 64)` calls `moe_tp_decode_nvfp4`
   directly; `n < 16` pads `x` and `scores` to `m = 16`, runs the `m = 16`
-  bucket, and slices `[:n]`.
+  bucket, and slices `[:n]`. `TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64=1` adds the
+  row counts above 64 where they fit VMEM (128 rows: at `EP2xTP4` with
+  `b2 = 512` below, not at `TP8`).
 - **Mixed / prefill (`n > 64`):** calls `_tp_chain` (`layers/adapter/moe_tp_decode.py`)
   (`fused_moe_func` -> `gmm_v2` W4A16 + online-FP8 shared expert + `lax.psum`)
   inside the same custom op on the same K-major FP4 weights and 4D block scales,
@@ -95,6 +97,7 @@ layers after model load when `USE_MOE_TP_DECODE_NVFP4_KERNEL=1` and
 | :--- | :--- | :--- |
 | `USE_MOE_TP_DECODE_NVFP4_KERNEL` | `0` | Enables per-matrix K-major FP4 block requantization at load time and arms the fused NVFP4 TP decode op. |
 | `TPU_MOE_SKIP_PADDED_TOKENS` | `0` | Required (`=1`) so `token_padding` provides the valid-token mask consumed as `n_valid`. |
+| `TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64` | `False` | Also runs the decode kernel at its row counts above 64 (128, plus any the FP8 kernel adds) on layers whose VMEM plan fits them; off keeps the op at up to 64 rows. |
 | `MOE_REQUANTIZE_BLOCK_SIZE` | `512` (when kernel flag is `1`) | Target K-block size; clamped per matrix to `min(block, K_matrix)` when the fused EP W4A8 kernel is not used. |
 | `TPU_MOE_TP_DECODE_FAST` | `1` | Uses packed-key top-k routing, vector active-expert compaction, and peeled 4-slot ring scheduling (bitwise identical to `0`). |
 | `TPU_MOE_TP_DECODE_HBM_OPERANDS` | `drafter` | Pins large weight operands to HBM on armed layers (`''`, `'0'`, `'drafter'`, or `'all'`). |

@@ -23,13 +23,15 @@ from vllm_torchtpu.kernels.experimental.moe_tp_decode.kernel import (
     _NVFP4_NUM_BUFFERS,
     _Q_BLOCK,
     FP4,
-    ROW_BUCKETS,
     VMEM_HEADROOM,
     Nvfp4Format,
     _admit_shapes,
     _call,
     _fixed_vmem_bytes,
     exact_in_bf16,
+)
+from vllm_torchtpu.kernels.experimental.moe_tp_decode.kernel import (
+    ROW_BUCKETS as FP8_ROW_BUCKETS,
 )
 
 __all__ = [
@@ -41,6 +43,10 @@ __all__ = [
     "moe_tp_decode_nvfp4",
 ]
 
+# The NVFP4 format's decode row counts: the FP8 format's plus 128. FP4 weights
+# halve the expert ring's VMEM, which leaves room for 128 rows at some layouts
+# (each count still has to pass _vmem_plan at the layer's shapes).
+ROW_BUCKETS = (*FP8_ROW_BUCKETS, 128)
 _W2_N_CHUNK = 2048
 _GROUP_COLS = 1024
 _MAX_GROUP = 4
@@ -150,6 +156,7 @@ def can_use_moe_tp_decode_nvfp4(
         n_ranks=n_ranks,
         info=info,
         weight_dtype=FP4,
+        row_buckets=ROW_BUCKETS,
     )
     if dims is None:
         return False

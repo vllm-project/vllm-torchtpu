@@ -7,8 +7,10 @@ behind ``USE_MOE_TP_DECODE_NVFP4_KERNEL`` (default off):
   - At ``n < 16``, pads ``x`` and ``scores`` to ``m = 16``, runs
     ``moe_tp_decode_nvfp4`` (W4A8 grouped FP4 decode kernel + in-kernel
     all-reduce), and slices ``[:n]``.
-  - At ``n in (16, 32, 64)``, runs ``moe_tp_decode_nvfp4`` directly.
-  - At ``n > 64`` (mixed / prefill buckets), runs ``moe_tp_decode._tp_chain``
+  - At the kernel's row counts up to ``DEFAULT_MAX_ROWS`` (64: ``n in (16, 32,
+    64)``), or all of them with ``TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64``, that
+    the layer's VMEM plan admits, runs ``moe_tp_decode_nvfp4`` directly.
+  - At other ``n`` (mixed / prefill buckets), runs ``moe_tp_decode._tp_chain``
     (``fused_moe_func`` -> ``gmm_v2`` W4A16 + online-FP8 shared expert) plus
     ``lax.psum`` on the same K-major FP4 weights and 4D block scales, with zero
     weight duplication.
@@ -52,6 +54,22 @@ _OPS: dict[tuple, Any] = {}
 class _OpStatics(fp8_decode._OpStatics):
     split_meta: bool = True
     w2_n_chunk: int = 2048
+    # TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64: also run the decode kernel above 64 rows.
+    rows_above_64: bool = False
+
+
+# The largest row count the op serves with the kernel by default: the counts it
+# had before larger buckets existed. Larger ones change which path (and so which
+# numerics) 65-128-token steps take, and stay opt-in.
+DEFAULT_MAX_ROWS = 64
+
+
+def _row_buckets(rows_above_64: bool) -> tuple[int, ...]:
+    """The kernel's row counts the op tries: up to DEFAULT_MAX_ROWS, or all of
+    them with TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64."""
+    return tuple(
+        m for m in kernel.ROW_BUCKETS if rows_above_64 or m <= DEFAULT_MAX_ROWS
+    )
 
 
 def moe_tp_decode_nvfp4_supported(quant_method: Any) -> bool:
@@ -120,6 +138,8 @@ def _admit(
     )
     from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4MoEMethod
 
+    rows_above_64 = bool(envs.TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64)
+
     def _pre_check() -> str | None:
         if enable_pipelined_collective_and_compute():
             return "the MoE path owns its collectives (TPU_MOE_COLLECTION_CHUNK_SIZE)"
@@ -138,7 +158,7 @@ def _admit(
         quant_cls=VllmNvfp4MoEMethod,
         pre_check=_pre_check,
         get_scales=_get_scales,
-        row_buckets=kernel.ROW_BUCKETS,
+        row_buckets=_row_buckets(rows_above_64),
         can_use_fn=kernel.can_use_moe_tp_decode_nvfp4,
         no_rows_msg=lambda w13, scales, shared: (
             f"the kernel admits no token count (w13 {list(w13.shape)} "
@@ -148,6 +168,7 @@ def _admit(
         build_statics=lambda base, _rnr, _hid, _topk, _scales, _shared: _OpStatics(
             **base,
             split_meta=bool(envs.TPU_MOE_TP_DECODE_SPLIT_META),
+            rows_above_64=rows_above_64,
         ),
         proposed_routed=proposed_routed,
         pre_load=pre_load,
@@ -194,19 +215,23 @@ def _op_body(
     above_fn: Any = None,
 ):
     """Per-rank body under ``shard_map`` over ``axis``."""
+    row_buckets = _row_buckets(statics.rows_above_64)
     return fp8_decode._make_op_body(
         statics,
         n_ranks,
         axis,
-        row_buckets=kernel.ROW_BUCKETS,
-        can_use_fn=lambda x, scores, bias, *weights: kernel.can_use_moe_tp_decode_nvfp4(
-            x,
-            scores,
-            bias,
-            *weights,
-            topk=statics.topk,
-            n_ranks=n_ranks,
-            w2_n_chunk=statics.w2_n_chunk,
+        row_buckets=row_buckets,
+        can_use_fn=lambda x, scores, bias, *weights: (
+            x.shape[0] in row_buckets
+            and kernel.can_use_moe_tp_decode_nvfp4(
+                x,
+                scores,
+                bias,
+                *weights,
+                topk=statics.topk,
+                n_ranks=n_ranks,
+                w2_n_chunk=statics.w2_n_chunk,
+            )
         ),
         decode_fn=lambda x, scores, bias, n_valid, rank, *weights_and_e0: (
             kernel.moe_tp_decode_nvfp4(

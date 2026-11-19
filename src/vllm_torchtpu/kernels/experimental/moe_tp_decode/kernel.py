@@ -256,6 +256,7 @@ def _admit_shapes(
     n_ranks: int,
     info,
     weight_dtype,
+    row_buckets: tuple[int, ...] = ROW_BUCKETS,
 ) -> _Dims | None:
     """The admission checks every weight format shares: the hardware (one
     TensorCore per device, an FP8 x FP8 MXU), the shapes of all operands but
@@ -270,7 +271,7 @@ def _admit_shapes(
     m, h = x.shape
     experts, i, out = w2.shape
     num_experts, shared_inter = scores.shape[1], shared_w2.shape[0]
-    if m not in ROW_BUCKETS or scores.shape != (m, num_experts):
+    if m not in row_buckets or scores.shape != (m, num_experts):
         return None
     # This rank's experts are a linear block of the router's num_experts
     # (experts == num_experts under plain TP).
