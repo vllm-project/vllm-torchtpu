@@ -291,7 +291,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
            max_groups: int | None = None, phys: bool = False, dcp: int = 1, dcp_pool: bool = True,
            shared_kv: bool = False, cdcp: bool = False, cdcp_keys: bool = True, ck_fn=None,
            async_dma: bool = False, B: int | None = None, xreq: int = 0,
-           skip_idle: bool = False):
+           skip_idle: bool = False, xmerge: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -332,7 +332,8 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
     long_kw = dict(carrier="bf16", chunk_pages=8, hbm_tables=True, per_request_scores=True,
                    bounded_chunks=True, shard_index=shard, union_attn=union,
                    union_stats=stats, union_phys=phys, loop_requests=loop, dcp=dcp,
-                   compressed_dcp=cdcp, xreq_prefetch=xreq, skip_idle=skip_idle)
+                   compressed_dcp=cdcp, xreq_prefetch=xreq, skip_idle=skip_idle,
+                   **(dict(xmerge=True) if xmerge else {}))
     spec = wholestep_spec(
         G,
         R,
@@ -1331,3 +1332,91 @@ def test_xreq_prefetch_wrong_request_is_caught(monkeypatch):
                  ctx=CTX_XREQ, async_dma=True, xreq=1)
     with pytest.raises(AssertionError):
         _assert_xreq_identical(base, run)
+
+
+# Main-call geometry (T = 4, 16-row tile: 4 request slots, 2 per rank at R = 2): live
+# requests first, then idle slots (context 0) for B < 16.
+CTX_MAIN = [3001, 100, 2000, 777]
+
+
+def _main_run(monkeypatch, B: int, dcp: int = 1, **kw):
+    """`_run_c` in the served main-call form (sharded selection, union attention, request
+    loop, async selection DMAs, both cross-request prefetches)."""
+    from vllm_torchtpu.models.vllm.qwen4_exp import pool_layout
+
+    nlive = B // 4
+    run_kw = dict(long=True, rank_ids=True, union=True, shard=True, loop=True, B=B,
+                  ctx=CTX_MAIN[:nlive] + [0] * (4 - nlive), async_dma=True, xreq=3)
+    if dcp > 1:
+        monkeypatch.setenv(pool_layout.MAIN_KV_DCP_ENV, str(dcp))
+        run_kw.update(dcp=dcp, shared_kv=True)
+    run_kw.update(kw)
+    return _run_c(**run_kw)
+
+
+def _assert_live_identical(base: tuple, run: tuple, nlive: int) -> None:
+    """Every live row / request output byte-identical (idle request slots' cache rows are
+    unwritten under `skip_idle` and read by no one)."""
+    for i, name in ((0, "residual"), (7, "ids")):
+        np.testing.assert_array_equal(run[i], base[i], err_msg=name)
+    for i, name in ((3, "ck_new"), (4, "ring_new")):
+        np.testing.assert_array_equal(run[i][:, :nlive], base[i][:, :nlive], err_msg=name)
+    for k in ("_kr_new", "_ir_new"):
+        np.testing.assert_array_equal(run[8][k], base[8][k], err_msg=k)
+
+
+@pytest.mark.parametrize("B,dcp", [(4, 1), (8, 1), (16, 1), (8, 2)])
+def test_qsa_xmerge_bit_identical(monkeypatch, B, dcp):
+    """VLLM_TPU_MK_QSA_XMERGE: the selection rows and the unions in one exchange per QSA
+    layer; every output byte-identical (b4 / b8 / b16-like tiles, with idle request slots
+    at b4 / b8, with and without main-KV DCP)."""
+    base = _main_run(monkeypatch, B, dcp)
+    run = _main_run(monkeypatch, B, dcp, xmerge=True)
+    assert np.isfinite(base[0]).all()
+    _assert_live_identical(base, run, 4)
+
+
+def test_qsa_xmerge_unrolled_bit_identical():
+    """The merged exchange from the unrolled sharded path (no request loop)."""
+    kw = dict(long=True, rank_ids=True, union=True, shard=True, async_dma=True)
+    base = _run_c(**kw)
+    run = _run_c(**kw, xmerge=True)
+    _assert_live_identical(base, run, 2)
+
+
+@pytest.mark.parametrize("B", [4, 8, 16])
+def test_main_skip_idle_and_xmerge_bit_identical(monkeypatch, B):
+    """VLLM_TPU_MK_WHOLE_SKIP_IDLE on the main-call geometry (1 / 2 / 4 live requests of 4
+    slots), alone and with the merged exchange: live outputs byte-identical to the full
+    request loops."""
+    nlive = B // 4
+    base = _main_run(monkeypatch, B)
+    skip = _main_run(monkeypatch, B, skip_idle=True)
+    both = _main_run(monkeypatch, B, skip_idle=True, xmerge=True)
+    _assert_live_identical(base, skip, nlive)
+    _assert_live_identical(base, both, nlive)
+
+
+def test_qsa_xmerge_lost_union_is_caught(monkeypatch):
+    """Mutation: the peer's union payload of the merged row arrives zeroed (mis-packed
+    exchange); the comparison must fail."""
+    from jax.experimental import pallas as pl
+
+    from vllm_torchtpu.megakernel.wholestep import qsa_full_c as qc
+
+    base = _main_run(monkeypatch, 16)
+    orig = qc.QSAFullIndexedBlock._gather_runs
+
+    def lossy(self, ctx, send, recv, ssem, rsem, own_rank=False):  # noqa: ANN001
+        orig(self, ctx, send, recv, ssem, rsem, own_rank)
+        if getattr(self, "xmerge", False):
+            u0, wm = self._xmerge_width(ctx.ex)
+            peer = 1 - self._run(ctx)
+            recv[peer, :, :, pl.ds(u0, wm - u0)] = jnp.zeros(
+                (recv.shape[1], 1, wm - u0), jnp.int32
+            )
+
+    monkeypatch.setattr(qc.QSAFullIndexedBlock, "_gather_runs", lossy)
+    run = _main_run(monkeypatch, 16, xmerge=True)
+    with pytest.raises(AssertionError):
+        _assert_live_identical(base, run, 4)

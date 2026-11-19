@@ -107,6 +107,18 @@ def indexed_options() -> dict:
     )
 
 
+def main_call_options() -> dict:
+    """Main whole-step call only (the draft passes its own `skip_idle`): VLLM_TPU_MK_QSA_XMERGE
+    (one exchange per QSA layer) and VLLM_TPU_MK_WHOLE_SKIP_IDLE (request loops stop after
+    the last live request). Empty when both are off, so the spec is unchanged."""
+    out: dict = {}
+    if envs.VLLM_TPU_MK_QSA_XMERGE:
+        out["xmerge"] = True
+    if envs.VLLM_TPU_MK_WHOLE_SKIP_IDLE and LOOP_REQUESTS:
+        out["skip_idle"] = True
+    return out
+
+
 # VLLM_TPU_MK_BUCKET_TUNE: knob overrides per row bucket (core `Tiles` fields or
 # `<block>.<field>` tunables), measured with tpu_bench_wholestep_call (~/q38f/d1/BUCKETS.md).
 # rel_fetch (trace-time-decoded dense refills; exact): j-01f264b1, bitwise at b4/b8/b16,
@@ -320,6 +332,7 @@ def build_wholestep_call(
                 carrier="fp8",
                 n_layers=n_layers,
                 **indexed_options(),
+                **main_call_options(),
             ),
             hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
         )
