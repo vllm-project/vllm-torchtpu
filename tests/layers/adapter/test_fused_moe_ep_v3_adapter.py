@@ -147,9 +147,11 @@ def armed(monkeypatch):
     return built
 
 
-def _prebuild(layer):
+def _prebuild(layer, renormalize=True):
     with patch.object(v3, "ep_mesh_index", return_value=0):
-        v3.prebuild_fused_moe_ep(layer, topk=2, renormalize=True, activation="silu")
+        v3.prebuild_fused_moe_ep(
+            layer, topk=2, renormalize=renormalize, activation="silu"
+        )
     return getattr(layer, "_tpu_fused_ep_eligible", False)
 
 
@@ -200,6 +202,15 @@ def test_simulated_routing_is_refused(armed, monkeypatch):
     monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", object())
     monkeypatch.setattr(moe_routing, "_strategy_name", "uniform_random")
     assert not _prebuild(_layer(slots=4))
+
+
+def test_raw_router_weights_are_refused(armed):
+    """The kernel refuses renormalize=False at trace time (no TPU case covers
+    the raw weights), so the bridge declines such a layer up front, as it
+    declines the other routing it cannot serve, and the layer keeps the
+    grouped-matmul path."""
+    assert not _prebuild(_layer(slots=4), renormalize=False)
+    assert "local_experts" not in armed
 
 
 def test_the_softmax_router_is_admitted(armed):
