@@ -176,7 +176,7 @@ def test_rotated_sweep_holds_no_collective(monkeypatch, synthetic, optional_path
     sampler_graphs: dict[str, list[torch.fx.GraphModule]] = {}
     for name in (
         "_greedy_rejection_sample_with_segment",
-        "_greedy_rejection_sample_from_argmax",
+        "_greedy_rejection_sample_from_tokens",
         "_random_rejection_sample_with_segment",
     ):
         sampler_graphs[name] = []
@@ -232,10 +232,6 @@ def test_rotated_sweep_holds_no_collective(monkeypatch, synthetic, optional_path
         return 2 if optional_paths else 0
 
     runner._topk_candidate_blocks = topk_candidate_blocks
-    token_graphs: list[torch.fx.GraphModule] = []
-    runner.spec_bonus_and_target_tokens = functools.partial(
-        _recording(TPUModelRunner.spec_bonus_and_target_tokens, token_graphs), None
-    )
     runner._precompile_top_token_verify = functools.partial(
         TPUModelRunner._precompile_top_token_verify, runner
     )
@@ -262,9 +258,11 @@ def test_rotated_sweep_holds_no_collective(monkeypatch, synthetic, optional_path
         3 if optional_paths else 2
     )
     # The optional paths ran only when enabled.
-    assert bool(token_graphs) == optional_paths
+    assert bool(sampler_graphs["_greedy_rejection_sample_from_tokens"]) == (
+        optional_paths
+    )
     assert candidate_calls
-    assert [op for gm in graphs + token_graphs for op in _ops_outside_aten(gm)] == []
+    assert [op for gm in graphs for op in _ops_outside_aten(gm)] == []
 
 
 @torch.library.custom_op("rotation_sweep_test::exchange", mutates_args=())

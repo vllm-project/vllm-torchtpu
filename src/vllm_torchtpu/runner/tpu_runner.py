@@ -5963,12 +5963,10 @@ class TPUModelRunner(GPUModelRunner):
         assert self.speculative_config is not None
         draft_token_ids = md.draft_token_ids
         target_logits: torch.Tensor | None = None
-        target_argmax: torch.Tensor | None = None
         params: _ChunkSamplingParams | None = None
         if top_tokens:
-            bonus_token_ids, target_argmax = self.spec_bonus_and_target_tokens(
-                logits, md.bonus_logits_indices, md.target_logits_indices
-            )
+            # The bonus and target rows are gathered in the verify program.
+            bonus_token_ids = None
         else:
             min_toks = min_toks or {}
             min_tokens_rows = None
@@ -6052,6 +6050,18 @@ class TPUModelRunner(GPUModelRunner):
         temperatures = top_k = top_p = recover_u = None
         topk_candidates = 0
         apply_topk_topp = True
+        if top_tokens:
+            return self.rejection_sampler.greedy_from_tokens(
+                logits,
+                md.bonus_logits_indices,
+                md.target_logits_indices,
+                draft_token_ids,
+                md.draft_lengths,
+                md.segment_ids,
+                md.group_indices,
+                self.speculative_config.num_speculative_tokens,
+                accept_u,
+            )
         if do_sampling:
             assert params is not None and target_logits is not None
             temperatures = params.temperatures[md.segment_ids]
@@ -6077,7 +6087,6 @@ class TPUModelRunner(GPUModelRunner):
             recover_u=recover_u,
             do_sampling=do_sampling,
             topk_candidates=topk_candidates,
-            target_argmax=target_argmax,
             apply_topk_topp=apply_topk_topp,
         )
 
@@ -8088,19 +8097,16 @@ class TPUModelRunner(GPUModelRunner):
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
         tokens = torch.zeros((num_tokens, 1), dtype=torch.int64).to(self.device)
-        bonus_token_ids, target_argmax = self.spec_bonus_and_target_tokens(
-            tokens, bonus_logits_indices, target_logits_indices
-        )
-        out = self.rejection_sampler(
-            draft_token_ids=draft_token_ids,
-            num_draft_tokens=draft_lengths,
-            target_logits=None,
-            bonus_token_ids=bonus_token_ids,
-            segment_ids=segment_ids,
-            group_indices=group_indices,
-            max_draft_tokens=self.speculative_config.num_speculative_tokens,
-            accept_u=warm_accept_u if self.rejection_sampler.synthetic_mode else None,
-            target_argmax=target_argmax,
+        out = self.rejection_sampler.greedy_from_tokens(
+            tokens,
+            bonus_logits_indices,
+            target_logits_indices,
+            draft_token_ids,
+            draft_lengths,
+            segment_ids,
+            group_indices,
+            self.speculative_config.num_speculative_tokens,
+            warm_accept_u if self.rejection_sampler.synthetic_mode else None,
         )
         synchronize_tensors(out)
 
@@ -9958,19 +9964,6 @@ class TPUModelRunner(GPUModelRunner):
         )
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_token_ids, target_logits
-
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def spec_bonus_and_target_tokens(
-        self,
-        tokens: torch.Tensor,
-        bonus_logits_indices: torch.Tensor,
-        target_logits_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # spec_bonus_and_target_logits on the greedy tokens ([rows, 1]) of
-        # TPU_GREEDY_TOP_TOKENS: the same rows, already argmaxed.
-        bonus_token_ids = torch.index_select(tokens, 0, bonus_logits_indices)
-        target_argmax = torch.index_select(tokens, 0, target_logits_indices)
-        return bonus_token_ids.view(-1), target_argmax.view(-1)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_gather_bonus_and_target_logits(

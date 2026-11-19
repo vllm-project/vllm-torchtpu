@@ -73,7 +73,6 @@ def _runner(*, all_greedy: bool = True, spec_k: int | None = None) -> SimpleName
         TPUModelRunner._apply_temperature,
         TPUModelRunner._sampler_applies_topk_topp,
         TPUModelRunner.spec_bonus_and_target_logits,
-        TPUModelRunner.spec_bonus_and_target_tokens,
         TPUModelRunner.spec_gather_bonus_and_target_logits,
     ):
         setattr(runner, fn.__name__, fn.__get__(runner))

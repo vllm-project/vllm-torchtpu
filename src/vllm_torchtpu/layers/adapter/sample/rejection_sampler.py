@@ -70,7 +70,6 @@ class RejectionSampler:
         recover_u: torch.Tensor | None = None,
         do_sampling: bool = False,
         topk_candidates: int = 0,
-        target_argmax: torch.Tensor | None = None,
         apply_topk_topp: bool = True,
         draft_probs: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -89,9 +88,40 @@ class RejectionSampler:
             recover_u=recover_u,
             do_sampling=do_sampling,
             topk_candidates=topk_candidates,
-            target_argmax=target_argmax,
             apply_topk_topp=apply_topk_topp,
             draft_probs=draft_probs,
+        )
+
+    def greedy_from_tokens(
+        self,
+        tokens: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        max_draft_tokens: int,
+        accept_u: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Greedy rejection on each verify row's greedy token (`tokens`
+        `[rows, 1]`, TPU_GREEDY_TOP_TOKENS) in place of logits: the bonus and
+        target gathers and the acceptance in one program. Returns as
+        `forward`."""
+        if self.synthetic_mode and accept_u is None:
+            raise ValueError("Synthetic rejection sampling requires accept_u.")
+        return _greedy_rejection_sample_from_tokens(
+            draft_token_ids,
+            tokens,
+            bonus_logits_indices,
+            target_logits_indices,
+            num_draft_tokens,
+            segment_ids,
+            group_indices,
+            max_draft_tokens,
+            accept_u,
+            self.synthetic_conditional_rates,
+            self.synthetic_mode,
         )
 
     def forward(
@@ -110,7 +140,6 @@ class RejectionSampler:
         recover_u: torch.Tensor | None = None,
         do_sampling: bool = False,
         topk_candidates: int = 0,
-        target_argmax: torch.Tensor | None = None,
         apply_topk_topp: bool = True,
         draft_probs: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -136,8 +165,6 @@ class RejectionSampler:
             keeps the existing greedy rejection path.
           topk_candidates: Candidate vocab blocks for small top-k; 0 searches
             the full vocab. See `apply_top_k_top_p_candidates`.
-          target_argmax: The target's greedy token per row, standing in for
-            target_logits on the greedy path (TPU_GREEDY_TOP_TOKENS).
           apply_topk_topp: False skips `apply_top_k_top_p` on the non-greedy
             path. The caller passes False only when no request sets top-k or
             top-p, where the two 32-step bisections over the vocabulary are
@@ -152,11 +179,8 @@ class RejectionSampler:
           accepted tokens and bonus tokens, padded with PLACEHOLDER_TOKEN_ID.
         """
         if do_sampling:
-            if target_argmax is not None or target_logits is None:
-                raise ValueError(
-                    "Non-greedy rejection sampling needs target_logits, not "
-                    "target_argmax."
-                )
+            if target_logits is None:
+                raise ValueError("Non-greedy rejection sampling needs target_logits.")
             if (
                 temperatures is None
                 or top_k is None
@@ -210,23 +234,8 @@ class RejectionSampler:
             )
         if self.synthetic_mode and accept_u is None:
             raise ValueError("Synthetic rejection sampling requires accept_u.")
-        if target_argmax is not None:
-            return _greedy_rejection_sample_from_argmax(
-                draft_token_ids,
-                target_argmax,
-                num_draft_tokens,
-                bonus_token_ids,
-                segment_ids,
-                group_indices,
-                max_draft_tokens,
-                accept_u,
-                self.synthetic_conditional_rates,
-                self.synthetic_mode,
-            )
         if target_logits is None:
-            raise ValueError(
-                "Greedy rejection sampling needs target_logits or target_argmax."
-            )
+            raise ValueError("Greedy rejection sampling needs target_logits.")
         return _greedy_rejection_sample_with_segment(
             draft_token_ids,
             target_logits,
@@ -299,11 +308,12 @@ def _greedy_rejection_sample_with_segment(
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def _greedy_rejection_sample_from_argmax(
+def _greedy_rejection_sample_from_tokens(
     draft_token_ids: torch.Tensor,
-    target_argmax: torch.Tensor,
+    tokens: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
     num_draft_tokens: torch.Tensor,
-    bonus_token_ids: torch.Tensor,
     segment_ids: torch.Tensor,
     group_indices: torch.Tensor,
     max_draft_tokens: int,
@@ -311,7 +321,9 @@ def _greedy_rejection_sample_from_argmax(
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
 ) -> torch.Tensor:
-    """Greedy validation from the target's argmax tokens, without logits."""
+    """Greedy validation from each verify row's greedy token, without logits."""
+    bonus_token_ids = torch.index_select(tokens, 0, bonus_logits_indices).view(-1)
+    target_argmax = torch.index_select(tokens, 0, target_logits_indices).view(-1)
     return _greedy_rejection_sample(
         draft_token_ids,
         target_argmax.to(torch.int32),

@@ -324,10 +324,8 @@ def test_rejection_sampler_greedy_scenarios(case: RejectionSamplerCase, device):
 
 
 @pytest.mark.parametrize("case", GREEDY_CASES, ids=lambda c: c.name)
-def test_rejection_sampler_greedy_from_target_argmax(
-    case: RejectionSamplerCase, device
-):
-    """TPU_GREEDY_TOP_TOKENS verifies on the target's argmax tokens; the
+def test_rejection_sampler_greedy_from_tokens(case: RejectionSamplerCase, device):
+    """TPU_GREEDY_TOP_TOKENS verifies on each verify row's greedy token; the
     result must equal the target_logits path."""
     sampler = RejectionSampler()
     segment_ids, group_indices = _segment_info(case.num_draft_per_seq, device)
@@ -348,13 +346,23 @@ def test_rejection_sampler_greedy_from_target_argmax(
     target_logits = _target_logits_from_tokens(case.target_tokens, device)
 
     from_logits = sampler(target_logits=target_logits, **inputs)
-    from_argmax = sampler(
-        target_logits=None,
-        target_argmax=torch.argmax(target_logits, dim=-1),
-        **inputs,
+    # The verify rows' tokens: the targets' argmax, then the bonus tokens.
+    num_target = target_logits.shape[0]
+    tokens = torch.cat(
+        [torch.argmax(target_logits, dim=-1), inputs["bonus_token_ids"]]
+    ).view(-1, 1)
+    from_tokens = sampler.greedy_from_tokens(
+        tokens,
+        num_target + torch.arange(len(case.bonus_tokens), device=device),
+        torch.arange(num_target, device=device),
+        inputs["draft_token_ids"],
+        inputs["num_draft_tokens"],
+        segment_ids,
+        group_indices,
+        inputs["max_draft_tokens"],
     )
 
-    assert torch.equal(from_argmax, from_logits)
+    assert torch.equal(from_tokens, from_logits)
 
 
 def test_rejection_sampler_synthetic_converts_to_conditional_rates(device):

@@ -401,7 +401,7 @@ def test_synthetic_verify_on_top_tokens_matches_full_logits(monkeypatch, seed):
     assert torch.equal(top, full)
 
 
-def test_rejection_sampler_refuses_argmax_for_sampling():
+def test_rejection_sampler_refuses_sampling_without_logits():
     with pytest.raises(ValueError, match="needs target_logits"):
         RejectionSampler()(
             draft_token_ids=torch.zeros(1, dtype=torch.int32),
@@ -412,7 +412,6 @@ def test_rejection_sampler_refuses_argmax_for_sampling():
             group_indices=torch.zeros(1, dtype=torch.int32),
             max_draft_tokens=1,
             do_sampling=True,
-            target_argmax=torch.zeros(1, dtype=torch.int64),
         )
 
 
