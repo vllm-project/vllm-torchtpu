@@ -69,8 +69,9 @@ CASES = [  # (nv per row, K, ties, D)
 ]
 
 
+@pytest.mark.parametrize("digit", [1, 3])
 @pytest.mark.parametrize("nvs,K,ties,D", CASES)
-def test_chunked_selection_matches_full(nvs, K, ties, D):
+def test_chunked_selection_matches_full(nvs, K, ties, D, digit):
     S, G, n, gpp, CH, CM = 512, 65536, len(nvs), 128, 32, 64
     bits_raw = _scores(len(nvs) + sum(nvs) + K, n, S, ties)
     p = jnp.arange(S)[:, None] * 128 + jnp.arange(128)[None]
@@ -86,7 +87,8 @@ def test_chunked_selection_matches_full(nvs, K, ties, D):
         return jax.lax.dynamic_slice(a, (0, base(c), 0), (n, CH, 128))
 
     thr2, tmax2 = ix.thresholds_chunks(
-        lambda c: chunk(bits, c), lambda c: chunk(ids, c), m, nv, K, G, (n, CH, 128)
+        lambda c: chunk(bits, c), lambda c: chunk(ids, c), m, nv, K, G, (n, CH, 128),
+        digit=digit,
     )
     np.testing.assert_array_equal(thr2, thr)
     np.testing.assert_array_equal(tmax2, tmax)
@@ -119,6 +121,26 @@ def test_chunked_selection_matches_full(nvs, K, ties, D):
             acc = acc + part
         np.testing.assert_array_equal(acc.astype(I32), want, err_msg=f"row {r}")
         assert int(tot[0, 0]) == kept
+
+
+@pytest.mark.parametrize("digit", [2, 3, 4])
+def test_digit_thresholds_match(digit):
+    """Several bits per bisection pass: same thresholds on tie-heavy and plain rows."""
+    S, G, n, K, CH = 64, 8192, 4, 64, 8
+    for key, ties in ((1, True), (2, False)):
+        bits_raw = _scores(key, n, S, ties)
+        ids = jnp.broadcast_to(jnp.arange(S)[:, None] * 128 + jnp.arange(128)[None], (n, S, 128))
+        nv = jnp.asarray([3000, 3001, 8192, 40], I32).reshape(n, 1, 1)
+        bits = jnp.where(ids < nv, bits_raw, -1)
+        want = ix.thresholds(bits, ids, nv, K, G)
+
+        def chunk(a, c):
+            return jax.lax.dynamic_slice(a, (0, c * CH, 0), (n, CH, 128))
+
+        got = ix.thresholds_chunks(lambda c: chunk(bits, c), lambda c: chunk(ids, c), S // CH,
+                                   nv, K, G, (n, CH, 128), digit=digit)
+        np.testing.assert_array_equal(got[0], want[0])
+        np.testing.assert_array_equal(got[1], want[1])
 
 
 def test_off_by_one_chunk_bound_is_caught():
