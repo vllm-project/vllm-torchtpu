@@ -114,14 +114,22 @@ def images(layout):
 
 
 def test_image_blocks_match_as_with_vllm_hashes():
+    """Including images that end past the prompt's last full block, so the
+    first decode-time call picks the image index to start from; the twins
+    differ only in the block that call hashes."""
     rng = random.Random(1)
-    trunk = [rng.randrange(150_000) for _ in range(BLOCK * 8)]
+    trunk = [rng.randrange(150_000) for _ in range(BLOCK * 8 + 5)]
     layouts = [
         [],
         [("a", BLOCK * 3 + 2, BLOCK)],
         [("b", BLOCK * 3 + 2, BLOCK)],
         [("a", BLOCK * 3 + 2, BLOCK), ("c", BLOCK * 6, BLOCK - 3)],
         [("a", 0, BLOCK * 2 + 5), ("b", BLOCK * 4, 3)],
+        [("d", BLOCK * 8 - 2, 6)],
+        [("d", BLOCK * 8 + 2, 3)],
+        [("e", BLOCK * 8 + 2, 3)],
+        [("a", BLOCK * 3 + 2, BLOCK), ("d", BLOCK * 8 + 2, 3)],
+        [("a", BLOCK * 3 + 2, BLOCK), ("e", BLOCK * 8 + 2, 3)],
     ]
     output = [rng.randrange(150_000) for _ in range(BLOCK * 2 + 3)]
 
