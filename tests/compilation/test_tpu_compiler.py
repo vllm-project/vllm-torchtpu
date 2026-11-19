@@ -92,6 +92,19 @@ def fake_backend(monkeypatch):
     return _install_fake_backend(monkeypatch)
 
 
+def _runtime_hashed_files() -> tuple[Path, set[str]]:
+    """The source root and the files under it that the runtime cache key
+    hashes, relative to that root."""
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    source_root = Path(tpu_compiler.__file__).resolve().parents[2]
+    hashed = {
+        path.relative_to(source_root).as_posix()
+        for path in tpu_compiler._iter_runtime_cache_key_files(source_root)
+    }
+    return source_root, hashed
+
+
 class TestTpuCompilerCache:
     @staticmethod
     def _config(
@@ -357,11 +370,7 @@ class TestTpuCompilerCache:
     def test_runtime_hash_covers_custom_op_boundaries(self):
         from vllm_torchtpu.compilation import tpu_compiler
 
-        source_root = Path(tpu_compiler.__file__).resolve().parents[2]
-        hashed = {
-            path.relative_to(source_root).as_posix()
-            for path in tpu_compiler._iter_runtime_cache_key_files(source_root)
-        }
+        source_root, hashed = _runtime_hashed_files()
         # sharded_jax_op is the legacy helper some ops still register with.
         custom_op_boundaries = {
             path.relative_to(source_root).as_posix()
@@ -1351,12 +1360,5 @@ class TestSingleSizeCompile:
 def test_runtime_cache_key_covers_the_qwen3_5_kernel_copies():
     """The Qwen3.5 kernel copies run behind custom-op boundaries like the
     shared kernels, so their source must be part of the runtime cache key."""
-    import vllm_torchtpu
-    from vllm_torchtpu.compilation import tpu_compiler
-
-    repo_root = Path(vllm_torchtpu.__file__).resolve().parent.parent
-    hashed = {
-        p.relative_to(repo_root).as_posix()
-        for p in tpu_compiler._iter_runtime_cache_key_files(repo_root)
-    }
+    _, hashed = _runtime_hashed_files()
     assert "vllm_torchtpu/models/qwen3_5/kernels/gdn/wrapper.py" in hashed
