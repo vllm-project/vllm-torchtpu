@@ -126,8 +126,15 @@ def pp_permute_op(mesh: Mesh, num_tensors: int = 1):
         )
         name = f"vllm_torchtpu::pp_permute{num_tensors}"
 
+    # The program is the same for every pipeline column and only its device
+    # assignment differs, which torch_tpu's compile cache does not key on: a
+    # column restored from a shared cache would load another column's
+    # executable ("local device count is 0"). Name the program after its
+    # devices so each column's cache entry is its own.
+    devices = "_".join(str(int(d.id)) for d in mesh.devices.flat)
+    shift.__name__ = f"pp_permute{num_tensors}_dev{devices}"
     op = jax_op(
-        name,
+        f"{name}_dev{devices}",
         shift,
         mesh=mesh,
         input_partition_specs=(spec,) * num_tensors,
