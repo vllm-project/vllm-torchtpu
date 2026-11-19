@@ -79,7 +79,7 @@ def main():
     p.add_argument("--hidden", type=int, default=2816)
     p.add_argument("--inter", type=int, default=704)
     p.add_argument("--rows", type=int, default=0, help="0: B rounded up to 16")
-    p.add_argument("--ar-dtype", default="float32", choices=["float32", "bfloat16"])
+    p.add_argument("--ar-dtype", default="bfloat16", choices=["float32", "bfloat16"])
     p.add_argument("--batches", default="1,16,64")
     p.add_argument("--steps", default="4,16")
     p.add_argument("--reps", type=int, default=20)

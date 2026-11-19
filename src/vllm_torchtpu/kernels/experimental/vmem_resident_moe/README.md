@@ -169,7 +169,9 @@ identical. µs per step:
   rounds, far below ICI link rates. A reduce-scatter + all-gather (half the
   bytes) and overlapping rounds are the next levers.
 * bf16 wire numerics: max abs error 0.585 against the f32 oracle over 4 steps
-  (|ref| ≈ 4). It is a precision trade, not a free win.
+  (|ref| ≈ 4). It is a precision trade, not a free win. The experiment owner
+  accepted it (2026-11-19), so `layer_bench.py` now defaults to
+  `--ar-dtype bfloat16`. `float32` stays available as the exact arm.
 * Noise: the no-AR arms do not depend on the wire dtype, yet B = 64
   streamed/no-AR read 17.4 µs in one run and 22.3 µs in the other, and B = 1
   rows swing by ~2 µs. A single run resolves about ±25%. Rows below 1.2× are
