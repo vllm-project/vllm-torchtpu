@@ -15,26 +15,99 @@
 
 Where a structured-output request's grammar admits exactly one continuation
 string, the tokens of that string are known before the model runs. GaaD plans
-them into the request's draft row with flag ``GRAMMAR``: the rejection sampler
-can accept a ``GRAMMAR`` slot without comparing it with the target, while a
-rejected ``MODEL`` slot ahead of it still rejects it, as it rejects every later
-slot.
+them into the request's draft row with flag ``GRAMMAR``; the rejection sampler
+accepts a ``GRAMMAR`` slot without comparing it with the target, and a rejected
+``MODEL`` slot ahead of it still rejects it, as it rejects every later slot.
 
-This module holds the host-side planner: ``GrammarCursor`` walks the request's
-grammar matcher along a row, ``plan_draft_row`` merges the drafter's proposal
-with the forced tokens, ``plan_request`` replaces a request's drafts with its
-planned row, and ``scheduled_flags`` trims each row's flags to the drafts the
-scheduler scheduled.
+Each row is planned in ``Scheduler.schedule()``, before the step is dispatched,
+from the grammar state after the previous step's tokens and from the drafter's
+proposal for this step. Both are on the host only with async scheduling off, so
+GaaD turns async scheduling off (``check_config``).
+
+GaaD is on when ``--additional-config`` has a ``gaad`` entry, for example
+``{"gaad": {"draft_tokens": 3}}``. A row has ``num_speculative_tokens`` slots.
+The model drafter fills at most ``draft_tokens`` of them (all of them when
+unset) and the grammar may force tokens into the rest, so a wide row costs the
+drafter nothing. The runner computes target logits only for ``MODEL`` slots and
+the bonus slot.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from vllm_torchtpu.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+
+logger = init_logger(__name__)
 
 DRAFT_FLAG_EMPTY = 0
 DRAFT_FLAG_MODEL = 1
 DRAFT_FLAG_GRAMMAR = 2
+
+
+def _options(vllm_config: VllmConfig) -> Any:
+    """The ``gaad`` entry of ``additional_config``; None when GaaD is off."""
+    additional_config = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional_config, dict):
+        return None
+    return additional_config.get("gaad")
+
+
+def is_enabled(vllm_config: VllmConfig) -> bool:
+    """Whether ``additional_config`` turns GaaD on."""
+    return _options(vllm_config) is not None
+
+
+def draft_limit(vllm_config: VllmConfig) -> int:
+    """How many slots of a row the model drafter fills."""
+    assert vllm_config.speculative_config is not None
+    k = vllm_config.speculative_config.num_speculative_tokens
+    options = _options(vllm_config)
+    if options is None:
+        return k
+    return options.get("draft_tokens", k)
+
+
+def check_config(vllm_config: VllmConfig) -> None:
+    """Validates a GaaD configuration and turns async scheduling off for it."""
+    speculative_config = vllm_config.speculative_config
+    options = _options(vllm_config)
+    if options is None:
+        return
+    if not isinstance(options, dict):
+        raise ValueError(f'additional_config["gaad"] must be a dict, got {options!r}.')
+    unknown = sorted(set(options) - {"draft_tokens"})
+    if unknown:
+        raise ValueError(
+            f'Unknown additional_config["gaad"] keys {unknown}; the only key '
+            "is draft_tokens."
+        )
+    if speculative_config is None:
+        raise ValueError(
+            'additional_config["gaad"] needs a speculative config with a drafter.'
+        )
+    k = speculative_config.num_speculative_tokens
+    draft_tokens = options.get("draft_tokens", k)
+    if (
+        isinstance(draft_tokens, bool)
+        or not isinstance(draft_tokens, int)
+        or not 1 <= draft_tokens <= k
+    ):
+        raise ValueError(
+            'additional_config["gaad"]["draft_tokens"] must be an integer from '
+            f"1 to num_speculative_tokens ({k}), got {draft_tokens!r}."
+        )
+    scheduler_config = vllm_config.scheduler_config
+    if scheduler_config.async_scheduling:
+        logger.warning(
+            "GaaD plans each draft row from the previous step's tokens on the "
+            "host; turning async scheduling off."
+        )
+        scheduler_config.async_scheduling = False
 
 
 class GrammarCursor:
@@ -131,9 +204,11 @@ def _has_penalties(sampling_params: Any) -> bool:
 
 
 def plan_request(
-    request: Any, structured_output_manager: Any, k: int
+    request: Any, structured_output_manager: Any, k: int, limit: int | None = None
 ) -> list[int] | None:
     """Replaces ``request.spec_token_ids`` with its GaaD row; returns its flags.
+
+    The row keeps at most ``limit`` of the drafter's tokens (all when None).
 
     Returns None, leaving the drafts as they are, for a request GaaD skips: one
     still prefilling, whose grammar does not constrain its next token (it has
@@ -160,9 +235,10 @@ def plan_request(
     budget = min(k, request.max_tokens - request.num_output_tokens - 1)
     if budget <= 0:
         return None
+    model_draft = request.spec_token_ids[:limit]
     cursor = GrammarCursor(matcher, structured_output_manager.tokenizer)
     try:
-        tokens, flags = plan_draft_row(request.spec_token_ids, cursor, budget)
+        tokens, flags = plan_draft_row(model_draft, cursor, budget)
     finally:
         cursor.rollback()
     request.spec_token_ids = tokens
