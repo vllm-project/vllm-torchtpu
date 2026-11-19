@@ -435,9 +435,11 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 sc = pltpu.bitcast(qs[ix_].reshape(CM, 128), I32)
                 b = jnp.where(lid < jnp.where(c < m, nvs, 0), sc, -1)  # past m: none
                 sel = (ov & ((b > th) | ((b == th) & (lid <= tm)))) | (~ov & (b >= 0))
-                sga = sga + jnp.sum((sel & (lid == ga)).astype(I32))
+                # Elementwise counts, reduced once after the loop (no per-chunk vector ->
+                # scalar moves).
+                sga = sga + (sel & (lid == ga)).astype(I32)
                 s2 = sel & (lid < ga)
-                kept = kept + jnp.sum(s2.astype(I32))
+                kept = kept + s2.astype(I32)
                 if self.union_attn:  # row bit r - lo of every pool-path group it selects
                     rows = pl.ds(pl.multiple_of(base, 8), CM)
                     scr["qu_code"][rows] = scr["qu_code"][rows] | jnp.where(
@@ -452,12 +454,12 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             part, tot = ix.compact_chunk(jnp.concatenate(sels, axis=0), tot, row_of, consts)
             return acc + part, tot, sga, kept
 
-        z = jnp.zeros((), I32)
+        z = jnp.zeros((CM, 128), I32)
         acc, _, sga, kept = jax.lax.fori_loop(
             0, (m + 1) // 2, it,
             (jnp.zeros((1, K), F32), jnp.zeros((1, 1), F32), z, z),
         )
-        return acc.astype(I32), sga, kept
+        return acc.astype(I32), jnp.sum(sga), jnp.sum(kept)
 
     def _nvis_union(self, ctx: Any, lo: Any, r: Any, KU: int, D: int, gpp: int,
                     nv_max: Any) -> None:
