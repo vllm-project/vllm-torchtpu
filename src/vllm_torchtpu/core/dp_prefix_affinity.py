@@ -34,9 +34,10 @@ prefix-cache hit.
 With VLLM_TPU_DP_PROMPT_BACKLOG=1 as well, the stock choice is the backlog one
 (core/dp_prompt_backlog.py): it is installed first and this choice wraps it,
 so the table records the engine a request finally went to. A request this
-choice routes does not pass through the backlog choice, so its prompt is not
-added to the backlog router's local estimate of that engine's pending prompt
-tokens; the engine's next published count includes it.
+choice routes adds its prompt's tokens to the backlog router's local estimate
+of that engine's pending prompt tokens, as the backlog choice does for the
+requests it routes, so the requests after it see the same estimate whichever
+choice routed it.
 
 Run with one API server process (--api-server-count 1): each API server
 process has its own client and table, and the stock front end spreads a
@@ -104,6 +105,7 @@ def load_scores(client) -> list[float]:
 def make_router(stock, chunk_tokens: int, load_margin: int, capacity: int):
     """A get_core_engine_for_request that prefers the engine holding the
     prompt's deepest remembered prefix and otherwise calls `stock`."""
+    counts_pending_prompts = hasattr(stock, "backlog_stats")
 
     def get_core_engine_for_request(self, request):
         token_ids = request.prompt_token_ids
@@ -136,6 +138,8 @@ def make_router(stock, chunk_tokens: int, load_margin: int, capacity: int):
             self.lb_engines[chosen_index][0] += self.client_count
             self.reqs_in_flight[request.request_id] = chosen
             self.engine_inflight[chosen] += 1
+            if counts_pending_prompts:
+                self._lb_pending[chosen_index] += len(token_ids)
 
         table.remember(hashes, chosen_index)
         return chosen
