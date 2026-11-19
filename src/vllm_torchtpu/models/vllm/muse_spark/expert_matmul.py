@@ -40,16 +40,16 @@ def _grouped_experts(
     experts_start: jax.Array | None,
     *,
     num_experts: int | None,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int,
 ) -> jax.Array:
     tokens, top_k = ids.shape
     use_ep = num_experts is not None
-    use_sparse_core = envs.USE_MOE_SPARSE_CORE
-    onehot_threshold = resolve_onehot_permute_threshold()
     if use_ep:
         assert experts_start is not None
         ids = ids - experts_start
         ids = jnp.where((ids >= 0) & (ids < w13.shape[0]), ids, -1)
-        if use_sparse_core and tokens * top_k <= onehot_threshold:
+        if use_sparse_core and tokens * top_k <= onehot_moe_permute_threshold:
             # The one-hot permute is a matmul across all tokens, and
             # 0 * NaN == NaN: zero non-finite values, as fused_moe_func does,
             # so the damage stays with that token.
@@ -62,7 +62,7 @@ def _grouped_experts(
         topk=top_k,
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=onehot_threshold,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
     )
 
     def matmul(lhs, weight, scale, global_scale):
@@ -102,13 +102,30 @@ def _grouped_experts(
     )
 
 
-@cache
 def get_grouped_experts_op(num_experts: int | None = None):
+    """The grouped-expert op, built for the current SparseCore permute settings."""
+    return _build_grouped_experts_op(
+        num_experts, envs.USE_MOE_SPARSE_CORE, resolve_onehot_permute_threshold()
+    )
+
+
+@cache
+def _build_grouped_experts_op(
+    num_experts: int | None, use_sparse_core: bool, onehot_moe_permute_threshold: int
+):
     # Build once outside torch.compile; tensor EP offsets keep rank graphs identical.
+    # The permute settings are part of the op name, so a program compiled under
+    # one setting is never reused under another.
     suffix = "" if num_experts is None else f"_e{num_experts}"
+    suffix += f"_sc{int(use_sparse_core)}_oh{onehot_moe_permute_threshold}"
     op = pallas.jax_op(
         "pallas::muse_grouped_experts" + suffix,
-        partial(_grouped_experts, num_experts=num_experts),
+        partial(
+            _grouped_experts,
+            num_experts=num_experts,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        ),
     )
 
     def fake(
