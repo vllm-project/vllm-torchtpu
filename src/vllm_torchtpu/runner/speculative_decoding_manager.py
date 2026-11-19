@@ -309,7 +309,7 @@ class SpeculativeDecodingManager:
         With GaaD every verify step passes flags, a request without them
         having only MODEL drafts, so the rejection samplers keep one graph.
         """
-        if not gaad.is_enabled():
+        if not gaad.is_enabled(self.runner.vllm_config):
             return None
         padded_draft_flags = np.zeros(padded_logits_length, dtype=np.int32)
         padded_draft_flags[: flat_flags.shape[0]] = flat_flags

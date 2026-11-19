@@ -1204,7 +1204,7 @@ class Eagle3Proposer:
         GaaD's drafter share of the row (the grammar may fill the rest)."""
         from vllm_torchtpu.structured_decoding import gaad
 
-        return gaad.draft_limit(self.speculative_config.num_speculative_tokens)
+        return gaad.draft_limit(self.vllm_config)
 
     def propose(
         self,

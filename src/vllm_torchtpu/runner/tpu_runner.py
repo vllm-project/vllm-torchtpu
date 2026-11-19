@@ -3832,7 +3832,7 @@ class TPUModelRunner(GPUModelRunner):
                         # Logprobs and min_tokens read every verify row by
                         # position, so only skip GRAMMAR rows without them.
                         skip_grammar_rows=(
-                            gaad.is_enabled()
+                            gaad.is_enabled(self.vllm_config)
                             and self.input_batch.max_num_logprobs is None
                             and not self._min_tokens
                         ),
@@ -7300,7 +7300,10 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
-                if gaad.is_enabled() and self.speculative_config is not None:
+                if (
+                    gaad.is_enabled(self.vllm_config)
+                    and self.speculative_config is not None
+                ):
                     # A verify step's logits rows are a token bucket; GaaD drops
                     # GRAMMAR rows, so any bucket up to the step's tokens occurs.
                     for num_rows in self.num_tokens_paddings:
@@ -7675,7 +7678,7 @@ class TPUModelRunner(GPUModelRunner):
                 # With GaaD every verify passes flags (a separate graph).
                 warm_draft_flags = (
                     torch.ones(num_tokens, dtype=torch.int32).to(self.device)
-                    if gaad.is_enabled()
+                    if gaad.is_enabled(self.vllm_config)
                     else None
                 )
                 # --- greedy verify path (do_sampling=False) ---
@@ -7711,7 +7714,7 @@ class TPUModelRunner(GPUModelRunner):
                 _, target_logits_ng = self.spec_gather_bonus_and_target_logits(
                     dummy_logits, bonus_logits_indices, target_logits_indices
                 )
-                if gaad.is_enabled():
+                if gaad.is_enabled(self.vllm_config):
                     # GaaD computes logits only for MODEL and bonus rows, so the
                     # gather also reads from fewer rows: every smaller bucket that
                     # still holds one row per request.

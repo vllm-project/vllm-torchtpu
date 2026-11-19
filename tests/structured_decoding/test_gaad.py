@@ -246,61 +246,75 @@ def test_scheduled_flags_follow_the_scheduled_drafts():
     assert flags == {"a": [G, G]}
 
 
-def _vllm_config(speculative_config=None, async_scheduling=True):
+def _vllm_config(speculative_config=None, async_scheduling=True, gaad=None):
     return SimpleNamespace(
         speculative_config=speculative_config,
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+        additional_config={} if gaad is None else {"gaad": gaad},
     )
 
 
-_STANDALONE = SimpleNamespace(method="custom_class", model=gaad.GAAD_PROPOSER)
+_STANDALONE = SimpleNamespace(
+    method="custom_class", model=gaad.GAAD_PROPOSER, num_speculative_tokens=7
+)
+_DRAFTER = SimpleNamespace(method="mtp", model=None, num_speculative_tokens=7)
 
 
-def test_check_config_needs_the_env_for_standalone(monkeypatch):
-    monkeypatch.delenv("VLLM_TPU_JUMP_DECODING", raising=False)
-    with pytest.raises(ValueError, match="VLLM_TPU_JUMP_DECODING"):
+def test_check_config_needs_gaad_for_standalone():
+    with pytest.raises(ValueError, match="gaad entry"):
         gaad.check_config(_vllm_config(_STANDALONE))
 
 
-def test_check_config_needs_a_speculative_config(monkeypatch):
-    monkeypatch.setenv("VLLM_TPU_JUMP_DECODING", "1")
+def test_check_config_needs_a_speculative_config():
     with pytest.raises(ValueError, match="speculative config"):
-        gaad.check_config(_vllm_config())
+        gaad.check_config(_vllm_config(gaad={}))
 
 
-def test_check_config_turns_async_scheduling_off(monkeypatch):
-    monkeypatch.setenv("VLLM_TPU_JUMP_DECODING", "1")
-    config = _vllm_config(_STANDALONE, async_scheduling=True)
+@pytest.mark.parametrize(
+    ("options", "match"),
+    [
+        (True, "must be a dict"),
+        ({"draft_token": 3}, "Unknown"),
+        ({"draft_tokens": 0}, "from 1 to"),
+        ({"draft_tokens": 8}, "from 1 to"),
+        ({"draft_tokens": "3"}, "from 1 to"),
+        ({"draft_tokens": True}, "from 1 to"),
+    ],
+)
+def test_check_config_rejects_bad_options(options, match):
+    with pytest.raises(ValueError, match=match):
+        gaad.check_config(_vllm_config(_DRAFTER, gaad=options))
+
+
+def test_check_config_turns_async_scheduling_off():
+    config = _vllm_config(_DRAFTER, async_scheduling=True, gaad={"draft_tokens": 3})
     gaad.check_config(config)
     assert config.scheduler_config.async_scheduling is False
 
 
-def test_check_config_leaves_other_configs_alone(monkeypatch):
-    monkeypatch.delenv("VLLM_TPU_JUMP_DECODING", raising=False)
+def test_check_config_leaves_other_configs_alone():
     config = _vllm_config(SimpleNamespace(method="ngram", model=None))
     gaad.check_config(config)
     assert config.scheduler_config.async_scheduling is True
 
 
-def _manager_for(req_ids):
+def _manager_for(req_ids, enabled):
     from vllm_torchtpu.runner.speculative_decoding_manager import (
         SpeculativeDecodingManager,
     )
 
     manager = SpeculativeDecodingManager.__new__(SpeculativeDecodingManager)
     manager.runner = SimpleNamespace(
-        device=torch.device("cpu"), input_batch=SimpleNamespace(req_ids=req_ids)
+        device=torch.device("cpu"),
+        input_batch=SimpleNamespace(req_ids=req_ids),
+        vllm_config=_vllm_config(_DRAFTER, gaad={} if enabled else None),
     )
     return manager
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_draft_flags_are_laid_out_like_the_drafts(monkeypatch, enabled):
-    if enabled:
-        monkeypatch.setenv("VLLM_TPU_JUMP_DECODING", "1")
-    else:
-        monkeypatch.delenv("VLLM_TPU_JUMP_DECODING", raising=False)
-    manager = _manager_for(["x", "a", "b", "c"])
+def test_draft_flags_are_laid_out_like_the_drafts(enabled):
+    manager = _manager_for(["x", "a", "b", "c"], enabled)
     flat = manager._flat_draft_flags(
         np.array([3, 0, 2], dtype=np.int32), {"a": [G, G, M], "c": [G]}, start_index=1
     )
@@ -334,29 +348,27 @@ def test_grammar_rows_skip_the_lm_head():
     assert target.tolist() == [1, 0, 1, 2, 2]
 
 
-def test_the_drafter_fills_only_its_share_of_the_row(monkeypatch):
-    monkeypatch.setenv("VLLM_TPU_JUMP_DECODING", "1")
-    monkeypatch.setenv("VLLM_TPU_GAAD_DRAFT_TOKENS", "1")
-    assert gaad.draft_limit(7) == 1
+def test_the_drafter_fills_only_its_share_of_the_row():
+    assert gaad.draft_limit(_vllm_config(_DRAFTER, gaad={"draft_tokens": 1})) == 1
     # The drafter's x after the forced run is past its share; the grammar
     # still fills the row.
     request = _request(spec_token_ids=[1, 2, 3, 7])
-    assert plan_request(request, _manager(), 7) == [G, G, G]
+    assert plan_request(request, _manager(), 7, 1) == [G, G, G]
     assert request.spec_token_ids == [1, 2, 3]
 
 
-def test_a_skipped_request_keeps_the_drafters_share(monkeypatch):
-    monkeypatch.setenv("VLLM_TPU_JUMP_DECODING", "1")
-    monkeypatch.setenv("VLLM_TPU_GAAD_DRAFT_TOKENS", "2")
+def test_a_skipped_request_keeps_the_drafters_share():
     skipped = _request(request_id="s", spec_token_ids=[7, 8, 9], is_prefill_chunk=True)
     scheduler = SimpleNamespace(
-        structured_output_manager=_manager(), num_spec_tokens=7, running=[skipped]
+        structured_output_manager=_manager(),
+        num_spec_tokens=7,
+        running=[skipped],
+        vllm_config=_vllm_config(_DRAFTER, gaad={"draft_tokens": 2}),
     )
     assert gaad.plan_running_requests(scheduler) == {}
     assert skipped.spec_token_ids == [7, 8]
 
 
-def test_draft_limit_without_gaad(monkeypatch):
-    monkeypatch.delenv("VLLM_TPU_JUMP_DECODING", raising=False)
-    monkeypatch.setenv("VLLM_TPU_GAAD_DRAFT_TOKENS", "2")
-    assert gaad.draft_limit(7) == 7
+def test_draft_limit_is_the_row_without_draft_tokens():
+    assert gaad.draft_limit(_vllm_config(_DRAFTER)) == 7
+    assert gaad.draft_limit(_vllm_config(_DRAFTER, gaad={})) == 7
