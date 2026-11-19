@@ -13,7 +13,7 @@
 # limitations under the License.
 import contextlib
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import pytest
 import torch
@@ -198,7 +198,6 @@ def staging_patch_undo(monkeypatch):
     monkeypatch.setattr(
         RoutedExperts, "_tpu_expert_staging_patch", False, raising=False
     )
-    monkeypatch.setattr(RoutedExperts, "_tpu_expert_stager", None, raising=False)
     monkeypatch.setattr(
         base_loader,
         "process_weights_after_loading",
@@ -221,7 +220,6 @@ _MODEL_CONFIG = SimpleNamespace(dtype=torch.bfloat16, quantization=None)
 
 
 def _quant_method(process):
-    """A quant method whose process_weights_after_loading calls `process`."""
     from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 
     class _QuantMethod(QuantizeMethodBase):
@@ -268,10 +266,12 @@ def _model(**children: torch.nn.Module) -> torch.nn.Module:
 
 @pytest.fixture
 def post_load(staging_patch_undo, monkeypatch):
-    """Upstream's process_weights_after_loading wrapped by the staging patch."""
+    """Return a runner for vLLM's process_weights_after_loading wrapped by the
+    staging patch. The runner's `stager` attribute is the patch's stager."""
     from vllm.model_executor.model_loader import base_loader
     from vllm.model_executor.model_loader import utils as loader_utils
 
+    from vllm_torchtpu import model_loader_patches
     from vllm_torchtpu.model_loader_patches import patch_moe_expert_write_staging
 
     monkeypatch.setattr(
@@ -282,15 +282,27 @@ def post_load(staging_patch_undo, monkeypatch):
     monkeypatch.setattr(
         loader_utils, "maybe_retie_word_embeddings", lambda *a, **kw: None
     )
+    # Capture the stager the patch creates so tests can stage expert writes.
+    stagers: list[Any] = []
+    real_stager_cls = model_loader_patches.ExpertParamStager
+
+    def _capturing_stager() -> Any:
+        stagers.append(real_stager_cls())
+        return stagers[-1]
+
+    monkeypatch.setattr(model_loader_patches, "ExpertParamStager", _capturing_stager)
     patch_moe_expert_write_staging()
-    return lambda model: base_loader.process_weights_after_loading(
-        model, _MODEL_CONFIG, torch.device("cpu")
-    )
+
+    def run(model: Any) -> None:
+        base_loader.process_weights_after_loading(
+            model, _MODEL_CONFIG, torch.device("cpu")
+        )
+
+    run.stager = stagers[0]
+    return run
 
 
 def test_linear_weights_processed_before_expert_flush_and_not_rerun(post_load):
-    from vllm.model_executor.layers.fused_moe import RoutedExperts
-
     events: list[str] = []
 
     def process_experts(layer: Any) -> None:
@@ -312,7 +324,7 @@ def test_linear_weights_processed_before_expert_flush_and_not_rerun(post_load):
         lin_a=_linear(shared_qm, "a"),
         lin_b=_linear(shared_qm, "b"),
     )
-    stager = cast(Any, RoutedExperts)._tpu_expert_stager
+    stager = post_load.stager
     # Stage only expert 0 of 2 so w2 stays on the host until flush_all().
     stager.host_param(experts.w2)[0] = 9.0
     assert not stager.written(experts.w2, 0, "w2")
@@ -328,8 +340,8 @@ def test_linear_weights_processed_before_expert_flush_and_not_rerun(post_load):
 def test_offloaded_linear_modules_are_not_moved_to_the_device_twice(
     post_load, monkeypatch
 ):
-    """Under CPU offloading, upstream's pass skips the device round trip for
-    linear modules the early pass already processed."""
+    """Under CPU offloading, vLLM's pass skips the device round trip for
+    linear modules that the staging patch already processed."""
     from vllm.model_executor.model_loader import utils as loader_utils
 
     entered: list[str] = []
@@ -395,7 +407,8 @@ def test_dense_model_takes_the_upstream_path(staging_patch_undo, monkeypatch):
 
 def test_failed_expert_processing_restores_quant_methods(post_load):
     def process_experts(layer: Any) -> None:
-        # The early pass has finished, so the overrides are in place.
+        # Expert hooks run while the quant-method overrides from the linear
+        # pass are still in place.
         assert shared_qm.requires_device_loading is False
         raise RuntimeError("boom in expert pwal")
 

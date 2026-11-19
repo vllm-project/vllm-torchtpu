@@ -124,14 +124,12 @@ def _to_kernel_scale(scale_f32: torch.Tensor) -> torch.Tensor:
 def _requant_w13_padded(
     w13_u8: torch.Tensor, w13_scale_f: torch.Tensor, block: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Requantize NVFP4 MoE w13 from native block-16 to block-`block` fp4
-    for either W4A16 GMM or W4A8 fused EP execution.
+    """Requantize NVFP4 MoE w13 from native block-16 to block-`block` fp4 in
+    PyTorch, for either W4A16 GMM or W4A8 fused EP execution.
 
-    Dequantizes with the fused block-16 scale, zero-pads each output half (gate
-    and up) of the MoE intermediate up to a multiple of `block` (the padded
-    rows are zero-weight, so they are numerically inert), then requantizes.
-    Pure PyTorch, reusing the common fp4 toolkit. Returns packed
-    (w13_u8, w13_scale_4d).
+    Each output half (gate and up) is zero-padded up to a multiple of `block`.
+    The padded rows are zero-weight, so they are numerically inert. Returns the
+    packed weight and its kernel-layout scale.
     """
     H = w13_u8.shape[-1] * 2  # contracting dim of w13
     inter = w13_u8.shape[1] // 2  # MoE intermediate (per expert)
@@ -159,9 +157,9 @@ def _requant_w13_padded(
 def _requant_w2_padded(
     w2_u8: torch.Tensor, w2_scale_f: torch.Tensor, block: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Requantize NVFP4 MoE w2 from native block-16 to block-`block` fp4,
-    zero-padding its contracting dim (the MoE intermediate) up to a multiple
-    of `block`. Returns packed (w2_u8, w2_scale_4d).
+    """Requantize NVFP4 MoE w2 from native block-16 to block-`block` fp4 in
+    PyTorch, zero-padding its contracting dim (the MoE intermediate) up to a
+    multiple of `block`. Returns the packed weight and its kernel-layout scale.
     """
     inter = w2_u8.shape[-1] * 2
     inter_pad = align_to(inter, block) - inter
@@ -179,7 +177,11 @@ def _requant_w2_padded(
 
 
 def _expand_w13_scale(layer: TpuRoutedExperts) -> torch.Tensor:
-    """Fuse E4M3 block scale * FP32 per-w1/w3 global scale [E, 2] -> FP32."""
+    """Return the FP32 w13 block scale.
+
+    The E4M3 block scale is multiplied by the per-expert global scales [E, 2],
+    whose columns belong to w1 (the gate half) and w3 (the up half).
+    """
     w13_scale = layer.w13_weight_scale.data  # [E, 2I, H/group] e4m3
     g13 = layer.w13_weight_scale_2.data.to(torch.float32)  # [E, 2]
     half = w13_scale.shape[1] // 2
@@ -189,7 +191,8 @@ def _expand_w13_scale(layer: TpuRoutedExperts) -> torch.Tensor:
 
 
 def _expand_w2_scale(layer: TpuRoutedExperts) -> torch.Tensor:
-    """Fuse E4M3 block scale * FP32 per-expert global scale [E] -> FP32."""
+    """Return the FP32 w2 block scale: the E4M3 block scale times the
+    per-expert global scale [E]."""
     w2_scale = layer.w2_weight_scale.data  # [E, H, I/group] e4m3
     g2 = layer.w2_weight_scale_2.data.to(torch.float32)  # [E]
     return w2_scale.to(torch.float32) * g2.view(-1, 1, 1)
@@ -198,7 +201,8 @@ def _expand_w2_scale(layer: TpuRoutedExperts) -> torch.Tensor:
 def _install_moe_weight(
     layer: TpuRoutedExperts, prefix: str, weight: torch.Tensor, scale: torch.Tensor
 ) -> None:
-    """Replace one projection's checkpoint tensors with its prepared weight."""
+    """Replace one projection's checkpoint tensors with its prepared weight
+    and scale."""
     for attr in (f"{prefix}_weight_scale_2", f"{prefix}_input_scale"):
         if hasattr(layer, attr):
             delattr(layer, attr)
@@ -218,8 +222,8 @@ def _install_prepared_moe_weights(
     hidden = layer.w13_weight.shape[-1] * 2
     inter = layer.w2_weight.shape[-1] * 2
     block = int(requant_block) if requant_block else 0
-    # A block that does not divide hidden or inter takes the torch requant,
-    # which pads the intermediate.
+    # Only the torch requant can pad the intermediate up to the block. It still
+    # requires hidden to be a multiple of the block.
     padded = bool(block) and (hidden % block != 0 or inter % block != 0)
 
     def prepare(w_u8, scale_f, requant_padded):

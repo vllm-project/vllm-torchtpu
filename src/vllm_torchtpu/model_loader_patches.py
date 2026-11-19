@@ -965,6 +965,11 @@ def patch_moe_expert_write_staging() -> None:
     writes: its remaining experts go through the direct path. Experts the
     loader never writes (padding experts) stay uninitialized, as they would
     on the device.
+
+    For MoE models, every LinearBase is post-processed before the expert
+    parameters still staged at the end of loading are written and before any
+    RoutedExperts post-load hook runs. Those hooks therefore see LinearBase
+    weights already in their runtime layout, not their checkpoint layout.
     """
     from vllm.model_executor.layers.fused_moe import RoutedExperts
     from vllm.model_executor.model_loader import base_loader
@@ -1025,7 +1030,10 @@ def patch_moe_expert_write_staging() -> None:
             )
         return result
 
-    @functools.wraps(orig_process)
+    # updated=() keeps orig_process's attributes off this wrapper. Copying the
+    # router patch's applied marker would make that patch skip itself if this
+    # one were ever applied after it.
+    @functools.wraps(orig_process, updated=())
     def process_weights_after_loading(model, model_config, target_device):
         from contextlib import nullcontext
 
@@ -1037,6 +1045,7 @@ def patch_moe_expert_write_staging() -> None:
             OnlineLinearBase,
         )
         from vllm.model_executor.model_loader import utils as loader_utils
+        from vllm.utils.mem_utils import release_device_memory_under_pressure
 
         has_moe = len(stager) > 0 or any(
             isinstance(m, RoutedExperts) for m in model.modules()
@@ -1060,6 +1069,10 @@ def patch_moe_expert_write_staging() -> None:
             int, tuple[typing.Any, typing.Any, bool, dict[str, typing.Any]]
         ] = {}
         try:
+            # The loop body copies the per-module loop in vLLM's
+            # model_loader.utils.process_weights_after_loading, so a change to
+            # that loop in vLLM has to be made here too. When orig_process runs
+            # its loop afterwards, the guarded quant method skips these modules.
             for module in model.modules():
                 if not isinstance(module, LinearBase):
                     continue
@@ -1102,10 +1115,12 @@ def patch_moe_expert_write_staging() -> None:
                     orig_pwal(module)
                 if hasattr(module, "update_param_tp_status"):
                     module.update_param_tp_status()
+                release_device_memory_under_pressure(target_device)
                 done_modules.add(id(module))
 
-            # Avoid redundant CPU-offload H2D/D2H copies in orig_process for
-            # quant_methods whose modules have all completed processing.
+            # A quant method used only by already-processed linear modules has
+            # nothing left to do, so orig_process can skip the CPU-offload
+            # H2D/D2H round trip for its modules.
             non_linear_qms = {
                 id(getattr(m, "quant_method", None))
                 for m in model.modules()
@@ -1137,7 +1152,6 @@ def patch_moe_expert_write_staging() -> None:
 
     RoutedExperts.weight_loader = weight_loader
     RoutedExperts._tpu_expert_staging_patch = True
-    RoutedExperts._tpu_expert_stager = stager
     base_loader.process_weights_after_loading = process_weights_after_loading
     logger.info(
         "Applied TPU patch: expert parameters are staged on the host "

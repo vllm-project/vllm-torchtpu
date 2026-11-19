@@ -821,6 +821,7 @@ class TestNvfp4MoEMethod:
 
         from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
             _install_prepared_moe_weights,
+            requant_load_kmajor_fp4,
             synchronize_tensors,
         )
 
@@ -857,22 +858,29 @@ class TestNvfp4MoEMethod:
             torch.ones(e, dtype=torch.float32, device=device), requires_grad=False
         )
 
-        sync_counts: list[int] = []
+        events: list[str] = []
+
+        def _spy_requant(*args, **kwargs):
+            events.append("requant")
+            return requant_load_kmajor_fp4(*args, **kwargs)
 
         def _spy_sync(tensors):
-            sync_counts.append(len(tensors))
+            events.append(f"sync{len(tensors)}")
             synchronize_tensors(tensors)
 
-        with patch(
-            "vllm_torchtpu.layers.adapter.quantization.nvfp4.synchronize_tensors",
-            side_effect=_spy_sync,
+        nvfp4_module = "vllm_torchtpu.layers.adapter.quantization.nvfp4"
+        with (
+            patch(f"{nvfp4_module}.requant_load_kmajor_fp4", side_effect=_spy_requant),
+            patch(f"{nvfp4_module}.synchronize_tensors", side_effect=_spy_sync),
         ):
             (w13, w2, s13, s2), mode = _install_prepared_moe_weights(
                 layer, requant_block=512
             )
 
         assert mode == "FP4 (jax requant block-512)"
-        assert sync_counts == [2, 2]
+        # w13 must be installed and synced before w2 is requantized, so w13's
+        # temporaries are freed before w2 allocates.
+        assert events == ["requant", "sync2", "requant", "sync2"]
         assert w13.dtype == torch.float4_e2m1fn_x2
         assert w2.dtype == torch.float4_e2m1fn_x2
         assert s13.shape == (e, 1, 1, two_i)
