@@ -245,6 +245,22 @@ def plan_request(
     return flags
 
 
+def plan_running_requests(scheduler: Any) -> dict[str, list[int]]:
+    """Plans every running request's draft row; returns flags by request id."""
+    manager = scheduler.structured_output_manager
+    k = scheduler.num_spec_tokens
+    flags_by_req: dict[str, list[int]] = {}
+    limit = draft_limit(scheduler.vllm_config)
+    for request in scheduler.running:
+        flags = plan_request(request, manager, k, limit)
+        if flags is not None:
+            flags_by_req[request.request_id] = flags
+        elif len(request.spec_token_ids) > limit:
+            # A request GaaD skips keeps only the drafter's share of the row.
+            request.spec_token_ids = request.spec_token_ids[:limit]
+    return flags_by_req
+
+
 def scheduled_flags(
     flags_by_req: dict[str, list[int]],
     scheduled_spec_decode_tokens: dict[str, list[int]],
@@ -255,3 +271,37 @@ def scheduled_flags(
         for req_id, tokens in scheduled_spec_decode_tokens.items()
         if req_id in flags_by_req
     }
+
+
+def patch_scheduler() -> None:
+    """Plans GaaD rows in ``Scheduler.schedule`` in the engine-core process.
+
+    The scheduler sends the flags of each scheduled row to the runner as
+    ``SchedulerOutput.scheduled_spec_decode_flags``; a request without flags
+    has only ``MODEL`` drafts. Whether GaaD is on comes from each scheduler's
+    config, so the patch is installed always and does nothing when it is off.
+    """
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if getattr(Scheduler, "_tpu_gaad_patched", False):
+        return
+    SchedulerOutput.scheduled_spec_decode_flags = None
+    original_schedule = Scheduler.schedule
+
+    def schedule(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if not is_enabled(self.vllm_config):
+            return original_schedule(self, *args, **kwargs)
+        flags_by_req = plan_running_requests(self)
+        # Any: vLLM's SchedulerOutput does not declare the flags field added
+        # above; the runner reads it with getattr.
+        output: Any = original_schedule(self, *args, **kwargs)
+        if flags_by_req:
+            output.scheduled_spec_decode_flags = scheduled_flags(
+                flags_by_req, output.scheduled_spec_decode_tokens
+            )
+        return output
+
+    Scheduler.schedule = schedule
+    Scheduler._tpu_gaad_patched = True
+    logger.info("Applied TPU patch: GaaD draft rows in Scheduler.schedule.")
