@@ -1565,8 +1565,41 @@ def union_sc_bits(sel, bit_lengths, *, ratio, groups, words, group, plan_layout=
     tokens = sel.shape[0]
     if group % LANES or 128 % group or tokens % group:
         raise ValueError(f"the SparseCore bitset needs groups of whole 16-row slabs that split the {tokens} rows")
+    if plan_layout:
+        return _union_sc_bits_plan(sel, bit_lengths, ratio=ratio, groups=groups, words=words, group=group)
     flat = union_sc_bits_flat(sel, bit_lengths, ratio=ratio, groups=groups, words=words)
     return bits_slabs_to_plan(flat, tokens=tokens, group=group, words=words)
+
+
+def _union_sc_bits_plan(sel, bit_lengths, *, ratio, groups, words, group):
+    """``union_sc_bits(plan_layout=True)`` (q38 VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN, rw3 c3b211130a): the same
+    checks and the same ``_bits_plan_kernel`` call as rw3's union_sc_bits, kept out of ``union_sc_bits_flat`` so that
+    Benliang Wang's flat path stays byte for byte his (q38 MERGE-LEAD bpb integration: the textual merge had put this
+    branch inside union_sc_bits_flat, where ``plan_layout`` and ``group`` are undefined)."""
+    tokens, k = sel.shape
+    if words % 8 or groups > words * WORD_BITS:
+        raise ValueError("words must be a multiple of 8 covering every group")
+    _log2(ratio)
+    need = bits_vmem_bytes(k, words)
+    if need > _GATHER_VMEM_BUDGET:
+        raise ValueError(f"the SparseCore bitset needs {need} bytes of VMEM per subcore")
+    sc = _sc_geometry()
+    workers = sc.num_cores * sc.num_subcores
+    items = tokens // LANES
+    bits = core_map_helper.kernel(
+        functools.partial(_bits_plan_kernel, items=items, k=k, words=words, ratio=ratio, groups=groups,
+                          workers=workers, nslab=group // LANES),
+        out_type=jax.ShapeDtypeStruct((tokens // group * words, 128), jnp.int32),
+        mesh=_mesh(sc),
+        scratch_types=(),
+        # The SparseCore tiling: the (words, 16) VMEM block is not padded to 128 lanes (the TensorCore tiling
+        # pads it past the VMEM budget), and the output's [N, 128] SparseCore layout is a bitcast of the
+        # TensorCore's (8, 128) tiles (deviceless compile, M).
+        compiler_params=pltpu.CompilerParams(disable_bounds_checks=True, needs_layout_passes=False,
+                                             use_tc_tiling_on_sc=False),
+        name=f"qsa_union_sc_bits_plan_k{k}_w{words}",
+    )(sel.astype(jnp.int32).reshape(-1), bit_lengths.astype(jnp.int32))
+    return bits.reshape(tokens // group, words, 128)
 
 
 def union_sc_bits_flat(sel, bit_lengths, *, ratio, groups, words):
@@ -1584,21 +1617,6 @@ def union_sc_bits_flat(sel, bit_lengths, *, ratio, groups, words):
     sc = _sc_geometry()
     workers = sc.num_cores * sc.num_subcores
     items = tokens // LANES
-    if plan_layout:
-        bits = core_map_helper.kernel(
-            functools.partial(_bits_plan_kernel, items=items, k=k, words=words, ratio=ratio, groups=groups,
-                              workers=workers, nslab=group // LANES),
-            out_type=jax.ShapeDtypeStruct((tokens // group * words, 128), jnp.int32),
-            mesh=_mesh(sc),
-            scratch_types=(),
-            # The SparseCore tiling: the (words, 16) VMEM block is not padded to 128 lanes (the TensorCore tiling
-            # pads it past the VMEM budget), and the output's [N, 128] SparseCore layout is a bitcast of the
-            # TensorCore's (8, 128) tiles (deviceless compile, M).
-            compiler_params=pltpu.CompilerParams(disable_bounds_checks=True, needs_layout_passes=False,
-                                                 use_tc_tiling_on_sc=False),
-            name=f"qsa_union_sc_bits_plan_k{k}_w{words}",
-        )(sel.astype(jnp.int32).reshape(-1), bit_lengths.astype(jnp.int32))
-        return bits.reshape(tokens // group, words, 128)
     flat = core_map_helper.kernel(
         functools.partial(_bits_kernel, items=items, k=k, words=words, ratio=ratio, groups=groups, workers=workers),
         out_type=jax.ShapeDtypeStruct((items * words * LANES,), jnp.int32),
