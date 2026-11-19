@@ -56,7 +56,7 @@ def interpret(monkeypatch):
     kernel.moe_lowtok.clear_cache()
 
 
-def quantize_rows(v):
+def _reference_quantize_rows(v):
     amax = jnp.max(jnp.abs(v), axis=1, keepdims=True)
     scale = jnp.maximum(amax, 1e-12) / 448.0
     return (v / scale).astype(FP8), scale
@@ -66,7 +66,7 @@ def _reference(x, ids, weights, w13, s13, w2, s2):
     """Plain JAX with the kernel's arithmetic: per-row FP8 activations."""
     e, _, two_inter = w13.shape
     inter = two_inter // 2
-    x_q, x_s = quantize_rows(x.astype(jnp.float32))
+    x_q, x_s = _reference_quantize_rows(x.astype(jnp.float32))
     s13 = s13.reshape(e, two_inter)
     s2 = s2.reshape(e, -1)
     out = jnp.zeros((x.shape[0], x.shape[1]), jnp.float32)
@@ -75,7 +75,7 @@ def _reference(x, ids, weights, w13, s13, w2, s2):
         h = jnp.dot(x_q, w13[expert], preferred_element_type=jnp.float32)
         h = h * x_s * s13[expert][None, :]
         a = jax.nn.silu(h[:, :inter]) * h[:, inter:]
-        a_q, a_s = quantize_rows(a)
+        a_q, a_s = _reference_quantize_rows(a)
         o = jnp.dot(a_q, w2[expert], preferred_element_type=jnp.float32)
         out = out + w[:, None] * (o * a_s * s2[expert][None, :])
     return out.astype(x.dtype)

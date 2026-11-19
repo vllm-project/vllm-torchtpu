@@ -11,17 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The few-token MoE with its DP dispatch and EP combine in the kernel, on a
-(dp, tp) = (4, 2) mesh.
+"""The few-token MoE with its DP dispatch and EP combine in the kernel, and the
+torch op's program around it, on a (dp, tp) = (4, 2) mesh.
 
 The interpret checks run this file as a script in a subprocess on 8 CPU
 devices, because the host device count (XLA_FLAGS) must be set before JAX
 starts. They use TPU interpret mode with the race detector, so they check
-routing, the remote DMA and semaphore protocols and the arithmetic (against a
-float32 reference of the kernel's roundings), not Mosaic lowering, VMEM limits
-or TPU timing. The multichip checks run the compiled kernel on the 8 TPU
-cores of one host against the same reference, at these test shapes and at the
-Qwen3.5-397B decode shapes the torch op serves.
+routing, the remote DMA and semaphore protocols and the arithmetic (against
+float32 references that share no code with the kernel), not Mosaic lowering,
+VMEM limits or TPU timing. They also run the program the torch op builds
+(moe_lowtok_fused_op.program) at, below and above its row cap; above it, the
+scores entry's own path (moe_scores_fn) serves the gathered rows, here through
+its few-token branch, since the interpreter cannot run the grouped matmul's
+DMA pipeline. The multichip checks run the compiled kernel and program on the
+8 TPU cores of one host against the same references, at these test shapes and
+at the Qwen3.5-397B decode shapes the torch op serves, where the path above
+the cap is the grouped matmul.
 """
 
 import contextlib
@@ -56,19 +61,46 @@ Q35_CASES = {
     "q35_served_48": (48, False),
     "q35_served_8": (8, False),
 }
+# The torch op's program, armed with a cap of 32 rows per engine at these
+# shapes: rows per engine, whether the step runs the fused kernel (else the
+# all-gather, moe_scores_fn, reduce-scatter path) and with FP8 rows. Each case
+# has one row whose router logits are all -inf, as apply() masks a padded row.
+OP_CAP = DP * 32
+OP_CASES = {
+    "op_at_cap_32": (32, True, True),
+    "op_below_cap_13": (13, True, False),
+    "op_above_cap_33": (33, False, False),
+}
+# At the 397B shapes with the served cap (448 rows over 4 engines).
+Q35_OP_CAP = 448
+Q35_OP_CASES = {
+    "q35_op_at_cap_112": (112, True, False),
+    "q35_op_below_cap_64": (64, True, True),
+    "q35_op_above_cap_128": (128, False, False),
+}
+# The row of each engine-0 block whose logits are all -inf.
+PADDED_ROW = 3
 
 
-def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
-    """``run(*case)`` on ``mesh`` (axes ("dp", "tp")): the kernel's output of
-    every core [DP * TP, rows, hidden] bf16 and the float32 reference of this
-    engine's rows (float64)."""
+def _reference_quantize_rows(v):
+    """Per-row FP8 quantization (e4m3, max 448) for the references, written
+    independently of the kernel's helper."""
+    import jax.numpy as jnp
+
+    amax = jnp.max(jnp.abs(v), axis=1, keepdims=True)
+    scale = jnp.maximum(amax, 1e-12) / 448.0
+    return (v / scale).astype(jnp.float8_e4m3fn), scale
+
+
+def _setup(mesh, geometry=(E, H, INTER, TOPK)):
+    """Weights split over ``mesh`` (axes ("dp", "tp")), every core's first
+    expert and (dp, tp) index, and the inputs and references of a step."""
     import jax
     import jax.numpy as jnp
     import numpy as np
     from jax.sharding import NamedSharding
     from jax.sharding import PartitionSpec as P
 
-    from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives as fc
     from vllm_torchtpu.kernels.experimental.moe_lowtok import kernel
 
     e, h, inter, topk = geometry
@@ -112,32 +144,54 @@ def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
         w13, w2, s13, s2 = jax.jit(draw, out_shardings=(split,) * 4)()
     starts = jnp.asarray(np.arange(DP * TP) * e, jnp.int32)
     ranks = jnp.asarray([[i // TP, i % TP] for i in range(DP * TP)], jnp.int32)
-    experts = P(("dp", "tp"))
 
-    def inputs(rows):
+    def inputs(rows, padded_row=None):
+        """Every engine's rows and router logits; row ``padded_row`` of each
+        engine's block has all -inf logits."""
         r = np.random.default_rng(rows)
         x = jnp.asarray(r.standard_normal((DP * rows, h)), jnp.bfloat16)
-        logits = jnp.asarray(
-            r.standard_normal((DP * rows, n_experts)) * 2, jnp.bfloat16
-        )
-        return x, logits
+        logits = r.standard_normal((DP * rows, n_experts)) * 2
+        if padded_row is not None:
+            logits[padded_row::rows] = -np.inf
+        return x, jnp.asarray(logits, jnp.bfloat16)
 
     def reference(x, logits):
         """Plain JAX with the kernel's roundings: per-row FP8 activations, a
-        softmax top-k renormalized over every expert, float32 sums."""
-        x_q, x_s = kernel.quantize_rows(x.astype(jnp.float32))
-        weights, ids = jax.lax.top_k(jax.nn.softmax(logits.astype(jnp.float32)), topk)
-        weights = weights / weights.sum(axis=1, keepdims=True)
+        softmax top-k renormalized over every expert, float32 sums, zero for a
+        row with no finite logit."""
+        x_q, x_s = _reference_quantize_rows(x.astype(jnp.float32))
+        lg = logits.astype(jnp.float32)
+        routed = jnp.isfinite(lg).any(axis=1, keepdims=True)
+        weights, ids = jax.lax.top_k(jax.nn.softmax(jnp.where(routed, lg, 0)), topk)
+        weights = jnp.where(routed, weights / weights.sum(axis=1, keepdims=True), 0)
         out = jnp.zeros((x.shape[0], h), jnp.float32)
         for expert in range(n_experts):
             w = jnp.sum(jnp.where(ids == expert, weights, 0), axis=1)
             hid = jnp.dot(x_q, w13[expert], preferred_element_type=jnp.float32)
             hid = hid * x_s * s13[expert].reshape(1, -1)
             a = jax.nn.silu(hid[:, :inter]) * hid[:, inter:]
-            a_q, a_s = kernel.quantize_rows(a)
+            a_q, a_s = _reference_quantize_rows(a)
             o = jnp.dot(a_q, w2[expert], preferred_element_type=jnp.float32)
             out = out + w[:, None] * (o * a_s * s2[expert].reshape(1, -1))
         return np.asarray(out.astype(jnp.bfloat16)).astype(np.float64)
+
+    return (w13, w2, s13, s2), starts, ranks, inputs, reference
+
+
+def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
+    """``run(*case)`` on ``mesh``: the kernel's output of every core
+    [DP * TP, rows, hidden] bf16 and the float32 reference of the engines'
+    rows (float64)."""
+    import jax
+    import numpy as np
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives as fc
+
+    topk = geometry[3]
+    (w13, w2, s13, s2), starts, ranks, inputs, reference = _setup(mesh, geometry)
+    h = geometry[1]
+    experts = P(("dp", "tp"))
 
     def run(rows, fp8):
         x, logits = inputs(rows)
@@ -177,6 +231,66 @@ def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
     return run
 
 
+def _op_runner(mesh, cap, geometry=(E, H, INTER, TOPK), scores_cap=None):
+    """``run(rows)`` on ``mesh``: the torch op's program (armed with ``cap``)
+    on every engine's rows, with operands in apply()'s order. Returns its
+    output [DP * rows, hidden] (float64), the float32 reference, the served
+    path's sum (each core's moe_scores_fn on every engine's rows, summed over
+    the cores), and which forms the traced program holds. ``scores_cap`` is
+    the scores entry's cap moe_scores_fn reads (default ``cap``, as the rule
+    arms both)."""
+    import jax
+    import numpy as np
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.layers.adapter import moe_lowtok_fused_op
+    from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
+
+    (w13, w2, s13, s2), starts, ranks, inputs, reference = _setup(mesh, geometry)
+    moe_lowtok_scores._ARMED_MAX_TOKENS = cap if scores_cap is None else scores_cap
+    topk = geometry[3]
+    fn = moe_lowtok_fused_op.program(mesh, topk, cap)
+    core = P(("dp", "tp"))
+
+    def served_partial(x, logits, w13, w2, s13, s2, start):
+        return moe_lowtok_scores.moe_scores_fn(
+            x, logits, w13, w2, s13, s2, start[0], topk=topk
+        )[None]
+
+    served = jax.jit(
+        jax.shard_map(
+            served_partial,
+            mesh=mesh,
+            in_specs=(P(), P()) + (core,) * 5,
+            out_specs=core,
+            check_vma=False,
+        )
+    )
+
+    def run(rows):
+        x, logits = inputs(rows, padded_row=PADDED_ROW)
+        args = (x, logits, w13, w2, s13, s2, starts, ranks.reshape(-1))
+        program = str(jax.make_jaxpr(fn)(*args))
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = np.asarray(jax.block_until_ready(jax.jit(fn)(*args)))
+            parts = np.asarray(
+                jax.block_until_ready(served(x, logits, w13, w2, s13, s2, starts))
+            )
+        forms = dict(
+            fused_kernel="moe_lowtok_fused_dih" in program,
+            fp8_rows="moe_lowtok_fused_dihq" in program,
+            all_gather="all_gather" in program,
+        )
+        return (
+            out.astype(np.float64),
+            reference(x, logits),
+            parts.astype(np.float64).sum(axis=0),
+            forms,
+        )
+
+    return run
+
+
 def _summary(cores, want):
     """(bits of every core, the checks on them): both cores of a TP pair hold
     the same bytes, no NaN, and the engines' rows against the reference."""
@@ -193,11 +307,42 @@ def _summary(cores, want):
     )
 
 
+def _op_summary(got, want, want_served, forms, rows):
+    """The op program's checks: no NaN, each padded row zero, and the rows
+    against the float32 reference and against the served path's sum."""
+    import numpy as np
+
+    def rel(ref):
+        return float(np.linalg.norm(got - ref) / np.linalg.norm(ref))
+
+    return dict(
+        forms,
+        nan=int(np.isnan(got).sum()),
+        padded_rows_zero=bool(np.all(got[PADDED_ROW::rows] == 0)),
+        rel_l2=rel(want),
+        rel_l2_served=rel(want_served),
+    )
+
+
 def _check(case):
     # Both cores of a chip end with the same bytes.
     assert case["pairs_identical"], case
     assert case["nan"] == 0, case
     assert case["rel_l2"] <= REL_L2, case
+
+
+def _check_op(case, fused_kernel, fp8_rows):
+    """The program took the form its row count selects and summed the
+    engines' rows: the fused kernel against the float32 reference of its
+    roundings; above the cap, against each core's moe_scores_fn summed over
+    the cores (the path's own arithmetic, so what is checked is the gather,
+    reduce-scatter and all-reduce around it)."""
+    assert case["fused_kernel"] is fused_kernel, case
+    assert case["fp8_rows"] is fp8_rows, case
+    assert case["all_gather"] is not fused_kernel, case
+    assert case["nan"] == 0, case
+    assert case["padded_rows_zero"], case
+    assert case["rel_l2" if fused_kernel else "rel_l2_served"] <= REL_L2, case
 
 
 def _race_control():
@@ -241,22 +386,28 @@ def _race_control():
 def _worker():
     import jax
     import numpy as np
+    from jax._src import tpu_info as pipeline_tpu_info
     from jax._src.pallas.mosaic import tpu_info
     from jax._src.pallas.mosaic.interpret import interpret_pallas_call
     from jax.experimental.pallas import tpu as pltpu
     from jax.sharding import Mesh
+
+    from vllm_torchtpu.kernels.experimental.moe_lowtok import kernel
 
     def tpu7x():
         return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
 
     pltpu.get_tpu_info = tpu7x
     tpu_info.get_tpu_info = tpu7x
+    # The grouped matmul above the op's cap tiles its pipeline by this one.
+    pipeline_tpu_info.get_tpu_info = tpu7x
 
     devices = sorted(jax.devices("cpu"), key=lambda d: d.id)
     assert len(devices) == DP * TP, devices
-    run = _case_runner(Mesh(np.asarray(devices).reshape(DP, TP), ("dp", "tp")))
+    mesh = Mesh(np.asarray(devices).reshape(DP, TP), ("dp", "tp"))
+    run = _case_runner(mesh)
 
-    result = {"race_control": _race_control(), "cases": {}}
+    result = {"race_control": _race_control(), "cases": {}, "op_cases": {}}
     bits = {}
     for name, case in CASES.items():
         pltpu.reset_tpu_interpret_mode_state()
@@ -268,6 +419,15 @@ def _worker():
     result["fp8_dispatch_bit_identical"] = bool(
         np.array_equal(bits["served_32"], bits["bf16_dispatch_32"])
     )
+    # moe_scores_fn's few-token branch serves the gathered rows above the cap:
+    # the interpreter cannot run the grouped matmul's DMA pipeline.
+    run_op = _op_runner(mesh, OP_CAP, scores_cap=kernel.MOE_LOWTOK_MAX_TOKENS)
+    for name, (rows, _, _) in OP_CASES.items():
+        pltpu.reset_tpu_interpret_mode_state()
+        result["op_cases"][name] = _op_summary(*run_op(rows), rows)
+        result["op_cases"][name]["races_found"] = bool(
+            interpret_pallas_call.races.races_found
+        )
     print("RESULT " + json.dumps(result))
 
 
@@ -278,13 +438,18 @@ def on_8_devices():
         os.environ,
         JAX_PLATFORMS="cpu",
         XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count={DP * TP}",
+        # As the DP4 x TP2 decode leg runs the path above the op's cap.
+        TPU_MOE_SKIP_PADDED_TOKENS="1",
     )
+    # Below the CPU lane's 600 s pytest timeout, which this module-scoped
+    # setup counts against, so this one fires first and shows the child's
+    # output.
     proc = subprocess.run(
         [sys.executable, __file__],
         env=env,
         capture_output=True,
         text=True,
-        timeout=900,
+        timeout=540,
     )
     lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
     assert proc.returncode == 0 and lines, proc.stdout[-3000:] + proc.stderr[-3000:]
@@ -309,6 +474,18 @@ def test_fp8_dispatch_moves_the_same_expert_inputs(on_8_devices):
     """Rows pushed as per-row FP8 give the bytes the bf16 push gives: the
     expert pass quantizes the same rows the same way."""
     assert on_8_devices["fp8_dispatch_bit_identical"]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("name", sorted(OP_CASES))
+def test_op_program_sums_the_engine_rows_on_either_side_of_its_cap(on_8_devices, name):
+    """The torch op's program with operands in apply()'s order: at and below
+    its cap the fused kernel (FP8 rows where the rows per engine allow), above
+    it the all-gather, moe_scores_fn and reduce-scatter path; a row with no
+    finite logit (a padded row) adds nothing."""
+    case = on_8_devices["op_cases"][name]
+    assert not case["races_found"], case
+    _check_op(case, *OP_CASES[name][1:])
 
 
 def _call(rows=32, experts=E, **kwargs):
@@ -426,6 +603,43 @@ def test_compiled_kernel_at_the_qwen3_5_decode_shapes_on_tpu(tpu_mesh, name):
     """The forms the torch op runs, at the Qwen3.5-397B MoE layer's shapes."""
     _, case = _summary(*_case_runner(tpu_mesh, Q35_GEOMETRY)(*Q35_CASES[name]))
     _check(case)
+
+
+@pytest.fixture
+def armed_scores_cap(monkeypatch):
+    """The scores entry's cap left as the test found it, and padded-row
+    skipping on, as on the DP4 x TP2 decode leg."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
+
+    monkeypatch.setattr(moe_lowtok_scores, "_ARMED_MAX_TOKENS", 0)
+    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("name", sorted(OP_CASES))
+def test_compiled_op_program_on_tpu(tpu_mesh, armed_scores_cap, name):
+    """The torch op's program compiled, at the interpret checks' cases."""
+    from vllm_torchtpu.kernels.experimental.moe_lowtok import kernel
+
+    rows = OP_CASES[name][0]
+    run = _op_runner(tpu_mesh, OP_CAP, scores_cap=kernel.MOE_LOWTOK_MAX_TOKENS)
+    case = _op_summary(*run(rows), rows)
+    _check_op(case, *OP_CASES[name][1:])
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("name", sorted(Q35_OP_CASES))
+def test_compiled_op_program_at_the_qwen3_5_decode_shapes_on_tpu(
+    tpu_mesh, armed_scores_cap, name
+):
+    """The torch op's program at the Qwen3.5-397B MoE layer's shapes and the
+    served cap: the fused kernel at and below 112 rows per engine, the grouped
+    matmul path above."""
+    rows = Q35_OP_CASES[name][0]
+    run = _op_runner(tpu_mesh, Q35_OP_CAP, Q35_GEOMETRY)
+    case = _op_summary(*run(rows), rows)
+    _check_op(case, *Q35_OP_CASES[name][1:])
 
 
 if __name__ == "__main__":
