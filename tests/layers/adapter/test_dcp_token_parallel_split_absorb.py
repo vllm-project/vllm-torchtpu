@@ -15,10 +15,15 @@
 
 from types import SimpleNamespace
 
+import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
 import torch
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.kernels.mla import dcp_token_parallel
+from vllm_torchtpu.kernels.mla import dcp_token_parallel, kv_cache_utils
 from vllm_torchtpu.layers.adapter import attention as attention_adapter
 from vllm_torchtpu.layers.adapter import dcp_token_parallel_op
 
@@ -223,3 +228,149 @@ def test_should_compute_exact_fake_shapes_for_absorb_q_split():
     head, tail = attention_adapter._fake_absorb_q_split(q_nope, w_uk_t, 64)  # noqa: SLF001 -- verifying registered torch fake kernel shape contract directly on CPU
     assert tuple(head.shape) == (64, 64, 512)
     assert tuple(tail.shape) == (1024, 64, 512)
+
+
+def test_should_route_oproj_op_through_overlapped_lead_attention_and_project_from_v(
+    monkeypatch,
+):
+    dcp = 4
+    if len(jax.devices()) < dcp:
+        pytest.skip(f"needs {dcp} devices")
+    mesh = Mesh(np.array(jax.devices()[:dcp]), ("dcp",))
+    shd = NamedSharding(mesh, P("dcp"))
+    _capture_built_ops(monkeypatch, q_replicated=True, local_oproj=True)
+    captured_real: list[dict] = []
+
+    def fake_pcp_op(name, fn, **kwargs):
+        rec = {"name": name, "fn": fn, "kwargs": kwargs}
+
+        def rec_call(*args):
+            return args
+
+        def register_fake(fake_fn):
+            del fake_fn
+
+        rec_call.register_fake = register_fake
+        captured_real.append(rec)
+        return rec_call
+
+    monkeypatch.setattr(dcp_token_parallel_op, "pcp_streaming_jax_op", fake_pcp_op)
+    layout = _make_layout(dcp_size=dcp, split_rows=8)
+    layer = _make_fake_layer()
+    nope_spec = kv_cache_utils.SparseMLAKVCacheSpec.create(
+        kv_cache_utils.KVCacheType.NOPE,
+        kv_cache_utils.KVCacheLayout.TENSORCORE,
+        4,
+        16,
+        512,
+        1,
+    )
+    rope_spec = kv_cache_utils.SparseMLAKVCacheSpec.create(
+        kv_cache_utils.KVCacheType.ROPE,
+        kv_cache_utils.KVCacheLayout.TENSORCORE,
+        4,
+        16,
+        64,
+        1,
+    )
+    layer.mla_kv_spec = (nope_spec, rope_spec)
+    impl = SimpleNamespace(_dcp_mesh=mesh, dcp_size=dcp, dcp_interleave_size=1)
+
+    calls: list[str] = []
+
+    def fake_write(nope, rope, *a, **kw):
+        return nope, rope
+
+    def fake_dcp_attn(q_dcp, pe_dcp, kvc, kpe, nope, rope, *a, **kw):
+        calls.append("lead_dcp")
+        part = jax.device_put(jnp.zeros((dcp * 8, 16, 32), jnp.bfloat16), shd)
+        lse = jax.device_put(jnp.zeros((dcp * 8, 16), jnp.float32), shd)
+        return nope, rope, part, lse
+
+    def fake_with_lead(lay, m, ax, nope, rope, *a, **kw):
+        calls.append("with_lead")
+        own_v = jax.device_put(jnp.zeros((dcp * 16, 16, 16), jnp.bfloat16), shd)
+        lead_v = jnp.zeros((8, 16, 16), jnp.bfloat16)
+        return nope, rope, own_v, lead_v
+
+    def fake_from_v(lay, m, ax, lead_v, own_v, *a, **kw):
+        calls.append("from_v")
+        return jax.device_put(jnp.zeros((dcp * 16, 32), jnp.bfloat16), shd)
+
+    def fake_plain_tp(lay, m, ax, nope, rope, *a, **kw):
+        calls.append("plain_tp")
+        out = jax.device_put(jnp.zeros((dcp * 64, 4, 16), jnp.bfloat16), shd)
+        return nope, rope, out
+
+    monkeypatch.setattr(
+        dcp_token_parallel_op, "update_sparse_mla_kv_cache_dcp", fake_write
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.core.attention_interface.sparse_mla_attention_dcp",
+        fake_dcp_attn,
+    )
+    monkeypatch.setattr(
+        dcp_token_parallel, "sparse_mla_attention_with_lead", fake_with_lead
+    )
+    monkeypatch.setattr(dcp_token_parallel, "project_sequence_rows_from_v", fake_from_v)
+    monkeypatch.setattr(dcp_token_parallel, "sparse_mla_attention", fake_plain_tp)
+    dcp_token_parallel_op.build_attention_op(layer, impl, layout, q_replicated=True)
+
+    nope = jax.device_put(jnp.zeros((dcp * 4, 16, 4, 32), jnp.uint8), shd)
+    rope = jax.device_put(jnp.zeros((dcp * 4, 4, 4, 8), jnp.uint8), shd)
+    q_head = jax.device_put(jnp.zeros((dcp * 8, 16, 32), jnp.bfloat16), shd)
+    q_tail = jax.device_put(jnp.zeros((dcp * 16, 16, 32), jnp.bfloat16), shd)
+    q_pe = jax.device_put(jnp.zeros((dcp * 24, 16, 8), jnp.bfloat16), shd)
+    kv_c = jnp.zeros((64, 32), jnp.bfloat16)
+    k_pe = jnp.zeros((64, 8), jnp.bfloat16)
+    topk = jax.device_put(jnp.zeros((dcp * 24, 4), jnp.int32), shd)
+    sl = jnp.asarray([64, 0], jnp.int32)
+    bt = jnp.zeros((8,), jnp.int32)
+    qsl = jnp.asarray([0, 64, 64], jnp.int32)
+    dist = jnp.asarray([0, 0, 1], jnp.int32)
+    ranks = jax.device_put(jnp.arange(dcp, dtype=jnp.int32), shd)
+    w_uv = jnp.zeros((16, 32, 16), jnp.bfloat16)
+    w_o = jax.device_put(jnp.zeros((dcp * 128, 32), jnp.float8_e4m3fn), shd)
+    s_o = jax.device_put(jnp.ones((dcp * 32,), jnp.float32), shd)
+
+    oproj_fn = captured_real[1]["fn"]
+    base_fn = captured_real[0]["fn"]
+    oproj_fn(
+        nope,
+        rope,
+        q_head,
+        q_tail,
+        q_pe,
+        kv_c,
+        k_pe,
+        topk,
+        sl,
+        bt,
+        qsl,
+        dist,
+        ranks,
+        w_uv,
+        w_o,
+        s_o,
+    )
+    assert calls == ["lead_dcp", "with_lead", "from_v"]
+
+    calls.clear()
+    w_uv_shd = jax.device_put(jnp.zeros((dcp * 4, 32, 16), jnp.bfloat16), shd)
+    base_fn(
+        nope,
+        rope,
+        q_head,
+        q_tail,
+        q_pe,
+        kv_c,
+        k_pe,
+        topk,
+        sl,
+        bt,
+        qsl,
+        dist,
+        ranks,
+        w_uv_shd,
+    )
+    assert calls == ["lead_dcp", "plain_tp"]

@@ -576,6 +576,75 @@ def _project_fp8_pair_halves(
     return (y * x_scale * s_local.astype(jnp.float32)[None, :]).astype(rows.dtype)
 
 
+def _merge_lead_partial_to_v(
+    lead_partial: jax.Array,
+    lead_lse: jax.Array,
+    w_uv_all: jax.Array,
+    axis_name: str,
+    out_dtype: jnp.dtype,
+) -> jax.Array:
+    lses = lax.all_gather(lead_lse, axis_name, axis=0, tiled=False)
+    m = jax.nn.logsumexp(lses, axis=0)
+    safe_m = jnp.where(jnp.isfinite(m), m, 0.0)
+    w = jnp.where(jnp.isfinite(lead_lse), jnp.exp(lead_lse - safe_m), 0.0)
+    weighted = (lead_partial.astype(jnp.float32) * w[..., None]).astype(
+        lead_partial.dtype
+    )
+    lead_latent = lax.psum(weighted, axis_name)
+    return jnp.einsum(
+        "rhl,hlv->rhv", lead_latent, w_uv_all.astype(lead_latent.dtype)
+    ).astype(out_dtype)
+
+
+def _project_w_uv(out: jax.Array, w_uv_all: jax.Array) -> jax.Array:
+    return (
+        jnp.einsum(
+            "hrl,hlv->hrv",
+            jnp.swapaxes(out, 0, 1),
+            w_uv_all.astype(out.dtype),
+        )
+        .swapaxes(0, 1)
+        .astype(out.dtype)
+    )
+
+
+def project_sequence_rows_from_v(
+    layout: TokenParallelLayout,
+    mesh: Mesh,
+    axis_name: str,
+    lead_v: jax.Array,
+    own_out: jax.Array,
+    rank_ids: jax.Array,
+    w_o: jax.Array,
+    w_o_scale: jax.Array,
+) -> jax.Array:
+    """Shift pre-projected lead/own rows to sequence rows and apply o_proj."""
+    sharded = P(axis_name)
+
+    def _local(lead_rows, own, rank_arr, w_shard, s_shard):
+        # Avoid projecting s + R rows (an extra partial tile) before shifting:
+        # shifting to each rank's R sequence rows first keeps quantize_rows and
+        # o_proj on exact R rows while remaining bit-exact.
+        seq_rows = token_rows_to_sequence_rows(
+            layout,
+            own.reshape(own.shape[0], -1),
+            lead_rows.reshape(lead_rows.shape[0], -1),
+            rank_arr[0],
+            axis_name,
+        )
+        return project_all_heads(
+            seq_rows, w_shard, s_shard, rank_arr[0], axis_name, layout.dcp_size
+        )
+
+    return jax.shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(P(), sharded, sharded, sharded, sharded),
+        out_specs=sharded,
+        check_vma=False,
+    )(lead_v, own_out, rank_ids, w_o, w_o_scale)
+
+
 def project_sequence_rows(
     layout: TokenParallelLayout,
     mesh: Mesh,
@@ -615,15 +684,9 @@ def project_sequence_rows(
     sharded = P(axis_name)
 
     def _local(part, lse_part, own, rank_arr, w_uv_all, w_shard, s_shard):
-        lses = lax.all_gather(lse_part, axis_name, axis=0, tiled=False)
-        m = jax.nn.logsumexp(lses, axis=0)
-        safe_m = jnp.where(jnp.isfinite(m), m, 0.0)
-        w = jnp.where(jnp.isfinite(lse_part), jnp.exp(lse_part - safe_m), 0.0)
-        weighted = (part.astype(jnp.float32) * w[..., None]).astype(part.dtype)
-        lead_latent = lax.psum(weighted, axis_name)
-        lead_v = jnp.einsum(
-            "rhl,hlv->rhv", lead_latent, w_uv_all.astype(lead_latent.dtype)
-        ).astype(own.dtype)
+        lead_v = _merge_lead_partial_to_v(
+            part, lse_part, w_uv_all, axis_name, own.dtype
+        )
         # Avoid projecting s + R rows (an extra partial tile) before shifting:
         # shifting to each rank's R sequence rows first keeps quantize_rows and
         # o_proj on exact R rows while remaining bit-exact.
@@ -659,6 +722,175 @@ SelectTopkFn = Callable[
 
 def _rank(rank_ids: tuple[jax.Array, ...], axis_name: str, dcp: int) -> jax.Array:
     return rank_ids[0][0] if rank_ids else rank_as_data(axis_name, dcp)
+
+
+def _sparse_mla_attention_core(
+    layout: TokenParallelLayout,
+    mesh: Mesh,
+    axis_name: str,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    q: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    flat_topk: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    *,
+    write_kv: WriteKVFn | None,
+    attend: Callable[..., jax.Array],
+    rank_ids: jax.Array | None = None,
+    q_own_rows: bool = False,
+    read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
+    w_uv: jax.Array | None = None,
+    q_pe: jax.Array | None = None,
+    token_rows: bool = False,
+    w_uv_replicated: bool = False,
+    lead_partial: jax.Array | None = None,
+    lead_lse: jax.Array | None = None,
+) -> tuple[jax.Array, ...]:
+    if (lead_partial is None) != (lead_lse is None):
+        raise ValueError("lead_partial and lead_lse must be passed together")
+    has_lead = lead_partial is not None
+    if has_lead and (w_uv is None or not token_rows):
+        raise ValueError("lead_partial/lead_lse require w_uv and token_rows=True")
+
+    dcp = layout.dcp_size
+    sharded = P(axis_name)
+    rep = P()
+
+    def _local(nope, rope, q, kv_c, k_pe, topk, seq_lens, bt, qsl, dist, *extra_args):
+        idx = 0
+        q_pe_local = None
+        if q_pe is not None:
+            q_pe_local = extra_args[idx]
+            idx += 1
+        n_rank = 1 if rank_ids is not None else 0
+        rank_arg = extra_args[idx : idx + n_rank]
+        idx += n_rank
+        w_uv_local = None
+        if w_uv is not None:
+            w_uv_local = extra_args[idx]
+            idx += 1
+        lead_part_local = lead_lse_local = None
+        if has_lead:
+            lead_part_local, lead_lse_local = extra_args[idx], extra_args[idx + 1]
+        rank = _rank(rank_arg, axis_name, dcp)
+        if write_kv is not None:
+            nope, rope = write_kv(nope, rope, kv_c, k_pe, seq_lens, bt, qsl, rank)
+        # Keep cache arrays in their [pages, rows, 128] layout across the cap
+        # switch rather than propagating the SparseCore writer's 32-word view.
+        nope, rope = lax.optimization_barrier((nope, rope))
+        pages, offsets = step_pages(layout, seq_lens, qsl, dist[2])
+        page_ids = gather_page_ids(layout, bt, pages, offsets, nope.shape[0])
+        q_tok = q if q_own_rows else heads_to_tokens(layout, q, axis_name)
+        q_pe_tok = (
+            None
+            if q_pe_local is None
+            else (
+                q_pe_local
+                if q_own_rows
+                else heads_to_tokens(layout, q_pe_local, axis_name)
+            )
+        )
+        rr = rank_rows(layout, rank, kv_c.shape[0], seq_lens, qsl, dist[2])
+        w_uv_all = (
+            None
+            if w_uv_local is None
+            else (
+                w_uv_local
+                if w_uv_replicated
+                else lax.all_gather(w_uv_local, axis_name, axis=0, tiled=True)
+            )
+        )
+
+        # Gather and attend at the step's page count: the kernel reads a
+        # buffer of `cap` pages per rank, with no padding copy to max_pages.
+        # Running W_UV inside the branch avoids a relayout copy across the
+        # switch boundary and halves switch output bytes.
+        def branch(cap: int) -> Callable[[], Any]:
+            def run() -> Any:
+                g_nope, g_rope = gather_latent(
+                    nope, rope, page_ids[:cap], axis_name, read_pages
+                )
+                flat = restride_flat_rows(layout, topk, cap)
+                lead_v = None
+                if has_lead:
+                    assert (
+                        lead_part_local is not None
+                        and lead_lse_local is not None
+                        and w_uv_all is not None
+                    )
+                    # Avoid hoisting lead LSE AG / psum ahead of gather_latent:
+                    # tying both via optimization_barrier prevents ICI contention
+                    # with gather_latent while overlapping lead collectives with
+                    # the zero-ICI attention kernel.
+                    g_nope, g_rope, lp_t, ll_t = lax.optimization_barrier(
+                        (g_nope, g_rope, lead_part_local, lead_lse_local)
+                    )
+                    lead_v = _merge_lead_partial_to_v(
+                        lp_t, ll_t, w_uv_all, axis_name, q_tok.dtype
+                    )
+                if q_pe_tok is not None:
+                    out = attend(q_tok, g_nope, g_rope, flat, rr.num_rows, q_pe_tok)
+                else:
+                    out = attend(q_tok, g_nope, g_rope, flat, rr.num_rows)
+                if w_uv_all is not None:
+                    out = _project_w_uv(out, w_uv_all)
+                if has_lead:
+                    assert lead_v is not None
+                    return out, lead_v
+                return out
+
+            return run
+
+        switched = _switch_on_cap(layout, jnp.sum(pages), branch)
+        if has_lead:
+            out, lead_v = switched
+            return nope, rope, out, lead_v
+        out = switched
+        if token_rows:
+            return nope, rope, out
+        return nope, rope, tokens_to_heads(out, axis_name)
+
+    extra: tuple[jax.Array, ...] = ()
+    if q_pe is not None:
+        extra = (*extra, q_pe)
+    if rank_ids is not None:
+        extra = (*extra, rank_ids)
+    extra_specs = (sharded,) * len(extra)
+    if w_uv is not None:
+        extra = (*extra, w_uv)
+        extra_specs = (*extra_specs, rep if w_uv_replicated else sharded)
+    if has_lead:
+        assert lead_partial is not None and lead_lse is not None
+        extra = (*extra, lead_partial, lead_lse)
+        extra_specs = (*extra_specs, sharded, sharded)
+    out_specs = (
+        (sharded, sharded, sharded, rep) if has_lead else (sharded, sharded, sharded)
+    )
+    return jax.shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(sharded, sharded, sharded, rep, rep, sharded, rep, rep, rep, rep)
+        + extra_specs,
+        out_specs=out_specs,
+        check_vma=False,
+    )(
+        kv_cache_nope,
+        kv_cache_rope,
+        q,
+        kv_c_normed,
+        k_pe,
+        flat_topk,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        *extra,
+    )
 
 
 def sparse_mla_attention(
@@ -710,91 +942,10 @@ def sparse_mla_attention(
       With `w_uv_replicated`, `w_uv` is every head's `[H, L, V]` on every
       rank (no per-step all-gather of it).
     """
-    dcp = layout.dcp_size
-    sharded = P(axis_name)
-    rep = P()
-
-    def _local(nope, rope, q, kv_c, k_pe, topk, seq_lens, bt, qsl, dist, *extra_args):
-        idx = 0
-        q_pe_local = None
-        if q_pe is not None:
-            q_pe_local = extra_args[idx]
-            idx += 1
-        n_rank = 1 if rank_ids is not None else 0
-        rank_arg = extra_args[idx : idx + n_rank]
-        idx += n_rank
-        w_uv_local = extra_args[idx] if w_uv is not None else None
-        rank = _rank(rank_arg, axis_name, dcp)
-        if write_kv is not None:
-            nope, rope = write_kv(nope, rope, kv_c, k_pe, seq_lens, bt, qsl, rank)
-        # Keep cache arrays in their [pages, rows, 128] layout across the cap
-        # switch rather than propagating the SparseCore writer's 32-word view.
-        nope, rope = lax.optimization_barrier((nope, rope))
-        pages, offsets = step_pages(layout, seq_lens, qsl, dist[2])
-        page_ids = gather_page_ids(layout, bt, pages, offsets, nope.shape[0])
-        q_tok = q if q_own_rows else heads_to_tokens(layout, q, axis_name)
-        q_pe_tok = (
-            None
-            if q_pe_local is None
-            else (
-                q_pe_local
-                if q_own_rows
-                else heads_to_tokens(layout, q_pe_local, axis_name)
-            )
-        )
-        rr = rank_rows(layout, rank, kv_c.shape[0], seq_lens, qsl, dist[2])
-
-        # Gather and attend at the step's page count: the kernel reads a
-        # buffer of `cap` pages per rank, with no padding copy to max_pages.
-        def branch(cap: int) -> Callable[[], jax.Array]:
-            def run() -> jax.Array:
-                g_nope, g_rope = gather_latent(
-                    nope, rope, page_ids[:cap], axis_name, read_pages
-                )
-                flat = restride_flat_rows(layout, topk, cap)
-                if q_pe_tok is not None:
-                    return attend(q_tok, g_nope, g_rope, flat, rr.num_rows, q_pe_tok)
-                return attend(q_tok, g_nope, g_rope, flat, rr.num_rows)
-
-            return run
-
-        out = _switch_on_cap(layout, jnp.sum(pages), branch)
-        if w_uv_local is not None:
-            w_uv_all = (
-                w_uv_local
-                if w_uv_replicated
-                else lax.all_gather(w_uv_local, axis_name, axis=0, tiled=True)
-            )
-            out = (
-                jnp.einsum(
-                    "hrl,hlv->hrv",
-                    jnp.swapaxes(out, 0, 1),
-                    w_uv_all.astype(out.dtype),
-                )
-                .swapaxes(0, 1)
-                .astype(out.dtype)
-            )
-        if token_rows:
-            return nope, rope, out
-        return nope, rope, tokens_to_heads(out, axis_name)
-
-    extra: tuple[jax.Array, ...] = ()
-    if q_pe is not None:
-        extra = (*extra, q_pe)
-    if rank_ids is not None:
-        extra = (*extra, rank_ids)
-    extra_specs = (sharded,) * len(extra)
-    if w_uv is not None:
-        extra = (*extra, w_uv)
-        extra_specs = (*extra_specs, rep if w_uv_replicated else sharded)
-    return jax.shard_map(
-        _local,
-        mesh=mesh,
-        in_specs=(sharded, sharded, sharded, rep, rep, sharded, rep, rep, rep, rep)
-        + extra_specs,
-        out_specs=(sharded, sharded, sharded),
-        check_vma=False,
-    )(
+    nope, rope, out = _sparse_mla_attention_core(
+        layout,
+        mesh,
+        axis_name,
         kv_cache_nope,
         kv_cache_rope,
         q,
@@ -805,8 +956,73 @@ def sparse_mla_attention(
         block_tables,
         query_start_loc,
         request_distribution,
-        *extra,
+        write_kv=write_kv,
+        attend=attend,
+        rank_ids=rank_ids,
+        q_own_rows=q_own_rows,
+        read_pages=read_pages,
+        w_uv=w_uv,
+        q_pe=q_pe,
+        token_rows=token_rows,
+        w_uv_replicated=w_uv_replicated,
     )
+    return nope, rope, out
+
+
+def sparse_mla_attention_with_lead(
+    layout: TokenParallelLayout,
+    mesh: Mesh,
+    axis_name: str,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    q: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    flat_topk: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    *,
+    lead_partial: jax.Array,
+    lead_lse: jax.Array,
+    write_kv: WriteKVFn | None,
+    attend: Callable[..., jax.Array],
+    w_uv: jax.Array,
+    rank_ids: jax.Array | None = None,
+    q_own_rows: bool = False,
+    read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
+    q_pe: jax.Array | None = None,
+    w_uv_replicated: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Run token-parallel sparse MLA with overlapped lead merge + W_UV inside branch."""
+    nope, rope, own_v, lead_v = _sparse_mla_attention_core(
+        layout,
+        mesh,
+        axis_name,
+        kv_cache_nope,
+        kv_cache_rope,
+        q,
+        kv_c_normed,
+        k_pe,
+        flat_topk,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        write_kv=write_kv,
+        attend=attend,
+        rank_ids=rank_ids,
+        q_own_rows=q_own_rows,
+        read_pages=read_pages,
+        w_uv=w_uv,
+        q_pe=q_pe,
+        token_rows=True,
+        w_uv_replicated=w_uv_replicated,
+        lead_partial=lead_partial,
+        lead_lse=lead_lse,
+    )
+    return nope, rope, own_v, lead_v
 
 
 def indexer_topk(

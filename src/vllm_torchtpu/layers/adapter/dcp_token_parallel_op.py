@@ -662,11 +662,48 @@ def build_attention_op(
             merge_pieces=False,
             skip_kv_write=True,
         )
-        own_rank_ids = (
-            _tie_rank_to_partial(partial, rank_ids, mesh, shd)
-            if w_o is not None and rank_ids is not None
-            else rank_ids
-        )
+        if w_o is not None:
+            assert s_o is not None and w_uv is not None and rank_ids is not None
+            _, _, tail_out, lead_v = dcp_token_parallel.sparse_mla_attention_with_lead(
+                layout,
+                mesh,
+                DCP_AXIS_NAME,
+                kv_cache_nope,
+                kv_cache_rope,
+                q_tp,
+                kv_c_normed,
+                k_pe,
+                tail_topk,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                lead_partial=partial,
+                lead_lse=lse,
+                write_kv=None,
+                attend=attend,
+                w_uv=w_uv,
+                rank_ids=rank_ids,
+                q_own_rows=q_replicated,
+                read_pages=read_pages,
+                q_pe=pe_tp,
+                w_uv_replicated=True,
+            )
+            return (
+                kv_cache_nope,
+                kv_cache_rope,
+                dcp_token_parallel.project_sequence_rows_from_v(
+                    layout,
+                    mesh,
+                    DCP_AXIS_NAME,
+                    lead_v,
+                    tail_out,
+                    rank_ids,
+                    w_o,
+                    s_o,
+                ),
+            )
+
         _, _, tail_out = dcp_token_parallel.sparse_mla_attention(
             layout,
             mesh,
@@ -683,33 +720,14 @@ def build_attention_op(
             request_distribution,
             write_kv=None,
             attend=attend,
-            rank_ids=own_rank_ids,
+            rank_ids=rank_ids,
             q_own_rows=q_replicated,
             read_pages=read_pages,
             w_uv=w_uv,
             q_pe=pe_tp,
-            token_rows=w_o is not None,
-            w_uv_replicated=w_o is not None,
+            token_rows=False,
+            w_uv_replicated=False,
         )
-
-        if w_o is not None:
-            assert s_o is not None and w_uv is not None and rank_ids is not None
-            return (
-                kv_cache_nope,
-                kv_cache_rope,
-                dcp_token_parallel.project_sequence_rows(
-                    layout,
-                    mesh,
-                    DCP_AXIS_NAME,
-                    partial,
-                    lse,
-                    tail_out,
-                    rank_ids,
-                    w_uv,
-                    w_o,
-                    s_o,
-                ),
-            )
 
         def _merge_and_join(part, lse_part, tail_local, *w_uv_arg):
             lses = jax.lax.all_gather(lse_part, DCP_AXIS_NAME, axis=0, tiled=False)
@@ -1176,7 +1194,6 @@ def build_attention_op(
     # TPU_DCP_TP_PREFILL_LOCAL_OPROJ needs the fused sub-batch op with the DCP
     # rank operand and W_UV in the op; other layers keep o_proj outside.
     if envs.TPU_DCP_TP_PREFILL_LOCAL_OPROJ and fused_subbatch and has_rank and uv_in_tp:
-
         if split_q_inputs:
 
             def w_oproj(
@@ -1417,11 +1434,7 @@ def attention(
         if getattr(tp_op, "uv_in_tp", False):
             # The sequence-row o_proj takes every head's W_UV (replicated).
             w_uv_src = layer.W_UV if w_o is None else layer.W_UV_tp_all
-            w_uv_arg = (
-                w_uv_src.to(q_dtype)
-                if w_uv_src.dtype != q_dtype
-                else w_uv_src
-            )
+            w_uv_arg = w_uv_src.to(q_dtype) if w_uv_src.dtype != q_dtype else w_uv_src
         out = tp_op(
             kv_cache,
             ql_nope,

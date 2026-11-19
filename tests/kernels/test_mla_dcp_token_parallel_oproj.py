@@ -370,3 +370,244 @@ def test_should_keep_rank_tie_zero_delta_for_all_65536_bf16_bit_patterns():
 
     _walk(jaxpr.jaxpr)
     assert "optimization_barrier" in prims
+
+
+def test_should_match_serial_sequence_rows_when_lead_merge_and_w_uv_in_branch():
+    dcp = 4
+    mesh = _mesh(dcp)
+    split_rows = 2
+    rows_per_rank = 4
+    num_tokens = dcp * rows_per_rank
+    heads, lkv, vdim, hidden = 4, 8, 6, 12
+    page_size = 4
+    layout = tp.TokenParallelLayout(
+        dcp_size=dcp,
+        interleave_size=1,
+        page_size=page_size,
+        split_rows=split_rows,
+        max_pages=2,
+        gather_caps=(1, 2),
+    )
+    rng = np.random.default_rng(137)
+    nope_cache = _sharded(
+        mesh, rng.standard_normal((dcp * 2, page_size, lkv)).astype(np.float32)
+    )
+    rope_cache = _sharded(
+        mesh, rng.standard_normal((dcp * 2, page_size, 4)).astype(np.float32)
+    )
+    q = _sharded(
+        mesh,
+        rng.standard_normal((dcp * rows_per_rank, heads, lkv)).astype(np.float32),
+    ).astype(jnp.bfloat16)
+    kv_c = jnp.zeros((num_tokens, lkv), jnp.bfloat16)
+    k_pe = jnp.zeros((num_tokens, 4), jnp.bfloat16)
+    flat_topk = _sharded(
+        mesh,
+        rng.integers(0, dcp * page_size, size=(dcp * rows_per_rank, 4), dtype=np.int32),
+    )
+    seq_lens = jnp.asarray([num_tokens], jnp.int32)
+    block_tables = jnp.asarray([0, 1], jnp.int32)
+    qsl = jnp.asarray([0, num_tokens], jnp.int32)
+    dist = jnp.asarray([0, 0, 1], jnp.int32)
+    rank_ids = _sharded(mesh, np.arange(dcp, dtype=np.int32))
+    w_uv = jnp.asarray(
+        rng.standard_normal((heads, lkv, vdim)).astype(np.float32) * 0.2,
+        jnp.bfloat16,
+    )
+    lead_part = _sharded(
+        mesh,
+        (rng.standard_normal((dcp * split_rows, heads, lkv)) * 0.5).astype(np.float32),
+    ).astype(jnp.bfloat16)
+    lead_lse_np = rng.standard_normal((dcp * split_rows, heads)).astype(np.float32)
+    # Anti-cancellation: non-finite -inf rows on one rank and all ranks for a head.
+    lead_lse_np[0, 1] = -np.inf
+    lead_lse_np[1::split_rows, 3] = -np.inf
+    lead_lse = _sharded(mesh, lead_lse_np)
+    w_q_full, s_full = _whole_k_fp8(rng, heads * vdim, hidden)
+    half = heads * vdim // 2
+    w_o = np.concatenate(
+        [w_q_full[(r % 2) * half : (r % 2 + 1) * half] for r in range(dcp)]
+    )
+    w_o_shd = _sharded(mesh, w_o)
+    s_o_shd = _sharded(mesh, np.tile(s_full, dcp))
+
+    def _attend(q_tok, g_nope, g_rope, flat, num_rows):
+        del g_rope, flat, num_rows
+        scale = jnp.mean(g_nope.astype(jnp.float32)) * jnp.float32(1e-3)
+        return (q_tok.astype(jnp.float32) + scale).astype(q_tok.dtype)
+
+    _, _, own_ref = tp.sparse_mla_attention(
+        layout,
+        mesh,
+        AXIS,
+        nope_cache,
+        rope_cache,
+        q,
+        kv_c,
+        k_pe,
+        flat_topk,
+        seq_lens,
+        block_tables,
+        qsl,
+        dist,
+        write_kv=None,
+        attend=_attend,
+        rank_ids=rank_ids,
+        q_own_rows=True,
+        w_uv=w_uv,
+        token_rows=True,
+        w_uv_replicated=True,
+    )
+    want = tp.project_sequence_rows(
+        layout,
+        mesh,
+        AXIS,
+        lead_part,
+        lead_lse,
+        own_ref,
+        rank_ids,
+        w_uv,
+        w_o_shd,
+        s_o_shd,
+    )
+
+    _, _, own_got, lead_v_got = tp.sparse_mla_attention_with_lead(
+        layout,
+        mesh,
+        AXIS,
+        nope_cache,
+        rope_cache,
+        q,
+        kv_c,
+        k_pe,
+        flat_topk,
+        seq_lens,
+        block_tables,
+        qsl,
+        dist,
+        lead_partial=lead_part,
+        lead_lse=lead_lse,
+        write_kv=None,
+        attend=_attend,
+        w_uv=w_uv,
+        rank_ids=rank_ids,
+        q_own_rows=True,
+        w_uv_replicated=True,
+    )
+    got = tp.project_sequence_rows_from_v(
+        layout,
+        mesh,
+        AXIS,
+        lead_v_got,
+        own_got,
+        rank_ids,
+        w_o_shd,
+        s_o_shd,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
+    )
+
+    # Structural check: lead all_gather, lead psum, optimization_barrier, and
+    # W_UV dot_general live inside the cap switch branches, not outside.
+    jaxpr = jax.make_jaxpr(
+        lambda *a: tp.sparse_mla_attention_with_lead(
+            layout,
+            mesh,
+            AXIS,
+            *a[:10],
+            lead_partial=a[10],
+            lead_lse=a[11],
+            write_kv=None,
+            attend=_attend,
+            w_uv=a[12],
+            rank_ids=a[13],
+            q_own_rows=True,
+            w_uv_replicated=True,
+        )
+    )(
+        nope_cache,
+        rope_cache,
+        q,
+        kv_c,
+        k_pe,
+        flat_topk,
+        seq_lens,
+        block_tables,
+        qsl,
+        dist,
+        lead_part,
+        lead_lse,
+        w_uv,
+        rank_ids,
+    )
+    in_cond_prims: set[str] = set()
+    outside_cond_prims: set[str] = set()
+
+    def _walk_scope(jpr, inside_cond: bool):
+        for eqn in jpr.eqns:
+            is_cond = eqn.primitive.name == "cond"
+            target = in_cond_prims if inside_cond else outside_cond_prims
+            target.add(eqn.primitive.name)
+            for sub in jax.core.jaxprs_in_params(eqn.params):
+                _walk_scope(sub, inside_cond or is_cond)
+
+    _walk_scope(jaxpr.jaxpr, False)
+    assert {
+        "all_gather",
+        "psum",
+        "optimization_barrier",
+        "dot_general",
+    } <= in_cond_prims
+    assert "psum" not in outside_cond_prims
+    assert "dot_general" not in outside_cond_prims
+
+
+def test_should_reject_partial_or_invalid_lead_merge_arguments():
+    dcp = 4
+    mesh = _mesh(dcp)
+    layout = _layout(dcp, 2)
+    shd = _sharded(mesh, np.zeros((dcp, 1), dtype=np.float32))
+    rep = jnp.zeros((1,), dtype=np.float32)
+    with pytest.raises(ValueError, match="together"):
+        tp._sparse_mla_attention_core(  # noqa: SLF001 -- fail-fast guard test
+            layout,
+            mesh,
+            AXIS,
+            shd,
+            shd,
+            shd,
+            rep,
+            rep,
+            shd,
+            rep,
+            rep,
+            rep,
+            rep,
+            write_kv=None,
+            attend=lambda *a: a[0],
+            lead_partial=shd,
+            lead_lse=None,
+        )
+    with pytest.raises(ValueError, match="token_rows=True"):
+        tp._sparse_mla_attention_core(  # noqa: SLF001 -- fail-fast guard test
+            layout,
+            mesh,
+            AXIS,
+            shd,
+            shd,
+            shd,
+            rep,
+            rep,
+            shd,
+            rep,
+            rep,
+            rep,
+            rep,
+            write_kv=None,
+            attend=lambda *a: a[0],
+            w_uv=rep,
+            token_rows=False,
+            lead_partial=shd,
+            lead_lse=shd,
+        )
