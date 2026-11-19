@@ -17,6 +17,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tests.distributed.tpu_test_utils import run_in_isolated_process
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import tpu_communicator as comm
 
@@ -300,16 +301,14 @@ def test_prefill_sized_steps_are_gathered_tensor_by_tensor(monkeypatch, communic
     assert group.all_gather.call_args_list[1].args[0] is logits
 
 
-@pytest.mark.tpu_test
-def test_packed_gather_is_bit_exact_on_device_under_compile(device, monkeypatch):
-    """On TPU, inside a fullgraph compile, int32 ids (small ids have bf16
-    subnormal lanes), fp32 weights with subnormals / NaN / inf / -0 and bf16
-    hidden states with NaN / inf come back bit-identical to per-tensor
-    gathers. A bf16 carrier fails this: TPU flushes the subnormal lanes."""
-    if device.type != "tpu":
-        pytest.skip("needs a TPU device")
-    # Pretend to be a warmup trace, which is where packing is allowed.
-    monkeypatch.setattr(shape_variants, "aot_cache_tag", lambda: "trace0")
+def _packed_gather_bit_exact_on_device():
+    """Body of the on-device test; runs in a spawned process (see below)."""
+    import torch_tpu  # noqa: F401
+
+    device = torch.device("tpu")
+    # Pretend to be a warmup trace on tpu7x, where packing is allowed.
+    shape_variants.aot_cache_tag = lambda: "trace0"
+    comm._chip_is_tpu7x = lambda: True
     gathers = []
 
     class FakeGroup:
@@ -342,3 +341,17 @@ def test_packed_gather_is_bit_exact_on_device_under_compile(device, monkeypatch)
         actual = actual.cpu()
         assert actual.dtype == reference.dtype and actual.shape == reference.shape
         assert torch.equal(actual.view(torch.uint8), reference.view(torch.uint8))
+
+
+@pytest.mark.tpu_test
+@pytest.mark.spawns_tpu_workers
+def test_packed_gather_is_bit_exact_on_device_under_compile():
+    """On TPU, inside a fullgraph compile, int32 ids (small ids have bf16
+    subnormal lanes), fp32 weights with subnormals / NaN / inf / -0 and bf16
+    hidden states with NaN / inf come back bit-identical to per-tensor
+    gathers. A bf16 carrier fails this: TPU flushes the subnormal lanes.
+
+    Runs in a spawned process so its TPU handles do not block later tests
+    that start their own engine processes.
+    """
+    run_in_isolated_process(_packed_gather_bit_exact_on_device)
