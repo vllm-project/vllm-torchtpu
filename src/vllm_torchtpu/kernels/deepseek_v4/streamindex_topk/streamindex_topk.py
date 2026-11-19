@@ -1239,6 +1239,82 @@ def convert_cache_to_seq_along_lane(
     )
 
 
+_SMALL_EFFECTIVE_ROW_GATHER_MAX_TOKENS = 4
+
+
+def _effective_global_visible(
+    seq_lens: jax.Array,  # i32[max_num_seqs]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
+    num_tokens: int,
+    compression_ratio: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Return global `(visible, valid)` per token before CP sharding/clamp."""
+    max_num_seqs = seq_lens.shape[0]
+    num_seqs = distribution[2]
+    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
+    # Avoid replacing dynamic gathers on tiny decode buckets (num_tokens <= 4):
+    # on 16-TC DCP decode the [4, max_num_seqs] reduction regresses c=1 ITL by
+    # +48..+195 us/step, whereas b >= 8 and prefill gain from gather-free VPU math.
+    if num_tokens <= _SMALL_EFFECTIVE_ROW_GATHER_MAX_TOKENS:
+        seq_mask = token_ids[:, None] >= cu_q_lens[None, 1 : max_num_seqs + 1]
+        seq_mask = jnp.where(
+            jnp.arange(max_num_seqs)[None, :] < num_seqs, seq_mask, False
+        )
+        seq_ids = jnp.sum(seq_mask, axis=1)
+        q_start = cu_q_lens[seq_ids]
+        q_len = cu_q_lens[seq_ids + 1] - q_start
+        seq_len = seq_lens[seq_ids]
+        token_pos = seq_len - q_len + (token_ids - q_start)
+        kv_len = seq_len // compression_ratio
+        visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+        valid = token_ids < cu_q_lens[num_seqs]
+        return visible, valid
+
+    seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
+    q_starts = cu_q_lens[:max_num_seqs]
+    q_ends = cu_q_lens[1 : max_num_seqs + 1]
+    # Avoid dynamic 1D gathers on cu_q_lens/seq_lens for b >= 8 and prefill:
+    # XLA lowers those as sequential gather fusions, whereas a masked int32
+    # reduction over [num_tokens, max_num_seqs] stays on the VPU (~6x faster).
+    in_seq = (
+        (seq_idx[None, :] < num_seqs)
+        & (token_ids[:, None] >= q_starts[None, :])
+        & (token_ids[:, None] < q_ends[None, :])
+    )
+    if compression_ratio == 1:
+        pos_off = (seq_lens - q_ends + jnp.int32(1))[None, :]
+        cand = jnp.minimum(seq_lens[None, :], token_ids[:, None] + pos_off)
+        visible = jnp.sum(jnp.where(in_seq, cand, jnp.int32(0)), axis=1)
+        return visible, visible > jnp.int32(0)
+    pos_off = seq_lens - q_ends
+    off = jnp.sum(jnp.where(in_seq, pos_off[None, :], jnp.int32(0)), axis=1)
+    seq_len = jnp.sum(jnp.where(in_seq, seq_lens[None, :], jnp.int32(0)), axis=1)
+    token_pos = token_ids + off
+    kv_len = seq_len // compression_ratio
+    visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+    valid = jnp.any(in_seq, axis=1)
+    return visible, valid
+
+
+def _clamp_local_visible(
+    visible: jax.Array,
+    valid: jax.Array,
+    *,
+    num_positions: int,
+    compression_ratio: int,
+    num_tokens: int,
+    cp_rank: jax.Array | int,
+    cp_size: int,
+    interleave_c: int,
+) -> jax.Array:
+    local = cp_local_length(visible, cp_rank, cp_size, interleave_c)
+    clamped = jnp.minimum(local, jnp.int32(num_positions))
+    if compression_ratio == 1 and num_tokens > _SMALL_EFFECTIVE_ROW_GATHER_MAX_TOKENS:
+        return clamped
+    return jnp.where(valid, clamped, jnp.int32(0))
+
+
 def _effective_row_lengths(
     seq_lens: jax.Array,  # i32[max_num_seqs]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -1255,34 +1331,19 @@ def _effective_row_lengths(
     Under context parallelism the score matrix is rank-local, so the row length
     is the number of globally-visible positions that *this* rank owns.
     """
-    max_num_seqs = seq_lens.shape[0]
-    num_seqs = distribution[2]
-    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
-    q_starts = cu_q_lens[:max_num_seqs]
-    q_ends = cu_q_lens[1 : max_num_seqs + 1]
-    # Avoid dynamic 1D gathers on cu_q_lens/seq_lens inside lax.switch branches:
-    # XLA lowers those as sequential gather fusions, whereas a masked int32
-    # reduction over [num_tokens, max_num_seqs] stays on the VPU (~6x faster).
-    in_seq = (
-        (seq_idx[None, :] < num_seqs)
-        & (token_ids[:, None] >= q_starts[None, :])
-        & (token_ids[:, None] < q_ends[None, :])
+    visible, valid = _effective_global_visible(
+        seq_lens, cu_q_lens, distribution, num_tokens, compression_ratio
     )
-    if compression_ratio == 1 and cp_size == 1:
-        pos_off = (seq_lens - q_ends + jnp.int32(1))[None, :]
-        cand = jnp.minimum(seq_lens[None, :], token_ids[:, None] + pos_off)
-        visible = jnp.sum(jnp.where(in_seq, cand, jnp.int32(0)), axis=1)
-        return jnp.minimum(visible, jnp.int32(num_positions))
-    pos_off = seq_lens - q_ends
-    off = jnp.sum(jnp.where(in_seq, pos_off[None, :], jnp.int32(0)), axis=1)
-    seq_len = jnp.sum(jnp.where(in_seq, seq_lens[None, :], jnp.int32(0)), axis=1)
-    token_pos = token_ids + off
-    kv_len = seq_len // compression_ratio
-    visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
-    visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
-    valid = jnp.any(in_seq, axis=1)
-    return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
+    return _clamp_local_visible(
+        visible,
+        valid,
+        num_positions=num_positions,
+        compression_ratio=compression_ratio,
+        num_tokens=num_tokens,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        interleave_c=interleave_c,
+    )
 
 
 @functools.partial(
@@ -1871,31 +1932,56 @@ def streamindex_topk(
         )
 
         num_positions = max(num_sublanes_total * 128, k)
-        eff_row_lengths = _effective_row_lengths(
-            seq_lens=seq_lens,
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
-            num_tokens=max_num_tokens,
-            num_positions=num_positions,
-            compression_ratio=compression_ratio,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            interleave_c=interleave_c,
-        )
-        # Rank 0 owns the first interleave block of every row, so its row
-        # lengths bound every rank's, and every rank computes the same (only
-        # `dcp_axis_name` reads them).
-        row_bounds = _effective_row_lengths(
-            seq_lens=seq_lens,
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
-            num_tokens=max_num_tokens,
-            num_positions=num_positions,
-            compression_ratio=compression_ratio,
-            cp_rank=0,
-            cp_size=cp_size,
-            interleave_c=interleave_c,
-        )
+        if max_num_tokens > _SMALL_EFFECTIVE_ROW_GATHER_MAX_TOKENS:
+            global_visible, global_valid = _effective_global_visible(
+                seq_lens, cu_q_lens, distribution, max_num_tokens, compression_ratio
+            )
+            eff_row_lengths = _clamp_local_visible(
+                global_visible,
+                global_valid,
+                num_positions=num_positions,
+                compression_ratio=compression_ratio,
+                num_tokens=max_num_tokens,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                interleave_c=interleave_c,
+            )
+            # Rank 0 owns the first interleave block of every row, so its row
+            # lengths bound every rank's, and every rank computes the same (only
+            # `dcp_axis_name` reads them).
+            row_bounds = _clamp_local_visible(
+                global_visible,
+                global_valid,
+                num_positions=num_positions,
+                compression_ratio=compression_ratio,
+                num_tokens=max_num_tokens,
+                cp_rank=0,
+                cp_size=cp_size,
+                interleave_c=interleave_c,
+            )
+        else:
+            eff_row_lengths = _effective_row_lengths(
+                seq_lens=seq_lens,
+                cu_q_lens=cu_q_lens,
+                distribution=distribution,
+                num_tokens=max_num_tokens,
+                num_positions=num_positions,
+                compression_ratio=compression_ratio,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                interleave_c=interleave_c,
+            )
+            row_bounds = _effective_row_lengths(
+                seq_lens=seq_lens,
+                cu_q_lens=cu_q_lens,
+                distribution=distribution,
+                num_tokens=max_num_tokens,
+                num_positions=num_positions,
+                compression_ratio=compression_ratio,
+                cp_rank=0,
+                cp_size=cp_size,
+                interleave_c=interleave_c,
+            )
 
         if chunk_tokens is None or max_num_tokens % chunk_tokens:
             num_chunks, chunk_len = 1, max_num_tokens

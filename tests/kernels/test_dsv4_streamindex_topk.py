@@ -1797,24 +1797,29 @@ def test_should_match_causal_fast_path_indices_with_compare_all_searchsorted():
 
 
 @pytest.mark.parametrize(
-    "compression_ratio,cp_size,cp_rank,interleave_c",
+    "num_tokens,compression_ratio,cp_size,cp_rank,interleave_c",
     [
-        pytest.param(1, 1, 0, 1, id="fast-cr1-cp1"),
-        pytest.param(2, 1, 0, 1, id="general-cr2-cp1"),
-        pytest.param(1, 4, 1, 4, id="general-cr1-cp4-il4"),
+        pytest.param(16, 1, 1, 0, 1, id="fast-cr1-cp1"),
+        pytest.param(16, 2, 1, 0, 1, id="general-cr2-cp1"),
+        pytest.param(16, 1, 4, 1, 4, id="fast-cr1-cp4-il4"),
+        pytest.param(4, 1, 4, 1, 4, id="small-b4-cr1-cp4-il4"),
     ],
 )
 def test_should_compute_exact_effective_row_lengths_for_mixed_and_padded_batches(
-    compression_ratio, cp_size, cp_rank, interleave_c
+    num_tokens, compression_ratio, cp_size, cp_rank, interleave_c
 ):
     # Anti-cancellation batch: 2 decode rows, a zero-length gap sequence, a
     # mid-sequence chunked prefill, an over-cap sequence, plus inactive slots
     # with non-zero garbage seq_lens/cu_q_lens past num_seqs.
-    num_tokens = 16
     num_positions = 40
-    seq_lens = np.array([15, 7, 100, 30, 60, 999, 888, 777], dtype=np.int32)
-    cu_q_lens = np.array([0, 1, 2, 2, 6, 11, 0, 0, 0], dtype=np.int32)
-    distribution = np.array([2, 2, 5], dtype=np.int32)
+    if num_tokens <= 4:
+        seq_lens = np.array([15, 7, 999, 888], dtype=np.int32)
+        cu_q_lens = np.array([0, 1, 2, 0, 0], dtype=np.int32)
+        distribution = np.array([2, 2, 2], dtype=np.int32)
+    else:
+        seq_lens = np.array([15, 7, 100, 30, 60, 999, 888, 777], dtype=np.int32)
+        cu_q_lens = np.array([0, 1, 2, 2, 6, 11, 0, 0, 0], dtype=np.int32)
+        distribution = np.array([2, 2, 5], dtype=np.int32)
 
     got = np.asarray(
         _effective_row_lengths(
