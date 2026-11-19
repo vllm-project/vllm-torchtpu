@@ -1359,6 +1359,16 @@ def _attention_call(
                     msa_attention._VMEM_LIMIT_BYTES + cache_size * rows_per_page * 8 * row_width * 2,
                 )
                 if bf16_cache
+                else min(
+                    63 * 1024 * 1024,
+                    msa_attention._VMEM_LIMIT_BYTES
+                    + cache_size
+                    * rows_per_page
+                    * packing
+                    * row_width
+                    * jnp.dtype(kv_cache.dtype).itemsize,
+                )
+                if cache_size and not fp4
                 else msa_attention._VMEM_LIMIT_BYTES
             ),
             # Every copy's page comes from the page table, so the checks only
@@ -1788,7 +1798,13 @@ def _chunked_call(
         step_widths=step_widths,
         row_split=row_split,
     )
-    cache_size = page_cache_slots if scale_cache is not None else 0
+    # 4-bit caches; 8-bit ones when the caller asks
+    # (TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_FP8, `msa_dcp.msa_attend_dcp`).
+    cache_size = (
+        page_cache_slots
+        if scale_cache is not None or jnp.dtype(kv_cache.dtype).itemsize == 1
+        else 0
+    )
     if cache_size:
         call = functools.partial(
             call,
