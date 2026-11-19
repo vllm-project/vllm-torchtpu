@@ -58,16 +58,20 @@ _E2E = textwrap.dedent(
     seq_lens = np.array([8, nblk * S, 0], np.int32); cu = np.array([0, 8, TREAL, TREAL], np.int32)
     hp = np.array([False, True, False])
     H._own_selection = lambda candidates, **kw: candidates
-    def run():
+    def run(between=None):
         @jax.jit
         @functools.partial(jax.shard_map, mesh=mesh, in_specs=(P("d"),) * 5 + (P(),) * 4,
                            out_specs=P("d"), check_vma=False)
         def f(rank, q, kv, sc, sel, seq_lens, bt, cu, hp):
             tokens = msa.token_positions(T, seq_lens, cu)
-            return H._head_parallel_attend(
+            out = H._head_parallel_attend(
                 q[0], kv[0], sc[0], sel[0], seq_lens, bt.reshape(-1), cu, hp, tokens, axis="d",
                 rank=rank[0], dcp=dcp, kv_head_replicas=R, sm_scale=D ** -0.5, topk=K,
-                interpret=True)[None]
+                interpret=True, between=between)
+            if between is not None:
+                out, x = out
+                out = out + 0 * x.astype(out.dtype)
+            return out[None]
         return np.asarray(f(put(np.arange(dcp, dtype=np.int32)[:, None]), put(jnp.asarray(q, jnp.bfloat16)),
                             put(kv), put(sc), put(sel), rep(seq_lens), rep(bt), rep(cu),
                             rep(hp)).astype(jnp.float32))
@@ -82,6 +86,13 @@ _E2E = textwrap.dedent(
     c = run()
     assert H._exchange_logged
     assert np.array_equal(a, c), float(np.abs(a - c).max())
+    # `between` without TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC: the synchronous
+    # exchange. (The asynchronous start / wait pair needs DMA semaphores that
+    # outlive a kernel, which interpret mode does not model: TPU harness.)
+    between = lambda q, cand: jnp.sum(q[:8].astype(jnp.float32)) + jnp.sum(cand[:8])
+    os.environ["TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT"] = "0"
+    d = run(between)
+    assert np.array_equal(a, d), float(np.abs(a - d).max())
     print("OK")
     """
 )

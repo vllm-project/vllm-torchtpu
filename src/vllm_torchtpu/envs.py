@@ -256,6 +256,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: bool = False
     TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT: int = 8
     TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT: bool = False
+    TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC: bool = False
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
@@ -1633,6 +1634,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT": env_bool(
         "TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT", default=False
+    ),
+    # ASYNC=1: the first round's page copies start ahead of the decode rows'
+    # DCP attention and the selection merge and are retired after them
+    # (a start / wait pair of kernels), so the exchange overlaps that work.
+    "TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC": env_bool(
+        "TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC", default=False
     ),
     # MiniMax M3 MSA prefill page cache table (`msa_attention_lse._page_cache`):
     # how its sorts run. Empty keeps three stable sorts (two of two operands);
