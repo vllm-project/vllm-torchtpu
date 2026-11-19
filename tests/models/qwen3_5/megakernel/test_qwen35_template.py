@@ -164,6 +164,26 @@ def test_qwen_create_runs_no_collective_and_loads_nothing(
         adapter.create(view, {"profiel": "x"})
 
 
+@pytest.mark.parametrize(
+    ("spec_k", "has_decode", "has_verify"),
+    [(0, True, False), (1, True, False), (3, False, True), (7, True, False)],
+)
+def test_qwen_create_serves_only_the_mtp_verify_width(
+    spec_k: int, has_decode: bool, has_verify: bool
+) -> None:
+    """The program compiles `T=4` verify only, so a draft length other than 3
+    keeps the decode buckets and drops verify (`BucketPolicy.resolve` would
+    otherwise derive verify width `K + 1`)."""
+    view = RunnerView(_full_size_runner(speculative_tokens=spec_k), tp_rank=0)
+    prog = adapter.create(view, {})
+    assert isinstance(prog, adapter.Qwen35Program)
+    assert prog.bucket_policy.verify_tokens == (4,)
+    assert (bool(prog.decode_buckets), bool(prog.verify_buckets)) == (
+        has_decode,
+        has_verify,
+    )
+
+
 def test_qwen_create_declines_are_named() -> None:
     view = RunnerView(_full_size_runner(unified_kv_layout=False), tp_rank=0)
     dec = adapter.create(view, {})
