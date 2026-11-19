@@ -29,6 +29,9 @@
   const PROF = DATA.model_profile || {}, CHIP = DATA.chip_spec || {};
   const REGIMES = DATA.regimes || [];
   const SUPPORTED_FAM = new Set(CORE_LIM.supported_onchip_families || []);
+  const CORE_FAM = new Set(CORE_LIM.core_module_families || []),
+    CORE_DTYPES = new Set(CORE_LIM.core_supported_dtypes || []),
+    STRUCTURAL_TAGS = new Set(CORE_LIM.structural_layer_tags || []);
   const RECOGNIZED_TYPES = new Set(CORE_LIM.recognized_model_types || []);
   const VERIFIED_RANKS = new Set(CORE_LIM.verified_ranks || []);
   const CHIP_KINDS = new Set(
@@ -275,6 +278,51 @@
     }
     return false;
   }
+  // Return { hasUnmodeled, familyGap, dtypeGap } matching support.py core gap rules.
+  function evaluateCoreGaps(p, hasDecl) {
+    if (hasDecl) return { hasUnmodeled: false, familyGap: false, dtypeGap: false };
+    const fams = (p.layer_families || []).filter(f => !STRUCTURAL_TAGS.has(f));
+    const hasUnmodeled = fams.some(f => !SUPPORTED_FAM.has(f));
+    const familyGap = fams.some(f => SUPPORTED_FAM.has(f) && !CORE_FAM.has(f));
+    const weightDtype = String(p.weight_dtype || '').toLowerCase();
+    const expertDtype = String(p.expert_dtype || p.weight_dtype || '').toLowerCase();
+    const dtypeGap = !CORE_DTYPES.has(weightDtype) || !CORE_DTYPES.has(expertDtype);
+    return { hasUnmodeled, familyGap, dtypeGap };
+  }
+  // Return declared expert_owner_groups (> 0) for p matching wl by sameLayout, else undefined.
+  function declaredExpertOwnerGroups(p, wl) {
+    const match = declaredFor(p ? p.name : '').find(
+      d => d && String(d.source || '').trim() && d.ranks > 0 && sameLayout(d, wl)
+    );
+    return (match && match.expert_owner_groups > 0) ? match.expert_owner_groups : undefined;
+  }
+  // Return "Attn: ... · MoE: ..." string for layout and optional expert owner groups.
+  function sublayerLabel(layout, expertOwnerGroups) {
+    const layoutAxes = layout || {};
+    const tp = layoutAxes.tp !== undefined ? layoutAxes.tp : 1;
+    const ep = layoutAxes.ep !== undefined ? layoutAxes.ep : 1;
+    const attnAxes = [
+      ['TP', tp],
+      ['DP', layoutAxes.dp !== undefined ? layoutAxes.dp : 1],
+      ['PP', layoutAxes.pp !== undefined ? layoutAxes.pp : 1],
+      ['PCP', layoutAxes.pcp !== undefined ? layoutAxes.pcp : 1],
+      ['DCP', layoutAxes.dcp !== undefined ? layoutAxes.dcp : 1],
+    ];
+    const attnParts = [];
+    for (const [axisName, degree] of attnAxes) {
+      if (degree > 1) attnParts.push(`${axisName}${degree}`);
+    }
+    const attention = attnParts.length ? attnParts.join(' x ') : 'TP1';
+    if (ep <= 1) return `Attn: ${attention} \u00b7 MoE: TP${tp}`;
+    const rawGroups = (expertOwnerGroups !== undefined && expertOwnerGroups !== null)
+      ? expertOwnerGroups : ep;
+    const parsedGroups = Number(rawGroups);
+    const groups = Number.isFinite(parsedGroups) ? Math.trunc(parsedGroups) : ep;
+    const ranks = Math.max(ep, tp);
+    const innerTp = Math.max(1, Math.floor(ranks / Math.max(1, groups)));
+    const moe = innerTp === 1 ? `EP${groups}` : `TP${innerTp} x EP${groups}`;
+    return `Attn: ${attention} \u00b7 MoE: ${moe}`;
+  }
   function evaluateSupport(sc, p, wl, ch, ctx) {
     const batchRaw = wl.batch !== undefined ? wl.batch : WL_DEF.batch;
     if (sc === 'per_op' || batchRaw <= 0) {
@@ -285,8 +333,7 @@
     const blocks = declaredBlocks(p, sc, wl.phase);
     const rankMatches = blocks.filter(d => ctx.effTp === d.ranks);
     const decl = rankMatches.find(d => sameLayout(d, wl)) || null;
-    const fams = p.layer_families || [];
-    const hasUnmodeled = !decl && fams.some(f => !SUPPORTED_FAM.has(f));
+    const gaps = evaluateCoreGaps(p, Boolean(decl));
     const maxAr = CORE_LIM.max_ar_slots_per_layer;
     const isPeriodic = p.is_periodic !== undefined ? Boolean(p.is_periodic) : true;
     const arSlots = p.ar_slots_per_layer !== undefined ? p.ar_slots_per_layer : 2;
@@ -319,7 +366,9 @@
     if (ctx.epDp > 1 && !(decl && decl.attention_dp_in_call)) {
       blockers.push('all_to_all_not_in_core');
     }
-    if (hasUnmodeled) blockers.push('unmodeled_layer_family');
+    if (gaps.hasUnmodeled) blockers.push('unmodeled_layer_family');
+    if (gaps.familyGap) blockers.push('family_not_in_core');
+    if (gaps.dtypeGap) blockers.push('dtype_not_in_core');
     if (archUnv) blockers.push('model_type_unrecognized');
     if (plannerBad) blockers.push('planner_rejected');
     const maxRowsPerCall = wl.maxRowsPerCall ?? wl.max_rows_per_call ?? 0;
@@ -1665,7 +1714,7 @@
       DATA, PROF, CHIP, REGIMES, roundEven, gcd, peakFlops, rowFloor,
       allReduceCost, computePerTokenVmem,
       expertsHit, selectAdaptiveRing, validateWorkload, evaluateWorkload,
-      evaluateScenario
+      evaluateScenario, sublayerLabel, declaredExpertOwnerGroups
     };
   }
 
