@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Prepare and gather packed FP8 candidate caches for cross-layer reuse."""
 
-from collections.abc import Callable
-from typing import NamedTuple, cast
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -50,6 +49,8 @@ def prepare_candidates(
     layout: PackedFP8Layout,
     block: int,
     width: int,
+    *,
+    ascending: bool = False,
 ) -> PreparedCandidates:
     """Gather packed FP8 K for candidate unions shared by query groups.
 
@@ -62,13 +63,15 @@ def prepare_candidates(
         layout: Packed cache storage layout.
         block: Tokens per candidate block.
         width: Logical token range upper bound.
+        ascending: Whether candidate rows already ascend with -1 suffix
+            padding, as candidate publication emits them; others are sorted.
 
     Returns:
         PreparedCandidates with gathered K, logical block mappings, query group
         offsets, validity and the start/split of each query window.
     """
     metadata = prepare_candidate_metadata(
-        pages, candidates, requests_ids, layout, block, width
+        pages, candidates, requests_ids, layout, block, width, ascending=ascending
     )
     keys = gather_candidate_keys(
         banks,
@@ -87,6 +90,8 @@ def prepare_candidate_metadata(
     layout: PackedFP8Layout,
     block: int,
     width: int,
+    *,
+    ascending: bool = False,
 ) -> CandidateMetadata:
     """Pair queries of even-sized requests; odd-sized requests stay unpaired.
 
@@ -98,14 +103,20 @@ def prepare_candidate_metadata(
         layout: Packed cache storage layout.
         block: Tokens per candidate block.
         width: Logical token range upper bound.
+        ascending: Whether candidate rows already ascend with -1 suffix
+            padding, as candidate publication emits them; others are sorted.
 
     Returns:
         Per-group physical fragments, per-query block IDs and window spans,
         grouping offsets and validity mask, all in input query order.
     """
-    tokens, count = candidates.shape
-    owners = jnp.clip(requests, 0, pages.shape[0] - 1)
+    tokens = candidates.shape[0]
     valid = (requests >= 0) & (requests < pages.shape[0])
+    if not ascending:
+        # The SparseCore kernel takes ascending rows with -1 suffix padding.
+        limit = jnp.iinfo(jnp.int32).max
+        candidates = jnp.sort(jnp.where(candidates >= 0, candidates, limit), axis=-1)
+        candidates = jnp.where(candidates == limit, -1, candidates)
 
     rows = jnp.arange(tokens, dtype=jnp.int32)
     boundary = requests[1:] != requests[:-1]
@@ -129,71 +140,16 @@ def prepare_candidate_metadata(
         (offsets,) = jnp.nonzero(starts, size=tokens + 1, fill_value=tokens)
     sizes = jnp.diff(offsets)
 
-    direct = False
-    if jax.default_backend() == "tpu":
-        info = pltpu.get_tpu_info()
-        if info.sparse_core is not None and count % info.num_lanes == 0:
-            words = _metadata_scratch_words(
-                2,
-                count,
-                pl.cdiv(width, block),
-                pages.shape[1],
-                offsets=offsets.size,
-                requests=requests.size,
-            )
-            direct = (
-                words * jnp.dtype(jnp.int32).itemsize
-                <= info.sparse_core.vmem_capacity_bytes // 2
-            )
-    if direct:
-        candidate_block_ids, physical_block_ids, counts = canonical_candidate_blocks(
-            candidates,
-            pages,
-            offsets,
-            block=block,
-            width=width,
-            cache_pages=layout.pages,
-            page_size=layout.page_size,
-            requests=requests,
-        )
-    else:
-        # Preserve per-query ownership when forming each pair's union.
-        representatives = offsets[:-1]
-        representatives = jnp.minimum(representatives, tokens - 1)
-        first_candidates = candidates[representatives]
-        following = candidates[jnp.minimum(representatives + 1, tokens - 1)]
-        second_candidates = jnp.where(sizes[:, None] == 2, following, -1)
-        live_group = (sizes > 0)[:, None] & valid[representatives, None]
-        group_candidates = jnp.stack(
-            (
-                jnp.where(live_group, first_candidates, -1),
-                jnp.where(live_group, second_candidates, -1),
-            ),
-            axis=1,
-        )
-
-        # Compact into A-only/shared/B-only segments, ascending within each.
-        # width bounds logical Index-K record positions, not candidate count.
-        candidate_block_ids, physical_block_ids, counts = canonical_candidate_blocks(
-            group_candidates,
-            pages[owners[representatives]],
-            offsets,
-            block=block,
-            width=width,
-            cache_pages=layout.pages,
-            page_size=layout.page_size,
-        )
-
-        member = rows - offsets[groups]
-        start = jnp.where(member == 0, 0, counts[groups, 0])
-        size = jnp.where(member == 0, counts[groups, 0], counts[groups, 2])
-        size += counts[groups, 1]
-        slots = start[:, None] + jnp.arange(count)
-        candidate_block_ids = jnp.where(
-            jnp.arange(count) < size[:, None],
-            jnp.take_along_axis(candidate_block_ids[groups], slots, axis=1),
-            -1,
-        )
+    candidate_block_ids, physical_block_ids, counts = canonical_candidate_blocks(
+        candidates,
+        pages,
+        offsets,
+        requests,
+        block=block,
+        width=width,
+        cache_pages=layout.pages,
+        page_size=layout.page_size,
+    )
 
     member = rows - offsets[groups]
     spans = jnp.stack(
@@ -224,555 +180,388 @@ def prepare_candidate_metadata(
     )
 
 
-def _metadata_scratch_words(
-    queries: int,
-    per_query: int,
-    blocks: int,
-    table_columns: int,
-    *,
-    offsets: int = 0,
-    requests: int = 0,
-) -> int:
-    info = pltpu.get_tpu_info()
-    sc = info.sparse_core
-    assert sc is not None
-    alignment = info.num_lanes
-
-    def aligned(size):
-        return pl.cdiv(size, alignment) * alignment
-
-    control = (
-        alignment + aligned(offsets) + aligned(requests) if requests else sc.num_lanes
-    )
-    return (
-        queries * aligned(blocks)
-        + aligned(table_columns)
-        + 4 * (aligned(queries * per_query) + sc.num_lanes)
-        + control
-    )
-
-
 def canonical_candidate_blocks(
     candidates: jax.Array,
     table: jax.Array,
     offsets: jax.Array,
+    requests: jax.Array,
     *,
     block: int,
     width: int,
     cache_pages: int,
     page_size: int = PAGE_RECORDS,
-    requests: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Deduplicate and partition each pair into A-only/shared/B-only blocks.
+    """Deduplicate and partition each query pair into A-only/shared/B-only blocks.
 
-    Each member occupies one contiguous window in the gathered union;
-    each of its two segments retains ascending logical IDs.
+    Each query of a pair marks its blocks in its own bitmap of blocks / 32
+    words. A's blocks split by B's bits into A-only and shared, and B's by A's
+    into B-only, so the work scales with the candidate count, not the width.
 
     Args:
-        candidates: [groups, queries, per_query] logical candidate block IDs;
-            [queries, per_query] when requests is supplied.
-        table: [groups, max_pages_per_request] physical page table rows.
-        offsets: Query boundaries identifying live group rows.
-        block: Tokens per candidate block.
+        candidates: [queries, per_query] logical block IDs. Rows ascend with
+            -1 suffix padding, as candidate publication emits them, so repeats
+            are adjacent.
+        table: [requests, max_pages_per_request] physical page table.
+        offsets: Pair g owns queries [offsets[g], offsets[g + 1]).
+        requests: [queries] request IDs; queries of invalid requests get no
+            blocks.
+        block: Tokens per candidate block; page_size // block is a power of two.
         width: Logical token range upper bound.
         cache_pages: Physical cache page count.
         page_size: Tokens per cache page.
-        requests: Original query request IDs for direct metadata preparation.
 
     Returns:
-        Union IDs (per-query windows for direct preparation), physical
-        fragment IDs, and per-group [A-only, shared, B-only] counts.
-        Invalid IDs are -1; trailing empty groups remain unset.
+        Per-query windows [queries, per_query] (A: A-only then shared; B:
+        shared then B-only), per-pair physical union [pairs, 2 * per_query]
+        (A-only, shared, B-only) and per-pair [A-only, shared, B-only] counts.
+        Segments ascend; invalid IDs and padding are -1. Rows of trailing
+        empty pairs remain unset.
     """
-    blocks = pl.cdiv(width, block)
-    direct = requests is not None
-    if direct:
-        rows, queries, per_query = offsets.shape[0] - 1, 2, candidates.shape[1]
-    else:
-        rows, queries, per_query = candidates.shape
-    count = queries * per_query
-    # Keep half of subcore VMEM free for compiler temporaries and alignment.
-    info = pltpu.get_tpu_info().sparse_core if jax.default_backend() == "tpu" else None
-    fits = (
-        info is not None
-        and _metadata_scratch_words(
-            queries,
-            per_query,
-            blocks,
-            table.shape[1],
-            offsets=offsets.size if direct else 0,
-            requests=requests.size if requests is not None else 0,
-        )
-        * jnp.dtype(jnp.int32).itemsize
-        <= info.vmem_capacity_bytes // 2
-    )
-    if not fits:
-        if direct:
-            raise ValueError("Direct candidate metadata exceeds its TPU scratch budget")
-        return _canonical_candidate_blocks_ref(
-            candidates, table, block, width, cache_pages, page_size
-        )
-
-    info = plsc.get_sparse_core_info()
-    lanes, units = info.num_lanes, info.num_cores * info.num_subcores
+    sc = plsc.get_sparse_core_info()
+    lanes, units = sc.num_lanes, sc.num_cores * sc.num_subcores
     alignment = pltpu.get_tpu_info().num_lanes
-    columns = pl.cdiv(count, alignment) * alignment
-    histogram_width = pl.cdiv(blocks, alignment) * alignment
-    if not direct:
-        candidates = jnp.pad(
-            candidates.reshape(rows, count),
-            ((0, 0), (0, columns - count)),
-            constant_values=-1,
+    unroll = alignment // lanes
+    # TODO: retry 2 on libtpu > 0.0.50; it gave wrong windows with correct counts.
+    classify_unroll = 4
+    tokens, per_query = candidates.shape
+    pairs = offsets.shape[0] - 1
+    blocks = pl.cdiv(width, block)
+    per_page = page_size // block
+    shift = per_page.bit_length() - 1
+    if per_query % alignment or page_size % block or per_page & (per_page - 1):
+        raise NotImplementedError(
+            f"Candidate metadata needs {alignment}-aligned candidate rows and "
+            f"page_size // block a power of two; got per_query={per_query}, "
+            f"block={block}, page_size={page_size}"
         )
-    elif per_query % alignment:
-        raise ValueError("Direct candidate metadata requires lane-aligned query rows")
+    shr = lax.shift_right_logical
     table = jnp.pad(
         table, ((0, 0), (0, -table.shape[1] % alignment)), constant_values=-1
     )
-    live = jnp.max(jnp.where(offsets[1:] > offsets[:-1], jnp.arange(1, rows + 1), 0))
-    control = jnp.full((lanes,), live, jnp.int32)
-    offset_width = pl.cdiv(offsets.size, alignment) * alignment
-    if requests is not None:
-        control = jnp.concatenate(
-            (
-                jnp.full((alignment,), live, jnp.int32),
-                jnp.pad(
-                    offsets,
-                    (0, offset_width - offsets.size),
-                    constant_values=candidates.shape[0],
-                ),
-                jnp.pad(requests, (0, -requests.size % alignment), constant_values=-1),
-            )
+    table_columns = table.shape[1]
+
+    def aligned(size):
+        return pl.cdiv(size, alignment) * alignment
+
+    offset_words = aligned(offsets.size)
+    # Words per scratch buffer; two-slot buffers hold two pairs in flight.
+    bitmap_words = aligned(pl.cdiv(blocks, 32))
+    words = dict(
+        bits_a=bitmap_words,
+        bits_b=bitmap_words,
+        # Per slot: [pad][A][pad][B]; each pad ends a row's previous-ID compare.
+        ids=2 * (2 * lanes + 2 * per_query),
+        page_ids=2 * table_columns,
+        # Compressed stores address `lanes` words past each live prefix. B's
+        # window holds a pair, so rows that break the ascending contract
+        # cannot write past it.
+        window_a=2 * (per_query + lanes),
+        window_b=2 * (2 * per_query + lanes),
+        union=2 * (2 * per_query + lanes),
+        shared_union=per_query + lanes,
+        counts=2 * alignment,
+        control=alignment + offset_words + aligned(tokens),
+    )
+    # Keep half of subcore VMEM free for compiler temporaries and alignment.
+    if 4 * sum(words.values()) > sc.vmem_capacity_bytes // 2:
+        raise ValueError(
+            f"Candidate metadata for {tokens} queries at width {width} exceeds "
+            "SparseCore VMEM; lower max_num_batched_tokens"
         )
-    per_page, parts = max(1, page_size // block), max(1, block // page_size)
+    id_slot, a_slot, b_slot, union_slot = (
+        words[name] // 2 for name in ("ids", "window_a", "window_b", "union")
+    )
+    a_base, b_base = lanes, 2 * lanes + per_query
+
+    # [live pairs][offsets][requests], each lane-aligned.
+    live = jnp.max(jnp.where(offsets[1:] > offsets[:-1], jnp.arange(1, pairs + 1), 0))
+    request_base = alignment + offset_words
+    control = jnp.concatenate(
+        (
+            jnp.full((alignment,), live, jnp.int32),
+            jnp.pad(offsets, (0, offset_words - offsets.size), constant_values=tokens),
+            jnp.pad(requests, (0, -tokens % alignment), constant_values=-1),
+        )
+    )
     mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
+    scratch = {name: pltpu.VMEM((size,), jnp.int32) for name, size in words.items()}
 
     @pl.kernel(
         out_type=(
-            jax.ShapeDtypeStruct((rows, per_query if direct else columns), jnp.int32),
-            jax.ShapeDtypeStruct((rows, columns), jnp.int32),
-            jax.ShapeDtypeStruct((rows, alignment), jnp.int32),
-        ),
-        scratch_types=(
-            pltpu.VMEM((queries * histogram_width,), jnp.int32),
-            pltpu.VMEM((columns + lanes,), jnp.int32),
-            pltpu.VMEM((table.shape[1],), jnp.int32),
-            pltpu.VMEM((columns + lanes,), jnp.int32),
-            pltpu.VMEM((columns + lanes,), jnp.int32),
-            pltpu.VMEM((columns + lanes,), jnp.int32),
-            pltpu.VMEM((control.size,), jnp.int32),
-            pltpu.SemaphoreType.DMA((5,)),
+            jax.ShapeDtypeStruct((tokens, per_query), jnp.int32),
+            jax.ShapeDtypeStruct((pairs, 2 * per_query), jnp.int32),
+            jax.ShapeDtypeStruct((pairs, alignment), jnp.int32),
         ),
         mesh=mesh,
+        scratch_types=dict(scratch, sems=pltpu.SemaphoreType.DMA((2, 6))),
         compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
         name="paged_mqa_candidate_metadata",
     )
-    def prepare(
+    def kernel(
         src,
         pages,
-        control_ref,
-        candidate_block_ids,
-        physical_block_ids,
-        owners,
-        hist,
+        control_hbm,
+        out_ids,
+        out_union,
+        out_counts,
+        *,
+        bits_a,
+        bits_b,
         ids,
         page_ids,
-        logical_ids,
-        physical_block_id_buffer,
-        owner_ids,
-        active,
-        sem,
+        window_a,
+        window_b,
+        union,
+        shared_union,
+        counts,
+        control,
+        sems,
     ):
-        pltpu.async_copy(control_ref, active, sem.at[0]).wait()
+        pltpu.async_copy(control_hbm, control, sems.at[0, 0]).wait()
         unit = lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
+        lane = jnp.arange(lanes, dtype=jnp.int32)
+        zeros, ones = jnp.zeros(lanes, jnp.int32), jnp.ones(lanes, jnp.int32)
 
-        @pl.loop(unit, active[pl.ds(0, lanes)][0], step=units)
-        def row(row_id):
-            row_start, row_queries, row_valid = row_id, queries, jnp.bool_(True)
-            if direct:
+        def scalar(position):
+            return plsc.load_gather(control, [jnp.full(lanes, position, jnp.int32)])[0]
 
-                def scalar(position):
-                    return plsc.load_gather(
-                        active, [jnp.full(lanes, position, jnp.int32)]
-                    )[0]
+        def count(mask):
+            return plsc.all_reduce_population_count(mask)[0]
 
-                row_start = scalar(alignment + row_id)
-                row_queries = scalar(alignment + row_id + 1) - row_start
-                request = scalar(alignment + offset_width + row_start)
-                row_valid = (request >= 0) & (request < pages.shape[0])
-                read_ids = tuple(
-                    pltpu.async_copy(
-                        src.at[jnp.minimum(row_start + query, src.shape[0] - 1)],
-                        ids.at[pl.ds(query * per_query, per_query)],
-                        sem.at[0],
-                    )
-                    for query in range(queries)
+        def pair_info(step):
+            pair = unit + step * units
+            start = scalar(alignment + pair)
+            queries = scalar(alignment + pair + 1) - start
+            return pair, start, queries, scalar(request_base + start)
+
+        def page_row(request):
+            return jnp.clip(request, 0, pages.shape[0] - 1)
+
+        def reads(step, wait=False):
+            """Copy a pair's IDs, and its page row unless the slot holds it."""
+            slot = step % 2
+            _, start, _, request = pair_info(step)
+            for query, base in enumerate((a_base, b_base)):
+                copy = pltpu.make_async_copy(
+                    src.at[jnp.minimum(start + query, tokens - 1)],
+                    ids.at[pl.ds(slot * id_slot + base, per_query)],
+                    sems.at[slot, 0],
                 )
-                page_row = jnp.clip(request, 0, pages.shape[0] - 1)
-            else:
-                read_ids = (
-                    pltpu.async_copy(src.at[row_id], ids.at[:columns], sem.at[0]),
-                )
-                page_row = row_id
-            read_pages = pltpu.async_copy(pages.at[page_row], page_ids, sem.at[1])
+                (copy.wait if wait else copy.start)()
 
-            @plsc.parallel_loop(
-                0, queries * histogram_width, lanes, unroll=alignment // lanes
+            # The slot still holds the page row of the pair two steps back.
+            before = pair_info(jnp.maximum(step - 2, 0))[3]
+            copy = pltpu.make_async_copy(
+                pages.at[page_row(request)],
+                page_ids.at[pl.ds(slot * table_columns, table_columns)],
+                sems.at[slot, 1],
             )
-            def clear_hist(i):
-                hist[pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
+            pl.when((step < 2) | (page_row(request) != page_row(before)))(
+                copy.wait if wait else copy.start
+            )
 
-            @plsc.parallel_loop(0, columns + lanes, lanes)
-            def clear_result(i):
-                logical_ids[pl.ds(i, lanes)] = jnp.full(lanes, -1, jnp.int32)
-                owner_ids[pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
-
-            for copy in read_ids:
-                copy.wait()
-            read_pages.wait()
-
-            # One presence histogram per query; a block's owner bit is set when
-            # that query lists it. ``scan_count`` dedupes repeats within a query.
-            @plsc.parallel_loop(0, columns, lanes, unroll=alignment // lanes)
-            def scatter(i):
-                keys = ids[pl.ds(i, lanes)]
-                query = (i + jnp.arange(lanes)) // per_query
-                base = query * histogram_width
-                inc, mask = plsc.scan_count(
-                    keys,
-                    mask=(keys >= 0)
-                    & (keys < blocks)
-                    & (query < row_queries)
-                    & row_valid,
-                )
-                plsc.addupdate_scatter(
-                    hist,
-                    [base + jnp.clip(keys, 0, histogram_width - 1)],
-                    inc,
-                    mask=mask,
-                )
-
-            def compact(i, count):
-                logical = i + jnp.arange(lanes)
-                owner = jnp.zeros(lanes, jnp.int32)
-                for query in range(queries):
-                    present = hist[pl.ds(query * histogram_width + i, lanes)] != 0
-                    owner = owner | (present.astype(jnp.int32) << query)
-                page = plsc.load_gather(
-                    page_ids,
-                    [jnp.minimum(logical // per_page * parts, table.shape[1] - 1)],
-                )
-                valid = (
-                    (owner != 0)
-                    & (logical < blocks)
-                    & (logical * block < table.shape[1] * page_size)
-                    & (page >= 0)
-                    & (page < cache_pages)
-                )
-                for part in range(1, parts):
-                    column = logical * parts + part
-                    following = plsc.load_gather(
-                        page_ids, [jnp.minimum(column, table.shape[1] - 1)]
-                    )
-                    valid &= (logical * block + part * page_size >= width) | (
-                        (column < table.shape[1])
-                        & (following >= 0)
-                        & (following < cache_pages)
-                    )
-                plsc.store_compressed(
-                    logical_ids.at[pl.ds(count, lanes)], logical, mask=valid
-                )
-                plsc.store_compressed(
-                    owner_ids.at[pl.ds(count, lanes)], owner, mask=valid
-                )
-                return count + plsc.all_reduce_population_count(valid)[0]
-
-            loop = cast(
-                Callable[[Callable[[jax.Array, jax.Array], jax.Array]], jax.Array],
-                plsc.parallel_loop(
-                    0,
-                    histogram_width,
-                    lanes,
-                    # Fully unrolling one histogram vector miscompiles the
-                    # page-ID gather in libtpu 0.0.50.
-                    unroll=1 if histogram_width == alignment else alignment // lanes,
-                    carry=jnp.int32(0),
+        def writes(step, wait=False):
+            """Copy a pair's windows, physical union and counts out."""
+            slot = step % 2
+            pair, start, queries, _ = pair_info(step)
+            first = (
+                pltpu.make_async_copy(
+                    window_a.at[pl.ds(slot * a_slot, per_query)],
+                    out_ids.at[start],
+                    sems.at[slot, 2],
+                ),
+                pltpu.make_async_copy(
+                    union.at[pl.ds(slot * union_slot, 2 * per_query)],
+                    out_union.at[pair],
+                    sems.at[slot, 3],
+                ),
+                pltpu.make_async_copy(
+                    counts.at[pl.ds(slot * alignment, alignment)],
+                    out_counts.at[pair],
+                    sems.at[slot, 4],
                 ),
             )
-            union_size = loop(compact)
-            ends = []
-            position = jnp.int32(0)
-            for ownership in (1, 3, 2):
+            for copy in first:
+                (copy.wait if wait else copy.start)()
+            second = pltpu.make_async_copy(
+                window_b.at[pl.ds(slot * b_slot, per_query)],
+                out_ids.at[jnp.minimum(start + 1, tokens - 1)],
+                sems.at[slot, 5],
+            )
+            pl.when(queries > 1)(second.wait if wait else second.start)
 
-                def partition(i, count, ownership=ownership):
-                    logical = logical_ids[pl.ds(i, lanes)]
-                    mask = (i + jnp.arange(lanes) < union_size) & (
-                        owner_ids[pl.ds(i, lanes)] == ownership
+        def pad(ref, base, end, size):
+            """-1 from end to size: the slot holds an earlier pair's IDs."""
+            start = pl.multiple_of(end // lanes * lanes, lanes)
+
+            @plsc.parallel_loop(0, size - start, lanes, unroll=4)
+            def fill(i):
+                at = pl.ds(base + start + i, lanes)
+                ref[at] = jnp.where(start + i + lane >= end, -1, ref[at])
+
+        def emit(targets, offset, mask):
+            """Compress the mask's lanes of each (ref, base, value) to base + offset."""
+            for ref, base, value in targets:
+                plsc.store_compressed(
+                    ref.at[pl.ds(base + offset, lanes)], value, mask=mask
+                )
+            return offset + count(mask)
+
+        def clear_bitmaps():
+            @plsc.parallel_loop(0, bitmap_words, lanes, unroll=unroll)
+            def clear(i):
+                bits_a[pl.ds(i, lanes)] = zeros
+                bits_b[pl.ds(i, lanes)] = zeros
+
+        clear_bitmaps()
+        for slot in range(2):
+            for base in (a_base, b_base):
+                at = pl.ds(slot * id_slot + base - lanes, lanes)
+                ids[at] = jnp.full(lanes, -2, jnp.int32)
+
+        steps = (jnp.maximum(scalar(0) - unit, 0) + units - 1) // units
+
+        @pl.when(steps > 0)
+        def prologue():
+            reads(jnp.int32(0))
+
+        @pl.loop(0, steps)
+        def body(step):
+            slot = step % 2
+            _, _, queries, request = pair_info(step)
+            reads(step, wait=True)
+
+            @pl.when(step + 1 < steps)
+            def prefetch():
+                reads(step + 1)
+
+            bases = (slot * id_slot + a_base, slot * id_slot + b_base)
+            page_base = slot * table_columns
+            valid_request = (request >= 0) & (request < pages.shape[0])
+            bounds = (
+                jnp.where(valid_request, per_query, 0),
+                jnp.where(valid_request & (queries > 1), per_query, 0),
+            )
+
+            def first(query, i, key):
+                """Rows ascend, so a repeat equals the ID before it."""
+                return key != ids[pl.ds(bases[query] + i - 1, lanes)]
+
+            def word(key):
+                return jnp.minimum(shr(key, 5), bitmap_words - 1)
+
+            # Each query marks its in-range first occurrences in its own bitmap.
+            for query, bits in enumerate((bits_a, bits_b)):
+
+                @plsc.parallel_loop(0, bounds[query], lanes, unroll=unroll)
+                def mark(i, query=query, bits=bits):
+                    key = ids[pl.ds(bases[query] + i, lanes)]
+                    marked = (key >= 0) & (key < blocks) & first(query, i, key)
+                    # Distinct IDs set distinct bits, so adding them is an OR.
+                    plsc.addupdate_scatter(
+                        bits, [word(key)], ones << (key & 31), mask=marked
                     )
-                    plsc.store_compressed(
-                        ids.at[pl.ds(count, lanes)], logical, mask=mask
-                    )
-                    return count + plsc.all_reduce_population_count(mask)[0]
 
-                position = plsc.parallel_loop(
-                    0,
-                    pl.cdiv(union_size, lanes) * lanes,
-                    lanes,
-                    carry=position,
-                    unroll=alignment // lanes,
-                )(partition)
-                ends.append(position)
-
-            # Compressed stores may touch the last vector past the live prefix.
-            @plsc.parallel_loop(0, columns, lanes)
-            def pad(i):
-                live = i + jnp.arange(lanes) < union_size
-                logical = ids[pl.ds(i, lanes)]
+            def classify(query, i, other):
+                """Block ID, physical ID, validity and whether `other` lists it."""
+                key = ids[pl.ds(bases[query] + i, lanes)]
+                column = shr(key, shift)
                 page = plsc.load_gather(
-                    page_ids,
-                    [jnp.clip(logical // per_page * parts, 0, table.shape[1] - 1)],
+                    page_ids, [page_base + jnp.clip(column, 0, table_columns - 1)]
                 )
-                ids[pl.ds(i, lanes)] = jnp.where(live, logical, -1)
-                physical_block_id_buffer[pl.ds(i, lanes)] = jnp.where(
-                    live, page * per_page + logical % per_page, -1
+                valid = (key >= 0) & (key < blocks) & (page >= 0) & (page < cache_pages)
+                if blocks > table_columns * per_page:
+                    valid &= column < table_columns
+                valid &= first(query, i, key)
+                listed = plsc.load_gather(other, [word(key)]) >> (key & 31)
+                physical = (page << shift) | (key & (per_page - 1))
+                return key, physical, valid, (listed & 1) != 0
+
+            a_window, b_window = slot * a_slot, slot * b_slot
+            union_base = slot * union_slot
+
+            # The pair two steps back must have drained this slot's outputs.
+            @pl.when(step >= 2)
+            def drain():
+                writes(step - 2, wait=True)
+
+            # A against B's bits: A-only opens A's window, shared opens B's.
+            def classify_a(i, carry):
+                a_only, shared = carry
+                key, physical, valid, in_b = classify(0, i, bits_b)
+                a_targets = ((window_a, a_window, key), (union, union_base, physical))
+                b_targets = ((window_b, b_window, key), (shared_union, 0, physical))
+                only, both = valid & ~in_b, valid & in_b
+                return emit(a_targets, a_only, only), emit(b_targets, shared, both)
+
+            a_only, shared = plsc.parallel_loop(
+                0,
+                bounds[0],
+                lanes,
+                unroll=classify_unroll,
+                carry=(jnp.int32(0), jnp.int32(0)),
+            )(classify_a)
+
+            # Shared closes A's window and follows A-only in the union.
+            @plsc.parallel_loop(0, pl.cdiv(shared, lanes) * lanes, lanes, unroll=unroll)
+            def append_shared(i):
+                live = i + lane < shared
+                plsc.store_compressed(
+                    window_a.at[pl.ds(a_window + a_only + i, lanes)],
+                    window_b[pl.ds(b_window + i, lanes)],
+                    mask=live,
+                )
+                plsc.store_compressed(
+                    union.at[pl.ds(union_base + a_only + i, lanes)],
+                    shared_union[pl.ds(i, lanes)],
+                    mask=live,
                 )
 
-            if direct:
-                for query in range(queries):
+            # B against A's bits: B-only follows shared in B's window and the union.
+            def classify_b(i, b_only):
+                key, physical, valid, in_a = classify(1, i, bits_a)
+                targets = (
+                    (window_b, b_window + shared, key),
+                    (union, union_base + a_only + shared, physical),
+                )
+                return emit(targets, b_only, valid & ~in_a)
 
-                    @pl.when(query < row_queries)
-                    def publish_query(query=query):
-                        start = jnp.int32(0) if query == 0 else ends[0]
-                        length = ends[1] if query == 0 else ends[2] - ends[0]
+            b_only = plsc.parallel_loop(
+                0, bounds[1], lanes, unroll=classify_unroll, carry=jnp.int32(0)
+            )(classify_b)
 
-                        @plsc.parallel_loop(
-                            0, per_query, lanes, unroll=alignment // lanes
-                        )
-                        def map_query(i):
-                            slots = i + jnp.arange(lanes)
-                            values = plsc.load_gather(ids, [start + slots])
-                            logical_ids[pl.ds(i, lanes)] = jnp.where(
-                                slots < length, values, -1
-                            )
+            pad(window_a, a_window, a_only + shared, per_query)
+            pad(window_b, b_window, shared + b_only, per_query)
+            pad(union, union_base, a_only + shared + b_only, 2 * per_query)
+            counts[pl.ds(slot * alignment, lanes)] = jnp.where(
+                lane == 0,
+                a_only,
+                jnp.where(lane == 1, shared, jnp.where(lane == 2, b_only, 0)),
+            )
+            writes(step)
 
-                        pltpu.async_copy(
-                            logical_ids.at[:per_query],
-                            candidate_block_ids.at[row_start + query],
-                            sem.at[2],
-                        ).wait()
+            # Clear this pair's bits while its outputs drain: whole bitmaps
+            # when they are no longer than a row, else only the marked words.
+            if bitmap_words <= per_query:
+                clear_bitmaps()
             else:
-                pltpu.async_copy(
-                    ids.at[:columns], candidate_block_ids.at[row_id], sem.at[2]
-                ).wait()
-            owner_ids[pl.ds(0, lanes)] = jnp.where(
-                jnp.arange(lanes) == 0,
-                ends[0],
-                jnp.where(
-                    jnp.arange(lanes) == 1,
-                    ends[1] - ends[0],
-                    jnp.where(jnp.arange(lanes) == 2, ends[2] - ends[1], 0),
-                ),
-            )
-            copy_physical = pltpu.async_copy(
-                physical_block_id_buffer.at[:columns],
-                physical_block_ids.at[row_id],
-                sem.at[3],
-            )
-            copy_counts = pltpu.async_copy(
-                owner_ids.at[:alignment], owners.at[row_id], sem.at[4]
-            )
-            copy_physical.wait()
-            copy_counts.wait()
+                for query, bits in enumerate((bits_a, bits_b)):
 
-    candidate_block_ids, physical_block_ids, owners = prepare(
-        candidates, table, control
-    )
-    candidate_block_ids = candidate_block_ids[:, : per_query if direct else count]
-    physical_block_ids, owners = physical_block_ids[:, :count], owners[:, :3]
-    if parts > 1:
-        physical_block_ids = resolve_candidate_blocks(
-            candidate_block_ids,
-            table,
-            sparse_block_kv=block,
-            cache_pages=cache_pages,
-            page_size=page_size,
-        )
-    return candidate_block_ids, physical_block_ids, owners
+                    @plsc.parallel_loop(0, bounds[query], lanes, unroll=unroll)
+                    def unmark(i, query=query, bits=bits):
+                        # Words hold only this pair's bits, so zeroing the
+                        # words of unmarked IDs is harmless.
+                        key = ids[pl.ds(bases[query] + i, lanes)]
+                        plsc.store_scatter(bits, [word(key)], zeros)
 
+        for back in (2, 1):
 
-def _canonical_candidate_blocks_ref(
-    candidates, table, block, width, cache_pages, page_size
-):
-    """Reference partition into three sorted segments on host XLA."""
-    rows, queries, per_query = candidates.shape
-    blocks = pl.cdiv(width, block)
-    flat = candidates.reshape(rows, queries * per_query)
-    physical_block_ids = resolve_candidate_blocks(
-        flat,
-        table,
-        sparse_block_kv=block,
-        cache_pages=cache_pages,
-        page_size=page_size,
-    )
-    parts = max(1, block // page_size)
-    needed = flat[..., None] * block + jnp.arange(parts) * min(block, page_size) < width
-    valid = jnp.all(
-        (physical_block_ids.reshape(*flat.shape, parts) >= 0) | ~needed, axis=-1
-    )
-    valid &= (flat >= 0) & (flat < blocks)
-    candidate_block_ids = jnp.sort(jnp.where(valid, flat, blocks), axis=-1)
-    unique = jnp.diff(candidate_block_ids, axis=-1, prepend=-1) != 0
-    candidate_block_ids = jnp.sort(
-        jnp.where(unique, candidate_block_ids, blocks), axis=-1
-    )
-    candidate_block_ids = jnp.where(
-        candidate_block_ids < blocks, candidate_block_ids, -1
-    )
-    physical_block_ids = resolve_candidate_blocks(
-        candidate_block_ids,
-        table,
-        sparse_block_kv=block,
-        cache_pages=cache_pages,
-        page_size=page_size,
-    )
-    # Pack per-query ownership: bit q set when query q lists the union block.
-    owners = jnp.zeros_like(candidate_block_ids)
-    for query in range(queries):
-        present = (
-            (candidate_block_ids[:, :, None] == candidates[:, query, None, :])
-            & (candidates[:, query, None, :] >= 0)
-        ).any(axis=-1)
-        owners = owners | (present.astype(jnp.int32) << query)
-    owners = jnp.where(candidate_block_ids >= 0, owners, 0)
-    category = jnp.where(
-        owners == 1, 0, jnp.where(owners == 3, 1, jnp.where(owners == 2, 2, 3))
-    )
-    order = jnp.argsort(category, axis=1, stable=True)
-    candidate_block_ids = jnp.take_along_axis(candidate_block_ids, order, axis=1)
-    physical_block_ids = jnp.take_along_axis(
-        physical_block_ids.reshape(rows, -1, parts), order[..., None], axis=1
-    ).reshape(rows, -1)
-    counts = jnp.stack([(owners == flag).sum(axis=1) for flag in (1, 3, 2)], axis=1)
-    return candidate_block_ids, physical_block_ids, counts
+            @pl.when(steps >= back)
+            def epilogue(back=back):
+                writes(steps - back, wait=True)
 
-
-def _resolve_blocks_sc(blocks, table, block, cache_pages, page_size):
-    """Resolve sub-page or page-sized blocks using SparseCore.
-
-    Args:
-        blocks: [groups, slots] logical block IDs.
-        table: [groups, max_pages_per_request] physical page table rows.
-        block: Tokens per block; divides page_size.
-        cache_pages: Physical cache page count.
-        page_size: Tokens per cache page.
-
-    Returns:
-        Physical block IDs shaped like blocks; invalid entries are -1.
-    """
-    info = plsc.get_sparse_core_info()
-    lanes, units = info.num_lanes, info.num_cores * info.num_subcores
-    rows, count = blocks.shape
-    table_width, per_page = table.shape[1], page_size // block
-    columns = pl.cdiv(count, 128) * 128
-    blocks = jnp.pad(blocks, ((0, 0), (0, columns - count)), constant_values=-1)
-    table = jnp.pad(table, ((0, 0), (0, -table_width % 128)), constant_values=-1)
-    mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
-
-    @pl.kernel(
-        out_type=jax.ShapeDtypeStruct(blocks.shape, jnp.int32),
-        scratch_types=(
-            pltpu.VMEM((columns,), jnp.int32),
-            pltpu.VMEM((table.shape[1],), jnp.int32),
-            pltpu.VMEM((columns,), jnp.int32),
-            pltpu.SemaphoreType.DMA((3,)),
-        ),
-        mesh=mesh,
-        compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
-        name="paged_mqa_candidate_addresses",
-    )
-    def resolve(src, pages, out, ids, page_ids, physical_block_ids, sem):
-        unit = lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
-
-        @pl.loop(unit, rows, step=units)
-        def row(row_id):
-            read_ids = pltpu.async_copy(src.at[row_id], ids, sem.at[0])
-            read_pages = pltpu.async_copy(pages.at[row_id], page_ids, sem.at[1])
-            read_ids.wait()
-            read_pages.wait()
-
-            @plsc.parallel_loop(0, columns, lanes, unroll=8)
-            def address(i):
-                selected = ids[pl.ds(i, lanes)]
-                safe = jnp.clip(selected, 0, table_width * per_page - 1)
-                page = plsc.load_gather(page_ids, [safe // per_page])
-                valid = (
-                    (selected >= 0)
-                    & (selected < table_width * per_page)
-                    & (page >= 0)
-                    & (page < cache_pages)
-                )
-                physical_block_ids[pl.ds(i, lanes)] = jnp.where(
-                    valid, page * per_page + safe % per_page, -1
-                )
-
-            pltpu.async_copy(physical_block_ids, out.at[row_id], sem.at[2]).wait()
-
-    return resolve(blocks, table)[:, :count]
-
-
-@jax.jit(static_argnames=("sparse_block_kv", "cache_pages", "page_size"))
-def resolve_candidate_blocks(
-    sparse_blocks: jax.Array,
-    block_table: jax.Array,
-    *,
-    sparse_block_kv: int,
-    cache_pages: int,
-    page_size: int = PAGE_RECORDS,
-) -> jax.Array:
-    """Resolve request-shared [G,C] blocks, preserving order and duplicates.
-
-    Blocks spanning pages expand into page-sized fragments in candidate order.
-    Per-query causal lengths are applied by the scorer, not this shared metadata.
-
-    Args:
-        sparse_blocks: [groups, slots] logical candidate block IDs.
-        block_table: [groups, max_pages_per_request] physical page table rows.
-        sparse_block_kv: Tokens per candidate block.
-        cache_pages: Physical cache page count.
-        page_size: Tokens per cache page.
-
-    Returns:
-        [groups, slots * max(1, sparse_block_kv // page_size)] physical fragment
-        IDs, preserving order and duplicates; invalid entries are -1.
-    """
-    if sparse_block_kv > page_size:
-        parts = sparse_block_kv // page_size
-        sparse_blocks = jnp.where(
-            sparse_blocks[..., None] >= 0,
-            sparse_blocks[..., None] * parts + jnp.arange(parts),
-            -1,
-        ).reshape(sparse_blocks.shape[0], -1)
-        sparse_block_kv = page_size
-    per_page = page_size // sparse_block_kv
-    limit = block_table.shape[1] * per_page
-    safe = jnp.clip(sparse_blocks, 0, limit - 1)
-    scratch_words = (
-        2 * pl.cdiv(sparse_blocks.shape[1], 128) + pl.cdiv(block_table.shape[1], 128)
-    ) * 128
-    if jax.default_backend() == "tpu" and (
-        scratch_words * 4 <= plsc.get_sparse_core_info().vmem_capacity_bytes // 2
-    ):
-        return _resolve_blocks_sc(
-            sparse_blocks, block_table, sparse_block_kv, cache_pages, page_size
-        )
-    pages = jnp.take_along_axis(block_table, safe // per_page, axis=1)
-    valid = (
-        (sparse_blocks >= 0)
-        & (sparse_blocks < limit)
-        & (pages >= 0)
-        & (pages < cache_pages)
-    )
-    return jnp.where(valid, pages * per_page + safe % per_page, -1)
+    candidate_block_ids, physical_block_ids, owners = kernel(candidates, table, control)
+    return candidate_block_ids, physical_block_ids, owners[:, :3]
 
 
 def gather_candidate_keys(

@@ -31,8 +31,8 @@ resolves to P=8 with 16640-word slices and 16384 candidates.
 Two properties of the kernel shape these tests, and both rule out the obvious
 assertion:
 
-* **Compare selected SCORES as a multiset, never the indices.** The kernel
-  returns indices *unsorted* and its own docstring concedes that equal boundary
+* **Compare selected SCORES as a multiset, never the indices.** The kernel's
+  docstring concedes that equal boundary
   scores "may be broken differently". Real score rows carry hundreds of exact
   ties, so asserting on the index set asserts something the kernel never
   promised, and would fail on a correct implementation.

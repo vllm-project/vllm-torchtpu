@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Exact unsorted top-k over fp32 score rows on SparseCore.
+"""Exact top-k over fp32 score rows on SparseCore.
 
 Hierarchical 2-stage multi-subcore selection:
 1. For any batch size B (including B = 1, 2, 4, 8, 16, 32) and N in 2048..256K,
@@ -24,7 +24,7 @@ their
 3. In Stage 2, candidate scores are merged on SparseCore to produce the exact
    global top-k column indices.
 
-Output rows are the top-k column indices in unspecified order, ``-1``
+Output rows are the top-k column indices in ascending order, ``-1``
 suffix-padded, matching an exact top-k over the given scores as a set (equal
 boundary scores may be broken differently). ``-inf`` scores and positions at
 or beyond ``row_lengths`` are never selected. NaNs are unsupported.
@@ -514,7 +514,7 @@ def sparsecore_topk(
     stage2_scheduling_group_id: int | None = None,
     return_scores: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
-    """Exact top-k indices per row, unsorted, -1 suffix-padded.
+    """Exact top-k indices per row, ascending, -1 suffix-padded.
 
     Uses 2-stage hierarchical subcore selection when b < 32 or n > 64K to utilize
     all 32 subcores in parallel without inter-core barrier overhead.

@@ -155,6 +155,7 @@ _SHAPES = {
     "dsv41_output_projection": _TPU_2,
     "dsv41_projection_rope": _TPU_2,
     "dsv41_swa_parity": _TPU_2,
+    "dsv41_candidate_metadata": _TPU_2,
     "dsv41_benchmark_scripts_cpu": "cpu",
     "dsv41_kernel_config_cpu": "cpu",
     "dsv41_stage_model": "cpu",
