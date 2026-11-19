@@ -431,6 +431,7 @@ def _kernel(
     precision: frozenset = frozenset(),
     pair: bool = False,
     chunk: int = 0,
+    inbody: int = 0,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -507,6 +508,8 @@ def _kernel(
         local_limit_ref=local_limit_ref,
     ):
         store_out = None
+        body_hook = []  # `inbody` copy starts, run first in whichever body runs
+        tail_hook = []  # `inbody` end-of-call waits, after the body
         if tiles_per_step > 1:
             tile = msa_attention._meta_tile(work_meta_ref[w], groups_per_tile)
             bq = q_ref.shape[1] // tiles_per_step
@@ -599,7 +602,15 @@ def _kernel(
                 stream_cached()
                 return
 
-            def start_group(group, half):
+            # `inbody` (K): a group's first K page copies start unconditionally
+            # inside the running group's body (straight-line with its vector
+            # work, whose bundles leave the scalar slots idle), slots past its
+            # count copying its first page again; the rest start in the loop
+            # ahead of the body. Waits cover max(count, K) copies, and the
+            # copies started for groups past the last are waited at the end.
+            lo = inbody
+
+            def start_group(group, half, lo=0):
                 base = msa_attention._slot(work_meta_ref[group], pages_per_step, 0)
                 kv_head = group_head(group)
 
@@ -613,35 +624,77 @@ def _kernel(
                 # Four page copies per iteration: their address chains (two
                 # dependent SMEM loads each) overlap.
                 group_count = work_count_ref[group]
+                rest = jnp.maximum(group_count - lo, 0)
 
                 def start4(i, carry):
                     for j in range(_START_UNROLL):  # alternate the two DMA queues
-                        start(_START_UNROLL * i + j, j % 2)
+                        start(lo + _START_UNROLL * i + j, j % 2)
                     return carry
 
-                jax.lax.fori_loop(0, group_count // _START_UNROLL, start4, 0)
-                done = group_count - group_count % _START_UNROLL
+                jax.lax.fori_loop(0, rest // _START_UNROLL, start4, 0)
+                done = lo + rest - rest % _START_UNROLL
 
                 def start1(g, carry):
                     start(g)
                     return carry
 
-                jax.lax.fori_loop(done, group_count, start1, 0)
+                jax.lax.fori_loop(done, jnp.maximum(group_count, lo), start1, 0)
+
+            def start_fixed(group, half):
+                """The first `lo` copies of `group` (clamped to the last group:
+                a group past it copies the last group's pages, waited at the
+                end), unconditionally."""
+                grp = jnp.minimum(group, num_groups - 1)
+                base = msa_attention._slot(work_meta_ref[grp], pages_per_step, 0)
+                kv_head = group_head(grp)
+                group_count = work_count_ref[grp]
+                key0 = jnp.maximum(work_page_ref[base], 0)
+                for g in range(lo):
+                    key = jnp.where(g < group_count, work_page_ref[base + g], key0)
+                    page = page_table_ref[jnp.maximum(key, 0)]
+                    for copy in page_copies(
+                        (half, pl.ds(g, 1), 0), (half, 0), page, kv_head
+                    ):
+                        copy.start(priority=g % 2)
 
             @pl.when(w == 0)
             def _first():
                 for d in range(ring - 1):
-                    pl.when(d < num_groups)(functools.partial(start_group, d, d))
 
-            @pl.when(w + ring - 1 < num_groups)
+                    @pl.when(d < num_groups)
+                    def _start(d=d):
+                        if lo:
+                            start_fixed(d, d)
+                        start_group(d, d, lo)
+
+            nxt = w + ring - 1
+
+            @pl.when(nxt < num_groups)
             def _next():
-                start_group(w + ring - 1, (w + ring - 1) % ring)
+                start_group(nxt, nxt % ring, lo)
+
+            if lo:
+                body_hook.append(lambda: start_fixed(nxt, nxt % ring))
+
+                def _drain():
+                    for d in range(1, ring):
+                        x = w + d  # past the last group: started in-body by x - ring + 1
+
+                        @pl.when(x >= ring - 1)
+                        def _wait(x=x):
+                            for copy in page_copies(
+                                (x % ring, pl.ds(0, lo), 0), (x % ring, 0), 0, 0, lo
+                            ):
+                                copy.wait()
+
+                tail_hook.append(lambda: pl.when(w == num_groups - 1)(_drain))
 
             # One wait per set bit of `count` (the source only sizes the wait).
+            waited = jnp.maximum(count, lo) if lo else count
             n = 1
             while n <= pages_per_step:
                 for copy in page_copies((half, pl.ds(0, n), 0), (half, 0), 0, 0, n):
-                    pl.when((count & n) != 0)(copy.wait)
+                    pl.when((waited & n) != 0)(copy.wait)
                 n *= 2
 
         if not cached:
@@ -1060,6 +1113,14 @@ def _kernel(
         # groups are 16, 32 or 64 pages by call). A step costs per score column,
         # filled or not (~2.3 us at 16 pages, ~1.1 us at 4, twin standalone
         # j-952e8a64), plus ~0.7 us whatever its width (j-aec3278d).
+        def hooked(fn):
+            def run():
+                for hook in body_hook:
+                    hook()
+                fn()
+
+            return run
+
         def run_widths(count=count, first=first, last=last):
             single = first & last
             widths = [n for n in step_widths if n < pages_per_step] + [pages_per_step]
@@ -1079,9 +1140,9 @@ def _kernel(
                             functools.partial(attend, width, False, from_bf16)
                         )
                     continue
-                pl.when(fits & single)(functools.partial(body, width, True))
+                pl.when(fits & single)(hooked(functools.partial(body, width, True)))
                 pl.when(fits & jnp.logical_not(single))(
-                    functools.partial(body, width, False)
+                    hooked(functools.partial(body, width, False))
                 )
 
         def empty():  # a tile of padding tokens: its only group holds no page
@@ -1093,11 +1154,14 @@ def _kernel(
         if mode != "full":
             use_chunked = chunk and fp4 and not cached and row_split == 1 and not (qk8 or pv8)
             return types.SimpleNamespace(
+                body_hook=body_hook, hooked=hooked,
                 attend=attend_chunked if use_chunked else attend, count=count, single=first & last,
                 run_widths=run_widths, empty=empty,
             )
         run_widths()
-        pl.when(count == 0)(empty)
+        pl.when(count == 0)(hooked(empty))
+        for hook in tail_hook:
+            hook()
 
     def loop(w, carry):
         group(w)
@@ -1111,7 +1175,7 @@ def _kernel(
         group, b, block_start_ref, num_groups, tiles_per_step, work_page_ref,
         work_meta_ref, work_count_ref, page_table_ref, kv_hbm_ref, buf_ref, sem_ref,
         scale_hbm_ref, scale_buf_ref, scale_sem_ref, pages_per_step, step_widths,
-        group_head, o_ref,
+        group_head, o_ref, inbody,
     )
 
 
@@ -1119,7 +1183,7 @@ def _pair_loop(
     group, b, block_start_ref, num_groups, tiles_per_step, work_page_ref,
     work_meta_ref, work_count_ref, page_table_ref, kv_hbm_ref, buf_ref, sem_ref,
     scale_hbm_ref, scale_buf_ref, scale_sem_ref, pages_per_step, step_widths,
-    group_head, o_ref,
+    group_head, o_ref, inbody=0,
 ):
     """`_kernel`'s group loop with `pair` (decode, streamed pages): a grid
     step whose tiles hold one group each runs them two at a time, both
@@ -1153,7 +1217,12 @@ def _pair_loop(
             )
         return out
 
-    def start(group_id):
+    # `inbody` (K, as in `_kernel`): each group's first K copies start
+    # unconditionally in the body of the step that starts it (clamped to the
+    # last group), the rest in the loop ahead; waits cover max(count, K).
+    lo = inbody
+
+    def start(group_id, lo=lo):
         slot = group_id % ring
         base = msa_attention._slot(work_meta_ref[group_id], pages_per_step, 0)
         kv_head = group_head(group_id)
@@ -1164,19 +1233,33 @@ def _pair_loop(
                 copy.start(priority=queue)
 
         count = work_count_ref[group_id]
+        rest = jnp.maximum(count - lo, 0)
 
         def start4(i, carry):
             for j in range(_START_UNROLL):
-                one(_START_UNROLL * i + j, j % 2)
+                one(lo + _START_UNROLL * i + j, j % 2)
             return carry
 
-        jax.lax.fori_loop(0, count // _START_UNROLL, start4, 0)
+        jax.lax.fori_loop(0, rest // _START_UNROLL, start4, 0)
 
         def start1(g, carry):
             one(g)
             return carry
 
-        jax.lax.fori_loop(count - count % _START_UNROLL, count, start1, 0)
+        jax.lax.fori_loop(lo + rest - rest % _START_UNROLL, jnp.maximum(count, lo), start1, 0)
+
+    def start_fixed(group_id):
+        slot = group_id % ring
+        grp = jnp.minimum(group_id, num_groups - 1)
+        base = msa_attention._slot(work_meta_ref[grp], pages_per_step, 0)
+        kv_head = group_head(grp)
+        count = work_count_ref[grp]
+        key0 = jnp.maximum(work_page_ref[base], 0)
+        for g in range(lo):
+            key = jnp.where(g < count, work_page_ref[base + g], key0)
+            page = page_table_ref[jnp.maximum(key, 0)]
+            for copy in copies(slot, slot, page, kv_head, g=g):
+                copy.start(priority=g % 2)
 
     def start_if(group_id):
         pl.when(group_id < num_groups)(functools.partial(start, group_id))
@@ -1184,31 +1267,40 @@ def _pair_loop(
     def wait(group_id):
         slot = group_id % ring
         count = work_count_ref[group_id]
+        if lo:
+            count = jnp.maximum(count, lo)
         n = 1
         while n <= pages_per_step:
             for copy in copies(slot, slot, 0, 0, n):
                 pl.when((count & n) != 0)(copy.wait)
             n *= 2
 
-    lo, hi = block_start_ref[b], block_start_ref[b + 1]
+    lo_g, hi = block_start_ref[b], block_start_ref[b + 1]
 
-    @pl.when(lo == 0)
+    @pl.when(lo_g == 0)
     def _first():
-        start_if(0)
-        start_if(1)
+        for d in (0, 1):
+
+            @pl.when(d < num_groups)
+            def _start(d=d):
+                if lo:
+                    start_fixed(d)
+                start(d)
 
     def one_by_one(w, carry):
         start_if(w + 2)
         wait(w)
         g = group(w, mode="setup")
+        if lo:
+            g.body_hook.append(lambda: start_fixed(w + 2))
         g.run_widths()
-        pl.when(g.count == 0)(g.empty)
+        pl.when(g.count == 0)(g.hooked(g.empty))
         return carry
 
     widths = [n for n in step_widths if n < pages_per_step] + [pages_per_step]
 
     def two_at_a_time(i, carry):
-        w = lo + 2 * i
+        w = lo_g + 2 * i
         start_if(w + 2)
         start_if(w + 3)
         wait(w)
@@ -1224,6 +1316,11 @@ def _pair_loop(
             o_ref[:, rows, :] = jnp.concatenate(
                 [outs[0].pop(), outs[1].pop()], axis=1
             ).astype(o_ref.dtype)
+        def in_body():
+            if lo:
+                start_fixed(w + 2)
+                start_fixed(w + 3)
+
         pair_max = decode_pair_max()
         # `pairmax`: pairs up to the narrowest width holding pair_max pages;
         # a wider pair runs one by one (below).
@@ -1237,6 +1334,7 @@ def _pair_loop(
                 fits = fits & (count <= width)
 
             def both(width=width):
+                in_body()
                 ga.attend(width, True)
                 gb.attend(width, True)
                 store()
@@ -1245,6 +1343,7 @@ def _pair_loop(
 
         @pl.when(count == 0)
         def _empty():
+            in_body()
             ga.empty()
             gb.empty()
             store()
@@ -1253,6 +1352,7 @@ def _pair_loop(
 
             @pl.when(count > pair_widths[-1])
             def _one_by_one():
+                in_body()
                 for g in (w, w + 1):
                     single = group(g, mode="setup")
                     single.run_widths()
@@ -1260,17 +1360,28 @@ def _pair_loop(
         return carry
 
     if tiles_per_step % 2:  # no pairs in a step
-        jax.lax.fori_loop(lo, hi, one_by_one, 0)
-        return
-    paired = hi - lo == tiles_per_step
+        jax.lax.fori_loop(lo_g, hi, one_by_one, 0)
+    else:
+        paired = hi - lo_g == tiles_per_step
 
-    @pl.when(paired)
-    def _pairs():
-        jax.lax.fori_loop(0, tiles_per_step // 2, two_at_a_time, 0)
+        @pl.when(paired)
+        def _pairs():
+            jax.lax.fori_loop(0, tiles_per_step // 2, two_at_a_time, 0)
 
-    @pl.when(jnp.logical_not(paired))
-    def _singles():
-        jax.lax.fori_loop(lo, hi, one_by_one, 0)
+        @pl.when(jnp.logical_not(paired))
+        def _singles():
+            jax.lax.fori_loop(lo_g, hi, one_by_one, 0)
+
+    if lo:  # copies started in-body for groups past the last
+
+        @pl.when(hi == num_groups)
+        def _drain():
+            for x in (num_groups, num_groups + 1):
+
+                @pl.when(x >= 2)
+                def _wait(x=x):
+                    for copy in copies(x % ring, x % ring, 0, 0, lo):
+                        copy.wait()
 
 
 def _merged_store_rows(block_q: int, num_heads: int, dtype) -> int:
@@ -1326,6 +1437,7 @@ def _attention_call(
     precision=frozenset(),
     pair=False,
     chunk=0,
+    inbody=0,
 ):
     """One kernel call over the tiles ``tile_offset + [0, tiles)`` of the
     head-major ``q [G * Hg, T, D]``, ``selected [G, T, K]``, ``local_page``
@@ -1495,6 +1607,7 @@ def _attention_call(
             precision=precision if fp4 else frozenset(),
             pair=pair,
             chunk=chunk if fp4 and block_q == 8 and not cache_size else 0,
+            inbody=min(inbody, pages_per_step) if not cache_size else 0,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
@@ -1821,6 +1934,8 @@ def decode_opt() -> dict:
             opt["pages_per_step"] = int(val)
         elif key == "pair" and not val:
             opt["pair"] = True
+        elif key == "inbody" and val.isdigit():
+            pass  # `decode_inbody`
         elif key == "strided" and not val:
             pass  # `decode_strided`
         elif key == "bcast" and not val:
@@ -1846,6 +1961,18 @@ def decode_chunk() -> int:
         key, _, val = x.strip().partition("=")
         if key == "chunk":
             return 2 if val == "2" else 1
+    return 0
+
+
+def decode_inbody() -> int:
+    """`TPU_MINIMAX_M3_MSA_DECODE_OPT` ``inbody=<K>``: decode groups start
+    the next group's first K page copies inside their body (`_kernel`
+    `inbody`); 0 = off."""
+    spec = os.environ.get(DECODE_OPT_ENV, "")
+    for x in spec.replace("+", ",").split(","):
+        key, _, val = x.strip().partition("=")
+        if key == "inbody" and val.isdigit():
+            return int(val)
     return 0
 
 
@@ -2020,6 +2147,9 @@ def _chunked_call(
     align = _merged_store_rows(block_q, num_q_heads // num_heads, q.dtype)
     tiles_per_step = _tiles_per_step(num_tiles, block_q, align)
     decode = num_chunks == 1 and num_tokens <= _DECODE_MAX_TOKENS and not cache_size
+    if decode and decode_inbody():
+        _proof(DECODE_OPT_ENV, f"MSA decode copies start in-body (inbody={decode_inbody()})")
+        call = functools.partial(call, inbody=decode_inbody())
     if decode and decode_chunk():
         _proof(DECODE_OPT_ENV, f"MSA decode tiles run page by page (chunk={decode_chunk()})")
         call = functools.partial(call, chunk=decode_chunk())
