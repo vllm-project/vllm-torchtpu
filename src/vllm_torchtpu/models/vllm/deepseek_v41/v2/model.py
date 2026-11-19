@@ -1592,6 +1592,11 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
     model_cls = DeepseekV41Model
 
     def load_weights(self, weights):
+        if vocab_parallel_head.is_vocab_parallel(self.lm_head):
+            raise RuntimeError(
+                "Cannot reload weights: the LM head is vocab-parallel and holds "
+                "only this rank's vocab rows"
+            )
         loaded = super().load_weights(weights)
         # TPU_DEEPSEEK_V41_ENGRAM_HBM: place the host Engram head shards in HBM
         # before the KV cache is sized from what remains.

@@ -19,6 +19,7 @@ import pytest
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME
 from vllm_torchtpu.models.vllm.deepseek_v41.common import vocab_parallel_head
 
 WORLD, VOCAB, WIDTH = 8, 8 * 48, 64
@@ -40,14 +41,18 @@ def test_logits_equal_plain_matmul():
         XLA_FLAGS=f"--xla_force_host_platform_device_count={WORLD}",
     )
     result = subprocess.run(
-        [sys.executable, "-c", code], env=env, capture_output=True, text=True
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
     )
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
 
 
 def _check_logits():
-    mesh = Mesh(np.array(jax.devices()[:WORLD]), (vocab_parallel_head._AXIS,))
-    sharded = NamedSharding(mesh, P(vocab_parallel_head._AXIS, None))
+    mesh = Mesh(np.array(jax.devices()[:WORLD]), (EP_AXIS_NAME,))
+    sharded = NamedSharding(mesh, P(EP_AXIS_NAME, None))
     head = jax.jit(vocab_parallel_head.make_head(mesh, WORLD, VOCAB))
     rng = np.random.default_rng(0)
     # The target and draft heads' rows per rank at decode batch 2.
@@ -78,6 +83,7 @@ def _head_setup(monkeypatch, vocab=VOCAB, width=WIDTH, device="cpu", **changes):
 
     monkeypatch.setattr(ep_mesh, "ep_device_ids", lambda: list(range(WORLD)))
     monkeypatch.setattr(ep_mesh, "ep_mesh_index", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: WORLD)
     monkeypatch.delenv("TPU_GREEDY_HEAD_BACKEND", raising=False)
     lm_head = torch.nn.Module()
     lm_head.weight = torch.nn.Parameter(
@@ -85,6 +91,7 @@ def _head_setup(monkeypatch, vocab=VOCAB, width=WIDTH, device="cpu", **changes):
         requires_grad=False,
     )
     lm_head.quant_method = UnquantizedEmbeddingMethod()
+    lm_head.bias = None
     processor = SimpleNamespace(
         logits_as_input=False,
         soft_cap=None,
@@ -107,6 +114,10 @@ def _head_setup(monkeypatch, vocab=VOCAB, width=WIDTH, device="cpu", **changes):
     for name, value in changes.items():
         if name == "greedy_head_backend":
             monkeypatch.setenv("TPU_GREEDY_HEAD_BACKEND", value)
+        elif name == "world_size":
+            monkeypatch.setattr(
+                torch.distributed, "get_world_size", lambda value=value: value
+            )
         elif name == "ep_ranks":
             ranks = list(range(value))
             monkeypatch.setattr(ep_mesh, "ep_device_ids", lambda ranks=ranks: ranks)
@@ -141,6 +152,7 @@ def test_measured_setup_splits_the_head(monkeypatch):
         ({"quantized": True}, "quantized"),
         ({"ep_ranks": 1}, "EP over 2 or more ranks"),
         ({"ep_ranks": 7}, "divisible by 7"),
+        ({"world_size": 2 * WORLD}, "whole world of 16 ranks"),
     ],
 )
 def test_unsupported_setups_keep_the_whole_head(monkeypatch, changes, reason):
