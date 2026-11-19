@@ -30,6 +30,7 @@ from vllm.v1.worker.encoder_cudagraph import (
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.mm_host_copy_patch import copy_bytes_
 from vllm_torchtpu.runner.mm_encoder_rows import split_batch_output
 from vllm_torchtpu.runner.mm_video_chunking import (
     embed_multimodal_chunked,
@@ -59,11 +60,14 @@ ROW_CHUNKS = 8
 
 
 @functools.cache
-def _tail_buffer(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-    # Reused, so the budget-sized allocation is not faulted in per call. Rows
-    # past the tail keep earlier (finite) rows: padding rows of a budget graph
-    # are never attended to by real ones, and their outputs are dropped.
-    return torch.zeros(shape, dtype=dtype)
+def _tail_buffer(shape: tuple[int, ...], dtype: torch.dtype) -> list[Any]:
+    """A host buffer for partial chunks and its last upload.
+
+    Reused, so the chunk-sized allocation is not faulted in per call. Rows
+    past the tail keep earlier (finite) rows: padding rows of a budget graph
+    are never attended to by real ones, and their outputs are dropped.
+    """
+    return [torch.zeros(shape, dtype=dtype), None]
 
 
 def rows_to_device(
@@ -73,7 +77,7 @@ def rows_to_device(
     dtype, on its device.
 
     Whole chunks upload as views; a partial one goes through a reused host
-    buffer (`_tail_buffer`) and uploads blocking, so the next can refill it.
+    buffer (`_tail_buffer`), refilled once its previous upload is done.
     Padding rows are zero past the last chunk.
     """
     rows, rest = template.shape[0], tuple(template.shape[1:])
@@ -108,12 +112,19 @@ def _upload_tail(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    buffer = _tail_buffer((size, *rest), dtype)
-    start = 0
+    slot = _tail_buffer((size, *rest), dtype)
+    buffer, previous = slot
+    if previous is not None:
+        synchronize_tensors([previous], wait=True)
+    flat = buffer.view(-1).view(torch.uint8)
+    pairs, start = [], 0
     for piece in pieces:
-        buffer[start : start + piece.shape[0]].copy_(piece)
-        start += piece.shape[0]
-    return buffer.to(device, copy=True)
+        src = piece.contiguous().view(-1).view(torch.uint8)
+        pairs.append((flat[start : start + src.numel()], src))
+        start += src.numel()
+    copy_bytes_(pairs)
+    slot[1] = buffer.to(device, non_blocking=True, copy=True)
+    return slot[1]
 
 
 @contextmanager
