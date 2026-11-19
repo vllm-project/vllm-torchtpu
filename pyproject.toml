@@ -207,6 +207,7 @@ ignore-missing-imports = [
     "google.protobuf", "google.protobuf.*",
     "jax", "jax.*",
     "jaxlib", "jaxlib.*",
+    "msgspec", "msgspec.*",
     "numpy", "numpy.*",
     "numba", "numba.*",
     "packaging", "packaging.*",

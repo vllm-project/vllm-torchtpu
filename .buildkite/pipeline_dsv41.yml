@@ -215,6 +215,7 @@ steps:
             tests/core/test_dp_prompt_backlog.py
             tests/core/test_dp_prefix_affinity.py
             tests/core/test_block_hash_bytes.py
+            tests/core/test_packed_prompt_ids.py
             tests/platforms/test_patch_registry.py
             -q --junitxml=perf_eval_results/dsv41-serving-cpu.xml
 

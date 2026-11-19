@@ -66,13 +66,15 @@ def request(request_id: str, token_ids: list[int], **fields) -> EngineCoreReques
     return EngineCoreRequest(**values)
 
 
-@pytest.fixture
-def routed(monkeypatch):
+@pytest.fixture(params=[False, True], ids=["ids", "packed"])
+def routed(monkeypatch, request):
     stock = DPLBAsyncMPClient.get_core_engine_for_request
     monkeypatch.setattr(
         DPLBAsyncMPClient,
         "get_core_engine_for_request",
-        affinity.make_router(stock, CHUNK, load_margin=2, capacity=4096),
+        affinity.make_router(
+            stock, CHUNK, load_margin=2, capacity=4096, packed=request.param
+        ),
     )
     return stock
 

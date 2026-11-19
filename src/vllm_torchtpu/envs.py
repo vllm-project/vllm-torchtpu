@@ -213,6 +213,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS: int = 4096
     VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN: int = 2
     VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE: int = 65536
+    VLLM_TPU_PACKED_PROMPT_IDS: bool = False
 
 
 def env_with_choices(
@@ -1359,6 +1360,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE": env_positive_int(
         "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE", 65536
     ),
+    # API server -> engine core: send prompt ids as 1 packed 32-bit array instead
+    # of a msgpack list of ints (core/packed_prompt_ids.py). Same ids. A rollout
+    # switch: remove it and keep the packed path once serving runs confirm it.
+    "VLLM_TPU_PACKED_PROMPT_IDS": env_bool("VLLM_TPU_PACKED_PROMPT_IDS"),
 }
 
 

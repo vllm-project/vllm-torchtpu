@@ -134,6 +134,9 @@ PATCHES = (
         "vllm_torchtpu.platforms.tpu_platform:_patch_api_server_kernel_reload_endpoint",
         _ACTIVE,
     ),
+    # Prompt ids as 1 packed array across the engine hand-off, encoded in the
+    # API server and decoded in the engine core (VLLM_TPU_PACKED_PROMPT_IDS).
+    Patch("vllm_torchtpu.core.packed_prompt_ids:install", _ENGINE),
     # API-server prompt tokenization (VLLM_TPU_SEGMENT_TOKENIZE).
     Patch("vllm_torchtpu.segment_tokenize:patch_renderer_segment_tokenize", _ACTIVE),
     # API-server first-token detokenization (VLLM_TPU_DETOK_PRIME_SUFFIX).

@@ -129,6 +129,23 @@ def test_toy_tokenizer_matches_full_encode():
     assert seg.hits > 0 and seg.misses > 0
 
 
+def test_packed_ids_equal_the_ids_through_prefix_reuse():
+    tok = _toy_tokenizer()
+    seg = SegmentTokenizer(tok, max_cached_tokens=10_000, max_prompts=4, packed=True)
+    rng = random.Random(3)
+    reused_total = 0
+    for _ in range(200):
+        # A conversation grows turn by turn, so later turns reuse earlier ids.
+        text = _random_text(rng, rng.randrange(1, 20))
+        for _ in range(4):
+            prompt, reused = seg.encode_prompt(text)
+            assert prompt.ids == tok.encode(text, add_special_tokens=False).ids
+            assert prompt.packed is not None and prompt.packed.tolist() == prompt.ids
+            reused_total += reused
+            text += _random_text(rng, rng.randrange(1, 10))
+    assert reused_total > 0
+
+
 def test_cold_pieces_encode_in_parallel():
     tok = _toy_tokenizer()
     seg = SegmentTokenizer(tok, max_cached_tokens=10_000)

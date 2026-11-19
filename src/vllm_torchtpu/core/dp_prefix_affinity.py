@@ -44,9 +44,11 @@ process has its own client and table, and the stock front end spreads a
 conversation's turns over all of them.
 """
 
+from array import array
 from collections import OrderedDict
 from collections.abc import Sequence
 
+from vllm_torchtpu.core.packed_prompt_ids import packed_for
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -59,6 +61,19 @@ def boundary_hashes(token_ids: Sequence[int], chunk_tokens: int) -> list[int]:
     previous = 0
     for end in range(chunk_tokens, len(token_ids) + 1, chunk_tokens):
         previous = hash((previous, tuple(token_ids[end - chunk_tokens : end])))
+        hashes.append(previous)
+    return hashes
+
+
+def packed_boundary_hashes(packed: array, chunk_tokens: int) -> list[int]:
+    """boundary_hashes over the ids' packed bytes (VLLM_TPU_PACKED_PROMPT_IDS):
+    hash k covers the same tokens, without a tuple of ints per chunk."""
+    data = memoryview(packed).cast("B")
+    step = chunk_tokens * packed.itemsize
+    hashes: list[int] = []
+    previous = 0
+    for end in range(step, len(data) + 1, step):
+        previous = hash((previous, bytes(data[end - step : end])))
         hashes.append(previous)
     return hashes
 
@@ -102,9 +117,13 @@ def load_scores(client) -> list[float]:
     return scores
 
 
-def make_router(stock, chunk_tokens: int, load_margin: int, capacity: int):
+def make_router(
+    stock, chunk_tokens: int, load_margin: int, capacity: int, packed: bool = False
+):
     """A get_core_engine_for_request that prefers the engine holding the
-    prompt's deepest remembered prefix and otherwise calls `stock`."""
+    prompt's deepest remembered prefix and otherwise calls `stock`. With
+    `packed`, every prompt is hashed from its packed array, so all entries of
+    the table come from one hash scheme."""
     counts_pending_prompts = hasattr(stock, "backlog_stats")
 
     def get_core_engine_for_request(self, request):
@@ -121,7 +140,10 @@ def make_router(stock, chunk_tokens: int, load_margin: int, capacity: int):
         if table is None:
             table = self._prefix_table = PrefixTable(capacity)
 
-        hashes = boundary_hashes(token_ids, chunk_tokens)
+        if packed:
+            hashes = packed_boundary_hashes(packed_for(token_ids), chunk_tokens)
+        else:
+            hashes = boundary_hashes(token_ids, chunk_tokens)
         match = table.deepest(hashes)
         chosen_index = None
         if match is not None and len(match) < len(self.core_engines):
@@ -149,14 +171,16 @@ def make_router(stock, chunk_tokens: int, load_margin: int, capacity: int):
     return get_core_engine_for_request
 
 
-def install(chunk_tokens: int, load_margin: int, capacity: int) -> None:
+def install(
+    chunk_tokens: int, load_margin: int, capacity: int, packed: bool = False
+) -> None:
     from vllm.v1.engine.core_client import DPLBAsyncMPClient
 
     stock = DPLBAsyncMPClient.get_core_engine_for_request
     if hasattr(stock, "stock"):
         return
     DPLBAsyncMPClient.get_core_engine_for_request = make_router(
-        stock, chunk_tokens, load_margin, capacity
+        stock, chunk_tokens, load_margin, capacity, packed
     )
     logger.info(
         "dp prefix affinity on: %d-token chunks, load margin %d requests, "
@@ -175,4 +199,5 @@ def install_if_enabled() -> None:
             envs.VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS,
             envs.VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN,
             envs.VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE,
+            envs.VLLM_TPU_PACKED_PROMPT_IDS,
         )

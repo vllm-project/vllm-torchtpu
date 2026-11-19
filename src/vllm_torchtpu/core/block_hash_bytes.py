@@ -24,6 +24,7 @@ from array import array
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from vllm_torchtpu.core.packed_prompt_ids import ENGINE_PACKED
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -81,6 +82,13 @@ def get_request_block_hasher(
 
     def request_block_hasher(request: "Request") -> list[BlockHash]:
         start_token_idx = len(request.block_hashes) * hash_block_size
+        # The prompt's array as the engine received it (packed_prompt_ids.py):
+        # the same 4-byte ids, so the same block hashes, without a second pack.
+        received = (
+            ENGINE_PACKED.take(request.prompt_token_ids)
+            if start_token_idx == 0
+            else None
+        )
         num_tokens = request.num_tokens
         if start_token_idx + hash_block_size > num_tokens:
             return []
@@ -102,10 +110,13 @@ def get_request_block_hasher(
             token_ids = all_token_ids
         else:
             token_ids = all_token_ids[start_token_idx:end_token_idx]
-        try:
-            packed = memoryview(array(_TOKEN_ID_TYPECODE, token_ids)).cast("B")
-        except OverflowError:
-            packed = None
+        if received is not None and len(received) >= end_token_idx:
+            packed = memoryview(received).cast("B")
+        else:
+            try:
+                packed = memoryview(array(_TOKEN_ID_TYPECODE, token_ids)).cast("B")
+            except OverflowError:
+                packed = None
 
         parent = (
             request.block_hashes[-1]

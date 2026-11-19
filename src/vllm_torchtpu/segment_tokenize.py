@@ -72,10 +72,12 @@ import copy
 import json
 import re
 import threading
+from array import array
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
+from vllm_torchtpu.core.packed_prompt_ids import API_PACKED, pack
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -100,6 +102,8 @@ class TokenizedPrompt:
     token_starts: list[int]
     token_ends: list[int]
     ids_through_token: list[int]
+    # ``ids`` packed as 32-bit ints (VLLM_TPU_PACKED_PROMPT_IDS), or None.
+    packed: array | None = None
 
 
 @dataclass
@@ -126,6 +130,12 @@ class SharedPrefix:
         prompt = self.prompt
         joined = prompt.ids[:ids]
         joined.extend(rest.ids)
+        # The shared part's packed ids are copied as bytes; only the new ids
+        # are packed one by one.
+        packed = None
+        if prompt.packed is not None:
+            packed = prompt.packed[:ids]
+            packed.extend(pack(rest.ids))
         return TokenizedPrompt(
             text=text,
             ids=joined,
@@ -134,6 +144,7 @@ class SharedPrefix:
             token_ends=prompt.token_ends[:tokens] + [e + end for e in rest.token_ends],
             ids_through_token=prompt.ids_through_token[:tokens]
             + [n + ids for n in rest.ids_through_token],
+            packed=packed,
         )
 
 
@@ -297,7 +308,13 @@ class RecentPrompts:
 class SegmentTokenizer:
     """Encodes text exactly as ``backend.encode(text, add_special_tokens=False)``."""
 
-    def __init__(self, backend: Any, max_cached_tokens: int, max_prompts: int = 0):
+    def __init__(
+        self,
+        backend: Any,
+        max_cached_tokens: int,
+        max_prompts: int = 0,
+        packed: bool = False,
+    ):
         # Private copy: transformers mutates truncation/padding on the shared
         # backend per call, which must not leak into these encodes.
         self._backend = copy.deepcopy(backend)
@@ -323,6 +340,7 @@ class SegmentTokenizer:
         self._max_cached_tokens = max_cached_tokens
         self._lock = threading.Lock()
         self._recent = RecentPrompts(alts, max_prompts) if max_prompts > 0 else None
+        self._packed = packed
         self.hits = 0
         self.misses = 0
 
@@ -355,12 +373,20 @@ class SegmentTokenizer:
 
     def encode_reusing(self, text: str) -> tuple[list[int], int]:
         """The ids of ``text`` and how many of them came from a recent prompt."""
+        prompt, reused = self.encode_prompt(text)
+        return prompt.ids, reused
+
+    def encode_prompt(self, text: str) -> tuple[TokenizedPrompt, int]:
+        """``text`` tokenized, with its packed ids when packing is on and recent
+        prompts are kept, and how many ids came from a recent prompt."""
         if self._recent is None:
-            return self.encode_pieces(text).ids, 0
+            return self.encode_pieces(text), 0
         with self._lock:
             prefix = self._recent.longest_prefix(text)
         if prefix is None:
             prompt = self.encode_pieces(text)
+            if self._packed:
+                prompt.packed = pack(prompt.ids)
             reused = 0
         else:
             prompt = prefix.join(self.encode_pieces(text[prefix.end :]), text)
@@ -369,7 +395,7 @@ class SegmentTokenizer:
             self._recent.add(
                 prompt, replaces=prefix.prompt if prefix and prefix.whole else None
             )
-        return prompt.ids, reused
+        return prompt, reused
 
     def encode_pieces(self, text: str) -> TokenizedPrompt:
         pieces: list[tuple[bool, str]] = []  # (is_added_token, text)
@@ -491,7 +517,9 @@ _INSTANCES: dict[int, tuple[Any, SegmentTokenizer | None]] = {}
 _INSTANCES_LOCK = threading.Lock()
 
 
-def get_segment_tokenizer(tokenizer: Any, max_cached_tokens: int, max_prompts: int = 0):
+def get_segment_tokenizer(
+    tokenizer: Any, max_cached_tokens: int, max_prompts: int = 0, packed: bool = False
+):
     """One ``SegmentTokenizer`` per vLLM tokenizer object, or None if ineligible."""
     with _INSTANCES_LOCK:
         if id(tokenizer) in _INSTANCES:
@@ -505,7 +533,7 @@ def get_segment_tokenizer(tokenizer: Any, max_cached_tokens: int, max_prompts: i
         else:
             reason = SegmentTokenizer.eligible(backend)
         if reason is None:
-            seg = SegmentTokenizer(backend, max_cached_tokens, max_prompts)
+            seg = SegmentTokenizer(backend, max_cached_tokens, max_prompts, packed)
             logger.info(
                 "VLLM_TPU_SEGMENT_TOKENIZE: piecewise prompt tokenization on "
                 "(%d added tokens, cache %d tokens, ~12 B/token, prefix reuse "
@@ -541,15 +569,19 @@ def patch_renderer_segment_tokenize() -> None:
     orig = cls._tokenize_prompt
     max_cached = envs.VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS
     max_prompts = envs.VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS
+    packed_ids = envs.VLLM_TPU_PACKED_PROMPT_IDS
 
     def _tokenize_prompt(self, prompt, params):
         kwargs = params.get_encode_kwargs()
         if kwargs.get("add_special_tokens") or self._wants_offsets(prompt, params):
             return orig(self, prompt, params)
-        seg = get_segment_tokenizer(self.get_tokenizer(), max_cached, max_prompts)
+        seg = get_segment_tokenizer(
+            self.get_tokenizer(), max_cached, max_prompts, packed_ids
+        )
         if seg is None:
             return orig(self, prompt, params)
-        ids = seg.encode(prompt["prompt"])
+        tokenized, _ = seg.encode_prompt(prompt["prompt"])
+        ids = tokenized.ids
         max_length = kwargs.get("max_length")
         if (
             kwargs.get("truncation")
@@ -560,6 +592,8 @@ def patch_renderer_segment_tokenize() -> None:
             return orig(self, prompt, params)
         tokens_prompt = self._build_tokens_prompt(ids, prompt, offset_mapping=None)
         TOKENIZER_MADE_IDS.add(tokens_prompt["prompt_token_ids"])
+        if tokenized.packed is not None:
+            API_PACKED.put(tokens_prompt["prompt_token_ids"], tokenized.packed)
         return tokens_prompt
 
     cls._tokenize_prompt = _tokenize_prompt
