@@ -411,6 +411,9 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
 def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     """Hash TPU-specific factors used by both AOT and piecewise caches."""
     # Deferred: tpu_info imports Pallas, which this module otherwise avoids.
+    from vllm_torchtpu.runner.metadata_req_bucketing import (
+        get_active_metadata_req_bucket,
+    )
     from vllm_torchtpu.tpu_info import get_libtpu_cache_key
 
     cache_config = vllm_config.cache_config
@@ -424,6 +427,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "libtpu": get_libtpu_cache_key(),
         "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
+        "metadata_req_bucket": get_active_metadata_req_bucket(),
         "parallel": {
             "effective_data_parallel_size": utils.get_dp_size(
                 vllm_config.parallel_config
