@@ -87,6 +87,8 @@ from typing import Any, NamedTuple
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
+from vllm_torchtpu.core.scheduler_utils import format_counts, is_waiting_status
+
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY = 1000
@@ -121,18 +123,6 @@ _MAX_PINNED_BLOCKS = 360
 _KEEP_PRIOR_TURNS = 1
 _SMART_FORK = True
 _SAFE_TAIL_OFFSET = 4
-_WAITING_STATUS_NAMES = frozenset(("WAITING", "PREEMPTED"))
-
-
-def is_waiting_status(request: Any) -> bool:
-    """Returns whether ``request`` sits in the waiting queue (WAITING or PREEMPTED)."""
-    status = getattr(request, "status", None)
-    return getattr(status, "name", None) in _WAITING_STATUS_NAMES
-
-
-def format_counts(counts: dict[str, int]) -> str:
-    """Formats a reason -> count map as ``a:1,b:2`` for a telemetry field."""
-    return ",".join(f"{k}:{v}" for k, v in counts.items()) or "-"
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -488,7 +478,7 @@ class HybridStateRetention:
     ) -> Any:
         """Calls allocate_slots; on a real block shortage evicts the shortfall
         from the retained entries and retries."""
-        request = args[0] if args else kwargs.get("request")
+        request = args[0] if args else kwargs["request"]
         self._last_need = None
         res = orig(*args, **kwargs)
         reason = None

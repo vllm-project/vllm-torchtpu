@@ -24,6 +24,7 @@ from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.core import hybrid_retention
 from vllm_torchtpu.core.hybrid_retention import HybridStateRetention, _ConvLRUEntry
+from vllm_torchtpu.core.scheduler_utils import is_waiting_status
 
 BS = 256  # attention / mamba block size
 HB = 128  # hash block size (fine-grained partial hits)
@@ -866,6 +867,11 @@ def test_default_bounds_are_the_values_the_points_ran():
     assert (ret.smart_fork, ret.safe_tail_offset) == (True, 4)
     assert ret._get_keep_prior_turns() == 1
     assert not ret.enabled
+
+
+def test_only_waiting_and_preempted_requests_are_waiting():
+    waiting = {s for s in RequestStatus if is_waiting_status(SimpleNamespace(status=s))}
+    assert waiting == {RequestStatus.WAITING, RequestStatus.PREEMPTED}
 
 
 def test_partial_tail_hook_passes_vllm_arguments_through():

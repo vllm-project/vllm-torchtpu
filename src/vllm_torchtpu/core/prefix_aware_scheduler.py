@@ -62,8 +62,8 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu.core import prefix_change_log, scheduler_options
-from vllm_torchtpu.core.hybrid_retention import format_counts, is_waiting_status
 from vllm_torchtpu.core.packed_ids import pack_new_request_prompt_ids
+from vllm_torchtpu.core.scheduler_utils import format_counts, is_waiting_status
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
