@@ -23,7 +23,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 
 from vllm_torchtpu.kernels import fp8_lm_head as kernel
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -46,11 +46,13 @@ def apply_head(
 
 def quantize(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``[vocab, hidden]`` -> (e4m3 ``[vocab, hidden]``, f32 ``[1, vocab]``
-    per-row scale): each row's amax maps to e4m3's largest finite value."""
+    per-row scale): each row's amax maps to e4m3's largest finite value.
+    The scale gets a buffer of its own shape: as a view of the ``[vocab, 1]``
+    amax, torch_tpu re-materialized it before every head call."""
     w = weight.float()
     amax = w.abs().amax(dim=1, keepdim=True)
     scale = torch.clamp(amax / kernel.E4M3_MAX, min=torch.finfo(torch.float32).tiny)
-    return (w / scale).to(torch.float8_e4m3fn), scale.view(1, -1)
+    return (w / scale).to(torch.float8_e4m3fn), fresh_buffer(scale.view(1, -1))
 
 
 class Fp8LMHeadMethod(UnquantizedEmbeddingMethod):
