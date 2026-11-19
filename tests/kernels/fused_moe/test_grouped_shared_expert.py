@@ -75,3 +75,51 @@ def test_each_rank_gets_the_whole_expert_on_its_rows(group):
     # being summed in bf16 (group > 1).
     tol = 1e-3 if group == 1 else 1e-2
     assert np.linalg.norm(got - want) / np.linalg.norm(want) < tol
+
+
+def _block_quantized(key, k, n, blocks):
+    """An e4m3 `[k, n]` weight with one f32 scale per (k-block, channel), and
+    its dequantized f32 value."""
+    w = jax.random.normal(key, (k, n)) * 0.02
+    wb = w.reshape(blocks, k // blocks, n)
+    s = jnp.max(jnp.abs(wb), axis=1) / 448.0
+    q = (wb / s[:, None, :]).astype(FP8)
+    deq = (q.astype(jnp.float32) * s[:, None, :]).reshape(k, n)
+    return q.reshape(k, n), s, deq
+
+
+def _per_block_w8a8(act, w2, s2):
+    """Each k-block contracted on its own with its activation columns
+    quantized per row, the partials summed in f32."""
+    blocks = s2.shape[0]
+    kb = w2.shape[0] // blocks
+    out = jnp.zeros((act.shape[0], w2.shape[1]), jnp.float32)
+    for b in range(blocks):
+        rows = slice(b * kb, (b + 1) * kb)
+        out += xla_quantized_matmul(act[:, rows], w2[rows], s2[b]).astype(jnp.float32)
+    return out.astype(act.dtype)
+
+
+@pytest.mark.parametrize("m,blocks,kb,n", [(37, 3, 32, 96), (64, 8, 128, 256)])
+def test_blocked_down_is_one_dot_over_the_dequantized_weight(m, blocks, kb, n):
+    ks = jax.random.split(jax.random.key(1), 2)
+    q, s, deq = _block_quantized(ks[0], blocks * kb, n, blocks)
+    act = jax.random.normal(ks[1], (m, blocks * kb)).astype(jnp.bfloat16)
+    want = act.astype(jnp.float32) @ deq
+    got = jax.jit(blocked_down)(act, q, s)
+    assert got.dtype == jnp.bfloat16 and got.shape == (m, n)
+
+    def err(y):
+        y = np.asarray(y, np.float32)
+        return np.linalg.norm(y - want) / np.linalg.norm(want)
+
+    # Only the bf16 rounding of the weight and of the result.
+    assert err(got) < 5e-3
+    # No worse than contracting each block with an fp8-quantized activation.
+    assert err(got) < err(_per_block_w8a8(act, q, s))
+
+
+def test_blocked_down_refuses_a_weight_that_does_not_split_into_blocks():
+    act = jnp.zeros((8, 96), jnp.bfloat16)
+    with pytest.raises(ValueError):
+        blocked_down(act, jnp.zeros((96, 32), FP8), jnp.ones((5, 32), jnp.float32))

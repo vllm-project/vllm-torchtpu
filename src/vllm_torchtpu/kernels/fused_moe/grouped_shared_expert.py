@@ -21,9 +21,12 @@ The weight cost per rank is `1/g` of the expert instead of all of it; the
 traffic is `2 * (g - 1)` row blocks per rank, within the group.
 
 The down projection arrives as `blocks` k-slices, each with its own
-per-channel scale (a TP shard's quantization, kept as it was); each slice is
-contracted on its own, quantizing its activation columns per row, which is
-the arithmetic of the TP shard it came from.
+per-channel scale (a TP shard's quantization, kept as it was). `blocked_down`
+dequantizes each slice with its scales and contracts the unquantized
+activation over the whole `k` in one dot, so no per-slice partial is written
+out and summed (and the activation is not rounded to fp8). The contraction is
+bf16 x bf16, at about half the MXU rate of fp8 x fp8: the price of not
+writing and re-reading one f32 partial of the whole output per slice.
 """
 
 import jax
@@ -39,15 +42,17 @@ def silu_and_mul(x: jax.Array) -> jax.Array:
 
 
 def blocked_down(act: jax.Array, w2: jax.Array, s2: jax.Array) -> jax.Array:
-    """`act [m, k] @ w2 [k, n]` with `s2 [blocks, n]` per k-block scales;
-    each block's partial is summed in f32. Returns `act.dtype`."""
+    """`act [m, k] @ w2 [k, n]` with `s2 [blocks, n]` per k-block scales, as
+    one dot: each k-block of the weight times its scales (in f32), rounded to
+    `act.dtype`, then a single f32-accumulated contraction over `k`. Returns
+    `act.dtype`."""
     blocks, n = s2.shape
-    kb = w2.shape[0] // blocks
-    out = jnp.zeros((act.shape[0], n), jnp.float32)
-    for b in range(blocks):
-        rows = slice(b * kb, (b + 1) * kb)
-        out += xla_quantized_matmul(act[:, rows], w2[rows], s2[b]).astype(jnp.float32)
-    return out.astype(act.dtype)
+    k = w2.shape[0]
+    if k % blocks or w2.shape != (k, n) or act.shape[1] != k:
+        raise ValueError(f"blocked_down: act {act.shape}, w2 {w2.shape}, s2 {s2.shape}")
+    w = w2.reshape(blocks, k // blocks, n).astype(jnp.float32) * s2[:, None, :]
+    w = w.astype(act.dtype).reshape(k, n)
+    return jnp.dot(act, w, preferred_element_type=jnp.float32).astype(act.dtype)
 
 
 def grouped_shared_expert(
