@@ -18,8 +18,10 @@ matmul's streamed whole-expert slabs, its tuned FP8 MoE tiling and rhs-scale
 hoist) and the few-token MoE kernel change the last bits of the forward pass.
 They were measured for Qwen3.5-397B-A17B on TPU7x, the kernel at EP8. Every
 other Qwen3.5 checkpoint, device and expert-parallel size (main's CI model,
-Qwen3.5-35B-A3B at EP4, among them) keeps main's arithmetic and code, and
-every leg of the validation entries keeps what it ran."""
+Qwen3.5-35B-A3B at EP4, among them) keeps main's arithmetic and code. The
+validation entries' legs take the kernel numerics; on their decode legs the
+few-token kernel arms only once the sequence-parallel row threshold is set
+(it is 0 in this tree), and no leg arms the fused MoE decode kernels."""
 
 import pathlib
 from types import SimpleNamespace
@@ -27,8 +29,10 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul import util
+from vllm_torchtpu.layers.adapter import fused_moe_ep_v3, sequence_parallel
 from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores as scores
 from vllm_torchtpu.layers.core import fused_moe_gmm
 from vllm_torchtpu.models.qwen3_5 import hooks, settings
@@ -77,7 +81,7 @@ def _engine(shape: dict, ep: bool = True) -> SimpleNamespace:
     )
 
 
-def _arm(monkeypatch, engine, ep_size: int) -> int:
+def _arm(monkeypatch, engine, ep_size: int, sequence_parallel: bool = False) -> int:
     """The few-token kernel's prebuild for one MoE layer of `engine` at
     `ep_size`; returns the row cap the grouped path is armed with."""
     import vllm.config
@@ -88,7 +92,9 @@ def _arm(monkeypatch, engine, ep_size: int) -> int:
         # Not expert-parallel itself, so the prebuild stops at the layer's
         # verdict after the rule has armed (or not armed) the kernel.
         moe_config=SimpleNamespace(
-            ep_size=ep_size, moe_parallel_config=SimpleNamespace(use_ep=False)
+            ep_size=ep_size,
+            is_sequence_parallel=sequence_parallel,
+            moe_parallel_config=SimpleNamespace(use_ep=False, pcp_size=1),
         ),
     )
     assert scores.prebuild(SimpleNamespace(), layer, "silu") is None
@@ -178,7 +184,7 @@ def test_few_token_kernel_needs_expert_parallelism(monkeypatch):
     assert scores._LAYERS == []
 
 
-# The validation entries: every leg keeps what the record jobs ran.
+# The validation entries.
 
 
 def _flag(args: list[str], name: str, default: str) -> str:
@@ -211,15 +217,51 @@ def _legs(path: pathlib.Path) -> dict:
 
 
 @pytest.mark.parametrize("path", POINTS + GATES, ids=lambda p: p.stem)
-def test_validation_legs_keep_the_levers_they_ran(monkeypatch, path):
+def test_validation_legs_take_the_levers_this_tree_gives_them(monkeypatch, path):
     legs = _legs(path)
     # Both legs serve the measured checkpoint on TPU7x: the kernel numerics.
     assert hooks.apply_kernel_numerics(_model(SHAPE_397B)) is None
     assert _levers() == ON
-    # The decode leg is EP8, where the few-token kernel runs up to 448 rows.
-    decode_ep = _expert_parallel_size(legs["decode"]["serve_args"])
+    # The decode leg: EP8 at TP2 or TP8, with its own MoE environment (fused
+    # EP v3 and sequence-parallel MoE).
+    decode = legs["decode"]
+    decode_ep = _expert_parallel_size(decode["serve_args"])
     assert decode_ep == 8
-    assert _arm(monkeypatch, _engine(SHAPE_397B), decode_ep) == 448
+    tp = int(_flag(decode["serve_args"], "--tensor-parallel-size", "1"))
+    env = decode["env"]
+    monkeypatch.setattr(
+        envs, "USE_MOE_FUSED_EP_KERNEL", env["USE_MOE_FUSED_EP_KERNEL"] == "1"
+    )
+    monkeypatch.setattr(
+        envs, "MOE_FUSED_EP_KERNEL_IMPL", env["MOE_FUSED_EP_KERNEL_IMPL"]
+    )
+    monkeypatch.setattr(
+        envs, "TPU_MOE_SEQUENCE_PARALLEL", env["TPU_MOE_SEQUENCE_PARALLEL"] == "1"
+    )
+    monkeypatch.setattr(fused_moe_ep_v3, "_tensor_parallel_size", lambda: tp)
+    assert tp > 1 and envs.MOE_FUSED_EP_KERNEL_IMPL == "v3"
+    # In this tree the sequence-parallel row threshold is 0 on every layout, so
+    # fused EP v3 takes the decode legs' sequence-parallel steps from one row
+    # and the few-token kernel stays off (fused_moe_ep_v3.
+    # sequence_parallel_threshold_unset): the cap these legs get is 0.
+    engine = _engine(SHAPE_397B)
+    assert _arm(monkeypatch, engine, decode_ep, sequence_parallel=True) == 0
+    assert scores._LAYERS == []
+    # With a nonzero threshold, which the model sets once it follows each
+    # step's form, the same leg arms the kernel at 448 rows.
+    monkeypatch.setattr(sequence_parallel, "min_rows", lambda *args: 1)
+    assert _arm(monkeypatch, engine, decode_ep, sequence_parallel=True) == 448
     # The prefill leg is PP8 x TP1, one expert-parallel rank: no expert
-    # parallelism, so the kernel does not serve it (as before).
+    # parallelism, so the kernel does not serve it.
     assert _expert_parallel_size(legs["prefill"]["serve_args"]) == 1
+
+
+@pytest.mark.parametrize("path", POINTS, ids=lambda p: p.stem)
+def test_no_leg_arms_the_fused_moe_decode_kernels(path):
+    """Neither leg sets the switches of the fused MoE decode kernel or the TP
+    decode MoE kernel (both off by default), so arming them is a no-op on
+    every leg and no layer takes either path."""
+    for leg in _legs(path).values():
+        env = leg.get("env", {})
+        assert env.get("FUSED_MOE_DECODE_KERNEL", "0") in ("0", "false", "False")
+        assert env.get("USE_MOE_TP_DECODE_KERNEL", "0") in ("0", "false", "False")

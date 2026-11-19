@@ -17,11 +17,11 @@ It is a rule, not an option: the expert-parallel MoE layers of the checkpoint
 and device it was measured on (Qwen3.5-397B-A17B on TPU7x), with a row cap per
 measured expert-parallel size (EP8). Every other model, other Qwen3.5
 checkpoints and other expert-parallel sizes included, keeps the default MoE
-path, which is what main does without this kernel.
+path, which is what main does without this kernel. Which layers the rule
+arms at load is tested in tests/models/qwen3_5/test_qwen3_5_measured_levers.py.
 """
 
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 
@@ -88,49 +88,3 @@ def test_row_cap_only_at_the_measured_expert_parallel_size(ep, cap):
 def test_routed_ids_path_is_off_until_a_model_arms_it():
     """Main's grouped path is unchanged for a model the rule does not cover."""
     assert fused_moe_gmm._MOE_LOWTOK_MAX_TOKENS == 0
-
-
-def _layer(ep_size=8):
-    return SimpleNamespace(
-        layer_name="model.layers.0.mlp.experts",
-        moe_config=SimpleNamespace(
-            ep_size=ep_size, moe_parallel_config=SimpleNamespace(use_ep=False)
-        ),
-    )
-
-
-@pytest.fixture
-def armed_state(monkeypatch):
-    setter = Mock()
-    monkeypatch.setattr(scores, "_ARMED_MAX_TOKENS", 0)
-    monkeypatch.setattr(scores, "_LAYERS", [])
-    monkeypatch.setattr(scores, "set_lowtok_max_tokens", setter)
-    return setter
-
-
-@pytest.mark.parametrize(
-    "config,ep_size,cap",
-    [
-        (_config(), 8, 448),
-        (_config(), 4, 0),
-        (_config(shape=QWEN3_5_35B), 4, 0),
-        (_config(shape=QWEN3_5_35B), 8, 0),
-        (_config(arch="DeepseekV3ForCausalLM"), 8, 0),
-    ],
-    ids=["397b_ep8", "397b_ep4", "35b_ep4", "35b_ep8", "other_model_ep8"],
-)
-def test_prebuild_arms_the_cap_by_the_rule(
-    monkeypatch, armed_state, config, ep_size, cap
-):
-    import vllm.config
-
-    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
-    # This layer is not expert-parallel, so no op is built either way; what
-    # the rule decides is whether the kernel is armed at all.
-    assert scores.prebuild(SimpleNamespace(), _layer(ep_size), "silu") is None
-    assert scores.armed_max_tokens() == cap
-    if cap:
-        armed_state.assert_called_once_with(cap)
-    else:
-        armed_state.assert_not_called()
-        assert scores._LAYERS == []
