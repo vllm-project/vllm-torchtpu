@@ -140,7 +140,7 @@ class RejectionSampler:
             target_logits on the greedy path (TPU_GREEDY_TOP_TOKENS).
           apply_topk_topp: False skips `apply_top_k_top_p` on the non-greedy
             path. The caller passes False only when no request sets top-k or
-            top-p, where the two 31-step bisections over the vocabulary are
+            top-p, where the two 32-step bisections over the vocabulary are
             the identity (7.5 ms per 512 rows on Flash). A separate graph.
           draft_probs: float32 distribution each draft token was sampled
             from (probabilistic drafting), shaped like target_logits. None

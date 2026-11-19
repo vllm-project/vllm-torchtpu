@@ -93,3 +93,153 @@ def prepare_tpu_environment(world_size: int | None = None) -> None:
     )
 
     _legacy_prepare(world_size=world_size)
+
+
+# Multichip tests that launch one worker per device with torchrun. The test
+# file runs as the worker script: `<file> --worker --result-dir DIR`.
+
+_LAUNCH_ENV_KEYS = (
+    "TORCH_TPU_XPROF_SESSION_ID",
+    "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+    "TORCH_TPU_TOPOLOGY",
+)
+
+
+def torchrun_worker_env(world_size: int) -> dict[str, str]:
+    """The environment for `world_size` single-host TPU workers; skips the test
+    when TorchTPU or the devices are unavailable."""
+    import os
+
+    saved = {k: os.environ.get(k) for k in _LAUNCH_ENV_KEYS}
+    try:
+        for k in _LAUNCH_ENV_KEYS:
+            os.environ.pop(k, None)
+        prepare_tpu_environment(world_size=world_size)
+        env = os.environ.copy()
+    except ImportError as exc:
+        pytest.skip(f"TorchTPU is unavailable: {exc}")
+    except ValueError as exc:
+        pytest.skip(f"{world_size} TPU devices are unavailable: {exc}")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
+    env.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
+    env.setdefault("VLLM_USE_AOT_COMPILE", "0")
+    return env
+
+
+def launch_torchrun_workers(
+    script: Any,
+    result_dir: Any,
+    *,
+    world_size: int,
+    env: dict[str, str],
+    cwd: Any,
+    timeout: float,
+) -> Any:
+    """Runs `script --worker` on `world_size` ranks; returns the completed
+    process. Keep `timeout` under pytest's, so that this, not pytest, ends a
+    hung launch and the workers are reaped."""
+    import os
+    import signal
+    import subprocess
+    import sys
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nnodes=1",
+            f"--nproc-per-node={world_size}",
+            str(script),
+            "--worker",
+            "--result-dir",
+            str(result_dir),
+        ],
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+        start_new_session=True,
+    )
+    output = ""
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        output = exc.output or ""
+    finally:
+        # Also on pytest's own timeout, which raises out of communicate(): the
+        # workers run in their own session and would keep holding the chips.
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=60)
+    return subprocess.CompletedProcess(process.args, process.returncode, output, "")
+
+
+def read_worker_results(result_dir: Any, world_size: int, completed: Any) -> list:
+    """Every rank's result; fails the test if a rank reported an error."""
+    import json
+
+    results = []
+    for rank in range(world_size):
+        path = result_dir / f"rank_{rank}.json"
+        results.append(
+            json.loads(path.read_text())
+            if path.exists()
+            else {"rank": rank, "error": "missing worker result"}
+        )
+    errors = [r for r in results if "error" in r]
+    assert not errors, (errors, (completed.stdout or "")[-4000:])
+    return results
+
+
+def run_torchrun_worker(result_dir: Any, check: Callable[[int], dict]) -> None:
+    """Worker side: joins torch.distributed and vLLM's world, runs
+    `check(rank)` and writes the rank's result for read_worker_results."""
+    import json
+    import os
+
+    import torch
+    import torch_tpu  # noqa: F401
+    from torch import distributed as dist
+
+    rank = int(os.environ["RANK"])
+    world = int(os.environ["WORLD_SIZE"])
+    result: dict[str, object] = {"rank": rank, "world": world}
+    initialized = False
+    try:
+        dist.init_process_group(backend="tpu_dist")
+        initialized = True
+        torch.empty((1,), device="tpu").cpu()
+        from vllm.distributed.parallel_state import init_distributed_environment
+
+        init_distributed_environment(
+            world_size=world,
+            rank=rank,
+            local_rank=int(os.environ["LOCAL_RANK"]),
+            distributed_init_method="env://",
+            backend="tpu_dist",
+        )
+        result["check"] = check(rank)
+    except BaseException as exc:  # noqa: BLE001 - reported to the parent
+        traceback.print_exc()
+        result["error"] = repr(exc)
+    finally:
+        (result_dir / f"rank_{rank}.json").write_text(json.dumps(result, indent=2))
+        if rank == 0:
+            print("RESULT rank0", json.dumps(result), flush=True)
+        if initialized:
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                traceback.print_exc()
+    if "error" in result:
+        raise SystemExit(1)

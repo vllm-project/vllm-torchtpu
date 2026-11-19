@@ -27,6 +27,7 @@ from ..errors import MegakernelConfigError
 from ..exec_spec import ExecSpec
 from ..ops import BF16, FP8, I32
 from .backend import check_ckpt_bounds, resolve_active_seqs
+from .checks import check_step_pool_metadata
 from .config import cache_exec
 from .layout import PoolLayout
 from .scatter_ckpt import prepare_ckpt
@@ -34,8 +35,8 @@ from .scatter_ctx import ScatterGeom, ScatterKernel
 from .scatter_kv import kv_cols, scatter_kv
 from .scatter_sched import ckpt_prologue, scatter_ckpt_states
 
-# Pallas kernel name (`SCATTER_KERNEL_NAME` is a substring of it).
-_PALLAS_NAME = "qwen3_5_scatter_pool_states"
+# Pallas kernel name (`SCATTER_KERNEL_NAME`).
+_PALLAS_NAME = "scatter_pool_states"
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +62,8 @@ def scatter_pool_states(
 
     Only the per-row KV page indices `kv_pages` of shape `(NS, T)` are passed into
     SMEM (rather than the full `(NS, max_pages_per_seq)` `page_table`), and all
-    page/checkpoint indices are clamped to `[0, num_pages)` before DMA.
+    out-of-range page/checkpoint indices are routed to shared null page `0`
+    before DMA.
 
     Note on `interpret=True` vs TPU `Ref.bitcast` stores:
       On TPU (`interpret=False`), sub-slice writes into `page_buf` and `kv_page`
@@ -98,11 +100,17 @@ def scatter_pool_states(
             f"page_table has shape {page_table.shape}, expected ({NS}, >=1)"
         )
     has_gdn = G_PER_ATT > 0
+    default_partial = cache_exec(ex).GPR and layout.conv_itemsize == 2
     use_conv_partial = (
-        bool(cache_exec(ex).GPR if conv_partial is None else conv_partial)
+        bool(default_partial if conv_partial is None else conv_partial)
         and has_gdn
         and not bool(interpret)
     )
+    if use_conv_partial and layout.conv_itemsize != 2:
+        raise MegakernelConfigError(
+            "scatter_pool_states: the partial conv page write (GPR) stores bf16 "
+            f"conv; layout.conv_dtype is {layout.conv_dtype}"
+        )
     act_mode, active_mask = resolve_active_seqs(
         active_seqs,
         default_mode="from_ckpt" if has_gdn else "all",
@@ -120,14 +128,30 @@ def scatter_pool_states(
         min_k=T,
     )
 
-    # Pre-gather and clamp only the (NS, T) active KV page indices for SMEM
+    if cache_exec(ex).check_ckpt_bounds or pl.enable_debug_checks.value:
+        check_step_pool_metadata(
+            layout,
+            ex,
+            page_table,
+            pos,
+            ckpt_indices=ckpt_indices if has_gdn else None,
+            active_seqs=active_mask,
+            check_bounds=bool(cache_exec(ex).check_ckpt_bounds),
+            force_under_jit=bool(cache_exec(ex).check_ckpt_bounds),
+        )
+
+    # Pre-gather only the (NS, T) active KV page indices for SMEM; route
+    # negative positions, positions past page_table (`lp >= pt_cols`), or
+    # out-of-range physical page ids to shared null page 0 instead of clamping.
     pt_cols = page_table.shape[1]
-    pos_st = pos[: NS * T].reshape(NS, T)
-    lp_idx = jnp.clip(lax.div(pos_st, page_size), 0, pt_cols - 1)
+    pos_raw = pos[: NS * T].reshape(NS, T)
+    pos_st = jnp.maximum(pos_raw, jnp.int32(0))
+    lp_raw = lax.div(pos_st, page_size)
+    p_in_range = jnp.logical_and(pos_raw >= 0, lp_raw < pt_cols)
+    lp_idx = jnp.where(p_in_range, lp_raw, jnp.int32(0))
     s_idx_arr = jnp.arange(NS, dtype=I32)[:, None]
-    kv_pages = jnp.clip(
-        page_table[s_idx_arr, lp_idx], 0, cache_exec(ex).num_pages - 1
-    ).astype(I32)
+    raw_kp = page_table[s_idx_arr, lp_idx].astype(I32)
+    kv_pages = jnp.where(p_in_range, raw_kp, jnp.int32(0))
 
     conv_in, conv_buf_shape, conv_buf_dt, ckpt_geom = prepare_ckpt(
         layout,

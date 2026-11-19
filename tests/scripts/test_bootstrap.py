@@ -616,6 +616,63 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(rendered, 'priority: 12\nif: \'"1" == "1"\'\n')
 
+    def test_pr_changed_files_deepens_until_merge_base(self) -> None:
+        bp = self.bp
+        ctx = bp.BuildContext.from_env(
+            {
+                "BUILDKITE_PULL_REQUEST": "42",
+                "BUILDKITE_PULL_REQUEST_BASE_BRANCH": "main",
+                "BUILDKITE_COMMIT": "headsha",
+            }
+        )
+
+        def run(found_at: int | None) -> tuple[list[str], list[tuple[str, ...]]]:
+            calls: list[tuple[str, ...]] = []
+            fetched_depth = [0]
+
+            def fake_git(
+                *args: str, env: Mapping[str, str] | None = None, **_: Any
+            ) -> subprocess.CompletedProcess[str]:
+                calls.append(args)
+                if args[:1] == ("fetch",):
+                    fetched_depth[0] = int(args[3].removeprefix("--depth="))
+                    return subprocess.CompletedProcess(args, 0, stdout="")
+                if args[:1] == ("merge-base",):
+                    ok = found_at is not None and fetched_depth[0] >= found_at
+                    return subprocess.CompletedProcess(args, 0 if ok else 1, stdout="")
+                if args[:1] == ("diff",):
+                    return subprocess.CompletedProcess(
+                        args, 0, stdout="src/vllm_torchtpu/envs.py\nREADME.md\n"
+                    )
+                # diff-tree lists only the head commit, which is docs-only.
+                return subprocess.CompletedProcess(args, 0, stdout="README.md\n")
+
+            with (
+                mock.patch.object(bp, "_git", side_effect=fake_git),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                return bp._changed_files(ctx, env={}), calls
+
+        # Merge-base within the first fetch: one round, whole-PR diff.
+        files, calls = run(found_at=20)
+        self.assertEqual(files, ["src/vllm_torchtpu/envs.py", "README.md"])
+        self.assertEqual(sum(c[:1] == ("merge-base",) for c in calls), 1)
+
+        # A PR far behind main: fetch deeper until the merge-base appears.
+        files, calls = run(found_at=1000)
+        self.assertEqual(files, ["src/vllm_torchtpu/envs.py", "README.md"])
+        self.assertEqual(
+            [c[3] for c in calls if c[:3] == ("fetch", "origin", "main")],
+            ["--depth=20", "--depth=200", "--depth=1000"],
+        )
+        self.assertIn(("diff", "--name-only", "origin/main...headsha"), calls)
+
+        # No merge-base at any depth: run the full build instead of diffing
+        # only the (docs-only) head commit.
+        files, calls = run(found_at=None)
+        self.assertEqual(files, [])
+        self.assertFalse(any(c[:1] in (("diff",), ("diff-tree",)) for c in calls))
+
     def test_choose_suite_and_suites_table(self) -> None:
         bp = self.bp
         ctx = bp.BuildContext.from_env

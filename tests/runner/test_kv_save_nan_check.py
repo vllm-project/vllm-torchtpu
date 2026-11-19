@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from runner_output_test_utils import _host_copy_state
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
 )
@@ -202,9 +203,8 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
             pass
 
     connector = OptInConnector()
-    wave = MagicMock()
-    wave.step.return_value = contextlib.nullcontext()
-    wave.start_forward.return_value = IntermediateTensors(
+    handoff = MagicMock()
+    handoff.start_forward.return_value = IntermediateTensors(
         {"hidden_states": torch.zeros(2, 2), "residual": torch.zeros(2, 2)}
     )
 
@@ -233,8 +233,9 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     valid_tokens_per_chunk = [2, 1]
 
     runner = SimpleNamespace(
-        _pp_wave=None if pp_is_last else wave,
+        _pp_handoff=None if pp_is_last else handoff,
         _dp_step_other_decode=False,
+        _thinking_budget=None,
         _pp_is_first=True,
         _pp_is_last=pp_is_last,
         _pp_pending_scheduler_output=None,
@@ -246,12 +247,15 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         _reorder_batch_for_rpa=lambda _so: (0, 0),
         _count_input_chunks=lambda _so: (2, 1),
         _dp_coordinated_step=lambda *_args, **_kwargs: (2, 3),
+        _dp_local_prompt_logprob_rows=lambda _so: 0,
+        _dp_step_prompt_logprob_rows=0,
         _dp_num_tokens_across_dp=lambda _n: None,
         supports_mm_inputs=False,
         phase_based_profiler=None,
         _is_async_drafter=False,
         _greedy_top_tokens_this_step=lambda: False,
         _min_tokens_batch_state=lambda: {},
+        _repetition_penalty=SimpleNamespace(begin_step=lambda _batch: False),
         vllm_config=SimpleNamespace(),
         maybe_setup_kv_connector=lambda *_args, **_kwargs: None,
         input_batch=SimpleNamespace(
@@ -271,6 +275,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
                 num_computed_tokens=0, num_tokens=1, output_token_ids=[]
             ),
         },
+        num_prompt_logprobs={},
         _run_dp_dummy_chunk=MagicMock(),
         query_start_loc_np=np.zeros(4, dtype=np.int32),
         _last_sequence_layout_plan=None,
@@ -288,6 +293,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         _kv_cache_bundle=None,
         _stage_timing=MagicMock(),
         is_pooling_model=False,
+        pcp_manager=None,
         sequence_layout_planner=SimpleNamespace(
             maybe_select_logits_hidden_states=lambda hs, _plan, _idx: hs[:1]
         ),
@@ -331,12 +337,15 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     for name in (
         "_any_decode",
         "_readmit_trimmed_drafts",
+        "_sample_chunk_logits",
+        "_sample_plain_chunk",
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
         "_build_kv_connector_output",
         "_sample_tokens_pp_intermediate_stage",
         "sample_tokens",
         "execute_model",
+        "_maybe_select_logits_hidden_states",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 
@@ -365,14 +374,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
             side_effect=lambda *_a, **_kw: contextlib.nullcontext(),
         ),
         patch.object(
-            AsyncTPUCopyState,
-            "from_device_chunks",
-            side_effect=lambda chunks, lengths, spec_logprobs=None: AsyncTPUCopyState(
-                chunks_cpu=chunks,
-                chunk_real_lens=lengths,
-                copy_ready_event=MagicMock(),
-                spec_logprobs=spec_logprobs,
-            ),
+            AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy_state
         ),
     ):
         assert runner.execute_model(scheduler_output) is None

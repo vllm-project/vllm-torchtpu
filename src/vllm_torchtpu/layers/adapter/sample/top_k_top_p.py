@@ -311,3 +311,56 @@ def apply_top_k_top_p_candidates(
         logits >= cutoff, logits, torch.full_like(logits, MASKED_LOGIT_VALUE)
     )
     return torch.where(top_k > 0, masked, logits)
+
+
+def topk_candidate_blocks(num_blocks: int, vocab_size: int) -> int:
+    """`num_blocks` (TPU_SAMPLER_TOPK_CANDIDATES) if the vocabulary splits
+    into at least that many whole CANDIDATE_BLOCKs, else 0."""
+    if (
+        num_blocks <= 0
+        or vocab_size % CANDIDATE_BLOCK != 0
+        or num_blocks > vocab_size // CANDIDATE_BLOCK
+    ):
+        return 0
+    return num_blocks
+
+
+def select_topk_candidates(
+    top_k: torch.Tensor, num_blocks: int, grammar_mask: bool
+) -> int:
+    """Candidate blocks for sampling the rows with these `top_k` values, or 0.
+
+    Candidates match the full-vocab result only when every row keeps
+    1 <= top_k <= num_blocks // 2 and no grammar mask applies. With
+    `num_blocks` from `topk_candidate_blocks`, a row that does not set top-k
+    (it holds vocab_size, as vLLM's InputBatch stores it) never qualifies.
+    """
+    if num_blocks == 0 or grammar_mask:
+        return 0
+    if not bool(((top_k >= 1) & (top_k <= num_blocks // 2)).all()):
+        return 0
+    return num_blocks
+
+
+def should_apply_top_k_top_p(no_top_k: bool, no_top_p: bool) -> bool:
+    """False when no request sets top-k or top-p.
+
+    Skipping `apply_top_k_top_p` is then bit-exact: every row reaches the
+    sampler with top_k == 0 and top_p == 1.0, where its `torch.where` calls
+    return the unmasked logits unchanged.
+    """
+    return not (no_top_k and no_top_p)
+
+
+def random_sampler_variants(num_blocks: int) -> list[tuple[int, bool]]:
+    """The (topk_candidates, apply_topk_topp) graphs of the random sampling
+    path, for `num_blocks` from `topk_candidate_blocks`.
+
+    `select_topk_candidates` and `should_apply_top_k_top_p` pick one of them
+    per step, and the runner's precompiles warm each one. Candidates need
+    top-k on every row, so they never run without top-k/top-p.
+    """
+    variants = [(0, True), (0, False)]
+    if num_blocks:
+        variants.append((num_blocks, True))
+    return variants

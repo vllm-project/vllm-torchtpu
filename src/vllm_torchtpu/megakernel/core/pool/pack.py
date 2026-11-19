@@ -122,15 +122,20 @@ def raw_pages_to_ssm(
 
 
 def conv_to_raw_page(taps_qkv: Any, layout: PoolLayout | None = None) -> jax.Array:
-    """Pack `(conv_taps, QKV)` conv taps into one conv page `kv_page_shape` fp8."""
+    """Pack `(conv_taps, QKV)` conv taps into one conv page `kv_page_shape` fp8.
+
+    The taps are stored as `layout.conv_dtype` rows of `LANES` lanes, tap-major;
+    each bf16 / f32 element spans 2 / 4 consecutive fp8 sublanes of a u32 row.
+    """
     lay = _DEFAULT_LAYOUT if layout is None else layout
     k2, h4, w4, ps = lay.kv_page_shape
     QKV = taps_qkv.shape[-1]
     conv_rows = (lay.conv_taps * QKV) // LANES
-    taps_bf16 = np.asarray(taps_qkv, dtype=jnp.dtype(BF16)).reshape(conv_rows, LANES)
-    padded = np.pad(taps_bf16, ((0, lay.conv_page_rows - conv_rows), (0, 0)))
+    store = jnp.dtype(lay.conv_dtype)
+    taps_st = np.asarray(taps_qkv, dtype=store).reshape(conv_rows, LANES)
+    padded = np.pad(taps_st, ((0, lay.conv_page_rows - conv_rows), (0, 0)))
     fp8_1p = (
-        padded.reshape(k2, h4, w4 // 2, ps, 1)
+        padded.reshape(k2, h4, w4 // store.itemsize, ps, 1)
         .view(jnp.dtype(FP8))
         .transpose(0, 1, 2, 4, 3)
     )
@@ -145,15 +150,16 @@ def raw_page_to_conv(
     lay = _DEFAULT_LAYOUT if layout is None else layout
     k2, h4, w4, ps = lay.kv_page_shape
     conv_rows = (lay.conv_taps * QKV) // LANES
+    store = jnp.dtype(lay.conv_dtype)
     arr_u8 = np.asarray(raw_1page).view(np.uint8)
-    bf16_page = (
-        arr_u8.reshape(k2, h4, w4 // 2, 2, ps)
+    conv_page = (
+        arr_u8.reshape(k2, h4, w4 // store.itemsize, store.itemsize, ps)
         .transpose(0, 1, 2, 4, 3)
         .copy()
-        .view(jnp.dtype(BF16))
+        .view(store)
         .reshape(lay.conv_page_rows, LANES)[:conv_rows, :]
     )
-    return jnp.asarray(bf16_page).reshape(lay.conv_taps, QKV).astype(F32)
+    return jnp.asarray(conv_page).reshape(lay.conv_taps, QKV).astype(F32)
 
 
 def _pages_per_seq(ex: ExecSpec) -> int:
