@@ -219,6 +219,23 @@ def test_skip_reading_prefix_cache_or_caching_disabled():
     assert [r.request_id for r in q_disabled] == ["r1", "r3"]
 
 
+def test_promotion_looks_each_request_up_once_and_reads_no_pool():
+    """PrefixAwareScheduler's ranking reads neither the head's local hit a
+    second time nor the free-block count, so a promotion looks every request
+    of the window up once and never probes the block pool."""
+    now = time.time()
+    reqs = [
+        _make_request(f"r{i}", num_tokens=1000, arrival_time=now - 10 + i)
+        for i in range(3)
+    ]
+    s = _make_scheduler(reqs, {"r2": 900})
+    pool = s.kv_cache_manager.block_pool
+    q = s._select_waiting_queue_for_scheduling()
+    assert [r.request_id for r in q] == ["r2", "r0", "r1"]
+    assert s.kv_cache_manager.coordinator.find_longest_cache_hit.call_count == 3
+    pool.get_num_free_blocks.assert_not_called()
+
+
 def test_coordinator_failure_falls_back_to_fcfs():
     now = time.time()
     r1 = _make_request("r1", num_tokens=1000, arrival_time=now - 10)

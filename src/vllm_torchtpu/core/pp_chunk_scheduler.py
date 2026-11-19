@@ -472,6 +472,21 @@ class TpuPipelineChunkScheduler(Scheduler):
             0,
         )
 
+    def _free_blocks_for_fit(self, head: Any) -> int | None:
+        """The free HBM blocks when the uncached tokens of ``head`` (the
+        queue's head) do not fit them, else None: the input of the fit tier
+        of ``_rank_and_warmth``, for the borrowed ``_promote_warmest``."""
+        if self._is_kv_consumer:
+            return None
+        head_local_warmth = self._prefix_warmth(head)
+        free_blocks = self._get_num_free_blocks()
+        if free_blocks is None:
+            return None
+        head_cold_tokens = max(head.num_tokens - head_local_warmth, 0)
+        if free_blocks < math.ceil(head_cold_tokens / self._get_block_size()):
+            return free_blocks
+        return None
+
     def _make_cached_request_data(self, *args, **kwargs):
         cached = super()._make_cached_request_data(*args, **kwargs)
         if not self._prefix_aware:

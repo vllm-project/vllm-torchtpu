@@ -47,7 +47,6 @@ Do not name it on a pipeline-parallel (PP > 1) leg: the platform then keeps
 the configured class and turns pipeline chunk sizing off.
 """
 
-import math
 import time
 from bisect import bisect_right
 from itertools import islice
@@ -992,6 +991,13 @@ class PrefixAwareScheduler(AsyncScheduler):
             self._promote_warmest(self.waiting)
         return self.kv_holding_waiting or self.waiting
 
+    def _free_blocks_for_fit(self, head: Request) -> int | None:
+        """The free-block count ``_rank_and_warmth`` ranks the window against
+        when ``head`` does not fit it, else None. This scheduler's ranking
+        does not read it, so it answers None without a lookup; the pipeline
+        chunk scheduler, which borrows ``_promote_warmest``, ranks by fit."""
+        return None
+
     def _promote_warmest(self, queue: RequestQueue) -> None:
         """Promote the request with the fewest uncached tokens within WINDOW."""
         if len(queue) < 2 or self.policy != SchedulingPolicy.FCFS:
@@ -1001,19 +1007,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         head = window[0]
         now = self._now()
         head_scored = self._rank_and_warmth(head, now=now)
-        head_local_warmth = self._prefix_warmth(head)
-
-        free_blocks = (
-            None
-            if getattr(self, "_is_kv_consumer", False)
-            else self._get_num_free_blocks()
-        )
-        free_blocks_for_fit: int | None = None
-        if free_blocks is not None:
-            head_cold_tokens = max(head.num_tokens - head_local_warmth, 0)
-            head_needed_blocks = math.ceil(head_cold_tokens / self._get_block_size())
-            if free_blocks < head_needed_blocks:
-                free_blocks_for_fit = free_blocks
+        free_blocks_for_fit = self._free_blocks_for_fit(head)
 
         scored = [(head_scored, head)] + [
             (
