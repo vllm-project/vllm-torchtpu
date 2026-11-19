@@ -116,6 +116,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_ROUTER_TOPK_TRANSPOSED_MIN_ROWS: int = 0
+    TPU_MINIMAX_M3_QK_NORM_ROPE_BLOCK_TOKENS: int = 0
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
@@ -971,6 +972,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # this many rows (a multiple of 128) run the transposed kernel (experts
     # on sublanes, rows on lanes: VPU reductions instead of cross-lane XLU
     # ones). 0 (default) keeps the row kernel. Same picks bit for bit.
+    # MiniMax M3 fused qk norm + rope kernel: token block of calls with at
+    # least this many tokens (0, default: the kernel's 256). Fewer grid
+    # steps on large prefill chunks; same bits.
+    "TPU_MINIMAX_M3_QK_NORM_ROPE_BLOCK_TOKENS": env_int(
+        "TPU_MINIMAX_M3_QK_NORM_ROPE_BLOCK_TOKENS", 0
+    ),
     "TPU_ROUTER_TOPK_TRANSPOSED_MIN_ROWS": env_int(
         "TPU_ROUTER_TOPK_TRANSPOSED_MIN_ROWS", 0
     ),
