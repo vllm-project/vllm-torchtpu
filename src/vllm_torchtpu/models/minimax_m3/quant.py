@@ -41,6 +41,7 @@ from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.models.minimax_m3.fp8_split import split_e4m3_matmul
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -74,6 +75,15 @@ def _upcast_e4m3(w: jax.Array) -> jax.Array:
 # Built at import: torch_tpu cannot create a jax_op inside a traced forward.
 _materialized_bf16 = pallas.jax_op("pallas::minimax_m3_upcast_e4m3", _upcast_e4m3)
 _materialized_bf16.register_fake(lambda w: torch.empty_like(w, dtype=torch.bfloat16))
+
+
+# Built at import: torch_tpu cannot create a jax_op inside a traced forward.
+_split_e4m3 = pallas.jax_op("pallas::minimax_m3_split_e4m3_matmul", split_e4m3_matmul)
+_split_e4m3.register_fake(
+    lambda x, w, s: torch.empty(
+        (*x.shape[:-1], w.shape[-1]), dtype=x.dtype, device=x.device
+    )
+)
 
 
 QUANT_METHOD = "mxfp8"
@@ -227,6 +237,14 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
                 max(1, envs.TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS),
                 envs.TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS,
             )
+        if envs.TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS:
+            logger.info_once(
+                "TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS=%d: MXFP8 linears run split-e4m3 "
+                "activations x e4m3 weights (fp8 MXU) for token buckets of %d..%d rows.",
+                envs.TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS,
+                max(1, envs.TPU_MINIMAX_M3_FP8_SPLIT_MIN_ROWS),
+                envs.TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS,
+            )
         logger.debug(
             "MXFP8 linear %s kept e4m3: %d of %d elements below e4m3's normal "
             "range after the block shift.",
@@ -252,6 +270,13 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         ):
             # Rows are static at trace time, so each bucket picks one path.
             return quantized_matmul(x, layer.weight, layer.weight_scale)
+        if (
+            max(1, envs.TPU_MINIMAX_M3_FP8_SPLIT_MIN_ROWS)
+            <= rows
+            <= envs.TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS
+            and x.dtype == torch.bfloat16
+        ):
+            return _split_e4m3(x, layer.weight, layer.weight_scale)
         if rows >= _UPCAST_MIN_ROWS and x.dtype == torch.bfloat16:
             weight = _materialized_bf16(layer.weight)
         else:
