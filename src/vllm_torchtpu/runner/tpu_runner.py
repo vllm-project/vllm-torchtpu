@@ -1161,7 +1161,7 @@ class TPUModelRunner(GPUModelRunner):
         self._repetition_penalty = repetition_penalty_tracker.RepetitionPenaltyTracker(
             self.vocab_size,
             self.max_num_reqs,
-            async_scheduling=self.scheduler_config.async_scheduling,
+            async_scheduling=bool(self.scheduler_config.async_scheduling),
             speculative_decoding=self.speculative_config is not None,
         )
         # 1 on TP rank 0, else 0; built lazily on first use by
