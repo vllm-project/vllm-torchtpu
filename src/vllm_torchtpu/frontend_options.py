@@ -60,13 +60,13 @@ class FrontendOptions:
     """Most token ids the tokenization cache keeps per API server; the least
     recently used prompts are evicted first. Read only with
     ``tokenize_prefix_cache``. This trades API-server host memory for
-    tokenization CPU time: a cached token id holds about 15 bytes (measured
-    with the Qwen3.5 tokenizer on multi-turn chats), so the default allows
-    about 4 GB per API server, and each DP API server has its own cache.
-    A smaller limit evicts more conversations, whose next turn is then
-    encoded in full (the token ids are the same either way). Lower it where
-    the API server's host shares its memory, as on a prefill host with a
-    host KV-cache tier."""
+    tokenization CPU time. A cached token id holds about 15 bytes when
+    conversations reuse their earlier turns (measured with the Qwen3.5
+    tokenizer on multi-turn chats) and up to about 40 bytes with little
+    prefix reuse, so the default allows about 4 to 10 GB per API server, and
+    each DP API server has its own cache. A smaller limit evicts more
+    conversations, whose next turn is then encoded in full (the token ids are
+    the same either way). Lower it to bound an API server's host memory."""
 
     def __post_init__(self) -> None:
         if self.tokenize_prefix_cache_max_tokens <= 0:
