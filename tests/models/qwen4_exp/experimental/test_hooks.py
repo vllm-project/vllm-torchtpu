@@ -13,6 +13,7 @@
 # limitations under the License.
 """Registration hook of experimental Qwen3.8-Flash."""
 
+import importlib
 from unittest import mock
 
 import pytest
@@ -67,6 +68,9 @@ def test_register_takes_over_qwen4_exp_architectures(monkeypatch):
             "vllm_torchtpu.models.qwen4_exp.experimental.runner.metadata."
             "_install_block_table_version"
         ) as block_table_version,
+        mock.patch(
+            "vllm_torchtpu.runner.model_runner_registry.register_model_runner"
+        ) as model_runner,
     ):
         hooks.register()
         from vllm.model_executor.models.config import MODELS_CONFIG_MAP
@@ -84,6 +88,12 @@ def test_register_takes_over_qwen4_exp_architectures(monkeypatch):
     assert tuple(draft_archs) == ("Qwen4ExpMTP",)
     assert make_draft is hooks._make_draft_proposer
     block_table_version.assert_called_once_with()
+    runner_cls, *runner_archs = model_runner.call_args.args
+    assert set(runner_archs) == set(hooks.QWEN4_EXP_ARCHITECTURES)
+    module, _, name = runner_cls.partition(":")
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    assert issubclass(getattr(importlib.import_module(module), name), TPUModelRunner)
     factors = cache_key.call_args.kwargs["env_factors"]()
     assert set(factors) == {"model_plan"}
     for target in registered.values():
