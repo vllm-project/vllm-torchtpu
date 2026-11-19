@@ -32,6 +32,7 @@ import torch
 
 from vllm_torchtpu import utils as vu
 from vllm_torchtpu.compilation import fast_dispatch as fd
+from vllm_torchtpu.distributed.kv_transfer import tpu_connector as tc
 from vllm_torchtpu.runner import fast_forward_context as ffc
 from vllm_torchtpu.runner import host_trims, runner_options
 
@@ -261,7 +262,6 @@ def test_aot_skip_guards_waits_for_compiled_fn(monkeypatch):
 
 
 def test_connector_env_cache(monkeypatch):
-    tc = pytest.importorskip("vllm_torchtpu.distributed.kv_transfer.tpu_connector")
     monkeypatch.setattr(tc, "_env_predicate_cache", {})
     monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
     monkeypatch.setattr(host_trims, "ENABLED", False)
