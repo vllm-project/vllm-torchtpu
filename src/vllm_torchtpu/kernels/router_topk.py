@@ -63,6 +63,67 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
     w_ref[...] = jnp.where(w_ref[:, :1] <= NEG, jnp.nan, w_ref[...])
 
 
+def _select_kernel_t(x_ref, w_ref, i_ref, *, topk: int, n: int):
+    """`_select_kernel` on the block transposed once in VMEM: experts on
+    sublanes, rows on lanes, so each pass's max and min reduce across vregs
+    on the VPU (plus one sublane reduce) instead of across lanes on the XLU,
+    and each pick is one dense row store of ``[topk, rows]``. Same picks,
+    values and ties bit for bit."""
+    x = x_ref[...].T  # [n, block]
+    x = jnp.where(x > NEG, x, NEG)
+    masked = jnp.finfo(x.dtype).min
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 0)
+    ws = []
+    for j in range(topk):
+        m = jnp.max(x, axis=0, keepdims=True)  # [1, block]
+        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=0, keepdims=True)
+        ws.append(m)
+        i_ref[j : j + 1, :] = idx.astype(jnp.int32)
+        x = jnp.where(iota == idx, masked, x)
+    w = jnp.concatenate(ws, axis=0)
+    w_ref[...] = jnp.where(w[:1] <= NEG, jnp.nan, w)
+
+
+# Rows from which `select` takes the transposed kernel
+# (TPU_ROUTER_TOPK_TRANSPOSED_MIN_ROWS, 0 = never); rows must also be a
+# multiple of 128 (whole lanes).
+_logged_t = False
+
+
+def _transposed_min_rows() -> int:
+    from vllm_torchtpu import envs
+
+    return int(envs.TPU_ROUTER_TOPK_TRANSPOSED_MIN_ROWS)
+
+
+def _select_t(scores: jax.Array, topk: int, interpret: bool = False):
+    global _logged_t
+    rows, n = scores.shape
+    block = min(MAX_BLOCK_ROWS, rows)
+    if not _logged_t:
+        _logged_t = True
+        print(
+            "TPU_ROUTER_TOPK_TRANSPOSED_MIN_ROWS=1: router top-k by the "
+            f"transposed kernel ({rows} rows, {n} experts)",
+            flush=True,
+        )
+    w, i = pl.pallas_call(
+        functools.partial(_select_kernel_t, topk=topk, n=n),
+        grid=(pl.cdiv(rows, block),),
+        in_specs=[pl.BlockSpec((block, n), lambda b: (b, 0))],
+        out_specs=[
+            pl.BlockSpec((topk, block), lambda b: (0, b)),
+            pl.BlockSpec((topk, block), lambda b: (0, b)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((topk, rows), jnp.float32),
+            jax.ShapeDtypeStruct((topk, rows), jnp.int32),
+        ],
+        interpret=interpret,
+    )(scores)
+    return w.T, i.T
+
+
 def select(
     scores: jax.Array, topk: int, interpret: bool = False
 ) -> tuple[jax.Array, jax.Array]:
@@ -78,6 +139,14 @@ def select(
     one.
     """
     rows, n = scores.shape
+    min_rows = _transposed_min_rows()
+    if (
+        0 < min_rows <= rows
+        and rows % 128 == 0
+        and n % 8 == 0
+        and scores.dtype == jnp.float32
+    ):
+        return _select_t(scores, topk, interpret)
     block = min(MAX_BLOCK_ROWS, rows)
     return pl.pallas_call(
         functools.partial(_select_kernel, topk=topk, n=n),
