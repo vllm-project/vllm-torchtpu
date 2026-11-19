@@ -471,3 +471,117 @@ def all_reduce_v1(x: jax.Array, me: jax.Array, tab: np.ndarray) -> jax.Array:
         h_cw, h_cc = put(put_blocks(pos - i, pos + i), q_cw, s_cw, q_cc, s_cc, h_cw, h_cc)
     full = _d2d_ag_call(t, h)(rank, tab_j, h_cw, h_cc)
     return full[:rows]
+
+
+# --------------------------------------------------------------------------
+# v1b: the all-gather puts write straight into the full [t, h] output (column
+# block core*8 + d*4 + k) and the d2d all-gather is one remote DMA of this
+# core's half into the sibling's output (6 KB row segments; v1's four 3 KB
+# strided writes took 1.5 ms at t = 8192).
+@functools.cache
+def _put_full_call(t: int, h: int, w: int):
+    sr = _TILE // QROWS
+
+    # One grid axis over the direction: both write disjoint column blocks of
+    # the one aliased output.
+    def kernel(blk_ref, q, s, full_in, o):
+        del full_in
+        o[...] = _deq_tile(q[...], s[...]).astype(BF16)
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((t, h), BF16),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(2, t // _TILE),
+            in_specs=[
+                pl.BlockSpec((None, _TILE, w), lambda d, i, blk: (d, i, 0)),
+                pl.BlockSpec((None, sr, w), lambda d, i, blk: (d, i, 0)),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec((_TILE, w), lambda d, i, blk: (i, blk[d])),
+        ),
+        input_output_aliases={3: 0},
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary", "parallel")),
+        name=f"qar_put_full-t_{t}-w_{w}",
+    )
+
+
+@functools.cache
+def _d2d_ag_full_call(t: int, h: int):
+    hh = h // 2
+
+    def kernel(rank_ref, tab_ref, full_in, o_ref, send_sem, recv_sem):
+        del full_in
+        me = rank_ref[0]
+        barrier = pltpu.get_barrier_semaphore()
+        for d in range(_N):
+            pl.semaphore_signal(barrier, 1, device_id=(d,), device_id_type=_MESH)
+        pl.semaphore_wait(barrier, _N)
+        cols = pl.ds(pl.multiple_of(tab_ref[CORE, me] * hh, 128), hh)
+        copy = pltpu.make_async_remote_copy(
+            o_ref.at[:, cols], o_ref.at[:, cols], send_sem.at[0], recv_sem.at[0],
+            device_id=(tab_ref[SIB, me],), device_id_type=_MESH,
+        )
+        copy.start()
+        copy.wait_recv()
+        copy.wait_send()
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((t, h), BF16),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[_HBM],
+            out_specs=_HBM,
+            scratch_shapes=[pltpu.SemaphoreType.DMA((1,)), pltpu.SemaphoreType.DMA((1,))],
+        ),
+        input_output_aliases={2: 0},
+        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID, has_side_effects=True),
+        name=f"qar_d2d_ag_full-t_{t}-h_{h}",
+    )
+
+
+def all_reduce_v1b(x: jax.Array, me: jax.Array, tab: np.ndarray) -> jax.Array:
+    """v1 with in-place puts into the full output and a one-DMA d2d all-gather."""
+    rows, h = x.shape
+    hh = h // 2
+    w = hh // 8
+    t = padded_rows(rows)
+    if t != rows:
+        x = jnp.pad(x, ((0, t - rows), (0, 0)))
+    tab_j = jnp.asarray(tab)
+    rank = me.reshape(1).astype(jnp.int32)
+    me = rank[0]
+    core = tab_j[CORE, me]
+    pos = tab_j[POS, me]
+    exchange = pallas_exchange(rank, tab)
+    recv = _d2d_rs_call(t, h)(rank, tab_j, x)
+
+    def blocks(k_cw, k_cc):
+        k_cw, k_cc = k_cw % 4, k_cc % 4
+        return jnp.stack([core * 8 + k_cw, core * 8 + 4 + k_cc, k_cw, 4 + k_cc]).astype(jnp.int32)
+
+    q_cw, s_cw, q_cc, s_cc = _step_call(t, h, w, False)(blocks(pos, pos), x, x, recv, recv)
+    for i in range(3):
+        prev = exchange([q_cw, s_cw, q_cc, s_cc], [CW_NEXT, CW_NEXT, CW_PREV, CW_PREV])
+        q_cw, s_cw, q_cc, s_cc = _step_call(t, h, w, True)(
+            blocks(pos - i - 1, pos + i + 1), x, x, recv, recv, *prev
+        )
+    full = jnp.zeros((t, h), BF16)
+    put = _put_full_call(t, h, w)
+
+    def put_blocks(k_cw, k_cc):
+        return jnp.stack([core * 8 + k_cw % 4, core * 8 + 4 + k_cc % 4]).astype(jnp.int32)
+
+    def put_both(full, k_cw, k_cc, q_cw, s_cw, q_cc, s_cc):
+        return put(put_blocks(k_cw, k_cc), jnp.stack([q_cw, q_cc]), jnp.stack([s_cw, s_cc]), full)
+
+    full = put_both(full, pos + 1, pos - 1, q_cw, s_cw, q_cc, s_cc)
+    for i in range(3):
+        q_cw, s_cw, q_cc, s_cc = exchange(
+            [q_cw, s_cw, q_cc, s_cc], [CW_NEXT, CW_NEXT, CW_PREV, CW_PREV]
+        )
+        full = put_both(full, pos - i, pos + i, q_cw, s_cw, q_cc, s_cc)
+    full = _d2d_ag_full_call(t, h)(rank, tab_j, full)
+    return full[:rows]
