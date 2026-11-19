@@ -23,7 +23,6 @@
 # v6e's upload leaves it out: its model does not fit in a v6e 2x4 slice's
 # 256 GB of HBM (a v7x-8 has 768 GB), it needs native fp4, or it goes through
 # run_multihost.sh, whose topology and JobSets assume 4-chip v7x hosts.
-# tests/scripts/test_tpu_generations.py lists each such step with its reason.
 # Every step that sets TPU_ACCELERATOR_TYPE takes it from the generation, never
 # a fixed chip.
 
