@@ -1,0 +1,749 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Utility functions and classes for TPU runners."""
+
+import copy
+import datetime
+import json
+import os
+from enum import Enum
+from typing import Any
+
+import torch
+import torch.profiler
+from torch_tpu._internal.profiler import TpuProfilerConfig
+from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    UnquantizedEmbeddingMethod,
+)
+from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
+
+from vllm_torchtpu import profiler_trace
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
+MIN_NUM_SEQS = 8
+
+PREFILL_HEAVY_RATIO_THRESHOLD = 0.9
+DECODE_HEAVY_RATIO_THRESHOLD = 0.2
+BALANCED_RATIO_THRESHOLD = (0.4, 0.6)
+PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR = 15
+PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP = 0
+PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD = -1
+PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD = -1
+
+# Tuning knobs with no `profiler_config` equivalent, so they stay in
+# `additional_config`.
+PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
+    "phased_profiler_decode_only_kv_len_threshold"
+)
+PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
+    "phased_profiler_prefill_only_kv_len_threshold"
+)
+
+# The worker's process placement (`worker.worker_options`, ported for q38 L6
+# MAINPIN-2 from 96bfba489) never changes a compiled program.
+WORKER_OPTIONS_SECTION = "tpu_worker"
+
+# Diagnostics-only knob: it steers profiling and never changes the compiled
+# graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps it out of the
+# TPU compile cache key; likewise the host-only worker section.
+HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
+    {
+        PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
+        PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
+        WORKER_OPTIONS_SECTION,
+    }
+)
+
+
+class InferencePhase(Enum):
+    PREFILL_HEAVY = 0
+    DECODE_HEAVY = 1
+    BALANCED = 2
+    AMBIGUOUS = 3
+    PREFILL_ONLY = 4
+    DECODE_ONLY = 5
+
+
+def determine_phase_from_batch_composition_stats(
+    batch_composition_stats: dict[str, Any],
+) -> InferencePhase:
+    """Determines the inference phase based on the batch composition stats."""
+    num_prefill_tokens = batch_composition_stats["num_prefill_tokens"]
+    total_num_scheduled_tokens = batch_composition_stats["total_num_scheduled_tokens"]
+    prefill_ratio_for_batch = num_prefill_tokens / total_num_scheduled_tokens
+    if prefill_ratio_for_batch == 1.0:
+        return InferencePhase.PREFILL_ONLY
+    if prefill_ratio_for_batch == 0.0:
+        return InferencePhase.DECODE_ONLY
+    if prefill_ratio_for_batch >= PREFILL_HEAVY_RATIO_THRESHOLD:
+        return InferencePhase.PREFILL_HEAVY
+    if prefill_ratio_for_batch <= DECODE_HEAVY_RATIO_THRESHOLD:
+        return InferencePhase.DECODE_HEAVY
+    if (
+        prefill_ratio_for_batch >= BALANCED_RATIO_THRESHOLD[0]
+        and prefill_ratio_for_batch <= BALANCED_RATIO_THRESHOLD[1]
+    ):
+        return InferencePhase.BALANCED
+
+    return InferencePhase.AMBIGUOUS
+
+
+def get_batch_composition_stats(
+    batch_id: int,
+    input_batch: Any,  # Use Any to avoid circular dependency or import issues for now
+    total_num_scheduled_tokens: int,
+    num_reqs: int,
+    padded_total_num_scheduled_tokens: int,
+    scheduler_output: "VllmSchedulerOutput",
+) -> dict:
+    """Logs batch composition stats and returns them as a dict."""
+    num_prefill_tokens = 0
+    num_decode_tokens = 0
+
+    # Get the number of scheduled tokens for each request.
+    num_scheduled_tokens_per_req_list = []
+    # Get the number of tokens already processed for each request.
+    num_computed_tokens_per_req = input_batch.num_computed_tokens_cpu[:num_reqs]
+
+    scheduled_spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+    min_kv_len = float("inf") if num_reqs > 0 else 0
+    for i, req_id in enumerate(input_batch.req_ids[:num_reqs]):
+        assert req_id is not None
+
+        # This is the number of tokens to process in the current step for this request
+        num_scheduled_for_req = scheduler_output.num_scheduled_tokens[req_id]
+        num_scheduled_tokens_per_req_list.append(num_scheduled_for_req)
+
+        # This is the number of tokens already processed for this request
+        # (before this step)
+        num_already_computed = int(num_computed_tokens_per_req[i])  # Cast from np.int32
+        min_kv_len = min(min_kv_len, num_already_computed)
+
+        # When speculative decoding is enabled for this request, the extra
+        # tokens are draft tokens being verified, not chunked prefill tokens.
+        num_spec_tokens = len(scheduled_spec_decode_tokens.get(req_id, ()))
+
+        if num_already_computed == 0:
+            # Prefill
+            num_prefill_tokens += num_scheduled_for_req
+        # This means the request is ongoing
+        else:
+            if num_spec_tokens > 0:
+                # Verifying draft tokens for an ongoing request — count the
+                # target token plus the draft tokens as decode.
+                num_decode_tokens += num_scheduled_for_req
+            elif num_scheduled_for_req > 1:
+                # It's a multi-token request, so it's chunked prefill
+                num_prefill_tokens += num_scheduled_for_req
+            else:
+                # It's a single token for an ongoing request, so it's decode
+                num_decode_tokens += 1
+
+    stats: dict[str, Any] = {
+        "batch_id": batch_id,
+        "total_num_scheduled_tokens": total_num_scheduled_tokens,
+        "num_prefill_tokens": num_prefill_tokens,
+        "num_decode_tokens": num_decode_tokens,
+        "padded_total_num_scheduled_tokens": padded_total_num_scheduled_tokens,
+        "num_reqs": num_reqs,
+        "min_kv_len": min_kv_len if min_kv_len != float("inf") else 0,
+    }
+    stats["phase"] = determine_phase_from_batch_composition_stats(stats).name
+    return stats
+
+
+class PhaseBasedProfiler:
+    """Implements a phase-based profiler for PyTorch/XLA, profiling different
+    inference phases.
+    """
+
+    def __init__(
+        self,
+        profile_dir: str,
+        worker_rank: int = 0,
+        world_size: int = 1,
+        num_steps_to_profile_for: int = PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR,
+        num_decode_steps_to_skip: int = PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
+        decode_kv_len_threshold: int = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
+        prefill_kv_len_threshold: int = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD,
+        standard_opts: dict[str, Any] | None = None,
+        advanced_opts: dict[str, Any] | None = None,
+    ):
+        self.profiling_n_steps_left: int = 0
+        self.profile_dir_with_phase_suffix: str | None = None
+        self.num_steps_to_profile_for: int = num_steps_to_profile_for
+        # Skip initial decode steps to avoid profiling XLA compilation
+        # and warmup overhead
+        self.num_decode_steps_to_skip: int = num_decode_steps_to_skip
+        self.decode_steps_skipped: int = 0
+        # Wait for KV cache to reach a certain length before profiling decode-only phase
+        # to ensure we capture traces of longer, steady-state context lengths.
+        self.decode_kv_len_threshold: int = decode_kv_len_threshold
+        # Same idea for chunked prefill: without this the capture always lands
+        # on batch 1, where the sequence is one chunk long.
+        self.prefill_kv_len_threshold: int = prefill_kv_len_threshold
+        self.standard_opts = standard_opts or {}
+        self.advanced_opts = advanced_opts or {}
+        self.profile_dir: str = profile_dir
+        self.inference_phase_seen: dict[InferencePhase, bool] = {
+            InferencePhase.PREFILL_ONLY: False,
+            InferencePhase.PREFILL_HEAVY: False,
+            InferencePhase.DECODE_ONLY: False,
+            InferencePhase.DECODE_HEAVY: False,
+            InferencePhase.BALANCED: False,
+        }
+        self.current_phase: str = ""
+        self.worker_rank = worker_rank
+        self.world_size = world_size
+        self.profile_context: Any | None = None
+        self._canonical_dst_ts: str | None = None
+
+        logger.info(
+            "Phase-based profiler enabled. Traces will be saved to: %s",
+            self.profile_dir,
+        )
+        if self.num_decode_steps_to_skip > 0:
+            logger.info(
+                "Will skip %d decode-heavy steps before profiling decode_heavy phase.",
+                self.num_decode_steps_to_skip,
+            )
+        if self.decode_kv_len_threshold >= 0:
+            logger.info(
+                "Will skip decode-only steps until min KV len >= %d.",
+                self.decode_kv_len_threshold,
+            )
+        if self.prefill_kv_len_threshold >= 0:
+            logger.info(
+                "Will skip prefill-only steps until min KV len >= %d.",
+                self.prefill_kv_len_threshold,
+            )
+
+    def _write_batch_composition_stats_to_file_helper(
+        self, batch_composition_stats: dict
+    ) -> None:
+        """Writes the batch composition stats to a file."""
+        if not self.profile_dir_with_phase_suffix:
+            return
+        now = datetime.datetime.now()
+        date_string_in_profiler_format = now.strftime("%Y_%m_%d_%H_%M_%S_%f")
+
+        stats_file = os.path.join(
+            self.profile_dir_with_phase_suffix,
+            f"batch_composition_stats_{date_string_in_profiler_format}.json",
+        )
+        try:
+            with open(stats_file, "w") as f:
+                f.write(json.dumps(batch_composition_stats) + "\n")
+        except Exception as e:
+            logger.warning("Failed to write batch composition stats: %s", e)
+
+    def _resolve_canonical_dst_ts(self, phase_dir: str) -> str:
+        """Resolve the canonical destination timestamp for this phase."""
+        return profiler_trace.resolve_canonical_dst_ts(phase_dir, self.worker_rank)
+
+    def _start_profiling(self, batch_composition_stats: dict) -> None:
+        """Starts profiling if the current phase is unseen."""
+        current_determined_phase = determine_phase_from_batch_composition_stats(
+            batch_composition_stats
+        )
+        for phase, has_been_seen in self.inference_phase_seen.items():
+            if has_been_seen or phase != current_determined_phase:
+                continue
+
+            if (
+                phase == InferencePhase.DECODE_HEAVY
+                and self.decode_steps_skipped < self.num_decode_steps_to_skip
+            ):
+                self.decode_steps_skipped += 1
+                logger.debug(
+                    "Skipping decode-heavy step %d/%d before profiling.",
+                    self.decode_steps_skipped,
+                    self.num_decode_steps_to_skip,
+                )
+                break
+
+            # `min_kv_len` is a batch minimum, so this only makes sense for the
+            # single-composition phases. PREFILL_HEAVY always carries a
+            # freshly-admitted request at kv len 0 and would never arm.
+            kv_len_threshold = -1
+            if phase == InferencePhase.DECODE_ONLY:
+                kv_len_threshold = self.decode_kv_len_threshold
+            elif phase == InferencePhase.PREFILL_ONLY:
+                kv_len_threshold = self.prefill_kv_len_threshold
+            if kv_len_threshold >= 0:
+                min_kv_len = batch_composition_stats.get("min_kv_len", 0)
+                if min_kv_len < kv_len_threshold:
+                    logger.debug(
+                        "Skipping %s step as min KV len %d < threshold %d.",
+                        phase.name.lower(),
+                        min_kv_len,
+                        kv_len_threshold,
+                    )
+                    break
+
+            self.inference_phase_seen[phase] = True
+            self.profiling_n_steps_left = self.num_steps_to_profile_for
+            self.current_phase = phase.name.lower()
+
+            logger.info("Starting profiling for %s phase", self.current_phase)
+            logger.info("Batch composition stats: %s", batch_composition_stats)
+            phase_dir = os.path.join(self.profile_dir, self.current_phase)
+            os.makedirs(phase_dir, exist_ok=True)
+
+            self._canonical_dst_ts = self._resolve_canonical_dst_ts(phase_dir)
+            self.profile_dir_with_phase_suffix = profiler_trace.rank_capture_dir(
+                phase_dir, self.worker_rank
+            )
+            os.makedirs(self.profile_dir_with_phase_suffix, exist_ok=True)
+
+            self._write_batch_composition_stats_to_file_helper(batch_composition_stats)
+
+            # Start PyTorch/XLA profiler
+            handler = torch.profiler.tensorboard_trace_handler(
+                dir_name=self.profile_dir_with_phase_suffix, use_gzip=True
+            )
+
+            config = TpuProfilerConfig(
+                run_dir=self.profile_dir_with_phase_suffix,
+                host_tracer_level=self.standard_opts["host_tracer_level"],
+                device_tracer_level=self.standard_opts["device_tracer_level"],
+                python_tracer_level=self.standard_opts["python_tracer_level"],
+                experimental_options=self.advanced_opts,
+            )
+            self.profile_context = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.PrivateUse1,
+                ],
+                on_trace_ready=handler,
+                experimental_config=config,
+            )
+            try:
+                self.profile_context.__enter__()
+            except Exception as e:
+                logger.error("Failed to start PyTorch profiler: %s", e)
+                self.profile_context = None
+                self.current_phase = ""
+                self.profiling_n_steps_left = 0
+            break
+
+    def _step_or_stop_profiling(self, batch_composition_stats: dict) -> None:
+        """Steps or stops the profiler."""
+        if self.current_phase != "":
+            self._write_batch_composition_stats_to_file_helper(batch_composition_stats)
+            self.profiling_n_steps_left -= 1
+            if self.profiling_n_steps_left <= 0:
+                self._finish_current_phase()
+
+    def _finish_current_phase(self) -> None:
+        """Closes out the phase capture in progress, if any."""
+        if self.profile_context:
+            try:
+                self.profile_context.__exit__(None, None, None)
+                logger.info("Stopped PyTorch profiler trace.")
+            except Exception as e:
+                logger.error("Failed to stop PyTorch profiler: %s", e)
+            self.profile_context = None
+
+        self._merge_profile_directories()
+        logger.info("Profiling for %s phase finished", self.current_phase)
+        self.current_phase = ""
+        self.profiling_n_steps_left = 0
+
+    def finish(self) -> None:
+        """Force-stops a phase capture in progress.
+
+        Called when profiling is disarmed (worker.profile(is_start=False))
+        before the current phase's step budget ran out.
+        """
+        if self.current_phase:
+            self._finish_current_phase()
+
+    def _merge_profile_directories(self) -> None:
+        """Consolidates phase trace artifacts."""
+        if not self.profile_dir_with_phase_suffix or not self._canonical_dst_ts:
+            return
+        phase_dir = os.path.dirname(self.profile_dir_with_phase_suffix)
+        profiler_trace.merge_rank_capture(
+            self.profile_dir_with_phase_suffix,
+            phase_dir,
+            self._canonical_dst_ts,
+            self.worker_rank,
+            world_size=self.world_size,
+        )
+        if self.worker_rank == 0:
+            # The phase is merged, so nothing will read this marker again.
+            # Dropping it keeps a later run against the same profile_dir from
+            # finding it; slower ranks have long since timed out, since a
+            # phase spans num_steps_to_profile_for steps and the poll window
+            # is CANONICAL_TS_POLL_TIMEOUT_S.
+            profiler_trace.clear_canonical_ts_marker(phase_dir)
+
+    def step(self, batch_composition_stats: dict) -> None:
+        """Steps the profiler and logs batch composition stats."""
+        have_seen_all_phases = all(self.inference_phase_seen.values())
+        # A batch with no work has no phase -- the classifier divides by
+        # total_num_scheduled_tokens. execute_model already returns before
+        # calling us in that case, so this only keeps the invariant local.
+        #
+        # The threshold must stay at 0, not 1. One request in decode schedules
+        # exactly one token, so `> 1` skipped every steady-state step of a
+        # batch-size-1 run: decode_only could never be captured, and because
+        # this guard also covers _step_or_stop_profiling, the phase already
+        # capturing never counted down. That left the capture open until
+        # /stop_profile, ignoring max_iterations and filing every later step
+        # under the phase that opened it.
+        has_scheduled_work = batch_composition_stats["total_num_scheduled_tokens"] > 0
+        if has_scheduled_work and (
+            not have_seen_all_phases or self.current_phase != ""
+        ):
+            if self.profiling_n_steps_left <= 0:
+                self._start_profiling(batch_composition_stats)
+            else:
+                self._step_or_stop_profiling(batch_composition_stats)
+
+
+# (dtype, shape) -> minor_to_major, for buffers whose device layout is not
+# XLA's default-for-shape and so must be pinned on the compiled entry too.
+_PINNED_ENTRY_LAYOUTS: dict[tuple[torch.dtype, tuple[int, ...]], list[int]] = {}
+_entry_pin_installed = False
+
+
+def _to_row_major(tensor: torch.Tensor) -> torch.Tensor:
+    """Return `tensor` re-materialized on its device with a `{1,0}` layout.
+
+    `LayoutContext` hooks host->device transfers only -- a device-side
+    allocation inside the context still gets the default layout -- so the
+    tensor makes one round trip through the host. Shape and values are
+    unchanged; only the physical layout differs.
+    """
+    from torch_tpu._internal.compile import tpu_torch_compile as ttc
+    from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayout
+
+    # Keep the dtype's own tiling; only the dimension order changes.
+    _, tiles, elem_bits = ttc.get_default_layout(tensor.dtype, tensor.shape)
+    row_major = TpuLayout(
+        minor_to_major=[1, 0], tiles=tiles, element_size_in_bits=elem_bits
+    )
+    host = tensor.cpu()
+    with LayoutContext(row_major):
+        device_tensor = host.to(tensor.device)
+    _PINNED_ENTRY_LAYOUTS[(tensor.dtype, tuple(tensor.shape))] = [1, 0]
+    return device_tensor
+
+
+def relayout_rope_caches(model: torch.nn.Module):
+    """Re-materialize every rope cache with a row-major device layout."""
+    num_changed = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, RotaryEmbeddingBase):
+            continue
+        # The buffers on a rotary module that are indexed by position.
+        caches: list[tuple[str, Any]] = [
+            (buf_name, getattr(module, buf_name, None))
+            for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16")
+        ]
+        caches = [(n, b) for n, b in caches if isinstance(b, torch.Tensor)]
+        if not caches:
+            continue
+        if any(b.ndim != 2 for _, b in caches):
+            continue
+        for buf_name, buf in caches:
+            setattr(module, buf_name, _to_row_major(buf))
+        num_changed += 1
+        logger.info(
+            "Relayouted rope cache %s to {1,0} (shape %s)",
+            name,
+            tuple(caches[0][1].shape),
+        )
+
+    if num_changed:
+        _install_entry_layout_pin()
+    logger.info("Row-major relayouted %d rope caches", num_changed)
+
+
+def relayout_hash_tables(model: torch.nn.Module):
+    """Re-materialize every MOE hash-routing table row-major."""
+    seen: set[int] = set()
+    num_changed = 0
+    for name, module in model.named_modules():
+        # The attributes under which one hash-routing table is reachable;
+        # the same tensor object is bound to all of them.
+        for attr in ("tid2eid", "hash_indices_table"):
+            table: torch.Tensor | None = getattr(module, attr, None)
+            if not isinstance(table, torch.Tensor) or id(table) in seen:
+                continue
+            seen.add(id(table))
+            if table.ndim != 2:
+                continue
+            table.data = _to_row_major(table.data)
+            num_changed += 1
+            logger.info(
+                "Relayouted hash table %s.%s to {1,0} (shape %s)",
+                name,
+                attr,
+                tuple(table.shape),
+            )
+
+    if num_changed:
+        _install_entry_layout_pin()
+    logger.info("Row-major relayouted %d hash tables", num_changed)
+
+
+class HiddenMajorLMHeadMethod(UnquantizedEmbeddingMethod):
+    """LM head whose weight is stored [hidden, vocab shard] (see relayout_lm_head).
+
+    The projection becomes a plain `(m, k) @ (k, n)` matmul, which XLA streams
+    from HBM faster than the `(m, k) @ (n, k)^T` form of vLLM's
+    [vocab shard, hidden] layout. Same dtypes, but the compiler accumulates
+    the hidden dimension in a different order, so logits can differ in the
+    last bf16 bit.
+
+    Ported from PR 2821 (049bb029b, Yin Lin) for q38 L4 LMH-STREAM stage 0.
+    """
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if bias is None:
+            return torch.matmul(x, layer.weight)
+        out_shape = (*x.shape[:-1], layer.weight.shape[-1])
+        return torch.addmm(bias, x.reshape(-1, x.shape[-1]), layer.weight).reshape(
+            out_shape
+        )
+
+    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("a [hidden, vocab] LM head is not an embedding table")
+
+
+def hidden_major_refusal(
+    head: Any, processor: Any, embed: Any
+) -> str | None:
+    """Why ``head`` cannot be stored [hidden, vocab shard] (None: it can).
+
+    PR 2821's conditions: an untied, unquantized 2-D ParallelLMHead whose logits
+    processor projects in the weight's own dtype. A head already stored
+    hidden-major is refused too (its method is no longer the stock one), so a
+    second call never transposes it back.
+    """
+    if not isinstance(head, ParallelLMHead):
+        return f"the head is a {type(head).__name__}, not a ParallelLMHead"
+    if type(head.quant_method) is not UnquantizedEmbeddingMethod:
+        return (
+            f"the head's quant method is {type(head.quant_method).__name__}, "
+            "not UnquantizedEmbeddingMethod"
+        )
+    if head.weight.ndim != 2:
+        return f"the head's weight is {head.weight.ndim}-D"
+    if embed is not None and getattr(embed, "weight", None) is head.weight:
+        return "the head is tied to the input embedding"
+    if processor is None:
+        return "no logits_processor next to the head"
+    if processor.head_dtype not in (None, head.weight.dtype):
+        return (
+            f"the logits processor projects in {processor.head_dtype}, the head is "
+            f"{head.weight.dtype}"
+        )
+    return None
+
+
+def _hidden_major_weight(head: torch.nn.Module) -> torch.nn.Parameter:
+    """``head``'s weight as a new [hidden, vocab shard] row-major parameter."""
+    return torch.nn.Parameter(
+        _to_row_major(head.weight.data.t().contiguous()), requires_grad=False
+    )
+
+
+def relayout_lm_head(model: torch.nn.Module) -> bool:
+    """Store an untied, unquantized LM head as [hidden, vocab shard], row-major.
+
+    Returns whether the head was changed. The weight keeps its own buffer, so
+    a draft model holding the same head module follows it. (PR 2821.)
+    """
+    language_model = (
+        model.get_language_model() if hasattr(model, "get_language_model") else model
+    )
+    head = getattr(language_model, "lm_head", None)
+    processor = getattr(language_model, "logits_processor", None)
+    embed = getattr(getattr(language_model, "model", None), "embed_tokens", None)
+    if hidden_major_refusal(head, processor, embed) is not None:
+        logger.info("LM head kept in its [vocab, hidden] layout")
+        return False
+    assert head is not None
+    head.weight = _hidden_major_weight(head)
+    head.quant_method = HiddenMajorLMHeadMethod()
+    _install_entry_layout_pin()
+    logger.info(
+        "LM head stored [hidden, vocab shard] %s, row-major", tuple(head.weight.shape)
+    )
+    return True
+
+
+def hidden_major_head_copy(head: ParallelLMHead) -> ParallelLMHead:
+    """A second head module like ``head`` (same shard indices, buffers and bias)
+    whose weight is a [hidden, vocab shard] row-major copy. ``head`` itself,
+    its weight and its quant method are left as they are."""
+    new = copy.copy(head)
+    # copy.copy shares the module's registries; give the copy its own, so the
+    # weight below lands in the copy only.
+    new._parameters = head._parameters.copy()
+    new._buffers = head._buffers.copy()
+    new._modules = head._modules.copy()
+    new.weight = _hidden_major_weight(head)
+    new.quant_method = HiddenMajorLMHeadMethod()
+    return new
+
+
+def _head_census(head: Any) -> str:
+    w = head.weight
+    return (
+        f"{tuple(w.shape)} {str(w.dtype).replace('torch.', '')} "
+        f"{w.numel() * w.element_size()} B"
+    )
+
+
+def arm_lm_head_hidden_major(
+    target_model: torch.nn.Module,
+    draft_model: torch.nn.Module | None,
+    *,
+    draft: bool,
+    verify: bool,
+) -> dict[str, str]:
+    """q38 L4 LMH-STREAM stage 0: VLLM_TPU_LMH_HIDDEN_MAJOR_DRAFT / _VERIFY.
+
+    ``draft``: the draft's LM head is stored [hidden, vocab shard]. A draft that
+    shares the target's head module gets its own hidden-major copy (one more
+    vocab shard x hidden table per rank) and the target head is untouched; a
+    draft with its own head is relayouted in place. ``verify``: the target's
+    head is relayouted in place (PR 2821's TPU_LM_HEAD_HIDDEN_MAJOR); a draft
+    sharing that module then uses the same table, which is why ``verify``
+    requires ``draft`` there. Read once at load (never per step or window), on
+    the last pipeline stage, after the drafter is built and before any head is
+    traced. A requested head that cannot be relayouted raises (fail-stop).
+    Returns the census logged as ``q38 LMH-HM ARMED``.
+    """
+    census: dict[str, str] = {}
+    if not (draft or verify):
+        return census
+    changed = False
+    target_lm = (
+        target_model.get_language_model()
+        if hasattr(target_model, "get_language_model")
+        else target_model
+    )
+    target_head = getattr(target_lm, "lm_head", None)
+    draft_head = (
+        getattr(draft_model, "lm_head", None) if draft_model is not None else None
+    )
+    shared = draft_head is not None and draft_head is target_head
+    if verify and shared and not draft:
+        raise ValueError(
+            "VLLM_TPU_LMH_HIDDEN_MAJOR_VERIFY=1 without VLLM_TPU_LMH_HIDDEN_MAJOR_DRAFT=1: "
+            "the draft shares the target's LM head module, so relayouting the verify "
+            "head would switch the draft head too. Set both, or neither."
+        )
+    if verify:
+        why = hidden_major_refusal(
+            target_head,
+            getattr(target_lm, "logits_processor", None),
+            getattr(getattr(target_lm, "model", None), "embed_tokens", None),
+        )
+        if why is not None:
+            raise ValueError(
+                f"VLLM_TPU_LMH_HIDDEN_MAJOR_VERIFY=1: {why}; unset it for this model."
+            )
+        assert target_head is not None
+        target_head.weight = _hidden_major_weight(target_head)
+        target_head.quant_method = HiddenMajorLMHeadMethod()
+        changed = True
+        census["verify"] = "hidden-major in place " + _head_census(target_head)
+    elif target_head is not None and hasattr(target_head, "weight"):
+        census["verify"] = "kept [vocab, hidden] " + _head_census(target_head)
+    if draft:
+        if draft_model is None:
+            logger.warning(
+                "q38 LMH-HM: VLLM_TPU_LMH_HIDDEN_MAJOR_DRAFT=1 but this worker has no "
+                "draft model; no draft head armed"
+            )
+            census["draft"] = "none (no draft model)"
+        elif shared and verify:
+            census["draft"] = "shares the hidden-major target head " + _head_census(
+                target_head
+            )
+        else:
+            why = hidden_major_refusal(
+                draft_head,
+                getattr(draft_model, "logits_processor", None),
+                getattr(getattr(draft_model, "model", None), "embed_tokens", None),
+            )
+            if why is not None:
+                raise ValueError(
+                    f"VLLM_TPU_LMH_HIDDEN_MAJOR_DRAFT=1: draft {why}; unset it for "
+                    "this model."
+                )
+            assert draft_head is not None and draft_model is not None
+            if shared:
+                draft_model.lm_head = hidden_major_head_copy(draft_head)
+                changed = True
+                census["draft"] = "own hidden-major copy " + _head_census(
+                    draft_model.lm_head
+                )
+            else:
+                draft_head.weight = _hidden_major_weight(draft_head)
+                draft_head.quant_method = HiddenMajorLMHeadMethod()
+                changed = True
+                census["draft"] = "hidden-major in place " + _head_census(draft_head)
+    if changed:
+        _install_entry_layout_pin()
+    logger.info(
+        "q38 LMH-HM ARMED draft=%s verify=%s",
+        census.get("draft", "off"),
+        census.get("verify", "off"),
+    )
+    return census
+
+
+def _install_entry_layout_pin() -> None:
+    """Make the compiler pin entry layouts for buffers in the registry."""
+    global _entry_pin_installed
+    if _entry_pin_installed:
+        return
+    from torch_tpu._internal.compile import compiler as tt_compiler
+
+    original_call = tt_compiler.StaticCompiler.__call__
+
+    def _call_with_pinned_layouts(self, graph_module, example_inputs, *args, **kwargs):
+        # `argument_layouts` is the 5th positional parameter; len(args) < 3
+        # means the caller did not pass it positionally.
+        if (
+            _PINNED_ENTRY_LAYOUTS
+            and len(args) < 3
+            and kwargs.get("argument_layouts") is None
+        ):
+            # One entry per *tensor* argument: `fx_to_mlir` filters the
+            # non-tensors (generators, symints) out before length-checking.
+            layouts: list[list[int]] = []
+            pinned_any = False
+            for val in example_inputs:
+                if not isinstance(val, torch.Tensor):
+                    continue
+                pin = _PINNED_ENTRY_LAYOUTS.get((val.dtype, tuple(val.shape)))
+                layouts.append(list(pin) if pin is not None else [])
+                pinned_any = pinned_any or pin is not None
+            if pinned_any:
+                kwargs["argument_layouts"] = layouts
+                logger.info(
+                    "Pinned %d of %d entry layouts for this graph",
+                    sum(1 for entry in layouts if entry),
+                    len(layouts),
+                )
+        return original_call(self, graph_module, example_inputs, *args, **kwargs)
+
+    tt_compiler.StaticCompiler.__call__ = _call_with_pinned_layouts
+    _entry_pin_installed = True

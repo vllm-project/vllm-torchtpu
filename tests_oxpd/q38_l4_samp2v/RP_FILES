@@ -1,0 +1,25 @@
+# Per-file regression candidates for SAMP2 x VFY-ONE on the composed v5 tree (vs 2e166829a). KEY = must run on CPU.
+KEY tests/l4vfy/test_vfy_one.py
+KEY tests/l4vfy/test_vfy_v5_flagoff.py
+KEY tests/l4vfy/test_vfy_agree.py
+KEY tests/l4vfy/test_vfy_dha_compose.py
+KEY tests/l4tail/test_vps_ro_fold.py
+KEY tests/q38mm_dstock/test_vp_sampler.py
+KEY tests/q38mm_dstock/test_vps_wiring.py
+KEY tests/decfb2/test_vps_fallback.py
+KEY tests/decfb2/test_vps_fb_wiring.py
+KEY tests/compilation/test_tpu_compile_key_registration.py
+KEY tests/q38_samp1/test_vps_topk_keys.py
+KEY tests/runner/test_spec_verify_served_only.py
+KEY tests/runner/test_q38_eagerfix.py
+KEY tests/layers/adapter/test_top_k_top_p.py
+RUN tests/l4vfy/test_vfy_flagoff.py
+RUN tests/decfb2/test_vps_harness_no_leak.py
+RUN tests/compilation/test_fast_compiled_call.py
+RUN tests/test_envs.py
+RUN tests/test_envs_builders.py
+RUN tests/runner/test_tpu_runner.py
+RUN tests/runner/test_tpu_runner_async_output.py
+RUN tests/spec_decode/test_eagle3.py
+RUN tests/q38_l6/test_l6_ab_envcache.py
+RUN tests/q38_l6/test_l6_lockstep.py

@@ -1,0 +1,12 @@
+tests/compilation/test_tpu_compile_key_registration.py
+tests/q38mm_dstock/test_vps_wiring.py
+tests/decfb2/test_vps_fb_wiring.py
+tests/runner/test_spec_verify_served_only.py
+tests/runner/test_draft_carries_port.py
+tests/runner/test_q38_eagerfix.py
+tests/q38mm_dstock/test_vp_sampler.py
+tests/decfb2/test_vps_fallback.py
+tests/l4tail/test_vps_ro_fold.py
+tests/q38_l6/test_l6_ab_envcache.py
+tests/q38_l6/test_l6_lockstep.py
+tests/megakernel_runtime/test_served_ab.py

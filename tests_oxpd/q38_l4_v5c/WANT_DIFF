@@ -1,0 +1,24 @@
+Files base/src/vllm_torchtpu/__init__.py and head/src/vllm_torchtpu/__init__.py differ
+Files base/src/vllm_torchtpu/compilation/tpu_compiler.py and head/src/vllm_torchtpu/compilation/tpu_compiler.py differ
+Files base/src/vllm_torchtpu/core/l6_ab.py and head/src/vllm_torchtpu/core/l6_ab.py differ
+Files base/src/vllm_torchtpu/envs.py and head/src/vllm_torchtpu/envs.py differ
+Files base/src/vllm_torchtpu/models/vllm/qwen4_exp/mtp.py and head/src/vllm_torchtpu/models/vllm/qwen4_exp/mtp.py differ
+Files base/src/vllm_torchtpu/runner/tpu_runner.py and head/src/vllm_torchtpu/runner/tpu_runner.py differ
+Files base/src/vllm_torchtpu/spec_decode/eagle3.py and head/src/vllm_torchtpu/spec_decode/eagle3.py differ
+Only in head/src/vllm_torchtpu/runner: l4_vpshost.py
+Only in head/src/vllm_torchtpu/runner: vfy_one.py
+Only in head/src/vllm_torchtpu/spec_decode: draft_asm.py
+Only in head/src/vllm_torchtpu/spec_decode: draft_one.py
+Only in head/src/vllm_torchtpu/runner: l4_agree.py
+Only in head/src/vllm_torchtpu/spec_decode: draft_cap.py
+Files base/src/vllm_torchtpu/layers/adapter/sample/vp_sampler.py and head/src/vllm_torchtpu/layers/adapter/sample/vp_sampler.py differ
+Only in head/src/vllm_torchtpu/layers/adapter/sample: counter_uniform.py
+Only in head/src/vllm_torchtpu/layers/adapter/sample: vps_rng.py
+Only in head/src/vllm_torchtpu/runner: l4_samp2.py
+Files base/src/vllm_torchtpu/runner/utils.py and head/src/vllm_torchtpu/runner/utils.py differ
+Files base/src/vllm_torchtpu/platforms/tpu_platform.py and head/src/vllm_torchtpu/platforms/tpu_platform.py differ
+Only in head/src/vllm_torchtpu/runner: seedfix.py
+Only in head/src/vllm_torchtpu/spec_decode: k1fuse.py
+Only in head/src/vllm_torchtpu/megakernel/wholestep: qsa_draft.py
+Only in head/src/vllm_torchtpu/megakernel_runtime: qwen38_draft_attn.py
+Files base/src/vllm_torchtpu/runner/speculative_decoding_manager.py and head/src/vllm_torchtpu/runner/speculative_decoding_manager.py differ

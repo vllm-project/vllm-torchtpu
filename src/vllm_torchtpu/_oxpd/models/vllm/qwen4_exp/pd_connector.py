@@ -1,0 +1,1763 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Model-owned Stage-3 page planning for Qwen's hybrid caches.
+
+Native admission binds the loaded model identity and measured page layout.
+This connector does not borrow another model's native pool admission.
+"""
+
+import json
+import math
+import time
+import os
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+from vllm.v1.outputs import KVConnectorOutput
+from vllm.distributed.parallel_state import get_ep_group, get_tp_group
+from vllm.v1.kv_cache_interface import KVCacheConfig
+
+from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
+    PoolByteSpan,
+    PoolSpanRegistration,
+)
+from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
+    canonical_layout_fingerprint,
+)
+from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (
+    PoolEntry,
+    PoolManifest,
+    materialize_storages,
+    verify_storage_binding,
+)
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+    SendMeta,
+    TPURaidenConnector,
+    TPURaidenConnectorWorker,
+    _engine_is_pipeline,
+    _resolved_reshard_controller_address,
+    _Stage3LoadMeta,
+    _Stage3TransferGroup,
+    _use_per_layer_pool_tags,
+)
+
+from .pd import (
+    TransferExtent,
+    TransferGroup,
+    build_transfer_groups,
+    handoff_block_ids,
+    held_heads,
+    skipped_source_pages,
+    suffix_pages,
+)
+from vllm_torchtpu.distributed.kv_transfer import stage3_async as _s3a
+from vllm_torchtpu.runner import host_phases as _hp
+
+from . import pd_landing_log
+from .pd_identity import canonical_rank_identity
+from .pd_manifest import build_transfer_manifest, measure_transfer_layout
+
+logger = init_logger(__name__)
+
+def sync_repack_enabled() -> bool:
+    """QWEN4_EXP_PD_SYNC_REPACK, or its wall-clock A/B, is configured."""
+    return bool(envs.QWEN4_EXP_PD_SYNC_REPACK) or int(envs.QWEN4_EXP_PD_SYNC_REPACK_AB_S) > 0
+
+
+def sync_repack_on(now: float | None = None) -> bool:
+    """Whether a load landing now waits for the scheduler-named step.
+
+    QWEN4_EXP_PD_SYNC_REPACK_AB_S > 0 alternates by wall clock (off in even
+    periods, on in odd ones), so one serving job holds both arms. Every
+    process of an engine reads the same host clock; a load deferred in an on
+    period is flushed at the first step of the next off period.
+    """
+    period = int(envs.QWEN4_EXP_PD_SYNC_REPACK_AB_S)
+    if period > 0:
+        t = time.time() if now is None else now
+        return int(t // period) % 2 == 1
+    return bool(envs.QWEN4_EXP_PD_SYNC_REPACK)
+
+
+# A hybrid pool's block IDs are only unique within a group, so vLLM rejects
+# invalid_block_ids for it; failed loads go back as request-level failures.
+_REQUEST_LEVEL_LOAD_FAILURES = "failed_recving" in getattr(
+    KVConnectorOutput, "__dataclass_fields__", {}
+)
+
+
+class Qwen4ExpRaidenConnector(TPURaidenConnector):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        role: KVConnectorRole,
+        kv_cache_config: KVCacheConfig,
+    ):
+        parallel = vllm_config.parallel_config
+        cache = vllm_config.cache_config
+        # Prefix caching is admitted on either leg: a producer publishes the
+        # running state of its align-mode state tables (and ordinary, possibly
+        # shared, token pages); a consumer adopts its local prefix and pulls
+        # the suffix (supports_stage3_grouped_prefix_loads).
+        # MTP is admitted on a consumer behind TP1 pipeline stages: the
+        # staging repack builds the producer's plan and lands states in the
+        # committed entry of a speculative table. Without
+        # QWEN4_EXP_PD_DRAFT_KV the producer ships no draft KV, so the
+        # draft's prompt KV starts empty (meant for synthetic rejection
+        # sampling). With it (q38 F2), a TP1 pipeline producer runs
+        # prefill-only MTP (K = 1) on its last stage and ships the draft
+        # layer's caches (config.pd_prefill_mtp_producer); any other
+        # producer MTP stays refused.
+        from .config import pd_prefill_mtp_producer
+
+        transfer = vllm_config.kv_transfer_config
+        decode_only_mtp = (
+            vllm_config.speculative_config is not None
+            and transfer is not None
+            and not transfer.is_kv_producer
+            and _use_per_layer_pool_tags()
+            and parallel.pipeline_parallel_size == 1
+            and parallel.tensor_parallel_size > 1
+        )
+        producer_mtp = pd_prefill_mtp_producer(vllm_config)
+        if (
+            parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+            or (
+                vllm_config.speculative_config is not None
+                and not (decode_only_mtp or producer_mtp)
+            )
+        ):
+            raise NotImplementedError(
+                "Qwen PD first requires CP1, and MTP only on a staged TP>1 decode "
+                "(or prefill-only MTP K=1 on a TP1 pipeline producer with "
+                "QWEN4_EXP_PD_DRAFT_KV=1)"
+            )
+        # A pipeline producer (Qwen3.5's prefill shape): each TP1 stage ships
+        # its own layers' pages whole, paired with a TP1 consumer's pools by
+        # per-layer tag, so both peers hold the same per-layer page encoding.
+        if parallel.pipeline_parallel_size != 1 and (
+            parallel.tensor_parallel_size != 1
+            or vllm_config.kv_transfer_config is None
+            or not vllm_config.kv_transfer_config.is_kv_producer
+            or not _use_per_layer_pool_tags()
+        ):
+            raise NotImplementedError(
+                "Qwen PD pipeline stages produce only, at TP1, with "
+                "TPU_RAIDEN_POOL_TAGS_PER_LAYER=1 on both peers"
+            )
+        from .pd_staging import draft_hold_enabled, draft_kv_enabled
+
+        if draft_hold_enabled() and not draft_kv_enabled():
+            raise ValueError(
+                "QWEN4_EXP_PD_DRAFT_HOLD=1 holds the F2 producer's MTP draft blocks; "
+                "it needs QWEN4_EXP_PD_DRAFT_KV=1 on both legs"
+            )
+        if envs.TPU_KV_RESHARD_TRANSPORT != "raiden":
+            raise ValueError("Qwen PD requires the Raiden Stage-3 transport")
+        if any(
+            (
+                envs.TPU_RAIDEN_QWEN35_ADMISSION,
+                envs.TPU_RAIDEN_KIMIK3_ADMISSION,
+                envs.TPU_RAIDEN_GLM_ADMISSION,
+                envs.TPU_RAIDEN_DSV4_ADMISSION,
+            )
+        ):
+            raise ValueError("Qwen PD cannot use another model's pool admission")
+        super().__init__(vllm_config, role, kv_cache_config)
+        # QWEN4_EXP_PD_SYNC_REPACK: the scheduler names the loads that landed
+        # on every rank; each rank's staged repack runs in the step that
+        # names them (start_load_kv, before the forward), on all ranks alike.
+        self._sync_repack = sync_repack_enabled() and not (
+            transfer is not None and transfer.is_kv_producer
+        )
+        self._landed_on_all_ranks: list[str] = []
+        self._failed_on_some_rank: list[str] = []
+        # The aborted-while-landing guard (``_guards_landing``): whenever L1
+        # names loads, the scheduler names only a load whose request still
+        # waits for it (3eeddf339's rule) and drops a name whose request
+        # finished before the metadata went out: its blocks may already
+        # belong to another request, so repacking (L1) or gathering (S4,
+        # QWEN4_EXP_PD_SHARED_COMPRESSED) into them would corrupt it.
+        # req id -> request.
+        from .pd_shared_compressed import enabled as _shared_enabled
+
+        self._shared_compressed = self._sync_repack and _shared_enabled()
+        self._load_requests: dict[str, Any] = {}
+        self._qwen_divergent_hits = bool(cache.enable_prefix_caching) and os.environ.get(
+            "QWEN4_EXP_PD_DIVERGENT_HITS", "1"
+        ).strip() not in ("0", "false", "False")
+        # q38 F2 option (a), producer: req id -> the prefix hit the request was
+        # last (re)scheduled with. Its draft KV is not prefix-cacheable, so its
+        # draft rows start there; the hit goes to the decode in the transfer
+        # params (pd_staging.PRODUCER_HIT_PARAM). None on every other engine.
+        self._producer_hits: dict[str, int] | None = {} if producer_mtp else None
+        # q38 F2-HOLD, producer: cumulative counters of the held draft tables
+        # (engagement evidence; logged at most once a minute).
+        self._hold_counters: dict[str, int] = dict(
+            sends=0, held_sends=0, held_pages=0, skip_tokens=0, hit_tokens=0,
+            unheld_hits=0, skip_above_hit=0,
+        )
+        self._hold_logged = -1e9
+        # q38 F2-HOLD, decode: what the producers published per load (the
+        # zero-fill end the staging repack then uses is max(hit, skip)).
+        self._hold_decode: dict[str, int] = dict(
+            loads=0, hit_loads=0, skip_loads=0, skip_tokens=0, skip_above_hit=0
+        )
+
+    # --- QWEN4_EXP_PD_SYNC_REPACK -----------------------------------------
+
+    def _guards_landing(self) -> bool:
+        """The aborted-while-landing guard is on whenever L1 names loads
+        (QWEN4_EXP_PD_SYNC_REPACK, which S4 requires)."""
+        return bool(getattr(self, "_sync_repack", False))
+
+    def _loads(self) -> dict[str, Any]:
+        # Created on first use: connectors assembled without __init__ (tests)
+        # behave as one that has recorded no load yet.
+        return self.__dict__.setdefault("_load_requests", {})
+
+    def update_state_after_alloc(self, request, blocks, num_external_tokens):
+        if self._guards_landing() and num_external_tokens > 0:
+            self._loads()[request.request_id] = request
+        result = super().update_state_after_alloc(request, blocks, num_external_tokens)
+        self._carry_producer_hit(request)
+        return result
+
+    # --- q38 F2 option (a): the producer's prefix hit Hp -------------------
+
+    def _carry_producer_hit(self, request) -> None:
+        """Decode: the producer's published prefix hit rides this request's
+        load metadata to the staging repack, which zero-fills the draft rows
+        the producer never computed (pd_staging.StagedConsumer.draft_zero_end).
+        Absent, it is 0."""
+        from .pd_staging import draft_kv_enabled, published_hit_tokens
+
+        scheduler = getattr(self, "connector_scheduler", None)
+        if scheduler is None or not draft_kv_enabled():
+            return
+        meta = getattr(scheduler, "reqs_to_load", {}).get(request.request_id)
+        if meta is not None and hasattr(meta, "src_cached_tokens"):
+            meta.src_cached_tokens = published_hit_tokens(request.kv_transfer_params)
+            self._count_published_skip(request, meta.src_cached_tokens)
+
+    def _count_published_skip(self, request, zero_end: int) -> None:
+        """Decode: count the F2-HOLD producer's published draft skip next to its
+        hit, and log at most once a minute (engagement evidence)."""
+        from .pd_staging import PRODUCER_DRAFT_SKIP_PARAM, PRODUCER_HIT_PARAM, _positive_int
+
+        params = request.kv_transfer_params
+        hit = _positive_int(params, PRODUCER_HIT_PARAM)
+        skip = _positive_int(params, PRODUCER_DRAFT_SKIP_PARAM)
+        c = self.__dict__.setdefault(
+            "_hold_decode",
+            dict(loads=0, hit_loads=0, skip_loads=0, skip_tokens=0, skip_above_hit=0),
+        )
+        c["loads"] += 1
+        c["hit_loads"] += int(hit > 0)
+        c["skip_loads"] += int(skip > 0)
+        c["skip_tokens"] += skip
+        c["skip_above_hit"] += int(skip > hit)
+        now = time.monotonic()
+        if skip and now - self.__dict__.get("_hold_decode_logged", -1e9) >= 60.0:
+            self._hold_decode_logged = now
+            logger.info(
+                "Qwen PD F2-HOLD decode: last load req %s hit %d draft skip %d zero-fill end %d "
+                "| cumulative %s",
+                request.request_id, hit, skip, zero_end, dict(c),
+            )
+
+    def _record_producer_hits(self, scheduler_output) -> None:
+        """Producer: the tokens each newly scheduled or resumed request did
+        not compute (its prefix hit). A resumed request's hit replaces its
+        first one: its draft rows were recomputed only from the new hit."""
+        hits = getattr(self, "_producer_hits", None)
+        if hits is None:
+            return
+        for new_req in getattr(scheduler_output, "scheduled_new_reqs", None) or ():
+            hits[new_req.req_id] = int(new_req.num_computed_tokens)
+        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached is None:
+            return
+        resumed = set(getattr(cached, "resumed_req_ids", None) or ())
+        for index, req_id in enumerate(cached.req_ids):
+            if req_id in resumed:
+                hits[req_id] = int(cached.num_computed_tokens[index])
+
+    def request_finished_all_groups(self, request, block_ids):
+        delay_free_blocks, params = super().request_finished_all_groups(request, block_ids)
+        hits = getattr(self, "_producer_hits", None)
+        if hits is None:
+            return delay_free_blocks, params
+        hit = hits.pop(request.request_id, None)
+        if hit is None:  # never seen scheduled: vLLM's own count, if any
+            hit = int(getattr(request, "num_cached_tokens", 0) or 0)
+        num_tokens = params.get("num_tokens") if isinstance(params, dict) else None
+        if type(num_tokens) is int and hit > 0:
+            from .pd_staging import PRODUCER_HIT_PARAM
+
+            params = dict(params)
+            params[PRODUCER_HIT_PARAM] = min(hit, num_tokens)
+        if type(num_tokens) is int:
+            skip = self._held_draft_skip(block_ids)
+            if skip is not None:
+                params = self._publish_draft_skip(request, params, skip, hit, num_tokens)
+        return delay_free_blocks, params
+
+    # --- q38 F2-HOLD: the producer's held draft tables -------------------
+
+    def _held_draft_skip(self, block_ids) -> int | None:
+        """The tokens this request's held draft tables skip (their leading null
+        blocks times the page size), or None when no group is held (the flag
+        off, or not an F2 producer). Every held group skips the same tokens: they
+        were nulled together, at the request's first allocation."""
+        held = [
+            g for g in getattr(self, "_stage3_transfer_groups", ()) if g.leading_null_pages_ok
+        ]
+        if not held:
+            return None
+        skips = {
+            g.leading_null_pages(block_ids[g.cache_group_index]) * g.page_tokens for g in held
+        }
+        if len(skips) != 1:
+            raise ValueError(
+                f"q38 F2-HOLD: the held draft groups skip different prefixes {sorted(skips)}"
+            )
+        return skips.pop()
+
+    def _publish_draft_skip(self, request, params, skip, hit, num_tokens):
+        """Publish the draft skip next to the hit; count and log. A skip above
+        the hit cannot happen by construction (the hold skips the computed
+        prefix, which the hit records); if it ever did, the producer's draft
+        rows in [hit, skip) would be lost, and the published skip makes the
+        decode zero-fill them (pd_staging.published_hit_tokens) instead of
+        landing the rows the send filled them with."""
+        from .pd_staging import PRODUCER_DRAFT_SKIP_PARAM
+
+        c = self._hold_counters
+        c["sends"] += 1
+        c["hit_tokens"] += int(hit)
+        page = min(
+            g.page_tokens for g in self._stage3_transfer_groups if g.leading_null_pages_ok
+        )
+        if skip > 0:
+            params = dict(params)
+            params[PRODUCER_DRAFT_SKIP_PARAM] = int(min(skip, num_tokens))
+            c["held_sends"] += 1
+            c["held_pages"] += skip // page
+            c["skip_tokens"] += skip
+        elif hit >= page:
+            c["unheld_hits"] += 1  # a hit of a whole page and nothing held: not engaged
+        if skip > hit:
+            c["skip_above_hit"] += 1
+            logger.error(
+                "q38 F2-HOLD: req %s draft skip %d is above its published hit %d; "
+                "the decode zero-fills its draft rows up to the skip",
+                request.request_id, skip, hit,
+            )
+        now = time.monotonic()
+        if now - self._hold_logged >= 60.0:
+            self._hold_logged = now
+            logger.info(
+                "Qwen PD F2-HOLD producer: last req %s hit %d draft skip %d of %d tokens "
+                "| cumulative %s",
+                request.request_id, hit, skip, num_tokens, dict(c),
+            )
+        return params
+
+    def update_connector_output(self, connector_output: Any) -> None:
+        super().update_connector_output(connector_output)
+        if not self._sync_repack or self.connector_scheduler is None:
+            return
+        # vLLM's aggregator reports a receive only once every rank has, and
+        # a failure on any rank in failed_recving beside it. A failed load
+        # recomputes locally: no rank repacks it, and every rank frees the
+        # pages it staged for it in the named step.
+        finished = set(connector_output.finished_recving or ())
+        failed = set(getattr(connector_output, "failed_recving", None) or ())
+        land_log = self._landing_timeline()
+        if land_log is not None:
+            land_log.landed(sorted(finished - failed), time.time())
+            land_log.forget(finished & failed)
+        guard = self._guards_landing()
+        for req_id in sorted(finished - failed):
+            if guard and not self._still_waiting(req_id):
+                # Aborted while landing: naming it would repack (or gather)
+                # into blocks vLLM freed; every rank frees its staged pages.
+                self._failed_on_some_rank.append(req_id)
+                self._loads().pop(req_id, None)
+                continue
+            self._landed_on_all_ranks.append(req_id)
+        for req_id in sorted(finished & failed):
+            self._failed_on_some_rank.append(req_id)
+            if guard:
+                self._loads().pop(req_id, None)
+
+    def _still_waiting(self, req_id: str) -> bool:
+        """A recorded load whose request still waits for it. A load with no
+        record is named as L1 names it (never dropped on a guess: a dropped
+        load is not recomputed)."""
+        from vllm.v1.request import RequestStatus
+
+        request = self._loads().get(req_id)
+        return request is None or request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    def build_connector_meta(self, scheduler_output):
+        meta = super().build_connector_meta(scheduler_output)
+        self._record_producer_hits(scheduler_output)
+        if self._sync_repack:
+            named = self._landed_on_all_ranks
+            land_log = self._landing_timeline()
+            prompt_tokens = None
+            if land_log is not None:
+                # Read before the guard pops the records (log-only).
+                loads = self._loads()
+                prompt_tokens = {
+                    r: getattr(loads.get(r), "num_prompt_tokens", None) for r in named
+                }
+            if self._guards_landing():
+                loads = self._loads()
+                keep = []
+                for req_id in named:
+                    request = loads.pop(req_id, None)
+                    if request is not None and request.is_finished():
+                        self._failed_on_some_rank.append(req_id)
+                    else:
+                        keep.append(req_id)
+                named = keep
+                # Requests that finished before landing never get named.
+                for req_id in [r for r, q in loads.items() if q.is_finished()]:
+                    loads.pop(req_id)
+            meta.qwen_repack_req_ids = named
+            meta.qwen_drop_req_ids = self._failed_on_some_rank
+            if land_log is not None:
+                now = time.time()
+                land_log.forget(self._failed_on_some_rank)
+                land_log.named(named, now, prompt_tokens)
+                for record in land_log.scheduled(
+                    getattr(scheduler_output, "num_scheduled_tokens", None), now
+                ):
+                    logger.info("%s", pd_landing_log.dumps(record))
+            self._landed_on_all_ranks, self._failed_on_some_rank = [], []
+        return meta
+
+    def _landing_timeline(self):
+        """QWEN4_EXP_PD_LANDING_LOG on a staged decode's scheduler (log-only),
+        else None. Created on first use, like ``_loads``."""
+        if not getattr(self, "_sync_repack", False):
+            return None
+        if "_land_log" not in self.__dict__:
+            self._land_log = (
+                pd_landing_log.LandingTimeline() if pd_landing_log.every() > 0 else None
+            )
+        return self._land_log
+
+    def start_load_kv(self, *args, **kwargs) -> None:
+        worker = self.connector_worker
+        staging = getattr(worker, "_staging", None) if worker is not None else None
+        advance = getattr(staging, "advance_quarantine", None)
+        if advance is not None:
+            # Staging pages released QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS steps
+            # ago are free again, before this step's repacks and admission.
+            advance()
+        steps = worker._kvconn_steps() if hasattr(worker, "_kvconn_steps") else None
+        repack_ms = None
+        if _s3a.SUBMARKS and self._sync_repack and worker is not None:
+            # q38 L6-S3ASYNC sub-mark: the sync repack's share of ~kc_start_load.
+            t_m = time.perf_counter_ns()
+            self._start_load_repack(worker, steps)
+            _hp.charge("s3_repack", time.perf_counter_ns() - t_m)
+            repack_ms = getattr(self, "_s3a_repack_ms", None)
+        elif self._sync_repack and worker is not None:
+            # Before this step's forward, so a request admitted in this step
+            # reads its repacked pages.
+            meta = self._connector_metadata
+            names = getattr(meta, "qwen_repack_req_ids", ())
+            drop = getattr(meta, "qwen_drop_req_ids", ())
+            if steps is None:
+                worker.repack_landed(names, drop=drop)
+            else:
+                _, ms = pd_landing_log.timed(
+                    lambda: worker.repack_landed(names, drop=drop), time.perf_counter
+                )
+                repack_ms = ms if (names or drop) else None
+        worker_ = self.connector_worker
+        if (
+            worker_ is not None
+            and not kwargs.get("wait_for_completion", False)
+            and _s3a.defer_configured()
+            and _s3a.defer_on()
+            and hasattr(worker_, "s3d_issue")
+            and worker_.s3d_issue(self._connector_metadata)
+        ):
+            # q38 L6-S3ASYNC S3-DEFER-AR. The deferral is Benliang Wang's
+            # QWEN4_EXP_PD_DEFER_LOAD_SUBMIT (benliangw/q38fh-integ-pin-5b44702aea,
+            # 09b6990cb), credited: the step's loads are not read by its own forward
+            # (they land in staging and are repacked in a later step), so the submit
+            # and its CPU-group collectives wait for the forward dispatch
+            # (submit_deferred_loads). s3d_issue has already issued the pass's
+            # admission all-reduce (async), so it runs during the dispatch.
+            self._s3d_deferred = (args, kwargs)
+            return
+        if steps is None:
+            super().start_load_kv(*args, **kwargs)
+            return
+        _, load_ms = pd_landing_log.timed(
+            lambda: super(Qwen4ExpRaidenConnector, self).start_load_kv(*args, **kwargs),
+            time.perf_counter,
+        )
+        record = steps.add(repack_ms, load_ms)
+        if record is not None:
+            logger.info("%s", pd_landing_log.dumps(record))
+
+    _s3d_deferred: tuple | None = None
+
+    def submit_deferred_loads(self) -> bool:
+        """Submits the loads start_load_kv deferred in this step, once (S3-DEFER-AR).
+
+        Ported from Benliang Wang's submit_deferred_loads (benliangw/q38fh-integ-pin-5b44702aea,
+        09b6990cb), credited: the runner calls it after the step's forward and sampling
+        dispatch and again before polling for finished transfers (the poll clears the
+        metadata), so a step without a forward submits at the poll and a submit-time
+        failure still reaches the same step's output. Every rank reaches both call sites
+        in the same order, so the submit's CPU-group collectives stay paired across ranks.
+        Returns whether a deferred submit ran."""
+        pending = self._s3d_deferred
+        if pending is None:
+            return False
+        self._s3d_deferred = None
+        args, kwargs = pending
+        super().start_load_kv(*args, **kwargs)
+        return True
+
+    def _start_load_repack(self, worker, steps) -> None:
+        """start_load_kv's sync-repack block, verbatim (the S3 sub-mark path)."""
+        meta = self._connector_metadata
+        names = getattr(meta, "qwen_repack_req_ids", ())
+        drop = getattr(meta, "qwen_drop_req_ids", ())
+        self._s3a_repack_ms = None
+        if steps is None:
+            worker.repack_landed(names, drop=drop)
+        else:
+            _, ms = pd_landing_log.timed(
+                lambda: worker.repack_landed(names, drop=drop), time.perf_counter
+            )
+            self._s3a_repack_ms = ms if (names or drop) else None
+
+    @staticmethod
+    def _build_stage3_transfer_groups(
+        config: KVCacheConfig,
+    ) -> tuple[_Stage3TransferGroup, ...]:
+        from .pd_staging import draft_hold_group_indices
+
+        # q38 F2-HOLD: an F2 producer's held draft groups (empty otherwise).
+        held = draft_hold_group_indices(config.kv_cache_groups)
+        return tuple(
+            _Stage3TransferGroup(
+                cache_group_index=group.group_index,
+                page_tokens=group.block_size,
+                request_state=group.extent is TransferExtent.REQUEST_STATE,
+                positional_state=group.positional_state,
+                speculative_blocks=_speculative_blocks(
+                    config.kv_cache_groups[group.group_index]
+                )
+                if group.extent is TransferExtent.REQUEST_STATE
+                else 0,
+                leading_null_pages_ok=group.group_index in held,
+            )
+            for group in build_transfer_groups(config.kv_cache_groups)
+        )
+
+    # The worker plans per-group suffix pages for decode-local prefix hits
+    # (token groups clip their local prefix, request-state groups move whole).
+    supports_stage3_grouped_prefix_loads = True
+
+    @staticmethod
+    def _supports_stage3_grouped_transfer() -> bool:
+        return True
+
+    @staticmethod
+    def _raiden_worker_type() -> type[TPURaidenConnectorWorker]:
+        return Qwen4ExpRaidenWorker
+
+    @property
+    def supports_divergent_local_hybrid_hits(self) -> bool:
+        """A caching consumer adopts only token pages from its local cache.
+
+        Every load moves the request-state pages whole (GDN, PLE and ring at
+        the published extent; ``supports_stage3_grouped_prefix_loads``), so
+        a local hit needs no GDN/PLE checkpoint at its boundary: only the
+        attention groups' cached prefix
+        (``core.divergent_hybrid_hits``). With MTP no exact decode-boundary
+        state exists, and a handoff at ``prompt - 1`` lands its state off any
+        block boundary, so a hit that needed a local state would never
+        occur. ``QWEN4_EXP_PD_DIVERGENT_HITS=0`` restores that requirement.
+        """
+        return (
+            getattr(self, "_qwen_divergent_hits", False)
+            and super().supports_divergent_local_hybrid_hits
+        )
+
+    if _REQUEST_LEVEL_LOAD_FAILURES:
+
+        def get_transfer_results(self, finished_req_ids: set[str]):
+            from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+                KVConnectorTransferResults,
+            )
+
+            worker = self.connector_worker
+            assert worker is not None
+            sending, recving = worker.get_finished(finished_req_ids)
+            return KVConnectorTransferResults(
+                finished_sending=set(sending or ()),
+                finished_recving=set(recving or ()),
+                failed_recving=set(getattr(worker, "last_failed_recving", ())),
+            )
+
+        def get_block_ids_with_load_errors(self) -> set[int]:
+            # Drained so they do not accumulate; the failure is reported per
+            # request by get_transfer_results instead.
+            super().get_block_ids_with_load_errors()
+            return set()
+
+
+class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
+    """Whole-page transport over the shared Stage-3 request lifecycle.
+
+    Native admission binds ``_qwen_page_plan`` after validating the loaded
+    model identity and measured layout.
+    """
+
+    def __init__(self, vllm_config: VllmConfig):
+        super().__init__(vllm_config)
+        self._qwen_page_plan: QwenPagePlan | None = None
+        self._qwen_semantics: dict[str, Any] | None = None
+        # QWEN4_EXP_PD_ROUTED_DST (pd_route): set at admission on a pipeline
+        # producer and on a staged consumer; None broadcasts as before.
+        self._qwen_route = None
+        # QWEN4_EXP_PD_SHARED_COMPRESSED (pd_shared_compressed) on either leg.
+        self._qwen_shared = None
+        self.last_failed_recving: set[str] = set()
+        # QWEN4_EXP_PD_SYNC_REPACK: destination req id -> (uuid, group tables,
+        # tokens) of a load whose bytes landed on this rank and whose repack
+        # waits for the step the scheduler names it in (repack_landed).
+        self._sync_repack = sync_repack_enabled()
+        self._sync_on = sync_repack_on
+        self._pending_repacks: dict[str, tuple[int, list[list[int]], int]] = {}
+
+    def get_finished(self, finished_req_ids: set[str] | None = None):
+        failed_before = set(self._failed_recving)
+        sending, recving = super().get_finished(finished_req_ids)
+        self.last_failed_recving = set(recving) & (
+            failed_before | self._failed_recving
+        )
+        if self.last_failed_recving:
+            logger.warning(
+                "Qwen4ExpRaidenWorker rank%d --> KV loads failed for %s; "
+                "they will be recomputed locally",
+                self.tp_rank,
+                sorted(self.last_failed_recving),
+            )
+        return sending, recving
+
+    def register_runner(self, runner) -> None:
+        from .inputs import Qwen4ExpAdapter
+        from .pooled_cache import Qwen4ExpPooledCache
+
+        if self._raiden_transfer_engine is not None:
+            if self.runner is not runner:
+                raise ValueError("Qwen PD cannot replace an admitted model runner")
+            return
+        adapter = runner.model_adapter
+        if not isinstance(adapter, Qwen4ExpAdapter) or not isinstance(
+            adapter.cache, Qwen4ExpPooledCache
+        ):
+            raise ValueError("Qwen PD requires the model-owned native unified pool")
+        cache = adapter.cache
+        if cache.materialized is None or self.named_kv_caches is None:
+            raise ValueError("Qwen PD requires initialized and registered cache owners")
+        if set(self.named_kv_caches) != set(cache.materialized.kv_caches) or any(
+            self.named_kv_caches[name] is not value
+            for name, value in cache.materialized.kv_caches.items()
+        ):
+            raise ValueError(
+                "Qwen PD registered owner bindings differ from live caches"
+            )
+        if cache.native_config != runner.kv_cache_config:
+            raise ValueError("Qwen PD scheduler and materialized cache plans differ")
+        if not self._raiden_stage3_enabled():
+            raise ValueError("Qwen PD requires the Raiden Stage-3 transport")
+        self._validate_stage3_transfer_parallelism(self._raiden_transfer_parallelism())
+        if self._staged_consumer():
+            # A TP-T decode behind TP1 pipeline stages: Raiden lands the
+            # producer's pages in a staging carrier of the producer's geometry
+            # and every load is repacked into this rank's pool (pd_staging).
+            from .pd_staging import RankSlice, StagedConsumer
+
+            parallel = self.vllm_config.parallel_config
+            self._staging = StagedConsumer(
+                self.vllm_config,
+                cache.layout,
+                cache.get_transfer_groups(),
+                runner.kv_cache_raw_tensors[0],
+                RankSlice(
+                    tp_size=int(parallel.tensor_parallel_size),
+                    tp_rank=int(self.tp_rank),
+                    num_kv_heads=int(self.vllm_config.model_config.hf_text_config.num_key_value_heads),
+                    main_dcp=cache.layout.main_dcp,
+                ),
+                staging_bytes=int(envs.QWEN4_EXP_PD_STAGING_BYTES),
+            )
+            manifest = self._staging.manifest
+            materialize_storages(manifest)
+            plan_groups = self._staging.src_groups
+            self._qwen_route = self._staging.route
+            self._qwen_shared = self._staging.shared
+            if self._qwen_shared is not None:
+                self._enable_shared_compressed()
+            self._log_hbm_after_staging(runner)
+        else:
+            from .config import pd_prefill_mtp_producer
+
+            if pd_prefill_mtp_producer(self.vllm_config):
+                # q38 F2 option (a): the draft's groups stay out of this
+                # producer's prefix cache, as the decode's model of it assumes.
+                from .pd_staging import warn_draft_groups
+
+                warn_draft_groups(cache.native_config.kv_cache_groups, "producer")
+            self._qwen_route = self._producer_route(cache.layout)
+            self._qwen_shared = self._producer_shared(self._qwen_route)
+            manifest = build_transfer_manifest(
+                cache.native_config, cache.materialized, cache.layout
+            )
+            verify_storage_binding(
+                manifest, self.named_kv_caches, runner.kv_cache_raw_tensors
+            )
+            materialize_storages(manifest)
+            plan_groups = cache.get_transfer_groups()
+        semantics = self._collect_pd_semantics(runner)
+        # Validate physical geometry before starting any network/native manager.
+        measure_transfer_layout(manifest)
+        self.runner = runner
+        held = frozenset()
+        if not self._staged_consumer():
+            from .pd_staging import draft_hold_group_indices
+
+            # q38 F2-HOLD: the held draft groups' sends register live pages only.
+            held = draft_hold_group_indices(cache.native_config.kv_cache_groups)
+        self._qwen_page_plan = QwenPagePlan(plan_groups, manifest, held)
+        self._qwen_semantics = semantics
+        self._maybe_host_reshard_store()
+        address = _resolved_reshard_controller_address(self.dp_rank)
+        if not address:
+            raise ValueError("Qwen PD requires a Raiden controller address")
+        engine = self._construct_raiden_transfer_engine(
+            list(manifest.storages), num_slots=1
+        )
+        # QWEN4_EXP_PD_STAGING_LEASES on a producer: bounded host staging
+        # (empty kwargs register exactly as before).
+        staging_kwargs = self._qwen_staging_kwargs(manifest, int(cache.layout.block_size))
+        try:
+            summary = dict(engine.register_pools(manifest.pool_dicts(), **staging_kwargs))
+        except TypeError as exc:
+            if not staging_kwargs:
+                raise
+            summary = self._qwen_staging_fallback(engine, manifest, exc)
+        self._log_qwen_host_staging(summary, staging_kwargs)
+        summary["stage3_registration"] = self._register_raiden_stage3_work_unit(
+            engine=engine, manifest=manifest, controller_address=address
+        )
+        self._raiden_manifest = manifest
+        self._raiden_transfer_engine = engine
+        self._raiden_admission_summary = summary
+        self._after_native_registration()
+
+    def _qwen_staging_kwargs(self, manifest, block_tokens: int) -> dict:
+        """``register_pools`` keywords for bounded host staging: with
+        QWEN4_EXP_PD_STAGING_LEASES=N > 0 on a producer, an arena of N
+        max-length transfers' source pages per storage
+        (pd_manifest.qwen_staging_hints) instead of tpu_sync's full host mirror
+        of every pool. Empty (today's registration) otherwise, and always on a
+        staged consumer."""
+        leases = int(envs.QWEN4_EXP_PD_STAGING_LEASES)
+        if leases <= 0 or not self.is_producer or getattr(self, "_staging", None) is not None:
+            return {}
+        from .pd_manifest import qwen_staging_hints
+
+        hints = qwen_staging_hints(
+            manifest.pools,
+            block_tokens,
+            int(self.vllm_config.model_config.max_model_len),
+        )
+        return {"staging_leases": leases, "staging_blocks_per_pool": hints}
+
+    def _qwen_staging_fallback(self, engine, manifest, exc) -> dict:
+        """A tpu_sync without bounded staging: keep the full host mirror."""
+        logger.warning(
+            "Qwen PD producer rank%d: bounded host staging unavailable in the "
+            "installed tpu_sync (%s); keeping the full host mirror",
+            self.tp_rank,
+            exc,
+        )
+        return dict(engine.register_pools(manifest.pool_dicts()))
+
+    def _log_qwen_host_staging(self, summary: dict, staging_kwargs: dict) -> None:
+        """The engagement line a gate reads (only when bounded staging was asked)."""
+        if not staging_kwargs:
+            return
+        staging = summary.get("host_staging")
+        staging = staging if isinstance(staging, dict) else {}
+        hints = staging_kwargs.get("staging_blocks_per_pool") or [0]
+        logger.info(
+            "Qwen PD producer host staging rank%d: mode=%s leases=%s hint=%s "
+            "bounded_bytes_per_shard=%s full_mirror_bytes_per_shard=%s storages=%d",
+            self.tp_rank,
+            staging.get("mode", "unreported"),
+            staging.get("leases", staging_kwargs.get("staging_leases")),
+            hints[0],
+            staging.get("bounded_storage_bytes_per_shard"),
+            staging.get("full_storage_bytes_per_shard"),
+            len(staging.get("storages") or ()),
+        )
+
+    def _after_native_registration(self) -> None:
+        """Work that needs the native manager to hold the carrier already.
+
+        QWEN4_EXP_PD_SHARED_COMPRESSED: compile the landing gather for the
+        staging carrier's shape (read-only), so no served landing pays the
+        first-call compile. Collective, like the self-test: every TP worker
+        reaches the end of register_runner at the same point."""
+        staging = getattr(self, "_staging", None)
+        warm_v2 = getattr(staging, "warm_repack_v2", None)
+        if warm_v2 is not None:
+            # QWEN4_EXP_PD_REPACK_V2: compile every program layout now, so no
+            # served landing pays a compile (null pages only).
+            seconds = warm_v2()
+            if seconds is not None:
+                logger.info(
+                    "Qwen PD repack v2 rank%d: %d program layouts warmed in %.1f s "
+                    "(GDN owners per program %d)",
+                    self.tp_rank,
+                    len(staging.v2_null_programs()),
+                    seconds,
+                    staging._v2_gdn_pages,
+                )
+        warm_l2 = getattr(staging, "warm_repack_l2", None)
+        if warm_l2 is not None:
+            # QWEN4_EXP_PD_REPACK_L2: compile the one landing program now (null pages only).
+            seconds = warm_l2()
+            if seconds is not None:
+                logger.info(
+                    "Qwen PD repack L2 rank%d: descriptor program warmed in %.1f s",
+                    self.tp_rank,
+                    seconds,
+                )
+        if staging is None or getattr(self, "_qwen_shared", None) is None:
+            return
+        seconds = staging.warm_shared()
+        if seconds is not None:
+            logger.info(
+                "Qwen PD shared compressed keys rank%d: landing gather warmed for the "
+                "carrier shape in %.1f s",
+                self.tp_rank,
+                seconds,
+            )
+
+    def _producer_route(self, layout):
+        """QWEN4_EXP_PD_ROUTED_DST on a TP1 pipeline producer: its staged
+        consumer's geometry (decode TP, DCP, block), else None."""
+        from types import SimpleNamespace
+
+        from . import pd_route
+        from .pd_staging import route_geometry_for
+
+        parsed = pd_route.parse_route_env(envs.QWEN4_EXP_PD_ROUTED_DST)
+        if parsed is None:
+            return None
+        if not (self.is_producer and _engine_is_pipeline(self.vllm_config)):
+            raise ValueError(
+                "QWEN4_EXP_PD_ROUTED_DST routes a TP1 pipeline producer to a staged "
+                "TP>1 decode; this engine is neither"
+            )
+        tp, dcp, block = parsed
+        return route_geometry_for(
+            self.vllm_config,
+            layout,
+            SimpleNamespace(block_size=block, token_bytes=layout.token_bytes),
+            SimpleNamespace(tp_size=tp, main_dcp=dcp),
+        )
+
+    @staticmethod
+    def _producer_shared(route):
+        """QWEN4_EXP_PD_SHARED_COMPRESSED on a producer: its routed decode's
+        shared geometry (the decode must run it too; the fingerprint pins
+        it), else None."""
+        from . import pd_shared_compressed
+
+        if not pd_shared_compressed.enabled():
+            return None
+        if route is None:
+            raise ValueError(
+                "QWEN4_EXP_PD_SHARED_COMPRESSED routes compressed keys over "
+                "QWEN4_EXP_PD_ROUTED_DST; set it on both legs"
+            )
+        return pd_shared_compressed.geometry_for(route)
+
+    def _tp_cpu_group(self):
+        return get_tp_group().cpu_group
+
+    def _enable_shared_compressed(self) -> None:
+        """The decode half of QWEN4_EXP_PD_SHARED_COMPRESSED: refuse a decode
+        without L1, then allocate the landing buffers and compile and check
+        the all-gather of every bucket. Collective: every TP worker reaches
+        register_runner at the same point of its startup (3eeddf339's
+        head-unique setup relies on the same)."""
+        import faulthandler
+
+        from . import pd_shared_compressed
+
+        parallel = self.vllm_config.parallel_config
+        pd_shared_compressed.check_admissible(
+            tp_size=int(parallel.tensor_parallel_size),
+            sync_repack=bool(envs.QWEN4_EXP_PD_SYNC_REPACK),
+            sync_repack_ab_s=int(envs.QWEN4_EXP_PD_SYNC_REPACK_AB_S),
+        )
+        # A peer that never arrives would hang the self-test's all-gather:
+        # dump every stack and exit instead.
+        faulthandler.dump_traceback_later(600, exit=True)
+        try:
+            self._staging.enable_shared(get_tp_group(), int(self.tp_rank))
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+        logger.info(
+            "Qwen PD shared compressed keys rank%d: landing buffers %.1f MiB, "
+            "buckets %s self-tested",
+            self.tp_rank,
+            self._staging.landing.buffer_bytes / 2**20,
+            list(pd_shared_compressed.GATHER_PAGE_BUCKETS),
+        )
+
+    def _staged_consumer(self) -> bool:
+        """A TP>1 consumer of TP1 pipeline stages (per-layer pool tags)."""
+        return (
+            not self.is_producer and _use_per_layer_pool_tags() and int(self.tp_size) > 1
+        )
+
+    def _stage3_reserve_destination(self, destination_req_id, req_meta, tp_group) -> bool:
+        staging = getattr(self, "_staging", None)
+        if staging is None:
+            return True
+        ok = staging.reserve(
+            int(req_meta.uuid),
+            int(req_meta.num_tokens),
+            tp_group,
+            skip_tokens=int(getattr(req_meta, "skip_tokens", 0) or 0),
+            draft_zero_until=int(getattr(req_meta, "src_cached_tokens", 0) or 0),
+        )
+        if not ok:
+            # The load parks and is re-attempted each step until room frees
+            # (or the wait budget ends; the connector logs that fallback).
+            logger.debug(
+                "Qwen PD staging full (%d pages): req=%s waits", staging.pages, destination_req_id
+            )
+        return ok
+
+    def _log_hbm_after_staging(self, runner) -> None:
+        """One line per rank with the device's HBM after the staging carrier.
+
+        The carrier is allocated here, after the KV pool is sized and after
+        the worker's ``Memory statistics`` line, and it is not part of the
+        connector HBM reserve; this is the only record of the margin a larger
+        ``QWEN4_EXP_PD_STAGING_BYTES`` would eat (XFER L4)."""
+        staging = self._staging
+        try:
+            device = getattr(runner, "device", None) or torch.device("tpu")
+            free, limit = torch.accelerator.get_memory_info(device)
+            logger.info(
+                "Qwen PD staging carrier rank%d: %d pages, %.2f GiB requested | HBM after the "
+                "carrier: used %.2f GiB of %.2f GiB, free %.2f GiB",
+                self.tp_rank,
+                staging.pages,
+                int(envs.QWEN4_EXP_PD_STAGING_BYTES) / 2**30,
+                (limit - free) / 2**30,
+                limit / 2**30,
+                free / 2**30,
+            )
+        except Exception as exc:  # observability only; never block the load path
+            logger.info("Qwen PD staging carrier rank%d: HBM unavailable (%s)", self.tp_rank, exc)
+
+    # --- QWEN4_EXP_PD_BATCHED_ADMISSION hooks (distributed/kv_transfer/stage3_admission.py) ---
+
+    def _stage3_admission_free_map(self):
+        staging = getattr(self, "_staging", None)
+        return None if staging is None else staging.free
+
+    def _stage3_reserve_destination_reduced(self, req_meta, reduced_free) -> bool:
+        staging = getattr(self, "_staging", None)
+        if staging is None:
+            return True
+        return staging.reserve(
+            int(req_meta.uuid),
+            int(req_meta.num_tokens),
+            skip_tokens=int(getattr(req_meta, "skip_tokens", 0) or 0),
+            reduced_free=reduced_free,
+            draft_zero_until=int(getattr(req_meta, "src_cached_tokens", 0) or 0),
+        )
+
+    def s3a_reserve(self, req_meta, reduced_free) -> bool:
+        """q38 L6-S3ASYNC coordinator: ``_stage3_reserve_destination_reduced``
+        through ``stage3_async.fast_reserve`` (same arguments, same tables)."""
+        staging = getattr(self, "_staging", None)
+        if staging is None:
+            return True
+        return _s3a.fast_reserve(
+            staging,
+            int(req_meta.uuid),
+            int(req_meta.num_tokens),
+            skip_tokens=int(getattr(req_meta, "skip_tokens", 0) or 0),
+            reduced_free=reduced_free,
+            draft_zero_until=int(getattr(req_meta, "src_cached_tokens", 0) or 0),
+        )
+
+    def _stage3_destination_pages_needed(self, req_meta) -> int:
+        staging = getattr(self, "_staging", None)
+        if staging is None:
+            return 0
+        return staging.pages_needed(
+            int(req_meta.uuid),
+            int(req_meta.num_tokens),
+            skip_tokens=int(getattr(req_meta, "skip_tokens", 0) or 0),
+        )
+
+    def _stage3_admission_snapshot(self):
+        staging = getattr(self, "_staging", None)
+        if staging is None:
+            return None
+        return (
+            staging.free.clone(),
+            dict(staging.reservations),
+            dict(staging.skips),
+            dict(getattr(staging, "tokens", {})),
+            dict(staging.__dict__.get("draft_zero", {})),
+        )
+
+    def _stage3_admission_restore(self, saved) -> None:
+        staging = getattr(self, "_staging", None)
+        if staging is None or saved is None:
+            return
+        free, reservations, skips = saved[:3]
+        staging.free.copy_(free)
+        staging.reservations.clear()
+        staging.reservations.update(reservations)
+        staging.skips.clear()
+        staging.skips.update(skips)
+        if len(saved) > 3 and hasattr(staging, "tokens"):
+            staging.tokens.clear()
+            staging.tokens.update(saved[3])
+        if len(saved) > 4:
+            draft_zero = staging.__dict__.setdefault("draft_zero", {})
+            draft_zero.clear()
+            draft_zero.update(saved[4])
+
+    def _stage3_finish_destination(self, destination_req_id, ok) -> None:
+        staging = getattr(self, "_staging", None)
+        if staging is None:
+            return
+        if not ok:
+            # Cleaned up (aborted, failed or finished) before the scheduler
+            # named it for the synchronized repack: free its staging pages.
+            pending = self._pending_repacks.pop(destination_req_id, None)
+            if pending is not None:
+                staging.release(pending[0])
+                return
+        req_meta = self._stage3_submitted_load_metas.get(destination_req_id)
+        if req_meta is None or int(req_meta.uuid) not in staging.reservations:
+            return
+        uuid = int(req_meta.uuid)
+        if ok and self._sync_repack and self._sync_on():
+            # Keep the staged pages; every rank repacks in the step the
+            # scheduler names this load in, after it landed on all of them.
+            tables = [list(table) for table in req_meta.group_block_ids]
+            pending = (uuid, tables, int(req_meta.num_tokens))
+            if (
+                getattr(staging, "_v2_gdn_pages", 0)
+                and getattr(staging, "shared", None) is None
+                and bool(envs.QWEN4_EXP_PD_REPACK_PLAN_AT_LAND)
+            ):
+                # QWEN4_EXP_PD_REPACK_V2 + _PLAN_AT_LAND (F3): plan now, from the
+                # same snapshot, so the named step only dispatches the programs.
+                pending += (staging.plan_repack(uuid, tables, int(req_meta.num_tokens)),)
+            self._pending_repacks[destination_req_id] = pending
+            return
+        try:
+            if ok:
+                staging.repack(uuid, req_meta.group_block_ids, int(req_meta.num_tokens))
+        finally:
+            staging.release(uuid)
+
+    def repack_landed(self, req_ids, drop=()) -> None:
+        """Repack the named loads (QWEN4_EXP_PD_SYNC_REPACK). The scheduler
+        names a load only once every rank reported it landed, and every rank
+        receives the same names in the same step. ``drop``: loads that
+        failed on some rank; their staged pages are freed unrepacked."""
+        staging = getattr(self, "_staging", None)
+        if staging is None:
+            return
+        for req_id in drop:
+            pending = self._pending_repacks.pop(req_id, None)
+            if pending is not None:
+                staging.release(pending[0])
+        names = list(req_ids)
+        if getattr(staging, "shared", None) is not None:
+            self._repack_landed_shared(staging, names)
+            return
+        if not self._sync_on():
+            # An off period of the A/B: loads deferred in the last on period
+            # repack now, before any of them can be scheduled.
+            names += [r for r in self._pending_repacks if r not in names]
+        for req_id in names:
+            pending = self._pending_repacks.pop(req_id, None)
+            if pending is None:
+                # Repacked on landing (an off period of the A/B), never staged
+                # on this rank, or cleaned up first: not this repack's pages.
+                if int(envs.QWEN4_EXP_PD_SYNC_REPACK_AB_S) <= 0:
+                    logger.warning(
+                        "Qwen4ExpRaidenWorker rank%d --> no staged load to repack for %s",
+                        self.tp_rank,
+                        req_id,
+                    )
+                continue
+            uuid, tables, num_tokens = pending[:3]
+            plan = pending[3] if len(pending) > 3 else None
+            try:
+                if self._kvconn_steps() is not None:
+                    self._repack_logged(staging, req_id, uuid, tables, num_tokens, plan)
+                elif plan is not None:
+                    staging.run_repack(plan)
+                else:
+                    staging.repack(uuid, tables, num_tokens)
+            finally:
+                staging.release(uuid)
+
+    def _kvconn_steps(self):
+        """QWEN4_EXP_PD_LANDING_LOG on TP rank 0 of a staged decode (log-only),
+        else None. Created on first use."""
+        if "_kvconn" not in self.__dict__:
+            n = pd_landing_log.every()
+            self._kvconn = (
+                pd_landing_log.KvConnectorSteps(n, rank=0)
+                if n > 0 and getattr(self, "tp_rank", 0) == 0
+                and getattr(self, "_sync_repack", False)
+                else None
+            )
+        return self._kvconn
+
+    def _repack_logged(self, staging, req_id, uuid, tables, num_tokens, plan=None) -> None:
+        """``staging.repack`` (which is exactly run_repack(plan_repack(...)))
+        with its two halves timed on the host, and one landing line. A plan
+        made at landing (QWEN4_EXP_PD_REPACK_V2's F3) logs plan_ms -1."""
+        skip = int(staging.skips.get(uuid, (0, None))[0])
+        if plan is None:
+            plan, plan_ms = pd_landing_log.timed(
+                lambda: staging.plan_repack(uuid, tables, num_tokens), time.perf_counter
+            )
+        else:
+            plan_ms = -1.0
+        _, run_ms = pd_landing_log.timed(lambda: staging.run_repack(plan), time.perf_counter)
+        logger.info(
+            "%s",
+            pd_landing_log.dumps(
+                pd_landing_log.landing_record(
+                    req_id, uuid, num_tokens, skip,
+                    getattr(plan, "rows", ()) or getattr(staging, "last_plan_rows", (0, 0, 0)),
+                    len(plan.chunks), plan_ms, run_ms,
+                )
+            ),
+        )
+
+    def _repack_landed_shared(self, staging, names) -> None:
+        """``repack_landed`` under QWEN4_EXP_PD_SHARED_COMPRESSED, whose
+        landing runs TP all-gathers: every rank must run the same loads'
+        passes in the same order. So (1) the ranks agree, in one CPU MIN
+        all-reduce, on which named loads all of them still hold, and drop the
+        rest on every rank; (2) every load's passes and chunks are planned
+        before the first collective; (3) the landings run in name order."""
+        from . import pd_shared_compressed
+
+        present = [name in self._pending_repacks for name in names]
+        agreed = pd_shared_compressed.agree_named_loads(present, self._tp_cpu_group())
+        loads = []
+        for name, keep in zip(names, agreed):
+            pending = self._pending_repacks.pop(name, None)
+            if keep:
+                loads.append((name, pending))
+                continue
+            if pending is not None:
+                staging.release(pending[0])
+            logger.error(
+                "Qwen4ExpRaidenWorker rank%d --> %s is not staged on every rank (here: %s); "
+                "dropped on all ranks without its landing gather",
+                self.tp_rank,
+                name,
+                "staged" if pending is not None else "absent",
+            )
+        plans = []
+        try:
+            for name, (uuid, tables, num_tokens) in loads:
+                plans.append((uuid, staging.plan_repack(uuid, tables, num_tokens)))
+        except BaseException:
+            for _, (uuid, _, _) in loads:
+                staging.release(uuid)
+            raise
+        for i, (uuid, plan) in enumerate(plans):
+            try:
+                staging.run_repack(plan)
+            except BaseException:
+                for later, _ in plans[i + 1 :]:
+                    staging.release(later)
+                raise
+            finally:
+                staging.release(uuid)
+
+    def _ensure_raiden_transfer_engine(self):
+        if self._raiden_transfer_engine is None:
+            raise RuntimeError("Qwen PD native admission must finish before transfer")
+        return self._raiden_transfer_engine
+
+    def _collect_pd_semantics(self, runner) -> dict[str, Any]:
+        from .pd_staging import draft_hold_enabled, draft_kv_enabled
+
+        model = runner.model_adapter.cache.model
+        if model.pd_gdn_qk_pair_layout != envs.TPU_GDN_CONV_QK_PAIR_LAYOUT:
+            raise ValueError("Qwen PD GDN layout changed since model construction")
+        scales = []
+        # This pipeline stage's own layers (all of them without PP).
+        for index in model.model.stage:
+            layer = model.model.layers[index]
+            if layer.layer_type == "full_attention":
+                attention = layer.self_attn
+                k, v = attention._k_scale_float, attention._v_scale_float
+                if not all(math.isfinite(x) and x > 0 for x in (k, v)):
+                    raise ValueError(
+                        "Qwen PD requires finite positive loaded FP8 scales"
+                    )
+                if k != float(attention._k_scale_cpu.item()) or v != float(
+                    attention._v_scale_cpu.item()
+                ):
+                    raise ValueError(
+                        "Qwen PD FP8 kernel scales differ from loaded buffers"
+                    )
+                scales.append((index, k, v))
+        parallel = self.vllm_config.parallel_config
+        group = get_ep_group() if parallel.enable_expert_parallel else get_tp_group()
+        config = model.config.to_dict()
+        for name in ("_name_or_path", "_commit_hash", "transformers_version"):
+            config.pop(name, None)
+        record = dict(
+            rank=group.rank_in_group,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            checkpoint=model.pd_loaded_weight_identity,
+            ple_checkpoint=model.pd_loaded_ple_identity,
+            config=config,
+            kv_scales=scales,
+            state_flags=dict(
+                gdn_qk_pair=model.pd_gdn_qk_pair_layout,
+                expert_parallel=parallel.enable_expert_parallel,
+                ssm_dtype=str(self.vllm_config.cache_config.mamba_ssm_cache_dtype),
+                cp=1,
+                pp=1,
+                mtp=False,
+                # Prefix caching is a per-leg choice: the pages that cross are
+                # the same encoding either way (a positional state table ships
+                # its running-state page), so it is not part of the identity.
+                # QWEN4_EXP_PD_DRAFT_KV (q38 F2) is not: the producer then
+                # ships draft owners the decode must land, so a one-sided flag
+                # fails the handshake. Present only when on, so the identity
+                # with the flag off is unchanged.
+                **({"mtp_draft_kv": True} if draft_kv_enabled() else {}),
+                # QWEN4_EXP_PD_DRAFT_HOLD (q38 F2-HOLD) changes what the
+                # producer registers for its draft's pages below each hit, so
+                # it must match too. Present only when on.
+                **({"mtp_draft_hold": True} if draft_hold_enabled() else {}),
+            ),
+        )
+        records: list[Any] = [None] * group.world_size
+        torch.distributed.all_gather_object(records, record, group=group.cpu_group)
+        return canonical_rank_identity(records, world_size=group.world_size)
+
+    def _measure_stage3_layout(self, manifest) -> tuple[str, dict[str, Any], int]:
+        if self._qwen_semantics is None:
+            raise RuntimeError("Qwen PD loaded-state identity has not been admitted")
+        _, layout = measure_transfer_layout(manifest)
+        if self._qwen_route is not None:
+            if not _use_per_layer_pool_tags():
+                raise ValueError("QWEN4_EXP_PD_ROUTED_DST needs TPU_RAIDEN_POOL_TAGS_PER_LAYER=1")
+            payload = dict(
+                layout=_routed_layout(
+                    _owner_invariant_layout(layout),
+                    self._qwen_route,
+                    shared=getattr(self, "_qwen_shared", None) is not None,
+                ),
+                semantics=_owner_invariant_semantics(self._qwen_semantics),
+            )
+        elif _use_per_layer_pool_tags():
+            payload = dict(
+                layout=_owner_invariant_layout(layout),
+                semantics=_owner_invariant_semantics(self._qwen_semantics),
+            )
+        else:
+            payload = dict(layout=layout, semantics=self._qwen_semantics)
+        token_sizes = {
+            g.block_size
+            for g in self._page_plan().groups
+            if g.extent is TransferExtent.TOKEN_PAGES
+        }
+        if len(token_sizes) != 1:
+            raise ValueError("Qwen PD requires one native token-page size")
+        fingerprint = canonical_layout_fingerprint(payload)
+        # Per-field digests, so a peer mismatch names the field that differs.
+        fields = {
+            f"layout.{k}": v for k, v in payload["layout"].items()
+        } | {f"semantics.{k}": v for k, v in payload["semantics"].items()}
+        logger.info(
+            "Qwen PD rank%d layout fingerprint %s fields %s carriers %s",
+            self.tp_rank,
+            fingerprint[:12],
+            {k: canonical_layout_fingerprint({"v": v})[:12] for k, v in fields.items()},
+            json.dumps(payload["layout"].get("carriers"), sort_keys=True)[:600],
+        )
+        return fingerprint, payload, token_sizes.pop()
+
+    def _validate_stage3_transfer_parallelism(self, transfer_parallelism: int) -> None:
+        from .config import pd_prefill_mtp_producer
+
+        parallel = self.vllm_config.parallel_config
+        pp = int(parallel.pipeline_parallel_size or 1)
+        if pp > 1:
+            # A pipeline producer: one transfer unit per TP1 stage.
+            units = self.is_producer and self.tp_size == 1 and transfer_parallelism == pp
+        elif _use_per_layer_pool_tags() and not self.is_producer:
+            # A consumer of pipeline stages pulls every stage's layers: whole
+            # pages at TP1, through the staging repack at TP>1.
+            units = True
+        else:
+            # Matching TP: producer rank k ships its pages to decode rank k.
+            units = transfer_parallelism == self.tp_size
+        if (
+            not units
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+            or (
+                self.vllm_config.speculative_config is not None
+                and (self.is_producer or self.tp_size == 1)
+                and not pd_prefill_mtp_producer(self.vllm_config)
+            )
+        ):
+            raise ValueError(
+                "Qwen PD requires matching TP (or a TP1 pipeline producer with "
+                "a TP1 consumer), CP1 and MTP off (but on a staged TP>1 decode, "
+                "or prefill-only MTP K=1 on a TP1 pipeline producer with "
+                "QWEN4_EXP_PD_DRAFT_KV=1)"
+            )
+
+    def _raiden_interleave_tokens(
+        self, page_tokens: int, transfer_parallelism: int
+    ) -> int:
+        self._validate_stage3_transfer_parallelism(transfer_parallelism)
+        return page_tokens
+
+    @staticmethod
+    def _uses_stage3_grouped_pages() -> bool:
+        return True
+
+    def _local_raiden_transfer_rank(self) -> int:
+        if _engine_is_pipeline(self.vllm_config):
+            # The stage index (TP1 stages, no PCP).
+            return super()._local_raiden_transfer_rank()
+        return int(self.tp_rank)
+
+    def _page_plan(self) -> "QwenPagePlan":
+        if self._qwen_page_plan is None:
+            raise RuntimeError("Qwen PD native page admission has not completed")
+        self._validate_stage3_transfer_parallelism(self._raiden_transfer_parallelism())
+        if not _engine_is_pipeline(self.vllm_config) and (
+            self._local_raiden_transfer_rank() != self.tp_rank
+        ):
+            raise ValueError("Qwen PD requires matching TP rank ownership")
+        return self._qwen_page_plan
+
+    def _stage3_grouped_spans(
+        self, req_meta: SendMeta, num_tokens: int
+    ) -> tuple[tuple[tuple[int, ...], ...], list[PoolSpanRegistration]]:
+        plan = self._page_plan()
+        # A pipeline stage behind a larger scheduler block-ID space reads its
+        # own groups' pages through the stage map; the request's tables, the
+        # controller's block list and every replay check stay in block IDs.
+        translate = getattr(
+            getattr(self, "runner", None), "qwen4_stage_page_map", None
+        )
+        translate = None if translate is None else translate.lookup
+        # q38 F2-HOLD: a held draft group's pages come without its leading null
+        # blocks (heads); every span below keeps the full request-global
+        # destination layout and reads those positions from a live page.
+        pages, heads = plan.request_pages_and_heads(
+            req_meta.group_block_ids, num_tokens, translate
+        )
+        # Logged with the registration (raiden_stage3_grouped_request_blocks_registered
+        # "held_pages"), whose group_pages count the live pages only.
+        self._stage3_held_heads = heads if any(heads) else None
+        if tuple(req_meta.local_block_ids) != pages[0]:
+            raise ValueError("Qwen PD primary pages differ from the full group table")
+        # A producer serving a caching decode declares its token pages in the
+        # request-global destination byte space (dst_space_version=1), page i
+        # at i * stride, which the controller splits at destination pages and
+        # can clip at a decode-local prefix (dst_skip_bytes). Request-state
+        # pages stay page-indexed (version 0) and always move whole.
+        clippable = int(envs.TPU_RAIDEN_HANDOFF_ALIGN_TOKENS) > 0
+        # An unpacked compressed-key page holds one layer's keys for the page's
+        # tokens in its first block_size / 128 kernel pages (12% of a TP1
+        # stage's 3200-token page); the rest is padding. Send only the keys.
+        from .pd_manifest import compressed_live_bytes
+
+        compressed_bytes = compressed_live_bytes(self.runner.model_adapter.cache.layout)
+        trim_compressed = compressed_bytes is not None
+        if self._qwen_route is not None:
+            return pages, self._routed_spans(
+                plan, pages, num_tokens, translate, compressed_bytes, heads
+            )
+        from .pd_route import held_ordinal
+
+        spans = []
+        for pool, group_index in plan.pool_groups():
+            ids = pages[group_index]
+            head = heads[group_index]
+            if translate is not None:
+                ids = translate(group_index, ids)
+            size_bytes = (
+                compressed_bytes
+                if trim_compressed and pool.layer_name.endswith(".compressed_k")
+                else pool.block_stride_bytes
+            )
+            global_space = (
+                clippable
+                and plan.groups[group_index].extent is TransferExtent.TOKEN_PAGES
+            )
+            spans.append(
+                PoolSpanRegistration(
+                    tag=pool.tag,
+                    block_ids=ids,
+                    spans=tuple(
+                        PoolByteSpan(
+                            src_block_ordinal=held_ordinal(index, head),
+                            src_offset_bytes=0,
+                            dst_block_index=0 if global_space else index,
+                            # The request-global destination space counts
+                            # destination pages by their live bytes (the
+                            # controller splits it, and checks dst_skip_bytes,
+                            # in those units): a trimmed compressed-key page
+                            # is 409,600 bytes there, not its 3.2 MB stride.
+                            dst_offset_bytes=(
+                                index * size_bytes if global_space else 0
+                            ),
+                            size_bytes=size_bytes,
+                            # A pipeline stage's pages go to every decode unit
+                            # (a TP>1 decode repacks its slice); matching TP
+                            # sends rank k to rank k.
+                            dst_unit_ordinal=None
+                            if _engine_is_pipeline(self.vllm_config)
+                            else self.tp_rank,
+                        )
+                        for index in range(head + len(ids))
+                    ),
+                    declared_bytes=(head + len(ids)) * size_bytes,
+                    dst_space_version=1 if global_space else 0,
+                )
+            )
+        return pages, spans
+
+    def _routed_spans(self, plan, pages, num_tokens, translate, compressed_bytes, heads=None):
+        """QWEN4_EXP_PD_ROUTED_DST: each destination rank's slice, at its
+        compact rank-local offsets (pd_route; ``dst_space_version=1``).
+
+        ``heads`` (q38 F2-HOLD): a held draft group's leading null pages, which
+        ``pages`` omits; its spans keep the full layout and read those
+        positions from a live page (``pd_route.held_spans``)."""
+        from . import pd_route
+        from .pd_staging import owner_kind
+
+        route = self._qwen_route
+        if compressed_bytes is not None and compressed_bytes != (
+            route.pairs_per_src_page * pd_route.ROW_BYTES
+        ):
+            raise ValueError("routed compressed keys need one pair row per 2*ratio tokens")
+        registrations = []
+        for pool, group_index in plan.pool_groups():
+            ids = pages[group_index]
+            head = heads[group_index] if heads else 0
+            if translate is not None:
+                ids = translate(group_index, ids)
+            kind = owner_kind(pool.layer_name)
+            shared = getattr(self, "_qwen_shared", None)
+            if kind == "compressed" and shared is not None and shared.shared(num_tokens):
+                # QWEN4_EXP_PD_SHARED_COMPRESSED: page b of the pair space to
+                # rank b % TP only (the decode all-gathers at landing).
+                from .pd_shared_compressed import shared_spans
+
+                routed = shared_spans(num_tokens, head + len(ids), shared, pd_route.ROW_BYTES)
+            else:
+                routed = pd_route.producer_spans(kind, num_tokens, head + len(ids), route)
+            routed = pd_route.held_spans(routed, head)
+            spans = tuple(
+                PoolByteSpan(
+                    src_block_ordinal=src,
+                    src_offset_bytes=src_off,
+                    dst_block_index=0,
+                    dst_offset_bytes=dst_off,
+                    size_bytes=size,
+                    dst_unit_ordinal=unit,
+                )
+                for src, src_off, dst_off, size, unit in routed
+            )
+            registrations.append(
+                PoolSpanRegistration(
+                    tag=pool.tag,
+                    block_ids=ids,
+                    spans=spans,
+                    declared_bytes=sum(span.size_bytes for span in spans),
+                    dst_space_version=1,
+                )
+            )
+        return registrations
+
+    def _stage3_grouped_destination_pages(
+        self, req_meta: _Stage3LoadMeta, num_tokens: int
+    ) -> tuple[list[str], list[int], list[int]]:
+        """Destination pages per pool tag, in plan order.
+
+        A prefix-aware load (``skip_tokens`` > 0: the decode-local prefix
+        cache already holds that prefix of every token group) lists only each
+        token group's suffix pages, which the transfer fills from the clipped
+        source (``_stage3_dst_skip_bytes``); request-state pages move whole.
+        The adopted prefix pages are shared cache pages and never targets.
+        """
+        plan = self._page_plan()
+        if req_meta.src_parallelism != self._raiden_transfer_parallelism():
+            raise ValueError("Qwen PD needs the admitted source units")
+        skip = int(req_meta.skip_tokens or 0)
+        if skip and not self._prefix_loads_supported():
+            raise ValueError("Qwen PD prefix-aware loads are not enabled on this rank")
+        staging = getattr(self, "_staging", None)
+        if staging is not None:
+            return staging.destination(int(req_meta.uuid))
+        pages = plan.request_pages(req_meta.group_block_ids, num_tokens)
+        if tuple(req_meta.local_block_ids) != pages[0]:
+            raise ValueError("Qwen PD primary pages differ from the full group table")
+        tags, blocks, counts = [], [], []
+        for pool, group_index in plan.pool_groups():
+            ids = suffix_pages(plan.groups[group_index], pages[group_index], skip)
+            tags.append(pool.tag)
+            blocks.extend(ids)
+            counts.append(len(ids))
+        return tags, blocks, counts
+
+    @staticmethod
+    def _prefix_loads_supported() -> bool:
+        from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+            _prefix_aware_load_enabled,
+        )
+
+        return _prefix_aware_load_enabled()
+
+    def _stage3_dst_skip_bytes(
+        self, req_meta: Any, skip_tokens: int, num_tags: int, fa_tag_count: int
+    ) -> list[int]:
+        """Per-tag clips of a prefix-aware load, in the order of
+        ``_stage3_grouped_destination_pages``: each token pool skips the source
+        pages wholly inside the local prefix, request-state pools nothing."""
+        staging = getattr(self, "_staging", None)
+        if staging is not None:
+            clips = staging.skip_bytes(int(req_meta.uuid))
+        else:
+            plan = self._page_plan()
+            clips = [
+                skipped_source_pages(plan.groups[group_index], skip_tokens)
+                * _live_page_bytes(pool)
+                for pool, group_index in plan.pool_groups()
+            ]
+        if len(clips) != num_tags or num_tags != fa_tag_count:
+            raise ValueError(
+                "Qwen PD clips must cover every grouped transfer tag: "
+                f"clips={len(clips)}, tags={num_tags}, grouped={fa_tag_count}"
+            )
+        return clips
+
+
+def _live_page_bytes(pool) -> int:
+    """A pool page's live bytes: its single leading region's unit (a trimmed
+    compressed-key page's keys), else the whole stride. The request-global
+    destination byte space and its dst_skip_bytes clips are in these units."""
+    regions = getattr(pool, "regions", ()) or ()
+    if len(regions) == 1 and getattr(regions[0], "num_units", 1) == 1:
+        return int(regions[0].unit_bytes)
+    return int(pool.block_stride_bytes)
+
+
+def _speculative_blocks(group) -> int:
+    """Speculative state checkpoints of a request-state cache group."""
+    spec = group.kv_cache_spec
+    specs = (
+        tuple(spec.kv_cache_specs.values())
+        if hasattr(spec, "kv_cache_specs")
+        else (spec,)
+    )
+    depths = {int(getattr(s, "num_speculative_blocks", 0) or 0) for s in specs}
+    if len(depths) != 1:
+        raise ValueError("A Qwen PD state group needs one speculative depth")
+    return depths.pop()
+
+
+def _owner_invariant_layout(layout: dict[str, Any]) -> dict[str, Any]:
+    """The page encoding without the owner list or carrier count.
+
+    Under per-layer tags the peers hold different owner subsets of one
+    whole-model plan (a pipeline stage its layers, the decode every layer):
+    carriers and tags differ, while every page must encode the same way. The
+    controller pairs pools by tag; this pins the encoding they share.
+    """
+
+    def unique(items):
+        encoded = {json.dumps(item, sort_keys=True) for item in items}
+        return [json.loads(item) for item in sorted(encoded)]
+
+    return dict(
+        schema="qwen4-whole-fp8-page-layout-v2",
+        torch_tpu=layout["torch_tpu"],
+        libtpu=layout["libtpu"],
+        carriers=unique(layout["carriers"]),
+        pages=unique(
+            dict(block_stride_bytes=p["block_stride_bytes"], dtype_tag=p["dtype_tag"])
+            for p in layout["pools"]
+        ),
+    )
+
+
+def _routed_layout(layout: dict[str, Any], route, shared: bool = False) -> dict[str, Any]:
+    """The routed page encoding (QWEN4_EXP_PD_ROUTED_DST): the producer's
+    pages and the decode's compact staging pages differ in rows per page, so
+    both describe a carrier per 1,024-byte row and name the routing geometry
+    instead; a peer routing for a different decode fails closed."""
+
+    def per_row(carrier):
+        carrier = dict(carrier)
+        shape = list(carrier["shape_per_kernel_page"])
+        carrier["shape_per_kernel_page"] = [1] + shape[1:]
+        return carrier
+
+    encoded = {json.dumps(per_row(c), sort_keys=True) for c in layout["carriers"]}
+    tags = {json.dumps({"dtype_tag": p["dtype_tag"]}, sort_keys=True) for p in layout["pages"]}
+    return dict(
+        schema="qwen4-routed-fp8-row-layout-v1",
+        torch_tpu=layout["torch_tpu"],
+        libtpu=layout["libtpu"],
+        carriers=[json.loads(c) for c in sorted(encoded)],
+        pages=[json.loads(t) for t in sorted(tags)],
+        routed=route.key(),
+        # QWEN4_EXP_PD_SHARED_COMPRESSED changes where compressed pairs land:
+        # a peer on the other side of the flag fails closed.
+        **({"shared_compressed": 1} if shared else {}),
+    )
+
+
+def _owner_invariant_semantics(semantics: dict[str, Any]) -> dict[str, Any]:
+    """The loaded model state, without rank ownership.
+
+    A pipeline stage and a decode differ in rank count, TP size, expert
+    parallelism and the layers whose KV scales they hold; the scales come from
+    the checkpoint, whose digest is compared, and the page geometry the TP size
+    implies is in the layout half of the fingerprint (a staged TP>1 decode
+    presents the producer's geometry).
+    """
+    ranks = semantics["ranks"]
+    checkpoints = sorted({r["checkpoint"] for r in ranks})
+    if len(checkpoints) != 1:
+        raise ValueError("Qwen PD ranks loaded different checkpoints")
+    first = ranks[0]
+    flags = {k: v for k, v in first["state_flags"].items() if k != "expert_parallel"}
+    return dict(
+        schema="qwen4-loaded-state-v2",
+        checkpoint=checkpoints[0],
+        ple_checkpoint=first["ple_checkpoint"],
+        config=first["config"],
+        state_flags=flags,
+    )
+
+
+@dataclass(frozen=True)
+class QwenPagePlan:
+    groups: tuple[TransferGroup, ...]
+    manifest: PoolManifest
+    # q38 F2-HOLD: group indices whose producer tables open with null blocks
+    # (pd_staging.draft_hold_group_indices; empty on every other engine).
+    held: frozenset = frozenset()
+
+    def pool_groups(self) -> tuple[tuple[PoolEntry, int], ...]:
+        owners = {
+            name: group.group_index
+            for group in self.groups
+            for name in group.layer_names
+        }
+        names = [pool.layer_name for pool in self.manifest.pools]
+        tags = [pool.tag for pool in self.manifest.pools]
+        if (
+            len(names) != len(set(names))
+            or len(tags) != len(set(tags))
+            or set(names) != set(owners)
+        ):
+            raise ValueError("Qwen PD page plan must cover every owner exactly once")
+        return tuple((pool, owners[pool.layer_name]) for pool in self.manifest.pools)
+
+    def request_pages(
+        self,
+        tables: list[list[int]] | None,
+        num_tokens: int,
+        translate=None,
+    ) -> tuple[tuple[int, ...], ...]:
+        """The committed block IDs per group; ``translate(group, ids)``, when
+        given, maps a group's IDs to the pages checked against the carrier."""
+        return self.request_pages_and_heads(tables, num_tokens, translate)[0]
+
+    def request_pages_and_heads(
+        self,
+        tables: list[list[int]] | None,
+        num_tokens: int,
+        translate=None,
+    ) -> tuple[tuple[tuple[int, ...], ...], tuple[int, ...]]:
+        """``request_pages`` and, per group, the leading null blocks it left out
+        of a held group's pages (q38 F2-HOLD; 0 for every other group)."""
+        if tables is None or num_tokens <= 0:
+            raise ValueError("Qwen PD requires complete committed group tables")
+        heads = held_heads(self.groups, tables, self.held)
+        # The scheduler verifies actual computed == published before emitting
+        # metadata; workers consume that committed record, not a fresh model count.
+        pages = handoff_block_ids(
+            self.groups, tables, committed_tokens=num_tokens, computed_tokens=num_tokens,
+            heads=heads,
+        )
+        occupied: set[tuple[int, int]] = set()
+        for pool, group_index in self.pool_groups():
+            ids = pages[group_index]
+            if translate is not None:
+                ids = translate(group_index, ids)
+            for page in ids:
+                if page >= pool.num_blocks:
+                    raise ValueError("Qwen PD page is outside its native carrier")
+                key = (pool.storage_index, page)
+                if key in occupied:
+                    raise ValueError("Qwen PD groups overlap a physical carrier page")
+                occupied.add(key)
+        return pages, heads
