@@ -374,6 +374,17 @@ def synchronize_tensors(
     sync.synchronize(tensors=tensors, wait=wait)
 
 
+_FLOAT8_DTYPES = frozenset(
+    {
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float8_e8m0fnu,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2fnuz,
+    }
+)
+
+
 def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
     """Return a copy of `t` backed by a fresh device buffer of its own shape.
 
@@ -385,11 +396,16 @@ def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
 
     `torch.empty(...).copy_(t)` is not enough: torch_tpu may satisfy a
     same-shape, same-dtype `copy_` by aliasing the destination's storage to
-    `t`'s base buffer, which keeps the shape mismatch. On TPU the `+ 0` forces
-    a real op whose output buffer has `t`'s logical shape. Other devices get a
-    plain contiguous clone (CPU has no `add` kernel for float8 dtypes).
+    `t`'s base buffer, which keeps the shape mismatch. On TPU a real op forces
+    an output buffer of `t`'s logical shape: `+ 0`, or for float8 a round trip
+    through bfloat16, since torch_tpu 0.3.0 has no float8 `add` (casts remain).
+    Every non-NaN value comes back bit-identical. Other devices get a plain
+    contiguous clone (CPU has no `add` kernel for float8 dtypes).
     """
     out = torch.clone(t, memory_format=torch.contiguous_format)
     if out.device.type == "tpu":
-        out = out + 0
+        if out.dtype in _FLOAT8_DTYPES:
+            out = out.to(torch.bfloat16).to(out.dtype)
+        else:
+            out = out + 0
     return out
