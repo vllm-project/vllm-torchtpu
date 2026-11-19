@@ -1245,7 +1245,8 @@ def test_fused_verify_and_sample_candidates(device):
     group_indices = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device=device)
 
     req_temperatures = torch.ones((batch_size, 1), dtype=torch.bfloat16, device=device)
-    req_top_k = torch.full((batch_size, 1), 4, dtype=torch.int32, device=device)
+    # The candidate path's contract: 1 <= top_k <= num_blocks // 2.
+    req_top_k = torch.full((batch_size, 1), 1, dtype=torch.int32, device=device)
     req_top_p = torch.ones((batch_size, 1), dtype=torch.float32, device=device)
     accept_u = torch.full((total_tokens,), 0.5, dtype=torch.float32, device=device)
     u_all = torch.full(

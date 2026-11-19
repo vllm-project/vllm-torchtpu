@@ -880,7 +880,8 @@ def _fused_spec_verify_and_sample_candidates(
         )
         # Accept iff u < p(x): torch.rand can return exactly 0.0, and
         # u <= p(x) would then accept a draft with p(x) == 0 (outside the
-        # candidates or masked by top-k), as main's sampler notes.
+        # candidates or masked by top-k), as _random_rejection_sample_with_segment
+        # notes.
         accepted = torch.where(
             target_is_greedy,
             draft_token_ids_i32 == target_greedy_token_ids,

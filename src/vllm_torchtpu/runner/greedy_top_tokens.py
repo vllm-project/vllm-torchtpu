@@ -417,7 +417,7 @@ def tpu_get_top_tokens(
     the W8A8 head never computes the logits the original starts from, and the
     tensor shard bounds and the ``dim=0`` all-gather change the BF16 body too.
     """
-    if self.scale <= 0.0 and self.scale != 1.0:
+    if self.scale <= 0.0:
         raise ValueError(
             f"scale must be > 0.0 for greedy argmax reduction, got {self.scale}"
         )
@@ -638,8 +638,7 @@ def tpu_get_topk_candidates(
     hidden_states: torch.Tensor,
     embedding_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """TPU-optimized vocabulary-parallel top-32 candidate extraction
-    (``S3_MA_Top32_BS``).
+    """TPU-optimized vocabulary-parallel top-32 candidate extraction.
 
     Each rank extracts its local top-32 ``(logit, token_id)`` pairs from its
     vocab shard and exchanges only ``[rows, 32, 2]`` ``float32`` across TP
@@ -648,7 +647,7 @@ def tpu_get_topk_candidates(
     ``C = 32 * tp_size``, ``packed[:, :C]`` are the candidate logits and
     ``packed[:, C:]`` are the global candidate token IDs.
     """
-    if self.scale <= 0.0 and self.scale != 1.0:
+    if self.scale <= 0.0:
         raise ValueError(
             f"scale must be > 0.0 for top-k candidate reduction, got {self.scale}"
         )
@@ -1049,7 +1048,8 @@ def topk_candidates(
 ) -> torch.Tensor:
     """Packed ``[rows, 2 * C]`` ``float32`` vocabulary-parallel top-32
     candidates per TP rank (``C = 32 * tp_size``)."""
-    # Module.__getattr__ is typed Tensor | Module; LogitsProcessor gets this at import.
+    # Module.__getattr__ is typed Tensor | Module; patch_logits_processor_heads
+    # installs get_topk_candidates on LogitsProcessor.
     # pyrefly: ignore[missing-attribute]
     return owner.logits_processor.get_topk_candidates(owner.lm_head, hidden_states)
 
@@ -1100,16 +1100,16 @@ def topk_candidates_step_eligible(
         if params.structured_outputs is not None:
             return False
         if (
-            getattr(params, "presence_penalty", 0.0) != 0.0
-            or getattr(params, "frequency_penalty", 0.0) != 0.0
-            or getattr(params, "repetition_penalty", 1.0) != 1.0
-            or getattr(params, "min_p", 0.0) != 0.0
-            or getattr(params, "bad_words_token_ids", None)
+            params.presence_penalty != 0.0
+            or params.frequency_penalty != 0.0
+            or params.repetition_penalty != 1.0
+            or params.min_p != 0.0
+            or params.bad_words_token_ids
         ):
             return False
-        if getattr(params, "temperature", 1.0) == 0:
+        if params.temperature == 0:
             continue
-        top_k = int(getattr(params, "top_k", 0))
+        top_k = int(params.top_k)
         if req_id.startswith("__"):
             if top_k > max_local_k:
                 return False

@@ -568,7 +568,7 @@ def test_spec_verify_chunk_top_tokens_with_processors_skips_the_fused_verify(
 
 
 class _ReachedGather(Exception):
-    pass
+    """Raised by the full-logits gather: the chunk took the non-fused path."""
 
 
 def test_spec_verify_chunk_with_processors_skips_the_candidate_verify() -> None:
