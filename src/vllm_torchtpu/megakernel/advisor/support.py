@@ -25,9 +25,13 @@ from .constants import (
 )
 from .models import (
     DEPLOYMENT_PRESETS,
+    DeclaredCollectives,
     DeploymentPreset,
+    InCallExpertMode,
     ModelProfile,
     ParallelLayout,
+    parse_declared_collectives,
+    parse_expert_mode_rules,
 )
 from .specs import (
     SUPPORTED_ONCHIP_FAMILIES,
@@ -45,10 +49,12 @@ if TYPE_CHECKING:
 __all__ = [
     "CORE_LIMITS",
     "CoreLimits",
+    "declared_collectives",
     "effective_expert_owner_groups",
     "evaluate_support",
     "exceeds_default_buckets",
     "find_declaration",
+    "resolve_declared_expert_mode",
     "single_call_row_limit",
     "whole_step_row_limit",
 ]
@@ -81,13 +87,21 @@ def _declared_int(declaration: Mapping[str, object] | None, key: str) -> int:
 
 
 def _same_layout(layout: ParallelLayout, workload: WorkloadSpec) -> bool:
-    """Return whether a declared layout has the workload's serving axes."""
-    return (layout.tp, layout.ep, layout.dp, layout.pp, layout.dcp) == (
+    """Return whether a declared layout has the workload's 6 serving axes."""
+    return (
+        layout.tp,
+        layout.ep,
+        layout.dp,
+        layout.pp,
+        layout.dcp,
+        layout.pcp,
+    ) == (
         workload.tp,
         workload.ep,
         workload.dp,
         workload.pp,
         workload.dcp,
+        workload.pcp,
     )
 
 
@@ -124,12 +138,39 @@ def find_declaration(
     """Return the megakernel block declared for this scope, phase, and layout.
 
     A block matches when its rank count equals eff_tp and the layout entry
-    that holds it has the workload's tp, ep, dp, pp, and dcp.
+    that holds it has the workload's tp, ep, dp, pp, dcp, and pcp.
     """
     for layout, mk in _declared_layouts(profile_name, scope, workload.phase):
         if eff_tp == _declared_int(mk, "ranks") and _same_layout(layout, workload):
             return mk
     return None
+
+
+def declared_collectives(
+    declaration: Mapping[str, object] | None,
+) -> DeclaredCollectives | None:
+    """Return parsed `DeclaredCollectives` when a declaration specifies them."""
+    if declaration is None or declaration.get("collectives") is None:
+        return None
+    return parse_declared_collectives(declaration["collectives"])
+
+
+def resolve_declared_expert_mode(
+    declaration: Mapping[str, object] | None,
+    workload: WorkloadSpec,
+    active_tokens: int,
+    l_moe: int,
+) -> InCallExpertMode:
+    """Return in-call MoE execution mode (`tp`, `ep`, or `none`) for active rows."""
+    if l_moe <= 0:
+        return "none"
+    if declaration is not None and declaration.get("expert_mode_by_rows") is not None:
+        rules = parse_expert_mode_rules(declaration["expert_mode_by_rows"])
+        for rule in rules:
+            if active_tokens <= rule.max_rows:
+                return rule.mode
+        return rules[-1].mode
+    return "ep" if workload.ep > 1 else "tp"
 
 
 def effective_expert_owner_groups(
