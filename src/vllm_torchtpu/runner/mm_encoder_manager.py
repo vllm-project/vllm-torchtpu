@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections.abc import Iterator
+import functools
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any, cast
 
@@ -50,19 +51,85 @@ def _to_device(mm_kwargs: Any, device: torch.device) -> Any:
     )
 
 
+# Host rows reach the device as chunks of 1/ROW_CHUNKS of a budget's rows
+# (`rows_to_device`): the device program then depends on the chunk count, not
+# the row count. Uploading 30000 of 32768 rows as 8 chunks took 6.3 ms, as one
+# tensor 8.5 ms; copying them into one budget-shaped host buffer first, 14 ms.
+ROW_CHUNKS = 8
+
+
+@functools.cache
+def _tail_buffer(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    # Reused, so the budget-sized allocation is not faulted in per call. Rows
+    # past the tail keep earlier (finite) rows: padding rows of a budget graph
+    # are never attended to by real ones, and their outputs are dropped.
+    return torch.zeros(shape, dtype=dtype)
+
+
+def rows_to_device(
+    parts: Sequence[torch.Tensor], template: torch.Tensor
+) -> torch.Tensor:
+    """The concatenated host rows of `parts`, padded to `template`'s shape and
+    dtype, on its device.
+
+    Whole chunks upload as views; a partial one goes through a reused host
+    buffer (`_tail_buffer`) and uploads blocking, so the next can refill it.
+    Padding rows are zero past the last chunk.
+    """
+    rows, rest = template.shape[0], tuple(template.shape[1:])
+    size = rows // ROW_CHUNKS if rows % ROW_CHUNKS == 0 else rows
+    device, chunks, tail, filled = template.device, [], [], 0
+    for part in parts:
+        start = 0
+        while start < part.shape[0]:
+            take = min(size - filled, part.shape[0] - start)
+            piece = part[start : start + take]
+            start += take
+            if take == size:
+                chunks.append(piece.to(device, non_blocking=True))
+                continue
+            tail.append(piece)
+            filled += take
+            if filled == size:
+                chunks.append(_upload_tail(tail, size, rest, part.dtype, device))
+                tail, filled = [], 0
+    if tail:
+        chunks.append(_upload_tail(tail, size, rest, tail[0].dtype, device))
+    out = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+    if out.shape[0] < rows:
+        out = torch.cat([out, out.new_zeros(rows - out.shape[0], *rest)])
+    return out.to(template.dtype)
+
+
+def _upload_tail(
+    pieces: list[torch.Tensor],
+    size: int,
+    rest: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    buffer = _tail_buffer((size, *rest), dtype)
+    start = 0
+    for piece in pieces:
+        buffer[start : start + piece.shape[0]].copy_(piece)
+        start += piece.shape[0]
+    return buffer.to(device, copy=True)
+
+
 @contextmanager
 def host_encoder_batches(runner: Any) -> Iterator[None]:
     """Hand the encoder manager this step's batches on the host.
 
-    Its model then pads each budget graph's pixels on the host
-    (`BUDGET_INPUTS_HOOK`), so no device program takes an item's patch count.
-    A step with a modality the manager does not encode keeps the upload; so
-    does a manager without a layout-free path (see `layout_free`).
+    Its model's budget-inputs hook (`BUDGET_INPUTS_HOOK`) then returns each
+    budget graph's pixels as host rows, which reach the device in chunks of
+    the budget (`rows_to_device`), so no device program takes an item's patch
+    count. A step with a modality the manager does not encode keeps the
+    upload; so does a manager without a layout-free path (see `layout_free`).
     """
     from vllm.v1.worker import gpu_model_runner
 
     manager = runner.encoder_cudagraph_manager
-    if not isinstance(manager, MMEncoderManager) or not manager.host_pixels:
+    if not isinstance(manager, MMEncoderManager) or not manager.layout_free:
         yield
         return
     upstream = gpu_model_runner.group_and_batch_mm_kwargs
@@ -211,10 +278,9 @@ class MMEncoderManager(EncoderCudaGraphManager):
             getattr(type(self.model), BUDGET_INPUTS_HOOK, None)
         )
         # The layout-free path (`enable_layout_free`): encoder outputs as row
-        # handles into their batch output, optionally with this step's
-        # batches on the host (`host_pixels`, `host_batches`).
+        # handles into their batch output, and this step's batches on the
+        # host (`host_batches`, see `host_encoder_batches`).
         self.layout_free = False
-        self.host_pixels = False  # pad pixels on the host (`host_encoder_batches`)
         self.host_batches = False
         self._layout_free_off = False  # a batch on the per-item-tensor path
         # CUDA graph metadata owns CUDA replay buffers. Track XLA warmup
@@ -253,6 +319,11 @@ class MMEncoderManager(EncoderCudaGraphManager):
             src = replay_values.get(key)
             if src is None or tmpl is None:
                 padded[key] = tmpl
+                continue
+
+            if isinstance(src, list):
+                # Host rows from the budget-inputs hook (`host_encoder_batches`).
+                padded[key] = rows_to_device(src, tmpl)
                 continue
 
             if not hasattr(src, "shape") or src.ndim == 0:
@@ -302,6 +373,9 @@ class MMEncoderManager(EncoderCudaGraphManager):
                     [v for v in values.values() if isinstance(v, torch.Tensor)],
                     wait=True,
                 )
+                for key, value in values.items():
+                    if isinstance(value, list):
+                        self._warm_rows_to_device(path, token_budget, key)
             self.compiled_budgets[path].add(token_budget)
         except Exception as e:
             logger.warning(
@@ -311,6 +385,21 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 path,
                 e,
             )
+
+    def _warm_rows_to_device(self, path: str, token_budget: int, key: str) -> None:
+        """Compile `rows_to_device` of `key` at every chunk count a batch of
+        this budget can have: a batch gets the smallest budget that holds it,
+        so it has more rows than the next smaller budget's template."""
+        template = self.budget_templates[path][token_budget][key]
+        smaller = [b for b in self.budget_templates[path] if b < token_budget]
+        fewer = (
+            self.budget_templates[path][max(smaller)][key].shape[0] if smaller else 0
+        )
+        rows = template.shape[0]
+        size = rows // ROW_CHUNKS if rows % ROW_CHUNKS == 0 else rows
+        for count in range(fewer // size + 1, rows // size + 1):
+            part = torch.zeros(count * size, *template.shape[1:], dtype=template.dtype)
+            synchronize_tensors([rows_to_device([part], template)], wait=True)
 
     @torch.no_grad()
     def _run_budget_graph(
