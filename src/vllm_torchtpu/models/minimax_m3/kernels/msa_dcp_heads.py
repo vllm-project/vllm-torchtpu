@@ -444,7 +444,7 @@ def exchange_head_pages_start(
     """`exchange_head_pages` as a start / `exchange_head_pages_wait` pair:
     starts every page copy of this rank (`direct`: every part to every
     replica of its head; else part ``j`` to replica ``j``, forwarded by the
-    wait) and returns the future ``(out, send_sem, recv_sem)`` with the
+    wait) and returns the future ``(out, send_sem, recv_sem, fwd_sem)`` with the
     copies in flight, so the caller's work in between overlaps them. The
     pages are read from `kv_cache` until the wait: the caller keeps it
     unchanged (an operand of the program, written before the start)."""
@@ -454,7 +454,10 @@ def exchange_head_pages_start(
     if kv_cache.dtype != jnp.uint8:
         raise ValueError(f"4-bit (uint8) caches only, got {kv_cache.dtype}")
 
-    def kernel(pages_ref, live_ref, rank_ref, kv_ref, out_ref, send_sem, recv_sem):
+    def kernel(
+        pages_ref, live_ref, rank_ref, kv_ref, out_ref, send_sem, recv_sem, fwd_sem
+    ):
+        del fwd_sem  # the wait's forwarding semaphore, live from here on
         me = rank_ref[0]
         counts = [live_part(live_ref[0], j, replicas, part) for j in range(replicas)]
         barrier = pltpu.get_barrier_semaphore()
@@ -500,12 +503,14 @@ def exchange_head_pages_start(
                 pl.BlockSpec(memory_space=pl.ANY),
                 pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
                 pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+                pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
             ),
         ),
         out_shape=(
             jax.ShapeDtypeStruct(
                 (replicas, dcp, part, rows, packing, head_width), kv_cache.dtype
             ),
+            pltpu.SemaphoreType.DMA(()),
             pltpu.SemaphoreType.DMA(()),
             pltpu.SemaphoreType.DMA(()),
         ),
@@ -532,11 +537,13 @@ def exchange_head_pages_wait(
     """Retires `exchange_head_pages_start`'s copies (and, unless `direct`,
     forwards the received part to the head's other replicas): the same
     buffer `exchange_head_pages` returns."""
-    out, send_sem, recv_sem = future
+    # fwd_sem comes from the start: a peer may forward pages before this
+    # rank enters the wait, when a scratch semaphore would not exist yet.
+    out, send_sem, recv_sem, fwd_sem = future
     part = out.shape[2]
     out_shape = jax.ShapeDtypeStruct(out.shape, out.dtype)
 
-    def kernel(live_ref, rank_ref, buf_ref, send_sem, recv_sem, out_ref, fwd_sem):
+    def kernel(live_ref, rank_ref, buf_ref, send_sem, recv_sem, fwd_sem, out_ref):
         del buf_ref  # aliased to out_ref
         me = rank_ref[0]
         replica = me % replicas
@@ -602,16 +609,16 @@ def exchange_head_pages_wait(
                 pl.BlockSpec(memory_space=pl.ANY),
                 pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
                 pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+                pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
             ],
             out_specs=pl.BlockSpec(memory_space=pl.ANY),
-            scratch_shapes=[pltpu.SemaphoreType.DMA(())],
         ),
         out_shape=out_shape,
         input_output_aliases={2: 0},
         compiler_params=pltpu.CompilerParams(has_side_effects=True),
         interpret=pltpu.InterpretParams() if interpret else False,
         name="minimax_m3_msa_dcp_exchange_wait",
-    )(live, rank, out, send_sem, recv_sem)
+    )(live, rank, out, send_sem, recv_sem, fwd_sem)
 
 
 def _exchange_pages(
