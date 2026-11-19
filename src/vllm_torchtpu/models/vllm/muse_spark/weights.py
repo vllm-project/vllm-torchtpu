@@ -15,6 +15,8 @@
 
 import torch
 
+from vllm_torchtpu.layers.core.quantization import unpack_uint8_to_fp4
+
 
 def expert_ep_slice(tensor: torch.Tensor, rank: int, world_size: int) -> torch.Tensor:
     """Copy a contiguous block of whole experts, including their scales."""
@@ -60,13 +62,7 @@ def dequantize_nvfp4(
         raise ValueError("NVFP4 block scales must cover 16 unpacked values")
     if packed.shape[:-1] != block_scale.shape[:-1]:
         raise ValueError("NVFP4 scale and weight row shapes disagree")
-    lut = torch.tensor(
-        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
-        dtype=torch.float32,
-        device=packed.device,
-    )
-    indices = torch.stack((packed & 15, packed >> 4), dim=-1).long()
-    values = lut[indices].flatten(-2)
+    values = unpack_uint8_to_fp4(packed)
     scales = block_scale.float() * global_scale.float()
     return (values.reshape(*block_scale.shape, 16) * scales.unsqueeze(-1)).flatten(-2)
 
