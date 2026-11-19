@@ -577,3 +577,75 @@ def test_html_badge_counts_a_measured_collective() -> None:
     html_output = advisor.render_advisor_html(sweep)
     assert "CALIBRATED TRACE" in html_output
     assert "coll_only.xplane.pb" in html_output
+
+
+def test_band_first_cli_and_html_tables_lead_with_floor_to_upper_band() -> None:
+    """Verify CLI and HTML tables lead with the `[floor..upper]` step band."""
+    sweep = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    html_out = advisor.render_advisor_html(sweep)
+    band_th = '<th class="tabular">Step Band [floor..upper] (us)</th>'
+    tput_th = '<th class="tabular">Throughput (tok/s/chip)</th>'
+    gain_th = '<th class="tabular">Gain vs per_op</th>'
+    assert band_th in html_out
+    assert html_out.index(band_th) < html_out.index(tput_th) < html_out.index(gain_th)
+    assert "<strong>floor " in html_out
+    assert "hardware floor:" in html_out
+    assert "fused-scope device estimate" in html_out
+
+    table_txt = advisor.format_regime_table(sweep, unresolved=True)
+    assert "Step Band [floor..upper] (us)" in table_txt
+    assert "Step Band=[floor " in table_txt
+    assert "Unresolved Assumptions (Decode Reference):" in table_txt
+    assert "assumed=" in table_txt
+
+    split_report = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(
+            phase="verify",
+            batch=56,
+            spec_tokens=3,
+            context=4096,
+            tp=8,
+            ep=8,
+            dcp=4,
+            dispatch_regime="zero_floor",
+        ),
+        "tpu7x",
+    )
+    split_summary = advisor.format_advisor_summary(split_report, unresolved=True)
+    assert "[floor " in split_summary
+    assert "[basis: fused-scope device estimate]" in split_summary
+    assert "Break-even host-head delta: +" in split_summary
+
+    e2e_report = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(
+            phase="decode",
+            batch=8,
+            context=4096,
+            tp=8,
+            ep=8,
+            dcp=4,
+            per_op_step_us=9500.0,
+            step_coverage=0.85,
+            batch_explicit=True,
+        ),
+        "tpu7x",
+    )
+    e2e_summary = advisor.format_advisor_summary(e2e_report)
+    assert "Whole-server E2E gain (calibrated):" in e2e_summary
+    assert "[basis: calibrated whole-server E2E]" in e2e_summary
+    calibrated_sweep = advisor.advise_regimes(
+        "qwen3.5-397b",
+        "tpu7x",
+        options=advisor.RegimeSweepOptions(
+            base_workload=advisor.WorkloadSpec(
+                per_op_step_us=9500.0,
+                host_head_per_op_us=1200.0,
+                host_head_explicit=True,
+            )
+        ),
+    )
+    calibrated_html = advisor.render_advisor_html(calibrated_sweep)
+    assert "CALIBRATED TRACE" in calibrated_html
+    assert "UNCALIBRATED PRIORS" not in calibrated_html
