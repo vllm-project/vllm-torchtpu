@@ -661,6 +661,15 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
     return next(iter(found.values()))
 
 
+def _synthetic_logit_rows(recv: torch.Tensor, per_rank: int) -> torch.Tensor:
+    """``[rows / tp, tp, width]`` from the all-to-all's receive buffer (``[tp,
+    width]`` for one row per rank, else ``[tp, rows / tp, width]``), as
+    `TPUModelRunner.compute_selected_logit_rows` hands it to the sampler. The
+    sampler's compiled program is keyed on these strides, so its precompile
+    builds its input the same way."""
+    return recv.unsqueeze(0) if per_rank == 1 else recv.permute(1, 0, 2)
+
+
 # Recompilation-avoidance contract:
 #   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
 #   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
@@ -6644,7 +6653,9 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_compute_selected_logits(self) -> None:
         hsize = self.model_config.get_hidden_size()
-        with self._precompile_timed("compute_selected_logits"):
+        # Serving computes logits under execute_model's no_grad, and dynamo
+        # guards on grad mode.
+        with self._precompile_timed("compute_selected_logits"), torch.no_grad():
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
@@ -7141,19 +7152,24 @@ class TPUModelRunner(GPUModelRunner):
         one_draw = synthetic_uniforms_fit(draft_token_ids.shape[0], num_reqs)
         u_shape = self._synthetic_uniforms_shape(num_reqs)
         recover_u = torch.zeros(u_shape, dtype=torch.float32).to(self.device)
-        accepted_count, _, recover_draft = (
-            synthetic_verify_rows_from_uniforms if one_draw else synthetic_verify_rows
-        )(
-            draft_token_ids,
-            draft_lengths,
-            segment_ids,
-            group_indices,
-            target_logits_indices,
-            bonus_logits_indices,
-            target_logits_indices,
-            recover_u if one_draw else warm_accept_u,
-            self.rejection_sampler.synthetic_conditional_rates,
-        )
+        # The verify runs under execute_model's no_grad, and dynamo guards on
+        # grad mode.
+        with torch.no_grad():
+            accepted_count, _, recover_draft = (
+                synthetic_verify_rows_from_uniforms
+                if one_draw
+                else synthetic_verify_rows
+            )(
+                draft_token_ids,
+                draft_lengths,
+                segment_ids,
+                group_indices,
+                target_logits_indices,
+                bonus_logits_indices,
+                target_logits_indices,
+                recover_u if one_draw else warm_accept_u,
+                self.rejection_sampler.synthetic_conditional_rates,
+            )
         logits = torch.zeros(
             (num_reqs, self.vocab_size), dtype=self._hidden_states_dtype
         ).to(self.device)
@@ -7176,10 +7192,15 @@ class TPUModelRunner(GPUModelRunner):
             assert self._synthetic_shard is not None
             row_width, vocab = self._synthetic_shard
             tp = get_tensor_model_parallel_world_size()
-            rows = torch.zeros(
-                (num_reqs // tp, tp, synthetic_shard_width(row_width)),
-                dtype=self._hidden_states_dtype,
-            ).to(self.device)
+            per_rank = num_reqs // tp
+            width = synthetic_shard_width(row_width)
+            recv_shape = (tp, width) if per_rank == 1 else (tp, per_rank, width)
+            rows = _synthetic_logit_rows(
+                torch.zeros(recv_shape, dtype=self._hidden_states_dtype).to(
+                    self.device
+                ),
+                per_rank,
+            )
             sampler: tuple = (
                 synthetic_sample_rows_and_assemble,
                 rows,
@@ -8884,7 +8905,7 @@ class TPUModelRunner(GPUModelRunner):
         )
         if isinstance(recv, funcol.AsyncCollectiveTensor):
             recv = funcol.wait_tensor(recv)
-        return recv.unsqueeze(0) if per_rank == 1 else recv.permute(1, 0, 2)
+        return _synthetic_logit_rows(recv, per_rank)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits_from_hidden_states(
