@@ -924,7 +924,7 @@ class TpuPlatform(Platform):
         kv_cache_layout = get_flashinfer_layout_string(layout)
         # A malformed tpu_kv_transfer section fails here, not at KV cache setup,
         # and a page this engine will not apply is logged.
-        check_kv_transfer_page(vllm_config, layout)
+        check_kv_transfer_page(vllm_config, layout, backend)
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
             kv_cache_layout=kv_cache_layout,
