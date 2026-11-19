@@ -34,6 +34,7 @@ import math
 from collections.abc import Sequence
 
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
 
 # Decode tiles stop at 16 sequences. At n_v=8, T=32 measured +59.6% (N=64) and
 # +15.8% (N=256) slower than T=16: the per-slot f32 state copy and vector
@@ -68,13 +69,9 @@ _F32_BYTES = 4
 _QKV_2D_PER_SEQ_EXTRA_BYTES_PER_COLUMN = 136
 
 
-def _cdiv(a: int, b: int) -> int:
-    return -(-a // b)
-
-
 def align_to(x: int, alignment: int) -> int:
     """Aligns an integer upward to the nearest multiple of alignment."""
-    return _cdiv(x, alignment) * alignment
+    return pl.cdiv(x, alignment) * alignment
 
 
 def _nearest_candidate(value: float, candidates: Sequence[int]) -> int:
@@ -516,7 +513,8 @@ def get_tile_sizes(
     # Guarantee strictly positive tile sizes (>= 1) for Pallas grid compilation,
     # keeping a derived mixed_tile_size a power of two so triangular_block_size
     # divides it. A caller's chunk is the tiler's (fused_conv1d_gdn at
-    # config.TILER_SHAPES), which holds whole triangular blocks already.
+    # config.TILER_SHAPES), which the caller rounds down to whole triangular
+    # blocks after this returns.
     decode_tile_size = max(1, min(decode_tile_size, padded_batch_size))
     if caller_chunk:
         mixed_tile_size = max(1, min(mixed_tile_size, batch_size))
@@ -537,6 +535,7 @@ def spec_window_tile_cap(
     num_buffers: int,
     vmem_budget: int,
     rec_state_bytes: int = 4,
+    act_out_bytes: int = 2,
 ) -> int:
     """Sequences per BATCHED tile whose state windows fit half the scoped VMEM.
 
@@ -545,8 +544,9 @@ def spec_window_tile_cap(
     1 + window (2 at window = 1). Shrink the tile so the double-buffered
     state tiles fit in roughly half the scoped-VMEM budget (the rest goes to
     weights, activations scratch and compiler temporaries). The recurrent
-    state tile holds `rec_state_bytes` per element (the state dtype); the
-    conv state tile is f32.
+    state tile holds `rec_state_bytes` per element (the state dtype) and the
+    output `act_out_bytes` (the output dtype); the conv state tile is f32, as
+    the kernel keeps it.
     """
     state_positions = 1 + window
     rec_bytes = state_positions * n_v * d_k * d_v * rec_state_bytes
@@ -555,13 +555,14 @@ def spec_window_tile_cap(
         rec_bytes
         + conv_bytes
         # qkv (fp32), b/a (fp32), out (act_out).
-        + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
+        + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * act_out_bytes)
     )
     return ((vmem_budget // 2) // num_buffers) // bytes_per_seq
 
 
-def legacy_spec_batch_tile(batch_size: int) -> int:
-    """Select token-count decode tile size for speculative verify windows."""
+def token_count_verify_tile(batch_size: int) -> int:
+    """The decode tile of a speculative verify window from the call's token
+    count alone, for a static (not dynamically picked) tile."""
     return 1 if batch_size <= 8 else (2 if batch_size <= 32 else 4)
 
 
@@ -582,8 +583,8 @@ def select_decode_tile_size(
     Args:
       default_tile: The caller's decode_tile_size (static path).
       dyn_tile: get_tile_sizes' decode tile, or None when dynamic tiling is
-        off. Replaces both default_tile and, for verify windows, the legacy
-        token-count heuristic.
+        off. Replaces both default_tile and, for verify windows, the
+        token-count tile (token_count_verify_tile).
       batch_size: Tokens in the call (qkv rows).
       num_spec_tokens: Speculative draft tokens per verify window.
       spec_tile_cap: spec_window_tile_cap(...) at window num_spec_tokens + 1.
@@ -610,7 +611,9 @@ def select_decode_tile_size(
     if dyn_tile is None or num_spec_tokens > 0:
         tile = min(tile, spec_tile_cap)
     if num_spec_tokens > 0:
-        heuristic = tile if dyn_tile is not None else legacy_spec_batch_tile(batch_size)
+        heuristic = (
+            tile if dyn_tile is not None else token_count_verify_tile(batch_size)
+        )
         tile = max(1, min(tile, heuristic))
         if is_kda:
             # KDA verify keeps one sequence per tile until multi-sequence KDA

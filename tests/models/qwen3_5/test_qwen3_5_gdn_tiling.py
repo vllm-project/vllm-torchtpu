@@ -196,10 +196,19 @@ def test_select_decode_tile_size(kwargs, expected):
 
 
 def _call_kernels(
-    n_kq, n_v, window, num_seqs, num_tokens, state_dtype, module=wrapper, **kwargs
+    n_kq,
+    n_v,
+    window,
+    num_seqs,
+    num_tokens,
+    state_dtype,
+    module=wrapper,
+    act_dtype=BF16,
+    **kwargs,
 ):
     """Kernel names of one fused_conv1d_gdn call (decode and prefill/mixed),
-    traced from shapes only. `module` is the copy's wrapper or main's."""
+    traced from shapes only. `module` is the copy's wrapper or main's;
+    `act_dtype` is qkv's, which the output takes."""
     dim = 2 * n_kq * D_K + n_v * D_V
     num_slots = num_seqs * window + 1
 
@@ -207,7 +216,7 @@ def _call_kernels(
         return jax.ShapeDtypeStruct(shape, dtype)
 
     inputs = dict(
-        qkv=sds((num_tokens, dim), BF16),
+        qkv=sds((num_tokens, dim), act_dtype),
         b=sds((num_tokens, n_v), BF16),
         a=sds((num_tokens, n_v), BF16),
         states=(
@@ -659,7 +668,7 @@ def test_off_the_tiler_shapes_a_small_bucket_takes_a_power_of_two_chunk(
     """Outside config.TILER_SHAPES a token bucket that is not a power of two
     (TPU_TOKEN_BUCKET_EXTRA, a small max_num_batched_tokens) takes the largest
     power of two below it as the chunk, which the triangular block divides,
-    as main's kernel does since #2438. A 24-token bucket at 8 value heads per
+    as main's kernel does. A 24-token bucket at 8 value heads per
     rank (blocks of 16) failed to trace with a 24-token chunk."""
     monkeypatch.setattr(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", dynamic)
     for num_tokens, chunk in ((3, 2), (5, 4), (12, 8), (24, 16), (48, 32), (96, 64)):
@@ -672,7 +681,7 @@ _GDN_BLOCKS = {8: 16, 16: 8, 24: 4, 32: 4, 40: 2, 48: 2, 64: 2}
 
 def test_the_triangular_block_is_a_power_of_two_dividing_every_chunk():
     """B is the largest power of two within the head-group budget, for every
-    head count, GDN and KDA (main's rule since #2438). The Qwen3.5-397B blocks
+    head count, GDN and KDA (main's rule). The Qwen3.5-397B blocks
     (2 rows at 64 value heads per rank, 4 at 32, 16 at 8) are the old
     quotient's."""
     for n_v in (1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 96, 128):
@@ -692,9 +701,53 @@ def test_the_triangular_block_is_a_power_of_two_dividing_every_chunk():
             assert config.gdn_triangular_block_size(n_v) == _GDN_BLOCKS[n_v]
 
 
+def test_the_spec_window_cap_counts_the_output_dtype(monkeypatch):
+    """The verify-window VMEM cap counts the output at its dtype's width: the
+    wrapper passes qkv's itemsize (2 for the bf16 the model serves), and a
+    4-byte output adds window * n_v * d_v * 2 bytes per sequence."""
+    seen = []
+    real = tiling.spec_window_tile_cap
+
+    def recording(**kwargs):
+        seen.append(kwargs["act_out_bytes"])
+        return real(**kwargs)
+
+    monkeypatch.setattr(tiling, "spec_window_tile_cap", recording)
+    _call_kernels(2, 8, 4, 8, 32, F32)
+    assert seen and set(seen) == {2}
+    # An f32 activation is counted at 4 bytes, so a constant would not pass.
+    seen.clear()
+    _call_kernels(2, 8, 4, 8, 32, F32, act_dtype=F32)
+    assert seen and set(seen) == {4}
+
+    kwargs = dict(
+        window=4,
+        n_v=8,
+        d_k=128,
+        d_v=128,
+        kernel_size=4,
+        dim=1536,
+        aligned_num_v_heads=128,
+        num_buffers=2,
+        # 40 sequences at a 2-byte output, 39 at a 4-byte one.
+        vmem_budget=4 * 40 * 2_750_464,
+    )
+
+    def expected(out_bytes):
+        per_seq = (
+            5 * 8 * 128 * 128 * 4
+            + 5 * 3 * 1536 * 4
+            + 4 * (1536 * 4 + 2 * 128 * 4 + 8 * 128 * out_bytes)
+        )
+        return ((4 * 40 * 2_750_464 // 2) // 2) // per_seq
+
+    assert real(**kwargs) == expected(2) == 40
+    assert real(**kwargs, act_out_bytes=4) == expected(4) == 39
+
+
 def test_the_solves_reject_a_block_that_does_not_divide_the_chunk():
     """A non-dividing block fails at the solve with the divisibility message
-    instead of dropping the remainder rows (main's check since #2438)."""
+    instead of dropping the remainder rows (main's check)."""
     t = jnp.tril(jnp.ones((2, 128, 128), F32))
     with pytest.raises(AssertionError, match="divisible"):
         compute_gdn.invert_triangular_matrix(t, block_size=5)
