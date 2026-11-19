@@ -26,11 +26,16 @@ from .constants import (
     BOUNDARY_SYNC_HOP_FACTOR,
     CORE_LIMITS,
     CORNER_AXES,
+    DECODING_SEQS_SETTLE_CMD,
     DOT_BF16,
     DOT_FP8,
     EQUAL_SPLIT_GROUP_COUNTS,
+    GAIN_BASIS_E2E,
+    GAIN_BASIS_ESTIMATE,
+    HOST_HEAD_SETTLE_CMD,
     LAYER_GROUP_PRICING_NOTE,
     PER_OP_COLLECTIVE_CALL_FACTOR,
+    PER_OP_STEP_SETTLE_CMD,
     SETTLE_CMD,
 )
 from .models import (
@@ -49,6 +54,7 @@ from .roofline import (
 from .specs import (
     AdvisorReport,
     FusionScope,
+    GainBasis,
     LayerGroupCandidate,
     LayerGroupSearchResult,
     MeasurementsData,
@@ -206,17 +212,202 @@ def _decisive_input(
     return candidates[0] if candidates else AB_KNOB
 
 
+@dataclass(frozen=True)
+class _UnresolvedContext:
+    """Inputs for assembling standardized ASSUMED assumption entries."""
+
+    profile: ModelProfile
+    workload: WorkloadSpec
+    chip_spec: ChipSpec
+    scope_context: _ScopeContext
+    meas: MeasurementsData | None
+    d_ops: int
+    b_val: float
+    lg_val: float
+    lg_lo: float
+    lg_hi: float
+    lg_tag: ProvenanceTag
+    coll_val: float
+    coll_lo: float
+    coll_hi: float
+    coll_tag: ProvenanceTag
+    cov_val: float
+    cov_tag: ProvenanceTag
+    per_op_step_val: float
+    per_op_step_lo: float
+    per_op_step_hi: float
+    per_op_step_tag: ProvenanceTag
+    break_even_host_head_us: float
+    collectives_measured: bool
+    row_limit_unresolved: bool
+
+
+def _append_gain_assumptions(
+    unresolved: list[dict[str, object]],
+    ctx: _UnresolvedContext,
+) -> None:
+    """Append gain-affecting ASSUMED inputs outside CORNER_AXES."""
+    workload = ctx.workload
+    scope_context = ctx.scope_context
+    if ctx.cov_tag == "ASSUMED":
+        unresolved.append(
+            {
+                "name": "step_coverage",
+                "value": ctx.cov_val,
+                "band": [0.0, 1.0],
+                "unit": "ratio",
+                "sensitivity_us": round(ctx.b_val, 2),
+                "affects": "gain",
+                "how_to_settle": SETTLE_CMD,
+            }
+        )
+    if ctx.per_op_step_tag == "ASSUMED":
+        unresolved.append(
+            {
+                "name": "per_op_step_us",
+                "value": ctx.per_op_step_val,
+                "band": [ctx.per_op_step_lo, ctx.per_op_step_hi],
+                "unit": "us",
+                "sensitivity_us": round(
+                    abs(ctx.per_op_step_hi - ctx.per_op_step_lo), 2
+                ),
+                "affects": "gain",
+                "how_to_settle": PER_OP_STEP_SETTLE_CMD,
+            }
+        )
+    if not workload.host_head_explicit:
+        calibrated_head_hi = (
+            round(ctx.meas.host_head_p90_us, 2)
+            if ctx.meas is not None and ctx.meas.host_head_p90_us is not None
+            else round(ctx.break_even_host_head_us, 2)
+        )
+        unresolved.append(
+            {
+                "name": "host_head_us",
+                "value": 0.0,
+                "band": [0.0, max(0.0, calibrated_head_hi)],
+                "unit": "us",
+                "sensitivity_us": round(ctx.break_even_host_head_us, 2),
+                "affects": "gain",
+                "how_to_settle": HOST_HEAD_SETTLE_CMD,
+            }
+        )
+    eta_fields: list[str] = ["eta_hbm", "eta_dense"]
+    if scope_context.l_moe > 0:
+        eta_fields.append("eta_moe_grouped")
+    if (
+        scope_context.eff_tp * workload.ep * workload.dcp * workload.pp * workload.pcp
+        > 1
+    ):
+        eta_fields.append("eta_ici")
+    unresolved.extend(
+        {
+            "name": eta_name,
+            "value": getattr(workload.efficiency, eta_name),
+            "band": list(workload.efficiency.BRACKETS[eta_name]),
+            "unit": "ratio",
+            "sensitivity_us": 0.0,
+            "affects": "gain",
+            "how_to_settle": ("Calibrate achievable unit utilization from XProf trace"),
+        }
+        for eta_name in eta_fields
+    )
+    if scope_context.eff_tp > 1 and not ctx.collectives_measured:
+        unresolved.append(
+            {
+                "name": "per_op_collective_call_factor",
+                "value": float(PER_OP_COLLECTIVE_CALL_FACTOR),
+                "band": [1.0, float(PER_OP_COLLECTIVE_CALL_FACTOR)],
+                "unit": "x",
+                "sensitivity_us": 0.0,
+                "affects": "gain",
+                "how_to_settle": SETTLE_CMD,
+            }
+        )
+    unresolved.append(
+        {
+            "name": "boundary_sync_hop_factor",
+            "value": float(BOUNDARY_SYNC_HOP_FACTOR),
+            "band": [0.0, float(BOUNDARY_SYNC_HOP_FACTOR)],
+            "unit": "hops",
+            "sensitivity_us": 0.0,
+            "affects": "gain",
+            "how_to_settle": SETTLE_CMD,
+        }
+    )
+
+
+def _append_support_and_config_assumptions(
+    unresolved: list[dict[str, object]],
+    ctx: _UnresolvedContext,
+) -> None:
+    """Append workload-geometry and support ASSUMED inputs outside CORNER_AXES."""
+    workload = ctx.workload
+    scope_context = ctx.scope_context
+    if not workload.batch_explicit and workload.phase in ("decode", "verify"):
+        unresolved.append(
+            {
+                "name": "decoding_sequences",
+                "value": workload.batch,
+                "band": [1, max(workload.batch, CORE_LIMITS.max_batch_rows)],
+                "unit": "seqs",
+                "sensitivity_us": 0.0,
+                "affects": "support",
+                "how_to_settle": DECODING_SEQS_SETTLE_CMD,
+            }
+        )
+    if workload.context == 0:
+        unresolved.append(
+            {
+                "name": "context",
+                "value": scope_context.eff_ctx,
+                "band": [workload.isl, workload.isl + workload.osl],
+                "unit": "tok",
+                "sensitivity_us": 0.0,
+                "affects": "gain",
+                "how_to_settle": (
+                    "Pass explicit --context <tokens> from serving KV length"
+                ),
+            }
+        )
+    if ctx.profile.dtype_source.startswith("default"):
+        unresolved.append(
+            {
+                "name": "weight_dtype",
+                "value": ctx.profile.weight_dtype,
+                "band": [ctx.profile.weight_dtype, "bf16"],
+                "unit": "dtype",
+                "sensitivity_us": 0.0,
+                "affects": "gain",
+                "how_to_settle": (
+                    "Pass --weight-dtype or point --model at a quantized HF config"
+                ),
+            }
+        )
+    if ctx.row_limit_unresolved:
+        bucket_top = (
+            CORE_LIMITS.default_verify_bucket_top
+            if workload.phase == "verify"
+            else CORE_LIMITS.default_decode_bucket_top
+        )
+        unresolved.append(
+            {
+                "name": "max_rows_per_call",
+                "value": 0,
+                "band": [bucket_top, CORE_LIMITS.max_batch_rows],
+                "unit": "rows",
+                "sensitivity_us": 0.0,
+                "affects": "support",
+                "how_to_settle": (
+                    "Pass --max-rows-per-call or add a megakernel declaration "
+                    "in data/presets/deployments.json"
+                ),
+            }
+        )
+
+
 def _collect_unresolved_assumptions(
-    workload: WorkloadSpec,
-    chip_spec: ChipSpec,
-    scope_context: _ScopeContext,
-    bounds: tuple[
-        int,
-        float,
-        tuple[float, float, ProvenanceTag],
-        tuple[float, float, ProvenanceTag],
-        ProvenanceTag,
-    ],
+    ctx: _UnresolvedContext,
     contest: tuple[
         Mapping[Corner, Mapping[FusionScope, float]],
         FusionScope,
@@ -225,13 +416,12 @@ def _collect_unresolved_assumptions(
 ) -> list[dict[str, object]]:
     """Collect and sort unresolved ASSUMED inputs by step-time sensitivity.
 
-    `sensitivity_us` of a scope input is how far its band moves the margin
-    between the best scope and its challenger (the corner winner on a tie,
-    else the runner-up). `affects` is `scope` for inputs that can change the
-    recommended scope and `gain` for `step_coverage`, which scales gain only.
+    `CORNER_AXES` (`launch_gap_us`, `collective_latency_us`, and
+    `prefill_attn_dot_dtype`) remain the sole entries with `affects == 'scope'`.
     """
-    d_ops, b_val, (lg_lo, lg_hi, lg_tag), (coll_lo, coll_hi, coll_tag), cov_tag = bounds
     corners, best_scope, challenger = contest
+    workload = ctx.workload
+    scope_context = ctx.scope_context
 
     def scope_sens(axis: str, fallback_us: float) -> float:
         """Margin swing vs the challenger, else the per_op-relative estimate."""
@@ -240,28 +430,32 @@ def _collect_unresolved_assumptions(
         return _margin_swing(corners, best_scope, challenger, axis)
 
     unresolved: list[dict[str, object]] = []
-    if lg_tag == "ASSUMED":
+    if ctx.lg_tag == "ASSUMED":
         unresolved.append(
             {
                 "name": "launch_gap_us",
-                "band": [lg_lo, lg_hi],
+                "value": ctx.lg_val,
+                "band": [ctx.lg_lo, ctx.lg_hi],
                 "unit": "us",
-                "sensitivity_us": scope_sens("launch_gap_us", d_ops * (lg_hi - lg_lo)),
+                "sensitivity_us": scope_sens(
+                    "launch_gap_us", ctx.d_ops * (ctx.lg_hi - ctx.lg_lo)
+                ),
                 "affects": "scope",
                 "how_to_settle": SETTLE_CMD,
             }
         )
-    if coll_tag == "ASSUMED" and scope_context.eff_tp * workload.ep > 1:
+    if ctx.coll_tag == "ASSUMED" and scope_context.eff_tp * workload.ep > 1:
         unresolved.append(
             {
                 "name": "collective_latency_us",
-                "band": [coll_lo, coll_hi],
+                "value": ctx.coll_val,
+                "band": [ctx.coll_lo, ctx.coll_hi],
                 "unit": "us/hop",
                 "sensitivity_us": scope_sens(
                     "collective_latency_us",
                     scope_context.num_ar
                     * scope_context.ar_hops
-                    * max(0.0, coll_hi - coll_lo),
+                    * max(0.0, ctx.coll_hi - ctx.coll_lo),
                 ),
                 "affects": "scope",
                 "how_to_settle": SETTLE_CMD,
@@ -270,18 +464,20 @@ def _collect_unresolved_assumptions(
     if (
         not scope_context.attn_is_bf16
         and workload.phase in ("prefill", "mixed")
-        and chip_spec.native_ocp_fp8
+        and ctx.chip_spec.native_ocp_fp8
         and scope_context.flops_kv > 0
     ):
         attn_sens_us = (
             scope_context.flops_kv / scope_context.bf16_peak
             - scope_context.flops_kv / scope_context.peak_w
         ) * 1e6
+        bf16_tflops = round(scope_context.bf16_peak / 1e12, 1)
         unresolved.append(
             {
                 "name": "prefill_attn_dot_dtype",
+                "value": bf16_tflops,
                 "band": [
-                    round(scope_context.bf16_peak / 1e12, 1),
+                    bf16_tflops,
                     round(scope_context.peak_w / 1e12, 1),
                 ],
                 "unit": "TFLOP/s",
@@ -292,17 +488,8 @@ def _collect_unresolved_assumptions(
                 "how_to_settle": "Inspect compiler profile HLO attention dot precision",
             }
         )
-    if cov_tag == "ASSUMED":
-        unresolved.append(
-            {
-                "name": "step_coverage",
-                "band": [0.0, 1.0],
-                "unit": "ratio",
-                "sensitivity_us": round(b_val, 2),
-                "affects": "gain",
-                "how_to_settle": SETTLE_CMD,
-            }
-        )
+    _append_gain_assumptions(unresolved, ctx)
+    _append_support_and_config_assumptions(unresolved, ctx)
     unresolved.sort(key=lambda item: float(str(item["sensitivity_us"])), reverse=True)
     return unresolved
 
@@ -319,6 +506,257 @@ def _summed_calls(est: ScopeEstimate, scope_context: _ScopeContext) -> int:
     ):
         return ceil(scope_context.active_tokens / scope_context.single_call_rows)
     return 1
+
+
+def _resolve_per_op_step_provenance(
+    workload: WorkloadSpec,
+    meas: MeasurementsData | None,
+    per_op_sc: ScopeEstimate,
+    base_per_op_us: float,
+    lg_val: float,
+) -> tuple[float, float, float, ProvenanceTag, str]:
+    """Resolve measured or modeled per_op step time, band, tag, and source."""
+    if workload.per_op_step_us is not None:
+        val = round(workload.per_op_step_us, 2)
+        return (
+            val,
+            val,
+            val,
+            "MEASURED",
+            "caller WorkloadSpec.per_op_step_us (--per-op-step-us)",
+        )
+    if (
+        meas is not None
+        and _is_calibrated_trace(meas)
+        and meas.per_op_step_us is not None
+    ):
+        image_suffix = f" [image={meas.source_image}]" if meas.source_image else ""
+        val = round(meas.per_op_step_us, 2)
+        return (
+            val,
+            val,
+            val,
+            "MEASURED",
+            f"{meas.source_desc} per_op_step_us{image_suffix}",
+        )
+    if (
+        meas is not None
+        and _is_calibrated_trace(meas)
+        and meas.step_time_us is not None
+        and meas.step_time_us > 0.0
+        and meas.source_scope in ("", "per_op")
+    ):
+        image_suffix = f" [image={meas.source_image}]" if meas.source_image else ""
+        val = round(meas.step_time_us, 2)
+        return (
+            val,
+            val,
+            val,
+            "MEASURED",
+            f"{meas.source_desc} step_time_us{image_suffix}",
+        )
+    val = round(
+        base_per_op_us + per_op_sc.ops_per_step * lg_val + per_op_sc.host_head_us,
+        2,
+    )
+    return (
+        val,
+        per_op_sc.step_bound_us,
+        max(per_op_sc.step_bound_us, per_op_sc.step_upper_us),
+        "ASSUMED",
+        "modeled per_op step bound (settle via --per-op-step-us or --measurements)",
+    )
+
+
+def _compute_fusion_and_e2e_gains(
+    best: ScopeEstimate,
+    per_op_sc: ScopeEstimate,
+    step_inputs: tuple[float, float, float, float, ProvenanceTag],
+    boundary_band: tuple[float, float, float],
+    cov_inputs: tuple[float, list[float], ProvenanceTag],
+) -> tuple[tuple[float, float, float], tuple[float, float, float], GainBasis]:
+    """Compute fusion_gain_max, expected_gain_max, and gain_basis."""
+    base_per_op_us, base_best_us, lg_val, per_op_step_val, per_op_step_tag = step_inputs
+    b_val, b_lo, b_hi = boundary_band
+    cov_val, cov_band, cov_tag = cov_inputs
+    if per_op_step_tag == "MEASURED":
+        if best.scope == "per_op":
+            fg_val, fg_lo, fg_hi = 0.0, 0.0, 0.0
+        else:
+            best_at_lg = base_best_us + best.ops_per_step * lg_val + best.host_head_us
+            best_lo_us = best.step_bound_us
+            best_hi_us = max(best.step_bound_us, best.step_upper_us)
+            denom_us = max(1e-6, per_op_step_val)
+            fg_val = round(
+                min(1.0, max(0.0, (per_op_step_val - best_at_lg) / denom_us)), 4
+            )
+            fg_lo = round(
+                min(fg_val, max(0.0, (per_op_step_val - best_hi_us) / denom_us)), 4
+            )
+            fg_hi = round(
+                max(
+                    fg_val,
+                    min(1.0, max(0.0, (per_op_step_val - best_lo_us) / denom_us)),
+                ),
+                4,
+            )
+    else:
+        denom_us = max(
+            1e-6,
+            base_per_op_us + per_op_sc.ops_per_step * lg_val + per_op_sc.host_head_us,
+        )
+        fg_val = round(min(1.0, max(0.0, b_val / denom_us)), 4)
+        fg_lo = round(min(fg_val, max(0.0, b_lo / denom_us)), 4)
+        fg_hi = round(max(fg_val, min(1.0, b_hi / denom_us)), 4)
+    eg_band = (
+        round(fg_val * cov_val, 4),
+        round(fg_lo * cov_band[0], 4),
+        round(fg_hi * cov_band[1], 4),
+    )
+    gain_basis: GainBasis = (
+        GAIN_BASIS_E2E
+        if (per_op_step_tag == "MEASURED" and cov_tag == "MEASURED")
+        else GAIN_BASIS_ESTIMATE
+    )
+    return (fg_val, fg_lo, fg_hi), eg_band, gain_basis
+
+
+def _resolve_break_even_head_and_tput(
+    estimates: Sequence[ScopeEstimate],
+    best: ScopeEstimate,
+    recommended: ScopeEstimate,
+    chip_spec: ChipSpec,
+    tput_ctx: tuple[_ScopeContext, WorkloadSpec, bool],
+) -> tuple[float, float, float, float]:
+    """Compute break-even host-head delta, throughput band, and rec_upper_us."""
+    scope_context, workload, hbm_fits = tput_ctx
+    supported_fused = [
+        est
+        for est in estimates
+        if est.scope != "per_op"
+        and est.feasible
+        and est.support in ("within_core_limits", "declared")
+    ]
+    feasible_fused = [
+        est for est in estimates if est.scope != "per_op" and est.feasible
+    ]
+    if recommended.scope != "per_op":
+        break_even_host_head_us = recommended.break_even_host_head_delta_us
+    elif supported_fused:
+        break_even_host_head_us = min(
+            est.break_even_host_head_delta_us for est in supported_fused
+        )
+    elif best.scope == "per_op" and feasible_fused:
+        break_even_host_head_us = min(
+            est.break_even_host_head_delta_us for est in feasible_fused
+        )
+    else:
+        break_even_host_head_us = 0.0
+    eff_pcp = workload.pcp if workload.phase in ("prefill", "mixed") else 1
+    tokens_per_chip = (
+        scope_context.active_tokens
+        * eff_pcp
+        * chip_spec.devices_per_chip
+        / max(1, scope_context.eff_tp * workload.pp)
+    )
+    rec_upper_us = max(recommended.step_bound_us, recommended.step_upper_us)
+    can_run = hbm_fits and recommended.feasible
+    tput_hi = (
+        round(tokens_per_chip / max(1e-9, recommended.step_bound_us * 1e-6), 2)
+        if can_run
+        else 0.0
+    )
+    tput_lo = (
+        round(tokens_per_chip / max(1e-9, rec_upper_us * 1e-6), 2) if can_run else 0.0
+    )
+    return break_even_host_head_us, tput_lo, tput_hi, rec_upper_us
+
+
+def _resolve_flags_and_verdict(
+    profile: ModelProfile,
+    workload: WorkloadSpec,
+    chip_spec: ChipSpec,
+    scope_context: _ScopeContext,
+    eval_state: tuple[
+        Sequence[ScopeEstimate],
+        ScopeEstimate,
+        bool,
+        MeasurementsData | None,
+        Mapping[Corner, Mapping[FusionScope, float]],
+        _UnresolvedContext,
+    ],
+) -> tuple[
+    tuple[str, ...],
+    str,
+    str,
+    tuple[dict[str, object], ...],
+    tuple[Corner, FusionScope] | None,
+]:
+    """Compute advisor flags, tie flip, unresolved list, verdict, and confidence."""
+    estimates, best, hbm_fits, meas, corners, unresolved_context = eval_state
+    hbm_pool_overflow = (
+        scope_context.hbm_used
+        > workload.hbm_utilization_cap * chip_spec.hbm_capacity_bytes
+    )
+    microbatched = 0 < scope_context.single_call_rows < scope_context.active_tokens
+    rows_per_call = min(
+        scope_context.active_tokens,
+        scope_context.single_call_rows or scope_context.active_tokens,
+    )
+    whole_step_ok = any(e.scope == "whole_step" and e.feasible for e in estimates)
+    flags_list = [
+        flag
+        for cond, flag in (
+            (profile.architecture_unverified, "architecture_unverified"),
+            (
+                best.n_splits > _summed_calls(best, scope_context),
+                "multi_call_unmodeled",
+            ),
+            (microbatched and whole_step_ok, "microbatch_rerun"),
+            (
+                whole_step_ok and exceeds_default_buckets(workload, rows_per_call),
+                "above_default_buckets",
+            ),
+            (hbm_pool_overflow, "hbm_pool_overflow"),
+            (
+                profile.dtype_source.startswith("default"),
+                "unquantized_default_dtype",
+            ),
+            (True, "core_limits_pinned"),
+        )
+        if cond
+    ]
+    feasible_others = [e for e in estimates if e.feasible and e.scope != best.scope]
+    runner_up = (
+        min(feasible_others, key=lambda e: (e.step_bound_us, e.ops_per_step))
+        if feasible_others
+        else None
+    )
+    ops = {e.scope: e.ops_per_step for e in estimates}
+    winners = _corner_winners(corners, ops) if hbm_fits else {}
+    flip = next(((c, w) for c, w in winners.items() if w != best.scope), None)
+    challenger = flip[1] if flip else (runner_up.scope if runner_up else None)
+    unresolved = _collect_unresolved_assumptions(
+        unresolved_context, (corners, best.scope, challenger)
+    )
+    scope_inputs = [str(u["name"]) for u in unresolved if u["affects"] == "scope"]
+    is_tie = hbm_fits and best.feasible and flip is not None
+    verdict = (
+        f"tie(measure: {_decisive_input(winners, scope_inputs)})"
+        if is_tie
+        else _scope_verdict(best.scope if (hbm_fits and best.feasible) else "per_op")
+    )
+    confidence = (
+        "validated_end_to_end"
+        if unresolved_context.per_op_step_tag == "MEASURED"
+        or (
+            meas is not None
+            and _is_calibrated_trace(meas)
+            and meas.step_time_us is not None
+        )
+        else ("bounded" if _is_calibrated_trace(meas) else "prior_only")
+    )
+    return tuple(flags_list), verdict, confidence, tuple(unresolved), flip
 
 
 def _build_provenance_and_verdict(
@@ -343,8 +781,9 @@ def _build_provenance_and_verdict(
     str,
     tuple[dict[str, object], ...],
     tuple[Corner, FusionScope] | None,
+    GainBasis,
 ]:
-    """Assemble provenance-tagged metrics, flags, confidence, and verdict."""
+    """Assemble provenance metrics, flags, confidence, verdict, and gain basis."""
     estimates, best, recommended, ridge_tokens, hbm_fits, meas, corners, lg_floor = info
     per_op_sc = estimates[0]
     d_ops = max(0, per_op_sc.ops_per_step - best.ops_per_step)
@@ -356,9 +795,13 @@ def _build_provenance_and_verdict(
         in_kernel_coll,
     ) = _resolve_calibrated_priors(workload, chip_spec, scope_context, meas)
 
-    # step_bound_us already carries ops * lg_floor; strip it before re-pricing.
-    base_per_op_us = per_op_sc.step_bound_us - per_op_sc.ops_per_step * lg_floor
-    base_best_us = best.step_bound_us - best.ops_per_step * lg_floor
+    # Strip ops * lg_floor and host_head_us from step_bound_us for pure device physics.
+    base_per_op_us = (
+        per_op_sc.step_bound_us
+        - per_op_sc.ops_per_step * lg_floor
+        - per_op_sc.host_head_us
+    )
+    base_best_us = best.step_bound_us - best.ops_per_step * lg_floor - best.host_head_us
     pure_diff_us = max(0.0, base_per_op_us - base_best_us)
     pp_zero_time = (
         scope_context.token_residual_bytes / chip_spec.ici_link_bw_bytes_per_s
@@ -378,7 +821,12 @@ def _build_provenance_and_verdict(
             measured_ar_in_kernel_s=None,
         ),
         profile,
-        replace(workload, op_overhead_us=0.0),
+        replace(
+            workload,
+            op_overhead_us=0.0,
+            host_head_per_op_us=0.0,
+            host_head_fused_us=0.0,
+        ),
     )
     zero_map = {e.scope: e for e in est_zero}
     fact_diff_us = round(
@@ -401,42 +849,41 @@ def _build_provenance_and_verdict(
     c_gain_tag: ProvenanceTag = (
         "ASSUMED" if (assumed_diff_us > 0.0 and not collectives_measured) else "DERIVED"
     )
-    b_val = round(d_ops * lg_val + pure_diff_us, 2)
-    b_lo = round(d_ops * lg_lo + pure_diff_us, 2)
-    b_hi = round(d_ops * lg_hi + pure_diff_us + ar_band_extra_us, 2)
+    host_head_gain_us = per_op_sc.host_head_us - best.host_head_us
+    b_val = round(d_ops * lg_val + pure_diff_us + host_head_gain_us, 2)
+    b_lo = round(d_ops * lg_lo + pure_diff_us + host_head_gain_us, 2)
+    b_hi = round(d_ops * lg_hi + pure_diff_us + host_head_gain_us + ar_band_extra_us, 2)
     b_tag: ProvenanceTag = (
         "MEASURED" if lg_tag == "MEASURED" and collectives_measured else "ASSUMED"
     )
 
-    denom_us = max(1e-6, base_per_op_us + per_op_sc.ops_per_step * lg_val)
-    fg_val = round(min(1.0, max(0.0, b_val / denom_us)), 4)
-    fg_lo = round(min(fg_val, max(0.0, b_lo / denom_us)), 4)
-    fg_hi = round(max(fg_val, min(1.0, b_hi / denom_us)), 4)
-    eg_val, eg_lo, eg_hi = (
-        round(fg_val * cov_val, 4),
-        round(fg_lo * cov_band[0], 4),
-        round(fg_hi * cov_band[1], 4),
+    (
+        per_op_step_val,
+        per_op_step_lo,
+        per_op_step_hi,
+        per_op_step_tag,
+        per_op_step_src,
+    ) = _resolve_per_op_step_provenance(
+        workload, meas, per_op_sc, base_per_op_us, lg_val
     )
-
-    # Tokens finished per step across the slice, divided by physical chips.
-    # active_tokens is per core: PCP splits the window, TP and DCP replicate it,
-    # and DP cancels (each replica owns its own tokens and devices).
-    eff_pcp = workload.pcp if workload.phase in ("prefill", "mixed") else 1
-    tokens_per_chip = (
-        scope_context.active_tokens
-        * eff_pcp
-        * chip_spec.devices_per_chip
-        / max(1, scope_context.eff_tp * workload.pp)
+    (
+        (fg_val, fg_lo, fg_hi),
+        (eg_val, eg_lo, eg_hi),
+        gain_basis,
+    ) = _compute_fusion_and_e2e_gains(
+        best,
+        per_op_sc,
+        (base_per_op_us, base_best_us, lg_val, per_op_step_val, per_op_step_tag),
+        (b_val, b_lo, b_hi),
+        (cov_val, cov_band, cov_tag),
     )
-    rec_upper_us = max(recommended.step_bound_us, recommended.step_upper_us)
-    can_run = hbm_fits and recommended.feasible
-    tput_hi = (
-        round(tokens_per_chip / max(1e-9, recommended.step_bound_us * 1e-6), 2)
-        if can_run
-        else 0.0
-    )
-    tput_lo = (
-        round(tokens_per_chip / max(1e-9, rec_upper_us * 1e-6), 2) if can_run else 0.0
+    (
+        break_even_host_head_us,
+        tput_lo,
+        tput_hi,
+        rec_upper_us,
+    ) = _resolve_break_even_head_and_tput(
+        estimates, best, recommended, chip_spec, (scope_context, workload, hbm_fits)
     )
 
     metrics: dict[str, ProvenanceMetric] = {
@@ -517,7 +964,11 @@ def _build_provenance_and_verdict(
             "value": b_val,
             "unit": "us",
             "tag": b_tag,
-            "source": "(per_op_ops - scope_ops) * launch_gap_us + collective_saving_us",
+            "source": (
+                "(per_op_ops - scope_ops) * launch_gap_us + "
+                "collective_saving_us + "
+                "(per_op_host_head_us - scope_host_head_us)"
+            ),
             "band": [min(b_lo, b_hi), max(b_lo, b_hi)],
         },
         "gain_fact_us": {
@@ -667,102 +1118,109 @@ def _build_provenance_and_verdict(
             "source": "constants.BOUNDARY_SYNC_HOP_FACTOR",
             "band": [0.0, float(BOUNDARY_SYNC_HOP_FACTOR)],
         },
+        "per_op_step_us": {
+            "value": per_op_step_val,
+            "unit": "us",
+            "tag": per_op_step_tag,
+            "source": per_op_step_src,
+            "band": [
+                min(per_op_step_lo, per_op_step_hi),
+                max(per_op_step_lo, per_op_step_hi),
+            ],
+        },
+        "gain_basis": {
+            "value": gain_basis,
+            "unit": "mode",
+            "tag": "MEASURED" if gain_basis == GAIN_BASIS_E2E else "ASSUMED",
+            "source": "per_op_step_us and step_coverage provenance",
+            "band": [1.0, 1.0] if gain_basis == GAIN_BASIS_E2E else [0.0, 0.0],
+        },
+        "host_head_us": {
+            "value": round(per_op_sc.host_head_us, 2),
+            "unit": "us",
+            "tag": "MEASURED" if workload.host_head_explicit else "ASSUMED",
+            "source": (
+                "WorkloadSpec --host-head-us (per_op; band spans [min, max] "
+                "across per_op and fastest scope)"
+                if workload.host_head_explicit
+                else "default 0.0 us host dispatch head"
+            ),
+            "band": [
+                round(min(per_op_sc.host_head_us, best.host_head_us), 2),
+                round(max(per_op_sc.host_head_us, best.host_head_us), 2),
+            ],
+        },
+        "break_even_host_head_delta_us": {
+            "value": break_even_host_head_us,
+            "unit": "us",
+            "tag": "DERIVED",
+            "source": "max(0, fused_device_bound_us - per_op_device_bound_us)",
+            "band": [break_even_host_head_us, break_even_host_head_us],
+        },
     }
-
-    hbm_pool_overflow = (
-        scope_context.hbm_used
-        > workload.hbm_utilization_cap * chip_spec.hbm_capacity_bytes
-    )
-    # A whole_step past its single-call row limit is priced as microbatches.
-    microbatched = 0 < scope_context.single_call_rows < scope_context.active_tokens
-    rows_per_call = min(
-        scope_context.active_tokens,
-        scope_context.single_call_rows or scope_context.active_tokens,
-    )
-    whole_step_ok = any(e.scope == "whole_step" and e.feasible for e in estimates)
-    flags_list = [
-        flag
-        for cond, flag in (
-            (profile.architecture_unverified, "architecture_unverified"),
-            # Separate calls are priced; extra passes inside one call are not.
-            (
-                best.n_splits > _summed_calls(best, scope_context),
-                "multi_call_unmodeled",
-            ),
-            (microbatched and whole_step_ok, "microbatch_rerun"),
-            (
-                whole_step_ok and exceeds_default_buckets(workload, rows_per_call),
-                "above_default_buckets",
-            ),
-            (hbm_pool_overflow, "hbm_pool_overflow"),
-            (
-                profile.dtype_source.startswith("default"),
-                "unquantized_default_dtype",
-            ),
-            (True, "core_limits_pinned"),
+    if meas is not None and meas.host_head_p50_us is not None:
+        host_head_lo = round(meas.host_head_p50_us, 2)
+        host_head_hi = round(
+            max(host_head_lo, meas.host_head_p90_us or host_head_lo), 2
         )
-        if cond
-    ]
-    feasible_others = [e for e in estimates if e.feasible and e.scope != best.scope]
-    runner_up = (
-        min(feasible_others, key=lambda e: (e.step_bound_us, e.ops_per_step))
-        if feasible_others
-        else None
-    )
-    # Every scope is priced at the same corner; a tie needs the winner to change.
-    ops = {e.scope: e.ops_per_step for e in estimates}
-    winners = _corner_winners(corners, ops) if hbm_fits else {}
-    flip = next(((c, w) for c, w in winners.items() if w != best.scope), None)
-    challenger = flip[1] if flip else (runner_up.scope if runner_up else None)
+        metrics["calibrated_host_head_us"] = {
+            "value": host_head_lo,
+            "unit": "us",
+            "tag": "MEASURED" if _is_calibrated_trace(meas) else "ASSUMED",
+            "source": (
+                f"{meas.source_desc} XLA Modules pre-first-op head "
+                f"(n={meas.host_head_n})"
+            ),
+            "band": [host_head_lo, host_head_hi],
+        }
+
     coll_eff_tag: ProvenanceTag = "MEASURED" if collectives_measured else coll_tag
-    unresolved = _collect_unresolved_assumptions(
+    row_limit_unresolved = any(
+        est.scope == "whole_step" and "row_limit_not_stated" in est.blockers
+        for est in estimates
+    )
+    unresolved_context = _UnresolvedContext(
+        profile=profile,
+        workload=workload,
+        chip_spec=chip_spec,
+        scope_context=scope_context,
+        meas=meas,
+        d_ops=d_ops,
+        b_val=b_val,
+        lg_val=lg_val,
+        lg_lo=lg_lo,
+        lg_hi=lg_hi,
+        lg_tag=lg_tag,
+        coll_val=coll_val,
+        coll_lo=coll_lo,
+        coll_hi=coll_hi,
+        coll_tag=coll_eff_tag,
+        cov_val=cov_val,
+        cov_tag=cov_tag,
+        per_op_step_val=per_op_step_val,
+        per_op_step_lo=per_op_step_lo,
+        per_op_step_hi=per_op_step_hi,
+        per_op_step_tag=per_op_step_tag,
+        break_even_host_head_us=break_even_host_head_us,
+        collectives_measured=collectives_measured,
+        row_limit_unresolved=row_limit_unresolved,
+    )
+    flags_tup, verdict, confidence, unresolved_tup, flip = _resolve_flags_and_verdict(
+        profile,
         workload,
         chip_spec,
         scope_context,
-        (
-            d_ops,
-            b_val,
-            (lg_lo, lg_hi, lg_tag),
-            (coll_lo, coll_hi, coll_eff_tag),
-            cov_tag,
-        ),
-        (corners, best.scope, challenger),
+        (estimates, best, hbm_fits, meas, corners, unresolved_context),
     )
-    if any(
-        est.scope == "whole_step" and "row_limit_not_stated" in est.blockers
-        for est in estimates
-    ):
-        bucket_top = (
-            CORE_LIMITS.default_verify_bucket_top
-            if workload.phase == "verify"
-            else CORE_LIMITS.default_decode_bucket_top
-        )
-        unresolved.append(
-            {
-                "name": "max_rows_per_call",
-                "band": [bucket_top, CORE_LIMITS.max_batch_rows],
-                "unit": "rows",
-                "sensitivity_us": 0.0,
-                "affects": "support",
-                "how_to_settle": (
-                    "Pass --max-rows-per-call or add a megakernel declaration "
-                    "in data/presets/deployments.json"
-                ),
-            }
-        )
-    scope_inputs = [str(u["name"]) for u in unresolved if u["affects"] == "scope"]
-    is_tie = hbm_fits and best.feasible and flip is not None
-    verdict = (
-        f"tie(measure: {_decisive_input(winners, scope_inputs)})"
-        if is_tie
-        else _scope_verdict(best.scope if (hbm_fits and best.feasible) else "per_op")
+    return (
+        metrics,
+        flags_tup,
+        verdict,
+        confidence,
+        unresolved_tup,
+        flip,
+        gain_basis,
     )
-    confidence = (
-        "validated_end_to_end"
-        if meas is not None and meas.step_time_us is not None
-        else ("bounded" if _is_calibrated_trace(meas) else "prior_only")
-    )
-    return metrics, tuple(flags_list), verdict, confidence, tuple(unresolved), flip
 
 
 def _format_advise_reason(
@@ -947,7 +1405,7 @@ def _assemble_advisor_report(
             else "masked_on_chip"
         )
 
-    metrics, flags, verdict, confidence, unresolved, flip = (
+    metrics, flags, verdict, confidence, unresolved, flip, gain_basis = (
         _build_provenance_and_verdict(
             profile,
             eff_wl,
@@ -1037,6 +1495,7 @@ def _assemble_advisor_report(
         fastest_verdict=fastest_verdict,
         evidence=recommended.support,
         hypothetical_best=hypothetical_best,
+        gain_basis=gain_basis,
         coverage=(
             "decoder layer stack; excludes embedding, LM head, sampling, "
             "draft heads and modality towers"
