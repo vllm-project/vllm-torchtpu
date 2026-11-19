@@ -214,6 +214,34 @@ def test_spec_warmup_batch_steps_and_blocks_follow_the_scheduler():
     assert len(block_ids) * spec.block_size >= ncts[-1] + 1 + K
 
 
+def test_spec_warmup_batch_mixed_steps_stay_within_max_model_len():
+    """With little room past the prompt, the decode run leaves room for the
+    two mixed verify+prefill steps after it: no step writes a position at or
+    past max_model_len."""
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+    )
+    captured = []
+    runner = _spec_warmup_runner(spec, config, captured, async_scheduling=True)
+    runner.max_model_len = 28
+    runner.max_num_reqs = 8
+    runner.max_num_tokens = 64
+    P, R = 4, 2
+
+    TPUModelRunner._warmup_spec_batch(runner, R, P, mixed=True)
+
+    K = runner.speculative_config.num_speculative_tokens
+    cached = [so for so in captured if so.scheduled_cached_reqs.req_ids]
+    assert sum(1 for so in cached if so.scheduled_new_reqs) == 2
+    last = max(
+        nct + K for so in cached for nct in so.scheduled_cached_reqs.num_computed_tokens
+    )
+    assert last < runner.max_model_len
+
+
 @pytest.mark.parametrize("dcp_size,expected_blocks", [(1, 65), (8, 9)])
 def test_spec_warmup_request_counts_blocks_in_block_table_units(
     dcp_size, expected_blocks
@@ -3470,6 +3498,7 @@ class TestAsyncSpecDecodeTokenAccounting:
     def _setup_runner(self, max_num_reqs=4, max_model_len=64):
         runner = MagicMock()
         runner.max_model_len = max_model_len
+        runner._decode_carry_enabled = False
         runner.input_batch = SimpleNamespace(
             token_ids_cpu=np.zeros((max_num_reqs, max_model_len), dtype=np.int32),
             num_tokens_no_spec=np.zeros((max_num_reqs,), dtype=np.int32),
@@ -3924,6 +3953,7 @@ def test_flush_keeps_zero_token_async_results_until_waited():
             req_id_to_index_copy={},
             copy_state=copy_state,
         ),
+        _decode_carry_enabled=False,
     )
     # A flush that rolls back calls self._modify_prev_results().
     runner._modify_prev_results = lambda: TPUModelRunner._modify_prev_results(runner)

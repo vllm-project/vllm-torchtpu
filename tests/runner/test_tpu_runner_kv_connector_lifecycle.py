@@ -75,6 +75,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     runner = SimpleNamespace(
         _pp_handoff=None,
         _dp_step_other_decode=False,
+        _decode_carry_enabled=False,
         num_prompt_logprobs={},
         _thinking_budget=None,
         _cached_output_req_ids_key=None,
@@ -142,6 +143,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
         "_build_kv_connector_output",
+        "_skips_multi_chunk_draft_cat",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     return runner

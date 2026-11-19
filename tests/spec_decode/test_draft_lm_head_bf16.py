@@ -49,9 +49,10 @@ class ParallelLMHead(torch.nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        torch.manual_seed(0)
+        generator = torch.Generator().manual_seed(0)
         self.weight = torch.nn.Parameter(
-            torch.randn(VOCAB, HIDDEN).to(torch.bfloat16), requires_grad=False
+            torch.randn(VOCAB, HIDDEN, generator=generator).to(torch.bfloat16),
+            requires_grad=False,
         )
         self.tp_size = 1
         self.org_vocab_size = VOCAB
@@ -143,6 +144,36 @@ def test_without_a_twin_the_draft_still_shares_the_target_head():
     assert draft.lm_head is target.lm_head
 
 
+@pytest.mark.parametrize("materialize", [False, True])
+def test_a_draft_on_another_tp_layout_releases_the_twin(monkeypatch, materialize):
+    """A draft on another TP layout (a replicated MTP draft, or DFlash, which
+    gathers a replicated copy from the twin) never binds the twin, so it is
+    released."""
+    target = _target_with_head()
+    _quantize_target_head_like_the_hook(target.lm_head)
+    twin = gtt.draft_bf16_head_of(target.lm_head)
+    draft = _Draft()
+    own = draft.lm_head
+    copied = []
+    monkeypatch.setattr(
+        utils,
+        "populate_draft_lm_head_from_target",
+        lambda _draft, head: copied.append(head),
+    )
+
+    utils.maybe_share_lm_head(
+        draft,
+        target,
+        draft_replicated=False,
+        tp_layout_matches=False,
+        materialize_if_mismatched=materialize,
+    )
+
+    assert draft.lm_head is own
+    assert copied == ([twin] if materialize else [])
+    assert gtt.draft_bf16_head_of(target.lm_head) is None
+
+
 def test_a_draft_with_its_own_head_releases_the_twin():
     target = _target_with_head()
     _quantize_target_head_like_the_hook(target.lm_head)
@@ -198,9 +229,7 @@ def test_post_load_hook_keeps_a_bf16_twin_by_default(monkeypatch):
     from vllm_torchtpu.models.vllm import qwen3_next_patch
 
     monkeypatch.setattr(qwen3_next_patch, "_quantize_target_lm_head", lambda: True)
-    monkeypatch.setattr(
-        qwen3_next_patch, "_speculative_decoding_configured", lambda: True
-    )
+    monkeypatch.setattr(qwen3_next_patch, "_draft_borrows_target_head", lambda: True)
     head = ParallelLMHead()
     w = head.weight
 
@@ -227,31 +256,46 @@ def test_post_load_hook_keeps_no_twin_without_a_draft(monkeypatch):
 
     monkeypatch.setattr(qwen3_next_patch, "_quantize_target_lm_head", lambda: True)
     # No speculative decoding: no twin, so no extra memory.
-    monkeypatch.setattr(
-        qwen3_next_patch, "_speculative_decoding_configured", lambda: False
-    )
+    monkeypatch.setattr(qwen3_next_patch, "_draft_borrows_target_head", lambda: False)
     head = ParallelLMHead()
     qwen3_next_patch.setup_qwen3_next_v6_after_loading(_fake_qwen3_next_model(head))
     assert head._quant_mode == "fp8" and gtt.draft_bf16_head_of(head) is None
 
 
-def test_speculative_decoding_configured_reads_the_vllm_config(monkeypatch):
+@pytest.mark.parametrize(
+    ("method", "borrows"),
+    [
+        ("mtp", True),
+        ("eagle3", True),
+        ("dflash", True),
+        ("dspark", True),
+        ("ngram", False),
+        (None, False),
+    ],
+)
+def test_only_a_draft_that_borrows_the_target_head_keeps_a_twin(
+    monkeypatch, method, borrows
+):
+    """The BF16 twin is kept only for an EAGLE/MTP, DFlash or DSpark draft,
+    the drafts that bind the target's head; an n-gram drafter or no drafter
+    keeps none."""
     import vllm.config
 
     from vllm_torchtpu.models.vllm import qwen3_next_patch
 
+    spec = (
+        None
+        if method is None
+        else SimpleNamespace(
+            method=method, use_eagle=lambda: method in ("eagle", "eagle3", "mtp")
+        )
+    )
     monkeypatch.setattr(
         vllm.config,
         "get_current_vllm_config",
-        lambda: SimpleNamespace(speculative_config=object()),
+        lambda: SimpleNamespace(speculative_config=spec),
     )
-    assert qwen3_next_patch._speculative_decoding_configured() is True
-    monkeypatch.setattr(
-        vllm.config,
-        "get_current_vllm_config",
-        lambda: SimpleNamespace(speculative_config=None),
-    )
-    assert qwen3_next_patch._speculative_decoding_configured() is False
+    assert qwen3_next_patch._draft_borrows_target_head() is borrows
 
 
 def _init_greedy_head(draft: torch.nn.Module):
@@ -261,6 +305,7 @@ def _init_greedy_head(draft: torch.nn.Module):
         draft_model=draft,
         vllm_config=None,
         runner=SimpleNamespace(_dp_lockstep_enabled=lambda: False),
+        _dp_lockstep_sharded=lambda: False,
     )
     Eagle3Proposer._init_draft_greedy_head(proposer)
     return proposer._draft_greedy_head_owner
@@ -294,14 +339,89 @@ def test_draft_greedy_head_defaults_to_bf16_with_no_proxy(monkeypatch):
     assert torch.equal(tokens, ref)
 
 
+def _vocab_parallel_owner(base_head: torch.nn.Module):
+    """The owner vocab_parallel_draft_owner builds at DP2 x TP1 on DP rank 1:
+    a proxy holding a _VocabParallelDraftHead over the upper half of
+    ``base_head``'s rows."""
+    head = gtt._VocabParallelDraftHead(
+        base_head, dp_rank=1, dp_size=2, tp_rank=0, tp_size=1
+    )
+    return gtt._DraftHeadOwnerProxy(_Processor(), head)
+
+
+def test_a_vocab_parallel_draft_head_releases_the_bf16_twin():
+    """Under EP-DP lockstep the vocab-parallel head clones its slice of the
+    BF16 twin, so the twin is released: the target head drops it, and the
+    draft's own reference now holds the vocab-parallel head. The head the
+    draft's tokens come from keeps its own copy of the same rows."""
+    draft, target = _shared_draft()
+    twin = gtt.draft_bf16_head_of(target.lm_head)
+    assert twin is not None and draft.lm_head is twin
+    upper_rows = twin.weight.detach()[VOCAB // 2 :].clone()
+    owner = _vocab_parallel_owner(twin)
+
+    assert gtt.release_twin_behind_vocab_parallel_head(owner, draft, target.lm_head)
+
+    assert gtt.draft_bf16_head_of(target.lm_head) is None
+    assert draft.lm_head is owner.lm_head
+    assert all(module is not twin for module in draft.modules())
+    assert torch.equal(owner.lm_head.weight, upper_rows)
+    assert owner.lm_head.weight.data_ptr() != twin.weight.data_ptr()
+
+
+@pytest.mark.parametrize("owner_kind", ["fallback", "per_tp_group"])
+def test_the_bf16_twin_stays_while_the_draft_reads_it(owner_kind):
+    """Without a greedy head (compute_logits + argmax reads the draft's head)
+    or with the per-TP-group head (the twin itself), the twin is kept."""
+    draft, target = _shared_draft()
+    twin = gtt.draft_bf16_head_of(target.lm_head)
+    owner = None if owner_kind == "fallback" else gtt.resolve_head_owner(draft, False)
+
+    assert not gtt.release_twin_behind_vocab_parallel_head(owner, draft, target.lm_head)
+
+    assert gtt.draft_bf16_head_of(target.lm_head) is twin
+    assert draft.lm_head is twin
+
+
+@pytest.mark.parametrize("vocab_parallel", [True, False])
+def test_the_proposer_releases_the_twin_behind_a_vocab_parallel_head(vocab_parallel):
+    """load_model releases the twin right after resolving the greedy head, and
+    only when that head is the vocab-parallel one."""
+    import ast
+    import inspect
+    import textwrap
+
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    draft, target = _shared_draft()
+    twin = gtt.draft_bf16_head_of(target.lm_head)
+    proposer = SimpleNamespace(
+        draft_model=draft,
+        _draft_greedy_head_owner=_vocab_parallel_owner(twin)
+        if vocab_parallel
+        else None,
+    )
+
+    Eagle3Proposer._release_unread_draft_bf16_head(proposer, target)
+
+    assert (gtt.draft_bf16_head_of(target.lm_head) is None) is vocab_parallel
+    tree = ast.parse(textwrap.dedent(inspect.getsource(Eagle3Proposer.load_model)))
+    lines = {
+        node.func.attr: node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert (
+        lines["_release_unread_draft_bf16_head"] == lines["_init_draft_greedy_head"] + 1
+    )
+
+
 def test_target_lm_head_stays_bf16_by_default(monkeypatch):
     """quantize_target_lm_head is off unless set: the target head keeps its
     BF16 weight and no twin is made, whatever the draft."""
     from vllm_torchtpu.models.vllm import qwen3_next_patch
 
-    monkeypatch.setattr(
-        qwen3_next_patch, "_speculative_decoding_configured", lambda: True
-    )
+    monkeypatch.setattr(qwen3_next_patch, "_draft_borrows_target_head", lambda: True)
     monkeypatch.setattr(qwen3_next_patch, "_quantize_target_lm_head", lambda: False)
     head = ParallelLMHead()
     w = head.weight

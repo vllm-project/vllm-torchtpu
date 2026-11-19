@@ -96,8 +96,9 @@ def test_substitution_enabled_fast_path():
 def test_spec_verify_step_skips_the_fast_slice():
     """A spec-verify step (spec_decode_metadata set) goes through the
     substitution kernel even when the fast slice would apply: the verify path
-    needs the substituted ids (and, on TPU, the fused draft-token extract), not
-    a slice view of the previous step's tokens."""
+    needs the substituted ids, not a slice view of the previous step's tokens.
+    On TPU that step runs the fused draft-token extract instead; this CPU test
+    checks only the kernel call, not the TPU fused path."""
     runner = SimpleNamespace(
         _fast_token_substitution=True,
         device=torch.device("cpu"),

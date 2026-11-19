@@ -205,11 +205,14 @@ def test_fit_rows_returns_slices_or_pads_the_leading_dim():
 
 @pytest.fixture
 def qwen3_5_draft_path_rule(monkeypatch):
-    """The registry holding exactly Qwen3.5's rule, as register_models leaves it."""
-    from vllm_torchtpu.models.qwen3_5.hooks import mtp_draft_path
+    """The registry holding exactly Qwen3.5's rule, as register_models leaves it,
+    on the checkpoint and device the rule was validated on."""
+    from vllm_torchtpu.models.qwen3_5 import hooks
     from vllm_torchtpu.spec_decode import draft_path_rules
 
-    monkeypatch.setattr(draft_path_rules, "_RULES", [mtp_draft_path])
+    monkeypatch.setattr(draft_path_rules, "_RULES", [hooks.mtp_draft_path])
+    monkeypatch.setattr(hooks, "has_calibrated_shape", lambda _model_config: True)
+    monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
 
 
 def _qwen35_mtp_config(arch="Qwen3_5MoeForConditionalGeneration", method="mtp"):
@@ -256,6 +259,41 @@ def test_qwen3_5_mtp_rules_follow_the_model_and_draft(
         utils.fused_draft_loop_enabled(config, draft_kv_shared=False, dp_lockstep=False)
         is expected
     )
+
+
+@pytest.mark.parametrize(
+    ("chip", "num_experts", "expected"),
+    [
+        ("7x", 512, True),
+        ("v6e", 512, False),
+        (None, 512, False),
+        ("7x", 256, False),
+        (None, 256, False),
+    ],
+)
+def test_qwen3_5_mtp_rule_holds_only_where_validated(
+    monkeypatch, chip, num_experts, expected
+):
+    """The rule turns the draft path on only for the checkpoint shape and
+    device it was validated on (Qwen3.5-397B-A17B on TPU7x); another Qwen3.5
+    checkpoint or device keeps main's opt-in keys, and that checkpoint on a
+    chip that cannot be read warns once."""
+    from types import SimpleNamespace as NS
+
+    from vllm_torchtpu.models.qwen3_5 import hooks
+    from vllm_torchtpu.spec_decode import draft_path_rules
+
+    monkeypatch.setattr(draft_path_rules, "_RULES", [hooks.mtp_draft_path])
+    monkeypatch.setattr(hooks, "_chip_family", lambda: chip)
+    warned = []
+    monkeypatch.setattr(hooks.logger, "warning_once", lambda *a, **k: warned.append(a))
+    config = _qwen35_mtp_config()
+    config.model_config.hf_text_config = NS(
+        num_experts=num_experts, hidden_size=4096, num_hidden_layers=60
+    )
+    assert draft_path_rules.holds(config) is expected
+    # Only the validated checkpoint on an unknown chip says why the path is off.
+    assert bool(warned) is (chip is None and num_experts == 512)
 
 
 def test_qwen3_5_fused_draft_loop_rule_exceptions(monkeypatch, qwen3_5_draft_path_rule):
@@ -319,19 +357,3 @@ def test_matching_names_the_rule_that_applies(qwen3_5_draft_path_rule):
         "vllm_torchtpu.models.qwen3_5.hooks.mtp_draft_path"
     ]
     assert draft_path_rules.matching(_qwen35_mtp_config(method="eagle3")) == []
-
-
-@pytest.mark.parametrize("registered", [True, False])
-def test_qwen3_5_mtp_without_its_rule_warns_once(monkeypatch, registered):
-    """A Qwen3.5 MTP engine warns when its draft-path rule is missing, and
-    stays quiet when it is registered."""
-    from vllm_torchtpu.models.qwen3_5 import hooks
-    from vllm_torchtpu.spec_decode import draft_path_rules
-
-    monkeypatch.setattr(
-        draft_path_rules, "_RULES", [hooks.mtp_draft_path] if registered else []
-    )
-    warned = []
-    monkeypatch.setattr(hooks.logger, "warning_once", lambda *a, **k: warned.append(a))
-    hooks.warn_if_no_draft_path_rule(_qwen35_mtp_config())
-    assert bool(warned) is (not registered)

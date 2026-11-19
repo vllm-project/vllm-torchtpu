@@ -204,6 +204,10 @@ class AsyncPreResults:
     # it does not count proposals for the next step. Bootstrap/non-spec: 0 or
     # absent entry (None for an entirely non-spec result).
     num_draft_per_req: dict[int, int] | None = None
+    # The decode carry's number for these results (decode_carry.tag_results),
+    # so a carry can tell which step's rejected counts it saw. None while the
+    # carry is off.
+    decode_carry_seq: int | None = None
 
     def wait_for_copy(self) -> torch.Tensor | None:
         if self.copy_state is None:

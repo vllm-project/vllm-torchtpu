@@ -387,33 +387,27 @@ def mtp_draft_path(vllm_config: VllmConfig) -> bool:
     """Qwen3.5's draft-path rule (spec_decode/draft_path_rules.py): a Qwen3.5
     target with an MTP draft runs greedy top tokens, fast token substitution
     and the fused MTP draft loop by default, and batch-1 async decode runs the
-    runner's decode carry. These are the configurations they were validated
-    on."""
+    runner's decode carry. Like every default in this file, only for the
+    checkpoint shape and device they were validated on (_is_calibrated); any
+    other Qwen3.5 engine keeps main's opt-in keys. Read once at engine and
+    drafter start, not per step."""
     spec = vllm_config.speculative_config
-    return (
-        spec is not None
-        and spec.method == "mtp"
-        and settings.is_qwen3_5(vllm_config.model_config)
-    )
-
-
-def warn_if_no_draft_path_rule(vllm_config: VllmConfig) -> None:
-    """A Qwen3.5 MTP engine whose draft-path rule is not registered (for
-    example, register_models did not run in this process) silently keeps
-    main's opt-in defaults; say so once."""
-    from vllm_torchtpu.spec_decode import draft_path_rules
-
-    spec = vllm_config.speculative_config
+    model_config = vllm_config.model_config
     if (
-        spec is not None
-        and spec.method == "mtp"
-        and not draft_path_rules.registered(mtp_draft_path)
+        spec is None
+        or spec.method != "mtp"
+        or not settings.is_qwen3_5(model_config)
+        or not has_calibrated_shape(model_config)
     ):
+        return False
+    chip = _chip_family()
+    if chip is None:
         logger.warning_once(
-            "Qwen3.5 MTP: the draft-path rule (mtp_draft_path) is not "
-            "registered, so greedy top tokens, fast token substitution, the "
-            "fused MTP draft loop and the batch-1 decode carry stay off."
+            "Qwen3.5 MTP: this checkpoint's draft-path defaults were validated "
+            "on TPU7x, but this host's TPU chip is unknown (is "
+            "TPU_ACCELERATOR_TYPE set?), so they stay off."
         )
+    return chip == _CALIBRATED_CHIP
 
 
 def apply_serving_defaults(vllm_config: VllmConfig) -> None:
@@ -436,4 +430,3 @@ class TPUQwen35MoeConfig(Qwen3_5ForConditionalGenerationConfig):
         # Fails at engine start on an unknown setting or a wrongly typed value.
         settings.get(vllm_config)
         apply_serving_defaults(vllm_config)
-        warn_if_no_draft_path_rule(vllm_config)

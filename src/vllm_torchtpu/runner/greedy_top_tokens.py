@@ -423,7 +423,7 @@ def tpu_get_top_tokens(
         raise ValueError(
             f"scale must be > 0.0 for greedy argmax reduction, got {self.scale}"
         )
-    if getattr(lm_head, "_vp_draft", False):
+    if isinstance(lm_head, _VocabParallelDraftHead):
         return _vocab_parallel_draft_top_tokens(
             self, lm_head, hidden_states, embedding_bias
         )
@@ -931,8 +931,8 @@ class _VocabParallelDraftHead(torch.nn.Module):
 
     Every rank must run each pass, with the same row count: true under
     EP-DP lockstep for a TP-sharded draft, where busy and idle engines run
-    the same ``_draft_propose_token`` / fused-loop programs at the loop
-    bucket of ``max_num_reqs`` (``Eagle3Proposer._loop_bucket``).
+    the same ``_draft_propose_token`` programs at the step's coordinated loop
+    bucket (``Eagle3Proposer._loop_bucket``).
     Rank-specific values (vocab start, padding, DP rank) are tensor buffers
     so every rank compiles the same program.
     """
@@ -996,7 +996,6 @@ class _VocabParallelDraftHead(torch.nn.Module):
             torch.tensor(perm, dtype=torch.int64, device=device),
             persistent=False,
         )
-        self._vp_draft = True
         self._quant_mode = None
         self._quant_group_size = None
         self._quant_desc = "bf16"
@@ -1165,13 +1164,43 @@ def draft_bf16_head_of(target_head: object) -> torch.nn.Module | None:
 
 
 def release_draft_bf16_head(target_head: object) -> None:
-    """Drops the BF16 head kept for a draft that turned out to have its own."""
+    """Drops the BF16 head kept for a draft that does not read it."""
     state = getattr(target_head, "__dict__", None)
     if state is not None and state.pop(_DRAFT_BF16_HEAD_ATTR, None) is not None:
         logger.info(
-            "The draft has its own lm_head; released the BF16 copy of the "
-            "target's head."
+            "The draft does not use the BF16 copy of the target's lm_head; released it."
         )
+
+
+def release_twin_behind_vocab_parallel_head(
+    owner: torch.nn.Module | None,
+    draft_model: torch.nn.Module,
+    target_head: object,
+) -> bool:
+    """Drops the BF16 head kept for the draft once only a vocab-parallel draft
+    head reads it, and says whether it did.
+
+    ``_VocabParallelDraftHead`` clones its slice of that head, so with such an
+    ``owner`` the draft's tokens no longer read the BF16 head; it stays alive
+    only through the draft's own reference and the target head's. Both go: the
+    draft's modules that held it hold the vocab-parallel head instead. With any
+    other owner, or none (compute_logits + argmax reads the draft's head), the
+    BF16 head is kept."""
+    if owner is None or not isinstance(owner.lm_head, _VocabParallelDraftHead):
+        return False
+    twin = draft_bf16_head_of(target_head)
+    if twin is None:
+        return False
+    holders = [
+        (module, name)
+        for module in draft_model.modules()
+        for name, child in module.named_children()
+        if child is twin
+    ]
+    for module, name in holders:
+        setattr(module, name, owner.lm_head)
+    release_draft_bf16_head(target_head)
+    return True
 
 
 def head_precision(head: object) -> str:
@@ -1196,24 +1225,13 @@ def target_head_dp_mode(dp_lockstep: bool, tp_size: int) -> str:
     always replay the stock one; collectives pair across ranks in emission
     order, so the target stays on the stock path there. The draft is not
     affected: its tokens are always a greedy argmax, and an idle engine's
-    dummy draft runs the same ``_draft_propose_token`` program
-    (see ``draft_head_dp_lockstep``).
+    dummy draft runs the same ``_draft_propose_token`` program, so the
+    draft's head owner is resolved as off lockstep
+    (``Eagle3Proposer._init_draft_greedy_head``).
     """
     if dp_lockstep and tp_size > 1:
         return "stock"
     return "fast"
-
-
-def draft_head_dp_lockstep(dp_lockstep: bool) -> bool:
-    """The ``dp_lockstep`` a draft head owner is resolved with.
-
-    Always False: the MTP/EAGLE draft head's argmax runs in
-    ``_draft_propose_token`` for busy engines and for an idle engine's
-    ``run_dp_dummy_draft`` alike, so every rank emits the same pair exchange
-    in the same order, whatever the requests' sampling params.
-    """
-    del dp_lockstep
-    return False
 
 
 def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Module:

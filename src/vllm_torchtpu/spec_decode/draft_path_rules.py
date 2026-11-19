@@ -17,10 +17,10 @@ Main keeps greedy top tokens, fast token substitution and the fused MTP draft
 loop opt-in (TPU_GREEDY_TOP_TOKENS, VLLM_TPU_FAST_TOKEN_SUBSTITUTION,
 VLLM_TPU_FUSED_DRAFT_LOOP), and the runner's batch-1 decode carry off. A model
 package registers a rule at model registration (models/vllm/__init__.py) for
-the configurations it has validated with them; spec_decode/utils.py and
-runner/decode_carry.py ask only whether a registered rule holds, so they carry
-no model-specific logic. This module imports nothing, so registering a rule
-at plugin load costs nothing.
+the configurations it has validated with them; the code that turns those
+paths on (spec_decode/utils.py, runner/decode_carry.py) asks only whether a
+registered rule holds, so it carries no model-specific logic. This module
+imports nothing, so registering a rule at plugin load costs nothing.
 """
 
 from __future__ import annotations
@@ -41,11 +41,6 @@ def holds(vllm_config: Any) -> bool:
     """Whether any registered rule turns the draft-path programs on for this
     configuration."""
     return any(rule(vllm_config) for rule in _RULES)
-
-
-def registered(rule: Callable[[Any], bool]) -> bool:
-    """Whether ``rule`` is registered."""
-    return rule in _RULES
 
 
 def matching(vllm_config: Any) -> list[str]:

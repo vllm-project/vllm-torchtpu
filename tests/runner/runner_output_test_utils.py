@@ -82,6 +82,7 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
         _pre_async_results=None,
         _pp_handoff=None,
         _dp_step_other_decode=False,
+        _decode_carry_enabled=False,
         speculative_config=None,
         scheduler_config=SimpleNamespace(async_scheduling=False),
         _is_async_drafter=False,

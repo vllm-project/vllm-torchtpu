@@ -484,6 +484,7 @@ def test_compiled_async_spec_helpers_match_eager(device):
     runner = object.__new__(TPUModelRunner)
     runner.device = device
     runner.max_num_reqs = 8
+    runner._zero_draft_lengths_cache = {}
     runner.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     drafts_view = drafts_p[:2]
     runner.drafter = _eagle3_drafter_stand_in(
@@ -715,6 +716,179 @@ def test_subtract_and_substitute_draft_token_ids_and_two_chunk_mamba_offsets():
     assert int(read_offsets[5]) == 0
 
 
+class _TpuTyped(torch.Tensor):
+    """A CPU tensor whose ``device`` reads as a TPU device, so the runner's
+    TPU-only assembly branches run on CPU (with the programs' eager bodies)."""
+
+    @property
+    def device(self):
+        return SimpleNamespace(type="tpu")
+
+
+def _eager(program):
+    return program.__wrapped__._torchdynamo_orig_callable
+
+
+def _verify_output():
+    """A 4-row rejection output (K = 3): 3, 0 and 1 drafts accepted, one
+    padding row."""
+    return torch.tensor(
+        [
+            [10, 11, 12, 13],
+            [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+            [30, 31, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+            [0, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+        ],
+        dtype=torch.int32,
+    )
+
+
+def _padded_drafts(rows, k=3):
+    return 100 * torch.arange(1, rows + 1, dtype=torch.int32).unsqueeze(
+        1
+    ) + torch.arange(k, dtype=torch.int32)
+
+
+@pytest.mark.parametrize("draft_rows", [2, 4, 8])
+@pytest.mark.parametrize("num_groups", [1, 2])
+def test_one_chunk_assembly_with_read_offsets_matches_the_separate_programs(
+    draft_rows, num_groups
+):
+    """The one-chunk program that folds in the mamba read-offset scatter
+    gives the eager assembly's substitution source and rejected counts and
+    the verify scatter's read offsets, for drafts with fewer, as many and
+    more rows than the sampled output, and one or two mamba groups."""
+    from vllm_torchtpu.runner.tpu_runner import (
+        _compiled_assemble_spec_rejected_and_read_offsets,
+        _update_read_offsets_verify_impl,
+    )
+    from vllm_torchtpu.spec_decode.utils import fit_rows
+
+    k, max_num_reqs = 3, 8
+    bound = max_num_reqs * (1 + k)
+    nt = _verify_output()
+    drafts = _padded_drafts(draft_rows)
+    draft_lengths = torch.tensor([3, 3, 3, 0], dtype=torch.int32)
+    groups = torch.tensor(
+        [[5, 7, 9, 0, 0, 0, 0, 0], [11, 13, 15, 0, 0, 0, 0, 0]], dtype=torch.int32
+    )
+    stacked = groups[0] if num_groups == 1 else groups
+    offsets = torch.full((16,), -7, dtype=torch.int32)
+    src, rejected = _eager(_compiled_assemble_spec_rejected_and_read_offsets)(
+        nt, drafts, draft_lengths, offsets, stacked, bound, max_num_reqs
+    )
+    want_offsets = torch.full((16,), -7, dtype=torch.int32)
+    _update_read_offsets_verify_impl(want_offsets, stacked, nt)
+    assert torch.equal(offsets, want_offsets)
+    assert offsets[[5, 7, 9]].tolist() == [3, 0, 1]
+    rows = nt.shape[0] * (1 + k)
+    assert src.shape == (bound,)
+    assert torch.equal(src[:rows], assemble_spec_next_tokens(nt, fit_rows(drafts, 4)))
+    assert not src[rows:].any()
+    assert rejected.shape == (max_num_reqs,)
+    assert torch.equal(rejected[:4], compute_num_rejected(nt, draft_lengths))
+    assert not rejected[4:].any()
+
+
+def _assembly_runner(drafts_view, padded):
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    runner = object.__new__(TPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.max_num_reqs = 8
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    runner._adaptive_verification = None
+    runner._zero_draft_lengths_cache = {}
+    runner.drafter = _eagle3_drafter_stand_in(
+        _last_padded_drafts_per_chunk=padded, _last_propose_device_out=drafts_view
+    )
+    return runner
+
+
+def test_assembly_folds_deferred_read_offsets_into_the_one_chunk_program(
+    monkeypatch,
+):
+    """With deferred mamba indices, the one-chunk assembly runs the program
+    that scatters the read offsets too (not the separate scatter), with the
+    same source, rejected counts and offsets as the general path."""
+    from vllm_torchtpu.runner.tpu_runner import (
+        TPUModelRunner,
+        _compiled_assemble_spec_rejected_and_read_offsets,
+    )
+
+    ran = []
+
+    def fused(*args):
+        ran.append("fused")
+        return _eager(_compiled_assemble_spec_rejected_and_read_offsets)(*args)
+
+    def separate(*_args, **_kwargs):
+        raise AssertionError("the separate read-offset scatter ran")
+
+    monkeypatch.setattr(
+        tpu_runner, "_compiled_assemble_spec_rejected_and_read_offsets", fused
+    )
+    monkeypatch.setattr(TPUModelRunner, "_update_mamba_slot_read_offsets", separate)
+    padded = [_padded_drafts(8)]
+    drafts_view = padded[0][:3]
+    runner = _assembly_runner(drafts_view, padded)
+    runner.mamba_slot_read_offsets = torch.zeros(16, dtype=torch.int32)
+    md = SimpleNamespace(
+        draft_lengths=torch.tensor([3, 3, 3, 0], dtype=torch.int32),
+        draft_lengths_cpu=np.array([3, 3, 3], dtype=np.int32),
+    )
+    state = SimpleNamespace(num_reqs_list=[3], spec_decode_metadata_list=[md])
+    indices = torch.tensor([5, 7, 9, 0, 0, 0, 0, 0], dtype=torch.int32)
+    nt = _verify_output()
+    chunks, next_idx, rejected, counts = runner._assemble_async_spec_substitution(
+        drafts_view,
+        [nt.as_subclass(_TpuTyped)],
+        state,
+        deferred_mamba_indices=[indices],
+    )
+    assert ran == ["fused"]
+    assert runner.mamba_slot_read_offsets[[5, 7, 9]].tolist() == [3, 0, 1]
+    assert next_idx == {0: 0, 1: 1, 2: 2} and counts == {0: 3, 1: 3, 2: 3}
+    want = assemble_spec_next_tokens(nt, padded[0], 3)
+    assert torch.equal(chunks[0][: want.shape[0]], want)
+    assert (
+        rejected[:3].tolist() == compute_num_rejected(nt, md.draft_lengths[:3]).tolist()
+    )
+
+
+@pytest.mark.parametrize("draft_rows", [4, 8])
+def test_prefill_bootstrap_program_matches_the_general_bootstrap(
+    monkeypatch, draft_rows
+):
+    """The compiled bootstrap (its eager body) parks each request's sampled
+    token and its drafts where the general bootstrap does, with no rejected
+    drafts and no drafts counted for this step."""
+    monkeypatch.setattr(
+        async_output,
+        "_compiled_assemble_prefill_bootstrap",
+        _eager(async_output._compiled_assemble_prefill_bootstrap),
+    )
+    n, k = 3, 3
+    padded = [_padded_drafts(draft_rows)]
+    drafts_view = padded[0][:n]
+    selected = torch.tensor([[71], [72], [73], [0]], dtype=torch.int64)
+    general = _assembly_runner(drafts_view, padded)._assemble_async_prefill_bootstrap(
+        drafts_view, [selected], [n]
+    )
+    fused = _assembly_runner(drafts_view, padded)._assemble_async_prefill_bootstrap(
+        drafts_view, [selected.as_subclass(_TpuTyped)], [n]
+    )
+    assert len(general[0]) == 1 and len(fused[0]) == 1
+    assert fused[0][0].shape == (8 * (1 + k),)
+    assert fused[1] == general[1] == {0: 0, 1: 1, 2: 2}
+    assert fused[3] == general[3] == {0: 0, 1: 0, 2: 0}
+    for src, _, _, _ in (general, fused):
+        assert [src[0][r * (1 + k) : (r + 1) * (1 + k)].tolist() for r in range(n)] == [
+            [71 + r] + padded[0][r].tolist() for r in range(n)
+        ]
+    assert not general[2].any() and not fused[2].any()
+
+
 _ASSEMBLY_PROGRAMS = (
     "_compiled_pad_non_spec_next_tokens",
     "_compiled_assemble_prefill_bootstrap",
@@ -723,11 +897,19 @@ _ASSEMBLY_PROGRAMS = (
     "_compiled_subtract_num_rejected_tokens",
     "_compiled_subtract_and_substitute_placeholder_token",
     "_compiled_subtract_and_substitute_draft_token_ids",
+    "_compiled_carry_subtract_and_substitute_draft_token_ids",
 )
+# The rejected-draft subtraction programs, warmed at every token bucket.
+_SUBTRACT_PROGRAMS = _ASSEMBLY_PROGRAMS[4:7]
 
 
 def _assembly_warmup_calls(
-    monkeypatch, *, async_scheduling=True, most=None, async_drafter=True
+    monkeypatch,
+    *,
+    async_scheduling=True,
+    most=None,
+    async_drafter=True,
+    runner_fields=None,
 ):
     """Run _precompile_async_spec_assembly on a stub runner and record the
     shapes each assembly program was warmed with."""
@@ -759,8 +941,13 @@ def _assembly_warmup_calls(
         num_reqs_most_model_len=most,
         uses_mrope=False,
         device=torch.device("cpu"),
+        drafter=None,
         _precompile_timed=lambda name: contextlib.nullcontext(),
+        _decode_carry_enabled=False,
+        _dp_lockstep_enabled=lambda: False,
     )
+    for name, value in (runner_fields or {}).items():
+        setattr(runner, name, value)
     tpu_runner.TPUModelRunner._precompile_async_spec_assembly(runner)  # type: ignore[arg-type]
     return calls
 
@@ -782,11 +969,57 @@ def test_async_spec_assembly_warmup_covers_every_bucket(monkeypatch):
     two = calls["_compiled_assemble_two_chunks_spec_and_rejected"]
     assert two and all(c[0][0] + c[3][0] <= max_num_reqs for c in two)
     assert {(c[0][0], c[3][0]) for c in two} >= {(2, 2), (2, 4), (4, 4)}
-    for name in _ASSEMBLY_PROGRAMS[4:]:
+    for name in _SUBTRACT_PROGRAMS:
         warmed = {(c[0][0], c[1][-1]) for c in calls[name]}
         # Every token bucket, for both the max-model-len and the
         # most-model-len request layouts.
         assert warmed == {(knr, t) for knr in (8, 4) for t in (8, 16, 32)}, name
+
+
+@pytest.mark.parametrize("uses_mrope", [False, True])
+@pytest.mark.parametrize("lockstep", [False, True])
+@pytest.mark.parametrize("paddings", [[4, 8, 16, 32], [2, 4, 16, 32]])
+def test_decode_carry_program_is_warmed_at_every_carried_shape(
+    monkeypatch, paddings, lockstep, uses_mrope
+):
+    """The decode carry's form of the draft-token program serves a carried step:
+    one request (max_num_seqs == 1) with its bonus token and 1 to K drafts,
+    padded to the first token bucket at or above that count (under EP-DP
+    lockstep, to the DP-wide bucket, which can be any), at either request
+    layout, with step_delta = 1 + K baked in. The warm-up compiles exactly
+    those shapes, with the arguments the draft-token program takes there.
+    With K = 3 the carried counts 2 to 4 pad to bucket 4 alone, or to 2 and 4."""
+    calls = _assembly_warmup_calls(
+        monkeypatch,
+        most=4,
+        runner_fields=dict(
+            _decode_carry_enabled=True,
+            _dp_lockstep_enabled=lambda: lockstep,
+            num_tokens_paddings=paddings,
+            uses_mrope=uses_mrope,
+        ),
+    )
+    k = 3
+    buckets = (
+        set(paddings)
+        if lockstep
+        else {min(t for t in paddings if t >= n) for n in range(2, k + 2)}
+    )
+    served = {(knr, t) for knr in (8, 4) for t in buckets}
+    carry = calls["_compiled_carry_subtract_and_substitute_draft_token_ids"]
+    assert {(c[0][0], c[1][-1]) for c in carry} == served
+    assert len(carry) == len(served)
+    assert all(c[2] == 1 + k for c in carry)
+    assert all(len(c[1]) == (2 if uses_mrope else 1) for c in carry)
+    draft = calls["_compiled_subtract_and_substitute_draft_token_ids"]
+    assert {c[:2] + c[3:] for c in carry} == {
+        c for c in draft if (c[0][0], c[1][-1]) in served
+    }
+
+
+def test_decode_carry_program_is_not_warmed_without_the_carry(monkeypatch):
+    calls = _assembly_warmup_calls(monkeypatch, most=4)
+    assert not calls["_compiled_carry_subtract_and_substitute_draft_token_ids"]
 
 
 def test_async_spec_assembly_warmup_needs_async_scheduling(monkeypatch):
@@ -797,6 +1030,169 @@ def test_async_spec_assembly_warmup_needs_async_scheduling(monkeypatch):
 def test_async_spec_assembly_warmup_needs_an_async_drafter(monkeypatch):
     calls = _assembly_warmup_calls(monkeypatch, async_drafter=False)
     assert all(not c for c in calls.values())
+
+
+# A 32-request engine: request buckets 8/16/32, loop buckets 16/32/64.
+_LOCKSTEP_FIELDS = dict(
+    max_num_reqs=32,
+    num_reqs_paddings=[8, 16, 32],
+    num_tokens_paddings=[16, 32, 64],
+    num_reqs_max_model_len=32,
+)
+
+
+def _sharded_mtp_drafter(runner, lockstep):
+    """A TP-sharded Eagle3 drafter on `runner`, under EP-DP lockstep or not."""
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    runner._dp_lockstep_enabled = lambda: lockstep
+    runner._dp_step_max_reqs = 0
+    drafter = object.__new__(Eagle3Proposer)
+    drafter.runner = runner
+    drafter._draft_replicated = False
+    return drafter
+
+
+def _served_assembly_shapes(runner, drafter, lockstep):
+    """The shapes the compiled assembly takes while serving: per chunk, its
+    request bucket and the drafter's padded draft rows (the program runs when
+    the drafts cover the sampled rows); per two-chunk step, both chunks of one
+    step, whose request buckets fit max_num_reqs. Under lockstep every step's
+    DP-wide largest chunk m is walked, with every chunk of at most m requests."""
+    top = runner.max_num_reqs
+    one, two = set(), set()
+    for m in range(1, top + 1) if lockstep else [0]:
+        runner._dp_step_max_reqs = m
+        chunks = set()
+        for n in range(1, (m if lockstep else top) + 1):
+            shape = (
+                tpu_runner._get_padded_num_reqs_with_upper_limit(n, top),
+                drafter._loop_bucket(n),
+            )
+            if shape[1] >= shape[0]:
+                chunks.add(shape)
+        one |= chunks
+        two |= {(c0, c1) for c0 in chunks for c1 in chunks if c0[0] + c1[0] <= top}
+    runner._dp_step_max_reqs = 0
+    return one, two
+
+
+@pytest.mark.parametrize("lockstep", [False, True])
+def test_async_spec_assembly_warmup_covers_the_drafters_loop_buckets(
+    monkeypatch, lockstep
+):
+    """Under EP-DP lockstep the drafter pads a chunk's drafts to the loop
+    bucket of the step's DP-wide largest chunk, so a chunk pairs with every
+    loop bucket from its own up; the warm-up compiles each pair the serving
+    assembly takes, and off lockstep the same pairs as before."""
+    runner = SimpleNamespace(**_LOCKSTEP_FIELDS)
+    drafter = _sharded_mtp_drafter(runner, lockstep)
+    calls = _assembly_warmup_calls(
+        monkeypatch, runner_fields=dict(_LOCKSTEP_FIELDS, drafter=drafter)
+    )
+    one, two = _served_assembly_shapes(runner, drafter, lockstep)
+    if lockstep:
+        assert (8, 32) in one and (16, 32) in one
+    else:
+        assert one == {(8, 16), (16, 16), (32, 32)}
+    for name in (
+        "_compiled_assemble_spec_and_rejected",
+        "_compiled_assemble_prefill_bootstrap",
+    ):
+        assert {(c[0][0], c[1][0]) for c in calls[name]} == one, name
+    warmed_two = {
+        ((c[0][0], c[1][0]), (c[3][0], c[4][0]))
+        for c in calls["_compiled_assemble_two_chunks_spec_and_rejected"]
+    }
+    assert warmed_two == two
+
+
+_READ_OFFSET_PROGRAMS = (
+    "_reset_read_offsets_compiled",
+    "_clear_read_offsets_compiled",
+    "_update_read_offsets_verify_compiled",
+    "_compiled_assemble_spec_rejected_and_read_offsets",
+    "_compiled_assemble_two_chunks_spec_rejected_and_read_offsets",
+)
+
+
+@pytest.mark.parametrize("lockstep", [False, True])
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_mamba_read_offset_warmup_covers_every_spec_shape(
+    monkeypatch, lockstep, async_scheduling
+):
+    """The spec-decode half of _precompile_mamba_rollback_helpers warms the
+    read-offset reset, clear and verify scatters at every batch width, and,
+    under async scheduling, the assembly programs that fold the read-offset
+    scatter in at every shape the serving assembly takes for that width."""
+    calls: dict[str, list[tuple]] = {name: [] for name in _READ_OFFSET_PROGRAMS}
+
+    def recorder(name):
+        def record(*args):
+            calls[name].append(
+                tuple(
+                    (tuple(a.shape), a.dtype) if isinstance(a, torch.Tensor) else a
+                    for a in args
+                )
+            )
+            return (torch.zeros(1), torch.zeros(1))
+
+        return record
+
+    for name in _READ_OFFSET_PROGRAMS:
+        monkeypatch.setattr(tpu_runner, name, recorder(name))
+    for name in (
+        "_rollback_offsets_seed_compiled",
+        "_rollback_offsets_migrate_compiled",
+    ):
+        monkeypatch.setattr(tpu_runner, name, lambda *_a: None)
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+    runner = SimpleNamespace(
+        **_LOCKSTEP_FIELDS,
+        mamba_slot_read_offsets=torch.zeros(64, dtype=torch.int32),
+        _mamba_ckpt_window=1,
+        _pool_block_split=1,
+        _mamba_copy_plan=[(0, [])],
+        kv_cache_config=None,
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        num_reqs_most_model_len=None,
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+        _is_async_drafter=True,
+        _read_offset_scratch={},
+        _bucket_len=tpu_runner.TPUModelRunner._bucket_len,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+    )
+    runner._read_offset_reset_scratch = (
+        tpu_runner.TPUModelRunner._read_offset_reset_scratch.__get__(runner)
+    )
+    runner.drafter = _sharded_mtp_drafter(runner, lockstep)
+    tpu_runner.TPUModelRunner._precompile_mamba_rollback_helpers(runner)  # type: ignore[arg-type]
+
+    widths = [8, 16, 32]
+    for name in ("_reset_read_offsets_compiled", "_clear_read_offsets_compiled"):
+        assert sorted(
+            c[2 if name.startswith("_reset") else 1][0] for c in calls[name]
+        ) == [(w,) for w in widths], name
+    assert sorted(
+        (c[1][0][0], c[2][0], str(c[2][1]))
+        for c in calls["_update_read_offsets_verify_compiled"]
+    ) == sorted(
+        (w, (w, 4), str(dt)) for w in widths for dt in (torch.int32, torch.int64)
+    )
+    one, two = _served_assembly_shapes(runner, runner.drafter, lockstep)
+    warmed_one = {
+        (c[0][0][0], c[1][0][0], c[4][0][0])
+        for c in calls["_compiled_assemble_spec_rejected_and_read_offsets"]
+    }
+    warmed_two = {
+        ((c[0][0][0], c[1][0][0]), (c[3][0][0], c[4][0][0]), c[7][0][0])
+        for c in calls["_compiled_assemble_two_chunks_spec_rejected_and_read_offsets"]
+    }
+    if not async_scheduling:
+        assert not warmed_one and not warmed_two
+        return
+    assert warmed_one == {(b, p, w) for b, p in one for w in widths if b <= w}
+    assert warmed_two == {(c0, c1, w) for c0, c1 in two for w in widths if c0[0] <= w}
 
 
 @pytest.mark.parametrize(
