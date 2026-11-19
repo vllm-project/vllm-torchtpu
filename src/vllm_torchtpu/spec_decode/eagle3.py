@@ -65,6 +65,7 @@ from vllm_torchtpu.spec_decode.utils import (
     iter_mtp_shared_heads,
     maybe_share_embeddings,
     maybe_share_lm_head,
+    target_lm_head_of,
 )
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -440,6 +441,7 @@ class Eagle3Proposer:
 
         self._validate_mtp_layer_count()
         self._init_draft_greedy_head()
+        self._release_unread_draft_bf16_head(target_model)
         self._init_mtp_index_sharing()
         self._build_draft_loop_programs()
 
@@ -507,6 +509,25 @@ class Eagle3Proposer:
             type(owner).__name__,
             getattr(owner.lm_head, "_quant_desc", "bf16"),
         )
+
+    def _release_unread_draft_bf16_head(self, target_model: torch.nn.Module) -> None:
+        """Under EP-DP lockstep the vocab-parallel draft head clones its slice
+        of the BF16 copy of the target's head, so the copy (the TP shard, about
+        1 GB per device at DP4 x TP2) is released once that head is built; the
+        draft's tokens are unchanged. With any other greedy head, or without
+        one, the draft still reads the copy and it is kept."""
+        from vllm_torchtpu.runner import greedy_top_tokens
+
+        assert self.draft_model is not None
+        if greedy_top_tokens.release_twin_behind_vocab_parallel_head(
+            self._draft_greedy_head_owner,
+            self.draft_model,
+            target_lm_head_of(target_model),
+        ):
+            logger.info(
+                "Released the BF16 copy of the target's lm_head: the "
+                "vocab-parallel draft head holds its own slice."
+            )
 
     def _validate_mtp_layer_count(self) -> None:
         """One nextn layer only: the proposer's per-step wiring assumes it.

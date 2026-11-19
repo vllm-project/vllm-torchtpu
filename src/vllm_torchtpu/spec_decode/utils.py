@@ -448,6 +448,16 @@ def populate_draft_lm_head_from_target(
     )
 
 
+def target_lm_head_of(target_model: torch.nn.Module) -> torch.nn.Module | None:
+    """The target's LM head, on its language model when it wraps one."""
+    target_lm = (
+        cast("SupportsMultiModal", target_model).get_language_model()
+        if hasattr(target_model, "get_language_model")
+        else target_model
+    )
+    return getattr(target_lm, "lm_head", None)
+
+
 def maybe_share_lm_head(
     draft_model: torch.nn.Module,
     target_model: torch.nn.Module,
@@ -456,12 +466,7 @@ def maybe_share_lm_head(
     force_share: bool = False,
     materialize_if_mismatched: bool = True,
 ) -> None:
-    target_lm = (
-        cast("SupportsMultiModal", target_model).get_language_model()
-        if hasattr(target_model, "get_language_model")
-        else target_model
-    )
-    target_lm_head = getattr(target_lm, "lm_head", None)
+    target_lm_head = target_lm_head_of(target_model)
 
     if target_lm_head is None:
         raise RuntimeError("Draft expects the target model to have an lm_head.")

@@ -925,8 +925,8 @@ class _VocabParallelDraftHead(torch.nn.Module):
 
     Every rank must run each pass, with the same row count: true under
     EP-DP lockstep for a TP-sharded draft, where busy and idle engines run
-    the same ``_draft_propose_token`` / fused-loop programs at the loop
-    bucket of ``max_num_reqs`` (``Eagle3Proposer._loop_bucket``).
+    the same ``_draft_propose_token`` programs at the step's coordinated loop
+    bucket (``Eagle3Proposer._loop_bucket``).
     Rank-specific values (vocab start, padding, DP rank) are tensor buffers
     so every rank compiles the same program.
     """
@@ -1158,12 +1158,43 @@ def draft_bf16_head_of(target_head: object) -> torch.nn.Module | None:
 
 
 def release_draft_bf16_head(target_head: object) -> None:
-    """Drops the BF16 head kept for a draft that did not bind it."""
+    """Drops the BF16 head kept for a draft that does not read it."""
     state = getattr(target_head, "__dict__", None)
     if state is not None and state.pop(_DRAFT_BF16_HEAD_ATTR, None) is not None:
         logger.info(
             "The draft does not use the BF16 copy of the target's lm_head; released it."
         )
+
+
+def release_twin_behind_vocab_parallel_head(
+    owner: torch.nn.Module | None,
+    draft_model: torch.nn.Module,
+    target_head: object,
+) -> bool:
+    """Drops the BF16 head kept for the draft once only a vocab-parallel draft
+    head reads it, and says whether it did.
+
+    ``_VocabParallelDraftHead`` clones its slice of that head, so with such an
+    ``owner`` the draft's tokens no longer read the BF16 head; it stays alive
+    only through the draft's own reference and the target head's. Both go: the
+    draft's modules that held it hold the vocab-parallel head instead. With any
+    other owner, or none (compute_logits + argmax reads the draft's head), the
+    BF16 head is kept."""
+    if owner is None or not isinstance(owner.lm_head, _VocabParallelDraftHead):
+        return False
+    twin = draft_bf16_head_of(target_head)
+    if twin is None:
+        return False
+    holders = [
+        (module, name)
+        for module in draft_model.modules()
+        for name, child in module.named_children()
+        if child is twin
+    ]
+    for module, name in holders:
+        setattr(module, name, owner.lm_head)
+    release_draft_bf16_head(target_head)
+    return True
 
 
 def head_precision(head: object) -> str:

@@ -337,6 +337,83 @@ def test_draft_greedy_head_defaults_to_bf16_with_no_proxy(monkeypatch):
     assert torch.equal(tokens, ref)
 
 
+def _vocab_parallel_owner(base_head: torch.nn.Module):
+    """The owner vocab_parallel_draft_owner builds at DP2 x TP1 on DP rank 1:
+    a proxy holding a _VocabParallelDraftHead over the upper half of
+    ``base_head``'s rows."""
+    head = gtt._VocabParallelDraftHead(
+        base_head, dp_rank=1, dp_size=2, tp_rank=0, tp_size=1
+    )
+    return gtt._DraftHeadOwnerProxy(_Processor(), head)
+
+
+def test_a_vocab_parallel_draft_head_releases_the_bf16_twin():
+    """Under EP-DP lockstep the vocab-parallel head clones its slice of the
+    BF16 twin, so the twin is released: the target head drops it, and the
+    draft's own reference now holds the vocab-parallel head. The head the
+    draft's tokens come from keeps its own copy of the same rows."""
+    draft, target = _shared_draft()
+    twin = gtt.draft_bf16_head_of(target.lm_head)
+    assert twin is not None and draft.lm_head is twin
+    upper_rows = twin.weight.detach()[VOCAB // 2 :].clone()
+    owner = _vocab_parallel_owner(twin)
+
+    assert gtt.release_twin_behind_vocab_parallel_head(owner, draft, target.lm_head)
+
+    assert gtt.draft_bf16_head_of(target.lm_head) is None
+    assert draft.lm_head is owner.lm_head
+    assert all(module is not twin for module in draft.modules())
+    assert torch.equal(owner.lm_head.weight, upper_rows)
+    assert owner.lm_head.weight.data_ptr() != twin.weight.data_ptr()
+
+
+@pytest.mark.parametrize("owner_kind", ["fallback", "per_tp_group"])
+def test_the_bf16_twin_stays_while_the_draft_reads_it(owner_kind):
+    """Without a greedy head (compute_logits + argmax reads the draft's head)
+    or with the per-TP-group head (the twin itself), the twin is kept."""
+    draft, target = _shared_draft()
+    twin = gtt.draft_bf16_head_of(target.lm_head)
+    owner = None if owner_kind == "fallback" else gtt.resolve_head_owner(draft, False)
+
+    assert not gtt.release_twin_behind_vocab_parallel_head(owner, draft, target.lm_head)
+
+    assert gtt.draft_bf16_head_of(target.lm_head) is twin
+    assert draft.lm_head is twin
+
+
+@pytest.mark.parametrize("vocab_parallel", [True, False])
+def test_the_proposer_releases_the_twin_behind_a_vocab_parallel_head(vocab_parallel):
+    """load_model releases the twin right after resolving the greedy head, and
+    only when that head is the vocab-parallel one."""
+    import ast
+    import inspect
+    import textwrap
+
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    draft, target = _shared_draft()
+    twin = gtt.draft_bf16_head_of(target.lm_head)
+    proposer = SimpleNamespace(
+        draft_model=draft,
+        _draft_greedy_head_owner=_vocab_parallel_owner(twin)
+        if vocab_parallel
+        else None,
+    )
+
+    Eagle3Proposer._release_unread_draft_bf16_head(proposer, target)
+
+    assert (gtt.draft_bf16_head_of(target.lm_head) is None) is vocab_parallel
+    tree = ast.parse(textwrap.dedent(inspect.getsource(Eagle3Proposer.load_model)))
+    lines = {
+        node.func.attr: node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert (
+        lines["_release_unread_draft_bf16_head"] == lines["_init_draft_greedy_head"] + 1
+    )
+
+
 def test_target_lm_head_stays_bf16_by_default(monkeypatch):
     """quantize_target_lm_head is off unless set: the target head keeps its
     BF16 weight and no twin is made, whatever the draft."""
