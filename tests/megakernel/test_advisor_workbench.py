@@ -17,8 +17,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
-from typing import TYPE_CHECKING, cast
+import shutil
+import signal
+import time
+from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -28,9 +33,6 @@ from vllm_torchtpu.megakernel.advisor import (
     workbench_engine,
 )
 from vllm_torchtpu.megakernel.core import errors
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 DENYLIST_RE = re.compile(
     r"gmm|ragged_dot|megablox|sparsecore|mxu|tensorcore|vpu|\bllo\b",
@@ -366,3 +368,128 @@ def test_workbench_verdict_mesh_regime_and_proof_drawer_controls() -> None:
     ):
         assert snippet in html_text
     assert "vmemMip" not in html_text
+
+
+def _eval_workbench_custom_steps(
+    tmp_path: Path,
+    sweep_report: advisor.AdvisorSweepReport,
+    steps: list[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    """Run workbench.js custom UI steps in a hermetic temp runner."""
+    js_runtime = shutil.which("node") or shutil.which("gjs")
+    if js_runtime is None:
+        msg = "Neither node nor gjs runtime found; install nodejs"
+        raise RuntimeError(msg)
+    base_runner = (
+        Path(__file__)
+        .with_name("advisor_workbench_runner.js")
+        .read_text(encoding="utf-8")
+    )
+    hook_anchor = (
+        '  } else if (op === "select_topic") {\n'
+        "    window.wbSelectTopic(step.kind, step.scope, step.sub);\n"
+        "  }"
+    )
+    hook_replacement = (
+        '  } else if (op === "select_topic") {\n'
+        "    window.wbSelectTopic(step.kind, step.scope, step.sub);\n"
+        '  } else if (op === "apply_littles_law") {\n'
+        '    doc.getElementById("ctl-out-tps").value = String(step.outTps);\n'
+        '    doc.getElementById("ctl-mean-tpot").value = String(step.meanTpot);\n'
+        "    window.wbApplyLittlesLaw();\n"
+        '  } else if (op === "set_host_heads") {\n'
+        '    doc.getElementById("ctl-host-head-per-op").value = String(step.perOpUs);\n'
+        '    doc.getElementById("ctl-host-head-fused").value = String(step.fusedUs);\n'
+        "    window.wbOnHwControl();\n"
+        "  }"
+    )
+    if hook_anchor not in base_runner:
+        msg = "Missing select_topic anchor in advisor_workbench_runner.js"
+        raise RuntimeError(msg)
+    temp_runner = tmp_path / "custom_wb_runner.js"
+    temp_runner.write_text(
+        base_runner.replace(hook_anchor, hook_replacement, 1),
+        encoding="utf-8",
+    )
+    engine_path = (
+        Path(workbench_engine.__file__).parent / "assets" / "workbench_engine.js"
+    )
+    html_text = advisor.render_advisor_html(sweep_report)
+    m_seed = re.search(
+        r'<script id="advisor-data" type="application/json">(.*?)</script>',
+        html_text,
+        re.DOTALL,
+    )
+    assert m_seed is not None
+    seed_data = {
+        **workbench_engine.build_engine_seed_defaults(),
+        **json.loads(m_seed.group(1)),
+    }
+    in_json = tmp_path / "custom_wb_in.json"
+    out_json = tmp_path / "custom_wb_out.json"
+    in_json.write_text(
+        json.dumps(
+            {
+                "engine_path": str(engine_path),
+                "seed_data": seed_data,
+                "steps": steps,
+            }
+        ),
+        encoding="utf-8",
+    )
+    argv = [js_runtime, str(temp_runner), str(in_json), str(out_json)]
+    pid = os.posix_spawnp(js_runtime, argv, os.environ)
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid == pid:
+            if os.waitstatus_to_exitcode(status) != 0:
+                msg = "Temp workbench UI runner failed"
+                raise RuntimeError(msg)
+            snaps = json.loads(out_json.read_text(encoding="utf-8"))["snapshots"]
+            return {str(snap["tag"]): cast("dict[str, object]", snap) for snap in snaps}
+        time.sleep(0.05)
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    msg = "Temp workbench UI runner timed out"
+    raise TimeoutError(msg)
+
+
+def test_workbench_littles_law_and_host_head_controls(tmp_path: Path) -> None:
+    """Verify Decoding Seqs Little's Law helper and host-head equation conservation."""
+    sweep_report = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    html_text = advisor.render_advisor_html(sweep_report)
+    assert "Decoding Seqs (B)" in html_text
+    assert 'id="ctl-out-tps" type="number" min="0.1" step="1" value=""' in html_text
+    assert 'id="ctl-mean-tpot" type="number" min="0.1" step="0.1" value=""' in html_text
+    assert 'id="lbl-littles-preview">Enter &gt; 0 tok/s &amp; TPOT<' in html_text
+    assert 'id="ctl-host-head-per-op"' in html_text
+    assert 'id="ctl-host-head-fused"' in html_text
+
+    output_tok_s = 605.0
+    mean_tpot_ms = 13.42
+    expected_batch = round(output_tok_s * (mean_tpot_ms / 1000.0))
+    snaps = _eval_workbench_custom_steps(
+        tmp_path,
+        sweep_report,
+        [
+            {
+                "op": "apply_littles_law",
+                "outTps": output_tok_s,
+                "meanTpot": mean_tpot_ms,
+                "tag": "littles_applied",
+            },
+            {
+                "op": "set_host_heads",
+                "perOpUs": 1800.0,
+                "fusedUs": 350.0,
+                "tag": "heads_applied",
+            },
+        ],
+    )
+    assert snaps["littles_applied"]["ctlBatch"] == str(expected_batch)
+    assert snaps["littles_applied"]["activeTokens"] == expected_batch
+    drawer_html = str(snaps["heads_applied"]["derivDrawer"])
+    assert " + t_head" in drawer_html
+    assert " + 350.00" in drawer_html
+    assert "Host Dispatch Head Gain: +1450.00 us" in drawer_html
