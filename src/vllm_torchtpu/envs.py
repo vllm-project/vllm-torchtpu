@@ -1427,3 +1427,100 @@ def compute_dedup_moe_env_hash() -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()[:16]
+
+
+# De-Dup MoE presets (DEDUP_MOE_PRESET). Each preset is the measured best
+# kernel configuration for one serving shape; it only fills in env vars that
+# are unset (explicit env always wins). Applied at import, i.e. before the
+# platform forwards env to Ray workers and before the AOT cache key hashes the
+# DEDUP_MOE_* env, so every process sees the same resolved values.
+#   mixed_8k1k:  8k in / 1k out, many concurrent sequences, small batched-token
+#                budget (e.g. --max-num-batched-tokens 1024): Direct dispatch,
+#                W=4 prefill / W=1 decode, chunked epilogue on every bucket.
+#   prefill_8k1: 8k in / 1 out, few sequences, large batched-token budget
+#                (e.g. --max-num-batched-tokens 8192): De-Dup over 8-device
+#                boards, W=4, gateway lookahead 3, padded-token skipping.
+_DEDUP_MOE_COMMON = {
+    "MOE_FUSED_EP_KERNEL_IMPL": "dedup",
+    "USE_MOE_FUSED_EP_KERNEL": "1",
+    "MOE_FUSED_EP_V2_SHARDED_PLAN": "1",
+    "DEDUP_MOE_WAVES": "4",
+    "DEDUP_MOE_DECODE_WAVES": "1",
+    "DEDUP_MOE_DECODE_MAX_T": "96",
+    "DEDUP_MOE_PREFILL_CAPACITY": "256",
+    "DEDUP_MOE_SEND_LIST_GATHER": "vec",
+    "DEDUP_MOE_ROW_SEND": "1",
+    "DEDUP_MOE_SORT_FREE_MAX_T": "96",
+    "DEDUP_MOE_DECODE_FAST_PLAN": "0",
+    "DEDUP_MOE_FAST_GLUE": "1",
+    "DEDUP_MOE_FAST_GLUE_V2": "1",
+    "DEDUP_MOE_TG_CLIP_FUSE": "0",
+    "DEDUP_MOE_DIRECT_ORDER": "board_stripe",
+    "DEDUP_MOE_DIRECT_BOARD_SIZE": "8",
+    "DEDUP_MOE_WAVE_ORDER": "xboard",
+    "DEDUP_MOE_COMBINE_OPTS": '{"fuse_scale_gather": "vmem"}',
+}
+_DEDUP_MOE_KERNEL_OPTS_COMMON = {
+    "fuse_tg_assemble": True,
+    "epilogue_barrier": False,
+    "branchless_gather_window": True,
+    "progressive_push_lag": 1,
+    "return_order": "board_stripe",
+    "return_board_size": 8,
+    "prologue_full_prefetch": True,
+    "early_weight_refill": True,
+    "fuse_tg_copy": True,
+    "split_weight_waits": True,
+    "decode_only_opts": True,
+    "chunked_epilogue": True,
+}
+
+
+def _dedup_moe_presets() -> dict[str, dict[str, str]]:
+    import json
+
+    mixed_opts = dict(
+        _DEDUP_MOE_KERNEL_OPTS_COMMON,
+        prime_before_ship=True,
+        overlap_prologue_sync=True,
+        chunked_epilogue_decode=True,
+    )
+    prefill_opts = dict(_DEDUP_MOE_KERNEL_OPTS_COMMON, dedup_fwd_lookahead=3)
+    return {
+        "mixed_8k1k": dict(
+            _DEDUP_MOE_COMMON,
+            DEDUP_MOE_BOARD_SIZE="0",
+            DEDUP_MOE_ASYNC_ROUTING_AG="1",
+            DEDUP_MOE_FUSE_SHARED="split",
+            DEDUP_MOE_KERNEL_OPTS=json.dumps(mixed_opts),
+        ),
+        "prefill_8k1": dict(
+            _DEDUP_MOE_COMMON,
+            DEDUP_MOE_BOARD_SIZE="8",
+            DEDUP_MOE_BOARD_SOURCE="coords",
+            DEDUP_MOE_COMPACT_PLAN="1",
+            DEDUP_MOE_ROW_SEND_MAX_T="512",
+            DEDUP_MOE_ASYNC_ROUTING_AG="0",
+            DEDUP_MOE_FUSE_SHARED="dispatch",
+            DEDUP_MOE_KERNEL_OPTS=json.dumps(prefill_opts),
+            TPU_MOE_SKIP_PADDED_TOKENS="1",
+        ),
+    }
+
+
+def apply_dedup_moe_preset(environ=os.environ) -> str | None:
+    """Fill unset env vars from DEDUP_MOE_PRESET; returns the preset name."""
+    name = environ.get("DEDUP_MOE_PRESET", "").strip()
+    if not name:
+        return None
+    presets = _dedup_moe_presets()
+    if name not in presets:
+        raise ValueError(
+            f"DEDUP_MOE_PRESET={name!r}; expected one of {sorted(presets)}"
+        )
+    for key, value in presets[name].items():
+        environ.setdefault(key, value)
+    return name
+
+
+apply_dedup_moe_preset()

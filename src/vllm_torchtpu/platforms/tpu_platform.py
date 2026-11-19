@@ -517,6 +517,7 @@ class TpuPlatform(Platform):
         "DEDUP_MOE_DECODE_WAVES",
         "DEDUP_MOE_DECODE_MAX_T",
         "DEDUP_MOE_DIRECT_MAX_T",
+        "DEDUP_MOE_PRESET",
         "DEDUP_MOE_KERNEL_OPTS",
         "DEDUP_MOE_COMBINE_OPTS",
         "DEDUP_MOE_FWD_MAX_RUNS_CAP",
