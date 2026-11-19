@@ -596,6 +596,9 @@ def _serialize_scope_dicts(
             "step_floor_strict_us": s.step_floor_strict_us,
             "support": s.support,
             "blockers": list(s.blockers),
+            "expert_mode": s.expert_mode,
+            "host_head_us": s.host_head_us,
+            "break_even_host_head_delta_us": s.break_even_host_head_delta_us,
         }
         for s in scopes
     )
@@ -632,6 +635,12 @@ def _serialize_workload_dict(
         "dispatch_regime": workload.dispatch_regime,
         "hbm_utilization_cap": workload.hbm_utilization_cap,
         "max_rows_per_call": workload.max_rows_per_call,
+        "host_head_per_op_us": workload.host_head_per_op_us,
+        "host_head_fused_us": workload.host_head_fused_us,
+        "host_head_explicit": workload.host_head_explicit,
+        "per_op_step_us": workload.per_op_step_us,
+        "step_coverage": workload.step_coverage,
+        "batch_explicit": workload.batch_explicit,
     }
 
 
@@ -687,6 +696,7 @@ def _evaluate_sweep_workloads(
                 step_floor_strict_us=recommended_scope_estimate.step_floor_strict_us,
                 blockers=recommended_scope_estimate.blockers,
                 hypothetical_best=report.hypothetical_best,
+                gain_basis=report.gain_basis,
             )
         )
     return entries, reports
