@@ -122,8 +122,6 @@ def main() -> None:
     worker = multihost and args.host_rank == 1
     if multihost != bool(args.head_address) or (args.host_rank and not multihost):
         parser.error("decode_dp16 requires --head-address and two host ranks")
-    if multihost and args.profile:
-        parser.error("The CI multihost launcher runs formal measurements only")
     scenario = SCENARIOS[args.scenario]
     decode = scenario.name == "decode"
     if args.rounds is None:
