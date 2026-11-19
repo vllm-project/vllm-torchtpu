@@ -85,7 +85,8 @@ sizes differ (for example 2304 and 640 tokens), the two engines page
 differently and every transfer is refused with "Layout fingerprint mismatch".
 Give both engines the same page:
 `--additional-config '{"tpu_kv_transfer": {"kernel_page_tokens": 128}}'`.
-`Qwen/Qwen3.5-397B-A17B` engines with a KV transfer config, the
+Prefill (`kv_producer`) and decode (`kv_consumer`) engines of the
+`Qwen/Qwen3.5-397B-A17B` checkpoint shape (its BF16 and FP8 releases) with the
 seq-along-lane layout and no prefill context parallelism default to 128.
 
 ### Step 3: Launch Decode Instance (`kv_consumer`)

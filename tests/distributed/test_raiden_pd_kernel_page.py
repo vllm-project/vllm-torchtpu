@@ -25,6 +25,7 @@ destination"), which is what the pair below reproduces without the setting.
 """
 
 import contextlib
+import copy
 import os
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -225,14 +226,35 @@ def test_differing_pages_are_refused_by_the_fingerprint():
     }
 
 
-@pytest.mark.parametrize("kv_role", ["kv_producer", "kv_consumer", "kv_both"])
+@pytest.mark.parametrize("kv_role", ["kv_producer", "kv_consumer"])
 def test_qwen3_5_engines_with_kv_transfer_page_at_128(monkeypatch, kv_role):
-    # kv_both is the role an offloading connector inside a prefill engine sees
-    # in its copy of the engine config: it must resolve the runner's page.
     with _engine(monkeypatch, kv_role=kv_role):
         assert BATCHED.get_supported_kernel_block_sizes() == [128]
     for block in (PREFILL_BLOCK, DECODE_BLOCK, 1280, 2560):
         assert _kernel_page(monkeypatch, block, kv_role=kv_role) == 128
+
+
+def test_an_offloading_child_resolves_the_engines_page(monkeypatch):
+    """vLLM's MultiConnector gives each child connector a shallow copy of the
+    engine config with the child's own role (kv_both for the offloading child
+    of a prefill engine); the copy shares the section the hook wrote."""
+    from vllm.config import KVTransferConfig, set_current_vllm_config
+
+    with _engine(monkeypatch, kv_role="kv_producer") as config:
+        child = copy.copy(config)
+        child.kv_transfer_config = KVTransferConfig(
+            kv_connector="TPURaidenOffloadingConnector", kv_role="kv_both"
+        )
+        with set_current_vllm_config(child):
+            assert BATCHED.get_supported_kernel_block_sizes() == [128]
+
+
+def test_an_offload_only_engine_keeps_vllms_page(monkeypatch):
+    """An engine whose only connector offloads (kv_both) has no peer to page
+    alike with, so the hook leaves its page to vLLM, as on main."""
+    with _engine(monkeypatch, kv_role="kv_both") as config:
+        assert _section(config) is None
+        assert BATCHED.get_supported_kernel_block_sizes() == [128, 256]
 
 
 def test_other_models_keep_vllms_page(monkeypatch):
