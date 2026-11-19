@@ -592,8 +592,10 @@ class PrefixAwareScheduler(AsyncScheduler):
 
     def schedule(self, *args, **kwargs):
         if not self._is_kv_consumer:
-            # Off a decode leg: the warmest-first admission alone.
-            self._promote_warmest(self.kv_holding_waiting or self.waiting)
+            # Off a decode leg: the warmest-first admission alone, unless
+            # tpu_scheduler.promote_warmest=false asks for FCFS admission.
+            if self._promote_warmest_on():
+                self._promote_warmest(self.kv_holding_waiting or self.waiting)
             return super().schedule(*args, **kwargs)
         # Decoders first: vLLM schedules ``running`` in list order and a
         # partial prefill takes min(remaining, budget), so a prefill ahead of
