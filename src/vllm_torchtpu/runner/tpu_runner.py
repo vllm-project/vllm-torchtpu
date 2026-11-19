@@ -4258,8 +4258,12 @@ class TPUModelRunner(GPUModelRunner):
             ids = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
             _, embeds = self._get_model_inputs(ids, ([EncoderEmbeds(parts)], is_mm))
             synchronize_tensors([embeds])
-            # Nothing consumes this merge: drop what it staged for the forward
-            # (Qwen3-VL's deepstack inputs), or the next forward would add it.
+            # What the merge staged for the forward (Qwen3-VL's deepstack
+            # inputs): read it as the forward does, which compiles the read at
+            # this bucket, then drop it, or the next forward would add it.
+            staged = getattr(self.model, "_get_deepstack_input_embeds", None)
+            if staged is not None and (inputs := staged(num_tokens)) is not None:
+                synchronize_tensors(list(inputs.tensors.values()))
             clear = getattr(self.model, "_clear_deepstack_input_embeds", None)
             if clear is not None:
                 clear(num_tokens)

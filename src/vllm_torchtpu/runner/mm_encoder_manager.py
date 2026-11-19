@@ -91,7 +91,10 @@ def rows_to_device(
     index.append(np.full(rows - used, offset))  # the zero row
     source = torch.cat([*chunks, chunks[0].new_zeros(1, *rest)])
     picks = torch.from_numpy(np.concatenate(index)).to(device, non_blocking=True)
-    return source[picks].to(template.dtype)
+    out = source[picks].to(template.dtype)
+    # A program of its own, as `MMEncoderManager._warm_rows_to_device` compiles it.
+    synchronize_tensors([out], wait=False)
+    return out
 
 
 def _coalesce(parts: Sequence[torch.Tensor]) -> list[torch.Tensor]:
@@ -429,6 +432,12 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 self.budget_templates[path][token_budget],
                 self.max_batch_size,
                 self.max_frames_per_batch,
+            )
+            # As their own program, the one warm-up compiled; fused with the
+            # pixel upload's, they would make a program per chunk count.
+            synchronize_tensors(
+                [v for v in values.values() if isinstance(v, torch.Tensor)],
+                wait=False,
             )
         else:
             values = self.model.prepare_encoder_cudagraph_replay_buffers(
