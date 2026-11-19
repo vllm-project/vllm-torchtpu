@@ -201,7 +201,11 @@ _PRECISION_LEVERS = ("qk8", "pv8")
 # rounded p in f32). Standalone fp8 calls on served DCP 2 selections, block_q
 # 32 and 32-page groups: -2.6% (8,192 tokens), out rel-rms 3e-3 (j-662afb0e).
 FP8_OPT_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT"
-_FP8_LEVERS = ("exp16",)
+# "bias": the per-score cmp + select page mask becomes a lane-row add (0 or
+# -inf per token, from the page's hit / limit) on fully visible or unseen
+# pages; only a page some token sees in part (its local page) or an empty
+# slot keeps the select, under a scalar branch. Bitwise (finite pages).
+_FP8_LEVERS = ("exp16", "bias")
 
 
 def fp8_prefill_levers(spec: str | None = None) -> frozenset:
@@ -480,6 +484,7 @@ def _kernel(
     qk8 = fp4 and "qk8" in precision
     pv8 = fp4 and "pv8" in precision
     exp16_t = not fp4 and "exp16" in precision
+    bias_t = not fp4 and "bias" in precision
     out_unit = 1.0 / _PV8_UNIT if pv8 else 1.0
 
     def group_head(w):
@@ -749,13 +754,22 @@ def _kernel(
             sel_t = selected_ref[...].T  # [K, Bq]
             local_page = local_page_ref[...].T  # [1, Bq]
             local_limit = local_limit_ref[...].T
-            keys, values, masks = [], [], []
+            keys, values, masks, limits, fixes = [], [], [], [], []
             for g in range(width):
                 page, kv_ref, scale_ref = group_page(g)
                 hit = jnp.max((sel_t == page).astype(jnp.int32), axis=0, keepdims=True)
                 limit = jnp.where(local_page == page, local_limit, page_size)
                 limit = jnp.where(page >= 0, limit * hit, 0)  # [1, Bq]
                 seen = jnp.max(limit)
+                if bias_t:
+                    # A token sees all of the page or none of it, unless the
+                    # page is its local one; an empty slot (page -1) holds
+                    # stale bytes that may not be finite.
+                    part = jnp.max(
+                        ((limit > 0) & (limit < page_size)).astype(jnp.int32)
+                    )
+                    limits.append(limit)
+                    fixes.append((part > 0) | (page < 0))
                 if packing == 4:
                     rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
                     values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
@@ -763,17 +777,32 @@ def _kernel(
                     rows = msa_attention._page_rows(kv_ref, seen)
                     values.append(rows[:, head_dim:])
                 keys.append(rows[:, :head_dim])
-                # Rows are head-major (h * Bq + t): every head shares a token's mask.
-                masks.append(row_slots < jnp.tile(limit, (1, num_heads)))  # [S, rows]
+                if not bias_t:
+                    # Rows are head-major (h * Bq + t): every head shares a token's mask.
+                    masks.append(row_slots < jnp.tile(limit, (1, num_heads)))  # [S, rows]
             k = jnp.concatenate(keys, axis=0)
             v = jnp.concatenate(values, axis=0)
-            mask = jnp.concatenate(masks, axis=0)
             q = q_ref[...].reshape(num_heads * block_q, head_dim)
             q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
             s = jax.lax.dot_general(
                 k, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
             )  # [W * S, rows]
-            s = jnp.where(mask, s, -jnp.inf)
+            if bias_t:
+                slabs = []
+                for g in range(width):
+                    limit = jnp.tile(limits[g], (1, num_heads))  # [1, rows]
+                    s_g = s[g * page_size : (g + 1) * page_size] + jnp.where(
+                        limit > 0, 0.0, -jnp.inf
+                    )
+
+                    def _select(x, limit=limit):
+                        return jnp.where(row_slots < limit, x, -jnp.inf)
+
+                    slabs.append(jax.lax.cond(fixes[g], _select, lambda x: x, s_g))
+                s = jnp.concatenate(slabs, axis=0)
+            else:
+                mask = jnp.concatenate(masks, axis=0)
+                s = jnp.where(mask, s, -jnp.inf)
             m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
             m_new = jnp.maximum(m_prev, jnp.max(s, axis=0, keepdims=True))
             if exp16_t:
