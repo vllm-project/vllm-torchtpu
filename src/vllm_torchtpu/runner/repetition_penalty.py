@@ -36,6 +36,11 @@ and picks the token from ``float32``. Here the scaled logits go back to
 precompiled graphs take, so they are rounded a second time. Two logits closer
 than one ``bfloat16`` step (0.125 near 20) can then tie or swap, and the
 greedy token can differ from vLLM's.
+
+With async scheduling, the last output id of a request that the previous step
+sampled is a placeholder until that step's tokens reach the host. The runner
+puts those tokens in (``TPUModelRunner._modify_prev_results``) before a step
+with a penalized request samples, so the bitmasks never read a placeholder.
 """
 
 from __future__ import annotations
@@ -118,15 +123,12 @@ class RepetitionPenaltyTracker:
         vocab_size: int,
         max_num_reqs: int,
         *,
-        async_scheduling: bool,
         speculative_decoding: bool,
     ) -> None:
         self.vocab_size = vocab_size
-        # TODO(#2861): apply under async_scheduling. There the previous step's
-        # sampled token is still on the device when the bitmask is built.
         # TODO(#2862): apply in speculative decoding. There each verify row
         # needs the bitmask plus its draft prefix.
-        self.supported = not async_scheduling and not speculative_decoding
+        self.supported = not speculative_decoding
         self._seen: dict[str, SeenTokenBitmask] = {}
         self._bitmask_buf = np.zeros(
             (max_num_reqs, cdiv(vocab_size, 32)), dtype=np.int32
@@ -149,9 +151,8 @@ class RepetitionPenaltyTracker:
         if not self.supported:
             logger.warning_once(
                 "repetition_penalty is not yet applied on TPU with "
-                "async_scheduling or speculative decoding; requests run without "
-                "it. Run with async_scheduling=False and no speculative_config "
-                "to apply it."
+                "speculative decoding; requests run without it. Run with no "
+                "speculative_config to apply it."
             )
             return False
         self._prune(penalized)
