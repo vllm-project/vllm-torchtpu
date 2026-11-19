@@ -13,14 +13,12 @@
 # limitations under the License.
 """Row-count padding filter in prepare_routed_gmm_inputs (non-EP).
 
-When every real row carries non-zero routing weights,
-``PaddedRowFilter.ROW_COUNT`` builds the same routing layout as zeroing padded
-weights while leaving padded row weights untouched. When a real row carries a
-zero routing weight, the row-count filter keeps stock dispatch for that real
-route while excluding padded rows by row index.
+When every real row carries non-zero routing weights, passing ``row_info``
+builds the same routing layout as zeroing padded weights while leaving padded
+row weights untouched. When a real row carries a zero routing weight, the
+row-count filter keeps stock dispatch for that real route while excluding
+padded rows by row index.
 """
-
-from typing import Any
 
 import jax.numpy as jnp
 import numpy as np
@@ -28,11 +26,7 @@ import pytest
 import torch
 
 from vllm_torchtpu.layers.adapter import fused_moe as fused_moe_adapter
-from vllm_torchtpu.layers.core.fused_moe_gmm import (
-    PaddedRowFilter,
-    check_padded_row_filter,
-    prepare_routed_gmm_inputs,
-)
+from vllm_torchtpu.layers.core.fused_moe_gmm import prepare_routed_gmm_inputs
 
 E, TOPK, H = 64, 8, 32
 
@@ -87,7 +81,6 @@ def test_count_filter_matches_zeroed_weights_with_nonzero_padded_gates(t, n, see
         ids,
         w,
         skip_padded_tokens=True,
-        padded_row_filter=PaddedRowFilter.ROW_COUNT,
         row_info=jnp.asarray([n], jnp.int32),
     )
     for k in ref:
@@ -111,7 +104,6 @@ def test_real_row_zero_gate_keeps_stock_dispatch():
         ids,
         w,
         skip_padded_tokens=True,
-        padded_row_filter=PaddedRowFilter.ROW_COUNT,
         row_info=jnp.asarray([n], jnp.int32),
     )
 
@@ -134,111 +126,17 @@ def test_real_row_zero_gate_keeps_stock_dispatch():
     )
 
 
-_INVALID_COMBINATIONS = [
-    # (skip_padded_tokens, padded_row_filter, pass row_info)
-    (False, PaddedRowFilter.ROW_COUNT, True),
-    (True, PaddedRowFilter.ROW_COUNT, False),
-    (False, PaddedRowFilter.ZERO_WEIGHT, True),
-    (True, PaddedRowFilter.ZERO_WEIGHT, True),
-]
-
-
-@pytest.mark.parametrize(
-    "skip, padded_row_filter, with_row_info", _INVALID_COMBINATIONS
-)
-def test_prepare_rejects_invalid_padded_row_filter_combinations(
-    skip, padded_row_filter, with_row_info
-):
-    x, ids, w = _inputs(16, seed=0)
-    row_info = jnp.asarray([4], jnp.int32) if with_row_info else None
-    with pytest.raises(ValueError):
-        _prep(
-            x,
-            ids,
-            w,
-            skip_padded_tokens=skip,
-            padded_row_filter=padded_row_filter,
-            row_info=row_info,
-        )
-
-
-@pytest.mark.parametrize(
-    "skip, padded_row_filter, with_row_info", _INVALID_COMBINATIONS
-)
-def test_adapter_rejects_invalid_padded_row_filter_combinations(
-    skip, padded_row_filter, with_row_info
-):
-    row_info = torch.tensor([4], dtype=torch.int32) if with_row_info else None
-    with pytest.raises(ValueError):
-        fused_moe_adapter.fused_moe_gmm(
-            hidden_states=torch.randn(4, 16, dtype=torch.bfloat16),
-            w1=torch.empty(0),
-            w2=torch.empty(0),
-            w1_scale=None,
-            w2_scale=None,
-            w1_bias=None,
-            w2_bias=None,
-            topk_weights=torch.ones(4, 2, dtype=torch.bfloat16) * 0.5,
-            topk_ids=torch.zeros(4, 2, dtype=torch.int32),
-            experts_start=None,
-            topk=2,
-            activation="silu",
-            skip_padded_tokens=skip,
-            padded_row_filter=padded_row_filter,
-            row_info=row_info,
-        )
-
-
-def test_padded_row_filter_must_be_the_enum():
-    """A value that is not a PaddedRowFilter (here its string value) raises
-    instead of silently taking the ZERO_WEIGHT branch."""
-    not_the_enum: Any = PaddedRowFilter.ROW_COUNT.value
-    with pytest.raises(TypeError, match="PaddedRowFilter"):
-        check_padded_row_filter(True, not_the_enum)
-    with pytest.raises(TypeError, match="PaddedRowFilter"):
-        fused_moe_adapter.prebuild_fused_moe_kernel(
-            topk=2,
-            activation="silu",
-            use_ep=False,
-            skip_padded_tokens=True,
-            padded_row_filter=not_the_enum,
-        )
-
-
-@pytest.mark.parametrize(
-    "row_info",
-    [torch.tensor([4], dtype=torch.int64), torch.tensor([4, 4], dtype=torch.int32)],
-)
-def test_adapter_rejects_row_info_that_is_not_one_int32(row_info):
-    with pytest.raises(ValueError, match="1-element int32"):
-        fused_moe_adapter.fused_moe_gmm(
-            hidden_states=torch.randn(4, 16, dtype=torch.bfloat16),
-            w1=torch.empty(0),
-            w2=torch.empty(0),
-            w1_scale=None,
-            w2_scale=None,
-            w1_bias=None,
-            w2_bias=None,
-            topk_weights=torch.ones(4, 2, dtype=torch.bfloat16) * 0.5,
-            topk_ids=torch.zeros(4, 2, dtype=torch.int32),
-            experts_start=None,
-            topk=2,
-            activation="silu",
-            skip_padded_tokens=True,
-            padded_row_filter=PaddedRowFilter.ROW_COUNT,
-            row_info=row_info,
-        )
-
-
-def test_prebuild_rejects_row_count_filter_without_skipping():
-    with pytest.raises(ValueError):
-        fused_moe_adapter.prebuild_fused_moe_kernel(
-            topk=2,
-            activation="silu",
-            use_ep=False,
-            skip_padded_tokens=False,
-            padded_row_filter=PaddedRowFilter.ROW_COUNT,
-        )
+def test_row_info_without_skipping_keeps_stock_dispatch():
+    """row_info only takes effect with skip_padded_tokens=True."""
+    t, n = 16, 4
+    x, ids, w = _inputs(t, seed=3)
+    stock = _prep(x, ids, w, skip_padded_tokens=False)
+    with_count = _prep(
+        x, ids, w, skip_padded_tokens=False, row_info=jnp.asarray([n], jnp.int32)
+    )
+    for k in stock:
+        np.testing.assert_array_equal(with_count[k], stock[k], err_msg=k)
+    assert int(with_count["group_sizes"].sum()) == t * TOPK
 
 
 @pytest.mark.tpu_test
@@ -275,7 +173,7 @@ def test_adapter_row_count_through_custom_op_matches_stock(num_tokens, num_valid
         activation="silu",
         use_ep=False,
         skip_padded_tokens=True,
-        padded_row_filter=PaddedRowFilter.ROW_COUNT,
+        has_row_info=True,
     )
 
     def stock(x, weights, ids):
@@ -310,7 +208,6 @@ def test_adapter_row_count_through_custom_op_matches_stock(num_tokens, num_valid
             topk,
             "silu",
             skip_padded_tokens=True,
-            padded_row_filter=PaddedRowFilter.ROW_COUNT,
             row_info=count,
         )
 

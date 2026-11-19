@@ -29,7 +29,6 @@ from vllm.distributed.parallel_state import get_dp_group
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
-from vllm_torchtpu.layers.core.fused_moe_gmm import PaddedRowFilter
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
 
@@ -205,7 +204,6 @@ def pipelined_fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
-    padded_row_filter: PaddedRowFilter = PaddedRowFilter.ZERO_WEIGHT,
     row_info: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute.
@@ -240,21 +238,17 @@ def pipelined_fused_moe_gmm(
         activation: Gated activation function string (e.g., "silu" for SwiGLU).
         rhs_quant_dtype: Optional RHS quantization data type.
         skip_padded_tokens: Optional flag to skip padded tokens.
-        padded_row_filter: Only ``PaddedRowFilter.ZERO_WEIGHT`` is supported.
         row_info: Unsupported in pipelined mode; must be None.
 
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
     """
-    if not isinstance(padded_row_filter, PaddedRowFilter):
-        raise TypeError(
-            f"padded_row_filter must be a PaddedRowFilter, got {padded_row_filter!r}."
-        )
-    if padded_row_filter is PaddedRowFilter.ROW_COUNT or row_info is not None:
+    if row_info is not None:
+        # Each chunk holds rows gathered from several ranks, so one local
+        # valid-row count would drop real rows of the other ranks.
         raise NotImplementedError(
-            "pipelined_fused_moe_gmm does not support PaddedRowFilter.ROW_COUNT "
-            "or row_info (chunked DP/PCP layouts cannot reuse a single local "
-            "valid-row count)."
+            "pipelined_fused_moe_gmm does not support row_info (chunked DP/PCP "
+            "layouts cannot reuse a single local valid-row count)."
         )
     collective_group, _ = _get_moe_collective_group()
 

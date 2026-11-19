@@ -13,11 +13,11 @@
 # limitations under the License.
 """Tests for BF16 MoE padded-token skipping in VllmUnquantizedFusedMoEMethod.
 
-- Skipping on: skip_padded_tokens=True, PaddedRowFilter.ROW_COUNT and
-  row_info=local_valid_tokens.
+- Skipping on: skip_padded_tokens=True and row_info=local_valid_tokens (the
+  row-count filter).
 - Skipping off (flag off, an unsupported configuration, or a layer built
   outside the runner's policy scope): skip_padded_tokens=False and
-  PaddedRowFilter.ZERO_WEIGHT (the stock kernel), without row_info.
+  row_info=None (the stock kernel).
 - On the TPU, the compiled forward reads local_valid_tokens when it runs, so
   one program serves every count the runner writes.
 """
@@ -34,7 +34,6 @@ from vllm_torchtpu.layers.adapter.quantization import unquantized as module
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedFusedMoEMethod,
 )
-from vllm_torchtpu.layers.core.fused_moe_gmm import PaddedRowFilter
 
 _TOPK = 2
 
@@ -127,7 +126,6 @@ def test_count_forward_passes_count_and_does_not_zero_weights(capture_forward):
     assert len(capture_forward.fused_calls) == 1
     call = capture_forward.fused_calls[0]
     assert call["skip_padded_tokens"] is True
-    assert call["padded_row_filter"] is PaddedRowFilter.ROW_COUNT
     assert call["row_info"] is state.local_valid_tokens
     assert int(call["row_info"].item()) == 2
     # Padded rows keep their original non-zero weights (exclusion is by count).
@@ -136,8 +134,7 @@ def test_count_forward_passes_count_and_does_not_zero_weights(capture_forward):
 
 def test_stock_contract_when_disabled_or_fallback(capture_forward, monkeypatch):
     """With skipping off, the forward passes skip_padded_tokens=False and
-    PaddedRowFilter.ZERO_WEIGHT without row_info, also when
-    pipelined_fused_moe_gmm runs."""
+    row_info=None, also when pipelined_fused_moe_gmm runs."""
     state = token_padding.TokenPaddingState.create(16, "cpu", track_valid_tokens=True)
     state.update(1, 4)
     token_padding.set_padding_state(state)
@@ -157,16 +154,15 @@ def test_stock_contract_when_disabled_or_fallback(capture_forward, monkeypatch):
     assert len(capture_forward.pipelined_calls) == 1
     for call in (capture_forward.fused_calls[0], capture_forward.pipelined_calls[0]):
         assert call["skip_padded_tokens"] is False
-        assert call["padded_row_filter"] is PaddedRowFilter.ZERO_WEIGHT
-        assert "row_info" not in call
+        assert call["row_info"] is None
 
 
-def test_count_mode_raises_if_local_valid_tokens_missing(capture_forward):
+def test_count_mode_asserts_if_local_valid_tokens_missing(capture_forward):
     state = token_padding.TokenPaddingState.create(16, "cpu", track_valid_tokens=False)
     token_padding.set_padding_state(state)
     try:
         method = _method(skip_padded_tokens=True)
-        with pytest.raises(RuntimeError, match="track_valid_tokens=False"):
+        with pytest.raises(AssertionError, match="tracks no valid tokens"):
             _run_forward(method)
     finally:
         token_padding.set_padding_state(None)
@@ -189,6 +185,33 @@ def test_init_consumes_runner_policy_scope(monkeypatch):
     assert m_off._skip_padded_tokens is False
 
 
+def test_init_logs_the_fallback_reason(monkeypatch):
+    """A BF16 MoE layer logs why the flag is not applied; nothing is logged
+    with the flag off, with skipping on, or outside the runner's scope."""
+    monkeypatch.setattr(
+        module.UnquantizedFusedMoEMethod, "__init__", lambda self, moe: None
+    )
+    logged: list[tuple] = []
+    monkeypatch.setattr(
+        module.logger, "warning_once", lambda msg, *args: logged.append(args)
+    )
+    for policy in (
+        moe_skip_policy.Bf16MoeSkipPolicy(enabled=False),
+        moe_skip_policy.Bf16MoeSkipPolicy(enabled=True),
+    ):
+        with moe_skip_policy.bf16_policy_scope(policy):
+            VllmUnquantizedFusedMoEMethod(_moe_cfg())
+    VllmUnquantizedFusedMoEMethod(_moe_cfg())
+    assert logged == []
+
+    fallback = moe_skip_policy.Bf16MoeSkipPolicy(
+        enabled=False, fallback_reason="expert parallelism"
+    )
+    with moe_skip_policy.bf16_policy_scope(fallback):
+        VllmUnquantizedFusedMoEMethod(_moe_cfg())
+    assert logged == [("expert parallelism",)]
+
+
 def test_init_outside_runner_scope_runs_stock(monkeypatch):
     """Only the runner's policy turns skipping on: with the flag set, a layer
     built outside bf16_policy_scope still runs the stock path."""
@@ -204,8 +227,8 @@ def test_init_outside_runner_scope_runs_stock(monkeypatch):
 @pytest.mark.parametrize(
     "skip, expected_keys",
     [
-        (False, [(_TOPK, "silu", False, None, False, PaddedRowFilter.ZERO_WEIGHT)]),
-        (True, [(_TOPK, "silu", False, None, True, PaddedRowFilter.ROW_COUNT)]),
+        (False, [(_TOPK, "silu", False, None, False, False)]),
+        (True, [(_TOPK, "silu", False, None, True, True)]),
     ],
 )
 def test_process_weights_after_loading_prebuilds_expected_kernels(
@@ -249,20 +272,6 @@ def test_process_weights_after_loading_prebuilds_expected_kernels(
     )
     method.process_weights_after_loading(layer)
     assert cache.lookups == expected_keys
-
-
-def test_disable_moe_skip_disarms_and_prebuilds_stock_kernel(monkeypatch):
-    prebuild_calls: list[dict] = []
-    monkeypatch.setattr(
-        module,
-        "prebuild_fused_moe_kernel",
-        lambda **kwargs: prebuild_calls.append(kwargs),
-    )
-    method = _method(skip_padded_tokens=True)
-    method.disable_moe_skip(_dummy_layer())
-    assert method._skip_padded_tokens is False
-    assert [call["skip_padded_tokens"] for call in prebuild_calls] == [False]
-    assert prebuild_calls[0]["padded_row_filter"] is PaddedRowFilter.ZERO_WEIGHT
 
 
 def _top_logits(hidden_states, gating_output, topk, renormalize):
@@ -321,7 +330,7 @@ def test_one_compiled_forward_reads_each_steps_row_count():
             activation="silu",
             use_ep=False,
             skip_padded_tokens=method._skip_padded_tokens,
-            padded_row_filter=method._padded_row_filter,
+            has_row_info=method._skip_padded_tokens,
         )
 
     def stock_forward(x, logits):

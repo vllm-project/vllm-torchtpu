@@ -14,10 +14,9 @@
 """Padded-token skipping policy for BF16 MoE ("MoE skip" in names here).
 
 With ``TPU_MOE_SKIP_PADDED_TOKENS=1``, ``VllmUnquantizedFusedMoEMethod`` drops
-padded rows inside ``fused_moe_gmm`` by row index
-(``PaddedRowFilter.ROW_COUNT``), using the local valid-token count that
-``TokenPaddingState`` tracks. Real rows keep the stock dispatch, including
-routes whose routing weight is exactly 0.
+padded rows inside ``fused_moe_gmm`` by row index: it passes the local
+valid-token count that ``TokenPaddingState`` tracks as ``row_info``. Real rows
+keep the stock dispatch, including routes whose routing weight is exactly 0.
 
 ``TPUModelRunner`` resolves the policy once, before it builds the target model
 and the drafter, and publishes it with ``bf16_policy_scope`` so the MoE layers,
@@ -25,7 +24,8 @@ the GMM kernel prebuild and ``TokenPaddingState`` use the same mode. A layer
 built outside that scope runs the stock path. Unsupported configurations
 (expert parallelism, DP / PP / PCP / DCP > 1, the pipelined MoE collective,
 the fused MoE decode kernels, speculative decoding, LoRA, quantized models)
-also run the stock path and allocate no valid-token count.
+also run the stock path and allocate no valid-token count; the BF16 MoE layers
+log the reason.
 """
 
 from __future__ import annotations

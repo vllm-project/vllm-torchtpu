@@ -26,7 +26,6 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
 from vllm_torchtpu.layers.core import fused_moe_gmm
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
-    PaddedRowFilter,
     fused_moe_func,
     moe_gmm,
     prepare_routed_gmm_inputs,
@@ -885,7 +884,6 @@ def _run_row_count(hidden_states, w1, w2, topk_weights, topk_ids, topk, num_vali
         topk=topk,
         activation="silu",
         skip_padded_tokens=True,
-        padded_row_filter=PaddedRowFilter.ROW_COUNT,
     )
 
 
