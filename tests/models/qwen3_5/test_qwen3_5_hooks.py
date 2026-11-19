@@ -607,7 +607,7 @@ def _leg_config(leg: dict) -> SimpleNamespace:
 
 
 # The KV budget each point's decode leg gets on this tree: TP8 + DCP4 legs the
-# auto budget with main's permutation placement; #1's DP4 x TP2 leg passes
+# auto budget with main's permutation placement; p01's DP4 x TP2 leg passes
 # --kv-cache-memory-bytes, which is kept.
 DECODE_KV_BYTES = {
     "p01": 39_500_000_000,
