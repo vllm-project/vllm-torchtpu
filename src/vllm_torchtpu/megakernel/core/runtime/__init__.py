@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     from . import (
         checks,
+        constants,
         contract,
         eligibility,
         exec_policy,
@@ -42,6 +43,16 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         verify_ir_coverage,
         verify_pooled_step_hlo,
         verify_sentinel_step,
+    )
+    from .constants import (
+        DEFAULT_BUCKETS,
+        DEFAULT_VERIFY_BUCKETS,
+        FALSE_STRS,
+        MAX_BUCKET_ROWS,
+        MIN_VERIFY_TOKENS,
+        MTP_SPECULATIVE_TOKENS,
+        MTP_VERIFY_TOKENS,
+        STARTUP_FLAG_RULES,
     )
     from .contract import (
         DOMAIN_TP,
@@ -80,10 +91,6 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         facts_from_pool_layout,
     )
     from .policy import (
-        DEFAULT_BUCKETS,
-        DEFAULT_VERIFY_BUCKETS,
-        MTP_SPECULATIVE_TOKENS,
-        MTP_VERIFY_TOKENS,
         BucketPolicy,
         parse_mk_buckets,
         parse_mk_verify_buckets,
@@ -108,10 +115,12 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
 
 # Public names resolve on first access (PEP 562): importing a submodule
 # (e.g. `runtime.contract`) doesn't import jax through this package. The
-# framework-free part is `contract` and `policy` (stdlib) and `stats` (numpy);
-# the rest is policy- / kernel-bound.
+# framework-free part is `constants`, `contract`, and `policy` (stdlib) and
+# `stats` (numpy); `eligibility` imports jax through the chip table and loads on
+# first access, and the rest is policy- / kernel-bound.
 _SUBMODULES = frozenset(
     {
+        "constants",
         "contract",
         "stats",
         "checks",
@@ -123,6 +132,14 @@ _SUBMODULES = frozenset(
     }
 )
 _LAZY: dict[str, str] = {
+    "DEFAULT_BUCKETS": ".constants",
+    "DEFAULT_VERIFY_BUCKETS": ".constants",
+    "FALSE_STRS": ".constants",
+    "MAX_BUCKET_ROWS": ".constants",
+    "MIN_VERIFY_TOKENS": ".constants",
+    "MTP_SPECULATIVE_TOKENS": ".constants",
+    "MTP_VERIFY_TOKENS": ".constants",
+    "STARTUP_FLAG_RULES": ".constants",
     "DOMAIN_TP": ".contract",
     "PARALLELISM_UNSUPPORTED": ".contract",
     "REQUIRES_KEYS": ".contract",
@@ -159,23 +176,19 @@ _LAZY: dict[str, str] = {
     "check_post_mesh_eligibility": ".eligibility",
     "check_startup_eligibility": ".eligibility",
     "check_step_eligibility": ".eligibility",
-    "PoolLayoutFacts": ".layout_facts",
-    "compare_layout_facts": ".layout_facts",
-    "facts_from_pool_layout": ".layout_facts",
-    "DEFAULT_BUCKETS": ".policy",
     "DEFAULT_FUSED_POOL_IO_MAX_B": ".exec_policy",
     "DEFAULT_FUSED_POOL_IO_MIN_B_HI": ".exec_policy",
-    "DEFAULT_VERIFY_BUCKETS": ".policy",
-    "MTP_SPECULATIVE_TOKENS": ".policy",
-    "MTP_VERIFY_TOKENS": ".policy",
-    "BucketPolicy": ".policy",
     "align_cache_exec": ".exec_policy",
     "bucket_exec_spec": ".exec_policy",
     "explicit_profile_settings": ".exec_policy",
-    "parse_mk_buckets": ".policy",
-    "parse_mk_verify_buckets": ".policy",
     "parse_runtime_config": ".exec_policy",
     "resolve_driver_profile": ".exec_policy",
+    "PoolLayoutFacts": ".layout_facts",
+    "compare_layout_facts": ".layout_facts",
+    "facts_from_pool_layout": ".layout_facts",
+    "BucketPolicy": ".policy",
+    "parse_mk_buckets": ".policy",
+    "parse_mk_verify_buckets": ".policy",
     "select_bucket": ".policy",
     "JaxStepMetaOps": ".step_meta",
     "StepMeta": ".step_meta",
@@ -186,18 +199,22 @@ _LAZY: dict[str, str] = {
 }
 
 __all__ = [
-    "DOMAIN_TP",
-    "PARALLELISM_UNSUPPORTED",
-    "REQUIRES_KEYS",
-    "REQUIRES_UNMET",
-    "UNSUPPORTED_TPU_CHIP",
-    "UNSUPPORTED_TP_SIZE",
     "DEFAULT_BUCKETS",
     "DEFAULT_FUSED_POOL_IO_MAX_B",
     "DEFAULT_FUSED_POOL_IO_MIN_B_HI",
     "DEFAULT_VERIFY_BUCKETS",
+    "DOMAIN_TP",
+    "FALSE_STRS",
+    "MAX_BUCKET_ROWS",
+    "MIN_VERIFY_TOKENS",
     "MTP_SPECULATIVE_TOKENS",
     "MTP_VERIFY_TOKENS",
+    "PARALLELISM_UNSUPPORTED",
+    "REQUIRES_KEYS",
+    "REQUIRES_UNMET",
+    "STARTUP_FLAG_RULES",
+    "UNSUPPORTED_TPU_CHIP",
+    "UNSUPPORTED_TP_SIZE",
     "BatchShape",
     "Bucket",
     "BucketPolicy",
@@ -230,8 +247,9 @@ __all__ = [
     "check_startup_eligibility",
     "check_step_eligibility",
     "checks",
-    "contract",
     "compare_layout_facts",
+    "constants",
+    "contract",
     "eligibility",
     "exec_policy",
     "explicit_profile_settings",
@@ -258,17 +276,20 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
+    """Resolve submodules and lazy exports on first attribute access."""
     if name in _SUBMODULES:
         mod_obj = importlib.import_module(f".{name}", __name__)
         globals()[name] = mod_obj
         return mod_obj
     mod = _LAZY.get(name)
     if mod is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        msg = f"module {__name__!r} has no attribute {name!r}"
+        raise AttributeError(msg)
     value = getattr(importlib.import_module(mod, __name__), name)
     globals()[name] = value
     return value
 
 
 def __dir__() -> list[str]:
+    """Return sorted module attributes including lazy exports."""
     return sorted(set(globals()) | set(__all__) | _SUBMODULES)

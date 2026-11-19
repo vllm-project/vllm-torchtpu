@@ -29,19 +29,18 @@ from ..modules.gqa import GQAModule, GQATunables
 from ..pool.config import with_cache
 from ..profile import Profile, get_profile, model_default_profile
 from ..spec import ModelSpec
-from .policy import (
-    _FALSE_STRS,
-    DEFAULT_BUCKETS,
-    DEFAULT_VERIFY_BUCKETS,
-    _need,
-    parse_mk_buckets,
-    parse_mk_verify_buckets,
-)
+from .constants import DEFAULT_BUCKETS, DEFAULT_VERIFY_BUCKETS, FALSE_STRS
+from .policy import parse_mk_buckets, parse_mk_verify_buckets
 
 _TRUE_STRS = ("1", "true", "yes", "on")
 DEFAULT_FUSED_POOL_IO_MAX_B: int = 24
 DEFAULT_FUSED_POOL_IO_MIN_B_HI: int = 56
-_SPLIT_STRS = (*_FALSE_STRS, "split", "3stage")
+_SPLIT_STRS = (*FALSE_STRS, "split", "3stage")
+
+
+def _need(cond: bool, msg: str) -> None:
+    if not cond:
+        raise ValueError(f"Megakernel: {msg}")
 
 
 def _parse_bool(val: Any) -> bool:
@@ -49,7 +48,7 @@ def _parse_bool(val: Any) -> bool:
     if isinstance(val, (bool, int, float)):
         return bool(val)
     s = str(val).strip().lower()
-    if s in _TRUE_STRS or s in _FALSE_STRS:
+    if s in _TRUE_STRS or s in FALSE_STRS:
         return s in _TRUE_STRS
     raise ValueError(f"MegakernelDriver: invalid boolean value {val!r}")
 
@@ -159,7 +158,7 @@ def parse_runtime_config(*sources: Any) -> dict[str, Any]:
             _apply_dict(src)
         else:
             s, sl = str(src).strip(), str(src).strip().lower()
-            if sl in _FALSE_STRS:
+            if sl in FALSE_STRS:
                 cfg["enabled"] = False
             elif sl in _TRUE_STRS:
                 cfg["enabled"] = True

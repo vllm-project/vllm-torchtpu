@@ -356,6 +356,7 @@ class TestBufferedStepPosting:
             _reorder_batch_for_rpa=lambda _so: (0, 0),
             _count_input_chunks=lambda _so: (2, 1),
             _any_decode=lambda _so: False,
+            _dp_local_prompt_logprob_rows=lambda _so: 0,
             _dp_coordinated_step=lambda *_a, **_kw: (None, 2),
             _adaptive_verification=None,
             _readmit_trimmed_drafts=lambda *_a: None,

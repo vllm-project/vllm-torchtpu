@@ -30,7 +30,7 @@ from ..errors import MegakernelConfigError, MegakernelLayoutError
 from ..exec_spec import ExecSpec
 from ..pool.config import cache_exec
 from ..spec import ModelSpec
-from .policy import MTP_VERIFY_TOKENS
+from .constants import MTP_VERIFY_TOKENS
 
 
 @dataclass(frozen=True)
