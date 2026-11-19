@@ -194,6 +194,8 @@ steps:
             tests/kernels/fused_moe/test_fused_ep_moe_v2_weight_slots.py
             tests/kernels/fused_moe/test_fused_ep_moe_v2_plan_kernel.py
             tests/kernels/fused_moe/test_direct_all_gather.py
+            tests/models/vllm/test_dsv41_vocab_parallel_head.py
+            tests/runner/test_vocab_parallel_rows.py
             tests/kernels/test_decode_preparation.py
             tests/kernels/test_decode_bridge.py
             tests/models/vllm/test_csa2_chunk_cache.py
