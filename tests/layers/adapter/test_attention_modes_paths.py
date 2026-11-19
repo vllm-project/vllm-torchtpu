@@ -88,22 +88,40 @@ def test_the_bundled_kernel_refuses_a_layer_with_modes():
         impl._build_bundled_kernel(None, None, None)
 
 
+class _PastTheRefusal(Exception):
+    """Raised by the step after the modes check."""
+
+
+def _past_the_refusal(*args, **kwargs):
+    raise _PastTheRefusal
+
+
 @pytest.mark.parametrize(
-    "build",
+    ("build", "next_step"),
     [
-        lambda impl: impl._build_rpa_kernel(None, None, None, use_pcp_streaming=True),
-        lambda impl: impl._build_bundled_kernel(None, None, None),
+        (
+            lambda impl: impl._build_rpa_kernel(
+                None, None, None, use_pcp_streaming=True
+            ),
+            "_select_kernel_mesh",
+        ),
+        (
+            lambda impl: impl._build_bundled_kernel(None, None, None),
+            "get_vllm_model_wrapper_context",
+        ),
     ],
+    ids=["pcp-streaming", "bundled"],
 )
-def test_a_draft_layer_with_target_modes_is_not_refused(build):
-    """A draft runs every mode off, so the refusal does not apply to it (the
-    build then needs a mesh this test does not set up)."""
+def test_a_draft_layer_with_target_modes_is_not_refused(monkeypatch, build, next_step):
+    """A draft runs every mode off, so the refusal does not apply to it: the
+    build goes on to its next step."""
     impl = _impl(attention.PallasAttentionBackendImpl, draft=True)
-    with _context():
-        try:
-            build(impl)
-        except Exception as e:  # noqa: BLE001 - only the modes refusal matters
-            assert "reduced-precision" not in str(e), e
+    if next_step == "_select_kernel_mesh":
+        monkeypatch.setattr(impl, next_step, _past_the_refusal)
+    else:
+        monkeypatch.setattr(attention, next_step, _past_the_refusal)
+    with _context(), pytest.raises(_PastTheRefusal):
+        build(impl)
 
 
 def test_export_marks_the_mtp_drafts_attention(monkeypatch):

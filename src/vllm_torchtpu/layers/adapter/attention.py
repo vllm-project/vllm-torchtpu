@@ -1019,21 +1019,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
         modes = native_fp8_scope.effective(
             self.attention_modes, self.is_attention_draft
         )
-        if modes.any() and (
-            use_pcp_streaming
-            or "attention_modes" not in inspect.signature(self._kernel_entry).parameters
-        ):
-            # Only the batched RPA entry runs reduced-precision modes; the PCP
-            # streaming kernel and the other entries would drop them.
-            kernel = (
-                "the PCP streaming RPA kernel"
-                if use_pcp_streaming
-                else self._kernel_entry.__name__
-            )
-            raise NotImplementedError(
-                f"{kernel} has no reduced-precision attention modes, but this "
-                f"layer asks for {modes}; leave attention_modes off for it."
-            )
         config_key = (
             self._kernel_op_prefix,
             self.sliding_window,
@@ -1054,6 +1039,23 @@ class PallasAttentionBackendImpl(AttentionImpl):
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
             return existing
+        if modes.any() and (
+            use_pcp_streaming
+            or "attention_modes" not in inspect.signature(self._kernel_entry).parameters
+        ):
+            # Only the batched RPA entry runs reduced-precision modes; the PCP
+            # streaming kernel and the other entries would drop them. Checked
+            # on a cache miss only: the modes are part of the key, so a cached
+            # kernel has passed this check.
+            kernel = (
+                "the PCP streaming RPA kernel"
+                if use_pcp_streaming
+                else self._kernel_entry.__name__
+            )
+            raise NotImplementedError(
+                f"{kernel} has no reduced-precision attention modes, but this "
+                f"layer asks for {modes}; leave attention_modes off for it."
+            )
 
         # Reuse an existing custom op if one with the same config already exists.
         # `_kernel_op_prefix` is included so subclasses (e.g. the batched RPA
