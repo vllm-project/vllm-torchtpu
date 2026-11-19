@@ -16,8 +16,9 @@ non-uniform row at 160 (one request of 1 token: pred False, the cond takes the s
 1 x 4 x 256 f8e4m3fn (the served page geometry), 2048 pages per device.
 
 Chain: one call of the op per iteration, L calls per program (pool carried and donated, each call's output is the next call's
-x), L_LONG 24 / L_SHORT 4. Each dispatch records every TensorCore's completion time (polling its output shards' readiness)
-and the wall time. Per TensorCore: per-call us = (median long - median short) / (L_LONG - L_SHORT). The figure of record per
+x), L_LONG 24 / L_SHORT 4. Each dispatch records every TensorCore's completion time (one waiter thread per TensorCore blocking
+in block_until_ready, the GIL released while it waits; a TC-count check) and the wall time. A per-row watchdog
+(--row-budget-s, default 1800 s) turns a stalled row into a FAIL for that row and the run moves on. Per TensorCore: per-call us = (median long - median short) / (L_LONG - L_SHORT). The figure of record per
 case is the MAX over TensorCores (the served step waits for the slowest rank); the median over TensorCores and the wall-time
 figure are descriptive; split halves (max over TensorCores of each half) as a noise figure (DECODE-L3b ruling 2026-11-19).
 Order per row: base (A, R reps), then A / W / WU interleaved with a rotating order (R rounds), then base2 (A, R reps).
@@ -40,6 +41,7 @@ import os
 import platform
 import statistics
 import sys
+import threading
 import time
 
 try:
@@ -151,6 +153,36 @@ def combine_tc(long_tc, short_tc, l_long=L_LONG, l_short=L_SHORT):
     return max(per), statistics.median(per), per
 
 
+class RowWatchdog(Exception):
+    """A row's work outlived its budget (--row-budget-s): the row reads FAIL and the run moves on."""
+
+
+def wait_all(p_shards, x_shards, t0, deadline, n_expected):
+    """One waiter thread per TensorCore: each blocks in block_until_ready() (the GIL is released while it waits) on that
+    TensorCore's output shards and records its completion time (seconds after the dispatch at t0). Raises RowWatchdog if
+    any waiter is still blocked at ``deadline`` (time.perf_counter() clock) and ValueError if fewer than n_expected
+    TensorCores reported (the TC-count check)."""
+    done = [None] * len(p_shards)
+
+    def waiter(i):
+        p_shards[i].data.block_until_ready()
+        x_shards[i].data.block_until_ready()
+        done[i] = time.perf_counter() - t0
+
+    threads = [threading.Thread(target=waiter, args=(i,), daemon=True) for i in range(len(p_shards))]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=max(0.0, deadline - time.perf_counter()))
+    if any(th.is_alive() for th in threads):
+        raise RowWatchdog(f"RPLE ROW WATCHDOG: {sum(th.is_alive() for th in threads)} TensorCore waiter(s) still blocked "
+                          f"at the row deadline")
+    got = [d for d in done if isinstance(d, float)]
+    if len(done) != n_expected or len(got) != n_expected:
+        raise ValueError(f"RPLE TC COUNT: {len(got)} of {n_expected} TensorCores reported a completion time")
+    return done
+
+
 def rotation(rnd: int, arms=ARMS):
     k = rnd % len(arms)
     return arms[k:] + arms[:k]
@@ -196,6 +228,30 @@ def _checks(verbose=True) -> int:
     chk("combine_tc max / median", per is not None and [round(x, 6) for x in per] == [100.0, 200.0]
         and round(mx, 6) == 200.0 and round(md, 6) == 150.0)
     chk("combine_tc empty", g["combine_tc"]([], [[1.0]]) == (None, None, None))
+
+    class _D:
+        def __init__(self, delay):
+            self.delay = delay
+
+        def block_until_ready(self):
+            time.sleep(self.delay)
+
+    class _S:
+        def __init__(self, delay):
+            self.data = _D(delay)
+
+    try:
+        done = g["wait_all"]([_S(0.001 * i) for i in range(8)], [_S(0.0)] * 8, time.perf_counter(), time.perf_counter() + 5, 8)
+        chk("wait_all 8 TensorCores", len(done) == 8 and all(isinstance(d, float) for d in done) and done[7] >= done[0])
+    except Exception as e:  # noqa: BLE001
+        chk(f"wait_all 8 TensorCores ({type(e).__name__})", False)
+    try:
+        g["wait_all"]([_S(5.0)] + [_S(0.0)] * 7, [_S(0.0)] * 8, time.perf_counter(), time.perf_counter() + 0.2, 8)
+        chk("wait_all watchdog", False)
+    except RowWatchdog:
+        chk("wait_all watchdog", True)
+    except Exception:  # noqa: BLE001
+        chk("wait_all watchdog", False)
     chk("rotation", [g["rotation"](i) for i in range(4)] == [("A", "W", "WU"), ("W", "WU", "A"), ("WU", "A", "W"),
                                                              ("A", "W", "WU")])
     eg = g["engaged"]
@@ -224,6 +280,8 @@ _MUTANTS = {
     "nonuniform row is uniform": ("metadata", lambda T, count, uniform: [WINDOW] * min(T // WINDOW, count)
                                   + [0] * (count - min(T // WINDOW, count))),
     "halves swapped": ("halves", lambda l, s, a=L_LONG, b=L_SHORT: None),
+    "one TensorCore waiter dropped": ("wait_all", lambda ps, xs, t0, dl, n: [time.perf_counter() - t0
+                                                                             for i in range(len(ps) - 1)]),
     "figure of record is the median over TensorCores": ("combine_tc", lambda lt, st, a=L_LONG, b=L_SHORT:
         (lambda per: (statistics.median(per), statistics.median(per), per) if per else (None, None, None))(
             [per_call_us([r[i] for r in lt], [r[i] for r in st], a, b) for i in range(len(lt[0]))] if lt and st else [])),
@@ -391,7 +449,7 @@ def run(args) -> int:
     rows = tuple(int(r) for r in args.rows.split(","))
     out = {"plan": plan(rows), "host": {"platform": platform.node(), "backend": jax.default_backend(), "devices": n_dev,
                                         "device_kind": devs[0].device_kind, "chain": [l_long, l_short], "reps": reps,
-                                        "warmup": args.warmup,
+                                        "warmup": args.warmup, "row_budget_s": args.row_budget_s,
                                         "geometry": geo, "cpu_real": cpu, "libtpu_final": final,
                                         "pool_file": os.path.realpath(pool_mod.__file__)},
            "cases": {}, "health": {}, "engagement": {}, "pred": {}, "errors": []}
@@ -431,6 +489,7 @@ def run(args) -> int:
     same = same_fn()
     row_list = [(r, True) for r in rows] + ([(NONUNIFORM_ROW, False)] if NONUNIFORM_ROW in rows else [])
     for T, uniform in row_list:
+        row_deadline = time.perf_counter() + args.row_budget_s  # the per-row watchdog (compile is not interruptible)
         key = str(T) if uniform else f"{T}nu"
         count = COUNTS[T]
         seed = T + (0 if uniform else 1)
@@ -472,6 +531,8 @@ def run(args) -> int:
             out["health"][key] = {"ok": False, "why": "not compiled"}
             continue
         try:
+            if time.perf_counter() > row_deadline:
+                raise RowWatchdog("RPLE ROW WATCHDOG: the row's budget ran out before health")
             # health: one short chain per arm from the same pool
             res = {}
             for arm in ARMS:
@@ -498,12 +559,7 @@ def run(args) -> int:
                     p_out, x_out = compiled[(arm, length)](*a_in)
                     ps = sorted(p_out.addressable_shards, key=lambda s: s.device.id)
                     xs = sorted(x_out.addressable_shards, key=lambda s: s.device.id)
-                    done = [None] * len(ps)
-                    while any(d is None for d in done):
-                        for i in range(len(ps)):
-                            if done[i] is None and ps[i].data.is_ready() and xs[i].data.is_ready():
-                                done[i] = time.perf_counter() - t0
-                        time.sleep(0)  # yield the GIL (the CPU interpreter's kernel callbacks need it; ~1 us on TPU)
+                    done = wait_all(ps, xs, t0, row_deadline, n_dev)
                     jax.block_until_ready((p_out, x_out))
                     samples[case][tag].append(time.perf_counter() - t0)
                     samples[case][tag + "_tc"].append(done)
@@ -561,6 +617,9 @@ def main() -> int:
     ap.add_argument("--l-short", type=int, default=L_SHORT)
     ap.add_argument("--reps", type=int, default=REPS)
     ap.add_argument("--warmup", type=int, default=2)
+    ap.add_argument("--row-budget-s", type=float, default=1800.0,
+                    help="per-row watchdog: a row (health + timing; compile is not interruptible) still running this many "
+                         "seconds after its start reads FAIL (error 'RPLE ROW WATCHDOG') and the run moves on")
     ap.add_argument("--cpu-real", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--mutants", action="store_true")
