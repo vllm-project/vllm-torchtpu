@@ -30,18 +30,6 @@ KNOWN = [
 UNKNOWN = ["tpu-unknown-8", "v9z-4", ""]
 
 
-@pytest.fixture
-def accelerator_type(monkeypatch):
-    def use(value):
-        monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: value)
-        tpu_info.find_chip_version.cache_clear()
-        tpu_info.get_chip_version.cache_clear()
-
-    yield use
-    tpu_info.find_chip_version.cache_clear()
-    tpu_info.get_chip_version.cache_clear()
-
-
 @pytest.mark.parametrize("value, chip", KNOWN)
 def test_known_types_resolve_alike(accelerator_type, value, chip):
     accelerator_type(value)
