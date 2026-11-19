@@ -82,6 +82,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
     AsyncPreResults,
     AsyncTPUModelRunnerOutput,
+    extract_draft_token_ids,
 )
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
@@ -4645,3 +4646,50 @@ def test_update_states_clears_prev_draft_len_of_scheduled_cached_requests():
         runner._update_states(output)
 
     assert seen == {"drafting": 0, "budget_cut": 0, "unscheduled": 3}
+
+
+@pytest.mark.parametrize(
+    "num_draft_tokens,cu_num_scheduled_tokens,num_input,trimmed",
+    [
+        ([3, 2], [4, 7], 16, True),  # every draft input lies below 8 rows
+        ([3, 2], [4, 7], 8, False),  # nothing to cut
+        ([0, 2], [10, 13], 16, False),  # a draft input at row 12 >= 8
+    ],
+    ids=["padded_decode", "unpadded_decode", "prefill_first"],
+)
+def test_draft_extract_reads_the_same_drafts_from_the_cut_input(
+    num_draft_tokens, cu_num_scheduled_tokens, num_input, trimmed
+):
+    """The draft extract takes `input_ids` cut to the logits length only when
+    the metadata's largest draft input index lies below it, as a copy, and
+    reads the same drafts as from the whole input. Both build paths set the
+    index: the second build of the same layout comes from the cache."""
+    runner = MagicMock()
+    runner.device = torch.device("cpu")
+    runner.arange_np = np.arange(100, dtype=np.int32)
+    runner.num_tokens_paddings = [8, 16, 32, 64]
+    input_ids = torch.arange(1, num_input + 1, dtype=torch.int32)
+    runner.input_ids_cpu = input_ids
+    manager = SpeculativeDecodingManager(runner)
+    layout = (
+        np.array(num_draft_tokens, dtype=np.int32),
+        np.array(cu_num_scheduled_tokens, dtype=np.int32),
+        4,
+    )
+    fresh = manager.get_spec_decode_metadata(*layout)
+    cached = manager.get_spec_decode_metadata(*layout)
+    assert cached.final_logits_indices is fresh.final_logits_indices  # a cache hit
+    for metadata in (fresh, cached):
+        cut = tpu_runner._draft_extract_input_ids(input_ids, metadata)
+        length = metadata.final_logits_indices.shape[0]
+        assert cut.shape[0] == (length if trimmed else num_input)
+        if trimmed:
+            # A copy, not a view of the input.
+            assert cut.untyped_storage().data_ptr() != (
+                input_ids.untyped_storage().data_ptr()
+            )
+        args = (metadata.final_logits_indices, metadata.target_logits_indices)
+        assert torch.equal(
+            extract_draft_token_ids(cut, *args),
+            extract_draft_token_ids(input_ids, *args),
+        )
