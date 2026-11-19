@@ -413,18 +413,6 @@ def test_explicit_budget_is_kept_on_any_device(monkeypatch):
     assert cfg.cache_config.kv_cache_memory_bytes == 12_000_000_000
 
 
-@pytest.fixture
-def accelerator_type(monkeypatch):
-    """Sets the accelerator type tpu_info reads; its chip lookup is cached."""
-
-    def use(value):
-        monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: value)
-        tpu_info.find_chip_version.cache_clear()
-
-    yield use
-    tpu_info.find_chip_version.cache_clear()
-
-
 @pytest.mark.parametrize(
     "value, family",
     [
