@@ -337,6 +337,20 @@ def env_nonnegative_int(env_name: str, default: int) -> Callable[[], int]:
     return _get_nonnegative_int_env
 
 
+def env_positive_int(env_name: str, default: int) -> Callable[[], int]:
+    """Integer knob that must be greater than zero, for sizes and steps that
+    always have a value. A value of zero or less raises."""
+    parse_int = env_int(env_name, default)
+
+    def _get_positive_int_env() -> int:
+        value = parse_int()
+        if value <= 0:
+            raise ValueError(f"Invalid value '{value}' for {env_name}: must be > 0.")
+        return value
+
+    return _get_positive_int_env
+
+
 def env_float(env_name: str, default: float) -> Callable[[], float]:
     """Float knob with a default. An unparseable value raises."""
 
@@ -1421,13 +1435,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DP_PREFIX_AFFINITY": env_bool(
         "VLLM_TPU_DP_PREFIX_AFFINITY", default=False
     ),
-    "VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS": env_positive_int_or_none(
+    "VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS": env_positive_int(
         "VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS", 4096
     ),
     "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN": env_nonnegative_int(
         "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN", 2
     ),
-    "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE": env_positive_int_or_none(
+    "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE": env_positive_int(
         "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE", 65536
     ),
 }
