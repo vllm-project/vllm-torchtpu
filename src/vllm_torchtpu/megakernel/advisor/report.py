@@ -37,6 +37,7 @@ from .constants import (
     SVG_MIN_FONT_PX,
     SVG_TICKS,
 )
+from .models import has_dsa_profile
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -1185,6 +1186,12 @@ def _render_facts_ledger_card(sweep: AdvisorSweepReport) -> str:
     num_attn = model_prof.num_attention_heads
     num_kv = model_prof.num_kv_heads
     head_dim = model_prof.head_dim
+    attn_geom_text = f"NH={num_attn}, NKV={num_kv}, HD={head_dim}"
+    if has_dsa_profile(model_prof):
+        attn_geom_text += (
+            f", top-k={model_prof.index_topk} "
+            f"({model_prof.num_indexer_layers} indexer layers)"
+        )
     num_exp = model_prof.num_experts
     top_k = model_prof.top_k
     moe_desc = (
@@ -1308,7 +1315,7 @@ def _render_facts_ledger_card(sweep: AdvisorSweepReport) -> str:
           </tr>
           <tr>
             <td>Attention Geometry</td>
-            <td><strong>NH={num_attn}, NKV={num_kv}, HD={head_dim}</strong></td>
+            <td><strong>{attn_geom_text}</strong></td>
             <td>
               <span class="fact-src">
                 {_esc(model_sources.get("attention_heads", "HF config.json"))}
