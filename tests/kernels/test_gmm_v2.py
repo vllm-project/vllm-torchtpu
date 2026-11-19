@@ -31,6 +31,7 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     apply_act_fn,
     gmm_v2,
     interleave_lane,
+    silu_and_mul_bf16,
     situ_and_mul,
 )
 
@@ -85,6 +86,39 @@ def test_apply_act_fn_dispatches_situ(monkeypatch, linear_beta):
 
     actual = apply_act_fn(interleave_lane(gate, up), f"situ:4.0:{linear_beta}")
     _assert_allclose(actual, expected)
+
+
+def test_apply_act_fn_silu_bf16_rounds_intermediates_to_bfloat16(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
+        lambda: SimpleNamespace(num_lanes=1),
+    )
+    gate = jnp.asarray([-3.86777902], dtype=jnp.float32)
+    up = jnp.asarray([2.9283731], dtype=jnp.float32)
+    interleaved = interleave_lane(gate, up)
+
+    actual = apply_act_fn(interleaved, "silu_bf16")
+
+    # bf16(bf16(silu(bf16(gate))) * bf16(up)). Dropping any one of the three
+    # intermediate casts changes the value (checked below), so the test fails
+    # if the kernel skips one.
+    expected = np.asarray([-0.2294921875], dtype=np.float32)
+    assert actual.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(actual), expected)
+    np.testing.assert_array_equal(
+        np.asarray(silu_and_mul_bf16(gate, up).astype(jnp.float32)), expected
+    )
+    bf16, f32 = jnp.bfloat16, jnp.float32
+    silu_of_bf16_gate = jax.nn.silu(gate.astype(bf16).astype(f32))
+    without_one_cast = {
+        "gate": jax.nn.silu(gate).astype(bf16) * up.astype(bf16),
+        "up": silu_of_bf16_gate.astype(bf16).astype(f32) * up,
+        "silu": silu_of_bf16_gate * up.astype(bf16).astype(f32),
+        "all": jax.nn.silu(gate) * up,
+    }
+    for name, value in without_one_cast.items():
+        value = np.asarray(value.astype(bf16).astype(f32))
+        assert not np.array_equal(value, expected), name
 
 
 def get_group_sizes(batch_size: int, num_groups: int) -> jax.Array:
@@ -256,7 +290,7 @@ def test_gmm_weight_quantized_matches_reference(weight_dtype, block_size):
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("fuse_act", ["silu", "swigluoai"])
+@pytest.mark.parametrize("fuse_act", ["silu", "silu_bf16", "swigluoai"])
 def test_gmm_fused_activation_matches_reference(fuse_act):
     _require_tpu()
 
@@ -313,6 +347,70 @@ def test_gmm_fused_activation_matches_reference(fuse_act):
 
     assert actual.shape == (batch_size, final_out_size)
     _assert_allclose(actual, expected, atol=4.0, rtol=2.0)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "weight_dtype,maybe_quantize_lhs",
+    [(None, False), (jnp.int8, False), (jnp.int8, True)],
+)
+def test_gmm_fused_silu_bf16_matches_unfused_silu_and_mul(
+    weight_dtype, maybe_quantize_lhs
+):
+    _require_tpu()
+
+    batch_size = 128
+    in_size = 512
+    out_size = 512
+    num_groups = 16
+    key = jax.random.key(0)
+    lhs_key, rhs_key, bias_key = jax.random.split(key, 3)
+
+    lhs = jax.random.uniform(lhs_key, (batch_size, in_size), jnp.bfloat16, -1.0, 1.0)
+    rhs = jax.random.uniform(
+        rhs_key, (num_groups, in_size, out_size), jnp.bfloat16, -0.1, 0.1
+    )
+    rhs_bias = jax.random.uniform(
+        bias_key, (num_groups, 1, out_size), jnp.bfloat16, -0.1, 0.1
+    )
+    rhs_scale = None
+    if weight_dtype is not None:
+        rhs, rhs_scale = quantize_tensor(rhs, weight_dtype, axis=1, block_size=512)
+        rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    def run(fuse_act):
+        return gmm_v2(
+            lhs,
+            rhs,
+            group_sizes,
+            rhs_scale=rhs_scale,
+            rhs_bias=rhs_bias,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+            fuse_act=fuse_act,
+        )
+
+    # Unfused reference: the same GEMM writes bfloat16 gate/up, then a
+    # standalone bfloat16 SiluAndMul.
+    gate, up = jnp.split(run(None).astype(jnp.bfloat16), 2, axis=-1)
+    expected = np.asarray(
+        jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16) * up
+    )
+    actual_silu_bf16 = run("silu_bf16")
+    actual_silu = np.asarray(run("silu").astype(jnp.bfloat16))
+
+    assert actual_silu_bf16.dtype == jnp.bfloat16
+    actual = np.asarray(actual_silu_bf16).astype(np.float32)
+    # Every element within 2 bfloat16 ULPs; most are bit-equal.
+    assert np.isfinite(actual).all()
+    np.testing.assert_allclose(
+        actual, expected.astype(np.float32), rtol=2**-6, atol=2**-10
+    )
+    bf16_equal = np.mean(np.asarray(actual_silu_bf16) == expected)
+    fp32_equal = np.mean(actual_silu == expected)
+    assert bf16_equal > 0.99, (bf16_equal, fp32_equal)
+    # Reverting to float32 intermediates must fail the check above.
+    assert fp32_equal < 0.9, (bf16_equal, fp32_equal)
 
 
 @pytest.mark.tpu_test

@@ -186,7 +186,7 @@ class Bucket:
 
     @property
     def key(self) -> tuple[int, int]:
-        return (int(self.T), int(self.B))
+        return (self.T, self.B)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -326,7 +326,7 @@ class TpuMonoSpec:
             )
         if PAR_TP not in self.parallelism:
             raise MegakernelConfigError(f"{where}: parallelism must include 'tp'")
-        if unknown := sorted(set(self.requires) - set(REQUIRES_KEYS)):
+        if unknown := sorted(self.requires.keys() - REQUIRES_KEYS.keys()):
             raise MegakernelConfigError(
                 f"{where}: unknown requires key {unknown[0]!r}; "
                 f"known: {sorted(REQUIRES_KEYS)}"

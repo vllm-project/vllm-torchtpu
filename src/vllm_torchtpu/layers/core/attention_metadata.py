@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_torchtpu.layers.core.pcp_metadata import PcpMetadata
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
     DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
@@ -70,6 +71,7 @@ def attention_block_table_width(
         "mamba_request_distribution",
         "mamba_prefill_ckpt_offsets",
         "mamba_prefill_ckpt_indices",
+        "pcp_metadata",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -128,6 +130,8 @@ class AttentionMetadata:
     # checkpoint (-1 if none). Present iff the group declares prefill
     # checkpoint blocks and mamba_prefill_ckpt_offsets is set.
     mamba_prefill_ckpt_indices: jax.Array | torch.Tensor | None = None
+    # PCP manager only (see `runner/pcp/manager.py`); None elsewhere.
+    pcp_metadata: PcpMetadata | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -553,10 +557,14 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             # table whose upload is still in flight (see `stage_h2d_upload`).
             flat = zeros_h2d_source(runner, target_num_reqs * target_num_blocks)
             block_tables = flat.view(target_num_reqs, target_num_blocks)
-            source_block_tables = block_table_obj.get_cpu_tensor()
-            block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
-            ]
+            # PCP currently only read block table inside pcpmetadata
+            # TODO(weiyulin): Evaluate if we want to derive split/replicated block
+            # tables for pcpmanager from md.blocktable
+            if runner.pcp_manager is None:
+                source_block_tables = block_table_obj.get_cpu_tensor()
+                block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
+                    ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
+                ]
             # Flatten on CPU before H2D to avoid device-side
             # as_strided/reshape materialization on every decode step.
             block_tables_dev = stage_h2d_upload(runner, flat)
@@ -647,6 +655,17 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 "Prefill checkpoints need the unified KV pool."
             )
 
+        pcp_metadata = (
+            None
+            if runner.pcp_manager is None
+            else runner.pcp_manager.build_metadata(
+                runner=runner,
+                block_table_obj=block_table_obj,
+                target_num_reqs=target_num_reqs,
+                target_num_blocks=target_num_blocks,
+            )
+        )
+
         return AttentionMetadata(
             input_positions=input_positions,
             block_tables=block_tables_dev,
@@ -657,6 +676,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets=mamba_slot_read_offsets,
             mamba_ckpt_indices=mamba_ckpt_indices,
             mamba_request_distribution=mamba_request_distribution,
+            pcp_metadata=pcp_metadata,
             mamba_prefill_ckpt_offsets=mamba_prefill_ckpt_offsets,
             mamba_prefill_ckpt_indices=mamba_prefill_ckpt_indices,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
@@ -708,7 +728,8 @@ def stage_block_table_uploads(
     # (see `stage_h2d_upload`).
     flat = zeros_h2d_source(runner, total)
 
-    if ctx.position_ids_override is None:
+    # The PCP manager's layers read block tables inside pcp_metadata.
+    if ctx.position_ids_override is None and runner.pcp_manager is None:
         offset = 0
         for _, block_table_obj, target_num_blocks in entries:
             rows = flat[offset : offset + num_reqs_padded * target_num_blocks].view(

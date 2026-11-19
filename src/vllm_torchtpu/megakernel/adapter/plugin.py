@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 if TYPE_CHECKING:
     from vllm_torchtpu.megakernel.core.runtime.contract import StepFn
@@ -50,6 +50,23 @@ class Shorthand(NamedTuple):
 # Built-in templates by shorthand name. Imported by string only, so the
 # adapter never imports a template at module load.
 SHORTHANDS: Mapping[str, Shorthand] = {}
+
+
+class RunnerProtocol(Protocol):
+    """The runner the adapter reads at startup: `TPUModelRunner` (and
+    `testing.fake_runner`). `RunnerView` wraps it for programs; the startup
+    guards read it directly. Config comes from `vllm_config`; the rest are
+    attributes the TPU model runner always sets."""
+
+    vllm_config: Any
+    model: Any
+    supports_mm_inputs: bool
+    uses_mrope: bool
+    _pp_is_first: bool
+    _pp_is_last: bool
+    _pcp_enabled: bool
+
+    def _dp_lockstep_enabled(self) -> bool: ...
 
 
 class RunnerView:
@@ -104,10 +121,10 @@ class RunnerView:
     @property
     def tp_rank(self) -> int:
         if self._tp_rank is not None:
-            return int(self._tp_rank)
+            return self._tp_rank
         from vllm.distributed import get_tensor_model_parallel_rank
 
-        return int(get_tensor_model_parallel_rank())
+        return get_tensor_model_parallel_rank()
 
     @property
     def speculative_tokens(self) -> int:
@@ -221,6 +238,7 @@ class ForwardView:
 __all__ = [
     "SHORTHANDS",
     "ForwardView",
+    "RunnerProtocol",
     "RunnerView",
     "Shorthand",
 ]

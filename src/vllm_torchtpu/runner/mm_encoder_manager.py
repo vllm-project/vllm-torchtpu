@@ -29,7 +29,7 @@ from vllm_torchtpu.runner.mm_video_chunking import (
     embed_multimodal_chunked,
     get_video_chunk_patch_size,
 )
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import align_to, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -116,21 +116,35 @@ class MMEncoderManager(EncoderCudaGraphManager):
 
         # Create dummy input templates for every budget size and path directly
         # from self.path_token_budgets prepared by EncoderCudaGraphManager.
-        self.budget_templates: dict[str, dict[int, dict[str, torch.Tensor]]] = {
-            path: {
-                budget: self.model.prepare_encoder_cudagraph_capture_inputs(
-                    budget,
-                    self.max_batch_size,
-                    self.max_frames_per_batch,
-                    self.device,
-                    self.dtype,
-                    path=path,
-                ).values
-                for budget in budgets
-                if budget > 0
-            }
-            for path, budgets in self.path_token_budgets.items()
-        }
+        # Built without autograd and detached: some templates derive from or
+        # return parameters directly (e.g. Kimi-K3's `pos_embeds`), and a
+        # template that requires grad is a different Dynamo guard than the
+        # `no_grad` replay inputs, so replays that bypass the template would
+        # recompile every budget.
+        with torch.no_grad():
+            self.budget_templates: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
+            for path, budgets in self.path_token_budgets.items():
+                templates: dict[int, dict[str, torch.Tensor]] = {}
+                for budget in budgets:
+                    if budget <= 0:
+                        continue
+                    capture = self.model.prepare_encoder_cudagraph_capture_inputs(
+                        budget,
+                        self.max_batch_size,
+                        self.max_frames_per_batch,
+                        self.device,
+                        self.dtype,
+                        path=path,
+                    )
+                    templates[budget] = {
+                        key: (
+                            val.detach()
+                            if isinstance(val, torch.Tensor) and val.requires_grad
+                            else val
+                        )
+                        for key, val in capture.values.items()
+                    }
+                self.budget_templates[path] = templates
         # CUDA graph metadata owns CUDA replay buffers. Track XLA warmup
         # separately rather than storing template dicts in that upstream map.
         self.compiled_budgets: dict[str, set[int]] = {
@@ -165,7 +179,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
 
         for key, tmpl in template.items():
             src = replay_values.get(key)
-            if src is None:
+            if src is None or tmpl is None:
                 padded[key] = tmpl
                 continue
 
@@ -176,8 +190,10 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 continue
 
             if src.shape == tmpl.shape:
-                # Already perfectly bucket-sized
-                padded[key] = src.to(device=tmpl.device)
+                # Already perfectly bucket-sized. Detach if needed so the
+                # input matches the template's requires_grad=False guard.
+                src = src.to(device=tmpl.device)
+                padded[key] = src.detach() if src.requires_grad else src
                 continue
 
             padding_logic = self.config.padding_logics.get(
@@ -404,6 +420,8 @@ class MMEncoderManager(EncoderCudaGraphManager):
     ) -> list[torch.Tensor]:
         from vllm.distributed.parallel_state import get_tp_group
 
+        # Each new all-gather size compiles on every rank; budgets bound the sizes.
+        max_tokens = self._gather_slot_tokens(max_tokens)
         padded = torch.zeros(
             (max_tokens, self.config.out_hidden_size),
             device=self.device,
@@ -427,11 +445,43 @@ class MMEncoderManager(EncoderCudaGraphManager):
             start += count
         return [outputs[index] for index in range(len(tokens))]
 
-    def precompile_vision_encoder(self) -> None:
-        """Prime the XLA compilation cache for all configured token budgets."""
+    def _gather_slot_tokens(self, max_tokens: int) -> int:
+        """Per-rank slot size of the encoder-DP all-gather for `max_tokens`.
+
+        The smallest token budget that fits, or, past the largest budget (one
+        rank encoding several large items), the next multiple of it. Startup
+        warms multiples up to ``max_step_tokens`` via
+        ``precompile_vision_encoder``; any larger unscheduled multiple compiles
+        on first use.
+        """
+        budget = self._find_smallest_fitting_budget_given_tokens(max_tokens)
+        if budget is not None:
+            return budget
+        return align_to(max_tokens, self.token_budgets[-1])
+
+    def precompile_vision_encoder(self, max_step_tokens: int = 0) -> None:
+        """Prime the XLA compilation cache for all configured token budgets.
+
+        Under encoder data parallelism, also warms the all-gather for every
+        token budget and, when ``max_step_tokens`` exceeds the largest budget,
+        each reachable multiple of the largest budget up to ``max_step_tokens``.
+        """
         for path, templates in self.budget_templates.items():
             for budget in templates:
                 self._capture_budget_graph(budget, path=path)
+        if self.use_dp:
+            largest = self.token_budgets[-1]
+            slots = list(self.token_budgets)
+            if max_step_tokens > largest:
+                slots.extend(
+                    range(
+                        2 * largest,
+                        align_to(max_step_tokens, largest) + 1,
+                        largest,
+                    )
+                )
+            for slot in slots:
+                self._gather_dp_outputs([], [], [], [], slot)
 
 
 def maybe_create_mm_encoder_manager(
