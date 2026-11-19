@@ -51,6 +51,21 @@ def test_parse(monkeypatch):
         msa_dcp_heads.hp_prefill_kernel_kwargs()
 
 
+def test_parse_tile_pages(monkeypatch):
+    monkeypatch.setenv(ENV, "8:64::1024:192")
+    kw = msa_dcp_heads.hp_prefill_kernel_kwargs()
+    assert kw["block_q"] == 8 and kw["pages_per_step"] == 64
+    assert kw["page_cache_slots"] == 1024 and kw["page_cache_tile_pages"] == 192
+    assert "step_widths" not in kw
+    # Empty fifth field / four fields: the global tile limit applies.
+    for spec in ("8:64::1024:", "8:64::1024"):
+        monkeypatch.setenv(ENV, spec)
+        assert "page_cache_tile_pages" not in msa_dcp_heads.hp_prefill_kernel_kwargs()
+    monkeypatch.setenv(ENV, "8:64::1024:192:1")
+    with pytest.raises(ValueError):
+        msa_dcp_heads.hp_prefill_kernel_kwargs()
+
+
 def _inputs(T=64, pool=40, heads=8, d=128, s=128, topk=16, seed=0):
     rng = np.random.default_rng(seed)
     nib = jnp.asarray(rng.integers(0, 16, (pool, s, 2 * d)), jnp.uint8)

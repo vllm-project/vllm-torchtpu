@@ -91,8 +91,13 @@ _hp_config_logged = False
 def hp_prefill_kernel_kwargs() -> dict:
     """Kernel config of the head-parallel prefill attention from
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG ("<block_q>:<pages per step>:
-    <widths w/w/...>:<page cache slots>"); empty -> `_BLOCK_Q` /
-    `_PAGES_PER_STEP` and the kernel's widths, no page cache."""
+    <widths w/w/...>:<page cache slots>[:<page cache tile pages>]"); empty ->
+    `_BLOCK_Q` / `_PAGES_PER_STEP` and the kernel's widths, no page cache.
+    The optional fifth field gives the head-parallel calls their own page
+    cache tile limit, so the global
+    TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_TILE_PAGES can be tuned for the
+    other prefill calls (c64 DCP 4: steps below 2048 tokens prefer 64, the
+    head-parallel calls 192)."""
     global _hp_config_logged
     from vllm_torchtpu import envs
 
@@ -100,9 +105,12 @@ def hp_prefill_kernel_kwargs() -> dict:
     if not spec:
         return dict(block_q=_BLOCK_Q, pages_per_step=_PAGES_PER_STEP)
     parts = spec.split(":")
-    if len(parts) != 4:
-        raise ValueError(f"{HP_PREFILL_CONFIG_ENV}={spec!r}: want bq:pps:widths:slots")
-    block_q, pages_per_step, widths, slots = parts
+    if len(parts) not in (4, 5):
+        raise ValueError(
+            f"{HP_PREFILL_CONFIG_ENV}={spec!r}: want bq:pps:widths:slots[:tile_pages]"
+        )
+    block_q, pages_per_step, widths, slots = parts[:4]
+    tile_pages = int(parts[4] or 0) if len(parts) == 5 else 0
     kw = dict(
         block_q=int(block_q or _BLOCK_Q),
         pages_per_step=int(pages_per_step or _PAGES_PER_STEP),
@@ -112,6 +120,8 @@ def hp_prefill_kernel_kwargs() -> dict:
     if int(slots or 0):
         kw["page_cache_slots"] = int(slots)
         kw["page_cache_bf16"] = msa_attention_lse.PREFILL_PAGE_CACHE_BF16
+        if tile_pages:
+            kw["page_cache_tile_pages"] = tile_pages
     if not _hp_config_logged:
         _hp_config_logged = True
         init_logger(__name__).warning(
@@ -120,7 +130,7 @@ def hp_prefill_kernel_kwargs() -> dict:
             HP_PREFILL_CONFIG_ENV,
             spec,
             kw,
-            msa_attention_lse.PAGE_CACHE_TILE_PAGES,
+            tile_pages or msa_attention_lse.PAGE_CACHE_TILE_PAGES,
         )
     return kw
 
