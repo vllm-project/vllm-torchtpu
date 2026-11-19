@@ -124,6 +124,13 @@ _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # non-ragged paths (EP one-hot permute and non-EP TP). Off, those paths run
 # the packed single sort or the three-sort form; ragged permute is unaffected.
 _COUNTING_SORT = envs.TPU_MOE_COUNTING_SORT
+# Fixed at import: the valid route count comes from the counting sort.
+_VALID_COUNT_FROM_SORT = envs.TPU_MOE_VALID_COUNT_FROM_SORT
+if _VALID_COUNT_FROM_SORT:
+    logger.info(
+        "TPU_MOE_VALID_COUNT_FROM_SORT=1 on: the MoE combine's computed-row "
+        "count comes from the counting sort's bucket bases"
+    )
 # Routed-row cap for the one-hot EP permute and non-EP paths. Up to here the
 # counting sort (or, where it declines, the packed single sort) replaces the
 # three-sort form; above it the three sorts stay. Past this point the single
@@ -292,7 +299,7 @@ def gmm_wrapper(
 
 def _counting_sort_positions(
     sort_keys: jax.Array, num_buckets: int
-) -> tuple[jax.Array | None, jax.Array | None]:
+) -> tuple[jax.Array | None, jax.Array | None, jax.Array | None]:
     """Stable counting sort: row -> its position in the sorted order.
 
     `jnp.argsort(jnp.argsort(keys))` spends a second comparison sort over M
@@ -300,7 +307,9 @@ def _counting_sort_positions(
     The keys take only `num_buckets` values, so the rank within a bucket comes
     from a triangular matmul on the one-hot block -- MXU work proportional to
     M*block*num_buckets instead of a length-M sort -- and the bucket totals
-    fall out of the same histogram, which is exactly `group_sizes`.
+    fall out of the same histogram, which is exactly `group_sizes`. The
+    third value is the base of the last bucket (the sentinel) as an int32
+    ``[1]``: the number of rows in the real buckets.
     """
     m = sort_keys.shape[0]
     block = min(_COUNTING_SORT_BLOCK, m)
@@ -308,7 +317,7 @@ def _counting_sort_positions(
         # XLA miscompiles the rank matmul here on jaxlib 0.10.2 + libtpu
         # 0.0.44.1: under jit the positions come back not a permutation. Only
         # num_buckets > block is affected, so that is the excluded region.
-        return None, None
+        return None, None, None
     pad = -m % block
     if pad:
         # The sentinel bucket sorts after every real one, so padding into it
@@ -342,6 +351,7 @@ def _counting_sort_positions(
             precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
         )[None, :]
+        last_base = base[0, num_buckets - 1 :]
     else:
         counts = hist.sum(axis=0)
         bucket_offset = jnp.einsum(
@@ -365,8 +375,14 @@ def _counting_sort_positions(
         else:
             block_offset = jnp.cumsum(hist, axis=0) - hist
         base = block_offset + bucket_offset
+        last_base = bucket_offset[num_buckets - 1 :]
     pos = ((base[:, None, :] + rank) * onehot).sum(axis=2)
-    return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
+    # Exact: a HIGHEST-precision sum of at most m integer counts in f32.
+    return (
+        pos.reshape(-1)[:m].astype(jnp.int32),
+        counts.astype(jnp.int32),
+        last_base.astype(jnp.int32),
+    )
 
 
 def _zero_non_finite(x: jax.Array) -> jax.Array:
@@ -408,8 +424,12 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    with_valid_count: bool = False,
+) -> tuple[jax.Array, ...]:
     """Prepare the local-only routing layout using already-local expert ids.
+
+    With `with_valid_count`, a seventh value: the number of valid local
+    routes as int32 ``[1]`` from the counting sort, or None without it.
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
     valid-mask path computed below is a no-op (jnp.where on an all-True
@@ -447,10 +467,10 @@ def prepare_routed_gmm_inputs(
     counting_sort = ragged_permute or (
         _COUNTING_SORT and token_indices_flat.shape[0] <= _SINGLE_SORT_MAX_ROWS
     )
-    argsort_revert_indices, bucket_counts = (
+    argsort_revert_indices, bucket_counts, sorted_valid_count = (
         _counting_sort_positions(sort_keys, local_num_experts + 1)
         if counting_sort
-        else (None, None)
+        else (None, None, None)
     )
     token_bits = max(1, (num_tokens_local - 1).bit_length())
     packable = (local_num_experts + 1).bit_length() + token_bits < 31
@@ -526,7 +546,9 @@ def prepare_routed_gmm_inputs(
                 x = bounded_onehot_permute(
                     hidden_states_local,
                     argsort_revert_indices,
-                    group_sizes_local.sum(dtype=jnp.int32)[None],
+                    sorted_valid_count
+                    if _VALID_COUNT_FROM_SORT and sorted_valid_count is not None
+                    else group_sizes_local.sum(dtype=jnp.int32)[None],
                 )
             elif bucket_counts is not None:
                 onehot = (
@@ -550,16 +572,20 @@ def prepare_routed_gmm_inputs(
             # Match uLLM/reference EP routing: materialize the valid local
             # expert prefix through SparseCore ragged_gather. Invalid
             # non-local rows are sorted after the valid prefix.
-            valid_count = group_sizes_local.sum(dtype=jnp.int32)
+            valid_count = (
+                sorted_valid_count
+                if _VALID_COUNT_FROM_SORT and sorted_valid_count is not None
+                else group_sizes_local.sum(dtype=jnp.int32)[None]
+            )
             x = ragged_gather_v2(
                 hidden_states_local,
                 token_indices_sorted,
                 jnp.array([0], dtype=jnp.int32),
-                valid_count[None],
+                valid_count,
             )
     else:
         x = hidden_states_local[token_indices_sorted]
-    return (
+    out = (
         x,
         group_sizes_local,
         argsort_revert_indices,
@@ -567,6 +593,9 @@ def prepare_routed_gmm_inputs(
         valid_mask,
         token_indices_sorted,
     )
+    if with_valid_count:
+        return out + (sorted_valid_count,)
+    return out
 
 
 def moe_gmm(
@@ -590,8 +619,12 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    valid_count: jax.Array | None = None,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
+
+    `valid_count` (int32 ``[1]``, optional) is ``group_sizes.sum()`` computed
+    elsewhere (`TPU_MOE_VALID_COUNT_FROM_SORT`).
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
@@ -707,7 +740,8 @@ def moe_gmm(
                 .at[argsort_revert_indices]
                 .set(topk_weights_flat)
             )
-            valid_count = group_sizes.sum(dtype=jnp.int32)[None]
+            if valid_count is None:
+                valid_count = group_sizes.sum(dtype=jnp.int32)[None]
             if (
                 envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on"
                 and can_use_blockwise_onehot_unpermute(
@@ -746,9 +780,7 @@ def moe_gmm(
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
-            computed = jnp.arange(gmm2_res.shape[0], dtype=jnp.int32) < group_sizes.sum(
-                dtype=jnp.int32
-            )
+            computed = jnp.arange(gmm2_res.shape[0], dtype=jnp.int32) < valid_count[0]
             gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
             onehot = jax.nn.one_hot(
@@ -977,6 +1009,7 @@ def fused_moe_func(
         topk_weights_flat,
         valid_mask,
         token_indices_sorted,
+        *sorted_valid_count,
     ) = prepare_routed_gmm_inputs(
         hidden_states,
         topk_ids,
@@ -987,6 +1020,7 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
+        with_valid_count=_VALID_COUNT_FROM_SORT,
     )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
@@ -1009,5 +1043,6 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        valid_count=sorted_valid_count[0] if sorted_valid_count else None,
     )
     return x[:num_tokens, :hidden_size]

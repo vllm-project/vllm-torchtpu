@@ -1337,7 +1337,7 @@ def test_prepare_routed_counting_sort_eliminates_redundant_sorts(
     with monkeypatch.context() as m:
         m.setattr(fused_moe_gmm, "_COUNTING_SORT_SCATTER_MAX_ROWS", 0)
         m.setattr(
-            fused_moe_gmm, "_counting_sort_positions", lambda *a, **kw: (None, None)
+            fused_moe_gmm, "_counting_sort_positions", lambda *a, **kw: (None, None, None)
         )
         ref_out = prepare_routed_gmm_inputs(
             hidden_states, topk_indices, topk_weights, **common
@@ -1351,10 +1351,14 @@ def test_prepare_routed_counting_sort_eliminates_redundant_sorts(
         # just through the end-to-end comparison above.
         flat = topk_indices.reshape(-1)
         sort_keys = jnp.where(flat >= 0, flat, local_num_experts)
-        positions, counts = fused_moe_gmm._counting_sort_positions(
+        positions, counts, real_count = fused_moe_gmm._counting_sort_positions(
             sort_keys, local_num_experts + 1
         )
         assert positions is not None and counts is not None
+        # The sentinel bucket's base counts the rows of the real buckets.
+        np.testing.assert_array_equal(
+            np.asarray(real_count), [int(np.asarray(counts)[:-1].sum())]
+        )
         np.testing.assert_array_equal(
             np.sort(np.asarray(positions)), np.arange(sort_keys.shape[0])
         )
