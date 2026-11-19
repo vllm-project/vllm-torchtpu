@@ -18,24 +18,35 @@ The plugin ships in two complete forms. Each process picks one when `vllm_torcht
 
 ## Which form serves which band
 
-| Band | Point | Mtok/$ | x (tok/s/user, p90) | TTFT p90 | Form | Recipe and flags | Run commit (provenance) |
-|---|---|---|---|---|---|---|---|
-| B1 | RK2144 | 199.89 | 82.24 | 9.200 s | Benliang's | `infx-qwen38-flash-agentx-disagg`, `B1_RK2144.flags.txt` | `d16384fe6` |
-| B2 | RM4096 | 145.71 | 120.55 | 7.17 s | Benliang's | same recipe, `B2_RM4096.flags.txt` | `d16384fe6` |
-| B3 | RB374d | 119.50 | 142.64 | 7.128 s | Benliang's | same recipe, `B3_RB374d.flags.txt` | `8247b68f7` |
-| B4 | P2C128 | 139.93 | 169.82 | 7.952 s | oxpd | `exos-infx-qwen38-flash-agentx-disagg`, `B4_P2C128.flags.txt` | `2bc75911f5` |
-| B4 | p2c112 | 131.37 | 176.45 | 4.677 s | oxpd | same, `B4_p2c112.flags.txt` | `2bc75911f5` |
-| B4 | P2C96 | 112.64 | 188.34 | 2.669 s | oxpd | same, `B4_P2C96.flags.txt` | `2bc75911f5` |
-| B5 | p2c96m12r64k48 | 109.61 | 240.61 | 7.194 s | oxpd | same, `B5_p2c96m12r64k48.flags.txt` | `2bc75911f5` |
-| B6 | P3C48 | 46.95 | 372.00 | 1.330 s | oxpd | same, `B6_P3C48.flags.txt` | `2bc75911f5` |
+The table lists the best point in each band, by Mtok/$, among the points on the dash sheet `q38-pd-ixc-frontier-1118` (dash `d-5234ec7a`) as of 2026-11-19. Bands are cut by x (tok/s/user, p90): B1 ≤ 110 < B2 ≤ 140 < B3 ≤ 160 < B4 ≤ 205 < B5 ≤ 275 < B6. Every point has TTFT p90 under 10 s.
+
+| Band | Point | Job | Mtok/$ | x (tok/s/user, p90) | TTFT p90 | Form | Recipe and flags | Run commit (provenance) |
+|---|---|---|---|---|---|---|---|---|
+| B1 | RK2144 | `j-a97a2392-21d8-4f5c-b93b` | 199.89 | 82.24 | 9.200 s | Benliang's | `infx-qwen38-flash-agentx-disagg`, `B1_RK2144.flags.txt` | `d16384fe6` |
+| B2 | RM40104 | `j-b351c04a-62e8-466f-b9f1` | 154.32 | 119.715 | 9.805 s | Benliang's | same recipe, `B2_RM40104.flags.txt` | `d16384fe6` |
+| B3 | RB374d | `j-5b155f79-7257-45b7-9f42` | 119.50 | 142.64 | 7.128 s | Benliang's | same recipe, `B3_RB374d.flags.txt` | `8247b68f7` |
+| B4 | P2C128 | `j-38139aef-5cbe-4af7-a6de` | 139.93 | 169.82 | 7.952 s | oxpd | `exos-infx-qwen38-flash-agentx-disagg`, `B4_P2C128.flags.txt` | `2bc75911f5` |
+| B5 | p2c96m12r64k48 | `j-c325b23f-5785-454b-bee8` | 109.61 | 240.61 | 7.194 s | oxpd | same, `B5_p2c96m12r64k48.flags.txt` | `2bc75911f5` |
+| B6 | p3c80 | `j-15ca9825-0a7a-4943-b683` | 75.05 | 288.67 | 2.207 s | oxpd | same, `B6_p3c80.flags.txt` | `2bc75911f5` |
 
 - B1–B3 ran on the default cluster (8 chips, 1P1D). B4–B5 ran on Exos (12 chips, 1P2D), and B6 on Exos (16 chips, 1P3D).
+- The concurrency c is in each point's name: RK2144 c144, RM40104 c104, RB374d c74, P2C128 c128, p2c96m12r64k48 c96, p3c80 c80. It is a benchmark setting, not an engine flag, so the flags files do not carry it.
 - Each `*.flags.txt` lists every engine flag the dash job set explicitly, per leg, from its stored recipe. Anything not listed runs at the form's default.
 - For B4–B6, add `Q38_OXPD_FORM=1` to every leg.
 
+The other points on the same dash sheet are each beaten in their band by a point above. Their flags files stay in this directory.
+
+| Band | Point | Job | Mtok/$ | x (tok/s/user, p90) | TTFT p90 | Flags | Run commit |
+|---|---|---|---|---|---|---|---|
+| B2 | RM4096 | `j-ce1d3d26-32c5-4246-bfa0` | 145.71 | 120.55 | 7.17 s | `B2_RM4096.flags.txt`, identical to RM40104's (c96 instead of c104) | `d16384fe6` |
+| B4 | p2c112 | `j-4bf73187-9459-43a6-81db` | 131.37 | 176.45 | 4.677 s | `B4_p2c112.flags.txt` | `2bc75911f5` |
+| B4 | P2C96 | `j-272ac2cb-238d-4077-8550` | 112.64 | 188.34 | 2.669 s | `B4_P2C96.flags.txt` | `2bc75911f5` |
+| B6 | p3c72 | `j-a8bff01e-39c7-45d5-96a5` | 64.57 | 321.27 | 5.108 s | `B6_p3c72.flags.txt`, identical to p3c80's (c72 instead of c80) | `2bc75911f5` |
+| B6 | P3C48 | `j-95d7820c-ce03-448f-a30e` | 46.95 | 372.00 | 1.330 s | `B6_P3C48.flags.txt` | `2bc75911f5` |
+
 ## Disclosure: VLLM_TPU_MTP_DRAFT_ROWS and IX admissibility
 
-All six curve-of-record configurations run `VLLM_TPU_MTP_DRAFT_ROWS` on the decode leg; B4–B6 also run it on the prefill leg. Its IX admissibility requires a bit-identity proof (`reports/ix_draft_rows_audit_1119.md`). Measured so far: on the prefill leg it is **not** bit-identical; on the decode legs it is bitwise at op level. A strict TPU bitwise test is being built.
+All six curve-of-record configurations run `VLLM_TPU_MTP_DRAFT_ROWS` on the decode leg; B4–B6 also run it on the prefill leg. Status as of 2026-11-19 (`reports/ix_draft_rows_audit_1119.md`): on the prefill leg it is **not** bit-identical (about 1 bf16 ulp in the draft attention output), while the draft KV and the draft proposals are bit-identical; on the decode legs it is bitwise at op level. The IX lead ruled it admissible under Check 8(a) (consumed outputs bit-identical) and Check 13 (equal precision), and that ruling was accepted on 2026-11-19.
 
 ## Exos: required before running B4–B6 from this branch
 
