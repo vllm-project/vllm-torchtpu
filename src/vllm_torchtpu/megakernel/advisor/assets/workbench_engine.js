@@ -98,8 +98,65 @@
   }
   // A layer requests its routed-expert weights only after its router runs, so that
   // stream overlaps the MoE matmuls but not the dense compute before them.
-  function routedChain(tDense, routedHbmS, tMoe, tVecMoe = 0.0) {
-    return tDense + Math.max(routedHbmS, tMoe, tVecMoe);
+  function readPositiveSeed(key) {
+    const value = Number(DATA[key]);
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new Error(`Missing or invalid positive seed constant: ${key}`);
+    }
+    return value;
+  }
+  function routedChain(tDense, routedHbmS, tMoe, tVecMoe = 0.0, dsaStageS = 0.0) {
+    return Math.max(tDense, dsaStageS) + Math.max(routedHbmS, tMoe, tVecMoe);
+  }
+  function hasDsaProfile(p) {
+    return (p.index_topk || 0) > 0 && (p.index_n_heads || 0) > 0 && (p.index_head_dim || 0) > 0;
+  }
+  function dsaQueryGatherDim(p) {
+    return (p.kv_lora_rank || 0) > 0
+      ? ((p.kv_lora_rank || 0) + (p.qk_rope_head_dim || 0))
+      : p.head_dim;
+  }
+  function indexerRecordBytes(indexHeadDim) {
+    if (indexHeadDim <= 0) return 0;
+    const scaleBlock = readPositiveSeed('indexer_scale_block_size');
+    const wordAlign = readPositiveSeed('word_align_bytes');
+    const scaleBytes = Math.ceil(indexHeadDim / scaleBlock);
+    const rawBytes = indexHeadDim + scaleBytes;
+    return Math.floor((rawBytes + wordAlign - 1) / wordAlign) * wordAlign;
+  }
+  function padCachelineBytes(byteCount) {
+    const lineBytes = readPositiveSeed('hbm_cacheline_bytes');
+    return Math.ceil(byteCount / lineBytes) * lineBytes;
+  }
+  function padVectorLanes(elementCount) {
+    const laneWidth = readPositiveSeed('attn_tile_tokens');
+    return Math.ceil(elementCount / laneWidth) * laneWidth;
+  }
+  function computeIndexerStaticAndResidentTerms(
+    p, layersLocal, attnLayersLocal, batchLocal, effCtx, kvSplit
+  ) {
+    const hasDsa = hasDsaProfile(p);
+    if (!hasDsa) {
+      return {
+        hasDsa: false, lIndexer: 0, indexerQueryProjParams: 0,
+        indexerKeyWeightProjParams: 0, indexerKeyRecordBytes: 0,
+        indexerKResidentBytes: 0
+      };
+    }
+    const numLayers = p.num_layers;
+    const hidden = p.hidden_size;
+    const qLora = p.q_lora_rank || 0;
+    const lIndexer = Math.min(
+      attnLayersLocal, Math.ceil((p.num_indexer_layers || 0) * layersLocal / numLayers)
+    );
+    const indexerQueryProjParams = (qLora || hidden) * (p.index_n_heads || 0) * (p.index_head_dim || 0);
+    const indexerKeyWeightProjParams = hidden * ((p.index_head_dim || 0) + (p.index_n_heads || 0));
+    const indexerKeyRecordBytes = indexerRecordBytes(p.index_head_dim || 0);
+    const indexerKResidentBytes = lIndexer * batchLocal * (effCtx / kvSplit) * indexerKeyRecordBytes;
+    return {
+      hasDsa: true, lIndexer, indexerQueryProjParams,
+      indexerKeyWeightProjParams, indexerKeyRecordBytes, indexerKResidentBytes
+    };
   }
   // A fused kernel overlaps the whole HBM stream with the chain, but each all-reduce
   // waits for its layer's result. Separate kernels run collectives after the compute.
@@ -288,8 +345,18 @@
     const vmemAlias = wl.vmemAlias !== undefined
       ? wl.vmemAlias : (wl.vmem_alias !== undefined ? wl.vmem_alias : true);
     const moeMode = wl.moeMode || wl.moe_mode || 'masked_on_chip';
+    const hasDsa = hasDsaProfile(p);
+    const wordAlignBytes = hasDsa ? readPositiveSeed('word_align_bytes') : 0;
+    const bf16Bytes = hasDsa ? readPositiveSeed('bf16_bytes') : 0;
+    const indexerIndicesBytes = hasDsa
+      ? wordAlignBytes * Math.ceil((p.index_topk || 0) / kvSplit) : 0;
+    const numIndexerLayers = p.num_indexer_layers || 0;
+    const numAttentionLayers = p.num_attention_layers || 0;
+    const sharedIndexerSpineBytes = (
+      hasDsa && numIndexerLayers > 0 && numIndexerLayers < numAttentionLayers
+    ) ? indexerIndicesBytes : 0;
     const resStreams = Math.max(1, p.residual_streams || 1);
-    const spine = (4 * resStreams + 2) * H + (effTp > 1 ? 6 * H : 0);
+    const spine = (4 * resStreams + 2) * H + (effTp > 1 ? 6 * H : 0) + sharedIndexerSpineBytes;
     const nhLoc = Math.max(1, Math.ceil(p.num_attention_heads / effTp));
     const hd = p.head_dim;
     let attn = 0, lin = 0, moe = 0;
@@ -300,6 +367,15 @@
       const tpPerKv = Math.max(1, Math.floor(effTp / kvSplit));
       const nkvLoc = Math.max(1, Math.ceil(p.num_kv_heads / tpPerKv));
       attn = 2 * (2 * nhLoc + 2 * nkvLoc) * hd + 4 * nhLoc * hd;
+    }
+    if (hasDsa) {
+      const queryGatherDim = dsaQueryGatherDim(p);
+      attn += bf16Bytes * (
+        (p.index_n_heads || 0) * (p.index_head_dim || 0) +
+        (p.index_head_dim || 0) +
+        (p.index_n_heads || 0)
+      ) + (sharedIndexerSpineBytes ? 0 : indexerIndicesBytes) +
+        (dcp > 1 ? bf16Bytes * (dcp - 1) * nhLoc * queryGatherDim : 0);
     }
     if ((p.num_linear_layers || 0) > 0 && (p.linear_value_heads || 0) > 0) {
       const khL = Math.max(1, Math.ceil((p.linear_key_heads || 0) / effTp));
@@ -474,17 +550,26 @@
       (p.moe_intermediate_size || 0) / Math.max(1, Math.floor(effTp / epTp))
     ) : 0;
     const routedExpParams = 3 * (p.routed_expert_hidden_size || H) * iExpLoc;
-    const baseDenseParams = lAttn * attnParams + lLin * linParams +
-      (layersLocal - lMoe) * denseFfnParams + lMoe * sharedExpParams;
-    const wStatic = baseDenseParams * bwW + lMoe * H * nExp * 2.0;
+    const bf16Bytes = readPositiveSeed('bf16_bytes');
+    const indexerStatic = computeIndexerStaticAndResidentTerms(
+      p, layersLocal, lAttn, batchLocal, effCtx, kvSplit
+    );
+    const baseDenseParams = lAttn * attnParams +
+      indexerStatic.lIndexer * indexerStatic.indexerQueryProjParams +
+      lLin * linParams + (layersLocal - lMoe) * denseFfnParams + lMoe * sharedExpParams;
+    // Indexer key and head-weight projections stay unquantized in BF16.
+    const wStatic = baseDenseParams * bwW + lMoe * H * nExp * bf16Bytes +
+      indexerStatic.lIndexer * indexerStatic.indexerKeyWeightProjParams * bf16Bytes;
     const expBytes = routedExpParams * bwE;
     const kvComp = Math.min(1.0, Math.max(1e-6, p.kv_compress_factor ?? 1.0));
     const kvRawTok = kvLora ? (kvLora + qkRope) : 2.0 * kvhLoc * hd;
-    const kvReadBytes = lAttn * batchLocal * effCtx *
+    const fullKvBytes = lAttn * batchLocal * effCtx *
       ((kvRawTok * bwKv * kvComp) / kvSplit);
+    const residentKvBytes = indexerStatic.hasDsa
+      ? (fullKvBytes + indexerStatic.indexerKResidentBytes) : fullKvBytes;
     const recRwBytes = 2.0 * lLin * batchLocal *
       (zDim * kd + qkvLin * (p.linear_conv_kernel || 0)) * bwSt;
-    return wStatic + lMoe * expertsLoc * expBytes + kvReadBytes + 0.5 * recRwBytes;
+    return wStatic + lMoe * expertsLoc * expBytes + residentKvBytes + 0.5 * recRwBytes;
   }
   function isSliceTopologySupported(sliceCores, chipObj) {
     const minSlice = (chipObj && chipObj.min_slice_cores) || 1;
@@ -717,15 +802,60 @@
       (p.moe_intermediate_size || 0) / Math.max(1, Math.floor(effTp / epTp))
     ) : 0;
     const routedExpParams = 3 * (p.routed_expert_hidden_size || H) * iExpLoc;
-    const baseDenseParams = lAttn * attnParams + lLin * linParams +
-      (layersLocal - lMoe) * denseFfnParams + lMoe * sharedExpParams;
-    const wStatic = baseDenseParams * bwW + lMoe * H * nExp * 2.0;
-    const expBytes = routedExpParams * bwE;
+    const seedBf16Bytes = readPositiveSeed('bf16_bytes');
+    const seedFp32Bytes = readPositiveSeed('fp32_bytes');
+    const indexerRadixPasses = readPositiveSeed('indexer_radix_passes');
+    const indexerRadixBuckets = readPositiveSeed('indexer_radix_buckets');
+    const indexerHeadReduceOps = readPositiveSeed('indexer_head_reduce_vec_ops');
+    const indexerScaleOps = readPositiveSeed('indexer_scale_vec_ops');
+    const indexerRadixPassOps = readPositiveSeed('indexer_radix_pass_vec_ops');
+    const dsaUnpackMaskOps = readPositiveSeed('dsa_unpack_mask_vec_ops');
+    const dsaSoftmaxOps = readPositiveSeed('dsa_softmax_vec_ops');
+    const dsaOutputRescaleOps = readPositiveSeed('dsa_output_rescale_vec_ops');
+    const dcpLseMergeOps = readPositiveSeed('dcp_lse_merge_vec_ops');
+    const perOpIndexerScoreRoundtripBytes = readPositiveSeed('per_op_indexer_score_roundtrip_bytes');
+    const perOpDsaKvRoundtripFactor = readPositiveSeed('per_op_dsa_kv_roundtrip_factor');
+    const indexerStatic = computeIndexerStaticAndResidentTerms(
+      p, layersLocal, lAttn, batchLocal, effCtx, kvSplit
+    );
+    const hasDsa = indexerStatic.hasDsa;
+    const lIndexer = indexerStatic.lIndexer;
+    const indexerQueryProjParams = indexerStatic.indexerQueryProjParams;
+    const indexerKeyWeightProjParams = indexerStatic.indexerKeyWeightProjParams;
+    const tPrefill = wl.phase === 'prefill'
+      ? activeTokens : (wl.phase === 'mixed' ? chunkTokens : 0);
+    const rawAttnCtx = (wl.phase === 'prefill' && tPrefill > 1)
+      ? (Math.max(0, effCtx - tPrefill) + (tPrefill + 1) / 2.0) : effCtx;
     const kvComp = Math.min(1.0, Math.max(1e-6, p.kv_compress_factor ?? 1.0));
     const resStreams = Math.max(1, p.residual_streams || 1);
-    const kvRawTok = kvLora ? (kvLora + qkRope) : 2.0 * kvhLoc * hd;
-    const kvBytesPerTok = (kvRawTok * bwKv * kvComp) / kvSplit;
-    const kvReadBytes = lAttn * batchLocal * effCtx * kvBytesPerTok;
+    const rawKvElements = kvLora ? (kvLora + qkRope) : 2.0 * kvhLoc * hd;
+    const kvBytesPerTok = (rawKvElements * bwKv * kvComp) / kvSplit;
+    const isSparseGather = hasDsa && (rawAttnCtx > (p.index_topk || 0));
+    const indexerCtxLocal = hasDsa ? (rawAttnCtx / kvSplit) : 0.0;
+    const selectedTopk = hasDsa ? Math.min(rawAttnCtx, p.index_topk || 0) : rawAttnCtx;
+    const localSelectedTopk = hasDsa ? (selectedTopk / kvSplit) : 0.0;
+    const indexerKReadBytes = hasDsa
+      ? (lIndexer * batchLocal * indexerCtxLocal * indexerStatic.indexerKeyRecordBytes) : 0.0;
+    const dsaEntryBytes = hasDsa
+      ? (kvLora > 0
+         ? (padCachelineBytes(kvLora * bwKv) + padCachelineBytes(qkRope * bwKv))
+         : padCachelineBytes(rawKvElements * bwKv))
+      : 0.0;
+    const dsaKvStrictBytes = hasDsa
+      ? (lAttn * batchLocal * localSelectedTopk * rawKvElements * bwKv * kvComp) : 0.0;
+    const dsaKvGatherBytes = hasDsa
+      ? (isSparseGather ? (lAttn * activeTokens * localSelectedTopk * dsaEntryBytes) : dsaKvStrictBytes)
+      : 0.0;
+    const baseDenseParams = lAttn * attnParams + lIndexer * indexerQueryProjParams +
+      lLin * linParams + (layersLocal - lMoe) * denseFfnParams + lMoe * sharedExpParams;
+    // Indexer key and head-weight projections stay unquantized in BF16.
+    const wStatic = baseDenseParams * bwW + lMoe * H * nExp * seedBf16Bytes +
+      lIndexer * indexerKeyWeightProjParams * seedBf16Bytes;
+    const expBytes = routedExpParams * bwE;
+    const fullKvBytes = lAttn * batchLocal * effCtx * kvBytesPerTok;
+    const residentKvBytes = hasDsa
+      ? (fullKvBytes + indexerStatic.indexerKResidentBytes) : fullKvBytes;
+    const kvReadBytes = hasDsa ? (indexerKReadBytes + dsaKvGatherBytes) : fullKvBytes;
     const recRwBytes = 2.0 * lLin * batchLocal *
       (zDim * kd + qkvLin * (p.linear_conv_kernel || 0)) * bwSt;
     const vmemUsable = ch.vmem_usable_bytes;
@@ -742,19 +872,47 @@
       vmemUsable, Math.max(0, baseVmemBytes - (fitHead ? spillRes : 0))
     );
     const ffnChoose = lMoe > 0 ? sharedExpParams : denseFfnParams;
+    const indexerLayerDenseParams = lIndexer > 0 ? indexerQueryProjParams : 0;
+    const indexerLayerBf16Bytes = lIndexer > 0
+      ? indexerKeyWeightProjParams * seedBf16Bytes : 0.0;
     const layerDenseBytes = Math.trunc(
-      (Math.max(attnParams, linParams) + ffnChoose) * bwW
+      (Math.max(attnParams + indexerLayerDenseParams, linParams) + ffnChoose) * bwW +
+      indexerLayerBf16Bytes
     );
-    const tPrefill = wl.phase === 'prefill'
-      ? activeTokens : (wl.phase === 'mixed' ? chunkTokens : 0);
     const dMla = (activeTokens - tPrefill) * (2 * kvLora + qkRope) +
       tPrefill * (qkNope + qkRope + hd);
-    const attnCtx = (wl.phase === 'prefill' && tPrefill > 1)
-      ? (Math.max(0, effCtx - tPrefill) + (tPrefill + 1) / 2.0) : effCtx;
+    const attnCtx = selectedTopk;
     const flopsKv = 2.0 * lAttn * attnCtx * kvComp *
       (kvLora ? nhLoc * dMla : 2.0 * activeTokens * qDim);
+    const flopsIndexerScore = hasDsa
+      ? (2.0 * lIndexer * activeTokens * (p.index_n_heads || 0) *
+         (p.index_head_dim || 0) * indexerCtxLocal)
+      : 0.0;
     const routerFlops = lMoe * H * nExp;
-    const flopsDense = 2.0 * activeTokens * (baseDenseParams + routerFlops) + flopsKv;
+    const flopsDense = 2.0 * activeTokens * (
+      baseDenseParams + routerFlops + lIndexer * indexerKeyWeightProjParams
+    ) + flopsKv + flopsIndexerScore;
+    const vecOpsIndexerRadix = (hasDsa && isSparseGather)
+      ? (indexerRadixPasses * indexerRadixPassOps * lIndexer * activeTokens * indexerCtxLocal)
+      : 0.0;
+    const vecOpsPreDsaExtra = hasDsa
+      ? ((indexerHeadReduceOps * (p.index_n_heads || 0) + indexerScaleOps) *
+         lIndexer * activeTokens * indexerCtxLocal + vecOpsIndexerRadix)
+      : 0.0;
+    let vecOpsDsa = 0.0;
+    if (hasDsa) {
+      const selectedTopkPadded = padVectorLanes(localSelectedTopk);
+      const kvElementsPadded = padVectorLanes(rawKvElements);
+      const headsWithDcp = nhLoc * dcp;
+      const dsaValueDim = kvLora > 0 ? kvLora : hd;
+      const dcpMergeOps = dcp > 1 ? (dcpLseMergeOps * dcp * nhLoc * dsaValueDim) : 0.0;
+      vecOpsDsa = lAttn * activeTokens * (
+        dsaUnpackMaskOps * selectedTopkPadded * kvElementsPadded +
+        dsaSoftmaxOps * headsWithDcp * selectedTopkPadded +
+        dsaOutputRescaleOps * headsWithDcp * dsaValueDim +
+        dcpMergeOps
+      );
+    }
     const flopsMoe = expertsLoc > 0
       ? (2.0 * activeTokens * epDp * lMoe * topK *
          routedExpParams * expertsLoc / nExp) : 0.0;
@@ -773,16 +931,8 @@
     const gqaScratch = lAttn > 0
       ? (2 * 128 * (4 * Math.max(hd, kvLora)) + 2 * 128 * 128 * 4) : 0;
     const gdnScratch = lLin > 0 ? (4 * Math.min(vhLoc, 8) * kd * vd) : 0;
-    const attnTileTokens = Number(DATA.attn_tile_tokens);
-    const denseFfnTileCap = Number(DATA.dense_ffn_tile_cap);
-    const seedFp32Bytes = Number(DATA.fp32_bytes);
-    if (
-      !Number.isFinite(attnTileTokens) ||
-      !Number.isFinite(denseFfnTileCap) ||
-      !Number.isFinite(seedFp32Bytes)
-    ) {
-      throw new Error('Missing required tile scratch seed constants in DATA');
-    }
+    const attnTileTokens = readPositiveSeed('attn_tile_tokens');
+    const denseFfnTileCap = readPositiveSeed('dense_ffn_tile_cap');
     const computeFfnScratchBytes = moeInterLocal => lMoe > 0
       ? (2 * attnTileTokens * moeInterLocal * seedFp32Bytes)
       : (2 * attnTileTokens * denseFfnTileCap * seedFp32Bytes);
@@ -828,7 +978,28 @@
     const noWholeStep = pp > 1 || segCount > 1 || lgArr.length > 1 ||
       L === 1 || Boolean(wl.planError);
     const hbmUsed = wStatic + lMoe * expertsLoc * expBytes +
-      kvReadBytes + 0.5 * recRwBytes;
+      residentKvBytes + 0.5 * recRwBytes;
+    let dcpHops = 0, dcpQueryAllGatherTransferS = 0.0, dcpQueryAllGatherHops = 0;
+    let dcpPostAttnTransferS = 0.0, dcpPostAttnHops = 0;
+    if (hasDsa && dcp > 1) {
+      dcpHops = roundEven(Math.log2(dcp));
+      const queryGatherDim = dsaQueryGatherDim(p);
+      const outputMergeDim = kvLora > 0 ? kvLora : hd;
+      const dcpQueryAllGatherBytes = lAttn * (dcp - 1) * activeTokens * nhLoc *
+        queryGatherDim * seedBf16Bytes;
+      const dcpPartialOutputAllToAllBytes = lAttn * (dcp - 1) * activeTokens * nhLoc *
+        (outputMergeDim * seedBf16Bytes + seedFp32Bytes);
+      const indexerMinExchangeElements = Math.min(
+        p.index_topk || 0, indexerRadixPasses * indexerRadixBuckets
+      );
+      const dcpIndexerMinBytes = isSparseGather
+        ? (lIndexer * (dcp - 1) * activeTokens * indexerMinExchangeElements * seedFp32Bytes)
+        : 0.0;
+      dcpQueryAllGatherTransferS = dcpQueryAllGatherBytes / iciEg;
+      dcpQueryAllGatherHops = lAttn * dcpHops;
+      dcpPostAttnTransferS = (dcpPartialOutputAllToAllBytes + dcpIndexerMinBytes) / iciEg;
+      dcpPostAttnHops = (lAttn + (isSparseGather ? lIndexer : 0)) * dcpHops;
+    }
     const hbmCapBytes = ch.hbm_capacity_bytes;
     const hbmUtilCap = wl.hbmUtilizationCap ?? wl.hbm_utilization_cap ?? 0.80;
     const hbmPoolCapBytes = hbmUtilCap * hbmCapBytes;
@@ -1052,6 +1223,10 @@
       if (tiled) {
         actBytes = Math.max(actBytes, 2.0 * resStreams * layersLocal * tokResBytes);
       }
+      if (sc === 'per_op' && hasDsa && isSparseGather) {
+        actBytes += perOpIndexerScoreRoundtripBytes * lIndexer * activeTokens * indexerCtxLocal +
+          perOpDsaKvRoundtripFactor * dsaKvGatherBytes;
+      }
       const declColl = (moeDecl && moeDecl.collectives && typeof moeDecl.collectives === 'object')
         ? moeDecl.collectives : null;
       const effNumAr = (declColl && typeof declColl.all_reduces === 'number')
@@ -1068,6 +1243,7 @@
       if (declColl) {
         stepsToPrice = Array.isArray(declColl.steps) ? declColl.steps : [];
       } else if (
+        !hasDsa &&
         dcp > 1 &&
         (dcp & (dcp - 1)) === 0 &&
         (wl.phase === 'decode' || wl.phase === 'verify')
@@ -1078,6 +1254,9 @@
         stepCallMult = sc === 'per_op' ? perOpCollFactor : 1;
       }
       const hasDeclaredRouted = stepsToPrice.some(st => st && st.kind === 'routed_transport');
+      const hasDeclaredDcp = stepsToPrice.some(
+        st => st && (st.kind === 'dcp_gather' || st.kind === 'split_kv')
+      );
       let stepTransferS = 0.0, stepStrictS = 0.0, stepHops = 0;
       const stepCtx = { activeTokens, effTp, lMoe, lAttn, nhLoc, iciLink, iciEg };
       for (const stItem of stepsToPrice) {
@@ -1088,7 +1267,12 @@
         stepStrictS += stepTerms.strictEgressS;
         stepHops += stepTerms.hops;
       }
-      const stepCollS = stepTransferS + stepHops * latColl;
+      const priceDsaDcp = hasDsa && dcpPostAttnHops > 0 && !hasDeclaredDcp;
+      const dcpPostHopsTotal = priceDsaDcp
+        ? (nSplits * xlaArFactor * dcpPostAttnHops) : 0;
+      stepHops += dcpPostHopsTotal;
+      const dcpPostTransferScopeS = priceDsaDcp ? dcpPostAttnTransferS : 0.0;
+      const stepCollS = stepTransferS + dcpPostTransferScopeS + stepHops * latColl;
       const overlappedComm = isFusedMulti && nSplits === 1;
       const arAndPcpS = (hasMeasuredAr
         ? measuredArTotalS
@@ -1148,7 +1332,8 @@
         ? Math.ceil(p.shared_expert_intermediate_size / effTp) : 0;
       const vecOpsDense = 8.0 * Math.max(1, p.residual_streams || 1) * activeTokens * (p.hidden_size / effTp) * layersLocal +
         4.0 * activeTokens * ffnDenseInterLocal * (layersLocal - lMoe) +
-        4.0 * activeTokens * sharedInterLocal * lMoe + subchannelVecDense;
+        4.0 * activeTokens * sharedInterLocal * lMoe + subchannelVecDense +
+        vecOpsPreDsaExtra + vecOpsDsa;
       const routedBytesStreamed = weightPasses * (wStep - wStatic);
       const streamedRoutedParams = Math.max(0.0, routedBytesStreamed / Math.max(1e-6, bwE));
       const iExpLocal = scopeIExpLoc;
@@ -1175,7 +1360,29 @@
       // Routed-expert bytes are requested after each layer's router, so they stream
       // under neither the dense compute nor the collectives.
       const routedHbmS = weightPasses * (wStep - wStatic) / bwHbm;
-      const chainS = routedChain(tDense, routedHbmS, tMoe, tVecMoe);
+      const dsaStageSeconds = (
+        latCollVal, bf16Upper, strictMode, effDenseVal, effHbmVal, effIciVal
+      ) => {
+        if (!hasDsa) return 0.0;
+        const effVecRate = strictMode
+          ? ((DATA.vector_max_elements_per_word || 4) * vecRate) : vecRate;
+        let vecPreDsa = Math.max(0.0, vecOpsDense - vecOpsDsa);
+        if (strictMode) vecPreDsa = Math.max(0.0, vecPreDsa - vecOpsIndexerRadix);
+        const tPreMatmul = ((flopsDense - flopsKv) / peakW) / effDenseVal;
+        const useBf16 = attnIsBf16 || (bf16Upper && isPrefOrMix);
+        const kvPeak = useBf16 ? bf16Peak : peakW;
+        const tDsaMatmul = flopsKv > 0 ? ((flopsKv / kvPeak) / effDenseVal) : 0.0;
+        const tPreDsa = Math.max(tPreMatmul, (vecPreDsa / effVecRate) / effDenseVal);
+        const tDsaCompute = Math.max(tDsaMatmul, (vecOpsDsa / effVecRate) / effDenseVal);
+        const dcpQueryAllGatherS = (dcpQueryAllGatherHops > 0 && !hasDeclaredDcp)
+          ? ((dcpQueryAllGatherTransferS + nSplits * xlaArFactor * dcpQueryAllGatherHops * latCollVal) / effIciVal)
+          : 0.0;
+        const dsaBytes = strictMode ? dsaKvStrictBytes : dsaKvGatherBytes;
+        const dsaHbmS = (dsaBytes / bwHbm) / effHbmVal;
+        return Math.max(tPreDsa, dcpQueryAllGatherS) + Math.max(tDsaCompute, dsaHbmS);
+      };
+      const dsaStageS = dsaStageSeconds(latColl, false, false, 1.0, 1.0, 1.0);
+      const chainS = routedChain(tDense, routedHbmS, tMoe, tVecMoe, dsaStageS);
       const roofCoreS = coreTime(tHbm, chainS, commS, isFusedMulti);
       const roofUs = (roofCoreS + fillDrainS) * 1e6;
       const baseAi = (flopsDense + scopeFlopsMoe) / Math.max(1.0, wStep + effStateBytes);
@@ -1217,13 +1424,22 @@
       const tMoeAch = ((moePadFactor * routedAchRatio * scopeFlopsMoe) / peakE) / effMoe;
       const tVecMoeAch = ((vecOpsMoe * routedAchRatio) / vecRate) / effDense;
       const tHbmAch = (tHbm + (routedAchRatio - 1.0) * routedHbmS) / effHbm;
+      const indexerAchievableExtraHops = (
+        sc !== 'per_op' && !hasDeclaredDcp && hasDsa && isSparseGather && dcpHops > 0
+      ) ? ((indexerRadixPasses - 1) * lIndexer * nSplits * dcpHops) : 0;
+      const indexerAchievableExtraS = indexerAchievableExtraHops * latColl;
       const unmeasuredCommS = Math.max(0.0, commS - measuredInCommS);
-      const tCommAch = measuredInCommS + unmeasuredCommS / effIci;
+      const tCommAch = measuredInCommS + (unmeasuredCommS + indexerAchievableExtraS) / effIci;
       const unmeasuredSyncS = Math.max(0.0, syncStageS - measuredInSyncS);
       const syncExtraS = isFusedMulti
         ? unmeasuredSyncS * (1.0 / effIci - 1.0) : 0.0;
       const routedHbmAchS = (routedHbmS * routedAchRatio) / effHbm;
-      const chainAchS = routedChain(tDenseAch, routedHbmAchS, tMoeAch, tVecMoeAch);
+      const dsaStageAchS = dsaStageSeconds(
+        latColl, false, false, effDense, effHbm, effIci
+      );
+      const chainAchS = routedChain(
+        tDenseAch, routedHbmAchS, tMoeAch, tVecMoeAch, dsaStageAchS
+      );
       const achCoreS = Math.max(tHbmAch, chainAchS) + tCommAch + syncExtraS;
       const stepAchUs = (achCoreS + achFillDrainS) * 1e6 + repassUs + launchUs + scopeHostHeadUs;
       const extraLatS = Math.max(0.0, latCollHi - latColl);
@@ -1233,7 +1449,10 @@
       const a2aCnt = hasDeclaredRouted
         ? 0 : ((lMoe > 0 && scopeEpDp > 1) ? (2 * lMoe * nSplits * xlaArFactor) : 0);
       const a2aExtraS = a2aCnt * extraLatS;
-      const chainHiS = routedChain(tDenseUpper, routedHbmS, tMoe, tVecMoe);
+      const dsaStageHiS = dsaStageSeconds(latCollHi, true, false, 1.0, 1.0, 1.0);
+      const chainHiS = routedChain(
+        tDenseUpper, routedHbmS, tMoe, tVecMoe, dsaStageHiS
+      );
       const roofHiCoreS = coreTime(tHbm, chainHiS, commS + arExtraS, overlappedComm) +
         a2aExtraS;
       const roofHiUs = (roofHiCoreS + fillDrainS) * 1e6;
@@ -1248,9 +1467,15 @@
         tMatmulDenseUpperAch,
         (vecOpsDense / vecRate) / effDense
       );
+      const indexerAchievableExtraHiS = indexerAchievableExtraHops * latCollHi;
       const tCommHiAch = measuredInCommS +
-        (unmeasuredCommS + arExtraS) / effIci;
-      const chainHiAchS = routedChain(tDenseHiAch, routedHbmAchS, tMoeAch, tVecMoeAch);
+        (unmeasuredCommS + arExtraS + indexerAchievableExtraHiS) / effIci;
+      const dsaStageHiAchS = dsaStageSeconds(
+        latCollHi, true, false, effDense, effHbm, effIci
+      );
+      const chainHiAchS = routedChain(
+        tDenseHiAch, routedHbmAchS, tMoeAch, tVecMoeAch, dsaStageHiAchS
+      );
       const achHiCoreS = Math.max(tHbmAch, chainHiAchS) + tCommHiAch +
         syncExtraS + (a2aExtraS / effIci);
       const stepAchHiUs = Math.max(
@@ -1266,7 +1491,9 @@
         ? ((flopsDense - flopsKv) / peakW + flopsKv / bf16Peak)
         : (flopsDense / peakW);
       const tMatmulStrict = tMatmulDenseStrict + scopeFlopsMoe / peakE;
-      const tHbmStrict = (weightPasses * wStepStrict + effStateBytes + actBytes) / bwHbm;
+      const effStateStrictBytes = hasDsa
+        ? (effStateBytes - dsaKvGatherBytes + dsaKvStrictBytes) : effStateBytes;
+      const tHbmStrict = (weightPasses * wStepStrict + effStateStrictBytes + actBytes) / bwHbm;
       const tMoeStrict = scopeFlopsMoe / peakE;
       const routedStrictS = weightPasses * (wStepStrict - wStatic) / bwHbm;
       const routedBytesStrict = weightPasses * (wStepStrict - wStatic);
@@ -1279,11 +1506,13 @@
       const unpackOpsStrict = isFp4Expert ? 2.0 * streamedRoutedParamsStrict : 0.0;
       const tVecMoeStrict = (vecOpsMoeStrict - unpackOpsStrict) / strictVecRate +
         unpackOpsStrict / ((DATA.vector_sub_byte_elements_per_word || 8) * vecRate);
+      const vecOpsDenseStrict = Math.max(0.0, vecOpsDense - vecOpsIndexerRadix);
       const tDenseStrict = Math.max(
-        tMatmulStrict - tMoeStrict, vecOpsDense / strictVecRate
+        tMatmulStrict - tMoeStrict, vecOpsDenseStrict / strictVecRate
       );
+      const dsaStageStrictS = dsaStageSeconds(latColl, false, true, 1.0, 1.0, 1.0);
       const chainStrictS = routedChain(
-        tDenseStrict, routedStrictS, tMoeStrict, tVecMoeStrict
+        tDenseStrict, routedStrictS, tMoeStrict, tVecMoeStrict, dsaStageStrictS
       );
       // The strict floor prices all-reduce transfer at the egress sum. That transfer sits
       // in commS, or in the sync stage of fillDrainS when a fused scope runs several passes.

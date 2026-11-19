@@ -29,6 +29,11 @@ import pytest
 from tests.megakernel.test_advisor_bounds import (
     compute_expected_kimi_k3_decode_comm_us,
 )
+from tests.megakernel.test_advisor_specs import (
+    DEEPSEEK_V4_CFG,
+    HOMOGENEOUS_DSA_CFG,
+    QWEN4_EXP_CFG,
+)
 from vllm_torchtpu.megakernel import advisor
 from vllm_torchtpu.megakernel.advisor import (
     constants,
@@ -36,6 +41,7 @@ from vllm_torchtpu.megakernel.advisor import (
     support,
     workbench_engine,
 )
+from vllm_torchtpu.megakernel.advisor.roofline import _build_scope_context
 
 
 class _ScopeParityEntry(TypedDict):
@@ -739,8 +745,15 @@ def test_sparse_csa_and_hyper_connection_engine_parity(tmp_path: Path) -> None:
     chip_dict = dataclasses.asdict(chip_spec)
 
     cases: list[tuple[advisor.ModelProfile, advisor.WorkloadSpec]] = []
-    for model_name in ("deepseek-v4", "qwen4-exp"):
-        model_profile = models.resolve_model_profile(model_name)
+    custom_profiles = (
+        models.model_profile_from_hf_config(
+            DEEPSEEK_V4_CFG, name="deepseek-v4-hf", weight_dtype="fp8"
+        ),
+        models.model_profile_from_hf_config(
+            QWEN4_EXP_CFG, name="qwen4-exp-hf", weight_dtype="fp8"
+        ),
+    )
+    for model_profile in custom_profiles:
         cases.extend(
             [
                 (
@@ -1702,3 +1715,221 @@ def test_js_engine_matches_python_on_declared_collectives_expert_mode_and_host_h
     _run_engine_runner(js_runtime, runner_path, in_json, out_json)
     out_records = json.loads(out_json.read_text(encoding="utf-8"))
     _verify_parity_records(batch_items, expected_refs, out_records)
+
+
+def test_glm_moe_dsa_and_dcp_engine_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify Python/JS parity on GLM-5.2 DSA, indexer, DCP, VMEM, and HBM."""
+    js_runtime = shutil.which("node") or shutil.which("gjs")
+    if js_runtime is None:
+        msg = "Neither node nor gjs runtime found; install nodejs"
+        raise RuntimeError(msg)
+
+    declared_dsa_deployment = models.DeploymentPreset(
+        decode=models.ParallelLayout(
+            tp=8,
+            ep=1,
+            dp=1,
+            pp=1,
+            dcp=4,
+            megakernel={
+                "scopes": ["whole_step"],
+                "max_rows": 64,
+                "ranks": 8,
+                "phases": ["decode"],
+                "collectives": {
+                    "steps": [
+                        {
+                            "kind": "dcp_gather",
+                            "group_size": 4,
+                            "calls_per_layer": 2,
+                        }
+                    ]
+                },
+                "source": "declared DSA DCP parity contract test",
+            },
+        ),
+        prefill=models.ParallelLayout(tp=8, ep=1),
+    )
+    monkeypatch.setitem(
+        support.DEPLOYMENT_PRESETS, "homo-dsa-declared", declared_dsa_deployment
+    )
+    seed_defaults = workbench_engine.build_engine_seed_defaults()
+    runner_path = Path(__file__).with_name("advisor_engine_runner.js")
+    engine_path = Path(models.__file__).parent / "assets" / "workbench_engine.js"
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    chip_dict = dataclasses.asdict(chip_spec)
+
+    glm_profile = models.resolve_model_profile("glm-5.2")
+    homogeneous_dsa_profile = models.model_profile_from_hf_config(
+        HOMOGENEOUS_DSA_CFG, name="homo-dsa", weight_dtype="fp8"
+    )
+    declared_dsa_profile = models.model_profile_from_hf_config(
+        HOMOGENEOUS_DSA_CFG, name="homo-dsa-declared", weight_dtype="fp8"
+    )
+    cases: list[tuple[advisor.ModelProfile, advisor.WorkloadSpec]] = [
+        (
+            glm_profile,
+            advisor.WorkloadSpec(
+                phase="decode", batch=4, context=131076, tp=16, ep=1, dcp=1
+            ),
+        ),
+        (
+            glm_profile,
+            advisor.WorkloadSpec(
+                phase="verify",
+                spec_tokens=3,
+                batch=1,
+                context=1024,
+                tp=16,
+                ep=1,
+                dcp=8,
+            ),
+        ),
+        (
+            glm_profile,
+            advisor.WorkloadSpec(
+                phase="verify",
+                spec_tokens=3,
+                batch=1,
+                context=131076,
+                tp=16,
+                ep=1,
+                dcp=8,
+            ),
+        ),
+        (
+            glm_profile,
+            advisor.WorkloadSpec(
+                phase="verify",
+                spec_tokens=3,
+                batch=4,
+                context=131076,
+                tp=16,
+                ep=1,
+                dcp=8,
+            ),
+        ),
+        (
+            glm_profile,
+            advisor.WorkloadSpec(
+                phase="verify",
+                spec_tokens=3,
+                batch=8,
+                context=131076,
+                tp=16,
+                ep=1,
+                dcp=8,
+            ),
+        ),
+        (
+            glm_profile,
+            advisor.WorkloadSpec(
+                phase="decode", batch=32, context=131076, tp=16, ep=16, dcp=16
+            ),
+        ),
+        (
+            glm_profile,
+            advisor.WorkloadSpec(
+                phase="prefill", batch=1, isl=4096, chunk_size=2048, tp=16, ep=1, dcp=1
+            ),
+        ),
+        (
+            glm_profile,
+            advisor.WorkloadSpec(
+                phase="mixed",
+                batch=4,
+                isl=4096,
+                chunk_size=512,
+                context=16384,
+                tp=16,
+                ep=1,
+                dcp=8,
+            ),
+        ),
+        (
+            glm_profile,
+            advisor.WorkloadSpec(
+                phase="verify",
+                spec_tokens=3,
+                batch=8,
+                context=131076,
+                tp=16,
+                ep=1,
+                dcp=8,
+                max_rows_per_call=16,
+            ),
+        ),
+        (
+            homogeneous_dsa_profile,
+            advisor.WorkloadSpec(
+                phase="decode", batch=8, context=8192, tp=8, ep=1, dcp=4
+            ),
+        ),
+        (
+            declared_dsa_profile,
+            advisor.WorkloadSpec(
+                phase="decode", batch=8, context=8192, tp=8, ep=1, dcp=4
+            ),
+        ),
+    ]
+    items = [
+        {
+            "params": {
+                "only_validate": False,
+                "profile": dataclasses.asdict(model_profile),
+                "chip": chip_dict,
+                "wl": dataclasses.asdict(workload),
+            }
+        }
+        for model_profile, workload in cases
+    ]
+    in_json = tmp_path / "glm_dsa_in.json"
+    out_json = tmp_path / "glm_dsa_out.json"
+    in_json.write_text(
+        json.dumps(
+            {
+                "engine_path": str(engine_path),
+                "seed_data": {"chip_spec": chip_dict, **seed_defaults},
+                "items": items,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _run_engine_runner(js_runtime, runner_path, in_json, out_json)
+    records = json.loads(out_json.read_text(encoding="utf-8"))
+
+    # 0.01 us 2-decimal display quantum + 0.005 us JS/Python rounding slack.
+    display_round_tol_us = 0.015
+    for (model_profile, workload), record in zip(cases, records, strict=True):
+        expected_reasons = list(
+            advisor.validate_workload(model_profile, chip_spec, workload)
+        )
+        scope_context = _build_scope_context(model_profile, workload, chip_spec)
+        report = advisor.advise(model_profile, workload, chip_spec)
+        got = record["eval"]
+        full = got["full"]
+        assert list(got["invalid_reasons"]) == expected_reasons
+        assert full["hbmUsedBytes"] == pytest.approx(scope_context.hbm_used, rel=1e-6)
+        assert full["fastestScope"] == report.fastest_scope
+        assert full["recScope"] == report.recommended_scope
+        for scope in report.scopes:
+            got_scope = got["scopes"][scope.scope]
+            assert got_scope["t_vmem_max"] == scope.t_vmem_max
+            assert got_scope["n_splits"] == scope.n_splits
+            assert got_scope["support"] == scope.support
+            assert list(got_scope["blockers"]) == list(scope.blockers)
+            for field_name in (
+                "step_bound_us",
+                "step_floor_strict_us",
+                "step_achievable_us",
+                "step_achievable_upper_us",
+                "step_upper_us",
+                "act_hbm_mb",
+                "comm_us",
+                "chain_us",
+            ):
+                assert got_scope[field_name] == pytest.approx(
+                    getattr(scope, field_name), abs=display_round_tol_us
+                ), f"{model_profile.name} {workload.phase} {scope.scope} {field_name}"
