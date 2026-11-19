@@ -203,8 +203,6 @@ def _expert(weight_fp8, block, token_block, *, swap_halves=False):
     weight_dtype = jnp.float8_e4m3fn if weight_fp8 else jnp.bfloat16
     common = dict(
         activation="silu",
-        w1_bias=None,
-        no_gate=False,
         block=block,
         token_block=token_block,
         columns_per_pass=128,  # two activation passes over the intermediate
@@ -220,7 +218,7 @@ def _expert(weight_fp8, block, token_block, *, swap_halves=False):
     else:
         acc2, mid_scales = ffn.expert_ffn_bf16(*args, **common)
     w2_scales = None if s2 is None else jnp.asarray(s2)
-    q, scales = ffn.result_rows(acc2, mid_scales, w2_scales=w2_scales, w2_bias=None)
+    q, scales = ffn.result_rows(acc2, mid_scales, w2_scales=w2_scales)
     got = np.asarray(q.astype(jnp.float32)) * np.asarray(scales)
     want = _reference(*world, block, tokens_blocked)
     return got, want
@@ -266,11 +264,9 @@ def test_bf16_result_rows_skip_the_last_rounding():
         jnp.asarray(w2).astype(jnp.float8_e4m3fn),
         jnp.asarray(s1),
         activation="silu",
-        w1_bias=None,
-        no_gate=False,
     )
     out, scales = ffn.result_rows(
-        acc2, mid_scales, w2_scales=jnp.asarray(s2), w2_bias=None, dtype=jnp.bfloat16
+        acc2, mid_scales, w2_scales=jnp.asarray(s2), dtype=jnp.bfloat16
     )
     assert scales is None and out.dtype == jnp.bfloat16
     want = np.asarray(acc2) * np.asarray(mid_scales) * s2
