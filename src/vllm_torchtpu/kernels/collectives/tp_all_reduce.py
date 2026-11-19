@@ -135,6 +135,67 @@ def _call(n: int, m: int, h: int):
     )
 
 
+@functools.cache
+def _call_oneshot(n: int, m: int, h: int):
+    """One-shot form: every rank pushes its whole [m, h] to every peer's slot,
+    then sums the n slots in rank order (f32, rounded to bf16), so each rank
+    computes the full sum itself. One exchange round after the barrier
+    instead of two (reduce-scatter, then all-gather); n - 1 times the bytes
+    of each copy. Same additions in the same order as `_call`, so the same
+    bits."""
+
+    def kernel(rank_ref, x_ref, out_ref, recv, send_sem, recv_sem):
+        me = rank_ref[0]
+        barrier = pltpu.get_barrier_semaphore()
+        for d in range(n):
+            pl.semaphore_signal(barrier, inc=1, device_id=(d,), device_id_type=_MESH)
+        pl.semaphore_wait(barrier, n)
+        sends = []
+        for step in range(1, n):
+            t = lax.rem(me + step, n)
+            copy = pltpu.make_async_remote_copy(
+                x_ref,
+                recv.at[me],
+                send_sem.at[step],
+                recv_sem.at[me],
+                device_id=(t,),
+                device_id_type=_MESH,
+            )
+            copy.start()
+            sends.append(copy)
+        recv[me] = x_ref[...]
+        for step in range(1, n):
+            t = lax.rem(me + n - step, n)
+            pltpu.make_async_copy(recv.at[t], recv.at[t], recv_sem.at[t]).wait_recv()
+        acc = recv[0].astype(F32)
+        for s in range(1, n):
+            acc = acc + recv[s].astype(F32)
+        out_ref[...] = acc.astype(BF16)
+        for copy in sends:
+            copy.wait_send()
+
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    view = m * h * jnp.dtype(BF16).itemsize
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((m, h), BF16),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[vmem],
+            out_specs=vmem,
+            scratch_shapes=[
+                pltpu.VMEM((n, m, h), BF16),
+                pltpu.SemaphoreType.DMA((n,)),
+                pltpu.SemaphoreType.DMA((n,)),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=COLLECTIVE_ID, vmem_limit_bytes=(n + 3) * view + (1 << 20)
+        ),
+        name=f"tp_all_reduce_oneshot-m_{m}-h_{h}-n_{n}",
+    )
+
+
 def direct_ok(rows: int, hidden: int, n: int, direct_rows: int) -> bool:
     """Whether `all_reduce` runs on x's own [rows, hidden] layout: direct_rows
     > 0 divides rows and every rank's column chunk is whole lane tiles."""
@@ -147,7 +208,11 @@ def direct_ok(rows: int, hidden: int, n: int, direct_rows: int) -> bool:
 
 
 def all_reduce(
-    x: jax.Array, rank: jax.Array, n: int, direct_rows: int = 0
+    x: jax.Array,
+    rank: jax.Array,
+    n: int,
+    direct_rows: int = 0,
+    oneshot_rows: int = 0,
 ) -> jax.Array:
     """Sum of bf16 x [rows, hidden] over the n ranks; call under shard_map over
     the 1-D mesh. rank (int32, one element) must be this device's mesh index.
@@ -155,8 +220,13 @@ def all_reduce(
     direct_rows > 0: when it divides rows, the kernel runs on x itself
     (column chunks [rows, hidden / n]) and skips the copies into and out of
     the [16, w] view. Each element is still summed in rank order, so the bits
-    are the same as the view's."""
+    are the same as the view's.
+
+    oneshot_rows > 0: inputs of at most that many rows (multiple of 8) run the
+    one-shot kernel on x's own layout (`_call_oneshot`); same bits."""
     rows, hidden = x.shape
+    if 0 < rows <= oneshot_rows and rows % 8 == 0:
+        return _call_oneshot(n, rows, hidden)(rank.reshape(1).astype(jnp.int32), x)
     if direct_ok(rows, hidden, n, direct_rows):
         return _call(n, rows, hidden)(rank.reshape(1).astype(jnp.int32), x)
     padded, m, w = view_shape(rows, hidden, n)

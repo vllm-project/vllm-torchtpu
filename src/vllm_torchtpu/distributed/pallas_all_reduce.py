@@ -64,21 +64,23 @@ class _Armed:
 _ARMED: _Armed | None = None
 
 
-def _body(n: int, max_bytes: int, axis: str, direct_rows: int = 0):
+def _body(
+    n: int, max_bytes: int, axis: str, direct_rows: int = 0, oneshot_rows: int = 0
+):
     def body(x, rank):
         rows, hidden = x.shape
         if 0 < kernel.view_bytes(rows, hidden, n) <= max_bytes:
-            return kernel.all_reduce(x, rank, n, direct_rows)
+            return kernel.all_reduce(x, rank, n, direct_rows, oneshot_rows)
         return lax.psum(x, axis)
 
     return body
 
 
-def _make_op(mesh, max_bytes: int, direct_rows: int = 0):
+def _make_op(mesh, max_bytes: int, direct_rows: int = 0, oneshot_rows: int = 0):
     axis = mesh.axis_names[0]
     specs = (P(axis), P(axis))
     sharded = jax.shard_map(
-        _body(int(mesh.size), max_bytes, axis, direct_rows),
+        _body(int(mesh.size), max_bytes, axis, direct_rows, oneshot_rows),
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
@@ -192,7 +194,8 @@ def arm(hidden: int, device: torch.device) -> bool:
         raise RuntimeError(f"tp_all_reduce: mesh indices are not 0..n-1: {seen}")
     n = int(mesh.size)
     direct_rows = max(envs.TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS, 0)
-    op = _make_op(mesh, max_bytes, direct_rows)
+    oneshot_rows = max(envs.TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS, 0)
+    op = _make_op(mesh, max_bytes, direct_rows, oneshot_rows)
     rank = torch.tensor([[mesh_index]], dtype=torch.int32, device=device)
     failures = _gather(_selftest(op, rank, mesh_index, n, hidden, device))
     if any(failures):
@@ -216,6 +219,13 @@ def arm(hidden: int, device: torch.device) -> bool:
             " multiple of it all-reduce on their own [rows, %d] layout (no view copy)",
             direct_rows,
             hidden,
+        )
+    if oneshot_rows:
+        logger.warning(
+            "tp_all_reduce: TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS=%d: all-reduces of"
+            " at most %d rows run the one-shot kernel (one exchange round, same bits)",
+            oneshot_rows,
+            oneshot_rows,
         )
     return True
 
