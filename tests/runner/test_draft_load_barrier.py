@@ -70,15 +70,6 @@ def test_with_a_timeout_ranks_meet_on_a_monitored_barrier():
 
 
 @pytest.mark.parametrize("seconds", [None, 10800])
-def test_vllm_parallel_config_exposes_the_cpu_timeout(seconds):
-    """The barrier and the worker read ParallelConfig.cpu_distributed_timeout,
-    which --cpu-distributed-timeout-seconds sets in vLLM."""
-    config = ParallelConfig(cpu_distributed_timeout_seconds=seconds)
-    expected = None if seconds is None else timedelta(seconds=seconds)
-    assert config.cpu_distributed_timeout == expected
-
-
-@pytest.mark.parametrize("seconds", [None, 10800])
 def test_the_world_group_gets_the_cpu_timeout_only_when_set(seconds):
     config = ParallelConfig(cpu_distributed_timeout_seconds=seconds)
     expected = {} if seconds is None else {"timeout": timedelta(seconds=seconds)}
@@ -216,12 +207,16 @@ def _draft_load_outcomes(align):
         ctx.Process(target=_draft_load_on_rank, args=(rank, port, align, results))
         for rank in range(2)
     ]
-    for proc in procs:
-        proc.start()
-    outcomes = dict(results.get(timeout=240) for _ in procs)
-    for proc in procs:
-        proc.join(timeout=60)
-    return outcomes
+    try:
+        for proc in procs:
+            proc.start()
+        return dict(results.get(timeout=240) for _ in procs)
+    finally:
+        for proc in procs:
+            proc.join(timeout=60)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(5)
 
 
 def test_a_late_rank_fails_the_fixed_group_wait_without_the_barrier():
@@ -230,3 +225,81 @@ def test_a_late_rank_fails_the_fixed_group_wait_without_the_barrier():
 
 def test_the_barrier_lets_a_late_rank_pass_the_fixed_group_wait():
     assert _draft_load_outcomes(align=True) == {0: "ok", 1: "ok"}
+
+
+# The question whether the CPU timeout reaches the world group's gloo
+# cpu_group, which the draft load barrier waits on: vLLM's GroupCoordinator
+# builds it with new_group(..., timeout=...) from the current vLLM config,
+# whatever the default group's own timeout. Here the default group waits
+# 120 s, the option says 2 s, and rank 1 never reaches the barrier.
+_CPU_TIMEOUT_S = 2
+_DEFAULT_GROUP_TIMEOUT = timedelta(seconds=120)
+
+
+def _world_cpu_group_wait_on_rank(rank, port, results):
+    import vllm.platforms
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import parallel_state
+    from vllm.platforms.cpu import CpuPlatform
+
+    # The group coordinator also picks a device from the platform; without a
+    # TPU that has to be the CPU. The CPU group it builds does not depend on it.
+    vllm.platforms._current_platform = CpuPlatform()
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=2,
+        timeout=_DEFAULT_GROUP_TIMEOUT,
+    )
+    try:
+        config = SimpleNamespace(
+            parallel_config=ParallelConfig(
+                cpu_distributed_timeout_seconds=_CPU_TIMEOUT_S
+            )
+        )
+        try:
+            with set_current_vllm_config(config):
+                world = parallel_state.init_world_group([0, 1], rank, "gloo")
+        except Exception as e:  # reported at once instead of a queue timeout
+            results.put((rank, f"setup failed: {type(e).__name__}: {e}", 0.0))
+            return
+        if rank == 1:
+            time.sleep(4 * _CPU_TIMEOUT_S)
+            results.put((rank, "absent", 0.0))
+            return
+        start = time.perf_counter()
+        try:
+            dist.barrier(group=world.cpu_group)
+            outcome = "passed"
+        except Exception as e:  # the gloo timeout, reported to the parent
+            outcome = type(e).__name__
+        results.put((rank, outcome, time.perf_counter() - start))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_the_world_cpu_group_waits_the_cpu_timeout_not_the_default_groups():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    ctx = multiprocessing.get_context("spawn")
+    results = ctx.Queue()
+    procs = [
+        ctx.Process(target=_world_cpu_group_wait_on_rank, args=(rank, port, results))
+        for rank in range(2)
+    ]
+    try:
+        for proc in procs:
+            proc.start()
+        outcomes = {r: (o, s) for r, o, s in (results.get(timeout=240) for _ in procs)}
+    finally:
+        for proc in procs:
+            proc.join(timeout=60)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(5)
+    outcome, waited = outcomes[0]
+    assert not any(o.startswith("setup failed") for o, _ in outcomes.values()), outcomes
+    assert outcome != "passed"
+    assert _CPU_TIMEOUT_S - 1 < waited < 3 * _CPU_TIMEOUT_S
