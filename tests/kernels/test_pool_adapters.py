@@ -111,6 +111,91 @@ def test_unaligned_region_gcd_decomposition_roundtrip():
     np.testing.assert_array_equal(after[:, tok0 + ntok :], before[:, tok0 + ntok :])
 
 
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("num_valid", [0, 1, 2, 3])
+@pytest.mark.parametrize("row_offset", [0, 1])
+@pytest.mark.parametrize(
+    ("tok0", "ntok"), [(0, 32), (12, 8)], ids=["aligned", "gcd-chunks"]
+)
+def test_live_rows_roundtrip(num_valid, row_offset, tok0, ntok):
+    """`num_valid` visits only the leading requests through a dynamic grid
+    and `row_offset` shifts them in the dense buffer; the rows of requests
+    past `num_valid` are never written back, so their blocks keep their
+    bytes, and the static-grid result is unchanged for the live rows."""
+    pool = _pool()
+    before = np.asarray(pool)
+    idx = jnp.asarray([2, 0, 3], dtype=jnp.int32)
+    rows = ntok * TOK_BYTES // (4 * LANES)
+    rng = np.random.default_rng(11)
+    vals = jnp.asarray(
+        rng.standard_normal((row_offset + 3, rows, LANES)), dtype=jnp.float32
+    )
+    n = jnp.asarray(num_valid, jnp.int32)
+
+    pool = pool_adapters.scatter_region(
+        pool, vals, idx, tok0=tok0, ntok=ntok, num_valid=n, row_offset=row_offset
+    )
+    got = pool_adapters.gather_region(
+        pool,
+        idx,
+        tok0=tok0,
+        ntok=ntok,
+        out_dtype=jnp.float32,
+        num_valid=n,
+        row_offset=row_offset,
+    )
+    ref = pool_adapters.gather_region(
+        pool, idx, tok0=tok0, ntok=ntok, out_dtype=jnp.float32
+    )
+
+    assert got.shape == (row_offset + 3, rows, LANES)
+    live = slice(row_offset, row_offset + num_valid)
+    np.testing.assert_array_equal(np.asarray(got[live]), np.asarray(vals[live]))
+    np.testing.assert_array_equal(np.asarray(ref[:num_valid]), np.asarray(vals[live]))
+    after = np.asarray(pool)
+    written = {int(b) for b in np.asarray(idx)[:num_valid]}
+    for block in range(NB):
+        if block not in written:
+            np.testing.assert_array_equal(after[block], before[block])
+        else:
+            np.testing.assert_array_equal(after[block, :tok0], before[block, :tok0])
+            np.testing.assert_array_equal(
+                after[block, tok0 + ntok :], before[block, tok0 + ntok :]
+            )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("num_valid", [None, 0, 1, 2])
+def test_live_rows_manager_window_roundtrip(num_valid):
+    """The split > 1 whole-kernel-block window path honours `num_valid` and
+    `row_offset` like the plain path, including passing the non-region
+    kernel blocks of a visited manager block through untouched."""
+    split = 2
+    pool = _pool()  # 4 kernel blocks of 64 tokens = 2 manager blocks
+    before = np.asarray(pool)
+    mgr = jnp.asarray([1, 0], dtype=jnp.int32)
+    ntok = BS  # the second kernel block of each manager block
+    rows = ntok * TOK_BYTES // (4 * LANES)
+    rng = np.random.default_rng(12)
+    vals = jnp.asarray(rng.standard_normal((3, rows, LANES)), dtype=jnp.float32)
+    n = None if num_valid is None else jnp.asarray(num_valid, jnp.int32)
+    kw = dict(tok0=BS, ntok=ntok, split=split, num_valid=n, row_offset=1)
+
+    pool = pool_adapters.scatter_region(pool, vals, mgr, **kw)
+    got = pool_adapters.gather_region(pool, mgr, out_dtype=jnp.float32, **kw)
+
+    live = 2 if num_valid is None else num_valid
+    np.testing.assert_array_equal(
+        np.asarray(got[1 : 1 + live]), np.asarray(vals[1 : 1 + live])
+    )
+    after = np.asarray(pool)
+    for m in range(2):
+        first, second = m * split, m * split + 1
+        np.testing.assert_array_equal(after[first], before[first])
+        if m not in {int(b) for b in np.asarray(mgr)[:live]}:
+            np.testing.assert_array_equal(after[second], before[second])
+
+
 def test_out_of_block_region_rejected():
     pool = _pool()
     idx = jnp.asarray([0], dtype=jnp.int32)

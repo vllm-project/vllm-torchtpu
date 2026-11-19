@@ -557,8 +557,31 @@ def _pooled_kda_core(
     num_spec_tokens: int = 0,
     pool_tokens_per_row: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
+    # Every live request schedules at least one token, so a step can hold at
+    # most `num_tokens` of them; rows past that are request-bucket padding
+    # (`max_num_seqs` under the stock scheduler, e.g. 256 for a 16-token
+    # decode). The gather/scatter below moves one full state region per row,
+    # so trim the padding statically per token bucket instead of moving it
+    # through HBM on every layer of every step.
+    max_live = min(state_indices.shape[0], mixed_qkv.shape[0])
+    if max_live < state_indices.shape[0]:
+        state_indices = state_indices[:max_live]
+        seq_lens = seq_lens[:max_live]
+        query_start_loc = query_start_loc[: max_live + 1]
+        distribution = jnp.minimum(distribution, max_live)
+        if window_distribution is not None:
+            window_distribution = jnp.minimum(window_distribution, max_live)
+        if ckpt_indices is not None:
+            ckpt_indices = ckpt_indices[:max_live]
     num_reqs = state_indices.shape[0]
     window = num_spec_tokens + 1
+    # Live rows: requests are packed in front of the bucket and
+    # `distribution[2]` is the step's request count (verify windows own
+    # `window` consecutive checkpoint rows each). The region gather/scatter
+    # below visit only these rows through a dynamic grid; the dense rows of
+    # padded requests stay uninitialized, which is safe because the kernel
+    # gates the state DMAs of padded and zero-length sequences to zero size.
+    live_rows = jnp.clip(distribution[2], 0, num_reqs) * window
     dense_offsets = None
     identity = 1 + jnp.arange(num_reqs, dtype=jnp.int32) * window
     if num_spec_tokens:
@@ -636,7 +659,10 @@ def _pooled_kda_core(
         )
 
     # SSM region [0, ssm_tokens): f32 view with one head_dim-wide lane group
-    # per typed row, so the leading H * D rows are exactly the state.
+    # per typed row, so the leading H * D rows are exactly the state. The
+    # gather lands request r in dense row r + 1: dense slot 0 is the scratch
+    # slot for the kernel's idempotent null-block writes, zeroed in place
+    # below rather than concatenated (which would copy every live state).
     ssm_gathered = pool_adapters.gather_region(
         pool,
         state_indices,
@@ -645,10 +671,12 @@ def _pooled_kda_core(
         out_dtype=jnp.float32,
         out_lanes=head_dim,
         split=split,
+        num_valid=live_rows,
+        row_offset=1,
     )
     ssm_rows = num_heads * head_dim
-    ssm_local = ssm_gathered[:, :ssm_rows, :].reshape(
-        num_reqs, num_heads, head_dim, head_dim
+    ssm_buf = ssm_gathered[:, :ssm_rows, :].reshape(
+        num_reqs + 1, num_heads, head_dim, head_dim
     )
 
     # Stage-3 stores whole, padded prefill-head shards in rank order. Each
@@ -675,20 +703,23 @@ def _pooled_kda_core(
         ntok=layout.conv_tokens,
         out_dtype=conv_dtype,
         split=split,
+        num_valid=live_rows,
+        row_offset=1,
     )
-    conv_local = conv_gathered.reshape(num_reqs, conv_shards, padded_shard_elems)[
+    conv_buf = conv_gathered.reshape(num_reqs + 1, conv_shards, padded_shard_elems)[
         :, :, :shard_elems
     ]
-    conv_local = conv_local.reshape(
-        num_reqs, conv_shards, kernel_size - 1, 3, shard_heads, head_dim
+    conv_buf = conv_buf.reshape(
+        num_reqs + 1, conv_shards, kernel_size - 1, 3, shard_heads, head_dim
     )
-    conv_local = conv_local.transpose(0, 2, 3, 1, 4, 5).reshape(
-        num_reqs, kernel_size - 1, 3, num_heads, head_dim
+    conv_buf = conv_buf.transpose(0, 2, 3, 1, 4, 5).reshape(
+        num_reqs + 1, kernel_size - 1, 3, num_heads, head_dim
     )
 
-    # Dense slot 0 is scratch for the kernel's idempotent null-block writes.
-    conv_buf = jnp.concatenate([jnp.zeros_like(conv_local[:1]), conv_local], axis=0)
-    ssm_buf = jnp.concatenate([jnp.zeros_like(ssm_local[:1]), ssm_local], axis=0)
+    # Dense slot 0 is scratch for the kernel's idempotent null-block writes;
+    # it must start zeroed. In-place updates of the gather outputs.
+    conv_buf = conv_buf.at[0].set(0)
+    ssm_buf = ssm_buf.at[0].set(0)
 
     # The fused conv1d + GDN v3 kernel takes the conv state flat
     # [slots, K - 1, 3*H*D]; the buffers here lay their channels out as
@@ -722,22 +753,31 @@ def _pooled_kda_core(
     # Scatter the real slots back; the padding rows/elems of each region are
     # zero-filled so the pool bytes stay deterministic.
     ssm_region_rows = layout.ssm_tokens * tok_bytes // (4 * head_dim)
-    new_ssm = new_ssm_buf[1:].reshape(num_reqs, ssm_rows, head_dim)
+    # Dense row r + 1 holds request r (row_offset=1), so the scatter reads the
+    # kernel's output in place instead of slicing off the scratch slot.
+    new_ssm = new_ssm_buf.reshape(num_reqs + 1, ssm_rows, head_dim)
     new_ssm = jnp.pad(new_ssm, ((0, 0), (0, ssm_region_rows - ssm_rows), (0, 0)))
     pool = pool_adapters.scatter_region(
-        pool, new_ssm, state_indices, tok0=0, ntok=layout.ssm_tokens, split=split
+        pool,
+        new_ssm,
+        state_indices,
+        tok0=0,
+        ntok=layout.ssm_tokens,
+        split=split,
+        num_valid=live_rows,
+        row_offset=1,
     )
 
-    new_conv = new_conv_buf[1:].reshape(
-        num_reqs, kernel_size - 1, 3, conv_shards, shard_heads, head_dim
+    new_conv = new_conv_buf.reshape(
+        num_reqs + 1, kernel_size - 1, 3, conv_shards, shard_heads, head_dim
     )
     new_conv = new_conv.transpose(0, 3, 1, 2, 4, 5).reshape(
-        num_reqs, conv_shards, shard_elems
+        num_reqs + 1, conv_shards, shard_elems
     )
     new_conv = jnp.pad(
         new_conv, ((0, 0), (0, 0), (0, padded_shard_elems - shard_elems))
     )
-    new_conv = new_conv.reshape(num_reqs, -1, pool.shape[-1])
+    new_conv = new_conv.reshape(num_reqs + 1, -1, pool.shape[-1])
     pool = pool_adapters.scatter_region(
         pool,
         new_conv,
@@ -745,6 +785,8 @@ def _pooled_kda_core(
         tok0=layout.ssm_tokens,
         ntok=layout.conv_tokens,
         split=split,
+        num_valid=live_rows,
+        row_offset=1,
     )
 
     return output, pool

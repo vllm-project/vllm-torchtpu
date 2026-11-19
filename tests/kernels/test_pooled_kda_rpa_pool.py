@@ -463,20 +463,29 @@ def _fake_gather_region(
     out_dtype,
     out_lanes=None,
     split=1,
+    num_valid=None,
+    row_offset=0,
 ):
     """A pure-JAX stand-in for the Pallas gather.
 
     Reads manager-block rows `[tok0, tok0 + ntok)` as `out_dtype`. Its byte
     order inside a row differs from the Pallas kernel's in-VMEM bitcast, but
     it is the exact inverse of `_fake_scatter_region`, which is all the
-    region arithmetic needs.
+    region arithmetic needs. Rows the real kernel leaves uninitialized (the
+    leading `row_offset` rows and the requests past `num_valid`) come back
+    as NaN poison so a caller that reads them is caught.
     """
     calls.append(("gather", tok0, ntok, split))
     n = state_indices.shape[0]
     rows = _region_view(pool, split)[state_indices, tok0 : tok0 + ntok]
     itemsize = jnp.dtype(out_dtype).itemsize
     vals = jax.lax.bitcast_convert_type(rows.reshape(n, -1, itemsize), out_dtype)
-    return vals.reshape(n, -1, out_lanes or pool.shape[-1])
+    vals = vals.reshape(n, -1, out_lanes or pool.shape[-1])
+    if num_valid is not None:
+        live = jnp.arange(n) < num_valid
+        vals = jnp.where(live[:, None, None], vals, jnp.nan)
+    poison = jnp.full((row_offset, *vals.shape[1:]), jnp.nan, vals.dtype)
+    return jnp.concatenate([poison, vals], axis=0)
 
 
 def _fake_scatter_region(
@@ -488,11 +497,20 @@ def _fake_scatter_region(
     tok0,
     ntok,
     split=1,
+    num_valid=None,
+    row_offset=0,
 ):
     calls.append(("scatter", tok0, ntok, split))
     n = state_indices.shape[0]
-    raw = jax.lax.bitcast_convert_type(vals, jnp.uint8).reshape(n, ntok, -1)
+    raw = jax.lax.bitcast_convert_type(vals[row_offset:], jnp.uint8).reshape(
+        n, ntok, -1
+    )
     view = _region_view(pool, split)
+    if num_valid is not None:
+        live = jnp.arange(n) < num_valid
+        raw = jnp.where(
+            live[:, None, None], raw, view[state_indices, tok0 : tok0 + ntok]
+        )
     view = view.at[state_indices, tok0 : tok0 + ntok].set(raw)
     itemsize = jnp.dtype(pool.dtype).itemsize
     return jax.lax.bitcast_convert_type(view.reshape(*pool.shape, itemsize), pool.dtype)
@@ -641,6 +659,186 @@ def test_fused_core_zeros_uninitialized_padded_tail_rows(monkeypatch, num_spec_t
         np.asarray(out[real_tokens:].astype(jnp.float32)),
         np.zeros((padded_tokens - real_tokens, h, d), dtype=np.float32),
     )
+
+
+@pytest.mark.parametrize("num_spec_tokens", [0, 3], ids=["plain", "spec3"])
+def test_pooled_trims_request_bucket_padding_to_token_bucket(
+    monkeypatch, num_spec_tokens
+):
+    """A step holds at most `num_tokens` live requests, so the pooled op
+    gathers/scatters only `min(num_reqs, num_tokens)` state regions (times
+    the verify window) instead of the whole `max_num_seqs` request bucket,
+    and the live requests' states still round-trip."""
+    gathered = []
+
+    def _gather(pool, state_indices, **kwargs):
+        gathered.append(int(state_indices.shape[0]))
+        return _fake_gather_region([], pool, state_indices, **kwargs)
+
+    monkeypatch.setattr(pool_adapters, "gather_region", _gather)
+    monkeypatch.setattr(
+        pool_adapters, "scatter_region", functools.partial(_fake_scatter_region, [])
+    )
+    seen = {}
+
+    def _fake_core(lower_bound, eps, num_spec_tokens=0):
+        del lower_bound, eps, num_spec_tokens
+
+        def fused_core(mixed_qkv, raw_gate, beta, output_gate, conv, ssm, *args):
+            del mixed_qkv, beta, output_gate
+            seen["qsl"], seen["state"], seen["seq_lens"], seen["dist"] = (
+                args[4],
+                args[5],
+                args[6],
+                args[7],
+            )
+            return jnp.zeros_like(raw_gate), conv + 1.0, ssm * 2.0
+
+        return fused_core
+
+    monkeypatch.setattr(kda_attention_op, "_build_fused_core", _fake_core)
+
+    geom = TP8
+    rng = np.random.default_rng(31)
+    weights = _weights(geom, rng)
+    num_tokens, bucket, live = 4, 16, 2
+    window = num_spec_tokens + 1
+    query_lens = [2, 2] + [0] * (bucket - live)
+    seq_lens = [9, 5] + [0] * (bucket - live)
+    acts = _activations(geom, rng, query_lens, seq_lens)
+    block_ids = [1, 3] + [0] * (bucket - live)
+    conv_init, ssm_init = _initial_states(geom, rng, live)
+    pool = _pack_pool(geom, _garbage_pool(geom), conv_init, ssm_init, [1, 3])
+    distribution = jnp.asarray([live, live, bucket], jnp.int32)
+    extra = ()
+    if num_spec_tokens:
+        ckpt = np.zeros((bucket, window), np.int32)
+        ckpt[0, 0], ckpt[1, 0] = 1, 3
+        extra = (distribution, jnp.zeros((NUM_BLOCKS,), jnp.int32), jnp.asarray(ckpt))
+    _, pool_after = kda_attention_op._pooled_kda_core(
+        acts["mixed_qkv"],
+        acts["raw_gate"],
+        acts["beta"],
+        acts["output_gate"],
+        pool,
+        weights["conv_weight"],
+        weights["a_log"],
+        weights["dt_bias"],
+        weights["norm_weight"],
+        acts["query_start_loc"],
+        jnp.asarray(block_ids, jnp.int32),
+        acts["seq_lens"],
+        distribution,
+        *extra,
+        lower_bound=LOWER_BOUND,
+        eps=EPS,
+        pool_block_tokens=BLOCK_SIZE,
+        num_spec_tokens=num_spec_tokens,
+        pool_tokens_per_row=1,
+    )
+    assert gathered == [num_tokens * window, num_tokens * window]
+    assert seen["seq_lens"].shape == (num_tokens,)
+    assert seen["qsl"].shape == (num_tokens + 1,)
+    assert int(seen["qsl"][-1]) == num_tokens
+    assert np.asarray(seen["dist"]).max() <= num_tokens
+    conv_back, ssm_back, _ = _unpack_pool(geom, pool_after, [1, 3])
+    np.testing.assert_array_equal(np.asarray(conv_back), np.asarray(conv_init + 1.0))
+    np.testing.assert_array_equal(np.asarray(ssm_back), np.asarray(ssm_init * 2.0))
+
+
+@pytest.mark.parametrize("num_spec_tokens", [0, 3], ids=["plain", "spec3"])
+def test_pooled_moves_only_live_request_rows(monkeypatch, num_spec_tokens):
+    """The region gather/scatter visit only the `distribution[2]` live
+    requests (times the verify window) and land them at dense row r + 1, so
+    the scratch slot needs no concatenate and the scatter no slice. Padded
+    request rows are never read back into the pool: their blocks keep their
+    bytes, and the (poisoned) unvisited dense rows never reach the pool."""
+    region_calls = []
+
+    def _gather(pool, state_indices, **kwargs):
+        region_calls.append(
+            ("gather", kwargs.get("num_valid"), kwargs.get("row_offset"))
+        )
+        return _fake_gather_region([], pool, state_indices, **kwargs)
+
+    def _scatter(pool, vals, state_indices, **kwargs):
+        region_calls.append(
+            ("scatter", kwargs.get("num_valid"), kwargs.get("row_offset"))
+        )
+        return _fake_scatter_region([], pool, vals, state_indices, **kwargs)
+
+    monkeypatch.setattr(pool_adapters, "gather_region", _gather)
+    monkeypatch.setattr(pool_adapters, "scatter_region", _scatter)
+    seen = {}
+
+    def _fake_core(lower_bound, eps, num_spec_tokens=0):
+        del lower_bound, eps, num_spec_tokens
+
+        def fused_core(mixed_qkv, raw_gate, beta, output_gate, conv, ssm, *args):
+            del mixed_qkv, beta, output_gate, args
+            seen["conv0"], seen["ssm0"] = conv[0], ssm[0]
+            return jnp.zeros_like(raw_gate), conv + 1.0, ssm * 2.0
+
+        return fused_core
+
+    monkeypatch.setattr(kda_attention_op, "_build_fused_core", _fake_core)
+
+    geom = TP8
+    rng = np.random.default_rng(37)
+    weights = _weights(geom, rng)
+    bucket, live = 4, 2
+    window = num_spec_tokens + 1
+    query_lens = [1, 1] + [0] * (bucket - live)
+    seq_lens = [9, 5] + [0] * (bucket - live)
+    acts = _activations(geom, rng, query_lens, seq_lens)
+    # Padded requests point at block 2, whose bytes must survive untouched.
+    block_ids = [1, 3] + [2] * (bucket - live)
+    conv_init, ssm_init = _initial_states(geom, rng, live)
+    pool = _pack_pool(geom, _garbage_pool(geom), conv_init, ssm_init, [1, 3])
+    before = _bits(pool).reshape(geom.pool_shape())
+    region_calls.clear()  # _pack_pool scatters through the stand-in too
+    distribution = jnp.asarray([live, live, live], jnp.int32)
+    extra = ()
+    if num_spec_tokens:
+        ckpt = np.full((bucket, window), 2, np.int32)
+        # Slot 0 of each live window is the request's state block; the other
+        # checkpoint slots share a spare block (they round-trip identically).
+        ckpt[0], ckpt[1] = 4, 0
+        ckpt[0, 0], ckpt[1, 0] = 1, 3
+        extra = (distribution, jnp.zeros((NUM_BLOCKS,), jnp.int32), jnp.asarray(ckpt))
+    _, pool_after = kda_attention_op._pooled_kda_core(
+        acts["mixed_qkv"],
+        acts["raw_gate"],
+        acts["beta"],
+        acts["output_gate"],
+        pool,
+        weights["conv_weight"],
+        weights["a_log"],
+        weights["dt_bias"],
+        weights["norm_weight"],
+        acts["query_start_loc"],
+        jnp.asarray(block_ids, jnp.int32),
+        acts["seq_lens"],
+        distribution,
+        *extra,
+        lower_bound=LOWER_BOUND,
+        eps=EPS,
+        pool_block_tokens=BLOCK_SIZE,
+        num_spec_tokens=num_spec_tokens,
+        pool_tokens_per_row=1,
+    )
+    assert [c[0] for c in region_calls] == ["gather", "gather", "scatter", "scatter"]
+    for _, num_valid, row_offset in region_calls:
+        assert int(num_valid) == live * window
+        assert row_offset == 1
+    # The scratch slot reaches the kernel zeroed, not as gather poison.
+    assert not np.asarray(seen["conv0"]).any()
+    assert not np.asarray(seen["ssm0"]).any()
+    conv_back, ssm_back, _ = _unpack_pool(geom, pool_after, [1, 3])
+    np.testing.assert_array_equal(np.asarray(conv_back), np.asarray(conv_init + 1.0))
+    np.testing.assert_array_equal(np.asarray(ssm_back), np.asarray(ssm_init * 2.0))
+    after = _bits(pool_after).reshape(geom.pool_shape())
+    np.testing.assert_array_equal(after[2], before[2])
 
 
 # --- TPU: the fused kernel and the Pallas pool adapters ---------------------
