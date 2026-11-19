@@ -894,7 +894,10 @@ _ASSEMBLY_PROGRAMS = (
     "_compiled_subtract_num_rejected_tokens",
     "_compiled_subtract_and_substitute_placeholder_token",
     "_compiled_subtract_and_substitute_draft_token_ids",
+    "_compiled_carry_subtract_and_substitute_draft_token_ids",
 )
+# The rejected-draft subtraction programs, warmed at every token bucket.
+_SUBTRACT_PROGRAMS = _ASSEMBLY_PROGRAMS[4:7]
 
 
 def _assembly_warmup_calls(
@@ -947,6 +950,8 @@ def _assembly_warmup_calls(
         device=torch.device("cpu"),
         drafter=None,
         _precompile_timed=lambda name: contextlib.nullcontext(),
+        _decode_carry_enabled=False,
+        _dp_lockstep_enabled=lambda: False,
     )
     for name, value in (runner_fields or {}).items():
         setattr(runner, name, value)
@@ -1102,7 +1107,7 @@ def test_async_spec_assembly_warmup_covers_every_bucket(monkeypatch):
     two = calls["_compiled_assemble_two_chunks_spec_and_rejected"]
     assert two and all(c[0][0] + c[3][0] <= max_num_reqs for c in two)
     assert {(c[0][0], c[3][0]) for c in two} >= {(2, 2), (2, 4), (4, 4)}
-    for name in _ASSEMBLY_PROGRAMS[4:]:
+    for name in _SUBTRACT_PROGRAMS:
         warmed = {(c[0][0], c[1][-1]) for c in calls[name]}
         # Every token bucket, for both the max-model-len and the
         # most-model-len request layouts.
@@ -1149,6 +1154,52 @@ def test_substituting_programs_warm_the_drafters_source_dtype(
         assert warmed == {
             ((knr,), (t,), dt) for knr in (8, 4) for t in (8, 16, 32) for dt in want
         }, name
+
+
+@pytest.mark.parametrize("uses_mrope", [False, True])
+@pytest.mark.parametrize("lockstep", [False, True])
+@pytest.mark.parametrize("paddings", [[4, 8, 16, 32], [2, 4, 16, 32]])
+def test_decode_carry_program_is_warmed_at_every_carried_shape(
+    monkeypatch, paddings, lockstep, uses_mrope
+):
+    """The decode carry's form of the draft-token program serves a carried step:
+    one request (max_num_seqs == 1) with its bonus token and 1 to K drafts,
+    padded to the first token bucket at or above that count (under EP-DP
+    lockstep, to the DP-wide bucket, which can be any), at either request
+    layout, with step_delta = 1 + K baked in. The warm-up compiles exactly
+    those shapes, with the arguments the draft-token program takes there.
+    With K = 3 the carried counts 2 to 4 pad to bucket 4 alone, or to 2 and 4."""
+    calls = _assembly_warmup_calls(
+        monkeypatch,
+        most=4,
+        runner_fields=dict(
+            _decode_carry_enabled=True,
+            _dp_lockstep_enabled=lambda: lockstep,
+            num_tokens_paddings=paddings,
+            uses_mrope=uses_mrope,
+        ),
+    )
+    k = 3
+    buckets = (
+        set(paddings)
+        if lockstep
+        else {min(t for t in paddings if t >= n) for n in range(2, k + 2)}
+    )
+    served = {(knr, t) for knr in (8, 4) for t in buckets}
+    carry = calls["_compiled_carry_subtract_and_substitute_draft_token_ids"]
+    assert {(c[0][0], c[1][-1]) for c in carry} == served
+    assert len(carry) == len(served)
+    assert all(c[2] == 1 + k for c in carry)
+    assert all(len(c[1]) == (2 if uses_mrope else 1) for c in carry)
+    draft = calls["_compiled_subtract_and_substitute_draft_token_ids"]
+    assert {c[:2] + c[3:] for c in carry} == {
+        c for c in draft if (c[0][0], c[1][-1]) in served
+    }
+
+
+def test_decode_carry_program_is_not_warmed_without_the_carry(monkeypatch):
+    calls = _assembly_warmup_calls(monkeypatch, most=4)
+    assert not calls["_compiled_carry_subtract_and_substitute_draft_token_ids"]
 
 
 def test_async_spec_assembly_warmup_needs_async_scheduling(monkeypatch):

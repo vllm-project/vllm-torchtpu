@@ -9563,6 +9563,7 @@ class TPUModelRunner(GPUModelRunner):
             _compiled_assemble_prefill_bootstrap,
             _compiled_assemble_spec_and_rejected,
             _compiled_assemble_two_chunks_spec_and_rejected,
+            _compiled_carry_subtract_and_substitute_draft_token_ids,
             _compiled_pad_non_spec_next_tokens,
             _compiled_subtract_and_substitute_draft_token_ids,
             _compiled_subtract_and_substitute_placeholder_token,
@@ -9644,6 +9645,14 @@ class TPUModelRunner(GPUModelRunner):
                     None
                     if isinstance(self.drafter, Eagle3Proposer)
                     else torch.zeros(bound, dtype=torch.int64, device=self.device)
+                )
+                # The decode carry's form of the draft-token program runs on the
+                # carried steps' token buckets only, with step_delta = 1 + K
+                # baked in.
+                carry_token_buckets = (
+                    set(_decode_carry.token_buckets(self))
+                    if _decode_carry.enabled(self)
+                    else set()
                 )
                 for num_tokens in self.num_tokens_paddings:
                     pos_shape = (3, num_tokens) if self.uses_mrope else (num_tokens,)
@@ -9738,6 +9747,23 @@ class TPUModelRunner(GPUModelRunner):
                                     ),
                                 )
                             )
+                        if num_tokens in carry_token_buckets:
+                            out_carry = (
+                                _compiled_carry_subtract_and_substitute_draft_token_ids(
+                                    sl_warm,
+                                    pos_warm,
+                                    1 + k,
+                                    rej_warm,
+                                    sl_idx_warm,
+                                    pos_idx_warm,
+                                    ids_warm,
+                                    subst_idx_warm,
+                                    next_tpu_warm,
+                                    logits_idx_warm,
+                                    logits_idx_warm,
+                                )
+                            )
+                            synchronize_tensors(out_carry)
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.

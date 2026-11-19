@@ -37,6 +37,7 @@ configuration it was measured on; every other engine keeps the uploads.
 
 from __future__ import annotations
 
+import bisect
 import itertools
 from typing import TYPE_CHECKING
 
@@ -69,6 +70,19 @@ def rule_holds(scheduler_config: SchedulerConfig, vllm_config: VllmConfig) -> bo
 
 def enabled(runner: TPUModelRunner) -> bool:
     return runner._decode_carry_enabled
+
+
+def token_buckets(runner: TPUModelRunner) -> list[int]:
+    """The token buckets of the steps the carry runs: one request
+    (max_num_seqs == 1) scheduling its bonus token and 1 to K drafts, padded to
+    the first token bucket at or above that count. Under EP-DP lockstep a step
+    is raised to the DP-wide bucket, which can be any token bucket."""
+    paddings = runner.num_tokens_paddings
+    if runner._dp_lockstep_enabled():
+        return list(paddings)
+    assert runner.speculative_config is not None
+    k = runner.speculative_config.num_speculative_tokens
+    return sorted({paddings[bisect.bisect_left(paddings, n)] for n in range(2, k + 2)})
 
 
 class CarryState:
