@@ -60,7 +60,7 @@ logger = init_logger(__name__)
 # them; tests/test_frontend_detok_tail.py checks all four families.
 # ---------------------------------------------------------------------------
 
-_DT = "tpu_frontend.detok_prompt_tail:"
+_LOG_PREFIX = "tpu_frontend.detok_prompt_tail:"
 _DETOK_INSTALLED = False
 # Prompt tokens the detokenizer is primed with when the tail is safe.
 DETOK_PROMPT_TAIL_TOKENS = 8
@@ -135,7 +135,9 @@ def maybe_install_detok_prompt_tail() -> bool:
     # APIServer_DPRank_<n> (ApiServer_<n> in older vLLM).
     if not (pname == "MainProcess" or pname.lower().startswith("apiserver")):
         logger.warning(
-            "%s not installed in process %r, which is not an API server", _DT, pname
+            "%s not installed in process %r, which is not an API server",
+            _LOG_PREFIX,
+            pname,
         )
         return False
     try:
@@ -147,14 +149,17 @@ def maybe_install_detok_prompt_tail() -> bool:
         src = inspect.getsource(cls.__init__)
     except Exception as e:
         logger.warning(
-            "%s cannot import FastIncrementalDetokenizer (%r); not enabled", _DT, e
+            "%s cannot import FastIncrementalDetokenizer (%r); not enabled",
+            _LOG_PREFIX,
+            e,
         )
         return False
     # Only patch the upstream shape we have proven equivalent: a DecodeStream
     # primed with ``ids=request.prompt_token_ids``.
     if "DecodeStream(" not in src or "ids=request.prompt_token_ids" not in src:
         logger.warning(
-            "%s FastIncrementalDetokenizer.__init__ changed upstream; not enabled", _DT
+            "%s FastIncrementalDetokenizer.__init__ changed upstream; not enabled",
+            _LOG_PREFIX,
         )
         return False
 
@@ -176,18 +181,21 @@ def maybe_install_detok_prompt_tail() -> bool:
             logger.warning_once(
                 "%s %s while choosing the prompt tail; priming with the full "
                 "prompt (details at debug level)",
-                _DT,
+                _LOG_PREFIX,
                 type(e).__name__,
             )
             logger.debug(
-                "%s %s while choosing the prompt tail: %s", _DT, type(e).__name__, e
+                "%s %s while choosing the prompt tail: %s",
+                _LOG_PREFIX,
+                type(e).__name__,
+                e,
             )
         now = time.monotonic()
         if now - _DetokStats.last_log >= log_s:
             _DetokStats.last_log = now
             logger.debug(
                 "%s stats tail=%d full_fallback=%d short=%d error=%d",
-                _DT,
+                _LOG_PREFIX,
                 _DetokStats.tail,
                 _DetokStats.full_fallback,
                 _DetokStats.short,
@@ -202,7 +210,7 @@ def maybe_install_detok_prompt_tail() -> bool:
     logger.info(
         "%s installed FastIncrementalDetokenizer prompt-tail priming "
         "(tail=%d, pid %d, %s)",
-        _DT,
+        _LOG_PREFIX,
         tail_n,
         os.getpid(),
         pname,
