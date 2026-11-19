@@ -504,3 +504,216 @@ def write_region_ring(pool, values, ids, *, tok0=0, depth=4):
         input_output_aliases={2: 0},
         name="q38_ple_wrdefer",
     )(ids, values, pool)
+
+
+# q38 PLE-UNIFORM-COND on the R form (layer U of rple_design_v1; port of L1's D07-b2
+# ``bounded_request_rows`` / ``uniform_window_conv``, q38-L1-c64-w3 2bc75911f, credit L1):
+# VLLM_TPU_PLE_UNIFORM_COND (default off, hashed). It sits below everything else and rebinds
+# ``pooled_short_conv_speculative`` here, so with the flag unset every line above is unchanged
+# and the stock function runs as before. With the flag set, a token-path bucket whose shape
+# allows it (T % window == 0, n = T // window <= rows, state_len == (taps - 1) * dilation,
+# VLLM_TPU_PLE_SKIP_IDLE_ROWS off) chooses ON THE DEVICE, by ``lax.cond``, between the uniform
+# path (history for the n leading rows, taps and checkpoint windows by static slices) and the
+# stock path (the same equations as the stock function); every other bucket runs the stock
+# function with no cond. The checkpoint write stays outside the cond (one writer: the
+# VLLM_TPU_PLE_WRDEFER dispatcher), so the pool is only read inside it.
+_pooled_short_conv_speculative_stock = pooled_short_conv_speculative
+_UNIFORM_SEEN: set = set()
+
+
+def uniform_cond_enabled() -> bool:
+    """VLLM_TPU_PLE_UNIFORM_COND: the device-side uniform-window choice (q38 PLE-UNIFORM-COND)."""
+    return bool(envs.VLLM_TPU_PLE_UNIFORM_COND)
+
+
+def bounded_request_rows(token_count: int, count: int, window: int) -> int:
+    """Request rows a uniform-window bucket can fill (q38 L1 D07-b2).
+
+    A bucket of ``token_count`` tokens whose live requests each hold ``window``
+    tokens has at most ceil(token_count / window) of them, and they come first:
+    the runner's metadata lists the scheduled requests in order and pads the
+    tail with empty rows up to max-num-seqs (``count``).
+    """
+    return min(count, -(-token_count // window))
+
+
+def uniform_window_pred(starts: jax.Array, rows: int, window: int) -> jax.Array:
+    """pred = (L <= rows) & all(lengths[:L] == window) & all(lengths[L:] == 0), with
+    L = starts[-1] // window, the live row count of a uniform bucket: True iff every
+    token sits in one of the L leading rows, each holding exactly ``window`` tokens.
+    (With L counted as the rows that hold tokens the tail check would be implied by the
+    lead check; with this L each check carries weight: a short request after full ones,
+    e.g. lengths [4, 4, 1, 1], passes the lead check and fails only the tail check.)"""
+    lengths = starts[1:] - starts[:-1]
+    live = starts[-1] // window
+    lead = jnp.arange(lengths.shape[0], dtype=starts.dtype) < live
+    lead_ok = jnp.all(jnp.where(lead, lengths == window, True))
+    tail_ok = jnp.all(jnp.where(lead, True, lengths == 0))
+    return (live <= rows) & lead_ok & tail_ok
+
+
+def _note_uniform(kind: str, token_count: int, count: int, rows: int, window: int, why: str = "") -> None:
+    """Trace-time engagement line, once per traced shape and kind."""
+    key = (kind, token_count, count, rows, window, why)
+    if key in _UNIFORM_SEEN:
+        return
+    _UNIFORM_SEEN.add(key)
+    from vllm_torchtpu.logger import init_logger
+
+    if kind == "cond":
+        init_logger(__name__).info(
+            "q38 PLE-UNIFORM-COND traced: %d tokens, device-side cond between the uniform path "
+            "(%d of %d request rows, window %d, static slices) and the stock path",
+            token_count,
+            rows,
+            count,
+            window,
+        )
+    else:
+        init_logger(__name__).info(
+            "q38 PLE-UNIFORM-COND static fallback: %d tokens, %d request rows, window %d (%s); "
+            "stock path, no cond",
+            token_count,
+            count,
+            window,
+            why,
+        )
+
+
+def uniform_window_conv(x, weight, history, starts, ids, initial, ckpt_ids, windowed, *, dilation):
+    """``short_conv`` (request-owned history) plus ``token_checkpoints`` for a
+    bucket of exactly ``count`` requests x ``window`` tokens whose live
+    requests each hold ``window`` tokens and come first (q38 L1 D07-b2).
+    Returns (output, values, targets).
+
+    Token ``t`` is chunk token ``t % window`` of request ``t // window``, so
+    every row the two functions gather is a static slice of
+    ``E[r] = concat(history[r] masked by initial[r], x[r * window : (r + 1) * window])``:
+    tap ``k`` of token ``(r, j)`` reads ``E[r, k * dilation + j]``, and its
+    checkpoint is ``E[r, j + 1 : j + 1 + state_len]``. The f32 products and
+    their tap order, the BF16 rounding points and the masks are those of
+    ``short_conv``, so live tokens' outputs and every written (target, value)
+    pair are bitwise equal. Padded tokens (past ``starts[-1]``) read other
+    rows than there, but their outputs are masked to zero and they write
+    nothing in both.
+    """
+    token_count, channels = x.shape
+    count, window = ckpt_ids.shape
+    state_len = history.shape[1]
+    taps = weight.shape[-1]
+    assert token_count == count * window, (token_count, count, window)
+    assert state_len == (taps - 1) * dilation, (state_len, taps, dilation)
+    lengths = starts[1:] - starts[:-1]
+    active = (ids > 0) & (lengths > 0)
+    past = jnp.where(initial[:, None, None], history, jnp.zeros((), history.dtype))
+    extended = jnp.concatenate(
+        [past.astype(x.dtype), x.reshape(count, window, channels)], axis=1
+    )
+    accum = jnp.zeros((token_count, channels), jnp.float32)
+    for tap in range(taps):
+        value = extended[:, tap * dilation : tap * dilation + window].reshape(
+            token_count, channels
+        )
+        accum = accum + value.astype(jnp.float32) * weight[:, tap].astype(jnp.float32)
+    pre = _ple_bf16(accum)
+    output = _ple_bf16(jax.nn.silu(pre.astype(jnp.float32)))
+    t = jnp.arange(token_count, dtype=jnp.int32)
+    req = t // window
+    rel = t % window
+    valid = (t < starts[-1]) & active[req]
+    output = jnp.where(valid[:, None], output, 0)
+
+    values = jnp.stack(
+        [extended[:, j + 1 : j + 1 + state_len] for j in range(window)], axis=1
+    ).reshape(token_count, state_len * channels)
+    win = windowed[req]
+    write = valid & jnp.where(win, rel < window, rel == lengths[req] - 1)
+    column = jnp.where(win, jnp.clip(rel, 0, window - 1), 0)
+    targets = jnp.where(write, ckpt_ids[req, column], 0)
+    return output, values, targets
+
+
+def _ple_bf16(x):
+    from vllm_torchtpu.kernels.qwen4_exp.ple import _bf16
+
+    return _bf16(x)
+
+
+def pooled_short_conv_speculative(
+    x: jax.Array,
+    weight: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    ids: jax.Array,
+    initial: jax.Array,
+    read_ids: jax.Array,
+    ckpt_ids: jax.Array,
+    windowed: jax.Array,
+    *,
+    dilation: int,
+    state_len: int,
+) -> tuple[jax.Array, jax.Array]:
+    """The stock ``pooled_short_conv_speculative`` unless VLLM_TPU_PLE_UNIFORM_COND is set
+    (q38 PLE-UNIFORM-COND): then a token-path bucket of exactly n = T // window request
+    rows chooses on the device between ``uniform_window_conv`` (pred True) and the stock
+    equations (pred False); live tokens' outputs and every written checkpoint are bitwise
+    the stock function's either way."""
+    args = (x, weight, pool, starts, ids, initial, read_ids, ckpt_ids, windowed)
+    kw = dict(dilation=dilation, state_len=state_len)
+    if not uniform_cond_enabled():
+        return _pooled_short_conv_speculative_stock(*args, **kw)
+    token_count, channels = x.shape
+    count0, window = ckpt_ids.shape
+    rows = token_count // window
+    why = (
+        "VLLM_TPU_PLE_SKIP_IDLE_ROWS" if envs.VLLM_TPU_PLE_SKIP_IDLE_ROWS
+        else "T % window != 0" if token_count % window
+        else "state_len != (taps - 1) * dilation" if state_len != (weight.shape[-1] - 1) * dilation
+        else "request path (T // window > rows)" if not 0 < rows <= count0
+        else ""
+    )
+    if why:
+        _note_uniform("fallback", token_count, count0, rows, window, why)
+        return _pooled_short_conv_speculative_stock(*args, **kw)
+    starts, ids, initial, read_ids, ckpt_ids, windowed = step_request_rows(
+        token_count, starts, ids, initial, read_ids, ckpt_ids, windowed
+    )
+    count = ckpt_ids.shape[0]
+    _note_uniform("cond", token_count, count, rows, window)
+    pred = uniform_window_pred(starts, rows, window)
+
+    def uniform(_):
+        history = read_region(
+            pool, read_ids[:rows], elements=state_len * channels, dtype=jnp.bfloat16
+        ).reshape(rows, state_len, channels)
+        return uniform_window_conv(
+            x, weight, history, starts[: rows + 1], ids[:rows], initial[:rows],
+            ckpt_ids[:rows], windowed[:rows], dilation=dilation,
+        )
+
+    def stock(_):
+        # The stock function's equations (token path, SKIP_IDLE_ROWS off), without its write.
+        lengths = starts[1:] - starts[:-1]
+        active = (ids > 0) & (lengths > 0)
+        history = read_region(
+            pool, read_ids, elements=state_len * channels, dtype=jnp.bfloat16
+        ).reshape(count, state_len, channels)
+        slots = jnp.where(active, jnp.arange(count, dtype=jnp.int32), -1)
+        output, _final = short_conv(
+            x,
+            weight,
+            history,
+            starts,
+            slots,
+            initial,
+            dilation=dilation,
+            request_owned_history=True,
+        )
+        values, targets = token_checkpoints(
+            x, history, starts, initial, active, ckpt_ids, windowed
+        )
+        return output, values, targets
+
+    output, values, targets = jax.lax.cond(pred, uniform, stock, None)
+    pool = write_region(pool, values, targets)
+    return pool, output
