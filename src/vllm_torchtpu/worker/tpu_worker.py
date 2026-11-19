@@ -53,6 +53,7 @@ from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.model_runner_registry import select_model_runner
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
@@ -478,11 +479,14 @@ class TPUWorker(WorkerBase):
         is_first_rank = pp_group.is_first_rank
         is_last_rank = pp_group.is_last_rank
 
+        # A model directory may register a subclass of the runner for its
+        # architectures (runner/model_runner_registry.py).
+        runner_cls = select_model_runner(self.model_config.architecture, TPUModelRunner)
         # TODO: Fix device assignment
         # WorkerBase declares `nn.Module | None`; this worker always holds a
         # TPUModelRunner from here on.
         # pyrefly: ignore[bad-override-mutable-attribute]
-        self.model_runner: TPUModelRunner = TPUModelRunner(
+        self.model_runner: TPUModelRunner = runner_cls(
             self.vllm_config,
             self.devices[0],
             profiler_rank=self.profile_rank,
