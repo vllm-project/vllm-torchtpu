@@ -19,6 +19,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from jax import lax
 from jax.experimental import pallas as pl
@@ -381,3 +382,76 @@ def test_borrow_epool_rejected_inside_expert_stream():
         ):
             pass
     assert ring.borrow_epool() == "EPOOL"
+
+
+def _ring_outputs(hier: int, B: int, layers: int = 3):
+    """Per layer `rnd(allreduce(x_l))` and the raw sum on 8 ranks (WAR, as the HC ring)."""
+    R = 8
+    devs = jax.devices("cpu")
+    assert len(devs) >= R, f"Expected >= {R} CPU devices (check XLA_FLAGS), found {len(devs)}"
+    tiles = dataclasses.replace(TINY_TILES, hier=hier, rsag=False, war=1, mb8=2)
+    ex = ExecSpec(B=B, T=1, R=R, ctx=128, tiles=tiles, interpret=True)
+    g = FakeGeometry(L=2, H=1024)
+    ms = ModelSpec("ar_test", config=g, layer_type=LayerType("lt", slots=(_TwoTileBlock(),)))
+    cp, scratch = vmem.build_scratch(ms, ex)
+    assert cp.comm.HIER == hier and cp.comm.WAR
+    s_names = list(scratch.keys())
+
+    def pallas_body(x_ref, rnd_ref, raw_ref, *scr_refs):
+        scr = dict(zip(s_names, scr_refs))
+        me = lax.axis_index("tp").astype(I32)
+        ar = comm.AllReduceRing(cp.comm, scr, me)
+        barrier = pltpu.get_barrier_semaphore()
+        for off in range(1, R):
+            pl.semaphore_signal(barrier, 1, device_id=(me ^ off,),
+                                device_id_type=pl.DeviceIdType.MESH)
+        pl.semaphore_wait(barrier, R - 1)
+        for lyr in range(layers):  # alternating slots, as the HC sublayers
+            tot = ar.allreduce(lyr % 2, x_ref[lyr], lyr < 2)
+            raw_ref[lyr] = tot
+            rnd_ref[lyr] = rnd(tot)  # HCBlock._combine rounds the sum first
+        ar.drain_sends()
+
+    shp = jax.ShapeDtypeStruct((layers, ex.MR, g.H), F32)
+    call = pl.pallas_call(
+        pallas_body,
+        out_shape=(shp, shp),
+        in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)],
+        out_specs=(pl.BlockSpec(memory_space=pltpu.VMEM),) * 2,
+        scratch_shapes=[scratch[k] for k in s_names],
+        compiler_params=pltpu.CompilerParams(collective_id=0),
+        interpret=pltpu.InterpretParams(),
+    )
+    mesh = Mesh(devs[:R], ("tp",))
+    step = jax.jit(jax.shard_map(
+        lambda x: tuple(o[None] for o in call(x[0])), mesh=mesh, in_specs=(P("tp"),),
+        out_specs=(P("tp"), P("tp")), check_vma=False))
+    x_all = 3.0 * jax.random.normal(jax.random.PRNGKey(7), (R, layers, ex.MR, g.H), F32)
+    r, w = step(x_all)
+    return np.asarray(r), np.asarray(w), ex.B
+
+
+@pytest.mark.parametrize("B", [4, 8])
+def test_hier1_rounded_sum_bit_identical_to_hier2(B: int):
+    """VLLM_TPU_MK_AR_HIER_SMALL: hier=1 (2 rounds, full-width pair sum) and hier=2 (3 rounds,
+    half-width pair sum) give byte-identical `rnd(sum)` on every rank: both round each pair
+    sum to bf16 and add the 4 pair sums in f32 in pair order; hier=2 only rounds the f32 total
+    to bf16 once more, which `rnd` (HCBlock._combine, the only consumer in the whole step)
+    does anyway. The raw f32 totals differ only by that rounding."""
+    r1, w1, b = _ring_outputs(1, B)
+    r2, w2, _ = _ring_outputs(2, B)
+    np.testing.assert_array_equal(r1[:, :, :b], r2[:, :, :b])
+    np.testing.assert_array_equal(np.asarray(rnd(jnp.asarray(w1[:, :, :b]))), w2[:, :, :b])
+    assert (w1[:, :, :b] != w2[:, :, :b]).any()  # hier=1's total is not pre-rounded
+
+
+def test_ar_hier_small_toggle_picks_hier1_up_to_8_rows(monkeypatch):
+    """VLLM_TPU_MK_AR_HIER_SMALL: whole-step buckets <= 8 rows get hier=1, larger keep hier=2;
+    off leaves every bucket on hier=2."""
+    from vllm_torchtpu.megakernel_runtime import qwen38_wholestep_call as wc
+
+    monkeypatch.delenv("VLLM_TPU_MK_HIER", raising=False)
+    monkeypatch.delenv("VLLM_TPU_MK_AR_HIER_SMALL", raising=False)
+    assert {B: wc.wholestep_tiles(B).hier for B in (4, 8, 16, 32)} == {4: 2, 8: 2, 16: 2, 32: 2}
+    monkeypatch.setenv("VLLM_TPU_MK_AR_HIER_SMALL", "1")
+    assert {B: wc.wholestep_tiles(B).hier for B in (4, 8, 16, 32)} == {4: 1, 8: 1, 16: 2, 32: 2}

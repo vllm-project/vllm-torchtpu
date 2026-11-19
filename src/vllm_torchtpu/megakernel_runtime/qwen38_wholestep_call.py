@@ -160,6 +160,9 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     # VLLM_TPU_MK_GDN_HM=0 restores the whole-state update.
     if os.environ.get("VLLM_TPU_MK_GDN_HM", "1") not in ("", "0"):
         t = t.with_blocks({"gdn": {"gdn_head_major": True}})
+    # VLLM_TPU_MK_AR_HIER_SMALL: hier=1 up to 8 rows (exact; envs.py).
+    if envs.VLLM_TPU_MK_AR_HIER_SMALL and B <= 8 and t.hier == 2:
+        t = dataclasses.replace(t, hier=1)
     # VLLM_TPU_MK_HIER=N (bench sweeps): override the all-reduce hierarchy.
     hier = os.environ.get("VLLM_TPU_MK_HIER", "")
     if hier:
