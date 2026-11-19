@@ -239,6 +239,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS: int = 8
     VLLM_TPU_PLE_SKIP_IDLE_ROWS: bool = False
     VLLM_TPU_PLE_HISTORY_ROW_KERNEL: bool = False
+    VLLM_TPU_PLE_WRDEFER: str = "0"
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -1270,6 +1271,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gather halts some programs when MSA places that operand in VMEM).
     # Bitwise the XLA gathers.
     "VLLM_TPU_PLE_HISTORY_ROW_KERNEL": env_bool("VLLM_TPU_PLE_HISTORY_ROW_KERNEL"),
+    # q38 PLE-WRDEFER (port of L1's PLE-WRDEFER onto the R form): K > 0 keeps K checkpoint
+    # DMAs in flight in the PLE pool writer (kernels/qwen4_exp/pool.write_region_ring: one
+    # grid step, a ring of K VMEM slots / DMA semaphores) instead of one grid step and one
+    # waited DMA per row. Bitwise (unique positive ids; null ids skipped). 0 = stock writer.
+    # VLLM_TPU_PLE_SKIP_IDLE_ROWS keeps the stock writer. Hashed (changes device programs).
+    "VLLM_TPU_PLE_WRDEFER": env_with_choices(
+        "VLLM_TPU_PLE_WRDEFER", "0", ["0", "1", "2", "4", "8"]
+    ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.

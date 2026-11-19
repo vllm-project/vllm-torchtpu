@@ -349,3 +349,158 @@ def token_checkpoints(x, history, starts, initial, active, ckpt_ids, windowed):
     column = jnp.where(win, jnp.clip(rel, 0, window - 1), 0)
     targets = jnp.where(write, ckpt_ids[req, column], 0)
     return values.reshape(token_count, -1), targets
+
+
+# q38 PLE-WRDEFER on the R form (port of L1's PLE-WRDEFER, q38-L1-plewd 2c0da1bd8, as served on
+# q38-L1-c64-w3 2bc75911f): VLLM_TPU_PLE_WRDEFER = K (default 0 = off, hashed) keeps K checkpoint
+# DMAs in flight. It sits below everything else and rebinds ``write_region`` here, so with the flag
+# unset every line above, and with them the stock writer's Mosaic payload and debug locations, is
+# unchanged; callers resolve ``write_region`` at call time. Only ``skip_idle_source=False`` takes the
+# ring: with VLLM_TPU_PLE_SKIP_IDLE_ROWS (``skip_idle_source=True``) the stock writer runs as before.
+_write_region_stock = write_region
+_WRDEFER_SEEN: set = set()
+
+
+def wrdefer_depth() -> int:
+    """VLLM_TPU_PLE_WRDEFER: checkpoint DMAs the PLE writer keeps in flight (0 = stock writer)."""
+    return int(envs.VLLM_TPU_PLE_WRDEFER or "0")
+
+
+def write_region(pool, values, ids, *, tok0=0, skip_idle_source=False):
+    """Write unique positive manager IDs; idle/null IDs leave all bytes intact.
+
+    The stock writer (one grid step and one waited DMA per row) unless
+    VLLM_TPU_PLE_WRDEFER = K > 0 and ``skip_idle_source`` is off (q38 PLE-WRDEFER):
+    ``write_region_ring``.
+    """
+    depth = wrdefer_depth()
+    if depth and not skip_idle_source:
+        return write_region_ring(pool, values, ids, tok0=tok0, depth=depth)
+    return _write_region_stock(
+        pool, values, ids, tok0=tok0, skip_idle_source=skip_idle_source
+    )
+
+
+def _note_wrdefer(count: int, ntok: int, depth: int) -> None:
+    """Trace-time engagement line, once per traced (rows, region, depth)."""
+    key = (count, ntok, depth)
+    if key in _WRDEFER_SEEN:
+        return
+    _WRDEFER_SEEN.add(key)
+    from vllm_torchtpu.logger import init_logger
+
+    init_logger(__name__).info(
+        "q38 PLE-WRDEFER traced: %d rows x %d pool tokens, %d checkpoint DMAs in flight, "
+        "one grid step",
+        count,
+        ntok,
+        depth,
+    )
+
+
+def _when(condition):
+    """``pl.when`` that also takes a static Python bool (static rows of the ring)."""
+    if isinstance(condition, bool):
+        return (lambda f: f()) if condition else (lambda f: None)
+    return pl.when(condition)
+
+
+def write_region_ring(pool, values, ids, *, tok0=0, depth=4):
+    """``write_region`` with ``depth`` checkpoint DMAs in flight (q38 PLE-WRDEFER).
+
+    One grid step walks the rows. Row ``i`` uses ring slot ``s = i % depth``: its
+    values are DMA'd HBM -> VMEM slot ``s`` (started ``depth`` rows ahead), stored
+    through the same typed view as the stock writer (``typed_ldst.store_typed``) into
+    the slot's pool-layout buffer, and DMA'd to ``pool[ids[i], tok0 : tok0 + ntok]``.
+    Row ``i`` first waits row ``i - depth``'s write (the slot's previous user), and
+    the last ``depth`` writes are drained at the end, so every started DMA is waited
+    exactly once before the kernel returns. Rows with ``ids <= 0`` start and wait
+    nothing and leave every byte intact. Written ids are unique and positive, so no
+    two DMAs touch the same bytes and their completion order cannot change the
+    result: the pool is bitwise the stock writer's. ``depth = 1`` keeps one write in
+    flight (the stock order, plus the read-ahead of the next row's values).
+    """
+    count, elements = values.shape
+    ntok, rows = region_rows(pool, elements, values.dtype)
+    assert tok0 + ntok <= pool.shape[1], "state region exceeds its manager page"
+    if count == 0:
+        return pool
+    depth = max(1, min(int(depth), count))
+    lanes = pool.shape[-1]
+    values = jnp.pad(values, ((0, 0), (0, rows * lanes - elements))).reshape(
+        count, rows, lanes
+    )
+    payload = tuple(pool.shape[2:])
+    _note_wrdefer(count, ntok, depth)
+
+    def kernel(indices, source, old, target, staged, encoded, rsem, wsem):
+        def read(i, slot):
+            return pltpu.make_async_copy(source.at[i], staged.at[slot], rsem.at[slot])
+
+        def write(i, slot):
+            return pltpu.make_async_copy(
+                encoded.at[slot],
+                target.at[indices[i], pl.ds(tok0, ntok)],
+                wsem.at[slot],
+            )
+
+        def row(i, slot):
+            # i: row (traced in the loop, static in the tail); slot = i % depth, static.
+            @_when(i >= depth)
+            def _():
+                @pl.when(indices[i - depth] > 0)
+                def _():
+                    write(i - depth, slot).wait()
+
+            @pl.when(indices[i] > 0)
+            def _():
+                read(i, slot).wait()
+                typed_ldst.store_typed(encoded.at[slot], staged[slot])
+                write(i, slot).start()
+
+            @_when(i + depth < count)
+            def _():
+                @pl.when(indices[i + depth] > 0)
+                def _():
+                    read(i + depth, slot).start()
+
+        for i in range(depth):  # read-ahead of the first ring
+            @pl.when(indices[i] > 0)
+            def _():
+                read(i, i).start()
+
+        def chunk(c, carry):
+            for slot in range(depth):
+                row(c * depth + slot, slot)
+            return carry
+
+        full = count // depth
+        jax.lax.fori_loop(0, full, chunk, 0)
+        for slot in range(count - full * depth):
+            row(full * depth + slot, slot)
+        for i in range(count - depth, count):  # drain
+            @pl.when(indices[i] > 0)
+            def _():
+                write(i, i % depth).wait()
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(1,),
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[
+                pltpu.VMEM((depth, rows, lanes), values.dtype),
+                pltpu.VMEM((depth, ntok) + payload, pool.dtype),
+                pltpu.SemaphoreType.DMA((depth,)),
+                pltpu.SemaphoreType.DMA((depth,)),
+            ],
+        ),
+        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={2: 0},
+        name="q38_ple_wrdefer",
+    )(ids, values, pool)
