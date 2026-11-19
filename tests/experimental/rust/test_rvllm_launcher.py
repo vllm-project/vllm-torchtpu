@@ -275,6 +275,41 @@ def test_the_binary_can_be_provided_via_vllm_tpu_rvllm_binary(run, monkeypatch):
     assert r.execs == [[str(r.rvllm), "proxy", "--port", "8000"]]
 
 
+def _fake_binary(directory):
+    """An executable fake `rvllm` in `directory`."""
+    directory.mkdir()
+    binary = directory / "rvllm"
+    binary.write_text(FAKE_RVLLM)
+    binary.chmod(0o755)
+    return binary
+
+
+def test_the_binary_is_found_on_path(run, tmp_path, monkeypatch):
+    on_path = _fake_binary(tmp_path / "on_path")
+    monkeypatch.setenv("PATH", str(on_path.parent))
+    r = run("proxy", "--port", "8000", binary=None)
+    assert r.execs == [[str(on_path), "proxy", "--port", "8000"]]
+
+
+def test_the_env_var_wins_over_path(run, tmp_path, monkeypatch):
+    on_path = _fake_binary(tmp_path / "on_path")
+    from_env = _fake_binary(tmp_path / "from_env")
+    monkeypatch.setenv("PATH", str(on_path.parent))
+    monkeypatch.setenv("VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", str(from_env))
+    r = run("proxy", binary=None)
+    assert r.execs == [[str(from_env), "proxy"]]
+
+
+def test_the_option_wins_over_the_env_var_and_path(run, tmp_path, monkeypatch):
+    on_path = _fake_binary(tmp_path / "on_path")
+    from_env = _fake_binary(tmp_path / "from_env")
+    from_option = _fake_binary(tmp_path / "from_option")
+    monkeypatch.setenv("PATH", str(on_path.parent))
+    monkeypatch.setenv("VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", str(from_env))
+    r = run("proxy", binary=str(from_option))
+    assert r.execs == [[str(from_option), "proxy"]]
+
+
 def test_the_binary_error_mentions_vllm_tpu_rvllm_binary(run, capsys):
     with pytest.raises(SystemExit):
         run("proxy", binary=None)
@@ -327,6 +362,53 @@ def test_vllm_tpu_use_rust_invalid_bool_raises(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["vllm", "serve", "m"])
     with pytest.raises(ValueError, match="Invalid boolean value 'ture'"):
         maybe_run_experimental_rust()
+
+
+def test_use_rust_with_vllm_rust_frontend_is_an_error(monkeypatch, capsys):
+    from sitecustomize import maybe_run_experimental_rust
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.experimental.rust.launcher.main",
+        lambda argv: pytest.fail("the launcher must not run"),
+    )
+    monkeypatch.setenv("VLLM_TPU_EXPERIMENTAL_USE_RUST", "1")
+    monkeypatch.setenv("VLLM_USE_RUST_FRONTEND", "1")
+    monkeypatch.setattr(sys, "argv", ["vllm", "serve", "m"])
+    with pytest.raises(SystemExit) as e:
+        maybe_run_experimental_rust()
+    assert e.value.code == 2
+    assert "set only one" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("use_rust", [True, False])
+def test_vllm_serve_execs_rvllm_only_with_the_env_var(tmp_path, use_rust):
+    """`vllm serve --help` reaches the fake rvllm only when the env var is set."""
+    rvllm = _fake_binary(tmp_path / "bin")
+    log = tmp_path / "args"
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(
+            [str(ROOT / "src"), os.environ.get("PYTHONPATH", "")]
+        ),
+        "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY": str(rvllm),
+        "FAKE_LOG": str(log),
+    }
+    env.pop("VLLM_USE_RUST_FRONTEND", None)
+    env.pop("VLLM_TPU_EXPERIMENTAL_USE_RUST", None)
+    if use_rust:
+        env["VLLM_TPU_EXPERIMENTAL_USE_RUST"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", "--help"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if use_rust:
+        assert result.returncode == 0, result.stderr
+        assert log.read_text().splitlines() == ["serve", "--help"]
+    else:
+        assert not log.exists(), result.stderr
 
 
 def _publish(tmp_path, binary, sha=None):
