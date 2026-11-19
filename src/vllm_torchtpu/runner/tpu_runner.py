@@ -77,6 +77,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
+from vllm_torchtpu.distributed import expert_placement
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
@@ -5266,6 +5267,9 @@ class TPUModelRunner(GPUModelRunner):
             "Setting TPU quantization config for: %s", self.model_config.quantization
         )
         self.vllm_config.quant_config = get_tpu_quantization_config(self.vllm_config)
+        # Validates a placement table, and refuses a config it cannot serve,
+        # whatever the loader.
+        expert_placement.active(self.vllm_config)
 
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
@@ -5281,6 +5285,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        expert_placement.install(self.model, self.vllm_config)
         if self.is_pooling_model:
             self._resolve_static_pooler()
         if self.parallel_config.pipeline_parallel_size > 1:

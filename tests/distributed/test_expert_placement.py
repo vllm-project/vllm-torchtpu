@@ -101,7 +101,7 @@ def test_identity_table_relabels_nothing():
         assert ident.physical_expert_id(name) == (m and int(m.group(1)))
 
 
-def test_permutation_moves_experts_and_router_rows_together():
+def test_permutation_moves_experts_and_keeps_the_router():
     rng = np.random.default_rng(2)
     slots = {k: rng.permutation(E) for k in LAYERS}
     place = _load(_table(slots))
@@ -110,19 +110,14 @@ def test_permutation_moves_experts_and_router_rows_together():
     assert len(out) == len(ckpt)
     for layer, s in slots.items():
         p = f"model.layers.{layer}.mlp"
-        inv = np.argsort(s)
+        # Routing stays logical: the ids move after the top-k.
         for name in (f"{p}.gate.weight", f"{p}.gate.e_score_correction_bias"):
-            assert torch.equal(out[name], ckpt[name][inv])
+            assert out[name] is ckpt[name]
         for e in range(E):
             src = f"{p}.experts.{e}.down_proj.weight_scale_inv"
             dst = f"{p}.experts.{s[e]}.down_proj.weight_scale_inv"
             assert torch.equal(out[dst], ckpt[src])
             assert place.physical_expert_id(src) == s[e]
-        # Router row p scores the expert loaded as p.
-        for q in range(E):
-            assert torch.equal(
-                out[f"{p}.gate.weight"][q], ckpt[f"{p}.gate.weight"][inv[q]]
-            )
     shared = "model.layers.3.mlp.shared_experts.gate_proj.weight"
     assert out[shared] is ckpt[shared]
     assert (
@@ -169,3 +164,60 @@ def test_table_tool_writes_lpt_of_the_dump(tmp_path):
         )
     with pytest.raises(ValueError, match="dump"):
         ep_place.table_from_stats(dict(stats, format="x"))
+
+
+def test_physical_ids_map_selected_experts_through_the_slots():
+    slots = np.random.default_rng(4).permutation(E)
+    layer = torch.nn.Module()
+    ids = torch.randint(0, E, (5, 3), dtype=torch.int32)
+    assert ep_place.physical_ids(layer, ids) is ids
+    layer.register_buffer(ep_place.SLOTS_ATTR, torch.tensor(slots, dtype=torch.int32))
+    got = ep_place.physical_ids(layer, ids)
+    assert got.dtype == ids.dtype and torch.equal(
+        got, torch.tensor(slots)[ids.long()].int()
+    )
+
+
+def _check_annotated(name, fn, **_kw):
+    """torch_tpu's jax_op reads every operand's type from fn's annotations."""
+    import functools
+    import inspect
+    from unittest.mock import MagicMock
+
+    assert not isinstance(fn, functools.partial), name
+    params = inspect.signature(fn).parameters.values()
+    missing = [p.name for p in params if p.annotation is inspect.Parameter.empty]
+    assert not missing, (name, missing)
+    return MagicMock()
+
+
+def test_ops_handed_to_jax_op_are_fully_annotated(monkeypatch):
+    import jax
+    import vllm.envs
+    from jax.sharding import Mesh
+
+    # moe_routing resolves its simulation strategy at import.
+    monkeypatch.setattr(vllm.envs, "VLLM_MOE_ROUTING_SIMULATION_STRATEGY", "", False)
+    from vllm_torchtpu.layers.adapter import fused_moe_ep, moe_prefill_sp, moe_tp_decode
+
+    monkeypatch.setattr(moe_prefill_sp, "jax_op", _check_annotated)
+    monkeypatch.setattr(fused_moe_ep, "jax_op", _check_annotated)
+    monkeypatch.setattr(moe_tp_decode.pallas, "jax_op", _check_annotated)
+    monkeypatch.setattr(moe_prefill_sp, "_LOAD_OPS", {})
+    monkeypatch.setattr(fused_moe_ep, "_OPS", {})
+    monkeypatch.setattr(moe_tp_decode, "_OPS", {})
+    moe_prefill_sp._build_load_op(8)
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ("d",))
+    fused_moe_ep._build_op(
+        mesh, 8, True, "silu", None, True, has_score_bias=True, has_expert_slots=True
+    )
+    statics = moe_tp_decode._OpStatics(
+        topk=8,
+        routed_scale=1.0,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        use_ep=True,
+        placed=True,
+    )
+    moe_tp_decode._get_op(mesh, statics)

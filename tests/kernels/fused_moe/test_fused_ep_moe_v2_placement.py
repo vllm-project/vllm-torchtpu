@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """A static expert placement (`distributed/expert_placement.py`) only changes
-which core computes each (token, expert) row, so the sequence-parallel fused
-EP op must give bit-identical outputs on a relabelled checkpoint; and the
-expert-load counter must count exactly the routed ids."""
+which core computes each (token, expert) row: with the router in logical order
+and the selected ids moved after the top-k, the sequence-parallel fused EP op
+gives bit-identical outputs on a relabelled checkpoint, exact score ties
+included; and the expert-load counter counts exactly the routed ids."""
 
 import json
 import os
@@ -114,23 +115,53 @@ def _placed_outputs():
         "identity": ExpertPlacement({LAYER: np.arange(e_total)}),
         "random": ExpertPlacement({LAYER: rng.permutation(e_total)}),
     }
-    outs, logits = {}, {}
+    p = f"model.layers.{LAYER}.mlp"
+    # The served router: bf16 logits (cast to f32), and a score bias on a
+    # 0.001 lattice in which experts 2j and 2j + 1 share a value, as many of
+    # the checkpoint's experts do.
+    bias = np.repeat(np.round(rng.standard_normal(e_total // 2) * 100) / 1000, 2)
+    bias = (bias + 3.0).astype(np.float32)
+    ckpt[f"{p}.gate.e_score_correction_bias"] = bias
+    lg = np.array(
+        jnp.dot(x, jnp.asarray(ckpt[f"{p}.gate.weight"], jnp.bfloat16).T).astype(
+            jnp.float32
+        )
+    )
+    # Exact score ties: a row's pick j and its bias twin get the same logit,
+    # j the last pick (a tie across the top-k boundary) on even rows and the
+    # first pick (a tie inside the top-k: slot order) on odd rows.
+    order = np.argsort(-(1 / (1 + np.exp(-lg)) + bias), axis=1, kind="stable")
+    for t in range(lg.shape[0]):
+        j = order[t, TOPK - 1 if t % 2 == 0 else 0]
+        lg[t, j ^ 1] = lg[t, j]
+    scores = np.asarray(jax.nn.sigmoid(jnp.asarray(lg))) + bias
+    top = -np.sort(-scores, axis=1)
+    boundary_ties = int(np.sum(top[:, TOPK - 1] == top[:, TOPK]))
+    inner_ties = int(np.sum(np.any(top[:, : TOPK - 1] == top[:, 1:TOPK], axis=1)))
+    outs = {}
     with (
         patch.object(pltpu, "get_tpu_info", lambda: info),
         pltpu.force_tpu_interpret_mode(),
     ):
-        for name, place in [("none", None), *placements.items()]:
+        arms = [("none", None, False), *((k, v, True) for k, v in placements.items())]
+        # The previous design permuted the router instead (ties then resolve by
+        # physical index): the sensitivity control.
+        arms.append(("router_permuted", placements["random"], False))
+        for name, place, remap in arms:
             loaded = dict(
                 ckpt.items() if place is None else place.relabel(ckpt.items())
             )
-            w1, w2, s1, s2, gate, bias = _operands(loaded, e_total, ep, ep_tp)
-            # The router as served: logits from the (relabelled) gate rows.
-            lg = jnp.dot(x.astype(jnp.float32), jnp.asarray(gate).T)
-            logits[name] = np.asarray(lg)
+            w1, w2, s1, s2, _, _ = _operands(loaded, e_total, ep, ep_tp)
+            gating, score_bias, slots = lg, bias, None
+            if place is not None and remap:
+                slots = jax.device_put(jnp.asarray(place.slots[LAYER], jnp.int32), rep)
+            elif place is not None:
+                inv = np.argsort(place.slots[LAYER])
+                gating, score_bias = lg[:, inv], bias[inv]
             out = fused_ep_moe_v2(
                 jax.device_put(x, sh),
                 *(jax.device_put(jnp.asarray(a), sh) for a in (w1, w2, s1, s2)),
-                jax.device_put(lg, sh),
+                jax.device_put(jnp.asarray(gating), sh),
                 rank=rank,
                 topk=TOPK,
                 renormalize=True,
@@ -138,16 +169,17 @@ def _placed_outputs():
                 capacity=cap,
                 sharded_plan=True,
                 scoring_fn="sigmoid",
-                score_bias=jax.device_put(jnp.asarray(bias), rep),
+                score_bias=jax.device_put(jnp.asarray(score_bias), rep),
+                expert_slots=slots,
                 wire_dtype=jnp.bfloat16,
                 ep_tp_size=ep_tp,
                 eager_push=True,
             )
             outs[name] = np.asarray(jax.block_until_ready(out)).astype(np.float32)
-    inv = np.argsort(placements["random"].slots[LAYER])
     return dict(
-        differs={k: int(np.sum(outs[k] != outs["none"])) for k in placements},
-        logits_permuted=bool(np.array_equal(logits["random"], logits["none"][:, inv])),
+        differs={k: int(np.sum(outs[k] != outs["none"])) for k in outs},
+        boundary_ties=boundary_ties,
+        inner_ties=inner_ties,
         finite=bool(np.isfinite(outs["none"]).all()),
         nonzero=bool(np.abs(outs["none"]).sum() > 0),
     )
@@ -164,10 +196,12 @@ def test_placed_checkpoint_is_bit_identical_to_identity():
     )
     lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
     assert proc.returncode == 0 and lines, proc.stdout[-3000:] + proc.stderr[-3000:]
-    result = json.loads(lines[-1][len("RESULT ") :])
-    assert result["finite"] and result["nonzero"], result
-    assert result["logits_permuted"], result
-    assert result["differs"] == {"identity": 0, "random": 0}, result
+    got = json.loads(lines[-1][len("RESULT ") :])
+    assert got["differs"]["identity"] == 0 and got["differs"]["random"] == 0, got
+    # The forced ties are there, and they do flip a router-permuted layer.
+    assert got["boundary_ties"] > 0 and got["inner_ties"] > 0, got
+    assert got["differs"]["router_permuted"] > 0, got
+    assert got["finite"] and got["nonzero"], got
 
 
 def test_expert_load_counts_equal_a_histogram_of_the_routed_ids():

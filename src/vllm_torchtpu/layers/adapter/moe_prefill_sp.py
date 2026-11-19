@@ -43,7 +43,6 @@ through every tensor either branch reads (`_retain_buffers`, no data read):
 the first access names each buffer the same way in both traces.
 """
 
-import functools
 import inspect
 from itertools import islice
 from typing import Any
@@ -422,6 +421,7 @@ def _moe(mlp: Any, x: torch.Tensor, num_tokens: int, tp: int) -> torch.Tensor:
         router_logits,
         rank,
         experts.e_score_correction_bias,
+        getattr(experts, expert_placement.SLOTS_ATTR, None),
     )
     scale = getattr(mlp, SCALE_ATTR)
     if scale != 1.0:
@@ -577,10 +577,14 @@ def _build_load_op(topk: int) -> Any:
     """The expert-load counter (built at load, outside Dynamo). Its counts
     operand is donated and written back with copy_: an in-place update."""
     if topk not in _LOAD_OPS:
+        # jax_op reads the operand types from these annotations.
+        def count(
+            counts: jax.Array, logits: jax.Array, bias: jax.Array, valid: jax.Array
+        ) -> jax.Array:
+            return router_ops.expert_load_counts(counts, logits, bias, valid, topk=topk)
+
         op = jax_op(
-            f"pallas::moe_expert_load_counts_k{topk}",
-            functools.partial(router_ops.expert_load_counts, topk=topk),
-            donate_argnums=(0,),
+            f"pallas::moe_expert_load_counts_k{topk}", count, donate_argnums=(0,)
         )
         op.register_fake(lambda counts, *_args, **_kw: torch.empty_like(counts))
         _LOAD_OPS[topk] = op
@@ -721,7 +725,9 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
     backbone = _backbone(model)
     tp = get_tensor_model_parallel_world_size()
     extra = vllm_config.additional_config
-    load_stats = isinstance(extra, dict) and extra.get(LOAD_STATS_KEY) is True
+    load_stats = extra.get(LOAD_STATS_KEY, False) if isinstance(extra, dict) else False
+    if not isinstance(load_stats, bool):
+        raise ValueError(f"{LOAD_STATS_KEY} takes true or false; got {load_stats!r}")
     if torch.distributed.get_world_size() != tp:
         raise NotImplementedError("the TP group must be the whole world")
     layers = list(islice(backbone.layers, backbone.start_layer, backbone.end_layer))

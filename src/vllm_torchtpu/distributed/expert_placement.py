@@ -14,12 +14,13 @@
 """Static expert placement: which EP rank holds which routed expert, per layer.
 
 A placement relabels every MoE layer's routed experts as the checkpoint
-streams in. Logical expert `e` of layer `L` is loaded as physical expert
-`slots[L][e]`, and the router's rows (`mlp.gate.weight`) and its score bias
-are permuted the same way, so the model selects the same experts with the same
-weights and each (token, expert) row is computed on the rank that now holds the
-expert. No compiled program changes: every consumer of the router and the
-expert weights (prefill and decode alike) sees one consistent relabelled model.
+streams in: logical expert `e` of layer `L` is loaded as physical expert
+`slots[L][e]`, so each (token, expert) row is computed on the rank that now
+holds the expert. The router (`mlp.gate.weight`) and its score bias keep the
+checkpoint's logical order, so selection, its lowest-index tie rule and the
+slot order inside the top-k are the identity placement's; every consumer of
+the selected ids maps them through the layer's `SLOTS_ATTR` table after the
+top-k (`physical_ids`, the fused EP op's `expert_slots`, moe_tp_decode).
 
 Served with `--additional-config '{"moe_expert_placement": "<table.json>"}'`
 (a TABLE_FORMAT file); without the key nothing here runs. Tables come from the
@@ -30,6 +31,7 @@ dump into a table offline.
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -42,10 +44,12 @@ CONFIG_KEY = "moe_expert_placement"
 TABLE_FORMAT = "vllm_torchtpu.moe_expert_placement.v1"
 STATS_FORMAT = "vllm_torchtpu.moe_expert_load.v1"
 
+# On a placed layer's RoutedExperts: int32 [E], the physical index of each logical
+# expert (`install`).
+SLOTS_ATTR = "_tpu_expert_slots"
+
 _EXPERT = re.compile(r"(^|\.)layers\.(\d+)\.mlp\.experts\.(\d+)\.")
-_ROUTER = re.compile(
-    r"(^|\.)layers\.(\d+)\.mlp\.gate\.(weight|e_score_correction_bias)$"
-)
+_LAYER = re.compile(r"(^|\.)layers\.(\d+)\.")
 
 
 def lpt_slots(rows: np.ndarray, ep_size: int, ep_tp_size: int) -> np.ndarray:
@@ -114,9 +118,11 @@ def write_json(path: str, payload: dict[str, Any]) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class ExpertPlacement:
-    """slots[L][e]: the physical index of logical expert e of MoE layer L."""
+    """slots[L][e]: the physical index of logical expert e of MoE layer L;
+    `digest` is the table file's sha256."""
 
     slots: dict[int, np.ndarray]
+    digest: str = ""
 
     @classmethod
     def from_table(
@@ -127,6 +133,7 @@ class ExpertPlacement:
         moe_layers: Iterable[int],
         ep_size: int,
         ep_tp_size: int,
+        digest: str = "",
     ) -> "ExpertPlacement":
         """Validate a TABLE_FORMAT table against the served model and mesh."""
         want = dict(
@@ -158,7 +165,7 @@ class ExpertPlacement:
             ):
                 raise ValueError(f"layer {key}: slots are not a permutation of 0..E-1")
             slots[int(key)] = s.astype(np.int64)
-        return cls(slots)
+        return cls(slots, digest)
 
     def physical_expert_id(self, name: str) -> int | None:
         """The physical expert a checkpoint tensor loads as, or None."""
@@ -170,23 +177,21 @@ class ExpertPlacement:
         return expert if slots is None else int(slots[expert])
 
     def relabel(self, weights: Iterable[tuple[str, Any]]) -> Iterator[tuple[str, Any]]:
-        """The checkpoint stream with every placed layer relabelled: expert
-        tensors renamed to their physical index, router rows and score bias
-        permuted to physical order (row p = logical expert inverse[p])."""
-        inverse = {layer: np.argsort(s) for layer, s in self.slots.items()}
+        """The checkpoint stream with every placed layer's expert tensors
+        renamed to their physical index (weights and scales alike); the router
+        and its score bias stream unchanged."""
         for name, tensor in weights:
             m = _EXPERT.search(name)
             if m is not None and int(m.group(2)) in self.slots:
                 p = self.slots[int(m.group(2))][int(m.group(3))]
                 name = f"{name[: m.start(3)]}{p}{name[m.end(3) :]}"
-            else:
-                m = _ROUTER.search(name)
-                if m is not None and int(m.group(2)) in inverse:
-                    tensor = tensor[inverse[int(m.group(2))]]
+                _RELABELLED.add(self.digest)
             yield name, tensor
 
 
 _PLACEMENT: dict[str, ExpertPlacement] = {}
+# Digests of the placements a weight stream was relabelled by.
+_RELABELLED: set[str] = set()
 
 
 def moe_layer_indices(hf_config: Any) -> list[int]:
@@ -214,6 +219,7 @@ def active(vllm_config: Any) -> ExpertPlacement | None:
 
 
 def _load(vllm_config: Any, path: str) -> ExpertPlacement:
+    from vllm_torchtpu import envs
     from vllm_torchtpu.layers.adapter import moe_hierarchical
 
     parallel, load = vllm_config.parallel_config, vllm_config.load_config
@@ -229,19 +235,88 @@ def _load(vllm_config: Any, path: str) -> ExpertPlacement:
         "assumes the linear expert placement strategy": (
             parallel.expert_placement_strategy != "linear"
         ),
+        # Kernels that select experts inside and take no slots table.
+        "is not taken by the fused EP MoE kernel (USE_MOE_FUSED_EP_KERNEL)": (
+            envs.USE_MOE_FUSED_EP_KERNEL
+        ),
+        "is not taken by FUSED_MOE_DECODE_KERNEL": envs.FUSED_MOE_DECODE_KERNEL,
     }
     bad = [why for why, hit in refusals.items() if hit]
     if bad:
         raise NotImplementedError(f"{CONFIG_KEY} " + "; ".join(bad) + ".")
-    with open(path) as f:
-        table = json.load(f)
+    with open(path, "rb") as f:
+        raw = f.read()
     return ExpertPlacement.from_table(
-        table,
+        json.loads(raw),
         num_experts=vllm_config.model_config.get_num_experts(),
         moe_layers=moe_layer_indices(vllm_config.model_config.hf_config),
         ep_size=parallel.tensor_parallel_size,
         ep_tp_size=moe_hierarchical.ep_tp_size(),
+        digest=hashlib.sha256(raw).hexdigest(),
     )
+
+
+def physical_ids(layer: Any, topk_ids: Any) -> Any:
+    """`topk_ids` (selected logical experts, any shape) as the physical
+    experts `layer` holds them at; unchanged on a layer without a placement."""
+    slots = getattr(layer, SLOTS_ATTR, None)
+    if slots is None:
+        return topk_ids
+    flat = topk_ids.reshape(-1).to(slots.dtype)
+    return slots.index_select(0, flat).view(topk_ids.shape).to(topk_ids.dtype)
+
+
+def install(model: Any, vllm_config: Any) -> int:
+    """After the weights load, on every rank: stage each placed layer's slots
+    table as SLOTS_ATTR on its RoutedExperts module and check that this rank's
+    stream was relabelled and that every rank serves the same table. Returns
+    the number of placed layers (0 without the key). Collective over the TP
+    group when the key is set."""
+    placement = active(vllm_config)
+    if placement is None:
+        return 0
+    import torch
+    from vllm.distributed import get_tp_group
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    from vllm_torchtpu.logger import init_logger
+
+    digests: list[Any] = [None] * torch.distributed.get_world_size(
+        get_tp_group().cpu_group
+    )
+    torch.distributed.all_gather_object(
+        digests, placement.digest, group=get_tp_group().cpu_group
+    )
+    if len(set(digests)) != 1:
+        raise RuntimeError(f"{CONFIG_KEY}: the ranks serve different tables {digests}")
+    if placement.digest not in _RELABELLED:
+        raise RuntimeError(f"{CONFIG_KEY}: the weight stream was not relabelled")
+    placed = 0
+    for module in model.modules():
+        if not isinstance(module, RoutedExperts):
+            continue
+        m = _LAYER.search(module.layer_name)
+        slots = None if m is None else placement.slots.get(int(m.group(2)))
+        if slots is None:
+            continue
+        table = torch.tensor(slots, dtype=torch.int32, device=module.w13_weight.device)
+        module.register_buffer(SLOTS_ATTR, table, persistent=False)
+        placed += 1
+    if placed != len(placement.slots):
+        raise RuntimeError(
+            f"{CONFIG_KEY}: {placed} routed-expert layers matched the table's "
+            f"{len(placement.slots)}"
+        )
+    moved = sum(int(np.sum(s != np.arange(s.size))) for s in placement.slots.values())
+    init_logger(__name__).info(
+        "%s: %s (sha256 %s) applied to %d layers, %d expert slots moved",
+        CONFIG_KEY,
+        vllm_config.additional_config[CONFIG_KEY],
+        placement.digest,
+        placed,
+        moved,
+    )
+    return placed
 
 
 def main(argv: list[str] | None = None) -> None:

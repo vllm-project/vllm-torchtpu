@@ -49,6 +49,7 @@ import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import jax_op
+from vllm_torchtpu.distributed import expert_placement
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
@@ -180,8 +181,11 @@ def _build_op(
     wire_dtype=None,
     ep_tp_size: int = 1,
     eager_push: bool = False,
+    has_expert_slots: bool = False,
 ):
-    """The op for this closure, built once per distinct closure and reused."""
+    """The op for this closure, built once per distinct closure and reused.
+    `has_expert_slots`: the op takes the layer's expert placement table after
+    the score bias (`fused_ep_moe_v2`'s expert_slots)."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
     key = (
@@ -200,6 +204,7 @@ def _build_op(
         wire_dtype,
         ep_tp_size,
         eager_push,
+        has_expert_slots,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -304,7 +309,32 @@ def _build_op(
             hash_topk_ids=hash_ids.astype(jnp.int32),
         )
 
+    def moe_placed(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        score_bias: jax.Array,
+        expert_slots: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            score_bias=score_bias.astype(jnp.float32),
+            expert_slots=expert_slots,
+        )
+
     assert not (has_score_bias and has_hash_ids)
+    if has_expert_slots and not has_score_bias:
+        raise NotImplementedError("an expert placement needs a score-bias router")
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
     # every shard for its own tokens, so it is replicated where the other
@@ -317,6 +347,7 @@ def _build_op(
     input_specs = (
         (spec,) * 7
         + ((PartitionSpec(),) if has_score_bias else ())
+        + ((PartitionSpec(),) if has_expert_slots else ())
         + ((spec,) if has_hash_ids else ())
     )
     # Stock jax_op. It used to size its outputs from the export's avals, where
@@ -325,7 +356,9 @@ def _build_op(
     # JaxCallable with that one line replaced, was the way around it. Torchtpu
     # takes output_partition_specs itself now, which is the same information
     # without a copy of anyone's source.
-    if has_score_bias:
+    if has_expert_slots:
+        fn = moe_placed
+    elif has_score_bias:
         fn = moe_with_score_bias
     elif has_hash_ids:
         fn = moe_with_hash_ids
@@ -781,6 +814,7 @@ def build_sequence_parallel_op(layer, topk: int, renormalize: bool, activation: 
         # as soon as it is staged keeps that link busy from the first visit
         # on. Same rows, same arrival offsets: bit-identical outputs.
         eager_push=wire_dtype is not None,
+        has_expert_slots=getattr(layer, expert_placement.SLOTS_ATTR, None) is not None,
     )
 
 
@@ -800,16 +834,18 @@ def run_sequence_parallel_op(
     router_logits: torch.Tensor,
     rank: torch.Tensor,
     score_bias: torch.Tensor | None,
+    expert_slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """`op` (from `build_sequence_parallel_op`) on this rank's own rows; the
     result is this rank's rows combined over every expert, unscaled by the
-    runner's routed scale. `score_bias` must be passed exactly when the layer
-    has one (the op's arity was built around it)."""
+    runner's routed scale. `score_bias` and `expert_slots` (the layer's
+    `expert_placement.SLOTS_ATTR`) must be passed exactly when the layer has
+    them (the op's arity was built around them)."""
     scales = (
         _squeeze_channel_scale_checked(w1_scale),
         _squeeze_channel_scale_checked(w2_scale),
     )
-    extra = () if score_bias is None else (score_bias,)
+    extra = tuple(t for t in (score_bias, expert_slots) if t is not None)
     return op(hidden_states, w1, w2, *scales, router_logits, rank, *extra)
 
 
