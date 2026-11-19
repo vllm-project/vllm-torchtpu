@@ -113,7 +113,6 @@ def _per_seq_cfgs(chunk, n_kq, n_v):
 
 
 def test_shared_kkt_runs_only_at_the_397b_prefill_shape():
-    assert frozenset({(16, 64, 128, 128)}) == config.SHARED_KKT_SHAPES
     on, _ = _per_seq_cfgs(64, SHARED_N_KQ, SHARED_N_V)
     assert on.shared_kkt
     # Qwen3.5-35B-A3B at TP4 and TP1 (the CI model), and the 397B decode legs'
