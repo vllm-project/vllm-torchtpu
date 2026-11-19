@@ -142,7 +142,6 @@ def plain_step_runner(logits: torch.Tensor) -> SimpleNamespace:
         _repetition_penalty=repetition_penalty.RepetitionPenaltyTracker(
             logits.shape[1],
             max(8, logits.shape[0]),
-            async_scheduling=False,
             speculative_decoding=False,
         ),
     )

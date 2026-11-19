@@ -86,7 +86,7 @@ def _runner(seen, speculative=False):
             _reasoning_config(), max_num_reqs=PADDINGS[-1], device=torch.device("cpu")
         ),
         _repetition_penalty=repetition_penalty_tracker.RepetitionPenaltyTracker(
-            4, PADDINGS[-1], async_scheduling=False, speculative_decoding=False
+            4, PADDINGS[-1], speculative_decoding=False
         ),
     )
     # The real helper; without a speculative config it yields no verify rows.
