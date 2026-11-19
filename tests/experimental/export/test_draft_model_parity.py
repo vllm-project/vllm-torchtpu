@@ -226,6 +226,11 @@ def _runner_bound_draft_impl(draft_tp: int) -> Any:
     runner.model = None
     runner.mesh = MagicMock()
     runner.vllm_config = MagicMock()
+    # A single-stage target: on a tp=1 pipeline stage a tp=1 draft shares the
+    # target's kernel instead.
+    runner.parallel_config = SimpleNamespace(
+        tensor_parallel_size=8, pipeline_parallel_size=1
+    )
     runner.drafter = SimpleNamespace(_draft_attn_layer_names={"draft.0"})
     runner.speculative_config = SimpleNamespace(draft_tensor_parallel_size=draft_tp)
     with (
