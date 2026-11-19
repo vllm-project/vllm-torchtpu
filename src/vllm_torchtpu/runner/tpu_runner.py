@@ -826,6 +826,16 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 #      gather_logprobs) so _dummy_run and execute_model trace identically.
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
+# q38 BLSTACK-RFIX: per-process count of the prefill-only padding strip (TPUModelRunner._strip_prefill_only_padding).
+# Host Python only (no env key, no traced code); touched only when a request is trimmed.
+_PREFILL_ONLY_STRIP = {"requests": 0, "rows": 0}
+
+
+def _prefill_only_strip_log_due(requests: int) -> bool:
+    """Log the running strip count at 1, 2, 4, ... 1024 trimmed requests, then every 1024."""
+    return requests > 0 and (requests & (requests - 1) == 0 or requests % 1024 == 0)
+
+
 class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
     drafter: NgramProposer | DFlashProposer | Eagle3Proposer | None
@@ -4082,6 +4092,59 @@ class TPUModelRunner(GPUModelRunner):
             device="cpu",
         )
 
+    def _strip_prefill_only_padding(self, scheduler_output: "SchedulerOutput") -> int:
+        """Drop draft-placeholder rows that vLLM padded onto a final prompt token (prefill-only MTP).
+
+        Applies only to a request whose placeholders are all -1 and whose step would cross the prompt by
+        exactly those rows. Returns how many requests were trimmed.
+        """
+        spec = getattr(scheduler_output, "scheduled_spec_decode_tokens", None)
+        if not spec:
+            return 0
+        info: dict[str, tuple[int, int | None]] = {}
+        for nrd in getattr(scheduler_output, "scheduled_new_reqs", None) or ():
+            prompt_ids = getattr(nrd, "prompt_token_ids", None)
+            info[nrd.req_id] = (
+                int(nrd.num_computed_tokens),
+                len(prompt_ids) if prompt_ids is not None else None,
+            )
+        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached is not None:
+            for req_id, computed in zip(
+                getattr(cached, "req_ids", ()) or (), getattr(cached, "num_computed_tokens", ()) or ()
+            ):
+                idx = self.input_batch.req_id_to_index.get(req_id)
+                prompt = int(self.input_batch.num_prompt_tokens[idx]) if idx is not None else None
+                info[req_id] = (int(computed), prompt)
+        trimmed = 0
+        for req_id, drafts in list(spec.items()):
+            if not drafts or any(int(t) != -1 for t in drafts):
+                continue
+            n = scheduler_output.num_scheduled_tokens.get(req_id)
+            computed, prompt = info.get(req_id, (None, None))
+            if n is None or computed is None or prompt is None:
+                continue
+            if computed + n > prompt and computed + n - len(drafts) <= prompt:
+                scheduler_output.num_scheduled_tokens[req_id] = n - len(drafts)
+                scheduler_output.total_num_scheduled_tokens -= len(drafts)
+                del spec[req_id]
+                trimmed += 1
+                logger.warning_once(
+                    "Prefill-only MTP: dropped %d draft-placeholder row(s) padded onto the final prompt "
+                    "token of request %s (num_computed_tokens=%d, num_prompt_tokens=%d).",
+                    len(drafts), req_id, computed, prompt,
+                )
+                # q38 BLSTACK-RFIX: how often the strip fires (warning_once shows only the first), host only.
+                _PREFILL_ONLY_STRIP["requests"] += 1
+                _PREFILL_ONLY_STRIP["rows"] += len(drafts)
+                if _prefill_only_strip_log_due(_PREFILL_ONLY_STRIP["requests"]):
+                    logger.info(
+                        "Prefill-only MTP padding strip: %d request(s), %d draft-placeholder row(s) trimmed in "
+                        "this process so far",
+                        _PREFILL_ONLY_STRIP["requests"], _PREFILL_ONLY_STRIP["rows"],
+                    )
+        return trimmed
+
     @torch.no_grad()
     @_pp_step
     def execute_model(
@@ -4097,6 +4160,11 @@ class TPUModelRunner(GPUModelRunner):
         host_phases.begin_step()
         if host_admit_probe.ENABLED:
             host_admit_probe.runner_step(self, scheduler_output)
+        if self._mtp_prefill_only:
+            # Port of the IX prefill-kernel agent's fix 69c56a021 (vllm-torchtpu #3079; q38 BLSTACK-RFIX onto Benliang
+            # Wang's tree): drop the all -1 draft-placeholder rows vLLM pads onto a final prompt token, before the states
+            # absorb them and before the prefill-only refusal below would raise on them (F2 prefill under load).
+            self._strip_prefill_only_padding(scheduler_output)
         # Update cached state
         self._update_states(scheduler_output)
         host_phases.mark("update_states")
@@ -7806,6 +7874,13 @@ class TPUModelRunner(GPUModelRunner):
         one forward alone has none, so each stage settles the burst right
         after each forward; those launches carry the prefill on to the last
         stage, whose forward waits for it.
+
+        With TPU_PP_MTP_WARMUP_BARRIER the stages also meet at the host
+        barrier of ``_pp_warmup_barrier`` before each prompt length. The last
+        stage cold-compiles its draft inside the first one, after it has
+        posted that step's receive; without the barrier the stages ahead of
+        it send the next prompt's hand-off and wait for its receive on the
+        ring's cross-host descriptor, whose store times out after 300 s.
         """
         if not envs.SPEC_WARMUP:
             return
@@ -7831,6 +7906,11 @@ class TPUModelRunner(GPUModelRunner):
             for P in prompt_lens:
                 if pipeline:
                     assert self._pp_wave is not None
+                    if envs.TPU_PP_MTP_WARMUP_BARRIER:
+                        # q38 HIGHC-PPRING: every stage has finished the previous
+                        # prompt, the last stage's draft compile included, before
+                        # any stage sends this one's hand-off (x1c r j-ab73d6ff).
+                        self._pp_warmup_barrier(f"MTP prefill warmup P={P}")
                     try:
                         warmed = self._warmup_one_mtp_prefill(P)
                     finally:
@@ -7963,6 +8043,8 @@ class TPUModelRunner(GPUModelRunner):
         own.
         """
         assert self._pp_wave is not None
+        if envs.TPU_PP_WARMUP_BARRIER:
+            self._pp_warmup_barrier()
         started = time.perf_counter()
         for num_tokens in self.num_tokens_paddings:
             self._dummy_run(
@@ -7987,6 +8069,32 @@ class TPUModelRunner(GPUModelRunner):
         logger.info(
             "Pipeline hand-off warmup: %d buckets in %.1f s",
             len(self.num_tokens_paddings),
+            time.perf_counter() - started,
+        )
+
+    def _pp_warmup_barrier(self, what: str = "hand-off warmup") -> None:
+        """Meet every pipeline stage before the hand-off warmup
+        (TPU_PP_WARMUP_BARRIER), or before one prompt length of the MTP
+        prefill warmup (TPU_PP_MTP_WARMUP_BARRIER); ``what`` names it in
+        the log line.
+
+        Each stage compiles its standalone forwards on its own, so stages
+        reach the hand-off warmup as far apart as their compile times. The
+        warmup's first transfer then waits on the ring's cross-host
+        descriptor, whose store times out after 300 s. A barrier on the
+        world group's CPU (gloo) group, after this stage's device work has
+        drained, absorbs that skew under the process group's own timeout,
+        so the warmup starts with every stage compiled.
+        """
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import get_world_group
+
+        started = time.perf_counter()
+        synchronize_device()
+        dist.barrier(group=get_world_group().cpu_group)
+        logger.info(
+            "Pipeline %s barrier: waited %.1f s for the other stages",
+            what,
             time.perf_counter() - started,
         )
 

@@ -180,6 +180,19 @@ def draft_kv_enabled() -> bool:
     return bool(envs.QWEN4_EXP_PD_DRAFT_KV)
 
 
+def draft_kv_split_keys_enabled() -> bool:
+    """QWEN4_EXP_PD_DRAFT_KV_SPLIT_KEYS (q38 BLSTACK-R; envs; read directly
+    when this module is loaded by path, without the package)."""
+    try:
+        from vllm_torchtpu import envs
+    except ImportError:
+        import os
+
+        value = os.environ.get("QWEN4_EXP_PD_DRAFT_KV_SPLIT_KEYS", "").strip().lower()
+        return value in ("1", "true", "yes", "on")
+    return bool(envs.QWEN4_EXP_PD_DRAFT_KV_SPLIT_KEYS)
+
+
 def fast_admit() -> bool:
     """QWEN4_EXP_PD_FAST_ADMIT (envs; read directly when this module is loaded
     by path, without the package)."""
@@ -291,10 +304,16 @@ def check_draft_kv(missing, dst_owners, main_dcp: int, main_dcp_owners) -> None:
             "QWEN4_EXP_PD_ZERO_DRAFT_KV=1 would zero the draft KV that "
             "QWEN4_EXP_PD_DRAFT_KV=1 lands; unset one of them"
         )
-    if any(name.endswith(".compressed_k") for name in main_dcp_owners):
+    if any(
+        name.endswith(".compressed_k") for name in main_dcp_owners
+    ) and not draft_kv_split_keys_enabled():
         # The staged landing splits compressed keys for a decode-only draft
         # (whose owners have no producer pages); F2's landed draft keys and
         # their draft-gap zero-fill are not validated split.
+        # QWEN4_EXP_PD_DRAFT_KV_SPLIT_KEYS=1 (q38 BLSTACK-R) admits them: every
+        # landing planner splits each compressed owner by _split_rank, the
+        # draft's included, and routes the draft gap through the same split
+        # pair tokens (indices, _routed_indices, _routed_indices_shared_rows).
         raise ValueError(
             "QWEN4_EXP_PD_DRAFT_KV=1 refuses VLLM_TPU_QSA_COMPRESSED_DCP=1: split "
             "compressed keys land for a decode-only draft only"
@@ -1799,6 +1818,19 @@ class StagedConsumer:
                 missing, self._dst_owner, rank.main_dcp,
                 getattr(decode_layout, "main_dcp_owners", ()),
             )
+            if draft_kv_split_keys_enabled():
+                # Engagement (QWEN4_EXP_PD_DRAFT_KV_SPLIT_KEYS): once per rank,
+                # the F2 draft compressed-key owners this rank lands split.
+                split_draft = sorted(
+                    n for n in self._dcp_owners
+                    if n.startswith("mtp.") and owner_kind(n) == "compressed"
+                )
+                if split_draft:
+                    logger.info(
+                        "Qwen PD F2 draft KV split keys: rank %d lands %s split over "
+                        "DCP %d (QWEN4_EXP_PD_DRAFT_KV_SPLIT_KEYS)",
+                        rank.tp_rank, split_draft, rank.main_dcp,
+                    )
         elif any(not n.startswith("mtp.") for n in missing):
             raise ValueError(f"Qwen PD staging lacks producer pages for {sorted(missing)}")
         # QWEN4_EXP_PD_ZERO_DRAFT_KV=1: the repack also writes zeros over the
