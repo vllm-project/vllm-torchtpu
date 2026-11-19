@@ -230,7 +230,16 @@ def test_every_decision_row_has_collapsed_number_ledger() -> None:
         n_rows = len(sweep.regimes)
         assert html_out.count('<tr class="ledger-row">') == n_rows
         assert html_out.count("<summary>Numbers behind this row:") == n_rows
-        assert html_out.count('<th class="tabular">Estimate (us)</th>') == n_rows
+        ledger_blocks = re.findall(
+            r'<tr class="ledger-row">.*?</details></td></tr>',
+            html_out,
+            flags=re.DOTALL,
+        )
+        assert len(ledger_blocks) == n_rows
+        assert all(
+            block.count('<th class="tabular">Peak Floor (us)</th>') == 1
+            for block in ledger_blocks
+        )
         for row in sweep.regimes:
             assert {scope["scope"] for scope in row.scopes} == {
                 "per_op",
@@ -418,8 +427,16 @@ def test_regime_table_surfaces_pct_headroom_and_low_roi_tag() -> None:
     assert sat_entry.fastest_scope == "whole_step"
     assert sat_entry.recommended_moe_mode == "grouped_on_chip"
     assert long_prefill.recommended_scope == "per_op"
-    assert long_prefill.fastest_scope == "single_layer"
-    assert long_prefill.recommended_moe_mode == "grouped_on_chip"
+    # Block-scaled FP8 weights make one 4096-token single-layer call slower
+    # than per_op, so the long prefill has no faster fused candidate.
+    assert long_prefill.fastest_scope == "per_op"
+    assert long_prefill.recommended_moe_mode == "grouped_in_hbm"
+    preset_window = next(
+        entry for label, entry in by_label.items() if "Preset Prefill Window" in label
+    )
+    assert preset_window.recommended_scope == "per_op"
+    assert preset_window.fastest_scope == "single_layer"
+    assert preset_window.recommended_moe_mode == "grouped_on_chip"
 
     table_txt = advisor.format_regime_table(sweep)
     assert "% vs per_op)" in table_txt
