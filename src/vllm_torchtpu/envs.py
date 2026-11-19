@@ -1229,7 +1229,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (layers/adapter/moe_tp_decode_nvfp4.py). Also clamps
     # MOE_REQUANTIZE_BLOCK_SIZE per matrix on non-EP-fused NVFP4 MoE layers
     # (b13=512, b2=min(512, I_rank): 512/512 at EP2xTP4, 512/256 at TP8) so TP
-    # slices narrower than the block stay unpadded. Needs
+    # slices narrower than the block stay unpadded. FP8-checkpoint layers that
+    # MOE_REQUANTIZE_WEIGHT_DTYPE=fp4 requantizes are served too: where they
+    # will arm, the loader keeps their FP4 native (unpacked) with the same
+    # per-matrix blocks (512/256 at EP2xTP8). Needs
     # TPU_MOE_SKIP_PADDED_TOKENS=1. Remove once the path is the default for
     # these layers or is folded into moe_tp_decode.
     "USE_MOE_TP_DECODE_NVFP4_KERNEL": env_bool("USE_MOE_TP_DECODE_NVFP4_KERNEL"),

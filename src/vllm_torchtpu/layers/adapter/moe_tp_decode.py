@@ -286,7 +286,7 @@ def _admit_common(
     runner: Any,
     n_ranks: int,
     *,
-    quant_cls: type,
+    quant_cls: type | tuple[type, ...],
     pre_check: Callable[[], str | None],
     get_scales: Callable[[Any], tuple[Any, Any] | str],
     row_buckets: tuple[int, ...],
@@ -317,8 +317,10 @@ def _admit_common(
     qm = layer.quant_method
     cfg = runner.moe_config
     par = cfg.moe_parallel_config
-    if type(qm) is not quant_cls:
-        return f"quant method {type(qm).__name__} is not {quant_cls.__name__}"
+    classes = quant_cls if isinstance(quant_cls, tuple) else (quant_cls,)
+    if type(qm) not in classes:
+        names = " / ".join(c.__name__ for c in classes)
+        return f"quant method {type(qm).__name__} is not {names}"
     if qm._tpu_activation_str != "silu":
         return f"activation {qm._tpu_activation_str!r} is not silu"
     if qm._use_adaptive_fused_moe or fused_moe_ep_supported(qm):

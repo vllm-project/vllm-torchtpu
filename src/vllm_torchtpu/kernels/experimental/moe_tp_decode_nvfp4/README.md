@@ -72,7 +72,11 @@ def moe_tp_decode_nvfp4(
 
 `layers/adapter/moe_tp_decode_nvfp4.py` arms eligible `VllmNvfp4MoEMethod`
 layers after model load when `USE_MOE_TP_DECODE_NVFP4_KERNEL=1` and
-`TPU_MOE_SKIP_PADDED_TOKENS=1`:
+`TPU_MOE_SKIP_PADDED_TOKENS=1`. It arms `VllmFp8MoEMethodTPU` layers of an FP8
+checkpoint too when `MOE_REQUANTIZE_WEIGHT_DTYPE=fp4` requantizes their experts:
+for a layer that will arm (judged before requantizing), the loader keeps the
+FP4 weights native instead of packed and clamps the block per matrix, which
+gives the kernel's operands exactly (scales held as `w*_weight_scale_inv`):
 
 - **Decode (`n <= 64`):** `n in (16, 32, 64)` calls `moe_tp_decode_nvfp4`
   directly; `n < 16` pads `x` and `scores` to `m = 16`, runs the `m = 16`
@@ -81,9 +85,10 @@ layers after model load when `USE_MOE_TP_DECODE_NVFP4_KERNEL=1` and
   (`fused_moe_func` -> `gmm_v2` W4A16 + online-FP8 shared expert + `lax.psum`)
   inside the same custom op on the same K-major FP4 weights and 4D block scales,
   with zero weight duplication.
-- **Drafter / non-NVFP4 layers:** layers that do not use `VllmNvfp4MoEMethod`
-  (such as GLM-5.2's BF16 MTP drafter layer 78) are refused by `_admit` and
-  keep their existing execution path. When `USE_MOE_TP_DECODE_NVFP4_KERNEL=0`
+- **Drafter / other layers:** layers whose routed experts are not FP4 in this
+  layout (such as GLM-5.2's BF16 MTP drafter layer 78, or FP8-method layers
+  kept in FP8 or packed FP4) are refused by `_admit` and keep their existing
+  execution path. When `USE_MOE_TP_DECODE_NVFP4_KERNEL=0`
   (the default), weight loading, custom-op dispatch, and HLO renders are
   unchanged. Although this kernel quantizes routed-expert decode activations to
   FP8 (W4A8) where `_tp_chain` (`gmm_v2`) keeps BF16 activations (W4A16), 5-shot

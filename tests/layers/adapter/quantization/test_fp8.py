@@ -1303,6 +1303,44 @@ class TestInt8MoERequantization:
         assert err_lsb.max().item() <= 0.5 + 1e-4
 
 
+def _native_fp4_values(w):
+    """[E, K, N] float32 values of a float4_e2m1fn_x2 [E, K, N/2] weight (the
+    pair of each byte along N)."""
+    import jax
+    import numpy as np
+
+    u8 = jnp.asarray(w.view(torch.uint8).numpy())
+    fp4 = jax.lax.bitcast_convert_type(u8, jnp.float4_e2m1fn)
+    return np.asarray(fp4.astype(jnp.float32)).reshape(*w.shape[:2], -1)
+
+
+def _kblock_fp4_reference(param, scale, block):
+    """The dequantized FP8 checkpoint weight [E, N, K] quantized to FP4 per
+    `block` elements of K in that orientation (absmax / 6 scales, as XLA
+    rounds them), laid out K-major: values [E, K, N] and scales
+    [E, K / block, 1, N], float32."""
+    import jax
+    import numpy as np
+
+    from vllm_torchtpu.layers.core.quantization import dequantize_tensor
+
+    @jax.jit
+    def quantize(w):
+        e, n, k = w.shape
+        blocks = w.reshape(e, n, k // block, block)
+        s = jnp.max(jnp.abs(blocks), axis=-1, keepdims=True) / 6.0
+        inv = jnp.where(s == 0, 0.0, 1.0 / s)
+        q = jnp.clip(blocks * inv, -6.0, 6.0).astype(jnp.float4_e2m1fn)
+        return q.astype(jnp.float32).reshape(e, n, k), s[..., 0]
+
+    w = dequantize_tensor(param.data, scale.data, axis=(1, 2), out_dtype=torch.float32)
+    vals, s = quantize(jnp.asarray(w.numpy()))
+    return (
+        np.asarray(vals).transpose(0, 2, 1),
+        np.asarray(s).transpose(0, 2, 1)[:, :, None, :],
+    )
+
+
 def _cpu_jax_op(_name, fn, **_kwargs):
     """`pallas.jax_op` on CPU: the JAX function on numpy views of the tensors."""
     import jax
@@ -1356,9 +1394,9 @@ class TestFp4MoERequantization:
         monkeypatch.setenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "fp4")
         monkeypatch.delenv("MOE_REQUANTIZE_BLOCK_SIZE", raising=False)
 
-    def _layer(self):
+    def _layer(self, inter=INTER, H=H):
         gen = torch.Generator().manual_seed(0)
-        E, inter, H, B = self.E, self.INTER, self.H, self.BLOCK
+        E, B = self.E, self.BLOCK
         layer = FakeFusedMoELayer(
             (torch.randn(E, 2 * inter, H, generator=gen) * 40).to(torch.float8_e4m3fn),
             (torch.randn(E, H, inter, generator=gen) * 40).to(torch.float8_e4m3fn),
@@ -1382,10 +1420,8 @@ class TestFp4MoERequantization:
             vals = np.asarray(fp4.astype(jnp.float32)).reshape(
                 w.shape[0], -1, w.shape[2]
             )
-        else:  # float4_e2m1fn_x2 [E, K, N/2], the pair of each byte along N
-            u8 = jnp.asarray(w.view(torch.uint8).numpy())
-            fp4 = jax.lax.bitcast_convert_type(u8, jnp.float4_e2m1fn)
-            vals = np.asarray(fp4.astype(jnp.float32)).reshape(*w.shape[:2], -1)
+        else:
+            vals = _native_fp4_values(w)
         block = vals.shape[1] // scale.shape[1]
         return vals * np.repeat(scale[:, :, 0, :].float().numpy(), block, axis=1)
 
@@ -1433,6 +1469,80 @@ class TestFp4MoERequantization:
             got = self._unpack_kmajor(got_w, got_s, packed=not fused_ep_w4a8)
             rel_err = np.linalg.norm(got - want) / np.linalg.norm(want)
             assert rel_err < 0.22
+
+    @pytest.mark.parametrize(
+        "inter, w2_block",
+        [
+            pytest.param(256, 256, id="ep2xtp8-shard"),
+            pytest.param(512, 512, id="ep2xtp4-shard"),
+        ],
+    )
+    def test_moe_tp_decode_fp4_layout(self, monkeypatch, inter, w2_block):
+        """With USE_MOE_TP_DECODE_NVFP4_KERNEL an admitted layer gets the layout
+        moe_tp_decode_nvfp4 reads: native FP4, w13 at block 512 and w2 at
+        min(512, I). Block 512 alone cannot tile the EP2xTP8 shard's I = 256.
+        The values are those of a K-blocked quantization of the checkpoint in
+        its own [E, N, K] orientation."""
+        import numpy as np
+
+        from vllm_torchtpu.layers.adapter import moe_tp_decode_nvfp4
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            _process_fp8_moe_weights,
+        )
+
+        prechecks = []
+
+        def admit(layer, *, requant_block):
+            prechecks.append(requant_block)
+
+        monkeypatch.setattr(moe_tp_decode_nvfp4, "precheck_admission", admit)
+        monkeypatch.setenv("USE_MOE_TP_DECODE_NVFP4_KERNEL", "1")
+        layer = self._layer(inter=inter, H=1024)
+
+        w13, w13_scale, w2, w2_scale, _, block_size = _process_fp8_moe_weights(
+            layer, weight_block_size=(self.BLOCK, self.BLOCK), activation="silu"
+        )
+
+        assert prechecks == [512] and block_size == 512
+        for got_w, got_s, param, scale, block in (
+            (w13, w13_scale, layer.w13_weight, layer.w13_weight_scale_inv, 512),
+            (w2, w2_scale, layer.w2_weight, layer.w2_weight_scale_inv, w2_block),
+        ):
+            assert got_w.dtype == torch.float4_e2m1fn_x2
+            want_vals, want_scale = _kblock_fp4_reference(param, scale, block)
+            assert np.array_equal(_native_fp4_values(got_w), want_vals)
+            assert np.array_equal(got_s.numpy(), want_scale)
+
+    @pytest.mark.parametrize("case", ["refused", "fused_ep_w4a8"])
+    def test_moe_tp_decode_fp4_layout_only_where_it_arms(self, monkeypatch, case):
+        """A layer the precheck refuses, or one the fused EP W4A8 kernel is asked
+        to serve, keeps exactly the layout it gets without the flag."""
+        from vllm_torchtpu.layers.adapter import moe_tp_decode_nvfp4
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            _process_fp8_moe_weights,
+        )
+
+        if case == "fused_ep_w4a8":
+            monkeypatch.setenv("USE_MOE_FUSED_EP_KERNEL", "1")
+            monkeypatch.setenv("MOE_FUSED_EP_ENABLE_W4A8", "1")
+        layer = self._layer()
+        kwargs = dict(weight_block_size=(self.BLOCK, self.BLOCK), activation="silu")
+        want = _process_fp8_moe_weights(layer, **kwargs)
+        prechecks = []
+
+        def refuse(layer, *, requant_block):
+            prechecks.append(requant_block)
+            return "refused by the test"
+
+        monkeypatch.setattr(moe_tp_decode_nvfp4, "precheck_admission", refuse)
+        monkeypatch.setenv("USE_MOE_TP_DECODE_NVFP4_KERNEL", "1")
+        got = _process_fp8_moe_weights(layer, **kwargs)
+
+        assert prechecks == ([512] if case == "refused" else [])
+        assert got[4:] == want[4:]
+        for a, b in zip(want[:4], got[:4]):
+            assert a.dtype == b.dtype and a.shape == b.shape
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
     def test_mtp_layers_stay_fp8(self, monkeypatch):
         from vllm_torchtpu.layers.adapter.quantization.fp8 import (

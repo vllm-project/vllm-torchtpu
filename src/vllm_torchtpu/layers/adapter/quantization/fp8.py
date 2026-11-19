@@ -494,11 +494,15 @@ def _quantize_and_format_single_moe_weight(
     quant_dtype: torch.dtype,
     block_size: int | None,
     activation: str = "",
+    tp_decode_fp4: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a float32 MoE weight tensor to FP8 and format for the GMM kernel.
 
     Handles swigluoai deinterleaving (for w13), 128-alignment padding,
     block alignment validation, quantization, transpose, and scale reshaping.
+    ``tp_decode_fp4``: the FP4 layout moe_tp_decode_nvfp4 reads, native
+    ``float4_e2m1fn_x2`` with the block clamped to this matrix's contracting
+    dimension (w2's TP slice can be narrower than the block).
     """
     if activation == "swigluoai" and name == "w13":
         w1 = w[:, ::2, :]
@@ -525,6 +529,9 @@ def _quantize_and_format_single_moe_weight(
     )
     if is_fp4 and block_size is None:
         block_size = 512
+    if tp_decode_fp4:
+        assert is_fp4 and block_size is not None
+        block_size = min(block_size, w.shape[-1])
 
     if block_size is not None and w.shape[-1] % block_size != 0:
         raise ValueError(
@@ -535,7 +542,7 @@ def _quantize_and_format_single_moe_weight(
 
     if is_fp4:
         assert block_size is not None
-        pack_for_gmm = not (
+        pack_for_gmm = not tp_decode_fp4 and not (
             envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_ENABLE_W4A8
         )
         w_kmajor = fresh_buffer(w.transpose(1, 2).contiguous())
@@ -664,6 +671,28 @@ def _release_param_storage(param: torch.nn.Parameter | None) -> None:
         param.data = torch.empty((1,), dtype=param.data.dtype, device=param.data.device)
 
 
+def _moe_tp_decode_fp4_layout(layer: TpuRoutedExperts, block_size: int) -> bool:
+    """Whether to requantize this layer's experts to the FP4 layout of
+    moe_tp_decode_nvfp4 (USE_MOE_TP_DECODE_NVFP4_KERNEL): only when the layer
+    will arm, judged while the checkpoint tensors are intact. A requested fused
+    EP W4A8 kernel keeps its own FP4 layout."""
+    if not envs.USE_MOE_TP_DECODE_NVFP4_KERNEL or (
+        envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_ENABLE_W4A8
+    ):
+        return False
+    from vllm_torchtpu.layers.adapter.moe_tp_decode_nvfp4 import precheck_admission
+
+    refusal = precheck_admission(layer, requant_block=block_size)
+    if refusal is not None:
+        logger.warning_once(
+            "moe_tp_decode_nvfp4: keeping the GMM FP4 MoE weight layout "
+            "(refused before load-time requantization: %s)",
+            refusal,
+        )
+        return False
+    return True
+
+
 def _process_fp8_moe_weights(
     layer: TpuRoutedExperts,
     *,
@@ -691,6 +720,12 @@ def _process_fp8_moe_weights(
         and requant_block_size is None
     ):
         requant_block_size = 512
+    tp_decode_fp4 = (
+        hasattr(torch, "float4_e2m1fn_x2")
+        and requant_dtype == torch.float4_e2m1fn_x2
+        and requant_block_size is not None
+        and _moe_tp_decode_fp4_layout(layer, requant_block_size)
+    )
 
     # Dequantize from checkpoint FP8 to float32
     w13_scale_param = getattr(
@@ -787,6 +822,7 @@ def _process_fp8_moe_weights(
         quant_dtype=requant_dtype,
         block_size=requant_block_size,
         activation=activation,
+        tp_decode_fp4=tp_decode_fp4,
     )
     assert w13_scale is not None
     if release_inputs:
@@ -804,6 +840,7 @@ def _process_fp8_moe_weights(
         quant_dtype=requant_dtype,
         block_size=requant_block_size,
         activation=activation,
+        tp_decode_fp4=tp_decode_fp4,
     )
     assert w2_scale is not None
     if release_inputs:
@@ -1447,6 +1484,14 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 router_logits,
                 score_bias_operand(layer),
             )
+        if envs.USE_MOE_TP_DECODE_NVFP4_KERNEL:
+            from vllm_torchtpu.layers.adapter.moe_tp_decode_nvfp4 import (
+                moe_tp_decode_nvfp4_forward,
+                moe_tp_decode_nvfp4_supported,
+            )
+
+            if moe_tp_decode_nvfp4_supported(self):
+                return moe_tp_decode_nvfp4_forward(self, layer, x, router_logits)
         from vllm_torchtpu.layers.adapter.moe_tp_decode import (
             moe_tp_decode_forward,
             moe_tp_decode_supported,

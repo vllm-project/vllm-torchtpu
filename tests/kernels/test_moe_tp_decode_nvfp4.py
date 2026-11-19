@@ -59,6 +59,8 @@ SMALL_EP2TP4 = dict(h=2048, e=16, i=512, fs=128, topk=4, b13=512, b2=512, ep=2)
 GLM52_TP8 = dict(h=6144, e=256, i=256, fs=256, topk=8, b13=512, b2=256, ep=1)
 GLM52_EP2TP4 = dict(h=6144, e=256, i=512, fs=256, topk=8, b13=512, b2=512, ep=2)
 GLM52_EP2TP4_B256 = dict(h=6144, e=256, i=512, fs=256, topk=8, b13=512, b2=256, ep=2)
+# EP2xTP8 on 16 ranks: I_rank 2048 / 8, shared I 2048 / 16.
+GLM52_EP2TP8 = dict(h=6144, e=256, i=256, fs=128, topk=8, b13=512, b2=256, ep=2)
 
 # Kernel vs pure f32 dequantized reference (unquantized activations): W4A8
 # activation quantization + bf16 combine/all-reduce roundings.
@@ -67,6 +69,9 @@ REF_TOL = dict(rel_l2=0.08, cos=0.998)
 # rel_l2(kernel, oracle) <= rel_l2(oracle_a, oracle_b) (measured spread between
 # two valid W4A8 oracle orderings).
 ORACLE_REF_REL_L2_DIFF_MAX = 0.005
+# Kernel on FP4-requantized weights vs the MoE on the FP8 checkpoint they came
+# from: the e2m1 block-512 requantization error (0.17-0.18 measured on CPU).
+FP4_REQUANT_REL_L2_MAX = 0.25
 
 
 def _tpu7x():
@@ -640,6 +645,39 @@ def test_default_vmem_headroom_and_kernel_name(monkeypatch):
             )
 
 
+def test_ep2_tp8_vmem_plan_fits_up_to_128_rows(monkeypatch):
+    """EP2xTP8 on 16 ranks (I_rank 256, w2 block 256, g = 2, shared I 128 per
+    rank) plans 16 to 128 rows within the admission cap, with at least
+    EP2xTP4's margin (8 ranks; 0.2 MiB at 128 rows), and admits the row counts
+    the kernel has."""
+    info = _tpu7x()
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    cap_bytes = int(info.vmem_capacity_bytes * nvfp4_kernel_impl.VMEM_FRACTION)
+
+    def margin(cfg: dict, n_ranks: int, rows: int) -> int:
+        plan = nvfp4_kernel_impl._vmem_plan(
+            rows,
+            cfg["h"],
+            cfg["i"],
+            cfg["h"] // cfg["b13"],
+            cfg["i"] // cfg["b2"],
+            kernel.group_size(cfg["i"], cfg["e"] // cfg["ep"]),
+            cfg["e"],
+            cfg["fs"],
+            info,
+            all_reduce.make_spec(n_ranks, rows, cfg["h"]),
+        )
+        assert plan is not None, (cfg, n_ranks, rows)
+        return cap_bytes - plan[1]
+
+    for rows in (16, 32, 64, 80, 96, 128):
+        assert margin(GLM52_EP2TP8, 16, rows) >= margin(GLM52_EP2TP4, N_RANKS, rows) > 0
+        admitted = kernel.can_use_moe_tp_decode_nvfp4(
+            *_shapes(rows, GLM52_EP2TP8), topk=GLM52_EP2TP8["topk"], n_ranks=16
+        )
+        assert admitted == (rows in kernel.ROW_BUCKETS)
+
+
 def test_kept_levers_tpu7x_lowering(monkeypatch):
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
     devs = jax.devices()[:1]
@@ -698,122 +736,128 @@ def test_kept_levers_tpu7x_lowering(monkeypatch):
             assert "tpu_custom_call" in hlo
 
 
-def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
-    """Execute ``_kernel`` directly on CPU across partial/tail active counts,
-    verifying ``fast=True`` vs ``fast=False`` and ``w2_n_chunk`` 0-ULP bitwise
-    identity plus clean semaphore pairing and NaN-poisoned padding masking."""
+def _pack_fp4_u32(arr: Any) -> np.ndarray:
+    """``[..., K, N]`` FP4 -> ``uint32 [..., K / 8, N]``, 8 K-rows per word, as
+    the kernel's HBM view of its K-major weights."""
+    a = jnp.asarray(arr, FP4)
+    *lead, rows, cols = a.shape
+    return np.asarray(
+        lax.bitcast_convert_type(
+            a.reshape(*lead, rows // 8, 8, cols).swapaxes(-2, -1), jnp.uint32
+        )
+    )
+
+
+def _unpack_u32_fp4(u32: Any) -> jax.Array:
+    u = jnp.asarray(u32, jnp.uint32)
+    rows, cols = u.shape
+    return lax.bitcast_convert_type(u, FP4).swapaxes(-2, -1).reshape(rows * 8, cols)
+
+
+def _norm_idx(idx: Any) -> Any:
+    if idx is Ellipsis:
+        return slice(None)
+    if not isinstance(idx, tuple):
+        idx = (idx,)
+    out: list[Any] = []
+    for it in idx:
+        if isinstance(it, pl.Slice):
+            start = int(np.asarray(it.start))
+            size = int(np.asarray(it.size))
+            out.append(slice(start, start + size))
+        elif isinstance(it, slice) or it is Ellipsis:
+            out.append(it)
+        else:
+            out.append(int(np.asarray(it)))
+    return tuple(out)
+
+
+class _FakeRef:
+    def __init__(self, buf: np.ndarray):
+        self._buf = buf
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self._buf.shape
+
+    @property
+    def dtype(self) -> Any:
+        return self._buf.dtype
+
+    @property
+    def at(self) -> Any:
+        parent = self
+
+        class _At:
+            def __getitem__(self, sub: Any) -> Any:
+                return _FakeRef(parent._buf[_norm_idx(sub)])
+
+        return _At()
+
+    def __getitem__(self, sub: Any) -> jax.Array:
+        return jnp.asarray(self._buf[_norm_idx(sub)])
+
+    def __setitem__(self, sub: Any, val: Any) -> None:
+        self._buf[_norm_idx(sub)] = np.asarray(val, dtype=self.dtype)
+
+    def bitcast(self, target_dtype: Any) -> Any:
+        assert target_dtype == jnp.uint32
+        return _FakeRef(_pack_fp4_u32(self._buf))
+
+
+class _FakeSem:
+    def __init__(self, shape: tuple[int, ...]):
+        self.pending: dict[tuple[Any, ...], list[tuple[np.ndarray, np.ndarray]]] = {}
+        self.shape = shape
+        self.routed_dmas = 0
+
+    @property
+    def at(self) -> Any:
+        parent = self
+
+        class _At:
+            def __getitem__(self, sub: Any) -> tuple[Any, tuple[Any, ...]]:
+                k = _norm_idx(sub)
+                if not isinstance(k, tuple):
+                    k = (k,)
+                return (parent, k)
+
+        return _At()
+
+
+class _FakeCopy:
+    def __init__(
+        self,
+        src: _FakeRef,
+        dst: _FakeRef,
+        sem_slot: tuple[_FakeSem, tuple[Any, ...]],
+    ):
+        self.src = src
+        self.dst = dst
+        self.sem, self.key = sem_slot
+
+    def start(self) -> None:
+        payload = np.array(self.src._buf, copy=True)
+        q = self.sem.pending.setdefault(self.key, [])
+        assert len(q) == 0, f"double start on busy semaphore {self.key}"
+        q.append((self.dst._buf, payload))
+        if len(self.sem.shape) == 2:
+            self.sem.routed_dmas += 1
+
+    def wait(self) -> None:
+        q = self.sem.pending.get(self.key, [])
+        assert len(q) == 1, f"wait on unstarted semaphore {self.key}"
+        dst_view, payload = q.pop(0)
+        dst_view[...] = payload
+
+
+def _cpu_kernel_executor(monkeypatch) -> None:
+    """Make ``nvfp4_kernel_impl._kernel`` run eagerly on CPU (TPU7x info):
+    Python control flow for ``pl.when`` and ``lax.fori_loop``, numpy-backed
+    refs and DMAs that check semaphore pairing, and an all-reduce epilogue that
+    writes this rank's bf16 partial with rows >= n_valid zeroed."""
     info = _tpu7x()
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
-
-    def pack_fp4_u32(arr: np.ndarray) -> np.ndarray:
-        a = jnp.asarray(arr, FP4)
-        *lead, rows, cols = a.shape
-        return np.asarray(
-            lax.bitcast_convert_type(
-                a.reshape(*lead, rows // 8, 8, cols).swapaxes(-2, -1), jnp.uint32
-            )
-        )
-
-    def unpack_u32_fp4(u32: Any) -> jax.Array:
-        u = jnp.asarray(u32, jnp.uint32)
-        rows, cols = u.shape
-        return lax.bitcast_convert_type(u, FP4).swapaxes(-2, -1).reshape(rows * 8, cols)
-
-    def norm_idx(idx: Any) -> Any:
-        if idx is Ellipsis:
-            return slice(None)
-        if not isinstance(idx, tuple):
-            idx = (idx,)
-        out: list[Any] = []
-        for it in idx:
-            if isinstance(it, pl.Slice):
-                start = int(np.asarray(it.start))
-                size = int(np.asarray(it.size))
-                out.append(slice(start, start + size))
-            elif isinstance(it, slice) or it is Ellipsis:
-                out.append(it)
-            else:
-                out.append(int(np.asarray(it)))
-        return tuple(out)
-
-    class _FakeRef:
-        def __init__(self, buf: np.ndarray):
-            self._buf = buf
-
-        @property
-        def shape(self) -> tuple[int, ...]:
-            return self._buf.shape
-
-        @property
-        def dtype(self) -> Any:
-            return self._buf.dtype
-
-        @property
-        def at(self) -> Any:
-            parent = self
-
-            class _At:
-                def __getitem__(self, sub: Any) -> Any:
-                    return _FakeRef(parent._buf[norm_idx(sub)])
-
-            return _At()
-
-        def __getitem__(self, sub: Any) -> jax.Array:
-            return jnp.asarray(self._buf[norm_idx(sub)])
-
-        def __setitem__(self, sub: Any, val: Any) -> None:
-            self._buf[norm_idx(sub)] = np.asarray(val, dtype=self.dtype)
-
-        def bitcast(self, target_dtype: Any) -> Any:
-            assert target_dtype == jnp.uint32
-            return _FakeRef(pack_fp4_u32(self._buf))
-
-    class _FakeSem:
-        def __init__(self, shape: tuple[int, ...]):
-            self.pending: dict[
-                tuple[Any, ...], list[tuple[np.ndarray, np.ndarray]]
-            ] = {}
-            self.shape = shape
-            self.routed_dmas = 0
-
-        @property
-        def at(self) -> Any:
-            parent = self
-
-            class _At:
-                def __getitem__(self, sub: Any) -> tuple[Any, tuple[Any, ...]]:
-                    k = norm_idx(sub)
-                    if not isinstance(k, tuple):
-                        k = (k,)
-                    return (parent, k)
-
-            return _At()
-
-    class _FakeCopy:
-        def __init__(
-            self,
-            src: _FakeRef,
-            dst: _FakeRef,
-            sem_slot: tuple[_FakeSem, tuple[Any, ...]],
-        ):
-            self.src = src
-            self.dst = dst
-            self.sem, self.key = sem_slot
-
-        def start(self) -> None:
-            payload = np.array(self.src._buf, copy=True)
-            q = self.sem.pending.setdefault(self.key, [])
-            assert len(q) == 0, f"double start on busy semaphore {self.key}"
-            q.append((self.dst._buf, payload))
-            if len(self.sem.shape) == 2:
-                self.sem.routed_dmas += 1
-
-        def wait(self) -> None:
-            q = self.sem.pending.get(self.key, [])
-            assert len(q) == 1, f"wait on unstarted semaphore {self.key}"
-            dst_view, payload = q.pop(0)
-            dst_view[...] = payload
-
     orig_bitcast = pltpu.bitcast
 
     def fake_fori_loop(lo: Any, hi: Any, body: Any, init: Any) -> Any:
@@ -841,14 +885,106 @@ def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
     monkeypatch.setattr(
         pltpu,
         "bitcast",
-        lambda x, dt: unpack_u32_fp4(x) if dt == FP4 else orig_bitcast(x, dt),
+        lambda x, dt: _unpack_u32_fp4(x) if dt == FP4 else orig_bitcast(x, dt),
     )
     monkeypatch.setattr(all_reduce, "prologue", lambda spec: None)
     monkeypatch.setattr(all_reduce, "epilogue", fake_epilogue)
 
+
+def _run_kernel_on_cpu(
+    x: np.ndarray,
+    scores: np.ndarray,
+    bias: np.ndarray,
+    n_valid: int,
+    experts_start: int,
+    w1: np.ndarray,
+    w2: np.ndarray,
+    s1: np.ndarray,
+    s2: np.ndarray,
+    sw13: np.ndarray,
+    ss13: np.ndarray,
+    sw2: np.ndarray,
+    ss2: np.ndarray,
+    *,
+    topk: int,
+    fast: bool = True,
+    w2_n_chunk: int = 512,
+    n_ranks: int = N_RANKS,
+) -> tuple[np.ndarray, int]:
+    """One rank's bf16 partial from ``_kernel`` under ``_cpu_kernel_executor``
+    (shared ``ss13 [1, 2Fs]`` / ``ss2 [1, H]`` as the kernel stages them), and
+    the number of routed-weight DMAs it started."""
+    m, h = x.shape
+    el, i, _ = w2.shape
+    e = scores.shape[1]
+    b13, b2 = s1.shape[1], s2.shape[1]
+    fs = sw2.shape[0]
+    g = kernel.group_size(i, el)
+    nb = nvfp4_kernel_impl._NUM_BUFFERS
+    e_pad = pl.cdiv(e, 128) * 128
+    scores_pad = np.pad(scores, ((0, 0), (0, e_pad - e)))
+    bias_pad = np.pad(bias, (0, e_pad - e), constant_values=-np.inf).reshape(1, e_pad)
+    out = np.array(jnp.full((m, h), -1.0, dtype=BF16), copy=True)
+    ring_sem = _FakeSem((nb, 4 * g))
+    shared_sem = _FakeSem((4,))
+    hit_sem = _FakeSem((1,))
+    nvfp4_kernel_impl._kernel(
+        _FakeRef(np.array([n_valid, 0, experts_start], np.int32)),
+        _FakeRef(x),
+        _FakeRef(scores_pad),
+        _FakeRef(bias_pad),
+        _FakeRef(w1),
+        _FakeRef(w2),
+        _FakeRef(s1),
+        _FakeRef(s2),
+        _FakeRef(sw13),
+        _FakeRef(ss13),
+        _FakeRef(sw2),
+        _FakeRef(ss2),
+        _FakeRef(out),
+        _FakeRef(np.zeros((nb, h // 8, g * 2 * i), np.uint32)),
+        _FakeRef(np.zeros((nb, g, i // 8, h), np.uint32)),
+        _FakeRef(np.zeros((nb, b13, 1, g * 2 * i), np.float32)),
+        _FakeRef(np.zeros((nb, g, b2, 1, h), np.float32)),
+        _FakeRef(np.array(jnp.zeros((h, 2 * fs), FP8), copy=True)),
+        _FakeRef(np.zeros((1, 2 * fs), np.float32)),
+        _FakeRef(np.array(jnp.zeros((fs, h), FP8), copy=True)),
+        _FakeRef(np.zeros((1, h), np.float32)),
+        _FakeRef(np.array(jnp.zeros((m, h), FP8), copy=True)),
+        _FakeRef(np.array(jnp.zeros((m, h), FP8), copy=True)),
+        _FakeRef(np.zeros((h // Q_BLOCK, m, 128), np.float32)),
+        _FakeRef(np.zeros((m, h), np.float32)),
+        _FakeRef(np.zeros((m, h), np.float32)),
+        _FakeRef(np.zeros((m, e_pad), np.float32)),
+        _FakeRef(np.zeros((4 if fast else 1, e_pad), np.int32)),
+        _FakeRef(np.zeros((4 if fast else 1, e_pad), np.int32)),
+        _FakeRef(np.zeros((max(1, ((el + g - 1) // g) * g),), np.int32)),
+        ring_sem,
+        shared_sem,
+        hit_sem,
+        local_experts=el,
+        group=g,
+        bk2=i // b2,
+        topk=topk,
+        routed_scale=ROUTED_SCALE,
+        ar_spec=all_reduce.make_spec(n_ranks, m, h),
+        fast=fast,
+        w2_n_chunk=w2_n_chunk,
+    )
+    for sem in (ring_sem, shared_sem, hit_sem):
+        for key, queue in sem.pending.items():
+            assert len(queue) == 0, f"unwaited DMA on {key}"
+    return out, ring_sem.routed_dmas
+
+
+def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
+    """Execute ``_kernel`` directly on CPU across partial/tail active counts,
+    verifying ``fast=True`` vs ``fast=False`` and ``w2_n_chunk`` 0-ULP bitwise
+    identity plus clean semaphore pairing and NaN-poisoned padding masking."""
+    _cpu_kernel_executor(monkeypatch)
+
     m, h, fs, topk = 16, 1024, 128, 4
     b13, b2 = h // Q_BLOCK, 1
-    nb = nvfp4_kernel_impl._NUM_BUFFERS
     for cfg_i, el, counts in (
         (512, 8, (-1, 0, 1, 3, 5, 7)),
         (256, 16, (-1, 0, 1, 3, 5, 11, 13)),
@@ -878,7 +1014,7 @@ def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
             copy=True,
         )
         ss2 = np.abs(rng.standard_normal((1, h), np.float32)) * 0.05
-        spec = all_reduce.make_spec(N_RANKS, m, h)
+        weights = (w1, w2, s1, s2, sw13, ss13, sw2, ss2)
 
         def run_one(
             count_target: int,
@@ -888,19 +1024,9 @@ def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
             w2_n_chunk: int = 512,
             _el: int = el,
             _e: int = e,
-            _i: int = cfg_i,
             _x: np.ndarray = x_bf16,
-            _w1: np.ndarray = w1,
-            _w2: np.ndarray = w2,
-            _s1: np.ndarray = s1,
-            _s2: np.ndarray = s2,
-            _sw13: np.ndarray = sw13,
-            _ss13: np.ndarray = ss13,
-            _sw2: np.ndarray = sw2,
-            _ss2: np.ndarray = ss2,
-            _spec: Any = spec,
+            _weights: tuple[np.ndarray, ...] = weights,
         ) -> tuple[np.ndarray, int]:
-            g = kernel.group_size(_i, _el)
             scores = np.full((m, _e), 0.01, np.float32)
             bias = np.zeros((_e,), np.float32)
             nv = 0 if count_target == -1 else 14
@@ -919,68 +1045,20 @@ def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
                     picks = np.concatenate([loc_picks, rem_picks]).astype(np.int32)
                     scores[r, picks] = np.linspace(0.95, 0.75, topk, dtype=np.float32)
             scores[nv:] = np.nan
-
-            e_pad = 128
-            scores_pad = np.pad(scores, ((0, 0), (0, e_pad - _e)))
-            bias_pad = np.pad(bias, (0, e_pad - _e), constant_values=-np.inf).reshape(
-                1, e_pad
-            )
-            w1_scr = np.zeros((nb, h // 8, g * 2 * _i), np.uint32)
-            s1_scr = np.zeros((nb, b13, 1, g * 2 * _i), np.float32)
-            out = np.array(jnp.full((m, h), -1.0, dtype=BF16), copy=True)
-            ring_sem = _FakeSem((nb, 4 * g))
-            shared_sem = _FakeSem((4,))
-            hit_sem = _FakeSem((1,))
-
-            nvfp4_kernel_impl._kernel(
-                _FakeRef(np.array([nv, 0, 0], np.int32)),
-                _FakeRef(_x),
-                _FakeRef(scores_pad),
-                _FakeRef(bias_pad),
-                _FakeRef(_w1),
-                _FakeRef(_w2),
-                _FakeRef(_s1),
-                _FakeRef(_s2),
-                _FakeRef(_sw13),
-                _FakeRef(_ss13),
-                _FakeRef(_sw2),
-                _FakeRef(_ss2),
-                _FakeRef(out),
-                _FakeRef(w1_scr),
-                _FakeRef(np.zeros((nb, g, _i // 8, h), np.uint32)),
-                _FakeRef(s1_scr),
-                _FakeRef(np.zeros((nb, g, b2, 1, h), np.float32)),
-                _FakeRef(np.array(jnp.zeros((h, 2 * fs), FP8), copy=True)),
-                _FakeRef(np.zeros((1, 2 * fs), np.float32)),
-                _FakeRef(np.array(jnp.zeros((fs, h), FP8), copy=True)),
-                _FakeRef(np.zeros((1, h), np.float32)),
-                _FakeRef(np.array(jnp.zeros((m, h), FP8), copy=True)),
-                _FakeRef(np.array(jnp.zeros((m, h), FP8), copy=True)),
-                _FakeRef(np.zeros((h // Q_BLOCK, m, 128), np.float32)),
-                _FakeRef(np.zeros((m, h), np.float32)),
-                _FakeRef(np.zeros((m, h), np.float32)),
-                _FakeRef(np.zeros((m, e_pad), np.float32)),
-                _FakeRef(np.zeros((4 if fast else 1, e_pad), np.int32)),
-                _FakeRef(np.zeros((4 if fast else 1, e_pad), np.int32)),
-                _FakeRef(np.zeros((max(1, ((_el + g - 1) // g) * g),), np.int32)),
-                ring_sem,
-                shared_sem,
-                hit_sem,
-                local_experts=_el,
-                group=g,
-                bk2=_i // b2,
+            out, routed_dmas = _run_kernel_on_cpu(
+                _x,
+                scores,
+                bias,
+                nv,
+                0,
+                *_weights,
                 topk=topk,
-                routed_scale=ROUTED_SCALE,
-                ar_spec=_spec,
                 fast=fast,
                 w2_n_chunk=w2_n_chunk,
             )
-            for sem in (ring_sem, shared_sem, hit_sem):
-                for key, queue in sem.pending.items():
-                    assert len(queue) == 0, f"unwaited DMA on {key}"
             assert not np.any(np.isnan(out.astype(np.float32)))
             assert np.all(out[max(nv, 0) :].view(np.uint16) == 0)
-            return out, ring_sem.routed_dmas
+            return out, routed_dmas
 
         for cnt in counts:
             base, base_dmas = run_one(cnt, fast=True)
@@ -995,6 +1073,166 @@ def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
         base_tied, _ = run_one(4, tied=True, fast=True)
         got_tied, _ = run_one(4, tied=True, fast=False)
         assert np.array_equal(got_tied.view(np.uint16), base_tied.view(np.uint16))
+
+
+@pytest.mark.parametrize(
+    "n_ranks, inter, hidden",
+    [
+        # w2's K is the 256-column TP slice: block 512 clamps to 256.
+        pytest.param(16, 256, 2048, id="ep2xtp8"),
+        pytest.param(8, 512, 1024, id="ep2xtp4"),
+    ],
+)
+def test_cpu_kernel_on_fp8_checkpoint_requantized_to_fp4(
+    monkeypatch, n_ranks: int, inter: int, hidden: int
+):
+    """The FP8 method's load-time FP4 requantization, laid out for this kernel,
+    feeds ``_kernel`` as installed. Every EP2 x TP rank's tensors come from the
+    real loader on a random block-FP8 checkpoint shard and run on CPU; the sum
+    of the ranks' partials matches the MoE on the dequantized FP4 weights
+    within the W4A8 tolerance and stays near the MoE on the FP8 checkpoint
+    (FP4 requantization error; a K-major orientation or gate/up mistake is far
+    outside it)."""
+    pytest.importorskip("torch_tpu")
+    import torch
+
+    from tests.layers.adapter.quantization.test_fp8 import (
+        FakeFusedMoELayer,
+        FakeInt8MoEConfig,
+        _cpu_jax_op,
+        _native_fp4_values,
+    )
+    from vllm_torchtpu.layers.adapter import fused_moe, moe_tp_decode_nvfp4
+    from vllm_torchtpu.layers.adapter.quantization import fp8 as fp8_mod
+    from vllm_torchtpu.layers.core.quantization import dequantize_tensor
+
+    monkeypatch.setattr(fused_moe.pallas, "jax_op", _cpu_jax_op)
+    monkeypatch.setattr(fused_moe, "_quantize_native_fp4_kmajor_ops", {})
+    monkeypatch.setattr(fp8_mod, "fresh_buffer", lambda t: t)
+    monkeypatch.setattr(moe_tp_decode_nvfp4, "precheck_admission", lambda *a, **k: None)
+    monkeypatch.setenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "fp4")
+    monkeypatch.delenv("MOE_REQUANTIZE_BLOCK_SIZE", raising=False)
+    monkeypatch.setenv("USE_MOE_TP_DECODE_NVFP4_KERNEL", "1")
+
+    ep, experts, fs, topk, rows, n_valid = 2, 4, 128, 2, 16, 12
+    el, tp = experts // ep, n_ranks // ep
+    gen = torch.Generator().manual_seed(n_ranks)
+    rng = np.random.default_rng(n_ranks)
+
+    def fp8_block_weight(n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """[el, n, k] FP8 with 128 x 128 scales; dequantized ~ N(0, 1 / k)."""
+        w = (torch.randn(el, n, k, generator=gen) * 40).to(torch.float8_e4m3fn)
+        s = (torch.rand(el, n // 128, k // 128, generator=gen) + 0.5) / (40 * k**0.5)
+        return w, s
+
+    def dequant_kmajor(w: torch.Tensor, s: torch.Tensor) -> np.ndarray:
+        out = dequantize_tensor(w, s, axis=(1, 2), out_dtype=torch.float32)
+        return out.transpose(1, 2).numpy()
+
+    def fp4_dequant(w: torch.Tensor, s: torch.Tensor) -> np.ndarray:
+        vals = _native_fp4_values(w)
+        return vals * np.repeat(s[:, :, 0, :].numpy(), vals.shape[1] // s.shape[1], 1)
+
+    x = rng.standard_normal((rows, hidden)).astype(np.float32)
+    x_bf16 = np.array(jnp.asarray(x, BF16), copy=True)
+    scores = (1 / (1 + np.exp(-rng.standard_normal((rows, experts))))).astype(
+        np.float32
+    )
+    bias = rng.uniform(-0.05, 0.05, experts).astype(np.float32)
+    ranks = []
+    for r in range(n_ranks):
+        w13, s13 = fp8_block_weight(2 * inter, hidden)
+        w2, s2 = fp8_block_weight(hidden, inter)
+        layer = FakeFusedMoELayer(w13, w2, s13, s2)
+        layer.moe_config = FakeInt8MoEConfig(inter)
+        q13, qs13, q2, qs2, _, _ = fp8_mod._process_fp8_moe_weights(
+            layer, weight_block_size=(128, 128), activation="silu"
+        )
+        sw13_f = rng.standard_normal((hidden, 2 * fs)).astype(np.float32)
+        sw13, ss13 = _quantize_fp8_per_channel(jnp.asarray(sw13_f / hidden**0.5))
+        sw2_f = rng.standard_normal((fs, hidden)).astype(np.float32)
+        sw2, ss2 = _quantize_fp8_per_channel(jnp.asarray(sw2_f / fs**0.5))
+        ranks.append(
+            dict(
+                e0=(r // tp) * el,
+                kernel=(
+                    np.array(jnp.asarray(_native_fp4_values(q13), FP4)),
+                    np.array(jnp.asarray(_native_fp4_values(q2), FP4)),
+                    qs13.numpy(),
+                    qs2.numpy(),
+                    np.array(sw13),
+                    np.asarray(ss13).reshape(1, -1),
+                    np.array(sw2),
+                    np.asarray(ss2).reshape(1, -1),
+                ),
+                fp4=(fp4_dequant(q13, qs13), fp4_dequant(q2, qs2)),
+                ckpt=(dequant_kmajor(w13, s13), dequant_kmajor(w2, s2)),
+            )
+        )
+
+    _cpu_kernel_executor(monkeypatch)
+    w13_k, w2_k, s13_k, s2_k, sw13, ss13, sw2, ss2 = ranks[0]["kernel"]
+    shapes = (
+        jax.ShapeDtypeStruct((rows, hidden), BF16),
+        jax.ShapeDtypeStruct((rows, experts), F32),
+        jax.ShapeDtypeStruct((experts,), F32),
+        *(jax.ShapeDtypeStruct(a.shape, a.dtype) for a in (w13_k, w2_k, s13_k, s2_k)),
+        jax.ShapeDtypeStruct(sw13.shape, sw13.dtype),
+        jax.ShapeDtypeStruct((2 * fs,), F32),
+        jax.ShapeDtypeStruct(sw2.shape, sw2.dtype),
+        jax.ShapeDtypeStruct((hidden,), F32),
+    )
+    assert kernel.can_use_moe_tp_decode_nvfp4(*shapes, topk=topk, n_ranks=n_ranks)
+
+    got = np.zeros((rows, hidden), np.float32)
+    for rank in ranks:
+        partial, _ = _run_kernel_on_cpu(
+            x_bf16,
+            scores,
+            bias,
+            n_valid,
+            rank["e0"],
+            *rank["kernel"],
+            topk=topk,
+            n_ranks=n_ranks,
+        )
+        got += partial.astype(np.float32)
+    got = got.astype(BF16).astype(np.float32)
+    assert np.all(got[n_valid:].view(np.uint32) == 0)
+
+    wtab = np.asarray(
+        fp8_kernel_impl._route(
+            jnp.asarray(scores), jnp.asarray(bias), n_valid, topk=topk
+        )
+    )[:n_valid]
+    xv = x_bf16[:n_valid].astype(np.float32)
+
+    def moe(form: str) -> np.ndarray:
+        def silu_glu(gu: np.ndarray, width: int) -> np.ndarray:
+            return gu[:, :width] / (1 + np.exp(-gu[:, :width])) * gu[:, width:]
+
+        total = np.zeros((n_valid, hidden), np.float64)
+        for rank in ranks:
+            w13, w2 = rank[form]
+            sw13, ss13, sw2, ss2 = rank["kernel"][4:]
+            shared_w13 = np.asarray(jnp.asarray(sw13, F32)) * ss13
+            shared_w2 = np.asarray(jnp.asarray(sw2, F32)) * ss2.reshape(1, -1)
+            total += silu_glu(xv @ shared_w13, fs) @ shared_w2
+            for j in range(el):
+                coeff = wtab[:, rank["e0"] + j : rank["e0"] + j + 1]
+                total += ROUTED_SCALE * (coeff * silu_glu(xv @ w13[j], inter)) @ w2[j]
+        return total
+
+    def rel_l2_and_cos(want: np.ndarray) -> tuple[float, float]:
+        g = got[:n_valid].astype(np.float64)
+        rel = np.linalg.norm(g - want) / np.linalg.norm(want)
+        cos = np.sum(g * want) / (np.linalg.norm(g) * np.linalg.norm(want))
+        return float(rel), float(cos)
+
+    fp4 = rel_l2_and_cos(moe("fp4"))
+    assert fp4[0] <= REF_TOL["rel_l2"] and fp4[1] >= REF_TOL["cos"], fp4
+    ckpt = rel_l2_and_cos(moe("ckpt"))
+    assert ckpt[0] <= FP4_REQUANT_REL_L2_MAX, ckpt
 
 
 def test_scale_4d_no_reshape_in_jaxpr_and_tpu_hlo_and_3d_compat(monkeypatch):
@@ -3153,6 +3391,214 @@ def test_arm_ep2_tp4_and_forward_dispatch(monkeypatch):
     assert call_args[3] is pad_mask
     assert call_args[12] is layer_ep1._moe_tp_decode_nvfp4_rank
     assert call_args[13] is layer_ep1._moe_tp_decode_nvfp4_e0
+
+
+def _fp8_method_runner(rt, cfg: dict, n_ranks: int, *, form: str, ep_rank: int = 1):
+    """A GLM-5.2 EP x TP runner whose ``VllmFp8MoEMethodTPU`` experts are in
+    ``form``: "kmajor_fp4" (requantized for this kernel), "packed_fp4" (the GMM
+    layout), "fp8" (per-channel FP8) or "checkpoint" (FP8 blocks before
+    loading). Meta tensors: admission reads shapes and dtypes only."""
+    t = rt.torch
+    fp8 = importlib.import_module("vllm_torchtpu.layers.adapter.quantization.fp8")
+    h, e, i, ep = cfg["h"], cfg["e"], cfg["i"], cfg["ep"]
+    el, tp = e // ep, n_ranks // ep
+    qm = fp8.VllmFp8MoEMethodTPU(
+        SimpleNamespace(
+            weight_block_size=[128, 128], is_checkpoint_fp8_serialized=True
+        ),
+        SimpleNamespace(has_bias=False, is_act_and_mul=True),
+    )
+    qm._tpu_activation_str = "silu"
+    qm._rhs_quant_dtype = jnp.float4_e2m1fn if form == "packed_fp4" else None
+
+    def meta(*shape, dtype):
+        return t.empty(*shape, dtype=dtype, device="meta")
+
+    fp4, fp8_dt, f32 = t.float4_e2m1fn_x2, t.float8_e4m3fn, t.float32
+    blocks13, blocks2 = h // cfg["b13"], i // cfg["b2"]
+    layer = _new_routed_experts(rt, rt.nvfp4.RoutedExperts)
+    layer.quant_method = qm
+    if form == "checkpoint":
+        layer.w13_weight = meta(el, 2 * i, h, dtype=fp8_dt)
+        layer.w2_weight = meta(el, h, i, dtype=fp8_dt)
+    else:
+        layer.w13_weight, layer.w2_weight = {
+            "kmajor_fp4": (meta(el, h, i, dtype=fp4), meta(el, i, h // 2, dtype=fp4)),
+            "packed_fp4": (
+                meta(el, h // 2, 2 * i, dtype=t.uint8),
+                meta(el, i // 2, h, dtype=t.uint8),
+            ),
+            "fp8": (meta(el, h, 2 * i, dtype=fp8_dt), meta(el, i, h, dtype=fp8_dt)),
+        }[form]
+        if form == "fp8":
+            blocks13 = blocks2 = 1
+        layer.w13_weight_scale_inv = meta(el, blocks13, 1, 2 * i, dtype=f32)
+        layer.w2_weight_scale_inv = meta(el, blocks2, 1, h, dtype=f32)
+    layer.e_score_correction_bias = t.zeros(e, dtype=f32)
+    layer.global_num_experts = e
+    layer.use_grouped_topk = False
+    layer.num_expert_group = 1
+    layer.topk_group = 1
+    layer.scoring_func = "sigmoid"
+    layer.renormalize = True
+    layer.custom_routing_function = None
+    layer.routed_scaling_factor = 1.0
+    layer.moe_parallel_config = SimpleNamespace(
+        use_ep=True,
+        ep_size=ep,
+        ep_rank=ep_rank,
+        tp_size=tp,
+        tp_rank=0,
+        dp_size=1,
+        pcp_size=1,
+        enable_eplb=False,
+    )
+
+    VllmMoERunner = rt.moe_runner.VllmMoERunner
+    r: Any = VllmMoERunner.__new__(VllmMoERunner)
+    t.nn.Module.__init__(r)
+    r.layer_name = "model.layers.3.mlp"
+    r.routed_experts = layer
+    _set_runner_quant_method(r, qm)
+    r.moe_config = SimpleNamespace(
+        experts_per_token=cfg["topk"],
+        is_sequence_parallel=False,
+        skip_final_all_reduce=False,
+        ep_size=ep,
+        ep_rank=ep_rank,
+        moe_parallel_config=layer.moe_parallel_config,
+    )
+    layer.moe_config = r.moe_config
+    r.gate = object()
+    r.shared_expert_gate = None
+    r.routed_input_transform = None
+    r.routed_output_transform = None
+    r.router = object()
+    r.routed_scaling_factor = 2.5
+    _set_runner_shared_experts(r, "shared_mlp")
+    rt.adapter.fp8_decode.bind_routed_experts_runner(r)
+    return r, qm, layer
+
+
+def _fake_fp8_method_topology(monkeypatch, rt, cfg: dict, n_ranks: int, ep_rank: int):
+    """Topology, shared expert and padding state of rank 0 of EP group
+    ``ep_rank`` on an ``n_ranks`` op mesh."""
+    t = rt.torch
+    fs, h = cfg["fs"], cfg["h"]
+    mesh_index = ep_rank * (n_ranks // cfg["ep"])
+    topo = SimpleNamespace(
+        mesh=SimpleNamespace(size=n_ranks, axis_names=("ep",)), mesh_index=mesh_index
+    )
+    shared = (
+        t.empty(h, 2 * fs, dtype=t.float8_e4m3fn, device="meta"),
+        t.empty(2 * fs, dtype=t.float32, device="meta"),
+        t.empty(fs, h, dtype=t.float8_e4m3fn, device="meta"),
+        t.empty(h, dtype=t.float32, device="meta"),
+    )
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+    monkeypatch.setattr(rt.adapter.fp8_decode, "_topology", lambda: topo)
+    monkeypatch.setattr(rt.adapter.fp8_decode, "_shared_slice", lambda _r, **_k: shared)
+    return topo
+
+
+FP8_REQUANT_LAYOUTS = {
+    "ep2xtp4": (GLM52_EP2TP4, N_RANKS),
+    "ep2xtp8": (GLM52_EP2TP8, 16),
+}
+
+
+@pytest.mark.parametrize("layout", list(FP8_REQUANT_LAYOUTS))
+def test_admits_fp8_checkpoint_requantized_to_fp4(monkeypatch, layout: str):
+    """FP8-checkpoint layers the loader requantizes to FP4 (#3334's path) are
+    admitted at the 8- and 16-rank EP2 x TP decode shapes: before loading from
+    the checkpoint shapes (only at block 512, which w13 needs), and after it
+    from the installed K-major FP4 weights and ``*_weight_scale_inv``."""
+    rt = _load_runtime_modules(monkeypatch)
+    adapter = rt.adapter
+    cfg, n_ranks = FP8_REQUANT_LAYOUTS[layout]
+    _fake_fp8_method_topology(monkeypatch, rt, cfg, n_ranks, ep_rank=1)
+
+    ckpt_runner, _, ckpt_layer = _fp8_method_runner(rt, cfg, n_ranks, form="checkpoint")
+    assert adapter.precheck_admission(ckpt_layer, requant_block=512) is None
+    for block in (256, 1024):
+        refusal = adapter.precheck_admission(ckpt_layer, requant_block=block)
+        assert refusal is not None and "admits no token count" in refusal
+    del ckpt_runner  # precheck_admission finds it through a weakref
+
+    runner, _, _ = _fp8_method_runner(rt, cfg, n_ranks, form="kmajor_fp4")
+    adm = adapter._admit(runner, n_ranks)
+    assert not isinstance(adm, str), adm
+    assert adm.rows == kernel.ROW_BUCKETS
+    assert adm.experts_start == cfg["e"] // cfg["ep"]
+    assert adm.statics.use_ep
+
+
+@pytest.mark.parametrize(
+    "layout, form", [("ep2xtp4", "packed_fp4"), ("ep2xtp8", "fp8")]
+)
+def test_refuses_fp8_method_layers_without_native_fp4(monkeypatch, layout, form):
+    """The GMM's packed FP4 experts and unrequantized FP8 experts keep their
+    paths."""
+    rt = _load_runtime_modules(monkeypatch)
+    cfg, n_ranks = FP8_REQUANT_LAYOUTS[layout]
+    _fake_fp8_method_topology(monkeypatch, rt, cfg, n_ranks, ep_rank=0)
+    runner, _, _ = _fp8_method_runner(rt, cfg, n_ranks, form=form)
+    reason = rt.adapter._admit(runner, n_ranks)
+    assert isinstance(reason, str) and "not native FP4" in reason
+
+
+def test_arm_fp8_method_layer_and_dispatch_apply_monolithic(monkeypatch):
+    """An armed EP2xTP8 FP8-method layer runs the op from ``apply_monolithic``
+    with its ``*_weight_scale_inv`` scales as the op's s13 / s2."""
+    rt = _load_runtime_modules(monkeypatch)
+    t = rt.torch
+    adapter = rt.adapter
+    cfg, n_ranks = FP8_REQUANT_LAYOUTS["ep2xtp8"]
+    topo = _fake_fp8_method_topology(monkeypatch, rt, cfg, n_ranks, ep_rank=1)
+    adapter._OPS.clear()
+    monkeypatch.setattr(adapter.fp8_decode, "_SELFTESTED_BUCKETS", set())
+    monkeypatch.setattr(adapter.fp8_decode, "_check_ranks_agree", lambda _d: None)
+    monkeypatch.setattr(adapter.fp8_decode, "_selftest", lambda *_a: [])
+    monkeypatch.setattr(adapter.fp8_decode, "_gather", lambda d: [d])
+    monkeypatch.setattr(
+        adapter.fp8_decode, "_rank_tensor", lambda _dev, r: _f32_vec(t, r)
+    )
+    monkeypatch.setattr(
+        adapter.fp8_decode, "_e0_tensor", lambda _dev, e0: _f32_vec(t, e0)
+    )
+    calls: list[tuple[Any, ...]] = []
+
+    def fake_op(*args):
+        calls.append(args)
+        return args[0].clone()
+
+    monkeypatch.setattr(adapter, "_get_op", lambda _mesh, _statics: fake_op)
+    monkeypatch.setenv("USE_MOE_TP_DECODE_NVFP4_KERNEL", "1")
+    monkeypatch.setenv("USE_MOE_FUSED_EP_KERNEL", "0")
+    monkeypatch.setenv("TPU_MOE_TP_DECODE_HBM_OPERANDS", "0")
+    monkeypatch.setattr(
+        adapter.fp8_decode.token_padding,
+        "_padding_state",
+        SimpleNamespace(local_padding_mask=t.zeros(64, dtype=t.uint8)),
+    )
+    runner, qm, layer = _fp8_method_runner(rt, cfg, n_ranks, form="kmajor_fp4")
+
+    class _Model(t.nn.Module):
+        def modules(self):
+            return [self, runner]
+
+    assert adapter.arm(_Model()) == 1
+    assert adapter.moe_tp_decode_nvfp4_supported(qm)
+    assert _scalar(layer._moe_tp_decode_nvfp4_rank) == topo.mesh_index
+    assert _scalar(layer._moe_tp_decode_nvfp4_e0) == cfg["e"] // cfg["ep"]
+
+    x = t.zeros(16, cfg["h"], dtype=t.bfloat16)
+    out = qm.apply_monolithic(layer, x, t.zeros(16, cfg["e"], dtype=t.bfloat16))
+    assert out.shape == x.shape and len(calls) == 1
+    assert calls[0][0] is x
+    assert calls[0][6] is layer.w13_weight_scale_inv
+    assert calls[0][7] is layer.w2_weight_scale_inv
 
 
 def _load_precedence_modules(monkeypatch):

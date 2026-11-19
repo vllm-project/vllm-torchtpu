@@ -2,8 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Torch bridge for kernels/experimental/moe_tp_decode_nvfp4.
 
-Mirrors ``layers/adapter/moe_tp_decode.py`` for ``VllmNvfp4MoEMethod`` layers
-behind ``USE_MOE_TP_DECODE_NVFP4_KERNEL`` (default off):
+Mirrors ``layers/adapter/moe_tp_decode.py`` for FP4 MoE layers behind
+``USE_MOE_TP_DECODE_NVFP4_KERNEL`` (default off): ``VllmNvfp4MoEMethod`` layers,
+and ``VllmFp8MoEMethodTPU`` layers whose FP8-checkpoint experts the loader
+requantized to native FP4 with per-matrix blocks under
+``MOE_REQUANTIZE_WEIGHT_DTYPE=fp4`` (the same K-major values and 4D f32 block
+scales, held as ``w*_weight_scale_inv``):
   - At ``n < 16``, pads ``x`` and ``scores`` to ``m = 16``, runs
     ``moe_tp_decode_nvfp4`` (W4A8 grouped FP4 decode kernel + in-kernel
     all-reduce), and slices ``[:n]``.
@@ -46,6 +50,12 @@ _BUFFERS = (
 )
 
 _OPS: dict[tuple, Any] = {}
+# w13, w2 and (s13, s2) of a routed-expert layout, before the weights exist.
+_RoutedSds = tuple[
+    jax.ShapeDtypeStruct,
+    jax.ShapeDtypeStruct,
+    tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct],
+]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,7 +65,7 @@ class _OpStatics(fp8_decode._OpStatics):
 
 
 def moe_tp_decode_nvfp4_supported(quant_method: Any) -> bool:
-    """Whether arming gave this layer's NVFP4 quant method the fused TP op."""
+    """Whether arming gave this layer's FP4 quant method the fused TP op."""
     return getattr(quant_method, _OP_ATTR, None) is not None
 
 
@@ -64,14 +74,7 @@ def _proposed_routed_sds(
     *,
     requant_block: int,
     clamp_per_matrix: bool = True,
-) -> (
-    tuple[
-        jax.ShapeDtypeStruct,
-        jax.ShapeDtypeStruct,
-        tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct],
-    ]
-    | str
-):
+) -> _RoutedSds | str:
     """Describe the K-major FP4 weights and 4D scales ``_prepare_moe_weights``
     will emit for ``layer`` before checkpoint tensors are mutated."""
     if requant_block <= 0:
@@ -95,16 +98,51 @@ def _proposed_routed_sds(
             )
         inter_out = align_to(inter, requant_block)
         b13 = b2 = requant_block
+    return _kmajor_fp4_sds(experts, hidden, inter_out, b13, b2)
+
+
+def _proposed_fp8_requant_sds(layer: Any, *, requant_block: int) -> _RoutedSds | str:
+    """Describe the native FP4 weights and 4D scales the FP8 method's FP4
+    requantization emits for ``layer`` (FP8 checkpoint ``w13 [E, 2I, H]``,
+    ``w2 [E, H, I]``) with blocks clamped per matrix to ``min(block, K)``.
+    An intermediate size the loader would pad to 128 columns is described
+    unpadded, which the kernel refuses."""
+    if requant_block <= 0:
+        return f"invalid requant_block {requant_block}"
+    experts, _, hidden = (int(d) for d in layer.w13_weight.shape)
+    inter = int(layer.w2_weight.shape[-1])
+    b13, b2 = min(requant_block, hidden), min(requant_block, inter)
+    if hidden % b13 or inter % b2:
+        return (
+            f"weight block {requant_block} does not tile hidden ({hidden}) and "
+            f"intermediate ({inter})"
+        )
+    return _kmajor_fp4_sds(experts, hidden, inter, b13, b2)
+
+
+def _kmajor_fp4_sds(
+    experts: int, hidden: int, inter: int, b13: int, b2: int
+) -> _RoutedSds:
+    """K-major FP4 ``w13 [E, H, 2I]``, ``w2 [E, I, H]`` and their 4D block
+    scales at w13 block ``b13`` and w2 block ``b2``."""
     return (
-        jax.ShapeDtypeStruct((experts, hidden, 2 * inter_out), jnp.float4_e2m1fn),
-        jax.ShapeDtypeStruct((experts, inter_out, hidden), jnp.float4_e2m1fn),
+        jax.ShapeDtypeStruct((experts, hidden, 2 * inter), jnp.float4_e2m1fn),
+        jax.ShapeDtypeStruct((experts, inter, hidden), jnp.float4_e2m1fn),
         (
-            jax.ShapeDtypeStruct(
-                (experts, hidden // b13, 1, 2 * inter_out), jnp.float32
-            ),
-            jax.ShapeDtypeStruct((experts, inter_out // b2, 1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((experts, hidden // b13, 1, 2 * inter), jnp.float32),
+            jax.ShapeDtypeStruct((experts, inter // b2, 1, hidden), jnp.float32),
         ),
     )
+
+
+def _routed_scale_attrs(quant_method: Any) -> tuple[str, str]:
+    """The layer attributes holding the routed experts' FP4 block scales: the
+    FP8 method keeps its runtime scales under ``*_weight_scale_inv``."""
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
+
+    if isinstance(quant_method, VllmFp8MoEMethodTPU):
+        return ("w13_weight_scale_inv", "w2_weight_scale_inv")
+    return ("w13_weight_scale", "w2_weight_scale")
 
 
 def _admit(
@@ -118,24 +156,37 @@ def _admit(
     from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
         enable_pipelined_collective_and_compute,
     )
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
     from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4MoEMethod
 
     def _pre_check() -> str | None:
         if enable_pipelined_collective_and_compute():
             return "the MoE path owns its collectives (TPU_MOE_COLLECTION_CHUNK_SIZE)"
+        layer = runner.routed_experts
+        if (
+            not pre_load
+            and isinstance(layer.quant_method, VllmFp8MoEMethodTPU)
+            and layer.w13_weight.dtype != torch.float4_e2m1fn_x2
+        ):
+            return (
+                f"the FP8 method's routed weights are {layer.w13_weight.dtype}, "
+                "not native FP4 (MOE_REQUANTIZE_WEIGHT_DTYPE=fp4 with this "
+                "kernel's layout)"
+            )
         return None
 
     def _get_scales(layer: Any) -> tuple[torch.Tensor, torch.Tensor] | str:
-        w13_scale = getattr(layer, "w13_weight_scale", None)
-        w2_scale = getattr(layer, "w2_weight_scale", None)
+        s13_attr, s2_attr = _routed_scale_attrs(layer.quant_method)
+        w13_scale = getattr(layer, s13_attr, None)
+        w2_scale = getattr(layer, s2_attr, None)
         if w13_scale is None or w2_scale is None:
-            return "missing w13_weight_scale / w2_weight_scale"
+            return f"missing {s13_attr} / {s2_attr}"
         return (w13_scale, w2_scale)
 
     return fp8_decode._admit_common(
         runner,
         n_ranks,
-        quant_cls=VllmNvfp4MoEMethod,
+        quant_cls=(VllmNvfp4MoEMethod, VllmFp8MoEMethodTPU),
         pre_check=_pre_check,
         get_scales=_get_scales,
         row_buckets=kernel.ROW_BUCKETS,
@@ -170,11 +221,16 @@ def precheck_admission(
         return None
     if fp8_decode.moe_tp_decode_supported(qm):
         return "moe_tp_decode already serves this layer"
-    proposed = _proposed_routed_sds(
-        layer,
-        requant_block=requant_block,
-        clamp_per_matrix=clamp_per_matrix,
-    )
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
+
+    if isinstance(qm, VllmFp8MoEMethodTPU):
+        proposed = _proposed_fp8_requant_sds(layer, requant_block=requant_block)
+    else:
+        proposed = _proposed_routed_sds(
+            layer,
+            requant_block=requant_block,
+            clamp_per_matrix=clamp_per_matrix,
+        )
     if isinstance(proposed, str):
         return proposed
     topo = fp8_decode._topology()
@@ -246,7 +302,7 @@ def should_arm() -> bool:
 
 
 def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> int:
-    """Arm every admitted NVFP4 MoE layer of ``model`` and ``draft_model``."""
+    """Arm every admitted FP4 MoE layer of ``model`` and ``draft_model``."""
     return fp8_decode._arm_layers(
         model,
         draft_model,
@@ -266,7 +322,7 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
 def moe_tp_decode_nvfp4_forward(
     quant_method: Any, layer: Any, x: torch.Tensor, router_logits: torch.Tensor
 ) -> torch.Tensor:
-    """Forward of an armed NVFP4 layer: reduced ``shared + scale * routed``."""
+    """Forward of an armed FP4 layer: reduced ``shared + scale * routed``."""
     return fp8_decode._forward_armed(
         quant_method,
         layer,
@@ -274,6 +330,6 @@ def moe_tp_decode_nvfp4_forward(
         router_logits,
         op_attr=_OP_ATTR,
         buffers=_BUFFERS,
-        scale_attrs=("w13_weight_scale", "w2_weight_scale"),
+        scale_attrs=_routed_scale_attrs(quant_method),
         log_tag="moe_tp_decode_nvfp4",
     )
