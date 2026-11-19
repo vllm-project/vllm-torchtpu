@@ -90,7 +90,7 @@ def _parse_visible_chip_ids(devices: str | int | None) -> list[int]:
 
     Raises:
         ValueError: If ``devices`` is a boolean or contains empty, non-integer,
-            negative, duplicate, or non-contiguous multi-chip IDs.
+            negative, duplicate, non-contiguous, or unaligned multi-chip IDs.
     """
     if isinstance(devices, bool):
         raise ValueError(
@@ -119,6 +119,14 @@ def _parse_visible_chip_ids(devices: str | int | None) -> list[int]:
             f"Invalid TPU visible devices specification: {devices!r}. "
             "Multi-chip TPU stages require contiguous ascending chip IDs "
             "(e.g. '0,1' or '2,3')."
+        )
+    # torch_tpu picks the stage topology from the chip count alone, so only
+    # slices aligned to their size are known to match the physical mesh.
+    if len(chip_ids) > 1 and chip_ids[0] % len(chip_ids) != 0:
+        raise ValueError(
+            f"Invalid TPU visible devices specification: {devices!r}. "
+            f"A {len(chip_ids)}-chip TPU stage must start at a multiple of "
+            f"{len(chip_ids)} (e.g. '0,1,2,3' or '4,5,6,7')."
         )
     return chip_ids
 
@@ -227,8 +235,8 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
                 clear visible chips.
 
         Raises:
-            ValueError: If ``devices`` contains invalid, duplicate, or
-                non-contiguous multi-chip IDs.
+            ValueError: If ``devices`` contains invalid, duplicate,
+                non-contiguous, or unaligned multi-chip IDs.
         """
         # Restore first: scoped_spawn_device_env calls this from its `finally`
         # with the parent's own value, which may not pass stage validation.

@@ -1163,7 +1163,20 @@ def test_set_device_control_env_var_multi_chip_and_empty(monkeypatch):
 
 @pytest.mark.parametrize(
     "bad_devices",
-    ["abc", "-1", "0,", ",1", "1,,2", "1,1", "0,2", "3,2", True, False],
+    [
+        "abc",
+        "-1",
+        "0,",
+        ",1",
+        "1,,2",
+        "1,1",
+        "0,2",
+        "3,2",
+        "1,2",
+        "2,3,4,5",
+        True,
+        False,
+    ],
 )
 def test_set_device_control_env_var_invalid_inputs_atomic(monkeypatch, bad_devices):
     monkeypatch.setattr(OmniTpuPlatform, "_saved_spawn_env", None)
