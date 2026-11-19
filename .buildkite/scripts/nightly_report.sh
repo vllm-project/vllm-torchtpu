@@ -26,17 +26,41 @@
 set -euo pipefail
 
 SCRIPTS="$(dirname "${BASH_SOURCE[0]}")"
+# The key prefix of the nightly tests-lane steps a verified pair needs passed:
+# pipeline_tests.yml names no generation in its keys, bootstrap.py puts each
+# generation's prefix before them, and a pair needs v7x's. Asked here and not
+# where it is used: tests_lane_passed reads the keys through a process
+# substitution, where a failure would only shorten the list of steps that must
+# have passed.
+VERIFIED_KEY_PREFIX="$(python3 "${SCRIPTS}/bootstrap.py" verified-key-prefix)"
 
 meta() {
   buildkite-agent meta-data get "$1" --default "$2"
 }
 
-# Every cpu/tests-lane step a nightly runs (every key but `(PR)` steps) passed.
+# The keys of file $1's steps a nightly runs: every key but the (PR) steps'
+# `_pr` ones.
+nightly_keys_in() {
+  grep -oE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' "$1" \
+    | sed -E 's/.*key:[[:space:]]*"?//' \
+    | grep -v '_pr$'
+}
+
+# The keys of every CPU and tests-lane step a nightly runs, the tests lane's
+# behind VERIFIED_KEY_PREFIX.
+nightly_tests_lane_keys() {
+  nightly_keys_in ".buildkite/pipeline_cpu.yml"
+  nightly_keys_in ".buildkite/pipeline_tests.yml" \
+    | sed "s/^/${VERIFIED_KEY_PREFIX}/"
+}
+
+# Every step nightly_tests_lane_keys names passed. Another generation's steps
+# carry its own prefix and are not among them, so they do not hold back a
+# pair.
 # A step the report did not wait for may have no outcome yet, which counts as
 # not passed: a nightly test missing from the step's depends_on can stop a pair
 # being recorded, never let one through.
 tests_lane_passed() {
-  local files=(".buildkite/pipeline_cpu.yml" ".buildkite/pipeline_tests.yml")
   local key outcome passed=true
   while IFS= read -r key; do
     outcome=$(buildkite-agent step get outcome --step "${key}" 2>/dev/null || true)
@@ -44,9 +68,14 @@ tests_lane_passed() {
     if [[ "${outcome}" != "passed" ]]; then
       passed=false
     fi
-  done < <(grep -hoE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' "${files[@]}" | sed -E 's/.*key:[[:space:]]*"?//' | grep -v '_pr$')
+  done < <(nightly_tests_lane_keys)
   [[ "${passed}" == true ]]
 }
+
+# Sourced (as test_bootstrap.py does, to call the functions above), stop here.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
 
 if [[ "$(meta stop_support_matrix false)" == "true" ]]; then
   echo "--- 🛑 Uploading the models and features failed: no support matrices"
