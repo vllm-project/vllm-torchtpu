@@ -533,9 +533,18 @@ def merge_head_candidates(
     """`merge_candidates` per KV head: ``[dcp, T, G * 2 * topk]`` (each
     rank's `pack_candidates` of its ``G`` heads, head-major) -> selection
     ``[T, G, topk]``."""
+    from vllm_torchtpu import envs
+
     dcp, num_tokens, width = candidates.shape
     num_heads = width // (2 * topk)
-    if dcp * topk < _KERNEL_MERGE_MIN_CANDIDATES:
+    min_tokens = int(envs.TPU_MINIMAX_M3_DCP_MERGE_KERNEL_MIN_TOKENS)
+    kernel_by_tokens = 0 < min_tokens <= num_tokens
+    if kernel_by_tokens and dcp * topk < _KERNEL_MERGE_MIN_CANDIDATES:
+        msa_attention_lse._proof(
+            "TPU_MINIMAX_M3_DCP_MERGE_KERNEL_MIN_TOKENS",
+            f"DCP selection merge of >= {min_tokens} tokens by the merge kernel",
+        )
+    if dcp * topk < _KERNEL_MERGE_MIN_CANDIDATES and not kernel_by_tokens:
         rows = candidates.reshape(dcp, num_tokens * num_heads, 2 * topk)
         return merge_candidates(rows, topk).reshape(num_tokens, num_heads, topk)
     block_t = min(_MERGE_BLOCK_TOKENS, -(-num_tokens // 8) * 8)

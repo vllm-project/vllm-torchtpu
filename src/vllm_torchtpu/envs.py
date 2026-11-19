@@ -255,6 +255,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
     TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR: int = 1
     TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: bool = False
+    TPU_MINIMAX_M3_DCP_MERGE_KERNEL_MIN_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT: int = 8
     TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT: bool = False
     TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC: bool = False
@@ -1633,6 +1634,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the same selected-page union (twice the rows per page at 2 replicas).
     # The query heads and outputs move by an all-to-all inside the replica
     # group (one chip's cores). Same outputs bit for bit.
+    # MiniMax M3 DCP selection merge (`msa_dcp.merge_head_candidates`): calls
+    # of at least this many tokens run the Pallas merge kernel even when the
+    # merge has fewer than 64 candidates per token (DCP 2), instead of the
+    # dense [rows, n, n] ranking fusions. 0 (default) keeps the dense
+    # ranking there. Same selection bit for bit.
+    "TPU_MINIMAX_M3_DCP_MERGE_KERNEL_MIN_TOKENS": env_int(
+        "TPU_MINIMAX_M3_DCP_MERGE_KERNEL_MIN_TOKENS", 0
+    ),
     "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT": env_bool(
         "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT", default=False
     ),
