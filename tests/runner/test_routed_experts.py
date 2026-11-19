@@ -179,6 +179,19 @@ def test_a_dp_rank_returns_its_own_rows(
     assert np.array_equal(outputs["a"].rows, rows[:5].numpy())
 
 
+def test_layers_that_differ_in_who_gathers_are_rejected(monkeypatch, on_host):
+    """The capturer keeps one count of gathered DP ranks for every layer, so a
+    model where vLLM gathers the rows for some MoE layers and the MoE method
+    for the others cannot be captured."""
+    model = capture_utils.make_moe_model(dp_size=2, vllm_gathers_dp_rows=True)
+    model[1].do_naive_dispatch_combine = False
+
+    with pytest.raises(
+        NotImplementedError, match=r"vLLM gathers them before MoE layers \[0, 2\]"
+    ):
+        _capture(monkeypatch, model)
+
+
 def test_a_rank_that_does_not_publish_copies_nothing(build_capture, on_host):
     capture, model = build_capture(is_first_rank=False)
     _begin(capture, ["a"])

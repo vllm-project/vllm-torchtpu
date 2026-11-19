@@ -159,15 +159,32 @@ def _gathered_dp_rows(model: torch.nn.Module) -> tuple[int, int]:
     which of them are this rank's.
 
     With DP and EP, vLLM gathers every DP rank's rows before it calls the MoE
-    method, unless the method gathers them itself after `route()`. Every MoE
-    layer does the same, so the first one answers for all. The gather follows
-    the DP group, so this rank's rows sit at its position in the group, the
-    `dp_rank` vLLM gives every MoE layer from that group.
+    method, unless the method gathers them itself after `route()`. The
+    capturer keeps one count for all layers, so a model whose layers differ is
+    rejected: under TPU_MOE_FP8_ALL_GATHER the FP8 method gathers the rows
+    itself, but the unquantized method of an FP8 checkpoint's ignored MoE
+    layers does not. The gather follows the DP group, so this rank's rows sit
+    at its position in the group, the `dp_rank` vLLM gives every MoE layer
+    from that group.
     """
-    runner = next(module for module in model.modules() if isinstance(module, MoERunner))
-    if not runner.do_naive_dispatch_combine:
+    runners = [module for module in model.modules() if isinstance(module, MoERunner)]
+    gathered_by_vllm = [
+        runner.layer_id for runner in runners if runner.do_naive_dispatch_combine
+    ]
+    if gathered_by_vllm and len(gathered_by_vllm) < len(runners):
+        raise NotImplementedError(
+            "--enable-return-routed-experts cannot capture a model whose MoE "
+            "layers differ in who gathers the DP ranks' rows: vLLM gathers "
+            f"them before MoE layers {gathered_by_vllm}, and the other "
+            "layers' MoE methods gather them after picking the experts. Unset "
+            "TPU_MOE_FP8_ALL_GATHER."
+        )
+    if not gathered_by_vllm:
         return 1, 0
-    return runner.moe_config.dp_size, runner.moe_config.dp_rank
+    # Every MoE layer's moe_config comes from the engine's one parallel
+    # config, so the first layer's DP size and rank are every layer's.
+    moe_config = runners[0].moe_config
+    return moe_config.dp_size, moe_config.dp_rank
 
 
 @dataclass
