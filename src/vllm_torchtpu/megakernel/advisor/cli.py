@@ -26,11 +26,14 @@ from vllm_torchtpu.megakernel.core import errors
 
 from .calibrate import CalibrateOptions, calibrate_trace
 from .chips import (
+    BUILTIN_CHIP_SPECS,
     ChipSpec,
     public_calibration_path,
     resolve_chip_spec,
 )
 from .constants import (
+    CHIP_KIND_MAP,
+    CORE_LIMITS,
     DEFAULT_CHIP,
     DEFAULT_PHASE,
     DEFAULT_PREFILL_ISL,
@@ -41,6 +44,12 @@ from .constants import (
     VALID_DMA_BUFFERS,
 )
 from .models import (
+    DEPLOYMENT_PRESETS,
+    DTYPE_BASIS_PHRASES,
+    MODEL_PRESET_DTYPE_BASIS,
+    MODEL_PRESET_SOURCES,
+    MODEL_PRESETS,
+    DeploymentPreset,
     ModelProfile,
     ParallelLayout,
     match_preset_by_geometry,
@@ -60,16 +69,147 @@ from .report import (
     write_bucket_schedule,
 )
 from .specs import (
+    SUPPORT_TIER_DESCRIPTIONS,
     DispatchRegime,
+    ModelSupportTier,
     MoEMode,
     ObjectiveMode,
     Phase,
     WorkloadSpec,
 )
+from .support import classify_model_support_tier
 from .verdict import advise, search_layer_groups
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+
+MODEL_LISTING_TIER_HEADINGS: tuple[tuple[ModelSupportTier, str], ...] = tuple(
+    (tier_name, SUPPORT_TIER_DESCRIPTIONS[tier_name])
+    for tier_name in get_args(ModelSupportTier)
+)
+
+ModelListingRow = tuple[str, ModelProfile, tuple[str, ...]]
+
+
+def _format_listing_role_line(role_name: str, layout: ParallelLayout) -> str:
+    """Format one deployment role line with optional megakernel limits."""
+    base_line = f"    {role_name}: {layout.label()} ({layout.submodule_label()})"
+    if layout.megakernel is None:
+        return base_line
+    megakernel = layout.megakernel
+    clauses: list[str] = []
+    max_rows = megakernel.get("max_rows")
+    if max_rows is not None:
+        clauses.append(f"rows per call <= {max_rows}")
+    max_total_rows = megakernel.get("max_total_rows")
+    if max_total_rows is not None:
+        clauses.append(f"rows per step <= {max_total_rows}")
+    source_ref = megakernel.get("source_ref", "")
+    if source_ref:
+        clauses.append(f"ref: {source_ref}")
+    if not clauses:
+        return f"{base_line} | declared megakernel"
+    return f"{base_line} | declared megakernel: {', '.join(clauses)}"
+
+
+def _format_deployment_listing_lines(deployment: DeploymentPreset) -> list[str]:
+    """Format shipped deployment layouts and unmodeled notes for a preset."""
+    lines = [
+        _format_listing_role_line(role_name, layout)
+        for role_name, layout in deployment.named_layouts()
+    ]
+    lines.extend(f"    not modeled: {note}" for note in deployment.unmodeled_notes)
+    return lines
+
+
+def _format_model_listing_preset(
+    preset_name: str,
+    profile: ModelProfile,
+    tier_name: ModelSupportTier,
+    unmodeled_notes: tuple[str, ...],
+) -> list[str]:
+    """Format all listing lines for a single shipped model preset."""
+    families_text = ",".join(profile.layer_families) or "none"
+    basis_key = MODEL_PRESET_DTYPE_BASIS[preset_name]
+    basis_phrase = DTYPE_BASIS_PHRASES[basis_key]
+    source_text = MODEL_PRESET_SOURCES.get(preset_name, "")
+    lines = [
+        (
+            f"  {preset_name}: tier={tier_name} | families={families_text} | "
+            f"dtypes={profile.weight_dtype}/{profile.expert_dtype} ({basis_phrase})"
+        ),
+        f"    source: {source_text}",
+    ]
+    deployment = DEPLOYMENT_PRESETS.get(preset_name)
+    if deployment is not None:
+        lines.extend(_format_deployment_listing_lines(deployment))
+    elif unmodeled_notes:
+        lines.extend(f"    not modeled: {note}" for note in unmodeled_notes)
+    return lines
+
+
+def _format_chip_budget_lines() -> list[str]:
+    """Build `--list-models` chip support lines from `CORE_LIMITS` and chip specs."""
+    budget_chips = [
+        chip_name
+        for chip_name in BUILTIN_CHIP_SPECS
+        if CHIP_KIND_MAP.get(chip_name) in CORE_LIMITS.chip_kinds
+    ]
+    rate_only_chips = [
+        chip_name
+        for chip_name in BUILTIN_CHIP_SPECS
+        if CHIP_KIND_MAP.get(chip_name) not in CORE_LIMITS.chip_kinds
+    ]
+    lines: list[str] = []
+    if budget_chips:
+        budget_verb = "has" if len(budget_chips) == 1 else "have"
+        lines.append(
+            f"Chips: {', '.join(budget_chips)} {budget_verb} megakernel core budgets."
+        )
+    else:
+        kinds_text = ", ".join(CORE_LIMITS.chip_kinds)
+        lines.append(f"Chips with megakernel core budgets: {kinds_text}.")
+    if rate_only_chips:
+        rate_verb = "is" if len(rate_only_chips) == 1 else "are"
+        lines.append(
+            f"{', '.join(rate_only_chips)} {rate_verb} priced from hardware rates "
+            "only: every fused scope there is gated by chip_without_core_budget."
+        )
+    return lines
+
+
+def format_model_listing() -> str:
+    """Format shipped model presets grouped by megakernel support tier."""
+    lines = [
+        "=== Megakernel Advisor: shipped model presets by support tier ===",
+        *_format_chip_budget_lines(),
+    ]
+    grouped: dict[ModelSupportTier, list[ModelListingRow]] = {
+        tier_name: [] for tier_name, _heading in MODEL_LISTING_TIER_HEADINGS
+    }
+    for preset_name in MODEL_PRESETS:
+        profile = resolve_model_profile(preset_name)
+        tier_name, unmodeled_notes = classify_model_support_tier(profile)
+        grouped[tier_name].append((preset_name, profile, unmodeled_notes))
+    for tier_name, heading_text in MODEL_LISTING_TIER_HEADINGS:
+        entries = grouped[tier_name]
+        if not entries:
+            continue
+        lines.append("")
+        lines.append(f"[{tier_name}] {heading_text}")
+        for preset_name, profile, unmodeled_notes in entries:
+            preset_lines = _format_model_listing_preset(
+                preset_name, profile, tier_name, unmodeled_notes
+            )
+            lines.extend(preset_lines)
+    return "\n".join(lines)
+
+
+def _emit_model_listing() -> int:
+    """Write the shipped model listing to stdout and return exit code 0."""
+    sys.stdout.write(format_model_listing() + "\n")
+    return 0
 
 
 def _emit_config_preset_notice(
@@ -186,6 +326,11 @@ def _add_source_args(parser: argparse.ArgumentParser) -> None:
         "--hf-repo",
         type=str,
         help="HuggingFace repository ID.",
+    )
+    model_group.add_argument(
+        "--list-models",
+        action="store_true",
+        help="List shipped model presets by megakernel support tier and exit.",
     )
     parser.add_argument(
         "--chip",
@@ -424,7 +569,10 @@ def _add_output_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--regime-sweep",
         action="store_true",
-        help="Evaluate the full 12-regime matrix across batch and phase.",
+        help=(
+            "Evaluate the regime matrix across batch sizes and phases "
+            "(rows depend on the model's layouts)."
+        ),
     )
     parser.add_argument(
         "--search-layer-groups",
@@ -813,6 +961,8 @@ def _run_calibrate_cli(argv: Sequence[str]) -> int:
 
 def _run_main_command(args: argparse.Namespace) -> int:
     """Execute the resolved non-calibrate advisor CLI action."""
+    if args.list_models:
+        return _emit_model_listing()
     if args.config and not Path(args.config).is_file():
         msg = f"Missing config file: {args.config!r}"
         raise errors.MegakernelConfigError(msg)

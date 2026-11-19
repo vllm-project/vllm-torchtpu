@@ -579,21 +579,31 @@ def test_html_badge_counts_a_measured_collective() -> None:
 
 
 def test_band_first_cli_and_html_tables_lead_with_floor_to_upper_band() -> None:
-    """Verify CLI and HTML tables lead with the `[floor..upper]` step band."""
+    """Verify CLI and HTML tables lead with the peak floor band."""
     sweep = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
     html_out = advisor.render_advisor_html(sweep)
-    band_th = '<th class="tabular">Step Band [floor..upper] (us)</th>'
+    band_th = '<th class="tabular">Peak Floor Band (eta=1.0, us)</th>'
     tput_th = '<th class="tabular">Throughput (tok/s/chip)</th>'
     gain_th = '<th class="tabular">Gain vs per_op</th>'
     assert band_th in html_out
     assert html_out.index(band_th) < html_out.index(tput_th) < html_out.index(gain_th)
-    assert "<strong>floor " in html_out
-    assert "hardware floor:" in html_out
+    for entry in sweep.regimes:
+        assert f"<strong>{entry.step_bound_us:,.1f} .. " in html_out
+    assert "derated achievable: " in html_out
+    assert "hardware floor:" not in html_out
     assert "fused-scope device estimate" in html_out
+    assert "Peak Floor to Peak Upper (us)" in html_out
+    eta_legend = (
+        "eta is the efficiency factor applied to peak hardware rates; "
+        "eta=1.0 means peak rates."
+    )
+    assert eta_legend in " ".join(html_out.split())
 
     table_txt = advisor.format_regime_table(sweep, unresolved=True)
-    assert "Step Band [floor..upper] (us)" in table_txt
-    assert "Step Band=[floor " in table_txt
+    assert "Peak Floor Band (eta=1.0, us)" in table_txt
+    assert eta_legend in table_txt
+    assert "Peak Floor Band=[" in table_txt
+    assert "Derated Achievable=[" in table_txt
     assert "Unresolved Assumptions (Decode Reference):" in table_txt
     assert "assumed=" in table_txt
 
@@ -648,3 +658,46 @@ def test_band_first_cli_and_html_tables_lead_with_floor_to_upper_band() -> None:
     calibrated_html = advisor.render_advisor_html(calibrated_sweep)
     assert "CALIBRATED TRACE" in calibrated_html
     assert "UNCALIBRATED PRIORS" not in calibrated_html
+
+
+def test_layer_group_table_separates_peak_band_from_derated_achievable() -> None:
+    """Verify layer-group and regime tables separate peak band from derated."""
+    sweep = advisor.advise_regimes("kimi-k3", "tpu7x")
+    search = sweep.layer_group_search
+    assert search is not None
+    assert search.candidates
+
+    search_text = advisor.format_layer_group_search(search)
+    search_header = ""
+    for line in search_text.splitlines():
+        if "Partition" in line and "Calls" in line:
+            search_header = line
+            break
+    assert search_header
+    assert "Bound (us)" not in search_text
+    peak_floor_pos = search_header.index("Peak Floor (us)")
+    peak_upper_pos = search_header.index("Peak Upper (us)")
+    derated_pos = search_header.index("Derated Achievable (us)")
+    assert peak_floor_pos < peak_upper_pos < derated_pos
+
+    html_out = advisor.render_advisor_html(sweep)
+    lg_table = html_out.split("Layer-Group Partition Search", 1)[1].split(
+        "</table>", 1
+    )[0]
+    floor_th = '<th class="tabular">Peak Floor (us)</th>'
+    upper_th = '<th class="tabular">Peak Upper (us)</th>'
+    derated_th = '<th class="tabular">Derated Achievable (us)</th>'
+    assert lg_table.index(floor_th) < lg_table.index(upper_th)
+    assert lg_table.index(upper_th) < lg_table.index(derated_th)
+
+    for candidate in search.candidates:
+        assert candidate.step_bound_us <= candidate.step_upper_us
+
+    regime_text = advisor.format_regime_table(sweep)
+    assert "Peak Floor Band (eta=1.0, us)" in regime_text
+    has_derated_line = False
+    for line in regime_text.splitlines():
+        if line.strip().startswith("Derated Achievable=["):
+            has_derated_line = True
+            break
+    assert has_derated_line

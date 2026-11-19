@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import html
 import json
 import os
 import re
@@ -36,10 +37,12 @@ from tests.megakernel.test_advisor_calibrate import (
     XLA_MOD_START_OFFSET_US,
     build_multi_program_xla_modules_perfetto_events,
 )
+from tests.megakernel.test_advisor_engine_parity import DISPLAY_ROUND_TOL_US
 from vllm_torchtpu.megakernel import advisor
 from vllm_torchtpu.megakernel.advisor import (
     constants,
     models,
+    specs,
     workbench_engine,
     workbench_phase,
 )
@@ -790,6 +793,33 @@ def test_workbench_waterfall_card_matches_chain_composition(tmp_path: Path) -> N
         assert float(m_delta.group(1)) == pytest.approx(svg_delta, abs=1e-9)
 
 
+def _first_single_layer_verify_batch() -> int:
+    """Return the smallest verify batch whose fastest scope is single_layer.
+
+    The scan uses 3 draft tokens on TP8 x EP8 x DCP4 at a 4K context, the
+    workload of the spec-verify regimes. The row count where the whole step
+    stops winning moves when a priced preset field changes.
+    """
+    for batch in (8, 16, 32, 64, 128, 256, 512, 1024):
+        report = advisor.advise(
+            "qwen3.5-397b",
+            advisor.WorkloadSpec(
+                phase="verify",
+                batch=batch,
+                spec_tokens=3,
+                context=4096,
+                tp=8,
+                ep=8,
+                dcp=4,
+            ),
+            "tpu7x",
+        )
+        if report.fastest_scope == "single_layer":
+            return batch
+    msg = "no verify batch from 8 to 1024 has single_layer as the fastest scope"
+    raise AssertionError(msg)
+
+
 def test_workbench_waterfall_card_tracks_winner_and_zero_sign(tmp_path: Path) -> None:
     """Verify waterfall card tracks evalA.winner, exact zero sign, and 0-comm snap."""
     sweep_report = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
@@ -824,7 +854,11 @@ def test_workbench_waterfall_card_tracks_winner_and_zero_sign(tmp_path: Path) ->
             "sub": "1",
             "tag": "wf_comm_before_flip",
         },
-        {"op": "set_batch", "value": 1024, "tag": "flipped_winner"},
+        {
+            "op": "set_batch",
+            "value": _first_single_layer_verify_batch(),
+            "tag": "flipped_winner",
+        },
         {"op": "pin_regime", "idx": mixed_idx, "slot": "A", "tag": "mixed"},
         {"op": "set_batch", "value": 1024, "tag": "mixed_1024"},
         {
@@ -892,7 +926,40 @@ def test_workbench_multicall_snap_and_inspecting_scope_sync(tmp_path: Path) -> N
         phase=True,
     )
     mc_by_tag = {str(s["tag"]): s for s in snaps_mc}
-    assert "[A] whole_step: 1873.60 us" in str(mc_by_tag["mc_wf_comm"]["derivDrawer"])
+    dec_high_reg = sweep_38.regimes[dec_high_idx]
+    dec_high_par = sweep_38.parallelism
+    expected_report = advisor.advise(
+        "qwen3.8-2.4t",
+        advisor.WorkloadSpec(
+            phase=dec_high_reg.phase,
+            batch=batch_32,
+            context=dec_high_reg.effective_context,
+            tp=dec_high_par.tp,
+            ep=dec_high_par.ep,
+            dp=dec_high_par.dp,
+            pp=dec_high_par.pp,
+            dcp=dec_high_par.dcp,
+            pcp=dec_high_par.pcp,
+            max_rows_per_call=row_limit_16,
+        ),
+        "tpu7x",
+    )
+    expected_whole = next(
+        scope for scope in expected_report.scopes if scope.scope == "whole_step"
+    )
+    expected_exposed_comm_us = (
+        expected_whole.roof_floor_us
+        - expected_whole.fill_drain_us
+        - max(expected_whole.chain_us, expected_whole.hbm_us)
+    )
+    drawer_match = re.search(
+        r"\[A\] whole_step: ([+-]?[0-9.]+) us",
+        str(mc_by_tag["mc_wf_comm"]["derivDrawer"]),
+    )
+    assert drawer_match is not None
+    assert float(drawer_match.group(1)) == pytest.approx(
+        expected_exposed_comm_us, abs=DISPLAY_ROUND_TOL_US
+    )
 
     sweep_35 = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
     vsmall_idx = next(
@@ -912,7 +979,11 @@ def test_workbench_multicall_snap_and_inspecting_scope_sync(tmp_path: Path) -> N
                 "sub": "1",
                 "tag": "wf",
             },
-            {"op": "set_batch", "value": 1024, "tag": "flip"},
+            {
+                "op": "set_batch",
+                "value": _first_single_layer_verify_batch(),
+                "tag": "flip",
+            },
         ],
         phase=True,
     )
@@ -1710,3 +1781,43 @@ def test_workbench_littles_law_decoding_seqs_and_xla_modules_trace_trim(
     drawer_after_cal = str(apply_res["derivDrawer"])
     assert "Calibrated Host Head:" in drawer_after_cal
     assert f"{expected_host_head_us:.1f} us" in drawer_after_cal
+
+
+def _extract_element_inner_html(html_text: str, element_id: str) -> str:
+    """Return inner markup of the unique HTML element bearing `element_id`."""
+    pattern = rf'<([a-z0-9]+)\b[^>]*\bid="{re.escape(element_id)}"[^>]*>(.*?)</\1>'
+    match = re.search(pattern, html_text, re.DOTALL)
+    assert match is not None, f"Missing element id={element_id!r}"
+    return match.group(2)
+
+
+def test_workbench_renders_support_tier_and_unmodeled_notes() -> None:
+    """Verify workbench topbar renders support tier, sublayer label, and notes."""
+    kimi_sweep = advisor.advise_regimes("kimi-k3", "tpu7x")
+    kimi_html = advisor.render_advisor_html(kimi_sweep)
+    tier_inner = _extract_element_inner_html(kimi_html, "wb-support-tier")
+    assert html.unescape(tier_inner).strip() == kimi_sweep.support_tier
+    expected_kimi_title = html.escape(
+        specs.SUPPORT_TIER_DESCRIPTIONS[kimi_sweep.support_tier], quote=True
+    )
+    assert f'id="wb-support-tier" title="{expected_kimi_title}"' in kimi_html
+
+    sublayer_inner = _extract_element_inner_html(kimi_html, "wb-sublayer-label")
+    assert (
+        html.unescape(sublayer_inner).strip() == kimi_sweep.submodule_labels["decode"]
+    )
+
+    assert len(kimi_sweep.unmodeled_notes) > 0
+    notes_inner = _extract_element_inner_html(kimi_html, "wb-unmodeled-notes")
+    for note in kimi_sweep.unmodeled_notes:
+        assert html.escape(note, quote=True) in notes_inner
+
+    mistral_sweep = advisor.advise_regimes("mistral-large", "tpu7x")
+    mistral_html = advisor.render_advisor_html(mistral_sweep)
+    mistral_tier = _extract_element_inner_html(mistral_html, "wb-support-tier")
+    assert html.unescape(mistral_tier).strip() == mistral_sweep.support_tier
+    expected_mistral_title = html.escape(
+        specs.SUPPORT_TIER_DESCRIPTIONS[mistral_sweep.support_tier], quote=True
+    )
+    assert f'id="wb-support-tier" title="{expected_mistral_title}"' in mistral_html
+    assert 'id="wb-unmodeled-notes"' not in mistral_html

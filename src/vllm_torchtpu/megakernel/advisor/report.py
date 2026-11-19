@@ -75,6 +75,61 @@ SUPPORT_TIER_BADGE_CLASSES: dict[str, str] = {
 }
 
 
+def _format_sweep_support_lines(sweep: AdvisorSweepReport) -> list[str]:
+    """Return support tier, sublayer mesh, and unmodeled note lines for sweep text."""
+    tier_description = SUPPORT_TIER_DESCRIPTIONS[sweep.support_tier]
+    lines = [f"Support tier: {sweep.support_tier} ({tier_description})"]
+    role_parts = [
+        f"{role_name} {sweep.submodule_labels[role_name]}"
+        for role_name in ("decode", "prefill", "saturation")
+        if role_name in sweep.submodule_labels
+    ]
+    if role_parts:
+        lines.append(f"Sublayer meshes: {'; '.join(role_parts)}")
+    if sweep.unmodeled_notes:
+        lines.append("Not modeled in this estimate:")
+        lines.extend(f"  - {note}" for note in sweep.unmodeled_notes)
+    return lines
+
+
+def _format_triage_entry_lines(entry: RegimeEntry) -> list[str]:
+    """Format peak-floor band and derated achievable triage lines for one regime."""
+    scope_dict = _entry_rec_scope_dict(entry)
+    upper_us = max(entry.step_bound_us, entry.step_upper_us)
+    achievable_low_us = float(
+        str(scope_dict.get("step_achievable_us", entry.step_bound_us))
+    )
+    achievable_high_us = float(str(scope_dict["step_achievable_upper_us"]))
+    ring_text = _format_ring_pair(scope_dict)
+    physics_us, dispatch_us = _entry_gain_split_us(entry)
+    physics_pct, achievable_pct = _entry_gain_pct_pair(entry)
+    physics_band = _gain_band_text(entry.metrics.get("compiler_proof_gain_us"))
+    break_even_head_us = float(
+        str(entry.metrics.get("break_even_host_head_delta_us", {}).get("value", 0.0))
+    )
+    break_even_suffix = (
+        f" | Break-even host-head=+{break_even_head_us:.1f} us"
+        if entry.recommended_scope == "per_op" and break_even_head_us > 0.0
+        else ""
+    )
+    roi_tag = " [LOW ROI <1% PHYSICS]" if 0.0 < physics_pct < 1.0 else ""
+    return [
+        (
+            f"  * {entry.label}: "
+            f"Peak Floor Band=[{entry.step_bound_us:.1f} .. {upper_us:.1f}] us"
+        ),
+        (
+            f"    Derated Achievable=[{achievable_low_us:.1f} .. "
+            f"{achievable_high_us:.1f}] us | "
+            f"Derated Achievable Step={achievable_low_us:.1f} us "
+            f"({achievable_pct:+.1f}% vs per_op) | ring={ring_text} | "
+            f"Fusion gain (estimate)={physics_us:+.1f} us "
+            f"({physics_pct:+.1f}%; {physics_band}) | "
+            f"Dispatch Bubble Gain={dispatch_us:+.1f} us{break_even_suffix}{roi_tag}"
+        ),
+    ]
+
+
 def _render_tier_badge_html(sweep: AdvisorSweepReport) -> str:
     """Render an HTML pill badge for the model support tier."""
     badge_class = SUPPORT_TIER_BADGE_CLASSES.get(
@@ -85,6 +140,14 @@ def _render_tier_badge_html(sweep: AdvisorSweepReport) -> str:
         f'<span class="{badge_class}" title="{_esc(tier_description)}">'
         f"{_esc(sweep.support_tier)}</span>"
     )
+
+
+def _render_decode_sublayer_inline(sweep: AdvisorSweepReport) -> str:
+    """Render the decode sublayer mesh inline beside the layout label."""
+    decode_sublayer = sweep.submodule_labels.get("decode", "")
+    if not decode_sublayer:
+        return ""
+    return f" &middot; <code>{_esc(decode_sublayer)}</code>"
 
 
 def _render_unmodeled_details_html(notes: tuple[str, ...]) -> str:
@@ -336,7 +399,7 @@ def format_regime_table(
     hdr = (
         f"{'Request Regime':36s} | {'Layout':22s} | {'Tokens':>6s} | "
         f"{'AI (FLOP/B)':>11s} | {'Passes':>6s} | {'Scope':12s} | "
-        f"{'MoE Mode':15s} | {'Step Band [floor..upper] (us)':>29s}"
+        f"{'MoE Mode':15s} | {'Peak Floor Band (eta=1.0, us)':>29s}"
     )
     layout_lines = [
         f"Decode Parallelism: {rec.label()} [{rec.topology}] ({mode_tag})",
@@ -367,6 +430,7 @@ def format_regime_table(
         )
     lines = [
         f"=== Megakernel Advisor Regime Report: {sweep.model} on {sweep.chip} ===",
+        *_format_sweep_support_lines(sweep),
         *layout_lines,
         f"Dtypes: {sweep.model_sources.get('dtypes', '')}",
     ]
@@ -422,38 +486,17 @@ def format_regime_table(
         f"{max(entry.step_bound_us, entry.step_upper_us):7.1f}]"
         for entry in sweep.regimes
     )
+    lines.append(
+        "eta is the efficiency factor applied to peak hardware rates; "
+        "eta=1.0 means peak rates."
+    )
     if sweep.regimes:
         lines.append("")
-        lines.append("Investment Triage (Step Band, Achievable Step, Gain Split):")
+        lines.append(
+            "Investment Triage (Peak Floor Band, Derated Achievable, Gain Split):"
+        )
         for entry in sweep.regimes:
-            rec_sc = _entry_rec_scope_dict(entry)
-            hi_us = max(entry.step_bound_us, entry.step_upper_us)
-            ach_us = float(str(rec_sc.get("step_achievable_us", entry.step_bound_us)))
-            ring_txt = _format_ring_pair(rec_sc)
-            cp_us, db_us = _entry_gain_split_us(entry)
-            cp_pct, ach_pct = _entry_gain_pct_pair(entry)
-            cp_band = _gain_band_text(entry.metrics.get("compiler_proof_gain_us"))
-            break_even_head_us = float(
-                str(
-                    entry.metrics.get("break_even_host_head_delta_us", {}).get(
-                        "value", 0.0
-                    )
-                )
-            )
-            break_even_suffix = (
-                f" | Break-even host-head=+{break_even_head_us:.1f} us"
-                if entry.recommended_scope == "per_op" and break_even_head_us > 0.0
-                else ""
-            )
-            roi_tag = " [LOW ROI <1% PHYSICS]" if 0.0 < cp_pct < 1.0 else ""
-            lines.append(
-                f"  * {entry.label}: "
-                f"Step Band=[floor {entry.step_bound_us:.1f}..{hi_us:.1f} us] | "
-                f"Derated Achievable Step={ach_us:.1f} us "
-                f"({ach_pct:+.1f}% vs per_op) | ring={ring_txt} | "
-                f"Fusion gain (estimate)={cp_us:+.1f} us ({cp_pct:+.1f}%; {cp_band}) | "
-                f"Dispatch Bubble Gain={db_us:+.1f} us{break_even_suffix}{roi_tag}"
-            )
+            lines.extend(_format_triage_entry_lines(entry))
     if unresolved and sweep.regimes and sweep.regimes[0].unresolved_assumptions:
         lines.append("")
         lines.append("Unresolved Assumptions (Decode Reference):")
@@ -1208,9 +1251,7 @@ def _render_decision_table_rows(sweep: AdvisorSweepReport) -> list[str]:
 
         rec_sc = _entry_rec_scope_dict(entry)
         ach_us = float(str(rec_sc.get("step_achievable_us", entry.step_bound_us)))
-        ach_hi_us = float(
-            str(rec_sc.get("step_achievable_upper_us", max(ach_us, hi_us)))
-        )
+        ach_hi_us = float(str(rec_sc["step_achievable_upper_us"]))
         ring_str = _format_ring_pair(rec_sc)
         ring_sub = (
             f'<div class="kpi-sub">ring=<code>{_esc(ring_str)}</code></div>'
@@ -1245,11 +1286,10 @@ def _render_decision_table_rows(sweep: AdvisorSweepReport) -> list[str]:
             f'<td><span class="badge badge-{scope}">{scope}</span>'
             f'<div class="kpi-sub"><code>{_esc(moe_mode)}</code></div>'
             f"{ring_sub}</td>"
-            f'<td class="tabular"><strong>floor {entry.step_bound_us:,.1f} .. '
+            f'<td class="tabular"><strong>{entry.step_bound_us:,.1f} .. '
             f"{hi_us:,.1f}</strong>"
             f'<div class="kpi-sub tabular" style="text-align: right;">'
-            f"hardware floor: {entry.step_bound_us:,.1f} us<br/>"
-            f"achievable: {ach_us:,.1f}..{ach_hi_us:,.1f} us</div></td>"
+            f"derated achievable: {ach_us:,.1f}..{ach_hi_us:,.1f} us</div></td>"
             f'<td class="tabular">{tput_val:,.1f}</td>'
             f'<td class="tabular {gain_cls}">{gain_str}'
             f'<div class="kpi-sub tabular" style="text-align: right;">'
@@ -1561,6 +1601,7 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
         layout_label=rec.label(),
         mode_source=mode_src,
         vmem_bounds_mib=(vmem_init_mib, vmem_max_mib),
+        sweep=sweep,
     )
     wb_js = render_workbench_script(sweep.model)
     return f"""<!DOCTYPE html>
@@ -1584,7 +1625,9 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
         Model: <strong>{_esc(sweep.model)}</strong> &middot;
         Chip: <strong>{_esc(sweep.chip)}</strong> &middot;
         Slice: <strong>{_esc(rec.topology)}</strong> &middot;
-        Parallelism: <strong>{_esc(rec.label())}</strong> ({_esc(mode_src)})
+        Parallelism: <strong>{_esc(rec.label())}</strong>
+        {_render_decode_sublayer_inline(sweep)} ({_esc(mode_src)})
+        &middot; Tier: {_render_tier_badge_html(sweep)}
       </div>
     </div>
     <button class="theme-btn" id="audit-theme-toggle" onclick="toggleTheme()"
@@ -1657,8 +1700,9 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
     <h2 style="font-size: 16px;">5. Request Regime Recommendations</h2>
     <p class="kpi-sub">Step bounds are hardware floors, not predictions:
       across analytical envelope fixtures they sit below derated achievable
-      step estimates. A small margin to the runner-up is a close call;
-      A/B the two scopes before building.</p>
+      step estimates. eta is the efficiency factor applied to peak hardware
+      rates; eta=1.0 means peak rates. A small margin to the runner-up is a
+      close call; A/B the two scopes before building.</p>
     <table>
       <thead>
         <tr>
@@ -1668,7 +1712,7 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
           <th class="tabular">AI (FLOP/B)</th>
           <th class="tabular">Passes</th>
           <th>Scope &amp; MoE</th>
-          <th class="tabular">Step Band [floor..upper] (us)</th>
+          <th class="tabular">Peak Floor Band (eta=1.0, us)</th>
           <th class="tabular">Throughput (tok/s/chip)</th>
           <th class="tabular">Gain vs per_op</th>
           <th>Verdict &amp; Action</th>
