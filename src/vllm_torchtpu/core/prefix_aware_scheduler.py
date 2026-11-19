@@ -380,12 +380,11 @@ class PrefixAwareScheduler(AsyncScheduler):
                 self._last_sched_log_t = now
                 logger.info(
                     "prefix-scheduler telemetry: running=%d waiting=%d decoding=%d "
-                    "prefilling=%d free_blocks=%s sched_tokens=%d %s",
+                    "prefilling=%d sched_tokens=%d %s",
                     len(self.running),
                     len(getattr(self, "waiting", ())),
                     len(decoding),
                     len(prefilling),
-                    self._get_num_free_blocks(),
                     getattr(out, "total_num_scheduled_tokens", 0),
                     self._admission_telemetry(stop),
                 )
@@ -476,14 +475,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         """Formats the sampled step's admission state plus the per-minute step
         counters, and resets the counters."""
         tm = getattr(self, "_tm", None) or {}
-        pool_free = "-"
-        pool = getattr(getattr(self, "kv_cache_manager", None), "block_pool", None)
-        get_free = getattr(pool, "get_num_free_blocks", None)
-        if callable(get_free):
-            try:
-                pool_free = str(int(get_free()))
-            except Exception:
-                pool_free = "-"
+        pool_free = self._get_num_free_blocks()
         stops = dict(sorted((tm.get("stops") or {}).items(), key=lambda kv: -kv[1]))
         text = (
             f"stop={stop} "
