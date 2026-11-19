@@ -153,6 +153,20 @@ _TPU_DUAL_DEVICE_GENERATIONS = ("v7", "tpu7x")
 # TPU v8i / TPU8i generations.
 _TPU_8I_GENERATIONS = ("v8i", "tpu8i")
 
+# Multi-host TPU slice mesh topologies for TPU v8t, which exposes 1
+# TensorCore per chip (3D Torus without a trailing cores-per-chip dimension).
+TPU_8T_MULTIHOST_TOPOLOGY_MAP = {
+    1: "1,1,1",
+    2: "1,2,1",
+    4: "2,2,1",
+    8: "2,2,2",
+    16: "2,2,4",
+    32: "2,4,4",
+    64: "4,4,4",
+}
+
+_TPU_8T_GENERATIONS = ("v8t", "tpu8t")
+
 
 def get_tpu_multihost_topology(
     world_size: int,
@@ -184,6 +198,8 @@ def get_tpu_multihost_topology(
         topo_map = TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP
     elif any(gen in device_name for gen in _TPU_8I_GENERATIONS):
         topo_map = TPU_8I_MULTIHOST_TOPOLOGY_MAP
+    elif any(gen in device_name for gen in _TPU_8T_GENERATIONS):
+        topo_map = TPU_8T_MULTIHOST_TOPOLOGY_MAP
     elif any(gen in device_name for gen in _TPU_DUAL_DEVICE_GENERATIONS):
         topo_map = TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP
     else:
@@ -511,6 +527,11 @@ class TpuPlatform(Platform):
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
+        "TPU_SKIP_MDS_QUERY",
+        "TPU_ACCELERATOR_TYPE",
+        "EXPECTED_TPU_DEVICES",
+        "VLLM_TORCHTPU_NUM_CHIPS",
+        "VLLM_DP_INIT_PORTS",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

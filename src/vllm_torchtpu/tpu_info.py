@@ -33,10 +33,17 @@ GCE_TPU_HEADERS = {"Metadata-Flavor": "Google"}
 
 
 def get_tpu_metadata(key: str = "") -> str:
+    if os.environ.get("TPU_SKIP_MDS_QUERY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return None
     try:
         accelerator_type_request = requests.get(
             os.path.join(GCE_TPU_ACCELERATOR_ENDPOINT, key),
             headers=GCE_TPU_HEADERS,
+            timeout=2.0,
         )
         if (
             accelerator_type_request.status_code == 200
@@ -74,8 +81,12 @@ def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
     # ChipVersion's values are bare chip names ("7x", "v6e"); accelerator types
     # add a chip-count suffix and sometimes a "tpu" prefix ("tpu7x", "v6e-8").
     name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
-    # v5litepod and v7x are the only two that still differ after stripping.
-    name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
+    name = {
+        "v5litepod": "v5e",
+        "v7x": "7x",
+        "v8i": "8i",
+        "v8t": "8t",
+    }.get(name, name)
     try:
         return pltpu.ChipVersion(name)
     except ValueError:
@@ -187,13 +198,20 @@ def get_node_worker_id() -> int:
 
 
 def get_num_cores_per_chip() -> int:
-    tpu_type = get_tpu_type()
-    if tpu_type.startswith(("v5litepod", "v6e")):
+    tpu_type = (get_tpu_type() or "").strip().lower()
+    if tpu_type.startswith(
+        ("v5litepod", "v5e", "v6e", "tpu8t", "v8t", "8t")
+    ):
         return 1
     return 2
 
 
 def get_num_chips() -> int:
+    override = os.environ.get("VLLM_TORCHTPU_NUM_CHIPS") or os.environ.get(
+        "EXPECTED_TPU_DEVICES"
+    )
+    if override:
+        return int(override)
     accel_files = glob.glob("/dev/accel*")
     if accel_files:
         return len(accel_files)

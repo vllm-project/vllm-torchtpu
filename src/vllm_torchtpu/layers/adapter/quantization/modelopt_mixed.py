@@ -156,7 +156,9 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
         if isinstance(layer, LinearBase):
             if quant_algo == "FP8":
                 return VllmFp8LinearMethodTPU(
-                    self.tpu_fp8_config, self.get_linear_config(layer)
+                    self.tpu_fp8_config,
+                    self.get_linear_config(layer),
+                    prefix=prefix,
                 )
             if nvfp4_cfg is not None:
                 return VllmNvfp4LinearMethod(nvfp4_cfg, self.get_linear_config(layer))

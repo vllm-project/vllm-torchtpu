@@ -1012,6 +1012,15 @@ def fused_moe_ep_unsupported_reason(
     supplies_hash_ids=False,
 ) -> str | None:
     """Validate prepared (or meta) weights and routing before installation."""
+    from jax.experimental.pallas import tpu as pltpu
+    from vllm_torchtpu.tpu_info import get_chip_version
+
+    chip_info = pltpu.get_tpu_info_for_chip(get_chip_version(), 1)
+    if chip_info.num_sublanes != U32_SUBLANE_TILE:
+        return (
+            f"fused EP v2 assumes {U32_SUBLANE_TILE}-sublane u32 tiling; "
+            f"chip {chip_info.chip_version} has {chip_info.num_sublanes} sublanes"
+        )
     w1, w2, w1_scale, w2_scale = weights
     if w1.ndim != 3 or w2.ndim != 3 or w2.shape[0] != w1.shape[0]:
         return f"weight rank/expert mismatch {tuple(w1.shape)} {tuple(w2.shape)}"

@@ -66,7 +66,7 @@ import time
 from datetime import timedelta
 
 import torch.distributed as dist
-from vllm.utils.network_utils import get_ip
+from vllm.utils.network_utils import get_ip, join_host_port
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
@@ -170,13 +170,14 @@ def prepare_mp_multihost_env(parallel_config) -> None:
 
     # Same construction as ray_distributed_executor_v2.py: one address per chip,
     # ordered by (host, local_rank), spanning every host in the slice.
-    base_port = envs.TORCH_TPU_BASE_PORT
-    sb_addresses = [
-        f"{ip}:{base_port + local_rank}"
-        for ip in host_ips
-        for local_rank in range(local_world_size)
-    ]
-    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(sb_addresses)
+    if not os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES"):
+        base_port = envs.TORCH_TPU_BASE_PORT
+        sb_addresses = [
+            join_host_port(ip, base_port + local_rank)
+            for ip in host_ips
+            for local_rank in range(local_world_size)
+        ]
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(sb_addresses)
 
     # Lazy import: tpu_platform.py imports this module from inside
     # check_and_update_config to avoid a top-level circular import. Mirrors
@@ -236,9 +237,15 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     # on every host from data_parallel_rpc_port (already CLI-identical), so
     # every host agrees without needing coordination of its own.
     dp_rpc_port = parallel_config.data_parallel_rpc_port
-    parallel_config._data_parallel_master_port_list = [
-        dp_rpc_port + 100 + i for i in range(5)
-    ]
+    dp_init_ports_env = os.environ.get("VLLM_DP_INIT_PORTS", "").strip()
+    if dp_init_ports_env:
+        parallel_config._data_parallel_master_port_list = [
+            int(p.strip()) for p in dp_init_ports_env.split(",") if p.strip()
+        ]
+    else:
+        parallel_config._data_parallel_master_port_list = [
+            dp_rpc_port + 100 + i for i in range(5)
+        ]
 
     if os.environ.get(_DP_DONE_SENTINEL) == str(dp_size):
         return True
@@ -276,13 +283,14 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     # increases in host-major order under --data-parallel-start-rank.
     world_size = parallel_config.world_size
     local_chip_count = world_size * dp_size_local
-    base_port = envs.TORCH_TPU_BASE_PORT
-    sb_addresses = [
-        f"{ip}:{base_port + local_slot}"
-        for ip in host_ips
-        for local_slot in range(local_chip_count)
-    ]
-    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(sb_addresses)
+    if not os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES"):
+        base_port = envs.TORCH_TPU_BASE_PORT
+        sb_addresses = [
+            join_host_port(ip, base_port + local_slot)
+            for ip in host_ips
+            for local_slot in range(local_chip_count)
+        ]
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(sb_addresses)
 
     from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
 
