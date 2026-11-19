@@ -25,6 +25,7 @@ QWEN4_EXP_ARCHITECTURES = (
 _PKG = "vllm_torchtpu.models.qwen4_exp.experimental"
 _MODEL = f"{_PKG}.model:Qwen4ExpForCausalLM"
 _MTP_MODEL = f"{_PKG}.mtp:Qwen4ExpMTP"
+_RUNNER = f"{_PKG}.runner.runner:Qwen38Runner"
 
 
 def enabled() -> bool:
@@ -72,6 +73,10 @@ def register() -> None:
         MODELS_CONFIG_MAP[arch] = TPUQwen4ExpConfig
     # Upstream's speculative config maps qwen4_exp to this MTP architecture.
     ModelRegistry.register_model("Qwen4ExpMTP", _MTP_MODEL)
+    # The worker builds this directory's runner subclass for these architectures.
+    from vllm_torchtpu.runner.model_runner_registry import register_model_runner
+
+    register_model_runner(_RUNNER, *QWEN4_EXP_ARCHITECTURES)
 
     from vllm_torchtpu.compilation.tpu_compiler import register_compile_cache_key
 
