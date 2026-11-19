@@ -281,11 +281,16 @@ def _fold_into_router(layer: Any, perm: list[int]) -> bool:
         idx = torch.tensor(inv, dtype=torch.int64, device=weight.device)
         weight.data = weight.data.index_select(dim, idx).contiguous()
         tensors = [weight]
-        if bias is not None:
-            bias.data = bias.data.index_select(
-                0, idx.to(bias.device)
-            ).contiguous()
-            tensors.append(bias)
+        # The router's correction bias, and the experts layer's own handle on
+        # it if that is a separate tensor; each permuted exactly once.
+        biases = [bias, getattr(layer, "e_score_correction_bias", None)]
+        seen: set[int] = set()
+        for t in biases:
+            if t is None or id(t) in seen or t.shape[-1] != num:
+                continue
+            seen.add(id(t))
+            t.data = t.data.index_select(0, idx.to(t.device)).contiguous()
+            tensors.append(t)
     if weight.device.type == "tpu":
         from vllm_torchtpu.utils import synchronize_tensors
 
