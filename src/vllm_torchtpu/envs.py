@@ -240,6 +240,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PLE_SKIP_IDLE_ROWS: bool = False
     VLLM_TPU_PLE_HISTORY_ROW_KERNEL: bool = False
     VLLM_TPU_PLE_WRDEFER: str = "0"
+    VLLM_TPU_PLE_UNIFORM_COND: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -1279,6 +1280,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_PLE_WRDEFER": env_with_choices(
         "VLLM_TPU_PLE_WRDEFER", "0", ["0", "1", "2", "4", "8"]
     ),
+    # q38 PLE-UNIFORM-COND (layer U; port of L1's D07-b2 uniform_window_conv onto the R form):
+    # a token-path PLE bucket of T % window == 0 chooses on the device (lax.cond) between the
+    # uniform-window path (history for the T // window leading rows, static slices) and the
+    # stock path; bitwise the stock op. Off = the stock op, no cond. Hashed (changes programs).
+    "VLLM_TPU_PLE_UNIFORM_COND": env_bool("VLLM_TPU_PLE_UNIFORM_COND"),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.
