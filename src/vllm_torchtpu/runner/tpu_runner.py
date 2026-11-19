@@ -2194,10 +2194,7 @@ class TPUModelRunner(GPUModelRunner):
         )
         if swapped:
             self._cached_output_req_ids_key = None
-            if getattr(self.input_batch, "batch_update_builder", None) is not None:
-                refresh = getattr(self.input_batch, "refresh_metadata", None)
-                if callable(refresh):
-                    refresh()
+            self.input_batch.refresh_metadata()
         return num_decode, num_windowed
 
     def _build_attention_metadata(
@@ -2575,11 +2572,7 @@ class TPUModelRunner(GPUModelRunner):
         num_computed = self.input_batch.num_computed_tokens_cpu[
             start_index : start_index + num_reqs
         ]
-        num_computed_list = (
-            num_computed.tolist()
-            if hasattr(num_computed, "tolist")
-            else [int(x) for x in num_computed]
-        )
+        num_computed_list = num_computed.tolist()
         req_ids = self.input_batch.req_ids
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         crossings: list[tuple[int, int, int]] = []
@@ -3158,8 +3151,7 @@ class TPUModelRunner(GPUModelRunner):
         # The PCP manager repacks tokens rank-major, so its mapping is never
         # the identity and is not cached.
         is_identity_layout = pcp_plan is None and (
-            layout_plan is None
-            or getattr(layout_plan, "kind", None) is SequenceLayoutKind.ALL
+            layout_plan is None or layout_plan.kind is SequenceLayoutKind.ALL
         )
         if sub_pairs is None:
             sched_list = (
@@ -3394,14 +3386,13 @@ class TPUModelRunner(GPUModelRunner):
         if getattr(input_batch, "_tpu_spec_room_guard", False):
             return
         orig = input_batch.update_req_spec_token_ids
-        is_real_input_batch = hasattr(input_batch, "is_token_ids")
 
         def guarded(request, scheduled_spec_tokens):
             req_id = request.req_id
             ids = scheduled_spec_tokens.get(req_id)
             idx = input_batch.req_id_to_index.get(req_id)
             if not ids or idx is None:
-                if is_real_input_batch and idx is not None:
+                if idx is not None:
                     input_batch.spec_token_ids[idx].clear()
                     request.prev_num_draft_len = 0
                     return None
@@ -3411,27 +3402,25 @@ class TPUModelRunner(GPUModelRunner):
             room = max(0, input_batch.token_ids_cpu.shape[1] - start_idx)
             n_ids = len(ids)
             if n_ids <= room:
-                if is_real_input_batch:
-                    end_idx = start_idx + n_ids
-                    row_tok = input_batch.token_ids_cpu[idx]
-                    if n_ids == 3:
-                        row_tok[start_idx] = ids[0]
-                        row_tok[start_idx + 1] = ids[1]
-                        row_tok[start_idx + 2] = ids[2]
-                    elif n_ids == 1:
-                        row_tok[start_idx] = ids[0]
-                    elif n_ids == 2:
-                        row_tok[start_idx] = ids[0]
-                        row_tok[start_idx + 1] = ids[1]
-                    else:
-                        row_tok[start_idx:end_idx] = ids
-                    input_batch.is_token_ids[idx, start_idx:end_idx] = True
-                    request.prev_num_draft_len = n_ids
-                    cur_spec = input_batch.spec_token_ids[idx]
-                    cur_spec.clear()
-                    cur_spec.extend(ids)
-                    return None
-                return orig(request, scheduled_spec_tokens)
+                end_idx = start_idx + n_ids
+                row_tok = input_batch.token_ids_cpu[idx]
+                if n_ids == 3:
+                    row_tok[start_idx] = ids[0]
+                    row_tok[start_idx + 1] = ids[1]
+                    row_tok[start_idx + 2] = ids[2]
+                elif n_ids == 1:
+                    row_tok[start_idx] = ids[0]
+                elif n_ids == 2:
+                    row_tok[start_idx] = ids[0]
+                    row_tok[start_idx + 1] = ids[1]
+                else:
+                    row_tok[start_idx:end_idx] = ids
+                input_batch.is_token_ids[idx, start_idx:end_idx] = True
+                request.prev_num_draft_len = n_ids
+                cur_spec = input_batch.spec_token_ids[idx]
+                cur_spec.clear()
+                cur_spec.extend(ids)
+                return None
 
             # Fires routinely for a request's final steps near max_model_len:
             # async placeholder accounting overshoots the scheduler-side bound
@@ -4419,10 +4408,7 @@ class TPUModelRunner(GPUModelRunner):
                 pos_idx_dev = torch.from_numpy(pos_idx_np).to(self.device)
                 sub_cache[sub_key] = (seq_idx_dev, pos_idx_dev, qx_sub_mask)
             num_rejected_dev = self._pre_async_results.spec_decode_num_rejected_tokens
-            if (
-                seq_lens.device.type == "tpu"
-                and getattr(self, "max_num_reqs", None) is not None
-            ):
+            if seq_lens.device.type == "tpu":
                 if num_rejected_dev.shape[0] < self.max_num_reqs:
                     num_rejected_dev = torch.nn.functional.pad(
                         num_rejected_dev,
@@ -5083,10 +5069,10 @@ class TPUModelRunner(GPUModelRunner):
 
     def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
         if not self._dp_lockstep_enabled():
-            if (
-                getattr(self.parallel_config, "use_sequence_parallel_moe", False)
-                is not True
-            ):
+            # On TPU sequence-parallel MoE needs EP, so without lockstep this
+            # is DP 1. vLLM builds the same one-element count for it on every
+            # forward; a cached tensor saves that build.
+            if not self.parallel_config.use_sequence_parallel_moe:
                 return None
             dp_size = 1
         else:
@@ -5563,7 +5549,7 @@ class TPUModelRunner(GPUModelRunner):
             if self.mamba_slot_read_offsets is None:
                 # No mamba layers, or no spec decoding: nothing to roll back.
                 mamba_state_indices_list.append(None)
-            elif getattr(ctx, "_stacked_mamba_groups", None) is not None:
+            elif ctx._stacked_mamba_groups is not None:
                 # Reuse the pre-stacked group tensor built during this chunk's
                 # _reset_read_offsets_for_new_requests, so
                 # _update_mamba_slot_read_offsets does not stack the group list

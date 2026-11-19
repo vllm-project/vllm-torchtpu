@@ -242,6 +242,7 @@ def _make_runner(
         token_ids_cpu=token_ids_cpu.numpy(),
         token_ids_cpu_tensor=token_ids_cpu,
         block_table=[_BlockTable(block_tables)],
+        refresh_metadata=lambda: None,
     )
     runner.input_batch = input_batch
 
