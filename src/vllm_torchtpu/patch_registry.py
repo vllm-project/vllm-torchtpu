@@ -179,6 +179,11 @@ PATCHES = (
         model_config=True,
     ),
     Patch(
+        "vllm_torchtpu.models.vllm.qwen3_vl_patch:maybe_patch_qwen3_vl_budget_inputs",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
+    Patch(
         "vllm_torchtpu.models.vllm.sp_prefill:maybe_patch_qwen3_vl_sp_prefill",
         ("platform_activation", "model_load"),
         model_config=True,

@@ -245,6 +245,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_patch_qwen3_vl",
         "maybe_patch_qwen3_vl_video_prompt",
         "maybe_patch_qwen3_vl_image_hf_text",
+        "maybe_patch_qwen3_vl_budget_inputs",
         "maybe_patch_qwen3_vl_sp_prefill",
         "maybe_patch_qwen3_vl_sp_vision",
         "maybe_patch_qwen3_next",
