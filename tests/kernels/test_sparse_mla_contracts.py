@@ -25,7 +25,11 @@ import pytest
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.mla.sparse import ref_registry
+from vllm_torchtpu.kernels.mla.sparse import (
+    dsa_gather,
+    index_prep,
+    ref_registry,
+)
 from vllm_torchtpu.kernels.mla.sparse.config import (
     DECODE_BODY_DEFAULT,
     GATHER_ATOM_ROWS,
@@ -54,6 +58,13 @@ from vllm_torchtpu.kernels.mla.sparse.config import (
     align_to,
     send_layout_lanes,
     send_layout_shape,
+)
+from vllm_torchtpu.kernels.mla.sparse.gather_dispatch import (
+    GatheredChunk,
+    PreparedIndices,
+    apply_dcp_skip_windows,
+    gather_chunk_kv,
+    prepare_attention_indices,
 )
 from vllm_torchtpu.kernels.mla.sparse.ref_registry import (
     AttentionRefs,
@@ -2331,3 +2342,861 @@ def test_width_sequences_normalized_to_tuples_and_hashable() -> None:
     assert isinstance(decode_kernel.row_widths, tuple)
     assert decode_kernel.row_widths == (128, 256)
     assert isinstance(hash(decode_kernel), int)
+
+
+# ---------------------------------------------------------------------------
+# 6. index_prep.py contract tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "divisor",
+    [1, 2, 8, 64, 128, 256, 3, 5, 7, 13, 17, 100, 127, 255, 1000, 8191],
+)
+def test_floor_divmod_const_exact_match(divisor: int) -> None:
+    values = [
+        -1000,
+        -divisor - 1,
+        -divisor,
+        -1,
+        0,
+        1,
+        divisor - 1,
+        divisor,
+        divisor + 1,
+        2 * divisor - 1,
+        2 * divisor,
+        100_003,
+        1_048_575,
+        4_194_303,
+    ]
+    x = jnp.array(values, dtype=jnp.int32)
+    q, r = index_prep._floor_divmod_const(x, divisor)
+    assert q.dtype == jnp.int32
+    assert r.dtype == jnp.int32
+    assert q.tolist() == [v // divisor for v in values]
+    assert r.tolist() == [v % divisor for v in values]
+
+
+@pytest.mark.parametrize(
+    "divisor",
+    [1, 2, 64, 128, 256, 3, 5, 7, 17, 100, 127, 255, 1000],
+)
+def test_cdiv_const_exact_match(divisor: int) -> None:
+    values = [
+        0,
+        1,
+        max(0, divisor - 1),
+        divisor,
+        divisor + 1,
+        2 * divisor - 1,
+        2 * divisor,
+        99_999,
+        1_000_000,
+    ]
+    x = jnp.array(values, dtype=jnp.int32)
+    out = index_prep._cdiv_const(x, divisor)
+    assert out.dtype == jnp.int32
+    assert out.tolist() == [(v + divisor - 1) // divisor for v in values]
+
+
+def test_token_seq_ids_maps_ragged_and_empty_sequences() -> None:
+    cu_q_lens = jnp.array([0, 3, 3, 5, 8], dtype=jnp.int32)
+    seq_ids = index_prep._token_seq_ids(cu_q_lens, num_tokens=8)
+    assert seq_ids.shape == (8,)
+    assert seq_ids.tolist() == [0, 0, 0, 2, 2, 3, 3, 3]
+
+    # Padding slots beyond cu_q_lens[-1] carry the final sequence id.
+    padded_ids = index_prep._token_seq_ids(cu_q_lens, num_tokens=10)
+    assert padded_ids.shape == (10,)
+    assert padded_ids.tolist() == [0, 0, 0, 2, 2, 3, 3, 3, 3, 3]
+
+
+@pytest.mark.parametrize("pages_per_seq", [5, 128, 130])
+def test_build_token_page_windows_padding_and_lookup(pages_per_seq: int) -> None:
+    num_seqs = 3
+    cu_q_lens = jnp.array([0, 2, 3, 5], dtype=jnp.int32)
+    num_tokens = 5
+    page_rows = [
+        [seq * 1000 + p + 1 for p in range(pages_per_seq)] for seq in range(num_seqs)
+    ]
+    flat_pages = jnp.array(
+        [entry for row in page_rows for entry in row], dtype=jnp.int32
+    )
+
+    windows, returned_pps = index_prep._build_token_page_windows(
+        flat_pages, cu_q_lens, num_tokens
+    )
+    expected_padded = align_to(pages_per_seq, index_prep._GATHER_PAGE_CHUNK)
+    assert returned_pps == pages_per_seq
+    assert windows.shape == (num_tokens, expected_padded)
+
+    expected_seq_for_token = [0, 0, 1, 2, 2]
+    windows_list = windows.tolist()
+    for tok, seq in enumerate(expected_seq_for_token):
+        assert windows_list[tok][:pages_per_seq] == page_rows[seq]
+        assert all(v == 0 for v in windows_list[tok][pages_per_seq:])
+
+    # Verify chunked physical page lookup recovers exact pages per token.
+    last_page = pages_per_seq - 1
+    mid_page = pages_per_seq // 2
+    logical = jnp.array(
+        [[0, mid_page, last_page] for _ in range(num_tokens)], dtype=jnp.int32
+    )
+    looked_up = index_prep._lookup_physical_page(logical, windows)
+    expected_lookup = [
+        [page_rows[seq][0], page_rows[seq][mid_page], page_rows[seq][last_page]]
+        for seq in expected_seq_for_token
+    ]
+    assert looked_up.tolist() == expected_lookup
+
+
+@pytest.mark.parametrize(
+    ("total_num_pages", "page_size"),
+    [
+        (16, 64),
+        (37, 256),
+        (100, 96),
+        (513, 100),
+    ],
+)
+def test_scatter_padding_slots_determinism_and_bounds(
+    total_num_pages: int, page_size: int
+) -> None:
+    flat = jnp.arange(64, dtype=jnp.int32).reshape(8, 8)
+    page_a, off_a = index_prep.scatter_padding_slots(flat, total_num_pages, page_size)
+    page_b, off_b = index_prep.scatter_padding_slots(flat, total_num_pages, page_size)
+
+    assert page_a.shape == (8, 8)
+    assert off_a.shape == (8, 8)
+    assert page_a.dtype == jnp.int32
+    assert off_a.dtype == jnp.int32
+    assert page_a.tolist() == page_b.tolist()
+    assert off_a.tolist() == off_b.tolist()
+
+    flat_pages = [p for row in page_a.tolist() for p in row]
+    flat_offs = [o for row in off_a.tolist() for o in row]
+    assert all(0 <= p < total_num_pages for p in flat_pages)
+    assert all(0 <= o < page_size for o in flat_offs)
+    assert len(set(flat_pages)) > 1
+    assert len(set(flat_offs)) > 1
+
+
+def test_live_group_table_counts_offsets_and_chunk_bounds() -> None:
+    # 3 chunks of 8 tokens, batch size 4 -> 6 groups (2 per chunk), atoms_w = 4.
+    kv_lens = jnp.array(
+        [
+            # Chunk 0 (chunk_windows=1): g0 max=70 -> 2 atoms, g1 max=128 -> 2 atoms.
+            10,
+            70,
+            0,
+            64,
+            128,
+            100,
+            1,
+            65,
+            # Chunk 1 (chunk_windows=2): g2 max=400 -> 4 atoms, g3 max=50 -> 1 atom.
+            400,
+            10,
+            20,
+            30,
+            50,
+            0,
+            0,
+            1,
+            # Chunk 2 (past token_end=16): ungridded -> 0 live atoms despite values.
+            999,
+            999,
+            999,
+            999,
+            999,
+            999,
+            999,
+            999,
+        ],
+        dtype=jnp.int32,
+    )
+    tab, num_live = index_prep.live_group_table(
+        kv_lens,
+        token_end=jnp.int32(16),
+        chunk_size=8,
+        kernel_batch_size=4,
+        topk_cap=256,
+        num_windows=4,
+    )
+    assert tab.shape == (12,)
+    assert tab.dtype == jnp.int32
+    assert num_live.shape == (3,)
+    assert num_live.dtype == jnp.int32
+    # live_atoms = [2, 2, 4, 1, 0, 0], per-chunk exclusive offsets = [0, 2, 0, 4, 0, 0]
+    assert tab.tolist() == [2, 2, 4, 1, 0, 0, 0, 2, 0, 4, 0, 0]
+    # Chunk 0 (1 window): (2 + 2) * (4 * 64) = 1024.
+    # Chunk 1 (2 windows, grid_rows=8): (2 - 1) * 8 * 256 + 8 * 256 = 4096.
+    # Chunk 2 (ungridded, grid_rows=0, 1 window): 0.
+    assert num_live.tolist() == [1024, 4096, 0]
+
+
+@pytest.mark.parametrize(
+    (
+        "num_tokens",
+        "chunk_size",
+        "batch_size",
+        "token_end",
+        "kv_lens_vals",
+        "topk_cap",
+        "num_windows",
+        "expected",
+    ),
+    [
+        # Aligned: all zeros clamps to 1.
+        (8, 8, 4, 8, [0] * 8, 128, 4, 1),
+        # Aligned: live token in chunk 1 needs 3 windows.
+        (
+            16,
+            8,
+            4,
+            12,
+            [64] * 8 + [300, 10, 10, 10, 9999, 9999, 9999, 9999],
+            128,
+            4,
+            3,
+        ),
+        # Aligned: huge token past grid_rows is ignored; clipped to num_windows.
+        (8, 8, 4, 3, [50, 60, 70, 80, 9999, 9999, 9999, 9999], 128, 4, 1),
+        (8, 8, 4, 5, [50, 60, 70, 80, 9999, 0, 0, 0], 128, 4, 4),
+        # Non-multiple fallback (12 % 8 != 0): live token in partial tail chunk.
+        (12, 8, 4, 10, [64] * 8 + [260, 10, 10, 10], 128, 4, 3),
+        # Non-multiple fallback: huge padding token past grid_rows is ignored.
+        (12, 8, 4, 8, [64] * 8 + [9999, 9999, 9999, 9999], 128, 4, 1),
+        # Non-multiple fallback: huge live token clips to num_windows.
+        (12, 8, 4, 9, [10] * 8 + [9999, 0, 0, 0], 128, 3, 3),
+    ],
+)
+def test_capped_live_windows_aligned_and_non_multiple_fallback(
+    num_tokens: int,
+    chunk_size: int,
+    batch_size: int,
+    token_end: int,
+    kv_lens_vals: list[int],
+    topk_cap: int,
+    num_windows: int,
+    expected: int,
+) -> None:
+    kv_lens = jnp.array(kv_lens_vals, dtype=jnp.int32)
+    assert kv_lens.shape == (num_tokens,)
+    out = index_prep.capped_live_windows(
+        kv_lens,
+        jnp.int32(token_end),
+        chunk_size=chunk_size,
+        kernel_batch_size=batch_size,
+        topk_cap=topk_cap,
+        num_windows=num_windows,
+    )
+    assert out.dtype == jnp.int32
+    assert int(out) == expected
+
+
+# ---------------------------------------------------------------------------
+# 7. gather_dispatch.py contract tests
+# ---------------------------------------------------------------------------
+
+
+def test_prepared_indices_chunk_accessors() -> None:
+    kv = jnp.zeros((4,), jnp.int32)
+    none_prep = PreparedIndices(
+        kv_lens=kv,
+        physical_indices=None,
+        window_indices_all=None,
+        chunk_window_rows=0,
+        fused_prep=False,
+        group_tab=None,
+        group_num_live=None,
+    )
+    assert none_prep.window_indices_for_chunk(0) is None
+    assert none_prep.group_num_live_for_chunk(0) is None
+
+    whole = jnp.arange(12, dtype=jnp.int32).reshape(6, 2)
+    fused_prep = PreparedIndices(
+        kv_lens=kv,
+        physical_indices=None,
+        window_indices_all=whole,
+        chunk_window_rows=3,
+        fused_prep=True,
+        group_tab=None,
+        group_num_live=None,
+    )
+    assert fused_prep.window_indices_for_chunk(0) is whole
+    assert fused_prep.window_indices_for_chunk(1) is whole
+
+    c0 = jnp.zeros((2, 2), jnp.int32)
+    c1 = jnp.full((2, 2), 7, jnp.int32)
+    live_arr = jnp.array([1024, 2048], dtype=jnp.int32)
+    tuple_prep = PreparedIndices(
+        kv_lens=kv,
+        physical_indices=None,
+        window_indices_all=(c0, c1),
+        chunk_window_rows=2,
+        fused_prep=False,
+        group_tab=jnp.zeros((4,), jnp.int32),
+        group_num_live=live_arr,
+    )
+    assert tuple_prep.window_indices_for_chunk(0) is c0
+    assert tuple_prep.window_indices_for_chunk(1) is c1
+    live0 = tuple_prep.group_num_live_for_chunk(0)
+    live1 = tuple_prep.group_num_live_for_chunk(1)
+    assert live0 is not None and int(live0) == 1024
+    assert live1 is not None and int(live1) == 2048
+
+    sliced_prep = PreparedIndices(
+        kv_lens=kv,
+        physical_indices=None,
+        window_indices_all=whole,
+        chunk_window_rows=3,
+        fused_prep=False,
+        group_tab=None,
+        group_num_live=None,
+    )
+    chunk0 = sliced_prep.window_indices_for_chunk(0)
+    chunk1 = sliced_prep.window_indices_for_chunk(1)
+    assert chunk0 is not None and chunk0.tolist() == [[0, 1], [2, 3], [4, 5]]
+    assert chunk1 is not None and chunk1.tolist() == [[6, 7], [8, 9], [10, 11]]
+
+
+def test_prepare_attention_indices_fused_decode_branch() -> None:
+    num_tokens = 16
+    topk = 256
+    # First 8 tokens have 2 live entries, last 8 are DCP padding with 1 live entry.
+    rows = [[0, 1] + [-1] * (topk - 2)] * 8 + [[0] + [-1] * (topk - 1)] * 8
+    topk_indices = jnp.array(rows, dtype=jnp.int32)
+    page_indices = jnp.zeros((4,), dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 8], dtype=jnp.int32)
+    token_end = jnp.int32(8)
+
+    capped = CappedWindowConfig(topk_cap=128, fused_window_prep=True)
+    cfg = SparseMlaConfig(
+        attention_kernel_batch_size=8,
+        gather=GatherConfig(
+            cache_layout=CacheLayout.SPARSECORE,
+            chunk_size=256,
+            small_chunk_tokens=16,
+            small_chunk_batch_size=4,
+            small_chunk_live_gather=True,
+            small_chunk_gather_atoms=4,
+            sparsecore_atoms_per_batch=16,
+        ),
+        capped=capped,
+        lse=LseConfig(mask_empty=True),
+        dcp=DcpConfig(is_dcp_mode=True),
+    )
+    sentinel_win = jnp.zeros((33, 128), dtype=jnp.int32)
+    recorded_kw: dict[str, Any] = {}
+
+    def _fake_fused(*_args: Any, **kw: Any) -> jax.Array:
+        recorded_kw.update(kw)
+        return sentinel_win
+
+    with patch.object(
+        index_prep, "prepare_capped_window_fused", side_effect=_fake_fused
+    ):
+        prepared = prepare_attention_indices(
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            token_end,
+            num_tokens=num_tokens,
+            page_size=64,
+            total_num_pages=4,
+            config=cfg,
+            capped=capped,
+            has_kv_write=True,
+        )
+
+    assert prepared.fused_prep is True
+    assert prepared.window_indices_all is sentinel_win
+    assert prepared.physical_indices is None
+    assert prepared.group_tab is None
+    assert prepared.group_num_live is None
+    assert prepared.chunk_window_rows == 0
+    assert prepared.kv_lens.tolist() == [2] * 8 + [0] * 8
+    assert recorded_kw["kernel_batch_size"] == 4
+    assert recorded_kw["gather_atoms"] == 4
+
+
+def test_prepare_attention_indices_mixed_live_fused_and_unfused() -> None:
+    num_tokens = 128
+    topk = 256
+    topk_indices = jnp.zeros((num_tokens, topk), dtype=jnp.int32)
+    page_indices = jnp.zeros((4,), dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, num_tokens], dtype=jnp.int32)
+    token_end = jnp.int32(num_tokens)
+
+    # 1) Mixed live-group fused + spy interception via prepare_live_fused_fn.
+    fused_capped = CappedWindowConfig(
+        topk_cap=128, mixed_live_gather=True, mixed_fused_prep=True
+    )
+    fused_cfg = SparseMlaConfig(
+        attention_kernel_batch_size=16,
+        gather=GatherConfig(cache_layout=CacheLayout.SPARSECORE, chunk_size=128),
+        capped=fused_capped,
+    )
+    hooks = FaultHooks(live_prep=LivePrepFault.KV)
+    spy_rows = (jnp.zeros((256, 128), dtype=jnp.int32),)
+    spy_kv = jnp.full((num_tokens,), 128, dtype=jnp.int32)
+    spy_tab = jnp.zeros((16,), dtype=jnp.int32)
+    spy_live = jnp.array([4096], dtype=jnp.int32)
+    spy_calls: list[dict[str, Any]] = []
+
+    def _spy(*_a: Any, **kw: Any) -> Any:
+        spy_calls.append(kw)
+        return spy_rows, spy_kv, spy_tab, spy_live
+
+    prep_fused = prepare_attention_indices(
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        token_end,
+        num_tokens=num_tokens,
+        page_size=64,
+        total_num_pages=4,
+        config=fused_cfg,
+        capped=fused_capped,
+        hooks=hooks,
+        prepare_live_fused_fn=_spy,
+    )
+    assert len(spy_calls) == 1
+    assert spy_calls[0]["hooks"] == hooks
+    assert prep_fused.fused_prep is False
+    assert prep_fused.window_indices_all is spy_rows
+    assert prep_fused.kv_lens is spy_kv
+    assert prep_fused.group_tab is spy_tab
+    assert prep_fused.group_num_live is spy_live
+    assert prep_fused.chunk_window_rows == topk * num_tokens // 128
+
+    # 2) Mixed live-group unfused (is_dcp_mode=True must NOT zero kv_lens padding).
+    unfused_capped = CappedWindowConfig(
+        topk_cap=128, mixed_live_gather=True, mixed_fused_prep=False
+    )
+    unfused_cfg = SparseMlaConfig(
+        attention_kernel_batch_size=16,
+        gather=GatherConfig(cache_layout=CacheLayout.SPARSECORE, chunk_size=128),
+        capped=unfused_capped,
+        dcp=DcpConfig(is_dcp_mode=True),
+    )
+    sentinel_live = jnp.zeros((256, 128), dtype=jnp.int32)
+    with patch.object(
+        index_prep, "prepare_capped_window_live", return_value=sentinel_live
+    ) as mock_live:
+        prep_unfused = prepare_attention_indices(
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            jnp.int32(64),
+            num_tokens=num_tokens,
+            page_size=64,
+            total_num_pages=4,
+            config=unfused_cfg,
+            capped=unfused_capped,
+        )
+    assert mock_live.call_count == 1
+    assert prep_unfused.window_indices_all is sentinel_live
+    assert prep_unfused.group_tab is not None
+    assert prep_unfused.group_num_live is not None
+    assert prep_unfused.kv_lens.tolist() == [topk] * num_tokens
+
+
+def test_prepare_attention_indices_live_fused_legacy_signature_compat() -> None:
+    num_tokens = 128
+    topk = 256
+    topk_indices = jnp.zeros((num_tokens, topk), dtype=jnp.int32)
+    page_indices = jnp.zeros((4,), dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, num_tokens], dtype=jnp.int32)
+    token_end = jnp.int32(num_tokens)
+
+    fused_capped = CappedWindowConfig(
+        topk_cap=128, mixed_live_gather=True, mixed_fused_prep=True
+    )
+    fused_cfg = SparseMlaConfig(
+        attention_kernel_batch_size=16,
+        gather=GatherConfig(cache_layout=CacheLayout.SPARSECORE, chunk_size=128),
+        capped=fused_capped,
+    )
+    spy_rows = (jnp.zeros((256, 128), dtype=jnp.int32),)
+    spy_kv = jnp.full((num_tokens,), 128, dtype=jnp.int32)
+    spy_tab = jnp.zeros((16,), dtype=jnp.int32)
+    spy_live = jnp.array([4096], dtype=jnp.int32)
+    legacy_calls: list[int] = []
+
+    # Legacy stub without a ``hooks`` parameter must succeed under NO_FAULT_HOOKS.
+    def _legacy_spy(
+        _topk: Any,
+        _pages: Any,
+        _cu: Any,
+        _end: Any,
+        *,
+        chunk_size: int,
+        kernel_batch_size: int,
+        topk_cap: int,
+        page_size: int,
+        total_num_pages: int,
+    ) -> Any:
+        del chunk_size, kernel_batch_size, topk_cap, page_size, total_num_pages
+        legacy_calls.append(1)
+        return spy_rows, spy_kv, spy_tab, spy_live
+
+    prep_default = prepare_attention_indices(
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        token_end,
+        num_tokens=num_tokens,
+        page_size=64,
+        total_num_pages=4,
+        config=fused_cfg,
+        capped=fused_capped,
+        hooks=NO_FAULT_HOOKS,
+        prepare_live_fused_fn=_legacy_spy,
+    )
+    assert legacy_calls == [1]
+    assert prep_default.window_indices_all is spy_rows
+
+    # With an active live_prep fault, ``hooks`` is forwarded explicitly.
+    received_hooks: list[FaultHooks] = []
+    fault_hooks = FaultHooks(live_prep=LivePrepFault.KV)
+
+    def _hooks_spy(*_a: Any, hooks: FaultHooks, **_kw: Any) -> Any:
+        received_hooks.append(hooks)
+        return spy_rows, spy_kv, spy_tab, spy_live
+
+    prepare_attention_indices(
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        token_end,
+        num_tokens=num_tokens,
+        page_size=64,
+        total_num_pages=4,
+        config=fused_cfg,
+        capped=fused_capped,
+        hooks=fault_hooks,
+        prepare_live_fused_fn=_hooks_spy,
+    )
+    assert received_hooks == [fault_hooks]
+
+
+def test_prepare_attention_indices_plain_capped_and_uncapped_fallback() -> None:
+    num_tokens = 128
+    topk = 256
+    topk_indices = jnp.zeros((num_tokens, topk), dtype=jnp.int32)
+    page_indices = jnp.zeros((4,), dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, num_tokens], dtype=jnp.int32)
+    token_end = jnp.int32(num_tokens)
+
+    # Plain capped window (mixed_live_gather=False, fused_window_prep=False).
+    plain_capped = CappedWindowConfig(
+        topk_cap=128, fused_window_prep=False, mixed_live_gather=False
+    )
+    plain_cfg = SparseMlaConfig(
+        attention_kernel_batch_size=16,
+        gather=GatherConfig(cache_layout=CacheLayout.SPARSECORE, chunk_size=128),
+        capped=plain_capped,
+    )
+    sentinel_win = jnp.zeros((256, 128), dtype=jnp.int32)
+    with patch.object(
+        index_prep, "prepare_capped_window_indices", return_value=sentinel_win
+    ) as mock_plain:
+        prep_plain = prepare_attention_indices(
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            token_end,
+            num_tokens=num_tokens,
+            page_size=64,
+            total_num_pages=4,
+            config=plain_cfg,
+            capped=plain_capped,
+        )
+    assert mock_plain.call_count == 1
+    assert prep_plain.window_indices_all is sentinel_win
+    assert prep_plain.physical_indices is None
+    assert prep_plain.group_tab is None
+    assert prep_plain.chunk_window_rows == (topk // 128) * num_tokens
+
+    # Uncapped fallback (topk_cap=None and page_indices=None).
+    uncapped = CappedWindowConfig(topk_cap=None)
+    uncapped_cfg = SparseMlaConfig(
+        gather=GatherConfig(cache_layout=CacheLayout.TENSORCORE, chunk_size=128),
+        capped=uncapped,
+    )
+    sentinel_kv = jnp.zeros((num_tokens,), dtype=jnp.int32)
+    sentinel_phys = jnp.zeros((num_tokens, topk), dtype=jnp.int32)
+    with patch.object(
+        index_prep,
+        "prepare_gather_indices",
+        return_value=(sentinel_kv, sentinel_phys),
+    ) as mock_fallback:
+        prep_fb = prepare_attention_indices(
+            topk_indices,
+            None,
+            cu_q_lens,
+            token_end,
+            num_tokens=num_tokens,
+            page_size=64,
+            total_num_pages=4,
+            config=uncapped_cfg,
+            capped=uncapped,
+        )
+    assert mock_fallback.call_count == 1
+    assert prep_fb.window_indices_all is None
+    assert prep_fb.physical_indices is sentinel_phys
+    assert prep_fb.kv_lens is sentinel_kv
+    assert prep_fb.chunk_window_rows == 0
+
+
+def test_prepare_attention_indices_fail_fast_checks() -> None:
+    cu_q_lens = jnp.array([0, 8], dtype=jnp.int32)
+    page_indices = jnp.zeros((4,), dtype=jnp.int32)
+
+    # 1) fused_window_prep without lse_mask_empty.
+    topk_small = jnp.zeros((16, 256), dtype=jnp.int32)
+    capped_fused = CappedWindowConfig(topk_cap=128, fused_window_prep=True)
+    cfg_no_mask = SparseMlaConfig(
+        gather=GatherConfig(cache_layout=CacheLayout.SPARSECORE, chunk_size=256),
+        capped=capped_fused,
+        lse=LseConfig(mask_empty=False),
+    )
+    with pytest.raises(ValueError, match="fused_window_prep requires lse_mask_empty"):
+        prepare_attention_indices(
+            topk_small,
+            page_indices,
+            cu_q_lens,
+            jnp.int32(8),
+            num_tokens=16,
+            page_size=64,
+            total_num_pages=4,
+            config=cfg_no_mask,
+            capped=capped_fused,
+        )
+
+    # 2) kv_write without fused_prep.
+    capped_unfused = CappedWindowConfig(topk_cap=128, fused_window_prep=False)
+    cfg_unfused = SparseMlaConfig(
+        gather=GatherConfig(cache_layout=CacheLayout.SPARSECORE, chunk_size=256),
+        capped=capped_unfused,
+        lse=LseConfig(mask_empty=True),
+    )
+    with pytest.raises(ValueError, match="kv_write needs the fused-prep decode path"):
+        prepare_attention_indices(
+            topk_small,
+            page_indices,
+            cu_q_lens,
+            jnp.int32(8),
+            num_tokens=16,
+            page_size=64,
+            total_num_pages=4,
+            config=cfg_unfused,
+            capped=capped_unfused,
+            has_kv_write=True,
+        )
+
+    # 3) live_prep fault without mixed_fused_prep.
+    with pytest.raises(ValueError, match="live_prep fault requires mixed_fused_prep"):
+        prepare_attention_indices(
+            topk_small,
+            page_indices,
+            cu_q_lens,
+            jnp.int32(8),
+            num_tokens=16,
+            page_size=64,
+            total_num_pages=4,
+            config=cfg_unfused,
+            capped=capped_unfused,
+            hooks=FaultHooks(live_prep=LivePrepFault.OFF),
+        )
+
+
+@pytest.mark.parametrize(
+    ("sparsecore_layout", "topk", "atoms", "expected_window", "expected_subchunks"),
+    [
+        (True, 256, 2, 128, 16),
+        (False, 512, 4, 256, 16),
+    ],
+)
+def test_apply_dcp_skip_windows_marks_dead_windows_only(
+    sparsecore_layout: bool,
+    topk: int,
+    atoms: int,
+    expected_window: int,
+    expected_subchunks: int,
+) -> None:
+    # 4 tokens: empty (0), 1 live, exact 1-window boundary, full topk.
+    kv_lens = jnp.array([0, 1, expected_window, topk], dtype=jnp.int32)
+    base = jnp.arange(4 * topk, dtype=jnp.int32).reshape(4, topk)
+
+    out, subchunks, dcp_atoms = apply_dcp_skip_windows(
+        base,
+        kv_lens,
+        topk=topk,
+        sparsecore_layout=sparsecore_layout,
+        sparsecore_atoms_per_batch=atoms,
+    )
+    assert out is not None
+    assert subchunks == expected_subchunks
+    assert dcp_atoms == atoms
+    skip = dsa_gather.SKIP_INDEX
+    rows = out.tolist()
+    base_rows = base.tolist()
+    # Token 0 (kv_len=0): every window dead -> all SKIP_INDEX.
+    assert all(v == skip for v in rows[0])
+    # Token 1 (kv_len=1): window 0 live, remaining windows SKIP_INDEX.
+    assert rows[1][:expected_window] == base_rows[1][:expected_window]
+    assert all(v == skip for v in rows[1][expected_window:])
+    # Token 2 (kv_len=expected_window): window 0 live, window 1+ SKIP_INDEX.
+    assert rows[2][:expected_window] == base_rows[2][:expected_window]
+    assert all(v == skip for v in rows[2][expected_window:])
+    # Token 3 (kv_len=topk): all windows live.
+    assert rows[3] == base_rows[3]
+
+    # None indices and sub-atom topk pass through unchanged.
+    none_out, _, _ = apply_dcp_skip_windows(
+        None,
+        kv_lens,
+        topk=topk,
+        sparsecore_layout=sparsecore_layout,
+        sparsecore_atoms_per_batch=atoms,
+    )
+    assert none_out is None
+
+    tiny = jnp.arange(16, dtype=jnp.int32).reshape(4, 4)
+    tiny_out, tiny_sc, tiny_atoms = apply_dcp_skip_windows(
+        tiny,
+        kv_lens,
+        topk=4,
+        sparsecore_layout=sparsecore_layout,
+        sparsecore_atoms_per_batch=atoms,
+    )
+    assert tiny_out is tiny
+    assert tiny_sc == 32
+    assert tiny_atoms == atoms
+
+
+def test_gather_chunk_kv_dispatch_and_validation() -> None:
+    cache_nope = jnp.zeros((2, 8, 4, 128), jnp.uint8)
+    cache_rope = jnp.zeros((2, 2, 4, 128), jnp.uint8)
+    kv_lens = jnp.full((8,), 64, jnp.int32)
+    phys = jnp.arange(8 * 64, dtype=jnp.int32).reshape(8, 64)
+    tc_cfg = SparseMlaConfig(
+        gather=GatherConfig(cache_layout=CacheLayout.TENSORCORE),
+        capped=CappedWindowConfig(topk_cap=None),
+    )
+
+    # 1) group_tab without topk_cap raises ValueError.
+    with pytest.raises(ValueError, match="group_tab requires topk_cap"):
+        gather_chunk_kv(
+            cache_nope,
+            cache_rope,
+            kv_lens,
+            phys,
+            start_pos=0,
+            end_pos=8,
+            topk=64,
+            kernel_batch_size=4,
+            small_chunk=False,
+            batch_end=jnp.int32(8),
+            config=tc_cfg,
+            group_tab=jnp.zeros((4,), jnp.int32),
+        )
+
+    # 2) pre_gathered passthrough and kv_write guard.
+    pre_nope = jnp.zeros((8, 64, 128), jnp.uint32)
+    pre_rope = jnp.zeros((8, 16, 128), jnp.uint32)
+    pre_views = (jnp.zeros((2, 4, 64, 128), jnp.uint32), pre_rope)
+    passthrough = gather_chunk_kv(
+        cache_nope,
+        cache_rope,
+        kv_lens,
+        phys,
+        start_pos=0,
+        end_pos=8,
+        topk=64,
+        kernel_batch_size=4,
+        small_chunk=False,
+        batch_end=jnp.int32(8),
+        config=tc_cfg,
+        pre_gathered=(pre_nope, pre_rope, pre_views),
+    )
+    assert isinstance(passthrough, GatheredChunk)
+    assert passthrough.nope is pre_nope
+    assert passthrough.rope is pre_rope
+    assert passthrough.live_views is pre_views
+    assert passthrough.cache_kv_nope is cache_nope
+    assert passthrough.cache_kv_rope is cache_rope
+
+    with pytest.raises(ValueError, match="pre_gathered does not carry kv_write"):
+        gather_chunk_kv(
+            cache_nope,
+            cache_rope,
+            kv_lens,
+            phys,
+            start_pos=0,
+            end_pos=8,
+            topk=64,
+            kernel_batch_size=4,
+            small_chunk=False,
+            batch_end=jnp.int32(8),
+            config=tc_cfg,
+            kv_write=jnp.zeros((3, 128), jnp.uint32),
+            pre_gathered=(pre_nope, pre_rope, None),
+        )
+
+    # 3) TensorCore dispatch via dsa_gather mock (non-DCP and DCP modes).
+    def _make_fake_dsa_gather(target: dict[str, Any]) -> Any:
+        def _fake_dsa_gather(
+            nope_c: jax.Array,
+            rope_c: jax.Array,
+            flat_idx: jax.Array,
+            **kw: Any,
+        ) -> tuple[jax.Array, jax.Array]:
+            target["args"] = (nope_c, rope_c, flat_idx)
+            target["kwargs"] = kw
+            return (
+                jnp.zeros((8 * 64 * 4, 128), jnp.uint8),
+                jnp.zeros((8 * 64, 64), jnp.uint8),
+            )
+
+        return _fake_dsa_gather
+
+    for is_dcp in (False, True):
+        cfg = SparseMlaConfig(
+            gather=GatherConfig(cache_layout=CacheLayout.TENSORCORE),
+            capped=CappedWindowConfig(topk_cap=None),
+            dcp=DcpConfig(is_dcp_mode=is_dcp),
+        )
+        captured: dict[str, Any] = {}
+
+        with patch.object(
+            dsa_gather, "dsa_gather", side_effect=_make_fake_dsa_gather(captured)
+        ):
+            gathered = gather_chunk_kv(
+                cache_nope,
+                cache_rope,
+                kv_lens,
+                phys,
+                start_pos=0,
+                end_pos=8,
+                topk=64,
+                kernel_batch_size=4,
+                small_chunk=False,
+                batch_end=jnp.int32(8),
+                config=cfg,
+            )
+        assert captured["args"][2].shape == (8 * 64,)
+        assert int(captured["kwargs"]["num_valid_indices"]) == 8 * 64
+        if is_dcp:
+            assert captured["kwargs"]["is_dcp_mode"] is True
+            assert "num_row_subchunks" in captured["kwargs"]
+        else:
+            assert "is_dcp_mode" not in captured["kwargs"]
+            assert "num_row_subchunks" not in captured["kwargs"]
+        assert gathered.nope.shape == (8, 64 * 4, 128)
+        assert gathered.rope.shape == (8, 64, 64)
+        assert gathered.live_views is None
