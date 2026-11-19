@@ -57,6 +57,10 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer imp
     VllmDeepseekV4Indexer,
     static_verify_q_len,
 )
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
@@ -195,6 +199,10 @@ class VllmDeepseekV4MLAAttention(
             dsv4_attention.DeepseekCompressor = orig_compressor
             dsv4_attention.DeepseekV4SWACache = orig_swa_cache
             torch.cuda.Event = orig_cuda_event
+
+        # process_weights_after_loading below reads wo_a's raw [n_out, n_in]
+        # weight, and the fused o-projection kernel needs it FP8 per-channel.
+        setattr(self.wo_a, KEEP_VLLM_LAYOUT_ATTR, True)
 
         # Bind compressor key-cache reference to SWA or main layer depending on
         # compression ratio.
@@ -801,6 +809,10 @@ class VllmDeepseekV4MLAAttention(
 
         out = fresh_buffer(weight.data.t())
         self.wo_a.weight = torch.nn.Parameter(out, requires_grad=False)
+        # The weight is now K-major, so later readers and reload passes must
+        # not treat it as vLLM's [n_out, n_in] layout.
+        setattr(self.wo_a, KEEP_VLLM_LAYOUT_ATTR, False)
+        setattr(self.wo_a, WEIGHT_FLIPPED_ATTR, True)
 
     def _assert_o_proj_supported(self) -> None:
         """Check what the fused `wo_a` kernel requires.

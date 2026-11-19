@@ -188,13 +188,15 @@ def quantized_matmul(
 def _quantized_matmul_fp4_jax(
     x: jax.Array, w_q: jax.Array, w_s: jax.Array
 ) -> jax.Array:
-    """W4A16 dense matmul for NVFP4 weights via gmm_v2 (single group).
+    """Dense matmul for native K-major FP4 weights via gmm_v2 (single group).
 
     `w_q` is the native fp4 weight in K-major layout [n_in, n_out] (unpacked at
     load); it only needs a leading group axis for the gmm_v2 rhs layout
     [1, n_in, n_out]. `w_s` is the fused fp32 block scale [1, num_blocks, 1,
-    n_out]. gmm_v2 selects the regime from the block size: block-16 dequantizes
-    the fp4 weight per block and keeps bf16 activations (W4A16).
+    n_out]. gmm_v2 selects W4A16 when block < mxu_column_size and W4A8 when
+    block >= mxu_column_size. The single group covers all `x.shape[0]` rows,
+    so there are no unvisited rows to zero, and `zero_initialize=False` frees
+    the VMEM scratch the zero fill would reserve.
     """
     rhs = w_q[None]  # [n_in, n_out] fp4 -> [1, n_in, n_out]
     return gmm_v2(
@@ -205,7 +207,7 @@ def _quantized_matmul_fp4_jax(
         group_offset=jnp.array([0], dtype=jnp.int32),
         preferred_element_type=x.dtype,
         maybe_quantize_lhs=True,
-        zero_initialize=True,
+        zero_initialize=False,
     )
 
 
@@ -242,13 +244,18 @@ def _get_quantized_matmul_fp4_op() -> Callable:
 def quantized_matmul_fp4(
     x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
 ) -> torch.Tensor:
-    """Torch entry for the NVFP4 W4A16 dense-linear matmul.
+    """Torch entry for native K-major FP4 dense-linear matmul (W4A16 or W4A8).
 
     `w_q` is the native fp4 weight in K-major layout [n_in, n_out] (unpacked at
     load), stored as ``torch.float4_e2m1fn_x2`` (2 fp4 per byte, so its torch
     last dim is packed). The fused fp32 block scale `w_s` [1, num_blocks, 1,
     n_out] carries the logical output width.
     """
+    if x.shape[-1] != w_q.shape[0]:
+        raise ValueError(
+            f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
+            f"{w_q.shape[0]}."
+        )
     orig_out_shape = (*x.shape[:-1], w_s.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_fp4_op()(x_2d, w_q, w_s)

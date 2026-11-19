@@ -25,13 +25,17 @@ making the consumer consistent rather than by exempting the layer:
                    reads it raw and asserts `[n_out, n_in]`. Our MLA op hands
                    it that view for the duration of the upstream call; the
                    layer is cleared immediately after and never runs a forward
-                   pass, so nothing else observes the layout.
+                   pass, so nothing else observes the layout. It is marked
+                   anyway so FP4 requantization never repacks it.
   in_proj_qkvz     still exempt by default. `fused_qkvz_projection_pcp_gdn`
                    is a Pallas kernel whose block specs encode `[n_out, n_in]`;
                    teaching it (k, n) means reworking index maps and re-tuning
                    block sizes under a VMEM budget, so the layer keeps the old
                    layout. TPU_GDN_QKVZ_KERNEL_LAYOUT flips it like the rest
-                   when PCP is off. This is the one remaining marker.
+                   when PCP is off.
+
+DeepSeek-V4's `wo_a` is also marked: its fused o-projection kernel needs FP8
+with per-channel scales, and the attention hook transposes it itself.
 """
 
 import torch

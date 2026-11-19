@@ -68,7 +68,10 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasMLAttentionBackendImpl,
     VllmTPUDeepseekV32IndexerBackend,
 )
-from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+)
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.dcp_indexer_cache import scatter_indexer_k_rows
@@ -1047,6 +1050,10 @@ class VllmTPUMLAAttention(MLAAttention):
         **extra_impl_args,
     ):
         torch.nn.Module.__init__(self)
+        # VllmTPUMLAAttention.process_weights_after_loading slices W_UK_T/W_UV
+        # directly from kv_b_proj's [n_out, n_in] weight and clears kv_b_proj.
+        if kv_b_proj is not None:
+            setattr(kv_b_proj, KEEP_VLLM_LAYOUT_ATTR, True)
 
         original_mla_get_backend = getattr(
             mla_attention, "get_mla_prefill_backend", None

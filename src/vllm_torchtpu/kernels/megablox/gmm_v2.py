@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, cast
@@ -23,6 +24,9 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+# Default block size for dynamic activation quantization.
+_LHS_QUANT_BLOCK_SIZE = 512
 
 # Util.
 
@@ -965,14 +969,27 @@ def calculate_tiling(
 
     # Initialize tile_k and tile_n to their maximum valid values.
     num_k_tiles = num_n_tiles = 1
-    num_lanes = pltpu.get_tpu_info().num_lanes
+    tpu_info = pltpu.get_tpu_info()
+    num_lanes = tpu_info.num_lanes
     tile_k = align_to(dims.size_k, num_lanes)
     tile_n = align_to(size_n_per_rhs, num_lanes)
+
+    # Native FP4 RHS against a quantized LHS is widened to the LHS quantized
+    # dtype inside inner_kernel. Only this path adds the upcast, scale and
+    # second accumulator terms below, so other dtypes keep their tiling.
+    fp4_rhs_upcast = (
+        lhs_cfgs.should_quantize
+        and rhs_dtype == jnp.dtype(jnp.float4_e2m1fn)
+        and not tpu_info.is_matmul_supported(
+            cast(jnp.dtype, lhs_cfgs.quant_dtype), rhs_dtype
+        )
+    )
 
     def _gmm_vmem_estimate(tm: int, tn: int, tk: int) -> int:
         # 1. LHS tile (double-buffered HBM load)
         lhs_tile_bytes = lhs_bits // 8
         lhs_vmem = 2 * tm * tk * lhs_tile_bytes
+        rhs_upcast_vmem = 0
         # If LHS is quantized on-the-fly, we need an extra single-buffered cast
         # buffer in VMEM.
         if lhs_cfgs.should_quantize:
@@ -980,6 +997,13 @@ def calculate_tiling(
                 cast(jnp.dtype, lhs_cfgs.quant_dtype)
             )
             lhs_vmem += tm * tk * (lhs_quant_bits // 8)
+            if fp4_rhs_upcast:
+                # Widened RHS tile plus the per-quant-block scaled partials.
+                num_qblocks = pl.cdiv(tk, rhs_cfgs.quant_block_size)
+                rhs_upcast_vmem = fuse_act_factor * (
+                    tk * tn * (lhs_quant_bits // 8)
+                    + num_qblocks * tm * min(tn, tpu_info.mxu_column_size) * 4
+                )
 
         # 2. RHS tile (triple-buffered, includes scale and bias if present)
         # If fuse_act is enabled, we have both gate and up weights,
@@ -992,14 +1016,18 @@ def calculate_tiling(
         rhs_bias_vmem = 0
         if rhs_cfgs.has_bias:
             rhs_bias_vmem = tn * 4
-        rhs_vmem = fuse_act_factor * (
-            3 * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
+        rhs_vmem = (
+            fuse_act_factor
+            * (3 * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem)
+            + rhs_upcast_vmem
         )
 
-        # 3. Accumulator
+        # 3. Accumulator. The FP4 upcast path also keeps the per-MXU-column
+        # acc_list chunks live while they are concatenated into acc.
         acc_cols = fuse_act_factor * tn
         acc_dtype_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4
-        acc_vmem = tm * acc_cols * acc_dtype_bytes
+        acc_copies = 2 if fp4_rhs_upcast else 1
+        acc_vmem = acc_copies * tm * acc_cols * acc_dtype_bytes
 
         # 4. Output tile (double-buffered)
         out_dtype_bytes = jax.dtypes.itemsize_bits(lhs_cfgs.dtype) // 8
@@ -1219,8 +1247,14 @@ def make_gmm_configs(
         # Input quantization involves reading all elements in a block to compute
         # scale value. Since this operation is very memory intensive, we use a
         # block size that is small enough to minimize memory overhead but large
-        # enough to minimize compute overhead of quantization.
-        quant_block_size=512,
+        # enough to minimize compute overhead of quantization. The kernel applies
+        # one rhs scale per lhs block, so a quantized lhs block must also divide
+        # the rhs quant block (e.g. 256 for a block-256 rhs).
+        quant_block_size=(
+            math.gcd(_LHS_QUANT_BLOCK_SIZE, block_size)
+            if lhs_q_dtype is not None
+            else _LHS_QUANT_BLOCK_SIZE
+        ),
         dtype=lhs.dtype,
     )
 

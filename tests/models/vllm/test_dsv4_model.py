@@ -39,6 +39,10 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_o
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
     VllmDeepseekV4Indexer,
 )
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+)
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.deepseek_v4 import DeepseekV4ForCausalLM
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
@@ -224,6 +228,15 @@ def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio
     assert spec.block_size == 128
     assert spec.sliding_window == 128
     assert spec.dtype == torch.uint8
+
+    # wo_a keeps [n_out, n_in] through its linear method, so FP4 requantization
+    # skips it; the attention hook then stores it K-major for the fused kernel.
+    assert getattr(attention.wo_a, KEEP_VLLM_LAYOUT_ATTR, False)
+    n_out, n_in = attention.wo_a.weight.shape
+    attention.process_weights_after_loading(torch.bfloat16)
+    assert tuple(attention.wo_a.weight.shape) == (n_in, n_out)
+    assert not getattr(attention.wo_a, KEEP_VLLM_LAYOUT_ATTR, False)
+    assert getattr(attention.wo_a, WEIGHT_FLIPPED_ATTR, False)
 
 
 @pytest.fixture()
