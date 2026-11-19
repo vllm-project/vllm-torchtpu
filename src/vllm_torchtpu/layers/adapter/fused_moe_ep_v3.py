@@ -211,10 +211,13 @@ def fused_moe_ep_supported(owner: Any = None) -> bool:
     selects the fused kernel, the few-token kernel or the grouped-matmul path
     for each compiled static shape.
     With no `owner` this reports whether the operation exists at all. `owner`
-    is a MoE layer or its quant method: `prebuild_fused_moe_ep` marks both
-    eligible when the layer's shape and routing match the operation, which is
-    built once for the process from the first eligible layer, so a layer that
-    was refused, or whose shape differs, is answered False and takes the
+    is the MoE layer `prebuild_fused_moe_ep` was given, or an object that
+    holds a copy of its mark: prebuild marks the layer eligible when its
+    shape and routing match the operation, which is built once for the
+    process from the first eligible layer, and a quant method that calls
+    prebuild copies the layer's mark onto itself before it asks about itself
+    (as v2's quant methods record the op prebuild returns). A layer that was
+    refused, or whose shape differs, is answered False and takes the
     grouped-matmul path.
     """
     if _OP is None:
