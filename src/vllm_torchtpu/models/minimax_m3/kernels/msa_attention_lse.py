@@ -378,9 +378,11 @@ def _kernel(
             output accumulates as ``acc^T [D, rows]`` across the p @ v
             contraction, and ``m``, ``l`` are lane vectors over rows (fewer
             spills and pops: bench j-9081937a, c4 pool48 -5.4%). 4-bit pages
-            keep `attend`, whose per-key scales are lane vectors there, and
-            so do 8-token (decode) tiles: c4 b3 decode +0.4 ms per step
-            transposed (twin j-fa6121d0 vs glue-only j-2abe5011)."""
+            (`FP4_TRANSPOSED`) fold their K / V scales into the bf16 rows, a
+            scale column per page: worth it from 16-token tiles on; 8-token
+            (decode) tiles keep `attend` (c4 b3 decode +0.4 ms per step
+            transposed, twin j-fa6121d0 vs glue-only j-2abe5011; 4-bit 8-token
+            body 2,055 -> 3,977 bundles for 32 pages)."""
             if inline_issue and width > _INLINE_ISSUE_PAGES:
                 issue_next()
             mxu_mask = MXU_MASK and MAX_FREE and block_q <= head_dim
@@ -1408,23 +1410,25 @@ def _union_ratio(selected, tile):
 # 0.50 ms at ratio ~1.7, 1.08 -> 0.81 at ~4, even at ~5.9 (c48 shape) and ~4.4
 # (c64 head-parallel shape); fp8 32 -> 64 0.60 -> 0.50 at ~1.6, even at ~3.3.
 WIDE_BLOCK_Q = 64
+# "auto" (as above), "on" (every such call) or "off" (`TPU_MINIMAX_M3_MSA_WIDE_TILES`).
+WIDE_TILES = "auto"
 WIDE_TILE_MIN_TOKENS = msa_attention.SMALL_BATCH_TOKENS
-_WIDE_TILE_MAX_RATIO = {"fp4": 4.0, "8bit": 3.0}  # 8bit: 8/16-bit pages
+_WIDE_TILE_MAX_RATIO = {"fp4": 4.0, "8bit": 3.0}
 # Bitmap width of `_union_ratio`: a rank's blocks of a 256K-token request
 # at DCP 2 (1,024 at 128-token pages; head-parallel calls see 2,048, where
 # far blocks alias, lowering the estimate only for very wide tiles).
 _UNION_BITS = 1024
 
 
-def _wide_tile_kind(scale_cache, head_dim):
+def _wide_tile_kind(kv_cache, scale_cache, head_dim):
     """The `_WIDE_TILE_MAX_RATIO` key of a call's cache, or None where wide
-    tiles do not run `attend_t` with the MXU mask (which needs
-    ``WIDE_BLOCK_Q <= D``)."""
+    tiles were not measured (16-bit pages) or do not run `attend_t` with the
+    MXU mask (which needs ``WIDE_BLOCK_Q <= D``)."""
     if not (MAX_FREE and MXU_MASK) or head_dim < WIDE_BLOCK_Q:
         return None
-    if scale_cache is None:
-        return "8bit"
-    return "fp4" if FP4_TRANSPOSED else None
+    if scale_cache is not None:
+        return "fp4" if FP4_TRANSPOSED else None
+    return "8bit" if jnp.dtype(kv_cache.dtype).itemsize == 1 else None
 
 
 def _adaptive_call(
@@ -1448,7 +1452,7 @@ def _adaptive_call(
     whole wide tiles. Both tile sizes give the same results up to the order
     of the softmax sums."""
     num_tokens = selected.shape[0]
-    kind = _wide_tile_kind(scale_cache, q.shape[2])
+    kind = _wide_tile_kind(kv_cache, scale_cache, q.shape[2])
     call = functools.partial(
         _chunked_call,
         kv_cache=kv_cache,
@@ -1460,7 +1464,12 @@ def _adaptive_call(
         q_head_major=q_head_major,
         **kwargs,
     )
-    if kind is None or block_q >= WIDE_BLOCK_Q or num_tokens <= WIDE_TILE_MIN_TOKENS:
+    if (
+        WIDE_TILES == "off"
+        or kind is None
+        or block_q >= WIDE_BLOCK_Q
+        or num_tokens <= WIDE_TILE_MIN_TOKENS
+    ):
         return call(
             q,
             selected=selected,
@@ -1471,7 +1480,6 @@ def _adaptive_call(
     q, selected, local_page, local_limit = _pad_tokens(
         q, selected, local_page, local_limit, WIDE_BLOCK_Q, q_head_major
     )
-    ratio = _union_ratio(selected, WIDE_BLOCK_Q)
     operands = (q, selected, local_page, local_limit)
 
     def wide(operands):
@@ -1494,9 +1502,13 @@ def _adaptive_call(
             block_q=block_q,
         )
 
-    out, lse = jax.lax.cond(
-        ratio <= _WIDE_TILE_MAX_RATIO[kind], wide, regular, operands
-    )
+    if WIDE_TILES == "on":
+        out, lse = wide(operands)
+    else:
+        ratio = _union_ratio(selected, WIDE_BLOCK_Q)
+        out, lse = jax.lax.cond(
+            ratio <= _WIDE_TILE_MAX_RATIO[kind], wide, regular, operands
+        )
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]
     return out[:num_tokens], lse[:num_tokens]

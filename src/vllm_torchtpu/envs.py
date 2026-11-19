@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_ATTN_PIECES: bool = False
     TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES: bool = True
     TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS: int = 4096
+    TPU_MINIMAX_M3_MSA_WIDE_TILES: str = "auto"
     TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = True
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS: int = 0
@@ -824,6 +825,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (off: only the attention side, qkv_proj and o_proj, runs per piece).
     "TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES": env_bool(
         "TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES", default=True
+    ),
+    # MSA prefill-size sparse-attention calls on 64-token tiles
+    # (models/minimax_m3/kernels/msa_attention_lse.py `_adaptive_call`):
+    # "auto" per step from its selections' locality, "on" always, "off" never.
+    "TPU_MINIMAX_M3_MSA_WIDE_TILES": env_with_choices(
+        "TPU_MINIMAX_M3_MSA_WIDE_TILES", "auto", ["auto", "on", "off"]
     ),
     # MoE steps (EP or TP-MoE) of up to this many tokens with fp4 (NVFP4)
     # experts run the permutation-free dense-expert kernel (kernels/experimental/

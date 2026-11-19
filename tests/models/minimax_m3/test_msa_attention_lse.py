@@ -475,11 +475,14 @@ def test_decode_tiles_read_unwritten_slots_through_the_write(pages_per_step):
 
 
 @pytest.mark.parametrize("fp4", [False, True])
-@pytest.mark.parametrize("max_union", [0.0, 1e9])  # regular / wide tiles taken
-def test_adaptive_tiles_match_reference(fp4, max_union, monkeypatch):
+@pytest.mark.parametrize(
+    "mode,max_union", [("auto", 0.0), ("auto", 1e9), ("on", 0.0)]
+)  # regular / wide tiles taken
+def test_adaptive_tiles_match_reference(fp4, mode, max_union, monkeypatch):
     """Prefill-size calls past `WIDE_TILE_MIN_TOKENS` tokens: the wide-tile
     branch (64-token tiles, `attend_t`) and the regular one give the
     reference, with tokens padded to whole wide tiles and several calls."""
+    monkeypatch.setattr(msa_attention_lse, "WIDE_TILES", mode)
     monkeypatch.setattr(msa_attention_lse, "WIDE_TILE_MIN_TOKENS", 64)
     monkeypatch.setattr(
         msa_attention_lse, "_WIDE_TILE_MAX_RATIO", {"fp4": max_union, "8bit": max_union}

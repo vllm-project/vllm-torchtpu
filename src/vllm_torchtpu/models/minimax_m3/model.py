@@ -522,6 +522,7 @@ class MiniMaxM3Model(nn.Module):
         bound = max(layer.self_attn.score_bound() for layer in self.layers)
         on = msa_attention_lse.configure_max_free(bound)
         logger.info("MiniMax-M3 MSA score bound %.1f: max-free softmax %s", bound, on)
+        msa_attention_lse.WIDE_TILES = envs.TPU_MINIMAX_M3_MSA_WIDE_TILES
         return loaded_params
 
 
