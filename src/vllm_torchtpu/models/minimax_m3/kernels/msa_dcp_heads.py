@@ -497,6 +497,65 @@ def hp_round_factor() -> int:
     return factor
 
 
+HP_ROW_SPLIT_ENV = "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT"
+_row_split_logged = False
+
+
+def hp_row_split() -> bool:
+    """TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT, read at trace time through `envs`."""
+    global _row_split_logged
+    from vllm_torchtpu import envs
+
+    on = bool(envs.TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT)
+    if on and not _row_split_logged:
+        _row_split_logged = True
+        init_logger(__name__).warning(
+            "%s=1: head-parallel MSA prefill replicas split query tiles, "
+            "each tile with all its KV head's query heads.",
+            HP_ROW_SPLIT_ENV,
+        )
+    return on
+
+
+def _attend_row_split(attend, q, kv, keys, local, limit, page_table, *, rank,
+                      replicas, block_q, axis, dcp):
+    """``attend`` (head-major out ``[Hl, T, D]``) with the rows split across
+    the ``replicas`` ranks of this rank's KV head instead of the query
+    heads: replica ``j`` takes the query tiles ``i`` with ``i % replicas ==
+    j`` with every replica's query heads, ``[T / replicas, replicas * Hl,
+    D]``. A tile then carries ``replicas`` times the rows over the same
+    selected-page union (the pages are the tile's tokens' selections,
+    whatever the heads). Queries and outputs move by an all-to-all inside
+    the replica group; each (row, head) is attended over the same pages in
+    the same order, so the outputs match the head split bit for bit."""
+    num_tokens, num_q_heads, head_dim = q.shape
+    tiles = num_tokens // (replicas * block_q)
+    groups = [list(range(h * replicas, (h + 1) * replicas))
+              for h in range(dcp // replicas)]
+    j = jnp.reshape(rank, (-1,))[0] % replicas
+
+    def mine(x):
+        # Rows of tiles i % replicas == j: [tiles * block_q, ...].
+        x = x.reshape(tiles, replicas, block_q, *x.shape[1:])
+        x = jax.lax.dynamic_index_in_dim(x, j, axis=1, keepdims=False)
+        return x.reshape(tiles * block_q, *x.shape[2:])
+
+    # [dst replica, tiles, block_q, Hl, D] -> [src replica, ...].
+    send = q.reshape(tiles, replicas, block_q, num_q_heads, head_dim)
+    send = jnp.moveaxis(send, 1, 0)
+    recv = jax.lax.all_to_all(send, axis, 0, 0, axis_index_groups=groups)
+    # Query heads replica-major: [tiles * block_q, replicas * Hl, D].
+    q_rows = jnp.moveaxis(recv, 0, 2).reshape(
+        tiles * block_q, replicas * num_q_heads, head_dim
+    )
+    out, _ = attend(q_rows, kv, mine(keys), mine(local), mine(limit), page_table)
+    # out [replicas * Hl, tiles * block_q, D] -> back to the heads' owners.
+    send = out.reshape(replicas, num_q_heads, tiles, block_q, head_dim)
+    recv = jax.lax.all_to_all(send, axis, 0, 0, axis_index_groups=groups)
+    # recv [src replica (= tile phase), Hl, tiles, block_q, D] -> [Hl, T, D].
+    return jnp.moveaxis(recv, 0, 2).reshape(num_q_heads, num_tokens, head_dim)
+
+
 def _head_parallel_attend(
     q,
     kv_cache,
@@ -621,6 +680,26 @@ def _head_parallel_attend(
             # One call over every row: the kernel chunks the rows and writes
             # its output in place; rows outside the round see no page and
             # come back zero (cheap empty tiles).
+            block_q = attend.keywords["block_q"]
+            if (
+                replicas > 1
+                and hp_row_split()
+                and num_tokens % (replicas * block_q) == 0
+            ):
+                return _attend_row_split(
+                    attend,
+                    q,
+                    kv,
+                    keys,
+                    local,
+                    limit,
+                    page_table,
+                    rank=rank,
+                    replicas=replicas,
+                    block_q=block_q,
+                    axis=axis,
+                    dcp=dcp,
+                )
             out, _ = attend(q, kv, keys, local, limit, page_table)
             return out
 

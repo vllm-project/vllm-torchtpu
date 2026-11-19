@@ -253,6 +253,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
     TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR: int = 1
+    TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: bool = False
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
@@ -1611,6 +1612,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (c64 8k chunks of ~140K-token contexts) in one round.
     "TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR", 1
+    ),
+    # MiniMax M3 head-parallel MSA prefill: the replicas of a KV head split
+    # the first round's rows (alternate query tiles) instead of its query
+    # heads, so each kernel tile carries all the KV head's query heads over
+    # the same selected-page union (twice the rows per page at 2 replicas).
+    # The query heads and outputs move by an all-to-all inside the replica
+    # group (one chip's cores). Same outputs bit for bit.
+    "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT": env_bool(
+        "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT", default=False
     ),
     # MiniMax M3 MSA prefill page cache table (`msa_attention_lse._page_cache`):
     # how its sorts run. Empty keeps three stable sorts (two of two operands);
