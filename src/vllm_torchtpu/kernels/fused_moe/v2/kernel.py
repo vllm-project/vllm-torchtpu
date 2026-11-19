@@ -912,10 +912,12 @@ def _build_fused_ep_moe_kernel(
     # source. A tile is computed into `out_vm`, copied to `contrib_hbm`, then
     # read straight back out of it by the push that ships it -- two local
     # passes and, at the small buckets, about a quarter of the visit's DMA
-    # enqueues, for a buffer nothing else reads. Where a build's experts are
-    # expected to fit inside one tile -- the same bound the height ladder
-    # above is emitted on -- the tile can be shipped from `out_vm` itself,
-    # deleting the commits, the drain that gates them and the slab's traffic.
+    # enqueues, for a buffer nothing else reads. Where a build's slab is
+    # within one tile per local expert on every shard -- the first bound
+    # tile_height_rungs checks; a short-tile build is over it by its slab
+    # padding and keeps the slab -- the tile can be shipped from `out_vm`
+    # itself, deleting the commits, the drain that gates them and the slab's
+    # traffic.
     # It costs a staging buffer that stays live until the wire has read it,
     # which is why a build whose visits carry several tiles keeps the slab:
     # there the wire is the busy resource and the round trip is what keeps
