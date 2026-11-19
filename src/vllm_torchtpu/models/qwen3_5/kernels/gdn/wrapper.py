@@ -37,7 +37,8 @@
 #   and dt_bias padded once) and, for verify windows at
 #   config.FUSED_1DOT_SHAPES, the fused 1-dot recurrence (use_fused_1dot).
 #   Every other shape keeps main's tiles (MAIN_MIXED_TILE_SIZE) and code.
-# - Verify read offsets are clipped to the window.
+# - Verify read offsets into a caller's checkpoint table (ckpt_indices) are
+#   clipped to the window.
 # No change targets AttentionMode.KDA, which this copy's callers never pass;
 # see compute_kda.py.
 
@@ -832,6 +833,7 @@ def fused_conv1d_gdn(
         num_buffers=config.GDNConfig.__dataclass_fields__["num_buffers"].default,
         vmem_budget=decode_vmem_limit_bytes,
         rec_state_bytes=jnp.dtype(recurrent_dtype).itemsize,
+        act_out_bytes=jnp.dtype(act_out_dtype).itemsize,
     )
     if not tiler_shape:
         # main's decode tile: its dynamic pick, or the caller's tile under the
@@ -853,7 +855,7 @@ def fused_conv1d_gdn(
                 window_size=window_size,
             )
         else:
-            # main's static chunk (#2438): rounded down to a power of two, so
+            # main's static chunk: rounded down to a power of two, so
             # a small non-power-of-two token bucket stays divisible by
             # triangular_block_size.
             mixed_tile_size = tiling.clip_mixed_tile_size(mixed_tile_size, batch_size)
