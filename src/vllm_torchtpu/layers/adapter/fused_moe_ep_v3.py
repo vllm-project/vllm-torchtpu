@@ -49,9 +49,6 @@ these export and padding constraints:
   row past it nowhere and the transport zeroes its input row, so nothing of
   it travels; its output row is padding the caller drops, with no defined
   value. A rank with no valid rows still takes part in every collective.
-
-PyTorch/XLA custom-op adapter bridging vLLM FusedMoE layers to the Pallas Fused
-EP v3 pipeline.
 """
 
 from typing import Any
@@ -288,8 +285,9 @@ def _build_op(
         FUSED_MOE_EP_OP_NAME,
         moe,
         mesh=mesh,
-        # x, w1, w2, w1_scale, w2_scale, gating, rank -- every operand is
-        # sharded on axis 0 over the EP axis, and so is the single output.
+        # x, w1, w2, w1_scale, w2_scale, gating, rank and, with padding
+        # skipped, valid_tokens -- every operand is sharded on axis 0 over the
+        # EP axis, and so is the single output.
         input_partition_specs=input_specs,
         output_partition_specs=spec,
     )
@@ -521,8 +519,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
     _TP_SIZE = tp
     from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
 
-    layer_is_sp = bool(getattr(layer.moe_config, "is_sequence_parallel", False))
-    if tp > 1 and (not _sp.enabled() or not layer_is_sp):
+    if tp > 1 and not (_sp.enabled() and layer.moe_config.is_sequence_parallel):
         logger.warning_once(
             "Fused EP MoE not engaged on layer %s: under tensor parallelism "
             "(tp_size=%d) without sequence parallelism (layer_is_sp=%s) the "
@@ -531,7 +528,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
             "these steps.",
             getattr(layer, "layer_name", "<unnamed>"),
             tp,
-            layer_is_sp,
+            layer.moe_config.is_sequence_parallel,
             tp,
         )
         return
