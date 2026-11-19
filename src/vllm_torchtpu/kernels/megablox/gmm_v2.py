@@ -597,7 +597,9 @@ def inner_kernel(
         lax.fori_loop(0, num_chunks, body, 0)
         return acc_ref[:bucket_m]
 
-    def _pipe_matmul(bucket_m, unroll, chunk_epilogue, compact, iters=False):
+    def _pipe_matmul(
+        bucket_m, unroll, chunk_epilogue, compact, iters=False, deferred=False
+    ):
         # Software-pipelined rolled loop over MXU column chunks: chunk j+1 is
         # dequantized into one VMEM buffer while chunk j's matmul reads the
         # other, so the VPU dequant overlaps the MXU inside each iteration and
@@ -645,6 +647,47 @@ def inner_kernel(
                 tiled_out_ref.dtype
             )
 
+        def mm_raw(j, buf, raw, slot):
+            lhs = tiled_lhs_ref.reshape(-1, tile_k)[:bucket_m]
+            block_acc = jnp.matmul(
+                lhs, buf[...], preferred_element_type=jnp.float32
+            ).astype(acc_ref.dtype)
+            raw[:, slot * mxu_size : (slot + 1) * mxu_size] = (
+                jnp.zeros((bucket_m, mxu_size), acc_ref.dtype) + block_acc
+            )
+
+        def epi(j, raw, slot):
+            acc = raw[:, slot * mxu_size : (slot + 1) * mxu_size]
+            acc = apply_act_fn(acc, cfgs.fuse_act)
+            iota = lax.broadcasted_iota(jnp.int32, acc.shape, 0)
+            mask = jnp.logical_and(m_start_local <= iota, iota < m_end_local)
+            tiled_out_2d_ref[:bucket_m, out_cols(j)] = jnp.where(mask, acc, 0).astype(
+                tiled_out_ref.dtype
+            )
+
+        def scoped_deferred(buf_a, buf_b, raw):
+            # The epilogue of pair p-1 runs in iteration p, beside pair p's
+            # matmuls, so the iteration does not end on a serial act + store.
+            # Iteration 0 runs it on zeros into chunk 0, overwritten later.
+            raw[...] = jnp.zeros(raw.shape, raw.dtype)
+            deq(0, buf_a)
+
+            def pair(p, carry):
+                j = 2 * p
+                deq(j + 1, buf_b)
+                epi(jnp.maximum(j - 2, 0), raw, 0)
+                mm_raw(j, buf_a, raw, 0)
+                deq(jnp.minimum(j + 2, num_chunks - 1), buf_a)
+                epi(jnp.maximum(j - 1, 0), raw, 1)
+                mm_raw(j + 1, buf_b, raw, 1)
+                return carry
+
+            num_pairs = num_chunks // 2
+            unroll_n = -(-num_pairs // unroll) if iters else unroll
+            lax.fori_loop(0, num_pairs, pair, 0, unroll=min(unroll_n, num_pairs))
+            epi(num_chunks - 2, raw, 0)
+            epi(num_chunks - 1, raw, 1)
+
         def scoped(buf_a, buf_b):
             deq(0, buf_a)
 
@@ -677,7 +720,11 @@ def inner_kernel(
                 mm(num_chunks - 1, buf_b)
 
         buf = pltpu.VMEM((tile_k, mxu_size), cfgs.lhs_cfgs.dtype)
-        pl.run_scoped(scoped, buf, buf)
+        if deferred and chunk_epilogue:
+            raw = pltpu.VMEM((bucket_m, 2 * mxu_size), acc_ref.dtype)
+            pl.run_scoped(scoped_deferred, buf, buf, raw)
+        else:
+            pl.run_scoped(scoped, buf, buf)
         if not chunk_epilogue:
             return acc_ref[:bucket_m]
         # Same tail as the whole-tile epilogue below.
@@ -753,7 +800,7 @@ def inner_kernel(
                 chunk_epilogue = "a" not in spec and not cfgs.rhs_cfgs.has_bias
                 acc = _pipe_matmul(
                     bucket_m, int(digits or 1), chunk_epilogue, "c" in spec,
-                    iters="i" in spec,
+                    iters="i" in spec, deferred="d" in spec,
                 )
                 if acc is None:
                     return
@@ -1006,7 +1053,7 @@ def _k1_body_env() -> str | None:
     if raw in ("", "0", "off"):
         return None
     if raw not in ("single", "hoist", "roll", "chunk") and not (
-        raw.startswith("pipe") and (raw[4:].rstrip("aci") or "1").isdigit()
+        raw.startswith("pipe") and (raw[4:].rstrip("acid") or "1").isdigit()
     ):
         raise ValueError(
             f"{_K1_BODY_ENV}={raw!r}: expected single|hoist|roll|chunk|pipe[N]"
