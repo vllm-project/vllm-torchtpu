@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_RAIDEN_KIMIK3_ADMISSION: bool = False
     TPU_RAIDEN_GLM_ADMISSION: bool = False
+    TPU_RAIDEN_GLM_DCP_IDENTITY: bool = False
     TPU_RAIDEN_DSV4_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
     TPU_RAIDEN_CONTROLLER_ADDRESS: str = ""
@@ -224,6 +225,7 @@ if TYPE_CHECKING:
     TPU_P2P_WAIT_PULL_TIMEOUT: int = 120
     TPU_RAIDEN_STAGE3_STATUS_PROBE_S: float = 1.0
     TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT: bool = True
+    TPU_RAIDEN_STAGE3_REGISTER_AHEAD: bool = True
     TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S: float = 30.0
     TPU_RAIDEN_TEST_REGISTRATION_DELAY_S: float = 0.0
     TPU_KV_STAGE_WAIT_TIMEOUT_SECS: float = 30.0
@@ -236,6 +238,10 @@ if TYPE_CHECKING:
     TPU_USE_RAIDEN_CONNECTOR: bool = False
     TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
+    TPU_SCHED_KV_PREFETCH_WAITING: int = 0
+    TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS: int = 64
+    TPU_PREFIX_AWARE_TIER_WARMTH: bool = False
+    TPU_OFFLOAD_KEEP_EAGLE_TAIL: bool = False
     TPU_RAIDEN_INLINE_LOAD: bool = False
     QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
     KDA_MANUAL_STATE_DMA: bool | None = None
@@ -272,6 +278,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
+    VLLM_TPU_DETOK_PRIME_TOKENS: int = 32
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     VLLM_TPU_MTP_FUSED_INDEXSHARE: bool = True
@@ -753,6 +760,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # least this many tokens (0 = every chunked bucket). The lse-gather head
     # split (2) is torch-side and does not follow it (a token-count test there
     # specializes range-compiled graphs).
+    # Buckets that take the V-space merge (TPU_DCP_MERGE_VSPACE_FUSED) use
+    # min(this, TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS) instead.
     "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": env_int(
         "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS", 2048
     ),
@@ -800,7 +809,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # mask, one rounding; layers/adapter/dcp_vspace.py) instead of a pre-merge
     # projection followed by the latent merge path. GLM-5.2 AgentX c4 TP16 x
     # DCP8: P90 TTFT -10..-12% (the separate W_UV bmm, concat and relayouts
-    # cost ~36 ms per 4096-token step).
+    # cost ~36 ms per 4096-token step). Its buckets also take merge pieces down
+    # to TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS (a sliced chunk is a slow copy).
     "TPU_DCP_MERGE_VSPACE_FUSED": env_bool("TPU_DCP_MERGE_VSPACE_FUSED"),
     # Where W_UV is replicated over the DCP group (TPU_DCP_MLA_UV_BEFORE_MERGE),
     # replicate o_proj too, so the backbone buckets that apply W_UV before the
@@ -1066,6 +1076,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # must set it identically.
     "TPU_RAIDEN_POOL_TAGS_PER_LAYER": env_bool("TPU_RAIDEN_POOL_TAGS_PER_LAYER"),
     "TPU_RAIDEN_GLM_ADMISSION": env_bool("TPU_RAIDEN_GLM_ADMISSION"),
+    # GLM Stage-3 from a TP/DCP producer to a TP/DCP decode with the same TP =
+    # DCP size, interleave and block size: each producer rank ships its whole
+    # pages to the decode rank with the same index. Both peers must set it.
+    # Whole pages need no packed-row geometry, so the indexer K cache may keep
+    # its SEQ_ALONG_LANE layout under Raiden GLM admission.
+    "TPU_RAIDEN_GLM_DCP_IDENTITY": env_bool("TPU_RAIDEN_GLM_DCP_IDENTITY"),
     # DeepSeek-V4 admits several attention KV cache groups at once: CSA,
     # indexer, HCA, SWA and the compressor states. Every other model here has
     # exactly one.
@@ -1731,6 +1747,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT": env_bool(
         "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT", default=True
     ),
+    # On by default: a PCP, TP or DP Stage-3 producer registers a request's
+    # KV blocks in the step that completes its prompt rather than in the step
+    # after its finish response (pipeline producers always do).
+    "TPU_RAIDEN_STAGE3_REGISTER_AHEAD": env_bool(
+        "TPU_RAIDEN_STAGE3_REGISTER_AHEAD", default=True
+    ),
     # Seconds, bounded by TPU_P2P_WAIT_PULL_TIMEOUT downstream.
     "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S": env_float(
         "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S", 30.0
@@ -1762,6 +1784,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Concurrent pool-reshard transfers to provision bounded host staging for.
     "TPU_RAIDEN_POOL_STAGING_LEASES": env_nonnegative_int(
         "TPU_RAIDEN_POOL_STAGING_LEASES", 8
+    ),
+    # Decode KV prefetch past a full running set (core/kv_prefetch_scheduler.py):
+    # up to this many waiting requests start their remote KV pull while every
+    # slot is taken, so a freed slot is refilled on the next step. 0 = off.
+    "TPU_SCHED_KV_PREFETCH_WAITING": env_nonnegative_int(
+        "TPU_SCHED_KV_PREFETCH_WAITING", 0
+    ),
+    # Free scheduler blocks a prefetched pull must leave for the running set
+    # beyond the in-flight loads' reservation.
+    "TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS": env_nonnegative_int(
+        "TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS", 64
+    ),
+    # PrefixAwareScheduler: also count the whole chunks the offload tier holds
+    # right past a request's HBM hit as warm (core/prefix_aware_scheduler.py),
+    # so a session HBM evicted but the tier kept is not ranked fully cold.
+    "TPU_PREFIX_AWARE_TIER_WARMTH": env_bool(
+        "TPU_PREFIX_AWARE_TIER_WARMTH", default=False
+    ),
+    # Offload tier: serve the whole tier hit when no KV cache group is
+    # annotated as an MTP/EAGLE drafter group. The pinned vLLM then flags every
+    # group as a drafter group and pops the last chunk of every tier hit (vLLM
+    # main stopped doing so, vllm-project/vllm#52771). The offload-tier
+    # counterpart of VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP
+    # (offload/raiden_connector.py).
+    # TODO(vllm-project/vllm#52735): Remove once the pinned vLLM includes
+    # vllm-project/vllm#52771.
+    "TPU_OFFLOAD_KEEP_EAGLE_TAIL": env_bool(
+        "TPU_OFFLOAD_KEEP_EAGLE_TAIL", default=False
     ),
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD": env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
@@ -1889,6 +1939,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS": env_int(
         "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS", 33554432
     ),
+    # API server: prime the detokenizer with this many prompt-tail tokens; 0 = off.
+    "VLLM_TPU_DETOK_PRIME_TOKENS": env_int("VLLM_TPU_DETOK_PRIME_TOKENS", 32),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:

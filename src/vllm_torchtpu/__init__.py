@@ -1242,19 +1242,139 @@ def _patch_vllm_offload_fine_prefix_alignment() -> None:
     )
 
 
+# Children a TPUMultiConnector may pair with the Raiden P/D connector without
+# changing what the DCP identity patches assume: the Raiden CPU offload tier
+# copies whole rank-local pages (any interleave) and takes its tokens_per_hash
+# from the runtime resolve (_patch_vllm_offloading_config_build).
+_RAIDEN_IDENTITY_COMPANIONS = frozenset({"TPURaidenOffloadingConnector"})
+
+
+def _raiden_children(kv_transfer_config) -> list[dict] | None:
+    """The children of a TPUMultiConnector made of Raiden connectors only.
+
+    Returns [] for a plain TPURaidenConnector config and None for anything
+    else (another connector, or a multi-connector with a foreign child)."""
+    if kv_transfer_config.kv_connector == "TPURaidenConnector":
+        return []
+    if kv_transfer_config.kv_connector != "TPUMultiConnector":
+        return None
+    children = (kv_transfer_config.kv_connector_extra_config or {}).get(
+        "connectors"
+    ) or []
+    raiden = [c for c in children if c.get("kv_connector") == "TPURaidenConnector"]
+    if len(raiden) != 1 or not all(
+        c.get("kv_connector") in _RAIDEN_IDENTITY_COMPANIONS
+        for c in children
+        if c is not raiden[0]
+    ):
+        return None
+    return list(children)
+
+
+def _is_raiden_glm_dcp_identity_producer(kv_transfer_config) -> bool:
+    """A TPURaidenConnector producer under TPU_RAIDEN_GLM_DCP_IDENTITY, alone or
+    as the single P/D child of a TPUMultiConnector next to Raiden offload tiers."""
+    if not (envs.use_raiden_glm_admission() and envs.TPU_RAIDEN_GLM_DCP_IDENTITY):
+        return False
+    children = _raiden_children(kv_transfer_config)
+    if children is None:
+        return False
+    if not children:
+        return bool(
+            kv_transfer_config.is_kv_producer and not kv_transfer_config.is_kv_consumer
+        )
+    (raiden,) = [c for c in children if c.get("kv_connector") == "TPURaidenConnector"]
+    return raiden.get("kv_role") == "kv_producer"
+
+
+def _fine_prefix_hashes_safe(kv_transfer_config) -> bool:
+    """Whether this connector config tolerates sub-block (fine) block hashes.
+
+    The Raiden GLM DCP identity producer reads none, and under the identity
+    transfer a Raiden CPU offload tier takes its tokens_per_hash from this same
+    resolve (_patch_vllm_offloading_config_build). A TPUMultiConnector child is
+    resolved against its own config (the child's), so the offload child must
+    reach the same answer as the engine, which sees the parent."""
+    if _is_raiden_glm_dcp_identity_producer(kv_transfer_config):
+        return True
+    return bool(
+        envs.use_raiden_glm_admission()
+        and envs.TPU_RAIDEN_GLM_DCP_IDENTITY
+        and kv_transfer_config.kv_connector in _RAIDEN_IDENTITY_COMPANIONS
+    )
+
+
+def _patch_raiden_identity_keeps_cp_interleave() -> None:
+    """Keep the configured DCP interleave under the GLM DCP identity transfer.
+
+    The pinned vLLM sets cp_kv_cache_interleave_size to the block size for any
+    KV connector (#50611, for NIXL's block-level transfers); upstream later
+    scoped that to NixlConnector and an unset interleave (#54803, #55531). The
+    identity transfer ships whole pages from producer rank k to consumer rank
+    k, so it works at any interleave both legs share, which every load checks.
+    """
+    if not (envs.use_raiden_glm_admission() and envs.TPU_RAIDEN_GLM_DCP_IDENTITY):
+        return
+    from functools import wraps
+
+    from vllm.config import VllmConfig
+
+    if VllmConfig.__dict__.get("_tpu_raiden_keep_interleave_patch", False):
+        return
+    original = VllmConfig.adjust_dcp_kv_cache_interleave_size
+
+    @wraps(original)
+    def adjust_dcp_kv_cache_interleave_size(self, kv_cache_config) -> None:
+        transfer = self.kv_transfer_config
+        # Standalone TPURaidenOffloadingConnector stores rank-local pages under
+        # GLM DCP identity, matching TPUMultiConnector on disaggregated legs.
+        keep_interleave = transfer is not None and (
+            _raiden_children(transfer) is not None
+            or (
+                envs.use_raiden_glm_admission()
+                and envs.TPU_RAIDEN_GLM_DCP_IDENTITY
+                and transfer.kv_connector in _RAIDEN_IDENTITY_COMPANIONS
+            )
+        )
+        if not keep_interleave:
+            return original(self, kv_cache_config)
+        parallel = self.parallel_config
+        if parallel.decode_context_parallel_size <= 1:
+            return
+        # The deprecated dcp_kv_cache_interleave_size still wins, as upstream.
+        if parallel.dcp_kv_cache_interleave_size > 1 and (
+            parallel.cp_kv_cache_interleave_size
+            != parallel.dcp_kv_cache_interleave_size
+        ):
+            parallel.cp_kv_cache_interleave_size = parallel.dcp_kv_cache_interleave_size
+        logger.info(
+            "[guard] Raiden GLM DCP identity kept cp_kv_cache_interleave_size=%d "
+            "(connector=%s)",
+            parallel.cp_kv_cache_interleave_size,
+            transfer.kv_connector,
+        )
+
+    VllmConfig.adjust_dcp_kv_cache_interleave_size = adjust_dcp_kv_cache_interleave_size
+    VllmConfig._tpu_raiden_keep_interleave_patch = True
+    logger.info(
+        "Applied TPU patch: Raiden GLM DCP identity keeps cp_kv_cache_interleave_size."
+    )
+
+
 def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
     """Return the fine prefix-hit unit for a single-group DCP model, or None.
 
     Opt-in: only a single full-attention (incl. MLA) group under DCP with
-    prefix caching, no PCP, no KV connector other than a CPU offloading one,
-    and an explicit ``--prefix-match-unit`` smaller than the logical block
-    (block_size * dcp). Everything else keeps upstream behavior (hash ==
-    scheduler block).
+    prefix caching, no PCP, no KV connector other than a CPU offloading one
+    or a Raiden GLM DCP identity producer, and an explicit
+    ``--prefix-match-unit`` smaller than the logical block (block_size * dcp).
+    Everything else keeps upstream behavior (hash == scheduler block).
 
     Offloading connectors chunk at the logical block and key each chunk by its
     last fine hash, so they work with a finer hash unit; see
     ``_patch_vllm_offload_fine_prefix_alignment`` for the one load case that
-    needs care.
+    needs care. A Raiden GLM DCP identity producer reads no block hashes: it
+    ships whole pages.
     """
     from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
     from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
@@ -1270,10 +1390,14 @@ def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
         or not cache_config.enable_prefix_caching
         or dcp <= 1
         or parallel_config.prefill_context_parallel_size != 1
-        # P/D connectors consume block hashes at block granularity.
+        # P/D connectors consume block hashes at block granularity. CPU
+        # offloading connectors do not, nor does a Raiden GLM DCP identity
+        # producer (it ships whole pages) with a Raiden offload tier next to it
+        # (keyed by the runtime hash size).
         or (
             vllm_config.kv_transfer_config is not None
             and not _is_offloading_connector(vllm_config.kv_transfer_config)
+            and not _fine_prefix_hashes_safe(vllm_config.kv_transfer_config)
         )
         or len(groups) != 1
     ):

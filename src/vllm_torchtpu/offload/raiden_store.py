@@ -397,6 +397,11 @@ class RaidenOffloadingManager(OffloadingManager):
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
 
+        # Cleared by lazy offload (disable_request_stores): blocks are then
+        # stored only on their way out of HBM, and the request path offers
+        # nothing.
+        self._request_stores_enabled = True
+
     # -- sub-hash / block-id expansion ----------------------------------
 
     def _sub_hashes(self, key: OffloadKey) -> list[bytes]:
@@ -518,17 +523,24 @@ class RaidenOffloadingManager(OffloadingManager):
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
 
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+    def lookup(
+        self,
+        key: OffloadKey,
+        req_context: ReqContext | None = None,
+        *,
+        local_only: bool = False,
+    ) -> LookupResult:
         if key in self._inflight_store_keys:
             return LookupResult.HIT_PENDING
         sub_hashes = self._sub_hashes(key)
         # A probe across all sub-hashes, not a claim: the store pins every
         # local hit it reports, and those pins go straight back below.
         # `prepare_load` takes them again when the scheduler commits to a load.
-        # With the global registry enabled, local misses query remote peer slices.
-        # If the registry is unreachable or times out, the error is swallowed and
-        # lookup safely falls back to local-only caching without failing requests.
-        allow_remote = self._enable_global
+        # With the global registry enabled, local misses query remote peer slices
+        # unless the caller asked for a local-only probe (e.g. scheduler warmth
+        # ranking, which never calls `prepare_load` and must not stall on RPCs
+        # or populate `_remote_slices`).
+        allow_remote = self._enable_global and not local_only
         matches = self._probe(sub_hashes, enable_global=allow_remote)
         if len(matches) < len(sub_hashes):
             return LookupResult.MISS
@@ -568,6 +580,14 @@ class RaidenOffloadingManager(OffloadingManager):
                     # A read_remote for this sub-hash is already in flight;
                     # a second launch on the same hash must not race it.
                     return LookupResult.HIT_PENDING
+                if local_only:
+                    # A local-only probe still counts a storage-tier block: the
+                    # store answered for it in this same lookup (the storage
+                    # tier is asked whatever enable_global is), and a load
+                    # would read it. Nothing is stashed for a `prepare_load`
+                    # the probe never makes. A peer's block cannot get here:
+                    # allow_remote is False for a local-only probe.
+                    continue
                 all_local = False
                 remote_slices[sub_hash] = block
                 continue
@@ -575,6 +595,73 @@ class RaidenOffloadingManager(OffloadingManager):
         if not all_local:
             self._remote_slices.update(remote_slices)
         return LookupResult.HIT
+
+    def probe_warm_chunks(self, keys: Sequence[OffloadKey]) -> int:
+        """How many of `keys`, from the first, a load could serve now or soon.
+
+        The scheduler's tier-warmth probe for a run of chunk keys. A key
+        counts when `lookup(key, local_only=True)` would answer HIT or
+        HIT_PENDING, and the count stops at the first key it would not. Like
+        that lookup, the probe never asks the global registry, pins nothing
+        and stashes nothing.
+
+        It asks the store once for the whole run instead of once per key: the
+        store answers with the resident prefix of what it was asked, host pool
+        first and then the storage tier for the tail, and the storage tier
+        batches its existence checks and stops at its first absent block.
+        Keys with a save in flight count without a store call, as in `lookup`,
+        so the store is asked once per run of keys between them.
+
+        One difference from a per-key lookup: past the first block the host
+        pool lacks, only the storage tier answers, so a host-pool block that
+        follows a storage-tier miss ends the count. Every completed save is
+        also written to the storage tier, so this takes storage files pruned
+        while the host pool still holds their blocks. The probe then ranks the
+        request colder than a load would serve it; it never ranks it warmer.
+        """
+        keys = list(keys)
+        warm = 0
+        i = 0
+        while i < len(keys):
+            if keys[i] in self._inflight_store_keys:
+                warm += 1
+                i += 1
+                continue
+            j = i
+            while j < len(keys) and keys[j] not in self._inflight_store_keys:
+                j += 1
+            run = [self._sub_hashes(key) for key in keys[i:j]]
+            matches = self._probe([h for subs in run for h in subs])
+            answered = self._count_warm_prefix(run, matches)
+            warm += answered
+            if answered < len(run):
+                break
+            i = j
+        return warm
+
+    def _count_warm_prefix(
+        self, run: list[list[bytes]], matches: list[tuple[bytes, Any]]
+    ) -> int:
+        """The leading keys of `run` (each a list of sub-hashes) that `matches`
+        covers in full with blocks a load can serve now or soon."""
+        status = self._block_status
+        servable = (status.HOST, status.HOST_AND_HBM, status.SHARED_STORAGE)
+        pos = 0
+        count = 0
+        for subs in run:
+            chunk = matches[pos : pos + len(subs)]
+            if len(chunk) < len(subs):
+                break
+            for sub_hash, block in chunk:
+                if block.status in servable:
+                    continue
+                if block.status == status.HBM and sub_hash in self._hash_to_admission:
+                    # A save in flight: `lookup` answers HIT_PENDING.
+                    continue
+                return count
+            pos += len(subs)
+            count += 1
+        return count
 
     def touch(self, keys, req_context: ReqContext) -> None:
         # A lookup pins what it finds and releasing drops the entry back at
@@ -589,8 +676,13 @@ class RaidenOffloadingManager(OffloadingManager):
         # hashes past the first host-pool miss without the host pool having
         # been asked about them, so the pool may still hold the same hash,
         # pinned by an in-flight job, and a release would drop that job's pin.
+        #
+        # The scheduler touches a request's keys prefix first. Released in
+        # that order, the prefix would end up least recent, so the LRU would
+        # drop a conversation's head first and strand the rest (a hit needs
+        # the prefix). Releasing the tail first leaves the prefix most recent.
         skip = (self._block_status.REMOTE, self._block_status.SHARED_STORAGE)
-        for key in keys:
+        for key in reversed(list(keys)):
             sub_hashes = self._sub_hashes(key)
             held = [
                 sub_hash
@@ -680,7 +772,35 @@ class RaidenOffloadingManager(OffloadingManager):
         self._pending_remote_slices.update(remote_slices)
         return RaidenLoadStoreSpec(keys)
 
+    def disable_request_stores(self) -> None:
+        """Lazy offload: store blocks only on their way out of HBM.
+
+        The scheduler then admits stores through `prepare_evicting_store`
+        alone, and `prepare_store` (the request path) offers nothing.
+        """
+        self._request_stores_enabled = False
+
     def prepare_store(self, keys, req_context: ReqContext) -> PrepareStoreOutput | None:
+        if not self._request_stores_enabled:
+            # An empty answer, not None (which counts as an allocation
+            # failure): the scheduler advances past these chunks exactly as
+            # it does for chunks already stored.
+            return PrepareStoreOutput(
+                keys_to_store=[],
+                store_spec=RaidenLoadStoreSpec([]),
+                evicted_keys=[],
+            )
+        return self._admit_store_keys(keys)
+
+    def prepare_evicting_store(self, keys) -> PrepareStoreOutput | None:
+        """Admit stores for HBM blocks the allocator is about to evict.
+
+        The lazy-offload counterpart of `prepare_store`, answered the same
+        way: a key already resident or in flight is skipped.
+        """
+        return self._admit_store_keys(keys)
+
+    def _admit_store_keys(self, keys) -> PrepareStoreOutput | None:
         # The Raiden directory is the sole authority on what is stored: probe
         # it per key, so a key whose entries were displaced from the LRU is
         # re-offered here on its next appearance. A key is skipped only when
