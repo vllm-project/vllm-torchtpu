@@ -653,7 +653,17 @@ def _walk_kernel(
     stage_ubits: bool = True,
     mask_view: bool = False,
     vguard_lean: bool = False,
+    walk_pipe: bool = False,
+    pipe_refs=None,
 ):
+    # walk_pipe (q38 UNION-BUILD, gathered walk only; union_walk_kernel(walk_pipe=True)): the tile loop software-pipelined.
+    #   Each tile's work is split in two stages with the served math unchanged: stage A = mask, decode, value guard and the
+    #   masked QK scores (compute_tile up to the score select), stage B = the online softmax, PV and the state update (the
+    #   rest of compute_tile). One loop step runs stage A of tile t + 1 and stage B of tile t in one basic block, so the
+    #   MXU / VPU work of the two tiles can overlap; stage A's scores and values wait in VMEM (``pipe_refs`` = scores and
+    #   values of slot 0 and slot 1). The state still sees tile 0, 1, ... in order and every op is the served op on the
+    #   same operands: bitwise the served walk (a TPU measurement, as every schedule-only change). DMA depth unchanged
+    #   (tile j in buffer j % 2, refilled with tile j + 2 after its stage A).
     # mask_view / vguard_lean (q38 QA-1, gathered walk only; union_walk_kernel(mask_view=..., vguard_lean=...)):
     #   mask_view: the tile's select on a [q_heads_per_kv, rows, keys] view of the scores, with no materialized
     #     [q_heads_per_kv * rows, keys] mask. The same select of the same scores: bitwise.
@@ -1141,38 +1151,166 @@ def _walk_kernel(
                 mass_ref[0, head, :] = mass * alpha + jnp.sum(prob, axis=1)
                 accumulator_ref[0, head, :, :] = acc * alpha[:, None] + weighted
 
-    @pl.when(count > 0)
-    def prefetch_first():
-        start_tile(kv0_ref, line0_ref, sem0_ref)
+    def stage_a(tile, kv_ref, line_ref):
+        # walk_pipe: compute_tile up to the masked scores (same ops, same order); returns [(score, value)] per KV head.
+        logical = tile * kv_tile
+        if line_matmul:
+            lines = line_ref[...].T[:query_block, :].astype(jnp.float32)
+            expand = (
+                lax.broadcasted_iota(jnp.int32, (groups_per_tile, kv_tile), 1) // ratio
+                == lax.broadcasted_iota(jnp.int32, (groups_per_tile, kv_tile), 0)
+            ).astype(jnp.float32)
+            visible = lax.dot(lines, expand, preferred_element_type=jnp.float32) != 0
+        else:
+            visible = line_ref[...].T[:query_block, :] != 0
+        visible &= logical + row[None, :] <= positions[:, None]
+        written = logical + lax.broadcasted_iota(jnp.int32, (kv_tile, head_dim), 0) < jnp.max(
+            lengths_ref[:, 0]
+        )
+        key_values = []
+        for key, value in split_kv(kv_ref)[:kv_heads]:
+            key = key.astype(jnp.bfloat16 if qk16 else jnp.float32)
+            value = value.astype(jnp.float32)
+            if not lean:
+                key = jnp.where(jnp.isfinite(key) & written, key, 0)
+            if vguard_lean:
+                value = jnp.where(written, value, 0)
+            else:
+                value = jnp.where(jnp.isfinite(value) & written, value, 0)
+            key_values.append((key, value))
+        rows = query_block * q_heads_per_kv
+        if not mask_view:
+            row_visible = jnp.broadcast_to(
+                visible[None, :, :], (q_heads_per_kv, query_block, kv_tile)
+            ).reshape(rows, kv_tile)
+        staged = []
+        for head, (key, value) in enumerate(key_values):
+            query = q[head].reshape(rows, head_dim)
+            score = lax.dot(
+                query, key, dimension_numbers=(([1], [1]), ([], [])),
+                preferred_element_type=jnp.float32,
+            )
+            if mask_view:
+                score = jnp.where(
+                    visible[None, :, :], score.reshape(q_heads_per_kv, query_block, kv_tile), -jnp.inf
+                ).reshape(rows, kv_tile)
+            else:
+                score = jnp.where(row_visible, score, -jnp.inf)
+            staged.append((score, value))
+        return staged
 
-    @pl.when(count > 1)
-    def prefetch_second():
-        start_tile(kv1_ref, line1_ref, sem1_ref)
+    def stage_b(staged):
+        # walk_pipe: the rest of compute_tile (online softmax, PV, state), same ops on the staged scores and values.
+        for head, (score, value) in enumerate(staged):
+            m = max_ref[0, head, :]
+            mass = mass_ref[0, head, :]
+            acc = accumulator_ref[0, head, :, :]
+            next_m = jnp.maximum(m, jnp.max(score, axis=1))
+            finite_m = jnp.where(jnp.isneginf(next_m), 0.0, next_m)
+            prob = jnp.exp(score - finite_m[:, None])
+            alpha = jnp.where(jnp.isneginf(next_m), 1.0, jnp.exp(m - next_m))
+            weighted = lax.dot(
+                prob, value, dimension_numbers=(([1], [0]), ([], [])),
+                preferred_element_type=jnp.float32,
+            )
+            max_ref[0, head, :] = next_m
+            mass_ref[0, head, :] = mass * alpha + jnp.sum(prob, axis=1)
+            accumulator_ref[0, head, :, :] = acc * alpha[:, None] + weighted
 
-    def pair_step(pair, _):
-        tile = pair * 2
-        wait_tile(kv0_ref, sem0_ref, line0_ref)
-        compute_tile(tile, kv0_ref, line0_ref)
+    if walk_pipe:
+        s_slots, v_slots = (pipe_refs[0], pipe_refs[1]), (pipe_refs[2], pipe_refs[3])
 
-        @pl.when(tile + 2 < count)
-        def prefetch_next_even():
+        def put(slot, staged):
+            for head, (score, value) in enumerate(staged):
+                s_slots[slot][head] = score
+                v_slots[slot][head] = value
+
+        def take(slot):
+            return [(s_slots[slot][head], v_slots[slot][head]) for head in range(kv_heads)]
+
+        @pl.when(count > 0)
+        def pipe_start_first():
             start_tile(kv0_ref, line0_ref, sem0_ref)
 
-        wait_tile(kv1_ref, sem1_ref, line1_ref)
-        compute_tile(tile + 1, kv1_ref, line1_ref)
-
-        @pl.when(tile + 3 < count)
-        def prefetch_next_odd():
+        @pl.when(count > 1)
+        def pipe_start_second():
             start_tile(kv1_ref, line1_ref, sem1_ref)
 
-        return None
+        @pl.when(count > 0)
+        def pipe_stage_a_first():
+            wait_tile(kv0_ref, sem0_ref, line0_ref)
+            put(0, stage_a(0, kv0_ref, line0_ref))
 
-    lax.fori_loop(0, count // 2, pair_step, None)
+        @pl.when(count > 2)
+        def pipe_start_third():
+            start_tile(kv0_ref, line0_ref, sem0_ref)
 
-    @pl.when(count % 2 != 0)
-    def consume_odd():
-        wait_tile(kv0_ref, sem0_ref, line0_ref)
-        compute_tile(count - 1, kv0_ref, line0_ref)
+        def half(t, kv_ref, line_ref, sem_ref, a_slot, b_slot):
+            # stage A of tile t + 1 (in kv_ref) and stage B of tile t (slot b_slot) in one block; then refill kv_ref with
+            # tile t + 3 (tiles start in order: start_tile_gathered counts them).
+            wait_tile(kv_ref, sem_ref, line_ref)
+            staged = stage_a(t + 1, kv_ref, line_ref)
+            stage_b(take(b_slot))
+            put(a_slot, staged)
+
+            @pl.when(t + 3 < count)
+            def pipe_refill():
+                start_tile(kv_ref, line_ref, sem_ref)
+
+        def pipe_pair(pair, _):
+            t = pair * 2
+            half(t, kv1_ref, line1_ref, sem1_ref, 1, 0)
+            half(t + 1, kv0_ref, line0_ref, sem0_ref, 0, 1)
+            return None
+
+        halves = jnp.maximum(count - 1, 0)
+        lax.fori_loop(0, halves // 2, pipe_pair, None)
+
+        @pl.when((count >= 2) & (halves % 2 == 1))
+        def pipe_last_half():
+            half(halves - 1, kv1_ref, line1_ref, sem1_ref, 1, 0)
+
+        @pl.when((count > 0) & ((count - 1) % 2 == 0))
+        def pipe_last_even():
+            stage_b(take(0))
+
+        @pl.when((count > 0) & ((count - 1) % 2 == 1))
+        def pipe_last_odd():
+            stage_b(take(1))
+
+    if not walk_pipe:
+        @pl.when(count > 0)
+        def prefetch_first():
+            start_tile(kv0_ref, line0_ref, sem0_ref)
+
+        @pl.when(count > 1)
+        def prefetch_second():
+            start_tile(kv1_ref, line1_ref, sem1_ref)
+
+        def pair_step(pair, _):
+            tile = pair * 2
+            wait_tile(kv0_ref, sem0_ref, line0_ref)
+            compute_tile(tile, kv0_ref, line0_ref)
+
+            @pl.when(tile + 2 < count)
+            def prefetch_next_even():
+                start_tile(kv0_ref, line0_ref, sem0_ref)
+
+            wait_tile(kv1_ref, sem1_ref, line1_ref)
+            compute_tile(tile + 1, kv1_ref, line1_ref)
+
+            @pl.when(tile + 3 < count)
+            def prefetch_next_odd():
+                start_tile(kv1_ref, line1_ref, sem1_ref)
+
+            return None
+
+        lax.fori_loop(0, count // 2, pair_step, None)
+
+        @pl.when(count % 2 != 0)
+        def consume_odd():
+            wait_tile(kv0_ref, sem0_ref, line0_ref)
+            compute_tile(count - 1, kv0_ref, line0_ref)
 
     heads = []
     for head in range(kv_heads):
@@ -1236,6 +1374,8 @@ def _walk_kernel_gathered(
     **options,
 ):
     """``_walk_kernel`` reading pre-gathered union tiles (``union_walk_kernel(gathered=...)``)."""
+    if options.get("walk_pipe"):  # the last 4 scratch buffers: pipelined scores / values, slots 0 and 1
+        scratch, options = scratch[:-4], dict(options, pipe_refs=scratch[-4:])
     _walk_kernel(
         tiles_ref, usize_ref, table_ref, debruijn_ref, physw_ref, query_ref, bits_ref, lengths_ref,
         ubits_hbm_ref, cache_ref, output_ref, *scratch,
@@ -1522,8 +1662,12 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
                       union_cap, kv_tile, ratio=4, k_scale=1.0, v_scale=1.0, lean=False,
                       scan_list=False, line_matmul=False, fast_walk=False, scopes=0, walk_runs=0,
                       qk16=False, gathered=None, listed=None, listed_lines=None, run_tables=None,
-                      group_offset=0, lean_gathered=False, mask_view=False, vguard_lean=False):
+                      group_offset=0, lean_gathered=False, mask_view=False, vguard_lean=False, walk_pipe=False):
     """The walking kernel alone, on a precomputed ``union_bits_plan`` (ungated bf16 output).
+
+    ``walk_pipe`` (q38 UNION-BUILD; gathered walk only; see ``_walk_kernel``): the software-pipelined tile loop (stage A of
+    tile t + 1 beside stage B of tile t), the served per-tile math unchanged; 16 MiB more VMEM scratch at G64 / KV1024.
+    The kernel name gains ``_pipe``.
 
     ``mask_view`` / ``vguard_lean`` (q38 QA-1; gathered walk only; see ``_walk_kernel``): bitwise on a finite pool.
     The kernel name gains ``_mv`` / ``_vg``.
@@ -1580,6 +1724,8 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
         raise ValueError("lean_gathered needs the in-place gathered walk (gathered tiles, bits=None)")
     if (mask_view or vguard_lean) and gathered is None:
         raise ValueError("mask_view / vguard_lean (QA-1) apply to the gathered walk only")
+    if walk_pipe and gathered is None:
+        raise ValueError("walk_pipe (the pipelined tile loop) applies to the gathered walk only")
     if (group_offset or bits is None) and gathered is None:
         raise ValueError("group_offset and bits=None need the gathered walk")
     in_place = bool(group_offset) or bits is None
@@ -1678,6 +1824,7 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
             line_matmul=line_matmul, fast_walk=True, scopes=scopes, qk16=qk16,
             gathered_cap_tiles=cap_tiles, **({"stage_ubits": False} if lean_gathered else {}),
             **({"mask_view": True} if mask_view else {}), **({"vguard_lean": True} if vguard_lean else {}),
+            **({"walk_pipe": True} if walk_pipe else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
@@ -1707,7 +1854,12 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
                 pltpu.VMEM(state_shape, jnp.float32),
                 pltpu.VMEM(state_shape, jnp.float32),
                 pltpu.VMEM((*state_shape, head_dim), jnp.float32),
-            ] + ids_scratch,
+            ] + ids_scratch + ([
+                pltpu.VMEM((kv_heads, group * q_heads_per_kv, kv_tile), jnp.float32),
+                pltpu.VMEM((kv_heads, group * q_heads_per_kv, kv_tile), jnp.float32),
+                pltpu.VMEM((kv_heads, kv_tile, head_dim), jnp.float32),
+                pltpu.VMEM((kv_heads, kv_tile, head_dim), jnp.float32),
+            ] if walk_pipe else []),
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
@@ -1722,7 +1874,8 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
         + ("_sc" if scopes else "") + (f"_runs{walk_runs}" if walk_runs else "")
         + ("_gathered" if gathered is not None else "") + ("_listed" if listed is not None else "")
         + ("_lines" if listed_lines is not None else "") + ("_runs" if run_tables is not None else "")
-        + ("_glean" if lean_gathered else "") + ("_mv" if mask_view else "") + ("_vg" if vguard_lean else ""),
+        + ("_glean" if lean_gathered else "") + ("_mv" if mask_view else "") + ("_vg" if vguard_lean else "")
+        + ("_pipe" if walk_pipe else ""),
     )(
         tiles,
         usize.astype(jnp.int32),
@@ -1896,8 +2049,11 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                        run_tables=False, max_run=8, lazy_share=False, gathered=None, gather_chunks=4,
                        gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem", sc_bitset=False,
                        in_place=False, sc_bits_plan=False, gathered_lean=False, mask_view=False, vguard_lean=False,
-                       align_gather=False):
+                       align_gather=False, walk_pipe=False):
     """D2 union-walk attention for a packed prefill step; ``(gated bf16 output, cache)``.
+
+    q38 UNION-BUILD (default off): ``walk_pipe`` reaches the gathered walk kernel only (the software-pipelined tile loop,
+    the served per-tile math unchanged; see ``_walk_kernel``); one engagement line per trace.
 
     q38 QA-1 (all default off): ``mask_view`` / ``vguard_lean`` reach the gathered walk kernel only (bitwise on a
     finite pool; see ``_walk_kernel``). ``align_gather`` (PA-0) builds the group-aligned layout by an inverse row
@@ -2040,7 +2196,13 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
         }
     )
 
-    qa1 = {**({"mask_view": True} if mask_view else {}), **({"vguard_lean": True} if vguard_lean else {})}
+    qa1 = {**({"mask_view": True} if mask_view else {}), **({"vguard_lean": True} if vguard_lean else {}),
+           **({"walk_pipe": True} if walk_pipe else {})}
+    if walk_pipe:
+        if not gathered:
+            raise ValueError("walk_pipe needs the gathered walk (gathered='reference' or 'sparsecore')")
+        _engagement_log("QSA union walk: pipelined tile loop (walk_pipe) traced for %d-row steps (group %d, KV tile %d)",
+                        int(tokens), int(group), int(kv_tile))
 
     def walk(max_tokens):
         """(ungated bf16 output in the original row order, whether every union fits)."""
@@ -2424,7 +2586,7 @@ def gather_chunk_bounds(ngroups, chunks, growth=1.0):
 
 def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows, ids, *, gathered, chunks, group,
                      union_cap, kv_tile, ratio, k_scale, v_scale, lean, qk16, growth=1.0, gather_pool=None,
-                     in_place=False, lean_gathered=False, mask_view=False, vguard_lean=False):
+                     in_place=False, lean_gathered=False, mask_view=False, vguard_lean=False, walk_pipe=False):
     """``union_walk_prefill(gathered=...)``: per chunk of whole query groups, gather the chunk's union tiles from
     the list (``rows``/``ids``), then run the walk-free kernel on them; outputs concatenated in group order."""
     ngroups = ubits.shape[0]
@@ -2437,7 +2599,8 @@ def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows
     # words and no page rows, which it never reads (union_walk_kernel(lean_gathered=True)). Bitwise the in-place walk.
     if lean_gathered and not in_place:
         raise ValueError("lean_gathered needs in_place")
-    qa1 = {**({"mask_view": True} if mask_view else {}), **({"vguard_lean": True} if vguard_lean else {})}
+    qa1 = {**({"mask_view": True} if mask_view else {}), **({"vguard_lean": True} if vguard_lean else {}),
+           **({"walk_pipe": True} if walk_pipe else {})}
     outs = []
     for g0, g1 in gather_chunk_bounds(ngroups, chunks, growth):
         sl, rs = slice(g0, g1), slice(g0 * group, g1 * group)
