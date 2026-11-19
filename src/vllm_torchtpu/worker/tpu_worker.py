@@ -93,8 +93,13 @@ def _world_group_init_kwargs(parallel_config: ParallelConfig) -> dict[str, Any]:
     can still be streaming weights after that while its peers sit in a CPU
     collective (the draft load barrier on prefill, the all_gather_object of
     build_ep_mesh on decode), and the waiters die with "Timed out waiting
-    1800000ms". The option sets the timeout of every CPU collective: vLLM's own
-    groups read it, and the world group gets it here.
+    1800000ms". The option sets the timeout of every CPU collective. This
+    passes it to init_process_group for the default group. vLLM builds the CPU
+    group of each of its group coordinators, the world group's gloo
+    ``cpu_group`` included, with ``new_group(ranks, backend="gloo",
+    timeout=...)`` read from the current vLLM config, which init_device sets
+    around both calls, so no CPU group depends on the default group's
+    timeout.
     """
     timeout = parallel_config.cpu_distributed_timeout
     return {} if timeout is None else {"timeout": timeout}
