@@ -403,6 +403,8 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_RELOAD_MODULES",
         "TPU_MOE_ROUTER_TOPK",
         "TPU_MOE_ROUTER_TOPK_BIAS",
+        # Every EP rank must place experts from the same table.
+        "TPU_EXPERT_PLACEMENT",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",

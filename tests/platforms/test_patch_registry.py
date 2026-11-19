@@ -236,6 +236,10 @@ def test_manifest_preserves_lifecycle_dependencies():
         assert names.index("_patch_vllm_force_v1_runner_tpu") < names.index(
             "_patch_vllm_config_triton_tpu"
         )
+        # The placement wraps the Run:AI iterator the sharded streaming installs.
+        assert names.index("patch_runai_sharded_expert_streaming") < names.index(
+            "install_expert_placement"
+        )
 
 
 def test_plugin_import_sets_environment_before_jax():
