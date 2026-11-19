@@ -278,30 +278,38 @@ class OutBufferedRef(BaseBufferedRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class _GranuleStateRef(BaseBufferedRef):
-    """Shared addressing of the per-sequence state refs below.
+    """Base class for copying per-sequence state between HBM and VMEM.
 
-    A state block is addressed in granules (`granule_view`): one unified-pool
-    row holds both state regions, told apart by `offset`, and a dense state
-    tensor is the same view with `offset` 0. Granules are one 512-byte lane
-    row, except for a dense fp32 state, whose granule is its own last axis
-    (see `_granule_width`).
+    Each state block is copied as a list of equal-size chunks ("granules")
+    instead of in its real tensor shape (see `granule_view`).
+
+    Two HBM storage modes:
+      * Unified pool: conv and recurrent state share one row. `offset` (in
+        granules) says where each region starts.
+      * Dense: conv and recurrent state are separate tensors; `offset` is 0.
     """
 
-    # HBM address offset.
+    # Where this state's region starts in a unified-pool row, in granules.
     offset: int = dataclasses.field(default=0, metadata=dict(static=True))
 
-    def _granule_width(self, ref: jax.Ref) -> int | None:
-        """Granule width for this state's DMA views.
+    def _granule_width(self, ref: jax.Ref) -> int:
+        """Words per DMA granule (see `granule_view`).
 
-        The unified pool packs both state regions into one row addressed by
-        lane-row offsets, and a bf16 state is packed on a non-minor axis, so
-        both keep one-lane-row granules. A dense fp32 state is addressed whole
-        (offset 0), so its own last axis serves, which keeps the VMEM reshape
-        tile-preserving for value heads wider than one lane row.
+        fp32 VMEM is tiled (8, 128), and Mosaic only allows reshapes that keep
+        the lane axis intact. A row of up to 128 words is contiguous, so
+        128-word granules work. A wider row (e.g. d_v = 512) spans several
+        tiles, so the whole row is used as the granule.
+
+        The unified pool always uses 128: its region offsets are in lane
+        rows, and `ref` there is the KV pool, not the state. The wrapper
+        rejects a unified pool with d_v > 128.
         """
-        if self.cfg.is_shared or jnp.dtype(ref.dtype).itemsize != 4:
-            return None
-        return ref.shape[-1]
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        if self.cfg.is_shared:
+            return num_lanes
+        if ref.shape[-1] > num_lanes:
+            return ref.shape[-1]
+        return num_lanes
 
     def _ckpt_state_idx(self, s_idx, ckpt):
         """Source block holding checkpoint `ckpt` of sequence `s_idx`.
