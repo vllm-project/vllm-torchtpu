@@ -178,27 +178,47 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
 
 
 def _patch_vllm_aot_compile_cache_key() -> None:
-    """Include the TPU compiler hash, and the trace ordinal, in vLLM's outer
-    AOT cache key."""
+    """Include the TPU compiler hash, De-Dup MoE env hash, and the trace ordinal
+    in vLLM's outer AOT cache key."""
+    import contextlib
+    import sys
+
     from vllm.compilation import caching
 
-    original = caching.aot_compile_hash_factors
-    if getattr(original, "_tpu_compiler_hash_patch", False):
-        return
+    if not getattr(caching.aot_compile_hash_factors, "_tpu_compiler_hash_patch", False):
+        original = caching.aot_compile_hash_factors
 
-    def tpu_aot_compile_hash_factors(vllm_config):
-        from vllm_torchtpu.compilation import shape_variants
-        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+        def tpu_aot_compile_hash_factors(vllm_config):
+            from vllm_torchtpu.compilation import shape_variants
+            from vllm_torchtpu.compilation.tpu_compiler import (
+                compute_tpu_compilation_hash,
+            )
 
-        return [
-            *original(vllm_config),
-            compute_tpu_compilation_hash(vllm_config),
-            *filter(None, [shape_variants.aot_cache_tag()]),
-        ]
+            dedup_env_hash = envs.compute_dedup_moe_env_hash()
+            return [
+                *original(vllm_config),
+                compute_tpu_compilation_hash(vllm_config),
+                *([f"dedup_moe:{dedup_env_hash}"] if dedup_env_hash else []),
+                *filter(None, [shape_variants.aot_cache_tag()]),
+            ]
 
-    tpu_aot_compile_hash_factors._tpu_compiler_hash_patch = True
-    caching.aot_compile_hash_factors = tpu_aot_compile_hash_factors
-    logger.info("Applied TPU patch: include compiler hash in AOT cache key.")
+        tpu_aot_compile_hash_factors._tpu_compiler_hash_patch = True
+        tpu_aot_compile_hash_factors._tpu_original = original
+        caching.aot_compile_hash_factors = tpu_aot_compile_hash_factors
+        logger.info(
+            "Applied TPU patch: include compiler and De-Dup MoE env hash in AOT cache key."
+        )
+
+    patched = caching.aot_compile_hash_factors
+    orig_fn = getattr(patched, "_tpu_original", None)
+    if orig_fn is not None:
+        for mod in list(sys.modules.values()):
+            if (
+                mod is not None
+                and getattr(mod, "aot_compile_hash_factors", None) is orig_fn
+            ):
+                with contextlib.suppress(AttributeError, TypeError):
+                    setattr(mod, "aot_compile_hash_factors", patched)
 
 
 def _patch_vllm_config_hash_ignore_diagnostics() -> None:
@@ -215,6 +235,7 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
     keys, mirroring ``_TPU_COMPILE_ENV_IGNORED`` for env vars.
     """
     import copy
+    import hashlib
 
     from vllm.config import VllmConfig
 
@@ -225,17 +246,26 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
 
     original = VllmConfig.compute_hash
 
+    def _salt_with_dedup_moe_env(base_hash: str) -> str:
+        dedup_hash = envs.compute_dedup_moe_env_hash()
+        if not dedup_hash:
+            return base_hash
+        digest = hashlib.sha256(
+            f"{base_hash}:dedup_moe:{dedup_hash}".encode()
+        ).hexdigest()
+        return digest[: len(base_hash)] if base_hash else digest
+
     def compute_hash(self, *args, **kwargs) -> str:
         additional_config = self.additional_config
         if not isinstance(additional_config, dict):
-            return original(self, *args, **kwargs)
+            return _salt_with_dedup_moe_env(original(self, *args, **kwargs))
         filtered = {
             key: value
             for key, value in additional_config.items()
             if key not in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
         }
         if filtered == additional_config:
-            return original(self, *args, **kwargs)
+            return _salt_with_dedup_moe_env(original(self, *args, **kwargs))
         # Hash a shallow copy with the filtered dict rather than mutating the
         # live config: compute_hash() may run while other code holds the same
         # VllmConfig, and a shallow copy shares every sub-config by reference
@@ -243,7 +273,7 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
         # compute_hash its own additional_config to read.
         proxy = copy.copy(self)
         proxy.additional_config = filtered
-        return original(proxy, *args, **kwargs)
+        return _salt_with_dedup_moe_env(original(proxy, *args, **kwargs))
 
     VllmConfig._tpu_upstream_compute_hash = original
     VllmConfig.compute_hash = compute_hash

@@ -277,6 +277,9 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # export is chosen from their source, so an edit here has to invalidate
     # the compiled executables like any other kernel change.
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+    # Vendored tokamax De-Dup / fused MoE kernels exported behind pallas:: custom ops.
+    "tokamax/_src/ops/experimental/dedup_moe",
+    "tokamax/_src/ops/experimental/fused_moe",
     # Same for the TP decode MoE op, whose body this module builds.
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
     # Still listed: on this base `pp_shift.py` is a second caller, so the
@@ -294,6 +297,9 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/gdn_pool_layout.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
+    # Sampler (top-k/top-p fast path): compiled separately from the model graph, so
+    # its source must reach the AOT key or a stale sampler executable can load.
+    "vllm_torchtpu/layers/adapter/sample",
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
@@ -413,6 +419,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "jaxlib": importlib_metadata.version("jaxlib"),
         "libtpu": get_libtpu_cache_key(),
         "env": _tpu_compile_env_factors(),
+        "dedup_moe_env": envs.compute_dedup_moe_env_hash(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
         "parallel": {
             "effective_data_parallel_size": utils.get_dp_size(

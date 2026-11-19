@@ -70,10 +70,14 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops", _ACTIVE),
     # Compilation and cache keys.
-    Patch("vllm_torchtpu:_patch_vllm_aot_compile_cache_key", _ACTIVE),
+    Patch(
+        "vllm_torchtpu:_patch_vllm_aot_compile_cache_key",
+        _ENGINE,
+        refresh="vllm_torchtpu:_patch_vllm_aot_compile_cache_key",
+    ),
     Patch("vllm_torchtpu:_patch_vllm_compile_all_ranges", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_compile_prefix_isolation", _ACTIVE),
-    Patch("vllm_torchtpu:_patch_vllm_config_hash_ignore_diagnostics", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_vllm_config_hash_ignore_diagnostics", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_disable_compile_ranges", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_piecewise_backend", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_reset_compile_wrapper", _ACTIVE),

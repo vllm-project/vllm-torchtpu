@@ -105,6 +105,10 @@ if TYPE_CHECKING:
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
+    DEDUP_MOE_WAVES: int = 4
+    DEDUP_MOE_BOARD_SIZE: int = 8
+    DEDUP_MOE_BOARD_SOURCE: str = "coords"
+    VLLM_TT_HYBRID_V2_MAX_T_LOCAL: int = 32
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
@@ -854,7 +858,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.
     "MOE_FUSED_EP_KERNEL_IMPL": env_with_choices(
-        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive"]
+        "MOE_FUSED_EP_KERNEL_IMPL",
+        None,
+        ["v2", "adaptive", "dedup", "hybrid"],
+    ),
+    # G3-LOCAL: MOE_FUSED_EP_KERNEL_IMPL=hybrid serves each token bucket with
+    # stock fused EP v2 when its per-device t_local is below this threshold,
+    # and with the De-Dup direct wave dispatch (DEDUP_MOE_* knobs) otherwise.
+    "VLLM_TT_HYBRID_V2_MAX_T_LOCAL": lambda: int(
+        os.getenv("VLLM_TT_HYBRID_V2_MAX_T_LOCAL", "32") or 32
+    ),
+    # G3-LOCAL (experimental, not for upstream): MOE_FUSED_EP_KERNEL_IMPL=dedup
+    # serves the fused EP layer with tokamax's De-Dup MoE (`dedup_ep_moe`):
+    # wave dispatch over a split-phase ragged all-to-all, plus De-Dup of
+    # inter-board traffic. Expert waves per layer; must divide the experts per
+    # EP shard.
+    "DEDUP_MOE_WAVES": lambda: int(os.getenv("DEDUP_MOE_WAVES", "4") or 4),
+    # EP devices (TensorCores) per board for De-Dup. 8 = one TPU8i tray
+    # (4 chips x 2 TensorCores). 0, or fewer than two boards, runs the direct
+    # wave dispatch without De-Dup.
+    "DEDUP_MOE_BOARD_SIZE": lambda: int(os.getenv("DEDUP_MOE_BOARD_SIZE", "8") or 0),
+    # How boards are derived: "coords" groups devices by physical chip
+    # coordinates (a tray is 4 consecutive chips along x); "id" uses
+    # device_id // board_size.
+    "DEDUP_MOE_BOARD_SOURCE": env_with_choices(
+        "DEDUP_MOE_BOARD_SOURCE", "coords", ["coords", "id"]
     ),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
@@ -1336,3 +1364,66 @@ def use_raiden_glm_admission() -> bool:
 def is_indexer_kv_cache_mode_explicit() -> bool:
     """True when VLLM_TPU_INDEXER_KV_CACHE_MODE was explicitly set."""
     return "VLLM_TPU_INDEXER_KV_CACHE_MODE" in os.environ
+
+
+_DEDUP_MOE_CACHE_ENV_PREFIXES = (
+    "DEDUP_MOE_",
+    "MOE_FUSED_EP_",
+)
+_DEDUP_MOE_CACHE_ENV_EXACT = frozenset({
+    "USE_MOE_FUSED_EP_KERNEL",
+    "VLLM_TT_HYBRID_V2_MAX_T_LOCAL",
+})
+_DEDUP_MOE_CACHE_ENV_IGNORED = frozenset({
+    "DEDUP_MOE_ROUTING_HIST_EVERY_S",
+})
+
+
+def compute_dedup_moe_env_hash() -> str:
+    """Deterministic digest of De-Dup / fused-EP MoE env vars and placements.
+
+    Returns ``""`` when none of the tracked MoE env vars are set in
+    ``os.environ``, and a 16-hex-char SHA-256 prefix otherwise.
+    """
+    import contextlib
+    import hashlib
+    import json
+    from pathlib import Path
+
+    env_items: dict[str, Any] = {}
+    for key, val in sorted(os.environ.items()):
+        if key in _DEDUP_MOE_CACHE_ENV_IGNORED:
+            continue
+        if key == "DEDUP_MOE_ROUTING_HIST_DIR":
+            # Presence changes the traced graph (inserts routing hist count);
+            # the per-run output directory path itself does not.
+            if val.strip():
+                env_items[key] = True
+            continue
+        if (
+            key.startswith(_DEDUP_MOE_CACHE_ENV_PREFIXES)
+            or key in _DEDUP_MOE_CACHE_ENV_EXACT
+        ):
+            env_items[key] = val
+
+    if not env_items:
+        return ""
+
+    placement_digests: list[tuple[str, str]] = []
+    placement_dir = os.environ.get("DEDUP_MOE_PLACEMENT_DIR", "").strip()
+    if placement_dir:
+        pdir = Path(placement_dir)
+        if pdir.is_dir():
+            for npy in sorted(pdir.glob("layer_*.npy")):
+                with contextlib.suppress(OSError):
+                    placement_digests.append(
+                        (npy.name, hashlib.sha256(npy.read_bytes()).hexdigest()[:16])
+                    )
+
+    payload = {
+        "env": env_items,
+        "placements": placement_digests,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]

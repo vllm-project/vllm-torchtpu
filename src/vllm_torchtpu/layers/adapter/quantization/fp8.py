@@ -1156,6 +1156,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             fused_moe_ep,
             fused_moe_ep_supported,
             score_bias_operand,
+            shared_operands,
         )
 
         if fused_moe_ep_supported(self):
@@ -1168,6 +1169,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w2_weight_scale_inv,
                 router_logits,
                 score_bias_operand(layer),
+                shared=shared_operands(layer),
             )
         from vllm_torchtpu.layers.adapter.moe_tp_decode import (
             moe_tp_decode_forward,
