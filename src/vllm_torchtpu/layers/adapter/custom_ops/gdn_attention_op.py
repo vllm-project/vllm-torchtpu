@@ -374,7 +374,7 @@ def _get_shared_gdn_op(kind: str, key: tuple, build: Callable[[str], Any]) -> An
 
 
 def _project_prequant(
-    layer: Any, prequant: tuple[torch.Tensor, torch.Tensor]
+    layer: LinearBase, prequant: tuple[torch.Tensor, torch.Tensor]
 ) -> torch.Tensor:
     """One input projection of rows already quantized per row to FP8
     (values, scales), which the Qwen3.5 model patch hands the layer from its
@@ -382,7 +382,6 @@ def _project_prequant(
     such rows (`linear_common.PrequantLinearMethod`: the TPU FP8 and
     unquantized linear methods) applies the layer to them directly; any other
     method runs the layer's own forward on the dequantized rows."""
-    layer = cast(LinearBase, layer)
     x_q, x_s = prequant
     method = layer.quant_method
     if isinstance(method, PrequantLinearMethod):
@@ -1258,9 +1257,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 ba, _ = self.in_proj_ba(hidden_states)
                 z, _ = self.in_proj_z(hidden_states)
             else:
-                mixed_qkv = _project_prequant(self.in_proj_qkv, prequant)
+                # torch's stubs type these two projections `Module | Tensor`.
+                mixed_qkv = _project_prequant(
+                    cast(LinearBase, self.in_proj_qkv), prequant
+                )
                 ba = _project_prequant(self.in_proj_ba, prequant)
-                z = _project_prequant(self.in_proj_z, prequant)
+                z = _project_prequant(cast(LinearBase, self.in_proj_z), prequant)
             if self.fused_output_projection is None:
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
