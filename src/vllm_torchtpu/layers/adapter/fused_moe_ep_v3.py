@@ -72,6 +72,7 @@ from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
 from vllm_torchtpu.kernels.fused_moe.v3 import layer as _latest_layer
 from vllm_torchtpu.kernels.fused_moe.v3 import layout as _latest_layout
 from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+    _max_node_tokens,
     _pcp_size,
     _squeeze_channel_scale,
     _squeeze_channel_scale_checked,
@@ -575,8 +576,10 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
     local_experts, hidden = w1.shape[0], w1.shape[1]
     inter = w1.shape[2] // 2
 
-    # Build fused EP only when the largest batch justifies it.
-    max_node_tokens = _max_node_tokens(ep)
+    # Build fused EP only when the largest batch justifies it. The EP group
+    # holds ep // tp scheduler batches: the TP ranks of a DP rank split one
+    # batch's rows between them (sequence parallelism) rather than adding one.
+    max_node_tokens = _max_node_tokens(ep // tp)
     if max_node_tokens < envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS:
         logger.info_once(
             "Fused EP MoE not engaged: the largest node-wide batch is %d "
@@ -775,15 +778,3 @@ def _tensor_parallel_size() -> int:
         return int(get_current_vllm_config().parallel_config.tensor_parallel_size)
     except Exception:  # noqa: BLE001 - no config outside a served model
         return 1
-
-
-def _max_node_tokens(ep: int) -> int:
-    """The largest node-wide token count a step can carry, or 0 if unknown."""
-    from vllm.config import get_current_vllm_config
-
-    try:
-        cfg = get_current_vllm_config()
-    except Exception:  # noqa: BLE001 - no config outside a served model
-        return 0
-    cap = getattr(cfg.scheduler_config, "max_num_batched_tokens", None)
-    return int(cap) * ep if isinstance(cap, int) else 0
