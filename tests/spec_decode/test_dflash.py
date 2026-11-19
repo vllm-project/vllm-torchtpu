@@ -39,7 +39,12 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
-from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.kernels.experimental.batched_rpa.configs import (
+    Fp8Operand,
+    NativeFp8,
+)
+from vllm_torchtpu.layers.adapter import native_fp8_scope, token_padding
+from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 from vllm_torchtpu.layers.adapter.token_padding import TokenPaddingState
 from vllm_torchtpu.platforms.tpu_platform import _get_token_paddings
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
@@ -145,6 +150,47 @@ def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp, monkeypa
         )
         assert draft.lm_head is not target.lm_head
         assert torch.equal(draft.lm_head.weight, target.lm_head.weight)
+
+
+def test_load_model_builds_the_drafts_attention_with_modes_off(monkeypatch):
+    """The draft's attention is marked as a draft before its kernels are
+    built, so a model rule's reduced-precision modes do not reach it."""
+    modes = native_fp8_scope.AttentionModes(
+        native_fp8=NativeFp8(pv=Fp8Operand.STATIC), decode_exp2=True
+    )
+    impl = object.__new__(PallasAttentionBackendImpl)
+    impl.attention_modes = modes
+    proposer = _make_proposer()
+    draft, target = _make_vocab_models()
+    draft.model.layers = [
+        SimpleNamespace(self_attn=SimpleNamespace(attn=SimpleNamespace(impl=impl)))
+    ]
+    draft.get_draft_attn_causal = lambda: [False]
+    built = []
+
+    def initialize_kernel(self, layer):
+        built.append(
+            native_fp8_scope.effective(self.attention_modes, self.is_attention_draft)
+        )
+
+    def load_draft_model():
+        proposer.draft_model = draft
+
+    proposer._load_draft_model = load_draft_model
+    monkeypatch.setattr(
+        PallasAttentionBackendImpl, "initialize_kernel", initialize_kernel
+    )
+    monkeypatch.setattr(
+        spec_decode_utils, "gather_sharded_weight", _fake_gather_sharded_weight
+    )
+
+    with mock.patch(
+        "vllm_torchtpu.spec_decode.dflash.get_layers_from_vllm_config", return_value={}
+    ):
+        proposer.load_model(target)
+
+    assert built == [native_fp8_scope.OFF]
+    assert impl.attention_modes == modes
 
 
 def test_propose_empty_batch():
