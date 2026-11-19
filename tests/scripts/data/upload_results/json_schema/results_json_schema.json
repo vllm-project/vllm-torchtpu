@@ -1,0 +1,17 @@
+{
+  "results": {
+    "json_schema": {
+      "acc,none": 0.95,
+      "acc_stderr,none": 0.0,
+      "json_parse_rate,none": 1.0,
+      "non_truncated_rate,none": 0.975,
+      "case_character_acc,none": 1.0,
+      "case_flat_json_acc,none": 0.9
+    }
+  },
+  "meta": {
+    "model": "Qwen/Qwen3.5-397B-A17B-FP8",
+    "total_trials": 40,
+    "successful_trials": 40
+  }
+}

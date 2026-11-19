@@ -13,6 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Upload one results directory to Spanner and BigQuery.
+
+Each measured point becomes one BigQuery row (see bq_utils for the row
+shape):
+
+  isl*_osl*_c*.json           one `vllm bench serve` cell per row, with the
+                              run's accuracy scores on every row. Also the
+                              only rows written to Spanner.
+  profile_export_aiperf.json  one AgentX replay point per row, found at any
+                              depth (agentx_client.sh writes one per
+                              conc_<N>/).
+  results_*.json              one accuracy row for the run, when the run has
+                              no speed-grid row to carry the scores.
+"""
+
 import argparse
 import json
 import os
@@ -87,6 +102,108 @@ def load_accuracy_metrics(results_dir: Path) -> dict:
     return metrics
 
 
+def detect_device() -> str:
+    device = os.getenv("TPU_NAME")
+    if device:
+        return device
+    accelerator = os.getenv("TPU_ACCELERATOR_TYPE")
+    topology = os.getenv("TPU_TOPOLOGY")
+    if os.getenv("CI_RUNNER") == "kube" and accelerator and topology:
+        # Every kube step runs off the one "kube" queue, which names no
+        # TPU, so the pod's own TPU says which: GKE sets TPU_TOPOLOGY.
+        # TPU_ACCELERATOR_TYPE is GKE's "tpu7x-8" unless the step forwards
+        # its own "tpu7x" over it; only the generation is taken, so both
+        # give tpu7x-2x2x1.
+        return f"{accelerator.split('-')[0]}-{topology}"
+    return "unknown-device"
+
+
+def run_bq_config(config: dict, *, code_hash, device, run_by, job_ref) -> dict:
+    """The config fields every BigQuery row of one run shares."""
+    return {
+        "code_hash": code_hash,
+        "created_by": os.getenv("CREATED_BY") or "buildkite-agent",
+        "device_type": device,
+        "run_by": run_by,
+        "job_reference": str(job_ref),
+        "profile_gcs_dir": config.get("profile_gcs_dir"),
+    }
+
+
+def engine_flags(config: dict) -> dict:
+    return {
+        "max_num_seqs": config.get("max_num_seqs"),
+        "max_num_batched_tokens": config.get("max_num_batched_tokens"),
+        "tensor_parallel_size": config.get("tensor_parallelism"),
+        "data_parallel_size": config.get("data_parallelism", 1),
+        "max_model_len": config.get("max_model_len"),
+        "enable_ep": bool(config.get("enable_ep")),
+        "quantization": config.get("quantization"),
+        "multihost_backend": os.getenv("TPU_MULTIHOST_BACKEND") or None,
+    }
+
+
+def load_agentx_point(export_path: Path, config: dict) -> dict | None:
+    """One AgentX replay point: the aiperf export, its concurrency, and the
+    routing metrics the engines reported beside it. None when unreadable."""
+    try:
+        export = json.loads(export_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"Error loading {export_path}: {e}", file=sys.stderr)
+        return None
+    if not isinstance(export, dict):
+        print(f"Error: {export_path} is not a JSON object", file=sys.stderr)
+        return None
+    routing = {}
+    server_path = export_path.with_name(bq_utils.SERVER_METRICS_EXPORT_FILENAME)
+    if server_path.is_file():
+        try:
+            routing = bq_utils.server_routing_metrics(
+                json.loads(server_path.read_text()), config.get("max_num_seqs")
+            )
+        except (OSError, json.JSONDecodeError) as e:
+            # The point is still a measurement without its routing metrics.
+            print(f"Warning: Failed to load {server_path}: {e}", file=sys.stderr)
+    return {
+        "export": export,
+        "concurrency": bq_utils.agentx_concurrency(export),
+        "routing": routing,
+    }
+
+
+def agentx_workload(export: dict, concurrency) -> dict:
+    input_config = export.get("input_config")
+    input_config = input_config if isinstance(input_config, dict) else {}
+    datasets = input_config.get("datasets")
+    dataset = datasets[0] if isinstance(datasets, list) and datasets else {}
+    dataset = dataset if isinstance(dataset, dict) else {}
+    metadata = export.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return {
+        "scenario": metadata.get("scenario") or input_config.get("scenario"),
+        "dataset": dataset.get("dataset"),
+        "max_context_length": dataset.get("max_context_length"),
+        "max_concurrency": concurrency,
+    }
+
+
+def agentx_model(export: dict) -> str | None:
+    try:
+        return export["input_config"]["models"]["items"][0]["name"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def chips_argument(value: str) -> int:
+    try:
+        chips = int(value)
+    except ValueError:
+        chips = 0
+    if chips <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return chips
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Upload performance benchmark results to Spanner and "
@@ -139,7 +256,41 @@ def main():
         "(default: BQ_TABLE env or "
         f"{bq_utils.DEFAULT_BQ_TABLE}).",
     )
+    parser.add_argument(
+        "--chips",
+        type=chips_argument,
+        default=None,
+        help="Physical accelerator chips serving the run, the divisor of "
+        "per-chip throughput. Not TP x DP, which counts ranks "
+        f"(default: {' or '.join(bq_utils.CHIPS_ENVS)} env; per-chip "
+        "throughput is left out when no count is stated).",
+    )
+    parser.add_argument(
+        "--prefill-chips",
+        type=chips_argument,
+        default=None,
+        help="Chips of the prefill pool of a disaggregated run; with "
+        "--decode-chips it replaces --chips "
+        f"(default: {bq_utils.PREFILL_CHIPS_ENV} env).",
+    )
+    parser.add_argument(
+        "--decode-chips",
+        type=chips_argument,
+        default=None,
+        help="Chips of the decode pool of a disaggregated run "
+        f"(default: {bq_utils.DECODE_CHIPS_ENV} env).",
+    )
     args = parser.parse_args()
+
+    try:
+        if (args.chips, args.prefill_chips, args.decode_chips) == (None,) * 3:
+            chips = bq_utils.chips_from_env()
+        else:
+            chips = bq_utils.physical_chips(
+                args.chips, args.prefill_chips, args.decode_chips
+            )
+    except ValueError as e:
+        parser.error(str(e))
 
     if not args.results_dir.exists():
         print(f"Error: results-dir does not exist: {args.results_dir}", file=sys.stderr)
@@ -148,10 +299,17 @@ def main():
     config = load_config_json(args.results_dir)
     accuracy_metrics = load_accuracy_metrics(args.results_dir)
 
+    routing_metrics = bq_utils.load_routing_metrics(args.results_dir)
+
     # Locate all result json files matching the pattern
     result_files = sorted(args.results_dir.glob("isl*_osl*_c*.json"))
-    if not result_files:
-        print(f"No perf result files (isl*_osl*_c*.json) found in {args.results_dir}.")
+    # agentx_client.sh writes one conc_<N>/ directory per point, under
+    # <results>/agentx/ when run_eval_flow.sh drives it.
+    agentx_files = sorted(
+        args.results_dir.glob(f"**/conc_*/**/{bq_utils.AGENTX_EXPORT_FILENAME}")
+    )
+    if not (result_files or agentx_files or accuracy_metrics):
+        print(f"Nothing to upload from {args.results_dir}.")
         return 0
 
     code_hash = os.getenv("BUILDKITE_COMMIT")
@@ -161,19 +319,7 @@ def main():
         )
         return 1
 
-    device = os.getenv("TPU_NAME")
-    if not device:
-        accelerator = os.getenv("TPU_ACCELERATOR_TYPE")
-        topology = os.getenv("TPU_TOPOLOGY")
-        if os.getenv("CI_RUNNER") == "kube" and accelerator and topology:
-            # Every kube step runs off the one "kube" queue, which names no
-            # TPU, so the pod's own TPU says which: GKE sets TPU_TOPOLOGY.
-            # TPU_ACCELERATOR_TYPE is GKE's "tpu7x-8" unless the step forwards
-            # its own "tpu7x" over it; only the generation is taken, so both
-            # give tpu7x-2x2x1.
-            device = f"{accelerator.split('-')[0]}-{topology}"
-        else:
-            device = "unknown-device"
+    device = detect_device()
 
     run_by = os.getenv("GCP_INSTANCE_NAME")
     if not run_by:
@@ -183,7 +329,12 @@ def main():
         "BUILDKITE_BUILD_NUMBER", datetime.now().strftime("%Y%m%d_%H%M%S")
     )
 
+    run_config = run_bq_config(
+        config, code_hash=code_hash, device=device, run_by=run_by, job_ref=job_ref
+    )
+    run_type = os.getenv("RUN_TYPE") or "DAILY"
     success = True
+    speed_grid_rows = 0
 
     for rf in result_files:
         m = RESULT_FILENAME_RE.match(rf.name)
@@ -339,24 +490,13 @@ def main():
         bq_metrics = [("vllm_bench", bq_utils.extract_bench_metrics(res))]
         if accuracy_metrics:
             bq_metrics.append(("lm_eval", accuracy_metrics))
+        bq_utils.with_shared_elements(
+            bq_metrics, bq_utils.bench_derived_metrics(res, chips), routing_metrics
+        )
         bq_config = {
-            "code_hash": code_hash,
-            "created_by": os.getenv("CREATED_BY") or "buildkite-agent",
-            "device_type": device,
-            "run_by": run_by,
-            "job_reference": str(job_ref),
-            "profile_gcs_dir": config.get("profile_gcs_dir"),
+            **run_config,
             "backend": dataset,
-            "engine_flags": {
-                "max_num_seqs": max_num_seqs,
-                "max_num_batched_tokens": max_num_batched_tokens,
-                "tensor_parallel_size": tensor_parallelism,
-                "data_parallel_size": config.get("data_parallelism", 1),
-                "max_model_len": max_model_len,
-                "enable_ep": bool(config.get("enable_ep")),
-                "quantization": config.get("quantization"),
-                "multihost_backend": os.getenv("TPU_MULTIHOST_BACKEND") or None,
-            },
+            "engine_flags": engine_flags(config),
             "workload": {
                 "input_len": input_len,
                 "output_len": output_len,
@@ -369,16 +509,91 @@ def main():
         bq_sql = bq_utils.build_insert_sql(
             record_id=record_id,
             created_time=bq_utils.created_time_sql(res.get("date")),
-            run_type=os.getenv("RUN_TYPE") or "DAILY",
+            run_type=run_type,
             model_id=model,
             metrics=bq_metrics,
             config=bq_config,
             bq_table=args.bq_table,
         )
+        speed_grid_rows += 1
         if not bq_utils.run_insert(
             bq_sql,
             project=args.bq_project,
             label=rf.name,
+            record_id=record_id,
+            skip=args.skip_db_upload,
+        ):
+            success = False
+
+    # AgentX replay points and the accuracy row go to BigQuery only: Spanner's
+    # RunRecord is keyed on a speed-grid cell and is being migrated away from.
+    for export_path in agentx_files:
+        label = str(export_path.relative_to(args.results_dir))
+        point = load_agentx_point(export_path, config)
+        if point is None:
+            success = False
+            continue
+        export = point["export"]
+        model = config.get("model") or agentx_model(export)
+        if not model:
+            print(f"Error: no model in config.json or {label}", file=sys.stderr)
+            success = False
+            continue
+        record_id = str(uuid.uuid4())
+        bq_sql = bq_utils.build_insert_sql(
+            record_id=record_id,
+            created_time=bq_utils.created_time_sql(export.get("end_time")),
+            run_type=run_type,
+            model_id=model,
+            metrics=bq_utils.with_shared_elements(
+                [("agentx", bq_utils.extract_agentx_metrics(export))],
+                bq_utils.agentx_derived_metrics(export, chips),
+                # What the engines measured for this point wins over the
+                # run-level file.
+                {**routing_metrics, **point["routing"]},
+            ),
+            config={
+                **run_config,
+                "engine_flags": engine_flags(config),
+                "workload": agentx_workload(export, point["concurrency"]),
+            },
+            bq_table=args.bq_table,
+        )
+        if not bq_utils.run_insert(
+            bq_sql,
+            project=args.bq_project,
+            label=label,
+            record_id=record_id,
+            skip=args.skip_db_upload,
+        ):
+            success = False
+
+    # Accuracy is stamped on every speed-grid row; a run that wrote none
+    # (--skip-benchmark, or AgentX only) gets one row of its own.
+    if accuracy_metrics and not speed_grid_rows:
+        model = config.get("model")
+        if not model:
+            print(
+                "Error: Missing required config parameter 'model' in config.json",
+                file=sys.stderr,
+            )
+            return 1
+        record_id = str(uuid.uuid4())
+        bq_sql = bq_utils.build_insert_sql(
+            record_id=record_id,
+            created_time=bq_utils.created_time_sql(None),
+            run_type=run_type,
+            model_id=model,
+            metrics=bq_utils.with_shared_elements(
+                [("lm_eval", accuracy_metrics)], {}, routing_metrics
+            ),
+            config={**run_config, "engine_flags": engine_flags(config)},
+            bq_table=args.bq_table,
+        )
+        if not bq_utils.run_insert(
+            bq_sql,
+            project=args.bq_project,
+            label="accuracy",
             record_id=record_id,
             skip=args.skip_db_upload,
         ):
