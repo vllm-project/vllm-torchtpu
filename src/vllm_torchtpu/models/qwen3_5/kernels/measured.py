@@ -15,12 +15,17 @@
 quantization were measured, and so where they run.
 
 Both kernels ran on every leg of the validation entries: Qwen3.5-397B-A17B on TPU7x,
-prefill legs at TP1 and decode legs at TP2 and TP8. Each changes the last
-bits of the forward pass (no bf16 rounding between the norm and the rope; the
-out_proj's FP8 rows quantized from the f32 gated norm), so they run only
-there. Every other Qwen3.5 checkpoint, main's CI model Qwen3.5-35B-A3B among
-them, every other device and every other per-device head count keeps main's
-eager q/k norm and rope and main's ``RMSNormGated`` + FP8 linear.
+prefill legs at TP1 and decode legs at TP2 and TP8. The q/k norm + rope
+changes the last bits of the forward pass (no bf16 rounding between the norm
+and the rope). The gated norm + FP8 kernel rounds the normed rows to bf16, as
+RMSNormGated returns them, and quantizes them as the fp8 linear does: on the
+host its FP8 rows and scales equal the fp8 linear's bit for bit. On TPU7x,
+19 of 20 measured cases gave bit-identical scales; in the other, one row's
+scale was one bf16 step off, which moves that row's FP8 values by at most one
+float8_e4m3fn step. Both run only there. Every other Qwen3.5 checkpoint,
+main's CI model Qwen3.5-35B-A3B among them, every other device and every
+other per-device head count keeps main's eager q/k norm and rope and main's
+``RMSNormGated`` + FP8 linear.
 """
 
 from vllm_torchtpu.logger import init_logger
