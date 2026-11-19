@@ -1,0 +1,18 @@
+{
+ "agentx-tp8-ep-dcp-dspark": {
+  "config": {"tp": 8, "dp": 1, "ep": true, "spec": true},
+  "plan": {"model": "msa_sparse", "draft": "dspark", "tp_all_reduce": "pallas_512k", "spec_verify": "fused", "msa_cache": "kv_cache_dtype"}
+ },
+ "tp8-ep-no-spec": {
+  "config": {"tp": 8, "dp": 1, "ep": true, "spec": false},
+  "plan": {"model": "msa_sparse", "draft": "dspark", "tp_all_reduce": "pallas_512k", "spec_verify": "unfused", "msa_cache": "kv_cache_dtype"}
+ },
+ "tp8-no-ep-dspark": {
+  "config": {"tp": 8, "dp": 1, "ep": false, "spec": true},
+  "plan": {"model": "msa_sparse", "draft": "dspark", "tp_all_reduce": "xla", "spec_verify": "fused", "msa_cache": "kv_cache_dtype"}
+ },
+ "agentx-int4-tp8-ep-dcp4-dspark": {
+  "config": {"tp": 8, "dp": 1, "ep": true, "spec": true, "kv_cache_dtype": "fp8", "additional": {"model_plan": {"profile": "agentx-int4"}}},
+  "plan": {"model": "msa_sparse", "draft": "dspark", "tp_all_reduce": "pallas_512k", "spec_verify": "fused", "msa_cache": "int4"}
+ }
+}

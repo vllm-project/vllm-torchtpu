@@ -72,9 +72,11 @@ def _runner():
         spec_bonus_and_target_logits=_logits,
         spec_gather_bonus_and_target_logits=_logits,
         _precompile_timed=lambda name: contextlib.nullcontext(),
-        # The greedy top-token verify and top-k candidate warmups are off.
+        # The greedy top-token verify, top-k candidate and model verify
+        # warmups are off.
         _greedy_head_owner=None,
         _topk_candidate_blocks=lambda: 0,
+        _spec_verify_sampler=None,
     )
     runner._spec_verify_bucket_reachable = functools.partial(
         TPUModelRunner._spec_verify_bucket_reachable, runner
@@ -215,6 +217,7 @@ def test_rotated_sweep_holds_no_collective(monkeypatch, synthetic, optional_path
         _hidden_states_dtype=torch.float32,
         device="cpu",
         _precompile_timed=lambda name: contextlib.nullcontext(),
+        _spec_verify_sampler=None,
     )
     runner.spec_bonus_and_target_logits = functools.partial(
         _recording(TPUModelRunner.spec_bonus_and_target_logits, graphs), None
