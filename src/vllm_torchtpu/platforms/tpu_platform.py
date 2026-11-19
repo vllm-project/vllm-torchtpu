@@ -34,6 +34,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.moe_reference_parity import get_moe_reference_parity
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
@@ -218,9 +219,9 @@ _tpu_kv_connectors_registered = False
 
 
 def _configure_torchtpu_eager_mode() -> None:
-    from torch_tpu._internal import execution_mode
+    from torch import tpu
 
-    previous_mode = execution_mode.eager_mode
+    previous_mode = tpu.eager_mode
     # Kernel-iteration mode keeps DEFER_NEVER: DEFER_AND_FUSE fuses the eager
     # region around the split-out Pallas ops into per-context device programs,
     # each of which recompiles after a kernel hot-swap. With DEFER_NEVER the
@@ -230,10 +231,10 @@ def _configure_torchtpu_eager_mode() -> None:
             "TorchTPU eager mode left at %s (TPU_KERNEL_ITER_MODE).", previous_mode.name
         )
         return
-    execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
+    tpu.eager_mode = tpu.EagerMode.DEFER_AND_FUSE
     logger.info(
         "TorchTPU eager mode configured: %s (previous=%s)",
-        execution_mode.eager_mode.name,
+        tpu.eager_mode.name,
         previous_mode.name,
     )
 
@@ -851,6 +852,14 @@ class TpuPlatform(Platform):
                 "nothing. Unset it; the fused expert-parallel MoE kernel is "
                 "USE_MOE_FUSED_EP_KERNEL=1."
             )
+        if "TPU_MOE_TOPK_WEIGHTS_FLOAT32" in os.environ:
+            raise ValueError(
+                "TPU_MOE_TOPK_WEIGHTS_FLOAT32 is no longer supported. Unset it "
+                "and pass --additional-config "
+                "'{\"tpu_moe_topk_weights_float32\": true}' instead."
+            )
+        # Rejects non-bool MoE reference-parity values before any worker starts.
+        get_moe_reference_parity(vllm_config)
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )

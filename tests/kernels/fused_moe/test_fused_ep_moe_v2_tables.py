@@ -37,6 +37,8 @@ client for every registered platform including TPU. Nothing here needs one, but
 do not read the fixture as a claim that the chips stay free.
 """
 
+import types
+
 import numpy as np
 import pytest
 
@@ -45,7 +47,7 @@ jnp = jax.numpy
 
 from jax.experimental.pallas import tpu as pltpu  # noqa: E402
 
-from vllm_torchtpu.kernels.fused_moe.v2 import host  # noqa: E402
+from vllm_torchtpu.kernels.fused_moe.v2 import host, kernel  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -467,6 +469,24 @@ def test_slab_tables_follow_the_sparse_core(chip, on_tensorcore):
     """Only a chip whose SparseCore has at most 4 subcores builds on the TensorCore."""
     info = pltpu.get_tpu_info_for_chip(getattr(pltpu.ChipVersion, chip), 1)
     assert host.slab_tables_on_tensorcore(info) is on_tensorcore
+
+
+@pytest.mark.parametrize(
+    "smem,tokens,fits",
+    [
+        (None, 131072, True),  # TPU8i's record: 1 MiB, so the full 512 KiB
+        (None, 131073, False),
+        (512 * 1024, 65536, True),  # half the SMEM, so half the budget
+        (512 * 1024, 65537, False),
+    ],
+)
+def test_scale_slab_budget_follows_the_chips_smem(smem, tokens, fits):
+    """The lookup's scale table takes at most half of the chip's SMEM."""
+    if smem is None:
+        info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_8I, 1)
+    else:
+        info = types.SimpleNamespace(smem_capacity_bytes=smem)
+    assert kernel.scale_slab_fits(tokens, info) is fits
 
 
 def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens():

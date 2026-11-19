@@ -1961,13 +1961,15 @@ def test_sp_moe_reduces_latent_before_norm_and_up_projection(monkeypatch, gather
     model.shared_experts = None
     model.experts = SimpleNamespace(
         routed_experts=SimpleNamespace(
-            quant_method=SimpleNamespace(apply_with_routing=experts)
+            quant_method=SimpleNamespace(
+                apply_with_routing=experts, _tpu_topk_weights_float32=False
+            )
         )
     )
     monkeypatch.setattr(
         module.moe_routing,
         "route",
-        lambda *args: (torch.full((1, 2), 0.5), torch.tensor([[3, 9]])),
+        lambda *args, **kwargs: (torch.full((1, 2), 0.5), torch.tensor([[3, 9]])),
     )
     dtype = torch.float32 if gather_mode == "plain" else torch.bfloat16
     x = torch.tensor([[1.0, 3.0, 4.0, 6.0]], dtype=dtype)

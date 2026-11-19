@@ -34,6 +34,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         profile,
         profiles,
         spec,
+        weights,
     )
     from .collectives import AllReduceRing
     from .dma import pool_alias
@@ -115,6 +116,14 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         VLLMAlias,
         WeightDecl,
     )
+    from .weights import (
+        ArrayOps,
+        JaxArrayOps,
+        WeightSource,
+        default_eplb_cores,
+        encode_eplb_ecopy,
+        pack_spec_logical_weights,
+    )
 
 # Public names resolve on first access (PEP 562): importing a submodule
 # (e.g. `runtime.contract`) doesn't import jax through this package.
@@ -134,6 +143,7 @@ _SUBMODULES = frozenset(
         "profile",
         "profiles",
         "spec",
+        "weights",
     }
 )
 _LAZY: dict[str, str] = {
@@ -203,6 +213,12 @@ _LAZY: dict[str, str] = {
     "VLLMAlias": ".spec",
     "WeightDecl": ".spec",
     "pool_alias": ".dma",
+    "ArrayOps": ".weights",
+    "JaxArrayOps": ".weights",
+    "WeightSource": ".weights",
+    "default_eplb_cores": ".weights",
+    "encode_eplb_ecopy": ".weights",
+    "pack_spec_logical_weights": ".weights",
 }
 
 __all__ = [
@@ -210,6 +226,7 @@ __all__ = [
     "POOL_STATE_NAME",
     "REQUIRED",
     "AllReduceRing",
+    "ArrayOps",
     "Baseline",
     "CacheExec",
     "CompareMode",
@@ -223,6 +240,7 @@ __all__ = [
     "GDNParams",
     "GQAParams",
     "HFParamDecl",
+    "JaxArrayOps",
     "KVCacheDecl",
     "LayerType",
     "MegakernelConfigError",
@@ -252,16 +270,19 @@ __all__ = [
     "Tiles",
     "VLLMAlias",
     "WeightDecl",
+    "WeightSource",
     "allocate_test_layout",
     "cache_exec",
     "col_chunk",
     "collectives",
     "conv_to_raw_page",
     "decls",
+    "default_eplb_cores",
     "default_tiles",
     "derive_pool_layout",
     "dma",
     "encode_ecopy",
+    "encode_eplb_ecopy",
     "errors",
     "exec_spec",
     "get_profile",
@@ -273,6 +294,7 @@ __all__ = [
     "module_options",
     "modules",
     "ops",
+    "pack_spec_logical_weights",
     "planner",
     "pool",
     "pool_alias",
@@ -285,6 +307,7 @@ __all__ = [
     "round_up",
     "spec",
     "ssm_to_raw_pages",
+    "weights",
     "with_cache",
 ]
 
