@@ -54,8 +54,15 @@ SCENARIOS = {s.name: s for s in (SCENARIO, DECODE_SCENARIO)}
 SCENARIOS["decode_agentx"] = Scenario(
     "decode", 128, prefix_tokens=147456, output_tokens=512, chunk_tokens=2048
 )
+# DSV41_DP16_REQUESTS / DSV41_DP16_PREFIX_TOKENS size it, e.g. 192 requests at
+# 147456 tokens for the AgentX decode slice.
 SCENARIOS["decode_dp16"] = Scenario(
-    "decode", 768, output_tokens=512, dp_size=16, physical_chips=8
+    "decode",
+    int(os.environ.get("DSV41_DP16_REQUESTS", "768")),
+    prefix_tokens=int(os.environ.get("DSV41_DP16_PREFIX_TOKENS", "98304")),
+    output_tokens=512,
+    dp_size=16,
+    physical_chips=8,
 )
 
 
