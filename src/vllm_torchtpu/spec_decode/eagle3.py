@@ -445,7 +445,14 @@ class Eagle3Proposer:
         # as its own program (_build_step0_programs), whether it has run once,
         # and whether the capacity-row program (the draft's own) has.
         self._decode_rows_model: torch.nn.Module | None = None
-        self._decode_rows_warm = False
+        # One compiled decode-rows program per token bucket: its forward slices
+        # decode_rows_count(T) rows, a Python int of the bucket, so each bucket
+        # traces its own graph. Re-tracing one compiled module would compile a
+        # second time on the same vLLM backend, which vLLM rejects
+        # (configure_post_pass: pre-grad pass already set).
+        self._decode_rows_models: dict[int, torch.nn.Module] = {}
+        self._decode_rows_build = None
+        self._decode_rows_warm: set[int] = set()
         self._draft_step0_warm = False
 
     @property
@@ -634,20 +641,26 @@ class Eagle3Proposer:
 
         assert self.draft_model is not None
         K = self.speculative_config.num_speculative_tokens
-        with (
-            set_model_tag("eagle_head"),
-            set_vllm_model_wrapper_context(
-                mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
-            ),
-            set_current_vllm_config(self.draft_vllm_config),
-        ):
-            self._decode_rows_model = build_mtp_step0_rows_model(
-                vllm_config=self.draft_vllm_config,
-                prefix=f"mtp_step0_decode_rows_k{K}",
-                mtp=self.draft_model,
-                dynamic_arg_dims=draft_dims,
-                tokens_per_request=K + 1,
-            )
+        def build(prefix: str) -> torch.nn.Module:
+            with (
+                set_model_tag("eagle_head"),
+                set_vllm_model_wrapper_context(
+                    mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
+                ),
+                set_current_vllm_config(self.draft_vllm_config),
+            ):
+                return build_mtp_step0_rows_model(
+                    vllm_config=self.draft_vllm_config,
+                    prefix=prefix,
+                    mtp=self.draft_model,
+                    dynamic_arg_dims=draft_dims,
+                    tokens_per_request=K + 1,
+                )
+
+        self._decode_rows_build = build
+        # Marks the lever on; the per-bucket programs come from
+        # _decode_rows_model_for.
+        self._decode_rows_model = build(f"mtp_step0_decode_rows_k{K}")
         logger.info(
             "MTP draft step 0 of a step with at most %d * ceil(T / %d) "
             "requests evaluates that many rows.",
@@ -664,6 +677,21 @@ class Eagle3Proposer:
             if c is not None
         ]
         return int(min(caps))
+
+    def _decode_rows_model_for(self, tokens: int) -> torch.nn.Module:
+        """The decode-rows step-0 program of the ``tokens`` bucket (built on
+        first use; the first bucket reuses the module built at load)."""
+        model = self._decode_rows_models.get(tokens)
+        if model is None:
+            if not self._decode_rows_models and self._decode_rows_model is not None:
+                model = self._decode_rows_model
+            else:
+                K = self.speculative_config.num_speculative_tokens
+                model = self._decode_rows_build(
+                    f"mtp_step0_decode_rows_k{K}_t{tokens}"
+                )
+            self._decode_rows_models[tokens] = model
+        return model
 
     def _decode_rows_serves(self, tokens: int) -> bool:
         """Whether the decode-rows step-0 program has a ``tokens`` bucket:
@@ -3164,9 +3192,10 @@ class Eagle3Proposer:
         # Token-length rows (-1 past the requests); the program evaluates the
         # first decode_rows_count(T) of them.
         rows = self._padded_draft_rows(last_token_indices, tokens)
-        if not self._decode_rows_warm:
+        decode = self._decode_rows_model_for(tokens)
+        if tokens not in self._decode_rows_warm:
             run(rows, decode, serves)
-            self._decode_rows_warm = True
+            self._decode_rows_warm.add(tokens)
         return run(rows, decode, serves)
 
     def _forward_draft(
