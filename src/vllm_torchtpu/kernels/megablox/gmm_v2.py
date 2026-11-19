@@ -524,6 +524,13 @@ def inner_kernel(
     m_end_local = m_end - m_offset
 
     chunk_mode = _k1_body_mode(cfgs)
+    pipe_buckets = _pipe_buckets_env()
+
+    def _pipe_bucket(bucket_m):
+        # TPU_GMM_V2_K1_PIPE_BUCKETS: only these buckets take the chunk mode
+        # (the others keep the fully unrolled body); unset = all buckets.
+        return pipe_buckets is None or bucket_m in pipe_buckets
+
     if chunk_mode is None or not (
         chunk_mode in ("roll", "chunk") or chunk_mode.startswith("pipe")
     ):
@@ -590,7 +597,7 @@ def inner_kernel(
         lax.fori_loop(0, num_chunks, body, 0)
         return acc_ref[:bucket_m]
 
-    def _pipe_matmul(bucket_m, unroll, chunk_epilogue, compact):
+    def _pipe_matmul(bucket_m, unroll, chunk_epilogue, compact, iters=False):
         # Software-pipelined rolled loop over MXU column chunks: chunk j+1 is
         # dequantized into one VMEM buffer while chunk j's matmul reads the
         # other, so the VPU dequant overlaps the MXU inside each iteration and
@@ -655,8 +662,15 @@ def inner_kernel(
                 return carry
 
             num_pairs = num_chunks // 2 - (0 if compact else 1)
+            if iters:
+                # unroll = pairs per iteration for a target iteration count.
+                unroll_n = -(-num_pairs // unroll) if num_pairs else 1
+            else:
+                unroll_n = unroll
             if num_pairs > 0:
-                lax.fori_loop(0, num_pairs, pair, 0, unroll=min(unroll, num_pairs))
+                lax.fori_loop(
+                    0, num_pairs, pair, 0, unroll=min(unroll_n, num_pairs)
+                )
             if not compact:
                 deq(num_chunks - 1, buf_b)
                 mm(num_chunks - 2, buf_a)
@@ -726,6 +740,8 @@ def inner_kernel(
         # Step 2: Matmul.
         acc_list = []
         if chunk_mode is not None and rhs_pre is None and fp8_rhs is None and (
+            _pipe_bucket(bucket_m)
+        ) and (
             is_first_k_step and is_last_k_step and valid_k == 0
         ):
             # Dequantize + matmul one MXU column chunk at a time (rolled loop
@@ -736,7 +752,8 @@ def inner_kernel(
                 digits = "".join(ch for ch in spec if ch.isdigit())
                 chunk_epilogue = "a" not in spec and not cfgs.rhs_cfgs.has_bias
                 acc = _pipe_matmul(
-                    bucket_m, int(digits or 1), chunk_epilogue, "c" in spec
+                    bucket_m, int(digits or 1), chunk_epilogue, "c" in spec,
+                    iters="i" in spec,
                 )
                 if acc is None:
                     return
@@ -989,12 +1006,20 @@ def _k1_body_env() -> str | None:
     if raw in ("", "0", "off"):
         return None
     if raw not in ("single", "hoist", "roll", "chunk") and not (
-        raw.startswith("pipe") and (raw[4:].rstrip("ac") or "1").isdigit()
+        raw.startswith("pipe") and (raw[4:].rstrip("aci") or "1").isdigit()
     ):
         raise ValueError(
             f"{_K1_BODY_ENV}={raw!r}: expected single|hoist|roll|chunk|pipe[N]"
         )
     return raw
+
+
+@functools.cache
+def _pipe_buckets_env() -> frozenset[int] | None:
+    raw = os.environ.get("TPU_GMM_V2_K1_PIPE_BUCKETS", "").strip()
+    if not raw:
+        return None
+    return frozenset(int(x) for x in raw.split(",") if x.strip())
 
 
 _k1_body_logged: set[str] = set()
