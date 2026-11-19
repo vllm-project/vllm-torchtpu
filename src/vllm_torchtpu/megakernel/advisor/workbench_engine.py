@@ -57,6 +57,7 @@ def build_engine_seed_defaults() -> dict[str, object]:
                         "dp": layout.dp,
                         "pp": layout.pp,
                         "dcp": layout.dcp,
+                        "pcp": layout.pcp,
                         "scopes": _string_list(mk.get("scopes")),
                         "max_rows": int(str(mk.get("max_rows", 0))),
                         "max_total_rows": int(str(mk.get("max_total_rows", 0))),
@@ -69,6 +70,8 @@ def build_engine_seed_defaults() -> dict[str, object]:
                         "expert_owner_groups": int(
                             str(mk.get("expert_owner_groups", 0))
                         ),
+                        "collectives": mk.get("collectives"),
+                        "expert_mode_by_rows": mk.get("expert_mode_by_rows"),
                         "source": str(mk.get("source", "")),
                     }
                 )
@@ -107,6 +110,15 @@ def build_engine_seed_defaults() -> dict[str, object]:
         "per_op_shared_expert_kernels_per_layer": (
             constants.PER_OP_SHARED_EXPERT_KERNELS_PER_LAYER
         ),
+        "attn_tile_tokens": constants.ATTN_TILE_TOKENS,
+        "dense_ffn_tile_cap": constants.DENSE_FFN_TILE_CAP,
+        "bf16_bytes": constants.BF16_BYTES,
+        "fp32_bytes": constants.FP32_BYTES,
+        "lse_scalars_per_head": constants.LSE_SCALARS_PER_HEAD,
+        "default_declared_calls_per_layer": (
+            constants.DEFAULT_DECLARED_CALLS_PER_LAYER
+        ),
+        "per_op_collective_call_factor": (constants.PER_OP_COLLECTIVE_CALL_FACTOR),
         "workload_defaults": {
             "batch": wl_default.batch,
             "isl": wl_default.isl,
