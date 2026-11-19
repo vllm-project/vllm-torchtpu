@@ -27,32 +27,30 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-
-torch = pytest.importorskip("torch")
-
-from vllm import SamplingParams  # noqa: E402
-from vllm.utils.hashing import sha256  # noqa: E402
-from vllm.v1.core.block_pool import BlockPool  # noqa: E402
-from vllm.v1.core.kv_cache_manager import KVCacheManager  # noqa: E402
-from vllm.v1.core.kv_cache_utils import (  # noqa: E402
+import torch
+from vllm import SamplingParams
+from vllm.utils.hashing import sha256
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
     init_none_hash,
 )
-from vllm.v1.core.sched.scheduler import Scheduler  # noqa: E402
-from vllm.v1.kv_cache_interface import (  # noqa: E402
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
 )
-from vllm.v1.request import Request  # noqa: E402
+from vllm.v1.request import Request
 
-import vllm_torchtpu  # noqa: E402
-from vllm_torchtpu.core import prefix_change_log  # noqa: E402
-from vllm_torchtpu.core.pp_chunk_scheduler import (  # noqa: E402
+import vllm_torchtpu
+from vllm_torchtpu.core import prefix_change_log
+from vllm_torchtpu.core.pp_chunk_scheduler import (
     TpuPipelineChunkScheduler,
 )
-from vllm_torchtpu.core.pp_chunks import StepCostModel  # noqa: E402
+from vllm_torchtpu.core.pp_chunks import StepCostModel
 
 HASH_BS = 2
 BS = 4

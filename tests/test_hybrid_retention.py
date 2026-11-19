@@ -981,8 +981,6 @@ def test_shutdown_releases_the_pins_and_the_retained_entries():
 
 
 def test_after_shutdown_the_hooks_call_vllms_methods_unchanged():
-    from vllm_torchtpu.core.hybrid_retention import ALLOC_NONE_REASONS
-
     kvm = _GuardKVM(free=100, need=200)
     seen = []
 
@@ -1008,7 +1006,7 @@ def test_after_shutdown_the_hooks_call_vllms_methods_unchanged():
     # vLLM's refusal stands and retention records nothing.
     ret.begin_step()
     assert kvm.allocate_slots(_waiting_req(), 0) is None
-    assert ret.alloc_none == dict.fromkeys(ALLOC_NONE_REASONS, 0)
+    assert ret.alloc_none == dict.fromkeys(hybrid_retention.ALLOC_NONE_REASONS, 0)
     assert ret.step_waiting_none == [] and ret.step_admits == 0
     # A 2563-token prompt ends 3 tokens past the 2560 boundary, inside the
     # safe-tail offset: retention would skip caching that tainted boundary.
