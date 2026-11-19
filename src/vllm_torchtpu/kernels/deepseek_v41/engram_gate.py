@@ -1,0 +1,317 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Engram's wkv projection, gate and residual in one pass over the weight.
+
+The XLA path writes the [T, 5*D] projection, reads it back as FP32 and makes
+five FP32 passes over [T, 4, D] for the gate and residual, about 1.1 ms per
+layer at 2,048 tokens against a 0.4 ms FP8 matmul. Here each weight window is
+read once while the vector unit consumes the previous product: key windows
+accumulate the gate's three row sums, value windows apply the residual.
+
+Numerics follow the module: per-token FP8 activation quantization
+(``quantize_block``), BF16 projection, FP32 gate and one BF16 rounding of the
+output. Row sums run in a different order than XLA's, so outputs differ from
+the XLA path by reordering only; the contract is error against an exact
+reference no larger than the XLA path's.
+"""
+
+import functools
+
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+FP8 = jnp.float8_e4m3fn
+FP8_MAX = 448.0
+LANES = 128
+
+
+def _kernel(
+    x,
+    w,
+    w_scale,
+    hidden,
+    q_weight,
+    k_weight,
+    mask,
+    out,
+    xb,
+    q,
+    x_scale,
+    wb,
+    hb,
+    ob,
+    dot_sum,
+    h_sum,
+    k_sum,
+    gate,
+    x_sem,
+    w_sem,
+    h_sem,
+    o_sem,
+    *,
+    heads: int,
+    dim: int,
+    window: int,
+    token_tile: int,
+    quant_rows: int,
+    eps: float,
+    clamp: float,
+):
+    tokens = q.shape[0]
+    tiles = tokens // token_tile
+    per_head = dim // window
+    key_windows = heads * per_head
+    windows = key_windows + per_head
+
+    # Per-token FP8 activation quantization, as quantize_block does it.
+    def x_copy(block, slot):
+        return pltpu.make_async_copy(
+            x.at[pl.ds(block * quant_rows, quant_rows)], xb.at[slot], x_sem.at[slot]
+        )
+
+    blocks = tokens // quant_rows
+    x_copy(0, 0).start()
+
+    @pl.loop(0, blocks)
+    def _(block):
+        slot = block % 2
+
+        @pl.when(block + 1 < blocks)
+        def _():
+            x_copy(block + 1, 1 - slot).start()
+
+        x_copy(block, slot).wait()
+        a = xb[slot].astype(jnp.float32)
+        scale = jnp.max(jnp.abs(a), axis=1, keepdims=True) / FP8_MAX
+        scale = jnp.where(scale == 0, 1.0, scale)
+        rows = pl.ds(block * quant_rows, quant_rows)
+        q[rows, :] = jnp.clip(a / scale, -FP8_MAX, FP8_MAX).astype(FP8)
+        x_scale[rows, :] = scale
+
+    def w_copy(i):
+        return pltpu.make_async_copy(
+            w.at[:, pl.ds(i * window, window)], wb.at[i % 2], w_sem.at[i % 2]
+        )
+
+    def project(i, t):
+        """BF16 projection of token tile t against weight window i, as FP32."""
+        rows = pl.ds(t * token_tile, token_tile)
+        z = jax.lax.dot_general(
+            q[rows, :],
+            wb[i % 2],
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        z = (z * x_scale[rows, :]) * w_scale[pl.ds(i * window, window)][None, :]
+        return z.astype(jnp.bfloat16).astype(jnp.float32)
+
+    # Hidden tiles stream in unit order; unit u reads rows/columns of the
+    # flat [T, heads * dim] hidden state.
+    def k_cell(u):
+        return (u % tiles) * token_tile, (u // tiles) * window
+
+    def v_cell(u):
+        t, s = (u // heads) % tiles, u % heads
+        j = u // (heads * tiles)
+        return t * token_tile, s * dim + j * window
+
+    def h_copy(cell, u):
+        row, col = cell(u)
+        return pltpu.make_async_copy(
+            hidden.at[pl.ds(row, token_tile), pl.ds(col, window)],
+            hb.at[u % 2],
+            h_sem.at[u % 2],
+        )
+
+    def o_copy(u):
+        row, col = v_cell(u)
+        return pltpu.make_async_copy(
+            ob.at[u % 2],
+            out.at[pl.ds(row, token_tile), pl.ds(col, window)],
+            o_sem.at[u % 2],
+        )
+
+    w_copy(0).start()
+    w_copy(1).start()
+    h_copy(k_cell, 0).start()
+
+    # Key windows, head by head: lane-partial sums, reduced once per head.
+    @pl.loop(0, key_windows)
+    def _(i):
+        s, c = i // per_head, i % per_head
+        w_copy(i).wait()
+
+        @pl.when(c == 0)
+        def _():
+            dot_sum[...] = jnp.zeros_like(dot_sum)
+            h_sum[...] = jnp.zeros_like(h_sum)
+            k_sum[...] = jnp.zeros_like(k_sum)
+
+        @pl.loop(0, tiles)
+        def _(t):
+            u = i * tiles + t
+
+            @pl.when(u + 1 < key_windows * tiles)
+            def _():
+                h_copy(k_cell, u + 1).start()
+
+            k = project(i, t)
+            h_copy(k_cell, u).wait()
+            h = hb[u % 2].astype(jnp.float32)
+            cols = pl.ds(c * window, window)
+            qw = q_weight[pl.ds(s, 1), cols].astype(jnp.float32)
+            kw = k_weight[pl.ds(s, 1), cols].astype(jnp.float32)
+            product = ((h * qw) * kw) * k
+            rows = pl.ds(t * token_tile, token_tile)
+            for lane in range(0, window, LANES):
+                part = slice(lane, lane + LANES)
+                dot_sum[rows, :] += product[:, part]
+                h_sum[rows, :] += h[:, part] * h[:, part]
+                k_sum[rows, :] += k[:, part] * k[:, part]
+
+        @pl.when(c == per_head - 1)
+        def _():
+            dot = jnp.sum(dot_sum[...], axis=1, keepdims=True)
+            dot = dot * jax.lax.rsqrt(
+                jnp.sum(h_sum[...], axis=1, keepdims=True) / dim + eps
+            )
+            dot = dot * (
+                jax.lax.rsqrt(jnp.sum(k_sum[...], axis=1, keepdims=True) / dim + eps)
+                * dim**-0.5
+            )
+            magnitude = jnp.sqrt(jnp.maximum(jnp.abs(dot), clamp))
+            signed = jnp.where(dot < 0, -magnitude, magnitude)
+            gate[s] = jax.nn.sigmoid(signed) * mask[...]
+
+        @pl.when(i + 2 < windows)
+        def _():
+            w_copy(i + 2).start()
+
+    h_copy(v_cell, 0).start()
+
+    # Value windows: out = BF16(hidden + gate * value), one head at a time.
+    @pl.loop(0, per_head)
+    def _(j):
+        i = key_windows + j
+        w_copy(i).wait()
+
+        @pl.loop(0, tiles)
+        def _(t):
+            v = project(i, t)
+            rows = pl.ds(t * token_tile, token_tile)
+            for s in range(heads):
+                u = (j * tiles + t) * heads + s
+
+                @pl.when(u + 1 < per_head * tiles * heads)
+                def _():
+                    h_copy(v_cell, u + 1).start()
+
+                h_copy(v_cell, u).wait()
+
+                @pl.when(u >= 2)
+                def _():
+                    o_copy(u - 2).wait()
+
+                g = gate[s, rows, :]
+                ob[u % 2] = (hb[u % 2].astype(jnp.float32) + g * v).astype(ob.dtype)
+                o_copy(u).start()
+
+        @pl.when(i + 2 < windows)
+        def _():
+            w_copy(i + 2).start()
+
+    last = per_head * tiles * heads
+    if last >= 2:
+        o_copy(last - 2).wait()
+    o_copy(last - 1).wait()
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "eps",
+        "clamp",
+        "window",
+        "token_tile",
+        "quant_rows",
+        "interpret",
+    ),
+)
+def engram_gate(
+    x: jax.Array,
+    w: jax.Array,
+    w_scale: jax.Array,
+    hidden: jax.Array,
+    q_weight: jax.Array,
+    k_weight: jax.Array,
+    mask: jax.Array,
+    *,
+    eps: float,
+    clamp: float,
+    window: int = 1280,
+    token_tile: int = 512,
+    quant_rows: int = 64,
+    interpret: bool = False,
+) -> jax.Array:
+    """Engram's gated residual from rows ``x`` [T, K] and ``hidden`` [T, H, D].
+
+    ``w`` is the canonical [K, (H + 1) * D] FP8 weight with per-column FP32
+    ``w_scale``; ``mask`` [T] gates padded tokens shut. Returns [T, H, D] BF16.
+    """
+    tokens, k_dim = x.shape
+    _, heads, dim = hidden.shape
+    token_tile = min(token_tile, tokens)
+    quant_rows = min(quant_rows, tokens)
+    if (
+        w.shape != (k_dim, (heads + 1) * dim)
+        or dim % window
+        or tokens % token_tile
+        or tokens % quant_rows
+    ):
+        raise ValueError("Unsupported Engram gate shapes")
+    hbm, vmem = (pl.BlockSpec(memory_space=s) for s in (pltpu.HBM, pltpu.VMEM))
+    kernel = functools.partial(
+        _kernel,
+        heads=heads,
+        dim=dim,
+        window=window,
+        token_tile=token_tile,
+        quant_rows=quant_rows,
+        eps=eps,
+        clamp=clamp,
+    )
+    flat = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((tokens, heads * dim), hidden.dtype),
+        in_specs=(hbm, hbm, vmem, hbm, vmem, vmem, vmem),
+        out_specs=hbm,
+        scratch_shapes=(
+            pltpu.VMEM((2, quant_rows, k_dim), x.dtype),
+            pltpu.VMEM((tokens, k_dim), FP8),
+            pltpu.VMEM((tokens, 1), jnp.float32),
+            pltpu.VMEM((2, k_dim, window), w.dtype),
+            pltpu.VMEM((2, token_tile, window), hidden.dtype),
+            pltpu.VMEM((2, token_tile, window), hidden.dtype),
+            pltpu.VMEM((tokens, LANES), jnp.float32),
+            pltpu.VMEM((tokens, LANES), jnp.float32),
+            pltpu.VMEM((tokens, LANES), jnp.float32),
+            pltpu.VMEM((heads, tokens, 1), jnp.float32),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((2,)),
+        ),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=62 * 2**20),
+        interpret=pltpu.InterpretParams() if interpret else False,
+        name="engram_gate",
+    )(
+        x,
+        w,
+        w_scale,
+        hidden.reshape(tokens, heads * dim),
+        q_weight,
+        k_weight,
+        mask.astype(jnp.float32)[:, None],
+    )
+    return flat.reshape(tokens, heads, dim)
