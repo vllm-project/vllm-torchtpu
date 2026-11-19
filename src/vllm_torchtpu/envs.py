@@ -269,6 +269,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
+    TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
     TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT: bool = False
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
@@ -1743,6 +1744,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of two (`models.minimax_m3.dcp_pack`). 0 keeps two gathers.
     "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS", 0
+    ),
+    # MiniMax M3 decode steps of at most this many tokens (DCP 2, one KV head
+    # per pair: c4 / c16 with fp8 caches, or 4-bit caches) run the attention
+    # half of the DCP op (query and candidate exchange, candidate merge, work
+    # list, sparse attention, partial exchange, LSE merge) as one Pallas call
+    # with remote DMAs between the pair
+    # (`models.minimax_m3.kernels.msa_dcp_fused`; bitwise equal). At most 128;
+    # 0 (default) keeps the unfused program.
+    "TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS", 0
     ),
     # MiniMax M3 4-bit MSA prefill attention with a page cache:
     # "<threshold>:<block_q>:<tile_pages>" runs a call whose selections hold
