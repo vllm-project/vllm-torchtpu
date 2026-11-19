@@ -167,7 +167,7 @@ spec:
           value: "chunked_kernel_v3_pd"
         - name: DP_SCHED_BATCH_PREFILL_MAX_ADMIT_PER_FLUSH
           value: "0"
-        - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
+        - name: TORCH_TPU_TIER2_COMPILATION_CACHE
           value: "disabled"
         - name: TPU_ENABLE_D2H_TRANSFER
           value: "1"
