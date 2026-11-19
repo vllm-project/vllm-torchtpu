@@ -50,9 +50,14 @@ logger = init_logger(__name__)
 # sequence-parallel MoE.
 _PACK_MAX_TOKENS = 512
 
-# The only carrier measured, and checked bit-exact on device. Other hidden
-# dtypes (fp32, fp8) keep per-tensor gathers.
-_PACK_CARRIER = torch.bfloat16
+# Packing is enabled when the hidden states are bf16 (the measured case);
+# other hidden dtypes (fp32, fp8) keep per-tensor gathers. The rows travel as
+# int16, which has bf16's width, so viewing the hidden states costs nothing,
+# and an integer copy cannot flush subnormal lanes: in a float carrier, the
+# halves of fp32 / int32 values (e.g. a small expert id) can be bf16
+# subnormals, which TPU flushes to zero.
+_PACK_HIDDEN_DTYPE = torch.bfloat16
+_PACK_CARRIER = torch.int16
 
 
 @functools.cache
@@ -76,13 +81,13 @@ def _log_unpackable(dtypes: str) -> None:
     """Trace-time log; takes no symbolic values."""
     logger.warning_once(
         "EP dispatch gathers tensors one by one: their dtypes (%s) do not fit a "
-        "bfloat16 carrier.",
+        "16-bit carrier.",
         dtypes,
     )
 
 
 def _should_pack(tensors: list[torch.Tensor], num_tokens) -> bool:
-    if tensors[0].dtype != _PACK_CARRIER:
+    if tensors[0].dtype != _PACK_HIDDEN_DTYPE:
         return False
     if any(t.dtype.itemsize % _PACK_CARRIER.itemsize for t in tensors):
         _log_unpackable(", ".join(str(t.dtype) for t in tensors))
@@ -101,13 +106,12 @@ def _should_pack(tensors: list[torch.Tensor], num_tokens) -> bool:
 def _packed_all_gather(group, tensors: list[torch.Tensor]) -> list[torch.Tensor]:
     """All-gather per-token tensors along dim 0 with a single collective.
 
-    The rows of every tensor are bit-cast to bfloat16 (the hidden-state dtype)
-    and concatenated along the last dim, gathered once, then split and cast
-    back. Using the hidden-state dtype as the carrier keeps the bulk of the
-    payload in its native layout; a byte carrier forces TPU to repack every
-    element. An all-gather only copies, so the result is bit-identical to
-    gathering each tensor separately. Everything `_should_pack` rejects is
-    gathered tensor by tensor.
+    The rows of every tensor are bit-cast to int16 and concatenated along the
+    last dim, gathered once, then split and cast back. int16 has the bf16
+    hidden states' width, so they keep their native layout (a byte carrier
+    forces TPU to repack every element), and integer copies keep every bit,
+    so the result is bit-identical to gathering each tensor separately.
+    Everything `_should_pack` rejects is gathered tensor by tensor.
     """
     num_tokens = tensors[0].shape[0]
     if any(t.shape[0] != num_tokens for t in tensors):

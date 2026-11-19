@@ -41,7 +41,7 @@ def _assert_one_packed_gather(group, result, tensors):
     """
     assert group.all_gather.call_count == 1
     packed = group.all_gather.call_args.args[0]
-    assert packed.dtype == tensors[0].dtype
+    assert packed.dtype == comm._PACK_CARRIER
     assert group.all_gather.call_args.kwargs == {"dim": 0}
     assert len(result) == len(tensors)
     for actual, expected in zip(result, tensors):
@@ -162,7 +162,7 @@ def test_dispatch_and_combine_with_sequence_parallel(
 
 def test_packed_gather_is_bit_exact_across_dtypes_and_shapes(monkeypatch, communicator):
     """bf16 hidden states (with inf/nan), fp32 weights and int32 ids, with a
-    trailing extra dim, survive the bf16 carrier bit for bit."""
+    trailing extra dim, survive the int16 carrier bit for bit."""
     group = Mock(world_size=2)
     monkeypatch.setattr(comm, "get_dp_group", lambda: group)
     group.all_gather.side_effect = lambda x, dim: torch.cat([x, x.flip(0)], dim=dim)
@@ -203,8 +203,9 @@ def test_packed_gather_rejects_mismatched_token_counts(monkeypatch, communicator
     group.all_gather.assert_not_called()
 
 
-def test_packed_gather_carrier_is_the_hidden_state_dtype(monkeypatch, communicator):
-    """fp32 logits ride inside a bf16 carrier as two bf16 lanes per value."""
+def test_packed_gather_carrier_is_int16(monkeypatch, communicator):
+    """The carrier has the bf16 hidden states' width but is an integer type,
+    so fp32 logits ride as two int16 lanes per value."""
     group = Mock(world_size=2)
     monkeypatch.setattr(comm, "get_dp_group", lambda: group)
     group.all_gather.side_effect = lambda x, dim: torch.cat([x, x], dim=dim)
@@ -214,12 +215,12 @@ def test_packed_gather_carrier_is_the_hidden_state_dtype(monkeypatch, communicat
     communicator.dispatch_router_logits(hidden, logits)
 
     packed = group.all_gather.call_args.args[0]
-    assert packed.dtype == torch.bfloat16
+    assert packed.dtype == torch.int16
     assert packed.shape == (4, 6 + 2 * 5)
 
 
 def test_packed_gather_falls_back_when_sizes_do_not_divide(monkeypatch, communicator):
-    """A bf16 carrier cannot hold 1-byte elements; each tensor is then
+    """A 16-bit carrier cannot hold 1-byte elements; each tensor is then
     gathered on its own, with a warning naming the dtypes."""
     group = Mock(world_size=2)
     monkeypatch.setattr(comm, "get_dp_group", lambda: group)
@@ -241,8 +242,8 @@ def test_packed_gather_falls_back_when_sizes_do_not_divide(monkeypatch, communic
 def test_non_bf16_hidden_states_are_gathered_tensor_by_tensor(
     monkeypatch, communicator, hidden_dtype
 ):
-    """Only the measured bf16 carrier packs; fp32 or fp8 hidden states keep
-    per-tensor gathers."""
+    """Only bf16 hidden states (the measured case) pack; fp32 or fp8 hidden
+    states keep per-tensor gathers."""
     group = Mock(world_size=2)
     monkeypatch.setattr(comm, "get_dp_group", lambda: group)
     group.all_gather.side_effect = lambda x, dim: torch.cat([x, x], dim=dim)
@@ -301,10 +302,10 @@ def test_prefill_sized_steps_are_gathered_tensor_by_tensor(monkeypatch, communic
 
 @pytest.mark.tpu_test
 def test_packed_gather_is_bit_exact_on_device_under_compile(device, monkeypatch):
-    """On TPU, inside a fullgraph compile, int32 ids (small ids are bf16
+    """On TPU, inside a fullgraph compile, int32 ids (small ids have bf16
     subnormal lanes), fp32 weights with subnormals / NaN / inf / -0 and bf16
     hidden states with NaN / inf come back bit-identical to per-tensor
-    gathers."""
+    gathers. A bf16 carrier fails this: TPU flushes the subnormal lanes."""
     if device.type != "tpu":
         pytest.skip("needs a TPU device")
     # Pretend to be a warmup trace, which is where packing is allowed.
@@ -335,7 +336,7 @@ def test_packed_gather_is_bit_exact_on_device_under_compile(device, monkeypatch)
 
     outputs = dispatch(*(t.to(device) for t in inputs))
 
-    assert gathers == [torch.bfloat16]  # one packed collective
+    assert gathers == [torch.int16]  # one packed collective
     for actual, expected in zip(outputs, inputs):
         reference = torch.cat([expected, expected.flip(0)])
         actual = actual.cpu()
