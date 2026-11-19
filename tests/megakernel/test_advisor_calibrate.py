@@ -1117,3 +1117,204 @@ def test_calibrate_reports_mean_collective_latency(tmp_path: Path) -> None:
     assert payload["collectives"][0]["mean_latency_us"] == pytest.approx(
         expected_mean_latency_us
     )
+
+
+XLA_MOD_NUM_STEPS = 4
+XLA_MOD_NUM_LAYERS = 60
+XLA_MOD_START_OFFSET_US = 1000.0
+XLA_MOD_FIRST_OP_OFFSET_US = 5800.0
+XLA_MOD_ACTIVE_SPAN_US = 6800.0
+XLA_MOD_BUSY_US = 6560.0
+XLA_MOD_POST_TAIL_US = 10.0
+
+
+def _build_multi_program_xla_modules_xspace_bytes() -> bytes:
+    """Build a synthetic 4-step multi-program XSpace with XLA Modules and zero Steps."""
+    ps_per_us = int(constants.PS_PER_US)
+    space = xplane_pb2.XSpace()
+    dev_plane = space.planes.add()
+    dev_plane.id = 1
+    dev_plane.name = "/device:TPU:0"
+    for ev_id, ev_name in (
+        (1, "jit_main_decode_step"),
+        (2, "jit_aux_sampler_stub"),
+        (3, "fused_layer_op"),
+    ):
+        dev_plane.event_metadata[ev_id].id = ev_id
+        dev_plane.event_metadata[ev_id].name = ev_name
+
+    mod_line = dev_plane.lines.add()
+    mod_line.id = 1
+    mod_line.name = "XLA Modules"
+    ops_line = dev_plane.lines.add()
+    ops_line.id = 2
+    ops_line.name = "XLA Ops"
+
+    num_ops = constants.SUBLAYER_BOUNDARIES_PER_LAYER * XLA_MOD_NUM_LAYERS
+    op_dur_us = XLA_MOD_BUSY_US / num_ops
+    gap_us = (XLA_MOD_ACTIVE_SPAN_US - XLA_MOD_BUSY_US) / (num_ops - 1)
+    raw_mod_dur_us = (
+        (XLA_MOD_FIRST_OP_OFFSET_US - XLA_MOD_START_OFFSET_US)
+        + XLA_MOD_ACTIVE_SPAN_US
+        + XLA_MOD_POST_TAIL_US
+    )
+    step_stride_us = 20000.0
+
+    for step_idx in range(XLA_MOD_NUM_STEPS):
+        base_us = step_idx * step_stride_us
+        mod_ev = mod_line.events.add()
+        mod_ev.metadata_id = 1
+        mod_ev.offset_ps = round((base_us + XLA_MOD_START_OFFSET_US) * ps_per_us)
+        mod_ev.duration_ps = round(raw_mod_dur_us * ps_per_us)
+
+        for op_idx in range(num_ops):
+            op_start_us = (
+                base_us + XLA_MOD_FIRST_OP_OFFSET_US + op_idx * (op_dur_us + gap_us)
+            )
+            op_ev = ops_line.events.add()
+            op_ev.metadata_id = 3
+            op_ev.offset_ps = round(op_start_us * ps_per_us)
+            op_ev.duration_ps = round(op_dur_us * ps_per_us)
+
+        aux_mod = mod_line.events.add()
+        aux_mod.metadata_id = 2
+        aux_mod.offset_ps = round((base_us + 13000.0) * ps_per_us)
+        aux_mod.duration_ps = round(200.0 * ps_per_us)
+
+        aux_op = ops_line.events.add()
+        aux_op.metadata_id = 3
+        aux_op.offset_ps = round((base_us + 13030.0) * ps_per_us)
+        aux_op.duration_ps = round(150.0 * ps_per_us)
+
+    return bytes(space.SerializeToString())
+
+
+def build_multi_program_xla_modules_perfetto_events(
+    *,
+    ranks: tuple[int, ...] = (1,),
+    host_wraps: bool = False,
+    step0_compile_extra_us: float = 0.0,
+    overhanging_tail_us: float = 0.0,
+) -> dict[str, object]:
+    """Build synthetic Perfetto XLA Modules traceEvents across one or more ranks."""
+    num_ops = constants.SUBLAYER_BOUNDARIES_PER_LAYER * XLA_MOD_NUM_LAYERS
+    op_dur_us = XLA_MOD_BUSY_US / num_ops
+    gap_us = (XLA_MOD_ACTIVE_SPAN_US - XLA_MOD_BUSY_US) / (num_ops - 1)
+    raw_mod_dur_us = (
+        (XLA_MOD_FIRST_OP_OFFSET_US - XLA_MOD_START_OFFSET_US)
+        + XLA_MOD_ACTIVE_SPAN_US
+        + XLA_MOD_POST_TAIL_US
+    )
+    step_stride_us = 30000.0
+    events: list[dict[str, object]] = []
+    wrap_pids = (0,) if host_wraps else ranks
+    for step_idx in range(XLA_MOD_NUM_STEPS):
+        base_us = step_idx * step_stride_us
+        extra_us = step0_compile_extra_us if step_idx == 0 else 0.0
+        for wrap_pid in wrap_pids:
+            events.append(
+                {
+                    "ph": "X",
+                    "cat": "XLA Modules",
+                    "name": "jit_main_decode_step",
+                    "pid": wrap_pid,
+                    "tid": 1,
+                    "ts": base_us + XLA_MOD_START_OFFSET_US,
+                    "dur": raw_mod_dur_us + extra_us,
+                }
+            )
+            events.append(
+                {
+                    "ph": "X",
+                    "cat": "XLA Modules",
+                    "name": "jit_aux_sampler_stub",
+                    "pid": wrap_pid,
+                    "tid": 1,
+                    "ts": base_us + 25000.0,
+                    "dur": 200.0,
+                }
+            )
+        for rank_pid in ranks:
+            for op_idx in range(num_ops):
+                is_last = op_idx == num_ops - 1
+                this_dur = (
+                    op_dur_us
+                    + (extra_us if is_last else 0.0)
+                    + (overhanging_tail_us if (is_last and step_idx > 0) else 0.0)
+                )
+                events.append(
+                    {
+                        "ph": "X",
+                        "cat": "xla_op",
+                        "name": f"fused_layer_op_{op_idx}",
+                        "pid": rank_pid,
+                        "tid": 2,
+                        "ts": (
+                            base_us
+                            + XLA_MOD_FIRST_OP_OFFSET_US
+                            + op_idx * (op_dur_us + gap_us)
+                        ),
+                        "dur": this_dur,
+                    }
+                )
+            events.append(
+                {
+                    "ph": "X",
+                    "cat": "xla_op",
+                    "name": "aux_sampler_op",
+                    "pid": rank_pid,
+                    "tid": 2,
+                    "ts": base_us + 25030.0,
+                    "dur": 150.0,
+                }
+            )
+    return {"traceEvents": events}
+
+
+def test_xla_modules_primary_window_trims_pre_first_op_host_head(
+    tmp_path: Path,
+) -> None:
+    """Verify XLA Modules trims pre-first-op head and clamps overhanging ops."""
+    xplane_file = tmp_path / "xla_modules_only.xplane.pb"
+    xplane_file.write_bytes(_build_multi_program_xla_modules_xspace_bytes())
+    perfetto_file = _write_json_trace(
+        tmp_path,
+        "xla_modules_only.json",
+        build_multi_program_xla_modules_perfetto_events(overhanging_tail_us=500.0),
+    )
+
+    # Pre-first-op head = first_op_offset - mod_start_offset; step 0 dropped.
+    expected_host_head_us = XLA_MOD_FIRST_OP_OFFSET_US - XLA_MOD_START_OFFSET_US
+    expected_steady_steps = XLA_MOD_NUM_STEPS - 1
+    expected_xplane_step_us = XLA_MOD_ACTIVE_SPAN_US
+    expected_clamped_perfetto_step_us = XLA_MOD_ACTIVE_SPAN_US + XLA_MOD_POST_TAIL_US
+    boundaries = constants.SUBLAYER_BOUNDARIES_PER_LAYER * XLA_MOD_NUM_LAYERS
+    expected_xplane_gap_us = (XLA_MOD_ACTIVE_SPAN_US - XLA_MOD_BUSY_US) / boundaries
+
+    for idx, (trace_file, exp_step_us) in enumerate(
+        (
+            (xplane_file, expected_xplane_step_us),
+            (perfetto_file, expected_clamped_perfetto_step_us),
+        )
+    ):
+        out_json = tmp_path / f"cal_xla_mod_{idx}.json"
+        payload = advisor.calibrate_trace(
+            trace_file,
+            out_json,
+            options=advisor.CalibrateOptions(
+                chip="tpu7x",
+                model="qwen3.5-397b",
+                num_layers=XLA_MOD_NUM_LAYERS,
+            ),
+        )
+        assert "host_head_us" in payload
+        assert payload["host_head_us"]["p50"] == pytest.approx(
+            expected_host_head_us, abs=1e-2
+        )
+        assert payload["host_head_us"]["n"] == expected_steady_steps
+        assert "step_time_us" in payload
+        assert payload["step_time_us"]["p50"] == pytest.approx(exp_step_us, abs=1e-2)
+        if idx == 0:
+            assert payload["launch_gap_us"]["p50"] == pytest.approx(
+                expected_xplane_gap_us, abs=1e-3
+            )

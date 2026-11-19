@@ -20,7 +20,7 @@ import json
 import math
 from bisect import bisect_left
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
@@ -201,6 +201,7 @@ class CalibrationPayload(TypedDict, total=False):
     collectives: list[CollectiveSummary]
     step_coverage: StepCoverageSummary
     step_time_us: QuantileSummary
+    host_head_us: QuantileSummary
 
 
 @dataclass(frozen=True)
@@ -230,6 +231,16 @@ class _ComputeEvent:
 
 
 @dataclass(frozen=True)
+class _ModuleWindow:
+    """Raw `XLA Modules` program wrapper span on a device rank."""
+
+    rank_key: str
+    program_name: str
+    start_us: float
+    end_us: float
+
+
+@dataclass(frozen=True)
 class _ParsedTrace:
     """Intermediate normalized representation of an XPlane or Perfetto trace."""
 
@@ -237,6 +248,7 @@ class _ParsedTrace:
     file_label: str
     steps_by_rank: dict[str, list[_StepWindow]]
     events_by_stream: dict[str, list[_ComputeEvent]]
+    modules_by_rank: dict[str, list[_ModuleWindow]] = field(default_factory=dict)
 
 
 def _percentile_prec(
@@ -374,11 +386,12 @@ def _build_compute_event(
     )
 
 
-def _propagate_perfetto_host_steps(
-    steps_by_rank: dict[str, list[_StepWindow]],
+def _propagate_perfetto_host_tracks[T](
+    tracks_by_rank: dict[str, list[T]],
     events_by_stream: Mapping[str, Sequence[_ComputeEvent]],
+    rebind_fn: Callable[[T, str], T],
 ) -> None:
-    """Attach host-PID step markers to device PIDs that lack local step tracks."""
+    """Attach host-PID wrapper or step tracks to device PIDs lacking local ones."""
     compute_ranks = {
         event.rank_key
         for stream_events in events_by_stream.values()
@@ -386,20 +399,34 @@ def _propagate_perfetto_host_steps(
     }
     if not compute_ranks:
         return
-    host_steps = [
-        step_window
-        for rank_key, steps in sorted(steps_by_rank.items())
+    host_items = [
+        item
+        for rank_key, items in sorted(tracks_by_rank.items())
         if rank_key not in compute_ranks
-        for step_window in steps
+        for item in items
     ]
-    if not host_steps:
+    if not host_items:
         return
     for rank_key in sorted(compute_ranks):
-        if not steps_by_rank.get(rank_key):
-            steps_by_rank[rank_key] = list(host_steps)
-    for rank_key in list(steps_by_rank):
+        if not tracks_by_rank.get(rank_key):
+            tracks_by_rank[rank_key] = [
+                rebind_fn(item, rank_key) for item in host_items
+            ]
+    for rank_key in list(tracks_by_rank):
         if rank_key not in compute_ranks:
-            del steps_by_rank[rank_key]
+            del tracks_by_rank[rank_key]
+
+
+def _propagate_perfetto_host_steps(
+    steps_by_rank: dict[str, list[_StepWindow]],
+    events_by_stream: Mapping[str, Sequence[_ComputeEvent]],
+) -> None:
+    """Attach host-PID step markers to device PIDs that lack local step tracks."""
+    _propagate_perfetto_host_tracks(
+        steps_by_rank,
+        events_by_stream,
+        lambda step_window, _rank: step_window,
+    )
 
 
 def _read_perfetto_events(path: Path) -> list[object]:
@@ -426,10 +453,28 @@ def _read_perfetto_events(path: Path) -> list[object]:
             raise errors.MegakernelConfigError(msg)
 
 
+def _propagate_perfetto_host_modules(
+    modules_by_rank: dict[str, list[_ModuleWindow]],
+    events_by_stream: Mapping[str, Sequence[_ComputeEvent]],
+) -> None:
+    """Attach host-PID XLA module wrappers to device PIDs lacking local wrappers."""
+    _propagate_perfetto_host_tracks(
+        modules_by_rank,
+        events_by_stream,
+        lambda mod, rank_key: _ModuleWindow(
+            rank_key=rank_key,
+            program_name=mod.program_name,
+            start_us=mod.start_us,
+            end_us=mod.end_us,
+        ),
+    )
+
+
 def _record_perfetto_item(
     item: object,
     steps_by_rank: dict[str, list[_StepWindow]],
     events_by_stream: dict[str, list[_ComputeEvent]],
+    modules_by_rank: dict[str, list[_ModuleWindow]],
 ) -> None:
     """Record one raw Perfetto `X` event into step or compute stream buckets."""
     match item:
@@ -455,7 +500,11 @@ def _record_perfetto_item(
         steps_by_rank.setdefault(rank_key, []).append(
             _build_step_window(start_us, duration_us, args)
         )
-    elif not _is_module_wrapper(name, category, ""):
+    elif _is_module_wrapper(name, category, ""):
+        modules_by_rank.setdefault(rank_key, []).append(
+            _ModuleWindow(rank_key, name, start_us, start_us + duration_us)
+        )
+    else:
         stream_key = f"{rank_key}:tid:{thread_id}"
         events_by_stream.setdefault(stream_key, []).append(
             _build_compute_event(
@@ -468,14 +517,17 @@ def _parse_perfetto_file(path: Path) -> _ParsedTrace:
     """Parse a `.json` or `.json.gz` Perfetto trace into normalized streams."""
     steps_by_rank: dict[str, list[_StepWindow]] = {}
     events_by_stream: dict[str, list[_ComputeEvent]] = {}
+    modules_by_rank: dict[str, list[_ModuleWindow]] = {}
     for item in _read_perfetto_events(path):
-        _record_perfetto_item(item, steps_by_rank, events_by_stream)
+        _record_perfetto_item(item, steps_by_rank, events_by_stream, modules_by_rank)
     _propagate_perfetto_host_steps(steps_by_rank, events_by_stream)
+    _propagate_perfetto_host_modules(modules_by_rank, events_by_stream)
     return _ParsedTrace(
         kind="perfetto",
         file_label=path.name,
         steps_by_rank=steps_by_rank,
         events_by_stream=events_by_stream,
+        modules_by_rank=modules_by_rank,
     )
 
 
@@ -505,6 +557,7 @@ def _ingest_xplane(
     rank_key: str,
     steps_by_rank: dict[str, list[_StepWindow]],
     events_by_stream: dict[str, list[_ComputeEvent]],
+    modules_by_rank: dict[str, list[_ModuleWindow]],
 ) -> None:
     """Ingest all lines from a device XPlane into step or compute streams."""
     event_metadata_map = dict(plane.event_metadata.items())
@@ -530,7 +583,13 @@ def _ingest_xplane(
                 steps_by_rank.setdefault(rank_key, []).append(
                     _build_step_window(start_us, duration_us, args)
                 )
-            elif not _is_module_wrapper(event_name, "", line_name):
+            elif _is_module_wrapper(event_name, "", line_name):
+                modules_by_rank.setdefault(rank_key, []).append(
+                    _ModuleWindow(
+                        rank_key, event_name, start_us, start_us + duration_us
+                    )
+                )
+            else:
                 events_by_stream.setdefault(stream_key, []).append(
                     _build_compute_event(
                         (rank_key, stream_key), start_us, duration_us, event_name, args
@@ -573,6 +632,7 @@ def _parse_xplane_target(path: Path) -> _ParsedTrace:
 
     steps_by_rank: dict[str, list[_StepWindow]] = {}
     events_by_stream: dict[str, list[_ComputeEvent]] = {}
+    modules_by_rank: dict[str, list[_ModuleWindow]] = {}
     for file_idx, pb_path in enumerate(files):
         space = proto_module.XSpace()
         try:
@@ -588,32 +648,36 @@ def _parse_xplane_target(path: Path) -> _ParsedTrace:
             ):
                 continue
             rank_key = f"file:{file_idx}:plane:{plane.id}:{plane_name}"
-            _ingest_xplane(plane, rank_key, steps_by_rank, events_by_stream)
+            _ingest_xplane(
+                plane, rank_key, steps_by_rank, events_by_stream, modules_by_rank
+            )
     return _ParsedTrace(
         kind="xplane",
         file_label=path.name,
         steps_by_rank=steps_by_rank,
         events_by_stream=events_by_stream,
+        modules_by_rank=modules_by_rank,
     )
 
 
-def _steady_state_steps(steps: Sequence[_StepWindow]) -> list[_StepWindow]:
-    """Sort step windows and drop compilation/warmup step 0 under both thresholds.
-
-    Drops step 0 when at least `MIN_STEPS_FOR_WARMUP_DROP` (3) steps exist, or when
-    at least `MIN_WARMUP_DROP_STEPS` (2) steps exist and step 0 exceeds
-    `WARMUP_OUTLIER_RATIO` times the minimum duration of subsequent steps.
-    """
-    ordered = sorted(steps, key=lambda step_window: step_window.start_us)
+def _drop_warmup_step_zero[T](
+    ordered: Sequence[T], duration_fn: Callable[[T], float]
+) -> list[T]:
+    """Drop warmup item 0 using MIN_WARMUP_DROP_STEPS and WARMUP_OUTLIER_RATIO."""
     if len(ordered) >= MIN_WARMUP_DROP_STEPS:
-        min_steady_step_dur_us = min(
-            step_window.duration_us for step_window in ordered[1:]
-        )
-        if ordered[0].duration_us > WARMUP_OUTLIER_RATIO * min_steady_step_dur_us:
-            return list(ordered[1:])
-        if len(ordered) >= MIN_STEPS_FOR_WARMUP_DROP:
+        min_steady_dur_us = min(duration_fn(item) for item in ordered[1:])
+        if (
+            duration_fn(ordered[0]) > WARMUP_OUTLIER_RATIO * min_steady_dur_us
+            or len(ordered) >= MIN_STEPS_FOR_WARMUP_DROP
+        ):
             return list(ordered[1:])
     return list(ordered)
+
+
+def _steady_state_steps(steps: Sequence[_StepWindow]) -> list[_StepWindow]:
+    """Sort step windows and drop compilation/warmup step 0 under both thresholds."""
+    ordered = sorted(steps, key=lambda step_window: step_window.start_us)
+    return _drop_warmup_step_zero(ordered, lambda step_window: step_window.duration_us)
 
 
 def _scan_event_window(
@@ -917,6 +981,81 @@ def _compute_launch_gap_and_collectives(
     return launch_gap, all_collectives
 
 
+def _trim_rank_module_programs(
+    mod_list: Sequence[_ModuleWindow],
+    rank_events: Sequence[_ComputeEvent],
+) -> list[tuple[_StepWindow, float]]:
+    """Select the primary XLA Modules program on one rank and trim to op bounds."""
+    if not mod_list or not rank_events:
+        return []
+    starts = [ev.start_us for ev in rank_events]
+    by_program: dict[str, list[tuple[_StepWindow, float]]] = {}
+    for mod in mod_list:
+        lo = bisect_left(starts, mod.start_us)
+        hi = bisect_left(starts, mod.end_us)
+        if lo >= hi:
+            continue
+        first_start = rank_events[lo].start_us
+        last_end = min(mod.end_us, max(ev.end_us for ev in rank_events[lo:hi]))
+        if last_end <= first_start:
+            continue
+        trimmed = _StepWindow(
+            start_us=first_start,
+            end_us=last_end,
+            duration_us=last_end - first_start,
+        )
+        head_us = max(0.0, first_start - mod.start_us)
+        by_program.setdefault(mod.program_name, []).append((trimmed, head_us))
+    if not by_program:
+        return []
+    primary_prog = min(
+        by_program,
+        key=lambda name: (
+            -sum(pair[0].duration_us for pair in by_program[name]),
+            name,
+        ),
+    )
+    return sorted(by_program[primary_prog], key=lambda pair: pair[0].start_us)
+
+
+def _steady_state_module_heads(
+    pairs: Sequence[tuple[_StepWindow, float]],
+) -> list[float]:
+    """Drop warmup step 0 from ordered `(trimmed_step, host_head_us)` pairs."""
+    steady_pairs = _drop_warmup_step_zero(pairs, lambda pair: pair[0].duration_us)
+    return [pair[1] for pair in steady_pairs]
+
+
+def _derive_module_steps_and_heads(
+    parsed: _ParsedTrace,
+) -> QuantileSummary | None:
+    """Populate trimmed XLA Modules fallback steps and return `host_head_us`."""
+    if not parsed.modules_by_rank:
+        return None
+    events_by_rank: dict[str, list[_ComputeEvent]] = {}
+    for stream_events in parsed.events_by_stream.values():
+        for event in stream_events:
+            events_by_rank.setdefault(event.rank_key, []).append(event)
+    for rank_events in events_by_rank.values():
+        rank_events.sort(key=lambda event: event.start_us)
+    steady_heads: list[float] = []
+    for rank_key, mod_list in sorted(parsed.modules_by_rank.items()):
+        pairs = _trim_rank_module_programs(mod_list, events_by_rank.get(rank_key, ()))
+        if not pairs:
+            continue
+        steady_heads.extend(_steady_state_module_heads(pairs))
+        if not parsed.steps_by_rank.get(rank_key):
+            parsed.steps_by_rank[rank_key] = [pair[0] for pair in pairs]
+    if not steady_heads:
+        return None
+    sorted_heads = sorted(steady_heads)
+    return {
+        "p50": _percentile(sorted_heads, 0.5),
+        "p90": _percentile(sorted_heads, 0.9),
+        "n": len(sorted_heads),
+    }
+
+
 def calibrate_trace(
     trace_path: str | Path,
     out_path: str | Path | None = None,
@@ -926,6 +1065,7 @@ def calibrate_trace(
     """Calibrate advisor priors from an XPlane or Perfetto trace file or directory."""
     calibration_options = options or CalibrateOptions()
     parsed = _load_parsed_trace(trace_path)
+    host_head_summary = _derive_module_steps_and_heads(parsed)
     steady_by_rank = {
         rank_key: _steady_state_steps(steps)
         for rank_key, steps in parsed.steps_by_rank.items()
@@ -959,6 +1099,8 @@ def calibrate_trace(
             "p90": _percentile(step_durations, 0.9),
             "n": len(step_durations),
         }
+    if host_head_summary is not None:
+        payload["host_head_us"] = host_head_summary
     if out_path is not None:
         dest = Path(out_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
