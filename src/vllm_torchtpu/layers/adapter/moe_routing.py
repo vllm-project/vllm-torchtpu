@@ -27,11 +27,12 @@ logger = init_logger(__name__)
 _ROUTER_TOPK = envs.TPU_MOE_ROUTER_TOPK
 
 
-def _get_topk_weights_dtype(default_dtype: torch.dtype) -> torch.dtype:
-    """Returns torch.float32 if TPU_MOE_TOPK_WEIGHTS_FLOAT32 is enabled,
-    else default_dtype.
-    """
-    return torch.float32 if envs.TPU_MOE_TOPK_WEIGHTS_FLOAT32 else default_dtype
+def _get_topk_weights_dtype(
+    default_dtype: torch.dtype, topk_weights_float32: bool
+) -> torch.dtype:
+    """float32 under additional_config["tpu_moe_topk_weights_float32"]
+    (the quant method's `_tpu_topk_weights_float32`), else default_dtype."""
+    return torch.float32 if topk_weights_float32 else default_dtype
 
 
 def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -99,6 +100,7 @@ def _uniform_random_routing(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     topk: int,
+    topk_weights_float32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Uniform-random expert selection that stays anchored to the real input.
 
@@ -121,15 +123,15 @@ def _uniform_random_routing(
     topk_weights = torch.ones(
         (router_logits.shape[0], topk), dtype=torch.float32, device=router_logits.device
     )
-    return topk_weights.to(_get_topk_weights_dtype(hidden_states.dtype)), topk_ids.to(
-        torch.int32
-    )
+    weights_dtype = _get_topk_weights_dtype(hidden_states.dtype, topk_weights_float32)
+    return topk_weights.to(weights_dtype), topk_ids.to(torch.int32)
 
 
 def maybe_simulate_routing(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     topk: int,
+    topk_weights_float32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Optionally replace routing with a simulated strategy, for profiling.
 
@@ -146,16 +148,17 @@ def maybe_simulate_routing(
     if _SIMULATION_STRATEGY is None:
         return None
     if is_uniform_random_simulation():
-        return _uniform_random_routing(hidden_states, router_logits, topk)
+        return _uniform_random_routing(
+            hidden_states, router_logits, topk, topk_weights_float32
+        )
     topk_weights, topk_ids = _SIMULATION_STRATEGY.route_tokens(
         hidden_states=hidden_states,
         router_logits=router_logits,
         top_k=topk,
         indices_type=torch.int32,
     )
-    return topk_weights.to(_get_topk_weights_dtype(hidden_states.dtype)), topk_ids.to(
-        torch.int32
-    )
+    weights_dtype = _get_topk_weights_dtype(hidden_states.dtype, topk_weights_float32)
+    return topk_weights.to(weights_dtype), topk_ids.to(torch.int32)
 
 
 def route(
@@ -163,6 +166,8 @@ def route(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     input_ids: torch.Tensor | None = None,
+    *,
+    topk_weights_float32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantization-independent routing entry point for the TPU MoE methods.
 
@@ -175,7 +180,25 @@ def route(
     hook -- and any future routing-path change -- lives in exactly one place.
     """
     topk = layer.moe_config.experts_per_token
-    simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
+    topk_weights, topk_ids = _select_routing(
+        layer, hidden_states, router_logits, topk, input_ids, topk_weights_float32
+    )
+    if layer.capture_fn is not None:
+        layer.capture_fn(topk_ids)
+    return topk_weights, topk_ids
+
+
+def _select_routing(
+    layer,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    topk: int,
+    input_ids: torch.Tensor | None,
+    topk_weights_float32: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    simulated = maybe_simulate_routing(
+        hidden_states, router_logits, topk, topk_weights_float32
+    )
     if simulated is not None:
         return simulated
     custom_routing_fn = layer.custom_routing_function
@@ -194,6 +217,7 @@ def route(
         scoring_fn=layer.scoring_func,
         layer=layer,
         input_ids=input_ids,
+        topk_weights_float32=topk_weights_float32,
     )
 
 
@@ -249,6 +273,7 @@ def select_experts(
     scoring_fn: str,
     layer=None,
     input_ids: torch.Tensor | None = None,
+    topk_weights_float32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute local routed expert IDs and weights for non-EP execution.
 
@@ -263,7 +288,9 @@ def select_experts(
     """
     # Profiling-only override; a no-op unless a routing-simulation strategy is
     # set. Replaces the whole routing output, so return early.
-    simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
+    simulated = maybe_simulate_routing(
+        hidden_states, router_logits, topk, topk_weights_float32
+    )
     if simulated is not None:
         return simulated
 
@@ -283,7 +310,7 @@ def select_experts(
             routed_scaling_factor,
         )
         return topk_weights.to(
-            _get_topk_weights_dtype(hidden_states.dtype)
+            _get_topk_weights_dtype(hidden_states.dtype, topk_weights_float32)
         ), topk_ids.to(torch.int32)
 
     use_grouped = (
@@ -310,7 +337,7 @@ def select_experts(
             e_score_correction_bias=layer.e_score_correction_bias,
         )
         return topk_weights.to(
-            _get_topk_weights_dtype(hidden_states.dtype)
+            _get_topk_weights_dtype(hidden_states.dtype, topk_weights_float32)
         ), topk_ids.to(torch.int32)
 
     scores = _apply_scoring_fn(scoring_fn, router_logits.float())
@@ -335,9 +362,8 @@ def select_experts(
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
 
-    return topk_weights.to(_get_topk_weights_dtype(hidden_states.dtype)), topk_ids.to(
-        torch.int32
-    )
+    weights_dtype = _get_topk_weights_dtype(hidden_states.dtype, topk_weights_float32)
+    return topk_weights.to(weights_dtype), topk_ids.to(torch.int32)
 
 
 def get_experts_start(layer) -> int | None:

@@ -153,6 +153,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
     "VLLM_TPU_SRPT_ATTN_WORK_CAP",
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS",
+    # Rust native runtime launcher and binary path; intercepted at CLI startup
+    # before runtime and compilation.
+    "VLLM_TPU_EXPERIMENTAL_USE_RUST",
+    "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY",
     "PYTHON_TRACER_LEVEL",
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",
@@ -296,10 +300,13 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
     "vllm_torchtpu/distributed/dcp.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",
+    # Builds the hierrs_tc reduce-scatter op for the EP MoE combine.
+    "vllm_torchtpu/distributed/hier_reduce_scatter.py",
     # `prefill_checkpoint_enabled` decides whether the GDN op traces with
     # prefill checkpoint operands or with constant None inputs.
     "vllm_torchtpu/gdn_pool_layout.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
+    "vllm_torchtpu/layers/adapter/routed_experts_capturer.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
@@ -614,16 +621,24 @@ class TpuCompilerAdaptor(CompilerInterface):
         self,
         key: str,
         path: str,
-        entry: Any,
+        entry: Any | None,
         graph: fx.GraphModule,
         was_wrapped: bool,
         fingerprint: str | None,
     ) -> bool:
         """Write the bundled entry for `graph` to `path`. True if it landed.
 
-        `fingerprint` is `_graph_fingerprint(graph)` taken before the backend
-        ran, as a peer replaying this artifact computes it.
+        With no entry, logs and returns `False`. `fingerprint` is
+        `_graph_fingerprint(graph)` taken before the backend ran, as a peer
+        replaying this artifact computes it.
         """
+        if entry is None:
+            logger.info(
+                "[TpuCompilerAdaptor] No serializable artifact for %s; it "
+                "will be recompiled on the next start",
+                path,
+            )
+            return False
         tmp_path = f"{path}.{os.getpid()}.tmp"
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -873,8 +888,12 @@ class TpuCompilerAdaptor(CompilerInterface):
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
-        caching = (
-            key is not None and self.cache_dir is not None and not self._disable_cache
+        save_path = (
+            os.path.join(self.cache_dir, key)
+            if key is not None
+            and self.cache_dir is not None
+            and not self._disable_cache
+            else None
         )
 
         # Another rank of this host compiled, or is compiling, this bucket:
@@ -887,21 +906,20 @@ class TpuCompilerAdaptor(CompilerInterface):
         peer = None
         fingerprint = (
             _graph_fingerprint(graph)
-            if caching and envs.TPU_PRECOMPILE_PEER_REPLAY
+            if save_path is not None and envs.TPU_PRECOMPILE_PEER_REPLAY
             else None
         )
         if fingerprint is not None:
             assert key is not None
             peer = self._replay_from_peer(key, graph, was_wrapped, fingerprint)
         if peer is not None:
-            assert key is not None and self.cache_dir is not None
+            assert key is not None and save_path is not None
             compiled_fn, peer_path = peer
             logger.info(
                 "[TpuCompilerAdaptor] Replayed range %s from %s",
                 compile_range,
                 peer_path,
             )
-            save_path = os.path.join(self.cache_dir, key)
             handle = (
                 (key, save_path, was_wrapped)
                 if self._link_artifact(peer_path, save_path)
@@ -933,19 +951,13 @@ class TpuCompilerAdaptor(CompilerInterface):
         # the PJRT binary itself (torch_tpu_tier3/*.bin); that covers the
         # recompile path in `load`, not this one.
         handle = None
-        if caching and entry is not None:
-            assert self.cache_dir is not None
-            save_path = os.path.join(self.cache_dir, key)
+        if save_path is not None:
+            assert key is not None
             if self._save_handle(
                 key, save_path, entry, graph, was_wrapped, fingerprint
             ):
                 handle = (key, save_path, was_wrapped)
-        elif caching:
-            logger.info(
-                "[TpuCompilerAdaptor] No serializable artifact for range %s; "
-                "it will be recompiled on the next start",
-                compile_range,
-            )
+
         # Under peer replay, other ranks of the host may be waiting for this
         # artifact: say so when it will not come, so they compile it now.
         if fingerprint is not None:
@@ -1009,11 +1021,7 @@ class TpuCompilerAdaptor(CompilerInterface):
             compiled_fn, entry = self._run_backend(graph, example_inputs)
             # Self-heal: overwrite the artifact vLLM will hand us again next
             # run. Without this a single stale entry recompiles forever.
-            if (
-                entry is not None
-                and self.cache_dir is not None
-                and not self._disable_cache
-            ):
+            if self.cache_dir is not None and not self._disable_cache:
                 self._save_handle(key, path, entry, graph, was_wrapped, fingerprint)
 
         if was_wrapped:

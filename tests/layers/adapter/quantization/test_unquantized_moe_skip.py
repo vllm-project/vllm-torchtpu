@@ -73,7 +73,7 @@ def capture_forward(monkeypatch):
     pipelined_calls: list[dict] = []
 
     monkeypatch.setattr(
-        module.moe_routing, "route", lambda layer, x, logits: (weights, ids)
+        module.moe_routing, "route", lambda layer, x, logits, **kwargs: (weights, ids)
     )
     monkeypatch.setattr(
         token_padding,
@@ -227,8 +227,10 @@ def test_init_outside_runner_scope_runs_stock(monkeypatch):
 @pytest.mark.parametrize(
     "skip, expected_keys",
     [
-        (False, [(_TOPK, "silu", False, None, False, False)]),
-        (True, [(_TOPK, "silu", False, None, True, True)]),
+        # (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens,
+        #  topk_weights_float32, has_row_info)
+        (False, [(_TOPK, "silu", False, None, False, False, False)]),
+        (True, [(_TOPK, "silu", False, None, True, False, True)]),
     ],
 )
 def test_process_weights_after_loading_prebuilds_expected_kernels(

@@ -188,7 +188,9 @@ def test_draft_moe_layers_follow_the_runner_policy(monkeypatch):
     weights = torch.full((4, 2), 0.5, dtype=torch.float32)
     ids = torch.zeros(4, 2, dtype=torch.int32)
     monkeypatch.setattr(
-        unquantized.moe_routing, "route", lambda layer, x, logits: (weights, ids)
+        unquantized.moe_routing,
+        "route",
+        lambda layer, x, logits, **kwargs: (weights, ids),
     )
     monkeypatch.setattr(
         unquantized, "enable_pipelined_collective_and_compute", lambda: False

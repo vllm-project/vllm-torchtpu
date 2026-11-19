@@ -66,3 +66,23 @@ def test_startup_accepts_the_knob_unset(
     monkeypatch.delenv(REMOVED, raising=False)
 
     TpuPlatform.check_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize("value", ["1", "0", ""])
+def test_startup_rejects_topk_weights_float32_env(monkeypatch, vllm_config, value):
+    """The setting moved to additional_config; naming the old knob fails."""
+    monkeypatch.delenv(REMOVED, raising=False)
+    monkeypatch.setenv("TPU_MOE_TOPK_WEIGHTS_FLOAT32", value)
+
+    with pytest.raises(ValueError, match='"tpu_moe_topk_weights_float32": true'):
+        TpuPlatform.check_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize("key", ["tpu_moe_silu_bf16", "tpu_moe_topk_weights_float32"])
+def test_startup_rejects_non_bool_moe_reference_parity(monkeypatch, vllm_config, key):
+    monkeypatch.delenv(REMOVED, raising=False)
+    monkeypatch.delenv("TPU_MOE_TOPK_WEIGHTS_FLOAT32", raising=False)
+    vllm_config.additional_config = {key: "true"}
+
+    with pytest.raises(ValueError, match=key):
+        TpuPlatform.check_and_update_config(vllm_config)

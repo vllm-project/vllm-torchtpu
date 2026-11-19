@@ -409,6 +409,73 @@ def test_tpu_sdpa_attention_backend():
 
 
 @pytest.mark.parametrize(
+    ("mask_kind", "expect_math"),
+    [
+        ("1d", True),
+        ("2d", True),
+        ("3d_11k", True),
+        ("3d_h1k", True),
+        ("3d_hqk", False),
+        ("b11k", True),
+        ("b11k_additive", True),
+        ("b1qk", False),
+        ("b1qk_additive", False),
+    ],
+)
+def test_tpu_sdpa_masked_calls_use_math_backend(monkeypatch, mask_kind, expect_math):
+    # torch_tpu 0.2.0's default SDPA lowering misreads a mask of size 1 along
+    # the query dim (google-pytorch/torch_tpu#5677), so calls with such a
+    # mask (including a 1D [K] mask, a 2D [B, K] mask, which becomes
+    # [B, 1, 1, K], and 3D [1, 1, K] / [H, 1, K] masks) must run under
+    # sdpa_kernel(MATH), while unmasked calls and full-query-dim masks (3D or
+    # 4D) must not. b11k_additive is a float mask in the query dtype, for which
+    # vLLM-Omni's SDPAImpl does not select MATH itself.
+    from vllm_torchtpu.omni import attention as omni_attention
+
+    backends = []
+    real_sdpa_kernel = omni_attention.sdpa_kernel
+
+    def recording_sdpa_kernel(backend):
+        backends.append(backend)
+        return real_sdpa_kernel(backend)
+
+    monkeypatch.setattr(omni_attention, "sdpa_kernel", recording_sdpa_kernel)
+    impl = TpuSDPAImpl(num_heads=4, head_size=16, softmax_scale=0.25)
+    query = torch.randn(2, 8, 4, 16)
+    key = torch.randn(2, 6, 4, 16)
+    value = torch.randn(2, 6, 4, 16)
+    keep = torch.arange(6) < 5
+    keep_2d = keep[None, :].expand(2, -1)
+    if mask_kind == "1d":
+        mask = keep
+    elif mask_kind == "2d":
+        mask = keep_2d
+    elif mask_kind == "3d_11k":
+        mask = keep[None, None, :]
+    elif mask_kind == "3d_h1k":
+        mask = keep[None, None, :].expand(query.shape[2], 1, -1)
+    elif mask_kind == "3d_hqk":
+        mask = keep[None, None, :].expand(query.shape[2], query.shape[1], -1)
+    elif mask_kind.startswith("b11k"):
+        mask = keep_2d[:, None, None, :]
+    else:
+        mask = keep_2d[:, None, None, :].expand(-1, -1, query.shape[1], -1)
+    if mask_kind.endswith("_additive"):
+        mask = torch.zeros(mask.shape, dtype=query.dtype).masked_fill(~mask, -10000.0)
+
+    impl.forward(query, key, value)
+    impl.forward(query, key, value, SimpleNamespace(attn_mask=None))
+    assert backends == []
+
+    out = impl.forward(query, key, value, SimpleNamespace(attn_mask=mask))
+    assert backends == ([omni_attention.SDPBackend.MATH] if expect_math else [])
+    scores = torch.einsum("bqhd,bkhd->bhqk", query, key) * 0.25
+    scores = scores.masked_fill(~keep[None, None, None, :], float("-inf"))
+    ref = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(dim=-1), value)
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
     "rope_cls_name",
     ["QwenEmbedRope", "QwenEmbedLayer3DRope"],
 )
