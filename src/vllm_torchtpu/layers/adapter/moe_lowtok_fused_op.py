@@ -42,7 +42,6 @@ from vllm_torchtpu.distributed.ep_mesh import (
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives
 from vllm_torchtpu.layers.adapter import (
-    fused_moe_ep_v3,
     sequence_parallel,
     small_all_reduce_op,
     token_padding,
@@ -72,18 +71,17 @@ def maybe_prebuild(layer, scores_op) -> None:
     op for the layer's top-k once armed; nothing for any other layer.
 
     The op's only caller is the FP8 method's fused EP v3 entry
-    (``_apply_owning_dispatch_v3``), which the method's forward takes for a
-    layer v3's prebuild armed while USE_MOE_FUSED_EP_KERNEL is set; call this
-    after that prebuild. There the op serves the steps v3's kernel does not
-    take when the few-token kernel's scores entry (``scores_op``, from
-    ``moe_lowtok_scores.prebuild``) serves the layer without copy slots under
-    expert parallelism (:func:`serves`). Elsewhere nothing can call the op,
-    so nothing is checked, allocated, built or logged for it.
+    (``_apply_owning_dispatch_v3``), so the FP8 method calls this only for a
+    layer whose one MoE decision is fused EP v3
+    (``served_before_fused_decode``), after v3's prebuild. There the op serves
+    the steps v3's kernel does not take when the few-token kernel's scores
+    entry (``scores_op``, from ``moe_lowtok_scores.prebuild``) serves the
+    layer without copy slots under expert parallelism (:func:`serves`).
+    Elsewhere nothing can call the op, so nothing is checked, allocated,
+    built or logged for it.
     """
     if not (
-        envs.USE_MOE_FUSED_EP_KERNEL
-        and fused_moe_ep_v3.fused_moe_ep_supported(layer)
-        and scores_op is not None
+        scores_op is not None
         and not layer._lowtok_has_copies
         and layer.moe_config.moe_parallel_config.use_ep
     ):
