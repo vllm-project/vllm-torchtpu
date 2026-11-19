@@ -134,6 +134,9 @@ spec:
                     - name: k31-dspark
                       mountPath: /cache/hf/hub/models--Inferact--Kimi-K3.1-Pro-DSpark-preview/snapshots/6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94
                       readOnly: true
+                    - name: k31-dspark-released
+                      mountPath: /cache/hf/hub/models--Inferact--Kimi-K3.1-Pro-DSpark/snapshots/46ea9cb020652016de0d6e60ee6e4510fd6ec986
+                      readOnly: true
                     - name: k31-overlays
                       mountPath: /overlays
                       readOnly: true
@@ -170,6 +173,14 @@ spec:
                     volumeAttributes:
                       bucketName: tpu-ci-models-60b4c3c7
                       mountOptions: "implicit-dirs,only-dir=models--Inferact--Kimi-K3.1-Pro-DSpark-preview/snapshots/6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94"
+                      skipCSIBucketAccessCheck: "true"
+                - name: k31-dspark-released
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-ci-models-60b4c3c7
+                      mountOptions: "implicit-dirs,only-dir=models--Inferact--Kimi-K3.1-Pro-DSpark/snapshots/46ea9cb020652016de0d6e60ee6e4510fd6ec986"
                       skipCSIBucketAccessCheck: "true"
                 - name: k31-overlays
                   csi:
