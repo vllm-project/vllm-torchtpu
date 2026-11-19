@@ -1,0 +1,147 @@
+# VMEM-resident MoE expert weights (experiment)
+
+Question: if one layer's expert weights stay in VMEM for every decode step,
+instead of being read from HBM each step, how much faster is a step? The
+target is TPU 8i (SunFish, 192 MiB VMEM per TensorCore) with Gemma 4 26B-A4B
+expert shapes. v7x (GhostFish, 64 MiB) is the proxy that validates the kernel
+and the method.
+
+This is an experiment, not a serving path. Nothing outside this directory
+imports it.
+
+## What "resident" can mean on TPU today
+
+VMEM is per-call scratch. jax has no mechanism that keeps VMEM contents across
+`pallas_call` invocations (jax `1a1e875`, `jax/_src/pallas/mosaic/`; no test
+covers it either way). Scratch persists across grid steps inside one call
+(`jax/experimental/pallas/ops/tpu/matmul.py:28-40`,
+`paged_attention/paged_attention_kernel.py:234-265`). So the only way to keep
+weights resident for N decode steps is one call that runs all N steps, which
+is what this kernel does.
+
+Not tried here: XLA-placed VMEM arrays (`pltpu.with_memory_space_constraint`,
+VMEM-coloured `out_shape`, `tests/pallas/tpu_pallas_memory_space_test.py`),
+which might keep a weight in VMEM across separate calls in one jitted program.
+No upstream test chains two calls through such a buffer.
+
+## Design
+
+`kernel.py` has two arms with the same per-item body over a flattened
+`(step, expert)` work list (only experts some token routed to that step):
+
+| arm | expert weights | per item |
+| --- | --- | --- |
+| `resident` | whole-array VMEM inputs, copied in once | index `w[e]` in VMEM |
+| `streamed` | HBM (`pl.ANY`) | DMA `w[e]` into a 2-slot VMEM ring, prefetch item `t+1` |
+
+* Expert: SwiGLU, `fp8_e4m3fn` weights, per-token dynamic `fp8_e4m3fn`
+  activations, fp32 accumulate, per-channel fp32 scales.
+* Step `s+1` consumes the RMS-normed output of step `s`, so steps are serial.
+* Routing is synthetic: each real token picks one local expert per step
+  (EP-sharded layer, one TensorCore's shard). Token rows are padded to
+  `--rows`.
+* Per-step time is the slope between two step counts (`--steps lo,hi`),
+  which removes launch cost and the resident arm's one-time weight load.
+
+Correctness: both arms are checked against a plain-JAX oracle with the same
+quantization (`reference`). A corrupted expert must make the oracle disagree
+(`FAULT`), so a green check means something.
+`tests/kernels/experimental/test_vmem_resident_moe.py` runs both on the CPU
+Pallas interpreter.
+
+## Modelled ceiling (not measured)
+
+One expert is `3 * 2816 * 704` fp8 bytes = 5.95 MB. Even resident, the MXU
+must load (`vmatpush`) the weights each matmul. Its rate is 2 MXUs × one
+256×256 tile per push. From the GhostFish/SunFish/ZebraFish spec tables, that
+is 64 cycles at 2.2 GHz on v7x and 32 cycles at 2.4 GHz on TPU 8i.
+
+| per expert, one TensorCore | v7x | TPU 8i |
+| --- | --- | --- |
+| HBM read (3.69 / 4.30 TB/s) | 1.61 µs | 1.38 µs |
+| MXU weight push (4.5 / 9.8 TB/s) | 1.32 µs | 0.60 µs |
+| VMEM read | 0.44 µs | 0.40 µs |
+| **streamed / resident** | **1.22×** | **2.29×** |
+
+Decode stays push-bound up to ~220-256 tokens per expert. On v7x, the push
+rate is barely above HBM, so residency can buy at most ~1.2×. TPU 8i pushes
+twice as fast, which is where residency pays.
+
+## Results
+
+### v7x, one TensorCore (job `j-b92e1ec1-959a-4139-b7ee`)
+
+jax 0.11.2, libtpu 0.0.47, Gemma 4 26B-A4B expert shapes (2816 × 704, fp8),
+64 padded rows, slope over 4 → 16 steps, median of 30 reps. µs per step is
+for the whole step. µs per item is per (step, expert) pair, i.e. per expert
+actually touched.
+
+| local experts | B | resident µs/step | streamed µs/step | resident µs/item | streamed µs/item | streamed / resident |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8 | 1 | 2.45 | 2.48 | 2.45 | 2.48 | 1.01× |
+| 8 | 4 | 7.51 | 6.06 | 2.31 | 1.87 | 0.81× |
+| 8 | 16 | 12.83 | 16.24 | 1.77 | 2.24 | **1.27×** |
+| 8 | 64 | 14.43 | 17.91 | 1.82 | 2.26 | **1.24×** |
+| 4 | 1 | 3.29 | 2.91 | 3.29 | 2.91 | 0.88× |
+| 4 | 16 | 7.55 | 10.51 | 1.89 | 2.63 | **1.39×** |
+| 4 | 64 | 8.31 | 9.68 | 2.08 | 2.42 | **1.16×** |
+
+* **B ≥ 16: resident is 1.16–1.39× faster (1.24–1.27× at 8 experts).** That
+  matches the modelled 1.22× ceiling. Neither arm is at its floor. Resident
+  runs at ~1.8 µs per expert against the 1.32 µs push floor, and streamed at
+  ~2.25 µs against the 1.61 µs HBM floor. Both sit at ~72-73% of their floors.
+* **B ≤ 4: inconclusive.** A step there is 2.5-7.5 µs on top of a ~230 µs
+  fixed cost (dispatch plus the one-time load). The slope of a 12-step
+  difference resolves about ±0.5 µs per step, which is ±10-20% here. The
+  B = 4 inversion (0.81×) is inside that band and has not been re-run.
+* Measured with host wall clock, not xprof.
+
+Correctness on TPU: both arms give identical output, max abs error 0.234
+against the oracle (|ref| ≤ 4.18). An injected corrupted expert gives 5.91, so
+the check discriminates. On the CPU interpreter the error is 0.0. The
+residual on TPU is between the kernel and the XLA-compiled oracle. Most
+likely a few fp8 roundings flip and RMS norm carries them through 4 serial
+steps, but this has not been isolated. Do not read 0.234 as a tolerance.
+
+## Running
+
+```bash
+# CPU interpreter
+JAX_PLATFORMS=cpu pytest tests/kernels/experimental/test_vmem_resident_moe.py
+
+# v7x, one TensorCore, 8 local experts (~48 MiB resident)
+LIBTPU_INIT_ARGS=--xla_tpu_scoped_vmem_limit_kib=63488 \
+python -m vllm_torchtpu.kernels.experimental.vmem_resident_moe.benchmark \
+    --experts 8 --hidden 2816 --inter 704 --rows 64 --steps 4,16 \
+    --batches 1,4,16,64 --vmem-limit-mib 61
+```
+
+### On exos (how `j-b92e1ec1` ran)
+
+`cloud-devkit` at `48cfbe34` or later (it has the exos recipes). The directory
+mapped in holds this package's `kernel.py` and `benchmark.py` and a `run.sh`
+that runs the command above twice, at `--experts 8` and at `--experts 4`.
+
+```bash
+CDK_ROOT_DIR=<cloud-devkit checkout> cdk job create --cluster cdk-tpu-exos \
+  exos-simple-run-command --active-deadline-seconds 1800 \
+  --map-dir "<dir>:*:/root/vmemjob" -t agent-jobs,vmem-resident-moe \
+  PLATFORM=ghostfish SLICE=2x2 \
+  DOCKER_IMAGE=us-central1-docker.pkg.dev/cloud-tpu-inference-test/inferencex/vllm:harut-glm52-pd-agentx-c934e275d-tpusync1012-flat@sha256:bfb9752fe98af30dee4d6584f9f65e686197eea6e82556abca14c8f174ff1047 \
+  "RUN_CMD=bash /root/vmemjob/run.sh"
+```
+
+The slice is 4 chips; the benchmark uses device 0 only.
+
+`vmem_limit_bytes` above the default needs `--xla_tpu_scoped_vmem_limit_kib`
+too (`jax/_src/pallas/mosaic/core.py:98-100`). On TPU 8i, 16 local experts
+(one TensorCore's share of 128 experts at EP=8, ~96 MiB) fit in 192 MiB.
+
+## Next
+
+1. TPU 8i, `--experts 16`, on exos `sunfish_sampling`. The smallest slice is
+   `4x1x1` (2 hosts). The run needs the arm64 TPU 8i image and a 2-host
+   launcher.
+2. Whole layer on 8 TensorCores: attention + dense MLP (TP) + expert
+   all-to-all, all resident, N steps in one call.
+3. Arm 3: XLA-placed VMEM weights across per-step calls.
