@@ -104,14 +104,6 @@ def _save_qwen3_omni_config(
     return model_dir
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "TpuPlatform.check_and_update_config overwrites worker_cls with "
-        "TPUWorker, which ignores use_v2_model_runner."
-    ),
-)
 @pytest.mark.parametrize("model_runner", ["v1", "v2"])
 def test_stage_model_runner_selection(
     tmp_path: Path,
@@ -164,14 +156,6 @@ def test_stage_model_runner_selection(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ValueError,
-    reason=(
-        "OmniEngineArgs.create_engine_config raises ValueError because "
-        "TPUWorker lacks an Omni connector model runner (vllm-torchtpu#2065)."
-    ),
-)
 @pytest.mark.parametrize(
     ("moe_backend", "linear_backend"),
     [("auto", "auto"), ("triton", "torch")],

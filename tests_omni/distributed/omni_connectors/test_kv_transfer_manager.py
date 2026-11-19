@@ -51,28 +51,49 @@ def _receive_kv_sync(
 def _receive_kv_prefetched(
     mgr: OmniKVTransferManager, req: SimpleNamespace, device: torch.device
 ) -> bool:
-    mgr.start_prefetch(KVPrefetchJob(request_id=req.request_id), target_device=device)
+    mgr.start_prefetch(
+        KVPrefetchJob(
+            request_id=req.request_id,
+            kv_sender_info={"host": "127.0.0.1", "zmq_port": 50051},
+        ),
+        target_device=device,
+    )
+    assert req.request_id in mgr._prefetch_futures, (
+        f"Async KV prefetch was not scheduled for {req.request_id}"
+    )
+    future = mgr._prefetch_futures[req.request_id]
     assert mgr.wait_prefetch(timeout=PREFETCH_TIMEOUT_S) is True, (
         f"Async KV prefetch for {req.request_id} not ready after {PREFETCH_TIMEOUT_S}s"
     )
+    future.result()
     return mgr.consume_and_distribute_kv_cache(req, target_device=device)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ValueError,
-    reason="TPUWorker fails validate_worker_omni_connector; tracked by PR #2065",
-)
 @pytest.mark.parametrize(
     ("async_prefetch", "receive_kv"),
     [
         pytest.param(False, _receive_kv_sync, id="False"),
-        pytest.param(True, _receive_kv_prefetched, id="True"),
+        pytest.param(
+            True,
+            _receive_kv_prefetched,
+            id="True",
+            marks=pytest.mark.xfail(
+                strict=True,
+                raises=ValueError,
+                reason=(
+                    "OmniKVTransferManager._prefetch_payload calls "
+                    "torch.accelerator.set_device_index(target_device.index) "
+                    "with index=None from torch.device('tpu') "
+                    "(and OmniTpuPlatform lacks Stream)"
+                ),
+            ),
+        ),
     ],
 )
 def test_cross_stage_kv_transfer_ar_to_dit(
     async_prefetch: bool,
     receive_kv: Callable[[OmniKVTransferManager, SimpleNamespace, torch.device], bool],
+    omni_ctx: None,
 ) -> None:
     """Cross-stage KV transfer, AR to DiT.
 
@@ -138,8 +159,8 @@ def test_cross_stage_kv_transfer_ar_to_dit(
                     "type": "SharedMemoryConnector",
                     "wakeup_scope": scope,
                 },
-                "from_stage": "0",
-                "to_stage": "1",
+                "omni_from_stage": "0",
+                "omni_to_stage": "1",
                 "stage_id": 0,
                 "need_send_cache": True,
             }
@@ -152,8 +173,8 @@ def test_cross_stage_kv_transfer_ar_to_dit(
                     "type": "SharedMemoryConnector",
                     "wakeup_scope": scope,
                 },
-                "from_stage": "0",
-                "to_stage": "1",
+                "omni_from_stage": "0",
+                "omni_to_stage": "1",
                 "stage_id": 1,
                 "need_recv_cache": True,
                 "enable_kv_async_prefetch": async_prefetch,

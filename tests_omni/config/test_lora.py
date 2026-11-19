@@ -18,12 +18,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
 from safetensors.torch import save_file
 from vllm import SamplingParams
+from vllm.lora.layers import LoRAMapping
 from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.models.interfaces import SupportsLoRA
 from vllm_omni.config.lora import LoRAConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
@@ -91,16 +94,29 @@ def _write_tiny_qwen2_and_lora(
     return model_dir, lora_dir, lora_a, lora_b
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ValueError,
-    reason=(
-        "OmniEngineArgs resolves OmniTpuPlatform.get_omni_ar_worker_cls() "
-        "('TPUWorker') which fails validate_worker_omni_connector (tracked by "
-        "vllm-torchtpu PR #2065)"
-    ),
-)
-def test_autoregressive_lora(tmp_path: Path) -> None:
+class _TinyAttn(torch.nn.Module):
+    def __init__(self, q_proj: ColumnParallelLinear) -> None:
+        super().__init__()
+        self.q_proj = q_proj
+
+
+class _TinyLayer(torch.nn.Module):
+    def __init__(self, q_proj: ColumnParallelLinear) -> None:
+        super().__init__()
+        self.self_attn = _TinyAttn(q_proj)
+
+
+class _TinyLoRAModel(torch.nn.Module, SupportsLoRA):
+    packed_modules_mapping: dict[str, list[str]] = {}
+    embedding_modules: dict[str, str] = {}
+
+    def __init__(self, q_proj: ColumnParallelLinear, hf_config: Any) -> None:
+        super().__init__()
+        self.config = hf_config
+        self.layers = torch.nn.ModuleList([_TinyLayer(q_proj)])
+
+
+def test_autoregressive_lora(tmp_path: Path, omni_ctx: None) -> None:
     """Autoregressive LoRA.
 
     - TPU path: Build a tiny Qwen2 config + PEFT adapter, resolve
@@ -153,13 +169,12 @@ def test_autoregressive_lora(tmp_path: Path) -> None:
     )
 
     tpu_device = torch.device("tpu")
-    linear_layer = ColumnParallelLinear(
-        16, 16, bias=False, params_dtype=torch.bfloat16
-    ).to(tpu_device)
-    model = torch.nn.Module()
-    model.layers = torch.nn.ModuleList([torch.nn.Module()])
-    model.layers[0].self_attn = torch.nn.Module()
-    model.layers[0].self_attn.q_proj = linear_layer
+    base_weight = torch.randn(16, 16, dtype=torch.bfloat16) * 0.1
+    linear_layer = ColumnParallelLinear(16, 16, bias=False, params_dtype=torch.bfloat16)
+    linear_layer.weight.data.copy_(base_weight)
+    model = _TinyLoRAModel(linear_layer, vllm_config.model_config.hf_config).to(
+        tpu_device
+    )
 
     manager = TPUWorkerLoRAManager(
         vllm_config=vllm_config,
@@ -167,11 +182,11 @@ def test_autoregressive_lora(tmp_path: Path) -> None:
         embedding_modules={},
         max_num_tokens=16,
     )
-    manager.create_lora_manager(model)
-    manager.add_adapter(lora_req)
+    manager.create_lora_manager(model, vllm_config)
+    manager.set_active_adapters({lora_req}, LoRAMapping((1, 1), (1,)))
 
     x_cpu = torch.randn(2, 16, dtype=torch.float32)
-    ref_out = x_cpu @ linear_layer.weight.cpu().float().T + (
+    ref_out = x_cpu @ base_weight.float().T + (
         (x_cpu @ lora_a.float().T) @ lora_b.float().T
     )
     tpu_out, _ = model.layers[0].self_attn.q_proj(

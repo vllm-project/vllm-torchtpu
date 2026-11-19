@@ -121,14 +121,6 @@ def _serve_joyvl_model_backend(reply_content: str) -> Iterator[str]:
         sock.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ValueError,
-    reason=(
-        "JoyVL AR/connector stages resolve to TPUWorker, which lacks an Omni "
-        "connector model runner on main (see vllm-torchtpu PR #2065)"
-    ),
-)
 def test_joyvl_interaction_server(tmp_path: Path) -> None:
     """JoyVL Interaction Server on TPU fronting the JoyAI AR/TTS pipeline.
 
