@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 from ..core import errors
 from .constants import (
     ARENA_ALIGN_RESERVE_BYTES,
+    BF16_BYTES,
     DEFAULT_USABLE_VMEM_MIB,
     DENSE_SLOT_DEFAULT_BYTES,
     DOUBLE_BUFFER_SLOTS,
@@ -33,7 +34,9 @@ from .constants import (
     VALID_DMA_BUFFERS,
     WIDE_DENSE_RING_SLOTS,
     WIDE_EXPERT_RING_SLOTS,
+    WORD_ALIGN_BYTES,
 )
+from .models import dsa_query_gather_dim, has_dsa_profile
 from .specs import FusionScope, RingPlan, WorkloadSpec, default_double_buffer_ring_plan
 
 if TYPE_CHECKING:
@@ -119,11 +122,25 @@ def compute_per_token_vmem_bytes(
     hidden = profile.hidden_size
     tp = max(1, workload.tp, workload.dcp if workload.tp == 1 else workload.tp)
     ep = max(1, workload.ep)
+    dcp = max(1, workload.dcp)
     kv_split = max(1, workload.kv_split, workload.dcp)
+    has_dsa = has_dsa_profile(profile)
+    indexer_indices_bytes = (
+        WORD_ALIGN_BYTES * ceil(profile.index_topk / kv_split) if has_dsa else 0
+    )
+    shared_indexer_spine_bytes = (
+        indexer_indices_bytes
+        if has_dsa and 0 < profile.num_indexer_layers < profile.num_attention_layers
+        else 0
+    )
 
     # 1. On-chip residual (F32 4*streams*H), norm (BF16 2*H), staging (6*H)
     streams = max(1, profile.residual_streams)
-    residual_buffer_bytes = (4 * streams + 2) * hidden + (6 * hidden if tp > 1 else 0)
+    residual_buffer_bytes = (
+        (4 * streams + 2) * hidden
+        + (6 * hidden if tp > 1 else 0)
+        + shared_indexer_spine_bytes
+    )
 
     # 2. Attention per_op per-token scratch (sharded across TP ranks)
     nh_local = max(1, ceil(profile.num_attention_heads / tp))
@@ -135,6 +152,18 @@ def compute_per_token_vmem_bytes(
         nkv_local = max(1, ceil(profile.num_kv_heads / max(1, tp // kv_split)))
         attn_scratch_bytes = 2 * (2 * nh_local + 2 * nkv_local) * profile.head_dim + (
             4 * nh_local * profile.head_dim
+        )
+    if has_dsa:
+        query_gather_dim = dsa_query_gather_dim(profile)
+        attn_scratch_bytes += (
+            BF16_BYTES
+            * (
+                profile.index_n_heads * profile.index_head_dim
+                + profile.index_head_dim
+                + profile.index_n_heads
+            )
+            + (0 if shared_indexer_spine_bytes else indexer_indices_bytes)
+            + (BF16_BYTES * (dcp - 1) * nh_local * query_gather_dim if dcp > 1 else 0)
         )
 
     # 3. Linear attention (GDN / KDA) per-token scratch (sharded across TP ranks)
