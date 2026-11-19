@@ -13,3 +13,5 @@ python -m pytest -q tests/kernels/fused_moe/test_fused_ep_moe_v2_plan_kernel.py 
   -k lowered_for_tpu --junitxml="$results/kernel-plan-lowered.xml"
 python -m pytest -q tests/kernels/deepseek_v41/test_candidate_block_scores.py \
   --junitxml="$results/kernel-block-max.xml"
+python -m pytest -q tests/kernels/fused_moe/test_direct_all_gather.py \
+  --junitxml="$results/kernel-direct-all-gather.xml"
