@@ -160,13 +160,14 @@ def test_tp8_dcp4_budget_at_the_entries_batch_caps(seqs):
 @pytest.mark.parametrize(
     "layout",
     [
-        # A pipeline-parallel engine: every rank was charged for all 60 layers,
-        # so PP8 x TP1 holds 512 slots per rank and got about -293.6e9 B.
+        # Pipeline parallelism: a stage holds only its own layers, and the slot
+        # credit, which counts every MoE layer on every rank, does not model it.
         dict(kv_role=None, tp=1, pp=8, dcp=1, max_num_seqs=32),
         dict(kv_role="kv_consumer", tp=1, pp=8, dcp=1, max_num_seqs=32),
         dict(kv_role=None, tp=4, pp=2, dcp=1, max_num_seqs=32),
         dict(tp=8, pp=2),
-        # Experts over 4 ranks: 128 slots per rank, about -2.7e9 B.
+        # Experts over 4 ranks: 128 slots per rank, more than the 80 the budget
+        # was measured with, so the credit is negative.
         dict(tp=4, dcp=1),
         dict(tp=2, dp=2, dcp=1),
         # Experts over 16 ranks.
