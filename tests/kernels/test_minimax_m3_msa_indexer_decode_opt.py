@@ -1,4 +1,4 @@
-"""TPU_MINIMAX_M3_INDEXER_DECODE_OPT items noclamp / full / counts / tail<N>:
+"""TPU_MINIMAX_M3_INDEXER_DECODE_OPT items noclamp / full / counts / tail<N> / defer:
 the decode (token-major, transposed) block_scores tiles give the same bits as
 the default kernel on a folded 4-bit index cache (Pallas interpret mode)."""
 
@@ -66,7 +66,16 @@ CTX = [128 * 300 + 5, 128 * 150, 128 * 33 + 1, 128 * 130, 128 * 470 + 77]
 
 
 @pytest.mark.parametrize(
-    "spec", ["noclamp", "noclamp,full", "noclamp,full,counts", "full,counts,tail16", "noclamp,tail8"]
+    "spec",
+    [
+        "noclamp",
+        "noclamp,full",
+        "noclamp,full,counts",
+        "full,counts,tail16",
+        "noclamp,tail8",
+        "noclamp,defer",
+        "defer,counts",
+    ],
 )
 def test_decode_opt_same_bits(monkeypatch, spec):
     args, cu = _case(3, CTX, 6, 471)
