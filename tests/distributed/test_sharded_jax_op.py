@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A hand-written fake keeps the caller's dynamic batch dimension, and a
-sharded output is sized for this rank's shard."""
+"""A hand-written fake keeps the caller's dynamic batch dimension, and the op
+hands JaxCallable the output partition specs that size a sharded output for
+this rank's shard."""
 
 import types
 
@@ -76,7 +77,8 @@ def test_a_specializing_fake_is_caught():
 def test_the_callable_gets_the_output_specs(monkeypatch):
     """JaxCallable sizes outputs from the specs it is given: without them, a
     P("d") output is sized for the global array, eight times this rank's rows
-    on an 8-core mesh."""
+    on an 8-core mesh. The op is not called here: the test checks the spec it
+    hands JaxCallable and the shard shape JaxCallable derives from it."""
     built = []
     real = torch.library.custom_op
 

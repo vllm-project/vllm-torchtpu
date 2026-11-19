@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.layers.adapter import linear_common
@@ -52,8 +53,6 @@ def test_prequant_path_matches_the_quantized_matmul_bit_for_bit(seed):
 
 
 def test_ops_fake_shapes():
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
     linear_common.prebuild_prequant_ops()
     with FakeTensorMode():
         x = torch.empty(2, M, K, dtype=torch.bfloat16)
