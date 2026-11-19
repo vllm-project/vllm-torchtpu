@@ -27,6 +27,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import vllm
+import vllm.model_executor.custom_op as custom_op_mod
+from vllm.config import CompilationConfig, CompilationMode
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.models import qwen3_5, qwen3_5_mtp, qwen3_next, qwen3_next_mtp
 
@@ -36,6 +38,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     WEIGHT_FLIPPED_ATTR,
     PrequantLinearMethod,
 )
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.models.qwen3_5 import hooks as qwen3_5_hooks
 from vllm_torchtpu.models.vllm import qwen3_next_patch as patch_mod
 from vllm_torchtpu.models.vllm.qwen3_5_mtp import UPSTREAM_PREDICTOR_FORWARD
@@ -411,6 +414,8 @@ def test_patched_decoder_layer_forward_fp8_gather(monkeypatch):
 
     attn_calls: list[dict[str, object]] = []
     layer = _sp_dummy_layer(attn_calls, [])
+    # Its attention's main projection takes pre-quantized rows.
+    layer._pre_norm_quant_eligible = True
     num_tokens = 8
     hidden = torch.randn(num_tokens // tp, 64)
     residual = torch.randn(num_tokens // tp, 64)
@@ -422,6 +427,46 @@ def test_patched_decoder_layer_forward_fp8_gather(monkeypatch):
     assert x_q.dtype == torch.bfloat16
     assert x_q.shape == (num_tokens, 64)
     assert x_s.shape == (num_tokens, 1)
+
+
+@pytest.mark.parametrize("marked", [False, None], ids=["bf16_projection", "unmarked"])
+def test_a_sliced_layer_without_fp8_projections_gathers_bf16_rows(monkeypatch, marked):
+    """A layer whose attention's main projection does not take pre-quantized
+    rows (a bf16 checkpoint, say) gathers its bf16 rows on a sliced step, as
+    on main, and attention gets no prequant."""
+    tp = 2
+    _fake_tp_collectives(monkeypatch, tp)
+    _sequence_parallel(monkeypatch, min_rows=0, fp8_gather=True)
+    quantized = []
+    monkeypatch.setattr(
+        patch_mod.linear_common,
+        "quantize_rows",
+        lambda x: quantized.append(x) or (x, torch.ones(x.shape[0], 1)),
+    )
+    gathered = _record_all_gathers(monkeypatch)
+
+    attn_calls: list[dict[str, object]] = []
+    received = []
+    layer = _sp_dummy_layer(attn_calls, [])
+    if marked is not None:
+        layer._pre_norm_quant_eligible = marked
+    linear_attn = layer.linear_attn
+    layer.linear_attn = lambda hidden_states, **kwargs: (
+        received.append(hidden_states),
+        linear_attn(hidden_states, **kwargs),
+    )[1]
+    num_tokens = 8
+    hidden = torch.randn(num_tokens // tp, 64, dtype=torch.bfloat16)
+    residual = torch.randn(num_tokens // tp, 64, dtype=torch.bfloat16)
+
+    patched_decoder_layer_forward(layer, hidden, residual, torch.arange(num_tokens))
+
+    assert attn_calls == [{}]
+    assert quantized == []
+    assert gathered == [num_tokens // tp]
+    (rows,) = received
+    assert rows.dtype == torch.bfloat16 and rows.shape == (num_tokens, 64)
+    torch.testing.assert_close(rows, torch.cat([hidden * 1.05] * tp))
 
 
 def _record_all_gathers(monkeypatch) -> list[int]:
@@ -1086,6 +1131,48 @@ def test_cat768_fp8_fusion_and_weight_deletion():
         assert cos_moe > 0.999, f"cos_moe={cos_moe}"
 
 
+def test_an_unflipped_fp8_shared_expert_is_checked_again_after_the_flip():
+    """The fused gate setup waits for an FP8 gate_up_proj to be flipped to
+    (k, n), matching the FP8 method by class, subclasses included, and then
+    fuses."""
+
+    class _Fp8Method(VllmFp8LinearMethodTPU):
+        pass
+
+    hidden_dim, n_gate, n_inter = 512, 128, 64
+
+    def linear(weight, scale=None):
+        mod = nn.Module()
+        mod.register_parameter("weight", nn.Parameter(weight, requires_grad=False))
+        if scale is not None:
+            mod.register_parameter(
+                "weight_scale", nn.Parameter(scale, requires_grad=False)
+            )
+        mod.bias = None
+        return mod
+
+    def fp8(shape):
+        return (torch.randn(*shape) * 0.02).to(torch.float8_e4m3fn)
+
+    gate_up = linear(fp8((hidden_dim, 2 * n_inter)), torch.ones(2 * n_inter))
+    gate_up.quant_method = object.__new__(_Fp8Method)
+    down = linear(fp8((n_inter, hidden_dim)), torch.ones(hidden_dim))
+    setattr(down, WEIGHT_FLIPPED_ATTR, True)
+    moe = nn.Module()
+    moe.gate = linear(torch.randn(n_gate, hidden_dim, dtype=torch.bfloat16))
+    moe.shared_expert = SimpleNamespace(
+        gate_up_proj=gate_up, down_proj=down, act_fn=F.silu
+    )
+    moe.shared_expert_gate = linear(
+        torch.randn(1, hidden_dim, dtype=torch.bfloat16) * 0.02
+    )
+
+    assert maybe_setup_fused_gate_se(moe) is False
+    assert not getattr(moe, "_fused_gate_se_checked", False)
+    setattr(gate_up, WEIGHT_FLIPPED_ATTR, True)
+    assert maybe_setup_fused_gate_se(moe) is True
+
+
 def test_the_shared_expert_gate_weight_takes_a_host_round_trip(monkeypatch):
     """The fused shared-expert gate weight is copied through host memory: on
     TPU an on-device copy of the [1, hidden] gate can alias the buffer behind
@@ -1601,3 +1688,289 @@ def test_a_draft_trace_reads_a_sliced_form_until_the_draft_form_is_recorded(
     assert not patch_mod._rows_are_sequence_parallel(4)
     sp.set_active(True)  # the proposer records a sliced draft forward
     assert patch_mod._rows_are_sequence_parallel(4)
+
+
+class _QkvProj:
+    """`qkv_proj` stand-in recording which entry the attention forward used."""
+
+    def __init__(self, skip_bias_add):
+        self.skip_bias_add = skip_bias_add
+        self.bias = torch.full((24,), 0.5)
+        self.calls: list[tuple] = []
+        self.quant_method = SimpleNamespace(apply_prequant=self._apply_prequant)
+
+    def _apply_prequant(self, layer, x_q, x_s, bias):
+        assert layer is self
+        self.calls.append(("prequant", x_q, x_s, bias))
+        return torch.zeros(x_q.shape[0], 24)
+
+    def __call__(self, x):
+        self.calls.append(("plain", x))
+        return torch.zeros(x.shape[0], 24), None
+
+
+@pytest.mark.parametrize("skip_bias_add", [False, True])
+def test_attn_forward_takes_the_rows_or_the_prequantized_rows(
+    monkeypatch, skip_bias_add
+):
+    """Without prequant the attention runs qkv_proj on its rows; with it, the
+    projection's apply_prequant on the FP8 rows and scales, with the bias the
+    projection adds itself."""
+    seen = []
+    monkeypatch.setattr(
+        patch_mod,
+        "_forward_qwen3_next_attn_from_qkv",
+        lambda layer, qkv, positions: seen.append((qkv.shape, positions)) or qkv,
+    )
+    proj = _QkvProj(skip_bias_add)
+    attn = SimpleNamespace(qkv_proj=proj)
+    rows, positions = torch.randn(4, 16), torch.arange(4)
+    patch_mod.patched_qwen3_next_attn_forward(attn, positions, rows)
+    x_q, x_s = torch.randn(4, 16), torch.ones(4, 1)
+    patch_mod.patched_qwen3_next_attn_forward(attn, positions, x_q, (x_q, x_s))
+
+    (plain, prequant) = proj.calls
+    assert plain[0] == "plain" and plain[1] is rows
+    assert prequant[0] == "prequant" and prequant[1] is x_q and prequant[2] is x_s
+    assert prequant[3] is (None if skip_bias_add else proj.bias)
+    assert [s for s, _ in seen] == [(4, 24), (4, 24)]
+
+
+def _attn_from_qkv_layer(pal_gate_q_eligible=False):
+    o_proj_calls = []
+
+    def o_proj(x):
+        o_proj_calls.append(x)
+        return x * 3.0, None
+
+    layer = SimpleNamespace(
+        _project_qkv_gate=lambda qkv, positions: (
+            qkv[:, :8],
+            qkv[:, 8:16],
+            qkv[:, 16:24],
+            qkv[:, 24:32],
+        ),
+        attn=lambda q, k, v: q * 2.0,
+        o_proj=o_proj,
+        _pal_gate_q_eligible=pal_gate_q_eligible,
+    )
+    return layer, o_proj_calls
+
+
+@pytest.mark.parametrize("gather", [None, [1, 3]], ids=["all_rows", "step0_gather"])
+def test_attention_from_qkv_gates_the_attention_rows(gather):
+    """The attention output is gated by sigmoid(gate) before o_proj; on MTP
+    step 0 the post-attention gather keeps only the requested rows of both."""
+    layer, o_proj_calls = _attn_from_qkv_layer()
+    qkv = torch.randn(4, 32)
+    indices = None if gather is None else torch.tensor(gather)
+    with patch_mod.step0_post_attn_gather_context(indices):
+        out = patch_mod._forward_qwen3_next_attn_from_qkv(layer, qkv, None)
+    rows = slice(None) if gather is None else gather
+    want = qkv[rows, :8] * 2.0 * torch.sigmoid(qkv[rows, 24:32])
+    (o_proj_in,) = o_proj_calls
+    torch.testing.assert_close(o_proj_in, want)
+    torch.testing.assert_close(out, want * 3.0)
+    assert patch_mod._step0_gather_indices is None
+
+
+def test_pal_gate_q_o_proj_runs_the_fused_op_and_all_reduces(monkeypatch):
+    """The fused sigmoid gate + FP8 o_proj takes 2D rows, all-reduces a TP
+    o_proj's output and gives it the attention output's leading shape."""
+    calls, reduced = [], []
+
+    def op(attn_2d, gate_2d, weight, weight_scale):
+        calls.append((attn_2d.shape, gate_2d.shape, weight, weight_scale))
+        return attn_2d[:, :16] + gate_2d[:, :16]
+
+    monkeypatch.setattr(patch_mod, "_get_sigmoid_gate_o_proj_op", lambda: op)
+    monkeypatch.setattr(
+        patch_mod,
+        "tensor_model_parallel_all_reduce",
+        lambda x: reduced.append(x) or x * 2.0,
+    )
+    o_proj = SimpleNamespace(
+        weight=object(), weight_scale=object(), reduce_results=True, tp_size=2
+    )
+    attn_out, gate = torch.randn(2, 3, 128), torch.randn(2, 3, 128)
+    out = patch_mod._apply_pal_gate_q_o_proj(o_proj, attn_out, gate)
+    ((a_shape, g_shape, w, s),) = calls
+    assert a_shape == g_shape == (6, 128)
+    assert w is o_proj.weight and s is o_proj.weight_scale
+    assert len(reduced) == 1
+    want = (attn_out.reshape(6, 128)[:, :16] + gate.reshape(6, 128)[:, :16]) * 2.0
+    torch.testing.assert_close(out, want.reshape(2, 3, 16))
+
+
+def test_decoder_layer_step0_gather_keeps_the_requested_residual_rows(monkeypatch):
+    """On MTP step 0 the attention keeps only the gathered rows, and the
+    decoder layer gathers the residual to match before the MoE."""
+    _sequence_parallel(monkeypatch, min_rows=0)
+
+    class Layer:
+        use_attn_reduce_scatter_for_moe = False
+        layer_type = "full_attention"
+        layer_scale = False
+
+        def input_layernorm(self, x, residual=None):
+            return x if residual is None else (x, residual)
+
+        def self_attn(self, hidden_states, positions):
+            return torch.index_select(hidden_states, 0, patch_mod._step0_gather_indices)
+
+        def post_attention_layernorm(self, x, residual):
+            return x, residual + x
+
+        def mlp(self, x):
+            return x
+
+    hidden, residual = torch.randn(4, 8), torch.randn(4, 8)
+    with patch_mod.step0_post_attn_gather_context(torch.tensor([1, 3])):
+        out, new_residual = patched_decoder_layer_forward(
+            Layer(), hidden, residual, torch.arange(4)
+        )
+    torch.testing.assert_close(out, hidden[[1, 3]])
+    torch.testing.assert_close(new_residual, residual[[1, 3]] + hidden[[1, 3]])
+
+
+@pytest.fixture
+def unpatched_v6(monkeypatch):
+    """The classes and loader install_qwen3_next_v6_patches rewrites, restored
+    at teardown, with the install flag cleared."""
+    from vllm.model_executor.model_loader import base_loader
+
+    monkeypatch.setattr(
+        qwen3_next.Qwen3NextAttention,
+        "__init__",
+        patch_mod.UPSTREAM_ATTN_INIT,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        qwen3_next.Qwen3NextAttention, "forward", patch_mod.UPSTREAM_ATTN_FORWARD
+    )
+    monkeypatch.setattr(
+        qwen3_next.Qwen3NextSparseMoeBlock,
+        "forward",
+        patch_mod.UPSTREAM_SPARSE_MOE_FORWARD,
+    )
+    monkeypatch.setattr(
+        GemmaRMSNorm, "forward_native", patch_mod.UPSTREAM_GEMMA_RMSNORM_FORWARD_NATIVE
+    )
+    monkeypatch.setattr(
+        base_loader,
+        "process_weights_after_loading",
+        lambda model, model_config, target_device: "processed",
+    )
+    monkeypatch.setattr(
+        base_loader, "_qwen3_next_v6_process_patched", False, raising=False
+    )
+    monkeypatch.setattr(patch_mod, "_V6_PATCHES_INSTALLED", False)
+    return base_loader
+
+
+def test_install_qwen3_next_v6_patches_wraps_the_loader_once(monkeypatch, unpatched_v6):
+    """The install routes Qwen3NextAttention and the sparse MoE block through
+    the patched forwards and has the loader run the post-load setup on every
+    model it processes; a second install changes nothing."""
+    setups = []
+    monkeypatch.setattr(patch_mod, "setup_qwen3_next_v6_after_loading", setups.append)
+    monkeypatch.setattr(patch_mod, "_get_sigmoid_gate_quant_op", lambda: None)
+    patch_mod.install_qwen3_next_v6_patches()
+    assert (
+        qwen3_next.Qwen3NextAttention.forward
+        is patch_mod.patched_qwen3_next_attn_forward
+    )
+    assert (
+        qwen3_next.Qwen3NextSparseMoeBlock.forward
+        is patch_mod.patched_sparse_moe_forward
+    )
+    assert (
+        GemmaRMSNorm.forward_native is patch_mod._patched_gemma_rmsnorm_forward_native
+    )
+    wrapped = unpatched_v6.process_weights_after_loading
+    model = torch.nn.Linear(2, 2)
+    assert wrapped(model, None, "cpu") == "processed"
+    assert setups == [model]
+
+    patch_mod.install_qwen3_next_v6_patches()
+    assert unpatched_v6.process_weights_after_loading is wrapped
+
+
+def test_step0_post_attn_gather_is_installed_with_the_patched_forwards(
+    monkeypatch, unpatched_v6
+):
+    """A draft model runs the step-0 post-attention gather when it says so or
+    when the attention, decoder-layer and MTP forwards are the patched ones."""
+    monkeypatch.setattr(patch_mod, "_get_sigmoid_gate_quant_op", lambda: None)
+
+    class Mtp:
+        forward = patch_mod.patched_mtp_forward
+
+    draft = SimpleNamespace(model=Mtp())
+    assert not patch_mod.is_step0_post_attn_gather_installed(None)
+    assert not patch_mod.is_step0_post_attn_gather_installed(draft)
+    patch_mod.install_qwen3_next_v6_patches()
+    monkeypatch.setattr(
+        qwen3_next.Qwen3NextDecoderLayer, "forward", patched_decoder_layer_forward
+    )
+    assert patch_mod.is_step0_post_attn_gather_installed(draft)
+    assert not patch_mod.is_step0_post_attn_gather_installed(
+        SimpleNamespace(model=SimpleNamespace())
+    )
+    assert patch_mod.is_step0_post_attn_gather_installed(
+        SimpleNamespace(_supports_step0_post_attn_gather=True)
+    )
+
+
+def _decoder_layer(cls, qkv_weight_dtype):
+    """A real decoder-layer instance carrying only what the post-load setup
+    reads: its type, its input norm and its attention's qkv_proj."""
+    layer = cls.__new__(cls)
+    nn.Module.__init__(layer)
+    layer.layer_type = "full_attention"
+    layer.layer_scale = False
+    compilation_config = CompilationConfig(
+        mode=CompilationMode.NONE, custom_ops=["none"]
+    )
+    with patch.object(
+        custom_op_mod, "get_cached_compilation_config", lambda: compilation_config
+    ):
+        layer.input_layernorm = GemmaRMSNorm(64, eps=1e-6)
+    qkv_proj = nn.Module()
+    weight = torch.randn(64, 96).to(qkv_weight_dtype)
+    qkv_proj.register_parameter("weight", nn.Parameter(weight, requires_grad=False))
+    qkv_proj.register_parameter(
+        "weight_scale", nn.Parameter(torch.ones(96), requires_grad=False)
+    )
+    qkv_proj.quant_method = (
+        object.__new__(VllmFp8LinearMethodTPU)
+        if qkv_weight_dtype == torch.float8_e4m3fn
+        else SimpleNamespace()
+    )
+    layer.self_attn = nn.Module()
+    layer.self_attn.qkv_proj = qkv_proj
+    layer.mlp = nn.Module()
+    return layer
+
+
+@pytest.mark.parametrize(
+    "cls", [qwen3_next.Qwen3NextDecoderLayer, qwen3_5.Qwen3_5DecoderLayer]
+)
+def test_setup_after_loading_marks_where_the_fused_input_norm_quant_applies(
+    monkeypatch, cls
+):
+    """The post-load setup hoists each GemmaRMSNorm's (1 + w) and marks a
+    decoder layer, Qwen3.5's subclass included, eligible for the fused input
+    norm + FP8 quantization only when its qkv_proj takes pre-quantized rows."""
+    monkeypatch.setattr(patch_mod, "_prebuild_norm_ops", lambda eps: None)
+    fp8 = _decoder_layer(cls, torch.float8_e4m3fn)
+    bf16 = _decoder_layer(cls, torch.bfloat16)
+    model = nn.ModuleList([fp8, bf16])
+    patch_mod.setup_qwen3_next_v6_after_loading(model)
+    assert fp8._pre_norm_quant_eligible and fp8._pre_norm_quant_exact
+    assert not bf16._pre_norm_quant_eligible and not bf16._pre_norm_quant_exact
+    for layer in (fp8, bf16):
+        norm = layer.input_layernorm
+        torch.testing.assert_close(
+            norm._tpu_weight_plus_one, 1.0 + norm.weight.data.float()
+        )
