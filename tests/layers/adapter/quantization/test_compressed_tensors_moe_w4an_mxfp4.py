@@ -649,7 +649,7 @@ def test_preselected_routes_keep_padding_and_skip_router(monkeypatch):
     monkeypatch.setattr(
         module.moe_routing,
         "route",
-        lambda *args: (calls.append("router") or (weights, ids)),
+        lambda *args, **kwargs: (calls.append("router") or (weights, ids)),
     )
 
     def mask(ids, weights, is_local_tensor):

@@ -921,7 +921,7 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
         monkeypatch.setattr(
             nvfp4.moe_routing,
             "route",
-            lambda *args: (
+            lambda *args, **kwargs: (
                 torch.ones(2, 2, dtype=torch.bfloat16),
                 torch.zeros(2, 2, dtype=torch.int32),
             ),
