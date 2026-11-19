@@ -524,7 +524,9 @@ def inner_kernel(
     m_end_local = m_end - m_offset
 
     chunk_mode = _k1_body_mode(cfgs)
-    if chunk_mode not in ("roll", "chunk"):
+    if chunk_mode is None or not (
+        chunk_mode in ("roll", "chunk") or chunk_mode.startswith("pipe")
+    ):
         chunk_mode = None
 
     def _dequant_rhs_before():
@@ -588,6 +590,95 @@ def inner_kernel(
         lax.fori_loop(0, num_chunks, body, 0)
         return acc_ref[:bucket_m]
 
+    def _pipe_matmul(bucket_m, unroll, chunk_epilogue, compact):
+        # Software-pipelined rolled loop over MXU column chunks: chunk j+1 is
+        # dequantized into one VMEM buffer while chunk j's matmul reads the
+        # other, so the VPU dequant overlaps the MXU inside each iteration and
+        # the body holds 4 chunk dequants + 4 matmuls instead of all of them.
+        # Same per-chunk operands and matmul as "chunk" mode.
+        mxu_size = pltpu.get_tpu_info().mxu_column_size
+        rhs_tile_n = cfgs.tiles.tile_n * (2 if cfgs.fuse_act is not None else 1)
+        num_chunks = rhs_tile_n // mxu_size
+        assert num_chunks >= 2 and num_chunks % 2 == 0, (rhs_tile_n, mxu_size)
+        tile_k = cfgs.tiles.tile_k
+
+        def cols(j):
+            if isinstance(j, int):
+                return pl.ds(j * mxu_size, mxu_size)
+            return pl.ds(pl.multiple_of(j * mxu_size, mxu_size), mxu_size)
+
+        def deq(j, buf):
+            start = cols(j).start
+            buf[...] = _chunk_rhs(start, mxu_size)
+
+        # Per-chunk epilogue (no bias): an MXU chunk holds whole gate/up lane
+        # pairs, so the activation, row mask and output store run per chunk
+        # inside the loop instead of once over the whole tile after it.
+        out_w = mxu_size // 2 if cfgs.fuse_act is not None else mxu_size
+        tiled_out_2d_ref = tiled_out_ref.reshape(-1, cfgs.tiles.tile_n)
+
+        def out_cols(j):
+            if isinstance(j, int):
+                return pl.ds(j * out_w, out_w)
+            return pl.ds(pl.multiple_of(j * out_w, out_w), out_w)
+
+        def mm(j, buf):
+            lhs = tiled_lhs_ref.reshape(-1, tile_k)[:bucket_m]
+            block_acc = jnp.matmul(
+                lhs, buf[...], preferred_element_type=jnp.float32
+            ).astype(acc_ref.dtype)
+            acc = jnp.zeros((bucket_m, mxu_size), acc_ref.dtype) + block_acc
+            if not chunk_epilogue:
+                acc_ref[:bucket_m, cols(j)] = acc
+                return
+            acc = apply_act_fn(acc, cfgs.fuse_act)
+            iota = lax.broadcasted_iota(jnp.int32, acc.shape, 0)
+            mask = jnp.logical_and(m_start_local <= iota, iota < m_end_local)
+            tiled_out_2d_ref[:bucket_m, out_cols(j)] = jnp.where(mask, acc, 0).astype(
+                tiled_out_ref.dtype
+            )
+
+        def scoped(buf_a, buf_b):
+            deq(0, buf_a)
+
+            def pair(p, carry):
+                j = 2 * p
+                deq(j + 1, buf_b)
+                mm(j, buf_a)
+                if compact:
+                    # The last pair dequantizes chunk n-1 a second time
+                    # (unused) instead of carrying a separate tail.
+                    deq(jnp.minimum(j + 2, num_chunks - 1), buf_a)
+                else:
+                    deq(j + 2, buf_a)
+                mm(j + 1, buf_b)
+                return carry
+
+            num_pairs = num_chunks // 2 - (0 if compact else 1)
+            if num_pairs > 0:
+                lax.fori_loop(0, num_pairs, pair, 0, unroll=min(unroll, num_pairs))
+            if not compact:
+                deq(num_chunks - 1, buf_b)
+                mm(num_chunks - 2, buf_a)
+                mm(num_chunks - 1, buf_b)
+
+        buf = pltpu.VMEM((tile_k, mxu_size), cfgs.lhs_cfgs.dtype)
+        pl.run_scoped(scoped, buf, buf)
+        if not chunk_epilogue:
+            return acc_ref[:bucket_m]
+        # Same tail as the whole-tile epilogue below.
+        partial_out_zeros = jnp.zeros_like(partial_out_ref)
+        tiled_out_ref[0] += jnp.where(
+            gm_id == 0, partial_out_zeros, partial_out_ref[...]
+        )
+        last_row = m_end_local // cfgs.dims.size_lhs_sublane
+        partial_out_ref[...] = jnp.where(
+            m_end_local % cfgs.dims.size_lhs_sublane == 0,
+            partial_out_zeros,
+            tiled_out_ref[last_row],
+        )
+        return None
+
     def _matmul(
         is_first_k_step: bool,
         is_last_k_step: bool,
@@ -640,7 +731,17 @@ def inner_kernel(
             # Dequantize + matmul one MXU column chunk at a time (rolled loop
             # for "roll", unrolled for "chunk"): the same per-chunk operands
             # and matmul as below, without the whole-tile bf16 temporary.
-            acc = _chunked_matmul(tiled_lhs, bucket_m, chunk_mode == "roll")
+            if chunk_mode.startswith("pipe"):
+                spec = chunk_mode[4:]
+                digits = "".join(ch for ch in spec if ch.isdigit())
+                chunk_epilogue = "a" not in spec and not cfgs.rhs_cfgs.has_bias
+                acc = _pipe_matmul(
+                    bucket_m, int(digits or 1), chunk_epilogue, "c" in spec
+                )
+                if acc is None:
+                    return
+            else:
+                acc = _chunked_matmul(tiled_lhs, bucket_m, chunk_mode == "roll")
         elif not cfgs.lhs_cfgs.should_quantize:
             # Unquantized matmul path.
             for start_n in range(0, rhs_tile_n, mxu_size):
@@ -887,8 +988,12 @@ def _k1_body_env() -> str | None:
     raw = os.environ.get(_K1_BODY_ENV, "").strip().lower()
     if raw in ("", "0", "off"):
         return None
-    if raw not in ("single", "hoist", "roll", "chunk"):
-        raise ValueError(f"{_K1_BODY_ENV}={raw!r}: expected single|hoist|roll|chunk")
+    if raw not in ("single", "hoist", "roll", "chunk") and not (
+        raw.startswith("pipe") and (raw[4:].rstrip("ac") or "1").isdigit()
+    ):
+        raise ValueError(
+            f"{_K1_BODY_ENV}={raw!r}: expected single|hoist|roll|chunk|pipe[N]"
+        )
     return raw
 
 
@@ -899,7 +1004,7 @@ def _k1_body_mode(cfgs: "GmmConfigs") -> str | None:
     mode = _k1_body_env()
     if mode is None or pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k) != 1:
         return None
-    if mode in ("hoist", "roll", "chunk") and not (
+    if mode != "single" and not (
         cfgs.rhs_cfgs.should_dequantize_before_matmul
         and not cfgs.lhs_cfgs.should_quantize
         and all(cfgs.fp8_rhs_dtype(b) is None for b in cfgs.tiles.bucket_sizes)
