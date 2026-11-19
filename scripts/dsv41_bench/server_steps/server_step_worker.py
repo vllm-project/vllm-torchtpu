@@ -29,10 +29,16 @@ class Scenario:
     chunk_tokens: int = 2048
     dspark_tokens: int = 5
     physical_chips: int = 4
+    # Request slots per DP rank (max_num_seqs); 0 = the rank's concurrency.
+    slots_per_rank: int = 0
 
     @property
     def local_concurrency(self) -> int:
         return self.concurrency // self.dp_size
+
+    @property
+    def max_seqs(self) -> int:
+        return self.slots_per_rank or self.local_concurrency
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -55,7 +61,8 @@ SCENARIOS["decode_agentx"] = Scenario(
     "decode", 128, prefix_tokens=147456, output_tokens=512, chunk_tokens=2048
 )
 # DSV41_DP16_REQUESTS / DSV41_DP16_PREFIX_TOKENS size it, e.g. 192 requests at
-# 147456 tokens for the AgentX decode slice.
+# 147456 tokens for the AgentX decode slice. DSV41_DP16_SLOTS_PER_RANK serves
+# them from more slots than requests, so steps pad to the slots' row bucket.
 SCENARIOS["decode_dp16"] = Scenario(
     "decode",
     int(os.environ.get("DSV41_DP16_REQUESTS", "768")),
@@ -63,6 +70,7 @@ SCENARIOS["decode_dp16"] = Scenario(
     output_tokens=512,
     dp_size=16,
     physical_chips=8,
+    slots_per_rank=int(os.environ.get("DSV41_DP16_SLOTS_PER_RANK", "0")),
 )
 
 
@@ -463,10 +471,8 @@ class ServerStepWorker:
         hf = self.vllm_config.model_config.hf_config
         if hf.num_hidden_layers != 40 or hf.sliding_window != 128:
             raise ValueError("Expected the 40-layer DSv4.1 model with SWA=128")
-        if self.vllm_config.scheduler_config.max_num_seqs != selected.local_concurrency:
-            raise ValueError(
-                "max_num_seqs must equal the scenario's per-DP concurrency"
-            )
+        if self.vllm_config.scheduler_config.max_num_seqs != selected.max_seqs:
+            raise ValueError("max_num_seqs must equal the scenario's per-DP slots")
         if (
             self.vllm_config.scheduler_config.max_num_batched_tokens
             != selected.chunk_tokens

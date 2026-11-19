@@ -173,9 +173,9 @@ def main() -> None:
     )
     env["KV_BYTES"] = "auto"
     env["MOE_FUSED_EP_PREPROCESS_BACKEND"] = "topology" if decode else "native"
-    # Steady target verification is exactly local_concurrency * (K + 1) rows;
-    # padding it to 384 runs every layer on 25% padding rows.
-    verify_rows = scenario.local_concurrency * (scenario.dspark_tokens + 1)
+    # Steady target verification is exactly max_seqs * (K + 1) rows; padding
+    # it to 384 runs every layer on 25% padding rows.
+    verify_rows = scenario.max_seqs * (scenario.dspark_tokens + 1)
     # Target and context-KV buckets; draft queries derive their own ladder
     # from request buckets and the draft block size.
     prefill = os.environ.get("DSV41_PREFILL_COMPILE_SIZES", "128,2048")
@@ -188,7 +188,7 @@ def main() -> None:
         TP="1",
         DP=str(scenario.dp_size),
         CHUNK=str(scenario.chunk_tokens),
-        MAX_SEQS=str(scenario.local_concurrency),
+        MAX_SEQS=str(scenario.max_seqs),
     )
     if decode:
         env["MAX_MODEL_LEN"] = str(scenario.prefix_tokens + scenario.output_tokens)
