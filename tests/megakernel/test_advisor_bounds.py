@@ -2863,3 +2863,358 @@ def test_per_op_achievable_prices_operator_kernel_boundaries() -> None:
         per_op_scope.step_achievable_us - per_op_scope.step_bound_us
         == pytest.approx(extra_boundaries * per_boundary_us, abs=rounding_tol_us)
     )
+
+
+def compute_expected_kimi_k3_decode_comm_us(
+    kimi_profile: models.ModelProfile,
+    chip_spec: advisor.ChipSpec,
+    active_tokens: int,
+) -> float:
+    """Derive Kimi-K3 TP32 x EP32 x DCP32 decode whole_step collective floor."""
+    tp_size = 32
+    routed_group_size = 8
+    dcp_group_size = 32
+    declared_all_reduces = 94
+    calls_per_layer = constants.DEFAULT_DECLARED_CALLS_PER_LAYER
+    lat_s = chip_spec.collective_latency_s
+    link_bw = chip_spec.ici_link_bw_bytes_per_s
+    # Single-slice TP=32 ring: round(log2(tp_size)) = 5 hops per all-reduce.
+    residual_bytes = active_tokens * kimi_profile.hidden_size * constants.BF16_BYTES
+    ar_xfer_s = 2.0 * ((tp_size - 1) / tp_size) * residual_bytes / link_bw
+    ar_hops = round(math.log2(tp_size))
+    ar_total_s = declared_all_reduces * (ar_xfer_s + ar_hops * lat_s)
+    # 92 MoE layers: group-8 routed dispatch + combine over intra-group TP=32//8=4.
+    tp_in_group = tp_size // routed_group_size
+    routed_hidden = kimi_profile.routed_expert_hidden_size or kimi_profile.hidden_size
+    routed_fanout = min(kimi_profile.top_k, routed_group_size)
+    routed_wire_bytes = (
+        kimi_profile.num_moe_layers
+        * 2.0
+        * ((routed_group_size - 1) / routed_group_size)
+        * active_tokens
+        * routed_fanout
+        * routed_hidden
+        * constants.BF16_BYTES
+        / tp_in_group
+    )
+    routed_hops = (
+        kimi_profile.num_moe_layers
+        * calls_per_layer
+        * round(math.log2(routed_group_size))
+    )
+    # 24 MLA full-attention layers: group-32 query gather + FP32 output/LSE combine.
+    local_heads = kimi_profile.num_attention_heads // tp_size
+    q_head_dim = kimi_profile.qk_nope_head_dim + kimi_profile.qk_rope_head_dim
+    dcp_bytes_per_head = constants.BF16_BYTES * q_head_dim + constants.FP32_BYTES * (
+        kimi_profile.head_dim + constants.LSE_SCALARS_PER_HEAD
+    )
+    dcp_wire_bytes = (
+        kimi_profile.num_attention_layers
+        * (dcp_group_size - 1)
+        * active_tokens
+        * local_heads
+        * dcp_bytes_per_head
+    )
+    dcp_hops = (
+        kimi_profile.num_attention_layers
+        * calls_per_layer
+        * round(math.log2(dcp_group_size))
+    )
+    total_comm_s = (
+        ar_total_s
+        + (routed_wire_bytes + dcp_wire_bytes) / link_bw
+        + (routed_hops + dcp_hops) * lat_s
+    )
+    return round(total_comm_s * 1e6, 2)
+
+
+def test_declared_collective_steps_price_kimi_k3_and_qwen35_floors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify declared collective floor math on Kimi-K3 decode and Qwen3.5 verify."""
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    kimi_profile = advisor.resolve_model_profile("kimi-k3")
+    kimi_batch = 4
+    kimi_workload = advisor.WorkloadSpec(
+        phase="decode",
+        batch=kimi_batch,
+        context=4096,
+        osl=1,
+        tp=32,
+        ep=32,
+        dcp=32,
+    )
+    kimi_report = advisor.advise(kimi_profile, kimi_workload, chip_spec)
+    kimi_whole_step = next(
+        scope for scope in kimi_report.scopes if scope.scope == "whole_step"
+    )
+    expected_kimi_comm_floor_us = compute_expected_kimi_k3_decode_comm_us(
+        kimi_profile, chip_spec, kimi_batch
+    )
+    rounding_tol_us = 0.05
+    kimi_preset_check = advisor.DEPLOYMENT_PRESETS["kimi-k3"]
+    assert kimi_preset_check.decode is not None
+    assert advisor.declared_collectives(kimi_preset_check.decode.megakernel) is not None
+    assert kimi_whole_step.comm_us == pytest.approx(
+        expected_kimi_comm_floor_us, abs=rounding_tol_us
+    )
+    assert kimi_whole_step.support == "declared"
+
+    pcp_mismatch_workload = dataclasses.replace(kimi_workload, pcp=2)
+    assert (
+        support.find_declaration("kimi-k3", "whole_step", 32, pcp_mismatch_workload)
+        is None
+    )
+    pcp_mismatch_report = advisor.advise(kimi_profile, pcp_mismatch_workload, chip_spec)
+    pcp_mismatch_whole_step = next(
+        scope for scope in pcp_mismatch_report.scopes if scope.scope == "whole_step"
+    )
+    assert "layout_not_declared" in pcp_mismatch_whole_step.blockers
+
+    qwen_profile = advisor.resolve_model_profile("qwen3.5-397b")
+    qwen_verify_workload = advisor.WorkloadSpec(
+        phase="verify",
+        batch=4,
+        spec_tokens=3,
+        context=4096,
+        tp=8,
+        ep=8,
+        dcp=4,
+    )
+    qwen_with_split_kv = advisor.advise(qwen_profile, qwen_verify_workload, chip_spec)
+    whole_step_with_split = next(
+        scope for scope in qwen_with_split_kv.scopes if scope.scope == "whole_step"
+    )
+
+    qwen_preset = advisor.DEPLOYMENT_PRESETS["qwen3.5-397b"]
+    assert qwen_preset.decode is not None
+    assert qwen_preset.decode.megakernel is not None
+    no_step_mk = dict(qwen_preset.decode.megakernel)
+    no_step_mk["collectives"] = {"steps": []}
+    monkeypatch.setitem(
+        advisor.DEPLOYMENT_PRESETS,
+        "qwen3.5-397b",
+        dataclasses.replace(
+            qwen_preset,
+            decode=dataclasses.replace(qwen_preset.decode, megakernel=no_step_mk),
+        ),
+    )
+    qwen_without_split_kv = advisor.advise(
+        qwen_profile, qwen_verify_workload, chip_spec
+    )
+    whole_step_without_split = next(
+        scope for scope in qwen_without_split_kv.scopes if scope.scope == "whole_step"
+    )
+    verify_rows = qwen_verify_workload.batch * (qwen_verify_workload.spec_tokens + 1)
+    split_kv_group_size = 4
+    split_kv_hops_per_call = 2
+    local_qwen_heads = qwen_profile.num_attention_heads // qwen_verify_workload.tp
+    split_kv_wire_bytes = (
+        qwen_profile.num_attention_layers
+        * (split_kv_group_size - 1)
+        * verify_rows
+        * local_qwen_heads
+        * qwen_profile.head_dim
+        * (constants.BF16_BYTES + constants.FP32_BYTES)
+    )
+    split_kv_hop_count = (
+        qwen_profile.num_attention_layers
+        * constants.DEFAULT_DECLARED_CALLS_PER_LAYER
+        * split_kv_hops_per_call
+    )
+    expected_split_kv_floor_us = (
+        split_kv_wire_bytes / chip_spec.ici_link_bw_bytes_per_s
+        + split_kv_hop_count * chip_spec.collective_latency_s
+    ) * 1e6
+    assert (
+        whole_step_with_split.comm_us - whole_step_without_split.comm_us
+        == pytest.approx(expected_split_kv_floor_us, abs=rounding_tol_us)
+    )
+    # Non-power-of-two DCP must return invalid_config without raising inside advise().
+    non_pow2_dcp_report = advisor.advise(
+        qwen_profile,
+        advisor.WorkloadSpec(phase="decode", batch=4, tp=6, dcp=3),
+        chip_spec,
+    )
+    assert non_pow2_dcp_report.verdict.startswith("invalid_config(")
+
+
+def test_row_threshold_expert_mode_switches_tp_below_and_ep_above_limit() -> None:
+    """Verify Qwen3.5-397B switches expert_mode from tp (<=12) to ep (>12)."""
+    for batch_size, expected_mode in ((1, "tp"), (3, "tp"), (4, "ep"), (8, "ep")):
+        workload = advisor.WorkloadSpec(
+            phase="verify",
+            batch=batch_size,
+            spec_tokens=3,
+            context=4096,
+            tp=8,
+            ep=8,
+            dcp=4,
+        )
+        report = advisor.advise("qwen3.5-397b", workload, "tpu7x")
+        whole_step_scope = next(
+            scope for scope in report.scopes if scope.scope == "whole_step"
+        )
+        per_op_scope = next(scope for scope in report.scopes if scope.scope == "per_op")
+        assert whole_step_scope.expert_mode == expected_mode
+        assert per_op_scope.expert_mode == "ep"
+
+
+def test_host_head_defaults_zero_and_computes_break_even_delta() -> None:
+    """Verify default 0 host head, single-add split behavior, and break-even delta."""
+    whole_step_device_us = 14250.0
+    per_op_device_us = 12800.0
+    # Break-even host-head delta equals max(0, fused_device_us - per_op_device_us).
+    expected_synthetic_delta_us = whole_step_device_us - per_op_device_us
+    assert (
+        roofline.compute_break_even_host_head_delta_us(
+            whole_step_device_us, per_op_device_us
+        )
+        == expected_synthetic_delta_us
+    )
+
+    # 56 verify requests * 4 tokens/req = 224 rows -> 2 calls of 112 rows on Qwen3.5.
+    split_workload = advisor.WorkloadSpec(
+        phase="verify",
+        batch=56,
+        spec_tokens=3,
+        context=4096,
+        tp=8,
+        ep=8,
+        dcp=4,
+        dispatch_regime="zero_floor",
+    )
+    default_report = advisor.advise("qwen3.5-397b", split_workload, "tpu7x")
+    per_op_default = next(
+        scope for scope in default_report.scopes if scope.scope == "per_op"
+    )
+    whole_step_default = next(
+        scope for scope in default_report.scopes if scope.scope == "whole_step"
+    )
+    assert per_op_default.host_head_us == 0.0
+    assert whole_step_default.host_head_us == 0.0
+    assert per_op_default.break_even_host_head_delta_us == 0.0
+    assert whole_step_default.step_bound_us > per_op_default.step_bound_us
+    break_even_delta_us = whole_step_default.break_even_host_head_delta_us
+    rounding_tol_us = 0.02
+    assert break_even_delta_us == pytest.approx(
+        whole_step_default.step_bound_us - per_op_default.step_bound_us,
+        abs=rounding_tol_us,
+    )
+
+    fused_head_us = 550.0
+    per_op_head_us = fused_head_us + break_even_delta_us
+    equalized_workload = dataclasses.replace(
+        split_workload,
+        host_head_per_op_us=per_op_head_us,
+        host_head_fused_us=fused_head_us,
+        host_head_explicit=True,
+    )
+    equalized_report = advisor.advise("qwen3.5-397b", equalized_workload, "tpu7x")
+    per_op_eq = next(
+        scope for scope in equalized_report.scopes if scope.scope == "per_op"
+    )
+    whole_step_eq = next(
+        scope for scope in equalized_report.scopes if scope.scope == "whole_step"
+    )
+    # Host head adds once per step even when whole_step splits across 2 calls.
+    assert whole_step_eq.host_head_us == pytest.approx(fused_head_us, abs=1e-6)
+    assert whole_step_eq.step_bound_us == pytest.approx(
+        whole_step_default.step_bound_us + fused_head_us,
+        abs=rounding_tol_us,
+    )
+    assert whole_step_eq.step_bound_us == pytest.approx(
+        per_op_eq.step_bound_us,
+        abs=rounding_tol_us,
+    )
+    assert whole_step_eq.roof_floor_us == whole_step_default.roof_floor_us
+    assert whole_step_eq.step_floor_strict_us == whole_step_default.step_floor_strict_us
+    assert (
+        equalized_report.metrics["compiler_proof_gain_us"]["value"]
+        == default_report.metrics["compiler_proof_gain_us"]["value"]
+    )
+    host_head_metric = equalized_report.metrics["host_head_us"]
+    host_head_band = host_head_metric["band"]
+    assert host_head_band[0] <= float(host_head_metric["value"]) <= host_head_band[1]
+
+
+def test_measured_per_op_step_and_coverage_set_whole_server_gain_basis() -> None:
+    """Verify gain_basis requires per_op_step_us and step_coverage to be MEASURED."""
+    base_workload = advisor.WorkloadSpec(
+        phase="decode",
+        batch=4,
+        context=4096,
+        tp=8,
+        ep=8,
+        dcp=4,
+    )
+    uncalibrated_report = advisor.advise("qwen3.5-397b", base_workload, "tpu7x")
+    assert uncalibrated_report.gain_basis == constants.GAIN_BASIS_ESTIMATE
+    assert (
+        uncalibrated_report.metrics["gain_basis"]["value"]
+        == constants.GAIN_BASIS_ESTIMATE
+    )
+    assert uncalibrated_report.metrics["per_op_step_us"]["tag"] == "ASSUMED"
+
+    scope_affecting = {
+        str(item["name"])
+        for item in uncalibrated_report.unresolved_assumptions
+        if item["affects"] == "scope"
+    }
+    assert scope_affecting <= set(constants.CORNER_AXES.keys())
+    unresolved_names = {
+        str(item["name"]) for item in uncalibrated_report.unresolved_assumptions
+    }
+    for expected_name in (
+        "per_op_step_us",
+        "step_coverage",
+        "host_head_us",
+        "eta_hbm",
+        "eta_dense",
+        "decoding_sequences",
+    ):
+        assert expected_name in unresolved_names
+    for item in uncalibrated_report.unresolved_assumptions:
+        for required_key in (
+            "name",
+            "value",
+            "band",
+            "unit",
+            "sensitivity_us",
+            "affects",
+            "how_to_settle",
+        ):
+            assert required_key in item
+
+    only_step_workload = dataclasses.replace(base_workload, per_op_step_us=9500.0)
+    only_step_report = advisor.advise("qwen3.5-397b", only_step_workload, "tpu7x")
+    assert only_step_report.gain_basis == constants.GAIN_BASIS_ESTIMATE
+    assert only_step_report.metrics["per_op_step_us"]["tag"] == "MEASURED"
+
+    calibrated_measurements = {
+        "schema": "advisor.measurements.v1",
+        "source": {
+            "kind": "xprof_xplane",
+            "file": "baseline_trace.xplane.pb",
+            "image": "vllm-tpu:baseline-v1",
+            "scope": "per_op",
+        },
+        "step_time_us": {"p50": 9500.0},
+        "step_coverage": {"fused_eligible_fraction": 0.85},
+        "host_head_us": {"p50": 4800.0, "p90": 5100.0, "n": 12},
+    }
+    calibrated_report = advisor.advise(
+        "qwen3.5-397b",
+        base_workload,
+        "tpu7x",
+        measurements=calibrated_measurements,
+    )
+    assert calibrated_report.gain_basis == constants.GAIN_BASIS_E2E
+    assert calibrated_report.metrics["gain_basis"]["value"] == constants.GAIN_BASIS_E2E
+    assert calibrated_report.metrics["per_op_step_us"]["tag"] == "MEASURED"
+    assert (
+        "vllm-tpu:baseline-v1" in calibrated_report.metrics["per_op_step_us"]["source"]
+    )
+    assert calibrated_report.metrics["calibrated_host_head_us"][
+        "value"
+    ] == pytest.approx(4800.0)
