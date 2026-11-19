@@ -641,7 +641,7 @@ class Eagle3Proposer:
 
         assert self.draft_model is not None
         K = self.speculative_config.num_speculative_tokens
-        def build(prefix: str) -> torch.nn.Module:
+        def build(prefix: str, tokens: int) -> torch.nn.Module:
             # Its own compilation config: vLLM's backend records its pre-grad
             # pass in the inductor config, and a module whose backend starts
             # from a config another compile already marked fails
@@ -653,6 +653,13 @@ class Eagle3Proposer:
                 for k, v in cc.inductor_compile_config.items()
                 if k != "pre_grad_custom_pass"
             }
+            # Only its own token bucket: the forward slices
+            # decode_rows_count(T) rows, so the traced graph guards on T
+            # (16 * ceil(T / 64) vs T) and cannot serve other compile sizes
+            # (ShapeSpecializationError, then the retry trips the backend's
+            # pre-grad assert). No open range either.
+            cc.compile_sizes = [tokens]
+            cc.compile_ranges_endpoints = []
             cfg.compilation_config = cc
             with (
                 set_model_tag("eagle_head"),
@@ -670,9 +677,9 @@ class Eagle3Proposer:
                 )
 
         self._decode_rows_build = build
-        # Marks the lever on; the per-bucket programs come from
-        # _decode_rows_model_for.
-        self._decode_rows_model = build(f"mtp_step0_decode_rows_k{K}")
+        # Marks the lever on; the per-bucket programs are built on first use
+        # by _decode_rows_model_for.
+        self._decode_rows_model = build
         logger.info(
             "MTP draft step 0 of a step with at most %d * ceil(T / %d) "
             "requests evaluates that many rows.",
@@ -691,17 +698,14 @@ class Eagle3Proposer:
         return int(min(caps))
 
     def _decode_rows_model_for(self, tokens: int) -> torch.nn.Module:
-        """The decode-rows step-0 program of the ``tokens`` bucket (built on
-        first use; the first bucket reuses the module built at load)."""
+        """The decode-rows step-0 program of the ``tokens`` bucket, compiled
+        for that bucket only (built on first use)."""
         model = self._decode_rows_models.get(tokens)
         if model is None:
-            if not self._decode_rows_models and self._decode_rows_model is not None:
-                model = self._decode_rows_model
-            else:
-                K = self.speculative_config.num_speculative_tokens
-                model = self._decode_rows_build(
-                    f"mtp_step0_decode_rows_k{K}_t{tokens}"
-                )
+            K = self.speculative_config.num_speculative_tokens
+            model = self._decode_rows_build(
+                f"mtp_step0_decode_rows_k{K}_t{tokens}", tokens
+            )
             self._decode_rows_models[tokens] = model
         return model
 

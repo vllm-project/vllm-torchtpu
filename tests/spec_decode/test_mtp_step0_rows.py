@@ -110,7 +110,7 @@ def _proposer(capacity=128, decode=True):
     proposer._draft_rows = True
     proposer._decode_rows_model = object() if decode else None
     proposer._decode_rows_models = {}
-    proposer._decode_rows_build = lambda prefix: object()
+    proposer._decode_rows_build = lambda prefix, tokens: object()
     proposer._decode_rows_warm = set()
     proposer._draft_step0_warm = False
     proposer._draft_rows_len = lambda chunk: capacity
@@ -143,8 +143,8 @@ def _step0(proposer, tokens, num_reqs):
 
 def test_decode_step_runs_decode_rows_after_compiling_both():
     proposer, calls = _proposer()
-    decode = proposer._decode_rows_model
     _step0(proposer, 256, 64)
+    decode = proposer._decode_rows_models[256]
     # First call: the capacity-row program once, the decode program twice.
     assert calls == [(None, 128, False), (decode, 256, True), (decode, 256, True)]
     calls.clear()
@@ -277,12 +277,17 @@ def test_decode_rows_programs_get_their_own_compile_config(monkeypatch):
     proposer.draft_model = types.SimpleNamespace(_dynamic_arg_dims={"input_ids": 0})
     proposer.runner.mesh = None
     shared_icc = {"pre_grad_custom_pass": object(), "_vllm_model_tag": "eagle_head"}
-    shared_cc = types.SimpleNamespace(inductor_compile_config=shared_icc)
+    shared_cc = types.SimpleNamespace(
+        inductor_compile_config=shared_icc, compile_sizes=[16, 48, 128, 256],
+        compile_ranges_endpoints=[8192],
+    )
     proposer.draft_vllm_config = types.SimpleNamespace(compilation_config=shared_cc)
     proposer._build_step0_programs()
     proposer._decode_rows_model_for(256)
     proposer._decode_rows_model_for(128)
     assert len(seen) == 2
+    assert [cfg.compilation_config.compile_sizes for _, cfg in seen] == [[256], [128]]
+    assert all(cfg.compilation_config.compile_ranges_endpoints == [] for _, cfg in seen)
     for _, cfg in seen:
         icc = cfg.compilation_config.inductor_compile_config
         assert "pre_grad_custom_pass" not in icc
@@ -290,3 +295,4 @@ def test_decode_rows_programs_get_their_own_compile_config(monkeypatch):
         assert cfg.compilation_config is not shared_cc
     # The shared config is left as it was.
     assert "pre_grad_custom_pass" in shared_icc
+    assert shared_cc.compile_sizes == [16, 48, 128, 256]
