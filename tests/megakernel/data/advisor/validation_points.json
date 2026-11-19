@@ -192,27 +192,6 @@
       }
     },
     {
-      "id": "qwen38_2_4t_tp32_dcp8_mk_b64",
-      "model": "qwen3.8-2.4t",
-      "chip": "tpu7x",
-      "scope": "whole_step",
-      "fixture_step_us": 17000.0,
-      "measured_spread_us": 200.0,
-      "provenance_kind": "synthetic_envelope_fixture",
-      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer whole-step decode at batch 64 synthetic envelope fixture",
-      "workload": {
-        "phase": "decode",
-        "batch": 64,
-        "isl": 1024,
-        "osl": 1024,
-        "context": 1536,
-        "tp": 32,
-        "ep": 32,
-        "dcp": 8,
-        "moe_mode": "grouped_on_chip"
-      }
-    },
-    {
       "id": "qwen38_2_4t_tp32_dcp8_mk_b256",
       "model": "qwen3.8-2.4t",
       "chip": "tpu7x",
