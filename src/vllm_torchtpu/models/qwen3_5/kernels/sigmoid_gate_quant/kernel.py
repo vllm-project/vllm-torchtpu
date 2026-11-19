@@ -44,7 +44,7 @@ def select_vreg_step(cols: int) -> int:
 
 
 def select_tile(rows: int, cols: int) -> int:
-    """Select multiple-of-8 VMEM BlockSpec tile cap for [rows, cols] gate + quant.
+    """Select a multiple-of-32 VMEM BlockSpec tile cap for [rows, cols] gate + quant.
 
     For decode/verify batch sizes (rows <= 256), caps tile so grid >= 6 and
     double-buffered VMEM DMAs overlap with compute. For large prefill shapes

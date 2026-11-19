@@ -2041,7 +2041,7 @@ def test_forward_hands_prequant_rows_to_the_methods_that_take_them(
             )
         }
     projs["in_proj_ba"] = _Proj(
-        None, _PrequantMethod(ba), bias=bias, skip_bias_add=True
+        None, _PrequantMethod(ba), bias=torch.randn(1), skip_bias_add=True
     )
     for name, proj in projs.items():
         setattr(attn, name, proj)

@@ -158,10 +158,12 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod, PrequantLinearMethod)
         x_s: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply unquantized linear to pre-quantized FP8 rows `(x_q, x_s)` by
-        contracting `x_q.to(weight.dtype) @ weight` first and scaling the
-        `[m, n_out]` result by `x_s`, avoiding materializing a full `[m, k]`
-        float32/bfloat16 dequantized activation buffer."""
+        """Apply unquantized linear to pre-quantized FP8 rows `(x_q, x_s)`:
+        contract `x_q.to(weight.dtype) @ weight`, then scale the `[m, n_out]`
+        result by `x_s` in float32. The cast rows are an `[m, k]` buffer in
+        the weight's dtype unless XLA fuses the cast into the matmul; no
+        float32 dequantized rows are built. The product is rounded to the
+        weight's dtype before the scale and again after it."""
         layer = cast("TpuLinear", layer)
         weight = layer.weight
         x_cast = x_q.to(weight.dtype)
