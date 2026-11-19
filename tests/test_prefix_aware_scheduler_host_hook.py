@@ -43,6 +43,11 @@ def _scheduler(monkeypatch, events, kv_consumer):
     s.running = []
     s.waiting = []
     s.kv_holding_waiting = []
+    # The tpu_scheduler options schedule() reads: KV prefetch off (no count,
+    # no cap), the warmest-first promotion on (its default).
+    s._kv_prefetch_n = 0
+    s._kv_prefetch_cap = None
+    s._promote_warmest_switch = True
     # Off a decode leg: the warmest-first promotion.
     s._promote_warmest = lambda queue: None
     # On a decode leg: the queue selection and the step telemetry, with the
