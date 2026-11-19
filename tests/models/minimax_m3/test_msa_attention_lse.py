@@ -374,7 +374,14 @@ def test_lse_wide_groups(block_q, pages_per_step, dtype, monkeypatch):
 
 @pytest.mark.parametrize(
     "block_q,pages_per_step,q_per_kv,num_tokens",
-    [(8, 32, 16, 64), (8, 64, 16, 64), (8, 64, 8, 64), (8, 64, 8, 48)],
+    [
+        (8, 32, 16, 64),
+        (8, 64, 16, 64),
+        (8, 64, 8, 64),
+        (8, 64, 8, 48),
+        (32, 32, 16, 64),
+        (16, 32, 16, 64),
+    ],
 )
 def test_fp4_lse_wide_groups(
     block_q, pages_per_step, q_per_kv, num_tokens, monkeypatch
@@ -455,6 +462,52 @@ def test_decode_tiles_read_unwritten_slots_through_the_write(pages_per_step):
         interpret=True,
     )
     assert np.isfinite(np.asarray(got[0].astype(jnp.float32))).all()
+    want = _reference(
+        np.asarray(q.astype(jnp.float32)),
+        kv_rows,
+        keys[:, 0],
+        local_key,
+        local_limit,
+        table,
+        0,
+    )
+    _check(got, want)
+
+
+@pytest.mark.parametrize("fp4", [False, True])
+@pytest.mark.parametrize("max_union", [0.0, 1e9])  # regular / wide tiles taken
+def test_adaptive_tiles_match_reference(fp4, max_union, monkeypatch):
+    """Prefill-size calls past `WIDE_TILE_MIN_TOKENS` tokens: the wide-tile
+    branch (64-token tiles, `attend_t`) and the regular one give the
+    reference, with tokens padded to whole wide tiles and several calls."""
+    monkeypatch.setattr(msa_attention_lse, "WIDE_TILE_MIN_TOKENS", 64)
+    monkeypatch.setattr(
+        msa_attention_lse, "_WIDE_TILE_MAX_RATIO", {"fp4": max_union, "8bit": max_union}
+    )
+    monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", 128)
+    num_tokens = 150
+    rng = np.random.default_rng(23 + fp4)
+    dtype = jnp.float8_e4m3fn
+    q, kv_rows, kv, table, keys, local_key, local_limit = _inputs(
+        rng, num_tokens, num_tokens - 4, 1, dtype
+    )
+    extra = {}
+    if fp4:
+        kv, scales, kv_rows = _fp4_cache(rng, 1)
+        extra = dict(scale_cache=jnp.asarray(scales))
+    got = msa_sparse_attention_lse(
+        q,
+        kv,
+        jnp.asarray(keys[:, 0]),
+        jnp.asarray(local_key),
+        jnp.asarray(local_limit),
+        jnp.asarray(table),
+        sm_scale=SCALE,
+        block_q=8 if fp4 else 32,
+        pages_per_step=32,
+        interpret=True,
+        **extra,
+    )
     want = _reference(
         np.asarray(q.astype(jnp.float32)),
         kv_rows,

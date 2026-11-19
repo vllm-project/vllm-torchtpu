@@ -79,6 +79,9 @@ _LIMIT_TABLE_MIN_TOKENS = msa_attention.SMALL_BATCH_TOKENS
 # group's pages instead of a compare and a lane reduction per page (13 % of
 # a c64 decode call, kernel bench j-0a524278), then the same spread matmul.
 KERNEL_LIMITS = True
+# 4-bit tiles of 16+ tokens run `attend_t` with the K / V scales folded into
+# their bf16 rows, as the 8/16-bit caches do.
+FP4_TRANSPOSED = True
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -383,7 +386,7 @@ def _kernel(
             mxu_mask = MXU_MASK and MAX_FREE and block_q <= head_dim
             row_slots = (
                 jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
-                if packing == 4
+                if packing == 4 or fp4
                 else msa_attention._bitcast_slots(rows_per_page, packing)
             )  # [S, 1]
             sel_t = selected_ref[...].T  # [K, Bq]
@@ -396,7 +399,24 @@ def _kernel(
                 limit = jnp.where(local_page == page, local_limit, page_size)
                 limit = jnp.where(page >= 0, limit * hit, 0)  # [1, Bq]
                 seen = jnp.max(limit)
-                if packing == 4 and mxu_mask:  # an additive mask needs finite keys
+                if fp4:
+                    # Each key's scale (with the score scale) and each value's
+                    # fold into their bf16 rows: a scale column per page, not a
+                    # multiply per score. int4 rows and the sanitized scales are
+                    # finite, so masked keys and values meet p = 0 harmlessly.
+                    if fp4_rows == "head":
+                        k_row = 2 * head_ref[0]
+                        v_row = k_row + 1
+                    else:
+                        k_row, v_row = fp4_rows
+                    rows, sk, sv = msa_attention._fp4_page(
+                        kv_ref, scale_buf_ref.at[half, g], k_row, v_row
+                    )
+                    k_col = (sk * (sm_scale * _LOG2_E)).reshape(page_size, 1)
+                    v_col = sv.reshape(page_size, 1)
+                    values.append((rows[:, head_dim:] * v_col).astype(jnp.bfloat16))
+                    rows = (rows[:, :head_dim] * k_col).astype(jnp.bfloat16)
+                elif packing == 4 and mxu_mask:  # an additive mask needs finite keys
                     rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
                     rows = jnp.where(row_slots < seen, rows, 0)
                     values.append(rows[:, head_dim:])
@@ -423,7 +443,8 @@ def _kernel(
             k = jnp.concatenate(keys, axis=0)
             v = jnp.concatenate(values, axis=0)
             q = q_ref[...].reshape(num_heads * block_q, head_dim)
-            q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
+            if not fp4:  # 4-bit keys carry the scale
+                q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
             if mxu_mask:  # [q | onehot(token)]
                 shape = (num_heads * block_q, head_dim)
                 row = jax.lax.broadcasted_iota(jnp.int32, shape, 0)
@@ -732,17 +753,19 @@ def _attention_call(
     aliased = out is not None
     in_place = (pl.BlockSpec(memory_space=pl.ANY),) * 2 if aliased else ()
     fp4 = scale_rows is not None
-    transposed = not fp4 and block_q >= msa_attention.DEFAULT_BLOCK_Q
+    transposed = (
+        not fp4 or FP4_TRANSPOSED
+    ) and block_q >= msa_attention.DEFAULT_BLOCK_Q
     scale_inputs = (scale_cache,) if fp4 else ()
     limited = bool(limits)
-    if limited and (calls > 1 or not fp4):
+    if limited and (calls > 1 or not fp4 or transposed):
         raise ValueError("page-limit tables serve one 4-bit call per grid")
     limit_specs = [
         pl.BlockSpec((tiles_per_step,) + x.shape[1:], lambda b, *_: (b, 0, 0, 0))
         for x in limits
     ]
     page_size = msa_attention.page_tokens(kv_cache)
-    kernel_limits = KERNEL_LIMITS and fp4 and not limited
+    kernel_limits = KERNEL_LIMITS and fp4 and not limited and not transposed
     spread = (
         [pltpu.VMEM((pages_per_step, pages_per_step * page_size), jnp.bfloat16)]
         if limited or kernel_limits
@@ -1248,30 +1271,17 @@ def _chunked_call(
         scale_cache=scale_cache,
         scale_rows=scale_rows,
     )
-    limit = msa_attention.MAX_TOKENS_PER_CALL
-    step = min(num_tokens, max(block_q, limit - limit % block_q))
-    num_chunks = -(-num_tokens // step)
-    pad = num_chunks * step - num_tokens
+    step, num_chunks, pad, selected, (packed, tiles_per_step) = _chunk_work(
+        selected, num_q_heads, q.dtype, block_q, pages_per_step
+    )
     q = jnp.pad(q, ((0, 0), (0, pad), (0, 0)))
-    selected = jnp.pad(
-        selected, ((0, pad), (0, 0), (0, 0)), constant_values=-1
-    ).transpose(1, 0, 2)
     local_page = jnp.pad(local_page, (0, pad), constant_values=-1)[:, None]
     local_limit = jnp.pad(local_limit, (0, pad))[:, None]
-
-    # Every call's work list in one batched pass ahead of the loop: built
-    # per call inside it, each call paid its own two union sorts and glue
-    # (~9 us per call, x G x 4 calls per layer).
-    packed, tiles_per_step = _packed_work(
-        selected.reshape(num_heads * num_chunks, step, selected.shape[2]),
-        block_q,
-        pages_per_step,
-        align=_merged_store_rows(block_q, num_q_heads // num_heads, q.dtype),
-    )
     limits = None
     if (
         LIMIT_TABLE
         and scale_rows is not None
+        and not (FP4_TRANSPOSED and block_q >= msa_attention.DEFAULT_BLOCK_Q)
         and step >= _LIMIT_TABLE_MIN_TOKENS
         and not (num_chunks == 1 and num_heads > 1)
     ):  # 4-bit prefill-size calls, one per grid
@@ -1338,6 +1348,158 @@ def _chunked_call(
     lse = lse.reshape(num_blocks, num_tiles, -1, block_q).transpose(1, 3, 0, 2)
     lse = lse.reshape(num_tiles * block_q, num_q_heads)
     return out.transpose(1, 0, 2)[:num_tokens], lse[:num_tokens]
+
+
+def _chunk_work(selected, num_q_heads, dtype, block_q, pages_per_step):
+    """`_chunked_call`'s calls over ``selected [T, G, K]``: ``(step,
+    chunks, pad, selected [G, chunks * step, K], (packed, tiles_per_step))``
+    with every call's work list built in one batched pass ahead of the loop
+    (built per call inside it, each call paid its own two union sorts and
+    glue: ~9 us per call, x G x 4 calls per layer)."""
+    num_tokens, num_heads, topk = selected.shape
+    limit = msa_attention.MAX_TOKENS_PER_CALL
+    step = min(num_tokens, max(block_q, limit - limit % block_q))
+    num_chunks = -(-num_tokens // step)
+    pad = num_chunks * step - num_tokens
+    selected = jnp.pad(
+        selected, ((0, pad), (0, 0), (0, 0)), constant_values=-1
+    ).transpose(1, 0, 2)
+    packed = _packed_work(
+        selected.reshape(num_heads * num_chunks, step, topk),
+        block_q,
+        pages_per_step,
+        align=_merged_store_rows(block_q, num_q_heads // num_heads, dtype),
+    )
+    return step, num_chunks, pad, selected, packed
+
+
+def _union_ratio(selected, tile):
+    """A step's mean page union per `tile`-token tile over its mean pages per
+    token (``selected [T, G, K]`` page keys, -1 none, `T` a multiple of
+    `tile`), from each tile's bitmap of its keys modulo `_UNION_BITS`
+    (exact while a tile's keys span fewer: a request's blocks on a rank). A
+    few vector passes: no work list, no sort."""
+    num_tokens, num_heads, topk = selected.shape
+    keys = selected.transpose(1, 0, 2).reshape(num_heads, -1, tile * topk)
+    valid = keys >= 0
+    words = _UNION_BITS // 32
+    word = jax.lax.broadcasted_iota(jnp.int32, (1, 1, 1, words), 3)
+    bit = jnp.left_shift(jnp.uint32(1), (keys & 31).astype(jnp.uint32))
+    onehot = jnp.where(
+        valid[..., None] & ((keys[..., None] >> 5) % words == word),
+        bit[..., None],
+        jnp.uint32(0),
+    )
+    bitmap = jax.lax.reduce(onehot, jnp.uint32(0), jax.lax.bitwise_or, (2,))
+    union = jnp.sum(jax.lax.population_count(bitmap), axis=-1)  # [G, tiles]
+    tiles = jnp.maximum(jnp.sum(union > 0), 1)
+    per_token = jnp.sum(valid) / jnp.maximum(jnp.sum(jnp.any(selected >= 0, -1)), 1)
+    return jnp.sum(union) / tiles / jnp.maximum(per_token, 1)
+
+
+# Prefill-size calls (past `WIDE_TILE_MIN_TOKENS` tokens) of caches whose
+# tiles run `attend_t` may take `WIDE_BLOCK_Q`-token tiles: a tile's page
+# union and its per-page work then serve more rows, which pays while the
+# step's tokens choose much the same pages (served c48 selections look at
+# least that local). A step takes the wide tile when its mean union per
+# wide tile is at most `_WIDE_TILE_MAX_RATIO[kind]` times its tokens' mean
+# pages, under each kind's crossover in the kernel bench (synthetic
+# selections, 8192 tokens, j-9c5505d9): int4 8 -> 64-token tiles 0.98 ->
+# 0.50 ms at ratio ~1.7, 1.08 -> 0.81 at ~4, even at ~5.9 (c48 shape) and ~4.4
+# (c64 head-parallel shape); fp8 32 -> 64 0.60 -> 0.50 at ~1.6, even at ~3.3.
+WIDE_BLOCK_Q = 64
+WIDE_TILE_MIN_TOKENS = msa_attention.SMALL_BATCH_TOKENS
+_WIDE_TILE_MAX_RATIO = {"fp4": 4.0, "8bit": 3.0}  # 8bit: 8/16-bit pages
+# Bitmap width of `_union_ratio`: a rank's blocks of a 256K-token request
+# at DCP 2 (1,024 at 128-token pages; head-parallel calls see 2,048, where
+# far blocks alias, lowering the estimate only for very wide tiles).
+_UNION_BITS = 1024
+
+
+def _wide_tile_kind(scale_cache, head_dim):
+    """The `_WIDE_TILE_MAX_RATIO` key of a call's cache, or None where wide
+    tiles do not run `attend_t` with the MXU mask (which needs
+    ``WIDE_BLOCK_Q <= D``)."""
+    if not (MAX_FREE and MXU_MASK) or head_dim < WIDE_BLOCK_Q:
+        return None
+    if scale_cache is None:
+        return "8bit"
+    return "fp4" if FP4_TRANSPOSED else None
+
+
+def _adaptive_call(
+    q,
+    kv_cache,
+    selected,
+    local_page,
+    local_limit,
+    page_table,
+    head,
+    *,
+    block_q,
+    pages_per_step,
+    scale_cache,
+    head_major,
+    q_head_major,
+    **kwargs,
+):
+    """`_chunked_call` at `block_q` or, when the step's selections are local
+    enough (`_WIDE_TILE_MAX_RATIO`), at `WIDE_BLOCK_Q`; ``q`` etc. padded to
+    whole wide tiles. Both tile sizes give the same results up to the order
+    of the softmax sums."""
+    num_tokens = selected.shape[0]
+    kind = _wide_tile_kind(scale_cache, q.shape[2])
+    call = functools.partial(
+        _chunked_call,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        first_head=head,
+        pages_per_step=pages_per_step,
+        scale_cache=scale_cache,
+        head_major=head_major,
+        q_head_major=q_head_major,
+        **kwargs,
+    )
+    if kind is None or block_q >= WIDE_BLOCK_Q or num_tokens <= WIDE_TILE_MIN_TOKENS:
+        return call(
+            q,
+            selected=selected,
+            local_page=local_page,
+            local_limit=local_limit,
+            block_q=block_q,
+        )
+    q, selected, local_page, local_limit = _pad_tokens(
+        q, selected, local_page, local_limit, WIDE_BLOCK_Q, q_head_major
+    )
+    ratio = _union_ratio(selected, WIDE_BLOCK_Q)
+    operands = (q, selected, local_page, local_limit)
+
+    def wide(operands):
+        q, selected, local_page, local_limit = operands
+        return call(
+            q,
+            selected=selected,
+            local_page=local_page,
+            local_limit=local_limit,
+            block_q=WIDE_BLOCK_Q,
+        )
+
+    def regular(operands):
+        q, selected, local_page, local_limit = operands
+        return call(
+            q,
+            selected=selected,
+            local_page=local_page,
+            local_limit=local_limit,
+            block_q=block_q,
+        )
+
+    out, lse = jax.lax.cond(
+        ratio <= _WIDE_TILE_MAX_RATIO[kind], wide, regular, operands
+    )
+    if head_major:
+        return out[:, :num_tokens], lse[:, :num_tokens]
+    return out[:num_tokens], lse[:num_tokens]
 
 
 def _pad_tokens(q, selected, local_page, local_limit, block_q, q_head_major=False):
@@ -1416,7 +1578,7 @@ def msa_sparse_attention_lse(
     q, selected, local_page, local_limit = _pad_tokens(
         q, selected, local_page, local_limit, block_q, q_head_major
     )
-    out, lse = _chunked_call(
+    out, lse = _adaptive_call(
         q,
         kv_cache,
         selected[:, None],
@@ -1492,7 +1654,7 @@ def msa_sparse_attention_lse_heads(
     q, selected, local_page, local_limit = _pad_tokens(
         q, selected, local_page, local_limit, block_q, q_head_major
     )
-    out, lse = _chunked_call(
+    out, lse = _adaptive_call(
         q,
         kv_cache,
         selected,
