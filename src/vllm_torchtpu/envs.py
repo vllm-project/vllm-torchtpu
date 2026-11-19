@@ -154,6 +154,7 @@ if TYPE_CHECKING:
     TPU_HOST_TOKEN_PADDING_REUSE: bool = False
     TPU_HOST_SAMPLING_PARAMS_REUSE: bool = False
     TPU_HOST_SKIP_GUARD_EVAL_AFTER_STEPS: int = 0
+    TPU_HOST_KEEP_INPUT_MUTATIONS: int = 0
     TPU_DSPARK_MARKOV_KERNEL: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
@@ -1173,6 +1174,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # warm. 0 = off.
     "TPU_HOST_SKIP_GUARD_EVAL_AFTER_STEPS": env_nonnegative_int(
         "TPU_HOST_SKIP_GUARD_EVAL_AFTER_STEPS", 0
+    ),
+    # Keep compiled graphs' input mutations (kv/index cache writes) in the
+    # graph instead of AOTAutograd's eager copy_ epilogue (120 host copy_ per
+    # MiniMax forward). 1 = keep_inference_input_mutations; 2 = also donate
+    # the written placeholders to torch_tpu's StaticCompiler. 0 = off. Changes
+    # every compiled program (and the compile cache key).
+    "TPU_HOST_KEEP_INPUT_MUTATIONS": env_nonnegative_int(
+        "TPU_HOST_KEEP_INPUT_MUTATIONS", 0
     ),
     # Run the DSpark greedy Markov chain over the vocab-parallel draft logits
     # as one Pallas call (kernels/collectives/markov_argmax.py) instead of K

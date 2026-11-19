@@ -78,3 +78,72 @@ class GuardEvalSkipper:
             torch.compiler.set_stance("default", skip_guard_eval_unsafe=False)
             self.armed = False
             self._quiet = 0
+
+
+# --- TPU_HOST_KEEP_INPUT_MUTATIONS ------------------------------------------
+#
+# torch_tpu's backend runs AOTAutograd with keep_inference_input_mutations=False:
+# a compiled graph returns the new value of every input it writes (the MiniMax
+# forward writes 60 kv caches + 60 index caches), and AOT's runtime epilogue
+# then runs one eager `inp.copy_(new)` per written input on the host after the
+# executable returns (120 host copy_ dispatches per decode forward). With 1 the
+# copies stay in the graph as `aten.copy_(placeholder, new)`. With 2 those
+# placeholders are also passed to torch_tpu's StaticCompiler as donated inputs
+# (its make_fx in-place path), so the executable may update them in place.
+
+
+def mutated_placeholder_indices(gm: torch.fx.GraphModule) -> list[int]:
+    """Placeholder positions that the graph overwrites with `aten.copy_`."""
+    placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    index = {n: i for i, n in enumerate(placeholders)}
+    out = set()
+    for node in gm.graph.nodes:
+        if (
+            node.op == "call_function"
+            and node.target is torch.ops.aten.copy_.default
+            and node.args[0] in index
+        ):
+            out.add(index[node.args[0]])
+    return sorted(out)
+
+
+def keep_input_mutations_aot_autograd(aot_autograd_fn):
+    """Wraps `aot_autograd(**kwargs)` to keep inference input mutations."""
+
+    def aot_autograd_keep(**kwargs):
+        kwargs["keep_inference_input_mutations"] = True
+        return aot_autograd_fn(**kwargs)
+
+    aot_autograd_keep._tpu_keep_input_mutations = True
+    return aot_autograd_keep
+
+
+def install_keep_input_mutations(mode: int | None = None) -> None:
+    """Patch torch_tpu's TpuBackend per TPU_HOST_KEEP_INPUT_MUTATIONS."""
+    if mode is None:
+        from vllm_torchtpu import envs
+
+        mode = int(envs.TPU_HOST_KEEP_INPUT_MUTATIONS)
+    if mode <= 0:
+        return
+    from torch_tpu._internal.compile import _backend, compiler
+
+    if not getattr(_backend.aot_autograd, "_tpu_keep_input_mutations", False):
+        _backend.aot_autograd = keep_input_mutations_aot_autograd(
+            _backend.aot_autograd
+        )
+    if mode >= 2 and not getattr(
+        compiler.StaticCompiler.__call__, "_tpu_donate_mutated", False
+    ):
+        original_call = compiler.StaticCompiler.__call__
+
+        def call_donating(self, graph_module, example_inputs, *args, **kwargs):
+            if kwargs.get("donated_inputs") is None and len(args) < 5:
+                donated = mutated_placeholder_indices(graph_module)
+                if donated:
+                    kwargs["donated_inputs"] = donated
+            return original_call(self, graph_module, example_inputs, *args, **kwargs)
+
+        call_donating._tpu_donate_mutated = True
+        compiler.StaticCompiler.__call__ = call_donating
+    logger.info("TPU_HOST_KEEP_INPUT_MUTATIONS=%d: TpuBackend patched.", mode)

@@ -281,3 +281,170 @@ def test_guard_skipper_keeps_compiled_outputs(restore_stance):
 def test_runner_ticks_guard_skipper_only_when_pending():
     src = inspect.getsource(inspect.unwrap(TPUModelRunner.execute_model))
     assert "if self._guard_eval_skipper.pending:" in src
+
+
+# --- keep input mutations ---------------------------------------------------
+
+from torch._dynamo.backends.common import aot_autograd  # noqa: E402
+
+
+@torch.library.custom_op("host_path_test::cache_write", mutates_args=())
+def _cache_write(
+    q: torch.Tensor, cache: torch.Tensor, slots: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Functional stand-in for a MiniMax MSA jax_op: new cache + attention."""
+    new = cache.index_copy(0, slots, q)
+    return new, (new.sum(0, keepdim=True) * q).tanh()
+
+
+@_cache_write.register_fake
+def _(q, cache, slots):
+    return torch.empty_like(cache), torch.empty_like(q)
+
+
+class _Layers(torch.nn.Module):
+    """`n` layers that each write two caches the way msa.py does:
+    functional op, then `kv_cache.copy_(new)` / `index_cache.copy_(new)`."""
+
+    def __init__(self, n=6, slots=16, d=8):
+        super().__init__()
+        self.n = n
+        self.kv = [torch.randn(slots, d) for _ in range(n)]
+        self.idx = [torch.randn(slots, d) for _ in range(n)]
+
+    def forward(self, x, slots, kv, idx):
+        for i in range(self.n):
+            new_kv, x = _cache_write(x, kv[i], slots)
+            kv[i].copy_(new_kv)
+            new_idx, y = _cache_write(x * 0.5, idx[i], slots)
+            idx[i].copy_(new_idx)
+            x = x + y
+        return x
+
+
+def _compiled(keep: bool, graphs: list):
+    def fw(gm, _inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    aot = keep_input_mutations_aot_autograd(aot_autograd) if keep else aot_autograd
+    from functorch.compile import make_boxed_func
+
+    backend = aot(fw_compiler=lambda gm, ex: make_boxed_func(fw(gm, ex)))
+    torch._dynamo.reset()
+    return torch.compile(backend=backend, fullgraph=True, dynamic=False)
+
+
+from vllm_torchtpu.runner.host_path import (  # noqa: E402
+    keep_input_mutations_aot_autograd,
+    mutated_placeholder_indices,
+)
+
+
+def _run(keep):
+    torch.manual_seed(0)
+    model = _Layers()
+    x = torch.randn(4, 8)
+    slots = torch.tensor([3, 7, 1, 12])
+    kv = [t.clone() for t in model.kv]
+    idx = [t.clone() for t in model.idx]
+    graphs = []
+    fn = _compiled(keep, graphs)(model.forward)
+    with torch.no_grad():
+        fn(x, slots, kv, idx)  # compile
+        kv2 = [t.clone() for t in model.kv]
+        idx2 = [t.clone() for t in model.idx]
+        # The AOT epilogue calls `Tensor.copy_`; graph ops call
+        # `torch.ops.aten.copy_` directly, so this counts the epilogue only.
+        epilogue = [0]
+        orig = torch.Tensor.copy_
+
+        def counted(self, *a, **k):
+            epilogue[0] += 1
+            return orig(self, *a, **k)
+
+        torch.Tensor.copy_ = counted
+        try:
+            out = fn(x, slots, kv2, idx2)
+        finally:
+            torch.Tensor.copy_ = orig
+    (gm,) = graphs
+    in_graph = sum(
+        n.op == "call_function" and n.target is torch.ops.aten.copy_.default
+        for n in gm.graph.nodes
+    )
+    return out, kv2, idx2, epilogue[0], in_graph, gm
+
+
+def test_keep_input_mutations_same_outputs_and_caches_no_epilogue():
+    model = _Layers()
+    torch.manual_seed(0)
+    model = _Layers()
+    x = torch.randn(4, 8)
+    slots = torch.tensor([3, 7, 1, 12])
+    kv = [t.clone() for t in model.kv]
+    idx = [t.clone() for t in model.idx]
+    with torch.no_grad():
+        ref = model.forward(x, slots, kv, idx)
+
+    out0, kv0, idx0, epi0, graph0, _ = _run(keep=False)
+    out1, kv1, idx1, epi1, graph1, gm1 = _run(keep=True)
+    # Default: the graph returns the 12 new caches; AOT copies them back on
+    # the host. Kept: the 12 writes are graph ops, no host epilogue copy.
+    assert (epi0, graph0) == (12, 0)
+    assert (epi1, graph1) == (0, 12)
+    for got_out, got_kv, got_idx in ((out0, kv0, idx0), (out1, kv1, idx1)):
+        assert torch.equal(got_out, ref)
+        assert all(torch.equal(a, b) for a, b in zip(got_kv, kv))
+        assert all(torch.equal(a, b) for a, b in zip(got_idx, idx))
+    # The written caches are the donation candidates for mode 2.
+    donated = mutated_placeholder_indices(gm1)
+    assert len(donated) == 12
+
+
+def test_keep_input_mutations_traces_with_fake_tensors():
+    """The kept-mutation graph traces under FakeTensorMode (as AOT does)."""
+    from torch._functorch.aot_autograd import aot_export_module
+
+    model = _Layers(n=2)
+
+    class Wrap(torch.nn.Module):
+        def forward(self, x, slots, kv0, kv1, i0, i1):
+            return (model.forward(x, slots, [kv0, kv1], [i0, i1]),)
+
+    with FakeTensorMode() as mode:
+        args = (
+            torch.randn(4, 8),
+            torch.tensor([1, 2, 3, 4]),
+            *[torch.randn(16, 8) for _ in range(4)],
+        )
+        gm, sig = aot_export_module(Wrap(), args, trace_joint=False)
+    assert len(sig.user_inputs_to_mutate) == 4
+    del mode
+
+
+def test_install_keep_input_mutations_patches_backend(monkeypatch):
+    from torch_tpu._internal.compile import _backend, compiler
+
+    from vllm_torchtpu.runner import host_path as hp
+
+    monkeypatch.setattr(_backend, "aot_autograd", _backend.aot_autograd)
+    monkeypatch.setattr(
+        compiler.StaticCompiler, "__call__", compiler.StaticCompiler.__call__
+    )
+    orig_aot, orig_call = _backend.aot_autograd, compiler.StaticCompiler.__call__
+    hp.install_keep_input_mutations(0)
+    assert _backend.aot_autograd is orig_aot
+    hp.install_keep_input_mutations(1)
+    assert _backend.aot_autograd._tpu_keep_input_mutations
+    assert compiler.StaticCompiler.__call__ is orig_call
+    hp.install_keep_input_mutations(2)
+    hp.install_keep_input_mutations(2)  # idempotent
+    assert compiler.StaticCompiler.__call__._tpu_donate_mutated
+    seen = {}
+    monkeypatch.setattr(
+        _backend.aot_autograd.__closure__[0], "cell_contents",
+        lambda **kw: seen.update(kw),
+    )
+    _backend.aot_autograd(fw_compiler=None, keep_inference_input_mutations=False)
+    assert seen["keep_inference_input_mutations"] is True
