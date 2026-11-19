@@ -106,9 +106,28 @@ def render_workbench_body(
         "<summary>Custom 6-Axis Mesh Override (TP / EP / DP / PP / DCP / PCP)"
         f"</summary>{mesh_grid}</details>"
     )
+    littles_drawer = (
+        '<details class="wb-eta-details" id="wb-littles-details">'
+        "<summary>Derive B from Little's Law (tok/s &times; TPOT)</summary>"
+        '<div class="wb-knob-pair">'
+        '<div class="wb-knob-row"><div class="wb-knob-head"><span>Output tok/s'
+        "</span></div>"
+        '<input id="ctl-out-tps" type="number" min="0.1" step="1" value="" '
+        'placeholder="tok/s" oninput="wbPreviewLittlesLaw()"/></div>'
+        '<div class="wb-knob-row"><div class="wb-knob-head"><span>Mean TPOT (ms)'
+        "</span></div>"
+        '<input id="ctl-mean-tpot" type="number" min="0.1" step="0.1" '
+        'value="" placeholder="ms" oninput="wbPreviewLittlesLaw()"/></div></div>'
+        '<div style="display:flex;align-items:center;justify-content:space-between;'
+        'gap:6px;margin-top:4px;"><span class="kpi-sub tabular" '
+        'id="lbl-littles-preview">Enter &gt; 0 tok/s &amp; TPOT</span>'
+        '<button class="wb-mini-btn" id="btn-apply-littles-law" type="button" '
+        'onclick="wbApplyLittlesLaw()">Apply to B</button></div></details>'
+    )
     knobs_wl = (
         f'<div class="wb-knob-pair">{pair_wl}</div>'
-        + _rknob("batch", "Batch Size (B)", "16", (1, 1024, 1, 16))
+        + _rknob("batch", "Decoding Seqs (B)", "16", (1, 1024, 1, 16))
+        + littles_drawer
         + _rknob("seq-tokens", "Tokens/Seq", "1", (1, 8192, 1, 1), "wbOnSeqChange()")
         + _rknob("context", "Context (S)", "4.0K", (512, 1048576, 512, 4096))
         + mesh_drawer
@@ -146,6 +165,16 @@ def render_workbench_body(
         "<summary>Advanced Priors (Gap, Hop, Ring Slots, Aliasing)</summary>"
         + _rknob("launch-gap", "Launch Gap", "1.00 us", (0, 12, 0.01, 1.0), hw_fn)
         + _rknob("coll-hop", "Collective Hop", "1.00 us", (0.5, 8.0, 0.001, 1.0), hw_fn)
+        + _rknob(
+            "host-head-per-op",
+            "Host Head (per_op)",
+            "0 us",
+            (0, 10000, 10, 0),
+            hw_fn,
+        )
+        + _rknob(
+            "host-head-fused", "Host Head (fused)", "0 us", (0, 10000, 10, 0), hw_fn
+        )
         + f'<div class="wb-knob-pair">{pair_hw}</div>'
         + "</details>"
     )
