@@ -10,8 +10,8 @@ against:
   throughput per dollar) to H. The rest of the name is the decode layout, the
   prefill and decode replica counts (`4p3d`: four prefill and three decode
   replicas), the decode leg's `--max-num-seqs` (`capN`) and the benchmark
-  concurrency (`cN`); p12's `t3` marks the batch-1 host trims its
-  `decode_layout` names.
+  concurrency (`cN`). The `t3` at the end of p12's name stands for the
+  batch-1 host trims that its `decode_layout` lists.
 - `gate-*.yaml`: the 1P1D accuracy gates, one per decode layout. Each runs
   its `arms` back to back and reports the `suite`.
 
@@ -48,7 +48,8 @@ The record tree's environment variables are being turned into settings,
 rules or `additional_config` options change by change, and each change that
 turns one that the points use into a setting or section updates the entries.
 A value that this tree cannot run yet is kept as the record run used it and
-listed under `not_yet_supported`, per leg, with the capability it needs; the
+listed under `not_yet_supported`, per leg, with what it needs: a capability
+this tree lacks, or a file it does not ship (p01's permutation table); the
 change that adds the capability removes it from that list. The entry tests
 check that this tree's `envs.py` accepts every other environment value. A leg
 run here without the listed values uses fused EP MoE v2 and main's
