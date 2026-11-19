@@ -68,11 +68,12 @@ def test_row_operands_run_on_an_e5m2_kv_cache():
     assert _serve(jnp.float8_e5m2, modes).native_fp8 == modes
 
 
+@pytest.mark.parametrize("name", ["native_fp8", "native_fp8_prefill"])
 @pytest.mark.parametrize(
     ("chip", "admitted"),
     [(pltpu.ChipVersion.TPU_7X, True), (pltpu.ChipVersion.TPU_V5E, False)],
 )
-def test_native_fp8_needs_fp8_matmuls_on_the_mxu(monkeypatch, chip, admitted):
+def test_native_fp8_needs_fp8_matmuls_on_the_mxu(monkeypatch, chip, admitted, name):
     info = pltpu.get_tpu_info_for_chip(chip, 1)
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda *args, **kwargs: info)
     monkeypatch.setattr(
@@ -102,7 +103,7 @@ def test_native_fp8_needs_fp8_matmuls_on_the_mxu(monkeypatch, chip, admitted):
                 v_scale=1.0,
                 kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
                 decode_query_size=4,
-                native_fp8=configs.NativeFp8(pv=_ROW),
+                **{name: configs.NativeFp8(pv=_ROW)},
             )
         )(
             spec((tokens, 4, 256), jnp.bfloat16),
@@ -118,7 +119,7 @@ def test_native_fp8_needs_fp8_matmuls_on_the_mxu(monkeypatch, chip, admitted):
     if admitted:
         trace()
     else:
-        with pytest.raises(ValueError, match="fp8 on the MXU"):
+        with pytest.raises(ValueError, match=f"{name}=.*fp8 on the MXU"):
             trace()
 
 
