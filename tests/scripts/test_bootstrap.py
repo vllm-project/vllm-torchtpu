@@ -103,10 +103,12 @@ def _expand_env(text: str, env: Mapping[str, str]) -> str:
     return re.sub(r"\$\{([A-Za-z0-9_]+)(?::-([^}]*))?\}", _sub, text)
 
 
-# The uploads of a lane in TPU_GENERATION_FILES, as _RunRecorder tags them: one
-# per default generation (v7x). CI_TPU_GENERATIONS=all adds v6e's, first, so
+# The uploads of each lane in TPU_GENERATION_FILES, as _RunRecorder tags them:
+# one per default generation (v7x). CI_TPU_GENERATIONS=all adds v6e's, first, so
 # v7x's still shows (and queues) first.
 _TESTS = ("tests:v7x",)
+_INTEGRATION = ("integration:v7x",)
+_PERF = ("perf:v7x",)
 
 
 # (extras, actor, error) as returned by `_merge_queue_pr_extras`.
@@ -1354,14 +1356,14 @@ class TestBootstrapUnits(unittest.TestCase):
         pr_stage1 = self._run_next_stage(pr)
         self.assertEqual(
             [u[0] for u in pr_stage1.uploads],
-            ["verify", "integration", *_TESTS],
+            ["verify", *_INTEGRATION, *_TESTS],
         )
         self.assertIn("Stage 2 now: tests, integration, verify", pr_stage1.stdout)
         self.assertEqual(
             pr_stage1.meta,
             [
                 ("upload-stages:upload_stage_1:verify", "1"),
-                ("upload-stages:upload_stage_1:integration", "1"),
+                ("upload-stages:upload_stage_1:integration:v7x", "1"),
                 ("upload-stages:upload_stage_1:tests:v7x", "1"),
             ],
         )
@@ -1382,7 +1384,8 @@ class TestBootstrapUnits(unittest.TestCase):
         retry_rec = _RunRecorder(bp)
         retry_rec.meta = [
             ("upload-stages:upload_stage_1:verify", "1"),
-            ("upload-stages:upload_stage_1:integration", "1"),
+            ("upload-stages:upload_stage_1:integration:v6e", "1"),
+            ("upload-stages:upload_stage_1:integration:v7x", "1"),
             ("upload-stages:upload_stage_1:tests:v6e", "1"),
         ]
         with (
@@ -1430,7 +1433,7 @@ class TestBootstrapUnits(unittest.TestCase):
             chain_s1 = self._run_next_stage(chain_s0, expected_key="upload_stage_1")
             self.assertEqual(
                 [u[0] for u in chain_s1.uploads],
-                ["upload_stages", "integration", *_TESTS],
+                ["upload_stages", *_INTEGRATION, *_TESTS],
             )
             chain_s2 = self._run_next_stage(chain_s1, expected_key="upload_stage_2")
             self.assertEqual([u[0] for u in chain_s2.uploads], ["verify"])
@@ -1448,7 +1451,7 @@ class TestBootstrapUnits(unittest.TestCase):
         perf_eval_stage1 = self._run_next_stage(perf_eval_pr)
         self.assertEqual(
             [u[0] for u in perf_eval_stage1.uploads],
-            ["verify", "perf", "integration", *_TESTS],
+            ["verify", *_PERF, *_INTEGRATION, *_TESTS],
         )
         self.assertNotIn("NIGHTLY", perf_eval_stage1.uploads[0][2])
 
@@ -1473,7 +1476,7 @@ class TestBootstrapUnits(unittest.TestCase):
         oncall_stage1 = self._run_next_stage(oncall_full)
         self.assertEqual(
             [u[0] for u in oncall_stage1.uploads],
-            ["verify", "perf", "integration", *_TESTS],
+            ["verify", *_PERF, *_INTEGRATION, *_TESTS],
         )
         self.assertEqual(json.loads(oncall_stage1.uploads[0][1])["priority"], 12)
         self.assertIn("tpu-pr/oncall@example.com", oncall_stage1.uploads[-1][1])
@@ -1528,7 +1531,7 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertTrue(main_pm.annotations[0][2].startswith("CI suite: default: "))
         self.assertEqual(
             [u[0] for u in main_pm.uploads],
-            ["verify", "integration", *_TESTS, "cpu", "build"],
+            ["verify", *_INTEGRATION, *_TESTS, "cpu", "build"],
         )
         self.assertNotIn("NIGHTLY", main_pm.uploads[0][2])
 
@@ -1551,7 +1554,7 @@ class TestBootstrapUnits(unittest.TestCase):
         perf_sched = self._run_bootstrap(
             {"CI_SUITE": "perf", "CI_LANES": "perf", "BUILDKITE_BRANCH": "main"}
         )
-        self.assertEqual([u[0] for u in perf_sched.uploads], ["perf", "build"])
+        self.assertEqual([u[0] for u in perf_sched.uploads], [*_PERF, "build"])
         self.assertTrue(bool(perf_sched.uploads[-1][2]["OMNI_IMAGE_SKIP"]))
 
         # Scheduled Nightly, release builds (tag or releases/vX.Y.Z branch), and
@@ -1579,7 +1582,7 @@ class TestBootstrapUnits(unittest.TestCase):
             )
             self.assertEqual(
                 [u[0] for u in fx.uploads],
-                ["verify", "perf", "integration", *_TESTS, "cpu", "build"],
+                ["verify", *_PERF, *_INTEGRATION, *_TESTS, "cpu", "build"],
             )
             for _, content, _ in fx.uploads:
                 self.assertNotIn('build.env("NIGHTLY")', content)
@@ -1599,7 +1602,7 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(
             [u[0] for u in torchtpu_nightly.uploads],
-            ["verify", "integration", *_TESTS, "cpu", "build"],
+            ["verify", *_INTEGRATION, *_TESTS, "cpu", "build"],
         )
 
         # Integration pipeline resolves upstream vLLM HEAD and uploads promote lane.
@@ -1612,7 +1615,7 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertIn(("VLLM_COMMIT_HASH", "upstream999"), integ.meta)
         self.assertEqual(
             [u[0] for u in integ.uploads],
-            ["promote", "verify", "perf", "integration", *_TESTS, "cpu", "build"],
+            ["promote", "verify", *_PERF, *_INTEGRATION, *_TESTS, "cpu", "build"],
         )
 
         # [skip ci] and docs-only PRs exit 0 before uploading any pipeline steps.
@@ -1641,7 +1644,7 @@ class TestBootstrapUnits(unittest.TestCase):
         ci_run_stage1 = self._run_next_stage(ci_run)
         self.assertEqual(
             [u[0] for u in ci_run_stage1.uploads],
-            ["verify", "perf", "integration", *_TESTS],
+            ["verify", *_PERF, *_INTEGRATION, *_TESTS],
         )
         self.assertIn("tpu-pr/alice@example.com", ci_run_stage1.uploads[-1][1])
 
@@ -1689,7 +1692,7 @@ class TestBootstrapUnits(unittest.TestCase):
         mq_main_stage1 = self._run_next_stage(mq_main)
         self.assertEqual(
             [u[0] for u in mq_main_stage1.uploads],
-            ["verify", "integration", *_TESTS],
+            ["verify", *_INTEGRATION, *_TESTS],
         )
         for _, content, _ in mq_main_stage1.uploads:
             self.assertNotIn("tpu-pr/", content)
@@ -1710,7 +1713,7 @@ class TestBootstrapUnits(unittest.TestCase):
             )
         )
         mq_rel_stage1 = self._run_next_stage(mq_rel)
-        self.assertIn("perf", [u[0] for u in mq_rel_stage1.uploads])
+        self.assertIn(_PERF[0], [u[0] for u in mq_rel_stage1.uploads])
 
         # Merge queue without BUILDKITE_MERGE_QUEUE_BASE_COMMIT falls back to
         # fetching the base branch ref, and with precheck-only marker runs pr+cpu-only.
@@ -2145,19 +2148,39 @@ class TestBootstrapUnits(unittest.TestCase):
             [bp._and_list(items) for items in ([], ["a"], ["a", "b"], ["a", "b", "c"])],
             ["", "a", "a and b", "a, b and c"],
         )
-        # `all` sends the tests lane up once per generation it lists, v6e's
-        # first so v7x's still shows (and queues) first, and says so. (Unset,
-        # v7x alone: _TESTS in the tests above.) A PR build passes it on to its
-        # second stage's uploader, whose uploads these are.
-        both = ("tests:v6e", "tests:v7x")
-        with_both = ["verify", "integration", *both, "cpu", "build"]
-        for env, uploads in (
-            ({}, with_both),
+
+        # `all` sends each per-generation lane up once per generation it lists,
+        # v6e's first so v7x's still shows (and queues) first, and says so.
+        # (Unset, v7x alone: _TESTS, _INTEGRATION and _PERF in the tests above.)
+        # A PR build passes it on to its second stage's uploader, whose uploads
+        # these are.
+        def both(lane: str) -> list[str]:
+            return [f"{lane}:v6e", f"{lane}:v7x"]
+
+        tests_integration = "tests and integration lanes"
+        for env, uploads, lanes in (
+            (
+                {},
+                ["verify", *both("integration"), *both("tests"), "cpu", "build"],
+                tests_integration,
+            ),
             (
                 {"NIGHTLY": "1"},
-                ["verify", "perf", "integration", *both, "cpu", "build"],
+                [
+                    "verify",
+                    *both("perf"),
+                    *both("integration"),
+                    *both("tests"),
+                    "cpu",
+                    "build",
+                ],
+                "tests, integration and perf lanes",
             ),
-            ({"BUILDKITE_PULL_REQUEST": "42"}, ["verify", "integration", *both]),
+            (
+                {"BUILDKITE_PULL_REQUEST": "42"},
+                ["verify", *both("integration"), *both("tests")],
+                tests_integration,
+            ),
         ):
             with self.subTest(env=env):
                 rec = self._run_bootstrap({"CI_TPU_GENERATIONS": "all", **env})
@@ -2165,7 +2188,7 @@ class TestBootstrapUnits(unittest.TestCase):
                     _tpu_generations_note(rec),
                     (
                         "info",
-                        "Also runs the TPU v6e steps of the tests lane "
+                        f"Also runs the TPU v6e steps of the {lanes} "
                         "(`CI_TPU_GENERATIONS=all`).",
                     ),
                 )
@@ -2177,7 +2200,10 @@ class TestBootstrapUnits(unittest.TestCase):
         every = (gens.TPU_V6E, gens.TPU_V7X)
         with mock.patch.object(gens, "DEFAULT_TPU_GENERATIONS", every):
             rec = self._run_bootstrap({"CI_TPU_GENERATIONS": "all"})
-        self.assertEqual([u[0] for u in rec.uploads], with_both)
+        self.assertEqual(
+            [u[0] for u in rec.uploads],
+            ["verify", *both("integration"), *both("tests"), "cpu", "build"],
+        )
         self.assertNotIn("ci-tpu-generations", [c for _, c, _ in rec.annotations])
 
         # Refused with an error annotation, before any upload: an unknown value
@@ -2332,15 +2358,24 @@ class TestBootstrapUnits(unittest.TestCase):
             depends_on = step.get("depends_on", [])
             for dep in depends_on if isinstance(depends_on, list) else [depends_on]:
                 self.assertIn(dep["step"] if isinstance(dep, dict) else dep, known)
-        # Each generation's upload of the tests lane runs on its shapes, both.
+        # Each generation's upload of a per-generation lane runs on its shapes,
+        # and every step that names a chip type names its own.
         gens = self.bp.tpu_generations
-        for gen in gens.TPU_GENERATION_FILES[".buildkite/pipeline_tests.yml"]:
-            shapes = {
-                s["env"]["SHAPE"]
-                for s in uploaded[f"tests:{gen.name}"]
-                if "SHAPE" in s.get("env", ())
-            }
-            self.assertEqual(shapes, {gen.shape_single, gen.shape_multi}, gen.name)
+        for path, listed in gens.TPU_GENERATION_FILES.items():
+            lane = pathlib.Path(path).stem.removeprefix("pipeline_")
+            for gen in listed:
+                envs = [s.get("env", {}) for s in uploaded[f"{lane}:{gen.name}"]]
+                shapes = {env["SHAPE"] for env in envs if "SHAPE" in env}
+                self.assertEqual(
+                    shapes, {gen.shape_single, gen.shape_multi}, (lane, gen.name)
+                )
+                for env in envs:
+                    if "TPU_ACCELERATOR_TYPE" in env:
+                        self.assertEqual(
+                            env["TPU_ACCELERATOR_TYPE"],
+                            gen.accelerator_type,
+                            (lane, gen.name),
+                        )
 
 
 if __name__ == "__main__":
