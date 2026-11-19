@@ -33,9 +33,35 @@ def _post_pre_rms_jax(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     tokens, mult = pre.shape
     dim = flat.shape[1] // mult
-    if not shifted_post_pre_rms.is_supported_shape(tokens, mult, dim) or (
-        tokens % 32 and not envs.TPU_DEEPSEEK_V41_MHC_SHIFTED_T16
-    ):
+    padded = -(-tokens // 16) * 16
+    if padded != tokens and _kernel_admits(padded, mult, dim):
+        # Rows are independent: zero rows (DSpark's 40-row draft bucket) run
+        # the kernel at the next whole 16-token tile and are sliced off.
+        def pad(a):
+            return jnp.pad(a, ((0, padded - tokens),) + ((0, 0),) * (a.ndim - 1))
+
+        outputs = _post_pre_rms_jax(
+            pad(x.reshape(tokens, -1)),
+            pad(flat),
+            pad(post),
+            pad(comb),
+            weight,
+            scale,
+            base,
+            pad(pre),
+            norm_weight,
+            rms_eps,
+            pre_eps,
+            sinkhorn_eps,
+            post_multiplier,
+            repeats,
+            norm_eps,
+        )
+        return cast(
+            tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+            tuple(out[:tokens] for out in outputs),
+        )
+    if not _kernel_admits(tokens, mult, dim):
         from vllm_torchtpu.models.vllm.deepseek_v41.common.mhc import (
             delayed_post_pre_flat_jax,
         )
@@ -78,6 +104,12 @@ def _post_pre_rms_jax(
         norm_weight=norm_weight,
         norm_eps=norm_eps,
         **_gate_layout(),
+    )
+
+
+def _kernel_admits(tokens: int, mult: int, dim: int) -> bool:
+    return shifted_post_pre_rms.is_supported_shape(tokens, mult, dim) and (
+        tokens % 32 == 0 or envs.TPU_DEEPSEEK_V41_MHC_SHIFTED_T16
     )
 
 

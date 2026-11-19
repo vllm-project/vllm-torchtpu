@@ -91,3 +91,36 @@ def test_t240_matches_unfused_fallback_within_rounding(monkeypatch):
         r, g = np.asarray(r, np.float32), np.asarray(g, np.float32)
         bound = np.maximum(np.abs(r), np.abs(g)) * rtol + 1e-6
         assert np.all(np.abs(r - g) <= bound)
+
+
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU7x mHC kernel")
+def test_t40_pads_to_a_kernel_tile_and_matches_fallback(monkeypatch):
+    from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
+        deepseek_v41_mhc_op as op,
+    )
+
+    x, flat, post, comb, pre, weight, scale, base, norm = _inputs(48)
+    consts = (1e-20, 1e-6, 1e-6, 2.0, 20, 1e-6)
+
+    def layer(*args):
+        return op._post_pre_rms_jax(*args, *consts)
+
+    def rows(n):
+        return (x[:n], flat[:n], post[:n], comb[:n], weight, scale, base, pre[:n], norm)
+
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_MHC_SHIFTED_T16", "1")
+    full = jax.jit(layer)(*rows(48))
+    got = jax.jit(layer)(*rows(40))
+    # Rows are independent: the 40 live rows equal the 48-row kernel's.
+    for f, g in zip(full, got, strict=True):
+        assert g.shape[0] == 40
+        np.testing.assert_array_equal(
+            np.ascontiguousarray(f[:40]).view(np.uint8),
+            np.ascontiguousarray(g).view(np.uint8),
+        )
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_MHC_SHIFTED_T16", "0")
+    ref = jax.jit(layer)(*rows(40))
+    for r, g, rtol in zip(ref, got, (2.0**-7, 1e-4, 1e-4, 2.0**-6, 1e-4)):
+        r, g = np.asarray(r, np.float32), np.asarray(g, np.float32)
+        bound = np.maximum(np.abs(r), np.abs(g)) * rtol + 1e-6
+        assert np.all(np.abs(r - g) <= bound)
