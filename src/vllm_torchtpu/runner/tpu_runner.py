@@ -2819,25 +2819,30 @@ class TPUModelRunner(GPUModelRunner):
             self._pre_async_results.next_tokens_tpu,
         )
 
-    def _flush_disjoint_async_results(self) -> None:
+    def _unmap_disjoint_async_results(self) -> None:
+        """Unmap the previous step's results when no request of this step
+        continues one of its requests.
+
+        This step then reads none of their outputs: the previous step's
+        requests committed no tokens (partial prefill chunks) or left the batch
+        (finished, preempted or not scheduled), as on every step of one-token
+        requests. Their D2H copy may still be in flight. Keep the results
+        instead of waiting on it here, which would stall the host before this
+        step's forward: sample_tokens() waits on them in
+        _modify_prev_results(), rolls back the requests that left, and replaces
+        them. Never drop them unsynchronized: on TP ranks other than the
+        executor's output rank, vLLM may discard the AsyncTPUModelRunnerOutput
+        when the RPC returns, leaving these results the only owner of the copy
+        (#985).
+        """
         if self._pre_async_results is None:
             return
         current_req_ids = set(self.input_batch.req_ids[: self.input_batch.num_reqs])
         previous_req_ids = self._pre_async_results.req_id_to_index_copy
-        # An empty map means nothing to roll back (the previous step committed no
-        # tokens, or all its requests finished or were preempted), but its D2H
-        # copy may still be in flight. Keep the results instead of waiting here,
-        # which would stall the host before this step's forward: sample_tokens()
-        # waits on them in _modify_prev_results() and then replaces them. Never
-        # drop them unsynchronized: on TP ranks other than the executor's output
-        # rank, vLLM may discard the AsyncTPUModelRunnerOutput when the RPC
-        # returns, leaving these results the only owner of the copy (#985).
-        if not previous_req_ids or any(
-            req_id in current_req_ids for req_id in previous_req_ids
-        ):
-            return
-        self._modify_prev_results()
-        self._pre_async_results = None
+        if not any(req_id in current_req_ids for req_id in previous_req_ids):
+            # With nothing mapped, _prepare_inputs substitutes no tokens and
+            # skips the rejected-token subtraction.
+            previous_req_ids.clear()
 
     def _install_spec_token_room_guard(self) -> None:
         """Wrap InputBatch.update_req_spec_token_ids to clamp its *write*.
@@ -3672,10 +3677,11 @@ class TPUModelRunner(GPUModelRunner):
         # Async spec: seq_lens/positions were advanced optimistically (every
         # draft from the previous step assumed accepted). Subtract the real
         # per-request rejected count on-device, keyed by req position.
-        # req_id_to_index_copy is empty for zero-token results that
-        # _flush_disjoint_async_results() keeps until sample_tokens() waits on
-        # their copy. Nothing maps then, and under PCP the full-size index arrays
-        # below would not match this rank's shard of position_ids.
+        # req_id_to_index_copy is empty for results that no request of this step
+        # continues, which _unmap_disjoint_async_results() keeps until
+        # sample_tokens() waits on their copy. Nothing maps then, and under PCP
+        # the full-size index arrays below would not match this rank's shard of
+        # position_ids.
         if (
             self.scheduler_config.async_scheduling
             and self.speculative_config
@@ -4342,7 +4348,7 @@ class TPUModelRunner(GPUModelRunner):
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
-            self._flush_disjoint_async_results()
+            self._unmap_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
@@ -8884,7 +8890,7 @@ class TPUModelRunner(GPUModelRunner):
         # The last async warmup step parks an AsyncPreResults (in-flight D2H copy
         # + optimistic 1+K placeholders) with no follower step to drain it.
         # Finish the copy and null it BEFORE the drain below so the drain's
-        # _flush_disjoint_async_results early-returns instead of issuing a stray
+        # _unmap_disjoint_async_results early-returns instead of issuing a stray
         # D2H / placeholder rollback on the torn-down synthetic request, and no
         # in-flight copy host buffer is freed mid-transfer (defensive: covers the
         # `if present:`-skip path). No-op in sync (always None).
