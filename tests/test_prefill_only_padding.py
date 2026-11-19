@@ -49,7 +49,13 @@ def _cached(req_ids, computed):
     )
 
 
+def _requests(prompts=()):
+    """The runner's request states: request id -> prompt length."""
+    return {r: types.SimpleNamespace(num_prompt_tokens=p) for r, p in prompts}
+
+
 def _batch(prompts=()):
+    """An input batch holding these requests: request id -> prompt length."""
     ids = {r: i for i, (r, _) in enumerate(prompts)}
     return types.SimpleNamespace(
         req_id_to_index=ids, num_prompt_tokens=np.array([p for _, p in prompts] or [0])
@@ -75,7 +81,7 @@ def test_strips_padding_on_new_request():
         {"crash": [-1]},
         new=[_new("crash", 126208, 126209), _new("other", 0, 9000)],
     )
-    out = _strip_prefill_only_padding(so, _batch())
+    out = _strip_prefill_only_padding(so, _requests())
     assert out.num_scheduled_tokens == {"crash": 1, "other": 4096}
     assert out.total_num_scheduled_tokens == 4097
     assert "crash" not in out.scheduled_spec_decode_tokens
@@ -86,7 +92,7 @@ def test_the_scheduler_s_step_is_left_untouched():
     """Under a uniprocess executor the scheduler holds this object, and it
     rolls the placeholder back as a rejected draft only if it still sees it."""
     so = _so({"crash": 2}, {"crash": [-1]}, new=[_new("crash", 126208, 126209)])
-    out = _strip_prefill_only_padding(so, _batch())
+    out = _strip_prefill_only_padding(so, _requests())
     assert out is not so
     assert so.num_scheduled_tokens == {"crash": 2}
     assert so.total_num_scheduled_tokens == 2
@@ -95,7 +101,7 @@ def test_the_scheduler_s_step_is_left_untouched():
 
 def test_strips_padding_on_resumed_cached_request():
     so = _so({"r": 2}, {"r": [-1]}, cached=_cached(["r"], [126208]))
-    out = _strip_prefill_only_padding(so, _batch([("r", 126209)]))
+    out = _strip_prefill_only_padding(so, _requests([("r", 126209)]))
     assert out.num_scheduled_tokens["r"] == 1
 
 
@@ -103,10 +109,10 @@ def test_leaves_real_drafts_and_in_prompt_steps_alone():
     # Real draft ids (not placeholders): untouched (the runner's guard still
     # refuses them).
     so = _so({"a": 2}, {"a": [17]}, new=[_new("a", 126208, 126209)])
-    assert _strip_prefill_only_padding(so, _batch()) is so
+    assert _strip_prefill_only_padding(so, _requests()) is so
     # Placeholders but the step stays inside the prompt: untouched.
     so = _so({"b": 2}, {"b": [-1]}, new=[_new("b", 100, 5000)])
-    assert _strip_prefill_only_padding(so, _batch()) is so
+    assert _strip_prefill_only_padding(so, _requests()) is so
     assert so.num_scheduled_tokens["b"] == 2
 
 
@@ -114,26 +120,30 @@ class _Stop(Exception):
     pass
 
 
-def _execute_until_update_states(monkeypatch, prefill_only):
-    """Run TPUModelRunner.execute_model on a stub runner up to _update_states,
-    the first step after the strip, and report whether the strip ran first and
-    on the runner's input batch."""
-    calls = []
-    batch = types.SimpleNamespace()
-    stripped = _so({"r": 1}, {})
-
-    def _strip(so, input_batch):
-        calls.append(("strip", so, input_batch))
-        return stripped
-
-    monkeypatch.setattr(tpu_runner, "_strip_prefill_only_padding", _strip)
-    runner = types.SimpleNamespace(
+def _stub_runner(prefill_only, **fields):
+    return types.SimpleNamespace(
         _pp_wave=None,
         execute_model_state=None,
         _adaptive_verification=None,
         _mtp_prefill_only=prefill_only,
-        input_batch=batch,
+        **fields,
     )
+
+
+def _execute_until_update_states(monkeypatch, prefill_only):
+    """Run TPUModelRunner.execute_model on a stub runner up to _update_states,
+    the first step after the strip, and report whether the strip ran first and
+    on the runner's requests."""
+    calls = []
+    requests = {}
+    stripped = _so({"r": 1}, {})
+
+    def _strip(so, reqs):
+        calls.append(("strip", so, reqs))
+        return stripped
+
+    monkeypatch.setattr(tpu_runner, "_strip_prefill_only_padding", _strip)
+    runner = _stub_runner(prefill_only, requests=requests)
 
     def _update_states(so):
         calls.append(("update", so))
@@ -143,17 +153,41 @@ def _execute_until_update_states(monkeypatch, prefill_only):
     so = _so({"r": 2}, {"r": [-1]})
     with pytest.raises(_Stop):
         TPUModelRunner.execute_model(runner, so)
-    return calls, so, batch, stripped
+    return calls, so, requests, stripped
 
 
 def test_execute_model_strips_before_reading_the_step(monkeypatch):
-    calls, so, batch, stripped = _execute_until_update_states(
+    calls, so, requests, stripped = _execute_until_update_states(
         monkeypatch, prefill_only=True
     )
     # The rest of the step runs on the stripped copy.
-    assert calls == [("strip", so, batch), ("update", stripped)]
+    assert calls == [("strip", so, requests), ("update", stripped)]
 
 
 def test_execute_model_does_not_strip_off_the_prefill_only_path(monkeypatch):
     calls, so, _, _ = _execute_until_update_states(monkeypatch, prefill_only=False)
     assert calls == [("update", so)]
+
+
+def test_a_request_skipped_in_the_last_step_is_stripped():
+    """vLLM's _update_states drops a request it did not schedule from the input
+    batch and adds it back when it is scheduled again; the strip runs before
+    that, so it reads the prompt length from the runner's requests."""
+    seen = []
+
+    def _update_states(so):
+        seen.append(so)
+        raise _Stop
+
+    runner = _stub_runner(
+        True,
+        input_batch=_batch(),  # "r" was not scheduled in the previous step
+        requests=_requests([("r", 126209)]),
+        _update_states=_update_states,
+    )
+    so = _so({"r": 2}, {"r": [-1]}, cached=_cached(["r"], [126208]))
+    with pytest.raises(_Stop):
+        TPUModelRunner.execute_model(runner, so)
+    (out,) = seen
+    assert out.num_scheduled_tokens == {"r": 1}
+    assert "r" not in out.scheduled_spec_decode_tokens
