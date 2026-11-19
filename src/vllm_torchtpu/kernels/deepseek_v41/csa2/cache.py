@@ -236,8 +236,13 @@ def _gather_sc_banked_deep(words, scales, records):
     count = records.size
     padding = -count % block
     indices = jnp.pad(records.reshape(-1), (0, padding), constant_values=-1)
-    zero_words = jnp.zeros((8, 128), jnp.int32)
-    zero_scales = jnp.zeros((8,), jnp.float32)
+    # Invalid ids gather a zero row. Give every subcore lane its own row: when
+    # all ids are invalid (DP-lockstep dummy steps, short selections) a single
+    # shared zero row turns every lane's DMA into a same-address read, which
+    # serializes and made idle-rank gathers ~15x slower than real ones.
+    zero_rows = cores * lanes
+    zero_words = jnp.zeros((zero_rows, 128), jnp.int32)
+    zero_scales = jnp.zeros((zero_rows,), jnp.float32)
     mesh = plsc.VectorSubcoreMesh(
         num_cores=info.num_cores,
         num_subcores=info.num_subcores,
@@ -261,6 +266,7 @@ def _gather_sc_banked_deep(words, scales, records):
         core = jax.lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
         split = word_refs[0].shape[0]
         steps = subchunks // streams
+        zero_row = core * lanes + jax.lax.broadcasted_iota(jnp.int32, (lanes,), 0)
 
         def outer(ids):
             base = (pl.program_id(0) * cores + core) * subchunks * lanes
@@ -283,7 +289,11 @@ def _gather_sc_banked_deep(words, scales, records):
                             )
                         )
                     targets.append(
-                        (zero_word_ref, zero_scale_ref, jnp.where(selected < 0, 0, -1))
+                        (
+                            zero_word_ref,
+                            zero_scale_ref,
+                            jnp.where(selected < 0, zero_row, -1),
+                        )
                     )
                     for word_src, scale_src, rows in targets:
                         indexed = plsc.Indices(rows, ignored_value=-1)

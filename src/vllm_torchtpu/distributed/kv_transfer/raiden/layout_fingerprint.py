@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import math
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -366,14 +367,15 @@ def _measure_packed_row_layouts(
             and int(tensor.element_size()) == 4
             and len(pool.regions) == 1
         )
-        word_rows = (
-            (len(shape) == 3 and int(tensor.element_size()) == 4)
-            or word_rows_2d
-            or word_rows_1d
-        )
+        # Rank-3 pages of any element width are row arrays too: DSv4 CSA word
+        # pools are int32, and DeepSeek-V4.1's private CSA2 SWA pool is a BF16
+        # [pages, rows, width] owner. Either way the tile check below admits
+        # only layouts where a row prefix is a byte prefix of the page.
+        word_rows = len(shape) == 3 or word_rows_2d or word_rows_1d
         if len(shape) != 4 and not word_rows:
             raise RuntimeError(
-                f"admitted {pool.tag} storage must be rank-4: shape={shape}"
+                f"admitted {pool.tag} storage must be rank-4: shape={shape} "
+                f"element_size={int(tensor.element_size())}"
             )
         region = pool.regions[0] if (word_rows_2d or word_rows_1d) else None
         shape_key = (
@@ -386,6 +388,17 @@ def _measure_packed_row_layouts(
             raise RuntimeError(
                 f"admitted {pool.tag} storages disagree on shape: {known} vs {shape_key}"
             )
+        # A pool that moves each page as one whole unit copies raw page bytes,
+        # which is exact under any physical order or tiling.
+        page_bytes = (
+            math.prod(shape[1:]) * int(tensor.element_size()) if len(shape) >= 2 else 0
+        )
+        whole_page = (
+            len(pool.regions) == 1
+            and int(pool.regions[0].num_units) == 1
+            and page_bytes > 0
+            and int(pool.regions[0].unit_bytes) == page_bytes
+        )
         layout = getter(tensor)
         if layout is None:
             raise RuntimeError(
@@ -420,7 +433,7 @@ def _measure_packed_row_layouts(
             if word_rows
             else ROW_CACHE_MINOR_TO_MAJOR
         )
-        if minor_to_major != expected_order:
+        if minor_to_major != expected_order and not whole_page:
             raise RuntimeError(
                 "Packed-row transfers require the natural physical order: "
                 f"tag={pool.tag}, layer={pool.layer_name}, "
@@ -442,11 +455,12 @@ def _measure_packed_row_layouts(
             tiles_ok = tiles_ok and rows % tiles[0][0] == 0
         else:
             tiles_ok = tiles == ((packing, 128), (packing, 1))
-        if not tiles_ok:
+        if not tiles_ok and not whole_page:
             raise RuntimeError(
                 "Packed-row transfers require the packed tile shape "
                 f"(({packing},128),({packing},1)): tag={pool.tag}, "
-                f"layer={pool.layer_name}, tiles={tiles}"
+                f"layer={pool.layer_name}, shape={shape}, "
+                f"element_size={int(tensor.element_size())}, tiles={tiles}"
             )
         measured = per_tag.setdefault(
             tag,

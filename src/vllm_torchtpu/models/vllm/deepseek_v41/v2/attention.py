@@ -2,6 +2,7 @@
 
 import contextlib
 import dataclasses
+import os
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -443,12 +444,31 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
                 "DeepSeek-V4.1 CSA2 SWA with prefix caching requires "
                 "--swa-bounded-replay and prefill-context-parallel-size=1"
             )
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         return DeepseekV41SWASpec(
             **values,
-            max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+            max_num_seqs=max_num_seqs,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             num_lookahead_tokens=vllm_config.num_lookahead_tokens,
+            held_seqs=_swa_held_seqs(vllm_config, max_num_seqs),
         )
+
+
+def _swa_held_seqs(vllm_config, max_num_seqs: int) -> int:
+    """Finished requests whose SWA window pages a KV connector keeps alive.
+
+    A P/D producer holds each sent request's pages until the consumer pulls
+    them, and a consumer holds pages of requests waiting for remote KV; neither
+    counts toward `max_num_seqs`. Headroom for 4x as many by default (about six
+    pages each); TPU_DSV41_SWA_HELD_SEQS overrides. Beyond it the manager
+    defers allocations rather than failing.
+    """
+    override = os.environ.get("TPU_DSV41_SWA_HELD_SEQS")
+    if override is not None:
+        return max(0, int(override))
+    if getattr(vllm_config, "kv_transfer_config", None) is None:
+        return 0
+    return 4 * max_num_seqs
 
 
 def _value(output):

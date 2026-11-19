@@ -42,6 +42,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
+    KVConnectorTransferResults,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -189,6 +190,11 @@ class _Stage3TransferGroup:
     # nor expects ceil(num_tokens / page_tokens) blocks; the one block always
     # travels whole, like Mamba state.
     slot: bool = False
+    # Whether the group participates in prefix caching. Under DSv4.1 SWA
+    # bounded replay the SWA and ring-buffer groups do not, so a decode-local
+    # prefix hit holds pages of the other groups only: a Stage-3 load skips
+    # the hit in those and moves the SWA and ring groups whole.
+    prefix_cacheable: bool = True
 
 
 def _stage3_slot_block(block_ids: Sequence[int], *, group_label: str) -> list[int]:
@@ -251,17 +257,21 @@ def _stage3_trim_window_pages(
     allocator freed the pages that fell behind the window and pointed them at
     the null block. Those entries get dropped here.
     """
-    ids = [int(block_id) for block_id in block_ids]
     skipped = min(
         _stage3_skipped_window_pages(
             num_tokens=num_tokens, page_tokens=page_tokens, window_tokens=window_tokens
         ),
-        len(ids),
+        len(block_ids),
     )
     if not skipped:
-        return ids
-    dropped, kept = ids[:skipped], ids[skipped:]
-    if any(block_id != _STAGE3_NULL_BLOCK_ID for block_id in dropped):
+        return list(map(int, block_ids))
+    # A long sliding-window request drops ~10^4 pages in each of ~50 groups,
+    # on every producer send and consumer load: check the dropped prefix with
+    # list.count and convert only the kept pages.
+    dropped = list(block_ids[:skipped])
+    kept = list(map(int, block_ids[skipped:]))
+    if dropped.count(_STAGE3_NULL_BLOCK_ID) != len(dropped):
+        ids = list(map(int, block_ids))
         raise ValueError(
             "Stage-3 sliding-window trim dropped pages that are not the null "
             f"block: group={group_label}, dropped={dropped}, ids={ids}, "
@@ -272,7 +282,8 @@ def _stage3_trim_window_pages(
     if len(set(kept)) != len(kept):
         raise ValueError(
             "Stage-3 sliding-window block table still repeats a page after "
-            f"trimming: group={group_label}, kept={kept}, ids={ids}, "
+            f"trimming: group={group_label}, kept={kept}, "
+            f"ids={list(map(int, block_ids))}, "
             f"skipped={skipped}, "
             f"num_tokens={num_tokens}, page_tokens={page_tokens}, "
             f"window={window_tokens}"
@@ -344,6 +355,9 @@ def _stage3_transfer_groups(
                 else _stage3_group_window_tokens(group.kv_cache_spec)
             ),
             slot=isinstance(group.kv_cache_spec, CircularBufferSpec),
+            prefix_cacheable=bool(
+                getattr(group.kv_cache_spec, "prefix_cacheable", True)
+            ),
         )
         for index, group in enumerate(kv_cache_groups)
         if not isinstance(group.kv_cache_spec, MambaSpec)
@@ -430,6 +444,9 @@ class _Stage3LoadMeta:
     # and excluded from the transfer. local_block_ids then holds only the
     # suffix pages; the source store clips its plan at
     # skip_tokens * token_bytes of the FA global destination byte space.
+    # DSv4 keeps every group's whole table in group_block_ids; the worker
+    # drops the hit's pages of the prefix-cacheable groups only, since the
+    # sliding-window and ring groups always travel whole.
     skip_tokens: int = 0
     # Full local hit: nothing to transfer; the worker only releases the
     # producer's request-block registration instead of pulling.
@@ -513,6 +530,66 @@ class _Stage3RegisteredSend:
     local_block_ids: tuple[int, ...]
     num_tokens: int
     expiration_time: float
+
+
+def _stage3_profiled(label: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Runs fn under cProfile when TPU_STAGE3_PROFILE=1 (diagnostics only)."""
+    if os.environ.get("TPU_STAGE3_PROFILE") != "1":
+        return fn(*args, **kwargs)
+    import cProfile
+    import io
+    import pstats
+
+    prof = cProfile.Profile()
+    result = prof.runcall(fn, *args, **kwargs)
+    out = io.StringIO()
+    pstats.Stats(prof, stream=out).sort_stats("tottime").print_stats(12)
+    logger.info("Stage-3 profile %s:\n%s", label, out.getvalue())
+    return result
+
+
+def _register_request_blocks_prelowered(
+    facade: Any,
+    *,
+    req_id: str,
+    uuid: int,
+    unit: Any,
+    block_ids: list[int],
+    pool_spans: Sequence[Any],
+) -> None:
+    """facade.register_request_blocks, handing the C++ ReshardClient the
+    registrations' pre-built wire tuples (DSv4 spans: ~10^5 per long request,
+    whose per-field conversion in the Python wrapper took ~70 ms)."""
+    impl = getattr(facade, "_impl", None)
+    if impl is None or not pool_spans or any(
+        getattr(entry, "wire_spans", None) is None for entry in pool_spans
+    ):
+        facade.register_request_blocks(
+            req_id=req_id,
+            uuid=uuid,
+            unit=unit,
+            block_ids=block_ids,
+            pool_spans=pool_spans,
+        )
+        return
+    from tpu_sync.api.torch import reshard_client as _reshard_client
+
+    impl.register_request_blocks(
+        str(req_id),
+        int(uuid),
+        _reshard_client._unit_tuple(unit),
+        [int(b) for b in block_ids],
+        [
+            {
+                "tag": str(entry.tag),
+                "block_ids": list(entry.block_ids),
+                "declared_bytes": int(entry.declared_bytes),
+                "dst_space_version": int(entry.dst_space_version),
+                "spans": list(entry.wire_spans),
+            }
+            for entry in pool_spans
+        ],
+    )
 
 
 def _get_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
@@ -844,6 +921,10 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                 self.connector_scheduler._stage3_mamba_num_speculative_blocks = (
                     stage3_mamba_num_speculative_blocks
                 )
+                self.connector_scheduler._stage3_bounded_replay = any(
+                    getattr(group.kv_cache_spec, "prefix_replay_tokens", 0) > 0
+                    for group in kv_cache_config.kv_cache_groups
+                )
             self.connector_worker = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
@@ -1029,13 +1110,51 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         return self.connector_worker.get_finished(finished_req_ids)
 
+    def skips_prefix_replay(self, request: "Request") -> bool:
+        """Read by the (patched) vLLM scheduler: this request's load restores
+        its exact KV state, so it is not rounded down nor replayed."""
+        scheduler = self.connector_scheduler
+        fn = getattr(scheduler, "skips_prefix_replay", None)
+        return bool(fn is not None and fn(request))
+
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
+        finished_sending, finished_recving = self.get_finished(finished_req_ids)
+        failed_recving: set[str] = set()
+        if self._stage3_reports_failed_requests():
+            # Failed receives are already in finished_recving; naming them
+            # here lets the scheduler recompute those requests whole.
+            failed_recving = set(finished_recving or ()) & set(
+                getattr(self.connector_worker, "_failed_recving", ())
+            )
+        return KVConnectorTransferResults(
+            finished_sending=set(finished_sending or ()),
+            finished_recving=set(finished_recving or ()),
+            failed_recving=failed_recving,
+        )
+
+    def _stage3_reports_failed_requests(self) -> bool:
+        """Block IDs are only unique within a group, so a model with several
+        transferred groups must report failed loads per request; vLLM raises
+        on invalid_block_ids for such models and the engine dies."""
+        return (
+            self.use_raiden
+            and _use_raiden_stage3_transport()
+            and len(self._stage3_transfer_groups) > 1
+        )
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         # Surface KV-load failures so the scheduler recomputes the affected
         # blocks instead of running with absent KV. Only the Raiden worker
         # tracks these; other backends fall back to the base (no errors).
         worker = self.connector_worker
         fn = getattr(worker, "get_block_ids_with_load_errors", None)
-        return fn() if fn is not None else set()
+        failed = fn() if fn is not None else set()
+        if self._stage3_reports_failed_requests():
+            # Drained above; the requests travel in failed_recving instead.
+            return set()
+        return failed
 
     def get_block_ids_with_load_errors_group_index(self) -> int | None:
         """Scopes Stage-3 load errors to the one transferred FA group."""
@@ -1508,6 +1627,14 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         self._stage3_transfer_groups: tuple[_Stage3TransferGroup, ...] = ()
         self._stage3_mamba_group_indices: list[int] = []
         self._stage3_mamba_num_speculative_blocks: int = 0
+        # Set by TPUConnector: DSv4.1 SWA bounded replay is on.
+        self._stage3_bounded_replay = False
+        # Decoder: req_id -> block-aligned local prefix hit seen by
+        # get_num_new_matched_tokens, read back after allocation.
+        self._stage3_local_hit_tokens: dict[str, int] = {}
+        # Decoder: requests whose load restores the exact KV state; the
+        # scheduler neither rounds nor replays them (skips_prefix_replay).
+        self._stage3_exact_load_reqs: set[str] = set()
         # Decoder: prefill (source) req_id -> the admitted destination
         # req_id.
         self._stage3_active_source_req_ids: dict[str, str] = {}
@@ -1674,6 +1801,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             # Do not replace it with prompt length here.
             transfer_tokens = request.kv_transfer_params["num_tokens"]
             count = max(transfer_tokens - num_computed_tokens, 0)
+            self._stage3_local_hit_tokens[request.request_id] = int(
+                num_computed_tokens
+            )
+            if count > 0 and self._stage3_exact_loads_enabled():
+                self._stage3_exact_load_reqs.add(request.request_id)
             if count > 0 and dist_utils.get_raiden_inline_load():
                 return count, False
             return count, count > 0
@@ -1787,6 +1919,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         num_external_tokens: int,
     ) -> None:
         """Declares a destination transfer without source physical IDs."""
+        local_hit_tokens = self._stage3_local_hit_tokens.pop(request.request_id, 0)
         if num_external_tokens <= 0:
             # First admission with a full local prefix hit: nothing to pull,
             # but the producer holds a request-block registration pinned until
@@ -1883,15 +2016,24 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 f"external={external_tokens}, num_tokens={num_tokens}",
             )
             return
-        # TODO: turn on prefix-aware loads for DSv4. The current path assumes
-        # an `fa` pool tag, one page size, and one block table, and DSv4 has
-        # none of those.
-        skip_tokens = (
-            num_tokens - external_tokens
-            if (self._stage3_prefix_aware_load_enabled and not multi_group)
-            else 0
-        )
-        if skip_tokens:
+        if multi_group and self._stage3_exact_loads_enabled():
+            # DSv4: the local hit's pages of the prefix-cacheable groups stay;
+            # everything past it, plus the sliding-window and ring groups at
+            # the producer's length, travels.
+            skip_tokens = int(local_hit_tokens)
+            reason = self._stage3_dsv4_skip_reason(
+                skip_tokens, external_tokens, num_tokens
+            )
+            if reason is not None:
+                self._fail_load(request, local_block_ids, reason)
+                return
+        else:
+            skip_tokens = (
+                num_tokens - external_tokens
+                if (self._stage3_prefix_aware_load_enabled and not multi_group)
+                else 0
+            )
+        if skip_tokens and not multi_group:
             # Partial local prefix hit: pull only the suffix, and only into
             # the trailing (newly allocated) pages — the leading adopted
             # cache pages are shared and must never be transfer targets.
@@ -1996,6 +2138,44 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return None
         return normalized
 
+    def _stage3_exact_loads_enabled(self) -> bool:
+        """DSv4 loads restore the exact KV state under SWA bounded replay.
+
+        Bounded replay rounds a load down to a scheduler block and recomputes
+        the hit's last window afterwards, a few hundred tokens of local
+        prefill on every request. Instead the load carries the
+        prefix-cacheable groups from the local hit to the producer's length
+        and the sliding-window and ring groups whole, and the scheduler
+        resumes at that length (`skips_prefix_replay`).
+        """
+        return (
+            self._stage3_bounded_replay
+            and self._stage3_prefix_aware_load_enabled
+            and len(self._stage3_transfer_groups) > 1
+        )
+
+    def skips_prefix_replay(self, request: "Request") -> bool:
+        return request.request_id in self._stage3_exact_load_reqs
+
+    def _stage3_dsv4_skip_reason(
+        self, skip_tokens: int, external_tokens: int, num_tokens: int
+    ) -> str | None:
+        """Why a DSv4 load cannot skip `skip_tokens` local tokens, or None."""
+        if skip_tokens + external_tokens != num_tokens:
+            return (
+                "Stage-3 DSv4 load must end at the producer's length: "
+                f"local_hit={skip_tokens}, external={external_tokens}, "
+                f"num_tokens={num_tokens}"
+            )
+        for group in self._stage3_transfer_groups:
+            if group.prefix_cacheable and skip_tokens % group.page_tokens:
+                return (
+                    f"Stage-3 DSv4 local hit {skip_tokens} is not aligned to "
+                    f"group g{group.cache_group_index}'s "
+                    f"{group.page_tokens}-token pages"
+                )
+        return None
+
     def _fail_load(
         self, request: "Request", local_block_ids: list[int], reason: str
     ) -> None:
@@ -2085,6 +2265,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
     ) -> tuple[bool, dict[str, Any] | None]:
         if not _use_raiden_stage3_transport():
             return super().request_finished(request, block_ids)
+        self._stage3_local_hit_tokens.pop(request.request_id, None)
+        self._stage3_exact_load_reqs.discard(request.request_id)
         if not self.is_producer:
             if (
                 os.environ.get("TPU_RAIDEN_DSV4_DEBUG_CHECKSUMS", "0") == "1"
@@ -3863,10 +4045,19 @@ class TPURaidenConnectorWorker:
                 # materialize the model's typed KV views and wait before
                 # handing them to the external transfer engine. Admission's
                 # raw storage buffers alone do not express those writes.
+                t_sync = time.perf_counter()
                 synchronize_tensors(self._flattened_kv_cache_tensors(), wait=True)
+                self._stage3_last_sync_ms = (time.perf_counter() - t_sync) * 1000
             if self._raiden_stage3_enabled():
                 if _use_raiden_dsv4_admission():
-                    self._register_stage3_request_blocks_dsv4(metadata)
+                    if metadata.reqs_to_send:
+                        _stage3_profiled(
+                            "producer register",
+                            self._register_stage3_request_blocks_dsv4,
+                            metadata,
+                        )
+                    else:
+                        self._register_stage3_request_blocks_dsv4(metadata)
                 elif _use_raiden_glm_admission() or _uses_tp_stage3_source(
                     self.vllm_config
                 ):
@@ -4454,10 +4645,33 @@ class TPURaidenConnectorWorker:
         dst_counts: list[int] = []
         for pool in self._stage3_dsv4_plan:
             pages = group_blocks[pool.plan_position].pages
+            pages = pages[self._stage3_dsv4_skipped_pages(req_meta, pool) :]
             transfer_tags.append(pool.tag)
             dst_blocks.extend(pages)
             dst_counts.append(len(pages))
         return transfer_tags, dst_blocks, dst_counts
+
+    def _stage3_dsv4_skipped_pages(self, req_meta: Any, pool: Any) -> int:
+        """Leading pages of `pool` the decode-local prefix hit already holds.
+
+        Only prefix-cacheable groups keep hit pages; the sliding-window and
+        ring groups are rebuilt from the producer whole. The producer
+        declares a group's pages back to back in one byte space, so the
+        same count, times the page's live bytes, is the tag's dst_skip_bytes.
+        """
+        skip_tokens = int(getattr(req_meta, "skip_tokens", 0) or 0)
+        group = self._stage3_dsv4_transfer_groups[pool.plan_position]
+        if not skip_tokens or not group.prefix_cacheable:
+            return 0
+        return skip_tokens // int(pool.page_tokens)
+
+    def _stage3_dsv4_skip_bytes(self, req_meta: Any) -> list[int]:
+        """Per-tag dst_skip_bytes of a DSv4 load, in receive-plan order."""
+        return [
+            self._stage3_dsv4_skipped_pages(req_meta, pool)
+            * int(pool.live_bytes_per_block)
+            for pool in self._stage3_dsv4_plan
+        ]
 
     def _stage3_dsv4_group_blocks(
         self, req_meta: Any, num_tokens: int
@@ -4684,6 +4898,7 @@ class TPURaidenConnectorWorker:
                 raise ValueError(
                     "Stage-3 producer send metadata requires a positive expiration_time"
                 )
+            t_lower = time.perf_counter()
             group_blocks = self._stage3_dsv4_group_blocks(req_meta, num_tokens)
             if self._stage3_dsv4_debug_enabled() and req_id not in self._stage3_registered_sends:
                 logger.info(
@@ -4746,8 +4961,10 @@ class TPURaidenConnectorWorker:
                         f"for req_id={req_id}"
                     )
                 continue
+            t_rpc = time.perf_counter()
             try:
-                facade.register_request_blocks(
+                _register_request_blocks_prelowered(
+                    facade,
                     req_id=req_id,
                     uuid=uuid,
                     unit=self._raiden_work_unit,
@@ -4788,6 +5005,9 @@ class TPURaidenConnectorWorker:
                 json.dumps(
                     {
                         "event": "raiden_stage3_dsv4_request_blocks_registered",
+                        "sync_ms": round(getattr(self, "_stage3_last_sync_ms", 0.0), 1),
+                        "lower_ms": round((t_rpc - t_lower) * 1000, 1),
+                        "rpc_ms": round((time.perf_counter() - t_rpc) * 1000, 1),
                         "req_id": req_id,
                         "uuid": uuid,
                         "num_tokens": num_tokens,
@@ -5637,7 +5857,9 @@ class TPURaidenConnectorWorker:
             skip_tokens = req_meta.skip_tokens
             fa_skip_bytes = 0
             clip_kwargs: dict[str, Any] = {}
-            if skip_tokens > 0:
+            if skip_tokens > 0 and _use_raiden_dsv4_admission():
+                clip_kwargs["dst_skip_bytes"] = self._stage3_dsv4_skip_bytes(req_meta)
+            elif skip_tokens > 0:
                 token_bytes = self._stage3_fa_token_bytes(
                     int(self.vllm_config.cache_config.block_size)
                 )
@@ -5698,10 +5920,15 @@ class TPURaidenConnectorWorker:
         """
         task = pending.task
         if task is None:
-            task = self._stage_stage3_submit_task(pending, synchronous)
+            t_stage = time.perf_counter()
+            task = _stage3_profiled(
+                "consumer stage", self._stage_stage3_submit_task, pending, synchronous
+            )
             if task is None:
                 return
             pending.task = task
+            pending.stage_ms = (time.perf_counter() - t_stage) * 1000
+        pending.dispatched_at = time.perf_counter()
         if self._stage3_sharded_consumer():
             self._stage3_tp_submits.add(pending.destination_req_id)
             if self.tp_rank != 0:
@@ -5910,6 +6137,13 @@ class TPURaidenConnectorWorker:
                     "state_group_count": self._stage3_state_group_count,
                     "destination_pages": len(pending.local_blocks),
                     "controller_submit_ms": outcome.submit_ms,
+                    "stage_ms": round(getattr(pending, "stage_ms", 0.0), 1),
+                    "queued_ms": round(
+                        (outcome.attempted_at - getattr(pending, "dispatched_at", outcome.attempted_at)) * 1000, 1
+                    ),
+                    "apply_delay_ms": round(
+                        (time.perf_counter() - outcome.attempted_at) * 1000 - outcome.submit_ms, 1
+                    ),
                 },
                 sort_keys=True,
             ),
@@ -6151,7 +6385,9 @@ class TPURaidenConnectorWorker:
             skip_tokens = int(getattr(req_meta, "skip_tokens", 0) or 0)
             fa_skip_bytes = 0
             clip_kwargs: dict[str, Any] = {}
-            if skip_tokens > 0:
+            if skip_tokens > 0 and _use_raiden_dsv4_admission():
+                clip_kwargs["dst_skip_bytes"] = self._stage3_dsv4_skip_bytes(req_meta)
+            elif skip_tokens > 0:
                 if _raiden_seq_on_lane_layout():
                     from vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane import (  # noqa: E501
                         sol_fa_geometry_from_manifest,

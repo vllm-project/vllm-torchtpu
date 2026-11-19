@@ -265,3 +265,198 @@ def test_dsv4_receive_plan_follows_the_pool_plan_order():
     assert tags == ["dsv4.swa.p0.g0", "dsv4.swa.p1.g0", "dsv4.state.csa.g1"]
     assert blocks == [11, 12, 13, 14, 11, 12, 13, 14, 7]
     assert counts == [4, 4, 1]
+
+
+
+def _skip_groups():
+    return (
+        tpu_connector._Stage3TransferGroup(
+            cache_group_index=0, page_tokens=32, window_tokens=128,
+            prefix_cacheable=False,
+        ),
+        tpu_connector._Stage3TransferGroup(cache_group_index=1, page_tokens=128),
+        tpu_connector._Stage3TransferGroup(cache_group_index=2, page_tokens=64),
+        tpu_connector._Stage3TransferGroup(
+            cache_group_index=3, page_tokens=8, slot=True, prefix_cacheable=False,
+        ),
+    )
+
+
+def _skip_worker():
+    worker = tpu_connector.TPURaidenConnectorWorker.__new__(
+        tpu_connector.TPURaidenConnectorWorker
+    )
+    worker._stage3_dsv4_transfer_groups = _skip_groups()
+    worker._stage3_dsv4_plan = (
+        types.SimpleNamespace(tag="dsv4.swa.g0", plan_position=0, page_tokens=32,
+                              live_bytes_per_block=4096),
+        types.SimpleNamespace(tag="dsv4.csa.nope.r2.g1", plan_position=1,
+                              page_tokens=128, live_bytes_per_block=1000),
+        types.SimpleNamespace(tag="dsv4.csa.rope.scale.r2.g1", plan_position=1,
+                              page_tokens=128, live_bytes_per_block=10),
+        types.SimpleNamespace(tag="dsv4.idx.r1.g2", plan_position=2,
+                              page_tokens=64, live_bytes_per_block=500),
+        types.SimpleNamespace(tag="dsv4.state.csa.g3", plan_position=3,
+                              page_tokens=8, live_bytes_per_block=64),
+    )
+    return worker
+
+
+def test_dsv4_prefix_hit_skips_only_the_cacheable_groups_hit_pages():
+    """A decode-local hit of 512 tokens drops those pages of the
+    prefix-cacheable groups (destination pages and producer bytes alike);
+    the SWA window and the ring slot at the producer's length travel whole."""
+    worker = _skip_worker()
+    # 1023 tokens: SWA window 128 at 32/page keeps pages 28..31 (24 nulls).
+    req_meta = types.SimpleNamespace(
+        skip_tokens=512,
+        group_block_ids=[
+            [0] * 28 + [41, 42, 43, 44],
+            [101, 102, 103, 104, 105, 106, 107, 108],
+            list(range(201, 217)),
+            [7],
+        ],
+    )
+    tags, blocks, counts = worker._stage3_dsv4_receive_plan(req_meta, 1023, "r1")
+    assert tags == [pool.tag for pool in worker._stage3_dsv4_plan]
+    assert counts == [4, 4, 4, 8, 1]
+    assert blocks == ([41, 42, 43, 44] + [105, 106, 107, 108] * 2
+                      + list(range(209, 217)) + [7])
+    assert worker._stage3_dsv4_skip_bytes(req_meta) == [0, 4000, 40, 4000, 0]
+
+
+def test_dsv4_load_without_hit_is_unchanged():
+    worker = _skip_worker()
+    req_meta = types.SimpleNamespace(
+        skip_tokens=0,
+        group_block_ids=[[0] * 28 + [41, 42, 43, 44], list(range(101, 109)),
+                         list(range(201, 217)), [7]],
+    )
+    _, blocks, counts = worker._stage3_dsv4_receive_plan(req_meta, 1023, "r1")
+    assert counts == [4, 8, 8, 16, 1]
+    assert worker._stage3_dsv4_skip_bytes(req_meta) == [0, 0, 0, 0, 0]
+
+
+def _skip_scheduler(replay=True, prefix_aware=True):
+    scheduler = tpu_connector.TPURaidenConnectorScheduler.__new__(
+        tpu_connector.TPURaidenConnectorScheduler
+    )
+    scheduler._stage3_transfer_groups = _skip_groups()
+    scheduler._stage3_bounded_replay = replay
+    scheduler._stage3_prefix_aware_load_enabled = prefix_aware
+    scheduler._stage3_exact_load_reqs = {"dst-1"}
+    return scheduler
+
+
+def test_exact_loads_need_bounded_replay_and_prefix_aware_loads():
+    assert _skip_scheduler()._stage3_exact_loads_enabled()
+    assert not _skip_scheduler(replay=False)._stage3_exact_loads_enabled()
+    assert not _skip_scheduler(prefix_aware=False)._stage3_exact_loads_enabled()
+    scheduler = _skip_scheduler()
+    assert scheduler.skips_prefix_replay(types.SimpleNamespace(request_id="dst-1"))
+    assert not scheduler.skips_prefix_replay(types.SimpleNamespace(request_id="x"))
+
+
+@pytest.mark.parametrize(
+    "skip,external,ok",
+    [
+        (512, 511, True),
+        (0, 1023, True),
+        # Rounded load: does not end at the producer's length.
+        (512, 256, False),
+        # Local hit not aligned to group 1's 128-token pages.
+        (576, 447, False),
+    ],
+)
+def test_dsv4_skip_reason(skip, external, ok):
+    reason = _skip_scheduler()._stage3_dsv4_skip_reason(skip, external, 1023)
+    assert (reason is None) == ok, reason
+
+
+def test_index_k_pages_travel_as_whole_halfplane_owner_rows():
+    """Halfplane Index-K packs records 2r and 2r+1 into the low and high 16
+    bits of owner row r, so a partial tail must ship whole owner rows: half
+    a row would carry only half the channels of its records."""
+    pool = _pool(_build(), "dsv4.idx.r2.g3")
+    (region,) = pool.regions
+    assert (region.unit_bytes, region.num_units) == (512, 64)
+    assert pool.live_bytes_per_block == PAGE_BYTES
+    # 6 tokens at 2 tokens per record = 3 records: owner rows 0 and 1, where
+    # row 1 holds record 2 in its low halfplanes.
+    base = pool.base_offset_bytes + pool.block_stride_bytes
+    assert _live_byte_ranges(pool, 1, 6, 256) == [(base, base + 2 * 512)]
+
+
+PRIVATE_SWA_PAGES = 7
+
+
+def _build_private_swa():
+    """The CSA2 SWA cache in its own window-sized BF16 pool (DeepseekV41SWAManager)."""
+    named, groups, raw, materialized = _materialization()
+    swa_owner = torch.zeros((PRIVATE_SWA_PAGES, 32, 512), dtype=torch.bfloat16)
+    materialized.native_cache_layouts[SWA] = (
+        (PRIVATE_SWA_PAGES, 32, 512),
+        torch.bfloat16,
+        32 * 512 * 2,
+        0,
+    )
+    materialized.native_raw_cache[SWA] = swa_owner
+    return rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=[*raw, swa_owner],
+        dsv41_materialized_kv=materialized,
+    )
+
+
+def test_private_swa_pool_moves_whole_pages_with_its_own_block_count():
+    manifest = _build_private_swa()
+    swa = _pool(manifest, "dsv4.swa.g0")
+    page = 32 * 512 * 2
+    assert swa.num_blocks == PRIVATE_SWA_PAGES
+    assert swa.storage_index != _pool(manifest, "dsv4.csa.nope.r2.g1").storage_index
+    assert (swa.regions[0].unit_bytes, swa.regions[0].num_units) == (page, 1)
+    # The XLA tiling interleaves rows inside the page, so even a partial page
+    # ships whole.
+    assert _live_byte_ranges(swa, 3, 5, 32) == [(3 * page, 4 * page)]
+    # The other groups keep the shared pool's block count.
+    assert _pool(manifest, "dsv4.csa.nope.r2.g1").num_blocks == NUM_BLOCKS
+
+
+def test_block_counts_must_agree_within_a_group_only():
+    def manifest(*pools):
+        return types.SimpleNamespace(
+            pools=[types.SimpleNamespace(tag=t, num_blocks=n) for t, n in pools]
+        )
+
+    rpm._check_dsv4_group_block_counts(
+        manifest(("dsv4.swa.g0", 7), ("dsv4.csa.nope.r2.g1", 4))
+    )
+    with pytest.raises(rpm.ManifestError, match="group 1 disagree"):
+        rpm._check_dsv4_group_block_counts(
+            manifest(("dsv4.csa.nope.r2.g1", 4), ("dsv4.csa.rope.scale.r2.g1", 5))
+        )
+
+
+def test_packed_fp8_index_pages_move_as_whole_owner_rows():
+    named, groups, raw, materialized = _materialization()
+    records = 64
+    materialized.native_cache_layouts[IDX] = (
+        (NUM_BLOCKS, records, rpm.DSV41_PACKED_FP8_INDEX_RECORD_BYTES),
+        torch.uint8,
+        PAGE_BYTES,
+        0,
+    )
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=raw,
+        dsv41_materialized_kv=materialized,
+    )
+    idx = _pool(manifest, "dsv4.idx.r2.g3")
+    page = -(-records * 132 // 512) * 512
+    assert (idx.regions[0].unit_bytes, idx.regions[0].num_units) == (page, 1)
+    assert idx.live_bytes_per_block == page
+    assert _live_byte_ranges(idx, 2, 3, 256) == [
+        (2 * PAGE_BYTES, 2 * PAGE_BYTES + page)
+    ]

@@ -52,6 +52,12 @@ class PoolSpanRegistration:
     # compact destination byte space (FA) — the controller splits at
     # destination pages (T3.4).
     dst_space_version: int = 0
+    # Optional pre-built wire tuples of ``spans`` (the ReshardClient span
+    # entry format), so a registration with ~10^5 spans skips the per-field
+    # conversion on every request.
+    wire_spans: tuple[tuple[int, ...], ...] | None = dataclasses.field(
+        default=None, compare=False, repr=False
+    )
 
 
 def owned_token_ranges(
@@ -526,21 +532,77 @@ def lower_dsv4_row_spans(
     tail_tokens = num_tokens - (num_pages - 1) * page_tokens
     tail_rows = -(-tail_tokens * rows_per_page // page_tokens)
     tail_bytes = tail_rows * row_bytes
+    # Every page but the last is a full page whose span depends only on the
+    # page ordinal and the geometry, so the full-page spans (and their wire
+    # tuples) are built once per geometry and shared by all requests.
+    full_spans, full_wire = _dsv4_full_page_spans(
+        live_bytes_per_block, transfer_rank, parallelism, num_pages - 1
+    )
+    # Owned full pages are transfer_rank, transfer_rank + parallelism, ...
+    num_full = len(range(transfer_rank, num_pages - 1, parallelism))
+    spans = full_spans[:num_full]
+    wire = full_wire[:num_full]
+    declared_bytes = num_full * live_bytes_per_block
+    last = num_pages - 1
+    if last % parallelism == transfer_rank:
+        offset = last * live_bytes_per_block
+        spans += (
+            PoolByteSpan(
+                src_block_ordinal=last,
+                src_offset_bytes=0,
+                dst_block_index=0,
+                dst_offset_bytes=offset,
+                size_bytes=tail_bytes,
+            ),
+        )
+        wire += ((last, 0, 0, offset, tail_bytes, 0, 0, 1, -1),)
+        declared_bytes += tail_bytes
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=tuple(map(int, block_ids)),
+        spans=spans,
+        declared_bytes=declared_bytes,
+        dst_space_version=1,
+        wire_spans=wire,
+    )
+
+
+# (live_bytes_per_block, transfer_rank, parallelism) -> (spans, wire tuples)
+# of the owned full pages, grown on demand.
+_DSV4_FULL_PAGE_SPANS: dict[
+    tuple[int, int, int],
+    tuple[tuple[PoolByteSpan, ...], tuple[tuple[int, ...], ...]],
+] = {}
+
+
+def _dsv4_full_page_spans(
+    live_bytes_per_block: int, transfer_rank: int, parallelism: int, num_pages: int
+) -> tuple[tuple[PoolByteSpan, ...], tuple[tuple[int, ...], ...]]:
+    key = (live_bytes_per_block, transfer_rank, parallelism)
+    cached = _DSV4_FULL_PAGE_SPANS.get(key)
+    if cached is not None and len(cached[0]) >= len(
+        range(transfer_rank, num_pages, parallelism)
+    ):
+        return cached
+    # Grow geometrically so a slowly increasing prompt length does not
+    # rebuild the table on every request.
+    target_pages = num_pages
+    if cached is not None:
+        target_pages = max(num_pages, 2 * len(cached[0]) * parallelism)
+    pages = range(transfer_rank, target_pages, parallelism)
     spans = tuple(
         PoolByteSpan(
             src_block_ordinal=page,
             src_offset_bytes=0,
             dst_block_index=0,
             dst_offset_bytes=page * live_bytes_per_block,
-            size_bytes=(tail_bytes if page == num_pages - 1 else live_bytes_per_block),
+            size_bytes=live_bytes_per_block,
         )
-        for page in range(num_pages)
-        if page % parallelism == transfer_rank
+        for page in pages
     )
-    return PoolSpanRegistration(
-        tag=tag,
-        block_ids=tuple(int(block_id) for block_id in block_ids),
-        spans=spans,
-        declared_bytes=sum(span.size_bytes for span in spans),
-        dst_space_version=1,
+    wire = tuple(
+        (page, 0, 0, page * live_bytes_per_block, live_bytes_per_block, 0, 0, 1, -1)
+        for page in pages
     )
+    _DSV4_FULL_PAGE_SPANS[key] = (spans, wire)
+    return spans, wire

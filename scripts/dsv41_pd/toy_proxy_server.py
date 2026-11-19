@@ -1,0 +1,1306 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import argparse
+import asyncio
+import codecs
+import collections
+import hashlib
+import itertools
+import json
+import logging
+import os
+import re
+
+try:
+    import orjson
+except ImportError:  # stdlib json then
+    orjson = None
+import threading
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+
+class _ProxyLatencyTracker:
+    """Small running latency summary for the proxy path."""
+
+    def __init__(self, log_interval_s: float):
+        self._log_interval_s = log_interval_s
+        self._lock = threading.Lock()
+        self._stats: dict[str, list[float]] = {}
+        self._next_log = time.monotonic() + log_interval_s
+
+    def record(self, phase: str, ms: float) -> None:
+        if self._log_interval_s <= 0:
+            return
+        msg: str | None = None
+        with self._lock:
+            stat = self._stats.setdefault(phase, [0.0, 0.0, ms, ms])
+            stat[0] += 1.0
+            stat[1] += ms
+            stat[2] = min(stat[2], ms)
+            stat[3] = max(stat[3], ms)
+
+            now = time.monotonic()
+            if now >= self._next_log:
+                self._next_log = now + self._log_interval_s
+                parts = []
+                for key in sorted(self._stats):
+                    n, total, min_ms, max_ms = self._stats[key]
+                    parts.append(
+                        f"{key}: n={int(n)} avg={total / n:.2f}ms "
+                        f"min={min_ms:.2f}ms max={max_ms:.2f}ms"
+                    )
+                msg = f"PERF PROXY latency summary | {' | '.join(parts)}"
+        if msg is not None:
+            print(msg, flush=True)
+            logger.info(msg)
+
+
+def _proxy_latency_interval() -> float:
+    val = os.getenv("PROXY_LATENCY_LOG_INTERVAL", "30")
+    try:
+        return float(val)
+    except ValueError:
+        return 30.0
+
+
+_PROXY_LATENCY = _ProxyLatencyTracker(_proxy_latency_interval())
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+# Retries here are deliberately limited to failures that provably occur before
+# any request byte is written to the socket, so the backend holds no state for
+# the request and a replay is indistinguishable from a first attempt:
+#   ConnectError   - the TCP/TLS connection was never established.
+#   ConnectTimeout - timed out establishing that connection.
+#   PoolTimeout    - timed out waiting for a free slot in the local pool, so we
+#                    never even got a socket to write to.
+# ConnectTimeout and PoolTimeout subclass TimeoutException, *not* ConnectError,
+# so they have to be named explicitly.
+#
+# Anything that fails *after* the request hits the wire (ReadError, WriteError,
+# ReadTimeout, 5xx) must NOT be retried from this proxy: vLLM derives its
+# internal request id straight from the X-Request-Id header we send, so a
+# replay is seen by the engine as the same request arriving twice. That trips
+# `assert existing.streaming_queue is not None, "duplicate request id"` in
+# Scheduler.add_request, which raises inside the engine loop and takes down the
+# whole EngineCore rather than failing the single request. On the decode hop it
+# additionally collides with the Raiden Stage-3 KV registration keyed by the
+# same id. Recovering those cases requires re-running prefill under a fresh
+# request id to mint a new KV uuid, which has to happen at the request-flow
+# level (see _handle_completions), not inside a per-hop wrapper.
+_PRE_SEND_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+_MAX_ATTEMPTS = max(1, _env_int("PROXY_MAX_ATTEMPTS", 5))
+_RETRY_BASE_DELAY_S = _env_float("PROXY_RETRY_BASE_DELAY_S", 0.5)
+
+
+def _log_unsafe_transport_failure(
+    phase: str, request_id: str, exc: Exception, detail: str = ""
+) -> None:
+    """Flag a failure that cannot be retried safely at this layer."""
+    msg = (
+        f"[UNSAFE-{phase}] req_id={request_id} failed after the request "
+        f"was already sent: {exc!r}. Not retrying: the server may have "
+        f"admitted this request, and replaying it with the same "
+        f"X-Request-Id would collide with the in-flight vLLM request id "
+        f"(and the Raiden KV registration on the decode hop). Recovery "
+        f"needs a fresh request id + new KV uuid and must be handled at "
+        f"the request-flow level, not in this per-hop retry wrapper."
+    )
+    if detail:
+        msg = f"{msg} {detail}"
+    print(msg, flush=True)
+    logger.error(msg)
+
+
+async def _backoff_before_retry(
+    attempt: int, phase: str, request_id: str, exc: Exception
+) -> None:
+    delay = _RETRY_BASE_DELAY_S * (2**attempt)
+    msg = (
+        f"[RETRY-{phase}] attempt {attempt + 1}/{_MAX_ATTEMPTS} "
+        f"failed for req_id={request_id}: {exc!r}, "
+        f"retrying in {delay:.1f}s"
+    )
+    print(msg, flush=True)
+    logger.warning(msg)
+    await asyncio.sleep(delay)
+
+
+def _json_body(req_data: dict, headers: dict) -> dict:
+    """httpx kwargs (body + headers) for a JSON POST. A rendered prompt is a
+    list of up to ~10^6 token ids; httpx's stdlib json encodes it in ~30 ms on
+    the event loop, once for P and once for D, serializing concurrent requests.
+    orjson takes ~3 ms."""
+    if orjson is None:
+        return {"json": req_data, "headers": headers}
+    return {
+        "content": orjson.dumps(req_data),
+        "headers": {**headers, "Content-Type": "application/json"},
+    }
+
+
+async def _post_with_retries(
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    headers: dict,
+    request_id: str,
+    phase: str,
+):
+    """POST to a backend, retrying only connection-establishment failures."""
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            response = await client_info["client"].post(
+                endpoint, **_json_body(req_data, headers)
+            )
+            response.raise_for_status()
+            return response
+        except _PRE_SEND_ERRORS as e:
+            if attempt == _MAX_ATTEMPTS - 1:
+                raise
+            await _backoff_before_retry(attempt, phase, request_id, e)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                _log_unsafe_transport_failure(phase, request_id, e)
+            raise
+        except httpx.TransportError as e:
+            _log_unsafe_transport_failure(phase, request_id, e)
+            raise
+
+
+def _render_endpoint_for_api(api: str) -> str | None:
+    # This vLLM build has no /v1/completions/render, so the proxy tokenizes once
+    # through /tokenize and sends the token IDs to both P and D; otherwise each
+    # of them tokenizes the raw text again, back to back on the TTFT path.
+    # PROXY_RENDER=0 restores raw-text forwarding.
+    if api == "/v1/completions" and os.environ.get("PROXY_RENDER", "1") != "0":
+        return "/tokenize"
+    return None
+
+
+# Local tokenization (PROXY_TOKENIZER=<dir with tokenizer.json>): the HF fast
+# tokenizer, split into chunks encoded in parallel. A chunk boundary is placed
+# only on a space between two ASCII letters: the pre-tokenizer always starts a
+# new piece at such a space (" word"), so the chunks' tokens concatenate to
+# exactly the whole-text tokenization. 557k tokens take ~0.2 s instead of
+# ~2.4 s through /tokenize.
+_SAFE_SPLIT = re.compile(r"(?<=[A-Za-z]) (?=[A-Za-z])")
+_LOCAL_TOKENIZER = None
+# Process pool for local rendering. Threads were not enough: building the
+# Python int list of ~10^6 ids holds the GIL, so with 4 long prompts in flight
+# each render took ~0.3 s instead of ~0.1 s and the event loop was starved
+# (the 4th request was not even accepted until the others finished). Workers
+# return the ids already JSON-encoded; the main process embeds the bytes with
+# orjson.Fragment and never materializes the ids.
+_RENDER_POOL = None
+
+
+def _render_worker_init(path: str) -> None:
+    global _LOCAL_TOKENIZER
+    from tokenizers import Tokenizer
+
+    _LOCAL_TOKENIZER = Tokenizer.from_file(os.path.join(path, "tokenizer.json"))
+    if int(os.environ.get("PROXY_RENDER_CACHE_MB", "0")) > 0:
+        global _RENDER_CACHE
+        _RENDER_CACHE = {}
+
+
+# Optional per-worker cache of chunk -> ids (PROXY_RENDER_CACHE_MB of chunk
+# text per worker, 0 = off). Chunk boundaries depend only on the text before
+# them, so prompts sharing a long prefix (multi-turn, shared documents) split
+# that prefix into the same chunks and only the tail is encoded again.
+_RENDER_CACHE: "dict[str, bytes] | None" = None
+_RENDER_CACHE_CHARS = 0
+
+
+def _render_ids_json(text: str) -> bytes:
+    if _RENDER_CACHE is None:
+        return orjson.dumps(_local_token_ids(text))
+    global _RENDER_CACHE_CHARS
+    pieces = _split_for_render(text)
+    parts: list = [_RENDER_CACHE.get(p) for p in pieces]
+    missing = {i for i, part in enumerate(parts) if part is None}
+    for i, piece in enumerate(pieces):
+        if i not in missing:  # refresh recency of hits before any eviction
+            _RENDER_CACHE[piece] = _RENDER_CACHE.pop(piece)
+    if missing:
+        encs = _LOCAL_TOKENIZER.encode_batch(
+            [pieces[i] for i in missing], add_special_tokens=False
+        )
+        limit = int(os.environ.get("PROXY_RENDER_CACHE_MB", "0")) << 20
+        for i, enc in zip(missing, encs):
+            parts[i] = orjson.dumps(enc.ids)[1:-1]
+            if pieces[i] in _RENDER_CACHE or len(pieces[i]) * 2 > limit:
+                continue
+            while _RENDER_CACHE and _RENDER_CACHE_CHARS + len(pieces[i]) > limit:
+                evicted = next(iter(_RENDER_CACHE))  # oldest insertion
+                _RENDER_CACHE_CHARS -= len(evicted)
+                del _RENDER_CACHE[evicted]
+            _RENDER_CACHE[pieces[i]] = parts[i]
+            _RENDER_CACHE_CHARS += len(pieces[i])
+    return b"[" + b",".join(part for part in parts if part) + b"]"
+
+
+def _load_local_tokenizer():
+    global _LOCAL_TOKENIZER
+    path = os.environ.get("PROXY_TOKENIZER")
+    if not path or os.environ.get("PROXY_RENDER", "1") == "0":
+        return
+    from tokenizers import Tokenizer
+
+    tok = Tokenizer.from_file(os.path.join(path, "tokenizer.json"))
+    # Chunks are encoded without special tokens; that is only the same as
+    # the server's encoding when the post-processor adds none.
+    probe = "The capital of France is"
+    if tok.encode(probe).ids != tok.encode(probe, add_special_tokens=False).ids:
+        logger.warning("PROXY_TOKENIZER adds special tokens; using /tokenize")
+        return
+    _LOCAL_TOKENIZER = tok
+    logger.info("Proxy tokenizes prompts locally from %s", path)
+    procs = int(os.environ.get("PROXY_TOKENIZER_PROCS", "8"))
+    if orjson is not None and procs > 0:
+        import concurrent.futures
+        import multiprocessing
+
+        global _RENDER_POOL
+        _RENDER_POOL = concurrent.futures.ProcessPoolExecutor(
+            max_workers=procs,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=_render_worker_init,
+            initargs=(path,),
+        )
+        # Start every worker now, not on the first long request.
+        for f in [_RENDER_POOL.submit(_render_ids_json, probe) for _ in range(procs * 2)]:
+            f.result()
+        print(f"PROXY render pool ready: {procs} processes", flush=True)
+
+
+def _local_token_ids(text: str) -> list[int]:
+    ids: list[int] = []
+    for enc in _LOCAL_TOKENIZER.encode_batch(
+        _split_for_render(text), add_special_tokens=False
+    ):
+        ids.extend(enc.ids)
+    return ids
+
+
+def _split_for_render(text: str, chunk_chars: int = 65536) -> list[str]:
+    cuts, pos = [0], 0
+    while pos + chunk_chars < len(text):
+        m = _SAFE_SPLIT.search(text, pos + chunk_chars)
+        if m is None:
+            break
+        cuts.append(m.start())
+        pos = m.start()
+    cuts.append(len(text))
+    return [text[a:b] for a, b in zip(cuts, cuts[1:])]
+
+
+def _token_ids_from_completion_render(rendered: Any) -> list[int] | list[list[int]]:
+    if isinstance(rendered, dict) and "tokens" in rendered:
+        # /tokenize response: {"count": n, "tokens": [...]}
+        rendered = [{"token_ids": rendered["tokens"]}]
+    if not isinstance(rendered, list) or not rendered:
+        raise ValueError("Completion render response must be a non-empty list")
+
+    prompts: list[list[int]] = []
+    for item in rendered:
+        if not isinstance(item, dict):
+            raise ValueError("Completion render item must be an object")
+        token_ids = item.get("token_ids")
+        if not isinstance(token_ids, list) or not all(
+            type(token_id) is int and token_id >= 0 for token_id in token_ids
+        ):
+            raise ValueError("Completion render item must contain token_ids")
+        prompts.append(token_ids)
+
+    return prompts[0] if len(prompts) == 1 else prompts
+
+
+def _replace_prompt_with_rendered_token_ids(req_data: dict, rendered: Any) -> dict:
+    req_data = req_data.copy()
+    req_data["prompt"] = _token_ids_from_completion_render(rendered)
+    req_data.pop("prompt_embeds", None)
+    return req_data
+
+
+def _json_escape_non_ascii(text: str) -> bytes:
+    """Encode text as ASCII bytes while preserving JSON string semantics."""
+    if text.isascii():
+        return text.encode("ascii")
+
+    parts = []
+    for char in text:
+        codepoint = ord(char)
+        if codepoint < 128:
+            parts.append(char)
+        elif codepoint <= 0xFFFF:
+            parts.append(f"\\u{codepoint:04x}")
+        else:
+            codepoint -= 0x10000
+            high_surrogate = 0xD800 + (codepoint >> 10)
+            low_surrogate = 0xDC00 + (codepoint & 0x3FF)
+            parts.append(f"\\u{high_surrogate:04x}\\u{low_surrogate:04x}")
+    return "".join(parts).encode("ascii")
+
+
+class _AsciiSafeStreamEncoder:
+    """Converts UTF-8 stream chunks to ASCII-only JSON-compatible chunks."""
+
+    def __init__(self):
+        self._decoder = codecs.getincrementaldecoder("utf-8")()
+
+    def encode(self, chunk: bytes = b"", *, final: bool = False) -> bytes:
+        text = self._decoder.decode(chunk, final=final)
+        if not text:
+            return b""
+        return _json_escape_non_ascii(text)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Lifespan context manager to handle startup and shutdown events.
+    """
+    _load_local_tokenizer()
+    # Startup: Initialize client pools for prefiller and decoder services
+    app.state.prefill_clients = []
+    app.state.decode_clients = []
+
+    # keepalive_expiry must stay *below* the backend's keep-alive timeout,
+    # otherwise the pool hands out sockets the server has already reaped and
+    # the next request dies with ReadError/RemoteProtocolError -- which we
+    # cannot retry safely (see _PRE_SEND_ERRORS above). vLLM runs uvicorn with
+    # timeout_keep_alive=VLLM_HTTP_TIMEOUT_KEEP_ALIVE, default 5s, and httpx's
+    # own default expiry is also 5.0, so out of the box the two race exactly.
+    # 4.0 buys a second of margin; raise VLLM_HTTP_TIMEOUT_KEEP_ALIVE on the
+    # backends if you want longer-lived connections.
+    keepalive_expiry = _env_float("PROXY_KEEPALIVE_EXPIRY_S", 4.0)
+    limits = httpx.Limits(
+        max_connections=None,
+        max_keepalive_connections=None,
+        keepalive_expiry=keepalive_expiry,
+    )
+
+    # Create prefill clients
+    for i, (host, port) in enumerate(global_args.prefiller_instances):
+        prefiller_base_url = f"http://{host}:{port}"
+        app.state.prefill_clients.append(
+            {
+                "client": httpx.AsyncClient(
+                    timeout=None, base_url=prefiller_base_url, limits=limits
+                ),
+                "host": host,
+                "port": port,
+                "id": i,
+            }
+        )
+
+    # Create decode clients
+    for i, (host, port) in enumerate(global_args.decoder_instances):
+        decoder_base_url = f"http://{host}:{port}"
+        app.state.decode_clients.append(
+            {
+                "client": httpx.AsyncClient(
+                    timeout=None, base_url=decoder_base_url, limits=limits
+                ),
+                "host": host,
+                "port": port,
+                "id": i,
+            }
+        )
+
+    # Initialize round-robin iterators
+    app.state.prefill_iterator = itertools.cycle(range(len(app.state.prefill_clients)))
+    app.state.decode_iterator = itertools.cycle(range(len(app.state.decode_clients)))
+
+    print(
+        f"Initialized {len(app.state.prefill_clients)} prefill clients "
+        f"and {len(app.state.decode_clients)} decode clients."
+    )
+
+    yield
+
+    # Shutdown: Close all clients
+    for client_info in app.state.prefill_clients:
+        await client_info["client"].aclose()
+
+    for client_info in app.state.decode_clients:
+        await client_info["client"].aclose()
+
+
+# Update FastAPI app initialization to use lifespan
+app = FastAPI(lifespan=lifespan)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--host", type=str, default="localhost")
+
+    # For prefiller instances
+    parser.add_argument(
+        "--prefiller-hosts",
+        "--prefiller-host",
+        type=str,
+        nargs="+",
+        default=["localhost"],
+    )
+    parser.add_argument(
+        "--prefiller-ports", "--prefiller-port", type=int, nargs="+", default=[8400]
+    )
+
+    # For decoder instances
+    parser.add_argument(
+        "--decoder-hosts", "--decoder-host", type=str, nargs="+", default=["localhost"]
+    )
+    parser.add_argument(
+        "--decoder-ports", "--decoder-port", type=int, nargs="+", default=[9400]
+    )
+
+    args = parser.parse_args()
+
+    # Validate and pair hosts with ports
+    if len(args.prefiller_hosts) != len(args.prefiller_ports):
+        raise ValueError(
+            "Number of prefiller hosts must match number of prefiller ports"
+        )
+
+    if len(args.decoder_hosts) != len(args.decoder_ports):
+        raise ValueError("Number of decoder hosts must match number of decoder ports")
+
+    # Create tuples of (host, port) for each service type
+    args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
+    args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
+
+    return args
+
+
+def get_next_client(app, service_type: str):
+    """
+    Get the next client in round-robin fashion.
+
+    Args:
+        app: The FastAPI app instance
+        service_type: Either 'prefill' or 'decode'
+
+    Returns:
+        The next client to use
+    """
+    if service_type == "prefill":
+        client_idx = next(app.state.prefill_iterator)
+        return app.state.prefill_clients[client_idx]
+    elif service_type == "decode":
+        client_idx = next(app.state.decode_iterator)
+        return app.state.decode_clients[client_idx]
+    else:
+        raise ValueError(f"Unknown service type: {service_type}")
+
+
+async def send_request_to_prefill(
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    forwarded: dict | None = None,
+):
+    """
+    Send a request to a service using a client from the pool.
+    """
+    req_data = req_data.copy()
+    # Must overwrite these for prefill workers.
+    req_data["stream"] = False
+    req_data["max_tokens"] = 1
+    if _REUSE_PROMPT_IDS and "messages" in req_data:
+        # Have P return the ids it rendered, so the decode hop reuses them
+        # (kv_transfer_params["prompt_token_ids"]) instead of templating and
+        # tokenizing the conversation again on the TTFT path.
+        req_data["return_token_ids"] = True
+    if "max_completion_tokens" in req_data:
+        req_data["max_completion_tokens"] = 1
+    if "stream_options" in req_data:
+        del req_data["stream_options"]
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        "X-Request-Id": request_id,
+        **(forwarded or {}),
+    }
+
+    return await _post_with_retries(
+        client_info, endpoint, req_data, headers, request_id, phase="PREFILL"
+    )
+
+
+async def render_completion_prompt(
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    forwarded: dict | None = None,
+):
+    """
+    Render/tokenize a completion request once so downstream P/D requests can
+    use prompt token IDs instead of retokenizing raw text independently.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        "X-Request-Id": request_id,
+        **(forwarded or {}),
+    }
+
+    return await _post_with_retries(
+        client_info, endpoint, req_data, headers, request_id, phase="RENDER"
+    )
+
+
+async def stream_from_decode(
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    forwarded: dict | None = None,
+):
+    """
+    Asynchronously stream response from a service using a client from the pool.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        "X-Request-Id": request_id,
+        **(forwarded or {}),
+    }
+
+    for attempt in range(_MAX_ATTEMPTS):
+        yielded_any = False
+        try:
+            async with client_info["client"].stream(
+                "POST", endpoint, **_json_body(req_data, headers)
+            ) as response:
+                if response.status_code >= 400:
+                    # Streaming responses are not read on entry, so pull the
+                    # body first or the raised error carries no vLLM detail.
+                    await response.aread()
+                response.raise_for_status()
+                encoder = _AsciiSafeStreamEncoder()
+                async for chunk in response.aiter_bytes():
+                    chunk = encoder.encode(chunk)
+                    if chunk:
+                        yielded_any = True
+                        yield chunk
+                chunk = encoder.encode(final=True)
+                if chunk:
+                    yielded_any = True
+                    yield chunk
+            return
+        except _PRE_SEND_ERRORS as e:
+            # Never reached the decode server, so the KV handle minted by
+            # prefill is still parked and unclaimed: safe to re-send as-is.
+            if attempt == _MAX_ATTEMPTS - 1:
+                raise
+            await _backoff_before_retry(attempt, "DECODE", request_id, e)
+        except (httpx.TransportError, httpx.HTTPStatusError) as e:
+            if yielded_any:
+                detail = (
+                    "Stream had already emitted bytes to the client, "
+                    "so the response is truncated."
+                )
+            else:
+                detail = (
+                    "Failed before the first byte; the client will "
+                    "still see HTTP 200 followed by an empty/short "
+                    "body because StreamingResponse has already "
+                    "flushed headers."
+                )
+            _log_unsafe_transport_failure("DECODE", request_id, e, detail)
+            raise
+
+
+# Send alignment (PROXY_ALIGN_MS, 0 = off). Under EP the prefill DP ranks step
+# in lockstep, so requests that arrive together must reach the engines within
+# the same wave-start window (VLLM_DP_WAVE_START_DELAY_MS) or the late one
+# waits a whole step. Rendering times differ by tens of ms between concurrent
+# long prompts; requests arriving within PROXY_ALIGN_MS of the first one of a
+# group are therefore sent to prefill together, once all of them are rendered.
+_ALIGN_S = _env_float("PROXY_ALIGN_MS", 0.0) / 1000.0
+
+
+class _AlignGroup:
+    def __init__(self):
+        self.pending = 0
+        self.open = True
+        self.released = asyncio.Event()
+
+    def close(self) -> None:
+        self.open = False
+        self._maybe_release()
+
+    def leave(self) -> None:
+        self.pending -= 1
+        self._maybe_release()
+
+    def _maybe_release(self) -> None:
+        if not self.open and self.pending == 0:
+            self.released.set()
+
+
+_ALIGN_GROUP: _AlignGroup | None = None
+
+
+def _align_join() -> _AlignGroup:
+    global _ALIGN_GROUP
+    group = _ALIGN_GROUP
+    if group is None or not group.open:
+        group = _ALIGN_GROUP = _AlignGroup()
+        asyncio.get_running_loop().call_later(_ALIGN_S, group.close)
+    group.pending += 1
+    return group
+
+
+
+# PROXY_SESSION_AFFINITY_DP=<dp size> (default 0 = off): a request without an
+# X-data-parallel-rank header is pinned to rank hash(conversation head) % dp on
+# both hops. Prefix caches are per DP rank, and a multi-turn conversation only
+# appends to its messages, so every turn of one conversation lands on the rank
+# that already holds its prefix (agentic replay: P hit rate 26% -> see notes).
+# PROXY_REUSE_PROMPT_IDS=1 (default): for chat requests, the decode hop reuses
+# the prompt token ids the prefill hop rendered (vLLM decode-side token reuse
+# via kv_transfer_params["prompt_token_ids"]) instead of re-rendering; one
+# ~130k-token conversation costs ~0.35 s to template and tokenize per hop.
+_REUSE_PROMPT_IDS = os.environ.get("PROXY_REUSE_PROMPT_IDS", "1") != "0"
+
+
+class _HitDiag:
+    """PROXY_HIT_DIAG=1: per-request prefix-hit accounting from P's prompt ids.
+
+    Prompts are cut into 128-token blocks with chained hashes. For each request
+    it logs how many leading tokens were seen before in the same conversation,
+    on the same P rank (an LRU sized like that rank's KV cache) and anywhere
+    (unbounded, i.e. a single shared cache), next to what P reports cached.
+    """
+
+    BLOCK = 128
+
+    def __init__(self, rank_blocks: int, global_blocks: int = 8_000_000):
+        self.rank_blocks = rank_blocks
+        self.global_blocks = global_blocks
+        self.sessions: "collections.OrderedDict[int, list[bytes]]" = collections.OrderedDict()
+        self.ranks: dict[int, "collections.OrderedDict[bytes, None]"] = {}
+        self.seen: "collections.OrderedDict[bytes, None]" = collections.OrderedDict()
+
+    def _hashes(self, ids: list[int]) -> list[bytes]:
+        import array
+
+        raw = array.array("i", ids).tobytes()
+        step, prev, out = self.BLOCK * 4, b"", []
+        for i in range(0, len(raw) - step + 1, step):
+            prev = hashlib.blake2b(prev + raw[i : i + step], digest_size=8).digest()
+            out.append(prev)
+        return out
+
+    @staticmethod
+    def _lcp(hashes: list[bytes], contains) -> int:
+        n = 0
+        for h in hashes:
+            if not contains(h):
+                break
+            n += 1
+        return n
+
+    def observe(self, key: int | None, rank: int, ids: list[int]) -> tuple[int, int, int]:
+        hs = self._hashes(ids)
+        prev = set(self.sessions.get(key, ())) if key is not None else set()
+        cache = self.ranks.setdefault(rank, collections.OrderedDict())
+        sess = self._lcp(hs, prev.__contains__)
+        rank_hit = self._lcp(hs, cache.__contains__)
+        glob = self._lcp(hs, self.seen.__contains__)
+        for h in hs:
+            cache[h] = None
+            cache.move_to_end(h)
+            self.seen[h] = None
+            self.seen.move_to_end(h)
+        while len(cache) > self.rank_blocks:
+            cache.popitem(last=False)
+        while len(self.seen) > self.global_blocks:
+            self.seen.popitem(last=False)
+        if key is not None:
+            self.sessions[key] = hs
+            self.sessions.move_to_end(key)
+            while len(self.sessions) > 8192:
+                self.sessions.popitem(last=False)
+        b = self.BLOCK
+        return sess * b, rank_hit * b, glob * b
+
+
+_HIT_DIAG = (
+    _HitDiag(int(os.environ.get("PROXY_HIT_DIAG_RANK_TOKENS", "8874043")) // _HitDiag.BLOCK)
+    if os.environ.get("PROXY_HIT_DIAG", "0") == "1"
+    else None
+)
+
+_SESSION_AFFINITY_DP = int(os.environ.get("PROXY_SESSION_AFFINITY_DP", "0"))
+
+
+def _dumps(obj: Any) -> bytes:
+    if orjson is not None:
+        return orjson.dumps(obj)
+    return json.dumps(obj, separators=(",", ":")).encode()
+
+
+def _session_key(req_data: dict) -> int | None:
+    """Stable key of the conversation `req_data` belongs to, or None."""
+    if _SESSION_AFFINITY_DP <= 1:
+        return None
+    messages = req_data.get("messages")
+    if isinstance(messages, list) and messages:
+        # The system prompt is usually shared by every conversation and can be
+        # long, so key on the head of the system prompt AND of the first user
+        # message (where per-conversation markers such as aiperf's cache-bust
+        # RID sit); a later turn only appends messages, keeping both heads.
+        system = next((m for m in messages if m.get("role") == "system"), None)
+        user = next((m for m in messages if m.get("role") == "user"), None)
+        head = b"".join(
+            _dumps(m.get("content", ""))[:4096] if isinstance(m, dict) else b""
+            for m in (system, user)
+        )
+    else:
+        prompt = req_data.get("prompt")
+        if isinstance(prompt, str):
+            head = prompt[:8192].encode()
+        elif isinstance(prompt, list) and prompt:
+            head = _dumps(prompt[:2048])
+        else:
+            return None
+    digest = hashlib.blake2b(head, digest_size=8).digest()
+    return int.from_bytes(digest, "little")
+
+
+class _SessionRouter:
+    """Pins conversations to prefill DP ranks, keeping prefix-cache affinity
+    without letting a few long conversations pile up on one rank.
+
+    Each rank carries its outstanding prefill work in estimated tokens (request
+    bytes / 4). A first-seen conversation computes its whole prompt, so it goes
+    to the least-loaded rank. A known conversation only computes what it
+    appended since its last turn and stays on its rank, unless waiting there
+    (queued work + its new tokens) costs more than `migrate_factor` times
+    recomputing its whole prompt on the least-loaded rank; then it moves and
+    remembers the new rank (a low factor migrates often, and each migration's
+    full recompute loads its target). PROXY_AFFINITY_MIGRATE_FACTOR (default 3,
+    0 = never migrate); PROXY_AFFINITY_BALANCE=0 keeps plain hash % dp.
+    """
+
+    def __init__(
+        self,
+        dp: int,
+        balance: bool,
+        migrate_factor: float = 3.0,
+        capacity: int = 200_000,
+    ):
+        self.dp = dp
+        self.balance = balance
+        self.migrate_factor = migrate_factor
+        self.capacity = capacity
+        self.work = [0] * dp
+        self.homes: "collections.OrderedDict[int, tuple[int, int]]" = (
+            collections.OrderedDict()
+        )
+        self.migrations = 0
+
+    def assign(self, key: int, prompt_tokens: int) -> tuple[int, int]:
+        """(rank, work charged to it) for one request of conversation `key`."""
+        if not self.balance:
+            return key % self.dp, 0
+        least = min(range(self.dp), key=lambda r: (self.work[r], (key + r) % self.dp))
+        home = self.homes.get(key)
+        if home is None:
+            rank, work = least, prompt_tokens
+        else:
+            rank, last_tokens = home
+            work = max(prompt_tokens - last_tokens, 512)
+            if self.migrate_factor > 0 and self.work[rank] + work > (
+                self.migrate_factor * (self.work[least] + prompt_tokens)
+            ):
+                rank, work = least, prompt_tokens
+                self.migrations += 1
+        self.homes[key] = (rank, prompt_tokens)
+        self.homes.move_to_end(key)
+        while len(self.homes) > self.capacity:
+            self.homes.popitem(last=False)
+        self.work[rank] += work
+        return rank, work
+
+    def release(self, rank: int, work: int) -> None:
+        self.work[rank] = max(0, self.work[rank] - work)
+
+
+class _PrefixRouter:
+    """Routes each request to the prefill DP rank that already caches the
+    longest prefix of it (default when PROXY_SESSION_AFFINITY_DP > 1;
+    PROXY_PREFIX_ROUTING=0 falls back to _SessionRouter).
+
+    The request's messages (and tools) are flattened to text and cut into
+    fixed-size character blocks with chained hashes; each rank keeps an LRU of
+    the blocks sent to it, sized like its KV cache. A request goes to the rank
+    holding its longest cached prefix, so a conversation follows its cache and
+    so does a subagent whose context starts with its parent's; it moves to the
+    cheapest rank (queued work + tokens to compute) only when staying costs
+    more than PROXY_PREFIX_MIGRATE_FACTOR times that (default 0 = never: on
+    AgentX c512 the recompute a move causes cost more than the imbalance it
+    fixed). Queued work is charged at routing time and released when the
+    prefill returns.
+    """
+
+    BLOCK_CHARS = 2048
+    CHARS_PER_TOKEN = 3.5
+
+    def __init__(self, dp: int, rank_tokens: int, migrate_factor: float):
+        self.dp = dp
+        self.capacity = int(rank_tokens * self.CHARS_PER_TOKEN / self.BLOCK_CHARS)
+        self.migrate_factor = migrate_factor
+        self.work = [0] * dp
+        self.caches = [collections.OrderedDict() for _ in range(dp)]
+        self.migrations = 0  # requests not sent to their longest-match rank
+
+    @staticmethod
+    def _text(req_data: dict) -> str | None:
+        messages = req_data.get("messages")
+        if isinstance(messages, list) and messages:
+            parts = []
+            if req_data.get("tools"):
+                parts.append(_dumps(req_data["tools"]).decode())
+            for m in messages:
+                if not isinstance(m, dict):
+                    continue
+                c = m.get("content", "")
+                parts.append(f"\x00{m.get('role')}\x00")
+                parts.append(c if isinstance(c, str) else _dumps(c).decode())
+                if m.get("tool_calls"):
+                    parts.append(_dumps(m["tool_calls"]).decode())
+            return "".join(parts)
+        prompt = req_data.get("prompt")
+        return prompt if isinstance(prompt, str) else None
+
+    def assign(self, req_data: dict) -> tuple[int, int] | None:
+        text = self._text(req_data)
+        if text is None:
+            return None
+        raw = text.encode("utf-8", "surrogatepass")
+        step, prev, hashes = self.BLOCK_CHARS, b"", []
+        for i in range(0, len(raw) - step + 1, step):
+            prev = hashlib.blake2b(prev + raw[i : i + step], digest_size=8).digest()
+            hashes.append(prev)
+        total = len(raw) / self.CHARS_PER_TOKEN
+        matches, costs = [], []
+        for r in range(self.dp):
+            cache, n = self.caches[r], 0
+            for h in hashes:
+                if h not in cache:
+                    break
+                n += 1
+            matches.append(n)
+            costs.append(self.work[r] + total - n * step / self.CHARS_PER_TOKEN)
+        # Stay with the longest cached prefix (least loaded among ties); move
+        # only if that costs more than `migrate_factor` x the cheapest rank,
+        # since a move recomputes the prefix and adds load P cannot spare.
+        home = max(range(self.dp), key=lambda r: (matches[r], -costs[r]))
+        cheapest = min(range(self.dp), key=lambda r: (costs[r], -matches[r]))
+        best = home
+        if (
+            matches[home] > 0
+            and self.migrate_factor > 0
+            and costs[home] > self.migrate_factor * costs[cheapest]
+        ):
+            best = cheapest
+            self.migrations += 1
+        elif matches[home] == 0:
+            best = cheapest
+        best_match = matches[best]
+        cache = self.caches[best]
+        for h in hashes:
+            cache[h] = None
+            cache.move_to_end(h)
+        while len(cache) > self.capacity:
+            cache.popitem(last=False)
+        work = int(max(total - best_match * step / self.CHARS_PER_TOKEN, 512))
+        self.work[best] += work
+        return best, work
+
+    def release(self, rank: int, work: int) -> None:
+        self.work[rank] = max(0, self.work[rank] - work)
+
+
+_PREFIX_ROUTER = (
+    _PrefixRouter(
+        _SESSION_AFFINITY_DP,
+        int(os.environ.get("PROXY_PREFIX_RANK_TOKENS", "8874043")),
+        float(os.environ.get("PROXY_PREFIX_MIGRATE_FACTOR", "0")),
+    )
+    if _SESSION_AFFINITY_DP > 1 and os.environ.get("PROXY_PREFIX_ROUTING", "1") == "1"
+    else None
+)
+
+class _DecodeRouter:
+    """Picks the DECODE DP rank (PROXY_DECODE_ROUTING=1; default off = the
+    decode hop reuses the prefill rank header).
+
+    D keeps a prefix cache and pulls only the uncached part of the KV, so a
+    request prefers the D rank holding its longest prefix (same block hashes
+    as _PrefixRouter). D's ranks step in lockstep, so the busiest rank sets
+    the step time for all of them; a request leaves its prefix rank for the
+    rank with the fewest in-flight decode streams when its prefix rank has
+    more than PROXY_DECODE_SLACK (default 2) streams above that minimum.
+    """
+
+    def __init__(self, dp: int, rank_tokens: int, slack: int):
+        self.dp = dp
+        self.slack = slack
+        self.capacity = int(
+            rank_tokens * _PrefixRouter.CHARS_PER_TOKEN / _PrefixRouter.BLOCK_CHARS
+        )
+        self.active = [0] * dp
+        self.caches = [collections.OrderedDict() for _ in range(dp)]
+        self.moves = 0  # requests sent away from their longest-prefix rank
+
+    @staticmethod
+    def hashes(req_data: dict) -> list[bytes] | None:
+        text = _PrefixRouter._text(req_data)
+        if text is None:
+            return None
+        raw = text.encode("utf-8", "surrogatepass")
+        step, prev, out = _PrefixRouter.BLOCK_CHARS, b"", []
+        for i in range(0, len(raw) - step + 1, step):
+            prev = hashlib.blake2b(prev + raw[i : i + step], digest_size=8).digest()
+            out.append(prev)
+        return out
+
+    def assign(self, hashes: list[bytes]) -> tuple[int, int, bool]:
+        matches = []
+        for r in range(self.dp):
+            cache, n = self.caches[r], 0
+            for h in hashes:
+                if h not in cache:
+                    break
+                n += 1
+            matches.append(n)
+        least = min(range(self.dp), key=lambda r: (self.active[r], -matches[r]))
+        home = max(range(self.dp), key=lambda r: (matches[r], -self.active[r]))
+        moved = False
+        if matches[home] == 0:
+            best = least
+        elif self.active[home] - self.active[least] > self.slack:
+            best, moved = least, True
+            self.moves += 1
+        else:
+            best = home
+        cache = self.caches[best]
+        for h in hashes:
+            cache[h] = None
+            cache.move_to_end(h)
+        while len(cache) > self.capacity:
+            cache.popitem(last=False)
+        self.active[best] += 1
+        return best, matches[best], moved
+
+    def release(self, rank: int) -> None:
+        self.active[rank] = max(0, self.active[rank] - 1)
+
+
+_DECODE_ROUTER = (
+    _DecodeRouter(
+        _SESSION_AFFINITY_DP,
+        int(os.environ.get("PROXY_DECODE_RANK_TOKENS", "8874043")),
+        int(os.environ.get("PROXY_DECODE_SLACK", "2")),
+    )
+    if _SESSION_AFFINITY_DP > 1 and os.environ.get("PROXY_DECODE_ROUTING", "0") == "1"
+    else None
+)
+
+_SESSION_ROUTER = (
+    _SessionRouter(
+        _SESSION_AFFINITY_DP,
+        balance=os.environ.get("PROXY_AFFINITY_BALANCE", "1") != "0",
+        migrate_factor=float(os.environ.get("PROXY_AFFINITY_MIGRATE_FACTOR", "3")),
+    )
+    if _SESSION_AFFINITY_DP > 1
+    else None
+)
+
+
+async def _handle_completions(api: str, request: Request):
+    align = _align_join() if _ALIGN_S > 0 else None
+    try:
+        t_request_recv_perf = time.perf_counter()
+        req_data = await request.json()
+        request_id = str(uuid.uuid4())
+        # vLLM sends a request carrying X-data-parallel-rank to that DP rank of
+        # the engine. Passed to both hops, so that a client can hold a request
+        # to one prefill replica and one decode replica.
+        forwarded = {}
+        if (dp_rank := request.headers.get("X-data-parallel-rank")) is not None:
+            forwarded["X-data-parallel-rank"] = dp_rank
+        routed: tuple[int, int] | None = None
+        session_key = None
+        client_rank = "X-data-parallel-rank" in forwarded
+        d_hashes = (
+            _DecodeRouter.hashes(req_data)
+            if _DECODE_ROUTER is not None and not client_rank
+            else None
+        )
+        router = _PREFIX_ROUTER or _SESSION_ROUTER
+        if "X-data-parallel-rank" not in forwarded and _PREFIX_ROUTER is not None:
+            routed = _PREFIX_ROUTER.assign(req_data)
+            if routed is not None:
+                forwarded["X-data-parallel-rank"] = str(routed[0])
+                session_key = _session_key(req_data)
+        elif "X-data-parallel-rank" not in forwarded and _SESSION_ROUTER is not None:
+            if (session_key := _session_key(req_data)) is not None:
+                prompt_tokens = len(await request.body()) // 4
+                routed = _SESSION_ROUTER.assign(session_key, prompt_tokens)
+                forwarded["X-data-parallel-rank"] = str(routed[0])
+        route_log = (
+            f" rank={routed[0]} work={routed[1]} migrations={router.migrations}"
+            if routed is not None
+            else ""
+        )
+        print(
+            f"PERF PROXY req_received req_id={request_id} ts={time.time():.6f}"
+            f"{route_log}",
+            flush=True,
+        )
+
+        # Get the next prefill client in round-robin fashion
+        prefill_client_info = get_next_client(request.app, "prefill")
+        render_endpoint = _render_endpoint_for_api(api)
+        if render_endpoint is not None and isinstance(req_data.get("prompt"), str):
+            t_render = time.perf_counter()
+            if _RENDER_POOL is not None:
+                ids_json = await asyncio.get_running_loop().run_in_executor(
+                    _RENDER_POOL, _render_ids_json, req_data["prompt"]
+                )
+                local_ids = orjson.Fragment(ids_json)
+                rendered = None
+                where = "local-proc"
+            elif _LOCAL_TOKENIZER is not None:
+                local_ids = await asyncio.to_thread(_local_token_ids, req_data["prompt"])
+                rendered = None
+                where = "local"
+            else:
+                render_response = await render_completion_prompt(
+                    prefill_client_info,
+                    render_endpoint,
+                    {"model": req_data.get("model"), "prompt": req_data["prompt"]},
+                    request_id,
+                    forwarded,
+                )
+                rendered = render_response.json()
+                where = "prefill"
+            print(
+                f"PERF PROXY render req_id={request_id} where={where} "
+                f"dur_ms={(time.perf_counter() - t_render) * 1000:.2f}",
+                flush=True,
+            )
+            if rendered is None:
+                # Locally rendered ids are ints by construction; skip the
+                # per-id validation (a Python loop over ~10^6 ids).
+                req_data = {**req_data, "prompt": local_ids}
+                req_data.pop("prompt_embeds", None)
+            else:
+                req_data = _replace_prompt_with_rendered_token_ids(req_data, rendered)
+
+        if align is not None:
+            t_align = time.perf_counter()
+            align.leave()
+            group, align = align, None
+            await group.released.wait()
+            print(
+                f"PERF PROXY align req_id={request_id} "
+                f"wait_ms={(time.perf_counter() - t_align) * 1000:.2f}",
+                flush=True,
+            )
+
+        # Send request to prefill service
+        t_prefill_send = time.time()
+        t_prefill_send_perf = time.perf_counter()
+        print(
+            f"PERF PROXY prefill_send req_id={request_id} ts={t_prefill_send:.6f}",
+            flush=True,
+        )
+        try:
+            response = await send_request_to_prefill(
+                prefill_client_info, api, req_data, request_id, forwarded
+            )
+        finally:
+            if routed is not None:
+                router.release(*routed)
+        t_prefill_recv = time.time()
+        t_prefill_recv_perf = time.perf_counter()
+        prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
+        _PROXY_LATENCY.record("prefill", prefill_ms)
+        _PROXY_LATENCY.record(
+            "prefill_from_req", (t_prefill_recv_perf - t_request_recv_perf) * 1000.0
+        )
+
+        # Extract the needed fields
+        response_json = response.json()
+        kv_transfer_params = response_json.get("kv_transfer_params", {})
+        kv_uuid = kv_transfer_params.get("uuid") if kv_transfer_params else None
+        kv_uuid_log = f" kv_uuid={kv_uuid}" if kv_uuid is not None else ""
+        print(
+            f"PERF PROXY prefill_recv req_id={request_id} ts={t_prefill_recv:.6f} "
+            f"dur_ms={prefill_ms:.2f}{kv_uuid_log}",
+            flush=True,
+        )
+
+        if _HIT_DIAG is not None and response_json.get("prompt_token_ids"):
+            ids = response_json["prompt_token_ids"]
+            details = (response_json.get("usage") or {}).get("prompt_tokens_details") or {}
+            sess, rank_hit, glob = _HIT_DIAG.observe(
+                session_key if routed is not None else None,
+                routed[0] if routed is not None else -1,
+                ids,
+            )
+            print(
+                f"PERF PROXY hit req_id={request_id} rank={routed[0] if routed else -1} "
+                f"isl={len(ids)} p_cached={details.get('cached_tokens')} "
+                f"sess_lcp={sess} rank_sim={rank_hit} global_sim={glob}",
+                flush=True,
+            )
+
+        if kv_transfer_params:
+            prompt_ids = response_json.get("prompt_token_ids")
+            if _REUSE_PROMPT_IDS and "messages" in req_data and prompt_ids:
+                kv_transfer_params = {**kv_transfer_params, "prompt_token_ids": prompt_ids}
+            req_data["kv_transfer_params"] = kv_transfer_params
+
+        # Get the next decode client in round-robin fashion
+        decode_client_info = get_next_client(request.app, "decode")
+
+        logger.debug("Using %s %s", prefill_client_info, decode_client_info)
+
+        # Stream response from decode service
+        async def generate_stream():
+            t_decode_send = time.time()
+            t_decode_send_perf = time.perf_counter()
+            print(
+                f"PERF PROXY decode_send req_id={request_id} "
+                f"ts={t_decode_send:.6f}{kv_uuid_log}",
+                flush=True,
+            )
+            first = True
+            d_forwarded, d_rank = forwarded, None
+            if d_hashes is not None:
+                d_rank, d_match, d_moved = _DECODE_ROUTER.assign(d_hashes)
+                d_forwarded = {**forwarded, "X-data-parallel-rank": str(d_rank)}
+                print(
+                    f"PERF PROXY decode_route req_id={request_id} rank={d_rank} "
+                    f"p_rank={forwarded.get('X-data-parallel-rank')} "
+                    f"match_blocks={d_match} moved={int(d_moved)} "
+                    f"active={_DECODE_ROUTER.active} moves={_DECODE_ROUTER.moves}",
+                    flush=True,
+                )
+            try:
+              async for chunk in stream_from_decode(
+                decode_client_info, api, req_data, request_id, d_forwarded
+              ):
+                  if first:
+                      t_first = time.time()
+                      t_first_perf = time.perf_counter()
+                      decode_first_ms = (t_first_perf - t_decode_send_perf) * 1000.0
+                      ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
+                      _PROXY_LATENCY.record("decode_first", decode_first_ms)
+                      _PROXY_LATENCY.record("ttft", ttft_ms)
+                      print(
+                          f"PERF PROXY first_chunk req_id={request_id} "
+                          f"ts={t_first:.6f} "
+                          f"dur_from_decode_send_ms={decode_first_ms:.2f} "
+                          f"ttft_ms={ttft_ms:.2f}{kv_uuid_log}",
+                          flush=True,
+                      )
+                      first = False
+                  yield chunk
+            finally:
+                if d_rank is not None:
+                    _DECODE_ROUTER.release(d_rank)
+
+        # Streaming responses are SSE: clients such as aiperf pick the parser
+        # from the Content-Type and reject `data:` lines served as JSON.
+        media_type = (
+            "text/event-stream" if req_data.get("stream") else "application/json"
+        )
+        return StreamingResponse(generate_stream(), media_type=media_type)
+
+    except Exception as e:
+        if align is not None:
+            align.leave()
+        import sys
+        import traceback
+
+        exc_info = sys.exc_info()
+        print(f"Error occurred in disagg prefill proxy server - {api} endpoint")
+        print(e)
+        print("".join(traceback.format_exception(*exc_info)))
+        raise
+
+
+@app.post("/v1/completions")
+async def handle_completions(request: Request):
+    return await _handle_completions("/v1/completions", request)
+
+
+@app.post("/v1/chat/completions")
+async def handle_chat_completions(request: Request):
+    return await _handle_completions("/v1/chat/completions", request)
+
+
+@app.get("/healthcheck")
+async def healthcheck():
+    """Simple endpoint to check if the server is running."""
+    return {
+        "status": "ok",
+        "prefill_instances": len(app.state.prefill_clients),
+        "decode_instances": len(app.state.decode_clients),
+    }
+
+
+if __name__ == "__main__":
+    global global_args
+    global_args = parse_args()
+
+    import uvicorn
+
+    # aiperf reuses pooled connections after a session's idle gap; uvicorn's
+    # 5 s default keep-alive closed some of them mid-reuse (AgentX c256 3600s:
+    # 4 "Connection reset" / "Server disconnected" errors).
+    uvicorn.run(
+        app,
+        host=global_args.host,
+        port=global_args.port,
+        timeout_keep_alive=int(os.environ.get("PROXY_KEEP_ALIVE_S", "300")),
+    )
