@@ -427,6 +427,7 @@ def _kernel(
     pair: bool = False,
     chunk: tuple[int, int, str] | None = None,
     removed: str = "",
+    phys_pages: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -603,7 +604,13 @@ def _kernel(
                 kv_head = group_head(group)
 
                 def start(g, queue=0):
-                    page = page_table_ref[work_page_ref[base + g]]
+                    # `phys_pages`: the table input holds the union's physical
+                    # pages, translated ahead of the call (one SMEM load a copy).
+                    page = (
+                        page_table_ref[base + g]
+                        if phys_pages
+                        else page_table_ref[work_page_ref[base + g]]
+                    )
                     for copy in page_copies(
                         (half, pl.ds(g, 1), 0), (half, 0), page, kv_head
                     ):
@@ -1395,6 +1402,9 @@ def _attention_call(
     in_place = (pl.BlockSpec(memory_space=pl.ANY),) * 2 if aliased else ()
     fp4 = scale_rows is not None
     transposed = not fp4 and block_q >= msa_attention.DEFAULT_BLOCK_Q
+    phys_pages = bool(prefill_body) and prefill_body.startswith("P") and not cache_size
+    if prefill_body and prefill_body.startswith("P"):
+        prefill_body = prefill_body[1:] or None
     if prefill_body and prefill_body.startswith("T"):  # transposed body at any tile size
         transposed, prefill_body = not fp4, prefill_body[1:] or None
     scale_inputs = (scale_cache,) if fp4 else ()
@@ -1507,6 +1517,7 @@ def _attention_call(
             pair=pair,
             chunk=chunk,
             removed=removed,
+            phys_pages=phys_pages,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
@@ -2033,6 +2044,20 @@ def _chunked_call(
             [table[:, :union_len], packed[:, union_len:], table[:, union_len:]], axis=1
         )
 
+    if (
+        prefill_body
+        and prefill_body.startswith("P")
+        and not cache_size
+        and offsets is None
+    ):
+        # The union's physical pages, so a page copy needs one SMEM load.
+        union_len = (step // block_q) * msa_attention._groups_per_tile(
+            block_q, selected.shape[2], pages_per_step
+        ) * pages_per_step
+        phys = jnp.take(page_table, jnp.maximum(packed[:, :union_len], 0), axis=0)
+    else:
+        phys = None
+
     def head_chunk(i, out):
         h, c = i // num_chunks, i % num_chunks
         offset = jnp.full((1,), c * (step // block_q), jnp.int32)
@@ -2043,7 +2068,7 @@ def _chunked_call(
             selected,
             local_page,
             local_limit,
-            page_table,
+            page_table if phys is None else phys[i],
             heads,
             offset,
             out,
