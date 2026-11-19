@@ -419,16 +419,24 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
     ) -> torch.Tensor | None:
         rows = hidden.shape[0]
         requests = rows // 5
-        # The Markov sampler takes 16 to 48 requests in whole 16-row tiles.
+        # The Markov sampler takes 16 to 48 requests in whole 16-row tiles;
+        # requests are sampled independently, so fewer pad to the next tile
+        # (12 per rank on v7x-16 run as 16).
+        padded = -(-requests // 16) * 16
         if (
             hidden.shape != (rows, 5120)
             or hidden.dtype != torch.bfloat16
             or block_size != 5
             or rows != 5 * requests
-            or requests % 16
-            or not 0 < requests <= 48
+            or not 0 < padded <= 48
         ):
             return None
+        if padded != requests:
+            extra = 5 * (padded - requests)
+            hidden = torch.nn.functional.pad(hidden, (0, 0, 0, extra))
+            input_ids = torch.nn.functional.pad(input_ids[:rows], (0, extra))
+            sampled = self._sample_decode(hidden, input_ids, block_size)
+            return None if sampled is None else sampled[:requests]
         slot_hidden = hidden.view(requests, 5, 5120).transpose(0, 1).reshape(rows, 5120)
         if self._decode_logits is not None:
             assert self.lm_head is not None

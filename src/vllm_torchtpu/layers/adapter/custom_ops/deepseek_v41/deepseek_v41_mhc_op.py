@@ -79,10 +79,10 @@ def _post_pre_rms_jax(
     tokens, mult = pre.shape
     dim = flat.shape[1] // mult
     # Every op is per token, so the kernel takes the tokens padded to its
-    # 16 (or 32) token groups: the real rows are the kernel's rows. Decode at
-    # 72 rows otherwise falls back to ~200 XLA ops, 38 us against 7.
-    group = 16 if envs.TPU_DEEPSEEK_V41_MHC_SHIFTED_T16 else 32
-    padded = -(-tokens // group) * group
+    # 32-token mix groups: the real rows are the kernel's rows. 16-token
+    # groups run slower than the XLA layer at decode sizes (72 rows padded to
+    # 80: 25.0 us against 20.1), 96 rows take 11.7.
+    padded = -(-tokens // 32) * 32
     if not shifted_post_pre_rms.is_supported_shape(padded, mult, dim):
         return _unfused(
             x,

@@ -857,11 +857,20 @@ def test_decode_sampler_uses_standard_logits_without_copying_lm_weight(monkeypat
     assert actual_embedding is embedding
     assert actual_weight is markov_weight
     torch.testing.assert_close(anchors, input_ids[::5])
-    assert sampler(hidden[:235], input_ids[:235], 5) is None
+    assert sampler(hidden[:238], input_ids[:238], 5) is None
     assert compute_logits.call_count == 1
     compute_logits.return_value = logits.float()
     assert sampler(hidden, input_ids, 5) is None
     assert sample.call_count == 1
+    # 12 requests (v7x-16 decode) pad to one 16-request tile.
+    compute_logits.return_value = logits[:80]
+    sample.return_value = torch.arange(80).view(16, 5)
+    assert torch.equal(
+        sampler(hidden[:60], input_ids[:60], 5), sample.return_value[:12]
+    )
+    anchors = sample.call_args.args[3]
+    assert anchors.shape == (16,)
+    torch.testing.assert_close(anchors[:12], input_ids[:60:5])
 
 
 @pytest.mark.parametrize(
