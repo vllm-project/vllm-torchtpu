@@ -113,10 +113,13 @@ def test_mask_levers_are_bitwise(block_q, other, lever):
 
 
 @pytest.mark.parametrize("block_q", [16, 32])
-def test_vt_close(block_q):
+@pytest.mark.parametrize("lever", ["vt", "lmxu", "exp16,lmxu"])
+def test_vt_close(block_q, lever):
     args = make(64, seed=11 + block_q)
     o0, l0 = run(args, block_q, "")
-    o1, l1 = run(args, block_q, "vt")
+    o1, l1 = run(args, block_q, lever)
+    fin = np.isfinite(np.asarray(l0))
+    assert np.max(np.abs(np.where(fin, np.asarray(l1) - np.asarray(l0), 0))) < 2e-2
     o0 = np.asarray(o0, np.float64); o1 = np.asarray(o1, np.float64)
     assert np.array_equal(np.isfinite(np.asarray(l0)), np.isfinite(np.asarray(l1)))
     assert np.sqrt(np.mean((o1 - o0) ** 2)) / np.sqrt(np.mean(o0 ** 2)) < 1e-2

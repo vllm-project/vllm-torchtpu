@@ -209,7 +209,10 @@ FP8_OPT_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT"
 # x 32 tokens at block_q 32) and reused by every head group (bitwise).
 # "vt": each page's V rows transposed as they unpack, so p @ v runs as
 # v^T [D, keys] @ p [keys, rows] with no transposed operand in the dot.
-_FP8_LEVERS = ("exp16", "bias", "lanemask", "vt")
+# "lmxu": the softmax row sums come out of the p @ v dot (8 rows of ones
+# under v^T) instead of a VALU add per score vreg; l sums the bf16 p the dot
+# multiplies.
+_FP8_LEVERS = ("exp16", "bias", "lanemask", "vt", "lmxu")
 
 
 def fp8_prefill_levers(spec: str | None = None) -> frozenset:
@@ -490,7 +493,8 @@ def _kernel(
     exp16_t = not fp4 and "exp16" in precision
     bias_t = not fp4 and "bias" in precision
     lanemask_t = not fp4 and "lanemask" in precision
-    vt_t = not fp4 and "vt" in precision
+    lmxu_t = not fp4 and "lmxu" in precision
+    vt_t = not fp4 and ("vt" in precision or lmxu_t)
     out_unit = 1.0 / _PV8_UNIT if pv8 else 1.0
 
     def group_head(w):
@@ -799,6 +803,8 @@ def _kernel(
             k = jnp.concatenate(keys, axis=0)
             if vt_t:
                 v = jnp.concatenate([x.T for x in values], axis=1)  # [D, W * S]
+                if lmxu_t:
+                    v = jnp.concatenate([v, jnp.ones((8, v.shape[1]), v.dtype)], axis=0)
             else:
                 v = jnp.concatenate(values, axis=0)
             q = q_ref[...].reshape(num_heads * block_q, head_dim)
@@ -835,16 +841,21 @@ def _kernel(
             m_new = jnp.maximum(m_prev, jnp.max(s, axis=0, keepdims=True))
             if exp16_t:
                 p = jnp.exp2((s - m_new).astype(jnp.bfloat16))
-                l_cur = jnp.sum(p.astype(jnp.float32), axis=0, keepdims=True)
+                if not lmxu_t:
+                    l_cur = jnp.sum(p.astype(jnp.float32), axis=0, keepdims=True)
             else:
                 p = jnp.exp2(s - m_new)
-                l_cur = jnp.sum(p, axis=0, keepdims=True)
+                if not lmxu_t:
+                    l_cur = jnp.sum(p, axis=0, keepdims=True)
             pv = jax.lax.dot_general(
                 v,
                 p.astype(v.dtype),
                 (((1 if vt_t else 0,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
-            )  # [D, rows]
+            )  # [D, rows] ([D + 8, rows] with lmxu: row D is l)
+            if lmxu_t:
+                l_cur = pv[head_dim : head_dim + 1]
+                pv = pv[:head_dim]
             if single:
                 finish_t(m_new, l_cur, pv)
                 return

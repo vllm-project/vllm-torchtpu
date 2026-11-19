@@ -1701,7 +1701,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # softmax exp in bf16 (p enters p @ v in bf16 anyway; not bitwise); "bias"
     # masks whole pages by a lane-row add instead of a per-score select
     # (bitwise); "lanemask" compares the mask once per 128 lanes (bitwise);
-    # "vt" transposes V pages as they unpack for an untransposed p @ v dot.
+    # "vt" transposes V pages as they unpack for an untransposed p @ v dot;
+    # "lmxu" takes the softmax row sums from the p @ v dot (not bitwise).
     # Comma-separated; empty
     # (default) = off.
     "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT": env_str(
