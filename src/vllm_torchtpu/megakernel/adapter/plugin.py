@@ -49,7 +49,16 @@ class Shorthand(NamedTuple):
 
 # Built-in templates by shorthand name. Imported by string only, so the
 # adapter never imports a template at module load.
-SHORTHANDS: Mapping[str, Shorthand] = {}
+SHORTHANDS: Mapping[str, Shorthand] = {
+    "glm53": Shorthand(
+        module="vllm_torchtpu.kernels.glm53_megakernel",
+        architectures=(
+            "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
+        ),
+        model_types=("glm5_next",),
+    ),
+}
 
 
 class RunnerProtocol(Protocol):
