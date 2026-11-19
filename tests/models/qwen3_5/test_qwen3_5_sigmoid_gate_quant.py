@@ -123,7 +123,13 @@ def test_compiled_kernel_matches_the_eager_gate_on_tpu(rows, cols):
     a = jnp.asarray(rng.standard_normal((rows, cols)), dtype=jnp.bfloat16)
     g = jnp.asarray(rng.standard_normal((rows, cols)), dtype=jnp.bfloat16)
     q, s = jax.block_until_ready(pallas_sigmoid_gate_quant(a, g))
-    q_ref, s_ref = jax.block_until_ready(sigmoid_gate_quant_reference(a, g))
+    # The reference runs on the host, so it shares no TPU lowering with the
+    # kernel.
+    cpu = jax.devices("cpu")[0]
+    with jax.default_device(cpu):
+        q_ref, s_ref = jax.block_until_ready(
+            sigmoid_gate_quant_reference(*jax.device_put((a, g), cpu))
+        )
     assert q.shape == q_ref.shape == (rows, cols)
     assert q.dtype == q_ref.dtype == jnp.float8_e4m3fn
     assert s.shape == s_ref.shape == (rows, 1)
