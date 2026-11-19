@@ -568,6 +568,69 @@ def test_tpu_grouped_experts_match_packed_reference_decoder(monkeypatch, use_ep)
     assert actual[-1].count_nonzero() == 0
 
 
+@pytest.mark.tpu_test
+@torch.inference_mode()
+def test_tpu_one_hot_ep_permute_keeps_non_finite_row_local(monkeypatch):
+    """A NaN row must not reach other tokens through the one-hot EP permute."""
+    from vllm_torchtpu.models.vllm.muse_spark import model
+    from vllm_torchtpu.models.vllm.muse_spark.weights import (
+        selected_packed_expert_outputs,
+    )
+
+    monkeypatch.setenv("USE_MOE_SPARSE_CORE", "1")
+    monkeypatch.setenv("ONEHOT_MOE_PERMUTE_THRESHOLD", "4096")
+    hidden, intermediate, num_experts, top_k = 4096, 512, 8, 4
+    ep_size, ep_rank = 2, 1
+    monkeypatch.setattr(model, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        model,
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=ep_size, rank_in_group=ep_rank),
+    )
+    target = model.MuseSparkForCausalLM.__new__(model.MuseSparkForCausalLM)
+    nn.Module.__init__(target)
+    target.tp_rank, target.tp_size, target.use_ep = 0, 1, True
+    target.ep_rank, target.ep_size = ep_rank, ep_size
+    target.model = nn.Module()
+    target.model.language_model = nn.Module()
+    layer = nn.Module()
+    layer.mlp = nn.Module()
+    experts = model.MuseExperts(
+        hidden, intermediate, num_experts, packed=True, use_ep=True
+    )
+    layer.mlp.experts = experts
+    target.model.language_model.layers = nn.ModuleList([layer])
+    parts = _tp8_rank_packed_weights(num_experts, hidden, intermediate)
+    prefix = "model.language_model.layers.0.mlp.experts."
+    assert len(target.load_weights((prefix + k, v) for k, v in parts.items())) == 6
+
+    rng = torch.Generator().manual_seed(107)
+    tokens = 16
+    x = torch.randn(tokens, hidden, generator=rng).bfloat16()
+    x[-1] = float("nan")
+    ids = torch.rand(tokens, num_experts, generator=rng).argsort(-1)[:, :top_k]
+    clean = x.clone()
+    clean[-1] = 0
+    expected = selected_packed_expert_outputs(
+        clean,
+        ids,
+        parts["gate_up_proj"],
+        parts["down_proj"],
+        parts["gate_up_proj_weight_scale"].view(torch.uint8),
+        parts["down_proj_weight_scale"].view(torch.uint8),
+        parts["gate_up_proj_weight_scale_2"],
+        parts["down_proj_weight_scale_2"],
+    )
+    owned = ids // (num_experts // ep_size) == ep_rank
+    expected = expected.masked_fill(~owned[..., None], 0)
+
+    actual = experts.to("tpu")(x.to("tpu"), ids.to("tpu")).cpu()
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1.6e-2, atol=2**-5)
+    assert actual[-1].count_nonzero() == 0
+
+
 @pytest.mark.parametrize("packed", [False, True])
 @torch.inference_mode()
 def test_ep_loader_and_local_expert_outputs(monkeypatch, packed):

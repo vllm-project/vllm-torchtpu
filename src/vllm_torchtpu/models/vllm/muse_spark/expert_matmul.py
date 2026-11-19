@@ -42,19 +42,27 @@ def _grouped_experts(
     num_experts: int | None,
 ) -> jax.Array:
     tokens, top_k = ids.shape
-    if num_experts is not None:
+    use_ep = num_experts is not None
+    use_sparse_core = envs.USE_MOE_SPARSE_CORE
+    onehot_threshold = resolve_onehot_permute_threshold()
+    if use_ep:
         assert experts_start is not None
         ids = ids - experts_start
         ids = jnp.where((ids >= 0) & (ids < w13.shape[0]), ids, -1)
+        if use_sparse_core and tokens * top_k <= onehot_threshold:
+            # The one-hot permute is a matmul across all tokens, and
+            # 0 * NaN == NaN: zero non-finite values, as fused_moe_func does,
+            # so the damage stays with that token.
+            x = jnp.where(jnp.isfinite(x), x, 0)
     inputs, sizes, inverse, _, valid, _ = prepare_routed_gmm_inputs(
         x,
         ids,
         jnp.ones(ids.shape, x.dtype),
         local_num_experts=w13.shape[0],
         topk=top_k,
-        use_ep=num_experts is not None,
-        use_sparse_core=envs.USE_MOE_SPARSE_CORE,
-        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_threshold,
     )
 
     def matmul(lhs, weight, scale, global_scale):
