@@ -354,6 +354,7 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_FP4_SLOTS: int = 256
     VLLM_TPU_OFFLOAD_FP4_GDN: bool = False
     VLLM_TPU_OFFLOAD_FP4_GDN_SLOTS: int = 0
+    VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE: bool = False
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TPU_MAMBA_CHECKPOINT_RETENTION: bool = True
     VLLM_TPU_MAMBA_DECODE_CHECKPOINT: bool = True
@@ -2415,6 +2416,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # HBM staging slots per GDN region for VLLM_TPU_OFFLOAD_FP4_GDN (0: as
     # VLLM_TPU_OFFLOAD_FP4_SLOTS).
     "VLLM_TPU_OFFLOAD_FP4_GDN_SLOTS": env_int("VLLM_TPU_OFFLOAD_FP4_GDN_SLOTS", 0),
+    # With QWEN4_EXP_HOST_TIER_POLICY=victim: exclusive restore. Once a load from
+    # the host tier lands, its host copy is evicted (KVCacheStore.evict, which
+    # erases only unpinned host entries), so the tier never holds a block that
+    # HBM holds; HBM's later eviction stores it again. Needs a Raiden build
+    # with KVCacheStore.evict. Host-only.
+    "VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE": env_bool(
+        "VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE", default=False
+    ),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
