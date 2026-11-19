@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.request_queue import FCFSRequestQueue
 
 from vllm_torchtpu.core import scheduler_options
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
@@ -41,15 +42,35 @@ def test_schedule_promotes_only_when_on(monkeypatch, on):
     calls = []
     monkeypatch.setattr(AsyncScheduler, "schedule", lambda self, *a, **k: "out")
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
-    # The promotion switch acts on a decode leg (a KV consumer).
+    # On a decode leg (a KV consumer) both waiting queues are promoted.
     s._is_kv_consumer = True
     s.running = []
+    s.waiting = FCFSRequestQueue()
+    s.kv_holding_waiting = FCFSRequestQueue()
     s._inflight_prefills = set()
     s._decode_throttle_switch = False
+    s._kv_prefetch_n = 0
+    s._kv_prefetch_cap = None
     s._promote_warmest_switch = on
     s._select_waiting_queue_for_scheduling = lambda: calls.append(1)
     assert s.schedule() == "out"
     assert calls == ([1] if on else [])
+
+
+@pytest.mark.parametrize("on", [True, False])
+def test_schedule_off_a_decode_leg_promotes_only_when_on(monkeypatch, on):
+    """Any other engine (no KV transfer, a KV producer, kv_both) promotes the
+    first non-empty waiting queue, and the switch turns that off too."""
+    promoted = []
+    monkeypatch.setattr(AsyncScheduler, "schedule", lambda self, *a, **k: "out")
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s._is_kv_consumer = False
+    s.waiting = FCFSRequestQueue()
+    s.kv_holding_waiting = FCFSRequestQueue()
+    s._promote_warmest_switch = on
+    s._promote_warmest = promoted.append
+    assert s.schedule() == "out"
+    assert promoted == ([s.waiting] if on else [])
 
 
 def test_init_reads_the_option(monkeypatch):
