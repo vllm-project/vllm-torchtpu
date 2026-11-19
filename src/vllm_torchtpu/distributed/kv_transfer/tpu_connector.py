@@ -3987,27 +3987,30 @@ class TPURaidenConnectorWorker:
                 return f"pcp{pcp_size}tp{tp_size}_prefill"
             if not self.is_producer and pcp_size == 1 and tp_size > 1:
                 return f"tp{tp_size}dcp{dcp_size}_decode"
-        if self.is_producer and pp_size > 1 and pcp_size > 1:
-            # PP x PCP prefill: every stage-local PCP rank is a source unit
-            # (TPU_RAIDEN_TRANSFER_PARALLELISM = PP * PCP) lowering its own
-            # tokens and GDN heads of its stage's layers.
-            # TODO(yinlin): reachable once pp_validation admits context-parallel
-            # stages, i.e. once the pinned torch_tpu builds a stage group's meshes
-            # (google-pytorch/torch_tpu#4387, for a group made standalone).
+        if self.is_producer and pp_size > 1 and (pcp_size > 1 or tp_size > 1):
+            # PP x PCP or PP x TP prefill: every worker of a stage is a source
+            # unit (TPU_RAIDEN_TRANSFER_PARALLELISM = PP * stage size) lowering
+            # its own tokens and KV and GDN heads of its stage's layers.
+            # TODO(yinlin): reachable once pp_validation admits stages of several
+            # devices, i.e. once the pinned torch_tpu compiles a process group's
+            # programs for the group's own devices.
             dcp_size = int(parallel_config.decode_context_parallel_size)
             if (
                 _raiden_seq_on_lane_layout()
-                and tp_size == 1
+                and (tp_size == 1 or pcp_size == 1)
                 and dp_size == 1
                 and dcp_size == 1
                 and pp_size in (2, 4, 8)
             ):
+                if tp_size > 1:
+                    return f"pp{pp_size}tp{tp_size}_prefill"
                 return f"pp{pp_size}pcp{pcp_size}_prefill"
             raise ValueError(
                 "Raiden Qwen3.5 admission topology pp{2,4,8}pcp{N}_prefill "
-                "requires the seq-along-lane FA layout "
-                "(VLLM_KV_CACHE_LAYOUT=HND) and kv_producer with "
-                "tensor_parallel_size=1, data_parallel_size=1, "
+                "or pp{2,4,8}tp{N}_prefill requires the seq-along-lane FA "
+                "layout (VLLM_KV_CACHE_LAYOUT=HND) and kv_producer with "
+                "tensor_parallel_size=1 or prefill_context_parallel_size=1, "
+                "data_parallel_size=1, "
                 "decode_context_parallel_size=1, pipeline_parallel_size in "
                 f"(2, 4, 8); got prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
