@@ -241,6 +241,7 @@ def _kernel(
         "window",
         "token_tile",
         "quant_rows",
+        "max_tokens",
         "interpret",
     ),
 )
@@ -258,24 +259,50 @@ def engram_gate(
     window: int = 1280,
     token_tile: int = 512,
     quant_rows: int = 64,
+    max_tokens: int = 2048,
     interpret: bool = False,
 ) -> jax.Array:
     """Engram's gated residual from rows ``x`` [T, K] and ``hidden`` [T, H, D].
 
     ``w`` is the canonical [K, (H + 1) * D] FP8 weight with per-column FP32
-    ``w_scale``; ``mask`` [T] gates padded tokens shut. Returns [T, H, D] BF16.
+    ``w_scale``; ``mask`` [T] gates padded tokens shut. Any T: rows are
+    padded to whole token tiles internally. Returns [T, H, D] BF16.
     """
     tokens, k_dim = x.shape
     _, heads, dim = hidden.shape
-    token_tile = min(token_tile, tokens)
-    quant_rows = min(quant_rows, tokens)
-    if (
-        w.shape != (k_dim, (heads + 1) * dim)
-        or dim % window
-        or tokens % token_tile
-        or tokens % quant_rows
-    ):
+    if tokens > max_tokens:
+        # The quantized rows stay in VMEM (12 MiB at 2,048 tokens), so longer
+        # inputs run in chunks, each re-reading the weight (~50 us).
+        return jnp.concatenate(
+            [
+                engram_gate(
+                    x[i : i + max_tokens],
+                    w,
+                    w_scale,
+                    hidden[i : i + max_tokens],
+                    q_weight,
+                    k_weight,
+                    mask[i : i + max_tokens],
+                    eps=eps,
+                    clamp=clamp,
+                    window=window,
+                    token_tile=token_tile,
+                    quant_rows=quant_rows,
+                    max_tokens=max_tokens,
+                    interpret=interpret,
+                )
+                for i in range(0, tokens, max_tokens)
+            ]
+        )
+    if w.shape != (k_dim, (heads + 1) * dim) or dim % window or token_tile % quant_rows:
         raise ValueError("Unsupported Engram gate shapes")
+    # Zero rows pad the tokens to whole tiles; their gate is masked shut.
+    token_tile = min(token_tile, -(-tokens // quant_rows) * quant_rows)
+    padded = -(-tokens // token_tile) * token_tile
+    pad = ((0, padded - tokens), (0, 0))
+    x = jnp.pad(x, pad)
+    mask = jnp.pad(mask.astype(jnp.float32), pad[:1])
+    hidden = jnp.pad(hidden.reshape(tokens, heads * dim), pad)
     hbm, vmem = (pl.BlockSpec(memory_space=s) for s in (pltpu.HBM, pltpu.VMEM))
     kernel = functools.partial(
         _kernel,
@@ -289,20 +316,20 @@ def engram_gate(
     )
     flat = pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((tokens, heads * dim), hidden.dtype),
+        out_shape=jax.ShapeDtypeStruct((padded, heads * dim), hidden.dtype),
         in_specs=(hbm, hbm, vmem, hbm, vmem, vmem, vmem),
         out_specs=hbm,
         scratch_shapes=(
             pltpu.VMEM((2, quant_rows, k_dim), x.dtype),
-            pltpu.VMEM((tokens, k_dim), FP8),
-            pltpu.VMEM((tokens, 1), jnp.float32),
+            pltpu.VMEM((padded, k_dim), FP8),
+            pltpu.VMEM((padded, 1), jnp.float32),
             pltpu.VMEM((2, k_dim, window), w.dtype),
             pltpu.VMEM((2, token_tile, window), hidden.dtype),
             pltpu.VMEM((2, token_tile, window), hidden.dtype),
-            pltpu.VMEM((tokens, LANES), jnp.float32),
-            pltpu.VMEM((tokens, LANES), jnp.float32),
-            pltpu.VMEM((tokens, LANES), jnp.float32),
-            pltpu.VMEM((heads, tokens, 1), jnp.float32),
+            pltpu.VMEM((padded, LANES), jnp.float32),
+            pltpu.VMEM((padded, LANES), jnp.float32),
+            pltpu.VMEM((padded, LANES), jnp.float32),
+            pltpu.VMEM((heads, padded, 1), jnp.float32),
             pltpu.SemaphoreType.DMA((2,)),
             pltpu.SemaphoreType.DMA((2,)),
             pltpu.SemaphoreType.DMA((2,)),
@@ -315,9 +342,9 @@ def engram_gate(
         x,
         w,
         w_scale,
-        hidden.reshape(tokens, heads * dim),
+        hidden,
         q_weight,
         k_weight,
-        mask.astype(jnp.float32)[:, None],
+        mask[:, None],
     )
-    return flat.reshape(tokens, heads, dim)
+    return flat[:tokens].reshape(tokens, heads, dim)

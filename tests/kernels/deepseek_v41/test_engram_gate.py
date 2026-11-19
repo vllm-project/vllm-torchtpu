@@ -57,6 +57,7 @@ def _exact(x, w, w_scale, hidden, q_weight, k_weight, mask):
     "tokens,heads,dim,k_dim,window,tile",
     [
         pytest.param(128, 2, 256, 256, 128, 64, id="small-interpret"),
+        pytest.param(100, 2, 256, 256, 128, 64, id="ragged-interpret"),
         pytest.param(2048, 4, 5120, 6144, 1280, 512, id="prefill"),
     ],
 )
@@ -83,6 +84,7 @@ def test_engram_gate_error_no_worse_than_xla(tokens, heads, dim, k_dim, window, 
         window=window,
         token_tile=tile,
         quant_rows=min(64, tokens),
+        max_tokens=max(64, tokens // 2),
         interpret=interpret,
     )
     xla = jax.jit(_xla_path)(*args)
