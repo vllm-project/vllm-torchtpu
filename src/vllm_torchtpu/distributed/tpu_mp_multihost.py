@@ -101,9 +101,9 @@ def _rendezvous_timeout(parallel_config) -> timedelta:
     distributed timeout when --cpu-distributed-timeout-seconds sets one, the
     bound on every other CPU-side wait, else 300 s.
 
-    Hosts can arrive minutes apart: a pod that started late and then spent
-    minutes pre-pulling the model config reached a four-host prefill job's
-    rendezvous 5.5 minutes after the other three.
+    The hosts of a slice can reach the rendezvous minutes apart (one may start
+    later or take longer to fetch the model config); a host that has waited
+    this long gives up.
     """
     return parallel_config.cpu_distributed_timeout or _RENDEZVOUS_TIMEOUT
 
