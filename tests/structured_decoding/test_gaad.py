@@ -297,6 +297,18 @@ def test_the_drafter_fills_only_its_share_of_the_row():
     assert request.spec_token_ids == [1, 2, 3]
 
 
+def test_a_skipped_request_keeps_the_drafters_share():
+    skipped = _request(request_id="s", spec_token_ids=[7, 8, 9], is_prefill_chunk=True)
+    scheduler = SimpleNamespace(
+        structured_output_manager=_manager(),
+        num_spec_tokens=7,
+        running=[skipped],
+        vllm_config=_vllm_config(_DRAFTER, gaad={"draft_tokens": 2}),
+    )
+    assert gaad.plan_running_requests(scheduler) == {}
+    assert skipped.spec_token_ids == [7, 8]
+
+
 def test_draft_limit_is_the_row_without_draft_tokens():
     assert gaad.draft_limit(_vllm_config(_DRAFTER)) == 7
     assert gaad.draft_limit(_vllm_config(_DRAFTER, gaad={})) == 7
