@@ -26,6 +26,13 @@ and a larger tensor (a prefill chunk) takes a psum over the same mesh, which
 XLA lowers as it lowers the usual all-reduce. The kernel's output bits can
 differ from XLA's all-reduce: it sums in f32 in rank order and rounds once;
 every rank gets the same bits.
+
+With TPU_TP_FP8_ALL_REDUCE the op also arms when the byte cap is 0, and
+tensors of at least TPU_TP_FP8_ALL_REDUCE_MIN_TOKENS rows (a multiple of the
+group size) take the lossy fp8-wire path of kernels/collectives/
+fp8_all_reduce.py instead of the psum; the decision is static inside the op
+like the kernel's, so the model's traces do not change. Off, the op's body
+is the one above.
 """
 
 import dataclasses
@@ -44,6 +51,7 @@ from vllm.distributed import parallel_state
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
+from vllm_torchtpu.kernels.collectives import fp8_all_reduce
 from vllm_torchtpu.kernels.collectives import tp_all_reduce as kernel
 from vllm_torchtpu.logger import init_logger
 
@@ -59,26 +67,50 @@ class _Armed:
     ranks: tuple[int, ...]
     op: Any
     rank: torch.Tensor  # this rank's mesh index, int32 [1, 1]
+    fp8: "Fp8Config | None" = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Fp8Config:
+    """The fp8-wire all-reduce of tensors of at least `min_tokens` rows."""
+
+    min_tokens: int
+    mode: str
+    granularity: str
+
+
+def fp8_config_from_env() -> Fp8Config | None:
+    if not envs.TPU_TP_FP8_ALL_REDUCE or envs.TPU_TP_FP8_ALL_REDUCE_MIN_TOKENS <= 0:
+        return None
+    return Fp8Config(
+        min_tokens=envs.TPU_TP_FP8_ALL_REDUCE_MIN_TOKENS,
+        mode=envs.TPU_TP_FP8_ALL_REDUCE_MODE,
+        granularity=envs.TPU_TP_FP8_ALL_REDUCE_SCALE,
+    )
 
 
 _ARMED: _Armed | None = None
 
 
-def _body(n: int, max_bytes: int, axis: str):
+def _body(n: int, max_bytes: int, axis: str, fp8: Fp8Config | None = None):
     def body(x, rank):
         rows, hidden = x.shape
         if 0 < kernel.view_bytes(rows, hidden, n) <= max_bytes:
             return kernel.all_reduce(x, rank, n)
+        if fp8 is not None and fp8_all_reduce.applies(
+            rows, hidden, n, fp8.min_tokens, fp8.granularity
+        ):
+            return fp8_all_reduce.all_reduce(x, axis, n, fp8.mode, fp8.granularity)
         return lax.psum(x, axis)
 
     return body
 
 
-def _make_op(mesh, max_bytes: int):
+def _make_op(mesh, max_bytes: int, fp8: Fp8Config | None = None):
     axis = mesh.axis_names[0]
     specs = (P(axis), P(axis))
     sharded = jax.shard_map(
-        _body(int(mesh.size), max_bytes, axis),
+        _body(int(mesh.size), max_bytes, axis, fp8),
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
@@ -146,6 +178,35 @@ def _selftest(
     return failures
 
 
+def _fp8_selftest(
+    op, rank: torch.Tensor, mesh_index: int, n: int, hidden: int, fp8: Fp8Config, device
+) -> bool:
+    """One fp8-path all-reduce on the exact-sum inputs of `_selftest`: every
+    value within the two e4m3 roundings, so a row block that lands in the
+    wrong place shows. Returns whether it failed."""
+    rows = -(-fp8.min_tokens // n) * n
+    if not fp8_all_reduce.applies(rows, hidden, n, fp8.min_tokens, fp8.granularity):
+        return False
+    faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
+    try:
+        x = _selftest_inputs(n, rows, hidden)
+        mine = torch.from_numpy(x[mesh_index]).to(torch.bfloat16).to(device)
+        got = op(mine, rank).to(torch.float32).cpu().numpy()
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+    return not fp8_selftest_ok(x, got)
+
+
+def fp8_selftest_ok(x: np.ndarray, got: np.ndarray) -> bool:
+    """Whether `got` is the fp8-wire sum of the [n, rows, hidden] partials x.
+    Each e4m3 rounding is within 2^-4 of its value (normals; these partials
+    stay in range): the first of every partial, the second of the sum, plus
+    the bf16 output rounding."""
+    want = x.sum(0)
+    tol = (np.abs(x).sum(0) + np.abs(want)) * 2**-4 + np.abs(want) * 2**-7 + 1e-3
+    return bool(np.all(np.abs(got - want) <= tol))
+
+
 def _gather(obj) -> list:
     tp = parallel_state.get_tp_group()
     seen = [None] * tp.world_size
@@ -177,9 +238,12 @@ def arm(hidden: int, device: torch.device) -> bool:
     """Route the TP group's small bf16 all-reduces through the kernel; returns
     whether it armed. Collective over the TP group."""
     global _ARMED
-    max_bytes = min(envs.TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES, kernel.MAX_VIEW_BYTES)
+    max_bytes = max(
+        min(envs.TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES, kernel.MAX_VIEW_BYTES), 0
+    )
+    fp8 = fp8_config_from_env()
     tp = parallel_state.get_tp_group()
-    if max_bytes <= 0 or tp.world_size == 1:
+    if (max_bytes <= 0 and fp8 is None) or tp.world_size == 1:
         return False
     refusal = _refusal()
     mesh = None if refusal else build_ep_mesh()  # collective
@@ -191,14 +255,24 @@ def arm(hidden: int, device: torch.device) -> bool:
     if sorted(s["mesh_index"] for s in seen) != list(range(tp.world_size)):
         raise RuntimeError(f"tp_all_reduce: mesh indices are not 0..n-1: {seen}")
     n = int(mesh.size)
-    op = _make_op(mesh, max_bytes)
+    op = _make_op(mesh, max_bytes, fp8)
     rank = torch.tensor([[mesh_index]], dtype=torch.int32, device=device)
     failures = _gather(_selftest(op, rank, mesh_index, n, hidden, device))
     if any(failures):
         raise RuntimeError(
             f"tp_all_reduce: self-test failed (rows per rank): {failures}"
         )
-    _ARMED = _Armed(ranks=tuple(int(r) for r in tp.ranks), op=op, rank=rank)
+    if fp8 is not None:
+        bad = _gather(_fp8_selftest(op, rank, mesh_index, n, hidden, fp8, device))
+        if any(bad):
+            raise RuntimeError(f"tp_all_reduce: fp8 self-test failed per rank: {bad}")
+        logger.info(
+            "tp_all_reduce: fp8 wire (lossy) from %d rows: mode %s, scales %s",
+            fp8.min_tokens,
+            fp8.mode,
+            fp8.granularity,
+        )
+    _ARMED = _Armed(ranks=tuple(int(r) for r in tp.ranks), op=op, rank=rank, fp8=fp8)
     logger.info(
         "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B views"
         " (TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES=%d, kernel cap %d); libtpu %s",

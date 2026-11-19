@@ -85,6 +85,10 @@ if TYPE_CHECKING:
     TPU_MOE_BOUNDED_ONEHOT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
+    TPU_TP_FP8_ALL_REDUCE: bool = False
+    TPU_TP_FP8_ALL_REDUCE_MIN_TOKENS: int = 2048
+    TPU_TP_FP8_ALL_REDUCE_MODE: str = "a2a"
+    TPU_TP_FP8_ALL_REDUCE_SCALE: str = "g128"
     TPU_MOE_TC_COMBINE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
@@ -829,6 +833,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # buckets up to 40 rows of 6144, where the two still differ.
     "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES", 0
+    ),
+    # Lossy TP all-reduce of large bf16 [tokens, hidden] activations with an
+    # e4m3 wire and dynamic f32 scales (kernels/collectives/fp8_all_reduce.py),
+    # inside the TP all-reduce op of distributed/pallas_all_reduce.py (armed
+    # with this switch even when TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES is 0) for
+    # steps of at least _MIN_TOKENS tokens (a multiple of TP); smaller ones
+    # (decode) keep their path. _MODE: "a2a" (fp8 all-to-all, f32 sum, fp8
+    # all-gather; ~1/2 the bytes), "rs" (bf16 reduce-scatter, fp8 all-gather)
+    # or "a2a16" (fp8 all-to-all, bf16 all-gather; both ~3/4). _SCALE: "row"
+    # or "g128" (one scale per 128 columns). Default off; off = unchanged.
+    "TPU_TP_FP8_ALL_REDUCE": env_bool("TPU_TP_FP8_ALL_REDUCE"),
+    "TPU_TP_FP8_ALL_REDUCE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_TP_FP8_ALL_REDUCE_MIN_TOKENS", 2048
+    ),
+    "TPU_TP_FP8_ALL_REDUCE_MODE": env_with_choices(
+        "TPU_TP_FP8_ALL_REDUCE_MODE", "a2a", ["a2a", "rs", "a2a16"]
+    ),
+    "TPU_TP_FP8_ALL_REDUCE_SCALE": env_with_choices(
+        "TPU_TP_FP8_ALL_REDUCE_SCALE", "g128", ["row", "g128"]
     ),
     # Expert-parallel MoE combine of large batches on the TensorCore
     # (kernels/megablox/tc_combine.py) instead of the SparseCore
