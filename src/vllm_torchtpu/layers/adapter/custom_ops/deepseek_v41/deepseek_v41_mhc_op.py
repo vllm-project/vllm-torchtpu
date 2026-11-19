@@ -14,6 +14,51 @@ from vllm_torchtpu.kernels.deepseek_v41.mhc import shifted_post_pre_rms
 _post_pre_rms_op = None
 
 
+def _unfused(
+    x: jax.Array,
+    flat: jax.Array,
+    post: jax.Array,
+    comb: jax.Array,
+    weight: jax.Array,
+    scale: jax.Array,
+    base: jax.Array,
+    pre: jax.Array,
+    norm_weight: jax.Array,
+    rms_eps: float,
+    pre_eps: float,
+    sinkhorn_eps: float,
+    post_multiplier: float,
+    repeats: int,
+    norm_eps: float,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """The same layer as XLA ops, for shapes the kernel does not take."""
+    from vllm_torchtpu.models.vllm.deepseek_v41.common.mhc import (
+        delayed_post_pre_flat_jax,
+    )
+
+    residual, next_post, next_comb, value, next_pre = delayed_post_pre_flat_jax(
+        x,
+        flat,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        pre,
+        rms_eps,
+        pre_eps,
+        sinkhorn_eps,
+        post_multiplier,
+        repeats,
+    )
+    normalized = value.astype(jnp.float32) * jax.lax.rsqrt(
+        jnp.mean(jnp.square(value.astype(jnp.float32)), axis=-1, keepdims=True)
+        + norm_eps
+    )
+    value = (normalized * norm_weight.astype(jnp.float32)).astype(value.dtype)
+    return residual, next_post, next_comb, value, next_pre
+
+
 def _post_pre_rms_jax(
     x: jax.Array,
     flat: jax.Array,
@@ -33,14 +78,13 @@ def _post_pre_rms_jax(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     tokens, mult = pre.shape
     dim = flat.shape[1] // mult
-    if not shifted_post_pre_rms.is_supported_shape(tokens, mult, dim) or (
-        tokens % 32 and not envs.TPU_DEEPSEEK_V41_MHC_SHIFTED_T16
-    ):
-        from vllm_torchtpu.models.vllm.deepseek_v41.common.mhc import (
-            delayed_post_pre_flat_jax,
-        )
-
-        residual, next_post, next_comb, value, next_pre = delayed_post_pre_flat_jax(
+    # Every op is per token, so the kernel takes the tokens padded to its
+    # 16 (or 32) token groups: the real rows are the kernel's rows. Decode at
+    # 72 rows otherwise falls back to ~200 XLA ops, 38 us against 7.
+    group = 16 if envs.TPU_DEEPSEEK_V41_MHC_SHIFTED_T16 else 32
+    padded = -(-tokens // group) * group
+    if not shifted_post_pre_rms.is_supported_shape(padded, mult, dim):
+        return _unfused(
             x,
             flat,
             post,
@@ -49,27 +93,29 @@ def _post_pre_rms_jax(
             scale,
             base,
             pre,
+            norm_weight,
             rms_eps,
             pre_eps,
             sinkhorn_eps,
             post_multiplier,
             repeats,
+            norm_eps,
         )
-        normalized = value.astype(jnp.float32) * jax.lax.rsqrt(
-            jnp.mean(jnp.square(value.astype(jnp.float32)), axis=-1, keepdims=True)
-            + norm_eps
-        )
-        value = (normalized * norm_weight.astype(jnp.float32)).astype(value.dtype)
-        return residual, next_post, next_comb, value, next_pre
-    return shifted_post_pre_rms.shifted_post_pre_rms(
-        x.reshape(flat.shape[0], -1).astype(flat.dtype),
-        flat,
-        post,
-        comb,
+
+    def pad(a: jax.Array) -> jax.Array:
+        # Repeated last rows keep the padding finite.
+        widths = [(0, padded - tokens)] + [(0, 0)] * (a.ndim - 1)
+        return jnp.pad(a, widths, mode="edge")
+
+    outputs = shifted_post_pre_rms.shifted_post_pre_rms(
+        pad(x.reshape(tokens, -1).astype(flat.dtype)),
+        pad(flat),
+        pad(post),
+        pad(comb),
         weight,
         scale,
         base,
-        pre,
+        pad(pre),
         rms_eps=rms_eps,
         hc_pre_eps=pre_eps,
         hc_sinkhorn_eps=sinkhorn_eps,
@@ -79,6 +125,9 @@ def _post_pre_rms_jax(
         norm_eps=norm_eps,
         **_gate_layout(),
     )
+    if padded == tokens:
+        return outputs
+    return cast(Any, tuple(out[:tokens] for out in outputs))
 
 
 def _gate_layout() -> dict:
