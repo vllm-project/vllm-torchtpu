@@ -55,10 +55,9 @@ proper prefix of an added token for some ``p <= s``, which is checked, and
 such an end is not reused. The ids before ``e`` are then those of the same
 pieces, and the rest is split from ``e`` as the full scan would.
 
-Trusted ids: before a request
-leaves the API server, vLLM checks that every prompt id is in the vocabulary
-with a ``max()`` and ``min()`` over the whole id list, ~20 us per 1,000
-tokens on the event loop. Every id this module returns comes from the
+Trusted ids: before a request leaves the API server, vLLM checks that every
+prompt id is in the vocabulary with a ``max()`` and ``min()`` over the whole
+id list, on the event loop. Every id this module returns comes from the
 tokenizer's own output or its added-token table, so the check cannot fail.
 The id list each patched tokenization returns is remembered by identity, and
 ``validate_token_ids`` skips that one list once, while it is unchanged in
@@ -564,8 +563,8 @@ def patch_renderer_segment_tokenize() -> None:
         return tokens_prompt
 
     cls._tokenize_prompt = _tokenize_prompt
-    cls._tpu_segment_tokenize = True
     _patch_validate_token_ids(cls)
+    cls._tpu_segment_tokenize = True
     logger.info(
         "VLLM_TPU_SEGMENT_TOKENIZE: patched BaseRenderer._tokenize_prompt "
         "(prefix reuse over %d recent prompts; vocabulary check skipped for "
