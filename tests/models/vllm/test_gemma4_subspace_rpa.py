@@ -19,6 +19,7 @@ import copy
 import math
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
@@ -93,6 +94,20 @@ class _FlippedLinear(nn.Module):
         return (x.float() @ w.float()).to(x.dtype), None
 
 
+@pytest.fixture
+def python_attention(monkeypatch) -> None:
+    """Send the kernel call to the module's Python attention stand-in."""
+
+    def _call(attn_layer, query_3d, k_rot_3d, value_3d):
+        return attn_layer(
+            query_3d.flatten(-2, -1),
+            k_rot_3d.flatten(-2, -1),
+            value_3d.flatten(-2, -1),
+        )
+
+    monkeypatch.setattr(gsub, "call_subspace_unified_attention", _call)
+
+
 def _quant_dequant_fp8(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     finfo = torch.finfo(torch.float8_e4m3fn)
     xq = (x.float() / scale).clamp(finfo.min, finfo.max).to(torch.float8_e4m3fn)
@@ -127,8 +142,8 @@ def _build_gemma4_global_attn_pair(dtype: torch.dtype, quantize_kv_fp8: bool = F
         k_norm = _TestRMSNorm(head_dim, has_weight=True, dtype=dtype)
         v_norm = _TestRMSNorm(head_dim, has_weight=False, dtype=dtype)
         with torch.no_grad():
-            # Gemma 4 sets sm_scale=1.0 and folds 1/sqrt(D) into q_norm/k_norm,
-            # with high-dynamic-range outlier spikes on positional channels!
+            # Gemma 4 folds 1/sqrt(D) into q_norm/k_norm, and the positional
+            # channels of k_norm carry much larger weights than the rest.
             q_norm.weight.copy_((torch.randn(head_dim) * 0.15 + 0.25).to(dtype))
             k_w = torch.randn(head_dim).abs() * 0.35 + 0.15
             k_w[:64] *= 8.0
@@ -232,12 +247,9 @@ def _run_stock_attn(mod, pos: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def test_subspace_rpa_exact_algebraic_equivalence_fp32_and_bf16():
-    """Verify Pi-conjugation + W_v slicing + norm absorption is exact."""
-    ref32, _ = _build_gemma4_global_attn_pair(torch.float32, quantize_kv_fp8=False)
-    # In pure FP32 reference, keep k_rot in FP32 too to verify exact algebraic identity
-    _, sub32 = _build_gemma4_global_attn_pair(torch.float32, quantize_kv_fp8=False)
-    orig_sub_sdpa = sub32.attn
+def test_subspace_rpa_exact_algebraic_equivalence_fp32_and_bf16(python_attention):
+    """The rewritten layer matches the stock layer in FP32 and BF16."""
+    ref32, sub32 = _build_gemma4_global_attn_pair(torch.float32, quantize_kv_fp8=False)
 
     def _exact_f32_sdpa(q_2d, kr_2d, v_2d):
         t = q_2d.shape[0]
@@ -252,7 +264,7 @@ def test_subspace_rpa_exact_algebraic_equivalence_fp32_and_bf16():
         probs = torch.softmax(scores, dim=-1)
         return torch.einsum("hts,shd->thd", probs, vh).reshape(t, 2048)
 
-    del orig_sub_sdpa
+    # Keep k_rot in FP32 here so the comparison checks the algebra alone.
     sub32.attn = _exact_f32_sdpa  # type: ignore[assignment]
 
     assert sub32.qkv_proj.weight.shape[1] == sub32.q_size + sub32.kv_size
@@ -274,7 +286,9 @@ def test_subspace_rpa_exact_algebraic_equivalence_fp32_and_bf16():
     assert sqnr16 > 40.0, f"Expected >40 dB BF16 equivalence, got {sqnr16:.2f} dB"
 
 
-def test_subspace_rpa_mixed_precision_kv_quantization_sqnr_advantage():
+def test_subspace_rpa_mixed_precision_kv_quantization_sqnr_advantage(
+    python_attention,
+):
     """Verify Subspace-RPA (BF16-K_rot + FP8-V) beats stock FP8 K+V SQNR."""
     ref_exact, _ = _build_gemma4_global_attn_pair(torch.bfloat16, quantize_kv_fp8=False)
     ref_fp8_kv, sub_fp8_kv = _build_gemma4_global_attn_pair(
@@ -289,11 +303,11 @@ def test_subspace_rpa_mixed_precision_kv_quantization_sqnr_advantage():
 
     sqnr_stock = _sqnr_db(y_exact, y_stock_fp8)
     sqnr_sub = _sqnr_db(y_exact, y_sub_fp8)
-    # Subspace-RPA eliminates K_norm scale quantization error on both K_rot (exact BF16)
-    # and K_nope (absorbed into BF16 q_norm.weight while V is unit-RMS normalized)!
+    # K_rot stays BF16 and the unrotated k_norm weights move into q_norm, so
+    # the k_norm scale is never FP8-quantized.
     assert sqnr_sub >= sqnr_stock + 1.5, (
         f"Expected Subspace-RPA SQNR ({sqnr_sub:.2f} dB) to beat stock FP8 KV "
-        f"({sqnr_stock:.2f} dB) by >= 1.5 dB while using 2x less KV memory!"
+        f"({sqnr_stock:.2f} dB) by >= 1.5 dB"
     )
 
 

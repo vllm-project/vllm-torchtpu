@@ -1350,8 +1350,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY": env_str(
         "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", default=""
     ),
-    # Opt-in orthogonal-conjugated k_eq_v + proportional-RoPE Subspace-RPA on
-    # Gemma 4 512-dim global attention layers (False default).
+    # Opt-in Subspace-RPA KV storage for Gemma 4 global attention layers.
     "TPU_SUBSPACE_RPA": env_bool("TPU_SUBSPACE_RPA", default=False),
 }
 
