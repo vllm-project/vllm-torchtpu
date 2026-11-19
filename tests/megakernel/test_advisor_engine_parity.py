@@ -22,7 +22,7 @@ import shutil
 import signal
 import time
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 
 import pytest
 
@@ -83,6 +83,10 @@ class _BatchScenarioItem(TypedDict):
     only_validate: bool
     model_name: str
     wl: advisor.WorkloadSpec
+
+
+# 0.01 us 2-decimal display quantum + 0.005 us JS/Python rounding slack.
+DISPLAY_ROUND_TOL_US = 0.015
 
 
 def _select_five_models() -> tuple[str, ...]:
@@ -1900,8 +1904,6 @@ def test_glm_moe_dsa_and_dcp_engine_parity(
     _run_engine_runner(js_runtime, runner_path, in_json, out_json)
     records = json.loads(out_json.read_text(encoding="utf-8"))
 
-    # 0.01 us 2-decimal display quantum + 0.005 us JS/Python rounding slack.
-    display_round_tol_us = 0.015
     for (model_profile, workload), record in zip(cases, records, strict=True):
         expected_reasons = list(
             advisor.validate_workload(model_profile, chip_spec, workload)
@@ -1931,5 +1933,205 @@ def test_glm_moe_dsa_and_dcp_engine_parity(
                 "chain_us",
             ):
                 assert got_scope[field_name] == pytest.approx(
-                    getattr(scope, field_name), abs=display_round_tol_us
+                    getattr(scope, field_name), abs=DISPLAY_ROUND_TOL_US
                 ), f"{model_profile.name} {workload.phase} {scope.scope} {field_name}"
+
+
+def _assert_scope_parity_fields(
+    got_scope: dict[str, object],
+    expected_scope: advisor.ScopeEstimate,
+    label: str,
+) -> None:
+    """Assert JS scope estimate matches Python support, blockers, and latencies."""
+    assert got_scope["support"] == expected_scope.support
+    assert list(cast("list[str]", got_scope["blockers"])) == list(
+        expected_scope.blockers
+    )
+    for field_name, exp_val in (
+        ("step_bound_us", expected_scope.step_bound_us),
+        ("step_floor_strict_us", expected_scope.step_floor_strict_us),
+        ("step_achievable_us", expected_scope.step_achievable_us),
+        ("step_achievable_upper_us", expected_scope.step_achievable_upper_us),
+        ("step_upper_us", expected_scope.step_upper_us),
+    ):
+        assert got_scope[field_name] == pytest.approx(
+            exp_val, abs=DISPLAY_ROUND_TOL_US
+        ), f"{label} {expected_scope.scope} {field_name}"
+
+
+def _sublayer_item(layout: models.ParallelLayout) -> dict[str, object]:
+    """Build runner payload item to query JS sublayerLabel for one layout."""
+    owner_groups = (
+        layout.megakernel.get("expert_owner_groups")
+        if layout.megakernel is not None
+        else None
+    )
+    return {
+        "sublayer_layout": {
+            "tp": layout.tp,
+            "ep": layout.ep,
+            "dp": layout.dp,
+            "pp": layout.pp,
+            "dcp": layout.dcp,
+            "pcp": layout.pcp,
+        },
+        "expert_owner_groups": owner_groups,
+    }
+
+
+def _run_engine_runner_batch(
+    tmp_path: Path,
+    batch_slug: str,
+    items: list[dict[str, object]],
+    chip_dict: dict[str, object],
+) -> list[dict[str, object]]:
+    """Run the JS engine runner on a list of evaluation or sublayer items."""
+    js_runtime = shutil.which("node") or shutil.which("gjs")
+    if js_runtime is None:
+        msg = "Neither node nor gjs runtime found; install nodejs"
+        raise RuntimeError(msg)
+
+    seed_defaults = workbench_engine.build_engine_seed_defaults()
+    runner_path = Path(__file__).with_name("advisor_engine_runner.js")
+    engine_path = Path(models.__file__).parent / "assets" / "workbench_engine.js"
+    in_json = tmp_path / f"{batch_slug}_in.json"
+    out_json = tmp_path / f"{batch_slug}_out.json"
+    in_json.write_text(
+        json.dumps(
+            {
+                "engine_path": str(engine_path),
+                "seed_data": {"chip_spec": chip_dict, **seed_defaults},
+                "items": items,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _run_engine_runner(js_runtime, runner_path, in_json, out_json)
+    return cast("list[dict[str, object]]", json.loads(out_json.read_text("utf-8")))
+
+
+def _assert_eval_cases_parity(
+    tmp_path: Path,
+    batch_slug: str,
+    cases: list[tuple[advisor.ModelProfile, advisor.WorkloadSpec]],
+) -> None:
+    """Assert JS engine scope estimates and winners match Python advise."""
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    chip_dict = dataclasses.asdict(chip_spec)
+    items: list[dict[str, object]] = [
+        {
+            "params": {
+                "only_validate": False,
+                "profile": dataclasses.asdict(model_profile),
+                "chip": chip_dict,
+                "wl": dataclasses.asdict(workload),
+            }
+        }
+        for model_profile, workload in cases
+    ]
+    records = _run_engine_runner_batch(tmp_path, batch_slug, items, chip_dict)
+    for (model_profile, workload), rec in zip(cases, records, strict=True):
+        report = advisor.advise(model_profile, workload, chip_spec)
+        got = cast("dict[str, object]", rec["eval"])
+        full = cast("dict[str, object]", got["full"])
+        scopes_map = cast("dict[str, dict[str, object]]", got["scopes"])
+        assert full["fastestScope"] == report.fastest_scope
+        assert full["recScope"] == report.recommended_scope
+        for scope in report.scopes:
+            _assert_scope_parity_fields(
+                scopes_map[scope.scope],
+                scope,
+                f"{model_profile.name} {workload.phase}",
+            )
+
+
+def test_prefill_sparse_dsa_and_kimi_k31_engine_parity(tmp_path: Path) -> None:
+    """Verify prefill sparse DSA and Kimi-K3.1 Pro JS engine parity."""
+    kimi31_prof = models.resolve_model_profile("kimi-k3.1-pro")
+    glm_prof = models.resolve_model_profile("glm-5.2")
+    cases: list[tuple[advisor.ModelProfile, advisor.WorkloadSpec]] = [
+        (
+            kimi31_prof,
+            advisor.WorkloadSpec(
+                phase="decode", batch=4, context=4096, tp=32, ep=32, dcp=32
+            ),
+        ),
+        (
+            kimi31_prof,
+            advisor.WorkloadSpec(
+                phase="prefill", batch=1, isl=4096, tp=32, ep=32, pcp=32
+            ),
+        ),
+        (
+            glm_prof,
+            advisor.WorkloadSpec(phase="prefill", batch=1, isl=4096, tp=16),
+        ),
+    ]
+    _assert_eval_cases_parity(tmp_path, "prefill_dsa_kimi31", cases)
+
+
+def test_core_gap_blockers_engine_parity(tmp_path: Path) -> None:
+    """Verify core dtype and family gap blockers match Python advise in JS."""
+    gpt_oss_prof = models.resolve_model_profile("gpt-oss-120b")
+    mistral_prof = models.resolve_model_profile("mistral-large")
+    cases: list[tuple[advisor.ModelProfile, advisor.WorkloadSpec]] = [
+        (
+            gpt_oss_prof,
+            advisor.WorkloadSpec(phase="decode", batch=4, context=4096, tp=8),
+        ),
+        (
+            mistral_prof,
+            advisor.WorkloadSpec(phase="decode", batch=4, context=4096, tp=8),
+        ),
+    ]
+    _assert_eval_cases_parity(tmp_path, "core_gap_blockers", cases)
+
+
+def test_sublayer_mesh_label_engine_parity(tmp_path: Path) -> None:
+    """Verify JS sublayerLabel matches Python labels with explicit and auto groups."""
+    chip_dict = dataclasses.asdict(advisor.resolve_chip_spec("tpu7x"))
+    layout_cases: list[tuple[str, str, models.ParallelLayout]] = []
+    for preset_slug in ("kimi-k3", "qwen3.5-397b"):
+        preset = advisor.DEPLOYMENT_PRESETS[preset_slug]
+        candidates: list[tuple[str, models.ParallelLayout | None]] = [
+            ("decode", preset.decode),
+            ("prefill", preset.prefill),
+            ("saturation", preset.saturation),
+        ]
+        candidates.extend(
+            (f"megakernel_{idx}", mk_layout)
+            for idx, mk_layout in enumerate(preset.megakernel_layouts)
+        )
+        for role_tag, layout in candidates:
+            if layout is not None:
+                layout_cases.append((preset_slug, role_tag, layout))
+
+    preset_profiles = {
+        slug: dataclasses.asdict(models.resolve_model_profile(slug))
+        for slug in ("kimi-k3", "qwen3.5-397b")
+    }
+    items: list[dict[str, object]] = [
+        _sublayer_item(layout) for _, _, layout in layout_cases
+    ]
+    items.extend(
+        {
+            "sublayer_layout": _sublayer_item(layout)["sublayer_layout"],
+            "sublayer_profile": preset_profiles[preset_slug],
+        }
+        for preset_slug, _, layout in layout_cases
+    )
+
+    records = _run_engine_runner_batch(tmp_path, "sublayer_labels", items, chip_dict)
+    auto_start = len(layout_cases)
+    for (preset_slug, role_tag, layout), rec in zip(
+        layout_cases, records[:auto_start], strict=True
+    ):
+        assert rec["sublayer_label"] == layout.submodule_label(), (
+            f"{preset_slug} {role_tag}"
+        )
+    for (preset_slug, role_tag, layout), rec in zip(
+        layout_cases, records[auto_start:], strict=True
+    ):
+        assert rec["sublayer_label"] == layout.submodule_label(), (
+            f"{preset_slug} {role_tag} auto owner groups"
+        )

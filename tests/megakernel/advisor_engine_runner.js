@@ -95,7 +95,14 @@ for (const sc of inPayload.items) {
   if (sc.params) {
     evalRes = engine.evaluateScenario(sc.params);
   }
-  results.push({ eval: evalRes });
+  let sublayerRes = null;
+  if (sc.sublayer_layout) {
+    const ownerGroups = sc.sublayer_profile
+      ? engine.declaredExpertOwnerGroups(sc.sublayer_profile, sc.sublayer_layout)
+      : sc.expert_owner_groups;
+    sublayerRes = engine.sublayerLabel(sc.sublayer_layout, ownerGroups);
+  }
+  results.push({ eval: evalRes, sublayer_label: sublayerRes });
 }
 
 writeFile(outPath, JSON.stringify(results));

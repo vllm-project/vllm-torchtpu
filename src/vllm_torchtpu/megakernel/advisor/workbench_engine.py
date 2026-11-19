@@ -21,7 +21,13 @@ import json
 from . import constants
 from .assets import load_asset
 from .models import DEPLOYMENT_PRESETS, RECOGNIZED_MODEL_TYPES
-from .specs import SUPPORTED_ONCHIP_FAMILIES, WorkloadSpec
+from .specs import (
+    CORE_MODULE_FAMILIES,
+    CORE_SUPPORTED_DTYPES,
+    STRUCTURAL_LAYER_TAGS,
+    SUPPORTED_ONCHIP_FAMILIES,
+    WorkloadSpec,
+)
 from .support import CORE_LIMITS
 
 
@@ -83,6 +89,9 @@ def build_engine_seed_defaults() -> dict[str, object]:
         "verified_ranks": list(CORE_LIMITS.verified_ranks),
         "chip_kinds": list(CORE_LIMITS.chip_kinds),
         "supported_onchip_families": sorted(SUPPORTED_ONCHIP_FAMILIES),
+        "core_module_families": sorted(CORE_MODULE_FAMILIES),
+        "core_supported_dtypes": sorted(CORE_SUPPORTED_DTYPES),
+        "structural_layer_tags": sorted(STRUCTURAL_LAYER_TAGS),
         "recognized_model_types": sorted(RECOGNIZED_MODEL_TYPES),
         "declared_megakernels": declared,
         "default_declared_phases": list(constants.DEFAULT_DECLARED_PHASES),
