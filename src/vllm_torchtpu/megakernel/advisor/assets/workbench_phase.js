@@ -133,9 +133,9 @@
         ['Multi-Pass HBM Weight Re-stream', scA.repass_spill_us, scB.repass_spill_us,
           `n_splits=${scA.n_splits} vs ${scB.n_splits} (knob: #ctl-vmem)`],
         ['Dispatch / Boundary Bubble',
-          scA.ops_per_step * (evalA.launchGapPriorUs ?? evalA.launchGapLoUs),
-          scB.ops_per_step * (evalA.launchGapPriorUs ?? evalA.launchGapLoUs),
-          `ops=${scA.ops_per_step} vs ${scB.ops_per_step} * gap (#ctl-launch-gap)`]
+          scA.ops_per_step * (evalA.launchGapPriorUs ?? evalA.launchGapLoUs) + (scA.host_head_us || 0),
+          scB.ops_per_step * (evalA.launchGapPriorUs ?? evalA.launchGapLoUs) + (scB.host_head_us || 0),
+          `ops=${scA.ops_per_step} vs ${scB.ops_per_step} * gap + host_head (#ctl-launch-gap)`]
       ];
       const r = rows[idx] || rows[0];
       const rawD = r[1] - r[2], d = Math.abs(rawD) < 5e-3 ? 0 : rawD;
@@ -214,10 +214,21 @@
       : `${pTag('ASSUMED')} Settle: calibrate --trace &lt;p&gt;`;
     const ratio = (STATE.calStepTimeUs && STATE.calStepTimeUs > 0)
       ? (sc.step_bound_us / Math.max(0.1, STATE.calStepTimeUs) * 100).toFixed(1) : '';
-    const anc = (STATE.calibrated && STATE.calStepTimeUs !== null)
-      ? '<div class="wb-deriv-box"><strong>Measured Step:</strong> ' +
-        `<span class="tabular">${STATE.calStepTimeUs.toFixed(1)} us</span> ` +
-        `(${ratio}%)</div>`
+    const calParts = [];
+    if (STATE.calibrated && STATE.calStepTimeUs !== null) {
+      calParts.push(
+        '<strong>Measured Step:</strong> ' +
+        `<span class="tabular">${STATE.calStepTimeUs.toFixed(1)} us</span> (${ratio}%)`
+      );
+    }
+    if (STATE.calibrated && STATE.calHostHeadUs !== null) {
+      calParts.push(
+        '<strong>Calibrated Host Head:</strong> ' +
+        `<span class="tabular">${STATE.calHostHeadUs.toFixed(1)} us</span>`
+      );
+    }
+    const anc = calParts.length
+      ? `<div class="wb-deriv-box">${calParts.join(' &middot; ')}</div>`
       : '';
     return { line, anc };
   };
@@ -438,7 +449,10 @@
       typeof obj.step_time_us.p50 === 'number' || typeof obj.step_time_us === 'number'
     ));
     const hasRing = Boolean(obj.ring_plan && typeof obj.ring_plan === 'object');
-    if (!hasGap && !hasColls && !hasStepTime && !hasRing) {
+    const hasHostHead = Boolean(
+      obj.host_head_us && typeof obj.host_head_us.p50 === 'number'
+    );
+    if (!hasGap && !hasColls && !hasStepTime && !hasRing && !hasHostHead) {
       const st = document.getElementById('wb-cal-status');
       if (st) st.textContent = 'Rejected: payload lacks usable calibration measurements';
       return;
@@ -501,6 +515,7 @@
     const stRaw = obj.step_time_us;
     STATE.calStepTimeUs = (stRaw && typeof stRaw.p50 === 'number') ? stRaw.p50
       : (typeof stRaw === 'number' ? stRaw : null);
+    STATE.calHostHeadUs = hasHostHead ? obj.host_head_us.p50 : null;
     STATE.calibrated = true;
     STATE.hwDirty = true;
     STATE.dispatchRegime = 'compiled_xla';
@@ -518,18 +533,32 @@
     const hi = Math.min(arr.length - 1, lo + 1), frac = pos - lo;
     return arr[lo] * (1.0 - frac) + arr[hi] * frac;
   }
+  function dropWarmupSteps(stepList) {
+    const minWarmupSteps = Number(PHASE_GRID_SEED.min_warmup_drop_steps || 2);
+    const minDropSteps = Number(PHASE_GRID_SEED.min_steps_for_warmup_drop || 3);
+    const outlierRatio = Number(PHASE_GRID_SEED.warmup_outlier_ratio || 2.0);
+    if (stepList.length >= minWarmupSteps) {
+      const minRest = Math.min(...stepList.slice(1).map(s => s.dur));
+      if (stepList.length >= minDropSteps || stepList[0].dur > outlierRatio * minRest) {
+        return stepList.slice(1);
+      }
+    }
+    return stepList;
+  }
   function traceEventsToMeas(raw, fileName) {
     const evs = Array.isArray(raw) ? raw
       : (raw && Array.isArray(raw.traceEvents) ? raw.traceEvents : null);
     if (!evs) return raw;
     const valid = evs.filter(e => e && (!e.ph || e.ph === 'X') &&
       typeof e.ts === 'number' && typeof e.dur === 'number' && e.dur > 0);
-    const isStep = e => /step/i.test(String(e.name || '')) ||
-      /step/i.test(String(e.cat || ''));
     const isWrap = e => /^(jit[(]|pjit[(]|xla_computation[(]|module_main|__main__)/i
       .test(String(e.name || '').trim()) ||
       /xla modules/i.test(String(e.cat || ''));
-    const steps = valid.filter(isStep).sort((a, b) => a.ts - b.ts);
+    const isStep = e => !isWrap(e) && (/step/i.test(String(e.name || '')) ||
+      /step/i.test(String(e.cat || '')));
+    const rawSteps = valid.filter(isStep).sort((a, b) => a.ts - b.ts);
+    const wraps = valid.filter(e => !isStep(e) && isWrap(e))
+      .sort((a, b) => a.ts - b.ts);
     const spans = valid.filter(e => !isStep(e) && !isWrap(e))
       .sort((a, b) => a.ts - b.ts);
     const numLayers = (window.__MK_ADVISOR_ENGINE &&
@@ -540,13 +569,93 @@
 
     let launchGapPayload = null;
     let stepTimePayload = null;
+    let hostHeadPayload = null;
+    let steps = rawSteps;
+    let derivedAlreadyDropped = false;
+
+    if (wraps.length > 0 && spans.length > 0) {
+      const spansByPid = new Map();
+      for (const sp of spans) {
+        const rankKey = sp.pid || 0;
+        if (!spansByPid.has(rankKey)) spansByPid.set(rankKey, []);
+        spansByPid.get(rankKey).push(sp);
+      }
+      const wrapsByPid = new Map();
+      for (const w of wraps) {
+        const rankKey = w.pid || 0;
+        if (!wrapsByPid.has(rankKey)) wrapsByPid.set(rankKey, []);
+        wrapsByPid.get(rankKey).push(w);
+      }
+      const hostWraps = [];
+      for (const [rankKey, wList] of wrapsByPid.entries()) {
+        if (!spansByPid.has(rankKey)) hostWraps.push(...wList);
+      }
+      if (hostWraps.length > 0) {
+        hostWraps.sort((a, b) => a.ts - b.ts);
+        for (const rankKey of spansByPid.keys()) {
+          if (!wrapsByPid.has(rankKey)) wrapsByPid.set(rankKey, hostWraps);
+        }
+        for (const rankKey of Array.from(wrapsByPid.keys())) {
+          if (!spansByPid.has(rankKey)) wrapsByPid.delete(rankKey);
+        }
+      }
+      const derivedSteps = [];
+      const steadyHeads = [];
+      for (const [rankKey, wList] of wrapsByPid.entries()) {
+        const rankSpans = spansByPid.get(rankKey) || spans;
+        const byProg = new Map();
+        for (const w of wList) {
+          const w0 = w.ts, w1 = w.ts + w.dur;
+          let firstStart = Infinity, lastEnd = -Infinity, cnt = 0;
+          for (const sp of rankSpans) {
+            if (sp.ts >= w1) break;
+            if (sp.ts >= w0) {
+              if (sp.ts < firstStart) firstStart = sp.ts;
+              const spEnd = Math.min(w1, sp.ts + sp.dur);
+              if (spEnd > lastEnd) lastEnd = spEnd;
+              cnt += 1;
+            }
+          }
+          if (cnt === 0 || lastEnd <= firstStart) continue;
+          const pName = String(w.name || 'module');
+          if (!byProg.has(pName)) byProg.set(pName, []);
+          byProg.get(pName).push({
+            pid: rankKey,
+            ts: firstStart,
+            dur: lastEnd - firstStart,
+            headUs: Math.max(0.0, firstStart - w0)
+          });
+        }
+        let bestName = null, bestSum = -1.0;
+        for (const [pName, arr] of byProg.entries()) {
+          const tot = arr.reduce((a, x) => a + x.dur, 0.0);
+          if (tot > bestSum || (tot === bestSum && (bestName === null || pName < bestName))) {
+            bestSum = tot; bestName = pName;
+          }
+        }
+        if (bestName !== null) {
+          const primarySteps = byProg.get(bestName).sort((a, b) => a.ts - b.ts);
+          const steadyRankSteps = dropWarmupSteps(primarySteps);
+          derivedSteps.push(...steadyRankSteps);
+          for (const item of steadyRankSteps) steadyHeads.push(item.headUs);
+        }
+      }
+      if (steadyHeads.length > 0) {
+        steadyHeads.sort((a, b) => a - b);
+        hostHeadPayload = {
+          p50: Number(quantileSorted(steadyHeads, 0.5).toFixed(2)),
+          p90: Number(quantileSorted(steadyHeads, 0.9).toFixed(2)),
+          n: steadyHeads.length
+        };
+      }
+      if (steps.length === 0 && derivedSteps.length > 0) {
+        steps = derivedSteps.sort((a, b) => a.ts - b.ts);
+        derivedAlreadyDropped = true;
+      }
+    }
 
     if (steps.length > 0) {
-      const minRest = steps.length > 1
-        ? Math.min(...steps.slice(1).map(s => s.dur)) : 0.0;
-      const dropWarmup = steps.length >= 3 ||
-        (steps.length === 2 && steps[0].dur > 2.0 * minRest);
-      const steady = dropWarmup ? steps.slice(1) : steps;
+      const steady = derivedAlreadyDropped ? steps : dropWarmupSteps(steps);
       const perBnd = [], stepIdles = [], stepDurs = [];
       let maxStepOps = 0;
 
@@ -644,6 +753,7 @@
     };
     if (stepTimePayload) out.step_time_us = stepTimePayload;
     if (launchGapPayload) out.launch_gap_us = launchGapPayload;
+    if (hostHeadPayload) out.host_head_us = hostHeadPayload;
     return out;
   }
   window.__WB_TRACE_TO_MEAS = traceEventsToMeas;
