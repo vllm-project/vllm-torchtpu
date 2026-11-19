@@ -148,6 +148,8 @@ PATCHES = (
         "vllm_torchtpu.platforms.tpu_platform:_patch_api_server_kernel_reload_endpoint",
         _ACTIVE,
     ),
+    # API-server detokenizer: prime with a prompt tail, not the whole prompt.
+    Patch("vllm_torchtpu.prompt_tail_decode_stream:install", _ACTIVE),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.
