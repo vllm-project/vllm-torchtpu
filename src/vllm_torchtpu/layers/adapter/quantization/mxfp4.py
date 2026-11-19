@@ -306,6 +306,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         prebuild_fused_moe_kernel(
+            topk_weights_float32=self._tpu_topk_weights_float32,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
@@ -334,10 +335,15 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         # input_ids is forwarded for DeepSeek-V4 hash routing; mxfp4 is the only
         # method that supplies it, matching the pre-consolidation behavior.
         topk_weights, topk_ids = moe_routing.route(
-            layer, x, router_logits, input_ids=input_ids
+            layer,
+            x,
+            router_logits,
+            input_ids=input_ids,
+            topk_weights_float32=self._tpu_topk_weights_float32,
         )
 
         kwargs = {
+            "topk_weights_float32": self._tpu_topk_weights_float32,
             "hidden_states": x,
             "w1": layer.w13_weight,
             "w2": layer.w2_weight,
@@ -689,6 +695,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=device)
         prebuild_fused_moe_kernel(
+            topk_weights_float32=self._tpu_topk_weights_float32,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,

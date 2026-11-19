@@ -148,6 +148,19 @@ def test_admission_declines_silu_bf16(monkeypatch):
     assert bridge._admit(runner, 2) is None
 
 
+def test_admission_declines_topk_weights_float32(monkeypatch):
+    """The kernel rounds the top-k weights to bfloat16; under
+    tpu_moe_topk_weights_float32 the layer keeps gmm_v2's float32 combine."""
+    import vllm.distributed
+
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    runner = _glm_runner(DeepseekV2MLP(256, 128))
+    runner._quant_method._tpu_topk_weights_float32 = True
+    assert bridge._admit(runner, 2) is None
+
+
 def test_admission_declines_attention_narrower_than_mesh(monkeypatch):
     """PCP2 (or DP2) at TP1: the EP group spans the mesh, attention does not, so
     MoERunner still runs a collective after the op."""

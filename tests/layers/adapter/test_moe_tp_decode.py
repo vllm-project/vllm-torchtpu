@@ -388,6 +388,16 @@ def test_refuses_silu_bf16(harness):
     assert "activation 'silu_bf16' is not silu" in harness.logs[-1]
 
 
+def test_refuses_topk_weights_float32(harness):
+    """The kernel's routing rounds the top-k weights to bfloat16, so a layer
+    under tpu_moe_topk_weights_float32 keeps gmm_v2's float32 combine."""
+    model = harness.model({})
+    model.layers[0].routed_experts.quant_method._tpu_topk_weights_float32 = True
+    assert moe_tp_decode.arm(model) == 0
+    assert not _armed(model.layers[0])
+    assert "tpu_moe_topk_weights_float32 is set" in harness.logs[-1]
+
+
 def test_refuses_without_the_padding_mask(harness, monkeypatch):
     monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", False)
     model = harness.model({})

@@ -999,7 +999,9 @@ def test_fused_moe_func_silu_bf16_matches_unfused_silu_and_mul():
     )
 
     args = (hidden_states, w1, w2, None, None, None, None, topk_weights, topk_ids)
-    kwargs = dict(topk=topk, use_ep=False, use_sparse_core=False)
+    kwargs = dict(
+        topk=topk, use_ep=False, use_sparse_core=False, topk_weights_float32=True
+    )
     fused_moe_func.clear_cache()
     try:
         hlo = fused_moe_func.lower(*args, activation="silu_bf16", **kwargs).as_text()
@@ -1022,6 +1024,52 @@ def test_fused_moe_func_silu_bf16_matches_unfused_silu_and_mul():
     assert bf16_equal > 0.99, (bf16_equal, fp32_equal)
     # Reverting to float32 intermediates must fail the check above.
     assert fp32_equal < 0.9, (bf16_equal, fp32_equal)
+
+
+@pytest.mark.tpu_test
+def test_fused_moe_func_topk_weights_dtype_follows_the_setting():
+    """The setting, not the incoming dtype, picks the combine dtype: float32
+    weights from a custom routing function are rounded to the activation dtype
+    when it is off, and bfloat16 weights are combined in float32 when on."""
+    _require_tpu()
+
+    num_tokens, hidden, inter, num_experts, topk = 64, 512, 256, 8, 2
+    k_h, k_r, k_w1, k_w2 = jax.random.split(jax.random.key(7), 4)
+    hidden_states = jax.random.normal(k_h, (num_tokens, hidden), jnp.bfloat16)
+    w1 = (jax.random.normal(k_w1, (num_experts, hidden, 2 * inter)) * 0.05).astype(
+        jnp.bfloat16
+    )
+    w2 = (jax.random.normal(k_w2, (num_experts, inter, hidden)) * 0.05).astype(
+        jnp.bfloat16
+    )
+    scores = jax.nn.softmax(jax.random.normal(k_r, (num_tokens, num_experts)))
+    weights_f32, topk_ids = jax.lax.top_k(scores, topk)
+    topk_ids = topk_ids.astype(jnp.int32)
+    weights_bf16 = weights_f32.astype(jnp.bfloat16)
+
+    def run(weights, topk_weights_float32):
+        return np.asarray(
+            fused_moe_func(
+                hidden_states,
+                w1,
+                w2,
+                None,
+                None,
+                None,
+                None,
+                weights,
+                topk_ids,
+                topk=topk,
+                use_ep=False,
+                use_sparse_core=False,
+                topk_weights_float32=topk_weights_float32,
+            )
+        )
+
+    np.testing.assert_array_equal(run(weights_f32, False), run(weights_bf16, False))
+    np.testing.assert_array_equal(
+        run(weights_bf16, True), run(weights_bf16.astype(jnp.float32), True)
+    )
 
 
 def _fake_tpu_info(sparse_core):

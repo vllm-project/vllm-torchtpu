@@ -665,6 +665,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "topk_weights_float32",
     ),
 )
 def fused_moe_func(
@@ -685,6 +686,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    topk_weights_float32: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -725,12 +727,12 @@ def fused_moe_func(
     assert topk_weights.shape == (num_tokens, topk)
     assert topk_ids.shape == (num_tokens, topk)
 
-    # Routing returns float32 top-k weights when
-    # additional_config["tpu_moe_topk_weights_float32"] is set; keep those, and
-    # pin any other dtype to hidden_states.dtype, so the EP mask, GMM reduce,
-    # and `where` propagate appropriately.
-    if topk_weights.dtype != jnp.float32:
-        topk_weights = topk_weights.astype(hidden_states.dtype)
+    # Pin topk_weights to hidden_states.dtype (or float32 under
+    # additional_config["tpu_moe_topk_weights_float32"]) so the EP mask, GMM
+    # reduce, and `where` propagate appropriately.
+    topk_weights = topk_weights.astype(
+        jnp.float32 if topk_weights_float32 else hidden_states.dtype
+    )
 
     if use_ep and use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold:
         # The one-hot permute and unpermute are matmuls across all tokens, and

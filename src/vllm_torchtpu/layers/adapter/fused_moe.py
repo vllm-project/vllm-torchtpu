@@ -23,7 +23,6 @@ from torch_tpu._internal import pallas
 from vllm.config import get_current_vllm_config_or_none
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
@@ -41,7 +40,7 @@ logger = init_logger(__name__)
 
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
+_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool, bool], Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -91,6 +90,9 @@ class TpuMoEActivationMixin:
     """
 
     _tpu_activation_str: str | None = None
+    # additional_config["tpu_moe_topk_weights_float32"], set with the
+    # activation at weight load.
+    _tpu_topk_weights_float32: bool = False
 
     def _resolve_tpu_activation(self, layer) -> str:
         """Encode this layer's activation for the kernel.
@@ -108,7 +110,7 @@ class TpuMoEActivationMixin:
         stay out of the compiled forward.
         """
         parity = get_moe_reference_parity(get_current_vllm_config_or_none())
-        moe_routing.set_topk_weights_float32(parity.topk_weights_float32)
+        self._tpu_topk_weights_float32 = parity.topk_weights_float32
         activation = self._resolve_tpu_activation(layer)
         resolved = resolve_silu_bf16(activation, parity.silu_bf16)
         if resolved != activation:
@@ -207,6 +209,7 @@ def _build_fused_moe_custom_op(
     use_ep: bool,
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
+    topk_weights_float32: bool = False,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -231,6 +234,7 @@ def _build_fused_moe_custom_op(
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        topk_weights_float32=topk_weights_float32,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
@@ -242,7 +246,14 @@ def _build_fused_moe_custom_op(
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+        topk_weights_float32,
+    )
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -254,10 +265,18 @@ def _get_fused_moe_custom_op(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    topk_weights_float32: bool = False,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+        topk_weights_float32,
+    )
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -267,6 +286,7 @@ def _get_fused_moe_custom_op(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        topk_weights_float32=topk_weights_float32,
     )
 
 
@@ -277,6 +297,7 @@ def prebuild_fused_moe_kernel(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    topk_weights_float32: bool = False,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -285,6 +306,7 @@ def prebuild_fused_moe_kernel(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        topk_weights_float32=topk_weights_float32,
     )
 
 
@@ -303,6 +325,7 @@ def fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    topk_weights_float32: bool = False,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
@@ -323,6 +346,7 @@ def fused_moe_gmm(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        topk_weights_float32=topk_weights_float32,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand

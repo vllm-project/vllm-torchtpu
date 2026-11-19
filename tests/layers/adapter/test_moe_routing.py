@@ -253,15 +253,12 @@ def test_route_hash_table_scales_by_the_layer_factor():
     torch.testing.assert_close(weights, torch.full((2, 2), 0.5))
 
 
-def test_get_topk_weights_dtype(monkeypatch):
+def test_get_topk_weights_dtype():
     torch = pytest.importorskip("torch")
-    monkeypatch.setattr(moe_routing, "_TOPK_WEIGHTS_FLOAT32", False)
-    assert moe_routing._get_topk_weights_dtype(torch.bfloat16) == torch.bfloat16
-    assert moe_routing._get_topk_weights_dtype(torch.float16) == torch.float16
-
-    moe_routing.set_topk_weights_float32(True)
-    assert moe_routing._get_topk_weights_dtype(torch.bfloat16) == torch.float32
-    assert moe_routing._get_topk_weights_dtype(torch.float16) == torch.float32
+    assert moe_routing._get_topk_weights_dtype(torch.bfloat16, False) == torch.bfloat16
+    assert moe_routing._get_topk_weights_dtype(torch.float16, False) == torch.float16
+    assert moe_routing._get_topk_weights_dtype(torch.bfloat16, True) == torch.float32
+    assert moe_routing._get_topk_weights_dtype(torch.float16, True) == torch.float32
 
 
 def test_select_experts_honours_topk_weights_float32(monkeypatch):
@@ -272,7 +269,6 @@ def test_select_experts_honours_topk_weights_float32(monkeypatch):
 
     monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
 
-    monkeypatch.setattr(moe_routing, "_TOPK_WEIGHTS_FLOAT32", False)
     weights_bf16, _ = moe_routing.select_experts(
         hidden_states=hidden,
         router_logits=logits,
@@ -280,10 +276,10 @@ def test_select_experts_honours_topk_weights_float32(monkeypatch):
         renormalize=True,
         scoring_fn="softmax",
         layer=layer,
+        topk_weights_float32=False,
     )
     assert weights_bf16.dtype == torch.bfloat16
 
-    monkeypatch.setattr(moe_routing, "_TOPK_WEIGHTS_FLOAT32", True)
     weights_fp32, _ = moe_routing.select_experts(
         hidden_states=hidden,
         router_logits=logits,
@@ -291,22 +287,25 @@ def test_select_experts_honours_topk_weights_float32(monkeypatch):
         renormalize=True,
         scoring_fn="softmax",
         layer=layer,
+        topk_weights_float32=True,
     )
     assert weights_fp32.dtype == torch.float32
     torch.testing.assert_close(weights_fp32.bfloat16(), weights_bf16)
 
 
-def test_uniform_random_routing_honours_topk_weights_float32(monkeypatch):
+def test_uniform_random_routing_honours_topk_weights_float32():
     torch = pytest.importorskip("torch")
     hidden = torch.randn(4, 8, dtype=torch.bfloat16)
     logits = torch.randn(4, 16)
 
-    monkeypatch.setattr(moe_routing, "_TOPK_WEIGHTS_FLOAT32", False)
-    weights_bf16, _ = moe_routing._uniform_random_routing(hidden, logits, topk=2)
+    weights_bf16, _ = moe_routing._uniform_random_routing(
+        hidden, logits, topk=2, topk_weights_float32=False
+    )
     assert weights_bf16.dtype == torch.bfloat16
 
-    monkeypatch.setattr(moe_routing, "_TOPK_WEIGHTS_FLOAT32", True)
-    weights_fp32, _ = moe_routing._uniform_random_routing(hidden, logits, topk=2)
+    weights_fp32, _ = moe_routing._uniform_random_routing(
+        hidden, logits, topk=2, topk_weights_float32=True
+    )
     assert weights_fp32.dtype == torch.float32
 
 

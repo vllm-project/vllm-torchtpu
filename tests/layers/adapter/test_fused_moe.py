@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_torchtpu.layers.adapter import fused_moe, moe_routing
+from vllm_torchtpu.layers.adapter import fused_moe
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     get_fused_moe_activation,
@@ -69,7 +69,6 @@ def test_set_tpu_activation_reads_additional_config(monkeypatch, enabled, thresh
         "get_current_vllm_config_or_none",
         lambda: _vllm_config(tpu_moe_silu_bf16=enabled),
     )
-    monkeypatch.setattr(moe_routing, "_TOPK_WEIGHTS_FLOAT32", True)
     monkeypatch.setattr(fused_moe.envs, "TPU_MOE_DENSE_EXPERT_THRESHOLD", threshold)
     monkeypatch.setattr(
         fused_moe.logger, "warning_once", lambda msg, *a: warnings.append(msg % a)
@@ -80,8 +79,7 @@ def test_set_tpu_activation_reads_additional_config(monkeypatch, enabled, thresh
     expected = "silu_bf16" if enabled else "silu"
     assert method._set_tpu_activation(layer) == expected
     assert method._tpu_activation_str == expected
-    # tpu_moe_topk_weights_float32 is unset, so routing goes back to off.
-    assert moe_routing._TOPK_WEIGHTS_FLOAT32 is False
+    assert method._tpu_topk_weights_float32 is False
     if enabled and threshold:
         assert len(warnings) == 1
         assert "tpu_moe_silu_bf16" in warnings[0]
@@ -97,12 +95,14 @@ def test_set_tpu_activation_configures_topk_weights_float32(monkeypatch, enabled
         "get_current_vllm_config_or_none",
         lambda: _vllm_config(tpu_moe_topk_weights_float32=enabled),
     )
-    monkeypatch.setattr(moe_routing, "_TOPK_WEIGHTS_FLOAT32", not enabled)
     layer = SimpleNamespace(activation=_Activation.SILU, moe_config=None)
+    method, other = _Method(), _Method()
 
     # Only the silu_bf16 setting changes the activation.
-    assert _Method()._set_tpu_activation(layer) == "silu"
-    assert moe_routing._TOPK_WEIGHTS_FLOAT32 is enabled
+    assert method._set_tpu_activation(layer) == "silu"
+    # Stored per quant method, so another layer's method is unaffected.
+    assert method._tpu_topk_weights_float32 is enabled
+    assert other._tpu_topk_weights_float32 is False
 
 
 @pytest.mark.parametrize("enabled", [False, True])

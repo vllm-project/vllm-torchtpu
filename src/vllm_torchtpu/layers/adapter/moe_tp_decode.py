@@ -97,8 +97,6 @@ class _OpStatics:
     activation: str
     use_sparse_core: bool
     onehot_threshold: int
-    # additional_config["tpu_moe_topk_weights_float32"] (moe_routing).
-    topk_weights_float32: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -196,6 +194,9 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         return f"quant method {type(qm).__name__} is not VllmFp8MoEMethodTPU"
     if qm._tpu_activation_str != "silu":
         return f"activation {qm._tpu_activation_str!r} is not silu"
+    if qm._tpu_topk_weights_float32:
+        # The kernel's routing rounds the top-k weights to bfloat16.
+        return "tpu_moe_topk_weights_float32 is set"
     if qm._use_adaptive_fused_moe or fused_moe_ep_supported(qm):
         return "a fused EP MoE kernel serves this layer"
     if envs.FUSED_MOE_DECODE_KERNEL:
@@ -285,7 +286,6 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         activation=qm._tpu_activation_str,
         use_sparse_core=envs.USE_MOE_SPARSE_CORE,
         onehot_threshold=resolve_onehot_permute_threshold(),
-        topk_weights_float32=moe_routing._TOPK_WEIGHTS_FLOAT32,
     )
     return _Admitted(shared=shared, rows=rows, hidden=hidden, statics=statics)
 
@@ -302,9 +302,6 @@ def _tp_chain(x, scores, bias, is_pad, w13, w2, s13, s2, sw13, ss13, sw2, ss2, s
     total = jnp.where(jnp.isnan(total), total, jnp.maximum(total, _SUM_FLOOR))
     w = (w / total).astype(x.dtype)
     w = jnp.where(is_pad[:, None], jnp.zeros_like(w), w)
-    if st.topk_weights_float32:
-        # fused_moe_func combines in float32 only for float32 weights.
-        w = w.astype(jnp.float32)
     routed = fused_moe_func(
         x,
         w13,
