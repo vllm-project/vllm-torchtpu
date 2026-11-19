@@ -1179,7 +1179,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # graph instead of AOTAutograd's eager copy_ epilogue (120 host copy_ per
     # MiniMax forward). 1 = keep_inference_input_mutations; 2 = also donate
     # the written placeholders to torch_tpu's StaticCompiler. 0 = off. Changes
-    # every compiled program (and the compile cache key).
+    # every compiled program (and the compile cache key). BROKEN on the
+    # pinned torch_tpu: exos j-d93796de lost every in-graph cache write in
+    # both modes (caches_equal 0/120). Kept only for a future torch_tpu.
     "TPU_HOST_KEEP_INPUT_MUTATIONS": env_nonnegative_int(
         "TPU_HOST_KEEP_INPUT_MUTATIONS", 0
     ),

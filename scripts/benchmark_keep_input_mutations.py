@@ -56,7 +56,11 @@ def main():
             import jax.numpy as jnp
             from torch_tpu._internal import pallas
 
-            def _write(q, cache, slots):
+            import jax
+
+            def _write(
+                q: jax.Array, cache: jax.Array, slots: jax.Array
+            ) -> tuple[jax.Array, jax.Array]:
                 new = cache.at[slots].set(q.astype(cache.dtype))
                 return new, jnp.tanh(q + new[slots].astype(q.dtype))
 
@@ -118,7 +122,7 @@ def main():
         x, s = xs[0].to(dev), sl[0].to(dev)
         for _ in range(10):
             compiled(x, s, kv, idx)
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
         n = [0]
         orig = torch.Tensor.copy_
 
@@ -132,14 +136,14 @@ def main():
         finally:
             torch.Tensor.copy_ = orig
         res["epilogue_copies"] = n[0]
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
         host = 0.0
         t0 = time.perf_counter()
         for _ in range(a.iters):
             h = time.perf_counter()
             compiled(x, s, kv, idx)
             host += time.perf_counter() - h
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
         res["host_us"] = round(host / a.iters * 1e6, 1)
         res["wall_us"] = round((time.perf_counter() - t0) / a.iters * 1e6, 1)
     except Exception as e:  # noqa: BLE001

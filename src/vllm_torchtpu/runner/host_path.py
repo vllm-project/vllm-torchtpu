@@ -146,4 +146,9 @@ def install_keep_input_mutations(mode: int | None = None) -> None:
 
         call_donating._tpu_donate_mutated = True
         compiler.StaticCompiler.__call__ = call_donating
-    logger.info("TPU_HOST_KEEP_INPUT_MUTATIONS=%d: TpuBackend patched.", mode)
+    logger.warning(
+        "TPU_HOST_KEEP_INPUT_MUTATIONS=%d: TpuBackend patched. On the pinned "
+        "torch_tpu the in-graph cache writes are lost (exos j-d93796de); "
+        "outputs will be wrong.",
+        mode,
+    )
