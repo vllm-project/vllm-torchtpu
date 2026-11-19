@@ -448,24 +448,35 @@ class TokenizerMadeIds:
     identity until vLLM's vocabulary check takes them.
 
     Each entry holds its list, so its id is never reused by another list while
-    the entry exists. Lists whose check never comes are dropped oldest first.
+    the entry exists. Lists whose check never comes (a ``/tokenize`` request,
+    a prompt refused before the check) are dropped oldest first once the
+    remembered lists hold more than ``max_tokens`` ids; a dropped list is
+    simply checked.
     """
 
-    def __init__(self, capacity: int = 64):
-        self._capacity = capacity
+    def __init__(self, max_tokens: int = 1 << 22):
+        self._max_tokens = max_tokens
+        self._tokens = 0
         self._lists: OrderedDict[int, tuple[list[int], int]] = OrderedDict()
         self._lock = threading.Lock()
 
     def add(self, ids: list[int]) -> None:
         with self._lock:
+            old = self._lists.pop(id(ids), None)
+            if old is not None:
+                self._tokens -= old[1]
             self._lists[id(ids)] = (ids, len(ids))
-            while len(self._lists) > self._capacity:
-                self._lists.popitem(last=False)
+            self._tokens += len(ids)
+            while self._tokens > self._max_tokens and len(self._lists) > 1:
+                _, (_, length) = self._lists.popitem(last=False)
+                self._tokens -= length
 
     def take(self, ids: Any) -> bool:
         """Whether ``ids`` is a remembered list of its remembered length; forgets it."""
         with self._lock:
             entry = self._lists.pop(id(ids), None)
+            if entry is not None:
+                self._tokens -= entry[1]
         return entry is not None and entry[0] is ids and entry[1] == len(ids)
 
     def __len__(self) -> int:
