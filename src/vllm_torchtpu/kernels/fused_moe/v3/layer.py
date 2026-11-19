@@ -384,7 +384,6 @@ def _pallas_step(
     w1_cols,
     arrival_rows,
     blocks_per_step,
-    activation_block,
     token_block,
     result_rows,
     elementwise,
@@ -397,8 +396,8 @@ def _pallas_step(
 ):
     """One shard of the pallas mode. `config` supplies the programs'
     geometry (the gather, scatter and combine settings); `token_block` is
-    the token rows' rounding block (their scale planes), `activation_block`
-    the intermediate's."""
+    the token rows' rounding block (their scale planes). The intermediate's
+    is built into `run_kernel`."""
     real_tokens = tokens_per_shard
     n_scales = transport.scale_planes(hidden, token_block)
     tokens_per_shard, message_tokens, pairs_per_shard = pallas_geometry(
@@ -1047,7 +1046,6 @@ def fused_ep_moe(
         w1_cols=w1_cols,
         arrival_rows=arrival_rows,
         blocks_per_step=blocks_per_step,
-        activation_block=activation_block,
         token_block=token_block,
         result_rows=config.result_rows,
         elementwise=config.elementwise,
