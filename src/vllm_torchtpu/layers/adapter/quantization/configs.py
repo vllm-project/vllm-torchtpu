@@ -57,7 +57,6 @@ if TYPE_CHECKING:
         _tpu_fused_w13_scale: torch.Tensor
         _tpu_fused_w2_scale: torch.Tensor
         _rhs_quant_dtype: Any
-        _gmm_primary_experts: int | None
 
     class TpuLinear(LinearBase):
         """Typing-only view of a LinearBase layer with the parameters and

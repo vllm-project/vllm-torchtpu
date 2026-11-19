@@ -555,11 +555,13 @@ def test_the_fp8_method_bounds_the_grouped_path_to_a_layers_primaries(
     monkeypatch.setattr(
         fp8, "prebuild_fused_moe_kernel", lambda **kw: prebuilt.append(kw)
     )
-    method = object.__new__(fp8.VllmFp8MoEMethodTPU)
-    for layer in (placed, unplaced):
+    # vLLM builds one quant method per MoE layer.
+    methods = [object.__new__(fp8.VllmFp8MoEMethodTPU) for _ in range(2)]
+    assert methods[0]._gmm_primary_experts is None  # before the weights load
+    for method, layer in zip(methods, (placed, unplaced)):
         method._prebuild_grouped_path(layer, "silu")
     want = (4, 4) if table == "copies" else (None, None)
-    assert (placed._gmm_primary_experts, unplaced._gmm_primary_experts) == want
+    assert tuple(m._gmm_primary_experts for m in methods) == want
     assert [kw["num_primary_experts"] for kw in prebuilt] == list(want)
 
 

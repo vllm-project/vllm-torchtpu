@@ -780,6 +780,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     CUDA-only router.select_experts() path.
     """
 
+    # The grouped path's bound on the layer's local slots
+    # (expert_placement.primary_experts), set when the weights load; None
+    # serves every slot.
+    _gmm_primary_experts: int | None = None
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
 
@@ -1115,12 +1119,12 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         """Record the grouped path's bound on the layer's local slots (its
         primaries under a placement with copy slots, see
         expert_placement.primary_experts) and prebuild the op for it."""
-        layer._gmm_primary_experts = expert_placement.primary_experts(layer)
+        self._gmm_primary_experts = expert_placement.primary_experts(layer)
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
-            num_primary_experts=layer._gmm_primary_experts,
+            num_primary_experts=self._gmm_primary_experts,
         )
 
     def apply_monolithic(
@@ -1223,7 +1227,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "experts_start": layer._experts_start,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
-            "num_primary_experts": getattr(layer, "_gmm_primary_experts", None),
+            "num_primary_experts": self._gmm_primary_experts,
         }
         if owns_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
