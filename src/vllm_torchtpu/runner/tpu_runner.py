@@ -11218,9 +11218,25 @@ class TPUModelRunner(GPUModelRunner):
         )
         gumbel_noise = -torch.log(-torch.log(u_clamped))
         noisy_logits = masked_logits + gumbel_noise
-        final_logits = torch.where(is_greedy, cand_logits, noisy_logits)
-        cand_idx = torch.argmax(final_logits, dim=-1, keepdim=True)
-        return torch.gather(cand_token_ids, -1, cand_idx)
+        sampled = torch.gather(
+            cand_token_ids, -1, torch.argmax(noisy_logits, dim=-1, keepdim=True)
+        )
+        # Greedy rows take the tied candidate with the lowest token id, the full
+        # vocabulary's first argmax, as _fused_spec_verify_and_sample_candidates
+        # does. The packed producer already lists tied maxima in token-id order
+        # (stable top-k over rank-ordered shards), so this keeps that rule
+        # whatever order a producer uses.
+        max_cand_logits = cand_logits.max(dim=-1, keepdim=True).values
+        greedy = (
+            torch.where(
+                cand_logits == max_cand_logits,
+                cand_token_ids.to(torch.int32),
+                torch.iinfo(torch.int32).max,
+            )
+            .min(dim=-1, keepdim=True)
+            .values.to(cand_token_ids.dtype)
+        )
+        return torch.where(is_greedy, greedy, sampled)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_logprob_row_tokens(
