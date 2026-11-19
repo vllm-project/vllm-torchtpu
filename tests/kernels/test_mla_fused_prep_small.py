@@ -53,7 +53,6 @@ pytestmark = pytest.mark.tpu_test
 
 SMALL_FLAG = "TPU_DCP_MLA_MIXED_FUSED_PREP_SMALL"
 EARLY_FLAG = "TPU_MLA_GATHER_EARLY_DMA_LIVE_GROUP"
-_Base = nsa.SparseMlaCacheLayoutsTest
 
 
 def _require_tpu():
@@ -86,9 +85,11 @@ class FusedPrepSmallTest(parameterized.TestCase):
     # The case builders and the bitwise check of the 128-token fused prep test
     # (`test_capped_window_live_fused_matches_live`); its chunk is
     # min(256, num_tokens), so 64 tokens give one 64-token chunk.
-    _live_fused_case = _Base._live_fused_case
-    _live_fused_check = _Base._live_fused_check
-    _split_q_lse_case = _Base._split_q_lse_case
+    # (Borrowed as attributes, not through a module-level alias, so pytest
+    # does not collect the borrowed test class a second time here.)
+    _live_fused_case = nsa.SparseMlaCacheLayoutsTest._live_fused_case
+    _live_fused_check = nsa.SparseMlaCacheLayoutsTest._live_fused_check
+    _split_q_lse_case = nsa.SparseMlaCacheLayoutsTest._split_q_lse_case
 
     @parameterized.product(real=(64, 49, 17), overflow=(False, True))
     def test_fused_prep_chunk64_matches_live(self, real, overflow):
@@ -188,8 +189,10 @@ def _dcp_size():
 def _dcp(dcp, extra_env, prep_fault=None):
     """One `prologue._dcp_run` with the bucket-64 step, the KV write in the
     gather at 64 tokens, the fused prep enabled for 128-token chunks, and
-    `extra_env`. Returns (results, fused prep calls, gather calls with
-    early_dma)."""
+    `extra_env`. Returns (results, fused prep traces of the 64-token step,
+    out_size of every gather traced with early_dma). The 256-token step of
+    `_dcp_run` takes the fused prep in every run (its chunk is whole 128-token
+    rows), so only 64-row calls are counted."""
     env = dict(
         prologue.PROD_ENV,
         TPU_MLA_DECODE_PROLOGUE="1",
@@ -223,7 +226,8 @@ def _dcp(dcp, extra_env, prep_fault=None):
             for c in gather_spy.call_args_list
             if c.kwargs.get("early_dma")
         ]
-    return res, prep_spy.call_count, early
+        prep64 = sum(c.args[0].shape[0] == 64 for c in prep_spy.call_args_list)
+    return res, prep64, early
 
 
 def _assert_same(ref, got):
