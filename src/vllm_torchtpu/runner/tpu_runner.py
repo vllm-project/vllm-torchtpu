@@ -23,7 +23,7 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Callable, Collection, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -234,7 +234,7 @@ from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 if TYPE_CHECKING:
     from vllm.model_executor.models.interfaces import SupportsPP
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-    from vllm.v1.worker.gpu_input_batch import InputBatch
+    from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 
 @dataclass
@@ -697,7 +697,8 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 
 
 def _strip_prefill_only_padding(
-    scheduler_output: "SchedulerOutput", input_batch: "InputBatch"
+    scheduler_output: "SchedulerOutput",
+    requests: "Mapping[str, CachedRequestState]",
 ) -> "SchedulerOutput":
     """The step without the draft-placeholder rows vLLM padded onto a final
     prompt token (prefill-only MTP).
@@ -707,6 +708,11 @@ def _strip_prefill_only_padding(
     copy when it drops any, as ``trim_scheduled_drafts`` does: under a
     uniprocess executor the scheduler holds the same object, and it rolls the
     placeholders back as rejected drafts only if it still sees them.
+
+    A cached request's prompt length comes from the runner's ``requests``,
+    which keep every unfinished request. The input batch would not do: this
+    runs before ``_update_states``, and vLLM drops a request it did not
+    schedule in a step from the input batch until it is scheduled again.
     """
     spec = scheduler_output.scheduled_spec_decode_tokens
     if not spec:
@@ -720,9 +726,8 @@ def _strip_prefill_only_padding(
         )
     cached = scheduler_output.scheduled_cached_reqs
     for req_id, computed in zip(cached.req_ids, cached.num_computed_tokens):
-        idx = input_batch.req_id_to_index.get(req_id)
-        prompt = int(input_batch.num_prompt_tokens[idx]) if idx is not None else None
-        info[req_id] = (computed, prompt)
+        state = requests.get(req_id)
+        info[req_id] = (computed, None if state is None else state.num_prompt_tokens)
     num_scheduled_tokens = scheduler_output.num_scheduled_tokens
     total = scheduler_output.total_num_scheduled_tokens
     stripped: dict[str, int] = {}
@@ -4404,7 +4409,7 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
         if self._mtp_prefill_only:
             scheduler_output = _strip_prefill_only_padding(
-                scheduler_output, self.input_batch
+                scheduler_output, self.requests
             )
         # Update cached state
         self._update_states(scheduler_output)

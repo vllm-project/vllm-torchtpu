@@ -230,6 +230,12 @@ def _make_runner(
         block_table=[_BlockTable(block_tables)],
     )
     runner.input_batch = input_batch
+    # The runner's per-request states (vLLM keeps one for every unfinished
+    # request); the prefill-only strip reads prompt lengths from them.
+    runner.requests = {
+        req_id: SimpleNamespace(num_prompt_tokens=int(n))
+        for req_id, n in zip(input_batch.req_ids, prompt_tokens)
+    }
 
     spec = FullAttentionSpec(
         block_size=block_size,
