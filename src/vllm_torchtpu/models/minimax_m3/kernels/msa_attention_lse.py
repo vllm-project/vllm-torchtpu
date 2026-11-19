@@ -195,6 +195,40 @@ _PV8_UNIT = 64.0
 _FP8_MAX = 448.0
 PREFILL_PRECISION_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION"
 _PRECISION_LEVERS = ("qk8", "pv8")
+# TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT levers of 8-bit (fp8) pages on the
+# transposed prefill path (`_kernel.attend_t`), default off, not bitwise:
+# "exp16": p = exp2(s - m) in bf16 (p enters p @ v in bf16 anyway; l sums the
+# rounded p in f32). Standalone fp8 calls on served DCP 2 selections, block_q
+# 32 and 32-page groups: -2.6% (8,192 tokens), out rel-rms 3e-3 (j-662afb0e).
+FP8_OPT_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT"
+# "bias": the per-score cmp + select page mask becomes a lane-row add (0 or
+# -inf per token, from the page's hit / limit) on fully visible or unseen
+# pages; only a page some token sees in part (its local page) or an empty
+# slot keeps the select, under a scalar branch. Bitwise (finite pages).
+# "lanemask": the page mask compared once per 128-lane vreg of rows (4 heads
+# x 32 tokens at block_q 32) and reused by every head group (bitwise).
+# "vt": each page's V rows transposed as they unpack, so p @ v runs as
+# v^T [D, keys] @ p [keys, rows] with no transposed operand in the dot.
+# "lmxu": the softmax row sums come out of the p @ v dot (8 rows of ones
+# under v^T) instead of a VALU add per score vreg; l sums the bf16 p the dot
+# multiplies.
+_FP8_LEVERS = ("exp16", "bias", "lanemask", "vt", "lmxu")
+
+
+def fp8_prefill_levers(spec: str | None = None) -> frozenset:
+    """Levers of ``envs.TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT`` (or `spec`); read
+    when the program is traced."""
+    if spec is None:
+        from vllm_torchtpu import envs
+
+        spec = envs.TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT
+    levers = frozenset(x.strip() for x in spec.replace("/", ",").split(",") if x.strip())
+    bad = levers - set(_FP8_LEVERS)
+    if bad:
+        raise ValueError(f"{FP8_OPT_ENV}: unknown levers {sorted(bad)}")
+    if levers:
+        _proof(FP8_OPT_ENV, f"fp8 MSA prefill attention levers {sorted(levers)}")
+    return levers
 
 
 def prefill_precision_levers(spec: str | None = None) -> frozenset:
@@ -482,6 +516,11 @@ def _kernel(
     # `precision` levers (4-bit pages, `prefill_precision_levers`).
     qk8 = fp4 and "qk8" in precision
     pv8 = fp4 and "pv8" in precision
+    exp16_t = not fp4 and "exp16" in precision
+    bias_t = not fp4 and "bias" in precision
+    lanemask_t = not fp4 and "lanemask" in precision
+    lmxu_t = not fp4 and "lmxu" in precision
+    vt_t = not fp4 and ("vt" in precision or lmxu_t)
     out_unit = 1.0 / _PV8_UNIT if pv8 else 1.0
 
     def group_head(w):
@@ -751,13 +790,28 @@ def _kernel(
             sel_t = selected_ref[...].T  # [K, Bq]
             local_page = local_page_ref[...].T  # [1, Bq]
             local_limit = local_limit_ref[...].T
-            keys, values, masks = [], [], []
+            keys, values, masks, limits, fixes = [], [], [], [], []
+            lane_reps = (
+                128 // block_q
+                if 128 % block_q == 0 and num_heads % (128 // block_q) == 0
+                and num_heads > 128 // block_q
+                else 0
+            )
             for g in range(width):
                 page, kv_ref, scale_ref = group_page(g)
                 hit = jnp.max((sel_t == page).astype(jnp.int32), axis=0, keepdims=True)
                 limit = jnp.where(local_page == page, local_limit, page_size)
                 limit = jnp.where(page >= 0, limit * hit, 0)  # [1, Bq]
                 seen = jnp.max(limit)
+                if bias_t:
+                    # A token sees all of the page or none of it, unless the
+                    # page is its local one; an empty slot (page -1) holds
+                    # stale bytes that may not be finite.
+                    part = jnp.max(
+                        ((limit > 0) & (limit < page_size)).astype(jnp.int32)
+                    )
+                    limits.append(limit)
+                    fixes.append((part > 0) | (page < 0))
                 if packing == 4:
                     rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
                     values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
@@ -765,27 +819,69 @@ def _kernel(
                     rows = msa_attention._page_rows(kv_ref, seen)
                     values.append(rows[:, head_dim:])
                 keys.append(rows[:, :head_dim])
-                # Rows are head-major (h * Bq + t): every head shares a token's mask.
-                masks.append(row_slots < jnp.tile(limit, (1, num_heads)))  # [S, rows]
+                if lanemask_t and lane_reps:
+                    # One 128-lane mask: every 128-lane chunk of rows holds the
+                    # same tokens (h * Bq + t, Bq dividing 128).
+                    masks.append(row_slots < jnp.tile(limit, (1, lane_reps)))  # [S, 128]
+                elif not bias_t:
+                    # Rows are head-major (h * Bq + t): every head shares a token's mask.
+                    masks.append(row_slots < jnp.tile(limit, (1, num_heads)))  # [S, rows]
             k = jnp.concatenate(keys, axis=0)
-            v = jnp.concatenate(values, axis=0)
-            mask = jnp.concatenate(masks, axis=0)
+            if vt_t:
+                v = jnp.concatenate([x.T for x in values], axis=1)  # [D, W * S]
+                if lmxu_t:
+                    v = jnp.concatenate([v, jnp.ones((8, v.shape[1]), v.dtype)], axis=0)
+            else:
+                v = jnp.concatenate(values, axis=0)
             q = q_ref[...].reshape(num_heads * block_q, head_dim)
             q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
             s = jax.lax.dot_general(
                 k, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
             )  # [W * S, rows]
-            s = jnp.where(mask, s, -jnp.inf)
+            if bias_t:
+                slabs = []
+                for g in range(width):
+                    limit = jnp.tile(limits[g], (1, num_heads))  # [1, rows]
+                    s_g = s[g * page_size : (g + 1) * page_size] + jnp.where(
+                        limit > 0, 0.0, -jnp.inf
+                    )
+
+                    def _select(x, limit=limit):
+                        return jnp.where(row_slots < limit, x, -jnp.inf)
+
+                    slabs.append(jax.lax.cond(fixes[g], _select, lambda x: x, s_g))
+                s = jnp.concatenate(slabs, axis=0)
+            elif lanemask_t and lane_reps:
+                mask = jnp.concatenate(masks, axis=0)  # [W * S, 128]
+                s = jnp.concatenate(
+                    [
+                        jnp.where(mask, s[:, c : c + 128], -jnp.inf)
+                        for c in range(0, s.shape[1], 128)
+                    ],
+                    axis=1,
+                )
+            else:
+                mask = jnp.concatenate(masks, axis=0)
+                s = jnp.where(mask, s, -jnp.inf)
             m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
             m_new = jnp.maximum(m_prev, jnp.max(s, axis=0, keepdims=True))
-            p = jnp.exp2(s - m_new)
-            l_cur = jnp.sum(p, axis=0, keepdims=True)
+            if exp16_t:
+                p = jnp.exp2((s - m_new).astype(jnp.bfloat16))
+                if not lmxu_t:
+                    l_cur = jnp.sum(p.astype(jnp.float32), axis=0, keepdims=True)
+            else:
+                p = jnp.exp2(s - m_new)
+                if not lmxu_t:
+                    l_cur = jnp.sum(p, axis=0, keepdims=True)
             pv = jax.lax.dot_general(
                 v,
                 p.astype(v.dtype),
-                (((0,), (0,)), ((), ())),
+                (((1 if vt_t else 0,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
-            )  # [D, rows]
+            )  # [D, rows] ([D + 8, rows] with lmxu: row D is l)
+            if lmxu_t:
+                l_cur = pv[head_dim : head_dim + 1]
+                pv = pv[:head_dim]
             if single:
                 finish_t(m_new, l_cur, pv)
                 return
@@ -1358,7 +1454,7 @@ def _attention_call(
             bf16_cache=bf16_cache,
             row_split=row_split,
             tiles_per_head=tiles_per_head,
-            precision=precision if fp4 else frozenset(),
+            precision=precision if fp4 else precision & frozenset(_FP8_LEVERS),
             pair=pair,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
@@ -1821,6 +1917,12 @@ def _chunked_call(
             cache_size=cache_size,
             cache_bf16=page_cache_bf16,
             precision=prefill_precision_levers(prefill_precision),
+        )
+    elif scale_cache is None and prefill_precision:
+        # 8-bit pages: `prefill_precision` names TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT
+        # levers (`msa_dcp.msa_attend_dcp`).
+        call = functools.partial(
+            call, precision=fp8_prefill_levers(prefill_precision)
         )
     limit = msa_attention.MAX_TOKENS_PER_CALL
     step = min(num_tokens, max(block_q, limit - limit % block_q))
