@@ -58,13 +58,12 @@ class TpuSDPAImpl(SDPAImpl):
         #   (B, 1, 1, K) or (B, H, 1, K) key-padding mask, bool or additive.
         #   The output is wrong even for a mask that keeps every key, and NaN
         #   for some shapes. A mask with a full query dim is read correctly.
-        # Fix: calls whose mask has no query dim or size 1 along it (a 1D
-        #   [K] mask, a 2D [B, K] mask, which becomes [B, 1, 1, K], or a
-        #   mask with shape[-2] == 1) run under
-        #   sdpa_kernel(SDPBackend.MATH), which on
-        #   torch_tpu selects the StableHLO SDPA lowering, not ATen math. It
-        #   builds the full (B, H, Q, K) score tensor, so it is slower than
-        #   the flash kernel on long sequences.
+        # Fix: (B, 1, 1, K) key-padding masks — along with 1D [K], 2D [B, K]
+        #   (reshaped to [B, 1, 1, K]), and any 3D/4D mask with shape[-2] == 1
+        #   — now take the SDPBackend.MATH path, which on torch_tpu selects
+        #   the StableHLO SDPA lowering (not ATen math). This path materializes
+        #   the full [B, H, Sq, Sk] scores, so an OOM or slowdown on long
+        #   LTX-2/Wan sequences can be traced to this pin.
         # Effect: masked calls match a float64 reference. Before, LTX-2 under
         #   Ulysses, which pads the audio latents to a multiple of the SP size
         #   and sends a key-padding mask to audio self-attention and
@@ -74,8 +73,10 @@ class TpuSDPAImpl(SDPAImpl):
         #   was finite but wrong.
         # ---------------------------------------------------------------------
         mask = attn_metadata.attn_mask if attn_metadata is not None else None
-        masked = mask is not None and (mask.ndim < 3 or mask.shape[-2] == 1)
-        with sdpa_kernel(SDPBackend.MATH) if masked else nullcontext():
+        query_broadcast_mask = mask is not None and (
+            mask.ndim < 3 or mask.shape[-2] == 1
+        )
+        with sdpa_kernel(SDPBackend.MATH) if query_broadcast_mask else nullcontext():
             return self._forward_impl(
                 query, key, value, attn_metadata, mask_mode="broadcast_k"
             )

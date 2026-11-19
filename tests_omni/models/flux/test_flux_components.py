@@ -26,6 +26,7 @@ Tested FLUX Components:
 """
 
 import math
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -440,13 +441,20 @@ class TestFluxTpuSDPAAttention:
             SimpleNamespace(attn_mask=mask_cpu.to("tpu")),
             mask_mode="broadcast_k",
         ).cpu()
-        with pytest.raises(AssertionError, match=NUMERIC_MISMATCH_PATTERN):
+        try:
             assert_parity(
                 unpinned_out,
                 ref_out,
                 name=f"unpinned TpuSDPAImpl {mask_kind} b{batch_size} q{q_len}",
                 max_rel_l2=MASKED_SDPA_BF16_MAX_REL_L2,
                 max_abs=MASKED_SDPA_BF16_MAX_ABS,
+            )
+        except AssertionError as exc:
+            assert re.search(NUMERIC_MISMATCH_PATTERN, str(exc)), str(exc)
+        else:
+            pytest.fail(
+                "torch_tpu#5677 appears fixed: remove the SDPBackend.MATH pin "
+                "in TpuSDPAImpl.forward and delete this canary"
             )
 
     @DTYPES

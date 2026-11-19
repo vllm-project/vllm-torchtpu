@@ -413,6 +413,9 @@ def test_tpu_sdpa_attention_backend():
     [
         ("1d", True),
         ("2d", True),
+        ("3d_11k", True),
+        ("3d_h1k", True),
+        ("3d_hqk", False),
         ("b11k", True),
         ("b11k_additive", True),
         ("b1qk", False),
@@ -422,10 +425,11 @@ def test_tpu_sdpa_attention_backend():
 def test_tpu_sdpa_masked_calls_use_math_backend(monkeypatch, mask_kind, expect_math):
     # torch_tpu 0.2.0's default SDPA lowering misreads a mask of size 1 along
     # the query dim (google-pytorch/torch_tpu#5677), so calls with such a
-    # mask (including a 1D [K] mask and a 2D [B, K] mask, which becomes
-    # [B, 1, 1, K]) must run under sdpa_kernel(MATH), while unmasked calls
-    # and full-query-dim masks must not. b11k_additive is a float mask in the
-    # query dtype, for which vLLM-Omni's SDPAImpl does not select MATH itself.
+    # mask (including a 1D [K] mask, a 2D [B, K] mask, which becomes
+    # [B, 1, 1, K], and 3D [1, 1, K] / [H, 1, K] masks) must run under
+    # sdpa_kernel(MATH), while unmasked calls and full-query-dim masks (3D or
+    # 4D) must not. b11k_additive is a float mask in the query dtype, for which
+    # vLLM-Omni's SDPAImpl does not select MATH itself.
     from vllm_torchtpu.omni import attention as omni_attention
 
     backends = []
@@ -446,6 +450,12 @@ def test_tpu_sdpa_masked_calls_use_math_backend(monkeypatch, mask_kind, expect_m
         mask = keep
     elif mask_kind == "2d":
         mask = keep_2d
+    elif mask_kind == "3d_11k":
+        mask = keep[None, None, :]
+    elif mask_kind == "3d_h1k":
+        mask = keep[None, None, :].expand(query.shape[2], 1, -1)
+    elif mask_kind == "3d_hqk":
+        mask = keep[None, None, :].expand(query.shape[2], query.shape[1], -1)
     elif mask_kind.startswith("b11k"):
         mask = keep_2d[:, None, None, :]
     else:
