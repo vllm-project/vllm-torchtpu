@@ -2337,7 +2337,9 @@ class TestProbeWarmChunks(unittest.TestCase):
             manager = make_global_manager(store)
             keys = [b"t%03d_" % trial + _key(i) for i in range(8)]
             for key in keys:
-                tier = rng.choice(["host", "host", "storage", "both", "none", "inflight"])
+                tier = rng.choice(
+                    ["host", "host", "storage", "both", "none", "inflight"]
+                )
                 if tier in ("host", "both"):
                     seed_host_entries(store, key)
                 if tier in ("storage", "both", "host"):

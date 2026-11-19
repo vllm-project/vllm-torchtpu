@@ -75,7 +75,8 @@ def test_vision_attention_falls_back_for_cross_attention(monkeypatch):
         called["args"] = (query, key, value, cu_seqlens, max_seqlen, sequence_lengths)
         return torch.full_like(query, 7.0)
 
-    monkeypatch.setattr(attn, "forward_native", fake_native)
+    # A bare instance (no Module.__init__): monkeypatch's undo would delattr.
+    attn.forward_native = fake_native
 
     out = attn.forward_oot(query, key, value)
 

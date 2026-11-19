@@ -11,14 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pallas `lse_rescale_head_major` vs the XLA expression it replaces."""
+"""Pallas `lse_rescale_head_major` and `lse_rescale_quantize` vs the XLA
+expressions they replace."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.lse_rescale import lse_rescale_head_major
+from vllm_torchtpu.kernels.lse_rescale import (
+    lse_rescale_head_major,
+    lse_rescale_quantize,
+)
+from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
 
 
 def _reference(output, lse, merged_lse, out_dtype):
@@ -53,3 +58,38 @@ def test_matches_reference(tokens, heads, dim, out_dtype):
     # Mosaic's exp and XLA's differ by an ulp; bf16 can round either way.
     rtol = 1e-2 if out_dtype == "bfloat16" else 1e-5
     np.testing.assert_allclose(got, want, rtol=rtol, atol=1e-6)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("heads,dim", [(64, 256), (8, 128)])
+@pytest.mark.parametrize("tokens", [1, 200, 2304, 4096])
+def test_quantized_matches_reference(tokens, heads, dim):
+    output, lse, merged = _partial(tokens, heads, dim)
+    head_major = jnp.swapaxes(output, 0, 1)
+    chunk = 1024
+    q, scale = [], []
+    for start in range(0, tokens, chunk):
+        stop = min(start + chunk, tokens)
+        q_c, s_c = lse_rescale_quantize(
+            head_major, lse[start:stop], merged[start:stop], start, "float8_e4m3fn"
+        )
+        assert q_c.shape == (stop - start, heads * dim)
+        assert s_c.shape == (stop - start, 1)
+        q.append(q_c)
+        scale.append(s_c)
+    q, scale = jnp.concatenate(q), jnp.concatenate(scale)
+    # The weighted partial, quantized per token as XLA's quantized matmul does.
+    weighted = jnp.swapaxes(_reference(output, lse, merged, "float32"), 0, 1)
+    want_q, want_scale = quantize_tensor(
+        weighted.reshape(tokens, -1), jnp.float8_e4m3fn
+    )
+    np.testing.assert_allclose(scale, want_scale, rtol=1e-6)
+    got = np.asarray(q.astype(jnp.float32) * scale)
+    want = np.asarray(want_q.astype(jnp.float32) * want_scale)
+    assert not np.isnan(got).any()
+    np.testing.assert_array_equal(got[::3], 0.0)  # rank 0 owns none of these
+    # Mosaic's exp and XLA's differ by an ulp, which can tip a value to the
+    # next FP8 step: an eighth of it, or the subnormal step, scale / 512.
+    np.testing.assert_array_less(
+        np.abs(got - want), np.abs(want) / 8 + np.asarray(scale) / 256
+    )

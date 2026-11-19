@@ -251,11 +251,13 @@ def test_rotated_sweep_holds_no_collective(monkeypatch, synthetic, optional_path
         TPUModelRunner._precompile_top_token_verify, runner
     )
     # The static-kwarg variants are one recompile each; the runner raises
-    # Dynamo's limits the same way (TPUModelRunner.__init__).
-    monkeypatch.setattr(torch._dynamo.config, "cache_size_limit", 1024)
-    monkeypatch.setattr(torch._dynamo.config, "accumulated_recompile_limit", 1024)
-    torch._dynamo.reset()
-    TPUModelRunner._precompile_rejection_sampler(runner)  # type: ignore[arg-type]
+    # Dynamo's limits the same way (TPUModelRunner.__init__). Dynamo's own
+    # patch restores them; monkeypatch's undo hides the key for later tests.
+    with torch._dynamo.config.patch(
+        cache_size_limit=1024, accumulated_recompile_limit=1024
+    ):
+        torch._dynamo.reset()
+        TPUModelRunner._precompile_rejection_sampler(runner)  # type: ignore[arg-type]
 
     assert len(graphs) >= 4
     # The optional paths ran only when enabled.
