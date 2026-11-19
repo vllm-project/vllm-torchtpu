@@ -377,6 +377,8 @@ def test_kv_pressure_preempts_the_last_running_request(
     )
     if decode_leg:
         # A KV consumer of prefill/decode disaggregation, without a connector.
+        # Set after construction, so the cross-step memo stays off; decoders
+        # first and the preemption victim do not depend on it.
         scheduler._is_kv_consumer = True
     reqs = {
         "long": _make_real_request("long", 64, hasher, seed=1),
