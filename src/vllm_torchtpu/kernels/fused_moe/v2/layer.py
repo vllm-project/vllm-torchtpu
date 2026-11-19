@@ -25,6 +25,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
+    FP4,
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
     QB4,
@@ -38,7 +39,9 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     align_up,
     build_routing_tables,
     build_routing_tables_sharded,
+    can_use_fp4_combine,
     expert_visit_list,
+    hadamard_128_bf16,
     local_slab_rows,
     pair_block_hist,
     pow2_shift,
@@ -141,17 +144,32 @@ def _combine_arrivals(
             wire_dtype=arrivals.dtype,
             out_dtype=out_dtype,
         )
-        return combine(arrivals, coef, rows)
-    rows_fp8 = arrivals[pos.T.reshape(-1)]  # f8 [K*t, lane blocks, 128]
-    coef_k = coef.T.reshape(-1)  # k-major [K*t_local]
-    terms = []
-    for k in range(topk):
-        slot_rows = lax.slice(
-            rows_fp8, (k * t_local, 0, 0), ((k + 1) * t_local, lane_blocks, lanes)
+        combined = combine(arrivals, coef, rows)
+    else:
+        rows_arr = arrivals[pos.T.reshape(-1)]  # [K*t, lane blocks, 128]
+        coef_k = coef.T.reshape(-1)  # k-major [K*t_local]
+        terms = []
+        for k in range(topk):
+            slot_rows = lax.slice(
+                rows_arr, (k * t_local, 0, 0), ((k + 1) * t_local, lane_blocks, lanes)
+            )
+            slot_coef = lax.slice(coef_k, (k * t_local,), ((k + 1) * t_local,))
+            terms.append(slot_rows.astype(jnp.float32) * slot_coef[:, None, None])
+        combined = (
+            cast(jax.Array, sum(terms)).astype(out_dtype).reshape(t_local, hidden)
         )
-        slot_coef = lax.slice(coef_k, (k * t_local,), ((k + 1) * t_local,))
-        terms.append(slot_rows.astype(jnp.float32) * slot_coef[:, None, None])
-    return cast(jax.Array, sum(terms)).astype(out_dtype).reshape(t_local, hidden)
+    if arrivals.dtype == FP4:
+        h128_inv = hadamard_128_bf16(inverse=True)
+        combined = (
+            jnp.matmul(
+                combined.reshape(-1, lanes).astype(jnp.bfloat16),
+                h128_inv,
+                preferred_element_type=jnp.float32,
+            )
+            .astype(out_dtype)
+            .reshape(t_local, hidden)
+        )
+    return combined
 
 
 def _exchange_layout(t_local, topk, e_total, quantized):
@@ -280,6 +298,7 @@ def fused_ep_moe_v2(
     stage="fused",
     routed=None,
     gather_positions=None,
+    combine_fp4: bool = False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -478,6 +497,7 @@ def fused_ep_moe_v2(
                 "hash_topk_ids are expert ids and must be an integer dtype; "
                 f"got {jnp.dtype(hash_topk_ids.dtype).name}"
             )
+    eff_combine_fp4 = bool(combine_fp4 and can_use_fp4_combine(hidden, weight_format))
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -490,6 +510,7 @@ def fused_ep_moe_v2(
         act_fn=act_fn,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        combine_fp4=eff_combine_fp4,
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -946,6 +967,7 @@ def fused_ep_moe_v2(
         float(routed_scaling_factor),
         stage,
         gather_positions,
+        eff_combine_fp4,
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),
