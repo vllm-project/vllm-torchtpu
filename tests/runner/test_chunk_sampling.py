@@ -642,3 +642,33 @@ def test_packed_topk_candidates_never_meet_a_processor() -> None:
         )
     # Neither path ran a hook on the packed values.
     assert events == []
+
+
+def test_in_graph_draws_seed_the_device_generator_or_refuse(monkeypatch) -> None:
+    """The candidate samplers draw in-graph from the TPU default generator;
+    every rank seeds it alike, and a missing generator is an error, not a
+    silent skip."""
+    seeded = []
+
+    class _Generator:
+        def manual_seed(self, seed):
+            seeded.append(seed)
+
+    runner = SimpleNamespace(
+        _sampling_generator=None,
+        model_config=SimpleNamespace(seed=7),
+        device=torch.device("cpu"),
+        _sampler_draws_in_graph=lambda: True,
+    )
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(default_generators=[_Generator()]), raising=False
+    )
+    TPUModelRunner._get_sampling_generator(runner)
+    assert seeded == [7]
+
+    runner._sampling_generator = None
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(default_generators=[]), raising=False
+    )
+    with pytest.raises(RuntimeError, match="TPU device 0"):
+        TPUModelRunner._get_sampling_generator(runner)
