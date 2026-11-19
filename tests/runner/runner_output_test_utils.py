@@ -39,6 +39,7 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
     and returns before the copy is waited on."""
     req_ids = [f"r{i}" for i in range(sum(num_reqs_list))]
     runner = SimpleNamespace(
+        decode_owner=None,
         execute_model_state=SimpleNamespace(
             scheduler_output=SimpleNamespace(
                 num_scheduled_tokens={r: 1 for r in req_ids},
@@ -54,6 +55,7 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
             pooler_output_list=[],
             top_tokens=False,
             kv_save_nan_check=None,
+            owned_front=0,
             prompt_logprobs_chunks=[],
         ),
         input_batch=SimpleNamespace(

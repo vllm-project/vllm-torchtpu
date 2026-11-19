@@ -329,6 +329,7 @@ def _make_sample_runner(
     runner = SimpleNamespace(
         device=torch.device("cpu"),
         model_config=SimpleNamespace(max_logprobs=2, seed=7),
+        decode_owner=None,
         execute_model_state=None,
         input_batch=SimpleNamespace(
             max_num_logprobs=None,
