@@ -184,6 +184,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_DRAFT_LOOP: bool = False
     VLLM_TPU_MK_QSEL_ASYNC: bool = False
     VLLM_TPU_MK_QSA_XREQ_PREFETCH: int = 0
+    VLLM_TPU_MK_QSA_SELECT_NVIS: int = 0
     VLLM_TPU_MK_WHOLE_L47: bool = False
     VLLM_TPU_MK_WHOLE_L45: bool = False
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
@@ -1298,6 +1299,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # loop's per-request loads (raw ring row, RoPE row, recent tile's pool rows) are issued one
     # request ahead (`wholeloop=1`). 2 is the useful setting; 3 = both.
     "VLLM_TPU_MK_QSA_XREQ_PREFETCH": env_int("VLLM_TPU_MK_QSA_XREQ_PREFETCH", 0),
+    # Whole-step QSA selection: the threshold bisection and the per-row compaction scan
+    # only the score rows that hold visible groups (n_vis) instead of all max_groups / 128
+    # (exact: the rows past n_vis are invisible and add nothing). 2: also the union
+    # compaction of union attention (slot windows past the union skipped).
+    "VLLM_TPU_MK_QSA_SELECT_NVIS": env_int("VLLM_TPU_MK_QSA_SELECT_NVIS", 0),
     # Whole-step megakernel: also run the last QSA layer (model layer 47) in the whole-step
     # call, as a one-layer kernel after layers 3..46, its step tokens written with theirs;
     # the stock L47 attention core and last segment kernel are skipped.
