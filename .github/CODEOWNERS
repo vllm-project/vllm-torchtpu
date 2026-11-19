@@ -183,6 +183,7 @@
 
 # Models: Qwen4 Experimental
 /src/vllm_torchtpu/models/qwen4_exp/ @kyuyeunk @BirdsOfAFthr
+/tests/models/qwen4_exp/ @kyuyeunk @BirdsOfAFthr
 
 # Models: Qwen4 Experimental (experimental tier)
 /src/vllm_torchtpu/models/qwen4_exp/experimental/ @caojx-google @DRZDONG @benliangw @mshrihari3
