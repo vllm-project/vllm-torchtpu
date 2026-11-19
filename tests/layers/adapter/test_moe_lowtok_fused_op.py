@@ -241,6 +241,66 @@ def test_retain_reads_the_rank_buffer_in_the_warmup(monkeypatch):
     torch.testing.assert_close(op.retain(out), out, rtol=0, atol=0)
 
 
+def _served_layer():
+    """A MoE layer with distinct weight, scale and experts_start tensors."""
+    return SimpleNamespace(
+        moe_config=SimpleNamespace(experts_per_token=TOPK),
+        w13_weight=torch.zeros(2, 8, 4),
+        w2_weight=torch.zeros(2, 2, 8),
+        w13_weight_scale_inv=torch.ones(2, 1, 1, 4),
+        w2_weight_scale_inv=torch.ones(2, 1, 1, 8),
+        _experts_start=torch.tensor(64, dtype=torch.int32),
+    )
+
+
+@pytest.fixture
+def recorded_op(monkeypatch):
+    """The op apply() builds, replaced by one that returns its operands, and a
+    rank buffer."""
+    build = Mock(name="_build_op", return_value=lambda *operands: operands)
+    monkeypatch.setattr(op, "_build_op", build)
+    rank = torch.tensor([2, 1], dtype=torch.int32)
+    monkeypatch.setattr(op, "_RANK", rank)
+    return build, rank
+
+
+@pytest.mark.parametrize("skip_padded", [True, False], ids=["skip_padded", "keep"])
+def test_apply_masks_padded_rows_and_passes_the_programs_operand_order(
+    monkeypatch, recorded_op, skip_padded
+):
+    """apply() calls the op for the layer's top-k with program()'s operands:
+    this engine's rows; the router logits, with each padded row at -inf under
+    TPU_MOE_SKIP_PADDED_TOKENS (this engine's own mask, no DP gather);
+    w13, w2, their scales; experts_start as [1]; the rank buffer."""
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", skip_padded)
+    build, rank = recorded_op
+    layer = _served_layer()
+    x = torch.randn(4, 8)
+    logits = torch.randn(4, 16)
+    with token_padding.use_padding_state(
+        token_padding.TokenPaddingState.create(8, "cpu")
+    ):
+        # Rows 0..2 are this step's tokens, row 3 is padding.
+        token_padding.mark_padding(3, 4)
+        operands = op.apply(layer, x, logits)
+    build.assert_called_once_with(TOPK)
+    got_x, got_logits, w13, w2, s13, s2, start, got_rank = operands
+    assert got_x is x
+    assert w13 is layer.w13_weight
+    assert w2 is layer.w2_weight
+    assert s13 is layer.w13_weight_scale_inv
+    assert s2 is layer.w2_weight_scale_inv
+    assert start.tolist() == [64]
+    assert got_rank is rank
+    torch.testing.assert_close(got_logits[:3], logits[:3], rtol=0, atol=0)
+    if skip_padded:
+        assert torch.isneginf(got_logits[3]).all()
+    else:
+        torch.testing.assert_close(got_logits[3], logits[3], rtol=0, atol=0)
+
+
 # The FP8 MoE method's fused EP v3 entry, on a step the fused v3 kernel does
 # not take (use_fused_kernel=False).
 

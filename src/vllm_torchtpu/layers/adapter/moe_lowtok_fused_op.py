@@ -25,6 +25,8 @@ all-gather, the grouped-matmul MoE and XLA's reduce-scatter and all-reduce.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import jax
 import numpy as np
 import torch
@@ -51,6 +53,12 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _OPS: dict[int, torch.library.CustomOpDef] = {}
+# The program's operand and result specs: rows by DP engine; the experts'
+# weights, scales and experts_start, and the core's index, by core.
+_OUT_SPEC = PartitionSpec(fused_collectives.DP_AXIS)
+_IN_SPECS = (_OUT_SPEC, _OUT_SPEC) + (
+    PartitionSpec((fused_collectives.DP_AXIS, fused_collectives.TP_AXIS)),
+) * 6
 # This core's (dp, tp) index on the mesh view, as an int32 [2] device tensor.
 _RANK = None
 _DP = 0
@@ -136,20 +144,19 @@ def prebuild() -> None:
     )
 
 
-def _build_op(topk: int) -> torch.library.CustomOpDef:
-    op = _OPS.get(topk)
-    if op is not None:
-        return op
-    mesh = build_ep_mesh()
-    assert mesh is not None  # prebuild armed the op on this mesh
-    dp, tp = _DP, _TP
+def program(mesh: Mesh, topk: int, cap: int) -> Callable[..., jax.Array]:
+    """The op's JAX program over ``mesh``, whose axes are (DP_AXIS, TP_AXIS)
+    of fused_collectives.
+
+    Operands in :func:`apply`'s order: each engine's rows and router logits,
+    then w13, w2, their scales, experts_start and the core's (dp, tp) index,
+    by core. A step of at most ``cap`` rows over the DP engines runs the
+    fused kernel; a larger one takes the served path inside the op: XLA's DP
+    all-gather, ``moe_lowtok_scores.moe_scores_fn``, XLA's DP reduce-scatter
+    and TP all-reduce. Returns each engine's rows summed over every rank.
+    """
     dp_axis, tp_axis = fused_collectives.DP_AXIS, fused_collectives.TP_AXIS
-    mesh2 = Mesh(
-        np.asarray(mesh.devices).reshape(dp, tp), axis_names=(dp_axis, tp_axis)
-    )
-    rows = PartitionSpec(dp_axis)
-    experts = PartitionSpec((dp_axis, tp_axis))
-    cap = moe_lowtok_scores.armed_max_tokens()
+    dp, tp = mesh.shape[dp_axis], mesh.shape[tp_axis]
 
     def body(x, scores, w13, w2, s13, s2, experts_start, rank):
         start = experts_start[0]
@@ -191,30 +198,35 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
     ) -> jax.Array:
         return jax.shard_map(
             body,
-            mesh=mesh2,
-            in_specs=(rows, rows, experts, experts, experts, experts, experts, experts),
-            out_specs=rows,
+            mesh=mesh,
+            in_specs=_IN_SPECS,
+            out_specs=_OUT_SPEC,
             check_vma=False,
         )(x, scores, w13, w2, s13, s2, experts_start, rank)
+
+    return fn
+
+
+def _build_op(topk: int) -> torch.library.CustomOpDef:
+    op = _OPS.get(topk)
+    if op is not None:
+        return op
+    mesh = build_ep_mesh()
+    assert mesh is not None  # prebuild armed the op on this mesh
+    mesh2 = Mesh(
+        np.asarray(mesh.devices).reshape(_DP, _TP),
+        axis_names=(fused_collectives.DP_AXIS, fused_collectives.TP_AXIS),
+    )
 
     def fake(x, *_args):
         return torch.empty_like(x)
 
     op = sharded_jax_op(
         f"pallas::moe_lowtok_fused_k{topk}",
-        fn,
+        program(mesh2, topk, moe_lowtok_scores.armed_max_tokens()),
         mesh=mesh2,
-        input_partition_specs=(
-            rows,
-            rows,
-            experts,
-            experts,
-            experts,
-            experts,
-            experts,
-            experts,
-        ),
-        output_partition_specs=rows,
+        input_partition_specs=_IN_SPECS,
+        output_partition_specs=_OUT_SPEC,
         fake=fake,
     )
     _OPS[topk] = op
