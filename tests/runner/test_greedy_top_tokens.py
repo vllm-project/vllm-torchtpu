@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from sampling_test_utils import _sampling_step, _verify_md
 from vllm import SamplingParams
 from vllm import logger as vllm_logger
 from vllm.config import LoRAConfig
@@ -36,7 +37,7 @@ from vllm.sampling_params import StructuredOutputsParams
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.lora.torch_punica_tpu import PunicaWrapperTPU
-from vllm_torchtpu.runner import greedy_top_tokens, min_tokens
+from vllm_torchtpu.runner import chunk_sampling, greedy_top_tokens, min_tokens
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -328,26 +329,16 @@ def _verify_chunk(monkeypatch, synthetic):
     assert torch.topk(logits[4], 2).indices.sort().values.tolist() == [20, 50]
     argmax = torch.argmax(logits, dim=-1)
 
-    target_rows, bonus_rows, drafts, segments, groups = [], [], [], [], []
+    drafts = []
     row = 0
     for req, length in enumerate(draft_lengths):
+        drafts.append([])
         for pos in range(length):
-            target_rows.append(row + pos)
-            segments.append(req)
-            groups.append(pos)
             token = int(argmax[row + pos])
             rejected = (req == 1 and pos == 1) or (req == 2 and pos == 0)
-            drafts.append((token + 1) % 96 if rejected else token)
-        bonus_rows.append(row + length)
+            drafts[req].append((token + 1) % 96 if rejected else token)
         row += length + 1
-    md = SimpleNamespace(
-        draft_token_ids=torch.tensor(drafts, dtype=torch.int32),
-        draft_lengths=torch.tensor(draft_lengths, dtype=torch.int32),
-        target_logits_indices=torch.tensor(target_rows, dtype=torch.int32),
-        bonus_logits_indices=torch.tensor(bonus_rows, dtype=torch.int32),
-        segment_ids=torch.tensor(segments, dtype=torch.int64),
-        group_indices=torch.tensor(groups, dtype=torch.int32),
-    )
+    md = _verify_md(drafts, pad_tokens=sum(draft_lengths), pad_reqs=len(draft_lengths))
     spec_config = SimpleNamespace(
         num_speculative_tokens=K,
         rejection_sample_method="synthetic" if synthetic else "strict",
@@ -360,19 +351,11 @@ def _verify_chunk(monkeypatch, synthetic):
 
 
 def _sample(runner, values, md, top_tokens, seed=0):
+    step = _sampling_step(
+        top_tokens=top_tokens, sampling_generator=torch.Generator().manual_seed(seed)
+    )
     with torch.compiler.set_stance("force_eager"):
-        return TPUModelRunner._sample_spec_verify_chunk(
-            runner,
-            values,
-            md,
-            None,
-            None,
-            0,
-            3,
-            True,
-            torch.Generator().manual_seed(seed),
-            top_tokens,
-        )
+        return chunk_sampling.sample_spec_verify_chunk(runner, step, values, md, 0, 3)
 
 
 def test_verify_on_top_tokens_matches_full_logits(monkeypatch):

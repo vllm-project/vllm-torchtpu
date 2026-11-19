@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 import torch
 from runner_input_test_utils import _make_sample_runner
+from sampling_test_utils import _sampling_step, _verify_md
 from vllm import SamplingParams
 from vllm.config.reasoning import ReasoningConfig
 from vllm.sampling_params import StructuredOutputsParams
@@ -69,6 +70,7 @@ from vllm_torchtpu.layers.adapter.sample.thinking_budget import (
     query_forced_tokens,
 )
 from vllm_torchtpu.runner import (
+    chunk_sampling,
     greedy_top_tokens,
     min_tokens,
     request_slot_table,
@@ -256,36 +258,6 @@ def _make_lifecycle_runner(
     runner.uses_xdrope_dim = 0
     runner._may_reorder_batch = lambda _output: None
     return runner
-
-
-def _verify_md(
-    drafts_per_req: list[list[int]], pad_tokens: int = 4, pad_reqs: int = 4
-) -> SimpleNamespace:
-    flat_drafts, tgt_idx, bonus_idx, seg, grp = [], [], [], [], []
-    row_cursor = 0
-    for req_i, drafts in enumerate(drafts_per_req):
-        flat_drafts.extend(drafts)
-        tgt_idx.extend(range(row_cursor, row_cursor + len(drafts)))
-        bonus_idx.append(row_cursor + len(drafts))
-        seg.extend([req_i] * len(drafts))
-        grp.extend(range(len(drafts)))
-        row_cursor += len(drafts) + 1
-    pad = pad_tokens - len(flat_drafts)
-    lengths = [len(d) for d in drafts_per_req]
-    return SimpleNamespace(
-        draft_token_ids=torch.tensor(flat_drafts + [0] * pad, dtype=torch.int32),
-        draft_lengths=torch.tensor(
-            lengths + [0] * (pad_reqs - len(lengths)), dtype=torch.int32
-        ),
-        draft_lengths_cpu=np.array(lengths),
-        target_logits_indices=torch.tensor(tgt_idx + [0] * pad, dtype=torch.int32),
-        bonus_logits_indices=torch.tensor(
-            bonus_idx + [0] * (pad_reqs - len(bonus_idx)), dtype=torch.int32
-        ),
-        final_logits_indices=torch.arange(pad_tokens, dtype=torch.int32),
-        segment_ids=torch.tensor(seg + [len(drafts_per_req)] * pad, dtype=torch.int64),
-        group_indices=torch.tensor(grp + [0] * pad, dtype=torch.int32),
-    )
 
 
 def _run_sample_tokens(runner: SimpleNamespace, grammar_output: object = None):
@@ -1460,7 +1432,7 @@ class TestSampleTokens:
         assert emitted_s == [50, 50, GEMMA4_END[0], GEMMA4_END[1]]
 
     def test_sample_plain_chunk_budget_processor_and_logprob_logits(self) -> None:
-        """``_sample_plain_chunk`` runs the budget's plain-chunk processor from
+        """``sample_plain_chunk`` runs the budget's plain-chunk processor from
         ``processors``: a budget of 0 forces ``end_ids[0]`` after
         ``logprob_logits`` is taken, and advances the request's budget state."""
         cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
@@ -1475,17 +1447,12 @@ class TestSampleTokens:
         assert tb_step is not None
         tb_chunk = tb_step.plain_chunk(0, 1)
         assert tb_chunk is not None
-        selected, logprob_logits = runner._sample_plain_chunk(
+        selected, logprob_logits = chunk_sampling.sample_plain_chunk(
+            runner,
+            _sampling_step(),
             raw.clone(),
             cur_start_idx=0,
             cur_end_idx=1,
-            top_tokens=False,
-            all_greedy=True,
-            sampling_generator=None,
-            grammar_output=None,
-            scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={}),
-            is_spec_step=False,
-            min_toks={},
             processors=(tb_chunk,),
         )
         # The forced token beats the argmax 13; the logprobs see neither the

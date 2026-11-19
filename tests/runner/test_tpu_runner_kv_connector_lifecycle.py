@@ -24,6 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
 )
 
+from vllm_torchtpu.runner import chunk_sampling
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
@@ -122,7 +123,6 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         _greedy_sample=lambda _logits: torch.tensor([7]),
         _min_tokens_batch_state=lambda: {},
         _repetition_penalty=SimpleNamespace(begin_step=lambda _batch: False),
-        _sample_spec_verify_chunk=lambda *_args: torch.tensor([[7, -1]]),
         _update_mamba_slot_read_offsets=lambda *_args: None,
         _update_num_xla_graphs=lambda *_args: None,
         _modify_prev_results=lambda: None,
@@ -135,8 +135,6 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     runner._stage_timing.take_samples.return_value = ([], [])
     runner._async_drafter = runner.drafter
     for name in (
-        "_sample_chunk_logits",
-        "_sample_plain_chunk",
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
         "_build_kv_connector_output",
@@ -183,6 +181,11 @@ def test_device_drafter_runs_before_kv_connector_save(
         ),
         patch.object(
             AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy_state
+        ),
+        patch.object(
+            chunk_sampling,
+            "sample_spec_verify_chunk",
+            side_effect=lambda *_args: torch.tensor([[7, -1]]),
         ),
     ):
         output = TPUModelRunner.sample_tokens(runner, None)
