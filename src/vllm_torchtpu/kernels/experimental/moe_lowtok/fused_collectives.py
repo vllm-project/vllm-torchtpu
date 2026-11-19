@@ -53,7 +53,9 @@ from vllm_torchtpu.kernels.experimental.moe_lowtok.kernel import (
     weight_layout,
 )
 from vllm_torchtpu.kernels.experimental.small_collectives.common import (
+    MESH,
     MOE_LOWTOK_FUSED_COLLECTIVE_ID,
+    wait_bytes_of,
 )
 
 # Row blocks are pushed by DMA and sliced by rows; bf16 tiles are 16 sublanes.
@@ -72,7 +74,6 @@ _PIECES = 3
 COLLECTIVE_ID = MOE_LOWTOK_FUSED_COLLECTIVE_ID
 # Experts in the weight ring.
 _RING_DEPTH = 1
-MESH = pl.DeviceIdType.MESH
 DP_AXIS = "dp"
 TP_AXIS = "tp"
 # Cores in a TP pair: the dispatch and combine split each row block into two
@@ -102,11 +103,6 @@ def _push(src, dst, send_sem, recv_sem, dp_idx, tp_idx):
         device_id=(dp_idx, tp_idx),
         device_id_type=MESH,
     ).start()
-
-
-def _wait_bytes(ref_slice, sem):
-    """Block until `sem` has counted the bytes of `ref_slice`."""
-    pltpu.make_async_copy(ref_slice, ref_slice, sem).wait()
 
 
 def _barrier(dp, tp):
@@ -309,9 +305,10 @@ def _gather_rows_of(rows):
     return max(LANE, pl.cdiv(rows, LANE) * LANE)
 
 
-def _gather_scratch(sc, rows, hidden, inter, fp8_rows):
-    """The gather formulation's scratch, appended to `sc` in
-    `_gather_prologue`'s order."""
+def _gather_scratch(sc, rows, hidden, inter):
+    """Append the gather formulation's scratch to `sc` in `_gather_prologue`'s
+    order; returns the number of entries appended."""
+    first = len(sc.shapes)
     g_rows = _gather_rows_of(rows)
     max_pass = pl.cdiv(rows, GATHER_ROWS)
     sc.vmem((g_rows, hidden), jnp.bfloat16)  # the routed rows as the gather operand
@@ -329,7 +326,7 @@ def _gather_scratch(sc, rows, hidden, inter, fp8_rows):
     sc.vmem(
         (LANE, hidden), jnp.bfloat16
     )  # the contribution pieces, K rows of the scatter
-    return 14
+    return len(sc.shapes) - first
 
 
 def _gather_prologue(gid_s, wtab_ref, x_all, xs_all, g, rows):
@@ -512,6 +509,7 @@ def _kernel(
     dp,
     tp,
     dispatch_fp8,
+    gather_entries,
 ):
     d, t = rank_s[0], rank_s[1]
     _kernel_body(
@@ -526,6 +524,7 @@ def _kernel(
         dp=dp,
         tp=tp,
         dispatch_fp8=dispatch_fp8,
+        gather_entries=gather_entries,
     )
 
 
@@ -548,6 +547,7 @@ def _kernel_body(
     dp,
     tp,
     dispatch_fp8,
+    gather_entries,
 ):
     scratch = list(scratch)
 
@@ -568,7 +568,7 @@ def _kernel_body(
     ring = take(7)
     acc = take(1)[0]
     c_send, c_recv1, c_half, c_recv2, csem = take(5)
-    gscratch = tuple(take(14))
+    gscratch = tuple(take(gather_entries))
     assert not scratch
 
     _barrier(dp, tp)
@@ -613,7 +613,7 @@ def _kernel_body(
                         t,
                     )
 
-    _wait_bytes(lg_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[1])
+    wait_bytes_of(lg_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[1])
 
     wtab[...] = select_topk(lg_all[...], topk, from_logits=True)
     hit = jnp.any(wtab[...] != 0, axis=0, keepdims=True)
@@ -624,7 +624,7 @@ def _kernel_body(
 
     def rows_ready():
         if dispatch_fp8:
-            _wait_bytes(xs_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[6])
+            wait_bytes_of(xs_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[6])
         # Each foreign block's column half lands from its DP peer and is
         # forwarded to the TP partner, whose other half arrives the same way.
         for u, cols in ((0, pl.ds(0, half)), (1, pl.ds(half, half))):
@@ -635,7 +635,7 @@ def _kernel_body(
 
                     @pl.when(j != d)
                     def _(j=j):
-                        _wait_bytes(x_all.at[_rows_of(j, rows_l), cols], xrecv.at[j])
+                        wait_bytes_of(x_all.at[_rows_of(j, rows_l), cols], xrecv.at[j])
                         _push(
                             x_all.at[_rows_of(j, rows_l), cols],
                             x_all.at[_rows_of(j, rows_l), cols],
@@ -645,7 +645,7 @@ def _kernel_body(
                             1 - t,
                         )
 
-                _wait_bytes(x_all.at[pl.ds(0, (dp - 1) * rows_l), cols], dsem.at[4])
+                wait_bytes_of(x_all.at[pl.ds(0, (dp - 1) * rows_l), cols], dsem.at[4])
 
     _stream_ring(
         gid_s,
@@ -678,7 +678,7 @@ def _kernel_body(
         def _(theirs=theirs):
             _push(c_send.at[:, theirs], c_recv1, csem.at[0], csem.at[1], d, 1 - t)
 
-    _wait_bytes(c_recv1, csem.at[1])
+    wait_bytes_of(c_recv1, csem.at[1])
     for u, mine, theirs in (
         (0, pl.ds(0, half), pl.ds(half, half)),
         (1, pl.ds(half, half), pl.ds(0, half)),
@@ -705,7 +705,7 @@ def _kernel_body(
                 t,
             )
 
-    _wait_bytes(c_recv2.at[pl.ds(0, dp - 1)], csem.at[3])
+    wait_bytes_of(c_recv2.at[pl.ds(0, dp - 1)], csem.at[3])
     fin = c_half[_rows_of(d, rows_l), :].astype(jnp.float32)
     for j in range(dp):
         fin = fin + c_recv2[j].astype(jnp.float32)
@@ -728,16 +728,16 @@ def _kernel_body(
                 1 - t,
             )
 
-    _wait_bytes(out_ref.at[:, pl.ds(0, half)], csem.at[5])
-    _wait_bytes(c_recv1, csem.at[0])
-    _wait_bytes(c_recv2.at[pl.ds(0, dp - 1)], csem.at[2])
-    _wait_bytes(out_ref.at[:, pl.ds(0, half)], csem.at[4])
+    wait_bytes_of(out_ref.at[:, pl.ds(0, half)], csem.at[5])
+    wait_bytes_of(c_recv1, csem.at[0])
+    wait_bytes_of(c_recv2.at[pl.ds(0, dp - 1)], csem.at[2])
+    wait_bytes_of(out_ref.at[:, pl.ds(0, half)], csem.at[4])
 
-    _wait_bytes(lg_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[0])
+    wait_bytes_of(lg_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[0])
     if dispatch_fp8:
-        _wait_bytes(xs_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[5])
-    _wait_bytes(x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[2])
-    _wait_bytes(x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[3])
+        wait_bytes_of(xs_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[5])
+    wait_bytes_of(x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[2])
+    wait_bytes_of(x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[3])
 
 
 class _Scratch:
@@ -815,7 +815,8 @@ def moe_lowtok_fused(
     """
     if tp != TP_PAIR:
         raise ValueError(
-            f"the hier forms pair the two cores of a chip (tp == {TP_PAIR})"
+            "the dispatch and combine split each row block between the two "
+            f"cores of a chip (tp == {TP_PAIR})"
         )
     tokens, hidden = x.shape
     if hidden % (2 * LANE):
@@ -869,7 +870,7 @@ def moe_lowtok_fused(
     sc.vmem((rows, half), jnp.bfloat16)
     sc.vmem((dp, rows_l, half), jnp.bfloat16)
     sc.add(pltpu.SemaphoreType.DMA((6,)))
-    _gather_scratch(sc, rows, hidden, inter, dispatch_fp8)
+    gather_entries = _gather_scratch(sc, rows, hidden, inter)
     operand_bytes = (
         x_rows.size * 2
         + lg_rows.size * lg_rows.dtype.itemsize
@@ -894,6 +895,7 @@ def moe_lowtok_fused(
             dp=dp,
             tp=tp,
             dispatch_fp8=dispatch_fp8,
+            gather_entries=gather_entries,
         ),
         out_shape=jax.ShapeDtypeStruct((out_rows, hidden), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
