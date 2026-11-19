@@ -1158,19 +1158,34 @@ _LTX2_FAST_EAGER_DISPATCH_PATCHED = "_tpu_ltx2_fast_eager_dispatch_patched"
 
 
 def _patch_ltx2_fast_eager_dispatch() -> None:
-    """Eliminate Python reflection and wrapper overhead in LTX-2 block dispatch.
+    """Eliminate Python reflection and wrapper overhead in eager Ulysses dispatch.
+
+    Upstream provenance (vllm-omni 0.32.0rc1):
+    ``vllm_omni/diffusion/models/ltx2/ltx2_transformer.py``
+    (``LTX2Attention.forward``) and
+    ``vllm_omni/diffusion/distributed/comm.py`` (``all_to_all_4D`` and
+    ``SeqAllToAll4D``).
 
     Host-timeline profiling of the 48-block LTX-2 denoise step showed two
     pure-Python dispatch hotspots:
     1. ``LTX2Attention.forward`` calls ``inspect.signature(self.processor.__call__)``
        on all 288 attention calls per step (11,520 calls per 40-step run,
-       ~29.0 ms/step). Fast-pathing the standard 6-arg call and caching
-       processor signatures per class eliminates per-call reflection.
+       ~19 ms/step under 8-worker load). Fast-pathing the standard 6-arg call
+       (all LTX-2 processors in vllm-omni 0.32.0rc1 accept
+       ``perturbation_mask``) and caching processor signatures per class
+       eliminates per-call reflection.
     2. ``SeqAllToAll4D.apply`` boxes through ``torch.autograd.Function.apply``
        288 times per step under ``torch.no_grad()`` and performs a double
        transpose in ``(scatter_idx=1, gather_idx=2)``. Calling
        ``all_to_all_4D`` directly with a single ``permute`` removes autograd
-       boxing and extra transpose ops.
+       boxing and extra transpose ops for inference (shared across Ulysses
+       diffusion models). Callers passing ``use_sync=True`` or
+       ``_output_destination`` fall back to upstream ``comm.all_to_all_4D``.
+
+    REMOVAL / FIX CONDITION:
+    Remove once vLLM-Omni caches ``inspect.signature`` in
+    ``LTX2Attention.forward`` and bypasses autograd boxing / double-transpose
+    in inference ``SeqAllToAll4D`` / ``all_to_all_4D``.
     """
     import inspect
 
@@ -1239,7 +1254,7 @@ def _patch_ltx2_fast_eager_dispatch() -> None:
         *,
         _output_destination: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if _output_destination is not None:
+        if _output_destination is not None or use_sync:
             return orig_all_to_all_4d(
                 input_t,
                 scatter_idx,

@@ -25,6 +25,7 @@ from diffusers.pipelines.ltx2.vocoder import UpSample1d
 from vllm_omni.diffusion import ipc
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.distributed import comm as diffusion_comm
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.diffusion.models.ltx2 import (
@@ -91,6 +92,8 @@ _UPSTREAM_SYNC_GUIDANCE_STEP = (
     ltx2_runtime.LTXRuntime._synchronize_guidance_parallel_step_output
 )
 _UPSTREAM_LTX2_ATTN_FORWARD = ltx2_transformer.LTX2Attention.forward
+_UPSTREAM_ALL_TO_ALL_4D = diffusion_comm.all_to_all_4D
+_UPSTREAM_SEQ_ALL_TO_ALL_4D_APPLY = diffusion_comm.SeqAllToAll4D.apply
 
 
 def test_register_omni_tpu_platform(monkeypatch):
@@ -1617,18 +1620,26 @@ def test_ltx2_fast_attention_dispatch_and_all_to_all_4d(monkeypatch):
     from vllm_omni.diffusion.distributed import comm
     from vllm_omni.diffusion.models.ltx2 import ltx2_sequence_parallel
 
-    orig_a2a = comm.all_to_all_4D
-    orig_seq_apply = comm.SeqAllToAll4D.apply
+    # Restore true module-level upstream callables captured before autouse
+    # _omni_model_patches so the parity check compares patched vs upstream.
     monkeypatch.setattr(
         ltx2_transformer.LTX2Attention, "forward", _UPSTREAM_LTX2_ATTN_FORWARD
     )
-    monkeypatch.setattr(comm, "all_to_all_4D", orig_a2a)
-    monkeypatch.setattr(comm.SeqAllToAll4D, "apply", orig_seq_apply)
-    monkeypatch.setattr(ulysses_mod.SeqAllToAll4D, "apply", orig_seq_apply)
-    monkeypatch.setattr(ltx2_sequence_parallel.SeqAllToAll4D, "apply", orig_seq_apply)
+    monkeypatch.setattr(comm, "all_to_all_4D", _UPSTREAM_ALL_TO_ALL_4D)
+    monkeypatch.setattr(comm.SeqAllToAll4D, "apply", _UPSTREAM_SEQ_ALL_TO_ALL_4D_APPLY)
+    monkeypatch.setattr(
+        ulysses_mod.SeqAllToAll4D, "apply", _UPSTREAM_SEQ_ALL_TO_ALL_4D_APPLY
+    )
+    monkeypatch.setattr(
+        ltx2_sequence_parallel.SeqAllToAll4D,
+        "apply",
+        _UPSTREAM_SEQ_ALL_TO_ALL_4D_APPLY,
+    )
 
     patches._patch_ltx2_fast_eager_dispatch()
     patches._patch_ltx2_fast_eager_dispatch()  # idempotent
+    assert comm.all_to_all_4D is not _UPSTREAM_ALL_TO_ALL_4D
+    assert comm.SeqAllToAll4D.apply is not _UPSTREAM_SEQ_ALL_TO_ALL_4D_APPLY
 
     class _DummyProc:
         def __call__(
@@ -1675,8 +1686,9 @@ def test_ltx2_fast_attention_dispatch_and_all_to_all_4d(monkeypatch):
         torch.testing.assert_close(out_kw1, torch.full_like(x, 4.0))
         torch.testing.assert_close(out_kw2, out_kw1)
 
-    # Verify _fast_all_to_all_4d matches upstream comm.all_to_all_4D for both
-    # (scatter=2, gather=1) and (scatter=1, gather=2) across 4 simulated ranks.
+    # Verify _fast_all_to_all_4d and SeqAllToAll4D.apply match upstream
+    # comm.all_to_all_4D for both (scatter=2, gather=1) and (scatter=1, gather=2)
+    # across 4 simulated ranks.
     world_size = 4
     monkeypatch.setattr(
         torch.distributed, "get_world_size", lambda group=None: world_size
@@ -1707,15 +1719,37 @@ def test_ltx2_fast_attention_dispatch_and_all_to_all_4d(monkeypatch):
             outputs.append(fn(rank_inputs[r], scatter_idx, gather_idx, group="pg"))
         return outputs
 
+    def _via_seq_apply(t, scatter_idx, gather_idx, group="pg"):
+        return comm.SeqAllToAll4D.apply(group, t, scatter_idx, gather_idx, False)
+
     torch.manual_seed(0)
     in_21 = [torch.randn(2, 3, 8, 4) for _ in range(world_size)]
     got_21 = _run_simulated_world(comm.all_to_all_4D, in_21, 2, 1)
-    want_21 = _run_simulated_world(orig_a2a, in_21, 2, 1)
-    for g, w in zip(got_21, want_21, strict=True):
+    got_21_seq = _run_simulated_world(_via_seq_apply, in_21, 2, 1)
+    want_21 = _run_simulated_world(_UPSTREAM_ALL_TO_ALL_4D, in_21, 2, 1)
+    for g, gs, w in zip(got_21, got_21_seq, want_21, strict=True):
         torch.testing.assert_close(g, w, rtol=0, atol=0)
+        torch.testing.assert_close(gs, w, rtol=0, atol=0)
 
     in_12 = [torch.randn(2, 12, 2, 4) for _ in range(world_size)]
     got_12 = _run_simulated_world(comm.all_to_all_4D, in_12, 1, 2)
-    want_12 = _run_simulated_world(orig_a2a, in_12, 1, 2)
-    for g, w in zip(got_12, want_12, strict=True):
+    got_12_seq = _run_simulated_world(_via_seq_apply, in_12, 1, 2)
+    want_12 = _run_simulated_world(_UPSTREAM_ALL_TO_ALL_4D, in_12, 1, 2)
+    for g, gs, w in zip(got_12, got_12_seq, want_12, strict=True):
         torch.testing.assert_close(g, w, rtol=0, atol=0)
+        torch.testing.assert_close(gs, w, rtol=0, atol=0)
+
+    # use_sync=True falls back to upstream comm.all_to_all_4D (honoring sync).
+    sync_calls: list[bool] = []
+    monkeypatch.setattr(
+        comm.current_omni_platform,
+        "synchronize",
+        lambda: sync_calls.append(True),
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_to_all_single",
+        lambda recv_buf, send_buf, group=None: recv_buf.copy_(send_buf),
+    )
+    comm.all_to_all_4D(in_21[0], 2, 1, group="pg", use_sync=True)
+    assert sync_calls == [True]
