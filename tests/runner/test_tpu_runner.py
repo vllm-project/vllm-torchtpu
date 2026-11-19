@@ -2410,7 +2410,7 @@ class TestInputStagingFence:
             _dp_lockstep_enabled=lambda: False,
             _vocab_parallel_rows=lambda: None,
             forward_model=forward_model,
-            compute_selected_logits=lambda out, idx: out,
+            compute_selected_logits=lambda out, idx, padded_rows=None: out,
         )
         for name in (
             "_build_attention_metadata",

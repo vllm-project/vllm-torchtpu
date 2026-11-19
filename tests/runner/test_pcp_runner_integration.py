@@ -1008,8 +1008,9 @@ def test_idle_dummy_logits_rows_match_the_vocab_parallel_bound(
     )
     runner._vocab_parallel_rows = lambda: vocab_parallel_rows
     _run_dummy_run(monkeypatch, runner, num_tokens=256, dp_lockstep=True)
-    (_, indices), _ = runner.compute_selected_logits.call_args
+    (_, indices), kwargs = runner.compute_selected_logits.call_args
     assert indices.shape[0] == (vocab_parallel_rows or runner.num_reqs_max_model_len)
+    assert kwargs == {"padded_rows": vocab_parallel_rows}
 
 
 @pytest.mark.parametrize("idle", [False, True])
