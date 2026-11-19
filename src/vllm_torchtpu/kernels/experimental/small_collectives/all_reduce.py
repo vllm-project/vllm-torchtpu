@@ -167,7 +167,7 @@ def _oneshot_xor(x, n, axis, rank, collective_id):
     )
 
 
-def _hier_halves_col_zcopy(x, n, axis, rank, collective_id):
+def _hier_halves(x, n, axis, rank, collective_id):
     """3-stage topology-aware column-half (rows, hidden // 2) all-reduce on 8 cores:
     Stage 1: Intra-chip RS of (rows, half) with `me ^ 1` directly from `x_ref`.
     Stage 2: Inter-chip 4-way all-reduce of (rows, half) across `me ^ {2, 4, 6}`.
@@ -540,7 +540,7 @@ def small_all_reduce(
     builds = {
         "oneshot": _oneshot,
         "oneshot_xor": _oneshot_xor,
-        "hier_halves": _hier_halves_col_zcopy,
+        "hier_halves": _hier_halves,
         "twoshot": _twoshot,
         "hier_2stage": _hier_2stage_rs_ag,
     }

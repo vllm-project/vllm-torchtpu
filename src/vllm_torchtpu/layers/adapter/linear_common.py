@@ -235,9 +235,9 @@ def _get_prequant_matmul_op() -> Callable:
 
 
 def _quantize_rows_jax(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Per-row fp8 quantisation of the activation: the rows and scales
+    """Per-row fp8 quantization of the activation: the rows and scales
     xla_quantized_matmul computes for itself, so a projection fed the
-    pre-quantised rows reproduces the plain path's numerics."""
+    pre-quantized rows reproduces the plain path's numerics."""
     x_q, x_s = quantize_tensor(x, jnp.float8_e4m3fn)
     return x_q, x_s.astype(jnp.float32)
 
