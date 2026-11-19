@@ -529,6 +529,12 @@ def inner_kernel(
     def _pipe_bucket(bucket_m):
         # TPU_GMM_V2_K1_PIPE_BUCKETS: only these buckets take the chunk mode
         # (the others keep the fully unrolled body); unset = all buckets.
+        if chunk_mode is not None and chunk_mode.startswith("pipe"):
+            # The pipelined loop walks MXU column chunks in pairs.
+            mxu_size = pltpu.get_tpu_info().mxu_column_size
+            rhs_n = cfgs.tiles.tile_n * (2 if cfgs.fuse_act is not None else 1)
+            if rhs_n % (2 * mxu_size) != 0:
+                return False
         return pipe_buckets is None or bucket_m in pipe_buckets
 
     if chunk_mode is None or not (
@@ -1093,7 +1099,10 @@ def _k1_body_mode(cfgs: "GmmConfigs") -> str | None:
         mode = "single"
     if mode not in _k1_body_logged:
         _k1_body_logged.add(mode)
-        args = ("gmm_v2 %s=%s on: one first_last body per bucket", _K1_BODY_ENV, mode)
+        args = (
+            "gmm_v2 %s=%s on: one first_last body per bucket (pipe buckets %s)",
+            _K1_BODY_ENV, mode, _pipe_buckets_env(),
+        )
         try:
             from vllm_torchtpu.logger import init_logger
 
