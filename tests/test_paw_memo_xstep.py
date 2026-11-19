@@ -23,40 +23,32 @@ one."""
 import random
 
 import pytest
-
-torch = pytest.importorskip("torch")
-
-from vllm import SamplingParams  # noqa: E402
-from vllm.utils.hashing import sha256  # noqa: E402
-from vllm.v1.core.block_pool import BlockPool  # noqa: E402
-from vllm.v1.core.kv_cache_manager import KVCacheManager  # noqa: E402
-from vllm.v1.core.kv_cache_utils import (  # noqa: E402
+import torch
+from vllm import SamplingParams
+from vllm.utils.hashing import sha256
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
     init_none_hash,
 )
-from vllm.v1.kv_cache_interface import (  # noqa: E402
+from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
 )
-from vllm.v1.request import Request  # noqa: E402
+from vllm.v1.request import Request
 
-import vllm_torchtpu  # noqa: E402
-from vllm_torchtpu.core import prefix_change_log  # noqa: E402
-from vllm_torchtpu.core.prefix_aware_scheduler import (  # noqa: E402
+import vllm_torchtpu
+from vllm_torchtpu.core import prefix_change_log
+from vllm_torchtpu.core.prefix_aware_scheduler import (
     PrefixAwareScheduler,
     _hit_signature,
 )
 
 HASH_BS = 2
 BS = 4
-
-
-def _begin_step(pool_owner_mgr):
-    """Step prologue before ``new_step_starts``: nothing to do on main, where
-    the same-step patch clears the unwritten set in ``new_step_starts`` (the
-    simulation calls it right after this)."""
 
 
 @pytest.fixture
@@ -76,7 +68,7 @@ def patched_pool():
     assert prefix_change_log.installed()
     init_none_hash(sha256)
     try:
-        yield _begin_step
+        yield
     finally:
         for k, v in saved_pool.items():
             setattr(BlockPool, k, v)
@@ -151,7 +143,7 @@ def _lookup(s, req):
     return c
 
 
-def _simulate(begin_step, seed, steps, verify=0, num_blocks=160, on_check=None):
+def _simulate(seed, steps, verify=0, num_blocks=160, on_check=None):
     rng = random.Random(seed)
     mgr = _manager(num_blocks)
     s = _paw(mgr, verify)
@@ -159,7 +151,7 @@ def _simulate(begin_step, seed, steps, verify=0, num_blocks=160, on_check=None):
     running: dict[str, Request] = {}
     waiting: list[Request] = []
     n = 0
-    checks = nontrivial = resets = 0
+    checks = nontrivial = 0
 
     def new_waiting():
         nonlocal n
@@ -191,7 +183,6 @@ def _simulate(begin_step, seed, steps, verify=0, num_blocks=160, on_check=None):
             nontrivial += memo[0] > 0
 
     for _ in range(steps):
-        begin_step(mgr)
         mgr.new_step_starts()
         check_all()
         for _ in range(rng.randint(1, 4)):
@@ -224,33 +215,32 @@ def _simulate(begin_step, seed, steps, verify=0, num_blocks=160, on_check=None):
                 rid = rng.choice(list(running))
                 mgr.free(running.pop(rid))
             elif op < 0.87 and not running:
-                resets += bool(mgr.reset_prefix_cache())
+                mgr.reset_prefix_cache()
             else:
                 waiting.append(new_waiting())
                 if len(waiting) > 14:
                     waiting.pop(0)
         check_all()  # mid-step: freshly inserted blocks are still unwritten
-    print(f"seed={seed} resets={resets}")
     return s, checks, nontrivial
 
 
 def test_xstep_memo_equals_fresh_lookup(patched_pool):
     tot_hits = tot_checks = tot_nontrivial = tot_computes = 0
     for seed in range(12):
-        s, checks, nontrivial = _simulate(patched_pool, seed, steps=150)
+        s, checks, nontrivial = _simulate(seed, steps=150)
         tot_hits += s._memo_hits
         tot_checks += checks
         tot_nontrivial += nontrivial
         tot_computes += s._memo_computes
         assert s._memo_xstep  # never disabled
     # Cross-step reuse really happens, on non-trivial hits.
-    assert tot_checks > 10_000
-    assert tot_hits > tot_checks // 4
-    assert tot_nontrivial > tot_checks // 6
-    print(
+    counts = (
         f"checks={tot_checks} xstep_hits={tot_hits} computes={tot_computes} "
         f"nontrivial={tot_nontrivial}"
     )
+    assert tot_checks > 10_000, counts
+    assert tot_hits > tot_checks // 4, counts
+    assert tot_nontrivial > tot_checks // 6, counts
 
 
 def _local_hit_view(mgr, hit):
@@ -284,14 +274,13 @@ def test_memo_local_hit_equals_the_upstream_lookup(patched_pool):
         counts["hits"] += want[1] > 0
 
     for seed in range(4):
-        _simulate(patched_pool, seed, steps=60, on_check=compare)
-    assert counts["from_memo"] == counts["checks"] > 1000
-    assert counts["hits"] > counts["checks"] // 6
-    print(counts)
+        _simulate(seed, steps=60, on_check=compare)
+    assert counts["from_memo"] == counts["checks"] > 1000, counts
+    assert counts["hits"] > counts["checks"] // 6, counts
 
 
 def test_runtime_verifier_agrees(patched_pool):
-    s, checks, _ = _simulate(patched_pool, 99, steps=150, verify=10_000)
+    s, checks, _ = _simulate(99, steps=150, verify=10_000)
     assert s._memo_xstep and s._memo_verified > 100 and s._memo_hits == 0
 
 
