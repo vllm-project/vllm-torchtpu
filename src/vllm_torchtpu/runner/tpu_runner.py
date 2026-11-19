@@ -7625,6 +7625,9 @@ class TPUModelRunner(GPUModelRunner):
         if backend == "logits":
             return
 
+        from vllm_torchtpu.models.vllm.deepseek_v41.common import (
+            vocab_parallel_head,
+        )
         from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
             DeepseekV41ForCausalLM,
         )
@@ -7635,6 +7638,12 @@ class TPUModelRunner(GPUModelRunner):
             if supports_multimodal(self.model)
             else self.model
         )
+        if vocab_parallel_head.is_vocab_parallel(getattr(model, "lm_head", None)):
+            logger.info(
+                "Greedy head: logits, because the LM head is vocab-parallel and "
+                "the fused greedy head reads the whole vocab"
+            )
+            return
         spec = self.speculative_config
         if (
             isinstance(model, DeepseekV41ForCausalLM)

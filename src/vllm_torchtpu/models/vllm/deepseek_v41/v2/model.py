@@ -1601,7 +1601,7 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         # whole): drop the other ranks' vocab rows before the KV cache is
         # sized, and before the drafter shares this head.
         vocab_parallel_head.shard_lm_head(
-            self.lm_head, self.logits_processor, self._parallel_config
+            self.lm_head, self.logits_processor, self._vllm_config
         )
         return loaded
 
@@ -1663,7 +1663,7 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             # inputs instead of copying device hashes back every step.
             install_host_engram_inputs()
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self._parallel_config = parallel
+        self._vllm_config = vllm_config
         # TPU's existing FP8 linear adapter registers weight_scale_inv; the
         # NVIDIA MXFP8 adapter selected by upstream uses weight_scale instead.
         self.hf_to_vllm_mapper = upstream._make_deepseek_v4_weights_mapper(

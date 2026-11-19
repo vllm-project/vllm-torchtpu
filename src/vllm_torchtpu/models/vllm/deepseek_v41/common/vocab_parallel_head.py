@@ -131,10 +131,41 @@ def _logits_processor_reason(lm_head, logits_processor) -> str | None:
     return None
 
 
-def whole_head_reason(lm_head, logits_processor, parallel_config) -> str | None:
+def _fused_head_reason(weight, vllm_config) -> str | None:
+    """Which fused kernel that reads the whole vocab serves this deployment:
+    the fused greedy head (as ``TPUModelRunner._init_fused_greedy_head``
+    builds it) or the DSpark draft sampler (48 requests of 5 draft rows,
+    ``DSparkDeepseekV41ForCausalLM._sample_decode``)."""
+    from vllm_torchtpu.layers.adapter.sample.fused_greedy_head import (
+        FusedGreedyHead,
+    )
+
+    spec = vllm_config.speculative_config
+    parallel_config = vllm_config.parallel_config
+    if spec is None or spec.method != "dspark":
+        return None
+    if parallel_config.tensor_parallel_size != 1:
+        return None
+    max_reqs = vllm_config.scheduler_config.max_num_seqs
+    k = spec.num_speculative_tokens
+    rows = max_reqs * (k + 1)
+    if (
+        envs.TPU_GREEDY_HEAD_BACKEND != "logits"
+        and parallel_config.pipeline_parallel_size == 1
+        and vllm_config.lora_config is None
+        and FusedGreedyHead.is_supported(weight, rows)
+    ):
+        return f"the fused greedy head reads the whole vocab for {rows} rows"
+    if (max_reqs, k) == (48, 5) and tuple(weight.shape) == (129280, 5120):
+        return "the fused DSpark draft sampler reads the whole vocab"
+    return None
+
+
+def whole_head_reason(lm_head, logits_processor, vllm_config) -> str | None:
     """Why ``lm_head`` must stay whole on this deployment, or None to split it."""
     from vllm_torchtpu.distributed.ep_mesh import ep_device_ids, ep_mesh_index
 
+    parallel_config = vllm_config.parallel_config
     if not (
         parallel_config.data_parallel_size > 1
         and parallel_config.enable_expert_parallel
@@ -143,6 +174,9 @@ def whole_head_reason(lm_head, logits_processor, parallel_config) -> str | None:
     if envs.TPU_GREEDY_HEAD_BACKEND == "pallas":
         return "TPU_GREEDY_HEAD_BACKEND=pallas needs the whole vocab on every rank"
     reason = _logits_processor_reason(lm_head, logits_processor)
+    if reason is not None:
+        return reason
+    reason = _fused_head_reason(lm_head.weight, vllm_config)
     if reason is not None:
         return reason
     ids, rank = ep_device_ids(), ep_mesh_index()
@@ -157,12 +191,12 @@ def whole_head_reason(lm_head, logits_processor, parallel_config) -> str | None:
     return None
 
 
-def shard_lm_head(lm_head: torch.nn.Module, logits_processor, parallel_config) -> bool:
+def shard_lm_head(lm_head: torch.nn.Module, logits_processor, vllm_config) -> bool:
     """Keep only this rank's vocab slice of ``lm_head.weight`` and attach the
     head op where the head can be split; returns whether it was split."""
     from vllm_torchtpu.distributed.ep_mesh import ep_device_ids, ep_mesh_index
 
-    reason = whole_head_reason(lm_head, logits_processor, parallel_config)
+    reason = whole_head_reason(lm_head, logits_processor, vllm_config)
     if reason is not None:
         logger.info("LM head kept whole (not vocab-parallel): %s", reason)
         return False
