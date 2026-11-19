@@ -270,6 +270,18 @@ class DecodeOpt(NamedTuple):
     issue: bool = False  # full groups start their copies without per-page checks
     slots: int = _RING_SLOTS  # page groups in the DMA ring
     quad: bool = False  # fp8 queries, four pages per MXU row
+    # A page copy below the group's live pages reads its block-table entry
+    # unclamped (it is inside the request's row).
+    noclamp: bool = False
+    # Bodies specialised on whether the ahead group is full: a full one starts
+    # its copies unpredicated, in the same straight-line body.
+    full: bool = False
+    # The last scored chunk of a body runs as dots of this many pages, so the
+    # maxima left after the body's last matmul are a few pages' (0: off).
+    tail: int = 0
+    # One body per count of scored chunks (1 .. all), not per power of two:
+    # a group's partial last chunks are not scored.
+    every_count: bool = False
 
 
 _DECODE_OPT_LOGGED = False
@@ -288,6 +300,14 @@ def decode_opt() -> DecodeOpt:
             opt = opt._replace(issue=True)
         elif item == "quad":
             opt = opt._replace(quad=True)
+        elif item == "noclamp":
+            opt = opt._replace(noclamp=True)
+        elif item == "full":
+            opt = opt._replace(full=True)
+        elif item == "counts":
+            opt = opt._replace(every_count=True)
+        elif item.startswith("tail") and item[4:] in ("4", "8", "16"):
+            opt = opt._replace(tail=int(item[4:]))
         elif item.startswith("slots") and item[5:].isdigit() and int(item[5:]) >= 2:
             opt = opt._replace(slots=int(item[5:]))
         else:
@@ -298,11 +318,15 @@ def decode_opt() -> DecodeOpt:
         _DECODE_OPT_LOGGED = True
         logger.info(
             "TPU_MINIMAX_M3_INDEXER_DECODE_OPT=%s on: MSA indexer decode tiles run "
-            "issue=%s slots=%d quad=%s.",
+            "issue=%s slots=%d quad=%s noclamp=%s full=%s tail=%d counts=%s.",
             spec,
             opt.issue,
             opt.slots,
             opt.quad,
+            opt.noclamp,
+            opt.full,
+            opt.tail,
+            opt.every_count,
         )
     return opt
 # Folded 4-bit and fp8 tiles of up to this many rows score transposed
@@ -510,6 +534,10 @@ def _kernel_v3(
     fp8_q=False,
     fast_issue=False,
     quad=False,
+    noclamp=False,
+    full_bodies=False,
+    tail=0,
+    every_count=False,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -548,7 +576,7 @@ def _kernel_v3(
 
     def copy(base, g, slot):
         col = g
-        if pages_per_seq % pages_per_step:
+        if pages_per_seq % pages_per_step and not noclamp:
             # Keep the last group's block-table reads in its request's row.
             first = base % pages_per_seq
             col = jnp.minimum(first + g, pages_per_seq - 1) - first
@@ -580,9 +608,14 @@ def _kernel_v3(
             words.at[pl.ds(0, n)], buf.at[slot, pl.ds(0, n)], sems.at[slot]
         )
 
-    def start(base, live, pages, slot):
+    def start(base, live, pages, slot, full=False):
         """Start the copies of a group's `pages` that are below its `live`
-        pages, alternate pages on the second DMA queue (priority 1)."""
+        pages, alternate pages on the second DMA queue (priority 1). With
+        `full` (static) every page is live: no predicates."""
+        if full:
+            for g in pages:
+                copy(base, g, slot).start(priority=g % 2)
+            return
         if fast_issue:
             full = live >= pages_per_step
 
@@ -643,17 +676,22 @@ def _kernel_v3(
     issue_chunks = min(_DMA_ISSUE_CHUNKS, num_chunks)
     per_pair = -(-pages_per_step // (issue_chunks * (chunk // 2)))
 
-    def score_chunk(slot, first, share):
-        """Score pages ``[first, first + chunk)``, issuing the ahead group's
-        descriptors `share` among the first page pairs (`start`)."""
+    def score_chunk(slot, first, share, next_full=False, size=None, pair_off=0):
+        """Score pages ``[first, first + size)`` (default a chunk), issuing
+        the ahead group's descriptors `share` among the first page pairs of
+        the chunk (`start`); `pair_off` is the first page pair's index in
+        the chunk when a chunk runs as several smaller dots."""
+        size = chunk if size is None else size
 
         def issue(j):
+            j += pair_off
             if j < chunk // 2:
                 start(
                     next_base,
                     next_live,
                     share[j * per_pair : (j + 1) * per_pair],
                     (slot + ahead) % slots,
+                    next_full,
                 )
 
         if quad:
@@ -669,19 +707,20 @@ def _kernel_v3(
                 q_pair,
                 buf.at[slot],
                 first,
-                chunk,
+                size,
                 live,
                 issue,
                 dtype=cache_ref.dtype,
                 folded=folded,
-            )  # [Bq, chunk]
+            )  # [Bq, size]
             if row_scale is not None:
                 m = m * row_scale
             if transposed:
-                o_ref[:, pl.ds(first, chunk)] = m
+                o_ref[:, pl.ds(first, size)] = m
             else:
-                o_ref[pl.ds(first, chunk), :] = m.T
+                o_ref[pl.ds(first, size), :] = m.T
             return
+        assert size == chunk, "split chunks need transposed scores"
 
         if folded:
             # Each page's slot scales as a column of one transpose for the
@@ -726,8 +765,14 @@ def _kernel_v3(
             o_ref[pl.ds(first, chunk), :] = m
 
     share = per_pair * (chunk // 2)
+    tail_split = (
+        0 < tail < chunk
+        and chunk % tail == 0
+        and not quad
+        and _scores_transposed(block_q, rows, cache_ref.dtype)
+    )
 
-    def body(slot, scored):
+    def body(slot, scored, next_full=False):
         """Score the group's first `scored` chunks; the rest are past the
         request's last page (their scores are never read) and only issue
         their share of the ahead group's descriptors."""
@@ -736,19 +781,39 @@ def _kernel_v3(
             pages = range(
                 min(c * share, pages_per_step), min((c + 1) * share, pages_per_step)
             )
-            if c < scored:
-                score_chunk(slot, c * chunk, pages)
+            if c < scored - 1 or (c == scored - 1 and not tail_split):
+                score_chunk(slot, c * chunk, pages, next_full)
+            elif c == scored - 1:
+                # The last scored chunk as `tail`-page dots: the maxima
+                # still to do after its last matmul are one small dot's.
+                for off in range(0, chunk, tail):
+                    score_chunk(
+                        slot,
+                        c * chunk + off,
+                        pages,
+                        next_full,
+                        size=tail,
+                        pair_off=off // 2,
+                    )
             else:
-                start(next_base, next_live, pages, (slot + ahead) % slots)
+                start(next_base, next_live, pages, (slot + ahead) % slots, next_full)
 
     # One straight-line body per slot and count of scored chunks, so that a
     # chunk's matmuls overlap the previous chunk's maxima.
     counts = sorted({num_chunks} | {2**k for k in range(1, 8) if 2**k < num_chunks})
+    if every_count:
+        counts = list(range(1, num_chunks + 1))
     live_chunks = jnp.minimum(-(-live // chunk), num_chunks)
+    next_is_full = next_live >= pages_per_step
     for slot in range(slots):
         for i, n in enumerate(counts):
             lo = counts[i - 1] if i else 0
-            pl.when((step % slots == slot) & (live_chunks > lo) & (live_chunks <= n))(
+            cond = (step % slots == slot) & (live_chunks > lo) & (live_chunks <= n)
+            if not full_bodies:
+                pl.when(cond)(functools.partial(body, slot, n))
+                continue
+            pl.when(cond & next_is_full)(functools.partial(body, slot, n, True))
+            pl.when(cond & jnp.logical_not(next_is_full))(
                 functools.partial(body, slot, n)
             )
 
@@ -965,6 +1030,10 @@ def _class_scores(
                 fp8_q=fp8_q and index_cache.dtype in (jnp.float8_e4m3fn, jnp.uint8),
                 fast_issue=dopt.issue,
                 quad=dopt.quad,
+                noclamp=dopt.noclamp,
+                full_bodies=dopt.full,
+                tail=dopt.tail,
+                every_count=dopt.every_count,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=4,
