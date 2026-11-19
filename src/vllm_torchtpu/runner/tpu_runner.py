@@ -123,7 +123,6 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.model_loader_patches import runai_metadata_cache
-from vllm_torchtpu.models.vllm.deepseek_v41.common import vocab_parallel_head
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -6018,12 +6017,22 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_compute_selected_logits(self) -> None:
         hsize = self.model_config.get_hidden_size()
+        vocab_parallel_rows = self._vocab_parallel_row_counts()
         with self._precompile_timed("compute_selected_logits"):
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
                     dtype=self._hidden_states_dtype,
                 ).to(self.device)
+                for rows in vocab_parallel_rows:
+                    indices = torch.zeros(rows, dtype=torch.int32).to(self.device)
+                    out = self.compute_selected_logits(dummy_hidden, indices)
+                    synchronize_tensors(out)
+                    logger.info(
+                        "  -- num_tokens: %d, logits rows: %d", num_tokens, rows
+                    )
+                if vocab_parallel_rows:
+                    continue
                 for num_reqs in self.num_reqs_paddings:
                     indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
@@ -6037,7 +6046,7 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_logits_from_hidden_states"):
-            for num_reqs in self.num_reqs_paddings:
+            for num_reqs in self._vocab_parallel_row_counts() or self.num_reqs_paddings:
                 dummy_hidden = torch.zeros(
                     (num_reqs, hsize),
                     dtype=self._hidden_states_dtype,
@@ -7705,30 +7714,54 @@ class TPUModelRunner(GPUModelRunner):
     ) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
 
-    def _vocab_parallel_rows(self) -> int | None:
-        """The logits row count every DP rank uses this step when the LM head
-        is vocab-parallel (common/vocab_parallel_head.py), else None.
+    def _uses_vocab_parallel_head(self) -> bool:
+        from vllm_torchtpu.models.vllm.deepseek_v41.common import (
+            vocab_parallel_head,
+        )
 
-        The head's collectives pair across ranks, so all ranks score the same
-        number of rows. It is the padded bound for the step's DP-wide largest
-        chunk: each request yields at most 1 + K logits rows, padded as the
-        spec-decode rows are, and at least the padded request count."""
-        if not self._dp_lockstep_enabled():
-            return None
         model = (
             self.model.get_language_model()
             if supports_multimodal(self.model)
             else self.model
         )
-        if not vocab_parallel_head.is_vocab_parallel(getattr(model, "lm_head", None)):
-            return None
-        max_reqs = max(1, self._dp_step_max_reqs)
+        return self._dp_lockstep_enabled() and vocab_parallel_head.is_vocab_parallel(
+            getattr(model, "lm_head", None)
+        )
+
+    def _vocab_parallel_rows_for(self, max_reqs: int) -> int:
+        """The logits rows of a step whose DP-wide largest chunk has
+        ``max_reqs`` requests: each request yields at most 1 + K logits rows,
+        padded as the spec-decode rows are, and at least the padded request
+        count."""
+        max_reqs = max(1, max_reqs)
         spec = self.speculative_config
         rows_per_req = 1 + (spec.num_speculative_tokens if spec is not None else 0)
         rows = min(max_reqs * rows_per_req, self.num_tokens_paddings[-1])
         return max(
             _get_padded_token_len(self.num_tokens_paddings, rows),
             _get_padded_num_reqs_with_upper_limit(max_reqs, self.max_num_reqs),
+        )
+
+    def _vocab_parallel_rows(self) -> int | None:
+        """The logits row count every DP rank uses this step when the LM head
+        is vocab-parallel (common/vocab_parallel_head.py), else None.
+
+        The head's collectives pair across ranks, so all ranks score the same
+        number of rows: the bound for the step's DP-wide largest chunk."""
+        if not self._uses_vocab_parallel_head():
+            return None
+        return self._vocab_parallel_rows_for(self._dp_step_max_reqs)
+
+    def _vocab_parallel_row_counts(self) -> list[int]:
+        """Every row count ``_vocab_parallel_rows`` can return, which warmup
+        compiles; empty when the head is not vocab-parallel."""
+        if not self._uses_vocab_parallel_head():
+            return []
+        return sorted(
+            {
+                self._vocab_parallel_rows_for(max_reqs)
+                for max_reqs in range(1, self.max_num_reqs + 1)
+            }
         )
 
     def _padded_logits_rows(self, rows: int) -> int:
