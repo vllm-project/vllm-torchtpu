@@ -48,7 +48,12 @@ def get_request_block_hasher(
     hash_block_size: int,
     caching_hash_fn: Callable[[Any], bytes],
 ) -> Callable[["Request"], list["BlockHash"]]:
-    """Same contract as vLLM's get_request_block_hasher, with byte hashing."""
+    """Same contract as vLLM's get_request_block_hasher, with byte hashing.
+
+    The first call on a request reads its own token list,
+    ``request._all_token_ids``, rather than a slice of ``all_token_ids``,
+    which would copy the whole prompt.
+    """
     from vllm.utils.hashing import sha256
     from vllm.v1.core import kv_cache_utils
     from vllm.v1.core.kv_cache_utils import (
@@ -82,11 +87,11 @@ def get_request_block_hasher(
                     mm_features, start_token_idx, start_token_idx + hash_block_size
                 )
 
-        all_token_ids = getattr(request, "_all_token_ids", None)
-        if start_token_idx == 0 and isinstance(all_token_ids, list):
+        all_token_ids = request._all_token_ids
+        if start_token_idx == 0:
             token_ids = all_token_ids
         else:
-            token_ids = request.all_token_ids[start_token_idx:end_token_idx]
+            token_ids = all_token_ids[start_token_idx:end_token_idx]
         try:
             packed = memoryview(array(_TOKEN_ID_TYPECODE, token_ids)).cast("B")
         except OverflowError:
