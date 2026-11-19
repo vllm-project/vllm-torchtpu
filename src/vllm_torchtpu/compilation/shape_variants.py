@@ -418,8 +418,11 @@ def _handover_error(key: str, delta: str) -> ShapeSpecializationError:
         "graph is split, so its subgraph boundaries move with the "
         "specialization, or the two "
         "sides of a token-count branch lift different buffers; a bucket cannot "
-        "be handed between such traces. Give both sides of the branch the same "
-        "inputs, or unset TPU_KERNEL_ITER_MODE to serve this model."
+        "be handed between such traces. A split comes from "
+        "compilation_config.splitting_ops (boundaries declared by the model's "
+        "config hook or the caller, or the RPA boundaries TPU_KERNEL_ITER_MODE "
+        "adds): drop those boundaries, or give both sides of the branch the "
+        "same inputs, to serve this model."
     )
 
 
