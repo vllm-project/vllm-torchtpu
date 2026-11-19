@@ -97,6 +97,22 @@ def test_scatter_refuses_more_pairs_than_its_float_decode_is_exact_for():
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("divisor", [3, 1000, 1024, 3072, 10239, 81920])
+def test_the_float_decode_is_exact_below_max_pairs(divisor):
+    """The scatter floors pair // divisor as (pair + FLOOR_NUDGE) times the
+    float32 inverse, truncated. That is exact for every pair number below
+    MAX_PAIRS, at the divisors the layer uses (pair words and message tokens
+    per shard) and at awkward ones; with divisor 1000 it first goes wrong
+    at 5,386,999, about 1.28 x 2**22, so the bound cannot be twice as high."""
+    pair = np.arange(row_tables_kernel.MAX_PAIRS, dtype=np.int64)
+    inverse = np.float32(1.0 / divisor)
+    nudged = pair.astype(np.float32) + np.float32(row_tables_kernel.FLOOR_NUDGE)
+    decoded = (nudged * inverse).astype(np.int64)
+    bad = np.flatnonzero(decoded != pair // divisor)
+    assert not bad.size, (divisor, bad[:3])
+
+
+@pytest.mark.cpu_test
 def test_scatter_refuses_a_short_chunk_with_several_scale_planes(tpu7x_record):
     """A chunk that is a subcore's whole run (32 pairs here) may be shorter
     than 128 words with one scale plane, but not with two: plane 1 of a ring
