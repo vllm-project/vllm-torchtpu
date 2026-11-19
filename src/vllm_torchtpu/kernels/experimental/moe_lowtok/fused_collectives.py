@@ -805,7 +805,10 @@ def moe_lowtok_fused(
     [rows, experts] bf16 are this engine's own rows; the kernel gathers them
     over the DP axis, and the result is this engine's rows [rows, hidden]
     summed over every rank. This rank holds experts
-    [experts_start, experts_start + E). `dispatch_fp8` pushes
+    [experts_start, experts_start + E): E must divide LANE and experts_start
+    must be a multiple of E (linear expert-parallel placement), so that the
+    rank's experts sit in one LANE-wide block of the routing table, the block
+    the routed-row gather reads. `dispatch_fp8` pushes
     the rows quantized per row to fp8 with their scale (half the bytes, the
     same values the kernel computes from bf16 rows); it needs row blocks of
     whole fp8 tiles (`fp8_dispatch_fits`).
@@ -818,6 +821,13 @@ def moe_lowtok_fused(
     if hidden % (2 * LANE):
         raise ValueError(f"hidden {hidden} is not a multiple of {2 * LANE}")
     n_experts, inter, w13_parts, _ = weight_layout(x, w13)
+    if LANE % n_experts:
+        raise ValueError(
+            f"{n_experts} experts per rank do not divide {LANE}: the routed-row "
+            f"gather reads the routing weights of one {LANE}-lane block per "
+            "rank, so a rank's experts must not cross a block; serve this "
+            "expert split with moe_lowtok's scores entry and XLA collectives"
+        )
     lanes = pl.cdiv(logits.shape[1], LANE) * LANE
     rows_l = engine_rows(tokens)
     rows = rows_l * dp

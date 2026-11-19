@@ -311,7 +311,7 @@ def test_fp8_dispatch_moves_the_same_expert_inputs(on_8_devices):
     assert on_8_devices["fp8_dispatch_bit_identical"]
 
 
-def _call(rows=32, **kwargs):
+def _call(rows=32, experts=E, **kwargs):
     import jax.numpy as jnp
 
     from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives as fc
@@ -320,11 +320,11 @@ def _call(rows=32, **kwargs):
     statics.update(kwargs)
     return fc.moe_lowtok_fused(
         jnp.zeros((rows, H), jnp.bfloat16),
-        jnp.zeros((rows, E * DP * TP), jnp.bfloat16),
-        jnp.zeros((E, H, 2 * INTER), jnp.float8_e4m3fn),
-        jnp.zeros((E, 1, 1, 2 * INTER), jnp.float32),
-        jnp.zeros((E, INTER, H), jnp.float8_e4m3fn),
-        jnp.zeros((E, 1, 1, H), jnp.float32),
+        jnp.zeros((rows, experts * DP * TP), jnp.bfloat16),
+        jnp.zeros((experts, H, 2 * INTER), jnp.float8_e4m3fn),
+        jnp.zeros((experts, 1, 1, 2 * INTER), jnp.float32),
+        jnp.zeros((experts, INTER, H), jnp.float8_e4m3fn),
+        jnp.zeros((experts, 1, 1, H), jnp.float32),
         **statics,
     )
 
@@ -335,8 +335,12 @@ def _call(rows=32, **kwargs):
     [
         (dict(tp=4), "tp == 2"),
         (dict(rows=16, dispatch_fp8=True), "multiple of 32"),
+        # 96 experts per rank: the rank starting at expert 96 holds lanes
+        # 96..191, across the first 128-lane block of the routing table.
+        (dict(experts=96), "do not divide 128"),
+        (dict(experts=3), "do not divide 128"),
     ],
-    ids=["hier_needs_tp2", "fp8_rows"],
+    ids=["hier_needs_tp2", "fp8_rows", "experts_cross_a_lane_block", "experts_3"],
 )
 def test_refuses_unsupported_calls(kwargs, match):
     rows = kwargs.pop("rows", 32)
