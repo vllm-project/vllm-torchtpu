@@ -324,9 +324,13 @@ def test_bundled_entry_passes_torch_tpu_signature_check(
     _torch_tpu_check(fn)
 
 
-@pytest.mark.parametrize("modes", [_OFF, PVS], ids=["modes-off", "modes-on"])
+# A target layer with modes is refused here (test_attention_modes_paths.py);
+# a draft with the target's modes runs them off and builds.
+@pytest.mark.parametrize(
+    ("modes", "draft"), [(_OFF, False), (PVS, True)], ids=["modes-off", "draft"]
+)
 def test_pcp_streaming_entry_passes_torch_tpu_signature_check(
-    monkeypatch, registered, cpu_vllm_config_context, modes
+    monkeypatch, registered, cpu_vllm_config_context, modes, draft
 ):
     seen = []
 
@@ -335,7 +339,7 @@ def test_pcp_streaming_entry_passes_torch_tpu_signature_check(
         return _FakeOp()
 
     monkeypatch.setattr(attention, "pcp_streaming_jax_op", fake_pcp_jax_op)
-    impl = _impl(PallasBatchedRPAAttentionBackendImpl, modes, False, None)
+    impl = _impl(PallasBatchedRPAAttentionBackendImpl, modes, draft, None)
     with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
         impl._build_rpa_kernel(
             None, None, None, use_pcp_streaming=True, cp_kv_cache_interleave_size=1
@@ -383,7 +387,7 @@ def test_dcp_kernels_take_the_modes(monkeypatch):
 # --- the runner marks the draft before building its kernels --------------------
 
 
-def _runner(layers, draft_names):
+def _runner(draft_names):
     runner = MagicMock(spec=TPUModelRunner)
     runner._attention_kernels_initialized = False
     runner.model = None
@@ -413,7 +417,7 @@ def test_runner_marks_draft_layers_before_initialize_kernel():
 
         impl.initialize_kernel.side_effect = record
         layers[name] = SimpleNamespace(impl=impl)
-    runner = _runner(layers, ["mtp.layers.0.self_attn.attn"])
+    runner = _runner(["mtp.layers.0.self_attn.attn"])
     with (
         patch(
             "vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config",
