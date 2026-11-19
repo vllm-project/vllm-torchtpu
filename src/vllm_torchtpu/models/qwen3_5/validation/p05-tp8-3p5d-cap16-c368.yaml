@@ -11,19 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Benchmark point 8: the serve arguments and
+# Benchmark point 5: the serve arguments and
 # environment each leg of the record run used. See README.md in this
 # directory for how to read and use it.
-name: p08-band-e-tp8-2p4d-cap8-c224
-point: 8
+name: p05-tp8-3p5d-cap16-c368
+point: 5
 record:
-  mtok_per_dollar: 136.04
-  p90_interactivity: 329.95
+  mtok_per_dollar: 159.52
+  p90_interactivity: 218.99
   # The record run's decode megakernel mode; this tree has no decode megakernel.
   decode_megakernel: "on (mode ep)"
 decode_layout: "TP8 + DCP4"
-concurrency: 224
-chips: 24
+concurrency: 368
+chips: 32
 # Values the record run used that this tree cannot run yet (README.md).
 not_yet_supported:
   decode:
@@ -31,7 +31,7 @@ not_yet_supported:
     TPU_EXPERT_PLACEMENT: "an expert placement table with 68 slots per rank (64 experts and 4 copies) and placement with expert copies; this tree ships no table and places permutations only"
 legs:
   prefill:
-    replicas: 2
+    replicas: 3
     chips_per_replica: 4
     serve_args:
       - "$MODEL"
@@ -132,7 +132,7 @@ legs:
       VLLM_XLA_CHECK_RECOMPILATION: "0"
     additional_config: {}
   decode:
-    replicas: 4
+    replicas: 5
     chips_per_replica: 4
     serve_args:
       - "$MODEL"
@@ -164,7 +164,7 @@ legs:
       - "--max-num-batched-tokens"
       - "2048"
       - "--max-num-seqs"
-      - "8"
+      - "16"
       - "--no-disable-hybrid-kv-cache-manager"
       - "--attention-backend"
       - "CUSTOM"
