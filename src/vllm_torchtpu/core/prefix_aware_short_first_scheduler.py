@@ -43,6 +43,12 @@ best-ranked long requests in the prefix-aware window are admitted as before.
 Running requests are never capped or preempted by the limit, and a running
 prefill stops counting once its tokens left are at or under the threshold.
 
+With TPU_PREFILL_STEP_FILL=1, a step in which no waiting request can be
+admitted (the queues are empty, or what they hold is held by the limit, not
+ready, or has no free sequence slot) caps the running prefill chunks at the
+step budget instead of the long-prefill threshold, in running order, so a
+lone long prefill takes the whole step instead of half of it.
+
 Enable with --scheduler-cls set to SCHEDULER_CLS and
 TPU_SHORT_PREFILL_FIRST_TOKENS at half of --max-num-batched-tokens.
 """
@@ -85,9 +91,16 @@ class PrefixAwareShortFirstScheduler(ShortPrefillFirstScheduler, PrefixAwareSche
         self._held_ids: set[str] = set()
         self._held_steps = 0
         self._held_requests = 0
+        self.step_fill = envs.TPU_PREFILL_STEP_FILL
+        spec = self.vllm_config.speculative_config
+        self._draft_slots = (
+            spec.max_num_new_slots_for_drafting if spec is not None else 0
+        )
+        # (scheduled-token budget, input-token budget) left in a filling step.
+        self._fill_left: tuple[int, int] | None = None
         logger.info(
             "PrefixAwareShortFirstScheduler ACTIVE (short prompts: at most %d "
-            "uncached tokens; long prefills running at once: %s)",
+            "uncached tokens; long prefills running at once: %s; step fill: %s)",
             self.short_prompt_tokens,
             (
                 f"at most {self.max_long_prefills} over "
@@ -95,14 +108,24 @@ class PrefixAwareShortFirstScheduler(ShortPrefillFirstScheduler, PrefixAwareSche
                 if self.max_long_prefills > 0
                 else "no limit"
             ),
+            "on" if self.step_fill else "off",
         )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self._promoted_from_waiting = []
         held = self._hold_long_requests()
+        self._fill_left = (
+            (
+                self.max_num_scheduled_tokens,
+                self.scheduler_config.max_num_batched_tokens,
+            )
+            if self.step_fill and not self._admittable_waiting()
+            else None
+        )
         try:
             output = super().schedule(throttle_prefills)
         finally:
+            self._fill_left = None
             self._restore_held_requests(held)
         # A promoted prompt admitted to an async KV load schedules no tokens,
         # but it has left the waiting queue and is not reserved for again
@@ -114,6 +137,58 @@ class PrefixAwareShortFirstScheduler(ShortPrefillFirstScheduler, PrefixAwareSche
         ):
             self._skip_promotion = False
         return output
+
+    def _reserve_prefill_lookahead(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+    ) -> int:
+        fill = self._fill_left
+        if (
+            fill is not None
+            and request.status == RequestStatus.RUNNING
+            and request.is_prefill_chunk
+            and not request.has_encoder_inputs
+            and not self.need_mamba_block_aligned_split
+        ):
+            left = (
+                request.num_tokens_with_spec
+                + request.num_output_placeholders
+                - num_computed_tokens
+            )
+            room = min(
+                fill[0],
+                fill[1] - self._draft_slots,
+                self.max_model_len
+                - num_computed_tokens
+                - self.num_sampled_tokens_per_step,
+            )
+            num_new_tokens = max(num_new_tokens, min(left, room))
+        num_new_tokens = super()._reserve_prefill_lookahead(
+            request, num_computed_tokens, num_new_tokens
+        )
+        if fill is not None and num_new_tokens > 0:
+            self._fill_left = (
+                fill[0] - num_new_tokens,
+                fill[1] - num_new_tokens - self._draft_slots,
+            )
+        return num_new_tokens
+
+    def _admittable_waiting(self) -> bool:
+        """Whether the waiting loop could admit a request this step: a free
+        sequence slot and a waiting request that is not held and is ready.
+        Called after _hold_long_requests has taken the held ones out."""
+        free_slots = (
+            self.max_num_running_reqs
+            - len(self.running)
+            - self.num_waiting_for_streaming_input
+        )
+        if free_slots <= 0 or self._pause_state != PauseState.UNPAUSED:
+            return False
+        if any(r.status in _ADMITTABLE for r in self.waiting):
+            return True
+        return any(self._skipped_uncached(r) is not None for r in self.skipped_waiting)
 
     def _promote_short_waiting(self) -> list[Request]:
         """Return the short prompts the step reserves budget for: the ready

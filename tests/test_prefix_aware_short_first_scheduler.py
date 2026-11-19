@@ -62,11 +62,18 @@ def model_dir(tmp_path_factory):
 
 
 def _scheduler(
-    cls, model_dir, monkeypatch, num_blocks=40_000, max_long=0, long_tokens=16_384
+    cls,
+    model_dir,
+    monkeypatch,
+    num_blocks=40_000,
+    max_long=0,
+    long_tokens=16_384,
+    step_fill=False,
 ):
     monkeypatch.setenv("TPU_SHORT_PREFILL_FIRST_TOKENS", str(SHORT))
     monkeypatch.setenv("TPU_PREFILL_MAX_LONG_RUNNING", str(max_long))
     monkeypatch.setenv("TPU_PREFILL_LONG_TOKENS", str(long_tokens))
+    monkeypatch.setenv("TPU_PREFILL_STEP_FILL", "1" if step_fill else "0")
     model_config = ModelConfig(
         model=model_dir, skip_tokenizer_init=True, max_model_len=131072
     )
@@ -496,3 +503,124 @@ def test_the_limit_off_schedules_as_the_class_without_it(model_dir, monkeypatch)
         traces.append(trace)
     assert traces[0] == traces[1]
     assert scheduler._held_steps == 0
+
+
+# --- Step fill (TPU_PREFILL_STEP_FILL) ----------------------------------------
+
+
+def _filling(model_dir, monkeypatch, step_fill=True, max_long=1, **kwargs):
+    return _scheduler(
+        PrefixAwareShortFirstScheduler,
+        model_dir,
+        monkeypatch,
+        max_long=max_long,
+        long_tokens=L,
+        step_fill=step_fill,
+        **kwargs,
+    )
+
+
+def test_a_lone_long_prefill_with_empty_queues_takes_the_whole_step(
+    model_dir, monkeypatch
+):
+    off = _filling(model_dir, monkeypatch, step_fill=False)
+    on = _filling(model_dir, monkeypatch)
+    for scheduler in (off, on):
+        scheduler.add_request(_request("long", 20_000))
+        assert _step(scheduler) == {"long": LONG}
+    assert _step(off) == {"long": LONG}
+    assert _step(on) == {"long": BUDGET}
+
+
+def test_a_lone_long_prefill_beside_an_admittable_short_keeps_its_cap(
+    model_dir, monkeypatch
+):
+    scheduler = _filling(model_dir, monkeypatch)
+    scheduler.add_request(_request("long", 20_000))
+    _step(scheduler)
+    scheduler.add_request(_request("short", 500, first_token=100_000))
+    assert _step(scheduler) == {"long": LONG, "short": 500}
+
+
+def test_a_lone_long_prefill_with_only_held_longs_waiting_takes_the_whole_step(
+    model_dir, monkeypatch
+):
+    scheduler = _filling(model_dir, monkeypatch)
+    scheduler.add_request(_request("long1", 20_000))
+    _step(scheduler)
+    scheduler.add_request(_request("long2", 20_000, first_token=100_000))
+    assert _step(scheduler) == {"long1": BUDGET}
+    assert _ids(scheduler.waiting) == ["long2"]
+
+
+def test_running_prefills_fill_the_step_in_running_order(model_dir, monkeypatch):
+    off = _filling(model_dir, monkeypatch, step_fill=False, max_long=0)
+    on = _filling(model_dir, monkeypatch, max_long=0)
+    for scheduler in (off, on):
+        scheduler.add_request(_request("long1", 5000))
+        scheduler.add_request(_request("long2", 20_000, first_token=100_000))
+        assert _step(scheduler) == {"long1": LONG, "long2": LONG}
+    assert _step(off) == {"long1": LONG, "long2": LONG}
+    # long1 has 2,952 tokens left; long2 takes what the step has after it.
+    assert _step(on) == {"long1": 2952, "long2": BUDGET - 2952}
+
+
+class _NoFill(PrefixAwareShortFirstScheduler):
+    def _admittable_waiting(self):
+        return True
+
+
+def test_step_fill_off_schedules_as_the_class_without_it(model_dir, monkeypatch):
+    prompts = {
+        "a": 30_000,
+        "b": 700,
+        "c": 12_000,
+        "d": 1900,
+        "e": 64,
+        "f": 2049,
+        "g": 25_000,
+        "h": 300,
+        "i": 5000,
+        "j": 3500,
+        "k": 40_000,
+    }
+    traces = []
+    for scheduler in (
+        _scheduler(_NoFill, model_dir, monkeypatch, max_long=1, long_tokens=L),
+        _filling(model_dir, monkeypatch, step_fill=False),
+    ):
+        trace = []
+        pending = list(prompts.items())
+        while scheduler.requests or pending:
+            if pending and len(trace) % 2 == 0:
+                req_id, prompt = pending.pop(0)
+                scheduler.add_request(
+                    _request(req_id, prompt, first_token=100_000 * (ord(req_id) - 96))
+                )
+            trace.append(_step(scheduler))
+            assert len(trace) < 300
+        traces.append(trace)
+    assert traces[0] == traces[1]
+
+
+def test_every_prompt_token_is_computed_once_with_step_fill(model_dir, monkeypatch):
+    prompts = {"a": 30_000, "b": 700, "c": 12_000, "d": 1900, "e": 64, "f": 2049}
+    prompts |= {"g": 25_000, "h": 300, "i": 5000}
+    scheduler = _filling(model_dir, monkeypatch)
+    prefilled = dict.fromkeys(prompts, 0)
+    pending = list(prompts.items())
+    steps = 0
+    while scheduler.requests or pending:
+        if pending and steps % 3 == 0:
+            req_id, prompt = pending.pop(0)
+            scheduler.add_request(
+                _request(req_id, prompt, first_token=100_000 * (ord(req_id) - 96))
+            )
+        scheduled = _step(scheduler)
+        assert scheduled
+        assert sum(scheduled.values()) <= BUDGET
+        for req_id, tokens in scheduled.items():
+            prefilled[req_id] += min(tokens, prompts[req_id] - prefilled[req_id])
+        steps += 1
+        assert steps < 200
+    assert prefilled == prompts

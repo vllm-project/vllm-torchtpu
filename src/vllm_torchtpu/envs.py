@@ -146,6 +146,7 @@ if TYPE_CHECKING:
     TPU_SHORT_PREFILL_FIRST_TOKENS: int = 0
     TPU_PREFILL_MAX_LONG_RUNNING: int = 0
     TPU_PREFILL_LONG_TOKENS: int = 16384
+    TPU_PREFILL_STEP_FILL: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -1537,6 +1538,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_PREFILL_MAX_LONG_RUNNING", 0
     ),
     "TPU_PREFILL_LONG_TOKENS": env_nonnegative_int("TPU_PREFILL_LONG_TOKENS", 16384),
+    # PrefixAwareShortFirstScheduler: in a step where no waiting request can be
+    # admitted, running prefill chunks take the whole step budget instead of
+    # the long-prefill threshold.
+    "TPU_PREFILL_STEP_FILL": env_bool("TPU_PREFILL_STEP_FILL"),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
