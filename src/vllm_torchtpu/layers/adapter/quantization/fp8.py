@@ -406,11 +406,6 @@ def _quantize_and_format_single_moe_weight(
     return w, w_scale
 
 
-# Bytes of the float32 copy one requantization chunk dequantizes at a time.
-# The quantized chunk, its scales and the formatting temporaries come on top.
-_REQUANT_CHUNK_BYTES = 1 << 30
-
-
 def _requantize_expert_chunks(
     weight: torch.Tensor,
     scale: torch.Tensor | None,
@@ -431,7 +426,7 @@ def _requantize_expert_chunks(
     """
     num_experts = weight.shape[0]
     per_expert = weight[0].numel() * 4
-    per_chunk = max(1, _REQUANT_CHUNK_BYTES // per_expert)
+    per_chunk = max(1, envs.TPU_MOE_REQUANT_CHUNK_BYTES // per_expert)
     weights, scales = [], []
     for start in range(0, num_experts, per_chunk):
         end = min(start + per_chunk, num_experts)
