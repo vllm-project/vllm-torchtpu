@@ -1061,11 +1061,10 @@ def patch_moe_expert_write_staging() -> None:
         ] = {}
         try:
             for module in model.modules():
+                if not isinstance(module, LinearBase):
+                    continue
                 qm = getattr(module, "quant_method", None)
-                if not (
-                    isinstance(module, LinearBase)
-                    and isinstance(qm, QuantizeMethodBase)
-                ):
+                if not isinstance(qm, QuantizeMethodBase):
                     continue
                 qm_id = id(qm)
                 if qm_id not in saved_qms:
