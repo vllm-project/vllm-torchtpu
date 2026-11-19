@@ -97,6 +97,18 @@ def _partials(t, h, n):
     return gen
 
 
+def _ref_block(t, n):
+    """f32 sum of this rank's row block of the partials, from a bf16
+    all-to-all (exact data movement: an f32 all-reduce of this size does not
+    run under the SparseCore hierarchical all-reduce flags)."""
+
+    def ref(v):
+        r = jax.lax.all_to_all(v, AXIS, 0, 0, tiled=True)
+        return r.astype(jnp.float32).reshape(n, t // n, -1).sum(0)
+
+    return ref
+
+
 _COLL = re.compile(
     r"\b(all-reduce|all-gather|reduce-scatter|all-to-all)(-start|-done)?\(", re.I
 )
@@ -162,7 +174,7 @@ def main():
     for t in args.tokens:
         seed = jax.device_put(jnp.zeros((n, 1), jnp.int32), sh)
         x = smap(_partials(t, args.hidden, n))(seed)
-        ref = smap(lambda v: jax.lax.psum(v.astype(jnp.float32), AXIS))(x)
+        ref = smap(_ref_block(t, n))(x)
         base_ms = None
         for name in names:
             ar = modes[name]
@@ -173,7 +185,11 @@ def main():
                 return v
 
             def err(v, r, ar=ar):
-                o = ar(v).astype(jnp.float32)
+                # This rank's row block of the result against its f32 sum.
+                blk = t // n
+                o = jax.lax.dynamic_slice_in_dim(
+                    ar(v), jax.lax.axis_index(AXIS) * blk, blk, axis=0
+                ).astype(jnp.float32)
                 e = jnp.sum((o - r) ** 2)
                 s = jnp.sum(r**2)
                 return jnp.stack([e, s]).reshape(1, 2)
