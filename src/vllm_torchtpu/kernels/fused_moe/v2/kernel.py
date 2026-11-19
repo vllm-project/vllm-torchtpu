@@ -634,6 +634,7 @@ def _build_fused_ep_moe_kernel(
     has_w2_bias=False,
     wire_dtype=None,
     ep_tp_size=1,
+    ep_tp_z_clone=False,
 ):
     """Build the pallas_call and the function that invokes it.
 
@@ -643,6 +644,16 @@ def _build_fused_ep_moe_kernel(
             f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}"
         )
     ep_tp_size = int(ep_tp_size)
+    ep_tp_z_clone = bool(ep_tp_z_clone)
+    if ep_tp_z_clone and (
+        ep_tp_size != 2
+        or weight_format != host.WeightFormat.FP8
+        or has_w1_bias
+        or has_w2_bias
+    ):
+        raise ValueError(
+            "ep_tp_z_clone requires ep_tp_size=2, FP8 weights, and no expert biases"
+        )
     if ep_tp_size < 1 or ep % ep_tp_size:
         raise ValueError(f"ep={ep} must be divisible by ep_tp_size={ep_tp_size}")
     inter_slice = inter // ep_tp_size
@@ -1021,6 +1032,10 @@ def _build_fused_ep_moe_kernel(
         # for their row geometry, which the send waits count bytes against.
         contrib_hbm = next(it)
         cscl_hbm = next(it)
+        if ep_tp_z_clone:
+            z_w1_hbm, z_w2_hbm, z_w1s_hbm, z_w2s_hbm = (next(it) for _ in range(4))
+        else:
+            z_w1_hbm = z_w2_hbm = z_w1s_hbm = z_w2s_hbm = None
         # Two independent refs (rather than a leading slot dimension) let the
         # scalar core branch once per activation tile and then use static SMEM
         # indexing for all of that tile's token rows.
@@ -1070,6 +1085,10 @@ def _build_fused_ep_moe_kernel(
             tp_w1s_s_sem, tp_w1s_r_sem = (next(it) for _ in range(2))
             tp_w2s_s_sem, tp_w2s_r_sem = (next(it) for _ in range(2))
             tp_bar_sem = next(it)
+            if ep_tp_z_clone:
+                z_send_sems, z_recv_sems = (next(it) for _ in range(2))
+            else:
+                z_send_sems = z_recv_sems = None
         else:
             tp_w2s_vm = None
             tp_w1p_vm = None
@@ -1079,10 +1098,19 @@ def _build_fused_ep_moe_kernel(
             tp_w1s_s_sem = tp_w1s_r_sem = None
             tp_w2s_s_sem = tp_w2s_r_sem = None
             tp_bar_sem = None
+            z_send_sems = z_recv_sems = None
 
         me = rank_sm[0, 0]
         tp_grp = lax.div(me, jnp.int32(ep_tp_size))
         tp_me = lax.rem(me, jnp.int32(ep_tp_size))
+        if ep_tp_z_clone:
+            z_push_phys = rank_sm[0, 1]
+            z_recv_step = rank_sm[0, 2]
+            z_peer_rank = rank_sm[0, 3]
+        else:
+            z_push_phys = jnp.int32(-1)
+            z_recv_step = jnp.int32(-1)
+            z_peer_rank = jnp.int32(0)
 
         def sync(src, dst):
             """Copy `src` into `dst` and wait for it before returning."""
@@ -1152,6 +1180,43 @@ def _build_fused_ep_moe_kernel(
 
         prologue()
         _all_pairs_barrier(ep)
+        if ep_tp_z_clone:
+
+            @pl.when(z_push_phys >= 0)
+            def _():
+                z_peer = (z_peer_rank,)
+                pltpu.make_async_remote_copy(
+                    src_ref=w1_hbm.at[z_push_phys],
+                    dst_ref=z_w1_hbm.at[0],
+                    send_sem=z_send_sems.at[0],
+                    recv_sem=z_recv_sems.at[0],
+                    device_id=z_peer,
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+                pltpu.make_async_remote_copy(
+                    src_ref=w2_hbm.at[z_push_phys],
+                    dst_ref=z_w2_hbm.at[0],
+                    send_sem=z_send_sems.at[1],
+                    recv_sem=z_recv_sems.at[1],
+                    device_id=z_peer,
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+                pltpu.make_async_remote_copy(
+                    src_ref=w1s_hbm.at[z_push_phys, pl.ds(0, 2 * inter_slice)],
+                    dst_ref=z_w1s_hbm.at[0, pl.ds(0, 2 * inter_slice)],
+                    send_sem=z_send_sems.at[2],
+                    recv_sem=z_recv_sems.at[2],
+                    device_id=z_peer,
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+                pltpu.make_async_remote_copy(
+                    src_ref=w2s_hbm.at[z_push_phys, pl.ds(0, hidden)],
+                    dst_ref=z_w2s_hbm.at[0, pl.ds(0, hidden)],
+                    send_sem=z_send_sems.at[3],
+                    recv_sem=z_recv_sems.at[3],
+                    device_id=z_peer,
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
 
         def tp_barrier(step):
             bpar = lax.rem(step, jnp.int32(2))
@@ -1196,6 +1261,24 @@ def _build_fused_ep_moe_kernel(
                 return visit_sm[ep_tp_size + 1 + m, step]
             return m * g_local + visit_sm[m, step]
 
+        def _z_wait_recv():
+            pltpu.make_async_copy(
+                z_w1_hbm.at[0], z_w1_hbm.at[0], z_recv_sems.at[0]
+            ).wait()
+            pltpu.make_async_copy(
+                z_w2_hbm.at[0], z_w2_hbm.at[0], z_recv_sems.at[1]
+            ).wait()
+            pltpu.make_async_copy(
+                z_w1s_hbm.at[0, pl.ds(0, 2 * inter_slice)],
+                z_w1s_hbm.at[0, pl.ds(0, 2 * inter_slice)],
+                z_recv_sems.at[2],
+            ).wait()
+            pltpu.make_async_copy(
+                z_w2s_hbm.at[0, pl.ds(0, hidden)],
+                z_w2s_hbm.at[0, pl.ds(0, hidden)],
+                z_recv_sems.at[3],
+            ).wait()
+
         def tp_w1_local_start(step, s):
             """Own gate/up half of this core's expert at `step` into slot `s`."""
             pltpu.make_async_copy(
@@ -1204,9 +1287,51 @@ def _build_fused_ep_moe_kernel(
                 w1_sems.at[s],
             ).start(priority=WEIGHT_DMA_PRIORITY)
 
+        def tp_w1_local_or_z(step, s):
+            if not ep_tp_z_clone:
+                tp_w1_local_start(step, s)
+                return
+
+            @pl.when(step != z_recv_step)
+            def _():
+                tp_w1_local_start(step, s)
+
+            @pl.when(step == z_recv_step)
+            def _():
+                pltpu.make_async_copy(
+                    z_w1_hbm.at[0],
+                    w1_vm.at[s],
+                    w1_sems.at[s],
+                ).start(priority=WEIGHT_DMA_PRIORITY)
+
         def tp_w1_peer_start(step, s):
             """Push this core's half of the PEER's expert at `step` into the
             peer's slot `s`; the peer does the same for this core."""
+            if ep_tp_z_clone:
+
+                @pl.when(step != z_recv_step)
+                def _():
+                    pltpu.make_async_remote_copy(
+                        src_ref=w1_hbm.at[_tp_expert(tp_peer, step)],
+                        dst_ref=tp_w1p_vm.at[s],
+                        send_sem=tp_w1_s_sem.at[s],
+                        recv_sem=tp_w1_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                @pl.when(step == z_recv_step)
+                def _():
+                    pltpu.make_async_remote_copy(
+                        src_ref=z_w1_hbm.at[0],
+                        dst_ref=tp_w1p_vm.at[s],
+                        send_sem=tp_w1_s_sem.at[s],
+                        recv_sem=tp_w1_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                return
             pltpu.make_async_remote_copy(
                 src_ref=w1_hbm.at[_tp_expert(tp_peer, step)],
                 dst_ref=tp_w1p_vm.at[s],
@@ -1219,6 +1344,96 @@ def _build_fused_ep_moe_kernel(
         def tp_scales_starts(step, s):
             """Scale tables for `step` into slot `s`, own half at position 0
             locally and this core's half at position 1 on the peer."""
+            if ep_tp_z_clone:
+
+                @pl.when(step != z_recv_step)
+                def _():
+                    exp_me = _tp_expert(tp_me, step)
+                    exp_pr = _tp_expert(tp_peer, step)
+                    pltpu.make_async_copy(
+                        w1s_hbm.at[exp_me, pl.ds(0, inter_slice)],
+                        w1s_vm.at[s, pl.ds(0, inter_slice)],
+                        w1s_sems.at[s],
+                    ).start(priority=WEIGHT_DMA_PRIORITY)
+                    pltpu.make_async_copy(
+                        w1s_hbm.at[exp_me, pl.ds(inter_slice, inter_slice)],
+                        w1s_vm.at[s, pl.ds(inter, inter_slice)],
+                        w1s_sems.at[s],
+                    ).start(priority=WEIGHT_DMA_PRIORITY)
+                    pltpu.make_async_copy(
+                        w2s_hbm.at[exp_me, pl.ds(0, hidden)],
+                        tp_w2s_vm.at[s, pl.ds(0, hidden)],
+                        w2s_sems.at[s],
+                    ).start(priority=WEIGHT_DMA_PRIORITY)
+                    pltpu.make_async_remote_copy(
+                        src_ref=w1s_hbm.at[exp_pr, pl.ds(0, inter_slice)],
+                        dst_ref=w1s_vm.at[s, pl.ds(inter_slice, inter_slice)],
+                        send_sem=tp_w1s_s_sem.at[s],
+                        recv_sem=tp_w1s_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+                    pltpu.make_async_remote_copy(
+                        src_ref=w1s_hbm.at[exp_pr, pl.ds(inter_slice, inter_slice)],
+                        dst_ref=w1s_vm.at[s, pl.ds(inter + inter_slice, inter_slice)],
+                        send_sem=tp_w1s_s_sem.at[s],
+                        recv_sem=tp_w1s_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+                    pltpu.make_async_remote_copy(
+                        src_ref=w2s_hbm.at[exp_pr, pl.ds(0, hidden)],
+                        dst_ref=tp_w2s_vm.at[s, pl.ds(hidden, hidden)],
+                        send_sem=tp_w2s_s_sem.at[s],
+                        recv_sem=tp_w2s_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                @pl.when(step == z_recv_step)
+                def _():
+                    _z_wait_recv()
+                    pltpu.make_async_copy(
+                        z_w1s_hbm.at[0, pl.ds(0, inter_slice)],
+                        w1s_vm.at[s, pl.ds(0, inter_slice)],
+                        w1s_sems.at[s],
+                    ).start(priority=WEIGHT_DMA_PRIORITY)
+                    pltpu.make_async_copy(
+                        z_w1s_hbm.at[0, pl.ds(inter_slice, inter_slice)],
+                        w1s_vm.at[s, pl.ds(inter, inter_slice)],
+                        w1s_sems.at[s],
+                    ).start(priority=WEIGHT_DMA_PRIORITY)
+                    pltpu.make_async_copy(
+                        z_w2s_hbm.at[0, pl.ds(0, hidden)],
+                        tp_w2s_vm.at[s, pl.ds(0, hidden)],
+                        w2s_sems.at[s],
+                    ).start(priority=WEIGHT_DMA_PRIORITY)
+                    pltpu.make_async_remote_copy(
+                        src_ref=z_w1s_hbm.at[0, pl.ds(0, inter_slice)],
+                        dst_ref=w1s_vm.at[s, pl.ds(inter_slice, inter_slice)],
+                        send_sem=tp_w1s_s_sem.at[s],
+                        recv_sem=tp_w1s_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+                    pltpu.make_async_remote_copy(
+                        src_ref=z_w1s_hbm.at[0, pl.ds(inter_slice, inter_slice)],
+                        dst_ref=w1s_vm.at[s, pl.ds(inter + inter_slice, inter_slice)],
+                        send_sem=tp_w1s_s_sem.at[s],
+                        recv_sem=tp_w1s_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+                    pltpu.make_async_remote_copy(
+                        src_ref=z_w2s_hbm.at[0, pl.ds(0, hidden)],
+                        dst_ref=tp_w2s_vm.at[s, pl.ds(hidden, hidden)],
+                        send_sem=tp_w2s_s_sem.at[s],
+                        recv_sem=tp_w2s_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                return
             exp_me = _tp_expert(tp_me, step)
             exp_pr = _tp_expert(tp_peer, step)
             pltpu.make_async_copy(
@@ -1268,7 +1483,49 @@ def _build_fused_ep_moe_kernel(
                 w2_sems.at[0],
             ).start(priority=WEIGHT_DMA_PRIORITY)
 
+        def tp_w2_local_or_z(step):
+            if not ep_tp_z_clone:
+                tp_w2_local_start(step)
+                return
+
+            @pl.when(step != z_recv_step)
+            def _():
+                tp_w2_local_start(step)
+
+            @pl.when(step == z_recv_step)
+            def _():
+                pltpu.make_async_copy(
+                    z_w2_hbm.at[0],
+                    w2_vm.at[0],
+                    w2_sems.at[0],
+                ).start(priority=WEIGHT_DMA_PRIORITY)
+
         def tp_w2_peer_start(step, s):
+            if ep_tp_z_clone:
+
+                @pl.when(step != z_recv_step)
+                def _():
+                    pltpu.make_async_remote_copy(
+                        src_ref=w2_hbm.at[_tp_expert(tp_peer, step)],
+                        dst_ref=tp_w2p_vm.at[s],
+                        send_sem=tp_w2_s_sem.at[s],
+                        recv_sem=tp_w2_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                @pl.when(step == z_recv_step)
+                def _():
+                    pltpu.make_async_remote_copy(
+                        src_ref=z_w2_hbm.at[0],
+                        dst_ref=tp_w2p_vm.at[s],
+                        send_sem=tp_w2_s_sem.at[s],
+                        recv_sem=tp_w2_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                return
             pltpu.make_async_remote_copy(
                 src_ref=w2_hbm.at[_tp_expert(tp_peer, step)],
                 dst_ref=tp_w2p_vm.at[s],
@@ -1280,7 +1537,7 @@ def _build_fused_ep_moe_kernel(
 
         def tp_w2_starts(step, s):
             """Down slab for `step`: own half locally and peer half into slot `s`."""
-            tp_w2_local_start(step)
+            tp_w2_local_or_z(step)
             tp_w2_peer_start(step, s)
 
         def tp_wait_scales(s):
@@ -1348,6 +1605,18 @@ def _build_fused_ep_moe_kernel(
             def _():
                 s = lax.rem(visit_i, jnp.int32(tp_w1p_slots))
                 tp_barrier(visit_i)
+                if ep_tp_z_clone:
+
+                    @pl.when(visit_i + 1 == z_recv_step)
+                    def _():
+                        if tp_w1_slots == 1:
+                            pltpu.make_async_copy(
+                                z_w1_hbm.at[0], w1_vm.at[0], w1_sems.at[0]
+                            ).start(priority=WEIGHT_DMA_PRIORITY)
+                        pltpu.make_async_copy(
+                            z_w2_hbm.at[0], w2_vm.at[0], w2_sems.at[0]
+                        ).start(priority=WEIGHT_DMA_PRIORITY)
+
                 if tp_w2p_slots == 1:
                     tp_w2_peer_start(visit_i + 1, jnp.int32(0))
 
@@ -1355,7 +1624,7 @@ def _build_fused_ep_moe_kernel(
                 def _():
                     tp_scales_starts(visit_i + 2, s)
                     if tp_w1_slots > 1:
-                        tp_w1_local_start(visit_i + 2, s)
+                        tp_w1_local_or_z(visit_i + 2, s)
                     tp_w1_peer_start(visit_i + 2, s)
                     if tp_w2p_slots > 1:
                         tp_w2_peer_start(visit_i + 2, s)
@@ -2093,7 +2362,13 @@ def _build_fused_ep_moe_kernel(
                                 (
                                     lambda: pl.when(
                                         jnp.logical_and(
-                                            last_tile, visit_i + 1 < n_tp_visit
+                                            last_tile,
+                                            jnp.logical_and(
+                                                visit_i + 1 < n_tp_visit,
+                                                visit_i + 1 != z_recv_step,
+                                            )
+                                            if ep_tp_z_clone
+                                            else visit_i + 1 < n_tp_visit,
                                         )
                                     )(
                                         lambda: tp_w1_local_start(
@@ -2125,7 +2400,13 @@ def _build_fused_ep_moe_kernel(
                                 (
                                     lambda: pl.when(
                                         jnp.logical_and(
-                                            last_tile, visit_i + 1 < n_tp_visit
+                                            last_tile,
+                                            jnp.logical_and(
+                                                visit_i + 1 < n_tp_visit,
+                                                visit_i + 1 != z_recv_step,
+                                            )
+                                            if ep_tp_z_clone
+                                            else visit_i + 1 < n_tp_visit,
                                         )
                                     )(lambda: tp_w2_local_start(visit_i + 1))
                                 )
@@ -2368,7 +2649,7 @@ def _build_fused_ep_moe_kernel(
             @pl.when(n_tp_visit > 0)
             def _():
                 tp_scales_starts(jnp.int32(0), jnp.int32(0))
-                tp_w1_local_start(jnp.int32(0), jnp.int32(0))
+                tp_w1_local_or_z(jnp.int32(0), jnp.int32(0))
                 tp_w1_peer_start(jnp.int32(0), jnp.int32(0))
                 tp_w2_starts(jnp.int32(0), jnp.int32(0))
 
@@ -2376,7 +2657,7 @@ def _build_fused_ep_moe_kernel(
                 def _():
                     tp_scales_starts(jnp.int32(1), jnp.int32(1))
                     if tp_w1_slots > 1:
-                        tp_w1_local_start(jnp.int32(1), jnp.int32(1))
+                        tp_w1_local_or_z(jnp.int32(1), jnp.int32(1))
                     tp_w1_peer_start(jnp.int32(1), jnp.int32(1))
                     if tp_w2p_slots > 1:
                         tp_w2_peer_start(jnp.int32(1), jnp.int32(1))
@@ -2402,15 +2683,22 @@ def _build_fused_ep_moe_kernel(
                 @pl.when(rows == 0)
                 def _():
                     tp_wait_w1(w1_s, s)
+                    next_is_local = (
+                        jnp.logical_and(
+                            visit_i + 1 < n_tp_visit, visit_i + 1 != z_recv_step
+                        )
+                        if ep_tp_z_clone
+                        else visit_i + 1 < n_tp_visit
+                    )
                     if tp_w1_slots == 1:
 
-                        @pl.when(visit_i + 1 < n_tp_visit)
+                        @pl.when(next_is_local)
                         def _():
                             tp_w1_local_start(visit_i + 1, jnp.int32(0))
 
                     tp_wait_w2(w2p_s)
 
-                    @pl.when(visit_i + 1 < n_tp_visit)
+                    @pl.when(next_is_local)
                     def _():
                         tp_w2_local_start(visit_i + 1)
 
@@ -2468,6 +2756,27 @@ def _build_fused_ep_moe_kernel(
             _rows_wait(mehop_scl_sem, rscl_hbm, count(host.COUNT_SELF_MIRROR))
 
         drain_transport()
+        if ep_tp_z_clone:
+
+            @pl.when(z_push_phys >= 0)
+            def _():
+                pltpu.make_async_copy(
+                    z_w1_hbm.at[0], z_w1_hbm.at[0], z_send_sems.at[0]
+                ).wait()
+                pltpu.make_async_copy(
+                    z_w2_hbm.at[0], z_w2_hbm.at[0], z_send_sems.at[1]
+                ).wait()
+                pltpu.make_async_copy(
+                    z_w1s_hbm.at[0, pl.ds(0, 2 * inter_slice)],
+                    z_w1s_hbm.at[0, pl.ds(0, 2 * inter_slice)],
+                    z_send_sems.at[2],
+                ).wait()
+                pltpu.make_async_copy(
+                    z_w2s_hbm.at[0, pl.ds(0, hidden)],
+                    z_w2s_hbm.at[0, pl.ds(0, hidden)],
+                    z_send_sems.at[3],
+                ).wait()
+
         _all_pairs_barrier(ep)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
@@ -2582,6 +2891,14 @@ def _build_fused_ep_moe_kernel(
                 pltpu.SemaphoreType.DMA((tp_scl_slots,)),  # tp_w2s_r_sem
                 pltpu.SemaphoreType.REGULAR((2,)),  # tp_bar_sem
             ]
+            + (
+                [
+                    pltpu.SemaphoreType.DMA((4,)),  # z_send_sems
+                    pltpu.SemaphoreType.DMA((4,)),  # z_recv_sems
+                ]
+                if ep_tp_z_clone
+                else []
+            )
             if ep_tp_size > 1
             else []
         )
@@ -2625,6 +2942,17 @@ def _build_fused_ep_moe_kernel(
                 jnp.float32,
             ),
         ]
+        if ep_tp_z_clone:
+            out_shape.extend(
+                [
+                    jax.ShapeDtypeStruct(
+                        (1, hidden, 2 * inter_slice), form.weight_dtype
+                    ),
+                    jax.ShapeDtypeStruct((1, inter_slice, hidden), form.weight_dtype),
+                    jax.ShapeDtypeStruct((ROWBLK, 2 * inter_slice), jnp.float32),
+                    jax.ShapeDtypeStruct((ROWBLK, hidden), jnp.float32),
+                ]
+            )
         # Each suffix appears only when its feature is on, so a kernel that
         # fuses silu on eight-bit float weights with no biases keeps the name
         # it had before any of those operands existed, and every fingerprint
@@ -2642,6 +2970,8 @@ def _build_fused_ep_moe_kernel(
             bias_tag += "_bf16wire"
         if ep_tp_size > 1:
             bias_tag += f"_eptp{ep_tp_size}"
+        if ep_tp_z_clone:
+            bias_tag += "_zclone"
         name = (
             f"fused_ep_moe_v2"
             f"{format_tag}"
@@ -2753,7 +3083,7 @@ def _build_fused_ep_moe_kernel(
             *scale_args,
             *biases,
         )
-        recv, rscl, _contrib, _contrib_scl = res
+        recv, rscl = res[0], res[1]
         return recv, rscl
 
     return fn
