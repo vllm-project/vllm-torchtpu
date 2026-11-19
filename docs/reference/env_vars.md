@@ -79,8 +79,9 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |
 | `QUANTIZE_ON_LOAD_PREFIXES` | `[]` | Comma-separated dot-bounded module prefix names to quantize to FP8 on load (e.g., `"self_attn,shared_experts,layers.0.mlp"`), including `VocabParallelEmbedding` and `ParallelLMHead`. |
-| `REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time linear weight requantization. |
-| `REQUANTIZE_BLOCK_SIZE` | `None` | Target subchannel block size for load-time linear weight requantization. |
+| `REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time linear weight requantization (e.g., `"float8_e4m3fn"` or `"fp4"` with `ENABLE_QUANTIZED_MATMUL_KERNEL=1`). |
+| `REQUANTIZE_BLOCK_SIZE` | `None` | Target subchannel block size for load-time linear weight requantization (defaults to `512` when `REQUANTIZE_WEIGHT_DTYPE="fp4"`). |
+| `REQUANTIZE_FP4_PREFIXES` | `[]` | Optional comma-separated dot-bounded module prefixes allowed to requantize to `FP4` when `REQUANTIZE_WEIGHT_DTYPE="fp4"`; empty allows all eligible `LinearBase` layers. |
 | `TPU_FP8_LINEAR_W8A16_MAX_ROWS` | `0` | Opt-in. FP8 dense-linear steps whose padded token bucket has at most this many rows keep bf16 activations (W8A16) instead of quantizing them to FP8. Per-channel path with FP8 weights only; measured on v7x. |
 | `TPU_GDN_QKVZ_KERNEL_LAYOUT` | `False` | Opt-in. Stores the GDN `in_proj_qkvz` weight in the matmul's (k, n) layout instead of vLLM's [n_out, n_in], removing a per-step weight copy on the per-block FP8 path. Ignored with prefill context parallelism; the experimental AOT export rejects it at TP > 1. |
 | `TPU_GDN_SSM_STATE_QUANT` | `""` | Opt-in GDN recurrent state compression (`"int8_block16"`). Packs 16-element `K`-blocks into `INT8` with `FP32` scales (1.25 B/element, 3.2x smaller than `FP32`) when `head_k_dim % 128 == 0` and `PCP == 1`. |

@@ -22,7 +22,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2 import calculate_tiling, gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.logger import init_logger
 
@@ -185,16 +185,32 @@ def quantized_matmul(
     return out_2d.reshape(orig_out_shape)
 
 
+def _fp4_linear_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes: int, fuse_act):
+    """Reserve 35% scoped-VMEM headroom for W4A8 FP4->FP8 upcast and block scales.
+
+    `gmm_v2.calculate_tiling` sizes double-buffered `lhs`, `rhs`, and `out`
+    scratch against `vmem_limit_bytes`, while W4A8 (`maybe_quantize_lhs=True`
+    with 4-bit `rhs`) also materializes per-tile `FP8`-widened `rhs` blocks and
+    `FP32` block-scale temporaries inside Pallas scoped VMEM (~35% of VMEM on
+    wide `K=8192, N=18432` projections).
+    """
+    return calculate_tiling(
+        dims, lhs_cfgs, rhs_cfgs, int(vmem_limit_bytes * 0.65), fuse_act
+    )
+
+
 def _quantized_matmul_fp4_jax(
     x: jax.Array, w_q: jax.Array, w_s: jax.Array
 ) -> jax.Array:
-    """W4A16 dense matmul for NVFP4 weights via gmm_v2 (single group).
+    """Dense matmul for native K-major FP4 weights via gmm_v2 (single group).
 
     `w_q` is the native fp4 weight in K-major layout [n_in, n_out] (unpacked at
     load); it only needs a leading group axis for the gmm_v2 rhs layout
     [1, n_in, n_out]. `w_s` is the fused fp32 block scale [1, num_blocks, 1,
-    n_out]. gmm_v2 selects the regime from the block size: block-16 dequantizes
-    the fp4 weight per block and keeps bf16 activations (W4A16).
+    n_out]. gmm_v2 selects W4A16 when block < mxu_column_size and W4A8 when
+    block >= mxu_column_size. Single-group dense matmul visits all `x.shape[0]`
+    rows, so `zero_initialize=False` avoids allocating the zero-fill VMEM
+    scratch and issuing a redundant zeroing DMA.
     """
     rhs = w_q[None]  # [n_in, n_out] fp4 -> [1, n_in, n_out]
     return gmm_v2(
@@ -203,9 +219,10 @@ def _quantized_matmul_fp4_jax(
         group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
         rhs_scale=w_s,
         group_offset=jnp.array([0], dtype=jnp.int32),
+        tile_info=_fp4_linear_tiling,
         preferred_element_type=x.dtype,
         maybe_quantize_lhs=True,
-        zero_initialize=True,
+        zero_initialize=False,
     )
 
 

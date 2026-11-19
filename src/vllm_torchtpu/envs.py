@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
+    REQUANTIZE_FP4_PREFIXES: list[str] = []
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
@@ -593,6 +594,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
     ),
+    # Optional comma-separated dot-bounded module prefixes allowed to requantize
+    # to FP4 when REQUANTIZE_WEIGHT_DTYPE=fp4; empty allows all eligible layers.
+    "REQUANTIZE_FP4_PREFIXES": lambda: [
+        p.strip()
+        for p in os.getenv("REQUANTIZE_FP4_PREFIXES", "").split(",")
+        if p.strip()
+    ],
     # Opt-in W8A16 for small FP8 dense-linear steps. A step whose padded token
     # bucket (from compile_sizes, not the number of live requests) has at most
     # this many rows keeps bf16 activations against the FP8 weights instead of
