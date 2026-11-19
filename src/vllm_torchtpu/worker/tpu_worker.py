@@ -365,8 +365,24 @@ class TPUWorker(WorkerBase):
                 local_world = os.environ.get("LOCAL_WORLD_SIZE") or pc.world_size
                 local_rank_for_init = int(self.local_rank)
                 debug_local_rank_offset = envs.DEBUG_TPU_LOCAL_RANK_OFFSET
-                tpu_local_rank_env = local_rank_for_init + debug_local_rank_offset
+                physical_local_rank = envs.TPU_PHYSICAL_LOCAL_RANK
+                base_local_rank = (
+                    physical_local_rank
+                    if physical_local_rank is not None
+                    else local_rank_for_init
+                )
+                tpu_local_rank_env = base_local_rank + debug_local_rank_offset
                 tpu_local_world = int(local_world)
+                if physical_local_rank is not None:
+                    logger.info(
+                        "Ascending TPU device binding | rank=%d "
+                        "engine_local_rank=%d -> physical_local_rank=%d "
+                        "tpu_local_world=%d",
+                        self.rank,
+                        local_rank_for_init,
+                        tpu_local_rank_env,
+                        tpu_local_world,
+                    )
                 if debug_local_rank_offset:
                     tpu_local_world = max(
                         tpu_local_world, debug_local_rank_offset + pc.world_size

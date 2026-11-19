@@ -268,6 +268,8 @@ if TYPE_CHECKING:
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
     VLLM_TPU_DEBUG_PCP_LAYOUT: bool = False
     TPU_LOCAL_RANK_OFFSET: int = 0
+    TPU_ASCENDING_DEVICE_ORDER: str = "auto"
+    TPU_PHYSICAL_LOCAL_RANK: int | None = None
     VLLM_TPU_DEVICE_ORDER: str = ""
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
     TORCH_TPU_BASE_PORT: int = 8070
@@ -1886,6 +1888,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Added to every worker's local rank when it binds to a physical chip.
     # worker/tpu_rank_binding.py reads it from the env mapping it is given.
     "TPU_LOCAL_RANK_OFFSET": env_int("TPU_LOCAL_RANK_OFFSET", 0),
+    # Align global ranks 0..N-1 to physical TPU global device IDs 0..N-1.
+    # "auto" enables when DCP > 1 (and PCP == DP == PP == 1); "1"/"0" force on/off.
+    "TPU_ASCENDING_DEVICE_ORDER": lambda: os.getenv(
+        "TPU_ASCENDING_DEVICE_ORDER", "auto"
+    ),
+    # Per-worker physical LOCAL_RANK override assigned by RayDistributedExecutorV2
+    # when ascending device ordering is active; unset uses engine local_rank.
+    "TPU_PHYSICAL_LOCAL_RANK": env_optional_int("TPU_PHYSICAL_LOCAL_RANK"),
     # Physical device index per local rank ("0,2,1,3,4,6,5,7"); empty = native.
     "VLLM_TPU_DEVICE_ORDER": lambda: os.getenv("VLLM_TPU_DEVICE_ORDER", ""),
     # Same offset for the legacy worker init path; debug only.
