@@ -142,6 +142,9 @@ def _format_runtime_metrics_ports(chip_ids: Sequence[int]) -> str:
     When TPU_RUNTIME_METRICS_PORTS is unset, libtpu queries GCE TPU VM metadata
     (8431,8432,...) and indexes by local slice rank, causing independent stages
     on the same host to collide on local rank 0's port 8431.
+
+    Each chip gets port 8431 + chip_id. This assumes host-local chip IDs and
+    that ports 8431-8438 are free on an 8-chip host.
     """
     return ",".join(
         str(_BASE_TPU_RUNTIME_METRICS_PORT + chip_id) for chip_id in chip_ids
