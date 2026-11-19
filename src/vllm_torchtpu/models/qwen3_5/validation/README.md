@@ -5,9 +5,9 @@ against:
 
 - `pNN-*.yaml`: five benchmark points of Qwen3.5-397B-A17B-FP8, each a
   prefill/decode disaggregated deployment.
-  `pNN` is the point's number on the published throughput/interactivity curve
-  and `band-X` its interactivity band, from A (lowest interactivity, highest
-  throughput per dollar) to H. The rest of the name is the decode layout, the
+  `pNN` is the point's number on the published throughput/interactivity curve,
+  from p01 (lowest interactivity, highest throughput per dollar) to p12. The
+  rest of the name is the decode layout, the
   prefill and decode replica counts (`4p3d`: four prefill and three decode
   replicas), the decode leg's `--max-num-seqs` (`capN`) and the benchmark
   concurrency (`cN`). The `t3` at the end of p12's name stands for the
