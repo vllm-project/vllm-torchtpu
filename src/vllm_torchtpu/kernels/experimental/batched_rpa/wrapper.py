@@ -978,13 +978,14 @@ def ragged_paged_attention(
         skip_kv_update=skip_kv_update,
         mask_invalid_v=mask_invalid_v,
     )
-    tpu_info = pltpu.get_tpu_info()
-    if serve_cfgs.native_fp8.any() and not tpu_info.fp8_ops_per_second:
-        raise ValueError(
-            f"native_fp8={serve_cfgs.native_fp8} runs matmuls in fp8 on the MXU, "
-            f"which this chip ({tpu_info.chip_version}) does not have; leave "
-            "native_fp8 off."
-        )
+    tpu_info = configs.get_tpu_info()
+    for name in ("native_fp8", "native_fp8_prefill"):
+        modes = getattr(serve_cfgs, name)
+        if modes.any() and not tpu_info.fp8_ops_per_second:
+            raise ValueError(
+                f"{name}={modes} runs matmuls in fp8 on the MXU, which this chip "
+                f"({tpu_info.chip_version}) does not have; leave {name} off."
+            )
 
     if prepared_inputs is None:
         q_hbm, new_kv_hbm = prepare_inputs(
