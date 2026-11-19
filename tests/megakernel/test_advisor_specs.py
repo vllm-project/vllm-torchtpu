@@ -740,3 +740,126 @@ def test_validate_declared_layouts_rejects_non_dividing_or_unknown_owner_groups(
         models.validate_declared_layouts("kimi-k3", bad_preset)
     with pytest.raises(KeyError):
         models.validate_declared_layouts("unknown-preset-slug", bad_preset)
+
+
+def test_declared_collectives_and_expert_modes_validate_schema() -> None:
+    """Validate declared collective steps, expert row rules, and 6-axis pcp keys."""
+    kimi_preset = advisor.DEPLOYMENT_PRESETS["kimi-k3"]
+    assert kimi_preset.decode is not None
+    assert kimi_preset.decode.megakernel is not None
+    kimi_decode_coll = advisor.parse_declared_collectives(
+        kimi_preset.decode.megakernel["collectives"]
+    )
+    assert kimi_decode_coll is not None
+    expected_kimi_all_reduces = 94
+    assert kimi_decode_coll.all_reduces == expected_kimi_all_reduces
+    assert [step.kind for step in kimi_decode_coll.steps] == [
+        "routed_transport",
+        "dcp_gather",
+    ]
+
+    qwen_preset = advisor.DEPLOYMENT_PRESETS["qwen3.5-397b"]
+    assert qwen_preset.decode is not None
+    assert qwen_preset.decode.megakernel is not None
+    raw_rules = qwen_preset.decode.megakernel["expert_mode_by_rows"]
+    parsed_rules = advisor.parse_expert_mode_rules(raw_rules)
+    tp_row_limit = 12
+    ep_row_limit = 800
+    assert [(rule.max_rows, rule.mode) for rule in parsed_rules] == [
+        (tp_row_limit, "tp"),
+        (ep_row_limit, "ep"),
+    ]
+    qwen_decode_coll = advisor.parse_declared_collectives(
+        qwen_preset.decode.megakernel["collectives"]
+    )
+    assert qwen_decode_coll is not None
+    assert [
+        (step.kind, step.group_size, step.calls_per_layer)
+        for step in qwen_decode_coll.steps
+    ] == [
+        ("split_kv", 4, 2),
+    ]
+
+    for bad_collectives in (
+        {"all_reduces": -1},
+        {"all_reduces": True},
+        {"steps": [{"kind": "unknown_op", "group_size": 4}]},
+        {"steps": [{"kind": "split_kv", "group_size": 6}]},
+        {"steps": [{"kind": "split_kv", "group_size": 1}]},
+        {"steps": [{"kind": "split_kv", "group_size": 4, "calls_per_layer": 0}]},
+    ):
+        with pytest.raises(errors.MegakernelConfigError):
+            models.parse_parallel_layout(
+                {
+                    "tp": 8,
+                    "ep": 8,
+                    "megakernel": {
+                        "source": "invalid collective schema check",
+                        "scopes": ["whole_step"],
+                        "ranks": 8,
+                        "collectives": bad_collectives,
+                    },
+                }
+            )
+
+    for bad_rules in (
+        [],
+        [{"max_rows": 0, "mode": "tp"}],
+        [{"max_rows": 16, "mode": "tp"}, {"max_rows": 12, "mode": "ep"}],
+        [{"max_rows": 12, "mode": "tp"}, {"max_rows": 12, "mode": "ep"}],
+        [{"max_rows": 12, "mode": "invalid_mode"}],
+    ):
+        with pytest.raises(errors.MegakernelConfigError):
+            models.parse_parallel_layout(
+                {
+                    "tp": 8,
+                    "ep": 8,
+                    "megakernel": {
+                        "source": "invalid expert_mode_by_rows check",
+                        "scopes": ["whole_step"],
+                        "ranks": 8,
+                        "expert_mode_by_rows": bad_rules,
+                    },
+                }
+            )
+
+    pcp_one_layout = models.parse_parallel_layout(
+        {
+            "tp": 32,
+            "ep": 16,
+            "pcp": 1,
+            "megakernel": {
+                "source": "pcp=1 prefill layout",
+                "scopes": ["whole_step"],
+                "phases": ["prefill"],
+                "ranks": 32,
+            },
+        }
+    )
+    pcp_two_layout = models.parse_parallel_layout(
+        {
+            "tp": 32,
+            "ep": 16,
+            "pcp": 2,
+            "megakernel": {
+                "source": "pcp=2 prefill layout",
+                "scopes": ["whole_step"],
+                "phases": ["prefill"],
+                "ranks": 32,
+            },
+        }
+    )
+    distinct_pcp_preset = models.DeploymentPreset(
+        decode=models.parse_parallel_layout({"tp": 32, "ep": 32, "dcp": 32}),
+        prefill=pcp_one_layout,
+        megakernel_layouts=(pcp_two_layout,),
+    )
+    models.validate_declared_layouts("kimi-k3", distinct_pcp_preset)
+
+    duplicate_pcp_preset = models.DeploymentPreset(
+        decode=models.parse_parallel_layout({"tp": 32, "ep": 32, "dcp": 32}),
+        prefill=pcp_two_layout,
+        megakernel_layouts=(pcp_two_layout,),
+    )
+    with pytest.raises(errors.MegakernelConfigError, match="Duplicate megakernel"):
+        models.validate_declared_layouts("kimi-k3", duplicate_pcp_preset)
