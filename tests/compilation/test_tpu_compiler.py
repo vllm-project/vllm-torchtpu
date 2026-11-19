@@ -89,7 +89,13 @@ class TestTpuCompilerCache:
         num_gpu_blocks=1024,
         mamba_cache_mode="none",
         prefix_match_unit=None,
+        mm_encoder_attn_backend=None,
     ):
+        mm_config = (
+            None
+            if mm_encoder_attn_backend is None
+            else SimpleNamespace(mm_encoder_attn_backend=mm_encoder_attn_backend)
+        )
         return SimpleNamespace(
             cache_config=SimpleNamespace(
                 gpu_memory_utilization=0.9,
@@ -100,7 +106,9 @@ class TestTpuCompilerCache:
                 prefix_match_unit=prefix_match_unit,
             ),
             model_config=SimpleNamespace(
-                max_model_len=4096, architecture="Qwen3_5MoeForCausalLM"
+                max_model_len=4096,
+                architecture="Qwen3_5MoeForCausalLM",
+                multimodal_config=mm_config,
             ),
             scheduler_config=SimpleNamespace(
                 max_num_batched_tokens=2048,
@@ -131,6 +139,32 @@ class TestTpuCompilerCache:
 
         assert base != different_batch
         assert base != different_kv
+
+    def test_tpu_hash_covers_mm_encoder_attn_backend(self):
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+        from vllm_torchtpu.layers.adapter.attention_backend import (
+            ensure_flywheel_enum_registered,
+        )
+
+        flywheel = ensure_flywheel_enum_registered()
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            unset = compute_tpu_compilation_hash(self._config())
+            flash = compute_tpu_compilation_hash(
+                self._config(mm_encoder_attn_backend=AttentionBackendEnum.FLASH_ATTN)
+            )
+            sdpa = compute_tpu_compilation_hash(
+                self._config(mm_encoder_attn_backend=AttentionBackendEnum.TORCH_SDPA)
+            )
+            fw = compute_tpu_compilation_hash(
+                self._config(mm_encoder_attn_backend=flywheel)
+            )
+
+        assert len({unset, flash, sdpa, fw}) == 4
 
     def test_tpu_hash_covers_gdn_prefill_checkpoint_gate_only(self):
         """The hash follows prefill_checkpoint_enabled, not its raw inputs."""
@@ -223,6 +257,7 @@ class TestTpuCompilerCache:
             "jax": "1",
             "jaxlib": "1",
             "libtpu": "1",
+            "flywheel-tpu": "1",
         }
         with patch(
             "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",

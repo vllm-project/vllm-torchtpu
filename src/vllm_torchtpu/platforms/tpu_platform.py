@@ -722,6 +722,64 @@ class TpuPlatform(Platform):
         return selected_backend.get_path()
 
     @classmethod
+    def get_supported_vit_attn_backends(cls) -> list["AttentionBackendEnum"]:
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        from vllm_torchtpu.layers.adapter.attention_backend import (
+            ensure_flywheel_enum_registered,
+        )
+
+        flywheel_enum = ensure_flywheel_enum_registered()
+        return [
+            AttentionBackendEnum.FLASH_ATTN,
+            flywheel_enum,
+            AttentionBackendEnum.TORCH_SDPA,
+        ]
+
+    @classmethod
+    def get_vit_attn_backend(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        backend: "AttentionBackendEnum | None" = None,
+    ) -> "AttentionBackendEnum":
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        from vllm_torchtpu.layers.adapter.attention_backend import (
+            MAX_FLYWHEEL_VIT_HEAD_DIM,
+        )
+
+        supported = cls.get_supported_vit_attn_backends()
+        if backend is not None:
+            if backend not in supported:
+                supported_names = [b.name.lower() for b in supported]
+                raise ValueError(
+                    f"[TpuPlatform] --mm-encoder-attn-backend {backend.name.lower()} "
+                    f"is not supported on TPU (head_size={head_size}, dtype={dtype}). "
+                    f"Supported backends: {supported_names}."
+                )
+            if (
+                backend.name == "FLYWHEEL"
+                and not 0 < head_size <= MAX_FLYWHEEL_VIT_HEAD_DIM
+            ):
+                raise ValueError(
+                    f"[TpuPlatform] --mm-encoder-attn-backend flywheel requires "
+                    f"0 < head_size <= {MAX_FLYWHEEL_VIT_HEAD_DIM}, got "
+                    f"head_size={head_size}. Use --mm-encoder-attn-backend "
+                    "flash_attn or torch_sdpa."
+                )
+            logger.info_once(
+                "Using configured %s backend for TPU ViT attention.", backend.name
+            )
+            return backend
+
+        default_backend = AttentionBackendEnum.FLASH_ATTN
+        logger.info_once(
+            "Using default %s backend for TPU ViT attention.", default_backend.name
+        )
+        return default_backend
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return hardware.get_tpu_device_name()
 
