@@ -185,6 +185,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_QSEL_ASYNC: bool = False
     VLLM_TPU_MK_QSA_XREQ_PREFETCH: int = 0
     VLLM_TPU_MK_QSA_SELECT_NVIS: int = 0
+    VLLM_TPU_MK_AR_HIER_SMALL: bool = False
     VLLM_TPU_MK_WHOLE_L47: bool = False
     VLLM_TPU_MK_WHOLE_L45: bool = False
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
@@ -1304,6 +1305,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (exact: the rows past n_vis are invisible and add nothing). 2: also the union
     # compaction of union attention (slot windows past the union skipped).
     "VLLM_TPU_MK_QSA_SELECT_NVIS": env_int("VLLM_TPU_MK_QSA_SELECT_NVIS", 0),
+    # Whole-step megakernel: the sublayer all-reduce of buckets up to 8 rows runs hier=1
+    # (2 rounds, full-width pair sum) instead of hier=2 (3 rounds). Exact: both round each
+    # pair sum to bf16 and add the 4 pair sums in f32 in pair order; the consumer
+    # (HCBlock._combine) rounds the total to bf16, which hier=2 already did
+    # (tests/megakernel/test_stream_comm.py). exos c16 env ctx 20K: b4 -29, b8 -43 us per
+    # call, same output hash; b16 +44, b32 +241 (kept on hier=2).
+    "VLLM_TPU_MK_AR_HIER_SMALL": env_bool("VLLM_TPU_MK_AR_HIER_SMALL"),
     # Whole-step megakernel: also run the last QSA layer (model layer 47) in the whole-step
     # call, as a one-layer kernel after layers 3..46, its step tokens written with theirs;
     # the stock L47 attention core and last segment kernel are skipped.
