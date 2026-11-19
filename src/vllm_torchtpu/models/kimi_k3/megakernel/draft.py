@@ -54,7 +54,14 @@ from vllm_torchtpu.logger import init_logger
 
 from . import draft_mla
 from .common.constants import AXIS_TP, GIB_BYTES, REV_PREFIX_LEN, ROPE_POS_SLACK
-from .draft_mla import BANK_FIELDS, DECISION_COLS, DRAFT_VECTOR_LEN
+from .draft_mla import (
+    BANK_FIELDS,
+    DECISION_COLS,
+    DRAFT_VECTOR_LEN,
+    seed_draft_vector_cpu,
+    seed_draft_vector_jax,
+    settle_tpu_anchor,
+)
 from .program import TP_SIZE, kernel_modules
 from .runtime_shim.bridge import (
     OpRegistrationSpec,
@@ -98,7 +105,8 @@ def _settled(state: DraftState) -> DraftState:
     continuing states (torch_tpu otherwise compiles a tensor's deferred work
     into the graph of the next op taking it).
     """
-    synchronize_tpu([state.cache, state.positions, state.vector])
+    if state.cache.device.type == "tpu":
+        synchronize_tpu([state.cache, state.positions, state.vector])
     return state
 
 
@@ -366,19 +374,102 @@ class DsparkDraft:
             )
         return wall
 
+    def _build_init_vector(self) -> Callable[..., tuple[torch.Tensor, ...]]:
+        """Build or return the mesh-replicated draft vector initializer custom op."""
+        key = ("init_vector",)
+        if key in self._ops:
+            return self._ops[key]
+        rows = int(self.dspark.ROWS)
+        bonus_idx = int(self.dspark.OUT_BONUS)
+
+        def fn(anchor: jax.Array) -> tuple[jax.Array]:
+            """Seed a replicated ``[1, 128]`` draft vector with ``anchor``."""
+            # Built on the device either way, then settled with its state: the draft ops
+            # compile per operand history (see _settled).
+            return (seed_draft_vector_jax(anchor, rows, bonus_idx),)
+
+        self._ops[key] = register_global_op(
+            "pallas::k3_dspark_init_vector",
+            self.mesh,
+            fn,
+            OpRegistrationSpec(
+                in_specs=(P(),),
+                out_specs=(P(),),
+                export_key=repr(("dspark_init_vector", rows, bonus_idx)),
+            ),
+        )
+        return self._ops[key]
+
+    def _build_init_state(self) -> Callable[..., tuple[torch.Tensor, ...]]:
+        """Build or return the mesh-sharded cold draft state initializer custom op."""
+        key = ("init_state",)
+        if key in self._ops:
+            return self._ops[key]
+        cfg = self.config
+        rows = int(self.dspark.ROWS)
+        bonus_idx = int(self.dspark.OUT_BONUS)
+
+        def fn(anchor: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+            """Allocate cold ring cache, positions, and seeded draft vector on mesh."""
+            cache = jnp.zeros(
+                (TP_SIZE, cfg.layers, cfg.window, 2 * cfg.head_dim),
+                dtype=jnp.bfloat16,
+            )
+            positions = jnp.full((1, cfg.window), -1, dtype=jnp.int32)
+            vector = seed_draft_vector_jax(anchor, rows, bonus_idx)
+            return (cache, positions, vector)
+
+        self._ops[key] = register_global_op(
+            "pallas::k3_dspark_init_state",
+            self.mesh,
+            fn,
+            OpRegistrationSpec(
+                in_specs=(P(),),
+                out_specs=(P(AXIS_TP), P(), P()),
+                export_key=repr(
+                    (
+                        "dspark_init_state",
+                        rows,
+                        bonus_idx,
+                        dataclasses.astuple(cfg),
+                    )
+                ),
+            ),
+        )
+        return self._ops[key]
+
+    def _target_device(self, anchor: int | torch.Tensor) -> torch.device:
+        """Resolve target device from resident draft weights or ``anchor``."""
+        if self.weights:
+            return next(iter(self.weights.values())).device
+        if isinstance(anchor, torch.Tensor):
+            return anchor.device
+        return torch.device("tpu")
+
     def new_state(self, anchor: int | torch.Tensor) -> DraftState:
         """Return a cold draft state seeded with ``anchor``.
 
         The next verify starts with ``anchor`` followed by ``anchor`` repeated
         as placeholder drafts that are rejected on the first verify.
         """
+        dev = self._target_device(anchor)
+        if dev.type == "tpu":
+            anchor_t = settle_tpu_anchor(anchor, dev)
+            cache, positions, vector = self._build_init_state()(anchor_t)
+            return _settled(DraftState(cache, positions, vector))
         cfg = self.config
         cache = torch.zeros(
             (1, cfg.layers, cfg.window, 2 * cfg.head_dim),
             dtype=torch.bfloat16,
-        ).to("tpu")
-        positions = torch.full((1, cfg.window), -1, dtype=torch.int32).to("tpu")
-        return _settled(DraftState(cache, positions, self._vector(anchor)))
+            device=dev,
+        )
+        positions = torch.full(
+            (1, cfg.window),
+            -1,
+            dtype=torch.int32,
+            device=dev,
+        )
+        return _settled(DraftState(cache, positions, self._vector(anchor, device=dev)))
 
     def from_ring(
         self,
@@ -392,25 +483,26 @@ class DsparkDraft:
         (``[1, window]``) come from ``KdaImporter.import_ring``; the next
         verify starts with ``anchor`` and placeholder drafts.
         """
-        return _settled(DraftState(cache, positions, self._vector(anchor)))
+        dev = cache.device
+        if dev.type == "tpu":
+            anchor_t = settle_tpu_anchor(anchor, dev)
+            (vector,) = self._build_init_vector()(anchor_t)
+            return _settled(DraftState(cache, positions, vector))
+        return _settled(DraftState(cache, positions, self._vector(anchor, device=dev)))
 
-    def _vector(self, anchor: int | torch.Tensor) -> torch.Tensor:
+    def _vector(
+        self,
+        anchor: int | torch.Tensor,
+        *,
+        device: torch.device | str = "cpu",
+    ) -> torch.Tensor:
         """Allocate and seed a ``[1, 128]`` draft output vector with ``anchor``."""
-        # Built on the device either way, then settled with its state: the
-        # draft ops compile per operand history (see _settled).
-        vector = torch.full((1, DRAFT_VECTOR_LEN), -1, dtype=torch.int32).to("tpu")
-        anchor_t = (
-            anchor
-            if isinstance(anchor, torch.Tensor)
-            else torch.tensor([int(anchor)], dtype=torch.int32).to("tpu")
+        return seed_draft_vector_cpu(
+            anchor,
+            int(self.dspark.ROWS),
+            int(self.dspark.OUT_BONUS),
+            device=device,
         )
-        anchor_t = anchor_t.reshape(1).to(torch.int32)
-        vector[0, : self.dspark.ROWS - 1] = anchor_t
-        vector[0, self.dspark.OUT_BONUS] = anchor_t[0]
-        # Indexed writes leave a flat backing buffer even after _settled; the clone has
-        # draft outputs' [1, 128] backing, so mixes of new and continuing states share
-        # an executable.
-        return vector.clone()
 
     def synthetic_rates_for(self, drafts: int) -> tuple[float, ...] | None:
         """Return synthetic acceptance rates configured for ``drafts`` width."""
@@ -801,6 +893,13 @@ class DsparkDraft:
                         priority=2 * rows,
                     )
                 )
+        anchor = torch.empty((1,), dtype=torch.int32)
+        calls.extend(
+            (
+                CompileCall(self._build_init_state(), (anchor,), {}, priority=1),
+                CompileCall(self._build_init_vector(), (anchor,), {}, priority=1),
+            )
+        )
         return calls
 
     def step_batched(

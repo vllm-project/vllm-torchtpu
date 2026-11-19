@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
@@ -29,6 +30,7 @@ import pytest
 import torch
 from jax.experimental import pallas as pl
 from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.models.kimi_k3.megakernel import (
     config as kernel_config,
@@ -36,6 +38,8 @@ from vllm_torchtpu.models.kimi_k3.megakernel import (
 from vllm_torchtpu.models.kimi_k3.megakernel import (
     decode,
     decode_ops,
+    draft,
+    draft_mla,
     draft_ring,
     pools,
     program,
@@ -46,6 +50,9 @@ from vllm_torchtpu.models.kimi_k3.megakernel.kernels import (
     decode_megakernel as kernel,
 )
 from vllm_torchtpu.models.kimi_k3.megakernel.kernels import dspark
+from vllm_torchtpu.models.kimi_k3.megakernel.kernels import (
+    dspark_mla as dspark_mla_mod,
+)
 from vllm_torchtpu.models.kimi_k3.megakernel.layout import (
     CONV_HEAD_ROWS,
     CONV_TAPS,
@@ -53,12 +60,15 @@ from vllm_torchtpu.models.kimi_k3.megakernel.layout import (
     KDA_HEADS,
 )
 from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import backend, bridge
+from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import (
+    program as shim_program,
+)
 from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
     MegakernelEngineConfig,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from jax.typing import DTypeLike
 
@@ -71,6 +81,22 @@ _REAL_PALLAS_CALL = pl.pallas_call
 # Mask bit 14 of float32 low-16 half so CPU Pallas interpret does not
 # canonicalize bfloat16 NaN payloads (0x7F81..0x7FFF) on the bfloat16 pool.
 _NON_BF16_NAN_LOW16_MASK = ~0x4000 & 0xFFFFFFFF
+_TEST_ANCHOR_TOKEN = 17
+_TEST_MAX_POS = 1024
+_TEST_RING_LEN = 12
+_REAL_TORCH_TENSOR = torch.tensor
+_REAL_TORCH_ZEROS = torch.zeros
+_REAL_TORCH_ONES = torch.ones
+_REAL_TORCH_FULL = torch.full
+_REAL_TORCH_FROM_NUMPY = torch.from_numpy
+_REAL_TORCH_DEVICE = torch.device
+
+
+@dataclasses.dataclass(frozen=True)
+class _SyntheticDevice:
+    """Synthetic torch-like device descriptor for CPU-backed TPU tests."""
+
+    type: str = "tpu"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -167,6 +193,409 @@ class _StubCommWorkspace:
     """Minimal collective workspace stub carrying reduction_phase."""
 
     reduction_phase: jax.Array
+
+
+@dataclasses.dataclass(frozen=True)
+class _StubKdaImporter:
+    """Importer double wrapping test callbacks for decoder bind and step tests."""
+
+    import_state: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, int],
+        tuple[torch.Tensor, torch.Tensor],
+    ]
+    mla_layer_names: tuple[str, ...]
+    kda_layer_names: tuple[str, ...]
+    raw_pools: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    mla_raw: list[int] = dataclasses.field(default_factory=list)
+
+    def bind(self, _caches: object, _dtype: str) -> int:
+        """Return synthetic unified block count."""
+        return _POOL_BLOCKS
+
+    def import_ring(
+        self,
+        draft_config: dspark.DraftConfig | dspark_mla_mod.MlaDraftConfig,
+        _kda_blocks: torch.Tensor,
+        _length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return a cold synthetic TPU draft ring pair."""
+        _ = draft_config
+        cfg = dspark.DraftConfig()
+        ring_cache = _as_fake_tpu(
+            _REAL_TORCH_ZEROS(
+                (1, cfg.layers, cfg.window, 2 * cfg.head_dim),
+                dtype=torch.bfloat16,
+            ),
+        )
+        ring_pos = _as_fake_tpu(
+            _REAL_TORCH_FULL((1, cfg.window), -1, dtype=torch.int32)
+        )
+        return ring_cache, ring_pos
+
+
+@dataclasses.dataclass
+class _AdmitDecodeOpsDouble:
+    """DecodeOps double for decoder admission and batched speculation sync tests."""
+
+    rank: int
+    num_slots: int
+    attention_dp: int
+    batch_sizes: tuple[int, ...]
+    slots: list[torch.Tensor]
+    importer: _StubKdaImporter
+    recorded_modes: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    events: list[str] = dataclasses.field(default_factory=list)
+    mesh: object = dataclasses.field(default_factory=object)
+    unified_pools: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    pool_map: list[int] | None = None
+
+    def load_weights(self) -> None:
+        """No-op weight load for CPU decode-admission tests."""
+
+    def use_unified_pools(
+        self,
+        _raw: Sequence[torch.Tensor],
+        _mla: Sequence[int],
+    ) -> None:
+        """No-op unified pool bind for CPU decode-admission tests."""
+
+    def cached_op(
+        self,
+        key: object,
+        _factory: Callable[[], object],
+    ) -> object:
+        """Return the stub KDA importer or a pass-through control/enter op."""
+        if key == ("kda_importer", None):
+            return self.importer
+        return lambda control, *_rest: (control,)
+
+    def batch_for(self, _rows: int) -> int:
+        """Return the single compiled batch size."""
+        return self.batch_sizes[0]
+
+    def plain_step(
+        self,
+        control: torch.Tensor,
+        _shape: object,
+        *,
+        sampled: bool,
+        mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return synthetic greedy emissions and pass control through."""
+        _ = (sampled, mask)
+        return (
+            _REAL_TORCH_ZEROS((1, decode.KimiDecoder.WIDTH), dtype=torch.int32),
+            control,
+        )
+
+    def verify_batched(
+        self,
+        _spec: object,
+        _layout: object,
+        control_and_modes: tuple[torch.Tensor, torch.Tensor],
+        *,
+        synthetic_rates: tuple[float, ...] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Record modes tensor passed into batched verify and return dummy outputs."""
+        _ = synthetic_rates
+        _, modes_t = control_and_modes
+        self.events.append("verify_batched")
+        self.recorded_modes.append(modes_t)
+        dummy = _as_fake_tpu(_REAL_TORCH_ZEROS((1,), dtype=torch.int32))
+        return dummy, dummy, dummy
+
+
+@dataclasses.dataclass
+class _StubSpecDraft:
+    """Minimal DSpark draft double exercising batched speculation modes sync."""
+
+    config: dspark.DraftConfig = dataclasses.field(default_factory=dspark.DraftConfig)
+    aux_layers: tuple[int, ...] = (0,)
+    uses_unified_pools: bool = False
+    weights: dict[str, torch.Tensor] = dataclasses.field(
+        default_factory=lambda: {"w": _as_fake_tpu(_REAL_TORCH_ZEROS((1,)))},
+    )
+
+    def load_weights(self) -> float:
+        """No-op weight load returning zero wall time."""
+        return 0.0
+
+    def new_state(self, _zero: torch.Tensor, /) -> draft_mla.MlaDraftState:
+        """Return a minimal synthetic draft state."""
+        return draft_mla.MlaDraftState(
+            _as_fake_tpu(
+                _REAL_TORCH_FULL(
+                    (1, draft_mla.DRAFT_VECTOR_LEN),
+                    -1,
+                    dtype=torch.int32,
+                ),
+            ),
+        )
+
+    def from_ring(
+        self,
+        _cache: torch.Tensor,
+        _positions: torch.Tensor,
+        zero: torch.Tensor,
+        /,
+    ) -> draft_mla.MlaDraftState:
+        """Return a minimal synthetic draft state from an offered ring."""
+        return self.new_state(zero)
+
+    def synthetic_rates_for(self, _drafts: int, /) -> tuple[float, ...] | None:
+        """Return no synthetic acceptance rates."""
+        return None
+
+    def step_single(
+        self,
+        state: draft_mla.MlaDraftState,
+        inputs: decode_ops.DraftStepInputs,
+    ) -> tuple[draft_mla.MlaDraftState, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return unchanged state and dummy single-request outputs."""
+        dummy = _as_fake_tpu(_REAL_TORCH_ZEROS((1,), dtype=torch.int32))
+        return state, dummy, inputs.control_state, dummy
+
+    def step_batched(
+        self,
+        states: Sequence[draft_mla.MlaDraftState],
+        inputs: decode_ops.BatchedDraftStepInputs,
+    ) -> tuple[list[draft_mla.MlaDraftState], torch.Tensor, torch.Tensor]:
+        """Return unchanged states and dummy batched emissions."""
+        emitted = _REAL_TORCH_ZEROS(
+            (len(states), decode.KimiDecoder.WIDTH),
+            dtype=torch.int32,
+        )
+        return list(states), emitted, inputs.control_state
+
+    def compilation_calls(
+        self,
+        _control: decode_ops.Control,
+        _spec_shapes: Sequence[tuple[int, int]],
+        *,
+        spec_alone: bool = False,
+    ) -> list[object]:
+        """Return no precompilation calls for stub draft."""
+        _ = spec_alone
+        return []
+
+
+class _UnboundImporterDecoder(decode.KimiDecoder):
+    """KimiDecoder subclass allowing tests to drop the bound importer cleanly."""
+
+    def drop_importer(self) -> None:
+        """Clear the bound importer to test fail-closed zero-slot admission."""
+        self._importer = None
+
+
+class _CpuTpuCapableTensor(torch.Tensor):
+    """CPU tensor that upgrades to _FakeTpuTensor when .to('tpu') is called."""
+
+    def to(self, *args: object, **kwargs: object) -> torch.Tensor:
+        """Upgrade to _FakeTpuTensor when target device is TPU, else stay on CPU."""
+        target = kwargs.get("device")
+        for arg in args:
+            if isinstance(arg, (_REAL_TORCH_DEVICE, str, _SyntheticDevice)):
+                target = arg
+        is_tpu = target == "tpu" or (
+            isinstance(target, (_REAL_TORCH_DEVICE, _SyntheticDevice))
+            and target.type == "tpu"
+        )
+        clean_kwargs = {k: v for k, v in kwargs.items() if k != "device"}
+        clean_args = tuple(
+            arg
+            for arg in args
+            if not isinstance(arg, (_REAL_TORCH_DEVICE, str, _SyntheticDevice))
+        )
+        converted = super().to(*clean_args, **clean_kwargs)
+        if is_tpu:
+            return converted.as_subclass(_FakeTpuTensor)
+        return converted.as_subclass(torch.Tensor)
+
+
+class _FakeTpuTensor(_CpuTpuCapableTensor):
+    """CPU-backed tensor double reporting device.type == 'tpu'."""
+
+    @property
+    def device(self) -> _SyntheticDevice:
+        """Return a synthetic TPU device descriptor."""
+        return _SyntheticDevice(type="tpu")
+
+    def to(self, *args: object, **kwargs: object) -> _FakeTpuTensor:
+        """Convert dtype on CPU while preserving _FakeTpuTensor."""
+        clean_kwargs = {k: v for k, v in kwargs.items() if k != "device"}
+        clean_args = tuple(
+            arg
+            for arg in args
+            if not isinstance(arg, (_REAL_TORCH_DEVICE, str, _SyntheticDevice))
+        )
+        return torch.Tensor.to(self, *clean_args, **clean_kwargs).as_subclass(
+            _FakeTpuTensor,
+        )
+
+    def contiguous(
+        self,
+        memory_format: torch.memory_format = torch.contiguous_format,
+    ) -> _FakeTpuTensor:
+        """Return a contiguous _FakeTpuTensor on CPU."""
+        return (
+            super().contiguous(memory_format=memory_format).as_subclass(_FakeTpuTensor)
+        )
+
+    def clone(
+        self,
+        *,
+        memory_format: torch.memory_format | None = None,
+    ) -> _FakeTpuTensor:
+        """Return a cloned _FakeTpuTensor on CPU."""
+        return super().clone(memory_format=memory_format).as_subclass(_FakeTpuTensor)
+
+    def reshape(self, *shape: int) -> _FakeTpuTensor:
+        """Return a reshaped _FakeTpuTensor on CPU."""
+        return super().reshape(*shape).as_subclass(_FakeTpuTensor)
+
+
+def _as_fake_tpu(tensor: torch.Tensor) -> _FakeTpuTensor:
+    """Wrap a CPU torch.Tensor as a _FakeTpuTensor."""
+    return tensor.as_subclass(_FakeTpuTensor)
+
+
+def _is_tpu_device(device: object) -> bool:
+    """Return True when device represents a TPU device."""
+    return device == "tpu" or (
+        isinstance(device, (_REAL_TORCH_DEVICE, _SyntheticDevice))
+        and device.type == "tpu"
+    )
+
+
+def _fake_torch_device(device: object) -> object:
+    """Return a synthetic TPU device descriptor for 'tpu', else a torch.device."""
+    if _is_tpu_device(device):
+        return _SyntheticDevice(type="tpu")
+    return _REAL_TORCH_DEVICE(cast("torch.device | str", device))
+
+
+def _fake_torch_tensor(
+    data: object,
+    *,
+    dtype: torch.dtype | None = None,
+    device: object = None,
+) -> torch.Tensor:
+    """Construct a _FakeTpuTensor when device is TPU, else a CPU tensor."""
+    if _is_tpu_device(device):
+        return _as_fake_tpu(_REAL_TORCH_TENSOR(data, dtype=dtype))
+    target_dev = cast("torch.device | str | None", device)
+    return _REAL_TORCH_TENSOR(
+        data,
+        dtype=dtype,
+        device=target_dev,
+    ).as_subclass(_CpuTpuCapableTensor)
+
+
+def _fake_torch_zeros(
+    *size: object,
+    dtype: torch.dtype | None = None,
+    device: object = None,
+) -> torch.Tensor:
+    """Construct a zero tensor supporting synthetic TPU device routing."""
+    shape = (
+        cast("tuple[int, ...]", size[0])
+        if len(size) == 1 and isinstance(size[0], tuple)
+        else cast("tuple[int, ...]", size)
+    )
+    if _is_tpu_device(device):
+        return _as_fake_tpu(_REAL_TORCH_ZEROS(shape, dtype=dtype))
+    target_dev = cast("torch.device | str | None", device)
+    return _REAL_TORCH_ZEROS(
+        shape,
+        dtype=dtype,
+        device=target_dev,
+    ).as_subclass(_CpuTpuCapableTensor)
+
+
+def _fake_torch_ones(
+    *size: object,
+    dtype: torch.dtype | None = None,
+    device: object = None,
+) -> torch.Tensor:
+    """Construct a ones tensor supporting synthetic TPU device routing."""
+    shape = (
+        cast("tuple[int, ...]", size[0])
+        if len(size) == 1 and isinstance(size[0], tuple)
+        else cast("tuple[int, ...]", size)
+    )
+    if _is_tpu_device(device):
+        return _as_fake_tpu(_REAL_TORCH_ONES(shape, dtype=dtype))
+    target_dev = cast("torch.device | str | None", device)
+    return _REAL_TORCH_ONES(
+        shape,
+        dtype=dtype,
+        device=target_dev,
+    ).as_subclass(_CpuTpuCapableTensor)
+
+
+def _fake_torch_full(
+    size: tuple[int, ...],
+    fill_value: float,
+    *,
+    dtype: torch.dtype | None = None,
+    device: object = None,
+) -> torch.Tensor:
+    """Construct a filled tensor supporting synthetic TPU device routing."""
+    if _is_tpu_device(device):
+        return _as_fake_tpu(_REAL_TORCH_FULL(size, fill_value, dtype=dtype))
+    target_dev = cast("torch.device | str | None", device)
+    return _REAL_TORCH_FULL(
+        size,
+        fill_value,
+        dtype=dtype,
+        device=target_dev,
+    ).as_subclass(_CpuTpuCapableTensor)
+
+
+def _fake_torch_from_numpy(ndarray: np.ndarray) -> torch.Tensor:
+    """Wrap torch.from_numpy output so .to('tpu') returns _FakeTpuTensor."""
+    return _REAL_TORCH_FROM_NUMPY(ndarray).as_subclass(_CpuTpuCapableTensor)
+
+
+def _jax_to_fake_tpu(arr: jax.Array) -> _FakeTpuTensor:
+    """Convert a JAX array to a CPU-backed _FakeTpuTensor."""
+    np_arr = np.array(arr, copy=True)
+    if np_arr.dtype.name == "bfloat16":
+        tensor = _REAL_TORCH_FROM_NUMPY(np_arr.view(np.uint16)).view(torch.bfloat16)
+    else:
+        tensor = _REAL_TORCH_FROM_NUMPY(np_arr)
+    return _as_fake_tpu(tensor)
+
+
+def _expected_cold_draft_vector(
+    anchor: int,
+    rows: int,
+    bonus_idx: int,
+) -> torch.Tensor:
+    """Build expected cold draft output vector directly from layout invariants."""
+    expected = _REAL_TORCH_FULL(
+        (1, draft_mla.DRAFT_VECTOR_LEN),
+        -1,
+        dtype=torch.int32,
+    )
+    for col in range(rows - 1):
+        expected[0, col] = anchor
+    expected[0, bonus_idx] = anchor
+    return expected
+
+
+def _expected_dspark_cold_state(
+    cfg: dspark.DraftConfig,
+    anchor: int,
+) -> draft.DraftState:
+    """Build an independent expected cold DSpark state from config and layout."""
+    cache = _REAL_TORCH_ZEROS(
+        (1, cfg.layers, cfg.window, 2 * cfg.head_dim),
+        dtype=torch.bfloat16,
+    )
+    positions = _REAL_TORCH_FULL((1, cfg.window), -1, dtype=torch.int32)
+    vector = _expected_cold_draft_vector(anchor, dspark.ROWS, dspark.OUT_BONUS)
+    return draft.DraftState(cache, positions, vector)
 
 
 @pytest.mark.parametrize(
@@ -632,6 +1061,660 @@ def test_select_verify_kda_rows_matches_accepted_token_offsets() -> None:
             rows_per=4,
             unknown_option=1,
         )
+
+
+def _make_dspark_global_op_registrar(
+    registered_specs: dict[str, bridge.OpRegistrationSpec],
+) -> Callable[
+    [str, Mesh, Callable[..., Sequence[jax.Array]], bridge.OpRegistrationSpec],
+    Callable[..., tuple[torch.Tensor, ...]],
+]:
+    """Build a fake register_global_op slicing P(AXIS_TP) outputs to rank 0."""
+
+    def fake_register_global_op(
+        name: str,
+        _mesh: Mesh,
+        fn: Callable[..., Sequence[jax.Array]],
+        spec: bridge.OpRegistrationSpec,
+    ) -> Callable[..., tuple[torch.Tensor, ...]]:
+        """Capture global op registration and slice TP-sharded outputs to 1 rank."""
+        registered_specs[name] = spec
+
+        def runner(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            """Run global JAX init op and shard P(AXIS_TP) outputs to local rank 0."""
+            jax_args = tuple(jnp.asarray(arg.detach().cpu().numpy()) for arg in args)
+            raw_outs = fn(*jax_args)
+            sliced: list[torch.Tensor] = []
+            for out, out_spec in zip(raw_outs, spec.out_specs, strict=True):
+                if out_spec == P(AXIS_TP):
+                    assert out.shape[0] == program.TP_SIZE
+                    local = out[:1]
+                else:
+                    local = out
+                sliced.append(_jax_to_fake_tpu(local))
+            return tuple(sliced)
+
+        return runner
+
+    return fake_register_global_op
+
+
+def _assert_dspark_state_matches(
+    actual: draft.DraftState,
+    expected: draft.DraftState,
+    synced_batch: list[torch.Tensor],
+) -> None:
+    """Verify a TPU DSpark draft state matches independent reference and was settled."""
+    assert actual.cache.device.type == "tpu"
+    assert torch.equal(actual.cache, expected.cache)
+    assert torch.equal(actual.positions, expected.positions)
+    assert torch.equal(actual.vector, expected.vector)
+    assert synced_batch == [actual.cache, actual.positions, actual.vector]
+
+
+def test_mla_draft_new_state_uses_mesh_init_op_and_matches_cpu() -> None:
+    """Verify MlaDsparkDraft.new_state matches independent oracle and syncs on TPU."""
+    mesh = Mesh(np.array([jax.devices()[0]]), (AXIS_TP,))
+    registered_specs: dict[str, bridge.OpRegistrationSpec] = {}
+    sync_batches: list[tuple[list[torch.Tensor], bool]] = []
+    sync_mod = importlib.import_module("torch_tpu._internal.sync")
+
+    def fake_register_global_op(
+        name: str,
+        _mesh: Mesh,
+        fn: Callable[..., Sequence[jax.Array]],
+        spec: bridge.OpRegistrationSpec,
+    ) -> Callable[..., tuple[torch.Tensor, ...]]:
+        """Capture global op registration and run JAX body on CPU arrays."""
+        registered_specs[name] = spec
+
+        def runner(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            """Convert tensor arguments to JAX arrays and wrap outputs as fake TPU."""
+            jax_args = tuple(jnp.asarray(arg.detach().cpu().numpy()) for arg in args)
+            return tuple(_jax_to_fake_tpu(out) for out in fn(*jax_args))
+
+        return runner
+
+    def fake_sync(tensors: Sequence[torch.Tensor], *, wait: bool = True) -> None:
+        """Record synchronized tensor lists and wait flags."""
+        sync_batches.append((list(tensors), wait))
+
+    expected_vector = _expected_cold_draft_vector(
+        _TEST_ANCHOR_TOKEN,
+        dspark.ROWS,
+        dspark.OUT_BONUS,
+    )
+    with (
+        patch.object(bridge, "kernel_mesh", return_value=(mesh, 0)),
+        patch.object(
+            dspark_mla_mod.MlaDraftConfig,
+            "from_checkpoint",
+            return_value=dspark_mla_mod.MlaDraftConfig(),
+        ),
+        patch.object(
+            bridge,
+            "register_global_op",
+            side_effect=fake_register_global_op,
+        ),
+        patch.object(sync_mod, "synchronize", side_effect=fake_sync),
+        patch.object(torch, "device", side_effect=_fake_torch_device),
+        patch.object(torch, "tensor", side_effect=_fake_torch_tensor),
+        patch.object(torch, "zeros", side_effect=_fake_torch_zeros),
+        patch.object(torch, "full", side_effect=_fake_torch_full),
+    ):
+        mla_draft = draft_mla.MlaDsparkDraft(_TEST_MAX_POS, "unused", Path("unused"))
+        mla_draft.pools = [torch.zeros((1,), dtype=torch.int32)]
+        cpu_state = mla_draft.new_state(_TEST_ANCHOR_TOKEN)
+        assert torch.equal(cpu_state.vector, expected_vector)
+        assert "pallas::k3_dspark_mla_init_state" not in registered_specs
+        assert not sync_batches
+
+        mla_draft.pools = [_as_fake_tpu(torch.zeros((1,), dtype=torch.int32))]
+        tpu_state_int = mla_draft.new_state(_TEST_ANCHOR_TOKEN)
+        tpu_anchor = _as_fake_tpu(
+            _REAL_TORCH_TENSOR([_TEST_ANCHOR_TOKEN], dtype=torch.int32),
+        )
+        tpu_state_tensor = mla_draft.new_state(tpu_anchor)
+
+        assert "pallas::k3_dspark_mla_init_state" in registered_specs
+        init_spec = registered_specs["pallas::k3_dspark_mla_init_state"]
+        assert init_spec.in_specs == (P(),)
+        assert init_spec.out_specs == (P(),)
+        tpu_states = (tpu_state_int, tpu_state_tensor)
+        for state in tpu_states:
+            assert torch.equal(state.vector, expected_vector)
+        assert len(sync_batches) == 2 * len(tpu_states)
+        assert all(wait is False for _, wait in sync_batches)
+        assert sync_batches[1][0] == [tpu_state_int.vector]
+        assert sync_batches[3][0] == [tpu_state_tensor.vector]
+
+
+def test_dspark_draft_new_state_and_from_ring_use_mesh_init_ops() -> None:
+    """Verify DsparkDraft new_state and from_ring match oracle and sync on TPU."""
+    mesh = Mesh(np.array([jax.devices()[0]]), (AXIS_TP,))
+    registered_specs: dict[str, bridge.OpRegistrationSpec] = {}
+    sync_batches: list[tuple[list[torch.Tensor], bool]] = []
+    sync_mod = importlib.import_module("torch_tpu._internal.sync")
+
+    def fake_sync(tensors: Sequence[torch.Tensor], *, wait: bool = True) -> None:
+        """Record synchronized tensor lists and wait flags."""
+        sync_batches.append((list(tensors), wait))
+
+    with (
+        patch.object(draft, "kernel_mesh", return_value=(mesh, 0)),
+        patch.object(
+            dspark.DraftConfig,
+            "from_checkpoint",
+            return_value=dspark.DraftConfig(),
+        ),
+        patch.object(
+            draft,
+            "register_global_op",
+            side_effect=_make_dspark_global_op_registrar(registered_specs),
+        ),
+        patch.object(sync_mod, "synchronize", side_effect=fake_sync),
+        patch.object(torch, "device", side_effect=_fake_torch_device),
+        patch.object(torch, "tensor", side_effect=_fake_torch_tensor),
+        patch.object(torch, "zeros", side_effect=_fake_torch_zeros),
+        patch.object(torch, "full", side_effect=_fake_torch_full),
+    ):
+        dspark_draft = draft.DsparkDraft(_TEST_MAX_POS, "unused", Path("unused"))
+        cfg = dspark_draft.config
+        expected_state = _expected_dspark_cold_state(cfg, _TEST_ANCHOR_TOKEN)
+        cpu_anchor = torch.tensor([_TEST_ANCHOR_TOKEN], dtype=torch.int32)
+        cpu_new = dspark_draft.new_state(cpu_anchor)
+        assert cpu_new.cache.device.type == "cpu"
+        assert torch.equal(cpu_new.cache, expected_state.cache)
+        assert torch.equal(cpu_new.positions, expected_state.positions)
+        assert torch.equal(cpu_new.vector, expected_state.vector)
+
+        cpu_ring_cache = torch.ones(
+            (1, cfg.layers, cfg.window, 2 * cfg.head_dim),
+            dtype=torch.bfloat16,
+        )
+        cpu_ring_pos = torch.zeros((1, cfg.window), dtype=torch.int32)
+        cpu_from_ring = dspark_draft.from_ring(
+            cpu_ring_cache,
+            cpu_ring_pos,
+            _TEST_ANCHOR_TOKEN,
+        )
+        assert torch.equal(cpu_from_ring.vector, expected_state.vector)
+        assert not registered_specs
+        assert not sync_batches
+
+        tpu_new = dspark_draft.new_state(_as_fake_tpu(cpu_anchor))
+        tpu_from_ring = dspark_draft.from_ring(
+            _as_fake_tpu(cpu_ring_cache),
+            _as_fake_tpu(cpu_ring_pos),
+            _TEST_ANCHOR_TOKEN,
+        )
+        dspark_draft.weights = {
+            "probe": _as_fake_tpu(_REAL_TORCH_ZEROS((1,), dtype=torch.bfloat16)),
+        }
+        tpu_from_cpu_anchor = dspark_draft.new_state(cpu_anchor)
+
+        assert registered_specs["pallas::k3_dspark_init_state"].in_specs == (P(),)
+        assert registered_specs["pallas::k3_dspark_init_state"].out_specs == (
+            P(AXIS_TP),
+            P(),
+            P(),
+        )
+        assert registered_specs["pallas::k3_dspark_init_vector"].in_specs == (P(),)
+        assert registered_specs["pallas::k3_dspark_init_vector"].out_specs == (P(),)
+        tpu_calls = (tpu_new, tpu_from_ring, tpu_from_cpu_anchor)
+        assert len(sync_batches) == 2 * len(tpu_calls)
+        assert all(wait is False for _, wait in sync_batches)
+        _assert_dspark_state_matches(tpu_new, expected_state, sync_batches[1][0])
+        assert torch.equal(tpu_from_ring.vector, expected_state.vector)
+        assert sync_batches[3][0] == [
+            tpu_from_ring.cache,
+            tpu_from_ring.positions,
+            tpu_from_ring.vector,
+        ]
+        _assert_dspark_state_matches(
+            tpu_from_cpu_anchor,
+            expected_state,
+            sync_batches[5][0],
+        )
+
+
+def test_draft_compilation_calls_include_mesh_init_ops() -> None:
+    """Verify DsparkDraft and MlaDsparkDraft compilation_calls include mesh init ops."""
+    mesh = Mesh(np.array([jax.devices()[0]]), (AXIS_TP,))
+    dspark_specs: dict[str, bridge.OpRegistrationSpec] = {}
+    mla_specs: dict[str, bridge.OpRegistrationSpec] = {}
+    control = decode_ops.Control(slots=4, rows=1, pages=1)
+
+    with (
+        patch.object(draft, "kernel_mesh", return_value=(mesh, 0)),
+        patch.object(bridge, "kernel_mesh", return_value=(mesh, 0)),
+        patch.object(
+            dspark.DraftConfig,
+            "from_checkpoint",
+            return_value=dspark.DraftConfig(),
+        ),
+        patch.object(
+            dspark_mla_mod.MlaDraftConfig,
+            "from_checkpoint",
+            return_value=dspark_mla_mod.MlaDraftConfig(),
+        ),
+        patch.object(
+            draft,
+            "register_global_op",
+            side_effect=_make_dspark_global_op_registrar(dspark_specs),
+        ),
+        patch.object(
+            bridge,
+            "register_global_op",
+            side_effect=_make_dspark_global_op_registrar(mla_specs),
+        ),
+    ):
+        dspark_draft = draft.DsparkDraft(_TEST_MAX_POS, "unused", Path("unused"))
+        dspark_draft.names = ()
+        dspark_calls = dspark_draft.compilation_calls(control, ())
+
+        mla_draft = draft_mla.MlaDsparkDraft(_TEST_MAX_POS, "unused", Path("unused"))
+        mla_draft.names = ()
+        mla_calls = mla_draft.compilation_calls(control, ())
+
+    expected_dspark_ops = {
+        "pallas::k3_dspark_init_state",
+        "pallas::k3_dspark_init_vector",
+    }
+    assert set(dspark_specs) == expected_dspark_ops
+    assert len(dspark_calls) == len(expected_dspark_ops)
+    for call in dspark_calls:
+        assert call.priority == 1
+        assert len(call.operands) == 1
+        operand = call.operands[0]
+        assert isinstance(operand, torch.Tensor)
+        assert operand.shape == (1,)
+        assert operand.dtype == torch.int32
+
+    assert set(mla_specs) == {"pallas::k3_dspark_mla_init_state"}
+    assert len(mla_calls) == 1
+    assert mla_calls[0].priority == 1
+    assert len(mla_calls[0].operands) == 1
+    mla_operand = mla_calls[0].operands[0]
+    assert isinstance(mla_operand, torch.Tensor)
+    assert mla_operand.shape == (1,)
+    assert mla_operand.dtype == torch.int32
+
+
+def test_kda_importer_synchronizes_tpu_state_and_ring_transfers() -> None:
+    """Verify KdaImporter synchronizes TPU state and ring import buffers."""
+    mesh = Mesh(np.array([jax.devices()[0]]), (AXIS_TP,))
+    importer = pools.KdaImporter(mesh, attention_dp=1, num_slots=4)
+    raw_pool = _as_fake_tpu(
+        torch.zeros(
+            (_POOL_BLOCKS, *k3_layout.LAYOUT.block_shape), dtype=torch.bfloat16
+        ),
+    )
+    importer.raw_pools = [raw_pool]
+    importer.kda_raw = [0] * pools.KDA_LAYERS
+
+    conv_bank = _as_fake_tpu(
+        torch.zeros(
+            (
+                1,
+                4,
+                pools.KDA_LAYERS,
+                CONV_TAPS,
+                pools.CONV_CHANNEL_GROUPS,
+                CONV_HEAD_ROWS,
+                HEAD_DIM,
+            ),
+            dtype=torch.bfloat16,
+        ),
+    )
+    rec_bank = _as_fake_tpu(
+        torch.zeros(
+            (1, 4, pools.KDA_LAYERS, KDA_HEADS, HEAD_DIM, HEAD_DIM),
+            dtype=torch.float32,
+        ),
+    )
+    kda_blocks = _as_fake_tpu(torch.ones((pools.KDA_LAYERS,), dtype=torch.int32))
+    events: list[str] = []
+    sync_batches: list[tuple[list[torch.Tensor], bool]] = []
+    sync_mod = importlib.import_module("torch_tpu._internal.sync")
+
+    def fake_register_op(
+        name: str,
+        _mesh: Mesh,
+        _body: Callable[..., object],
+        _spec: bridge.OpRegistrationSpec,
+    ) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+        """Return a stub TPU op recording invocation order relative to synchronize."""
+
+        def op_runner(*args: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            """Record custom op execution and return fake TPU outputs."""
+            if "import_kda" in name:
+                events.append("state_op")
+                return (_as_fake_tpu(args[0].clone()), _as_fake_tpu(args[1].clone()))
+            events.append("ring_op")
+            cfg = dspark.DraftConfig()
+            ring_out = _as_fake_tpu(
+                torch.zeros(
+                    (1, cfg.layers, cfg.window, 2 * cfg.head_dim),
+                    dtype=torch.bfloat16,
+                ),
+            )
+            pos_out = _as_fake_tpu(torch.full((1, cfg.window), -1, dtype=torch.int32))
+            return (ring_out, pos_out)
+
+        return op_runner
+
+    def fake_sync(tensors: Sequence[torch.Tensor], *, wait: bool = True) -> None:
+        """Record synchronize call ordering and arguments."""
+        events.append("sync")
+        sync_batches.append((list(tensors), wait))
+
+    with (
+        patch.object(bridge, "register_op", side_effect=fake_register_op),
+        patch.object(sync_mod, "synchronize", side_effect=fake_sync),
+        patch.object(torch, "tensor", side_effect=_fake_torch_tensor),
+    ):
+        conv_out, rec_out = importer.import_state(
+            conv_bank,
+            rec_bank,
+            kda_blocks,
+            slot=2,
+        )
+        ring_out, pos_out = importer.import_ring(
+            dspark.DraftConfig(),
+            kda_blocks,
+            length=_TEST_RING_LEN,
+        )
+
+    assert events == ["sync", "state_op", "sync", "sync", "ring_op", "sync"]
+    assert len(sync_batches) == events.count("sync")
+    assert all(wait is False for _, wait in sync_batches)
+    assert sync_batches[1][0] == [conv_out, rec_out]
+    assert sync_batches[3][0] == [ring_out, pos_out]
+
+
+def _make_kv_groups() -> tuple[
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[shim_program.KVGroup, shim_program.KVGroup],
+]:
+    """Return MLA and KDA layer names and matching KVGroup descriptors."""
+    mla_layers = ("model.layers.0.self_attn",)
+    kda_layers = tuple(
+        f"model.layers.{layer_idx}.self_attn"
+        for layer_idx in range(1, pools.KDA_LAYERS + 1)
+    )
+    kv_groups = (
+        shim_program.KVGroup(layer_names=mla_layers, block_size=256, table_width=1),
+        shim_program.KVGroup(layer_names=kda_layers, block_size=256, table_width=1),
+    )
+    return mla_layers, kda_layers, kv_groups
+
+
+def test_decoder_admit_zero_kda_routes_through_tpu_importer() -> None:
+    """Verify KimiDecoder cold admission at computed=0 uses KdaImporter on TPU."""
+    config = MegakernelEngineConfig(
+        role="decode",
+        tensor_parallel_size=32,
+        decode_context_parallel_size=32,
+        block_size=256,
+        max_num_seqs=1,
+        max_model_len=8192,
+        max_num_batched_tokens=8,
+    )
+    conv_slot = _as_fake_tpu(torch.ones((1, 4, 2), dtype=torch.bfloat16))
+    rec_slot = _as_fake_tpu(torch.ones((1, 4, 2), dtype=torch.float32))
+    conv_imported = _as_fake_tpu(torch.zeros((1, 4, 2), dtype=torch.bfloat16))
+    rec_imported = _as_fake_tpu(torch.zeros((1, 4, 2), dtype=torch.float32))
+    imported_calls: list[tuple[torch.Tensor, int]] = []
+    sync_batches: list[tuple[list[torch.Tensor], bool]] = []
+    sync_mod = importlib.import_module("torch_tpu._internal.sync")
+
+    def fake_import_state(
+        conv: torch.Tensor,
+        recurrent: torch.Tensor,
+        kda_blocks: torch.Tensor,
+        slot: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Record zero-block KdaImporter call and return fresh slot buffers."""
+        assert conv is conv_slot
+        assert recurrent is rec_slot
+        imported_calls.append((kda_blocks, int(slot)))
+        return (conv_imported, rec_imported)
+
+    def fake_sync(tensors: Sequence[torch.Tensor], *, wait: bool = True) -> None:
+        """Record synchronized tensor lists and wait flags."""
+        sync_batches.append((list(tensors), wait))
+
+    mla_layers, kda_layers, kv_groups = _make_kv_groups()
+    importer_stub = _StubKdaImporter(
+        import_state=fake_import_state,
+        mla_layer_names=mla_layers,
+        kda_layer_names=kda_layers,
+    )
+    ops_stub = cast(
+        "decode_ops.DecodeOps",
+        _AdmitDecodeOpsDouble(
+            rank=0,
+            num_slots=4,
+            attention_dp=1,
+            batch_sizes=(1,),
+            slots=[conv_slot, rec_slot],
+            importer=importer_stub,
+        ),
+    )
+    decoder = decode.KimiDecoder(config, ops_stub, tp_rank=0)
+    request = shim_program.RequestInput(
+        req_id="req-zero",
+        computed=0,
+        scheduled=1,
+        token_ids=np.array([1], dtype=np.int32),
+        num_tokens=1,
+        num_prompt_tokens=1,
+        block_tables=(
+            np.array([0], dtype=np.int32),
+            np.array([0], dtype=np.int32),
+        ),
+        sampling=shim_program.GREEDY,
+    )
+
+    with (
+        patch.object(decode, "tp_rank_permutation", return_value=None),
+        patch.object(sync_mod, "synchronize", side_effect=fake_sync),
+        patch.object(torch, "zeros", side_effect=_fake_torch_zeros),
+        patch.object(torch, "ones", side_effect=_fake_torch_ones),
+        patch.object(torch, "from_numpy", side_effect=_fake_torch_from_numpy),
+    ):
+        decoder.bind_kv_caches({}, kv_groups)
+        output = decoder.step(shim_program.StepInput(requests=[request]))
+
+    assert output.tokens.shape == (1, decode.KimiDecoder.WIDTH)
+    assert len(imported_calls) == 1
+    blocks_arg, slot_arg = imported_calls[0]
+    assert blocks_arg.shape == (pools.KDA_LAYERS,)
+    assert int(blocks_arg.abs().max().item()) == 0
+    assert slot_arg == 1
+    assert float(conv_slot[0, 1].min().item()) == 1.0
+    assert decoder.ops.slots == [conv_imported, rec_imported]
+    assert all(wait is False for _, wait in sync_batches)
+    assert any(
+        any(tensor is blocks_arg for tensor in batch) for batch, _ in sync_batches
+    )
+
+
+def test_decoder_zero_kda_tpu_slot_fails_closed_without_importer() -> None:
+    """Verify cold TPU zero-slot admission raises RuntimeError without importer."""
+    config = MegakernelEngineConfig(
+        role="decode",
+        tensor_parallel_size=32,
+        decode_context_parallel_size=32,
+        block_size=256,
+        max_num_seqs=1,
+        max_model_len=8192,
+        max_num_batched_tokens=8,
+    )
+    conv_slot = _as_fake_tpu(torch.ones((1, 4, 2), dtype=torch.bfloat16))
+    rec_slot = _as_fake_tpu(torch.ones((1, 4, 2), dtype=torch.float32))
+    sync_mod = importlib.import_module("torch_tpu._internal.sync")
+
+    def unused_import_state(
+        conv: torch.Tensor,
+        recurrent: torch.Tensor,
+        _kda_blocks: torch.Tensor,
+        _slot: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Unused callback when importer is dropped before step."""
+        return conv, recurrent
+
+    mla_layers, kda_layers, kv_groups = _make_kv_groups()
+    importer_stub = _StubKdaImporter(
+        import_state=unused_import_state,
+        mla_layer_names=mla_layers,
+        kda_layer_names=kda_layers,
+    )
+    ops_stub = cast(
+        "decode_ops.DecodeOps",
+        _AdmitDecodeOpsDouble(
+            rank=0,
+            num_slots=4,
+            attention_dp=1,
+            batch_sizes=(1,),
+            slots=[conv_slot, rec_slot],
+            importer=importer_stub,
+        ),
+    )
+    decoder = _UnboundImporterDecoder(config, ops_stub, tp_rank=0)
+    request = shim_program.RequestInput(
+        req_id="req-unbound",
+        computed=0,
+        scheduled=1,
+        token_ids=np.array([1], dtype=np.int32),
+        num_tokens=1,
+        num_prompt_tokens=1,
+        block_tables=(
+            np.array([0], dtype=np.int32),
+            np.array([0], dtype=np.int32),
+        ),
+        sampling=shim_program.GREEDY,
+    )
+
+    with (
+        patch.object(decode, "tp_rank_permutation", return_value=None),
+        patch.object(sync_mod, "synchronize"),
+        patch.object(torch, "zeros", side_effect=_fake_torch_zeros),
+        patch.object(torch, "ones", side_effect=_fake_torch_ones),
+        patch.object(torch, "from_numpy", side_effect=_fake_torch_from_numpy),
+    ):
+        decoder.bind_kv_caches({}, kv_groups)
+        decoder.drop_importer()
+        with pytest.raises(RuntimeError, match="KDA importer is not bound"):
+            decoder.step(shim_program.StepInput(requests=[request]))
+
+    assert float(conv_slot[0, 1].min().item()) == 1.0
+
+
+def test_decoder_continuing_admit_and_batched_spec_synchronize_tpu_inputs() -> None:
+    """Verify continuing KDA blocks and batched-spec modes synchronize on TPU."""
+    config = MegakernelEngineConfig(
+        role="decode",
+        tensor_parallel_size=32,
+        decode_context_parallel_size=32,
+        block_size=256,
+        max_num_seqs=1,
+        max_model_len=8192,
+        max_num_batched_tokens=8,
+        num_speculative_tokens=3,
+    )
+    needed_slots = decode_ops.Control.total_slots(2 * config.max_num_seqs + 1)
+    conv_slot = _as_fake_tpu(torch.ones((1, needed_slots, 2), dtype=torch.bfloat16))
+    rec_slot = _as_fake_tpu(torch.ones((1, needed_slots, 2), dtype=torch.float32))
+    imported_blocks: list[torch.Tensor] = []
+    sync_batches: list[tuple[list[torch.Tensor], bool]] = []
+    events: list[str] = []
+    sync_mod = importlib.import_module("torch_tpu._internal.sync")
+
+    def fake_import_state(
+        conv: torch.Tensor,
+        recurrent: torch.Tensor,
+        kda_blocks: torch.Tensor,
+        _slot: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Record continuing-request KDA block tensor and event ordering."""
+        events.append("import_state")
+        imported_blocks.append(kda_blocks)
+        return conv, recurrent
+
+    def fake_sync(tensors: Sequence[torch.Tensor], *, wait: bool = True) -> None:
+        """Record synchronized tensors, wait flag, and event ordering."""
+        events.append("sync")
+        sync_batches.append((list(tensors), wait))
+
+    mla_layers, kda_layers, kv_groups = _make_kv_groups()
+    importer_stub = _StubKdaImporter(
+        import_state=fake_import_state,
+        mla_layer_names=mla_layers,
+        kda_layer_names=kda_layers,
+    )
+    ops_double = _AdmitDecodeOpsDouble(
+        rank=0,
+        num_slots=needed_slots,
+        attention_dp=1,
+        batch_sizes=(1,),
+        slots=[conv_slot, rec_slot],
+        importer=importer_stub,
+        events=events,
+    )
+    decoder = decode.KimiDecoder(
+        config,
+        cast("decode_ops.DecodeOps", ops_double),
+        cast("draft.DsparkDraft", _StubSpecDraft()),
+        tp_rank=0,
+    )
+    expected_block = 2
+    continuing_request = shim_program.RequestInput(
+        req_id="req-continuing",
+        computed=1,
+        scheduled=1,
+        token_ids=np.array([10, 20], dtype=np.int32),
+        num_tokens=2,
+        num_prompt_tokens=2,
+        block_tables=(
+            np.array([1], dtype=np.int32),
+            np.array([expected_block], dtype=np.int32),
+        ),
+        sampling=shim_program.GREEDY,
+    )
+
+    with (
+        patch.object(decode, "tp_rank_permutation", return_value=None),
+        patch.object(sync_mod, "synchronize", side_effect=fake_sync),
+        patch.object(torch, "tensor", side_effect=_fake_torch_tensor),
+        patch.object(torch, "zeros", side_effect=_fake_torch_zeros),
+        patch.object(torch, "ones", side_effect=_fake_torch_ones),
+        patch.object(torch, "from_numpy", side_effect=_fake_torch_from_numpy),
+    ):
+        decoder.bind_kv_caches({}, kv_groups)
+        decoder.step(shim_program.StepInput(requests=[continuing_request]))
+
+    assert len(imported_blocks) == 1
+    kda_blocks_arg = imported_blocks[0]
+    assert kda_blocks_arg.shape == (pools.KDA_LAYERS,)
+    assert int(kda_blocks_arg.min().item()) == expected_block
+    assert int(kda_blocks_arg.max().item()) == expected_block
+    assert len(ops_double.recorded_modes) == 1
+    modes_arg = ops_double.recorded_modes[0]
+    assert modes_arg.shape == (1,)
+    assert all(wait is False for _, wait in sync_batches)
+    assert any(
+        any(tensor is kda_blocks_arg for tensor in batch) for batch, _ in sync_batches
+    )
+    assert any(
+        any(tensor is modes_arg for tensor in batch) for batch, _ in sync_batches
+    )
+    import_idx = events.index("import_state")
+    verify_idx = events.index("verify_batched")
+    assert "sync" in events[:import_idx]
+    assert "sync" in events[import_idx:verify_idx]
 
 
 _DRAFT_STATE_BLOCKS = 15
