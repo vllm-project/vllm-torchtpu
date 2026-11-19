@@ -58,7 +58,7 @@ def parse[T](options_cls: type[T], section: str, raw: Any) -> T:
 
 def get[T](options_cls: type[T], section: str, vllm_config: Any) -> T:
     """The section of ``vllm_config.additional_config`` as ``options_cls``."""
-    additional = getattr(vllm_config, "additional_config", None)
+    additional = vllm_config.additional_config
     if not isinstance(additional, dict):
         return options_cls()
     return parse(options_cls, section, additional.get(section))
