@@ -529,7 +529,10 @@ def _requantize_expert_chunks(
         hasattr(torch, "float4_e2m1fn_x2")
         and format_kwargs.get("quant_dtype") == torch.float4_e2m1fn_x2
     )
-    chunk_budget = (4 << 30) if is_fp4_target else _REQUANT_CHUNK_BYTES
+    unpacked_fp4_target = (
+        is_fp4_target and envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_ENABLE_W4A8
+    )
+    chunk_budget = (2 << 30) if unpacked_fp4_target else _REQUANT_CHUNK_BYTES
     per_chunk = max(1, chunk_budget // per_expert)
     weights, scales = [], []
     for start in range(0, num_experts, per_chunk):
@@ -583,14 +586,33 @@ def _quantize_and_format_moe_weights(
     return w13, w13_scale, w2, w2_scale
 
 
+def _release_param_storage(param: torch.nn.Parameter | None) -> None:
+    """Release a replaced Parameter's backing buffer immediately.
+
+    vLLM's ``load_weights`` builds ``params_dict = dict(self.named_parameters())``
+    before streaming checkpoint shards, keeping Python references to the initial
+    ``Parameter`` wrappers until the last shard finishes. Pointing ``.data`` at a
+    one-element stub of the same device and dtype (``set_data`` rejects a device
+    change) drops the old FP8/BF16 buffer as soon as its chunked requantization
+    completes.
+    """
+    if param is not None and param.data.numel() > 1:
+        param.data = torch.empty((1,), dtype=param.data.dtype, device=param.data.device)
+
+
 def _process_fp8_moe_weights(
     layer: TpuRoutedExperts,
     *,
     weight_block_size: tuple[int, int] | None = None,
     activation: str,
     force_fp8: bool = False,
+    release_inputs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int | None]:
     """Dequantize and requantize FP8 MoE weights for the TPU GMM kernel.
+
+    With `release_inputs`, the layer's checkpoint weight and scale storage is
+    released as soon as each of w13 and w2 is requantized, for a caller that
+    replaces those parameters with the results.
 
     Returns (w13_weight, w13_scale, w2_weight, w2_scale,
              requant_dtype_name, requant_block_size).
@@ -627,17 +649,17 @@ def _process_fp8_moe_weights(
         local_real = int(unpadded_intermediate or 0)
 
     if weight_block_size is not None:
-        # Validate block alignment
+        # Validate block alignment without retaining local tensor references.
         block_h, block_w = weight_block_size
-        for name, weight in (
-            ("w13_weight", layer.w13_weight.data),
-            ("w2_weight", layer.w2_weight.data),
+        for name, weight_shape in (
+            ("w13_weight", layer.w13_weight.shape),
+            ("w2_weight", layer.w2_weight.shape),
         ):
-            _, out_dim, in_dim = weight.shape
+            _, out_dim, in_dim = weight_shape
             if out_dim % block_h != 0 or in_dim % block_w != 0:
                 raise ValueError(
                     "FP8 block quantized MoE weights must be divisible by the "
-                    f"checkpoint block size, got {name}.shape={tuple(weight.shape)} "
+                    f"checkpoint block size, got {name}.shape={tuple(weight_shape)} "
                     f"and block_size={weight_block_size}."
                 )
 
@@ -702,6 +724,13 @@ def _process_fp8_moe_weights(
         block_size=requant_block_size,
         activation=activation,
     )
+    assert w13_scale is not None
+    if release_inputs:
+        if w13.device.type == "tpu":
+            synchronize_tensors([w13, w13_scale], wait=True)
+        _release_param_storage(layer.w13_weight)
+        _release_param_storage(w13_scale_param)
+
     w2, w2_scale = _requantize_expert_chunks(
         layer.w2_weight.data,
         w2_scale_param.data,
@@ -712,8 +741,13 @@ def _process_fp8_moe_weights(
         block_size=requant_block_size,
         activation=activation,
     )
+    assert w2_scale is not None
+    if release_inputs:
+        if w2.device.type == "tpu":
+            synchronize_tensors([w2, w2_scale], wait=True)
+        _release_param_storage(layer.w2_weight)
+        _release_param_storage(w2_scale_param)
 
-    assert w13_scale is not None and w2_scale is not None
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 
 
@@ -722,11 +756,13 @@ def _quantize_bf16_moe_weights(
     *,
     activation: str,
     force_fp8: bool = False,
+    release_inputs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int | None]:
     """Quantize BF16 MoE weights to FP8 for the TPU GMM kernel.
 
     Same output format as _process_fp8_moe_weights but starts from BF16
-    weights instead of dequantizing from FP8 first.
+    weights instead of dequantizing from FP8 first. `release_inputs` is as
+    for _process_fp8_moe_weights.
     """
     desired_quant_dtype, requant_dtype, requant_block_size = _get_moe_quant_config(
         "[MoE online FP8]: quantizing BF16 MoE weights",
@@ -756,6 +792,12 @@ def _quantize_bf16_moe_weights(
         block_size=requant_block_size,
         activation=activation,
     )
+    assert w13_scale is not None
+    if release_inputs:
+        if w13.device.type == "tpu":
+            synchronize_tensors([w13, w13_scale], wait=True)
+        _release_param_storage(layer.w13_weight)
+
     w2, w2_scale = _requantize_expert_chunks(
         layer.w2_weight.data,
         None,
@@ -766,8 +808,11 @@ def _quantize_bf16_moe_weights(
         block_size=requant_block_size,
         activation=activation,
     )
-
-    assert w13_scale is not None and w2_scale is not None
+    assert w2_scale is not None
+    if release_inputs:
+        if w2.device.type == "tpu":
+            synchronize_tensors([w2, w2_scale], wait=True)
+        _release_param_storage(layer.w2_weight)
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 
 
@@ -1126,6 +1171,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                     weight_block_size=weight_block_size,
                     activation=activation_str,
                     force_fp8=force_fp8,
+                    release_inputs=True,
                 )
             )
         else:
@@ -1134,6 +1180,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                     layer,
                     activation=activation_str,
                     force_fp8=force_fp8,
+                    release_inputs=True,
                 )
             )
 

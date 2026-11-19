@@ -513,3 +513,119 @@ def test_early_requant_skips_written_early_layer_and_falls_back_cleanly(monkeypa
     base_loader.process_weights_after_loading([layer], None, "cpu")
     assert layer.w13_weight.dtype == torch.uint8
     assert layer.w2_weight.dtype == torch.uint8
+
+
+def test_early_requant_releases_params_dict_pinned_fp8_storage(monkeypatch):
+    """Regression test for vLLM's load_weights ``params_dict`` pinning old
+    Parameter wrappers until all checkpoint shards finish streaming."""
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.model_loader import base_loader
+
+    from vllm_torchtpu import model_loader_patches
+
+    if not hasattr(torch, "float4_e2m1fn_x2"):
+        import pytest
+
+        pytest.skip("torch.float4_e2m1fn_x2 unavailable")
+
+    monkeypatch.setenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "fp4")
+    monkeypatch.setenv("MOE_REQUANTIZE_BLOCK_SIZE", "512")
+    monkeypatch.delenv("VLLM_TPU_MOE_EARLY_REQUANT", raising=False)
+    monkeypatch.setattr(model_loader_patches, "_STAGE_ON_CPU_FOR_TEST", True)
+
+    monkeypatch.setattr(RoutedExperts, "weight_loader", RoutedExperts.weight_loader)
+    monkeypatch.setattr(
+        RoutedExperts, "_tpu_expert_staging_patch", False, raising=False
+    )
+    monkeypatch.setattr(
+        base_loader,
+        "process_weights_after_loading",
+        lambda model, _mc, _td: [
+            m.quant_method.process_weights_after_loading(m) for m in model
+        ],
+    )
+    model_loader_patches.patch_moe_expert_write_staging()
+
+    model = torch.nn.ModuleList(
+        [
+            _build_fake_fp8_moe_layer(
+                monkeypatch, prefix=f"model.layers.{i}.mlp.experts"
+            )
+            for i in range(3, 6)
+        ]
+    )
+    # Mirror vLLM's load_weights(): snapshot named_parameters() BEFORE streaming.
+    params_dict = dict(model.named_parameters())
+    assert all(p.data.numel() > 0 for p in params_dict.values())
+
+    for idx, layer in enumerate(model):
+        _stream_expert_shards_into_layer(layer, _make_random_moe_shards(seed=200 + idx))
+        # Immediately after layer idx finishes streaming, every old Parameter
+        # wrapper held in params_dict for layer idx must have 0-element .data!
+        for name, old_p in params_dict.items():
+            if name.startswith(f"{idx}."):
+                assert old_p.data.numel() <= 1, f"{name} still pinned: {old_p.shape}"
+        assert layer.w13_weight.dtype == torch.uint8
+        assert layer.w13_weight.numel() > 0
+
+
+def test_multichunk_fp4_requant_matches_single_chunk_bit_for_bit(monkeypatch):
+    """Chunked packed-FP4 requantization (per_chunk < num_experts) produces
+    bit-identical weights and scales to single-chunk requantization."""
+    from vllm_torchtpu import model_loader_patches
+    from vllm_torchtpu.layers.adapter.quantization import fp8 as fp8_mod
+
+    if not hasattr(torch, "float4_e2m1fn_x2"):
+        import pytest
+
+        pytest.skip("torch.float4_e2m1fn_x2 unavailable")
+
+    monkeypatch.setenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "fp4")
+    monkeypatch.setenv("MOE_REQUANTIZE_BLOCK_SIZE", "512")
+    monkeypatch.setenv("USE_MOE_FUSED_EP_KERNEL", "0")
+    monkeypatch.setattr(model_loader_patches, "_STAGE_ON_CPU_FOR_TEST", True)
+
+    shards = _make_random_moe_shards(seed=321, num_experts=6)
+
+    def run_with_chunk_bytes(chunk_bytes: int):
+        monkeypatch.setattr(fp8_mod, "_REQUANT_CHUNK_BYTES", chunk_bytes)
+        layer = _build_fake_fp8_moe_layer(monkeypatch, num_experts=6)
+        for e in range(6):
+            half = layer.w13_weight.shape[1] // 2
+            layer.w13_weight.data[e, :half].copy_(shards[("w1", e)])
+            layer.w13_weight.data[e, half:].copy_(shards[("w3", e)])
+            layer.w2_weight.data[e].copy_(shards[("w2", e)])
+            sh = layer.w13_weight_scale_inv.shape[1] // 2
+            layer.w13_weight_scale_inv.data[e, :sh].copy_(shards[("s1", e)])
+            layer.w13_weight_scale_inv.data[e, sh:].copy_(shards[("s3", e)])
+            layer.w2_weight_scale_inv.data[e].copy_(shards[("s2", e)])
+        assert layer.quant_method.requantize_moe_layer_weights(layer) is True
+        return layer
+
+    # 2 experts per chunk for w13 (2 * 512 * 512 * 4 B = 2 MiB of float32 per
+    # expert) vs all 6 in one chunk.
+    multi = run_with_chunk_bytes(2 * (2 * 512 * 512 * 4))
+    single = run_with_chunk_bytes(1 << 30)
+    for attr in (
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale_inv",
+        "w2_weight_scale_inv",
+    ):
+        assert torch.equal(getattr(multi, attr).data, getattr(single, attr).data)
+
+
+def test_release_param_storage_preserves_non_cpu_dispatch_key(monkeypatch):
+    """variable.set_data rejects changing Tensor dispatch keys (e.g. TPU/Meta -> CPU);
+    verify _release_param_storage keeps the parameter's device and dtype."""
+    _install_cpu_torch_tpu_stub(monkeypatch)
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import _release_param_storage
+
+    p = torch.nn.Parameter(
+        torch.empty((32, 256, 512), dtype=torch.float8_e4m3fn, device="meta"),
+        requires_grad=False,
+    )
+    _release_param_storage(p)
+    assert p.device.type == "meta"
+    assert p.dtype == torch.float8_e4m3fn
+    assert p.numel() == 1
