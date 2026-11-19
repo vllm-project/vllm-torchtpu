@@ -26,6 +26,7 @@ from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41Mo
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
+from ..common.engram import initialize_engram_gate
 from ..common.mhc import (
     collapse,
     flat_collapse,
@@ -1406,6 +1407,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         initialize_cache_ops()
         initialize_delayed_mhc()
         initialize_shifted_mhc()
+        initialize_engram_gate()
         initialize_mhc_post()
         initialize_flat_collapse()
         initialize_paged_attention()

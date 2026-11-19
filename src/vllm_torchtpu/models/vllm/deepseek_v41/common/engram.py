@@ -602,8 +602,9 @@ def _fused_prep_op():
 _ENGRAM_GATE_OP = None
 
 
-def _engram_gate_op():
-    """Torch op for ``engram_gate``: 7 arrays, then eps and clamp."""
+def initialize_engram_gate() -> None:
+    """Build the torch op for ``engram_gate`` (7 arrays, then eps and clamp)
+    before tracing: dynamo cannot trace the op's construction."""
     global _ENGRAM_GATE_OP
     if _ENGRAM_GATE_OP is None:
         from jax.sharding import PartitionSpec as P
@@ -638,7 +639,6 @@ def _engram_gate_op():
         )
         op.register_fake(lambda x, w, w_scale, hidden, *_: torch.empty_like(hidden))
         _ENGRAM_GATE_OP = op
-    return _ENGRAM_GATE_OP
 
 
 def _load_local_rows(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
@@ -1359,7 +1359,8 @@ class Engram(upstream.Engram):
                 if token_mask is None
                 else token_mask
             )
-            return _engram_gate_op()(
+            assert _ENGRAM_GATE_OP is not None, "initialize_engram_gate() first"
+            return _ENGRAM_GATE_OP(
                 x,
                 self.wkv.weight,
                 self.wkv.weight_scale,
