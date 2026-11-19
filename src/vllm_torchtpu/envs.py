@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_COUNTING_SORT: bool = True
+    TPU_MOE_VALID_COUNT_FROM_SORT: bool = False
     TPU_MOE_BOUNDED_ONEHOT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
@@ -286,6 +287,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
     TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT: bool = False
+    TPU_MINIMAX_M3_DCP_MERGE_KERNEL_MIN_CANDIDATES: int = 64
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
     TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR: int = 1
     TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: bool = False
@@ -915,6 +917,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # counting sort either way. A stand-down knob in case a libtpu release
     # miscompiles the rank contraction again.
     "TPU_MOE_COUNTING_SORT": env_bool("TPU_MOE_COUNTING_SORT", True),
+    # With the counting sort, the number of valid local routes (the computed
+    # prefix of the grouped matmul's rows) is read off the sort's own bucket
+    # base contraction (the sentinel bucket's base) instead of a separate
+    # sum over group_sizes; the one-hot combine's row mask uses it. Exact.
+    "TPU_MOE_VALID_COUNT_FROM_SORT": env_bool("TPU_MOE_VALID_COUNT_FROM_SORT"),
     # Run the EP one-hot MoE permute and combine as Pallas kernels that visit
     # only the 128-slot blocks of the valid local prefix (about 1/EP of the
     # routed slots) instead of dense one-hot matmuls over every slot, where
@@ -1871,6 +1878,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # a middle axis. Same values; avoids a slow XLA layout at some row counts.
     "TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT": env_bool(
         "TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT", default=False
+    ),
+    # MiniMax M3 DCP candidate merges of at least this many candidates per
+    # token (DCP * top-k) run as the Pallas merge kernel, smaller ones as the
+    # dense XLA ranking (`msa_dcp.merge_head_candidates`). 32 moves DCP 2
+    # onto the kernel too. Same selection either way.
+    "TPU_MINIMAX_M3_DCP_MERGE_KERNEL_MIN_CANDIDATES": env_nonnegative_int(
+        "TPU_MINIMAX_M3_DCP_MERGE_KERNEL_MIN_CANDIDATES", 64
     ),
     # MiniMax M3 head-parallel DCP prefill attention (`msa_dcp_heads`, steps of
     # at least 2,048 tokens at DCP 8) kernel config, "<block_q>:<pages per

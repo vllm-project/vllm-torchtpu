@@ -50,6 +50,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import tight_vmem
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_attention,
@@ -531,7 +532,13 @@ def _merge_kernel_t(c_ref, o_ref, *, topk: int):
 # of the [dcp, rows, 2 * topk] candidates into rows cost ~3 ms per layer in the
 # c64 mixed step (32768 rows; j-c1444339). Narrower merges (DCP 2, as c4/c16/c48
 # serve) keep the dense ranking, cheap at n = 32.
-_KERNEL_MERGE_MIN_CANDIDATES = 64
+_KERNEL_MERGE_MIN_CANDIDATES = envs.TPU_MINIMAX_M3_DCP_MERGE_KERNEL_MIN_CANDIDATES
+if _KERNEL_MERGE_MIN_CANDIDATES != 64:
+    init_logger(__name__).warning(
+        "TPU_MINIMAX_M3_DCP_MERGE_KERNEL_MIN_CANDIDATES=%d on: MSA DCP merges of "
+        "at least that many candidates per token run as the Pallas merge kernel",
+        _KERNEL_MERGE_MIN_CANDIDATES,
+    )
 _MERGE_BLOCK_TOKENS = 256
 
 
