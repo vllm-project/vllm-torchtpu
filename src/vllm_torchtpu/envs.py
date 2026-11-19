@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
     TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS: int = 0
     TPU_MOE_TC_COMBINE: bool = False
+    TPU_MOE_TC_COMBINE_V2: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
     TPU_MOE_V3_PAYLOAD_SORT: bool = False
@@ -844,6 +845,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (kernels/megablox/tc_combine.py) instead of the SparseCore
     # gather-reduce, where its shape admits it.
     "TPU_MOE_TC_COMBINE": env_bool("TPU_MOE_TC_COMBINE"),
+    # With TPU_MOE_TC_COMBINE: build the combine's plan in one Pallas kernel
+    # and read each x tile that two consecutive token blocks share from HBM
+    # once (tc_combine.tc_combine_v2). Same buffers and products, same bits.
+    "TPU_MOE_TC_COMBINE_V2": env_bool("TPU_MOE_TC_COMBINE_V2"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

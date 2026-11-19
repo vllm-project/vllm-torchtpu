@@ -97,6 +97,14 @@ if _V3_PAYLOAD_SORT:
 # outputs on the TensorCore (0 = never). See moe_tc_combine.
 _TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
 _FLAT_ROUTING_MIN_TOKENS = envs.TPU_MOE_FLAT_ROUTING_MIN_TOKENS
+# Fixed at import: the TensorCore combine (TPU_MOE_TC_COMBINE) runs its v2
+# (Pallas plan, shared boundary tiles read once; same bits).
+_TC_COMBINE_V2 = envs.TPU_MOE_TC_COMBINE_V2
+if _TC_COMBINE_V2:
+    logger.warning(
+        "TPU_MOE_TC_COMBINE_V2=1: TensorCore MoE combine v2 (Pallas plan, "
+        "boundary tiles reused)"
+    )
 # Skip padded rows (skip_padded_tokens) only in batches of at least this many
 # routes (T * top_k). Below it the rows still run, so the grouped matmul and the
 # one-hot permute see the same layout as with the skip off and real rows come
@@ -761,7 +769,12 @@ def moe_gmm(
         if envs.TPU_MOE_TC_COMBINE and tc_combine_mod.supported(
             num_tokens, gmm2_res.shape[-1], topk, group_sizes.shape[0], gmm2_res.dtype
         ):
-            return tc_combine_mod.tc_combine(
+            combine_fn = (
+                tc_combine_mod.tc_combine_v2
+                if _TC_COMBINE_V2
+                else tc_combine_mod.tc_combine
+            )
+            return combine_fn(
                 gmm2_res,
                 argsort_revert_indices,
                 topk_weights_flat,
