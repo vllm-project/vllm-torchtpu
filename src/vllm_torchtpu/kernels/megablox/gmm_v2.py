@@ -919,6 +919,11 @@ def kernel_main(
         zero_out_end(out_ref, cast(jax.Array, semaphore_ref), zero_size, dims=cfgs.dims)
 
 
+_HIGH_GROUP_LOW_M_MIN_GROUPS = 32
+_HIGH_GROUP_LOW_M_MAX_TOKENS = 512
+_HIGH_GROUP_LOW_M_MIN_BUCKET = 16
+
+
 def calculate_tiling(
     dims: Dimensions,
     lhs_cfgs: InputConfigs,
@@ -933,6 +938,7 @@ def calculate_tiling(
 
     lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
     rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
+    tpu_info = pltpu.get_tpu_info()
 
     # When using bf16 for lhs and rhs, 128 is the largest tile_m value that is
     # safe to use for most scenarios. But if lower bitwidth is used, we need
@@ -943,11 +949,20 @@ def calculate_tiling(
     tile_m = bf16_bf16_tile_m // rhs_mod
     if lhs_cfgs.should_quantize:
         tile_m *= 2
+    # On TPU_8I, MoE shards with >= 32 local experts and <= 512 routed rows
+    # average <= 16 rows per expert; capping bucket_base to 16 (tile_m = 64
+    # across 4 sub-tiles) avoids padding sparse non-empty groups up to 64/256.
+    if (
+        tpu_info.chip_version == pltpu.ChipVersion.TPU_8I
+        and dims.size_group >= _HIGH_GROUP_LOW_M_MIN_GROUPS
+        and dims.size_m <= _HIGH_GROUP_LOW_M_MAX_TOKENS
+    ):
+        tile_m = min(tile_m, max(dims.size_lhs_sublane, _HIGH_GROUP_LOW_M_MIN_BUCKET))
     tile_m = min(tile_m, dims.size_m)
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
     # smaller than 2x of mxu_column_size.
-    tile_n_limit = pltpu.get_tpu_info().mxu_column_size * 2
+    tile_n_limit = tpu_info.mxu_column_size * 2
     tile_n_limit = min(tile_n_limit, dims.size_n)
 
     size_n_per_rhs = dims.size_n
