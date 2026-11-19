@@ -135,6 +135,7 @@ def make_method(fp4):
         method.quant_config = SimpleNamespace(is_checkpoint_fp8_serialized=True)
         method.weight_block_size = None
         method.weight_scale_name = "weight_scale"
+        method.prefix = "model.layers.0.mlp.experts"
     return method
 
 
