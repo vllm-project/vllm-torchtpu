@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     TPU_MOE_BOUNDED_ONEHOT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
+    TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS: int = 0
     TPU_MOE_TC_COMBINE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
@@ -819,6 +820,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # buckets up to 40 rows of 6144, where the two still differ.
     "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES", 0
+    ),
+    # Pallas TP all-reduce on the activation's own [rows, hidden] layout when
+    # rows is a multiple of this value (0, default: off). Off, the kernel runs
+    # on a [16, w] view, and the relayout into the view (and back) is a copy
+    # of the whole activation on each side of every decode all-reduce. Same
+    # bits either way (each element is summed in rank order).
+    "TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS": env_int(
+        "TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS", 0
     ),
     # Expert-parallel MoE combine of large batches on the TensorCore
     # (kernels/megablox/tc_combine.py) instead of the SparseCore

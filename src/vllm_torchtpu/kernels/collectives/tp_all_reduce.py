@@ -135,10 +135,30 @@ def _call(n: int, m: int, h: int):
     )
 
 
-def all_reduce(x: jax.Array, rank: jax.Array, n: int) -> jax.Array:
+def direct_ok(rows: int, hidden: int, n: int, direct_rows: int) -> bool:
+    """Whether `all_reduce` runs on x's own [rows, hidden] layout: direct_rows
+    > 0 divides rows and every rank's column chunk is whole lane tiles."""
+    return (
+        direct_rows > 0
+        and rows % direct_rows == 0
+        and rows % 8 == 0
+        and hidden % (n * _LANES) == 0
+    )
+
+
+def all_reduce(
+    x: jax.Array, rank: jax.Array, n: int, direct_rows: int = 0
+) -> jax.Array:
     """Sum of bf16 x [rows, hidden] over the n ranks; call under shard_map over
-    the 1-D mesh. rank (int32, one element) must be this device's mesh index."""
+    the 1-D mesh. rank (int32, one element) must be this device's mesh index.
+
+    direct_rows > 0: when it divides rows, the kernel runs on x itself
+    (column chunks [rows, hidden / n]) and skips the copies into and out of
+    the [16, w] view. Each element is still summed in rank order, so the bits
+    are the same as the view's."""
     rows, hidden = x.shape
+    if direct_ok(rows, hidden, n, direct_rows):
+        return _call(n, rows, hidden)(rank.reshape(1).astype(jnp.int32), x)
     padded, m, w = view_shape(rows, hidden, n)
     xp = jnp.pad(x, ((0, padded - rows), (0, 0))) if padded != rows else x
     out = _call(n, m, w)(rank.reshape(1).astype(jnp.int32), xp.reshape(m, w))
