@@ -196,6 +196,8 @@ steps:
             tests/kernels/fused_moe/test_direct_all_gather.py
             tests/models/vllm/test_dsv41_vocab_parallel_head.py
             tests/runner/test_vocab_parallel_rows.py
+            tests/runner/test_sampling_mask_flags.py
+            tests/layers/adapter/test_top_k_top_p.py
             tests/kernels/test_decode_preparation.py
             tests/kernels/test_decode_bridge.py
             tests/models/vllm/test_csa2_chunk_cache.py

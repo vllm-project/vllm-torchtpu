@@ -3181,6 +3181,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     )
 
     seen_u_dtypes: list[torch.dtype] = []
+    seen_mask_flags: list[tuple[bool, bool]] = []
 
     def fake_sample_from_logits(
         logits,
@@ -3190,15 +3191,20 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         top_p,
         all_greedy=False,
         topk_candidates=0,
+        use_top_k=True,
+        use_top_p=True,
     ):
         seen_u_dtypes.append(u.dtype)
+        seen_mask_flags.append((use_top_k, use_top_p))
         return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
 
     bf16_logits = torch.zeros((2, 16), dtype=torch.bfloat16)
-    sampling_params = (
-        torch.ones((2, 1), dtype=torch.bfloat16),
-        torch.zeros((2, 1), dtype=torch.int32),
-        torch.ones((2, 1), dtype=torch.float32),
+    sampling_params = tpu_runner.PaddedSamplingParams(
+        temperatures=torch.ones((2, 1), dtype=torch.bfloat16),
+        top_k=torch.zeros((2, 1), dtype=torch.int32),
+        top_p=torch.ones((2, 1), dtype=torch.float32),
+        use_top_k=False,
+        use_top_p=False,
     )
 
     # 1. _precompile_sample_from_logits
@@ -3212,8 +3218,10 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         sample_from_logits_func=fake_sample_from_logits,
     )
     TPUModelRunner._precompile_sample_from_logits(precompile_runner)
-    assert seen_u_dtypes == [torch.float32, torch.float32]
+    # The greedy program and the 4 top-k/top-p variants of the sampling one.
+    assert seen_u_dtypes == [torch.float32] * 5
     seen_u_dtypes.clear()
+    seen_mask_flags.clear()
 
     # 2. _sample_spec_verify_chunk (bonus_u and recover_u)
     seen_recover_dtypes: list[torch.dtype] = []
@@ -3320,3 +3328,5 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+    # Every sampling call site passes the chunk's top-k/top-p flags.
+    assert seen_mask_flags == [(False, False)] * 3

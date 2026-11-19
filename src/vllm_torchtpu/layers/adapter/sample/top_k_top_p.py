@@ -239,13 +239,53 @@ def topp_mask(
     return torch.where(probs >= threshold, logits, replace_tensor)
 
 
-def apply_top_k_top_p(
-    logits: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor
-) -> torch.Tensor:
-    should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
-    topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE)
-    masked_logits = torch.where(should_apply_topk, topk_masked, logits)
+# The (use_top_k, use_top_p) pairs masks_in_use can return; warmup compiles
+# a sampler program for each.
+MASK_FLAG_COMBINATIONS = ((True, True), (True, False), (False, True), (False, False))
 
-    should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
+
+def top_k_applies(top_k: torch.Tensor) -> torch.Tensor:
+    """Rows whose top-k restricts the choice; top_k <= 0 keeps every value."""
+    return top_k > 0
+
+
+def top_p_applies(top_p: torch.Tensor) -> torch.Tensor:
+    """Rows whose top-p restricts the choice; top_p == 1 keeps every value."""
+    return top_p < 1.0
+
+
+def masks_in_use(top_k: torch.Tensor, top_p: torch.Tensor) -> tuple[bool, bool]:
+    """Whether any row applies top-k, and whether any row applies top-p.
+
+    Called on the host copies of a step's parameters, it gives the static
+    use_top_k and use_top_p arguments of apply_top_k_top_p.
+    """
+    return bool(top_k_applies(top_k).any()), bool(top_p_applies(top_p).any())
+
+
+def apply_top_k_top_p(
+    logits: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    *,
+    use_top_k: bool = True,
+    use_top_p: bool = True,
+) -> torch.Tensor:
+    """Masks each row to its top-k values, then to its top-p mass.
+
+    A row that applies neither mask keeps its logits. use_top_k=False states
+    that no row applies top-k, and use_top_p=False that no row applies top-p;
+    the search for that cutoff is then left out of the program, with the same
+    result.
+    """
+    masked_logits = logits
+    if use_top_k:
+        should_apply_topk = top_k_applies(top_k).expand(-1, logits.shape[-1])
+        topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE)
+        masked_logits = torch.where(should_apply_topk, topk_masked, logits)
+    if not use_top_p:
+        return masked_logits
+
+    should_apply_topp = top_p_applies(top_p).expand(-1, masked_logits.shape[-1])
     topp_masked = topp_mask(masked_logits, top_p, MASKED_LOGIT_VALUE)
     return torch.where(should_apply_topp, topp_masked, masked_logits)
