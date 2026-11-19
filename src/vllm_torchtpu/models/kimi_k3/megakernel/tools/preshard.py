@@ -174,7 +174,7 @@ def convert_rank(load, checkpoint, rank: int, output: Path, log) -> dict:
         for name, shape in shapes.items():
             if name in EXPERT_FAMILIES:
                 continue
-            ids = load._family_layers(checkpoint.config, name, LAYERS)
+            ids = load.family_layers(checkpoint.config, name, LAYERS)
             if ids is None:
                 value = dense_value(checkpoint, name, rank, None)
             else:
@@ -465,7 +465,7 @@ def verify(args, log) -> bool:
             log(f"{name}: stored shape {spec['shape']}, loader {shapes[name]}")
             ok = False
             continue
-        ids = load._family_layers(checkpoint.config, name, LAYERS)
+        ids = load.family_layers(checkpoint.config, name, LAYERS)
         per_item = int(np.prod(spec["shape"][1:] if ids else spec["shape"]))
         for layer in (
             [None] if ids is None else [x for x in layers if x in ids] or ids[:1]
