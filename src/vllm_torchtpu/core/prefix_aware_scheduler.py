@@ -204,7 +204,7 @@ class PrefixAwareScheduler(AsyncScheduler):
     # tpu_scheduler.kv_prefetch, on a KV consumer with a connector;
     # N = _KV_PREFETCH_MAX_HELD).
     #
-    # vLLM v0.31.0's waiting loop stops at ``len(running) >=
+    # vLLM 0.33's waiting loop stops at ``len(running) >=
     # max_num_active_reqs`` before it asks the connector about the next
     # waiting request. On a PD consumer that also defers the remote KV pull,
     # although an async load never joins ``running``: it waits in
@@ -492,8 +492,8 @@ class PrefixAwareScheduler(AsyncScheduler):
     # max_num_seqs plus the overprovision; otherwise reserve max(the reserved
     # blocks, the per-sequence blocks x (running + in flight)). Every decode
     # leg of the validation entries with DCP 4 runs these values.
-    _DECODE_MAX_STAGE3_INFLIGHT = 16
-    _DECODE_STAGE3_OVERPROVISION = 32
+    _DECODE_MAX_INFLIGHT_LOADS = 16
+    _DECODE_INFLIGHT_OVERPROVISION = 32
     _DECODE_RESERVED_BLOCKS = 128
     _DECODE_RESERVED_BLOCKS_PER_SEQ = 8
 
@@ -506,12 +506,9 @@ class PrefixAwareScheduler(AsyncScheduler):
             return base
         num_inflight = len(self._inflight_prefills)
         num_running = len(self.running)
-        max_running = self.max_num_running_reqs
-        max_stage3_inflight = self._DECODE_MAX_STAGE3_INFLIGHT
-        stage3_overprovision = self._DECODE_STAGE3_OVERPROVISION
-        if (max_stage3_inflight > 0 and num_inflight >= max_stage3_inflight) or (
-            stage3_overprovision >= 0
-            and (num_running + num_inflight) >= (max_running + stage3_overprovision)
+        if num_inflight >= self._DECODE_MAX_INFLIGHT_LOADS or (
+            num_running + num_inflight
+            >= self.max_num_running_reqs + self._DECODE_INFLIGHT_OVERPROVISION
         ):
             return 1 << 30
         min_reserved = self._DECODE_RESERVED_BLOCKS
