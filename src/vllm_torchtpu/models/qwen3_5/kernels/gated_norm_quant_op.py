@@ -17,13 +17,10 @@ Where the kernel was measured (the Qwen3.5 rule,
 ``measured.maybe_install_fused_norm_kernels``), :func:`install_after_loading`
 has vLLM's loader call :func:`route_measured_model` on every model it
 finishes, which calls :func:`install_if_supported`. :func:`install` checks
-every gated-delta-net layer and marks it, and the layer's output
-projection runs :func:`output_projection`: one kernel produces the out-proj's
-fp8 rows and scales from the GDN output and the gate, and the fp8 matmul runs
-on them, instead of ``RMSNormGated`` followed by the fp8 linear.
-
-Custom-op registration and shape guards for fused post-GDN RMSNormGated +
-FP8 quantization.
+every gated-delta-net layer and sets its ``fused_output_projection`` to
+:func:`output_projection`: one kernel produces the out-proj's fp8 rows and
+scales from the GDN output and the gate, and the fp8 matmul runs on them,
+instead of ``RMSNormGated`` followed by the fp8 linear.
 """
 
 import functools
@@ -43,6 +40,7 @@ from vllm_torchtpu.layers.adapter import linear_common
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant as gnq
+from vllm_torchtpu.models.qwen3_5.kernels import measured
 
 logger = init_logger(__name__)
 
@@ -150,7 +148,7 @@ def install(model: torch.nn.Module) -> int:
         _build_ops(float(layer.norm.eps))
         # torch's Module.__setattr__ stub only accepts modules and tensors.
         # pyrefly: ignore[bad-argument-type]
-        layer.fused_norm_quant = True
+        layer.fused_output_projection = output_projection
     logger.info(
         "[GDN] %d layers run the gated norm and out_proj fp8 quantization "
         "as one kernel",
@@ -201,10 +199,6 @@ def route_measured_model(model: torch.nn.Module, model_config) -> int:
     value heads per device of its legs) and every GDN layer allows it.
     Other models, other Qwen3.5 checkpoints (the MTP draft among them) and
     other devices are untouched. Returns the number of layers routed."""
-    # Imported here so that importing the GDN layer, which imports this
-    # module, does not load the Qwen3.5 config hook the rule reads.
-    from vllm_torchtpu.models.qwen3_5.kernels import measured
-
     if not measured.is_measured_model(model_config):
         return 0
     return install_if_supported(model, value_heads=measured.GDN_VALUE_HEADS)
