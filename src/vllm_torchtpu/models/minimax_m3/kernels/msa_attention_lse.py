@@ -651,7 +651,7 @@ def _kernel(
                 n *= 2
 
         if not cached:
-            if mode == "full":  # `pair` kernels copy and wait outside
+            if mode == "full" and "d" not in removed:  # `pair` kernels copy and wait outside
                 stream()
 
             def group_page(g):
