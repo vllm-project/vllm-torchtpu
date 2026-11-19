@@ -70,8 +70,9 @@ def parse_chip_version(accelerator_type: str) -> pltpu.ChipVersion:
     # ChipVersion's values are bare chip names ("7x", "v6e"); accelerator types
     # add a chip-count suffix and sometimes a "tpu" prefix ("tpu7x", "v6e-8").
     name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
-    # v5litepod and v7x are the only two that still differ after stripping.
-    name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
+    # v5litepod, v7x and 6e are the ones that still differ after stripping. 6e
+    # is what CI's "tpu6e" leaves; the chip's own name keeps the "v".
+    name = {"v5litepod": "v5e", "v7x": "7x", "6e": "v6e"}.get(name, name)
     try:
         return pltpu.ChipVersion(name)
     except ValueError:
