@@ -247,3 +247,46 @@ def test_draft_padding_mask_zeroes_routing_of_padded_rows_only(monkeypatch):
     assert torch.equal(ids2, ids)
     assert torch.equal(w_on[:24], w[:24])
     assert (w_on[24:] == 0).all()
+
+
+def test_decode_rows_programs_get_their_own_compile_config(monkeypatch):
+    """Each decode-row module compiles under its own compilation config with
+    no pre-grad pass: by the time it is built the stock draft compile has
+    marked the shared inductor config, which a fresh vLLM backend asserts
+    absent (configure_post_pass)."""
+    import contextlib
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.spec_decode import mtp_loop_model
+
+    monkeypatch.setattr(envs, "VLLM_TPU_MTP_DRAFT_DECODE_ROWS", True)
+    seen = []
+
+    def fake_build(*, vllm_config, prefix, **kw):
+        seen.append((prefix, vllm_config))
+        return object()
+
+    monkeypatch.setattr(mtp_loop_model, "build_mtp_step0_rows_model", fake_build)
+    for name in ("set_model_tag", "set_current_vllm_config"):
+        monkeypatch.setattr(eagle3, name, lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(
+        eagle3, "set_vllm_model_wrapper_context", lambda **k: contextlib.nullcontext()
+    )
+    proposer, _ = _proposer(decode=False)
+    proposer._decode_rows_models = {}
+    proposer.draft_model = types.SimpleNamespace(_dynamic_arg_dims={"input_ids": 0})
+    proposer.runner.mesh = None
+    shared_icc = {"pre_grad_custom_pass": object(), "_vllm_model_tag": "eagle_head"}
+    shared_cc = types.SimpleNamespace(inductor_compile_config=shared_icc)
+    proposer.draft_vllm_config = types.SimpleNamespace(compilation_config=shared_cc)
+    proposer._build_step0_programs()
+    proposer._decode_rows_model_for(256)
+    proposer._decode_rows_model_for(128)
+    assert len(seen) == 2
+    for _, cfg in seen:
+        icc = cfg.compilation_config.inductor_compile_config
+        assert "pre_grad_custom_pass" not in icc
+        assert icc["_vllm_model_tag"] == "eagle_head"
+        assert cfg.compilation_config is not shared_cc
+    # The shared config is left as it was.
+    assert "pre_grad_custom_pass" in shared_icc

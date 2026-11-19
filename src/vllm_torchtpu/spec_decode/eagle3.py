@@ -642,15 +642,27 @@ class Eagle3Proposer:
         assert self.draft_model is not None
         K = self.speculative_config.num_speculative_tokens
         def build(prefix: str) -> torch.nn.Module:
+            # Its own compilation config: vLLM's backend records its pre-grad
+            # pass in the inductor config, and a module whose backend starts
+            # from a config another compile already marked fails
+            # configure_post_pass. Copy before any compile marks the shared one.
+            cfg = copy.copy(self.draft_vllm_config)
+            cc = copy.copy(cfg.compilation_config)
+            cc.inductor_compile_config = {
+                k: v
+                for k, v in cc.inductor_compile_config.items()
+                if k != "pre_grad_custom_pass"
+            }
+            cfg.compilation_config = cc
             with (
                 set_model_tag("eagle_head"),
                 set_vllm_model_wrapper_context(
-                    mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
+                    mesh=self.runner.mesh, vllm_config=cfg
                 ),
-                set_current_vllm_config(self.draft_vllm_config),
+                set_current_vllm_config(cfg),
             ):
                 return build_mtp_step0_rows_model(
-                    vllm_config=self.draft_vllm_config,
+                    vllm_config=cfg,
                     prefix=prefix,
                     mtp=self.draft_model,
                     dynamic_arg_dims=draft_dims,
