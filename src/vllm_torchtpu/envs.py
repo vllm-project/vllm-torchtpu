@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     TPU_MOE_BOUNDED_ONEHOT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
+    TPU_TP_QAR_MIN_TOKENS: int = 0
     TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS: int = 0
     TPU_MOE_TC_COMBINE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -832,6 +833,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES", 0
     ),
+    # TP all-reduces of at least this many rows run qar_all_reduce (int8
+    # payload on the ICI links, kernels/collectives/qar_all_reduce.py) instead
+    # of XLA's; needs the Pallas all-reduce armed (TPU_TP_PALLAS_ALL_REDUCE_
+    # MAX_BYTES > 0) on a tpu7x 2x2x1 TP8 group. Changes numerics (~0.9% rel
+    # L2 per all-reduce; mmlu_pro c64 -0.07pp). 0 = off.
+    "TPU_TP_QAR_MIN_TOKENS": env_int("TPU_TP_QAR_MIN_TOKENS", 0),
     # Pallas TP all-reduce on the activation's own [rows, hidden] layout when
     # rows is a multiple of this value (0, default: off). Off, the kernel runs
     # on a [16, w] view, and the relayout into the view (and back) is a copy
