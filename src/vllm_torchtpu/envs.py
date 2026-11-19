@@ -256,6 +256,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR: int = 1
     TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: bool = False
     TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS: int = 0
+    TPU_MINIMAX_M3_INDEX_FOLD_OPT: str = ""
     TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT: int = 8
     TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT: bool = False
     TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC: bool = False
@@ -1644,6 +1645,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reduce-scatter of the weighted partials. 0 = off.
     "TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS", 0
+    ),
+    # MiniMax M3 sharded index scores (`msa.partial_block_scores`): "gather"
+    # folds the index heads into query rows by a gather instead of a
+    # scatter; "compose" unfolds the scores inside `block_scores`' layout
+    # gather instead of a second row gather; "+"-joined. Bit-identical.
+    "TPU_MINIMAX_M3_INDEX_FOLD_OPT": lambda: os.getenv(
+        "TPU_MINIMAX_M3_INDEX_FOLD_OPT", ""
     ),
     # MiniMax M3 head-parallel MSA prefill page exchange
     # (`msa_dcp_heads.exchange_head_pages`): pages whose copies a rank keeps
