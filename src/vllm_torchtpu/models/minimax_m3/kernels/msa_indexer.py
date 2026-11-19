@@ -262,6 +262,49 @@ _PAGES_PER_CHUNK = 32
 _DMA_ISSUE_CHUNKS = 2
 # Page groups in `_kernel_v3`'s DMA ring.
 _RING_SLOTS = 3
+
+
+class DecodeOpt(NamedTuple):
+    """`TPU_MINIMAX_M3_INDEXER_DECODE_OPT` for the transposed (decode) class."""
+
+    issue: bool = False  # full groups start their copies without per-page checks
+    slots: int = _RING_SLOTS  # page groups in the DMA ring
+    quad: bool = False  # fp8 queries, four pages per MXU row
+
+
+_DECODE_OPT_LOGGED = False
+
+
+def decode_opt() -> DecodeOpt:
+    """Parse `TPU_MINIMAX_M3_INDEXER_DECODE_OPT` (read through envs, at trace
+    time): comma-separated ``issue``, ``slots<N>``, ``quad``."""
+    global _DECODE_OPT_LOGGED
+    from vllm_torchtpu import envs
+
+    spec = envs.TPU_MINIMAX_M3_INDEXER_DECODE_OPT
+    opt = DecodeOpt()
+    for item in filter(None, (x.strip() for x in spec.split(","))):
+        if item == "issue":
+            opt = opt._replace(issue=True)
+        elif item == "quad":
+            opt = opt._replace(quad=True)
+        elif item.startswith("slots") and item[5:].isdigit() and int(item[5:]) >= 2:
+            opt = opt._replace(slots=int(item[5:]))
+        else:
+            raise ValueError(
+                f"TPU_MINIMAX_M3_INDEXER_DECODE_OPT: unknown item {item!r} in {spec!r}"
+            )
+    if spec and not _DECODE_OPT_LOGGED:
+        _DECODE_OPT_LOGGED = True
+        logger.info(
+            "TPU_MINIMAX_M3_INDEXER_DECODE_OPT=%s on: MSA indexer decode tiles run "
+            "issue=%s slots=%d quad=%s.",
+            spec,
+            opt.issue,
+            opt.slots,
+            opt.quad,
+        )
+    return opt
 # Folded 4-bit and fp8 tiles of up to this many rows score transposed
 # (`_chunk_maxima_t`, maxima across lanes); larger ones score token-major
 # (maxima across sublanes), a folded page with its slot scales folded into
@@ -387,6 +430,58 @@ def _chunk_maxima_t(
     return jnp.concatenate([m[:block_q], m[block_q:]], axis=1)
 
 
+def _block_diag_query(q: jax.Array, n: int) -> jax.Array:
+    """``[Bq, D]`` -> block-diagonal ``[n Bq, n D]`` (n copies of q)."""
+    zeros = jnp.zeros_like(q)
+    return jnp.concatenate(
+        [
+            jnp.concatenate([q if i == k else zeros for k in range(n)], axis=1)
+            for i in range(n)
+        ],
+        axis=0,
+    )
+
+
+def _chunk_maxima_t4(q_quad, buf, first, chunk, live, issue) -> jax.Array:
+    """`_chunk_maxima_t` for folded 4-bit pages and fp8 queries with four
+    pages per MXU row: pages ``first + i * chunk / 4 + j`` (i = 0..3) share
+    row ``j``, ``[k_0 | k_1 | k_2 | k_3] @ q_quad^T`` with a contraction of
+    ``4 D``. int4 keys are exact in fp8; past-the-end pages get scale 0."""
+    rows = buf.shape[1]
+    quarter = chunk // 4
+    block_q = q_quad.shape[0] // 4
+    keys, scale_rows = [], [[], [], [], []]
+    for j in range(quarter):
+        issue(2 * j)
+        issue(2 * j + 1)
+        parts = []
+        for side in range(4):
+            p = first + side * quarter + j
+            parts.append(
+                pltpu.bitcast(buf[p, : rows - 1], jnp.int4).astype(jnp.float8_e4m3fn)
+            )
+            s = pltpu.bitcast(buf[p, rows - 1 :], jnp.float32)  # [1, S]
+            scale_rows[side].append(jnp.where(jnp.isfinite(s) & (p < live), s, 0.0))
+        keys.append(jnp.concatenate(parts, axis=1))
+    page_size = keys[0].shape[0]
+    s = jax.lax.dot_general(
+        q_quad,
+        jnp.concatenate(keys, axis=0),
+        (((1,), (1,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )  # [4 Bq, quarter * S]
+    sc = [jnp.concatenate(r, axis=1) for r in scale_rows]  # [1, quarter * S] each
+    row = jax.lax.broadcasted_iota(jnp.int32, s.shape, 0)
+    scale = jnp.where(
+        row < block_q,
+        sc[0],
+        jnp.where(row < 2 * block_q, sc[1], jnp.where(row < 3 * block_q, sc[2], sc[3])),
+    )
+    s = s * scale
+    m = jnp.max(s.reshape(4 * block_q, quarter, page_size), axis=2)  # [4 Bq, quarter]
+    return jnp.concatenate([m[i * block_q : (i + 1) * block_q] for i in range(4)], axis=1)
+
+
 def _v3_chunk(pages_per_step: int, block_q: int, page_size: int) -> int:
     """Pages per dot of `_kernel_v3`: the f32 ``[chunk / 2 * S, 2 Bq]``
     product within twice `_MAX_SCORE_ELEMS`."""
@@ -413,6 +508,8 @@ def _kernel_v3(
     *,
     transposed=False,
     fp8_q=False,
+    fast_issue=False,
+    quad=False,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -466,9 +563,15 @@ def _kernel_v3(
         their bytes, so one wait per set bit of `live` waits for them all
         (a wait per page cost two serial bundles each)."""
         live = jnp.minimum(live, pages_per_step)
+        if fast_issue:
+            full = live >= pages_per_step
+            pl.when(full)(fake_copy(pages_per_step, slot).wait)
         n = 1
         while n <= pages_per_step:
-            pl.when((live & n) != 0)(fake_copy(n, slot).wait)
+            cond = (live & n) != 0
+            if fast_issue:
+                cond = cond & jnp.logical_not(full)
+            pl.when(cond)(fake_copy(n, slot).wait)
             n *= 2
 
     def fake_copy(n, slot):
@@ -480,6 +583,25 @@ def _kernel_v3(
     def start(base, live, pages, slot):
         """Start the copies of a group's `pages` that are below its `live`
         pages, alternate pages on the second DMA queue (priority 1)."""
+        if fast_issue:
+            full = live >= pages_per_step
+
+            @pl.when(full)
+            def _():
+                # A full group: every page is below the request's last page,
+                # inside its block-table row.
+                for g in pages:
+                    pltpu.make_async_copy(
+                        words.at[block_tables_ref[base + g]],
+                        buf.at[slot, g],
+                        sems.at[slot],
+                    ).start(priority=g % 2)
+
+            for g in pages:
+                pl.when((g < live) & jnp.logical_not(full))(
+                    functools.partial(copy(base, g, slot).start, priority=g % 2)
+                )
+            return
         for g in pages:
             pl.when(g < live)(
                 functools.partial(copy(base, g, slot).start, priority=g % 2)
@@ -497,7 +619,15 @@ def _kernel_v3(
 
     base, live = group(step)
     next_base, next_live = ahead_group(step + ahead)
-    if fp8_q:
+    if quad:
+        q = q_ref[...].astype(jnp.float32)
+        amax = jnp.max(jnp.abs(q), axis=1, keepdims=True)  # [Bq, 1]
+        amax = jnp.where(amax > 0, amax, 1.0)
+        q_pair = _block_diag_query(
+            (q * (_FP8_Q_MAX / amax)).astype(jnp.float8_e4m3fn), 4
+        )
+        row_scale = amax * (1.0 / _FP8_Q_MAX)  # [Bq, 1]
+    elif fp8_q:
         q = q_ref[...].astype(jnp.float32)
         amax = jnp.max(jnp.abs(q), axis=1, keepdims=True)  # [Bq, 1]
         amax = jnp.where(amax > 0, amax, 1.0)
@@ -526,6 +656,14 @@ def _kernel_v3(
                     (slot + ahead) % slots,
                 )
 
+        if quad:
+            m = _chunk_maxima_t4(q_pair, buf.at[slot], first, chunk, live, issue)
+            m = m * row_scale
+            if transposed:
+                o_ref[:, pl.ds(first, chunk)] = m
+            else:
+                o_ref[pl.ds(first, chunk), :] = m.T
+            return
         if _scores_transposed(block_q, rows, cache_ref.dtype):
             m = _chunk_maxima_t(
                 q_pair,
@@ -813,12 +951,20 @@ def _class_scores(
                 f"pages_per_step must be an even divisor or a multiple of it, "
                 f"got {pages_per_step}"
             )
+        dopt = DecodeOpt()
+        folded = msa_fp4.scales_in_page(rows_per_page, index_cache.dtype)
+        if folded and _scores_transposed(block_q, rows_per_page, index_cache.dtype):
+            dopt = decode_opt()
+            if dopt.quad and chunk % 4:
+                dopt = dopt._replace(quad=False)
         scores_t = pl.pallas_call(
             functools.partial(
                 _kernel_v3,
                 transposed=token_major,
                 # fp8 x fp8 only for fp8 / 4-bit pages (keys exact in fp8).
                 fp8_q=fp8_q and index_cache.dtype in (jnp.float8_e4m3fn, jnp.uint8),
+                fast_issue=dopt.issue,
+                quad=dopt.quad,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=4,
@@ -827,10 +973,10 @@ def _class_scores(
                 out_specs=out_specs,
                 scratch_shapes=[
                     pltpu.VMEM(
-                        (_RING_SLOTS, pages_per_step, rows_per_page, head_dim),
+                        (dopt.slots, pages_per_step, rows_per_page, head_dim),
                         jnp.uint32,
                     ),
-                    pltpu.SemaphoreType.DMA((_RING_SLOTS,)),
+                    pltpu.SemaphoreType.DMA((dopt.slots,)),
                 ],
             ),
             out_shape=out_shape,

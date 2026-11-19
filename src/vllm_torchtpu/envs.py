@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     TPU_MOE_ROUTE_TRACE_EVERY: int = 8192
     VLLM_TPU_MOE_REDUNDANT_EXPERTS: int = 0
     TPU_MOE_NVFP4_SKIP_PADDED: bool = False
+    TPU_MINIMAX_M3_INDEXER_DECODE_OPT: str = ""
     TPU_MOE_SKIP_PADDED_MIN_ROUTES: int = 0
     VLLM_TPU_MOE_REDUNDANT_PLACEMENT: str = ""
     USE_PHASED_PROFILER: bool = False
@@ -871,6 +872,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gmm) is exposed per call. "<chunk_rows>:<slots>[@<max size_m>]", "on" =
     # 768:4@512. Same numerics as the fp8 rhs feed. Empty = off.
     "TPU_GMM_V2_DECODE_STREAM": env_str("TPU_GMM_V2_DECODE_STREAM", ""),
+    # MSA indexer decode (transposed block_q class, folded 4-bit pages)
+    # options, comma-separated: "issue" = a full page group starts its page
+    # copies without a per-page live check or block-table clamp; "slots<N>" =
+    # N page groups in the DMA ring (default 3); "quad" = fp8 queries and four
+    # pages per MXU row (contraction 4 x 128) instead of two. "issue" and
+    # "slots" are bit-identical; "quad" rounds the queries to fp8 (scores keep
+    # their order up to that rounding). Empty = off.
+    "TPU_MINIMAX_M3_INDEXER_DECODE_OPT": env_str(
+        "TPU_MINIMAX_M3_INDEXER_DECODE_OPT", ""
+    ),
     # TPU_MOE_SKIP_PADDED_TOKENS drops padded rows from the grouped matmul only
     # in batches of at least this many routes (T * top_k); smaller batches run
     # them as with the skip off (bitwise for real rows). 0 = every size.
