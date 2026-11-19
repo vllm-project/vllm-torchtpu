@@ -108,6 +108,8 @@ def _prepare_audio_encoder_metadata(
             "aftercnn_lens": [],
             "tokens_per_chunk": 0,
         }
+    if bool((lens_cpu < 0).any().item()):
+        raise ValueError(f"feature_lens must be non-negative, got {lens_cpu.tolist()}.")
 
     window_size = self.n_window * 2
     chunk_nums_t = torch.clamp_min(
@@ -299,16 +301,28 @@ def _padded_forward_with_encoder_metadata(
     window_size = self.n_window * 2
     buckets = _AUDIO_CHUNK_BUCKETS
     max_bucket = buckets[-1]
-    assert self.n_window_infer > 0 and self.n_window_infer % window_size == 0, (
-        f"n_window_infer ({self.n_window_infer}) must be a positive multiple "
-        f"of 2 * n_window ({window_size})."
-    )
+    if self.n_window_infer <= 0 or self.n_window_infer % window_size != 0:
+        raise ValueError(
+            f"n_window_infer ({self.n_window_infer}) must be a positive multiple "
+            f"of 2 * n_window ({window_size})."
+        )
     chunks_per_attn_window = self.n_window_infer // window_size
-    assert max_bucket % chunks_per_attn_window == 0, (
-        f"max_bucket ({max_bucket}) must be divisible by "
-        f"n_window_infer // (2 * n_window) ({chunks_per_attn_window}) "
-        "so multi-pass splits preserve attention window boundaries."
+    if max_bucket % chunks_per_attn_window != 0:
+        raise ValueError(
+            f"max_bucket ({max_bucket}) must be divisible by "
+            f"n_window_infer // (2 * n_window) ({chunks_per_attn_window}) "
+            "so multi-pass splits preserve attention window boundaries."
+        )
+    max_item_cu_entries = (
+        max_bucket // chunks_per_attn_window + _CU_SEQLENS_RESERVED_ENTRIES
     )
+    if max_item_cu_entries > _CU_SEQLENS_BLOCK_SIZE:
+        raise ValueError(
+            f"A full {max_bucket}-window clip needs up to {max_item_cu_entries} "
+            f"cu_seqlens entries (n_window_infer // (2 * n_window)="
+            f"{chunks_per_attn_window}), exceeding _CU_SEQLENS_BLOCK_SIZE "
+            f"({_CU_SEQLENS_BLOCK_SIZE})."
+        )
 
     device = self.conv2d1.weight.device
     dtype = self.conv2d1.weight.dtype

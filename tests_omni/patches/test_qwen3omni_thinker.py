@@ -210,14 +210,35 @@ def test_forward_chunks_raises_not_implemented() -> None:
         cls.forward_chunks(enc, torch.zeros(8, 16, 100), metadata)
 
 
-@pytest.mark.parametrize("n_window_infer", [300, 600, 1200])
-def test_unaligned_attention_window_ratio_raises(n_window_infer: int) -> None:
+@pytest.mark.parametrize(
+    ("n_window_infer", "match"),
+    [
+        (0, "positive multiple"),
+        (150, "positive multiple"),
+        (100, "exceeding _CU_SEQLENS_BLOCK_SIZE"),
+        (300, "divisible"),
+        (600, "divisible"),
+        (1200, "divisible"),
+    ],
+)
+def test_invalid_attention_window_config_raises_value_error(
+    n_window_infer: int, match: str
+) -> None:
     cls = Qwen3OmniMoeAudioEncoder
     assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
     enc = _make_dummy_audio_encoder(n_window_infer=n_window_infer)
     lens = torch.tensor([800], dtype=torch.long)
-    with pytest.raises(AssertionError, match="divisible"):
+    with pytest.raises(ValueError, match=match):
         cls.forward(enc, torch.zeros(16, 800), lens, torch.tensor([104]))
+
+
+@pytest.mark.parametrize("bad_lens", [[-10], [800, -1]])
+def test_negative_feature_lens_raises_value_error(bad_lens: list[int]) -> None:
+    cls = Qwen3OmniMoeAudioEncoder
+    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
+    enc = _make_dummy_audio_encoder()
+    with pytest.raises(ValueError, match="non-negative"):
+        cls.prepare_encoder_metadata(enc, bad_lens)
 
 
 @pytest.mark.parametrize(
