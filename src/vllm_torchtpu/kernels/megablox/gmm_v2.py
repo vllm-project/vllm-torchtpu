@@ -810,6 +810,17 @@ def inner_kernel(
             )
         else:
             k1_idx = (m_end_local - 1) // cfgs.tiles.bucket_base
+        if os.environ.get("TPU_GMM_V2_K1_PROBE") == "dummy":
+            # Diagnostic: one extra never-taken branch with no body.
+            k1_branches.append(lambda: None)
+        elif os.environ.get("TPU_GMM_V2_K1_PROBE") == "dupe":
+            # Diagnostic: one extra never-taken full-size body.
+            k1_branches.append(
+                functools.partial(
+                    _matmul, is_first_k_step=True, is_last_k_step=True,
+                    bucket_m=bucket_sizes[-1], rhs_pre=rhs_pre,
+                )
+            )
         if len(k1_branches) == 1:
             k1_branches[0]()
         else:
