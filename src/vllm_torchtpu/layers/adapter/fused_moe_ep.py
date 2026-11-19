@@ -278,6 +278,17 @@ def _build_op(
                 x.shape[0], mesh.shape[EP_AXIS_NAME], token_replica_groups
             )
             ovr = _dedup_overrides()
+            if dedup_topology is not None and t_local <= ovr.direct_max_t:
+                # G3-LOCAL hybrid: buckets at or below DEDUP_MOE_DIRECT_MAX_T
+                # (decode) take the direct path, the same kernel BOARD_SIZE=0
+                # builds; larger (prefill) buckets keep De-Dup.
+                dedup_topology = None
+                logger.info(
+                    "[VLLM_TT] De-Dup hybrid | t_local=%d <= direct_max_t=%d "
+                    "-> direct",
+                    t_local,
+                    ovr.direct_max_t,
+                )
             tile_m = (
                 ovr.prefill_capacity
                 if (
@@ -1575,6 +1586,7 @@ class _DedupOverrides(NamedTuple):
 
     decode_waves: int
     decode_max_t: int
+    direct_max_t: int
     prefill_capacity: int
     prefill_capacity_min_t: int
     kernel_options: tuple
@@ -1617,6 +1629,11 @@ def _dedup_overrides():
     """
     decode_waves = int(os.environ.get("DEDUP_MOE_DECODE_WAVES", "0") or 0)
     decode_max_t = int(os.environ.get("DEDUP_MOE_DECODE_MAX_T", "96") or 96)
+    # DEDUP_MOE_DIRECT_MAX_T (0 = off): buckets with t_local <= this run the
+    # direct path even when DEDUP_MOE_BOARD_SIZE arms De-Dup (G3-LOCAL hybrid).
+    direct_max_t = int(os.environ.get("DEDUP_MOE_DIRECT_MAX_T", "0") or 0)
+    if direct_max_t < 0:
+        raise ValueError(f"DEDUP_MOE_DIRECT_MAX_T={direct_max_t} must be >= 0")
     prefill_capacity = int(
         os.environ.get("DEDUP_MOE_PREFILL_CAPACITY", "0") or 0
     )
@@ -1638,6 +1655,7 @@ def _dedup_overrides():
     return _DedupOverrides(
         decode_waves,
         decode_max_t,
+        direct_max_t,
         prefill_capacity,
         prefill_capacity_min_t,
         _json_options("DEDUP_MOE_KERNEL_OPTS"),
