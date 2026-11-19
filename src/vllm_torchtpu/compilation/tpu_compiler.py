@@ -464,6 +464,11 @@ _RUNTIME_CACHE_KEY_EXCLUDED_PATHS = (
     "vllm_torchtpu/kernels/diffusion_attention",
     "vllm_torchtpu/omni/attention.py",
     "vllm_torchtpu/omni/rope.py",
+    # q38 oxpd form (Q38_OXPD_FORM=1, see vllm_torchtpu/__init__.py): a second
+    # copy of the package that this form never imports. No hashed path above
+    # contains it, so listing it changes no hash; it keeps the importer scans
+    # (test_runtime_hash_excluded_kernels_stay_omni_only) off that copy.
+    "vllm_torchtpu/_forms",
 )
 
 

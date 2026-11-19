@@ -20,11 +20,14 @@ once, when ``vllm_torchtpu`` is first imported, from ``Q38_OXPD_FORM``:
   body is stored byte for byte in ``_bl_init.py`` and executes here, in this
   module's namespace; every submodule loads from this directory as before.
 * ``1``: the q38 oxpd form, the ``src/vllm_torchtpu`` tree of q38 commit
-  2bc75911f5 ("w3"), stored byte for byte in ``_oxpd/``. The package
-  ``__path__`` is pointed at ``_oxpd/``, so every ``vllm_torchtpu.*`` submodule
-  loads from there, and that tree's ``__init__`` executes here.
+  2bc75911f5 ("w3"), stored byte for byte in ``_forms/oxpd/vllm_torchtpu/``.
+  The package ``__path__`` is pointed there, so every ``vllm_torchtpu.*``
+  submodule loads from it, and that tree's ``__init__`` executes here. The
+  extra ``_forms/oxpd/`` level keeps w3's own path logic exact: its
+  tpu_compiler hashes kernel sources relative to ``Path(__file__).parents[2]``,
+  which is ``_forms/oxpd/`` here and ``src/`` in a w3 checkout.
 
-Any other value is refused. Nothing from ``_oxpd/`` is imported when the gate
+Any other value is refused. Nothing from ``_forms/`` is imported when the gate
 is unset, and nothing from this directory except this file runs when it is set.
 The two forms cannot be mixed in one process.
 """
@@ -37,7 +40,7 @@ if _q38_form not in ("", "0", "1"):
         f"Q38_OXPD_FORM must be unset, 0 or 1 (got {_q38_form!r}); refusing to guess a form"
     )
 if _q38_form == "1":
-    __path__[:] = [_q38_os.path.join(_q38_os.path.dirname(__file__), "_oxpd")]
+    __path__[:] = [_q38_os.path.join(_q38_os.path.dirname(__file__), "_forms", "oxpd", "vllm_torchtpu")]
     _q38_body = _q38_os.path.join(__path__[0], "__init__.py")
     __file__ = _q38_body
     import sys as _q38_sys
