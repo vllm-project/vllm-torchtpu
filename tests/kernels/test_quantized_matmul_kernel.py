@@ -54,7 +54,7 @@ def _require_tpu_v7() -> None:
     device_kind = jax.devices()[0].device_kind
     match = re.match(r"^TPU[^\d]*(\d+)", device_kind)
     if match is None or int(match.group(1)) < 7:
-        pytest.fail(f"Expected TPU v7+, got {device_kind}.")
+        pytest.skip(f"Expected TPU v7+, got {device_kind}.")
 
 
 def _assert_allclose(actual, expected, atol=0.5, rtol=0.5) -> None:

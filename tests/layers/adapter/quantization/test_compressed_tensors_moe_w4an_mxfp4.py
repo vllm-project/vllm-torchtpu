@@ -39,6 +39,8 @@ class FakeRoutedExperts(RoutedExperts):
         self.e_score_correction_bias = None
         self.routed_scaling_factor = 1.0
         self.renormalize = True
+        # Set by VllmMoERunner; moe_routing.route reads it.
+        self.capture_fn = None
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id):
         return expert_id
@@ -133,7 +135,11 @@ def test_mxfp4_create_weights_and_process():
     ) as mock_prebuild:
         method.process_weights_after_loading(layer)
     mock_prebuild.assert_called_once_with(
-        topk=2, activation="silu", use_ep=False, skip_padded_tokens=True
+        topk_weights_float32=False,
+        topk=2,
+        activation="silu",
+        use_ep=False,
+        skip_padded_tokens=True,
     )
 
     # Validate output
@@ -647,7 +653,7 @@ def test_preselected_routes_keep_padding_and_skip_router(monkeypatch):
     monkeypatch.setattr(
         module.moe_routing,
         "route",
-        lambda *args: (calls.append("router") or (weights, ids)),
+        lambda *args, **kwargs: (calls.append("router") or (weights, ids)),
     )
 
     def mask(ids, weights, is_local_tensor):

@@ -12,15 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from types import SimpleNamespace
 
+import jax
 import jax.numpy as jnp
 import pytest
 import torch
+from jax import export
+from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
+    config as compressor_config,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    config as streamidx_config,
+)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+    deepseek_v4_indexer as indexer_mod,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
+    VllmDeepseekV4Indexer,
     VllmDeepseekV4IndexerCache,
     _indexer_jax,
     static_verify_q_len,
@@ -124,3 +138,72 @@ def test_knob_turns_the_static_pass_off_but_never_on(monkeypatch):
     monkeypatch.setattr(envs, "TPU_SPEC_STATIC_VERIFY", True)
     assert static_verify_q_len(_config("deepseek_v4", 5)) == 6
     assert static_verify_q_len(_config("qwen3_5", 5)) is None
+
+
+class _FakeJaxOp:
+    def __init__(self, name, fn, **kwargs):
+        self.name, self.fn = name, fn
+
+    def register_fake(self, fn):
+        pass
+
+
+def _build_op(monkeypatch, layer, chunk_tokens):
+    """`_build_indexer_op` of the CSA layer `layer`, with `pallas.jax_op` faked."""
+    monkeypatch.setattr(envs, "TPU_STREAMIDX_CHUNK_TOKENS", chunk_tokens)
+    monkeypatch.setattr(indexer_mod, "_indexer_op_cache", {})
+    monkeypatch.setattr(indexer_mod.pallas, "jax_op", _FakeJaxOp)
+    monkeypatch.setattr(indexer_mod, "get_pallas_op_mesh", lambda: None)
+    monkeypatch.setattr(indexer_mod, "get_current_vllm_config", lambda: None)
+    indexer = VllmDeepseekV4Indexer.__new__(VllmDeepseekV4Indexer)
+    object.__setattr__(indexer, "topk_tokens", 512)
+    object.__setattr__(indexer, "compress_ratio", 4)
+    object.__setattr__(indexer, "softmax_scale", 0.088)
+    object.__setattr__(indexer, "n_head", 64)
+    object.__setattr__(
+        indexer,
+        "k_cache",
+        SimpleNamespace(prefix=f"model.layers.{layer}.attn.indexer.k_cache"),
+    )
+    return indexer._build_indexer_op
+
+
+def test_unchunked_layers_share_one_indexer_op(monkeypatch):
+    build_first, build_second = (_build_op(monkeypatch, i, None) for i in (2, 4))
+    first = build_first()
+    assert build_second() is first
+    assert first.fn.keywords["scheduling_group_slot"] is None
+
+
+def _group_ids(fn):
+    """Scheduling group ids in `fn`, lowered for TPU on an abstract mesh."""
+    t, h, pages = 128, 4, 8
+    args = (
+        jax.ShapeDtypeStruct((t, h, 128), jnp.bfloat16),  # q
+        jax.ShapeDtypeStruct((t,), jnp.int32),  # positions
+        jax.ShapeDtypeStruct((4096, 64), jnp.float32),  # cos_sin_cache
+        jax.ShapeDtypeStruct((t, h), jnp.float32),  # indexer_weights
+        jax.ShapeDtypeStruct(  # SEQ_ALONG_LANE cache
+            (pages, compressor_config.SAL_SUBLANE_GROUPS, 4, 256), jnp.uint8
+        ),
+        jax.ShapeDtypeStruct((2,), jnp.int32),  # seq_lens
+        jax.ShapeDtypeStruct((2, pages // 2), jnp.int32),  # page_indices
+        jax.ShapeDtypeStruct((3,), jnp.int32),  # cu_q_lens
+        jax.ShapeDtypeStruct((3,), jnp.int32),  # distribution
+    )
+    mesh = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(mesh):
+        text = export.export(jax.jit(fn), platforms=("tpu",))(*args).mlir_module()
+    return set(map(int, re.findall(r'_scheduling_group_id\s*=\s*"?(\d+)', text)))
+
+
+def test_chunked_layers_get_their_own_op_and_groups(monkeypatch):
+    """A shared op would put one layer's scheduling groups in every layer."""
+    first = _build_op(monkeypatch, 2, 32)()
+    second = _build_op(monkeypatch, 4, 32)()
+    assert first is not second and first.name != second.name
+    streamidx_config.reset_scheduling_group_ids()
+    ids = [_group_ids(op.fn) for op in (first, second)]
+    # 128 tokens in chunks of 32: 4 chunks, 3 groups per layer.
+    assert [len(layer) for layer in ids] == [3, 3], ids
+    assert not ids[0] & ids[1], ids

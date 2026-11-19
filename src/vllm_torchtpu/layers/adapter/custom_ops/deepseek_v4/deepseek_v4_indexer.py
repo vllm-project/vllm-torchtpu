@@ -37,6 +37,9 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     get_kv_cache_shape,
     streamindex_topk,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    config as streamidx_config,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,
 )
@@ -109,6 +112,8 @@ def _indexer_jax(
     softmax_scale: float,
     n_head: int,
     verify_q_len: int | None = None,
+    chunk_tokens: int | None = None,
+    scheduling_group_slot: int | None = None,
 ) -> jax.Array:
     if cache_kv.shape[0] == 0:
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
@@ -157,9 +162,12 @@ def _indexer_jax(
             num_kv_pages_per_block=(32, 64, 32),
             num_queries_per_block=(1, 32, 32),
             decode_req_batch_size=4,
-            chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
+            chunk_tokens=chunk_tokens,
             kv_layout=KVLayout.SEQ_ALONG_LANE,
             uniform_q_len=verify_q_len,
+            scheduling_group_slot=streamidx_config.chunked_scheduling_group_slot(
+                scheduling_group_slot, q_quant.shape[0], chunk_tokens
+            ),
         )
 
     return _indexer_local(
@@ -217,6 +225,20 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         # Speculative verify windows all hold K + 1 tokens; the runner puts
         # them in `[distribution[0], distribution[1])`.
         verify_q_len = static_verify_q_len(get_current_vllm_config())
+        # None means unchunked. The kernel falls back to a single unpipelined
+        # pass when the token bucket is not a multiple of the chunk.
+        chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        # Unchunked, the CSA layers share one op (below): the kernel has no
+        # scheduling groups, so a layer reusing another's trace is harmless.
+        # Chunked, the pipeline's scheduling group ids are fixed when the op is
+        # traced, so a shared op would put the same groups in every layer and
+        # libtpu rejects the program ("annotation groups with gaps"): each
+        # layer then gets its own op and its own slot.
+        scheduling_group_slot = (
+            None
+            if chunk_tokens is None
+            else streamidx_config.layer_scheduling_group_slot(self.k_cache.prefix)
+        )
 
         wrapped_fn = functools.partial(
             _indexer_jax,
@@ -225,6 +247,8 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             softmax_scale=self.softmax_scale,
             n_head=self.n_head,
             verify_q_len=verify_q_len,
+            chunk_tokens=chunk_tokens,
+            scheduling_group_slot=scheduling_group_slot,
         )
 
         _scale = (
@@ -236,6 +260,8 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             f"pallas::deepseek_v4_indexer_k{self.topk_tokens}"
             f"_c{self.compress_ratio}_h{self.n_head}_s{_scale}"
             f"{'' if verify_q_len is None else f'_vq{verify_q_len}'}"
+            f"{'' if chunk_tokens is None else f'_ct{chunk_tokens}'}"
+            f"{'' if scheduling_group_slot is None else f'_sg{scheduling_group_slot}'}"
         )
         global _indexer_op_cache
         if op_name in _indexer_op_cache:

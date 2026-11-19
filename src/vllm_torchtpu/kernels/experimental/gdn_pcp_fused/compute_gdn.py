@@ -13,7 +13,8 @@
 # limitations under the License.
 
 # Forked from vllm_torchtpu/kernels/gdn/v3/compute_gdn.py.
-# Upstream V3 changes ported by hand through #1422.
+# Upstream V3 changes ported by hand through #1422, plus direct
+# solve_triangular_rhs (superseding #2438's invert_triangular_matrix check).
 # This copy is owned by the PCP workstream and must not import from
 # kernels/gdn/v3. Upstream V3 changes are not picked up automatically;
 # see README.md in this directory.

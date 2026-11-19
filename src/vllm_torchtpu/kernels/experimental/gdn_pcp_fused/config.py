@@ -13,7 +13,8 @@
 # limitations under the License.
 
 # Forked from vllm_torchtpu/kernels/gdn/v3/config.py.
-# Upstream V3 changes ported by hand through #1422.
+# Upstream V3 changes ported by hand through #1422, plus #2438's power-of-two
+# triangular_block_size selection (with an 8-row floor for GDN).
 # This copy is owned by the PCP workstream and must not import from
 # kernels/gdn/v3. Upstream V3 changes are not picked up automatically;
 # see README.md in this directory.

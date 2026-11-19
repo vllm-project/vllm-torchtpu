@@ -20,6 +20,7 @@ from typing import Any
 
 import torch
 from torch_tpu._internal import pallas
+from vllm.config import get_current_vllm_config_or_none
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
@@ -29,23 +30,46 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
     resolve_onehot_permute_threshold,
     unpack_fp4_to_e2m1,
 )
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.moe_reference_parity import (
+    SILU_BF16_KEY,
+    get_moe_reference_parity,
+)
+
+logger = init_logger(__name__)
+
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
+_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool, bool], Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
 
 
-def _resolve_activation_name(activation: Any) -> str:
+def resolve_activation_name(activation: Any) -> str:
+    """Plain string for vLLM's MoE activation enum or string."""
     if isinstance(activation, enum.Enum):
         return activation.value
     return activation.value if hasattr(activation, "value") else str(activation)
 
 
+def resolve_silu_bf16(activation: str, enabled: bool) -> str:
+    """Return gmm_v2's "silu_bf16" for "silu" when `enabled`.
+
+    Called once per layer at weight load, outside jit, so the name is a static
+    argument of every compiled MoE program and every kernel cache key. The v2
+    fused EP, fused decode, TP decode and dense-expert kernels fuse only
+    "silu" and decline "silu_bf16" in their admission checks, so the layer
+    runs on gmm_v2; the adaptive fused EP kernel raises on it at startup.
+    Other activations, including the clamped "silu_and_mul_with_clamp", are
+    returned unchanged.
+    """
+    return "silu_bf16" if enabled and activation == "silu" else activation
+
+
 def get_fused_moe_activation(activation, moe_config) -> str:
     """Encode vLLM's activation config for the Pallas GMM kernel."""
-    activation = _resolve_activation_name(activation)
+    activation = resolve_activation_name(activation)
     if activation != "situ":
         return activation
 
@@ -66,6 +90,9 @@ class TpuMoEActivationMixin:
     """
 
     _tpu_activation_str: str | None = None
+    # additional_config["tpu_moe_topk_weights_float32"], set with the
+    # activation at weight load.
+    _tpu_topk_weights_float32: bool = False
 
     def _resolve_tpu_activation(self, layer) -> str:
         """Encode this layer's activation for the kernel.
@@ -76,9 +103,34 @@ class TpuMoEActivationMixin:
         return get_fused_moe_activation(layer.activation, layer.moe_config)
 
     def _set_tpu_activation(self, layer) -> str:
-        """Resolve and store; returns it, since callers also use it locally."""
-        self._tpu_activation_str = self._resolve_tpu_activation(layer)
-        return self._tpu_activation_str
+        """Resolve and store; returns it, since callers also use it locally.
+
+        Also applies the MoE reference-parity settings (moe_reference_parity.py).
+        Runs at weight load, so the `additional_config` read and the logging
+        stay out of the compiled forward.
+        """
+        parity = get_moe_reference_parity(get_current_vllm_config_or_none())
+        self._tpu_topk_weights_float32 = parity.topk_weights_float32
+        activation = self._resolve_tpu_activation(layer)
+        resolved = resolve_silu_bf16(activation, parity.silu_bf16)
+        if resolved != activation:
+            logger.info_once(
+                "additional_config[%r]=true: SiLU MoE layers run gmm_v2 with "
+                "activation 'silu_bf16'; the v2 fused EP, fused decode, TP "
+                "decode and dense-expert MoE kernels, which fuse only 'silu', "
+                "are not used.",
+                SILU_BF16_KEY,
+            )
+            if envs.TPU_MOE_DENSE_EXPERT_THRESHOLD > 0:
+                logger.warning_once(
+                    "additional_config[%r]=true turns off the dense-expert MoE "
+                    "path that TPU_MOE_DENSE_EXPERT_THRESHOLD=%d selects: "
+                    "dense_expert_moe fuses only 'silu'.",
+                    SILU_BF16_KEY,
+                    envs.TPU_MOE_DENSE_EXPERT_THRESHOLD,
+                )
+        self._tpu_activation_str = resolved
+        return resolved
 
 
 def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
@@ -157,6 +209,7 @@ def _build_fused_moe_custom_op(
     use_ep: bool,
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
+    topk_weights_float32: bool = False,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -181,6 +234,7 @@ def _build_fused_moe_custom_op(
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        topk_weights_float32=topk_weights_float32,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
@@ -192,7 +246,14 @@ def _build_fused_moe_custom_op(
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+        topk_weights_float32,
+    )
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -204,10 +265,18 @@ def _get_fused_moe_custom_op(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    topk_weights_float32: bool = False,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+        topk_weights_float32,
+    )
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -217,6 +286,7 @@ def _get_fused_moe_custom_op(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        topk_weights_float32=topk_weights_float32,
     )
 
 
@@ -227,6 +297,7 @@ def prebuild_fused_moe_kernel(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    topk_weights_float32: bool = False,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -235,6 +306,7 @@ def prebuild_fused_moe_kernel(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        topk_weights_float32=topk_weights_float32,
     )
 
 
@@ -253,6 +325,7 @@ def fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    topk_weights_float32: bool = False,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
@@ -273,6 +346,7 @@ def fused_moe_gmm(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        topk_weights_float32=topk_weights_float32,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
