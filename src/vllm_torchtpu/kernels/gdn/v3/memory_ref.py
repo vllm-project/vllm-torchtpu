@@ -293,16 +293,18 @@ class _GranuleStateRef(BaseBufferedRef):
     offset: int = dataclasses.field(default=0, metadata=dict(static=True))
 
     def _granule_width(self, ref: jax.Ref) -> int:
-        """Words per DMA granule (see `granule_view`).
+        """Number of 32-bit words per DMA granule (see `granule_view`).
 
-        fp32 VMEM is tiled (8, 128), and Mosaic only allows reshapes that keep
-        the lane axis intact. A row of up to 128 words is contiguous, so
-        128-word granules work. A wider row (e.g. d_v = 512) spans several
-        tiles, so the whole row is used as the granule.
+        fp32 VMEM is tiled (8, 128), and Mosaic only reshapes a VMEM ref if
+        its last (lane) axis stays intact. That gives three cases:
 
-        The unified pool always uses 128: its region offsets are in lane
-        rows, and `ref` there is the KV pool, not the state. The wrapper
-        rejects a unified pool with d_v > 128.
+          * Unified pool: 128 words (one lane row). Region offsets are in lane
+            rows, and `ref` is the KV pool, not the state. The wrapper rejects
+            d_v > 128 for the unified pool.
+          * Dense, last axis <= 128 words: 128 words. Such rows are contiguous,
+            so a granule may span several of them.
+          * Dense, last axis > 128 words (e.g. d_v = 512): the whole row, since
+            one row already spans several tiles.
         """
         num_lanes = pltpu.get_tpu_info().num_lanes
         if self.cfg.is_shared:
