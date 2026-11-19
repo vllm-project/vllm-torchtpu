@@ -64,10 +64,13 @@ def _kernel(
     key_windows = heads * per_head
     windows = key_windows + per_head
 
+    def at(offset, size):
+        return pl.ds(pl.multiple_of(offset, size), size)
+
     # Per-token FP8 activation quantization, as quantize_block does it.
     def x_copy(block, slot):
         return pltpu.make_async_copy(
-            x.at[pl.ds(block * quant_rows, quant_rows)], xb.at[slot], x_sem.at[slot]
+            x.at[at(block * quant_rows, quant_rows)], xb.at[slot], x_sem.at[slot]
         )
 
     blocks = tokens // quant_rows
@@ -85,25 +88,25 @@ def _kernel(
         a = xb[slot].astype(jnp.float32)
         scale = jnp.max(jnp.abs(a), axis=1, keepdims=True) / FP8_MAX
         scale = jnp.where(scale == 0, 1.0, scale)
-        rows = pl.ds(block * quant_rows, quant_rows)
+        rows = at(block * quant_rows, quant_rows)
         q[rows, :] = jnp.clip(a / scale, -FP8_MAX, FP8_MAX).astype(FP8)
         x_scale[rows, :] = scale
 
     def w_copy(i):
         return pltpu.make_async_copy(
-            w.at[:, pl.ds(i * window, window)], wb.at[i % 2], w_sem.at[i % 2]
+            w.at[:, at(i * window, window)], wb.at[i % 2], w_sem.at[i % 2]
         )
 
     def project(i, t):
         """BF16 projection of token tile t against weight window i, as FP32."""
-        rows = pl.ds(t * token_tile, token_tile)
+        rows = at(t * token_tile, token_tile)
         z = jax.lax.dot_general(
             q[rows, :],
             wb[i % 2],
             (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
         )
-        z = (z * x_scale[rows, :]) * w_scale[pl.ds(i * window, window)][None, :]
+        z = (z * x_scale[rows, :]) * w_scale[at(i * window, window)][None, :]
         return z.astype(jnp.bfloat16).astype(jnp.float32)
 
     # Hidden tiles stream in unit order; unit u reads rows/columns of the
@@ -119,7 +122,7 @@ def _kernel(
     def h_copy(cell, u):
         row, col = cell(u)
         return pltpu.make_async_copy(
-            hidden.at[pl.ds(row, token_tile), pl.ds(col, window)],
+            hidden.at[at(row, token_tile), at(col, window)],
             hb.at[u % 2],
             h_sem.at[u % 2],
         )
@@ -128,7 +131,7 @@ def _kernel(
         row, col = v_cell(u)
         return pltpu.make_async_copy(
             ob.at[u % 2],
-            out.at[pl.ds(row, token_tile), pl.ds(col, window)],
+            out.at[at(row, token_tile), at(col, window)],
             o_sem.at[u % 2],
         )
 
@@ -136,57 +139,55 @@ def _kernel(
     w_copy(1).start()
     h_copy(k_cell, 0).start()
 
-    # Key windows, head by head: lane-partial sums, reduced once per head.
-    @pl.loop(0, key_windows)
-    def _(i):
-        s, c = i // per_head, i % per_head
-        w_copy(i).wait()
+    # Key windows, head by head (heads unrolled, so weight rows and gate
+    # slots are static): lane-partial sums, reduced once per head.
+    for s in range(heads):
+        dot_sum[...] = jnp.zeros_like(dot_sum)
+        h_sum[...] = jnp.zeros_like(h_sum)
+        k_sum[...] = jnp.zeros_like(k_sum)
 
-        @pl.when(c == 0)
-        def _():
-            dot_sum[...] = jnp.zeros_like(dot_sum)
-            h_sum[...] = jnp.zeros_like(h_sum)
-            k_sum[...] = jnp.zeros_like(k_sum)
+        @pl.loop(0, per_head)
+        def _(c, s=s):
+            i = s * per_head + c
+            w_copy(i).wait()
+            cols = at(c * window, window)
+            qw = q_weight[s : s + 1, cols].astype(jnp.float32)
+            kw = k_weight[s : s + 1, cols].astype(jnp.float32)
 
-        @pl.loop(0, tiles)
-        def _(t):
-            u = i * tiles + t
+            @pl.loop(0, tiles)
+            def _(t):
+                u = i * tiles + t
 
-            @pl.when(u + 1 < key_windows * tiles)
+                @pl.when(u + 1 < key_windows * tiles)
+                def _():
+                    h_copy(k_cell, u + 1).start()
+
+                k = project(i, t)
+                h_copy(k_cell, u).wait()
+                h = hb[u % 2].astype(jnp.float32)
+                product = ((h * qw) * kw) * k
+                rows = at(t * token_tile, token_tile)
+                for lane in range(0, window, LANES):
+                    part = slice(lane, lane + LANES)
+                    dot_sum[rows, :] += product[:, part]
+                    h_sum[rows, :] += h[:, part] * h[:, part]
+                    k_sum[rows, :] += k[:, part] * k[:, part]
+
+            @pl.when(i + 2 < windows)
             def _():
-                h_copy(k_cell, u + 1).start()
+                w_copy(i + 2).start()
 
-            k = project(i, t)
-            h_copy(k_cell, u).wait()
-            h = hb[u % 2].astype(jnp.float32)
-            cols = pl.ds(c * window, window)
-            qw = q_weight[pl.ds(s, 1), cols].astype(jnp.float32)
-            kw = k_weight[pl.ds(s, 1), cols].astype(jnp.float32)
-            product = ((h * qw) * kw) * k
-            rows = pl.ds(t * token_tile, token_tile)
-            for lane in range(0, window, LANES):
-                part = slice(lane, lane + LANES)
-                dot_sum[rows, :] += product[:, part]
-                h_sum[rows, :] += h[:, part] * h[:, part]
-                k_sum[rows, :] += k[:, part] * k[:, part]
-
-        @pl.when(c == per_head - 1)
-        def _():
-            dot = jnp.sum(dot_sum[...], axis=1, keepdims=True)
-            dot = dot * jax.lax.rsqrt(
-                jnp.sum(h_sum[...], axis=1, keepdims=True) / dim + eps
-            )
-            dot = dot * (
-                jax.lax.rsqrt(jnp.sum(k_sum[...], axis=1, keepdims=True) / dim + eps)
-                * dim**-0.5
-            )
-            magnitude = jnp.sqrt(jnp.maximum(jnp.abs(dot), clamp))
-            signed = jnp.where(dot < 0, -magnitude, magnitude)
-            gate[s] = jax.nn.sigmoid(signed) * mask[...]
-
-        @pl.when(i + 2 < windows)
-        def _():
-            w_copy(i + 2).start()
+        dot = jnp.sum(dot_sum[...], axis=1, keepdims=True)
+        dot = dot * jax.lax.rsqrt(
+            jnp.sum(h_sum[...], axis=1, keepdims=True) / dim + eps
+        )
+        dot = dot * (
+            jax.lax.rsqrt(jnp.sum(k_sum[...], axis=1, keepdims=True) / dim + eps)
+            * dim**-0.5
+        )
+        magnitude = jnp.sqrt(jnp.maximum(jnp.abs(dot), clamp))
+        signed = jnp.where(dot < 0, -magnitude, magnitude)
+        gate[s] = jax.nn.sigmoid(signed) * mask[...]
 
     h_copy(v_cell, 0).start()
 
@@ -199,7 +200,7 @@ def _kernel(
         @pl.loop(0, tiles)
         def _(t):
             v = project(i, t)
-            rows = pl.ds(t * token_tile, token_tile)
+            rows = at(t * token_tile, token_tile)
             for s in range(heads):
                 u = (j * tiles + t) * heads + s
 
