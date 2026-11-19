@@ -67,7 +67,7 @@ def _chip_family() -> str | None:
 def has_calibrated_shape(model_config) -> bool:
     """Whether the checkpoint has the calibrated shape (Qwen3.5-397B-A17B's
     text config), whatever the device."""
-    text = getattr(model_config, "hf_text_config", None)
+    text = model_config.hf_text_config
     return all(getattr(text, k, None) == v for k, v in _CALIBRATED_SHAPE.items())
 
 
