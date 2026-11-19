@@ -47,7 +47,7 @@ from .chips import (
     resolve_chip_spec,
     verify_chip_spec_against_jax,
 )
-from .cli import build_arg_parser, main
+from .cli import build_arg_parser, derive_decoding_sequences, main
 from .models import (
     DEPLOYMENT_PRESET_SOURCES,
     DEPLOYMENT_PRESETS,
@@ -204,6 +204,7 @@ __all__ = [
     "constants",
     "declared_collectives",
     "default_double_buffer_ring_plan",
+    "derive_decoding_sequences",
     "detect_tpu_from_sysfs",
     "effective_expert_owner_groups",
     "evaluate_support",
