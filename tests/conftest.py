@@ -274,6 +274,25 @@ def device(request):
     return torch.device("cpu")
 
 
+@pytest.fixture
+def accelerator_type(monkeypatch):
+    """Sets the accelerator type ``tpu_info`` reads: ``accelerator_type(value)``.
+    Its chip lookups are cached, so the caches are cleared on each call and at
+    teardown."""
+    from vllm_torchtpu import tpu_info
+
+    def clear_chip_caches():
+        tpu_info.find_chip_version.cache_clear()
+        tpu_info.get_chip_version.cache_clear()
+
+    def use(value):
+        monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: value)
+        clear_chip_caches()
+
+    yield use
+    clear_chip_caches()
+
+
 def pytest_collection_finish(session):
     """Fail fast if collecting the suite claimed the accelerator.
 
