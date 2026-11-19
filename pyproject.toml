@@ -71,8 +71,11 @@ dependencies = [
     "jax==0.11.2",
     "jaxlib==0.11.2",
     # The routing MoE kernel (USE_ROUTING_MOE, layers/adapter/routing_moe.py) is
-    # tokamax's; imported only on that path.
-    "tokamax==0.0.18.dev20261103",
+    # tokamax's; imported only on that path. 0.0.18's routing_moe is tokamax
+    # main @86a9452 (2026-11-18). Its metadata asks for jax>=0.12.0, but
+    # routing_moe runs on the jax pinned above, so install it with --no-deps
+    # (and its other requirements from its metadata) until jax moves to 0.12.
+    "tokamax==0.0.18",
     # tpu-sync-torch requires libtpu>=0.0.47. The workarounds in
     # src/vllm_torchtpu/env_override.py (SC-offload threshold gate) and the
     # per-config LIBTPU_INIT_ARGS additions under
