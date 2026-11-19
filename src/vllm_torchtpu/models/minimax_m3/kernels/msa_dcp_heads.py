@@ -608,9 +608,7 @@ def exchange_head_pages_wait(
         ),
         out_shape=out_shape,
         input_output_aliases={2: 0},
-        compiler_params=pltpu.CompilerParams(
-            collective_id=_EXCHANGE_COLLECTIVE_ID, has_side_effects=True
-        ),
+        compiler_params=pltpu.CompilerParams(has_side_effects=True),
         interpret=pltpu.InterpretParams() if interpret else False,
         name="minimax_m3_msa_dcp_exchange_wait",
     )(live, rank, out, send_sem, recv_sem)
