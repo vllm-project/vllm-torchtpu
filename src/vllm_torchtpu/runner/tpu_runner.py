@@ -6428,8 +6428,11 @@ class TPUModelRunner(GPUModelRunner):
                     # A REPLICATED (tp=1) draft moves to the LOCAL
                     # (non-shard_map) kernel, which is 1-wide; its width is
                     # folded into the threshold below. On a pipeline stage
-                    # whose target also runs at tp=1 the draft shares the
-                    # target's kernel, which reads the pool's KV layout.
+                    # whose target also runs at tp=1 (the PP8 x TP1 prefill
+                    # legs) the draft shares the target's kernel instead: the
+                    # local kernel cannot read every pool layout a stage
+                    # allocates (it has no block-major path), while the
+                    # target's kernel reads the pool as the stage allocated it.
                     replicated_draft = False
                     if is_draft:
                         assert self.speculative_config is not None
