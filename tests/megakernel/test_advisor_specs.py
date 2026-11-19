@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import dataclasses
 import json
 import re
@@ -38,6 +39,17 @@ SOURCE_PREFIXES = ("FACT:", "DERIVED:", "ASSUMED:", "CHOSEN:")
 
 
 SHIPPED_PRESET_COUNT = 13
+HF_CONFIG_DIR = Path(__file__).resolve().parent / "data" / "advisor" / "hf_configs"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load_config_snapshots() -> dict[str, dict[str, object]]:
+    """Load saved HuggingFace config snapshots keyed by preset slug."""
+    return {
+        snapshot_path.stem: json.loads(snapshot_path.read_text(encoding="utf-8"))
+        for snapshot_path in sorted(HF_CONFIG_DIR.glob("*.json"))
+    }
+
 
 # Shared HF config fixtures for custom architectures removed from models.json
 # (tested strictly via model_profile_from_hf_config / --model <config.json>).
@@ -143,6 +155,23 @@ QWEN35_397B_CFG: dict[str, object] = {
     "quantization_config": {"quant_method": "fp8"},
 }
 
+
+def _load_kimi_k3_pro_dsa_and_ignore() -> tuple[object, object]:
+    """Load `dsa_config` and `quantization_config.ignore` from Kimi-K3.1-Pro JSON."""
+    payload = json.loads(
+        (HF_CONFIG_DIR / "kimi-k3.1-pro.json").read_text(encoding="utf-8")
+    )
+    text_cfg = payload["config"]["text_config"]
+    return (
+        copy.deepcopy(text_cfg["dsa_config"]),
+        copy.deepcopy(text_cfg["quantization_config"]["ignore"]),
+    )
+
+
+_KIMI_K3_PRO_DSA_AND_IGNORE = _load_kimi_k3_pro_dsa_and_ignore()
+_KIMI_K3_PRO_DSA_CONFIG = _KIMI_K3_PRO_DSA_AND_IGNORE[0]
+_KIMI_K3_PRO_QUANT_IGNORE = _KIMI_K3_PRO_DSA_AND_IGNORE[1]
+
 KIMI_K3_PRO_CFG: dict[str, object] = {
     "model_type": "kimi_linear",
     "num_hidden_layers": 93,
@@ -168,7 +197,12 @@ KIMI_K3_PRO_CFG: dict[str, object] = {
         "head_v_dim": 128,
         "short_conv_kernel_size": 4,
     },
-    "quantization_config": {"quant_method": "fp8", "expert_dtype": "mxfp4"},
+    "dsa_config": _KIMI_K3_PRO_DSA_CONFIG,
+    "quantization_config": {
+        "quant_method": "fp8",
+        "expert_dtype": "mxfp4",
+        "ignore": _KIMI_K3_PRO_QUANT_IGNORE,
+    },
 }
 
 
@@ -1125,3 +1159,229 @@ def test_hf_config_deepseek_v4_compress_rates_mapping() -> None:
     )
     assert not qwen4_text_profile.architecture_unverified
     assert "hyper_connection" in qwen4_text_profile.layer_families
+
+
+def test_presets_match_cited_config() -> None:
+    """Verify every shipped preset with a config snapshot matches its parsed profile."""
+    snapshots = _load_config_snapshots()
+    assert snapshots
+    ignored_fields = {"name", "dtype_source", "kv_dtype", "state_dtype"}
+    dtype_fields = {"weight_dtype", "expert_dtype", "act_dtype", "weight_block_k"}
+    mismatches: list[str] = []
+    for preset_name, snapshot_payload in snapshots.items():
+        config_mapping = snapshot_payload["config"]
+        assert isinstance(config_mapping, dict)
+        text_subconfig = config_mapping.get("text_config")
+        text_mapping = text_subconfig if isinstance(text_subconfig, dict) else {}
+        dtype_basis = models.MODEL_PRESET_DTYPE_BASIS[preset_name]
+        if dtype_basis == "assumed":
+            has_quantization_config = (
+                "quantization_config" in config_mapping
+                or "quantization_config" in text_mapping
+            )
+            assert not has_quantization_config, (
+                f"{preset_name} has quantization_config despite dtype_basis='assumed'"
+            )
+        has_intermediate_key = any(
+            key in config_mapping or key in text_mapping
+            for key in ("intermediate_size", "ffn_dim")
+        )
+        parsed_profile = advisor.model_profile_from_hf_config(config_mapping)
+        preset_profile = advisor.MODEL_PRESETS[preset_name]
+        for profile_field in dataclasses.fields(models.ModelProfile):
+            field_name = profile_field.name
+            if field_name in ignored_fields:
+                continue
+            if field_name == "intermediate_size" and not has_intermediate_key:
+                continue
+            if field_name in dtype_fields and dtype_basis != "config":
+                continue
+            preset_value = getattr(preset_profile, field_name)
+            config_value = getattr(parsed_profile, field_name)
+            if field_name == "model_type":
+                preset_value = str(preset_value).removesuffix("_text")
+                config_value = str(config_value).removesuffix("_text")
+            if preset_value != config_value:
+                detail = f"preset={preset_value} config={config_value}"
+                mismatches.append(f"{preset_name}.{field_name}: {detail}")
+    assert mismatches == []
+
+
+def test_every_preset_has_snapshot_or_is_listed_unverified() -> None:
+    """Verify each preset has a matching snapshot or is explicitly marked unverified."""
+    revision_pattern = re.compile(r"[0-9a-f]{40}")
+    for preset_name in advisor.MODEL_PRESETS:
+        dtype_basis = models.MODEL_PRESET_DTYPE_BASIS[preset_name]
+        snapshot_path = HF_CONFIG_DIR / f"{preset_name}.json"
+        expects_snapshot = dtype_basis != "unverified"
+        assert snapshot_path.is_file() == expects_snapshot
+        if expects_snapshot:
+            snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            repo_id = str(snapshot_payload["repo_id"])
+            revision = str(snapshot_payload["revision"])
+            assert repo_id in models.MODEL_PRESET_SOURCES[preset_name]
+            assert revision_pattern.fullmatch(revision) is not None
+
+
+def test_config_path_honors_quantization_ignore_list() -> None:
+    """Verify HF config parsing honors per-module quantization skip lists."""
+    snapshots = _load_config_snapshots()
+    # Each expectation follows from that snapshot config's own skip list.
+    kimi_config = snapshots["kimi-k3"]["config"]
+    assert isinstance(kimi_config, dict)
+    kimi_profile = advisor.model_profile_from_hf_config(kimi_config)
+    assert kimi_profile.weight_dtype == "bf16"
+    assert kimi_profile.expert_dtype == "mxfp4"
+    assert kimi_profile.act_dtype == "bf16"
+
+    gpt_oss_config = snapshots["gpt-oss-120b"]["config"]
+    assert isinstance(gpt_oss_config, dict)
+    gpt_oss_profile = advisor.model_profile_from_hf_config(gpt_oss_config)
+    assert gpt_oss_profile.weight_dtype == "bf16"
+    assert gpt_oss_profile.expert_dtype == "mxfp4"
+
+    for preset_name in ("qwen3.5-397b", "glm-5.2"):
+        model_config = snapshots[preset_name]["config"]
+        assert isinstance(model_config, dict)
+        model_profile = advisor.model_profile_from_hf_config(model_config)
+        assert model_profile.weight_dtype == "fp8"
+        assert model_profile.expert_dtype == "fp8"
+
+    mla_config = copy.deepcopy(snapshots["deepseek-v3"]["config"])
+    assert isinstance(mla_config, dict)
+    mla_config["quantization_config"] = {
+        "quant_method": "fp8",
+        "modules_to_not_convert": [
+            "model.layers.*.self_attn.q_a_proj",
+            "model.layers.*.self_attn.kv_a_proj_with_mqa",
+        ],
+    }
+    mla_profile = advisor.model_profile_from_hf_config(mla_config)
+    assert mla_profile.weight_dtype == "bf16"
+    assert mla_profile.expert_dtype == "fp8"
+
+    qwen_base = snapshots["qwen3.5-397b"]["config"]
+    assert isinstance(qwen_base, dict)
+    qwen_text = qwen_base["text_config"]
+    assert isinstance(qwen_text, dict)
+    qwen_layer_types = qwen_text["layer_types"]
+    assert isinstance(qwen_layer_types, list)
+    qwen_full_modules = [
+        f"model.language_model.layers.{layer_idx}.self_attn.q_proj"
+        for layer_idx, layer_type in enumerate(qwen_layer_types)
+        if layer_type == "full_attention"
+    ]
+    for modules, expected_weight_dtype in (
+        (["model.language_model.layers.3.self_attn.q_proj"], "fp8"),
+        (qwen_full_modules, "bf16"),
+    ):
+        qwen_case_config = copy.deepcopy(qwen_base)
+        qwen_quant = qwen_case_config["quantization_config"]
+        assert isinstance(qwen_quant, dict)
+        qwen_quant["modules_to_not_convert"] = modules
+        qwen_case_profile = advisor.model_profile_from_hf_config(qwen_case_config)
+        assert qwen_case_profile.weight_dtype == expected_weight_dtype
+        assert qwen_case_profile.expert_dtype == "fp8"
+
+    kv_only_config = copy.deepcopy(snapshots["deepseek-v3"]["config"])
+    assert isinstance(kv_only_config, dict)
+    kv_only_config["quantization_config"] = {
+        "quant_method": "fp8",
+        "modules_to_not_convert": ["kv_a_proj_with_mqa"],
+    }
+    kv_only_profile = advisor.model_profile_from_hf_config(kv_only_config)
+    assert kv_only_profile.weight_dtype == "fp8"
+    assert kv_only_profile.expert_dtype == "fp8"
+
+
+def test_hf_config_parses_dsa_config() -> None:
+    """Verify nested dsa_config populates DSA dimensions and indexer layer counts."""
+    snapshots = _load_config_snapshots()
+    kimi_pro_config = snapshots["kimi-k3.1-pro"]["config"]
+    assert isinstance(kimi_pro_config, dict)
+    text_subconfig = kimi_pro_config["text_config"]
+    assert isinstance(text_subconfig, dict)
+    dsa_config = text_subconfig["dsa_config"]
+    assert isinstance(dsa_config, dict)
+    dsa_layers = dsa_config["dsa_layers"]
+    assert isinstance(dsa_layers, list)
+
+    kimi_pro_profile = advisor.model_profile_from_hf_config(kimi_pro_config)
+    assert kimi_pro_profile.index_topk == dsa_config["index_topk"]
+    assert kimi_pro_profile.index_head_dim == dsa_config["index_head_dim"]
+    assert kimi_pro_profile.index_n_heads == dsa_config["index_num_heads"]
+    assert kimi_pro_profile.num_indexer_layers == len(dsa_layers)
+    assert "dsa" in kimi_pro_profile.layer_families
+
+    kimi_config = snapshots["kimi-k3"]["config"]
+    assert isinstance(kimi_config, dict)
+    kimi_profile = advisor.model_profile_from_hf_config(kimi_config)
+    assert kimi_profile.index_topk == 0
+
+
+def test_declared_blocks_cite_openable_source() -> None:
+    """Verify each declared source_ref is a repo file, https URL, or unpublished."""
+    seen_blocks = 0
+    for deployment_preset in advisor.DEPLOYMENT_PRESETS.values():
+        candidate_layouts = (
+            deployment_preset.decode,
+            deployment_preset.prefill,
+            deployment_preset.saturation,
+            *deployment_preset.megakernel_layouts,
+        )
+        for layout in candidate_layouts:
+            if layout is None or layout.megakernel is None:
+                continue
+            seen_blocks += 1
+            megakernel_block = layout.megakernel
+            source_ref = megakernel_block.get("source_ref")
+            assert isinstance(source_ref, str)
+            assert source_ref
+            assert (
+                source_ref == "unpublished"
+                or source_ref.startswith("https://")
+                or (REPO_ROOT / source_ref).exists()
+            )
+    assert seen_blocks >= 1
+
+
+def test_preset_loaders_reject_malformed_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify config and preset parsers fail loudly on malformed fields."""
+    bad_skip_cfg = copy.deepcopy(DEEPSEEK_V3_CFG)
+    bad_skip_cfg["quantization_config"] = {
+        "quant_method": "fp8",
+        "ignore": ["re:[unclosed"],
+    }
+    with pytest.raises(
+        models.UnsupportedArchitectureError,
+        match="Invalid quantization skip pattern",
+    ):
+        advisor.model_profile_from_hf_config(bad_skip_cfg)
+
+    bad_deployments = {
+        "deployments": {
+            "broken-notes": {
+                "decode": {"tp": 8, "ep": 1},
+                "prefill": {"tp": 8, "ep": 1},
+                "unmodeled_notes": "not-a-list",
+            }
+        }
+    }
+    (tmp_path / "deployments.json").write_text(
+        json.dumps(bad_deployments), encoding="utf-8"
+    )
+    bad_models = {"presets": {"broken-basis": {"dtype_basis": "bogus"}}}
+    (tmp_path / "models.json").write_text(json.dumps(bad_models), encoding="utf-8")
+    monkeypatch.setattr(models, "PRESETS_DIR", tmp_path)
+    with pytest.raises(
+        errors.MegakernelConfigError,
+        match="unmodeled_notes must be a list of strings",
+    ):
+        models.load_deployment_presets()
+    with pytest.raises(
+        errors.MegakernelConfigError,
+        match="dtype_basis must be one of",
+    ):
+        models.load_preset_dtype_basis()
