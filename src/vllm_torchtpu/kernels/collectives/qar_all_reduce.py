@@ -64,6 +64,7 @@ def layout_table(devices: Sequence) -> np.ndarray:
     core index. The chip ring is (x0,y0) -> (x1,y0) -> (x1,y1) -> (x0,y1)."""
     if len(devices) != _N:
         raise ValueError(f"qar_all_reduce needs 8 TensorCores, got {len(devices)}")
+    devices = [_physical(d) for d in devices]
     chips = sorted({tuple(d.coords[:2]) for d in devices})
     if len(chips) != 4 or {d.core_on_chip for d in devices} != {0, 1}:
         raise ValueError(f"qar_all_reduce needs 4 chips x 2 cores: {chips}")
@@ -81,6 +82,30 @@ def layout_table(devices: Sequence) -> np.ndarray:
         tab[POS, i] = p
         tab[CORE, i] = core
     return tab
+
+
+class _Placed:
+    """A device's id with the physical coordinates layout_table needs."""
+
+    def __init__(self, id_: int, coords: tuple, core_on_chip: int):
+        self.id, self.coords, self.core_on_chip = id_, coords, core_on_chip
+
+
+def _physical(d):
+    """torch_tpu's Pallas mesh holds abstract devices with only an id. Take the
+    coordinates from jax.devices() when this process sees that id, else from a
+    tpu7x 2x2x1 host's numbering: id = 2 * chip + core, chip c at (c % 2, c // 2)
+    (read from jax.devices() on such a host)."""
+    if hasattr(d, "coords") and hasattr(d, "core_on_chip"):
+        return d
+    did = int(d.id)
+    for real in jax.devices():
+        if int(real.id) == did and hasattr(real, "coords"):
+            return real
+    if not 0 <= did < _N:
+        raise ValueError(f"qar_all_reduce: no coordinates for device id {did}")
+    chip = did // 2
+    return _Placed(did, (chip % 2, chip // 2, 0), did % 2)
 
 
 def padded_rows(rows: int) -> int:
