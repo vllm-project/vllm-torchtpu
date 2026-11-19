@@ -232,6 +232,7 @@ from vllm_torchtpu.tracing.utils import (
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
+    from vllm.config import SpeculativeConfig
     from vllm.model_executor.models.interfaces import SupportsPP
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
@@ -677,7 +678,7 @@ _TOPK_BUFFER_ATTRIBUTE = "topk_indices_buffer"
 _PP_CARRIED_FILL: dict[str, int] = {_TOPK_INDICES: -1}
 
 
-def _uses_hidden_state_drafter(spec: Any) -> bool:
+def _uses_hidden_state_drafter(spec: "SpeculativeConfig | None") -> bool:
     """Whether the speculative method drafts from the target's hidden states
     (eagle/MTP or dflash), on whichever pipeline stage hosts the draft."""
     if not spec:
