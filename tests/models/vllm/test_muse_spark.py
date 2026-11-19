@@ -19,12 +19,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.transformers_utils.configs.muse_spark import MuseSparkTextConfig
 
 from vllm_torchtpu.models.vllm.muse_spark.layers import (
     MuseResidual,
     MuseRMSNorm,
-    MuseRotaryEmbedding,
     attention_layout,
     selected_expert_outputs,
 )
@@ -266,14 +266,23 @@ def test_rope_matches_complex_rotation_across_window_boundary():
     generator = torch.Generator().manual_seed(7)
     x = torch.randn(3, 2, 64, generator=generator, dtype=torch.bfloat16)
     positions = torch.tensor([2047, 2048, 2049])
-    rope = MuseRotaryEmbedding(64, 2050, 500000.0)
+    rope = get_rope(
+        64,
+        2050,
+        is_neox_style=True,
+        rope_parameters={"rope_type": "default", "rope_theta": 500000.0},
+        dtype=torch.float32,
+    )
     freq = 1 / (500000.0 ** (torch.arange(0, 64, 2).float() / 64))
     phase = torch.outer(positions.float(), freq)
     rotation = torch.polar(torch.ones_like(phase), phase)
     z = torch.complex(*x.float().chunk(2, dim=-1))
     rotated = z * rotation[:, None, :]
     expected = torch.cat((rotated.real, rotated.imag), dim=-1).bfloat16()
-    torch.testing.assert_close(rope(x, positions), expected, rtol=0, atol=0)
+    assert rope.cos_sin_cache.dtype == torch.float32
+    q, k = rope(positions, x.float(), x.float())
+    torch.testing.assert_close(q.bfloat16(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(k.bfloat16(), expected, rtol=0, atol=0)
 
 
 def _loader_target():

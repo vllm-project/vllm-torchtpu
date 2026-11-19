@@ -35,6 +35,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -49,7 +50,6 @@ from vllm_torchtpu.logger import init_logger
 from .layers import (
     MuseResidual,
     MuseRMSNorm,
-    MuseRotaryEmbedding,
     attention_layout,
     selected_expert_outputs,
 )
@@ -329,10 +329,15 @@ class MuseAttention(nn.Module):
         )
         use_rope, window = attention_layout(config, layer_idx)
         self.rotary_emb = (
-            MuseRotaryEmbedding(
+            get_rope(
                 config.head_dim,
                 vllm_config.model_config.max_model_len,
-                config.layer_rope_theta[layer_idx],
+                is_neox_style=True,
+                rope_parameters={
+                    **config.rope_parameters,
+                    "rope_theta": config.layer_rope_theta[layer_idx],
+                },
+                dtype=torch.float32,
             )
             if use_rope
             else None
@@ -355,7 +360,9 @@ class MuseAttention(nn.Module):
         k = k.reshape(-1, self.num_kv_heads, self.head_dim)
         q, k = self.qk_norm(q), self.qk_norm(k)
         if self.rotary_emb is not None:
-            q, k = self.rotary_emb(q, positions), self.rotary_emb(k, positions)
+            # FP32 inputs keep the FP32 cos/sin table; round once afterwards.
+            q, k = self.rotary_emb(positions, q.float(), k.float())
+            q, k = q.to(x.dtype), cast(torch.Tensor, k).to(x.dtype)
         v = v.reshape(-1, self.num_kv_heads, self.head_dim)
         if self.attention_head_dim != self.head_dim:
             padding = (0, self.attention_head_dim - self.head_dim)
