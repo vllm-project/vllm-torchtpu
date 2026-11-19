@@ -154,7 +154,7 @@ def test_advisor_submodules_and_static_web_assets_packaged() -> None:
         ("qwen3.5-397b", "Qwen/Qwen3.5-397B-A17B-FP8", 60, 15, 45, 60, "fp8", "fp8"),
         ("qwen3.8-2.4t", "Qwen/Qwen3.8-2.4T-A95B", 92, 23, 69, 92, "fp8", "nvfp4"),
         ("kimi-k3", "moonshotai/Kimi-K3", 93, 24, 69, 92, "bf16", "mxfp4"),
-        ("kimi-k3.1-pro", "moonshotai/Kimi-K3.1-Pro", 93, 24, 69, 92, "fp8", "mxfp4"),
+        ("kimi-k3.1-pro", "moonshotai/Kimi-K3.1-Pro", 93, 24, 69, 92, "bf16", "mxfp4"),
         ("deepseek-v3", "deepseek-ai/DeepSeek-V3", 61, 61, 0, 58, "fp8", "fp8"),
         ("glm-5.2", "zai-org/GLM-5.2-FP8", 78, 78, 0, 75, "fp8", "fp8"),
         (
@@ -197,7 +197,7 @@ def test_advisor_submodules_and_static_web_assets_packaged() -> None:
             "fp8",
             "fp8",
         ),
-        ("gpt-oss-120b", "openai/gpt-oss-120b", 36, 36, 0, 36, "fp8", "mxfp4"),
+        ("gpt-oss-120b", "openai/gpt-oss-120b", 36, 36, 0, 36, "bf16", "mxfp4"),
     ],
 )
 def test_builtin_model_presets_and_hf_aliases(
@@ -455,9 +455,9 @@ def test_cli_json_presets_and_validation_errors(
     )
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["recommended_scope"] == "whole_step"
+    assert payload["recommended_scope"] == "per_op"
     assert payload["recommended_moe_mode"] == "dense_mlp"
-    assert payload["build_megakernel"] is True
+    assert payload["build_megakernel"] is False
     assert payload["vmem_budget_mib"] == resolve_chip_spec(
         "tpu7x"
     ).vmem_usable_bytes / (1024 * 1024)
@@ -714,11 +714,39 @@ def test_shared_assumptions_keep_decode_megakernel_verdict() -> None:
         assert row.step_upper_us > row.step_bound_us
 
 
+# On qwen3.5-397b decode (TP8 x DP2 x EP16 x DCP4, 16K context), whole_step crosses
+# from HBM-bound at batch=192 to compute-bound at batch=208 with n_splits=1, while
+# single_layer remains HBM-bound. At batch=192 whole_step wins at both launch-gap
+# corners; at batch=208 single_layer wins at the low corner and whole_step wins at
+# the high corner.
+LAUNCH_GAP_PRE_TIE_BATCH = 192
+LAUNCH_GAP_TIE_BATCH = 208
+
+
 @pytest.mark.usefixtures("without_declared_megakernels")
 def test_tie_only_when_winner_flips_between_corners() -> None:
-    """Verify VMEM-split decode boundary flips from single_layer to whole_step."""
+    """Verify decode crossover flips between corners at batch=208, not batch=192."""
+    below_workload = advisor.WorkloadSpec(
+        phase="decode",
+        batch=LAUNCH_GAP_PRE_TIE_BATCH,
+        tp=8,
+        dp=2,
+        ep=16,
+        dcp=4,
+        context=16384,
+    )
+    below_report = advisor.advise("qwen3.5-397b", below_workload, "tpu7x")
+    assert below_report.fastest_verdict == "megakernel_likely"
+    assert below_report.fastest_scope == "whole_step"
+
     workload = advisor.WorkloadSpec(
-        phase="decode", batch=512, tp=8, dp=2, ep=16, dcp=4, context=16384
+        phase="decode",
+        batch=LAUNCH_GAP_TIE_BATCH,
+        tp=8,
+        dp=2,
+        ep=16,
+        dcp=4,
+        context=16384,
     )
     report = advisor.advise("qwen3.5-397b", workload, "tpu7x")
     assert report.fastest_scope == "single_layer"
@@ -751,8 +779,25 @@ def test_measurements_narrow_scope_band_and_settle_verdict(tmp_path: Path) -> No
         ],
     }
     m_file.write_text(json.dumps(m_payload), encoding="utf-8")
+    below_wl = advisor.WorkloadSpec(
+        phase="decode",
+        batch=LAUNCH_GAP_PRE_TIE_BATCH,
+        tp=8,
+        dp=2,
+        ep=16,
+        dcp=4,
+        context=16384,
+    )
+    below_prior = advisor.advise("qwen3.5-397b", below_wl, "tpu7x")
+    assert not below_prior.fastest_verdict.startswith("tie(measure: ")
     cliff_wl = advisor.WorkloadSpec(
-        phase="decode", batch=512, tp=8, dp=2, ep=16, dcp=4, context=16384
+        phase="decode",
+        batch=LAUNCH_GAP_TIE_BATCH,
+        tp=8,
+        dp=2,
+        ep=16,
+        dcp=4,
+        context=16384,
     )
     prior = advisor.advise("qwen3.5-397b", cliff_wl, "tpu7x")
     assert prior.fastest_verdict.startswith("tie(measure: ")
@@ -954,7 +999,7 @@ def test_import_without_jax(monkeypatch: pytest.MonkeyPatch) -> None:
         adv_fresh.WorkloadSpec(phase="decode", batch=4, tp=8),
         "tpu7x",
     )
-    assert report.recommended_scope == "whole_step"
+    assert report.recommended_scope == "per_op"
 
 
 def test_objective_both_reports_disagreement() -> None:
@@ -1011,7 +1056,7 @@ def test_pd_disagg_alignment_qwen35_and_kimi_k3_and_dcn_handoff(
     k_sweep = advisor.advise_regimes("kimi-k3", "tpu7x")
     k_by_lbl = {r.label: r for r in k_sweep.regimes}
     assert k_by_lbl["Decode Med (B=16, T=1, 4K)"].fastest_scope == "whole_step"
-    assert k_by_lbl["Preset Prefill Window (W=2048)"].layout == "TP32 x EP16 x PCP32"
+    assert k_by_lbl["Preset Prefill Window (W=2048)"].layout == "TP32 x EP32 x PCP32"
     assert k_by_lbl["Preset Prefill Window (W=2048)"].fastest_scope == "layer_group"
     assert k_by_lbl["Preset Prefill Window (W=8192)"].fastest_scope == "layer_group"
 
@@ -1207,7 +1252,7 @@ def test_kimi_k3_deployment_preset_registered_and_evaluated() -> None:
         preset.prefill.tp,
         preset.prefill.ep,
         preset.prefill.pcp,
-    ) == (32, 32, 32, 32, 16, 32)
+    ) == (32, 32, 32, 32, 32, 32)
 
 
 def test_measured_collective_latency_moves_step_bound() -> None:

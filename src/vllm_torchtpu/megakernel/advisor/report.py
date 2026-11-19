@@ -38,6 +38,9 @@ from .constants import (
     SVG_TICKS,
 )
 from .models import has_dsa_profile
+from .specs import (
+    SUPPORT_TIER_DESCRIPTIONS,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -54,6 +57,63 @@ if TYPE_CHECKING:
 def _esc(val: object) -> str:
     """Escape a value for safe HTML rendering."""
     return "" if val is None else html.escape(str(val))
+
+
+SUPPORT_TIER_BADGE_CLASSES: dict[str, str] = {
+    "declared": "badge badge-whole_step",
+    "core_families": "badge badge-per_op",
+    "priced_only": "badge badge-single_layer",
+    "partly_unmodeled": "badge badge-assumed",
+}
+
+
+def _render_tier_badge_html(sweep: AdvisorSweepReport) -> str:
+    """Render an HTML pill badge for the model support tier."""
+    badge_class = SUPPORT_TIER_BADGE_CLASSES.get(
+        sweep.support_tier, "badge badge-single_layer"
+    )
+    tier_description = SUPPORT_TIER_DESCRIPTIONS[sweep.support_tier]
+    return (
+        f'<span class="{badge_class}" title="{_esc(tier_description)}">'
+        f"{_esc(sweep.support_tier)}</span>"
+    )
+
+
+def _render_unmodeled_details_html(notes: tuple[str, ...]) -> str:
+    """Render a collapsible HTML list of unmodeled aspects when notes exist."""
+    if not notes:
+        return ""
+    items_html = "".join(f"<li>{_esc(note)}</li>" for note in notes)
+    return (
+        '<details class="kpi-sub" style="margin-top: 6px;">'
+        f"<summary>Not modeled in this estimate ({len(notes)})</summary>"
+        f"<ul>{items_html}</ul></details>"
+    )
+
+
+def _render_facts_support_banner_html(sweep: AdvisorSweepReport) -> str:
+    """Render support tier, sublayer meshes, and unmodeled notes in facts card."""
+    tier_badge = _render_tier_badge_html(sweep)
+    tier_description = SUPPORT_TIER_DESCRIPTIONS[sweep.support_tier]
+    mesh_parts = [
+        f"{role_name}: <code>{_esc(sweep.submodule_labels[role_name])}</code>"
+        for role_name in ("decode", "prefill", "saturation")
+        if role_name in sweep.submodule_labels
+    ]
+    meshes_html = (
+        f'<div class="kpi-sub">Sublayer meshes: {" &middot; ".join(mesh_parts)}</div>'
+        if mesh_parts
+        else ""
+    )
+    details_html = _render_unmodeled_details_html(sweep.unmodeled_notes)
+    return (
+        '<div style="margin-bottom: 12px;">'
+        f'<div class="kpi-sub">Support tier: {tier_badge} '
+        f"({_esc(tier_description)})</div>"
+        f"{meshes_html}"
+        f"{details_html}"
+        "</div>"
+    )
 
 
 def _entry_rec_scope_dict(entry: RegimeEntry) -> Mapping[str, object]:
@@ -749,7 +809,7 @@ def render_step_band_svg(sweep: AdvisorSweepReport) -> str:
         t = (math.log10(clamped) - log_min) / max(0.01, log_max - log_min)
         return x0 + max(0.0, min(1.0, t)) * plot_w
 
-    title = "One-sided upward step latency bands: hardware floor to upper bound (us)"
+    title = "One-sided upward step latency bands: Peak Floor to Peak Upper (us)"
     width = max(
         x1 + gap + right_w + pad,
         pad + svg_text_width(title, 15) + pad,
@@ -869,10 +929,7 @@ def _render_ledger_row(entry: RegimeEntry) -> str:
                 str(scope.get('step_achievable_us', scope['step_bound_us']))
             ):,.1f}</td>"
         f'<td class="tabular">'
-        f"{
-            float(
-                str(scope.get('step_achievable_upper_us', scope['step_upper_us']))
-            ):,.1f}"
+        f"{float(str(scope['step_achievable_upper_us'])):,.1f}"
         f"</td>"
         f"<td><code>{_esc(scope.get('support', 'baseline'))}</code></td>"
         f'<td class="tabular">{_esc(_format_ring_pair(scope))}</td>'
@@ -883,11 +940,11 @@ def _render_ledger_row(entry: RegimeEntry) -> str:
     summary = ", ".join(f"{counts[t]} {t.lower()}" for t in PROVENANCE_TAGS)
     scope_table = (
         '<table class="ledger-table"><thead><tr><th>Scope</th><th>Feasible</th>'
-        '<th class="tabular">Estimate (us)</th>'
-        '<th class="tabular">Estimate upper (us)</th>'
+        '<th class="tabular">Peak Floor (us)</th>'
+        '<th class="tabular">Peak Upper (us)</th>'
         '<th class="tabular">Strict floor (us)</th>'
-        '<th class="tabular">Achievable (us)</th>'
-        '<th class="tabular">Achievable upper (us)</th>'
+        '<th class="tabular">Derated Achievable (us)</th>'
+        '<th class="tabular">Derated Achievable upper (us)</th>'
         "<th>Support</th><th>Ring</th>"
         '<th class="tabular">Launches</th><th class="tabular">Passes</th>'
         f"</tr></thead><tbody>{''.join(scope_rows)}</tbody></table>"
@@ -1228,6 +1285,7 @@ def _render_facts_ledger_card(sweep: AdvisorSweepReport) -> str:
       </div>
       <div class="prov-legend">{data.legend_html}</div>
     </div>
+    {_render_facts_support_banner_html(sweep)}
     <div class="facts-grid">
       <div class="facts-col">
         <h3>Hardware Specifications (<code>{_esc(sweep.chip)}</code>)</h3>
@@ -1585,7 +1643,8 @@ def format_layer_group_search(search: LayerGroupSearchResult) -> str:
     """Format a terminal table for `search_layer_groups`."""
     header = (
         f"{'Partition':28s} | {'Calls':>5s} | {'Feasible':>8s} | "
-        f"{'Bound (us)':>10s} | {'Achievable (us)':>15s} | {'Upper (us)':>10s}"
+        f"{'Peak Floor (us)':>15s} | {'Peak Upper (us)':>15s} | "
+        f"{'Derated Achievable (us)':>23s}"
     )
     lines = [
         (
@@ -1605,8 +1664,8 @@ def format_layer_group_search(search: LayerGroupSearchResult) -> str:
     lines.extend(
         f"{cand.label:28s} | {cand.num_groups:5d} | "
         f"{('yes' if cand.feasible else 'no'):>8s} | "
-        f"{cand.step_bound_us:10.1f} | {cand.step_achievable_us:15.1f} | "
-        f"{cand.step_upper_us:10.1f}"
+        f"{cand.step_bound_us:15.1f} | {cand.step_upper_us:15.1f} | "
+        f"{cand.step_achievable_us:23.1f}"
         for cand in search.candidates
     )
     if search.best is not None:

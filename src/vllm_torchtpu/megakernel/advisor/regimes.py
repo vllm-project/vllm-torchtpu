@@ -53,7 +53,7 @@ from .specs import (
     WorkloadSpec,
     load_measurements,
 )
-from .support import CORE_LIMITS
+from .support import CORE_LIMITS, classify_model_support_tier
 from .verdict import (
     AdvisorReport,
     ScopeEstimate,
@@ -745,6 +745,62 @@ def _build_tailoring_guide(
     )
 
 
+def _find_declared_megakernel(
+    preset_layouts: tuple[ParallelLayout, ...],
+    axes: tuple[int, int, int, int, int, int],
+) -> Mapping[str, object] | None:
+    """Return the megakernel block for a preset layout matching six mesh axes."""
+    for candidate in preset_layouts:
+        candidate_axes = (
+            candidate.tp,
+            candidate.ep,
+            candidate.dp,
+            candidate.pp,
+            candidate.dcp,
+            candidate.pcp,
+        )
+        if candidate_axes == axes and candidate.megakernel is not None:
+            return candidate.megakernel
+    return None
+
+
+def _sublayer_labels(
+    profile_name: str,
+    layouts: Mapping[str, ParallelismRecommendation | None],
+) -> dict[str, str]:
+    """Build per-role sublayer labels using matching preset megakernel declarations."""
+    deployment = DEPLOYMENT_PRESETS.get(profile_name)
+    preset_layouts = (
+        ()
+        if deployment is None
+        else tuple(layout for _role, layout in deployment.named_layouts())
+    )
+    labels: dict[str, str] = {}
+    for role_name, recommendation in layouts.items():
+        if recommendation is None:
+            continue
+        axes = (
+            recommendation.tp,
+            recommendation.ep,
+            recommendation.dp,
+            recommendation.pp,
+            recommendation.dcp,
+            recommendation.pcp,
+        )
+        matched_megakernel = _find_declared_megakernel(preset_layouts, axes)
+        parallel_layout = ParallelLayout(
+            tp=recommendation.tp,
+            ep=recommendation.ep,
+            dp=recommendation.dp,
+            pp=recommendation.pp,
+            dcp=recommendation.dcp,
+            pcp=recommendation.pcp,
+            megakernel=matched_megakernel,
+        )
+        labels[role_name] = parallel_layout.submodule_label()
+    return labels
+
+
 def advise_regimes(
     profile: ModelProfile | str | Mapping[str, object],
     chip: ChipSpec | str = DEFAULT_CHIP,
@@ -752,7 +808,7 @@ def advise_regimes(
     options: RegimeSweepOptions | None = None,
     measurements: MeasurementsData | Mapping[str, object] | Path | str | None = None,
 ) -> AdvisorSweepReport:
-    """Evaluate the 12-regime Batch Size x Phase & Context matrix."""
+    """Evaluate the Batch Size x Phase & Context matrix across a model's layouts."""
     cfg = options or RegimeSweepOptions()
     meas_opt = measurements if measurements is not None else cfg.measurements
     base = cfg.base_workload or WorkloadSpec()
@@ -804,6 +860,7 @@ def advise_regimes(
     cross_sc = next(s for s in decode_rep.scopes if s.scope == "whole_step")
     one_l_sc = next(s for s in decode_rep.scopes if s.scope == "single_layer")
     ref_sc = cross_sc if cross_sc.feasible else one_l_sc
+    support_tier, unmodeled_notes = classify_model_support_tier(resolved_profile)
     return AdvisorSweepReport(
         model=resolved_profile.name,
         chip=chip_spec.name,
@@ -835,6 +892,12 @@ def advise_regimes(
             meas_opt,
         ),
         model_profile=resolved_profile,
+        support_tier=support_tier,
+        unmodeled_notes=unmodeled_notes,
+        submodule_labels=_sublayer_labels(
+            resolved_profile.name,
+            {"decode": par, "prefill": prefill_par, "saturation": sat_par},
+        ),
     )
 
 
