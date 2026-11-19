@@ -336,20 +336,24 @@ def test_gather_rows_prefix_writes_the_live_prefix(tpu7x, live_blocks):
 
 
 # (shards, top_k, tokens per shard, message tokens, pair words per shard,
-#  scale planes): message tokens past the shard's tokens and pair words past
-#  message tokens x top_k are padding that routes nowhere. With 128-pair
-#  chunks over a two-chunk ring, "run_is_chunk" is one chunk per subcore
-#  (a subcore's whole run of 32 pairs) and the other two are three chunks
-#  per subcore, so the ring's slots are reused.
+#  scale planes, extra token-table rows past the drop row): message tokens
+#  past the shard's tokens and pair words past message tokens x top_k are
+#  padding that routes nowhere. With 128-pair chunks over a two-chunk ring,
+#  "run_is_chunk" is one chunk per subcore (a subcore's whole run of 32
+#  pairs) and the others are three chunks per subcore, so the ring's slots
+#  are reused. "padded_table" hands a token table longer than its drop row,
+#  as the layer does when the bound is not a whole number of 128 rows: the
+#  rows from the drop row on must stay zero.
 SCATTER_CASES = {
-    "run_is_chunk": (2, 4, 80, 96, 512, 1),
-    "ring_reuse": (2, 4, 1000, 1024, 6144, 1),
-    "two_planes": (4, 2, 600, 640, 3072, 2),
+    "run_is_chunk": (2, 4, 80, 96, 512, 1, 0),
+    "ring_reuse": (2, 4, 1000, 1024, 6144, 1, 0),
+    "two_planes": (4, 2, 600, 640, 3072, 2, 0),
+    "padded_table": (2, 4, 1000, 1024, 6144, 1, 96),
 }
 
 
 def _scatter_case(name, seed=6):
-    shards, top_k, tokens, message_tokens, pairs, n_scales = SCATTER_CASES[name]
+    shards, top_k, tokens, message_tokens, pairs, n_scales, extra = SCATTER_CASES[name]
     rng = np.random.default_rng(seed)
     plane_words = -(-tokens // LANES) * LANES
     scale_offset = pairs
@@ -381,6 +385,7 @@ def _scatter_case(name, seed=6):
         messages=messages,
         routed_row=routed_row,
         routed_rows=routed_rows,
+        table_rows=routed_rows + extra,
     )
 
 
@@ -388,9 +393,9 @@ def _scatter_reference(c):
     """The two tables in numpy: a routed row's token is its pair's shard's
     first token plus the pair's place in its top-k slot, and its scale words
     are that token's words in its shard's routing message, one per plane."""
-    routed_rows, n_scales = c["routed_rows"], c["n_scales"]
-    token_table = np.zeros(routed_rows, np.int32)
-    scale_table = np.zeros(n_scales * routed_rows, np.int32)
+    routed_rows, n_scales, table = c["routed_rows"], c["n_scales"], c["table_rows"]
+    token_table = np.zeros(table, np.int32)
+    scale_table = np.zeros(n_scales * table, np.int32)
     for p, row in enumerate(c["routed_row"]):
         if row >= routed_rows:
             continue
@@ -404,7 +409,7 @@ def _scatter_reference(c):
                 + plane * c["plane_words"]
                 + token
             )
-            scale_table[plane * routed_rows + row] = c["messages"][word]
+            scale_table[plane * table + row] = c["messages"][word]
     return token_table, scale_table
 
 
@@ -416,8 +421,8 @@ def test_scatter_row_tables_matches_the_reference(tpu7x, name):
     got_tokens, got_scales = row_tables_kernel.scatter_row_tables(
         jnp.asarray(c["routed_row"]),
         jnp.asarray(c["messages"]),
-        jnp.zeros(c["routed_rows"], jnp.int32),
-        jnp.zeros(c["n_scales"] * c["routed_rows"], jnp.int32),
+        jnp.zeros(c["table_rows"], jnp.int32),
+        jnp.zeros(c["n_scales"] * c["table_rows"], jnp.int32),
         top_k=c["top_k"],
         tokens_per_shard=c["tokens"],
         message_words=c["message_words"],
@@ -428,6 +433,7 @@ def test_scatter_row_tables_matches_the_reference(tpu7x, name):
         message_tokens=c["message_tokens"],
         chunk_max=LANES,
         ring=2,
+        routed_rows=c["routed_rows"],
     )
     np.testing.assert_array_equal(np.asarray(got_tokens), want_tokens)
     np.testing.assert_array_equal(np.asarray(got_scales), want_scales)
