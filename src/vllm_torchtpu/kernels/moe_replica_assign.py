@@ -48,7 +48,9 @@ _UNHIT = -1
 _HIT = -2
 
 
-def _kernel(ids_ref, copies_ref, init_ref, out_ref, hit_ref, load_ref, *, n, c, ep, slots):
+def _kernel(
+    ids_ref, copies_ref, init_ref, out_ref, hit_ref, load_ref, *rest, n, c, ep, slots, refine
+):
     # init_ref arrives as all -1 (_UNHIT), so no clearing loop over E; every
     # loop below runs over the routes or the experts they touch only.
     choice_ref = init_ref
@@ -99,10 +101,23 @@ def _kernel(ids_ref, copies_ref, init_ref, out_ref, hit_ref, load_ref, *, n, c, 
             r = best // slots
             load_ref[r] = load_ref[r] + 1
             choice_ref[x] = best
+            if refine:
+                lst_ref, lcnt_ref, _ = rest
+                k = lcnt_ref[r]
+                lst_ref[r * lcap + k] = x
+                lcnt_ref[r] = k + 1
 
         return 0
 
+    if refine:
+        lst_ref, lcnt_ref, flag_ref = rest
+        lcap = min(n, copies_ref.shape[0] // c)
+        for r in range(ep):
+            lcnt_ref[r] = 0
     lax.fori_loop(0, cnt, flexible, 0)
+    if refine:
+        _refine(copies_ref, choice_ref, load_ref, lst_ref, lcnt_ref, flag_ref,
+                c=c, ep=ep, slots=slots, lcap=lcap, iters=refine)
 
     def write(i, _):
         x = ids_ref[i]
@@ -110,6 +125,95 @@ def _kernel(ids_ref, copies_ref, init_ref, out_ref, hit_ref, load_ref, *, n, c, 
         return 0
 
     lax.fori_loop(0, n, write, 0, unroll=8)
+
+
+def _refine(copies_ref, choice_ref, load_ref, lst_ref, lcnt_ref, flag_ref, *, c, ep, slots, lcap, iters):
+    """Lower the busiest rank's load by moves of replicated experts.
+
+    Each round takes the first rank A at the maximum load M and looks for
+    either a direct move of one of A's replicated experts to another copy on a
+    rank with load <= M - 2, or a two-step chain: e from A to B (load M - 1)
+    while an expert e2 on B moves to a third rank C with load <= M - 2. A
+    round without such a move ends the search (the maximum cannot drop through
+    A). Experts stay whole; the result is a valid assignment either way.
+    flag_ref[0] = 1 while searching, flag_ref[1] = found in this round."""
+    flag_ref[0] = 1
+
+    def move(e, p_new, frm, to, idx):
+        # e sits at lst[frm][idx]: swap-remove it, append to `to`.
+        last = lcnt_ref[frm] - 1
+        lst_ref[frm * lcap + idx] = lst_ref[frm * lcap + last]
+        lcnt_ref[frm] = last
+        k = lcnt_ref[to]
+        lst_ref[to * lcap + k] = e
+        lcnt_ref[to] = k + 1
+        load_ref[frm] = load_ref[frm] - 1
+        load_ref[to] = load_ref[to] + 1
+        choice_ref[e] = p_new
+
+    def round_(it, _):
+        @pl.when(flag_ref[0] == 1)
+        def _():
+            m = load_ref[0]
+            a = jnp.int32(0)
+            for r in range(1, ep):
+                better = load_ref[r] > m
+                a = jnp.where(better, r, a)
+                m = jnp.where(better, load_ref[r], m)
+            flag_ref[1] = 0
+
+            def over_a(i, _):
+                @pl.when(flag_ref[1] == 0)
+                def _():
+                    e = lst_ref[a * lcap + i]
+                    for k in range(c):
+                        p = copies_ref[e * c + k]
+                        b = jnp.where(p >= 0, p, 0) // slots
+                        ok = jnp.logical_and(p >= 0, b != a)
+                        lb = load_ref[b]
+
+                        @pl.when(jnp.logical_and(flag_ref[1] == 0, jnp.logical_and(ok, lb <= m - 2)))
+                        def _():
+                            move(e, p, a, b, i)
+                            flag_ref[1] = 1
+
+                        @pl.when(jnp.logical_and(flag_ref[1] == 0, jnp.logical_and(ok, lb == m - 1)))
+                        def _():
+                            def over_b(j, _):
+                                @pl.when(flag_ref[1] == 0)
+                                def _():
+                                    e2 = lst_ref[b * lcap + j]
+                                    for k2 in range(c):
+                                        p2 = copies_ref[e2 * c + k2]
+                                        cr = jnp.where(p2 >= 0, p2, 0) // slots
+                                        ok2 = jnp.logical_and(
+                                            p2 >= 0, jnp.logical_and(cr != b, cr != a)
+                                        )
+
+                                        @pl.when(jnp.logical_and(
+                                            flag_ref[1] == 0,
+                                            jnp.logical_and(ok2, load_ref[cr] <= m - 2),
+                                        ))
+                                        def _():
+                                            move(e2, p2, b, cr, j)
+                                            move(e, p, a, b, i)
+                                            flag_ref[1] = 1
+
+                                return 0
+
+                            lax.fori_loop(0, lcnt_ref[b], over_b, 0)
+
+                return 0
+
+            lax.fori_loop(0, lcnt_ref[a], over_a, 0)
+
+            @pl.when(flag_ref[1] == 0)
+            def _():
+                flag_ref[0] = 0
+
+        return 0
+
+    lax.fori_loop(0, iters, round_, 0)
 
 
 def _reference(ids, copies, *, ep, slots):
@@ -151,13 +255,14 @@ def _reference(ids, copies, *, ep, slots):
     return jnp.where(valid, choice[jnp.maximum(ids, 0)], -1)
 
 
-@functools.partial(jax.jit, static_argnames=("ep", "slots", "interpret"))
+@functools.partial(jax.jit, static_argnames=("ep", "slots", "refine", "interpret"))
 def replica_assign(
     ids: jax.Array,
     copies: jax.Array,
     *,
     ep: int,
     slots: int,
+    refine: int = 0,
     interpret: bool = False,
 ) -> jax.Array:
     """Physical slot ids ``[T, K]`` for logical routed ids ``[T, K]``.
@@ -169,6 +274,10 @@ def replica_assign(
     column 0 is the native copy, further columns replicas, ``-1`` for none.
     Physical id ``p`` lives on rank ``p // slots``. Above ``MAX_ROUTES``
     routes the native copies are used (no replicas).
+
+    refine > 0: after the greedy pass, up to that many rounds of moves that
+    lower the busiest rank's load (`_refine`; TPU kernel only, the jnp
+    reference keeps the greedy assignment).
     """
     num_tokens, topk = ids.shape
     num_experts, c = copies.shape
@@ -181,8 +290,18 @@ def replica_assign(
         return _reference(ids.reshape(-1), copies, ep=ep, slots=slots).reshape(
             num_tokens, topk
         )
-    kernel = functools.partial(_kernel, n=n, c=c, ep=ep, slots=slots)
+    kernel = functools.partial(_kernel, n=n, c=c, ep=ep, slots=slots, refine=refine)
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    lcap = min(n, num_experts)
+    extra = (
+        [
+            pltpu.SMEM((ep * lcap,), jnp.int32),
+            pltpu.SMEM((ep,), jnp.int32),
+            pltpu.SMEM((2,), jnp.int32),
+        ]
+        if refine
+        else []
+    )
     out = pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((n,), jnp.int32),
@@ -191,6 +310,7 @@ def replica_assign(
         scratch_shapes=[
             pltpu.SMEM((min(n, num_experts),), jnp.int32),
             pltpu.SMEM((ep,), jnp.int32),
+            *extra,
         ],
         interpret=interpret,
     )(ids.reshape(-1), copies.reshape(-1), jnp.full((num_experts,), _UNHIT, jnp.int32))
