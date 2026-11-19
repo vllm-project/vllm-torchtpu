@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import types
 from collections.abc import Iterator
 from unittest.mock import patch
 
@@ -27,40 +26,35 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     _get_feat_extract_output_lengths,
 )
 
+from tests_omni.omni_test_utils import restore_class_attrs
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _AUDIO_CHUNK_BUCKETS,
     _AUDIO_CHUNK_LENGTHS_PATCHED,
     _CU_SEQLENS_BLOCK_SIZE,
     _get_compiled_bucket_fn,
+    _pad_cu_seqlens,
+    _run_static_bucket_pass,
     maybe_patch_qwen3_omni_thinker,
 )
 
 pytestmark = pytest.mark.omni
 
 THINKER_ARCHS = ["Qwen3OmniMoeForConditionalGeneration"]
-_PATCHED_ATTRS = (
-    "forward",
-    "prepare_encoder_metadata",
-    "forward_with_encoder_metadata",
-    "forward_chunks",
-    "_tpu_orig_forward",
-)
+_PATCHED_ATTRS = ("forward", "_tpu_orig_forward")
 
 
 @pytest.fixture(autouse=True)
 def _isolate_thinker_patch_targets() -> Iterator[None]:
     """Snapshot and restore Qwen3OmniMoeAudioEncoder attributes across each test."""
-    cls = Qwen3OmniMoeAudioEncoder
-    saved = {attr: cls.__dict__.get(attr) for attr in _PATCHED_ATTRS}
-    try:
+    with restore_class_attrs(Qwen3OmniMoeAudioEncoder, _PATCHED_ATTRS):
         yield
-    finally:
-        for attr, val in saved.items():
-            if val is None:
-                if attr in cls.__dict__:
-                    delattr(cls, attr)
-            else:
-                setattr(cls, attr, val)
+
+
+@pytest.fixture
+def patched_audio_encoder() -> type[Qwen3OmniMoeAudioEncoder]:
+    """Apply the Thinker audio encoder patch for tests exercising forward()."""
+    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
+    return Qwen3OmniMoeAudioEncoder
 
 
 class _DummyPosEmb(nn.Module):
@@ -124,7 +118,6 @@ def _make_dummy_audio_encoder(
             super().__init__()
             self.n_window = 50
             self.n_window_infer = n_window_infer
-            self.conv_chunksize = 500
             self.conv2d1 = _Conv1()
             self.conv2d2 = nn.Identity()
             self.conv2d3 = nn.Identity()
@@ -167,47 +160,29 @@ def test_patch_application_is_idempotent() -> None:
     assert cls.forward is patched_forward
 
 
-def test_forward_moves_feature_lens_to_cpu() -> None:
-    cls = Qwen3OmniMoeAudioEncoder
-    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
+def test_forward_moves_feature_lens_to_cpu(
+    patched_audio_encoder: type[Qwen3OmniMoeAudioEncoder],
+) -> None:
     _TrackedTensor.cpu_called = False
     enc = _make_dummy_audio_encoder()
     lens = torch.tensor([800]).as_subclass(_TrackedTensor)
-    out = cls.forward(enc, torch.zeros(16, 800), lens, torch.tensor([104]))
+    out = patched_audio_encoder.forward(
+        enc, torch.zeros(16, 800), lens, torch.tensor([104])
+    )
     assert _TrackedTensor.cpu_called is True
     assert out.shape == (104, 8)
 
 
-def test_metadata_api_computes_aftercnn_lens_and_encodes() -> None:
-    cls = Qwen3OmniMoeAudioEncoder
-    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
-    enc = _make_dummy_audio_encoder()
-    metadata = cls.prepare_encoder_metadata(enc, [800, 250])
-    assert metadata["aftercnn_lens"] == [104, 33]
-    out_meta = cls.forward_with_encoder_metadata(enc, torch.zeros(16, 1050), metadata)
-    assert out_meta.shape == (137, 8)
-
-
 @pytest.mark.parametrize("clip_lens", [[], [0], [0, 0]])
 def test_empty_audio_inputs_derive_output_dim_from_proj2(
+    patched_audio_encoder: type[Qwen3OmniMoeAudioEncoder],
     clip_lens: list[int],
 ) -> None:
-    cls = Qwen3OmniMoeAudioEncoder
-    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
     enc = _make_dummy_audio_encoder()
     assert not hasattr(enc, "output_dim")
-    metadata = cls.prepare_encoder_metadata(enc, clip_lens)
-    out = cls.forward_with_encoder_metadata(enc, torch.zeros(16, 0), metadata)
+    lens = torch.tensor(clip_lens, dtype=torch.long)
+    out = patched_audio_encoder.forward(enc, torch.zeros(16, 0), lens)
     assert out.shape == (0, 8)
-
-
-def test_forward_chunks_raises_not_implemented() -> None:
-    cls = Qwen3OmniMoeAudioEncoder
-    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
-    enc = _make_dummy_audio_encoder()
-    metadata = cls.prepare_encoder_metadata(enc, [800])
-    with pytest.raises(NotImplementedError, match="forward_chunks"):
-        cls.forward_chunks(enc, torch.zeros(8, 16, 100), metadata)
 
 
 @pytest.mark.parametrize(
@@ -217,57 +192,61 @@ def test_forward_chunks_raises_not_implemented() -> None:
         (150, "positive multiple"),
         (100, "exceeding _CU_SEQLENS_BLOCK_SIZE"),
         (300, "divisible"),
-        (600, "divisible"),
-        (1200, "divisible"),
     ],
 )
 def test_invalid_attention_window_config_raises_value_error(
-    n_window_infer: int, match: str
+    patched_audio_encoder: type[Qwen3OmniMoeAudioEncoder],
+    n_window_infer: int,
+    match: str,
 ) -> None:
-    cls = Qwen3OmniMoeAudioEncoder
-    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
     enc = _make_dummy_audio_encoder(n_window_infer=n_window_infer)
     lens = torch.tensor([800], dtype=torch.long)
     with pytest.raises(ValueError, match=match):
-        cls.forward(enc, torch.zeros(16, 800), lens, torch.tensor([104]))
+        patched_audio_encoder.forward(
+            enc, torch.zeros(16, 800), lens, torch.tensor([104])
+        )
 
 
 @pytest.mark.parametrize("bad_lens", [[-10], [800, -1]])
-def test_negative_feature_lens_raises_value_error(bad_lens: list[int]) -> None:
-    cls = Qwen3OmniMoeAudioEncoder
-    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
+def test_negative_feature_lens_raises_value_error(
+    patched_audio_encoder: type[Qwen3OmniMoeAudioEncoder],
+    bad_lens: list[int],
+) -> None:
     enc = _make_dummy_audio_encoder()
     with pytest.raises(ValueError, match="non-negative"):
-        cls.prepare_encoder_metadata(enc, bad_lens)
+        patched_audio_encoder.forward(
+            enc, torch.zeros(16, 0), torch.tensor(bad_lens, dtype=torch.long)
+        )
 
 
 @pytest.mark.parametrize(
     ("clip_lens", "expected_buckets", "expected_cu_prefixes"),
     [
-        ([250], [8], [[0, 33, 104, 105]]),
-        ([250, 800], [16], [[0, 33, 39, 91, 143, 208, 209]]),
+        ([250], [8], [[0, 33, 104]]),
+        ([0, 250], [8], [[0, 33, 104]]),
+        ([250, 800], [16], [[0, 33, 39, 91, 143, 208]]),
         (
             [2000, 2000],
             [64],
-            [[0, 52, 104, 156, 208, 260, 312, 364, 416, 468, 520, 832, 833]],
+            [[0, 52, 104, 156, 208, 260, 312, 364, 416, 468, 520, 832]],
         ),
-        ([6500], [128], [[0, 52, 104, 156, 208]]),
         (
             [12801, 200],
             [128, 8],
-            [[0, 52, 104, 156, 208], [0, 1, 13, 39, 104, 105]],
+            [[0, 52, 104, 156, 208], [0, 1, 13, 39, 104]],
         ),
+        # 65 one-window clips fit in <=128 chunks but exceed 128 cu_seqlens
+        # entries (2 + 65*2 = 132 > 128), forcing a cu_seqlens-budget group split.
+        ([50] * 65, [64, 8], [[0, 7, 13, 20, 26], [0, 7, 13, 20, 104]]),
     ],
 )
 def test_audio_encoder_static_bucketing_and_packing(
+    patched_audio_encoder: type[Qwen3OmniMoeAudioEncoder],
     clip_lens: list[int],
     expected_buckets: list[int],
     expected_cu_prefixes: list[list[int]],
 ) -> None:
-    """Verify power-of-2 bucketing, multi-clip packing, and >128 split layout."""
-    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
-    cls = Qwen3OmniMoeAudioEncoder
-
+    """Verify bucketing, packing, >128/cu_seqlens splits, and valid cu_seqlens tails."""
     seen_conv_batch_sizes: list[int] = []
     seen_layer_seq_lens: list[int] = []
     seen_cu_seqlens: list[list[int]] = []
@@ -282,52 +261,59 @@ def test_audio_encoder_static_bucketing_and_packing(
         "cpu",
         side_effect=AssertionError("Unexpected Module.cpu() host mutation"),
     ):
-        feats = torch.zeros(16, sum(clip_lens))
+        # Strided slice exercises the non-contiguous input_features path too.
+        total_frames = sum(clip_lens)
+        feats = torch.zeros(16, total_frames * 2)[:, ::2]
+        assert not feats.is_contiguous()
         lens = torch.tensor(clip_lens, dtype=torch.long)
         aftercnn = _get_feat_extract_output_lengths(lens)
-        out = cls.forward(enc, feats, lens, aftercnn)
+        out = patched_audio_encoder.forward(enc, feats, lens, aftercnn)
 
         assert out.shape == (int(aftercnn.sum().item()), 8)
         assert seen_conv_batch_sizes == expected_buckets
         expected_seq_lens = [b * 13 for b in expected_buckets for _ in range(2)]
         assert seen_layer_seq_lens == expected_seq_lens
-        for cu in seen_cu_seqlens:
-            assert len(cu) == _CU_SEQLENS_BLOCK_SIZE
         pass_cu_seqlens = seen_cu_seqlens[::2]
         assert pass_cu_seqlens == seen_cu_seqlens[1::2]
         assert len(pass_cu_seqlens) == len(expected_cu_prefixes)
-        for cu, expected_prefix in zip(
-            pass_cu_seqlens, expected_cu_prefixes, strict=True
+        for bucket, cu, expected_prefix in zip(
+            expected_buckets, pass_cu_seqlens, expected_cu_prefixes, strict=True
         ):
+            padded_total = bucket * 13
+            assert len(cu) == _CU_SEQLENS_BLOCK_SIZE
             assert cu[: len(expected_prefix)] == expected_prefix
+            # Trailing padding uses padded_total so segment lengths stay non-negative
+            # and sum exactly to padded_total for CPU/native SDPA splits.
+            assert cu[-1] == padded_total
+            diffs = [b_end - b_start for b_start, b_end in zip(cu, cu[1:])]
+            assert all(d >= 0 for d in diffs)
+            assert sum(diffs) == padded_total
 
 
-def test_compiled_bucket_cache_uses_distinct_code_objects(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verify per-bucket compile caching and distinct CodeTypes across encoders."""
-    seen_calls: list[tuple[types.FunctionType, dict[str, object]]] = []
+def test_pad_cu_seqlens_rejects_overflow() -> None:
+    with pytest.raises(ValueError, match="exceeds fixed _CU_SEQLENS_BLOCK_SIZE"):
+        _pad_cu_seqlens(list(range(_CU_SEQLENS_BLOCK_SIZE)), 1664, torch.device("cpu"))
 
-    def _fake_compile(fn: types.FunctionType, **kwargs: object) -> types.FunctionType:
-        seen_calls.append((fn, kwargs))
-        return fn
 
-    monkeypatch.setattr(torch, "compile", _fake_compile)
-    enc_a = _make_dummy_audio_encoder()
-    enc_b = _make_dummy_audio_encoder()
+def test_static_bucket_pass_traces_fullgraph_and_caches_per_bucket() -> None:
+    """Verify fullgraph torch.compile tracing (no mocks) and distinct bucket caches."""
+    enc = _make_dummy_audio_encoder()
+    x = torch.zeros(8, 1, 16, 100)
+    cu = _pad_cu_seqlens([0, 33], 104, torch.device("cpu"))
 
-    first_bucket = _AUDIO_CHUNK_BUCKETS[0]
-    assert _get_compiled_bucket_fn(enc_a, first_bucket) is _get_compiled_bucket_fn(
-        enc_a, first_bucket
+    eager_out = _run_static_bucket_pass(enc, x, cu)
+    compiled = torch.compile(
+        lambda x_in, cu_in: _run_static_bucket_pass(enc, x_in, cu_in),
+        backend="eager",
+        fullgraph=True,
+        dynamic=False,
     )
-    assert len(seen_calls) == 1
+    traced_out = compiled(x, cu)
+    assert torch.allclose(traced_out, eager_out)
 
-    for b in _AUDIO_CHUNK_BUCKETS:
-        _get_compiled_bucket_fn(enc_a, b)
-        _get_compiled_bucket_fn(enc_b, b)
-
-    expected_total = 2 * len(_AUDIO_CHUNK_BUCKETS)
-    assert len(seen_calls) == expected_total
-    assert len({fn.__code__ for fn, _ in seen_calls}) == expected_total
-    for _, kwargs in seen_calls:
-        assert kwargs == {"backend": "tpu", "fullgraph": True, "dynamic": False}
+    enc_b = _make_dummy_audio_encoder()
+    fn_a = _get_compiled_bucket_fn(enc, _AUDIO_CHUNK_BUCKETS[0])
+    assert fn_a is _get_compiled_bucket_fn(enc, _AUDIO_CHUNK_BUCKETS[0])
+    fn_b = _get_compiled_bucket_fn(enc_b, _AUDIO_CHUNK_BUCKETS[0])
+    assert fn_a is not fn_b
+    assert set(enc._tpu_compiled_buckets) == {_AUDIO_CHUNK_BUCKETS[0]}

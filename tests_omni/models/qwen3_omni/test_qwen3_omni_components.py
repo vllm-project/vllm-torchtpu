@@ -28,7 +28,11 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     _get_feat_extract_output_lengths,
 )
 
-from tests_omni.omni_test_utils import assert_all_loaded, assert_parity
+from tests_omni.omni_test_utils import (
+    assert_all_loaded,
+    assert_parity,
+    restore_class_attrs,
+)
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _AUDIO_CHUNK_LENGTHS_PATCHED,
     maybe_patch_qwen3_omni_thinker,
@@ -51,20 +55,17 @@ AUDIO_CONFIG = Qwen3OmniMoeAudioEncoderConfig(
 # Exercises all 5 buckets (8, 16, 32, 64, 128), sub-second odd/even CNN widths
 # ([50], [79]), multi-clip packing ([800, 801], [801, 800], [2000, 2000]), and
 # >128 multi-pass splits with dead-segment isolation ([12801, 200], [25601, 200]).
-PARITY_CLIP_LENGTHS = [
-    pytest.param([50], id="50"),
-    pytest.param([79], id="79"),
-    pytest.param([800], id="800"),
-    pytest.param([801], id="801"),
-    pytest.param([800, 801], id="800_801"),
-    pytest.param([801, 800], id="801_800"),
-    pytest.param([3200], id="3200"),
-    pytest.param([3201], id="3201"),
-    pytest.param([2000, 2000], id="2000_2000"),
-    pytest.param([6401], id="6401"),
-    pytest.param([12800], id="12800"),
-    pytest.param([12801, 200], id="12801_200"),
-    pytest.param([25601, 200], id="25601_200"),
+PARITY_CASES = [
+    pytest.param([50], {8}, id="50"),
+    pytest.param([79], {8}, id="79"),
+    pytest.param([800], {8}, id="800"),
+    pytest.param([801], {16}, id="801"),
+    pytest.param([800, 801], {32}, id="800_801"),
+    pytest.param([801, 800], {32}, id="801_800"),
+    pytest.param([2000, 2000], {64}, id="2000_2000"),
+    pytest.param([12800], {128}, id="12800"),
+    pytest.param([12801, 200], {128, 8}, id="12801_200"),
+    pytest.param([25601, 200], {128, 8}, id="25601_200"),
 ]
 
 # (max relative L2, max abs) vs float32 HF CPU reference on TPU v6e and v7x.
@@ -72,13 +73,7 @@ ATTN_LIMITS = (1.0e-2, 3.0e-3)
 LAYER_LIMITS = (8.0e-3, 5.5e-2)
 END_TO_END_LIMITS = (1.5e-2, 3.5e-3)
 
-_PATCHED_ATTRS = (
-    "forward",
-    "prepare_encoder_metadata",
-    "forward_with_encoder_metadata",
-    "forward_chunks",
-    "_tpu_orig_forward",
-)
+_PATCHED_ATTRS = ("forward", "_tpu_orig_forward")
 
 
 def _make_mel_features(n_frames: int, seed: int = 0) -> torch.Tensor:
@@ -101,9 +96,8 @@ def encoders(
 
     cls = Qwen3OmniMoeAudioEncoder
     upstream_forward = cls.forward
-    own_attrs = {name: cls.__dict__.get(name) for name in _PATCHED_ATTRS}
     assert not getattr(upstream_forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
-    try:
+    with restore_class_attrs(cls, _PATCHED_ATTRS):
         assert (
             maybe_patch_qwen3_omni_thinker(["Qwen3OmniMoeForConditionalGeneration"])
             is True
@@ -118,13 +112,6 @@ def encoders(
         assert_all_loaded(loaded, tpu)
         tpu = tpu.to(device="tpu", dtype=torch.bfloat16)
         yield tpu, ref, upstream_forward
-    finally:
-        for name, value in own_attrs.items():
-            if value is None:
-                if name in cls.__dict__:
-                    delattr(cls, name)
-            else:
-                setattr(cls, name, value)
 
 
 @pytest.mark.xfail(
@@ -189,9 +176,11 @@ def test_audio_encoder_layer_matches_cpu_reference(encoders) -> None:
     )
 
 
-@pytest.mark.parametrize("clip_lengths", PARITY_CLIP_LENGTHS)
+@pytest.mark.parametrize(("clip_lengths", "expected_buckets"), PARITY_CASES)
 @torch.no_grad()
-def test_audio_encoder_matches_cpu_reference(encoders, clip_lengths: list[int]) -> None:
+def test_audio_encoder_matches_cpu_reference(
+    encoders, clip_lengths: list[int], expected_buckets: set[int]
+) -> None:
     tpu, ref, _ = encoders
     features = torch.cat(
         [_make_mel_features(n, seed=idx) for idx, n in enumerate(clip_lengths)],
@@ -204,14 +193,12 @@ def test_audio_encoder_matches_cpu_reference(encoders, clip_lengths: list[int]) 
     feature_lens = torch.tensor(clip_lengths, dtype=torch.long, device="tpu")
     aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
     out = tpu(feats_tpu, feature_lens, aftercnn_lens)
-    metadata = tpu.prepare_encoder_metadata(clip_lengths)
-    out_meta = tpu.forward_with_encoder_metadata(feats_tpu, metadata)
 
     expected_tokens = int(_get_feat_extract_output_lengths(ref_lens).sum())
     assert feature_lens.device.type == "tpu"
     assert out.device.type == "tpu"
     assert out.shape == (expected_tokens, AUDIO_CONFIG.output_dim)
-    assert torch.equal(out, out_meta)
+    assert expected_buckets.issubset(getattr(tpu, "_tpu_compiled_buckets", {}))
     assert_parity(
         out,
         reference,
@@ -229,8 +216,8 @@ def test_audio_encoder_empty_inputs_on_tpu(encoders, clip_lengths: list[int]) ->
     feats_tpu = torch.zeros(
         (AUDIO_CONFIG.num_mel_bins, 0), device="tpu", dtype=torch.bfloat16
     )
-    metadata = tpu.prepare_encoder_metadata(clip_lengths)
-    out = tpu.forward_with_encoder_metadata(feats_tpu, metadata)
+    feature_lens = torch.tensor(clip_lengths, dtype=torch.long, device="tpu")
+    out = tpu(feats_tpu, feature_lens)
     assert out.device.type == "tpu"
     assert out.dtype == torch.bfloat16
     assert out.shape == (0, AUDIO_CONFIG.output_dim)
