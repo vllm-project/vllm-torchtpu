@@ -124,13 +124,13 @@ class TPUMultiConnector(MultiConnector):
         producer_divergent_hits; otherwise upstream's every-child rule holds,
         which on a producer is False because the transfer child never loads.
         """
-        if getattr(self, "_producer_divergent_hits", False):
+        if self._producer_divergent_hits:
             return any(c.supports_divergent_local_hybrid_hits for c in self._connectors)
         return super().supports_divergent_local_hybrid_hits
 
     def poll_and_complete_transfers(self, scheduler) -> tuple[int, int, int, bool]:
         """Sums every child's schedule-start completion poll (called by the
-        pipeline chunk scheduler's prefix-aware admission, #3090)."""
+        pipeline chunk scheduler's prefix-aware admission)."""
         total_ns = 0
         total_early = 0
         total_waited = 0
@@ -153,7 +153,7 @@ class TPUMultiConnector(MultiConnector):
         block_size: int,
     ) -> int | None:
         """Returns the first child's answer; None when no child can serve it
-        (asked by the pipeline chunk scheduler's local-hit lookup, #3090)."""
+        (asked by the pipeline chunk scheduler's local-hit lookup)."""
         for c in self._connectors:
             fn = getattr(c, "resolve_divergent_local_hit_tokens", None)
             if fn is not None:
