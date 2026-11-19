@@ -159,6 +159,40 @@ def test_admission_declines_a_layer_with_copy_slots(monkeypatch, tmp_path):
     assert bridge._admit(_glm_runner(DeepseekV2MLP(256, 128)), 2) is not None
 
 
+@pytest.mark.parametrize(
+    "path", ["scores", "v3", "adaptive", "v2", "collectives", "none"]
+)
+def test_admission_declines_a_layer_another_path_serves(monkeypatch, path):
+    """One MoE decision per layer: apply_monolithic serves these layers by
+    another path before it reaches the fused decode kernel, so arming one
+    would make the runner drop its shared expert and all-reduce while that
+    path returns only this rank's routed partial."""
+    import vllm.distributed
+
+    from vllm_torchtpu.layers.adapter import fused_moe_ep_v3
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import FUSED_MOE_EP_OP_ATTR
+
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    runner = _glm_runner(DeepseekV2MLP(256, 128))
+    qm = runner._quant_method
+    if path == "scores":
+        qm._moe_lowtok_scores_op = object()
+    elif path == "v3":
+        monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", True)
+        monkeypatch.setattr(fused_moe_ep_v3, "_OP", object())
+        qm._tpu_fused_ep_eligible = True
+    elif path == "adaptive":
+        qm._use_adaptive_fused_moe = True
+    elif path == "v2":
+        setattr(qm, FUSED_MOE_EP_OP_ATTR, object())
+    elif path == "collectives":
+        monkeypatch.setattr(envs, "TPU_MOE_FP8_ALL_GATHER", True)
+    admitted = bridge._admit(runner, 2)
+    assert (admitted is None) is (path != "none")
+
+
 def test_admission_declines_attention_narrower_than_mesh(monkeypatch):
     """PCP2 (or DP2) at TP1: the EP group spans the mesh, attention does not, so
     MoERunner still runs a collective after the op."""
