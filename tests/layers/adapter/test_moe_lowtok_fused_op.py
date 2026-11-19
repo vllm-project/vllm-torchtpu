@@ -23,8 +23,10 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
+import vllm.distributed.parallel_state as ps
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME
 from vllm_torchtpu.kernels.experimental.small_collectives import common as sc_common
 from vllm_torchtpu.layers.adapter import moe_lowtok_fused_op as op
@@ -72,8 +74,6 @@ def _layout(
     """The model-parallel groups, EP mesh and devices per chip prebuild reads
     (TPU7x: two); the groups check (a collective over the EP group) as a
     mock."""
-    import vllm.distributed.parallel_state as ps
-
     monkeypatch.setattr(sc_common, "devices_per_chip", lambda: chip_devices)
 
     monkeypatch.setattr(
@@ -91,13 +91,12 @@ def _layout(
 
 def test_dp4_tp2_arms_the_op(monkeypatch, fresh):
     check = _layout(monkeypatch, dp=4, tp=2, index=5)
-    op.prebuild(TOPK)
+    op.prebuild()
     assert op._ARMED is True
     assert (op._DP, op._TP) == (4, 2)
     # Mesh index 5 is DP rank 2, TP rank 1 of the (dp, tp) view.
     assert op._RANK.tolist() == [2, 1]
     check.assert_called_once_with(5, 2, 4)
-    fresh.assert_called_once_with(TOPK)
 
 
 @pytest.mark.parametrize(
@@ -127,11 +126,10 @@ def test_other_layouts_leave_it_unarmed_without_the_groups_collective(
     dispatch over DP), or a TP pair across two single-device chips: the
     default MoE path, and no collective."""
     check = _layout(monkeypatch, **layout)
-    op.prebuild(TOPK)
+    op.prebuild()
     assert op._ARMED is False
     assert op._RANK is None
     check.assert_not_called()
-    fresh.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -155,7 +153,7 @@ def test_the_device_info_decides_and_a_disarmed_tp_pair_is_logged(
     monkeypatch.setattr(sc_common.pltpu, "get_tpu_info", lambda: info)
     logger = Mock(name="logger")
     monkeypatch.setattr(small_all_reduce_op, "logger", logger)
-    op.prebuild(TOPK)
+    op.prebuild()
     assert op._ARMED is armed
     if armed:
         logger.warning_once.assert_not_called()
@@ -167,24 +165,21 @@ def test_the_device_info_decides_and_a_disarmed_tp_pair_is_logged(
 
 def test_tp_groups_off_the_mesh_blocks_leave_it_unarmed(monkeypatch, fresh):
     _layout(monkeypatch, dp=4, tp=2, groups_match=False)
-    op.prebuild(TOPK)
+    op.prebuild()
     assert op._ARMED is False
-    fresh.assert_not_called()
 
 
 def test_no_expert_parallel_mesh_leaves_it_unarmed(monkeypatch, fresh):
     _layout(monkeypatch, dp=4, tp=2, mesh=False)
-    op.prebuild(TOPK)
+    op.prebuild()
     assert op._ARMED is False
-    fresh.assert_not_called()
 
 
 def test_prebuild_checks_the_layout_once(monkeypatch, fresh):
     check = _layout(monkeypatch, dp=4, tp=2)
-    op.prebuild(TOPK)
-    op.prebuild(TOPK)
+    op.prebuild()
+    op.prebuild()
     check.assert_called_once()
-    fresh.assert_called_once()
 
 
 @pytest.fixture
@@ -252,8 +247,6 @@ def test_retain_reads_the_rank_buffer_in_the_warmup(monkeypatch):
 
 @pytest.fixture
 def v3_method(monkeypatch):
-    import vllm.distributed.parallel_state as ps
-
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
     ep = Mock(name="ep_group")
@@ -309,47 +302,108 @@ def test_v3_entry_keeps_vllms_dispatch_otherwise(monkeypatch, v3_method):
     method.apply_monolithic_external_dispatch.assert_called_once()
 
 
-def _moe_layer(use_ep=True, topk=TOPK):
+def _moe_layer(use_ep=True, topk=TOPK, v3_armed=True, copies=False):
+    """A MoE layer as v3's and the scores entry's prebuilds leave it."""
     return SimpleNamespace(
+        _tpu_fused_ep_eligible=v3_armed,
+        _lowtok_has_copies=copies,
         moe_config=SimpleNamespace(
             experts_per_token=topk,
             moe_parallel_config=SimpleNamespace(use_ep=use_ep),
-        )
+        ),
     )
 
 
-def test_maybe_prebuild_arms_for_a_scores_layer_under_ep(monkeypatch):
-    """The FP8 MoE method's weight processing calls it for every MoE layer."""
+@pytest.fixture
+def fused_ep_v3(monkeypatch):
+    """Fused EP v3 requested and its op built; each layer carries its own
+    eligibility."""
+    from vllm_torchtpu.layers.adapter import fused_moe_ep_v3
+
+    monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", True)
+    monkeypatch.setattr(fused_moe_ep_v3, "_OP", object())
+
+
+@pytest.fixture
+def prebuild(monkeypatch):
+    """prebuild recorded; it arms the op as it would on DP4 x TP2."""
+
+    def arm():
+        monkeypatch.setattr(op, "_ARMED", True)
+
+    record = Mock(name="prebuild", side_effect=arm)
+    monkeypatch.setattr(op, "prebuild", record)
+    return record
+
+
+def test_maybe_prebuild_arms_for_a_layer_v3_serves(fresh, fused_ep_v3, prebuild):
+    """A layer fused EP v3 armed, with the scores entry and no copy slots:
+    the steps v3's kernel leaves reach the op, so it is armed and built."""
+    op.maybe_prebuild(_moe_layer(), object())
+    prebuild.assert_called_once_with()
+    fresh.assert_called_once_with(TOPK)
+
+
+def test_maybe_prebuild_builds_each_top_k_while_armed(fresh, fused_ep_v3, prebuild):
+    """A later layer with another top-k (a drafter's) gets its op at load,
+    not inside the traced forward."""
+    op.maybe_prebuild(_moe_layer(), object())
+    op.maybe_prebuild(_moe_layer(), object())
+    op.maybe_prebuild(_moe_layer(topk=8), object())
+    assert [c.args for c in fresh.call_args_list] == [(TOPK,), (TOPK,), (8,)]
+
+
+def test_maybe_prebuild_builds_nothing_on_an_unarmed_layout(
+    monkeypatch, fresh, fused_ep_v3
+):
     prebuild = Mock(name="prebuild")
     monkeypatch.setattr(op, "prebuild", prebuild)
     op.maybe_prebuild(_moe_layer(), object())
-    prebuild.assert_called_once_with(TOPK)
+    prebuild.assert_called_once_with()
+    fresh.assert_not_called()
 
 
 @pytest.mark.parametrize(
-    "use_ep,scores_op",
-    [(False, object()), (True, None)],
-    ids=["no_expert_parallelism", "no_scores_entry"],
+    "requested,layer,scores_op",
+    [
+        (False, _moe_layer(), object()),
+        (True, _moe_layer(v3_armed=False), object()),
+        (True, _moe_layer(copies=True), object()),
+        (True, _moe_layer(), None),
+        (True, _moe_layer(use_ep=False), object()),
+    ],
+    ids=[
+        "fused_ep_v3_off",
+        "layer_v3_refused",
+        "copy_slots",
+        "no_scores_entry",
+        "no_expert_parallelism",
+    ],
 )
-def test_maybe_prebuild_leaves_other_layers(monkeypatch, use_ep, scores_op):
-    prebuild = Mock(name="prebuild")
-    monkeypatch.setattr(op, "prebuild", prebuild)
-    op.maybe_prebuild(_moe_layer(use_ep=use_ep), scores_op)
+def test_maybe_prebuild_leaves_layers_whose_steps_never_reach_the_op(
+    monkeypatch, fresh, fused_ep_v3, prebuild, requested, layer, scores_op
+):
+    """No groups collective, rank buffer, op or log line where nothing can
+    call the op: fused EP v3 off (its entry is the op's only caller), a layer
+    v3 refused (the forward takes another path), copy slots or no scores entry
+    (``serves`` declines), or no expert parallelism."""
+    if not requested:
+        monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", False)
+    op.maybe_prebuild(layer, scores_op)
     prebuild.assert_not_called()
+    fresh.assert_not_called()
 
 
-class _Armed(Exception):
-    """Stops the FP8 MoE method's weight processing at the arming call."""
-
-
-def test_fp8_moe_weight_processing_offers_the_layer_to_the_op(monkeypatch):
-    """VllmFp8MoEMethodTPU.process_weights_after_loading hands the layer and
-    its scores entry to maybe_prebuild once the scores entry is built."""
+def _fp8_moe_layer(monkeypatch, calls):
+    """An FP8 MoE layer and its method, with the weight processing's
+    prebuilds recorded in ``calls`` in order (fused EP v3 arms the layer)."""
+    from vllm_torchtpu.layers.adapter import fused_moe_ep, fused_moe_ep_v3
     from vllm_torchtpu.layers.adapter.quantization import fp8
 
     experts, hidden, inter = 1, 512, 256
     layer = torch.nn.Module()
     layer.activation = "silu"
+    layer.renormalize = True
     layer.moe_config = SimpleNamespace(
         experts_per_token=TOPK, moe_parallel_config=SimpleNamespace(use_ep=False)
     )
@@ -375,16 +429,51 @@ def test_fp8_moe_weight_processing_offers_the_layer_to_the_op(monkeypatch):
             None,
         )
 
+    def v3_prebuild(layer, **_kwargs):
+        calls.append("fused EP v3 prebuild")
+        layer._tpu_fused_ep_eligible = True
+
     scores_op = object()
-    arm = Mock(name="maybe_prebuild", side_effect=_Armed)
     monkeypatch.setattr(fp8, "RoutedExperts", torch.nn.Module)
     monkeypatch.setattr(fp8, "_process_fp8_moe_weights", converted)
     monkeypatch.setattr(
         fp8.moe_routing, "register_experts_start_buffer", lambda *a, **kw: None
     )
     monkeypatch.setattr(fp8.moe_lowtok_scores, "prebuild", lambda *a: scores_op)
-    monkeypatch.setattr(op, "maybe_prebuild", arm)
-    with pytest.raises(_Armed):
-        method.process_weights_after_loading(layer)
-    arm.assert_called_once_with(layer, scores_op)
+    monkeypatch.setattr(fp8, "prebuild_fused_moe_kernel", lambda **kw: None)
+    monkeypatch.setattr(fused_moe_ep_v3, "prebuild_fused_moe_ep", v3_prebuild)
+    monkeypatch.setattr(
+        fused_moe_ep,
+        "prebuild_fused_moe_ep",
+        lambda *a, **kw: calls.append("fused EP v2 prebuild"),
+    )
+    monkeypatch.setattr(
+        op,
+        "maybe_prebuild",
+        lambda layer, scores_op: calls.append(("fused op", layer, scores_op)),
+    )
+    return method, layer, scores_op
+
+
+def test_fp8_moe_weight_processing_offers_a_v3_layer_to_the_op(monkeypatch):
+    """Under fused EP v3, VllmFp8MoEMethodTPU.process_weights_after_loading
+    offers the layer and its scores entry to maybe_prebuild after v3's
+    prebuild has decided the layer's eligibility."""
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_KERNEL_IMPL", "v3")
+    monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", True)
+    calls = []
+    method, layer, scores_op = _fp8_moe_layer(monkeypatch, calls)
+    method.process_weights_after_loading(layer)
+    assert calls == ["fused EP v3 prebuild", ("fused op", layer, scores_op)]
     assert method._moe_lowtok_scores_op is scores_op
+    assert method._tpu_fused_ep_eligible is True
+
+
+def test_fp8_moe_weight_processing_without_v3_never_offers_the_layer(monkeypatch):
+    """Without fused EP v3 the op has no caller, so the layer is not offered."""
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_KERNEL_IMPL", None)
+    monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", False)
+    calls = []
+    method, layer, _ = _fp8_moe_layer(monkeypatch, calls)
+    method.process_weights_after_loading(layer)
+    assert calls == ["fused EP v2 prebuild"]

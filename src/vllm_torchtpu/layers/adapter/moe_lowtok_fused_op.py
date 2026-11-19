@@ -40,6 +40,7 @@ from vllm_torchtpu.distributed.ep_mesh import (
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives
 from vllm_torchtpu.layers.adapter import (
+    fused_moe_ep_v3,
     sequence_parallel,
     small_all_reduce_op,
     token_padding,
@@ -59,19 +60,38 @@ _CHECKED = False
 
 
 def maybe_prebuild(layer, scores_op) -> None:
-    """:func:`prebuild` for a MoE layer the few-token kernel's scores entry
-    serves (``scores_op``, from ``moe_lowtok_scores.prebuild``) under expert
-    parallelism; nothing for any other layer."""
-    if scores_op is None or not layer.moe_config.moe_parallel_config.use_ep:
+    """:func:`prebuild` for a MoE layer whose steps can reach the op, then the
+    op for the layer's top-k once armed; nothing for any other layer.
+
+    The op's only caller is the FP8 method's fused EP v3 entry
+    (``_apply_owning_dispatch_v3``), which the method's forward takes for a
+    layer v3's prebuild armed while USE_MOE_FUSED_EP_KERNEL is set; call this
+    after that prebuild. There the op serves the steps v3's kernel does not
+    take when the few-token kernel's scores entry (``scores_op``, from
+    ``moe_lowtok_scores.prebuild``) serves the layer without copy slots under
+    expert parallelism (:func:`serves`). Elsewhere nothing can call the op,
+    so nothing is checked, allocated, built or logged for it.
+    """
+    if not (
+        envs.USE_MOE_FUSED_EP_KERNEL
+        and fused_moe_ep_v3.fused_moe_ep_supported(layer)
+        and scores_op is not None
+        and not layer._lowtok_has_copies
+        and layer.moe_config.moe_parallel_config.use_ep
+    ):
         return
-    prebuild(int(layer.moe_config.experts_per_token))
+    prebuild()
+    if _ARMED:
+        # Every top-k the forward can ask for is built here, outside the
+        # traced region (a drafter's layer can differ from the target's).
+        _build_op(int(layer.moe_config.experts_per_token))
 
 
-def prebuild(topk: int) -> None:
+def prebuild() -> None:
     """Arm the op for this deployment, outside any traced region.
 
-    The caller calls it for a layer the few-token kernel serves. Armed when
-    the layout is DP x TP over the EP mesh with TP pairs on consecutive cores;
+    ``maybe_prebuild`` calls it for a layer the op can serve. Armed when the
+    layout is DP x TP over the EP mesh with TP pairs on consecutive cores;
     otherwise a no-op.
     """
     global _RANK, _DP, _TP, _ARMED, _CHECKED
@@ -114,7 +134,6 @@ def prebuild(topk: int) -> None:
         tp,
         moe_lowtok_scores.armed_max_tokens(),
     )
-    _build_op(topk)
 
 
 def _build_op(topk: int) -> torch.library.CustomOpDef:
