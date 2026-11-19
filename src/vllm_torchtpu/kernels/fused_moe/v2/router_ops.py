@@ -108,3 +108,14 @@ def pallas_select(scores, topk=10, block_rows=256, weight_scores=None, interpret
         out_shape=list(out_shapes),
         interpret=interpret,
     )(*operands)
+
+
+def expert_load_counts(counts, logits, bias, valid, *, topk):
+    """counts [E] int32 plus the routed rows per expert of `logits` [T, E]:
+    each valid row's top `topk` experts by biased sigmoid score (the noaux
+    selection; an exact tie may resolve to another expert than the kernel's).
+    Rows with valid False (padding) add nothing."""
+    scores = jax.nn.sigmoid(logits.astype(jnp.float32)) + bias.astype(jnp.float32)
+    _, ids = jax.lax.top_k(scores, topk)
+    hits = jnp.broadcast_to(valid[:, None], ids.shape).astype(counts.dtype)
+    return counts.at[ids.reshape(-1)].add(hits.reshape(-1))
