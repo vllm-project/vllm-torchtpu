@@ -961,6 +961,26 @@ def test_cli_update_mode(tmp_path, monkeypatch, capsys):
     assert "ERROR: _policy.owner must be a non-empty string" in capsys.readouterr().err
 
 
+def test_cli_update_mode_rejects_perf_flags(tmp_path, monkeypatch, capsys):
+    """Speed gate and chip flags are rejected in update mode."""
+    baseline_file = tmp_path / "baseline.json"
+    baseline_file.write_text(json.dumps(_TASK))
+    with pytest.raises(SystemExit) as exc_info:
+        _run_cli(
+            monkeypatch,
+            "--mode",
+            "update",
+            "--baseline",
+            str(baseline_file),
+            "--chips",
+            "4",
+        )
+    assert exc_info.value.code == 2
+    assert "speed gate and chip flags are only valid in perf check mode" in (
+        capsys.readouterr().err
+    )
+
+
 @pytest.mark.parametrize("content", [None, "[]", "{not json"])
 def test_cli_update_mode_unreadable_file_exits_2(
     tmp_path, monkeypatch, capsys, content
@@ -986,3 +1006,225 @@ def test_shipped_baselines_have_valid_policy():
     assert len(files) > 40
     for path in files:
         check_regression.parse_policy(json.loads(path.read_text()))
+
+
+# --- R6: advisory roofline reporting ---
+
+_ROOFLINE_TARGETS_PATH = _BASELINE_DIR.parent / "perf" / "roofline_targets.json"
+
+
+def _write_perf_cell(results_dir, cell_key, **metrics):
+    results_dir.mkdir(exist_ok=True)
+    payload = {"completed": 64, "num_prompts": 64, **metrics}
+    (results_dir / f"{cell_key}.json").write_text(json.dumps(payload))
+
+
+def test_shipped_roofline_targets_are_well_formed():
+    targets = check_regression.load_roofline_targets(_ROOFLINE_TARGETS_PATH)
+    assert "qwen3.5-397b-fp8-tp1-dp8-ep" in targets.targets
+    assert "kimi-k3-tp32-ep" in targets.targets
+    assert "qwen3.5-397b-fp8-mtp" in targets.not_modeled
+    kimi = targets.targets["kimi-k3-tp32-ep"]
+    assert kimi.num_chips == 16
+    assert kimi.cells["isl8192_osl1024_c1"].status == "unverified"
+    assert kimi.cells["isl8192_osl1024_c1"].output_token_throughput_per_chip == 12.54
+
+
+@pytest.mark.parametrize(
+    ("chips", "prefill", "decode", "expected"),
+    [
+        (None, None, None, None),
+        (8, None, None, 8),
+        (None, 4, 8, 12),
+    ],
+)
+def test_resolve_physical_chips(chips, prefill, decode, expected):
+    assert check_regression.resolve_physical_chips(chips, prefill, decode) == expected
+
+
+@pytest.mark.parametrize(
+    ("chips", "prefill", "decode", "message"),
+    [
+        (0, None, None, "chips must be a positive integer"),
+        (True, None, None, "chips must be a positive integer"),
+        (None, 4, None, "--prefill-chips and --decode-chips must be provided together"),
+        (None, None, 4, "--prefill-chips and --decode-chips must be provided together"),
+        (8, 4, 4, "--chips cannot be combined with --prefill-chips/--decode-chips"),
+    ],
+)
+def test_resolve_physical_chips_rejects_invalid(chips, prefill, decode, message):
+    with pytest.raises(ValueError, match=message):
+        check_regression.resolve_physical_chips(chips, prefill, decode)
+
+
+def test_cli_perf_roofline_advisory_ok_and_unverified(tmp_path, monkeypatch, capsys):
+    # qwen3.5-397b-fp8-tp1-dp8-ep isl1024_osl8192_c64 roofline is 1282.53 tok/s/chip.
+    # Total output_throughput 4104.096 across 4 physical chips = 1026.024 tok/s/chip
+    # = 80.00% of roofline; even at 50% (2565.06 total = 641.265/chip) advisory exits 0.
+    run_dir = tmp_path / "perf_ok"
+    _write_perf_cell(run_dir, "isl1024_osl8192_c64", output_throughput=2565.06)
+    _write_perf_cell(run_dir, "isl512_osl512_c1", output_throughput=100.0)
+    ret = _run_cli(
+        monkeypatch,
+        "--mode",
+        "perf",
+        "--results-dir",
+        str(run_dir),
+        "--roofline-targets",
+        str(_ROOFLINE_TARGETS_PATH),
+        "--config-name",
+        "qwen3.5-397b-fp8-tp1-dp8-ep",
+        "--chips",
+        "4",
+    )
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert (
+        "| `isl1024_osl8192_c64` | output_token_throughput_per_chip |"
+        " 641.26 | 1282.53 | 50.00% | ADVISORY |" in out
+    )
+    assert "| `isl512_osl512_c1` | (no roofline cell) |" in out
+
+    # kimi-k3-tp32-ep isl8192_osl1024_c1 is status=="unverified" (12.54 tok/s/chip).
+    # Disaggregated 8P + 8D = 16 physical chips, total 150.48 -> 9.405/chip = 75.00%.
+    kimi_dir = tmp_path / "perf_kimi"
+    _write_perf_cell(kimi_dir, "isl8192_osl1024_c1", output_throughput=150.48)
+    ret = _run_cli(
+        monkeypatch,
+        "--mode",
+        "perf",
+        "--results-dir",
+        str(kimi_dir),
+        "--roofline-targets",
+        str(_ROOFLINE_TARGETS_PATH),
+        "--config-name",
+        "kimi-k3-tp32-ep",
+        "--prefill-chips",
+        "8",
+        "--decode-chips",
+        "8",
+    )
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert (
+        "| `isl8192_osl1024_c1` | output_token_throughput_per_chip |"
+        " 9.40 | 12.54 | 75.00% | ADVISORY (unverified) |" in out
+    )
+
+
+def test_cli_perf_roofline_not_modeled_and_unknown_config(
+    tmp_path, monkeypatch, capsys
+):
+    empty_dir = tmp_path / "disagg"
+    empty_dir.mkdir()
+    ret = _run_cli(
+        monkeypatch,
+        "--mode",
+        "perf",
+        "--results-dir",
+        str(empty_dir),
+        "--roofline-targets",
+        str(_ROOFLINE_TARGETS_PATH),
+        "--config-name",
+        "qwen3.5-397b-fp8-1p1d",
+    )
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "not modeled" in out
+    assert "disaggregated_pd_kv_transfer_not_modeled" in out
+
+    ret = _run_cli(
+        monkeypatch,
+        "--mode",
+        "perf",
+        "--results-dir",
+        str(empty_dir),
+        "--roofline-targets",
+        str(_ROOFLINE_TARGETS_PATH),
+        "--config-name",
+        "nonexistent-config",
+    )
+    assert ret == 2
+    assert "not found in roofline targets" in capsys.readouterr().err
+
+
+def test_cli_perf_roofline_uses_modeled_chips_and_combines_with_baseline(
+    tmp_path, monkeypatch, capsys
+):
+    # Without --chips, check_roofline uses roofline_targets.json num_chips (8).
+    # 9009.792 / 8 = 1126.224 tok/s/chip = 80.00% of 1407.78.
+    run_dir = tmp_path / "glm"
+    _write_perf_cell(run_dir, "isl8192_osl1024_c1024", output_throughput=9009.792)
+    baseline_file = tmp_path / "glm.baseline.json"
+    baseline_file.write_text(
+        json.dumps(
+            {
+                "isl8192_osl1024_c1024": {
+                    "completed": 64,
+                    "output_token_throughput": 9000.0,
+                }
+            }
+        )
+    )
+    ret = _run_cli(
+        monkeypatch,
+        "--mode",
+        "perf",
+        "--results-dir",
+        str(run_dir),
+        "--baseline",
+        str(baseline_file),
+        "--roofline-targets",
+        str(_ROOFLINE_TARGETS_PATH),
+        "--config-name",
+        "glm-5.2-fp8-dp16-ep",
+    )
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "## Perf regression check" in out
+    assert (
+        "## Roofline speed check (`glm-5.2-fp8-dp16-ep`, 8 physical chips, advisory)"
+        in out
+    )
+    assert (
+        "| `isl8192_osl1024_c1024` | output_token_throughput_per_chip |"
+        " 1126.22 | 1407.78 | 80.00% | ADVISORY |" in out
+    )
+
+    # A failing relative baseline still exits 1 when advisory roofline runs beside it.
+    baseline_file.write_text(
+        json.dumps(
+            {
+                "isl8192_osl1024_c1024": {
+                    "completed": 64,
+                    "output_token_throughput": 12000.0,
+                }
+            }
+        )
+    )
+    assert (
+        _run_cli(
+            monkeypatch,
+            "--mode",
+            "perf",
+            "--results-dir",
+            str(run_dir),
+            "--baseline",
+            str(baseline_file),
+            "--roofline-targets",
+            str(_ROOFLINE_TARGETS_PATH),
+            "--config-name",
+            "glm-5.2-fp8-dp16-ep",
+        )
+        == 1
+    )
+
+
+def test_load_roofline_targets_rejects_malformed(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text("[]")
+    with pytest.raises(ValueError, match="must hold an object"):
+        check_regression.load_roofline_targets(bad)
+    bad.write_text(json.dumps({"targets": {"c": {"cells": {"x": {"status": "bad"}}}}}))
+    with pytest.raises(ValueError, match="status must be one of"):
+        check_regression.load_roofline_targets(bad)
