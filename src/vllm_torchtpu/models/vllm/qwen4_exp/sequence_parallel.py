@@ -73,7 +73,8 @@ def shard_rows(hc_tiles: Iterable[int]) -> int:
     Pallas path.
 
     ``GatedResidual`` picks a kernel or its XLA fallback by whether the row
-    count divides the kernel's tile (twice the tile for the full mix). Only
+    count divides the kernel's tile (explicit integer tiles only; auto tiles
+    gate on >= 1024 shard rows). Only
     shards that divide all of them keep the sequence-parallel graph one
     structure across its buckets, so it traces once.
     """
@@ -180,7 +181,9 @@ def decode_req_shard_enabled() -> bool:
     same guards as ``replicated_token_shard_enabled``)."""
     if not envs.VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD:
         return False
-    return _token_sharded_replicated_graph_allowed("VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD")
+    return _token_sharded_replicated_graph_allowed(
+        "VLLM_TPU_QSA_DECODE_INDEXER_REQ_SHARD"
+    )
 
 
 def decode_req_shard_eligible(

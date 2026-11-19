@@ -7,6 +7,14 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels.qwen4_exp.hc_resources import (
+    RESIDUAL_PIPELINE,
+    HcHardware,
+    resolve_kernel_vmem,
+    supports_residual,
+)
 
 
 def _kernel(residual_ref, block_ref, gates_ref, output_ref, *, branches, hidden):
@@ -22,14 +30,15 @@ def _kernel(residual_ref, block_ref, gates_ref, output_ref, *, branches, hidden)
 
 @functools.cache
 def gated_residual_fn(
-    branches: int, hidden: int, token_tile: int
+    branches: int, hidden: int, token_tile: int, hardware: HcHardware | None = None
 ) -> Callable[[jax.Array, jax.Array, jax.Array], jax.Array]:
     """Build a tiled residual merge with BF16 inputs/output and FP32 gates.
 
     Args:
         branches: Number of contiguous residual branches.
         hidden: Width of each branch, aligned to 128 TPU vector lanes.
-        token_tile: Token rows per tile, a positive multiple of 128.
+        token_tile: Full token rows per tile, aligned to dtype sublane packing.
+        hardware: Optional immutable layout facts; resolved at TPU tracing otherwise.
 
     Returns:
         A JAX function taking residual, block output, and scalar gates.
@@ -39,8 +48,8 @@ def gated_residual_fn(
     """
     if branches <= 0 or hidden <= 0 or hidden % 128:
         raise ValueError("Residual branches must be positive and width 128-aligned")
-    if token_tile <= 0 or token_tile % 128:
-        raise ValueError("Residual token tile must be a positive multiple of 128")
+    if token_tile <= 0:
+        raise ValueError("Residual token tile must be positive")
 
     def core(residual: jax.Array, block: jax.Array, gates: jax.Array) -> jax.Array:
         tokens = residual.shape[0]
@@ -55,16 +64,49 @@ def gated_residual_fn(
             or gates.dtype != jnp.float32
         ):
             raise ValueError("Residual merge requires full BF16 tiles and FP32 gates")
+        layout, vmem_bytes = resolve_kernel_vmem(hardware)
+        if layout is not None and not supports_residual(
+            branches, hidden, token_tile, layout
+        ):
+            raise ValueError(
+                "Residual merge requires supported packing and VMEM budget"
+            )
         return pl.pallas_call(
             functools.partial(_kernel, branches=branches, hidden=hidden),
             grid=(tokens // token_tile,),
             in_specs=(
-                pl.BlockSpec((token_tile, branches * hidden), lambda i: (i, 0)),
-                pl.BlockSpec((token_tile, hidden), lambda i: (i, 0)),
-                pl.BlockSpec((token_tile, branches), lambda i: (i, 0)),
+                pl.BlockSpec(
+                    (token_tile, branches * hidden),
+                    lambda i: (i, 0),
+                    pipeline_mode=RESIDUAL_PIPELINE,
+                ),
+                pl.BlockSpec(
+                    (token_tile, hidden),
+                    lambda i: (i, 0),
+                    pipeline_mode=RESIDUAL_PIPELINE,
+                ),
+                pl.BlockSpec(
+                    (token_tile, branches),
+                    lambda i: (i, 0),
+                    pipeline_mode=RESIDUAL_PIPELINE,
+                ),
             ),
-            out_specs=pl.BlockSpec((token_tile, branches * hidden), lambda i: (i, 0)),
+            out_specs=pl.BlockSpec(
+                (token_tile, branches * hidden),
+                lambda i: (i, 0),
+                pipeline_mode=RESIDUAL_PIPELINE,
+            ),
             out_shape=jax.ShapeDtypeStruct(residual.shape, residual.dtype),
+            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_bytes),
+            # Logical unpadded operand/output bytes, not exact DMA bus traffic.
+            cost_estimate=pl.CostEstimate(
+                flops=2 * tokens * branches * hidden,
+                transcendentals=0,
+                bytes_accessed=sum(
+                    a.size * a.dtype.itemsize for a in (residual, block, gates)
+                )
+                + residual.size * residual.dtype.itemsize,
+            ),
             name=f"gated_residual_b{branches}_h{hidden}_m{token_tile}",
         )(residual, block, gates)
 

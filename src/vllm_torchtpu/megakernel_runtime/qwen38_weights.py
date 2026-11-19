@@ -77,14 +77,22 @@ def _hc_mix_operands(
         if inj_w is not None
         else torch.zeros((g.NHC, W), dtype=down.dtype, device=down.device)
     )  # [NHC, W]
-    up = hc.input_mix_weight_up.weight.data  # [W, LR]
-    assert tuple(down.shape) == (lr, W) and tuple(up.shape) == (W, lr), (
-        down.shape,
-        up.shape,
-    )
+    up = hc.input_mix_weight_up.weight.data
+    if getattr(hc, "_up_transposed", False):
+        assert tuple(down.shape) == (lr, W) and tuple(up.shape) == (lr, W), (
+            down.shape,
+            up.shape,
+        )
+        up_lr_w = up
+    else:
+        assert tuple(down.shape) == (lr, W) and tuple(up.shape) == (W, lr), (
+            down.shape,
+            up.shape,
+        )
+        up_lr_w = up.t()
     hdn = torch.cat([down.t(), inj.t()], dim=1)
     hdn = F.pad(hdn, (0, rup(lr + g.NHC, 128) - hdn.shape[1]))
-    up_t = F.pad(up.t(), (0, 0, 0, rup(lr, 128) - lr))
+    up_t = F.pad(up_lr_w, (0, 0, 0, rup(lr, 128) - lr))
     return hdn.contiguous(), [
         up_t[:, b * g.H : (b + 1) * g.H].contiguous() for b in range(g.NHC)
     ]
