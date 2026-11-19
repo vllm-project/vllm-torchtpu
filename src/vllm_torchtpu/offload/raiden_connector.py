@@ -400,6 +400,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         )
         if victim.host_tier_policy() == "victim":
             self._enable_victim_policy(spec, vllm_config)
+        if tpu_envs.VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE:
+            self._enable_exclusive_restore()
 
     def host_resident_tokens(self, request: Request, num_local_tokens: int) -> int:
         """Prompt tokens past ``num_local_tokens`` that every offloaded group
@@ -486,6 +488,28 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             self._victim_min_age,
         )
 
+    def _enable_exclusive_restore(self) -> None:
+        """VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE: a landed load's host copy is
+        evicted. Only with the victim policy, which stores the block again
+        when HBM evicts it; write-through would never store it back."""
+        if not self.__dict__.get("_victim", False):
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE "
+                f"needs {victim.POLICY_ENV}=victim (the host tier stores a block "
+                "again only when HBM evicts it)"
+            )
+        manager = self._raiden_manager
+        manager.set_exclusive_restore(True)
+        self._excl = True
+        logger.info(
+            "TPURaidenOffloadingConnector: host-tier exclusive restore on (a "
+            "landed load's host copy is evicted with KVCacheStore.evict; HBM "
+            "eviction stores it again); %s",
+            "classes " + ",".join(c.name for c in manager.classes)
+            if isinstance(manager, TieredOffloadingManager)
+            else "single store",
+        )
+
     def _store_victims(self) -> None:
         """Store this step's evicted blocks and drain them before the step's
         metadata ships, so the new owners' forward passes cannot overwrite a
@@ -563,6 +587,15 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         manager = self.__dict__.get("_raiden_manager")
         if isinstance(manager, TieredOffloadingManager):
             line += " " + manager.telemetry_line()
+        if self.__dict__.get("_excl", False):
+            stats = manager.excl_stats()
+            if isinstance(stats, dict):
+                stats = [stats]
+            totals = {
+                k: sum(s[k] for s in stats)
+                for k in ("calls", "asked", "evicted", "abandoned", "discarded")
+            }
+            line += " excl_restore=" + ",".join(f"{k}:{v}" for k, v in totals.items())
         unhashed = self.__dict__.get("_tier_check_unhashed", {})
         for name, counts in sorted(self.__dict__.get("_tier_check_totals", {}).items()):
             fields = " ".join(f"{k}={v}" for k, v in zip(CHECK_FIELDS, counts))

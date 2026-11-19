@@ -542,6 +542,20 @@ class RaidenOffloadingManager(OffloadingManager):
         self._held_stored = 0
         self._held_evicted = 0
 
+        # Exclusive restore (VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE; off unless
+        # set_exclusive_restore): the local sub-hashes of a landed load are
+        # evicted from the host pool, deferred to the parent job's verdict
+        # under the tier classes. Sub-hashes being evicted right now, so the
+        # eviction callback counts them as discards, not LRU evictions.
+        self._excl = False
+        self._excl_defer = False
+        self._excl_deferred: dict[int, list[bytes]] = {}
+        self._excl_evicting: frozenset[bytes] = frozenset()
+        self._excl_counts = dict.fromkeys(
+            ("calls", "asked", "evicted", "abandoned"), 0
+        )
+        self._held_discarded = 0
+
     # -- sub-hash / block-id expansion ----------------------------------
 
     def _sub_hashes(self, key: OffloadKey) -> list[bytes]:
@@ -908,6 +922,51 @@ class RaidenOffloadingManager(OffloadingManager):
         """Victim policy: prepare_store stores nothing; see prepare_victim_store."""
         self.__dict__["_victim_mode"] = bool(on)
 
+    # -- exclusive restore (VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE) ---------------
+
+    def set_exclusive_restore(self, on: bool, defer: bool = False) -> None:
+        """Evict a landed load's local host entries (``defer``: on the parent
+        job's verdict, through ``excl_resolve``). Refuses a store without
+        ``evict``: a wheel that cannot evict must not run as if it did."""
+        if on and not hasattr(self._store, "evict"):
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE "
+                "needs a Raiden build whose KVCacheStore has evict(); this one "
+                "does not"
+            )
+        self._excl = bool(on)
+        self._excl_defer = bool(on and defer)
+
+    def excl_resolve(self, job_id: int, success: bool) -> None:
+        """The parent load of a deferred child ended: evict on success; on
+        failure the host entries stay (the scheduler recomputes the job)."""
+        local = self._excl_deferred.pop(job_id, None)
+        if local is None:
+            return
+        if success:
+            self._excl_evict(local)
+        else:
+            self._excl_counts["abandoned"] += len(local)
+
+    def _excl_evict(self, sub_hashes: list[bytes]) -> None:
+        if not sub_hashes:
+            return
+        # Not under _eviction_lock: the store fires the eviction callback,
+        # which takes it, before evict returns.
+        self._excl_evicting = frozenset(sub_hashes)
+        try:
+            evicted = int(self._store.evict(list(sub_hashes)))
+        finally:
+            self._excl_evicting = frozenset()
+        counts = self._excl_counts
+        counts["calls"] += 1
+        counts["asked"] += len(sub_hashes)
+        counts["evicted"] += evicted
+
+    def excl_stats(self) -> dict[str, int]:
+        """Exclusive-restore counters, and the held keys it discarded."""
+        return dict(self._excl_counts, discarded=self._held_discarded)
+
     def _keys_needing_store(self, keys) -> list[OffloadKey]:
         """Keys not in flight and not wholly resident (host or a peer). The
         probe pins then releases, so a resident key moves to the LRU's MRU
@@ -957,7 +1016,9 @@ class RaidenOffloadingManager(OffloadingManager):
         return OffloadKey(key_bytes), sub_idx
 
     def _on_eviction(self, evicted_hashes: list[bytes]) -> None:
-        """Callback invoked by Raiden C++ store upon host LRU cache eviction."""
+        """Callback invoked by Raiden C++ store upon host LRU cache eviction,
+        and by an exclusive-restore evict (counted as a discard)."""
+        discarding = self.__dict__.get("_excl_evicting", frozenset())
         with self._eviction_lock:
             for sub_hash in evicted_hashes:
                 parsed = self._sub_hash_to_offload_key(sub_hash)
@@ -965,7 +1026,10 @@ class RaidenOffloadingManager(OffloadingManager):
                     continue
                 key, sub_idx = parsed
                 if self._held is not None and self._held.pop(key, None) is not None:
-                    self._held_evicted += 1
+                    if sub_hash in discarding:
+                        self._held_discarded += 1
+                    else:
+                        self._held_evicted += 1
                 sub_indices = self._evicted_sub_hashes.setdefault(key, set())
                 if not sub_indices:
                     # Report eviction on the first sub-block loss: the logical
@@ -1289,6 +1353,18 @@ class RaidenOffloadingManager(OffloadingManager):
                 )
             )
         else:
+            if success and self.__dict__.get("_excl", False):
+                # The bytes are in HBM now: the host copy only duplicates them.
+                # Peer and storage reads left no local entry to evict.
+                local = [
+                    h
+                    for h in admission.sub_hashes
+                    if h not in admission.remote_sub_hashes
+                ]
+                if self._excl_defer:
+                    self._excl_deferred[admission.job_id] = local
+                else:
+                    self._excl_evict(local)
             self._finished.append(
                 FinishedJob(
                     job_id=admission.job_id,

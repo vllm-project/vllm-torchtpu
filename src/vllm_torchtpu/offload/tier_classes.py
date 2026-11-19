@@ -436,6 +436,17 @@ class TieredOffloadingManager(OffloadingManager):
         for manager in self._managers:
             manager.set_victim_mode(on)
 
+    def set_exclusive_restore(self, on: bool) -> None:
+        """Each class evicts its part of a load only once the whole parent
+        succeeded: a failed parent recomputes every block, so no class may have
+        dropped its host copy (``RaidenOffloadingManager.excl_resolve``)."""
+        for manager in self._managers:
+            manager.set_exclusive_restore(on, defer=True)
+        self.__dict__["_excl"] = bool(on)
+
+    def excl_stats(self) -> list[dict[str, int]]:
+        return [manager.excl_stats() for manager in self._managers]
+
     def prepare_victim_store(self, keys) -> list[OffloadKey]:
         keys = list(keys)
         chosen: set[OffloadKey] = set()
@@ -588,6 +599,9 @@ class TieredOffloadingManager(OffloadingManager):
         if parent.waiting:
             return
         del self._parents[finished.job_id]
+        if parent.op == AdmissionOp.LOAD and self.__dict__.get("_excl", False):
+            for manager in self._managers:
+                manager.excl_resolve(finished.job_id, not parent.failed)
         if (
             self._check is not None
             and parent.op == AdmissionOp.LOAD
@@ -688,6 +702,11 @@ class TieredOffloadingManager(OffloadingManager):
                 f"stored={stored} evicted={evicted}{rate} "
                 f"oldest_stored_at={stamp} oldest_age_s={age} "
                 f"load_keys={self._load_keys[c.index]}"
+                + (
+                    f" discarded={self._managers[c.index].excl_stats()['discarded']}"
+                    if self.__dict__.get("_excl", False)
+                    else ""
+                )
             )
         self._telemetry_last = (now, [(s[1], s[2]) for s in stats])
         return " ".join(parts)
