@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import functools
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any, cast
 
+import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import (
@@ -30,7 +30,6 @@ from vllm.v1.worker.encoder_cudagraph import (
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.mm_host_copy_patch import copy_bytes_
 from vllm_torchtpu.runner.mm_encoder_rows import split_batch_output
 from vllm_torchtpu.runner.mm_video_chunking import (
     embed_multimodal_chunked,
@@ -53,78 +52,65 @@ def _to_device(mm_kwargs: Any, device: torch.device) -> Any:
 
 
 # Host rows reach the device as chunks of 1/ROW_CHUNKS of a budget's rows
-# (`rows_to_device`): the device program then depends on the chunk count, not
+# (`rows_to_device`), so the device program depends on the chunk count, not
 # the row count. Uploading 30000 of 32768 rows as 8 chunks took 6.3 ms, as one
 # tensor 8.5 ms; copying them into one budget-shaped host buffer first, 14 ms.
 ROW_CHUNKS = 8
 
 
-@functools.cache
-def _tail_buffer(shape: tuple[int, ...], dtype: torch.dtype) -> list[Any]:
-    """A host buffer for partial chunks and its last upload.
-
-    Reused, so the chunk-sized allocation is not faulted in per call. Rows
-    past the tail keep earlier (finite) rows: padding rows of a budget graph
-    are never attended to by real ones, and their outputs are dropped.
-    """
-    return [torch.zeros(shape, dtype=dtype), None]
-
-
 def rows_to_device(
     parts: Sequence[torch.Tensor], template: torch.Tensor
 ) -> torch.Tensor:
-    """The concatenated host rows of `parts`, padded to `template`'s shape and
-    dtype, on its device.
+    """The concatenated host rows of `parts`, zero-padded to `template`'s shape
+    and dtype, on its device.
 
-    Whole chunks upload as views; a partial one goes through a reused host
-    buffer (`_tail_buffer`), refilled once its previous upload is done.
-    Padding rows are zero past the last chunk.
+    Each run of rows uploads as whole chunks, all views: the last chunk ends at
+    the run's end and overlaps the one before it. A gather by a host-built
+    index then picks every row once, and the padding rows from a zero row.
     """
     rows, rest = template.shape[0], tuple(template.shape[1:])
     size = rows // ROW_CHUNKS if rows % ROW_CHUNKS == 0 else rows
-    device, chunks, tail, filled = template.device, [], [], 0
+    device, chunks, index, offset = template.device, [], [], 0
+    for run in _coalesce(parts):
+        n = run.shape[0]
+        if n < size:
+            # Only below the smallest budget's chunk: pad it on the host, and
+            # upload it blocking, as the padded copy dies with this call.
+            chunks.append(torch.cat([run, run.new_zeros(size - n, *rest)]).to(device))
+            starts = [0]
+        else:
+            starts = [*range(0, n - size, size), n - size]
+            for start in starts:
+                chunks.append(run[start : start + size].to(device, non_blocking=True))
+        at = np.arange(n)
+        overlap = at >= (len(starts) - 1) * size
+        at[overlap] += (len(starts) - 1) * size - starts[-1]
+        index.append(offset + at)
+        offset += len(starts) * size
+    used = sum(len(i) for i in index)
+    index.append(np.full(rows - used, offset))  # the zero row
+    source = torch.cat([*chunks, chunks[0].new_zeros(1, *rest)])
+    picks = torch.from_numpy(np.concatenate(index)).to(device, non_blocking=True)
+    return source[picks].to(template.dtype)
+
+
+def _coalesce(parts: Sequence[torch.Tensor]) -> list[torch.Tensor]:
+    """`parts` with neighbours that are adjacent in one storage merged."""
+    runs: list[torch.Tensor] = []
     for part in parts:
-        start = 0
-        while start < part.shape[0]:
-            take = min(size - filled, part.shape[0] - start)
-            piece = part[start : start + take]
-            start += take
-            if take == size:
-                chunks.append(piece.to(device, non_blocking=True))
-                continue
-            tail.append(piece)
-            filled += take
-            if filled == size:
-                chunks.append(_upload_tail(tail, size, rest, part.dtype, device))
-                tail, filled = [], 0
-    if tail:
-        chunks.append(_upload_tail(tail, size, rest, tail[0].dtype, device))
-    out = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
-    if out.shape[0] < rows:
-        out = torch.cat([out, out.new_zeros(rows - out.shape[0], *rest)])
-    return out.to(template.dtype)
-
-
-def _upload_tail(
-    pieces: list[torch.Tensor],
-    size: int,
-    rest: tuple[int, ...],
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    slot = _tail_buffer((size, *rest), dtype)
-    buffer, previous = slot
-    if previous is not None:
-        synchronize_tensors([previous], wait=True)
-    flat = buffer.view(-1).view(torch.uint8)
-    pairs, start = [], 0
-    for piece in pieces:
-        src = piece.contiguous().view(-1).view(torch.uint8)
-        pairs.append((flat[start : start + src.numel()], src))
-        start += src.numel()
-    copy_bytes_(pairs)
-    slot[1] = buffer.to(device, non_blocking=True, copy=True)
-    return slot[1]
+        last = runs[-1] if runs else None
+        if (
+            last is not None
+            and last.is_contiguous()
+            and part.is_contiguous()
+            and part.untyped_storage().data_ptr() == last.untyped_storage().data_ptr()
+            and part.storage_offset() == last.storage_offset() + last.numel()
+        ):
+            shape = (last.shape[0] + part.shape[0], *last.shape[1:])
+            runs[-1] = last.as_strided(shape, last.stride(), last.storage_offset())
+        else:
+            runs.append(part)
+    return runs
 
 
 @contextmanager
