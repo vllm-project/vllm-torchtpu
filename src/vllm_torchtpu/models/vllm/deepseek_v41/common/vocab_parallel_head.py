@@ -27,16 +27,17 @@ import torch
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
-
-_AXIS = "d"
 
 
 def make_head(mesh, world: int, vocab: int):
     """The SPMD head over ``mesh``: (rows [W*T, D] bf16, weight [V, D] bf16),
     both sharded on axis 0, -> logits [W*T, V] bf16 sharded on axis 0."""
+    assert vocab % world == 0, f"vocab {vocab} is not divisible by {world} ranks"
     shard = vocab // world
 
     def local(x, w):
@@ -47,7 +48,7 @@ def make_head(mesh, world: int, vocab: int):
         # multi-rank decode, while the all-to-all form is not affected.
         copies = jnp.broadcast_to(x[None], (world, rows, width))
         every = jax.lax.all_to_all(
-            copies.reshape(world * rows, width), _AXIS, 0, 0, tiled=True
+            copies.reshape(world * rows, width), EP_AXIS_NAME, 0, 0, tiled=True
         )
         part = jax.lax.dot_general(
             every,
@@ -57,7 +58,7 @@ def make_head(mesh, world: int, vocab: int):
         ).astype(jnp.bfloat16)
         # [owner rank, T, V/W] -> [vocab slice, T, V/W] -> [T, V].
         mine = jax.lax.all_to_all(
-            part.reshape(world, rows, shard), _AXIS, 0, 0, tiled=True
+            part.reshape(world, rows, shard), EP_AXIS_NAME, 0, 0, tiled=True
         )
         return jnp.transpose(mine, (1, 0, 2)).reshape(rows, vocab)
 
@@ -65,8 +66,8 @@ def make_head(mesh, world: int, vocab: int):
         return jax.shard_map(
             local,
             mesh=mesh,
-            in_specs=(P(_AXIS, None), P(_AXIS, None)),
-            out_specs=P(_AXIS, None),
+            in_specs=(P(EP_AXIS_NAME, None), P(EP_AXIS_NAME, None)),
+            out_specs=P(EP_AXIS_NAME, None),
             check_vma=False,
         )(x, w)
 
@@ -82,15 +83,15 @@ def build_head_op(world: int, vocab: int, width: int):
 
     from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh
 
-    mesh = build_ep_mesh(axis_name=_AXIS)
+    mesh = build_ep_mesh()
     if mesh is None:
         raise RuntimeError("The vocab-parallel LM head needs an expert-parallel mesh")
     op = jax_op(
-        f"pallas::dsv41_vocab_parallel_head_v{vocab}_d{width}",
+        f"pallas::dsv41_vocab_parallel_head_w{world}_v{vocab}_d{width}",
         make_head(mesh, world, vocab),
         mesh=mesh,
-        input_partition_specs=(P(_AXIS, None), P(_AXIS, None)),
-        output_partition_specs=P(_AXIS, None),
+        input_partition_specs=(P(EP_AXIS_NAME, None), P(EP_AXIS_NAME, None)),
+        output_partition_specs=P(EP_AXIS_NAME, None),
     )
 
     def fake(x, w):
@@ -119,14 +120,13 @@ def _logits_processor_reason(lm_head, logits_processor) -> str | None:
             f"the head is padded from {logits_processor.org_vocab_size} to "
             f"{weight.shape[0]} vocab rows"
         )
-    if getattr(lm_head, "bias", None) is not None:
+    if lm_head.bias is not None:
         return "the head has a bias"
     if not isinstance(
-        getattr(lm_head, "quant_method", None),
-        (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
+        lm_head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
     ):
         return "the head is quantized"
-    if getattr(logits_processor, "head_dtype", None) not in (None, weight.dtype):
+    if logits_processor.head_dtype not in (None, weight.dtype):
         return f"the head computes in {logits_processor.head_dtype}"
     return None
 
@@ -188,6 +188,12 @@ def whole_head_reason(lm_head, logits_processor, vllm_config) -> str | None:
             f"it needs a BF16 vocab divisible by {len(ids)}; got "
             f"{tuple(weight.shape)} {weight.dtype}"
         )
+    world = torch.distributed.get_world_size()
+    if len(ids) != world:
+        return (
+            f"its mesh spans the whole world of {world} ranks, and the EP "
+            f"group has {len(ids)}"
+        )
     return None
 
 
@@ -208,6 +214,7 @@ def shard_lm_head(lm_head: torch.nn.Module, logits_processor, vllm_config) -> bo
     shard = vocab // world
     op = build_head_op(world, vocab, width)
     piece = weight.data[rank * shard : (rank + 1) * shard].clone()
+    synchronize_tensors(piece)
     lm_head.weight = torch.nn.Parameter(piece, requires_grad=False)
     lm_head.vocab_parallel_op = op
     lm_head.vocab_parallel_vocab = vocab
