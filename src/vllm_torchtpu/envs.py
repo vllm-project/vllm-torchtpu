@@ -262,6 +262,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_FP8: int = 0
+    TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT: str = ""
 
 
 def env_with_choices(
@@ -1681,6 +1682,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 = off (stream per group). Same outputs bit for bit.
     "TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_FP8": env_nonnegative_int(
         "TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_FP8", 0
+    ),
+    # MiniMax M3 MSA prefill attention on fp8 KV caches: comma list of
+    # "exp16" (softmax exp in bf16) and "qk8" (fp8 x fp8 score dot). Not
+    # bitwise; empty (default) = off.
+    "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT": env_str(
+        "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT", ""
     ),
     "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION": env_str(
         "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION", ""

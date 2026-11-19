@@ -792,6 +792,13 @@ def _fp8_page_cache_slots() -> int:
     return envs.TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_FP8
 
 
+def _fp8_opt() -> str:
+    """TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT (read when traced)."""
+    from vllm_torchtpu import envs
+
+    return envs.TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT
+
+
 def msa_attend_dcp(
     q: jax.Array,
     kv_cache: jax.Array,
@@ -884,7 +891,9 @@ def msa_attend_dcp(
         if scale_cache is not None:
             common["page_cache_slots"] = msa_attention_lse.PREFILL_PAGE_CACHE_SLOTS
             common["page_cache_bf16"] = msa_attention_lse.PREFILL_PAGE_CACHE_BF16
-        elif _fp8_page_cache_slots() and num_heads == 1:
+        if scale_cache is None and _fp8_opt():
+            common["prefill_precision"] = _fp8_opt()
+        if scale_cache is None and _fp8_page_cache_slots() and num_heads == 1:
             slots = _fp8_page_cache_slots()
             msa_attention_lse._proof(
                 "TPU_MINIMAX_M3_MSA_PREFILL_PAGE_CACHE_FP8",

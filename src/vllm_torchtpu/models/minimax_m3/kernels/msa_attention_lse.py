@@ -195,6 +195,29 @@ _PV8_UNIT = 64.0
 _FP8_MAX = 448.0
 PREFILL_PRECISION_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION"
 _PRECISION_LEVERS = ("qk8", "pv8")
+# TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT levers of 8-bit (fp8) pages on the
+# transposed prefill path (`_kernel.attend_t`), default off, not bitwise:
+# "exp16": p = exp2(s - m) in bf16 (p enters p @ v in bf16 anyway; l sums the
+# rounded p in f32). "qk8": K stays fp8 and the scaled query rounds to fp8, so
+# the score dot runs fp8 x fp8 and the page's K half needs no bf16 convert.
+FP8_OPT_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT"
+_FP8_LEVERS = ("exp16", "qk8")
+
+
+def fp8_prefill_levers(spec: str | None = None) -> frozenset:
+    """Levers of ``envs.TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT`` (or `spec`); read
+    when the program is traced."""
+    if spec is None:
+        from vllm_torchtpu import envs
+
+        spec = envs.TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT
+    levers = frozenset(x.strip() for x in spec.replace("/", ",").split(",") if x.strip())
+    bad = levers - set(_FP8_LEVERS)
+    if bad:
+        raise ValueError(f"{FP8_OPT_ENV}: unknown levers {sorted(bad)}")
+    if levers:
+        _proof(FP8_OPT_ENV, f"fp8 MSA prefill attention levers {sorted(levers)}")
+    return levers
 
 
 def prefill_precision_levers(spec: str | None = None) -> frozenset:
@@ -456,6 +479,8 @@ def _kernel(
     # `precision` levers (4-bit pages, `prefill_precision_levers`).
     qk8 = fp4 and "qk8" in precision
     pv8 = fp4 and "pv8" in precision
+    exp16_t = not fp4 and "exp16" in precision
+    qk8_t = not fp4 and "qk8" in precision
     out_unit = 1.0 / _PV8_UNIT if pv8 else 1.0
 
     def group_head(w):
@@ -732,7 +757,17 @@ def _kernel(
                 limit = jnp.where(local_page == page, local_limit, page_size)
                 limit = jnp.where(page >= 0, limit * hit, 0)  # [1, Bq]
                 seen = jnp.max(limit)
-                if packing == 4:
+                if packing == 4 and qk8_t:
+                    rows8 = kv_ref[0].reshape(page_size, -1)
+                    values.append(
+                        jnp.where(
+                            row_slots < seen,
+                            rows8[:, head_dim:].astype(jnp.bfloat16),
+                            0,
+                        )
+                    )
+                    rows = rows8
+                elif packing == 4:
                     rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
                     values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
                 else:
@@ -745,15 +780,21 @@ def _kernel(
             v = jnp.concatenate(values, axis=0)
             mask = jnp.concatenate(masks, axis=0)
             q = q_ref[...].reshape(num_heads * block_q, head_dim)
-            q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
+            q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(
+                k.dtype if qk8_t else q.dtype
+            )
             s = jax.lax.dot_general(
                 k, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
             )  # [W * S, rows]
             s = jnp.where(mask, s, -jnp.inf)
             m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
             m_new = jnp.maximum(m_prev, jnp.max(s, axis=0, keepdims=True))
-            p = jnp.exp2(s - m_new)
-            l_cur = jnp.sum(p, axis=0, keepdims=True)
+            if exp16_t:
+                p = jnp.exp2((s - m_new).astype(jnp.bfloat16))
+                l_cur = jnp.sum(p.astype(jnp.float32), axis=0, keepdims=True)
+            else:
+                p = jnp.exp2(s - m_new)
+                l_cur = jnp.sum(p, axis=0, keepdims=True)
             pv = jax.lax.dot_general(
                 v,
                 p.astype(v.dtype),
@@ -1332,7 +1373,7 @@ def _attention_call(
             bf16_cache=bf16_cache,
             row_split=row_split,
             tiles_per_head=tiles_per_head,
-            precision=precision if fp4 else frozenset(),
+            precision=precision if fp4 else precision & frozenset(_FP8_LEVERS),
             pair=pair,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
@@ -1805,12 +1846,20 @@ def _chunked_call(
         if scale_cache is not None or jnp.dtype(kv_cache.dtype).itemsize == 1
         else 0
     )
-    if cache_size:
+    if cache_size and scale_cache is not None:
         call = functools.partial(
             call,
             cache_size=cache_size,
             cache_bf16=page_cache_bf16,
             precision=prefill_precision_levers(prefill_precision),
+        )
+    elif scale_cache is None and (cache_size or prefill_precision):
+        # 8-bit pages: `prefill_precision` names TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT
+        # levers (`msa_dcp.msa_attend_dcp`).
+        call = functools.partial(
+            call,
+            cache_size=cache_size,
+            precision=fp8_prefill_levers(prefill_precision or ""),
         )
     limit = msa_attention.MAX_TOKENS_PER_CALL
     step = min(num_tokens, max(block_q, limit - limit % block_q))
