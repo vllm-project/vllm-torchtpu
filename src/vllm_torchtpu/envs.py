@@ -1656,7 +1656,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # how its sorts run. Empty keeps three stable sorts (two of two operands);
     # "unstable" drops the stability; "packed" sorts one packed int32 operand
     # per sort, unstable; "packed_search" also finds the distinct keys by a
-    # binary search instead of the second sort. Same table bit for bit.
+    # binary search instead of the second sort; "packed_batched" runs the
+    # second and third packed sorts as one two-row sort (they are
+    # independent). Same table bit for bit.
     "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT": env_str(
         "TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT", ""
     ),
