@@ -171,7 +171,9 @@ def test_names_and_bitwise_packed_unaligned(kernels, base):
     step = _packed_step(2, SPARE[0], SPARE[1])
     assert any(t >= 3 for t in _tiles(step)) and any(t <= 2 for t in _tiles(step)), _tiles(step)
     names = _walk_names(step, base, walk_pipe=True)
-    assert names and all(n.endswith("_pipe") for n in names), names
+    gathered = [n for n in names if "_gathered" in n]  # the listed fallback (more requests than compact_reqs) has no pipe
+    assert gathered and all(n.endswith("_pipe") for n in gathered), names
+    assert all(n.endswith("_pipe") == ("_gathered" in n) for n in names), names
     assert not any(n.endswith("_pipe") for n in _walk_names(step, base)), "flag off must not build the pipe kernel"
     off = _walk(step, base)
     on = _walk(step, base, walk_pipe=True)
