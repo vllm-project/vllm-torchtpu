@@ -161,6 +161,56 @@ def test_layers_capture_cannot_serve_are_refused(monkeypatch, on_host):
         _capture(monkeypatch, model)
 
 
+def test_moe_layers_sharing_a_layer_id_are_refused(build_capture):
+    """Two layers with one id would write the same table column, and the
+    record of the layers a forward wrote could not tell them apart."""
+    with pytest.raises(ValueError, match=r"MoE layers have ids \[1\]"):
+        build_capture(layer_ids=(0, 1, 1))
+
+
+@pytest.mark.parametrize("is_first_rank", [True, False])
+def test_the_warmup_check_names_a_layer_without_its_hook(build_capture, is_first_rank):
+    """Every rank checks its own forward."""
+    capture, model = build_capture(is_first_rank=is_first_rank)
+    model[1].capture_fn = None
+    capture_utils.model_forward(model, capture_utils.expert_ids(32))
+
+    with pytest.raises(RuntimeError, match=r"MoE layers \[1\] .* 32-token forward"):
+        capture.check_forward(32)
+
+
+@pytest.mark.parametrize("most_model_len", [None, 64])
+@pytest.mark.parametrize("enabled", [True, False])
+def test_warmup_checks_every_backbone_forward(most_model_len, enabled):
+    """Each warmup forward of every context bucket is checked right after it
+    runs, before the next forward replaces its table."""
+    events = []
+
+    def dummy_run(num_tokens, num_reqs, num_blocks, use_max_model_len):
+        events.append(("forward", num_tokens, num_reqs, num_blocks, use_max_model_len))
+
+    capture = SimpleNamespace(
+        check_forward=lambda num_tokens: events.append(("check", num_tokens))
+    )
+    runner = SimpleNamespace(
+        num_reqs_max_model_len=8,
+        max_num_blocks_per_req=4,
+        most_model_len=most_model_len,
+        num_reqs_most_model_len=16,
+        num_blocks_per_most_len_req=2,
+        _dummy_run=dummy_run,
+        _routed_experts=capture if enabled else None,
+    )
+
+    TPUModelRunner._backbone_dummy_runs(runner, 32)
+
+    contexts = [(8, 4, True)] + ([(16, 2, False)] if most_model_len else [])
+    checks = [("check", 32)] if enabled else []
+    assert events == [
+        event for context in contexts for event in [("forward", 32, *context), *checks]
+    ]
+
+
 def _reserve_config(
     monkeypatch,
     *,

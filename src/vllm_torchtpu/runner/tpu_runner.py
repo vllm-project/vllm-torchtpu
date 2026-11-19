@@ -8232,6 +8232,8 @@ class TPUModelRunner(GPUModelRunner):
             self.max_num_blocks_per_req,
             use_max_model_len=True,
         )
+        if self._routed_experts is not None:
+            self._routed_experts.check_forward(num_tokens)
         if self.most_model_len is not None:
             assert self.num_reqs_most_model_len is not None
             assert self.num_blocks_per_most_len_req is not None
@@ -8241,6 +8243,8 @@ class TPUModelRunner(GPUModelRunner):
                 self.num_blocks_per_most_len_req,
                 use_max_model_len=False,
             )
+            if self._routed_experts is not None:
+                self._routed_experts.check_forward(num_tokens)
 
     def _warmup_handoff_forwards(self) -> None:
         """Run every token bucket once through the pipeline hand-off.
