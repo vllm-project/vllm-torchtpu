@@ -21,6 +21,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.megakernel.test_advisor_regimes import (
+    LAUNCH_GAP_PRE_TIE_BATCH,
+    LAUNCH_GAP_TIE_BATCH,
+)
 from vllm_torchtpu.megakernel import advisor
 from vllm_torchtpu.megakernel.advisor import chips
 from vllm_torchtpu.megakernel.core import errors
@@ -33,7 +37,20 @@ MEASURED_CORPUS_PATH = (
 )
 ALLOWED_PROVENANCE_KINDS = frozenset({"synthetic_envelope_fixture"})
 REQUIRED_MEASURED_KEYS = frozenset(
-    {"job_id", "model", "chip", "scope", "workload", "layout", "step_time_us", "n"}
+    {
+        "id",
+        "provenance_kind",
+        "model",
+        "chip",
+        "scope",
+        "workload",
+        "layout",
+        "step_time_us",
+        "n",
+    }
+)
+REQUIRED_PUBLIC_SOURCE_KEYS = frozenset(
+    {"source_url", "source_quote", "approximate", "assumptions"}
 )
 PHASES: dict[str, advisor.Phase] = {
     "decode": "decode",
@@ -188,11 +205,29 @@ def test_validation_corpus_provenance_and_tie_overlap() -> None:
     assert saturated_row.fastest_scope == "whole_step"
     assert saturated_row.num_vmem_splits == 1
 
+    # Reuse LAUNCH_GAP_PRE_TIE_BATCH and LAUNCH_GAP_TIE_BATCH with isl=16384.
+    below_tie_report = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(
+            phase="decode",
+            batch=LAUNCH_GAP_PRE_TIE_BATCH,
+            tp=8,
+            dp=2,
+            ep=16,
+            dcp=4,
+            isl=16384,
+            context=16384,
+        ),
+        "tpu7x",
+    )
+    assert below_tie_report.fastest_verdict == "megakernel_likely"
+    assert below_tie_report.fastest_scope == "whole_step"
+
     tie_report = advisor.advise(
         "qwen3.5-397b",
         advisor.WorkloadSpec(
             phase="decode",
-            batch=512,
+            batch=LAUNCH_GAP_TIE_BATCH,
             tp=8,
             dp=2,
             ep=16,
@@ -203,6 +238,7 @@ def test_validation_corpus_provenance_and_tie_overlap() -> None:
         "tpu7x",
     )
     assert tie_report.fastest_verdict == "tie(measure: launch_gap_us)"
+    assert tie_report.fastest_scope == "single_layer"
     assert any(
         unresolved["affects"] == "scope"
         for unresolved in tie_report.unresolved_assumptions
@@ -275,14 +311,17 @@ def test_advisor_cli_with_bundled_measurements(tmp_path: Path) -> None:
 
 def test_qwen38_b256_directional_megakernel_win() -> None:
     """Verify single-pass adaptive ring whole_step beats per_op at B=64 and B=256."""
+    # Synthetic envelope fixtures in validation_points.json establish roofline
+    # upper envelopes and directional ordering above the analytical floor.
     corpus_points = {str(point["id"]): point for point in _load_validation_corpus()}
+    mk_b256 = corpus_points["qwen38_2_4t_tp32_dcp8_mk_b256"]
+    per_op_b256 = corpus_points["qwen38_2_4t_tp32_dcp8_per_op_b256"]
+    assert float(str(mk_b256["fixture_step_us"])) < float(
+        str(per_op_b256["fixture_step_us"])
+    )
     for batch_tag in ("b64", "b256"):
-        mk_point = corpus_points[f"qwen38_2_4t_tp32_dcp8_mk_{batch_tag}"]
         per_op_point = corpus_points[f"qwen38_2_4t_tp32_dcp8_per_op_{batch_tag}"]
-        assert float(str(mk_point["fixture_step_us"])) < float(
-            str(per_op_point["fixture_step_us"])
-        )
-        workload = _build_workload_from_point(mk_point)
+        workload = _build_workload_from_point(per_op_point)
         report = advisor.advise("qwen3.8-2.4t", workload, "tpu7x")
         whole_step_scope = next(s for s in report.scopes if s.scope == "whole_step")
         per_op_scope = next(s for s in report.scopes if s.scope == "per_op")
@@ -304,14 +343,56 @@ def test_fixture_corpus_is_labelled_fixture() -> None:
 
 
 def test_measured_corpus_schema() -> None:
-    """Verify measured_points.json exists and enforces advisor.measured_points.v1."""
+    """Verify measured_points.json exists and enforces advisor.measured_points.v2."""
     assert MEASURED_CORPUS_PATH.is_file()
     document = json.loads(MEASURED_CORPUS_PATH.read_text(encoding="utf-8"))
-    assert document["schema"] == "advisor.measured_points.v1"
+    assert document["schema"] == "advisor.measured_points.v2"
     points = document["points"]
     assert type(points) is list
     for point in points:
         assert REQUIRED_MEASURED_KEYS.issubset(point.keys())
-        assert bool(str(point["job_id"]).strip())
+        assert bool(str(point["id"]).strip())
+        if point["provenance_kind"] == "public_source":
+            assert REQUIRED_PUBLIC_SOURCE_KEYS.issubset(point.keys())
+            assert bool(str(point["source_url"]).strip())
+            assert isinstance(point["source_quote"], str)
+            assert point["source_quote"].strip()
+            assert type(point["approximate"]) is bool
+            assumptions = point["assumptions"]
+            assert type(assumptions) is list
+            assert assumptions
+        else:
+            assert bool(str(point.get("job_id", "")).strip())
         assert int(str(point["n"])) >= 1
         assert float(str(point["step_time_us"])) > 0.0
+
+
+def test_public_measured_point_respects_floor() -> None:
+    """Verify public measured points do not fall below advisor step_bound_us."""
+    document = json.loads(MEASURED_CORPUS_PATH.read_text(encoding="utf-8"))
+    public_points = [
+        point
+        for point in document["points"]
+        if point.get("provenance_kind") == "public_source"
+    ]
+    assert public_points
+    for point in public_points:
+        assert str(point["source_url"]).startswith("https://")
+        assert isinstance(point["source_quote"], str)
+        assert point["source_quote"].strip()
+        assert isinstance(point["rows_quote"], str)
+        assert point["rows_quote"].strip()
+        assert point["approximate"] is True
+        assumptions = point["assumptions"]
+        assert type(assumptions) is list
+        assert assumptions
+        for item in assumptions:
+            assert isinstance(item, str)
+            assert item.strip()
+        workload = _build_workload_from_point(point)
+        report = advisor.advise(str(point["model"]), workload, str(point["chip"]))
+        assert report.active_tokens == int(str(point["rows"]))
+        scope_name = str(point["scope"])
+        scopes_by_name = {item.scope: item for item in report.scopes}
+        scope_estimate = scopes_by_name[scope_name]
+        assert scope_estimate.step_bound_us <= float(str(point["step_time_us"]))
