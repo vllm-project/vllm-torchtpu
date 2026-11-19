@@ -2853,6 +2853,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         topk_indices = kwargs.get("topk_indices")
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
+        # The q head of q_dcp_replicated is W_UK-absorbed already (the MLA
+        # wrapper's q_b window gather, `_local_q_absorbs`): attend with it as is.
+        q_dcp_absorbed = bool(kwargs.get("q_dcp_absorbed", False))
         # Query replication hands us the whole DCP group's heads already, so
         # the sparse DCP path below can skip its per-step q all-gather. It is
         # the only consumer, hence the `topk_indices` term.
@@ -2872,6 +2875,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             q_nope, q_pe, *q_rope_table = q_dcp_replicated
             w_uk_t_src = layer.W_UK_T_dcp_qrep
             w_uk_t_scale = layer.W_UK_T_dcp_qrep_scale
+        elif q_dcp_absorbed:
+            raise ValueError(
+                "q_dcp_absorbed needs the query-replicated sparse DCP path "
+                f"(dcp_size {self.dcp_size}, top-k given: {topk_indices is not None})"
+            )
         else:
             w_uk_t_src = layer.W_UK_T
             w_uk_t_scale = getattr(layer, "W_UK_T_scale", None)
@@ -2896,7 +2904,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
-        if q_nope.device.type == "tpu" and w_uk_t_scale is None:
+        if q_dcp_absorbed:
+            if q_nope.shape[1:] != (attn_heads, layer.kv_lora_rank):
+                raise ValueError(
+                    f"absorbed q {tuple(q_nope.shape)} is not [T, {attn_heads}, "
+                    f"{layer.kv_lora_rank}]"
+                )
+            ql_nope = q_nope
+        elif q_nope.device.type == "tpu" and w_uk_t_scale is None:
             ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
         else:
             q_nope_t = q_nope.transpose(0, 1)
