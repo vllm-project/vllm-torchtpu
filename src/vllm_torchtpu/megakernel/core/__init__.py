@@ -20,12 +20,14 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     from . import (
+        collectives,
         decls,
         dma,
         errors,
         exec_spec,
         module,
         module_options,
+        modules,
         ops,
         planner,
         pool,
@@ -33,6 +35,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         profiles,
         spec,
     )
+    from .collectives import AllReduceRing
     from .dma import pool_alias
     from .errors import (
         MegakernelConfigError,
@@ -43,6 +46,17 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         ExecSpec,
         Tiles,
         default_tiles,
+    )
+    from .modules import (
+        Embedding,
+        EmbeddingModule,
+        GDNLinInLayout,
+        GDNParams,
+        GQAParams,
+        MoEDebug,
+        MoEParams,
+        Norm,
+        NormModule,
     )
     from .ops import (
         col_chunk,
@@ -106,12 +120,14 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
 # (e.g. `runtime.contract`) doesn't import jax through this package.
 _SUBMODULES = frozenset(
     {
+        "collectives",
         "decls",
         "dma",
         "errors",
         "exec_spec",
         "module",
         "module_options",
+        "modules",
         "ops",
         "planner",
         "pool",
@@ -121,12 +137,22 @@ _SUBMODULES = frozenset(
     }
 )
 _LAZY: dict[str, str] = {
+    "AllReduceRing": ".collectives",
     "MegakernelConfigError": ".errors",
     "MegakernelLayoutError": ".errors",
     "DebugOptions": ".exec_spec",
     "ExecSpec": ".exec_spec",
     "Tiles": ".exec_spec",
     "default_tiles": ".exec_spec",
+    "Embedding": ".modules",
+    "EmbeddingModule": ".modules",
+    "GDNLinInLayout": ".modules",
+    "GDNParams": ".modules",
+    "GQAParams": ".modules",
+    "MoEDebug": ".modules",
+    "MoEParams": ".modules",
+    "Norm": ".modules",
+    "NormModule": ".modules",
     "col_chunk": ".ops",
     "round_up": ".ops",
     "encode_ecopy": ".planner",
@@ -183,21 +209,31 @@ __all__ = [
     "DEFAULT_PROFILE",
     "POOL_STATE_NAME",
     "REQUIRED",
+    "AllReduceRing",
     "Baseline",
     "CacheExec",
     "CompareMode",
     "DebugOptions",
+    "Embedding",
+    "EmbeddingModule",
     "ExecSpec",
     "ExtraInput",
     "FrozenDict",
+    "GDNLinInLayout",
+    "GDNParams",
+    "GQAParams",
     "HFParamDecl",
     "KVCacheDecl",
     "LayerType",
     "MegakernelConfigError",
     "MegakernelLayoutError",
+    "MoEDebug",
+    "MoEParams",
     "ModelSpec",
     "Module",
     "ModuleBinding",
+    "Norm",
+    "NormModule",
     "OutputRole",
     "ParamInit",
     "ParamTransform",
@@ -219,6 +255,7 @@ __all__ = [
     "allocate_test_layout",
     "cache_exec",
     "col_chunk",
+    "collectives",
     "conv_to_raw_page",
     "decls",
     "default_tiles",
@@ -234,6 +271,7 @@ __all__ = [
     "model_default_profile",
     "module",
     "module_options",
+    "modules",
     "ops",
     "planner",
     "pool",

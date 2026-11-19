@@ -20,6 +20,7 @@ opposite orders, so both ICI links carry traffic on every step.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -31,11 +32,41 @@ _SUB_TILE = 32
 _SLOTS = 3
 _ROW_BLOCK = 128  # 256 needs ~66 MiB of VMEM
 _VMEM_LIMIT_BYTES = 56 << 20
+# VMEM the compiler needs beyond the declared scratch. On tpu7x, hidden 6656
+# (53.6 MiB of scratch) compiles and 7168 (57.75 MiB) runs out of VMEM.
+_VMEM_HEADROOM_BYTES = 2 << 20
 
 
-def supports_stream(rows: int) -> bool:
+def _vmem_buffer_shapes(hidden: int) -> list[tuple[int, ...]]:
+    """The VMEM buffers of reduce_scatter_stream_local: per slot, the running
+    sums, the phase-1 landing buffer, and the step-0 and step-1 landing
+    buffers."""
+    half_rows = _ROW_BLOCK // 2
+    return [
+        (_SLOTS, 4, _ROW_BLOCK, hidden),
+        (_SLOTS, 4, _ROW_BLOCK, hidden),
+        (_SLOTS, 2, 2, half_rows, hidden),
+        (_SLOTS, 2, half_rows, hidden),
+    ]
+
+
+def scratch_bytes(hidden: int, itemsize: int) -> int:
+    return sum(math.prod(shape) for shape in _vmem_buffer_shapes(hidden)) * itemsize
+
+
+def supports_stream(rows: int, hidden: int, itemsize: int) -> bool:
+    """Whether `rows` x `hidden` per device fits the row-streaming kernel.
+
+    Its scratch grows with `hidden` (33 MiB at bf16 hidden 4096), so a wide
+    shape that would not fit in VMEM is left to the micro-batched kernel.
+    """
     chunk, rem = divmod(rows, _NUM_DEVICES)
-    return rem == 0 and chunk >= _ROW_BLOCK and chunk % _ROW_BLOCK == 0
+    return (
+        rem == 0
+        and chunk >= _ROW_BLOCK
+        and chunk % _ROW_BLOCK == 0
+        and scratch_bytes(hidden, itemsize) <= _VMEM_LIMIT_BYTES - _VMEM_HEADROOM_BYTES
+    )
 
 
 def _kernel(
@@ -273,18 +304,16 @@ def reduce_scatter_stream_local(
 ) -> jax.Array:
     """Mesh index i receives the sum of input row block `order[i]`."""
     rows_per_device, hidden = local_x.shape
-    assert supports_stream(rows_per_device), f"{rows_per_device} rows per device"
+    assert supports_stream(rows_per_device, hidden, local_x.dtype.itemsize), (
+        f"{rows_per_device} x {hidden} per device"
+    )
     chunk_rows = rows_per_device // _NUM_DEVICES
     block_rows = _ROW_BLOCK
     num_blocks = chunk_rows // block_rows
-    half_rows = block_rows // 2
     dtype = local_x.dtype
     # In _kernel's parameter order.
     scratch = [
-        pltpu.VMEM((_SLOTS, 4, block_rows, hidden), dtype),
-        pltpu.VMEM((_SLOTS, 4, block_rows, hidden), dtype),
-        pltpu.VMEM((_SLOTS, 2, 2, half_rows, hidden), dtype),
-        pltpu.VMEM((_SLOTS, 2, half_rows, hidden), dtype),
+        *(pltpu.VMEM(shape, dtype) for shape in _vmem_buffer_shapes(hidden)),
         pltpu.SemaphoreType.DMA((_SLOTS, 4)),
         pltpu.SemaphoreType.DMA((_SLOTS, 4)),
         pltpu.SemaphoreType.DMA((_SLOTS, 4)),

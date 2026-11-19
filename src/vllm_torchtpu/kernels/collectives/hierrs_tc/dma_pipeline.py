@@ -138,7 +138,9 @@ class DmaManager:
         partner_chunks = self.locator.get_phase1_chunk_idxes(self.topo.partner_id)
         for chip_idx, c_neigh in enumerate(partner_chunks):
             src_slice = self.locator.get_slice(
-                chunk_idx=c_neigh, start=mb_start, size=mb_slice_size
+                chunk_idx=self.locator.input_chunk(c_neigh),
+                start=mb_start,
+                size=mb_slice_size,
             )
             dst_slice = self.locator.get_packed_slice(
                 chunk_idx=c_neigh, start=mb_start, size=mb_slice_size
