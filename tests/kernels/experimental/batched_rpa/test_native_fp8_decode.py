@@ -16,8 +16,8 @@
 Qwen3.5 TP8 per-device geometry (4 q heads, 1 KV head, head_dim 256), HND
 (SEQ_ALONG_LANE) fp8 e4m3 KV, 4 query tokens per request, KV lengths that end
 mid-block and mid-page. Every byte past a request's KV length, and every page
-no request owns, is an fp8 NaN, so this also covers the per-step zeroing of
-unattended V lanes that replaced the per-call zeroing of all KV VMEM.
+no request owns, is an fp8 NaN, so the outputs also show that those bytes stay
+out of the native matmuls (V is masked past each request's KV length on load).
 """
 
 import jax
@@ -86,7 +86,7 @@ def _inputs(kv_lens_list, seed=0):
     )
 
 
-def _reference(inp, kv_lens_list):
+def _reference(inp, kv_lens_list, k_scale=1.0, v_scale=1.0):
     pps = inp["pps"]
     outs = []
     for i, kv_len in enumerate(kv_lens_list):
@@ -96,8 +96,8 @@ def _reference(inp, kv_lens_list):
         vv = g[:, 1].transpose(0, 3, 1, 2).reshape(pps * _PAGE, _HD)
         sl = slice(i * _QLEN, (i + 1) * _QLEN)
         pos = kv_len - _QLEN + jnp.arange(_QLEN)
-        kk = kk.at[pos].set(inp["k"][sl, 0].astype(jnp.float32))[:kv_len]
-        vv = vv.at[pos].set(inp["v"][sl, 0].astype(jnp.float32))[:kv_len]
+        kk = kk.at[pos].set(inp["k"][sl, 0].astype(jnp.float32))[:kv_len] * k_scale
+        vv = vv.at[pos].set(inp["v"][sl, 0].astype(jnp.float32))[:kv_len] * v_scale
         s = jnp.einsum("qhd,kd->hqk", inp["q"][sl].astype(jnp.float32), kk)
         mask = jnp.arange(kv_len)[None, None, :] <= pos[None, :, None]
         p = jax.nn.softmax(jnp.where(mask, s * _SM_SCALE, -jnp.inf), axis=-1)
@@ -115,6 +115,40 @@ _MODES = {
     "qk_split_pv_split": (configs.NativeFp8(qk=_SPLIT, pv=_SPLIT), 0.06),
     "qk_pv": (configs.NativeFp8(qk=_ROW, pv=_ROW), 0.12),
 }
+
+
+@pytest.mark.parametrize("mode", ["pv", "qk_split_pv_split", "qk_pv"])
+def test_decode_fp8_kv_with_kv_scales(mode):
+    """k_scale and v_scale other than 1 reach the native QK scores and the
+    native PV output as they do on the dequantizing path."""
+    native_fp8, tol = _MODES[mode]
+    if not jtu.is_device_tpu_at_least(version=7):
+        pytest.skip("Expect TPU v7+ (native fp8 MXU)")
+    kv_lens_list = [5000, 9000 + 37, 131]
+    inp = _inputs(kv_lens_list)
+    ref = _reference(inp, kv_lens_list, k_scale=0.5, v_scale=0.75)
+    out, _ = wrapper.ragged_paged_attention(
+        inp["q"],
+        inp["k"],
+        inp["v"],
+        inp["kv_cache"],
+        inp["kv_lens"],
+        inp["page_indices"],
+        inp["cu_q_lens"],
+        inp["distribution"],
+        sm_scale=_SM_SCALE,
+        k_scale=0.5,
+        v_scale=0.75,
+        kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+        decode_query_size=_QLEN,
+        native_fp8=native_fp8,
+        tuned_tiles=True,
+        skip_empty_mixed=True,
+    )
+    out = np.asarray(out[: len(kv_lens_list) * _QLEN].astype(jnp.float32))
+    assert not np.isnan(out).any()
+    rel = np.linalg.norm(out - ref) / np.linalg.norm(ref)
+    assert rel < tol, rel
 
 
 @pytest.mark.parametrize("mode", list(_MODES))
