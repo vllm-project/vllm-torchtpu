@@ -16,13 +16,10 @@ output of the compiled forward, and a step's rows reach the host from the
 copies of its forwards' tables."""
 
 from functools import partial
-from types import SimpleNamespace
-from typing import cast
 
 import numpy as np
 import pytest
 import torch
-from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     bind_routed_experts_capturer,
@@ -30,112 +27,22 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.platforms import current_platform
 
 from tests.distributed.tpu_test_utils import run_in_isolated_process
-from vllm_torchtpu.layers.adapter import routed_experts_capturer
+from tests.layers.adapter.routed_experts_test_utils import (
+    NUM_LAYERS,
+    PADDING,
+    TOKEN_PADDINGS,
+    TOPK,
+    HostEvent,
+    expert_ids,
+    make_capturer,
+    make_moe_model,
+    make_vllm_config,
+    model_forward,
+    run_hooks,
+    use_host_events,
+)
 
-NUM_LAYERS, TOPK = 3, 4
-TOKEN_PADDINGS = [16, 32, 64]
-# Marks padding rows; `expert_ids(..., num_experts=PADDING)` stays below it.
-PADDING = 511
 TPU = "tpu"
-
-
-def make_vllm_config(num_experts=512):
-    model_config = SimpleNamespace(
-        get_total_num_hidden_layers=lambda: NUM_LAYERS,
-        get_num_experts=lambda: num_experts,
-        get_num_experts_per_tok=lambda: TOPK,
-        hf_text_config=SimpleNamespace(model_type="qwen3_moe"),
-    )
-    vllm_config = SimpleNamespace(
-        model_config=model_config,
-        parallel_config=SimpleNamespace(
-            data_parallel_rank=0,
-            data_parallel_size=1,
-            tensor_parallel_size=1,
-            use_sequence_parallel_moe=False,
-            is_moe_model=True,
-        ),
-        compilation_config=SimpleNamespace(
-            fast_moe_cold_start=False, static_forward_context={}
-        ),
-    )
-    return cast(VllmConfig, vllm_config)
-
-
-def make_capturer(num_experts=512, copies_to_host=True, moe_layer_ids=None):
-    """A capturer for MoE layers of the given ids, one per table column by
-    default."""
-    if moe_layer_ids is None:
-        moe_layer_ids = range(NUM_LAYERS)
-    return routed_experts_capturer.TPURoutedExpertsCapturer(
-        make_vllm_config(num_experts), moe_layer_ids, copies_to_host=copies_to_host
-    )
-
-
-class HostEvent:
-    """Stands in for `TpuEvent` on the host, where a copy to the host is done
-    when it returns. Records every instance in `HostEvent.events`."""
-
-    events: list["HostEvent"] = []
-
-    def __init__(self):
-        self.recorded = self.synchronized = False
-        HostEvent.events.append(self)
-
-    def record(self):
-        self.recorded = True
-
-    def synchronize(self):
-        assert self.recorded
-        self.synchronized = True
-
-
-def use_host_events(monkeypatch):
-    """Makes the capturer record `HostEvent`s, and returns the list they go
-    to."""
-    events = []
-    monkeypatch.setattr(HostEvent, "events", events)
-    monkeypatch.setattr(routed_experts_capturer, "TpuEvent", HostEvent)
-    return events
-
-
-def expert_ids(num_tokens, num_experts=512, seed=0):
-    """[num_tokens, layers, k] int32 expert ids, from the host generator only:
-    seeding torch would also open the chip in this process."""
-    rng = np.random.default_rng(seed)
-    ids = rng.integers(num_experts, size=(num_tokens, NUM_LAYERS, TOPK))
-    return torch.from_numpy(ids.astype(np.int32))
-
-
-class MoELayer(torch.nn.Module):
-    """A MoE layer as vLLM's capturer binder finds it."""
-
-    def __init__(self, layer_id):
-        super().__init__()
-        self.layer_id = layer_id
-        self.capture_fn = None
-
-
-def make_moe_model(layer_ids=None):
-    """MoE layers of the given ids; one per table column by default."""
-    if layer_ids is None:
-        layer_ids = range(NUM_LAYERS)
-    return torch.nn.ModuleList(MoELayer(layer) for layer in layer_ids)
-
-
-def run_hooks(model, ids):
-    """The hook calls of one forward of [bucket, layers, k] `ids` through
-    `model`. Like `route()`, it skips a layer that has no hook."""
-    for layer in model:
-        if layer.capture_fn is not None:
-            layer.capture_fn(ids[:, layer.layer_id])
-
-
-def model_forward(model, ids):
-    """One eager forward of `ids` through the hooks on `model`, under the
-    forward context vLLM's `capture()` reads."""
-    with set_forward_context(None, make_vllm_config(), num_tokens=ids.shape[0]):
-        run_hooks(model, ids)
 
 
 @pytest.fixture
