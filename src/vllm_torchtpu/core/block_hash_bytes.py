@@ -48,7 +48,17 @@ def get_request_block_hasher(
     hash_block_size: int,
     caching_hash_fn: Callable[[Any], bytes],
 ) -> Callable[["Request"], list["BlockHash"]]:
-    """Same contract as vLLM's get_request_block_hasher, with byte hashing.
+    """A request block hasher that names plain blocks by their token bytes.
+
+    The returned function gives the hashes of the request's full blocks that
+    have none yet, in order: from block ``len(request.block_hashes)`` up to
+    the last block ``request.num_tokens`` fills. Each hash chains on the hash
+    before it; the first on ``request.block_hashes[-1]``, or on ``NONE_HASH``
+    for a request's first block. A block without extra keys is named by
+    ``sha256(parent + its token ids as 32-bit bytes)``; a block with extra
+    keys (multimodal, LoRA, cache salt, prompt embeddings), or whose ids do
+    not fit 32 bits, is hashed by vLLM's ``hash_block_tokens``. For a hash
+    function other than ``sha256`` this returns vLLM's own hasher.
 
     The first call on a request reads its own token list,
     ``request._all_token_ids``, rather than a slice of ``all_token_ids``,
@@ -149,7 +159,13 @@ def install_byte_block_hasher() -> None:
     def init_with_byte_hasher(self, vllm_config, *args, **kwargs):
         original_init(self, vllm_config, *args, **kwargs)
         hasher = self.request_block_hasher
-        if hasher is None or _hashes_leave_the_process(vllm_config):
+        if hasher is None:
+            return
+        if _hashes_leave_the_process(vllm_config):
+            logger.info_once(
+                "Kept vLLM's prefix-cache block hasher, because a KV connector "
+                "or KV events read the block hashes."
+            )
             return
         arguments = _hasher_arguments(hasher)
         if arguments is None:
@@ -160,6 +176,10 @@ def install_byte_block_hasher() -> None:
             return
         hash_block_size, caching_hash_fn = arguments
         if caching_hash_fn is not sha256:
+            logger.info_once(
+                "Kept vLLM's prefix-cache block hasher, because the prefix-cache "
+                "hash algorithm is not sha256."
+            )
             return
         self.request_block_hasher = get_request_block_hasher(
             hash_block_size, caching_hash_fn
@@ -178,8 +198,8 @@ def _hasher_arguments(
     hasher: Callable,
 ) -> tuple[int, Callable[[Any], bytes]] | None:
     """Read (hash_block_size, caching_hash_fn) from vLLM's hasher closure."""
-    code = getattr(hasher, "__code__", None)
-    cells = dict(zip(code.co_freevars, hasher.__closure__ or ())) if code else {}
+    code = hasher.__code__
+    cells = dict(zip(code.co_freevars, hasher.__closure__ or ()))
     if "hash_block_size" not in cells or "caching_hash_fn" not in cells:
         return None
     return cells["hash_block_size"].cell_contents, cells[
