@@ -420,7 +420,7 @@ def _unpermute_op():
     return op
 
 
-def _token_shard_step_order(gathered, starts, context, world: int):
+def _token_shard_step_order(gathered, starts, context, world: int, unpermute):
     """The all-gathered token-shard blocks in step order.
 
     Under VLLM_TPU_QSA_INDEXER_BALANCED_SHARD the shards wider than the
@@ -429,14 +429,14 @@ def _token_shard_step_order(gathered, starts, context, world: int):
     """
     tokens, slots = gathered.shape[0], context.shape[0]
     if (
-        not envs.VLLM_TPU_QSA_INDEXER_BALANCED_SHARD
+        unpermute is None
         or tokens % world
         or tokens // world <= slots
     ):
         return gathered
     # No logging here: Dynamo traces this function (full graph).
     # token_shard_unpermute logs when JAX traces it.
-    return _unpermute_op()(gathered, starts, context, size=world)
+    return unpermute(gathered, starts, context, size=world)
 
 
 def _all_gather_ranks(x: torch.Tensor, group) -> torch.Tensor:
@@ -817,6 +817,8 @@ def build_pooled_qsa_token_shard_op(tp_group):
     world = int(tp_group.world_size)
     select = _token_select_op()
     _, attend = _shard_ops(False)
+    # Built here: Dynamo traces run() and does not see functools.cache hits.
+    unpermute = _unpermute_op() if envs.VLLM_TPU_QSA_INDEXER_BALANCED_SHARD else None
 
     def run(*args, shard_index, kv_heads, **kwargs):
         tokens, slots = args[0].shape[0], args[12].shape[0]
@@ -851,6 +853,7 @@ def build_pooled_qsa_token_shard_op(tp_group):
                 args[11],
                 args[12],
                 world,
+                unpermute,
             ),
             kv_heads=kv_heads,
             compress_ratio=kwargs["compress_ratio"],
@@ -1458,6 +1461,8 @@ def build_pooled_qsa_token_shard_dcp_op(tp_group, pair_group, size: int):
     """``build_pooled_qsa_token_shard_op`` with the DCP main-KV split."""
     world = int(tp_group.world_size)
     _, select, attend, combine = _dcp_ops()
+    # Built here: Dynamo traces run() and does not see functools.cache hits.
+    unpermute = _unpermute_op() if envs.VLLM_TPU_QSA_INDEXER_BALANCED_SHARD else None
 
     def run(*args, shard_index, dcp_rank, kv_heads, **kwargs):
         tokens = args[0].shape[0]
@@ -1491,6 +1496,7 @@ def build_pooled_qsa_token_shard_dcp_op(tp_group, pair_group, size: int):
                 args[11],
                 args[12],
                 world,
+                unpermute,
             ),
             dcp_rank,
             kv_heads=kv_heads,

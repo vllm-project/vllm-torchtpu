@@ -1292,7 +1292,9 @@ def balanced_shard_positions(plan, starts, tokens):
     return (shard * plan.width + plan.prefix[shard, req] + within).astype(jnp.int32)
 
 
-def token_shard_unpermute(gathered, starts, context, size):
+def token_shard_unpermute(
+    gathered: jax.Array, starts: jax.Array, context: jax.Array, size: int
+) -> jax.Array:
     """Step-ordered rows of the rank-major all-gather of the balanced shards
     (VLLM_TPU_QSA_INDEXER_BALANCED_SHARD)."""
     tokens = gathered.shape[0]
