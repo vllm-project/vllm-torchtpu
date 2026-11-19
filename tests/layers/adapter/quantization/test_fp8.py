@@ -1492,6 +1492,91 @@ class TestFp4MoERequantization:
         )
 
 
+class TestMtpMoELayerDetection:
+    """Which MoE layers belong to an MTP draft model.
+
+    vLLM's DeepSeek-style MTP drafters (GLM-5 included) name their layers
+    `model.layers.<i>` with `i` counted from the target's num_hidden_layers
+    up, so GLM-5's drafter MoE is `model.layers.78.mlp.experts` next to the
+    target's last MoE layer `model.layers.77.mlp.experts`.
+    """
+
+    NUM_HIDDEN_LAYERS = 78
+    MTP = "model.layers.78.mlp.experts"
+    MAIN = "model.layers.77.mlp.experts"
+
+    @staticmethod
+    def _current_config(monkeypatch, num_hidden_layers):
+        from types import SimpleNamespace
+
+        from vllm_torchtpu.layers.adapter.quantization import fp8 as fp8_mod
+
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(num_hidden_layers=num_hidden_layers)
+            )
+        )
+        monkeypatch.setattr(fp8_mod, "get_current_vllm_config_or_none", lambda: config)
+
+    def test_layer_index_at_or_past_num_hidden_layers_is_mtp(self):
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import _is_mtp_moe_layer
+
+        n = self.NUM_HIDDEN_LAYERS
+        assert _is_mtp_moe_layer(self.MTP, n)
+        assert _is_mtp_moe_layer("model.layers.79.mlp.experts", n)
+        assert not _is_mtp_moe_layer(self.MAIN, n)
+        assert not _is_mtp_moe_layer("model.layers.3.mlp.experts", n)
+        assert not _is_mtp_moe_layer("model.layers.780x.mlp.experts", n)
+
+    def test_mtp_prefix_forms_match_without_num_hidden_layers(self):
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import _is_mtp_moe_layer
+
+        for prefix in ("mtp.layers.0.mlp.experts", "model.mtp.layers.0.mlp.experts"):
+            assert _is_mtp_moe_layer(prefix)
+            assert _is_mtp_moe_layer(prefix, self.NUM_HIDDEN_LAYERS)
+        # No vLLM config is current here: an index alone cannot tell.
+        assert not _is_mtp_moe_layer(self.MTP)
+
+    def test_num_hidden_layers_defaults_to_the_current_config(self, monkeypatch):
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import _is_mtp_moe_layer
+
+        self._current_config(monkeypatch, self.NUM_HIDDEN_LAYERS)
+        assert _is_mtp_moe_layer(self.MTP)
+        assert not _is_mtp_moe_layer(self.MAIN)
+
+    def test_drafter_moe_keeps_fp8_under_fp4_requant(self, monkeypatch):
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import _mtp_moe_keeps_fp8
+
+        if not hasattr(torch, "float4_e2m1fn_x2"):
+            pytest.skip("torch.float4_e2m1fn_x2 unavailable")
+        n = self.NUM_HIDDEN_LAYERS
+        monkeypatch.setenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "fp4")
+        monkeypatch.delenv("VLLM_TPU_MOE_REQUANT_MTP", raising=False)
+        assert _mtp_moe_keeps_fp8(self.MTP, n)
+        assert _mtp_moe_keeps_fp8("mtp.layers.0.mlp.experts", n)
+        assert not _mtp_moe_keeps_fp8(self.MAIN, n)
+        monkeypatch.setenv("VLLM_TPU_MOE_REQUANT_MTP", "1")
+        assert not _mtp_moe_keeps_fp8(self.MTP, n)
+        monkeypatch.delenv("VLLM_TPU_MOE_REQUANT_MTP")
+        monkeypatch.setenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn")
+        assert not _mtp_moe_keeps_fp8(self.MTP, n)
+
+    def test_method_reads_num_hidden_layers_when_built(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            VllmFp8MoEMethodTPU,
+        )
+
+        self._current_config(monkeypatch, self.NUM_HIDDEN_LAYERS)
+        method = VllmFp8MoEMethodTPU(
+            SimpleNamespace(weight_block_size=[128, 128]),
+            SimpleNamespace(),
+            prefix=self.MTP,
+        )
+        assert method._num_hidden_layers == self.NUM_HIDDEN_LAYERS
+
+
 def test_concat_fp4_experts_op_has_annotated_signature():
     """`pallas.jax_op` needs a `jax.Array` annotation on every argument of
     the JAX function: the op that joins unpacked FP4 expert chunks cannot be

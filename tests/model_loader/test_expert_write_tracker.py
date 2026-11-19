@@ -233,6 +233,7 @@ def _build_fake_fp8_moe_layer(
     inter: int = 512,
     hidden: int = 512,
     block: int = 128,
+    num_hidden_layers: int | None = None,
 ):
     from types import SimpleNamespace
 
@@ -282,6 +283,7 @@ def _build_fake_fp8_moe_layer(
     qm.block_quant = True
     qm.weight_scale_name = "weight_scale_inv"
     qm.prefix = prefix
+    qm._num_hidden_layers = num_hidden_layers
     qm._tpu_activation_str = None
     qm._use_adaptive_fused_moe = False
     qm._rhs_quant_dtype = None
@@ -427,8 +429,14 @@ def test_early_per_layer_fp4_requant_matches_end_of_load_and_bounds_fp8_memory(
             "model.layers.4.mlp.experts",
             "model.layers.5.mlp.experts",
             "mtp.layers.0.mlp.experts",  # MTP layer: kept FP8 when REQUANT_MTP=0
+            # A DeepSeek/GLM-style drafter MoE: its layer index is the target's
+            # num_hidden_layers, so it is kept FP8 as well.
+            "model.layers.78.mlp.experts",
         ]
-        layers = [_build_fake_fp8_moe_layer(monkeypatch, prefix=p) for p in prefixes]
+        layers = [
+            _build_fake_fp8_moe_layer(monkeypatch, prefix=p, num_hidden_layers=78)
+            for p in prefixes
+        ]
         peak_fp8_layers_after_stream = 0
         for idx, layer in enumerate(layers):
             _stream_expert_shards_into_layer(
@@ -452,17 +460,18 @@ def test_early_per_layer_fp4_requant_matches_end_of_load_and_bounds_fp8_memory(
     # With early requant on, every layer converts as soon as its 4th parameter
     # completes during shard streaming (0 unrequanted layers accumulate!).
     assert peak_early == 0
-    assert peak_late == 4
+    assert peak_late == 5
 
-    # Target layers 0..2 are packed uint8 FP4; MTP layer 3 stays FP8.
+    # Target layers 0..2 are packed uint8 FP4; MTP layers 3 and 4 stay FP8.
     for idx in range(3):
         assert early_layers[idx].w13_weight.dtype == torch.uint8
         assert early_layers[idx].w2_weight.dtype == torch.uint8
-    assert early_layers[3].w13_weight.dtype == torch.float8_e4m3fn
-    assert early_layers[3].w2_weight.dtype == torch.float8_e4m3fn
-    assert early_layers[3]._tpu_moe_weights_requanted[3] is True
+    for idx in (3, 4):
+        assert early_layers[idx].w13_weight.dtype == torch.float8_e4m3fn
+        assert early_layers[idx].w2_weight.dtype == torch.float8_e4m3fn
+        assert early_layers[idx]._tpu_moe_weights_requanted[3] is True
 
-    # Bit-for-bit identical weights and inverse scales across all 4 layers.
+    # Bit-for-bit identical weights and inverse scales across all 5 layers.
     for e_layer, l_layer in zip(early_layers, late_layers):
         for attr in (
             "w13_weight",

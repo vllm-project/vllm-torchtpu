@@ -40,11 +40,13 @@ the blockwise Pallas kernel path instead.
 from __future__ import annotations
 
 import copy
+import re
 from collections.abc import Callable
 from math import gcd
 from typing import TYPE_CHECKING, cast
 
 import torch
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import refine_fp8_moe_block_shape
@@ -150,20 +152,50 @@ _concat_fp4_ops: dict[int, object] = {}
 MOE_REQUANT_RECORD_ATTR = "_tpu_moe_weights_requanted"
 
 
-def _is_mtp_moe_layer(prefix: str) -> bool:
-    return prefix.startswith("mtp.") or ".mtp." in prefix
+# `<parent>.layers.<i>` in a module prefix, e.g. `model.layers.78.mlp.experts`.
+_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
-def _mtp_moe_keeps_fp8(prefix: str) -> bool:
+def _current_num_hidden_layers() -> int | None:
+    """`num_hidden_layers` of the model in the current vLLM config, if set."""
+    model_config = getattr(get_current_vllm_config_or_none(), "model_config", None)
+    hf_config = getattr(model_config, "hf_text_config", None) or getattr(
+        model_config, "hf_config", None
+    )
+    num_layers = getattr(hf_config, "num_hidden_layers", None)
+    return num_layers if isinstance(num_layers, int) else None
+
+
+def _is_mtp_moe_layer(prefix: str, num_hidden_layers: int | None = None) -> bool:
+    """Whether the MoE layer at `prefix` belongs to an MTP draft model.
+
+    `mtp.` prefixes always match. vLLM's DeepSeek-style MTP drafters, which
+    GLM-5 also uses, name their layers `model.layers.<i>` with `i` counted
+    from the target's `num_hidden_layers` up (`mtp_start_layer_idx`), so a
+    layer index at or past `num_hidden_layers` matches as well.
+    `num_hidden_layers` defaults to the current vLLM config's; when it is
+    unknown, only the `mtp.` forms match.
+    """
+    if prefix.startswith("mtp.") or ".mtp." in prefix:
+        return True
+    if num_hidden_layers is None:
+        num_hidden_layers = _current_num_hidden_layers()
+    if num_hidden_layers is None:
+        return False
+    match = _LAYER_INDEX_RE.search(prefix)
+    return match is not None and int(match.group(1)) >= num_hidden_layers
+
+
+def _mtp_moe_keeps_fp8(prefix: str, num_hidden_layers: int | None = None) -> bool:
     """Whether this MTP MoE layer stays FP8 with per-channel scales while the
     other routed experts are requantized to FP4 (unless
     VLLM_TPU_MOE_REQUANT_MTP): FP4 draft experts cost acceptance."""
     requant = _MOE_REQUANT_WEIGHT_DTYPES.get(envs.MOE_REQUANTIZE_WEIGHT_DTYPE)
     return (
-        _is_mtp_moe_layer(prefix)
-        and hasattr(torch, "float4_e2m1fn_x2")
+        hasattr(torch, "float4_e2m1fn_x2")
         and requant == torch.float4_e2m1fn_x2
         and not envs.VLLM_TPU_MOE_REQUANT_MTP
+        and _is_mtp_moe_layer(prefix, num_hidden_layers)
     )
 
 
@@ -971,6 +1003,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         FusedMoEMethodBase.__init__(self, moe_config)
         self.quant_config = quant_config
         self.prefix = prefix
+        # Read while the model is built, when the vLLM config is current: the
+        # weights may be requantized later, while the checkpoint streams in.
+        self._num_hidden_layers = _current_num_hidden_layers()
         self.weight_block_size = quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
         self.weight_scale_name = (
@@ -1188,7 +1223,15 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
         activation_str = self._set_tpu_activation(layer)
 
-        force_fp8 = _mtp_moe_keeps_fp8(self.prefix)
+        force_fp8 = _mtp_moe_keeps_fp8(
+            self.prefix, getattr(self, "_num_hidden_layers", None)
+        )
+        if force_fp8:
+            logger.info(
+                "MTP MoE layer %s stays FP8 while routed experts are requantized "
+                "to FP4 (set VLLM_TPU_MOE_REQUANT_MTP=1 to requantize it too).",
+                self.prefix,
+            )
         is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
         if is_fp8_serialized:
             moe_block_shape = getattr(self, "moe_block_shape", self.weight_block_size)
