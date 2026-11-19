@@ -229,6 +229,7 @@
 /src/vllm_torchtpu/tools/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /tools/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /scripts/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
+/scripts/vllm/benchmarking/agentic_benchmark/ @wenxindongwork @pv97 @sierraisland @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /tests/tools/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /tests/scripts/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /.pre-commit-config.yaml @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
