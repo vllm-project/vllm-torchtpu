@@ -102,6 +102,9 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_CHUNK_TOKENS` | `None` | Query-token chunk size for Sparse MLA attention (each chunk gathers its tokens' top-k KV rows into one buffer and attends over it; unset keeps the kernel default of `64`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
+| `TPU_RPA_DECODE_BKV_PAGES` | `0` | Overrides the Ragged Paged Attention v3 `DECODE` KV prefetch block size (`bkv_sz = min(max_kv, pages * page_size)`); `0` keeps the default heuristic. |
+| `TPU_RPA_DECODE_BKV_COMPUTE_PAGES` | `0` | Overrides the Ragged Paged Attention v3 `DECODE` KV compute sub-block size (`bkv_csz = min(bkv_sz, pages * page_size)`); `0` keeps `bkv_sz` (or `>= 128`-lane base tier when `TPU_RPA_DECODE_ADAPTIVE_BKV_COMPUTE=1`). |
+| `TPU_RPA_DECODE_ADAPTIVE_BKV_COMPUTE` | `False` | Opt-in. In Ragged Paged Attention v3 `DECODE`, dispatches each sequence inside the Pallas kernel via `@pl.when` to the smallest 128-lane-aligned power-of-2 compute tier covering its active `kv_len` (up to `bkv_sz`), avoiding full-`bkv_sz` matmuls on short contexts while keeping `num_loops == 1` and exact full-tile vector reductions (`0` extra XLA compilations). |
 
 ---
 

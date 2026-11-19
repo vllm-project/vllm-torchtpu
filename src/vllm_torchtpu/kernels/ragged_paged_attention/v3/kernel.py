@@ -362,6 +362,7 @@ def _ragged_paged_attention_kernel_loop(
     bkv_sz,  # bkv prefetch size
     bq_csz,  # bq compute size
     bkv_csz,  # bkv compute size
+    bkv_csz_tiers: tuple[int, ...] = (),
     case: RpaCase = RpaCase.MIXED,
     debug_mode: bool = False,
 ):
@@ -467,8 +468,9 @@ def _ragged_paged_attention_kernel_loop(
         assert q.shape[0] % num_q_heads_per_kv_head == 0
         assert q.shape[1] == head_dim
         actual_bq_csz = q.shape[0] // num_q_heads_per_kv_head
-        assert k.shape == (bkv_csz, head_dim)
-        assert v.shape == (bkv_csz, head_dim)
+        cur_bkv_csz = k.shape[0]
+        assert k.shape == (cur_bkv_csz, head_dim)
+        assert v.shape == (cur_bkv_csz, head_dim)
         assert l_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
         assert m_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
         assert k.dtype == v.dtype
@@ -545,9 +547,9 @@ def _ragged_paged_attention_kernel_loop(
     ):
         assert len(p.shape) == 2
         assert p.shape[0] % num_q_heads_per_kv_head == 0
-        assert p.shape[1] == bkv_csz
+        cur_bkv_csz = p.shape[1]
         actual_bq_csz = p.shape[0] // num_q_heads_per_kv_head
-        assert v.shape == (bkv_csz, head_dim)
+        assert v.shape == (cur_bkv_csz, head_dim)
         assert exp_m_diff.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
         assert o_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, head_dim)
         pv = jnp.matmul(p, v, preferred_element_type=jnp.float32).astype(out_dtype)
@@ -1008,73 +1010,93 @@ def _ragged_paged_attention_kernel_loop(
                 )
                 effective_bkv_sz = jnp.maximum(effective_bkv_sz, 0)
 
-                num_loops = cdiv(effective_bkv_sz, bkv_csz)
+                def run_attention_compute(cur_bkv_csz):
+                    num_loops = cdiv(effective_bkv_sz, cur_bkv_csz)
 
-                @pl.loop(0, num_loops, unroll=False)
-                def attention_loop(idx):
-                    prev_lm_slice = None
-                    prev_p = None
-                    prev_v = None
-                    prev_exp_m_diff = None
-                    bkv_start = idx * bkv_csz
+                    @pl.loop(0, num_loops, unroll=False)
+                    def attention_loop(idx):
+                        prev_lm_slice = None
+                        prev_p = None
+                        prev_v = None
+                        prev_exp_m_diff = None
+                        bkv_start = idx * cur_bkv_csz
 
-                    for bq_start in range(0, actual_bq_sz, actual_bq_csz):
-                        for kv_head_idx in range(actual_num_kv_heads):
-                            bk_c, bv_c = load_bkv(
-                                bkv_sem_idx,
-                                kv_head_idx,
-                                bkv_start,
-                                bkv_csz,
-                            )
-                            bq_c = load_bq(
-                                bq_sem_idx, kv_head_idx, bq_start, actual_bq_csz
-                            )
-
-                            lm_slice_start = bq_start * num_q_heads_per_kv_head
-                            lm_slice_size = actual_bq_csz * num_q_heads_per_kv_head
-                            lm_slice = (
-                                kv_head_idx,
-                                pl.ds(lm_slice_start, lm_slice_size),
-                            )
-
-                            # FlashAttn is divided into
-                            # `flash_attention_step1_qk_softmax` and
-                            # `flash_attention_step2_pv` to pipeline the computation.
-                            # `step2_pv` for the previous KV head, which depends on the
-                            # softmax output, is overlapped with `step1_qk_softmax` for
-                            # the current KV head, reducing overall wait times.
-                            cur_p, cur_v, cur_exp_m_diff = (
-                                flash_attention_step1_qk_softmax(
-                                    bq_c,
-                                    bk_c,
-                                    bv_c,
-                                    l_ref.at[*lm_slice],
-                                    m_ref.at[*lm_slice],
-                                    processed_q_len=processed_q_len + bq_start,
-                                    processed_kv_len=processed_kv_len + bkv_start,
-                                    effective_kv_len=effective_kv_len,
+                        for bq_start in range(0, actual_bq_sz, actual_bq_csz):
+                            for kv_head_idx in range(actual_num_kv_heads):
+                                bk_c, bv_c = load_bkv(
+                                    bkv_sem_idx,
+                                    kv_head_idx,
+                                    bkv_start,
+                                    cur_bkv_csz,
                                 )
-                            )
-                            if prev_lm_slice is not None:
-                                flash_attention_step2_pv(
-                                    prev_p,
-                                    prev_v,
-                                    prev_exp_m_diff,
-                                    acc_ref.at[*prev_lm_slice],
+                                bq_c = load_bq(
+                                    bq_sem_idx, kv_head_idx, bq_start, actual_bq_csz
                                 )
-                            prev_lm_slice = lm_slice
-                            prev_p = cur_p
-                            prev_v = cur_v
-                            prev_exp_m_diff = cur_exp_m_diff
 
-                    # Execute pv of last iteration.
-                    assert prev_lm_slice is not None
-                    flash_attention_step2_pv(
-                        prev_p,
-                        prev_v,
-                        prev_exp_m_diff,
-                        acc_ref.at[*prev_lm_slice],
-                    )
+                                lm_slice_start = bq_start * num_q_heads_per_kv_head
+                                lm_slice_size = actual_bq_csz * num_q_heads_per_kv_head
+                                lm_slice = (
+                                    kv_head_idx,
+                                    pl.ds(lm_slice_start, lm_slice_size),
+                                )
+
+                                # FlashAttn is split into step1_qk_softmax and
+                                # step2_pv to overlap previous-head PV with the
+                                # current-head QK+softmax.
+                                cur_p, cur_v, cur_exp_m_diff = (
+                                    flash_attention_step1_qk_softmax(
+                                        bq_c,
+                                        bk_c,
+                                        bv_c,
+                                        l_ref.at[*lm_slice],
+                                        m_ref.at[*lm_slice],
+                                        processed_q_len=processed_q_len + bq_start,
+                                        processed_kv_len=processed_kv_len + bkv_start,
+                                        effective_kv_len=effective_kv_len,
+                                    )
+                                )
+                                if prev_lm_slice is not None:
+                                    flash_attention_step2_pv(
+                                        prev_p,
+                                        prev_v,
+                                        prev_exp_m_diff,
+                                        acc_ref.at[*prev_lm_slice],
+                                    )
+                                prev_lm_slice = lm_slice
+                                prev_p = cur_p
+                                prev_v = cur_v
+                                prev_exp_m_diff = cur_exp_m_diff
+
+                        # Execute pv of last iteration.
+                        assert prev_lm_slice is not None
+                        flash_attention_step2_pv(
+                            prev_p,
+                            prev_v,
+                            prev_exp_m_diff,
+                            acc_ref.at[*prev_lm_slice],
+                        )
+
+                def _make_tier_runner(csz: int):
+                    def _dispatch_tier():
+                        run_attention_compute(csz)
+
+                    return _dispatch_tier
+
+                if case == RpaCase.DECODE and len(bkv_csz_tiers) > 1:
+                    tier_bounds = compute_decode_bkv_tier_bounds(bkv_csz_tiers)
+                    for tier_idx, tier_csz in enumerate(bkv_csz_tiers):
+                        if tier_idx == 0:
+                            in_tier = effective_bkv_sz <= tier_bounds[0]
+                        elif tier_idx < len(bkv_csz_tiers) - 1:
+                            in_tier = jnp.logical_and(
+                                effective_bkv_sz > tier_bounds[tier_idx - 1],
+                                effective_bkv_sz <= tier_bounds[tier_idx],
+                            )
+                        else:
+                            in_tier = effective_bkv_sz > tier_bounds[tier_idx - 1]
+                        pl.when(in_tier)(_make_tier_runner(tier_csz))
+                else:
+                    run_attention_compute(bkv_csz)
 
             # Load acc and calculate final output.
             acc = acc_ref[...]
@@ -1295,6 +1317,7 @@ def dynamic_validate_inputs(
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
     d_block_sizes: tuple[int, int, int, int] | None = None,
+    d_bkv_csz_tiers: tuple[int, ...] | None = None,
     p_block_sizes: tuple[int, int, int, int] | None = None,
     m_block_sizes: tuple[int, int, int, int] | None = None,
     vmem_limit_bytes: int | None = None,
@@ -1388,6 +1411,7 @@ def static_validate_inputs(
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
     d_block_sizes: tuple[int, int, int, int] | None = None,
+    d_bkv_csz_tiers: tuple[int, ...] | None = None,
     p_block_sizes: tuple[int, int, int, int] | None = None,
     m_block_sizes: tuple[int, int, int, int] | None = None,
     vmem_limit_bytes: int | None = None,
@@ -1525,6 +1549,27 @@ def static_validate_inputs(
     _validate_block_sizes(d_block_sizes, "decode")
     _validate_block_sizes(p_block_sizes, "prefill")
     _validate_block_sizes(m_block_sizes, "mixed")
+    if d_bkv_csz_tiers:
+        if list(d_bkv_csz_tiers) != sorted(set(d_bkv_csz_tiers)):
+            raise ValueError(
+                f"d_bkv_csz_tiers={d_bkv_csz_tiers} must be strictly ascending."
+            )
+        for t in d_bkv_csz_tiers:
+            if t <= 0 or t % page_size != 0:
+                raise ValueError(
+                    f"Each decode tier {t} in {d_bkv_csz_tiers=} must be a "
+                    f"positive multiple of {page_size=}."
+                )
+        if d_bkv_csz_tiers[-1] >= 128 and d_bkv_csz_tiers[0] < 128:
+            raise ValueError(
+                f"Non-final decode tier {d_bkv_csz_tiers[0]} in "
+                f"{d_bkv_csz_tiers=} must be >= 128 lanes."
+            )
+        if d_block_sizes is not None and d_bkv_csz_tiers[-1] != d_block_sizes[1]:
+            raise ValueError(
+                f"Final decode tier {d_bkv_csz_tiers[-1]} must match "
+                f"decode bkv_sz={d_block_sizes[1]}."
+            )
 
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
         raise ValueError(f"{vmem_limit_bytes=} must be positive.")
@@ -1536,6 +1581,66 @@ def static_validate_inputs(
     del q_scale
     del k_scale
     del v_scale
+
+
+_RPA_BLOCK_SIZE_STATS: dict[str, dict[str, Any]] = {}
+
+
+def get_rpa_block_size_stats() -> dict[str, dict[str, Any]]:
+    return {k: dict(v) for k, v in sorted(_RPA_BLOCK_SIZE_STATS.items())}
+
+
+def reset_rpa_block_size_stats() -> None:
+    _RPA_BLOCK_SIZE_STATS.clear()
+
+
+def compute_decode_bkv_tier_bounds(
+    bkv_csz_tiers: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Return active ``kv_len`` upper bounds for each tier in ``bkv_csz_tiers``.
+
+    Non-final tiers use full 128-lane boundaries ``(c // 128) * 128`` so active
+    KV tokens never fall into a partial `< 128`-lane tail sub-tile (for example,
+    ``page_size = 544 = 4 * 128 + 32`` uses bound ``512`` for tier ``544`` and
+    promotes ``513..544`` to tier ``1088``).
+    """
+    return tuple(
+        (c // 128) * 128 if (c >= 128 and i < len(bkv_csz_tiers) - 1) else c
+        for i, c in enumerate(bkv_csz_tiers)
+    )
+
+
+def resolve_decode_bkv_csz_tiers(
+    bkv_sz: int,
+    bkv_csz: int,
+    page_size: int,
+    *,
+    adaptive: bool | None = None,
+) -> tuple[int, ...]:
+    """Return power-of-2 single-block decode compute tiers ending at ``bkv_sz``.
+
+    When ``bkv_sz >= 128``, non-final tiers are clamped to at least
+    ``align_to(128, page_size)`` so small ``page_size`` (< 128) never generates
+    sub-128-lane vector reduction tiers.
+    """
+    from vllm_torchtpu import envs
+
+    if adaptive is None:
+        adaptive = bool(envs.TPU_RPA_DECODE_ADAPTIVE_BKV_COMPUTE)
+    if not adaptive:
+        return ()
+    min_csz = bkv_csz if 0 < bkv_csz < bkv_sz else page_size
+    if bkv_sz >= 128:
+        min_csz = max(min_csz, align_to(128, page_size))
+    if min_csz <= 0 or min_csz >= bkv_sz or bkv_sz % min_csz != 0:
+        return ()
+    tiers: list[int] = []
+    cur = min_csz
+    while cur < bkv_sz:
+        tiers.append(cur)
+        cur *= 2
+    tiers.append(bkv_sz)
+    return tuple(tiers)
 
 
 def get_default_block_sizes(
@@ -1597,13 +1702,58 @@ def get_default_block_sizes(
 
     # The query compute block should never exceed the query fetch block.
     bq_csz = min(bq_csz, bq_sz)
+    bkv_sz = align_to(bkv_sz, page_size)
+    bkv_csz = align_to(bkv_csz, page_size)
 
-    return {
+    bkv_csz_tiers: tuple[int, ...] = ()
+    if case == RpaCase.DECODE:
+        from vllm_torchtpu import envs
+
+        fetch_pages = int(envs.TPU_RPA_DECODE_BKV_PAGES)
+        compute_pages = int(envs.TPU_RPA_DECODE_BKV_COMPUTE_PAGES)
+        adaptive_compute = bool(envs.TPU_RPA_DECODE_ADAPTIVE_BKV_COMPUTE)
+        if fetch_pages > 0:
+            bkv_sz = min(max_kv, fetch_pages * page_size)
+            if compute_pages <= 0:
+                bkv_csz = min(bkv_csz, bkv_sz)
+        if adaptive_compute and compute_pages <= 0:
+            compute_pages = cdiv(128, page_size) if bkv_sz >= 128 else 1
+        if compute_pages > 0:
+            bkv_csz = min(bkv_sz, compute_pages * page_size)
+        if bkv_csz <= 0 or bkv_sz % bkv_csz != 0:
+            raise ValueError(
+                f"Invalid RpaCase.DECODE block sizes: bkv_sz={bkv_sz} must be a "
+                f"positive multiple of bkv_csz={bkv_csz} "
+                f"(TPU_RPA_DECODE_BKV_PAGES={fetch_pages}, "
+                f"TPU_RPA_DECODE_BKV_COMPUTE_PAGES={compute_pages})"
+            )
+        bkv_csz_tiers = resolve_decode_bkv_csz_tiers(
+            bkv_sz, bkv_csz, page_size, adaptive=adaptive_compute
+        )
+
+    res = {
         "bq_sz": max(1, bq_sz),
-        "bkv_sz": align_to(bkv_sz, page_size),
+        "bkv_sz": bkv_sz,
         "bq_csz": max(1, bq_csz),
-        "bkv_csz": align_to(bkv_csz, page_size),
+        "bkv_csz": bkv_csz,
     }
+    key = (
+        f"{case.symbol}_tok{int(max_num_tokens)}"
+        f"_seq{int(max_num_seqs)}_p{int(page_size)}"
+    )
+    stat_entry: dict[str, Any] = {
+        "case": case.symbol,
+        "page_size": int(page_size),
+        "pages_per_seq": int(pages_per_seq),
+        "max_num_tokens": int(max_num_tokens),
+        "max_num_seqs": int(max_num_seqs),
+        **res,
+    }
+    if case == RpaCase.DECODE:
+        stat_entry["adaptive_bkv_compute"] = bool(bkv_csz_tiers)
+        stat_entry["bkv_csz_tiers"] = list(bkv_csz_tiers)
+    _RPA_BLOCK_SIZE_STATS[key] = stat_entry
+    return res
 
 
 @jax.jit(
@@ -1621,6 +1771,7 @@ def get_default_block_sizes(
         "v_scale",
         "chunk_prefill_size",
         "d_block_sizes",
+        "d_bkv_csz_tiers",
         "p_block_sizes",
         "m_block_sizes",
         "vmem_limit_bytes",
@@ -1661,6 +1812,7 @@ def ragged_paged_attention(
     # - bq_csz: the compute size of the block query.
     # - bkv_csz: the compute size of the block kv.
     d_block_sizes: tuple[int, int, int, int] | None = None,
+    d_bkv_csz_tiers: tuple[int, ...] | None = None,
     p_block_sizes: tuple[int, int, int, int] | None = None,
     m_block_sizes: tuple[int, int, int, int] | None = None,
     vmem_limit_bytes: int | None = None,
@@ -1787,6 +1939,7 @@ def ragged_paged_attention(
         bkv_sz,
         bq_csz,
         bkv_csz,
+        bkv_csz_tiers: tuple[int, ...] = (),
         static_q_len=None,
         case: RpaCase = RpaCase.MIXED,
     ):
@@ -1854,6 +2007,8 @@ def ragged_paged_attention(
         scope_name = (
             f"RPA{case.symbol}-p_{page_size}-bq_{bq_sz}_{bq_csz}-bkv_{bkv_sz}_{bkv_csz}"
         )
+        if len(bkv_csz_tiers) > 1:
+            scope_name += f"-adapt_{'_'.join(str(x) for x in bkv_csz_tiers)}"
         if sliding_window is not None:
             scope_name += f"-sw_{sliding_window}"
         kernel = pl.pallas_call(
@@ -1874,6 +2029,7 @@ def ragged_paged_attention(
                 bkv_sz=bkv_sz,
                 bq_csz=bq_csz,
                 bkv_csz=bkv_csz,
+                bkv_csz_tiers=bkv_csz_tiers,
                 case=case,
                 debug_mode=debug_mode,
             ),
@@ -1948,10 +2104,19 @@ def ragged_paged_attention(
         }
 
     # Decode-only
+    dec_bs = _prepare_block_sizes(d_block_sizes, RpaCase.DECODE)
+    dec_tiers = (
+        d_bkv_csz_tiers
+        if d_bkv_csz_tiers is not None
+        else resolve_decode_bkv_csz_tiers(
+            dec_bs["bkv_sz"], dec_bs["bkv_csz"], page_size
+        )
+    )
     q, kv_cache = run_rpa_kernel(
         q,
         kv_cache,
-        **_prepare_block_sizes(d_block_sizes, RpaCase.DECODE),
+        **dec_bs,
+        bkv_csz_tiers=dec_tiers,
         static_q_len=1,
         case=RpaCase.DECODE,
     )
@@ -1999,6 +2164,7 @@ def ragged_paged_attention(
         "v_scale",
         "chunk_prefill_size",
         "d_block_sizes",
+        "d_bkv_csz_tiers",
         "p_block_sizes",
         "m_block_sizes",
         "vmem_limit_bytes",
