@@ -194,6 +194,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_VGUARD_LEAN: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_ALIGN_GATHER: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE: int = 0
+    VLLM_TPU_QSA_PREFILL_UNION_DOT16: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_GATHERED: str = ""
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS: int = 4
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
@@ -1109,6 +1110,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the served walk (a TPU measurement). 2 = the two stages interleaved per KV head in program order. Kernel name gains
     # _pipe / _pipe2; one engagement line per trace. 0 / unset = off.
     "VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE": env_int("VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE", 0),
+    # q38 UNION-BUILD (default off; gathered walk only): DOT16: both walk dots take BF16 operands (queries once per block, keys and
+    # values decoded to BF16, probabilities cast at the PV dot). Mosaic's f32 dot there is one BF16 pass with round-to-nearest
+    # operands (M, T83m precision probe), so the dots' results are the served ones; bitwise checked on TPU. Kernel name _d16.
+    "VLLM_TPU_QSA_PREFILL_UNION_DOT16": env_bool("VLLM_TPU_QSA_PREFILL_UNION_DOT16"),
     # GATHERED ("", "reference", "sparsecore"; with LISTED): the walk-free kernel on chunked gathered tiles.
     "VLLM_TPU_QSA_PREFILL_UNION_GATHERED": env_str("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", ""),
     "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS": env_int("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", 4),
