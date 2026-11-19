@@ -20,8 +20,10 @@ They were measured for Qwen3.5-397B-A17B on TPU7x, the kernel at EP8. Every
 other Qwen3.5 checkpoint, device and expert-parallel size (main's CI model,
 Qwen3.5-35B-A3B at EP4, among them) keeps main's arithmetic and code. The
 validation entries' legs take the kernel numerics; on their decode legs the
-few-token kernel arms only once the sequence-parallel row threshold is set
-(it is 0 in this tree), and no leg arms the fused MoE decode kernels."""
+few-token kernel arms once the sequence-parallel row threshold is set (the
+Qwen3.5 model patch sets it per layout when the model follows each step's
+form: 64 rows at DP4 x TP2, so that decode leg arms the kernel at 448 rows),
+and no leg arms the fused MoE decode kernels."""
 
 import pathlib
 from types import SimpleNamespace
@@ -243,10 +245,11 @@ def test_validation_legs_take_the_levers_this_tree_gives_them(monkeypatch, path)
     )
     monkeypatch.setattr(fused_moe_ep_v3, "_tensor_parallel_size", lambda: tp)
     assert tp > 1 and envs.MOE_FUSED_EP_KERNEL_IMPL == "v3"
-    # In this tree the sequence-parallel row threshold is 0 on every layout, so
-    # fused EP v3 takes the decode legs' sequence-parallel steps from one row
-    # and the few-token kernel stays off (fused_moe_ep_v3.
-    # sequence_parallel_threshold_unset): the cap these legs get is 0.
+    # Before the model follows each step's form the sequence-parallel row
+    # threshold is 0, so fused EP v3 takes the decode legs' sequence-parallel
+    # steps from one row and the few-token kernel stays off (fused_moe_ep_v3.
+    # sequence_parallel_threshold_unset): the cap is 0. Serving sets the
+    # threshold at model load (64 rows at DP4 x TP2), which arms it at 448.
     engine = _engine(SHAPE_397B)
     assert _arm(monkeypatch, engine, decode_ep, sequence_parallel=True) == 0
     assert scores._LAYERS == []
