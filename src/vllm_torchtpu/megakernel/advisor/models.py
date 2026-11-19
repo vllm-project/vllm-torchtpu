@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import ceil, gcd
 from pathlib import Path
@@ -354,6 +355,7 @@ class _NormalizedHfConfig:
     index_head_dim: int = 0
     index_n_heads: int = 0
     num_indexer_layers: int = 0
+    dense_unquantized: bool = False
 
     def validate_supported(self, *, require_model_type: bool = False) -> None:
         """Validate that the configuration describes a supported causal LM."""
@@ -434,8 +436,16 @@ class _NormalizedHfConfig:
                 else fallback_dt
             )
         )
-        resolved_wd = str(weight_dtype or self.raw_weight_dtype or inferred_dt).lower()
-        resolved_ed = str(expert_dtype or self.raw_expert_dtype or resolved_wd).lower()
+        # A checkpoint that skips attention keeps dense weights unquantized.
+        unquantized_dt = "fp32" if "32" in self.torch_dtype.lower() else "bf16"
+        dense_default = unquantized_dt if self.dense_unquantized else inferred_dt
+        resolved_wd = str(
+            weight_dtype or self.raw_weight_dtype or dense_default
+        ).lower()
+        expert_default = inferred_dt if self.dense_unquantized else resolved_wd
+        resolved_ed = str(
+            expert_dtype or self.raw_expert_dtype or expert_default
+        ).lower()
         return resolved_wd, resolved_ed
 
     def infer_quant_dtypes_with_source(
@@ -447,6 +457,8 @@ class _NormalizedHfConfig:
         resolved_wd, resolved_ed = self.infer_quant_dtypes(weight_dtype, expert_dtype)
         if weight_dtype is not None or expert_dtype is not None:
             dtype_source = "flag"
+        elif self.dense_unquantized:
+            dtype_source = "quantization_config (experts); default (unquantized dense)"
         elif self.raw_weight_dtype or self.raw_expert_dtype or self.has_quant_config:
             dtype_source = "quantization_config"
         elif self.has_explicit_torch_dtype:
@@ -600,10 +612,79 @@ def _resolve_linear_schedule(
     return num_lin, is_per
 
 
+ATTENTION_MODULE_PREFIXES: tuple[str, ...] = (
+    "model.layers",
+    "model.language_model.layers",
+    "language_model.model.layers",
+)
+ATTENTION_PROJECTION_NAMES: tuple[str, ...] = (
+    "q_proj",
+    "q_a_proj",
+)
+
+
+def _compile_skip_pattern(pattern: str) -> Callable[[str], re.Match[str] | None]:
+    """Compile one quantization skip pattern into a bound matcher.
+
+    A `re:` prefix marks a regular expression matched from the start of the
+    name. Any other pattern is a dotted module path, matched on whole path
+    components, where `*` spans any run of characters.
+    """
+    if pattern.startswith("re:"):
+        try:
+            return re.compile(pattern.removeprefix("re:")).match
+        except re.error as exc:
+            msg = f"Invalid quantization skip pattern {pattern!r}: {exc}"
+            raise UnsupportedArchitectureError(msg) from exc
+    glob_body = ".*".join(re.escape(part) for part in pattern.split("*"))
+    return re.compile(rf"(?:^|\.){glob_body}(?:\.|$)").search
+
+
+def _quant_skips_attention(
+    quant_map: Mapping[str, object],
+    num_layers: int,
+    full_attn_layers: int,
+) -> bool:
+    """Return whether quantization skips query projections on full-attention layers.
+
+    Reads the compressed-tensors `ignore` list and the `modules_to_not_convert`
+    list across layer indices `0 .. num_layers - 1`, path prefixes, and query
+    projection names (`q_proj`, `q_a_proj`). Dense weights keep the checkpoint's
+    unquantized dtype only when covered layers reach a positive
+    `full_attn_layers` count.
+    """
+    patterns: list[str] = []
+    for key in ("ignore", "modules_to_not_convert"):
+        entries = _as_sequence(quant_map.get(key))
+        if entries is not None:
+            patterns.extend(str(entry) for entry in entries)
+    if not patterns:
+        return False
+    matchers = tuple(_compile_skip_pattern(pattern) for pattern in patterns)
+    if full_attn_layers <= 0:
+        return False
+    covered_layers = 0
+    for layer_index in range(num_layers):
+        layer_probes = (
+            f"{prefix}.{layer_index}.self_attn.{proj}"
+            for prefix in ATTENTION_MODULE_PREFIXES
+            for proj in ATTENTION_PROJECTION_NAMES
+        )
+        if any(
+            matcher(probe) is not None for probe in layer_probes for matcher in matchers
+        ):
+            covered_layers += 1
+            if covered_layers >= full_attn_layers:
+                return True
+    return False
+
+
 def _extract_quant_fields(
     tc: Mapping[str, object],
     raw_cfg: Mapping[str, object],
-) -> tuple[str, str, int, str, str, str, str, int, bool, bool]:
+    num_layers: int,
+    full_attn_layers: int,
+) -> tuple[str, str, int, str, str, str, str, int, bool, bool, bool]:
     """Extract normalized quantization fields from config mappings."""
     quant_raw = tc.get("quantization_config") or raw_cfg.get("quantization_config")
     quant_map = _as_mapping(quant_raw) or {}
@@ -677,6 +758,7 @@ def _extract_quant_fields(
         weight_block_k,
         has_quant_config,
         has_explicit_torch_dtype,
+        _quant_skips_attention(quant_map, num_layers, full_attn_layers),
     )
 
 
@@ -761,6 +843,31 @@ def _resolve_indexer_layers(
     return attn_layers
 
 
+def _resolve_dsa_fields(
+    text_cfg: Mapping[str, object], num_layers: int, attn_layers: int
+) -> tuple[int, int, int, int]:
+    """Resolve `(index_topk, index_head_dim, index_n_heads, num_indexer_layers)`.
+
+    Keys are read from the text config and from its nested `dsa_config`. A
+    `dsa_layers` list there gives the count of full indexer layers.
+    """
+    dsa_map = _as_mapping(text_cfg.get("dsa_config")) or {}
+    index_cfg: dict[str, object] = {**dsa_map, **text_cfg}
+    dsa_layers = _as_sequence(dsa_map.get("dsa_layers"))
+    if dsa_layers and not index_cfg.get("num_indexer_layers"):
+        index_cfg["num_indexer_layers"] = len(dsa_layers)
+    index_topk = _int_field(index_cfg, ("index_topk",))
+    index_head_dim = _int_field(index_cfg, ("index_head_dim",))
+    index_n_heads = _int_field(index_cfg, ("index_n_heads", "index_num_heads"))
+    num_indexer_layers = _resolve_indexer_layers(
+        index_cfg,
+        num_layers,
+        attn_layers,
+        (index_topk, index_head_dim, index_n_heads),
+    )
+    return index_topk, index_head_dim, index_n_heads, num_indexer_layers
+
+
 def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
     """Normalize a raw HuggingFace configuration mapping into a typed configuration."""
     tc, is_multimodal = _extract_text_subconfig(raw_cfg)
@@ -818,6 +925,7 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
     top_k = _int_field(
         tc, ("num_experts_per_tok", "num_experts_per_token", "num_selected_experts")
     ) * (num_experts > 0)
+    attn_layers = max(0, num_layers - num_linear_layers)
     (
         torch_dt,
         quant_tag,
@@ -829,17 +937,11 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
         weight_block_k,
         has_quant_config,
         has_explicit_torch_dtype,
-    ) = _extract_quant_fields(tc, raw_cfg)
+        dense_unquantized,
+    ) = _extract_quant_fields(tc, raw_cfg, num_layers, attn_layers)
     kv_compress = _extract_kv_compress_factor(tc)
-    index_topk = _int_field(tc, ("index_topk",))
-    index_head_dim = _int_field(tc, ("index_head_dim",))
-    index_n_heads = _int_field(tc, ("index_n_heads",))
-    attn_layers = max(0, num_layers - num_linear_layers)
-    num_indexer_layers = _resolve_indexer_layers(
-        tc,
-        num_layers,
-        attn_layers,
-        (index_topk, index_head_dim, index_n_heads),
+    index_topk, index_head_dim, index_n_heads, num_indexer_layers = _resolve_dsa_fields(
+        tc, num_layers, attn_layers
     )
 
     return _NormalizedHfConfig(
@@ -908,6 +1010,7 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
         ),
         has_quant_config=has_quant_config,
         has_explicit_torch_dtype=has_explicit_torch_dtype,
+        dense_unquantized=dense_unquantized,
     )
 
 
@@ -1027,6 +1130,38 @@ def _load_model_presets() -> tuple[
 MODEL_PRESETS, REGISTERED_MODEL_ALIASES, MODEL_PRESET_SOURCES = _load_model_presets()
 
 
+DTYPE_BASIS_PHRASES: Mapping[str, str] = {
+    "config": "dtypes from the cited config",
+    "assumed": "assumed serving dtype, cited checkpoint is unquantized",
+    "unverified": "cited config not re-read (gated repository)",
+}
+PRESET_DTYPE_BASES: frozenset[str] = frozenset(DTYPE_BASIS_PHRASES)
+
+
+def load_preset_dtype_basis() -> Mapping[str, str]:
+    """Load each preset's dtype basis from models.json.
+
+    `config`: the dtypes follow the cited config. `assumed`: the cited
+    checkpoint is unquantized and the preset keeps a serving quantization.
+    `unverified`: the cited config was not re-read.
+    """
+    payload = json.loads((PRESETS_DIR / "models.json").read_text("utf-8"))
+    basis: dict[str, str] = {}
+    for slug, entry in payload["presets"].items():
+        value = str(entry.get("dtype_basis", ""))
+        if value not in PRESET_DTYPE_BASES:
+            msg = (
+                f"Preset {slug!r} dtype_basis must be one of "
+                f"{sorted(PRESET_DTYPE_BASES)}, got {value!r}"
+            )
+            raise errors.MegakernelConfigError(msg)
+        basis[slug] = value
+    return basis
+
+
+MODEL_PRESET_DTYPE_BASIS = load_preset_dtype_basis()
+
+
 @dataclass(frozen=True)
 class ParallelLayout:
     """One serving role's mesh: parallel degrees, sequence sharding, layer groups."""
@@ -1053,6 +1188,23 @@ class ParallelLayout:
         )
         return " x ".join(f"{name}{deg}" for name, deg in axes if deg > 1) or "TP1"
 
+    def submodule_label(self) -> str:
+        """Return the attention mesh and the routed-expert mesh as one label.
+
+        Attention uses every axis except EP. Routed experts split the ranks
+        into expert owner groups (a declared `expert_owner_groups`, else
+        `ep`) and tensor-shard inside each group, as in `MoE: TP4 x EP8`.
+        """
+        attention = replace(self, ep=1).label()
+        if self.ep <= 1:
+            return f"Attn: {attention} \u00b7 MoE: TP{self.tp}"
+        declared = self.megakernel or {}
+        groups = int(str(declared.get("expert_owner_groups", self.ep)))
+        ranks = max(self.ep, self.tp)
+        inner_tp = max(1, ranks // max(1, groups))
+        moe = f"EP{groups}" if inner_tp == 1 else f"TP{inner_tp} x EP{groups}"
+        return f"Attn: {attention} \u00b7 MoE: {moe}"
+
 
 @dataclass(frozen=True)
 class DeploymentPreset:
@@ -1063,6 +1215,21 @@ class DeploymentPreset:
     saturation: ParallelLayout | None = None
     prefill_windows: tuple[int, ...] = ()
     megakernel_layouts: tuple[ParallelLayout, ...] = ()
+    unmodeled_notes: tuple[str, ...] = ()
+
+    def named_layouts(self) -> tuple[tuple[str, ParallelLayout], ...]:
+        """Return shipped role labels paired with their ParallelLayout."""
+        layouts: list[tuple[str, ParallelLayout]] = [
+            ("decode", self.decode),
+            ("prefill", self.prefill),
+        ]
+        if self.saturation is not None:
+            layouts.append(("saturation", self.saturation))
+        layouts.extend(
+            ("megakernel layout", extra_layout)
+            for extra_layout in self.megakernel_layouts
+        )
+        return tuple(layouts)
 
 
 def _int_tuple(raw: object, field_name: str) -> tuple[int, ...]:
@@ -1417,14 +1584,8 @@ def _declared_strings(raw: object) -> tuple[str, ...]:
 def validate_declared_layouts(slug: str, preset: DeploymentPreset) -> None:
     """Validate non-duplicate 6-axis declarations and expert-group divisibility."""
     seen_keys: set[tuple[tuple[int, int, int, int, int, int], str, str]] = set()
-    all_layouts = (
-        preset.decode,
-        preset.prefill,
-        preset.saturation,
-        *preset.megakernel_layouts,
-    )
-    for layout in all_layouts:
-        if layout is None or layout.megakernel is None:
+    for _role, layout in preset.named_layouts():
+        if layout.megakernel is None:
             continue
         declaration = layout.megakernel
         if not str(declaration.get("source", "")).strip():
@@ -1496,7 +1657,18 @@ def _parse_megakernel_layouts(slug: str, raw: object) -> tuple[ParallelLayout, .
     return tuple(layouts)
 
 
-def _load_deployment_presets() -> tuple[
+def _note_tuple(slug: str, raw: object) -> tuple[str, ...]:
+    """Parse the optional `unmodeled_notes` list of one deployment entry."""
+    if raw is None:
+        return ()
+    entries = _as_sequence(raw)
+    if entries is None:
+        msg = f"Deployment preset {slug!r} unmodeled_notes must be a list of strings"
+        raise errors.MegakernelConfigError(msg)
+    return tuple(_decl_str(entry, f"{slug}.unmodeled_notes") for entry in entries)
+
+
+def load_deployment_presets() -> tuple[
     Mapping[str, DeploymentPreset], Mapping[str, str]
 ]:
     """Load deployment layout presets and source strings from JSON."""
@@ -1516,13 +1688,86 @@ def _load_deployment_presets() -> tuple[
             saturation=sat,
             prefill_windows=windows,
             megakernel_layouts=mk_layouts,
+            unmodeled_notes=_note_tuple(slug, entry.get("unmodeled_notes")),
         )
         validate_declared_layouts(slug, preset)
         deps[slug] = preset
     return deps, sources
 
 
-DEPLOYMENT_PRESETS, DEPLOYMENT_PRESET_SOURCES = _load_deployment_presets()
+DEPLOYMENT_PRESETS, DEPLOYMENT_PRESET_SOURCES = load_deployment_presets()
+
+
+def _identity_view(profile: ModelProfile) -> ModelProfile:
+    """Return `profile` with non-geometric fields blanked for preset matching.
+
+    Quantization block size, KV/activation/state dtypes, dense FFN width, and a
+    multimodal `_text` suffix are normalized away; weight and expert dtypes are
+    checked separately when a preset fixes its dtypes from config.
+    """
+    return replace(
+        finalize_model_profile(profile),
+        name="",
+        intermediate_size=0,
+        weight_dtype="",
+        expert_dtype="",
+        act_dtype="",
+        kv_dtype="",
+        state_dtype="",
+        weight_block_k=0,
+        dtype_source="",
+        layer_families=(),
+        model_type=profile.model_type.strip().lower().removesuffix("_text"),
+    )
+
+
+def match_preset_by_geometry(profile: ModelProfile) -> str | None:
+    """Return the shipped preset matching `profile` geometry and config dtypes."""
+    finalized = finalize_model_profile(profile)
+    wanted = _identity_view(finalized)
+    for preset_name, preset in MODEL_PRESETS.items():
+        if _identity_view(preset) != wanted:
+            continue
+        if MODEL_PRESET_DTYPE_BASIS[preset_name] == "config" and (
+            preset.weight_dtype.lower() != finalized.weight_dtype.lower()
+            or preset.expert_dtype.lower() != finalized.expert_dtype.lower()
+        ):
+            continue
+        return preset_name
+    return None
+
+
+def normalize_preset_name(name: str) -> str:
+    """Normalize a model name the way declaration lookup matches preset slugs."""
+    return name.lower().replace(".", "_").replace("-", "_")
+
+
+def matching_shipped_preset_name(name: str) -> str | None:
+    """Return the shipped preset slug matching `name` after normalization, if any."""
+    normalized = normalize_preset_name(name)
+    for preset_name in MODEL_PRESETS:
+        if normalize_preset_name(preset_name) == normalized:
+            return preset_name
+    return None
+
+
+def _adopt_matching_preset_name(profile: ModelProfile) -> ModelProfile:
+    """Rename a config-derived profile to the shipped preset with the same geometry.
+
+    Applies to profiles built from a config file, a config directory, or a
+    config mapping, so a checkpoint gets the same layouts and declarations
+    whatever its directory is called. When no preset matches and the normalized
+    name equals a shipped preset slug, append `-custom` so config-path
+    declarations and layouts do not attach by name alone. A preset name with
+    dtype overrides, or a caller-supplied name, keeps that preset's
+    declarations.
+    """
+    preset_name = match_preset_by_geometry(profile)
+    if preset_name is not None:
+        return replace(profile, name=preset_name)
+    if matching_shipped_preset_name(profile.name) is not None:
+        return replace(profile, name=f"{profile.name}-custom")
+    return profile
 
 
 def _resolve_hf_profile(
@@ -1611,26 +1856,32 @@ def resolve_model_profile(  # noqa: PLR0913
         case ModelProfile():
             return target
         case Mapping() as mapping:
-            return _resolve_hf_profile(mapping, "model", dtypes, act_dtype=act_dtype)
+            return _adopt_matching_preset_name(
+                _resolve_hf_profile(mapping, "model", dtypes, act_dtype=act_dtype)
+            )
         case _:
             pass
 
     raw_str = str(target).strip()
     path = Path(raw_str)
     if path.is_file():
-        return _resolve_hf_profile(
-            json.loads(path.read_text("utf-8")),
-            path.parent.name or path.stem,
-            dtypes,
-            act_dtype=act_dtype,
+        return _adopt_matching_preset_name(
+            _resolve_hf_profile(
+                json.loads(path.read_text("utf-8")),
+                path.parent.name or path.stem,
+                dtypes,
+                act_dtype=act_dtype,
+            )
         )
     if not raw_str.endswith(".json") and (path / "config.json").is_file():
         cfg_file = path / "config.json"
-        return _resolve_hf_profile(
-            json.loads(cfg_file.read_text("utf-8")),
-            path.name or cfg_file.stem,
-            dtypes,
-            act_dtype=act_dtype,
+        return _adopt_matching_preset_name(
+            _resolve_hf_profile(
+                json.loads(cfg_file.read_text("utf-8")),
+                path.name or cfg_file.stem,
+                dtypes,
+                act_dtype=act_dtype,
+            )
         )
 
     tail = raw_str.lower().strip("/").split("/")[-1]
@@ -1674,12 +1925,14 @@ def resolve_model_profile(  # noqa: PLR0913
 
     snap_cfg = resolve_hf_snapshot_config(raw_str)
     if snap_cfg is not None:
-        return _resolve_hf_profile(
-            json.loads(snap_cfg.read_text("utf-8")),
-            tail,
-            dtypes,
-            act_dtype=act_dtype,
-            require_model_type=True,
+        return _adopt_matching_preset_name(
+            _resolve_hf_profile(
+                json.loads(snap_cfg.read_text("utf-8")),
+                tail,
+                dtypes,
+                act_dtype=act_dtype,
+                require_model_type=True,
+            )
         )
 
     msg = (

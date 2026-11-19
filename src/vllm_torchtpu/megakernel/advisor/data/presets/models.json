@@ -11,8 +11,10 @@
       "num_linear_layers": 18,
       "linear_key_heads": 16,
       "linear_value_heads": 16,
+      "has_attn_output_gate": true,
       "weight_dtype": "fp8",
       "model_type": "qwen3_5",
+      "dtype_basis": "assumed",
       "source": "HuggingFace Qwen/Qwen3.5-0.8B config.json"
     },
     "qwen3.5-397b": {
@@ -31,7 +33,9 @@
       "shared_expert_intermediate_size": 1024,
       "has_attn_output_gate": true,
       "weight_dtype": "fp8",
+      "weight_block_k": 128,
       "model_type": "qwen3_5_moe",
+      "dtype_basis": "config",
       "source": "HuggingFace Qwen/Qwen3.5-397B-A17B-FP8 config.json"
     },
     "qwen3.8-2.4t": {
@@ -48,9 +52,11 @@
       "top_k": 10,
       "moe_intermediate_size": 2048,
       "shared_expert_intermediate_size": 2048,
+      "has_attn_output_gate": true,
       "weight_dtype": "fp8",
       "expert_dtype": "nvfp4",
-      "model_type": "qwen3_8_moe",
+      "model_type": "qwen3_5_moe",
+      "dtype_basis": "assumed",
       "source": "HuggingFace Qwen/Qwen3.8-2.4T-A95B config.json"
     },
     "kimi-k3.1-pro": {
@@ -72,10 +78,15 @@
       "q_lora_rank": 1536,
       "qk_nope_head_dim": 128,
       "qk_rope_head_dim": 64,
+      "index_topk": 2048,
+      "index_head_dim": 128,
+      "index_n_heads": 32,
+      "num_indexer_layers": 24,
       "routed_expert_hidden_size": 3584,
-      "weight_dtype": "fp8",
+      "weight_dtype": "bf16",
       "expert_dtype": "mxfp4",
       "model_type": "kimi_linear",
+      "dtype_basis": "config",
       "source": "HuggingFace moonshotai/Kimi-K3.1-Pro config.json"
     },
     "kimi-k3": {
@@ -101,6 +112,7 @@
       "weight_dtype": "bf16",
       "expert_dtype": "mxfp4",
       "model_type": "kimi_linear",
+      "dtype_basis": "config",
       "source": "HuggingFace moonshotai/Kimi-K3 config.json"
     },
     "deepseek-v3": {
@@ -120,7 +132,9 @@
       "qk_nope_head_dim": 128,
       "qk_rope_head_dim": 64,
       "weight_dtype": "fp8",
+      "weight_block_k": 128,
       "model_type": "deepseek_v3",
+      "dtype_basis": "config",
       "source": "HuggingFace deepseek-ai/DeepSeek-V3 config.json"
     },
     "glm-5.2": {
@@ -146,6 +160,7 @@
       "weight_dtype": "fp8",
       "weight_block_k": 128,
       "model_type": "glm_moe_dsa",
+      "dtype_basis": "config",
       "source": "HuggingFace zai-org/GLM-5.2-FP8 config.json"
     },
     "mistral-large": {
@@ -157,6 +172,7 @@
       "head_dim": 128,
       "weight_dtype": "fp8",
       "model_type": "mistral",
+      "dtype_basis": "assumed",
       "source": "HuggingFace mistralai/Mistral-Large-Instruct-2411 config.json"
     },
     "llama-3.1-405b": {
@@ -168,6 +184,7 @@
       "head_dim": 128,
       "weight_dtype": "fp8",
       "model_type": "llama",
+      "dtype_basis": "unverified",
       "source": "HuggingFace meta-llama/Llama-3.1-405B-Instruct-FP8 config.json"
     },
     "mixtral-8x22b": {
@@ -182,6 +199,7 @@
       "top_k": 2,
       "weight_dtype": "bf16",
       "model_type": "mixtral",
+      "dtype_basis": "config",
       "source": "HuggingFace mistralai/Mixtral-8x22B-v0.1 config.json"
     },
     "llama-4-maverick": {
@@ -197,6 +215,7 @@
       "shared_expert_intermediate_size": 8192,
       "weight_dtype": "fp8",
       "model_type": "llama4",
+      "dtype_basis": "unverified",
       "source": "HuggingFace meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8 config.json"
     },
     "gpt-oss-120b": {
@@ -209,9 +228,10 @@
       "head_dim": 64,
       "num_experts": 128,
       "top_k": 4,
-      "weight_dtype": "fp8",
+      "weight_dtype": "bf16",
       "expert_dtype": "mxfp4",
       "model_type": "gpt_oss",
+      "dtype_basis": "config",
       "source": "HuggingFace openai/gpt-oss-120b config.json"
     },
     "qwen3-30b-a3b": {
@@ -225,7 +245,9 @@
       "top_k": 8,
       "moe_intermediate_size": 768,
       "weight_dtype": "fp8",
+      "weight_block_k": 128,
       "model_type": "qwen3_moe",
+      "dtype_basis": "config",
       "source": "HuggingFace Qwen/Qwen3-30B-A3B-FP8 config.json"
     }
   },

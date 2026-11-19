@@ -57,6 +57,31 @@ VALID_SOURCE_SCOPES: frozenset[str] = frozenset({"", *get_args(FusionScope)})
 SUPPORTED_ONCHIP_FAMILIES: frozenset[str] = frozenset(
     {"gqa", "mla", "dsa", "gdn", "kda", "dense_mlp", "moe"}
 )
+# Layer families that megakernel/core ships a module package for.
+CORE_MODULE_FAMILIES: frozenset[str] = frozenset({"gqa", "gdn", "moe"})
+# Weight dtypes the megakernel/core kernels read.
+CORE_SUPPORTED_DTYPES: frozenset[str] = frozenset({"fp8", "bf16"})
+# Entries of `ModelProfile.layer_families` that describe stack structure.
+STRUCTURAL_LAYER_TAGS: frozenset[str] = frozenset({"dense_prefix_moe"})
+
+ModelSupportTier = Literal[
+    "declared", "core_families", "priced_only", "partly_unmodeled"
+]
+
+SUPPORT_TIER_DESCRIPTIONS: Mapping[ModelSupportTier, str] = {
+    "declared": "A megakernel is declared for at least one serving layout.",
+    "core_families": (
+        "Every layer family and weight dtype has a megakernel/core counterpart. "
+        "Not a claim that it was run."
+    ),
+    "priced_only": (
+        "Priced by the advisor. A layer family or weight dtype has no "
+        "megakernel/core counterpart."
+    ),
+    "partly_unmodeled": (
+        "A layer family is not priced, or the model type is not recognized."
+    ),
+}
 
 
 def _scalar_float(val: object, field_name: str) -> float:
@@ -644,7 +669,10 @@ class ScopeEstimate:
 
 @dataclass(frozen=True)
 class AdvisorReport:
-    """First-principles fusion-scope recommendation for a single workload."""
+    """First-principles fusion-scope recommendation for a single workload.
+
+    Carries support_tier and unmodeled_notes describing model support coverage.
+    """
 
     model: str
     chip: str
@@ -680,6 +708,8 @@ class AdvisorReport:
         "decoder layer stack; excludes embedding, LM head, sampling, "
         "draft heads and modality towers"
     )
+    support_tier: ModelSupportTier = "priced_only"
+    unmodeled_notes: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         """Serialize AdvisorReport to a JSON-compatible dictionary."""
@@ -770,7 +800,11 @@ class DisaggHandoffSpec:
 
 @dataclass(frozen=True)
 class AdvisorSweepReport:
-    """Multi-regime crossover report across request regimes."""
+    """Multi-regime crossover report across request regimes.
+
+    Carries support_tier and unmodeled_notes describing model support coverage,
+    along with submodule_labels.
+    """
 
     model: str
     chip: str
@@ -794,6 +828,9 @@ class AdvisorSweepReport:
     chip_spec: ChipSpec | None = None
     layer_group_search: LayerGroupSearchResult | None = None
     model_profile: ModelProfile | None = None
+    support_tier: ModelSupportTier = "priced_only"
+    unmodeled_notes: tuple[str, ...] = ()
+    submodule_labels: Mapping[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         """Serialize AdvisorSweepReport to a JSON-compatible dictionary."""
