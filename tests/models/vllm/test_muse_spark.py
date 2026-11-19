@@ -514,7 +514,7 @@ def _tp8_rank_packed_weights(num_experts: int, hidden: int, intermediate: int):
 @pytest.mark.parametrize("use_ep", [False, True], ids=["tp", "ep"])
 @torch.inference_mode()
 def test_tpu_grouped_experts_match_packed_reference_decoder(monkeypatch, use_ep):
-    """Serving path (_grouped_experts -> gmm_v2) against the checkpoint decoder."""
+    """Serving path (routed_expert_rows -> gmm_v2) against the checkpoint decoder."""
     from vllm_torchtpu.models.vllm.muse_spark import model
     from vllm_torchtpu.models.vllm.muse_spark.weights import (
         selected_packed_expert_outputs,

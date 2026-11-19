@@ -315,8 +315,6 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
-    # Muse Spark's grouped expert matmul op (`pallas.jax_op` around gmm_v2).
-    "vllm_torchtpu/models/vllm/muse_spark/expert_matmul.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion

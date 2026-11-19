@@ -43,6 +43,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu.layers.adapter.custom_ops.routed_expert_rows_op import (
+    routed_expert_rows_op,
+)
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
 from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantizedConfig
 from vllm_torchtpu.logger import init_logger
@@ -109,9 +112,7 @@ class MuseExperts(nn.Module):
             torch.tensor([start], dtype=torch.int32) if use_ep else None,
             persistent=False,
         )
-        from .expert_matmul import get_grouped_experts_op
-
-        self._grouped_experts = get_grouped_experts_op(num_experts if use_ep else None)
+        self._routed_expert_rows = routed_expert_rows_op(use_ep)
         num_experts = local_experts
         if packed:
             if hidden_size % 16 or local % 16:
@@ -154,7 +155,7 @@ class MuseExperts(nn.Module):
 
     def forward(self, x: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
         if x.device.type == "tpu":
-            return self._grouped_experts(
+            return self._routed_expert_rows(
                 x,
                 ids,
                 self.gate_up_proj,

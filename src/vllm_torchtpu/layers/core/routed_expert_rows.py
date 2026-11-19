@@ -11,24 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Grouped Muse expert matmuls with tiled BF16/NVFP4 weights."""
+"""Routed expert GMMs that return one row per token and selected expert.
 
-from functools import cache, partial
+Unlike ``fused_moe_gmm``, the rows are returned before the weighted sum, as
+``[tokens, top_k, hidden]``, so a model can normalize each expert's output
+before combining them. Weights are BF16, or packed NVFP4 with compact uint8
+E4M3 block scales and FP32 per-expert global scales laid out as
+``[experts, 1, out_features]``.
+"""
 
 import jax
 import jax.numpy as jnp
-import torch
-from torch_tpu._internal import pallas
 
-import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.layers.core.fused_moe_gmm import (
-    prepare_routed_gmm_inputs,
-    resolve_onehot_permute_threshold,
-)
+from vllm_torchtpu.layers.core.fused_moe_gmm import prepare_routed_gmm_inputs
 
 
-def _grouped_experts(
+def routed_expert_rows(
     x: jax.Array,
     ids: jax.Array,
     w13: jax.Array,
@@ -39,12 +38,11 @@ def _grouped_experts(
     w2_global: jax.Array | None,
     experts_start: jax.Array | None,
     *,
-    num_experts: int | None,
+    use_ep: bool,
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int,
 ) -> jax.Array:
     tokens, top_k = ids.shape
-    use_ep = num_experts is not None
     if use_ep:
         assert experts_start is not None
         ids = ids - experts_start
@@ -92,63 +90,3 @@ def _grouped_experts(
     return jnp.where(valid[:, None], rows[inverse], 0).reshape(
         tokens, top_k, x.shape[-1]
     )
-
-
-def get_grouped_experts_op(num_experts: int | None = None):
-    """The grouped-expert op, built for the current SparseCore permute settings."""
-    return _build_grouped_experts_op(
-        num_experts, envs.USE_MOE_SPARSE_CORE, resolve_onehot_permute_threshold()
-    )
-
-
-@cache
-def _build_grouped_experts_op(
-    num_experts: int | None, use_sparse_core: bool, onehot_moe_permute_threshold: int
-):
-    # Build once outside torch.compile; tensor EP offsets keep rank graphs identical.
-    # The permute settings are part of the op name, so a program compiled under
-    # one setting is never reused under another.
-    suffix = "" if num_experts is None else f"_e{num_experts}"
-    suffix += f"_sc{int(use_sparse_core)}_oh{onehot_moe_permute_threshold}"
-    op = pallas.jax_op(
-        "pallas::muse_grouped_experts" + suffix,
-        partial(
-            _grouped_experts,
-            num_experts=num_experts,
-            use_sparse_core=use_sparse_core,
-            onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-        ),
-    )
-
-    def fake(
-        x, ids, w13, w2, w13_scale, w2_scale, w13_global, w2_global, experts_start
-    ):
-        return torch.empty(*ids.shape, x.shape[-1], device=x.device, dtype=x.dtype)
-
-    op.register_fake(fake)
-
-    def grouped_experts(
-        x,
-        ids,
-        w13,
-        w2,
-        w13_scale,
-        w2_scale,
-        w13_global=None,
-        w2_global=None,
-        experts_start=None,
-    ):
-        # Match the int32 JAX indexing schema at the custom-op boundary.
-        return op(
-            x,
-            ids.to(torch.int32),
-            w13,
-            w2,
-            w13_scale,
-            w2_scale,
-            w13_global,
-            w2_global,
-            experts_start,
-        )
-
-    return grouped_experts
