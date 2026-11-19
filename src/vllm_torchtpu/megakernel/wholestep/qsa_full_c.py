@@ -485,7 +485,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 base = jnp.where(c < m, base_of(c), 0)
                 cd = scr["qu_code"][pl.ds(pl.multiple_of(base, 8), CM)]
                 keep = jnp.where(c < m, 1, 0)
-                if D > 1 and not self.compressed_dcp:
+                if D > 1:  # pair rank r's groups (under `compressed_dcp`: its half)
                     gidx = self._nvis_ids(ctx, (CM, 128), base)
                     cd = jnp.where(jax.lax.rem(gidx // gpp, D) == r, cd, 0)
                 codes.append(cd * keep)
