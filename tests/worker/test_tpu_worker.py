@@ -702,11 +702,13 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
         torch.set_num_threads(2)
         with (
             patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap") as freeze,
+            patch("vllm_torchtpu.worker.tpu_worker._drop_traced_module_refs") as drop,
             patch(
                 "vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"
             ) as gc_debug,
         ):
             result = TPUWorker.compile_or_warm_up_model(worker)
+        drop.assert_called_once_with()
         freeze.assert_called_once_with()
         gc_debug.assert_called_once_with()
         # Speculative decoding warms up at the serving thread count; other
