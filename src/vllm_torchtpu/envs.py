@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS: int = 0
     TPU_MINIMAX_M3_FP8_CAST_SKIP: str = "shared_experts.gate_up_proj"
     TPU_MINIMAX_M3_FP8_CAST_IN_TORCH: bool = False
+    TPU_MINIMAX_M3_FP8_CAST_NORM: bool = False
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -783,6 +784,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the fp8 matmul op instead of inside it.
     "TPU_MINIMAX_M3_FP8_CAST_IN_TORCH": env_bool(
         "TPU_MINIMAX_M3_FP8_CAST_IN_TORCH", default=False
+    ),
+    # TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS: the input RMSNorm of a layer whose
+    # qkv projection casts emits the e4m3 activation itself (one write
+    # instead of a bf16 copy and a separate cast pass).
+    "TPU_MINIMAX_M3_FP8_CAST_NORM": env_bool(
+        "TPU_MINIMAX_M3_FP8_CAST_NORM", default=False
     ),
     # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
     # permutation-free dense-expert kernel (kernels/experimental/

@@ -109,6 +109,41 @@ def _fp8_cast_applies(layer: torch.nn.Module, rows: int) -> bool:
     return not any(prefix.endswith(s) for s in skip)
 
 
+def fp8_norm_applies(qkv_proj: torch.nn.Module, rows: int) -> bool:
+    """TPU_MINIMAX_M3_FP8_CAST_NORM: the input RMSNorm emits e4m3 for a qkv
+    projection that casts its activations at this bucket."""
+    applies = (
+        envs.TPU_MINIMAX_M3_FP8_CAST_NORM
+        and isinstance(getattr(qkv_proj, "quant_method", None), MiniMaxM3Mxfp8LinearMethod)
+        and qkv_proj.weight.dtype == torch.float8_e4m3fn
+        and _fp8_cast_applies(qkv_proj, rows)
+    )
+    if applies:
+        logger.info_once(
+            "TPU_MINIMAX_M3_FP8_CAST_NORM=1: input RMSNorm emits e4m3 for the qkv projection."
+        )
+    return applies
+
+
+def fused_add_rms_norm_e4m3(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    gemma_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GemmaRMSNorm's fused add + norm (the `tpu` IR provider's rounding
+    points: residual rounded to the activation dtype, FP32 norm, output
+    rounded to it) with the output cast to e4m3 (clamped) in the same
+    expression, so XLA writes the e4m3 activation once instead of a bf16
+    copy that a second pass re-reads (the IR op is a fusion boundary)."""
+    orig_dtype = x.dtype
+    residual = (x.to(torch.float32) + residual.to(torch.float32)).to(orig_dtype)
+    r = residual.to(torch.float32)
+    out = r * torch.rsqrt(r.pow(2).mean(dim=-1, keepdim=True) + eps)
+    out = (out * (gemma_weight.to(torch.float32) + 1.0)).to(orig_dtype)
+    return out.clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn), residual
+
+
 QUANT_METHOD = "mxfp8"
 MXFP8_BLOCK = 32
 _E8M0_BIAS = 127
@@ -294,6 +329,9 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         ):
             # Rows are static at trace time, so each bucket picks one path.
             return quantized_matmul(x, layer.weight, layer.weight_scale)
+        if x.dtype == torch.float8_e4m3fn:
+            # Already cast by its producer (fused_add_rms_norm_e4m3).
+            return _fp8_cast_linear(x, layer.weight, layer.weight_scale)
         if x.dtype == torch.bfloat16 and _fp8_cast_applies(layer, rows):
             if envs.TPU_MINIMAX_M3_FP8_CAST_IN_TORCH:
                 # Cast outside the jax_op, so XLA can fuse it into x's
