@@ -1296,8 +1296,24 @@ def token_shard_unpermute(gathered, starts, context, size):
     """Step-ordered rows of the rank-major all-gather of the balanced shards
     (VLLM_TPU_QSA_INDEXER_BALANCED_SHARD)."""
     tokens = gathered.shape[0]
+    # Runs once per traced bucket (JAX trace time, outside Dynamo): the
+    # served log's proof that the balanced path is in the graph.
+    _balanced_logger().warning(
+        "QSA indexer: rank-balanced token shard active "
+        "(VLLM_TPU_QSA_INDEXER_BALANCED_SHARD, %d tokens, TP %d, %d slots)",
+        tokens,
+        size,
+        len(context),
+    )
     plan = balanced_token_shard_plan(starts, context, tokens, size)
     return gathered[balanced_shard_positions(plan, starts, tokens)]
+
+
+@functools.cache
+def _balanced_logger():
+    from vllm_torchtpu.logger import init_logger
+
+    return init_logger(__name__)
 
 
 def token_shard_selection(

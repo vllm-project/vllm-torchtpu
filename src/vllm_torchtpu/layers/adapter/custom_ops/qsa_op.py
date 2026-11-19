@@ -23,9 +23,6 @@ from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     token_shard_unpermute,
 )
 from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_step
-from vllm_torchtpu.logger import init_logger
-
-logger = init_logger(__name__)
 
 
 @functools.cache
@@ -437,13 +434,8 @@ def _token_shard_step_order(gathered, starts, context, world: int):
         or tokens // world <= slots
     ):
         return gathered
-    logger.info_once(
-        "QSA indexer: rank-balanced token shard active "
-        "(VLLM_TPU_QSA_INDEXER_BALANCED_SHARD, %d tokens, TP %d, %d slots)",
-        tokens,
-        world,
-        slots,
-    )
+    # No logging here: Dynamo traces this function (full graph).
+    # token_shard_unpermute logs when JAX traces it.
     return _unpermute_op()(gathered, starts, context, size=world)
 
 
