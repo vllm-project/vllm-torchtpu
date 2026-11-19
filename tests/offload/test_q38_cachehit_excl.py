@@ -329,7 +329,7 @@ def test_connector_refuses_a_wheel_without_evict(monkeypatch):
         victim.deactivate()
 
 
-@pytest.mark.parametrize("on", [True, False])
+@pytest.mark.parametrize("on", [True, False], ids=["flag_on", "flag_off"])
 def test_connector_install_line_and_telemetry(monkeypatch, on):
     from vllm_torchtpu.offload import victim
 
@@ -361,7 +361,7 @@ def _turn_one_keys(first, kvc):
     return keys
 
 
-@pytest.mark.parametrize("on", [True, False])
+@pytest.mark.parametrize("on", [True, False], ids=["flag_on", "flag_off"])
 def test_victim_cycle_stores_restored_blocks_again_only_when_exclusive(monkeypatch, on):
     from vllm.v1.core.sched.output import SchedulerOutput
 
