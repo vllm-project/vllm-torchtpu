@@ -17,7 +17,7 @@ import bisect
 
 import jax
 import torch
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 from vllm.config import VllmConfig
 from vllm.forward_context import ForwardContext
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (

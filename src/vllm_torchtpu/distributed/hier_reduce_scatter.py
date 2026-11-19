@@ -109,7 +109,7 @@ def _build_op(
 ) -> Any:
     import jax
     from jax.sharding import PartitionSpec as P
-    from torch_tpu._internal import pallas
+    from torch.tpu import pallas
 
     from vllm_torchtpu.kernels.collectives.hierrs_tc.dispatch import (
         make_reduce_scatter_fn,
