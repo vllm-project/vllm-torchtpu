@@ -64,15 +64,18 @@ def _chip_family() -> str | None:
     return None if chip_version is None else chip_version.value
 
 
+def has_calibrated_shape(model_config) -> bool:
+    """Whether the checkpoint has the calibrated shape (Qwen3.5-397B-A17B's
+    text config), whatever the device."""
+    text = getattr(model_config, "hf_text_config", None)
+    return all(getattr(text, k, None) == v for k, v in _CALIBRATED_SHAPE.items())
+
+
 def _is_calibrated(model_config) -> bool:
     """Whether the defaults were measured for this checkpoint and device:
     the calibrated checkpoint shape on a TPU7x device. Any other shape, a
     smaller device or an unknown device keeps main's behaviour."""
-    text = getattr(model_config, "hf_text_config", None)
-    for key, value in _CALIBRATED_SHAPE.items():
-        if getattr(text, key, None) != value:
-            return False
-    return _chip_family() == _CALIBRATED_CHIP
+    return has_calibrated_shape(model_config) and _chip_family() == _CALIBRATED_CHIP
 
 
 def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
@@ -114,12 +117,22 @@ def mtp_draft_path(vllm_config: VllmConfig) -> bool:
     (_is_calibrated); any other Qwen3.5 engine keeps main's opt-in keys.
     Read once at engine and drafter start, not per step."""
     spec = vllm_config.speculative_config
-    return (
-        spec is not None
-        and spec.method == "mtp"
-        and settings.is_qwen3_5(vllm_config.model_config)
-        and _is_calibrated(vllm_config.model_config)
-    )
+    model_config = vllm_config.model_config
+    if (
+        spec is None
+        or spec.method != "mtp"
+        or not settings.is_qwen3_5(model_config)
+        or not has_calibrated_shape(model_config)
+    ):
+        return False
+    chip = _chip_family()
+    if chip is None:
+        logger.warning_once(
+            "Qwen3.5 MTP: this checkpoint's draft-path defaults were validated "
+            "on TPU7x, but this host's TPU chip is unknown (is "
+            "TPU_ACCELERATOR_TYPE set?), so they stay off."
+        )
+    return chip == _CALIBRATED_CHIP
 
 
 def apply_serving_defaults(vllm_config: VllmConfig) -> None:
