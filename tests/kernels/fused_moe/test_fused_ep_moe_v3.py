@@ -101,8 +101,9 @@ def _world(experts, real, routing, seed=0, shards=D, hidden=H, inter=INTER):
     x = (rng.standard_normal((tokens, hidden)) / 10).astype(np.float32)
     logits = rng.standard_normal((tokens, experts)).astype(np.float32)
     if routing == "hot":
-        # Every token picks experts 0..K-1, all on shard 0: one shard receives
-        # every row, the others none.
+        # Every token picks experts 0..K-1, which sit on the first shards
+        # (two of them with 2 experts a shard): those receive every row, the
+        # others none.
         logits[:, :K] += 20.0
     w1f = rng.standard_normal((experts, hidden, 2 * inter)).astype(np.float32) / 10
     w2f = rng.standard_normal((experts, inter, hidden)).astype(np.float32) / 10
@@ -700,6 +701,36 @@ def test_the_layer_refuses_a_caller_routing(one_cpu_shard):
     routing = (jnp.zeros((32, 2), jnp.int32), jnp.ones((32, 2), jnp.float32))
     with pytest.raises(NotImplementedError, match="caller's routing"):
         one_cpu_shard(routing=routing)
+
+
+@pytest.mark.cpu_test
+def test_experts_that_do_not_split_over_the_shards_are_refused():
+    """Without experts_per_shard, the weights' experts must split evenly over
+    the shards: 7 experts cannot go over 2."""
+    import types
+
+    import jax
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, fused_ep_moe
+    from vllm_torchtpu.kernels.fused_moe.v3.rowquant import FP8
+
+    tokens, hidden, inter, experts = 32, 256, 128, 7
+    mesh = types.SimpleNamespace(axis_names=(MESH_AXIS,), shape={MESH_AXIS: 2})
+    abstract = jax.ShapeDtypeStruct
+    with pytest.raises(ValueError, match="7 experts do not split evenly over 2"):
+        fused_ep_moe(
+            abstract((tokens, hidden), jnp.bfloat16),
+            abstract((experts, hidden, 2 * inter), FP8),
+            abstract((experts, inter, hidden), FP8),
+            abstract((experts, 2 * inter), jnp.float32),
+            abstract((experts, hidden), jnp.float32),
+            abstract((tokens, experts), jnp.float32),
+            top_k=2,
+            renormalize=True,
+            mesh=mesh,
+            tile_rows=TILE_ROWS,
+        )
 
 
 @pytest.mark.cpu_test
