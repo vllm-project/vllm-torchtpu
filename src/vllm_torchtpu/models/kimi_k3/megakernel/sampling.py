@@ -225,6 +225,7 @@ def uniforms(seed: jax.Array, position: jax.Array, rows: int) -> jax.Array:
 def sample_rows(local_logits, temperature, top_p, top_k, seeds, positions) -> jax.Array:
     """``[rows]`` int32: row r drawn from its own distribution (per-row
     ``temperature > 0``, ``top_p``, ``top_k``, ``seeds``, ``positions``)."""
+    (dspark,) = kernel_modules("dspark")
     accept = _nucleus_accept()
     values, ids, lse = _candidates(local_logits, temperature, top_k)
     # [rows, 1, 2]
@@ -234,13 +235,15 @@ def sample_rows(local_logits, temperature, top_p, top_k, seeds, positions) -> ja
 
     def one(values, ids, lse, top_p, draw):
         _, token = accept(
-            values[None],
-            ids[None],
-            lse[None],
-            jnp.full((1,), -1, jnp.int32),
-            jnp.int32(0),
-            top_p,
-            draw,
+            dspark.NucleusAcceptInputs(
+                values=values[None],
+                ids=ids[None],
+                lse=lse[None],
+                drafts=jnp.full((1,), -1, jnp.int32),
+                forced_count=jnp.int32(0),
+                top_p=top_p,
+                uniforms=draw,
+            )
         )
         return token
 
@@ -254,6 +257,7 @@ def accept_rows(
     draft verified at row k (-1: none), scalar sampling parameters,
     ``forced_count >= 0`` to fix the count (the bonus then from row count)."""
     rows = local_logits.shape[0]
+    (dspark,) = kernel_modules("dspark")
     accept = _nucleus_accept()
     values, ids, lse = _candidates(
         local_logits,
@@ -261,7 +265,15 @@ def accept_rows(
         jnp.full((rows,), top_k, jnp.int32),
     )
     return accept(
-        values, ids, lse, drafts, forced_count, top_p, uniforms(seed, position, rows)
+        dspark.NucleusAcceptInputs(
+            values=values,
+            ids=ids,
+            lse=lse,
+            drafts=drafts,
+            forced_count=forced_count,
+            top_p=top_p,
+            uniforms=uniforms(seed, position, rows),
+        )
     )
 
 
@@ -274,6 +286,7 @@ def accept_batched(
     batches and other shapes use the replicated candidate exchange.
     """
     requests, rows, width = local_logits.shape
+    (dspark,) = kernel_modules("dspark")
     if (
         1 < requests <= TP_SIZE
         and TP_SIZE % requests == 0
@@ -283,13 +296,15 @@ def accept_batched(
         values, ids, lse = _request_candidates(local_logits, temperature, top_k)
         request = jax.lax.axis_index(AXIS) % requests
         count, bonus = _nucleus_accept()(
-            values,
-            ids,
-            lse,
-            drafts[request],
-            forced_count[request],
-            top_p[request],
-            uniforms(seed[request], position[request], rows),
+            dspark.NucleusAcceptInputs(
+                values=values,
+                ids=ids,
+                lse=lse,
+                drafts=drafts[request],
+                forced_count=forced_count[request],
+                top_p=top_p[request],
+                uniforms=uniforms(seed[request], position[request], rows),
+            )
         )
         decisions = jax.lax.all_gather(jnp.stack((count, bonus)), AXIS)[:requests]
         return decisions[:, 0], decisions[:, 1]
@@ -300,13 +315,15 @@ def accept_batched(
     )
     draws = jax.vmap(lambda seed, pos: uniforms(seed, pos, rows))(seed, position)
     return jax.vmap(_nucleus_accept())(
-        values.reshape(requests, rows, -1),
-        ids.reshape(requests, rows, -1),
-        lse.reshape(requests, rows),
-        drafts,
-        forced_count,
-        top_p,
-        draws,
+        dspark.NucleusAcceptInputs(
+            values=values.reshape(requests, rows, -1),
+            ids=ids.reshape(requests, rows, -1),
+            lse=lse.reshape(requests, rows),
+            drafts=drafts,
+            forced_count=forced_count,
+            top_p=top_p,
+            uniforms=draws,
+        )
     )
 
 

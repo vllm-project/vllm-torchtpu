@@ -108,7 +108,14 @@ class PrefillRing:
 
         def gather(fc, kv, kvnorm, hidden_norm):  # [1, ...]: this rank's shards
             out = self.dspark.ring_weights_from_shards(
-                c, fc[0], kv[0], kvnorm[0], hidden_norm[0], axis
+                c,
+                self.dspark.DsparkRingWeightShards(
+                    fc=fc[0],
+                    kv=kv[0],
+                    kvnorm=kvnorm[0],
+                    hidden_norm=hidden_norm[0],
+                ),
+                axis,
             )
             return tuple(out[name] for name in ("fc", "kv", "k_norm", "hidden_norm"))
 
@@ -204,12 +211,14 @@ class PrefillRing:
                 after, at = dspark.prefill_ring_update(
                     c,
                     weights,
-                    aux,
-                    positions,
-                    sequences,
-                    jnp.stack([cache[0] for cache in caches]),
-                    ends,
-                    stops,
+                    dspark.DsparkRingUpdateSpec(
+                        aux=aux,
+                        positions=positions,
+                        sequences=sequences,
+                        rings=jnp.stack([cache[0] for cache in caches]),
+                        ends=ends,
+                        stops=stops,
+                    ),
                     axis,
                 )
                 firsts = [meta[1] for meta in metas]
