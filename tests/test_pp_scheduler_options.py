@@ -497,6 +497,25 @@ def test_promotion_and_sort_run_when_their_flags_are_set():
     assert calls == [("sort", True), ("promote", True)]
 
 
+def test_a_failing_sort_turns_the_sort_off_and_the_step_still_schedules():
+    s = _sched(_paw_sort=True, _prefix_aware=True)
+
+    def failing_sort():
+        raise RuntimeError("simulated sort failure")
+
+    s._sort_waiting_queue = failing_sort
+    with (
+        patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP) as base,
+        patch.object(pp_chunk_scheduler.logger, "exception") as log,
+    ):
+        s.schedule()
+        s.schedule()
+    assert s._paw_sort is False
+    assert base.call_count == 2
+    log.assert_called_once()
+    assert "waiting-queue sort failed" in log.call_args.args[0]
+
+
 def test_without_prefix_aware_the_local_hit_is_the_base_schedulers():
     seen = []
 
