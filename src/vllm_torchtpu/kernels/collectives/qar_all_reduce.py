@@ -585,3 +585,250 @@ def all_reduce_v1b(x: jax.Array, me: jax.Array, tab: np.ndarray) -> jax.Array:
         full = put_both(full, pos - i, pos + i, q_cw, s_cw, q_cc, s_cc)
     full = _d2d_ag_full_call(t, h)(rank, tab_j, full)
     return full[:rows]
+
+
+# --------------------------------------------------------------------------
+# v2: one fused call. The rows split into two halves that run the same
+# algorithm interleaved, so one half's remote DMA is in flight while the other
+# half's dequantize / add / quantize (an emit_pipeline over 256-row tiles)
+# runs. Every ring step has its own receive buffer: nothing is reused, so no
+# credits are needed, only one receive semaphore per buffer. Bits are v0's.
+def _rs_body(with_prev: bool, with_put: bool):
+    def body(*refs):
+        x_cw, r_cw, x_cc, r_cc = refs[:4]
+        rest = refs[4:]
+        if with_prev:
+            pq_cw, ps_cw, pq_cc, ps_cc = rest[:4]
+            rest = rest[4:]
+        q_cw, s_cw, q_cc, s_cc = rest[:4]
+        a_cw = x_cw[...].astype(F32) + r_cw[...].astype(F32)
+        a_cc = x_cc[...].astype(F32) + r_cc[...].astype(F32)
+        if with_prev:
+            a_cw = a_cw + _deq_tile(pq_cw[...], ps_cw[...])
+            a_cc = a_cc + _deq_tile(pq_cc[...], ps_cc[...])
+        qa, sa = _quant_tile(a_cw)
+        qb, sb = _quant_tile(a_cc)
+        q_cw[...], s_cw[...], q_cc[...], s_cc[...] = qa, sa, qb, sb
+        if with_put:
+            f_cw, f_cc = rest[4:6]
+            f_cw[...] = _deq_tile(qa, sa).astype(BF16)
+            f_cc[...] = _deq_tile(qb, sb).astype(BF16)
+
+    return body
+
+
+def _put_body(q_cw, s_cw, q_cc, s_cc, f_cw, f_cc):
+    f_cw[...] = _deq_tile(q_cw[...], s_cw[...]).astype(BF16)
+    f_cc[...] = _deq_tile(q_cc[...], s_cc[...]).astype(BF16)
+
+
+@functools.cache
+def _fused_call(t: int, h: int):
+    hh = h // 2
+    w = hh // 8
+    th = t // 2  # rows per half
+    nt = th // _TILE  # tiles per half
+    sr = _TILE // QROWS
+    nbuf = 3 * 2 * 2  # (step, direction, half)
+
+    def slot(i, d, hf):
+        return (i * 2 + d) * 2 + hf
+
+    def kernel(rank_ref, tab_ref, x_ref, full, recv, sq, ss, rq, rs, fq, fs, aq, as_,
+               d2d_send, d2d_recv, rs_send, rs_recv, ag_send, ag_recv, fin_send, fin_recv):
+        me = rank_ref[0]
+        core = tab_ref[CORE, me]
+        pos = tab_ref[POS, me]
+        sib = tab_ref[SIB, me]
+        peer = (tab_ref[CW_NEXT, me], tab_ref[CW_PREV, me])
+        barrier = pltpu.get_barrier_semaphore()
+        for dv in range(_N):
+            pl.semaphore_signal(barrier, 1, device_id=(dv,), device_id_type=_MESH)
+        pl.semaphore_wait(barrier, _N)
+
+        def rows(hf):
+            return pl.ds(hf * th, th)
+
+        def remote(src, dst, ssem, rsem, dev):
+            return pltpu.make_async_remote_copy(src, dst, ssem, rsem, device_id=(dev,),
+                                                device_id_type=_MESH)
+
+        # 1. d2d reduce-scatter of both halves (x's other column half, strided).
+        other = pl.ds(pl.multiple_of((1 - core) * hh, 128), hh)
+        d2d = [remote(x_ref.at[rows(hf), other], recv.at[rows(hf)], d2d_send.at[hf],
+                      d2d_recv.at[hf], sib) for hf in range(2)]
+        for c in d2d:
+            c.start()
+
+        def kblk(d, k):  # chunk k of direction d: column block in units of w
+            return d * 4 + lax.rem(k + 8, 4)
+
+        def tile_spec(base_blk, col_blk, rows_per=_TILE):
+            return pl.BlockSpec((rows_per, w), lambda r: (base_blk + r, col_blk))
+
+        def buf_q(i, d, hf):
+            return slot(i, d, hf) * nt
+
+        def buf_s(i, d, hf):
+            return slot(i, d, hf) * nt
+
+        sends = list(d2d)
+        rs_copies = {}
+
+        def rs_copy(i, d, hf):
+            j = slot(i, d, hf)
+            qs = pl.ds(j * th, th)
+            ssl = pl.ds(j * (th // QROWS), th // QROWS)
+            return (remote(sq.at[qs], rq.at[qs], rs_send.at[2 * j], rs_recv.at[2 * j], peer[d]),
+                    remote(ss.at[ssl], rs.at[ssl], rs_send.at[2 * j + 1], rs_recv.at[2 * j + 1], peer[d]))
+
+        # 2. ring reduce-scatter, interleaved over the halves.
+        for i in range(4):
+            for hf in range(2):
+                if i == 0:
+                    d2d[hf].wait_recv()
+                else:
+                    for d in range(2):
+                        for c in rs_copies[(i - 1, d, hf)]:
+                            c.wait_recv()
+                k = (pos - i, pos + i)  # chunk index per direction at this step
+                hb = hf * nt
+                in_specs = [tile_spec(hb, core * 8 + kblk(0, k[0])), tile_spec(hb, kblk(0, k[0])),
+                            tile_spec(hb, core * 8 + kblk(1, k[1])), tile_spec(hb, kblk(1, k[1]))]
+                args = [x_ref, recv, x_ref, recv]
+                if i > 0:
+                    for d in range(2):
+                        j = slot(i - 1, d, hf)
+                        in_specs += [pl.BlockSpec((_TILE, w), lambda r, j=j: (j * nt + r, 0)),
+                                     pl.BlockSpec((sr, w), lambda r, j=j: (j * nt + r, 0))]
+                        args += [rq, rs]
+                if i < 3:
+                    out_specs, outs = [], []
+                    for d in range(2):
+                        j = slot(i, d, hf)
+                        out_specs += [pl.BlockSpec((_TILE, w), lambda r, j=j: (j * nt + r, 0)),
+                                      pl.BlockSpec((sr, w), lambda r, j=j: (j * nt + r, 0))]
+                        outs += [sq, ss]
+                else:
+                    out_specs, outs = [], []
+                    for d in range(2):
+                        j = d * 2 + hf
+                        out_specs += [pl.BlockSpec((_TILE, w), lambda r, j=j: (j * nt + r, 0)),
+                                      pl.BlockSpec((sr, w), lambda r, j=j: (j * nt + r, 0))]
+                        outs += [fq, fs]
+                    out_specs += [tile_spec(hb, core * 8 + kblk(0, k[0])),
+                                  tile_spec(hb, core * 8 + kblk(1, k[1]))]
+                    outs += [full, full]
+                pltpu.emit_pipeline(_rs_body(i > 0, i == 3), grid=(nt,), in_specs=in_specs,
+                                    out_specs=out_specs)(*args, *outs)
+                if i < 3:
+                    for d in range(2):
+                        rs_copies[(i, d, hf)] = rs_copy(i, d, hf)
+                        for c in rs_copies[(i, d, hf)]:
+                            c.start()
+                        sends += list(rs_copies[(i, d, hf)])
+                else:  # owned chunk quantized once: start the all-gather
+                    for d in range(2):
+                        j = d * 2 + hf
+                        qs = pl.ds(j * th, th)
+                        ssl = pl.ds(j * (th // QROWS), th // QROWS)
+                        g = slot(0, d, hf)
+                        gq = pl.ds(g * th, th)
+                        gs = pl.ds(g * (th // QROWS), th // QROWS)
+                        cq = remote(fq.at[qs], aq.at[gq], fin_send.at[2 * j], ag_recv.at[2 * g], peer[d])
+                        cs = remote(fs.at[ssl], as_.at[gs], fin_send.at[2 * j + 1], ag_recv.at[2 * g + 1], peer[d])
+                        cq.start()
+                        cs.start()
+                        sends += [cq, cs]
+
+        # 3. ring all-gather: receive, forward unchanged, put in place.
+        def ag_pair(g, d, hf, dev, ssem_base):
+            gq = pl.ds(g * th, th)
+            gs = pl.ds(g * (th // QROWS), th // QROWS)
+            return (remote(aq.at[gq], aq.at[gq], ssem_base.at[2 * g], ag_recv.at[2 * g], dev),
+                    remote(as_.at[gs], as_.at[gs], ssem_base.at[2 * g + 1], ag_recv.at[2 * g + 1], dev))
+
+        fin_sends = []
+        for jstep in range(3):
+            for hf in range(2):
+                for d in range(2):
+                    g = slot(jstep, d, hf)
+                    for c in ag_pair(g, d, hf, peer[d], ag_send):
+                        c.wait_recv()
+                    if jstep < 2:  # forward the same bytes into the next ring slot
+                        g2 = slot(jstep + 1, d, hf)
+                        src_q = pl.ds(g * th, th)
+                        src_s = pl.ds(g * (th // QROWS), th // QROWS)
+                        dst_q = pl.ds(g2 * th, th)
+                        dst_s = pl.ds(g2 * (th // QROWS), th // QROWS)
+                        fq_ = remote(aq.at[src_q], aq.at[dst_q], ag_send.at[2 * g], ag_recv.at[2 * g2], peer[d])
+                        fs_ = remote(as_.at[src_s], as_.at[dst_s], ag_send.at[2 * g + 1], ag_recv.at[2 * g2 + 1], peer[d])
+                        fq_.start()
+                        fs_.start()
+                        sends += [fq_, fs_]
+                k = (pos - jstep, pos + jstep)
+                hb = hf * nt
+                gs_ = [slot(jstep, d, hf) for d in range(2)]
+                in_specs = []
+                for g in gs_:
+                    in_specs += [pl.BlockSpec((_TILE, w), lambda r, g=g: (g * nt + r, 0)),
+                                 pl.BlockSpec((sr, w), lambda r, g=g: (g * nt + r, 0))]
+                out_specs = [tile_spec(hb, core * 8 + kblk(0, k[0])),
+                             tile_spec(hb, core * 8 + kblk(1, k[1]))]
+                pltpu.emit_pipeline(_put_body, grid=(nt,), in_specs=in_specs,
+                                    out_specs=out_specs)(aq, as_, aq, as_, full, full)
+                if jstep == 2:  # half done: 4. d2d all-gather of this half
+                    mine = pl.ds(pl.multiple_of(core * hh, 128), hh)
+                    c = remote(full.at[rows(hf), mine], full.at[rows(hf), mine],
+                               fin_send.at[8 + hf], fin_recv.at[hf], sib)
+                    c.start()
+                    sends.append(c)
+                    fin_sends.append(c)
+        for c in fin_sends:
+            c.wait_recv()
+        for c in sends:
+            c.wait_send()
+
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    outs = (
+        jax.ShapeDtypeStruct((t, h), BF16),                      # full
+        jax.ShapeDtypeStruct((t, hh), BF16),                     # recv (d2d)
+        jax.ShapeDtypeStruct((nbuf * th, w), I8),                # sq
+        jax.ShapeDtypeStruct((nbuf * th // QROWS, w), F32),      # ss
+        jax.ShapeDtypeStruct((nbuf * th, w), I8),                # rq
+        jax.ShapeDtypeStruct((nbuf * th // QROWS, w), F32),      # rs
+        jax.ShapeDtypeStruct((4 * th, w), I8),                   # fq (owned, per (d, hf))
+        jax.ShapeDtypeStruct((4 * th // QROWS, w), F32),         # fs
+        jax.ShapeDtypeStruct((nbuf * th, w), I8),                # aq (all-gather slots)
+        jax.ShapeDtypeStruct((nbuf * th // QROWS, w), F32),      # as
+    )
+    return pl.pallas_call(
+        kernel,
+        out_shape=outs,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[hbm],
+            out_specs=[hbm] * len(outs),
+            scratch_shapes=[
+                pltpu.SemaphoreType.DMA((2,)), pltpu.SemaphoreType.DMA((2,)),          # d2d rs
+                pltpu.SemaphoreType.DMA((2 * nbuf,)), pltpu.SemaphoreType.DMA((2 * nbuf,)),  # rs
+                pltpu.SemaphoreType.DMA((2 * nbuf,)), pltpu.SemaphoreType.DMA((2 * nbuf,)),  # ag
+                pltpu.SemaphoreType.DMA((10,)), pltpu.SemaphoreType.DMA((2,)),          # owned AG start + d2d ag
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID, has_side_effects=True),
+        name=f"qar_fused-t_{t}-h_{h}",
+    )
+
+
+def all_reduce_v2(x: jax.Array, me: jax.Array, tab: np.ndarray) -> jax.Array:
+    """v2 of `all_reduce` (TPU only): one fused call, two interleaved row halves."""
+    rows, h = x.shape
+    if h % (2 * 2 * 4 * 128):
+        raise ValueError(f"hidden {h} must split into 16 lane-aligned chunks")
+    t = -(-rows // (2 * _TILE)) * (2 * _TILE)
+    if t != rows:
+        x = jnp.pad(x, ((0, t - rows), (0, 0)))
+    rank = me.reshape(1).astype(jnp.int32)
+    full = _fused_call(t, h)(rank, jnp.asarray(tab), x)[0]
+    return full[:rows]
