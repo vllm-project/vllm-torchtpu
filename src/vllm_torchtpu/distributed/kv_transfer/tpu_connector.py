@@ -6509,19 +6509,25 @@ class TPURaidenConnectorWorker:
                 elif req_id in self._stage3_controller_accepted:
                     states[req_id] = "accepted"
         states = cast(dict[str, str], get_tp_group().broadcast_object(states, src=0))
-        for req_id, state in states.items():
-            self._stage3_tp_submits.remove(req_id)
-            if self.tp_rank == 0:
-                continue
-            self._stage3_inflight_submits.remove(req_id)
-            if state == "failed":
-                self._record_stage3_load_failure(req_id, self._load_block_ids[req_id])
-            else:
-                self._stage3_controller_accepted.add(req_id)
-                if state == "uncertain":
-                    self._stage3_pending_controller_failures[req_id] = (
-                        time.time() + float(dist_utils.get_p2p_wait_pull_timeout())
+        # The late poll (async output thread) reads these tables under the
+        # receive lock; a follower must not let it see a load accepted before
+        # its deadline is set, or the deadline set after the report fails it.
+        with self._stage3_poll_lock:
+            for req_id, state in states.items():
+                self._stage3_tp_submits.remove(req_id)
+                if self.tp_rank == 0:
+                    continue
+                self._stage3_inflight_submits.remove(req_id)
+                if state == "failed":
+                    self._record_stage3_load_failure(
+                        req_id, self._load_block_ids[req_id]
                     )
+                else:
+                    self._stage3_controller_accepted.add(req_id)
+                    if state == "uncertain":
+                        self._stage3_pending_controller_failures[req_id] = (
+                            time.time() + float(dist_utils.get_p2p_wait_pull_timeout())
+                        )
 
     def _drain_stage3_pending_submits(self, finished_req_ids: set[str] | None) -> None:
         """Re-attempts parked Stage-3 loads once per scheduler step, paced
