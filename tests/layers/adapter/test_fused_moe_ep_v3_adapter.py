@@ -204,19 +204,27 @@ def test_an_ep_mesh_index_outside_the_mesh_is_refused(armed):
     assert v3._OP is None and v3._RANK_BUFFER is None
 
 
-def test_the_batch_floor_counts_one_scheduler_batch_per_dp_rank(armed, monkeypatch):
+@pytest.mark.parametrize(("ep", "tp"), [(2, 2), (8, 2), (8, 8)])
+def test_the_batch_floor_counts_one_scheduler_batch_per_dp_rank(
+    armed, monkeypatch, ep, tp
+):
     """Under TP with sequence parallelism the TP ranks of a DP rank split one
-    scheduler batch, so the batch floor sees ep // tp batches, not ep."""
+    scheduler batch, so the batch floor sees ep // tp batches, not ep: 4 at
+    DP4 x TP2 (EP 8), 1 at TP8 (EP 8)."""
     from vllm_torchtpu.layers.adapter import sequence_parallel
 
     batches = []
     monkeypatch.setattr(v3, "_max_node_tokens", lambda n: batches.append(n) or 4096)
-    monkeypatch.setattr(v3, "_tensor_parallel_size", lambda: 2)
+    monkeypatch.setattr(v3, "_tensor_parallel_size", lambda: tp)
     monkeypatch.setattr(sequence_parallel, "enabled", lambda: True)
+    monkeypatch.setattr(
+        v3, "build_ep_mesh", lambda: SimpleNamespace(shape={v3.EP_AXIS_NAME: ep})
+    )
     layer = _layer(slots=4)
+    layer.global_num_experts = 4 * ep
     layer.moe_config.is_sequence_parallel = True
     assert _prebuild(layer)
-    assert batches == [EP // 2]
+    assert batches == [ep // tp]
 
 
 @pytest.mark.parametrize(
