@@ -138,6 +138,7 @@ class AsyncTPUCopyState:
         `expected_positions`: its KV was written at the wrong position."""
         assert len(expected_positions) == num_reqs <= layout.num_rows
         packed_cpu = packed_tpu.to("cpu", non_blocking=True)
+        # pyrefly: ignore[missing-attribute]
         copy_ready_event = torch.tpu.Event()
         copy_ready_event.record()
         return cls(
