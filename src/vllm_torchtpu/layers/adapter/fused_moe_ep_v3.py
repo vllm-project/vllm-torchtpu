@@ -47,8 +47,8 @@ these export and padding constraints:
 - with padding skipped (`TPU_MOE_SKIP_PADDED_TOKENS`), each rank's valid-row
   count is the kernel's `valid_tokens` operand: the select kernel routes a
   row past it nowhere and the transport zeroes its input row, so nothing of
-  it travels, and the kernel returns zero for it. A rank with no valid rows
-  still takes part in every collective.
+  it travels; its output row is padding the caller drops, with no defined
+  value. A rank with no valid rows still takes part in every collective.
 
 PyTorch/XLA custom-op adapter bridging vLLM FusedMoE layers to the Pallas Fused
 EP v3 pipeline.
