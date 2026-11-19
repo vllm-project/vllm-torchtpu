@@ -335,16 +335,16 @@ def test_every_request_row_matches_the_known_answer(monkeypatch, num_spec):
 
 
 @pytest.mark.parametrize(
-    ("flaw", "num_spec", "message"),
+    ("flaw", "num_spec", "error", "message"),
     [
-        ("zero_rejected", 3, "capture moved backwards"),
-        ("padded_rows", 0, "took .* rows for a step of"),
-        ("no_wait", 0, "known answer"),
-        ("vllm_capturer", 0, r"routed-experts table of \(0, "),
+        ("zero_rejected", 3, AssertionError, "capture moved backwards"),
+        ("padded_rows", 0, AssertionError, "took .* rows for a step of"),
+        ("no_wait", 0, AssertionError, "known answer"),
+        ("vllm_capturer", 0, RuntimeError, "did not write expert ids"),
     ],
 )
-def test_a_flawed_step_fails(monkeypatch, flaw, num_spec, message):
+def test_a_flawed_step_fails(monkeypatch, flaw, num_spec, error, message):
     """Each way a step can go wrong fails a check: the known-answer check,
     or one of the capture's own."""
-    with pytest.raises(AssertionError, match=message):
+    with pytest.raises(error, match=message):
         _assert_known_rows(_serve(monkeypatch, 0, num_spec, flaw))

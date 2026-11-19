@@ -13,6 +13,7 @@
 # limitations under the License.
 """Routed-experts capture (`--enable-return-routed-experts`) in TPU steps."""
 
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -119,10 +120,19 @@ def _reject_uncapturable_layers(model: torch.nn.Module) -> None:
 
 def _moe_layer_ids(model: torch.nn.Module) -> list[int]:
     """Returns the ids of the MoE layers, sorted, as the forward runs its
-    layers in the order of their ids."""
-    return sorted(
+    layers in the order of their ids. Each layer writes the table column of
+    its id, so the ids must differ."""
+    layer_ids = [
         module.layer_id for module in model.modules() if isinstance(module, MoERunner)
-    )
+    ]
+    shared = sorted(layer_id for layer_id, n in Counter(layer_ids).items() if n > 1)
+    if shared:
+        raise ValueError(
+            "--enable-return-routed-experts needs a distinct layer id for each "
+            f"MoE layer, but several MoE layers have ids {shared}. They would "
+            "write the same column of the routed-experts table."
+        )
+    return sorted(layer_ids)
 
 
 @dataclass
@@ -180,6 +190,16 @@ class RoutedExpertsCapture:
             vllm_config, moe_layer_ids, copies_to_host=get_tp_group().is_first_rank
         )
         use_capturer(self._connector, model, self._capturer)
+
+    def check_forward(self, num_padded_tokens: int) -> None:
+        """Checks that the warmup forward that just ran wrote every MoE
+        layer's expert ids, so a compiled forward without some hooks fails the
+        start instead of returning zeros for those layers.
+
+        Args:
+            num_padded_tokens: the forward's token bucket.
+        """
+        self._capturer.check_forward(num_padded_tokens)
 
     def begin_step(self, metadata: AuxOutputConnectorMetadata | None) -> None:
         self._connector.begin_step(metadata)
