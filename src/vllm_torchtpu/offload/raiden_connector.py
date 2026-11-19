@@ -888,7 +888,24 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             return None
         if req_status.transfer_jobs:
             return (num_local // block_size) * block_size
+        # The local-hit lookup can run before the step's first connector hook
+        # opens schedule()'s region; outside it the probes hold the manager.
+        if self._step_region is None:
+            with self._manager_locked():
+                return self._resolve_divergent_hit(
+                    req_status, num_local, num_reconciled, block_size
+                )
+        return self._resolve_divergent_hit(
+            req_status, num_local, num_reconciled, block_size
+        )
 
+    def _resolve_divergent_hit(
+        self,
+        req_status: Any,
+        num_local: int,
+        num_reconciled: int,
+        block_size: int,
+    ) -> int | None:
         req_status.update_offload_keys()
         fa_aligned = (num_local // block_size) * block_size
         reconciled_aligned = (num_reconciled // block_size) * block_size

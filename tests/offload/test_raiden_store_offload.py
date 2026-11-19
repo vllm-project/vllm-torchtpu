@@ -56,6 +56,7 @@ physical TPU hardware or native C++ wheels:
      ends where it holds the recurrent state, and is 0 without it.
 """
 
+import contextlib
 import enum
 import os
 import sys
@@ -4916,6 +4917,8 @@ class TestResolveDivergentLocalHit(unittest.TestCase):
 
         sched = object.__new__(TPURaidenOffloadingScheduler)
         sched._events_tracker = MagicMock()
+        # vLLM's default manager lock, which RaidenOffloadingManager keeps.
+        sched.manager = SimpleNamespace(lock=contextlib.nullcontext())
         req_status = SimpleNamespace(
             transfer_jobs=set(transfer_jobs),
             update_offload_keys=MagicMock(),
@@ -4967,6 +4970,26 @@ class TestResolveDivergentLocalHit(unittest.TestCase):
                 self.assertEqual(seen, starts)
                 sched._events_tracker.record_lookup.assert_not_called()
                 sched._req_status["r"].update_offload_keys.assert_called_once()
+
+    def test_the_probes_hold_the_manager_outside_the_step_region(self):
+        entered: list[bool] = []
+
+        class Lock:
+            def __enter__(self):
+                entered.append(True)
+
+            def __exit__(self, *exc):
+                return False
+
+        sched, seen = self._sched({8: 4})
+        sched.manager = SimpleNamespace(lock=Lock())
+        self.assertEqual(self._resolve(sched, 10, 4), 8)
+        self.assertEqual(entered, [True])
+        # Inside schedule()'s region, which already holds the manager, the
+        # probes run without entering the lock again.
+        sched._step_region = object()
+        self.assertEqual(self._resolve(sched, 10, 4), 8)
+        self.assertEqual(entered, [True])
 
     def test_a_request_with_a_transfer_in_flight_keeps_its_aligned_hit(self):
         sched, seen = self._sched({8: 4}, transfer_jobs=[3])
