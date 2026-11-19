@@ -121,6 +121,20 @@ steps:
             tests/models/vllm/test_dsv41_projection_rope.py
             -q --junitxml=perf_eval_results/dsv41-projection-rope.xml
 
+      - label: "DeepSeek-V4.1 candidate metadata: SparseCore parity and publication order"
+        key: "dsv41_candidate_metadata"
+        <<: *tpu_step
+        env:
+          SHAPE: *shape_2_core
+        plugins:
+          - *kube_plugin
+        commands:
+          - >-
+            .buildkite/kubernetes/run.sh python -m pytest
+            tests/kernels/deepseek_v41/test_fp8_candidate_metadata.py
+            tests/models/vllm/test_dsv41_v2_attn_kernels_indexer.py
+            -q --junitxml=perf_eval_results/dsv41-candidate-metadata.xml
+
       # One pod for both checks: the CPU-only config test needs the image, not
       # another chip from the queue.
       - label: "DeepSeek-V4.1 SWA: shared windows and guard fallback"

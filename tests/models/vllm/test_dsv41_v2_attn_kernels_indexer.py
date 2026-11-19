@@ -428,11 +428,11 @@ class TestSelectIndicesJax:
         assert selected.shape == (count, 16)
         # Verify published candidate IDs are valid block IDs or -1
         assert np.all(np.asarray(published) < blocks)
-        # Verify the last block was marked jnp.inf and therefore published first
-        last_block = ((lengths - 1) // block_size)[:, None]
-        np.testing.assert_array_equal(
-            np.asarray(published[:, 0:1]), np.asarray(last_block)
-        )
+        # Rows ascend with -1 suffix padding and hold the forced newest block.
+        for row, length in zip(np.asarray(published), np.asarray(lengths)):
+            live = row[row >= 0]
+            assert np.all(row[live.size :] == -1) and np.all(np.diff(live) > 0)
+            assert (length - 1) // block_size in live
 
         # SparseCore candidate_write fast path: unordered=True, blocks >= 2048,
         # blocks % 16 == 0, cand_k % 16 == 0
