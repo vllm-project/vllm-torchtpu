@@ -38,6 +38,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
@@ -618,6 +619,27 @@ def _kernel_v3(
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
 
 
+def hoist_metadata_enabled() -> bool:
+    """TPU_MINIMAX_M3_INDEXER_HOIST_METADATA (read at trace time):
+    `block_scores` steps that pick their large class under a `lax.cond`
+    (decode-sized buckets with a prefill chunk) compute the large class's
+    tiles, work list and columns and every row's gather column outside the
+    cond. Outside a cond the metadata is the same expression of the step's
+    inputs in every layer and XLA CSEs it to one computation per step;
+    inside, each layer's branch recomputed it (c48 512-token mixed step:
+    77 us per layer, j-f5a8745c). Same scores."""
+    return bool(envs.TPU_MINIMAX_M3_INDEXER_HOIST_METADATA)
+
+
+def row_gather_enabled() -> bool:
+    """TPU_MINIMAX_M3_INDEXER_ROW_GATHER (read at trace time): with
+    token-major small scores, a step's rows come from a row gather of the
+    small class and a column gather of the large class only, selected per
+    row, instead of transposing the small class into one concatenated column
+    gather (a [P, columns] f32 copy and pad per layer). Same scores."""
+    return bool(envs.TPU_MINIMAX_M3_INDEXER_ROW_GATHER)
+
+
 def lookup(table: jax.Array, index: jax.Array) -> jax.Array:
     """``table[index]`` for a small per-request table and in-range `index`
     (an out-of-range one reads 0), by a one-hot over its entries: XLA lowers
@@ -669,9 +691,25 @@ class ClassScores(NamedTuple):
     tile_start: jax.Array  # [max_num_seqs] query row of its first tile
 
 
-def _class_scores(
-    index_q,
-    index_cache,
+class ClassMeta(NamedTuple):
+    """One tile class's metadata (`_class_meta`): a function of the step's
+    ragged batch (lengths, query layout) only, the same in every layer."""
+
+    tile_seq: jax.Array  # [tiles] request of each tile
+    tile_row0: jax.Array  # [tiles] query row of each tile's first column
+    first_tile: jax.Array  # [max_num_seqs] each request's first tile
+    tile_start: jax.Array  # [max_num_seqs] query row of its first tile
+    num_tiles: jax.Array  # tiles in use
+    tile_info: jax.Array  # [tiles] row << _ROW_SHIFT | request
+    work: jax.Array  # [tiles * groups] tile << _TILE_SHIFT | page group
+    num_work: jax.Array  # work entries in use
+    seq_pages: jax.Array  # [max_num_seqs] pages of each request
+    col: jax.Array  # [T] each query row's column
+
+
+def _class_meta(
+    num_tokens,
+    page_size,
     seq_lens,
     block_tables,
     cu_q_lens,
@@ -680,44 +718,15 @@ def _class_scores(
     block_q,
     max_tiles,
     pages_per_step,
-    kernel,
-    interpret,
-    token_major=False,
-    scale_cache=None,
-    scale_row=None,
-    q_pad=None,
-    fp8_q=False,
 ):
-    """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
-    column of each token (`ClassScores`); `token_major` (kernel v3) returns
-    them as ``[tiles * block_q, P]`` instead, so a token's scores are one row.
-    The query rows are padded by ``q_pad >= block_q`` rows (default
-    `block_q`): classes sharing it share one padded copy."""
-    num_tokens, _, head_dim = index_q.shape
-    _, rows_per_page, packing, _ = index_cache.shape
-    page_size = _page_tokens(rows_per_page, index_cache.dtype)
-    fp4 = scale_row is not None
-    if fp4 and kernel == "v1":
-        raise NotImplementedError("4-bit index caches need kernel v2 or v3")
+    """`_class_scores`' tiles, work list and token columns (`ClassMeta`)."""
     max_num_seqs = seq_lens.shape[0]
     pages_per_seq = block_tables.shape[0] // max_num_seqs
     num_groups_per_seq = -(-pages_per_seq // pages_per_step)
-    padded_pages = num_groups_per_seq * pages_per_step
 
     tile_seq, tile_row0, first_tile, tile_start, num_tiles = _tiles(
         cu_q_lens, seq_in_class, block_q, max_tiles
     )
-    # The kernel reads each tile's query rows straight from the token-ordered
-    # queries at an element offset (a gather of [tiles * block_q, D] cost
-    # ~0.5 ms per layer on an 8K prefill, twin j-52e2df18). Rows past a
-    # request's end read the next request's queries; their columns are never
-    # gathered back. f32 so that any row offset is a whole 32-bit row.
-    if max_num_seqs > _SEQ_MASK + 1:
-        raise NotImplementedError(
-            f"at most {_SEQ_MASK + 1} requests, got {max_num_seqs}"
-        )
-    q_pad = block_q if q_pad is None else q_pad
-    q_rows = jnp.pad(index_q[:, 0].astype(jnp.float32), ((0, q_pad), (0, 0)))
     tile_info = (
         jnp.clip(tile_row0, 0, num_tokens // _ROW_ALIGN * _ROW_ALIGN) << _ROW_SHIFT
     ) | tile_seq
@@ -746,6 +755,94 @@ def _class_scores(
     )
     work = (work_tile << _TILE_SHIFT) | jnp.clip(work_group, 0, _GROUP_MASK)
 
+    # Back to token order: token t of request r sits in r's tiles at its offset.
+    tok = jnp.arange(num_tokens, dtype=jnp.int32)
+    seq = jnp.minimum(
+        jnp.searchsorted(cu_q_lens[1:], tok, side="right", method="compare_all").astype(
+            jnp.int32
+        ),
+        max_num_seqs - 1,
+    )
+    offset = tok - lookup(tile_start, seq)
+    col = (lookup(first_tile, seq) + offset // block_q) * block_q + offset % block_q
+    col = jnp.clip(col, 0, max_tiles * block_q - 1)
+    return ClassMeta(
+        tile_seq,
+        tile_row0,
+        first_tile,
+        tile_start,
+        num_tiles,
+        tile_info,
+        work,
+        group_ends[-1],
+        seq_pages,
+        col,
+    )
+
+
+def _class_scores(
+    index_q,
+    index_cache,
+    seq_lens,
+    block_tables,
+    cu_q_lens,
+    seq_in_class,
+    *,
+    block_q,
+    max_tiles,
+    pages_per_step,
+    kernel,
+    interpret,
+    token_major=False,
+    scale_cache=None,
+    scale_row=None,
+    q_pad=None,
+    fp8_q=False,
+    meta=None,
+):
+    """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
+    column of each token (`ClassScores`); `token_major` (kernel v3) returns
+    them as ``[tiles * block_q, P]`` instead, so a token's scores are one row.
+    The query rows are padded by ``q_pad >= block_q`` rows (default
+    `block_q`): classes sharing it share one padded copy. `meta`
+    (`_class_meta` of the same arguments), when given, is used instead of
+    computing it here."""
+    num_tokens, _, head_dim = index_q.shape
+    _, rows_per_page, packing, _ = index_cache.shape
+    page_size = _page_tokens(rows_per_page, index_cache.dtype)
+    fp4 = scale_row is not None
+    if fp4 and kernel == "v1":
+        raise NotImplementedError("4-bit index caches need kernel v2 or v3")
+    max_num_seqs = seq_lens.shape[0]
+    pages_per_seq = block_tables.shape[0] // max_num_seqs
+    num_groups_per_seq = -(-pages_per_seq // pages_per_step)
+    padded_pages = num_groups_per_seq * pages_per_step
+
+    # The kernel reads each tile's query rows straight from the token-ordered
+    # queries at an element offset (a gather of [tiles * block_q, D] cost
+    # ~0.5 ms per layer on an 8K prefill, twin j-52e2df18). Rows past a
+    # request's end read the next request's queries; their columns are never
+    # gathered back. f32 so that any row offset is a whole 32-bit row.
+    if max_num_seqs > _SEQ_MASK + 1:
+        raise NotImplementedError(
+            f"at most {_SEQ_MASK + 1} requests, got {max_num_seqs}"
+        )
+    q_pad = block_q if q_pad is None else q_pad
+    q_rows = jnp.pad(index_q[:, 0].astype(jnp.float32), ((0, q_pad), (0, 0)))
+    if meta is None:
+        meta = _class_meta(
+            num_tokens,
+            page_size,
+            seq_lens,
+            block_tables,
+            cu_q_lens,
+            seq_in_class,
+            block_q=block_q,
+            max_tiles=max_tiles,
+            pages_per_step=pages_per_step,
+        )
+    tile_info, work, seq_pages = meta.tile_info, meta.work, meta.seq_pages
+
     def page_block(g):
         def index_map(w, work, tile_info, block_tables, *_):
             entry = work[w]
@@ -767,7 +864,7 @@ def _class_scores(
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=3,
         # One step even with no tile in the class; its scores are never read.
-        grid=(jnp.maximum(group_ends[-1], 1),),
+        grid=(jnp.maximum(meta.num_work, 1),),
         in_specs=[
             pl.BlockSpec(
                 (pl.Element(block_q), pl.Element(head_dim)),
@@ -858,28 +955,26 @@ def _class_scores(
             *([scale_cache] * (pages_per_step if fp4 else 0)),
         )
 
-    # Back to token order: token t of request r sits in r's tiles at its offset.
-    tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq = jnp.minimum(
-        jnp.searchsorted(cu_q_lens[1:], tok, side="right", method="compare_all").astype(
-            jnp.int32
-        ),
-        max_num_seqs - 1,
-    )
-    offset = tok - lookup(tile_start, seq)
-    col = (lookup(first_tile, seq) + offset // block_q) * block_q + offset % block_q
-    col = jnp.clip(col, 0, max_tiles * block_q - 1)
     return ClassScores(
-        scores_t, col, tile_seq, tile_row0, num_tiles, first_tile, tile_start
+        scores_t,
+        meta.col,
+        meta.tile_seq,
+        meta.tile_row0,
+        meta.num_tiles,
+        meta.first_tile,
+        meta.tile_start,
     )
 
 
 class _ClassPlan(NamedTuple):
     """`block_scores`' two tile classes. `small()` / `large()` score them
-    (`ClassScores` each); `token_major` is the small class's layout."""
+    (`ClassScores` each; ``meta=`` takes the class's precomputed `ClassMeta`);
+    `large_meta()` is the large class's `ClassMeta` alone; `token_major` is
+    the small class's layout."""
 
     small: Callable
     large: Callable
+    large_meta: Callable
     small_block_q: int
     large_block_q: int
     large_pages: int
@@ -990,9 +1085,7 @@ def class_plan(
         kernel=small_kernel,
         token_major=token_major,
     )
-    large = functools.partial(
-        score,
-        is_large,
+    large_tiles = dict(
         block_q=large_block_q,
         # +1 per request for the partial last tile, plus the up-to-7 rows
         # each aligned start adds.
@@ -1001,15 +1094,31 @@ def class_plan(
         + -(-(_ROW_ALIGN - 1) * max_large // large_block_q)
         + 1,
         pages_per_step=pages_per_step,
+    )
+    large = functools.partial(
+        score,
+        is_large,
         kernel=large_kernel,
         # fp8 queries on the prefill tiles only: the decode tiles are bound by
         # the key stream into the MXU, not its rate, and gain nothing.
         fp8_q=fp8_q,
+        **large_tiles,
+    )
+    large_meta = functools.partial(
+        _class_meta,
+        num_tokens,
+        _page_tokens(index_cache.shape[1], index_cache.dtype),
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        is_large,
+        **large_tiles,
     )
     pages_per_seq = block_tables.shape[0] // max_num_seqs
     return _ClassPlan(
         small=small,
         large=large,
+        large_meta=large_meta,
         small_block_q=tile,
         large_block_q=large_block_q,
         large_pages=-(-pages_per_seq // pages_per_step) * pages_per_step,
@@ -1114,9 +1223,13 @@ def block_scores(
     if max_large == 0:
         return small_only()[:, None, :]
 
-    def with_large():
-        large, large_col, *_ = plan.large()
-        small_t = small.T if token_major else small
+    # Columns of the small class's [P, columns] layout (`gather_rows`).
+    small_cols = small.shape[0 if token_major else 1]
+    row_gather = row_gather_enabled() and token_major
+
+    def row_columns(large_col):
+        """Each row's large-class flag and its column in the concatenated
+        ``[P, small | large columns]`` layout."""
         tok = jnp.arange(num_tokens, dtype=jnp.int32)
         seq = jnp.minimum(
             jnp.searchsorted(
@@ -1124,13 +1237,31 @@ def block_scores(
             ).astype(jnp.int32),
             max_num_seqs - 1,
         )
+        row_large = lookup(is_large, seq)
+        return row_large, jnp.where(row_large, small_cols + large_col, small_col)
+
+    def gather_rows(large, large_col, row_large, col):
+        if row_gather:
+            # Token-major small scores: a row gather (as `small_only`), and a
+            # column gather of the large class alone; no [P, columns] copy.
+            rows_small = small[small_col]
+            rows_large = large[:, large_col].T
+            rows_small, rows_large = (
+                jnp.pad(x, ((0, 0), (0, pages - x.shape[1])))
+                for x in (rows_small, rows_large)
+            )
+            return jnp.where(row_large[:, None], rows_large, rows_small)
         # One gather over both classes' columns (XLA fuses the concatenate
         # into it) instead of a transposing gather per class and a select.
-        col = jnp.where(lookup(is_large, seq), small_t.shape[1] + large_col, small_col)
+        small_t = small.T if token_major else small
         small_t, large = (
             jnp.pad(x, ((0, pages - x.shape[0]), (0, 0))) for x in (small_t, large)
         )
         return jnp.concatenate([small_t, large], axis=1)[:, col].T
+
+    def with_large():
+        large, large_col, *_ = plan.large()
+        return gather_rows(large, large_col, *row_columns(large_col))
 
     if is_prefill_step(num_tokens, max_num_seqs):
         # More rows than a batch of decode requests: a prefill step. A
@@ -1138,5 +1269,18 @@ def block_scores(
         # and its neighbours' collectives at its end (c4 mixed twin +50 us
         # per layer, j-08c5e333).
         return with_large()[:, None, :]
+    large_branch = with_large
+    if hoist_metadata_enabled():
+        # The large class's metadata and the rows' columns outside the cond:
+        # the same in every layer, so XLA computes them once per step (a
+        # branch is opaque to CSE). The lookups are one-hot, cheap where no
+        # request is large.
+        large_meta = plan.large_meta()
+        row_large, col = row_columns(large_meta.col)
+
+        def large_branch():
+            large = plan.large(meta=large_meta).scores
+            return gather_rows(large, large_meta.col, row_large, col)
+
     # Decode steps have no large request: skip its kernel call and gather.
-    return jax.lax.cond(jnp.any(is_large), with_large, small_only)[:, None, :]
+    return jax.lax.cond(jnp.any(is_large), large_branch, small_only)[:, None, :]

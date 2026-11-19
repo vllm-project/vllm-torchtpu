@@ -256,6 +256,10 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
     TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE: str = ""
+    TPU_MINIMAX_M3_INDEXER_HOIST_METADATA: bool = False
+    TPU_MINIMAX_M3_INDEXER_ROW_GATHER: bool = False
+    TPU_SPEC_VERIFY_COARSE_PAD: bool = False
+    TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES: bool = False
 
 
 def env_with_choices(
@@ -1639,6 +1643,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Lossy. Prefill steps are unchanged.
     "TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE": env_str(
         "TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE", ""
+    ),
+    # MiniMax M3 indexer (`msa_indexer.block_scores`), steps that score the
+    # large (prefill) tile class under a cond (decode-sized buckets holding a
+    # prefill chunk): that class's tiles, work list and columns and each
+    # row's gather column are computed outside the cond, so XLA computes them
+    # once per step instead of once per layer. Same scores.
+    "TPU_MINIMAX_M3_INDEXER_HOIST_METADATA": env_bool(
+        "TPU_MINIMAX_M3_INDEXER_HOIST_METADATA", default=False
+    ),
+    # MiniMax M3 indexer, token-major small scores: a step's rows come from a
+    # row gather of the small class and a column gather of the large class,
+    # selected per row, instead of one column gather over both (no
+    # transposed copy of the small class). Same scores.
+    "TPU_MINIMAX_M3_INDEXER_ROW_GATHER": env_bool(
+        "TPU_MINIMAX_M3_INDEXER_ROW_GATHER", default=False
+    ),
+    # Spec decode: pad a verify chunk's logits rows (padded_logits_length,
+    # the length of every verify-row tensor) to a coarse ladder (powers of
+    # two from 8 up to the token bucket of a full batch of verify windows)
+    # instead of the token buckets, so the verify / sampler programs do not
+    # multiply with TPU_TOKEN_BUCKET_EXTRA. The backbone keeps the token
+    # buckets; a full-logits verify runs the LM head at the token-bucket rows
+    # and pads the logits; eager uniforms are drawn at the token-bucket rows.
+    # Same tokens.
+    "TPU_SPEC_VERIFY_COARSE_PAD": env_bool("TPU_SPEC_VERIFY_COARSE_PAD", default=False),
+    # Upload upstream InputBatch's sampling metadata (temperature, top_p,
+    # top_k, penalties) at full length instead of [:num_reqs]: on TPU each
+    # new live request count compiled an eager copy_ + as_strided_inverse
+    # program mid-serving. Rows past num_reqs are never read; same values.
+    "TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES": env_bool(
+        "TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES", default=False
     ),
 }
 
