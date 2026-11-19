@@ -120,11 +120,62 @@
     const wlDp = wl.dp ?? WL_DEF.dp ?? 1;
     const wlPp = wl.pp ?? WL_DEF.pp ?? 1;
     const wlDcp = wl.dcp ?? WL_DEF.dcp ?? 1;
+    const wlPcp = wl.pcp ?? WL_DEF.pcp ?? 1;
     return (d.tp ?? 1) === wlTp &&
       (d.ep ?? 1) === wlEp &&
       (d.dp ?? 1) === wlDp &&
       (d.pp ?? 1) === wlPp &&
-      (d.dcp ?? 1) === wlDcp;
+      (d.dcp ?? 1) === wlDcp &&
+      (d.pcp ?? 1) === wlPcp;
+  }
+  function resolveDeclaredExpertMode(decl, wl, activeTokens, lMoe) {
+    if (lMoe <= 0) return 'none';
+    if (decl && Array.isArray(decl.expert_mode_by_rows) && decl.expert_mode_by_rows.length > 0) {
+      for (const rule of decl.expert_mode_by_rows) {
+        if (activeTokens <= Number(rule.max_rows)) return String(rule.mode);
+      }
+      return String(decl.expert_mode_by_rows[decl.expert_mode_by_rows.length - 1].mode);
+    }
+    return (wl.ep || 1) > 1 ? 'ep' : 'tp';
+  }
+  function computeCollectiveStepTerms(step, p, ctx, nSplits, callMult, expertMode, collectiveSeed) {
+    const groupSize = Number(step.group_size);
+    const callsPerLayer = Number(step.calls_per_layer || collectiveSeed.defaultCallsPerLayer);
+    const hopsPerCall = roundEven(Math.log2(groupSize));
+    let wireBytes = 0.0, totalCalls = 0;
+    if (step.kind === 'routed_transport') {
+      if (ctx.lMoe <= 0 || expertMode === 'tp') {
+        return { transferS: 0.0, strictEgressS: 0.0, hops: 0 };
+      }
+      const tpInGroup = Math.max(1, Math.floor(ctx.effTp / groupSize));
+      const fanout = Math.min(Math.max(1, p.top_k || 1), groupSize);
+      const routedHidden = p.routed_expert_hidden_size || p.hidden_size;
+      const bytesPerLayer = (
+        2.0 * ((groupSize - 1) / groupSize) * ctx.activeTokens * fanout *
+        routedHidden * collectiveSeed.bf16Bytes
+      ) / tpInGroup;
+      wireBytes = ctx.lMoe * bytesPerLayer;
+      totalCalls = ctx.lMoe * callsPerLayer * nSplits * callMult;
+    } else if (step.kind === 'split_kv') {
+      if (ctx.lAttn <= 0) return { transferS: 0.0, strictEgressS: 0.0, hops: 0 };
+      const bytesPerLayer = (groupSize - 1) * ctx.activeTokens * ctx.nhLoc *
+        p.head_dim * (collectiveSeed.bf16Bytes + collectiveSeed.fp32Bytes);
+      wireBytes = ctx.lAttn * bytesPerLayer;
+      totalCalls = ctx.lAttn * callsPerLayer * nSplits * callMult;
+    } else {
+      if (ctx.lAttn <= 0) return { transferS: 0.0, strictEgressS: 0.0, hops: 0 };
+      const qHeadDim = ((p.qk_nope_head_dim || 0) + (p.qk_rope_head_dim || 0)) || p.head_dim;
+      const bytesPerHeadTok = collectiveSeed.bf16Bytes * qHeadDim +
+        collectiveSeed.fp32Bytes * (p.head_dim + collectiveSeed.lseScalarsPerHead);
+      const bytesPerLayer = (groupSize - 1) * ctx.activeTokens * ctx.nhLoc * bytesPerHeadTok;
+      wireBytes = ctx.lAttn * bytesPerLayer;
+      totalCalls = ctx.lAttn * callsPerLayer * nSplits * callMult;
+    }
+    return {
+      transferS: wireBytes / ctx.iciLink,
+      strictEgressS: wireBytes / ctx.iciEg,
+      hops: totalCalls * hopsPerCall
+    };
   }
   // Deployment blocks that declare scope `sc` for the phase. A block without phases
   // covers decode and verify only, and a block needs a source and a rank count.
@@ -722,7 +773,20 @@
     const gqaScratch = lAttn > 0
       ? (2 * 128 * (4 * Math.max(hd, kvLora)) + 2 * 128 * 128 * 4) : 0;
     const gdnScratch = lLin > 0 ? (4 * Math.min(vhLoc, 8) * kd * vd) : 0;
-    const ffnScratch = lMoe > 0 ? (2 * 128 * iExpLoc * 4) : (2 * 128 * 1024 * 4);
+    const attnTileTokens = Number(DATA.attn_tile_tokens);
+    const denseFfnTileCap = Number(DATA.dense_ffn_tile_cap);
+    const seedFp32Bytes = Number(DATA.fp32_bytes);
+    if (
+      !Number.isFinite(attnTileTokens) ||
+      !Number.isFinite(denseFfnTileCap) ||
+      !Number.isFinite(seedFp32Bytes)
+    ) {
+      throw new Error('Missing required tile scratch seed constants in DATA');
+    }
+    const computeFfnScratchBytes = moeInterLocal => lMoe > 0
+      ? (2 * attnTileTokens * moeInterLocal * seedFp32Bytes)
+      : (2 * attnTileTokens * denseFfnTileCap * seedFp32Bytes);
+    const ffnScratch = computeFfnScratchBytes(iExpLoc);
     const vmemParts = computePerTokenVmem(wl, p);
     const defCollUs = (ch.collective_latency_s || 1e-6) * 1e6;
     const bracketHi = ch.collective_latency_us_bracket
@@ -784,6 +848,25 @@
       (wl.efficiency && wl.efficiency.eta_hbm) ?? ch.eta_hbm ?? 0.82;
     const etaIci = wl.etaIci ??
       (wl.efficiency && wl.efficiency.eta_ici) ?? ch.eta_ici ?? 0.75;
+    const bf16Bytes = Number(DATA.bf16_bytes);
+    const fp32Bytes = Number(DATA.fp32_bytes);
+    const lseScalarsPerHead = Number(DATA.lse_scalars_per_head);
+    const defaultCallsPerLayer = Number(DATA.default_declared_calls_per_layer);
+    const perOpCollFactor = Number(DATA.per_op_collective_call_factor);
+    if (
+      !Number.isFinite(bf16Bytes) ||
+      !Number.isFinite(fp32Bytes) ||
+      !Number.isFinite(lseScalarsPerHead) ||
+      !Number.isFinite(defaultCallsPerLayer) ||
+      !Number.isFinite(perOpCollFactor)
+    ) {
+      throw new Error('Missing required collective seed constants in DATA');
+    }
+    const collectiveSeed = {
+      bf16Bytes, fp32Bytes, lseScalarsPerHead, defaultCallsPerLayer, perOpCollFactor
+    };
+    const hostHeadPerOpUs = Number(wl.host_head_per_op_us ?? wl.hostHeadPerOpUs ?? 0.0);
+    const hostHeadFusedUs = Number(wl.host_head_fused_us ?? wl.hostHeadFusedUs ?? 0.0);
 
     // The single-call row limit floored to whole requests (0: no declared limit). A limit
     // below one request is an invalid workload (validateWorkload), not "no limit".
@@ -796,23 +879,33 @@
       const perCall = singleCallRows / tokPerReq;
       const fullCalls = Math.floor(batchLocal / perCall), restReq = batchLocal % perCall;
       const callScope = n => evaluateWorkload(
-        Object.assign({}, wl, { batch: n * dp }), p, ch
+        Object.assign({}, wl, {
+          batch: n * dp,
+          host_head_fused_us: 0.0,
+          hostHeadFusedUs: 0.0
+        }), p, ch
       ).scopes.find(s => s.scope === 'whole_step');
       const full = callScope(perCall), rest = restReq > 0 ? callScope(restReq) : null;
       const calls = Array(fullCalls).fill(full).concat(rest ? [rest] : []);
       const sum = (key, digits) => +calls.reduce((a, c) => a + c[key], 0).toFixed(digits);
+      const stepDecl = findDeclaration(p, 'whole_step', effTp, wl);
+      const stepExpertMode = resolveDeclaredExpertMode(stepDecl, wl, activeTokens, lMoe);
+      const stepEpDp = stepExpertMode === 'tp' ? 1 : epDp;
       // Support belongs to the whole step: its total rows are checked against the rows
       // a declaration serves through split calls.
       const stepSupport = evaluateSupport('whole_step', p, wl, ch, {
-        activeTokens, effTp, epDp, planError: wl.planError || ''
+        activeTokens, effTp, epDp: stepEpDp, planError: wl.planError || ''
       });
+      const stepHeadUs = hostHeadFusedUs;
       return Object.assign({}, full, {
         support: stepSupport.support, blockers: stepSupport.blockers,
+        expert_mode: stepExpertMode,
+        host_head_us: +stepHeadUs.toFixed(2),
         feasible: calls.every(c => c.feasible),
         reason: (calls.find(c => !c.feasible) || full).reason,
         nCalls: calls.length,
         ops_per_step: sum('ops_per_step', 0), n_splits: sum('n_splits', 0),
-        rawStepUs: fullCalls * full.rawStepUs + (rest ? rest.rawStepUs : 0.0),
+        rawStepUs: fullCalls * full.rawStepUs + (rest ? rest.rawStepUs : 0.0) + stepHeadUs,
         pureStepUs: fullCalls * full.pureStepUs + (rest ? rest.pureStepUs : 0.0),
         w_step_gb: sum('w_step_gb', 4), w_step_strict_gb: sum('w_step_strict_gb', 5),
         act_hbm_mb: sum('act_hbm_mb', 3),
@@ -820,11 +913,11 @@
         hbm_us: sum('hbm_us', 2), comm_us: sum('comm_us', 2),
         fill_drain_us: sum('fill_drain_us', 2), repass_spill_us: sum('repass_spill_us', 2),
         launch_us: sum('launch_us', 2), roof_floor_us: sum('roof_floor_us', 2),
-        step_bound_us: sum('step_bound_us', 2),
+        step_bound_us: +(sum('step_bound_us', 2) + stepHeadUs).toFixed(2),
         step_floor_strict_us: sum('step_floor_strict_us', 2),
-        step_achievable_us: sum('step_achievable_us', 2),
-        step_achievable_upper_us: sum('step_achievable_upper_us', 2),
-        step_upper_us: sum('step_upper_us', 2)
+        step_achievable_us: +(sum('step_achievable_us', 2) + stepHeadUs).toFixed(2),
+        step_achievable_upper_us: +(sum('step_achievable_upper_us', 2) + stepHeadUs).toFixed(2),
+        step_upper_us: +(sum('step_upper_us', 2) + stepHeadUs).toFixed(2)
       });
     }
 
@@ -834,6 +927,28 @@
         scopes.push(microbatchedWholeStep());
         continue;
       }
+      const moeDecl = findDeclaration(p, sc, effTp, wl);
+      const expertMode = resolveDeclaredExpertMode(moeDecl, wl, activeTokens, lMoe);
+      const scopeEp = (expertMode === 'tp' && ep > 1) ? 1 : ep;
+      const scopeWl = scopeEp === ep ? wl : Object.assign({}, wl, { ep: 1 });
+      const scopeEpTp = gcd(scopeEp, effTp);
+      const scopeEpDp = Math.max(1, Math.floor(scopeEp / scopeEpTp));
+      const scopeExpertsLoc = lMoe > 0 ? Math.floor(nExp / scopeEp) : 0;
+      const scopeIExpLoc = lMoe > 0
+        ? Math.ceil((p.moe_intermediate_size || 0) / Math.max(1, Math.floor(effTp / scopeEpTp)))
+        : 0;
+      const scopeRoutedExpParams = 3 * (p.routed_expert_hidden_size || H) * scopeIExpLoc;
+      const scopeExpBytes = scopeRoutedExpParams * bwE;
+      const scopeFlopsMoe = scopeExpertsLoc > 0
+        ? (2.0 * activeTokens * scopeEpDp * lMoe * topK * scopeRoutedExpParams * scopeExpertsLoc / nExp)
+        : 0.0;
+      const scopeSlExpertStaging = Math.min(bufSlots * eBank, Math.trunc(bufSlots * scopeExpBytes));
+      const scopeFfnScratch = computeFfnScratchBytes(scopeIExpLoc);
+      const scopeVmemParts = scopeEp === ep ? vmemParts : computePerTokenVmem(scopeWl, p);
+      const scopeA2aTime = scopeEpDp > 1
+        ? (2.0 * (scopeEpDp - 1) / scopeEpDp * Math.min(Math.max(1, topK), scopeEpDp) * tokResBytes / iciEg)
+        : 0.0;
+      const scopeHostHeadUs = sc === 'per_op' ? hostHeadPerOpUs : hostHeadFusedUs;
       let feasible = true, reason = 'ok';
       if (sc === 'layer_group' && presetGroups === 0 && pp === 1 && segCount === 1) {
         feasible = false;
@@ -864,16 +979,16 @@
         const isSl = sc === 'single_layer';
         const isSlOrGrp = isSl || (sc === 'layer_group' && presetGroups > 0);
         const mul = sc === 'layer_group' ? (presetGroups || segCount) : 1;
-        const sumScratch = gqaScratch + gdnScratch + ffnScratch;
+        const sumScratch = gqaScratch + gdnScratch + scopeFfnScratch;
         opScratch = vmemAlias
-          ? Math.max(gqaScratch, gdnScratch, ffnScratch) : sumScratch;
-        const alpha = vmemParts.totalPerTokenBytes;
+          ? Math.max(gqaScratch, gdnScratch, scopeFfnScratch) : sumScratch;
+        const alpha = scopeVmemParts.totalPerTokenBytes;
         let minStaticBytes = 0;
         if (isSlOrGrp) {
           selNbd = bufSlots;
           selNbe = lMoe > 0 ? bufSlots : 0;
           denseStage = slDenseStaging;
-          expertStage = lMoe > 0 ? slExpertStaging : 0;
+          expertStage = lMoe > 0 ? scopeSlExpertStaging : 0;
           padBytes = 0;
           staticBytes = denseStage + expertStage + opScratch;
           minStaticBytes = staticBytes;
@@ -881,7 +996,7 @@
           padBytes = 2097152;
           const ringSel = selectAdaptiveRing(
             vmemBudget, opScratch + padBytes, alpha, activeTokens,
-            lMoe > 0, wl, dBank, eBank
+            lMoe > 0, scopeWl, dBank, eBank
           );
           selNbd = ringSel.nbd;
           selNbe = ringSel.nbe;
@@ -891,7 +1006,7 @@
           minStaticBytes = ringSel.minRingB + opScratch + padBytes;
         }
         actBytes = 2.0 * resStreams * (isSl ? layersLocal : mul) * tokResBytes;
-        const subMul = (effTp * ep > 1 && (lAttn + lLin) > 0) ? 3 : 1;
+        const subMul = (effTp * scopeEp > 1 && (lAttn + lLin) > 0) ? 3 : 1;
         nOps = isSl ? layersLocal : (
           sc === 'layer_group' && presetGroups > 0 ? mul : mul * subMul
         );
@@ -910,24 +1025,23 @@
       const weightPasses = oneWeightPass ? 1 : nSplits;
       const tileTokens = Math.ceil(activeTokens / Math.max(1, nSplits));
       const isGrpMode = moeMode === 'grouped_on_chip';
-      const canGroupMoe = !isFusedMulti || epDp === 1 ||
-        ((effTp * epDp <= 8) && isGrpMode);
-      const moeDecl = findDeclaration(p, sc, effTp, wl);
+      const canGroupMoe = !isFusedMulti || scopeEpDp === 1 ||
+        ((effTp * scopeEpDp <= 8) && isGrpMode);
       const declLayout = moeDecl ? String(moeDecl.moe_layout || '') : '';
       // A declared megakernel runs the expert layout its deployment states.
       const groupedMoe = declLayout === 'grouped' || (declLayout !== 'masked' &&
-        canGroupMoe && (sc === 'per_op' || isGrpMode || tileTokens * epDp >= rFloor));
+        canGroupMoe && (sc === 'per_op' || isGrpMode || tileTokens * scopeEpDp >= rFloor));
       const moeTok = (groupedMoe && sc !== 'single_layer')
         ? activeTokens : tileTokens;
       let wStep = wStatic, moePadFactor = 1.0;
-      if (expertsLoc > 0) {
-        const tEp = moeTok * epDp;
-        const eHit = expertsHit(tEp, topK, nExp, expertsLoc);
-        const pairs = Math.max(1.0, tEp * topK * expertsLoc / nExp);
+      if (scopeExpertsLoc > 0) {
+        const tEp = moeTok * scopeEpDp;
+        const eHit = expertsHit(tEp, topK, nExp, scopeExpertsLoc);
+        const pairs = Math.max(1.0, tEp * topK * scopeExpertsLoc / nExp);
         const avgM = Math.max(1.0, pairs / eHit);
         const hit = oneWeightPass
-          ? expertsHit(activeTokens * epDp, topK, nExp, expertsLoc) : eHit;
-        wStep = wStatic + lMoe * hit * expBytes;
+          ? expertsHit(activeTokens * scopeEpDp, topK, nExp, scopeExpertsLoc) : eHit;
+        wStep = wStatic + lMoe * hit * scopeExpBytes;
         const maskedPhi = Math.max(1.0, (Math.floor((tEp + 15) / 16) * 16 * eHit) / pairs);
         moePadFactor = groupedMoe ? (Math.ceil(avgM / rFloor) * rFloor / avgM) : maskedPhi;
         // A per-op kernel may run each expert on all rows (masked) or on its own rows
@@ -938,22 +1052,55 @@
       if (tiled) {
         actBytes = Math.max(actBytes, 2.0 * resStreams * layersLocal * tokResBytes);
       }
+      const declColl = (moeDecl && moeDecl.collectives && typeof moeDecl.collectives === 'object')
+        ? moeDecl.collectives : null;
+      const effNumAr = (declColl && typeof declColl.all_reduces === 'number')
+        ? Math.ceil(declColl.all_reduces * layersLocal / Math.max(1, L))
+        : numAr;
       const measuredArS = sc === 'per_op' ? measuredArXlaS : measuredArInKernelS;
       const hasMeasuredAr = measuredArS !== null && effTp > 1;
-      const measuredArTotalS = hasMeasuredAr ? (numAr * nSplits * measuredArS) : 0.0;
-      const xlaArFactor = (sc === 'per_op' && effTp > 1) ? 2 : 1;
+      const measuredArTotalS = hasMeasuredAr ? (effNumAr * nSplits * measuredArS) : 0.0;
+      const xlaArFactor = (sc === 'per_op' && effTp > 1) ? perOpCollFactor : 1;
       const xlaHbmCollBytes = (!hasMeasuredAr && sc === 'per_op' && effTp > 1)
-        ? 2.0 * numAr * tokResBytes : 0.0;
+        ? 2.0 * effNumAr * tokResBytes : 0.0;
+      let stepsToPrice = [];
+      let stepCallMult = 1;
+      if (declColl) {
+        stepsToPrice = Array.isArray(declColl.steps) ? declColl.steps : [];
+      } else if (
+        dcp > 1 &&
+        (dcp & (dcp - 1)) === 0 &&
+        (wl.phase === 'decode' || wl.phase === 'verify')
+      ) {
+        stepsToPrice = [{
+          kind: 'dcp_gather', group_size: dcp, calls_per_layer: defaultCallsPerLayer
+        }];
+        stepCallMult = sc === 'per_op' ? perOpCollFactor : 1;
+      }
+      const hasDeclaredRouted = stepsToPrice.some(st => st && st.kind === 'routed_transport');
+      let stepTransferS = 0.0, stepStrictS = 0.0, stepHops = 0;
+      const stepCtx = { activeTokens, effTp, lMoe, lAttn, nhLoc, iciLink, iciEg };
+      for (const stItem of stepsToPrice) {
+        const stepTerms = computeCollectiveStepTerms(
+          stItem, p, stepCtx, nSplits, stepCallMult, expertMode, collectiveSeed
+        );
+        stepTransferS += stepTerms.transferS;
+        stepStrictS += stepTerms.strictEgressS;
+        stepHops += stepTerms.hops;
+      }
+      const stepCollS = stepTransferS + stepHops * latColl;
       const overlappedComm = isFusedMulti && nSplits === 1;
       const arAndPcpS = (hasMeasuredAr
         ? measuredArTotalS
-        : (numAr * (arInfo.xferS + nSplits * xlaArFactor * arInfo.latS) +
+        : (effNumAr * (arInfo.xferS + nSplits * xlaArFactor * arInfo.latS) +
            xlaHbmCollBytes / bwHbm)
-      ) + pcpRingTime;
-      const a2aSyncS = (lMoe > 0 && epDp > 1)
-        ? lMoe * (a2aTime + 2 * nSplits * xlaArFactor * latColl) : 0.0;
+      ) + pcpRingTime + stepCollS;
+      const a2aSyncS = hasDeclaredRouted
+        ? 0.0
+        : ((lMoe > 0 && scopeEpDp > 1)
+           ? lMoe * (scopeA2aTime + 2 * nSplits * xlaArFactor * latColl) : 0.0);
       const dcnSyncS = hasMeasuredAr
-        ? 0.0 : (numAr * nSplits * xlaArFactor * arInfo.interLatS);
+        ? 0.0 : (effNumAr * nSplits * xlaArFactor * arInfo.interLatS);
       const syncStageS = overlappedComm
         ? (dcnSyncS + ppStageTime + a2aSyncS)
         : (isFusedMulti ? (arAndPcpS + ppStageTime + a2aSyncS) : 0.0);
@@ -1004,14 +1151,11 @@
         4.0 * activeTokens * sharedInterLocal * lMoe + subchannelVecDense;
       const routedBytesStreamed = weightPasses * (wStep - wStatic);
       const streamedRoutedParams = Math.max(0.0, routedBytesStreamed / Math.max(1e-6, bwE));
-      const epTp = gcd(wl.ep || 1, effTp);
-      const iExpLocal = (p.num_experts > 0 && lMoe > 0)
-        ? Math.ceil((p.moe_intermediate_size || 0) / Math.max(1, Math.floor(effTp / epTp)))
-        : 0;
-      const moeTokensLocal = activeTokens * epDp * expertsLoc / Math.max(1, nExp);
+      const iExpLocal = scopeIExpLoc;
+      const moeTokensLocal = activeTokens * scopeEpDp * scopeExpertsLoc / Math.max(1, nExp);
       const isFp4Expert = ['nvfp4', 'mxfp4', 'fp4', 'int4'].includes(String(p.expert_dtype || '').toLowerCase());
       const subchannelVecMoe = (weightBlockK > 0 && weightBlockK < subchannelKThresh)
-        ? ((moePadFactor * flopsMoe) / weightBlockK)
+        ? ((moePadFactor * scopeFlopsMoe) / weightBlockK)
         : 0.0;
       const vecOpsMoe = 4.0 * moeTokensLocal * lMoe * topK * iExpLocal + (isFp4Expert ? 2.0 * streamedRoutedParams : 0.0) + subchannelVecMoe;
       const actDt = String(p.act_dtype || '').toLowerCase();
@@ -1025,10 +1169,8 @@
         : tMatmulDense;
       const tDense = Math.max(tMatmulDense, vecOpsDense / vecRate);
       const tDenseUpper = Math.max(tMatmulDenseUpper, vecOpsDense / vecRate);
-      const tMoe = (moePadFactor * flopsMoe) / peakE;
+      const tMoe = (moePadFactor * scopeFlopsMoe) / peakE;
       const tVecMoe = vecOpsMoe / vecRate;
-      const tMatmul = tDense + tMoe;
-      const tMatmulHi = tDenseUpper + tMoe;
       const tHbm = (weightPasses * wStep + effStateBytes + actBytes) / bwHbm;
       // Routed-expert bytes are requested after each layer's router, so they stream
       // under neither the dense compute nor the collectives.
@@ -1036,11 +1178,12 @@
       const chainS = routedChain(tDense, routedHbmS, tMoe, tVecMoe);
       const roofCoreS = coreTime(tHbm, chainS, commS, isFusedMulti);
       const roofUs = (roofCoreS + fillDrainS) * 1e6;
-      const baseAi = (flopsDense + flopsMoe) / Math.max(1.0, wStep + effStateBytes);
+      const baseAi = (flopsDense + scopeFlopsMoe) / Math.max(1.0, wStep + effStateBytes);
       const repassUs = (baseAi >= peakW / bwHbm && weightPasses > 1)
         ? ((actBytes + (nSplits - 1) * wStep) / bwHbm * 1e6) : 0.0;
       const pureStepUs = roofUs + repassUs;
-      const launchUs = nOps * lgBox.lo, stepUs = pureStepUs + launchUs;
+      const launchUs = nOps * lgBox.lo;
+      const stepUs = pureStepUs + launchUs + scopeHostHeadUs;
       const etaMoe = (groupedMoe && lMoe > 0) ? etaMoeGrp : etaDense;
       const effHbm = Math.max(minEffFloor, etaHbm);
       const effIci = Math.max(minEffFloor, etaIci);
@@ -1055,11 +1198,12 @@
         (vecOpsDense / vecRate) / effDense
       );
       const declOwnerGroups = moeDecl ? Number(moeDecl.expert_owner_groups || 0) : 0;
-      const ownerGroups = declOwnerGroups > 0 ? declOwnerGroups : ep;
-      const tokEpStep = activeTokens * epDp;
-      const routedAchRatio = expertsLoc > 0
-        ? (expertsHitBusiest(tokEpStep, topK, nExp, expertsLoc, ownerGroups) /
-           expertsHit(tokEpStep, topK, nExp, expertsLoc))
+      const ownerGroups = expertMode === 'tp'
+        ? 1 : (declOwnerGroups > 0 ? declOwnerGroups : scopeEp);
+      const tokEpStep = activeTokens * scopeEpDp;
+      const routedAchRatio = scopeExpertsLoc > 0
+        ? (expertsHitBusiest(tokEpStep, topK, nExp, scopeExpertsLoc, ownerGroups) /
+           expertsHit(tokEpStep, topK, nExp, scopeExpertsLoc))
         : 1.0;
       const perOpCalls = Math.max(
         1,
@@ -1070,7 +1214,7 @@
       );
       const boundaryCount = sc === 'per_op' ? (perOpCalls - 1) : (nOps - 1);
       const achFillDrainS = boundaryFillDrainS(boundaryCount, effHbm, effIci);
-      const tMoeAch = ((moePadFactor * routedAchRatio * flopsMoe) / peakE) / effMoe;
+      const tMoeAch = ((moePadFactor * routedAchRatio * scopeFlopsMoe) / peakE) / effMoe;
       const tVecMoeAch = ((vecOpsMoe * routedAchRatio) / vecRate) / effDense;
       const tHbmAch = (tHbm + (routedAchRatio - 1.0) * routedHbmS) / effHbm;
       const unmeasuredCommS = Math.max(0.0, commS - measuredInCommS);
@@ -1081,18 +1225,21 @@
       const routedHbmAchS = (routedHbmS * routedAchRatio) / effHbm;
       const chainAchS = routedChain(tDenseAch, routedHbmAchS, tMoeAch, tVecMoeAch);
       const achCoreS = Math.max(tHbmAch, chainAchS) + tCommAch + syncExtraS;
-      const stepAchUs = (achCoreS + achFillDrainS) * 1e6 + repassUs + launchUs;
-      const arExtraS = hasMeasuredAr ? 0.0 : (
-        (numAr * nSplits * xlaArFactor * arInfo.intraHops) *
-        Math.max(0.0, latCollHi - latColl)
-      );
-      const a2aCnt = (lMoe > 0 && epDp > 1) ? (2 * lMoe * nSplits * xlaArFactor) : 0;
-      const a2aExtraS = a2aCnt * Math.max(0.0, latCollHi - latColl);
+      const stepAchUs = (achCoreS + achFillDrainS) * 1e6 + repassUs + launchUs + scopeHostHeadUs;
+      const extraLatS = Math.max(0.0, latCollHi - latColl);
+      const arHopsTotal = hasMeasuredAr
+        ? 0 : (effNumAr * nSplits * xlaArFactor * arInfo.intraHops);
+      const arExtraS = (arHopsTotal + stepHops) * extraLatS;
+      const a2aCnt = hasDeclaredRouted
+        ? 0 : ((lMoe > 0 && scopeEpDp > 1) ? (2 * lMoe * nSplits * xlaArFactor) : 0);
+      const a2aExtraS = a2aCnt * extraLatS;
       const chainHiS = routedChain(tDenseUpper, routedHbmS, tMoe, tVecMoe);
       const roofHiCoreS = coreTime(tHbm, chainHiS, commS + arExtraS, overlappedComm) +
         a2aExtraS;
       const roofHiUs = (roofHiCoreS + fillDrainS) * 1e6;
-      const stepHiUs = Math.max(stepUs, roofHiUs + repassUs + nOps * lgBox.hi);
+      const stepHiUs = Math.max(
+        stepUs, roofHiUs + repassUs + nOps * lgBox.hi + scopeHostHeadUs
+      );
       const tMatmulDenseUpperAch = ((attnIsBf16 || isPrefOrMix) && flopsKv > 0)
         ? (((flopsDense - flopsKv) / peakW) / effDense +
            (flopsKv / bf16Peak) / effDense)
@@ -1108,19 +1255,19 @@
         syncExtraS + (a2aExtraS / effIci);
       const stepAchHiUs = Math.max(
         stepAchUs, stepHiUs,
-        (achHiCoreS + achFillDrainS) * 1e6 + repassUs + nOps * lgBox.hi
+        (achHiCoreS + achFillDrainS) * 1e6 + repassUs + nOps * lgBox.hi + scopeHostHeadUs
       );
-      const eStrict = expertsLoc > 0
-        ? Math.min(expertsLoc, Math.max(1.0, topK * expertsLoc / Math.max(1, nExp)))
+      const eStrict = scopeExpertsLoc > 0
+        ? Math.min(scopeExpertsLoc, Math.max(1.0, topK * scopeExpertsLoc / Math.max(1, nExp)))
         : 0.0;
-      const wStepStrict = expertsLoc > 0
-        ? (wStatic + lMoe * eStrict * expBytes) : wStatic;
+      const wStepStrict = scopeExpertsLoc > 0
+        ? (wStatic + lMoe * eStrict * scopeExpBytes) : wStatic;
       const tMatmulDenseStrict = (attnIsBf16 && flopsKv > 0)
         ? ((flopsDense - flopsKv) / peakW + flopsKv / bf16Peak)
         : (flopsDense / peakW);
-      const tMatmulStrict = tMatmulDenseStrict + flopsMoe / peakE;
+      const tMatmulStrict = tMatmulDenseStrict + scopeFlopsMoe / peakE;
       const tHbmStrict = (weightPasses * wStepStrict + effStateBytes + actBytes) / bwHbm;
-      const tMoeStrict = flopsMoe / peakE;
+      const tMoeStrict = scopeFlopsMoe / peakE;
       const routedStrictS = weightPasses * (wStepStrict - wStatic) / bwHbm;
       const routedBytesStrict = weightPasses * (wStepStrict - wStatic);
       const streamedRoutedParamsStrict = Math.max(0.0, routedBytesStrict / Math.max(1e-6, bwE));
@@ -1140,8 +1287,9 @@
       );
       // The strict floor prices all-reduce transfer at the egress sum. That transfer sits
       // in commS, or in the sync stage of fillDrainS when a fused scope runs several passes.
-      const arStrictSavingS = hasMeasuredAr
-        ? 0.0 : numAr * (arInfo.xferS - arInfo.xferStrictS);
+      const arStrictSavingS = (hasMeasuredAr
+        ? 0.0 : effNumAr * (arInfo.xferS - arInfo.xferStrictS)) +
+        (stepTransferS - stepStrictS);
       const commStrictS = commS - (commInCore ? arStrictSavingS : 0.0);
       const fillDrainStrictS = fillDrainS - (commInCore ? 0.0 : arStrictSavingS);
       const roofCoreStrictS = coreTime(tHbmStrict, chainStrictS, commStrictS, isFusedMulti);
@@ -1150,10 +1298,10 @@
       const stepFloorStrictUs = (roofCoreStrictS + fillDrainStrictS) * 1e6 +
         repassStrictUs + launchUs;
       const supInfo = evaluateSupport(sc, p, wl, ch, {
-        activeTokens, effTp, epDp, planError: wl.planError || ''
+        activeTokens, effTp, epDp: scopeEpDp, planError: wl.planError || ''
       });
       const resTok = Math.min(activeTokens, Math.max(1, tMax));
-      const aliasDiff = vmemParts.unaliasedOpBytes - vmemParts.opBytes;
+      const aliasDiff = scopeVmemParts.unaliasedOpBytes - scopeVmemParts.opBytes;
       scopes.push({
         scope: sc, feasible, reason, ops_per_step: nOps, t_vmem_max: tMax,
         n_splits: nSplits, tile_tokens: tileTokens,
@@ -1164,8 +1312,8 @@
         expert_stage_mib: +(expertStage / 1048576).toFixed(2),
         op_scratch_mib: +(opScratch / 1048576).toFixed(2),
         pad_mib: +(padBytes / 1048576).toFixed(2),
-        spine_dyn_mib: +((resTok * vmemParts.spineBytes) / 1048576).toFixed(2),
-        op_dyn_mib: +((resTok * vmemParts.opBytes) / 1048576).toFixed(2),
+        spine_dyn_mib: +((resTok * scopeVmemParts.spineBytes) / 1048576).toFixed(2),
+        op_dyn_mib: +((resTok * scopeVmemParts.opBytes) / 1048576).toFixed(2),
         alias_saved_kib: +(aliasDiff / 1024).toFixed(1),
         moe_flop_factor: +moePadFactor.toFixed(3), w_step_gb: +(wStep / 1e9).toFixed(4),
         w_step_strict_gb: +(wStepStrict / 1e9).toFixed(5),
@@ -1182,9 +1330,21 @@
         step_achievable_us: +stepAchUs.toFixed(2),
         step_achievable_upper_us: +stepAchHiUs.toFixed(2),
         step_upper_us: +stepHiUs.toFixed(2),
+        expert_mode: expertMode,
+        host_head_us: +scopeHostHeadUs.toFixed(2),
+        break_even_host_head_delta_us: 0.0,
         support: supInfo.support,
         blockers: supInfo.blockers
       });
+    }
+    const perOpDevUs = scopes[0].rawStepUs - hostHeadPerOpUs;
+    for (const s of scopes) {
+      if (s.scope !== 'per_op' && s.feasible) {
+        const scDevUs = s.rawStepUs - hostHeadFusedUs;
+        s.break_even_host_head_delta_us = +Math.max(0.0, scDevUs - perOpDevUs).toFixed(2);
+      } else {
+        s.break_even_host_head_delta_us = 0.0;
+      }
     }
     const feas = scopes.filter(s => s.feasible);
     const candidates = hbmFits
@@ -1215,7 +1375,7 @@
       Math.max(1, effTp * pp);
     const canRun = isPhysValid && recWinner.feasible;
     const tpsChip = canRun
-      ? (tokensPerChip / Math.max(1e-9, recWinner.step_bound_us * 1e-6))
+      ? +(tokensPerChip / Math.max(1e-9, recWinner.step_bound_us * 1e-6)).toFixed(2)
       : 0.0;
     const winFusedMulti = fastestScope === 'whole_step' || fastestScope === 'layer_group';
     const winCanGroup = !winFusedMulti || epDp === 1 ||
