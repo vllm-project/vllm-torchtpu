@@ -319,8 +319,9 @@ def build_export_config_from_vllm(
     else:
         req_buckets = tuple(int(r) for r in req_buckets)
 
-    raw_additional = getattr(vllm_config, "additional_config", None)
-    additional_config = dict(raw_additional) if raw_additional else None
+    additional_config = (
+        dict(vllm_config.additional_config) if vllm_config.additional_config else None
+    )
 
     return api.TextOnlyLLMExportConfig(
         model_name=str(resolved_model_name),
