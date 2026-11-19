@@ -80,6 +80,19 @@ def _vllm_config(
     )
 
 
+@pytest.fixture(autouse=True)
+def _layer_model_config(monkeypatch):
+    """Layers built with __new__ skip __init__, which sets model_config. They
+    get a GDN model outside the Qwen3.5 MoE architectures (the shared kernel
+    and contiguous b and a halves) unless the test sets its own."""
+    monkeypatch.setattr(
+        VllmGatedDeltaNetAttention,
+        "model_config",
+        SimpleNamespace(architecture="Qwen3NextForCausalLM"),
+        raising=False,
+    )
+
+
 def _qwen35_397b_gdn_attn(prefix: str, *, bias: bool = False, tp_size: int = 1):
     attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
     attn.prefix = prefix

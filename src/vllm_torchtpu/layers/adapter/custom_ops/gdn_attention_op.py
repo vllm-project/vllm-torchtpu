@@ -375,14 +375,7 @@ def _split_ba(
     decides, as it does for the kernel choice.
     """
     b, a = ba.chunk(2, dim=-1)
-    # Upstream's GatedDeltaNetAttention.__init__ always sets model_config; only
-    # test and mock layers built without __init__ lack it, and they get
-    # contiguous copies.
-    model_config = getattr(layer, "model_config", None)
-    if (
-        model_config is not None
-        and model_config.architecture in QWEN3_5_GDN_COPY_ARCHITECTURES
-    ):
+    if layer.model_config.architecture in QWEN3_5_GDN_COPY_ARCHITECTURES:
         return b, a
     return b.contiguous(), a.contiguous()
 
