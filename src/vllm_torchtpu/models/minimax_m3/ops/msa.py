@@ -29,6 +29,7 @@ from vllm_torchtpu.models.minimax_m3 import dcp_pack
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_dcp,
+    msa_dcp_fused,
     msa_dcp_heads,
     msa_fp4,
     msa_indexer,
@@ -717,6 +718,7 @@ def get_msa_dcp_op(
         attend_merge_op = _get_msa_dcp_attend_merge_op(
             sm_scale, topk, dcp, False, suffix
         )
+    fused_max, fused_op = _fused_decode_op(sm_scale, topk, dcp, kv_heads, False, suffix)
     if kv_heads > 1 or _packed_collectives_enabled():
         attend_op = pallas.jax_op(
             f"pallas::minimax_m3_msa_dcp_attend_{suffix}", _attend_jax
@@ -824,6 +826,18 @@ def get_msa_dcp_op(
             )
             return out
         if not packed_step and attend_merge_op is not None:
+            if fused_op is not None and msa_dcp_fused.eligible(
+                k.shape[0], fused_max, dcp=dcp, kv_heads=kv_heads
+            ):
+                return fused_op(
+                    dcp_rank,
+                    q,
+                    kv_cache,
+                    candidates,
+                    metadata.seq_lens,
+                    metadata.block_tables,
+                    metadata.query_start_loc,
+                )
             return attend_merge_op(
                 dcp_rank,
                 q,
@@ -1132,6 +1146,7 @@ def _get_msa_dcp_fp4_op(
         if kv_heads == 1
         else None
     )
+    fused_max, fused_op = _fused_decode_op(sm_scale, topk, dcp, kv_heads, True, suffix)
     attend_op = None
     if kv_heads == 1 and _packed_collectives_enabled():
         attend_op = pallas.jax_op(
@@ -1344,6 +1359,20 @@ def _get_msa_dcp_fp4_op(
             )
         if attend_rot_op is None and not _packed_step(q.shape[0]):
             assert attend_merge_op is not None
+            if fused_op is not None and msa_dcp_fused.eligible(
+                k.shape[0], fused_max, dcp=dcp, kv_heads=kv_heads
+            ):
+                return fused_op(
+                    dcp_rank,
+                    q,
+                    kv_cache,
+                    candidates,
+                    metadata.seq_lens,
+                    metadata.block_tables,
+                    metadata.query_start_loc,
+                    scale_cache,
+                    hadamard,
+                )
             return attend_merge_op(
                 dcp_rank,
                 q,
@@ -1385,6 +1414,28 @@ def _get_msa_dcp_fp4_op(
     return op
 
 
+def _fused_decode_op(
+    sm_scale: float, topk: int, dcp: int, kv_heads: int, fp4: bool, suffix: str
+) -> tuple[int, Callable[..., Any] | None]:
+    """TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS: ``(max tokens, op)`` of
+    the fused attention call (`msa_dcp_fused`) that small decode steps of a
+    DCP pair over one KV head take in place of the attend+merge op; ``(0,
+    None)`` when off or not applicable."""
+    fused_max = envs.TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS
+    if not fused_max or dcp != 2 or kv_heads != 1:
+        return 0, None
+    logger.info_once(
+        "MiniMax M3 DCP decode: steps of <= %d tokens run the fused attention "
+        "call (%s=%d)",
+        min(fused_max, msa_dcp_fused.MAX_TOKENS),
+        msa_dcp_fused.FUSED_ENV,
+        fused_max,
+    )
+    return fused_max, _get_msa_dcp_attend_merge_op(
+        sm_scale, topk, dcp, fp4, suffix, fused=True
+    )
+
+
 def _get_msa_dcp_attend_merge_op(
     sm_scale: float,
     topk: int,
@@ -1392,6 +1443,7 @@ def _get_msa_dcp_attend_merge_op(
     fp4: bool,
     suffix: str,
     selection: str = "candidates",
+    fused: bool = False,
 ) -> Callable[..., Any]:
     """The attention half of the DCP op over one KV head, as one SPMD op over
     the DCP mesh (`msa_dcp.attend_and_merge`): this rank's head-major
@@ -1408,6 +1460,8 @@ def _get_msa_dcp_attend_merge_op(
             f"selection must be one of {msa_dcp.SELECTIONS}, got {selection!r}"
         )
     two = selection == "return"
+    if fused and selection != "candidates":
+        raise ValueError("the fused DCP attention takes candidates, not a selection")
     from jax.sharding import NamedSharding, PartitionSpec
 
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
@@ -1419,7 +1473,7 @@ def _get_msa_dcp_attend_merge_op(
     specs = (sharded,) * 4 + (replicated,) * 3 + ((sharded, replicated) if fp4 else ())
     body = jax.shard_map(
         functools.partial(
-            msa_dcp.attend_and_merge,
+            msa_dcp_fused.fused_attend_and_merge if fused else msa_dcp.attend_and_merge,
             axis=DCP_AXIS_NAME,
             dcp=dcp,
             sm_scale=sm_scale,
@@ -1512,6 +1566,8 @@ def _get_msa_dcp_attend_merge_op(
         )
 
     name = f"pallas::minimax_m3_msa_dcp_attend_merge_{suffix}_fp4{int(fp4)}"
+    if fused:
+        name += "_fused"
     if selection != "candidates":
         name += f"_sel_{selection}"
     if two:
