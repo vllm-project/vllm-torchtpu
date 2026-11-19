@@ -410,6 +410,9 @@ def _quantize_and_format_single_moe_weight(
 # Bytes of the float32 copy one requantization chunk dequantizes at a time.
 # The quantized chunk, its scales and the formatting temporaries come on top.
 _REQUANT_CHUNK_BYTES = 1 << 30
+# VllmFp8MoEMethodTPU.served_before_fused_decode's answer for a layer fused
+# EP v3 serves; the fused few-token op arms only for such a layer.
+FUSED_EP_V3_PATH = "fused EP v3"
 
 
 def _requantize_expert_chunks(
@@ -1142,9 +1145,11 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # imports this module.
             from vllm_torchtpu.layers.adapter import moe_lowtok_fused_op
 
-            # After v3's prebuild: the fused few-token op serves only steps of
-            # a layer v3 armed (_apply_owning_dispatch_v3).
-            moe_lowtok_fused_op.maybe_prebuild(layer, self._moe_lowtok_scores_op)
+            # After v3's prebuild, from the layer's one MoE decision: the fused
+            # few-token op serves only steps of a layer fused EP v3 serves
+            # (_apply_owning_dispatch_v3).
+            if self.served_before_fused_decode(layer) == FUSED_EP_V3_PATH:
+                moe_lowtok_fused_op.maybe_prebuild(layer, self._moe_lowtok_scores_op)
         else:
             _ep_op = prebuild_fused_moe_ep(
                 layer,
@@ -1204,7 +1209,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if moe_tp_decode_supported(self):
             return "the TP decode MoE kernel"
         if envs.USE_MOE_FUSED_EP_KERNEL and fused_moe_ep_v3_supported(self):
-            return "fused EP v3"
+            return FUSED_EP_V3_PATH
         if self._moe_lowtok_scores_op is not None:
             return "the few-token scores entry"
         if enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER:
