@@ -41,6 +41,9 @@ def _config(additional_config, moe=True, dp=1, pcp=1, tp=8):
 )
 def test_defaults_are_mains_behaviour(additional_config):
     assert co.get(_config(additional_config)) == co.CollectivesOptions()
+
+
+def test_small_all_reduce_is_off_by_default():
     assert co.CollectivesOptions().small_all_reduce is False
 
 

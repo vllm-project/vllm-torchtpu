@@ -62,7 +62,7 @@ def test_matches_the_exact_sum(mesh, rows, rank_operand):
     "form", ["oneshot", "twoshot", "oneshot_xor", "hier_halves", "hier_2stage"]
 )
 @pytest.mark.parametrize("rows", [4, 16])
-def test_both_forms_at_both_sizes(mesh, form, rows):
+def test_every_form_at_two_sizes(mesh, form, rows):
     per_core = blocks((N, rows, 4096), seed=100 + rows)
     _check(_all_reduce(mesh, per_core, range(N), form=form), per_core)
 

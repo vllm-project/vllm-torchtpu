@@ -1331,7 +1331,9 @@ def _small_collective_fork_hands_buckets_over(cache_root, model_name, retain):
     if not retain:
         # Positive control: the fallback trace lifts no rank buffer, so the
         # bucket the kernel trace compiled cannot be handed to it.
-        with pytest.raises(Exception, match="token-count branch"):
+        with pytest.raises(
+            shape_variants.ShapeSpecializationError, match="token-count branch"
+        ):
             warm(model, config)
         return
     assert warm(model, config) == 1
