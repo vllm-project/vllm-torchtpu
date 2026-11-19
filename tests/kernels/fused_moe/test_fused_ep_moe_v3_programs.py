@@ -115,6 +115,24 @@ def test_select_top_k_routes_rows_past_the_valid_count_nowhere(interpret, renorm
         np.testing.assert_array_equal(weights[kept], np.asarray(values))
 
 
+@pytest.mark.parametrize("renormalize", [False, True], ids=["raw", "renormalized"])
+def test_select_top_k_gives_slots_past_a_rows_finite_scores_weight_zero(
+    interpret, renormalize
+):
+    """A row with two finite scores and top_k 4: its first two slots carry
+    the two scores (raw) or their softmax, the other two weight zero."""
+    logits = _logits(8, 64)
+    logits[5, 2:] = np.nan
+    weights, _ = select_kernel.select_top_k(
+        jnp.asarray(logits), top_k=4, block_rows=8, renormalize=renormalize
+    )
+    row = np.asarray(weights)[5]
+    assert not row[2:].any()
+    top = np.sort(logits[5, :2])[::-1]
+    want = np.asarray(jax.nn.softmax(jnp.asarray(top))) if renormalize else top
+    np.testing.assert_allclose(row[:2], want, rtol=1e-6, atol=0)
+
+
 def test_select_top_k_refuses_drop_nan_rows_on_raw_scores():
     """drop_nan_rows changes which rows route; raw scores would ignore it."""
     with pytest.raises(ValueError, match="drop_nan_rows"):

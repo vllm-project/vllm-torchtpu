@@ -111,9 +111,11 @@ def _select_body(
             assert selected is not None and slot_iota is not None
             selected = jnp.where(slot_iota == k, row_max, selected)
         else:
-            # A row that routes nowhere gets weight zero, as renormalized.
-            assert routes is not None  # set at k == 0
-            weights_ref[:, k] = jnp.where(routes[:, 0], row_max[:, 0], jnp.float32(0.0))
+            # A slot with no finite score left (all of a row that routes
+            # nowhere, or the slots past a row's finite scores) gets weight
+            # zero, as renormalized.
+            finite = row_max[:, 0] > jnp.float32(UNROUTABLE_MAX)
+            weights_ref[:, k] = jnp.where(finite, row_max[:, 0], jnp.float32(0.0))
         index_out[:, k] = index.astype(jnp.int32)
         logits = jnp.where(expert_iota == index[:, None], UNROUTABLE_LOGIT, logits)
     if renormalize:
@@ -174,8 +176,9 @@ def select_top_k(
 
     Returns (weights f32 [rows, top_k], indices int32 [rows, top_k]). A row
     with no finite score, and a row at or past `valid_tokens`, routes
-    nowhere with weight zero. `drop_nan_rows` (a row with any NaN score
-    routes nowhere) needs `renormalize`; raw scores refuse it. With
+    nowhere with weight zero, and so does every slot past a row's finite
+    scores. `drop_nan_rows` (a row with any NaN score routes nowhere) needs
+    `renormalize`; raw scores refuse it. With
     `message_rows` the indices come back as the routing message's index half,
     [message_rows, LANES] slot-major; the rows after the real pairs up to
     `pair_rows` (the index rows when None) carry the unrouted index. The
