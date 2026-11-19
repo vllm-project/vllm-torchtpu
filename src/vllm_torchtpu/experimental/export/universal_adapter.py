@@ -319,6 +319,10 @@ def build_export_config_from_vllm(
     else:
         req_buckets = tuple(int(r) for r in req_buckets)
 
+    additional_config = (
+        dict(vllm_config.additional_config) if vllm_config.additional_config else None
+    )
+
     return api.TextOnlyLLMExportConfig(
         model_name=str(resolved_model_name),
         target_tpu=str(target_tpu),
@@ -345,6 +349,7 @@ def build_export_config_from_vllm(
         hf_checkpoint_dir=str(resolved_hf_dir) if resolved_hf_dir else None,
         uses_mrope=model_cfg.uses_mrope,
         max_verify_tokens=max_verify_tokens,
+        additional_config=additional_config,
     )
 
 
