@@ -100,3 +100,16 @@ def test_env_key_reaches_the_walk(kernels, monkeypatch):
     got, _ = qsa_rpa._prefill_attention(q, gate, blocks, lengths, table, pool, starts, kv_heads=2, ratio=4)
     assert calls[-1].get("vguard_none") is True
     assert np.array_equal(_bits(want), _bits(got))
+
+
+def test_engagement_marker_names_the_levers(kernels, monkeypatch):
+    # one engagement line per trace naming the active union levers; none when no lever is set
+    lines = []
+    monkeypatch.setattr(ud, "_engagement_log", lambda msg, *args: lines.append(msg % args))
+    step = _packed_step(38, FOUR[0], FOUR[1])
+    _walk(step, SERVED_GL)
+    assert not any("levers traced" in l for l in lines), lines
+    _walk(step, SERVED_GL, mask_view=True, vguard_lean=True, align_gather=True, dot16=True, vguard_none=True)
+    hit = [l for l in lines if "levers traced" in l]
+    assert hit and all(t in hit[-1] for t in ("mask_view=1", "vguard_lean=1", "align_gather=1", "dot16=1", "vguard_none=1",
+                                              "walk_pipe=0", "qk16=0")), hit
