@@ -109,7 +109,9 @@ def _proposer(capacity=128, decode=True):
     proposer.speculative_config = types.SimpleNamespace(num_speculative_tokens=3)
     proposer._draft_rows = True
     proposer._decode_rows_model = object() if decode else None
-    proposer._decode_rows_warm = False
+    proposer._decode_rows_models = {}
+    proposer._decode_rows_build = lambda prefix: object()
+    proposer._decode_rows_warm = set()
     proposer._draft_step0_warm = False
     proposer._draft_rows_len = lambda chunk: capacity
     calls = []
@@ -146,8 +148,18 @@ def test_decode_step_runs_decode_rows_after_compiling_both():
     # First call: the capacity-row program once, the decode program twice.
     assert calls == [(None, 128, False), (decode, 256, True), (decode, 256, True)]
     calls.clear()
+    _step0(proposer, 256, 48)
+    assert calls == [(decode, 256, True)]
+    # Another bucket gets its own compiled module (one compile per vLLM
+    # backend), warmed once like the first.
+    calls.clear()
     _step0(proposer, 128, 32)
-    assert calls == [(decode, 128, True)]
+    other = proposer._decode_rows_models[128]
+    assert other is not decode
+    assert calls == [(other, 128, True), (other, 128, True)]
+    calls.clear()
+    _step0(proposer, 128, 20)
+    assert calls == [(other, 128, True)]
 
 
 def test_steps_outside_the_decode_bound_keep_capacity_rows():
