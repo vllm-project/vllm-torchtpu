@@ -464,6 +464,25 @@ def test_prebuild_declines_what_the_kernel_cannot_compute(
     assert reason in warnings[0]
 
 
+def test_prebuild_declines_a_compacted_rope_cache(monkeypatch):
+    """A NeoX cache whose trailing angle pairs were compacted away holds fewer
+    columns than the rotary dims the kernel reads."""
+    warnings = []
+    monkeypatch.setattr(
+        fused.logger, "warning_once", lambda msg, *args: warnings.append(msg % args)
+    )
+    layer = _layer(fused_qk_norm_rope=False)
+    rope = layer.rotary_emb
+    half = ROT // 2
+    compact = torch.cat(
+        (rope.cos_sin_cache[:, : half - 4], rope.cos_sin_cache[:, half : ROT - 4]), -1
+    )
+    rope.register_buffer("cos_sin_cache", compact, persistent=False)
+    assert not fused._prebuild(layer, SimpleNamespace(multimodal_config=None))
+    assert not fused._ops
+    assert f"holds {ROT - 8} of the {ROT} rotary columns" in warnings[0]
+
+
 def test_prebuild_arms_both_backbone_and_eagle_head_graphs():
     """Because the row-count fork lives inside the lowered JAX op rather than
     in Python during Dynamo tracing, both 'backbone' and 'eagle_head' arm."""
