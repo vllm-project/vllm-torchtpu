@@ -48,8 +48,10 @@ off by default, so a pipeline that sets none of them is scheduled as before.
 
 import math
 import time
+from itertools import islice
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
+from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_torchtpu import envs
@@ -139,8 +141,6 @@ class TpuPipelineChunkScheduler(Scheduler):
     # PrefixAwareScheduler, which this class is not.
     _MEMO_LOG_CAP = PrefixAwareScheduler._MEMO_LOG_CAP
     _MEMO_VERIFY_REUSES = PrefixAwareScheduler._MEMO_VERIFY_REUSES
-    _PAW_SORT_LOG_INTERVAL_S = PrefixAwareScheduler._PAW_SORT_LOG_INTERVAL_S
-    _PAW_SORT_WINDOW = PrefixAwareScheduler._PAW_SORT_WINDOW
     WINDOW = PrefixAwareScheduler.WINDOW
     _enable_memo_xstep: Any = PrefixAwareScheduler._enable_memo_xstep
     _memo_trim_log: Any = PrefixAwareScheduler._memo_trim_log
@@ -152,9 +152,7 @@ class TpuPipelineChunkScheduler(Scheduler):
     _prefix_warmth: Any = PrefixAwareScheduler._prefix_warmth
     _external_warmth: Any = PrefixAwareScheduler._external_warmth
     _get_paw_aging_rate: Any = PrefixAwareScheduler._get_paw_aging_rate
-    _now = PrefixAwareScheduler._now
-    _init_paw_sort: Any = PrefixAwareScheduler._init_paw_sort
-    _sort_waiting_queue: Any = PrefixAwareScheduler._sort_waiting_queue
+    _now: Any = PrefixAwareScheduler._now
     _select_waiting_queue_for_scheduling: Any = (
         PrefixAwareScheduler._select_waiting_queue_for_scheduling
     )
@@ -301,6 +299,86 @@ class TpuPipelineChunkScheduler(Scheduler):
         if rate <= 0:
             return eff
         return eff - rate * _wait_seconds(request, now)
+
+    # ------------------------------------------------------------------
+    # Waiting-queue sort of the prefix-aware admission, on a KV producer,
+    # together with the aging rate (option paw_aging_tok_per_s): without an
+    # aging rate a large prompt could be overtaken without bound.
+    #
+    # ``_promote_warmest`` moves one request per queue to the head. With the
+    # sort on, ``schedule()`` also stable-sorts the first _PAW_SORT_WINDOW
+    # requests of ``waiting`` before the base scheduler admits from it, so
+    # every admission of the step follows the order. The key is the
+    # request's estimated uncached prompt tokens (prompt minus local HBM hit
+    # minus a loadable external hit), priced quadratically under the option
+    # quadratic_cost, minus the aging rate x seconds waited, which bounds how
+    # long a large prompt can be overtaken. Requests that already hold
+    # computed tokens or were preempted go first, and requests whose uncached
+    # tokens do not fit the free HBM blocks go last, so they cannot stall the
+    # head.
+    # ------------------------------------------------------------------
+    _PAW_SORT_LOG_INTERVAL_S = 60.0
+    _PAW_SORT_WINDOW = 128
+
+    def _init_paw_sort(self) -> None:
+        self._paw_sort = self._is_kv_producer
+        self._paw_sort_window = self._PAW_SORT_WINDOW
+        self._paw_sort_steps = 0
+        self._paw_sort_reordered = 0
+        self._paw_sort_moved = 0
+        self._paw_sort_head_cold = 0
+        self._paw_sort_log_t = time.monotonic()
+        if self._paw_sort:
+            logger.info(
+                "Pipeline chunk scheduler: waiting-queue SRPF sort ACTIVE "
+                "(window=%d, aging_tok_per_s=%g)",
+                self._paw_sort_window,
+                self._get_paw_aging_rate(),
+            )
+
+    def _sort_waiting_queue(self) -> None:
+        """Stable-sort the first _PAW_SORT_WINDOW waiting requests by
+        ``_paw_sort_key`` in place."""
+        queue = self.waiting
+        if self.policy != SchedulingPolicy.FCFS or len(queue) < 2:
+            return
+        window = list(islice(queue, self._paw_sort_window))
+        free_blocks = self._get_num_free_blocks()
+        free_blocks_for_ext = free_blocks
+        if free_blocks is not None and self._is_kv_producer:
+            reserved = self._inflight_prefill_reserved_blocks()
+            free_blocks_for_ext = max(0, free_blocks - reserved)
+        # The step's wall time, the clock _promote_warmest ages on.
+        now = self._now()
+        keys = [
+            self._paw_sort_key(r, now, free_blocks, free_blocks_for_ext) for r in window
+        ]
+        order = sorted(range(len(window)), key=lambda i: (keys[i], i))
+        self._paw_sort_steps += 1
+        head = window[order[0]]
+        self._paw_sort_head_cold += max(
+            int(head.num_tokens) - self._prefix_warmth(head), 0
+        )
+        if order != list(range(len(window))):
+            self._paw_sort_reordered += 1
+            self._paw_sort_moved += sum(1 for pos, i in enumerate(order) if pos != i)
+            # The window is the queue's head: pop it and put it back sorted.
+            for _ in window:
+                queue.pop_request()
+            # prepend_requests reverses its argument (deque.extendleft).
+            queue.prepend_requests([window[i] for i in reversed(order)])
+        now_m = time.monotonic()
+        if now_m - self._paw_sort_log_t >= self._PAW_SORT_LOG_INTERVAL_S:
+            self._paw_sort_log_t = now_m
+            logger.info(
+                "paw-sort telemetry: steps=%d reordered=%d moved=%d "
+                "mean_head_cold_tokens=%.0f waiting=%d",
+                self._paw_sort_steps,
+                self._paw_sort_reordered,
+                self._paw_sort_moved,
+                self._paw_sort_head_cold / max(self._paw_sort_steps, 1),
+                len(queue),
+            )
 
     def _paw_sort_key(
         self,

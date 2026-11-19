@@ -37,9 +37,8 @@ prefetches remote KV for waiting requests past a full running set
 (``kv_prefetch``, which lifts ``max_num_active_reqs`` for vLLM's waiting loop
 and enforces the cap itself) and, with decode context parallelism, throttles
 how many remote loads it admits (``decode_inflight_throttle``, through the
-async-load block reservation). The waiting-queue sort helpers below are for
-the pipeline-parallel prefill scheduler (#3090); this scheduler does not
-sort.
+async-load block reservation). This scheduler does not sort the waiting
+queue.
 
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
@@ -417,128 +416,6 @@ class PrefixAwareScheduler(AsyncScheduler):
             len(self.running),
             len(self.waiting) + len(self.kv_holding_waiting),
         )
-
-    # ------------------------------------------------------------------
-    # Waiting-queue sort, for the pipeline chunk scheduler's prefix-aware
-    # admission (#3090), which borrows these helpers and turns the sort on
-    # for a KV producer together with its aging rate. PrefixAwareScheduler
-    # itself does not sort: none of its legs ran the sort, and without an
-    # aging rate a large prompt could be overtaken without bound.
-    #
-    # ``_promote_warmest`` moves one request per queue to the head. With the
-    # sort on, the borrowing scheduler's ``schedule()`` also stable-sorts the
-    # first _PAW_SORT_WINDOW requests of ``waiting`` before the base
-    # scheduler admits from it, so every admission of the step follows the
-    # order. The key is the request's estimated uncached prompt tokens
-    # (prompt minus local HBM hit minus a loadable external hit) minus
-    # the aging rate x seconds waited, which bounds how long a
-    # large prompt can be overtaken. Requests that already hold computed
-    # tokens or were preempted go first, and requests whose uncached tokens
-    # do not fit the free HBM blocks go last, so they cannot stall the head.
-    # ------------------------------------------------------------------
-    _PAW_SORT_LOG_INTERVAL_S = 60.0
-    _PAW_SORT_WINDOW = 128
-
-    def _init_paw_sort(self) -> None:
-        self._paw_sort = bool(getattr(self, "_is_kv_producer", False))
-        self._paw_sort_window = self._PAW_SORT_WINDOW
-        self._paw_sort_steps = 0
-        self._paw_sort_reordered = 0
-        self._paw_sort_moved = 0
-        self._paw_sort_head_cold = 0
-        self._paw_sort_log_t = time.monotonic()
-        if self._paw_sort:
-            logger.info(
-                "PrefixAwareScheduler: waiting-queue SRPF sort ACTIVE "
-                "(window=%d, aging_tok_per_s=%g)",
-                self._paw_sort_window,
-                self._get_paw_aging_rate(),
-            )
-
-    def _paw_sort_key(
-        self,
-        request: Request,
-        now: float,
-        free_blocks: int | None,
-        free_blocks_for_ext: int | None,
-    ) -> tuple[int, int, float, float]:
-        """Sort key of the waiting-queue sort; lower is admitted first."""
-        local_warmth = self._prefix_warmth(request)
-        num_tokens = int(request.num_tokens)
-        hbm_cold_tokens = max(num_tokens - local_warmth, 0)
-        block_size = self._get_block_size()
-        fits_hbm = (
-            free_blocks is None
-            or math.ceil(hbm_cold_tokens / block_size) <= free_blocks
-        )
-        ext_warmth = self._external_warmth(request, local_warmth)
-        if ext_warmth > 0 and not (
-            fits_hbm
-            and (
-                free_blocks_for_ext is None
-                or math.ceil(ext_warmth / block_size) <= free_blocks_for_ext
-            )
-        ):
-            ext_warmth = 0
-        uncached = max(num_tokens - local_warmth - ext_warmth, 0)
-        arrival = float(getattr(request, "arrival_time", now) or now)
-        rate = self._get_paw_aging_rate()
-        aged = uncached - rate * max(0.0, now - arrival)
-        started = (
-            getattr(request, "num_preemptions", 0) > 0
-            or getattr(request, "num_computed_tokens", 0) > 0
-        )
-        return (0 if fits_hbm else 1, 0 if started else 1, aged, arrival)
-
-    def _sort_waiting_queue(self) -> None:
-        """Stable-sort the first _PAW_SORT_WINDOW waiting requests by
-        ``_paw_sort_key`` in place."""
-        queue = self.waiting
-        if self.policy != SchedulingPolicy.FCFS or len(queue) < 2:
-            return
-        window = list(islice(queue, self._paw_sort_window))
-        free_blocks = self._get_num_free_blocks()
-        free_blocks_for_ext = free_blocks
-        if (
-            free_blocks is not None
-            and getattr(self, "_is_kv_producer", False)
-            and hasattr(self, "_inflight_prefill_reserved_blocks")
-        ):
-            try:
-                reserved = int(self._inflight_prefill_reserved_blocks() or 0)
-            except Exception:
-                reserved = 0
-            free_blocks_for_ext = max(0, free_blocks - reserved)
-        now = time.time()
-        keys = [
-            self._paw_sort_key(r, now, free_blocks, free_blocks_for_ext) for r in window
-        ]
-        order = sorted(range(len(window)), key=lambda i: (keys[i], i))
-        self._paw_sort_steps += 1
-        head = window[order[0]]
-        self._paw_sort_head_cold += max(
-            int(head.num_tokens) - self._prefix_warmth(head), 0
-        )
-        if order != list(range(len(window))):
-            self._paw_sort_reordered += 1
-            self._paw_sort_moved += sum(1 for pos, i in enumerate(order) if pos != i)
-            # The window is the queue's head: pop it and put it back sorted.
-            for _ in window:
-                queue.pop_request()
-            # prepend_requests reverses its argument (deque.extendleft).
-            queue.prepend_requests([window[i] for i in reversed(order)])
-        now_m = time.monotonic()
-        if now_m - self._paw_sort_log_t >= self._PAW_SORT_LOG_INTERVAL_S:
-            self._paw_sort_log_t = now_m
-            logger.info(
-                "paw-sort telemetry: steps=%d reordered=%d moved=%d "
-                "mean_head_cold_tokens=%.0f waiting=%d",
-                self._paw_sort_steps,
-                self._paw_sort_reordered,
-                self._paw_sort_moved,
-                self._paw_sort_head_cold / max(self._paw_sort_steps, 1),
-                len(queue),
-            )
 
     # ------------------------------------------------------------------
     # Cross-step memo of find_longest_cache_hit.
