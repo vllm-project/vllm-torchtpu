@@ -444,8 +444,13 @@ def _validate_routed_experts_config(vllm_config: "VllmConfig") -> None:
         ),
         # Placed layers pick expert slots, not checkpoint expert ids.
         "TPU_EXPERT_PLACEMENT": bool(envs.TPU_EXPERT_PLACEMENT),
-        # Rows of rejected drafts are kept.
-        "speculative decoding": vllm_config.speculative_config is not None,
+        # Under async scheduling the next step starts after every scheduled
+        # draft, trimmed ones included, but the step returns no row for a
+        # trimmed draft, so vLLM's connector fails the step.
+        "enable_adaptive_verification": (
+            vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.enable_adaptive_verification
+        ),
         # Untested.
         "kv_transfer_config": vllm_config.kv_transfer_config is not None,
         # vLLM builds a KV transfer config from this flag only after this

@@ -6028,6 +6028,7 @@ class TPUModelRunner(GPUModelRunner):
             routed_experts_output = self._routed_experts.prepare_output(
                 req_ids,
                 scheduler_output.num_scheduled_tokens,
+                scheduler_output.scheduled_spec_decode_tokens,
                 self.input_batch.num_computed_tokens_cpu[: len(req_ids)],
             )
 

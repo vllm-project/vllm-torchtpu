@@ -91,10 +91,14 @@ def _forward(capture, model, num_tokens, bucket, seed):
 
 
 def _begin(capture, requests, block_hashes=None):
+    """Begins a step of `requests`: their ids, or a dict of each id's first
+    position that vLLM's connector has not returned yet."""
     capture.begin_step(
         AuxOutputConnectorMetadata(
             generation=0,
-            requests=dict.fromkeys(requests, 0),
+            requests=requests
+            if isinstance(requests, dict)
+            else dict.fromkeys(requests, 0),
             block_hashes=block_hashes or {},
             finished_requests=(),
         )
@@ -117,7 +121,7 @@ def test_every_forward_of_a_step_reaches_its_requests(capture, on_host):
     bc_rows = _forward(capture, model, 9, 16, seed=1)
     token_starts = np.zeros(3, dtype=np.int32)
     pending = capture.prepare_output(
-        ["a", "b", "c"], {"a": 12, "b": 6, "c": 3}, token_starts
+        ["a", "b", "c"], {"a": 12, "b": 6, "c": 3}, {}, token_starts
     )
     # The runner's next step can overwrite this array before the output is
     # processed.
@@ -132,7 +136,7 @@ def test_every_forward_of_a_step_reaches_its_requests(capture, on_host):
 
     _begin(capture, ["a"], {"a": _hashes(3)})
     a_rest = _forward(capture, model, 4, 16, seed=2)
-    pending = capture.prepare_output(["a"], {"a": 4}, np.array([12]))
+    pending = capture.prepare_output(["a"], {"a": 4}, {}, np.array([12]))
     outputs = pending.process_output([[9]])
 
     expected = torch.cat([a_rows, a_rest]).numpy()
@@ -146,9 +150,76 @@ def test_a_rank_that_does_not_publish_copies_nothing(build_capture, on_host):
     _forward(capture, model, 5, 16, seed=0)
 
     token_starts = np.zeros(1, dtype=np.int32)
-    assert capture.prepare_output(["a"], {"a": 5}, token_starts) is None
+    assert capture.prepare_output(["a"], {"a": 5}, {}, token_starts) is None
     assert not on_host
     assert not capture._capturer._step_copies
+
+
+def test_a_step_without_connector_metadata_leaves_no_rows_behind(capture):
+    """The speculative decoding warmup runs steps that the scheduler did not
+    build. They carry no connector metadata, so vLLM's connector takes no
+    snapshot of them. Their forwards are not copied to the host, so none is
+    left over for the next step's snapshot."""
+    capture, model = capture
+    capture.begin_step(None)
+    _forward(capture, model, 7, 16, seed=0)
+    token_starts = np.zeros(1, dtype=np.int32)
+    assert capture.prepare_output(["w"], {"w": 7}, {}, token_starts) is None
+
+    _begin(capture, ["b"])
+    rows = _forward(capture, model, 3, 16, seed=1)
+    pending = capture.prepare_output(["b"], {"b": 3}, {}, token_starts)
+    outputs = pending.process_output([[7]])
+
+    assert np.array_equal(outputs["b"].rows, rows.numpy())
+
+
+def test_a_step_without_connector_metadata_still_checks_its_forwards(capture):
+    capture, model = capture
+    model[1].capture_fn = None
+    capture.begin_step(None)
+
+    with pytest.raises(RuntimeError, match=r"MoE layers \[1\]"):
+        _forward(capture, model, 7, 16, seed=0)
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_rows_of_rejected_drafts_are_dropped(capture, async_scheduling):
+    """`b`, first in the step, runs its last token and 2 drafts and keeps all
+    3 rows. `a` runs its last token and 3 drafts but keeps 1, so its last 2
+    rows are dropped and its next step's row follows the kept ones. The
+    scheduler lists no drafts for `c`, whose 1 sampled token keeps its row.
+    Under async scheduling `a`'s next step is scheduled as if every draft
+    were accepted, 2 positions late, and vLLM's connector puts its row after
+    the kept ones. Each request starts at a block boundary, as after a
+    prefix-cache hit."""
+    capture, model = capture
+    _begin(capture, {"a": 8, "b": 16, "c": 24})
+    rows = _forward(capture, model, 8, 16, seed=0)
+    pending = capture.prepare_output(
+        ["b", "a", "c"],
+        {"a": 4, "b": 3, "c": 1},
+        {"a": [0, 0, 0], "b": [0, 0]},
+        np.array([16, 8, 24], dtype=np.int32),
+    )
+    outputs = pending.process_output([[1, 2, 3], [1, 2], [1]])
+
+    assert outputs["b"].token_start == 16
+    assert np.array_equal(outputs["b"].rows, rows[:3].numpy())
+    assert outputs["a"].token_start == 8
+    assert np.array_equal(outputs["a"].rows, rows[3:5].numpy())
+    assert np.array_equal(outputs["c"].rows, rows[7:].numpy())
+
+    _begin(capture, {"a": 10})
+    next_rows = _forward(capture, model, 1, 16, seed=1)
+    scheduled_start = 12 if async_scheduling else 10
+    pending = capture.prepare_output(
+        ["a"], {"a": 1}, {}, np.array([scheduled_start], dtype=np.int32)
+    )
+    outputs = pending.process_output([[5]])
+
+    assert outputs["a"].token_start == 10
+    assert np.array_equal(outputs["a"].rows, next_rows.numpy())
 
 
 def test_layers_capture_cannot_serve_are_refused(monkeypatch, on_host):
@@ -350,6 +421,7 @@ def _scheduler_output(num_scheduled_tokens, finished_requests=()):
         total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
         scheduled_encoder_inputs={},
         num_scheduled_tokens=num_scheduled_tokens,
+        scheduled_spec_decode_tokens={},
         finished_req_ids=set(finished_requests),
         has_structured_output_requests=False,
         aux_output_connector_metadata=AuxOutputConnectorMetadata(

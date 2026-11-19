@@ -1291,7 +1291,15 @@ class TestRoutedExpertsConfigValidation:
                 "MOE_FUSED_EP_KERNEL_IMPL=adaptive",
             ),
             ({}, {"TPU_EXPERT_PLACEMENT": "/tmp/p.json"}, "TPU_EXPERT_PLACEMENT"),
-            ({"speculative_config": object()}, {}, "speculative decoding"),
+            (
+                {
+                    "speculative_config": SimpleNamespace(
+                        method="dspark", enable_adaptive_verification=True
+                    )
+                },
+                {},
+                "enable_adaptive_verification",
+            ),
             ({"kv_transfer_config": object()}, {}, "kv_transfer_config"),
             ({"kv_offloading_size": 4.0}, {}, "--kv-offloading-size"),
         ],
@@ -1302,6 +1310,16 @@ class TestRoutedExpertsConfigValidation:
 
         with pytest.raises(NotImplementedError, match=setting):
             _validate_routed_experts_config(self._config(**kwargs))
+
+    def test_speculative_decoding_passes(self):
+        """The runner drops each request's rows of rejected drafts."""
+        _validate_routed_experts_config(
+            self._config(
+                speculative_config=SimpleNamespace(
+                    method="mtp", enable_adaptive_verification=False
+                )
+            )
+        )
 
     def test_fused_ep_v2_is_left_to_the_loaded_layers(self, monkeypatch):
         """Setting MOE_FUSED_EP_KERNEL_IMPL=v2 alone does not fail startup: it
