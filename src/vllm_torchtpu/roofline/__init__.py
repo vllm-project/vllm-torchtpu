@@ -46,7 +46,14 @@ from .emit import (
     pool_cli_args,
     top_layouts,
 )
-from .geometry import LayerCounts, ModelGeometry, count_layer_types, from_hf_config
+from .geometry import (
+    LayerCounts,
+    ModelGeometry,
+    UnsupportedArchitectureError,
+    count_layer_types,
+    from_hf_config,
+    supports,
+)
 from .hf_loader import dtypes_from_hf_config, load_hf_config
 from .memory import (
     HbmBreakdown,
@@ -126,6 +133,7 @@ __all__ = [
     "StepShape",
     "TopKEntry",
     "TrafficScenario",
+    "UnsupportedArchitectureError",
     "active_experts_envelope",
     "bernoulli_expected_experts",
     "build_example_scenario",
@@ -151,6 +159,7 @@ __all__ = [
     "solve_serving_plan",
     "spec_cycle_floor",
     "step_floor",
+    "supports",
     "top_layouts",
     "torus_collective_s",
     "write_html",
