@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import torch
 from vllm.config import get_current_vllm_config_or_none
@@ -621,10 +622,12 @@ def initialize_engram_gate() -> None:
             hidden: jax.Array,
             q_weight: jax.Array,
             k_weight: jax.Array,
-            mask: jax.Array,
+            mask: jax.Array | None,
             eps: float,
             clamp: float,
         ) -> jax.Array:
+            if mask is None:
+                mask = jnp.ones(x.shape[0], jnp.float32)
             return engram_gate(
                 x, w, w_scale, hidden, q_weight, k_weight, mask, eps=eps, clamp=clamp
             )
@@ -1354,11 +1357,6 @@ class Engram(upstream.Engram):
             embedded = self.embed(hash_ids)
         x = embedded.flatten(-2)
         if self._fused_gate(x):
-            mask = (
-                hidden_states.new_ones(x.shape[0], dtype=torch.float32)
-                if token_mask is None
-                else token_mask
-            )
             assert _ENGRAM_GATE_OP is not None, "initialize_engram_gate() first"
             return _ENGRAM_GATE_OP(
                 x,
@@ -1367,7 +1365,7 @@ class Engram(upstream.Engram):
                 hidden_states,
                 self.q_weight,
                 self.k_weight,
-                mask,
+                token_mask,
                 self.eps,
                 self.clamp_value,
             )
