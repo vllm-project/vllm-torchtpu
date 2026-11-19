@@ -564,6 +564,7 @@ def fused_ep_moe_v2(
                 )
     (ax,) = mesh.axis_names
     ep = mesh.shape[ax]
+    single_host = len({d.process_index for d in mesh.devices.flat}) == 1
     if mesh_ep_ranks is not None:
         mesh_ep_ranks = tuple(int(rank) for rank in mesh_ep_ranks)
         if tuple(sorted(mesh_ep_ranks)) != tuple(range(ep)):
@@ -1274,12 +1275,14 @@ def fused_ep_moe_v2(
     def gather_exchange(packed):
         """The routing exchange [ep, width]: every shard's packed routing row.
 
-        Where the SparseCore can hold every row, each shard writes its row to
-        every peer in one round of remote copies, in place of XLA's SparseCore
-        all-gather, which passes the rows around a ring. Same rows in the same
-        order.
+        Where supports_direct_all_gather admits the exchange, each shard
+        writes its row to every peer in one round of remote copies, in place
+        of XLA's SparseCore all-gather, which passes the rows around a ring.
+        Same rows in the same order.
         """
-        if supports_direct_all_gather(ep, packed.size * packed.dtype.itemsize):
+        if supports_direct_all_gather(
+            ep, packed.size * packed.dtype.itemsize, single_host
+        ):
             gathered = direct_all_gather(packed, ax, ep)
         else:
             gathered = lax.all_gather(packed, ax, axis=0, tiled=True)
