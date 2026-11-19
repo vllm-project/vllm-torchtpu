@@ -25,6 +25,7 @@ import pytest
 from vllm.config import VllmConfig
 
 from vllm_torchtpu import _patch_vllm_config_hash_ignore_diagnostics
+from vllm_torchtpu.core.scheduler_options import SECTION as SCHEDULER_OPTIONS_SECTION
 from vllm_torchtpu.distributed import tpu_multiport_dp
 from vllm_torchtpu.runner.utils import (
     FRONTEND_OPTIONS_SECTION,
@@ -32,7 +33,6 @@ from vllm_torchtpu.runner.utils import (
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
     PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
     RUNNER_OPTIONS_SECTION,
-    SCHEDULER_OPTIONS_SECTION,
     WORKER_OPTIONS_SECTION,
 )
 
