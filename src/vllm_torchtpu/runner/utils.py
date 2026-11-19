@@ -26,6 +26,7 @@ from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from vllm_torchtpu import profiler_trace
+from vllm_torchtpu.core.scheduler_options import SECTION as SCHEDULER_OPTIONS_SECTION
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -49,14 +50,11 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_prefill_only_kv_len_threshold"
 )
 
-# Host-only section: the scheduler options (`core.scheduler_options`) only
-# decide admission order and never change a compiled program.
-SCHEDULER_OPTIONS_SECTION = "tpu_scheduler"
-
 # Keys that never change the compiled graph: the diagnostics-only profiler
 # knobs above, which only steer profiling, and the host-only scheduler
-# sections. `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of
-# the TPU compile cache key.
+# section (`core.scheduler_options`), which only decides admission order.
+# `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the TPU
+# compile cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
     {
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,

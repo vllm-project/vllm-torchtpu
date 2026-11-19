@@ -202,7 +202,8 @@ def _patch_vllm_aot_compile_cache_key() -> None:
 
 
 def _patch_vllm_config_hash_ignore_diagnostics() -> None:
-    """Keep diagnostics-only ``additional_config`` keys out of cache keys.
+    """Keep diagnostics-only and host-only ``additional_config`` keys out of
+    cache keys (``runner.utils.HASH_IGNORED_ADDITIONAL_CONFIG_KEYS``).
 
     ``VllmConfig.compute_hash()`` unconditionally folds
     ``json.dumps(additional_config)`` into its result, and that hash feeds both
@@ -249,8 +250,8 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
     VllmConfig.compute_hash = compute_hash
     VllmConfig._tpu_additional_config_hash_patch = True
     logger.info(
-        "Applied TPU patch: exclude diagnostics-only additional_config keys "
-        "%s from the compile cache key.",
+        "Applied TPU patch: exclude the diagnostics-only and host-only "
+        "additional_config keys %s from the compile cache key.",
         sorted(HASH_IGNORED_ADDITIONAL_CONFIG_KEYS),
     )
 

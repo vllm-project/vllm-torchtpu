@@ -25,11 +25,11 @@ import pytest
 from vllm.config import VllmConfig
 
 from vllm_torchtpu import _patch_vllm_config_hash_ignore_diagnostics
+from vllm_torchtpu.core.scheduler_options import SECTION as SCHEDULER_OPTIONS_SECTION
 from vllm_torchtpu.runner.utils import (
     HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
     PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
-    SCHEDULER_OPTIONS_SECTION,
 )
 
 KEY = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY
