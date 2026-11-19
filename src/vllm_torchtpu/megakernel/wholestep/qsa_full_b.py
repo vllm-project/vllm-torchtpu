@@ -235,6 +235,12 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.select_nvis = bool(int(select_nvis)) and per_request_scores
         # 2: also the union compaction (`qsa_ucompact`) over those rows.
         self.select_nvis_union = self.select_nvis and int(select_nvis) >= 2 and union_attn
+        # Parts (VLLM_TPU_MK_QSA_NVIS_PARTS, measurement only): t = thresholds, c = row
+        # compaction, u = union compaction.
+        parts = os.environ.get("VLLM_TPU_MK_QSA_NVIS_PARTS", "tcu")
+        self.nvis_thr = self.select_nvis and "t" in parts
+        self.nvis_cmp = self.select_nvis and "c" in parts
+        self.select_nvis_union = self.select_nvis_union and "u" in parts
         # 3: also the bisection `NVIS_DIGIT` bits per pass (fewer dependent count passes).
         self.nvis_digit = NVIS_DIGIT if self.select_nvis and int(select_nvis) >= 3 else 1
         self.nvis_rows = tuple(int(x) for x in nvis_rows)
