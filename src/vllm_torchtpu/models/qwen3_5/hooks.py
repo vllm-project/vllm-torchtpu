@@ -32,11 +32,12 @@ entries (``validation/``). Every other engine keeps main's behaviour.
   legs). Every other engine keeps the unit unset, so a PCP prefill leg
   resolves its hash block size from its KV cache groups.
 - ``additional_config["tpu_kv_transfer"]["kernel_page_tokens"]``: 128, for an
-  engine of the calibrated checkpoint shape with a KV transfer config and
-  without prefill context parallelism, so the prefill and decode legs of a
-  pair page their seq-along-lane caches alike (see
-  ``attention.kv_transfer_kernel_page``). A PCP prefill engine and other
-  checkpoints keep vLLM's page choice, as on main.
+  engine of the calibrated checkpoint shape with a KV transfer config, a
+  seq-along-lane KV cache layout and no prefill context parallelism, so the
+  prefill and decode legs of a pair page their seq-along-lane caches alike
+  (see ``attention.kv_transfer_kernel_page``). A PCP prefill engine, an
+  engine on another layout (whose page the transfer does not carry) and
+  other checkpoints keep vLLM's page choice, as on main.
 - ``tpu_pp_scheduler.hybrid_state_retention``: true on a prefill
   (``kv_producer``) leg with more than one pipeline stage, without context
   parallelism, whose pipeline chunk scheduler the platform installs (the
@@ -129,12 +130,49 @@ def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
     cache_config.prefix_match_unit = 128
 
 
+# vLLM's compatibility names for two KV cache layouts (VLLM_KV_CACHE_LAYOUT).
+_KV_LAYOUT_ALIASES = {"NHD": "LBNHC", "HND": "LBHNC"}
+
+
+def _kv_layout_is_seq_along_lane(vllm_config: VllmConfig) -> bool:
+    """Whether the engine's KV cache will be seq-along-lane, the only layout
+    whose kernel page the KV transfer carries.
+
+    The platform resolves the layout after this hook runs
+    (``resolve_kv_cache_layout``): a layout already on the cache config,
+    else ``VLLM_KV_CACHE_LAYOUT``, else the KV connector's required layout,
+    else the attention backend's first one. The TPU connectors require no
+    layout and every TPU attention backend lists a head-along-sublane layout
+    first, so without an explicit layout the cache is head-along-sublane.
+    """
+    from vllm import envs as vllm_envs
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    from vllm_torchtpu.kernels.experimental.batched_rpa import (
+        configs as batched_rpa_configs,
+    )
+    from vllm_torchtpu.layers.adapter.attention import KV_LAYOUT_BY_VLLM_LAYOUT
+
+    name = vllm_config.cache_config.kv_cache_layout or vllm_envs.VLLM_KV_CACHE_LAYOUT
+    if name is None:
+        return False
+    layout = KVCacheLayout[_KV_LAYOUT_ALIASES.get(name, name)]
+    return (
+        KV_LAYOUT_BY_VLLM_LAYOUT.get(layout)
+        is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+    )
+
+
 def _apply_kv_transfer_page(vllm_config: VllmConfig) -> None:
     if vllm_config.kv_transfer_config is None:
         return
     if vllm_config.parallel_config.prefill_context_parallel_size > 1:
         return
     if not has_calibrated_shape(vllm_config.model_config):
+        return
+    # On another layout the page would not apply, and the platform would
+    # warn about a setting the user never wrote.
+    if not _kv_layout_is_seq_along_lane(vllm_config):
         return
     from vllm_torchtpu.layers.adapter.attention import KV_TRANSFER_SECTION
 

@@ -109,6 +109,8 @@ def _vllm_config(
             prefix_match_unit=prefix_match_unit,
             prefix_cache_retention_interval=0,
             mamba_ssm_cache_dtype="auto",
+            # vLLM resolves the layout after the config hooks run.
+            kv_cache_layout=None,
         ),
         scheduler_config=SimpleNamespace(
             max_num_seqs=max_num_seqs,
