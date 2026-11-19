@@ -931,6 +931,7 @@ def _prefill_attention(
             **({"align_gather": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_ALIGN_GATHER else {}),
             **({"walk_pipe": envs.VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE} if envs.VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE else {}),
             **({"dot16": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_DOT16 else {}),
+            **({"vguard_none": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_VGUARD_NONE else {}),
         )
     from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
         block_sparse_gqa_attention,
