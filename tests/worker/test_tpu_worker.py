@@ -739,12 +739,14 @@ def test_warmup_freezes_heap_and_reports_compilation_time():
     )
     with (
         patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap") as freeze,
+        patch("vllm_torchtpu.worker.tpu_worker._drop_traced_module_refs") as drop,
         patch(
             "vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"
         ) as gc_debug,
     ):
         result = TPUWorker.compile_or_warm_up_model(worker)
     capture_model.assert_called_once_with()
+    drop.assert_called_once_with()
     freeze.assert_called_once_with()
     gc_debug.assert_called_once_with()
     assert result.language_model == worker.compilation_config.compilation_time
