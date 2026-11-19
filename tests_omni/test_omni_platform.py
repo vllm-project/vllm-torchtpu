@@ -1080,6 +1080,18 @@ def test_set_and_unset_device_control_env_var_single_chip(monkeypatch):
     assert os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] == "0"
 
 
+def test_unset_device_control_env_var_restores_parent_visible_chips(monkeypatch):
+    monkeypatch.setattr(OmniTpuPlatform, "_saved_spawn_env", None)
+    monkeypatch.setenv("TPU_VISIBLE_CHIPS", "4,5,6,7")
+
+    OmniTpuPlatform.set_device_control_env_var("0")
+    assert os.environ["TPU_VISIBLE_CHIPS"] == "0"
+
+    OmniTpuPlatform.unset_device_control_env_var()
+    assert os.environ["TPU_VISIBLE_CHIPS"] == "4,5,6,7"
+    assert OmniTpuPlatform._saved_spawn_env is None
+
+
 def test_set_device_control_env_var_multi_chip_and_empty(monkeypatch):
     monkeypatch.setattr(OmniTpuPlatform, "_saved_spawn_env", None)
     for key in (
