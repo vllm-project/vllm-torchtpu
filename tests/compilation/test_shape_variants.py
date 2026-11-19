@@ -1018,6 +1018,36 @@ def test_handover_reorders_graph_inputs_around_positional_intermediates():
     assert received == [("x", "weight", "bias")]
 
 
+def test_handover_refuses_named_inputs_moved_beside_a_changed_intermediate():
+    """The named graph inputs swap places while the intermediate keeps its
+    position but changes shape. Matching the named inputs by name alone would
+    hand the stored executable an intermediate it was not compiled for, so
+    the bucket is refused."""
+    stored_metas = {
+        "l_self_weight_": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+        "l_self_bias_": torch.empty(2, dtype=torch.bfloat16),
+        "getitem_3": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+    }
+    current_metas = {
+        **stored_metas,
+        "getitem_3": torch.empty(4, 2 * HIDDEN, dtype=torch.bfloat16),
+    }
+
+    def graph(order, metas):
+        g = _stub_graph(order, metas)
+        for node in g.graph.nodes:
+            if node.name.startswith("getitem"):
+                del node.meta["grapharg"]
+        return g
+
+    session = shape_variants.BucketExecutables()
+    stored = graph(["getitem_3", "l_self_weight_", "l_self_bias_"], stored_metas)
+    session.put("dir", "key", stored, lambda *a: a)
+    current = graph(["getitem_3", "l_self_bias_", "l_self_weight_"], current_metas)
+    with pytest.raises(shape_variants.ShapeSpecializationError, match="getitem_3"):
+        session.get("dir", "key", current)
+
+
 def test_handover_reorders_graph_inputs_that_carry_no_grapharg():
     """The graphs vLLM compiles carry no GraphArg: a tensor input is known by
     the tensor_dict Dynamo records on it, an int input by being the size
