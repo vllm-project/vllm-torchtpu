@@ -393,6 +393,35 @@ class TestTpuCompilerCache:
             ]
             assert self._sc_offload_flags() == expected
 
+    @pytest.mark.parametrize(
+        "extra_env,expected",
+        [
+            ({"TPU_ACCELERATOR_TYPE": "tpu7x-16"}, ["--xla_tpu_dvfs_p_state=7"]),
+            ({"TPU_ACCELERATOR_TYPE": "v7x-8"}, ["--xla_tpu_dvfs_p_state=7"]),
+            ({"TPU_ACCELERATOR_TYPE": "v6e-8"}, []),
+            # A state in LIBTPU_INIT_ARGS is kept as given, not doubled.
+            (
+                {
+                    "TPU_ACCELERATOR_TYPE": "tpu7x-16",
+                    "LIBTPU_INIT_ARGS": "--xla_tpu_dvfs_p_state=3",
+                },
+                ["--xla_tpu_dvfs_p_state=3"],
+            ),
+        ],
+    )
+    def test_env_override_dvfs_p_state_on_tpu7x(self, extra_env, expected):
+        """TPU v7 gets DVFS state 7 unless LIBTPU_INIT_ARGS names a state."""
+        with patch.dict(os.environ, extra_env, clear=True):
+            import vllm_torchtpu.env_override
+
+            importlib.reload(vllm_torchtpu.env_override)
+
+            assert [
+                token
+                for token in os.environ["LIBTPU_INIT_ARGS"].split()
+                if token.startswith(vllm_torchtpu.env_override.DVFS_P_STATE_FLAG)
+            ] == expected
+
     def test_env_override_user_all_reduce_flag_wins_with_prefill_kernel(self):
         """An all-reduce flag in LIBTPU_INIT_ARGS is kept as given."""
         env_mock = {
