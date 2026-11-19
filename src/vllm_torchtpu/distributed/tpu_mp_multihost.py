@@ -38,6 +38,11 @@ multi-host ICI mesh before local workers are forked:
   * TORCH_TPU_TOPOLOGY - ICI mesh shape for the full chip count, looked up
     the same way the Ray backend does (get_tpu_multihost_topology).
 
+A pipeline over several slices (`TPU_PP_SLICES`, see pp_slices.py) is the
+exception: there is no ICI mesh across its hosts, so each host's env
+describes its own slice alone, and every slice starts as a deployment of
+its own hosts would.
+
 There is no Ray actor system here to query other hosts' IPs, so a
 short-lived TCPStore rendezvous (host 0 is the store master) exchanges each
 host's IP address. TORCH_TPU_XPROF_SESSION_ID must also match across hosts
@@ -69,6 +74,7 @@ import torch.distributed as dist
 from vllm.utils.network_utils import get_ip
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.pp_slices import PipelineSlices, pipeline_slices
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -83,6 +89,9 @@ _RENDEZVOUS_TIMEOUT_S = 300
 # done"), so keep the master's store alive for the process lifetime instead
 # of letting it go out of scope.
 _keepalive_stores: list = []
+
+# This process's client of the rendezvous master (rendezvous_store).
+_rendezvous_client: dist.TCPStore | None = None
 
 
 def _rendezvous_port(base_port: int) -> int:
@@ -125,6 +134,73 @@ def _rendezvous_host_ips(
     return host_ips, xprof_session_id
 
 
+def rendezvous_store(parallel_config) -> dist.TCPStore:
+    """A client of the `--nnodes` rendezvous store, whose master node 0's
+    `vllm serve` process keeps alive (`_keepalive_stores`): a store every
+    host of the engine reaches after start-up too. One client per process.
+    """
+    global _rendezvous_client
+    if _rendezvous_client is None:
+        _rendezvous_client = dist.TCPStore(
+            host_name=parallel_config.master_addr,
+            port=_rendezvous_port(parallel_config.master_port),
+            is_master=False,
+            timeout=timedelta(seconds=_RENDEZVOUS_TIMEOUT_S),
+            wait_for_workers=False,
+        )
+    return _rendezvous_client
+
+
+def _prepare_slice_env(
+    layout: PipelineSlices, parallel_config, host_ips: list[str]
+) -> None:
+    """Describe only this host's slice of a pipeline over several slices to
+    TorchTPU: each slice starts as a deployment of its own hosts would, a
+    slice of one host like a one-host deployment."""
+    node_rank = parallel_config.node_rank
+    local_world_size = parallel_config.local_world_size
+    slice_ = layout.slice_of_node(node_rank)
+    hosts_per_slice = layout.hosts_of(slice_)
+    if hosts_per_slice == 1:
+        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+        TpuPlatform._prepare_singlehost_tpu_env(local_world_size)
+        logger.info(
+            "TPU mp multihost: node_rank=%d is pipeline slice %d of %d, one host",
+            node_rank,
+            slice_,
+            layout.slices,
+        )
+        return
+    first = layout.first_node_of(slice_)
+    slice_ips = host_ips[first : first + hosts_per_slice]
+    os.environ["MASTER_ADDR"] = slice_ips[0]
+    os.environ["MASTER_PORT"] = str(parallel_config.master_port)
+    base_port = envs.TORCH_TPU_BASE_PORT
+    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+        f"{ip}:{base_port + local_rank}"
+        for ip in slice_ips
+        for local_rank in range(local_world_size)
+    )
+    from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
+
+    os.environ["TORCH_TPU_TOPOLOGY"] = get_tpu_multihost_topology(
+        local_world_size * hosts_per_slice
+    )
+    os.environ["TPU_NUM_HOSTS"] = str(hosts_per_slice)
+    os.environ["NODE_RANK"] = str(node_rank - first)
+    logger.info(
+        "TPU mp multihost: node_rank=%d is pipeline slice %d of %d, hosts %s "
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES=%s TORCH_TPU_TOPOLOGY=%s",
+        node_rank,
+        slice_,
+        layout.slices,
+        slice_ips,
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"],
+        os.environ["TORCH_TPU_TOPOLOGY"],
+    )
+
+
 def prepare_mp_multihost_env(parallel_config) -> None:
     """Set TORCH_TPU_* env vars for a genuine multi-host `mp` backend run.
 
@@ -144,10 +220,13 @@ def prepare_mp_multihost_env(parallel_config) -> None:
     local_world_size = parallel_config.local_world_size
     total_chips = local_world_size * nnodes
     master_addr = parallel_config.master_addr
+    layout = pipeline_slices(parallel_config)
     # Native PjRt validates this endpoint independently of vLLM's c10d
-    # FileStore. Every host already agrees on the configured master pair.
-    os.environ.setdefault("MASTER_ADDR", master_addr)
-    os.environ.setdefault("MASTER_PORT", str(parallel_config.master_port))
+    # FileStore. Every host already agrees on the configured master pair;
+    # each slice of a sliced pipeline has a master of its own.
+    if layout is None:
+        os.environ.setdefault("MASTER_ADDR", master_addr)
+        os.environ.setdefault("MASTER_PORT", str(parallel_config.master_port))
     rendezvous_port = _rendezvous_port(parallel_config.master_port)
 
     logger.info(
@@ -167,6 +246,11 @@ def prepare_mp_multihost_env(parallel_config) -> None:
         port=rendezvous_port,
         key_prefix="tpu_mp_nnodes",
     )
+    if layout is not None:
+        _prepare_slice_env(layout, parallel_config, host_ips)
+        os.environ["TORCH_TPU_XPROF_SESSION_ID"] = xprof_session_id
+        os.environ[_DONE_SENTINEL] = str(nnodes)
+        return
 
     # Same construction as ray_distributed_executor_v2.py: one address per chip,
     # ordered by (host, local_rank), spanning every host in the slice.

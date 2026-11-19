@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     TPU_PP_EQUAL_COST_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_PP_HANDOFF_DEPTH: int = 2
+    TPU_PP_SLICES: str = "1"
     TPU_PP_DCN_STREAMS: int = 4
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
@@ -948,6 +949,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Pipeline parallelism: the forwards a stage may queue for sending to the
     # next stage before end_forward waits for room (distributed/pp_buffered.py).
     "TPU_PP_HANDOFF_DEPTH": env_int("TPU_PP_HANDOFF_DEPTH", 2),
+    # Pipeline parallelism: the TPU slices the pipeline spans, each a run of
+    # consecutive stages on its own hosts: a number of equal slices, or the
+    # stages of each slice in pipeline order, such as "4,2"
+    # (distributed/pp_slices.py).
+    "TPU_PP_SLICES": env_str("TPU_PP_SLICES", "1"),
     # Pipeline parallelism: the parallel TCP streams of each hand-off between
     # two TPU slices (distributed/pp_dcn_link.py).
     "TPU_PP_DCN_STREAMS": env_int("TPU_PP_DCN_STREAMS", 4),

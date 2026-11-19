@@ -153,14 +153,16 @@ def get_cp_group_layout(group: Any | None) -> CpGroupLayout:
 
 
 def get_pipeline_stage() -> tuple[int, int]:
-    """This worker's pipeline stage and the number of stages.
+    """This worker's pipeline stage and the number of stages, both within
+    its torch.distributed world: its slice's stages under a pipeline over
+    several slices (pp_slices), every stage otherwise.
 
     (0, 1) without pipeline parallelism or before distributed init.
     """
     try:
-        from vllm.distributed.parallel_state import get_pp_group
+        from vllm_torchtpu.distributed.pp_slices import in_slice_pipeline_group
 
-        group = get_pp_group()
+        group = in_slice_pipeline_group()
     except (AssertionError, ImportError):
         return 0, 1
     return int(group.rank_in_group), int(group.world_size)

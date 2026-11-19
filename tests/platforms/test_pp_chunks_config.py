@@ -118,3 +118,12 @@ def test_pipeline_knobs_do_not_change_the_compile_cache_key():
     assert "TPU_PP_EQUAL_COST_CHUNKS" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
     assert "TPU_PP_CHUNK_SLACK" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
     assert "TPU_PP_HANDOFF_DEPTH" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+    assert "TPU_PP_DCN_STREAMS" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+
+
+def test_the_slices_of_a_pipeline_change_the_compile_cache_key():
+    # Each slice is a torch.distributed world of its own, so the slice count
+    # moves a stage's devices within its world, and with them the device
+    # assignment of its meshes; nothing else in the key tells the layouts
+    # apart.
+    assert "TPU_PP_SLICES" not in tpu_compiler._TPU_COMPILE_ENV_IGNORED

@@ -453,3 +453,98 @@ def test_executor_slice_binding_rejects_pcp():
 
     with pytest.raises(NotImplementedError, match="context parallelism"):
         binding.get_tpu_worker_binding(pc, rank=1, local_rank=1, env=env)
+
+
+@pytest.mark.parametrize(
+    ("rank", "local_rank", "slice_rank"),
+    [(0, 0, 0), (7, 7, 7), (8, 0, 0), (15, 7, 7)],
+)
+def test_a_sliced_pipeline_binds_each_worker_into_its_slices_world(
+    monkeypatch, rank, local_rank, slice_rank
+):
+    """PP16 of one device a stage over two slices of one host each: every
+    slice is a torch.distributed world of eight ranks from 0, and the chip
+    a worker opens is unchanged."""
+    monkeypatch.setenv("TPU_PP_SLICES", "2")
+    config = _parallel_config(
+        pipeline_parallel_size=16,
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=1,
+        world_size=16,
+        nnodes=2,
+        local_world_size=8,
+    )
+    b = binding.get_tpu_worker_binding(config, rank=rank, local_rank=local_rank, env={})
+
+    assert (b.rank, b.world_size) == (slice_rank, 8)
+    assert (b.init_rank, b.init_world_size) == (slice_rank, 8)
+    assert (b.init_local_rank, b.native_local_rank) == (local_rank, local_rank)
+    assert b.as_env() == {
+        "RANK": str(slice_rank),
+        "LOCAL_RANK": str(local_rank),
+        "WORLD_SIZE": "8",
+        "LOCAL_WORLD_SIZE": "8",
+    }
+
+
+def test_a_sliced_pipeline_of_pcp_stages_rebases_the_spawned_worker(monkeypatch):
+    """PP4 x PCP4 over two slices of one host each: engine rank 12 is rank 4
+    of slice 1."""
+    monkeypatch.setenv("TPU_PP_SLICES", "2")
+    config = _parallel_config(
+        pipeline_parallel_size=4,
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=4,
+        world_size=16,
+        nnodes=2,
+        local_world_size=8,
+    )
+    b = binding.get_tpu_worker_binding(
+        config,
+        rank=12,
+        local_rank=4,
+        env={"LOCAL_RANK": "4"},
+        use_spawned_pcp_local_rank=True,
+    )
+
+    assert (b.rank, b.world_size, b.init_rank, b.init_world_size) == (4, 8, 4, 8)
+    assert (b.local_rank, b.init_local_rank) == (4, 4)
+
+
+def test_one_slice_keeps_engine_ranks(monkeypatch):
+    monkeypatch.setenv("TPU_PP_SLICES", "1")
+    config = _parallel_config(
+        pipeline_parallel_size=16,
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=1,
+        world_size=16,
+        nnodes=2,
+        local_world_size=8,
+    )
+    b = binding.get_tpu_worker_binding(config, rank=12, local_rank=4, env={})
+    assert (b.rank, b.world_size, b.init_rank, b.init_world_size) == (12, 16, 12, 16)
+
+
+@pytest.mark.parametrize(
+    ("rank", "local_rank", "slice_rank", "slice_world"),
+    [(0, 0, 0, 8), (7, 3, 7, 8), (8, 0, 0, 4), (11, 3, 3, 4)],
+)
+def test_a_rank_of_a_smaller_slice_binds_into_its_slices_world(
+    monkeypatch, rank, local_rank, slice_rank, slice_world
+):
+    """PP12 of one device a stage on three hosts of four, as stages (8, 4):
+    slice 0 on two hosts, slice 1 on one."""
+    monkeypatch.setenv("TPU_PP_SLICES", "8,4")
+    config = _parallel_config(
+        pipeline_parallel_size=12,
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=1,
+        world_size=12,
+        nnodes=3,
+        local_world_size=4,
+    )
+    b = binding.get_tpu_worker_binding(config, rank=rank, local_rank=local_rank, env={})
+
+    assert (b.rank, b.world_size) == (slice_rank, slice_world)
+    assert (b.init_rank, b.init_world_size) == (slice_rank, slice_world)
+    assert (b.local_rank, b.local_world_size) == (local_rank, 4)

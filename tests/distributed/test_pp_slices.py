@@ -23,8 +23,59 @@ from vllm.distributed import parallel_state
 from vllm.distributed.device_communicators import shm_broadcast
 
 from tests.distributed.store_test_utils import TIMEOUT, FakeStore
-from vllm_torchtpu.distributed import pp_slices
+from vllm_torchtpu.distributed import mesh_utils, pp_slices
 from vllm_torchtpu.distributed.pp_slices import PipelineSlices
+
+
+def _parallel_config(pp, nnodes, world_size):
+    return SimpleNamespace(
+        pipeline_parallel_size=pp, nnodes=nnodes, world_size=world_size
+    )
+
+
+def test_one_slice_has_no_layout(monkeypatch):
+    monkeypatch.delenv("TPU_PP_SLICES", raising=False)
+    assert pp_slices.pipeline_slices(_parallel_config(4, 2, 4)) is None
+    monkeypatch.setenv("TPU_PP_SLICES", "1")
+    assert pp_slices.pipeline_slices(_parallel_config(4, 2, 4)) is None
+    assert pp_slices.pipeline_slices(_parallel_config(1, 2, 16)) is None
+
+
+def test_the_layout_cuts_stages_hosts_and_ranks_slice_major(monkeypatch):
+    monkeypatch.setenv("TPU_PP_SLICES", "2")
+    # Four stages of eight workers on four hosts of eight: two hosts and two
+    # stages a slice.
+    layout = pp_slices.pipeline_slices(_parallel_config(4, 4, 32))
+    assert layout == PipelineSlices(ranks=(16, 16), stages=4, nnodes=4)
+    assert (
+        layout.stages_of(1),
+        layout.world_size_of(1),
+        layout.hosts_of(1),
+        layout.stage_width,
+    ) == (2, 16, 2, 8)
+    assert [layout.slice_of_rank(r) for r in (0, 15, 16, 31)] == [0, 0, 1, 1]
+    assert [layout.slice_of_node(n) for n in range(4)] == [0, 0, 1, 1]
+    assert [layout.slice_start(r) for r in (0, 15, 16, 31)] == [0, 0, 16, 16]
+
+
+@pytest.mark.parametrize(
+    ("slices", "pp", "nnodes", "message"),
+    [
+        ("3", 4, 3, r"TPU_PP_SLICES=3 must divide --pipeline-parallel-size \(4\)"),
+        ("2", 4, 3, r"TPU_PP_SLICES=2 must divide --nnodes \(3\)"),
+        ("2", 4, 1, r"TPU_PP_SLICES=2 must divide --nnodes \(1\)"),
+        # an engine without a pipeline
+        ("2", 1, 2, r"TPU_PP_SLICES=2 must divide --pipeline-parallel-size \(1\)"),
+        ("0", 4, 2, r"TPU_PP_SLICES must be at least 1, got 0\."),
+        ("-1", 4, 2, r"TPU_PP_SLICES must be at least 1, got -1\."),
+    ],
+)
+def test_slices_of_unequal_stages_or_hosts_are_refused(
+    monkeypatch, slices, pp, nnodes, message
+):
+    monkeypatch.setenv("TPU_PP_SLICES", slices)
+    with pytest.raises(ValueError, match=message):
+        pp_slices.pipeline_slices(_parallel_config(pp, nnodes, pp))
 
 
 @pytest.mark.parametrize(
@@ -64,6 +115,65 @@ def test_slices_of_different_sizes_follow_from_their_ranks(
         assert layout.slice_start(rank) == layout.first_rank_of(
             layout.slice_of_rank(rank)
         )
+
+
+@pytest.mark.parametrize(
+    ("text", "pp", "nnodes", "world_size", "ranks"),
+    [
+        ("4,2", 6, 6, 6, (4, 2)),
+        ("4,2", 6, 3, 6, (4, 2)),
+        ("2,1", 3, 3, 12, (8, 4)),
+        ("1,2,1", 4, 4, 8, (2, 4, 2)),
+        # a trailing comma ends the list; spaces around an entry are fine
+        ("4, 2,", 6, 6, 6, (4, 2)),
+    ],
+)
+def test_a_list_gives_the_stages_of_each_slice(
+    monkeypatch, text, pp, nnodes, world_size, ranks
+):
+    monkeypatch.setenv("TPU_PP_SLICES", text)
+    layout = pp_slices.pipeline_slices(_parallel_config(pp, nnodes, world_size))
+    assert layout == PipelineSlices(ranks=ranks, stages=pp, nnodes=nnodes)
+
+
+@pytest.mark.parametrize(
+    ("number", "listed", "pp", "nnodes", "world_size"),
+    [("2", "2,2", 4, 4, 32), ("3", "2,2,2", 6, 3, 6), ("2", "8,8", 16, 2, 16)],
+)
+def test_a_number_and_a_list_of_equal_slices_agree(
+    monkeypatch, number, listed, pp, nnodes, world_size
+):
+    config = _parallel_config(pp, nnodes, world_size)
+    monkeypatch.setenv("TPU_PP_SLICES", number)
+    equal = pp_slices.pipeline_slices(config)
+    monkeypatch.setenv("TPU_PP_SLICES", listed)
+    assert pp_slices.pipeline_slices(config) == equal
+
+
+@pytest.mark.parametrize(
+    ("text", "pp", "nnodes", "message"),
+    [
+        ("4,", 6, 6, r"TPU_PP_SLICES=4, lists one slice.*unset TPU_PP_SLICES"),
+        ("4,0", 4, 4, r"TPU_PP_SLICES=4,0: every slice holds at least 1 stage"),
+        ("4,-1", 3, 3, r"every slice holds at least 1 stage"),
+        ("3,2", 6, 6, r"lists 5 stages.*--pipeline-parallel-size \(6\)"),
+        # an engine without a pipeline
+        ("1,1", 1, 2, r"lists 2 stages.*--pipeline-parallel-size \(1\)"),
+        # stages of one rank on two hosts of three
+        ("4,2", 6, 2, r"slice 0 holds 4 engine ranks.*every host runs 3 workers"),
+        ("two", 4, 2, r"TPU_PP_SLICES='two' is neither a number"),
+        ("4;2", 6, 6, r"TPU_PP_SLICES='4;2' is neither a number"),
+        ("4,,2", 6, 6, r"is neither a number"),
+        ("4.0,2", 6, 6, r"is neither a number"),
+        (",", 6, 6, r"is neither a number"),
+    ],
+)
+def test_a_list_that_does_not_cut_the_pipeline_is_refused(
+    monkeypatch, text, pp, nnodes, message
+):
+    monkeypatch.setenv("TPU_PP_SLICES", text)
+    with pytest.raises(ValueError, match=message):
+        pp_slices.pipeline_slices(_parallel_config(pp, nnodes, pp))
 
 
 class _InSlice(SimpleNamespace):
@@ -232,6 +342,8 @@ def test_code_inside_the_torch_world_keeps_the_slice_pipeline(monkeypatch):
     assert parallel_state.get_pp_group() is group and group.store is store
     assert (group.rank_in_group, group.world_size) == (3, 4)
     assert pp_slices.in_slice_pipeline_group() is in_slice
+    # the meshes of PCP and EP are built inside the slice's torch world
+    assert mesh_utils.get_pipeline_stage() == (1, 2)
 
 
 @pytest.mark.parametrize(
