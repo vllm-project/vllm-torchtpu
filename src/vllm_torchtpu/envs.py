@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_MASK_VIEW: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_VGUARD_LEAN: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_ALIGN_GATHER: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_GATHERED: str = ""
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS: int = 4
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
@@ -1102,6 +1103,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ALIGN_GATHER (PA-0): union_walk_prefill builds its group-aligned row layout by an inverse row gather (each
     # aligned slot computes its source row) instead of a fill + scatter. Pure data movement: bit-identical.
     "VLLM_TPU_QSA_PREFILL_UNION_ALIGN_GATHER": env_bool("VLLM_TPU_QSA_PREFILL_UNION_ALIGN_GATHER"),
+    # q38 UNION-BUILD (default off; gathered walk only): WALK_PIPE: the gathered walk's tile loop software-pipelined (stage A
+    # = mask / decode / guard / masked QK of tile t + 1 beside stage B = softmax / PV / state of tile t, in one block, the
+    # staged scores and values in VMEM). The served per-tile ops on the same operands, the state in tile order: bitwise
+    # the served walk (a TPU measurement). Kernel name gains _pipe; one engagement line per trace.
+    "VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE": env_bool("VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE"),
     # GATHERED ("", "reference", "sparsecore"; with LISTED): the walk-free kernel on chunked gathered tiles.
     "VLLM_TPU_QSA_PREFILL_UNION_GATHERED": env_str("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", ""),
     "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS": env_int("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", 4),

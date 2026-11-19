@@ -929,6 +929,7 @@ def _prefill_attention(
             **({"mask_view": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_MASK_VIEW else {}),
             **({"vguard_lean": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_VGUARD_LEAN else {}),
             **({"align_gather": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_ALIGN_GATHER else {}),
+            **({"walk_pipe": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE else {}),
         )
     from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
         block_sparse_gqa_attention,
