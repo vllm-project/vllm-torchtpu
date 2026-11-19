@@ -177,6 +177,7 @@
 
 # Models: Qwen4 Experimental
 /src/vllm_torchtpu/models/qwen4_exp/ @kyuyeunk @BirdsOfAFthr
+/tests/models/qwen4_exp/ @kyuyeunk @BirdsOfAFthr
 
 # Models: Qwen4 Experimental (Alibaba)
 /src/vllm_torchtpu/models/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
