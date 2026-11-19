@@ -488,7 +488,7 @@ def test_op_program_sums_the_engine_rows_on_either_side_of_its_cap(on_8_devices,
     _check_op(case, *OP_CASES[name][1:])
 
 
-def _call(rows=32, experts=E, **kwargs):
+def _call(rows=32, experts=E, logit_cols=None, **kwargs):
     import jax.numpy as jnp
 
     from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives as fc
@@ -497,7 +497,7 @@ def _call(rows=32, experts=E, **kwargs):
     statics.update(kwargs)
     return fc.moe_lowtok_fused(
         jnp.zeros((rows, H), jnp.bfloat16),
-        jnp.zeros((rows, experts * DP * TP), jnp.bfloat16),
+        jnp.zeros((rows, logit_cols or experts * DP * TP), jnp.bfloat16),
         jnp.zeros((experts, H, 2 * INTER), jnp.float8_e4m3fn),
         jnp.zeros((experts, 1, 1, 2 * INTER), jnp.float32),
         jnp.zeros((experts, INTER, H), jnp.float8_e4m3fn),
@@ -516,8 +516,15 @@ def _call(rows=32, experts=E, **kwargs):
         # 96..191, across the first 128-lane block of the routing table.
         (dict(experts=96), "do not divide 128"),
         (dict(experts=3), "do not divide 128"),
+        (dict(logit_cols=E * DP * TP - 1), "every expert's logit"),
     ],
-    ids=["hier_needs_tp2", "fp8_rows", "experts_cross_a_lane_block", "experts_3"],
+    ids=[
+        "hier_needs_tp2",
+        "fp8_rows",
+        "experts_cross_a_lane_block",
+        "experts_3",
+        "logits_short_of_the_experts",
+    ],
 )
 def test_refuses_unsupported_calls(kwargs, match):
     rows = kwargs.pop("rows", 32)
