@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host-only tests: temporaries uploaded non_blocking stay alive until the
-input-staging fence that covers them has been waited on, and no cached or
-per-step upload reads a freed temporary.
+"""Host-only tests of the runner's uploads from temporaries: none is uploaded
+non_blocking outside the staged path, and every upload whose device copy is
+cached is synchronous, so no cached tensor can read a freed temporary. The
+staged path's keep-alive until the input-staging fence is tested in
+tests/layers/core/test_attention_metadata.py.
 
 The runner module needs vLLM + torch-tpu, so the helpers under test are
 extracted from the source with ``ast`` and run against a fake torch.

@@ -269,10 +269,9 @@ def test_mixed_prefill_decode_requires_pcp_local_destination_indices():
 
 
 def _separate_padded_rows(num_tokens, cur_indices, src_indices):
-    """The two index rows as they were built before the [2, N] upload."""
-    missing_mask = np.ones(num_tokens, dtype=bool)
-    missing_mask[cur_indices] = False
-    missing_values = np.flatnonzero(missing_mask).astype(np.int32)
+    """The two index rows of the [2, N] upload, built independently: the
+    substituted positions, then every other position in ascending order."""
+    missing_values = np.setdiff1d(np.arange(num_tokens), cur_indices).astype(np.int32)
     padded_cur = np.concatenate((cur_indices, missing_values))
     padded_src = np.pad(
         src_indices,
@@ -308,39 +307,53 @@ def _mtp_substitution_indices(num_spec, scheduled_tokens, previous_req_positions
     )
 
 
-_SUBSTITUTION_CASES = {
-    "decode": (
-        8,
-        _current_async_substitution_indices(
-            req_ids=["a", "b", "c"],
-            previous_req_positions={"a": 2, "b": 0, "c": 1},
-            scheduled_tokens=[1, 1, 1],
-        ),
-    ),
-    "mixed_prefill_decode": (
-        32,
-        _current_async_substitution_indices(
-            req_ids=["prefill", "a", "b"],
-            previous_req_positions={"a": 0, "b": 1},
-            scheduled_tokens=[16, 1, 1],
-        ),
-    ),
-    # MTP k=3: each request's source span starts at position * 4; a request
-    # whose drafts were rejected schedules fewer tokens this step.
-    "mtp_partial_acceptance": (
-        16,
-        _mtp_substitution_indices(
-            3, {"a": 4, "b": 2, "c": 1}, {"a": 1, "b": 0, "c": 2}
-        ),
-    ),
-    "all_padding": (8, (np.array([], np.int32), np.array([], np.int32))),
-    "unpadded": (4, (np.arange(4, dtype=np.int32), np.arange(4, dtype=np.int32))),
-}
+_SUBSTITUTION_CASE_NAMES = [
+    "all_padding",
+    "decode",
+    "mixed_prefill_decode",
+    "mtp_partial_acceptance",
+    "unpadded",
+]
 
 
-@pytest.mark.parametrize("case", sorted(_SUBSTITUTION_CASES))
+def _substitution_case(name):
+    """(num_tokens, (cur_indices, src_indices)) for a named layout. Built when
+    a test asks for it, so a failure in the code under test fails that case
+    instead of the collection of the whole file."""
+    cases = {
+        "decode": (
+            8,
+            _current_async_substitution_indices(
+                req_ids=["a", "b", "c"],
+                previous_req_positions={"a": 2, "b": 0, "c": 1},
+                scheduled_tokens=[1, 1, 1],
+            ),
+        ),
+        "mixed_prefill_decode": (
+            32,
+            _current_async_substitution_indices(
+                req_ids=["prefill", "a", "b"],
+                previous_req_positions={"a": 0, "b": 1},
+                scheduled_tokens=[16, 1, 1],
+            ),
+        ),
+        # MTP k=3: each request's source span starts at position * 4; a request
+        # whose drafts were rejected schedules fewer tokens this step.
+        "mtp_partial_acceptance": (
+            16,
+            _mtp_substitution_indices(
+                3, {"a": 4, "b": 2, "c": 1}, {"a": 1, "b": 0, "c": 2}
+            ),
+        ),
+        "all_padding": (8, (np.array([], np.int32), np.array([], np.int32))),
+        "unpadded": (4, (np.arange(4, dtype=np.int32), np.arange(4, dtype=np.int32))),
+    }
+    return cases[name]
+
+
+@pytest.mark.parametrize("case", _SUBSTITUTION_CASE_NAMES)
 def test_one_upload_index_rows_equal_the_two_separate_rows(case):
-    num_tokens, (cur_indices, src_indices) = _SUBSTITUTION_CASES[case]
+    num_tokens, (cur_indices, src_indices) = _substitution_case(case)
 
     stacked = _padded_substitution_indices(num_tokens, cur_indices, src_indices)
 
@@ -365,7 +378,7 @@ def test_one_upload_index_rows_equal_the_two_separate_rows(case):
 
 @pytest.mark.parametrize("fast", [False, True])
 def test_async_substitution_uploads_one_index_tensor(fast):
-    num_tokens, (cur_indices, src_indices) = _SUBSTITUTION_CASES["mixed_prefill_decode"]
+    num_tokens, (cur_indices, src_indices) = _substitution_case("mixed_prefill_decode")
     runner = SimpleNamespace(
         _fast_token_substitution=fast,
         device=torch.device("cpu"),
@@ -394,3 +407,42 @@ def test_async_substitution_uploads_one_index_tensor(fast):
     # The uncached path stages each temporary host source until the next
     # input-staging fence; the cached path uploads synchronously.
     assert len(runner._unfenced_h2d_sources) == (0 if fast else 2)
+
+
+def test_async_substitution_cache_hits_each_layout_and_evicts_the_oldest():
+    """The device copy of each index layout is uploaded once and served again
+    from the cache, also after another layout ran in between; at 256 layouts
+    the oldest goes first."""
+    runner = SimpleNamespace(
+        _fast_token_substitution=True,
+        device=torch.device("cpu"),
+        _pre_async_results=SimpleNamespace(
+            next_tokens_tpu=torch.arange(4, dtype=torch.int64)
+        ),
+        _registered_h2d_sources=set(),
+        _unfenced_h2d_sources=[],
+        _async_subst_dev_cache={},
+        _cached_subst_key=None,
+        _cached_substitution_indices=None,
+    )
+    one = np.zeros(1, dtype=np.int32)
+
+    def indices(num_tokens):
+        """The index tensor the substitution kernel gets for one substituted
+        token in a step of `num_tokens` tokens (a distinct layout per size)."""
+        with patch.object(tpu_runner, "_substitute_placeholder_token") as kernel:
+            TPUModelRunner._apply_async_token_substitution(
+                runner, torch.zeros(num_tokens, dtype=torch.int32), one, one
+            )
+        return kernel.call_args.args[1]
+
+    first, second = indices(2), indices(3)
+    assert indices(2) is first  # from the cache, not the last-layout slot
+    for num_tokens in range(4, 4 + 254):  # 256 layouts in all
+        indices(num_tokens)
+    assert len(runner._async_subst_dev_cache) == 256
+    assert indices(3) is second
+    indices(4 + 254)  # a 257th layout evicts the oldest, the 2-token one
+    assert len(runner._async_subst_dev_cache) == 256
+    assert indices(3) is second
+    assert indices(2) is not first
