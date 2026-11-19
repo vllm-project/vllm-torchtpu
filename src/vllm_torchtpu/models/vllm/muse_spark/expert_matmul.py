@@ -66,16 +66,8 @@ def _grouped_experts(
     )
 
     def matmul(lhs, weight, scale, global_scale):
-        quant_dtype = None
-        if scale is not None:
-            # Gate and up retain separate per-expert global scales.
-            global_scale = jnp.repeat(
-                global_scale.reshape(weight.shape[0], -1),
-                weight.shape[-1]
-                // (global_scale.shape[-1] if global_scale.ndim == 2 else 1),
-                axis=-1,
-            )[:, None, :]
-            quant_dtype = jnp.float4_e2m1fn
+        # Packed experts carry global scales already expanded to [E, 1, N].
+        quant_dtype = None if scale is None else jnp.float4_e2m1fn
         return gmm_v2(
             lhs=lhs,
             rhs=weight,

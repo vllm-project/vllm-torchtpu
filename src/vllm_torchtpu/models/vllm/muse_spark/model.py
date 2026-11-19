@@ -55,6 +55,7 @@ from .layers import (
 )
 from .weights import (
     decode_expert_weight,
+    expand_global_scale,
     expert_ep_slice,
     expert_tp_slice,
     selected_packed_expert_outputs,
@@ -135,15 +136,11 @@ class MuseExperts(nn.Module):
                         requires_grad=False,
                     ),
                 )
+                # Global scales expanded to gmm_v2's [E, 1, N] once at load.
                 self.register_parameter(
                     name + "_weight_scale_2",
                     nn.Parameter(
-                        torch.empty(
-                            (num_experts, 2)
-                            if name == "gate_up_proj"
-                            else (num_experts,),
-                            dtype=torch.float32,
-                        ),
+                        torch.empty(num_experts, 1, rows, dtype=torch.float32),
                         requires_grad=False,
                     ),
                 )
@@ -654,7 +651,10 @@ class MuseSparkForCausalLM(nn.Module):
                                 .transpose(1, 2)
                                 .contiguous()
                             )
-                            global_scale = group[weight_name + "_weight_scale_2"]
+                            global_scale = expand_global_scale(
+                                group[weight_name + "_weight_scale_2"],
+                                packed.shape[-1],
+                            )
                             scale_name = full_name + "_weight_scale"
                             global_name = full_name + "_weight_scale_2"
                             if (

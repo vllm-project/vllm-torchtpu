@@ -52,6 +52,20 @@ def expert_tp_slice(
     raise ValueError(f"Unknown Muse expert tensor: {name}")
 
 
+def expand_global_scale(global_scale: torch.Tensor, out_features: int) -> torch.Tensor:
+    """Expand per-expert [E] or gate/up [E, 2] scales to gmm_v2's [E, 1, N]."""
+    groups = global_scale.reshape(global_scale.shape[0], -1).float()
+    if out_features % groups.shape[1]:
+        raise ValueError(
+            f"{groups.shape[1]} global scales cannot split {out_features} outputs"
+        )
+    return (
+        groups.repeat_interleave(out_features // groups.shape[1], dim=-1)
+        .unsqueeze(1)
+        .contiguous()
+    )
+
+
 def dequantize_nvfp4(
     packed: torch.Tensor, block_scale: torch.Tensor, global_scale: torch.Tensor
 ) -> torch.Tensor:

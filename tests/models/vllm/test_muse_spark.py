@@ -31,6 +31,7 @@ from vllm_torchtpu.models.vllm.muse_spark.layers import (
 from vllm_torchtpu.models.vllm.muse_spark.weights import (
     decode_expert_weight,
     dequantize_nvfp4,
+    expand_global_scale,
     expert_tp_slice,
 )
 
@@ -94,7 +95,8 @@ def test_packed_loader_keeps_e4m3_bytes_and_separate_global_scales():
             expert,
             name + "_weight_scale_2",
             nn.Parameter(
-                torch.empty_like(local[name + "_weight_scale_2"]), requires_grad=False
+                torch.empty(local[name].shape[0], 1, local[name].shape[1]),
+                requires_grad=False,
             ),
         )
     prefix = "model.language_model.layers.0.mlp.experts."
@@ -115,10 +117,13 @@ def test_packed_loader_keeps_e4m3_bytes_and_separate_global_scales():
 
         torch.testing.assert_close(
             getattr(expert, name + "_weight_scale_2"),
-            local[name + "_weight_scale_2"],
+            expand_global_scale(local[name + "_weight_scale_2"], local[name].shape[1]),
             rtol=0,
             atol=0,
         )
+    gate, up = expert.gate_up_proj_weight_scale_2.chunk(2, dim=-1)
+    assert (gate == local["gate_up_proj_weight_scale_2"][:, None, :1]).all()
+    assert (up == local["gate_up_proj_weight_scale_2"][:, None, 1:]).all()
 
 
 def test_config_preserves_text_numerics_and_roundtrips():
@@ -684,7 +689,9 @@ def test_ep_loader_and_local_expert_outputs(monkeypatch, packed):
             want = value[start:end]
             if name.endswith("_weight_scale"):
                 want = want.view(torch.uint8)
-            if not name.endswith("_weight_scale_2"):
+            if name.endswith("_weight_scale_2"):
+                want = expand_global_scale(want, getattr(experts, name).shape[-1])
+            else:
                 want = want.transpose(1, 2)
             torch.testing.assert_close(getattr(experts, name), want, rtol=0, atol=0)
         actual = experts(x, ids)
@@ -824,11 +831,14 @@ def test_dp_attention_returns_only_local_tokens(monkeypatch):
         if packed:
             for name, value in parts.items():
                 value = value[rank * count : (rank + 1) * count]
+                target = getattr(moe.experts, name)
                 if name.endswith("_weight_scale"):
                     value = value.view(torch.uint8)
-                if not name.endswith("_weight_scale_2"):
+                if name.endswith("_weight_scale_2"):
+                    value = expand_global_scale(value, target.shape[-1])
+                else:
                     value = value.transpose(1, 2)
-                getattr(moe.experts, name).copy_(value)
+                target.copy_(value)
         else:
             moe.experts.to(torch.bfloat16)
             moe.experts.gate_up_proj.copy_(w13[rank * count : (rank + 1) * count])
