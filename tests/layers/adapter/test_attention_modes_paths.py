@@ -59,7 +59,7 @@ def _impl(cls, modes=_MODES, draft=False):
         kv_cache_dtype="fp8",
     )
     impl.attention_modes = modes
-    impl.native_fp8_draft = draft
+    impl.is_attention_draft = draft
     return impl
 
 

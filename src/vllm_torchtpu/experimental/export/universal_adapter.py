@@ -494,7 +494,7 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
                         if isinstance(impl, PallasAttentionBackendImpl):
                             # As in serving, the draft's attention runs with
                             # every reduced-precision mode off.
-                            impl.native_fp8_draft = id(impl) in draft_impls
+                            impl.is_attention_draft = id(impl) in draft_impls
                             impl.initialize_kernel(attn_layer)  # type: ignore[arg-type]
 
             model._export_tpu_mesh = mesh  # type: ignore[attr-defined]

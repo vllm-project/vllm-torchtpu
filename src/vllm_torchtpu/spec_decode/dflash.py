@@ -271,7 +271,7 @@ class DFlashProposer:
                     attn_impl.layer_idx = i
                     attn_impl.use_causal_mask = layer_causal_list[i]
                     # Draft attention keeps full precision (native_fp8_scope).
-                    attn_impl.native_fp8_draft = True
+                    attn_impl.is_attention_draft = True
                     attn_impl.initialize_kernel(attn_obj)
 
     def _load_draft_model(self) -> None:
