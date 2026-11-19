@@ -1017,6 +1017,21 @@ class PallasAttentionBackendImpl(AttentionImpl):
             else batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
         )
         modes = native_fp8_scope.effective(self.attention_modes, self.native_fp8_draft)
+        if modes.any() and (
+            use_pcp_streaming
+            or "attention_modes" not in inspect.signature(self._kernel_entry).parameters
+        ):
+            # Only the batched RPA entry runs reduced-precision modes; the PCP
+            # streaming kernel and the other entries would drop them.
+            kernel = (
+                "the PCP streaming RPA kernel"
+                if use_pcp_streaming
+                else self._kernel_entry.__name__
+            )
+            raise NotImplementedError(
+                f"{kernel} has no reduced-precision attention modes, but this "
+                f"layer asks for {modes}; leave attention_modes off for it."
+            )
         config_key = (
             self._kernel_op_prefix,
             self.sliding_window,
@@ -1329,6 +1344,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 f"{type(self).__name__} overrides the layer-major RPA "
                 "kernel but has no bundled variant; refusing to fall "
                 "back to the default bundled kernel."
+            )
+        modes = native_fp8_scope.effective(self.attention_modes, self.native_fp8_draft)
+        if modes.any():
+            raise NotImplementedError(
+                "VLLM_TPU_BLOCK_MAJOR_KV=1: the bundled RPA kernel has no "
+                f"reduced-precision attention modes, but this layer asks for "
+                f"{modes}; leave attention_modes off with the block-major pool."
             )
         ctx = get_vllm_model_wrapper_context()
         mesh = ctx.mesh
