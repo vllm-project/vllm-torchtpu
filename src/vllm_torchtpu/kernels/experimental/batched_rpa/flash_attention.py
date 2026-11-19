@@ -15,7 +15,8 @@
 """Pallas FlashAttention inner-loop primitives for Batched Ragged Paged Attention.
 
 Implements tiled QK^T matmul, online softmax rescaling, and PV accumulation
-with optional native FP8 KV cache dequantization in VMEM.
+over the KV cache in VMEM, optionally with the matmuls run natively in the fp8
+KV dtype (no dequantization of K or V).
 """
 
 import math
