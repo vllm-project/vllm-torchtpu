@@ -47,9 +47,9 @@ default, and are a documented trade-off:
 The worker applies them from ``execute_model``. When the workers run in their
 own processes (TP > 1), the engine-core process gets them only through
 :func:`on_scheduler_step`, which nothing calls yet: the prefix-aware
-scheduler's ``schedule()`` calls it in a follow-up to this change and to the
-prefix-aware scheduler PR (#3080), which rewrites that method. Until then
-they apply in the worker processes only.
+scheduler's ``schedule()`` will call it once this change and the change that
+adds the scheduler's decode-leg levers, which rewrites that method, are both
+in. Until then they apply in the worker processes only.
 """
 
 from __future__ import annotations
@@ -132,8 +132,8 @@ def on_scheduler_step(vllm_config: Any) -> None:
     engine's config on first use (the workers may run in other processes),
     then applies the process-wide settings.
 
-    No caller yet: the prefix-aware scheduler's ``schedule()`` calls it once
-    this change and #3080 are both in (see the module docstring)."""
+    No caller yet: the prefix-aware scheduler's ``schedule()`` will call it
+    (see the module docstring)."""
     if not _configured:
         configure(vllm_config)
     if STEP_HOOK:
