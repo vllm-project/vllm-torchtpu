@@ -147,8 +147,33 @@ f32 rows on the wire. µs per step:
 * Without the all-reduce, residency is 1.39-1.55× at B ≥ 16 with real top-8
   routing. The all-reduce cost ~35 µs, against the 6 µs assumed in the
   whole-layer model, and absorbed most of the gain. That run sent 721 KB per
-  round even at B = 1. `j-4e6685a1` reruns it with the wire sized to the batch,
-  in f32 and in a symmetric bf16 variant.
+  round even at B = 1. 
+L1 v2 (job `j-4e6685a1-6d7b-4858-8c44`). The wire is sized to the batch (rows =
+B rounded up to 16). The bf16 wire rounds both operands, so replicas stay
+identical. µs per step:
+
+| wire | B | resident + AR | streamed + AR | streamed / resident | AR cost |
+| --- | --- | --- | --- | --- | --- |
+| f32 | 1 | 18.7 | 15.9 | 0.85× | 15-16 |
+| f32 | 16 | 23.4 | 28.3 | 1.21× | 14-15 |
+| f32 | 64 | 50.3 | 54.2 | 1.08× | 37 |
+| bf16 | 1 | 10.3 | 13.9 | 1.36× | 9-12 |
+| bf16 | 16 | 17.7 | 24.7 | 1.40× | 8-9 |
+| bf16 | 64 | 35.2 | 38.4 | 1.09× | 16-25 |
+
+* Sizing the wire to the batch cut the all-reduce from ~35 to ~15 µs at
+  B ≤ 16. A bf16 wire brings it to ~9 µs. The residency gain on the full MoE
+  block is then 1.36-1.40× at B ≤ 16.
+* The all-reduce is still the bottleneck. Its cost fits ~7.7 µs fixed plus
+  ~41 ns per KB on the wire. That is ~25 GB/s across 3 serial full-buffer
+  rounds, far below ICI link rates. A reduce-scatter + all-gather (half the
+  bytes) and overlapping rounds are the next levers.
+* bf16 wire numerics: max abs error 0.585 against the f32 oracle over 4 steps
+  (|ref| ≈ 4). It is a precision trade, not a free win.
+* Noise: the no-AR arms do not depend on the wire dtype, yet B = 64
+  streamed/no-AR read 17.4 µs in one run and 22.3 µs in the other, and B = 1
+  rows swing by ~2 µs. A single run resolves about ±25%. Rows below 1.2× are
+  not distinguishable from 1.0× without repeats.
 
 ## Running
 
