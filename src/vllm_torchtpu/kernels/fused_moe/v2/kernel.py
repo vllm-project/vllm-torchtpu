@@ -64,6 +64,7 @@ FP4_OUTPUT_CHUNK = 256
 # top rung is always tile_m, so a full tile is unchanged. Overridable per
 # process by MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE, read at BUILD time.
 HEIGHT_RUNGS = 4
+CHUNK_PUSH_TILES = 4
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
@@ -138,7 +139,7 @@ def _apply_act(gate, up, act_fn):
     )
 
 
-def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
+def tile_height_rungs(tile_m, rows_alloc, g_local, ep, *, ep_tp_size=1):
     """The ascending static tile heights a build emits, ending at tile_m.
 
     Equally spaced so that a tail tile's rounding-up waste is bounded by one
@@ -161,10 +162,42 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
         rungs < 2
         or step % ROWBLK
         or step * rungs != tile_m
-        or rows_alloc > ep * g_local * tile_m
+        or (ep_tp_size <= 1 and rows_alloc > ep * g_local * tile_m)
     ):
         return (tile_m,)
     return tuple(range(step, tile_m + 1, step))
+
+
+def rotated_push_peer(me: jax.Array, ep: int, step_idx: int) -> jax.Array:
+    if ep >= 8 and (ep & (ep - 1)) == 0:
+        # Avoid fixed 0..ep-1 lockstep order: all ranks would target peer 0 first
+        # and leave half of cross-host links idle during the first ep // 2 sends.
+        return jnp.bitwise_xor(me, jnp.int32((ep // 2) ^ step_idx))
+    return jnp.int32(step_idx)
+
+
+def slice_run_true_rows(
+    run_start_blocks: jax.Array,
+    run_len_blocks: jax.Array,
+    true_rows: jax.Array,
+    lo_blocks: jax.Array,
+    hi_blocks: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    lo = jnp.maximum(run_start_blocks, lo_blocks)
+    hi = jnp.minimum(run_start_blocks + run_len_blocks, hi_blocks)
+    overlap_blocks = jnp.maximum(hi - lo, 0)
+    lo_clamped = jnp.minimum(lo, hi)
+    into_run_rows = (lo_clamped - run_start_blocks) * ROWBLK
+    true_rows_in_slice = jnp.clip(true_rows - into_run_rows, 0, overlap_blocks * ROWBLK)
+    return into_run_rows, true_rows_in_slice
+
+
+def tail_chunk_start_blocks(
+    rows: jax.Array, tile_m: int, chunk_tiles: int, tile_blocks: int
+) -> jax.Array:
+    n_tiles = -(-rows // tile_m)
+    n_interior_chunks = jnp.maximum(-(-n_tiles // chunk_tiles) - 1, 0)
+    return n_interior_chunks * chunk_tiles * tile_blocks
 
 
 def _row_scale(amax):
@@ -913,7 +946,9 @@ def _build_fused_ep_moe_kernel(
     # kernel converts between them with a shift.
     tile_block_shift = host.pow2_shift(tile_blocks, "tile_m // ROWBLK")
     tile_shift = host.pow2_shift(tile_m, "tile_m")
-    height_rungs = tile_height_rungs(tile_m, ragged_rows_alloc, g_local, ep)
+    height_rungs = tile_height_rungs(
+        tile_m, ragged_rows_alloc, g_local, ep, ep_tp_size=ep_tp_size
+    )
     # The contribution slab exists for one reason: to give the push an HBM
     # source. A tile is computed into `out_vm`, copied to `contrib_hbm`, then
     # read straight back out of it by the push that ships it -- two local
@@ -1185,22 +1220,8 @@ def _build_fused_ep_moe_kernel(
             @pl.when(z_push_phys >= 0)
             def _():
                 z_peer = (z_peer_rank,)
-                pltpu.make_async_remote_copy(
-                    src_ref=w1_hbm.at[z_push_phys],
-                    dst_ref=z_w1_hbm.at[0],
-                    send_sem=z_send_sems.at[0],
-                    recv_sem=z_recv_sems.at[0],
-                    device_id=z_peer,
-                    device_id_type=pl.DeviceIdType.MESH,
-                ).start()
-                pltpu.make_async_remote_copy(
-                    src_ref=w2_hbm.at[z_push_phys],
-                    dst_ref=z_w2_hbm.at[0],
-                    send_sem=z_send_sems.at[1],
-                    recv_sem=z_recv_sems.at[1],
-                    device_id=z_peer,
-                    device_id_type=pl.DeviceIdType.MESH,
-                ).start()
+                # Avoid queueing scale tables behind multi-MiB w1/w2 slabs:
+                # tp_scales_starts waits scales first while w2 hides an extra visit.
                 pltpu.make_async_remote_copy(
                     src_ref=w1s_hbm.at[z_push_phys, pl.ds(0, 2 * inter_slice)],
                     dst_ref=z_w1s_hbm.at[0, pl.ds(0, 2 * inter_slice)],
@@ -1214,6 +1235,22 @@ def _build_fused_ep_moe_kernel(
                     dst_ref=z_w2s_hbm.at[0, pl.ds(0, hidden)],
                     send_sem=z_send_sems.at[3],
                     recv_sem=z_recv_sems.at[3],
+                    device_id=z_peer,
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+                pltpu.make_async_remote_copy(
+                    src_ref=w1_hbm.at[z_push_phys],
+                    dst_ref=z_w1_hbm.at[0],
+                    send_sem=z_send_sems.at[0],
+                    recv_sem=z_recv_sems.at[0],
+                    device_id=z_peer,
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+                pltpu.make_async_remote_copy(
+                    src_ref=w2_hbm.at[z_push_phys],
+                    dst_ref=z_w2_hbm.at[0],
+                    send_sem=z_send_sems.at[1],
+                    recv_sem=z_recv_sems.at[1],
                     device_id=z_peer,
                     device_id_type=pl.DeviceIdType.MESH,
                 ).start()
@@ -1261,13 +1298,7 @@ def _build_fused_ep_moe_kernel(
                 return visit_sm[ep_tp_size + 1 + m, step]
             return m * g_local + visit_sm[m, step]
 
-        def _z_wait_recv():
-            pltpu.make_async_copy(
-                z_w1_hbm.at[0], z_w1_hbm.at[0], z_recv_sems.at[0]
-            ).wait()
-            pltpu.make_async_copy(
-                z_w2_hbm.at[0], z_w2_hbm.at[0], z_recv_sems.at[1]
-            ).wait()
+        def _z_wait_recv_w1_scales():
             pltpu.make_async_copy(
                 z_w1s_hbm.at[0, pl.ds(0, 2 * inter_slice)],
                 z_w1s_hbm.at[0, pl.ds(0, 2 * inter_slice)],
@@ -1277,6 +1308,18 @@ def _build_fused_ep_moe_kernel(
                 z_w2s_hbm.at[0, pl.ds(0, hidden)],
                 z_w2s_hbm.at[0, pl.ds(0, hidden)],
                 z_recv_sems.at[3],
+            ).wait()
+            pltpu.make_async_copy(
+                z_w1_hbm.at[0], z_w1_hbm.at[0], z_recv_sems.at[0]
+            ).wait()
+            if tp_w2p_slots > 1:
+                pltpu.make_async_copy(
+                    z_w2_hbm.at[0], z_w2_hbm.at[0], z_recv_sems.at[1]
+                ).wait()
+
+        def _z_wait_recv_w2():
+            pltpu.make_async_copy(
+                z_w2_hbm.at[0], z_w2_hbm.at[0], z_recv_sems.at[1]
             ).wait()
 
         def tp_w1_local_start(step, s):
@@ -1392,7 +1435,7 @@ def _build_fused_ep_moe_kernel(
 
                 @pl.when(step == z_recv_step)
                 def _():
-                    _z_wait_recv()
+                    _z_wait_recv_w1_scales()
                     pltpu.make_async_copy(
                         z_w1s_hbm.at[0, pl.ds(0, inter_slice)],
                         w1s_vm.at[s, pl.ds(0, inter_slice)],
@@ -1609,6 +1652,8 @@ def _build_fused_ep_moe_kernel(
 
                     @pl.when(visit_i + 1 == z_recv_step)
                     def _():
+                        if tp_w2p_slots == 1:
+                            _z_wait_recv_w2()
                         if tp_w1_slots == 1:
                             pltpu.make_async_copy(
                                 z_w1_hbm.at[0], w1_vm.at[0], w1_sems.at[0]
@@ -2498,11 +2543,68 @@ def _build_fused_ep_moe_kernel(
                     )
 
                 commit_tile(parity, t, tile_block_base, live_blocks)
+                new_p0 = jnp.where(parity == 0, live_blocks, carried[1])
+                new_p1 = jnp.where(parity == 1, live_blocks, carried[2])
+                # Avoid a second tile_body fori_loop for interior chunks:
+                # duplicating multi-rung FFN bodies overflows instruction cache.
+                is_chunk_end = jnp.logical_and(
+                    t + 1 < n_tiles,
+                    lax.rem(t + 1, jnp.int32(CHUNK_PUSH_TILES)) == 0,
+                )
+
+                @pl.when(is_chunk_end)
+                def _():
+                    @pl.when(new_p0 > 0)
+                    def _():
+                        wait_commits(0, new_p0)
+
+                    @pl.when(new_p1 > 0)
+                    def _():
+                        wait_commits(1, new_p1)
+
+                    chunk_lo_blocks = (t + 1 - CHUNK_PUSH_TILES) * tile_blocks
+                    chunk_hi_blocks = (t + 1) * tile_blocks
+                    for step_idx in range(ep):
+                        d_peer = rotated_push_peer(me, ep, step_idx)
+                        into_run_rows, true_here = slice_run_true_rows(
+                            commit_start_sm[e, d_peer],
+                            commit_len_sm[e, d_peer],
+                            true_rows_sm[e, d_peer],
+                            chunk_lo_blocks,
+                            chunk_hi_blocks,
+                        )
+                        is_me = d_peer == me
+
+                        @pl.when(_and_nonempty(jnp.logical_not(is_me), true_here))
+                        def _(
+                            d_peer=d_peer,
+                            into_run_rows=into_run_rows,
+                            true_here=true_here,
+                        ):
+                            pltpu.make_async_remote_copy(
+                                src_ref=contrib_hbm.at[
+                                    pl.ds(
+                                        contrib_off_sm[e, d_peer] * ROWBLK
+                                        + into_run_rows,
+                                        true_here,
+                                    )
+                                ],
+                                dst_ref=recv_hbm.at[
+                                    pl.ds(
+                                        push_dst_sm[e, d_peer] * ROWBLK + into_run_rows,
+                                        true_here,
+                                    )
+                                ],
+                                send_sem=send_sem,
+                                recv_sem=recv_sem,
+                                device_id=(d_peer,),
+                                device_id_type=pl.DeviceIdType.MESH,
+                            ).start()
 
                 return (
                     tile_count + 1,
-                    jnp.where(parity == 0, live_blocks, carried[1]),
-                    jnp.where(parity == 1, live_blocks, carried[2]),
+                    jnp.where(is_chunk_end, jnp.int32(0), new_p0),
+                    jnp.where(is_chunk_end, jnp.int32(0), new_p1),
                     wslot,
                 )
 
@@ -2575,51 +2677,60 @@ def _build_fused_ep_moe_kernel(
                 prime_expert(visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.bool_(False))
 
         def push_expert(e):
-            """Push expert e's remote regions and hop its own-dest region."""
-            # Remote pushes go per (expert, dest) at true length; run starts
-            # stay aligned, so recv positions are unchanged. Each is predicated
-            # on its own length: a zero-length REMOTE DMA must never issue.
-            for d in range(ep):
+            """Push expert e's unpushed tail rows and mirror scales."""
+            rows_e = expert_rows_sm[e]
+            tail_lo_blocks = tail_chunk_start_blocks(
+                rows_e, tile_m, CHUNK_PUSH_TILES, tile_blocks
+            )
+            total_blocks = rows_e // ROWBLK
+            for step_idx in range(ep):
+                d = rotated_push_peer(me, ep, step_idx)
                 region_blocks = commit_len_sm[e, d]
-                is_me = jnp.int32(d) == me
+                is_me = d == me
 
                 @pl.when(_and_nonempty(jnp.logical_not(is_me), region_blocks))
-                def _():
-                    # One expert per push, so the region IS expert e's run.
-                    true_rows = true_rows_sm[e, d]
+                def _(d=d, region_blocks=region_blocks):
+                    into_run_rows, true_here = slice_run_true_rows(
+                        commit_start_sm[e, d],
+                        region_blocks,
+                        true_rows_sm[e, d],
+                        tail_lo_blocks,
+                        total_blocks,
+                    )
 
                     def push_run():
-                        """The rows themselves, at their true length."""
                         pltpu.make_async_remote_copy(
                             src_ref=contrib_hbm.at[
-                                pl.ds(contrib_off_sm[e, d] * ROWBLK, true_rows)
+                                pl.ds(
+                                    contrib_off_sm[e, d] * ROWBLK + into_run_rows,
+                                    true_here,
+                                )
                             ],
                             dst_ref=recv_hbm.at[
-                                pl.ds(push_dst_sm[e, d] * ROWBLK, true_rows)
+                                pl.ds(
+                                    push_dst_sm[e, d] * ROWBLK + into_run_rows,
+                                    true_here,
+                                )
                             ],
                             send_sem=send_sem,
                             recv_sem=recv_sem,
-                            device_id=(jnp.int32(d),),
+                            device_id=(d,),
                             device_id_type=pl.DeviceIdType.MESH,
                         ).start()
 
-                    # A nonempty region can hold an empty (e, d) run.
-                    pl.when(true_rows > 0)(push_run)
-                    # Scale mirror: the source tiles this run's rows
-                    # fall in, landing at the base the destination's own
-                    # plan gave the run.
+                    pl.when(true_here > 0)(push_run)
                     src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
                     pltpu.make_async_remote_copy(
                         src_ref=cscl_hbm.at[pl.ds(src_sub, n_sub)],
                         dst_ref=rscl_hbm.at[pl.ds(dst_sub, n_sub)],
                         send_sem=send_scl_sem,
                         recv_sem=recv_scl_sem,
-                        device_id=(jnp.int32(d),),
+                        device_id=(d,),
                         device_id_type=pl.DeviceIdType.MESH,
                     ).start()
 
                 @pl.when(_and_nonempty(is_me, region_blocks))
-                def _():
+                def _(d=d, region_blocks=region_blocks):
                     src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
                     pltpu.make_async_copy(
                         cscl_hbm.at[pl.ds(src_sub, n_sub)],
@@ -2651,6 +2762,12 @@ def _build_fused_ep_moe_kernel(
                 tp_scales_starts(jnp.int32(0), jnp.int32(0))
                 tp_w1_local_or_z(jnp.int32(0), jnp.int32(0))
                 tp_w1_peer_start(jnp.int32(0), jnp.int32(0))
+                if ep_tp_z_clone and tp_w2p_slots == 1:
+
+                    @pl.when(z_recv_step == 0)
+                    def _():
+                        _z_wait_recv_w2()
+
                 tp_w2_starts(jnp.int32(0), jnp.int32(0))
 
                 @pl.when(n_tp_visit > 1)
