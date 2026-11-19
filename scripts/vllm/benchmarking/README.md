@@ -59,10 +59,11 @@ with a 5% tolerance. Baselines are per TPU chip. `run_eval_flow.sh` reads the
 chip from `TPU_ACCELERATOR_TYPE`, or from the GCE metadata when unset
 (`tpu7x-8` is chip `v7x`; `v6e-8` and `tpu6e` are `v6e`):
 
-- A chip with no baseline for the config reports its numbers without the gate.
 - A chip with no baseline for the config reports its numbers without the gate
   and prints a `::warning::` saying so. Check in a calibrated baseline to gate
   it, or pass `--skip-perf-check` to report on purpose.
+- A run that cannot read its chip stops before the server starts, unless it
+  passes `--skip-perf-check`.
 
 Gated metrics:
 
