@@ -78,8 +78,8 @@ def _sparsecore_top_k(
     """V4's SparseCore top-k (`kernels/deepseek_v4/sparsecore_topk.py`).
 
     Same set as ``jax.lax.top_k`` over the finite scores (ties at the k-th
-    value by lowest index), unordered, ``-1`` suffix-padded; ``-inf`` and
-    columns ``>= lengths`` are never selected.
+    value by lowest index), ascending (score order for ``k > 4096``), ``-1``
+    suffix-padded; ``-inf`` and columns ``>= lengths`` are never selected.
     """
     from jax.sharding import PartitionSpec as P
 
@@ -185,9 +185,19 @@ def _publish_candidate_blocks(
         block_scores = publication.candidate_block_scores(
             scores, lengths, block_size=block_size
         )
+    from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
+        supports_topk_width,
+    )
+
     blocks = block_scores.shape[1]
     cand_k = min(count, blocks)
-    if unordered and blocks >= 2048 and blocks % 16 == 0 and cand_k % 16 == 0:
+    # Wider k falls back to an unsorted `lax.top_k` inside `_sparsecore_top_k`.
+    if (
+        unordered
+        and blocks >= 2048
+        and blocks % 16 == 0
+        and supports_topk_width(cand_k)
+    ):
         block_lengths = (lengths + block_size - 1) // block_size
         published = _sparsecore_top_k(
             block_scores,

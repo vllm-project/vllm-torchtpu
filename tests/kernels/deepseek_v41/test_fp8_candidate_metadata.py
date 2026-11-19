@@ -24,8 +24,9 @@ CASES = {
     "decode": ([6] * 48, 0, False),
     "prefill": ([256], 0, False),
 }
-# Score widths with their page sizes; 1M-token contexts at ratios 2 and 1.
-WIDTHS = [(98816, 256), (524288, 128), (1048576, 256)]
+# Score widths with their page sizes; 1M-token contexts at ratios 2 and 1, and
+# one block per page.
+WIDTHS = [(98816, 256), (524288, 128), (1048576, 256), (16384, 8)]
 
 
 def _rows(rng, requests, blocks):
@@ -135,18 +136,20 @@ def test_metadata_matches_reference(case, width, page_size, ascending):
         np.testing.assert_array_equal(np.asarray(value), expected, err_msg=name)
 
 
-# Two-stage top-k, whose stages are the single-stage kernel, and the recursive
-# path one row at 1M tokens takes; it recursed forever while a slice could hold
-# exactly k blocks.
-@pytest.mark.parametrize("rows,width", [(288, 131072), (1, 1048576)])
-def test_publication_ascends(rows, width):
+# Single- and two-stage SparseCore top-k, and a count past its 4096 limit, which
+# takes `lax.top_k`.
+@pytest.mark.parametrize(
+    "rows,width,count",
+    [(288, 131072, PER_QUERY), (16, 131072, PER_QUERY), (2, 67584, 4224)],
+)
+def test_publication_ascends(rows, width, count):
     """Candidate metadata relies on ascending, -1-suffixed published rows."""
     if jax.default_backend() != "tpu":
         pytest.skip("SparseCore publication requires TPU")
     rng = np.random.default_rng(11)
     scores = jnp.asarray(rng.normal(size=(rows, width)), jnp.float32)
     lengths = jnp.asarray(rng.integers(0, width + 1, rows), jnp.int32)
-    published = _publish_candidate_blocks(scores, lengths, PER_QUERY, BLOCK, True)
+    published = _publish_candidate_blocks(scores, lengths, count, BLOCK, True)
     for row in np.asarray(published):
         live = row[row >= 0]
         assert np.all(row[live.size :] == -1) and np.all(np.diff(live) > 0)

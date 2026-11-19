@@ -474,7 +474,7 @@ def _select_fp8_indexer_jax(
                 return jnp.full(
                     (q.shape[0], min(topk, width)), -1, jnp.int32
                 ), candidates
-            # `_publish_candidate_blocks` emits ascending rows.
+            # `_publish_candidate_blocks` and `block_topk` emit ascending rows.
             gathered_candidates = prepare_candidates(
                 banks,
                 page_table,
@@ -813,7 +813,7 @@ def _prepare(
     width: int,
 ) -> tuple[jax.Array, ...]:
     return tuple(
-        # `_publish_candidate_blocks` emits ascending rows.
+        # `_publish_candidate_blocks` and `block_topk` emit ascending rows.
         prepare_candidates(
             banks,
             page_table,

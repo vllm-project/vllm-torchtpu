@@ -221,7 +221,7 @@ def canonical_candidate_blocks(
     lanes, units = sc.num_lanes, sc.num_cores * sc.num_subcores
     alignment = pltpu.get_tpu_info().num_lanes
     unroll = alignment // lanes
-    # 2 gave wrong windows with correct counts (libtpu 0.0.50).
+    # TODO: retry 2 on libtpu > 0.0.50; it gave wrong windows with correct counts.
     classify_unroll = 4
     tokens, per_query = candidates.shape
     pairs = offsets.shape[0] - 1
@@ -231,7 +231,8 @@ def canonical_candidate_blocks(
     if per_query % alignment or page_size % block or per_page & (per_page - 1):
         raise NotImplementedError(
             f"Candidate metadata needs {alignment}-aligned candidate rows and "
-            "page_size // block a power of two"
+            f"page_size // block a power of two; got per_query={per_query}, "
+            f"block={block}, page_size={page_size}"
         )
     shr = lax.shift_right_logical
     table = jnp.pad(
@@ -242,6 +243,7 @@ def canonical_candidate_blocks(
     def aligned(size):
         return pl.cdiv(size, alignment) * alignment
 
+    offset_words = aligned(offsets.size)
     # Words per scratch buffer; two-slot buffers hold two pairs in flight.
     bitmap_words = aligned(pl.cdiv(blocks, 32))
     words = dict(
@@ -258,7 +260,7 @@ def canonical_candidate_blocks(
         union=2 * (2 * per_query + lanes),
         shared_union=per_query + lanes,
         counts=2 * alignment,
-        control=alignment + aligned(tokens + 1) + aligned(tokens),
+        control=alignment + offset_words + aligned(tokens),
     )
     # Keep half of subcore VMEM free for compiler temporaries and alignment.
     if 4 * sum(words.values()) > sc.vmem_capacity_bytes // 2:
@@ -273,7 +275,6 @@ def canonical_candidate_blocks(
 
     # [live pairs][offsets][requests], each lane-aligned.
     live = jnp.max(jnp.where(offsets[1:] > offsets[:-1], jnp.arange(1, pairs + 1), 0))
-    offset_words = pl.cdiv(offsets.size, alignment) * alignment
     request_base = alignment + offset_words
     control = jnp.concatenate(
         (
@@ -466,7 +467,7 @@ def canonical_candidate_blocks(
                 key = ids[pl.ds(bases[query] + i, lanes)]
                 column = shr(key, shift)
                 page = plsc.load_gather(
-                    page_ids, [page_base + jnp.minimum(column, table_columns - 1)]
+                    page_ids, [page_base + jnp.clip(column, 0, table_columns - 1)]
                 )
                 valid = (key >= 0) & (key < blocks) & (page >= 0) & (page < cache_pages)
                 if blocks > table_columns * per_page:
