@@ -50,3 +50,13 @@ def test_collective_flags_last_value_wins():
     assert got["xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"] == "16777216"
     assert got["xla_tpu_enable_sparse_core_hierarchical_all_reduce"] == "default"
     assert set(par.collective_flags("")) == set(got)
+
+
+@pytest.mark.parametrize(
+    "rows,direct_rows,want",
+    [(32, 16, True), (24, 16, False), (24, 8, True), (8, 8, True), (12, 4, False), (32, 0, False)],
+)
+def test_direct_layout_gate(rows, direct_rows, want):
+    assert kernel.direct_ok(rows, HIDDEN, N, direct_rows) is want
+    # 6144 / 8 = 768 lanes per rank chunk: whole lane tiles.
+    assert not kernel.direct_ok(rows, 6144 + 128, N, 8)
