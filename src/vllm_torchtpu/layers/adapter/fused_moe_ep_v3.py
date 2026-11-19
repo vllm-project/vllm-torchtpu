@@ -585,7 +585,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
 
     reason = (
         _unsupported_layer_reason(layer, local_experts, ep)
-        or _unsupported_v3_routing_reason(layer)
+        or _unsupported_v3_routing_reason(layer, renormalize)
         or _unsupported_reason(
             w1, w2, w1_scale, w2_scale, local_experts, hidden, inter, activation
         )
@@ -677,7 +677,7 @@ def _unsupported_layer_reason(layer, local_experts: int, ep: int) -> str | None:
     return None
 
 
-def _unsupported_v3_routing_reason(layer) -> str | None:
+def _unsupported_v3_routing_reason(layer, renormalize: bool) -> str | None:
     """Why the v3 kernel's router cannot reproduce this layer's routing, or
     None.
 
@@ -689,12 +689,20 @@ def _unsupported_v3_routing_reason(layer) -> str | None:
     a plain softmax and takes no bias, no scale and no simulated routing,
     and this bridge passes none, so a layer that uses any of them is refused
     here rather than routed to different experts with different weights.
+    The kernel also refuses the raw top-k weights (`renormalize=False`) until
+    a TPU case covers them, so such a layer is refused here too and keeps the
+    grouped-matmul path instead of failing in its first traced forward.
     """
     from vllm_torchtpu.layers.adapter import moe_routing
 
     reason = _unsupported_routing_reason(layer)
     if reason is not None:
         return reason
+    if not renormalize:
+        return (
+            "renormalize=False; the v3 kernel takes renormalized top-k weights "
+            "only (check_tested_routing)"
+        )
     if layer.scoring_func != "softmax":
         return (
             f"scoring_func {layer.scoring_func!r}; the v3 router scores with "
