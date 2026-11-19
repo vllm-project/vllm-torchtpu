@@ -22,14 +22,17 @@ received tensor only once its data has landed. A schedule whose transfers
 do not pair therefore times out instead of passing by accident.
 """
 
+import contextlib
 import random
+import socket
 import threading
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vllm_torchtpu.distributed import pp_buffered
+from tests.distributed.store_test_utils import FakeStore
+from vllm_torchtpu.distributed import pp_buffered, pp_dcn_link, pp_slices
 
 HIDDEN = 8
 MAX_ROWS = 64
@@ -231,8 +234,9 @@ def _run(handoffs, transport, steps, timeout=60):
         t.start()
     for t in threads:
         t.join(timeout=timeout)
-    assert not any(t.is_alive() for t in threads), "a device never finished"
+    # A device that failed leaves the ones it feeds waiting; its error says why.
     assert not errors, errors
+    assert not any(t.is_alive() for t in threads), "a device never finished"
     return results
 
 
@@ -783,3 +787,327 @@ def test_the_hand_off_always_carries_hidden_states_and_residual(monkeypatch):
         )
     with pytest.raises(ValueError, match="depth of at least 1"):
         pp_buffered.PPBuffered(torch.device("cpu"), MAX_ROWS, _template(False), depth=0)
+
+
+# A pipeline over several slices. Each slice is a torch.distributed world of
+# its own, ranked from 0; here slice s's ranks are offset by s * OFFSET, so
+# one fake transport carries the hops inside every slice without mixing them
+# up, and a hop between two worlds shows as a send between offsets.
+OFFSET = 1000
+
+
+class _SlicedTransport(_Transport):
+    """The fake transport of the hops inside the slices. A tensor that came
+    over a slice boundary was on the device when its link returned it.
+    ``events`` records, with the thread of each, every forward a TCP link
+    stages and every fence the hand-off records; ``read_all`` records, by
+    receiving engine rank, whether a TCP link had read everything sent to it
+    when its hand-off closed it."""
+
+    def __init__(self, stride):
+        super().__init__(stride)
+        self.ici = {}
+        self.events = []
+        self.read_all = {}
+
+    def irecv(self, tensor, src, tag):
+        self.ici[id(tensor)] = tensor
+        return super().irecv(tensor, src, tag)
+
+    def wait_landed(self, tensor):
+        if self.ici.get(id(tensor)) is tensor:
+            super().wait_landed(tensor)
+
+
+@pytest.fixture
+def sliced(monkeypatch):
+    """Builds one PPBuffered per device of a pipeline over ``slices``
+    slices, keyed by (stage, column): every device's pipeline group is the
+    real stand-in over a fake group of its slice, the hops inside a slice go
+    through one fake transport, and the hops between slices over loopback
+    TCP links that meet in ``store``. Closes the hand-offs after the test."""
+    from vllm.distributed import parallel_state
+
+    from vllm_torchtpu.distributed import pcp
+
+    built = {}
+
+    def build(slices, stages, columns=1, side=False, store=None):
+        transport = _SlicedTransport(stride=columns)
+        monkeypatch.setattr(torch.distributed, "isend", transport.isend)
+        monkeypatch.setattr(torch.distributed, "irecv", transport.irecv)
+        monkeypatch.setattr(pp_buffered, "_flush", lambda tensors: None)
+
+        def fence():
+            transport.events.append((threading.get_ident(), "fence"))
+            return _Fence()
+
+        monkeypatch.setattr(pp_buffered, "_fence", fence)
+        link_stage = pp_dcn_link.DcnLink.stage
+
+        def recorded_stage(link, tensors):
+            transport.events.append((threading.get_ident(), "stage"))
+            return link_stage(link, tensors)
+
+        monkeypatch.setattr(pp_dcn_link.DcnLink, "stage", recorded_stage)
+        link_close = pp_dcn_link.DcnLink.close
+
+        def recorded_close(link):
+            if link._receiving and link._error is None and link._connections:
+                transport.read_all[link.dst] = _nothing_unread(link)
+            link_close(link)
+
+        monkeypatch.setattr(pp_dcn_link.DcnLink, "close", recorded_close)
+        read = pp_buffered._first_and_last
+
+        def first_and_last(x):
+            transport.wait_landed(x)
+            return read(x)
+
+        monkeypatch.setattr(pp_buffered, "_first_and_last", first_and_last)
+        monkeypatch.setattr(pp_dcn_link, "get_ip", lambda: "127.0.0.1")
+        monkeypatch.setenv("TPU_PP_DCN_STREAMS", "2")
+        store = FakeStore() if store is None else store
+        layout = pp_slices.PipelineSlices(
+            ranks=(stages * columns // slices,) * slices, stages=stages, nnodes=slices
+        )
+        per_slice = layout.stages_of(0)
+        current = {}
+
+        def pipeline_group():
+            stage, column = current["stage"], current["column"]
+            first = stage // per_slice * per_slice
+            in_slice = SimpleNamespace(
+                rank_in_group=stage - first,
+                world_size=per_slice,
+                ranks=[
+                    stage // per_slice * OFFSET + s * columns + column
+                    for s in range(per_slice)
+                ],
+            )
+            return pp_slices.SlicedPipelineGroup(
+                in_slice, layout, stage * columns + column, store
+            )
+
+        monkeypatch.setattr(parallel_state, "get_pp_group", pipeline_group)
+        monkeypatch.setattr(
+            pcp,
+            "get_pcp_group",
+            lambda: SimpleNamespace(
+                rank_in_group=current["column"], world_size=columns
+            ),
+        )
+        for stage in range(stages):
+            for column in range(columns):
+                current.update(stage=stage, column=column)
+                built[stage, column] = pp_buffered.PPBuffered(
+                    torch.device("cpu"), MAX_ROWS, _template(side)
+                )
+        return transport, dict(built)
+
+    yield build
+    for handoff in built.values():
+        # A hand-off that failed raises its failure again; the test has
+        # checked it.
+        with contextlib.suppress(RuntimeError):
+            handoff.close()
+
+
+def _kind(link):
+    return None if link is None else type(link)
+
+
+def _nothing_unread(link):
+    """Whether no connection of a receiving link holds bytes it has not
+    read."""
+    assert link._connections, f"{link.name} never connected"
+    for connection in link._connections:
+        try:
+            # Empty once the sending end has closed and everything is read.
+            if connection.sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
+                return False
+        except BlockingIOError:
+            continue
+    return True
+
+
+@pytest.mark.parametrize(
+    ("slices", "stages", "columns", "side"),
+    [(2, 4, 1, False), (2, 4, 1, True), (3, 6, 2, True)],
+    ids=["two_slices", "two_slices_with_side", "three_slices_of_two_columns"],
+)
+def test_a_pipeline_over_slices_hands_every_forward_to_the_last_stage(
+    sliced, slices, stages, columns, side
+):
+    transport, handoffs = sliced(slices, stages, columns=columns, side=side)
+    steps = _steps(random.Random(stages + side), 16)
+    results = _run(handoffs, transport, steps)
+    forwards = _check(results, steps, stages - 1, columns=columns, side=side)
+    per_slice = stages // slices
+    ici, tcp = pp_buffered.IciLink, pp_dcn_link.DcnLink
+    for (stage, _), handoff in handoffs.items():
+        place = stage % per_slice
+        assert _kind(handoff._inbound) == (
+            None if stage == 0 else tcp if place == 0 else ici
+        )
+        assert _kind(handoff._outbound) == (
+            None if stage == stages - 1 else tcp if place == per_slice - 1 else ici
+        )
+        assert handoff.transfers == 1 + len(forwards)
+        assert handoff.sent == (len(forwards) if stage < stages - 1 else 0)
+        assert handoff.posted_through == (1 + len(forwards) if stage > 0 else 0)
+        assert handoff.landed_through == 1 + len(forwards)
+    # Every receiving end had read all that was sent to it when it closed.
+    assert transport.read_all == {
+        (s * per_slice) * columns + column: True
+        for s in range(1, slices)
+        for column in range(columns)
+    }
+    # The fake carries only the hops inside a slice, between its own ranks:
+    # the warmup and every forward, once per carried tensor and column.
+    carried = 2 if side else 1
+    assert {(src // OFFSET, dst // OFFSET) for (src, dst, _), _ in transport.sends} == {
+        (s, s) for s in range(slices)
+    }
+    assert len(transport.sends) == (
+        (1 + len(forwards)) * slices * (per_slice - 1) * columns * carried
+    )
+    assert transport.posted == {}
+    # A sender over TCP starts the copies to the host of the warmup and of
+    # every forward on the thread that submits it, before its fence.
+    by_thread = {}
+    for thread, event in transport.events:
+        by_thread.setdefault(thread, []).append(event)
+    staged = 0
+    for events in by_thread.values():
+        for i, event in enumerate(events):
+            if event == "stage":
+                assert events[i + 1 : i + 2] == ["fence"]
+                staged += 1
+    assert staged == (1 + len(forwards)) * (slices - 1) * columns
+
+
+def test_steps_without_tokens_send_nothing_between_slices(sliced):
+    transport, handoffs = sliced(slices=2, stages=4)
+    results = _run(handoffs, transport, [([], True)] * 5)
+    assert results == []
+    # the warmup alone, over the hop inside each slice
+    assert len(transport.sends) == 2
+    for handoff in handoffs.values():
+        assert handoff.transfers == 1
+    assert handoffs[2, 0].posted_through == 1
+    assert transport.read_all == {2: True}
+
+
+class _CrossedStore(FakeStore):
+    """Hands each sending end the address of the other column's receiving
+    end, as a wrongly wired deployment would."""
+
+    def __init__(self, crossed):
+        super().__init__()
+        self.crossed = crossed
+
+    def _key(self, key):
+        prefix, rank = key.rsplit("_", 1)
+        return f"{prefix}_{self.crossed[int(rank)]}"
+
+    def wait(self, keys, timeout):
+        super().wait([self._key(key) for key in keys], timeout)
+
+    def get(self, key):
+        return super().get(self._key(key))
+
+
+def test_the_self_test_catches_a_slice_boundary_wired_to_the_wrong_column(sliced):
+    # One stage a slice, two columns: engine ranks 0 and 1 send to 2 and 3.
+    _, handoffs = sliced(
+        slices=2, stages=2, columns=2, store=_CrossedStore({2: 3, 3: 2})
+    )
+    errors = []
+
+    def warmup(handoff):
+        try:
+            handoff.warmup()
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=warmup, args=(handoff,), daemon=True)
+        for handoff in handoffs.values()
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(TIMEOUT)
+    assert not any(t.is_alive() for t in threads)
+    messages = sorted(str(error) for error in errors)
+    assert len(messages) == 2
+    assert "received (1.0, 1.0), expected 2.0 from global rank 1" in messages[0]
+    assert "received (2.0, 2.0), expected 1.0 from global rank 0" in messages[1]
+    # A hop over TCP does not depend on the libtpu the ICI hand-off needs.
+    assert not any("libtpu" in message for message in messages)
+
+
+def _warm_up(handoffs):
+    threads = [
+        threading.Thread(target=handoff.warmup, daemon=True)
+        for handoff in handoffs.values()
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(TIMEOUT)
+        assert not t.is_alive()
+
+
+def test_closing_a_stage_that_waits_for_another_slice_returns(sliced):
+    _, handoffs = sliced(slices=2, stages=4)
+    # The first stage of slice 1, before the previous slice has connected.
+    second = handoffs[2, 0]
+    second.begin_step([8])
+    poster = second._post_thread
+    errors = []
+
+    def close():
+        try:
+            second.close()
+        except BaseException as exc:  # reported by the test thread
+            errors.append(exc)
+
+    closer = threading.Thread(target=close, daemon=True)
+    closer.start()
+    closer.join(TIMEOUT)
+    assert not closer.is_alive() and not errors, errors
+    assert not poster.is_alive()
+    with pytest.raises(RuntimeError, match="has failed"):
+        second._inbound.receive(2, 8)
+
+
+class _FailingFence:
+    def synchronize(self):
+        raise RuntimeError("the forward failed on the device")
+
+
+def test_a_send_thread_failure_fails_the_next_slice_at_once(sliced, monkeypatch):
+    _, handoffs = sliced(slices=2, stages=4)
+    _warm_up(handoffs)
+    last, first = handoffs[1, 0], handoffs[2, 0]
+    # Slice 1 waits for a forward that slice 0 will not hand on.
+    first.begin_step([8])
+    monkeypatch.setattr(pp_buffered, "_fence", _FailingFence)
+    last.start_forward(8)
+    last.end_forward(_outgoing(8), 8)
+    errors = []
+
+    def forward():
+        try:
+            first.start_forward(8)
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    waiting = threading.Thread(target=forward, daemon=True)
+    waiting.start()
+    waiting.join(TIMEOUT)
+    assert not waiting.is_alive()
+    (error,) = errors
+    assert "posting thread failed" in str(error)
