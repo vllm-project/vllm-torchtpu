@@ -75,8 +75,10 @@ EXEMPT_PATHS = {
 #
 # The TORCH_TPU_* names and TPU_NUM_HOSTS are computed from the slice shape
 # by tpu_platform.py, tpu_mp_multihost.py and the Ray executors, written to
-# os.environ, and read back by the workers. An operator may pre-seed some of
-# them (GKE sets TORCH_TPU_TOPOLOGY); the package still owns the value.
+# os.environ, and read back by the workers. So is MASTER_ADDR, the first host
+# of a slice when a pipeline spans several (tpu_mp_multihost.py). An operator
+# may pre-seed some of them (GKE sets TORCH_TPU_TOPOLOGY); the package still
+# owns the value.
 #
 # Only names actually read in this package are listed. Adding a new bootstrap
 # read fails this hook with a message pointing here, which is the moment to
@@ -84,6 +86,7 @@ EXEMPT_PATHS = {
 BOOTSTRAP_VARS = {
     "LOCAL_RANK",
     "LOCAL_WORLD_SIZE",
+    "MASTER_ADDR",
     "MASTER_PORT",
     "PYTHONHASHSEED",
     "RANK",

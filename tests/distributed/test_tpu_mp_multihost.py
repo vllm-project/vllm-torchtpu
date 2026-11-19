@@ -208,3 +208,138 @@ def test_failed_bootstrap_can_retry(bootstrap):
     rendezvous.side_effect = None
     mp.prepare_mp_multihost_env(config)
     assert os.environ[mp._DONE_SENTINEL] == "2"
+
+
+def test_the_rendezvous_store_is_one_client_of_the_master(monkeypatch):
+    create = Mock(return_value=object())
+    monkeypatch.setattr(mp.dist, "TCPStore", create)
+    monkeypatch.setattr(mp, "_rendezvous_client", None)
+    config = SimpleNamespace(master_addr="10.0.0.1", master_port=9000)
+    store = mp.rendezvous_store(config)
+    assert mp.rendezvous_store(config) is store
+    create.assert_called_once_with(
+        host_name="10.0.0.1",
+        port=9001,
+        is_master=False,
+        timeout=timedelta(seconds=300),
+        wait_for_workers=False,
+    )
+
+
+def _sliced_config(rank, nnodes, local_world_size, pp):
+    return SimpleNamespace(
+        nnodes=nnodes,
+        node_rank=rank,
+        local_world_size=local_world_size,
+        master_addr="10.0.0.1",
+        master_port=9000,
+        pipeline_parallel_size=pp,
+        world_size=nnodes * local_world_size,
+    )
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_a_slice_of_two_hosts_describes_its_own_hosts(monkeypatch, bootstrap, rank):
+    rendezvous, topology = bootstrap
+    rendezvous.return_value = ([f"10.0.0.{i + 1}" for i in range(4)], "session")
+    monkeypatch.setenv("TPU_PP_SLICES", "2")
+    mp.prepare_mp_multihost_env(_sliced_config(rank, 4, 4, pp=8))
+    # The rendezvous spans every host of the engine.
+    rendezvous.assert_called_once_with(
+        num_peers=4,
+        peer_index=rank,
+        master_addr="10.0.0.1",
+        port=9001,
+        key_prefix="tpu_mp_nnodes",
+    )
+    first = rank // 2 * 2
+    hosts = [f"10.0.0.{first + 1}", f"10.0.0.{first + 2}"]
+    assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == ",".join(
+        f"{ip}:{8070 + port}" for ip in hosts for port in range(4)
+    )
+    topology.assert_called_once_with(8)
+    assert os.environ["TORCH_TPU_TOPOLOGY"] == "1,2,2,2"
+    assert os.environ["MASTER_ADDR"] == hosts[0]
+    assert os.environ["MASTER_PORT"] == "9000"
+    assert os.environ["TPU_NUM_HOSTS"] == "2"
+    assert os.environ["NODE_RANK"] == str(rank % 2)
+    assert os.environ["TORCH_TPU_XPROF_SESSION_ID"] == "session"
+    assert os.environ[mp._DONE_SENTINEL] == "4"
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_a_slice_of_one_host_starts_like_a_one_host_deployment(
+    monkeypatch, bootstrap, rank
+):
+    rendezvous, topology = bootstrap
+    single_host = Mock()
+    monkeypatch.setattr(
+        tpu_platform.TpuPlatform, "_prepare_singlehost_tpu_env", single_host
+    )
+    monkeypatch.setenv("TPU_PP_SLICES", "2")
+    mp.prepare_mp_multihost_env(_sliced_config(rank, 2, 8, pp=16))
+    rendezvous.assert_called_once()
+    single_host.assert_called_once_with(8)
+    topology.assert_not_called()
+    # Neither the engine's master nor the other host reaches TorchTPU.
+    for key in (
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+        "TPU_NUM_HOSTS",
+        "NODE_RANK",
+    ):
+        assert key not in os.environ
+    assert os.environ["TORCH_TPU_XPROF_SESSION_ID"] == "session"
+    assert os.environ[mp._DONE_SENTINEL] == "2"
+
+
+def test_slices_without_a_pipeline_are_refused_before_the_rendezvous(
+    monkeypatch, bootstrap
+):
+    rendezvous, _ = bootstrap
+    monkeypatch.setenv("TPU_PP_SLICES", "2")
+    with pytest.raises(ValueError, match=r"must divide --pipeline-parallel-size \(1\)"):
+        mp.prepare_mp_multihost_env(_sliced_config(1, 2, 4, pp=1))
+    rendezvous.assert_not_called()
+    assert mp._DONE_SENTINEL not in os.environ
+
+
+@pytest.mark.parametrize(
+    ("text", "rank", "hosts"),
+    [("2,1", 0, (1, 2)), ("2,1", 1, (1, 2)), ("1,2", 1, (2, 3)), ("1,2", 2, (2, 3))],
+)
+def test_a_slice_of_two_hosts_next_to_a_slice_of_one(
+    monkeypatch, bootstrap, text, rank, hosts
+):
+    """Three hosts of four ranks, a stage a host, as stages (2, 1) or (1, 2)."""
+    rendezvous, topology = bootstrap
+    rendezvous.return_value = ([f"10.0.0.{i + 1}" for i in range(3)], "session")
+    monkeypatch.setenv("TPU_PP_SLICES", text)
+    mp.prepare_mp_multihost_env(_sliced_config(rank, 3, 4, pp=3))
+    ips = [f"10.0.0.{host}" for host in hosts]
+    assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == ",".join(
+        f"{ip}:{8070 + port}" for ip in ips for port in range(4)
+    )
+    topology.assert_called_once_with(8)
+    assert os.environ["MASTER_ADDR"] == ips[0]
+    assert os.environ["TPU_NUM_HOSTS"] == "2"
+    assert os.environ["NODE_RANK"] == str(rank - (hosts[0] - 1))
+
+
+@pytest.mark.parametrize(("text", "rank"), [("2,1", 2), ("1,2", 0)])
+def test_the_slice_of_one_host_next_to_a_larger_one_starts_alone(
+    monkeypatch, bootstrap, text, rank
+):
+    rendezvous, topology = bootstrap
+    rendezvous.return_value = ([f"10.0.0.{i + 1}" for i in range(3)], "session")
+    single_host = Mock()
+    monkeypatch.setattr(
+        tpu_platform.TpuPlatform, "_prepare_singlehost_tpu_env", single_host
+    )
+    monkeypatch.setenv("TPU_PP_SLICES", text)
+    mp.prepare_mp_multihost_env(_sliced_config(rank, 3, 4, pp=3))
+    single_host.assert_called_once_with(4)
+    topology.assert_not_called()
+    for key in ("MASTER_ADDR", "TORCH_TPU_SLICEBUILDER_ADDRESSES", "TPU_NUM_HOSTS"):
+        assert key not in os.environ

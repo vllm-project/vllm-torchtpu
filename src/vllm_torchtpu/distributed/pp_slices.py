@@ -23,6 +23,9 @@ keep their stage-major order, so a slice holds a run of consecutive engine
 ranks: the P_s stages they make and the H_s hosts they cover, which come
 after those of the slices before it.
 
+``TPU_PP_SLICES`` sets the cut: a number of equal slices, or the stages of
+each slice in pipeline order.
+
 Each slice is a torch.distributed world of its own, brought up as a
 stand-alone deployment of that slice would be: ranks from 0, the slice's
 workers alone, a pipeline group of its P_s stages. torch_tpu never sees a
@@ -52,6 +55,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 from torch.distributed import Store
 from torch.distributed.constants import default_pg_timeout
+
+from vllm_torchtpu import envs
 
 if TYPE_CHECKING:
     from vllm.distributed.parallel_state import GroupCoordinator
@@ -153,6 +158,109 @@ class PipelineSlices:
     def slice_start(self, rank: int) -> int:
         """The first engine rank of ``rank``'s slice."""
         return self.first_rank_of(self.slice_of_rank(rank))
+
+
+def pipeline_slices(parallel_config: Any) -> PipelineSlices | None:
+    """How ``TPU_PP_SLICES`` cuts this engine's pipeline, or None for a
+    pipeline on one slice. The setting is a number of equal slices, or a list
+    with the stages of each slice in pipeline order, such as ``4,2``.
+
+    Raises:
+      ValueError: TPU_PP_SLICES is neither form, a number below 1, or a list
+        of one slice, of a slice without stages, of stages that do not add up
+        to the pipeline's, or of a slice that does not cover whole hosts; or
+        equal slices would not each hold the same number of stages and hosts,
+        as the one stage of an engine without a pipeline cannot.
+    """
+    # Set but empty means unset, as for a number.
+    text = envs.TPU_PP_SLICES or "1"
+    if "," in text:
+        return _listed_slices(text, parallel_config)
+    try:
+        slices = int(text)
+    except ValueError:
+        raise ValueError(_malformed(text)) from None
+    if slices < 1:
+        raise ValueError(f"TPU_PP_SLICES must be at least 1, got {slices}.")
+    if slices == 1:
+        return None
+    stages = parallel_config.pipeline_parallel_size
+    nnodes = parallel_config.nnodes
+    if stages % slices:
+        raise ValueError(
+            f"TPU_PP_SLICES={slices} must divide --pipeline-parallel-size "
+            f"({stages}): every slice holds the same number of stages."
+        )
+    if nnodes % slices:
+        raise ValueError(
+            f"TPU_PP_SLICES={slices} must divide --nnodes ({nnodes}): every "
+            "slice spans the same number of hosts, and every host runs "
+            "vllm serve with its --node-rank."
+        )
+    return PipelineSlices(
+        ranks=(parallel_config.world_size // slices,) * slices,
+        stages=stages,
+        nnodes=nnodes,
+    )
+
+
+def _malformed(text: str) -> str:
+    return (
+        f"TPU_PP_SLICES={text!r} is neither a number of equal slices, such as "
+        "2, nor a list with the stages of each slice in pipeline order, such "
+        "as 4,2."
+    )
+
+
+def _listed_slices(text: str, parallel_config: Any) -> PipelineSlices:
+    """The slices of ``TPU_PP_SLICES`` given as a list, such as ``4,2``; a
+    trailing comma ends the list."""
+    entries = text.split(",")
+    if not entries[-1].strip():
+        entries.pop()
+    try:
+        counts = tuple(int(entry) for entry in entries)
+    except ValueError:
+        raise ValueError(_malformed(text)) from None
+    if len(counts) == 1:
+        raise ValueError(
+            f"TPU_PP_SLICES={text} lists one slice, which is a pipeline on one "
+            "slice: unset TPU_PP_SLICES."
+        )
+    ranks = _ranks_of_listed_stages(text, counts, parallel_config)
+    nnodes = parallel_config.nnodes
+    per_host = parallel_config.world_size // nnodes
+    for slice_, count in enumerate(ranks):
+        if count % per_host:
+            raise ValueError(
+                f"TPU_PP_SLICES={text}: slice {slice_} holds {count} engine "
+                f"ranks, which do not cover whole hosts; every host runs "
+                f"{per_host} workers (the world size over --nnodes {nnodes}), so "
+                "every slice must cover whole hosts."
+            )
+    return PipelineSlices(
+        ranks=ranks, stages=parallel_config.pipeline_parallel_size, nnodes=nnodes
+    )
+
+
+def _ranks_of_listed_stages(
+    text: str, counts: tuple[int, ...], parallel_config: Any
+) -> tuple[int, ...]:
+    """The engine ranks of each slice of a ``TPU_PP_SLICES`` list, whose
+    entries count the stages of each slice: every stage has world_size //
+    stages workers."""
+    stages = parallel_config.pipeline_parallel_size
+    if min(counts) < 1:
+        raise ValueError(
+            f"TPU_PP_SLICES={text}: every slice holds at least 1 stage, as in 4,2."
+        )
+    if sum(counts) != stages:
+        raise ValueError(
+            f"TPU_PP_SLICES={text} lists {sum(counts)} stages; the stages of "
+            f"the slices must add up to --pipeline-parallel-size ({stages})."
+        )
+    width = parallel_config.world_size // stages
+    return tuple(count * width for count in counts)
 
 
 class SlicedPipelineGroup:

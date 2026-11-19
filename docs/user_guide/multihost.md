@@ -43,6 +43,36 @@ When TP, PP, or PCP spans multiple hosts (`--nnodes N`), launch `vllm serve` on 
       --headless
     ```
 
+#### Pipeline over several slices
+
+With `TPU_PP_SLICES=D`, a pipeline spans `D` TPU slices, which share no ICI, of `--nnodes` / `D` consecutive hosts each; `TPU_PP_SLICES` may instead list the stages of each slice in pipeline order, such as `4,2`, adding up to `--pipeline-parallel-size`, as long as every slice covers whole hosts. Node ranks run slice by slice, and each slice starts as a deployment of its own hosts. The hand-off from the last stage of one slice to the first stage of the next goes over TCP, `TPU_PP_DCN_STREAMS` (default `4`) streams to a port the receiving host picks. Data parallelism and the Ray backend are not supported. Two slices of one host each:
+
+=== "Host 0 (Leader)"
+
+    ```bash
+    TPU_PP_SLICES=2 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
+      --pipeline-parallel-size 8 \
+      --no-async-scheduling \
+      --nnodes 2 \
+      --node-rank 0 \
+      --master-addr <HOST_0_INTERNAL_IP> \
+      --master-port 29500 \
+      --port 8000
+    ```
+
+=== "Host 1 (Headless Worker)"
+
+    ```bash
+    TPU_PP_SLICES=2 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
+      --pipeline-parallel-size 8 \
+      --no-async-scheduling \
+      --nnodes 2 \
+      --node-rank 1 \
+      --master-addr <HOST_0_INTERNAL_IP> \
+      --master-port 29500 \
+      --headless
+    ```
+
 ### Mode B: Multi-Host Data Parallelism (`--data-parallel-size`)
 
 When `data_parallel_size` is wider than `data_parallel_size_local` (for example, `DP=16` across two 8-device TPU v7x hosts with `DP_LOCAL=8`), each host runs `vllm serve` for its local slice of DP ranks:

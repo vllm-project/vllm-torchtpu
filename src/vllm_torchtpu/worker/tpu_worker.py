@@ -51,6 +51,13 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
+from vllm_torchtpu.distributed.pp_slices import (
+    install_engine_queues,
+    install_sliced_pipeline_group,
+    pipeline_slices,
+    slice_view,
+)
+from vllm_torchtpu.distributed.tpu_mp_multihost import rendezvous_store
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
@@ -215,6 +222,9 @@ class TPUWorker(WorkerBase):
         pc = self.parallel_config
         dp_size = utils.get_dp_size(pc)
         pcp_size = pc.prefill_context_parallel_size
+        # A pipeline over several TPU slices runs a torch.distributed world
+        # per slice, and the binding's ranks are the slice's (pp_slices).
+        layout = pipeline_slices(pc)
         binding = get_tpu_worker_binding(
             pc,
             self.rank,
@@ -228,6 +238,10 @@ class TPUWorker(WorkerBase):
         # takes these at construction time.
         self.profile_rank = binding.rank
         self.profile_world_size = binding.world_size
+        if layout is not None:
+            # The slices' ranks overlap; the engine's do not.
+            self.profile_rank = self.rank
+            self.profile_world_size = pc.world_size
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
@@ -418,8 +432,11 @@ class TPUWorker(WorkerBase):
                 init_rank = self.rank
                 init_world = pc.world_size
                 dist_world_size = pc.world_size
+                if layout is not None:
+                    init_rank = binding.init_rank
+                    init_world = dist_world_size = binding.init_world_size
                 _configure_tpu_process_env(
-                    self.rank, tpu_local_rank_env, pc.world_size, tpu_local_world
+                    init_rank, tpu_local_rank_env, init_world, tpu_local_world
                 )
             if envs.TPU_LOCAL_RANK_OFFSET:
                 logger.info(
@@ -442,7 +459,15 @@ class TPUWorker(WorkerBase):
         tpu_platform = cast(TpuPlatform, current_platform)
         dist_backend = tpu_platform.get_worker_distributed_backend(dist_world_size)
 
-        with set_current_vllm_config(self.vllm_config):
+        # A sliced pipeline brings up the torch world of this worker's slice
+        # alone: a slice of one host keeps the executor's init method, one of
+        # several meets at the slice's first host (tpu_mp_multihost).
+        dist_config = (
+            self.vllm_config
+            if layout is None
+            else slice_view(self.vllm_config, layout, os.environ["MASTER_ADDR"])
+        )
+        with set_current_vllm_config(dist_config):
             init_distributed_environment(
                 world_size=init_world,
                 rank=init_rank,
@@ -450,6 +475,12 @@ class TPUWorker(WorkerBase):
                 distributed_init_method=dist_init_method,
                 backend=dist_backend,
             )
+        # The pipeline group vLLM builds holds the stages of this torch world.
+        stages = (
+            pc.pipeline_parallel_size
+            if layout is None
+            else layout.stages_of(layout.slice_of_rank(self.rank))
+        )
         # The PCP group keeps its natural rank order. Reordering it used to be
         # how the ring was chosen, on the understanding that the ring followed
         # the group's own rank order. google-pytorch/torch_tpu#3522 binds
@@ -473,10 +504,14 @@ class TPUWorker(WorkerBase):
         ):
             ensure_model_parallel_initialized(
                 tensor_model_parallel_size=self.parallel_config.tensor_parallel_size,
-                pipeline_model_parallel_size=self.parallel_config.pipeline_parallel_size,
+                pipeline_model_parallel_size=stages,
                 prefill_context_model_parallel_size=pcp_size,
                 decode_context_model_parallel_size=self.parallel_config.decode_context_parallel_size,
             )
+        if layout is not None:
+            store = rendezvous_store(pc)
+            install_sliced_pipeline_group(layout, self.rank, store)
+            install_engine_queues(store, self.rank, pc.world_size, pc.local_world_size)
 
         pp_group = get_pp_group()
         is_first_rank = pp_group.is_first_rank

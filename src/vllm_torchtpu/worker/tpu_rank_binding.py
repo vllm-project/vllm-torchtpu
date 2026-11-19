@@ -49,6 +49,7 @@ the PCP group's rank order, not here.
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from vllm_torchtpu.distributed.pp_slices import pipeline_slices
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -312,6 +313,11 @@ def get_tpu_worker_binding(
         if env.get("LOCAL_RANK")
         else _get_int_env(env, "LOCAL_WORLD_SIZE", parallel_config.local_world_size)
     )
+    # A slice of a sliced pipeline is a torch.distributed world of its own,
+    # ranked from 0 (pp_slices).
+    if (layout := pipeline_slices(parallel_config)) is not None:
+        world_size = layout.world_size_of(layout.slice_of_rank(rank))
+        rank -= layout.slice_start(rank)
     return TpuWorkerBinding(
         rank=rank,
         local_rank=local_rank_offset + tpu_local_rank,

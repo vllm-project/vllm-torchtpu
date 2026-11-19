@@ -31,6 +31,7 @@ def _config(
     dp=1,
     ep=False,
     index_topk=None,
+    nnodes=1,
 ):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -39,6 +40,8 @@ def _config(
             prefill_context_parallel_size=pcp,
             data_parallel_size=dp,
             enable_expert_parallel=ep,
+            nnodes=nnodes,
+            world_size=pp * tp * pcp,
         ),
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
         speculative_config=speculative,
@@ -306,3 +309,53 @@ def test_a_removed_pipeline_env_var_that_is_still_set_fails(monkeypatch, name, r
         validate_pipeline_parallel_config(_config(pp=2))
     # Without a pipeline it changes nothing.
     validate_pipeline_parallel_config(_config(pp=1))
+
+
+@pytest.fixture
+def two_slices(monkeypatch):
+    monkeypatch.setenv("TPU_PP_SLICES", "2")
+    monkeypatch.delenv("TPU_MULTIHOST_BACKEND", raising=False)
+    monkeypatch.delenv("TPU_PP_DCN_STREAMS", raising=False)
+
+
+def test_accepts_a_pipeline_over_slices(two_slices):
+    validate_pipeline_parallel_config(_config(pp=4, nnodes=2))
+
+
+@pytest.mark.parametrize(
+    ("pp", "nnodes", "message"),
+    [
+        (3, 2, r"must divide --pipeline-parallel-size \(3\)"),
+        (4, 3, r"must divide --nnodes \(3\)"),
+    ],
+)
+def test_slices_must_split_the_stages_and_hosts_evenly(two_slices, pp, nnodes, message):
+    with pytest.raises(ValueError, match=message):
+        validate_pipeline_parallel_config(_config(pp=pp, nnodes=nnodes))
+
+
+def test_slices_without_a_pipeline_are_refused(two_slices):
+    with pytest.raises(ValueError, match=r"must divide --pipeline-parallel-size \(1\)"):
+        validate_pipeline_parallel_config(_config(pp=1, nnodes=2))
+
+
+def test_a_pipeline_over_slices_rejects_data_parallelism(two_slices):
+    with pytest.raises(
+        NotImplementedError, match="data parallelism yet. Use --data-parallel-size 1"
+    ):
+        validate_pipeline_parallel_config(_config(pp=4, nnodes=2, dp=2))
+
+
+def test_a_pipeline_over_slices_rejects_the_ray_backend(two_slices, monkeypatch):
+    monkeypatch.setenv("TPU_MULTIHOST_BACKEND", "ray")
+    with pytest.raises(NotImplementedError, match="mp backend only"):
+        validate_pipeline_parallel_config(_config(pp=4, nnodes=2))
+
+
+def test_a_pipeline_over_slices_needs_a_tcp_stream(two_slices, monkeypatch):
+    monkeypatch.setenv("TPU_PP_DCN_STREAMS", "0")
+    with pytest.raises(ValueError, match="TPU_PP_DCN_STREAMS must be at least 1"):
+        validate_pipeline_parallel_config(_config(pp=4, nnodes=2))
+    # It is only read for a pipeline over several slices.
+    monkeypatch.setenv("TPU_PP_SLICES", "1")
+    validate_pipeline_parallel_config(_config(pp=4, nnodes=2))

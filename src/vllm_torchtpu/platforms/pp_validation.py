@@ -100,11 +100,17 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     """Reject configurations the TPU pipeline-parallel path does not serve.
 
     Raises NotImplementedError naming the unsupported feature, and
-    ValueError for a removed pipeline env var that is still set or a
+    ValueError for a removed pipeline env var that is still set, a
     buffered hand-off depth below one or deeper than a device's receive
-    flags allow.
+    flags allow, or slices (TPU_PP_SLICES) that do not split the stages and
+    hosts into whole slices or would hand off over fewer than one TCP stream. A
+    TPU_PP_SLICES below one, or above one on an engine without a pipeline,
+    is refused too.
     """
+    from vllm_torchtpu.distributed.pp_slices import pipeline_slices
+
     parallel_config = vllm_config.parallel_config
+    layout = pipeline_slices(parallel_config)
     if parallel_config.pipeline_parallel_size <= 1:
         return
     for name, remedy in _REMOVED_PIPELINE_ENVS.items():
@@ -199,6 +205,27 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
             f"Pipeline parallelism on TPU does not support {unsupported} yet.{remedy}"
         )
     from vllm_torchtpu import envs
+
+    if layout is not None:
+        # Each slice is a torch.distributed world of its own, brought up by
+        # the mp backend's --nnodes launch.
+        if parallel_config.data_parallel_size > 1:
+            raise NotImplementedError(
+                "A pipeline over several TPU slices (TPU_PP_SLICES) does not "
+                "support data parallelism yet. Use --data-parallel-size 1."
+            )
+        if envs.TPU_MULTIHOST_BACKEND == "ray":
+            raise NotImplementedError(
+                "A pipeline over several TPU slices (TPU_PP_SLICES) runs on the "
+                "mp backend only. Unset TPU_MULTIHOST_BACKEND and launch every "
+                "host with --nnodes and --node-rank."
+            )
+        if envs.TPU_PP_DCN_STREAMS < 1:
+            # The hop between two slices moves its data over this many TCP
+            # streams.
+            raise ValueError(
+                f"TPU_PP_DCN_STREAMS must be at least 1, got {envs.TPU_PP_DCN_STREAMS}."
+            )
 
     if envs.TPU_PP_HANDOFF_DEPTH < 1:
         # A stage queues at most this many forwards for the next one; with
