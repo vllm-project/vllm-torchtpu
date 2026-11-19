@@ -25,6 +25,14 @@ spin after every parallel region in the engine and worker loops (the reason
 vLLM keeps those processes at one torch thread). The copies move bytes, so the
 tensors are unchanged.
 
+`write_tensor` also takes the lowest free slot instead of the next one in
+turn. A slot's tmpfs pages are allocated and mapped by the first write and
+read through it, so upstream's round-robin made each of a fresh server's first
+8 large items pay that: 12.5 ms to write a 32 MB item into a new slot against
+1.3-1.5 into a used one. Sequential requests now keep reusing the same slots,
+and the creator touches slot 0 once at startup (`_init_arena`), so the first
+request finds it allocated too.
+
 `write_tensor` is a drop-in for its namesake in `vllm.distributed.
 device_communicators.shm_tensor_arena`, written to move there unchanged.
 """
@@ -41,6 +49,7 @@ from vllm.distributed.device_communicators import shm_tensor_arena
 from vllm.multimodal import inputs
 
 # The upstream code this module reproduces or wraps; the tests pin their sources.
+UPSTREAM_ARENA_INIT = shm_tensor_arena.ShmTensorArena.__init__
 UPSTREAM_WRITE_TENSOR = shm_tensor_arena.ShmTensorArena.write_tensor
 UPSTREAM_FLAT_REDUCE_DATA = inputs.MultiModalFlatField._reduce_data
 
@@ -52,14 +61,19 @@ CHUNK_BYTES = 4 << 20
 MIN_PARALLEL_BYTES = 8 << 20
 
 
+def host_threads() -> int:
+    """The host pool's threads: the knee, within this process's CPUs."""
+    return min(COPY_THREADS, len(os.sched_getaffinity(0)))
+
+
 @functools.cache
-def _pool() -> concurrent.futures.ThreadPoolExecutor:
-    threads = min(COPY_THREADS, len(os.sched_getaffinity(0)))
-    return concurrent.futures.ThreadPoolExecutor(threads, "mm_host_copy")
+def host_pool() -> concurrent.futures.ThreadPoolExecutor:
+    """The process's thread pool for host-side byte work on multimodal data."""
+    return concurrent.futures.ThreadPoolExecutor(host_threads(), "mm_host_copy")
 
 
 # A forked child (EngineCore, TP workers) has none of its parent's pool threads.
-os.register_at_fork(after_in_child=_pool.cache_clear)
+os.register_at_fork(after_in_child=host_pool.cache_clear)
 
 
 def copy_bytes_(pairs: Sequence[tuple[torch.Tensor, torch.Tensor]]) -> None:
@@ -73,7 +87,7 @@ def copy_bytes_(pairs: Sequence[tuple[torch.Tensor, torch.Tensor]]) -> None:
             dst.copy_(src)
         return
     futures = [
-        _pool().submit(dst[i : i + CHUNK_BYTES].copy_, src[i : i + CHUNK_BYTES])
+        host_pool().submit(dst[i : i + CHUNK_BYTES].copy_, src[i : i + CHUNK_BYTES])
         for dst, src in pairs
         for i in range(0, src.numel(), CHUNK_BYTES)
     ]
@@ -81,8 +95,19 @@ def copy_bytes_(pairs: Sequence[tuple[torch.Tensor, torch.Tensor]]) -> None:
         future.result()
 
 
+def _init_arena(self: shm_tensor_arena.ShmTensorArena, *args, **kwargs) -> None:
+    """Upstream's constructor; the creator then writes slot 0 once, which
+    allocates its tmpfs pages before the first request needs them."""
+    UPSTREAM_ARENA_INIT(self, *args, **kwargs)
+    if self.is_creator:
+        with self._slot(0, self.slot_bytes) as slot_mv:
+            slot = torch.frombuffer(slot_mv, dtype=torch.uint8)
+            slot.fill_(0)
+            del slot
+
+
 def write_tensor(self: shm_tensor_arena.ShmTensorArena, t: torch.Tensor) -> int | None:
-    """Copy tensor bytes into a free slot; return slot idx or None
+    """Copy tensor bytes into the lowest free slot; return slot idx or None
     (caller must then fall back to the default pickle path)."""
     nbytes = t.numel() * t.element_size()
     if nbytes > self.slot_bytes:
@@ -95,8 +120,7 @@ def write_tensor(self: shm_tensor_arena.ShmTensorArena, t: torch.Tensor) -> int 
     except RuntimeError:
         return None
     shm_tensor_arena.memory_fence()
-    for probe in range(self.n_slots):
-        idx = (self._next_slot + probe) % self.n_slots
+    for idx in range(self.n_slots):
         with self._meta(idx) as meta:
             free = meta[0] == 0 or sum(meta[1:]) == self.n_reader
             if not free:
@@ -114,7 +138,6 @@ def write_tensor(self: shm_tensor_arena.ShmTensorArena, t: torch.Tensor) -> int 
             shm_tensor_arena.memory_fence()
             meta[0] = 1
             shm_tensor_arena.memory_fence()
-        self._next_slot = (idx + 1) % self.n_slots
         return idx
     self._fallbacks += 1
     if self._fallbacks == 1 or self._fallbacks % 100 == 0:
@@ -164,6 +187,9 @@ def _flat_reduce_data(
 
 
 def patch_mm_host_copies() -> None:
-    """Run the arena write and the workers' batch concatenation on the copy pool."""
+    """Run the arena write and the workers' batch concatenation on the copy
+    pool, with the arena's slots reused lowest first and slot 0 touched at
+    creation."""
+    shm_tensor_arena.ShmTensorArena.__init__ = _init_arena
     shm_tensor_arena.ShmTensorArena.write_tensor = write_tensor
     inputs.MultiModalFlatField._reduce_data = _flat_reduce_data

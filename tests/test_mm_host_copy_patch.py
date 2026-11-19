@@ -26,6 +26,9 @@ from vllm_torchtpu import mm_host_copy_patch as patch_mod
 
 PINNED_VLLM_VERSION = "0.33.0"
 PINNED_SOURCE_HASHES = {
+    "__init__": (
+        "f550f1794a43766b415fbf3adf0728becc071a585e00d45d0b63cc43ff26b1e7"
+    ),
     "write_tensor": (
         "b68dfda05bea53ee9522e65519f14519d6a0c2cff2f393fc3717bd2b2e23afee"
     ),
@@ -42,6 +45,7 @@ PINNED_SOURCE_HASHES = {
 @pytest.mark.parametrize(
     ("name", "fn"),
     [
+        ("__init__", patch_mod.UPSTREAM_ARENA_INIT),
         ("write_tensor", patch_mod.UPSTREAM_WRITE_TENSOR),
         ("_reduce_data", patch_mod.UPSTREAM_FLAT_REDUCE_DATA),
     ],
@@ -76,3 +80,15 @@ def test_pooled_copies_match_upstream(rows):
         del view
     finally:
         slot.release()
+
+
+def test_arena_reuses_the_lowest_free_slot():
+    """A freed slot is written again before an untouched one."""
+    arena = ShmTensorArena.__new__(ShmTensorArena)
+    patch_mod._init_arena(arena, n_reader=1, slot_bytes=1 << 20, n_slots=3)
+    t = torch.ones(1 << 20, dtype=torch.uint8)
+    assert patch_mod.write_tensor(arena, t) == 0
+    assert patch_mod.write_tensor(arena, t) == 1
+    with arena._meta(0) as meta:
+        meta[1] = 1  # the one reader is done with slot 0
+    assert patch_mod.write_tensor(arena, t) == 0
