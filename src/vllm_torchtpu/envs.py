@@ -254,6 +254,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
     TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR: int = 1
     TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: bool = False
+    TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT: int = 8
+    TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT: bool = False
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
@@ -1621,6 +1623,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # group (one chip's cores). Same outputs bit for bit.
     "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT": env_bool(
         "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT", default=False
+    ),
+    # MiniMax M3 head-parallel MSA prefill page exchange
+    # (`msa_dcp_heads.exchange_head_pages`): pages whose copies a rank keeps
+    # in flight (default 8), and DIRECT=1 copies every page straight to every
+    # replica of its KV head instead of forwarding inside the replica group.
+    "TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT": env_nonnegative_int(
+        "TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT", 8
+    ),
+    "TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT": env_bool(
+        "TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT", default=False
     ),
     # MiniMax M3 MSA prefill page cache table (`msa_attention_lse._page_cache`):
     # how its sorts run. Empty keeps three stable sorts (two of two operands);

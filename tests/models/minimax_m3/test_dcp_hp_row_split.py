@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: (host devices, interpret) the replicas of
-a KV head splitting the query tiles give the same output bits as splitting
-the query heads, at DCP 4 and DCP 8."""
+"""TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT and TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT /
+_IN_FLIGHT: (host devices, interpret) the replicas of a KV head splitting the
+query tiles, and the page exchange copying straight to every replica with a
+different number of pages in flight, give the same output bits as the
+defaults, at DCP 4 and DCP 8."""
 
 import os
 import subprocess
@@ -74,6 +76,12 @@ _E2E = textwrap.dedent(
     assert H._row_split_logged
     assert np.abs(a[:, :, 8:TREAL]).min(axis=(0, 1, 3)).sum() >= 0 and np.abs(a).sum() > 0
     assert np.array_equal(a, b), float(np.abs(a - b).max())
+    os.environ["TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT"] = "0"
+    os.environ["TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT"] = "1"
+    os.environ["TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT"] = "3"
+    c = run()
+    assert H._exchange_logged
+    assert np.array_equal(a, c), float(np.abs(a - c).max())
     print("OK")
     """
 )

@@ -244,6 +244,7 @@ def _per_token(seq_id: jax.Array, table: jax.Array) -> jax.Array:
 _EXCHANGE_PAGES_IN_FLIGHT = 8
 # The exchange's barrier semaphore.
 _EXCHANGE_COLLECTIVE_ID = 0
+_exchange_logged = False
 
 
 def live_part(live: jax.Array, replica, replicas: int, part: int) -> jax.Array:
@@ -264,6 +265,8 @@ def exchange_head_pages(
     replicas: int,
     head_width: int,
     interpret: bool = False,
+    in_flight: int = _EXCHANGE_PAGES_IN_FLIGHT,
+    direct: bool = False,
 ) -> jax.Array:
     """Inside a ``shard_map`` over `axis`: every rank's pages of the KV head
     this rank (``rank``, ``int32[1]``) owns, ``[replicas, dcp, L / replicas,
@@ -278,7 +281,11 @@ def exchange_head_pages(
     (one chip's cores at c64). A static XLA gather, all-to-all and
     all-gather moved the whole buffer whatever the context, relaid the pages
     out around each collective and ran the all-to-all at one link's
-    bandwidth."""
+    bandwidth.
+
+    `in_flight`: pages whose copies a rank keeps in flight. `direct`: rank
+    ``src`` copies every part straight to every replica of the head (no
+    forwarding stage, ``replicas`` times the source's sends)."""
     _, rows, packing, _ = kv_cache.shape
     num_pages = pages.shape[0]
     part = num_pages // replicas
@@ -314,22 +321,23 @@ def exchange_head_pages(
         # Every rank has entered the call: its output buffer is live.
         pl.semaphore_wait(barrier, dcp)
 
-        def sends(i, op):
+        def sends(i, op, j=None):
             for d in range(dcp):
-                head, j = divmod(d, replicas)
+                head, jd = divmod(d, replicas)
+                jj = jd if j is None else j
 
-                def send(d=d, head=head, j=j):
+                def send(d=d, head=head, jj=jj):
                     columns = pl.ds(head * head_width, head_width)
-                    src = kv_ref.at[pages_ref[j * part + i], :, :, columns]
-                    op(remote(src, out_ref.at[j, me, i], send_sem, recv_sem, d))
+                    src = kv_ref.at[pages_ref[jj * part + i], :, :, columns]
+                    op(remote(src, out_ref.at[jj, me, i], send_sem, recv_sem, d))
 
-                pl.when(i < counts[j])(send)
+                pl.when(i < counts[jj])(send)
 
         def pipelined(n, copies):
             """Start ``copies(i, op)`` for ``i < n``, a bounded number in
             flight (equal-sized copies on one semaphore: any wait retires
             one)."""
-            ahead = _EXCHANGE_PAGES_IN_FLIGHT
+            ahead = in_flight
 
             def step(i, carry):
                 copies(i, lambda c: c.start())
@@ -343,8 +351,6 @@ def exchange_head_pages(
             jax.lax.fori_loop(0, n, step, 0)
             jax.lax.fori_loop(jnp.maximum(n - ahead, 0), n, drain, 0)
 
-        pipelined(counts[0], sends)
-
         def page_wait(sem):
             def wait(i, carry):
                 page = out_ref.at[0, 0, 0]
@@ -352,6 +358,14 @@ def exchange_head_pages(
                 return carry
 
             return wait
+
+        if direct:
+            # Every part to every replica of its head: no forwarding stage.
+            for j in range(replicas):
+                pipelined(counts[j], functools.partial(sends, j=j))
+            jax.lax.fori_loop(0, sum(counts) * dcp, page_wait(recv_sem), 0)
+            return
+        pipelined(counts[0], sends)
 
         mine = jnp.where(replica == 0, counts[0], counts[-1])
         for j in range(1, replicas - 1):
@@ -420,6 +434,19 @@ def _exchange_pages(
             f"cache rows {kv_cache.shape} do not hold {heads} KV heads of "
             f"{head_width} columns"
         )
+    from vllm_torchtpu import envs
+
+    in_flight = max(1, int(envs.TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT))
+    direct = bool(envs.TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT) and replicas > 1
+    global _exchange_logged
+    if (direct or in_flight != _EXCHANGE_PAGES_IN_FLIGHT) and not _exchange_logged:
+        _exchange_logged = True
+        init_logger(__name__).warning(
+            "MSA DCP page exchange: %d pages in flight, direct=%s "
+            "(TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT / _DIRECT).",
+            in_flight,
+            direct,
+        )
     recv = exchange_head_pages(
         kv_cache,
         pages,
@@ -430,6 +457,8 @@ def _exchange_pages(
         replicas=replicas,
         head_width=head_width,
         interpret=interpret,
+        in_flight=in_flight,
+        direct=direct,
     )
     # Destination rank d = h * replicas + j gets part j of head h.
     sc = scale_cache[pages][:, : 2 * heads]  # K/V rows of every head
