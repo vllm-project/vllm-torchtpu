@@ -24,7 +24,10 @@ from typing import TYPE_CHECKING, get_args
 
 from vllm_torchtpu.megakernel.core import errors
 
-from .chips import ChipSpec, resolve_chip_spec
+from .chips import (
+    ChipSpec,
+    resolve_chip_spec,
+)
 from .constants import (
     DEFAULT_CHIP,
     DEFAULT_PREFILL_ISL,
@@ -36,6 +39,8 @@ from .constants import (
 from .models import (
     ModelProfile,
     ParallelLayout,
+    match_preset_by_geometry,
+    matching_shipped_preset_name,
     resolve_model_profile,
 )
 from .regimes import (
@@ -59,6 +64,38 @@ from .verdict import advise
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+
+def _emit_config_preset_notice(
+    config_arg: Path | None,
+    profile: ModelProfile,
+) -> None:
+    """Write one stderr notice telling whether `--config` matched a preset."""
+    if config_arg is None:
+        return
+    matched_preset = match_preset_by_geometry(profile)
+    if matched_preset is not None:
+        message = (
+            f"Config matched shipped preset {matched_preset}: "
+            "its layouts and megakernel declarations apply.\n"
+        )
+    else:
+        preset_named = (
+            matching_shipped_preset_name(profile.name.removesuffix("-custom"))
+            if profile.name.endswith("-custom")
+            else None
+        )
+        if preset_named is not None:
+            message = (
+                f"Config is named like shipped preset {preset_named} but has a "
+                f"different architecture or dtypes: priced under {profile.name} "
+                "with no megakernel declaration.\n"
+            )
+        else:
+            message = (
+                "Config matched no shipped preset: no megakernel declaration applies.\n"
+            )
+    sys.stderr.write(message)
 
 
 def derive_decoding_sequences(
@@ -520,6 +557,7 @@ def _resolve_cli_model_and_chip(
     target: str | Path = args.model or args.config or args.hf_repo or "qwen3.5-397b"
     act_dt = getattr(args, "act_dtype", None)
     profile = resolve_model_profile(target, act_dtype=act_dt)
+    _emit_config_preset_notice(args.config, profile)
     chip_spec = resolve_chip_spec(
         args.chip,
         chip_spec_path=args.chip_spec_path,
