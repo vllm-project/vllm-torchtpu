@@ -169,6 +169,34 @@ def _fp4_rows(kv_ref) -> jax.Array:
     return pltpu.bitcast(words, jnp.int4).astype(jnp.bfloat16)
 
 
+def _fp4_kv_strided(kv_ref, head_dim):
+    """Unscaled bf16 K and V rows ``[S, D]`` of a 4-bit page, as
+    `_fp4_rows` split at `head_dim`, read through a ``[R * 2, 128]`` word
+    view: the page's ``[R, 4, 2D]`` bytes are tiled 4 rows by 128 lanes (one
+    sublane per row), so each row's K words and V words alternate, and a
+    sublane-strided load reads 8 rows of either per vreg. The ``[R, 2D]``
+    word view loads every row's sublane apart and gathers them (2 vld, 2
+    vcombine, 2 vrot per vreg of words: ~64 vector ops a page, AOT)."""
+    words = kv_ref.bitcast(jnp.uint32)
+    rows = words.shape[1]
+    lanes = words.shape[-1]
+    view = words.reshape(rows * lanes // 128, 128)
+    stride = lanes // 128
+
+    def half(start):
+        w = view[pl.ds(start, rows, stride=stride), :]
+        return pltpu.bitcast(w, jnp.int4).astype(jnp.bfloat16)
+
+    return half(0), half(head_dim // 128)
+
+
+def _fp4_strided_ok(kv_ref, head_dim) -> bool:
+    """`_fp4_kv_strided` reads this page: one page, D = 128, 2D lanes."""
+    return (
+        kv_ref.shape[0] == 1 and head_dim == 128 and kv_ref.shape[-1] == 2 * head_dim
+    )
+
+
 def _fp4_scales(scale_ref, k_row, v_row):
     """K / V scales of a page as `msa_attention._fp4_page` reads them."""
     if isinstance(k_row, int):
@@ -458,6 +486,8 @@ def _kernel(
     qk8 = fp4 and "qk8" in precision
     pv8 = fp4 and "pv8" in precision
     out_unit = 1.0 / _PV8_UNIT if pv8 else 1.0
+    # `strided` (DECODE_OPT): 4-bit pages read through `_fp4_kv_strided`.
+    strided = fp4 and decode_strided()
 
     def group_head(w):
         if not tiles_per_head:
@@ -828,11 +858,16 @@ def _kernel(
                     elif qk8 or pv8:
                         rows = _fp4_ints(kv_ref)  # int4 [S, 2D]
                         sk, sv = _fp4_scales(scale_ref, k_row, v_row)
+                    elif strided and _fp4_strided_ok(kv_ref, head_dim):
+                        rows = None
+                        k_int, v_int = _fp4_kv_strided(kv_ref, head_dim)
+                        sk, sv = _fp4_scales(scale_ref, k_row, v_row)
                     else:
                         rows, sk, sv = msa_attention._fp4_page(
                             kv_ref, scale_ref, k_row, v_row
                         )
-                    k_int, v_int = rows[:, :head_dim], rows[:, head_dim:]
+                    if rows is not None:
+                        k_int, v_int = rows[:, :head_dim], rows[:, head_dim:]
                     # int4 values are exact in fp8; scales apply around the dots.
                     values.append(
                         v_int.astype(jnp.float8_e4m3fn if pv8 else jnp.bfloat16)
@@ -866,6 +901,18 @@ def _kernel(
             part_heads = num_heads // row_split
             part_rows = part_heads * block_q
 
+            tiled = fp4 and block_q == 8 and decode_bcast()
+
+            def col_scale(x, vec):
+                """``x [rows, N] * vec [1, N]``. `tiled` (`bcast`): ``vec``
+                broadcast to one 8-row tile that every head's rows reuse;
+                a [1, N] -> [rows, N] broadcast materialised one relayout
+                per score vreg (two ops each, AOT), the same products."""
+                if not tiled:
+                    return x * vec
+                tile = jnp.broadcast_to(vec, (block_q, vec.shape[1]))
+                return (x.reshape(-1, block_q, x.shape[1]) * tile[None]).reshape(x.shape)
+
             for part in range(row_split):
                 heads = slice(part * part_heads, (part + 1) * part_heads)
                 rows_at = pl.ds(part * part_rows, part_rows)
@@ -879,7 +926,7 @@ def _kernel(
                     q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
                 )
                 if fp4:  # x = int4 * scale: K scales the score columns, V scales p
-                    s = s * k_scale
+                    s = col_scale(s, k_scale)
                 s = jnp.where(mask, s, -jnp.inf)
 
                 # The running max starts at a finite floor (`_MASK_VALUE`), so a
@@ -890,7 +937,7 @@ def _kernel(
                 m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
                 p = jnp.exp2(s - m_new)
                 l_cur = jnp.sum(p, axis=1, keepdims=True)
-                p_v = p * v_scale if fp4 else p
+                p_v = col_scale(p, v_scale) if fp4 else p
                 pv = jax.lax.dot_general(
                     p_v.astype(v.dtype),
                     v,
@@ -952,7 +999,10 @@ def _kernel(
             def scores(g, q=q):
                 page, kv_ref, scale_ref = pages[g]
                 sk, _ = _fp4_scales(scale_ref, k_row, v_row)
-                k = _fp4_rows(kv_ref)[:, :head_dim]
+                if strided and _fp4_strided_ok(kv_ref, head_dim):
+                    k = _fp4_kv_strided(kv_ref, head_dim)[0]
+                else:
+                    k = _fp4_rows(kv_ref)[:, :head_dim]
                 s_g = jax.lax.dot_general(
                     q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
                 )
@@ -980,7 +1030,10 @@ def _kernel(
                 _, sv = _fp4_scales(scale_ref, k_row, v_row)
                 p = jnp.exp2(s_g - m_new)
                 lsum = p if lsum is None else lsum + p
-                v = _fp4_rows(kv_ref)[:, head_dim:]
+                if strided and _fp4_strided_ok(kv_ref, head_dim):
+                    v = _fp4_kv_strided(kv_ref, head_dim)[1]
+                else:
+                    v = _fp4_rows(kv_ref)[:, head_dim:]
                 pv_g = jax.lax.dot_general(
                     (p * sv).astype(v.dtype), v, (((1,), (0,)), ((), ())),
                     preferred_element_type=jnp.float32,
@@ -1768,6 +1821,10 @@ def decode_opt() -> dict:
             opt["pages_per_step"] = int(val)
         elif key == "pair" and not val:
             opt["pair"] = True
+        elif key == "strided" and not val:
+            pass  # `decode_strided`
+        elif key == "bcast" and not val:
+            pass  # `decode_bcast`
         elif key == "chunk" and val in ("", "1", "2"):
             pass  # `decode_chunk`
         elif key == "pairmax" and val.isdigit():
@@ -1790,6 +1847,20 @@ def decode_chunk() -> int:
         if key == "chunk":
             return 2 if val == "2" else 1
     return 0
+
+
+def decode_strided() -> bool:
+    """`TPU_MINIMAX_M3_MSA_DECODE_OPT` holds ``strided``: 4-bit pages unpack
+    through `_fp4_kv_strided` (same bits)."""
+    spec = os.environ.get(DECODE_OPT_ENV, "")
+    return "strided" in (x.strip() for x in spec.replace("+", ",").split(","))
+
+
+def decode_bcast() -> bool:
+    """`TPU_MINIMAX_M3_MSA_DECODE_OPT` holds ``bcast``: 4-bit 8-token tiles
+    scale scores and p by K / V scale rows tiled once (`attend`)."""
+    spec = os.environ.get(DECODE_OPT_ENV, "")
+    return "bcast" in (x.strip() for x in spec.replace("+", ",").split(","))
 
 
 def decode_pair_max() -> int:
