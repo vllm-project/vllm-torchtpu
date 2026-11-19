@@ -52,8 +52,8 @@ LAYER = "model.layers.0"
 # own layout.
 LAYER1 = "model.layers.1"
 
-# Qwen3_5ForCausalLMBase.packed_modules_mapping: vLLM's fused layer name to the
-# checkpoint names that quantized_layers is keyed by.
+# This copies Qwen3_5ForCausalLMBase.packed_modules_mapping, which maps each
+# vLLM fused layer name to the checkpoint shard names quantized_layers uses.
 PACKED_MODULES = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "gate_up_proj": ["gate_proj", "up_proj"],
@@ -104,7 +104,6 @@ def _make_config(extra_layers: dict | None = None) -> VllmModelOptMixedConfig:
 
 
 def _linear(input_size: int = 64, output_size: int = 32) -> LinearBase:
-    """A bare LinearBase with explicit dimensions."""
     layer = LinearBase.__new__(LinearBase)
     torch.nn.Module.__init__(layer)
     layer.input_size = input_size
@@ -181,11 +180,15 @@ class TestRegistration:
         ],
     )
     def test_hf_quant_config_json_fallback(
-        self, tmp_path, quantization_config, text_quantization_config
+        self, tmp_path, monkeypatch, quantization_config, text_quantization_config
     ):
         from vllm.config import LoadConfig
 
+        # get_tpu_quantization_config stores vllm_config on the class; restore
+        # it so later tests don't see this test's stand-in config.
+        monkeypatch.setattr(VllmModelOptMixedConfig, "vllm_config", None)
         hf_quant = {
+            "producer": {"name": "modelopt", "version": "0.42.0"},
             "quantization": {
                 "quant_algo": "MIXED_PRECISION",
                 "quantized_layers": {
@@ -193,7 +196,7 @@ class TestRegistration:
                     f"{LAYER}.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16},
                 },
                 "exclude_modules": ["mtp*"],
-            }
+            },
         }
         (tmp_path / "hf_quant_config.json").write_text(json.dumps(hf_quant))
         text_config = (
@@ -227,13 +230,26 @@ class TestRegistration:
         method = resolved.get_quant_method(_linear(), f"{LAYER}.linear_attn.out_proj")
         assert isinstance(method, VllmFp8LinearMethodTPU)
 
+    def test_hf_quant_config_json_requires_modelopt_producer(self):
+        hf_quant = {
+            "producer": {"name": "other-tool"},
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    f"{LAYER}.linear_attn.out_proj": {"quant_algo": "FP8"}
+                },
+            },
+        }
+        with pytest.raises(ValueError, match="produced by modelopt"):
+            VllmModelOptMixedConfig.from_config(hf_quant)
+
 
 class TestDispatch:
     @pytest.mark.parametrize(
         "prefix",
         [
             f"{LAYER}.linear_attn.out_proj",
-            # Fused layers: every checkpoint shard is FP8.
+            # Every checkpoint shard of these fused layers is FP8.
             f"{LAYER}.linear_attn.in_proj_qkvz",
             f"{LAYER}.linear_attn.in_proj_ba",
             f"{LAYER}.self_attn.qkv_proj",
@@ -275,11 +291,11 @@ class TestDispatch:
     @pytest.mark.parametrize(
         "prefix",
         [
-            # In the checkpoint but absent from quantized_layers.
+            # These layers are in the checkpoint but absent from quantized_layers.
             f"{LAYER}.mlp.shared_expert.down_proj",
             f"{LAYER}.mlp.shared_expert.gate_up_proj",
             f"{LAYER}.mlp.gate",
-            # Matched by the "mtp*" ignore pattern.
+            # This layer matches the "mtp*" ignore pattern.
             "mtp.layers.0.self_attn.o_proj",
         ],
     )
@@ -297,7 +313,7 @@ class TestDispatch:
         cfg = _make_config(
             {
                 f"{LAYER}.mlp.shared_expert.gate_proj": {"quant_algo": "FP8"},
-                # up_proj intentionally omitted -> partial fused gate_up_proj
+                # Omitting up_proj leaves the fused gate_up_proj partly quantized.
             }
         )
         with pytest.raises(ValueError, match="Inconsistent quantization across shards"):
@@ -380,6 +396,21 @@ class TestDispatch:
         linear = cfg.get_quant_method(_linear(), f"{LAYER}.mlp.down")
         assert isinstance(linear, VllmNvfp4LinearMethod)
         assert linear.group_size == 16
+
+    def test_missing_group_size_uses_top_level_group_size(self):
+        raw = _quant_config({f"{LAYER}.mlp.down": {"quant_algo": "NVFP4"}})
+        raw["group_size"] = 32
+        cfg = VllmModelOptMixedConfig.from_config(raw)
+        assert isinstance(cfg, VllmModelOptMixedConfig)
+        cfg.packed_modules_mapping = dict(PACKED_MODULES)
+        cfg.vllm_config = _fake_vllm_config()
+        linear = cfg.get_quant_method(_linear(), f"{LAYER}.mlp.down")
+        assert isinstance(linear, VllmNvfp4LinearMethod)
+        assert linear.group_size == 32
+        # An entry's own group_size still wins over the top-level value.
+        experts = cfg.get_quant_method(_FakeRoutedExperts(), f"{LAYER}.mlp.experts")
+        assert isinstance(experts, VllmNvfp4MoEMethod)
+        assert experts.group_size == 16
 
     def test_fused_shards_without_packed_modules_mapping(self):
         cfg = _make_config()
@@ -475,7 +506,6 @@ class TestForwardPass:
         gen = torch.Generator().manual_seed(7)
         x = torch.randn(4, 64, generator=gen).to(torch.bfloat16)
 
-        # 1. Unquantized shared-expert linear forward pass.
         unq_layer = _linear()
         unq_method = cfg.get_quant_method(
             unq_layer, f"{LAYER}.mlp.shared_expert.down_proj"
@@ -496,8 +526,8 @@ class TestForwardPass:
         out_unq = unq_method.apply(unq_layer, x)
         torch.testing.assert_close(out_unq, x @ w_bf16.T, rtol=1e-2, atol=1e-2)
 
-        # 2. Multi-partition fused ModelOpt FP8 linear (e.g. in_proj_qkvz)
-        # exercising per-partition weight_scale reduction.
+        # The two partitions get different weight scales so the test covers
+        # how a fused layer's per-partition weight_scale is reduced.
         fp8_layer = _linear(input_size=64, output_size=32)
         fp8_method = cfg.get_quant_method(
             fp8_layer, f"{LAYER}.linear_attn.in_proj_qkvz"

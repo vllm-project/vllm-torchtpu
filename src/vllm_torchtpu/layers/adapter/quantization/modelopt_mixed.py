@@ -14,38 +14,27 @@
 """ModelOpt MIXED_PRECISION quantization support for TPU.
 
 A ModelOpt mixed-precision checkpoint (``quant_algo: MIXED_PRECISION``) names a
-quantization algorithm per layer in ``quantized_layers``. vLLM resolves it to
-the ``modelopt_mixed`` method.
+quantization algorithm per layer in ``quantized_layers``, and vLLM resolves it
+to the ``modelopt_mixed`` method. This config reuses upstream's checkpoint
+parsing and gives each layer the TPU method that serves the same algorithm in a
+uniform checkpoint.
 
-This config reuses upstream's checkpoint parsing and dispatches each layer to
-the TPU method that serves that algorithm in a uniform checkpoint:
+TPU supports ``FP8`` on linear layers, and ``NVFP4`` or ``W4A16_NVFP4`` on linear
+layers and routed experts. Layers that are excluded, marked ``"NONE"``, or
+absent from ``quantized_layers`` load unquantized. Any other layer and algorithm
+pair raises ``NotImplementedError``, and a fused projection or expert group
+whose entries disagree raises ``ValueError``.
 
-  - ``FP8`` linear layers: ``VllmFp8LinearMethodTPU`` (per-tensor weight
-    scale). The checkpoint's static ``input_scale`` is loaded and then freed,
-    because the TPU matmul quantizes activations dynamically.
-  - ``NVFP4`` / ``W4A16_NVFP4`` linear layers: ``VllmNvfp4LinearMethod`` with
-    the layer's own ``group_size``.
-  - ``NVFP4`` / ``W4A16_NVFP4`` routed experts: ``VllmNvfp4MoEMethod`` with the
-    expert group's own ``group_size``.
-  - Layers that are excluded, marked ``"NONE"``, or absent from
-    ``quantized_layers``: the unquantized TPU methods (supporting
-    ``QUANTIZE_ON_LOAD_PREFIXES`` via ``VllmUnquantizedConfig`` and
-    ``tpu_online_fp8`` via ``resolve_online_fp8``).
-
-TPU serves ``NVFP4`` and ``W4A16_NVFP4`` identically (W4A16), so both resolve to
-one ``("NVFP4", group_size)`` spec and may be mixed within a fused projection or
-an expert group. An NVFP4 entry without ``group_size`` uses ModelOpt's default
-of 16.
-
-Any other layer/algorithm pair raises ``NotImplementedError``, and partially
-quantized fused projections raise ``ValueError``, so a checkpoint never loads
-through a path that has not been written for it.
+TPU runs both ``NVFP4`` and ``W4A16_NVFP4`` layers as W4A16 (FP4 weights, bf16
+activations), so the two resolve to one ``NVFP4`` spec and may be mixed within a
+fused projection or an expert group. An NVFP4 entry without ``group_size`` uses
+the checkpoint's top-level ``group_size``, or ModelOpt's default of 16.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 from vllm.model_executor.layers.attention import Attention
@@ -88,8 +77,17 @@ from vllm_torchtpu.layers.core.quant_methods import (
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
-# (quant_algo, group_size); (None, None) means unquantized.
-LayerSpec = tuple[str | None, int | None]
+
+class LayerSpec(NamedTuple):
+    """How the checkpoint quantizes one layer."""
+
+    # None when the layer is unquantized.
+    quant_algo: str | None
+    # None for algorithms without block scales, such as FP8.
+    group_size: int | None
+
+
+_UNQUANTIZED = LayerSpec(None, None)
 
 _FALLBACK_FUSED_SHARDS: dict[str, tuple[str, ...]] = {
     "qkv_proj": ("q_proj", "k_proj", "v_proj"),
@@ -103,20 +101,22 @@ _NVFP4_ALGOS = ("NVFP4", "W4A16_NVFP4")
 _NVFP4_DEFAULT_GROUP_SIZE = 16
 
 
-def _normalize_layer_spec(entry: dict[str, Any]) -> LayerSpec:
+def _normalize_layer_spec(
+    entry: dict[str, Any], nvfp4_default_group_size: int
+) -> LayerSpec:
     raw_algo = entry.get("quant_algo")
     if raw_algo is None:
-        return None, None
+        return _UNQUANTIZED
     algo = str(raw_algo).upper()
     if algo == "NONE":
-        return None, None
+        return _UNQUANTIZED
     raw_group_size = entry.get("group_size")
     group_size = int(raw_group_size) if raw_group_size is not None else None
     if algo in _NVFP4_ALGOS:
         if group_size is None:
-            group_size = _NVFP4_DEFAULT_GROUP_SIZE
-        return "NVFP4", group_size
-    return algo, group_size
+            group_size = nvfp4_default_group_size
+        return LayerSpec("NVFP4", group_size)
+    return LayerSpec(algo, group_size)
 
 
 # vLLM picks a layer's weight loader by the method's class name, so a
@@ -159,21 +159,68 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
             mxfp8_config=mxfp8_config,
         )
         # ModelOpt FP8 linears store a per-tensor weight scale and a static
-        # input scale; "static" makes the method register both for loading.
-        # _ModelOptFp8LinearMethodTPU frees the input scale after loading.
+        # input scale. The "static" scheme makes the method register
+        # input_scale so the checkpoint tensor has a parameter to load into.
         self.tpu_fp8_config = VllmFp8Config(
             is_checkpoint_fp8_serialized=True,
             activation_scheme="static",
         )
-        # Upstream ModelOptMixedPrecisionConfig._from_config collapses NVFP4
-        # group_size onto a single value from the first NVFP4 entry. Cache TPU
-        # NVFP4 configs keyed by each layer's own resolved group_size instead.
+        # Upstream builds a single NVFP4 sub-config whose group_size comes from
+        # the top level or the first NVFP4 entry. Layers can use different
+        # group sizes, so TPU NVFP4 configs are cached per group_size.
         self._tpu_nvfp4_configs: dict[int, VllmNvfp4Config] = {}
+        self._nvfp4_default_group_size = _NVFP4_DEFAULT_GROUP_SIZE
         self._child_specs, self._expert_proj_specs = self._build_spec_index()
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
         return MODELOPT_MIXED
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> VllmModelOptMixedConfig:
+        # vLLM checks that a fallback hf_quant_config.json was written by
+        # ModelOpt only when the method is named "modelopt_mixed", and the
+        # "tpu-" prefix breaks that match, so the check is repeated here. That
+        # file nests its settings under "quantization" and has no
+        # "quant_method" key.
+        if "quantization" in config and "quant_method" not in config:
+            producer = config.get("producer", {}).get("name")
+            if producer != "modelopt":
+                raise ValueError(
+                    "ModelOpt MIXED_PRECISION expects hf_quant_config.json "
+                    f"produced by modelopt, got producer {producer!r}."
+                )
+        cfg = super().from_config(config)
+        assert isinstance(cfg, VllmModelOptMixedConfig)
+        return cfg
+
+    @classmethod
+    def _from_config(
+        cls,
+        *,
+        quant_method: str,
+        kv_cache_quant_method: str | None,
+        exclude_modules: list[str],
+        original_config: dict[str, Any],
+        group_size: int | None,
+        **kwargs: Any,
+    ) -> VllmModelOptMixedConfig:
+        cfg = super()._from_config(
+            quant_method=quant_method,
+            kv_cache_quant_method=kv_cache_quant_method,
+            exclude_modules=exclude_modules,
+            original_config=original_config,
+            group_size=group_size,
+            **kwargs,
+        )
+        assert isinstance(cfg, VllmModelOptMixedConfig)
+        # Upstream fills a missing top-level group_size from the first NVFP4
+        # entry before constructing the config, so take the checkpoint's own
+        # value here, before that fallback.
+        if group_size is not None:
+            cfg._nvfp4_default_group_size = group_size
+            cfg._child_specs, cfg._expert_proj_specs = cfg._build_spec_index()
+        return cfg
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
         super().apply_vllm_mapper(hf_to_vllm_mapper)
@@ -193,7 +240,7 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
         child_specs: dict[str, set[LayerSpec]] = {}
         expert_proj_specs: dict[str, set[LayerSpec]] = {}
         for key, info in self.quantized_layers.items():
-            spec = _normalize_layer_spec(info)
+            spec = _normalize_layer_spec(info, self._nvfp4_default_group_size)
             parts = key.split(".")
             for i in range(1, len(parts)):
                 parent = ".".join(parts[:i])
@@ -228,9 +275,11 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
             if not any(sp in self.quantized_layers for sp in shard_prefixes):
                 continue
             specs = [
-                _normalize_layer_spec(self.quantized_layers[sp])
+                _normalize_layer_spec(
+                    self.quantized_layers[sp], self._nvfp4_default_group_size
+                )
                 if sp in self.quantized_layers
-                else (None, None)
+                else _UNQUANTIZED
                 for sp in shard_prefixes
             ]
             unique_specs = set(specs)
@@ -242,15 +291,16 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
                     "quant_algo and group_size."
                 )
             return True, specs[0]
-        return False, (None, None)
+        return False, _UNQUANTIZED
 
     def _resolve_layer_quant_spec(self, prefix: str) -> LayerSpec:
-        # 1. Direct lookup.
         for candidate in self._quantized_layer_prefix_candidates(prefix):
             if candidate in self.quantized_layers:
-                return _normalize_layer_spec(self.quantized_layers[candidate])
+                return _normalize_layer_spec(
+                    self.quantized_layers[candidate], self._nvfp4_default_group_size
+                )
 
-        # 2. Packed / fused layer lookup via packed_modules_mapping.
+        # quantized_layers keys a fused layer by its checkpoint shard names.
         if "." in prefix:
             base, proj_name = prefix.rsplit(".", 1)
             base_candidates = self._quantized_layer_prefix_candidates(base)
@@ -263,7 +313,8 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
         else:
             proj_name = prefix
 
-        # 3. Prefix-based lookup for RoutedExperts / parent modules.
+        # A module without its own entry, such as RoutedExperts, takes the one
+        # spec shared by all entries under it.
         child_specs: set[LayerSpec] = set()
         for candidate in self._quantized_layer_prefix_candidates(prefix):
             child_specs |= self._child_specs.get(candidate, set())
@@ -274,8 +325,9 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
         if len(child_specs) == 1:
             return next(iter(child_specs))
 
-        # Checkpoints that list expert projections directly under the MoE block
-        # (e.g. "...moe.gate_proj") while vLLM names RoutedExperts "...moe.experts".
+        # Some checkpoints list expert projections directly under the MoE block
+        # (e.g. "...moe.gate_proj"), while vLLM names RoutedExperts
+        # "...moe.experts".
         if prefix.endswith(".experts"):
             for candidate in self._quantized_layer_prefix_candidates(prefix):
                 parent = candidate.rsplit(".experts", 1)[0]
@@ -288,7 +340,8 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
                 if len(sibling_specs) == 1:
                     return next(iter(sibling_specs))
 
-        # 4. Fallback shard names when packed_modules_mapping is not populated.
+        # This covers qkv_proj and gate_up_proj when packed_modules_mapping is
+        # empty or does not list them.
         fallback_shards = _FALLBACK_FUSED_SHARDS.get(proj_name)
         if fallback_shards is not None and "." in prefix:
             base = prefix.rsplit(".", 1)[0]
@@ -300,7 +353,7 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
             if matched:
                 return spec
 
-        return None, None
+        return _UNQUANTIZED
 
     def _get_checkpoint_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -310,30 +363,25 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
             return None
         if self.is_layer_excluded(prefix):
             return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
-        quant_algo, group_size = self._resolve_layer_quant_spec(prefix)
-        if quant_algo is None:
+        spec = self._resolve_layer_quant_spec(prefix)
+        if spec.quant_algo is None:
             return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
 
-        nvfp4_cfg = None
-        if quant_algo == "NVFP4":
-            assert group_size is not None
-            nvfp4_cfg = self._get_tpu_nvfp4_config(group_size)
-        if isinstance(layer, LinearBase):
-            if quant_algo == "FP8":
-                return _ModelOptFp8LinearMethodTPU(
-                    self.tpu_fp8_config,
-                    self.get_linear_config(layer),
-                    prefix=prefix,
-                )
-            if nvfp4_cfg is not None:
+        if spec.quant_algo == "FP8" and isinstance(layer, LinearBase):
+            return _ModelOptFp8LinearMethodTPU(
+                self.tpu_fp8_config, self.get_linear_config(layer), prefix=prefix
+            )
+        if spec.quant_algo == "NVFP4" and spec.group_size is not None:
+            nvfp4_cfg = self._get_tpu_nvfp4_config(spec.group_size)
+            if isinstance(layer, LinearBase):
                 return VllmNvfp4LinearMethod(nvfp4_cfg, self.get_linear_config(layer))
-        elif isinstance(layer, RoutedExperts):
-            if nvfp4_cfg is not None:
+            if isinstance(layer, RoutedExperts):
                 return VllmNvfp4MoEMethod(nvfp4_cfg, self.get_moe_config(layer))
         raise NotImplementedError(
             f"ModelOpt MIXED_PRECISION on TPU does not support quant_algo "
-            f"{quant_algo!r} for {type(layer).__name__} at {prefix!r}. TPU serves "
-            "FP8, NVFP4, and W4A16_NVFP4 linear layers and NVFP4 or W4A16_NVFP4 "
-            "routed experts; requantize this layer to one of those or list it in "
-            "the checkpoint's exclude_modules."
+            f"{spec.quant_algo!r} for {type(layer).__name__} at {prefix!r}. TPU "
+            "supports FP8 on linear layers, and NVFP4 or W4A16_NVFP4 (run as "
+            "W4A16) on linear layers and routed experts. Embeddings and lm_head "
+            "must be unquantized. Requantize this layer to one of those or list "
+            "it in the checkpoint's exclude_modules."
         )
