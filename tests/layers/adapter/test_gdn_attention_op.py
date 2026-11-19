@@ -2087,3 +2087,31 @@ def test_forward_runs_other_methods_on_the_dequantized_prequant_rows(
         rows, (x_q.to(torch.float32) * x_s).to(torch.bfloat16), rtol=0, atol=0
     )
     assert len(attn.in_proj_ba.quant_method.calls) == 1
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
+def test_the_397b_fp8_input_projection_takes_prequantized_rows(
+    make_gdn_attention, tp_size
+):
+    """The Qwen3.5-397B FP8 checkpoint's GDN layer (16 key and 64 value heads
+    of 128, hidden 4096, 128 x 128 block scales, in_proj_b and in_proj_a left
+    bf16) requantizes in_proj_qkvz per channel at load, so the model patch's
+    FP8 row gather and fused input norm admit it at every decode and prefill
+    TP size; the bf16 in_proj_ba is not admitted."""
+    from vllm_torchtpu.models.vllm import qwen3_next_patch
+
+    attention, _ = make_gdn_attention(
+        tp_size,
+        0,
+        "fp8_block",
+        num_key_heads=16,
+        num_value_heads=64,
+        hidden_size=4096,
+    )
+    for proj in (attention.in_proj_qkvz, attention.in_proj_ba):
+        proj.quant_method.process_weights_after_loading(proj)
+    qkvz = attention.in_proj_qkvz
+    assert qkvz.weight.dtype == torch.float8_e4m3fn
+    assert qwen3_next_patch._takes_prequant_rows(qkvz)
+    assert attention.in_proj_ba.weight.dtype == torch.bfloat16
+    assert not qwen3_next_patch._takes_prequant_rows(attention.in_proj_ba)

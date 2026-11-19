@@ -104,6 +104,8 @@ from vllm.sequence import IntermediateTensors
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter import (
+    fused_moe_ep,
+    fused_moe_ep_v3,
     linear_common,
     sequence_parallel,
     small_all_reduce_op,
@@ -112,6 +114,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
 )
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
 from vllm_torchtpu.models.qwen3_5.kernels import measured
@@ -738,10 +741,10 @@ def maybe_setup_fused_gate_se(moe: Any) -> bool:
             moe._fused_gate_se_checked = True
             return False
 
-    qm_name = type(getattr(gate_up_proj, "quant_method", None)).__name__
-    if qm_name == "VllmFp8LinearMethodTPU" and not getattr(
-        gate_up_proj, WEIGHT_FLIPPED_ATTR, False
-    ):
+    # An FP8 weight not flipped to (k, n) yet: check again after the flip.
+    if isinstance(
+        getattr(gate_up_proj, "quant_method", None), VllmFp8LinearMethodTPU
+    ) and not getattr(gate_up_proj, WEIGHT_FLIPPED_ATTR, False):
         return False
 
     if not (
@@ -939,20 +942,13 @@ def patched_sparse_moe_forward(
     # `USE_MOE_FUSED_EP_KERNEL=0` and `se_is_replicated=False`,
     # `skip_final_all_reduce=True` leaves `final_hidden_states` unreduced across
     # EP/TP so it can be all-reduced together with `shared_output`.
-    from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-        fused_moe_ep_supported as fused_moe_ep_v2_supported,
-    )
-    from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
-        fused_moe_ep_supported as fused_moe_ep_v3_supported,
-    )
-
     routed_experts = getattr(self.experts, "routed_experts", self.experts)
     qm = getattr(routed_experts, "quant_method", None)
     fused_ep_owns_combine = envs.USE_MOE_FUSED_EP_KERNEL and (
-        fused_moe_ep_v3_supported(routed_experts)
-        or fused_moe_ep_v3_supported(qm)
-        or fused_moe_ep_v2_supported(routed_experts)
-        or fused_moe_ep_v2_supported(qm)
+        fused_moe_ep_v3.fused_moe_ep_supported(routed_experts)
+        or fused_moe_ep_v3.fused_moe_ep_supported(qm)
+        or fused_moe_ep.fused_moe_ep_supported(routed_experts)
+        or fused_moe_ep.fused_moe_ep_supported(qm)
     )
     se_is_replicated = bool(
         getattr(self, "_fused_se_is_replicated", False)
@@ -1031,9 +1027,8 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
                 and _is_fp8_per_channel_linear(o_proj)
                 and getattr(o_proj, "input_is_parallel", True)
             )
-        elif isinstance(module, qwen3_next.Qwen3NextDecoderLayer) or (
-            type(module).__name__ == "Qwen3_5DecoderLayer"
-        ):
+        # Qwen3_5DecoderLayer subclasses Qwen3NextDecoderLayer.
+        elif isinstance(module, qwen3_next.Qwen3NextDecoderLayer):
             if getattr(module, "layer_scale", False):
                 module._tpu_attn_layer_scale_2d = (
                     module.attn_layer_scale.data.to(torch.bfloat16)[0] + 1
@@ -1333,7 +1328,15 @@ def patched_decoder_layer_forward(
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        if input_is_sliced and sequence_parallel.fp8_gather() and not pcp_streaming_gdn:
+        # FP8 rows go only to a layer whose attention's main projection takes
+        # them (`_mark_pre_attn_norm_quant`); any other gathers bf16 rows, as
+        # on main.
+        if (
+            input_is_sliced
+            and sequence_parallel.fp8_gather()
+            and not pcp_streaming_gdn
+            and getattr(self, "_pre_norm_quant_eligible", False)
+        ):
             x_q, x_s = linear_common.quantize_rows(hidden_states)
             x_q = tensor_model_parallel_all_gather(x_q, 0)
             x_s = tensor_model_parallel_all_gather(x_s, 0)
