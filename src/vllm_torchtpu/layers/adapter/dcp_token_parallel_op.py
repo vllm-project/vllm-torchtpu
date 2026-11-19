@@ -551,6 +551,7 @@ def build_attention_op(
                 read_pages=read_pages,
                 w_uv=w_uv,
                 q_pe=q_pe,
+                flat_topk_cap_strided=True,
             )
 
         assert q_pe is not None
@@ -721,6 +722,7 @@ def build_attention_op(
                 q_pe=pe_tp,
                 w_uv_replicated=True,
                 num_tokens=num_tokens,
+                flat_topk_cap_strided=True,
             )
             return (
                 kv_cache_nope,
@@ -761,6 +763,7 @@ def build_attention_op(
             token_rows=False,
             w_uv_replicated=False,
             num_tokens=num_tokens,
+            flat_topk_cap_strided=True,
         )
 
         def _merge_and_join(part, lse_part, tail_local, *w_uv_arg):
@@ -1763,6 +1766,7 @@ def build_indexer_op(
                 select_topk=select,
                 rank_ids=rank_ids,
                 q_own_rows=q_own_rows,
+                flat_topk_cap_strided=True,
             )
             return cache_kv, flat
 
@@ -1848,6 +1852,7 @@ def build_indexer_op(
             select_topk=select,
             rank_ids=rank_ids,
             q_own_rows=q_own_rows,
+            flat_topk_cap_strided=True,
         )
         full = jax.shard_map(
             lambda h, t: jnp.concatenate([h, t], axis=0),

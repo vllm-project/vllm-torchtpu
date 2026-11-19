@@ -28,7 +28,11 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     KVLayout,
     streamindex_topk,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.metadata import (
+    cp_local_length,
+)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+    _effective_row_lengths,
     convert_cache_to_seq_along_lane,
 )
 
@@ -1789,4 +1793,55 @@ def test_should_match_causal_fast_path_indices_with_compare_all_searchsorted():
         expected[t, : max_pos + 1] = np.arange(max_pos + 1, dtype=np.int32)
     for t in range(4):
         expected[5 + t, : t + 1] = np.arange(t + 1, dtype=np.int32)
+    np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.parametrize(
+    "compression_ratio,cp_size,cp_rank,interleave_c",
+    [
+        pytest.param(1, 1, 0, 1, id="fast-cr1-cp1"),
+        pytest.param(2, 1, 0, 1, id="general-cr2-cp1"),
+        pytest.param(1, 4, 1, 4, id="general-cr1-cp4-il4"),
+    ],
+)
+def test_should_compute_exact_effective_row_lengths_for_mixed_and_padded_batches(
+    compression_ratio, cp_size, cp_rank, interleave_c
+):
+    # Anti-cancellation batch: 2 decode rows, a zero-length gap sequence, a
+    # mid-sequence chunked prefill, an over-cap sequence, plus inactive slots
+    # with non-zero garbage seq_lens/cu_q_lens past num_seqs.
+    num_tokens = 16
+    num_positions = 40
+    seq_lens = np.array([15, 7, 100, 30, 60, 999, 888, 777], dtype=np.int32)
+    cu_q_lens = np.array([0, 1, 2, 2, 6, 11, 0, 0, 0], dtype=np.int32)
+    distribution = np.array([2, 2, 5], dtype=np.int32)
+
+    got = np.asarray(
+        _effective_row_lengths(
+            jnp.asarray(seq_lens),
+            jnp.asarray(cu_q_lens),
+            jnp.asarray(distribution),
+            num_tokens,
+            num_positions,
+            compression_ratio,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            interleave_c=interleave_c,
+        )
+    )
+
+    expected = np.zeros((num_tokens,), dtype=np.int32)
+    for s in range(int(distribution[2])):
+        q0, q1 = int(cu_q_lens[s]), int(cu_q_lens[s + 1])
+        q_len = q1 - q0
+        sl = int(seq_lens[s])
+        for tok in range(q0, q1):
+            token_pos = sl - q_len + (tok - q0)
+            vis = min(sl // compression_ratio, token_pos // compression_ratio + 1)
+            vis = int(
+                np.asarray(
+                    cp_local_length(jnp.int32(vis), cp_rank, cp_size, interleave_c)
+                )
+            )
+            expected[tok] = min(vis, num_positions)
     np.testing.assert_array_equal(got, expected)

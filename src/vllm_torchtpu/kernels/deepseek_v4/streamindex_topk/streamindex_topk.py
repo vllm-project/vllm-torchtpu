@@ -1258,18 +1258,30 @@ def _effective_row_lengths(
     max_num_seqs = seq_lens.shape[0]
     num_seqs = distribution[2]
     token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq_mask = token_ids[:, None] >= cu_q_lens[None, 1 : max_num_seqs + 1]
-    seq_mask = jnp.where(jnp.arange(max_num_seqs)[None, :] < num_seqs, seq_mask, False)
-    seq_ids = jnp.sum(seq_mask, axis=1)
-
-    q_start = cu_q_lens[seq_ids]
-    q_len = cu_q_lens[seq_ids + 1] - q_start
-    seq_len = seq_lens[seq_ids]
-    token_pos = seq_len - q_len + (token_ids - q_start)
+    seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
+    q_starts = cu_q_lens[:max_num_seqs]
+    q_ends = cu_q_lens[1 : max_num_seqs + 1]
+    # Avoid dynamic 1D gathers on cu_q_lens/seq_lens inside lax.switch branches:
+    # XLA lowers those as sequential gather fusions, whereas a masked int32
+    # reduction over [num_tokens, max_num_seqs] stays on the VPU (~6x faster).
+    in_seq = (
+        (seq_idx[None, :] < num_seqs)
+        & (token_ids[:, None] >= q_starts[None, :])
+        & (token_ids[:, None] < q_ends[None, :])
+    )
+    if compression_ratio == 1 and cp_size == 1:
+        pos_off = (seq_lens - q_ends + jnp.int32(1))[None, :]
+        cand = jnp.minimum(seq_lens[None, :], token_ids[:, None] + pos_off)
+        visible = jnp.sum(jnp.where(in_seq, cand, jnp.int32(0)), axis=1)
+        return jnp.minimum(visible, jnp.int32(num_positions))
+    pos_off = seq_lens - q_ends
+    off = jnp.sum(jnp.where(in_seq, pos_off[None, :], jnp.int32(0)), axis=1)
+    seq_len = jnp.sum(jnp.where(in_seq, seq_lens[None, :], jnp.int32(0)), axis=1)
+    token_pos = token_ids + off
     kv_len = seq_len // compression_ratio
     visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
     visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
-    valid = token_ids < cu_q_lens[num_seqs]
+    valid = jnp.any(in_seq, axis=1)
     return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
 
 

@@ -1414,11 +1414,21 @@ def rank_major_merge_fits(b: int) -> bool:
     return b <= 32
 
 
+# Wide-batch (b >= 32) single-subcore P=1 top-k fits in SparseCore VMEM up to
+# 122880 scores (120K, single-buffered); 128K+ (131072) exceeds VMEM and must
+# stay cooperative (P >= 2).
+_MAX_P1_WIDE_BATCH_WORDS = 122880
+
+
 def _pick_partition(b: int, n: int, k: int) -> int:
     """Picks the power-of-two partition factor P (1..16) per row to maximize
 
     subcore utilization across subcores while fitting in VMEM and VMEM_SHARED.
     """
+    # Avoid cooperative P >= 2 barriers on full-chip batches (b >= 32) when the
+    # full row fits single-buffered in one subcore's VMEM (n <= 122880).
+    if b >= 32 and n <= _MAX_P1_WIDE_BATCH_WORDS:
+        return 1
     # A cooperative group must fit on one SparseCore's 16 subcores. A subcore
     # holds its part of a row in up to two MAX_SLICE_WORDS buffers, which one
     # part may fill alone (single-buffered): fewer subcores per row means more

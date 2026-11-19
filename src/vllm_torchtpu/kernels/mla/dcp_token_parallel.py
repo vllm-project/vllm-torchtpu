@@ -186,16 +186,17 @@ def gather_page_ids(
 
 
 def flat_rows(
-    layout: TokenParallelLayout, positions: jax.Array, row_offsets: jax.Array
+    layout: TokenParallelLayout,
+    positions: jax.Array,
+    row_offsets: jax.Array,
+    *,
+    stride_pages: int | None = None,
 ) -> jax.Array:
     """Global positions `[N, K]` (`-1` = none) of the requests whose buffer
     offsets are `row_offsets [N]` -> flat rows of the gathered latent buffer."""
+    stride = layout.max_pages if stride_pages is None else stride_pages
     owner, slot = owner_and_slot(layout, positions)
-    page = (
-        owner * layout.max_pages
-        + row_offsets[:, None]
-        + positions // layout.virtual_page_size
-    )
+    page = owner * stride + row_offsets[:, None] + positions // layout.virtual_page_size
     return jnp.where(positions >= 0, page * layout.page_size + slot, -1)
 
 
@@ -381,6 +382,44 @@ def restride_flat_rows(
     return jnp.where(flat >= 0, owner * (cap * layout.page_size) + rest, -1)
 
 
+def _gather_index_k_pages(
+    cache: jax.Array,
+    page_ids: jax.Array,
+    cap: int,
+    dcp: int,
+    il: int,
+    ps: int,
+    axis_name: str,
+) -> jax.Array:
+    local = cache[page_ids[:cap]]
+    rows = local.shape[1]
+    if il == 4 and ps % (dcp * il) == 0:
+        # Avoid gathering along inner axis=3 on u32[cap, rows, ps // il, il]:
+        # XLA emits two full-buffer post-AG layout copies plus an unpack fusion
+        # (~82 us/L at 20 pages); pre-packing q into dim 0 and gathering on
+        # axis=0 keeps collective tiles aligned.
+        blocks = ps // (dcp * il)
+        words = lax.bitcast_convert_type(
+            local.reshape(cap, rows, 4, dcp, blocks, il), jnp.uint32
+        )
+        packed = jnp.transpose(words, (0, 3, 1, 2, 4)).reshape(
+            cap * dcp, rows, 4, blocks
+        )
+        gathered = lax.all_gather(packed, axis_name, axis=0, tiled=False)
+        gathered = jnp.transpose(gathered, (1, 2, 3, 4, 0))
+        return lax.bitcast_convert_type(
+            gathered.reshape(cap * dcp, rows, 4, ps // il), jnp.uint8
+        ).reshape(cap * dcp, rows, 4, ps)
+    words = lax.bitcast_convert_type(local.swapaxes(2, 3), jnp.uint32)
+    g = lax.all_gather(words.reshape(cap, rows, ps // il, il), axis_name, axis=3)
+    g = g.reshape(cap, rows, dcp, ps).swapaxes(1, 2)
+    return (
+        lax.bitcast_convert_type(g, jnp.uint8)
+        .swapaxes(3, 4)
+        .reshape(cap * dcp, rows, 4, ps)
+    )
+
+
 def gather_index_k(
     layout: TokenParallelLayout,
     cache: jax.Array,
@@ -406,12 +445,9 @@ def gather_index_k(
         )
 
     def gather(cap: int) -> jax.Array:
-        local = cache[page_ids[:cap]]
-        rows = local.shape[1]
-        words = lax.bitcast_convert_type(local.swapaxes(2, 3), jnp.uint32)
-        g = lax.all_gather(words.reshape(cap, rows, ps // il, il), axis_name, axis=3)
-        g = g.reshape(cap, rows, dcp, ps).swapaxes(1, 2)  # [cap, q, rows, ps]
-        return lax.bitcast_convert_type(g, jnp.uint8).swapaxes(3, 4)
+        return _gather_index_k_pages(
+            cache, page_ids, cap, dcp, il, ps, axis_name
+        ).reshape(cap, dcp, *cache.shape[1:])
 
     g = _sized_gather(layout, total_pages, gather, page_axis=0)
     return g.reshape(layout.max_pages * dcp, *g.shape[2:])
@@ -751,6 +787,7 @@ def _sparse_mla_attention_core(
     num_tokens: int | None = None,
     lead_partial: jax.Array | None = None,
     lead_lse: jax.Array | None = None,
+    flat_topk_cap_strided: bool = False,
 ) -> tuple[jax.Array, ...]:
     if (lead_partial is None) != (lead_lse is None):
         raise ValueError("lead_partial and lead_lse must be passed together")
@@ -830,7 +867,11 @@ def _sparse_mla_attention_core(
                 g_nope, g_rope = gather_latent(
                     nope, rope, page_ids[:cap], axis_name, read_pages
                 )
-                flat = restride_flat_rows(layout, topk, cap)
+                flat = (
+                    topk
+                    if flat_topk_cap_strided
+                    else restride_flat_rows(layout, topk, cap)
+                )
                 lead_v = None
                 if has_lead:
                     assert (
@@ -936,6 +977,7 @@ def sparse_mla_attention(
     token_rows: bool = False,
     w_uv_replicated: bool = False,
     num_tokens: int | None = None,
+    flat_topk_cap_strided: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Token-parallel sparse MLA for one layer (global view).
 
@@ -985,6 +1027,7 @@ def sparse_mla_attention(
         token_rows=token_rows,
         w_uv_replicated=w_uv_replicated,
         num_tokens=num_tokens,
+        flat_topk_cap_strided=flat_topk_cap_strided,
     )
     return nope, rope, out
 
@@ -1015,6 +1058,7 @@ def sparse_mla_attention_with_lead(
     q_pe: jax.Array | None = None,
     w_uv_replicated: bool = False,
     num_tokens: int | None = None,
+    flat_topk_cap_strided: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Run token-parallel sparse MLA with overlapped lead merge + W_UV inside branch."""
     nope, rope, own_v, lead_v = _sparse_mla_attention_core(
@@ -1043,6 +1087,7 @@ def sparse_mla_attention_with_lead(
         num_tokens=num_tokens,
         lead_partial=lead_partial,
         lead_lse=lead_lse,
+        flat_topk_cap_strided=flat_topk_cap_strided,
     )
     return nope, rope, own_v, lead_v
 
@@ -1062,6 +1107,7 @@ def indexer_topk(
     select_topk: SelectTopkFn,
     rank_ids: jax.Array | None = None,
     q_own_rows: bool = False,
+    flat_topk_cap_strided: bool = False,
 ) -> jax.Array:
     """Token-parallel indexer top-k for one layer (global view).
 
@@ -1090,32 +1136,34 @@ def indexer_topk(
         )
         vpages_per_seq = bt.shape[0] // seq_lens.shape[0]
         il, ps = layout.interleave_size, layout.page_size
+        row_offsets = offsets[row_requests(rr, rows)]
+        real = jnp.arange(rows, dtype=jnp.int32) < rr.num_rows
 
         def branch(cap: int) -> Callable[[], jax.Array]:
             def run() -> jax.Array:
-                local = cache[page_ids[:cap]]
-                r_dim = local.shape[1]
-                words = lax.bitcast_convert_type(local.swapaxes(2, 3), jnp.uint32)
-                g = lax.all_gather(
-                    words.reshape(cap, r_dim, ps // il, il), axis_name, axis=3
-                )
-                g = g.reshape(cap, r_dim, dcp, ps).swapaxes(1, 2)
-                nat = (
-                    lax.bitcast_convert_type(g, jnp.uint8)
-                    .swapaxes(3, 4)
-                    .reshape(cap * dcp, *cache.shape[1:])
+                nat = _gather_index_k_pages(
+                    cache, page_ids, cap, dcp, il, ps, axis_name
                 )
                 # Avoid hoisting natural_page_table above branch(cap): full
                 # vpages_per_seq width inflates score buffers to max_pages * dcp
                 # and forces multi-partition top-k barriers on <=64K-token caps.
                 table = natural_page_table(layout, rr, offsets, vpages_per_seq, cap=cap)
-                return select_topk(q_r, w_r, nat, rr, table)
+                positions = select_topk(q_r, w_r, nat, rr, table)
+                if flat_topk_cap_strided:
+                    # Avoid striding at max_pages and restriding in every MLA
+                    # layer: all layers of the step select the same cap from
+                    # step_pages, so striding at cap once removes redundant
+                    # per-layer int32 div/mod.
+                    flat = flat_rows(layout, positions, row_offsets, stride_pages=cap)
+                    return jnp.where(real[:, None], flat, -1)
+                return positions
 
             return run
 
-        positions = _switch_on_cap(layout, jnp.sum(pages), branch)
-        flat = flat_rows(layout, positions, offsets[row_requests(rr, rows)])
-        real = jnp.arange(rows, dtype=jnp.int32) < rr.num_rows
+        out = _switch_on_cap(layout, jnp.sum(pages), branch)
+        if flat_topk_cap_strided:
+            return out
+        flat = flat_rows(layout, out, row_offsets)
         return jnp.where(real[:, None], flat, -1)
 
     extra = () if rank_ids is None else (rank_ids,)
