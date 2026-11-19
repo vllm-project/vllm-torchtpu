@@ -28,6 +28,7 @@ from .layer import fused_ep_moe
 from .layout import LANES, MESH_AXIS, ROW_BLOCK
 from .routing_tables import ALIGNMENT_SLOT_FIELD, routing_block
 
+ACTIVATIONS = ffn.ACTIVATIONS
 SUPPORTED_GENERATIONS = device.SUPPORTED_GENERATIONS
 chip_generation = device.chip_generation
 supported_on = device.supported_on
@@ -38,6 +39,7 @@ __all__ = [
     "layer",
     "layout",
     "vmem",
+    "ACTIVATIONS",
     "ALIGNMENT_SLOT_FIELD",
     "Config",
     "LANES",
@@ -54,4 +56,3 @@ __all__ = [
     "weight_form",
     "weight_format_of_dtype",
 ]
-ACTIVATIONS = ffn.ACTIVATIONS
