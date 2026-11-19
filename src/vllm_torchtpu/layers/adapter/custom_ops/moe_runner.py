@@ -164,12 +164,10 @@ class VllmMoERunner(MoERunner):
         # _patch_moe_explicit_pcp_collectives.
         if self.moe_config.pcp_size <= 1:
             return False
+        # Fused EP v3 never arms with pcp_size > 1 (its prebuild returns
+        # first), so only v2 and the adaptive kernel can own the PCP pair.
         owner = self._quant_method
-        return (
-            fused_moe_ep_supported(owner)
-            or fused_moe_ep_v3_supported(owner)
-            or adaptive_fused_moe_supported(owner)
-        )
+        return fused_moe_ep_supported(owner) or adaptive_fused_moe_supported(owner)
 
     def _maybe_dispatch(self, hidden_states, router_logits):
         if self._fused_ep_owns_pcp_collectives():
