@@ -37,6 +37,13 @@ _op = pallas.jax_op("pallas::fp8_lm_head", kernel.fp8_lm_head)
 _op.register_fake(_fake)
 
 
+def apply_head(
+    rows: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """``[rows, vocab]`` logits of bf16 ``rows`` against a `quantize`d head."""
+    return _op(rows, weight, scale)
+
+
 def quantize(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``[vocab, hidden]`` -> (e4m3 ``[vocab, hidden]``, f32 ``[1, vocab]``
     per-row scale): each row's amax maps to e4m3's largest finite value."""
@@ -75,7 +82,7 @@ class Fp8LMHeadMethod(UnquantizedEmbeddingMethod):
         if bias is not None:
             raise NotImplementedError("The e4m3 LM head takes no bias.")
         rows = x.reshape(-1, x.shape[-1])
-        logits = _op(rows, layer.weight, layer.weight_scale)
+        logits = apply_head(rows, layer.weight, layer.weight_scale)
         return logits.view(*x.shape[:-1], logits.shape[-1])
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:

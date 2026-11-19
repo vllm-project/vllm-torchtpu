@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MINIMAX_M3_FP8_LINEARS: bool = True
     TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = True
+    TPU_MINIMAX_M3_FP8_DRAFT_LM_HEAD: bool = True
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     TPU_MOE_DENSE_FP4_SHARED: bool = False
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -727,6 +728,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 keeps them bf16 (the drafter streams them every decode step).
     "TPU_MINIMAX_M3_FP8_DRAFT_LINEARS": env_bool(
         "TPU_MINIMAX_M3_FP8_DRAFT_LINEARS", default=True
+    ),
+    # The DSpark draft's logits (on the vocab-parallel Markov path) contract
+    # an e4m3 copy of the shared LM head with per-vocabulary-row scales
+    # (kernels/fp8_lm_head.py) while the target keeps the bf16 head: the
+    # drafts change by the copy's rounding, the target's logits do not.
+    # Ignored when TPU_FP8_LM_HEAD already quantizes the shared head.
+    "TPU_MINIMAX_M3_FP8_DRAFT_LM_HEAD": env_bool(
+        "TPU_MINIMAX_M3_FP8_DRAFT_LM_HEAD", default=True
     ),
     # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
     # permutation-free dense-expert kernel (kernels/experimental/

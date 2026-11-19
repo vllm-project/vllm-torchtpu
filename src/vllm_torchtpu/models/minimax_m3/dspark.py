@@ -57,10 +57,12 @@ from vllm.model_executor.models.qwen3_dspark import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.cp_draft_attention import (
     write_layers_op,
     write_layers_with_dcp,
 )
+from vllm_torchtpu.layers.adapter.quantization import fp8_lm_head
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP
@@ -70,6 +72,7 @@ from vllm_torchtpu.spec_decode.vocab_parallel_argmax import (
     reduce_shard_argmax_pairs,
     shard_argmax_pair,
 )
+from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm.config import SpeculativeConfig
@@ -429,6 +432,10 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
         self.register_buffer("markov_w2_shard", None, persistent=False)
         self.register_buffer("vocab_shard_start", None, persistent=False)
         self.register_buffer("vocab_shard_pad_mask", None, persistent=False)
+        # e4m3 copy of this rank's LM head shard and its per-row scales
+        # (TPU_MINIMAX_M3_FP8_DRAFT_LM_HEAD), set with the vocab shard.
+        self.register_buffer("draft_head_weight", None, persistent=False)
+        self.register_buffer("draft_head_scale", None, persistent=False)
         # `pallas_markov_argmax.MarkovChainOp`: the whole greedy chain in one
         # kernel, set with the vocab shard when it builds.
         self.markov_chain_kernel = None
@@ -515,11 +522,39 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
             self.markov_chain_kernel = pallas_markov_argmax.build(
                 markov_w1, self.markov_w2_shard, start, end - start, self._max_num_seqs
             )
+        # The e4m3 kernel contracts bf16 rows against the bf16 head it copies:
+        # not with a head_dtype cast or a head TPU_FP8_LM_HEAD already scales.
+        if (
+            envs.TPU_MINIMAX_M3_FP8_DRAFT_LM_HEAD
+            and self._markov_cast_dtype is None
+            and self.lm_head.weight.dtype == torch.bfloat16
+            and not hasattr(self.lm_head, "weight_scale")
+        ):
+            self._set_fp8_draft_head()
         return True
+
+    def _set_fp8_draft_head(self) -> None:
+        """Quantize this rank's shard of the shared LM head for the draft's
+        logits. The target keeps reading the bf16 weight."""
+        weight, scale = fp8_lm_head.quantize(self.lm_head.weight.data)
+        if weight.device.type == "tpu":
+            synchronize_tensors([weight, scale])
+        self.draft_head_weight, self.draft_head_scale = weight, scale
+        logger.info(
+            "MiniMax DSpark: draft logits on an e4m3 copy of the LM head shard %s.",
+            tuple(weight.shape),
+        )
 
     def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's vocab shard of ``compute_draft_logits`` (pad columns
         included), without the all-gather."""
+        if self.draft_head_weight is not None:
+            # The vocab-parallel path rules out a logit scale and soft cap,
+            # and the copy a head_dtype cast (enable_vocab_parallel_markov_argmax).
+            rows = hidden_states.reshape(-1, hidden_states.shape[-1])
+            return fp8_lm_head.apply_head(
+                rows, self.draft_head_weight, self.draft_head_scale
+            )
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
     def markov_shard_pair(
