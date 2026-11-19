@@ -237,7 +237,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 ScratchReq("qu_tab", pltpu.VMEM((1, self.pps), I32)),
                 ScratchReq("qu_pv", pltpu.VMEM((1, KU), I32)),
             ]
-        if self.shard_index:
+        if self.shard_index and not self.xmerge:
             npr, n = self._shard_rows(ex)[0], max(ex.R - 1, 1)
             out += [
                 ScratchReq("qgu_send", pltpu.VMEM((npr, 1, 2 * D * KU + 128), I32)),
@@ -515,9 +515,25 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ref[...] = self._cdcp_gid(ctx, ref[...])
         scr["qu_n"][q, r] = n
 
+    def _xmerge_width(self, ex: ExecSpec) -> tuple[int, int]:
+        """`xmerge`: (union payload offset, row width) of a request's merged exchange row:
+        its `T` selection rows at lanes `[t * W, (t + 1) * W)` (`_shard_rows` width), then
+        its union ids, codes (`D * KU` lanes each) and counts (128 lanes)."""
+        WU = max(self.dcp, 1) * self._union_width(ex)
+        u0 = ex.T * self._shard_rows(ex)[2]
+        return u0, u0 + 2 * WU + 128
+
     def _shard_scratch(self, ex: ExecSpec) -> list[ScratchReq]:
         _, rows, W = self._shard_rows(ex)
         n = max(ex.R - 1, 1)
+        if self.xmerge:
+            npr, Wm = self._shard_rows(ex)[0], self._xmerge_width(ex)[1]
+            return [
+                ScratchReq("qm_send", pltpu.VMEM((npr, 1, Wm), I32)),
+                ScratchReq("qm_recv", pltpu.VMEM((self._runs(ex), npr, 1, Wm), I32)),
+                ScratchReq("qm_ssem", pltpu.SemaphoreType.DMA((n,))),
+                ScratchReq("qm_rsem", pltpu.SemaphoreType.DMA((n,))),
+            ]
         return [
             ScratchReq("qg_send", pltpu.VMEM((rows, 1, W), I32)),
             ScratchReq("qg_recv", pltpu.VMEM((self._runs(ex), rows, 1, W), I32)),
@@ -1092,6 +1108,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         rows (lanes `[0, K)` ids, `K` length, `K + 1` flag) to every peer's slot `me`;
         int32
         throughout, so the gathered selection is the owner's exactly."""
+        if self.xmerge:
+            self._exchange_merged(ctx)
+            return
         ex, scr, K, T, MB = ctx.ex, ctx.scr, self.budget, ctx.ex.T, ctx.ex.MB
         npr, rows, W = self._shard_rows(ex)
         me = ctx.me
@@ -1132,6 +1151,72 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             self._wait_ids_copies(ctx, MB)
         if self.union_attn:
             self._exchange_unions(ctx)
+
+    def _exchange_merged(self, ctx: Any) -> None:
+        """`xmerge`: `_exchange_selection` and `_exchange_unions` as one all-gather. Request
+        `i` of this rank's run sends one row (`_xmerge_width`): its `T` selection rows (the
+        same lanes as `qg_send`) and its union (the same lanes as `qgu_send`, offset `u0`);
+        unpacked into the same scratch as the two exchanges. int32 copies only."""
+        ex, scr, K, T, MB = ctx.ex, ctx.scr, self.budget, ctx.ex.T, ctx.ex.MB
+        nreq = MB // T
+        npr, rows, WS = self._shard_rows(ex)
+        u0, _ = self._xmerge_width(ex)
+        D = max(self.dcp, 1)
+        W = D * self._union_width(ex)
+        lane = jax.lax.broadcasted_iota(I32, (1, WS), 1)
+        ulane = jax.lax.broadcasted_iota(I32, (1, 2 * W + 128), 1)
+        run = self._run(ctx)
+        send, recv = scr["qm_send"], scr["qm_recv"]
+        scr["qi_z"][...] = jnp.zeros((1, 128), I32)  # set by select_rows only on owners
+
+        def pack(i: Any, carry: Any) -> Any:
+            for t in range(T):
+                r = jnp.minimum(run * rows + i * T + t, MB - 1)  # past the last request: never read
+                at = t * WS
+                send[i, :, pl.ds(at, K)] = scr["qi_id"][r]
+                head = jnp.where(lane == K, scr["qi_kvl"][r], 0)
+                send[i, :, pl.ds(at, WS)] = jnp.where(
+                    lane < K,
+                    send[i, :, pl.ds(at, WS)],
+                    jnp.where(lane == K + 1, scr["qc_sga"][r], head),
+                )
+            q = jnp.minimum(run * npr + i, nreq - 1)  # past the last request: never read
+            send[i, :, pl.ds(u0, W)] = scr["qu_id"][q]
+            send[i, :, pl.ds(u0 + W, W)] = scr["qu_cd"][q]
+            nl = jnp.zeros((1, 128), I32)
+            for r in range(D):
+                nl = jnp.where(ulane[:, :128] == r, scr["qu_n"][q, r], nl)
+            send[i, :, pl.ds(u0 + 2 * W, 128)] = nl
+            return carry
+
+        jax.lax.fori_loop(0, npr, pack, 0)
+        self._gather_runs(ctx, send, recv, scr["qm_ssem"], scr["qm_rsem"])
+
+        def unpack(q: Any, carry: Any) -> Any:
+            o = q // npr
+            j = q - o * npr
+            for t in range(T):
+                r = q * T + t
+                row = recv[o, j, :, pl.ds(t * WS, WS)]
+                scr["qi_id"][r] = row[:, :K]
+                scr["qi_kvl"][r] = jnp.sum(jnp.where(lane == K, row, 0))
+                scr["qc_sga"][r] = jnp.sum(jnp.where(lane == K + 1, row, 0))
+                cs = self._ids_copies(ctx, r)
+                for c in cs:
+                    c.start()
+                if not self.async_dma:
+                    for c in cs:
+                        c.wait()
+            urow = recv[o, j, :, pl.ds(u0, 2 * W + 128)]
+            scr["qu_id"][q] = urow[:, :W]
+            scr["qu_cd"][q] = urow[:, W : 2 * W]
+            for r in range(D):
+                scr["qu_n"][q, r] = jnp.sum(jnp.where(ulane == 2 * W + r, urow, 0))
+            return carry
+
+        jax.lax.fori_loop(0, nreq, unpack, 0)
+        if self.async_dma:
+            self._wait_ids_copies(ctx, MB)
 
     @_scoped("qsa_ux")
     def _exchange_unions(self, ctx: Any) -> None:

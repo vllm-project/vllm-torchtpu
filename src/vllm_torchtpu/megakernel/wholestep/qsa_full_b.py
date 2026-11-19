@@ -93,6 +93,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         xreq_prefetch: int = 0,
         select_nvis: int = 0,
         nvis_rows: tuple = (32, 64),
+        xmerge: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -188,6 +189,11 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.xreq_prefetch = bool(int(xreq_prefetch) & 1) and bool(union_attn)
         self.xreq_loads = bool(int(xreq_prefetch) & 2) and bool(loop_requests)
         assert not skip_idle or loop_requests, "skip_idle bounds the request loops"
+        # `xmerge` (VLLM_TPU_MK_QSA_XMERGE; `shard_index` + `union_attn`, not
+        # `compressed_dcp`): the selection rows and the union of each request go out in one
+        # all-gather per QSA layer (`_exchange_merged`) instead of two. Both payloads are
+        # ready at the same point and copied as int32, so every rank receives the same bytes.
+        self.xmerge = bool(xmerge) and bool(shard_index) and bool(union_attn) and not compressed_dcp
         assert not shard_index or per_request_scores, (
             "the sharded indexer selects per request"
         )
