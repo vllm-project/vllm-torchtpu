@@ -77,6 +77,9 @@ def _attention_layer_mock():
     """
     layer = MagicMock(spec=Attention)
     layer.get_attn_backend.return_value = PallasAttentionBackend
+    # `impl` is set in Attention.__init__, so the spec omits it. An ordinary
+    # layer: KV not sharded over DCP by a drafter hook.
+    layer.impl = SimpleNamespace(sharded_draft_dcp=None)
     return layer
 
 
@@ -2730,7 +2733,10 @@ def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
             is_hybrid=False,
         ),
         parallel_config=SimpleNamespace(pipeline_parallel_size=1),
-        vllm_config=SimpleNamespace(cache_config=cache_config),
+        vllm_config=SimpleNamespace(
+            cache_config=cache_config,
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        ),
         shared_kv_cache_layers={},
         runner_only_attn_layers=set(),
         _hybrid_uniform_page_size_bytes=None,
