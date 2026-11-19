@@ -523,13 +523,31 @@ def inner_kernel(
     m_start_local = m_start - m_offset
     m_end_local = m_end - m_offset
 
-    def _matmul(is_first_k_step: bool, is_last_k_step: bool, bucket_m: int):
+    def _dequant_rhs_before():
+        tiled_rhs = tiled_rhs_ref.get_weight()
+        rhs_qbs = cfgs.rhs_cfgs.quant_block_size
+        tiled_rhs_scale = tiled_rhs_ref.get_scale(replicate_size=rhs_qbs).astype(
+            cfgs.lhs_cfgs.dtype
+        )
+        num_blocks = cfgs.num_quant_blocks_per_tile_k
+        tiled_rhs_dequant = tiled_rhs.astype(cfgs.lhs_cfgs.dtype).reshape(
+            num_blocks, rhs_qbs, tiled_rhs.shape[1]
+        )
+        tiled_rhs_dequant = tiled_rhs_dequant * tiled_rhs_scale
+        return tiled_rhs_dequant.reshape(cfgs.tiles.tile_k, tiled_rhs.shape[1])
+
+    def _matmul(
+        is_first_k_step: bool,
+        is_last_k_step: bool,
+        bucket_m: int,
+        rhs_pre: jax.Array | None = None,
+    ):
         tpu_info = pltpu.get_tpu_info()
         mxu_size = tpu_info.mxu_column_size
 
         # Step 1: Input pre-processing.
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
-        tiled_rhs = tiled_rhs_ref.get_weight()
+        tiled_rhs = tiled_rhs_ref.get_weight() if rhs_pre is None else rhs_pre
 
         # This should only be taken in the case where we don't requantize
         # the scales and thus we need to dequantize inside VMEM to avoid small
@@ -538,7 +556,10 @@ def inner_kernel(
         rhs_qbs = cfgs.rhs_cfgs.quant_block_size
         dequant_after = cfgs.rhs_cfgs.should_dequantize_after_matmul
         fp8_rhs = cfgs.fp8_rhs_dtype(bucket_m)
-        if fp8_rhs is not None:
+        if rhs_pre is not None:
+            # Already dequantized once for every bucket (k1 body "hoist").
+            rhs_qbs = cfgs.tiles.tile_k
+        elif fp8_rhs is not None:
             # Skinny m: the MXU weight push binds, and fp8 halves it.
             tiled_rhs = tiled_rhs.astype(fp8_rhs)
             dequant_after = True
@@ -706,6 +727,34 @@ def inner_kernel(
             acc_ref[:acc_m] = acc
 
     bucket_sizes = cfgs.tiles.bucket_sizes
+    k1_mode = _k1_body_mode(cfgs)
+
+    if k1_mode is not None:
+        # One k tile: every step is the first and the last, so each bucket
+        # needs only its first_last body (the k-step conds would compile up to
+        # four copies of the dequant + matmul per bucket).
+        rhs_pre = _dequant_rhs_before() if k1_mode == "hoist" else None
+        k1_branches = [
+            functools.partial(
+                _matmul,
+                is_first_k_step=True,
+                is_last_k_step=True,
+                bucket_m=b,
+                rhs_pre=rhs_pre,
+            )
+            for b in bucket_sizes
+        ]
+        if cfgs.tiles.buckets:
+            k1_idx = sum(
+                (m_end_local > b).astype(jnp.int32) for b in bucket_sizes[:-1]
+            )
+        else:
+            k1_idx = (m_end_local - 1) // cfgs.tiles.bucket_base
+        if len(k1_branches) == 1:
+            k1_branches[0]()
+        else:
+            lax.switch(k1_idx, k1_branches)
+        return
 
     def run_matmul_step(bucket_idx: int):
         bucket_m = bucket_sizes[bucket_idx]
@@ -753,6 +802,50 @@ def inner_kernel(
     else:
         bucket_idx = (m_end_local - 1) // cfgs.tiles.bucket_base
     lax.switch(bucket_idx, branches)
+
+
+# Opt-in (default off, read once per process): TPU_GMM_V2_K1_BODY=single
+# compiles only the first_last matmul body per bucket when the call has a
+# single k tile (bitwise: the same body the k-step conds pick at runtime);
+# "hoist" also dequantizes the rhs tile once ahead of the bucket switch.
+_K1_BODY_ENV = "TPU_GMM_V2_K1_BODY"
+
+
+@functools.cache
+def _k1_body_env() -> str | None:
+    raw = os.environ.get(_K1_BODY_ENV, "").strip().lower()
+    if raw in ("", "0", "off"):
+        return None
+    if raw not in ("single", "hoist"):
+        raise ValueError(f"{_K1_BODY_ENV}={raw!r}: expected single|hoist")
+    return raw
+
+
+_k1_body_logged: set[str] = set()
+
+
+def _k1_body_mode(cfgs: "GmmConfigs") -> str | None:
+    mode = _k1_body_env()
+    if mode is None or pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k) != 1:
+        return None
+    if mode == "hoist" and not (
+        cfgs.rhs_cfgs.should_dequantize_before_matmul
+        and not cfgs.lhs_cfgs.should_quantize
+        and all(cfgs.fp8_rhs_dtype(b) is None for b in cfgs.tiles.bucket_sizes)
+    ):
+        mode = "single"
+    if mode not in _k1_body_logged:
+        _k1_body_logged.add(mode)
+        args = ("gmm_v2 %s=%s on: one first_last body per bucket", _K1_BODY_ENV, mode)
+        try:
+            from vllm_torchtpu.logger import init_logger
+
+            init_logger(__name__).info(*args)
+        except ImportError:  # kernel-only use without vllm
+            import logging
+
+            logging.getLogger(__name__).info(*args)
+    return mode
 
 
 def fill_metadata(
