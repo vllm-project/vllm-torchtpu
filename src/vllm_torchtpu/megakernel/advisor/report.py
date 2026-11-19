@@ -977,33 +977,33 @@ def _resolve_facts_card_data(sweep: AdvisorSweepReport) -> _FactsCardData:
         else {}
     )
     cov_metric = first_entry.metrics.get("step_coverage", {}) if first_entry else {}
+    per_op_step_metric = (
+        first_entry.metrics.get("per_op_step_us", {}) if first_entry else {}
+    )
+    host_head_metric = (
+        first_entry.metrics.get("host_head_us", {}) if first_entry else {}
+    )
+    calibrated_head_metric = (
+        first_entry.metrics.get("calibrated_host_head_us", {}) if first_entry else {}
+    )
 
     handoff = sweep.disagg_handoff
     dcn_tag = handoff.dcn_provenance if handoff is not None else "ASSUMED"
     lg_tag = str(lg_metric.get("tag", "ASSUMED"))
     coll_tag = str(coll_metric.get("tag", "ASSUMED"))
-    coll_xla_tag = str(coll_xla_metric.get("tag", "ASSUMED"))
-    coll_in_kernel_tag = str(coll_in_kernel_metric.get("tag", "ASSUMED"))
     cov_tag = str(cov_metric.get("tag", "ASSUMED"))
-    is_calibrated = "MEASURED" in (
-        lg_tag,
-        coll_tag,
-        coll_xla_tag,
-        coll_in_kernel_tag,
-        cov_tag,
-        dcn_tag,
+    candidate_metrics = (
+        lg_metric,
+        coll_metric,
+        coll_xla_metric,
+        coll_in_kernel_metric,
+        cov_metric,
+        per_op_step_metric,
+        host_head_metric,
+        calibrated_head_metric,
     )
-    measured = [
-        m
-        for m in (
-            lg_metric,
-            coll_metric,
-            coll_xla_metric,
-            coll_in_kernel_metric,
-            cov_metric,
-        )
-        if m.get("tag") == "MEASURED"
-    ]
+    measured = [m for m in candidate_metrics if m.get("tag") == "MEASURED"]
+    is_calibrated = bool(measured) or dcn_tag == "MEASURED"
     meas_source = (
         str(measured[0].get("source", ""))
         if measured
@@ -1047,6 +1047,61 @@ def _resolve_facts_card_data(sweep: AdvisorSweepReport) -> _FactsCardData:
     )
 
 
+def _render_decision_verdict_cell(entry: RegimeEntry) -> str:
+    """Render the Verdict & Action cell HTML for one Decision Table row."""
+    verdict_str = entry.verdict
+    if verdict_str.startswith("tie(measure:"):
+        knob = verdict_str[len("tie(measure:") : -1].strip()
+        verdict_cell = (
+            '<span class="verdict-tag verdict-tie">TIE</span>'
+            f'<div class="kpi-sub">measure: <code>{_esc(knob)}</code></div>'
+        )
+    elif verdict_str.startswith("tie(objective_split:"):
+        split_info = verdict_str[len("tie(objective_split:") : -1].strip()
+        if entry.recommended_scope in MEGAKERNEL_LABELS:
+            label = MEGAKERNEL_LABELS[entry.recommended_scope]
+            tag_cls = "verdict-fusion"
+        elif entry.recommended_scope == "single_layer":
+            label = "PER-LAYER FUSED KERNEL"
+            tag_cls = "verdict-layer"
+        else:
+            label = "SEPARATE OPS"
+            tag_cls = "verdict-separate"
+        verdict_cell = (
+            f'<span class="verdict-tag {tag_cls}">{label}</span>'
+            '<div class="kpi-sub">layout split: '
+            f"<code>{_esc(split_info)}</code></div>"
+        )
+    elif entry.recommended_scope in MEGAKERNEL_LABELS:
+        label = MEGAKERNEL_LABELS[entry.recommended_scope]
+        verdict_cell = f'<span class="verdict-tag verdict-fusion">{label}</span>'
+    elif entry.recommended_scope == "single_layer":
+        verdict_cell = (
+            '<span class="verdict-tag verdict-layer">PER-LAYER FUSED KERNEL</span>'
+        )
+    else:
+        verdict_cell = '<span class="verdict-tag verdict-separate">SEPARATE OPS</span>'
+    if entry.hypothetical_best is not None:
+        hypothetical_best = entry.hypothetical_best
+        hb_sc = str(hypothetical_best.get("scope", entry.fastest_scope))
+        hb_lbl = MEGAKERNEL_LABELS.get(
+            hb_sc,
+            "PER-LAYER FUSED KERNEL" if hb_sc == "single_layer" else "SEPARATE OPS",
+        )
+        raw_hb_blks = hypothetical_best.get("blockers")
+        hb_blks = (
+            ", ".join(str(b) for b in raw_hb_blks) if type(raw_hb_blks) is list else ""
+        )
+        verdict_cell += (
+            '<div class="kpi-sub">'
+            '<span class="badge badge-hypothetical">hypothetical:</span> '
+            f"<strong>{hb_lbl}</strong> "
+            f"(<code>{_esc(hb_sc)}</code>; blocked by: "
+            f"<code>{_esc(hb_blks)}</code>)</div>"
+        )
+    return verdict_cell
+
+
 def _render_decision_table_rows(sweep: AdvisorSweepReport) -> list[str]:
     """Render HTML table rows for Table 5 (Decision Table)."""
     rows_html = []
@@ -1062,61 +1117,7 @@ def _render_decision_table_rows(sweep: AdvisorSweepReport) -> list[str]:
         fg_val = float(entry.metrics.get("fusion_gain_max", {}).get("value", 0.0))
         gain_str = f"+{fg_val * 100:.1f}%" if fg_val > 0 else "+0.0%"
         gain_cls = "text-gain" if fg_val > 0 else "text-muted"
-
-        verdict_str = entry.verdict
-        if verdict_str.startswith("tie(measure:"):
-            knob = verdict_str[len("tie(measure:") : -1].strip()
-            verdict_cell = (
-                '<span class="verdict-tag verdict-tie">TIE</span>'
-                f'<div class="kpi-sub">measure: <code>{_esc(knob)}</code></div>'
-            )
-        elif verdict_str.startswith("tie(objective_split:"):
-            split_info = verdict_str[len("tie(objective_split:") : -1].strip()
-            if entry.recommended_scope in MEGAKERNEL_LABELS:
-                label = MEGAKERNEL_LABELS[entry.recommended_scope]
-                tag_cls = "verdict-fusion"
-            elif entry.recommended_scope == "single_layer":
-                label = "PER-LAYER FUSED KERNEL"
-                tag_cls = "verdict-layer"
-            else:
-                label = "SEPARATE OPS"
-                tag_cls = "verdict-separate"
-            verdict_cell = (
-                f'<span class="verdict-tag {tag_cls}">{label}</span>'
-                '<div class="kpi-sub">layout split: '
-                f"<code>{_esc(split_info)}</code></div>"
-            )
-        elif entry.recommended_scope in MEGAKERNEL_LABELS:
-            label = MEGAKERNEL_LABELS[entry.recommended_scope]
-            verdict_cell = f'<span class="verdict-tag verdict-fusion">{label}</span>'
-        elif entry.recommended_scope == "single_layer":
-            verdict_cell = (
-                '<span class="verdict-tag verdict-layer">PER-LAYER FUSED KERNEL</span>'
-            )
-        else:
-            verdict_cell = (
-                '<span class="verdict-tag verdict-separate">SEPARATE OPS</span>'
-            )
-        if entry.hypothetical_best is not None:
-            hypothetical_best = entry.hypothetical_best
-            hb_sc = str(hypothetical_best.get("scope", entry.fastest_scope))
-            hb_lbl = MEGAKERNEL_LABELS.get(
-                hb_sc,
-                "PER-LAYER FUSED KERNEL" if hb_sc == "single_layer" else "SEPARATE OPS",
-            )
-            raw_hb_blks = hypothetical_best.get("blockers")
-            hb_blks = (
-                ", ".join(str(b) for b in raw_hb_blks)
-                if type(raw_hb_blks) is list
-                else ""
-            )
-            verdict_cell += (
-                '<div class="kpi-sub">'
-                '<span class="badge badge-hypothetical">hypothetical:</span> '
-                f"<strong>{hb_lbl}</strong> "
-                f"(<code>{_esc(hb_sc)}</code>; blocked by: "
-                f"<code>{_esc(hb_blks)}</code>)</div>"
-            )
+        verdict_cell = _render_decision_verdict_cell(entry)
 
         rec_sc = _entry_rec_scope_dict(entry)
         ach_us = float(str(rec_sc.get("step_achievable_us", entry.step_bound_us)))
@@ -1131,6 +1132,22 @@ def _render_decision_table_rows(sweep: AdvisorSweepReport) -> list[str]:
         )
         cp_us, db_us = _entry_gain_split_us(entry)
         cp_pct, _ = _entry_gain_pct_pair(entry)
+        basis_txt = (
+            "calibrated whole-server E2E"
+            if entry.gain_basis == GAIN_BASIS_E2E
+            else "fused-scope device estimate"
+        )
+        break_even_head_us = float(
+            str(
+                entry.metrics.get("break_even_host_head_delta_us", {}).get("value", 0.0)
+            )
+        )
+        break_even_html = (
+            f"<br/>break-even host-head: +{break_even_head_us:,.1f} us"
+            if entry.recommended_scope == "per_op" and break_even_head_us > 0.0
+            else ""
+        )
+        basis_and_breakeven_sub = f"<br/>basis: {basis_txt}{break_even_html}"
         rows_html.append(
             "<tr>"
             f"<td><strong>{_esc(entry.label)}</strong></td>"
@@ -1141,15 +1158,16 @@ def _render_decision_table_rows(sweep: AdvisorSweepReport) -> list[str]:
             f'<td><span class="badge badge-{scope}">{scope}</span>'
             f'<div class="kpi-sub"><code>{_esc(moe_mode)}</code></div>'
             f"{ring_sub}</td>"
+            f'<td class="tabular"><strong>floor {entry.step_bound_us:,.1f} .. '
+            f"{hi_us:,.1f}</strong>"
+            f'<div class="kpi-sub tabular" style="text-align: right;">'
+            f"hardware floor: {entry.step_bound_us:,.1f} us<br/>"
+            f"achievable: {ach_us:,.1f}..{ach_hi_us:,.1f} us</div></td>"
             f'<td class="tabular">{tput_val:,.1f}</td>'
             f'<td class="tabular {gain_cls}">{gain_str}'
             f'<div class="kpi-sub tabular" style="text-align: right;">'
             f"physics: {cp_us:+.1f} us ({cp_pct:+.1f}%) | "
-            f"dispatch: {db_us:+.1f} us</div></td>"
-            f'<td class="tabular">{entry.step_bound_us:,.1f}'
-            f'<div class="kpi-sub tabular" style="text-align: right;">'
-            f"floor upper: {hi_us:,.1f} us<br/>"
-            f"achievable: {ach_us:,.1f}..{ach_hi_us:,.1f} us</div></td>"
+            f"dispatch: {db_us:+.1f} us{basis_and_breakeven_sub}</div></td>"
             f"<td>{verdict_cell}</td>"
             f"<td>{flags_cell}</td>"
             f"<td>{_esc(entry.rationale)}</td>"
@@ -1536,9 +1554,10 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
           <th class="tabular">AI (FLOP/B)</th>
           <th class="tabular">Passes</th>
           <th>Scope &amp; MoE</th>
+          <th class="tabular">Step Band [floor..upper] (us)</th>
           <th class="tabular">Throughput (tok/s/chip)</th>
           <th class="tabular">Gain vs per_op</th>
-          <th class="tabular">Step Bound (us)</th><th>Verdict &amp; Action</th>
+          <th>Verdict &amp; Action</th>
           <th>Flags</th>
           <th>Mechanical Rationale</th>
         </tr>
