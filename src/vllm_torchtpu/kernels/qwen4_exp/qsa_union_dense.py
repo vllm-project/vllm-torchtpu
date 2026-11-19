@@ -2254,6 +2254,13 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
            **({"vguard_none": True} if vguard_none else {})}
     if vguard_none and not gathered:
         raise ValueError("vguard_none needs the gathered walk")
+    levers = {"mask_view": mask_view, "vguard_lean": vguard_lean, "align_gather": align_gather, "qk16": qk16,
+              "dot16": dot16, "vguard_none": vguard_none, "walk_pipe": int(walk_pipe)}
+    if any(levers.values()):
+        # q38 UNION-BUILD engagement marker: one line per trace on every rank (logger.info, not info_once).
+        _engagement_log("QSA union walk levers traced for %d-row steps (group %d, KV tile %d, gathered %s): %s",
+                        int(tokens), int(group), int(kv_tile), gathered,
+                        " ".join("%s=%d" % (k, int(bool(v)) if k != "walk_pipe" else int(v)) for k, v in levers.items()))
     if dot16:
         if not gathered:
             raise ValueError("dot16 needs the gathered walk (gathered='reference' or 'sparsecore')")
