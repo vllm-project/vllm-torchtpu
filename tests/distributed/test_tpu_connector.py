@@ -8883,7 +8883,9 @@ class TestStage3LatePoll:
         # A follower TP rank marks the load accepted and sets its deadline
         # from the leader's fan-out. A late poll that ran between the two
         # would report the load and find no deadline to clear; the deadline
-        # set after it would then fail a load that succeeded.
+        # set after it would then fail a load that succeeded. The late poll
+        # starts as the load is accepted and runs as soon as it can take the
+        # receive lock: before the fan-out goes on past releasing it.
         worker = _make_raiden_worker(tp_rank=1, tp_size=2, is_producer=False)
         engine = MagicMock()
         engine.poll_stats.return_value = ([], ["src-a"], [])
@@ -8910,6 +8912,35 @@ class TestStage3LatePoll:
                 poller.join(0.5)
                 pollers.append(poller)
 
+        fan_out = threading.current_thread()
+
+        class HandOverLock:
+            """The receive lock. When the fan-out thread releases its
+            outermost hold, the pending late poll runs before the fan-out
+            goes on."""
+
+            def __init__(self):
+                self._lock = threading.RLock()
+                self._depth = 0
+
+            def __enter__(self):
+                self._lock.acquire()
+                if threading.current_thread() is fan_out:
+                    self._depth += 1
+                return self
+
+            def __exit__(self, *exc):
+                outermost = False
+                if threading.current_thread() is fan_out:
+                    self._depth -= 1
+                    outermost = self._depth == 0
+                self._lock.release()
+                if outermost:
+                    for poller in pollers:
+                        poller.join(5.0)
+                return False
+
+        worker._stage3_poll_lock = HandOverLock()
         worker._stage3_controller_accepted = LatePollOnAccept()
         tp_group = MagicMock()
         tp_group.broadcast_object.return_value = {"dst-a": "uncertain"}
