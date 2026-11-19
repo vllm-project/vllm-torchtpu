@@ -1075,7 +1075,7 @@ def test_fused_ep_moe_matches_the_reference(eight_tpu7x_cores, mode, name, resul
 
 @pytest.mark.multichip
 @pytest.mark.parametrize("name", list(CASES))
-def test_dp4tp2_settings_keep_the_layers_values(eight_tpu7x_cores, fresh_builds, name):
+def test_dp4tp2_settings_keep_the_layers_values(eight_tpu7x_cores, name):
     """The v3 settings of the Qwen3.5 DP4 x TP2 entry change what is gathered
     and summed and the programs' schedule, not values: with them the layer is
     within the reference's bound and gives every value it gives without
@@ -1120,7 +1120,7 @@ def _check_experts_are_skipped(name):
 
 @pytest.mark.multichip
 @pytest.mark.parametrize("name", list(CASES) + list(COLD_CASES))
-def test_dense_slots_layer_matches_the_reference(eight_tpu7x_cores, fresh_builds, name):
+def test_dense_slots_layer_matches_the_reference(eight_tpu7x_cores, name):
     """The dense-slots layer as the Qwen3.5 DP4 x TP2 entry runs it: within the
     reference's bound, and the bound must fail with two tokens' rows swapped;
     with float32 scaling products, bit-identical to this layer with bf16
