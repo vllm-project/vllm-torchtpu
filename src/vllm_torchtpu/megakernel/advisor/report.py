@@ -27,6 +27,7 @@ from .assets import load_asset
 from .constants import (
     BAND_PAIR_LEN,
     DECISION_TABLE_COLS,
+    GAIN_BASIS_E2E,
     MEGAKERNEL_LABELS,
     MOE_MODE_SHORT_HINTS,
     PROVENANCE_TAGS,
@@ -89,6 +90,26 @@ def _entry_gain_pct_pair(entry: RegimeEntry) -> tuple[float, float]:
     return cp_pct, ach_pct
 
 
+def _format_assumed_value(item: Mapping[str, object]) -> str:
+    """Format assumed value and uncertainty bracket for `--unresolved` output."""
+    band = item.get("band", [])
+    if "value" in item and item["value"] is not None:
+        return f"{item['value']} [band={band}]"
+    return f"band={band}"
+
+
+def _format_unresolved_lines(
+    assumptions: tuple[dict[str, object], ...],
+) -> list[str]:
+    """Render standardized `(metric, assumed, affects, settle)` lines."""
+    return [
+        f"  * {item['name']}: assumed={_format_assumed_value(item)} "
+        f"({item['unit']}) | affects={item.get('affects', 'gain')} | "
+        f"settle: {item['how_to_settle']}"
+        for item in assumptions
+    ]
+
+
 def format_advisor_summary(
     rep: AdvisorReport, *, explain: bool = False, unresolved: bool = False
 ) -> str:
@@ -122,13 +143,36 @@ def format_advisor_summary(
     if cp_metric is not None and db_metric is not None:
         cp_val = float(str(cp_metric.get("value", 0.0)))
         db_val = float(str(db_metric.get("value", 0.0)))
+        if rep.gain_basis == GAIN_BASIS_E2E:
+            expected_gain_pct = (
+                float(str(rep.metrics.get("expected_gain_max", {}).get("value", 0.0)))
+                * 100.0
+            )
+            lines.append(
+                f"Whole-server E2E gain (calibrated): {expected_gain_pct:+.2f}% | "
+                f"Fusion gain (estimate): {cp_val:+.2f} us "
+                f"[{_gain_band_text(cp_metric)}] | "
+                f"Dispatch Bubble Gain: {db_val:+.2f} us "
+                "[basis: calibrated whole-server E2E]"
+            )
+        else:
+            lines.append(
+                f"Fusion gain (estimate): {cp_val:+.2f} us "
+                f"[{_gain_band_text(cp_metric)}] | "
+                f"Dispatch Bubble Gain: {db_val:+.2f} us "
+                "[basis: fused-scope device estimate]"
+            )
+    break_even_head_us = float(
+        str(rep.metrics.get("break_even_host_head_delta_us", {}).get("value", 0.0))
+    )
+    if rep.recommended_scope == "per_op" and break_even_head_us > 0.0:
         lines.append(
-            f"Fusion gain (estimate): {cp_val:+.2f} us "
-            f"[{_gain_band_text(cp_metric)}] | "
-            f"Dispatch Bubble Gain: {db_val:+.2f} us"
+            f"Break-even host-head delta: +{break_even_head_us:.1f} us "
+            "(per_op - fused host dispatch head needed for fusion to tie)"
         )
     lines.extend(
-        f"  - {scope.scope:12s} {scope.step_bound_us:9.1f} us "
+        f"  - {scope.scope:12s} [floor {scope.step_bound_us:7.1f} .. "
+        f"{max(scope.step_bound_us, scope.step_upper_us):7.1f} us] "
         f"(Derated Achievable Step={scope.step_achievable_us:9.1f} us) "
         f"[rows/pass<={scope.t_vmem_max:4d}, passes={scope.n_splits:2d}, "
         f"ring=({scope.selected_dense_slots},{scope.selected_expert_slots}), "
@@ -144,11 +188,7 @@ def format_advisor_summary(
         )
     if unresolved and rep.unresolved_assumptions:
         lines.append("Unresolved Assumptions:")
-        lines.extend(
-            f"  * {item['name']} (band={item['band']} {item['unit']}): "
-            f"{item['how_to_settle']}"
-            for item in rep.unresolved_assumptions
-        )
+        lines.extend(_format_unresolved_lines(rep.unresolved_assumptions))
     if rep.hypothetical_best is not None:
         hypothetical_best = rep.hypothetical_best
         raw_blks = hypothetical_best.get("blockers")
@@ -210,7 +250,11 @@ def vector_register_load_cap_line(chip: chips.ChipSpec) -> str:
     )
 
 
-def format_regime_table(sweep: AdvisorSweepReport) -> str:
+def format_regime_table(
+    sweep: AdvisorSweepReport,
+    *,
+    unresolved: bool = False,
+) -> str:
     """Format multi-regime sweep table and tailoring guide for terminal output."""
     rec = sweep.parallelism
     chip_spec = sweep.chip_spec or chips.resolve_chip_spec(sweep.chip)
@@ -223,7 +267,7 @@ def format_regime_table(sweep: AdvisorSweepReport) -> str:
     hdr = (
         f"{'Request Regime':36s} | {'Layout':22s} | {'Tokens':>6s} | "
         f"{'AI (FLOP/B)':>11s} | {'Passes':>6s} | {'Scope':12s} | "
-        f"{'MoE Mode':15s} | {'Step (us)':>10s}"
+        f"{'MoE Mode':15s} | {'Step Band [floor..upper] (us)':>29s}"
     )
     layout_lines = [
         f"Decode Parallelism: {rec.label()} [{rec.topology}] ({mode_tag})",
@@ -299,26 +343,46 @@ def format_regime_table(sweep: AdvisorSweepReport) -> str:
         f"{entry.label:36s} | {entry.layout:22s} | {entry.active_tokens:6d} | "
         f"{entry.step_arithmetic_intensity:11.2f} | {entry.num_vmem_splits:6d} | "
         f"{entry.recommended_scope:12s} | {entry.recommended_moe_mode:15s} | "
-        f"{entry.step_bound_us:10.1f}"
+        f"[floor {entry.step_bound_us:7.1f}.."
+        f"{max(entry.step_bound_us, entry.step_upper_us):7.1f}]"
         for entry in sweep.regimes
     )
     if sweep.regimes:
         lines.append("")
-        lines.append("Investment Triage (Derated Achievable Step, Ring, Gain Split):")
+        lines.append("Investment Triage (Step Band, Achievable Step, Gain Split):")
         for entry in sweep.regimes:
             rec_sc = _entry_rec_scope_dict(entry)
+            hi_us = max(entry.step_bound_us, entry.step_upper_us)
             ach_us = float(str(rec_sc.get("step_achievable_us", entry.step_bound_us)))
             ring_txt = _format_ring_pair(rec_sc)
             cp_us, db_us = _entry_gain_split_us(entry)
             cp_pct, ach_pct = _entry_gain_pct_pair(entry)
             cp_band = _gain_band_text(entry.metrics.get("compiler_proof_gain_us"))
+            break_even_head_us = float(
+                str(
+                    entry.metrics.get("break_even_host_head_delta_us", {}).get(
+                        "value", 0.0
+                    )
+                )
+            )
+            break_even_suffix = (
+                f" | Break-even host-head=+{break_even_head_us:.1f} us"
+                if entry.recommended_scope == "per_op" and break_even_head_us > 0.0
+                else ""
+            )
             roi_tag = " [LOW ROI <1% PHYSICS]" if 0.0 < cp_pct < 1.0 else ""
             lines.append(
-                f"  * {entry.label}: Derated Achievable Step={ach_us:.1f} us "
+                f"  * {entry.label}: "
+                f"Step Band=[floor {entry.step_bound_us:.1f}..{hi_us:.1f} us] | "
+                f"Derated Achievable Step={ach_us:.1f} us "
                 f"({ach_pct:+.1f}% vs per_op) | ring={ring_txt} | "
                 f"Fusion gain (estimate)={cp_us:+.1f} us ({cp_pct:+.1f}%; {cp_band}) | "
-                f"Dispatch Bubble Gain={db_us:+.1f} us{roi_tag}"
+                f"Dispatch Bubble Gain={db_us:+.1f} us{break_even_suffix}{roi_tag}"
             )
+    if unresolved and sweep.regimes and sweep.regimes[0].unresolved_assumptions:
+        lines.append("")
+        lines.append("Unresolved Assumptions (Decode Reference):")
+        lines.extend(_format_unresolved_lines(sweep.regimes[0].unresolved_assumptions))
     lines.extend(
         [
             "",

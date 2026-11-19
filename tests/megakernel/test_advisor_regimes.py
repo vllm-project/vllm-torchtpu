@@ -1934,3 +1934,137 @@ def test_prior_file_collectives_do_not_change_prices() -> None:
         assert prior_scope.step_achievable_us == baseline_scope.step_achievable_us
         assert prior_scope.step_upper_us == baseline_scope.step_upper_us
         assert prior_scope.comm_us == baseline_scope.comm_us
+
+
+def test_cli_decoding_sequences_littles_law_and_host_head_flags(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify Little's Law decoding sequences, host-head CLI flags, and --unresolved."""
+    output_tok_s = 605.0
+    mean_tpot_ms = 13.42
+    # Little's Law active sequences: output_tok_s * (mean_tpot_ms / 1000.0).
+    expected_exact_seqs = round(output_tok_s * (mean_tpot_ms / 1000.0), 6)
+    expected_rounded_seqs = round(expected_exact_seqs)
+    exact_seqs, rounded_seqs = advisor.derive_decoding_sequences(
+        output_tok_s, mean_tpot_ms
+    )
+    assert exact_seqs == pytest.approx(expected_exact_seqs, abs=1e-6)
+    assert rounded_seqs == expected_rounded_seqs
+
+    exit_code_littles = advisor.main(
+        [
+            "estimate",
+            "--model",
+            "qwen3.5-397b",
+            "--chip",
+            "tpu7x",
+            "--phase",
+            "decode",
+            "--output-tok-s",
+            "605.0",
+            "--mean-tpot-ms",
+            "13.42",
+            "--tp",
+            "8",
+            "--ep",
+            "8",
+            "--dcp",
+            "4",
+            "--json",
+        ]
+    )
+    assert exit_code_littles == 0
+    littles_payload = json.loads(capsys.readouterr().out)
+    assert littles_payload["active_tokens"] == expected_rounded_seqs
+
+    exit_code_calibrated = advisor.main(
+        [
+            "estimate",
+            "--model",
+            "qwen3.5-397b",
+            "--chip",
+            "tpu7x",
+            "--phase",
+            "decode",
+            "--decoding-seqs",
+            "8",
+            "--tp",
+            "8",
+            "--ep",
+            "8",
+            "--dcp",
+            "4",
+            "--host-head-us",
+            "per_op=1800,fused=350",
+            "--per-op-step-us",
+            "9500",
+            "--step-coverage",
+            "0.85",
+            "--json",
+        ]
+    )
+    assert exit_code_calibrated == 0
+    cal_payload = json.loads(capsys.readouterr().out)
+    assert cal_payload["gain_basis"] == constants.GAIN_BASIS_E2E
+    scopes_by_name = {s["scope"]: s for s in cal_payload["scopes"]}
+    expected_per_op_head_us = 1800.0
+    expected_fused_head_us = 350.0
+    assert scopes_by_name["per_op"]["host_head_us"] == expected_per_op_head_us
+    assert scopes_by_name["whole_step"]["host_head_us"] == expected_fused_head_us
+
+    exit_code_unresolved = advisor.main(
+        [
+            "estimate",
+            "--model",
+            "qwen3.5-397b",
+            "--chip",
+            "tpu7x",
+            "--phase",
+            "decode",
+            "--tp",
+            "8",
+            "--ep",
+            "8",
+            "--dcp",
+            "4",
+            "--unresolved",
+        ]
+    )
+    assert exit_code_unresolved == 0
+    unres_out = capsys.readouterr().out
+    assert "Unresolved Assumptions:" in unres_out
+    assert "assumed=" in unres_out
+    assert "| affects=" in unres_out
+    assert "| settle:" in unres_out
+    assert "decoding_sequences:" in unres_out
+
+    for invalid_argv in (
+        [
+            "--model",
+            "qwen3.5-0.8b",
+            "--tp",
+            "8",
+            "--batch",
+            "4",
+            "--decoding-seqs",
+            "4",
+        ],
+        ["--model", "qwen3.5-0.8b", "--tp", "8", "--output-tok-s", "500.0"],
+        [
+            "--model",
+            "qwen3.5-0.8b",
+            "--tp",
+            "8",
+            "--output-tok-s",
+            "-1.0",
+            "--mean-tpot-ms",
+            "10.0",
+        ],
+        ["--model", "qwen3.5-0.8b", "--tp", "8", "--decoding-seqs", "0"],
+        ["--model", "qwen3.5-0.8b", "--tp", "8", "--host-head-us", "per_op=-5"],
+        ["--model", "qwen3.5-0.8b", "--tp", "8", "--host-head-us", "bad_key=10"],
+        ["--model", "qwen3.5-0.8b", "--tp", "8", "--per-op-step-us", "0"],
+        ["--model", "qwen3.5-0.8b", "--tp", "8", "--step-coverage", "1.2"],
+    ):
+        with pytest.raises(MegakernelConfigError):
+            advisor.main(invalid_argv)
