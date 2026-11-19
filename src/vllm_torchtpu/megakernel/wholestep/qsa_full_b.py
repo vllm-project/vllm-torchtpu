@@ -241,6 +241,12 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.nvis_thr = self.select_nvis and "t" in parts
         self.nvis_cmp = self.select_nvis and "c" in parts
         self.select_nvis_union = self.select_nvis_union and "u" in parts
+        # Routing by visible groups (per request; per row for the compaction): the ranged
+        # thresholds / compaction only up to VLLM_TPU_MK_QSA_NVIS_CUT groups (past it the
+        # chunk loops cost more than the static full scan: exos ctx 100K), the ranged union
+        # up to VLLM_TPU_MK_QSA_NVIS_UCUT; larger requests take the original path.
+        self.nvis_cut = int(os.environ.get("VLLM_TPU_MK_QSA_NVIS_CUT", "16384"))
+        self.nvis_ucut = int(os.environ.get("VLLM_TPU_MK_QSA_NVIS_UCUT", str(max_groups)))
         # 3: also the bisection `NVIS_DIGIT` bits per pass (fewer dependent count passes).
         self.nvis_digit = NVIS_DIGIT if self.select_nvis and int(select_nvis) >= 3 else 1
         self.nvis_rows = tuple(int(x) for x in nvis_rows)
