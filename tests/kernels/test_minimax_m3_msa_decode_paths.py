@@ -137,3 +137,37 @@ def test_decode_switch_same_bits(monkeypatch, env, heads, reqs, fp4):
     got = run()
     for a, b in zip(ref, got):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+def test_decode_opt_parse(monkeypatch):
+    monkeypatch.setenv(msa_attention_lse.DECODE_OPT_ENV, "widths=12/4/8,pps=16")
+    assert msa_attention_lse.decode_opt() == {
+        "step_widths": (4, 8, 12),
+        "pages_per_step": 16,
+    }
+    monkeypatch.setenv(msa_attention_lse.DECODE_OPT_ENV, "")
+    assert msa_attention_lse.decode_opt() == {}
+    monkeypatch.setenv(msa_attention_lse.DECODE_OPT_ENV, "bogus")
+    with pytest.raises(ValueError):
+        msa_attention_lse.decode_opt()
+
+
+@pytest.mark.parametrize("fp4", [True, False])
+def test_decode_finer_widths_same_bits(fp4):
+    """Finer step widths only drop masked score columns of a group."""
+    q, kv, sel, local, limit, table, sc = _attention_inputs(
+        np.random.default_rng(7), 2, 3, fp4
+    )
+
+    def run(**kw):
+        jax.clear_caches()
+        return msa_attention_lse.msa_sparse_attention_lse_heads(
+            q, kv, sel, local, limit, table, sm_scale=D**-0.5, block_q=8,
+            scale_cache=sc, interpret=True, head_major=True, pages_per_step=32,
+            **kw,
+        )
+
+    ref = run()
+    got = run(step_widths=(2, 4, 6, 8, 12, 16, 20, 24, 28))
+    for a, b in zip(ref, got):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
