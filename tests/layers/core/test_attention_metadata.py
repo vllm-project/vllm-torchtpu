@@ -1101,6 +1101,35 @@ class TestBlockTableUploadSkip:
         assert uploaded
         assert torch.equal(staged[0], self._expected(table, 3))
 
+    def test_full_and_targeted_walks_keep_their_own_uploads(self):
+        # A drafter's targeted walk (one group) and the target's full walk
+        # stage different tables in the same step; each reuses its own last
+        # upload instead of evicting the other's.
+        runner, tables = self._setup(num_groups=2)
+
+        def walk(gids=None):
+            before = len(runner._unfenced_h2d_sources)
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=3,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.ones((4,), dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([3, 3, 3], dtype=torch.int32),
+            )
+            stage_block_table_uploads(runner, ctx, 4, gids=gids)
+            return ctx.staged_block_tables, len(runner._unfenced_h2d_sources) > before
+
+        assert walk()[1] and walk({1})[1]
+        full, uploaded = walk()
+        assert not uploaded
+        for gid, table in enumerate(tables):
+            assert torch.equal(full[gid], self._expected(table, 3))
+        targeted, uploaded = walk({1})
+        assert not uploaded
+        assert set(targeted) == {1}
+        assert torch.equal(targeted[1], self._expected(tables[1], 3))
+
     def test_changed_upload_is_fenced(self):
         # A changed upload goes through stage_h2d_upload, so its host buffer
         # stays alive until the input-staging fence; a reused one adds none.
