@@ -90,3 +90,26 @@ def test_size_routing_with_qar_and_direct_rows(monkeypatch, rows, qar_min, want)
     assert [c[0] for c in calls] == [want]
     if want == "pallas":
         assert calls[0][1] == 8
+
+
+def test_qar_layout_from_abstract_device_ids():
+    """Serving meshes hold id-only devices; the id layout must give a valid
+    ring (siblings share a chip, ring neighbours are on adjacent chips)."""
+    par = pytest.importorskip("vllm_torchtpu.distributed.pallas_all_reduce")
+    import numpy as np
+
+    class _Dev:
+        def __init__(self, i):
+            self.id = i
+
+    class _Mesh:
+        devices = np.array([_Dev(i) for i in range(8)], dtype=object)
+
+    devs = par._qar_devices(_Mesh())
+    tab = par.qar.layout_table(devs)
+    for i, d in enumerate(devs):
+        sib = devs[tab[par.qar.SIB, i]]
+        assert sib.coords == d.coords and sib.core_on_chip != d.core_on_chip
+        nxt = devs[tab[par.qar.CW_NEXT, i]]
+        assert nxt.core_on_chip == d.core_on_chip
+        assert sum(abs(a - b) for a, b in zip(nxt.coords, d.coords)) == 1

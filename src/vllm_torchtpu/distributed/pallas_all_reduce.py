@@ -109,10 +109,53 @@ def _qdq_min_rows() -> int:
     return max(1, envs.TPU_TP_AR_QDQ_MIN_TOKENS)
 
 
+@dataclasses.dataclass(frozen=True)
+class _ChipCore:
+    id: int
+    coords: tuple[int, int, int]
+    core_on_chip: int
+
+
+def _qar_devices(mesh) -> list[_ChipCore]:
+    """The mesh's devices with chip coordinates and core index, in mesh order.
+
+    The serving mesh holds torch_tpu's compile-only abstract devices, which
+    carry only an id; the coordinates come from the PJRT attributes every rank
+    reported at init. Without them, the tpu7x id layout is assumed (id = 2 *
+    chip + core, chips in x-major order over the 2x2 grid)."""
+    ids = [int(d.id) for d in mesh.devices.flat]
+    if all(hasattr(d, "coords") and hasattr(d, "core_on_chip") for d in mesh.devices.flat):
+        return [
+            _ChipCore(int(d.id), tuple(int(c) for c in d.coords[:3]), int(d.core_on_chip))
+            for d in mesh.devices.flat
+        ]
+    by_id: dict[int, _ChipCore] = {}
+    try:
+        from torch_tpu._internal.distributed import tpu_distributed
+
+        for a in tpu_distributed.global_device_attributes():
+            c = tuple(int(x) for x in (a.coords or ())) + (0, 0, 0)
+            by_id[int(a.id)] = _ChipCore(int(a.id), c[:3], int(a.core_on_chip or 0))
+    except Exception as e:  # noqa: BLE001 - fall back to the id layout below
+        logger.warning("qar_all_reduce: no PJRT device attributes (%s)", e)
+    if all(i in by_id for i in ids):
+        source = "pjrt"
+        out = [by_id[i] for i in ids]
+    else:
+        source = "id-layout"
+        out = [_ChipCore(i, ((i // 2) % 2, (i // 2) // 2, 0), i % 2) for i in ids]
+    logger.warning(
+        "qar_all_reduce: device layout from %s: %s",
+        source,
+        [(d.id, d.coords[:2], d.core_on_chip) for d in out],
+    )
+    return out
+
+
 def _make_op(mesh, max_bytes: int, direct_rows: int = 0,
              qdq_min_rows: int = 0, qar_min_rows: int = 0):
     axis = mesh.axis_names[0]
-    qar_tab = qar.layout_table(list(mesh.devices.flat)) if qar_min_rows else None
+    qar_tab = qar.layout_table(_qar_devices(mesh)) if qar_min_rows else None
     specs = (P(axis), P(axis))
     sharded = jax.shard_map(
         _body(int(mesh.size), max_bytes, axis, direct_rows, qdq_min_rows,
