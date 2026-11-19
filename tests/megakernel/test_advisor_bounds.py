@@ -24,7 +24,13 @@ from typing import Literal
 import pytest
 
 from tests.megakernel.core.megakernel_fakes import TINY_TILES, make_fake_model_spec
-from tests.megakernel.test_advisor_specs import DEEPSEEK_V3_CFG, QWEN35_397B_CFG
+from tests.megakernel.test_advisor_specs import (
+    DEEPSEEK_V3_CFG,
+    DEEPSEEK_V4_CFG,
+    HOMOGENEOUS_DSA_CFG,
+    QWEN4_EXP_CFG,
+    QWEN35_397B_CFG,
+)
 from vllm_torchtpu.megakernel import advisor
 from vllm_torchtpu.megakernel.advisor import (
     constants,
@@ -1079,7 +1085,9 @@ def test_achievable_upper_band_never_inverts_below_achievable_or_floor() -> None
             scope.step_achievable_us, scope.step_upper_us
         )
 
-    p_ds4 = advisor.resolve_model_profile("deepseek-v4")
+    p_ds4 = models.model_profile_from_hf_config(
+        DEEPSEEK_V4_CFG, name="deepseek-v4-hf", weight_dtype="fp8"
+    )
     c7x = advisor.resolve_chip_spec("tpu7x")
     wl_ds4 = advisor.WorkloadSpec(
         phase="decode", batch=128, context=160000, dp=16, tp=1, ep=16
@@ -1098,7 +1106,9 @@ def test_achievable_upper_band_never_inverts_below_achievable_or_floor() -> None
         expected_ds4_kv_read_gb, abs=0.01
     )
 
-    p_q4 = advisor.resolve_model_profile("qwen4-exp")
+    p_q4 = models.model_profile_from_hf_config(
+        QWEN4_EXP_CFG, name="qwen4-exp-hf", weight_dtype="fp8"
+    )
     parts_q4 = advisor.compute_per_token_vmem_bytes(
         p_q4, advisor.WorkloadSpec(phase="decode", batch=16, tp=8)
     )
@@ -2641,9 +2651,17 @@ def test_achievable_adds_collectives_while_floor_and_corners_stay_overlapped() -
         + whole_step.repass_spill_us
         + whole_step.launch_us
     )
+    extra_indexer_radix_us = (
+        (constants.INDEXER_RADIX_PASSES - 1)
+        * glm_profile.num_indexer_layers
+        * round(math.log2(_GLM_VERIFY_DCP_DEGREE))
+        * chip_spec.collective_latency_s
+        * 1e6
+    )
     expected_ach_us = (
         max(whole_step.hbm_us, whole_step.chain_us)
         + whole_step.comm_us
+        + extra_indexer_radix_us
         + whole_step.fill_drain_us
         + whole_step.repass_spill_us
         + whole_step.launch_us
@@ -3218,3 +3236,261 @@ def test_measured_per_op_step_and_coverage_set_whole_server_gain_basis() -> None
     assert calibrated_report.metrics["calibrated_host_head_us"][
         "value"
     ] == pytest.approx(4800.0)
+
+
+def test_glm_moe_dsa_sparse_attention_indexer_and_dcp_bounds() -> None:
+    """Verify GLM-5.2 DSA sparse KV gather, 21-layer indexer, VMEM, and DCP bounds."""
+    glm_profile = advisor.resolve_model_profile("glm-5.2")
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    # Closed-form first-principles predictions for GLM-5.2 TP16 x DCP8 verify
+    # (spec_tokens=3, context=131076) on TPU v7x: (floor_ms, achievable_ms).
+    expected_ms_by_batch = {
+        1: (2.89, 4.74),
+        4: (7.13, 9.70),
+        8: (11.22, 14.71),
+    }
+    # 0.005 ms half-ULP of 2-decimal prediction + 0.005 ms half-ULP of built output.
+    ledger_tol_ms = 2 * 0.005
+    for batch_size, (
+        expected_floor_ms,
+        expected_achievable_ms,
+    ) in expected_ms_by_batch.items():
+        workload = advisor.WorkloadSpec(
+            phase="verify",
+            spec_tokens=_GLM_VERIFY_QUERY_ROWS - 1,
+            batch=batch_size,
+            context=_GLM_VERIFY_CONTEXT_TOKENS,
+            osl=1,
+            tp=16,
+            ep=1,
+            dcp=_GLM_VERIFY_DCP_DEGREE,
+        )
+        report = advisor.advise(glm_profile, workload, chip_spec)
+        whole_step = next(s for s in report.scopes if s.scope == "whole_step")
+        per_op = next(s for s in report.scopes if s.scope == "per_op")
+        floor_ms = whole_step.step_bound_us / 1e3
+        achievable_ms = whole_step.step_achievable_us / 1e3
+        assert floor_ms == pytest.approx(expected_floor_ms, abs=ledger_tol_ms)
+        assert achievable_ms == pytest.approx(expected_achievable_ms, abs=ledger_tol_ms)
+        assert whole_step.step_floor_strict_us <= whole_step.step_bound_us
+        assert (
+            whole_step.step_bound_us
+            <= whole_step.step_achievable_us
+            <= whole_step.step_achievable_upper_us
+        )
+        assert per_op.act_hbm_mb > whole_step.act_hbm_mb
+        assert report.recommended_scope == "per_op"
+        assert whole_step.support == "hypothetical"
+
+    # Resident HBM includes both full MLA KV and packed 21-layer indexer K-cache.
+    workload_dcp8 = advisor.WorkloadSpec(
+        phase="verify",
+        spec_tokens=_GLM_VERIFY_QUERY_ROWS - 1,
+        batch=1,
+        context=_GLM_VERIFY_CONTEXT_TOKENS,
+        tp=16,
+        ep=1,
+        dcp=_GLM_VERIFY_DCP_DEGREE,
+    )
+    workload_dcp1 = dataclasses.replace(workload_dcp8, dcp=1)
+    scope_context_batch1 = _build_scope_context(glm_profile, workload_dcp8, chip_spec)
+    assert scope_context_batch1.has_dsa
+    assert scope_context_batch1.is_sparse_gather
+    assert (
+        scope_context_batch1.hbm_used
+        > scope_context_batch1.w_static + scope_context_batch1.kv_cache_read_bytes
+    )
+
+    # Shared indexer spine (21 < 78) increases residual_buffer_bytes, and DCP=8
+    # adds cross-DCP gathered query scratch relative to DCP=1.
+    vmem_dcp8 = advisor.compute_per_token_vmem_bytes(glm_profile, workload_dcp8)
+    vmem_dcp1 = advisor.compute_per_token_vmem_bytes(glm_profile, workload_dcp1)
+    expected_shared_spine_dcp8 = constants.WORD_ALIGN_BYTES * math.ceil(
+        glm_profile.index_topk / _GLM_VERIFY_DCP_DEGREE
+    )
+    base_residual_bytes = (
+        4 * max(1, glm_profile.residual_streams) + 2 + 6
+    ) * glm_profile.hidden_size
+    assert vmem_dcp8["residual_buffer_bytes"] == (
+        base_residual_bytes + expected_shared_spine_dcp8
+    )
+    nh_local = math.ceil(glm_profile.num_attention_heads / workload_dcp8.tp)
+    expected_dcp_q_scratch = (
+        constants.BF16_BYTES
+        * (_GLM_VERIFY_DCP_DEGREE - 1)
+        * nh_local
+        * models.dsa_query_gather_dim(glm_profile)
+    )
+    assert (
+        vmem_dcp8["attn_scratch_bytes"] - vmem_dcp1["attn_scratch_bytes"]
+        == expected_dcp_q_scratch
+    )
+    # With vmem_alias=True, moe_scratch dominates attn_scratch while DCP=8 shards
+    # shared_indexer_spine_bytes (8192 -> 1024 B/tok), raising t_vmem_max.
+    assert vmem_dcp8["total_per_token_bytes"] < vmem_dcp1["total_per_token_bytes"]
+    report_dcp8 = advisor.advise(glm_profile, workload_dcp8, chip_spec)
+    report_dcp1 = advisor.advise(glm_profile, workload_dcp1, chip_spec)
+    whole_dcp8 = next(s for s in report_dcp8.scopes if s.scope == "whole_step")
+    whole_dcp1 = next(s for s in report_dcp1.scopes if s.scope == "whole_step")
+    assert whole_dcp8.t_vmem_max > whole_dcp1.t_vmem_max
+
+
+def test_glm_moe_dsa_evaluate_corners_matches_step_upper_us() -> None:
+    """Verify cross-DCP Q all-gather and indexer hops preserve _evaluate_corners."""
+    glm_profile = advisor.resolve_model_profile("glm-5.2")
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    workload = advisor.WorkloadSpec(
+        phase="verify",
+        spec_tokens=_GLM_VERIFY_QUERY_ROWS - 1,
+        batch=4,
+        context=_GLM_VERIFY_CONTEXT_TOKENS,
+        osl=1,
+        tp=16,
+        ep=1,
+        dcp=_GLM_VERIFY_DCP_DEGREE,
+    )
+    report = advisor.advise(glm_profile, workload, chip_spec)
+    scope_context = _build_scope_context(glm_profile, workload, chip_spec)
+    assert scope_context.has_dsa
+    assert scope_context.dcp_query_all_gather_hops > 0
+    assert scope_context.dcp_post_attn_hops > 0
+    priors = _resolve_calibrated_priors(workload, chip_spec, scope_context, None)
+    box = _assumed_box(scope_context, workload, priors)
+    ctx_box, wl_box = _apply_box(scope_context, workload, box)
+    corners = _evaluate_corners(ctx_box, glm_profile, wl_box, box)
+    low_corner = (
+        box.launch_gap_us[0],
+        round(box.collective_s[0] * 1e6, 3),
+        box.attn_dots[0],
+    )
+    high_corner = (
+        box.launch_gap_us[1],
+        round(box.collective_s[1] * 1e6, 3),
+        box.attn_dots[-1],
+    )
+    # 0.01 us 2-decimal display quantum + 0.005 us float-rounding slack.
+    display_round_tol_us = 0.015
+    for scope in report.scopes:
+        if not scope.feasible:
+            continue
+        assert corners[low_corner][scope.scope] == pytest.approx(
+            scope.step_bound_us, abs=display_round_tol_us
+        )
+        assert corners[high_corner][scope.scope] == pytest.approx(
+            scope.step_upper_us, abs=display_round_tol_us
+        )
+
+
+def test_homogeneous_dsa_profile_within_core_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify all-full DSA resolves within_core_limits and VMEM/DCP rules."""
+    profile = models.model_profile_from_hf_config(HOMOGENEOUS_DSA_CFG, name="homo-dsa")
+    assert profile.is_periodic
+    assert profile.layer_families == ("dsa", "moe")
+    workload = advisor.WorkloadSpec(
+        phase="decode", batch=8, context=8192, tp=8, ep=1, dcp=4
+    )
+    # All-full indexer stack keeps indices in per-layer attn_scratch, not spine.
+    vmem_parts = advisor.compute_per_token_vmem_bytes(profile, workload)
+    shared_profile = dataclasses.replace(
+        profile, num_indexer_layers=profile.num_attention_layers // 2
+    )
+    shared_vmem_parts = advisor.compute_per_token_vmem_bytes(shared_profile, workload)
+    base_residual_bytes = (
+        4 * max(1, profile.residual_streams) + 2 + 6
+    ) * profile.hidden_size
+    assert vmem_parts["residual_buffer_bytes"] == base_residual_bytes
+    expected_indices_bytes = constants.WORD_ALIGN_BYTES * math.ceil(
+        profile.index_topk / workload.dcp
+    )
+    assert (
+        vmem_parts["attn_scratch_bytes"] - shared_vmem_parts["attn_scratch_bytes"]
+        == expected_indices_bytes
+    )
+    assert (
+        shared_vmem_parts["residual_buffer_bytes"] - vmem_parts["residual_buffer_bytes"]
+        == expected_indices_bytes
+    )
+
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    report = advisor.advise(profile, workload, chip_spec)
+    whole_step = next(s for s in report.scopes if s.scope == "whole_step")
+    assert whole_step.support == "within_core_limits"
+    assert whole_step.blockers == ()
+
+    # Declared dcp_gather step on a DSA model suppresses automatic DSA DCP pricing
+    # so cross-DCP collectives are never double-counted.
+    declared_step = models.DeclaredCollectiveStep(
+        kind="dcp_gather", group_size=4, calls_per_layer=2
+    )
+    declared_deployment = models.DeploymentPreset(
+        decode=models.ParallelLayout(
+            tp=8,
+            ep=1,
+            dp=1,
+            pp=1,
+            dcp=4,
+            megakernel={
+                "scopes": ["whole_step"],
+                "max_rows": 64,
+                "ranks": 8,
+                "phases": ["decode"],
+                "collectives": {
+                    "steps": [
+                        {
+                            "kind": "dcp_gather",
+                            "group_size": 4,
+                            "calls_per_layer": 2,
+                        }
+                    ]
+                },
+                "source": "declared DSA DCP contract test",
+            },
+        ),
+        prefill=models.ParallelLayout(tp=8, ep=1),
+    )
+    monkeypatch.setitem(support.DEPLOYMENT_PRESETS, "homo-dsa", declared_deployment)
+    declared_report = advisor.advise(profile, workload, chip_spec)
+    declared_whole = next(s for s in declared_report.scopes if s.scope == "whole_step")
+    assert declared_whole.support == "declared"
+
+    scope_context = _build_scope_context(profile, workload, chip_spec)
+    all_reduce_us = (
+        scope_context.num_ar
+        * (
+            scope_context.ar_transfer_time_s
+            + scope_context.ar_hops * chip_spec.collective_latency_s
+        )
+        * 1e6
+    )
+    declared_transfer_s, _, declared_hops = roofline.compute_collective_step_terms(
+        declared_step, profile, scope_context, (1, 1, "tp")
+    )
+    declared_dcp_us = (
+        declared_transfer_s + declared_hops * chip_spec.collective_latency_s
+    ) * 1e6
+    auto_dsa_dcp_us = (
+        scope_context.dcp_post_attn_transfer_s
+        + scope_context.dcp_post_attn_hops * chip_spec.collective_latency_s
+    ) * 1e6
+    extra_radix_us = (
+        (constants.INDEXER_RADIX_PASSES - 1)
+        * scope_context.l_indexer
+        * scope_context.dcp_hops
+        * chip_spec.collective_latency_s
+        / workload.efficiency.eta_ici
+        * 1e6
+    )
+    # 0.01 us 2-decimal display quantum + 0.005 us float-rounding slack.
+    display_round_tol_us = 0.015
+    assert declared_whole.comm_us == pytest.approx(
+        all_reduce_us + declared_dcp_us, abs=display_round_tol_us
+    )
+    assert declared_whole.chain_us < whole_step.chain_us
+    expected_achievable_drop_us = (
+        auto_dsa_dcp_us - declared_dcp_us
+    ) / workload.efficiency.eta_ici + extra_radix_us
+    assert whole_step.step_achievable_us - declared_whole.step_achievable_us == (
+        pytest.approx(expected_achievable_drop_us, abs=display_round_tol_us)
+    )
