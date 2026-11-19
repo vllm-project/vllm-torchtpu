@@ -144,3 +144,19 @@ def test_should_fall_back_cleanly_when_shapes_or_dtype_unaligned():
         dtype=np.float32,
     )
     assert np.allclose(got, want, atol=1e-3, rtol=1e-3)
+
+
+def test_should_fall_back_to_xla_when_wide_dense_tile_exceeds_vmem_cap(monkeypatch):
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    moe_jaxpr = jax.make_jaxpr(blocked_down)(
+        jax.ShapeDtypeStruct((1024, 2048), jnp.bfloat16),
+        jax.ShapeDtypeStruct((2048, 6144), FP8),
+        jax.ShapeDtypeStruct((16, 6144), jnp.float32),
+    )
+    dense_jaxpr = jax.make_jaxpr(blocked_down)(
+        jax.ShapeDtypeStruct((1024, 12288), jnp.bfloat16),
+        jax.ShapeDtypeStruct((12288, 6144), FP8),
+        jax.ShapeDtypeStruct((16, 6144), jnp.float32),
+    )
+    assert "pallas_call" in str(moe_jaxpr)
+    assert "pallas_call" not in str(dense_jaxpr)

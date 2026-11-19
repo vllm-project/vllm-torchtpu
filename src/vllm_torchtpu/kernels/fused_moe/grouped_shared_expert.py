@@ -71,9 +71,16 @@ def _select_pallas_tile(
     bps = next((c for c in _BPS_CANDIDATES if blocks % c == 0), None)
     if bm is None or bn is None or bps is None:
         return None
-    # Avoid VMEM OOM on very large k-chunks by capping weight tile bytes.
+    # Avoid CompileTimeScopedVmemOom and slower multi-step tiles on wide dense
+    # k-chunks (e.g. k=12288, kb=768): XLA is already MXU-saturated past 4 MiB.
     if bps * kb * bn > 4 * 1024 * 1024:
         bps = _SUBLANE_ALIGN
+    kc = bps * kb
+    vmem_bytes = 2 * (bm * kc + kc * bn + 2 * bm * bn) + (
+        4 * bm * bn if blocks > bps else 0
+    )
+    if kc * bn > 4 * 1024 * 1024 or vmem_bytes > 24 * 1024 * 1024:
+        return None
     return bm, bn, bps
 
 
