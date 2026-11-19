@@ -61,6 +61,66 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 
+def derive_decoding_sequences(
+    output_tok_s: float,
+    mean_tpot_ms: float,
+) -> tuple[float, int]:
+    """Derive active decoding sequences `B = output_tok_s * (mean_tpot_ms / 1000)`."""
+    if (
+        isinstance(output_tok_s, bool)
+        or not math.isfinite(output_tok_s)
+        or output_tok_s <= 0.0
+    ):
+        msg = f"output_tok_s must be finite and > 0, got {output_tok_s!r}"
+        raise errors.MegakernelConfigError(msg)
+    if (
+        isinstance(mean_tpot_ms, bool)
+        or not math.isfinite(mean_tpot_ms)
+        or mean_tpot_ms <= 0.0
+    ):
+        msg = f"mean_tpot_ms must be finite and > 0, got {mean_tpot_ms!r}"
+        raise errors.MegakernelConfigError(msg)
+    exact_seqs = round(output_tok_s * (mean_tpot_ms / 1000.0), 6)
+    return exact_seqs, max(1, round(exact_seqs))
+
+
+def _parse_host_head_arg(raw: str | None) -> tuple[float, float, bool]:
+    """Parse `per_op=<us>,fused=<us>` into `(per_op_us, fused_us, explicit)`."""
+    if raw is None:
+        return 0.0, 0.0, False
+    stripped = raw.strip()
+    if not stripped:
+        msg = "Invalid --host-head-us: expected non-empty per_op=<us>,fused=<us>"
+        raise errors.MegakernelConfigError(msg)
+    parsed: dict[str, float] = {}
+    for token in stripped.split(","):
+        part = token.strip()
+        if "=" not in part:
+            msg = (
+                f"Invalid --host-head-us segment {part!r}; "
+                "expected key=value (per_op=<us>,fused=<us>)"
+            )
+            raise errors.MegakernelConfigError(msg)
+        key_raw, val_raw = part.split("=", 1)
+        key = key_raw.strip()
+        if key not in {"per_op", "fused"} or key in parsed:
+            msg = (
+                f"Invalid or duplicate --host-head-us key {key!r}; "
+                "allowed keys are 'per_op' and 'fused'"
+            )
+            raise errors.MegakernelConfigError(msg)
+        try:
+            val = float(val_raw.strip())
+        except ValueError as exc:
+            msg = f"Invalid float in --host-head-us {part!r}"
+            raise errors.MegakernelConfigError(msg) from exc
+        if not math.isfinite(val) or val < 0.0:
+            msg = f"--host-head-us {key} must be finite and >= 0, got {val!r}"
+            raise errors.MegakernelConfigError(msg)
+        parsed[key] = val
+    return parsed.get("per_op", 0.0), parsed.get("fused", 0.0), True
+
+
 def _parse_layer_groups(raw: str | None) -> tuple[int, ...]:
     """Parse a comma-separated layer-group string into a tuple of ints."""
     if not raw:
@@ -131,7 +191,28 @@ def _add_workload_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--batch",
         type=int,
-        help="Batch size (default: 1 for prefill, 16 for decode/verify/mixed).",
+        help=(
+            "Active sequences per step (default: 1 for prefill, 16 for "
+            "decode/verify/mixed); not open client concurrency."
+        ),
+    )
+    parser.add_argument(
+        "--decoding-seqs",
+        type=int,
+        default=None,
+        help="Active decoding sequences per step (alias for --batch).",
+    )
+    parser.add_argument(
+        "--output-tok-s",
+        type=float,
+        default=None,
+        help="Measured output throughput (tok/s) for Little's Law B derivation.",
+    )
+    parser.add_argument(
+        "--mean-tpot-ms",
+        type=float,
+        default=None,
+        help="Measured mean TPOT (ms) for Little's Law B derivation.",
     )
     parser.add_argument(
         "--isl",
@@ -270,6 +351,27 @@ def _add_mesh_and_tuning_args(parser: argparse.ArgumentParser) -> None:
         help="Per-operator launch overhead in microseconds.",
     )
     parser.add_argument(
+        "--host-head-us",
+        type=str,
+        default=None,
+        help=(
+            "Optional per-step host dispatch head "
+            "'per_op=<us>,fused=<us>' (default: 0,0)."
+        ),
+    )
+    parser.add_argument(
+        "--per-op-step-us",
+        type=float,
+        default=None,
+        help="Measured baseline per_op E2E step latency in microseconds.",
+    )
+    parser.add_argument(
+        "--step-coverage",
+        type=float,
+        default=None,
+        help="Measured fused-eligible step fraction in (0, 1].",
+    )
+    parser.add_argument(
         "--dispatch-regime",
         choices=get_args(DispatchRegime),
         default="auto",
@@ -347,13 +449,32 @@ def _resolve_cli_mesh(
     return (args.tp, args.ep, args.dp, args.pp, args.dcp)
 
 
+def _resolve_cli_batch(args: argparse.Namespace) -> tuple[int, bool]:
+    """Resolve `(batch, batch_explicit)` from CLI sequence-count flags."""
+    if args.batch is not None:
+        return args.batch, True
+    if args.decoding_seqs is not None:
+        return args.decoding_seqs, True
+    if args.output_tok_s is not None and args.mean_tpot_ms is not None:
+        _, derived_batch = derive_decoding_sequences(
+            args.output_tok_s, args.mean_tpot_ms
+        )
+        return derived_batch, True
+    default_batch = 1 if args.phase == "prefill" else RECOMMEND_DEFAULT_BATCH
+    return default_batch, False
+
+
 def _build_single_workload(
     args: argparse.Namespace,
     *,
     batch: int,
+    batch_explicit: bool = False,
     layout: ParallelLayout,
 ) -> WorkloadSpec:
     """Construct WorkloadSpec from parsed CLI arguments and layout."""
+    host_head_per_op_us, host_head_fused_us, host_head_explicit = _parse_host_head_arg(
+        args.host_head_us
+    )
     return WorkloadSpec(
         phase=args.phase,
         batch=batch,
@@ -380,6 +501,12 @@ def _build_single_workload(
         vmem_budget_mib=args.vmem_budget_mib,
         dma_buffers=args.dma_buffers,
         max_rows_per_call=args.max_rows_per_call,
+        host_head_per_op_us=host_head_per_op_us,
+        host_head_fused_us=host_head_fused_us,
+        host_head_explicit=host_head_explicit,
+        per_op_step_us=args.per_op_step_us,
+        step_coverage=args.step_coverage,
+        batch_explicit=batch_explicit,
         hbm_utilization_cap=args.hbm_utilization_cap,
         dispatch_regime=args.dispatch_regime,
         objective=args.objective,
@@ -413,7 +540,12 @@ def _validate_cli_ints(args: argparse.Namespace) -> None:
         if val < 1:
             msg = f"--{name.replace('_', '-')} must be >= 1, got {val}"
             raise errors.MegakernelConfigError(msg)
-    for name, opt_val in (("batch", args.batch), ("tp", args.tp), ("ep", args.ep)):
+    for name, opt_val in (
+        ("batch", args.batch),
+        ("decoding-seqs", args.decoding_seqs),
+        ("tp", args.tp),
+        ("ep", args.ep),
+    ):
         if opt_val is not None and opt_val < 1:
             msg = f"--{name} must be >= 1, got {opt_val}"
             raise errors.MegakernelConfigError(msg)
@@ -458,12 +590,42 @@ def _validate_cli_floats(args: argparse.Namespace) -> None:
             f"--vmem-budget-mib must be >= {MIN_VMEM_MIB}, got {args.vmem_budget_mib!r}"
         )
         raise errors.MegakernelConfigError(msg)
+    _parse_host_head_arg(args.host_head_us)
+    if args.per_op_step_us is not None and (
+        not math.isfinite(args.per_op_step_us) or args.per_op_step_us <= 0.0
+    ):
+        msg = f"--per-op-step-us must be finite and > 0, got {args.per_op_step_us!r}"
+        raise errors.MegakernelConfigError(msg)
+    if args.step_coverage is not None and (
+        not math.isfinite(args.step_coverage) or not (0.0 < args.step_coverage <= 1.0)
+    ):
+        msg = f"--step-coverage must be in (0, 1], got {args.step_coverage!r}"
+        raise errors.MegakernelConfigError(msg)
+
+
+def _validate_batch_exclusivity(args: argparse.Namespace) -> None:
+    """Enforce mutual exclusion and completeness on CLI sequence-count flags."""
+    has_batch = args.batch is not None
+    has_dec_seqs = args.decoding_seqs is not None
+    has_littles = args.output_tok_s is not None or args.mean_tpot_ms is not None
+    if sum((has_batch, has_dec_seqs, has_littles)) > 1:
+        msg = (
+            "Specify at most one of --batch, --decoding-seqs, or "
+            "(--output-tok-s with --mean-tpot-ms)"
+        )
+        raise errors.MegakernelConfigError(msg)
+    if has_littles:
+        if args.output_tok_s is None or args.mean_tpot_ms is None:
+            msg = "--output-tok-s and --mean-tpot-ms must be provided together"
+            raise errors.MegakernelConfigError(msg)
+        derive_decoding_sequences(args.output_tok_s, args.mean_tpot_ms)
 
 
 def _validate_cli_args(args: argparse.Namespace) -> None:
     """Validate CLI scalar bounds before running recommendations or sweeps."""
     _validate_cli_ints(args)
     _validate_cli_floats(args)
+    _validate_batch_exclusivity(args)
 
 
 def _run_sweep_command(
@@ -472,7 +634,10 @@ def _run_sweep_command(
     chip_spec: ChipSpec,
 ) -> int:
     """Execute `--regime-sweep` / `--html` and emit stdout/HTML/JSON outputs."""
-    base_wl = WorkloadSpec(
+    host_head_per_op_us, host_head_fused_us, host_head_explicit = _parse_host_head_arg(
+        args.host_head_us
+    )
+    base_workload = WorkloadSpec(
         tp=args.tp or 1,
         ep=args.ep or 1,
         dp=args.dp,
@@ -485,12 +650,18 @@ def _run_sweep_command(
         vmem_budget_mib=args.vmem_budget_mib,
         dma_buffers=args.dma_buffers,
         max_rows_per_call=args.max_rows_per_call,
+        host_head_per_op_us=host_head_per_op_us,
+        host_head_fused_us=host_head_fused_us,
+        host_head_explicit=host_head_explicit,
+        per_op_step_us=args.per_op_step_us,
+        step_coverage=args.step_coverage,
+        batch_explicit=True,
         hbm_utilization_cap=args.hbm_utilization_cap,
         objective=args.objective,
         dispatch_regime=args.dispatch_regime,
     )
     opts = RegimeSweepOptions(
-        base_workload=base_wl,
+        base_workload=base_workload,
         tp=args.tp,
         ep=args.ep,
         dp=args.dp,
@@ -506,14 +677,17 @@ def _run_sweep_command(
     if args.json is not None:
         _emit_json(sweep.to_dict(), args.json)
     elif args.regime_sweep:
-        sys.stdout.write(format_regime_table(sweep) + "\n")
+        sys.stdout.write(format_regime_table(sweep, unresolved=args.unresolved) + "\n")
     return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the fusion-scope advisor command-line interface."""
     parser = build_arg_parser()
-    args = parser.parse_args(argv)
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if argv_list and argv_list[0] == "estimate":
+        argv_list = argv_list[1:]
+    args = parser.parse_args(argv_list)
     _validate_cli_args(args)
 
     if args.config and not Path(args.config).is_file():
@@ -542,12 +716,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         layer_groups=_parse_layer_groups(args.layer_groups),
     )
 
-    batch_val = (
-        args.batch
-        if args.batch is not None
-        else (1 if args.phase == "prefill" else RECOMMEND_DEFAULT_BATCH)
+    batch_val, batch_explicit = _resolve_cli_batch(args)
+    workload = _build_single_workload(
+        args,
+        batch=batch_val,
+        batch_explicit=batch_explicit,
+        layout=layout,
     )
-    workload = _build_single_workload(args, batch=batch_val, layout=layout)
     report = advise(
         profile,
         workload,
