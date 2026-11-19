@@ -1124,6 +1124,29 @@ def test_ltx2_per_batch_timestep_patch_fails_on_signature_drift(monkeypatch):
         patches._patch_ltx2_per_batch_timestep()
 
 
+def test_ltx2_split_rope_lane_mask_built_on_host(monkeypatch):
+    # The cached lane mask is computed on the host and uploaded once: no
+    # arange is created on the target device, where it would stay a deferred
+    # graph until the first rotation reads it.
+    arange_devices = []
+    real_arange = torch.arange
+
+    def recording_arange(*args, **kwargs):
+        arange_devices.append(kwargs.get("device"))
+        return real_arange(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "arange", recording_arange)
+    omni_rope._first_half_lanes.cache_clear()
+    device = torch.device("cpu")
+    lanes = omni_rope._first_half_lanes(16, 8, device)
+    assert arange_devices == [None]
+    assert lanes.device == device
+    assert lanes.tolist() == ([True] * 4 + [False] * 4) * 2
+    assert omni_rope._first_half_lanes(16, 8, device) is lanes
+    assert arange_devices == [None]
+    omni_rope._first_half_lanes.cache_clear()
+
+
 @pytest.mark.parametrize("batch", [1, 2], ids=["b1_c4u2", "b2_c2u4"])
 def test_ltx2_split_rope_shard_cache_reused_for_sp_views(ltx2, table_syncs, batch):
     torch.manual_seed(0)
