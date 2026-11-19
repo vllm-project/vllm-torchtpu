@@ -87,6 +87,7 @@ def _build_dedup_moe_kernel(
     overlap_prologue_sync=False,
     decode_only_opts=False,
     chunked_epilogue=False,
+    chunked_epilogue_decode=False,
 ):
   """Build the pallas_call and the function that invokes it.
 
@@ -225,6 +226,7 @@ def _build_dedup_moe_kernel(
       overlap_prologue_sync=overlap_prologue_sync,
       decode_only_opts=decode_only_opts,
       chunked_epilogue=chunked_epilogue,
+      chunked_epilogue_decode=chunked_epilogue_decode,
   )
   fused_tg = cfg.fuse_tg_assemble
   if fused_tg:

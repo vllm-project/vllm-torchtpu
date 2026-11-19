@@ -236,7 +236,8 @@ class FusedKernelConfig:
   # decode_only_opts: when True in a global kernel_options dict, scope decode
   # M01 knobs (ewr, pf3, ftc, sww, pbs, ops) strictly to decode
   # (push_from_vmem and waves <= 2), keeping W>=4 prefill free of M01 overhead,
-  # and disable prefill-oriented chunked_epilogue on decode.
+  # and disable prefill-oriented chunked_epilogue on decode (unless
+  # chunked_epilogue_decode=True, the pre-0026 behaviour: CE on every bucket).
   decode_only_opts: bool = False
   # chunked_epilogue: N-chunk W2 into 3D VMEM `down_vm` (overlapping amax +
   # 3D layout repack with W2 MXU) and fuse FP8 rowquant directly into `out_vm`
@@ -372,6 +373,7 @@ class FusedKernelConfig:
       overlap_prologue_sync: bool = False,
       decode_only_opts: bool = False,
       chunked_epilogue: bool = False,
+      chunked_epilogue_decode: bool = False,
   ) -> "FusedKernelConfig":
     """Validates build parameters, resolves the weight slots and builds the config.
 
@@ -558,7 +560,7 @@ class FusedKernelConfig:
     height_rungs = plan_lib.tail_height_rungs(tile_m, rungs=num_height_rungs)
     use_chunked_epilogue = (
         bool(chunked_epilogue)
-        and not (decode_only_opts and is_decode)
+        and not (decode_only_opts and is_decode and not chunked_epilogue_decode)
         and weight_format == arg.WeightFormat.FP8
         and wire_dtype is arg.FP8
         and lane_blocks % plan_lib.DOWN_CHUNK_LANE_BLOCKS == 0
