@@ -831,13 +831,12 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
           is only ours to do if we are the one issuing it;
         - the fused EP kernel does the exchange inside its own program.
 
-        The fused half asks `fused_moe_ep_supported` about this method, not
-        `envs.USE_MOE_FUSED_EP_KERNEL`: the env var only says the operator
-        asked for the kernel, while `prebuild_fused_moe_ep` is what decides
-        whether this layer was actually armed. Claiming ownership on the
-        request would strip vLLM's collectives in every configuration prebuild
-        refuses -- TP, over the SMEM bound, under the token threshold, or
-        a weight or routing layout the kernel cannot serve.
+        The fused half needs both the request (`envs.USE_MOE_FUSED_EP_KERNEL`)
+        and the arming: `fused_moe_ep_supported` (v2 or v3) asks this method
+        whether `prebuild_fused_moe_ep` armed this layer. Claiming ownership on
+        the request alone would strip vLLM's collectives in every
+        configuration prebuild refuses -- over the SMEM bound, under the token
+        threshold, or a weight or routing layout the kernel cannot serve.
         """
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep_supported as fused_moe_ep_v2_supported,
@@ -1275,9 +1274,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # Armed layer: the runner no longer runs the shared expert or the
             # all-reduce, so this returns the reduced shared + routed sum.
             return moe_tp_decode_forward(self, layer, x, router_logits)
-        if envs.USE_MOE_FUSED_EP_KERNEL and (
-            fused_moe_ep_v3_supported(self) or fused_moe_ep_v3_supported(layer)
-        ):
+        # The method holds the layer's eligibility (copied by prebuild).
+        if envs.USE_MOE_FUSED_EP_KERNEL and fused_moe_ep_v3_supported(self):
             return self._apply_owning_dispatch_v3(
                 layer,
                 x,
@@ -1362,26 +1360,14 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             retain_fused_ep_graph_inputs,
         )
 
-        if use_fused_kernel and (
-            fused_moe_ep_supported(self) or fused_moe_ep_supported(layer)
-        ):
+        if use_fused_kernel and fused_moe_ep_supported(self):
             w13, w2, s13, s2 = (
                 layer.w13_weight,
                 layer.w2_weight,
                 layer.w13_weight_scale_inv,
                 layer.w2_weight_scale_inv,
             )
-            if (
-                getattr(layer, "_lowtok_has_copies", False)
-                and getattr(layer, "_lowtok_tables", None) is not None
-            ):
-                zero = (
-                    layer._lowtok_tables[:1]
-                    + layer._lowtok_prim[:1]
-                    + layer._lowtok_copy[:1]
-                    + layer._lowtok_hot1h[0, :1].to(torch.int32)
-                ) * 0
-                router_logits = router_logits + zero.to(router_logits.dtype)
+            router_logits = _retain_copy_tables(layer, router_logits)
             out = fused_moe_ep(x, w13, w2, s13, s2, router_logits)
             experts_start = layer._experts_start
             if experts_start is not None:
@@ -1420,18 +1406,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             assert op is not None
             out = moe_lowtok_scores.apply(op, layer, x, router_logits)
             return retain_fused_ep_graph_inputs(out)
+        # A layer with copy tables always has the scores op, which returned
+        # above, so this path never needs to keep them as graph inputs.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
-        if (
-            getattr(layer, "_lowtok_has_copies", False)
-            and getattr(layer, "_lowtok_tables", None) is not None
-        ):
-            zero = (
-                layer._lowtok_tables[:1]
-                + layer._lowtok_prim[:1]
-                + layer._lowtok_copy[:1]
-                + layer._lowtok_hot1h[0, :1].to(torch.int32)
-            ) * 0
-            topk_ids = topk_ids + zero
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                 topk_ids, topk_weights
@@ -1970,6 +1947,29 @@ def resolve_online_fp8(
     method.online_fp8_policy = policy
     policy.selected[prefix] = aliases
     return method
+
+
+def _retain_copy_tables(layer: TpuRoutedExperts, tensor: torch.Tensor) -> torch.Tensor:
+    """`tensor` plus a zero read from the layer's few-token copy tables, when
+    it has them.
+
+    Other compiled shapes of the same forward take the few-token scores op,
+    which reads those tables, so the fused kernel's shapes keep them as graph
+    inputs too, as `fused_moe_ep_v3.retain_fused_ep_graph_inputs` does for the
+    fused EP buffers: the shape-specific graphs keep one set of inputs.
+    """
+    if (
+        getattr(layer, "_lowtok_has_copies", False)
+        and getattr(layer, "_lowtok_tables", None) is not None
+    ):
+        zero = (
+            layer._lowtok_tables[:1]
+            + layer._lowtok_prim[:1]
+            + layer._lowtok_copy[:1]
+            + layer._lowtok_hot1h[0, :1].to(torch.int32)
+        ) * 0
+        tensor = tensor + zero.to(tensor.dtype)
+    return tensor
 
 
 def _fused_kernel_takes(rows: int, gate: int) -> bool:

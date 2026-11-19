@@ -15,7 +15,10 @@
 quantized_matmul.util.RECIPROCAL_SCALE: by default main's arithmetic (divide
 by the scale), with the flag the reciprocal multiply and the scale-1.0 clamp
 in the tensor's own dtype. Each is checked bit for bit against its formula
-on CPU, on values where the two formulas round to different FP8 values."""
+on CPU. At scales 0.37 and 1.7 the tensor holds values where the two formulas
+round to different FP8 values, so those cases tell the branches apart; at
+scale 1.0 both formulas give the same bits, so that case checks the result
+only, not which branch ran."""
 
 import pytest
 import torch

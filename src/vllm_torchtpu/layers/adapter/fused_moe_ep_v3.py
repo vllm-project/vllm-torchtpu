@@ -575,14 +575,14 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
         return
     if tp > 1:
         # With sequence parallelism each rank passes its own rows to the kernel.
+        gate = _step_min_tokens()
         logger.info_once(
             "Fused EP MoE under tensor parallelism (tp_size=%d) with sequence "
             "parallelism: each rank's own rows, steps of at least %d rows "
             "per rank.",
             tp,
-            _step_min_tokens(),
+            gate,
         )
-        gate = _step_min_tokens()
         if _sp.min_rows() // tp < gate:
             logger.warning_once(
                 "Fused EP MoE: the sequence-parallel threshold of %d rows gives "
@@ -616,9 +616,10 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
     w1, w2 = layer.w13_weight, layer.w2_weight
     w1_scale = layer.w13_weight_scale_inv
     w2_scale = layer.w2_weight_scale_inv
-    # under a copies placement the rank's tensors carry copy slots after its
-    # primaries; the prompt path routes to primaries only and streams them alone
-    # (the forward passes the same views)
+    # Under a copies placement the rank's tensors carry copy slots after its
+    # primaries. The op is built for the primaries alone (experts_per_shard),
+    # and routing selects primaries only; the FP8 method's forward passes the
+    # layer's full tensors, the copy slots included.
     from vllm_torchtpu.layers.adapter import expert_placement as _placement
 
     n_prim = getattr(layer, _placement.PRIMARY_EXPERTS_ATTR, None)

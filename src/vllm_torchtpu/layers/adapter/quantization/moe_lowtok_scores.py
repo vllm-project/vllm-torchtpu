@@ -156,7 +156,7 @@ def _install_copy_tables(layer: RoutedExperts) -> None:
     layer = cast("TpuRoutedExperts", layer)
     layer_idx = expert_placement.layer_index(getattr(layer, "layer_name", "") or "")
     assert layer_idx is not None
-    rank = int(getattr(layer.moe_config, "ep_rank", 0))
+    rank = int(layer.moe_config.ep_rank)
     owned = int(expert_placement.owned())
     gid, prim, copy = expert_placement.holder_tables(layer_idx, rank)
     order = expert_placement.hot_order(layer_idx)
