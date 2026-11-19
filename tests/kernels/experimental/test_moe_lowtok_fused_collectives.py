@@ -331,18 +331,24 @@ def _check(case):
     assert case["rel_l2"] <= REL_L2, case
 
 
-def _check_op(case, fused_kernel, fp8_rows):
+def _check_op(case, fused_kernel, fp8_rows, served_path_has_kernel_roundings=True):
     """The program took the form its row count selects and summed the
-    engines' rows: the fused kernel against the float32 reference of its
-    roundings; above the cap, against each core's moe_scores_fn summed over
-    the cores (the path's own arithmetic, so what is checked is the gather,
-    reduce-scatter and all-reduce around it)."""
+    engines' rows: against the float32 reference of the kernel's roundings
+    and, above the cap, also against each core's moe_scores_fn summed over
+    the cores (the path's own arithmetic, which isolates the gather,
+    reduce-scatter and all-reduce around it). The grouped matmul quantizes
+    its activations in blocks, so where it serves above the cap
+    (``served_path_has_kernel_roundings=False``) only its own sum is checked
+    there."""
     assert case["fused_kernel"] is fused_kernel, case
     assert case["fp8_rows"] is fp8_rows, case
     assert case["all_gather"] is not fused_kernel, case
     assert case["nan"] == 0, case
     assert case["padded_rows_zero"], case
-    assert case["rel_l2" if fused_kernel else "rel_l2_served"] <= REL_L2, case
+    if fused_kernel or served_path_has_kernel_roundings:
+        assert case["rel_l2"] <= REL_L2, case
+    if not fused_kernel:
+        assert case["rel_l2_served"] <= REL_L2, case
 
 
 def _race_control():
@@ -648,7 +654,7 @@ def test_compiled_op_program_at_the_qwen3_5_decode_shapes_on_tpu(
     rows = Q35_OP_CASES[name][0]
     run = _op_runner(tpu_mesh, Q35_OP_CAP, Q35_GEOMETRY)
     case = _op_summary(*run(rows), rows)
-    _check_op(case, *Q35_OP_CASES[name][1:])
+    _check_op(case, *Q35_OP_CASES[name][1:], served_path_has_kernel_roundings=False)
 
 
 if __name__ == "__main__":
