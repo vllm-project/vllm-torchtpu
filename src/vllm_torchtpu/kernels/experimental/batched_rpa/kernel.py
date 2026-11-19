@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import functools
 from collections.abc import Callable
 from typing import cast
 
@@ -368,6 +369,40 @@ def fetch_compute_metadata(
     )
 
 
+def _all_items_unmasked(
+    stitch_meta: StitchMetadata,
+    step_meta: ComputeMetadata,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> jax.Array | None:
+    """Whether no batch item of this step needs the QK or V mask.
+
+    True when, for every item, the whole KV block holds valid tokens and its
+    last token precedes the item's first query, so the causal mask keeps every
+    score. None when the configuration always masks (decode, sliding window,
+    a restricted attention scope).
+    """
+    if (
+        cfgs.mode != configs.RpaCase.MIXED
+        or cfgs.model.sliding_window is not None
+        or cfgs.serve.attention_scope != configs.AttentionScope.FULL
+    ):
+        return None
+    full = None
+    for b_idx in range(cfgs.batch_size):
+        valid_kv = (
+            stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
+        )
+        # causal_offset = k_start - q_start: the last key precedes the first
+        # query iff causal_offset <= 1 - bkv_sz.
+        item = jnp.logical_and(
+            valid_kv == cfgs.bkv_sz,
+            step_meta.causal_offset[b_idx] <= 1 - cfgs.bkv_sz,
+        )
+        full = item if full is None else jnp.logical_and(full, item)
+    return full
+
+
 def generate_mask(
     shape: tuple[int, int, int, int],
     *,
@@ -499,6 +534,55 @@ def rpa_body(
         cfgs=cfgs,
     )
 
+    full = _all_items_unmasked(stitch_meta, step_meta, cfgs=cfgs)
+    compute = functools.partial(
+        rpa_compute,
+        step,
+        q_vref,
+        kv_in_vref,
+        o_vref,
+        lse_o_vref,
+        schedule_ref,
+        m_scratch_ref,
+        l_scratch_ref,
+        acc_scratch_ref,
+        stitch_meta=stitch_meta,
+        step_meta=step_meta,
+        cfgs=cfgs,
+    )
+    if full is None:
+        compute(masked=True)
+    else:
+        # Blocks wholly below the causal diagonal (most of a long prefill) skip
+        # the mask iotas, the mask select and the V zeroing.
+        lax.cond(
+            full,
+            lambda: compute(masked=False),
+            lambda: compute(masked=True),
+        )
+
+
+def rpa_compute(
+    step: jax.Array,
+    q_vref: jax.Ref,
+    kv_in_vref: jax.Ref,
+    o_vref: jax.Ref,
+    lse_o_vref: jax.Ref | None,
+    schedule_ref: schedule.RpaSchedule,
+    m_scratch_ref: jax.Ref,
+    l_scratch_ref: jax.Ref,
+    acc_scratch_ref: jax.Ref,
+    *,
+    stitch_meta: StitchMetadata,
+    step_meta: ComputeMetadata,
+    masked: bool,
+    cfgs: configs.RpaConfigs,
+):
+    """Loads one step's Q and KV, runs flash attention and stores the output.
+
+    `masked=False` drops the QK mask and the V zeroing; only for steps where
+    `_all_items_unmasked` holds.
+    """
     # Step 2b: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
     q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
@@ -528,7 +612,7 @@ def rpa_body(
         pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
         token = (
             lax.broadcasted_iota(jnp.int32, (pack_dim, cfgs.bkv_sz), 1)
-            if cfgs.serve.mask_invalid_v
+            if masked and cfgs.serve.mask_invalid_v
             else None
         )
         for b_idx in range(cfgs.batch_size):
@@ -577,7 +661,7 @@ def rpa_body(
             v_b.append(jnp.stack(vs, axis=0))
     else:
         token = None
-        if cfgs.serve.mask_invalid_v:
+        if masked and cfgs.serve.mask_invalid_v:
             token = lax.broadcasted_iota(
                 jnp.int32, (cfgs.bkv_sz, cfgs.aligned_kv_head_dim), 0
             )
@@ -631,16 +715,20 @@ def rpa_body(
         q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
         q_slice = slice(q_start, q_end)
 
-        custom_mask = generate_mask(
-            shape=(
-                cfgs.batch_size,
-                cfgs.model.num_kv_heads,
-                q_end - q_start,
-                cfgs.bkv_sz,
-            ),
-            bq_start=bq_start,
-            step_meta=step_meta,
-            cfgs=cfgs,
+        custom_mask = (
+            generate_mask(
+                shape=(
+                    cfgs.batch_size,
+                    cfgs.model.num_kv_heads,
+                    q_end - q_start,
+                    cfgs.bkv_sz,
+                ),
+                bq_start=bq_start,
+                step_meta=step_meta,
+                cfgs=cfgs,
+            )
+            if masked
+            else None
         )
 
         p, alpha_list, m_next, l_next, m_carry, l_carry = (
