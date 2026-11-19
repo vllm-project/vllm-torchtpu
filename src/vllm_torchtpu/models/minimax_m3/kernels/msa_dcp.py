@@ -934,6 +934,12 @@ def msa_attend_dcp(
             q, kv_cache, keys, *args, head_major=True, **common, scale_cache=scale_cache
         )
     if num_heads == 1:
+        if msa_attention_lse.PREFILL_FP8_BODY and num_tokens >= _MIN_CANDIDATE_TOKENS:
+            msa_attention_lse._proof(
+                "TPU_MINIMAX_M3_MSA_PREFILL_FP8_BODY",
+                f"MSA prefill attention chunked body {msa_attention_lse.PREFILL_FP8_BODY}",
+            )
+            common["prefill_body"] = msa_attention_lse.PREFILL_FP8_BODY
         return msa_attention_lse.msa_sparse_attention_lse(
             q, kv_cache, keys[:, 0], *args, head=0, head_major=True, **common
         )
