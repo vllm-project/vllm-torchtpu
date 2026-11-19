@@ -542,7 +542,11 @@ def fused_ep_moe_v2(
         "fused_ep_moe_v2: token-gather table by %s, scale slab by %s; "
         "slab scatters (where left) by scatter-%s",
         "sort" if gather_by_sort else "scatter",
-        "lookup" if scale_by_lookup else "scatter",
+        (
+            ("lookup" if scale_by_lookup else "scatter")
+            if form.quantized_activations
+            else "none"
+        ),
         "set" if slab_by_set else "add",
     )
 
@@ -751,7 +755,9 @@ def fused_ep_moe_v2(
         # pairs rather than a scatter through slab_row (see
         # shard_token_gather_sorted). With the scale slab built from that
         # table by lookup, nothing reads slab_row any more and its per-pair
-        # plan pass drops out of the program as well.
+        # plan pass drops out of the program as well. The barrier then holds
+        # the sort; a scale-slab scatter left past the lookup's budget reads
+        # slab_row outside it, which has not been measured either way.
         if gather_by_sort:
             sort_ids = pairs_g
             if t_local >= AGQ_MIN_LOCAL_TOKENS:

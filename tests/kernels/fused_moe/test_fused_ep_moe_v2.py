@@ -761,29 +761,43 @@ def test_scale_slab_lookup_and_scatter_are_bit_exact(
 
 @pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
 @pytest.mark.parametrize(
-    "shape",
+    "shape,shared_weights",
     [
-        pytest.param(dict(SMALL), id="small"),
-        pytest.param(dict(PROD, tokens=PROD_TOKENS[0]), id="prod_t2048"),
-        pytest.param(dict(PROD, tokens=PROD_TOKENS[1]), id="prod_t16384"),
+        pytest.param(dict(SMALL), None, id="small"),
+        # The production weights are 6.4GB, so these shapes run against the
+        # module's one build of them rather than making their own.
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[0]), "production_weights", id="prod_t2048"
+        ),
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[1]), "production_weights", id="prod_t16384"
+        ),
     ],
 )
-def test_token_gather_sort_and_scatter_are_bit_exact(monkeypatch, sharded_plan, shape):
+def test_token_gather_sort_and_scatter_are_bit_exact(
+    request, monkeypatch, sharded_plan, shape, shared_weights
+):
     """The token-gather table built by sort gives the layer the scatter's output.
 
     The scatter form is forced by declaring the sort keys too wide for int32;
-    the TensorCore builds are forced on, as in the lookup test.
+    the TensorCore builds are forced on, as in the lookup test. The two forced
+    builds must lower to different programs, so the agreement is not vacuous:
+    were the choice ever dropped from the layer's shard_map cache key, the
+    second build would reuse the first one's body and fail here.
     """
     monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
     mesh = _mesh()
-    w1, w2, w1_scale, w2_scale = _make_weights(
-        mesh,
-        60,
-        hidden=shape["hidden"],
-        inter=shape["inter"],
-        e_total=shape["e_total"],
-        weight_format=WeightFormat.FP8,
-    )
+    if shared_weights is not None:
+        w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
+    else:
+        w1, w2, w1_scale, w2_scale = _make_weights(
+            mesh,
+            60,
+            hidden=shape["hidden"],
+            inter=shape["inter"],
+            e_total=shape["e_total"],
+            weight_format=WeightFormat.FP8,
+        )
     x, gating = _make_inputs(
         mesh,
         61,
@@ -791,19 +805,14 @@ def test_token_gather_sort_and_scatter_are_bit_exact(monkeypatch, sharded_plan, 
         hidden=shape["hidden"],
         e_total=shape["e_total"],
     )
-    outs = []
-    for fits in (True, False):
-        monkeypatch.setattr(
-            layer, "token_gather_sort_fits", lambda *_a, fits=fits, **_k: fits
-        )
-        outs.append(
-            fused_ep_moe_v2(
-                x,
-                w1,
-                w2,
-                w1_scale,
-                w2_scale,
-                gating,
+
+    def make_run():
+        # A fresh function per build: jax.jit caches the trace by function, and
+        # the form is read while tracing, so reusing one `run` would lower the
+        # first build's program again.
+        def run(*args):
+            return fused_ep_moe_v2(
+                *args,
                 topk=shape["topk"],
                 renormalize=True,
                 mesh=mesh,
@@ -811,8 +820,20 @@ def test_token_gather_sort_and_scatter_are_bit_exact(monkeypatch, sharded_plan, 
                 weight_format=WeightFormat.FP8,
                 sharded_plan=sharded_plan,
             )
+
+        return run
+
+    args = (x, w1, w2, w1_scale, w2_scale, gating)
+    outs, programs = {}, {}
+    for fits in (True, False):
+        monkeypatch.setattr(
+            layer, "token_gather_sort_fits", lambda *_a, fits=fits, **_k: fits
         )
-    np.testing.assert_array_equal(np.asarray(outs[0]), np.asarray(outs[1]))
+        run = make_run()
+        programs[fits] = jax.jit(run).lower(*args).as_text()
+        outs[fits] = np.asarray(run(*args))
+    assert programs[True] != programs[False]
+    np.testing.assert_array_equal(outs[True], outs[False])
 
 
 @pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])
