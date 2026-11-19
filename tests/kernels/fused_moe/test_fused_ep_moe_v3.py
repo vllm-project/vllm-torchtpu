@@ -672,6 +672,36 @@ def test_the_layer_takes_silu_only(one_cpu_shard):
 
 
 @pytest.mark.cpu_test
+def test_untested_routing_forms_are_refused():
+    """No TPU reference case runs a caller's routing, the router's raw
+    weights or a mesh with replica axes; the router's own renormalized top-k
+    on a one-axis mesh is admitted."""
+    from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
+
+    def check(caller_routing=False, raw_weights=False, replicas=1):
+        v3_layer.check_tested_routing(
+            caller_routing=caller_routing, raw_weights=raw_weights, replicas=replicas
+        )
+
+    check()
+    with pytest.raises(NotImplementedError, match="caller's routing"):
+        check(caller_routing=True)
+    with pytest.raises(NotImplementedError, match="raw weights"):
+        check(raw_weights=True)
+    with pytest.raises(NotImplementedError, match="2 replicas"):
+        check(replicas=2)
+
+
+@pytest.mark.cpu_test
+def test_the_layer_refuses_a_caller_routing(one_cpu_shard):
+    import jax.numpy as jnp
+
+    routing = (jnp.zeros((32, 2), jnp.int32), jnp.ones((32, 2), jnp.float32))
+    with pytest.raises(NotImplementedError, match="caller's routing"):
+        one_cpu_shard(routing=routing)
+
+
+@pytest.mark.cpu_test
 def test_the_scatter_drops_the_rows_the_shard_tables_drop(one_cpu_shard, monkeypatch):
     """The shard tables write routed_rows_per_shard as the drop row, and the
     token table is padded to whole LANES-row blocks past it when the bound
