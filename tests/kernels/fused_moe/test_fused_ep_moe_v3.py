@@ -86,7 +86,7 @@ COPY_SLOTS = {"copy_slots": 2}
 # the mesh axis. mode: (shard index operand, sorted rows, cases)
 MODES = {
     "bridge_sorted": (True, True, list(CASES)),
-    "bridge_transport": (True, False, [c for c in CASES if c not in COPY_SLOTS]),
+    "bridge_transport": (True, False, list(CASES)),
     "kernel_sorted": (False, True, ["spread"]),
 }
 
@@ -596,7 +596,8 @@ def test_the_tables_program_addresses_every_mesh_axis(one_cpu_shard, monkeypatch
 def test_the_layer_cache_keys_on_the_module_flags(one_cpu_shard):
     """A build per value of each flag the build bakes in: the jit wrapper
     (WRAP_IN_JIT) and the programs' side-effect declaration
-    (layout.SIDE_EFFECTS)."""
+    (layout.SIDE_EFFECTS). The third, layout.SHARD_INDEX_OPERAND, is covered
+    by the shard-index mode tests above."""
     from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
     from vllm_torchtpu.kernels.fused_moe.v3 import layout as v3_layout
 
@@ -782,6 +783,7 @@ def _run_case(name, mode, result_rows):
     from jax.sharding import PartitionSpec as P
 
     from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
+    from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
     from vllm_torchtpu.kernels.fused_moe.v3 import layout as v3_layout
 
     bridge, sorted_rows, _ = MODES[mode]
@@ -816,12 +818,12 @@ def _run_case(name, mode, result_rows):
             drop_nan_rows=True,
         )
 
-    saved = (v3_layout.SHARD_INDEX_OPERAND, v3_layout.SIDE_EFFECTS)
-    v3_layout.SHARD_INDEX_OPERAND, v3_layout.SIDE_EFFECTS = bridge, not bridge
-    try:
+    # The bridge modes run with the module flags the torch bridge sets.
+    with pytest.MonkeyPatch.context() as flags:
+        flags.setattr(v3_layout, "SHARD_INDEX_OPERAND", bridge)
+        flags.setattr(v3_layout, "SIDE_EFFECTS", not bridge)
+        flags.setattr(v3_layer, "WRAP_IN_JIT", not bridge)
         got = np.asarray(jax.block_until_ready(jax.jit(run)(*args)))
-    finally:
-        v3_layout.SHARD_INDEX_OPERAND, v3_layout.SIDE_EFFECTS = saved
     rows = _valid_rows(real, valid)
     weights, chosen = _routes(logits, real, valid)
     want = _reference(x, w1, w2, s1, s2, weights, chosen, rows, config)
