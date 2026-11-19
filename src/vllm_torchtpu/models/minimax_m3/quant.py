@@ -112,17 +112,12 @@ def _fp8_cast_applies(layer: torch.nn.Module, rows: int) -> bool:
 def fp8_norm_applies(qkv_proj: torch.nn.Module, rows: int) -> bool:
     """TPU_MINIMAX_M3_FP8_CAST_NORM: the input RMSNorm emits e4m3 for a qkv
     projection that casts its activations at this bucket."""
-    applies = (
+    return (
         envs.TPU_MINIMAX_M3_FP8_CAST_NORM
         and isinstance(getattr(qkv_proj, "quant_method", None), MiniMaxM3Mxfp8LinearMethod)
         and qkv_proj.weight.dtype == torch.float8_e4m3fn
         and _fp8_cast_applies(qkv_proj, rows)
     )
-    if applies:
-        logger.info_once(
-            "TPU_MINIMAX_M3_FP8_CAST_NORM=1: input RMSNorm emits e4m3 for the qkv projection."
-        )
-    return applies
 
 
 def fused_add_rms_norm_e4m3(
@@ -304,6 +299,11 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
                 envs.TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS,
                 envs.TPU_MINIMAX_M3_FP8_CAST_SKIP or "none",
             )
+            if envs.TPU_MINIMAX_M3_FP8_CAST_NORM:
+                logger.info_once(
+                    "TPU_MINIMAX_M3_FP8_CAST_NORM=1: input RMSNorms emit e4m3 for "
+                    "casting qkv projections."
+                )
         logger.debug(
             "MXFP8 linear %s kept e4m3: %d of %d elements below e4m3's normal "
             "range after the block shift.",
