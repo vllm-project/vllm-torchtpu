@@ -175,7 +175,7 @@ class CorePlan:
     stream: StreamParams
     comm: CommParams
     modules: dict[str, Any]
-    phase_map: dict[str, str]
+    phase_map: dict[str, frozenset[str]]
     vmem_bytes: int
     vmem_shapes: dict[str, tuple[tuple[int, ...], Any]]
     NACC: int
@@ -199,7 +199,7 @@ def _normalize_scratch_reqs(
 
 def _merge_scratch(
     scratch: dict[str, Any],
-    phase_map: dict[str, str],
+    phase_map: dict[str, frozenset[str]],
     reqs: list[ScratchReq],
 ) -> None:
     """Merge module `ScratchReq`s into `scratch`, overlaying compatible phases."""
@@ -215,16 +215,16 @@ def _merge_scratch(
             )
         if r.name not in scratch:
             scratch[r.name] = r.spec
-            phase_map[r.name] = r.phase
+            phase_map[r.name] = frozenset({r.phase})
             continue
 
         cur_spec = scratch[r.name]
-        cur_phase = phase_map[r.name]
+        cur_phases = phase_map[r.name]
         cur_ms = cur_spec.memory_space
         if (
             r.phase != "persistent"
-            and cur_phase != "persistent"
-            and r.phase != cur_phase
+            and "persistent" not in cur_phases
+            and r.phase not in cur_phases
             and ms in (pltpu.MemorySpace.VMEM, pltpu.MemorySpace.SMEM)
             and ms == cur_ms
             and r.spec.dtype == cur_spec.dtype
@@ -232,13 +232,14 @@ def _merge_scratch(
         ):
             max_shape = tuple(max(a, b) for a, b in zip(cur_spec.shape, r.spec.shape))
             scratch[r.name] = cur_ms(max_shape, cur_spec.dtype)
-            phase_map[r.name] = f"{cur_phase}|{r.phase}"
-        elif r.spec == cur_spec and r.phase == cur_phase:
+            phase_map[r.name] = cur_phases | {r.phase}
+        elif r.spec == cur_spec and cur_phases == frozenset({r.phase}):
             continue
         else:
+            cur_str = "|".join(sorted(cur_phases))
             raise MegakernelConfigError(
                 f"Conflicting scratch buffer {r.name!r}: "
-                f"phase {r.phase!r} vs {cur_phase!r}"
+                f"phase {r.phase!r} vs {cur_str!r}"
             )
 
 
@@ -257,7 +258,12 @@ def build_scratch(
     `ex.tiles=None` uses the default tiles fitted to the model's VMEM budget
     (`fit_default_tiles`).
     """
-    if p is not None and ex.tiles is None and p.ex.tiles is not None:
+    if (
+        p is not None
+        and ex.tiles is None
+        and p.ex.tiles is not None
+        and dataclasses.replace(p.ex, tiles=None) == ex
+    ):
         ex = p.ex
     else:
         ex = fit_default_tiles(model_spec, ex)
@@ -309,7 +315,8 @@ def build_scratch(
 
     scratch.update(stage_scratch(cp))
 
-    phase_map: dict[str, str] = {k: "persistent" for k in scratch}
+    persistent_phases = frozenset({"persistent"})
+    phase_map: dict[str, frozenset[str]] = {k: persistent_phases for k in scratch}
 
     module_plans: dict[str, Any] = dict(p.module_params)
     for m in model_spec.all_modules():
@@ -319,22 +326,22 @@ def build_scratch(
     if typed:
         for k in p.static_kinds:
             scratch["dring_" + k] = pltpu.VMEM((NBD,) + vshape[k], vdtype[k])
-            phase_map["dring_" + k] = "persistent"
+            phase_map["dring_" + k] = persistent_phases
         for k in p.dynamic_kinds:
             scratch["ering_" + k] = pltpu.VMEM((NBE,) + vshape[k], vdtype[k])
-            phase_map["ering_" + k] = "persistent"
+            phase_map["ering_" + k] = persistent_phases
         # A module that stages its KV ring in the expert pool (`KVE`) needs the
         # typed pool to hold `(2, HD // 4, 4, BLK)` fp8 KV items.
         kve = [mp for mp in module_plans.values() if getattr(mp, "KVE", False)]
         if p.dynamic_kinds and kve:
             scratch["epool"] = pltpu.VMEM((NBE, 2, g.HD // 4, 4, kve[0].BLK), FP8)
-            phase_map["epool"] = "persistent"
+            phase_map["epool"] = persistent_phases
     else:
         scratch["dpool"] = pltpu.VMEM((NBD * BROWS, 128), U8)
-        phase_map["dpool"] = "persistent"
+        phase_map["dpool"] = persistent_phases
         if p.dynamic_kinds:
             scratch["epool"] = pltpu.VMEM((NBE * EBROWS, 128), U8)
-            phase_map["epool"] = "persistent"
+            phase_map["epool"] = persistent_phases
 
     vmem_bytes = 0
     vmem_shapes: dict[str, tuple[tuple[int, ...], Any]] = {}
@@ -571,7 +578,16 @@ def fit_default_tiles(
             t_w, _, t_w_last = _fit_ring_depths(
                 model_spec, w_ex, t0, budget, shrink_nbe=True
             )
-        except MegakernelConfigError:
+        except MegakernelConfigError as exc:
+            logger.debug(
+                "fit_default_tiles skipped probe for ModelSpec %r "
+                "(B=%d, T=%d, R=%d): %s",
+                model_spec.name,
+                bw,
+                tw,
+                ex.R,
+                exc,
+            )
             continue
         model_nbe = min(model_nbe, (t_w or t_w_last).nbe)
     t_fit, vmem_bytes, t_last = _fit_ring_depths(
