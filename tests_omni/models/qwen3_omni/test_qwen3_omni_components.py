@@ -34,7 +34,7 @@ from tests_omni.omni_test_utils import (
     restore_class_attrs,
 )
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
-    _AUDIO_CHUNK_LENGTHS_PATCHED,
+    _padded_audio_forward,
     maybe_patch_qwen3_omni_thinker,
 )
 
@@ -96,13 +96,13 @@ def encoders(
 
     cls = Qwen3OmniMoeAudioEncoder
     upstream_forward = cls.forward
-    assert not getattr(upstream_forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
+    assert upstream_forward is not _padded_audio_forward
     with restore_class_attrs(cls, _PATCHED_ATTRS):
         assert (
             maybe_patch_qwen3_omni_thinker(["Qwen3OmniMoeForConditionalGeneration"])
             is True
         )
-        assert getattr(cls.forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
+        assert cls.forward is _padded_audio_forward
 
         torch.manual_seed(0)
         ref = HfQwen3OmniMoeAudioEncoder(AUDIO_CONFIG).eval()
