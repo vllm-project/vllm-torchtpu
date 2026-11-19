@@ -96,6 +96,22 @@ def build_engine_seed_defaults() -> dict[str, object]:
         "vector_sub_byte_elements_per_word": (
             constants.VECTOR_SUB_BYTE_ELEMENTS_PER_WORD
         ),
+        "indexer_scale_block_size": constants.INDEXER_SCALE_BLOCK_SIZE,
+        "word_align_bytes": constants.WORD_ALIGN_BYTES,
+        "hbm_cacheline_bytes": constants.HBM_CACHELINE_BYTES,
+        "indexer_radix_passes": constants.INDEXER_RADIX_PASSES,
+        "indexer_radix_buckets": constants.INDEXER_RADIX_BUCKETS,
+        "indexer_head_reduce_vec_ops": constants.INDEXER_HEAD_REDUCE_VEC_OPS,
+        "indexer_scale_vec_ops": constants.INDEXER_SCALE_VEC_OPS,
+        "indexer_radix_pass_vec_ops": constants.INDEXER_RADIX_PASS_VEC_OPS,
+        "dsa_unpack_mask_vec_ops": constants.DSA_UNPACK_MASK_VEC_OPS,
+        "dsa_softmax_vec_ops": constants.DSA_SOFTMAX_VEC_OPS,
+        "dsa_output_rescale_vec_ops": constants.DSA_OUTPUT_RESCALE_VEC_OPS,
+        "dcp_lse_merge_vec_ops": constants.DCP_LSE_MERGE_VEC_OPS,
+        "per_op_indexer_score_roundtrip_bytes": (
+            constants.PER_OP_INDEXER_SCORE_ROUNDTRIP_BYTES
+        ),
+        "per_op_dsa_kv_roundtrip_factor": (constants.PER_OP_DSA_KV_ROUNDTRIP_FACTOR),
         "hbm_utilization_cap": constants.HBM_UTILIZATION_CAP,
         "compiled_xla_gap_p50_us": constants.COMPILED_XLA_GAP_P50_US,
         "compiled_xla_gap_p90_us": constants.COMPILED_XLA_GAP_P90_US,
