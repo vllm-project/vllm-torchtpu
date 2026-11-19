@@ -816,7 +816,10 @@ def _fused_call(t: int, h: int):
                 pltpu.SemaphoreType.DMA((10,)), pltpu.SemaphoreType.DMA((2,)),          # owned AG start + d2d ag
             ],
         ),
-        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID, has_side_effects=True),
+        # No has_side_effects: under the serving shard_map (torch_tpu jax_op) the SPMD
+        # partitioner refuses a side-effecting custom call without a sharding; the
+        # used output keeps the call alive, like tp_all_reduce.
+        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID),
         name=f"qar_fused-t_{t}-h_{h}",
     )
 
