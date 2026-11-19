@@ -99,6 +99,40 @@ def test_optional_hooks_default_to_no_ops():
     assert adapter.bind_draft(object()) is None
     assert adapter.precompile_fused_inputs([16], [4, None]) is None
     assert adapter.kv_cache_memory_budget() is None
+    assert adapter.build_attention_metadata(object(), 8) is None
+
+
+class _MetadataAdapter(_Adapter):
+    def __init__(self, runner, owned):
+        super().__init__(runner)
+        self.owned = owned
+
+    def build_attention_metadata(self, ctx, num_reqs_padded):
+        self.calls.append(("metadata", ctx, num_reqs_padded))
+        return self.owned
+
+
+@pytest.mark.parametrize("num_reqs_padded", [None, 8])
+def test_build_attention_metadata_takes_the_adapter_metadata(num_reqs_padded):
+    owned = {"attn.0": object()}
+    adapter = _MetadataAdapter(None, owned)
+    ctx = NS(staged_block_tables=None)
+    runner = NS(model_adapter=adapter, _attn_metadata_builder_ctx=ctx, attn_groups=[])
+    built, spec = TPUModelRunner._build_attention_metadata(
+        runner, num_reqs=4, num_reqs_padded=num_reqs_padded
+    )
+    assert built is owned and spec is None
+    assert adapter.calls == [("metadata", ctx, num_reqs_padded or 4)]
+
+
+def test_build_attention_metadata_without_owned_metadata_runs_the_group_walk():
+    adapter = _MetadataAdapter(None, None)
+    # Already staged, so the walk goes straight to the (here empty) groups.
+    ctx = NS(staged_block_tables={})
+    runner = NS(model_adapter=adapter, _attn_metadata_builder_ctx=ctx, attn_groups=[])
+    built, spec = TPUModelRunner._build_attention_metadata(runner, num_reqs=4)
+    assert built == {} and spec is None
+    assert adapter.calls == [("metadata", ctx, 4)]
 
 
 @pytest.mark.parametrize("model_kwargs", [None, {"extra": 7}])
