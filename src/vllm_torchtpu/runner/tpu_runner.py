@@ -221,7 +221,7 @@ from vllm_torchtpu.spec_decode.utils import (
     handoff_seed_tokens,
     normalize_draft_config,
 )
-from vllm_torchtpu.structured_decoding import StructuredDecodingManager
+from vllm_torchtpu.structured_decoding import StructuredDecodingManager, gaad
 from vllm_torchtpu.tpu_info import get_libtpu_version, get_tpu_library_path
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
@@ -1502,7 +1502,10 @@ class TPUModelRunner(GPUModelRunner):
             self.rejection_sampler = RejectionSampler(
                 self.speculative_config, self.device
             )
-            if self.speculative_config.method == "ngram":
+            if gaad.is_standalone(self.speculative_config):
+                # GaaD alone: the scheduler plans every draft from the grammar.
+                self.drafter = None
+            elif self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "dflash":
                 self.drafter = DFlashProposer(self, self.vllm_config)
@@ -3737,6 +3740,10 @@ class TPUModelRunner(GPUModelRunner):
                         defer_draft_token_ids=bool(
                             self.scheduler_config.async_scheduling
                         ),
+                        scheduled_spec_decode_flags=getattr(
+                            scheduler_output, "scheduled_spec_decode_flags", None
+                        ),
+                        start_index=start_index,
                     )
                 )
 
@@ -5593,6 +5600,7 @@ class TPUModelRunner(GPUModelRunner):
             topk_candidates=topk_candidates,
             target_argmax=target_argmax,
             apply_topk_topp=apply_topk_topp,
+            draft_flags=md.draft_flags,
         )
         for proc in processors:
             proc.finish(next_tokens)
@@ -7486,6 +7494,12 @@ class TPUModelRunner(GPUModelRunner):
                 warm_accept_u = torch.zeros(num_tokens, dtype=torch.float32).to(
                     self.device
                 )
+                # With GaaD every verify passes flags (a separate graph).
+                warm_draft_flags = (
+                    torch.ones(num_tokens, dtype=torch.int32).to(self.device)
+                    if gaad.is_enabled(self.vllm_config)
+                    else None
+                )
                 # --- greedy verify path (do_sampling=False) ---
                 bonus_token_ids, target_logits_warm = self.spec_bonus_and_target_logits(
                     dummy_logits, bonus_logits_indices, target_logits_indices
@@ -7501,6 +7515,7 @@ class TPUModelRunner(GPUModelRunner):
                     accept_u=(
                         warm_accept_u if self.rejection_sampler.synthetic_mode else None
                     ),
+                    draft_flags=warm_draft_flags,
                 )
                 synchronize_tensors(out)
                 if self._greedy_head_owner is not None:
@@ -7553,6 +7568,7 @@ class TPUModelRunner(GPUModelRunner):
                         do_sampling=True,
                         topk_candidates=topk_candidates,
                         apply_topk_topp=apply_topk_topp,
+                        draft_flags=warm_draft_flags,
                     )
                     synchronize_tensors(out)
                 logger.info(

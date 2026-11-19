@@ -29,7 +29,8 @@ GaaD is on when ``--additional-config`` has a ``gaad`` entry, for example
 The model drafter fills at most ``draft_tokens`` of them (all of them when
 unset) and the grammar may force tokens into the rest, so a wide row costs the
 drafter nothing. The runner computes target logits only for ``MODEL`` slots and
-the bonus slot.
+the bonus slot. Without a drafter, the speculative config names
+``GAAD_PROPOSER`` as a ``custom_class`` method and GaaD fills every row.
 """
 
 from __future__ import annotations
@@ -40,13 +41,40 @@ from typing import TYPE_CHECKING, Any
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
+    from vllm.config import SpeculativeConfig, VllmConfig
 
 logger = init_logger(__name__)
 
 DRAFT_FLAG_EMPTY = 0
 DRAFT_FLAG_MODEL = 1
 DRAFT_FLAG_GRAMMAR = 2
+
+# The `custom_class` speculative model that selects GaaD without a drafter.
+GAAD_PROPOSER = "vllm_torchtpu.structured_decoding.gaad.GrammarOnlyProposer"
+
+
+class GrammarOnlyProposer:
+    """Names GaaD without a drafter; it proposes nothing.
+
+    vLLM's runner base class builds one from the `custom_class` config; the
+    TPU runner then replaces it with no drafter.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    def propose(self, *args: Any, **kwargs: Any) -> list[list[int]]:
+        del args, kwargs
+        return []
+
+
+def is_standalone(speculative_config: SpeculativeConfig | None) -> bool:
+    """Whether the speculative config selects GaaD without a drafter."""
+    return (
+        speculative_config is not None
+        and speculative_config.method == "custom_class"
+        and speculative_config.model == GAAD_PROPOSER
+    )
 
 
 def _options(vllm_config: VllmConfig) -> Any:
@@ -77,6 +105,11 @@ def check_config(vllm_config: VllmConfig) -> None:
     speculative_config = vllm_config.speculative_config
     options = _options(vllm_config)
     if options is None:
+        if is_standalone(speculative_config):
+            raise ValueError(
+                f"Speculative model {GAAD_PROPOSER} needs a gaad entry in "
+                "additional_config, e.g. --additional-config '{\"gaad\": {}}'."
+            )
         return
     if not isinstance(options, dict):
         raise ValueError(f'additional_config["gaad"] must be a dict, got {options!r}.')
@@ -88,7 +121,8 @@ def check_config(vllm_config: VllmConfig) -> None:
         )
     if speculative_config is None:
         raise ValueError(
-            'additional_config["gaad"] needs a speculative config with a drafter.'
+            'additional_config["gaad"] needs a speculative config: a drafter, '
+            f'or {{"model": "{GAAD_PROPOSER}", "num_speculative_tokens": K}}.'
         )
     k = speculative_config.num_speculative_tokens
     draft_tokens = options.get("draft_tokens", k)
