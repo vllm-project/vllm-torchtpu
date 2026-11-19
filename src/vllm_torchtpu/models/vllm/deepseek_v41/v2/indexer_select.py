@@ -175,7 +175,10 @@ def _publish_candidate_blocks(
     block_scores=None,
     scheduling_group_id=None,
 ):
-    """Match vLLM candidate_blocks.py: per-query block maxima and newest block."""
+    """Match vLLM candidate_blocks.py: per-query block maxima and newest block.
+
+    Rows ascend with -1 suffix padding, so FP8 candidate metadata skips its sort.
+    """
     rows, width = scores.shape
     lengths = jnp.clip(lengths, 0, width)
     if block_scores is None:
@@ -194,7 +197,7 @@ def _publish_candidate_blocks(
         ).astype(jnp.int32)
     else:
         values, ids = jax.lax.top_k(block_scores, cand_k)
-        published = jnp.where(values > -jnp.inf, ids, -1).astype(jnp.int32)
+        published = _compact_selected(jnp.where(values > -jnp.inf, ids, -1))
     return jnp.pad(published, ((0, 0), (0, count - cand_k)), constant_values=-1)
 
 

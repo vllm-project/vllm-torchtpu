@@ -487,7 +487,7 @@ def _pick_partition(b: int, n: int, k: int) -> int:
     max_p = 32 // b if b < 32 else 1
     while p * 2 <= max_p:
         next_np = n // (p * 2)
-        if next_np >= k and next_np >= LANES and (n % (p * 2)) == 0:
+        if next_np > k and next_np >= LANES and (n % (p * 2)) == 0:
             p *= 2
         else:
             break
