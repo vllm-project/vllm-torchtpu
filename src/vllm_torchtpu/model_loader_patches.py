@@ -1064,7 +1064,9 @@ def patch_moe_expert_write_staging() -> None:
                 if not isinstance(module, LinearBase):
                     continue
                 qm = getattr(module, "quant_method", None)
-                if not isinstance(qm, QuantizeMethodBase):
+                # The explicit None check lets the type checker narrow qm; it
+                # does not narrow through isinstance on this vLLM class.
+                if qm is None or not isinstance(qm, QuantizeMethodBase):
                     continue
                 qm_id = id(qm)
                 if qm_id not in saved_qms:
