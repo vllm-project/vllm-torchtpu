@@ -514,14 +514,6 @@ def fused_conv1d_gdn(
         )
     if beta_scale <= 0:
         raise ValueError(f"beta_scale must be positive; got {beta_scale}.")
-    # The unified pool addresses its state regions in lane-row granules
-    # (`_GranuleStateRef._granule_width`), which a wider value head would
-    # straddle.
-    if is_shared and d_v > pltpu.get_tpu_info().num_lanes:
-        raise NotImplementedError(
-            f"The unified KV pool requires d_v <= "
-            f"{pltpu.get_tpu_info().num_lanes}; got d_v={d_v}."
-        )
 
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
@@ -561,6 +553,13 @@ def fused_conv1d_gdn(
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
     num_lanes = pltpu.get_tpu_info().num_lanes
+    # The unified pool addresses its state regions in lane-row granules
+    # (`_GranuleStateRef._granule_width`), which a wider value head would
+    # straddle.
+    if is_shared and d_v > num_lanes:
+        raise NotImplementedError(
+            f"The unified KV pool requires d_v <= {num_lanes}; got d_v={d_v}."
+        )
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
