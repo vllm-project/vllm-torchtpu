@@ -13,7 +13,7 @@
 # limitations under the License.
 """TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT: fp8 MSA prefill attention (transposed
 body, block_q 16 / 32) with the "exp16" lever against a float64 oracle
-(interpret), and the "bias" page mask bit for bit against the select.
+(interpret), and the "bias" and "lanemask" page masks bit for bit against the select.
 
 Checks: no lever is the incumbent bit for bit; "exp16" keeps the -inf lse
 pattern, finite outputs and errors within a bf16-level bound; unknown levers
@@ -103,12 +103,23 @@ def test_exp16_close_and_off_is_incumbent(block_q):
 
 @pytest.mark.parametrize("block_q", [16, 32])
 @pytest.mark.parametrize("other", ["", "exp16"])
-def test_bias_mask_is_bitwise(block_q, other):
+@pytest.mark.parametrize("lever", ["bias", "lanemask"])
+def test_mask_levers_are_bitwise(block_q, other, lever):
     args = make(64, seed=7 + block_q)
     o0, l0 = run(args, block_q, other)
-    o1, l1 = run(args, block_q, ",".join(x for x in (other, "bias") if x))
+    o1, l1 = run(args, block_q, ",".join(x for x in (other, lever) if x))
     assert np.array_equal(np.asarray(o0), np.asarray(o1))
     assert np.array_equal(np.asarray(l0), np.asarray(l1))
+
+
+@pytest.mark.parametrize("block_q", [16, 32])
+def test_vt_close(block_q):
+    args = make(64, seed=11 + block_q)
+    o0, l0 = run(args, block_q, "")
+    o1, l1 = run(args, block_q, "vt")
+    o0 = np.asarray(o0, np.float64); o1 = np.asarray(o1, np.float64)
+    assert np.array_equal(np.isfinite(np.asarray(l0)), np.isfinite(np.asarray(l1)))
+    assert np.sqrt(np.mean((o1 - o0) ** 2)) / np.sqrt(np.mean(o0 ** 2)) < 1e-2
 
 
 def test_unknown_lever_raises():

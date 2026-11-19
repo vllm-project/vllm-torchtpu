@@ -205,7 +205,11 @@ FP8_OPT_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT"
 # -inf per token, from the page's hit / limit) on fully visible or unseen
 # pages; only a page some token sees in part (its local page) or an empty
 # slot keeps the select, under a scalar branch. Bitwise (finite pages).
-_FP8_LEVERS = ("exp16", "bias")
+# "lanemask": the page mask compared once per 128-lane vreg of rows (4 heads
+# x 32 tokens at block_q 32) and reused by every head group (bitwise).
+# "vt": each page's V rows transposed as they unpack, so p @ v runs as
+# v^T [D, keys] @ p [keys, rows] with no transposed operand in the dot.
+_FP8_LEVERS = ("exp16", "bias", "lanemask", "vt")
 
 
 def fp8_prefill_levers(spec: str | None = None) -> frozenset:
@@ -485,6 +489,8 @@ def _kernel(
     pv8 = fp4 and "pv8" in precision
     exp16_t = not fp4 and "exp16" in precision
     bias_t = not fp4 and "bias" in precision
+    lanemask_t = not fp4 and "lanemask" in precision
+    vt_t = not fp4 and "vt" in precision
     out_unit = 1.0 / _PV8_UNIT if pv8 else 1.0
 
     def group_head(w):
@@ -755,6 +761,12 @@ def _kernel(
             local_page = local_page_ref[...].T  # [1, Bq]
             local_limit = local_limit_ref[...].T
             keys, values, masks, limits, fixes = [], [], [], [], []
+            lane_reps = (
+                128 // block_q
+                if 128 % block_q == 0 and num_heads % (128 // block_q) == 0
+                and num_heads > 128 // block_q
+                else 0
+            )
             for g in range(width):
                 page, kv_ref, scale_ref = group_page(g)
                 hit = jnp.max((sel_t == page).astype(jnp.int32), axis=0, keepdims=True)
@@ -777,11 +789,18 @@ def _kernel(
                     rows = msa_attention._page_rows(kv_ref, seen)
                     values.append(rows[:, head_dim:])
                 keys.append(rows[:, :head_dim])
-                if not bias_t:
+                if lanemask_t and lane_reps:
+                    # One 128-lane mask: every 128-lane chunk of rows holds the
+                    # same tokens (h * Bq + t, Bq dividing 128).
+                    masks.append(row_slots < jnp.tile(limit, (1, lane_reps)))  # [S, 128]
+                elif not bias_t:
                     # Rows are head-major (h * Bq + t): every head shares a token's mask.
                     masks.append(row_slots < jnp.tile(limit, (1, num_heads)))  # [S, rows]
             k = jnp.concatenate(keys, axis=0)
-            v = jnp.concatenate(values, axis=0)
+            if vt_t:
+                v = jnp.concatenate([x.T for x in values], axis=1)  # [D, W * S]
+            else:
+                v = jnp.concatenate(values, axis=0)
             q = q_ref[...].reshape(num_heads * block_q, head_dim)
             q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
             s = jax.lax.dot_general(
@@ -800,6 +819,15 @@ def _kernel(
 
                     slabs.append(jax.lax.cond(fixes[g], _select, lambda x: x, s_g))
                 s = jnp.concatenate(slabs, axis=0)
+            elif lanemask_t and lane_reps:
+                mask = jnp.concatenate(masks, axis=0)  # [W * S, 128]
+                s = jnp.concatenate(
+                    [
+                        jnp.where(mask, s[:, c : c + 128], -jnp.inf)
+                        for c in range(0, s.shape[1], 128)
+                    ],
+                    axis=1,
+                )
             else:
                 mask = jnp.concatenate(masks, axis=0)
                 s = jnp.where(mask, s, -jnp.inf)
@@ -814,7 +842,7 @@ def _kernel(
             pv = jax.lax.dot_general(
                 v,
                 p.astype(v.dtype),
-                (((0,), (0,)), ((), ())),
+                (((1 if vt_t else 0,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
             )  # [D, rows]
             if single:

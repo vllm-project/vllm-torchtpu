@@ -1700,7 +1700,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MiniMax M3 MSA prefill attention on fp8 KV caches: "exp16" runs the
     # softmax exp in bf16 (p enters p @ v in bf16 anyway; not bitwise); "bias"
     # masks whole pages by a lane-row add instead of a per-score select
-    # (bitwise). Comma-separated; empty
+    # (bitwise); "lanemask" compares the mask once per 128 lanes (bitwise);
+    # "vt" transposes V pages as they unpack for an untransposed p @ v dot.
+    # Comma-separated; empty
     # (default) = off.
     "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT": env_str(
         "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT", ""
