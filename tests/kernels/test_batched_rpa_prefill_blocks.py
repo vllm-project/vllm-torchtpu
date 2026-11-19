@@ -13,7 +13,8 @@
 # limitations under the License.
 """Tuned batched RPA prefill tiles: the table entry, the heuristic elsewhere and
 without the tuned tiles, and the refusal of tiles known to be wrong. Every
-fallback to the heuristic's tiles is logged once."""
+fallback to the heuristic's tiles is logged once, except at the shapes listed
+as keeping the heuristic's tiles."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -53,6 +54,7 @@ def _tpu_info(chip_version=pltpu.ChipVersion.TPU_7X, mxu_column_size=256):
 def _blocks(
     total_q_tokens=4352,
     num_q_heads=32,
+    num_kv_heads=2,
     dtype_kv=jnp.float8_e4m3fn,
     tuned_tiles=True,
     page_size=128,
@@ -61,7 +63,10 @@ def _blocks(
 ):
     # The PP=8 stage geometry: 32 q heads, 2 KV heads, head_dim 256, fp8 KV, page 128.
     model = configs.ModelConfigs(
-        num_q_heads=num_q_heads, num_kv_heads=2, head_dim=256, mask_value=-1e30
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=256,
+        mask_value=-1e30,
     )
     serve = configs.ServingConfigs(
         num_seqs=32,
@@ -172,3 +177,26 @@ def test_tiles_that_do_not_fit_the_vmem_limit_take_the_heuristic(warnings):
 def test_the_table_entry_logs_nothing(warnings):
     _blocks()
     assert not [w for w in warnings if "prefill tiles" in w], warnings
+
+
+@pytest.mark.parametrize("num_q_heads", [16, 4])
+def test_the_measured_decode_shapes_keep_the_heuristic_without_a_log(
+    warnings, num_q_heads
+):
+    # The decode legs' shapes on TPU7x: 16 q / 1 KV head (DP4 x TP2) and
+    # 4 q / 1 KV head (TP8 and DCP4).
+    for tokens in (16, 2048):
+        kwargs = dict(total_q_tokens=tokens, num_q_heads=num_q_heads, num_kv_heads=1)
+        assert _blocks(**kwargs) == _heuristic(**kwargs)
+    assert not [w for w in warnings if "prefill tiles" in w], warnings
+
+
+def test_a_miss_logs_once_per_shape(warnings):
+    # The heuristic's tiles change with the token count; the miss line, which
+    # warning_once prints once per distinct message, does not.
+    v6e = pltpu.ChipVersion.TPU_V6E
+    _, small = _blocks(total_q_tokens=256, num_q_heads=4, chip_version=v6e)
+    _, large = _blocks(total_q_tokens=4352, num_q_heads=4, chip_version=v6e)
+    assert small != large
+    misses = [w for w in warnings if "no tuned prefill tiles" in w]
+    assert len(misses) == 2 and len(set(misses)) == 1, misses
