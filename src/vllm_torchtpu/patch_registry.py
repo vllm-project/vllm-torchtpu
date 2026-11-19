@@ -128,10 +128,9 @@ PATCHES = (
         _ACTIVE,
     ),
     # patch_expert_placement_routers must stay after
-    # patch_moe_expert_write_staging. A later patch wraps
-    # process_weights_after_loading outermost, so the routers are permuted
-    # before the staging patch processes LinearBase weights and transposes
-    # gate.weight.
+    # patch_moe_expert_write_staging. Both wrap process_weights_after_loading,
+    # and the later patch runs first. The routers must be permuted before the
+    # staging patch transposes gate.weight while processing LinearBase weights.
     Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging", _ACTIVE),
     Patch("vllm_torchtpu.model_loader_patches:patch_expert_placement_routers", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_vocab_parallel_embedding", _ACTIVE),

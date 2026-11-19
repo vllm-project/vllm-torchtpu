@@ -966,10 +966,10 @@ def patch_moe_expert_write_staging() -> None:
     loader never writes (padding experts) stay uninitialized, as they would
     on the device.
 
-    For MoE models, every LinearBase is post-processed before the expert
-    parameters still staged at the end of loading are written and before any
+    For MoE models, every LinearBase is post-processed first. This happens
+    before the stand-ins left at the end of loading are written and before any
     RoutedExperts post-load hook runs. Those hooks therefore see LinearBase
-    weights already in their runtime layout, not their checkpoint layout.
+    weights in their runtime layout, not their checkpoint layout.
     """
     from vllm.model_executor.layers.fused_moe import RoutedExperts
     from vllm.model_executor.model_loader import base_loader
@@ -1030,9 +1030,9 @@ def patch_moe_expert_write_staging() -> None:
             )
         return result
 
-    # updated=() keeps orig_process's attributes off this wrapper. Copying the
-    # router patch's applied marker would make that patch skip itself if this
-    # one were ever applied after it.
+    # updated=() stops functools.wraps from copying orig_process's __dict__.
+    # If this patch were applied after the router patch, that copy would carry
+    # the router patch's applied marker, and the router patch would skip itself.
     @functools.wraps(orig_process, updated=())
     def process_weights_after_loading(model, model_config, target_device):
         from contextlib import nullcontext
@@ -1057,28 +1057,29 @@ def patch_moe_expert_write_staging() -> None:
             stager.flush_all()
             return orig_process(model, model_config, target_device)
 
-        # Process dense LinearBase modules before flushing staged expert tensors
-        # and running RoutedExperts post-load hooks: shrinking or repacking
-        # dense weights first lowers the HBM high-water mark ahead of MoE
-        # expert requantization.
+        # LinearBase modules are processed before the expert flush and the
+        # RoutedExperts post-load hooks to lower peak HBM use. Shrinking or
+        # repacking dense weights first frees memory before the experts are
+        # requantized.
         patched_attrs = ("process_weights_after_loading", "requires_device_loading")
         done_modules: set[int] = set()
-        # id(qm) -> (qm, its original patched_attrs values, and the subset
-        # that qm held as instance attributes).
+        # id(qm) -> (qm, original process_weights_after_loading, original
+        # requires_device_loading, patched_attrs held as instance attributes).
         saved_qms: dict[
             int, tuple[typing.Any, typing.Any, bool, dict[str, typing.Any]]
         ] = {}
         try:
-            # The loop body copies the per-module loop in vLLM's
-            # model_loader.utils.process_weights_after_loading, so a change to
-            # that loop in vLLM has to be made here too. When orig_process runs
-            # its loop afterwards, the guarded quant method skips these modules.
+            # This loop body copies the per-module loop in vLLM's
+            # model_loader.utils.process_weights_after_loading. A change to
+            # that loop in vLLM has to be made here too. orig_process runs the
+            # vLLM loop afterwards, and the guarded quant method skips the
+            # modules processed here.
             for module in model.modules():
                 if not isinstance(module, LinearBase):
                     continue
                 qm = getattr(module, "quant_method", None)
-                # The explicit None check lets the type checker narrow qm; it
-                # does not narrow through isinstance on this vLLM class.
+                # pyrefly does not narrow qm through isinstance on this vLLM
+                # class. The explicit None check narrows it.
                 if qm is None or not isinstance(qm, QuantizeMethodBase):
                     continue
                 qm_id = id(qm)
@@ -1118,9 +1119,9 @@ def patch_moe_expert_write_staging() -> None:
                 release_device_memory_under_pressure(target_device)
                 done_modules.add(id(module))
 
-            # A quant method used only by already-processed linear modules has
-            # nothing left to do, so orig_process can skip the CPU-offload
-            # H2D/D2H round trip for its modules.
+            # A quant method used only by linear modules already processed here has
+            # nothing left to do. Clearing requires_device_loading lets
+            # orig_process skip the CPU-offload H2D/D2H round trip for them.
             non_linear_qms = {
                 id(getattr(m, "quant_method", None))
                 for m in model.modules()
@@ -1140,8 +1141,8 @@ def patch_moe_expert_write_staging() -> None:
             )
             return orig_process(model, model_config, target_device)
         finally:
-            # Popping rather than assigning back lets the class attributes show
-            # through again; assigning the saved bound method would leave an
+            # Popping the overrides lets the class attributes show through
+            # again. Assigning the saved bound method back would leave an
             # instance attribute that references qm itself.
             for qm, _, _, own_attrs in saved_qms.values():
                 for name in patched_attrs:

@@ -250,9 +250,9 @@ def test_manifest_preserves_lifecycle_dependencies():
 
 
 def test_router_permutation_wraps_expert_write_staging():
-    """The later patch wraps process_weights_after_loading outermost, so the
-    routers are renumbered before the staging patch processes LinearBase
-    weights early and transposes gate.weight."""
+    """The later patch wraps process_weights_after_loading outermost and runs
+    first. The routers must be renumbered before the staging patch transposes
+    gate.weight while processing LinearBase weights."""
     reg = _load_registry()
     targets = [p.target.split(":")[-1] for p in reg.PATCHES]
     assert targets.index("patch_moe_expert_write_staging") < targets.index(

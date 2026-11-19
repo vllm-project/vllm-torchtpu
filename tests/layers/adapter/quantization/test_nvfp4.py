@@ -13,10 +13,9 @@
 # limitations under the License.
 """Tests for NVFP4 (ModelOpt FP4) quantization support for TPU.
 
-Verifies helper functions (fresh_buffer, _to_kernel_scale, _requant_w13_padded,
-_requant_w2_padded), VllmNvfp4Config dispatch, VllmNvfp4LinearMethod (create_weights,
-process_weights_after_loading, apply), and VllmNvfp4MoEMethod (create_weights,
-process_weights_after_loading across W4A16 and W4A8 paths, apply_monolithic).
+Covers the buffer, scale-layout and requant helpers, config dispatch, and the
+linear and MoE methods, including MoE weight processing on the W4A16 and W4A8
+paths.
 """
 
 from unittest.mock import MagicMock, patch

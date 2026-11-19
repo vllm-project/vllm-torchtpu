@@ -158,7 +158,9 @@ def _requant_w2_padded(
     w2_u8: torch.Tensor, w2_scale_f: torch.Tensor, block: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Requantize NVFP4 MoE w2 from native block-16 to block-`block` fp4 in
-    PyTorch, zero-padding its contracting dim (the MoE intermediate) up to a
+    PyTorch.
+
+    The contracting dim is the MoE intermediate. It is zero-padded up to a
     multiple of `block`. Returns the packed weight and its kernel-layout scale.
     """
     inter = w2_u8.shape[-1] * 2
@@ -179,8 +181,8 @@ def _requant_w2_padded(
 def _expand_w13_scale(layer: TpuRoutedExperts) -> torch.Tensor:
     """Return the FP32 w13 block scale.
 
-    The E4M3 block scale is multiplied by the per-expert global scales [E, 2],
-    whose columns belong to w1 (the gate half) and w3 (the up half).
+    The E4M3 block scale is multiplied by the per-expert global scales [E, 2].
+    Column 0 scales w1, the gate half. Column 1 scales w3, the up half.
     """
     w13_scale = layer.w13_weight_scale.data  # [E, 2I, H/group] e4m3
     g13 = layer.w13_weight_scale_2.data.to(torch.float32)  # [E, 2]
@@ -217,13 +219,16 @@ def _install_moe_weight(
 def _install_prepared_moe_weights(
     layer: TpuRoutedExperts, requant_block: int | None
 ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], str]:
-    """Prepare and install w13, then w2, so checkpoint w13 and its FP32
-    block-16 scale are freed before w2 is expanded and prepared."""
+    """Prepare and install w13 before preparing w2.
+
+    Installing w13 first frees checkpoint w13 and its FP32 block-16 scale
+    before w2's scale is expanded and w2 is prepared.
+    """
     hidden = layer.w13_weight.shape[-1] * 2
     inter = layer.w2_weight.shape[-1] * 2
     block = int(requant_block) if requant_block else 0
-    # Only the torch requant can pad the intermediate up to the block. It still
-    # requires hidden to be a multiple of the block.
+    # The JAX requant needs hidden and the intermediate to be multiples of the
+    # block. The torch requant can pad the intermediate but not hidden.
     padded = bool(block) and (hidden % block != 0 or inter % block != 0)
 
     def prepare(w_u8, scale_f, requant_padded):

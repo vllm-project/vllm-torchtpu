@@ -188,7 +188,7 @@ def test_interleaved_parameters_sharing_pooled_buffers_keep_their_experts():
 def staging_patch_undo(monkeypatch):
     """Undo patch_moe_expert_write_staging after the test.
 
-    The patch is process-wide; undoing it lets later tests load expert weights
+    The patch is process-wide. Undoing it lets later tests load expert weights
     through the stock loader and start from a fresh stager.
     """
     from vllm.model_executor.layers.fused_moe import RoutedExperts
