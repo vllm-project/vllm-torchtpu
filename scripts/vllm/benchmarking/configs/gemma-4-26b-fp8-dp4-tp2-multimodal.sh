@@ -26,4 +26,7 @@ RANDOM_RANGE_RATIO="0.8"
 GPU_MEMORY_UTILIZATION=0.90
 EVAL_TOLERANCE="0.03"
 export VLLM_ENGINE_READY_TIMEOUT_S=1800
+export CAPTURE_PROFILE="${CAPTURE_PROFILE:-1}"
+export USE_PHASED_PROFILER="$CAPTURE_PROFILE"
+PROFILE_GCS_BASE="gs://tpu-commons-ci/xprof/gemma-4-26b/torchtpu"
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--block-size=256 --max-num-seqs=512 --mm-processor-kwargs {\"size\":{\"longest_edge\":262144,\"shortest_edge\":3136}} --disable-chunked-mm-input --mm-encoder-tp-mode data --compilation-config {\"cudagraph_mm_encoder\":true,\"encoder_cudagraph_max_vision_items_per_batch\":8,\"encoder_cudagraph_max_frames_per_batch\":8}"
