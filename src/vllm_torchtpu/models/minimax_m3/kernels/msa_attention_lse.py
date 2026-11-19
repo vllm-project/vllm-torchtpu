@@ -1678,19 +1678,31 @@ def decode_pair() -> bool:
 ADAPTIVE_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE"
 
 
-def adaptive_prefill() -> tuple[int, int, int] | None:
+def adaptive_prefill() -> tuple[int, dict] | None:
     """``envs.TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE`` = "<threshold>:<block_q>:
-    <tile_pages>" as ints, or None (unset). Read when the calling program is
+    <tile_pages>[:<pages_per_step>[:<widths w.w.w>]]" -> (threshold, the wide
+    configuration's kernel kwargs), or None (unset). The optional fields give
+    the wide configuration its own pages per step and step widths ("." between
+    widths; unset = the configured ones). Read when the calling program is
     traced, through `envs` (part of the compile-cache key)."""
     from vllm_torchtpu import envs
 
     spec = envs.TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE.strip()
     if not spec:
         return None
-    parts = [int(x) for x in spec.replace("/", ":").split(":")]
-    if len(parts) != 3 or min(parts) <= 0:
-        raise ValueError(f"{ADAPTIVE_ENV}={spec!r}: want <threshold>:<block_q>:<tile_pages>")
-    return parts[0], parts[1], parts[2]
+    fields = spec.replace("/", ":").split(":")
+    want = "<threshold>:<block_q>:<tile_pages>[:<pages_per_step>[:<w.w...>]]"
+    if not 3 <= len(fields) <= 5:
+        raise ValueError(f"{ADAPTIVE_ENV}={spec!r}: want {want}")
+    parts = [int(x) for x in fields[:4]]
+    if min(parts) <= 0:
+        raise ValueError(f"{ADAPTIVE_ENV}={spec!r}: want {want}")
+    wide = dict(block_q=parts[1], page_cache_tile_pages=parts[2])
+    if len(parts) > 3:
+        wide["pages_per_step"] = parts[3]
+    if len(fields) > 4:
+        wide["step_widths"] = tuple(sorted(int(w) for w in fields[4].split(".")))
+    return parts[0], wide
 
 
 def wide_selection(

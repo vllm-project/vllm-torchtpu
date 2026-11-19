@@ -153,7 +153,19 @@ def test_adaptive_off_runs_one_configuration(prefill_config):
 
 def test_adaptive_spec_parsing(monkeypatch):
     monkeypatch.setenv(lse_mod.ADAPTIVE_ENV, "30:8:64")
-    assert lse_mod.adaptive_prefill() == (30, 8, 64)
+    assert lse_mod.adaptive_prefill() == (
+        30, dict(block_q=8, page_cache_tile_pages=64)
+    )
+    monkeypatch.setenv(lse_mod.ADAPTIVE_ENV, "30:8:64:64:48.2.4.32")
+    assert lse_mod.adaptive_prefill() == (
+        30,
+        dict(
+            block_q=8,
+            page_cache_tile_pages=64,
+            pages_per_step=64,
+            step_widths=(2, 4, 32, 48),
+        ),
+    )
     monkeypatch.setenv(lse_mod.ADAPTIVE_ENV, "")
     assert lse_mod.adaptive_prefill() is None
     monkeypatch.setenv(lse_mod.ADAPTIVE_ENV, "30:8")

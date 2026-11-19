@@ -888,14 +888,24 @@ def msa_attend_dcp(
     if adaptive is not None:
         # Two kernel configurations in the program; each call runs one, by
         # how wide its selections are (the other's outputs are not computed).
-        threshold, wide_block_q, wide_tile_pages = adaptive
+        threshold, wide_kw = adaptive
         msa_attention_lse._proof(
             msa_attention_lse.ADAPTIVE_ENV,
             f"MSA prefill tiles per call: > {threshold} pages per "
-            f"{common['block_q']}-token tile -> block_q {wide_block_q}, "
-            f"tile pages {wide_tile_pages}",
+            f"{common['block_q']}-token tile -> block_q {wide_kw['block_q']}, "
+            f"tile pages {wide_kw['page_cache_tile_pages']}"
+            + (
+                f", pages per step {wide_kw['pages_per_step']}"
+                if "pages_per_step" in wide_kw
+                else ""
+            )
+            + (
+                f", widths {wide_kw['step_widths']}"
+                if "step_widths" in wide_kw
+                else ""
+            ),
         )
-        wide = dict(common, block_q=wide_block_q, page_cache_tile_pages=wide_tile_pages)
+        wide = dict(common, **wide_kw)
 
         def attend(kw):
             def run(operands):
