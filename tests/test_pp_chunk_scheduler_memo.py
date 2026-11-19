@@ -77,7 +77,7 @@ def engine_block_pool():
     # The patch registry's order at engine start.
     vllm_torchtpu._patch_vllm_same_step_prefix_hits()
     prefix_change_log.install_epoch()
-    assert prefix_change_log.install()
+    assert prefix_change_log.install() is None
     init_none_hash(sha256)
     try:
         yield
