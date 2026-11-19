@@ -17,6 +17,7 @@ import torch
 import vllm.envs as vllm_envs
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import Route
 from vllm_torchtpu.layers.adapter.router_topk import rowmax_select
 from vllm_torchtpu.logger import init_logger
 
@@ -338,6 +339,62 @@ def select_experts(
     return topk_weights.to(_get_topk_weights_dtype(hidden_states.dtype)), topk_ids.to(
         torch.int32
     )
+
+
+# Routing results the dense fp4 kernel can produce itself, by dtype name.
+_ROUTE_WEIGHT_DTYPES = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
+_FUSED_DENSE_ROUTING = envs.TPU_MOE_DENSE_FP4_FUSED_ROUTING
+# Sparse-row steps keep routing outside the kernel: in the kernel it delays
+# their counting sort (c16 twin: +6.5 us per layer at 40 tokens).
+_DENSE_FP4_TOKEN_CAP = envs.TPU_MOE_DENSE_FP4_MAX_TOKENS
+# The kernel lays route j's ids out as row j of one [8, 128] vreg tile.
+_ROUTE_MAX_TOPK = 8
+_ROUTE_MAX_TOKENS = 128
+
+
+def dense_route_spec(layer, hidden_dtype: torch.dtype) -> Route | None:
+    """The `Route` of a layer whose routing the dense fp4 kernel can evaluate
+    itself (TPU_MOE_DENSE_FP4_FUSED_ROUTING: the plain sigmoid + bias + rowmax
+    top-k + renormalize branch of `select_experts`), else None. Resolved at
+    load: its custom op must exist before the forward is traced."""
+    weight_dtype = _ROUTE_WEIGHT_DTYPES.get(_get_topk_weights_dtype(hidden_dtype))
+    if (
+        not _FUSED_DENSE_ROUTING
+        or _DENSE_FP4_TOKEN_CAP > _ROUTE_MAX_TOKENS
+        or layer.moe_config.experts_per_token > _ROUTE_MAX_TOPK
+        or weight_dtype is None
+        or _SIMULATION_STRATEGY is not None
+        or _ROUTER_TOPK != "rowmax"
+        or layer.custom_routing_function is not None
+        or getattr(layer, "hash_indices_table", None) is not None
+        or (
+            layer.use_grouped_topk
+            and layer.num_expert_group > 1
+            and layer.topk_group < layer.num_expert_group
+        )
+        or layer.scoring_func != "sigmoid"
+        or not layer.renormalize
+        or layer.e_score_correction_bias is None
+    ):
+        return None
+    return Route(
+        topk=layer.moe_config.experts_per_token,
+        scale=float(layer.routed_scaling_factor),
+        weight_dtype=weight_dtype,
+    )
+
+
+def fused_dense_route(
+    layer, router_logits: torch.Tensor, route: Route | None
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """``(scores, scores + correction bias)`` to pass to `fused_moe_gmm` with
+    ``route`` (from `dense_route_spec`) in place of the routing result, for a
+    step the dense fp4 kernel may serve; else None. A step the kernel does
+    not serve routes in `fused_moe_func` as select_experts would."""
+    if route is None or router_logits.shape[0] > _DENSE_FP4_TOKEN_CAP:
+        return None
+    scores = _apply_scoring_fn("sigmoid", router_logits.float())
+    return scores, scores + layer.e_score_correction_bias.float().view(1, -1)
 
 
 def get_experts_start(layer) -> int | None:

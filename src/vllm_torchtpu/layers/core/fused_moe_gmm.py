@@ -25,6 +25,7 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     dense_expert_moe,
 )
 from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import (
+    Route,
     SharedExpert,
     can_use_dense_expert_fp4,
     dense_expert_moe_fp4,
@@ -45,6 +46,7 @@ from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
 )
+from vllm_torchtpu.kernels.router_topk import select as router_topk_select
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
 )
@@ -930,6 +932,20 @@ def shared_expert_mlp(
     return _add_shared_down(routed, shared_expert_down(x, shared))
 
 
+def route_from_scores(
+    scores: jax.Array, choice: jax.Array, route: Route
+) -> tuple[jax.Array, jax.Array]:
+    """``(topk_weights, topk_ids)`` of the [tokens, E] f32 sigmoid ``scores``
+    and ``choice`` (scores + correction bias), as moe_routing.select_experts
+    computes them with the rowmax top-k."""
+    _, ids = router_topk_select(choice, route.topk)
+    weights = jnp.take_along_axis(scores, ids, axis=1)
+    weights = weights / jnp.maximum(weights.sum(axis=-1, keepdims=True), 1e-20)
+    if route.scale != 1.0:
+        weights = weights * route.scale
+    return weights.astype(route.weight_dtype), ids
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -940,6 +956,7 @@ def shared_expert_mlp(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "route",
     ),
 )
 def fused_moe_func(
@@ -963,8 +980,15 @@ def fused_moe_func(
     shared: SharedExpert | None = None,
     tp_experts: TpSlicedExperts | None = None,
     shared_down: SharedDown | None = None,
+    route: Route | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
+
+    With ``route``, ``topk_weights`` and ``topk_ids`` are instead the [tokens,
+    E] f32 sigmoid routing scores and the scores plus correction bias: the
+    dense fp4 kernel's all-row steps route in the same call, every other
+    path (sparse rows included) routes first
+    (`route_from_scores`).
 
     ``tp_experts`` is the dual layout of EP weights: this rank's TP slice of
     every routed expert. Steps of up to TPU_MOE_DUAL_LAYOUT_MAX_TOKENS tokens
@@ -1035,6 +1059,9 @@ def fused_moe_func(
             sparse_rows=sparse_rows,
         )
     )
+    if route is not None and (sparse_rows or not dense_fp4):
+        topk_weights, topk_ids = route_from_scores(topk_weights, topk_ids, route)
+        route = None
     if shared is not None and activation != "swigluoai":
         raise NotImplementedError(f"shared experts take swigluoai, not {activation}")
     if shared is not None and not (dense_fp4 or dual):
@@ -1067,6 +1094,26 @@ def fused_moe_func(
     _, padded_hidden_size, _ = w1.shape
     packing_factor = get_packing_factor(w1.dtype, rhs_quant_dtype)
     padded_hidden_size *= packing_factor
+
+    if route is not None:
+        logger.info_once("Selected dense-expert fp4 decode MoE with fused routing")
+        return _add_shared_down(
+            dense_expert_moe_fp4(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_weights,
+                topk_ids,
+                activation=activation,
+                shared=shared,
+                sparse_rows=sparse_rows,
+                route=route,
+                experts_start=experts_start if use_ep else None,
+            ),
+            shared_down,
+        )
 
     assert topk_weights.shape == (num_tokens, topk)
     assert topk_ids.shape == (num_tokens, topk)

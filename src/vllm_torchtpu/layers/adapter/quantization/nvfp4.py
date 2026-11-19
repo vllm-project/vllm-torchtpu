@@ -113,6 +113,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# The layer's moe_routing.dense_route_spec, set at load.
+_DENSE_ROUTE_ATTR = "_tpu_dense_route"
+
 
 def _to_kernel_scale(scale_f32: torch.Tensor) -> torch.Tensor:
     """[*, out, num_blocks] fp32 -> [*, num_blocks, 1, out] fp32 (gmm_v2 rhs
@@ -493,6 +496,21 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 activation=activation_str,
                 use_ep=layer.moe_config.moe_parallel_config.use_ep,
             )
+            # The activations (hidden_states) of an nvfp4 MoE are in_dtype, so
+            # the routing weights round to what select_experts gives them.
+            route = moe_routing.dense_route_spec(layer, layer.moe_config.in_dtype)
+            if route is not None:
+                # The routed op is built here, not while the forward is traced;
+                # the shared expert is armed later, so both variants.
+                for with_shared in (False, True):
+                    prebuild_fused_moe_kernel(
+                        topk=layer.moe_config.experts_per_token,
+                        activation=activation_str,
+                        use_ep=layer.moe_config.moe_parallel_config.use_ep,
+                        with_shared=with_shared,
+                        route=route,
+                    )
+                setattr(layer, _DENSE_ROUTE_ATTR, route)
 
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = op
@@ -558,7 +576,21 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         # the other three TPU MoE methods already passed it). moe_routing.route
         # passes `layer` uniformly, which fixes that -- flagging separately as
         # it's a behavior change, not just a refactor.
-        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        from vllm_torchtpu.layers.adapter.dense_fp4_dual import dual_operands
+
+        # The dual layout's steps run its own kernel call, routed outside.
+        route = getattr(layer, _DENSE_ROUTE_ATTR, None)
+        fused_route = None
+        if (
+            not enable_pipelined_collective_and_compute()
+            and dual_operands(layer) is None
+        ):
+            fused_route = moe_routing.fused_dense_route(layer, router_logits, route)
+        if fused_route is not None:
+            topk_weights, topk_ids = fused_route
+        else:
+            topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+            route = None
         kwargs = {
             "hidden_states": x,
             "w1": layer.w13_weight,
@@ -576,7 +608,6 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
 
-        from vllm_torchtpu.layers.adapter.dense_fp4_dual import dual_operands
         from vllm_torchtpu.layers.adapter.dense_fp4_shared import (
             model_side_shared,
             shared_operands,
@@ -585,7 +616,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         shared = shared_operands(layer)
         if model_side_shared(layer, x.shape[0]):
             shared = None
-        return fused_moe_gmm(**kwargs, shared=shared, tp_experts=dual_operands(layer))
+        return fused_moe_gmm(
+            **kwargs, shared=shared, tp_experts=dual_operands(layer), route=route
+        )
 
 
 class _NullInputQuantKernel:

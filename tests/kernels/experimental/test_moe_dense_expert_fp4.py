@@ -236,3 +236,58 @@ def test_dual_layout_matches_ep(monkeypatch, m, with_shared):
     )
     out = total(tp=True)
     np.testing.assert_allclose(out, ref, rtol=0, atol=1e-2 * np.abs(ref).max())
+
+
+# TP-sliced (every expert local) and EP ranks owning experts [e, 2e) of 2e;
+# the 40-row step falls back to routing first (sparse rows); top-8 too.
+@pytest.mark.parametrize(
+    "m,i,use_ep,topk",
+    [
+        (8, 384, False, 4),
+        (32, 384, False, 4),
+        (8, 1024, True, 4),
+        (40, 1024, True, 4),
+        (16, 384, False, 8),
+        (8, 1024, True, 8),
+    ],
+)
+def test_fused_routing_matches_routing_first(monkeypatch, m, i, use_ep, topk):
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    monkeypatch.setattr(wrapper, "_DENSE_FP4_MAX_TOKENS", 32)
+    monkeypatch.setattr(wrapper, "_DENSE_FP4_SPARSE_MAX_TOKENS", 64)
+    e = 16
+    num_global = 2 * e if use_ep else e
+    x, w1, w2, s1, s2, _, _ = _inputs(m, 1024, i, e, topk, seed=m)
+    rng = np.random.default_rng(m + 1)
+    logits = rng.normal(size=(m, num_global)).astype(np.float32)
+    logits[:, num_global // 2 :] = logits[:, : num_global // 2]  # ties
+    scores = jax.nn.sigmoid(jnp.asarray(logits)).at[1].set(jnp.nan)
+    choice = scores + jnp.asarray(rng.normal(size=(1, num_global)) * 0.1, jnp.float32)
+    route = kernel.Route(topk, 2.0, "bfloat16")
+    weights, ids = wrapper.route_from_scores(scores, choice, route)
+    shared = _shared(1024, 128, seed=m)
+    want = _moe(x, w1, w2, s1, s2, weights, ids, e, topk, shared, use_ep=use_ep)
+    got = wrapper.fused_moe_func(
+        x,
+        w1,
+        w2,
+        s1,
+        s2,
+        None,
+        None,
+        scores,
+        choice,
+        jnp.asarray(e, jnp.int32) if use_ep else None,
+        topk=topk,
+        activation="swigluoai",
+        use_ep=use_ep,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=wrapper.resolve_onehot_permute_threshold(),
+        skip_padded_tokens=True,
+        shared=shared,
+        route=route,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(got, np.float32), np.asarray(want, np.float32)
+    )

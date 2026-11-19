@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS: int = 0
     TPU_MOE_DENSE_FP4_SHARED: bool = False
+    TPU_MOE_DENSE_FP4_FUSED_ROUTING: bool = True
     TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS: int = 0
     TPU_MOE_DUAL_LAYOUT_MAX_TOKENS: int = 0
     TPU_GMM_FP8_W8A8: bool = False
@@ -811,6 +812,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # in the same call, other steps add it with XLA inside the op. Armed once
     # after load.
     "TPU_MOE_DENSE_FP4_SHARED": env_bool("TPU_MOE_DENSE_FP4_SHARED", default=False),
+    # Decode steps the dense fp4 kernel serves route in that kernel (sigmoid
+    # scores + correction bias, rowmax top-k, renormalized and scaled) instead
+    # of in a top-k kernel and XLA glue ahead of it.
+    "TPU_MOE_DENSE_FP4_FUSED_ROUTING": env_bool(
+        "TPU_MOE_DENSE_FP4_FUSED_ROUTING", default=True
+    ),
     # Steps of at least this many tokens whose MoE reduction the model owns
     # (MiniMax-M3 SP steps) leave a shared expert armed by
     # TPU_MOE_DENSE_FP4_SHARED to the model (on the e4m3-gathered rows,

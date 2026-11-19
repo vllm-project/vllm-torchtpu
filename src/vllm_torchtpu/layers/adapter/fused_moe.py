@@ -23,7 +23,7 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import SharedExpert
+from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import Route, SharedExpert
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     TpSlicedExperts,
     fused_moe_func,
@@ -35,7 +35,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[
-    tuple[int, str, bool, Any, bool, bool, bool], Callable
+    tuple[int, str, bool, Any, bool, bool, bool, Route | None], Callable
 ] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
@@ -164,6 +164,7 @@ def _build_fused_moe_custom_op(
     rhs_quant_dtype=None,
     with_shared: bool = False,
     with_dual: bool = False,
+    route: Route | None = None,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -188,6 +189,7 @@ def _build_fused_moe_custom_op(
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        route=route,
     )
 
     # torch_tpu takes only arrays and POD types as op arguments, so the op
@@ -318,6 +320,7 @@ def _build_fused_moe_custom_op(
         skip_padded_tokens,
         with_shared,
         with_dual,
+        route,
     )
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
@@ -332,6 +335,7 @@ def _get_fused_moe_custom_op(
     skip_padded_tokens: bool | None = None,
     with_shared: bool = False,
     with_dual: bool = False,
+    route: Route | None = None,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
@@ -343,6 +347,7 @@ def _get_fused_moe_custom_op(
         skip_padded_tokens,
         with_shared,
         with_dual,
+        route,
     )
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
@@ -355,6 +360,7 @@ def _get_fused_moe_custom_op(
         skip_padded_tokens=skip_padded_tokens,
         with_shared=with_shared,
         with_dual=with_dual,
+        route=route,
     )
 
 
@@ -367,6 +373,7 @@ def prebuild_fused_moe_kernel(
     skip_padded_tokens: bool | None = None,
     with_shared: bool = False,
     with_dual: bool = False,
+    route: Route | None = None,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -377,6 +384,7 @@ def prebuild_fused_moe_kernel(
         skip_padded_tokens=skip_padded_tokens,
         with_shared=with_shared,
         with_dual=with_dual,
+        route=route,
     )
 
 
@@ -397,8 +405,12 @@ def fused_moe_gmm(
     skip_padded_tokens: bool | None = None,
     shared: tuple[torch.Tensor, ...] | None = None,
     tp_experts: tuple[torch.Tensor, ...] | None = None,
+    route: Route | None = None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
+
+    With ``route``, ``topk_weights`` and ``topk_ids`` carry the routing
+    scores and the scores plus correction bias instead (fused_moe_func).
 
     ``shared`` holds a shared expert's tensors in SharedExpert's order; its
     output is then added to the routed output (fused_moe_func).
@@ -424,6 +436,7 @@ def fused_moe_gmm(
         skip_padded_tokens=skip_padded_tokens,
         with_shared=shared is not None,
         with_dual=tp_experts is not None,
+        route=route,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
