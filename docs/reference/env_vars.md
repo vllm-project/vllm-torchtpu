@@ -9,6 +9,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `VLLM_XLA_CACHE_PATH` | `~/.cache/vllm/xla_cache` | Directory path (or `gs://` URI) for persistent XLA/PJRT compilation cache artifacts. See [Compilation & Warmup Cache](../user_guide/compilation_cache.md). |
+| `LIBTPU_INIT_ARGS` | `""` | libtpu flags. `vllm-torchtpu` adds its defaults in front at import (`env_override.py`): dynamic SMEM negotiation, the SparseCore all-reduce / all-gather offload floors by chip family, and `--xla_tpu_dvfs_p_state=7` on TPU v7. A flag already given here is kept as given. |
 | `VLLM_XLA_CHECK_RECOMPILATION` | `False` | Logs or raises when an unexpected XLA graph recompilation occurs after warmup. |
 | `TPU_PARALLEL_PRECOMPILE` | `False` | Enables parallel compilation during model warmup. |
 | `TPU_MULTIHOST_BACKEND` | `""` (`mp` default, or `"ray"`) | Selects the multi-host execution backend (`"ray"` uses `RayDistributedExecutor`; unset uses native multiprocessing `mp`). See [Multi-Host Serving](../user_guide/multihost.md). |

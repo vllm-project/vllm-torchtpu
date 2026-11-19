@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
 
+import functools
 import logging
 import os
 
@@ -131,6 +132,8 @@ def _fetch_tpu_type_from_metadata() -> str | None:
             "http://metadata.google.internal/computeMetadata/v1/"
             "instance/attributes/accelerator-type",
             headers={"Metadata-Flavor": "Google"},
+            # Bounded: this runs at import, and off GCE nothing may answer.
+            timeout=10,
         )
         if resp.status_code == 200 and resp.text:
             return resp.text
@@ -145,17 +148,24 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
     override = envs.SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES
     if override is not None:
         return override if override > 0 else None
+    tpu_type = _tpu_type() or ""
+    for prefix, size in _TPU_VMEM_BYTES_PER_TENSOR_CORE.items():
+        if tpu_type.startswith(prefix):
+            return size
+    return None
 
+
+@functools.cache
+def _tpu_type() -> str | None:
+    """The accelerator type, lowercased: TPU_ACCELERATOR_TYPE, else the GCE
+    metadata (probed at most once, for every chip-family default)."""
     tpu_type = os.getenv("TPU_ACCELERATOR_TYPE")
     if not tpu_type:
         tpu_type = _fetch_tpu_type_from_metadata()
     if not tpu_type:
         return None
     tpu_type = tpu_type.strip().lower()
-    for prefix, size in _TPU_VMEM_BYTES_PER_TENSOR_CORE.items():
-        if tpu_type.startswith(prefix):
-            return size
-    return None
+    return tpu_type
 
 
 _existing_libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "")
@@ -222,6 +232,15 @@ if _sc_offload_bytes is not None:
             _bytes = min(_bytes, _PREFILL_KERNEL_ALL_REDUCE_BYTES)
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_bytes}")
+
+# --xla_tpu_dvfs_p_state=7 on TPU v7 (the chip-family prefixes of the table
+# above): libtpu's default DVFS state leaves a TensorCore-bound bf16 matmul
+# measurably slower than state 7 on these chips, with HBM bandwidth the same.
+DVFS_P_STATE_FLAG = "--xla_tpu_dvfs_p_state"
+if not _user_has_flag(DVFS_P_STATE_FLAG) and (_tpu_type() or "").startswith(
+    ("tpu7x", "v7x")
+):
+    _libtpu_extra_args.append(f"{DVFS_P_STATE_FLAG}=7")
 
 if _PREFILL_KERNEL_LOWERS_FLOOR:
     _all_reduce_floor = next(
