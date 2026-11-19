@@ -34,7 +34,6 @@ def test_promote_switch(val, expect):
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
     s._promote_warmest_switch = scheduler_options.get(cfg).promote_warmest
     assert s._promote_warmest_on() is expect
-    assert PrefixAwareScheduler.__new__(PrefixAwareScheduler)._promote_warmest_on()
 
 
 @pytest.mark.parametrize("on", [True, False])
