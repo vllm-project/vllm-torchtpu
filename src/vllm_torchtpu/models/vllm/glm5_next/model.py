@@ -39,8 +39,6 @@ import re
 from collections.abc import Iterable
 from typing import Any, NamedTuple, cast
 
-import jax
-import jax.numpy as jnp
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -50,6 +48,8 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import (
@@ -89,9 +89,12 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import _encode_layer_name
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.custom_ops import (
+    glm53_collectives_tpu,
     glm53_kda_tpu,
     glm53_mhc_tpu,
+    glm53_moe_tpu,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     VllmTPUMLAAttention,
@@ -101,6 +104,54 @@ from vllm_torchtpu.logger import init_logger
 from .config import GLM53_MLA_ROPE_PAD, MLA_IMPL_ABSORBED, glm53_mla_impl
 
 logger = init_logger(__name__)
+
+
+def glm53_sp_min_tokens(
+    tp_size: int,
+    *,
+    mhc_pallas: bool,
+    pp_size: int = 1,
+    has_tp_mesh: bool = True,
+) -> int | None:
+    """Smallest token count that runs sequence parallel, or None when SP is off.
+
+    Reads the env, so call it at construction: an env read inside the
+    compiled forward would be baked into the trace.
+    """
+    if (
+        not envs.VLLM_TPU_GLM53_SP_PREFILL
+        or tp_size <= 1
+        or pp_size > 1
+        or not mhc_pallas
+        or not has_tp_mesh
+    ):
+        return None
+    return max(int(envs.VLLM_TPU_GLM53_SP_MIN_TOKENS), tp_size * 32)
+
+
+def _sp_prefill_for(num_tokens: int, min_tokens: int | None, tp_size: int) -> bool:
+    """The per-step sequence-parallel decision.
+
+    Under torch.compile `num_tokens` is the symbolic bucket size, so this
+    leaves a shape guard and `compilation.shape_variants` gives the SP
+    buckets their own trace (the same mechanism Kimi-K3's
+    `num_tokens % world_size` gate relies on).
+    """
+    if min_tokens is None:
+        return False
+    return num_tokens >= min_tokens and num_tokens % (tp_size * 32) == 0
+
+
+def glm53_sp_prefill_enabled(
+    num_tokens: int,
+    tp_size: int,
+    *,
+    mhc_pallas: bool,
+    pp_size: int = 1,
+) -> bool:
+    """Whether to shard the token axis across TP for this forward step."""
+    min_tokens = glm53_sp_min_tokens(tp_size, mhc_pallas=mhc_pallas, pp_size=pp_size)
+    return _sp_prefill_for(num_tokens, min_tokens, tp_size)
 
 
 # Checkpoint (unfused) -> vLLM fused module names. Also consumed by the FP8
@@ -225,16 +276,6 @@ def _clamped_swiglu_fn(gate_up: torch.Tensor, limit: float) -> torch.Tensor:
     return F.silu(gate) * up
 
 
-def _clamped_swiglu_jax(gate_up: jax.Array, *, limit: float) -> jax.Array:
-    """JAX twin of `_clamped_swiglu_fn` (same op order and dtypes)."""
-    gate, up = jnp.split(gate_up, 2, axis=-1)
-    gate = jnp.minimum(gate, limit)
-    up = jnp.clip(up, -limit, limit)
-    # torch's bf16 silu computes in fp32 and rounds once.
-    act = jax.nn.silu(gate.astype(jnp.float32)).astype(gate.dtype)
-    return act * up
-
-
 _SWIGLU_OPS: dict[float, Any] = {}
 
 
@@ -248,7 +289,7 @@ def get_clamped_swiglu_op(limit: float) -> Any:
     if op is None:
         op = pallas.jax_op(
             f"glm53::clamped_swiglu_l{limit:g}".replace(".", "p"),
-            functools.partial(_clamped_swiglu_jax, limit=limit),
+            functools.partial(glm53_moe_tpu.clamped_swiglu_jax, limit=limit),
         )
         # The default fake rejects the symbolic token axis of the compiled
         # backbone's trace.
@@ -312,6 +353,17 @@ def _enable_tpu_swiglu_clamp(experts: nn.Module, swiglu_limit: float) -> None:
     quant_method._resolve_tpu_activation = _resolve_clamped
 
 
+def _local_token_shard(x: torch.Tensor) -> torch.Tensor:
+    """This TP rank's contiguous token shard of a gathered `[T, ...]` tensor.
+
+    Reshape + index rather than a slice with symbolic bounds, the pattern
+    Kimi-K3 uses, so a compiled trace never builds a local token count
+    expression. Selects the same rows as `x[r * T/tp : (r + 1) * T/tp]`.
+    """
+    group = get_tp_group()
+    return x.reshape(group.world_size, -1, *x.shape[1:])[group.rank_in_group]
+
+
 class Glm5NextMLP(nn.Module):
     """Clamped SwiGLU MLP used by the dense layers and the shared expert."""
 
@@ -344,9 +396,19 @@ class Glm5NextMLP(nn.Module):
         # Built now so the compiled backbone finds it cached.
         get_clamped_swiglu_op(self.swiglu_limit)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, *, sequence_parallel: bool = False
+    ) -> torch.Tensor:
+        if sequence_parallel:
+            x = glm53_collectives_tpu.token_all_gather(x)
         gate_up, _ = self.gate_up_proj(x)
         activated = _clamped_swiglu(gate_up, self.swiglu_limit)
+        if sequence_parallel:
+            assert self.down_proj.quant_method is not None
+            partial = self.down_proj.quant_method.apply(
+                self.down_proj, activated, bias=None
+            )
+            return glm53_collectives_tpu.token_reduce_scatter(partial)
         out, _ = self.down_proj(activated)
         return out
 
@@ -358,9 +420,8 @@ class Glm5NextMoE(nn.Module):
     the top-k experts, the un-biased sigmoid scores of those experts are
     renormalized and multiplied by `routed_scaling_factor`. The shared expert
     is added unscaled. Routed experts are vLLM's `FusedMoE`, so the block-FP8
-    checkpoint experts load through it, and its runner computes the routed
-    and shared experts and reduces them across TP. The TPU MoE kernels apply
-    GLM's clamped SwiGLU (see `_enable_tpu_swiglu_clamp`).
+    checkpoint experts load through it; the forward runs the fused one-op MoE
+    (`glm53_moe_tpu`) on TPU, or vLLM's MoE runner otherwise.
     """
 
     def __init__(
@@ -376,6 +437,7 @@ class Glm5NextMoE(nn.Module):
         self.moe_intermediate_size = int(config.moe_intermediate_size)
         self.routed_scaling_factor = float(config.routed_scaling_factor)
         self.swiglu_limit = float(config.swiglu_limit)
+        self.tp_size = get_tensor_model_parallel_world_size()
 
         # Registration order matters: `gate` and `shared_experts` are
         # registered before `experts` so `named_parameters()` reports them
@@ -424,12 +486,67 @@ class Glm5NextMoE(nn.Module):
         )
         _enable_tpu_swiglu_clamp(self.experts, self.swiglu_limit)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def resolve_fused_moe(self) -> None:
+        """Re-resolves the fused MoE op after (re)loading the weights.
+
+        The op captures the weight tensors, and building it registers a
+        `jax_op`, which cannot happen inside a trace. Off TPU the lazy
+        first-forward resolution is kept, so a weight still on the host never
+        caches the vLLM fallback.
+        """
+        if self.gate.weight.device.type != "tpu":
+            return
+        self.__dict__.pop("_fused_moe_args", None)
+        self._fused_moe()
+
+    def _fused_moe(self) -> glm53_moe_tpu.Glm53FusedMoeArgs | None:
+        """The one-dispatch MoE op, resolved after weight load.
+
+        `resolve_fused_moe` runs from the model's
+        `process_weights_after_loading`, before any forward, so a compiled
+        trace only reads the cached value.
+        """
+        fused = self.__dict__.get("_fused_moe_args", False)
+        if fused is False:
+            if torch.compiler.is_compiling():
+                raise RuntimeError(
+                    "GLM-5.3-Flash fused MoE op was not resolved before "
+                    "tracing; process_weights_after_loading must run first."
+                )
+            fused = None
+            if (
+                self.gate.weight.device.type == "tpu"
+                and glm53_moe_tpu.glm53_moe_impl() == glm53_moe_tpu.MOE_IMPL_FUSED
+            ):
+                fused = glm53_moe_tpu.Glm53FusedMoeArgs(self)
+                if fused.op is None:
+                    logger.info_once(
+                        "GLM-5.3-Flash fused MoE disabled: %s", fused.unsupported
+                    )
+                    fused = None
+            self.__dict__["_fused_moe_args"] = fused
+        return fused
+
+    def forward(
+        self, hidden_states: torch.Tensor, *, sequence_parallel: bool = False
+    ) -> torch.Tensor:
         is_2d = hidden_states.ndim == 2
         x_flat = hidden_states if is_2d else hidden_states.view(-1, self.hidden_size)
-        router_logits, _ = self.gate(x_flat)
-        # Routed + shared expert outputs, reduced across TP by the runner.
-        out = self.experts(hidden_states=x_flat, router_logits=router_logits)
+        if sequence_parallel:
+            x_flat = glm53_collectives_tpu.token_all_gather(x_flat)
+        fused = self._fused_moe()
+        if fused is None:
+            router_logits, _ = self.gate(x_flat)
+            # Routed + shared expert outputs, reduced across TP by the runner.
+            out = self.experts(hidden_states=x_flat, router_logits=router_logits)
+            if sequence_parallel:
+                out = _local_token_shard(out)
+            return out if is_2d else out.view_as(hidden_states)
+        out = fused(x_flat.contiguous())
+        if sequence_parallel:
+            out = glm53_collectives_tpu.token_reduce_scatter(out)
+        elif self.tp_size > 1:
+            out = tensor_model_parallel_all_reduce(out)
         return out if is_2d else out.view_as(hidden_states)
 
 
@@ -439,8 +556,8 @@ def _run_rpa_attention(
     """Run `Attention` without building a `SymInt` size tuple under `torch.compile`.
 
     `Attention.forward` allocates `torch.empty((num_tokens, ...))`, which fails
-    TorchTPU's `fx_to_mlir` when `num_tokens` is a symbolic expression rather
-    than a plain graph input. `torch.zeros_like` on
+    TorchTPU's `fx_to_mlir` when `num_tokens` is symbolic (e.g., `%mul` after
+    `token_all_gather` under sequence-parallel prefill). `torch.zeros_like` on
     `v_flat` (`[num_tokens, num_heads * head_size_v]`) avoids a `SymIntArrayRef`
     shape tuple while zero-initializing the output buffer for memory-probe /
     padded-tail calls where the backend leaves `out_3d` untouched.
@@ -609,15 +726,30 @@ class Glm5NextMLAAttention(nn.Module):
                 ),
             )
 
+    def _project_output(
+        self, attn_out: torch.Tensor, *, sequence_parallel: bool
+    ) -> torch.Tensor:
+        if sequence_parallel:
+            assert self.o_proj.quant_method is not None
+            partial = self.o_proj.quant_method.apply(self.o_proj, attn_out, bias=None)
+            return glm53_collectives_tpu.token_reduce_scatter(partial)
+        proj_out, _ = self.o_proj(attn_out)
+        return proj_out
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        sequence_parallel: bool = False,
     ) -> torch.Tensor:
-        """Attention output `[T, hidden]`."""
+        """Attention output `[T, hidden]` (`[T / tp, hidden]` under SP)."""
         del positions  # NoPE: no rotary embedding on the MLA layers.
         # One compiled fusion per norm instead of eager `RMSNorm` (same op
-        # order as vLLM's `rms_norm`, so bit-exact).
+        # order as vLLM's `rms_norm`, so bit-exact). Under sequence-parallel
+        # prefill, the replicated down-projections and norms run on the local
+        # token shard `[T / tp, D]` and the narrower `q_lora || kv_latent` is
+        # all-gathered instead of the hidden states.
         q_lora, _ = self.q_a_proj(hidden_states)
         q_lora = glm53_mhc_tpu.rms_norm_weighted(
             q_lora,
@@ -630,6 +762,13 @@ class Glm5NextMLAAttention(nn.Module):
             self.kv_a_layernorm.weight,
             self.kv_a_layernorm.variance_epsilon,
         )
+        if sequence_parallel:
+            qkv_latent = glm53_collectives_tpu.token_all_gather(
+                torch.cat([q_lora, kv_latent], dim=-1)
+            )
+            q_lora, kv_latent = torch.split(
+                qkv_latent, [self.q_lora_rank, self.kv_lora_rank], dim=-1
+            )
         q, _ = self.q_b_proj(q_lora)  # [T, H_local * qk_head_dim]
 
         if self.mla_attn is not None:
@@ -656,8 +795,7 @@ class Glm5NextMLAAttention(nn.Module):
                 k.reshape(-1, self.num_local_heads * self.qk_head_dim),
                 v.reshape(-1, self.num_local_heads * self.v_head_dim),
             )
-        proj_out, _ = self.o_proj(attn_out)
-        return proj_out
+        return self._project_output(attn_out, sequence_parallel=sequence_parallel)
 
 
 class MhcDeferredPost(NamedTuple):
@@ -741,6 +879,8 @@ class Glm5NextDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_streams: torch.Tensor,
         deferred: MhcDeferredPost | None = None,
+        *,
+        sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, MhcDeferredPost | None]:
         """Runs the layer; returns `(hidden_streams, deferred_post)`.
 
@@ -751,8 +891,13 @@ class Glm5NextDecoderLayer(nn.Module):
         `deferred_post` is always None.
         """
         if self._mhc_pallas:
-            return self._forward_pallas_mhc(positions, hidden_streams, deferred)
-        assert deferred is None
+            return self._forward_pallas_mhc(
+                positions,
+                hidden_streams,
+                deferred,
+                sequence_parallel=sequence_parallel,
+            )
+        assert deferred is None and not sequence_parallel
         post_attn, comb_attn, norm_attn_in = self.attn_hc.collapse_and_norm(
             hidden_streams
         )
@@ -768,15 +913,28 @@ class Glm5NextDecoderLayer(nn.Module):
         return hidden_streams, None
 
     def _run_attention(
-        self, hidden_states: torch.Tensor, positions: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        sequence_parallel: bool = False,
     ) -> torch.Tensor:
         if isinstance(self.self_attn, Glm5NextMLAAttention):
-            return self.self_attn(hidden_states, positions)
-        out = self.self_attn.forward_direct(hidden_states, positions)
+            return self.self_attn(
+                hidden_states, positions, sequence_parallel=sequence_parallel
+            )
+        out = self.self_attn.forward_direct(
+            hidden_states, positions, sequence_parallel=sequence_parallel
+        )
         if out is not None:
             return out
         # The KDA layer's direct path declines eager steps without a state
-        # cache (the startup profile run); run its generic forward instead.
+        # cache (the startup profile run); run its generic forward on the
+        # full token axis instead.
+        if sequence_parallel:
+            full_hidden = glm53_collectives_tpu.token_all_gather(hidden_states)
+            full_out = self.self_attn(hidden_states=full_hidden, positions=positions)
+            return _local_token_shard(full_out)
         return self.self_attn(hidden_states=hidden_states, positions=positions)
 
     def _forward_pallas_mhc(
@@ -784,6 +942,8 @@ class Glm5NextDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_streams: torch.Tensor,
         deferred: MhcDeferredPost | None,
+        *,
+        sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, MhcDeferredPost]:
         attn_hc, ffn_hc = self.attn_hc, self.ffn_hc
         if deferred is None:
@@ -807,7 +967,9 @@ class Glm5NextDecoderLayer(nn.Module):
                 attn_hc.base_f32,
                 attn_hc.sublayer_norm_weight,
             )
-        attn_out = self._run_attention(norm_attn_in, positions)
+        attn_out = self._run_attention(
+            norm_attn_in, positions, sequence_parallel=sequence_parallel
+        )
         residual, post, comb, norm_ffn_in = ffn_hc.mhc_ops.fused(
             attn_out,
             residual,
@@ -818,7 +980,7 @@ class Glm5NextDecoderLayer(nn.Module):
             ffn_hc.base_f32,
             ffn_hc.sublayer_norm_weight,
         )
-        ffn_out = self.mlp(norm_ffn_in)
+        ffn_out = self.mlp(norm_ffn_in, sequence_parallel=sequence_parallel)
         return residual, MhcDeferredPost(ffn_out, residual, post, comb)
 
 
@@ -874,11 +1036,23 @@ class Glm5NextTextModel(nn.Module):
             glm53_mhc_tpu.get_rms_norm_weighted_op(self.norm.variance_epsilon)
         else:
             self.norm = PPMissingLayer()
+        has_sp_mesh = True
+        if not vllm_config.model_config.enforce_eager:
+            # The SP token collectives need their mesh before tracing starts.
+            glm53_collectives_tpu.prepare()
+            has_sp_mesh = glm53_collectives_tpu.has_tp_mesh()
 
         # Resolved here, not in `forward`: env reads and the mHC impl choice
         # would otherwise be traced into the compiled program as constants,
         # and every decoder layer agrees on them.
         self._mhc_pallas = mhc_pallas_enabled(vllm_config)
+        self._tp_size = get_tensor_model_parallel_world_size()
+        self._sp_min_tokens = glm53_sp_min_tokens(
+            self._tp_size,
+            mhc_pallas=self._mhc_pallas,
+            pp_size=get_pp_group().world_size,
+            has_tp_mesh=has_sp_mesh,
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -896,12 +1070,19 @@ class Glm5NextTextModel(nn.Module):
         # The Pallas mHC ops carry the streams flattened to [T, M * D]; the
         # compiled path keeps [T, M, D].
         flat = bool(layers) and self._mhc_pallas
+        tp_size = self._tp_size
+        sequence_parallel = False
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 assert input_ids is not None
                 hidden_states = self.embed_input_ids(input_ids)
+            sequence_parallel = _sp_prefill_for(
+                hidden_states.shape[0], self._sp_min_tokens, tp_size
+            )
+            if sequence_parallel:
+                hidden_states = _local_token_shard(hidden_states)
             if flat:
                 # [T, D] -> [T, M * D]: M copies, same bytes as [T, M, D].
                 hidden_streams = hidden_states.repeat(1, self.hc_mult)
@@ -926,6 +1107,7 @@ class Glm5NextTextModel(nn.Module):
                 positions=positions,
                 hidden_streams=hidden_streams,
                 deferred=deferred,
+                sequence_parallel=sequence_parallel,
             )
         if deferred is not None:
             # Pallas mHC path: settle the post the last layer deferred.
@@ -946,6 +1128,8 @@ class Glm5NextTextModel(nn.Module):
         out = glm53_mhc_tpu.rms_norm_weighted(
             collapsed, self.norm.weight, self.norm.variance_epsilon
         )
+        if sequence_parallel:
+            out = glm53_collectives_tpu.token_all_gather(out)
         return out
 
 
@@ -1084,14 +1268,17 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
         Folds every KDA layer's conv weight into the Kimi ops' layout (vLLM's
         per-module hook normally does this already; the fold is idempotent,
         and running it here keeps it independent of which hooks a vLLM
-        version calls) and splits each mHC site's `fn` for the Pallas
-        kernels.
+        version calls), splits each mHC site's `fn` for the Pallas kernels,
+        and resolves each MoE layer's fused op, which registers a `jax_op`
+        and so cannot be built inside the compiled backbone.
         """
         for module in self.modules():
             if isinstance(module, glm53_kda_tpu.Glm53TpuKimiDeltaAttention):
                 module.fold_conv_weight()
             elif isinstance(module, glm53_mhc_tpu.FusedGlm53HyperConnectionTpu):
                 module.prepare_pallas_weights()
+            elif isinstance(module, Glm5NextMoE):
+                module.resolve_fused_moe()
 
     @classmethod
     def get_mamba_state_dtype_from_config(

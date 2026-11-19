@@ -185,6 +185,13 @@ class Glm53GatedRMSNorm(nn.Module):
         return out.to(x.dtype)
 
 
+def _sp_collectives() -> Any:
+    """GLM-5.3's sequence-parallel token collectives."""
+    from vllm_torchtpu.layers.adapter.custom_ops import glm53_collectives_tpu
+
+    return glm53_collectives_tpu
+
+
 class Glm53TpuKimiDeltaAttention(KimiGatedDeltaNetAttention):
     """``KimiGatedDeltaNetAttention`` on the TPU Kimi KDA ops."""
 
@@ -451,14 +458,23 @@ class Glm53TpuKimiDeltaAttention(KimiGatedDeltaNetAttention):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor | None = None,
+        *,
+        sequence_parallel: bool = False,
     ) -> torch.Tensor:
         """Projections, KDA and ``o_proj``; returns the layer output.
+
+        With ``sequence_parallel`` the caller holds ``T / tp`` tokens: they are
+        all-gathered before the projections, and ``o_proj``'s partial sums are
+        reduce-scattered back instead of all-reduced.
 
         Before the state cache exists (profiling runs, including the compiled
         memory profile) the KDA output is zeros, so the projections and
         ``o_proj`` still run at the step's shapes, as in Kimi-K3.
         """
         del positions
+        collectives = _sp_collectives() if sequence_parallel else None
+        if collectives is not None:
+            hidden_states = collectives.token_all_gather(hidden_states)
         projected = self.in_proj_qkvgfab(hidden_states)[0]
         if self.use_full_rank_gate:
             split_sizes = [
@@ -489,11 +505,19 @@ class Glm53TpuKimiDeltaAttention(KimiGatedDeltaNetAttention):
             core = self._kda_core(
                 metadata, mixed_qkv, raw_gate, beta, output_gate
             ).view(-1, self.local_projection_size)
+        if collectives is not None:
+            assert self.o_proj.quant_method is not None
+            partial = self.o_proj.quant_method.apply(self.o_proj, core, bias=None)
+            return collectives.token_reduce_scatter(partial)
         return self.o_proj(core)[0]
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor | None = None,
+        *,
+        sequence_parallel: bool = False,
     ) -> torch.Tensor:
-        return self.forward_direct(hidden_states, positions)
+        return self.forward_direct(
+            hidden_states, positions, sequence_parallel=sequence_parallel
+        )
