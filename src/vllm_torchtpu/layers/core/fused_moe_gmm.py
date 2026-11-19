@@ -127,7 +127,8 @@ _COUNTING_SORT = envs.TPU_MOE_COUNTING_SORT
 # Fixed at import: the valid route count comes from the counting sort.
 _VALID_COUNT_FROM_SORT = envs.TPU_MOE_VALID_COUNT_FROM_SORT
 if _VALID_COUNT_FROM_SORT:
-    logger.info(
+    # warning: imported before vLLM sets the worker log level; the proof line.
+    logger.warning(
         "TPU_MOE_VALID_COUNT_FROM_SORT=1 on: the MoE combine's computed-row "
         "count comes from the counting sort's bucket bases"
     )
