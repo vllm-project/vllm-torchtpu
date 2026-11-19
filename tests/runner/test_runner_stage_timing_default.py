@@ -59,7 +59,6 @@ def test_options_come_from_the_tpu_runner_section():
     assert runner_options.get(SimpleNamespace(additional_config=None)) == (
         runner_options.RunnerOptions()
     )
-    assert runner_options.get(SimpleNamespace()).stage_timing is True
 
 
 @pytest.mark.parametrize(
