@@ -51,10 +51,10 @@ def _to_device(mm_kwargs: Any, device: torch.device) -> Any:
     )
 
 
-# Host rows reach the device as chunks of 1/ROW_CHUNKS of a budget's rows
-# (`rows_to_device`), so the device program depends on the chunk count, not
-# the row count. Uploading 30000 of 32768 rows as 8 chunks took 6.3 ms, as one
-# tensor 8.5 ms; copying them into one budget-shaped host buffer first, 14 ms.
+# Host rows reach the device as ROW_CHUNKS chunks of 1/ROW_CHUNKS of a budget's
+# rows (`rows_to_device`), so no device program depends on the row count.
+# Uploading 30000 of 32768 rows as 8 chunks took 6.3 ms, as one tensor 8.5 ms;
+# copying them into one budget-shaped host buffer first, 14 ms.
 ROW_CHUNKS = 8
 
 
@@ -64,56 +64,61 @@ def rows_to_device(
     """The concatenated host rows of `parts`, zero-padded to `template`'s shape
     and dtype, on its device.
 
-    Each run of rows uploads as whole chunks, all views: the last chunk ends at
-    the run's end and overlaps the one before it. A gather by a host-built
-    index then picks every row once, and the padding rows from a zero row.
+    The span of host memory holding the parts uploads as ROW_CHUNKS views,
+    spread evenly over it (overlapping when it is shorter than the budget),
+    and a gather by a host-built index picks each part's rows in order, and
+    the padding rows from a zero row. The device ops then have the budget's
+    shapes only, and fuse with the budget-inputs hook's into one program per
+    budget (compiled by `MMEncoderManager._capture_budget_graph`).
     """
     rows, rest = template.shape[0], tuple(template.shape[1:])
-    size = rows // ROW_CHUNKS if rows % ROW_CHUNKS == 0 else rows
-    device, chunks, index, offset = template.device, [], [], 0
-    for run in _coalesce(parts):
-        n = run.shape[0]
-        if n < size:
-            # Only below the smallest budget's chunk: pad it on the host, and
-            # upload it blocking, as the padded copy dies with this call.
-            chunks.append(torch.cat([run, run.new_zeros(size - n, *rest)]).to(device))
-            starts = [0]
-        else:
-            starts = [*range(0, n - size, size), n - size]
-            for start in starts:
-                chunks.append(run[start : start + size].to(device, non_blocking=True))
-        at = np.arange(n)
-        overlap = at >= (len(starts) - 1) * size
-        at[overlap] += (len(starts) - 1) * size - starts[-1]
-        index.append(offset + at)
-        offset += len(starts) * size
-    used = sum(len(i) for i in index)
-    index.append(np.full(rows - used, offset))  # the zero row
+    size = -(-rows // ROW_CHUNKS)
+    span, offsets, copied = _span(parts, rows)
+    if span.shape[0] < size:
+        # Shorter than one chunk (the smallest budgets): pad it on the host.
+        span = torch.cat([span, span.new_zeros(size - span.shape[0], *rest)])
+        copied = True
+    last = span.shape[0] - size
+    starts = np.linspace(0, last, ROW_CHUNKS).round().astype(np.int64)
+    # A host copy dies with this call, so it uploads blocking.
+    chunks = [
+        span[start : start + size].to(template.device, non_blocking=not copied)
+        for start in starts
+    ]
+    at = np.concatenate(
+        [np.arange(o, o + p.shape[0]) for o, p in zip(offsets, parts, strict=True)]
+    )
+    chunk = np.searchsorted(starts, at, side="right") - 1
+    index = np.full(rows, ROW_CHUNKS * size, dtype=np.int64)  # the zero row
+    index[: len(at)] = chunk * size + at - starts[chunk]
     source = torch.cat([*chunks, chunks[0].new_zeros(1, *rest)])
-    picks = torch.from_numpy(np.concatenate(index)).to(device, non_blocking=True)
-    out = source[picks].to(template.dtype)
-    # A program of its own, as `MMEncoderManager._warm_rows_to_device` compiles it.
-    synchronize_tensors([out], wait=False)
-    return out
+    picks = torch.from_numpy(index).to(template.device, non_blocking=True)
+    return source[picks].to(template.dtype)
 
 
-def _coalesce(parts: Sequence[torch.Tensor]) -> list[torch.Tensor]:
-    """`parts` with neighbours that are adjacent in one storage merged."""
-    runs: list[torch.Tensor] = []
-    for part in parts:
-        last = runs[-1] if runs else None
-        if (
-            last is not None
-            and last.is_contiguous()
-            and part.is_contiguous()
-            and part.untyped_storage().data_ptr() == last.untyped_storage().data_ptr()
-            and part.storage_offset() == last.storage_offset() + last.numel()
-        ):
-            shape = (last.shape[0] + part.shape[0], *last.shape[1:])
-            runs[-1] = last.as_strided(shape, last.stride(), last.storage_offset())
-        else:
-            runs.append(part)
-    return runs
+def _span(
+    parts: Sequence[torch.Tensor], rows: int
+) -> tuple[torch.Tensor, list[int], bool]:
+    """A host tensor holding every part, each part's first row in it, and
+    whether it is a copy: a view of the parts' own storage when they are row
+    slices of one tensor within `rows` rows of each other, else a
+    concatenation."""
+    first = parts[0]
+    row = first[0].numel() if first.shape[0] else 0
+    if row and all(
+        p.is_contiguous()
+        and p.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+        and (p.storage_offset() - first.storage_offset()) % row == 0
+        for p in parts
+    ):
+        base = min(p.storage_offset() for p in parts)
+        end = max(p.storage_offset() + p.numel() for p in parts)
+        if end - base <= rows * row:
+            shape = ((end - base) // row, *first.shape[1:])
+            span = first.as_strided(shape, first.stride(), base)
+            return span, [(p.storage_offset() - base) // row for p in parts], False
+    starts = np.cumsum([0] + [p.shape[0] for p in parts[:-1]])
+    return torch.cat(list(parts)), [int(s) for s in starts], True
 
 
 @contextmanager
@@ -365,17 +370,15 @@ class MMEncoderManager(EncoderCudaGraphManager):
             out = self._compiled_budget_forward(dict(template), path=path)
             synchronize_tensors(out, wait=True)
             if self.has_budget_inputs_hook:
-                # The hook's device ops have the budget's shapes: compile them now.
+                # The hook's device ops, and the upload of its host rows, have
+                # the budget's shapes: compile the program they fuse into, as
+                # `_run_budget_graph` runs them.
                 values = getattr(self.model, BUDGET_INPUTS_HOOK)(
                     None, template, self.max_batch_size, self.max_frames_per_batch
                 )
-                synchronize_tensors(
-                    [v for v in values.values() if isinstance(v, torch.Tensor)],
-                    wait=True,
-                )
-                for key, value in values.items():
-                    if isinstance(value, list):
-                        self._warm_rows_to_device(path, token_budget, key)
+                padded = self._pad_to_template(values, token_budget, path=path)
+                out = self._compiled_budget_forward(dict(padded), path=path)
+                synchronize_tensors(out, wait=True)
             self.compiled_budgets[path].add(token_budget)
         except Exception as e:
             logger.warning(
@@ -385,21 +388,6 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 path,
                 e,
             )
-
-    def _warm_rows_to_device(self, path: str, token_budget: int, key: str) -> None:
-        """Compile `rows_to_device` of `key` at every chunk count a batch of
-        this budget can have: a batch gets the smallest budget that holds it,
-        so it has more rows than the next smaller budget's template."""
-        template = self.budget_templates[path][token_budget][key]
-        smaller = [b for b in self.budget_templates[path] if b < token_budget]
-        fewer = (
-            self.budget_templates[path][max(smaller)][key].shape[0] if smaller else 0
-        )
-        rows = template.shape[0]
-        size = rows // ROW_CHUNKS if rows % ROW_CHUNKS == 0 else rows
-        for count in range(fewer // size + 1, rows // size + 1):
-            part = torch.zeros(count * size, *template.shape[1:], dtype=template.dtype)
-            synchronize_tensors([rows_to_device([part], template)], wait=True)
 
     @torch.no_grad()
     def _run_budget_graph(
@@ -432,12 +420,6 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 self.budget_templates[path][token_budget],
                 self.max_batch_size,
                 self.max_frames_per_batch,
-            )
-            # As their own program, the one warm-up compiled; fused with the
-            # pixel upload's, they would make a program per chunk count.
-            synchronize_tensors(
-                [v for v in values.values() if isinstance(v, torch.Tensor)],
-                wait=False,
             )
         else:
             values = self.model.prepare_encoder_cudagraph_replay_buffers(

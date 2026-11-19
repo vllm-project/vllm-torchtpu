@@ -534,7 +534,7 @@ def _prepare_encoder_budget_inputs(
     the template's. Pixels pass through for the manager to pad: on the
     device, or as host item slices (`_select_encoder_items`), which it uploads
     in chunks of the budget (`rows_to_device`). `mm_kwargs=None` builds a
-    stand-in that fills the budget, with no host pixels (warm-up).
+    stand-in that fills the budget, with host pixels (warm-up).
     """
     from vllm.model_executor.layers.attention.mm_encoder_attention import (
         MMEncoderAttention,
@@ -545,7 +545,9 @@ def _prepare_encoder_budget_inputs(
     rows = template["pos_embeds"].shape[0]
     if mm_kwargs is None:
         side = int(rows**0.5) // merge * merge
-        grid, is_video, pixels = [(1, side, side)], False, []
+        grid, is_video = [(1, side, side)], False
+        stand_in = template["pixel_values"]
+        pixels = [torch.zeros(stand_in.shape, dtype=stand_in.dtype)]
     else:
         grid = [
             tuple(int(v) for v in g) for g in self._get_grid_thw_by_modality(mm_kwargs)
