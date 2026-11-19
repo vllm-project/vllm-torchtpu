@@ -37,6 +37,7 @@ from vllm_torchtpu.megakernel.advisor import (
     models,
     roofline,
     spec_bridge,
+    specs,
     support,
 )
 from vllm_torchtpu.megakernel.advisor.roofline import (
@@ -53,6 +54,7 @@ from vllm_torchtpu.megakernel.advisor.verdict import (
     _evaluate_corners,
 )
 from vllm_torchtpu.megakernel.advisor.vmem import _mesh_divisibility_reasons
+from vllm_torchtpu.megakernel.core import runtime as core_runtime
 from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec, Tiles
 
@@ -268,7 +270,7 @@ def test_deepseek_v3_mla_kv_split_physics() -> None:
     )
     assert r_ds2.hbm_used_gb < r_ds1.hbm_used_gb
     assert [
-        (s.feasible, s.support, "unmodeled_layer_family" in s.blockers)
+        (s.feasible, s.support, "family_not_in_core" in s.blockers)
         for s in r_ds1.scopes
         if s.scope == "whole_step"
     ] == [(True, "hypothetical", True)]
@@ -687,7 +689,9 @@ def test_intra_host_dp_grouped_moe_consistency() -> None:
     """Verify intra-host DPExchange groups MoE while multi-host DCN stays ungrouped."""
     grouped_phi_ceiling = 5.0
     ungrouped_phi_floor = 10.0
-    model_profile = advisor.resolve_model_profile("qwen3.5-397b")
+    model_profile = dataclasses.replace(
+        advisor.resolve_model_profile("qwen3.5-397b"), weight_block_k=0
+    )
     rep_grp = advisor.advise(
         model_profile,
         advisor.WorkloadSpec(
@@ -743,6 +747,73 @@ def test_intra_host_dp_grouped_moe_consistency() -> None:
     assert rep_dcn.recommended_moe_mode != "grouped_on_chip"
 
 
+def test_block_scaled_ungrouped_dp_prefers_grouped_single_layer() -> None:
+    """Verify block-scaled DP stays ungrouped whole-step and picks single-layer."""
+    grouped_phi_ceiling = 5.0
+    ungrouped_phi_floor = 10.0
+    model_profile = advisor.resolve_model_profile("qwen3.5-397b")
+    assert model_profile.weight_block_k > 0
+    rep_grp = advisor.advise(
+        model_profile,
+        advisor.WorkloadSpec(
+            phase="decode",
+            batch=600,
+            context=32768,
+            tp=2,
+            dp=4,
+            ep=8,
+            moe_mode="grouped_on_chip",
+        ),
+        "tpu7x",
+    )
+    ws_grp = next(s for s in rep_grp.scopes if s.scope == "whole_step")
+    assert ws_grp.moe_flop_factor < grouped_phi_ceiling
+    assert rep_grp.fastest_scope == "whole_step"
+    assert rep_grp.recommended_scope == "per_op"
+    assert rep_grp.recommended_moe_mode == "grouped_on_chip"
+    assert float(rep_grp.metrics["achievable_gain_pct"]["value"]) > 0.0
+
+    rep_msk = advisor.advise(
+        model_profile,
+        advisor.WorkloadSpec(
+            phase="decode",
+            batch=600,
+            context=32768,
+            tp=2,
+            dp=4,
+            ep=8,
+            moe_mode="masked_on_chip",
+        ),
+        "tpu7x",
+    )
+    ws_msk = next(s for s in rep_msk.scopes if s.scope == "whole_step")
+    assert ws_msk.moe_flop_factor > ungrouped_phi_floor
+    # An ungrouped whole step pays block-scale work on every padded row, so
+    # the grouped single-layer scope is faster.
+    assert rep_msk.fastest_scope == "single_layer"
+    assert rep_msk.recommended_moe_mode == "grouped_on_chip"
+
+    rep_dcn = advisor.advise(
+        model_profile,
+        advisor.WorkloadSpec(
+            phase="decode",
+            batch=600,
+            context=32768,
+            tp=2,
+            dp=8,
+            ep=16,
+            moe_mode="grouped_on_chip",
+        ),
+        "tpu7x",
+    )
+    ws_dcn = next(s for s in rep_dcn.scopes if s.scope == "whole_step")
+    assert ws_dcn.moe_flop_factor > ungrouped_phi_floor
+    # An ungrouped whole step pays block-scale work on every padded row, so
+    # the grouped single-layer scope is faster.
+    assert rep_dcn.fastest_scope == "single_layer"
+    assert rep_dcn.recommended_moe_mode == "grouped_on_chip"
+
+
 def test_unchunked_pp_prefill_preserves_window() -> None:
     """Verify unchunked B=1 prefill under PP>1 preserves its full stage window."""
     model_profile = advisor.resolve_model_profile("qwen3.5-397b")
@@ -763,16 +834,43 @@ def test_unchunked_pp_prefill_preserves_window() -> None:
     )
     assert rep_single.active_tokens == isl_tokens
     assert rep_single.recommended_scope == "per_op"
-    assert rep_single.fastest_scope == "single_layer"
-    assert rep_single.recommended_moe_mode == "grouped_on_chip"
+    # Block-scaled FP8 weights make one full-window single-layer call slower
+    # than per_op, so no fused scope has a positive compiler-proof gain.
+    assert rep_single.fastest_scope == "per_op"
+    assert rep_single.recommended_moe_mode == "grouped_in_hbm"
     per_op_sc = next(s for s in rep_single.scopes if s.scope == "per_op")
     single_sc = next(s for s in rep_single.scopes if s.scope == "single_layer")
-    pure_diff_us = per_op_sc.step_bound_us - single_sc.step_bound_us
+    assert single_sc.step_bound_us > per_op_sc.step_bound_us
+    assert float(rep_single.metrics["compiler_proof_gain_pct"]["value"]) == 0.0
+
+    rep_half_window = advisor.advise(
+        model_profile,
+        advisor.WorkloadSpec(
+            phase="prefill",
+            batch=1,
+            isl=isl_tokens // 2,
+            tp=1,
+            pp=8,
+            ep=1,
+            chunk_size=0,
+            microbatches=0,
+        ),
+        "tpu7x",
+    )
+    assert rep_half_window.active_tokens == isl_tokens // 2
+    assert rep_half_window.fastest_scope == "single_layer"
+    per_op_half = next(
+        scope for scope in rep_half_window.scopes if scope.scope == "per_op"
+    )
+    single_half = next(
+        scope for scope in rep_half_window.scopes if scope.scope == "single_layer"
+    )
+    pure_diff_us = per_op_half.step_bound_us - single_half.step_bound_us
     expected_gain_pct = round(
-        100.0 * pure_diff_us / max(1e-6, per_op_sc.step_bound_us), 2
+        100.0 * pure_diff_us / max(1e-6, per_op_half.step_bound_us), 2
     )
     assert (
-        float(rep_single.metrics["compiler_proof_gain_pct"]["value"])
+        float(rep_half_window.metrics["compiler_proof_gain_pct"]["value"])
         == expected_gain_pct
     )
     assert expected_gain_pct > 0.0
@@ -1404,15 +1502,9 @@ def test_validate_workload_names_row_limit_below_one_request() -> None:
 
 def test_rows_above_default_buckets_flagged() -> None:
     """Verify CORE_LIMITS mirrors the core bucket defaults and flags larger calls."""
-    core_dir = Path(advisor.__file__).resolve().parent.parent / "core"
-    policy_text = (core_dir / "runtime" / "policy.py").read_text("utf-8")
     tops = [
-        max(
-            ast.literal_eval(
-                policy_text.split(f"{name}: tuple[int, ...] = ", 1)[1].split("\n", 1)[0]
-            )
-        )
-        for name in ("DEFAULT_BUCKETS", "DEFAULT_VERIFY_BUCKETS")
+        max(core_runtime.DEFAULT_BUCKETS),
+        max(core_runtime.DEFAULT_VERIFY_BUCKETS),
     ]
     lim = advisor.CORE_LIMITS
     assert [lim.default_decode_bucket_top, lim.default_verify_bucket_top] == tops
@@ -2059,7 +2151,7 @@ def test_sourced_declaration_satisfies_rank_family_and_attention_dp_checks(
         chip_spec,
     )
     assert _whole_step_of(glm_report).support == "hypothetical"
-    assert "unmodeled_layer_family" in _whole_step_of(glm_report).blockers
+    assert "family_not_in_core" in _whole_step_of(glm_report).blockers
 
     # The same block without the flag brings the all-to-all blocker back.
     block_without_flag = {
@@ -3381,10 +3473,10 @@ def test_glm_moe_dsa_evaluate_corners_matches_step_upper_us() -> None:
         )
 
 
-def test_homogeneous_dsa_profile_within_core_limits(
+def test_homogeneous_dsa_profile_gated_without_core_family(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify all-full DSA resolves within_core_limits and VMEM/DCP rules."""
+    """Verify all-full DSA VMEM/DCP layout, core gating, and dcp_gather pricing."""
     profile = models.model_profile_from_hf_config(HOMOGENEOUS_DSA_CFG, name="homo-dsa")
     assert profile.is_periodic
     assert profile.layer_families == ("dsa", "moe")
@@ -3416,8 +3508,8 @@ def test_homogeneous_dsa_profile_within_core_limits(
     chip_spec = advisor.resolve_chip_spec("tpu7x")
     report = advisor.advise(profile, workload, chip_spec)
     whole_step = next(s for s in report.scopes if s.scope == "whole_step")
-    assert whole_step.support == "within_core_limits"
-    assert whole_step.blockers == ()
+    assert whole_step.support == "hypothetical"
+    assert whole_step.blockers == ("family_not_in_core",)
 
     # Declared dcp_gather step on a DSA model suppresses automatic DSA DCP pricing
     # so cross-DCP collectives are never double-counted.
@@ -3494,3 +3586,150 @@ def test_homogeneous_dsa_profile_within_core_limits(
     assert whole_step.step_achievable_us - declared_whole.step_achievable_us == (
         pytest.approx(expected_achievable_drop_us, abs=display_round_tol_us)
     )
+
+
+def test_support_separates_core_module_families_from_physics_modeled() -> None:
+    """Verify whole_step support separates core module families from priced models."""
+    default_workload = advisor.WorkloadSpec(phase="decode", batch=4, context=4096, tp=8)
+
+    mistral_profile = advisor.resolve_model_profile("mistral-large")
+    assert "dense_mlp" in mistral_profile.layer_families
+    assert mistral_profile.weight_dtype in specs.CORE_SUPPORTED_DTYPES
+    mistral_report = advisor.advise("mistral-large", default_workload, "tpu7x")
+    mistral_whole_step = _whole_step_of(mistral_report)
+    assert "family_not_in_core" in mistral_whole_step.blockers
+    assert "dtype_not_in_core" not in mistral_whole_step.blockers
+    assert "unmodeled_layer_family" not in mistral_whole_step.blockers
+
+    gpt_oss_profile = advisor.resolve_model_profile("gpt-oss-120b")
+    assert all(
+        family in specs.CORE_MODULE_FAMILIES
+        for family in gpt_oss_profile.layer_families
+    )
+    assert gpt_oss_profile.expert_dtype not in specs.CORE_SUPPORTED_DTYPES
+    gpt_oss_whole_step = _whole_step_of(
+        advisor.advise("gpt-oss-120b", default_workload, "tpu7x")
+    )
+    assert "dtype_not_in_core" in gpt_oss_whole_step.blockers
+    assert "family_not_in_core" not in gpt_oss_whole_step.blockers
+
+    qwen3_profile = advisor.resolve_model_profile("qwen3-30b-a3b")
+    assert all(
+        family in specs.CORE_MODULE_FAMILIES for family in qwen3_profile.layer_families
+    )
+    assert qwen3_profile.weight_dtype in specs.CORE_SUPPORTED_DTYPES
+    assert qwen3_profile.expert_dtype in specs.CORE_SUPPORTED_DTYPES
+    qwen3_whole_step = _whole_step_of(
+        advisor.advise("qwen3-30b-a3b", default_workload, "tpu7x")
+    )
+    assert "family_not_in_core" not in qwen3_whole_step.blockers
+    assert "dtype_not_in_core" not in qwen3_whole_step.blockers
+
+    deepseek_profile = advisor.resolve_model_profile("deepseek-v3")
+    assert "dense_prefix_moe" in deepseek_profile.layer_families
+    deepseek_whole_step = _whole_step_of(
+        advisor.advise("deepseek-v3", default_workload, "tpu7x")
+    )
+    assert "family_not_in_core" in deepseek_whole_step.blockers
+    assert "unmodeled_layer_family" not in deepseek_whole_step.blockers
+    assert "planner_rejected" in deepseek_whole_step.blockers
+
+    decode_layout = advisor.DEPLOYMENT_PRESETS["kimi-k3"].decode
+    assert decode_layout is not None
+    kimi_workload = advisor.WorkloadSpec(
+        phase="decode",
+        batch=4,
+        context=4096,
+        tp=decode_layout.tp,
+        ep=decode_layout.ep,
+        dcp=decode_layout.dcp,
+    )
+    kimi_report = advisor.advise("kimi-k3", kimi_workload, "tpu7x")
+    kimi_whole_step = _whole_step_of(kimi_report)
+    assert kimi_whole_step.support == "declared"
+    assert kimi_whole_step.blockers == ()
+
+    expected_tiers: tuple[tuple[str, specs.ModelSupportTier], ...] = (
+        ("kimi-k3", "declared"),
+        ("qwen3.5-397b", "declared"),
+        ("qwen3-30b-a3b", "core_families"),
+        ("mistral-large", "priced_only"),
+        ("gpt-oss-120b", "priced_only"),
+        ("glm-5.2", "priced_only"),
+    )
+    classified_tiers: dict[str, tuple[specs.ModelSupportTier, tuple[str, ...]]] = {}
+    for model_name, expected_tier in expected_tiers:
+        actual_tier, actual_notes = support.classify_model_support_tier(
+            advisor.resolve_model_profile(model_name)
+        )
+        assert actual_tier == expected_tier
+        classified_tiers[model_name] = (actual_tier, actual_notes)
+
+    assert (
+        classified_tiers["kimi-k3"][1]
+        == advisor.DEPLOYMENT_PRESETS["kimi-k3"].unmodeled_notes
+    )
+    assert classified_tiers["kimi-k3"][1] != ()
+    assert classified_tiers["mistral-large"][1] == ()
+    expected_kimi_tier, expected_kimi_notes = classified_tiers["kimi-k3"]
+    assert kimi_report.support_tier == expected_kimi_tier
+    assert kimi_report.unmodeled_notes == expected_kimi_notes
+    expected_mistral_tier, expected_mistral_notes = classified_tiers["mistral-large"]
+    assert mistral_report.support_tier == expected_mistral_tier
+    assert mistral_report.unmodeled_notes == expected_mistral_notes
+
+
+def test_support_tier_classifies_partly_unmodeled() -> None:
+    """Verify configs with an unmodeled layer family resolve as partly_unmodeled."""
+    default_workload = advisor.WorkloadSpec(phase="decode", batch=4, context=4096, tp=8)
+    deepseek_v4_profile = models.model_profile_from_hf_config(
+        DEEPSEEK_V4_CFG, name="deepseek-v4-hc"
+    )
+    assert "hyper_connection" in deepseek_v4_profile.layer_families
+    deepseek_v4_tier, deepseek_v4_notes = support.classify_model_support_tier(
+        deepseek_v4_profile
+    )
+    assert deepseek_v4_tier == "partly_unmodeled"
+    assert deepseek_v4_notes == ()
+    deepseek_v4_report = advisor.advise(deepseek_v4_profile, default_workload, "tpu7x")
+    assert deepseek_v4_report.support_tier == "partly_unmodeled"
+
+
+def test_core_sync_checks_bucket_cap_and_module_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify core sync checks catch module family drift and bucket cap overflows."""
+    assert spec_bridge.verify_core_limits_sync() == []
+
+    monkeypatch.setattr(spec_bridge, "CORE_MODULE_FAMILIES", frozenset({"gqa"}))
+    family_messages = spec_bridge.verify_core_limits_sync()
+    family_mismatches = [
+        message
+        for message in family_messages
+        if message.startswith("core_module_families:")
+    ]
+    assert len(family_mismatches) == 1
+
+    monkeypatch.undo()
+
+    monkeypatch.setattr(
+        spec_bridge,
+        "CORE_LIMITS",
+        dataclasses.replace(
+            advisor.CORE_LIMITS,
+            default_verify_bucket_top=core_runtime.MAX_BUCKET_ROWS + 1,
+        ),
+    )
+    bucket_messages = spec_bridge.verify_core_limits_sync()
+    bucket_cap_mismatches = [
+        message
+        for message in bucket_messages
+        if message.startswith("default_bucket_tops_within_max_bucket_rows:")
+    ]
+    bucket_top_mismatches = [
+        message
+        for message in bucket_messages
+        if message.startswith("default_verify_bucket_top:")
+    ]
+    assert len(bucket_cap_mismatches) == 1
+    assert len(bucket_top_mismatches) == 1
