@@ -35,6 +35,13 @@ def test_defaults_are_mains_behaviour():
     assert scheduler_options.get(SimpleNamespace(additional_config=None)) == opts
 
 
+def test_a_config_without_additional_config_fails_loudly():
+    """VllmConfig always has additional_config; a config object without it is
+    an error, not a run on the defaults."""
+    with pytest.raises(AttributeError, match="additional_config"):
+        scheduler_options.get(SimpleNamespace())
+
+
 def test_parse_reads_the_options():
     cfg = SimpleNamespace(
         additional_config={

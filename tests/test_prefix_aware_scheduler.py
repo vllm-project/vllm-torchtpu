@@ -486,7 +486,9 @@ def test_local_prefix_hit_forwards_max_cache_hit_length(monkeypatch):
 
 def _init_with(monkeypatch, kv_transfer_config, calls=None):
     def fake_init(self, *args, **kwargs):
-        self.vllm_config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
+        self.vllm_config = SimpleNamespace(
+            kv_transfer_config=kv_transfer_config, additional_config=None
+        )
         self.connector = None if kv_transfer_config is None else object()
         self.kv_cache_manager = MagicMock()
 

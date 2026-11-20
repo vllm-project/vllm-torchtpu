@@ -22,6 +22,7 @@ so the section stays out of the compile-cache key
 """
 
 import dataclasses
+import typing
 from dataclasses import dataclass
 from typing import Any
 
@@ -63,7 +64,8 @@ def parse(raw: Any) -> SchedulerOptions:
             f"additional_config.{SECTION} must be a JSON object, "
             f"got {type(raw).__name__}"
         )
-    fields = {f.name: f.type for f in dataclasses.fields(SchedulerOptions)}
+    hints = typing.get_type_hints(SchedulerOptions)
+    fields = {f.name: hints[f.name] for f in dataclasses.fields(SchedulerOptions)}
     unknown = sorted(set(raw) - set(fields))
     if unknown:
         raise ValueError(
@@ -83,7 +85,7 @@ def parse(raw: Any) -> SchedulerOptions:
 
 def get(vllm_config: Any) -> SchedulerOptions:
     """The engine's scheduler options."""
-    additional = getattr(vllm_config, "additional_config", None)
+    additional = vllm_config.additional_config
     if not isinstance(additional, dict):
         return SchedulerOptions()
     return parse(additional.get(SECTION))
