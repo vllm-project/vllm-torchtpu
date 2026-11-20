@@ -340,3 +340,16 @@ def test_a_packed_fp4_cache_takes_the_non_fp8_tuned_rules():
     layer = _correctness_test_shape("fp4")
     args = layer.pop("args")
     assert _tiles(*args, **layer) == ((4, 2, 1536, 8), (256, 64, 256, 1))
+
+
+def test_the_tpu_tuned_tiles_test_runs_different_tiles():
+    """test_ragged_paged_attention_tuned_tiles runs its call with and without
+    tuned_tiles on TPU7x, the chip of the TPU CI lane. Both tile sets must
+    differ there, or its tuned case runs the default kernels again."""
+    layer = _correctness_test_shape("fp8")
+    args = layer.pop("args")
+    default_decode, default_prefill = _tiles(*args, **{**layer, "tuned_tiles": False})
+    tuned_decode, tuned_prefill = _tiles(*args, **layer)
+    assert (default_decode, default_prefill) == ((4, 2, 1280, 8), (256, 64, 256, 1))
+    assert tuned_decode != default_decode
+    assert tuned_prefill != default_prefill

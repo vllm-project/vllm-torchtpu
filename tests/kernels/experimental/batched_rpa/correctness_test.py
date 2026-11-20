@@ -962,7 +962,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         """The wrapper's own tiles, with and without the tuned rules, at a
         layer shape the rules were tuned for (32 q / 2 KV heads of 256, fp8
         KV, SEQ_ALONG_LANE pages of 128): three 4-token decodes over contexts
-        up to 4,100 tokens and a 300-token chunk."""
+        up to 4,100 tokens and a 300-token chunk. On TPU7x the two cases run
+        different decode and prefill tiles (checked on CPU by
+        test_batched_rpa_tile_rules.py)."""
         self._test_ragged_paged_attention(
             [(4, 3000), (4, 700), (4, 4100), (300, 2000)],
             (32, 2),
