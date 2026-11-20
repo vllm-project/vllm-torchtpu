@@ -358,7 +358,7 @@ def _gather_lse_row_pairs(lse_f32: torch.Tensor, group: Any) -> torch.Tensor:
     torch._check_not_implemented(
         lse_f32.shape[0] % 2 == 0,
         lambda: "TPU_DCP_MERGE_LSE_ROW_PAIRS gathers rows in pairs and needs "
-        "an even row count per merge chunk; turn it off for this bucket size",
+        "an even row count per merge chunk; turn it off",
     )
     heads = lse_f32.shape[1]
     shard = lse_f32.reshape(-1, 2 * heads).contiguous()
