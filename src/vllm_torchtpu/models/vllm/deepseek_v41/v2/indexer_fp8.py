@@ -843,25 +843,22 @@ def _select_from_prepared_candidates(
 ) -> jax.Array:
     gathered_candidates = PreparedCandidates(*gathered_candidates)
     lengths = jnp.where(gathered_candidates.valid_queries, lengths, 0)
-
-    def short():
-        ids = jnp.broadcast_to(
-            jnp.arange(min(topk, context_width), dtype=jnp.int32),
-            (q.shape[0], min(topk, context_width)),
-        )
-        return jnp.where(ids < lengths[:, None], ids, -1)
-
-    return jax.lax.cond(
-        jnp.max(lengths) <= topk,
-        short,
-        lambda: _score_and_select_candidates(
-            q,
-            weights,
-            lengths,
-            gathered_candidates,
-            topk,
-            candidate_block_size,
-            unordered,
-            context_width,
-        ),
+    ids = jnp.broadcast_to(
+        jnp.arange(min(topk, context_width), dtype=jnp.int32),
+        (q.shape[0], min(topk, context_width)),
     )
+    visible = jnp.where(ids < lengths[:, None], ids, -1)
+    selected = _score_and_select_candidates(
+        q,
+        weights,
+        lengths,
+        gathered_candidates,
+        topk,
+        candidate_block_size,
+        unordered,
+        context_width,
+    )
+    # A select, not a cond: a branch costs an overlay load at its entry and
+    # keeps XLA from overlapping the selection with the layer's other work.
+    # Scoring therefore also runs on short contexts and must accept them.
+    return jnp.where(jnp.max(lengths) <= topk, visible, selected)
