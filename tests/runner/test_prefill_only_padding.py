@@ -18,7 +18,6 @@ final prompt token (a serving crash: computed 126208, scheduled 2, prompt
 import dataclasses
 import types
 
-import numpy as np
 import pytest
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -54,12 +53,9 @@ def _requests(prompts=()):
     return {r: types.SimpleNamespace(num_prompt_tokens=p) for r, p in prompts}
 
 
-def _batch(prompts=()):
-    """An input batch holding these requests: request id -> prompt length."""
-    ids = {r: i for i, (r, _) in enumerate(prompts)}
-    return types.SimpleNamespace(
-        req_id_to_index=ids, num_prompt_tokens=np.array([p for _, p in prompts] or [0])
-    )
+def _batch(req_ids=()):
+    """An input batch holding these requests."""
+    return types.SimpleNamespace(req_id_to_index={r: i for i, r in enumerate(req_ids)})
 
 
 def _new(rid, computed, prompt_len):
@@ -122,7 +118,6 @@ class _Stop(Exception):
 
 def _stub_runner(prefill_only, **fields):
     return types.SimpleNamespace(
-        _pp_wave=None,
         execute_model_state=None,
         _adaptive_verification=None,
         _mtp_prefill_only=prefill_only,
