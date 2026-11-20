@@ -96,7 +96,7 @@ def build_mtp_loop_step_model(
     vllm_config: VllmConfig,
     prefix: str,
     mtp: nn.Module,
-    dynamic_arg_dims: dict,
+    dynamic_arg_dims: dict[str, int | list[int] | dict[int, str]],
 ) -> nn.Module:
     """Compile a separate loop-step program with the draft's own dynamic dims
     (e.g. Qwen3.5 marks `positions` dim -1 for MRoPE, DeepSeek marks dim 0)."""

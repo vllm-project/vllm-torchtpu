@@ -64,9 +64,8 @@ class _MtpFusedLoop(nn.Module):
         greedy_head_owner: Any = None,
     ) -> None:
         """`greedy_head_owner`: a module with `logits_processor` and `lm_head`
-        (greedy_top_tokens.resolve_head_owner, or eagle3's draft head proxy)
-        whose `get_top_tokens` replaces compute_logits + argmax; None keeps
-        compute_logits + argmax.
+        (greedy_top_tokens.resolve_head_owner) whose `get_top_tokens` replaces
+        compute_logits + argmax; None keeps compute_logits + argmax.
         """
         super().__init__()
         # Own compile-cache folder, as in MtpLoopStepModel.

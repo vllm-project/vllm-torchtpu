@@ -808,7 +808,6 @@ class Eagle3Proposer:
 
             step0_gather = (
                 not self._draft_kv_shared
-                and not self.runner._dp_lockstep_enabled()
                 and is_step0_post_attn_gather_installed(draft_model)
             )
             loop_dims = (
@@ -1750,11 +1749,7 @@ class Eagle3Proposer:
         # only when the carry is the lm-head input (last_hidden is hidden) and
         # every rank holds the request's rows (ALL layout).
         fused_per_chunk: list[bool] = []
-        use_fused_loop = (
-            K > 1
-            and self._mtp_fused_loop is not None
-            and not runner._dp_lockstep_enabled()
-        )
+        use_fused_loop = K > 1 and self._mtp_fused_loop is not None
         # The post-step-0 bridge (_draft_post_step0_fused) replaces the
         # separate carry / position / seq_lens helpers ahead of the fused loop.
         can_use_post_step0_fused = use_fused_loop and not self._share_mtp_indices
@@ -1850,11 +1845,6 @@ class Eagle3Proposer:
                     step0_gather_indices = _maybe_pad_dim0(
                         safe_gather_indices, max_loop_p
                     )
-            # Passed only when set, so a test double of _forward_draft with
-            # the pre-gather signature still works.
-            draft_fwd_kwargs = {}
-            if step0_gather_indices is not None:
-                draft_fwd_kwargs["step0_gather_indices"] = step0_gather_indices
             last_hidden, hidden = self._forward_draft(
                 chunk=chunk,
                 input_ids=input_ids,
@@ -1864,7 +1854,7 @@ class Eagle3Proposer:
                 seq_lens_delta=0,
                 num_rejected_np=rejected_np_per_chunk[ci],
                 num_tokens_padded=input_ids.shape[0],
-                **draft_fwd_kwargs,
+                step0_gather_indices=step0_gather_indices,
             )
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
             # regions (the three gathers, then lm-head+argmax) so torch-tpu's
@@ -3049,8 +3039,8 @@ class Eagle3Proposer:
                         rows_sliced=rows_sliced,
                     )
             padding_ctx = contextlib.nullcontext()
-            # The squash's replicated drafter always took the small
-            # all-reduce kernel; a sliced step keeps main's collectives.
+            # A replicated step takes the small all-reduce kernel; a sliced
+            # step keeps main's collectives.
             force_small_ar = not rows_sliced
 
         if step0_gather_indices is not None:
