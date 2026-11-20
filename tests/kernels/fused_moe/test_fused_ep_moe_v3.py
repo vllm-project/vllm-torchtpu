@@ -733,6 +733,86 @@ def test_experts_that_do_not_split_over_the_shards_are_refused():
         )
 
 
+def _admit(w1_shape, w2_shape, *, hidden, shards, tokens, experts_per_shard=None):
+    """Calls fused_ep_moe on abstract fp8 weights of the given shapes over a
+    stand-in mesh of `shards` shards, with scales and logits that fit w1."""
+    import types
+
+    import jax
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, fused_ep_moe
+    from vllm_torchtpu.kernels.fused_moe.v3.rowquant import FP8
+
+    mesh = types.SimpleNamespace(axis_names=(MESH_AXIS,), shape={MESH_AXIS: shards})
+    abstract = jax.ShapeDtypeStruct
+    experts = w1_shape[0]
+    routed = experts if experts_per_shard is None else experts_per_shard * shards
+    fused_ep_moe(
+        abstract((tokens, hidden), jnp.bfloat16),
+        abstract(w1_shape, FP8),
+        abstract(w2_shape, FP8),
+        abstract((experts, w1_shape[-1]), jnp.float32),
+        abstract((experts, hidden), jnp.float32),
+        abstract((tokens, routed), jnp.float32),
+        top_k=2,
+        renormalize=True,
+        mesh=mesh,
+        tile_rows=TILE_ROWS,
+        experts_per_shard=experts_per_shard,
+    )
+
+
+# name: (w1 shape, w2 shape, the refusal), for x of hidden 256 on 8 shards.
+BAD_WEIGHT_SHAPES = {
+    "w2_fewer_experts": ((16, 256, 256), (8, 128, 256), r"w2 is \(8, 128, 256\)"),
+    "w2_wrong_inter": ((16, 256, 256), (16, 64, 256), r"w2 is \(16, 64, 256\)"),
+    "w2_wrong_hidden": ((16, 256, 256), (16, 128, 512), r"w2 is \(16, 128, 512\)"),
+    "w1_wrong_hidden": ((16, 512, 256), (16, 128, 256), r"match x's hidden size"),
+    "w1_odd_width": ((16, 256, 257), (16, 128, 256), r"width must be even"),
+    "w1_two_d": ((16, 256), (16, 128, 256), r"w1 is \(16, 256\)\. Expert weights"),
+}
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("name", list(BAD_WEIGHT_SHAPES))
+def test_weights_that_do_not_fit_x_or_each_other_are_refused(name):
+    """The kernel addresses w1 and w2 by their shapes with bounds checks off:
+    w2 must be [w1's experts, inter, hidden] and w1 [experts, hidden, an even
+    width]. A w2 with 8 experts while w1 has 16 still splits over 8 shards
+    and would read past w2 on every shard."""
+    w1_shape, w2_shape, refusal = BAD_WEIGHT_SHAPES[name]
+    with pytest.raises(ValueError, match=refusal):
+        _admit(w1_shape, w2_shape, hidden=256, shards=8, tokens=32)
+
+
+class _Admitted(Exception):
+    pass
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("experts", [512, 544], ids=["dp4tp2", "tp8"])
+def test_the_qwen3_5_decode_weight_shapes_are_admitted(monkeypatch, experts):
+    """The Qwen3.5-397B-A17B decode calls' weights pass the shape checks:
+    hidden 4096, intermediate 1024, eight shards of 64 routed experts, the
+    TP8 binding's weights with 4 copy slots a shard (68)."""
+    from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
+
+    def admitted(**kwargs):
+        raise _Admitted
+
+    monkeypatch.setattr(v3_layer, "check_tested_routing", admitted)
+    with pytest.raises(_Admitted):
+        _admit(
+            (experts, 4096, 2048),
+            (experts, 1024, 4096),
+            hidden=4096,
+            shards=8,
+            tokens=8 * 128,
+            experts_per_shard=64,
+        )
+
+
 @pytest.mark.cpu_test
 def test_top_k_and_the_logits_are_checked_against_the_routed_experts(
     one_cpu_shard,

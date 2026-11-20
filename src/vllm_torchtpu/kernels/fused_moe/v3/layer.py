@@ -754,6 +754,11 @@ def fused_ep_moe(
     form = weight_form(weight_format)
     weight_format = form.name
     for name, w in (("w1", w1), ("w2", w2)):
+        if w.ndim != 3:
+            raise ValueError(
+                f"{name} is {tuple(w.shape)}. Expert weights are 3-D: "
+                "w1 [experts, hidden, 2 * inter] and w2 [experts, inter, hidden]"
+            )
         if jnp.dtype(w.dtype) != jnp.dtype(form.weight_dtype):
             raise ValueError(
                 f"weight format {weight_format!r} takes "
@@ -788,6 +793,24 @@ def fused_ep_moe(
         raise ValueError("router_logits is None and no routing was given")
     w1_cols = inter if no_gate else 2 * inter
     ndim = SCALES_RANK_PER_CHANNEL
+    # The kernel addresses the weights by these shapes with Mosaic's bounds
+    # checks off (Config.bounds_checks), so a mismatch would read past them.
+    if w1.shape[1] != hidden:
+        raise ValueError(
+            f"w1 is {tuple(w1.shape)}. Its rows must match x's hidden size: "
+            f"[experts, {hidden}, 2 * inter] is expected"
+        )
+    if w1.shape[2] != w1_cols:
+        raise ValueError(
+            f"w1 is {tuple(w1.shape)}. Its gate and up halves sit side by side, "
+            "so its width must be even"
+        )
+    if tuple(w2.shape) != (num_experts, inter, hidden):
+        raise ValueError(
+            f"w2 is {tuple(w2.shape)}. [experts, inter, hidden] = "
+            f"{(num_experts, inter, hidden)}, from w1 {tuple(w1.shape)} and x's "
+            "hidden size, is expected"
+        )
     for name, s, n in (
         ("w1_scales", w1_scales, w1_cols),
         ("w2_scales", w2_scales, hidden),
