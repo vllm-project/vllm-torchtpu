@@ -1204,6 +1204,15 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             {"mixed_live_gather": True},
             {"mixed_live_gather": True, "mixed_live_widths": (256,)},
             {"mixed_live_gather": True, "mixed_live_widths": (128, 256)},
+            {"mixed_live_gather": True, "mixed_live_widths": (192, 256, 384)},
+            {"mixed_live_gather": True, "mixed_live_widths": (128, 192, 256, 384)},
+            {
+                "mixed_live_gather": True,
+                "mixed_live_widths": (192, 256, 384),
+                "mixed_body_levers": (
+                    sparse_mla.MIXED_BODY_DEFAULT + sparse_mla.MIXED_KERNEL_V2_LEVERS
+                ),
+            },
             # TPU_DCP_MLA_MIXED_BODY: each body lever alone and the default set.
             *(
                 {
@@ -1909,6 +1918,22 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                     cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
                     topk_cap=bad_cap,
                 )
+
+    def test_mixed_live_widths_validation(self):
+        with self.assertRaisesRegex(ValueError, "multiples of 64"):
+            sparse_mla.sparse_ragged_paged_attention(
+                jnp.zeros((16, 8, HEAD_DIM), jnp.bfloat16),
+                jnp.zeros((4, 256, 128), jnp.uint32),
+                jnp.zeros((4, 64, 128), jnp.uint32),
+                jnp.zeros((16, 2048), jnp.int32),
+                jnp.arange(4, dtype=jnp.int32),
+                jnp.array([0, 16], jnp.int32),
+                jnp.array([0, 0, 1], jnp.int32),
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                topk_cap=512,
+                mixed_live_gather=True,
+                mixed_live_widths=(96, 256),
+            )
 
     def test_sparsecore_layout_validation(self):
         q = jnp.zeros((128, 8, HEAD_DIM), jnp.bfloat16)

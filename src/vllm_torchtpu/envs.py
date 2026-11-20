@@ -865,8 +865,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of all 512 slots per token. Same outputs; decode buckets unaffected.
     "TPU_DCP_MLA_MIXED_LIVE": env_bool("TPU_DCP_MLA_MIXED_LIVE", default=False),
     # With TPU_DCP_MLA_MIXED_LIVE: comma-separated ascending row widths
-    # (multiples of 128 below the cap, e.g. "256"); a 16-token grid step whose
-    # live atoms fit a width runs its attention body on that many rows per
+    # (multiples of 64 below the cap, e.g. "192,256,384"); a 16-token grid step
+    # whose live atoms fit a width runs its attention body on that many rows per
     # token instead of the full 512. Same outputs. Empty = off.
     "TPU_DCP_MLA_MIXED_LIVE_WIDTHS": lambda: os.getenv(
         "TPU_DCP_MLA_MIXED_LIVE_WIDTHS", ""
