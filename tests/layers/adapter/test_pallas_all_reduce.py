@@ -14,8 +14,11 @@
 """pallas_all_reduce (TPU_PALLAS_SMALL_ALL_REDUCE_MAX_ROWS): the op body on 16
 CPU devices, the communicator's routing and arming.
 
-Only the armed row counts reach the op. Every other row count keeps the
-communicator's XLA all-reduce (DeviceCommunicatorBase.all_reduce).
+The communicator hands every armed-shape all-reduce to the custom op
+vllm_torchtpu::tp_all_reduce, whatever its row count, so every Dynamo trace
+records the same graph inputs. The op's implementation sends only the armed
+row counts to the Pallas op; every other row count takes the XLA all-reduce
+(_xla_all_reduce).
 
 The 16-device check runs this file as a script in a subprocess, because the
 host device count (XLA_FLAGS) must be set before JAX starts. It uses TPU
@@ -236,13 +239,26 @@ def armed(monkeypatch):
     return op
 
 
+GROUP = "tp-group"
+
+
 @pytest.fixture
 def communicator(monkeypatch):
     """A TpuDeviceCommunicator over the 16 ranks whose XLA all-reduce is a
-    marker: it returns x + 1."""
+    marker: it returns x + 1. Both XLA paths carry the marker: the
+    communicator's own (DeviceCommunicatorBase.all_reduce, for all-reduces the
+    op does not take) and the one inside tp_all_reduce (_xla_all_reduce, for
+    row counts the kernel does not serve)."""
     comm = object.__new__(TpuDeviceCommunicator)
     comm.ranks = list(range(N_RANKS))
+    comm.device_group = SimpleNamespace(group_name=GROUP)
     monkeypatch.setattr(DeviceCommunicatorBase, "all_reduce", lambda self, x: x + 1)
+
+    def xla_all_reduce(x, group_name):
+        assert group_name == GROUP
+        return x + 1
+
+    monkeypatch.setattr(pallas_all_reduce, "_xla_all_reduce", xla_all_reduce)
     return comm
 
 
@@ -265,9 +281,10 @@ def test_other_row_counts_keep_the_xla_all_reduce(armed, communicator, rows):
     assert armed.calls == 0
 
 
-def test_symbolic_row_count_keeps_the_xla_all_reduce(armed, communicator):
+def test_symbolic_row_count_adds_no_guard(armed, communicator):
     """A backed SymInt with hint 16 (an armed row count): reading its value
-    would add a guard, so the communicator must keep the XLA all-reduce."""
+    would add a guard. At trace time only the op's fake implementation runs,
+    so no guard is added and the Pallas op is not called."""
     from torch._dynamo.source import ConstantSource
     from torch._subclasses.fake_tensor import FakeTensorMode
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -275,20 +292,82 @@ def test_symbolic_row_count_keeps_the_xla_all_reduce(armed, communicator):
     shape_env = ShapeEnv()
     symbol = shape_env.create_symbol(16, ConstantSource("rows"))
     rows = shape_env.create_symintnode(symbol, hint=16)
-    with FakeTensorMode(shape_env=shape_env):
+    # The armed rank tensor is a real tensor, as on the TPU.
+    with FakeTensorMode(shape_env=shape_env, allow_non_fake_inputs=True):
         x = torch.empty(rows, HIDDEN, dtype=torch.bfloat16)
         assert isinstance(x.shape[0], torch.SymInt)
-        communicator.all_reduce(x)
+        out = communicator.all_reduce(x)
+        assert str(out.shape[0]) == str(x.shape[0])
     assert armed.calls == 0
     assert not shape_env.guards
+
+
+def _graph_inputs(rows, dynamic, communicator):
+    """The Dynamo graph of communicator.all_reduce on a bf16 [rows, HIDDEN]
+    input: (its tensor placeholders as (dtype, shape) with the row dimension
+    written "rows", and the custom ops it calls). A dynamic trace also takes
+    the row count itself as a SymInt placeholder; that one is left out."""
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    torch._dynamo.reset()
+    compiled = torch.compile(communicator.all_reduce, backend=backend, fullgraph=True)
+    x = _ones(rows, HIDDEN)
+    if dynamic:
+        torch._dynamo.mark_dynamic(x, 0)
+    compiled(x)
+    (gm,) = graphs
+    inputs = []
+    for node in gm.graph.nodes:
+        if node.op != "placeholder":
+            continue
+        value = node.meta["example_value"]
+        if not isinstance(value, torch.Tensor):
+            continue
+        dims = tuple(
+            "rows" if isinstance(d, torch.SymInt) or (d == rows and d != 1) else d
+            for d in value.shape
+        )
+        inputs.append((str(value.dtype), dims))
+    ops = [
+        str(node.target)
+        for node in gm.graph.nodes
+        if node.op == "call_function" and "vllm_torchtpu" in str(node.target)
+    ]
+    return inputs, ops
+
+
+def test_every_trace_has_the_same_graph_inputs(armed, communicator):
+    """vLLM traces the model with a symbolic token count, and the shape-variant
+    warmup can trace it again with the token count specialized to an int.
+    shape_variants hands a compiled bucket between traces only when their
+    graphs take the same inputs, so the choice of path must not change them.
+    Here one trace sees a SymInt, the others concrete rows: 16 (served by the
+    kernel), 24 (not a multiple of the row tile) and 4096 (a prefill step).
+    Each graph takes the partial and the rank tensor, and calls tp_all_reduce
+    once. A routing on the row count at trace time gives the rows-16 graph the
+    rank tensor and the others none, which is the mismatch shape_variants
+    refused at engine start."""
+    want = (
+        [("torch.bfloat16", ("rows", HIDDEN)), ("torch.int32", (1, 1))],
+        ["vllm_torchtpu.tp_all_reduce.default"],
+    )
+    for rows, dynamic in ((16, True), (16, False), (24, False), (4096, False)):
+        assert _graph_inputs(rows, dynamic, communicator) == want, (rows, dynamic)
+    # Each graph runs once after tracing, with concrete rows: the two rows-16
+    # runs reach the Pallas op, rows 24 and 4096 the XLA all-reduce.
+    assert armed.calls == 2
 
 
 @pytest.mark.parametrize("rows", (16, 24))
 def test_routing_traces_under_dynamo(armed, communicator, rows):
     """Dynamo traces the communicator inside compiled model code (the
-    embedding's tensor-parallel all-reduce). The routing check must trace in
-    one graph without calling a function on Dynamo's skip list, and pick the
-    same path as in eager mode: rows 16 is armed, rows 24 is not."""
+    embedding's tensor-parallel all-reduce). The routing must trace in one
+    graph, and the compiled graph must pick the same path as eager mode when
+    it runs: rows 16 is armed, rows 24 is not."""
     torch._dynamo.reset()
     compiled = torch.compile(
         communicator.all_reduce, backend="eager", fullgraph=True, dynamic=False

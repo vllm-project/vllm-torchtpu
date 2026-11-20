@@ -31,15 +31,22 @@ attention exit and the dense FFN exit (RowParallelLinear), the MoE FFN exit
 (the runner's tensor_model_parallel_all_reduce) and the embedding, because
 all of them call the same GroupCoordinator.all_reduce.
 
-`maybe_all_reduce` routes an all-reduce to the op only when its row count is
-one of the armed row counts. Every other all-reduce, for example a prefill
-step of 4096 tokens, keeps the communicator's own XLA all-reduce, as it would
-with the op unarmed. The row count is a concrete int at that point: vLLM
-compiles the graph once per token count (the TPU platform disables dynamic
-compile ranges), and torch_tpu runs vllm.all_reduce's implementation with
-inputs of that one shape. A symbolic row count (torch.SymInt) is not routed,
-because reading its value would add a shape guard. Every rank compiles the
-same shapes, so every rank takes the same path.
+The path is chosen per row count, and the row count is known only after
+Dynamo. vLLM traces the model with a symbolic token dimension, and the
+shape-variant warmup (compilation/shape_variants.py) can trace it again, so
+one trace may see the row count as a torch.SymInt and another as a concrete
+int. A choice made while Dynamo traces would then give the traces graphs with
+different inputs (the op takes the rank tensor, the XLA all-reduce does not),
+and shape_variants refuses to hand a compiled bucket between such traces. So
+`maybe_all_reduce` puts the same node in every trace: the custom op
+vllm_torchtpu::tp_all_reduce(x, rank, group_name). torch_tpu compiles one
+program per token count and runs the node's implementation once per program
+with tensors of that concrete shape. The implementation picks the path there:
+the Pallas op for the armed row counts, and for any other row count, for
+example a prefill step of 4096 tokens, the same _c10d_functional all-reduce
+that Dynamo emits for the communicator's own dist.all_reduce, so that row
+count compiles to the same XLA all-reduce as with the op unarmed. Every rank
+compiles the same shapes, so every rank takes the same path.
 
 All rows travel: the kernel's n_valid is the padded row count. The true token
 count exists on device only as token_padding's mask, which is set only with
@@ -110,7 +117,7 @@ def _op_body(n_ranks: int, buckets: tuple[int, ...]):
 
     Raises:
         ValueError: At trace time, when rows is not in `buckets`.
-            `maybe_all_reduce` routes only the armed row counts here.
+            tp_all_reduce sends only the armed row counts here.
     """
 
     def body(x, rank):
@@ -256,20 +263,62 @@ def arm(hidden: int, device: torch.device) -> bool:
     return True
 
 
-def maybe_all_reduce(x: torch.Tensor, ranks) -> torch.Tensor | None:
-    """The sum of x over the group `ranks` through the armed op, or None when
+def _xla_all_reduce(x: torch.Tensor, group_name: str) -> torch.Tensor:
+    """The sum of x over the process group `group_name` as the XLA all-reduce.
+
+    These are the ops Dynamo emits for dist.all_reduce on the group, without
+    the copy back into x, so torch_tpu lowers them to the same all-reduce as
+    DeviceCommunicatorBase.all_reduce.
+    """
+    reduced = torch.ops._c10d_functional.all_reduce(x, "sum", group_name)
+    return torch.ops._c10d_functional.wait_tensor(reduced)
+
+
+@torch.library.custom_op("vllm_torchtpu::tp_all_reduce", mutates_args=())
+def tp_all_reduce(x: torch.Tensor, rank: torch.Tensor, group_name: str) -> torch.Tensor:
+    """The sum of x over the TP group, from the Pallas op or the XLA all-reduce.
+
+    This implementation runs with concrete shapes: in eager mode, and inside
+    torch_tpu's compile, once per compiled token count. It reads the row count
+    there, so the Dynamo graph holds this one node for every row count.
+
+    Args:
+        x: This rank's bf16 [rows, hidden] partial.
+        rank: This rank's mesh index, int32 [1, 1], as the Pallas op takes it.
+            Unused on the XLA path.
+        group_name: The c10d name of the TP group's device process group.
+
+    Returns:
+        The reduced [rows, hidden] tensor. Example: armed with rows (16, 32),
+        rows 16 and 32 come from the Pallas op, and rows 24 and 4096 from the
+        XLA all-reduce.
+    """
+    armed = _ARMED
+    if armed is not None and x.shape[0] in armed.buckets:
+        return armed.op(x, rank)
+    return _xla_all_reduce(x, group_name)
+
+
+@tp_all_reduce.register_fake
+def _(x: torch.Tensor, rank: torch.Tensor, group_name: str) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+def maybe_all_reduce(x: torch.Tensor, ranks, group_name: str) -> torch.Tensor | None:
+    """The sum of x over the group `ranks` through tp_all_reduce, or None when
     the op does not serve this all-reduce. The caller then runs its own XLA
     all-reduce.
 
-    The op serves x only when it is armed for the group `ranks`, x is bf16
-    [rows, hidden] at the armed hidden size, and rows is a concrete int in the
-    armed row counts. Example: armed with rows (16, 32), a [32, 6144] decode
-    partial goes to the op, while a [4096, 6144] prefill partial and a
-    [24, 6144] partial return None.
+    The op serves x when it is armed for the group `ranks` and x is bf16
+    [rows, hidden] at the armed hidden size, for every row count. None of
+    these checks reads the row count, so every Dynamo trace makes the same
+    choice and records the same graph inputs. tp_all_reduce then picks the
+    kernel or the XLA all-reduce from the concrete row count.
 
     Args:
         x: This rank's partial.
         ranks: Global ranks of the group to reduce over.
+        group_name: The c10d name of that group's device process group.
 
     Returns:
         The reduced tensor, or None.
@@ -283,12 +332,4 @@ def maybe_all_reduce(x: torch.Tensor, ranks) -> torch.Tensor | None:
         or x.shape[1] != armed.hidden
     ):
         return None
-    rows = x.shape[0]
-    # A symbolic row count is a torch.SymInt, not an int. The isinstance check
-    # reads no value from it, so it adds no guard and no recompile, and the
-    # XLA all-reduce is kept. Dynamo traces this function (the embedding's
-    # all-reduce reaches it inside a compiled graph), so the check must also
-    # be traceable: torch.fx's is_concrete_int is on Dynamo's skip list.
-    if not isinstance(rows, int) or rows not in armed.buckets:
-        return None
-    return armed.op(x, armed.rank)
+    return tp_all_reduce(x, armed.rank, group_name)

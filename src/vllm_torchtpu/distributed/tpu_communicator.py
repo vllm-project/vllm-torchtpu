@@ -49,7 +49,9 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        reduced = pallas_all_reduce.maybe_all_reduce(input_, self.ranks)
+        reduced = pallas_all_reduce.maybe_all_reduce(
+            input_, self.ranks, self.device_group.group_name
+        )
         if reduced is not None:
             return reduced
         return super().all_reduce(input_)
