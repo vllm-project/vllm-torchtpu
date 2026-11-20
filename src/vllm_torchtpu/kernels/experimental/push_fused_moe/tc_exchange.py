@@ -136,10 +136,37 @@ def _exchange(
 ):
     """Barrier, push this shard's row everywhere, run `while_in_flight`,
     then wait for every row in and out."""
+    _exchange_start(
+        ep,
+        me,
+        x_hbm,
+        out_hbm,
+        send_sem,
+        recv_sem,
+        lsem,
+        while_in_flight,
+        single_barrier=single_barrier,
+    )
+    _exchange_wait(ep, me, x_hbm, out_hbm, send_sem, recv_sem, lsem)
+
+
+def _exchange_start(
+    ep,
+    me,
+    x_hbm,
+    out_hbm,
+    send_sem,
+    recv_sem,
+    lsem,
+    while_in_flight,
+    single_barrier=False,
+):
+    """_exchange up to its waits: barrier, this shard's row into row `me`
+    of every output, then `while_in_flight`. Every copy is left in flight on
+    the three semaphores; _exchange_wait retires them."""
     _double_barrier(ep, me, single=single_barrier)
     mine = out_hbm.at[pl.ds(me, 1)]
-    local = pltpu.make_async_copy(x_hbm, mine, lsem)
-    local.start()
+    pltpu.make_async_copy(x_hbm, mine, lsem).start()
 
     def push(i, c):
         dest = lax.rem(me + i, ep)
@@ -155,7 +182,11 @@ def _exchange(
 
     lax.fori_loop(1, ep, push, jnp.int32(0))
     while_in_flight()
-    local.wait()
+
+
+def _exchange_wait(ep, me, x_hbm, out_hbm, send_sem, recv_sem, lsem):
+    """Wait for _exchange_start's local row and every row in and out."""
+    pltpu.make_async_copy(x_hbm, out_hbm.at[pl.ds(me, 1)], lsem).wait()
     if ep > 1:
         # DMA semaphores count bytes: one wait the size of ep - 1 rows
         # retires every incoming (resp. outgoing) row.

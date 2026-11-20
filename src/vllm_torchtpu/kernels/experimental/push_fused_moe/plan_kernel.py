@@ -413,6 +413,59 @@ def _relane_counts(cnt, r3_ref, *, count_at, g):
         r3_ref[:, d, :] = jnp.where(lane < g, lo, 0)
 
 
+def _count_rows(count_at, ep, g):
+    """(first row, rows) of the payload slab holding the e_total count words."""
+    r_lo = count_at // LANES
+    return r_lo, (count_at + ep * g - 1) // LANES - r_lo + 1
+
+
+def _exchange_name(ep, width, n_rows, light_prepush, single_barrier, part=""):
+    return (
+        f"moe_tc_routing_exchange_ep{ep}_w{width}_rows{n_rows}_tables"
+        + (f"_lp{light_prepush}" if light_prepush else "")
+        + part
+        + ("_1b" if single_barrier else "")
+    )
+
+
+def _issue_row_copies(src_hbm, dst_hbm, idx_sm, gsem, n_rows):
+    """dst[j] = src[idx[j]], one local DMA per row, left in flight on gsem."""
+
+    def one(j, c):
+        pltpu.make_async_copy(
+            src_hbm.at[pl.ds(idx_sm[j], 1)], dst_hbm.at[pl.ds(j, 1)], gsem
+        ).start()
+        return c
+
+    lax.fori_loop(0, n_rows, one, jnp.int32(0), unroll=8)
+
+
+def _tables_after_exchange(
+    me, out_hbm, dst_hbm, seg3_vm, outs, csem, gsem, cnt_vm, r3_vm, *, g, **kw
+):
+    """Every peer's row has landed in out_hbm; the row copies may still be in
+    flight, and the tables are built meanwhile from the exchanged counts.
+    `kw`: count_at and _tables' ep, n_pre, tile_m, light_prepush."""
+    count_at = kw.pop("count_at")
+    r_lo, n_cnt = _count_rows(count_at, kw["ep"], g)
+    cp = pltpu.make_async_copy(out_hbm.at[:, pl.ds(r_lo, n_cnt), :], cnt_vm, csem)
+    cp.start()
+    cp.wait()
+    _relane_counts(cnt_vm[...], r3_vm, count_at=count_at - r_lo * LANES, g=g)
+    _store_tables(
+        _tables(r3_vm[...], seg3_vm[...], me, g=g, **kw), outs, ep=kw["ep"], g=g
+    )
+    pltpu.make_async_copy(dst_hbm, dst_hbm, gsem).wait()
+
+
+def _table_scratch(ep, n_cnt):
+    """The count words and their re-laned [s, d, 128] form."""
+    return (
+        pltpu.VMEM((ep, n_cnt, LANES), jnp.int32),
+        pltpu.VMEM((ep, ep, LANES), jnp.int32),
+    )
+
+
 @functools.cache
 def _build_exchange_rows_tables(
     ep,
@@ -426,24 +479,20 @@ def _build_exchange_rows_tables(
     single_barrier=False,
 ):
     slab_rows = tx._slab_rows(width)
-    r_lo = count_at // LANES
-    r_hi = (count_at + ep * g - 1) // LANES
-    n_cnt = r_hi - r_lo + 1
+    n_cnt = _count_rows(count_at, ep, g)[1]
+    table_kw = dict(
+        g=g,
+        count_at=count_at,
+        ep=ep,
+        n_pre=n_pre,
+        tile_m=tile_m,
+        light_prepush=light_prepush,
+    )
 
     def kernel(rank_sm, idx_sm, x_hbm, src_hbm, seg3_vm, out_hbm, dst_hbm, *rest):
         outs = rest[:N_TABLE_OUTS]
         send_sem, recv_sem, lsem, gsem, csem, cnt_vm, r3_vm = rest[N_TABLE_OUTS:]
         me = rank_sm[0]
-
-        def copy_rows():
-            def one(j, c):
-                pltpu.make_async_copy(
-                    src_hbm.at[pl.ds(idx_sm[j], 1)], dst_hbm.at[pl.ds(j, 1)], gsem
-                ).start()
-                return c
-
-            lax.fori_loop(0, n_rows, one, jnp.int32(0), unroll=8)
-
         tx._exchange(
             ep,
             me,
@@ -452,27 +501,12 @@ def _build_exchange_rows_tables(
             send_sem,
             recv_sem,
             lsem,
-            copy_rows,
+            lambda: _issue_row_copies(src_hbm, dst_hbm, idx_sm, gsem, n_rows),
             single_barrier=single_barrier,
         )
-        # Every peer's row has landed; the row copies may still be in flight,
-        # and the tables are built meanwhile from the exchanged counts.
-        cp = pltpu.make_async_copy(out_hbm.at[:, pl.ds(r_lo, n_cnt), :], cnt_vm, csem)
-        cp.start()
-        cp.wait()
-        _relane_counts(cnt_vm[...], r3_vm, count_at=count_at - r_lo * LANES, g=g)
-        t = _tables(
-            r3_vm[...],
-            seg3_vm[...],
-            me,
-            ep=ep,
-            g=g,
-            n_pre=n_pre,
-            tile_m=tile_m,
-            light_prepush=light_prepush,
+        _tables_after_exchange(
+            me, out_hbm, dst_hbm, seg3_vm, outs, csem, gsem, cnt_vm, r3_vm, **table_kw
         )
-        _store_tables(t, outs, ep=ep, g=g)
-        pltpu.make_async_copy(dst_hbm, dst_hbm, gsem).wait()
 
     def fn(packed, rank, rows, idx, seg_start_local):
         idx = idx.astype(jnp.int32).reshape(-1)
@@ -485,10 +519,7 @@ def _build_exchange_rows_tables(
                 in_specs=[tx._HBM, tx._HBM, vmem],
                 out_specs=(tx._HBM, tx._HBM) + (vmem,) * N_TABLE_OUTS,
                 scratch_shapes=(pltpu.SemaphoreType.DMA,) * 5
-                + (
-                    pltpu.VMEM((ep, n_cnt, LANES), jnp.int32),
-                    pltpu.VMEM((ep, ep, LANES), jnp.int32),
-                ),
+                + _table_scratch(ep, n_cnt),
                 grid=(),
             ),
             out_shape=(
@@ -497,9 +528,7 @@ def _build_exchange_rows_tables(
             )
             + _table_out_shapes(ep, g),
             compiler_params=tx._compiler_params(),
-            name=f"moe_tc_routing_exchange_ep{ep}_w{width}_rows{n_rows}_tables"
-            + (f"_lp{light_prepush}" if light_prepush else "")
-            + ("_1b" if single_barrier else ""),
+            name=_exchange_name(ep, width, n_rows, light_prepush, single_barrier),
         )(r, idx, slab, rows, _seg3(seg_start_local, ep, g))
         return (tx._unpad(out, ep, width), gathered) + _unpack_tables(tables)
 
@@ -527,6 +556,148 @@ def build_exchange_rows_tables(
     if g > LANES or ep > LANES or 2 * g + 3 > LANES:
         raise ValueError(f"the table kernel takes g_local, ep <= {LANES}")
     return _build_exchange_rows_tables(
+        ep,
+        width,
+        n_rows,
+        count_at,
+        g,
+        int(n_pre),
+        int(tile_m),
+        int(light_prepush),
+        bool(single_barrier),
+    )
+
+
+_SEM = pl.BlockSpec(memory_space=pltpu.MemorySpace.SEMAPHORE)
+# The split kernels' DMA semaphores: send, recv, local row, row copies.
+_N_SPLIT_SEMS = 4
+
+
+@functools.cache
+def _build_exchange_rows_tables_split(
+    ep,
+    width,
+    n_rows,
+    count_at,
+    g,
+    n_pre,
+    tile_m,
+    light_prepush=0,
+    single_barrier=False,
+):
+    slab_rows = tx._slab_rows(width)
+    n_cnt = _count_rows(count_at, ep, g)[1]
+    table_kw = dict(
+        g=g,
+        count_at=count_at,
+        ep=ep,
+        n_pre=n_pre,
+        tile_m=tile_m,
+        light_prepush=light_prepush,
+    )
+
+    def start_kernel(rank_sm, idx_sm, x_hbm, src_hbm, out_hbm, dst_hbm, sems):
+        send_sem, recv_sem, lsem, gsem = (sems.at[i] for i in range(_N_SPLIT_SEMS))
+        tx._exchange_start(
+            ep,
+            rank_sm[0],
+            x_hbm,
+            out_hbm,
+            send_sem,
+            recv_sem,
+            lsem,
+            lambda: _issue_row_copies(src_hbm, dst_hbm, idx_sm, gsem, n_rows),
+            single_barrier=single_barrier,
+        )
+
+    def done_kernel(rank_sm, x_hbm, src_hbm, out_in, dst_in, sems, seg3_vm, *rest):
+        # src_hbm is only kept live for the row copies still reading it;
+        # out_in and dst_in are out_hbm and dst_hbm (aliased).
+        del src_hbm, out_in, dst_in
+        out_hbm, dst_hbm = rest[:2]
+        outs = rest[2 : 2 + N_TABLE_OUTS]
+        csem, cnt_vm, r3_vm = rest[2 + N_TABLE_OUTS :]
+        send_sem, recv_sem, lsem, gsem = (sems.at[i] for i in range(_N_SPLIT_SEMS))
+        me = rank_sm[0]
+        tx._exchange_wait(ep, me, x_hbm, out_hbm, send_sem, recv_sem, lsem)
+        _tables_after_exchange(
+            me, out_hbm, dst_hbm, seg3_vm, outs, csem, gsem, cnt_vm, r3_vm, **table_kw
+        )
+
+    def start(packed, rank, rows, idx):
+        idx = idx.astype(jnp.int32).reshape(-1)
+        r, slab = tx._payload(packed, rank, width)
+        out, gathered, sems = pl.pallas_call(
+            start_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                in_specs=[tx._HBM, tx._HBM],
+                out_specs=(tx._HBM, tx._HBM, _SEM),
+                grid=(),
+            ),
+            out_shape=(
+                jax.ShapeDtypeStruct((ep, slab_rows, LANES), jnp.int32),
+                jax.ShapeDtypeStruct((n_rows, *rows.shape[1:]), rows.dtype),
+                pltpu.SemaphoreType.DMA((_N_SPLIT_SEMS,)),
+            ),
+            compiler_params=tx._compiler_params(),
+            name=_exchange_name(
+                ep, width, n_rows, light_prepush, single_barrier, "_start"
+            ),
+        )(r, idx, slab, rows)
+        return r, slab, out, gathered, sems
+
+    def done(handle, rows, seg_start_local):
+        r, slab, out, gathered, sems = handle
+        vmem = pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM)
+        out, gathered, *tables = pl.pallas_call(
+            done_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=1,
+                in_specs=[tx._HBM, tx._HBM, tx._HBM, tx._HBM, _SEM, vmem],
+                out_specs=(tx._HBM, tx._HBM) + (vmem,) * N_TABLE_OUTS,
+                scratch_shapes=(pltpu.SemaphoreType.DMA,) + _table_scratch(ep, n_cnt),
+                grid=(),
+            ),
+            out_shape=(
+                jax.ShapeDtypeStruct(out.shape, out.dtype),
+                jax.ShapeDtypeStruct(gathered.shape, gathered.dtype),
+            )
+            + _table_out_shapes(ep, g),
+            input_output_aliases={3: 0, 4: 1},
+            compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
+            name=_exchange_name(
+                ep, width, n_rows, light_prepush, single_barrier, "_done"
+            ),
+        )(r, slab, rows, out, gathered, sems, _seg3(seg_start_local, ep, g))
+        return (tx._unpad(out, ep, width), gathered) + _unpack_tables(tables)
+
+    return start, done
+
+
+def build_exchange_rows_tables_split(
+    *,
+    ep,
+    width,
+    n_rows,
+    count_at,
+    e_total,
+    n_pre,
+    tile_m,
+    light_prepush=0,
+    single_barrier=False,
+):
+    """build_exchange_rows_tables' kernel as two calls, so independent work
+    can run while its rows are in flight: start(packed, rank, rows, idx) ->
+    handle (barrier, every push and row copy issued, none waited);
+    done(handle, rows, seg_start_local) -> build_exchange_rows_tables'
+    outputs. `rows` goes to both, keeping it live for the copies reading it.
+    The handle holds buffers peers are still writing: it is opaque, and goes
+    to done once and to nothing else (a copy of it would read rows mid-flight)."""
+    g = e_total // ep
+    if g > LANES or ep > LANES or 2 * g + 3 > LANES:
+        raise ValueError(f"the table kernel takes g_local, ep <= {LANES}")
+    return _build_exchange_rows_tables_split(
         ep,
         width,
         n_rows,
