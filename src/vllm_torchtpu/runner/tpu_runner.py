@@ -7222,7 +7222,10 @@ class TPUModelRunner(GPUModelRunner):
         """
         assert self._pp_wave is not None
         started = time.perf_counter()
-        for num_tokens in self.num_tokens_paddings:
+        # The buckets the standalone pass compiled; under the PCP manager a
+        # rank's local token count stops at max_local_num_tokens.
+        paddings = self._backbone_token_paddings()
+        for num_tokens in paddings:
             self._dummy_run(
                 num_tokens,
                 self.num_reqs_max_model_len,
@@ -7244,7 +7247,7 @@ class TPUModelRunner(GPUModelRunner):
         synchronize_device()
         logger.info(
             "Pipeline hand-off warmup: %d buckets in %.1f s",
-            len(self.num_tokens_paddings),
+            len(paddings),
             time.perf_counter() - started,
         )
 
