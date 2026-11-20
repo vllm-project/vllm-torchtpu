@@ -215,6 +215,29 @@ def qwen3_5_draft_path_rule(monkeypatch):
     monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
 
 
+_DRAFT_PATH_KEYS = (
+    "TPU_GREEDY_TOP_TOKENS",
+    "VLLM_TPU_FAST_TOKEN_SUBSTITUTION",
+    "VLLM_TPU_FUSED_DRAFT_LOOP",
+)
+
+
+def _draft_path_keys(monkeypatch, **values):
+    """Set the draft-path env keys as a process sees them: a key given here
+    takes that string, every other one is unset. Drops a value an earlier
+    test's monkeypatch.setattr(envs, ...) undo may have left in the module
+    dict, which would shadow envs.__getattr__ (see test_mla_attention.py)."""
+    from vllm_torchtpu import envs
+
+    for key in _DRAFT_PATH_KEYS:
+        if key in vars(envs):
+            monkeypatch.delattr(envs, key)
+        if key in values:
+            monkeypatch.setenv(key, values[key])
+        else:
+            monkeypatch.delenv(key, raising=False)
+
+
 def _qwen35_mtp_config(arch="Qwen3_5MoeForConditionalGeneration", method="mtp"):
     from types import SimpleNamespace as NS
 
@@ -240,15 +263,9 @@ def test_qwen3_5_mtp_rules_follow_the_model_and_draft(
     """Greedy top tokens, fast token substitution and the fused draft loop
     run by rule only for a Qwen3.5 target with an MTP draft; every other
     configuration keeps main's opt-in env keys (default off)."""
-    from vllm_torchtpu import envs
     from vllm_torchtpu.spec_decode import utils
 
-    for key in (
-        "TPU_GREEDY_TOP_TOKENS",
-        "VLLM_TPU_FAST_TOKEN_SUBSTITUTION",
-        "VLLM_TPU_FUSED_DRAFT_LOOP",
-    ):
-        monkeypatch.setattr(envs, key, False)
+    _draft_path_keys(monkeypatch)
     config = _qwen35_mtp_config(arch, method)
     from vllm_torchtpu.spec_decode import draft_path_rules
 
@@ -298,35 +315,56 @@ def test_qwen3_5_mtp_rule_holds_only_where_validated(
 
 def test_qwen3_5_fused_draft_loop_rule_exceptions(monkeypatch, qwen3_5_draft_path_rule):
     """The fused loop rule stays off for a KV-sharing draft and under EP-DP
-    lockstep; main's key still turns it on anywhere."""
-    from vllm_torchtpu import envs
+    lockstep; main's key still turns it on anywhere off lockstep."""
     from vllm_torchtpu.spec_decode import utils
 
-    monkeypatch.setattr(envs, "VLLM_TPU_FUSED_DRAFT_LOOP", False)
+    _draft_path_keys(monkeypatch)
     config = _qwen35_mtp_config()
     on = utils.fused_draft_loop_enabled
     assert on(config, draft_kv_shared=True, dp_lockstep=False) is False
     assert on(config, draft_kv_shared=False, dp_lockstep=True) is False
-    monkeypatch.setattr(envs, "VLLM_TPU_FUSED_DRAFT_LOOP", True)
+    _draft_path_keys(
+        monkeypatch, VLLM_TPU_FUSED_DRAFT_LOOP="1", TPU_GREEDY_TOP_TOKENS="1"
+    )
     other = _qwen35_mtp_config("Qwen3NextForCausalLM")
     assert on(other, draft_kv_shared=False, dp_lockstep=False) is True
-    monkeypatch.setattr(envs, "TPU_GREEDY_TOP_TOKENS", True)
+    assert on(other, draft_kv_shared=False, dp_lockstep=True) is False
     assert utils.greedy_top_tokens_enabled(other) is True
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"), [(None, True), ("0", False), ("false", False), ("1", True)]
+)
+def test_a_set_draft_path_key_overrides_the_rule(
+    monkeypatch, qwen3_5_draft_path_rule, value, expected
+):
+    """On an engine the Qwen3.5 rule turns the draft path on for, a key set to
+    0 turns its part off and 1 keeps it on; only an unset key follows the
+    rule."""
+    from vllm_torchtpu.spec_decode import utils
+
+    config = _qwen35_mtp_config()
+    parts = {
+        "TPU_GREEDY_TOP_TOKENS": lambda: utils.greedy_top_tokens_enabled(config),
+        "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": lambda: (
+            utils.fast_token_substitution_enabled(config)
+        ),
+        "VLLM_TPU_FUSED_DRAFT_LOOP": lambda: utils.fused_draft_loop_enabled(
+            config, draft_kv_shared=False, dp_lockstep=False
+        ),
+    }
+    for key, enabled in parts.items():
+        _draft_path_keys(monkeypatch, **({} if value is None else {key: value}))
+        assert enabled() is expected, key
 
 
 def test_no_registered_rule_keeps_main_opt_in_keys(monkeypatch):
     """Without a model-provided rule, even a Qwen3.5 MTP configuration keeps
     main's opt-in keys (default off): the generic helpers hold no model logic."""
-    from vllm_torchtpu import envs
     from vllm_torchtpu.spec_decode import draft_path_rules, utils
 
     monkeypatch.setattr(draft_path_rules, "_RULES", [])
-    for key in (
-        "TPU_GREEDY_TOP_TOKENS",
-        "VLLM_TPU_FAST_TOKEN_SUBSTITUTION",
-        "VLLM_TPU_FUSED_DRAFT_LOOP",
-    ):
-        monkeypatch.setattr(envs, key, False)
+    _draft_path_keys(monkeypatch)
     config = _qwen35_mtp_config()
     assert draft_path_rules.holds(config) is False
     assert utils.greedy_top_tokens_enabled(config) is False

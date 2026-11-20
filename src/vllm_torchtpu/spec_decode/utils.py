@@ -99,31 +99,34 @@ def _static_shape_args(fn):
 
 
 def greedy_top_tokens_enabled(vllm_config: Any) -> bool:
-    """TPU_GREEDY_TOP_TOKENS, or a model-provided draft-path rule
-    (spec_decode/draft_path_rules.py). Greedy steps (all requests greedy, no
-    logprobs, no grammar) then take the vocab-parallel argmax; the tokens are
-    those of the full-logits argmax."""
-    return bool(envs.TPU_GREEDY_TOP_TOKENS) or draft_path_rules.holds(vllm_config)
+    """TPU_GREEDY_TOP_TOKENS when it is set, else a model-provided draft-path
+    rule (spec_decode/draft_path_rules.py). Greedy steps (all requests greedy,
+    no logprobs, no grammar) then take the vocab-parallel argmax; the tokens
+    are those of the full-logits argmax."""
+    knob = envs.TPU_GREEDY_TOP_TOKENS
+    return draft_path_rules.holds(vllm_config) if knob is None else knob
 
 
 def fast_token_substitution_enabled(vllm_config: Any) -> bool:
-    """VLLM_TPU_FAST_TOKEN_SUBSTITUTION, or a model-provided draft-path rule."""
-    return bool(envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION) or draft_path_rules.holds(
-        vllm_config
-    )
+    """VLLM_TPU_FAST_TOKEN_SUBSTITUTION when it is set, else a model-provided
+    draft-path rule."""
+    knob = envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION
+    return draft_path_rules.holds(vllm_config) if knob is None else knob
 
 
 def fused_draft_loop_enabled(
     vllm_config: Any, *, draft_kv_shared: bool, dp_lockstep: bool
 ) -> bool:
-    """VLLM_TPU_FUSED_DRAFT_LOOP, or a model-provided draft-path rule: on
-    unless the draft shares the target's KV cache or EP-DP runs in lockstep
-    (main lists both as unsupported by the fused loop)."""
-    if envs.VLLM_TPU_FUSED_DRAFT_LOOP:
-        return True
-    return (
-        draft_path_rules.holds(vllm_config) and not draft_kv_shared and not dp_lockstep
-    )
+    """Never under EP-DP lockstep, where propose runs the per-step loop (main
+    lists it as unsupported by the fused loop). Otherwise
+    VLLM_TPU_FUSED_DRAFT_LOOP when it is set, else a model-provided draft-path
+    rule, which also leaves out a draft that shares the target's KV cache."""
+    if dp_lockstep:
+        return False
+    knob = envs.VLLM_TPU_FUSED_DRAFT_LOOP
+    if knob is not None:
+        return knob
+    return draft_path_rules.holds(vllm_config) and not draft_kv_shared
 
 
 def fit_rows(t: torch.Tensor, rows: int, value: int = 0) -> torch.Tensor:
