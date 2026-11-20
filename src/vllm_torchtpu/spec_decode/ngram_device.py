@@ -73,7 +73,7 @@ def _write_row_impl(hist: torch.Tensor, packed: torch.Tensor) -> None:
     _write_rows(hist, packed[:1], packed[1:])
 
 
-def _propose_impl(
+def propose_step(
     hist: torch.Tensor,
     meta: torch.Tensor,
     new_tokens: torch.Tensor,
@@ -147,7 +147,7 @@ def _propose_impl(
 
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 _write_row_compiled = _tpu_compile(_write_row_impl)
-_propose_compiled = _tpu_compile(_propose_impl)
+_propose_compiled = _tpu_compile(propose_step)
 
 
 class DeviceNgramProposer:
@@ -224,30 +224,36 @@ class DeviceNgramProposer:
         self, meta: torch.Tensor, new_tokens: torch.Tensor, width: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._hist is not None
-        fn = _propose_compiled if self._is_compiled() else _propose_impl
+        fn = _propose_compiled if self._is_compiled() else propose_step
         return fn(self._hist, meta, new_tokens, self.min_n, self.max_n, self.k, width)
 
-    def _refresh_rows(self, scheduler_output: SchedulerOutput) -> bool:
-        """Uploads the history of each batch row whose device copy is stale;
-        whether any was.
+    def _stale_rows(self, scheduler_output: SchedulerOutput) -> list[int]:
+        """The batch rows whose device history is stale.
 
         A row is current only when the previous step's propose saw the same
         request there and appended its tokens, and the request was not
         rescheduled from scratch (new under a reused id, or resumed). Every
         other row (new, moved or re-added request) is stale.
         """
+        input_batch = self.runner.input_batch
+        rescheduled = {r.req_id for r in scheduler_output.scheduled_new_reqs}
+        rescheduled |= scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        return [
+            row
+            for row in range(input_batch.num_reqs)
+            if self._row_req_ids[row] != input_batch.req_ids[row]
+            or input_batch.req_ids[row] in rescheduled
+        ]
+
+    def _refresh_rows(self, scheduler_output: SchedulerOutput) -> bool:
+        """Uploads the history of each stale batch row; whether any was."""
         assert self._hist is not None
         input_batch = self.runner.input_batch
         num_reqs = input_batch.num_reqs
-        rescheduled = {r.req_id for r in scheduler_output.scheduled_new_reqs}
-        rescheduled |= scheduler_output.scheduled_cached_reqs.resumed_req_ids
         width = self._match_widths[-1]
-        stale = False
-        for row in range(num_reqs):
+        stale = self._stale_rows(scheduler_output)
+        for row in stale:
             req_id = input_batch.req_ids[row]
-            if self._row_req_ids[row] == req_id and req_id not in rescheduled:
-                continue
-            stale = True
             packed = zeros_h2d_source(self.runner, 1 + width)
             packed[0] = row
             packed[1 : 1 + self.max_model_len] = torch.from_numpy(
@@ -257,7 +263,32 @@ class DeviceNgramProposer:
             self._row_req_ids[row] = req_id
         # Rows past the batch miss this step's appends.
         self._row_req_ids[num_reqs:] = [None] * (len(self._row_req_ids) - num_reqs)
-        return stale
+        return bool(stale)
+
+    def fused_inputs(
+        self,
+        scheduler_output: SchedulerOutput,
+        start: int,
+        num_reqs: int,
+        rows: int,
+        steps: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, tuple[int, int, int]] | None:
+        """`(history, meta, match width, key)` for a caller that folds this
+        chunk's propose (`propose_step`) into its own program ahead of the
+        host commit, or None unless the last step left the chunk's lengths on
+        device and its rows are current. The host lengths then lag one step,
+        so the width bucket leaves room for two steps of tokens."""
+        key = (start, num_reqs, rows)
+        meta = self._next_meta.get(key)
+        if meta is None or self._stale_rows(scheduler_output):
+            return None
+        assert self._hist is not None
+        _, width = self._chunk_meta(start, num_reqs, rows, 2 * steps, meta)
+        return self._hist, meta, width, key
+
+    def commit_fused(self, key: tuple[int, int, int], next_meta: torch.Tensor) -> None:
+        """Keep the lengths a folded `propose_step` left (see `fused_inputs`)."""
+        self._next_meta = {key: next_meta}
 
     def _chunk_meta(
         self,

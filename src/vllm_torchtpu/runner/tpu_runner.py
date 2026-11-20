@@ -135,7 +135,10 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
-from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
+from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+    RejectionSampler,
+    greedy_rejection_from_tokens,
+)
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
     apply_top_k_top_p,
@@ -212,6 +215,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
     SpecLogprobsChunk,
+    extract_draft_token_ids_impl,
+    spec_substitution_impl,
 )
 from vllm_torchtpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
@@ -220,7 +225,7 @@ from vllm_torchtpu.spec_decode.adaptive_verification import (
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
-from vllm_torchtpu.spec_decode.ngram_device import DeviceNgramProposer
+from vllm_torchtpu.spec_decode.ngram_device import DeviceNgramProposer, propose_step
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     fit_rows,
@@ -549,6 +554,78 @@ def _advance_decode_inputs(
         num_rejected,
         tokens_per_req,
     )
+
+
+@dataclass(frozen=True)
+class _SteadyVerifyTail:
+    """What `_steady_verify_tail` computed after one verify step's kernel."""
+
+    next_tokens: torch.Tensor  # [rows, 1 + K]: the step's accepted tokens
+    drafts: torch.Tensor  # [rows, K]: the next step's drafts
+    source: torch.Tensor  # the next step's substitution source, padded
+    num_rejected: torch.Tensor  # [rows]
+
+
+def _steady_verify_tail_impl(
+    tokens: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    draft_lengths: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    final_logits_indices: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    hist: torch.Tensor,
+    meta: torch.Tensor,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    k: int,
+    min_n: int,
+    max_n: int,
+    width: int,
+    bound: int,
+) -> tuple[torch.Tensor, ...]:
+    """Everything after a steady greedy verify step's kernel, one program:
+    accept the drafts against the rows' greedy tokens, draft the next K from
+    the accepted ones, build the next step's substitution source and rejected
+    counts, and derive the next step's inputs as `_advance_decode_inputs`."""
+    next_tokens = greedy_rejection_from_tokens(
+        draft_token_ids,
+        tokens,
+        bonus_logits_indices,
+        target_logits_indices,
+        draft_lengths,
+        segment_ids,
+        group_indices,
+        k,
+    )
+    drafts, next_meta = propose_step(hist, meta, next_tokens, min_n, max_n, k, width)
+    source, num_rejected = spec_substitution_impl(next_tokens, drafts, draft_lengths)
+    source = torch.nn.functional.pad(source, (0, bound - source.shape[0]))
+    ids, pos, lens = _advance_decode_inputs_impl(
+        source, input_ids, positions, seq_lens, query_start_loc, num_rejected, 1 + k
+    )
+    next_drafts = extract_draft_token_ids_impl(
+        ids, final_logits_indices, target_logits_indices
+    )
+    return (
+        next_tokens,
+        drafts,
+        next_meta,
+        source,
+        num_rejected,
+        ids,
+        pos,
+        lens,
+        next_drafts,
+    )
+
+
+_steady_verify_tail_compiled = torch.compile(
+    _steady_verify_tail_impl, backend="tpu", fullgraph=True, dynamic=False
+)
 
 
 logger = init_logger(__name__)
@@ -1284,6 +1361,9 @@ class TPUModelRunner(GPUModelRunner):
         self.execute_model_state: ExecuteModelState | None = None
         self._pre_async_results: AsyncPreResults | None = None
         self._decode_carry: _DecodeCarry | None = None
+        # The next step's inputs `_steady_verify_tail` derived from this
+        # carry, for `_execute_steady_decode`.
+        self._steady_next: tuple[_DecodeCarry, tuple[torch.Tensor, ...]] | None = None
         self._min_tokens = min_tokens_mask.MinTokensTracker()
         # 1 on TP rank 0, else 0; built lazily on first use by
         # _sync_replicated_drafts_across_tp (needs the TP group initialized).
@@ -4648,6 +4728,7 @@ class TPUModelRunner(GPUModelRunner):
         if steady is not None:
             self._execute_steady_decode(scheduler_output, steady)
             return None
+        self._steady_next = None
         if scheduler_output.total_num_scheduled_tokens == 0:
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
@@ -5218,16 +5299,28 @@ class TPUModelRunner(GPUModelRunner):
         pre = self._pre_async_results
         assert pre is not None
         spec_md = carry.spec_metadata
-        input_ids, positions, seq_lens = _advance_decode_inputs(
-            pre.next_tokens_tpu,
-            carry.input_ids,
-            carry.positions,
-            carry.seq_lens,
-            carry.query_start_loc,
-            pre.spec_decode_num_rejected_tokens if spec_md is not None else None,
-            carry.tokens_per_req,
-        )
-        if spec_md is not None:
+        derived, self._steady_next = self._steady_next, None
+        if derived is not None and derived[0] is not carry:
+            derived = None
+        if derived is not None:
+            input_ids, positions, seq_lens, draft_token_ids = derived[1]
+            assert spec_md is not None
+            spec_md = dataclasses.replace(
+                spec_md,
+                draft_token_ids=draft_token_ids,
+                deferred_draft_token_ids_cpu=None,
+            )
+        else:
+            input_ids, positions, seq_lens = _advance_decode_inputs(
+                pre.next_tokens_tpu,
+                carry.input_ids,
+                carry.positions,
+                carry.seq_lens,
+                carry.query_start_loc,
+                pre.spec_decode_num_rejected_tokens if spec_md is not None else None,
+                carry.tokens_per_req,
+            )
+        if spec_md is not None and derived is None:
             from vllm_torchtpu.runner.tpu_runner_async_output import (
                 extract_draft_token_ids,
             )
@@ -5939,6 +6032,72 @@ class TPUModelRunner(GPUModelRunner):
                 )
         return selected, logprob_logits
 
+    def _steady_verify_tail(
+        self,
+        state: ExecuteModelState,
+        tokens: torch.Tensor,
+        md: SpecDecodeMetadata,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+    ) -> _SteadyVerifyTail | None:
+        """Run everything after this verify step's kernel as one program
+        (`_steady_verify_tail_impl`), or None to take the step-by-step path.
+
+        That takes a greedy top-token step of one chunk that carries its inputs
+        to the next step (`_decode_step_carry`) and whose n-gram drafter left
+        its lengths on device: the host then only enqueues, which keeps it off
+        the critical path (2.85 ms of host per step-by-step verify step vs a
+        2.69 ms kernel, traced). The next step uses the derived inputs if it is
+        steady (`_execute_steady_decode`)."""
+        carry = self._decode_carry
+        drafter = self.drafter
+        if not (
+            state.top_tokens
+            and carry is not None
+            and carry.spec_metadata is md
+            and isinstance(drafter, DeviceNgramProposer)
+            and self.rejection_sampler is not None
+            and not self.rejection_sampler.synthetic_mode
+            and len(state.spec_decode_metadata_list) == 1
+        ):
+            return None
+        assert md.draft_token_ids is not None
+        rows = md.draft_lengths.shape[0]
+        k = carry.tokens_per_req - 1
+        fused = drafter.fused_inputs(scheduler_output, 0, num_reqs, rows, 1 + k)
+        if fused is None:
+            return None
+        hist, meta, width, key = fused
+        out = (
+            _steady_verify_tail_compiled
+            if tokens.device.type == "tpu"
+            else _steady_verify_tail_impl
+        )(
+            tokens,
+            md.draft_token_ids,
+            md.draft_lengths,
+            md.bonus_logits_indices,
+            md.target_logits_indices,
+            md.final_logits_indices,
+            md.segment_ids,
+            md.group_indices,
+            hist,
+            meta,
+            carry.input_ids,
+            carry.positions,
+            carry.seq_lens,
+            carry.query_start_loc,
+            k,
+            drafter.min_n,
+            drafter.max_n,
+            width,
+            self.max_num_reqs * (1 + k),
+        )
+        next_tokens, drafts, next_meta, source, num_rejected = out[:5]
+        drafter.commit_fused(key, next_meta)
+        self._steady_next = (carry, out[5:])
+        return _SteadyVerifyTail(next_tokens, drafts, source, num_rejected)
+
     def _sample_spec_verify_chunk(
         self,
         logits: torch.Tensor,
@@ -6155,6 +6314,8 @@ class TPUModelRunner(GPUModelRunner):
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
+        # Set when one program ran everything after the kernel.
+        steady_tail: _SteadyVerifyTail | None = None
         if self.is_pooling_model:
             req_ids = cast(
                 list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
@@ -6172,19 +6333,25 @@ class TPUModelRunner(GPUModelRunner):
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
-                    with self._stage_timing.stage("sample"):
-                        next_tokens = self._sample_spec_verify_chunk(
-                            logits,
-                            md,
-                            grammar_output,
-                            scheduler_output,
-                            cur_start_idx,
-                            cur_end_idx,
-                            all_greedy,
-                            sampling_generator,
-                            state.top_tokens,
-                            min_toks,
-                        )
+                    steady_tail = self._steady_verify_tail(
+                        state, logits, md, scheduler_output, num_reqs
+                    )
+                    if steady_tail is not None:
+                        next_tokens = steady_tail.next_tokens
+                    else:
+                        with self._stage_timing.stage("sample"):
+                            next_tokens = self._sample_spec_verify_chunk(
+                                logits,
+                                md,
+                                grammar_output,
+                                scheduler_output,
+                                cur_start_idx,
+                                cur_end_idx,
+                                all_greedy,
+                                sampling_generator,
+                                state.top_tokens,
+                                min_toks,
+                            )
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
@@ -6390,7 +6557,9 @@ class TPUModelRunner(GPUModelRunner):
             and combined_selected_tokens
             and not self._is_dspark_pd_producer
         ):
-            if is_spec_step:
+            if steady_tail is not None:
+                eagle3_drafts = [steady_tail.drafts]
+            elif is_spec_step:
                 with self._stage_timing.stage("draft_propose"):
                     eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(
                         sampled_token_ids=None,
@@ -6502,7 +6671,16 @@ class TPUModelRunner(GPUModelRunner):
             # and the per-request rejected count to park.
             spec_num_rejected = None
             num_draft_per_req = None
-            if is_spec_step:
+            if steady_tail is not None:
+                (tail_md,) = state.spec_decode_metadata_list
+                assert tail_md is not None
+                next_tokens_tpu_chunks = [steady_tail.source]
+                next_token_indices = {r: r for r in range(num_reqs)}
+                spec_num_rejected = steady_tail.num_rejected
+                num_draft_per_req = {
+                    r: int(tail_md.draft_lengths_cpu[r]) for r in range(num_reqs)
+                }
+            elif is_spec_step:
                 (
                     next_tokens_tpu_chunks,
                     next_token_indices,

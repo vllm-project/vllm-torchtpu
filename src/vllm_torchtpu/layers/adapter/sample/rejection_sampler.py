@@ -307,8 +307,7 @@ def _greedy_rejection_sample_with_segment(
     )
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def _greedy_rejection_sample_from_tokens(
+def greedy_rejection_from_tokens(
     draft_token_ids: torch.Tensor,
     tokens: torch.Tensor,
     bonus_logits_indices: torch.Tensor,
@@ -317,11 +316,12 @@ def _greedy_rejection_sample_from_tokens(
     segment_ids: torch.Tensor,
     group_indices: torch.Tensor,
     max_draft_tokens: int,
-    accept_u: torch.Tensor | None,
-    synthetic_conditional_rates: torch.Tensor | None,
-    synthetic_mode: bool,
+    accept_u: torch.Tensor | None = None,
+    synthetic_conditional_rates: torch.Tensor | None = None,
+    synthetic_mode: bool = False,
 ) -> torch.Tensor:
-    """Greedy validation from each verify row's greedy token, without logits."""
+    """Greedy validation from each verify row's greedy token, without logits
+    (uncompiled: a caller may fold it into a larger program)."""
     bonus_token_ids = torch.index_select(tokens, 0, bonus_logits_indices).view(-1)
     target_argmax = torch.index_select(tokens, 0, target_logits_indices).view(-1)
     return _greedy_rejection_sample(
@@ -336,6 +336,11 @@ def _greedy_rejection_sample_from_tokens(
         synthetic_conditional_rates,
         synthetic_mode,
     )
+
+
+_greedy_rejection_sample_from_tokens = torch.compile(
+    greedy_rejection_from_tokens, backend="tpu", fullgraph=True, dynamic=False
+)
 
 
 def _greedy_rejection_sample(

@@ -309,7 +309,7 @@ def subtract_num_rejected_tokens(
     return seq_lens, positions
 
 
-def _extract_draft_token_ids_impl(
+def extract_draft_token_ids_impl(
     input_ids: torch.Tensor,
     logits_indices: torch.Tensor,
     target_logits_indices: torch.Tensor,
@@ -329,7 +329,7 @@ def extract_draft_token_ids(
     fn = (
         _extract_draft_token_ids_compiled
         if input_ids.device.type == "tpu"
-        else _extract_draft_token_ids_impl
+        else extract_draft_token_ids_impl
     )
     return fn(input_ids, logits_indices, target_logits_indices)
 
@@ -349,7 +349,7 @@ def compute_num_rejected(
     return (num_draft - num_valid + 1).clamp(min=0).to(torch.int32)
 
 
-def _spec_substitution_impl(
+def spec_substitution_impl(
     next_tokens: torch.Tensor, drafts: torch.Tensor, num_draft: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
@@ -366,11 +366,11 @@ def spec_substitution(
     fn = (
         _spec_substitution_compiled
         if next_tokens.device.type == "tpu"
-        else _spec_substitution_impl
+        else spec_substitution_impl
     )
     return fn(next_tokens, drafts, num_draft)
 
 
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-_extract_draft_token_ids_compiled = _tpu_compile(_extract_draft_token_ids_impl)
-_spec_substitution_compiled = _tpu_compile(_spec_substitution_impl)
+_extract_draft_token_ids_compiled = _tpu_compile(extract_draft_token_ids_impl)
+_spec_substitution_compiled = _tpu_compile(spec_substitution_impl)
