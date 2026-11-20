@@ -14,10 +14,13 @@
 """Direct guard-checked cache-entry dispatch and GLOBAL_STATE guard filtering
 for ``torch.compile(backend="tpu", fullgraph=True, dynamic=False)`` functions.
 
-The hook is installed when the TPU platform module loads, before any module
-applies its torch.compile decorators, and does nothing until the worker
-arms it from ``additional_config["tpu_compile"]`` (``compilation.compile_options``;
-both options default to off):
+:func:`tpu_compile` compiles a function with ``torch.compile(backend="tpu",
+fullgraph=True, dynamic=False)`` and wraps the result. The hook is installed
+when the TPU platform module loads, before any module applies its
+torch.compile decorators, and does the same for those decorators. Neither
+does anything until the worker arms them from
+``additional_config["tpu_compile"]`` (``compilation.compile_options``; both
+options default to off):
 
 * ``fast_compiled_call``: compiled plain functions evaluate each cached
   entry's ``guard_manager.check(f_locals)`` in MRU order and invoke the
@@ -43,6 +46,7 @@ from __future__ import annotations
 import functools
 import inspect
 import types
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -224,6 +228,49 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
 def _drop_global_state(entries: Any) -> list[bool]:
     keep_all = not _CONFIG["drop_global_state"]
     return [keep_all or e.guard_type != "GLOBAL_STATE" for e in entries]
+
+
+def tpu_compile[F: Callable[..., Any]](fn: F) -> F:
+    """Compile ``fn`` for TPU: ``torch.compile(fn, backend="tpu",
+    fullgraph=True, dynamic=False)`` with this module's guard filter, wrapped
+    for fast dispatch. Use it as a decorator, or call it on a function.
+
+    Disarmed (the default) the wrapper calls the compiled function and the
+    filter keeps every guard, so the compiled programs and their guards are
+    those of the plain ``torch.compile`` call. The options are read when a
+    frame compiles (the filter) and on every call (the wrapper), never at
+    decoration.
+
+    fast (``fast_compiled_call``): guard-checked direct dispatch (above).
+    drop_global_state (``drop_global_state_guard``): the guard filter drops
+    only the GLOBAL_STATE guard (grad mode, num_threads, autocast, default
+    dtype, ...). Warmup entries are then reused by serving even when the
+    serving thread's num_threads/grad mode differ from the warmup thread's;
+    tensor guards (shape, stride, dtype, device, requires_grad) and value
+    guards are kept. These graphs take no requires_grad inputs and run on
+    TPU, so neither grad mode nor the CPU intra-op thread count changes what
+    they compute.
+    """
+    if not isinstance(fn, types.FunctionType):
+        raise TypeError(
+            f"tpu_compile takes a plain function, got {type(fn).__name__}; "
+            "compile a bound method or a module with torch.compile"
+        )
+    compiled = torch.compile(
+        fn,
+        backend="tpu",
+        fullgraph=True,
+        dynamic=False,
+        # torch.compile pops guard_filter_fn; the emptied dict is falsy, so the
+        # backend still gets no options kwarg. The filter keeps every guard
+        # unless drop_global_state_guard is on when Dynamo compiles the frame.
+        options={"guard_filter_fn": _drop_global_state},
+    )
+    if compiled is fn:
+        # Dynamo is disabled (TORCHDYNAMO_DISABLE=1): torch.compile hands back
+        # the function itself, which has no cache entries to dispatch.
+        return fn
+    return _wrap(compiled, fn)
 
 
 def _eligible(model: Any, kwargs: dict) -> bool:
