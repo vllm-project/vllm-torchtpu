@@ -214,8 +214,8 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
     ``ProfilerConfig.compute_hash()`` ("this config will not affect the
     computation graph"); this is the equivalent carve-out for the plugin-owned
     keys, mirroring ``_TPU_COMPILE_ENV_IGNORED`` for env vars. The host-only
-    sections (the API-server patches' ``tpu_frontend``) never reach a compiled
-    program either.
+    sections in that set, each named by the ``SECTION`` of the module that
+    reads it, never reach a compiled program either.
     """
     import copy
 
