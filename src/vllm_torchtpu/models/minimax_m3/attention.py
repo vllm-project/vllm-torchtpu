@@ -42,7 +42,7 @@ from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3 import index_reuse as msa_index_reuse
 from vllm_torchtpu.models.minimax_m3 import sp_o_proj
-from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse, msa_fp4
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_dcp_op,
     get_msa_op,
@@ -347,6 +347,10 @@ class MiniMaxM3SparseAttention(nn.Module):
             scales_in_page=True,
         )
         self.fp4 = dtype == torch.uint8
+        # Cached keys' norm over the exact ones' (`score_bound`).
+        self.key_rounding = msa_attention_lse.KEY_ROUNDING[
+            "int4" if self.fp4 else "fp8" if dtype.itemsize == 1 else "bf16"
+        ]
         self.scale_cache = None
         if self.fp4:
             if self.index_shards > 1:
@@ -429,6 +433,17 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.head_dim,
             eps,
             self.q_head_major,
+        )
+
+    def score_bound(self) -> float:
+        """``|q . k| * head_dim**-0.5`` bound from the loaded norms (see
+        `msa_attention_lse.score_bound`), times the cache's key rounding and,
+        for 4-bit caches with fp8 queries ("qk8"), the queries' rounding."""
+        rounding = self.key_rounding
+        if self.fp4 and "qk8" in msa_attention_lse.prefill_precision_levers():
+            rounding *= msa_attention_lse._QK8_ROUNDING
+        return msa_attention_lse.score_bound(
+            self.q_norm.weight, self.k_norm.weight, self.head_dim, rounding
         )
 
     def forward(

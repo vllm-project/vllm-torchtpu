@@ -119,6 +119,32 @@ def test_fused_op_dynamo(fp4):
     assert out.shape == (TOKENS, HEADS * HEAD_DIM)
 
 
+@pytest.mark.parametrize("fp4", [False, True], ids=["fp8", "fp4"])
+def test_fused_op_fake_symbolic_max_free(fp4, monkeypatch):
+    """With the max-free softmax configured (TPU_MINIMAX_M3_MSA_MAX_FREE, the
+    MXU mask too) the op's fake still fits its schema symbolically."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse
+
+    monkeypatch.setattr(msa_attention_lse, "MAX_FREE", True)
+    monkeypatch.setattr(msa_attention_lse, "MXU_MASK", True)
+    op = _keep(
+        ("fused_mf", fp4),
+        lambda: _ops()._get_msa_dcp_attend_merge_op(
+            SCALE * 1.75, TOPK, 2, fp4, f"fake_dattn_mf{int(fp4)}", fused=True
+        ),
+    )
+    mode = FakeTensorMode(shape_env=ShapeEnv())
+    seed = mode.from_tensor(
+        torch.empty(TOKENS),
+        symbolic_context=StatelessSymbolicContext(dynamic_sizes=[DimDynamic.DYNAMIC]),
+    )
+    with mode:
+        num = seed.shape[0]
+        out = op(*[mode.from_tensor(a) for a in _args(num, fp4)])
+    assert out.shape == (num, HEADS * HEAD_DIM) and out.dtype == BF16
+    assert isinstance(out.shape[0], torch.SymInt)
+
+
 def test_fused_rejects_selection_modes():
     with pytest.raises(ValueError, match="candidates"):
         _ops()._get_msa_dcp_attend_merge_op(

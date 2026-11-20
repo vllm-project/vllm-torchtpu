@@ -14,7 +14,7 @@
 """Worker of `test_msa_dcp_fused.py` on a 2-device CPU platform: the fused
 DCP decode attention call against `msa_dcp.attend_and_merge`, bit for bit.
 
-    dcp_fused_spmd.py <fp8|fp4> <ctx,ctx,...> <padding rows> <control 0|1>
+    dcp_fused_spmd.py <fp8|fp4> <ctx,ctx,...> <padding rows> <control 0|1> [maxfree]
 
 8 verify rows per request over the given contexts, then the padding rows.
 """
@@ -27,7 +27,12 @@ import numpy as np
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_dcp_fused, msa_fp4
+from vllm_torchtpu.models.minimax_m3.kernels import (
+    msa_attention_lse,
+    msa_dcp,
+    msa_dcp_fused,
+    msa_fp4,
+)
 
 PAGE, D, HL, TOPK, DCP, ROWS = 128, 128, 8, 16, 2, 8
 SCALE = D**-0.5
@@ -82,6 +87,9 @@ def caches(fp4, pages, rng):
 
 
 def main():
+    if len(sys.argv) > 5 and sys.argv[5] == "maxfree":
+        # Both calls run the max-free softmax (TPU_MINIMAX_M3_MSA_MAX_FREE).
+        msa_attention_lse.configure_max_free(0.0, enabled=True, mxu_mask=True)
     fp4 = sys.argv[1] == "fp4"
     ctx = [int(x) for x in sys.argv[2].split(",")]
     pad, control = int(sys.argv[3]), sys.argv[4] == "1"

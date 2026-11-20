@@ -287,6 +287,7 @@ def _body(
         groups_per_tile=groups_per_tile,
         transposed=False,
         pages_per_step=_PAGES_PER_STEP,
+        precision=msa_attention_lse.max_free_levers(),
     )
 
     # 4. The partner's heads' partial and every LSE go to the partner.

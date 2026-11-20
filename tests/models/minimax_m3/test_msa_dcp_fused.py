@@ -68,6 +68,13 @@ def test_fused_matches_unfused_bitwise(kind, ctx, pad, control):
     _run(kind, ctx, str(pad), control)
 
 
+@pytest.mark.parametrize("kind", ["fp8", "fp4"])
+def test_fused_matches_unfused_bitwise_max_free(kind):
+    """With the max-free softmax (TPU_MINIMAX_M3_MSA_MAX_FREE) the fused call
+    still matches the unfused one bit for bit (both run the same body)."""
+    _run(kind, "5000,3000,700", "8", "0", "maxfree")
+
+
 def test_fused_matches_unfused_bitwise_128_rows():
     """16 requests (the c16 128-row bucket): 16 tiles, the work list's
     bitonic unions (the unfused call's XLA work list)."""
