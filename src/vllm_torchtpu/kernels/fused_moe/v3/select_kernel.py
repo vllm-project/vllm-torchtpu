@@ -11,11 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused router top-k selection and redundant-expert load-balancing kernel.
-
-Selects top-k experts per token and distributes activations across replicated
-physical expert slots when an expert placement table is active.
-"""
+"""Fused EP MoE v3's router top-k: each token's experts and their weights,
+optionally written as the routing message the exchange sends."""
 
 import functools
 

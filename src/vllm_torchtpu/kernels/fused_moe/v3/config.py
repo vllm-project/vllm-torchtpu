@@ -146,7 +146,9 @@ class Config:
         ring) exceeds the default's at 4096 lanes.
       scatter_chunk_pairs: the most routed pairs per chunk of the
         sparse-core row-tables scatter, a multiple of 128; the layer takes
-        the largest count up to it that divides a subcore's run.
+        the largest count up to it that divides a subcore's run and whose
+        ring of chunks, every scale plane included, fits a vector
+        subcore's VMEM.
       scatter_ring: the scatter's chunks in flight per subcore.
       combine_tokens_per_tile: tokens per grid step of the combine's
         weighted sum, a whole number of 8-row blocks; the routing message
@@ -204,7 +206,7 @@ class Config:
     tables_blocks_per_step: int = TABLES_BLOCKS_PER_STEP_AUTOMATIC
     vmem_fraction: float = VMEM_FRACTION_DEFAULT
     activation_block: int = 0
-    token_block: object = None
+    token_block: int | None = None
     result_rows: str = "fp8"
     elementwise_dtype: str = "bfloat16"
     combine_dtype: str = "float32"
@@ -219,7 +221,7 @@ class Config:
     activation_columns_per_pass: int = ACTIVATION_COLUMNS_PER_PASS_DEFAULT
     tables_zero_words: int = TABLES_ZERO_WORDS_DEFAULT
     weight_dma_priority: int = WEIGHT_DMA_PRIORITY_DEFAULT
-    sorted_rows: object = None
+    sorted_rows: bool | None = None
     combine_real_tokens: bool = False
     sort_index_compare: bool = False
     reorder_chain: bool = False
@@ -309,7 +311,8 @@ class Config:
                 f"(one scale per row) or a multiple of {LANES}"
             )
         if self.token_block is not None and (
-            not isinstance(self.token_block, int)
+            isinstance(self.token_block, bool)
+            or not isinstance(self.token_block, int)
             or self.token_block < 0
             or self.token_block % LANES
         ):
