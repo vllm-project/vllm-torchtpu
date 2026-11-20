@@ -486,6 +486,56 @@ def maybe_patch_qwen3_vl_image_hf_text(
     return None
 
 
+# Set while this thread runs Qwen3-VL's `_apply_hf_processor_main`.
+_qwen3_vl_hf_main = threading.local()
+
+
+def maybe_patch_qwen3_vl_video_hf_text(
+    model_config: Optional["ModelConfig"] = None,
+) -> bool | None:
+    """Process each Qwen3-VL video without the HF text vLLM discards.
+
+    vLLM's Qwen3-VL processor calls the HF processor once per video with the
+    text ``<|vision_start|><|video_pad|><|vision_end|>``. HF expands it to one
+    token per merged patch plus a timestamp per frame group and tokenizes it,
+    then vLLM pops the ids and builds the video's tokens itself
+    (`get_video_repl`); only the video fields come from that call, and the
+    video processor computes them without the text. Dropping the text takes
+    the tokenizer (3.9 ms) out of Cosmos3-Super's 9360-patch video. The call is
+    told apart by its `videos`, which upstream pops from the data of its other
+    call.
+    """
+    if model_config is None or not _has_qwen3_vl_vision(model_config):
+        return False
+    from vllm.model_executor.models import qwen3_vl
+    from vllm.multimodal.processing import context
+
+    processor_cls = qwen3_vl.Qwen3VLMultiModalProcessor
+    if not getattr(processor_cls, "_tpu_video_hf_text_skipped", False):
+        upstream_main = processor_cls._apply_hf_processor_main
+        upstream_call = context.InputProcessingContext.call_hf_processor
+
+        @functools.wraps(upstream_main)
+        def _apply_hf_processor_main(self, mm_items, hf_kwargs):
+            _qwen3_vl_hf_main.active = True
+            try:
+                return upstream_main(self, mm_items, hf_kwargs)
+            finally:
+                _qwen3_vl_hf_main.active = False
+
+        @functools.wraps(upstream_call)
+        def call_hf_processor(self, hf_processor, data, kwargs={}):
+            if getattr(_qwen3_vl_hf_main, "active", False) and "videos" in data:
+                data = {k: v for k, v in data.items() if k != "text"}
+            return upstream_call(self, hf_processor, data, kwargs)
+
+        processor_cls._apply_hf_processor_main = _apply_hf_processor_main
+        context.InputProcessingContext.call_hf_processor = call_hf_processor
+        processor_cls._tpu_video_hf_text_skipped = True
+        logger.info("Applied TPU patch: Qwen3-VL videos skip the HF text vLLM drops.")
+    return None
+
+
 @functools.lru_cache(maxsize=1024)
 def _bilinear_tables(
     h: int, w: int, num_grid_per_side: int, merge: int, dtype: torch.dtype
