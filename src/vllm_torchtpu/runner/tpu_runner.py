@@ -8275,7 +8275,8 @@ class TPUModelRunner(GPUModelRunner):
             next_lens.append(
                 self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
             )
-        with self._precompile_timed("substitute_placeholder_token"):
+        # execute_model runs under no_grad, and dynamo guards on grad mode.
+        with self._precompile_timed("substitute_placeholder_token"), torch.no_grad():
             for num_tokens in self.num_tokens_paddings:
                 input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
                 # Row 0 destinations, row 1 sources; the -1 sentinel marks
@@ -8328,6 +8329,55 @@ class TPUModelRunner(GPUModelRunner):
                         )
                         synchronize_tensors([out_i32, *out_sub_ext, *out_sub_ext_i64])
                     logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
+            if self._is_async_drafter:
+                self._precompile_draft_extract()
+
+    def _precompile_draft_extract(self) -> None:
+        """Warm the separate draft extract (`_compiled_extract_draft_token_ids`)
+        at every shape an async spec step can give it.
+
+        It runs when a step's logits rows do not cover its tokens (a verify
+        step that also schedules prefill tokens), so the fused substitute and
+        extract above does not apply. Its logits and target indices have the
+        padded logits length L; its input is cut to L when every draft lies
+        below L (`_draft_extract_input_ids`), and is otherwise the step's N > L
+        padded tokens. Called under no_grad.
+        """
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            _compiled_extract_draft_token_ids,
+        )
+
+        paddings = list(self.num_tokens_paddings)
+        for i, length in enumerate(paddings):
+            # Two tensors, as serving passes: dynamo guards on a repeated
+            # input, so a graph warmed with one tensor in both places would
+            # not serve a call with two.
+            logits_indices = torch.zeros(length, dtype=torch.int32).to(self.device)
+            target_indices = torch.zeros(length, dtype=torch.int32).to(self.device)
+            for num_tokens in paddings[i:]:
+                input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
+                synchronize_tensors(
+                    _compiled_extract_draft_token_ids(
+                        input_ids, logits_indices, target_indices
+                    )
+                )
+            logger.info("  -- draft extract: logits length %d", length)
+
+    def _precompile_non_spec_chunk_padding(self) -> None:
+        """Warm `_compiled_pad_non_spec_next_tokens` at every padded request
+        count. In a spec step it pads the tokens of a chunk with no drafts (a
+        request's first decode step, beside verifying ones), which are
+        `[padded_num_reqs, 1]` int64 whether sampled or greedy top tokens."""
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            _compiled_pad_non_spec_next_tokens,
+        )
+
+        assert self.speculative_config is not None
+        k = self.speculative_config.num_speculative_tokens
+        with self._precompile_timed("non-spec chunk padding"), torch.no_grad():
+            for num_reqs in self.num_reqs_paddings:
+                selected = torch.zeros((num_reqs, 1), dtype=torch.int64).to(self.device)
+                synchronize_tensors(_compiled_pad_non_spec_next_tokens(selected, k))
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
@@ -8694,6 +8744,7 @@ class TPUModelRunner(GPUModelRunner):
             elif self._is_async_drafter:
                 self._async_drafter.precompile()
                 self._precompile_rejection_sampler()
+                self._precompile_non_spec_chunk_padding()
                 self._precompile_spec_logprobs()
                 # The isolated precompiles above emit standalone fused
                 # programs; the real per-step propose+verify+sampling
