@@ -61,6 +61,9 @@ class _Armed:
     ranks: tuple[int, ...]
     op: Any
     rank: torch.Tensor  # this rank's mesh index, int32 [1, 1]
+    # Every rank's mesh index equals its group rank (decided once, from all
+    # ranks' indices, so the answer is the same on every rank).
+    rank_ordered: bool = False
 
 
 _ARMED: _Armed | None = None
@@ -286,6 +289,8 @@ def arm(hidden: int, device: torch.device) -> bool:
         return False
     if sorted(s["mesh_index"] for s in seen) != list(range(tp.world_size)):
         raise RuntimeError(f"tp_all_reduce: mesh indices are not 0..n-1: {seen}")
+    # Decided from every rank's index, so the answer is the same on every rank.
+    rank_ordered = all(s["mesh_index"] == i for i, s in enumerate(seen))
     n = int(mesh.size)
     direct_rows = max(envs.TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS, 0)
     op = _make_op(mesh, max_bytes, direct_rows)
@@ -317,7 +322,12 @@ def arm(hidden: int, device: torch.device) -> bool:
             envs.TPU_TP_AR_QDQ_ROWS,
             qdq_min_rows,
         )
-    _ARMED = _Armed(ranks=tuple(int(r) for r in tp.ranks), op=op, rank=rank)
+    _ARMED = _Armed(
+        ranks=tuple(int(r) for r in tp.ranks),
+        op=op,
+        rank=rank,
+        rank_ordered=rank_ordered,
+    )
     logger.info(
         "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B views"
         " (TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES=%d, kernel cap %d); libtpu %s",
@@ -350,3 +360,14 @@ def all_reduce(ranks, x: torch.Tensor) -> torch.Tensor | None:
     # branch here would give the model's Dynamo traces different graphs (and
     # inputs) per bucket, which shape_variants refuses to hand buckets between.
     return armed.op(x, armed.rank)
+
+
+def armed_rank(ranks) -> torch.Tensor | None:
+    """This rank's index in the group of `ranks` as an int32 [1, 1] tensor:
+    the armed op's mesh index, when the op is armed for that group and every
+    rank's mesh index is its group rank (the same answer on every rank), so
+    callers can index rank-ordered blocks by it."""
+    armed = _ARMED
+    if armed is None or tuple(ranks) != armed.ranks or not armed.rank_ordered:
+        return None
+    return armed.rank

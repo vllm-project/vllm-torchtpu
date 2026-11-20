@@ -345,6 +345,10 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
     # MiniMax-M3 MSA kernels, behind the custom ops of models/minimax_m3/ops.
     "vllm_torchtpu/models/minimax_m3/kernels",
+    # MiniMax-M3 sequence parallelism: the fused SP norm op's torch entry and
+    # the all-to-all o_proj's JAX bodies (TPU_MINIMAX_M3_SP_*).
+    "vllm_torchtpu/models/minimax_m3/ops/sp_norm.py",
+    "vllm_torchtpu/models/minimax_m3/sp_o_proj.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion

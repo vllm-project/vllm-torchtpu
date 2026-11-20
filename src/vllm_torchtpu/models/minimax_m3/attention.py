@@ -41,6 +41,7 @@ from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3 import index_reuse as msa_index_reuse
+from vllm_torchtpu.models.minimax_m3 import sp_o_proj
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_dcp_op,
@@ -296,6 +297,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        sp_o_proj.mark(self.o_proj)
         eps = config.rms_norm_eps
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=eps)
@@ -432,13 +434,27 @@ class MiniMaxM3SparseAttention(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         index_reuse: dict | None = None,
+        project: bool = True,
     ) -> torch.Tensor:
         """``index_reuse`` (MSA index reuse on) is a dict the step's layers
         share: on a decode step a Full layer leaves its selection in it for
-        the Shared layers after it."""
-        qkv, _ = self.qkv_proj(hidden_states)
+        the Shared layers after it.
+
+        ``hidden_states`` may come as e4m3 rows with per-row f32 scales
+        (an SP step's e4m3 all-gather), which qkv_proj contracts as e4m3.
+        ``project=False`` returns this rank's heads before o_proj."""
+        if isinstance(hidden_states, tuple):
+            e4m3_apply = getattr(self.qkv_proj.quant_method, "apply_e4m3_rows", None)
+            if e4m3_apply is None:
+                q8, row_scale = hidden_states
+                qkv, _ = self.qkv_proj((q8.float() * row_scale).to(torch.bfloat16))
+            else:
+                # qkv_proj is bias-free and keeps the linear's forward = apply.
+                qkv = e4m3_apply(self.qkv_proj, *hidden_states)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
             positions,
@@ -449,7 +465,8 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.rotary_emb,
             self.norm_rope_op,
         )
-        num_tokens = hidden_states.shape[0]
+        rows = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        num_tokens = rows.shape[0]
         if not self.q_head_major:
             q = q.view(num_tokens, self.num_heads, self.head_dim)
         metadata = get_forward_context().attn_metadata
@@ -491,5 +508,7 @@ class MiniMaxM3SparseAttention(nn.Module):
                 layer_metadata,
                 **extra,
             ).reshape(num_tokens, self.q_size)
+        if not project:
+            return attn_output
         output, _ = self.o_proj(attn_output)
         return output
