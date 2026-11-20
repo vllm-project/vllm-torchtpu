@@ -29,6 +29,19 @@ from vllm.distributed import parallel_state
 from vllm_torchtpu.runner import greedy_top_tokens as gtt
 
 
+def _set_greedy_top_tokens(monkeypatch) -> None:
+    """Turn TPU_GREEDY_TOP_TOKENS on in the environment, where envs reads it.
+    A monkeypatch.setattr(envs, ...) undo leaves the value it read in the
+    module dict, which shadows envs.__getattr__ for the rest of the session
+    (see tests/layers/adapter/test_mla_attention.py), so any such entry an
+    earlier test left is dropped first."""
+    from vllm_torchtpu import envs
+
+    if "TPU_GREEDY_TOP_TOKENS" in vars(envs):
+        monkeypatch.delattr(envs, "TPU_GREEDY_TOP_TOKENS")
+    monkeypatch.setenv("TPU_GREEDY_TOP_TOKENS", "1")
+
+
 class _Method:
     """vLLM's UnquantizedEmbeddingMethod.apply: F.linear on the weight."""
 
@@ -350,7 +363,7 @@ def test_eagle3_uses_the_vocab_parallel_head_only_under_lockstep(
 ):
     from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
-    monkeypatch.setenv("TPU_GREEDY_TOP_TOKENS", "1")
+    _set_greedy_top_tokens(monkeypatch)
     shards = _tp_shards(torch.randn(64, 8).to(torch.bfloat16), 2, 4)
     _patch_groups(monkeypatch, 4, 2, 2, 1, None, None)
     draft = _Draft(shards[1])
