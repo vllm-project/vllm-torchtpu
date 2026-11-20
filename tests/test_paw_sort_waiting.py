@@ -83,6 +83,8 @@ def _waiting(s, requests, warmth):
     kvm = MagicMock()
     kvm.enable_caching = True
     kvm.coordinator = coordinator
+    # Plenty of free blocks: every request fits unless a test sets fewer.
+    kvm.block_pool = SimpleNamespace(get_num_free_blocks=lambda: 1 << 20)
     s.kv_cache_manager = kvm
 
 

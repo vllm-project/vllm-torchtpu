@@ -115,7 +115,7 @@ def parse(raw: Any) -> PPSchedulerOptions:
 
 def get(vllm_config: Any) -> PPSchedulerOptions:
     """The engine's pipeline chunk scheduler options."""
-    additional = getattr(vllm_config, "additional_config", None)
+    additional = vllm_config.additional_config
     if not isinstance(additional, dict):
         return PPSchedulerOptions()
     return parse(additional.get(SECTION))

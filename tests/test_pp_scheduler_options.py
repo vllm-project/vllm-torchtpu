@@ -132,7 +132,9 @@ def test_defaults_are_the_schedulers_behaviour_without_options():
         opts.paw_aging_tok_per_s,
     ) == (False, False, 0.0)
     assert pp_scheduler_options.get(SimpleNamespace(additional_config=None)) == opts
-    assert pp_scheduler_options.get(SimpleNamespace()) == opts
+    # VllmConfig always has additional_config: a config without it is an error.
+    with pytest.raises(AttributeError, match="additional_config"):
+        pp_scheduler_options.get(SimpleNamespace())
 
 
 def test_parse_reads_every_option():
@@ -704,7 +706,8 @@ def test_promotion_ranks_with_the_free_block_fit():
     head, fits = _waiting("head", 990.0), _waiting("fits", 1_000.0)
     warmth = {"head": 2_000, "fits": 5_000}
     assert _promote(head, fits, warmth, free_blocks=3, step_time=1_000.0) == "fits"
-    assert _promote(head, fits, warmth, free_blocks=None, step_time=1_000.0) == "head"
+    # With room for the head there is no fit input: aging keeps the head first.
+    assert _promote(head, fits, warmth, free_blocks=10_000, step_time=1_000.0) == "head"
 
 
 def test_promotion_ages_the_head_and_the_window_to_the_step_time():
@@ -718,10 +721,10 @@ def test_promotion_ages_the_head_and_the_window_to_the_step_time():
     warmth = {"old-cold": 2_000, "new-warm": 6_000}
     # The head is the older, colder request: the warmer one is promoted
     # (the head must be aged to the step time).
-    assert _promote(old_cold, new_warm, warmth, None, step_time=1_000.0) == "new-warm"
+    assert _promote(old_cold, new_warm, warmth, 10_000, step_time=1_000.0) == "new-warm"
     # The head is the warmer one: it stays first (the window's other
     # requests must be aged to the step time too).
-    assert _promote(new_warm, old_cold, warmth, None, step_time=1_000.0) == "new-warm"
+    assert _promote(new_warm, old_cold, warmth, 10_000, step_time=1_000.0) == "new-warm"
 
 
 def test_free_blocks_count_the_blocks_retention_pins():
