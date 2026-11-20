@@ -79,6 +79,7 @@ def _armed():
         patch.object(envs, "ROUTING_MOE_FP8_DISPATCH", False),
         patch.object(envs, "ROUTING_MOE_GMM_PLAN", ""),
         patch.object(envs, "ROUTING_MOE_FP8_DISPATCH_MIN_ROWS", 256),
+        patch.object(envs, "ROUTING_MOE_PACK_BEFORE_GATHER", False),
     ):
         yield
 
@@ -205,6 +206,14 @@ def test_fp8_dispatch_rows_round_trip():
     amax = np.abs(np.asarray(x, np.float32)).max(-1, keepdims=True)
     assert (err <= amax / 8 + 1e-6).all()
     assert not np.asarray(back[2], np.float32).any()
+
+
+@pytest.mark.parametrize("pack", [False, True])
+def test_pack_before_gather_follows_the_flag(pack):
+    seen = []
+    with patch.object(envs, "ROUTING_MOE_PACK_BEFORE_GATHER", pack):
+        _prebuild(_layer(), build_op=lambda *args, **kw: seen.append(kw) or "op")
+    assert seen[0]["pack_before_gather"] is pack
 
 
 def test_gmm_plan_parsing():

@@ -134,6 +134,8 @@ def unsupported_reason(layer) -> str | None:
         )
     if envs.ROUTING_MOE_FP8_DISPATCH and not envs.ROUTING_MOE_REMOTE_SCATTER:
         return "ROUTING_MOE_FP8_DISPATCH needs remote scatter"
+    if envs.ROUTING_MOE_PACK_BEFORE_GATHER and not envs.ROUTING_MOE_REMOTE_SCATTER:
+        return "ROUTING_MOE_PACK_BEFORE_GATHER needs remote scatter"
     return None
 
 
@@ -548,7 +550,7 @@ def prebuild_routing_moe(
     logger.info_once(
         "[MoE]: routing_moe over %d devices, %d experts each, token replica "
         "groups %s; %s scatter, %s combine rows, %s dispatch rows (from %d rows "
-        "per device); gmm plan %s.",
+        "per device), rows packed before the gather: %s; gmm plan %s.",
         ep,
         local_experts,
         replica_groups,
@@ -556,6 +558,7 @@ def prebuild_routing_moe(
         "fp8" if envs.ROUTING_MOE_FP8_COMBINE else "bf16",
         "fp8" if envs.ROUTING_MOE_FP8_DISPATCH else "bf16",
         envs.ROUTING_MOE_FP8_DISPATCH_MIN_ROWS,
+        envs.ROUTING_MOE_PACK_BEFORE_GATHER,
         envs.ROUTING_MOE_GMM_PLAN or "tokamax heuristics",
     )
     return _build_op(
@@ -571,6 +574,7 @@ def prebuild_routing_moe(
         fp8_dispatch=envs.ROUTING_MOE_FP8_DISPATCH,
         gmm_plan=parse_gmm_plan(envs.ROUTING_MOE_GMM_PLAN),
         fp8_dispatch_min_rows=envs.ROUTING_MOE_FP8_DISPATCH_MIN_ROWS,
+        pack_before_gather=envs.ROUTING_MOE_PACK_BEFORE_GATHER,
     )
 
 
