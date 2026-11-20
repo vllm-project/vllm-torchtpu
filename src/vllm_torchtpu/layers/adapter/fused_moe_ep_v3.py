@@ -439,14 +439,15 @@ def check_kernel_threshold(ep: int, tp: int, lowtok_cap: int = 0) -> None:
         from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
 
         start = _sp.min_rows()
-        # below the sequence-parallel start every rank holds the step's rows;
-        # from it each rank holds at least ceil(start / tp) of them.
-        # Token buckets double at power-of-2 boundaries (e.g. 256 -> 512 where
-        # first_sp_bucket = 1 << (start - 1).bit_length() = 512 -> 64/rank).
-        # When cap < start // 2 (e.g. cap=64 for N<=64 MTP draft steps while
-        # N=96..128 target steps intentionally run fused_moe_gmm + SINGLE_SORT
-        # before SP + fused_moe_ep kicks in at first_sp_bucket), allow the
-        # 3-tier split as long as first_sp_bucket // tp >= gate.
+        # Under tensor parallelism the fused kernel takes only the
+        # sequence-parallel steps. A step below `start` rows keeps its rows
+        # replicated and is served by the few-token kernel up to `cap` rows and
+        # by the routed grouped-matmul path between `cap` and `start`. The
+        # first sliced step is the first token bucket of at least `start` rows
+        # (buckets double, so the next power of two), split over `tp` ranks;
+        # the kernels meet when that share reaches the fused kernel's per-rank
+        # gate. With `start` at 0 every step is sliced, the first bucket is one
+        # row, and no few-token cap meets the gate.
         first_sp_bucket = 1 << (max(start, 1) - 1).bit_length()
         meets = gate <= -(-first_sp_bucket // tp)
         if cap * 2 >= start:
@@ -647,7 +648,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
     layer._tpu_fused_ep_eligible = True
     logger.info_once(
         "Fused EP MoE armed | kernel=%s hidden=%d inter=%d local_experts=%d "
-        "ep=%d topk=%d capacity=%d skip_padded_tokens=%s",
+        "ep=%d topk=%d tile_rows=%d skip_padded_tokens=%s",
         "v3",
         hidden,
         inter,
