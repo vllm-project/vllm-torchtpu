@@ -16,26 +16,35 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Sequence
-from typing import Any
+from collections.abc import Mapping, Sequence
+from typing import Any, TypeGuard
 
-from .decls import REQUIRED, ModuleBinding, _lookup_raw_key, _resolve_field_spec
+from . import decls, schedule
+from .decls import REQUIRED, ModuleBinding
 from .errors import EligibilityResult, MegakernelConfigError
 from .geometry import FromHF
 from .modules.moe import MoEModule
 from .modules.norm import NormModule
 from .profile import Profile
-from .schedule import (
-    Every,
-    FromHFLayerTypes,
-    ModuleOrBinding,
-    ResolvedSchedule,
-    Schedule,
-    _module_cls_of,
-    _module_name_of,
-    _resolve_slot_spec,
-)
+from .schedule import ModuleOrBinding
 from .spec import Module
+
+_SKIP_KEYS = {"architectures", "model_type", "text_config"} | {
+    "torch_dtype",
+    "transformers_version",
+}
+
+
+def _is_int(v: Any) -> TypeGuard[int]:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _is_clean_str(v: Any) -> bool:
+    return isinstance(v, str) and bool(v.strip()) and v.strip() == v
+
+
+def _hf_key(v: Any) -> str:
+    return v[0] if isinstance(v, tuple) else str(v)
 
 
 def model_label(cls: Any, model_name: str | None = None) -> str:
@@ -52,7 +61,7 @@ def describe_binding(
     """Format a `Module` or `ModuleBinding` for error messages."""
     if m is None:
         return "None"
-    label = f"{_module_name_of(m)}/{_module_cls_of(m).__name__}"
+    label = f"{schedule._module_name_of(m)}/{schedule._module_cls_of(m).__name__}"
     m_opts = {k: v for k, v in m.options.items() if v is not None}
     if expected is not None:
         exp_opts = {k: v for k, v in expected.options.items() if v is not None}
@@ -78,7 +87,7 @@ def norm_zc_and_eps(
     default_eps: float | None = None,
 ) -> tuple[bool, float | None]:
     """Extract `(zero_centered, eps)` from a norm `Module` or `ModuleBinding`."""
-    if not issubclass(_module_cls_of(m), NormModule):
+    if not issubclass(schedule._module_cls_of(m), NormModule):
         raise MegakernelConfigError(
             f"Expected NormModule binding, got {describe_binding(m)}"
         )
@@ -86,16 +95,17 @@ def norm_zc_and_eps(
     if isinstance(m, ModuleBinding) and "eps" in m.explicit_fields:
         if merged is not None:
             return zc, float(m.resolve(merged).eps)
-        if isinstance(m.fields.get("eps"), (int, float)):
-            return zc, float(m.fields["eps"])
-    elif not isinstance(m, ModuleBinding) and getattr(m, "eps", None) is not None:
+        raw_eps = m.fields.get("eps")
+        if isinstance(raw_eps, (int, float)) and not isinstance(raw_eps, bool):
+            return zc, float(raw_eps)
+    elif isinstance(m, NormModule) and m.eps is not None:
         return zc, float(m.eps)
     return zc, default_eps
 
 
 def validate_norms(
     cls: Any,
-    sched: ResolvedSchedule,
+    sched: Any,
     merged: dict[str, Any] | None,
     eps: float | None = None,
     expected_zc: bool | None = None,
@@ -104,11 +114,11 @@ def validate_norms(
 ) -> bool:
     """Validate `pre_norm`, `post_norm`, and `final_norm` presence and agreement."""
     mname = model_label(cls, model_name)
+    pre_s, post_s = (
+        (sched.pre_norm, sched.post_norm) if hasattr(sched, "pre_norm") else sched
+    )
     entries: list[tuple[str, ModuleOrBinding]] = []
-    for slot_name, seq in (
-        ("pre_norm", sched.pre_norm),
-        ("post_norm", sched.post_norm),
-    ):
+    for slot_name, seq in (("pre_norm", pre_s), ("post_norm", post_s)):
         for i, m in enumerate(seq):
             if m is None:
                 raise MegakernelConfigError(
@@ -124,12 +134,13 @@ def validate_norms(
     first_loc, first_m = entries[0]
     first_zc, _ = norm_zc_and_eps(first_m, merged, eps)
     target_zc = first_zc if expected_zc is None else expected_zc
+    zc_owner = first_loc if expected_zc is None else "model"
     for loc, m in entries:
         zc_i, eps_i = norm_zc_and_eps(m, merged, eps)
         if zc_i != target_zc:
             raise MegakernelConfigError(
                 f"ModelDef {mname!r}: {loc} ({describe_binding(m)}) has "
-                f"zero_centered={zc_i}, disagreeing with {first_loc} "
+                f"zero_centered={zc_i}, disagreeing with {zc_owner} "
                 f"zero_centered={target_zc}"
             )
         if eps is not None and eps_i != eps:
@@ -141,22 +152,17 @@ def validate_norms(
 
 
 def _infer_static_layers(cls: Any, from_hf: FromHF) -> int | None:
-    layers_spec = from_hf.fields.get("layers")
+    ls = from_hf.fields.get("layers")
     if cls.default_hf_config is not None:
-        key = layers_spec[0] if isinstance(layers_spec, tuple) else str(layers_spec)
-        raw_l = _lookup_raw_key(cls.default_hf_config, key)
-        if isinstance(raw_l, int) and not isinstance(raw_l, bool):
-            return raw_l
-    if isinstance(layers_spec, int) and not isinstance(layers_spec, bool):
-        return layers_spec
+        raw_l = decls._lookup_raw_key(cls.default_hf_config, _hf_key(ls))
+        if _is_int(raw_l):
+            return int(raw_l)
+    if _is_int(ls):
+        return int(ls)
+    if isinstance(ls, tuple) and _is_int(ls[1]):
+        return int(ls[1])
     if (
-        isinstance(layers_spec, tuple)
-        and isinstance(layers_spec[1], int)
-        and not isinstance(layers_spec[1], bool)
-    ):
-        return layers_spec[1]
-    if (
-        isinstance(cls.schedule, Schedule)
+        isinstance(cls.schedule, schedule.Schedule)
         and isinstance(cls.schedule.mixer, Sequence)
         and not isinstance(cls.schedule.mixer, (str, bytes))
     ):
@@ -172,7 +178,7 @@ def validate_model_def(
     base_cls: type,
 ) -> None:
     """Validate `cls` at `@register_model` decoration time."""
-    if not isinstance(name, str) or not name.strip() or name.strip() != name:
+    if not _is_clean_str(name):
         raise MegakernelConfigError(f"register_model: invalid model name {name!r}")
     if not issubclass(cls, base_cls):
         raise MegakernelConfigError(
@@ -184,7 +190,7 @@ def validate_model_def(
             raise MegakernelConfigError(
                 f"register_model({name!r}): FromHF is missing required key {req_key!r}"
             )
-    if not isinstance(cls.schedule, Schedule):
+    if not isinstance(cls.schedule, schedule.Schedule):
         raise MegakernelConfigError(
             f"register_model({name!r}): `schedule` must be a Schedule instance, "
             f"got {cls.schedule!r}"
@@ -209,13 +215,23 @@ def validate_model_def(
 
     static_l = _infer_static_layers(cls, from_hf)
     if static_l is not None:
-        cls.schedule.validate_bounds(static_l)
-        if cls.default_hf_config is not None or not isinstance(
-            cls.schedule.mixer, FromHFLayerTypes
+        sch, lt_cls = cls.schedule, schedule.FromHFLayerTypes
+        sch.validate_bounds(static_l)
+        slots = (sch.mixer, sch.ffn, sch.pre_norm, sch.post_norm)
+        if cls.default_hf_config is not None or not any(
+            isinstance(s, lt_cls) for s in slots
         ):
-            sched = cls.schedule.resolve(cls.default_hf_config or {}, static_l)
+            sched = sch.resolve(cls.default_hf_config or {}, static_l)
             if cls.default_hf_config is None:
                 validate_norms(cls, sched, None, eps=None, model_name=name)
+        elif not any(isinstance(s, lt_cls) for s in slots[2:]):
+            s_fn = schedule._resolve_slot_spec
+            pre_l = s_fn(sch.pre_norm, {}, static_l, "pre_norm")
+            post_l = s_fn(sch.post_norm, {}, static_l, "post_norm")
+            for lyr, ov in sch.overrides.items():
+                pre_l[lyr] = ov.get("pre_norm", pre_l[lyr])
+                post_l[lyr] = ov.get("post_norm", post_l[lyr])
+            validate_norms(cls, (pre_l, post_l), None, eps=None, model_name=name)
 
     if cls.default_hf_config is not None:
         try:
@@ -231,7 +247,7 @@ def validate_model_def(
             ) from exc
 
     for alias, prof in (cls.profiles or {}).items():
-        if not isinstance(alias, str) or not alias.strip() or alias.strip() != alias:
+        if not _is_clean_str(alias):
             raise MegakernelConfigError(
                 f"register_model({name!r}): invalid profile alias key {alias!r}"
             )
@@ -247,7 +263,7 @@ def validate_model_def(
             )
     for kind, seq in (("hf_architectures", archs), ("hf_model_type", model_types)):
         for entry in seq:
-            if not isinstance(entry, str) or not entry.strip():
+            if not _is_clean_str(entry):
                 raise MegakernelConfigError(
                     f"register_model({name!r}): invalid {kind} entry {entry!r}"
                 )
@@ -257,12 +273,12 @@ def _resolved_ffn_bindings(
     cls: Any, hf_config: Any, from_hf: FromHF
 ) -> list[ModuleOrBinding]:
     sched = cls.schedule
-    if not isinstance(sched, Schedule) or sched.ffn is None:
+    if not isinstance(sched, schedule.Schedule) or sched.ffn is None:
         return []
     l_spec = from_hf.fields.get("layers", "num_hidden_layers")
     num_l: int | None = None
     try:
-        raw_l = _resolve_field_spec(hf_config, "layers", l_spec)
+        raw_l = decls._resolve_field_spec(hf_config, "layers", l_spec, explicit=True)
         if not isinstance(raw_l, bool) and int(raw_l) >= 1:
             num_l = int(raw_l)
     except (ValueError, TypeError):
@@ -271,7 +287,7 @@ def _resolved_ffn_bindings(
         num_l = _infer_static_layers(cls, from_hf)
     if num_l is not None and num_l >= 1:
         try:
-            ffn_l = _resolve_slot_spec(sched.ffn, hf_config, num_l, "ffn")
+            ffn_l = schedule._resolve_slot_spec(sched.ffn, hf_config, num_l, "ffn")
             for lyr, ov in sched.overrides.items():
                 if 0 <= lyr < num_l and "ffn" in ov:
                     ffn_l[lyr] = ov["ffn"]
@@ -281,17 +297,15 @@ def _resolved_ffn_bindings(
     spec = sched.ffn
     if isinstance(spec, (ModuleBinding, Module)):
         out: list[ModuleOrBinding] = [spec]
-    elif isinstance(spec, Every):
+    elif isinstance(spec, schedule.Every):
         out = [spec.last] if spec.rest is None else [spec.rest, spec.last]
-    elif isinstance(spec, FromHFLayerTypes):
+    elif isinstance(spec, schedule.FromHFLayerTypes):
         out = list(spec.mapping.values())
     elif isinstance(spec, Sequence) and not isinstance(spec, (str, bytes)):
         out = [x for x in spec if isinstance(x, (ModuleBinding, Module))]
     else:
         out = []
-    for ov in sched.overrides.values():
-        if "ffn" in ov and ov["ffn"] is not None:
-            out.append(ov["ffn"])
+    out.extend(ov["ffn"] for ov in sched.overrides.values() if ov.get("ffn"))
     return out
 
 
@@ -301,37 +315,27 @@ def validate_model_hf_config(cls: Any, hf_config: Any) -> EligibilityResult:
         return EligibilityResult(True)
     from_hf = cls._from_hf_decl()
     for ffn in _resolved_ffn_bindings(cls, hf_config, from_hf):
-        m_cls = _module_cls_of(ffn)
-        if not (
-            issubclass(m_cls, MoEModule) and getattr(m_cls, "routed_experts", True)
-        ):
+        m_cls = schedule._module_cls_of(ffn)
+        if not issubclass(m_cls, MoEModule):
             continue
-        if isinstance(ffn, ModuleBinding):
-            exp_spec = ffn.fields.get("experts", "num_experts")
-            exp_key = exp_spec[0] if isinstance(exp_spec, tuple) else str(exp_spec)
-            is_exp = "experts" in ffn.explicit_fields
-            aliases = getattr(m_cls, "FIELD_ALIASES", {})
-            exp_aliases = tuple(a for a, t in aliases.items() if t == "experts")
+        if not isinstance(ffn, ModuleBinding) and ffn.geometry is not None:
+            exp_key, valid_e = "E", _is_int(ffn.geometry.E) and ffn.geometry.E > 0
+        else:
+            exp_spec = (
+                ffn.fields.get("experts", "num_experts")
+                if isinstance(ffn, ModuleBinding)
+                else m_cls.GEOMETRY_FIELDS["experts"][0]
+            )
+            exp_key = _hf_key(exp_spec)
+            is_exp = isinstance(ffn, ModuleBinding) and "experts" in ffn.explicit_fields
+            als = tuple(a for a, t in m_cls.FIELD_ALIASES.items() if t == "experts")
             try:
-                raw_e = _resolve_field_spec(
-                    hf_config,
-                    "experts",
-                    exp_spec,
-                    fallback=REQUIRED,
-                    aliases=exp_aliases,
-                    explicit=is_exp,
+                raw_e = decls._resolve_field_spec(
+                    hf_config, "experts", exp_spec, REQUIRED, als, explicit=is_exp
                 )
-                valid_e = (
-                    isinstance(raw_e, int) and not isinstance(raw_e, bool) and raw_e > 0
-                )
+                valid_e = _is_int(raw_e) and raw_e > 0
             except (ValueError, TypeError):
                 valid_e = False
-        else:
-            exp_key = "num_experts"
-            raw_e = getattr(ffn, "E", getattr(ffn, "experts", 0))
-            valid_e = (
-                isinstance(raw_e, int) and not isinstance(raw_e, bool) and raw_e > 0
-            )
         if not valid_e:
             return EligibilityResult(
                 False,
@@ -340,29 +344,28 @@ def validate_model_hf_config(cls: Any, hf_config: Any) -> EligibilityResult:
                 f"supports MoE checkpoints only "
                 f"(missing or non-positive {exp_key!r}); skipping.",
             )
-    hid_spec = from_hf.fields.get("hidden", "hidden_size")
-    hid_key = hid_spec[0] if isinstance(hid_spec, tuple) else str(hid_spec)
-    has_hid = _lookup_raw_key(hf_config, hid_key) not in (None, REQUIRED)
-    geom_keys = {
-        (v[0] if isinstance(v, tuple) else str(v))
-        for v in from_hf.fields.values()
-        if isinstance(v, (str, tuple))
-    } | set(cls.default_hf_config or ())
-    geom_keys -= {"architectures", "model_type", "torch_dtype", "transformers_version"}
+    hid_key = _hf_key(from_hf.fields.get("hidden", "hidden_size"))
+    has_hid = decls._lookup_raw_key(hf_config, hid_key) not in (None, REQUIRED)
+    raw_tc = decls._sub_cfg(cls.default_hf_config, "text_config")
+    def_tc = dict(raw_tc) if isinstance(raw_tc, Mapping) else {}
+    f_keys = {_hf_key(v) for v in from_hf.fields.values() if isinstance(v, str | tuple)}
+    def_keys = set(cls.default_hf_config or ()) | set(def_tc)
+    geom_keys = (f_keys | def_keys) - _SKIP_KEYS
     present_geom = {
         k: val
         for k in geom_keys
-        if (val := _lookup_raw_key(hf_config, k)) not in (None, REQUIRED)
+        if (val := decls._lookup_raw_key(hf_config, k)) not in (None, REQUIRED)
     }
     if has_hid or present_geom:
-        cfg_for_geom = (
-            hf_config
-            if (has_hid or cls.default_hf_config is None)
-            else {**dict(cls.default_hf_config), **present_geom}
-        )
+        if has_hid or cls.default_hf_config is None:
+            cfg_for_geom: Any = hf_config
+        else:
+            cfg_for_geom = {**dict(cls.default_hf_config), **present_geom}
+            if def_tc:
+                cfg_for_geom["text_config"] = {**def_tc, **present_geom}
         try:
             g_hf = cls.derive_geometry(cfg_for_geom)
-        except (MegakernelConfigError, ValueError, KeyError) as exc:
+        except (MegakernelConfigError, ValueError, TypeError, KeyError) as exc:
             return EligibilityResult(
                 False,
                 "invalid_geometry",
@@ -386,10 +389,7 @@ def validate_model_hf_config(cls: Any, hf_config: Any) -> EligibilityResult:
     return EligibilityResult(True)
 
 
-__all__ = [
-    "describe_binding",
-    "model_label",
-    "norm_zc_and_eps",
+__all__ = ["describe_binding", "model_label", "norm_zc_and_eps"] + [
     "validate_model_def",
     "validate_model_hf_config",
     "validate_norms",
