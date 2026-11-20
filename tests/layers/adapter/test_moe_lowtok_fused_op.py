@@ -334,7 +334,7 @@ def v3_method(monkeypatch):
 
     def call(x, logits):
         return VllmFp8MoEMethodTPU._apply_owning_dispatch_v3(
-            method, layer, x, logits, "silu", use_fused_kernel=False
+            method, layer, x, logits, use_fused_kernel=False
         )
 
     return call, ep, method, layer
