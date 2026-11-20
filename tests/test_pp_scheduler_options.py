@@ -160,6 +160,7 @@ def test_parse_reads_every_option():
         ({"prefix_aware": True, "paw_aging_tok_per_s": "3000"}, "must be a float"),
         ({"prefix_aware": True, "paw_aging_tok_per_s": -1.0}, ">= 0"),
         ({"prefix_aware": True, "paw_aging_tok_per_s": math.inf}, "finite"),
+        ({"prefix_aware": True, "paw_aging_tok_per_s": math.nan}, "finite"),
         ({"paw_aging_tok_per_s": 3000}, "set prefix_aware"),
         ([], "must be a JSON object"),
     ],
@@ -301,11 +302,13 @@ def test_promotion_needs_prefix_aware_and_follows_promote_warmest():
     ],
 )
 def test_kv_both_is_not_a_kv_consumer(kv_role, consumer):
-    """As in PrefixAwareScheduler: kv_both (an offloading connector on an
-    aggregated engine) is also a producer, so it does not take the consumer's
-    sort tier."""
+    """kv_both (an offloading connector on an aggregated engine) has neither
+    role here: vLLM's role properties count it as a producer too, so it is
+    not a consumer (as in PrefixAwareScheduler), and only kv_producer is a
+    producer, so it gets neither the producer's sort nor retention."""
     s, _ = _built(kv_role=kv_role)
     assert s._is_kv_consumer is consumer
+    assert s._is_kv_producer is (kv_role == "kv_producer")
 
 
 class _HookedConnector:
@@ -656,9 +659,8 @@ def test_the_prefill_legs_run_what_the_record_jobs_ran():
 
 
 def test_the_prefill_legs_are_kv_producers_not_consumers():
-    """Every prefill leg is a kv_producer, which both readings of the role
-    (``kv_role != "kv_producer"`` before, vLLM's role properties now) take as
-    not a consumer: its sort keeps the producer tiers."""
+    """Every prefill leg is a kv_producer: a producer, and by vLLM's role
+    properties not a consumer, so its sort keeps the producer tiers."""
     for name, entry in _point_entries():
         args = entry["legs"]["prefill"]["serve_args"]
         kv = json.loads(args[args.index("--kv-transfer-config") + 1])
