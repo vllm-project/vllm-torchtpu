@@ -15,6 +15,7 @@ from vllm_torchtpu.kernels.deepseek_v41 import (
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
     block_topk,
+    publication,
     streaming_topk,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
@@ -579,11 +580,27 @@ def _select_fp8_indexer_jax(
     # Decode top-k scans only the blocks that can hold a winner. Publishing
     # layers rank the same SparseCore block maxima for their candidates.
     select_block = block_size if publish_rows else _BLOCK_TOPK_BLOCK
-    block_select = (
-        stream_select
-        and prefill_chunk_rows is None
-        and chunk_rows is not None
-        and block_topk.is_supported(chunk_rows, capacity, topk, select_block)
+    decode_tiles = (
+        stream_select and prefill_chunk_rows is None and chunk_rows is not None
+    )
+    block_select = decode_tiles and block_topk.is_supported(
+        chunk_rows, capacity, topk, select_block, given_maxima=True
+    )
+    # Publishing layers whose block maxima overflow SparseCore VMEM (1M-token
+    # contexts) select over blocks twice as wide, whose maxima block top-k
+    # folds from the scorer's, and publish from the scorer's directly.
+    folded_select = (
+        decode_tiles
+        and publish_rows
+        and not block_select
+        and block_topk.is_supported(
+            chunk_rows,
+            capacity,
+            topk,
+            2 * select_block,
+            given_maxima=True,
+            maxima_block=select_block,
+        )
     )
     pool = banks[0] if len(banks) == 1 else banks
 
@@ -675,6 +692,28 @@ def _select_fp8_indexer_jax(
         row_lengths = jax.lax.dynamic_slice_in_dim(
             inputs[2], tile * chunk_rows, chunk_rows
         )
+        if folded_select:
+            scores, maxima = scores
+            selected = block_topk.block_topk(
+                scores,
+                row_lengths,
+                k=topk,
+                block_size=2 * select_block,
+                maxima=maxima,
+                maxima_block=select_block,
+                scheduling_group_id=group,
+            )
+            return selected, _publish_candidate_blocks(
+                scores,
+                row_lengths,
+                candidates.shape[1],
+                block_size,
+                unordered,
+                block_scores=publication.visible_block_scores(
+                    maxima, row_lengths, block_size=block_size
+                ),
+                scheduling_group_id=group,
+            )
         if block_select:
             scores, maxima = scores
             # One SparseCore pass ranks the block maxima for both outputs.
@@ -722,7 +761,12 @@ def _select_fp8_indexer_jax(
         padded // chunk_rows,
         lambda tile: tile * chunk_rows,
         lambda start, group: score(
-            start, chunk_rows, inputs, pipelined=True, group=group, maxima=block_select
+            start,
+            chunk_rows,
+            inputs,
+            pipelined=True,
+            group=group,
+            maxima=block_select or folded_select,
         ),
         select,
         write,
