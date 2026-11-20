@@ -423,9 +423,8 @@ def test_b7_file_line_and_noqa_caps():
         rel = path.relative_to(pkg_root).as_posix()
         lines = path.read_text(encoding="utf-8").splitlines()
         # The package `__init__` lists every public name three times: eager
-        # imports for type checkers, the lazy name table, and `__all__`;
-        # `runtime/policy.py` carries the documented `verify_tokens` policy.
-        cap = {"__init__.py": 600, "runtime/policy.py": 450}.get(rel, 400)
+        # imports for type checkers, the lazy name table, and `__all__`.
+        cap = 600 if rel == "__init__.py" else 400
         assert len(lines) <= cap, f"{rel} has {len(lines)} > {cap} lines"
         for lineno, line in enumerate(lines, 1):
             assert "# noqa" not in line and "# fmt: skip" not in line, (

@@ -87,7 +87,7 @@ def isolated_model_registry(monkeypatch: pytest.MonkeyPatch):
 
 def test_runtime_package_ast_and_fresh_import_free_of_vllm_and_torch():
     """`megakernel/core/runtime/*.py` never imports `vllm`/`torch`/`os` and <= 400
-    lines (450 for `policy.py`)."""
+    lines."""
     runtime_dir = Path(mk_rt.__file__).parent
     py_files = sorted(runtime_dir.glob("*.py"))
     assert len(py_files) == 10
@@ -95,9 +95,7 @@ def test_runtime_package_ast_and_fresh_import_free_of_vllm_and_torch():
     for py_path in py_files:
         src = py_path.read_text(encoding="utf-8")
         lines = src.splitlines()
-        # `policy.py` carries main's documented `verify_tokens` bucket policy.
-        cap = 450 if py_path.name == "policy.py" else 400
-        assert len(lines) <= cap, f"{py_path.name} has {len(lines)} lines (> {cap})"
+        assert len(lines) <= 400, f"{py_path.name} has {len(lines)} lines (> 400)"
         assert "qwen" not in src.lower(), f"{py_path.name} mentions Qwen"
         tree = ast.parse(src, filename=str(py_path))
         for node in ast.walk(tree):
