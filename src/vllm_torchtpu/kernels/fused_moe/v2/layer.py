@@ -505,6 +505,27 @@ def _select_z_clone_plan(
     )
 
 
+def _row_hist_by_core_slot(ids_2d, *, n_cores, g_plan):
+    """Per-row histogram of planned ids -> [rows, n_cores * g_plan].
+
+    An id counts in bin `id` when it lies in [0, n_cores * g_plan).
+    """
+    core = jnp.floor_divide(ids_2d, jnp.int32(g_plan))
+    slot = ids_2d - core * jnp.int32(g_plan)
+    # Avoid a [rows, e_plan, pairs] one-hot compare-and-reduce: build the two
+    # small one-hots class-major (pairs on lanes) and contract them on the MXU.
+    core_oh = (
+        core[:, None, :] == jnp.arange(n_cores, dtype=jnp.int32)[None, :, None]
+    ).astype(jnp.bfloat16)
+    slot_oh = (
+        slot[:, None, :] == jnp.arange(g_plan, dtype=jnp.int32)[None, :, None]
+    ).astype(jnp.bfloat16)
+    counts = jnp.einsum(
+        "rce,rse->rcs", core_oh, slot_oh, preferred_element_type=jnp.float32
+    )
+    return counts.astype(jnp.int32).reshape(ids_2d.shape[0], n_cores * g_plan)
+
+
 def rebalance_ep_tp_pair_experts(
     pairs_g,
     local_blocks,
@@ -591,11 +612,11 @@ def rebalance_ep_tp_pair_experts(
             z_active,
             z_hot_phys,
             z_push_phys_by_chip,
-            is_z_hot,
+            _,
             best_k,
             src_is_h1,
             src_rem_ord,
-            take_rc,
+            _,
             counts_for_split,
         ) = _select_z_clone_plan(
             rows_by_dest,
@@ -613,22 +634,19 @@ def rebalance_ep_tp_pair_experts(
         z_active = None
         z_hot_phys = None
         z_push_phys_by_chip = None
-        is_z_hot = None
         best_k = None
         src_is_h1 = None
         src_rem_ord = None
-        take_rc = None
         counts_for_split = counts_chip
 
     if k_split > 0:
-        split_phys, split_active, is_split_phys, flip = _choose_ep_tp_row_splits(
+        split_phys, split_active, _, flip = _choose_ep_tp_row_splits(
             counts_for_split, g_local=g_local, k_split=k_split, capacity=capacity
         )
     else:
         flip = _ep_tp_pair_flip_mask(counts_for_split.reshape(n_chips, 2, g_local))
         split_phys = jnp.zeros((n_chips, 0), dtype=jnp.int32)
         split_active = jnp.zeros((n_chips, 0), dtype=jnp.bool_)
-        is_split_phys = jnp.zeros((n_chips, 2 * g_local), dtype=jnp.bool_)
 
     words = _pack_flip_words(flip)
     n_words = words.shape[0]
@@ -644,13 +662,6 @@ def rebalance_ep_tp_pair_experts(
             and best_k is not None
         )
         z_match = jnp.where(z_active, chip_base_1d + z_hot_phys, jnp.int32(-1))
-        local_host = me >= jnp.int32(half_ep)
-        if (half_ep & (half_ep - 1)) == 0:
-            me_rem_ord = jnp.bitwise_and(me, jnp.int32(half_ep - 1))
-        else:
-            me_rem_ord = me % jnp.int32(half_ep)
-        take_me_by_chip = (local_host != chip_host) & (me_rem_ord < best_k)
-        z_match_local = jnp.where(take_me_by_chip, z_match, jnp.int32(-1))
         # Avoid 8-way _select_by_chip over 131K global pairs when best_k fits in
         # 4-bit nibbles (0..8 per chip across <= 8 chips = one uint32 scalar).
         if n_chips <= 8 and half_ep <= 8:
@@ -665,10 +676,9 @@ def rebalance_ep_tp_pair_experts(
             packed_best_k = None
     else:
         z_match = None
-        z_match_local = None
         packed_best_k = None
 
-    def _remap_with_splits(ids, tok_par, tok_host, tok_rem_ord, *, is_local: bool):
+    def _remap_with_splits(ids, tok_par, tok_host, tok_rem_ord):
         valid = (ids >= jnp.int32(0)) & (ids < jnp.int32(e_total))
         pair_idx = jnp.bitwise_or(
             jnp.left_shift(jnp.right_shift(ids, chip_shift), g_shift),
@@ -687,30 +697,22 @@ def rebalance_ep_tp_pair_experts(
         log_id = core * jnp.int32(g_plan) + slot
         ch = jnp.right_shift(ids, chip_shift)
         if z_clone:
-            if is_local:
-                z_m_loc = _select_by_chip(ch, z_match_local, n_chips)
-                hit_z = valid & (ids == z_m_loc)
+            ch_host = ch >= jnp.int32(half_chips)
+            z_m = _select_by_chip(ch, z_match, n_chips)
+            if packed_best_k is not None:
+                k_take = jnp.bitwise_and(
+                    jnp.right_shift(
+                        packed_best_k, jnp.left_shift(ch, 2).astype(jnp.uint32)
+                    ),
+                    jnp.uint32(0xF),
+                ).astype(jnp.int32)
             else:
-                ch_host = ch >= jnp.int32(half_chips)
-                z_m = _select_by_chip(ch, z_match, n_chips)
-                if packed_best_k is not None:
-                    k_take = jnp.bitwise_and(
-                        jnp.right_shift(
-                            packed_best_k, jnp.left_shift(ch, 2).astype(jnp.uint32)
-                        ),
-                        jnp.uint32(0xF),
-                    ).astype(jnp.int32)
-                else:
-                    k_take = _select_by_chip(ch, best_k, n_chips)
-                hit_z = (
-                    valid
-                    & (ids == z_m)
-                    & (tok_host != ch_host)
-                    & (tok_rem_ord < k_take)
-                )
+                k_take = _select_by_chip(ch, best_k, n_chips)
+            hit_z = (
+                valid & (ids == z_m) & (tok_host != ch_host) & (tok_rem_ord < k_take)
+            )
         else:
             hit_z = None
-        hits = []
         for k in range(k_split):
             s_k = _select_by_chip(ch, split_match[:, k], n_chips)
             hit_k = valid & (ids == s_k)
@@ -720,7 +722,6 @@ def rebalance_ep_tp_pair_experts(
                 g_local + k
             )
             log_id = jnp.where(hit_k, dst_k, log_id)
-            hits.append(hit_k)
         if hit_z is not None:
             ch_z = lax.bitwise_xor(ch, jnp.int32(half_chips))
             dst_z = (jnp.left_shift(ch_z, 1) + tok_par) * jnp.int32(g_plan) + jnp.int32(
@@ -730,19 +731,13 @@ def rebalance_ep_tp_pair_experts(
         # Avoid leaving masked rows at e_total: e_total is now a live virtual
         # expert slot, so shift non-negative out-of-range sentinels to e_plan.
         sentinel = jnp.where(ids >= jnp.int32(e_total), jnp.int32(e_plan), ids)
-        return jnp.where(valid, log_id, sentinel), hits, hit_z
+        return jnp.where(valid, log_id, sentinel)
 
     n_tokens = pairs_g.size // topk
     global_par = jnp.broadcast_to(
         (jnp.arange(n_tokens, dtype=jnp.int32) & jnp.int32(1))[:, None],
         (n_tokens, topk),
     ).reshape(pairs_g.shape)
-    local_tok_par = (
-        (jnp.arange(t_local, dtype=jnp.int32) + me * jnp.int32(t_local)) & jnp.int32(1)
-    )[:, None]
-    local_par = jnp.broadcast_to(local_tok_par, (t_local, topk)).reshape(
-        local_blocks.shape
-    )
     if z_clone:
         assert src_is_h1 is not None and src_rem_ord is not None
         global_host = jnp.broadcast_to(
@@ -754,110 +749,25 @@ def rebalance_ep_tp_pair_experts(
     else:
         global_host = None
         global_rem_ord = None
-    new_pairs, global_hits, global_hit_z = _remap_with_splits(
-        pairs_g, global_par, global_host, global_rem_ord, is_local=False
+    new_pairs = _remap_with_splits(pairs_g, global_par, global_host, global_rem_ord)
+    # NOTE(cross-boundary-contract): fused_ep_moe_v2.local_fn all-gathers
+    # local_blocks.reshape(-1) in rank order, so pairs_g[me] is this shard's
+    # pairs and its remap is new_local. Avoid remapping local_blocks a second
+    # time: it repeats the per-pair select chains (~30 us/layer on TPU).
+    new_local = lax.dynamic_index_in_dim(
+        new_pairs.reshape(ep, t_local * topk), me, axis=0, keepdims=False
+    ).reshape(local_blocks.shape)
+
+    # Avoid re-deriving the histograms from block_hist / rows_by_dest plus
+    # per-chip masked counts of the moved pairs: each (class, chip, parity)
+    # count is a full masked reduction, and on [t_local, topk]-shaped masks the
+    # topk-wide minor axis pads to full lane tiles. Every valid pair lands in
+    # exactly one planned id and masked pairs stay outside [0, e_plan), so
+    # direct histograms of the remapped ids are the same counts.
+    new_rbd = _row_hist_by_core_slot(
+        new_pairs.reshape(ep, t_local * topk), n_cores=ep, g_plan=g_plan
     )
-    new_local, local_hits, local_hit_z = _remap_with_splits(
-        local_blocks, local_par, None, None, is_local=True
-    )
-
-    is_sp_flat = is_split_phys.reshape(e_total)
-
-    def _subtract_z_orig_local(hist, ids_2d, hit_z_2d):
-        assert is_z_hot is not None
-        ch_2d = jnp.right_shift(ids_2d, chip_shift)
-        z_orig_chip = jnp.stack(
-            [
-                (hit_z_2d & (ch_2d == jnp.int32(ci))).sum(axis=1, dtype=jnp.int32)
-                for ci in range(n_chips)
-            ],
-            axis=1,
-        )
-        z_orig_flat = (
-            z_orig_chip[:, :, None] * is_z_hot[None, :, :].astype(jnp.int32)
-        ).reshape(hist.shape[0], e_total)
-        return hist - z_orig_flat
-
-    def _swap_rem_4d(h):
-        h_rem = jnp.where(is_sp_flat[None, :], jnp.int32(0), h)
-        h4 = h_rem.reshape(h.shape[0], n_chips, 2, g_local)
-        return jnp.where(flip[None, :, None, :], h4[:, :, ::-1, :], h4)
-
-    def _count_split_hist(ids_2d, hits_list, par_2d):
-        if not hits_list:
-            return jnp.zeros((ids_2d.shape[0], n_chips, 2, 0), dtype=jnp.int32)
-        ch_2d = jnp.right_shift(ids_2d, chip_shift)
-        chip_masks = [ch_2d == jnp.int32(ci) for ci in range(n_chips)]
-        par0 = par_2d == jnp.int32(0)
-        par1 = ~par0
-        cols = []
-        for hk in hits_list:
-            h0 = hk & par0
-            h1 = hk & par1
-            c0 = jnp.stack(
-                [(h0 & cm).sum(axis=1, dtype=jnp.int32) for cm in chip_masks], axis=1
-            )
-            c1 = jnp.stack(
-                [(h1 & cm).sum(axis=1, dtype=jnp.int32) for cm in chip_masks], axis=1
-            )
-            cols.append(jnp.stack([c0, c1], axis=2))
-        return jnp.stack(cols, axis=3)
-
-    def _count_z_hist(ids_2d, hit_z_2d, par_2d):
-        ch_2d = jnp.right_shift(ids_2d, chip_shift)
-        par0 = par_2d == jnp.int32(0)
-        par1 = ~par0
-        h0 = hit_z_2d & par0
-        h1 = hit_z_2d & par1
-        c0 = jnp.stack(
-            [
-                (h0 & (ch_2d == jnp.int32(ci ^ half_chips))).sum(
-                    axis=1, dtype=jnp.int32
-                )
-                for ci in range(n_chips)
-            ],
-            axis=1,
-        )
-        c1 = jnp.stack(
-            [
-                (h1 & (ch_2d == jnp.int32(ci ^ half_chips))).sum(
-                    axis=1, dtype=jnp.int32
-                )
-                for ci in range(n_chips)
-            ],
-            axis=1,
-        )
-        return jnp.stack([c0, c1], axis=2)[..., None]
-
-    pairs_2d = pairs_g.reshape(ep, t_local * topk)
-    gpar_2d = global_par.reshape(ep, t_local * topk)
-    ghits_2d = [gh.reshape(ep, t_local * topk) for gh in global_hits]
-
-    bh_in = block_hist
-    rbd_in = rows_by_dest
-    ghitz_2d = None
-    if z_clone:
-        assert global_hit_z is not None and take_rc is not None and is_z_hot is not None
-        ghitz_2d = global_hit_z.reshape(ep, t_local * topk)
-        bh_in = _subtract_z_orig_local(bh_in, local_blocks, local_hit_z)
-        # Avoid 8 full [ep, t_local * topk] reductions to recover rbd_in: each
-        # selected rank r moves all rows_by_dest[r, hot_global] rows onto slot_z.
-        z_take_mask_rbd = (
-            take_rc.astype(jnp.int32)[:, :, None]
-            * is_z_hot[None, :, :].astype(jnp.int32)
-        ).reshape(ep, e_total)
-        rbd_in = rows_by_dest - rows_by_dest * z_take_mask_rbd
-
-    bh_sp = _count_split_hist(local_blocks, local_hits, local_par)
-    rbd_sp = _count_split_hist(pairs_2d, ghits_2d, gpar_2d)
-    bh_parts = [_swap_rem_4d(bh_in), bh_sp]
-    rbd_parts = [_swap_rem_4d(rbd_in), rbd_sp]
-    if z_clone:
-        assert ghitz_2d is not None
-        bh_parts.append(_count_z_hist(local_blocks, local_hit_z, local_par))
-        rbd_parts.append(_count_z_hist(pairs_2d, ghitz_2d, gpar_2d))
-    new_bh = jnp.concatenate(bh_parts, axis=3).reshape(block_hist.shape[0], e_plan)
-    new_rbd = jnp.concatenate(rbd_parts, axis=3).reshape(ep, e_plan)
+    new_bh = pair_block_hist(new_local, e_plan)
 
     base_phys = jnp.broadcast_to(
         jnp.arange(2 * g_local, dtype=jnp.int32).reshape(1, 2, g_local),
