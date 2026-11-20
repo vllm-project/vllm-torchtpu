@@ -64,6 +64,7 @@ _HEAVY = (
     "vllm_torchtpu.megakernel.core.planner",
     "vllm_torchtpu.megakernel.core.runtime.checks",
     "vllm_torchtpu.megakernel.core.runtime.exec_policy",
+    "vllm_torchtpu.megakernel.core.runtime.layout_facts",
     "vllm_torchtpu.megakernel.core.runtime.policy",
 )
 

@@ -29,8 +29,12 @@ from typing import Any
 
 import jax.numpy as jnp
 
-from ..errors import EligibilityResult
 from ..pool.layout import PoolLayout
+from .contract import (
+    CONV_STATE_DTYPE_UNSUPPORTED,
+    POOL_LAYOUT_MISMATCH,
+    EligibilityResult,
+)
 
 LAYOUT_FACTS_SCHEMA = "megakernel-pool-slot-facts-v1"
 
@@ -138,9 +142,7 @@ def compare_layout_facts(
         f"{k}: megakernel={mk_d[k]!r} framework={fw_d[k]!r}" for k in diffs
     )
     code = (
-        "conv_state_dtype_unsupported"
-        if "conv_dtype" in diffs
-        else "pool_layout_mismatch"
+        CONV_STATE_DTYPE_UNSUPPORTED if "conv_dtype" in diffs else POOL_LAYOUT_MISMATCH
     )
     msg = (
         "Megakernel pool slot layout differs from the framework's "
