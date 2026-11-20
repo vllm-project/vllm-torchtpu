@@ -70,7 +70,7 @@ def _build_ops(eps: float) -> None:
         w_proj: jax.Array,
         w_scale: jax.Array,
     ) -> jax.Array:
-        if MIN_ROWS > 0 and o.shape[0] < MIN_ROWS:
+        if o.shape[0] < MIN_ROWS:
             q, s = gnq.reference(o, z, w_norm, eps)
         else:
             q, s = gnq.gated_norm_quant(o, z, w_norm, eps)

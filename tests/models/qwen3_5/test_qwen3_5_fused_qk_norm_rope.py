@@ -483,6 +483,24 @@ def test_prebuild_declines_a_compacted_rope_cache(monkeypatch):
     assert f"holds {ROT - 8} of the {ROT} rotary columns" in warnings[0]
 
 
+def test_prebuild_declines_an_odd_rotary_width(monkeypatch):
+    """The kernel rotates [cos | sin] halves, so an odd rotary width is
+    declined with its value named, not asserted."""
+    warnings = []
+    monkeypatch.setattr(
+        fused.logger, "warning_once", lambda msg, *args: warnings.append(msg % args)
+    )
+    layer = _layer(fused_qk_norm_rope=False)
+    rope = layer.rotary_emb
+    rope.rotary_dim = ROT - 1
+    rope.register_buffer(
+        "cos_sin_cache", rope.cos_sin_cache[:, : ROT - 1].clone(), persistent=False
+    )
+    assert not fused._prebuild(layer, SimpleNamespace(multimodal_config=None))
+    assert not fused._ops
+    assert f"rotary_dim {ROT - 1} is not an even width" in warnings[0]
+
+
 def test_prebuild_arms_both_backbone_and_eagle_head_graphs():
     """Because the row-count fork lives inside the lowered JAX op rather than
     in Python during Dynamo tracing, both 'backbone' and 'eagle_head' arm."""

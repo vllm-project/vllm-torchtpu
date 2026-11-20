@@ -187,8 +187,10 @@ def _gdn_layer(num_v_heads, tp_size):
         (64, 1, True),
         (64, 2, True),
         (64, 8, True),
-        # The 397B at TP4; Qwen3.5-35B-A3B (32 value heads) at TP1 and TP4.
+        # The 397B at TP4: not routed.
         (64, 4, False),
+        # Qwen3.5-35B-A3B (32 value heads) at TP1 and TP4: routed by the value
+        # heads alone; at TP2: not routed.
         (32, 1, True),
         (32, 4, True),
         (32, 2, False),
