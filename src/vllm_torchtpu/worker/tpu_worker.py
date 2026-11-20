@@ -100,13 +100,18 @@ def _device_remap(local_rank_offset: int) -> str | None:
     """The setting that runs this engine's ranks on other TPU devices than
     their host-local rank names, or None. TPU_LOCAL_RANK_OFFSET and
     DEBUG_TPU_LOCAL_RANK_OFFSET shift every rank; VLLM_TPU_DEVICE_ORDER maps
-    each rank to a listed device at worker spawn."""
+    each rank to a listed device at worker spawn; under
+    TPU_MULTIHOST_BACKEND=ray each worker runs on the chip Ray assigned it,
+    and with vLLM's nnodes left at 1 the parallel config counts every worker
+    of a multi-host engine as this host's."""
     if local_rank_offset:
         return f"TPU_LOCAL_RANK_OFFSET={local_rank_offset}"
     if envs.DEBUG_TPU_LOCAL_RANK_OFFSET:
         return f"DEBUG_TPU_LOCAL_RANK_OFFSET={envs.DEBUG_TPU_LOCAL_RANK_OFFSET}"
     if envs.VLLM_TPU_DEVICE_ORDER:
         return f"VLLM_TPU_DEVICE_ORDER={envs.VLLM_TPU_DEVICE_ORDER}"
+    if envs.TPU_MULTIHOST_BACKEND == "ray":
+        return "TPU_MULTIHOST_BACKEND=ray"
     return None
 
 
