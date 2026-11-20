@@ -8370,6 +8370,49 @@ class TPUModelRunner(GPUModelRunner):
                 selected = torch.zeros((num_reqs, 1), dtype=torch.int64).to(self.device)
                 synchronize_tensors(_compiled_pad_non_spec_next_tokens(selected, k))
 
+    def _precompile_rejected_token_subtraction(self) -> None:
+        """Warm `_compiled_subtract_num_rejected_tokens` at every padded token
+        count and request-count layout, under execute_model's no_grad.
+
+        The step after an async verify step subtracts the rejected drafts from
+        the optimistic seq_lens `[target_num_reqs]` and positions `[N]` (or
+        `[3, N]` with mrope), all int32, with per-slot indices of the same
+        sizes into the `[max_num_reqs]` rejected counts. A step that mixes
+        verify windows with draft-free requests pads to token counts the
+        spec-decode warm-up does not run."""
+        if not self.scheduler_config.async_scheduling:
+            return
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            _compiled_subtract_num_rejected_tokens,
+        )
+
+        target_num_reqs = [self.num_reqs_max_model_len]
+        if self.most_model_len is not None:
+            assert self.num_reqs_most_model_len is not None
+            target_num_reqs.append(self.num_reqs_most_model_len)
+        num_rejected = torch.zeros(self.max_num_reqs, dtype=torch.int32).to(self.device)
+        with self._precompile_timed("rejected-token subtraction"), torch.no_grad():
+            for num_tokens in self.num_tokens_paddings:
+                pos_shape = (3, num_tokens) if self.uses_mrope else (num_tokens,)
+                positions = torch.zeros(pos_shape, dtype=torch.int32).to(self.device)
+                positions_idx = torch.full((num_tokens,), -1, dtype=torch.int32).to(
+                    self.device
+                )
+                for num_reqs in target_num_reqs:
+                    seq_lens = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
+                    seq_lens_idx = torch.full((num_reqs,), -1, dtype=torch.int32).to(
+                        self.device
+                    )
+                    synchronize_tensors(
+                        _compiled_subtract_num_rejected_tokens(
+                            seq_lens,
+                            positions,
+                            num_rejected,
+                            seq_lens_idx,
+                            positions_idx,
+                        )
+                    )
+
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
 
@@ -8736,6 +8779,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._async_drafter.precompile()
                 self._precompile_rejection_sampler()
                 self._precompile_non_spec_chunk_padding()
+                self._precompile_rejected_token_subtraction()
                 self._precompile_spec_logprobs()
                 # The isolated precompiles above emit standalone fused
                 # programs; the real per-step propose+verify+sampling

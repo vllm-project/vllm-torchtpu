@@ -36,16 +36,21 @@ from vllm_torchtpu.worker.tpu_worker import TPUWorker
 NUM_TOKENS_PADDINGS = [16, 32, 64]
 NUM_REQS_PADDINGS = [8, 16]
 K = 3
+MAX_NUM_REQS = 16
 
 
-def _runner():
+def _runner(most_model_len_num_reqs=None):
     runner = SimpleNamespace(
         scheduler_config=SimpleNamespace(async_scheduling=True),
         speculative_config=SimpleNamespace(num_speculative_tokens=K),
         _is_async_drafter=True,
-        max_num_reqs=16,
+        max_num_reqs=MAX_NUM_REQS,
         num_reqs_paddings=NUM_REQS_PADDINGS,
         num_tokens_paddings=NUM_TOKENS_PADDINGS,
+        num_reqs_max_model_len=MAX_NUM_REQS,
+        most_model_len=None if most_model_len_num_reqs is None else 1024,
+        num_reqs_most_model_len=most_model_len_num_reqs,
+        uses_mrope=False,
         device=torch.device("cpu"),
         _precompile_timed=lambda _label: contextlib.nullcontext(),
     )
@@ -86,16 +91,27 @@ def _count_compiles(monkeypatch, module, name) -> list:
     return compiles
 
 
+class _StepStopped(Exception):
+    pass
+
+
+class _EntryRunner:
+    """A runner stand-in that runs `call` at the entry point's first read of
+    it, inside the grad mode the entry point gives its body, then stops."""
+
+    def __init__(self, call):
+        self._call = call
+
+    def __getattr__(self, name):
+        self._call()
+        raise _StepStopped
+
+
 def _inside_sample_tokens(call) -> None:
     """Run `call` where sample_tokens' body runs, in the grad mode serving
     gives it: inside TPUWorker.sample_tokens and TPUModelRunner.sample_tokens,
-    called as the engine calls them. A pipeline stage without a pending step
-    returns `_sample_tokens_pp_intermediate_stage()` first thing."""
-    runner = SimpleNamespace(
-        execute_model_state=None,
-        _pp_is_last=False,
-        _sample_tokens_pp_intermediate_stage=call,
-    )
+    called as the engine calls them."""
+    runner = _EntryRunner(call)
     worker = SimpleNamespace(
         model_runner=SimpleNamespace(
             sample_tokens=lambda grammar_output: TPUModelRunner.sample_tokens(
@@ -103,7 +119,15 @@ def _inside_sample_tokens(call) -> None:
             )
         )
     )
-    TPUWorker.sample_tokens(worker, None)
+    with pytest.raises(_StepStopped):
+        TPUWorker.sample_tokens(worker, None)
+
+
+def _inside_execute_model(call) -> None:
+    """Run `call` where execute_model prepares a step's inputs, in the grad
+    mode serving gives it: inside TPUModelRunner.execute_model."""
+    with pytest.raises(_StepStopped):
+        TPUModelRunner.execute_model(_EntryRunner(call), None)
 
 
 @pytest.fixture
@@ -273,6 +297,62 @@ def test_the_warmed_chunk_padding_serves_sample_tokens_without_compiling(
     assert len(compiles) == warmed, compiles[warmed:]
 
 
+def _subtract_rejected(num_tokens, num_scheduled, target_num_reqs):
+    """Call the subtraction with the inputs `_prepare_inputs` gives it for a
+    step of `num_scheduled` tokens per request, every request in the previous
+    step's output, padded to `num_tokens`."""
+    seq_lens_idx = np.full(target_num_reqs, -1, dtype=np.int32)
+    positions_idx = np.full(num_tokens, -1, dtype=np.int32)
+    start = 0
+    for i, n in enumerate(num_scheduled):
+        seq_lens_idx[i] = i
+        positions_idx[start : start + n] = i
+        start += n
+    rejected = torch.zeros(len(num_scheduled), dtype=torch.int32)
+    async_output._compiled_subtract_num_rejected_tokens(
+        torch.zeros(256, dtype=torch.int32)[:target_num_reqs],
+        torch.zeros(256, dtype=torch.int32)[:num_tokens],
+        torch.nn.functional.pad(rejected, (0, MAX_NUM_REQS - rejected.shape[0])),
+        torch.from_numpy(seq_lens_idx),
+        torch.from_numpy(positions_idx),
+    )
+
+
+@pytest.mark.usefixtures("fresh_dynamo")
+@pytest.mark.parametrize(
+    "num_tokens, num_scheduled, most_model_len_num_reqs",
+    [
+        # Three requests verify K drafts each beside two draft-free ones.
+        (16, [1 + K] * 3 + [1] * 2, None),
+        (32, [1 + K] * 6 + [1] * 2, None),
+        (64, [1 + K] * 12 + [1] * 4, None),
+        # A step in the most-model-len request layout.
+        (16, [1 + K] * 2 + [1] * 3, 8),
+    ],
+)
+def test_the_warmed_rejected_token_subtraction_serves_a_step_without_compiling(
+    monkeypatch, num_tokens, num_scheduled, most_model_len_num_reqs
+):
+    """The real subtraction, warmed as capture_model warms it and then called
+    from inside execute_model at a step that mixes verify windows with
+    draft-free requests: the serving call reuses a warmed graph."""
+    compiles = _count_compiles(
+        monkeypatch, async_output, "_compiled_subtract_num_rejected_tokens"
+    )
+    monkeypatch.setattr(runner_mod, "synchronize_tensors", lambda *_a, **_k: None)
+    runner = _runner(most_model_len_num_reqs)
+    TPUModelRunner._precompile_rejected_token_subtraction(runner)
+    warmed = len(compiles)
+    layouts = 1 if most_model_len_num_reqs is None else 2
+    assert warmed == layouts * len(NUM_TOKENS_PADDINGS)
+
+    target_num_reqs = most_model_len_num_reqs or MAX_NUM_REQS
+    _inside_execute_model(
+        lambda: _subtract_rejected(num_tokens, num_scheduled, target_num_reqs)
+    )
+    assert len(compiles) == warmed, compiles[warmed:]
+
+
 class _WarmupStep:
     """A private runner method of the stand-in below: calling it records its
     name. It is falsy, so a private flag the stand-in does not set reads as
@@ -300,8 +380,10 @@ class _WarmupFlowRunner(SimpleNamespace):
 
 
 def test_the_async_drafter_warmup_pads_draft_free_chunks(monkeypatch):
-    """capture_model runs the non-spec chunk padding warm-up for an async
-    drafter that verifies: serving pads a draft-free chunk in a spec step."""
+    """capture_model runs the non-spec chunk padding and rejected-token
+    subtraction warm-ups for an async drafter that verifies: serving pads a
+    draft-free chunk in a spec step and subtracts the previous step's
+    rejected drafts."""
     calls = []
     runner = _WarmupFlowRunner(
         calls=calls,
@@ -327,3 +409,4 @@ def test_the_async_drafter_warmup_pads_draft_free_chunks(monkeypatch):
     TPUModelRunner.capture_model(runner)
     assert "_precompile_rejection_sampler" in calls
     assert "_precompile_non_spec_chunk_padding" in calls
+    assert "_precompile_rejected_token_subtraction" in calls
