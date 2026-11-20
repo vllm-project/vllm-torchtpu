@@ -163,7 +163,7 @@ def test_nothing_starts_before_the_cars_wheel_is_installed(tmp_path, monkeypatch
     from vllm_torchtpu.offload import tier_x2_sidecar as sc
 
     root = _fake_root(tmp_path)
-    monkeypatch.setattr(sc, "_tpu_sync_dir", lambda: root)
+    monkeypatch.setattr(sc, "_tpu_sync_dir", lambda env=None: root)
     monkeypatch.setattr(sc, "_tpu_sync_version", lambda: "0.0.1.dev20261012084241")
     env = _env(tmp_path, Q38X2_TPU_SYNC_VERSION="0.0.1.dev20261112161350")
     assert sc.maybe_start(env) is False
@@ -200,7 +200,7 @@ def test_one_watcher_per_pod(tmp_path, monkeypatch):
     from vllm_torchtpu.offload import tier_x2_sidecar as sc
 
     root = _fake_root(tmp_path)
-    monkeypatch.setattr(sc, "_tpu_sync_dir", lambda: root)
+    monkeypatch.setattr(sc, "_tpu_sync_dir", lambda env=None: root)
     monkeypatch.setattr(sc, "_tpu_sync_version", lambda: "0.0.1.dev20261112161350")
     env = _env(tmp_path, Q38X2_TPU_SYNC_VERSION="0.0.1.dev20261112161350")
     watcher = None
@@ -217,6 +217,9 @@ def test_one_watcher_per_pod(tmp_path, monkeypatch):
         lines = _lines(tmp_path)
         assert any(l.startswith("Q38X2_NODES_ALL_UP up=2 of 2") for l in lines), lines
         assert sum(l.startswith("Q38X2_REGISTRY_UP") for l in lines) == 1
+        # The watcher and the binaries write to their own file, not the importing process's pipes.
+        procs = (tmp_path / "out" / "q38x2" / "sidecar_procs.log").read_text()
+        assert "fake registry on" in procs and "Q38X2_NODE_UP" in procs
     finally:
         if watcher:
             try:
@@ -257,3 +260,29 @@ def test_the_spec_waits_for_the_registry_before_the_shard_stores(monkeypatch):
     assert calls == [REGISTRY["global_registry_address"]]
     spec.build_tier_manager(stores=[object()] * 9, store_types=object())
     assert calls == [REGISTRY["global_registry_address"]]  # injected stores (tests): no wait
+
+
+def test_the_importing_process_pipes_are_not_held(tmp_path):
+    """The importer returns and its pipes close although the watcher and the binaries keep running."""
+    import subprocess
+
+    import vllm_torchtpu.offload.tier_x2_sidecar as sc
+
+    root = _fake_root(tmp_path)
+    env = _env(tmp_path, Q38X2_TPU_SYNC_DIR=root)
+    code = "import importlib.util as u, sys; s = u.spec_from_file_location('sc', sys.argv[1]); m = u.module_from_spec(s); s.loader.exec_module(m); print(m.maybe_start())"
+    try:
+        out = subprocess.run([sys.executable, "-c", code, sc.__file__], env=env, capture_output=True, text=True, timeout=30)
+        assert out.stdout.strip() == "True", out
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not any(l.startswith("Q38X2_NODES_ALL_UP") for l in _lines(tmp_path)):
+            time.sleep(0.2)
+        assert any(l.startswith("Q38X2_NODES_ALL_UP up=2 of 2") for l in _lines(tmp_path)), _lines(tmp_path)
+    finally:
+        for line in _lines(tmp_path):
+            if "Q38X2_SIDECAR watcher pid" in line:
+                try:
+                    os.kill(int(line.split("watcher pid ")[1].split()[0]), signal.SIGKILL)
+                except (ProcessLookupError, ValueError):
+                    pass
+        _kill_started(tmp_path)

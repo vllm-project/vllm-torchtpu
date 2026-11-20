@@ -39,6 +39,8 @@ TPU_SYNC_VERSION = "Q38X2_TPU_SYNC_VERSION"
 # Where the lock and the executable copies live (tests point them elsewhere); one lock per pod.
 LOCK_DIR = "Q38X2_LOCK_DIR"
 BIN_DIR = "Q38X2_BIN_DIR"
+# The tpu_sync package directory holding the binaries (default: the installed tpu_sync's).
+TPU_SYNC_DIR = "Q38X2_TPU_SYNC_DIR"
 
 REGISTRY_BIN = ("kv_cache", "global_registry", "global_registry_server")
 NODE_BIN = ("store_node", "kv_cache_host_store_node_main")
@@ -102,9 +104,12 @@ def node_commands(env, node_bin: str) -> list[tuple[str, int, list[str]]]:
     return out
 
 
-def _tpu_sync_dir() -> str:
+def _tpu_sync_dir(env=None) -> str:
     import importlib.util
 
+    env = os.environ if env is None else env
+    if env.get(TPU_SYNC_DIR):
+        return env[TPU_SYNC_DIR]
     spec = importlib.util.find_spec("tpu_sync")
     if spec is None or not spec.submodule_search_locations:
         raise RuntimeError("tpu_sync is not installed")
@@ -145,7 +150,7 @@ def _start(env) -> bool:
             # Not yet: the leg installs the car's wheel before vllm serve; a later import retries.
             _say(f"Q38X2_SIDECAR waiting: tpu_sync_torch is {have}, not {want}", env)
             return False
-    root = _tpu_sync_dir()
+    root = _tpu_sync_dir(env)
     if env.get(NODES):
         node_commands(env, os.path.join(root, *NODE_BIN))  # refuse a bad spec before taking the lock
     lock = os.path.join(env.get(LOCK_DIR, "/tmp"), "q38x2_sidecar.lock")
@@ -155,14 +160,27 @@ def _start(env) -> bool:
         return False
     os.write(fd, f"{os.getpid()}\n".encode())
     os.close(fd)
-    proc = subprocess.Popen(
-        [sys.executable, "-I", os.path.abspath(__file__), "--watch", root],
-        env=dict(env),
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
+    # The watcher and the binaries write to their own file, never to the importing process's
+    # stdout / stderr: a long-lived child holding a parent's pipe would keep its reader (a log
+    # tee, a shell pipeline) from ever seeing end-of-file.
+    out_dir = os.path.join(env.get("CDK_OUTPUT_DIR") or "/tmp", "q38x2")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "sidecar_procs.log")
+    with open(out_path, "ab") as out:
+        proc = subprocess.Popen(
+            [sys.executable, "-I", os.path.abspath(__file__), "--watch", root],
+            env=dict(env),
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=out,
+            start_new_session=True,
+            close_fds=True,
+        )
+    _say(
+        f"Q38X2_SIDECAR watcher pid {proc.pid} started by pid {os.getpid()} (tpu_sync {root}; "
+        f"process output {out_path})",
+        env,
     )
-    _say(f"Q38X2_SIDECAR watcher pid {proc.pid} started by pid {os.getpid()} (tpu_sync {root})", env)
     return True
 
 
