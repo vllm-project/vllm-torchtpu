@@ -90,6 +90,8 @@ def apply_omni_model_specific_patches() -> None:
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
     _patch_ltx2_per_batch_timestep()
+    _patch_ltx2_guidance_sigma_scalar()
+    _patch_ltx2_async_guidance_step()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -903,3 +905,249 @@ def _patch_ltx2_per_batch_timestep() -> None:
     )
     LTXRuntime._denoise_timestep_kwargs = _per_batch_denoise_timestep_kwargs
     logger.info("Applied TPU patch: per-batch LTX-2 unconditioned timestep.")
+
+
+_LTX2_GUIDANCE_SIGMA_SCALAR_PATCHED = "_tpu_ltx2_guidance_sigma_scalar_patched"
+# Live entries are one video and one audio schedule per stage; the bound only
+# drops entries whose sigma tensors are gone.
+_MAX_SIGMA_CACHE_ENTRIES = 8
+_LTX2_ASYNC_STEP_PATCHED = "_tpu_ltx2_async_step_patched"
+
+
+def _patch_ltx2_guidance_sigma_scalar() -> None:
+    """Pre-materialize LTX-2 scheduler sigmas on CPU to avoid per-step D2H syncs.
+
+    Upstream provenance (vllm-omni 0.32.0rc1):
+    ``vllm_omni/diffusion/models/ltx2/ltx2_guidance.py``
+    (``LTXGuidanceExecutor.predict_noise``, ``predict_parallel_guidance``, and
+    ``_guide_modality``) and ``ltx2_denoise.py`` (``prepare_scheduler_stage``).
+
+    Upstream ``LTXGuidanceExecutor.predict_noise`` (and
+    ``predict_parallel_guidance``, which ``predict_noise`` dispatches to when
+    ``forward_ctx.guidance_parallel_ready`` is True) calls
+    ``self._guide_modality(..., sigma=scheduler.sigmas[index])`` twice per
+    denoise step (video and audio) without passing ``sigma_scalar``, so
+    ``velocity_from_x0`` executes ``sigma.to(torch.float32).item()`` on a TPU
+    tensor twice every step. In TorchTPU lazy execution mode, each ``.item()``
+    forces a blocking ``TransferFromDevice`` that drains the in-flight
+    execution queue and starves TensorCore between steps. Caching
+    ``scheduler.sigmas`` as CPU ``float32`` scalars once per stage and
+    supplying ``sigma_scalar`` eliminates all per-step D2H host syncs while
+    preserving the exact IEEE-754 ``float32`` scalar value.
+
+    The cache lives in this closure, keyed by the sigma tensor's identity (a
+    weakref) and version counter, never by storage address and never on the
+    scheduler: ``prepare_scheduler_stage`` deep-copies ``pipeline.scheduler``
+    into ``audio_scheduler``, and a freed schedule's address can be reused by
+    the next one. Each scheduler stage also refreshes it unconditionally.
+
+    Limitations: ``combine_cfg_velocity`` (``ltx2_guidance.py``) still calls
+    ``.item()`` per call. It is reached only through the generic
+    ``combine_cfg_noise`` CFG-parallel hook, not through ``predict_noise``.
+    Removing these reads also removes the per-step graph cut they made; the
+    step flush in ``_patch_ltx2_async_guidance_step`` replaces it.
+
+    REMOVAL / FIX CONDITION:
+    Remove once vLLM-Omni pre-materializes scheduler sigmas on CPU and passes
+    ``sigma_scalar`` from ``LTXGuidanceExecutor.predict_noise`` /
+    ``predict_parallel_guidance`` into ``_guide_modality``.
+    """
+    from vllm_omni.diffusion.models.ltx2 import ltx2_denoise, ltx2_guidance
+
+    executor_cls = ltx2_guidance.LTXGuidanceExecutor
+    if getattr(
+        executor_cls.predict_noise,
+        _LTX2_GUIDANCE_SIGMA_SCALAR_PATCHED,
+        False,
+    ):
+        return
+
+    orig_prepare_scheduler_stage = ltx2_denoise.prepare_scheduler_stage
+    orig_predict_noise = executor_cls.predict_noise
+    orig_guide_modality = executor_cls._guide_modality
+    active_step_sigma_map: dict[int, float | None] = {}
+    # id(sigmas) -> (weakref to sigmas, version counter or None, scalars).
+    sigma_cache: dict[int, tuple[Any, int | None, tuple[float, ...]]] = {}
+
+    def _ensure_sigma_scalars(
+        scheduler: Any, *, refresh: bool = False
+    ) -> tuple[float, ...] | None:
+        sigmas_t = getattr(scheduler, "sigmas", None)
+        if (
+            sigmas_t is None
+            or not isinstance(sigmas_t, torch.Tensor)
+            or sigmas_t.ndim != 1
+        ):
+            return None
+        key = id(sigmas_t)
+        # Inference tensors have no version counter; the per-stage refresh
+        # covers schedules rebuilt in inference mode.
+        version = None if sigmas_t.is_inference() else sigmas_t._version
+        entry = sigma_cache.get(key)
+        if (
+            not refresh
+            and entry is not None
+            and entry[0]() is sigmas_t
+            and entry[1] == version
+        ):
+            return entry[2]
+        scalars = tuple(
+            float(x)
+            for x in sigmas_t.detach().to(device="cpu", dtype=torch.float32).tolist()
+        )
+        if len(sigma_cache) >= _MAX_SIGMA_CACHE_ENTRIES:
+            for dead in [k for k, e in sigma_cache.items() if e[0]() is None]:
+                del sigma_cache[dead]
+            if len(sigma_cache) >= _MAX_SIGMA_CACHE_ENTRIES:
+                sigma_cache.clear()
+        sigma_cache[key] = (weakref.ref(sigmas_t), version, scalars)
+        return scalars
+
+    def _cached_prepare_scheduler_stage(
+        pipeline: Any,
+        request_inputs: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[Any, Any, torch.Tensor]:
+        audio_scheduler, video_audio_step_adapter, timesteps_tensor = (
+            orig_prepare_scheduler_stage(pipeline, request_inputs, *args, **kwargs)
+        )
+        _ensure_sigma_scalars(getattr(pipeline, "scheduler", None), refresh=True)
+        _ensure_sigma_scalars(audio_scheduler, refresh=True)
+        return audio_scheduler, video_audio_step_adapter, timesteps_tensor
+
+    def _predict_noise_with_cached_sigma(
+        self: Any,
+        pipeline: Any,
+        plan: Any,
+        index: int,
+        timestep: torch.Tensor,
+        state: Any,
+        forward_ctx: Any,
+        denoise_ctx: Any,
+        preserve_positive_velocity: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        v_scalars = _ensure_sigma_scalars(getattr(pipeline, "scheduler", None))
+        a_scalars = _ensure_sigma_scalars(getattr(forward_ctx, "audio_scheduler", None))
+        active_step_sigma_map[id(state.video)] = (
+            v_scalars[index]
+            if v_scalars is not None and 0 <= index < len(v_scalars)
+            else None
+        )
+        active_step_sigma_map[id(state.audio)] = (
+            a_scalars[index]
+            if a_scalars is not None and 0 <= index < len(a_scalars)
+            else None
+        )
+        try:
+            return orig_predict_noise(
+                self,
+                pipeline,
+                plan,
+                index,
+                timestep,
+                state,
+                forward_ctx,
+                denoise_ctx,
+                preserve_positive_velocity=preserve_positive_velocity,
+            )
+        finally:
+            active_step_sigma_map.clear()
+
+    @staticmethod
+    def _guide_modality_with_cached_sigma(
+        sample: torch.Tensor,
+        splits: dict[str, torch.Tensor],
+        sigma: torch.Tensor,
+        guidance: Any,
+        *,
+        model_sigma: torch.Tensor | None = None,
+        sigma_scalar: float | None = None,
+        preserve_positive_velocity: bool = False,
+        rescale_token_count: int | None = None,
+    ) -> torch.Tensor:
+        if sigma_scalar is None:
+            sigma_scalar = active_step_sigma_map.get(id(sample))
+        return orig_guide_modality(
+            sample,
+            splits,
+            sigma,
+            guidance,
+            model_sigma=model_sigma,
+            sigma_scalar=sigma_scalar,
+            preserve_positive_velocity=preserve_positive_velocity,
+            rescale_token_count=rescale_token_count,
+        )
+
+    setattr(
+        _predict_noise_with_cached_sigma,
+        _LTX2_GUIDANCE_SIGMA_SCALAR_PATCHED,
+        True,
+    )
+    ltx2_denoise.prepare_scheduler_stage = _cached_prepare_scheduler_stage
+    executor_cls.predict_noise = _predict_noise_with_cached_sigma
+    executor_cls._guide_modality = _guide_modality_with_cached_sigma
+    logger.info(
+        "Applied TPU patch: pre-materialized LTX-2 guidance sigma scalars on CPU."
+    )
+
+
+def _patch_ltx2_async_guidance_step() -> None:
+    """Replace CUDA-only per-step device synchronize() with non-blocking flush.
+
+    Upstream provenance (vllm-omni 0.32.0rc1):
+    ``vllm_omni/diffusion/models/ltx2/ltx2_runtime.py``
+    (``LTXRuntime._synchronize_guidance_parallel_step_output``).
+
+    Upstream materializes contiguous latents and calls
+    ``current_omni_platform.synchronize()`` at the end of every CFG-parallel
+    denoise step to avoid CUDA async numerical drift. On TPU, that blocking
+    sync stalls the host between steps and cannot be wrapped without invoking
+    the sync itself, so this patch replaces the 5-line method body to keep the
+    same CFG-world-size guard and ``.contiguous()`` materialization while
+    flushing via ``synchronize_tensors(list(latents), wait=False)``.
+
+    Every other step (``cfg_parallel_size == 1``, or a single-pass phase such
+    as the two-stage refine) is flushed too, without the copy. Upstream skips
+    the sync there, but its ``velocity_from_x0`` ``.item()`` cut the lazy graph
+    every step; ``_patch_ltx2_guidance_sigma_scalar`` removes that read, so
+    without this flush the whole loop and the decoder would trace into one
+    TPU program. This runs in the host denoise loop, never under
+    ``torch.compile``.
+
+    REMOVAL / FIX CONDITION:
+    Remove once vLLM-Omni gates the blocking ``synchronize()`` in
+    ``LTXRuntime._synchronize_guidance_parallel_step_output`` to CUDA (or
+    uses a non-blocking flush on TPU).
+    """
+    from vllm_omni.diffusion.distributed import parallel_state
+    from vllm_omni.diffusion.models.ltx2.ltx2_runtime import LTXRuntime
+
+    from vllm_torchtpu.utils import synchronize_tensors
+
+    if getattr(
+        LTXRuntime._synchronize_guidance_parallel_step_output,
+        _LTX2_ASYNC_STEP_PATCHED,
+        False,
+    ):
+        return
+
+    def _async_guidance_step_output(
+        self: Any,
+        latents: tuple[torch.Tensor, torch.Tensor],
+        guidance_parallel_ready: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del self
+        if (
+            guidance_parallel_ready
+            and parallel_state.get_classifier_free_guidance_world_size() > 1
+        ):
+            latents = tuple(tensor.contiguous() for tensor in latents)
+        synchronize_tensors(list(latents), wait=False)
+        return latents
+
+    setattr(_async_guidance_step_output, _LTX2_ASYNC_STEP_PATCHED, True)
+    LTXRuntime._synchronize_guidance_parallel_step_output = _async_guidance_step_output
+    logger.info(
+        "Applied TPU patch: non-blocking async guidance-parallel step boundary."
+    )
