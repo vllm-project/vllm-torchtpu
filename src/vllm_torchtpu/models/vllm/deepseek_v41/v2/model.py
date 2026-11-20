@@ -22,6 +22,7 @@ from vllm_torchtpu.kernels.experimental import decode_preparation
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
     initialize_shifted_mhc,
 )
+from vllm_torchtpu.layers.adapter.fused_moe_ep import mark_split_exchange_moe
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
@@ -1499,6 +1500,13 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             vllm_config, warn_prefix_caching=True, fallback_config=self.config
         )
         self._prefix_replay = prefix_replay_enabled(vllm_config)
+        if self._ced_enabled:
+            # The decoder half's MoE layers split their routing exchange around
+            # the shared expert; in the encoder half the split measured slower.
+            for i in range(max(self._ced_boundary, self.start_layer), self.end_layer):
+                experts = getattr(getattr(self.layers[i], "ffn", None), "experts", None)
+                if experts is not None:
+                    mark_split_exchange_moe(experts)
         self._ced_window = self.layers[self._ced_boundary].attn.window_size
         self._ced_compile_sizes = tuple(
             n

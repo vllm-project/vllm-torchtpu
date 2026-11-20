@@ -1049,8 +1049,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MOE_FUSED_EP_PUSH_SINGLE_BARRIER", default=True
     ),
     # MOE_FUSED_EP_KERNEL_IMPL=push with EXCHANGE_TABLES and the in-op shared
-    # expert: the routing exchange is issued and waited in two calls, with the
-    # shared expert's gate_up projection between them.
+    # expert, on layers the model tags (mark_split_exchange_moe): the routing
+    # exchange is issued and waited in two calls, with the shared expert's
+    # gate_up projection between them.
     "MOE_FUSED_EP_PUSH_SPLIT_EXCHANGE": env_bool(
         "MOE_FUSED_EP_PUSH_SPLIT_EXCHANGE", default=True
     ),

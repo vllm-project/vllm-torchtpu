@@ -134,6 +134,19 @@ FUSED_MOE_EP_SHARED_LIMIT_ATTR = "_fused_moe_ep_shared_limit"
 DSPARK_DRAFT_MOE_ATTR = "_dspark_draft_moe"
 
 
+# Set on the routed experts of a layer whose push MoE may split its routing
+# exchange around the shared expert (MOE_FUSED_EP_PUSH_SPLIT_EXCHANGE), by
+# `mark_split_exchange_moe`.
+SPLIT_EXCHANGE_MOE_ATTR = "_split_exchange_moe"
+
+
+def mark_split_exchange_moe(experts) -> None:
+    """Tag a layer's `ffn.experts` (a MoE runner, or the routed experts
+    themselves) for the split routing exchange before its weights are
+    processed."""
+    setattr(getattr(experts, "routed_experts", experts), SPLIT_EXCHANGE_MOE_ATTR, True)
+
+
 def mark_dspark_draft_moe(experts) -> None:
     """Tag a DSpark draft layer's `ffn.experts` (a MoE runner, or the routed
     experts themselves) before its weights are processed."""
@@ -205,6 +218,7 @@ def _build_op(
     has_expert_load=False,
     row_score_bias=False,
     dspark_draft=False,
+    split_exchange=False,
     shared_limit: float | None = None,
 ):
     """The op for this closure, built once per distinct closure and reused.
@@ -215,7 +229,9 @@ def _build_op(
     `dspark_draft` marks a DSpark draft layer (`mark_dspark_draft_moe`). Under
     the push build and TPU_DSPARK_DRAFT_MOE_TUNING it gets its own knobs,
     sc_prepush=1 and two tile-height rungs, in place of the process-wide envs;
-    every other layer is built exactly as before.
+    every other layer is built exactly as before. `split_exchange` marks a
+    layer `mark_split_exchange_moe` tagged: only such a layer splits its
+    routing exchange under MOE_FUSED_EP_PUSH_SPLIT_EXCHANGE.
 
     `has_expert_slot` adds the expert layout's slot table as one more
     replicated operand (expert_placement.py): the table's values are data, so
@@ -254,7 +270,7 @@ def _build_op(
             kernel_plan_tables=envs.MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES,
             light_prepush=envs.MOE_FUSED_EP_PUSH_LIGHT_PREPUSH,
             single_barrier=envs.MOE_FUSED_EP_PUSH_SINGLE_BARRIER,
-            split_exchange=envs.MOE_FUSED_EP_PUSH_SPLIT_EXCHANGE,
+            split_exchange=split_exchange and envs.MOE_FUSED_EP_PUSH_SPLIT_EXCHANGE,
             early_scale_scatter=envs.MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER,
         )
         if dspark_draft and envs.TPU_DSPARK_DRAFT_MOE_TUNING:
@@ -1046,6 +1062,7 @@ def prebuild_fused_moe_ep(
         has_expert_load=placed is not None and expert_load_tap.enabled(),
         row_score_bias=row_score_bias,
         dspark_draft=bool(getattr(layer, DSPARK_DRAFT_MOE_ATTR, False)),
+        split_exchange=bool(getattr(layer, SPLIT_EXCHANGE_MOE_ATTR, False)),
         shared_limit=shared_limit,
     )
     logger.info_once(
