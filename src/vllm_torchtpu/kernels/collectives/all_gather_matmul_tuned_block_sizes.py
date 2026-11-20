@@ -13,6 +13,8 @@
 # limitations under the License.
 """All-gather matmul kernel's tuned block sizes."""
 
+import re
+
 import jax
 
 # key:
@@ -40,12 +42,8 @@ TUNED_BLOCK_SIZES = {
 def get_tpu_version() -> int:
     """Returns the numeric version of the TPU, or -1 if not on TPU."""
     kind = jax.devices()[0].device_kind
-    if "TPU" not in kind:
-        return -1
-    if kind.endswith(" lite"):
-        kind = kind[: -len(" lite")]
-    assert kind[:-1] == "TPU v", kind
-    return int(kind[-1])
+    match = re.match(r"^TPU[^\d]*(\d+)", kind)
+    return int(match.group(1)) if match else -1
 
 
 def get_key(

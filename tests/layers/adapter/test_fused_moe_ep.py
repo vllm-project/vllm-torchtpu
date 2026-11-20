@@ -78,6 +78,7 @@ def _prebuild(
     has_mesh=True,
     node_tokens=4096,
     smem_bytes=1024 * 1024,
+    sublanes=bridge.U32_SUBLANE_TILE,
     ep_order=None,
     replica_groups=((0,), (1,)),
     build_op=None,
@@ -99,6 +100,7 @@ def _prebuild(
         patch.object(bridge, "ep_token_replica_groups", return_value=replica_groups),
         patch.object(bridge, "_max_node_tokens", return_value=node_tokens),
         patch.object(bridge, "_smem_capacity_bytes", return_value=smem_bytes),
+        patch.object(bridge, "_num_sublanes", return_value=sublanes),
         patch.object(bridge, "_build_op", side_effect=build_op),
     ):
         defaults = dict(topk=2, renormalize=True, activation="silu")
@@ -128,6 +130,24 @@ def _armed():
 
 def test_arms_on_a_supported_layer():
     assert _prebuild(_layer()) == "op"
+
+
+def test_refuses_chip_with_non_matching_sublanes():
+    layer = _layer()
+    assert _prebuild(layer, sublanes=16) is None
+    with patch.object(bridge, "_num_sublanes", return_value=16):
+        reason = bridge.fused_moe_ep_unsupported_reason(
+            layer,
+            (
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+            ),
+            "silu",
+        )
+    assert reason is not None
+    assert "16 sublanes" in reason
 
 
 def test_native_replica_groups_reach_prebuilt_op():

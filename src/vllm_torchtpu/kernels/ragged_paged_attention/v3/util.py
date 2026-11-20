@@ -13,6 +13,8 @@
 # limitations under the License.
 """Utility functions for ragged paged attention."""
 
+import re
+
 import jax
 from jax._src import dtypes
 
@@ -53,13 +55,5 @@ def next_power_of_2(x: int):
 def get_tpu_version() -> int:
     """Returns the numeric version of the TPU, or -1 if not on TPU."""
     kind = jax.devices()[0].device_kind
-    if "TPU" not in kind:
-        return -1
-    if kind.endswith(" lite"):
-        kind = kind[: -len(" lite")]
-    if kind.endswith("p") or kind.endswith("e"):
-        kind = kind[:-1]
-    if kind == "TPU7x":
-        return 7
-    assert kind[:-1] == "TPU v", kind
-    return int(kind[-1])
+    match = re.match(r"^TPU[^\d]*(\d+)", kind)
+    return int(match.group(1)) if match else -1
