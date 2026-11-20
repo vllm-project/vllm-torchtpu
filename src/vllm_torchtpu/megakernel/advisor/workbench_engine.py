@@ -144,6 +144,8 @@ def build_engine_seed_defaults() -> dict[str, object]:
             constants.DEFAULT_DECLARED_CALLS_PER_LAYER
         ),
         "per_op_collective_call_factor": (constants.PER_OP_COLLECTIVE_CALL_FACTOR),
+        "min_step_ops_for_explicit_norm": (constants.MIN_STEP_OPS_FOR_EXPLICIT_NORM),
+        "floor_tie_epsilon_us": constants.FLOOR_TIE_EPSILON_US,
         "workload_defaults": {
             "batch": wl_default.batch,
             "isl": wl_default.isl,
