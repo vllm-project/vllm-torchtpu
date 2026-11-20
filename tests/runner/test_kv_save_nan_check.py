@@ -243,6 +243,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         execute_model_state=None,
         _update_states=lambda _so: None,
         scheduler_config=SimpleNamespace(async_scheduling=False),
+        _fused_async_subst_done=False,
         _mtp_prefill_only=False,
         _reorder_batch_for_rpa=lambda _so: (0, 0),
         _count_input_chunks=lambda _so: (2, 1),
