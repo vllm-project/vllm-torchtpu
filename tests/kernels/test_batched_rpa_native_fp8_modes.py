@@ -64,11 +64,9 @@ def test_native_fp8_needs_an_fp8_kv_cache(native_fp8):
         assert _serve(dtype_kv, native_fp8).native_fp8 == native_fp8
 
 
-@pytest.mark.parametrize("name", ["native_fp8", "native_fp8_prefill"])
-def test_prefill_modes_need_an_fp8_kv_cache_too(name):
-    modes = {name: configs.NativeFp8(pv=_STATIC)}
-    with pytest.raises(ValueError, match="fp8 KV"):
-        _serve(jnp.bfloat16, **modes)
+def test_prefill_modes_need_an_fp8_kv_cache_too():
+    with pytest.raises(ValueError, match="native_fp8_prefill=pvs .* fp8 KV"):
+        _serve(jnp.bfloat16, native_fp8_prefill=configs.NativeFp8(pv=_STATIC))
 
 
 @pytest.mark.parametrize("name", ["native_fp8", "native_fp8_prefill"])
