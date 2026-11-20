@@ -60,9 +60,29 @@ local experts are compacted, and a ring item is one (expert, _I_CHUNK-column
 chunk of I) pair: the gate and up chunks of w13 and the matching w2 rows, so
 VMEM per slot is the TP16 slot whatever I is. The all-reduce still sums every
 rank, so each rank's partial covers its experts x its columns.
+
+Weight format (static weight_format of _kernel): everything above is
+Fp8Format, per-channel FP8 routed weights. Nvfp4Format (entry point
+nvfp4.moe_tp_decode_nvfp4) keeps the routing, compaction, shared expert, both
+ring schedules, combine and all-reduce and swaps only the routed-expert ring
+(_nvfp4_ring) for one that streams half the bytes:
+
+  1. w13 [El, H, 2I] and w2 [El, I, H] are float4_e2m1fn, viewed in HBM as
+     uint32 [El, H // 8, 2I] / [El, I // 8, H] (8 K-rows per word) and DMAed
+     whole into a ring of _NVFP4_NUM_BUFFERS slots; a slot holds g active
+     experts side by side along N (nvfp4.group_size), tail lanes of the last
+     group read active expert 0 and get routing coefficient 0;
+  2. each 512-row K-block of w13 widens fp4 -> fp8 in VMEM for one
+     [M, 512] x [512, g * 2I] FP8 dot, scaled in f32 by the x and w13 block
+     scales (f32, per _Q_BLOCK rows) and summed in f32; silu(gate) * up in f32;
+  3. w2 runs a K-block loop over its own block scales (I // bk2 blocks of bk2
+     rows), fp4 -> fp8 per block, into owner_ref in f32.
 """
 
+import dataclasses
 import functools
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -87,17 +107,26 @@ PAIR = 128
 # VMEM limit = need x headroom (Mosaic temporaries), refused above a fraction
 # of the capacity so neighbouring XLA ops keep room.
 VMEM_HEADROOM = 1.25
+# FP8 admission (nvfp4.VMEM_FRACTION for NVFP4).
 VMEM_FRACTION = 0.75
-# Output columns per second-matmul chunk; bounds the live f32 result.
-_N_CHUNK = 512
 # gmm_v2's activation quantization block: one scale per row per this many
-# columns of x (its quant_block_size).
+# columns of x (its quant_block_size). Also the NVFP4 w13 scale block: one f32
+# scale per _Q_BLOCK K-rows.
 _Q_BLOCK = 512
-# Weight ring depth. One slot holds the expert whose first matmul is in
-# flight, so num_buffers - 2 transfers run ahead of compute.
+# FP8 ring: output columns per second-matmul chunk; bounds the live f32 result.
+_N_CHUNK = 512
+# FP8 ring depth. One slot holds the expert whose first matmul is in flight, so
+# num_buffers - 2 transfers run ahead of compute.
 _NUM_BUFFERS = 6
-# Intermediate columns per ring item (one MXU-wide gate and up chunk).
+# FP8 ring: intermediate columns per ring item (one MXU-wide gate and up chunk).
 _I_CHUNK = 128
+
+# NVFP4 ring: float4_e2m1fn weights, viewed as uint32 words of _FP4_PACK K-rows
+# each, streamed whole through a shallower ring (an FP4 expert is half the
+# bytes of an FP8 one).
+FP4 = jnp.float4_e2m1fn
+_FP4_PACK = 8
+_NVFP4_NUM_BUFFERS = 4
 
 
 def exact_in_bf16(value: float) -> bool:
@@ -132,14 +161,13 @@ def _i_chunk(i):
     return min(i, _I_CHUNK)
 
 
-def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
-    """(need_bytes, vmem_limit_bytes), or None if the limit would exceed
-    VMEM_FRACTION of the capacity. Whole-array blocks (grid=()), tiles padded.
-    `i` is the ring item's column count (_i_chunk of the rank's I)."""
+def _fixed_vmem_bytes(m, h, num_experts, shared_inter, info, *, xs_dtype):
+    """VMEM bytes of everything but the routed-expert ring (tiles padded); the
+    ring's format sets the x block scales' dtype."""
     t = functools.partial(all_reduce.tiled_bytes, info=info)
     e_pad = pl.cdiv(num_experts, info.num_lanes) * info.num_lanes
     f32, bf16 = jnp.float32, jnp.bfloat16
-    fixed = (
+    return (
         2 * t((m, h), bf16)  # x in, out
         + t((m, e_pad), f32)  # scores
         + t((1, e_pad), f32)  # bias
@@ -148,10 +176,21 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
         + t((shared_inter, h), FP8)  # shared down
         + t((1, h), f32)
         + 2 * t((m, h), FP8)  # sxq (per row), xq (per block)
-        + t((h // _Q_BLOCK, m, info.num_lanes), bf16)  # xs
+        + t((h // _Q_BLOCK, m, info.num_lanes), xs_dtype)  # xs
         + 2 * t((m, h), f32)  # owner, shared
         + t((m, e_pad), f32)  # wtab
-        + t((1, e_pad), jnp.int32)  # hits_v
+        + t((4, e_pad), jnp.int32)  # hits_v (1 row unless fast; tiled the same)
+    )
+
+
+def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
+    """(need_bytes, vmem_limit_bytes), or None if the limit would exceed
+    VMEM_FRACTION of the capacity. Whole-array blocks (grid=()), tiles padded.
+    `i` is the ring item's column count (_i_chunk of the rank's I)."""
+    t = functools.partial(all_reduce.tiled_bytes, info=info)
+    f32 = jnp.float32
+    fixed = _fixed_vmem_bytes(
+        m, h, num_experts, shared_inter, info, xs_dtype=jnp.bfloat16
     )
     slot = t((h, 2 * i), FP8) + t((i, h), FP8) + t((1, 2 * i), f32) + t((1, h), f32)
     need = fixed + _NUM_BUFFERS * slot + all_reduce.vmem_bytes(spec, info)
@@ -191,6 +230,75 @@ def kernel_name(
     return name
 
 
+class _Dims(NamedTuple):
+    m: int
+    h: int
+    experts: int
+    i: int
+    num_experts: int
+    shared_inter: int
+
+
+def _admit_shapes(
+    x,
+    scores,
+    bias,
+    w13,
+    w2,
+    s13,
+    s2,
+    shared_w13,
+    shared_s13,
+    shared_w2,
+    shared_s2,
+    *,
+    topk: int,
+    n_ranks: int,
+    info,
+    weight_dtype,
+) -> _Dims | None:
+    """The admission checks every weight format shares: the hardware (one
+    TensorCore per device, an FP8 x FP8 MXU), the shapes of all operands but
+    the routed scales, the dtypes (routed weights `weight_dtype`) and the
+    all-reduce geometry. The dims, or None; the format checks the rest."""
+    if info.num_cores != 1 or not info.is_matmul_supported(FP8, FP8):
+        return None
+    if x.ndim != 2 or scores.ndim != 2 or bias.ndim != 1:
+        return None
+    if w13.ndim != 3 or w2.ndim != 3 or shared_w13.ndim != 2 or shared_w2.ndim != 2:
+        return None
+    m, h = x.shape
+    experts, i, out = w2.shape
+    num_experts, shared_inter = scores.shape[1], shared_w2.shape[0]
+    if m not in ROW_BUCKETS or scores.shape != (m, num_experts):
+        return None
+    # This rank's experts are a linear block of the router's num_experts
+    # (experts == num_experts under plain TP).
+    if bias.shape != (num_experts,) or experts <= 0 or num_experts % experts:
+        return None
+    if not 0 < topk <= num_experts or i <= 0 or i % info.num_lanes:
+        return None
+    if h % _Q_BLOCK or shared_inter <= 0 or shared_inter % PAIR:
+        return None
+    if out != h or w13.shape != (experts, h, 2 * i):
+        return None
+    shared = (shared_w13.shape, shared_s13.shape, shared_w2.shape, shared_s2.shape)
+    fs = shared_inter
+    if shared != ((h, 2 * fs), (2 * fs,), (fs, h), (h,)):
+        return None
+    if x.dtype != jnp.bfloat16 or scores.dtype != jnp.float32:
+        return None
+    if w13.dtype != weight_dtype or w2.dtype != weight_dtype:
+        return None
+    if shared_w13.dtype != FP8 or shared_w2.dtype != FP8:
+        return None
+    if any(s.dtype != jnp.float32 for s in (bias, s13, s2, shared_s13, shared_s2)):
+        return None
+    if not all_reduce.supported(n_ranks, m, h, info):
+        return None
+    return _Dims(m, h, experts, i, num_experts, shared_inter)
+
+
 def can_use_moe_tp_decode(
     x,
     scores,
@@ -215,40 +323,29 @@ def can_use_moe_tp_decode(
     top-k, SiLU, no scale folded into the weights) are the caller's to check.
     """
     info = pltpu.get_tpu_info()
-    if info.num_cores != 1 or not info.is_matmul_supported(FP8, FP8):
+    dims = _admit_shapes(
+        x,
+        scores,
+        bias,
+        w13,
+        w2,
+        s13,
+        s2,
+        shared_w13,
+        shared_s13,
+        shared_w2,
+        shared_s2,
+        topk=topk,
+        n_ranks=n_ranks,
+        info=info,
+        weight_dtype=FP8,
+    )
+    if dims is None:
         return False
-    if x.ndim != 2 or scores.ndim != 2 or bias.ndim != 1:
-        return False
-    if w13.ndim != 3 or w2.ndim != 3 or shared_w13.ndim != 2 or shared_w2.ndim != 2:
-        return False
-    m, h = x.shape
-    experts, i, out = w2.shape
-    num_experts, shared_inter = scores.shape[1], shared_w2.shape[0]
-    if m not in ROW_BUCKETS or scores.shape != (m, num_experts):
-        return False
-    # This rank's experts are a linear block of the router's num_experts
-    # (experts == num_experts under plain TP).
-    if bias.shape != (num_experts,) or experts <= 0 or num_experts % experts:
-        return False
-    if not 0 < topk <= num_experts or i <= 0 or i % info.num_lanes:
-        return False
-    if h % _N_CHUNK or h % _Q_BLOCK or shared_inter <= 0 or shared_inter % PAIR:
-        return False
-    if out != h or w13.shape != (experts, h, 2 * i):
+    m, h, experts, i, num_experts, shared_inter = dims
+    if h % _N_CHUNK:
         return False
     if s13.shape != (experts, 1, 1, 2 * i) or s2.shape != (experts, 1, 1, h):
-        return False
-    shared = (shared_w13.shape, shared_s13.shape, shared_w2.shape, shared_s2.shape)
-    fs = shared_inter
-    if shared != ((h, 2 * fs), (2 * fs,), (fs, h), (h,)):
-        return False
-    if x.dtype != jnp.bfloat16 or scores.dtype != jnp.float32:
-        return False
-    if any(w.dtype != FP8 for w in (w13, w2, shared_w13, shared_w2)):
-        return False
-    if any(s.dtype != jnp.float32 for s in (bias, s13, s2, shared_s13, shared_s2)):
-        return False
-    if not all_reduce.supported(n_ranks, m, h, info):
         return False
     spec = all_reduce.make_spec(n_ranks, m, h)
     plan = _vmem_plan(m, h, _i_chunk(i), num_experts, shared_inter, info, spec)
@@ -367,11 +464,6 @@ def _compact_vector(wtab, e0, local):
     return ids, jnp.sum(loc, axis=1, keepdims=True)
 
 
-def _unused(fn):
-    """Decorator that leaves fn untraced (the schedule not selected)."""
-    return fn
-
-
 def _quantize_blocks(x, q_ref, scale_ref):
     """x [m, h] bf16 to FP8 in q_ref as gmm_v2 quantizes its LHS: per row per
     _Q_BLOCK columns, scale = block amax / FP8 max and its inverse (0 for an
@@ -384,6 +476,19 @@ def _quantize_blocks(x, q_ref, scale_ref):
         block = x[:, k : k + _Q_BLOCK]
         scale = jnp.max(jnp.abs(block), axis=1, keepdims=True) / FP8_MAX
         inv = jnp.where(scale == 0, 0, 1 / scale)
+        q_ref[:, k : k + _Q_BLOCK] = (block * inv).astype(FP8)
+        scale_ref[k // _Q_BLOCK] = jnp.broadcast_to(scale, (m, lanes))
+
+
+def _quantize_blocks_f32(x, q_ref, scale_ref):
+    """_quantize_blocks in f32 (Nvfp4Format): x [m, h] bf16 to FP8
+    per _Q_BLOCK columns, scales and products in f32."""
+    m, h = x.shape
+    lanes = scale_ref.shape[-1]
+    for k in range(0, h, _Q_BLOCK):
+        block = x[:, k : k + _Q_BLOCK].astype(jnp.float32)
+        scale = jnp.max(jnp.abs(block), axis=1, keepdims=True) / FP8_MAX
+        inv = jnp.where(scale == 0, 0.0, 1.0 / scale)
         q_ref[:, k : k + _Q_BLOCK] = (block * inv).astype(FP8)
         scale_ref[k // _Q_BLOCK] = jnp.broadcast_to(scale, (m, lanes))
 
@@ -414,6 +519,325 @@ def _combine(routed_sum, shared_sum, routed_scale):
     scaled = (routed * routed_scale).astype(jnp.bfloat16).astype(jnp.float32)
     shared = shared_sum.astype(jnp.bfloat16).astype(jnp.float32)
     return (shared + scaled).astype(jnp.bfloat16)
+
+
+class _RingRefs(NamedTuple):
+    """The refs a routed-expert ring reads and writes (_kernel's names)."""
+
+    w1_hbm: Any
+    w2_hbm: Any
+    s1_hbm: Any
+    s2_hbm: Any
+    w1_ref: Any
+    w2_ref: Any
+    s1_ref: Any
+    s2_ref: Any
+    ring_sem: Any
+    xq_ref: Any
+    xs_ref: Any
+    owner_ref: Any
+    wtab_ref: Any
+    hits_s_ref: Any
+    active_ids_ref: Any
+
+
+class _Ring(NamedTuple):
+    """One weight format's routed-expert ring as _kernel drives it.
+
+    items: ring steps (int32 scalar); nb: ring slots; transfers(step): the DMA
+    descriptors of ring step `step`; quantize_x(x): x into xq_ref and xs_ref as
+    gate_up reads it; gate_up(slot): the step's first matmul;
+    finish(step, slot, acc1, expert_columns): its activation and second matmul
+    into owner_ref. _kernel runs both schedules over these.
+    """
+
+    items: Any
+    nb: int
+    transfers: Callable[[Any], list]
+    quantize_x: Callable[[Any], None]
+    gate_up: Callable[[Any], Any]
+    finish: Callable[[Any, Any, Any, Any], None]
+
+
+def _fp8_ring(r: _RingRefs, count, e0, *, fast: bool, n_chunks: int) -> _Ring:
+    """Fp8Format: ring items are (active expert, _I_CHUNK-column chunk
+    of I) pairs of per-channel FP8 weights (module docstring, steps 4-6)."""
+    m, h = r.xq_ref.shape
+    i = r.w2_hbm.shape[1]  # this rank's I
+    ic = r.w2_ref.shape[1]  # columns per ring item; i == ic * n_chunks
+    nc = n_chunks
+    nb = _NUM_BUFFERS
+    # Ring items, nc per active expert.
+    items = count * nc
+
+    def active(j):
+        """Local id of the j-th active expert."""
+        return r.hits_s_ref[2, j] if fast else r.active_ids_ref[j]
+
+    def transfers(step):
+        if nc > 1:
+            return chunk_transfers(step)
+        # Active expert `step`'s weights and scales into ring slot step % nb.
+        e, slot = active(step), step % nb
+        return [
+            pltpu.make_async_copy(
+                r.w1_hbm.at[e], r.w1_ref.at[slot], r.ring_sem.at[slot, 0]
+            ),
+            pltpu.make_async_copy(
+                r.w2_hbm.at[e], r.w2_ref.at[slot], r.ring_sem.at[slot, 1]
+            ),
+            pltpu.make_async_copy(
+                r.s1_hbm.at[e, 0], r.s1_ref.at[slot], r.ring_sem.at[slot, 2]
+            ),
+            pltpu.make_async_copy(
+                r.s2_hbm.at[e, 0], r.s2_ref.at[slot], r.ring_sem.at[slot, 3]
+            ),
+        ]
+
+    def chunk_transfers(step):
+        # Ring item `step` is chunk step % nc of active expert step // nc:
+        # w13's gate and up column chunks side by side, the matching w2 rows,
+        # their scales, and the expert's w2 scale.
+        e = active(lax.div(step, nc))
+        c0 = pl.multiple_of(lax.rem(step, nc) * ic, ic)
+        slot = step % nb
+        sem = r.ring_sem.at[slot]
+        lo, hi = pl.ds(0, ic), pl.ds(ic, ic)
+        gate, up = pl.ds(c0, ic), pl.ds(i + c0, ic)
+        return [
+            pltpu.make_async_copy(
+                r.w1_hbm.at[e, :, gate], r.w1_ref.at[slot, :, lo], sem.at[0]
+            ),
+            pltpu.make_async_copy(
+                r.w1_hbm.at[e, :, up], r.w1_ref.at[slot, :, hi], sem.at[1]
+            ),
+            pltpu.make_async_copy(r.w2_hbm.at[e, gate], r.w2_ref.at[slot], sem.at[2]),
+            pltpu.make_async_copy(
+                r.s1_hbm.at[e, 0, :, gate], r.s1_ref.at[slot, :, lo], sem.at[3]
+            ),
+            pltpu.make_async_copy(
+                r.s1_hbm.at[e, 0, :, up], r.s1_ref.at[slot, :, hi], sem.at[4]
+            ),
+            pltpu.make_async_copy(r.s2_hbm.at[e, 0], r.s2_ref.at[slot], sem.at[5]),
+        ]
+
+    def quantize_x(x):
+        # Per _Q_BLOCK columns with bf16 scales, as gmm_v2 quantizes its LHS.
+        _quantize_blocks(x, r.xq_ref, r.xs_ref)
+
+    lanes = r.xs_ref.shape[-1]
+
+    def gate_up(slot):
+        # gmm_v2's quantized matmul: one partial product per _Q_BLOCK rows of
+        # w1, rounded to bf16, times its x block's scales and then the weight
+        # scales in bf16, summed in bf16 (moe_dense_expert's pattern).
+        w_scale = r.s1_ref[slot].astype(jnp.bfloat16)
+        acc = jnp.zeros((m, 2 * ic), jnp.bfloat16)
+        for k in range(0, h, _Q_BLOCK):
+            part = jnp.matmul(
+                r.xq_ref[:, k : k + _Q_BLOCK],
+                r.w1_ref[slot, k : k + _Q_BLOCK, :],
+                preferred_element_type=jnp.float32,
+            ).astype(jnp.bfloat16)
+            part *= jnp.concatenate(
+                [r.xs_ref[k // _Q_BLOCK]] * (2 * ic // lanes), axis=1
+            )
+            part *= w_scale
+            acc += part
+        return acc
+
+    def finish(step, slot, acc1, expert_columns):
+        e = active(lax.div(step, nc)) if nc > 1 else active(step)
+        # Each row's routing weight for expert e (global column e0 + e of the
+        # routing table, 0 for rows that did not pick it).
+        coeff = jnp.sum(
+            jnp.where(expert_columns == e0 + e, r.wtab_ref[...], 0.0),
+            axis=1,
+            keepdims=True,
+        )
+        # gmm_v2's fused SiLU, on the bf16 gate_up result.
+        act = jax.nn.silu(acc1[:, :ic]) * acc1[:, ic:]
+        # Mask, not multiply: a padded row with non-finite hidden would give
+        # NaN * 0 = NaN. Rows this expert does not own contribute exactly 0.
+        mid = jnp.where(coeff != 0, act.astype(jnp.float32) * coeff, 0.0)
+        ms = jnp.max(jnp.abs(mid), axis=1, keepdims=True) / FP8_MAX
+        mq = (mid * jnp.where(ms == 0, 0.0, 1.0 / ms)).astype(FP8)
+        for n in range(0, h, _N_CHUNK):
+            acc2 = jnp.matmul(
+                mq,
+                r.w2_ref[slot, :, n : n + _N_CHUNK],
+                preferred_element_type=jnp.float32,
+            )
+            r.owner_ref[:, n : n + _N_CHUNK] += (
+                acc2 * r.s2_ref[slot, :, n : n + _N_CHUNK] * ms
+            )
+
+    return _Ring(items, nb, transfers, quantize_x, gate_up, finish)
+
+
+def _nvfp4_ring(
+    r: _RingRefs, count, e0, *, fast: bool, group: int, bk2: int, w2_n_chunk: int
+) -> _Ring:
+    """Nvfp4Format: ring slots of `group` whole active experts of FP4
+    weights with f32 block scales (module docstring, "Weight format")."""
+    # _FP4_PACK K-rows per uint32 word: the ring DMAs whole experts in this view
+    # and widens each K-block to FP8 in VMEM.
+    r = r._replace(
+        w1_hbm=r.w1_hbm.bitcast(jnp.uint32), w2_hbm=r.w2_hbm.bitcast(jnp.uint32)
+    )
+    m, h = r.xq_ref.shape
+    g = group
+    nb = _NVFP4_NUM_BUFFERS
+    two_i = r.s1_ref.shape[-1] // g
+    i = two_i // 2
+    # Ring steps: groups of g active experts, the last one padded.
+    items = lax.div(count + (g - 1), g)
+
+    def active_clamped(j):
+        """Local expert id for compacted index j; tail indices >= count clamp
+        to active[0] so group DMAs stay in bounds while finish zeroes coeff."""
+        j_safe = jnp.where(j < count, j, jnp.int32(0))
+        return r.hits_s_ref[2, j_safe] if fast else r.active_ids_ref[j_safe]
+
+    def transfers(q):
+        slot = q % nb
+        copies = []
+        for k in range(g):
+            e = active_clamped(q * g + k)
+            lanes_slice = pl.ds(k * two_i, two_i)
+            copies.extend(
+                (
+                    pltpu.make_async_copy(
+                        r.w1_hbm.at[e],
+                        r.w1_ref.at[slot, :, lanes_slice],
+                        r.ring_sem.at[slot, 4 * k],
+                    ),
+                    pltpu.make_async_copy(
+                        r.w2_hbm.at[e],
+                        r.w2_ref.at[slot, k],
+                        r.ring_sem.at[slot, 4 * k + 1],
+                    ),
+                    pltpu.make_async_copy(
+                        r.s1_hbm.at[e],
+                        r.s1_ref.at[slot, :, :, lanes_slice],
+                        r.ring_sem.at[slot, 4 * k + 2],
+                    ),
+                    pltpu.make_async_copy(
+                        r.s2_hbm.at[e],
+                        r.s2_ref.at[slot, k],
+                        r.ring_sem.at[slot, 4 * k + 3],
+                    ),
+                )
+            )
+        return copies
+
+    def quantize_x(x):
+        _quantize_blocks_f32(x, r.xq_ref, r.xs_ref)
+
+    lanes = r.xs_ref.shape[-1]
+    cols = g * two_i
+    rows1_u32 = _Q_BLOCK // _FP4_PACK
+    rows2_u32 = bk2 // _FP4_PACK
+    n_chunk = min(h, w2_n_chunk)
+
+    def gate_up(slot):
+        # Per 512-row K-block: widen fp4 -> fp8, one wide FP8 dot over the
+        # group, x and w13 block scales and the sum in f32.
+        acc = jnp.zeros((m, cols), jnp.float32)
+        for b in range(h // _Q_BLOCK):
+            wb = pltpu.bitcast(
+                r.w1_ref[slot, pl.ds(b * rows1_u32, rows1_u32), :], FP4
+            ).astype(FP8)
+            s1_b = r.s1_ref[slot, b, :, :]
+            part = jnp.matmul(
+                r.xq_ref[:, b * _Q_BLOCK : (b + 1) * _Q_BLOCK],
+                wb,
+                preferred_element_type=jnp.float32,
+            )
+            xs_b = jnp.concatenate([r.xs_ref[b]] * (cols // lanes), axis=1)
+            acc = acc + part * xs_b * s1_b
+        return acc
+
+    def finish_one(j, slot, k: int, ak, expert_columns):
+        e = active_clamped(j)
+        coeff = jnp.where(
+            j < count,
+            jnp.sum(
+                jnp.where(expert_columns == e0 + e, r.wtab_ref[...], 0.0),
+                axis=1,
+                keepdims=True,
+            ),
+            0.0,
+        )
+        act = jax.nn.silu(ak[:, :i]) * ak[:, i:]
+        mid = jnp.where(coeff != 0, act * coeff, 0.0)
+        ms = jnp.max(jnp.abs(mid), axis=1, keepdims=True) / FP8_MAX
+        mq = (mid * jnp.where(ms == 0, 0.0, 1.0 / ms)).astype(FP8)
+        for n0 in range(0, h, n_chunk):
+            width = min(n_chunk, h - n0)
+            n1 = n0 + width
+            acc2 = jnp.zeros((m, width), jnp.float32)
+            for c in range(i // bk2):
+                wb2 = pltpu.bitcast(
+                    r.w2_ref[
+                        slot,
+                        k,
+                        pl.ds(c * rows2_u32, rows2_u32),
+                        pl.ds(n0, width),
+                    ],
+                    FP4,
+                ).astype(FP8)
+                part2 = jnp.matmul(
+                    mq[:, c * bk2 : (c + 1) * bk2],
+                    wb2,
+                    preferred_element_type=jnp.float32,
+                )
+                acc2 = acc2 + part2 * r.s2_ref[slot, k, c, :, n0:n1]
+            r.owner_ref[:, n0:n1] += acc2 * ms
+
+    def finish(q, slot, acc1, expert_columns):
+        for k in range(g):
+            finish_one(
+                q * g + k,
+                slot,
+                k,
+                acc1[:, k * two_i : (k + 1) * two_i],
+                expert_columns,
+            )
+
+    return _Ring(items, nb, transfers, quantize_x, gate_up, finish)
+
+
+@dataclasses.dataclass(frozen=True)
+class Fp8Format:
+    """Per-channel FP8 routed weights (_fp8_ring): n_chunks ring items of
+    _I_CHUNK columns per expert."""
+
+    n_chunks: int
+
+    def ring(self, refs: _RingRefs, count, e0, *, fast: bool) -> _Ring:
+        return _fp8_ring(refs, count, e0, fast=fast, n_chunks=self.n_chunks)
+
+
+@dataclasses.dataclass(frozen=True)
+class Nvfp4Format:
+    """FP4-block512 routed weights (_nvfp4_ring): `group` experts per ring slot,
+    w2 K-blocks of bk2 rows, w2 output chunks of w2_n_chunk columns."""
+
+    group: int
+    bk2: int
+    w2_n_chunk: int
+
+    def ring(self, refs: _RingRefs, count, e0, *, fast: bool) -> _Ring:
+        return _nvfp4_ring(
+            refs,
+            count,
+            e0,
+            fast=fast,
+            group=self.group,
+            bk2=self.bk2,
+            w2_n_chunk=self.w2_n_chunk,
+        )
 
 
 def _kernel(
@@ -452,18 +876,16 @@ def _kernel(
     hit_sem,
     *ar_scr,
     local_experts,
-    n_chunks,
     topk,
     routed_scale,
     ar_spec,
     fast=False,
+    weight_format: Fp8Format | Nvfp4Format,
 ):
+    """The layer on one rank (module docstring); weight_format builds the
+    routed-expert ring."""
     all_reduce.prologue(ar_spec)
     m, h = x_ref.shape
-    i = w2_hbm.shape[1]  # this rank's I
-    ic = w2_ref.shape[1]  # columns per ring item; i == ic * n_chunks
-    nc = n_chunks
-    nb = _NUM_BUFFERS
     n_valid = meta_ref[0]
     rank = meta_ref[1]
     # First global expert this rank holds (0 under plain TP).
@@ -518,53 +940,6 @@ def _kernel(
         store_hits()
         copy_hits()
 
-    def active(j):
-        """Local id of the j-th active expert."""
-        return hits_s_ref[2, j] if fast else active_ids_ref[j]
-
-    def transfers(step):
-        if nc > 1:
-            return chunk_transfers(step)
-        # Active expert `step`'s weights and scales into ring slot step % nb.
-        e, slot = active(step), step % nb
-        return [
-            pltpu.make_async_copy(w1_hbm.at[e], w1_ref.at[slot], ring_sem.at[slot, 0]),
-            pltpu.make_async_copy(w2_hbm.at[e], w2_ref.at[slot], ring_sem.at[slot, 1]),
-            pltpu.make_async_copy(
-                s1_hbm.at[e, 0], s1_ref.at[slot], ring_sem.at[slot, 2]
-            ),
-            pltpu.make_async_copy(
-                s2_hbm.at[e, 0], s2_ref.at[slot], ring_sem.at[slot, 3]
-            ),
-        ]
-
-    def chunk_transfers(step):
-        # Ring item `step` is chunk step % nc of active expert step // nc:
-        # w13's gate and up column chunks side by side, the matching w2 rows,
-        # their scales, and the expert's w2 scale.
-        e = active(lax.div(step, nc))
-        c0 = pl.multiple_of(lax.rem(step, nc) * ic, ic)
-        slot = step % nb
-        sem = ring_sem.at[slot]
-        lo, hi = pl.ds(0, ic), pl.ds(ic, ic)
-        gate, up = pl.ds(c0, ic), pl.ds(i + c0, ic)
-        return [
-            pltpu.make_async_copy(
-                w1_hbm.at[e, :, gate], w1_ref.at[slot, :, lo], sem.at[0]
-            ),
-            pltpu.make_async_copy(
-                w1_hbm.at[e, :, up], w1_ref.at[slot, :, hi], sem.at[1]
-            ),
-            pltpu.make_async_copy(w2_hbm.at[e, gate], w2_ref.at[slot], sem.at[2]),
-            pltpu.make_async_copy(
-                s1_hbm.at[e, 0, :, gate], s1_ref.at[slot, :, lo], sem.at[3]
-            ),
-            pltpu.make_async_copy(
-                s1_hbm.at[e, 0, :, up], s1_ref.at[slot, :, hi], sem.at[4]
-            ),
-            pltpu.make_async_copy(s2_hbm.at[e, 0], s2_ref.at[slot], sem.at[5]),
-        ]
-
     def compact(e, count):
         # Appends expert e to active_ids_ref if any row picked it. The store
         # is unconditional, so the loop body has no branch: count <= e, a
@@ -579,8 +954,26 @@ def _kernel(
         count = hits_s_ref[3, 0]
     else:
         count = lax.fori_loop(0, local_experts, compact, jnp.int32(0))
-    # Ring items, nc per active expert.
-    items = count * nc
+
+    refs = _RingRefs(
+        w1_hbm,
+        w2_hbm,
+        s1_hbm,
+        s2_hbm,
+        w1_ref,
+        w2_ref,
+        s1_ref,
+        s2_ref,
+        ring_sem,
+        xq_ref,
+        xs_ref,
+        owner_ref,
+        wtab_ref,
+        hits_s_ref,
+        active_ids_ref,
+    )
+    ring = weight_format.ring(refs, count, e0, fast=fast)
+    items, nb, transfers = ring.items, ring.nb, ring.transfers
 
     if fast:
         # One loop starts the first nb ring items, with no DMA under a
@@ -612,60 +1005,16 @@ def _kernel(
 
     # Zeroing and x quantization follow the compaction, so the first weight
     # copies are already in flight while they run. x is quantized twice on
-    # purpose, each copy as its matmuls quantize it with this kernel off: per
-    # row for the shared expert (xla_quantized_matmul), per _Q_BLOCK columns
-    # for the routed experts (gmm_v2).
+    # purpose: per row for the shared expert (xla_quantized_matmul, as with
+    # this kernel off), per _Q_BLOCK columns for the routed experts (the
+    # ring's quantize_x).
     owner_ref[...] = jnp.zeros((m, h), jnp.float32)
     sxq, sxs = quantize_block(x_ref[...], axis=1, target_dtype=FP8)
     sxq_ref[...] = sxq
     _shared_expert(sxq_ref, sxs, sw13_ref, ss13_ref, sw2_ref, ss2_ref, shared_ref)
-    _quantize_blocks(x_ref[...], xq_ref, xs_ref)
+    ring.quantize_x(x_ref[...])
 
     expert_columns = lax.broadcasted_iota(jnp.int32, wtab_ref.shape, 1)
-    lanes = xs_ref.shape[-1]
-
-    def gate_up(slot):
-        # gmm_v2's quantized matmul: one partial product per _Q_BLOCK rows of
-        # w1, rounded to bf16, times its x block's scales and then the weight
-        # scales in bf16, summed in bf16 (moe_dense_expert's pattern).
-        w_scale = s1_ref[slot].astype(jnp.bfloat16)
-        acc = jnp.zeros((m, 2 * ic), jnp.bfloat16)
-        for k in range(0, h, _Q_BLOCK):
-            part = jnp.matmul(
-                xq_ref[:, k : k + _Q_BLOCK],
-                w1_ref[slot, k : k + _Q_BLOCK, :],
-                preferred_element_type=jnp.float32,
-            ).astype(jnp.bfloat16)
-            part *= jnp.concatenate([xs_ref[k // _Q_BLOCK]] * (2 * ic // lanes), axis=1)
-            part *= w_scale
-            acc += part
-        return acc
-
-    def finish(step, slot, acc1):
-        e = active(lax.div(step, nc)) if nc > 1 else active(step)
-        # Each row's routing weight for expert e (global column e0 + e of the
-        # routing table, 0 for rows that did not pick it).
-        coeff = jnp.sum(
-            jnp.where(expert_columns == e0 + e, wtab_ref[...], 0.0),
-            axis=1,
-            keepdims=True,
-        )
-        # gmm_v2's fused SiLU, on the bf16 gate_up result.
-        act = jax.nn.silu(acc1[:, :ic]) * acc1[:, ic:]
-        # Mask, not multiply: a padded row with non-finite hidden would give
-        # NaN * 0 = NaN. Rows this expert does not own contribute exactly 0.
-        mid = jnp.where(coeff != 0, act.astype(jnp.float32) * coeff, 0.0)
-        ms = jnp.max(jnp.abs(mid), axis=1, keepdims=True) / FP8_MAX
-        mq = (mid * jnp.where(ms == 0, 0.0, 1.0 / ms)).astype(FP8)
-        for n in range(0, h, _N_CHUNK):
-            acc2 = jnp.matmul(
-                mq,
-                w2_ref[slot, :, n : n + _N_CHUNK],
-                preferred_element_type=jnp.float32,
-            )
-            owner_ref[:, n : n + _N_CHUNK] += (
-                acc2 * s2_ref[slot, :, n : n + _N_CHUNK] * ms
-            )
 
     def ring_step(step, acc1, refill):
         """Wait for item step + 1, issue its gate_up, finish item step, and
@@ -673,61 +1022,64 @@ def _kernel(
         nxt = step + 1
         for copy in transfers(nxt):
             copy.wait()
-        acc1_next = gate_up(nxt % nb)
-        finish(step, step % nb, acc1)
+        acc1_next = ring.gate_up(nxt % nb)
+        ring.finish(step, step % nb, acc1, expert_columns)
         if refill:
             for copy in transfers(step + nb):
                 copy.start()
         return acc1_next
 
-    # Only one schedule is traced: the other function is defined, not called.
-    @(pl.when(items > 0) if fast else _unused)
-    def run_experts_fast():
-        for copy in transfers(jnp.int32(0)):
-            copy.wait()
-        # Steps [0, items - nb) refill; the rest only drain; the last item is
-        # finished outside the loops (no gate_up past it).
-        n_refill = jnp.maximum(items - nb, 0)
-        acc1 = lax.fori_loop(
-            0, n_refill, lambda s, a: ring_step(s, a, True), gate_up(0)
-        )
-        acc1 = lax.fori_loop(
-            n_refill, items - 1, lambda s, a: ring_step(s, a, False), acc1
-        )
-        finish(items - 1, (items - 1) % nb, acc1)
+    if fast:
 
-    @(_unused if fast else pl.when(items > 0))
-    def run_experts():
-        # The prime loop after the compaction started the first nb experts'
-        # copies.
-        for copy in transfers(jnp.int32(0)):
-            copy.wait()
+        @pl.when(items > 0)
+        def run_experts_fast():
+            for copy in transfers(jnp.int32(0)):
+                copy.wait()
+            # Steps [0, items - nb) refill; the rest only drain; the last item
+            # is finished outside the loops (no gate_up past it).
+            n_refill = jnp.maximum(items - nb, 0)
+            acc1 = lax.fori_loop(
+                0, n_refill, lambda s, a: ring_step(s, a, True), ring.gate_up(0)
+            )
+            acc1 = lax.fori_loop(
+                n_refill, items - 1, lambda s, a: ring_step(s, a, False), acc1
+            )
+            ring.finish(items - 1, (items - 1) % nb, acc1, expert_columns)
 
-        def expert_body(step, acc1):
-            nxt = step + 1
+    else:
 
-            @pl.when(nxt < items)
-            def wait_next():
-                for copy in transfers(nxt):
-                    copy.wait()
+        @pl.when(items > 0)
+        def run_experts():
+            # The prime loop after the compaction started the first nb items'
+            # copies.
+            for copy in transfers(jnp.int32(0)):
+                copy.wait()
 
-            # Issued before this expert's elementwise chain so the MXU and VPU
-            # overlap. On the last step it reads a stale slot; the result is
-            # dropped.
-            acc1_next = gate_up(nxt % nb)
-            finish(step, step % nb, acc1)
+            def item_body(step, acc1):
+                nxt = step + 1
 
-            # This expert's slot is free once its second matmul has read it.
-            @pl.when(step + nb < items)
-            def refill():
-                for copy in transfers(step + nb):
-                    copy.start()
+                @pl.when(nxt < items)
+                def wait_next():
+                    for copy in transfers(nxt):
+                        copy.wait()
 
-            return acc1_next
+                # Issued before this item's elementwise chain so the MXU and
+                # VPU overlap. On the last step it reads a stale slot; the
+                # result is dropped.
+                acc1_next = ring.gate_up(nxt % nb)
+                ring.finish(step, step % nb, acc1, expert_columns)
 
-        lax.fori_loop(0, items, expert_body, gate_up(0))
+                # This item's slot is free once its second matmul has read it.
+                @pl.when(step + nb < items)
+                def refill():
+                    for copy in transfers(step + nb):
+                        copy.start()
 
-    # Outside pl.when(count > 0): every rank must take part in the exchange
+                return acc1_next
+
+            lax.fori_loop(0, items, item_body, ring.gate_up(0))
+
+    # Outside pl.when(items > 0): every rank must take part in the exchange
     # (its peers wait for its chunks), consume the barrier signals sent at
     # entry and write out_ref.
     all_reduce.epilogue(
@@ -737,6 +1089,117 @@ def _kernel(
         _combine(owner_ref[...], shared_ref[...], routed_scale),
         out_ref,
         ar_scr,
+    )
+
+
+def _call(
+    x,
+    scores,
+    bias,
+    n_valid,
+    rank,
+    experts_start,
+    routed_weights,
+    shared_w13,
+    shared_s13,
+    shared_w2,
+    shared_s2,
+    *,
+    info,
+    ar_spec,
+    limit: int,
+    name: str,
+    split: bool,
+    fast: bool,
+    hbm_operands: bool,
+    ring_scratch: tuple,
+    xs_dtype,
+    active_len: int,
+    ring_sems: tuple[int, int],
+    kernel_kwargs: dict,
+):
+    """The pallas_call of _kernel, for either weight format: the caller passes
+    the four routed weight and scale operands, its ring's scratch (ring_scratch,
+    xs_dtype, active_len, ring_sems) and its _kernel statics."""
+    m, h = x.shape
+    num_experts = scores.shape[1]
+    shared_inter = shared_w2.shape[0]
+    # Lane-dense routing table. Padded experts never win: their biased score
+    # is -inf, clamped to ROUTER_NEG, and every real column has a lower index.
+    e_pad = pl.cdiv(num_experts, info.num_lanes) * info.num_lanes
+    scores = scores.astype(jnp.float32)
+    bias = bias.astype(jnp.float32)
+    if e_pad != num_experts:
+        scores = jnp.pad(scores, ((0, 0), (0, e_pad - num_experts)))
+        bias = jnp.pad(bias, (0, e_pad - num_experts), constant_values=-jnp.inf)
+    if split:
+        # Three [1] scalar operands, as small_all_reduce_valid_rows passes
+        # n_valid and rank, instead of one stacked int32[3] that XLA
+        # materializes with its own fusion per call.
+        metas = tuple(
+            jnp.asarray(v, jnp.int32).reshape(1) for v in (n_valid, rank, experts_start)
+        )
+    else:
+        metas = (
+            jnp.stack(
+                [
+                    jnp.asarray(n_valid, jnp.int32).reshape(()),
+                    jnp.asarray(rank, jnp.int32).reshape(()),
+                    jnp.asarray(experts_start, jnp.int32).reshape(()),
+                ]
+            ),
+        )
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    weights = (
+        *routed_weights,
+        shared_w13,
+        shared_s13.reshape(1, 2 * shared_inter),
+        shared_w2,
+        shared_s2.reshape(1, h),
+    )
+    if hbm_operands:
+        weights = tuple(
+            pltpu.with_memory_space_constraint(w, pltpu.HBM) for w in weights
+        )
+    return pl.pallas_call(
+        functools.partial(_split_entry if split else _kernel, **kernel_kwargs),
+        out_shape=jax.ShapeDtypeStruct((m, h), x.dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=len(metas),
+            in_specs=[vmem, vmem, vmem, *[hbm] * 8],
+            out_specs=vmem,
+            scratch_shapes=[
+                *ring_scratch,
+                pltpu.VMEM((h, 2 * shared_inter), FP8),
+                pltpu.VMEM((1, 2 * shared_inter), jnp.float32),
+                pltpu.VMEM((shared_inter, h), FP8),
+                pltpu.VMEM((1, h), jnp.float32),
+                pltpu.VMEM((m, h), FP8),
+                pltpu.VMEM((m, h), FP8),
+                pltpu.VMEM((h // _Q_BLOCK, m, info.num_lanes), xs_dtype),
+                pltpu.VMEM((m, h), jnp.float32),
+                pltpu.VMEM((m, h), jnp.float32),
+                pltpu.VMEM((m, e_pad), jnp.float32),
+                pltpu.VMEM((4 if fast else 1, e_pad), jnp.int32),
+                pltpu.SMEM((4 if fast else 1, e_pad), jnp.int32),
+                pltpu.SMEM((active_len,), jnp.int32),
+                pltpu.SemaphoreType.DMA(ring_sems),
+                pltpu.SemaphoreType.DMA((4,)),
+                pltpu.SemaphoreType.DMA((1,)),
+                *all_reduce.scratch_shapes(ar_spec),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=limit, collective_id=all_reduce.COLLECTIVE_ID
+        ),
+        name=name,
+    )(
+        *metas,
+        x,
+        scores,
+        bias.reshape(1, e_pad),
+        *weights,
     )
 
 
@@ -833,90 +1296,21 @@ def moe_tp_decode(
         raise ValueError("moe_tp_decode does not fit VMEM; check can_use_moe_tp_decode")
     _, limit = plan
     nb = _NUM_BUFFERS
-    # Lane-dense routing table. Padded experts never win: their biased score
-    # is -inf, clamped to ROUTER_NEG, and every real column has a lower index.
-    e_pad = pl.cdiv(num_experts, info.num_lanes) * info.num_lanes
-    scores = scores.astype(jnp.float32)
-    bias = bias.astype(jnp.float32)
-    if e_pad != num_experts:
-        scores = jnp.pad(scores, ((0, 0), (0, e_pad - num_experts)))
-        bias = jnp.pad(bias, (0, e_pad - num_experts), constant_values=-jnp.inf)
-    split = _split_meta()
-    if split:
-        # UPDATE (TPU_MOE_TP_DECODE_SPLIT_META): three [1] scalar operands, as
-        # small_all_reduce_valid_rows passes n_valid and rank, instead of one
-        # stacked int32[3] that XLA materializes with its own fusion per call.
-        metas = tuple(
-            jnp.asarray(v, jnp.int32).reshape(1) for v in (n_valid, rank, experts_start)
-        )
-    else:
-        metas = (
-            jnp.stack(
-                [
-                    jnp.asarray(n_valid, jnp.int32).reshape(()),
-                    jnp.asarray(rank, jnp.int32).reshape(()),
-                    jnp.asarray(experts_start, jnp.int32).reshape(()),
-                ]
-            ),
-        )
-    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
-    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    weights = (
-        w13,
-        w2,
-        s13,
-        s2,
+    return _call(
+        x,
+        scores,
+        bias,
+        n_valid,
+        rank,
+        experts_start,
+        (w13, w2, s13, s2),
         shared_w13,
-        shared_s13.reshape(1, 2 * shared_inter),
+        shared_s13,
         shared_w2,
-        shared_s2.reshape(1, h),
-    )
-    if hbm_operands:
-        weights = tuple(
-            pltpu.with_memory_space_constraint(w, pltpu.HBM) for w in weights
-        )
-    return pl.pallas_call(
-        functools.partial(
-            _split_entry if split else _kernel,
-            local_experts=experts,
-            n_chunks=i // ic,
-            topk=topk,
-            routed_scale=float(routed_scale),
-            ar_spec=ar_spec,
-            fast=fast,
-        ),
-        out_shape=jax.ShapeDtypeStruct((m, h), x.dtype),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=len(metas),
-            in_specs=[vmem, vmem, vmem, *[hbm] * 8],
-            out_specs=vmem,
-            scratch_shapes=[
-                pltpu.VMEM((nb, h, 2 * ic), FP8),
-                pltpu.VMEM((nb, ic, h), FP8),
-                pltpu.VMEM((nb, 1, 2 * ic), jnp.float32),
-                pltpu.VMEM((nb, 1, h), jnp.float32),
-                pltpu.VMEM((h, 2 * shared_inter), FP8),
-                pltpu.VMEM((1, 2 * shared_inter), jnp.float32),
-                pltpu.VMEM((shared_inter, h), FP8),
-                pltpu.VMEM((1, h), jnp.float32),
-                pltpu.VMEM((m, h), FP8),
-                pltpu.VMEM((m, h), FP8),
-                pltpu.VMEM((h // _Q_BLOCK, m, info.num_lanes), jnp.bfloat16),
-                pltpu.VMEM((m, h), jnp.float32),
-                pltpu.VMEM((m, h), jnp.float32),
-                pltpu.VMEM((m, e_pad), jnp.float32),
-                pltpu.VMEM((4 if fast else 1, e_pad), jnp.int32),
-                pltpu.SMEM((4 if fast else 1, e_pad), jnp.int32),
-                pltpu.SMEM((experts,), jnp.int32),
-                pltpu.SemaphoreType.DMA((nb, 4 if i == ic else 6)),
-                pltpu.SemaphoreType.DMA((4,)),
-                pltpu.SemaphoreType.DMA((1,)),
-                *all_reduce.scratch_shapes(ar_spec),
-            ],
-        ),
-        compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=limit, collective_id=all_reduce.COLLECTIVE_ID
-        ),
+        shared_s2,
+        info=info,
+        ar_spec=ar_spec,
+        limit=limit,
         name=kernel_name(
             experts,
             m,
@@ -929,10 +1323,26 @@ def moe_tp_decode(
             ar_spec.pair_rows,
             ar_spec.piece_rows,
         ),
-    )(
-        *metas,
-        x,
-        scores,
-        bias.reshape(1, e_pad),
-        *weights,
+        # UPDATE (TPU_MOE_TP_DECODE_SPLIT_META): n_valid, rank and e0 as three
+        # [1] scalar operands instead of one stacked int32[3].
+        split=_split_meta(),
+        fast=fast,
+        hbm_operands=hbm_operands,
+        ring_scratch=(
+            pltpu.VMEM((nb, h, 2 * ic), FP8),
+            pltpu.VMEM((nb, ic, h), FP8),
+            pltpu.VMEM((nb, 1, 2 * ic), jnp.float32),
+            pltpu.VMEM((nb, 1, h), jnp.float32),
+        ),
+        xs_dtype=jnp.bfloat16,
+        active_len=experts,
+        ring_sems=(nb, 4 if i == ic else 6),
+        kernel_kwargs=dict(
+            local_experts=experts,
+            topk=topk,
+            routed_scale=float(routed_scale),
+            ar_spec=ar_spec,
+            fast=fast,
+            weight_format=Fp8Format(n_chunks=i // ic),
+        ),
     )

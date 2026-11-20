@@ -36,12 +36,9 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.kernels.experimental import moe_tp_decode_nvfp4 as kernel
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
-from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel as fp8_kernel_impl
-from vllm_torchtpu.kernels.experimental.moe_tp_decode_nvfp4 import (
-    kernel as nvfp4_kernel_impl,
-)
+from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel as kernel_impl
+from vllm_torchtpu.kernels.experimental.moe_tp_decode import nvfp4 as kernel
 from vllm_torchtpu.kernels.quantized_matmul.util import quantize_block
 
 FP4 = jnp.float4_e2m1fn
@@ -256,7 +253,7 @@ def _compiled_oracles(mesh: Mesh, h: int, e: int, i: int, fs: int, topk: int, ep
             F32
         )
         x_clean = jnp.where(valid_row != 0, x.astype(F32), 0.0)
-        wtab = fp8_kernel_impl._route(scores, bias, n_valid, topk=topk)
+        wtab = kernel_impl._route(scores, bias, n_valid, topk=topk)
         expert_cols = lax.broadcasted_iota(jnp.int32, wtab.shape, 1)
 
         sw13_f = sw13.astype(F32) * ss13[None, :]
@@ -290,7 +287,7 @@ def _compiled_oracles(mesh: Mesh, h: int, e: int, i: int, fs: int, topk: int, ep
         bk2 = i // b2
         n_valid = nv[0]
         e_start = e0.reshape(())
-        wtab = fp8_kernel_impl._route(scores, bias, n_valid, topk=topk)
+        wtab = kernel_impl._route(scores, bias, n_valid, topk=topk)
         expert_cols = lax.broadcasted_iota(jnp.int32, wtab.shape, 1)
 
         # Shared expert (exact match to _shared_expert: FP8 x FP8 -> F32 dot).
@@ -336,7 +333,7 @@ def _compiled_oracles(mesh: Mesh, h: int, e: int, i: int, fs: int, topk: int, ep
             return acc + y * ms
 
         routed = lax.fori_loop(0, el, expert_step, jnp.zeros((rows, h), F32))
-        partial = fp8_kernel_impl._combine(routed, shared, ROUTED_SCALE)
+        partial = kernel_impl._combine(routed, shared, ROUTED_SCALE)
         gathered = lax.all_gather(partial, "d", axis=0, tiled=False)
         acc = jnp.zeros((rows, h), F32)
         for r in range(N_RANKS):
@@ -355,7 +352,7 @@ def _compiled_oracles(mesh: Mesh, h: int, e: int, i: int, fs: int, topk: int, ep
         bk2 = i // b2
         n_valid = nv[0]
         e_start = e0.reshape(())
-        wtab = fp8_kernel_impl._route(scores, bias, n_valid, topk=topk)
+        wtab = kernel_impl._route(scores, bias, n_valid, topk=topk)
         expert_cols = lax.broadcasted_iota(jnp.int32, wtab.shape, 1)
 
         sxs_b = jnp.max(jnp.abs(x), axis=1, keepdims=True) / jnp.asarray(FP8_MAX, BF16)
@@ -418,7 +415,7 @@ def _compiled_oracles(mesh: Mesh, h: int, e: int, i: int, fs: int, topk: int, ep
             return acc + y * (ms * coeff)
 
         routed = lax.fori_loop(0, el, expert_step, jnp.zeros((rows, h), F32))
-        partial = fp8_kernel_impl._combine(routed, shared, ROUTED_SCALE)
+        partial = kernel_impl._combine(routed, shared, ROUTED_SCALE)
         gathered = lax.all_gather(partial, "d", axis=0, tiled=False)
         acc = jnp.zeros((rows, h), F32)
         for r in range(N_RANKS):
@@ -612,7 +609,7 @@ def test_default_vmem_headroom_and_kernel_name(monkeypatch):
 
     # VMEM plan & admission across EP2xTP4 (g=1, nb=4) and TP8 (g=2, nb=4) at
     # m=16,32,64 with >11 MiB headroom below the 56 MiB cap.
-    cap_bytes = int(info.vmem_capacity_bytes * nvfp4_kernel_impl.VMEM_FRACTION)
+    cap_bytes = int(info.vmem_capacity_bytes * kernel.VMEM_FRACTION)
     for cfg, exp_g in ((GLM52_EP2TP4, 1), (GLM52_TP8, 2)):
         g_def = kernel.group_size(cfg["i"], cfg["e"] // cfg["ep"])
         assert g_def == exp_g
@@ -621,7 +618,7 @@ def test_default_vmem_headroom_and_kernel_name(monkeypatch):
         for rows in kernel.ROW_BUCKETS:
             shps = _shapes(rows, cfg)
             spec = all_reduce.make_spec(N_RANKS, rows, cfg["h"])
-            plan_def = nvfp4_kernel_impl._vmem_plan(
+            plan_def = kernel._vmem_plan(
                 rows,
                 cfg["h"],
                 cfg["i"],
@@ -848,7 +845,7 @@ def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
 
     m, h, fs, topk = 16, 1024, 128, 4
     b13, b2 = h // Q_BLOCK, 1
-    nb = nvfp4_kernel_impl._NUM_BUFFERS
+    nb = kernel._NUM_BUFFERS
     for cfg_i, el, counts in (
         (512, 8, (-1, 0, 1, 3, 5, 7)),
         (256, 16, (-1, 0, 1, 3, 5, 11, 13)),
@@ -925,14 +922,15 @@ def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
             bias_pad = np.pad(bias, (0, e_pad - _e), constant_values=-np.inf).reshape(
                 1, e_pad
             )
-            w1_scr = np.zeros((nb, h // 8, g * 2 * _i), np.uint32)
-            s1_scr = np.zeros((nb, b13, 1, g * 2 * _i), np.float32)
+            # Ring slots start as garbage: a stale-slot read must not reach out.
+            w1_scr = np.full((nb, h // 8, g * 2 * _i), 0xFFFFFFFF, np.uint32)
+            s1_scr = np.full((nb, b13, 1, g * 2 * _i), np.nan, np.float32)
             out = np.array(jnp.full((m, h), -1.0, dtype=BF16), copy=True)
             ring_sem = _FakeSem((nb, 4 * g))
             shared_sem = _FakeSem((4,))
             hit_sem = _FakeSem((1,))
 
-            nvfp4_kernel_impl._kernel(
+            kernel_impl._kernel(
                 _FakeRef(np.array([nv, 0, 0], np.int32)),
                 _FakeRef(_x),
                 _FakeRef(scores_pad),
@@ -947,9 +945,9 @@ def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
                 _FakeRef(_ss2),
                 _FakeRef(out),
                 _FakeRef(w1_scr),
-                _FakeRef(np.zeros((nb, g, _i // 8, h), np.uint32)),
+                _FakeRef(np.full((nb, g, _i // 8, h), 0xFFFFFFFF, np.uint32)),
                 _FakeRef(s1_scr),
-                _FakeRef(np.zeros((nb, g, b2, 1, h), np.float32)),
+                _FakeRef(np.full((nb, g, b2, 1, h), np.nan, np.float32)),
                 _FakeRef(np.array(jnp.zeros((h, 2 * fs), FP8), copy=True)),
                 _FakeRef(np.zeros((1, 2 * fs), np.float32)),
                 _FakeRef(np.array(jnp.zeros((fs, h), FP8), copy=True)),
@@ -962,18 +960,18 @@ def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
                 _FakeRef(np.zeros((m, e_pad), np.float32)),
                 _FakeRef(np.zeros((4 if fast else 1, e_pad), np.int32)),
                 _FakeRef(np.zeros((4 if fast else 1, e_pad), np.int32)),
-                _FakeRef(np.zeros((max(1, ((_el + g - 1) // g) * g),), np.int32)),
+                _FakeRef(np.full((max(1, ((_el + g - 1) // g) * g),), 10**6, np.int32)),
                 ring_sem,
                 shared_sem,
                 hit_sem,
                 local_experts=_el,
-                group=g,
-                bk2=_i // b2,
                 topk=topk,
                 routed_scale=ROUTED_SCALE,
                 ar_spec=_spec,
                 fast=fast,
-                w2_n_chunk=w2_n_chunk,
+                weight_format=kernel_impl.Nvfp4Format(
+                    group=g, bk2=_i // b2, w2_n_chunk=w2_n_chunk
+                ),
             )
             for sem in (ring_sem, shared_sem, hit_sem):
                 for key, queue in sem.pending.items():
@@ -1225,9 +1223,9 @@ def test_cpu_served_per_expert_shapes_stage_audit_and_oracle_spread(cfg: dict):
 
     # Stage 0: _route_fast vs _route
     wtab_slow = jnp.where(
-        valid, fp8_kernel_impl._route(scores, bias, n_valid, topk=topk), 0.0
+        valid, kernel_impl._route(scores, bias, n_valid, topk=topk), 0.0
     )
-    wtab_fast, flag_fast = fp8_kernel_impl._route_fast(scores, bias, n_valid, topk=topk)
+    wtab_fast, flag_fast = kernel_impl._route_fast(scores, bias, n_valid, topk=topk)
     wtab_fast = jnp.where(valid, wtab_fast, 0.0)
     assert float(flag_fast.reshape(())) == 0.0
     assert np.array_equal(np.asarray(wtab_fast), np.asarray(wtab_slow))
@@ -1287,7 +1285,7 @@ def test_cpu_served_per_expert_shapes_stage_audit_and_oracle_spread(cfg: dict):
 
     xq_buf = np.zeros((rows, h), dtype=FP8)
     xs_buf = np.zeros((b13, rows, 1), dtype=np.float32)
-    kernel.kernel._quantize_blocks_f32(x_m, xq_buf, xs_buf)
+    kernel_impl._quantize_blocks_f32(x_m, xq_buf, xs_buf)
     assert np.array_equal(
         xq_buf.reshape(rows, b13, Q_BLOCK).view(np.uint8),
         np.asarray(xq_a).view(np.uint8),
@@ -1321,7 +1319,7 @@ def test_cpu_served_per_expert_shapes_stage_audit_and_oracle_spread(cfg: dict):
             routed_a = routed_a + (part2 * ms) * s2_e[cb : cb + 1, :]
     exp_out = jnp.where(
         valid,
-        fp8_kernel_impl._combine(routed_a, shared_a, ROUTED_SCALE),
+        kernel_impl._combine(routed_a, shared_a, ROUTED_SCALE),
         jnp.zeros((rows, h), BF16),
     )
 
@@ -1366,7 +1364,7 @@ def test_cpu_served_per_expert_shapes_stage_audit_and_oracle_spread(cfg: dict):
                         )
         got_nc = jnp.where(
             valid,
-            fp8_kernel_impl._combine(owner_k, shared_a, ROUTED_SCALE),
+            kernel_impl._combine(owner_k, shared_a, ROUTED_SCALE),
             jnp.zeros((rows, h), BF16),
         )
         assert np.array_equal(
@@ -1431,7 +1429,7 @@ def test_cpu_served_per_expert_shapes_stage_audit_and_oracle_spread(cfg: dict):
         routed_b = routed_b + y_b * (ms_b * c)
     exp_alt_out = jnp.where(
         valid,
-        fp8_kernel_impl._combine(routed_b, shared_b, ROUTED_SCALE),
+        kernel_impl._combine(routed_b, shared_b, ROUTED_SCALE),
         jnp.zeros((rows, h), BF16),
     )
 
