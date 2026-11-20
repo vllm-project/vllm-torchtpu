@@ -1596,8 +1596,6 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
     vmem_init_mib = min(round(sweep.vmem_budget_mib, 1), vmem_max_mib)
     wb_css = render_workbench_css()
     wb_body = render_workbench_body(
-        model_name=sweep.model,
-        chip_name=sweep.chip,
         layout_label=rec.label(),
         mode_source=mode_src,
         vmem_bounds_mib=(vmem_init_mib, vmem_max_mib),

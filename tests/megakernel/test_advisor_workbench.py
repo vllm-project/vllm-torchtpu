@@ -453,9 +453,6 @@ def test_phase_map_long_context_oom_hatch_and_conserved_trace_idle(
     assert "262144, 1048576" in html_text
     assert 'id="wb-oom-hatch"' in html_text
     assert "OOM &gt; 80% HBM" in html_text
-    assert "tVal * epDp >= rFloor" in html_text
-    assert "tVal >= 32" not in html_text
-    assert "idle / (2.0 * numLayers)" in html_text
     assert "us_per_sublayer_boundary" in html_text
 
     # 4 steps x 400 non-overlapping 2.0 us ops -> 200 us idle;
@@ -1821,3 +1818,124 @@ def test_workbench_renders_support_tier_and_unmodeled_notes() -> None:
     )
     assert f'id="wb-support-tier" title="{expected_mistral_title}"' in mistral_html
     assert 'id="wb-unmodeled-notes"' not in mistral_html
+
+
+def test_workbench_auto_regime_upper_band_matches_python(tmp_path: Path) -> None:
+    """Verify auto dispatch upper band matches Python on initial load and reset."""
+    sweep_report = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    regime0_scopes = sweep_report.regimes[0].scopes
+    py_whole_step = next(s for s in regime0_scopes if s["scope"] == "whole_step")
+    expected_upper_us = float(str(py_whole_step["step_upper_us"]))
+    snaps = _run_workbench_ui_runner(
+        tmp_path,
+        sweep_report,
+        [
+            {"op": "dispatch_regime", "regime": "compiled_xla", "tag": "compiled"},
+            {"op": "reset_sliders", "tag": "reset"},
+        ],
+    )
+    by_tag = {str(snap["tag"]): snap for snap in snaps}
+    # 0.01 us 2-decimal display quantum + 0.005 us float-rounding slack.
+    upper_tol_us = 0.015
+    initial_upper_us = float(str(by_tag["initial"]["winnerStepUpperUs"]))
+    compiled_upper_us = float(str(by_tag["compiled"]["winnerStepUpperUs"]))
+    reset_upper_us = float(str(by_tag["reset"]["winnerStepUpperUs"]))
+    assert initial_upper_us == pytest.approx(expected_upper_us, abs=upper_tol_us)
+    assert compiled_upper_us < initial_upper_us
+    assert reset_upper_us == pytest.approx(expected_upper_us, abs=upper_tol_us)
+    # Regression check for report.py calibrate CLI hint.
+    html_doc = advisor.render_advisor_html(sweep_report)
+    assert (
+        "advisor calibrate --trace &lt;trace.xplane.pb&gt; --out measurements.json"
+        in html_doc
+    )
+
+
+@pytest.mark.parametrize("ops_per_step", [2, 4])
+def test_phase_trace_converter_accepts_two_op_explicit_step(
+    tmp_path: Path, ops_per_step: int
+) -> None:
+    """Verify JS phase trace converter normalizes explicit steps at >=2 ops."""
+    sweep_report = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    num_layers = 60
+    num_steps = 3
+    step_span_us = 1000.0
+    step_stride_us = 1200.0
+    op_dur_us = 235.0
+    op_stride_us = 255.0
+    events: list[dict[str, object]] = []
+    for step_idx in range(num_steps):
+        base_ts = float(step_idx) * step_stride_us
+        events.append(
+            {
+                "name": f"Step {step_idx}",
+                "cat": "step_marker",
+                "ph": "X",
+                "pid": 1,
+                "tid": 1,
+                "ts": base_ts,
+                "dur": step_span_us,
+            }
+        )
+        events.extend(
+            {
+                "name": f"fusion.{op_idx}",
+                "cat": "hlo_op",
+                "ph": "X",
+                "pid": 2,
+                "tid": 1,
+                "ts": base_ts + float(op_idx) * op_stride_us,
+                "dur": op_dur_us,
+            }
+            for op_idx in range(ops_per_step)
+        )
+    trace_doc: dict[str, object] = {"traceEvents": events}
+    trace_path = tmp_path / f"{ops_per_step}_op_step.json"
+    out_meas = tmp_path / f"{ops_per_step}_op_cal.json"
+    trace_path.write_text(json.dumps(trace_doc), encoding="utf-8")
+    py_cal = advisor.calibrate_trace(
+        trace_path,
+        out_meas,
+        options=advisor.CalibrateOptions(chip="tpu7x", num_layers=num_layers),
+    )
+    meas_res = cast(
+        "dict[str, object]",
+        _run_workbench_phase_runner(
+            tmp_path,
+            sweep_report,
+            {
+                "action": "trace_to_meas",
+                "raw": trace_doc,
+                "fileName": f"{ops_per_step}_op_step.json",
+            },
+        ),
+    )
+    js_meas = cast("dict[str, dict[str, object]]", meas_res["meas"])
+    assert js_meas["launch_gap_us"]["unit"] == "us_per_sublayer_boundary"
+    # 5e-5 us half-ULP at QUANTILE_DECIMALS=4 + 5e-5 us float slack.
+    gap_tol_us = 1e-4
+    assert float(str(js_meas["launch_gap_us"]["p50"])) == pytest.approx(
+        float(str(py_cal["launch_gap_us"]["p50"])), abs=gap_tol_us
+    )
+    # Negative control: a 1-op step below MIN_STEP_OPS_FOR_EXPLICIT_NORM=2
+    # must not normalize by 2 * num_layers.
+    if ops_per_step == constants.MIN_STEP_OPS_FOR_EXPLICIT_NORM:
+        one_op_events = [ev for ev in events if ev["name"] != "fusion.1"]
+        one_op_res = cast(
+            "dict[str, object]",
+            _run_workbench_phase_runner(
+                tmp_path,
+                sweep_report,
+                {
+                    "action": "trace_to_meas",
+                    "raw": {"traceEvents": one_op_events},
+                    "fileName": "one_op_step.json",
+                },
+            ),
+        )
+        one_op_meas = cast("dict[str, dict[str, object]]", one_op_res["meas"])
+        one_op_launch_gap = one_op_meas.get("launch_gap_us")
+        assert (
+            one_op_launch_gap is None
+            or one_op_launch_gap.get("unit") != "us_per_sublayer_boundary"
+        )
