@@ -21,6 +21,7 @@ import ctypes
 import os
 import threading
 import time
+from collections.abc import Callable
 from typing import Any, cast
 from urllib.parse import urlparse
 
@@ -208,7 +209,7 @@ class TPUWorker(WorkerBase):
         self._dummy_batch_cv = threading.Condition()
         self._dummy_batch_count = 0
         # The late-poll connector workers, listed on first use.
-        self._stage3_late_poller_list: list | None = None
+        self._stage3_late_poller_list: list[Callable[[], set[str]]] | None = None
 
         # Multi-host object-storage serve: ranks on hosts other than the API
         # server's receive a model_config.model rewritten to a local aux-file
@@ -801,7 +802,7 @@ class TPUWorker(WorkerBase):
                 return _LatePollModelRunnerOutput(output, pollers)
         return output
 
-    def _stage3_late_pollers(self) -> list:
+    def _stage3_late_pollers(self) -> list[Callable[[], set[str]]]:
         """Connector workers that report Stage-3 loads off the step.
 
         Only a Raiden connector whose kv_connector_extra_config turns on
@@ -810,7 +811,7 @@ class TPUWorker(WorkerBase):
         """
         if self._stage3_late_poller_list is not None:
             return self._stage3_late_poller_list
-        pollers = []
+        pollers: list[Callable[[], set[str]]] = []
         if has_kv_transfer_group():
             connector = get_kv_transfer_group()
             children = getattr(connector, "_connectors", None) or [connector]
