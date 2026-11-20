@@ -106,24 +106,83 @@ def score_rows(qr: jax.Array, ck: jax.Array) -> jax.Array:
     return (jnp.maximum(st, 0.0) * IDX_DIM**-0.5).reshape(T, IDX_HEADS, -1).sum(axis=1)
 
 
-def thresholds(bits: jax.Array, ids: jax.Array, nv: jax.Array, K: int, G: int):
+def thresholds(bits: jax.Array, ids: jax.Array, nv: jax.Array, K: int, G: int,
+               tie_skip: bool = False, early_exit: tuple = ()):
     """Per-row `(thr, tmax)` [R, 1, 1] for bit patterns `bits [R, S, 128]` (-1 =
-    invisible)."""
+    invisible).
+
+    `tie_skip` (VLLM_TPU_MK_QSA_THR_FAST): the id bisection runs only when some row's tie
+    at `thr` is truncated (`tmax` reads `t` only then). `early_exit = (bit, every)`: the
+    value passes from `bit` down run in a `while_loop` (`every` passes per trip) that stops
+    once every row over `K` has `cnt(bits >= lo) == K`: `{bits >= lo}` is then exactly the
+    top-K set, no tie is truncated (`tmax = G`), and the compaction's `b >= lo` selects the
+    same groups in the same order as `b >= thr` (a stopped `lo` may sit below the K-th
+    value; nothing lies in between). Both: same selection as the plain passes."""
     cnt = lambda m: jnp.sum(m.astype(I32), axis=(1, 2), keepdims=True)  # noqa: E731
     over = nv > K
     lo = jnp.zeros(nv.shape, I32)
-    for b in range(30, -1, -1):
-        cand = lo | (1 << b)
-        lo = jnp.where(cnt(bits >= cand) >= K, cand, lo)
+    if early_exit:
+        lo = _value_passes_early(bits, cnt, over, K, *early_exit)
+    else:
+        for b in range(30, -1, -1):
+            cand = lo | (1 << b)
+            lo = jnp.where(cnt(bits >= cand) >= K, cand, lo)
     thr = jnp.where(over, lo, 0)
     eq = bits == thr
     need = K - cnt(bits > thr)
-    t = jnp.zeros(nv.shape, I32)
-    for b in range(int(G - 1).bit_length() - 1, -1, -1):
-        cand = t | (1 << b)
-        t = jnp.where(cnt(eq & (ids < cand)) < need, cand, t)
-    tmax = jnp.where(over & (cnt(eq) > need), t, G)
-    return thr, tmax
+
+    def ties() -> jax.Array:
+        t = jnp.zeros(nv.shape, I32)
+        for b in range(int(G - 1).bit_length() - 1, -1, -1):
+            cand = t | (1 << b)
+            t = jnp.where(cnt(eq & (ids < cand)) < need, cand, t)
+        return t
+
+    if not (tie_skip or early_exit):
+        t = ties()
+        return thr, jnp.where(over & (cnt(eq) > need), t, G)
+    trunc = over & (cnt(eq) > need)
+    if tie_skip:
+        t = jax.lax.cond(
+            jnp.max(trunc.astype(I32)) > 0, ties, lambda: jnp.zeros(nv.shape, I32)
+        )
+    else:
+        t = ties()
+    return thr, jnp.where(trunc, t, G)
+
+
+def _exact_top(n_ge: jax.Array, K: int) -> jax.Array:
+    """Early-exit test of a row: its `{bits >= lo}` holds exactly `K` groups."""
+    return n_ge == K
+
+
+def _value_passes_early(bits, cnt, over, K: int, bit: int, every: int) -> jax.Array:
+    """The value bisection's `lo`: static passes above `bit`, then a `while_loop` of
+    `every` passes per trip from `bit` down that stops when no row over `K` is pending
+    (`thresholds`). A row that is done and keeps going only moves `lo` up toward its K-th
+    value (same top-K set), so the stop granularity does not change the selection."""
+    assert 0 <= bit <= 30 and every >= 1 and (bit + 1) % every == 0, (bit, every)
+    lo = jnp.zeros(over.shape, I32)
+    n_ge = jnp.full(over.shape, -1, I32)  # unknown count: never "done"
+    for b in range(30, bit, -1):
+        cand = lo | (1 << b)
+        n = cnt(bits >= cand)
+        lo, n_ge = jnp.where(n >= K, cand, lo), jnp.where(n >= K, n, n_ge)
+
+    def cond(c: Any) -> Any:
+        b, _, n_ge = c
+        pending = over & jnp.logical_not(_exact_top(n_ge, K))
+        return (b >= 0) & (jnp.max(pending.astype(I32)) > 0)
+
+    def body(c: Any) -> Any:
+        b, lo, n_ge = c
+        for i in range(every):
+            cand = lo | jnp.left_shift(jnp.int32(1), b - i)
+            n = cnt(bits >= cand)
+            lo, n_ge = jnp.where(n >= K, cand, lo), jnp.where(n >= K, n, n_ge)
+        return b - every, lo, n_ge
+
+    return jax.lax.while_loop(cond, body, (jnp.int32(bit), lo, n_ge))[1]
 
 
 def compact_row(b, th, tm, nv, K: int, consts: tuple) -> jax.Array:
