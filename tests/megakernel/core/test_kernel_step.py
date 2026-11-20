@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+from types import SimpleNamespace
 from typing import Any
 
 import jax
@@ -106,7 +107,6 @@ def test_kernel_make_step_matches_spec_reference_step(T: int, B: int):
 
     step, info = kernel.make_step(mesh, spec, ex)
     assert info["exec"].B == B and info["exec"].T == T
-    assert step.lower(pos_mk, hid_mk, w_mk, st_mk) is not None
 
     out_hid_mk, out_st_mk = step(pos_mk, hid_mk, w_mk, st_mk)
     jax.block_until_ready(out_hid_mk)
@@ -137,23 +137,116 @@ def test_kernel_make_step_matches_spec_reference_step(T: int, B: int):
 
 
 def test_kernel_build_ablations_and_scopes():
-    """`kernel.build` supports `skip` ablations and `scopes` levels."""
+    """`kernel.make_step` traces every `ABLATIONS` flag and executes state skips."""
     R = 2
     spec = synth_hybrid_spec(L=2, att_every=2, R=R)
     tiles = TINY_TILES.with_modules({"gqa": {"kv_blk": 128, "nkv": 2}})
-    ex = ExecSpec(
-        B=4,
-        T=1,
-        R=R,
-        ctx=256,
-        stack_e=True,
-        tiles=tiles,
-        interpret=True,
-        debug=DebugOptions(skip=frozenset({"experts", "kv"}), scopes=2),
+    mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
+    base_ex = ExecSpec(
+        B=4, T=1, R=R, ctx=256, stack_e=True, tiles=tiles, interpret=True
     )
-    call, info = kernel.build(spec, ex)
-    assert callable(call)
-    assert info["exec"].skip == frozenset({"experts", "kv"})
+    pos, hid, w_log, st_log = random_spec_inputs(jax.random.PRNGKey(21), spec, base_ex)
+    pos_mk, hid_mk, w_mk, st_mk = pack_spec_inputs(
+        pos, hid, w_log, st_log, spec, base_ex, mesh=mesh
+    )
+
+    # Every individual ablation lowers through the full Pallas kernel body.
+    for abl in kernel.ABLATIONS:
+        ex_abl = dataclasses.replace(
+            base_ex, debug=DebugOptions(skip=frozenset({abl}), scopes=2)
+        )
+        step_abl, info_abl = kernel.make_step(mesh, spec, ex_abl)
+        assert info_abl["exec"].skip == frozenset({abl})
+        assert step_abl.lower(pos_mk, hid_mk, w_mk, st_mk) is not None
+
+    # Execute `skip={"experts", "attn", "kv"}` (finite) and `skip={"comm"}`
+    # (ranks diverge when allreduce communication is ablated).
+    ex_skip_eak = dataclasses.replace(
+        base_ex,
+        debug=DebugOptions(skip=frozenset({"experts", "attn", "kv"}), scopes=2),
+    )
+    step_eak, _ = kernel.make_step(mesh, spec, ex_skip_eak)
+    out_eak, _ = step_eak(pos_mk, hid_mk, w_mk, st_mk)
+    jax.block_until_ready(out_eak)
+    assert jnp.all(
+        jnp.isfinite(out_eak.reshape(R, base_ex.M, spec.config.H)[:, : base_ex.B])
+    )
+
+    ex_skip_comm = dataclasses.replace(
+        base_ex, debug=DebugOptions(skip=frozenset({"comm"}), scopes=1)
+    )
+    step_comm, _ = kernel.make_step(mesh, spec, ex_skip_comm)
+    out_comm, _ = step_comm(pos_mk, hid_mk, w_mk, st_mk)
+    out_comm_r = np.asarray(
+        out_comm.reshape(R, base_ex.M, spec.config.H)[:, : base_ex.B]
+    )
+    assert np.isfinite(out_comm_r.astype(np.float32)).all()
+    assert not np.array_equal(out_comm_r[0], out_comm_r[1])
+
+    with pytest.raises(AssertionError):
+        kernel.build(
+            spec,
+            dataclasses.replace(
+                base_ex, debug=DebugOptions(skip=frozenset({"not_an_ablation"}))
+            ),
+        )
+
+
+def test_spec_inputs_per_layer_key_budget_and_bounded_pos():
+    """`random_spec_logical_weights` handles large-`L` `per_layer` modules without
+    `StopIteration`, `random_spec_inputs` bounds `pos < ctx`, and `kernel.build`
+    requires `g.check`."""
+
+    class _PerLayerNoHFModule(Module):
+        name = "per_layer_no_hf"
+        reduction = "allreduce"
+        input_norm = "in_norm"
+
+        def weights(self, g: FakeGeometry, ex: ExecSpec) -> list[WeightDecl]:
+            del ex
+            return [
+                WeightDecl(
+                    "w_pl",
+                    K=g.H,
+                    N=g.H,
+                    dtype=BF16,
+                    stream_ring="dynamic",
+                    layout="per_layer",
+                )
+            ]
+
+        def smalls(self, g: FakeGeometry, ex: ExecSpec) -> list[SmallField]:
+            del ex
+            return [SmallField("in_norm", g.H)]
+
+        def shared_widths(self, g: FakeGeometry, ex: ExecSpec) -> dict[str, int]:
+            del ex
+            return {"acc": g.H}
+
+    g40 = FakeGeometry(L=40, H=256)
+    ms40 = ModelSpec(
+        "pl40", config=g40, layer_type=LayerType("lt", (_PerLayerNoHFModule(),))
+    )
+    ex40 = ExecSpec(B=2, T=1, R=2, ctx=128, stack_e=False, tiles=TINY_TILES)
+    w40 = random_spec_logical_weights(jax.random.PRNGKey(7), ms40, ex40)
+    assert isinstance(w40["w_pl"], tuple) and len(w40["w_pl"]) == 40
+
+    spec = synth_hybrid_spec(L=2, att_every=2, R=2)
+    for b_val, t_val in ((16, 1), (32, 4)):
+        ex_hi = ExecSpec(B=b_val, T=t_val, R=2, ctx=128, stack_e=True, tiles=TINY_TILES)
+        pos, hid, w_l, st_l = random_spec_inputs(jax.random.PRNGKey(8), spec, ex_hi)
+        assert int(jnp.min(pos)) >= 0
+        assert int(jnp.max(pos)) < ex_hi.ctx
+        ref_y, _ = spec_reference_step(spec, spec.config, ex_hi, pos, hid, w_l, st_l)
+        assert jnp.all(jnp.isfinite(ref_y))
+
+    ms_no_check = ModelSpec(
+        "no_check",
+        config=SimpleNamespace(L=2, H=256),
+        layer_type=LayerType("lt", (_PerLayerNoHFModule(),)),
+    )
+    with pytest.raises(AttributeError):
+        kernel.build(ms_no_check, ex40)
 
 
 def test_kernel_per_module_profiling_scopes(monkeypatch):
@@ -189,11 +282,11 @@ def test_kernel_per_module_profiling_scopes(monkeypatch):
     )
     tiles = dataclasses.replace(TINY_TILES, bank=64 << 10, nbd=2)
     mesh = Mesh(jax.devices("cpu")[:1], ("tp",))
+    orig_ns = jax.named_scope
 
     def _trace_scopes(scopes_val: int | bool, *, interpret: bool = True):
         seen: list[str] = []
         traced_vals: list[tuple[str, object]] = []
-        orig_ns = jax.named_scope
 
         @contextlib.contextmanager
         def _spy_ns(name: str):

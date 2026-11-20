@@ -95,6 +95,11 @@ class KernelContext:
             self.norm_x = x
 
 
+def is_tupled_weight(wsh_entry: Any) -> bool:
+    """Return True if a `wshape[k]` entry describes a per-layer weight tuple."""
+    return isinstance(wsh_entry, tuple) and hasattr(wsh_entry[0], "shape")
+
+
 def build(
     model_spec: ModelSpec,
     ex: ExecSpec,
@@ -105,8 +110,7 @@ def build(
     (`vmem.fit_default_tiles`); `info["exec"]` is the `ExecSpec` actually built.
     """
     g = model_spec.config
-    if hasattr(g, "check"):
-        g.check(ex)
+    g.check(ex)
     ex = fit_default_tiles(model_spec, ex)
     skip = ex.skip
     assert set(skip) <= set(ABLATIONS), skip
@@ -324,7 +328,7 @@ def build(
 
     w_specs = [
         tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in wsh[k])
-        if isinstance(wsh[k], tuple) and hasattr(wsh[k][0], "shape")
+        if is_tupled_weight(wsh[k])
         else pl.BlockSpec(memory_space=pltpu.HBM)
         for k in w_names
     ]
@@ -361,12 +365,7 @@ def build(
         for k in o_names
     ]
 
-    n_w_leaves = sum(
-        len(wsh[k])
-        if (isinstance(wsh[k], tuple) and hasattr(wsh[k][0], "shape"))
-        else 1
-        for k in w_names
-    )
+    n_w_leaves = sum(len(wsh[k]) if is_tupled_weight(wsh[k]) else 1 for k in w_names)
     pool_key = POOL_STATE_NAME
     aliases: dict[int, int] = {}
     if (
@@ -396,7 +395,14 @@ def build(
             st = p.state_decls[k]
             n_s_leaves = len(ssh[k]) if st.tupled else 1
             if st.access == "rw" and k in o_names:
-                aliases[2 + n_w_leaves + s_leaf_offset] = o_names.index(k)
+                o_leaf_offset = sum(
+                    len(osh[ok])
+                    if (ok != "hidden" and p.output_decls[ok].tupled)
+                    else 1
+                    for ok in o_names[: o_names.index(k)]
+                )
+                for a_i in range(n_s_leaves):
+                    aliases[2 + n_w_leaves + s_leaf_offset + a_i] = o_leaf_offset + a_i
             s_leaf_offset += n_s_leaves
 
     coll_id = 0 if ex.R > 1 else None
@@ -451,12 +457,8 @@ def fold(x):
 
 
 def unfold(x, R: int):
+    """`[R * N0, ...] -> [R, N0, ...]`: inverse of `fold` across `R` ranks."""
     return x.reshape((R, x.shape[0] // R) + x.shape[1:])
-
-
-def is_tupled_weight(wsh_entry: Any) -> bool:
-    """Return True if a `wshape[k]` entry describes a per-layer weight tuple."""
-    return isinstance(wsh_entry, tuple) and hasattr(wsh_entry[0], "shape")
 
 
 def target_weight_shape(wsh_entry: Any) -> tuple[int, ...]:
