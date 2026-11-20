@@ -836,9 +836,14 @@ def test_token_gather_sort_and_scatter_are_bit_exact(
     np.testing.assert_array_equal(outs[True], outs[False])
 
 
+@pytest.mark.parametrize(
+    "t_local,gather_on_tensorcore",
+    [(256, False), (48, True), (8, True)],
+    ids=["t256", "t48_tc_gather", "t8_tc_gather"],
+)
 @pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])
 def test_pallas_combine_kernel_isolates_nan_arrivals_on_unrouted_padded_tokens(
-    wire_dtype,
+    wire_dtype, t_local, gather_on_tensorcore
 ):
     """Pallas `_build_combine_kernel` keeps NaN arrival rows on padded rows.
 
@@ -849,9 +854,10 @@ def test_pallas_combine_kernel_isolates_nan_arrivals_on_unrouted_padded_tokens(
     DMA/reduce combine kernel (`_build_combine_kernel`), with `arrivals` and
     `arrival_scales` explicitly poisoned with `NaN` at all sentinel positions,
     followed by the layer's `jnp.where(row_routes, combined, jnp.zeros_like(combined))`.
+    Below COMBINE_MIN_TOKENS the kernel combines only with `gather_on_tensorcore`
+    (its single-parity schedule).
     """
-    t_local = kernel.COMBINE_MIN_TOKENS
-    assert kernel.combine_step_tokens(t_local) > 0
+    assert kernel.combine_step_tokens(t_local, gather_on_tensorcore) > 0
     topk, lane_blocks, lanes, tile_m = 4, 2, 128, 128
     hidden = lane_blocks * lanes
     block = host.routing_block(t_local, topk)
@@ -889,6 +895,7 @@ def test_pallas_combine_kernel_isolates_nan_arrivals_on_unrouted_padded_tokens(
             jnp.asarray(mirror_pos),
             jnp.asarray(topk_weights),
             jnp.bfloat16,
+            gather_on_tensorcore=gather_on_tensorcore,
         )
         out = np.asarray(jnp.where(row_routes, combined, jnp.zeros_like(combined)))
 
@@ -898,6 +905,67 @@ def test_pallas_combine_kernel_isolates_nan_arrivals_on_unrouted_padded_tokens(
         out[active:].astype(np.float32),
         np.zeros((padded, hidden), dtype=np.float32),
     )
+
+
+@pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])
+@pytest.mark.parametrize(
+    "t_local,topk,lane_blocks",
+    [
+        (8, 10, 64),
+        (24, 10, 64),
+        (48, 10, 64),
+        (16, 4, 2),
+        (40, 4, 2),
+        (64, 4, 2),
+        (128, 4, 2),
+    ],
+)
+def test_small_step_combine_kernel_matches_the_xla_epilogue(
+    t_local, topk, lane_blocks, wire_dtype
+):
+    """The kernel combine below COMBINE_MIN_TOKENS is bit-exact with XLA's.
+
+    `gather_on_tensorcore` selects the kernel's single-parity schedule below
+    COMBINE_MIN_TOKENS; without it the same call takes the XLA gather and
+    weighted sum. Both fold the same coefficient and sum the topk terms in the
+    same order in f32, so the outputs are identical bit for bit -- including
+    the step widths that are one sublane tile (24 tokens: 8-token steps) and
+    the serving decode width (48 tokens a shard, hidden 8192, top-10).
+    """
+    lanes, tile_m = 128, 128
+    rng = np.random.default_rng(t_local * 100 + topk)
+    recv_rows = t_local * topk + 64
+    with jax.default_device(jax.devices()[0]):
+        arrivals = jnp.asarray(
+            rng.standard_normal((recv_rows, lane_blocks, lanes)).astype(np.float32)
+        ).astype(wire_dtype)
+        arrival_scales = jnp.asarray(
+            rng.uniform(0.5, 2.0, (recv_rows // tile_m + 1, tile_m)).astype(np.float32)
+        )
+        pos = jnp.asarray(rng.integers(0, recv_rows, (t_local, topk)).astype(np.int32))
+        mirror_pos = jnp.asarray(
+            rng.integers(0, recv_rows, (t_local, topk)).astype(np.int32)
+        )
+        topk_weights = jnp.asarray(
+            rng.dirichlet(np.ones(topk), t_local).astype(np.float32)
+        )
+        assert kernel.combine_step_tokens(t_local) == 0
+        assert kernel.combine_step_tokens(t_local, gather_on_tensorcore=True) > 0
+        outs = [
+            np.asarray(
+                layer._combine_arrivals(
+                    arrivals,
+                    arrival_scales,
+                    pos,
+                    mirror_pos,
+                    topk_weights,
+                    jnp.bfloat16,
+                    gather_on_tensorcore=flag,
+                ).astype(jnp.float32)
+            )
+            for flag in (False, True)
+        ]
+    np.testing.assert_array_equal(outs[1], outs[0])
 
 
 @pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
