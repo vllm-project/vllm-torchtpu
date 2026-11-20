@@ -132,12 +132,15 @@ def is_supported(
         "exclude_neg_inf",
         "unordered",
         "scheduling_group_id",
+        "row_count",
     ),
 )
 def streaming_topk(
     scores: jax.Array,
     *,
     valid_lengths: jax.Array | None = None,
+    row_start: jax.Array | int = 0,
+    row_count: int | None = None,
     k: int = 512,
     block_size: int = 8192,
     reconstruct_threshold: int = 8192,
@@ -151,6 +154,8 @@ def streaming_topk(
 
     Args:
         scores: Float32 [rows, N], request-major; NaNs are unsupported.
+        row_start: First input row, used only with row_count.
+        row_count: Select this many rows from a dense HBM score window.
         valid_lengths: Optional int32 [rows], clipped to [0, N]; None uses N.
             With logical_blocks, use [requests, queries], whose product is rows.
         k: Number of selected tokens per row.
@@ -172,6 +177,10 @@ def streaming_topk(
     if scores.ndim != 2 or scores.dtype != jnp.float32:
         raise ValueError("scores must be a rank-2 float32 array")
     batch_size, width = scores.shape
+    if row_count is not None:
+        if not 0 < row_count <= batch_size or logical_blocks is not None:
+            raise ValueError("Row windows require dense scores and a valid row_count")
+        batch_size = row_count
     if not 1 <= k <= width:
         raise ValueError("k must be in [1, N]")
     if block_size <= 0 or reconstruct_threshold <= 0:
@@ -312,6 +321,7 @@ def streaming_topk(
         order_refs,
         mapping_refs,
         start_refs,
+        row_start_refs,
         out_indices_ref,
         *scratch,
     ):
@@ -333,6 +343,10 @@ def streaming_topk(
         if order_width:
             visit_order = order_scratch[0]
             pltpu.async_copy(order_refs[0], visit_order, sem).wait()
+        score_start = 0
+        if row_count is not None:
+            pltpu.async_copy(row_start_refs[0], row_length, sem).wait()
+            score_start = row_length[...][0]
         request_start = 0
         if mapped:
             logical_blocks_ref = mapping_refs[0]
@@ -643,7 +657,9 @@ def streaming_topk(
 
             def full():
                 move(
-                    scores_ref.at[row, pl.ds(block_id * block_size, block_size)],
+                    scores_ref.at[
+                        row + score_start, pl.ds(block_id * block_size, block_size)
+                    ],
                     blocks.at[slot],
                 )
 
@@ -652,7 +668,9 @@ def streaming_topk(
 
                 def tail():
                     move(
-                        scores_ref.at[row, pl.ds(width - tail_size, tail_size)],
+                        scores_ref.at[
+                            row + score_start, pl.ds(width - tail_size, tail_size)
+                        ],
                         blocks.at[slot, pl.ds(0, tail_size)],
                     )
 
@@ -966,7 +984,14 @@ def streaming_topk(
         else ()
     )
     result = kernel(
-        scores, lengths, block_order, (logical_blocks,) if mapped else (), start
+        scores,
+        lengths,
+        block_order,
+        (logical_blocks,) if mapped else (),
+        start,
+        (jnp.broadcast_to(jnp.asarray(row_start, jnp.int32), (lanes,)),)
+        if row_count is not None
+        else (),
     )
     if output_width != k:
         result = result[:, :k]

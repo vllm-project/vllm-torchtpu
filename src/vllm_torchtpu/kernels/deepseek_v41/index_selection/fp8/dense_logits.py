@@ -97,12 +97,19 @@ class _DenseKernel:
         sem = self.q_sem.at[slot]
         _dma_rows(self.q, dst, sem, query.count, wait, src_start=query.start)
 
+    def write_semaphore(self, slot):
+        if len(self.write_sem.shape) == 1:
+            return self.write_sem.at[pl.ds(slot * self.q_tile, self.q_tile)]
+        return self.write_sem.at[slot]
+
     def release_outputs(self, pair):
         # counts: rows pending per score slot [0, 4), [4, 6) unused and
         # -inf padding row copies [6, 8) per query slot.
         for slot in (2 * pair, 2 * pair + 1)[: self.tiles]:
             src = self.scores.at[slot]
-            _dma_rows(src, src, self.write_sem.at[slot], self.counts[slot], wait=True)
+            _dma_rows(
+                src, src, self.write_semaphore(slot), self.counts[slot], wait=True
+            )
         src = self.padding.at[pl.ds(0, 1)]
         dst = self.out.at[pl.ds(0, 1), pl.ds(0, self.key_tile)]
         row = pltpu.make_async_copy(src, dst, self.pad_sem.at[pair])
@@ -159,6 +166,9 @@ class _DenseKernel:
         limit = reduce(jnp.maximum, self.row_lengths(query), jnp.int32(0))
         return pl.cdiv(jnp.minimum(limit, self.out.shape[1]), self.key_tile)
 
+    def retained_key_id(self, query, tile_count):
+        return query.page_row
+
     def query_block(self, state):
         return _QueryBlock(self, state).run()
 
@@ -198,7 +208,7 @@ class _QueryBlock:
 
     def key_slot(self, tile):
         if self.k.reuse_keys:
-            return 0
+            return tile
         return lax.rem(self.tile_base + tile, self.k.config.key_buffers)
 
     def page_slot(self, tile):
@@ -209,7 +219,7 @@ class _QueryBlock:
 
     def publish(self, tile, wait=False):
         k, slot = self.k, self.output_slot(tile)
-        src, sem = k.scores.at[slot], k.write_sem.at[slot]
+        src, sem = k.scores.at[slot], k.write_semaphore(slot)
         dst = k.out.at[:, pl.ds(tile * k.key_tile, k.key_tile)]
         _dma_rows(src, dst, sem, self.query.count, wait, dst_start=self.first_row)
 
@@ -230,8 +240,12 @@ class _QueryBlock:
 
     def fill_keys(self):
         # A complete K tile stays resident across query groups of one request.
-        self.k.load_pages(0, self.k.tile_pages, self.page_slot(0), 0)
-        self.k.wait_keys(0)
+        for tile in range(self.k.tiles):
+
+            @pl.when(tile < self.tile_count)
+            def fill(tile=tile):
+                self.k.load_pages(0, self.k.tile_pages, self.page_slot(tile), tile)
+                self.k.wait_keys(tile)
 
     def prefill(self, i):
         page_slot, key_slot = self.page_slot(i), self.key_slot(i)
@@ -258,8 +272,18 @@ class _QueryBlock:
         pages = range(fragment * per_fragment, (fragment + 1) * per_fragment)
         rows = [self.key_rows(tile, p, 0, PAGE_ROWS - 1) for p in pages]
         rhs = jnp.concatenate([pltpu.bitcast(r, k.q.dtype) for r in rows], axis=1)
-        logits = lax.dot(self.lhs, rhs, preferred_element_type=jnp.float32)
+        logits = self.dot(rhs)
         return jnp.maximum(logits.astype(jnp.bfloat16), jnp.bfloat16(0))
+
+    def dot(self, rhs):
+        return lax.dot(self.lhs, rhs, preferred_element_type=jnp.float32)
+
+    def reduce_fragment(self, products, fragment, tile, count):
+        tuned = fragment + PACKED_FP8_MQA_CONFIG.issue_depth
+        mxu = _reduce_on_mxu(fragment, tuned, count, every=4, drain=4)
+        return _reduce_heads(
+            products, *self.reduction, sublanes=self.k.sublanes, use_mxu=mxu
+        )
 
     def store(self, tile, fragment, values, remaining):
         k = self.k
@@ -302,12 +326,8 @@ class _QueryBlock:
                 fragment = stage - depth
                 # Keyed to the tuned depth, so another issue depth keeps each
                 # fragment's head-sum arithmetic.
-                tuned = fragment + PACKED_FP8_MQA_CONFIG.issue_depth
-                mxu = _reduce_on_mxu(fragment, tuned, count, every=4, drain=4)
                 products = pending.pop(fragment)
-                values = _reduce_heads(
-                    products, *self.reduction, sublanes=k.sublanes, use_mxu=mxu
-                )
+                values = self.reduce_fragment(products, fragment, tile, count)
                 self.store(tile, fragment, values, remaining)
             if prefetch:
                 k.load_pages(middle, last, metadata, following)
@@ -354,6 +374,16 @@ class _QueryBlock:
         sem = k.pad_sem.at[self.q_slot]
         _dma_rows(k.padding, dst, sem, self.query.count, dst_start=self.first_row)
 
+    def prepare_queries(self):
+        k = self.k
+        rows = k.row_ids(self.query)
+        weight = jnp.concatenate([k.weights[r][:, None] for r in rows])
+        selector = _weighted_selector(k.selector, k.weights, rows, sublanes=k.sublanes)
+        self.reduction = (_head_order(weight, k.q_tile, k.sublanes), selector)
+        queries = k.queries[pl.ds(self.q_slot * k.q_tile, k.q_tile)]
+        queries = queries.reshape(k.q_tile * k.heads, k.dim)
+        self.lhs = _head_order(queries, k.q_tile, k.sublanes)
+
     def run(self):
         k, query, q_slot = self.k, self.query, self.q_slot
         k.copy_queries(self.following, 1 - q_slot, zero=True)
@@ -367,21 +397,18 @@ class _QueryBlock:
         k.release_outputs(q_slot)
         scored = self.tile_count > 0
         if k.reuse_keys:
-            pl.when(scored)(partial(self.load_table, 0, wait=True))
-            # In this mode ready identifies the retained tile's request owner.
-            pl.when(scored & (self.ready != query.page_row))(self.fill_keys)
+            for tile in range(k.tiles):
+                pl.when(tile < self.tile_count)(
+                    partial(self.load_table, tile, wait=True)
+                )
+            owner = k.retained_key_id(query, self.tile_count)
+            pl.when(scored & (self.ready != owner))(self.fill_keys)
         else:
             for i in range(2):
                 needed = (i >= self.ready) & (i < self.total_tiles)
                 pl.when(needed)(partial(self.prefill, i))
         k.copy_queries(query, q_slot, wait=True)
-        rows = k.row_ids(query)
-        weight = jnp.concatenate([k.weights[r][:, None] for r in rows])
-        selector = _weighted_selector(k.selector, k.weights, rows, sublanes=k.sublanes)
-        self.reduction = (_head_order(weight, k.q_tile, k.sublanes), selector)
-        queries = k.queries[pl.ds(q_slot * k.q_tile, k.q_tile)]
-        queries = queries.reshape(k.q_tile * k.heads, k.dim)
-        self.lhs = _head_order(queries, k.q_tile, k.sublanes)
+        self.prepare_queries()
         if k.tiles == 1:
             pl.when(scored)(partial(self.step_tile, jnp.int32(0), None))
         else:
@@ -397,7 +424,9 @@ class _QueryBlock:
 
         ready = jnp.minimum(2, self.next_tiles + self.ahead_tiles)
         if k.reuse_keys:
-            ready = jnp.where(scored, query.page_row, self.ready)
+            ready = jnp.where(
+                scored, k.retained_key_id(query, self.tile_count), self.ready
+            )
         tiles = (self.next_tiles, self.ahead_tiles, self.far_tiles)
         step, base = self.step + 1, self.tile_base + self.tile_count
         return self.following, self.lookahead, self.farthest, tiles, step, base, ready
