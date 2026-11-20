@@ -60,9 +60,11 @@ def gdn_kernel_wrapper(architecture: str | None) -> ModuleType:
     GDN changes validated only on the Qwen3.5 MoE serving configurations.
     Every other architecture, and a caller that passes no architecture, runs
     the shared kernel in `kernels/gdn/v3` unchanged. The dense and pooled
-    paths choose here, and the copy is imported only when chosen; the PCP
-    prefill (`run_jax_gdn_attention_pcp_tp_prefill`) does not ask and always
-    runs `kernels/gdn/v3`.
+    paths choose here, and the copy is imported only when chosen. The PCP
+    prefills do not ask and always run `kernels/gdn/v3`:
+    `run_jax_gdn_attention_pcp_tp_prefill`, and
+    `run_jax_gdn_attention_pooled_pcp_prefill`, which calls
+    `run_jax_gdn_attention_pooled_local` with no architecture.
     """
     if architecture in QWEN3_5_GDN_COPY_ARCHITECTURES:
         from vllm_torchtpu.models.qwen3_5.kernels.gdn import (
