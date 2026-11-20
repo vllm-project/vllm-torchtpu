@@ -22,8 +22,6 @@ import threading
 import jax
 import jax.numpy as jnp
 from jax import lax
-from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
-from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
 
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
@@ -58,6 +56,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     combine_step_tokens,
     rowquant_fp8,
 )
+from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
+from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
 
 # The scoring functions the router can apply to the gate logits. These
 # mirror `layers/adapter/moe_routing._apply_scoring_fn` exactly.
@@ -339,9 +339,9 @@ def fused_ep_moe_v2(
     expert_slots [experts] i32 is a static expert placement: the weights hold
     logical expert e at global index expert_slots[e]. The router keeps the
     logical order, so selection (ties to the lower index) and the slot order
-    are the unplaced layer's; only the selected [tokens, topk] ids move, and
-    the owner still combines in slot order, so the output is the unplaced
-    layer's bit for bit.
+    are the unplaced layer's; the selector emits the selected experts' slots
+    (`pallas_select`'s index_map), and the owner still combines in slot
+    order, so the output is the unplaced layer's bit for bit.
 
     eager_push=True pushes each result tile toward its token owners as soon
     as it is staged rather than after its expert's last tile
@@ -475,6 +475,8 @@ def fused_ep_moe_v2(
             f"expert_slots must be one integer slot per global expert, "
             f"[{e_total}]; got {tuple(expert_slots.shape)} {expert_slots.dtype}"
         )
+    if has_expert_slots and has_hash_ids:
+        raise NotImplementedError("expert_slots relabel the router's own selection")
     if scoring_fn not in SCORING_FNS:
         raise ValueError(f"scoring_fn must be one of {SCORING_FNS}; got {scoring_fn!r}")
     if has_score_bias and score_bias.shape != (e_total,):
@@ -562,7 +564,7 @@ def fused_ep_moe_v2(
             topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
         elif score_bias_l is None:
             topk_weights, topk_idx = pallas_select(
-                scores, topk=topk, block_rows=select_rows
+                scores, topk=topk, block_rows=select_rows, index_map=slots_l
             )
         else:
             # Selection is based on (scores + score_bias_l); the weights come
@@ -572,9 +574,8 @@ def fused_ep_moe_v2(
                 topk=topk,
                 block_rows=select_rows,
                 weight_scores=scores,
+                index_map=slots_l,
             )
-        if slots_l is not None:
-            topk_idx = jnp.take(slots_l.astype(jnp.int32), topk_idx, axis=0)
         topk_idx = _relabel_expert_ids_to_mesh_order(
             topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
         )

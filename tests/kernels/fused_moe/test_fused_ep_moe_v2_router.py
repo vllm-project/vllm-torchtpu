@@ -136,3 +136,26 @@ def test_the_bias_moves_the_selection_and_not_the_weights():
         "the fixture's bias does not reorder the top-k, so this test cannot "
         "tell a kernel that applies it from one that ignores it"
     )
+
+
+@pytest.mark.parametrize("weighted", [False, True])
+def test_index_map_relabels_the_picks_and_nothing_else(weighted):
+    # A static expert placement's table: the picks, their order and the
+    # weights are the unmapped selector's, exact ties included; only the
+    # emitted indices go through the table.
+    rows = 512
+    s = _scores(rows, 11)
+    s[:, 1::2] = s[:, 0::2]  # columns 2j and 2j + 1 tie on every row
+    v = _scores(rows, 12) if weighted else None
+    slots = np.random.default_rng(13).permutation(EXPERTS).astype(np.int32)
+    w0, i0 = _select(s, v, block_rows=256)
+    w1, i1 = router_ops.pallas_select(
+        jnp.asarray(s),
+        topk=TOPK,
+        block_rows=256,
+        weight_scores=None if v is None else jnp.asarray(v),
+        interpret=True,
+        index_map=jnp.asarray(slots),
+    )
+    assert np.array_equal(np.asarray(w1).view(np.uint32), w0.view(np.uint32))
+    assert np.array_equal(np.asarray(i1), slots[i0])
