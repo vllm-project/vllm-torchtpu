@@ -2806,8 +2806,25 @@ def compressed_dcp_blocks(vals_pair, pos_pair, block_topk, *, topk=None):
     )
     kept = jnp.where(keep, pos_pair, dcp_select.EMPTY)
     kept = jnp.moveaxis(kept, 0, 1).reshape(kept.shape[1], -1)
-    kept = jnp.sort(kept, axis=1)[:, :block_topk]
+    kept = _sort_rows(kept)[:, :block_topk]
     return jnp.where(kept == dcp_select.EMPTY, -1, kept).astype(jnp.int32)
+
+
+def _sort_rows(x):
+    """``jnp.sort(x, axis=1)``; under q38 DEC-STEP-3's VLLM_TPU_QSA_DCP_SORT_ROWS
+    = N, a step of more than N rows sorts row blocks of at most N rows (as equal
+    as possible) and concatenates them. Each row is sorted alone either way, so
+    the values are the same; the per-step sort's cost jumps between 384 and 448
+    rows (t160 traces: 113 -> 302 us)."""
+    limit = envs.VLLM_TPU_QSA_DCP_SORT_ROWS
+    rows = x.shape[0]
+    if not limit or rows <= limit:
+        return jnp.sort(x, axis=1)
+    parts = -(-rows // limit)
+    size = -(-rows // parts)
+    return jnp.concatenate(
+        [jnp.sort(x[i : i + size], axis=1) for i in range(0, rows, size)], axis=0
+    )
 
 
 def compressed_dcp_own_blocks(vals_pair, pos_pair, dcp_rank, block_topk, *, topk=None):

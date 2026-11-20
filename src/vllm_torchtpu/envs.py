@@ -220,6 +220,9 @@ if TYPE_CHECKING:
     VLLM_TPU_RPA_SCHEDULE_HBM: bool = False
     VLLM_TPU_QSA_UNION_LEAN_GLUE: bool = False
     VLLM_TPU_QSA_UNION_CHAINED_CALLS: bool = False
+    VLLM_TPU_QSA_DECODE_RPA_UNION_WIDE: int = 0
+    VLLM_TPU_DECODE_ROWS_GLUE: bool = False
+    VLLM_TPU_QSA_DCP_SORT_ROWS: int = 0
     VLLM_TPU_QSA_INDEXER_META_SELECT: bool = False
     VLLM_TPU_QSA_DCP_MERGE: str = ""
     VLLM_TPU_QSA_DCP_MERGE_CHECK: bool = False
@@ -1227,6 +1230,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # through them in the kernel's layout, in place of a padded query sliced
     # per call and each call's output scattered back. Same results.
     "VLLM_TPU_QSA_UNION_CHAINED_CALLS": env_bool("VLLM_TPU_QSA_UNION_CHAINED_CALLS"),
+    # q38 DEC-STEP-3 (port of DECODE-QSA WIDE v2, 3772ac01ab): requests per union
+    # RPA call for verify steps of more than UNION_REQUESTS * max_query_len rows.
+    # 0 (default) keeps 32-request calls (5 per QSA layer at 448 / 480 rows); 64
+    # runs ceil(requests / 64). Only 64: a [64, 2080] int32 page table is 532 KB
+    # of the 1 MiB scalar memory (128 does not fit: DECODE-QSA aot2). Each
+    # request stays its own RPA sequence, so every row's sums run in the same
+    # order. Compile-ignored: it picks which programs run, each keyed by its own
+    # graph.
+    "VLLM_TPU_QSA_DECODE_RPA_UNION_WIDE": env_nonnegative_int(
+        "VLLM_TPU_QSA_DECODE_RPA_UNION_WIDE", 0
+    ),
+    # q38 DEC-STEP-3: data-movement glue of large decode steps without the
+    # layout copies / scatters the profile shows above 384 rows: the QSA
+    # selected-token tail fill as selects (no scatter) and GDN's packed gate
+    # input built by one concatenate (no stack + relayout). Same values.
+    # Compile-ignored (it picks which programs run).
+    "VLLM_TPU_DECODE_ROWS_GLUE": env_bool("VLLM_TPU_DECODE_ROWS_GLUE"),
+    # q38 DEC-STEP-3: the compressed-DCP global selection's per-row sort runs
+    # over row blocks of at most this many rows when a step has more (0 = one
+    # sort over every row). Each row is sorted alone either way: same values.
+    # Compile-ignored (it picks which programs run).
+    "VLLM_TPU_QSA_DCP_SORT_ROWS": env_nonnegative_int("VLLM_TPU_QSA_DCP_SORT_ROWS", 0),
     # The indexer kernel's step metadata is selected (empty pass: zeros) rather
     # than computed in a conditional, whose small outputs XLA places in VMEM
     # and then copies to HBM before every StreamIdxTC call. Same integers.

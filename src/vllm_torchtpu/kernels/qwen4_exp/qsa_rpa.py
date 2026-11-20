@@ -407,6 +407,29 @@ UNION_REQUESTS = 32  # requests per union RPA call; its [32, P] page table at
 # P = 2080 is 266 KB of scalar memory, as the 128-row per-row call's is.
 
 
+def union_call_requests(rows, max_query_len):
+    """Requests per union RPA call for a step of ``rows`` rows: ``UNION_REQUESTS``,
+    or, under q38 DEC-STEP-3's port of DECODE-QSA WIDE v2
+    (VLLM_TPU_QSA_DECODE_RPA_UNION_WIDE), 64 for a step past one
+    ``UNION_REQUESTS`` call's rows (448 / 480 rows: 3 calls a QSA layer instead
+    of 5). Steps of at most ``UNION_REQUESTS * max_query_len`` rows keep
+    ``UNION_REQUESTS``. Each request stays its own RPA sequence over its own
+    tiles, so every row's sums run in the same order either way."""
+    wide = envs.VLLM_TPU_QSA_DECODE_RPA_UNION_WIDE
+    if wide and rows > UNION_REQUESTS * max_query_len:
+        if wide != 64:
+            raise ValueError(
+                f"VLLM_TPU_QSA_DECODE_RPA_UNION_WIDE={wide}: only 64 (a [64, 2080] "
+                "page table, 532 KB of the 1 MiB scalar memory) is supported"
+            )
+        return wide
+    return UNION_REQUESTS
+
+
+# (rows, request slots) of the programs traced with WIDE calls (log once each).
+WIDE_TRACED: dict = {}
+
+
 def union_page_slots(budget, ratio, tile, rows=4):
     """Union page slots a request: ``rows`` rows' ``budget`` groups and their
     tail groups, in whole ``tile``-token KV tiles."""
@@ -528,12 +551,22 @@ def union_decode_attention(
         )
     starts, pages, sel, meta, live = metadata
     requests = len(starts) - 1
-    chunks = -(-requests // UNION_REQUESTS)
-    pad = chunks * UNION_REQUESTS - requests
+    per_call = union_call_requests(len(q), max_query_len)
+    if per_call != UNION_REQUESTS and (len(q), requests) not in WIDE_TRACED:
+        WIDE_TRACED[(len(q), requests)] = -(-requests // per_call)
+        # q38 DEC-STEP-3 WIDE engagement marker, once per traced program.
+        logger.info(
+            "q38 DEC-STEP-3 WIDE traced: rows %d, request slots %d, requests per call %d, calls %d",
+            len(q), requests, per_call, -(-requests // per_call),
+        )
+    chunks = -(-requests // per_call)
+    # WIDE: the last call takes the remaining requests (no padded requests,
+    # no copies of the page table / words / meta); 32-request calls pad as before.
+    pad = chunks * per_call - requests if per_call == UNION_REQUESTS else 0
     if pad > 0:
         starts = jnp.concatenate([starts, jnp.broadcast_to(starts[-1:], (pad,))])
         pages, sel, meta = (jnp.pad(x, ((0, pad), (0, 0))) for x in (pages, sel, meta))
-    call_rows = UNION_REQUESTS * max_query_len
+    call_rows = per_call * max_query_len
     # VLLM_TPU_QSA_UNION_LEAN_GLUE: when one call covers the step, it runs over
     # the step's own rows, so its query, output and LSE buffers have the step's
     # size and call row r is step row r. A row before starts[0] belongs to no
@@ -566,10 +599,11 @@ def union_decode_attention(
     lse = None if whole else jnp.full(query.shape[:2], -jnp.inf, jnp.float32)
     carry = None
     for c in range(chunks):
-        first = c * UNION_REQUESTS
-        part = slice(first, first + UNION_REQUESTS)
+        first = c * per_call
+        take = per_call if per_call == UNION_REQUESTS else min(per_call, requests - first)
+        part = slice(first, first + take)
         row0 = 0 if whole else starts[first]
-        edges = starts[first : first + UNION_REQUESTS + 1]
+        edges = starts[first : first + take + 1]
         if chained:
             # The rows a sliced call would attend, [starts[first], + span),
             # in step coordinates.
@@ -587,7 +621,7 @@ def union_decode_attention(
             # dummy steps) could carry a call past its query slice; rows
             # past the slice are not attended.
             cu_q_lens,
-            jnp.full((3,), UNION_REQUESTS, jnp.int32),
+            jnp.full((3,), take, jnp.int32),
             sm_scale=q.shape[-1] ** -0.5,
             q_scale=None,
             k_scale=k_scale,
@@ -1642,6 +1676,16 @@ def selected_tokens(blocks, lengths, token_topk, compress_ratio):
     ).reshape(len(blocks), token_topk)
     selected = jnp.pad(selected, ((0, 0), (0, compress_ratio - 1)), constant_values=-1)
     count = jnp.minimum(lengths // compress_ratio, blocks.shape[1])
+    if envs.VLLM_TPU_DECODE_ROWS_GLUE:
+        # q38 DEC-STEP-3: the same tail fill as selects over the columns, not
+        # a scatter (a scatter_fusion above 384 rows); one column a row each.
+        columns = jnp.arange(selected.shape[1], dtype=count.dtype)[None, :]
+        for tail in range(compress_ratio - 1):
+            token = lengths // compress_ratio * compress_ratio + tail
+            value = jnp.where(token < lengths, token, -1).astype(selected.dtype)
+            at = (count * compress_ratio + tail)[:, None]
+            selected = jnp.where(columns == at, value[:, None], selected)
+        return selected
     for tail in range(compress_ratio - 1):
         token = lengths // compress_ratio * compress_ratio + tail
         selected = selected.at[
