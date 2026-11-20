@@ -1563,6 +1563,9 @@ class TestTPURunnerInitOnHost:
     def setup_method(self):
         TestTPURunner._setup_runner(self, device_config=DeviceConfig(device="cpu"))
 
+    def teardown_method(self):
+        self._find_non_ssm_backend_patcher.stop()
+
     @pytest.mark.parametrize("has_drafter", [False, True])
     def test_init_records_whether_a_drafter_runs(self, has_drafter):
         """The worker records whether a drafter runs before the model loads:
