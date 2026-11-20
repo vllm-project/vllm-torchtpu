@@ -8216,7 +8216,14 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 # The MTP draft's two-pass step 0 runs on mixed verify +
                 # prefill steps, which under async scheduling carry an
-                # on-device rejected count into it: warm those steps too.
+                # on-device rejected count into it: warm those steps too,
+                # from one verifying request up (the counts below start at
+                # two, and max_num_seqs 2 leaves them no room for a prefill).
+                if kv_only is not None:
+                    for greedy in (True, False):
+                        self._warmup_spec_batch(
+                            1, prompt_buckets[0], greedy=greedy, short=True, mixed=True
+                        )
                 for R in counts:
                     for greedy in (True, False):
                         self._warmup_spec_batch(

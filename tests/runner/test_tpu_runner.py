@@ -684,14 +684,62 @@ def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
     # Every request count (async) or the request paddings (sync) at the
     # shortest prompt bucket, then the paddings at the longest one, nr > 1.
     # With the two-pass MTP step 0 on, the first sweep also runs the mixed
-    # verify + prefill steps it takes.
+    # verify + prefill steps it takes, from one verifying request up.
     counts = range(2, 33) if async_scheduling else (8, 16, 32)
-    assert batch.call_args_list == [
+    one_verifying = [
+        ((1, 16), {"greedy": greedy, "short": True, "mixed": True})
+        for greedy in (True, False)
+    ]
+    assert batch.call_args_list == (one_verifying if two_pass else []) + [
         ((R, 16), {"greedy": greedy, "mixed": two_pass})
         for R in counts
         for greedy in (True, False)
     ] + [
         ((R, 8192), {"greedy": greedy}) for R in (8, 16, 32) for greedy in (True, False)
+    ]
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_spec_decode_warmup_runs_a_mixed_step_at_two_max_num_seqs(async_scheduling):
+    """At max_num_seqs 2 the count sweep has no room for a mixed step beside
+    its decoders, so the one-verifying-request mixed step is the only one the
+    two-pass MTP step 0 gets compiled on before serving."""
+    batch = MagicMock()
+    drafter = MagicMock(spec=Eagle3Proposer)
+    drafter.bucketed_drafts = False
+    drafter.kv_only_step0_enabled = True
+    drafter.takes_two_pass_prefill.return_value = False
+    drafter.single_pass_step0.side_effect = contextlib.nullcontext
+    runner = SimpleNamespace(
+        drafter=drafter,
+        enforce_eager=False,
+        _is_async_drafter=True,
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[16, 32],
+        num_reqs_paddings=[1, 8],
+        max_model_len=1024,
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=2, async_scheduling=async_scheduling
+        ),
+        num_xla_graphs=3,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_spec_request=MagicMock(return_value=True),
+        _warmup_spec_batch=batch,
+    )
+    with (
+        patch.object(tpu_runner.envs, "SPEC_WARMUP", True),
+        patch.object(
+            tpu_runner,
+            "_suspend_kv_transfer_group",
+            return_value=contextlib.nullcontext(),
+        ),
+    ):
+        TPUModelRunner._warmup_spec_decode(runner)
+
+    mixed = [c for c in batch.call_args_list if c.kwargs.get("mixed")]
+    assert mixed[:2] == [
+        ((1, 16), {"greedy": greedy, "short": True, "mixed": True})
+        for greedy in (True, False)
     ]
 
 
