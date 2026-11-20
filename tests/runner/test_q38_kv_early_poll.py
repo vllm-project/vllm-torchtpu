@@ -250,11 +250,22 @@ def test_decision_on_engages_once_with_its_line(monkeypatch, caplog):
     assert "q38 EARLY_POLL engaged=1 connector=Qwen4ExpRaidenConnector" in caplog.text
 
 
-def test_decision_on_without_a_connector_is_not_engaged(monkeypatch, caplog):
+def test_decision_waits_for_the_connector(monkeypatch, caplog):
+    """vLLM's memory-profiling dummy run calls sample_tokens before the KV connector exists: that call must not fix the decision
+    (served q38_ds2x74 A1 logged 'engaged=0 reason=no KV connector' at warm-up and never engaged)."""
+    from vllm_torchtpu.runner import tpu_runner
+
     r = make_runner(monkeypatch, None, key_on=True)
     caplog.set_level(logging.INFO)
     assert r._kv_early_poll() is False
-    assert "q38 EARLY_POLL engaged=0 reason=no KV connector" in caplog.text
+    assert r._kv_early_poll() is False
+    assert "_kv_early_poll_on" not in r.__dict__
+    assert "q38 EARLY_POLL" not in caplog.text
+    c, _ = make_connector([], {})
+    monkeypatch.setattr(tpu_runner, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(tpu_runner, "get_kv_transfer_group", lambda: c)
+    assert r._kv_early_poll() is True
+    assert "q38 EARLY_POLL engaged=1 connector=Qwen4ExpRaidenConnector" in caplog.text
 
 
 def test_decision_on_a_producer_raises(monkeypatch):

@@ -1616,19 +1616,22 @@ class TPUModelRunner(GPUModelRunner):
 
     def _kv_early_poll(self) -> bool:
         """QWEN4_EXP_PD_EARLY_POLL engaged on this runner (decided once, at the
-        first step that asks; the same on every rank: the key and the KV
-        transfer config are)."""
+        first step that asks with a KV connector present; the same on every
+        rank: the key and the KV transfer config are)."""
         on = self.__dict__.get("_kv_early_poll_on")
         if on is None:
+            if not has_kv_transfer_group():
+                # vLLM's memory-profiling dummy run reaches sample_tokens before
+                # initialize_from_config creates the KV connector: decide at the
+                # first step that has one (served q38_ds2x74 A1 cached this
+                # 'no connector' state and never engaged).
+                return False
             on = self._decide_kv_early_poll()
             self._kv_early_poll_on = on
         return on
 
     def _decide_kv_early_poll(self) -> bool:
         if not envs.QWEN4_EXP_PD_EARLY_POLL:
-            return False
-        if not has_kv_transfer_group():
-            logger.info("q38 EARLY_POLL engaged=0 reason=no KV connector")
             return False
         why = kv_early_poll_refusals(
             self.vllm_config.kv_transfer_config, get_kv_transfer_group()
