@@ -170,6 +170,7 @@ from vllm_torchtpu.tracing.utils import (
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
+    from vllm.sampling_params import SamplingParams
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 
@@ -387,6 +388,39 @@ def _spec_warmup_all_token_ids(
         req_id: [0] * (num_computed + 1)
         for req_id, num_computed in zip(req_ids, num_computed_tokens)
     }
+
+
+# A top-k and a top-p that a synthetic warmup request sets to turn on that
+# mask's search; any top_k in (0, vocab size) and top_p in (0, 1) would do.
+_SPEC_WARMUP_TOP_K = 8
+_SPEC_WARMUP_TOP_P = 0.9
+
+# The (greedy, (use_top_k, use_top_p)) sampling of the synthetic requests:
+# the greedy path, and the non-greedy path with each pair of mask flags, since
+# each pair is a distinct sampler program in the fused verify step.
+_SPEC_WARMUP_SAMPLING = ((True, (False, False)),) + tuple(
+    (False, flags) for flags in MASK_FLAG_COMBINATIONS
+)
+
+
+def _spec_warmup_sampling_params(
+    greedy: bool, mask_flags: tuple[bool, bool]
+) -> "SamplingParams":
+    """SamplingParams of a synthetic warmup request.
+
+    Non-greedy requests set a top-k and a top-p where mask_flags asks for that
+    search, so _build_padded_sampling_params gives the step those flags.
+    """
+    from vllm.sampling_params import SamplingParams
+
+    if greedy:
+        return SamplingParams(temperature=0.0)
+    use_top_k, use_top_p = mask_flags
+    return SamplingParams(
+        temperature=1.0,
+        top_k=_SPEC_WARMUP_TOP_K if use_top_k else 0,
+        top_p=_SPEC_WARMUP_TOP_P if use_top_p else 1.0,
+    )
 
 
 def _spec_warmup_group_num_blocks(runner: Any, group: Any, max_pos: int) -> int:
@@ -6427,6 +6461,18 @@ class TPUModelRunner(GPUModelRunner):
                         (num_tokens, self.vocab_size),
                         dtype=torch.float32,
                     ).to(self.device)
+                    warm_bonus_temps = torch.ones(
+                        (num_reqs, 1), dtype=self._hidden_states_dtype
+                    ).to(self.device)
+                    warm_bonus_top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(
+                        self.device
+                    )
+                    warm_bonus_top_p = torch.ones(
+                        (num_reqs, 1), dtype=torch.float32
+                    ).to(self.device)
+                    warm_bonus_u = torch.zeros(
+                        (num_reqs, self.vocab_size), dtype=torch.float32
+                    ).to(self.device)
                     # Grammar masks are applied before greedy reduction.
                     logger.info(
                         "Rejection warmup: stage=grammar_greedy rows=%d reqs=%d",
@@ -6457,11 +6503,24 @@ class TPUModelRunner(GPUModelRunner):
                             use_top_k,
                             use_top_p,
                         )
+                        # The bonus token comes from sample_from_logits, as in
+                        # _sample_spec_verify_chunk: int64, unlike the greedy
+                        # prelude's int32 IDs.
+                        sampled_bonus_ids = self.sample_from_logits_func(
+                            bonus_logits_ng,
+                            warm_bonus_temps,
+                            warm_bonus_u,
+                            warm_bonus_top_k,
+                            warm_bonus_top_p,
+                            all_greedy=False,
+                            use_top_k=use_top_k,
+                            use_top_p=use_top_p,
+                        ).view(-1)
                         out = self.rejection_sampler(
                             draft_token_ids=draft_token_ids,
                             num_draft_tokens=draft_lengths,
                             target_logits=target_logits_ng,
-                            bonus_token_ids=bonus_token_ids,
+                            bonus_token_ids=sampled_bonus_ids,
                             segment_ids=segment_ids,
                             group_indices=group_indices,
                             max_draft_tokens=k,
@@ -6842,8 +6901,9 @@ class TPUModelRunner(GPUModelRunner):
         exact fused programs is to run the real two-phase execute path once. We
         do that here on synthetic requests -- both greedy and non-greedy
         (do_sampling=True), since the two verify+sample paths fuse into distinct
-        programs -- then fully tear each request down so serving starts from a
-        clean batch. execute_model / sample_tokens
+        programs, and the non-greedy one once per MASK_FLAG_COMBINATIONS entry,
+        whose sampler programs differ too -- then fully tear each request down
+        so serving starts from a clean batch. execute_model / sample_tokens
         branch internally on async_scheduling, so this same body warms whichever
         mode the process is configured for: in async it auto-routes through the
         real async dispatch (the unified device-seeded propose,
@@ -6889,10 +6949,11 @@ class TPUModelRunner(GPUModelRunner):
                 if int(P) > self.max_model_len:
                     continue
                 # Greedy and non-greedy (do_sampling=True) verify+sample are
-                # DISTINCT fused programs, so sweep both at every prompt bucket.
-                for greedy in (True, False):
+                # DISTINCT fused programs, and so is each pair of top-k/top-p
+                # flags of the non-greedy one: sweep all at every prompt bucket.
+                for greedy, mask_flags in _SPEC_WARMUP_SAMPLING:
                     if not self._warmup_one_spec_request(
-                        int(P), idx=i, quiet=True, greedy=greedy
+                        int(P), idx=i, quiet=True, greedy=greedy, mask_flags=mask_flags
                     ):
                         # First attempt cold-compiles the draft forward; a
                         # SymInt from that cold compile can leak into the
@@ -6900,7 +6961,9 @@ class TPUModelRunner(GPUModelRunner):
                         # once now that the forward is compiled and returns
                         # concrete-shaped tensors (this attempt logs loudly if it
                         # also fails).
-                        self._warmup_one_spec_request(int(P), idx=i, greedy=greedy)
+                        self._warmup_one_spec_request(
+                            int(P), idx=i, greedy=greedy, mask_flags=mask_flags
+                        )
             # (2) Batched spec steps. A bucketed-draft proposer depends on no
             # exact request count, so one count per program-bucket combination
             # (`_spec_warmup_bucket_grid`), each with a short decode run and a
@@ -6917,18 +6980,23 @@ class TPUModelRunner(GPUModelRunner):
                     sweep,
                 )
                 for R in sweep:
-                    self._warmup_spec_batch(
-                        int(R), P_small, greedy=True, short=True, mixed=True
-                    )
-                    self._warmup_spec_batch(
-                        int(R), P_small, greedy=False, short=True, mixed=True
-                    )
+                    for greedy, mask_flags in _SPEC_WARMUP_SAMPLING:
+                        self._warmup_spec_batch(
+                            int(R),
+                            P_small,
+                            greedy=greedy,
+                            short=True,
+                            mixed=True,
+                            mask_flags=mask_flags,
+                        )
             elif self.scheduler_config.max_num_seqs > 1:
                 P_small = int(self.num_tokens_paddings[0])
                 for R in self.num_reqs_paddings:
                     if int(R) > 1:
-                        self._warmup_spec_batch(int(R), P_small, greedy=True)
-                        self._warmup_spec_batch(int(R), P_small, greedy=False)
+                        for greedy, mask_flags in _SPEC_WARMUP_SAMPLING:
+                            self._warmup_spec_batch(
+                                int(R), P_small, greedy=greedy, mask_flags=mask_flags
+                            )
         logger.info("spec-decode warmup compiled %d graphs", self.num_xla_graphs - n0)
 
     def _spec_warmup_bucket_grid(self, mixed: bool) -> list[int]:
@@ -6984,13 +7052,14 @@ class TPUModelRunner(GPUModelRunner):
         *,
         short: bool = False,
         mixed: bool = False,
+        mask_flags: tuple[bool, bool] = (False, False),
     ) -> None:
         """Warm an nr=R decode batch: prefill R synthetic requests then decode
         them together so the multi-request fused programs are compiled.
 
         greedy=False routes the non-greedy (do_sampling=True) verify+sample
-        fusion, which is a distinct set of programs from the greedy path."""
-        from vllm.sampling_params import SamplingParams
+        fusion, which is a distinct set of programs from the greedy path;
+        mask_flags picks its (use_top_k, use_top_p) variant."""
         from vllm.v1.core.sched.output import (
             CachedRequestData,
             NewRequestData,
@@ -7018,8 +7087,14 @@ class TPUModelRunner(GPUModelRunner):
         rids = [f"__spec_warmup_b{R}_{j}__" for j in range(R)]
         mix_rid = f"__spec_warmup_b{R}_mix"
         mix_ids: list[str] = []
-        sp = SamplingParams(temperature=0.0 if greedy else 1.0)
-        logger.info("spec-decode warmup batch: R=%d P=%d greedy=%s", R, P, greedy)
+        sp = _spec_warmup_sampling_params(greedy, mask_flags)
+        logger.info(
+            "spec-decode warmup batch: R=%d P=%d greedy=%s top_k=%s top_p=%s",
+            R,
+            P,
+            greedy,
+            *mask_flags,
+        )
         try:
             # Match the low-block working set used by the LIFO BlockPool
             # workaround. High physical block ids can trigger the v7x SC2
@@ -7154,9 +7229,16 @@ class TPUModelRunner(GPUModelRunner):
             self._warmup_spec_decode_cleanup(rids + mix_ids)
 
     def _warmup_one_spec_request(
-        self, P: int, idx: int, quiet: bool = False, greedy: bool = True
+        self,
+        P: int,
+        idx: int,
+        quiet: bool = False,
+        greedy: bool = True,
+        mask_flags: tuple[bool, bool] = (False, False),
     ) -> bool:
         """Run one synthetic spec-decode request (prefill P + decodes).
+
+        A non-greedy request sets top-k and top-p as mask_flags says.
 
         Returns True on success, False if the warmup raised (and was caught).
         The caller retries a failed bucket once: the first attempt cold-compiles
@@ -7164,7 +7246,6 @@ class TPUModelRunner(GPUModelRunner):
         dynamic=False gather wrapper on the very first bucket; the retry runs with
         the forward already compiled (returning concrete-shaped tensors).
         """
-        from vllm.sampling_params import SamplingParams
         from vllm.v1.core.sched.output import (
             CachedRequestData,
             NewRequestData,
@@ -7204,7 +7285,7 @@ class TPUModelRunner(GPUModelRunner):
             logger.warning("skip spec-decode warmup P=%d: not enough kv blocks", P)
             return False
         block_ids = tuple(block_ids_per_group)
-        sp = SamplingParams(temperature=0.0 if greedy else 1.0)
+        sp = _spec_warmup_sampling_params(greedy, mask_flags)
         try:
             # ---- prefill ----
             new_req = NewRequestData(
