@@ -36,6 +36,7 @@ from vllm_torchtpu.kernels.attention_preprocessing.tuned_block_sizes import (
 # The resident FP8 qr encoding has (32, 128) tiles: every dynamic row offset
 # stored into it (token tiles, quantization fragments) must be a multiple of 32.
 _ROW_ALIGN = 32
+_BF16_ROW_TILE = 16  # rows of one BF16 (16, 128) tile
 
 
 def _qb_rope_kernel(
@@ -52,6 +53,7 @@ def _qb_rope_kernel(
     token_offset,
     aliased,
     last_rows,
+    real_rows,
 ):
     if aliased:
         refs = refs[1:]  # the aliased input is read and written as the output
@@ -66,6 +68,7 @@ def _qb_rope_kernel(
         sems,
         weight_ref,
         weight_sems,
+        *row_pads,
     ) = refs
     window, tile = pl.program_id(0), pl.program_id(1)
     windows, tiles = pl.num_programs(0), pl.num_programs(1)
@@ -101,16 +104,27 @@ def _qb_rope_kernel(
 
     @pl.when(window == 0)
     def prepare_rows():
+        qr_rows, rope_rows = qr_ref, rope_rows_ref
+        if real_rows is not None:
+            # The tile's rows past the real tokens are zero, as the wrapper's
+            # pad would make them.
+            qr_rows, rope_rows = row_pads
+            for pad_ref, src_ref in ((qr_rows, qr_ref), (rope_rows, rope_rows_ref)):
+                pad_ref[:real_rows, :] = src_ref[...]
+                pad_ref[real_rows:, :] = jnp.zeros(
+                    (tb - real_rows, pad_ref.shape[1]), pad_ref.dtype
+                )
+
         def quantize_fragment(fragment, _):
             start = pl.multiple_of(fragment * quant_fragment, quant_fragment)
             rows = pl.ds(start, quant_fragment)
             cached = pl.ds(token_start + start, quant_fragment)
-            encoded, scale = _quantize_rows(qr_ref[rows, :])
+            encoded, scale = _quantize_rows(qr_rows[rows, :])
             encoded_ref[cached, :] = encoded
             row_scale_ref[cached, :] = scale
 
         jax.lax.fori_loop(0, tb // quant_fragment, quantize_fragment, None)
-        cos_lanes, sin_lanes = rope_gather.coefficients(rope_rows_ref[...])
+        cos_lanes, sin_lanes = rope_gather.coefficients(rope_rows[...])
         coeff_ref[0, pl.ds(token_start, tb), :] = cos_lanes
         coeff_ref[1, pl.ds(token_start, tb), :] = sin_lanes
 
@@ -338,7 +352,10 @@ def _segment_call(
     segment,
     head_dim,
     out_tokens,
+    real_rows=None,
 ):
+    """``real_rows``: ``qr``/``rope_rows`` hold that many rows of one tile,
+    zero-padded to it in VMEM."""
     tokens, rank = qr.shape
     heads = weight.shape[1] // head_dim
     tb, hb = config.token_block, config.head_block
@@ -352,13 +369,22 @@ def _segment_call(
         return (jnp.where(h == 0, first_tile + t, last_tile), 0)
 
     once = pl.Buffered(buffer_count=1)
+    row_block = tb if real_rows is None else real_rows
     in_specs = [
-        pl.BlockSpec((tb, rank), rows),
+        pl.BlockSpec((row_block, rank), rows),
         pl.BlockSpec(memory_space=pltpu.HBM),  # streamed per head pair
         # The previous step's last pair may belong to the previous window.
         pl.BlockSpec(weight_scale.shape, lambda h, t, *_: (0,), once),
-        pl.BlockSpec((tb, rotary_dim), rows),
+        pl.BlockSpec((row_block, rotary_dim), rows),
     ]
+    row_pads = (
+        ()
+        if real_rows is None
+        else (
+            pltpu.VMEM((tb, rank), qr.dtype),
+            pltpu.VMEM((tb, rotary_dim), rope_rows.dtype),
+        )
+    )
     operands = [qr, weight, weight_scale, rope_rows]
     aliases = {}
     if out is not None:
@@ -380,6 +406,7 @@ def _segment_call(
             pltpu.SemaphoreType.DMA((config.output_slots,)),
             pltpu.VMEM((2, hb // 2, rank, 2 * head_dim), weight.dtype),
             pltpu.SemaphoreType.DMA((2, hb // 2)),
+            *row_pads,
         ),
     )
     last_rows = min(tb, out_tokens - (offset + segment - tb))
@@ -393,6 +420,7 @@ def _segment_call(
         token_offset=offset,
         aliased=out is not None,
         last_rows=last_rows,
+        real_rows=real_rows,
     )
     return pl.pallas_call(
         kernel,
@@ -433,13 +461,18 @@ def fused_qb_rope(
     rope_gather.check_rope_rows(rope_rows, tokens, head_dim)
     heads = weight.shape[1] // head_dim
     padded = -(-tokens // _ROW_ALIGN) * _ROW_ALIGN
-    if padded != tokens:
-        qr = jnp.pad(qr, ((0, padded - tokens), (0, 0)))
-        rope_rows = jnp.pad(rope_rows, ((0, padded - tokens), (0, 0)))
     if config is None:
         config = select_config(padded, rank, weight.shape[1], heads)
     segment = _segment_tokens(config, padded, rank, heads, head_dim)
     check_config(config, segment, heads)
+    # One token tile pads its rows in VMEM, where qr rows store in BF16 tiles.
+    real_rows = None
+    if padded != tokens:
+        if tokens % _BF16_ROW_TILE == 0 and config.token_block == segment == padded:
+            real_rows = tokens
+        else:
+            qr = jnp.pad(qr, ((0, padded - tokens), (0, 0)))
+            rope_rows = jnp.pad(rope_rows, ((0, padded - tokens), (0, 0)))
     weight_scale = weight_scale.reshape(-1)
     # Output DMAs move whole (8, 128) tiles of rows.
     out_tokens = tokens if exact_rows and tokens % 8 == 0 else padded
@@ -456,6 +489,7 @@ def fused_qb_rope(
             segment=segment,
             head_dim=head_dim,
             out_tokens=out_tokens,
+            real_rows=real_rows,
         )
     assert out is not None
     return out if out_tokens == tokens else out[:tokens]

@@ -193,3 +193,41 @@ def test_exact_rows_is_bitwise_the_sliced_result(tokens, token_block):
     np.testing.assert_array_equal(
         np.asarray(exact).view(np.uint16), np.asarray(sliced).view(np.uint16)
     )
+
+
+def _shapes(tokens, heads=64, rank=1280, head_dim=512):
+    return (
+        jax.ShapeDtypeStruct((tokens, rank), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rank, heads * head_dim), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((heads * head_dim,), jnp.float32),
+        jax.ShapeDtypeStruct((tokens, 64), jnp.float32),
+    )
+
+
+@pytest.mark.parametrize(("tokens", "pads"), [(16, 0), (48, 0), (40, 2), (1024, 0)])
+def test_one_tile_pads_rows_in_vmem(tokens, pads):
+    """16-row-aligned inputs of one token tile need no XLA pad."""
+    graph = str(jax.make_jaxpr(qb_rope.fused_qb_rope)(*_shapes(tokens)))
+    assert graph.count(" pad[") == pads
+
+
+@pytest.mark.parametrize("tokens", [16, 40, 48, 64, 240, 1024])
+def test_vmem_row_pad_is_bitwise(tokens):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Requires a TPU backend")
+    positions = (np.arange(tokens) * 37) % 4096
+    qr, weight, scale, rows = _inputs(tokens, 64, positions)
+    padded = -(-tokens // 32) * 32
+    expected = jax.jit(qb_rope.fused_qb_rope)(
+        jnp.pad(qr, ((0, padded - tokens), (0, 0))),
+        weight,
+        scale,
+        jnp.pad(rows, ((0, padded - tokens), (0, 0))),
+    )[:tokens]
+    for exact_rows in (False, True):
+        actual = jax.jit(
+            functools.partial(qb_rope.fused_qb_rope, exact_rows=exact_rows)
+        )(qr, weight, scale, rows)
+        np.testing.assert_array_equal(
+            np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16)
+        )
