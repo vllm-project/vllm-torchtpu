@@ -286,6 +286,34 @@ def test_weighted_sum_matches_the_k_ordered_sum(interpret, fp8_rows, form):
     assert _off_fraction(got, want) < 1e-3
 
 
+def test_weighted_sum_drops_a_zero_weight_route_with_a_bad_scale(interpret):
+    """A route of weight zero reads a row nobody wrote, whose scale is
+    whatever was there: a NaN or Inf scale must not reach the token."""
+    tokens, top_k, hidden = 128, 4, 1024
+    rows, weights = _pairs(tokens, top_k, hidden)
+    finite = np.nan_to_num(rows, nan=0.0)
+    scales = (np.abs(finite).max(axis=1) / 448.0).astype(np.float32)
+    q = jnp.asarray(finite / np.where(scales > 0, scales, 1)[:, None]).astype(
+        jnp.float8_e4m3fn
+    )
+    bad = scales.reshape(tokens, top_k)
+    bad[::2, -1] = np.nan  # the last slot has weight zero on every token
+    bad[1::2, -1] = np.inf
+    got = combine.weighted_sum(
+        q.reshape(tokens * top_k, hidden // LANES, LANES),
+        jnp.asarray(bad.reshape(-1)),
+        jnp.asarray(weights),
+        tokens_per_shard=tokens,
+        hidden=hidden,
+        out_dtype=jnp.bfloat16,
+    )
+    got = np.asarray(got.astype(jnp.float32))
+    assert np.isfinite(got).all()
+    with np.errstate(invalid="ignore"):
+        coef = np.where(weights != 0, weights * bad, 0.0)
+    assert _off_fraction(got, _k_ordered_sum(q, coef, tokens, top_k, hidden)) < 1e-3
+
+
 def _off_fraction(got, want):
     """The fraction of values more than one bf16 step from the reference."""
     want = np.asarray(jnp.asarray(want).astype(jnp.bfloat16), np.float32)

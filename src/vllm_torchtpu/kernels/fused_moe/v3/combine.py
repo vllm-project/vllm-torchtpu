@@ -68,7 +68,9 @@ def _weighted_sum_body(
     coef = weights_ref[...]
     if with_scales:
         assert scales_ref is not None
-        coef = coef * scales_ref[...]
+        # A route of weight zero reads a row nobody wrote, whose scale may be
+        # NaN or Inf: its coefficient stays zero instead of 0 * NaN.
+        coef = jnp.where(coef != 0, coef * scales_ref[...], jnp.float32(0.0))
     coef_vmem[...] = coef
 
     def token(t, carry):
