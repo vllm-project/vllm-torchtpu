@@ -22,6 +22,7 @@ import pytest
 import torch
 from vllm.model_executor.models import deepseek_v2
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
     fused_moe_prefill_kernel_v2 as v2,
 )
@@ -322,3 +323,28 @@ def test_flag_off_keeps_the_stock_rmsnorm():
         [sys.executable, "-c", probe], env=env, capture_output=True, text=True
     )
     assert done.returncode == 0, done.stderr[-2000:]
+
+
+@pytest.mark.parametrize(
+    ("split", "ep", "rotated", "error"),
+    [
+        (False, False, False, None),
+        (True, True, True, None),
+        (True, False, True, "ROTATED_SCATTER needs TPU_PREFILL_SEQ_PARALLEL_EP=1"),
+        (False, True, False, "_EP needs TPU_PREFILL_SEQ_PARALLEL=1"),
+    ],
+)
+def test_ep_switches_need_the_split(monkeypatch, split, ep, rotated, error):
+    """A switch set without the one it builds on fails at platform activation,
+    before the forward is patched."""
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL", split)
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP", ep)
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER", rotated)
+    if error is None:
+        prefill_token_split.check_env()
+        return
+    monkeypatch.setattr(prefill_token_split, "_UPSTREAM_MODEL_FORWARD", None)
+    forward = deepseek_v2.DeepseekV2Model.forward
+    with pytest.raises(ValueError, match=error):
+        prefill_token_split.maybe_patch_deepseek_v2()
+    assert deepseek_v2.DeepseekV2Model.forward is forward
