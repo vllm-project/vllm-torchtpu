@@ -18,29 +18,37 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import pytest
 
-from tests.roofline.conftest import QWEN35_CFG
+from tests.roofline.conftest import QWEN35_CFG, SMALL_HYBRID_MOE_CFG
 from vllm_torchtpu import roofline
 from vllm_torchtpu.roofline import (
     CHIPS,
+    TOPOLOGIES,
     Dtypes,
     FloorOptions,
     Parallel,
+    SolveOptions,
     SpecShape,
     StepShape,
+    TrafficScenario,
+    cli,
     from_hf_config,
+    layer_ffn_kinds,
+    pareto_skyline_by_concurrency,
     pass_costs,
+    render_html,
+    solve_serving_plan,
     spec_cycle_floor,
     step_floor,
 )
-from vllm_torchtpu.roofline.geometry import layer_ffn_kinds
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+_CLI_USAGE_EXIT_CODE = 2
 _DEFAULT_DECODE_GRID = [1, 4, 16, 64]
 _DEFAULT_DECODE_ACTIVE = [10.0, 28.0, 80.0, 200.0]
 _DEFAULT_PREFILL_GRID = [1, 64, 512]
@@ -598,3 +606,467 @@ def test_activation_hull_rejects_boolean_active_experts(
                 prefill_token_grid=(1,),
                 prefill_active_experts=(10.0,),
             )
+
+
+def test_default_bernoulli_regime_leaves_hard_floor_and_serial_estimate_unchanged() -> (
+    None
+):
+    """Default bernoulli keeps hard_floor_s, serial_estimate_s, and verdicts fixed."""
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    chip = CHIPS["tpu7x"]
+    dt = Dtypes(w_dense=1.0, w_expert=1.0, kv=1.0)
+    par = Parallel(tp=8, ep=8, moe="ep", moe_dispatch="a2a_push")
+
+    sf_default = step_floor(
+        geom,
+        chip,
+        par,
+        StepShape(batch=8, rows_per_seq=1, context=1024),
+        FloorOptions(dt=dt),
+    )
+    sf_pigeon = step_floor(
+        geom,
+        chip,
+        par,
+        StepShape(batch=8, rows_per_seq=1, context=1024),
+        FloorOptions(
+            dt=dt,
+            activation_model=roofline.ExpertActivationModel(regime="pigeonhole"),
+        ),
+    )
+    assert sf_default.hard_floor_s == pytest.approx(
+        sf_pigeon.hard_floor_s, rel=0, abs=0
+    )
+    assert sf_default.serial_estimate_s == pytest.approx(
+        sf_pigeon.serial_estimate_s, rel=0, abs=0
+    )
+    assert sf_default.hard_floor_s < sf_default.envelope_floor_s
+    assert sf_default.envelope_floor_s <= sf_default.serial_estimate_s
+
+    probe_scenario = TrafficScenario(
+        name="bernoulli_probe",
+        isl=512,
+        osl=256,
+        concurrencies=(16,),
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        kv_working_set_turns=1.0,
+        ttft_slo_ms=2000.0,
+        tpot_slo_ms=None,
+        think_time_s=0.0,
+    )
+    probe_plan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        probe_scenario,
+        SolveOptions(mode="mixed", max_chips=4, topologies=(TOPOLOGIES["2x2x1"],)),
+    )
+    separated = [
+        pt for pt in probe_plan.candidates if pt.bound_tpot_ms < pt.envelope_tpot_ms
+    ]
+    assert separated
+    mid_slo = 0.5 * (separated[0].bound_tpot_ms + separated[0].envelope_tpot_ms)
+    scenario = replace(probe_scenario, name="bernoulli_invariance", tpot_slo_ms=mid_slo)
+    plan_default = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4, topologies=(TOPOLOGIES["2x2x1"],)),
+    )
+    plan_pigeon = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scenario,
+        SolveOptions(
+            mode="mixed",
+            max_chips=4,
+            topologies=(TOPOLOGIES["2x2x1"],),
+            activation_model=roofline.ExpertActivationModel(regime="pigeonhole"),
+        ),
+    )
+    assert len(plan_default.candidates) == len(plan_pigeon.candidates)
+    for pt_def, pt_pig in zip(
+        plan_default.candidates, plan_pigeon.candidates, strict=True
+    ):
+        assert pt_def.bound_tpot_ms == pytest.approx(pt_pig.bound_tpot_ms, rel=0, abs=0)
+        assert pt_def.bound_ttft_ms == pytest.approx(pt_pig.bound_ttft_ms, rel=0, abs=0)
+        assert pt_def.est_tpot_ms == pytest.approx(pt_pig.est_tpot_ms, rel=0, abs=0)
+        assert pt_def.slo_verdict == pt_pig.slo_verdict
+    assert plan_default.search is not None
+    assert plan_default.search.envelope_feasible < plan_default.search.not_ruled_out
+    assert (
+        plan_default.search.enumerated
+        >= plan_default.search.hbm_fit
+        >= plan_default.search.not_ruled_out
+        >= plan_default.search.envelope_feasible
+        >= plan_default.search.slo_met
+        >= 0
+    )
+
+
+@pytest.mark.parametrize("mode", ["mixed", "disagg"])
+@pytest.mark.parametrize("think_time_s", [0.0, 2.0])
+def test_empirical_hull_prunes_across_modes_and_think_times(
+    tmp_path: Path,
+    mode: Literal["mixed", "disagg"],
+    think_time_s: float,
+) -> None:
+    """Hull prunes ruled-out points and tracks envelope residency for mixed & disagg."""
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    chip = CHIPS["tpu7x"]
+    dt = Dtypes(w_dense=1.0, w_expert=1.0, kv=1.0)
+    hull_path = _write_hull_json(
+        tmp_path / f"small_hull_{mode}_{think_time_s}.json",
+        geom,
+        decode_curve=([1, 4, 16, 64], [float(geom.top_k), 6.0, 12.0, 15.0]),
+        prefill_curve=([1, 16, 128], [float(geom.top_k), 12.0, 15.5]),
+    )
+    hull_model = roofline.load_activation_hull(hull_path, geom)
+    max_chips = 4 if mode == "mixed" else 8
+    topos = (TOPOLOGIES["2x2x1"],)
+    base_scenario = TrafficScenario(
+        name=f"hull_{mode}_{think_time_s}",
+        isl=256,
+        osl=1024,
+        concurrencies=(64,),
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        kv_working_set_turns=1.0,
+        ttft_slo_ms=50.0,
+        tpot_slo_ms=None,
+        think_time_s=think_time_s,
+    )
+    unconstrained = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        base_scenario,
+        SolveOptions(
+            mode=mode,
+            max_chips=max_chips,
+            topologies=topos,
+            activation_model=hull_model,
+        ),
+    )
+    separated = [
+        pt for pt in unconstrained.candidates if pt.bound_tpot_ms < pt.envelope_tpot_ms
+    ]
+    assert separated
+    assert all(
+        1.0 <= pt.min_decode_seqs <= pt.envelope_decode_seqs
+        for pt in unconstrained.candidates
+    )
+    target_pt = max(separated, key=lambda pt: pt.envelope_tpot_ms - pt.bound_tpot_ms)
+    mid_slo = 0.5 * (target_pt.bound_tpot_ms + target_pt.envelope_tpot_ms)
+    constrained = replace(base_scenario, tpot_slo_ms=mid_slo)
+    plan_bern = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        constrained,
+        SolveOptions(mode=mode, max_chips=max_chips, topologies=topos),
+    )
+    plan_hull = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        constrained,
+        SolveOptions(
+            mode=mode,
+            max_chips=max_chips,
+            topologies=topos,
+            activation_model=hull_model,
+        ),
+    )
+    assert plan_bern.search is not None
+    assert plan_hull.search is not None
+    assert plan_hull.search.not_ruled_out < plan_bern.search.not_ruled_out
+    assert plan_hull.search.not_ruled_out == plan_hull.search.envelope_feasible
+
+
+def test_pareto_skyline_uses_envelope_tpot_under_empirical_hull() -> None:
+    """Hull skyline uses envelope_tpot_ms across family, anchor, slot fill, and sort."""
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    chip = CHIPS["tpu7x"]
+    dt = Dtypes(w_dense=1.0, w_expert=1.0, kv=1.0)
+    hull_model = roofline.ExpertActivationModel(
+        regime="empirical_hull",
+        decode_token_grid=(1, 4, 16),
+        decode_active_experts=(float(geom.top_k), 6.0, 12.0),
+        prefill_token_grid=(1, 16),
+        prefill_active_experts=(float(geom.top_k), 12.0),
+    )
+    bern_model = roofline.ExpertActivationModel(regime="bernoulli")
+    scenario = TrafficScenario(
+        name="skyline_envelope_order",
+        isl=256,
+        osl=128,
+        concurrencies=(16,),
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        kv_working_set_turns=1.0,
+        think_time_s=0.0,
+    )
+    base_plan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scenario,
+        SolveOptions(
+            mode="mixed",
+            max_chips=4,
+            topologies=(TOPOLOGIES["2x2x1"],),
+            activation_model=hull_model,
+        ),
+    )
+    template = base_plan.candidates[0]
+
+    def _make_group(
+        tp: int,
+        metrics: tuple[float, float, float, float],
+        *,
+        kv_split: int = 1,
+    ) -> roofline.ParetoPoint:
+        """Build synthetic ParetoPoint with controlled TP group and TPOT floors."""
+        tput, inter, bound_tpot, envelope_tpot = metrics
+        pool = replace(template.decode_pool, tp=tp, kv_split=kv_split)
+        return replace(
+            template,
+            decode_pool=pool,
+            slo_met=True,
+            token_throughput_per_chip=tput,
+            est_interactivity_tok_s=inter,
+            bound_tpot_ms=bound_tpot,
+            envelope_tpot_ms=envelope_tpot,
+        )
+
+    # 1. Family winner (_skyline_preference): same mesh family, different kv_split.
+    kv_split_hull_winner = 2
+    fam_v1 = _make_group(1, (1000.0, 100.0, 1.0, 5.0), kv_split=1)
+    fam_v2 = _make_group(1, (1000.0, 100.0, 2.0, 3.0), kv_split=kv_split_hull_winner)
+    hull_fam = pareto_skyline_by_concurrency(
+        replace(base_plan, candidates=(fam_v1, fam_v2), activation_model=hull_model),
+        k=1,
+    )[16][0]
+    bern_fam = pareto_skyline_by_concurrency(
+        replace(base_plan, candidates=(fam_v1, fam_v2), activation_model=bern_model),
+        k=1,
+    )[16][0]
+    assert hull_fam.decode_pool.kv_split == kv_split_hull_winner
+    assert bern_fam.decode_pool.kv_split == 1
+
+    # 2 & 3. Anchor 1 (k=1) and final sort (k=2) on tied-throughput groups.
+    tp_hull_winner = 4
+    grp_a = _make_group(2, (1000.0, 100.0, 1.0, 5.0))
+    grp_b = _make_group(tp_hull_winner, (1000.0, 100.0, 2.0, 3.0))
+    hull_pair = pareto_skyline_by_concurrency(
+        replace(base_plan, candidates=(grp_a, grp_b), activation_model=hull_model),
+        k=2,
+    )[16]
+    bern_pair = pareto_skyline_by_concurrency(
+        replace(base_plan, candidates=(grp_a, grp_b), activation_model=bern_model),
+        k=2,
+    )[16]
+    assert [pt.decode_pool.tp for pt in hull_pair] == [tp_hull_winner, 2]
+    assert [pt.decode_pool.tp for pt in bern_pair] == [2, tp_hull_winner]
+    assert (
+        pareto_skyline_by_concurrency(
+            replace(base_plan, candidates=(grp_a, grp_b), activation_model=hull_model),
+            k=1,
+        )[16][0].decode_pool.tp
+        == tp_hull_winner
+    )
+
+    # 4. Slot fill (_fill_skyline_slots): 3 anchors take slots 1..3; slot 4 fills.
+    fill_candidates = (
+        _make_group(1, (500.0, 50.0, 0.5, 0.5)),
+        _make_group(2, (2000.0, 50.0, 4.0, 4.0)),
+        _make_group(4, (500.0, 200.0, 4.0, 4.0)),
+        _make_group(8, (900.0, 90.0, 1.5, 3.5)),
+        _make_group(16, (900.0, 90.0, 2.5, 2.0)),
+    )
+    hull_fill_tps = {
+        pt.decode_pool.tp
+        for pt in pareto_skyline_by_concurrency(
+            replace(base_plan, candidates=fill_candidates, activation_model=hull_model),
+            k=4,
+        )[16]
+    }
+    bern_fill_tps = {
+        pt.decode_pool.tp
+        for pt in pareto_skyline_by_concurrency(
+            replace(base_plan, candidates=fill_candidates, activation_model=bern_model),
+            k=4,
+        )[16]
+    }
+    assert hull_fill_tps == {1, 2, 4, 16}
+    assert bern_fill_tps == {1, 2, 4, 8}
+
+
+def _assert_legacy_html_omits_absent_activation_fields(
+    out_hull: dict[str, object],
+) -> None:
+    """Verify older solve/v2 payloads lacking activation keys render cleanly."""
+    legacy_payload = dict(out_hull)
+    legacy_payload.pop("activation_regime", None)
+    raw_search = legacy_payload["search"]
+    assert isinstance(raw_search, dict)
+    legacy_search = dict(raw_search)
+    legacy_search.pop("envelope_feasible", None)
+    legacy_payload["search"] = legacy_search
+    legacy_html = render_html(legacy_payload)
+    assert "MoE Activation:" not in legacy_html
+    assert "Envelope Feasible" not in legacy_html
+
+
+def test_cli_moe_activation_flag_sets_payload_activation_regime(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI --moe-activation sets activation_regime across solve/emit/HTML and prunes."""
+    cfg_path = tmp_path / "small_moe_config.json"
+    cfg_path.write_text(json.dumps(SMALL_HYBRID_MOE_CFG), encoding="utf-8")
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    hull_path = _write_hull_json(
+        tmp_path / "small_moe_hull.json",
+        geom,
+        decode_curve=([1, 4, 16], [float(geom.top_k), 6.0, 12.0]),
+        prefill_curve=([1, 16, 128], [float(geom.top_k), 12.0, 15.5]),
+    )
+    shared_args = [
+        "--config",
+        str(cfg_path),
+        "--chip",
+        "tpu7x",
+        "--mode",
+        "mixed",
+        "--max-chips",
+        "4",
+        "--isl",
+        "256",
+        "--osl",
+        "128",
+        "--concurrency",
+        "16",
+        "--prefix-hit-rate",
+        "0.0",
+        "--accept-len",
+        "1.0",
+        "--think-time-s",
+        "0.0",
+        "--json",
+    ]
+    solve_args = ["solve", *shared_args]
+
+    assert cli.main([*solve_args, "--moe-activation", "pigeonhole"]) == 0
+    out_pigeon = json.loads(capsys.readouterr().out)
+    assert out_pigeon["activation_regime"] == "pigeonhole"
+    assert "envelope_feasible" in out_pigeon["search"]
+
+    assert cli.main([*solve_args, "--moe-activation", "bernoulli"]) == 0
+    out_bern = json.loads(capsys.readouterr().out)
+    assert out_bern["activation_regime"] == "bernoulli"
+    assert "envelope_*" in out_bern["provenance"]["basis"]
+
+    # emit JSON also records activation_regime inside serving_plan.
+    assert (
+        cli.main(["emit", *shared_args, "--moe-activation", f"hull:{hull_path}"]) == 0
+    )
+    out_emit = json.loads(capsys.readouterr().out)
+    assert out_emit["serving_plan"]["activation_regime"] == "empirical_hull"
+
+    html_out = tmp_path / "report_hull.html"
+    assert (
+        cli.main(
+            [
+                *solve_args,
+                "--moe-activation",
+                f"hull:{hull_path}",
+                "--html",
+                str(html_out),
+            ]
+        )
+        == 0
+    )
+    out_hull = json.loads(capsys.readouterr().out)
+    assert out_hull["activation_regime"] == "empirical_hull"
+    html_text = html_out.read_text(encoding="utf-8")
+    assert "empirical_hull" in html_text
+    assert "No SLO set" in html_text
+    assert "Envelope Feasible" not in html_text
+    _assert_legacy_html_omits_absent_activation_fields(out_hull)
+
+    # With bounded TTFT SLO ensuring sound batch >= 2, pick TPOT SLO in the hull gap.
+    slo_solve_args = [
+        "solve",
+        "--config",
+        str(cfg_path),
+        "--chip",
+        "tpu7x",
+        "--mode",
+        "mixed",
+        "--max-chips",
+        "4",
+        "--isl",
+        "256",
+        "--osl",
+        "1024",
+        "--concurrency",
+        "64",
+        "--prefix-hit-rate",
+        "0.0",
+        "--accept-len",
+        "1.0",
+        "--think-time-s",
+        "0.0",
+        "--ttft-slo-ms",
+        "50.0",
+        "--json",
+    ]
+    assert cli.main([*slo_solve_args, "--moe-activation", f"hull:{hull_path}"]) == 0
+    out_hull_slo = json.loads(capsys.readouterr().out)
+    envelope_tpots = sorted(pt["envelope_tpot_ms"] for pt in out_hull_slo["candidates"])
+    bound_tpots = sorted(pt["bound_tpot_ms"] for pt in out_hull_slo["candidates"])
+    assert bound_tpots[-1] < envelope_tpots[-1]
+    mid_slo = 0.5 * (max(bound_tpots[-1], envelope_tpots[0]) + envelope_tpots[-1])
+    assert (
+        cli.main(
+            [
+                *slo_solve_args,
+                "--tpot-slo-ms",
+                f"{mid_slo:.6f}",
+                "--moe-activation",
+                "bernoulli",
+            ]
+        )
+        == 0
+    )
+    out_prune_bern = json.loads(capsys.readouterr().out)
+    html_slo = tmp_path / "report_hull_slo.html"
+    assert (
+        cli.main(
+            [
+                *slo_solve_args,
+                "--tpot-slo-ms",
+                f"{mid_slo:.6f}",
+                "--moe-activation",
+                f"hull:{hull_path}",
+                "--html",
+                str(html_slo),
+            ]
+        )
+        == 0
+    )
+    assert "Envelope Feasible" in html_slo.read_text(encoding="utf-8")
+    out_prune_hull = json.loads(capsys.readouterr().out)
+    assert (
+        out_prune_hull["search"]["not_ruled_out"]
+        < out_prune_bern["search"]["not_ruled_out"]
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main([*solve_args, "--moe-activation", "invalid_regime"])
+    assert exc_info.value.code == _CLI_USAGE_EXIT_CODE

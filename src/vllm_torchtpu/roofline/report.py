@@ -29,6 +29,7 @@ from .constants import (
     MIN_FRONTIER_POINTS_FOR_POLYLINE,
     PERCENT_SCALE,
     PREFIX_RANGE_PAIR_LEN,
+    SLO_VERDICT_RULED_OUT,
     SVG_GRID_CELL_PX,
     UNIT_GIGA,
     UNIT_MEGA,
@@ -91,13 +92,6 @@ def _as_int(value: object, default: int = 0) -> int:
     return default
 
 
-def _interactivity_val(point: Mapping[str, object]) -> float:
-    """Read estimated interactivity across solve/v1 and solve/v2 payloads."""
-    return _as_float(
-        point.get("est_interactivity_tok_s", point.get("p90_interactivity_tok_s"))
-    )
-
-
 def _escape(val: object) -> str:
     """Escape untrusted text for safe inline HTML embedding."""
     if val is None:
@@ -145,7 +139,7 @@ def _downsample_svg_points(
     seen: set[tuple[int, int]] = set()
     deduped: list[Mapping[str, object]] = []
     for p in points:
-        px = (_interactivity_val(p) / max_x) * plot_w
+        px = (_as_float(p.get("est_interactivity_tok_s")) / max_x) * plot_w
         py = (_as_float(p.get("token_throughput_per_chip")) / max_y) * plot_h
         cell = (int(px // SVG_GRID_CELL_PX), int(py // SVG_GRID_CELL_PX))
         if cell not in seen:
@@ -179,7 +173,7 @@ def _frontier_2d_envelope(
     ordered = sorted(
         points,
         key=lambda p: (
-            -_interactivity_val(p),
+            -_as_float(p.get("est_interactivity_tok_s")),
             -_as_float(p.get("token_throughput_per_chip")),
         ),
     )
@@ -190,14 +184,14 @@ def _frontier_2d_envelope(
         if tput > best_tput + FRONTIER_2D_TIE_TOLERANCE:
             envelope.append(pt)
             best_tput = tput
-    envelope.sort(key=lambda p: _interactivity_val(p))
+    envelope.sort(key=lambda p: _as_float(p.get("est_interactivity_tok_s")))
     return envelope
 
 
 def _point_2d_coords(point: Mapping[str, object]) -> tuple[float, float]:
     """Return rounded (interactivity, throughput) pair for 2D frontier matching."""
     return (
-        round(_interactivity_val(point), _ROUND_DECIMALS_2D),
+        round(_as_float(point.get("est_interactivity_tok_s")), _ROUND_DECIMALS_2D),
         round(_as_float(point.get("token_throughput_per_chip")), _ROUND_DECIMALS_2D),
     )
 
@@ -216,7 +210,7 @@ def _render_frontier_rings(
         pt = _as_mapping(entry.get("point"))
         if not pt:
             continue
-        inter = _interactivity_val(pt)
+        inter = _as_float(pt.get("est_interactivity_tok_s"))
         tput = _as_float(pt.get("token_throughput_per_chip"))
         conc_val = _as_int(pt.get("concurrency"), 1)
         role = str(entry.get("frontier_role", "candidate"))
@@ -272,7 +266,7 @@ def _render_frontier_svg(
         )
 
     raw_max_x = max(
-        (_interactivity_val(p) for p in all_pts),
+        (_as_float(p.get("est_interactivity_tok_s")) for p in all_pts),
         default=1.0,
     )
     raw_max_y = max(
@@ -328,7 +322,7 @@ def _render_frontier_svg(
         )
 
     for p in _downsample_svg_points(all_pts, (max_x, max_y), (plot_w, plot_h)):
-        inter = _interactivity_val(p)
+        inter = _as_float(p.get("est_interactivity_tok_s"))
         tput = _as_float(p.get("token_throughput_per_chip"))
         svg_parts.append(
             f'<circle cx="{scale_x(inter):.1f}" cy="{scale_y(tput):.1f}" r="3.5" '
@@ -344,7 +338,7 @@ def _render_frontier_svg(
     }
     if len(envelope_2d) >= MIN_FRONTIER_POINTS_FOR_POLYLINE:
         poly_pts = " ".join(
-            f"{scale_x(_interactivity_val(p)):.1f},"
+            f"{scale_x(_as_float(p.get('est_interactivity_tok_s'))):.1f},"
             f"{scale_y(_as_float(p.get('token_throughput_per_chip'))):.1f}"
             for p in envelope_2d
         )
@@ -354,7 +348,7 @@ def _render_frontier_svg(
         )
 
     for p in envelope_2d:
-        inter = _interactivity_val(p)
+        inter = _as_float(p.get("est_interactivity_tok_s"))
         tput = _as_float(p.get("token_throughput_per_chip"))
         conc_val = _as_int(p.get("concurrency"), 1)
         cx_env = scale_x(inter)
@@ -838,11 +832,7 @@ def _extract_recommended_view(
     has_moe: bool = False,
 ) -> tuple[dict[str, object], list[Mapping[str, object]], str]:
     """Extract display metrics, instance pools, and summary for recommended."""
-    if (
-        rec is not None
-        and rec.get("slo_verdict") != "ruled_out"
-        and bool(rec.get("slo_met", True))
-    ):
+    if rec is not None and rec.get("slo_verdict") != SLO_VERDICT_RULED_OUT:
         pools_list: list[Mapping[str, object]] = []
         p_pool = _as_mapping(rec.get("prefill_pool"))
         d_pool = _as_mapping(rec.get("decode_pool"))
@@ -866,7 +856,7 @@ def _extract_recommended_view(
             "concurrency": _as_int(rec.get("concurrency"), 1),
             "tput": f"{_as_float(rec.get('token_throughput_per_chip')):,.1f}",
             "out_tput": f"{_as_float(rec.get('output_throughput_per_chip')):,.1f}",
-            "interactivity": f"{_interactivity_val(rec):,.1f}",
+            "interactivity": f"{_as_float(rec.get('est_interactivity_tok_s')):,.1f}",
             "ttft": (
                 f"{_as_float(bound_ttft):.1f} ~ {ttft_val:.1f}"
                 if bound_ttft is not None
@@ -1055,7 +1045,7 @@ def _render_table_rows(
             f"<td>{_as_int(candidate_point.get('concurrency'), 1)}</td>"
             f"<td>{_as_int(candidate_point.get('total_chips'), 0)}</td>"
             f"{pool_cells}"
-            f"<td>{_interactivity_val(candidate_point):,.1f}</td>"
+            f"<td>{_as_float(candidate_point.get('est_interactivity_tok_s')):,.1f}</td>"
             f"<td>{_as_float(candidate_point.get('token_throughput_per_chip')):,.1f}</td>"
             f"<td>{_as_float(candidate_point.get('bound_tpot_ms')):.2f}</td>"
             f"<td>{_as_float(candidate_point.get('est_ttft_ms')):,.1f}</td>"
@@ -1531,7 +1521,7 @@ def _render_concurrency_skyline_section(
             label = _pools_display(pt, has_moe=has_moe)
             bound_ms = _as_float(pt.get("bound_tpot_ms"))
             tput = _as_float(pt.get("token_throughput_per_chip"))
-            inter = _interactivity_val(pt)
+            inter = _as_float(pt.get("est_interactivity_tok_s"))
             floor_seqs = _as_float(
                 pt.get("min_decode_seqs", pt.get("residency_floor_seqs"))
             )
@@ -1818,9 +1808,7 @@ def render_html(payload: Mapping[str, object]) -> str:
 
     if (
         rec is not None
-        and (
-            rec.get("slo_verdict") == "ruled_out" or not bool(rec.get("slo_met", True))
-        )
+        and rec.get("slo_verdict") == SLO_VERDICT_RULED_OUT
         and not warnings
     ):
         warnings = [

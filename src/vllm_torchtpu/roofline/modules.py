@@ -234,7 +234,7 @@ def ep_busiest_experts(num_experts: int, top_k: int, rows: int, ranks: int) -> f
 
 
 def _split_matmul_flops(
-    rows: int,
+    rows: float,
     weight_elems: float,
     weight_bytes: float,
     act: str = "a8",
@@ -251,7 +251,7 @@ def _split_matmul_flops(
 
 
 def _subchannel_scale_vector_flops(
-    rows: int,
+    rows: float,
     weight_elems: float,
     weight_bytes: float,
     weight_block_size: tuple[int, int] = (1, 1),
@@ -346,6 +346,7 @@ class _StepContext:
     activation_model: ExpertActivationModel = field(
         default_factory=ExpertActivationModel
     )
+    unpadded_linear: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,6 +362,7 @@ class _AttnCollSpec:
     extra_rows: int = 0
     block_parallel: int = 1
     kv_bytes_per_tok: float = 0.0
+    unpadded_linear: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,7 +396,11 @@ def _attn_layer_collectives(
 ) -> tuple[Collective, ...]:
     """Return communication collectives for one attention layer."""
     rows = spec.batch * spec.rows_per_seq + spec.extra_rows
-    mp = padded_rows(rows, parallel.tp, parallel.residual)
+    mp = (
+        rows
+        if spec.unpadded_linear
+        else padded_rows(rows, parallel.tp, parallel.residual)
+    )
     s_bytes = float(mp * spec.hidden * 2)
     colls: list[Collective] = []
     if parallel.tp > 1:
@@ -490,11 +496,17 @@ def _moe_ag_ep_collectives(
     spec: _MoeLayerSpec,
     ep_ranks: int,
     parallel: Parallel,
+    *,
+    unpadded_linear: bool = False,
 ) -> tuple[Collective, ...]:
     """Return collectives for ag_ep MoE dispatch."""
     tp = parallel.tp
     global_rows = _moe_ep_global_rows(spec, parallel, ep_ranks)
-    per_rank_rows = max(1, math.ceil(global_rows / max(1, ep_ranks)))
+    per_rank_rows: int | float = (
+        float(global_rows) / float(max(1, ep_ranks))
+        if unpadded_linear
+        else max(1, math.ceil(global_rows / max(1, ep_ranks)))
+    )
     colls: list[Collective] = [
         _make_coll(
             "dispatch_ag", "ag", float(global_rows * spec.hidden), ep_ranks, parallel
@@ -603,6 +615,8 @@ def _moe_sp_collectives(
 def _moe_layer_collectives(
     spec: _MoeLayerSpec,
     parallel: Parallel,
+    *,
+    unpadded_linear: bool = False,
 ) -> tuple[Collective, ...]:
     """Derive collectives for one MoE layer."""
     is_ep = parallel.moe == "ep" and parallel.ep > 1
@@ -610,13 +624,19 @@ def _moe_layer_collectives(
     if parallel.tp <= 1 and ep_ranks <= 1:
         return ()
     tp = parallel.tp
-    mp = padded_rows(spec.rows, max(1, tp), parallel.residual)
+    mp = (
+        spec.rows
+        if unpadded_linear
+        else padded_rows(spec.rows, max(1, tp), parallel.residual)
+    )
     s_bytes = float(mp * spec.hidden * ACTIVATION_BYTES_BF16)
 
     if parallel.moe_dispatch == "ag_ep" or (
         parallel.moe == "ep" and ep_ranks > tp and parallel.moe_dispatch == "allreduce"
     ):
-        return _moe_ag_ep_collectives(spec, ep_ranks, parallel)
+        return _moe_ag_ep_collectives(
+            spec, ep_ranks, parallel, unpadded_linear=unpadded_linear
+        )
 
     if parallel.moe_dispatch == "fused_rs":
         return _moe_fused_rs_collectives(
@@ -629,12 +649,16 @@ def _moe_layer_collectives(
         if parallel.moe_dispatch == "a2a_push"
         else spec.rows * max(1, parallel.dp)
     )
-    push_wire = float(
-        math.ceil(a2a_rows / max(1, disp_group))
-        * spec.top_k
-        * (disp_group - 1)
-        / max(1, disp_group)
-        * spec.hidden
+    per_group_rows = (
+        float(a2a_rows) / float(max(1, disp_group))
+        if unpadded_linear
+        else float(math.ceil(a2a_rows / max(1, disp_group)))
+    )
+    push_wire = (
+        per_group_rows
+        * float(spec.top_k * (disp_group - 1))
+        / float(max(1, disp_group))
+        * float(spec.hidden)
     )
     if parallel.residual == "replicated":
         return _moe_replicated_collectives(
@@ -658,12 +682,14 @@ def _lm_head_collectives(
     hidden: int,
     vocab: int,
     parallel: Parallel,
+    *,
+    unpadded_linear: bool = False,
 ) -> tuple[Collective, ...]:
     """Return communication collectives for language model head."""
     if parallel.tp <= 1:
         return ()
     tp = parallel.tp
-    mp = padded_rows(rows, tp, parallel.residual)
+    mp = rows if unpadded_linear else padded_rows(rows, tp, parallel.residual)
     s_bytes = float(mp * hidden * 2)
     colls: list[Collective] = []
     if parallel.residual == "sp" and hidden > 0:
@@ -872,6 +898,7 @@ def _compute_gqa_cost(
                 extra_rows=eval_context.eff_prefill,
                 block_parallel=geom.block_parallel,
                 kv_bytes_per_tok=float(_TWO_DIRECTIONS * kvh * gqa_hd) * dt.kv,
+                unpadded_linear=eval_context.unpadded_linear,
             ),
             parallel,
         ),
@@ -998,6 +1025,7 @@ def _compute_swa_cost(
                 extra_rows=eval_context.eff_prefill,
                 block_parallel=geom.block_parallel,
                 kv_bytes_per_tok=float(_TWO_DIRECTIONS * kvh * geom.head_dim) * dt.kv,
+                unpadded_linear=eval_context.unpadded_linear,
             ),
             parallel,
         ),
@@ -1262,6 +1290,7 @@ def _compute_mla_dsa_costs(
                     extra_rows=eval_context.eff_prefill,
                     block_parallel=geom.block_parallel,
                     kv_bytes_per_tok=float(kv_lora + rope_d) * dt.kv,
+                    unpadded_linear=eval_context.unpadded_linear,
                 ),
                 parallel,
             ),
@@ -1344,6 +1373,7 @@ def _compute_gdn_cost(
                 is_full_attention=False,
                 extra_rows=eval_context.eff_prefill,
                 block_parallel=geom.block_parallel,
+                unpadded_linear=eval_context.unpadded_linear,
             ),
             parallel,
         ),
@@ -1421,6 +1451,7 @@ def _compute_kda_cost(
                 is_full_attention=False,
                 extra_rows=eval_context.eff_prefill,
                 block_parallel=geom.block_parallel,
+                unpadded_linear=eval_context.unpadded_linear,
             ),
             parallel,
         ),
@@ -1588,7 +1619,7 @@ class _RoutedMoeLayout:
     routed_act_elems: float
     routed_act_elems_min: float
     routed_rows: int
-    sh_rows: int
+    sh_rows: int | float
 
 
 def _routed_moe_layout(
@@ -1676,10 +1707,14 @@ def _routed_moe_layout(
         n_m_eff * geom.top_k * 3 * expert_hidden * (geom.moe_inter / eff_moe_div)
     )
     routed_rows = global_rows if is_ep else eval_context.rows
-    sh_rows = (
-        math.ceil(eval_context.rows / tp)
-        if parallel.residual == "sp"
-        else eval_context.rows
+    sh_rows: int | float = (
+        float(eval_context.rows) / float(tp)
+        if (eval_context.unpadded_linear and parallel.residual == "sp")
+        else (
+            math.ceil(eval_context.rows / tp)
+            if parallel.residual == "sp"
+            else eval_context.rows
+        )
     )
     return _RoutedMoeLayout(
         tp=tp,
@@ -1803,7 +1838,8 @@ def _compute_routed_moe_cost(
             eval_context.rows, latent_flops_elems, dt.w_dense, dt.act
         )
     if (
-        eval_context.mxu_m_tile > 1
+        not eval_context.unpadded_linear
+        and eval_context.mxu_m_tile > 1
         and layout.routed_rows > 0
         and layout.ed > 0.0
         and geom.top_k > 0
@@ -1836,7 +1872,8 @@ def _compute_routed_moe_cost(
         )
     )
     if (
-        lhs_floor > 1
+        not eval_context.unpadded_linear
+        and lhs_floor > 1
         and layout.routed_rows > 0
         and layout.ed_min > 0.0
         and geom.top_k > 0
@@ -1910,6 +1947,7 @@ def _compute_routed_moe_cost(
                 eff_prefill=eval_context.eff_prefill,
             ),
             parallel,
+            unpadded_linear=eval_context.unpadded_linear,
         ),
         max(1, round(n_m_eff)),
     )
@@ -1979,6 +2017,7 @@ def _compute_moe_mlp_costs(
                 block_parallel=geom.block_parallel,
             ),
             d_par,
+            unpadded_linear=eval_context.unpadded_linear,
         ) * max(1, round(n_d_eff))
         mlp_swiglu = float(n_d_eff * 3.0 * eval_context.rows * mlp_inter)
         mlp_mix = float(
@@ -2085,7 +2124,13 @@ def _compute_lm_head_cost(
         eval_context.rows, lm_elems, dt.lm_head, dt.act
     )
     lm_all_colls = (
-        _lm_head_collectives(eval_context.rows, geom.hidden, geom.vocab, parallel)
+        _lm_head_collectives(
+            eval_context.rows,
+            geom.hidden,
+            geom.vocab,
+            parallel,
+            unpadded_linear=eval_context.unpadded_linear,
+        )
         + pp_colls
     )
     lm_colls, lm_ucolls = _repeat_colls(lm_all_colls, 1)
@@ -2110,6 +2155,7 @@ class PassCostOptions(TypedDict, total=False):
     mxu_lhs_rows_fp8: int | None
     fp8_to_bf16_ratio: float | None
     activation_model: ExpertActivationModel
+    unpadded_linear: bool
 
 
 def pass_costs(
@@ -2139,6 +2185,7 @@ def pass_costs(
     )
     fp8_to_bf16_ratio = default_fp8_ratio if raw_fp8_ratio is None else raw_fp8_ratio
     activation_model = options.get("activation_model", _DEFAULT_ACTIVATION_MODEL)
+    unpadded_linear = options.get("unpadded_linear", False)
 
     pp_scale = (
         float(math.ceil(geom.num_layers / max(1, parallel.pp))) / float(geom.num_layers)
@@ -2146,18 +2193,27 @@ def pass_costs(
         else 1.0
     )
     decode_rows = shape.batch * shape.rows_per_seq
-    eff_prefill = (
-        max(
-            1,
-            math.ceil(
-                shape.prefill_tokens
-                * max(0.0, 1.0 - shape.prefix_hit_rate)
-                / max(1, parallel.pcp)
-            ),
-        )
-        if shape.prefill_tokens > 0
-        else 0
-    )
+    if shape.prefill_tokens > 0:
+        if unpadded_linear:
+            eff_prefill = max(
+                0,
+                math.floor(
+                    shape.prefill_tokens
+                    * max(0.0, 1.0 - shape.prefix_hit_rate)
+                    / max(1, parallel.pcp)
+                ),
+            )
+        else:
+            eff_prefill = max(
+                1,
+                math.ceil(
+                    shape.prefill_tokens
+                    * max(0.0, 1.0 - shape.prefix_hit_rate)
+                    / max(1, parallel.pcp)
+                ),
+            )
+    else:
+        eff_prefill = 0
     cached_prefix = (
         round(shape.prefill_tokens * shape.prefix_hit_rate)
         if shape.prefill_tokens > 0
@@ -2175,11 +2231,12 @@ def pass_costs(
         batch=shape.batch,
         rows_per_seq=shape.rows_per_seq,
         state_writes=shape.state_writes,
-        mxu_m_tile=mxu_m_tile,
-        mxu_lhs_rows_bf16=mxu_lhs_rows_bf16,
-        mxu_lhs_rows_fp8=mxu_lhs_rows_fp8,
+        mxu_m_tile=1 if unpadded_linear else mxu_m_tile,
+        mxu_lhs_rows_bf16=1 if unpadded_linear else mxu_lhs_rows_bf16,
+        mxu_lhs_rows_fp8=1 if unpadded_linear else mxu_lhs_rows_fp8,
         fp8_to_bf16_ratio=fp8_to_bf16_ratio,
         activation_model=activation_model,
+        unpadded_linear=unpadded_linear,
     )
 
     counts = count_layer_types(geom)
