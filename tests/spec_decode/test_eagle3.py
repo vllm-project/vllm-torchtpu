@@ -4054,12 +4054,12 @@ class _TpuTypedTensor(torch.Tensor):
         return SimpleNamespace(type="tpu")
 
 
-def test_fused_loop_fallback_runs_the_steps_at_the_chunks_bucket(monkeypatch):
-    """Under the step-0 post-attention gather the post-step-0 bridge keeps the
-    gathered step-0 rows (max_p, the largest loop bucket) for the fused loop,
-    which slices them. When the loop program declines the chunk, the separate
-    steps must run at the chunk's own loop bucket p: step 0's token, the step
-    inputs and the hidden carry all p rows."""
+def _fused_loop_fallback(monkeypatch, *, loop_step_program):
+    """propose() on one chunk whose fused loop program declines it, under the
+    step-0 post-attention gather (max_p 32, the chunk's loop bucket p 16).
+    Building the loop-step program for steps 1+ leaves `loop_step_program`.
+    Returns the drafts, and per draft step (rows, positions, carry rows,
+    padded tokens, program run)."""
     import vllm_torchtpu.models.vllm.qwen3_next_patch as qwen3_next_patch
 
     monkeypatch.setattr(
@@ -4094,25 +4094,32 @@ def test_fused_loop_fallback_runs_the_steps_at_the_chunks_bucket(monkeypatch):
 
     def forward(self, *, input_ids, positions, step_idx, num_tokens_padded, **kw):
         rows = num_tokens_padded
+        program = self._draft_model_for_step(step_idx)
         if step_idx == 0:
             rows = kw["step0_gather_indices"].shape[0]
-        else:
-            steps.append(
-                (
-                    input_ids.shape[0],
-                    positions.shape[-1],
-                    kw["target_hidden_states"].shape[0],
-                    num_tokens_padded,
-                )
+        steps.append(
+            (
+                input_ids.shape[0],
+                positions.shape[-1],
+                kw["target_hidden_states"].shape[0],
+                num_tokens_padded,
+                program,
             )
+        )
         hidden = torch.zeros((rows, hidden_size)).as_subclass(_TpuTypedTensor)
         return hidden, hidden
+
+    def build_loop_step_program(self):
+        self._mtp_loop_model = loop_step_program
 
     bridge = Eagle3Proposer._draft_post_step0_fused.__wrapped__.__wrapped__
     monkeypatch.setattr(Eagle3Proposer, "_prepare_draft_inputs", prepare)
     monkeypatch.setattr(Eagle3Proposer, "_forward_draft", forward)
     monkeypatch.setattr(Eagle3Proposer, "_draft_post_step0_fused", bridge)
     monkeypatch.setattr(Eagle3Proposer, "_run_mtp_fused_loop", lambda self, **_kw: None)
+    monkeypatch.setattr(
+        Eagle3Proposer, "_build_mtp_step0_gather_loop_model", build_loop_step_program
+    )
     monkeypatch.setattr(
         Eagle3Proposer,
         "_draft_propose_token",
@@ -4141,9 +4148,34 @@ def test_fused_loop_fallback_runs_the_steps_at_the_chunks_bucket(monkeypatch):
         return_device=True,
         next_tokens_per_chunk=[torch.zeros((8, 4), dtype=torch.int32)],
     )
+    return proposer, drafts, steps
 
-    assert steps == [(p, p, p, p), (p, p, p, p)]
+
+def test_fused_loop_fallback_runs_the_steps_at_the_chunks_bucket(monkeypatch):
+    """Under the step-0 post-attention gather the post-step-0 bridge keeps the
+    gathered step-0 rows (max_p, the largest loop bucket) for the fused loop,
+    which slices them. When the loop program declines the chunk, the separate
+    steps must run at the chunk's own loop bucket p: step 0's token, the step
+    inputs and the hidden carry all p rows. Step 0 runs the draft's own program,
+    traced with the gather; steps 1+ run a loop-step program traced without it,
+    built on this first declined chunk."""
+    p = 16
+    loop_step_program = object()
+    proposer, drafts, steps = _fused_loop_fallback(
+        monkeypatch, loop_step_program=loop_step_program
+    )
+    assert steps[0][4] is proposer.draft_model
+    assert [s[:4] for s in steps[1:]] == [(p, p, p, p), (p, p, p, p)]
+    assert all(s[4] is loop_step_program for s in steps[1:])
     assert tuple(drafts.shape) == (3, 3)
+
+
+def test_fused_loop_fallback_refuses_without_a_loop_step_program(monkeypatch):
+    """If the loop-step program cannot be built, a declined chunk under the
+    step-0 gather fails with an actionable error instead of running steps 1+
+    on the draft program traced with the gather."""
+    with pytest.raises(NotImplementedError, match="declined a chunk"):
+        _fused_loop_fallback(monkeypatch, loop_step_program=None)
 
 
 def _seed_precompile_pairs(monkeypatch, *, lockstep, dp_step_max_reqs):

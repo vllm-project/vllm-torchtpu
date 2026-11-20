@@ -720,7 +720,7 @@ class Eagle3Proposer:
     def _build_mtp_step0_gather_loop_model(self) -> None:
         """Build a separately compiled loop-step program for steps 1..K-1 when
         the model patch installs the step-0 post-attention gather and the
-        fused draft loop is off,
+        per-step loop runs (the fused draft loop is off, or declined a chunk),
         so step 0 traces with `_step0_gather_indices` set while steps 1..K-1
         trace with `_step0_gather_indices=None` using the draft's own
         `_dynamic_arg_dims` (e.g. `positions=-1` on Qwen3.5 MRoPE)."""
@@ -934,6 +934,25 @@ class Eagle3Proposer:
                 self._mtp_fused_loop_warm = True
             return self._mtp_fused_loop(None, positions, hidden_states, seq_lens)
 
+    def _build_declined_chunk_loop_model(self) -> None:
+        """Give a chunk the fused loop declines a program for steps 1..K-1.
+
+        `_mtp_fused_loop_max_p > 0` means the fused loop runs with the step-0
+        post-attention gather, so the draft's own program is traced with the
+        gather and cannot run steps 1+ (they read no gather indices). Built on
+        the first declined chunk, as the per-step loop's program is built
+        without the fused loop; a draft whose chunks the loop always takes
+        never builds it.
+        """
+        self._build_mtp_step0_gather_loop_model()
+        if self._mtp_loop_model is None:
+            raise NotImplementedError(
+                "MTP fused draft loop: the loop program declined a chunk under "
+                "the step-0 post-attention gather, and the loop-step program "
+                "for its steps 1+ could not be built (see the warning above). "
+                "Serve this draft without the fused draft loop."
+            )
+
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
 
@@ -941,8 +960,9 @@ class Eagle3Proposer:
         IndexShare, step 0 runs the draft (indexer on) and steps 1+ the
         loop-step program (indexer off). `skip_topk` is set before every call,
         but it only matters on each program's first run, when it gets baked
-        in. Under the MTP step-0 post-attention gather without the fused loop,
-        steps 1+ likewise run their own program, traced without the gather.
+        in. Under the MTP step-0 post-attention gather, steps 1+ of the
+        per-step loop (no fused loop, or a chunk the fused loop declines)
+        likewise run their own program, traced without the gather.
         """
         assert self.draft_model is not None
         loop_model = self._mtp_loop_model
@@ -2135,6 +2155,8 @@ class Eagle3Proposer:
                     p_ci = padded_nr_per_chunk[ci]
                     if loop_hidden[ci].shape[0] > p_ci:
                         loop_hidden[ci] = loop_hidden[ci][:p_ci]
+                    if self._mtp_fused_loop_max_p > 0 and self._mtp_loop_model is None:
+                        self._build_declined_chunk_loop_model()
                     if not draft_tokens_per_chunk[ci]:
                         with set_model_tag("eagle_head"):
                             draft_tokens_per_chunk[ci].append(
