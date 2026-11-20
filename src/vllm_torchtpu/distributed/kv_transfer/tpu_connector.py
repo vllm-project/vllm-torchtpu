@@ -2787,6 +2787,11 @@ class TPURaidenConnectorWorker:
         # native terminal (or was cancelled unclaimed) and is drained into
         # the scheduler report exactly once.
         self._stage3_send_outcomes: dict[str, str] = {}
+        # async_register: native send terminals (req_id -> failed) that arrive
+        # while the request's registration is still on the side thread, which
+        # records the registration after its controller RPC returns. The
+        # registration applies the terminal when it lands.
+        self._stage3_early_send_terminals: dict[str, bool] = {}
         # req_id -> next registry status probe time (Unix seconds).
         self._stage3_status_probe_next: dict[str, float] = {}
         # vLLM independently randomizes the internal request ID on the
@@ -4664,6 +4669,7 @@ class TPURaidenConnectorWorker:
                         expiration_time=tombstone_deadline,
                     )
                     self._done_sending.add(req_id)
+                    self._stage3_early_send_terminals.pop(req_id, None)
                 logger.warning(
                     "TPURaidenConnectorWorker rank%d --> Stage-3 request "
                     "registration was already cancelled req_id=%s uuid=%d",
@@ -4689,6 +4695,14 @@ class TPURaidenConnectorWorker:
                     ),
                     finish_pending=registered_ahead,
                 )
+                # A native terminal that came in before this record (the
+                # transfer can finish before the side thread gets here).
+                early_failed = self._stage3_early_send_terminals.pop(req_id, None)
+                if early_failed is not None:
+                    if early_failed:
+                        self._stage3_send_outcomes[req_id] = "failed"
+                    else:
+                        self._stage3_send_outcomes.setdefault(req_id, "done")
                 if not any(reg.spans for reg in pool_spans):
                     # This PCP rank owns no physical page for the request. It
                     # has nevertheless published an empty D5 entry so
@@ -5468,6 +5482,10 @@ class TPURaidenConnectorWorker:
                 else:
                     self._stage3_send_outcomes.setdefault(req_id, "done")
                 continue
+            if self._stage3_registration_pending(req_id):
+                early = self._stage3_early_send_terminals
+                early[req_id] = failed or early.get(req_id, False)
+                continue
             # Replayed native terminals after the base moved to its tombstone
             # are harmless and must not become duplicate scheduler reports.
             if (
@@ -5477,6 +5495,14 @@ class TPURaidenConnectorWorker:
                 logger.warning(
                     "Ignoring unmapped Stage-3 producer terminal req_id=%s", req_id
                 )
+
+    def _stage3_registration_pending(self, req_id: str) -> bool:
+        """Whether an async_register registration of the request is still
+        running on the side thread."""
+        return any(
+            req_id in req_ids and not future.done()
+            for future, req_ids in self._stage3_register_futures
+        )
 
     def _stage3_ready_producer_send_terminals(
         self,
