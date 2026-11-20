@@ -304,8 +304,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
     VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS: bool = False
-    VLLM_TPU_DETOK_PRIME_TOKENS: int = 32
     VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS: int = 0
+    VLLM_TPU_DETOK_PRIME_TOKENS: int = 32
     VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS: int = 0
     VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK: bool = False
     VLLM_TPU_SEND_NEW_PROMPT_IDS: int = 0
@@ -2216,18 +2216,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS": env_bool(
         "VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS"
     ),
-    # API server: prime the detokenizer with this many prompt-tail tokens; 0 = off.
-    "VLLM_TPU_DETOK_PRIME_TOKENS": env_int("VLLM_TPU_DETOK_PRIME_TOKENS", 32),
     # Recent prompts whose ids a new prompt reuses up to the last added token
     # they share (segment_tokenize.py). 0 keeps no prompts: every prompt is
     # split and looked up piece by piece.
-    "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS": env_int(
+    "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS": env_nonnegative_int(
         "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS", 0
     ),
+    # API server: prime the detokenizer with this many prompt-tail tokens; 0 = off.
+    "VLLM_TPU_DETOK_PRIME_TOKENS": env_int("VLLM_TPU_DETOK_PRIME_TOKENS", 32),
     # Engine core: the number of recent prompts whose block hashes a new prompt
     # reuses for the blocks it shares with them (core/block_hash_reuse.py).
     # Exact; 0 keeps none and hashes every block.
-    "VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS": env_int(
+    "VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS": env_nonnegative_int(
         "VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS", 0
     ),
     # API server: prompt ids the server's own tokenizer made skip the max/min
@@ -2239,7 +2239,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # API server and engine core: the number of recent prompts both keep, so a
     # request carries only the ids after those it shares with one of them
     # (core/send_new_prompt_ids.py). Exact; 0 keeps none and sends every id.
-    "VLLM_TPU_SEND_NEW_PROMPT_IDS": env_int("VLLM_TPU_SEND_NEW_PROMPT_IDS", 0),
+    "VLLM_TPU_SEND_NEW_PROMPT_IDS": env_nonnegative_int(
+        "VLLM_TPU_SEND_NEW_PROMPT_IDS", 0
+    ),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:

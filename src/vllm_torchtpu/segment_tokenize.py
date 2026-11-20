@@ -140,7 +140,7 @@ def shared_prefix_length(a: str, b: str) -> int:
     return n
 
 
-class RecentPrompts:
+class RecentTokenizedPrompts:
     """The most recent tokenized prompts, searched for the longest prefix a new prompt
     can reuse."""
 
@@ -240,7 +240,9 @@ class SegmentTokenizer:
         self._cached_tokens = 0
         self._max_cached_tokens = max_cached_tokens
         self._lock = threading.Lock()
-        self._recent = RecentPrompts(alts, max_prompts) if max_prompts > 0 else None
+        self._recent = (
+            RecentTokenizedPrompts(alts, max_prompts) if max_prompts > 0 else None
+        )
         self.hits = 0
         self.misses = 0
 

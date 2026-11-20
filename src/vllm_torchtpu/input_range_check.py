@@ -33,8 +33,7 @@ REMEMBERED_PROMPTS = 64
 
 
 class TokenizerOutputs:
-    """The id lists the renderer's tokenizer built, kept until their range check claims
-    them."""
+    """Id lists the tokenizer built, kept until their range check claims them."""
 
     def __init__(self, capacity: int = REMEMBERED_PROMPTS) -> None:
         self.capacity = capacity

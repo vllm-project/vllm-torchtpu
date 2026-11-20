@@ -5,6 +5,7 @@ import random
 
 import pytest
 from vllm import SamplingParams
+from vllm.lora.request import LoRARequest
 from vllm.utils.hashing import sha256
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
@@ -12,8 +13,8 @@ from vllm.v1.request import Request
 
 from vllm_torchtpu.core import block_hash_reuse
 from vllm_torchtpu.core.block_hash_reuse import (
-    KeptPrompt,
-    RecentPrompts,
+    HashedPrompt,
+    RecentHashedPrompts,
     packed,
     reusing_block_hasher,
 )
@@ -26,12 +27,13 @@ def none_hash():
     init_none_hash(sha256)
 
 
-def _request(request_id, tokens, hasher, cache_salt=None):
+def _request(request_id, tokens, hasher, cache_salt=None, lora_request=None):
     return Request(
         request_id,
         tokens,
         SamplingParams(max_tokens=8),
         None,
+        lora_request=lora_request,
         cache_salt=cache_salt,
         block_hasher=hasher,
     )
@@ -66,7 +68,7 @@ def _conversation_prompts(rng, conversations=12, turns=10):
 def test_longest_shared_matches_a_block_by_block_search():
     rng = random.Random(0)
     for _ in range(500):
-        recent = RecentPrompts(capacity=8)
+        recent = RecentHashedPrompts(capacity=8)
         stem = [rng.randrange(3) for _ in range(rng.randrange(1, 6) * 4)]
         kept = []
         for _ in range(rng.randrange(1, 6)):
@@ -74,7 +76,7 @@ def test_longest_shared_matches_a_block_by_block_search():
             hashes = [
                 hash(tuple(tokens[: (b + 1) * 4])) for b in range(len(tokens) // 4)
             ]
-            recent.keep(KeptPrompt(packed(tokens, len(tokens) // 4, 4), hashes), None)
+            recent.keep(HashedPrompt(packed(tokens, len(tokens) // 4, 4), hashes), None)
             kept.append(tokens)
         new = list(rng.choice(kept)) + [
             rng.randrange(3) for _ in range(rng.randrange(0, 4) * 4)
@@ -146,6 +148,34 @@ def test_output_blocks_after_a_reused_prompt_equal_upstream():
     assert reusing.counts.reused_blocks == 4
     assert reused.block_hashes == plain.block_hashes
     assert len(plain.block_hashes) == 10
+
+
+def test_a_prompt_shorter_than_a_block_has_no_hashes_and_keeps_nothing():
+    upstream, reusing = _hashers()
+    short = list(range(1000, 1000 + BLOCK_SIZE - 1))
+    assert _request("s", short, reusing).block_hashes == []
+    assert len(reusing.recent) == 0
+    longer = short + list(range(3 * BLOCK_SIZE))
+    assert (
+        _request("l", longer, reusing).block_hashes
+        == _request("l", longer, upstream).block_hashes
+    )
+    assert reusing.counts.reused_blocks == 0
+
+
+def test_a_lora_request_is_hashed_by_upstream_and_not_kept():
+    upstream, reusing = _hashers()
+    prompt = list(range(1000, 1000 + 4 * BLOCK_SIZE))
+    _request("plain", prompt, reusing)
+    lora = LoRARequest("adapter", 1, "/adapter")
+    assert (
+        _request("lora", prompt, reusing, lora_request=lora).block_hashes
+        == _request("lora", prompt, upstream, lora_request=lora).block_hashes
+    )
+    assert _request("lora", prompt, upstream, lora_request=lora).block_hashes != (
+        _request("plain", prompt, upstream).block_hashes
+    )
+    assert (reusing.counts.requests, len(reusing.recent)) == (1, 1)
 
 
 def test_cache_salt_keeps_prompts_apart():

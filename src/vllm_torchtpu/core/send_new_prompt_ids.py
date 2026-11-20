@@ -88,12 +88,12 @@ class Header:
 
 
 @dataclass
-class KeptPrompt:
+class SlotPrompt:
     ids: list[int]
     probes: list[int]
 
     @classmethod
-    def of(cls, ids: list[int]) -> KeptPrompt:
+    def of(cls, ids: list[int]) -> SlotPrompt:
         return cls(ids, ids[PROBE_EVERY - 1 :: PROBE_EVERY])
 
 
@@ -127,7 +127,7 @@ def shared_length(a: list[Any], b: list[Any]) -> int:
     return first_difference(a, b, 0, n)
 
 
-def shared_ids(ids: list[int], kept: KeptPrompt, probes: int) -> int:
+def shared_ids(ids: list[int], kept: SlotPrompt, probes: int) -> int:
     """The number of leading ids ``ids`` shares with ``kept``, whose first ``probes``
     probes it matches.
 
@@ -150,7 +150,7 @@ class SentPrompts:
 
     def __init__(self, capacity: int) -> None:
         self.capacity = capacity
-        self.kept: OrderedDict[int, KeptPrompt] = OrderedDict()
+        self.kept: OrderedDict[int, SlotPrompt] = OrderedDict()
         self.counts = Counts()
 
     def header(self, ids: list[int]) -> Header:
@@ -168,7 +168,7 @@ class SentPrompts:
     def keep(self, header: Header, ids: list[int]) -> None:
         if header.shared_slot != NO_SLOT:
             self.kept.move_to_end(header.shared_slot)
-        self.kept[header.keep_slot] = KeptPrompt.of(ids)
+        self.kept[header.keep_slot] = SlotPrompt.of(ids)
         self.kept.move_to_end(header.keep_slot)
         self.counts.add(header)
         self.counts.log("the API server sent", len(self.kept))

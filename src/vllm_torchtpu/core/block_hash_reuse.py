@@ -48,7 +48,7 @@ SUMMARY_EVERY_REQUESTS = 256
 
 
 @dataclass
-class KeptPrompt:
+class HashedPrompt:
     tokens: bytes
     hashes: list[BlockHash]
 
@@ -69,7 +69,7 @@ def packed(token_ids: list[int], blocks: int, block_size: int) -> bytes:
 
 def longest_extended(
     tokens: bytes,
-    candidates: list[tuple[int, KeptPrompt]],
+    candidates: list[tuple[int, HashedPrompt]],
     blocks: int,
     block_bytes: int,
 ) -> tuple[int | None, int]:
@@ -121,7 +121,7 @@ def shared_blocks(
 
 def longest_shared_blockwise(
     tokens: bytes,
-    candidates: list[tuple[int, KeptPrompt]],
+    candidates: list[tuple[int, HashedPrompt]],
     blocks: int,
     block_bytes: int,
 ) -> tuple[int | None, int]:
@@ -149,13 +149,13 @@ def longest_shared_blockwise(
     return best_key, shared
 
 
-class RecentPrompts:
+class RecentHashedPrompts:
     """The full-block tokens and block hashes of the most recent prompts."""
 
     def __init__(self, capacity: int) -> None:
         self.capacity = capacity
         self.lock = threading.Lock()
-        self._prompts: OrderedDict[int, KeptPrompt] = OrderedDict()
+        self._prompts: OrderedDict[int, HashedPrompt] = OrderedDict()
         self._next_key = 0
 
     def __len__(self) -> int:
@@ -184,7 +184,7 @@ class RecentPrompts:
     def hashes(self, key: int) -> list[BlockHash]:
         return self._prompts[key].hashes
 
-    def keep(self, prompt: KeptPrompt, replaces: int | None) -> None:
+    def keep(self, prompt: HashedPrompt, replaces: int | None) -> None:
         if replaces is not None:
             self._prompts.pop(replaces, None)
         self._prompts[self._next_key] = prompt
@@ -219,7 +219,7 @@ def reusing_block_hasher(
     recent prompt."""
     from vllm.v1.core import kv_cache_utils
 
-    recent = RecentPrompts(capacity)
+    recent = RecentHashedPrompts(capacity)
     counts = ReuseCounts()
     block_bytes = block_size * array("I").itemsize
 
@@ -259,7 +259,9 @@ def reusing_block_hasher(
             )
             hashes.append(parent)
         with recent.lock:
-            recent.keep(KeptPrompt(tokens, list(hashes)), key if extends_kept else None)
+            recent.keep(
+                HashedPrompt(tokens, list(hashes)), key if extends_kept else None
+            )
             counts.requests += 1
             counts.blocks += blocks
             counts.reused_blocks += reused
