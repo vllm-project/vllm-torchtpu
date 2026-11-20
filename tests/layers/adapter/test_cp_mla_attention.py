@@ -607,8 +607,9 @@ def test_fused_lse_flag_selects_one_all_to_all(
     assert len(calls) == expect_calls * world
     assert len(rs_calls) == (0 if expect_calls else world)
     if expect_calls == 1:
-        # One flat row per destination: partials, then the lse as bf16 pairs.
-        assert set(calls) == {(world, tokens * local * vdim + tokens * local * 2)}
+        # One row per destination and token: the partials, then a 128-lane
+        # block that carries the token's lse as high and low bf16 halves.
+        assert set(calls) == {(world, tokens, local * vdim + 128)}
 
 
 @pytest.mark.parametrize(

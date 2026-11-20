@@ -180,22 +180,44 @@ def _all_to_all_with_lse(
 
     A collective has a fixed cost that does not depend on its size. At decode
     sizes the lse block is only a few KB, so a separate all-to-all for it
-    costs about as much as its fixed cost. This function instead reinterprets
-    (bitcasts) the f32 lse bits as elements of the partials' dtype and
-    appends them to the partials of the same destination. After the
-    exchange it splits the two parts and bitcasts the lse back. A bitcast
-    moves bits without conversion, so the received values are bit-identical
-    to those of the two-collective path.
+    costs about as much as its fixed cost. This function instead stores the
+    f32 lse bits in elements of the partials' dtype and appends them to the
+    partials of the same destination and token. After the exchange it splits
+    the two parts and rebuilds the f32 lse from the same bits, so the
+    received values are bit-identical to those of the two-collective path.
 
-    Each destination block is flattened to one row before the append. A
-    trailing axis of `V + 2` would not be a multiple of the TPU's 128-lane
-    tile and could be padded in the exchange; a flat row is padded at most
-    once, at its end.
+    Payload layout: `[world, T, local * V + L]`. Row `(d, t)` holds the
+    `local * V` partial values of token `t` for rank `d`, then an lse block of
+    `L` lanes, where `L` is the lse width rounded up to a multiple of 128.
+    The layout follows the TPU memory tiling of a 2-byte array, which is 16
+    rows by 128 lanes:
+
+    - The minor dimension `local * V + L` is a multiple of 128 when
+      `local * V` is, and the partials end on a 128-lane boundary. The
+      split after the exchange is then a tile-aligned slice that a consumer
+      fusion reads in place.
+    - The second-minor dimension is the token count, the same as in the
+      separate partials exchange.
+    - A flat `[world, T * local * V + 2 * T * local]` row is avoided. XLA
+      splits a minor dimension that large (32,896 at the sizes below) into
+      `[2, 16448]`. 16,448 is not a multiple of 128, so XLA inserts a
+      relayout copy of the whole payload after the exchange.
+
+    For 2-byte partials, each f32 lse is sent as two 16-bit halves: lanes
+    `[0, local)` of the block hold the high halves and lanes
+    `[local, 2 * local)` the low halves. The halves are computed with
+    integer shifts and masks, and each half is reinterpreted as one element
+    of the partials' dtype. A reinterpretation between two dtypes of equal
+    width keeps the shape. Viewing f32 as pairs of 16-bit values would add a
+    minor dimension of size 2, which the TPU tiling pads to 128 lanes and
+    relayouts. For 4-byte partials, each lse is reinterpreted as one element.
+    The unused lanes of the block are zero.
 
     Example: world 16, T = 16, 4 local heads, V = 512, bf16 partials. Each
-    destination row holds 16 * 4 * 512 = 32,768 partial values followed by
-    16 * 4 * 2 = 128 bf16 values that are the bits of 64 f32 lse values, so
-    the one all-to-all moves bf16[16, 32896].
+    row holds 4 * 512 = 2,048 partial values, then a block of 128 lanes whose
+    first 8 lanes are the high and low halves of the token's 4 lse values.
+    The all-to-all moves bf16[16, 16, 2176], 6.25% more bytes than the
+    partials alone.
 
     Args:
       o_send: `[world, T, local, V]` partials in a 2- or 4-byte dtype. Block
@@ -208,19 +230,39 @@ def _all_to_all_with_lse(
       `[world, T, local]` f32. Block `r` of each came from rank `r`.
     """
     world, num_tokens, local, vdim = o_send.shape
-    o_flat = o_send.reshape(world, num_tokens * local * vdim)
-    # [world, T * local] f32 -> [world, T * local * (4 // itemsize)].
-    l_bits = l_send.contiguous().reshape(world, num_tokens * local).view(o_send.dtype)
-    recv = _all_to_all(torch.cat([o_flat, l_bits], dim=1), group)
-    num_o = o_flat.shape[1]
-    o_recv = recv[:, :num_o].reshape(world, num_tokens, local, vdim)
-    l_recv = (
-        recv[:, num_o:]
-        .contiguous()
-        .view(torch.float32)
-        .reshape(world, num_tokens, local)
+    dtype = o_send.dtype
+    bits = l_send.contiguous().view(torch.int32)
+    if dtype.itemsize == 2:
+        # Each half is a value in [-32768, 32767], so the int16 conversion
+        # is exact and does not depend on how a backend wraps overflow.
+        hi = torch.bitwise_right_shift(bits, 16)
+        lo = (bits & 0xFFFF) - ((bits & 0x8000) << 1)
+        l_vals = torch.cat([hi, lo], dim=-1).to(torch.int16).view(dtype)
+    else:
+        l_vals = bits.view(dtype)
+    num_l = l_vals.shape[-1]
+    l_lanes = -(-num_l // 128) * 128
+    l_block = torch.nn.functional.pad(l_vals, (0, l_lanes - num_l))
+
+    num_o = local * vdim
+    payload = torch.cat(
+        [o_send.reshape(world, num_tokens, num_o), l_block], dim=-1
     )
-    return o_recv, l_recv
+    recv = _all_to_all(payload, group)
+
+    o_recv = recv[..., :num_o].reshape(world, num_tokens, local, vdim)
+    if dtype.itemsize == 2:
+        hi_r = recv[..., num_o : num_o + local].view(torch.int16).to(torch.int32)
+        lo_r = (
+            recv[..., num_o + local : num_o + 2 * local]
+            .view(torch.int16)
+            .to(torch.int32)
+            & 0xFFFF
+        )
+        l_bits = torch.bitwise_left_shift(hi_r, 16) | lo_r
+    else:
+        l_bits = recv[..., num_o : num_o + local].view(torch.int32)
+    return o_recv, l_bits.view(torch.float32)
 
 
 def _merge_received(o_recv: torch.Tensor, l_recv: torch.Tensor) -> torch.Tensor:
