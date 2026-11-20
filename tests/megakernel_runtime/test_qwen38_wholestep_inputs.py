@@ -269,3 +269,15 @@ def test_manager_page_table_expands_to_the_per_page_table(mp, batched, monkeypat
     np.testing.assert_array_equal(expanded, per_page)
     with pytest.raises(AssertionError):
         run(8)
+
+
+def test_key_slots_auto_by_bucket(monkeypatch):
+    """`wholekeyslots=auto`: 4 key-ring slots up to 48 rows, 3 at 64 (b64 under DCP-2 has no
+    VMEM for a fourth 512 KiB slot), 2 without a bucket; a fixed count passes through."""
+    from vllm_torchtpu.megakernel_runtime import qwen38_wholestep_call as wsc
+
+    monkeypatch.setattr(wsc, "KEY_SLOTS", wsc.KEY_SLOTS_AUTO)
+    assert [wsc.key_slots_for(b) for b in (4, 8, 16, 24, 32, 48, 64)] == [4] * 6 + [3]
+    assert wsc.key_slots_for(None) == 2
+    monkeypatch.setattr(wsc, "KEY_SLOTS", 3)
+    assert wsc.key_slots_for(16) == 3 and wsc.key_slots_for(None) == 3
