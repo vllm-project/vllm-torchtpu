@@ -586,6 +586,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 req_status.num_locally_computed_tokens = num_computed_tokens
                 req_status.update_offload_keys()
                 req_status.update_num_hit_chunks(num_computed_tokens)
+                # This hook can be the step's first to touch the manager, so
+                # it opens schedule()'s step region, as upstream's hook does
+                # before its lookup.
+                self._acquire_step()
                 self._touch(req_status)
             return 0, False
         max_loads = self._max_async_load_reqs
@@ -600,6 +604,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     req_status.update_offload_keys()
                     orig_local = req_status.num_locally_computed_tokens
                     orig_partial = req_status.partial_tail_boundary
+                    self._acquire_step()
                     try:
                         probe_hit = self._quiet_lookup(req_status, num_computed_tokens)
                     finally:
