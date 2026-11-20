@@ -870,10 +870,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
     # the batched kernel entry only; the DCP passes keep the wrapper's 8.
     decode_lanes: int | None = None
     # The tuned batched RPA tiles and decode lanes (wrapper.calculate_block_sizes,
-    # batched_rpa_decode); off unless a model rule turns them on.
+    # batched_rpa_decode); off by default, a model opts its layers in.
     tuned_tiles: bool = False
     # Skip an empty MIXED call (the batched RPA wrapper's skip_empty_mixed);
-    # off unless a model rule turns it on.
+    # off by default, a model opts its layers in.
     skip_empty_mixed: bool = False
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
@@ -1749,6 +1749,7 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         model_config = vllm_config.model_config if vllm_config is not None else None
         if self.tuned_tiles and model_config is not None and self.head_size != 64:
             self.decode_lanes = batched_rpa_decode.decode_lanes(
+                chip_version=get_chip_version(),
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_size,
                 kv_cache_dtype=self.kv_cache_quantized_dtype,
