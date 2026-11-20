@@ -30,6 +30,13 @@ moe_router.select_experts picks them: score, top-k, renormalize.
 ROUTING_MOE_REMOTE_SCATTER=0 selects the kernel's local mode instead of the remote
 scatter above: each device sums its experts' rows into a partial result for
 every token, and a reduce-scatter combines the partial results.
+
+ROUTING_MOE_FP8_COMBINE=1 has routing_gmm write its expert-output rows in fp8
+with per-lane f32 scales (tokamax's lane-strided format, `scatter_format`)
+instead of bf16, and output_reduce dequantizes them while summing each token's
+top-k rows. With remote scatter this halves the bytes sent to the token owners;
+in local mode the rows stay on the device, so it saves only HBM traffic. The
+rows are quantized, so the output is close to, not equal to, bf16 combine.
 """
 
 from typing import Any
@@ -69,6 +76,10 @@ _OPS: dict[tuple, Any] = {}
 # bridge rejects (see fused_moe_ep._RANK_BUFFER).
 _RANK_BUFFER: torch.Tensor | None = None
 
+# fp8 combine rows pack 4 fp8 values per 32-bit lane across 128 lanes, so the
+# hidden size must fill whole 512-element chunks (tokamax rejects others).
+_FP8_COMBINE_CHUNK = 512
+
 
 def routing_moe_supported(owner: Any) -> bool:
     """Whether prebuild_routing_moe armed this layer's quant method."""
@@ -96,6 +107,12 @@ def unsupported_reason(layer) -> str | None:
         or getattr(layer, "w2_bias", None) is not None
     ):
         return "expert biases aren't passed to the kernel here"
+    hidden = layer.w13_weight.shape[1]
+    if envs.ROUTING_MOE_FP8_COMBINE and hidden % _FP8_COMBINE_CHUNK:
+        return (
+            f"ROUTING_MOE_FP8_COMBINE needs a hidden size divisible by "
+            f"{_FP8_COMBINE_CHUNK}, not {hidden}"
+        )
     return None
 
 
@@ -127,6 +144,22 @@ def _relabel_table(order: tuple[int, ...], local_experts: int) -> list[int]:
     ]
 
 
+def _scatter_format(fp8_combine: bool) -> Any | None:
+    """tokamax's `RoutingMoEPlan.scatter_format`: routing_gmm's output rows
+    (what remote scatter sends to the token owners) in fp8 with one f32 scale
+    per lane for ROUTING_MOE_FP8_COMBINE, else None (bf16 rows)."""
+    if not fp8_combine:
+        return None
+    # pyrefly: ignore[missing-import]
+    from tokamax._src.ops.experimental.routing_moe.common import (
+        out_format as tk_out_format,
+    )
+
+    return tk_out_format.ActivationFormat(
+        dtype=jnp.float8_e4m3fn, quant=tk_out_format.LaneStrided()
+    )
+
+
 def _build_op(
     mesh,
     topk: int,
@@ -136,6 +169,8 @@ def _build_op(
     mesh_expert_order: tuple[int, ...] | None,
     replica_groups: tuple[tuple[int, ...], ...],
     remote_scatter: bool,
+    *,
+    fp8_combine: bool = False,
 ):
     key = (
         topk,
@@ -145,6 +180,7 @@ def _build_op(
         mesh_expert_order,
         replica_groups,
         remote_scatter,
+        fp8_combine,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -156,6 +192,8 @@ def _build_op(
 
     # pyrefly: ignore[missing-import]
     from tokamax._src.ops.experimental.routing_moe.layer import plan as tk_plan
+
+    scatter_format = _scatter_format(fp8_combine)
 
     # A distinct torch op name per closure: two ops registered under one name
     # would share a dispatch entry (see fused_moe_ep._build_op).
@@ -216,7 +254,9 @@ def _build_op(
             tp_axis=None,
             ep_axis=EP_AXIS_NAME,
             use_sp=True,
-            moe_plan=tk_plan.RoutingMoEPlan(remote_scatter=remote_scatter),
+            moe_plan=tk_plan.RoutingMoEPlan(
+                remote_scatter=remote_scatter, scatter_format=scatter_format
+            ),
             ep_shard_idx=rank.reshape(-1),
         )
         return jax.shard_map(
@@ -293,11 +333,12 @@ def prebuild_routing_moe(
     )
     logger.info_once(
         "[MoE]: routing_moe over %d devices, %d experts each, token replica "
-        "groups %s; %s scatter.",
+        "groups %s; %s scatter, %s combine rows.",
         ep,
         local_experts,
         replica_groups,
         "remote" if envs.ROUTING_MOE_REMOTE_SCATTER else "local",
+        "fp8" if envs.ROUTING_MOE_FP8_COMBINE else "bf16",
     )
     return _build_op(
         mesh,
@@ -308,6 +349,7 @@ def prebuild_routing_moe(
         None if order == tuple(range(ep)) else order,
         replica_groups,
         envs.ROUTING_MOE_REMOTE_SCATTER,
+        fp8_combine=envs.ROUTING_MOE_FP8_COMBINE,
     )
 
 

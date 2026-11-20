@@ -75,6 +75,7 @@ def _armed():
         patch.object(envs, "USE_ROUTING_MOE", True),
         patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", False),
         patch.object(envs, "ROUTING_MOE_REMOTE_SCATTER", True),
+        patch.object(envs, "ROUTING_MOE_FP8_COMBINE", False),
     ):
         yield
 
@@ -132,6 +133,39 @@ def test_scatter_mode_follows_the_flag(remote):
     with patch.object(envs, "ROUTING_MOE_REMOTE_SCATTER", remote):
         _prebuild(_layer(), build_op=lambda *args, **kw: seen.append(args) or "op")
     assert seen[0][-1] is remote
+
+
+@pytest.mark.parametrize("fp8_combine", [False, True])
+def test_fp8_combine_follows_the_flag(fp8_combine):
+    seen = []
+    with patch.object(envs, "ROUTING_MOE_FP8_COMBINE", fp8_combine):
+        _prebuild(
+            _layer(hidden=512),
+            build_op=lambda *args, **kw: seen.append(kw) or "op",
+        )
+    assert seen[0]["fp8_combine"] is fp8_combine
+
+
+def test_fp8_combine_refuses_a_hidden_size_off_512():
+    """fp8 combine rows fill whole 512-element chunks; another hidden size
+    raises instead of falling back to bf16 rows."""
+    with (
+        patch.object(envs, "ROUTING_MOE_FP8_COMBINE", True),
+        pytest.raises(ValueError, match="divisible by 512"),
+    ):
+        _prebuild(_layer(hidden=256))
+
+
+def test_scatter_format():
+    """The flag gives tokamax an fp8 lane-strided scatter_format; off, none
+    (bf16 rows)."""
+    out_format = pytest.importorskip(
+        "tokamax._src.ops.experimental.routing_moe.common.out_format"
+    )
+    assert bridge._scatter_format(False) is None
+    fmt = bridge._scatter_format(True)
+    assert fmt.dtype == jnp.float8_e4m3fn
+    assert isinstance(fmt.quant, out_format.LaneStrided)
 
 
 def test_identity_ep_order_needs_no_relabelling():
