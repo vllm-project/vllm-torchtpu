@@ -142,6 +142,8 @@ if TYPE_CHECKING:
     TPU_GREEDY_TOP_TOKENS: bool = False
     DP_SCHED_ENABLED: bool = False
     TPU_SHORT_PREFILL_FIRST_TOKENS: int = 0
+    TPU_DEFER_STEP: bool = False
+    VLLM_TPU_FOLLOW_SHARED_PREFIX: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -291,6 +293,7 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
+    VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -305,6 +308,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
     VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS: int = 0
+    VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR: str = ""
     VLLM_TPU_DETOK_PRIME_TOKENS: int = 32
     VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS: int = 0
     VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK: bool = False
@@ -1509,6 +1513,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SHORT_PREFILL_FIRST_TOKENS": env_nonnegative_int(
         "TPU_SHORT_PREFILL_FIRST_TOKENS", 0
     ),
+    # Behind a step in flight with prefill tokens, choose the next step shortly
+    # before that step is expected to end instead of at its start
+    # (core/deferred_step.py).
+    "TPU_DEFER_STEP": env_bool("TPU_DEFER_STEP"),
+    # PrefixAwareScheduler: a running prefill whose next chunk another request
+    # has already cached waits instead of computing it, then takes the cached
+    # tokens (core/prefix_aware_scheduler.py). Exact; off computes every chunk.
+    "VLLM_TPU_FOLLOW_SHARED_PREFIX": env_bool("VLLM_TPU_FOLLOW_SHARED_PREFIX"),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
@@ -2167,6 +2179,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
         "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=False
     ),
+    # Lazy KV offloading: also store a partly filled cached HBM block under
+    # the hash of its valid tokens, and load it as a request's partial tail.
+    # Needs TPU_OFFLOAD_KEEP_EAGLE_TAIL. Host-only.
+    "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS": env_bool(
+        "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS", default=False
+    ),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
     "VLLM_TORCHTPU_IPC_KEY": lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),
@@ -2221,6 +2239,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # split and looked up piece by piece.
     "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS": env_nonnegative_int(
         "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS", 0
+    ),
+    # Directory (e.g. /dev/shm/vllm-tpu-pieces) where every API server process
+    # of the container shares the segment tokenizer's encoded pieces, so a turn
+    # served by another process than its session's previous turn reuses the
+    # history's ids. Takes effect only with VLLM_TPU_SEGMENT_TOKENIZE=1. Each
+    # tokenizer of a process keeps up to 128 MiB of its own writes there, and
+    # each process trims older files to the same bound at startup. Empty: each
+    # process keeps its own cache only.
+    "VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR": env_str(
+        "VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR", ""
     ),
     # API server: prime the detokenizer with this many prompt-tail tokens; 0 = off.
     "VLLM_TPU_DETOK_PRIME_TOKENS": env_int("VLLM_TPU_DETOK_PRIME_TOKENS", 32),

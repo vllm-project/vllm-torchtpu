@@ -279,6 +279,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
     # Scheduler prefix-cache hit length only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
+    # Offloading tier entries and hit length only.
+    "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS",
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
@@ -291,8 +293,13 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS",
     "VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS",
     "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS",
+    "VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR",
     "VLLM_TPU_SEND_NEW_PROMPT_IDS",
     "VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK",
+    # Engine-core step timing and scheduling order only; every step keeps a
+    # compiled step size.
+    "TPU_DEFER_STEP",
+    "VLLM_TPU_FOLLOW_SHARED_PREFIX",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
