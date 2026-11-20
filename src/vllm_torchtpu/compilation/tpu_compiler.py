@@ -297,6 +297,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     # instead of before) and the step its request joins (q38 LAND-OVERLAP):
     # the repack programs, the bytes and every model program are the same.
     "QWEN4_EXP_PD_LANDX_DEFER_REPACK",
+    # When a PD consumer polls its KV connector within a step (q38 DEC-STEP-2,
+    # before the previous-results wait instead of after the drafter): host
+    # order only; every program and input is the same.
+    "QWEN4_EXP_PD_EARLY_POLL",
     # Per-step host phase logging (runner/host_phases.py).
     "VLLM_TPU_HOST_PHASES",
     # Last pipeline stage replies from the output thread (host only;

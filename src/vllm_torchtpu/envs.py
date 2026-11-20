@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     QWEN4_EXP_PD_SYNC_REPACK_AB_S: int = 0
     QWEN4_EXP_PD_DEFER_LOAD_SUBMIT: bool = False
     QWEN4_EXP_PD_LANDX_DEFER_REPACK: bool = False
+    QWEN4_EXP_PD_EARLY_POLL: bool = False
     QWEN4_EXP_PD_SHARED_COMPRESSED: bool = False
     QWEN4_EXP_PD_BATCHED_ADMISSION: bool = False
     QWEN4_EXP_PD_BATCHED_ADMISSION_AB_PASSES: int = 0
@@ -1663,6 +1664,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Same repack programs and bytes; host-side scheduling only. Refused at
     # build without SYNC_REPACK, with SYNC_REPACK_AB_S or SHARED_COMPRESSED.
     "QWEN4_EXP_PD_LANDX_DEFER_REPACK": env_bool("QWEN4_EXP_PD_LANDX_DEFER_REPACK"),
+    # Consumer (q38 DEC-STEP-2): poll the KV connector (finished loads, worker
+    # meta, stats, metadata clear) right after the step's forward and sampling
+    # dispatch and the deferred submit, before the wait for the previous step's
+    # sampled tokens, instead of after the drafter. On a decode host the poll
+    # then runs while the device is still busy, off the serial host chain that
+    # ends at the next forward's dispatch. Same programs, same inputs: the
+    # poll's results still reach this step's output; a load that lands in the
+    # moved window is reported one step later. Refused at the first step on a
+    # KV producer and on a connector other than a Raiden PD consumer (the
+    # producer's save fence and an offloading save need the drafter first).
+    "QWEN4_EXP_PD_EARLY_POLL": env_bool("QWEN4_EXP_PD_EARLY_POLL"),
     # Both legs (q38 XFER S4): a staged decode's compressed-key pairs cross
     # once per decode host instead of once per rank. Page b of a tag's pair
     # space goes to rank b % TP; the ranks all-gather them in the L1-named
