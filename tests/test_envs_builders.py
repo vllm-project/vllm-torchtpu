@@ -28,8 +28,10 @@ from vllm_torchtpu.envs import (
     env_bool,
     env_float,
     env_int,
+    env_nonnegative_float,
     env_nonnegative_int,
     env_nonnegative_int_or_auto,
+    env_positive_int,
     env_str,
 )
 
@@ -52,6 +54,7 @@ def _clear(monkeypatch):
         (env_bool, True),
         (env_int, 7),
         (env_nonnegative_int, 7),
+        (env_positive_int, 7),
         (env_float, 1.5),
     ],
 )
@@ -65,6 +68,7 @@ def test_unset_reads_as_the_default(builder, default):
         (env_bool, True),
         (env_int, 7),
         (env_nonnegative_int, 7),
+        (env_positive_int, 7),
         (env_float, 1.5),
     ],
 )
@@ -149,6 +153,24 @@ def test_nonnegative_int_rejects_negatives(monkeypatch):
         env_nonnegative_int(VAR, 0)()
 
 
+def test_positive_int_accepts_one(monkeypatch):
+    monkeypatch.setenv(VAR, "1")
+    assert env_positive_int(VAR, 4)() == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_positive_int_rejects_zero_and_negatives(monkeypatch, value):
+    monkeypatch.setenv(VAR, value)
+    with pytest.raises(ValueError, match="must be > 0"):
+        env_positive_int(VAR, 4)()
+
+
+def test_positive_int_rejects_non_integers(monkeypatch):
+    monkeypatch.setenv(VAR, "4k")
+    with pytest.raises(ValueError, match=VAR):
+        env_positive_int(VAR, 4)()
+
+
 def test_float_parses_ints_too(monkeypatch):
     monkeypatch.setenv(VAR, "30")
     assert env_float(VAR, 1.0)() == 30.0
@@ -158,6 +180,19 @@ def test_float_rejects_non_numbers(monkeypatch):
     monkeypatch.setenv(VAR, "soon")
     with pytest.raises(ValueError, match=VAR):
         env_float(VAR, 1.0)()
+
+
+@pytest.mark.parametrize("value,expected", [("0", 0.0), ("2.5", 2.5)])
+def test_nonnegative_float_accepts_zero_and_up(monkeypatch, value, expected):
+    monkeypatch.setenv(VAR, value)
+    assert env_nonnegative_float(VAR, 1.0)() == expected
+
+
+@pytest.mark.parametrize("value", ["-0.5", "nan", "inf"])
+def test_nonnegative_float_rejects_negative_and_non_finite(monkeypatch, value):
+    monkeypatch.setenv(VAR, value)
+    with pytest.raises(ValueError, match=VAR):
+        env_nonnegative_float(VAR, 1.0)()
 
 
 @pytest.mark.parametrize("value", [None, "", "  ", "auto", "AUTO", " Auto "])
