@@ -12,6 +12,10 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
 from vllm_torchtpu.kernels.qwen4_exp.hc_decode import hc_decode_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_decode_cmp import hc_decode_mix_auto
+from vllm_torchtpu.kernels.qwen4_exp.hc_decode_wide import (
+    MODES as WIDE_MODES,
+    hc_decode_mix_wide_auto,
+)
 from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_norm import _normalize
 from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_cmp import hc_prefill_mix_cmp
@@ -126,6 +130,31 @@ def build_up_epilogue_op(branches: int, hidden: int, token_tile: int):
     return op
 
 
+def _decode_mix_choice():
+    """The fused decode HC mix and its op-name tag.
+
+    TPU_QWEN4_HC_DECODE_WIDE (q38 HC-HIGHROWS, 0 = off) 1 / 2 runs
+    hc_decode_wide.py's served-order / cmp-math mode at 160-511 rows (a
+    multiple of 16); TPU_QWEN4_HC_DECODE_COMPARE runs hc_decode_cmp.py at
+    16-256 rows. They are exclusive. Unset, it is hc_decode_mix, untagged.
+    """
+    wide = envs.TPU_QWEN4_HC_DECODE_WIDE
+    if wide:
+        if wide not in WIDE_MODES:
+            raise ValueError(
+                f"TPU_QWEN4_HC_DECODE_WIDE={wide}: expected 0 (off), 1 or 2"
+            )
+        if envs.TPU_QWEN4_HC_DECODE_COMPARE:
+            raise ValueError(
+                "TPU_QWEN4_HC_DECODE_WIDE and TPU_QWEN4_HC_DECODE_COMPARE are "
+                "exclusive"
+            )
+        return functools.partial(hc_decode_mix_wide_auto, mode=wide), f"_w{wide}"
+    if envs.TPU_QWEN4_HC_DECODE_COMPARE:
+        return hc_decode_mix_auto, "_cmp"
+    return hc_decode_mix, ""
+
+
 @functools.cache
 def build_decode_mix_op(branches: int, hidden: int, eps: float, inject: bool):
     """Register the fused decode HC mix; callers gate it on decode_token_tile.
@@ -136,8 +165,7 @@ def build_decode_mix_op(branches: int, hidden: int, eps: float, inject: bool):
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
     max_tile = envs.TPU_QWEN4_HC_DECODE_TILE_ROWS
     static = dict(branches=branches, hidden=hidden, eps=eps, max_tile=max_tile)
-    mix = hc_decode_mix_auto if envs.TPU_QWEN4_HC_DECODE_COMPARE else hc_decode_mix
-    cmp_tag = "_cmp" if envs.TPU_QWEN4_HC_DECODE_COMPARE else ""
+    mix, cmp_tag = _decode_mix_choice()
     if inject:
 
         def core(
@@ -196,9 +224,8 @@ def build_decode_combine_mix_op(
     max_tile = envs.TPU_QWEN4_HC_DECODE_TILE_ROWS
     static = dict(branches=branches, hidden=hidden, eps=eps, max_tile=max_tile)
     tile_tag = f"_t{max_tile}" if max_tile else ""
-    if envs.TPU_QWEN4_HC_DECODE_COMPARE:
-        tile_tag += "_cmp"
-    mix = hc_decode_mix_auto if envs.TPU_QWEN4_HC_DECODE_COMPARE else hc_decode_mix
+    mix, impl_tag = _decode_mix_choice()
+    tile_tag += impl_tag
     if inject:
 
         def core(

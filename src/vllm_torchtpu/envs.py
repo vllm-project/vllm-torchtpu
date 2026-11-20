@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     TPU_QWEN4_HC_DECODE_FOLD: bool = False
     TPU_QWEN4_HC_DECODE_TILE_ROWS: int = 0
     TPU_QWEN4_HC_DECODE_COMPARE: bool = False
+    TPU_QWEN4_HC_DECODE_WIDE: int = 0
     TPU_QWEN4_HC_PREFILL_ODD_TILES: bool = False
     TPU_QWEN4_HC_PREFILL_FUSED_MIX: bool = False
     TPU_QWEN4_HC_PREFILL_PARTIAL_TILE: bool = False
@@ -1561,6 +1562,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # from the down projection's MXU pass and writes the combined rows back
     # stream by stream. Other row counts keep hc_decode.py.
     "TPU_QWEN4_HC_DECODE_COMPARE": env_bool("TPU_QWEN4_HC_DECODE_COMPARE"),
+    # q38 HC-HIGHROWS, qwen4_exp with TPU_QWEN4_HC_DECODE_FUSED: 1 or 2 runs
+    # the fused decode HC mix at 160-511 rows (a multiple of 16) as
+    # hc_decode_wide.py (row blocks copied by hand under a byte budget, the
+    # combined and mixed rows written back block by block, f32 intermediates
+    # bounded to 128-row chunks). 1 keeps hc_decode.py's math and order
+    # (bitwise target); 2 takes hc_decode_cmp.py's math (injection logits on
+    # the MXU, tanh sigmoid; ulp-level). 0 (default) keeps hc_decode.py.
+    # Exclusive with TPU_QWEN4_HC_DECODE_COMPARE.
+    "TPU_QWEN4_HC_DECODE_WIDE": env_int("TPU_QWEN4_HC_DECODE_WIDE", 0),
     # qwen4_exp prefill: let the fused HC mix (hc_full) and the gated_residual
     # combine take any whole number (>= 2) of hc_prefill_full_tile tiles, not
     # only even counts, so 6,400- and 3,200-token steps leave the unfused
