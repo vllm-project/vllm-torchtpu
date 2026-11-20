@@ -120,7 +120,8 @@ _MODES = {
 @pytest.mark.parametrize("mode", ["pv", "qk_split_pv_split", "qk_pv"])
 def test_decode_fp8_kv_with_kv_scales(mode):
     """k_scale and v_scale other than 1 reach the native QK scores and the
-    native PV output as they do on the dequantizing path."""
+    native PV output: the output matches an f32 reference that multiplies
+    K by k_scale and V by v_scale."""
     native_fp8, tol = _MODES[mode]
     if not jtu.is_device_tpu_at_least(version=7):
         pytest.skip("Expect TPU v7+ (native fp8 MXU)")
