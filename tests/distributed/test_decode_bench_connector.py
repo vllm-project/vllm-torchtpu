@@ -36,12 +36,12 @@ class _TransferConfig(SimpleNamespace):
         return (self.kv_connector_extra_config or {}).get(key, default)
 
 
-def _vllm_config(*, is_hybrid: bool = False):
+def _vllm_config(*, is_hybrid: bool = False, extra=None):
     return SimpleNamespace(
         kv_transfer_config=_TransferConfig(
             kv_connector=CONNECTOR_NAME,
             kv_role="kv_both",
-            kv_connector_extra_config={},
+            kv_connector_extra_config=extra or {},
         ),
         cache_config=SimpleNamespace(block_size=256),
         model_config=SimpleNamespace(is_hybrid=is_hybrid),
@@ -92,6 +92,27 @@ def test_worker_never_touches_kv():
     )
     conn.start_load_kv(None)
     conn.start_load_kv(None, wait_for_completion=True, report_completion=False)
+
+
+def test_marked_mode_claims_only_marked_requests():
+    conn = TPUDecodeBenchConnector(
+        _vllm_config(extra={"claim_mode": "marked"}), KVConnectorRole.SCHEDULER, None
+    )
+    plain = SimpleNamespace(request_id="p", num_tokens=10_000, kv_transfer_params=None)
+    assert conn.get_num_new_matched_tokens(plain, 4096) == (0, False)
+    marked = SimpleNamespace(
+        request_id="m",
+        num_tokens=10_000,
+        kv_transfer_params={"decode_bench_claim": True},
+    )
+    assert conn.get_num_new_matched_tokens(marked, 4096) == (10_000 - 4096 - 1, False)
+
+
+def test_unknown_claim_mode_is_rejected():
+    with pytest.raises(ValueError, match="claim_mode"):
+        TPUDecodeBenchConnector(
+            _vllm_config(extra={"claim_mode": "some"}), KVConnectorRole.SCHEDULER, None
+        )
 
 
 def test_hybrid_models_are_rejected():

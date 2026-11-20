@@ -30,6 +30,17 @@ Config::
                            "kv_connector_module_path":
                                "vllm_torchtpu.distributed.kv_transfer.decode_bench_connector"}'
 
+``kv_connector_extra_config.claim_mode``:
+
+* ``"all"`` (default): every request is claimed.
+* ``"marked"``: only requests whose ``kv_transfer_params`` carry
+  ``{"decode_bench_claim": true}`` are claimed; the rest compute normally. A
+  benchmark primes the prefix cache with real KV through unmarked requests,
+  then marks the measured ones, so the cached history is real and only what a
+  P/D prefill leg would send (the uncached suffix) is left unwritten. With all
+  of a context unwritten, attention sees no real keys and decode runs ~1.5x
+  slower than with real KV (GLM-5.2, TP16), so ``"all"`` understates decode.
+
 ``cp_kv_cache_interleave_size`` is kept as configured under DCP (see
 ``vllm_torchtpu._patch_decode_bench_keeps_cp_interleave``); the pinned vLLM
 would otherwise reset it to the block size, as it does for any connector.
@@ -52,6 +63,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 CONNECTOR_NAME = "TPUDecodeBenchConnector"
+CLAIM_MARKER = "decode_bench_claim"
+_CLAIM_MODES = ("all", "marked")
 
 
 class TPUDecodeBenchConnector(DecodeBenchConnector):
@@ -72,11 +85,26 @@ class TPUDecodeBenchConnector(DecodeBenchConnector):
                 "models; use DecodeBenchConnector."
             )
         super().__init__(vllm_config, role, kv_cache_config)
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        self._claim_mode = str(extra.get("claim_mode", "all"))
+        if self._claim_mode not in _CLAIM_MODES:
+            raise ValueError(
+                f"{CONNECTOR_NAME}: claim_mode must be one of {_CLAIM_MODES}, "
+                f"got {self._claim_mode!r}"
+            )
         logger.info(
             "%s: uncached prompt tokens (all but the last) are claimed as "
-            "externally loaded and never computed or written.",
+            "externally loaded and never computed or written (claim_mode=%s).",
             CONNECTOR_NAME,
+            self._claim_mode,
         )
+
+    def get_num_new_matched_tokens(self, request, num_computed_tokens: int):
+        if self._claim_mode == "marked":
+            params = getattr(request, "kv_transfer_params", None) or {}
+            if not params.get(CLAIM_MARKER):
+                return 0, False
+        return super().get_num_new_matched_tokens(request, num_computed_tokens)
 
     def register_kv_caches(self, kv_caches: "dict[str, torch.Tensor]") -> None:
         # The worker never touches KV, so it keeps no cache references.
