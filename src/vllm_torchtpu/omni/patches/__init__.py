@@ -1180,6 +1180,7 @@ def _patch_ltx2_fast_attention_dispatch() -> None:
     ``LTX2Attention.forward``.
     """
     import inspect
+    import types
 
     from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
 
@@ -1188,7 +1189,7 @@ def _patch_ltx2_fast_attention_dispatch() -> None:
     if getattr(attention_cls.forward, _LTX2_FAST_ATTENTION_DISPATCH_PATCHED, False):
         return
 
-    sig_cache: dict[type, frozenset[str]] = {}
+    sig_cache: dict[Any, frozenset[str]] = {}
 
     def _fast_ltx2_attention_forward(
         self: Any,
@@ -1214,19 +1215,25 @@ def _patch_ltx2_fast_attention_dispatch() -> None:
             )
         if perturbation_mask is not None:
             kwargs["perturbation_mask"] = perturbation_mask
-        proc_cls = type(processor)
-        attn_parameters = sig_cache.get(proc_cls)
+        if isinstance(processor, types.MethodType):
+            cache_key: Any = processor.__func__
+            proc_name = getattr(cache_key, "__qualname__", cache_key.__name__)
+        elif isinstance(processor, (types.FunctionType, types.BuiltinFunctionType)):
+            cache_key = processor
+            proc_name = getattr(processor, "__qualname__", processor.__name__)
+        else:
+            cache_key = type(processor)
+            proc_name = cache_key.__name__
+        attn_parameters = sig_cache.get(cache_key)
         if attn_parameters is None:
-            attn_parameters = frozenset(
-                inspect.signature(processor.__call__).parameters.keys()
-            )
-            sig_cache[proc_cls] = attn_parameters
+            attn_parameters = frozenset(inspect.signature(processor).parameters.keys())
+            sig_cache[cache_key] = attn_parameters
         unused_kwargs = [k for k in kwargs if k not in attn_parameters]
         if unused_kwargs:
             logger.warning(
                 "attention_kwargs %s are not expected by %s and will be ignored.",
                 unused_kwargs,
-                proc_cls.__name__,
+                proc_name,
             )
         return processor(
             self,
@@ -1255,9 +1262,10 @@ def _patch_ulysses_inference_all_to_all_4d() -> None:
     imports ``SeqAllToAll4D`` binds the same class, so setting ``apply`` once
     covers them all. ``SeqAllToAll4D`` defines no backward, so skipping
     ``torch.autograd.Function.apply`` (called 288 times per LTX-2 step under
-    ``torch.no_grad()``) changes nothing but host time. The ``(2, 1)`` and
-    ``(1, 2)`` layouts use one ``permute`` instead of chained transposes and
-    are bit-exact with upstream. ``use_sync=True``, ``_output_destination``,
+    ``torch.no_grad()``) changes nothing but host time. The ``(1, 2)`` layout
+    uses one ``permute`` instead of upstream's chained transposes (``(2, 1)``
+    was already a single ``transpose(0, 2)``) and both are bit-exact with
+    upstream. ``use_sync=True``, ``_output_destination``,
     a world size of 1 and other index pairs go to upstream ``all_to_all_4D``.
     Modules that imported ``all_to_all_4D`` by name keep upstream's function.
 

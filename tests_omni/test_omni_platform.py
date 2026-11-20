@@ -1707,6 +1707,41 @@ def test_ltx2_fast_attention_dispatch(monkeypatch):
     dummy_attn.processor = _ExtraKwProc()
     both(x, perturbation_mask=pmask, extra_accepted=1.0, ignored_kw=9.0)
 
+    # Distinct plain-function processors must not collide on type(processor)
+    # in sig_cache.
+    def _fn_proc_a(
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        query_rotary_emb=None,
+        key_rotary_emb=None,
+        *,
+        alpha=0.0,
+    ):
+        del attn, encoder_hidden_states, attention_mask
+        del query_rotary_emb, key_rotary_emb
+        return hidden_states + alpha
+
+    def _fn_proc_b(
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        query_rotary_emb=None,
+        key_rotary_emb=None,
+        *,
+        beta=0.0,
+    ):
+        del attn, encoder_hidden_states, attention_mask
+        del query_rotary_emb, key_rotary_emb
+        return hidden_states + beta
+
+    dummy_attn.processor = _fn_proc_a
+    torch.testing.assert_close(dummy_attn(x, alpha=2.0, beta=5.0), x + 2.0)
+    dummy_attn.processor = _fn_proc_b
+    torch.testing.assert_close(dummy_attn(x, alpha=2.0, beta=5.0), x + 5.0)
+
 
 def test_ulysses_inference_all_to_all_4d(monkeypatch):
     from vllm_omni.diffusion.attention.parallel import ulysses as ulysses_mod
