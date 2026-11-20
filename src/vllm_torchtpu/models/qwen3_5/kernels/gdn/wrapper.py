@@ -30,14 +30,16 @@
 # - Own-line pyrefly ignores where jax's stubs are narrower than the runtime
 #   (main lists the source's errors in .pyrefly-baseline-full.json).
 # - A comment typo.
+# - fused_conv1d_gdn pads b and a for a GDN call in one HBM pad of the two
+#   stacked, at every shape (KDA keeps the source's two pads).
 # - At config.TILER_SHAPES: the tiler's prefill chunk (128 by default, a
 #   multiple of 16 above 16 tokens, whole triangular blocks below, capped at
 #   its VMEM fit) and decode tile, decode_tile_override (capped at the VMEM
-#   ceilings at every shape), the per-step trims (one pad for b and a, a_log
-#   and dt_bias padded once) and, for verify windows at
-#   config.FUSED_1DOT_SHAPES, the fused 1-dot recurrence (use_fused_1dot).
-#   Every other shape keeps main's tiles (MAIN_MIXED_TILE_SIZE) and code,
-#   apart from the next change.
+#   ceilings at every shape), the per-step trims (a_log and dt_bias padded
+#   once) and, for verify windows at config.FUSED_1DOT_SHAPES, the fused
+#   1-dot recurrence (use_fused_1dot). Every other shape keeps main's tiles
+#   (MAIN_MIXED_TILE_SIZE) and code, apart from the b and a pad above and the
+#   next change.
 # - The verify-window tile cap (tiling.spec_window_tile_cap) counts the output
 #   at its dtype's width, where the source counts 2 bytes, so at any shape an
 #   f32 activation's static decode tile can be one sequence smaller than the
