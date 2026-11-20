@@ -88,11 +88,12 @@ def rotary_embedding_wan_forward(
 
 @functools.cache
 def _first_half_lanes(width: int, head_dim: int, device: torch.device) -> torch.Tensor:
-    # Built on the host and uploaded, so the cached mask is a device buffer
-    # from the start. A device-side arange would be cached as a deferred
-    # graph: the first rotation that reads it inlines the arange, later ones
-    # take the mask as an input, and the two compile as different programs.
-    return (torch.arange(width) % head_dim < head_dim // 2).to(device)
+    # Built on the host (also under a non-host default device) and uploaded,
+    # so the cached mask is a device buffer from the start. A device-side
+    # arange would be cached as a deferred graph: the first rotation that
+    # reads it inlines the arange, later ones take the mask as an input, and
+    # the two compile as different programs.
+    return (torch.arange(width, device="cpu") % head_dim < head_dim // 2).to(device)
 
 
 def split_rope_natural_tables(

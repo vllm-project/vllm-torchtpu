@@ -1140,12 +1140,15 @@ def test_ltx2_split_rope_lane_mask_built_on_host(monkeypatch):
     monkeypatch.setattr(torch, "arange", recording_arange)
     omni_rope._first_half_lanes.cache_clear()
     device = torch.device("cpu")
-    lanes = omni_rope._first_half_lanes(16, 8, device)
-    assert arange_devices == [None]
+    # A default device other than the host ("meta" stands in for TPU) must
+    # not move the arange off the host.
+    with torch.device("meta"):
+        lanes = omni_rope._first_half_lanes(16, 8, device)
+    assert arange_devices == ["cpu"]
     assert lanes.device == device
     assert lanes.tolist() == ([True] * 4 + [False] * 4) * 2
     assert omni_rope._first_half_lanes(16, 8, device) is lanes
-    assert arange_devices == [None]
+    assert arange_devices == ["cpu"]
     omni_rope._first_half_lanes.cache_clear()
 
 
@@ -1248,6 +1251,73 @@ def test_ltx2_split_rope_rotates_views_of_unknown_storage(
         out = ltx2.apply_split_rotary_emb(x, _ltx2_sp_shard(tables), head_dim=8)
         torch.testing.assert_close(out, want.to(torch.bfloat16), rtol=0, atol=0)
     assert len(table_syncs) == syncs
+
+
+@pytest.mark.parametrize(
+    "inference", [False, True], ids=["grad_mode", "inference_mode"]
+)
+def test_ltx2_split_rope_layout_change_releases_tables(ltx2, table_syncs, inference):
+    # A call with another token count (two-stage refinement, another
+    # resolution) builds tables with a new slice layout. The previous tables,
+    # the slices cut from them and their owned copies are released as soon as
+    # the rope module replaces its tables, before any rotation with the new
+    # ones. In inference mode a slice does not reference its base tensor, so
+    # there the slice (which pins the storage) is the object to watch.
+    torch.manual_seed(0)
+    rope = _ltx2_rope(heads=3, head_dim=8)
+    bf16 = torch.bfloat16
+    with torch.inference_mode(inference):
+        tables = rope(_ltx2_coords(batch=2, tokens=8), out_dtype=bf16)
+        shard = _ltx2_sp_shard(tables)
+        ltx2.apply_split_rotary_emb(
+            torch.randn(2, 4, 24, dtype=bf16), shard, head_dim=8
+        )
+        old = [weakref.ref(t) for t in (tables[0], shard[0], table_syncs[-1][0])]
+        del tables, shard
+        table_syncs.clear()  # the fixture's record holds the tables too
+
+        coords = _ltx2_coords(batch=2, tokens=12)
+        tables = rope(coords, out_dtype=bf16)
+        table_syncs.clear()
+        gc.collect()
+        assert [ref() is None for ref in old] == [True, True, True]
+
+        # The new layout rotates like upstream.
+        x = torch.randn(2, 6, 24, dtype=bf16)
+        out = ltx2.apply_split_rotary_emb(x, _ltx2_sp_shard(tables, 6, 12), head_dim=8)
+        upstream = _UPSTREAM_ROPE_FORWARD(rope, coords, None, bf16)
+        want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(
+            x, _ltx2_sp_shard(upstream, 6, 12), head_dim=8
+        )
+        torch.testing.assert_close(out, want.to(bf16), rtol=0, atol=0)
+
+
+def test_ltx2_split_rope_same_layout_tables_coexist(ltx2, table_syncs, monkeypatch):
+    # Two tables with one slice layout: under tensor parallelism the audio
+    # self-attention tables and the audio cross-attention tables have the
+    # same shape, and every block rotates with one and then the other. Each
+    # keeps its owned lanes; neither is copied again in later blocks.
+    torch.manual_seed(0)
+    ropes = [_ltx2_rope(heads=4, head_dim=8) for _ in range(2)]
+    coords = [_ltx2_coords(batch=2, tokens=5) for _ in ropes]
+    tables = [rope(c) for rope, c in zip(ropes, coords, strict=True)]
+    assert tables[0][0].shape == tables[1][0].shape
+    assert not torch.equal(tables[0][0], tables[1][0])
+    monkeypatch.setattr(ltx2, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(ltx2, "get_tensor_model_parallel_rank", lambda: 1)
+    x = torch.randn(2, 5, 2 * 8)
+    wants = []
+    for rope, c in zip(ropes, coords, strict=True):
+        cos, sin = _UPSTREAM_ROPE_FORWARD(rope, c)
+        wants.append(
+            _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(x, (cos[:, 2:], sin[:, 2:]), head_dim=8)
+        )
+    syncs = len(table_syncs)
+    for _block in range(3):
+        for freqs, want in zip(tables, wants, strict=True):
+            out = ltx2.apply_split_rotary_emb(x, freqs, head_dim=8)
+            torch.testing.assert_close(out, want, rtol=1e-6, atol=1e-6)
+    assert len(table_syncs) == syncs + 2  # one pair of owned lanes per table
 
 
 @pytest.mark.parametrize("batch", [1, 2], ids=["b1", "b2"])
