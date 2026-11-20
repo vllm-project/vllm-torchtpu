@@ -907,18 +907,21 @@ def _assembly_warmup_calls(
     most=None,
     async_drafter=True,
     runner_fields=None,
+    with_dtypes=False,
 ):
     """Run _precompile_async_spec_assembly on a stub runner and record the
-    shapes each assembly program was warmed with."""
+    shapes (and, `with_dtypes`, the dtypes) each assembly program was warmed
+    with."""
     calls: dict[str, list[tuple]] = {name: [] for name in _ASSEMBLY_PROGRAMS}
+
+    def spec(a):
+        if not isinstance(a, torch.Tensor):
+            return a
+        return (tuple(a.shape), a.dtype) if with_dtypes else tuple(a.shape)
 
     def recorder(name):
         def record(*args):
-            calls[name].append(
-                tuple(
-                    tuple(a.shape) if isinstance(a, torch.Tensor) else a for a in args
-                )
-            )
+            calls[name].append(tuple(spec(a) for a in args))
             return (torch.zeros(1),)
 
         return record
@@ -969,6 +972,48 @@ def test_async_spec_assembly_warmup_covers_every_bucket(monkeypatch):
         # Every token bucket, for both the max-model-len and the
         # most-model-len request layouts.
         assert warmed == {(knr, t) for knr in (8, 4) for t in (8, 16, 32)}, name
+
+
+@pytest.mark.parametrize("drafter_kind", ["mtp", "dflash"])
+def test_substituting_programs_warm_the_drafters_source_dtype(
+    monkeypatch, drafter_kind
+):
+    """The step after a spec verify substitutes from the parked source, which
+    keeps the drafts' dtype: int32 from the MTP/EAGLE drafter, int64 from
+    DFlash's argmax. Both substituting programs are warmed with each dtype the
+    drafter parks, at every request layout and token bucket; for the MTP
+    drafter that stays int32 only."""
+    from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    nt = torch.zeros((2, 4), dtype=torch.int32)
+    argmax_drafts = torch.zeros((2, 3, 5)).argmax(dim=-1)
+    assert assemble_spec_next_tokens(nt, argmax_drafts).dtype == torch.int64
+    assert assemble_spec_next_tokens(nt, argmax_drafts.int()).dtype == torch.int32
+    if drafter_kind == "mtp":
+        drafter = _sharded_mtp_drafter(
+            SimpleNamespace(
+                max_num_reqs=8,
+                num_reqs_paddings=[2, 4, 8],
+                num_tokens_paddings=[8, 16, 32],
+            ),
+            lockstep=False,
+        )
+        assert isinstance(drafter, Eagle3Proposer)
+    else:
+        drafter = object.__new__(DFlashProposer)
+    calls = _assembly_warmup_calls(
+        monkeypatch, most=4, runner_fields=dict(drafter=drafter), with_dtypes=True
+    )
+    want = {torch.int32} if drafter_kind == "mtp" else {torch.int32, torch.int64}
+    for name in (
+        "_compiled_subtract_and_substitute_placeholder_token",
+        "_compiled_subtract_and_substitute_draft_token_ids",
+    ):
+        warmed = {(c[0][0], c[5][0], c[7][1]) for c in calls[name]}
+        assert warmed == {
+            ((knr,), (t,), dt) for knr in (8, 4) for t in (8, 16, 32) for dt in want
+        }, name
 
 
 def test_async_spec_assembly_warmup_needs_async_scheduling(monkeypatch):

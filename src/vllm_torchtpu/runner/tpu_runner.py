@@ -9517,6 +9517,15 @@ class TPUModelRunner(GPUModelRunner):
                 next_tpu_warm = torch.zeros(
                     bound, dtype=torch.int32, device=self.device
                 )
+                # The parked substitution source keeps the drafts' dtype
+                # (assemble_spec_next_tokens). The MTP/EAGLE drafter casts its
+                # tokens to int32; another drafter's (DFlash's argmax) are
+                # int64, so the substituting programs get an int64 source too.
+                next_tpu_warm_i64 = (
+                    None
+                    if isinstance(self.drafter, Eagle3Proposer)
+                    else torch.zeros(bound, dtype=torch.int64, device=self.device)
+                )
                 for num_tokens in self.num_tokens_paddings:
                     pos_shape = (3, num_tokens) if self.uses_mrope else (num_tokens,)
                     pos_warm = torch.zeros(
@@ -9578,6 +9587,33 @@ class TPUModelRunner(GPUModelRunner):
                             logits_idx_warm,
                         )
                         synchronize_tensors((*out_sub, *out_sub_pl, *out_sub_dr))
+                        if next_tpu_warm_i64 is not None:
+                            synchronize_tensors(
+                                (
+                                    *_compiled_subtract_and_substitute_placeholder_token(
+                                        sl_warm,
+                                        pos_warm,
+                                        rej_warm,
+                                        sl_idx_warm,
+                                        pos_idx_warm,
+                                        ids_warm,
+                                        subst_idx_warm,
+                                        next_tpu_warm_i64,
+                                    ),
+                                    *_compiled_subtract_and_substitute_draft_token_ids(
+                                        sl_warm,
+                                        pos_warm,
+                                        rej_warm,
+                                        sl_idx_warm,
+                                        pos_idx_warm,
+                                        ids_warm,
+                                        subst_idx_warm,
+                                        next_tpu_warm_i64,
+                                        logits_idx_warm,
+                                        logits_idx_warm,
+                                    ),
+                                )
+                            )
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
