@@ -684,6 +684,11 @@ def moe_lowtok(
             f"moe_lowtok is built for at most {MOE_LOWTOK_MAX_TOKENS} rows, "
             f"got {tokens}"
         )
+    if from_logits and topk is None:
+        raise ValueError(
+            "moe_lowtok: from_logits=True needs topk (the kernel runs the top-k "
+            "on the router logits); pass a routing table with from_logits=False"
+        )
     n_experts, inter, w13_parts, rows = _layout(x, w13)
     route_cols = route.shape[1]
     lanes = pl.cdiv(route_cols, _LANE) * _LANE
