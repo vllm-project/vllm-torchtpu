@@ -164,6 +164,8 @@ def candidate_block_scores(
         config = tuned_block_sizes.PUBLISH_BLOCK_MAX_CONFIG.get(
             (pltpu.get_tpu_info().generation, rows, width, block_size)
         )
+    if config is None:
+        config = _untuned_block_max_config(scores, lengths, block_size)
     if config is not None:
         return _candidate_block_scores(scores, lengths, block_size, config)
     masked = jnp.where(jnp.arange(width)[None, :] < lengths[:, None], scores, -jnp.inf)
@@ -178,6 +180,35 @@ def candidate_block_scores(
     )
     last = (lengths - 1) // block_size
     return jnp.where(jnp.arange(blocks)[None, :] == last[:, None], jnp.inf, reduced)
+
+
+def _untuned_block_max_config(scores, lengths, block_size):
+    """(row_tile, block_tile) for a shape outside the tuned table, or None.
+
+    Enabled by ``TPU_DEEPSEEK_V41_PUBLISH_BLOCK_MAX_ANY_ROWS`` (a row limit).
+    One row tile covers all rows, so the tile's row dimension equals the
+    array's and needs no alignment; 1,024 blocks per tile read 8,192 FP32
+    scores per row (block size 8). Example: a [6, 1048576] decode score
+    buffer runs 128 grid steps of (6, 8192) scores each.
+    """
+    from vllm_torchtpu import envs
+
+    limit = envs.TPU_DEEPSEEK_V41_PUBLISH_BLOCK_MAX_ANY_ROWS
+    rows, width = scores.shape
+    lanes = 128
+    if (
+        limit <= 0
+        or rows > limit
+        or scores.dtype != jnp.float32
+        or lengths.dtype != jnp.int32
+        or block_size < 1
+        or lanes % block_size
+        or (block_size & (block_size - 1))
+        or width < 1024 * block_size
+        or jax.default_backend() != "tpu"
+    ):
+        return None
+    return rows, 1024
 
 
 def _candidate_block_scores(scores, lengths, block_size, config):

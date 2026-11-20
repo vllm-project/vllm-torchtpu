@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY: bool = True
     TPU_DEEPSEEK_V41_CED_PREFIX_IDENTITY: bool = False
     TPU_DEEPSEEK_V41_CED_LOCAL_BUCKET_MAX: int = 0
+    TPU_DEEPSEEK_V41_PUBLISH_BLOCK_MAX_ANY_ROWS: int = 0
     TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE: bool = True
@@ -443,6 +444,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # for every bucket. Example: 8 skips it for decode buckets 4 and 8.
     "TPU_DEEPSEEK_V41_CED_LOCAL_BUCKET_MAX": env_int(
         "TPU_DEEPSEEK_V41_CED_LOCAL_BUCKET_MAX", default=0
+    ),
+    # Indexer candidate publication: reduce token scores to 8-token block
+    # maxima with the Pallas kernel (index_selection/publication.py) for any
+    # score buffer of at most this many rows, not only the tuned shapes. The
+    # XLA fallback pads, masks and reshapes the whole [rows, max_model_len]
+    # buffer (about 1 ms per decode step at max_model_len 1,048,576 on tpu7x).
+    # Same block maxima. 0 keeps the tuned-shape table only.
+    "TPU_DEEPSEEK_V41_PUBLISH_BLOCK_MAX_ANY_ROWS": env_int(
+        "TPU_DEEPSEEK_V41_PUBLISH_BLOCK_MAX_ANY_ROWS", default=0
     ),
     # Engram n-gram hash on device as one fused program with exact 64-bit
     # arithmetic on uint32 pairs (kernels/engram_hash.py), instead of the
