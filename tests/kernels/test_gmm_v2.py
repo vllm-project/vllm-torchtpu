@@ -495,6 +495,15 @@ _TUNED_TABLE_SIZES = [3, 0, 2, 0] * 16
 _FP8_MOE_TOLERANCE = 0.05
 
 
+def _channel_magnitudes(key, slots, n):
+    """A factor of 2**U(-2, 2) per (weight slot, output channel). Uniform(-1, 1)
+    bf16 weights reach the same amax in every column, so their per-channel
+    scales would all be equal, and a scale applied to the wrong channel or
+    expert would change nothing; with these factors it changes the output by
+    far more than the tests' tolerances."""
+    return jnp.exp2(jax.random.uniform(key, (slots, 1, n), jnp.float32, -2, 2))
+
+
 def _fp8_moe_inputs(slots, group_sizes, as_arrays=True):
     """bf16 rows and a GMM2-shaped FP8 weight with one scale per output channel
     (a single quant block over k), as FP8 MoE checkpoints load."""
@@ -508,8 +517,10 @@ def _fp8_moe_inputs(slots, group_sizes, as_arrays=True):
     lhs_key, rhs_key = jax.random.split(jax.random.key(0))
     lhs = jax.random.uniform(lhs_key, (rows, _FP8_MOE_K), jnp.bfloat16, -1, 1)
     rhs = jax.random.uniform(
-        rhs_key, (slots, _FP8_MOE_K, _FP8_MOE_N), jnp.bfloat16, -1, 1
+        rhs_key, (slots, _FP8_MOE_K, _FP8_MOE_N), jnp.float32, -1, 1
     )
+    magnitudes = _channel_magnitudes(jax.random.fold_in(rhs_key, 1), slots, _FP8_MOE_N)
+    rhs = (rhs * magnitudes).astype(jnp.bfloat16)
     rhs_q, rhs_scale = quantize_tensor(
         rhs, jnp.float8_e4m3fn, axis=1, block_size=_FP8_MOE_K
     )
@@ -670,8 +681,11 @@ def _fp8_moe_gmm1_inputs(as_arrays=True):
         )
     lhs_key, rhs_key = jax.random.split(jax.random.key(1))
     lhs = jax.random.uniform(lhs_key, (rows, k), jnp.bfloat16, -1, 1)
-    rhs = jax.random.uniform(rhs_key, (slots, k, n), jnp.bfloat16, -1, 1)
-    rhs_q, rhs_scale = quantize_tensor(rhs, jnp.float8_e4m3fn, axis=1, block_size=k)
+    rhs = jax.random.uniform(rhs_key, (slots, k, n), jnp.float32, -1, 1)
+    rhs = rhs * _channel_magnitudes(jax.random.fold_in(rhs_key, 1), slots, n)
+    rhs_q, rhs_scale = quantize_tensor(
+        rhs.astype(jnp.bfloat16), jnp.float8_e4m3fn, axis=1, block_size=k
+    )
     return lhs, rhs_q, jnp.expand_dims(rhs_scale, axis=2)
 
 
@@ -706,6 +720,22 @@ def test_the_fused_gate_up_case_takes_the_gmm1_table_and_hoist(monkeypatch, tune
     assert (tiles == gmm_v2_module._FP8_MOE_GMM1_TILES[80]) is tuned
     assert gmm_v2_module.hoist_rhs_scale(cfgs) is tuned
     assert not gmm_v2_module.use_rhs_stream(cfgs)
+
+
+@pytest.mark.parametrize("which", ["gmm2", "gmm1"])
+def test_the_fp8_moe_inputs_give_each_channel_and_expert_its_own_scale(which):
+    """The device cases can only catch a scale applied to the wrong output
+    channel (the fused gate/up halves) or expert (a streamed slab's scale) if
+    those scales differ."""
+    if which == "gmm1":
+        _, _, scale = _fp8_moe_gmm1_inputs()
+    else:
+        _, _, scale = _fp8_moe_inputs(8, _FP8_MOE_LAYOUTS["spread"][3])
+    s = np.asarray(scale, dtype=np.float64)[:, 0, 0, :]
+    half = s.shape[1] // 2
+    # Halves of one expert, and two experts: typical ratios of 2 to 4.
+    assert np.median(np.abs(np.log2(s[:, :half] / s[:, half:]))) > 0.5
+    assert np.median(np.abs(np.log2(s[0] / s[1]))) > 0.5
 
 
 @pytest.mark.tpu_test
