@@ -1323,6 +1323,7 @@ def _effective_row_lengths(
         "decode_page_major",
         "shared_meta",
         "dcp_axis_name",
+        "scheduling_group_slot",
     ),
 )
 def streamindex_topk(
@@ -1358,6 +1359,7 @@ def streamindex_topk(
     decode_page_major: bool | None = None,
     shared_meta: bool = False,
     dcp_axis_name: str | None = None,
+    scheduling_group_slot: int | None = None,
 ) -> jax.Array | tuple[Any, ...]:  # (out, [scores,] [tied])
     """StreamIndex Top-K retrieval.
 
@@ -1904,7 +1906,11 @@ def streamindex_topk(
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.
         group_base = 0
-        if num_chunks > 1:
+        if num_chunks > 1 and scheduling_group_slot is not None:
+            group_base = config.slot_scheduling_group_ids(
+                scheduling_group_slot, num_chunks - 1
+            )
+        elif num_chunks > 1:
             group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
 
         chunk_starts = (
@@ -2110,6 +2116,7 @@ SMALL_AG_MAX_TOKENS = 8
         "small_all_gather",
         "decode_pack",
         "shared_meta",
+        "scheduling_group_slot",
     ),
 )
 def streamindex_topk_dcp(
@@ -2149,6 +2156,7 @@ def streamindex_topk_dcp(
     small_all_gather: bool | None = None,
     decode_pack: bool = False,
     shared_meta: bool = False,
+    scheduling_group_slot: int | None = None,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -2406,6 +2414,7 @@ def streamindex_topk_dcp(
             cp_rank=dcp_rank,
             interleave_size=interleave_size,
             return_scores=not hist_merge,
+            scheduling_group_slot=scheduling_group_slot,
             skip_empty_decode=skip_empty_decode,
             skip_empty_decode_chunked=skip_empty_decode_chunked,
             final_sc_tie=tuple(ov_args[:1]) if pin else (),
