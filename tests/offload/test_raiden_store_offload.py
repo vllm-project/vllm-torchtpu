@@ -4372,5 +4372,128 @@ class TestDenseDpIndex(unittest.TestCase):
         self.assertEqual(job_name, "vllm-offload-engine-dp2")
 
 
+class TestRaidenOffloadConnectorMetrics(unittest.TestCase):
+    """Scheduler-side Prometheus metrics emitted by RaidenOffloadingManager
+    and registered by RaidenOffloadPromMetrics."""
+
+    def _make_manager(self, capacity: int = 8) -> tuple[FakeKVCacheStore, object]:
+        store = FakeKVCacheStore()
+        manager = make_global_manager(
+            store, device_block_size_factor=1, num_blocks=capacity
+        )
+        return store, manager
+
+    def test_hit_pending_and_pre_transfer_drop_counters(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        store, manager = self._make_manager(capacity=2)
+        assert isinstance(manager, rs.RaidenOffloadingManager)
+        req = _ctx("r1")
+        manager.on_new_request(req)
+
+        # 1. inflight_store HIT_PENDING + fence_cancelled drop
+        k0 = _key(0)
+        prep = manager.prepare_store([k0], req)
+        self.assertIsNotNone(prep)
+        self.assertEqual(manager.lookup(k0, req), LookupResult.HIT_PENDING)
+        manager.on_store_job_cancelled([k0])
+
+        # 2. dead_hbm_residue drop (HBM entry with no live admission)
+        k1 = _key(1)
+        sh1 = manager._sub_hashes(k1)[0]
+        store.entries[sh1] = _Entry(status=FakeBlockStatus.HBM, device_block_id=1)
+        self.assertEqual(manager.lookup(k1, req), LookupResult.MISS)
+
+        # 3. store_skipped_resident + store_over_capacity
+        k2, k3, k4 = _key(2), _key(3), _key(4)
+        sh2 = manager._sub_hashes(k2)[0]
+        store.entries[sh2] = _Entry(status=FakeBlockStatus.HOST)
+        self.assertIsNone(manager.prepare_store([k2, k3, k4, _key(5)], req))
+
+        # 4. pin_race_evicted in prepare_load + failed load_wait sample
+        k6 = _key(6)
+        spec = manager.prepare_load([k6], req)
+        assert isinstance(spec, rs.RaidenLoadStoreSpec)
+        self.assertFalse(spec.pinned)
+        manager.submit_load_job(10, [k6], [0], "r1", pinned=False)
+
+        stats = manager.get_stats()
+        self.assertIsNotNone(stats)
+        assert stats is not None
+        data = stats.data["data"]
+        self.assertEqual(
+            data[rs.RAIDEN_OFFLOAD_HIT_PENDING_TOTAL][("inflight_store",)], 1
+        )
+        drops = data[rs.RAIDEN_OFFLOAD_PRE_TRANSFER_DROPS_TOTAL]
+        self.assertEqual(drops[("fence_cancelled",)], 1)
+        self.assertEqual(drops[("dead_hbm_residue",)], 1)
+        self.assertEqual(drops[("store_skipped_resident",)], 1)
+        self.assertEqual(drops[("store_over_capacity",)], 3)
+        self.assertEqual(drops[("pin_race_evicted",)], 1)
+        self.assertEqual(data[rs.RAIDEN_OFFLOAD_LOAD_WAIT_SECONDS][("failed",)], [0.0])
+        # Second drain returns None once stats have been consumed.
+        self.assertIsNone(manager.get_stats())
+
+    def test_load_wait_histogram_and_prom_metrics_observe(self):
+        from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+
+        from vllm_torchtpu.offload import raiden_connector as rc
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        store, manager = self._make_manager(capacity=4)
+        assert isinstance(manager, rs.RaidenOffloadingManager)
+        req = _ctx("r2")
+        manager.on_new_request(req)
+
+        k0 = _key(0)
+        sh0 = manager._sub_hashes(k0)[0]
+        store.entries[sh0] = _Entry(status=FakeBlockStatus.HOST)
+        self.assertEqual(manager.lookup(k0, req), LookupResult.HIT)
+        spec = manager.prepare_load([k0], req)
+        assert isinstance(spec, rs.RaidenLoadStoreSpec)
+        self.assertTrue(spec.pinned)
+        manager.submit_load_job(42, [k0], [0], "r2", pinned=True)
+        store.complete_load([sh0], success=True)
+        finished = manager.poll_finished_jobs()
+        self.assertEqual(len(finished), 1)
+        self.assertTrue(finished[0].success)
+
+        stats = manager.get_stats()
+        self.assertIsNotNone(stats)
+        assert stats is not None
+        ok_samples = stats.data["data"][rs.RAIDEN_OFFLOAD_LOAD_WAIT_SECONDS][("ok",)]
+        self.assertEqual(len(ok_samples), 1)
+        self.assertGreaterEqual(ok_samples[0], 0.0)
+
+        # Verify RaidenOffloadPromMetrics registers and observes all custom
+        # definitions end-to-end without error.
+        registry = CollectorRegistry()
+
+        def _make_metric(cls):
+            return lambda **kw: cls(registry=registry, **kw)
+
+        vllm_cfg = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(kv_connector_extra_config={})
+        )
+        prom = rc.RaidenOffloadPromMetrics(
+            vllm_cfg,  # type: ignore[arg-type]
+            {
+                Counter: _make_metric(Counter),  # type: ignore[dict-item]
+                Gauge: _make_metric(Gauge),  # type: ignore[dict-item]
+                Histogram: _make_metric(Histogram),  # type: ignore[dict-item]
+            },
+            labelnames=["engine"],
+            per_engine_labelvalues={0: ["0"]},
+        )
+        prom.observe(stats.data, engine_idx=0)
+        self.assertEqual(
+            registry.get_sample_value(
+                "vllm:raiden_offload_load_wait_seconds_count",
+                {"engine": "0", "outcome": "ok"},
+            ),
+            1.0,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

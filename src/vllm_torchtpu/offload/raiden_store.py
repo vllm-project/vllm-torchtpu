@@ -89,6 +89,9 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheConfig
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
@@ -96,8 +99,11 @@ from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
     Medium,
+    OffloadingCounterMetadata,
     OffloadingEvent,
+    OffloadingHistogramMetadata,
     OffloadingManager,
+    OffloadingMetricMetadata,
     OffloadingSpec,
     OffloadingWorker,
     OffloadKey,
@@ -132,6 +138,25 @@ _DRAIN_TIMEOUT_S = envs.VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S
 # suppressed for drained jobs: a drain means the source blocks are about to
 # be reused, so re-reading them would ship garbage.
 _SAVE_RETRIES = envs.VLLM_TPU_OFFLOAD_SAVE_RETRIES
+
+RAIDEN_OFFLOAD_LOAD_WAIT_SECONDS = "vllm:raiden_offload_load_wait_seconds"
+RAIDEN_OFFLOAD_HIT_PENDING_TOTAL = "vllm:raiden_offload_hit_pending_total"
+RAIDEN_OFFLOAD_PRE_TRANSFER_DROPS_TOTAL = "vllm:raiden_offload_pre_transfer_drops_total"
+_LOAD_WAIT_BUCKETS = (
+    0.001,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+)
 
 # Keep the default controller port below Linux's default ephemeral range
 # (net.ipv4.ip_local_port_range = 32768..60999) so kernel-assigned client
@@ -295,6 +320,7 @@ class Admission:
     # retry exactly this subset), and launch failures pre-fill the batch.
     failed_sub_hashes: list[bytes] = field(default_factory=list)
     retries_left: int = 0
+    started_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -503,6 +529,7 @@ class RaidenOffloadingManager(OffloadingManager):
         self._admissions: dict[int, Admission] = {}
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
+        self._stats = OffloadingConnectorStats()
 
     # -- sub-hash / block-id expansion ----------------------------------
 
@@ -634,6 +661,10 @@ class RaidenOffloadingManager(OffloadingManager):
         if key in self._unloadable.get(req_context.req_id, ()):
             return LookupResult.MISS
         if key in self._inflight_store_keys:
+            self._stats.increase_counter(
+                RAIDEN_OFFLOAD_HIT_PENDING_TOTAL,
+                labelvalues=("inflight_store",),
+            )
             return LookupResult.HIT_PENDING
         sub_hashes = self._sub_hashes(key)
         # A probe across all sub-hashes, not a claim: the store pins every
@@ -658,6 +689,10 @@ class RaidenOffloadingManager(OffloadingManager):
                     # scheduler should come back for it. (The common case is
                     # already caught by the per-key in-flight set above; this
                     # is the sub-hash-level net.)
+                    self._stats.increase_counter(
+                        RAIDEN_OFFLOAD_HIT_PENDING_TOTAL,
+                        labelvalues=("hbm_admission",),
+                    )
                     return LookupResult.HIT_PENDING
                 # HBM with no live job behind it is not a pending save. It is
                 # the residue of a save that failed and exhausted its retries
@@ -670,6 +705,10 @@ class RaidenOffloadingManager(OffloadingManager):
                 # again, and the request defers forever. The bytes are not on
                 # the host, so a load could not serve it either. It is a miss
                 # -- recompute, and let `prepare_store` re-offer the key.
+                self._stats.increase_counter(
+                    RAIDEN_OFFLOAD_PRE_TRANSFER_DROPS_TOTAL,
+                    labelvalues=("dead_hbm_residue",),
+                )
                 return LookupResult.MISS
             # A peer's block (REMOTE) and a storage tier's block
             # (SHARED_STORAGE) are both read with read_remote straight into
@@ -681,6 +720,10 @@ class RaidenOffloadingManager(OffloadingManager):
                 if sub_hash in self._hash_to_admission:
                     # A read_remote for this sub-hash is already in flight;
                     # a second launch on the same hash must not race it.
+                    self._stats.increase_counter(
+                        RAIDEN_OFFLOAD_HIT_PENDING_TOTAL,
+                        labelvalues=("inflight_remote_read",),
+                    )
                     return LookupResult.HIT_PENDING
                 all_local = False
                 remote_slices[sub_hash] = block
@@ -796,6 +839,10 @@ class RaidenOffloadingManager(OffloadingManager):
                     num_unloadable,
                     len(keys),
                 )
+                self._stats.increase_counter(
+                    RAIDEN_OFFLOAD_PRE_TRANSFER_DROPS_TOTAL,
+                    labelvalues=("pin_race_evicted",),
+                )
                 return RaidenLoadStoreSpec(keys, pinned=False)
             idx = resolved_to
         self._pending_remote_slices.update(remote_slices)
@@ -828,9 +875,18 @@ class RaidenOffloadingManager(OffloadingManager):
             if len(matches) == len(sub_hashes) and all(
                 block.status in resident_statuses for _, block in matches
             ):
+                self._stats.increase_counter(
+                    RAIDEN_OFFLOAD_PRE_TRANSFER_DROPS_TOTAL,
+                    labelvalues=("store_skipped_resident",),
+                )
                 continue
             keys_to_store.append(key)
         if len(keys_to_store) > self._capacity_keys:
+            self._stats.increase_counter(
+                RAIDEN_OFFLOAD_PRE_TRANSFER_DROPS_TOTAL,
+                counter_increase_value=len(keys_to_store),
+                labelvalues=("store_over_capacity",),
+            )
             return None
         # Atomic admission happens at job-submit time via insert; in-flight
         # tracking here only stops duplicate admission of the same key from a
@@ -918,6 +974,14 @@ class RaidenOffloadingManager(OffloadingManager):
 
     def has_pending_work(self) -> bool:
         return bool(self._admissions)
+
+    def get_stats(self) -> OffloadingConnectorStats | None:
+        """Return connector-level offload stats accumulated since the last poll."""
+        if self._stats.is_empty():
+            return None
+        stats = self._stats
+        self._stats = OffloadingConnectorStats()
+        return stats
 
     def shutdown(self) -> None:
         # Unregister first: the callback runs on a Raiden-owned thread and
@@ -1060,6 +1124,11 @@ class RaidenOffloadingManager(OffloadingManager):
         if not pinned:
             # prepare_load lost the pin race; nothing is held, so fail the
             # job without touching the store and let vLLM recompute.
+            self._stats.observe_histogram(
+                RAIDEN_OFFLOAD_LOAD_WAIT_SECONDS,
+                0.0,
+                labelvalues=("failed",),
+            )
             self._finished.append(
                 FinishedJob(
                     job_id=job_id,
@@ -1070,6 +1139,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 )
             )
             return
+        load_started_at = time.monotonic()
         sub_hashes = self._expand_keys(keys)
         device_ids = self._expand_device_blocks(device_block_ids)
         # Partition by where prepare_load found each sub-hash: one that came
@@ -1129,6 +1199,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 dst_device_block_ids=list(device_block_ids),
                 remote_sub_hashes=set(remote_hashes),
                 failed_sub_hashes=list(failed_hashes),
+                started_at=load_started_at,
             )
             if in_flight:
                 # Earlier launches succeeded: the job must stay non-terminal
@@ -1174,6 +1245,7 @@ class RaidenOffloadingManager(OffloadingManager):
             req_id=req_id,
             dst_device_block_ids=list(device_block_ids),
             remote_sub_hashes=set(remote_hashes),
+            started_at=load_started_at,
         )
         self._admissions[job_id] = admission
         for sub_hash in sub_hashes:
@@ -1182,6 +1254,12 @@ class RaidenOffloadingManager(OffloadingManager):
     def on_store_job_cancelled(self, keys: list[OffloadKey]) -> None:
         """A fence-pending (never admitted) store job was cancelled."""
         self._inflight_store_keys.difference_update(keys)
+        if keys:
+            self._stats.increase_counter(
+                RAIDEN_OFFLOAD_PRE_TRANSFER_DROPS_TOTAL,
+                counter_increase_value=len(keys),
+                labelvalues=("fence_cancelled",),
+            )
 
     def is_job_launched(self, job_id: int) -> bool:
         """Whether a job has been admitted+launched and is not yet terminal."""
@@ -1215,6 +1293,11 @@ class RaidenOffloadingManager(OffloadingManager):
         else:
             if admission.failed:
                 self._mark_unloadable(admission)
+            self._stats.observe_histogram(
+                RAIDEN_OFFLOAD_LOAD_WAIT_SECONDS,
+                max(0.0, time.monotonic() - admission.started_at),
+                labelvalues=("ok" if success else "failed",),
+            )
             self._finished.append(
                 FinishedJob(
                     job_id=admission.job_id,
@@ -2664,6 +2747,36 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 dp_rank=self.dp_rank,
             )
         return self._manager
+
+    @classmethod
+    def build_metric_definitions(
+        cls, extra_config: dict[str, Any]
+    ) -> dict[str, OffloadingMetricMetadata]:
+        """Declare Prometheus metrics emitted by RaidenOffloadingManager."""
+        return {
+            RAIDEN_OFFLOAD_LOAD_WAIT_SECONDS: OffloadingHistogramMetadata(
+                documentation=(
+                    "Wall-clock duration in seconds of a Raiden KV offload "
+                    "load job from submission until scheduler completion."
+                ),
+                labelnames=("outcome",),
+                buckets=_LOAD_WAIT_BUCKETS,
+            ),
+            RAIDEN_OFFLOAD_HIT_PENDING_TOTAL: OffloadingCounterMetadata(
+                documentation=(
+                    "Total Raiden offload lookup deferrals returning "
+                    "HIT_PENDING by deferral reason."
+                ),
+                labelnames=("reason",),
+            ),
+            RAIDEN_OFFLOAD_PRE_TRANSFER_DROPS_TOTAL: OffloadingCounterMetadata(
+                documentation=(
+                    "Total Raiden offload drops or skips resolved in the "
+                    "scheduler connector before reaching C++ transfers."
+                ),
+                labelnames=("reason",),
+            ),
+        }
 
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
         if self._worker is None:

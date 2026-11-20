@@ -61,12 +61,20 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorTransferResults,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    PromMetric,
+    PromMetricT,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
     config as offloading_config_module,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadPromMetrics,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
@@ -326,8 +334,55 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         super().update_connector_output(connector_output)
 
 
+class RaidenOffloadPromMetrics(OffloadPromMetrics):
+    """Prometheus metric definitions for TPURaidenOffloadingConnector.
+
+    Extends upstream OffloadPromMetrics with metrics declared by
+    TPURaidenStoreOffloadingSpec so scheduler-side offload stats flow through
+    vLLM's standard /metrics endpoint.
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ):
+        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+        kv_transfer_config = vllm_config.kv_transfer_config
+        extra_config = (
+            kv_transfer_config.kv_connector_extra_config
+            if kv_transfer_config is not None
+            else {}
+        )
+        for (
+            metric_name,
+            metadata,
+        ) in TPURaidenStoreOffloadingSpec.build_metric_definitions(
+            extra_config
+        ).items():
+            if metric_name not in self._offloading_metric_metadata:
+                self._offloading_metric_metadata[metric_name] = metadata
+                self._offloading_metric_defs[metric_name] = self._create_metric(
+                    metric_name, metadata
+                )
+
+
 class TPURaidenOffloadingConnector(OffloadingConnector):
     """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return RaidenOffloadPromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
