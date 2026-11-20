@@ -116,6 +116,11 @@ if TYPE_CHECKING:
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_TP_DECODE_FAST: bool = True
+    TPU_MOE_TP_DECODE_EXTRA_ROWS: list[int] = []
+    TPU_MOE_TP_DECODE_VMEM_FRACTION: float = 0.75
+    TPU_MOE_TP_DECODE_RG_MIN_ROWS: int = 0
+    TPU_MOE_TP_DECODE_INCUMBENT_MAX_ROWS: int = 0
+    TPU_MOE_TP_DECODE_RG_VMEM_HEADROOM: float = 1.25
     TPU_MOE_TP_DECODE_SPLIT_META: bool = True
     TPU_MOE_TP_DECODE_SHARED_META: bool = True
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -1174,8 +1179,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
-    # at 16, 32 and 64 tokens a single Pallas kernel per rank, at other token
-    # counts the usual path plus a psum (layers/adapter/moe_tp_decode.py).
+    # at 16, 32 and 64 tokens (and TPU_MOE_TP_DECODE_EXTRA_ROWS) a single
+    # Pallas kernel per rank, at other token counts the usual path plus a psum
+    # (layers/adapter/moe_tp_decode.py).
     # Armed once after load; needs TPU_MOE_SKIP_PADDED_TOKENS=1 (the op reads
     # the real token count from its padding mask), otherwise every layer keeps
     # the usual path; fused_moe_decode then arms only the layers it refused.
@@ -1188,6 +1194,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # issued after the compaction instead of inside it, and a ring loop without
     # conditional DMAs or a stale matmul. Default on.
     "TPU_MOE_TP_DECODE_FAST": env_bool("TPU_MOE_TP_DECODE_FAST", True),
+    # moe_tp_decode: decode row counts to admit beyond 16/32/64, e.g.
+    # "96,112,128". Each must still fit the kernel's shape and VMEM checks.
+    "TPU_MOE_TP_DECODE_EXTRA_ROWS": lambda: [
+        int(v)
+        for v in os.getenv("TPU_MOE_TP_DECODE_EXTRA_ROWS", "").split(",")
+        if v.strip()
+    ],
+    # moe_tp_decode: the share of VMEM a row count's plan may take to be
+    # admitted. The row-gathered kernel needs 1.0 at 96-192 rows.
+    "TPU_MOE_TP_DECODE_VMEM_FRACTION": env_float(
+        "TPU_MOE_TP_DECODE_VMEM_FRACTION", 0.75
+    ),
+    # moe_tp_decode: row counts from this up run the row-gathered kernel
+    # (fast schedule only; the incumbent's output bits). 0 (default) = off.
+    "TPU_MOE_TP_DECODE_RG_MIN_ROWS": env_nonnegative_int(
+        "TPU_MOE_TP_DECODE_RG_MIN_ROWS", 0
+    ),
+    # moe_tp_decode: run the incumbent kernel only up to this many rows; larger
+    # counts the row-gathered kernel does not take run the usual path. 0
+    # (default) = no cap.
+    "TPU_MOE_TP_DECODE_INCUMBENT_MAX_ROWS": env_nonnegative_int(
+        "TPU_MOE_TP_DECODE_INCUMBENT_MAX_ROWS", 0
+    ),
+    # moe_tp_decode row-gathered kernel: the factor on its estimated VMEM need
+    # for admission and the compile limit (kernel.VMEM_HEADROOM by default).
+    # 1.15 admits 224 rows at GLM-5.2 EP16.
+    "TPU_MOE_TP_DECODE_RG_VMEM_HEADROOM": env_float(
+        "TPU_MOE_TP_DECODE_RG_VMEM_HEADROOM", 1.25
+    ),
     # moe_tp_decode: pass n_valid, rank and the expert offset as three [1]
     # scalar operands instead of one stacked int32[3] (one XLA fusion per MoE
     # layer, ~0.6 us in situ). Exact.

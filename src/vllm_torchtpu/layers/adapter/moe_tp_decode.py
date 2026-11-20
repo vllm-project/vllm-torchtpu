@@ -4,7 +4,8 @@
 
 Under MoE tensor parallelism vLLM runs the shared expert, scales and adds the
 routed output, and all-reduces the sum over the TP group. For an armed layer
-one torch op does all of it: at the token counts the kernel admits (16, 32 and 64)
+one torch op does all of it: at the token counts the kernel admits (16, 32 and
+64, plus TPU_MOE_TP_DECODE_EXTRA_ROWS)
 one Pallas call per rank covers routing, the shared expert, the routed experts
 and the all-reduce; every other count runs the usual TP path (router top-k,
 fused_moe_func, the shared expert's linears) and a psum in the same exported
@@ -38,6 +39,13 @@ all-reduce) instead of the usual path and a psum: the same kernel and the same
 cut-over as under FUSED_MOE_DECODE_KERNEL, which this op stands down for.
 FUSED_MOE_PREFILL_KERNEL_V2 swaps in its stage-A build (per-row activation
 scales) where the layer's experts fit whole.
+
+Row-gathered kernel: with TPU_MOE_TP_DECODE_RG_MIN_ROWS, token counts from
+there up run kernels/experimental/moe_tp_decode/kernel_rg.py instead of the
+kernel: the same operands, routing, all-reduce and output bits, but each
+streamed expert multiplies only its routed rows.
+TPU_MOE_TP_DECODE_INCUMBENT_MAX_ROWS keeps the kernel to the smaller counts,
+so a count kernel_rg does not admit takes the usual path.
 """
 
 import dataclasses
@@ -64,7 +72,7 @@ from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
     fused_moe_prefill_stage_a,
 )
-from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
+from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce, kernel_rg
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.kernels.router_topk import select as router_select
 from vllm_torchtpu.kernels.router_topk import select_bias as router_select_bias
@@ -137,6 +145,13 @@ class _OpStatics:
     # TPU_MOE_TP_DECODE_HBM_OPERANDS: the kernel's 8 weight operands constrained
     # to HBM (it DMAs them itself; no XLA VMEM staging copy). Same bits.
     hbm_operands: bool = False
+    # TPU_MOE_TP_DECODE_RG_MIN_ROWS: row counts from here up run the row-gathered
+    # kernel (fast schedule only; same output bits). 0 = off.
+    rg_min_rows: int = 0
+    # TPU_MOE_TP_DECODE_INCUMBENT_MAX_ROWS: the incumbent kernel only up to this
+    # many rows (0 = no cap); above it, rows the row-gathered kernel does not
+    # take run the usual path.
+    incumbent_max_rows: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -323,7 +338,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
     )
     rows = tuple(
         m
-        for m in kernel.ROW_BUCKETS
+        for m in kernel.row_buckets()
         if kernel.can_use_moe_tp_decode(
             jax.ShapeDtypeStruct((m, hidden), jnp.bfloat16),
             jax.ShapeDtypeStruct((m, experts), jnp.float32),
@@ -353,6 +368,8 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
             else None
         ),
         fast=bool(envs.TPU_MOE_TP_DECODE_FAST),
+        rg_min_rows=int(envs.TPU_MOE_TP_DECODE_RG_MIN_ROWS),
+        incumbent_max_rows=int(envs.TPU_MOE_TP_DECODE_INCUMBENT_MAX_ROWS),
     )
     return _Admitted(
         shared=shared,
@@ -531,7 +548,32 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                     fast=statics.fast,
                     hbm_operands=statics.hbm_operands,
                 )[:n]
-        if kernel.can_use_moe_tp_decode(
+        if (
+            statics.rg_min_rows
+            and statics.fast
+            and n >= statics.rg_min_rows
+            and kernel_rg.can_use_moe_tp_decode_rg(
+                x, scores, bias, *weights, topk=statics.topk, n_ranks=n_ranks
+            )
+        ):
+            # Row-gathered expert compute: the same output bits as the
+            # incumbent's fast schedule, without its dense pass over all rows.
+            return kernel_rg.moe_tp_decode_rg(
+                x,
+                scores,
+                bias,
+                n_valid,
+                rank.reshape(()),
+                *weights,
+                e0.reshape(()),
+                routed_scale=statics.routed_scale,
+                topk=statics.topk,
+                n_ranks=n_ranks,
+                hbm_operands=statics.hbm_operands,
+            )
+        if (
+            not statics.incumbent_max_rows or n <= statics.incumbent_max_rows
+        ) and kernel.can_use_moe_tp_decode(
             x, scores, bias, *weights, topk=statics.topk, n_ranks=n_ranks
         ):
             return kernel.moe_tp_decode(

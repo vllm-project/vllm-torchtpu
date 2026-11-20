@@ -556,3 +556,69 @@ def test_op_body_runs_the_prefill_kernel_above_the_cap(monkeypatch, tokens, pref
     else:
         assert calls == [("chain", tokens)]
         assert bool(jnp.all(out == 2))  # the chain's partial, psummed over 2
+
+
+@pytest.mark.parametrize(
+    ("tokens", "rg_min_rows", "incumbent_max_rows", "want"),
+    [
+        (128, 96, 64, "rg"),
+        (64, 96, 64, "kernel"),
+        (128, 0, 64, "chain"),
+        (128, 0, 0, "kernel"),
+    ],
+)
+def test_op_body_picks_the_row_gathered_kernel(
+    monkeypatch, tokens, rg_min_rows, incumbent_max_rows, want
+):
+    import jax
+    import jax.numpy as jnp
+
+    calls = []
+
+    def fake(name, value):
+        def run(x, *args, **kwargs):
+            calls.append(name)
+            return jnp.full_like(x, value)
+
+        return run
+
+    monkeypatch.setattr(moe_tp_decode, "_tp_chain", fake("chain", 1))
+    monkeypatch.setattr(
+        moe_tp_decode.kernel, "can_use_moe_tp_decode", lambda *a, **k: True
+    )
+    monkeypatch.setattr(moe_tp_decode.kernel, "moe_tp_decode", fake("kernel", 3))
+    monkeypatch.setattr(
+        moe_tp_decode.kernel_rg, "can_use_moe_tp_decode_rg", lambda *a, **k: True
+    )
+    monkeypatch.setattr(moe_tp_decode.kernel_rg, "moe_tp_decode_rg", fake("rg", 5))
+    statics = moe_tp_decode._OpStatics(
+        topk=TOPK,
+        routed_scale=ROUTED_SCALE,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        fast=True,
+        rg_min_rows=rg_min_rows,
+        incumbent_max_rows=incumbent_max_rows,
+    )
+    body = moe_tp_decode._op_body(statics, n_ranks=2, axis="d")
+    f32, f8 = jnp.float32, jnp.float8_e4m3fn
+    operands = (
+        jnp.zeros((tokens, H), jnp.bfloat16),
+        jnp.zeros((tokens, E), f32),
+        jnp.zeros((E,), f32),
+        jnp.zeros((tokens,), jnp.bool_),
+        jnp.zeros((E, H, 2 * INTER), f8),
+        jnp.zeros((E, INTER, H), f8),
+        jnp.zeros((E, 1, 1, 2 * INTER), f32),
+        jnp.zeros((E, 1, 1, H), f32),
+        jnp.zeros((H, 2 * FS), f8),
+        jnp.zeros((2 * FS,), f32),
+        jnp.zeros((FS, H), f8),
+        jnp.zeros((H,), f32),
+        jnp.zeros((1, 1), jnp.int32),
+        jnp.zeros((1, 1), jnp.int32),
+    )
+    stacked = [jnp.stack([a, a]) for a in operands]
+    jax.vmap(body, axis_name="d")(*stacked)
+    assert calls == [want]

@@ -11,6 +11,7 @@ from vllm_torchtpu.kernels.experimental.moe_tp_decode.kernel import (
     exact_in_bf16,
     kernel_name,
     moe_tp_decode,
+    row_buckets,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "exact_in_bf16",
     "moe_tp_decode",
     "kernel_name",
+    "row_buckets",
 ]
