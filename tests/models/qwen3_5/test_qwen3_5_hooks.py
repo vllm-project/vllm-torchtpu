@@ -64,29 +64,28 @@ def test_hook_extends_vllms_qwen3_5_hook():
     assert issubclass(TPUQwen35MoeConfig, Qwen3_5ForConditionalGenerationConfig)
 
 
-# Qwen3.5-397B-A17B's text config: the shape the hook checks.
-HIDDEN, EXPERTS, LAYERS = 4096, 512, 60
+# Qwen3.5-397B-A17B's text config.
+HIDDEN, INTER, EXPERTS, LAYERS = 4096, 1024, 512, 60
 
 
 def _vllm_config(
     arch: str = QWEN35,
     *,
-    kv_role: str | None = None,
+    kv_role: str | None = "kv_consumer",
     kv_cache_memory_bytes: int | None = None,
     prefix_match_unit: int | None = None,
-    tp: int = 1,
+    tp: int = 8,
     dp: int = 1,
-    dcp: int = 1,
+    dcp: int = 4,
     pcp: int = 1,
     pp: int = 1,
-    ep: bool = False,
+    ep: bool = True,
     max_num_seqs: int = 8,
     additional: dict | None = None,
 ) -> SimpleNamespace:
-    """A Qwen3.5-397B-A17B engine config as the hook sees it; by default one
-    engine without KV transfer or any parallelism."""
     text = SimpleNamespace(
         hidden_size=HIDDEN,
+        moe_intermediate_size=INTER,
         num_experts=EXPERTS,
         num_hidden_layers=LAYERS,
         mamba_ssm_dtype="float32",
