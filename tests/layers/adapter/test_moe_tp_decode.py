@@ -509,8 +509,8 @@ def test_op_body_runs_the_prefill_kernel_above_the_cap(monkeypatch, tokens, pref
 
     calls = []
 
-    def fake_prefill(x, *args):
-        calls.append(("prefill", x.shape[0], args[-1]))
+    def fake_prefill(x, *args, slots=None):
+        calls.append(("prefill", x.shape[0], args[-1], slots))
         return jnp.full_like(x, 7)
 
     def fake_chain(x, *args):
@@ -553,7 +553,7 @@ def test_op_body_runs_the_prefill_kernel_above_the_cap(monkeypatch, tokens, pref
     out = jax.vmap(body, axis_name="d")(*stacked)
     if prefill:
         # The prefill kernel's output is already summed: no psum on top.
-        assert calls == [("prefill", tokens, "d")]
+        assert calls == [("prefill", tokens, "d", None)]
         assert bool(jnp.all(out == 7))
     else:
         assert calls == [("chain", tokens)]
