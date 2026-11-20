@@ -163,12 +163,13 @@ def _e4m3_steps(got, want):
 @pytest.mark.tpu_test
 # The 397B o_proj input per device: 32 query heads of 256 at TP1 (pipeline-
 # parallel prefill legs), 16 at TP2 and 4 at TP8 (decode legs). 4 rows take
-# the 8-row pad, 96 and 256 are decode steps (one block wider than 2048
-# columns; at 8192 columns 256 rows run as two 128-row blocks), 208 pads to
-# 224 rows at 8192 columns, 2176 and 8192 are prefill steps (128- to 512-row
+# the 8-row pad; 96 is a decode step. Wider than 2048 columns the VMEM budget
+# sets the boundary: 204 rows are the largest one-block step at 8192 columns
+# (256 at 4096); 256 rows at 8192 columns split into two 128-row blocks, and
+# 208 rows pad to 224 there. 2176 and 8192 are prefill steps (128- to 512-row
 # blocks).
 @pytest.mark.parametrize("cols", [1024, 4096, 8192])
-@pytest.mark.parametrize("rows", [4, 96, 208, 256, 2176, 8192])
+@pytest.mark.parametrize("rows", [4, 96, 204, 208, 256, 2176, 8192])
 def test_compiled_kernel_matches_the_eager_gate_on_tpu(rows, cols):
     """The Mosaic-compiled kernel at its default tiles against the reference.
     The TPU may round one scale a bf16 step away from the reference (an f32
