@@ -173,6 +173,9 @@ DISPATCHED_DIRECTLY = [
         "structured_decoding.structured_decoding_manager",
         "StructuredDecodingManager.structured_decode",
     ),
+    ("runner.tpu_runner", "_clear_read_offsets_compiled"),
+    ("runner.tpu_runner", "_update_read_offsets_verify_compiled"),
+    ("runner.tpu_runner_async_output", "_compiled_extract_draft_token_ids"),
 ]
 
 
