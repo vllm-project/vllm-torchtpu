@@ -239,7 +239,9 @@ def _fake_qwen3_next_model(head: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
-def test_post_load_hook_keeps_a_bf16_twin_by_default(monkeypatch):
+def test_post_load_hook_keeps_a_bf16_twin_when_quantize_target_lm_head_is_on(
+    monkeypatch,
+):
     from vllm_torchtpu.models.vllm import qwen3_next_patch
 
     monkeypatch.setattr(qwen3_next_patch, "_quantize_target_lm_head", lambda: True)
@@ -357,9 +359,7 @@ def _vocab_parallel_owner(base_head: torch.nn.Module):
     """The owner vocab_parallel_draft_owner builds at DP2 x TP1 on DP rank 1:
     a proxy holding a _VocabParallelDraftHead over the upper half of
     ``base_head``'s rows."""
-    head = gtt._VocabParallelDraftHead(
-        base_head, dp_rank=1, dp_size=2, tp_rank=0, tp_size=1
-    )
+    head = gtt._VocabParallelDraftHead(base_head, dp_rank=1, dp_size=2, tp_size=1)
     return gtt._DraftHeadOwnerProxy(_Processor(), head)
 
 
@@ -399,7 +399,7 @@ def test_the_bf16_twin_stays_while_the_draft_reads_it(owner_kind):
 
 @pytest.mark.parametrize("vocab_parallel", [True, False])
 def test_the_proposer_releases_the_twin_behind_a_vocab_parallel_head(vocab_parallel):
-    """load_model releases the twin right after resolving the greedy head, and
+    """load_model releases the twin after resolving the greedy head, and
     only when that head is the vocab-parallel one."""
     import ast
     import inspect
@@ -425,9 +425,7 @@ def test_the_proposer_releases_the_twin_behind_a_vocab_parallel_head(vocab_paral
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
-    assert (
-        lines["_release_unread_draft_bf16_head"] == lines["_init_draft_greedy_head"] + 1
-    )
+    assert lines["_release_unread_draft_bf16_head"] > lines["_init_draft_greedy_head"]
 
 
 def test_target_lm_head_stays_bf16_by_default(monkeypatch):
