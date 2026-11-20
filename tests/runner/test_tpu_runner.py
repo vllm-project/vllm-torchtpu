@@ -474,6 +474,8 @@ def test_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
         num_xla_graphs=7,
         _precompile_timed=lambda _label: contextlib.nullcontext(),
         _warmup_one_mtp_prefill=attempts,
+        vllm_config=SimpleNamespace(speculative_config=None),
+        _pcp_enabled=False,
     )
 
     expectation = (
@@ -517,6 +519,8 @@ def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
         num_xla_graphs=7,
         _precompile_timed=lambda _label: contextlib.nullcontext(),
         _warmup_one_mtp_prefill=attempts,
+        vllm_config=SimpleNamespace(speculative_config=None),
+        _pcp_enabled=False,
     )
     expectation = (
         contextlib.nullcontext()
@@ -536,6 +540,61 @@ def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
     assert attempts.call_args_list == [((4096,), {})]
 
 
+@pytest.mark.parametrize("last_stage", [True, False])
+def test_mtp_prefill_warmup_with_the_two_pass_step0_runs_alike_on_every_stage(
+    monkeypatch, last_stage
+):
+    # The sweep runs as the single pass, which warms the draft at p = P, then
+    # one more step at the longest prompt takes the two passes. Only the last
+    # pipeline stage holds the drafter, yet every stage runs the same steps.
+    monkeypatch.delenv("TPU_MTP_KV_ONLY_STEP0", raising=False)
+    single = {"on": False}
+
+    @contextlib.contextmanager
+    def single_pass_step0():
+        single["on"] = True
+        try:
+            yield
+        finally:
+            single["on"] = False
+
+    drafter = MagicMock(spec=Eagle3Proposer)
+    drafter.kv_only_step0_enabled = True
+    drafter.single_pass_step0 = single_pass_step0
+    steps = []
+
+    def attempt(P, **kwargs):
+        steps.append((P, single["on"]))
+        return True
+
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        speculative_config=object(),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2, prefill_context_parallel_size=1
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=1024),
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[256, 1024],
+        max_model_len=262144,
+        num_xla_graphs=7,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_mtp_prefill=MagicMock(side_effect=attempt),
+        vllm_config=SimpleNamespace(speculative_config=SimpleNamespace(method="mtp")),
+        _pcp_enabled=False,
+        drafter=drafter if last_stage else None,
+    )
+    with patch.object(
+        tpu_runner, "_suspend_kv_transfer_group", return_value=contextlib.nullcontext()
+    ):
+        TPUModelRunner._warmup_mtp_prefill(runner)
+
+    assert [P for P, _ in steps] == [256, 1024, 1024]
+    assert [on for _, on in steps] == (
+        [True, True, False] if last_stage else [False, False, False]
+    )
+
+
 def test_mtp_prefill_warmup_fills_every_bucket():
     # Buckets are per rank: a PCP8 prompt of 8 x 512 tokens pads to 512 per
     # rank. Prompts above one scheduler step collapse onto its size.
@@ -553,6 +612,8 @@ def test_mtp_prefill_warmup_fills_every_bucket():
         num_xla_graphs=7,
         _precompile_timed=lambda _label: contextlib.nullcontext(),
         _warmup_one_mtp_prefill=attempts,
+        vllm_config=SimpleNamespace(speculative_config=None),
+        _pcp_enabled=False,
     )
     with patch.object(
         tpu_runner, "_suspend_kv_transfer_group", return_value=contextlib.nullcontext()
@@ -568,13 +629,24 @@ def test_mtp_prefill_warmup_fills_every_bucket():
     ]
 
 
+@pytest.mark.parametrize("two_pass", [False, True])
 @pytest.mark.parametrize("async_scheduling", [True, False])
 def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
-    async_scheduling,
+    async_scheduling, two_pass
 ):
     one = MagicMock(return_value=True)
     batch = MagicMock()
+    drafter = MagicMock(spec=Eagle3Proposer)
+    drafter.bucketed_drafts = False
+    drafter.kv_only_step0_enabled = two_pass
+    # One request's step 0 takes the two passes from 4096 tokens.
+    drafter.takes_two_pass_prefill.side_effect = lambda T, num_reqs: T >= 4096
+    single_pass = []
+    drafter.single_pass_step0.side_effect = lambda: contextlib.nullcontext(
+        single_pass.append(True)
+    )
     runner = SimpleNamespace(
+        drafter=drafter,
         enforce_eager=False,
         _is_async_drafter=True,
         input_batch=SimpleNamespace(num_reqs=0),
@@ -599,17 +671,75 @@ def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
     ):
         TPUModelRunner._warmup_spec_decode(runner)
 
-    # One request per prompt bucket within max_model_len, greedy and not.
+    # One request per prompt bucket within max_model_len, greedy and not;
+    # with the two-pass MTP step 0 on, first as the single pass, then again
+    # (greedy and not) where one request's step 0 takes the two passes.
+    passes = {
+        P: 2 if two_pass and P >= 4096 else 1 for P in (16, 32, 64, 128, 4096, 8192)
+    }
     assert [c.args[0] for c in one.call_args_list] == [
-        P for P in (16, 32, 64, 128, 4096, 8192) for _ in range(2)
+        P for P, n in passes.items() for _ in range(2 * n)
     ]
+    assert len(single_pass) == (6 if two_pass else 0)
     # Every request count (async) or the request paddings (sync) at the
     # shortest prompt bucket, then the paddings at the longest one, nr > 1.
+    # With the two-pass MTP step 0 on, the first sweep also runs the mixed
+    # verify + prefill steps it takes, from one verifying request up.
     counts = range(2, 33) if async_scheduling else (8, 16, 32)
-    assert batch.call_args_list == [
-        ((R, 16), {"greedy": greedy}) for R in counts for greedy in (True, False)
+    one_verifying = [
+        ((1, 16), {"greedy": greedy, "short": True, "mixed": True})
+        for greedy in (True, False)
+    ]
+    assert batch.call_args_list == (one_verifying if two_pass else []) + [
+        ((R, 16), {"greedy": greedy, "mixed": two_pass})
+        for R in counts
+        for greedy in (True, False)
     ] + [
         ((R, 8192), {"greedy": greedy}) for R in (8, 16, 32) for greedy in (True, False)
+    ]
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_spec_decode_warmup_runs_a_mixed_step_at_two_max_num_seqs(async_scheduling):
+    """At max_num_seqs 2 the count sweep has no room for a mixed step beside
+    its decoders, so the one-verifying-request mixed step is the only one the
+    two-pass MTP step 0 gets compiled on before serving."""
+    batch = MagicMock()
+    drafter = MagicMock(spec=Eagle3Proposer)
+    drafter.bucketed_drafts = False
+    drafter.kv_only_step0_enabled = True
+    drafter.takes_two_pass_prefill.return_value = False
+    drafter.single_pass_step0.side_effect = contextlib.nullcontext
+    runner = SimpleNamespace(
+        drafter=drafter,
+        enforce_eager=False,
+        _is_async_drafter=True,
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[16, 32],
+        num_reqs_paddings=[1, 8],
+        max_model_len=1024,
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=2, async_scheduling=async_scheduling
+        ),
+        num_xla_graphs=3,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_spec_request=MagicMock(return_value=True),
+        _warmup_spec_batch=batch,
+    )
+    with (
+        patch.object(tpu_runner.envs, "SPEC_WARMUP", True),
+        patch.object(
+            tpu_runner,
+            "_suspend_kv_transfer_group",
+            return_value=contextlib.nullcontext(),
+        ),
+    ):
+        TPUModelRunner._warmup_spec_decode(runner)
+
+    mixed = [c for c in batch.call_args_list if c.kwargs.get("mixed")]
+    assert mixed[:2] == [
+        ((1, 16), {"greedy": greedy, "short": True, "mixed": True})
+        for greedy in (True, False)
     ]
 
 
@@ -783,6 +913,8 @@ def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():
         num_xla_graphs=7,
         _precompile_timed=lambda _label: contextlib.nullcontext(),
         _warmup_one_mtp_prefill=attempts,
+        vllm_config=SimpleNamespace(speculative_config=None),
+        _pcp_enabled=False,
     )
     with patch.object(
         tpu_runner, "_suspend_kv_transfer_group", return_value=contextlib.nullcontext()

@@ -363,6 +363,21 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
         )
 
 
+def _log_mtp_kv_only_step0(vllm_config: "VllmConfig", pcp_enabled: bool) -> None:
+    """Say up front when a draft keeps the single step-0 pass
+    (TPU_MTP_KV_ONLY_STEP0)."""
+    if vllm_config.speculative_config is None:
+        return
+    # MTP draft logic; imported only when there is a draft.
+    from vllm_torchtpu.spec_decode.mtp_kv_only import (
+        mtp_kv_only_step0_config_reason,
+    )
+
+    reason = mtp_kv_only_step0_config_reason(vllm_config, pcp_enabled)
+    if reason is not None:
+        logger.info("MTP KV-only draft step 0 is off: %s.", reason)
+
+
 def _validate_lora_config(vllm_config: "VllmConfig") -> None:
     """Rejects LoRA settings that the TPU LoRA path does not support yet.
 
@@ -930,6 +945,7 @@ class TpuPlatform(Platform):
                 "Using vLLM native multiprocess PCP world; PCP is not "
                 "represented as a JAX mesh axis."
             )
+        _log_mtp_kv_only_step0(vllm_config, pcp_config.enabled)
         validate_pipeline_parallel_config(vllm_config)
         if vllm_config.parallel_config.pipeline_parallel_size > 1:
             # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)

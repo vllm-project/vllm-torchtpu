@@ -47,6 +47,8 @@ vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
   }'
 ```
 
+On TPU7x, for a single-layer DSA MTP draft (`DeepSeek-V3.2`, `GLM-5.2`) without prefill context parallelism, draft step 0 of a large prefill chunk runs as a KV-only pass over every row, then the full layer on each request's last row, where that is faster than the single pass.
+
 ---
 
 ## 3. DFlash & DSpark Speculative Decoding

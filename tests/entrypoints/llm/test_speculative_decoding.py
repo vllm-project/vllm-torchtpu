@@ -32,6 +32,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import pytest
 from tpu_release import wait_for_tpu_release
 from vllm import LLM, SamplingParams
@@ -1856,6 +1857,21 @@ _WORKER_START_FAILED = "WorkerProc failed to start"
 # reported as is.
 _TPU_INIT_RACE = "PjRtClient is not initialized"
 DP_SERVER_START_ATTEMPTS = 2
+# The TPU platform writes these into the environment of the process that
+# builds an engine, for that engine's workers, and leaves them there. An
+# engine built in this process (an in-process `LLM` on every chip, say)
+# leaves its values behind; an engine started from here must work out its
+# own, or a smaller slice starts with the bigger one's topology.
+TPU_BOOTSTRAP_ENV = (
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "TORCH_TPU_DP_MASTER_ADDR",
+    "TORCH_TPU_DP_MASTER_PORT",
+    "TORCH_TPU_DP_SIZE",
+    "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+    "TORCH_TPU_TOPOLOGY",
+    "TORCH_TPU_XPROF_SESSION_ID",
+)
 
 # Prometheus renders the same counters the in-process reader exposes, with a
 # `_total` suffix.
@@ -1871,6 +1887,10 @@ _SERVE_TRANSLATED_KEYS = {
     "max_num_seqs",
     "tensor_parallel_size",
     "data_parallel_size",
+    "kv_cache_memory_bytes",
+    "load_format",
+    "seed",
+    "skip_tokenizer_init",
     "async_scheduling",
     "enable_prefix_caching",
     "language_model_only",
@@ -1902,6 +1922,9 @@ def _serve_args(kwargs: dict) -> list[str]:
         "tensor_parallel_size",
         "data_parallel_size",
         "kv_cache_dtype",
+        "kv_cache_memory_bytes",
+        "load_format",
+        "seed",
     ):
         if kwargs.get(key) is not None:
             args += [f"--{key.replace('_', '-')}", str(kwargs[key])]
@@ -1915,6 +1938,8 @@ def _serve_args(kwargs: dict) -> list[str]:
 
     if kwargs.get("language_model_only"):
         args.append("--language-model-only")
+    if kwargs.get("skip_tokenizer_init"):
+        args.append("--skip-tokenizer-init")
     if kwargs.get("enable_expert_parallel"):
         args.append("--enable-expert-parallel")
     if kwargs.get("limit_mm_per_prompt") is not None:
@@ -1959,9 +1984,46 @@ def _pick_free_port() -> int:
 class _ServedEngine:
     """Engine behind an out-of-process `vllm serve`."""
 
-    def __init__(self, base: str, model_name: str):
+    def __init__(self, base: str, model_name: str, log_path: str):
         self._base = base
         self._model = model_name
+        self._log_path = log_path
+
+    def log_text(self) -> str:
+        """Everything the server has logged so far."""
+        return _read_log(self._log_path)
+
+    def complete_token_ids(
+        self, prompts: list[list[int]], max_tokens: int
+    ) -> list[list[int]]:
+        """Greedy completions of token-id prompts, sent concurrently, as token
+        ids (for a server started with `skip_tokenizer_init`)."""
+
+        def one(ids: list[int]) -> list[int]:
+            payload = json.dumps(
+                {
+                    "model": self._model,
+                    "prompt": ids,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.0,
+                    "ignore_eos": True,
+                    "return_token_ids": True,
+                }
+            ).encode()
+            request = urllib.request.Request(
+                f"{self._base}/v1/completions",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(
+                request, timeout=DP_REQUEST_TIMEOUT_S
+            ) as response:
+                body = json.loads(response.read().decode())
+            return body["choices"][0]["token_ids"]
+
+        with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
+            return list(pool.map(one, prompts))
 
     def generate(
         self, prompts: list[str], sampling_config: SamplingParams
@@ -2074,9 +2136,13 @@ def _stop_server(server: subprocess.Popen) -> None:
 
 
 def _start_server(
-    model_name: str, speculative_config: dict | None, kwargs: dict
-) -> tuple[subprocess.Popen, str]:
-    """Launch `vllm serve` and wait for /health; return the server and its URL.
+    model_name: str,
+    speculative_config: dict | None,
+    kwargs: dict,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[subprocess.Popen, str, str]:
+    """Launch `vllm serve` and wait for /health; return the server, its URL
+    and its log file.
 
     A server that fails to come up is stopped before the error is raised.
     """
@@ -2106,10 +2172,14 @@ def _start_server(
     # compiles every graph at startup, which is CPU-bound: the DFlash pair
     # takes about 630s on a host with a slower CPU. Wait as long as the
     # health poll does.
-    env = dict(
-        os.environ,
+    #
+    # An engine built in this process by an earlier test leaves its TPU
+    # bootstrap variables in os.environ; the server works out its own.
+    env = {k: v for k, v in os.environ.items() if k not in TPU_BOOTSTRAP_ENV}
+    env.update(
         VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=str(DP_EXECUTE_MODEL_TIMEOUT_S),
         VLLM_ENGINE_READY_TIMEOUT_S=str(DP_SERVER_STARTUP_TIMEOUT_S),
+        **(extra_env or {}),
     )
 
     # Log to a file rather than a pipe. vLLM startup writes far more than a
@@ -2152,16 +2222,25 @@ def _start_server(
         _stop_server(server)
         raise
     print(f"vllm serve ready at {base}; log: {log.name}")
-    return server, base
+    return server, base, log.name
 
 
 @contextlib.contextmanager
-def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
-    """Run `vllm serve` with these engine kwargs; yield a _ServedEngine."""
+def _serve(
+    model_name: str,
+    speculative_config: dict | None,
+    kwargs: dict,
+    extra_env: dict[str, str] | None = None,
+):
+    """Run `vllm serve` with these engine kwargs (and extra environment
+    variables); yield a _ServedEngine. A failed start keeps its log, which
+    the error names."""
     attempt = 1
     while True:
         try:
-            server, base = _start_server(model_name, speculative_config, kwargs)
+            server, base, log_path = _start_server(
+                model_name, speculative_config, kwargs, extra_env
+            )
             break
         except _ServeStartupError as e:
             if not e.retryable or attempt == DP_SERVER_START_ATTEMPTS:
@@ -2169,9 +2248,11 @@ def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
             print(f"vllm serve attempt {attempt} hit the TPU init race:\n{e}")
             attempt += 1
     try:
-        yield _ServedEngine(base, model_name)
+        yield _ServedEngine(base, model_name, log_path)
     finally:
         _stop_server(server)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(log_path)
 
 
 def _qwen35_dp_kwargs() -> dict:
@@ -2352,3 +2433,388 @@ def test_dsv4_dspark_performance_greedy(
         async_scheduling=False,
         extra_kwargs=_dsv4_dspark_kwargs(),
     )
+
+
+# ---------------------------------------------------------------------------
+# MTP draft: two-pass step 0 (TPU_MTP_KV_ONLY_STEP0)
+#
+# A one-layer GLM-5.2-shaped DSA model with one MTP layer (small dims, dummy
+# weights, no tokenizer) serves the same token prompts with the switch off and
+# on: the outputs, the draft counters and every proposal must match, and the
+# two-pass step 0 must add no compiled program while serving. Six short
+# prompts and two long ones in one batch give a step whose prefill chunk
+# carries many requests, then steps that verify the short ones' drafts while
+# the long ones keep prefilling.
+#
+# Neither test touches the TPU from the pytest process itself: the one-chip
+# engines run in spawned children, and the served one out of process.
+# ---------------------------------------------------------------------------
+
+KV_ONLY_NUM_SPEC = 3
+KV_ONLY_MAX_NUM_SEQS = 8
+KV_ONLY_MAX_NUM_BATCHED_TOKENS = 1024
+KV_ONLY_MAX_MODEL_LEN = 2048
+KV_ONLY_VOCAB = 8192
+KV_ONLY_MAX_TOKENS = 24
+# Generous for one engine's build, warmup and generate.
+KV_ONLY_CHILD_TIMEOUT_S = 480
+KV_ONLY_DP_SIZE = 2
+KV_ONLY_BUILT_LOG = "with a prefill span runs a KV-only pass over every row"
+# Logged (at debug level) each time a padding chunk replays the two passes.
+KV_ONLY_REPLAY_LOG = "replaying the two-pass draft step 0"
+KV_ONLY_PROPOSER_LOGGER = "vllm.vllm_torchtpu.spec_decode.eagle3"
+
+
+def _kv_only_write_config(path: str, index_share: bool) -> None:
+    """GLM-5.2's architecture (MLA + lightning indexer, MoE, one MTP layer)
+    at small dims; the MLA latent, RoPE and indexer head sizes are the real
+    ones, which the TPU kernels are built for. `index_share` is
+    `index_share_for_mtp_iteration`, which DSA MTP checkpoints set."""
+    from transformers import GlmMoeDsaConfig
+
+    config = GlmMoeDsaConfig(
+        vocab_size=KV_ONLY_VOCAB,
+        hidden_size=1024,
+        intermediate_size=2048,
+        moe_intermediate_size=512,
+        num_hidden_layers=1,
+        first_k_dense_replace=0,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        n_shared_experts=1,
+        q_lora_rank=512,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        qk_nope_head_dim=192,
+        v_head_dim=256,
+        index_topk=256,
+        index_head_dim=128,
+        index_n_heads=8,
+        max_position_embeddings=KV_ONLY_MAX_MODEL_LEN,
+        num_nextn_predict_layers=1,
+        index_share_for_mtp_iteration=index_share,
+        architectures=["GlmMoeDsaForCausalLM"],
+        dtype="bfloat16",
+    )
+    config.save_pretrained(path)
+
+
+def _kv_only_prompts() -> list[list[int]]:
+    rng = np.random.default_rng(0)
+    lengths = [120, 150, 130, 140, 110, 160, 900, 700]
+    return [rng.integers(10, KV_ONLY_VOCAB - 10, size=n).tolist() for n in lengths]
+
+
+def _kv_only_lone_prompt() -> list[int]:
+    # Longer than one step's token budget: two prefill-carrying steps.
+    rng = np.random.default_rng(1)
+    return rng.integers(10, KV_ONLY_VOCAB - 10, size=1500).tolist()
+
+
+def _kv_only_cache_entries() -> int:
+    import torch
+
+    return len(torch.tpu._get_cache_stats().per_entry_stats)
+
+
+def _kv_only_instrument(worker) -> bool:
+    """From now on, record every proposal, and for every two-pass step 0
+    the XLA cache entries it adds; returns whether the switch built pass 1.
+
+    The two-pass step 0 runs pass 1, the pass-2 gather and pass-2 step 0:
+    compiled programs that compile, if at all, when they are called, so an
+    entry they add appears within the call. Counting only those keeps the
+    check to the switch's own programs, apart from the ones the runner
+    compiles after warmup with the switch off too."""
+    import torch
+
+    drafter = worker.model_runner.drafter
+    propose = drafter.propose
+    drafter.recorded_drafts = []
+    drafter.two_pass_graphs = []
+
+    def recorded(*args, **kwargs):
+        drafts = propose(*args, **kwargs)
+        rows = drafts.cpu().tolist() if isinstance(drafts, torch.Tensor) else drafts
+        drafter.recorded_drafts.append([list(row) for row in rows])
+        return drafts
+
+    drafter.propose = recorded
+    if drafter._mtp_kv_only is None:
+        return False
+    two_pass_step0 = drafter._two_pass_step0
+
+    def counted(*args, **kwargs):
+        before = _kv_only_cache_entries()
+        out = two_pass_step0(*args, **kwargs)
+        drafter.two_pass_graphs.append(_kv_only_cache_entries() - before)
+        return out
+
+    drafter._two_pass_step0 = counted
+    return True
+
+
+def _kv_only_recorded(worker) -> tuple[list, list]:
+    drafter = worker.model_runner.drafter
+    return drafter.two_pass_graphs, drafter.recorded_drafts
+
+
+def _kv_only_graphs(worker) -> int:
+    return _kv_only_cache_entries()
+
+
+def _kv_only_run_in_child(model_dir: str, switch: bool, async_scheduling: bool) -> dict:
+    """`_kv_only_run` in a spawned child process. A process that has touched
+    the TPU keeps its chips until it exits, so the child, not pytest, holds
+    them, and they are free again for the tests after this one."""
+    import multiprocessing
+
+    # The previous engine (another test's, or the switch-off child) may still
+    # hold the chips while it exits.
+    wait_for_tpu_release()
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_kv_only_run_case,
+        args=(model_dir, switch, async_scheduling, child),
+    )
+    process.start()
+    child.close()
+    try:
+        result = parent.recv() if parent.poll(KV_ONLY_CHILD_TIMEOUT_S) else "timed out"
+    except EOFError:
+        result = "exited without a result"
+    finally:
+        process.join(timeout=30)
+        if process.is_alive():
+            process.kill()
+            process.join()
+    try:
+        assert isinstance(result, dict), f"child exit code {process.exitcode}: {result}"
+    finally:
+        wait_for_tpu_release()
+    return result
+
+
+def _kv_only_run_case(model_dir: str, switch: bool, async_scheduling: bool, conn):
+    """Runs one engine in this (child) process and sends back its result or
+    a failure."""
+    import traceback
+
+    try:
+        conn.send(_kv_only_run(model_dir, switch, async_scheduling))
+    except BaseException:
+        conn.send(traceback.format_exc())
+
+
+def _kv_only_run(model_dir: str, switch: bool, async_scheduling: bool) -> dict:
+    """One engine, with the engine core in this process so `collective_rpc`
+    can instrument the drafter; call it through `_kv_only_run_in_child`."""
+    from vllm.inputs import TokensPrompt
+
+    for key in TPU_BOOTSTRAP_ENV:
+        os.environ.pop(key, None)
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    os.environ["VLLM_XLA_CHECK_RECOMPILATION"] = "1"
+    os.environ["TPU_MTP_KV_ONLY_STEP0"] = "1" if switch else "0"
+    llm = LLM(
+        model=model_dir,
+        skip_tokenizer_init=True,
+        load_format="dummy",
+        tensor_parallel_size=1,
+        max_model_len=KV_ONLY_MAX_MODEL_LEN,
+        max_num_seqs=KV_ONLY_MAX_NUM_SEQS,
+        max_num_batched_tokens=KV_ONLY_MAX_NUM_BATCHED_TOKENS,
+        kv_cache_memory_bytes=1 << 30,
+        # The sparse MLA kernels take an fp8 latent cache only.
+        kv_cache_dtype="fp8",
+        enable_prefix_caching=False,
+        async_scheduling=async_scheduling,
+        disable_log_stats=False,
+        speculative_config={
+            "method": "mtp",
+            "num_speculative_tokens": KV_ONLY_NUM_SPEC,
+        },
+        seed=0,
+    )
+    try:
+        (built,) = llm.collective_rpc(_kv_only_instrument)
+        (graphs_before,) = llm.collective_rpc(_kv_only_graphs)
+        params = SamplingParams(
+            temperature=0.0,
+            max_tokens=KV_ONLY_MAX_TOKENS,
+            ignore_eos=True,
+            detokenize=False,
+        )
+        outputs = llm.generate(
+            [TokensPrompt(prompt_token_ids=ids) for ids in _kv_only_prompts()], params
+        )
+        (graphs_after,) = llm.collective_rpc(_kv_only_graphs)
+        ((two_pass_graphs, proposals),) = llm.collective_rpc(_kv_only_recorded)
+        drafts = accepted = 0.0
+        for metric in llm.get_metrics():
+            if metric.name == SPEC_DRAFT_METRIC:
+                assert isinstance(metric, Counter)
+                drafts += metric.value
+            elif metric.name == SPEC_ACCEPTED_METRIC:
+                assert isinstance(metric, Counter)
+                accepted += metric.value
+    finally:
+        llm.llm_engine.engine_core.shutdown()
+        del llm
+        cleanup_dist_env_and_memory()
+    return {
+        "built": built,
+        "tokens": [list(out.outputs[0].token_ids) for out in outputs],
+        "drafts": drafts,
+        "accepted": accepted,
+        "two_pass_steps": len(two_pass_graphs),
+        "two_pass_new_graphs": sum(two_pass_graphs),
+        "proposals": proposals,
+        "new_graphs": graphs_after - graphs_before,
+    }
+
+
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "async_scheduling, index_share",
+    [
+        pytest.param(False, False, id="sync"),
+        pytest.param(True, True, id="async-indexshare"),
+    ],
+)
+def test_mtp_two_pass_step0_matches_the_single_pass(
+    tmp_path, async_scheduling: bool, index_share: bool
+):
+    """One chip, TP1: the two-pass step 0 leaves the outputs, the draft
+    counters and every proposal of the single pass, and warmup compiled every
+    program it runs. The async case also runs the mixed verify + prefill
+    steps with an on-device rejected count."""
+    model_dir = str(tmp_path / "glm-dsa-mtp-tiny")
+    _kv_only_write_config(model_dir, index_share)
+    off = _kv_only_run_in_child(model_dir, False, async_scheduling)
+    on = _kv_only_run_in_child(model_dir, True, async_scheduling)
+
+    def summary(result):
+        return {k: v for k, v in result.items() if k not in ("tokens", "proposals")}
+
+    # The raw totals include programs the runner compiles after warmup with
+    # the switch off too; the switch's own steps are counted separately.
+    print("switch off:", summary(off), "switch on:", summary(on))
+    differing = [
+        step
+        for step, (got, want) in enumerate(zip(on["proposals"], off["proposals"]))
+        if got != want
+    ]
+    print(f"proposals: {len(on['proposals'])}, differing steps: {differing}")
+    assert not off["built"] and off["two_pass_steps"] == 0
+    # The many-request prefill chunk and the verify + prefill steps are above
+    # the gate and carry a prefill span.
+    assert on["built"] and on["two_pass_steps"] > 0
+    assert on["tokens"] == off["tokens"]
+    assert off["drafts"] > 0
+    assert (on["drafts"], on["accepted"]) == (off["drafts"], off["accepted"])
+    # Every proposal, step 0's tokens and the loop steps' after them, is the
+    # same: acceptance alone says little with dummy weights.
+    assert len(on["proposals"]) == len(off["proposals"]) > 0
+    for step, (got, want) in enumerate(zip(on["proposals"], off["proposals"])):
+        assert got == want, f"proposal {step}: {got} != {want}"
+    # Warmup compiled every program the two passes run: pass 1, the pass-2
+    # gather and pass-2 step 0 add nothing while serving.
+    assert on["two_pass_new_graphs"] == 0, on["two_pass_new_graphs"]
+
+
+def _kv_only_logging_config(path: str) -> str:
+    """vLLM's logging at info, the proposer's at debug, so the server log
+    shows the padding-chunk replays."""
+    config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "plain": {
+                "format": "%(levelname)s %(asctime)s [%(filename)s:%(lineno)d] "
+                "%(message)s"
+            }
+        },
+        "handlers": {
+            "vllm": {
+                "class": "logging.StreamHandler",
+                "formatter": "plain",
+                "level": "DEBUG",
+                "stream": "ext://sys.stdout",
+            }
+        },
+        "loggers": {
+            "vllm": {"handlers": ["vllm"], "level": "INFO", "propagate": False},
+            KV_ONLY_PROPOSER_LOGGER: {"level": "DEBUG"},
+        },
+    }
+    with open(path, "w") as fh:
+        json.dump(config, fh)
+    return path
+
+
+def _kv_only_serve_and_generate(model_dir: str, switch: bool) -> dict:
+    """`vllm serve` with DP 2 + EP. A lone long prompt first, so one rank
+    prefills while the other is idle and replays its draft trace; then the
+    batch, sent concurrently, so the DP load balancer spreads it. Returns the
+    generated token ids, how many ranks logged that they built pass 1, and
+    how many padding-chunk replays of the two passes were logged."""
+    kwargs = {
+        "skip_tokenizer_init": True,
+        "load_format": "dummy",
+        "tensor_parallel_size": 1,
+        "data_parallel_size": KV_ONLY_DP_SIZE,
+        "enable_expert_parallel": True,
+        "kv_cache_dtype": "fp8",
+        "kv_cache_memory_bytes": 1 << 30,
+        "max_model_len": KV_ONLY_MAX_MODEL_LEN,
+        "max_num_seqs": KV_ONLY_MAX_NUM_SEQS,
+        "max_num_batched_tokens": KV_ONLY_MAX_NUM_BATCHED_TOKENS,
+        "enable_prefix_caching": False,
+        "seed": 0,
+    }
+    extra_env = {
+        "TPU_MTP_KV_ONLY_STEP0": "1" if switch else "0",
+        "VLLM_LOGGING_CONFIG_PATH": _kv_only_logging_config(
+            os.path.join(os.path.dirname(model_dir), "logging.json")
+        ),
+    }
+    speculative_config = {"method": "mtp", "num_speculative_tokens": KV_ONLY_NUM_SPEC}
+    with _serve(model_dir, speculative_config, kwargs, extra_env) as served:
+        (lone,) = served.complete_token_ids(
+            [_kv_only_lone_prompt()], KV_ONLY_MAX_TOKENS
+        )
+        tokens = served.complete_token_ids(_kv_only_prompts(), KV_ONLY_MAX_TOKENS)
+        text = served.log_text()
+    return {
+        "tokens": [lone, *tokens],
+        "built": text.count(KV_ONLY_BUILT_LOG),
+        "replays": text.count(KV_ONLY_REPLAY_LOG),
+    }
+
+
+@pytest.mark.multichip
+# Two servers one after the other, each allowed DP_SERVER_STARTUP_TIMEOUT_S
+# to come up.
+@pytest.mark.timeout(2 * DP_SERVER_STARTUP_TIMEOUT_S + 600)
+def test_mtp_two_pass_step0_matches_the_single_pass_under_ep_dp_lockstep(tmp_path):
+    """Served with data parallel 2 + expert parallel (vLLM runs data
+    parallelism out of process): idle ranks replay the two passes, nothing
+    hangs, and the outputs match the switch-off run. IndexShare on, as DSA
+    MTP checkpoints set it."""
+    _require_chips_for_dp(KV_ONLY_DP_SIZE, 1)
+    model_dir = str(tmp_path / "glm-dsa-mtp-tiny")
+    _kv_only_write_config(model_dir, index_share=True)
+    off = _kv_only_serve_and_generate(model_dir, switch=False)
+    on = _kv_only_serve_and_generate(model_dir, switch=True)
+    print("built: off", off["built"], "on", on["built"])
+    print("replays: off", off["replays"], "on", on["replays"])
+    assert off["built"] == off["replays"] == 0
+    # Every DP rank builds pass 1, and the idle rank replays it while its
+    # peer prefills the lone prompt.
+    assert on["built"] >= KV_ONLY_DP_SIZE
+    assert on["replays"] > 0
+    assert on["tokens"] == off["tokens"]

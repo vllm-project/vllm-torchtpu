@@ -248,6 +248,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         _dp_coordinated_step=lambda *_args, **_kwargs: (2, 3),
         _dp_local_prompt_logprob_rows=lambda _so: 0,
         _dp_step_prompt_logprob_rows=0,
+        _any_draft_prefill=lambda _so: False,
         _dp_num_tokens_across_dp=lambda _n: None,
         supports_mm_inputs=False,
         phase_based_profiler=None,

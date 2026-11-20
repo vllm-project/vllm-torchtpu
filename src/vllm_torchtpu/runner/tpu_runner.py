@@ -213,6 +213,7 @@ from vllm_torchtpu.spec_decode.adaptive_verification import (
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+from vllm_torchtpu.spec_decode.mtp_kv_only import mtp_kv_only_step0_config_reason
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     fit_rows,
@@ -972,6 +973,9 @@ class TPUModelRunner(GPUModelRunner):
         # Whether another DP rank ran a decode this step; SrptPrefillScheduler
         # applies VLLM_TPU_SRPT_ATTN_WORK_CAP only while some rank decodes.
         self._dp_step_other_decode = False
+        # Whether any DP rank's step carries a prefill span; the MTP draft's
+        # two-pass step 0 decides on it DP-wide (Eagle3Proposer).
+        self._dp_step_any_prefill = False
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -4138,6 +4142,7 @@ class TPUModelRunner(GPUModelRunner):
         has_encoder_inputs: bool = False,
         local_any_decode: bool = False,
         local_prompt_logprob_rows: int = 0,
+        local_any_prefill: bool = False,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         self._dp_step_other_decode = False
@@ -4163,6 +4168,7 @@ class TPUModelRunner(GPUModelRunner):
                 int(local_any_decode) * (dp_rank + 1),
                 int(local_any_decode) * (dp_size - dp_rank),
                 int(local_prompt_logprob_rows),
+                int(local_any_prefill),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -4182,6 +4188,7 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_other_decode = highest >= 0 and (
             highest != lowest or highest != dp_rank
         )
+        self._dp_step_any_prefill = bool(t[7].item())
         return bucket, int(t[1].item())
 
     def _any_decode(self, scheduler_output: "SchedulerOutput") -> bool:
@@ -4198,6 +4205,19 @@ class TPUModelRunner(GPUModelRunner):
                 batch.num_computed_tokens_cpu[indices]
                 >= batch.num_prompt_tokens[indices]
             ).any()
+        )
+
+    def _any_draft_prefill(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Whether this step schedules a prefill span; computed only for the
+        MTP draft's two-pass step 0, which reads it DP-wide under EP-DP
+        lockstep."""
+        if not self._dp_lockstep_enabled():
+            return False
+        drafter = self.drafter
+        return isinstance(drafter, Eagle3Proposer) and (
+            drafter.schedules_kv_only_prefill(
+                scheduler_output.num_scheduled_tokens.values()
+            )
         )
 
     def _execute_dp_mm_encoder(
@@ -4354,6 +4374,7 @@ class TPUModelRunner(GPUModelRunner):
             local_prompt_logprob_rows=self._dp_local_prompt_logprob_rows(
                 scheduler_output
             ),
+            local_any_prefill=self._any_draft_prefill(scheduler_output),
         )
         self._dp_step_num_chunks = target_num_chunks
         readmitted = self._readmit_trimmed_drafts(
@@ -6919,9 +6940,7 @@ class TPUModelRunner(GPUModelRunner):
             # hidden states it drafts from to these buckets, so the draft
             # needs a graph for every one of them.
             if isinstance(self.drafter, Eagle3Proposer):
-                self.drafter.draft_vllm_config.compilation_config.compile_sizes = list(
-                    self.num_tokens_paddings
-                )
+                self.drafter.set_draft_compile_sizes(self.num_tokens_paddings)
         logger.info(
             "Pipeline chunks: granularity %d tokens (KV block %d, block "
             "aligned %s), buckets added %s",
@@ -7684,6 +7703,14 @@ class TPUModelRunner(GPUModelRunner):
                 f"target buckets {self.num_tokens_paddings}, draft compile "
                 f"sizes {draft_sizes}"
             )
+        # The two-pass step 0's KV-only pass keeps its own copy of the sizes.
+        kv_only_missing = self.drafter.kv_only_missing_buckets(self.num_tokens_paddings)
+        if kv_only_missing:
+            raise RuntimeError(
+                "the MTP draft's KV-only pass (TPU_MTP_KV_ONLY_STEP0) has no "
+                f"compiled graph for token buckets {kv_only_missing}: target "
+                f"buckets {self.num_tokens_paddings}"
+            )
 
     def _warmup_mtp_prefill(self) -> None:
         """Warm the real prefill-only MTP K1 proposal and nothing else.
@@ -7719,28 +7746,48 @@ class TPUModelRunner(GPUModelRunner):
         )
         n0 = self.num_xla_graphs
         pipeline = self.parallel_config.pipeline_parallel_size > 1
+        # With the MTP draft's two-pass step 0 on, the sweep runs as the single
+        # pass, which warms the draft at p = P (pass 2's shape for P requests),
+        # and one more step at the longest prompt takes the two passes, which
+        # compiles pass 1. Every pipeline stage runs the same steps and only
+        # the last holds the drafter, so that step follows the config alone.
+        drafter = getattr(self, "drafter", None)
+        kv_only = (
+            drafter
+            if isinstance(drafter, Eagle3Proposer) and drafter.kv_only_step0_enabled
+            else None
+        )
+        steps = [(P, True) for P in prompt_lens]
+        if mtp_kv_only_step0_config_reason(self.vllm_config, self._pcp_enabled) is None:
+            steps.append((prompt_lens[-1], False))
         with (
             _suspend_kv_transfer_group(),
             self._precompile_timed("MTP real prefill warmup"),
         ):
-            for P in prompt_lens:
-                if pipeline:
-                    if not self._warmup_one_mtp_prefill(P):
-                        raise RuntimeError(
-                            f"MTP prefill warmup failed at P={P}; refusing to "
-                            "start a producer whose first live proposal would "
-                            "hit the same failure"
-                        )
-                elif not self._warmup_one_mtp_prefill(P, quiet=True):  # noqa: SIM102 (retry)
-                    if not self._warmup_one_mtp_prefill(P):
-                        raise RuntimeError(
-                            f"MTP prefill warmup failed at P={P} after retry; "
-                            "refusing to start a producer whose first live "
-                            "proposal would hit the same failure"
-                        )
+            for P, single in steps:
+                single_pass = (
+                    kv_only.single_pass_step0()
+                    if kv_only is not None and single
+                    else contextlib.nullcontext()
+                )
+                with single_pass:
+                    if pipeline:
+                        if not self._warmup_one_mtp_prefill(P):
+                            raise RuntimeError(
+                                f"MTP prefill warmup failed at P={P}; refusing "
+                                "to start a producer whose first live proposal "
+                                "would hit the same failure"
+                            )
+                    elif not self._warmup_one_mtp_prefill(P, quiet=True):  # noqa: SIM102 (retry)
+                        if not self._warmup_one_mtp_prefill(P):
+                            raise RuntimeError(
+                                f"MTP prefill warmup failed at P={P} after "
+                                "retry; refusing to start a producer whose "
+                                "first live proposal would hit the same failure"
+                            )
         logger.info(
             "MTP prefill warmup at P=%s compiled %d graphs",
-            prompt_lens,
+            [P for P, _ in steps],
             self.num_xla_graphs - n0,
         )
 
@@ -8084,6 +8131,12 @@ class TPUModelRunner(GPUModelRunner):
             # sweep one synthetic request per prompt-token bucket at nr=1. Each
             # runs the REAL two-phase propose+verify+sampling dispatch, so
             # torch-tpu emits the same fused programs serving will hit.
+            drafter = getattr(self, "drafter", None)
+            kv_only = (
+                drafter
+                if isinstance(drafter, Eagle3Proposer) and drafter.kv_only_step0_enabled
+                else None
+            )
             for i, P in enumerate(self.num_tokens_paddings):
                 # A single request's prompt can't exceed max_model_len; skip
                 # token buckets above it (they only arise as batched totals,
@@ -8093,19 +8146,37 @@ class TPUModelRunner(GPUModelRunner):
                 # max_model_len, e.g. small max_model_len configs.
                 if int(P) > self.max_model_len:
                     continue
-                # Greedy and non-greedy (do_sampling=True) verify+sample are
-                # DISTINCT fused programs, so sweep both at every prompt bucket.
-                for greedy in (True, False):
-                    if not self._warmup_one_spec_request(
-                        int(P), idx=i, quiet=True, greedy=greedy
-                    ):
-                        # First attempt cold-compiles the draft forward; a
-                        # SymInt from that cold compile can leak into the
-                        # dynamic=False gather wrapper on the first bucket. Retry
-                        # once now that the forward is compiled and returns
-                        # concrete-shaped tensors (this attempt logs loudly if it
-                        # also fails).
-                        self._warmup_one_spec_request(int(P), idx=i, greedy=greedy)
+                # With the MTP draft's two-pass step 0 on, a one-request step 0
+                # of P tokens may take the two passes: run it as the single
+                # pass first, which warms the draft at p = P (the shape loop
+                # steps of P requests reuse), then as the two passes where
+                # they are taken.
+                singles = [True]
+                if kv_only is not None and kv_only.takes_two_pass_prefill(int(P), 1):
+                    singles.append(False)
+                for single in singles:
+                    single_pass = (
+                        kv_only.single_pass_step0()
+                        if kv_only is not None and single
+                        else contextlib.nullcontext()
+                    )
+                    with single_pass:
+                        # Greedy and non-greedy (do_sampling=True) verify+sample
+                        # are DISTINCT fused programs, so sweep both at every
+                        # prompt bucket.
+                        for greedy in (True, False):
+                            if not self._warmup_one_spec_request(
+                                int(P), idx=i, quiet=True, greedy=greedy
+                            ):
+                                # First attempt cold-compiles the draft forward;
+                                # a SymInt from that cold compile can leak into
+                                # the dynamic=False gather wrapper on the first
+                                # bucket. Retry once now that the forward is
+                                # compiled and returns concrete-shaped tensors
+                                # (this attempt logs loudly if it also fails).
+                                self._warmup_one_spec_request(
+                                    int(P), idx=i, greedy=greedy
+                                )
             # (2) Batched spec steps. A bucketed-draft proposer depends on no
             # exact request count, so one count per program-bucket combination
             # (`_spec_warmup_bucket_grid`), each with a short decode run and a
@@ -8143,9 +8214,24 @@ class TPUModelRunner(GPUModelRunner):
                     if self.scheduler_config.async_scheduling
                     else paddings
                 )
+                # The MTP draft's two-pass step 0 runs on mixed verify +
+                # prefill steps, which under async scheduling carry an
+                # on-device rejected count into it: warm those steps too,
+                # from one verifying request up (the counts below start at
+                # two, and max_num_seqs 2 leaves them no room for a prefill).
+                if kv_only is not None:
+                    for greedy in (True, False):
+                        self._warmup_spec_batch(
+                            1, prompt_buckets[0], greedy=greedy, short=True, mixed=True
+                        )
                 for R in counts:
-                    self._warmup_spec_batch(R, prompt_buckets[0], greedy=True)
-                    self._warmup_spec_batch(R, prompt_buckets[0], greedy=False)
+                    for greedy in (True, False):
+                        self._warmup_spec_batch(
+                            R,
+                            prompt_buckets[0],
+                            greedy=greedy,
+                            mixed=kv_only is not None,
+                        )
                 if prompt_buckets[-1] != prompt_buckets[0]:
                     for R in paddings:
                         self._warmup_spec_batch(R, prompt_buckets[-1], greedy=True)
