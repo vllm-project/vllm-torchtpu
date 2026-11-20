@@ -254,8 +254,10 @@ steps:
       # InferenceX's synthetic MTP acceptance and GSM8K has to verify drafts for
       # real. agentx_sweep.sh boots the server on the Ray head and runs the
       # AgentX client there; its gates turn a bad result red, not just a crash:
-      #   perf   1 h replay at concurrency 16; red if the point has no
-      #          successful requests (the client alone exits 0 then)
+      #   perf   1 h replay at concurrency 16 with InferenceX's full warmup
+      #          (--fast 0: fast mode cuts the window to 20 min and the warmup
+      #          to one request per lane, whatever --duration says); red if the
+      #          point has no successful requests (the client alone exits 0 then)
       #   gsm8k  the full 1319-question split with InferenceX's 16384-token
       #          answer budget (GLM-5.2 reasons at length); red below 0.90 on
       #          strict-match or flexible-extract, InferenceX's floor for this
@@ -281,7 +283,7 @@ steps:
             .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 \
               bash scripts/vllm/benchmark/inferencex/agentx_sweep.sh \
                 --config glm-5.2-fp8-tp16-dcp8-mtp3-agentx --chips 8 \
-                --duration 3600 --gsm8k-limit 0 --min-requests-ok 1 \
+                --duration 3600 --fast 0 --gsm8k-limit 0 --min-requests-ok 1 \
                 --results-dir perf_eval_results/glm52-agentx-c16
 
       - label: "Eval: Nightly GLM-5.2 AgentX GSM8K (TPU v7x-16)"
