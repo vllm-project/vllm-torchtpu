@@ -62,7 +62,8 @@ tests cover the arithmetic but not every TPU lowering:
 - Conv checkpoint page: CPU zero-pads the staged taps to the full conv page
   (`PoolLayout.conv_page_rows`);
   TPU writes the live rows only and relies on the zero-initialized staging page.
-Only the TPU paths are exercised by the TPU benches (`test_tpu_v7x8_bench.py`).
+The TPU paths are exercised by `@pytest.mark.tpu_test` in
+`tests/megakernel/core/test_pool_f32_conv_step.py`.
 
 The fused GDN recurrence is always head-major (`GDNTunables.gdn_head_major=True`
 numerics); compare it against the split path with that flag enabled.
@@ -79,26 +80,17 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..errors import MegakernelConfigError
 from ..exec_spec import ExecSpec
 from ..fused_io_hook import FusedPoolIO, register_fused_io
 from ..modules.gdn.gate import gdn_gate_act
+from ..modules.gdn.states import gdn_pb_in, gdn_roff, is_seq_active
 from ..ops import BF16, F32, FP8, I32, U32, bswitch, round_bf16, round_up
+from ..pool.backend import kernel_debug_check
 from ..pool.checks import safe_kv_page, safe_page_base
 from ..pool.config import POOL_STATE_NAME, cache_exec
 from ..pool.layout import LANES
 from ..spec import StateDecl
-
-
-def _kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
-    """Emit `pl.debug_check` and enforce it in CPU `interpret` mode when enabled."""
-    pl.debug_check(cond, msg)
-    if interpret and pl.enable_debug_checks.value:
-
-        def _cb(ok: Any) -> None:
-            if not bool(ok):
-                raise RuntimeError(msg)
-
-        jax.debug.callback(_cb, cond)
 
 
 # ---------------------------------------------------------------------------
@@ -436,12 +428,8 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
                             )
                         else:
                             sh_t = lax.rem(
-                                ln_t
-                                + (
-                                    cache_exec(ex).page_size
-                                    - b_t % cache_exec(ex).page_size
-                                ),
-                                cache_exec(ex).page_size,
+                                ln_t + (page_size - b_t % page_size),
+                                page_size,
                             )
                             k_col = pltpu.roll(k_cols, sh_t, 1)
                             v_col = pltpu.roll(v_cols, sh_t, 1)
@@ -463,14 +451,10 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
                             ).swapaxes(1, 2)
                         else:
                             k_view = (
-                                kv_scat.at[s, 0]
-                                .bitcast(I32)
-                                .reshape(h4, cache_exec(ex).page_size)
+                                kv_scat.at[s, 0].bitcast(I32).reshape(h4, page_size)
                             )
                             v_view = (
-                                kv_scat.at[s, 1]
-                                .bitcast(I32)
-                                .reshape(h4, cache_exec(ex).page_size)
+                                kv_scat.at[s, 1].bitcast(I32).reshape(h4, page_size)
                             )
                             k_cur = jnp.where(mask_ln, k_col, k_view[...])
                             v_cur = jnp.where(mask_ln, v_col, v_view[...])
@@ -511,6 +495,11 @@ def gdn_fused_scratch(ex: ExecSpec, gp: Any, plan: Any) -> dict[str, Any]:
     module's slot geometry (`GDN_PAGES` / `REC_PAGES`).
     """
     del plan
+    if 2 * gp.kh > gp.vh:
+        raise MegakernelConfigError(
+            f"GDN fused_pool_io requires 2 * kh <= vh for per-rank sbuf staging, "
+            f"got kh={gp.kh}, vh={gp.vh} (R={ex.R})"
+        )
     page = gp.pool_layout.kv_page_shape
     return {
         "sbuf": pltpu.VMEM((gp.vh, gp.KD, gp.VD), F32),
@@ -594,45 +583,12 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
     out_mode = scr["gdn_out_mode"]
     sb = scr["sbuf"]
 
-    def _is_seq_active(s):
-        if cache_exec(ex).act_mode == "all":
-            return jnp.bool_(True)
-        if cache_exec(ex).act_mode == "ref":
-            return ST["active_seqs"][s] != 0
-        return (
-            (ST["ckpt_indices"][0, s, 0] > 0)
-            if gp.ckpt_is_3d
-            else (ST["ckpt_indices"][s, 0] > 0)
-        )
-
-    def _gdn_roff(sub, s):
-        return ST["read_offsets"][sub, s] if gp.roff_is_2d else ST["read_offsets"][s]
-
-    def _gdn_pb_in(sub, s):
-        raw_roff = _gdn_roff(sub, s)
-        _kernel_debug_check(
-            jnp.logical_and(raw_roff >= 0, raw_roff < gp.K_ckpt),
-            "GDN gather read_offsets outside [0, K)",
-            interpret=interpret,
-        )
-        roff = jnp.maximum(raw_roff, jnp.int32(0))
-        if gp.ckpt_is_3d:
-            pb = layout.page_base(ST["ckpt_indices"][sub, s, roff], sub, 3)
-        else:
-            pb = layout.page_base(ST["ckpt_indices"][s, roff], sub, 2)
-        _kernel_debug_check(
-            jnp.logical_and(pb >= 0, pb + GDN_PAGES <= cache_exec(ex).num_pages),
-            "GDN gather checkpoint slot maps outside [0, num_pages)",
-            interpret=interpret,
-        )
-        return safe_page_base(pb, GDN_PAGES, cache_exec(ex).num_pages)
-
     def _gdn_pb_out(sub, s, t, span: int = GDN_PAGES):
         if gp.ckpt_is_3d:
             pb = layout.page_base(ST["ckpt_indices"][sub, s, t + gp.ckpt_t_off], sub, 3)
         else:
             pb = layout.page_base(ST["ckpt_indices"][s, t + gp.ckpt_t_off], sub, 2)
-        _kernel_debug_check(
+        kernel_debug_check(
             jnp.logical_and(pb >= 0, pb + span <= cache_exec(ex).num_pages),
             "GDN scatter checkpoint slot maps outside [0, num_pages)",
             interpret=interpret,
@@ -662,14 +618,14 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
     def _start_gdn_in(o_, s):
         slot_i = s % NGI
         sub = lax.rem(o_, G_PER_ATT)
-        roff = _gdn_roff(sub, s)
-        act_in = jnp.logical_and(_is_seq_active(s), roff >= 0)
+        roff = gdn_roff(ctx, gp, sub, s)
+        act_in = jnp.logical_and(is_seq_active(ctx, gp, s), roff >= 0)
         in_pend[slot_i] = jnp.where(act_in, 1, 0).astype(I32)
 
         @pl.when(act_in)
         def _():
             g_pool = lax.div(o_, G_PER_ATT)
-            pb = _gdn_pb_in(sub, s)
+            pb = gdn_pb_in(ctx, gp, sub, s)
             bswitch(
                 g_pool,
                 [
@@ -698,7 +654,7 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
 
     def _start_gdn_out(o_, s):
         slot_o = s % NGO
-        act_out = _is_seq_active(s)
+        act_out = is_seq_active(ctx, gp, s)
         sub = lax.rem(o_, G_PER_ATT)
         g_pool = lax.div(o_, G_PER_ATT)
         if T == 1:
@@ -770,6 +726,7 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
         alog = ctx.sm(slot, "alog")[0, :vh]
         dtb = ctx.sm(slot, "dtb")[0, :vh]
         gnw = ctx.sm(slot, "gnorm")[0, :].astype(BF16)
+        g_act = gdn_gate_act(gp.gate)
         expand = vh // kh
         row_iota_conv = lax.broadcasted_iota(I32, (A_conv, QKV), 0)
         conv_live = (
@@ -786,7 +743,11 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
         def colsk(x):
             return jnp.swapaxes(jnp.broadcast_to(x[:, None, :], (kh, VD, KD)), 1, 2)
 
-        assert 2 * kh <= vh, (kh, vh)
+        if 2 * kh > vh:
+            raise MegakernelConfigError(
+                f"GDN fused_pool_io requires 2 * kh <= vh for per-rank sbuf staging, "
+                f"got kh={kh}, vh={vh} (R={ex.R})"
+            )
         NCB = 2 if 4 * kh <= vh else 1
         hrow = lax.broadcasted_iota(I32, (vh, VD), 0)
         HR2 = KD // 2
@@ -941,7 +902,6 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                         )
                         val = (gnw[None, :] * val.astype(BF16)).astype(F32)
                         zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-                        g_act = gdn_gate_act(gp.gate)
                         scr["mix"][b, :Z] = round_bf16(val * g_act(zz)).reshape(Z)
 
                         if interpret:
