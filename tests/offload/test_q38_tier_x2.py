@@ -17,7 +17,10 @@ the classes are cut into shards of equal per-worker region count.
   next to a local load; a key is held only if every shard holds it; a key the host pool
   holds costs no registry call; a registry miss is remembered for the TTL; a slice that
   went stale fails the load closed; a peer read takes and gives back no pin; exclusive
-  restore evicts only the local part.
+  restore evicts only the local part; a key a shard's node holds is never saved
+  again by that shard, from its own store probe or because a sibling shard needs it,
+  so a peer read lands the bytes last saved (smoke j-a44349b7 P1); the flag off keeps
+  the local-only probe and saves what it is handed.
 """
 
 import os
@@ -105,6 +108,8 @@ class ByteStore(FakeKVCacheStore):
         self.global_entries = registry
         self._remote_src: dict[bytes, object] = {}
         self.evicted: list[bytes] = []
+        # The bytes each sub-hash's last landed save copied to the host.
+        self.saved: dict[bytes, bytes] = {}
 
     def evict(self, block_hashes):
         n = 0
@@ -136,6 +141,7 @@ class ByteStore(FakeKVCacheStore):
         fail when the node no longer holds the block)."""
         for h in list(self._saving):
             self.host[h] = self.hbm[self.entries[h].device_block_id]
+            self.saved[h] = self.host[h]
             self.complete_save([h])
         for h in list(self._loading):
             dst = self._load_dst[h]
@@ -160,7 +166,11 @@ class ByteStore(FakeKVCacheStore):
 
     def demote(self, block_hashes):
         """Raiden's evict sweep: an unpinned host entry is copied to this store's node,
-        published there, then evicted here (the eviction callback fires)."""
+        published there, then evicted here (the eviction callback fires). A node that
+        already holds the hash keeps its own copy and the local one is freed all the
+        same: WriteRemote answers WRITE_ALL_EXIST without pulling a byte
+        (kv_cache_store_service.cc) and SweepOnce evicts the `existing` hashes
+        (kv_cache_store.cc WaitForBatchWriteResult)."""
         moved = []
         for h in block_hashes:
             entry = self.entries.get(h)
@@ -169,7 +179,8 @@ class ByteStore(FakeKVCacheStore):
                 FakeBlockStatus.HOST_AND_HBM,
             ):
                 continue
-            self.node.host[h] = self.host.pop(h)
+            mine = self.host.pop(h)
+            self.node.host.setdefault(h, mine)
             self.global_entries[h] = FakeRaidenBlockId(
                 raiden_id=self.node, status=FakeBlockStatus.REMOTE
             )
@@ -248,10 +259,14 @@ def _finish(tier, stores):
 
 
 def _save(tier, stores, keys, blocks, job_id=1):
-    """Write each store's own rows of each key into its device blocks, then store."""
+    """Write each store's own rows of each key into its device blocks, then store
+    (prepare first, as the connector does: a store job follows prepare_store or
+    prepare_victim_store)."""
     for name, store in stores.items():
         for key, b in zip(keys, blocks):
             store.hbm[b] = _payload(name, key)
+    out = tier.prepare_store(list(keys), _ctx())
+    assert list(out.keys_to_store) == list(keys)
     tier.submit_store_job(job_id, list(keys), list(blocks))
     (done,) = _finish(tier, stores)
     assert done.job_id == job_id and done.success
@@ -695,6 +710,123 @@ def test_exclusive_restore_evicts_only_the_local_part():
     assert {_sub_of(tier, "main.r2", k) for k in keys} <= set(
         stores["main.r2"].node.host
     )
+
+
+def test_the_sweep_keeps_a_nodes_copy_of_a_hash_it_already_holds():
+    """The fake's demotion follows Raiden: a node that holds the hash keeps its bytes,
+    and the host copy is freed all the same."""
+    tier, stores, registry = _shard_tier()
+    key = _key(6)
+    _save(tier, stores, [key], [10])
+    store = stores["main.r1"]
+    h = _sub_of(tier, "main.r1", key)
+    store.node.host[h] = b"older copy"
+    assert store.demote([h]) == [h]
+    assert store.node.host[h] == b"older copy"
+    assert h not in store.entries and h not in store.host
+    assert registry[h].raiden_id is store.node
+
+
+def _recompute(stores, names, key, block):
+    """The key's blocks recomputed in HBM: same key, other bytes (another chunking)."""
+    for name in names:
+        stores[name].hbm[block] = _payload(name, key) + b"|recomputed"
+
+
+def _landed_is_last_saved(tier, stores, names, key, block):
+    for name in names:
+        store = stores[name]
+        assert store.hbm[block] == store.saved[_sub_of(tier, name, key)], name
+
+
+@pytest.mark.parametrize("victim", [False, True], ids=["store", "victim"])
+def test_a_key_its_node_holds_is_not_saved_again(victim):
+    """Smoke j-a44349b7 failed P1: 29 keys restored on main.r1, keys.r1 and keys.r2
+    differed from what was saved. A key demoted to the node and later recomputed was
+    saved again from HBM (a local-only probe never sees the node's block); the sweep
+    then freed the new host copy because the node already held the hash, and the peer
+    read landed the node's older bytes, not the bytes last saved."""
+    tier, stores, _ = _shard_tier()
+    key = _key(1)
+    names = ("main.r1", "main.r2")
+    _save(tier, stores, [key], [5])
+    _demote(tier, stores, [key])
+    _recompute(stores, names, key, 7)
+    before = tier.x2_stats()
+    if victim:
+        tier.set_victim_mode(True)
+        chosen = tier.prepare_victim_store([key])
+    else:
+        chosen = list(tier.prepare_store([key], _ctx()).keys_to_store)
+    after = tier.x2_stats()
+    if chosen:
+        tier.submit_store_job(3, chosen, [7] * len(chosen))
+        _finish(tier, stores)
+        # The sweep demotes the new host copies; each node already holds the hash.
+        _demote(tier, stores, [key])
+    (done,) = _load(tier, stores, [key], [9], job_id=4)
+    assert done.success
+    # P1: the bytes a load lands are the bytes last saved.
+    _landed_is_last_saved(tier, stores, names, key, 9)
+    # Every shard's node holds the key, so no shard saves it; one registry probe each.
+    assert chosen == []
+    assert after["store_probe_lookups"] - before["store_probe_lookups"] == 2
+    assert after["store_remote_skips"] - before["store_remote_skips"] == 2
+
+
+def test_a_shard_whose_node_holds_a_key_skips_it_when_a_sibling_saves_it():
+    """A sharded class sends a key to every shard once any shard needs it. Here
+    main.r2's node lost the key and main.r1's still holds it: main.r2 saves the
+    recomputed bytes, main.r1 must not (its node would keep the older copy)."""
+    tier, stores, _ = _shard_tier()
+    key = _key(2)
+    names = ("main.r1", "main.r2")
+    _save(tier, stores, [key], [5])
+    _demote(tier, stores, [key])
+    stores["main.r2"].node_evicts([_sub_of(tier, "main.r2", key)])
+    _recompute(stores, names, key, 7)
+    out = tier.prepare_store([key], _ctx())
+    assert list(out.keys_to_store) == [key]
+    tier.submit_store_job(3, [key], [7])
+    (done,) = _finish(tier, stores)
+    assert done.success
+    held_skips = tier.x2_stats().get("store_held_skips")
+    _demote(tier, stores, [key])
+    (done,) = _load(tier, stores, [key], [9], job_id=4)
+    assert done.success
+    # P1: the bytes a load lands are the bytes last saved, in both shards.
+    _landed_is_last_saved(tier, stores, names, key, 9)
+    assert stores["main.r2"].hbm[9] == _payload("main.r2", key) + b"|recomputed"
+    r1 = _sub_of(tier, "main.r1", key)
+    assert stores["main.r1"].saved[r1] == _payload("main.r1", key)
+    assert held_skips == 1
+
+
+def test_flag_off_keeps_the_local_probe_and_saves_what_it_is_handed():
+    """Without TIER-X2 a store asks no registry and saves every key it is handed."""
+    from vllm_torchtpu.offload.raiden_store import RaidenOffloadingManager
+
+    store = ByteStore("main", {}, FakeNode("node-main"))
+    manager = RaidenOffloadingManager(
+        kernel_physical_blocks_capacity=8,
+        offload_logical_blocks_capacity=8,
+        device_block_size_factor=1,
+        world_size=1,
+        raiden_controller_port=0,
+        raiden_job_name="t-off",
+        store=store,
+        store_types=FAKE_STORE_TYPES,
+    )
+    keys = [_key(1), _key(2)]
+    out = manager.prepare_store(keys[:1], _ctx())
+    assert list(out.keys_to_store) == keys[:1]
+    assert all(not call.args[1] for call in store.calls_named("lookup"))
+    for key, b in zip(keys, [3, 4]):
+        store.hbm[b] = b"row%d" % b
+    # The second key was never prepared: the flag off still saves it.
+    manager.submit_store_job(1, keys, [3, 4])
+    saved = {h for call in store.calls_named("save") for h in call.args[0]}
+    assert saved == {manager._sub_hashes(k)[0] for k in keys}
 
 
 def test_the_shards_never_read_each_others_blocks():
