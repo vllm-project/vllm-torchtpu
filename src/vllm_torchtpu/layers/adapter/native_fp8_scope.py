@@ -24,11 +24,12 @@ the base-2 softmax, a folded scale rounded to bf16, 0.18% larger at head_dim
 A draft model must run at the precision it ships with, so its attention keeps
 the full-precision path whatever the target uses.
 
-The runner marks each draft attention layer's impl
-(``PallasAttentionBackendImpl.is_attention_draft = True``) before it builds that
-layer's kernels. The kernel builders pass a layer's modes to the batched and
-DCP kernel entries only when the layer is not a draft. The modes are part of
-every kernel registry key, so a draft layer never shares a target layer's op.
+The TPU runner, the DFlash proposer and the export path mark each draft
+attention layer's impl (``PallasAttentionBackendImpl.is_attention_draft =
+True``) before they build that layer's kernels. The kernel builders pass a
+layer's modes to the batched and DCP kernel entries only when the layer is not
+a draft. The modes are part of every kernel registry key, so a draft layer
+never shares a target layer's op.
 With every mode off the kernels are built with the wrapper's defaults: the
 entries that take ``attention_modes`` receive ``OFF`` and pass no mode to the
 wrapper.

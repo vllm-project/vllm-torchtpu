@@ -213,7 +213,8 @@ def test_builder_unchanged_with_the_modes_off(
     with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
         t_op = target._build_rpa_kernel(None, None, None)
         d_op = draft._build_rpa_kernel(None, None, None)
-    # As before the scoping: one shared op, nothing new bound.
+    # As before the scoping: one shared op, with attention_modes bound to OFF
+    # (the entry's default).
     assert t_op is d_op
     rpa = [(n, fn) for n, fn in registered if n.startswith("pallas::rpa_kernel")]
     assert len(rpa) == 1

@@ -196,14 +196,19 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
     assert all(type(fn.keywords["kv_layout"]) is KVLayout for fn in built)
 
 
+@pytest.mark.parametrize("draft", [False, True], ids=["target", "draft"])
 @pytest.mark.parametrize("compiled", [False, True])
 def test_dcp_forward_reuses_the_ops_built_with_the_layer_modes_and_tiles(
-    monkeypatch, compiled, cpu_vllm_config_context
+    monkeypatch, compiled, draft, cpu_vllm_config_context
 ):
     """The forward pass must look up the DCP ops initialize_kernel built for the
-    layer, with the same reduced-precision modes and tuned tiles. On a registry
-    miss it would build an op while torch.compile traces the forward, which
-    torch_tpu's jax_op cannot do under dynamo."""
+    layer, with the same reduced-precision modes (every mode off for a draft)
+    and tuned tiles. On a registry miss it would build an op while
+    torch.compile traces the forward, which torch_tpu's jax_op cannot do under
+    dynamo."""
+    # As in the layout test: the cases must not add up to dynamo's recompile
+    # limit.
+    torch._dynamo.reset()
     built = []
 
     def build_op(_name, fn):
@@ -235,10 +240,12 @@ def test_dcp_forward_reuses_the_ops_built_with_the_layer_modes_and_tiles(
     impl.attention_modes = modes
     impl.tuned_tiles = True
     impl.skip_empty_mixed = True
+    impl.is_attention_draft = draft
     with set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()):
         impl.initialize_kernel(layer)
     assert len(built) == 2
-    assert all(fn.keywords["attention_modes"] == modes for fn in built)
+    expected_modes = native_fp8_scope.OFF if draft else modes
+    assert all(fn.keywords["attention_modes"] == expected_modes for fn in built)
     assert all(fn.keywords["tuned_tiles"] is True for fn in built)
     assert all(fn.keywords["skip_empty_mixed"] is True for fn in built)
 
