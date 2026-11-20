@@ -108,3 +108,17 @@ def pallas_select(scores, topk=10, block_rows=256, weight_scores=None, interpret
         out_shape=list(out_shapes),
         interpret=interpret,
     )(*operands)
+
+
+def expert_load_counts(counts, logits, bias, valid, *, topk):
+    """counts [E] int32 plus the routed rows per expert of `logits` [T, E]:
+    each valid row's top `topk` experts by biased sigmoid score (the noaux
+    selection; an exact tie may resolve to another expert than the kernel's).
+    Rows with valid False (padding) add nothing. A compare-and-sum over the
+    picks rather than a scatter-add: a reduction stays on the TensorCore,
+    where the scatter is offloaded to the SparseCore."""
+    scores = jax.nn.sigmoid(logits.astype(jnp.float32)) + bias.astype(jnp.float32)
+    _, ids = jax.lax.top_k(scores, topk)
+    experts = jnp.arange(counts.shape[0], dtype=ids.dtype)
+    hits = jnp.logical_and(ids[:, :, None] == experts, valid[:, None, None])
+    return counts + jnp.sum(hits, axis=(0, 1), dtype=counts.dtype)

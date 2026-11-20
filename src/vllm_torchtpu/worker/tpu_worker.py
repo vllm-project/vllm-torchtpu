@@ -785,6 +785,13 @@ class TPUWorker(WorkerBase):
         logger.info("Kernel hot-reload done: %s", stats)
         return stats
 
+    def dump_moe_expert_load(self, stats_path: str, table_path: str) -> dict:
+        """Collective RPC: the served routing's expert-load counts and their
+        placement table, written on every host (moe_prefill_sp)."""
+        from vllm_torchtpu.layers.adapter import moe_prefill_sp
+
+        return moe_prefill_sp.dump_expert_load(self.get_model(), stats_path, table_path)
+
     def get_model(self):
         return self.model_runner.get_model()
 

@@ -59,26 +59,29 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.models import deepseek_v2
+
+from vllm_torchtpu import envs
+from vllm_torchtpu.distributed import expert_placement
 from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_mesh_index
+from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import (
+    grouped_shared_expert_sharded,
+)
+from vllm_torchtpu.kernels.fused_moe.v2 import router_ops
+from vllm_torchtpu.layers.adapter import (
+    dcp_token_parallel_op,
+    fused_moe_decode,
+    fused_moe_ep,
+    mla_prefill_rows,
+    moe_hierarchical,
+    token_padding,
+)
+from vllm_torchtpu.layers.adapter.attention import _retain_buffers
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer
-
-from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import (
-    grouped_shared_expert_sharded,
-)
-from vllm_torchtpu.layers.adapter import (
-    dcp_token_parallel_op,
-    fused_moe_decode,
-    fused_moe_ep,
-    mla_prefill_rows,
-    token_padding,
-)
-from vllm_torchtpu.layers.adapter.attention import _retain_buffers
 
 logger = init_logger(__name__)
 
@@ -106,6 +109,14 @@ SHARED_INDEX = "_tpu_sp_shared_index"
 SHARED_OP = "_tpu_sp_shared_op"
 OP_ATTR = "_tpu_sp_moe_op"
 SCALE_ATTR = "_tpu_sp_routed_scale"
+# With --additional-config '{"moe_expert_load_stats": true}', on an armed
+# decoder layer's mlp: int32 [E] routed rows per expert over this rank's own
+# rows of every step the split served (padding excluded), and its op. A
+# buffer updated with copy_: a functionalized input mutation travels with
+# each bucket's executable, which a rebound attribute would not.
+LOAD_STATS_KEY = "moe_expert_load_stats"
+LOAD_ATTR = "_tpu_sp_expert_load"
+LOAD_OP = "_tpu_sp_expert_load_op"
 
 UPSTREAM_DECODER_LAYER_FORWARD = deepseek_v2.DeepseekV2DecoderLayer.forward
 UPSTREAM_MODEL_FORWARD = deepseek_v2.DeepseekV2Model.forward
@@ -386,6 +397,13 @@ def _moe(mlp: Any, x: torch.Tensor, num_tokens: int, tp: int) -> torch.Tensor:
     experts = mlp.experts.routed_experts
     router_logits, _ = mlp.gate(x)
     rank = fused_moe_ep.rank_operand()
+    if hasattr(mlp, LOAD_ATTR):
+        valid = ~own_rows(
+            token_padding._padding_state.local_padding_mask.narrow(0, 0, num_tokens),
+            rank,
+            tp,
+        )
+        accumulate_load(mlp, router_logits, experts.e_score_correction_bias, valid)
     if envs.TPU_MOE_SKIP_PADDED_TOKENS and token_padding._padding_state is not None:
         pad_mask = own_rows(
             token_padding._padding_state.local_padding_mask.narrow(0, 0, num_tokens),
@@ -551,6 +569,89 @@ def install_forwards() -> None:
 # ---------------------------------------------------------------------------
 
 
+_LOAD_OPS: dict[int, Any] = {}
+
+
+def _build_load_op(topk: int) -> Any:
+    """The expert-load counter (built at load, outside Dynamo): a functional
+    op, counts in and new counts out, with no donation or aliasing."""
+    if topk not in _LOAD_OPS:
+        # jax_op reads the operand types from these annotations.
+        def count(
+            counts: jax.Array, logits: jax.Array, bias: jax.Array, valid: jax.Array
+        ) -> jax.Array:
+            return router_ops.expert_load_counts(counts, logits, bias, valid, topk=topk)
+
+        op = jax_op(f"pallas::moe_expert_load_counts_k{topk}", count)
+        op.register_fake(lambda counts, *_args, **_kw: torch.empty_like(counts))
+        _LOAD_OPS[topk] = op
+    return _LOAD_OPS[topk]
+
+
+def _arm_load_stats(mlp: Any, experts: Any, topk: int) -> None:
+    if token_padding._padding_state is None:
+        raise NotImplementedError(f"{LOAD_STATS_KEY} needs the token padding mask")
+    if experts.use_grouped_topk and experts.num_expert_group > 1:
+        raise NotImplementedError(f"{LOAD_STATS_KEY} does not count grouped top-k")
+    if experts.scoring_func != "sigmoid" or experts.e_score_correction_bias is None:
+        raise NotImplementedError(
+            f"{LOAD_STATS_KEY} counts sigmoid routing with a score bias; got "
+            f"{experts.scoring_func}"
+        )
+    counts = torch.zeros(
+        experts.global_num_experts, dtype=torch.int32, device=experts.w13_weight.device
+    )
+    mlp.register_buffer(LOAD_ATTR, counts, persistent=False)
+    setattr(mlp, LOAD_OP, _build_load_op(topk))
+
+
+def accumulate_load(
+    mlp: Any, router_logits: torch.Tensor, bias: torch.Tensor, valid: torch.Tensor
+) -> None:
+    """One step's routed rows added to the layer's counts: the op returns a new
+    tensor (nothing donated) and the buffer takes it with copy_."""
+    counts = getattr(mlp, LOAD_ATTR)
+    counts.copy_(getattr(mlp, LOAD_OP)(counts, router_logits, bias, valid))
+
+
+def dump_expert_load(model: torch.nn.Module, stats_path: str, table_path: str) -> dict:
+    """Write the counts summed over the TP group (every rank's own rows) as an
+    `expert_placement.STATS_FORMAT` file and their LPT placement table as a
+    TABLE_FORMAT file, then zero the counts (so a first call after warmup
+    drops the precompile runs). Collective over the TP group (call on every
+    rank, e.g. as a collective RPC); every rank writes the same two files, so
+    each host gets its own copy. int32 counts: topk per own row per step."""
+    backbone = _backbone(model)
+    first = backbone.start_layer
+    layers = [
+        (first + i, layer.mlp)
+        for i, layer in enumerate(
+            islice(backbone.layers, backbone.start_layer, backbone.end_layer)
+        )
+        if hasattr(layer.mlp, LOAD_ATTR)
+    ]
+    if not layers:
+        raise RuntimeError(
+            f"no expert-load counts: serve with --additional-config "
+            f"'{{\"{LOAD_STATS_KEY}\": true}}'"
+        )
+    counts = torch.stack([getattr(mlp, LOAD_ATTR) for _, mlp in layers]).cpu()
+    counts = counts.to(torch.int64)
+    for _, mlp in layers:
+        getattr(mlp, LOAD_ATTR).zero_()
+    torch.distributed.all_reduce(counts, group=get_tp_group().cpu_group)
+    stats = dict(
+        format=expert_placement.STATS_FORMAT,
+        num_experts=int(counts.shape[1]),
+        ep_size=get_tensor_model_parallel_world_size(),
+        ep_tp_size=moe_hierarchical.ep_tp_size(),
+        layers={str(i): row.tolist() for (i, _), row in zip(layers, counts)},
+    )
+    expert_placement.write_json(stats_path, stats)
+    expert_placement.write_json(table_path, expert_placement.table_from_stats(stats))
+    return dict(layers=len(layers), routed_rows=int(counts.sum()))
+
+
 def check_config(vllm_config: Any) -> None:
     """Raise for a server config the split does not serve."""
     parallel = vllm_config.parallel_config
@@ -629,6 +730,10 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
     check_config(vllm_config)
     backbone = _backbone(model)
     tp = get_tensor_model_parallel_world_size()
+    extra = vllm_config.additional_config
+    load_stats = extra.get(LOAD_STATS_KEY, False) if isinstance(extra, dict) else False
+    if not isinstance(load_stats, bool):
+        raise ValueError(f"{LOAD_STATS_KEY} takes true or false; got {load_stats!r}")
     if torch.distributed.get_world_size() != tp:
         raise NotImplementedError("the TP group must be the whole world")
     layers = list(islice(backbone.layers, backbone.start_layer, backbone.end_layer))
@@ -681,6 +786,8 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             )
         setattr(mlp, OP_ATTR, op)
         setattr(mlp, SCALE_ATTR, float(mlp.routed_scaling_factor))
+        if load_stats:
+            _arm_load_stats(mlp, experts, experts.moe_config.experts_per_token)
         shared_parts.append(
             _group_shared_expert(mlp, tp, get_tp_group().rank_in_group, group)
         )
