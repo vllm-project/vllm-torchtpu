@@ -513,6 +513,7 @@ class TestTpuPlatform:
         ):
             monkeypatch.setenv(key, os.environ.get(key, ""))
             monkeypatch.delenv(key)
+        monkeypatch.delenv("TPU_MULTIHOST_BACKEND", raising=False)
         vllm_config.additional_config = (
             {"tpu_multiport_dp": {"enabled": True}} if multiport else {}
         )
