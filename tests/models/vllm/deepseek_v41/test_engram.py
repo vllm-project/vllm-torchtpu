@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -111,6 +112,67 @@ def test_tpu_dp_shared_engram_storage_allocation_and_views(
     )
     st1 = TpuDPSharedEngramStorage(num_rows=4, dim=32, block_size=32, group=grp1)
     assert st1.weight.shape == (4, 32)
+
+
+def test_tpu_dp_shared_engram_storage_shared_across_ranks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Writes through EDP rank 0's /dev/shm mapping are visible on rank 1."""
+    monkeypatch.setattr(engram_mod.upstream, "SHM_PATH", str(tmp_path))
+    monkeypatch.setattr(engram_mod.upstream, "check_shm_free_space", lambda n: None)
+    world_size = 2
+    barrier = threading.Barrier(world_size, timeout=30)
+    board: dict[Any, Any] = {}
+
+    def _all_gather_object(out: list[Any], val: Any, group: Any = None) -> None:
+        board[("gather", group.rank)] = val
+        barrier.wait()
+        out[:] = [board[("gather", rank)] for rank in range(world_size)]
+        barrier.wait()
+
+    monkeypatch.setattr(engram_mod.dist, "all_gather_object", _all_gather_object)
+
+    def _make_group(rank: int) -> SimpleNamespace:
+        def _broadcast_object(obj: Any) -> Any:
+            if rank == 0:
+                board["broadcast"] = obj
+            barrier.wait()
+            return board["broadcast"]
+
+        return SimpleNamespace(
+            rank_in_group=rank,
+            world_size=world_size,
+            cpu_group=SimpleNamespace(rank=rank),
+            broadcast_object=_broadcast_object,
+        )
+
+    storages: list[Any] = [None] * world_size
+    errors: list[BaseException] = []
+
+    def _run(rank: int) -> None:
+        try:
+            storages[rank] = TpuDPSharedEngramStorage(
+                num_rows=4, dim=32, block_size=32, group=_make_group(rank)
+            )
+        except BaseException as exc:
+            errors.append(exc)
+            barrier.abort()
+
+    threads = [threading.Thread(target=_run, args=(r,)) for r in range(world_size)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert not errors and all(storage is not None for storage in storages)
+    st0, st1 = storages
+    # Two separate mappings of one backing file, not aliased tensors.
+    assert st0.weight.data_ptr() != st1.weight.data_ptr()
+    st0.weight.view(torch.uint8)[1].fill_(0x38)
+    st0.weight_scale_inv[1] = 127
+    assert torch.all(st1.weight.view(torch.uint8)[1] == 0x38)
+    assert int(st1.weight_scale_inv[1]) == 127
+    # Rank 0 unlinks the backing file once every rank has mapped it.
+    assert not list(tmp_path.iterdir())
 
 
 def test_tpu_dp_shared_engram_storage_error_propagation(
@@ -652,20 +714,16 @@ def test_engram_module_staging_and_forward(monkeypatch: pytest.MonkeyPatch) -> N
         eng_off._staged_by_tokens[8][0].data_ptr()
         != eng_off._staged_by_tokens[2][0].data_ptr()
     )
-    # Per-bucket 2-slot host ring isolates consecutive steps and distinct buckets
-    # even when raw FP8 tables contain 0x7F/0xFF patterns on adjacent steps.
-    r2_a, r2_b = eng_off._host_ring_by_tokens[2]
-    r8_a, _ = eng_off._host_ring_by_tokens[8]
-    assert r2_a.data_ptr() != r2_b.data_ptr() and r2_a.data_ptr() != r8_a.data_ptr()
-    eng_off._host_ring_idx.clear()
+    # One host buffer per bucket, reused across steps (the H2D copy is sync).
+    buf2 = eng_off._host_buf_by_tokens[2]
+    assert buf2.data_ptr() != eng_off._host_buf_by_tokens[8].data_ptr()
     h_step0 = torch.zeros((2, 4), dtype=torch.int32)
     eng_off.prepare_embeddings(h_step0)
-    snap_step0 = r2_a.clone()
+    assert eng_off._host_buf_by_tokens[2] is buf2
+    # Invalid scales (255) over 0x7F (NaN in E4M3FN) raw bytes dequantize to 0.
     eng_off.embed_tokens.weight.data.view(torch.uint8).fill_(0x7F)
     eng_off.embed_tokens.weight_scale_inv.data.fill_(255)
-    eng_off.prepare_embeddings(torch.zeros((8, 4), dtype=torch.int32))
     eng_off.prepare_embeddings(h_step0)
-    assert torch.equal(r2_a, snap_step0)
     nan_masked = eng_off._ready_rows(2)
     assert not torch.isnan(nan_masked).any() and torch.all(nan_masked == 0.0)
 
@@ -927,7 +985,7 @@ def test_tpu_engram_dequant_and_forward(
     assert torch.equal(out_tpu[~mask], h_in[~mask])
     assert not torch.allclose(out_tpu[mask], h_in[mask], rtol=1e-3, atol=1e-3)
 
-    # Multi-bucket (8 -> 2 -> 4 -> 2) whole-tensor H2D staging and 2-slot host ring.
+    # Multi-bucket (8 -> 2 -> 4 -> 2) whole-tensor H2D staging, one host buffer each.
     for b_sz in (8, 2, 4, 2):
         h_b = torch.randint(
             0, n_rows, (b_sz, layer_hashes.shape[1]), generator=gen, dtype=torch.int32
@@ -936,9 +994,7 @@ def test_tpu_engram_dequant_and_forward(
         eng_cpu.prepare_embeddings(h_b)
         ref_b = eng_cpu(x_b, h_b)
         eng_tpu.prepare_embeddings(h_b)
-        assert (
-            b_sz in eng_tpu._staged_by_tokens and b_sz in eng_tpu._host_ring_by_tokens
-        )
+        assert b_sz in eng_tpu._staged_by_tokens and b_sz in eng_tpu._host_buf_by_tokens
         assert eng_tpu._active_staged is not None
         got_b = eng_tpu(x_b.to(dev), h_b.to(dev)).cpu()
         torch.testing.assert_close(got_b, ref_b, rtol=1.6e-2, atol=1.6e-2)
