@@ -757,7 +757,8 @@ def moe_gmm(
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
-# MiniMaxM3Mxfp8LinearMethod materializes the bf16 weight from this many rows.
+# MiniMaxM3Mxfp8LinearMethod materializes the bf16 weight from this many rows
+# (models/minimax_m3/quant.py _UPCAST_MIN_ROWS; keep the two equal).
 _SHARED_UPCAST_MIN_ROWS = 4096
 
 

@@ -106,6 +106,10 @@ def _admit(runner) -> tuple[torch.Tensor, ...] | None:
         or enable_pipelined_collective_and_compute()
         or getattr(runner.routed_experts, "_experts_start", None) is None
         or getattr(cfg, "is_sequence_parallel", False)
+        # DP / PCP wrap the routed op in an all-gather and a reduce-scatter:
+        # a shared expert folded into it would be summed over those ranks.
+        or cfg.moe_parallel_config.dp_size != 1
+        or cfg.moe_parallel_config.pcp_size != 1
         or runner.routed_scaling_factor != 1.0
         or runner.routed_input_transform is not None
         or runner.routed_output_transform is not None
