@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES: bool = True
     TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES: bool = True
     TPU_DCP_TP_SHARDED_KV_WRITE: bool = True
+    TPU_DCP_TP_UNIFIED_INDEXER_MLA: bool = True
+    TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP: int = 12
     TPU_MLA_DECODE_LOCAL_Q_AG: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = True
@@ -876,6 +878,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all_to_all instead of all-gathering bf16 kv_lora to every rank.
     "TPU_DCP_TP_SHARDED_KV_WRITE": env_bool(
         "TPU_DCP_TP_SHARDED_KV_WRITE", default=True
+    ),
+    # With TPU_DCP_TP_PREFILL_LOCAL_OPROJ and query replication on indexer
+    # layers: run token-parallel indexer top-k and sparse MLA inside one shared
+    # cap-switch branch so context KV page gathers overlap StreamIdxTC.
+    "TPU_DCP_TP_UNIFIED_INDEXER_MLA": env_bool(
+        "TPU_DCP_TP_UNIFIED_INDEXER_MLA", default=True
+    ),
+    # Maximum gather cap inside the unified indexer+MLA branch at which
+    # gather_latent is ordered after StreamIdxTC to avoid small-cap SC/TC
+    # contention; 0 keeps gather_latent free on all caps.
+    "TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP": env_int(
+        "TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP", 12
     ),
     # Decode local-Q projection under query-replicated DCP: compute each rank's
     # local head-slice columns via the fused FP8 column-window matmul + 1-round

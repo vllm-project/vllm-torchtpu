@@ -1212,3 +1212,171 @@ def indexer_topk(
         request_distribution,
         *extra,
     )
+
+
+def unified_indexer_mla_with_lead(
+    layout: TokenParallelLayout,
+    mesh: Mesh,
+    axis_name: str,
+    index_cache: jax.Array,
+    q_idx: jax.Array,
+    w_idx: jax.Array,
+    idx_block_tables: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    q: jax.Array,
+    q_pe: jax.Array,
+    mla_block_tables: jax.Array,
+    seq_lens: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    *,
+    select_topk: SelectTopkFn,
+    attend: Callable[..., jax.Array],
+    lead_partial: jax.Array,
+    lead_lse: jax.Array,
+    w_uv: jax.Array,
+    num_tokens: int,
+    rank_ids: jax.Array | None = None,
+    read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
+    w_uv_replicated: bool = False,
+    tie_after_idx_max_cap: int = 0,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Run token-parallel indexer top-k, latent gather, lead merge, and MLA together.
+
+    Returns `(own_v [dcp*R, H, V], lead_v [S, H, V], tail_flat_topk [dcp*R, K])`
+    bit-identical to separate `indexer_topk(..., flat_topk_cap_strided=True)` and
+    `sparse_mla_attention_with_lead(..., flat_topk_cap_strided=True)`.
+    """
+    dcp = layout.dcp_size
+    sharded = P(axis_name)
+    rep = P()
+
+    def _local(
+        idx_cache,
+        q_idx_r,
+        w_idx_r,
+        idx_bt,
+        nope,
+        rope,
+        q_tok,
+        q_pe_tok,
+        mla_bt,
+        sl,
+        qsl,
+        dist,
+        lead_part_local,
+        lead_lse_local,
+        w_uv_local,
+        *rank_arg,
+    ):
+        rank = _rank(rank_arg, axis_name, dcp)
+        # Avoid propagating the SparseCore writer's 32-word view across the cap
+        # switch: keep latent cache arrays in their [pages, rows, 128] layout.
+        nope, rope = lax.optimization_barrier((nope, rope))
+        pages, offsets = step_pages(layout, sl, qsl, dist[2])
+        idx_page_ids = gather_page_ids(
+            layout, idx_bt, pages, offsets, idx_cache.shape[0]
+        )
+        mla_page_ids = gather_page_ids(layout, mla_bt, pages, offsets, nope.shape[0])
+        rr = rank_rows(layout, rank, num_tokens, sl, qsl, dist[2])
+        rows = layout.rows_per_rank(num_tokens)
+        idx_vpages_per_seq = idx_bt.shape[0] // sl.shape[0]
+        il, ps = layout.interleave_size, layout.page_size
+        row_offsets = offsets[row_requests(rr, rows)]
+        real = jnp.arange(rows, dtype=jnp.int32) < rr.num_rows
+        w_uv_all = (
+            w_uv_local
+            if w_uv_replicated
+            else lax.all_gather(w_uv_local, axis_name, axis=0, tiled=True)
+        )
+
+        def branch(cap: int) -> Callable[[], tuple[jax.Array, jax.Array, jax.Array]]:
+            def run() -> tuple[jax.Array, jax.Array, jax.Array]:
+                nat = _gather_index_k_pages(
+                    idx_cache, idx_page_ids, cap, dcp, il, ps, axis_name
+                )
+                table = natural_page_table(
+                    layout, rr, offsets, idx_vpages_per_seq, cap=cap
+                )
+                if tie_after_idx_max_cap > 0 and cap <= tie_after_idx_max_cap:
+                    positions = select_topk(q_idx_r, w_idx_r, nat, rr, table)
+                    # Avoid small-cap page_gather/StreamIdxTC contention: wait
+                    # for StreamIdxTC before launching gather_latent on tiny caps.
+                    positions, nope_t, rope_t = lax.optimization_barrier(
+                        (positions, nope, rope)
+                    )
+                    g_nope, g_rope = gather_latent(
+                        nope_t, rope_t, mla_page_ids[:cap], axis_name, read_pages
+                    )
+                else:
+                    g_nope, g_rope = gather_latent(
+                        nope, rope, mla_page_ids[:cap], axis_name, read_pages
+                    )
+                    positions = select_topk(q_idx_r, w_idx_r, nat, rr, table)
+                flat = jnp.where(
+                    real[:, None],
+                    flat_rows(layout, positions, row_offsets, stride_pages=cap),
+                    -1,
+                )
+                # Avoid hoisting lead LSE AG / psum ahead of gather_latent:
+                # tying both via optimization_barrier prevents ICI contention
+                # with gather_latent while overlapping lead collectives with
+                # the zero-ICI attention kernel.
+                g_nope, g_rope, lp_t, ll_t = lax.optimization_barrier(
+                    (g_nope, g_rope, lead_part_local, lead_lse_local)
+                )
+                lead_v = _merge_lead_partial_to_v(
+                    lp_t, ll_t, w_uv_all, axis_name, q_tok.dtype
+                )
+                out = attend(q_tok, g_nope, g_rope, flat, rr.num_rows, q_pe_tok)
+                out = _project_w_uv(out, w_uv_all)
+                return out, lead_v, flat
+
+            return run
+
+        return _switch_on_cap(layout, jnp.sum(pages), branch)
+
+    extra = () if rank_ids is None else (rank_ids,)
+    w_uv_spec = rep if w_uv_replicated else sharded
+    return jax.shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(
+            sharded,
+            sharded,
+            sharded,
+            rep,
+            sharded,
+            sharded,
+            sharded,
+            sharded,
+            rep,
+            rep,
+            rep,
+            rep,
+            sharded,
+            sharded,
+            w_uv_spec,
+        )
+        + (sharded,) * len(extra),
+        out_specs=(sharded, rep, sharded),
+        check_vma=False,
+    )(
+        index_cache,
+        q_idx,
+        w_idx,
+        idx_block_tables,
+        kv_cache_nope,
+        kv_cache_rope,
+        q,
+        q_pe,
+        mla_block_tables,
+        seq_lens,
+        query_start_loc,
+        request_distribution,
+        lead_partial,
+        lead_lse,
+        w_uv,
+        *extra,
+    )

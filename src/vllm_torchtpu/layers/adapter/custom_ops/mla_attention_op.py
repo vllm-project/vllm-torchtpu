@@ -79,7 +79,11 @@ from vllm_torchtpu.kernels.mla.fused_qb_absorb import (
 )
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny, fp8_window_all_gather
-from vllm_torchtpu.layers.adapter import dcp_token_parallel_op, small_all_reduce_op
+from vllm_torchtpu.layers.adapter import (
+    dcp_token_parallel_op,
+    dcp_unified_indexer_mla_op,
+    small_all_reduce_op,
+)
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasMLAttentionBackendImpl,
@@ -1347,6 +1351,49 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             return self.topk_indices_buffer, q_b_out
         return rows, q_b_out
 
+    def has_live_unified_cache(self) -> bool:
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return False
+        metadata = attn_metadata.get(self.k_cache.prefix)
+        return (
+            isinstance(metadata, AttentionMetadata)
+            and self.k_cache.kv_cache.numel() > 0
+        )
+
+    def prepare_unified_inputs(
+        self,
+        q_values: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> dcp_unified_indexer_mla_op.UnifiedIndexerInputs | None:
+        assert q_values.dtype == torch.float8_e4m3fn, (
+            f"streamindex_topk expects fp8 q, got {q_values.dtype}"
+        )
+        attn_metadata = get_forward_context().attn_metadata
+        metadata = None
+        if isinstance(attn_metadata, dict):
+            metadata = attn_metadata.get(self.k_cache.prefix)
+        if not isinstance(metadata, AttentionMetadata):
+            return None
+        kv_cache = self.k_cache.kv_cache
+        if kv_cache.numel() == 0:
+            return None
+        k_quant, k_scale = quantize_tensor(
+            k,
+            torch.float8_e4m3fn,
+            axis=-1,
+            use_ue8m0=True,
+        )
+        k_quant_packed = torch.cat([k_quant.view(torch.uint8), k_scale], dim=-1)
+        return dcp_unified_indexer_mla_op.UnifiedIndexerInputs(
+            indexer_op=self,
+            q_bytes=q_values.view(torch.uint8),
+            weights=weights,
+            k_packed=k_quant_packed,
+            idx_metadata=metadata,
+        )
+
     def _write_topk_rows(
         self, num_tokens: int, topk_indices: torch.Tensor
     ) -> torch.Tensor:
@@ -1508,23 +1555,16 @@ class VllmTPUIndexer(Indexer):
             synchronize_tensors(updated)
         self._rope_neox_permuted = True
 
-    # Widens Indexer.forward: an optional q_b_layer, and (topk, q) when given.
-    def forward(  # pyrefly: ignore[bad-override]
+    def prepare_inputs(
         self,
         hidden_states: torch.Tensor,
         qr: torch.Tensor,
         positions,
         rotary_emb,
-        q_b_layer: torch.nn.Module | None = None,
+        *,
         kw: torch.Tensor | None = None,
         q_rows: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
-        """`q_b_layer` (TPU_INDEXER_QB_OVERLAP): also return `q_b_layer(qr)`,
-        run inside the top-k op, as `(topk, q)`; `q` None where the op could
-        not take it (the caller runs `q_b_layer` itself). `kw`: the
-        `wk_weights_proj` output, when the caller already projected the rows
-        (only their count is then read from `hidden_states`). `q_rows`: when
-        `qr` holds only the rows this rank attends (`s + T // dcp`)."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         # Fused wk + weights_proj: one GEMM, then split
@@ -1553,64 +1593,83 @@ class VllmTPUIndexer(Indexer):
             )
             q_fp8, q_scale = qprep_op(q.reshape(-1, self.n_head * self.head_dim), c, s_)
             q_scale = q_scale.view(-1, self.n_head, 1)
-            return self._finish_forward(
-                hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer
-            )
-        if permuted and rope_half_split_leading_supported(rotary_emb):
-            # Half-split columns: rope the whole head in place, no split/cat.
-            q = rope_half_split_leading(rotary_emb, q_positions, q, self.rope_dim)
-            k = rope_half_split_leading(rotary_emb, positions, k, self.rope_dim)
         else:
-            q_pe, q_nope = torch.split(
-                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-            )
-            k_pe, k_nope = torch.split(
-                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-            )
-            rope_fn = (
-                (lambda pos, q_, k_: rope_half_split(rotary_emb, pos, q_, k_))
-                if permuted
-                else rotary_emb
-            )
-            if q_rows is None:
-                q_pe, k_pe = rope_fn(positions, q_pe, k_pe.unsqueeze(1))
+            if permuted and rope_half_split_leading_supported(rotary_emb):
+                # Half-split columns: rope the whole head in place, no split/cat.
+                q = rope_half_split_leading(rotary_emb, q_positions, q, self.rope_dim)
+                k = rope_half_split_leading(rotary_emb, positions, k, self.rope_dim)
             else:
-                k_pe_u = k_pe.unsqueeze(1)
-                q_pe = rope_fn(q_positions, q_pe, k_pe_u.index_select(0, q_rows))[0]
-                k_pe = rope_fn(positions, k_pe_u, k_pe_u)[1]
-            # A key was passed in, so one comes back.
-            assert k_pe is not None
-            # Note: RoPE (NeoX) can introduce extra leading dimensions during
-            # compilation so we need to reshape back to token-flattened shapes
-            q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
-            k_pe = k_pe.reshape(-1, 1, self.rope_dim)
+                q_pe, q_nope = torch.split(
+                    q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+                )
+                k_pe, k_nope = torch.split(
+                    k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+                )
+                rope_fn = (
+                    (lambda pos, q_, k_: rope_half_split(rotary_emb, pos, q_, k_))
+                    if permuted
+                    else rotary_emb
+                )
+                if q_rows is None:
+                    q_pe, k_pe = rope_fn(positions, q_pe, k_pe.unsqueeze(1))
+                else:
+                    k_pe_u = k_pe.unsqueeze(1)
+                    q_pe = rope_fn(q_positions, q_pe, k_pe_u.index_select(0, q_rows))[0]
+                    k_pe = rope_fn(positions, k_pe_u, k_pe_u)[1]
+                # A key was passed in, so one comes back.
+                assert k_pe is not None
+                # Note: RoPE (NeoX) can introduce extra leading dimensions during
+                # compilation so we need to reshape back to token-flattened shapes
+                q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
+                k_pe = k_pe.reshape(-1, 1, self.rope_dim)
 
-            # `rotary_emb` is shape-preserving; `q_pe` is already
-            # [num_tokens, n_head, rope_dim].
-            q = torch.cat([q_pe, q_nope], dim=-1)
-            # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
-            k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+                # `rotary_emb` is shape-preserving; `q_pe` is already
+                # [num_tokens, n_head, rope_dim].
+                q = torch.cat([q_pe, q_nope], dim=-1)
+                # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
+                k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
 
-        # we only quant q here since k quant is fused with cache insertion
-        q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = quantize_tensor(
-            q, torch.float8_e4m3fn, axis=-1, use_ue8m0=False
-        )
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
-        return self._finish_forward(
-            hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer
-        )
+            # we only quant q here since k quant is fused with cache insertion
+            q = q.view(-1, self.head_dim)
+            q_fp8, q_scale = quantize_tensor(
+                q, torch.float8_e4m3fn, axis=-1, use_ue8m0=False
+            )
+            q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+            q_scale = q_scale.view(-1, self.n_head, 1)
 
-    def _finish_forward(self, hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer):
-        # q_scale is fp32, so fold it in and cast back: the kernel expects the
-        # weights in the activation dtype.
         weights_dtype = weights.dtype
         weights = (
             weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
         )
         weights = weights.squeeze(-1).to(weights_dtype)
+        return q_fp8, k, weights
 
+    # Widens Indexer.forward: an optional q_b_layer, and (topk, q) when given.
+    def forward(  # pyrefly: ignore[bad-override]
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        positions,
+        rotary_emb,
+        q_b_layer: torch.nn.Module | None = None,
+        kw: torch.Tensor | None = None,
+        q_rows: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the TPU indexer forward pass, optionally overlapping MLA q_b_proj.
+
+        `q_b_layer` (TPU_INDEXER_QB_OVERLAP): also return `q_b_layer(qr)`,
+        run inside the top-k op, as `(topk, q)`; `q` None where the op could
+        not take it (the caller runs `q_b_layer` itself). `kw`: the
+        `wk_weights_proj` output, when the caller already projected the rows
+        (only their count is then read from `hidden_states`). `q_rows`: when
+        `qr` holds only the rows this rank attends (`s + T // dcp`).
+        """
+        q_fp8, k, weights = self.prepare_inputs(
+            hidden_states, qr, positions, rotary_emb, kw=kw, q_rows=q_rows
+        )
+        return self._finish_forward(hidden_states, qr, q_fp8, k, weights, q_b_layer)
+
+    def _finish_forward(self, hidden_states, qr, q_fp8, k, weights, q_b_layer):
         if q_b_layer is None:
             return self.indexer_op(hidden_states, q_fp8, k, weights)
         operands = _qb_overlap_operands(q_b_layer)
@@ -2051,6 +2110,7 @@ class VllmTPUMLAAttention(MLAAttention):
         self.sparse_mla_dcp_send_op = None
         self.sparse_mla_dcp_fused_op = None
         self.sparse_mla_tp_op = None
+        self.sparse_mla_unified_tp_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
@@ -2084,6 +2144,24 @@ class VllmTPUMLAAttention(MLAAttention):
                         self.token_parallel_layout,
                         q_own_rows=True,
                     )
+                    if getattr(self.sparse_mla_tp_op, "serves_oproj", False):
+                        unified_mod = dcp_unified_indexer_mla_op
+                        callbacks = unified_mod.UnifiedIndexerCallbacks(
+                            resolve_kv_cache_mode=_resolve_indexer_kv_cache_mode,
+                            scatter_indexer_k=_cp_scatter_indexer_k,
+                            streamidx_block_sizes=_streamidx_block_sizes,
+                            dcp_indexer_a2a_for_bucket=_dcp_indexer_a2a_for_bucket,
+                            register_indexer_layer=register_indexer_layer,
+                        )
+                        build_unified = unified_mod.build_unified_indexer_attention_op
+                        self.sparse_mla_unified_tp_op = build_unified(
+                            self,
+                            impl,
+                            indexer_op,
+                            self.token_parallel_layout,
+                            q_replicated=True,
+                            callbacks=callbacks,
+                        )
             # TPU_MLA_DECODE_PROLOGUE: the variant that takes the raw q head
             # and ropes q_pe in the attention kernel (query replication only).
             if envs.TPU_MLA_DECODE_PROLOGUE and self.dcp_q_replicate:
@@ -2188,6 +2266,7 @@ class VllmTPUMLAAttention(MLAAttention):
             q_dcp_replicated=kwargs.get("q_dcp_replicated"),
             sp_o_proj=kwargs.get("sp_o_proj"),
             kv_sharded=kwargs.get("kv_sharded", False),
+            unified_indexer_inputs=kwargs.get("unified_indexer_inputs"),
         )
 
 
@@ -2834,8 +2913,58 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 q_pe = q_pe.to(dtype=q_pe_dtype)
                 k_pe = k_pe.to(dtype=k_pe_dtype)
 
+        # TPU_DCP_TP_PREFILL_LOCAL_OPROJ: on a sequence-parallel token-parallel
+        # bucket the attention op runs o_proj (this rank's FP8 shard, gathered
+        # in the op) itself and returns this rank's sequence-parallel rows.
+        sp_o_proj = None
+        if (
+            envs.TPU_DCP_TP_PREFILL_LOCAL_OPROJ
+            and prefill_group is not None
+            and self.is_sparse
+            and output_gate is None
+            and self.g_proj is None
+            and getattr(
+                getattr(self.mla_attn, "sparse_mla_tp_op", None), "serves_oproj", False
+            )
+            and dcp_token_parallel_op.applies(num_tokens)
+            and dcp_token_parallel_op.serves_sequence_row_oproj(self.o_proj)
+        ):
+            w_half = getattr(self.mla_attn, "W_O_tp_half", None)
+            sp_o_proj = (
+                (self.o_proj.weight, self.o_proj.weight_scale)
+                if w_half is None
+                else (w_half, self.mla_attn.W_O_tp_half_scale)
+            )
+
+        unified_op = getattr(self.mla_attn, "sparse_mla_unified_tp_op", None)
+        unified_idx_inputs = None
+        if (
+            self.is_sparse
+            and early_topk is None
+            and self.indexer is not None
+            and not self.skip_topk
+            and sp_o_proj is not None
+            and llama_4_scaling is None
+            and unified_op is not None
+            and (not kv_sharded or getattr(unified_op, "serves_sharded_kv", False))
+            and indexer_qrows is not None
+            and (fused_qb_out is not None or self.dcp_q_replicate)
+            and self.indexer.indexer_op.has_live_unified_cache()
+        ):
+            q_idx_fp8, k_idx, w_idx = self.indexer.prepare_inputs(
+                hidden_states,
+                q_c,
+                positions,
+                self.indexer_rope_emb,
+                kw=pre_kw,
+                q_rows=indexer_qrows,
+            )
+            unified_idx_inputs = self.indexer.indexer_op.prepare_unified_inputs(
+                q_idx_fp8, k_idx, w_idx
+            )
+
         topk_indices = None
-        if self.is_sparse:
+        if self.is_sparse and unified_idx_inputs is None:
             if early_topk is not None:
                 topk_index = early_topk
             elif self.indexer is not None and not self.skip_topk:
@@ -2865,6 +2994,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
         # Hand the group-wide q to the sparse DCP path, which would otherwise
         # all-gather the heads itself; everything else takes this rank's shard.
+        has_topk = topk_indices is not None or unified_idx_inputs is not None
         q_dcp_replicated: Any = None
         if fused_qb_out is not None:
             ql_head, ql_tail, q_pe_all = fused_qb_out
@@ -2876,7 +3006,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             elif self.is_sparse:
                 q_dcp_replicated = (q_nope, q_pe)
             q_proj_layer = cast(DCPGroupColumnParallelLinear, self._q_proj_layer())
-            if q_dcp_replicated is not None and topk_indices is not None:
+            if q_dcp_replicated is not None and has_topk:
                 # The sparse DCP path reads only q_dcp_replicated, so this
                 # rank's shard is dead. Slice the same heads on every rank: a
                 # rank-dependent slice makes every rank trace a different graph,
@@ -2887,28 +3017,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 local_view = q_proj_layer._local_view
                 q_nope, q_pe = local_view(q_nope), local_view(q_pe)
 
-        # TPU_DCP_TP_PREFILL_LOCAL_OPROJ: on a sequence-parallel token-parallel
-        # bucket the attention op runs o_proj (this rank's FP8 shard, gathered
-        # in the op) itself and returns this rank's sequence-parallel rows.
-        sp_o_proj = None
-        if (
-            envs.TPU_DCP_TP_PREFILL_LOCAL_OPROJ
-            and prefill_group is not None
-            and topk_indices is not None
-            and output_gate is None
-            and self.g_proj is None
-            and getattr(
-                getattr(self.mla_attn, "sparse_mla_tp_op", None), "serves_oproj", False
-            )
-            and dcp_token_parallel_op.applies(num_tokens)
-            and dcp_token_parallel_op.serves_sequence_row_oproj(self.o_proj)
-        ):
-            w_half = getattr(self.mla_attn, "W_O_tp_half", None)
-            sp_o_proj = (
-                (self.o_proj.weight, self.o_proj.weight_scale)
-                if w_half is None
-                else (w_half, self.mla_attn.W_O_tp_half_scale)
-            )
+        if not has_topk:
+            sp_o_proj = None
 
         attn_out = self.mla_attn(
             (q_nope, q_pe),
@@ -2919,6 +3029,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             q_dcp_replicated=q_dcp_replicated,
             sp_o_proj=sp_o_proj,
             kv_sharded=kv_sharded,
+            unified_indexer_inputs=unified_idx_inputs,
         )
         # The two branches lift different W_UV buffers; each lifts the other's
         # too, as the bucket warmup requires (_retain_buffers: no data read).
