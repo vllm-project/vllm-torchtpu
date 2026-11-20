@@ -441,17 +441,36 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     else:
         union = _sorted_unions(per_tile)
     groups_per_tile = _groups_per_tile(block_q, topk, pages_per_step)
+    if num_tiles == 1:
+        meta, count = _single_tile_groups(union[0], groups_per_tile, pages_per_step)
+        num_groups = jnp.sum(_live_groups(meta, count), dtype=jnp.int32)
+    else:
+        meta, count, num_groups = _tile_groups(union, groups_per_tile, pages_per_step)
+    union = jnp.pad(
+        jnp.where(union == _NO_PAGE, -1, union),
+        ((0, 0), (0, groups_per_tile * pages_per_step - union_size)),
+        constant_values=-1,
+    )
+    return union.reshape(-1), meta.astype(jnp.int32), num_groups, count
+
+
+def _tile_groups(union: jax.Array, groups_per_tile: int, pages_per_step: int):
+    """`_work_list`'s meta words, page counts and group count of the tiles'
+    ``union [tiles, union_size]``, the groups of all tiles back to back."""
+    num_tiles = union.shape[0]
     # A tile with no page still gets one all-masked group so its output is set.
     pages_in_tile = jnp.sum(union != _NO_PAGE, axis=1, dtype=jnp.int32)
     groups_in_tile = jnp.maximum(-(-pages_in_tile // pages_per_step), 1)
     ends = jnp.cumsum(groups_in_tile)
     starts = ends - groups_in_tile
     # Group w's tile, first group and end from compares against every tile's
-    # range ([groups, tiles], fused into reductions): no gathers.
+    # range ([groups, tiles], fused into reductions): no gathers. A group past
+    # the last one gets no end (only `w + 1 == end` reads it): falling back
+    # to ends[-1] made every reduction wait for that scalar.
     w = jnp.arange(num_tiles * groups_per_tile, dtype=jnp.int32)[:, None]
     tile = jnp.sum(starts[None, 1:] <= w, axis=1, dtype=jnp.int32)
     start = jnp.max(jnp.where(starts[None, :] <= w, starts[None, :], 0), axis=1)
-    end = jnp.min(jnp.where(ends[None, :] > w, ends[None, :], ends[-1]), axis=1)
+    end = jnp.min(jnp.where(ends[None, :] > w, ends[None, :], _NO_PAGE), axis=1)
     tile_pages = jnp.max(
         jnp.where((starts[None, :] <= w) & (ends[None, :] > w), pages_in_tile, 0),
         axis=1,
@@ -464,12 +483,41 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
         | jnp.where(w == start, _FIRST_BIT, 0)
         | jnp.where(w + 1 == end, _LAST_BIT, 0)
     )
-    union = jnp.pad(
-        jnp.where(union == _NO_PAGE, -1, union),
-        ((0, 0), (0, groups_per_tile * pages_per_step - union_size)),
-        constant_values=-1,
+    return meta, count, ends[-1]
+
+
+def _single_tile_groups(union: jax.Array, groups_per_tile: int, pages_per_step: int):
+    """`_tile_groups` of one tile's ``union [union_size]``, from vector ops
+    only. Its page count would be a scalar, which XLA keeps in HBM and turns
+    into the group count on the scalar unit: ~2.5 us of round trips per
+    layer between the decode merge and the attention kernel (b1 decode
+    twin, j-05384dca).
+
+    A group's count is its slots' present pages (the union's present slots
+    are its first ones), and the tile's groups are those holding a page,
+    or its first group if none does."""
+    present = jnp.pad(
+        union != _NO_PAGE, (0, groups_per_tile * pages_per_step - union.shape[0])
     )
-    return union.reshape(-1), meta.astype(jnp.int32), ends[-1], count
+    count = jnp.sum(
+        present.reshape(groups_per_tile, pages_per_step), axis=1, dtype=jnp.int32
+    )
+    w = jnp.arange(groups_per_tile, dtype=jnp.int32)
+    live = (count > 0) | (w == 0)
+    last = live & ~jnp.pad(live[1:], (0, 1))
+    meta = (
+        (w << _ROW_SHIFT)
+        | jnp.where(w == 0, _FIRST_BIT, 0)
+        | jnp.where(last, _LAST_BIT, 0)
+    )
+    return meta, count
+
+
+def _live_groups(meta: jax.Array, count: jax.Array) -> jax.Array:
+    """Which of `_work_list`'s groups are in use (``w < num_groups``), from
+    their words: a group past the last one holds no page and starts no tile,
+    and every group in use holds a page or is its empty tile's only one."""
+    return (count > 0) | ((meta & _FIRST_BIT) != 0)
 
 
 def _attention_call(
