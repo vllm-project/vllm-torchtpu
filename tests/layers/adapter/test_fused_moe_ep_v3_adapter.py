@@ -217,6 +217,8 @@ def test_the_bridge_asks_the_kernel_for_its_lowering_by_argument(monkeypatch):
     assert kwargs["side_effects"] is False
     assert kwargs["wrap_in_jit"] is False
     assert kwargs["shard_index"] is rank
+    # Without valid counts too: a row with a NaN logit routes nowhere.
+    assert kwargs["drop_nan_rows"] is True
     for module, flag in (
         (kernel_layer, "WRAP_IN_JIT"),
         (kernel_layout, "SIDE_EFFECTS"),
