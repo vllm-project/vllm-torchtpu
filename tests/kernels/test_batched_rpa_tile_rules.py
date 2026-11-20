@@ -62,6 +62,8 @@ def _tiles(
     )
     fp8 = kv == "fp8"
     fp8_q = q == "fp8"
+    # A packed fp4 KV cache is stored as uint8, two fp4 values per byte.
+    dtype_kv = {"bf16": jnp.bfloat16, "fp8": jnp.float8_e4m3fn, "fp4": jnp.uint8}[kv]
     serve = configs.ServingConfigs(
         num_seqs=num_seqs,
         page_size=128,
@@ -69,7 +71,7 @@ def _tiles(
         num_page_indices=num_seqs * pages_per_seq,
         dtype_q=jnp.float8_e4m3fn if fp8_q else jnp.bfloat16,
         scale_q=1.0 if fp8_q else None,
-        dtype_kv=jnp.float8_e4m3fn if fp8 else jnp.bfloat16,
+        dtype_kv=dtype_kv,
         dtype_out=jnp.bfloat16,
         scale_k=1.0 if fp8 else None,
         scale_v=1.0 if fp8 else None,
@@ -312,3 +314,29 @@ def test_tuned_tiles_at_the_qwen3_5_shapes(layer, decode, prefill):
     layer = dict(layer)
     args = layer.pop("args")
     assert _tiles(*args, **layer) == (decode, prefill)
+
+
+def _correctness_test_shape(kv):
+    # The call of test_ragged_paged_attention_tuned_tiles in
+    # experimental/batched_rpa/correctness_test.py: 32 q / 2 KV heads of 256,
+    # 8 sequence slots of 33 pages (4,100 tokens), 512 padded tokens, MTP K=3.
+    return dict(
+        args=(32, 2, 256),
+        kv=kv,
+        layout=_SEQ,
+        num_seqs=8,
+        pages_per_seq=33,
+        tokens=512,
+        decode_query_size=4,
+        tuned_tiles=True,
+    )
+
+
+def test_a_packed_fp4_cache_takes_the_non_fp8_tuned_rules():
+    """A packed fp4 KV cache is one byte per element, like fp8, but the tuned
+    rules' fp8 branches need an fp8 cache: it takes the bf16 compute threshold
+    (prefill bq_c as without tuned_tiles) and the 75% decode cap. With the fp8
+    rules it would get 4,2,1792,8 and 256,128,256,1."""
+    layer = _correctness_test_shape("fp4")
+    args = layer.pop("args")
+    assert _tiles(*args, **layer) == ((4, 2, 1536, 8), (256, 64, 256, 1))

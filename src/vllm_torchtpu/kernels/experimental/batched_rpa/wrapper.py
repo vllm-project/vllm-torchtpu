@@ -417,9 +417,16 @@ def calculate_block_sizes(
 
         return batch_size * num_muls
 
+    # The tuned rules' fp8 branches need an fp8 KV cache: a packed fp4 cache
+    # (uint8) is also one byte per element, but takes the other branches.
+    is_fp8_kv = jnp.dtype(serve_cfgs.dtype_kv) in (
+        jnp.dtype(jnp.float8_e4m3fn),
+        jnp.dtype(jnp.float8_e5m2),
+    )
+
     # Threshold value based on hardware generation and precision.
     is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1 or (
-        tuned_tiles and kv_bytes == 1 and not serve_cfgs.return_lse
+        tuned_tiles and is_fp8_kv and not serve_cfgs.return_lse
     )
 
     match tpu_info.generation:
@@ -466,7 +473,7 @@ def calculate_block_sizes(
         # batch_size, allowing a 0.85 VMEM cap so bkv_sz reaches 4096 (32 pages).
         # Without them, decode VMEM is counted and capped like prefill.
         tuned_decode = tuned_tiles and fixed_bq_sz is not None
-        decode_vmem_frac = 0.85 if kv_bytes == 1 else 0.75
+        decode_vmem_frac = 0.85 if is_fp8_kv else 0.75
         capped_vmem_limit_bytes = vmem_limit_bytes * (
             decode_vmem_frac if tuned_decode else 0.8
         )
