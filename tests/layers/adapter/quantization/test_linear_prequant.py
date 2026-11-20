@@ -20,7 +20,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    PrequantLinearMethod,
+)
 from vllm_torchtpu.layers.adapter.quantization import fp8
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
@@ -73,23 +76,26 @@ def test_fp8_method_runs_the_prequant_matmul_on_the_kn_weight(
 
 
 @pytest.mark.parametrize(
-    "weight_dtype, scale_shape",
+    "weight_dtype, scale_shape, w8a16_max_rows",
     [
-        (torch.float8_e4m3fn, (1, _K // 16, 1, _N)),
-        (torch.int8, (_N,)),
-        (torch.float8_e5m2, (_N,)),
+        (torch.float8_e4m3fn, (1, _K // 16, 1, _N), 0),
+        (torch.int8, (_N,), 0),
+        (torch.float8_e5m2, (_N,), 0),
+        (torch.float8_e4m3fn, (_N,), 64),
     ],
-    ids=["block_scales", "int8_weight", "e5m2_weight"],
+    ids=["block_scales", "int8_weight", "e5m2_weight", "w8a16_small_steps"],
 )
 @pytest.mark.parametrize("keep_vllm_layout", [False, True])
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_fp8_method_runs_apply_on_the_dequantized_rows_for_other_weights(
-    monkeypatch, weight_dtype, scale_shape, keep_vllm_layout, with_bias
+    monkeypatch, weight_dtype, scale_shape, w8a16_max_rows, keep_vllm_layout, with_bias
 ):
-    """Only a float8_e4m3fn weight with per-channel scales takes the
-    pre-quantized matmul. A block-scaled weight (REQUANTIZE_BLOCK_SIZE gives a
-    rank-4 scale) or an int8 or float8_e5m2 weight (REQUANTIZE_WEIGHT_DTYPE)
-    runs the method's own apply on the dequantized rows instead."""
+    """Only a float8_e4m3fn weight with per-channel scales, on a method without
+    W8A16 small steps, takes the pre-quantized matmul. A block-scaled weight
+    (REQUANTIZE_BLOCK_SIZE gives a rank-4 scale), an int8 or float8_e5m2
+    weight (REQUANTIZE_WEIGHT_DTYPE), or a method that runs small steps W8A16
+    (TPU_FP8_LINEAR_W8A16_MAX_ROWS) runs the method's own apply on the
+    dequantized rows instead."""
     seen = {}
 
     def apply(self, layer, x, bias=None):
@@ -111,7 +117,7 @@ def test_fp8_method_runs_apply_on_the_dequantized_rows_for_other_weights(
     bias = torch.full((_N,), 2.0) if with_bias else None
     x_q, x_s = _rows()
     method = object.__new__(VllmFp8LinearMethodTPU)
-    method.w8a16_max_rows = 0
+    method.w8a16_max_rows = w8a16_max_rows
     out = method.apply_prequant(layer, x_q, x_s, bias)
     assert seen["layer"] is layer and seen["bias"] is bias
     assert seen["x"].dtype == torch.bfloat16
@@ -140,3 +146,20 @@ def test_unquantized_method_matches_the_dequantized_rows(keep_vllm_layout, with_
         want = want + bias.float()
     assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out.float(), want, rtol=2e-2, atol=2e-2)
+
+
+def test_only_a_method_that_says_so_serves_pre_quantized_rows():
+    """A bf16 `apply` does not see FP8-rounded rows, so the unquantized method
+    (and any method that does not say otherwise) does not serve them; the TPU
+    FP8 method does, for an e4m3 weight with per-channel scales."""
+    layer = SimpleNamespace(
+        weight=torch.randn(_K, _N).to(torch.float8_e4m3fn), weight_scale=torch.rand(_N)
+    )
+    assert not PrequantLinearMethod().serves_prequant_rows(layer)
+    unquantized = object.__new__(VllmUnquantizedLinearMethod)
+    assert not unquantized.serves_prequant_rows(
+        SimpleNamespace(weight=torch.randn(_K, _N))
+    )
+    fp8_method = object.__new__(VllmFp8LinearMethodTPU)
+    fp8_method.w8a16_max_rows = 0
+    assert fp8_method.serves_prequant_rows(layer)

@@ -74,8 +74,9 @@ class PrequantLinearMethod:
 
     def serves_prequant_rows(self, layer: torch.nn.Module) -> bool:
         """Whether `apply_prequant` on `layer` computes what `apply` computes
-        from the bf16 rows the FP8 rows were quantized from."""
-        return True
+        from the bf16 rows the FP8 rows were quantized from. No, unless the
+        method says so: a bf16 `apply` does not see FP8-rounded rows."""
+        return False
 
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
