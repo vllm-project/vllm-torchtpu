@@ -407,6 +407,104 @@ def _resolve_ep_tp_z_clone(
     return user_ragged_stride is None or user_ragged_stride >= clone_stride
 
 
+def _select_z_clone_plan(
+    rows_by_dest,
+    counts_chip,
+    *,
+    ep: int,
+    n_chips: int,
+    g_local: int,
+    capacity: int,
+    z_min_total: int,
+    z_min_remote: int,
+    z_waterfill: bool,
+):
+    half_ep = ep // 2
+    half_chips = n_chips // 2
+    counts_h0 = rows_by_dest[:half_ep].sum(axis=0).reshape(n_chips, 2 * g_local)
+    counts_h1 = rows_by_dest[half_ep:].sum(axis=0).reshape(n_chips, 2 * g_local)
+    chip_host = jnp.arange(n_chips, dtype=jnp.int32) >= jnp.int32(half_chips)
+    remote_counts = jnp.where(chip_host[:, None], counts_h0, counts_h1)
+    z_hot_phys = jnp.argmax(remote_counts, axis=1).astype(jnp.int32)
+    z_hot_tot = jnp.take_along_axis(counts_chip, z_hot_phys[:, None], axis=1)[:, 0]
+    chip_base_1d = jnp.arange(n_chips, dtype=jnp.int32) * jnp.int32(2 * g_local)
+    hot_global = chip_base_1d + z_hot_phys
+    per_rank_hot = jnp.take(rows_by_dest, hot_global, axis=1)
+
+    if z_waterfill:
+        # Avoid offloading all remote-host ranks blindly: bidirectional Z-clones
+        # or pushes onto a heavier Z-partner thrash the inter-host link and raise
+        # lockstep tiles, whereas water-filling remote ranks minimizes max(c, c^4).
+        ordered_rem = jnp.where(
+            chip_host[:, None],
+            per_rank_hot[:half_ep, :].T,
+            per_rank_hot[half_ep:, :].T,
+        )
+        opts = jnp.concatenate(
+            [jnp.zeros((n_chips, 1), dtype=jnp.int32), jnp.cumsum(ordered_rem, axis=1)],
+            axis=1,
+        )
+        chip_tot = counts_chip.sum(axis=1)
+        z_partner_idx = lax.bitwise_xor(
+            jnp.arange(n_chips, dtype=jnp.int32), jnp.int32(half_chips)
+        )
+        partner_tot = jnp.take(chip_tot, z_partner_idx, axis=0)
+        gap = chip_tot - partner_tot
+        visit_pen = int(round(TP_PAIR_VISIT_FLOOR_TILES * capacity))
+        k_idx = jnp.arange(half_ep + 1, dtype=jnp.int32)[None, :]
+        pen = jnp.where(k_idx == 0, jnp.int32(0), jnp.int32(visit_pen))
+        valid_opt = (k_idx == 0) | (
+            (opts >= jnp.int32(z_min_remote))
+            & (z_hot_tot[:, None] >= jnp.int32(z_min_total))
+            & (gap[:, None] >= jnp.int32(z_min_total))
+        )
+        obj = jnp.where(
+            valid_opt,
+            jnp.maximum(chip_tot[:, None] - opts, partner_tot[:, None] + opts + pen),
+            jnp.int32(1 << 29),
+        )
+        best_k = jnp.argmin(obj, axis=1).astype(jnp.int32)
+    else:
+        z_hot_rem = jnp.take_along_axis(remote_counts, z_hot_phys[:, None], axis=1)[
+            :, 0
+        ]
+        legacy_active = (z_hot_tot >= jnp.int32(z_min_total)) & (
+            z_hot_rem >= jnp.int32(z_min_remote)
+        )
+        best_k = jnp.where(legacy_active, jnp.int32(half_ep), jnp.int32(0))
+
+    z_active = best_k > jnp.int32(0)
+    z_push_phys_by_chip = jnp.where(z_active, z_hot_phys, jnp.int32(-1))
+    phys_idx_z = jnp.arange(2 * g_local, dtype=jnp.int32)[None, :]
+    is_z_hot = (phys_idx_z == z_hot_phys[:, None]) & z_active[:, None]
+
+    src_ranks = jnp.arange(ep, dtype=jnp.int32)
+    src_is_h1 = src_ranks >= jnp.int32(half_ep)
+    if (half_ep & (half_ep - 1)) == 0:
+        src_rem_ord = jnp.bitwise_and(src_ranks, jnp.int32(half_ep - 1))
+    else:
+        src_rem_ord = src_ranks % jnp.int32(half_ep)
+    take_rc = (src_is_h1[:, None] != chip_host[None, :]) & (
+        src_rem_ord[:, None] < best_k[None, :]
+    )
+    z_moved_tot = jnp.sum(per_rank_hot * take_rc.astype(jnp.int32), axis=0)
+    counts_for_split = jnp.where(
+        is_z_hot, counts_chip - z_moved_tot[:, None], counts_chip
+    )
+    return (
+        chip_host,
+        z_active,
+        z_hot_phys,
+        z_push_phys_by_chip,
+        is_z_hot,
+        best_k,
+        src_is_h1,
+        src_rem_ord,
+        take_rc,
+        counts_for_split,
+    )
+
+
 def rebalance_ep_tp_pair_experts(
     pairs_g,
     local_blocks,
@@ -425,6 +523,7 @@ def rebalance_ep_tp_pair_experts(
     z_clone=False,
     z_min_total=TP_PAIR_Z_CLONE_MIN_TOTAL,
     z_min_remote=TP_PAIR_Z_CLONE_MIN_REMOTE,
+    z_waterfill=True,
 ):
     """Balance paired experts and optionally split or Z-clone hot experts."""
     g_shift = g_local.bit_length() - 1
@@ -487,27 +586,38 @@ def rebalance_ep_tp_pair_experts(
     z_phys_id = 2 * g_local
 
     if z_clone:
-        counts_h0 = rows_by_dest[:half_ep].sum(axis=0).reshape(n_chips, 2 * g_local)
-        counts_h1 = rows_by_dest[half_ep:].sum(axis=0).reshape(n_chips, 2 * g_local)
-        chip_host = jnp.arange(n_chips, dtype=jnp.int32) >= jnp.int32(half_chips)
-        remote_counts = jnp.where(chip_host[:, None], counts_h0, counts_h1)
-        z_hot_phys = jnp.argmax(remote_counts, axis=1).astype(jnp.int32)
-        z_hot_rem = jnp.take_along_axis(remote_counts, z_hot_phys[:, None], axis=1)[
-            :, 0
-        ]
-        z_hot_tot = jnp.take_along_axis(counts_chip, z_hot_phys[:, None], axis=1)[:, 0]
-        z_active = (z_hot_tot >= jnp.int32(z_min_total)) & (
-            z_hot_rem >= jnp.int32(z_min_remote)
+        (
+            chip_host,
+            z_active,
+            z_hot_phys,
+            z_push_phys_by_chip,
+            is_z_hot,
+            best_k,
+            src_is_h1,
+            src_rem_ord,
+            take_rc,
+            counts_for_split,
+        ) = _select_z_clone_plan(
+            rows_by_dest,
+            counts_chip,
+            ep=ep,
+            n_chips=n_chips,
+            g_local=g_local,
+            capacity=capacity,
+            z_min_total=z_min_total,
+            z_min_remote=z_min_remote,
+            z_waterfill=z_waterfill,
         )
-        z_push_phys_by_chip = jnp.where(z_active, z_hot_phys, jnp.int32(-1))
-        phys_idx_z = jnp.arange(2 * g_local, dtype=jnp.int32)[None, :]
-        is_z_hot = (phys_idx_z == z_hot_phys[:, None]) & z_active[:, None]
-        counts_for_split = jnp.where(is_z_hot, counts_chip - remote_counts, counts_chip)
     else:
+        chip_host = None
         z_active = None
         z_hot_phys = None
         z_push_phys_by_chip = None
         is_z_hot = None
+        best_k = None
+        src_is_h1 = None
+        src_rem_ord = None
+        take_rc = None
         counts_for_split = counts_chip
 
     if k_split > 0:
@@ -526,13 +636,39 @@ def rebalance_ep_tp_pair_experts(
     split_match = jnp.where(
         split_active, chip_base_1d[:, None] + split_phys, jnp.int32(-1)
     )
-    z_match = (
-        jnp.where(z_active, chip_base_1d + z_hot_phys, jnp.int32(-1))
-        if z_clone
-        else None
-    )
+    if z_clone:
+        assert (
+            chip_host is not None
+            and z_active is not None
+            and z_hot_phys is not None
+            and best_k is not None
+        )
+        z_match = jnp.where(z_active, chip_base_1d + z_hot_phys, jnp.int32(-1))
+        local_host = me >= jnp.int32(half_ep)
+        if (half_ep & (half_ep - 1)) == 0:
+            me_rem_ord = jnp.bitwise_and(me, jnp.int32(half_ep - 1))
+        else:
+            me_rem_ord = me % jnp.int32(half_ep)
+        take_me_by_chip = (local_host != chip_host) & (me_rem_ord < best_k)
+        z_match_local = jnp.where(take_me_by_chip, z_match, jnp.int32(-1))
+        # Avoid 8-way _select_by_chip over 131K global pairs when best_k fits in
+        # 4-bit nibbles (0..8 per chip across <= 8 chips = one uint32 scalar).
+        if n_chips <= 8 and half_ep <= 8:
+            packed_best_k = jnp.sum(
+                jnp.left_shift(
+                    best_k.astype(jnp.uint32),
+                    jnp.arange(n_chips, dtype=jnp.uint32) * jnp.uint32(4),
+                ),
+                dtype=jnp.uint32,
+            )
+        else:
+            packed_best_k = None
+    else:
+        z_match = None
+        z_match_local = None
+        packed_best_k = None
 
-    def _remap_with_splits(ids, tok_par, tok_host):
+    def _remap_with_splits(ids, tok_par, tok_host, tok_rem_ord, *, is_local: bool):
         valid = (ids >= jnp.int32(0)) & (ids < jnp.int32(e_total))
         pair_idx = jnp.bitwise_or(
             jnp.left_shift(jnp.right_shift(ids, chip_shift), g_shift),
@@ -551,9 +687,27 @@ def rebalance_ep_tp_pair_experts(
         log_id = core * jnp.int32(g_plan) + slot
         ch = jnp.right_shift(ids, chip_shift)
         if z_clone:
-            ch_host = ch >= jnp.int32(half_chips)
-            z_m = _select_by_chip(ch, z_match, n_chips)
-            hit_z = valid & (ids == z_m) & (tok_host != ch_host)
+            if is_local:
+                z_m_loc = _select_by_chip(ch, z_match_local, n_chips)
+                hit_z = valid & (ids == z_m_loc)
+            else:
+                ch_host = ch >= jnp.int32(half_chips)
+                z_m = _select_by_chip(ch, z_match, n_chips)
+                if packed_best_k is not None:
+                    k_take = jnp.bitwise_and(
+                        jnp.right_shift(
+                            packed_best_k, jnp.left_shift(ch, 2).astype(jnp.uint32)
+                        ),
+                        jnp.uint32(0xF),
+                    ).astype(jnp.int32)
+                else:
+                    k_take = _select_by_chip(ch, best_k, n_chips)
+                hit_z = (
+                    valid
+                    & (ids == z_m)
+                    & (tok_host != ch_host)
+                    & (tok_rem_ord < k_take)
+                )
         else:
             hit_z = None
         hits = []
@@ -589,21 +743,28 @@ def rebalance_ep_tp_pair_experts(
     local_par = jnp.broadcast_to(local_tok_par, (t_local, topk)).reshape(
         local_blocks.shape
     )
-    global_host = jnp.broadcast_to(
-        (jnp.arange(n_tokens, dtype=jnp.int32) >= jnp.int32(n_tokens // 2))[:, None],
-        (n_tokens, topk),
-    ).reshape(pairs_g.shape)
-    local_host = me >= jnp.int32(half_ep)
+    if z_clone:
+        assert src_is_h1 is not None and src_rem_ord is not None
+        global_host = jnp.broadcast_to(
+            src_is_h1[:, None], (ep, t_local * topk)
+        ).reshape(pairs_g.shape)
+        global_rem_ord = jnp.broadcast_to(
+            src_rem_ord[:, None], (ep, t_local * topk)
+        ).reshape(pairs_g.shape)
+    else:
+        global_host = None
+        global_rem_ord = None
     new_pairs, global_hits, global_hit_z = _remap_with_splits(
-        pairs_g, global_par, global_host
+        pairs_g, global_par, global_host, global_rem_ord, is_local=False
     )
     new_local, local_hits, local_hit_z = _remap_with_splits(
-        local_blocks, local_par, local_host
+        local_blocks, local_par, None, None, is_local=True
     )
 
     is_sp_flat = is_split_phys.reshape(e_total)
 
-    def _subtract_z_orig(hist, ids_2d, hit_z_2d):
+    def _subtract_z_orig_local(hist, ids_2d, hit_z_2d):
+        assert is_z_hot is not None
         ch_2d = jnp.right_shift(ids_2d, chip_shift)
         z_orig_chip = jnp.stack(
             [
@@ -674,16 +835,25 @@ def rebalance_ep_tp_pair_experts(
 
     bh_in = block_hist
     rbd_in = rows_by_dest
+    ghitz_2d = None
     if z_clone:
+        assert global_hit_z is not None and take_rc is not None and is_z_hot is not None
         ghitz_2d = global_hit_z.reshape(ep, t_local * topk)
-        bh_in = _subtract_z_orig(bh_in, local_blocks, local_hit_z)
-        rbd_in = _subtract_z_orig(rbd_in, pairs_2d, ghitz_2d)
+        bh_in = _subtract_z_orig_local(bh_in, local_blocks, local_hit_z)
+        # Avoid 8 full [ep, t_local * topk] reductions to recover rbd_in: each
+        # selected rank r moves all rows_by_dest[r, hot_global] rows onto slot_z.
+        z_take_mask_rbd = (
+            take_rc.astype(jnp.int32)[:, :, None]
+            * is_z_hot[None, :, :].astype(jnp.int32)
+        ).reshape(ep, e_total)
+        rbd_in = rows_by_dest - rows_by_dest * z_take_mask_rbd
 
     bh_sp = _count_split_hist(local_blocks, local_hits, local_par)
     rbd_sp = _count_split_hist(pairs_2d, ghits_2d, gpar_2d)
     bh_parts = [_swap_rem_4d(bh_in), bh_sp]
     rbd_parts = [_swap_rem_4d(rbd_in), rbd_sp]
     if z_clone:
+        assert ghitz_2d is not None
         bh_parts.append(_count_z_hist(local_blocks, local_hit_z, local_par))
         rbd_parts.append(_count_z_hist(pairs_2d, ghitz_2d, gpar_2d))
     new_bh = jnp.concatenate(bh_parts, axis=3).reshape(block_hist.shape[0], e_plan)

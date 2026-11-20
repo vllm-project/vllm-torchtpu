@@ -146,8 +146,10 @@ def test_should_offload_only_remote_host_tokens_to_z_partner_when_expert_hot():
     e_total = ep * g_local
     rng = np.random.default_rng(11)
     ids = rng.integers(0, e_total, size=(ep * t_local, topk), dtype=np.int32)
-    # Force chip 0 physical expert 3 to own nearly every token on both hosts.
+    # Force chip 0 physical expert 3 to own every col-0 token on both hosts, plus
+    # local-host load on chip 0 expert 1 so full 8-rank remote offload is optimal.
     ids[:, 0] = 3
+    ids[: (ep // 2) * t_local, 1] = 1
     pairs_g, rbd, t_local, topk, n_blocks = _build_routing_inputs(
         ids, ep=ep, e_total=e_total
     )
@@ -210,13 +212,13 @@ def test_should_support_bidirectional_z_clone_and_zero_local_host_tokens():
     rng = np.random.default_rng(12)
     ids = rng.integers(0, e_total, size=(ep * t_local, topk), dtype=np.int32)
     # Chip 0 expert 2 has ZERO Host-0 tokens and 100% Host-1 tokens (tests
-    # _subtract_z_orig when owner chip has zero local tokens to split).
+    # _subtract_z_orig_local when owner chip has zero local tokens to split).
     ids[: (ep // 2) * t_local, :] = np.where(
         ids[: (ep // 2) * t_local, :] == 2, 10, ids[: (ep // 2) * t_local, :]
     )
     ids[(ep // 2) * t_local :, 0] = 2
     # Simultaneously chip 4 (Z-partner of chip 0) expert 35 (chip 4 phys 3) is
-    # hot across both hosts -> bidirectional Z-clone on the same Z-link.
+    # hot across both hosts -> tests z_waterfill=False bidirectional safety.
     ids[:, 1] = 4 * (2 * g_local) + 3
     pairs_g, rbd, t_local, topk, n_blocks = _build_routing_inputs(
         ids, ep=ep, e_total=e_total
@@ -248,6 +250,7 @@ def test_should_support_bidirectional_z_clone_and_zero_local_host_tokens():
                 z_clone=True,
                 z_min_total=128,
                 z_min_remote=64,
+                z_waterfill=False,
             )
         )
         zp = np.asarray(z_push)
@@ -262,6 +265,181 @@ def test_should_support_bidirectional_z_clone_and_zero_local_host_tokens():
             np.asarray(new_rbd),
             e_plan=e_plan,
         )
+
+
+@pytest.mark.parametrize(
+    ("partner_rows", "expected_chip0_push"),
+    [
+        (512, -1),
+        (97, -1),
+        (96, 2),
+    ],
+)
+def test_should_gate_z_push_on_partner_load_gap_boundary(
+    partner_rows: int,
+    expected_chip0_push: int,
+):
+    ep, g_local, k_split, topk, t_local = 16, 4, 2, 2, 32
+    e_total = ep * g_local
+    rng = np.random.default_rng(21)
+    ids = rng.integers(8, 24, size=(ep * t_local, topk), dtype=np.int32)
+    ids[: 2 * t_local, 0] = 2
+    ids[8 * t_local : 13 * t_local, 0] = 2
+    partner_exp = 4 * (2 * g_local) + 3
+    if partner_rows == 512:
+        ids[:, 1] = partner_exp
+    else:
+        ids[8 * t_local : 8 * t_local + partner_rows, 1] = partner_exp
+    pairs_g, rbd, t_local, topk, n_blocks = _build_routing_inputs(
+        ids, ep=ep, e_total=e_total
+    )
+    g_plan = g_local + k_split + 1
+    e_plan = ep * g_plan
+
+    for me_val in (0, 8, 12):
+        local_blocks = pairs_g[me_val].reshape(n_blocks, -1)
+        block_hist = jnp.stack(
+            [jnp.bincount(local_blocks[b], length=e_total) for b in range(n_blocks)],
+            axis=0,
+        ).astype(jnp.int32)
+        new_pairs, new_local, new_bh, new_rbd, _tp_phys, z_push = (
+            rebalance_ep_tp_pair_experts(
+                pairs_g,
+                local_blocks,
+                block_hist,
+                rbd,
+                ep=ep,
+                ep_tp_size=2,
+                g_local=g_local,
+                e_total=e_total,
+                k_split=k_split,
+                capacity=16,
+                me=jnp.int32(me_val),
+                t_local=t_local,
+                topk=topk,
+                z_clone=True,
+                z_min_total=128,
+                z_min_remote=64,
+            )
+        )
+        zp = np.asarray(z_push)
+        assert zp[0] == expected_chip0_push
+        if partner_rows == 512:
+            assert zp[4] == 3
+        _assert_histograms_match_remapped(
+            np.asarray(new_pairs),
+            np.asarray(new_local),
+            np.asarray(new_bh),
+            np.asarray(new_rbd),
+            e_plan=e_plan,
+        )
+
+
+def test_should_partially_waterfill_remote_ranks_when_hot_tokens_all_remote():
+    ep, g_local, k_split, topk, t_local = 16, 4, 2, 2, 32
+    e_total = ep * g_local
+    rng = np.random.default_rng(22)
+    ids = rng.integers(8, 24, size=(ep * t_local, topk), dtype=np.int32)
+    ids[(ep // 2) * t_local :, 0] = 5
+    pairs_g, rbd, t_local, topk, n_blocks = _build_routing_inputs(
+        ids, ep=ep, e_total=e_total
+    )
+    g_plan = g_local + k_split + 1
+    e_plan = ep * g_plan
+    slot_z = g_plan - 1
+    total_remote = int(rbd[8:, 5].sum())
+
+    for me_val in (0, 8, 11, 15):
+        local_blocks = pairs_g[me_val].reshape(n_blocks, -1)
+        block_hist = jnp.stack(
+            [jnp.bincount(local_blocks[b], length=e_total) for b in range(n_blocks)],
+            axis=0,
+        ).astype(jnp.int32)
+        new_pairs, new_local, new_bh, new_rbd, _tp_phys, z_push = (
+            rebalance_ep_tp_pair_experts(
+                pairs_g,
+                local_blocks,
+                block_hist,
+                rbd,
+                ep=ep,
+                ep_tp_size=2,
+                g_local=g_local,
+                e_total=e_total,
+                k_split=k_split,
+                capacity=16,
+                me=jnp.int32(me_val),
+                t_local=t_local,
+                topk=topk,
+                z_clone=True,
+                z_min_total=64,
+                z_min_remote=32,
+            )
+        )
+        zp = np.asarray(z_push)
+        assert zp[0] == 5
+        assert zp[4] == -1
+        rbd_3d = np.asarray(new_rbd).reshape(ep, ep, g_plan)
+        moved = int(rbd_3d[8:, 8:10, slot_z].sum())
+        kept = int(rbd_3d[:, 0:2, :].sum())
+        assert 64 <= moved < total_remote
+        assert kept + moved == total_remote
+        assert max(kept, moved) < total_remote
+        _assert_histograms_match_remapped(
+            np.asarray(new_pairs),
+            np.asarray(new_local),
+            np.asarray(new_bh),
+            np.asarray(new_rbd),
+            e_plan=e_plan,
+        )
+
+
+@pytest.mark.parametrize("ep", [12, 32])
+def test_should_conserve_waterfill_histograms_for_non_pow2_and_wide_ep(ep: int):
+    g_local, k_split, topk, t_local = 4, 2, 2, 16
+    e_total = ep * g_local
+    rng = np.random.default_rng(30 + ep)
+    ids = rng.integers(8, 24, size=(ep * t_local, topk), dtype=np.int32)
+    ids[(ep // 2) * t_local :, 0] = 3
+    pairs_g, rbd, t_local, topk, n_blocks = _build_routing_inputs(
+        ids, ep=ep, e_total=e_total
+    )
+    g_plan = g_local + k_split + 1
+    e_plan = ep * g_plan
+    me_val = ep // 2
+    local_blocks = pairs_g[me_val].reshape(n_blocks, -1)
+    block_hist = jnp.stack(
+        [jnp.bincount(local_blocks[b], length=e_total) for b in range(n_blocks)],
+        axis=0,
+    ).astype(jnp.int32)
+
+    new_pairs, new_local, new_bh, new_rbd, _tp_phys, z_push = (
+        rebalance_ep_tp_pair_experts(
+            pairs_g,
+            local_blocks,
+            block_hist,
+            rbd,
+            ep=ep,
+            ep_tp_size=2,
+            g_local=g_local,
+            e_total=e_total,
+            k_split=k_split,
+            capacity=8,
+            me=jnp.int32(me_val),
+            t_local=t_local,
+            topk=topk,
+            z_clone=True,
+            z_min_total=32,
+            z_min_remote=16,
+        )
+    )
+    assert int(np.asarray(z_push)[0]) == 3
+    _assert_histograms_match_remapped(
+        np.asarray(new_pairs),
+        np.asarray(new_local),
+        np.asarray(new_bh),
+        np.asarray(new_rbd),
+        e_plan=e_plan,
+    )
 
 
 @pytest.mark.parametrize("k_split", [0, 2])
