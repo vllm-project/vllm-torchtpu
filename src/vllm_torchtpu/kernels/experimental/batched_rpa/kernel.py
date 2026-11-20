@@ -380,12 +380,17 @@ def _all_items_unmasked(
     True when, for every item, the whole KV block holds valid tokens and its
     last token precedes the item's first query, so the causal mask keeps every
     score. None when the configuration always masks (decode, sliding window,
-    a restricted attention scope).
+    a restricted attention scope) or the call is too short to repay the branch.
     """
+    # The unmasked body costs ~5 us per call (v7x) and saves ~0.6 us per full
+    # step; a fresh prefill of n q blocks has ~n^2/4 full steps, so it pays from
+    # n ~ 7. Shorter calls keep the single masked body.
+    min_q_tokens = 8 * cfgs.bq_sz
     if (
         cfgs.mode != configs.RpaCase.MIXED
         or cfgs.model.sliding_window is not None
         or cfgs.serve.attention_scope != configs.AttentionScope.FULL
+        or cfgs.serve.total_q_tokens < min_q_tokens
     ):
         return None
     full = None
