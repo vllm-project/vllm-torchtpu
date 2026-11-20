@@ -163,6 +163,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK: int = 0
     VLLM_TPU_QSA_PREFILL_INDEXER_BQ: int = 128
     VLLM_TPU_QSA_PREFILL_INDEXER_BKV: int = 256
+    VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND: bool = False
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
     VLLM_TPU_QSA_RING_SELECT: bool = False
@@ -841,6 +842,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TPU_QSA_PREFILL_INDEXER_BKV": env_nonnegative_int(
         "VLLM_TPU_QSA_PREFILL_INDEXER_BKV", 256
+    ),
+    # q38 PSTEP-IDX: the ragged prefill indexer without its early-exit lax.cond.
+    # The scoring path always runs and the fast-path rows (every sequence
+    # within the top-k budget) are taken by a select on the cond's predicate,
+    # so the selection is the cond's bit for bit; the scoring kernels and the
+    # SparseCore top-k then sit in the layer's computation, where XLA can run
+    # the layer's selection-independent ops beside the SparseCore waits.
+    # Sharded / DCP indexers keep their own path. Default off.
+    "VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND": env_bool(
+        "VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND", default=False
     ),
     # Compressed keys per KV block of the shared-stream pass above (a multiple
     # of 128). Only read when VLLM_TPU_QSA_DECODE_QUERY_BLOCK > 0.

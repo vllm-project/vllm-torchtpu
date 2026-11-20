@@ -1225,6 +1225,26 @@ def prefill_indexer_chunk(tokens: int) -> int | None:
 PREFILL_PAGE_TABLE_SMEM_BYTES = 512 * 1024
 
 
+# q38 PSTEP-IDX: (tokens, chunk, engaged) already logged by _log_prefill_no_cond in this process.
+_Q38_PREFILL_NO_COND_LOGGED: set = set()
+
+
+def _log_prefill_no_cond(tokens: int, chunk: int | None, engaged: bool) -> None:
+    """q38 PSTEP-IDX engagement line (rule 13): one INFO line per traced ragged prefill indexer shape and process
+    when VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND is set. 'ENGAGED' = the early-exit cond is replaced by a select;
+    'NOT ENGAGED' = a sharded / DCP indexer keeps its own path. Trace time only (a compile-cache hit prints nothing)."""
+    key = (tokens, chunk, engaged)
+    if key in _Q38_PREFILL_NO_COND_LOGGED:
+        return
+    _Q38_PREFILL_NO_COND_LOGGED.add(key)
+    from vllm_torchtpu.logger import init_logger
+
+    init_logger(__name__).info(
+        "q38 PSTEP-IDX prefill indexer no-cond %s: tokens %d, chunk %s (VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND)",
+        "ENGAGED" if engaged else "NOT ENGAGED", tokens, chunk,
+    )
+
+
 def _traced_inline(fn):
     """``fn`` without its ``jax.jit`` wrapper, so it traces into the caller's
     computation (a stand-in that is not jitted is returned as is)."""
@@ -1434,6 +1454,14 @@ def _select_blocks(
             expansion = _compressed_expansion(logical_pages, physical_pages, slot)
         else:
             pages = expand_pages(table).reshape(len(table), -1)
+        # q38 PSTEP-IDX (VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND): the same
+        # result as the early-exit cond, taken by a select, so XLA can run the
+        # layer's selection-independent ops beside the SparseCore top-k.
+        no_cond = (
+            envs.VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND and shard is None and dcp is None
+        )
+        if envs.VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND:
+            _log_prefill_no_cond(len(query), chunk_tokens, no_cond)
         return topk(
             jnp.pad(query, ((0, 0), (0, 0), (0, width - query.shape[-1]))),
             jnp.full(query.shape[:2], query.shape[-1] ** -0.5, jnp.float32),
@@ -1447,7 +1475,8 @@ def _select_blocks(
             num_kv_pages_per_block=(envs.VLLM_TPU_QSA_PREFILL_INDEXER_BKV // rows,) * 3,
             num_queries_per_block=(1,) + (envs.VLLM_TPU_QSA_PREFILL_INDEXER_BQ,) * 2,
             decode_req_batch_size=8,
-            enable_early_exit=True,
+            enable_early_exit=not no_cond,
+            **({"early_exit_select": True} if no_cond else {}),
             chunk_tokens=chunk_tokens,
             components=qsa_indexing(ratio - 1, table_expansion=expansion),
             # VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: as the decode flag, for

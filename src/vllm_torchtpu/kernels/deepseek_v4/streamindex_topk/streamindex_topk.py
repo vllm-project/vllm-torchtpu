@@ -1314,6 +1314,7 @@ def _effective_row_lengths(
         "score_scheduling_group_id",
         "topk_scheduling_group_id",
         "score_sublane_align",
+        "early_exit_select",
     ),
 )
 def streamindex_topk(
@@ -1350,8 +1351,17 @@ def streamindex_topk(
     topk_scheduling_group_id: int | None = None,
     carry: Any = None,
     score_sublane_align: int = 1,
+    early_exit_select: bool = False,
 ) -> Any:
     """StreamIndex Top-K retrieval.
+
+    ``early_exit_select`` (q38 PSTEP-IDX, VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND;
+    needs ``enable_early_exit=False``): the result ``enable_early_exit=True``
+    gives, without its ``lax.cond``. The scoring path always runs and the
+    fast-path rows are taken by a select on the same predicate, so the output
+    is the cond's bit for bit, while the scoring kernels and the SparseCore
+    top-k sit in the caller's computation, where XLA can schedule the caller's
+    independent ops beside them.
 
     ``score_sublane_align`` rounds each token's score row up to a multiple of
     that many 128-lane sublanes (8 for int32 tiles), so the flat view the
@@ -1477,6 +1487,13 @@ def streamindex_topk(
     if enable_early_exit and return_scores:
         raise NotImplementedError(
             "return_scores is not supported with enable_early_exit."
+        )
+    if early_exit_select and (
+        enable_early_exit or return_scores or carry is not None or cp_size > 1
+    ):
+        raise ValueError(
+            "early_exit_select replaces enable_early_exit's cond: it needs "
+            "enable_early_exit=False, no return_scores, no carry and cp_size 1."
         )
     interleave_c = interleave_size // compression_ratio if cp_size > 1 else 1
 
@@ -1990,6 +2007,14 @@ def streamindex_topk(
         s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
         return jnp.where(s_idx <= max_valid_idx[:, None], s_idx, -1)
 
+    if early_exit_select:
+        # The cond below, as a select: both results are int32 [T, k], and the
+        # predicate is the cond's own.
+        return jnp.where(
+            jnp.max(seq_lens) // compression_ratio <= k,
+            _fast_path(None),
+            _common_path(None),
+        )
     if not enable_early_exit:
         result = _common_path(None)
         return result if carry is None else (result, carried[0])
