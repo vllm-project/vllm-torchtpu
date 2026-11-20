@@ -60,12 +60,13 @@ def select_tile(rows: int, cols: int) -> int:
     """Select a VMEM BlockSpec tile cap for [rows, cols] gate + quant: a
     multiple of 32, or ``rows`` for a step that runs as one block.
 
-    For decode/verify batch sizes (rows <= 256), caps tile so grid >= 6 and
-    double-buffered VMEM DMAs overlap with compute; wider than 2048 columns
-    such a step runs as one block where it fits the VMEM budget (see below).
-    For large prefill shapes (rows > 256), uses a larger VMEM block (up to
-    512 rows) while the kernel processes VREG-sized sub-tiles internally,
-    avoiding large Pallas grid overhead at T=8192 without spilling VREGs.
+    Up to 2048 columns a decode/verify step (rows <= 256) caps the tile near
+    rows / 6 (at least 32 rows) so double-buffered VMEM DMAs overlap with
+    compute; wider, such a step runs as one block where it fits the VMEM
+    budget (see below). For large prefill shapes (rows > 256), uses a larger
+    VMEM block (up to 512 rows) while the kernel processes VREG-sized
+    sub-tiles internally, avoiding large Pallas grid overhead at T=8192
+    without spilling VREGs.
     """
     vreg_cap = select_vreg_step(cols)
     budget_cap = max(
