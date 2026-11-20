@@ -488,12 +488,10 @@ class PrefixAwareScheduler(AsyncScheduler):
 
     # Decode admission throttle (option tpu_scheduler.decode_inflight_throttle,
     # on a KV consumer with DCP > 1): refuse a new remote load while this many
-    # loads are in flight, or while running plus in-flight requests reach
-    # max_num_seqs plus the overprovision; otherwise reserve max(the reserved
-    # blocks, the per-sequence blocks x (running + in flight)). Every decode
-    # leg of the validation entries with DCP 4 runs these values.
+    # loads are in flight; otherwise reserve max(the reserved blocks, the
+    # per-sequence blocks x (running + in flight)). Every decode leg of the
+    # validation entries with DCP 4 runs these values.
     _DECODE_MAX_INFLIGHT_LOADS = 16
-    _DECODE_INFLIGHT_OVERPROVISION = 32
     _DECODE_RESERVED_BLOCKS = 128
     _DECODE_RESERVED_BLOCKS_PER_SEQ = 8
 
@@ -506,10 +504,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             return base
         num_inflight = len(self._inflight_prefills)
         num_running = len(self.running)
-        if num_inflight >= self._DECODE_MAX_INFLIGHT_LOADS or (
-            num_running + num_inflight
-            >= self.max_num_running_reqs + self._DECODE_INFLIGHT_OVERPROVISION
-        ):
+        if num_inflight >= self._DECODE_MAX_INFLIGHT_LOADS:
             return 1 << 30
         min_reserved = self._DECODE_RESERVED_BLOCKS
         per_seq_reserved = self._DECODE_RESERVED_BLOCKS_PER_SEQ
