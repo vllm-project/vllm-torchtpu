@@ -177,6 +177,51 @@ identical. µs per step:
   rows swing by ~2 µs. A single run resolves about ±25%. Rows below 1.2× are
   not distinguishable from 1.0× without repeats.
 
+### TPU 8i (XManager `xid/1000000001543729`, `sunfish_sampling=4x1x1`)
+
+Run by the experiment owner through XManager (`tpu-npi-pilot`, `wl-kerneltest`),
+jax 0.12.1, `--xla_tpu_scoped_vmem_limit_kib=190464`, 8 TensorCores on 2 hosts.
+Raw logs are in the owner's x20 folder `Nov19`. Both hosts report the same
+numbers to within ~1%.
+
+**Stage L1, 128 experts EP=8 (16 per TensorCore, ~95 MiB resident), top-8.**
+µs per step, slope over 4 → 16 steps:
+
+| wire | B | resident + AR | streamed + AR | streamed / resident | resident, no AR | streamed, no AR | streamed / resident, no AR |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| bf16 | 1 | 8.36 | 10.69 | 1.28× | 0.75 | 2.31 | 3.09× |
+| bf16 | 4 | 10.29 | 16.02 | 1.56× | 2.96 | 7.43 | 2.51× |
+| bf16 | 16 | 16.58 | 28.65 | 1.73× | 9.02 | 19.89 | 2.20× |
+| bf16 | 64 | 28.02 | 43.22 | 1.54× | 13.93 | 29.51 | 2.12× |
+| f32 | 16 | 18.08 | 30.69 | 1.70× | 9.33 | 19.58 | 2.10× |
+| f32 | 64 | 35.96 | 51.32 | 1.43× | 13.79 | 29.72 | 2.15× |
+
+* The whole MoE block is 1.54-1.73× faster resident at B ≥ 4. The bf16
+  all-reduce costs ~7.5 µs at B = 16 and ~14 µs at B = 64, about half of
+  v7x's 16-TensorCore cost (3 rounds instead of 4).
+* Against v7x on the same 128-expert block (`vmempin-pt-v7x8-*`, 8 chips):
+  at B = 64 resident + AR, TPU 8i is 28.0 µs on 4 chips against 41.4 µs on
+  8 chips. That is 571 k against 193 k tokens/s per chip, and ~2.5× per chip
+  at B = 16.
+
+**Single TensorCore, top-1, 64 rows, median of 6.**
+
+| local experts | B=1 | B=4 | B=16 | B=64 | resident µs/item | streamed µs/item |
+| --- | --- | --- | --- | --- | --- | --- |
+| 16 (~96 MiB) | 1.44× | 1.39× | 1.45× | 1.41× | 1.31-1.63 | 1.90-2.34 |
+| 8 | 1.84× | 1.63× | 1.40× | 1.47× | 1.34-1.64 | 1.90-3.01 |
+| 4 | 1.64× | 1.45× | 1.50× | 1.16× | 1.28-1.62 | 1.85-2.17 |
+
+* Below the modelled 2.29×. Streamed runs at ~1.9 µs per expert, ~72% of its
+  1.38 µs HBM floor. Resident runs at ~1.3 µs per expert, only ~45% of its
+  0.605 µs push floor, and about the same per-expert time as on v7x. So the
+  resident arm is bound by chip-independent per-item work, not by the MXU
+  weight push. In `expert_ffn`, the step input is re-quantized (abs-max,
+  divide, fp8 cast over `[rows, 2816]`) for every expert item although it is
+  the same within a step. The single-TensorCore benchmark also always
+  processes 64 rows. Hoisting the input quantization out of the expert loop
+  and sizing rows to B is the next change.
+
 ## Running
 
 ```bash
