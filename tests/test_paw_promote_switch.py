@@ -58,19 +58,25 @@ def test_schedule_promotes_only_when_on(monkeypatch, on):
 
 
 @pytest.mark.parametrize("on", [True, False])
-def test_schedule_off_a_decode_leg_promotes_only_when_on(monkeypatch, on):
+@pytest.mark.parametrize("holding", [False, True], ids=["waiting", "kv_holding"])
+def test_schedule_off_a_decode_leg_promotes_only_when_on(monkeypatch, on, holding):
     """Any other engine (no KV transfer, a KV producer, kv_both) promotes the
-    first non-empty waiting queue, and the switch turns that off too."""
+    first non-empty waiting queue, kv_holding_waiting before waiting as vLLM
+    drains them, and the switch turns that off too."""
     promoted = []
     monkeypatch.setattr(AsyncScheduler, "schedule", lambda self, *a, **k: "out")
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
     s._is_kv_consumer = False
     s.waiting = FCFSRequestQueue()
+    s.waiting.append(object())
     s.kv_holding_waiting = FCFSRequestQueue()
+    if holding:
+        s.kv_holding_waiting.append(object())
     s._promote_warmest_switch = on
     s._promote_warmest = promoted.append
     assert s.schedule() == "out"
-    assert promoted == ([s.waiting] if on else [])
+    first = s.kv_holding_waiting if holding else s.waiting
+    assert [q is first for q in promoted] == ([True] if on else [])
 
 
 def test_init_reads_the_option(monkeypatch):

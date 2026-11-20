@@ -64,7 +64,6 @@ def _make_scheduler(
     s.WINDOW = window
     s._is_kv_consumer = False
     s._promote_warmest_switch = True
-    s._promote_warmest_switch = True
     s._paw_n = 0
     s._paw_cold_tokens = 0
     s._paw_prompt_tokens = 0
@@ -461,8 +460,6 @@ def test_local_prefix_hit_forwards_max_cache_hit_length(monkeypatch):
     """vLLM 0.33 passes ``max_cache_hit_length`` (an aux-output connector's
     bound); the override must take it, pass it on, and never reuse a memo
     computed for a different bound."""
-    from vllm.v1.core.sched.scheduler import Scheduler
-
     seen = []
 
     def base_hit(self, request, max_cache_hit_length=None):
