@@ -7166,7 +7166,8 @@ class TPUModelRunner(GPUModelRunner):
                 group_indices,
                 target_logits_indices,
                 bonus_logits_indices,
-                target_logits_indices,
+                # Its own tensor, as in serving: dynamo guards on aliasing.
+                torch.zeros_like(target_logits_indices),
                 recover_u if one_draw else warm_accept_u,
                 self.rejection_sampler.synthetic_conditional_rates,
             )
