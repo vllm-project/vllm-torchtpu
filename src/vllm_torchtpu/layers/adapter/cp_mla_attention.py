@@ -33,6 +33,7 @@ Each DCP rank stores a shard of the KV cache, so it can only produce a
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import jax
@@ -245,10 +246,214 @@ def merge_lse_partials_scatter_heads_vspace(
     narrow = envs.TPU_DCP_RS_OUT_PRECISION
     rs_dtype = (wire_dtype or output.dtype) if narrow else None
     chunks = _merge_chunks(output.shape[0])
+    tokens, heads, latent = output.shape
+    if output.dtype == torch.bfloat16 and lse_rs_applies(
+        tokens, chunks, heads, latent, w_uv.shape[-1], w_uv.element_size()
+    ):
+        return _retain_rank(_merge_lse_rs(output, lse, w_uv, w_uv_scale, chunks))
     merged = _merge_chunked(
         output, lse, group, chunks, rs_dtype=rs_dtype, vspace=(w_uv, w_uv_scale)
     )
     return _retain_rank(merged)
+
+
+# The log-sum-exp reduce-scatter ops over the DCP mesh (TPU_DCP_MERGE_LSE_RS),
+# keyed by whether W_UV has a scale; built at model build
+# (`prebuild_lse_reduce_scatter`), never inside a trace. Empty when the switch
+# is off or the mesh is not a 2x2x2 slice of 2-core chips.
+_LSE_RS_OPS: dict = {}
+_LSE_RS_WORLD = 0
+# Attention outputs each op takes; a bucket of fewer chunks repeats its last.
+_LSE_RS_O_PARTS = 4
+
+
+def lse_rs_applies(
+    num_tokens: int, chunks: int, heads: int, latent: int, vdim: int, w_bytes: int = 1
+) -> bool:
+    """TPU_DCP_MERGE_LSE_RS: whether this V-space bucket's merge runs as one
+    log-sum-exp reduce-scatter call. Fixed at trace time on the static bucket
+    size; only the backbone's buckets reach the V-space merge. The kernel
+    rounds every partial sum to bf16, as the reduce-scatter of
+    TPU_DCP_MERGE_RS_BF16=1 does, so it takes only that merge's place."""
+    from vllm_torchtpu.kernels.experimental import lse_reduce_scatter
+
+    cap = envs.TPU_DCP_MERGE_LSE_RS_MAX_TOKENS
+    if envs.TPU_DCP_MERGE_RS_BF16 != 1:
+        return False
+    if not _LSE_RS_OPS or (cap and num_tokens > cap):
+        return False
+    return (
+        heads % _LSE_RS_WORLD == 0
+        and chunks <= _LSE_RS_O_PARTS
+        and num_tokens % chunks == 0
+        and (num_tokens // chunks) % lse_reduce_scatter.CHUNK_TOKENS == 0
+        and lse_reduce_scatter.chunks_supports(num_tokens, heads, latent, vdim, w_bytes)
+    )
+
+
+def _merge_lse_rs(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    w_uv: torch.Tensor,
+    w_uv_scale: torch.Tensor | None,
+    chunks: int,
+) -> torch.Tensor:
+    """`merge_lse_partials_scatter_heads_vspace` by the log-sum-exp
+    reduce-scatter: it projects this rank's partial `[T, H, C]` through W_UV
+    for every head, unweighted, and merges the ranks' projections by their
+    log-sum-exps on the way. Takes the attention calls' `chunks` outputs as
+    separate operands. Returns `[T, H / world, V]` in `output.dtype`."""
+    heads, vdim = output.shape[1], w_uv.shape[-1]
+    span = output.shape[0] // chunks
+    parts = [output[c * span : (c + 1) * span] for c in range(chunks)]
+    parts += parts[-1:] * (_LSE_RS_O_PARTS - chunks)
+    args = (*parts, w_uv)
+    if w_uv_scale is not None:
+        scale = w_uv_scale.to(torch.float32).reshape(heads, -1).expand(heads, vdim)
+        args += (scale.contiguous(),)
+    op = _LSE_RS_OPS[w_uv_scale is not None]
+    merged = op(*args, lse.to(torch.float32).contiguous(), _DCP_RANK)
+    return merged.transpose(0, 1).to(output.dtype)
+
+
+def prebuild_lse_reduce_scatter(world: int) -> None:
+    """Build (register) the log-sum-exp reduce-scatter ops for a DCP group of
+    `world` ranks at model build, not inside a trace (TPU_DCP_MERGE_LSE_RS).
+    Collective: every rank reports its chip place. Leaves them unbuilt, with
+    the reason logged, when the DCP mesh is not a 2x2x2 slice of 2-core chips
+    with one lane."""
+    global _DCP_RANK, _LSE_RS_WORLD
+    if _LSE_RS_WORLD:
+        return
+    _LSE_RS_WORLD = world
+    from vllm_torchtpu.distributed.dcp import (
+        DCP_LANE_AXIS_NAME,
+        dcp_rank_operand,
+        get_or_create_dcp_mesh,
+    )
+    from vllm_torchtpu.kernels.experimental import rotated_collectives
+    from vllm_torchtpu.logger import init_logger
+
+    logger = init_logger(__name__)
+    mesh = get_or_create_dcp_mesh()
+    try:
+        places = _dcp_chip_places(mesh)
+        rotated_collectives.Layout(places)
+        if mesh.shape.get(DCP_LANE_AXIS_NAME, 1) != 1:
+            raise ValueError(f"the DCP mesh {dict(mesh.shape)} has more than one lane")
+    except (RuntimeError, ValueError) as e:
+        logger.warning("TPU_DCP_MERGE_LSE_RS: %s; the lse all-gather merge", e)
+        return
+    _DCP_RANK = dcp_rank_operand(torch.device("tpu"))
+    for scaled in (False, True):
+        _LSE_RS_OPS[scaled] = _build_lse_reduce_scatter(world, mesh, places, scaled)
+    logger.info(
+        "TPU_DCP_MERGE_LSE_RS: the V-space merge reduce-scatters with log-sum-exps "
+        "as rotated halving-doubling over %s",
+        places,
+    )
+
+
+def _dcp_chip_places(mesh) -> list:
+    """(chip coords, core on chip) per DCP rank, checked against the mesh's
+    devices in DCP order. Collective over the DCP group."""
+    import torch.distributed as dist
+
+    group = get_dcp_group()
+    assert group is not None
+    device = jax.local_devices()[0]
+    mine = dict(
+        rank=int(group.rank_in_group),
+        id=int(device.id),
+        coords=tuple(getattr(device, "coords", None) or ()),
+        core=getattr(device, "core_on_chip", None),
+    )
+    seen: list[Any] = [None] * int(group.world_size)
+    dist.all_gather_object(seen, mine, group=group.cpu_group)
+    seen = sorted(seen, key=lambda s: s["rank"])
+    ids = [int(d.id) for d in mesh.devices.reshape(-1)]
+    if [s["id"] for s in seen] != ids:
+        raise RuntimeError(
+            f"the DCP ranks' devices {seen} are not the DCP mesh's devices {ids}"
+        )
+    return [(s["coords"], s["core"]) for s in seen]
+
+
+def _o_parts_signature(rest: tuple[str, ...], annotation) -> inspect.Signature:
+    """The fixed signature (o0, ..., o3, *rest) of the op, every parameter
+    and the result of type `annotation`: a torch custom op takes no varargs."""
+    names = [f"o{a}" for a in range(_LSE_RS_O_PARTS)] + list(rest)
+    params = [
+        inspect.Parameter(
+            n, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=annotation
+        )
+        for n in names
+    ]
+    return inspect.Signature(params, return_annotation=annotation)
+
+
+def _build_lse_reduce_scatter(world: int, mesh, places, scaled: bool):
+    import numpy as np
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME
+    from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+    from vllm_torchtpu.kernels.experimental import rotated_collectives
+    from vllm_torchtpu.kernels.experimental.lse_reduce_scatter import (
+        lse_matmul_reduce_scatter_chunks,
+    )
+
+    o_parts = _LSE_RS_O_PARTS
+    table = np.asarray(rotated_collectives.peer_table(places, "reduce_scatter"))
+    other_ids = {a: 0 for a in mesh.axis_names if a != DCP_AXIS_NAME}
+    spec = P(DCP_AXIS_NAME)
+    weight_specs = (P(), P()) if scaled else (P(),)
+    specs = (spec,) * o_parts + weight_specs + (spec, spec)
+    rest = ("w", "scale", "lse", "rank") if scaled else ("w", "lse", "rank")
+
+    def body(*args):
+        o, (w, *rest_) = args[:o_parts], args[o_parts:]
+        scale, lse, rank = rest_ if scaled else (None, *rest_)
+        return lse_matmul_reduce_scatter_chunks(
+            o,
+            w,
+            scale,
+            lse,
+            rank,
+            jnp.asarray(table),
+            axis=DCP_AXIS_NAME,
+            other_ids=other_ids,
+        )
+
+    sharded = jax.shard_map(
+        body, mesh=mesh, in_specs=specs, out_specs=spec, check_vma=False
+    )
+
+    def fn(*args):
+        return sharded(*args)
+
+    def fake(*args):
+        o, w, lse = args[0], args[o_parts], args[-2]
+        return o.new_empty(
+            (o.shape[1] // _LSE_RS_WORLD, lse.shape[0], w.shape[-1]),
+            dtype=torch.bfloat16,
+        )
+
+    # The op registry types the torch schema from the signature, and a
+    # ``*args`` one carries no operand count.
+    # pyrefly: ignore[missing-attribute]
+    fn.__signature__ = _o_parts_signature(rest, jax.Array)
+    # pyrefly: ignore[missing-attribute]
+    fake.__signature__ = _o_parts_signature(rest, torch.Tensor)
+    variant = "scaled" if scaled else "plain"
+    return sharded_jax_op(
+        f"pallas::dcp_lse_matmul_reduce_scatter_{world}_{variant}_chunks",
+        fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=spec,
+        fake=fake,
+    )
 
 
 def _merge_chunks(num_tokens: int) -> int:

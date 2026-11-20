@@ -2148,6 +2148,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     "let a contiguous run of winners land on fewer ranks."
                 )
             self._dcp_mesh = get_or_create_dcp_mesh()
+            if envs.TPU_DCP_MERGE_LSE_RS and envs.TPU_DCP_MERGE_VSPACE_FUSED:
+                _cp_mla_attention.prebuild_lse_reduce_scatter(self.dcp_size)
             if envs.TPU_DCP_LSE_MERGE_A2A_REAL_ROWS:
                 # Register the merge's ragged exchange op before any trace.
                 _cp_mla_attention.prebuild_ragged_all_to_all(self.dcp_size)

@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_VSPACE_FUSED: bool = False
     TPU_DCP_MERGE_LSE_ROW_PAIRS: bool = False
+    TPU_DCP_MERGE_LSE_RS: bool = False
+    TPU_DCP_MERGE_LSE_RS_MAX_TOKENS: int = 2048
     TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
     TPU_DCP_MLA_TOKEN_SPLIT: bool = False
     TPU_DCP_MLA_TOKEN_SPLIT_MIN_TOKENS: int = 1024
@@ -934,6 +936,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_DCP_MERGE_VSPACE_FUSED is on, once a serving run shows it no slower
     # at every prefill size.
     "TPU_DCP_MERGE_LSE_ROW_PAIRS": env_bool("TPU_DCP_MERGE_LSE_ROW_PAIRS"),
+    # With TPU_DCP_MERGE_VSPACE_FUSED on a 2x2x2 slice of 2-core chips: the
+    # V-space merge projects every head's unweighted partial through W_UV and
+    # sends it with its log-sum-exps through one rotated halving-doubling
+    # reduce-scatter that merges them on the way
+    # (kernels/experimental/lse_reduce_scatter.py), so the lse all-gather
+    # before the merge goes away.
+    "TPU_DCP_MERGE_LSE_RS": env_bool("TPU_DCP_MERGE_LSE_RS"),
+    # With TPU_DCP_MERGE_LSE_RS: only buckets of at most this many tokens take
+    # it; 0 = no cap.
+    "TPU_DCP_MERGE_LSE_RS_MAX_TOKENS": env_nonnegative_int(
+        "TPU_DCP_MERGE_LSE_RS_MAX_TOKENS", 2048
+    ),
     # Where W_UV is replicated over the DCP group (TPU_DCP_MLA_UV_BEFORE_MERGE),
     # replicate o_proj too, so the backbone buckets that apply W_UV before the
     # merge (TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS) and would reduce-scatter
