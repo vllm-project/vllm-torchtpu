@@ -622,7 +622,6 @@ def inner_kernel(
 
         # Step 3: Output post-processing.
         if not is_first_k_step:
-            acc = jnp.pad(acc, ((cfgs.tiles.tile_m - bucket_m, 0), (0, 0)))
             acc += acc_ref[...]
         acc_m = acc.shape[0]
 
@@ -702,9 +701,9 @@ def inner_kernel(
                 lambda: lax.cond(is_last_k_step, matmul_last, matmul_mid),
             )
         else:
-            # Partial buckets are only correct with a single K step (the first
-            # step finalizes); gmm_v2 rejects buckets with a split K.
-            lax.cond(is_first_k_step, matmul_first_last, matmul_last)
+            # Partial buckets always have a single K step: calculate_tiling keeps
+            # one bucket when K is split, and gmm_v2 rejects such explicit tiles.
+            matmul_first_last()
 
     branches = []
     for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
