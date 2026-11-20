@@ -82,7 +82,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         align_cache_exec,
         bucket_exec_spec,
         explicit_profile_settings,
-        parse_runtime_config,
+        parse_runtime_options,
         resolve_driver_profile,
     )
     from .layout_facts import (
@@ -182,7 +182,7 @@ _LAZY: dict[str, str] = {
     "align_cache_exec": ".exec_policy",
     "bucket_exec_spec": ".exec_policy",
     "explicit_profile_settings": ".exec_policy",
-    "parse_runtime_config": ".exec_policy",
+    "parse_runtime_options": ".exec_policy",
     "resolve_driver_profile": ".exec_policy",
     "PoolLayoutFacts": ".layout_facts",
     "compare_layout_facts": ".layout_facts",
@@ -261,7 +261,7 @@ __all__ = [
     "pack_step_meta",
     "parse_mk_buckets",
     "parse_mk_verify_buckets",
-    "parse_runtime_config",
+    "parse_runtime_options",
     "policy",
     "pool_schedule_info",
     "resolve_driver_profile",

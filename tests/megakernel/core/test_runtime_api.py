@@ -63,7 +63,7 @@ from vllm_torchtpu.megakernel.core.runtime import (
     inspect_batch_shape,
     ir_required_buckets,
     pack_step_meta,
-    parse_runtime_config,
+    parse_runtime_options,
     pool_schedule_info,
     resolve_driver_profile,
     resolve_step_positions,
@@ -128,7 +128,7 @@ def test_runtime_package_ast_and_fresh_import_free_of_vllm_and_torch():
 
 
 def test_runtime_config_and_gpr_bucket_exec_spec():
-    """Test `parse_runtime_config`, `resolve_driver_profile` with `BucketPolicy`,
+    """Test `parse_runtime_options`, `resolve_driver_profile` with `BucketPolicy`,
     and `bucket_exec_spec` GPR rules (bucket parsing and selection:
     `test_bucket_policy.py`)."""
     prof = resolve_driver_profile(
@@ -157,16 +157,16 @@ def test_runtime_config_and_gpr_bucket_exec_spec():
     assert (pol.max_bucket, pol.max_verify_bucket) == (16, 0)
     assert pol.select(5, 1) == 8
 
-    cfg = parse_runtime_config(
+    cfg = parse_runtime_options(
         {
-            "enabled": True,
             "buckets": [4, 8],
             "verify_buckets": [16],
             "fused_pool_io": "auto",
             "pool_gather": True,
+            "mode": None,
         }
     )
-    assert cfg["enabled"] is True
+    assert "enabled" not in cfg and cfg["mode"] == ""
     assert cfg["buckets"] == (4, 8)
     assert cfg["verify_buckets"] == (16,)
     owned = explicit_profile_settings(cfg)
@@ -174,9 +174,14 @@ def test_runtime_config_and_gpr_bucket_exec_spec():
     assert owned["verify_buckets"] == (16,)
     assert owned["fused_pool_io"] == "auto"
     assert owned["pool_gather"] is True
+    # `enabled` and the other runtime keys belong to the adapter's config
+    # parser; a typo or a non-option key raises.
+    for bad in ({"enabled": True}, {"profiel": "default"}, {"ab": True}):
+        with pytest.raises(ValueError, match="unknown runtime option"):
+            parse_runtime_options(bad)
 
-    # BLOCKER 2 regression: Profile with pool_gather=True must normalize
-    # True -> "eligible" via Profile.exec_for and never re-apply raw True on T=1.
+    # A `Profile(pool_gather=True)` normalizes True -> "eligible" via
+    # `Profile.exec_for` and never re-applies a raw True on T=1.
     g = ModelGeometry(
         L=4,
         att_every=4,

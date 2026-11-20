@@ -118,7 +118,7 @@ def parse_options(options: Mapping[str, Any]) -> dict[str, Any]:
             f"Qwen35Program: unknown option {bad[0]!r}; known: {sorted(OPTION_KEYS)}"
         )
     register()  # profile names resolve through the library registry
-    return mk_rt.parse_runtime_config(options)
+    return mk_rt.parse_runtime_options(options)
 
 
 _TORCH_STEP_META_OPS = TorchStepMetaOps()

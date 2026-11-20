@@ -61,7 +61,7 @@ from vllm_torchtpu.megakernel.core.runtime import (
     facts_from_pool_layout,
     ir_required_buckets,
     pack_step_meta,
-    parse_runtime_config,
+    parse_runtime_options,
     resolve_driver_profile,
     resolve_step_positions,
     select_bucket,
@@ -459,33 +459,41 @@ def _make_backbone_from_logical_weights(
 def test_bucket_parsing_and_selection() -> None:
     """Adapter config parsing with the template's profiles, and the adapter's
     options (the bucket-list parsers are tested in `test_bucket_policy.py`)."""
-    # Single VLLM_TPU_MEGAKERNEL string forms + additional_config["megakernel"]
-    assert not parse_runtime_config("")["enabled"]
-    assert not parse_runtime_config("0")["enabled"]
-    cfg_on = parse_runtime_config("1")
-    assert cfg_on["enabled"] and cfg_on["mode"] == ""
-    cfg_tp = parse_runtime_config("tp")
-    assert cfg_tp["enabled"] and cfg_tp["mode"] == "tp"
-    cfg_kv = parse_runtime_config(
-        "mode=tp,buckets=8:16:32,verify_buckets=4:8,ab=1,stats_period_s=12.5,compile_hlo_check=1,fused_pool_io=0,fused_pool_io_max_b=16,fused_pool_io_min_b_hi=64,pool_gather=0"
+    # The template's options as the adapter forwards them (string values from
+    # `k=v` sources, JSON values otherwise); the adapter parses the sources.
+    cfg_def = parse_runtime_options({})
+    assert cfg_def["mode"] == ""
+    assert parse_runtime_options({"mode": "tp"})["mode"] == "tp"
+    cfg_kv = parse_runtime_options(
+        {
+            "mode": "tp",
+            "buckets": "8:16:32",
+            "verify_buckets": "4:8",
+            "compile_hlo_check": "1",
+            "fused_pool_io": "0",
+            "fused_pool_io_max_b": "16",
+            "fused_pool_io_min_b_hi": "64",
+            "pool_gather": "0",
+        }
     )
-    assert cfg_kv["enabled"]
     assert cfg_kv["mode"] == "tp"
     assert cfg_kv["buckets"] == (8, 16, 32)
     assert cfg_kv["verify_buckets"] == (4, 8)
-    assert cfg_kv["ab"] is True
-    assert cfg_kv["stats_period_s"] == pytest.approx(12.5)
     assert cfg_kv["compile_hlo_check"] is True
     assert cfg_kv["fused_pool_io"] is False
     assert cfg_kv["fused_pool_io_max_b"] == 16
     assert cfg_kv["fused_pool_io_min_b_hi"] == 64
     assert cfg_kv["pool_gather"] is False
 
-    cfg_json = parse_runtime_config(
-        '{"mode": "ep", "buckets": [4, 8], "verify_buckets": [4], '
-        '"ab": false, "fused_pool_io": "auto", "pool_gather": true}'
+    cfg_json = parse_runtime_options(
+        {
+            "mode": "ep",
+            "buckets": [4, 8],
+            "verify_buckets": [4],
+            "fused_pool_io": "auto",
+            "pool_gather": True,
+        }
     )
-    assert cfg_json["enabled"]
     assert cfg_json["mode"] == "ep"
     assert cfg_json["buckets"] == (4, 8)
     assert cfg_json["verify_buckets"] == (4,)
@@ -494,27 +502,26 @@ def test_bucket_parsing_and_selection() -> None:
 
     # No named profile: the driver runs the model's default profile; the
     # profile-owned keys keep their split pool I/O defaults.
-    cfg_def = parse_runtime_config("1")
     assert cfg_def["profile"] is None
     assert cfg_def["fused_pool_io"] is False
     assert cfg_def["pool_gather"] is False
     # An empty value means "off", not "auto"
-    cfg_empty = parse_runtime_config("fused_pool_io=,pool_gather=")
+    cfg_empty = parse_runtime_options({"fused_pool_io": "", "pool_gather": ""})
     assert cfg_empty["fused_pool_io"] is False
     assert cfg_empty["pool_gather"] is False
-    # Named profile selection via VLLM_TPU_MEGAKERNEL; explicit keys win
-    cfg_c30 = parse_runtime_config("profile=qwen35-candidate30")
-    assert cfg_c30["enabled"] and cfg_c30["profile"] == "qwen35-candidate30"
+    # Named profile selection; explicit keys win
+    cfg_c30 = parse_runtime_options({"profile": "qwen35-candidate30"})
+    assert cfg_c30["profile"] == "qwen35-candidate30"
     assert cfg_c30["pool_gather"] == "auto"
     assert cfg_c30["fused_pool_io"] is False
     assert cfg_c30["buckets"] == cfg_def["buckets"]
-    cfg_c30_ov = parse_runtime_config(
-        "profile=qwen35-candidate30,pool_gather=0,fused_pool_io=auto"
+    cfg_c30_ov = parse_runtime_options(
+        {"profile": "qwen35-candidate30", "pool_gather": "0", "fused_pool_io": "auto"}
     )
     assert cfg_c30_ov["pool_gather"] is False
     assert cfg_c30_ov["fused_pool_io"] == "auto"
     with pytest.raises(ValueError, match="unknown megakernel profile"):
-        parse_runtime_config("profile=does-not-exist")
+        parse_runtime_options({"profile": "does-not-exist"})
 
     fake_runner = SimpleNamespace(
         vllm_config=SimpleNamespace(
@@ -581,13 +588,17 @@ def test_driver_passes_only_explicit_profile_settings() -> None:
         "fused_pool_io_min_b_hi",
         "pool_gather",
     )
-    for raw in ("1", "profile=qwen35-candidate30"):
-        got = explicit_profile_settings(parse_runtime_config(raw))
-        assert got == dict.fromkeys(owned), raw
+    for opts in ({}, {"profile": "qwen35-candidate30"}):
+        got = explicit_profile_settings(parse_runtime_options(opts))
+        assert got == dict.fromkeys(owned), opts
     got = explicit_profile_settings(
-        parse_runtime_config(
-            "profile=qwen35-candidate30,buckets=8:16,pool_gather=0,"
-            "fused_pool_io_max_b=16"
+        parse_runtime_options(
+            {
+                "profile": "qwen35-candidate30",
+                "buckets": "8:16",
+                "pool_gather": "0",
+                "fused_pool_io_max_b": "16",
+            }
         )
     )
     assert got == {

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The runtime config parser and per-bucket `ExecSpec` setup: profile
+"""The runtime options parser and per-bucket `ExecSpec` setup: profile
 resolution (the profile registry) and the cache-planner decisions per bucket.
 The bucket lists and `BucketPolicy` are in `policy`.
 """
@@ -19,7 +19,6 @@ The bucket lists and `BucketPolicy` are in `policy`.
 from __future__ import annotations
 
 import dataclasses
-import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -50,7 +49,7 @@ def _parse_bool(val: Any) -> bool:
     s = str(val).strip().lower()
     if s in _TRUE_STRS or s in FALSE_STRS:
         return s in _TRUE_STRS
-    raise ValueError(f"MegakernelDriver: invalid boolean value {val!r}")
+    raise ValueError(f"Megakernel: invalid boolean value {val!r}")
 
 
 def _parse_tri_flag(val: Any, *, true_extra: str, name: str) -> bool | str:
@@ -62,7 +61,7 @@ def _parse_tri_flag(val: Any, *, true_extra: str, name: str) -> bool | str:
     if s in (*_TRUE_STRS, true_extra) or s in _SPLIT_STRS:
         return s in (*_TRUE_STRS, true_extra)
     raise ValueError(
-        f"MegakernelDriver: invalid {name}={val!r}; expected 'auto', 'true', or 'false'"
+        f"Megakernel: invalid {name}={val!r}; expected 'auto', 'true', or 'false'"
     )
 
 
@@ -84,7 +83,7 @@ def _apply_profile_defaults(cfg: dict[str, Any], explicit: set[str]) -> None:
     try:
         prof = get_profile(cfg["profile"])
     except KeyError as exc:
-        raise ValueError(f"MegakernelDriver: {exc.args[0]}") from None
+        raise ValueError(f"Megakernel: {exc.args[0]}") from None
     cfg["profile"] = prof.name
     for k in ("fused_pool_io", "fused_pool_io_max_b", "fused_pool_io_min_b_hi"):
         if k not in explicit:
@@ -98,8 +97,20 @@ def _apply_profile_defaults(cfg: dict[str, Any], explicit: set[str]) -> None:
         cfg["verify_buckets"] = parse_mk_verify_buckets(prof.verify_buckets)
 
 
-_DEFAULT_CFG: dict[str, Any] = {
-    "enabled": False,
+RUNTIME_OPTION_KEYS = frozenset(
+    {
+        "profile",
+        "mode",
+        "buckets",
+        "verify_buckets",
+        "fused_pool_io",
+        "fused_pool_io_max_b",
+        "fused_pool_io_min_b_hi",
+        "pool_gather",
+        "compile_hlo_check",
+    }
+)
+_DEFAULT_OPTIONS: dict[str, Any] = {
     "mode": "",
     "profile": None,
     "buckets": DEFAULT_BUCKETS,
@@ -110,75 +121,49 @@ _DEFAULT_CFG: dict[str, Any] = {
     "fused_pool_io_max_b": DEFAULT_FUSED_POOL_IO_MAX_B,
     "fused_pool_io_min_b_hi": DEFAULT_FUSED_POOL_IO_MIN_B_HI,
     "pool_gather": False,
-    "ab": False,
-    "stats_period_s": 60.0,
     "compile_hlo_check": False,
 }
 
 
-def parse_runtime_config(*sources: Any) -> dict[str, Any]:
-    """Parse one or more runtime config sources (str, bool, or mapping) into a dict."""
-    cfg: dict[str, Any] = dict(_DEFAULT_CFG)
+def parse_runtime_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    """Type a program's runtime `options` (`RUNTIME_OPTION_KEYS`; others raise).
+
+    `options` is what the adapter's config parser resolved from
+    `VLLM_TPU_MEGAKERNEL` / `additional_config` (it owns that grammar and
+    `enabled`); this parses each value (bucket lists, `auto` / on / off flags,
+    ints) and fills the named profile's defaults for keys left unset.
+    """
+    if bad := sorted(set(options) - RUNTIME_OPTION_KEYS):
+        raise ValueError(
+            f"Megakernel: unknown runtime option {bad[0]!r}; known: "
+            f"{sorted(RUNTIME_OPTION_KEYS)}"
+        )
+    cfg: dict[str, Any] = dict(_DEFAULT_OPTIONS)
     explicit: set[str] = set()
-
-    def _apply_dict(d: Mapping[str, Any]) -> None:
-        cfg["enabled"] = _parse_bool(d.get("enabled", True))
-        if d.get("profile") is not None:
-            cfg["profile"] = str(d["profile"]).strip() or None
-        if d.get("mode") is not None:
-            m = str(d["mode"]).strip().lower()
-            _need(m in ("", "auto", "ep", "tp"), f"invalid mode={d['mode']!r}")
-            cfg["mode"] = "" if m == "auto" else m
-        if d.get("buckets") is not None:
-            cfg["buckets"] = parse_mk_buckets(d["buckets"])
-            cfg["buckets_explicit"] = True
-        if d.get("verify_buckets") is not None:
-            cfg["verify_buckets"] = parse_mk_verify_buckets(d["verify_buckets"])
-            cfg["verify_buckets_explicit"] = True
-        for k, fn in (
-            ("fused_pool_io", _parse_fused_pool_io),
-            ("pool_gather", _parse_pool_gather),
-            ("fused_pool_io_max_b", int),
-            ("fused_pool_io_min_b_hi", int),
-        ):
-            if d.get(k) is not None:
-                cfg[k], _ = fn(d[k]), explicit.add(k)
-        for k in ("ab", "compile_hlo_check"):
-            if d.get(k) is not None:
-                cfg[k] = _parse_bool(d[k])
-        if d.get("stats_period_s") is not None:
-            cfg["stats_period_s"] = float(d["stats_period_s"])
-
-    for src in sources:
-        if src is None:
-            continue
-        if isinstance(src, bool):
-            cfg["enabled"] = src
-        elif isinstance(src, Mapping):
-            _apply_dict(src)
-        else:
-            s, sl = str(src).strip(), str(src).strip().lower()
-            if sl in FALSE_STRS:
-                cfg["enabled"] = False
-            elif sl in _TRUE_STRS:
-                cfg["enabled"] = True
-            elif sl in ("ep", "tp"):
-                cfg["enabled"], cfg["mode"] = True, sl
-            elif s.startswith("{"):
-                parsed = json.loads(s)
-                _need(isinstance(parsed, dict), f"expected JSON object in {s!r}")
-                _apply_dict(parsed)
-            else:
-                kv_dict: dict[str, Any] = {}
-                for part in (p.strip() for p in s.split(",") if p.strip()):
-                    if "=" not in part:
-                        raise ValueError(
-                            f"Invalid megakernel config entry {part!r} in {s!r}"
-                        )
-                    k, v = part.split("=", 1)
-                    kv_dict[k.strip()] = v.strip()
-                _apply_dict(kv_dict)
-
+    d = {k: v for k, v in options.items() if v is not None}
+    if "profile" in d:
+        cfg["profile"] = str(d["profile"]).strip() or None
+    if "mode" in d:
+        m = str(d["mode"]).strip().lower()
+        _need(m in ("", "auto", "ep", "tp"), f"invalid mode={d['mode']!r}")
+        cfg["mode"] = "" if m == "auto" else m
+    if "buckets" in d:
+        cfg["buckets"] = parse_mk_buckets(d["buckets"])
+        cfg["buckets_explicit"] = True
+    if "verify_buckets" in d:
+        cfg["verify_buckets"] = parse_mk_verify_buckets(d["verify_buckets"])
+        cfg["verify_buckets_explicit"] = True
+    for k, fn in (
+        ("fused_pool_io", _parse_fused_pool_io),
+        ("pool_gather", _parse_pool_gather),
+        ("fused_pool_io_max_b", int),
+        ("fused_pool_io_min_b_hi", int),
+    ):
+        if k in d:
+            cfg[k] = fn(d[k])
+            explicit.add(k)
+    if "compile_hlo_check" in d:
+        cfg["compile_hlo_check"] = _parse_bool(d["compile_hlo_check"])
     _apply_profile_defaults(cfg, explicit)
     cfg["explicit"] = frozenset(explicit)
     return cfg
@@ -215,7 +200,7 @@ def resolve_driver_profile(
     try:
         prof = get_profile(profile) if profile else model_default_profile(model_name)
     except KeyError as exc:
-        raise ValueError(f"MegakernelDriver: {exc.args[0]}") from None
+        raise ValueError(f"Megakernel: {exc.args[0]}") from None
     _need(
         prof.model is None or prof.model == model_name,
         f"profile {prof.name!r} targets model {prof.model!r}, not {model_name!r}",

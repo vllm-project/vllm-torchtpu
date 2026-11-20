@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The adapter config against the library's runtime-config parser, and the
-driver with a missing shorthand template."""
+"""The adapter config's legacy inputs against its documented per-key rule (the
+template settings reach the library's `parse_runtime_options` through
+`options`), and the driver with a missing shorthand template."""
 
 from __future__ import annotations
 
@@ -39,21 +40,6 @@ def _fake_template(mk_fake_template: str) -> None:
 
 
 # --- VLLM_TPU_MEGAKERNEL / additional_config matrix ---------------------------------
-
-_TEMPLATE_KEYS = (
-    "mode",
-    "profile",
-    "buckets",
-    "verify_buckets",
-    "buckets_explicit",
-    "verify_buckets_explicit",
-    "fused_pool_io",
-    "fused_pool_io_max_b",
-    "fused_pool_io_min_b_hi",
-    "pool_gather",
-    "compile_hlo_check",
-    "explicit",
-)
 
 _LEGACY_ENV = (
     None,
@@ -138,26 +124,54 @@ def _enabled_by_rule(*sources: Any) -> bool:
     return configured if explicit is None else explicit
 
 
+def _source_mapping(src: Any) -> dict[str, Any]:
+    """One source's keys: none for an on / off word, `mode` for `ep` / `tp`."""
+    if src is None or isinstance(src, bool):
+        return {}
+    if not isinstance(src, str):
+        return dict(src)
+    s = src.strip()
+    if s.lower() in ("", "0", "false", "no", "off", "none", "1", "true", "yes", "on"):
+        return {}
+    if s.lower() in ("ep", "tp"):
+        return {"mode": s.lower()}
+    if s.startswith("{"):
+        return json.loads(s)
+    return dict(kv.split("=", 1) for kv in s.split(","))
+
+
+def _keys_by_rule(*sources: Any) -> dict[str, Any]:
+    """Every key by the documented rule, independently of the parser: the
+    last source that sets a key wins."""
+    merged: dict[str, Any] = {}
+    for src in sources:
+        merged.update((k, v) for k, v in _source_mapping(src).items() if v is not None)
+    return merged
+
+
 @pytest.mark.usefixtures("_template_profile_names")
 @pytest.mark.parametrize("env", _LEGACY_ENV)
 @pytest.mark.parametrize("add", _LEGACY_ADD)
-def test_legacy_inputs_match_parse_runtime_config(env: Any, add: Any) -> None:
-    """Legacy syntaxes resolve to what `parse_runtime_config` gives: the
-    runtime keys directly, the template settings through `options`. `enabled`
-    follows the adapter's rule instead: an earlier explicit off holds over a
-    later source's settings (`parse_runtime_config` turns such a source on)."""
-    from vllm_torchtpu.megakernel.core.runtime import parse_runtime_config
+def test_legacy_inputs_follow_the_per_key_rule(env: Any, add: Any) -> None:
+    """Legacy syntaxes resolve per key, the later source winning: the runtime
+    keys directly, the template settings into `options` (which the library's
+    `parse_runtime_options` then types). `enabled` follows its own rule: an
+    earlier explicit off holds over a later source's settings."""
+    from vllm_torchtpu.megakernel.core.runtime import parse_runtime_options
 
-    old = parse_runtime_config(env, add)
     new = cfg_mod.parse_config(env, add, raw_env=env)
     assert new.enabled == _enabled_by_rule(env, add)
-    assert new.ab == old["ab"] and new.stats_period_s == old["stats_period_s"]
+    want = _keys_by_rule(env, add)
+    assert new.ab == cfg_mod.parse_bool(want.get("ab", False), key="ab")
+    want_period = float(want.get("stats_period_s", cfg_mod.DEFAULT_STATS_PERIOD_S))
+    assert new.stats_period_s == want_period
     resolved = cfg_mod.resolve_plugin_ref(new, _HF)
     assert resolved is not None
     ref, options = resolved
     assert ref.shorthand == _SHORTHAND
-    tmpl = parse_runtime_config(options)
-    assert {k: tmpl[k] for k in _TEMPLATE_KEYS} == {k: old[k] for k in _TEMPLATE_KEYS}
+    want_opts = {k: v for k, v in want.items() if k not in cfg_mod.RUNTIME_KEYS}
+    assert dict(options) == want_opts
+    assert parse_runtime_options(options) == parse_runtime_options(want_opts)
 
 
 def test_missing_shorthand_template_leaves_the_megakernel_off(
