@@ -69,8 +69,11 @@ def _blocker(head: torch.nn.Module, processors: list) -> str | None:
     if head.weight.dtype != torch.bfloat16:
         return f"the LM head weight is {head.weight.dtype}"
     for p in processors:
-        if p is not None and getattr(p, "head_dtype", None) is not None:
-            return "a logits processor sets head_dtype"
+        # LogitsProcessor._apply_head calls quant_method.apply only when
+        # head_dtype is unset or equals the activation (= weight) dtype.
+        head_dtype = getattr(p, "head_dtype", None) if p is not None else None
+        if head_dtype is not None and head_dtype != torch.bfloat16:
+            return f"a logits processor sets head_dtype {head_dtype}"
     return None
 
 

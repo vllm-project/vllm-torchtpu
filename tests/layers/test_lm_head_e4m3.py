@@ -85,3 +85,9 @@ def test_arm_refuses_head_dtype():
     model = _Model(_Head(_w()))
     model.logits_processor.head_dtype = torch.float32
     assert not lm_head_e4m3.arm(model, None)
+
+
+def test_arm_accepts_bf16_head_dtype():
+    model = _Model(_Head(_w()))
+    model.logits_processor.head_dtype = torch.bfloat16
+    assert lm_head_e4m3.arm(model, None)
