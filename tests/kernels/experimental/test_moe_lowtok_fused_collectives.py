@@ -80,6 +80,21 @@ Q35_OP_CASES = {
 }
 # The row of each engine-0 block whose logits are all -inf.
 PADDED_ROW = 3
+# Junk in each engine's padded row (all -inf logits, so no expert takes it),
+# which the kernel must not mix into the other rows: rows per engine, FP8
+# dispatch, and NaN, +Inf and -Inf across the columns or the largest finite
+# bf16 values.
+JUNK_CASES = {
+    "fp8_32_non_finite": (32, True, "non_finite"),
+    "fp8_32_large_finite": (32, True, "large_finite"),
+    "bf16_32_non_finite": (32, False, "non_finite"),
+    "bf16_32_large_finite": (32, False, "large_finite"),
+}
+# The same at the 397B shapes, in the forms the torch op runs.
+Q35_JUNK_CASES = {
+    "q35_fp8_64_non_finite": (64, True, "non_finite"),
+    "q35_bf16_48_non_finite": (48, False, "non_finite"),
+}
 
 
 def _reference_quantize_rows(v):
@@ -193,8 +208,10 @@ def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
     h = geometry[1]
     experts = P(("dp", "tp"))
 
-    def run(rows, fp8):
+    def run(rows, fp8, edit=None):
         x, logits = inputs(rows)
+        if edit is not None:
+            x, logits = edit(x, logits)
 
         def body(x, logits, w13, w2, s13, s2, start, rank):
             return fc.moe_lowtok_fused(
@@ -229,6 +246,52 @@ def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
         return out.reshape(DP * TP, rows, h), reference(x, logits)
 
     return run
+
+
+def _junk_summary(run, rows, fp8, junk, geometry=(E, H, INTER, TOPK)):
+    """``run`` (a ``_case_runner``) with ``junk`` in every engine's padded
+    row, against the same step with that row as drawn: the bits of every other
+    row, and the padded rows' output."""
+    import jax.numpy as jnp
+    import numpy as np
+
+    h = geometry[1]
+    padded = np.zeros((DP, rows), bool)
+    padded[:, PADDED_ROW] = True
+
+    def masked(x, logits):
+        lg = np.array(logits.astype(jnp.float32))
+        lg[padded.reshape(-1)] = -np.inf
+        return x, jnp.asarray(lg, jnp.bfloat16)
+
+    if junk == "non_finite":
+        row = np.resize([np.nan, np.inf, -np.inf, 1.0], h)
+    else:
+        big = float(jnp.finfo(jnp.bfloat16).max)
+        row = np.resize([big, -big], h)
+
+    def planted(x, logits):
+        x = np.array(x.astype(jnp.float32))
+        x[padded.reshape(-1)] = row
+        return masked(jnp.asarray(x, jnp.bfloat16), logits)
+
+    base, want = run(rows, fp8, masked)
+    got, _ = run(rows, fp8, planted)
+    bits = got.view(np.uint16).reshape(DP, TP, rows, h)
+    base_bits = base.view(np.uint16).reshape(DP, TP, rows, h)
+    engines = np.concatenate([base[TP * d] for d in range(DP)]).astype(np.float64)
+    out = np.concatenate([got[TP * d] for d in range(DP)]).astype(np.float64)
+    kept = ~padded.reshape(-1)
+    return dict(
+        other_rows_identical=all(
+            np.array_equal(bits[d, t][~padded[d]], base_bits[d, t][~padded[d]])
+            for d in range(DP)
+            for t in range(TP)
+        ),
+        nan=int(np.isnan(out[kept]).sum()),
+        padded_rows_zero=bool(np.all(out[~kept] == 0)),
+        base_rel_l2=float(np.linalg.norm(engines - want) / np.linalg.norm(want)),
+    )
 
 
 def _op_runner(mesh, cap, geometry=(E, H, INTER, TOPK), scores_cap=None):
@@ -392,6 +455,13 @@ def _check(case):
     assert case["rel_l2"] <= REL_L2, case
 
 
+def _check_junk(case):
+    assert case["other_rows_identical"], case
+    assert case["nan"] == 0, case
+    assert case["padded_rows_zero"], case
+    assert case["base_rel_l2"] <= REL_L2, case
+
+
 def _check_op(case, fused_kernel, fp8_rows, served_path_has_kernel_roundings=True):
     """The program took the form its row count selects and summed the
     engines' rows: against the float32 reference of the kernel's roundings
@@ -486,6 +556,13 @@ def _worker():
     result["fp8_dispatch_bit_identical"] = bool(
         np.array_equal(bits["served_32"], bits["bf16_dispatch_32"])
     )
+    result["junk_cases"] = {}
+    for name, case in JUNK_CASES.items():
+        pltpu.reset_tpu_interpret_mode_state()
+        result["junk_cases"][name] = _junk_summary(run, *case)
+        result["junk_cases"][name]["races_found"] = bool(
+            interpret_pallas_call.races.races_found
+        )
     # moe_scores_fn's few-token branch serves the gathered rows above the cap:
     # the interpreter cannot run the grouped matmul's DMA pipeline.
     run_op = _op_runner(mesh, OP_CAP, scores_cap=kernel.MOE_LOWTOK_MAX_TOKENS)
@@ -542,6 +619,19 @@ def test_fp8_dispatch_moves_the_same_expert_inputs(on_8_devices):
     """Rows pushed as per-row FP8 give the bytes the bf16 push gives: the
     expert pass quantizes the same rows the same way."""
     assert on_8_devices["fp8_dispatch_bit_identical"]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("name", sorted(JUNK_CASES))
+def test_rows_no_expert_of_a_core_takes_stay_out_of_its_gather(on_8_devices, name):
+    """The routed-row gather is a one-hot matmul over every row, so a NaN or
+    Inf left in a row no expert takes would turn every gathered row into NaN.
+    A padded row is such a row: apply() masks its router logits to -inf and
+    passes its activations on. Junk planted there leaves every other row
+    bit-identical and the padded rows zero."""
+    case = on_8_devices["junk_cases"][name]
+    assert not case["races_found"], case
+    _check_junk(case)
 
 
 @pytest.mark.cpu_test
@@ -695,6 +785,25 @@ def test_compiled_kernel_at_the_qwen3_5_decode_shapes_on_tpu(tpu_mesh, name):
     """The forms the torch op runs, at the Qwen3.5-397B MoE layer's shapes."""
     _, case = _summary(*_case_runner(tpu_mesh, Q35_GEOMETRY)(*Q35_CASES[name]))
     _check(case)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("name", sorted(JUNK_CASES))
+def test_compiled_kernel_keeps_junk_rows_out_of_the_gather_on_tpu(tpu_mesh, name):
+    """The interpret check's junk rows on the compiled kernel (the MXU's
+    one-hot gather)."""
+    _check_junk(_junk_summary(_case_runner(tpu_mesh), *JUNK_CASES[name]))
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("name", sorted(Q35_JUNK_CASES))
+def test_compiled_kernel_keeps_junk_rows_out_of_the_gather_at_the_qwen3_5_shapes_on_tpu(
+    tpu_mesh, name
+):
+    """Junk rows at the Qwen3.5-397B MoE layer's shapes, in the forms the
+    torch op runs."""
+    run = _case_runner(tpu_mesh, Q35_GEOMETRY)
+    _check_junk(_junk_summary(run, *Q35_JUNK_CASES[name], geometry=Q35_GEOMETRY))
 
 
 @pytest.fixture

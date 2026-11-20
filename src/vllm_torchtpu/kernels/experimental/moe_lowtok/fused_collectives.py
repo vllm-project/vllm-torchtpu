@@ -164,7 +164,9 @@ def _stream_ring(
     with more rows), the matmuls run on the block, and a second one-hot matmul
     scatters the f32 contributions back into the accumulator, carried as three
     bf16 pieces so the sum is exact. The row positions come from one prefix-sum
-    matmul over the routing mask per call. `xs_all` holds the per-row scales
+    matmul over the routing mask per call. The gather matmul reduces over every
+    row, so `_gather_prologue` zeroes the rows no expert of the block takes in
+    its operand. `xs_all` holds the per-row scales
     when the rows arrive quantized. `_h_acc` is ring scratch the loop does not
     use; it stays allocated so the kernel's VMEM plan is the one measured.
     """
@@ -330,13 +332,20 @@ def _gather_scratch(sc, rows, hidden, inter):
 
 
 def _gather_prologue(gid_s, wtab_ref, x_all, xs_all, g, rows):
-    """Routing positions, transposed tables and the gather operand, once per call."""
+    """Routing positions, transposed tables and the gather operand, once per call.
+
+    The gather operand is zero in every row no expert of the rank's lane block
+    takes (a padded row, whose router logits are -inf, or a row routed only to
+    other ranks): the gather is a one-hot matmul over all rows, so a NaN or
+    Inf left in such a row would reach every gathered row (0 * NaN is NaN).
+    """
     x_g, w_blk, pos, pos_t, w_t, xs_t, counts_v, counts_s, csem, *_ = g
     g_rows = x_g.shape[0]
     hidden = x_g.shape[1]
     first = gid_s[0, 0]
     blk = pl.multiple_of((first >> 7) << 7, LANE)
     w_rows = wtab_ref[:, pl.ds(blk, LANE)]
+    taken = jnp.sum(jnp.where(w_rows != 0, 1.0, 0.0), axis=1, keepdims=True)
     if g_rows > rows:
         w_rows = jnp.concatenate(
             [w_rows, jnp.zeros((g_rows - rows, LANE), jnp.float32)], axis=0
@@ -361,7 +370,12 @@ def _gather_prologue(gid_s, wtab_ref, x_all, xs_all, g, rows):
     counts_v[...] = jnp.sum(mask, axis=0, keepdims=True).astype(jnp.int32)
     copy = pltpu.make_async_copy(counts_v, counts_s, csem.at[0])
     copy.start()
-    x_g[pl.ds(0, rows), :] = x_all[...].astype(jnp.bfloat16)
+    # Selected in float32, as the kernel's other masks; exact for bf16 rows.
+    x_g[pl.ds(0, rows), :] = jnp.where(
+        jnp.broadcast_to(taken, (rows, hidden)) != 0,
+        x_all[...].astype(jnp.bfloat16).astype(jnp.float32),
+        0.0,
+    ).astype(jnp.bfloat16)
     if xs_all is not None:
         xs_rows = xs_all[...]
         if g_rows > rows:
