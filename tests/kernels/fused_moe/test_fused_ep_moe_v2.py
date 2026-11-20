@@ -712,7 +712,7 @@ def test_scale_slab_lookup_and_scatter_are_bit_exact(
     monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
     # At prefill sizes the run copy builds both tables instead; it is held off
     # so the lookup and the scatter are what is compared.
-    monkeypatch.setattr(layer, "SLAB_RUN_COPY_MIN_TOKENS", 1 << 30)
+    monkeypatch.setattr(layer, "slab_run_copy_pays", lambda *_a, **_k: False)
     mesh = _mesh()
     if shared_weights is not None:
         w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
@@ -790,7 +790,7 @@ def test_token_gather_sort_and_scatter_are_bit_exact(
     the second build would reuse the first one's body and fail here.
     """
     monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
-    monkeypatch.setattr(layer, "SLAB_RUN_COPY_MIN_TOKENS", 1 << 30)
+    monkeypatch.setattr(layer, "slab_run_copy_pays", lambda *_a, **_k: False)
     mesh = _mesh()
     if shared_weights is not None:
         w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
@@ -860,11 +860,11 @@ def test_slab_run_copy_and_sort_lookup_are_bit_exact(
 ):
     """Both slab tables by run copy give the layer the sort + lookup's output.
 
-    The run copy changes the routing payload (expert-sorted token numbers and
-    a scale per pair) and builds both tables from it; the tables differ from
-    the lookup's only on the ROWBLK padding rows, which the kernel never
-    commits. The TensorCore builds are forced on and the token threshold is
-    moved so each shape runs both forms; the lowered programs are checked to
+    The run copy changes the routing payload (expert-sorted token numbers and a
+    scale per pair) and builds both tables from it; the tables differ from the
+    lookup's only on the ROWBLK padding rows, which the kernel never commits.
+    The TensorCore builds are forced on and the run copy's gate is forced each
+    way so each shape runs both forms; the lowered programs are checked to
     really differ, so the agreement is not vacuous.
     """
     monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
@@ -908,9 +908,7 @@ def test_slab_run_copy_and_sort_lookup_are_bit_exact(
     args = (x, w1, w2, w1_scale, w2_scale, gating)
     outs, has_copy = {}, {}
     for on in (False, True):
-        monkeypatch.setattr(
-            layer, "SLAB_RUN_COPY_MIN_TOKENS", 0 if on else shape["tokens"] + 1
-        )
+        monkeypatch.setattr(layer, "slab_run_copy_pays", lambda *_a, on=on, **_k: on)
         layer._LAYER_SM_CACHE.clear()
         jax.clear_caches()
         run = make_run()

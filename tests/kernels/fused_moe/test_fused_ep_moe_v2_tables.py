@@ -644,6 +644,14 @@ def test_token_gather_sort_keys_stop_at_the_int32_bound():
 
 
 @pytest.mark.parametrize(
+    "tokens,pays", [(1536, False), (4096, False), (8192, True), (16384, True)]
+)
+def test_slab_run_copy_pays_at_qwen38s_measured_steps(tokens, pays):
+    """At Qwen3.8's shape (top-10 of 512) the gate picks the steps measured to gain."""
+    assert kernel.slab_run_copy_pays(tokens, 10, e_total=512) is pays
+
+
+@pytest.mark.parametrize(
     "t_local,vmem,fits",
     [
         (256, None, True),  # Qwen3.8's 8,192-token step on TPU8i

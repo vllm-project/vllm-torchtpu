@@ -2719,12 +2719,22 @@ def build_act_scale_slab(**kwargs):
 # instead of a sort over every routed pair and a lookup per row.
 # --------------------------------------------------------------------------- #
 
-# Gathered tokens per step at or above which the layer builds the tables by
-# run copy. Measured on TPU8i 4x4x1 (top-10 of 512, 32 shards) against the
-# sort + lookup: -102 us per layer at 16384 tokens, -14 us at 8192, +33 us at
-# 4096 and below, where the sort over fewer pairs is cheaper than visiting
-# all 512 runs.
-SLAB_RUN_COPY_MIN_TOKENS = 8192
+# Routed pairs per expert, T * topk / e_total, at or above which the layer
+# builds the tables by run copy. The copy visits every (local expert, source)
+# run of a shard -- g_local * ep = e_total of them -- one at a time, each in at
+# least one 128-lane chunk, so its cost follows e_total. The sort + lookup it
+# replaces sorts all T * topk pairs on every shard, so theirs follows T * topk.
+# Measured on TPU8i 4x4x1 at Qwen3.8's shape (top-10 of 512, 32 shards)
+# against the sort + lookup: -102 us per layer at 320 pairs per expert (16384
+# tokens), -14 us at 160 (8192), +33 us at 80 (4096) and below. Only that
+# shape has been measured; the lookup and the copy's sender sort work on a
+# shard's own pairs, so ep moves the break-even a little too.
+SLAB_RUN_COPY_MIN_PAIRS_PER_EXPERT = 160
+
+
+def slab_run_copy_pays(n_tokens, topk, *, e_total):
+    """Whether a step routes enough pairs per expert for the run copy to pay."""
+    return n_tokens * topk >= SLAB_RUN_COPY_MIN_PAIRS_PER_EXPERT * e_total
 
 
 def _build_slab_run_copy(*, n_streams, src_rows, out_rows, n_runs):

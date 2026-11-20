@@ -64,7 +64,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
 )
 from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     SCALE_SLAB_WINDOW,
-    SLAB_RUN_COPY_MIN_TOKENS,
+    SLAB_RUN_COPY_MIN_PAIRS_PER_EXPERT,
     build_act_scale_slab,
     build_combine_kernel,
     build_fused_ep_moe_kernel,
@@ -72,6 +72,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     combine_step_tokens,
     rowquant_fp8,
     scale_slab_fits,
+    slab_run_copy_pays,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
@@ -559,8 +560,9 @@ def fused_ep_moe_v2(
     gather_by_sort = bool(
         tables_on_tensorcore and token_gather_sort_fits(T, topk, e_total=e_total, ep=ep)
     )
-    # Both tables by one run copy (build_slab_run_copy) where the step has
-    # enough tokens for it to beat the sort and the lookup: every shard sends
+    # Both tables by one run copy (build_slab_run_copy) where the step routes
+    # enough pairs per expert for it to beat the sort and the lookup
+    # (slab_run_copy_pays, which says why per expert): every shard sends
     # its pairs sorted by expert, each with its token's number and scale, and
     # the receiver copies (expert, source) runs. The plan it reads is the
     # sharded builder's counts; the expert ids it no longer receives fed only
@@ -573,14 +575,15 @@ def fused_ep_moe_v2(
         and form.quantized_activations
         and sharded_plan
         and stage == "fused"
-        and T >= SLAB_RUN_COPY_MIN_TOKENS
+        and slab_run_copy_pays(T, topk, e_total=e_total)
         and slab_run_copy_fits(t_local, topk, ep, ragged_stride)
     )
     if tables_by_run_copy:
         gather_by_sort = scale_by_lookup = False
         logger.info_once(
-            "fused_ep_moe_v2: both slab tables by run copy at %d tokens and up",
-            SLAB_RUN_COPY_MIN_TOKENS,
+            "fused_ep_moe_v2: both slab tables by run copy "
+            "(at least %d routed pairs per expert)",
+            SLAB_RUN_COPY_MIN_PAIRS_PER_EXPERT,
         )
     else:
         logger.info_once(
