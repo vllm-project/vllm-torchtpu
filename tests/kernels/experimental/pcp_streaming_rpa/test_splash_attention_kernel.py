@@ -14,6 +14,7 @@
 """Standalone tests for forward Splash attention and segment tile refinement."""
 
 import dataclasses
+from collections.abc import Callable
 from typing import Literal
 
 import jax
@@ -27,9 +28,12 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import (
     splash_attention_mask_info,
 )
 
+BlockMaskCode = splash_attention_mask_info.BlockMaskCode
 _refine_mask_info_with_segments = vars(splash_attention_kernel)[
     "_refine_mask_info_with_segments"
 ]
+_SegmentRefinementGrid = vars(splash_attention_kernel)["_SegmentRefinementGrid"]
+_segment_block_overlap = vars(splash_attention_kernel)["_segment_block_overlap"]
 
 BLOCK_SIZE = 128
 SEQ_LEN_SMALL = 256
@@ -41,10 +45,6 @@ NUM_KV_HEADS_MHA = 2
 NUM_Q_HEADS_LARGE = 2
 NUM_KV_HEADS_LARGE = 1
 
-BLOCK_PARTIAL = 1
-BLOCK_FULL = 2
-BLOCK_SEGMENT_ONLY = 3
-
 INT8_MAX_SIGNED = int(np.iinfo(np.int8).max)
 MIN_UNIQUE_PARTIAL_BLOCKS_FOR_INT16 = INT8_MAX_SIGNED + 2
 UNIQUE_STATIC_PATTERN_MOD = BLOCK_SIZE - 1
@@ -55,19 +55,24 @@ LARGE_GRID_DIM = SEQ_LEN_LARGE // BLOCK_SIZE
 NUM_UNIQUE_BLOCKS_2048 = LARGE_GRID_DIM * LARGE_GRID_DIM
 CHECKERBOARD_MOD = 2
 
-SEGMENT_SPLIT_HALF = 128
-SEGMENT_SPLIT_STRADDLE = 64
-SEGMENT_SPLIT_MEDIUM = 192
-SEGMENT_SPLIT_LARGE_MAIN = 1024
-SEGMENT_SPLIT_LARGE_Q = 1088
-SEGMENT_SPLIT_LARGE_TAIL = 960
-SEGMENT_SPLIT_CAUSAL_512_HEAD = 192
-SEGMENT_SPLIT_CAUSAL_512_TAIL = 320
+SEGMENT_SPLIT_HALF = BLOCK_SIZE
+SEGMENT_SPLIT_STRADDLE = BLOCK_SIZE // 2
+SEGMENT_SPLIT_MEDIUM = SEQ_LEN_SMALL - SEGMENT_SPLIT_STRADDLE
+SEGMENT_SPLIT_LARGE_MAIN = SEQ_LEN_LARGE // 2
+SEGMENT_SPLIT_LARGE_Q = SEGMENT_SPLIT_LARGE_MAIN + SEGMENT_SPLIT_STRADDLE
+SEGMENT_SPLIT_LARGE_TAIL = SEQ_LEN_LARGE - SEGMENT_SPLIT_LARGE_Q
+SEGMENT_SPLIT_CAUSAL_512_HEAD = BLOCK_SIZE + SEGMENT_SPLIT_STRADDLE
+SEGMENT_SPLIT_CAUSAL_512_TAIL = SEQ_LEN_MEDIUM - SEGMENT_SPLIT_CAUSAL_512_HEAD
 
-POSITIVE_CAUSAL_OFFSET = 128
-INVALID_CAUSAL_OFFSET = 64
+POSITIVE_CAUSAL_OFFSET = BLOCK_SIZE
+INVALID_CAUSAL_OFFSET = BLOCK_SIZE // 2
 DIAG_SKIP_GRID = 2
 
+# BF16 parity error budgets (unit roundoff u = 2^-8, eps = 2^-7 = 7.8125e-3):
+# - Output: QK dot + exp/softmax + SV bf16 weight cast + bf16 output cast
+#   contribute <= 4 * eps max-abs and <= 1 * eps RMSE relative to ref_scale.
+# - Logsumexp: bf16 Q*LOG2E prescaling + fp32 exp2/log2 + /LOG2E conversion
+#   contributes <= 3 * eps relative to max(1.0, max |ref_lse|).
 BF16_EPS = float(jnp.finfo(jnp.bfloat16).eps)
 MAX_ABS_EPS_FACTOR = 4.0
 RMSE_EPS_FACTOR = 1.0
@@ -103,8 +108,8 @@ def _make_segment_ids_array(lengths: tuple[int, ...]) -> np.ndarray:
 
 def _make_segment_ids(lengths: tuple[int, ...]) -> splash_attention_kernel.SegmentIds:
     """Construct `SegmentIds` with identical Q and KV segment lengths."""
-    seg = jnp.asarray(_make_segment_ids_array(lengths), dtype=jnp.int32)
-    return splash_attention_kernel.SegmentIds(q=seg, kv=seg)
+    segment_ids = jnp.asarray(_make_segment_ids_array(lengths), dtype=jnp.int32)
+    return splash_attention_kernel.SegmentIds(q=segment_ids, kv=segment_ids)
 
 
 def _active_tile_block_mask(
@@ -356,7 +361,7 @@ def _run_diag_skip_case(
         block_kv_compute=BLOCK_SIZE,
         qk_diag_skip=diag_skip.qk_diag_skip,
         sv_diag_skip=diag_skip.sv_diag_skip,
-        qk_diag_grid=DIAG_SKIP_GRID,
+        diag_grid=DIAG_SKIP_GRID,
     )
     kernel = splash_attention_kernel.make_splash_mha_single_device(
         splash_attention_mask.CausalMask((SEQ_LEN_SMALL, SEQ_LEN_SMALL)),
@@ -434,7 +439,8 @@ def _run_base2_natural_logsumexp_case(
     )
     out, stats = kernel(q_prescaled, k, v, seg_ids)
     ref_out, ref_lse = _compute_fp64_attention(
-        np.asarray(jax.device_get(q)),
+        np.asarray(jax.device_get(q_prescaled), dtype=np.float64)
+        / splash_attention_kernel.LOG2E,
         np.asarray(jax.device_get(k)),
         np.asarray(jax.device_get(v)),
         mask_np,
@@ -452,8 +458,8 @@ def _run_base2_natural_logsumexp_case(
     return out_max, lse_max
 
 
-def test_refine_mask_info_prunes_and_promotes_segments() -> None:
-    """Prune disjoint tiles and promote uniform tiles across mask types."""
+def test_refine_mask_info_prunes_and_demotes_segments() -> None:
+    """Prune disjoint tiles and demote mixed/segment-masked tiles across mask types."""
     causal_info, _ = splash_attention_mask_info.process_mask(
         splash_attention_mask.CausalMask((SEQ_LEN_MEDIUM, SEQ_LEN_MEDIUM)),
         (BLOCK_SIZE, BLOCK_SIZE),
@@ -466,10 +472,13 @@ def test_refine_mask_info_prunes_and_promotes_segments() -> None:
         _make_segment_ids(
             (SEGMENT_SPLIT_CAUSAL_512_HEAD, SEGMENT_SPLIT_CAUSAL_512_TAIL)
         ),
-        q_blocks=MEDIUM_GRID_DIM,
-        kv_blocks=MEDIUM_GRID_DIM,
-        bq=BLOCK_SIZE,
-        bkv=BLOCK_SIZE,
+        _SegmentRefinementGrid(
+            q_blocks=MEDIUM_GRID_DIM,
+            kv_blocks=MEDIUM_GRID_DIM,
+            block_q=BLOCK_SIZE,
+            block_kv=BLOCK_SIZE,
+        ),
+        segment_only_full=False,
     )
     assert causal_refined.num_active_blocks is not None
     # Segment split prunes the 2 lower-left tiles (2, 0) and (3, 0).
@@ -480,36 +489,38 @@ def test_refine_mask_info_prunes_and_promotes_segments() -> None:
     causal_tiles = _active_tile_block_mask(causal_refined)
     assert (2, 0) not in causal_tiles
     assert (3, 0) not in causal_tiles
-    assert causal_tiles[(1, 0)] == BLOCK_PARTIAL
-    assert causal_tiles[(3, 1)] == BLOCK_PARTIAL
-    assert causal_tiles[(3, 2)] == BLOCK_FULL
+    assert causal_tiles[(1, 0)] == BlockMaskCode.PARTIAL
+    assert causal_tiles[(3, 1)] == BlockMaskCode.PARTIAL
+    assert causal_tiles[(3, 2)] == BlockMaskCode.FULL
 
     full_info, _ = splash_attention_mask_info.process_mask(
         splash_attention_mask.FullMask((SEQ_LEN_SMALL, SEQ_LEN_SMALL)),
         (BLOCK_SIZE, BLOCK_SIZE),
     )
+    small_grid = _SegmentRefinementGrid(
+        q_blocks=SMALL_GRID_DIM,
+        kv_blocks=SMALL_GRID_DIM,
+        block_q=BLOCK_SIZE,
+        block_kv=BLOCK_SIZE,
+    )
     full_split, _, _ = _refine_mask_info_with_segments(
         full_info,
         _make_segment_ids((SEGMENT_SPLIT_HALF, SEGMENT_SPLIT_HALF)),
-        q_blocks=SMALL_GRID_DIM,
-        kv_blocks=SMALL_GRID_DIM,
-        bq=BLOCK_SIZE,
-        bkv=BLOCK_SIZE,
+        small_grid,
+        segment_only_full=False,
     )
     assert full_split.num_active_blocks is not None
     assert int(jax.device_get(full_split.num_active_blocks[0])) == SMALL_GRID_DIM
     assert _active_tile_block_mask(full_split) == {
-        (0, 0): BLOCK_FULL,
-        (1, 1): BLOCK_FULL,
+        (0, 0): BlockMaskCode.FULL,
+        (1, 1): BlockMaskCode.FULL,
     }
 
     full_straddle, _, _ = _refine_mask_info_with_segments(
         full_info,
         _make_segment_ids((SEGMENT_SPLIT_STRADDLE, SEGMENT_SPLIT_MEDIUM)),
-        q_blocks=SMALL_GRID_DIM,
-        kv_blocks=SMALL_GRID_DIM,
-        bq=BLOCK_SIZE,
-        bkv=BLOCK_SIZE,
+        small_grid,
+        segment_only_full=False,
     )
     assert full_straddle.num_active_blocks is not None
     assert (
@@ -517,10 +528,10 @@ def test_refine_mask_info_prunes_and_promotes_segments() -> None:
         == SMALL_GRID_DIM * SMALL_GRID_DIM
     )
     assert _active_tile_block_mask(full_straddle) == {
-        (0, 0): BLOCK_PARTIAL,
-        (0, 1): BLOCK_PARTIAL,
-        (1, 0): BLOCK_PARTIAL,
-        (1, 1): BLOCK_FULL,
+        (0, 0): BlockMaskCode.PARTIAL,
+        (0, 1): BlockMaskCode.PARTIAL,
+        (1, 0): BlockMaskCode.PARTIAL,
+        (1, 1): BlockMaskCode.FULL,
     }
 
     full_qseq_info = splash_attention_mask_info.MaskInfo(
@@ -535,10 +546,8 @@ def test_refine_mask_info_prunes_and_promotes_segments() -> None:
     full_qseq_refined, _, _ = _refine_mask_info_with_segments(
         full_qseq_info,
         _make_segment_ids((SEQ_LEN_SMALL,)),
-        q_blocks=SMALL_GRID_DIM,
-        kv_blocks=SMALL_GRID_DIM,
-        bq=BLOCK_SIZE,
-        bkv=BLOCK_SIZE,
+        small_grid,
+        segment_only_full=False,
     )
     assert full_qseq_refined.num_active_blocks is not None
     # Causal q_sequence on a 2x2 FullMask prunes only upper-right tile (0, 1).
@@ -547,9 +556,9 @@ def test_refine_mask_info_prunes_and_promotes_segments() -> None:
         == SMALL_GRID_DIM * (SMALL_GRID_DIM + 1) // 2
     )
     assert _active_tile_block_mask(full_qseq_refined) == {
-        (0, 0): BLOCK_PARTIAL,
-        (1, 0): BLOCK_FULL,
-        (1, 1): BLOCK_PARTIAL,
+        (0, 0): BlockMaskCode.PARTIAL,
+        (1, 0): BlockMaskCode.FULL,
+        (1, 1): BlockMaskCode.PARTIAL,
     }
 
 
@@ -557,9 +566,9 @@ def test_refine_mask_info_prunes_and_promotes_segments() -> None:
 def test_refine_mask_info_demotes_base_full_with_partial_blocks_to_segment_only_code(
     grid_kind: Literal["dynamic", "static"],
 ) -> None:
-    """Demote base-full tiles with partial blocks to segment-only code 3."""
+    """Demote base-full tiles with partial blocks to `BlockMaskCode.SEGMENT_ONLY`."""
     dense_causal = np.tril(np.ones((SEQ_LEN_SMALL, SEQ_LEN_SMALL), dtype=np.bool_))
-    seg_ids = _make_segment_ids((SEGMENT_SPLIT_STRADDLE, SEGMENT_SPLIT_MEDIUM))
+    segment_ids = _make_segment_ids((SEGMENT_SPLIT_STRADDLE, SEGMENT_SPLIT_MEDIUM))
 
     if grid_kind == "dynamic":
         mask_info = splash_attention_mask_info.process_dynamic_mask(
@@ -573,16 +582,19 @@ def test_refine_mask_info_demotes_base_full_with_partial_blocks_to_segment_only_
         )
     refined, _, _ = _refine_mask_info_with_segments(
         mask_info,
-        seg_ids,
-        q_blocks=SMALL_GRID_DIM,
-        kv_blocks=SMALL_GRID_DIM,
-        bq=BLOCK_SIZE,
-        bkv=BLOCK_SIZE,
+        segment_ids,
+        _SegmentRefinementGrid(
+            q_blocks=SMALL_GRID_DIM,
+            kv_blocks=SMALL_GRID_DIM,
+            block_q=BLOCK_SIZE,
+            block_kv=BLOCK_SIZE,
+        ),
+        segment_only_full=True,
     )
     assert _active_tile_block_mask(refined) == {
-        (0, 0): BLOCK_PARTIAL,
-        (1, 0): BLOCK_SEGMENT_ONLY,
-        (1, 1): BLOCK_PARTIAL,
+        (0, 0): BlockMaskCode.PARTIAL,
+        (1, 0): BlockMaskCode.SEGMENT_ONLY,
+        (1, 1): BlockMaskCode.PARTIAL,
     }
 
 
@@ -595,10 +607,13 @@ def test_refine_mask_info_preserves_mask_next_over_127_dynamic() -> None:
     refined, _, _ = _refine_mask_info_with_segments(
         mask_info,
         _make_segment_ids((SEGMENT_SPLIT_LARGE_MAIN, SEGMENT_SPLIT_LARGE_MAIN)),
-        q_blocks=LARGE_GRID_DIM,
-        kv_blocks=LARGE_GRID_DIM,
-        bq=BLOCK_SIZE,
-        bkv=BLOCK_SIZE,
+        _SegmentRefinementGrid(
+            q_blocks=LARGE_GRID_DIM,
+            kv_blocks=LARGE_GRID_DIM,
+            block_q=BLOCK_SIZE,
+            block_kv=BLOCK_SIZE,
+        ),
+        segment_only_full=True,
     )
     assert refined.mask_next is not None
     assert refined.num_active_blocks is not None
@@ -609,16 +624,16 @@ def test_refine_mask_info_preserves_mask_next_over_127_dynamic() -> None:
     )
     assert bool(np.all(active_mask_next >= 0))
 
-    tile_bm = _active_tile_block_mask(refined)
+    tile_block_mask = _active_tile_block_mask(refined)
     tile_next = _active_tile_mask_next(refined)
     high_partial_ids = [
         tile_next[coord]
-        for coord, code in tile_bm.items()
-        if code == BLOCK_PARTIAL and coord[0] == coord[1]
+        for coord, code in tile_block_mask.items()
+        if code == BlockMaskCode.PARTIAL and coord[0] == coord[1]
     ]
     assert max(high_partial_ids) > INT8_MAX_SIGNED
-    for coord, code in tile_bm.items():
-        if code == BLOCK_PARTIAL:
+    for coord, code in tile_block_mask.items():
+        if code == BlockMaskCode.PARTIAL:
             assert tile_next[coord] == coord[0] * LARGE_GRID_DIM + coord[1]
 
 
@@ -635,10 +650,13 @@ def test_refine_mask_info_preserves_mask_next_over_127_static() -> None:
     refined, _, _ = _refine_mask_info_with_segments(
         mask_info,
         _make_segment_ids((SEGMENT_SPLIT_LARGE_MAIN, SEGMENT_SPLIT_LARGE_MAIN)),
-        q_blocks=LARGE_GRID_DIM,
-        kv_blocks=LARGE_GRID_DIM,
-        bq=BLOCK_SIZE,
-        bkv=BLOCK_SIZE,
+        _SegmentRefinementGrid(
+            q_blocks=LARGE_GRID_DIM,
+            kv_blocks=LARGE_GRID_DIM,
+            block_q=BLOCK_SIZE,
+            block_kv=BLOCK_SIZE,
+        ),
+        segment_only_full=True,
     )
     assert refined.mask_next is not None
     assert refined.num_active_blocks is not None
@@ -658,7 +676,7 @@ def test_refine_mask_info_preserves_mask_next_over_127_static() -> None:
 def test_refine_mask_info_demotes_diag_skip_causal_full_tile_to_segment_only_code() -> (
     None
 ):
-    """Demote lower-triangular full tile to code 3 when `segment_only_full=True`."""
+    """Demote lower-triangular full tile to `SEGMENT_ONLY` when enabled."""
     mask_info, _ = splash_attention_mask_info.process_mask(
         splash_attention_mask.CausalMask((SEQ_LEN_SMALL, SEQ_LEN_SMALL)),
         (BLOCK_SIZE, BLOCK_SIZE),
@@ -666,16 +684,18 @@ def test_refine_mask_info_demotes_diag_skip_causal_full_tile_to_segment_only_cod
     refined, _, _ = _refine_mask_info_with_segments(
         mask_info,
         _make_segment_ids((SEGMENT_SPLIT_STRADDLE, SEGMENT_SPLIT_MEDIUM)),
-        q_blocks=SMALL_GRID_DIM,
-        kv_blocks=SMALL_GRID_DIM,
-        bq=BLOCK_SIZE,
-        bkv=BLOCK_SIZE,
+        _SegmentRefinementGrid(
+            q_blocks=SMALL_GRID_DIM,
+            kv_blocks=SMALL_GRID_DIM,
+            block_q=BLOCK_SIZE,
+            block_kv=BLOCK_SIZE,
+        ),
         segment_only_full=True,
     )
     assert _active_tile_block_mask(refined) == {
-        (0, 0): BLOCK_PARTIAL,
-        (1, 0): BLOCK_SEGMENT_ONLY,
-        (1, 1): BLOCK_PARTIAL,
+        (0, 0): BlockMaskCode.PARTIAL,
+        (1, 0): BlockMaskCode.SEGMENT_ONLY,
+        (1, 1): BlockMaskCode.PARTIAL,
     }
 
 
@@ -693,16 +713,19 @@ def test_refine_mask_info_keeps_positive_offset_causal_tiles() -> None:
             q=jnp.zeros((BLOCK_SIZE,), dtype=jnp.int32),
             kv=jnp.zeros((SEQ_LEN_SMALL,), dtype=jnp.int32),
         ),
-        q_blocks=1,
-        kv_blocks=SMALL_GRID_DIM,
-        bq=BLOCK_SIZE,
-        bkv=BLOCK_SIZE,
+        _SegmentRefinementGrid(
+            q_blocks=1,
+            kv_blocks=SMALL_GRID_DIM,
+            block_q=BLOCK_SIZE,
+            block_kv=BLOCK_SIZE,
+        ),
+        segment_only_full=False,
     )
     assert refined.num_active_blocks is not None
     assert int(jax.device_get(refined.num_active_blocks[0])) == SMALL_GRID_DIM
     assert _active_tile_block_mask(refined) == {
-        (0, 0): BLOCK_FULL,
-        (0, 1): BLOCK_PARTIAL,
+        (0, 0): BlockMaskCode.FULL,
+        (0, 1): BlockMaskCode.PARTIAL,
     }
 
 
@@ -747,6 +770,783 @@ def test_diag_skip_rejects_nonzero_offset_and_dynamic_masks() -> None:
             )
         with pytest.raises(ValueError, match="unsupported for dynamic masks"):
             splash_attention_kernel.make_dynamic_splash_mha(dynamic_mask, config=config)
+
+
+def test_refine_mask_info_placeholder_row_for_disjoint_q_block() -> None:
+    """Keep one `EMPTY` placeholder for a disjoint Q block when another row runs."""
+    full_info, _ = splash_attention_mask_info.process_mask(
+        splash_attention_mask.FullMask((SEQ_LEN_SMALL, SEQ_LEN_SMALL)),
+        (BLOCK_SIZE, BLOCK_SIZE),
+    )
+    segment_ids = splash_attention_kernel.SegmentIds(
+        q=jnp.asarray(
+            _make_segment_ids_array((SEGMENT_SPLIT_HALF, SEGMENT_SPLIT_HALF)),
+            dtype=jnp.int32,
+        ),
+        kv=jnp.ones((SEQ_LEN_SMALL,), dtype=jnp.int32),
+    )
+    refined, bounds_start, bounds_end = _refine_mask_info_with_segments(
+        full_info,
+        segment_ids,
+        _SegmentRefinementGrid(
+            q_blocks=SMALL_GRID_DIM,
+            kv_blocks=SMALL_GRID_DIM,
+            block_q=BLOCK_SIZE,
+            block_kv=BLOCK_SIZE,
+        ),
+        segment_only_full=False,
+    )
+    assert refined.num_active_blocks is not None
+    expected_steps = SMALL_GRID_DIM + 1
+    assert int(jax.device_get(refined.num_active_blocks[0])) == expected_steps
+    assert _active_tile_block_mask(refined) == {
+        (0, 0): BlockMaskCode.EMPTY,
+        (1, 0): BlockMaskCode.FULL,
+        (1, 1): BlockMaskCode.FULL,
+    }
+    assert bounds_start is not None
+    assert bounds_end is not None
+    assert bounds_start.dtype == jnp.int8
+    assert bounds_end.dtype == jnp.int8
+    assert int(jax.device_get(bounds_start[0])) == 1
+    assert int(jax.device_get(bounds_end[0])) == 1
+
+
+def test_refine_mask_info_vmap_shares_union_schedule() -> None:
+    """Share union tile schedule and intersection demotion under `jax.vmap`."""
+    full_info, _ = splash_attention_mask_info.process_mask(
+        splash_attention_mask.FullMask((SEQ_LEN_SMALL, SEQ_LEN_SMALL)),
+        (BLOCK_SIZE, BLOCK_SIZE),
+    )
+    batch_seg_q = jnp.asarray(
+        np.stack(
+            [
+                _make_segment_ids_array((SEGMENT_SPLIT_HALF, SEGMENT_SPLIT_HALF)),
+                _make_segment_ids_array((SEGMENT_SPLIT_STRADDLE, SEGMENT_SPLIT_MEDIUM)),
+            ],
+            axis=0,
+        ),
+        dtype=jnp.int32,
+    )
+    batch_segments = splash_attention_kernel.SegmentIds(q=batch_seg_q, kv=batch_seg_q)
+    small_grid = _SegmentRefinementGrid(
+        q_blocks=SMALL_GRID_DIM,
+        kv_blocks=SMALL_GRID_DIM,
+        block_q=BLOCK_SIZE,
+        block_kv=BLOCK_SIZE,
+    )
+
+    def _refine_one(
+        seg_ids: splash_attention_kernel.SegmentIds,
+    ) -> splash_attention_mask_info.MaskInfo:
+        """Refine one batch item's segment schedule."""
+        refined_info, _, _ = _refine_mask_info_with_segments(
+            full_info,
+            seg_ids,
+            small_grid,
+            segment_only_full=False,
+        )
+        return refined_info
+
+    vmapped_info = jax.vmap(_refine_one, out_axes=None)(batch_segments)
+    assert vmapped_info.num_active_blocks is not None
+    assert int(jax.device_get(vmapped_info.num_active_blocks[0])) == (
+        SMALL_GRID_DIM * SMALL_GRID_DIM
+    )
+    assert _active_tile_block_mask(vmapped_info) == {
+        (0, 0): BlockMaskCode.PARTIAL,
+        (0, 1): BlockMaskCode.PARTIAL,
+        (1, 0): BlockMaskCode.PARTIAL,
+        (1, 1): BlockMaskCode.FULL,
+    }
+
+
+def test_refine_mask_info_uses_int16_rows_above_128_q_blocks() -> None:
+    """Use int16 rows above 128 Q blocks when downcasting and int32 otherwise."""
+    q_blocks = INT8_MAX_SIGNED + 2
+    kv_blocks = 1
+    q_len = q_blocks * BLOCK_SIZE
+    kv_len = kv_blocks * BLOCK_SIZE
+    mask_info, _ = splash_attention_mask_info.process_mask(
+        splash_attention_mask.FullMask((q_len, kv_len)),
+        (BLOCK_SIZE, BLOCK_SIZE),
+    )
+    segment_ids = splash_attention_kernel.SegmentIds(
+        q=jnp.zeros((q_len,), dtype=jnp.int32),
+        kv=jnp.zeros((kv_len,), dtype=jnp.int32),
+    )
+    tall_grid = _SegmentRefinementGrid(
+        q_blocks=q_blocks,
+        kv_blocks=kv_blocks,
+        block_q=BLOCK_SIZE,
+        block_kv=BLOCK_SIZE,
+    )
+    refined_downcast, _, _ = _refine_mask_info_with_segments(
+        mask_info,
+        segment_ids,
+        tall_grid,
+        segment_only_full=False,
+        downcast_smem_data=True,
+    )
+    assert refined_downcast.active_rows is not None
+    assert refined_downcast.num_active_blocks is not None
+    assert refined_downcast.active_rows.dtype == jnp.int16
+    assert int(jax.device_get(refined_downcast.num_active_blocks[0])) == q_blocks
+    assert (
+        int(jax.device_get(refined_downcast.active_rows[q_blocks - 1])) == q_blocks - 1
+    )
+
+    refined_int32, _, _ = _refine_mask_info_with_segments(
+        mask_info,
+        segment_ids,
+        tall_grid,
+        segment_only_full=False,
+        downcast_smem_data=False,
+    )
+    assert refined_int32.active_rows is not None
+    assert refined_int32.active_cols is not None
+    assert refined_int32.active_rows.dtype == jnp.int32
+    assert refined_int32.active_cols.dtype == jnp.int32
+    assert int(jax.device_get(refined_int32.active_rows[q_blocks - 1])) == q_blocks - 1
+
+
+class _OneDimMask(splash_attention_mask.Mask):
+    """Minimal 1D Mask stub for rank-validation tests."""
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Return an invalid 1D mask shape."""
+        return (SEQ_LEN_SMALL,)
+
+
+def _make_base_kernel(
+    *,
+    num_stacked_q_heads: int = 1,
+    block_kv: int = BLOCK_SIZE,
+    block_kv_compute: int = BLOCK_SIZE,
+    max_logit_const: float | None = None,
+) -> splash_attention_kernel.SplashAttentionKernel:
+    """Create a small causal MHA kernel for CPU validation checks."""
+    config = splash_attention_kernel.SplashConfig(
+        block_q=BLOCK_SIZE,
+        block_kv=block_kv,
+        block_kv_compute=block_kv_compute,
+        num_stacked_q_heads=num_stacked_q_heads,
+        max_logit_const=max_logit_const,
+    )
+    return splash_attention_kernel.make_splash_mha_single_device(
+        splash_attention_mask.CausalMask((SEQ_LEN_SMALL, SEQ_LEN_SMALL)),
+        config=config,
+    )
+
+
+def _make_zero_qkv(
+    *,
+    num_kv_heads: int = NUM_KV_HEADS_MHA,
+    k_head_dim: int = HEAD_DIM,
+    v_seq_len: int = SEQ_LEN_SMALL,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Allocate small zero bfloat16 Q, K, and V arrays for validation tests."""
+    q = jnp.zeros((NUM_Q_HEADS, SEQ_LEN_SMALL, HEAD_DIM), dtype=jnp.bfloat16)
+    k = jnp.zeros((num_kv_heads, SEQ_LEN_SMALL, k_head_dim), dtype=jnp.bfloat16)
+    v = jnp.zeros((num_kv_heads, v_seq_len, HEAD_DIM), dtype=jnp.bfloat16)
+    return q, k, v
+
+
+def _call_with_bad_sinks() -> None:
+    """Invoke kernel with wrong sinks length."""
+    q, k, v = _make_zero_qkv()
+    _make_base_kernel()(q, k, v, sinks=jnp.zeros((NUM_Q_HEADS - 1,), dtype=jnp.float32))
+
+
+def _call_stacked_with_sinks() -> None:
+    """Invoke stacked-head kernel with sinks."""
+    q, k, v = _make_zero_qkv()
+    _make_base_kernel(num_stacked_q_heads=2)(
+        q, k, v, sinks=jnp.zeros((NUM_Q_HEADS,), dtype=jnp.float32)
+    )
+
+
+def _call_mha_wrong_k_rank() -> None:
+    """Invoke MHA kernel with 2D key/value tensors."""
+    q, k, v = _make_zero_qkv()
+    _make_base_kernel()(q, k[0], v[0])
+
+
+def _call_mismatched_k_head_dim() -> None:
+    """Invoke kernel with key head dim different from query head dim."""
+    q, k, v = _make_zero_qkv(k_head_dim=HEAD_DIM // 2)
+    _make_base_kernel()(q, k, v)
+
+
+def _call_non_divisible_kv_heads() -> None:
+    """Invoke MHA kernel when query heads are not a multiple of KV heads."""
+    q, k, v = _make_zero_qkv(num_kv_heads=NUM_Q_HEADS - 1)
+    _make_base_kernel()(q, k, v)
+
+
+def _call_non_divisible_stacked_q_heads() -> None:
+    """Invoke kernel when query heads are not divisible by stacked heads."""
+    q, k, v = _make_zero_qkv()
+    _make_base_kernel(num_stacked_q_heads=NUM_Q_HEADS - 1)(q, k, v)
+
+
+def _call_non_divisible_kv_group_stacked() -> None:
+    """Invoke kernel when q_heads_per_kv_head is not divisible by stacked heads."""
+    q, k, v = _make_zero_qkv()
+    _make_base_kernel(num_stacked_q_heads=NUM_Q_HEADS)(q, k, v)
+
+
+def _call_mismatched_kv_leading_dims() -> None:
+    """Invoke kernel with mismatched K and V sequence lengths."""
+    q, k, v = _make_zero_qkv(v_seq_len=BLOCK_SIZE)
+    _make_base_kernel()(q, k, v)
+
+
+def _call_bkv_not_multiple_of_compute() -> None:
+    """Invoke kernel when block_kv is not a multiple of block_kv_compute."""
+    q, k, v = _make_zero_qkv()
+    _make_base_kernel(
+        block_kv=SEQ_LEN_SMALL,
+        block_kv_compute=BLOCK_SIZE + BLOCK_SIZE // 2,
+    )(q, k, v)
+
+
+def _call_bkv_compute_not_multiple_of_lanes() -> None:
+    """Invoke kernel when block_kv_compute is not a multiple of NUM_LANES."""
+    q, k, v = _make_zero_qkv()
+    _make_base_kernel(block_kv_compute=BLOCK_SIZE // 2)(q, k, v)
+
+
+def _call_bad_q_segment_shape() -> None:
+    """Invoke kernel with mismatched query segment ID length."""
+    q, k, v = _make_zero_qkv()
+    bad_segments = splash_attention_kernel.SegmentIds(
+        q=jnp.zeros((BLOCK_SIZE,), dtype=jnp.int32),
+        kv=jnp.zeros((SEQ_LEN_SMALL,), dtype=jnp.int32),
+    )
+    _make_base_kernel()(q, k, v, bad_segments)
+
+
+def _call_bad_kv_segment_shape() -> None:
+    """Invoke kernel with mismatched KV segment ID length."""
+    q, k, v = _make_zero_qkv()
+    bad_segments = splash_attention_kernel.SegmentIds(
+        q=jnp.zeros((SEQ_LEN_SMALL,), dtype=jnp.int32),
+        kv=jnp.zeros((BLOCK_SIZE,), dtype=jnp.int32),
+    )
+    _make_base_kernel()(q, k, v, bad_segments)
+
+
+def _call_both_max_logit_options() -> None:
+    """Invoke kernel when both max_logit_const and max_logit_value are set."""
+    q, k, v = _make_zero_qkv()
+    _make_base_kernel(max_logit_const=1.0)(
+        q, k, v, max_logit_value=jnp.asarray(1.0, dtype=jnp.float32)
+    )
+
+
+def _call_bad_max_logit_value_shape() -> None:
+    """Invoke kernel with invalid max_logit_value shape."""
+    q, k, v = _make_zero_qkv()
+    _make_base_kernel()(
+        q, k, v, max_logit_value=jnp.zeros((NUM_Q_HEADS - 1,), dtype=jnp.float32)
+    )
+
+
+def _call_dynamic_mesh_without_spec() -> None:
+    """Call make_dynamic_splash_mha with mesh set and mask_spec omitted."""
+    config = splash_attention_kernel.SplashConfig(
+        block_q=BLOCK_SIZE, block_kv=BLOCK_SIZE, block_kv_compute=BLOCK_SIZE
+    )
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("q",))
+    splash_attention_kernel.make_dynamic_splash_mha(
+        jnp.ones((SEQ_LEN_SMALL, SEQ_LEN_SMALL), dtype=jnp.bool_),
+        mesh=mesh,
+        config=config,
+    )
+
+
+def _call_dynamic_spec_wrong_rank() -> None:
+    """Call make_dynamic_splash_mha with a 2D PartitionSpec."""
+    config = splash_attention_kernel.SplashConfig(
+        block_q=BLOCK_SIZE, block_kv=BLOCK_SIZE, block_kv_compute=BLOCK_SIZE
+    )
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("q",))
+    splash_attention_kernel.make_dynamic_splash_mha(
+        jnp.ones((SEQ_LEN_SMALL, SEQ_LEN_SMALL), dtype=jnp.bool_),
+        mesh=mesh,
+        mask_spec=jax.sharding.PartitionSpec("q", None),
+        config=config,
+    )
+
+
+def _call_static_non_2d_mask() -> None:
+    """Call make_splash_mha_single_device with a 1D mask."""
+    config = splash_attention_kernel.SplashConfig(
+        block_q=BLOCK_SIZE, block_kv=BLOCK_SIZE, block_kv_compute=BLOCK_SIZE
+    )
+    splash_attention_kernel.make_splash_mha_single_device(
+        np.ones((SEQ_LEN_SMALL,), dtype=np.bool_), config=config
+    )
+
+
+def _call_dynamic_non_2d_mask() -> None:
+    """Call make_dynamic_splash_mha with a 1D mask."""
+    config = splash_attention_kernel.SplashConfig(
+        block_q=BLOCK_SIZE, block_kv=BLOCK_SIZE, block_kv_compute=BLOCK_SIZE
+    )
+    splash_attention_kernel.make_dynamic_splash_mha(
+        jnp.ones((SEQ_LEN_SMALL,), dtype=jnp.bool_), config=config
+    )
+
+
+@pytest.mark.parametrize(
+    ("trigger", "expected_exc", "match"),
+    [
+        pytest.param(
+            lambda: splash_attention_kernel.SplashConfig(
+                block_q=BLOCK_SIZE,
+                block_kv=BLOCK_SIZE,
+                use_base2_exp=False,
+                q_prescaled_log2e=True,
+            ),
+            ValueError,
+            "q_prescaled_log2e requires use_base2_exp=True",
+            id="q_prescaled_without_base2",
+        ),
+        pytest.param(
+            lambda: splash_attention_kernel.SplashConfig(
+                block_q=BLOCK_SIZE,
+                block_kv=SEQ_LEN_SMALL,
+                block_kv_compute=BLOCK_SIZE,
+                qk_diag_skip=True,
+            ),
+            ValueError,
+            "square forward blocks",
+            id="qk_diag_skip_non_square",
+        ),
+        pytest.param(
+            lambda: splash_attention_kernel.SplashConfig(
+                block_q=SEQ_LEN_SMALL,
+                block_kv=SEQ_LEN_SMALL,
+                block_kv_compute=BLOCK_SIZE,
+                sv_diag_skip=True,
+            ),
+            ValueError,
+            "square forward blocks",
+            id="sv_diag_skip_non_square_compute",
+        ),
+        pytest.param(
+            lambda: splash_attention_kernel.SplashConfig(
+                block_q=BLOCK_SIZE,
+                block_kv=BLOCK_SIZE,
+                block_kv_compute=BLOCK_SIZE,
+                qk_diag_skip=True,
+                diag_grid=1,
+            ),
+            ValueError,
+            "power of 2",
+            id="diag_skip_grid_lt_2",
+        ),
+        pytest.param(
+            lambda: splash_attention_kernel.SplashConfig(
+                block_q=BLOCK_SIZE,
+                block_kv=BLOCK_SIZE,
+                block_kv_compute=BLOCK_SIZE,
+                qk_diag_skip=True,
+                diag_grid=DIAG_SKIP_GRID + 1,
+            ),
+            ValueError,
+            "power of 2",
+            id="diag_skip_non_pow2_grid",
+        ),
+        pytest.param(
+            lambda: splash_attention_kernel.SplashConfig(
+                block_q=BLOCK_SIZE,
+                block_kv=BLOCK_SIZE,
+                block_kv_compute=BLOCK_SIZE,
+                qk_diag_skip=True,
+                diag_grid=SEQ_LEN_SMALL,
+            ),
+            ValueError,
+            "must divide",
+            id="diag_skip_non_dividing_grid",
+        ),
+        pytest.param(
+            lambda: splash_attention_kernel.SplashConfig(
+                block_q=BLOCK_SIZE,
+                block_kv=BLOCK_SIZE,
+                block_kv_compute=BLOCK_SIZE,
+                qk_diag_skip=True,
+                num_stacked_q_heads=2,
+            ),
+            ValueError,
+            "num_stacked_q_heads",
+            id="diag_skip_stacked_q_heads",
+        ),
+        pytest.param(
+            lambda: splash_attention_kernel.SplashConfig(
+                block_q=BLOCK_SIZE,
+                block_kv=BLOCK_SIZE,
+                block_kv_compute=BLOCK_SIZE,
+                sv_diag_skip=True,
+                v_layout=splash_attention_kernel.QKVLayout.SEQ_MINOR,
+            ),
+            ValueError,
+            "HEAD_DIM_MINOR",
+            id="sv_diag_skip_seq_minor_v",
+        ),
+        pytest.param(_call_with_bad_sinks, ValueError, "sinks", id="bad_sinks_shape"),
+        pytest.param(
+            _call_stacked_with_sinks,
+            ValueError,
+            "Stacked heads",
+            id="stacked_heads_with_sinks",
+        ),
+        pytest.param(
+            _call_mha_wrong_k_rank, ValueError, "Expected 3-dim", id="mha_wrong_k_rank"
+        ),
+        pytest.param(
+            _call_mismatched_k_head_dim,
+            ValueError,
+            "head dimension",
+            id="mismatched_k_head_dim",
+        ),
+        pytest.param(
+            _call_non_divisible_kv_heads,
+            ValueError,
+            "In MHA",
+            id="mha_head_ratio_not_divisible",
+        ),
+        pytest.param(
+            _call_non_divisible_stacked_q_heads,
+            ValueError,
+            "num_q_heads=",
+            id="q_heads_not_divisible_by_stacked",
+        ),
+        pytest.param(
+            _call_non_divisible_kv_group_stacked,
+            ValueError,
+            "q_heads_per_kv_head=",
+            id="kv_group_not_divisible_by_stacked",
+        ),
+        pytest.param(
+            _call_mismatched_kv_leading_dims,
+            ValueError,
+            "leading dimensions",
+            id="mismatched_kv_leading_dims",
+        ),
+        pytest.param(
+            _call_bkv_not_multiple_of_compute,
+            ValueError,
+            "must be a multiple",
+            id="bkv_not_multiple_of_compute",
+        ),
+        pytest.param(
+            _call_bkv_compute_not_multiple_of_lanes,
+            ValueError,
+            "must be a multiple",
+            id="bkv_compute_not_multiple_of_lanes",
+        ),
+        pytest.param(
+            _call_bad_q_segment_shape,
+            ValueError,
+            "q segment_ids",
+            id="bad_q_segment_shape",
+        ),
+        pytest.param(
+            _call_bad_kv_segment_shape,
+            ValueError,
+            "kv segment_ids",
+            id="bad_kv_segment_shape",
+        ),
+        pytest.param(
+            _call_both_max_logit_options,
+            ValueError,
+            "Only one of",
+            id="both_max_logit_options",
+        ),
+        pytest.param(
+            _call_bad_max_logit_value_shape,
+            ValueError,
+            "max_logit_value",
+            id="bad_max_logit_value_shape",
+        ),
+        pytest.param(
+            _call_static_non_2d_mask,
+            ValueError,
+            "Unexpected mask shape",
+            id="static_mask_not_2d",
+        ),
+        pytest.param(
+            _call_dynamic_mesh_without_spec,
+            ValueError,
+            "mesh and mask_spec",
+            id="dynamic_mesh_without_spec",
+        ),
+        pytest.param(
+            _call_dynamic_spec_wrong_rank,
+            ValueError,
+            "query sequence dimension",
+            id="dynamic_spec_wrong_rank",
+        ),
+        pytest.param(
+            _call_dynamic_non_2d_mask,
+            ValueError,
+            "Unexpected mask shape",
+            id="dynamic_mask_not_2d",
+        ),
+        pytest.param(
+            lambda: splash_attention_mask_info.process_dynamic_mask(
+                jnp.ones((SEQ_LEN_SMALL,), dtype=jnp.bool_),
+                (BLOCK_SIZE, BLOCK_SIZE),
+            ),
+            ValueError,
+            "2-dim mask",
+            id="process_dynamic_mask_not_2d",
+        ),
+        pytest.param(
+            lambda: splash_attention_mask_info.process_dynamic_mask(
+                jnp.ones((BLOCK_SIZE + 1, BLOCK_SIZE), dtype=jnp.bool_),
+                (BLOCK_SIZE, BLOCK_SIZE),
+            ),
+            ValueError,
+            "should divide",
+            id="process_dynamic_mask_bad_q_div",
+        ),
+        pytest.param(
+            lambda: splash_attention_mask_info.process_dynamic_mask(
+                jnp.ones((BLOCK_SIZE, BLOCK_SIZE + 1), dtype=jnp.bool_),
+                (BLOCK_SIZE, BLOCK_SIZE),
+            ),
+            ValueError,
+            "should divide",
+            id="process_dynamic_mask_bad_kv_div",
+        ),
+        pytest.param(
+            lambda: splash_attention_mask_info.process_mask(
+                _OneDimMask(), (BLOCK_SIZE, BLOCK_SIZE)
+            ),
+            ValueError,
+            "2-dim mask",
+            id="process_mask_not_2d",
+        ),
+        pytest.param(
+            lambda: splash_attention_mask_info.process_mask(
+                splash_attention_mask.FullMask((BLOCK_SIZE + 1, BLOCK_SIZE)),
+                (BLOCK_SIZE, BLOCK_SIZE),
+            ),
+            ValueError,
+            "should divide",
+            id="process_mask_bad_q_div",
+        ),
+        pytest.param(
+            lambda: splash_attention_mask_info.process_mask(
+                splash_attention_mask.FullMask((BLOCK_SIZE, BLOCK_SIZE + 1)),
+                (BLOCK_SIZE, BLOCK_SIZE),
+            ),
+            ValueError,
+            "should divide",
+            id="process_mask_bad_kv_div",
+        ),
+        pytest.param(
+            lambda: splash_attention_mask_info.process_mask(
+                splash_attention_mask.FullMask((SEQ_LEN_SMALL, SEQ_LEN_SMALL)),
+                (BLOCK_SIZE, BLOCK_SIZE),
+                q_seq_shards=SMALL_GRID_DIM + 1,
+            ),
+            ValueError,
+            "q_seq_shards",
+            id="process_mask_bad_q_shard_div",
+        ),
+        pytest.param(
+            lambda: splash_attention_mask_info.process_mask(
+                splash_attention_mask.FullMask((SEQ_LEN_SMALL, SEQ_LEN_SMALL)),
+                (BLOCK_SIZE, BLOCK_SIZE),
+                q_seq_shards=MEDIUM_GRID_DIM,
+            ),
+            ValueError,
+            "q_seq_len_per_shard",
+            id="process_mask_bad_q_shard_block_div",
+        ),
+        pytest.param(
+            lambda: splash_attention_kernel.make_splash_mha_single_device(
+                splash_attention_mask.CausalMask((SEQ_LEN_SMALL, SEQ_LEN_SMALL))
+            ),
+            TypeError,
+            "config",
+            id="static_maker_requires_config",
+        ),
+        pytest.param(
+            lambda: splash_attention_kernel.make_dynamic_splash_mha(
+                jnp.ones((SEQ_LEN_SMALL, SEQ_LEN_SMALL), dtype=jnp.bool_)
+            ),
+            TypeError,
+            "config",
+            id="dynamic_maker_requires_config",
+        ),
+    ],
+)
+def test_splash_config_and_validation_reject_invalid_inputs(
+    trigger: Callable[[], object],
+    expected_exc: type[Exception],
+    match: str,
+) -> None:
+    """Reject invalid SplashConfig, call-site, and mask-info inputs."""
+    with pytest.raises(expected_exc, match=match):
+        trigger()
+
+
+def _assert_mask_object_contracts() -> None:
+    """Verify FullMask, CausalMask, and NumpyMask slicing, equality, and hashing."""
+    full_a = splash_attention_mask.FullMask((SEQ_LEN_SMALL, SEQ_LEN_SMALL))
+    full_b = splash_attention_mask.FullMask((SEQ_LEN_SMALL, SEQ_LEN_SMALL))
+    assert full_a == full_b
+    assert hash(full_a) == hash(full_b)
+    assert full_a[:BLOCK_SIZE, :BLOCK_SIZE].all()
+    with pytest.raises(NotImplementedError, match="Conversion to bool"):
+        bool(full_a)
+
+    causal_a = splash_attention_mask.CausalMask((SEQ_LEN_SMALL, SEQ_LEN_SMALL))
+    causal_b = splash_attention_mask.CausalMask((SEQ_LEN_SMALL, SEQ_LEN_SMALL))
+    causal_shifted = splash_attention_mask.CausalMask(
+        (SEQ_LEN_SMALL, SEQ_LEN_SMALL), offset=POSITIVE_CAUSAL_OFFSET
+    )
+    assert causal_a == causal_b
+    assert hash(causal_a) == hash(causal_b)
+    assert causal_a != causal_shifted
+    expected_tril = np.tril(np.ones((BLOCK_SIZE, BLOCK_SIZE), dtype=np.bool_))
+    assert np.array_equal(causal_a[:BLOCK_SIZE, :BLOCK_SIZE], expected_tril)
+
+    dense_causal = np.tril(np.ones((SEQ_LEN_MEDIUM, SEQ_LEN_MEDIUM), dtype=np.bool_))
+    np_mask_a = splash_attention_mask.NumpyMask(dense_causal)
+    np_mask_b = splash_attention_mask.NumpyMask(dense_causal.copy())
+    assert np_mask_a == np_mask_b
+    assert hash(np_mask_a) == hash(np_mask_b)
+    with pytest.raises(ValueError, match="2-dim"):
+        splash_attention_mask.NumpyMask(np.ones((SEQ_LEN_SMALL,), dtype=np.bool_))
+    with pytest.raises(ValueError, match="boolean"):
+        splash_attention_mask.NumpyMask(
+            np.ones((SEQ_LEN_SMALL, SEQ_LEN_SMALL), dtype=np.int32)
+        )
+
+
+def test_mask_and_mask_info_contracts() -> None:
+    """Verify mask slicing/hashing, dedup, Q sharding, downcast, and dynamic specs."""
+    _assert_mask_object_contracts()
+    dense_causal = np.tril(np.ones((SEQ_LEN_MEDIUM, SEQ_LEN_MEDIUM), dtype=np.bool_))
+    np_mask_a = splash_attention_mask.NumpyMask(dense_causal)
+
+    dedup_info, dedup_fn = splash_attention_mask_info.process_mask(
+        np_mask_a, (BLOCK_SIZE, BLOCK_SIZE)
+    )
+    assert dedup_fn is None
+    assert dedup_info.partial_mask_blocks is not None
+    assert dedup_info.partial_mask_blocks.shape == (1, BLOCK_SIZE, BLOCK_SIZE)
+
+    sharded_info, sharded_fn = splash_attention_mask_info.process_mask(
+        splash_attention_mask.CausalMask((SEQ_LEN_MEDIUM, SEQ_LEN_MEDIUM)),
+        (BLOCK_SIZE, BLOCK_SIZE),
+        q_seq_shards=SMALL_GRID_DIM,
+    )
+    assert sharded_fn is not None
+    assert sharded_info.num_active_blocks is not None
+    assert sharded_info.active_rows is not None
+    assert list(sharded_info.num_active_blocks) == [
+        SMALL_GRID_DIM + 1,
+        MEDIUM_GRID_DIM * (MEDIUM_GRID_DIM + 1) // 2 - (SMALL_GRID_DIM + 1),
+    ]
+    assert int(np.max(sharded_info.active_rows)) == SMALL_GRID_DIM - 1
+
+    no_downcast_static, _ = splash_attention_mask_info.process_mask(
+        np_mask_a, (BLOCK_SIZE, BLOCK_SIZE), downcast_smem_data=False
+    )
+    assert no_downcast_static.active_rows is not None
+    assert no_downcast_static.block_mask is not None
+    assert no_downcast_static.active_rows.dtype == np.int32
+    assert no_downcast_static.block_mask.dtype == np.int32
+
+    no_downcast_dyn = splash_attention_mask_info.process_dynamic_mask(
+        jnp.asarray(dense_causal), (BLOCK_SIZE, BLOCK_SIZE), downcast_smem_data=False
+    )
+    assert no_downcast_dyn.mask_next is not None
+    assert no_downcast_dyn.block_mask is not None
+    assert no_downcast_dyn.mask_next.dtype == jnp.int32
+    assert no_downcast_dyn.block_mask.dtype == jnp.int32
+
+    config = splash_attention_kernel.SplashConfig(
+        block_q=BLOCK_SIZE, block_kv=BLOCK_SIZE, block_kv_compute=BLOCK_SIZE
+    )
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("q",))
+    mask_spec = jax.sharding.PartitionSpec("q")
+    dyn_kernel, dyn_spec = splash_attention_kernel.make_dynamic_splash_mha(
+        jnp.asarray(dense_causal),
+        mesh=mesh,
+        mask_spec=mask_spec,
+        config=config,
+        downcast_smem_data=False,
+    )
+    assert dyn_kernel.kwargs["downcast_smem_data"] is False
+    for field_name, field_spec in zip(
+        splash_attention_mask_info.MaskInfo._fields,
+        dyn_spec.fwd_mask_info,
+        strict=True,
+    ):
+        expected_spec = None if field_name == "q_sequence" else mask_spec
+        assert field_spec == expected_spec
+
+
+@pytest.mark.parametrize("sentinel_id", [-1, -2])
+@pytest.mark.parametrize("segment_only_full", [False, True])
+def test_segment_block_overlap_demotes_negative_sentinel_ids(
+    sentinel_id: int,
+    *,
+    segment_only_full: bool,
+) -> None:
+    """Keep uniform negative padding sentinel IDs demoted (`seg_all=False`)."""
+    q_idx = jnp.asarray([0, 0, 1, 1], dtype=jnp.int32)
+    kv_idx = jnp.asarray([0, 1, 0, 1], dtype=jnp.int32)
+    sentinel_segments = splash_attention_kernel.SegmentIds(
+        q=jnp.full((SEQ_LEN_SMALL,), sentinel_id, dtype=jnp.int32),
+        kv=jnp.full((SEQ_LEN_SMALL,), sentinel_id, dtype=jnp.int32),
+    )
+    seg_any, seg_all = _segment_block_overlap(
+        sentinel_segments,
+        q_idx,
+        kv_idx,
+        q_blocks=SMALL_GRID_DIM,
+        kv_blocks=SMALL_GRID_DIM,
+        bq=BLOCK_SIZE,
+        bkv=BLOCK_SIZE,
+    )
+    assert bool(jnp.all(seg_any))
+    assert not bool(jnp.any(seg_all))
+
+    full_info, _ = splash_attention_mask_info.process_mask(
+        splash_attention_mask.FullMask((SEQ_LEN_SMALL, SEQ_LEN_SMALL)),
+        (BLOCK_SIZE, BLOCK_SIZE),
+    )
+    refined, _, _ = _refine_mask_info_with_segments(
+        full_info,
+        sentinel_segments,
+        _SegmentRefinementGrid(
+            q_blocks=SMALL_GRID_DIM,
+            kv_blocks=SMALL_GRID_DIM,
+            block_q=BLOCK_SIZE,
+            block_kv=BLOCK_SIZE,
+        ),
+        segment_only_full=segment_only_full,
+    )
+    expected_code = (
+        BlockMaskCode.SEGMENT_ONLY if segment_only_full else BlockMaskCode.PARTIAL
+    )
+    assert _active_tile_block_mask(refined) == {
+        (0, 0): expected_code,
+        (0, 1): expected_code,
+        (1, 0): expected_code,
+        (1, 1): expected_code,
+    }
 
 
 @pytest.mark.tpu_test

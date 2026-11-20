@@ -16,9 +16,16 @@
 """Mini-mask creation library.
 
 Source provenance:
-  Ported from https://github.com/google-deepmind/tokamax
-  (`tokamax/_src/ops/splash_attention/splash_attention_mask.py`).
+  Ported from https://github.com/openxla/tokamax
+  (`tokamax/_src/ops/splash_attention/splash_attention_mask.py`),
+  commit `5dff06a967d941abc5035edff68766e22a315430` (2026-10-20).
   Local modifications vs upstream Tokamax:
+  - Renamed `_ComputableMask` to `ComputableMask` for direct type checks in
+    `splash_attention_mask_info`.
+  - Pruned unused mask classes and helpers (`LocalMask`, `ChunkedCausalMask`,
+    `LogicalOr`, `LogicalAnd`, `Mask.__or__`, `Mask.__and__`,
+    `make_causal_mask`, `make_local_attention_mask`,
+    `make_chunk_attention_mask`, `make_random_mask`).
   - Removed legacy mypy error-suppression directive and applied repository
     formatting and lint cleanup.
 """
@@ -46,137 +53,8 @@ class Mask:
             " instead of bitwise operations on masks."
         )
 
-    def __or__(self, other: "Mask") -> "Mask":
-        if self.shape != other.shape:
-            raise ValueError(
-                f"Invalid shape for other: {other.shape}, expected: {self.shape}"
-            )
-        return LogicalOr(self, other)
 
-    def __and__(self, other: "Mask") -> "Mask":
-        if self.shape != other.shape:
-            raise ValueError(
-                f"Invalid shape for other: {other.shape}, expected: {self.shape}"
-            )
-        return LogicalAnd(self, other)
-
-
-def make_causal_mask(shape: tuple[int, int], offset: int = 0) -> np.ndarray:
-    """Makes a causal attention mask.
-
-    Args:
-      shape: Shape of the 2-dim mask: (q_seq_len, kv_seq_len).
-      offset: Offset of q start wrt kv. A positive offset shifts the bottom
-        triangle upward, a negative one shifts it downward. A negative offset
-        makes the first 'offset' rows of the attention matrix all 0s which leads
-        to undefined softmax.
-
-    Returns:
-      The causal mask.
-    """
-    q_seq_len, kv_seq_len = shape
-    q_idx = np.arange(q_seq_len, dtype=np.int32)
-    kv_idx = np.arange(kv_seq_len, dtype=np.int32)
-    return (q_idx[:, None] + offset >= kv_idx[None, :]).astype(np.bool_)
-
-
-def make_local_attention_mask(
-    shape: tuple[int, int],
-    window_size: tuple[int | None, int | None],
-    *,
-    offset: int = 0,
-) -> np.ndarray:
-    """Makes a local attention mask."""
-    q_seq_len, kv_seq_len = shape
-    q_idx = np.arange(q_seq_len, dtype=np.int32)
-    kv_idx = np.arange(kv_seq_len, dtype=np.int32)
-    mask = np.ones((q_seq_len, kv_seq_len), dtype=np.bool_)
-    left, right = window_size
-    if left is not None:
-        mask = mask & (q_idx[:, None] - left + offset <= kv_idx[None, :])
-    if right is not None:
-        mask = mask & (q_idx[:, None] + right + offset >= kv_idx[None, :])
-    return mask.astype(np.bool_)
-
-
-def make_chunk_attention_mask(shape: tuple[int, int], chunk_size: int) -> np.ndarray:
-    """Makes a chunked causal attention mask.
-
-    Args:
-      shape: The desired shape of the mask (q_seq_len, kv_seq_len).
-      chunk_size: The size of the attention chunks.
-
-    Returns:
-      A boolean mask of shape `mask_shape` where True indicates attention is
-      allowed according to chunked causal rules, and False otherwise.
-
-    Raises:
-      ValueError: If chunk_window_size is None or not positive.
-    """
-    if chunk_size <= 0:
-        raise ValueError("chunk_size must be positive")
-
-    q_seq_len, kv_seq_len = shape
-    q_idx = np.arange(q_seq_len, dtype=np.int32)
-    kv_idx = np.arange(kv_seq_len, dtype=np.int32)
-
-    # chunk mask calculation
-    same_chunk = (q_idx[:, None] // chunk_size) == (kv_idx[None, :] // chunk_size)
-    mask = same_chunk & (q_idx[:, None] >= kv_idx[None, :])
-    return mask
-
-
-def make_random_mask(shape: tuple[int, int], sparsity: float, seed: int) -> np.ndarray:
-    """Makes a random attention mask."""
-    np.random.seed(seed)
-    return np.random.binomial(n=1, p=1.0 - sparsity, size=shape).astype(np.bool_)
-
-
-@dataclasses.dataclass(slots=True)
-class LogicalOr(Mask):
-    left: Mask
-    right: Mask
-
-    def __init__(self, left: Mask, right: Mask):
-        if left.shape != right.shape:
-            raise ValueError("Masks must have the same shape")
-        self.left = left
-        self.right = right
-
-    @property
-    def shape(self) -> tuple[int, ...]:
-        return self.left.shape
-
-    def __getitem__(self, idx) -> np.ndarray:
-        return self.left[idx] | self.right[idx]
-
-    def __hash__(self):
-        return hash((type(self),) + (self.left, self.right))
-
-
-@dataclasses.dataclass(slots=True)
-class LogicalAnd(Mask):
-    left: Mask
-    right: Mask
-
-    def __init__(self, left: Mask, right: Mask):
-        if left.shape != right.shape:
-            raise ValueError("Masks must have the same shape")
-        self.left = left
-        self.right = right
-
-    @property
-    def shape(self) -> tuple[int, ...]:
-        return self.left.shape
-
-    def __getitem__(self, idx) -> np.ndarray:
-        return self.left[idx] & self.right[idx]
-
-    def __hash__(self):
-        return hash((type(self),) + (self.left, self.right))
-
-
-class _ComputableMask(Mask):
+class ComputableMask(Mask):
     """Superclass for all masks that can be computed inside the kernel.
 
     Uses a callable object.
@@ -248,7 +126,7 @@ class _ComputableMask(Mask):
         raise NotImplementedError()
 
 
-class CausalMask(_ComputableMask):
+class CausalMask(ComputableMask):
     """Lazy causal mask, prevents the model from attending to future tokens.
 
     Attributes:
@@ -269,7 +147,7 @@ class CausalMask(_ComputableMask):
         self.offset = offset
 
         def causal_mask_function(q_ids, kv_ids):
-            # When evaluating the mask in _process_mask we typically work with numpy
+            # When evaluating the mask in process_mask we typically work with numpy
             # array views.
             # Avoid the addition when possible to avoid instantiating an actual array.
             if self.offset == 0:
@@ -300,145 +178,6 @@ class CausalMask(_ComputableMask):
             (
                 type(self),
                 self.shape,
-                self.offset,
-                self.q_sequence.tobytes() if self.q_sequence is not None else None,
-            )
-        )
-
-
-class ChunkedCausalMask(_ComputableMask):
-    """Lazy chunked causal mask.
-
-    Attention is causal within each chunk (0, K), (K, 2K), (2K, 3K), ... tokens
-    attend to each other but not across chunks.
-    Llama4 models use interleaved chunk attention along with global attention.
-
-
-    Attributes:
-      chunk_size: The size of each attention chunk.
-    """
-
-    chunk_size: int
-
-    def __init__(
-        self,
-        shape: tuple[int, int],
-        chunk_size: int,
-        shard_count: int = 1,
-    ):
-        if chunk_size <= 0:
-            raise ValueError("chunk_size must be positive")
-        self.chunk_size = chunk_size
-
-        # Define the mask function for chunk attention
-        def chunked_causal_mask_function(q_ids, kv_ids):
-            """Computes the mask logic for the given slice indices."""
-            # Condition 1: Same chunk
-            same_chunk = (q_ids // self.chunk_size) == (kv_ids // self.chunk_size)
-
-            # Condition 2: Causal
-            causal = q_ids >= kv_ids
-
-            return same_chunk & causal
-
-        super().__init__(
-            shape=shape,
-            mask_function=chunked_causal_mask_function,
-            shard_count=shard_count,
-        )
-
-    def __eq__(self, other: object):
-        if not isinstance(other, type(self)):
-            return NotImplemented
-
-        return (
-            self.shape == other.shape
-            and self.chunk_size == other.chunk_size
-            and np.array_equal(self.q_sequence, other.q_sequence)
-        )
-
-    def __hash__(self):
-        return hash(
-            (
-                type(self),
-                self.shape,
-                self.chunk_size,
-                self.q_sequence.tobytes() if self.q_sequence is not None else None,
-            )
-        )
-
-
-class LocalMask(_ComputableMask):
-    """Lazy local mask, prevents model from attending to tokens outside window.
-
-    Attributes:
-      window_size: Size of the two sides of the local window (None identifies no
-        limit for the given side).
-      offset: Offset of q start wrt kv. A positive offset shifts the bottom
-        triangle upward, a negative one shifts it downward. A negative offset
-        makes the first 'offset' rows of the attention matrix all 0s which leads
-        to undefined softmax.
-    """
-
-    window_size: tuple[int | None, int | None]
-    offset: int
-
-    def __init__(
-        self,
-        shape: tuple[int, int],
-        window_size: tuple[int | None, int | None],
-        offset: int,
-        shard_count: int = 1,
-    ):
-        self.window_size = window_size
-        self.offset = offset
-
-        def local_mask_function(q_ids, kv_ids):
-            """Computes the local attention mask for the given slice indices."""
-            left_size, right_size = self.window_size
-
-            assert q_ids.ndim == 2
-            assert kv_ids.ndim == 2
-
-            if left_size is None and right_size is None:
-                return np.ones((q_ids.shape[0], kv_ids.shape[1]), dtype=np.bool_)
-
-            # Avoid the addition when possible to avoid instantiating an actual array.
-            shifted_q_ids = q_ids + self.offset if offset != 0 else q_ids
-
-            mask = None
-            if left_size is not None:
-                mask = shifted_q_ids - left_size <= kv_ids
-            if right_size is not None:
-                if mask is None:
-                    mask = shifted_q_ids + right_size >= kv_ids
-                else:
-                    mask &= shifted_q_ids + right_size >= kv_ids
-            return mask
-
-        super().__init__(
-            shape=shape,
-            mask_function=local_mask_function,
-            shard_count=shard_count,
-        )
-
-    def __eq__(self, other: object):
-        if not isinstance(other, type(self)):
-            return False
-
-        return (
-            self.shape == other.shape
-            and self.window_size == other.window_size
-            and self.offset == other.offset
-            and np.array_equal(self.q_sequence, other.q_sequence)
-        )
-
-    def __hash__(self):
-        return hash(
-            (
-                type(self),
-                self.shape,
-                self.window_size,
                 self.offset,
                 self.q_sequence.tobytes() if self.q_sequence is not None else None,
             )
