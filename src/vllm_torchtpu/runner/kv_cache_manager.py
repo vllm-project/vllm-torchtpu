@@ -43,7 +43,7 @@ from vllm.models.deepseek_v4.attention import (
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.v1.attention.backend import AttentionLayer, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
-from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -66,6 +66,10 @@ from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     unified_block_major_enabled,
 )
+from vllm_torchtpu.core.runner_slot_mamba import (
+    check_runner_slot_groups,
+    maybe_runner_slot_mamba_spec,
+)
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id,
@@ -74,9 +78,13 @@ from vllm_torchtpu.kv_cache_materializer import (
     materialize_kv_cache_tensors,
     materialize_shared_attention_cache,
 )
-from vllm_torchtpu.kv_cache_spec_normalizer import normalize_kv_cache_specs_for_tpu
+from vllm_torchtpu.kv_cache_spec_normalizer import (
+    normalize_kv_cache_specs_for_tpu,
+    resolve_subpage_packing_block_size,
+)
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
+    PallasAttentionBackendImpl,
     PallasMLAttentionBackend,
     VllmTPUDeepseekV32IndexerBackend,
 )
@@ -90,7 +98,6 @@ from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
 from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
-    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
     class _TpuKVCacheBackend(Protocol):
@@ -134,6 +141,21 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
             DeepseekV4IndexerCache,
             CompressorStateCache,
         ),
+    )
+
+
+def sparse_mla_page_size_bytes(
+    attn_module: MLAAttention, block_size: int, kv_cache_dtype: torch.dtype
+) -> int | None:
+    """A sparse MLA layer's page bytes from its (nope, rope) layout specs.
+
+    None when the layer is not sparse, so dense MLA keeps the padded
+    `PallasMLAttentionBackend.get_kv_cache_page_size_bytes`.
+    """
+    if getattr(attn_module, "use_sparse", False) is not True:
+        return None
+    return PallasMLAttentionBackend.get_sparse_kv_cache_page_size_bytes(
+        block_size, attn_module.head_size, kv_cache_dtype
     )
 
 
@@ -204,12 +226,51 @@ def _warn_if_kv_cache_is_padded(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class _CompactMambaSizing:
+    """Inputs of the compact-mamba attention block count, kept from
+    get_kv_cache_spec until the KV budget is known (see
+    `KVCacheManager.size_compact_mamba_kv_cache`)."""
+
+    attn_page_size_bytes: int
+    unpadded_mamba_page_size_bytes: int
+    num_attn_groups: int
+    num_mamba_groups: int
+    group_size: int
+    mamba_num_blocks: int
+
+    @property
+    def mamba_per_tensor_bytes(self) -> int:
+        """Mamba slot bytes in each of the `group_size` layer regions."""
+        return (
+            self.num_mamba_groups
+            * self.mamba_num_blocks
+            * self.unpadded_mamba_page_size_bytes
+        )
+
+    def attn_blocks_that_fit(self, avail: int) -> int:
+        """Attention blocks per layer that fit in `avail` next to the mamba
+        slots; zero or negative when none do."""
+        return (avail // self.group_size - self.mamba_per_tensor_bytes) // (
+            self.num_attn_groups * self.attn_page_size_bytes
+        )
+
+
+_COMPACT_MAMBA_FIT_HINT = (
+    "Raise `gpu_memory_utilization` or lower `max_num_seqs`; after the profile "
+    "run, lowering `max_num_batched_tokens` also shrinks the activations it "
+    "measured."
+)
+
+
 class KVCacheManager:
     """Owns the KV-cache spec/sizing half of `TPUModelRunner`."""
 
     def __init__(self, runner: TPUModelRunner) -> None:
         self.runner = runner
         self.ds_v4 = DsV4KVCacheAllocator(runner)
+        # Set when get_kv_cache_spec selects the compact-mamba layout.
+        self._compact_mamba_sizing: _CompactMambaSizing | None = None
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -231,23 +292,58 @@ class KVCacheManager:
             isinstance(m, (Attention, MLAAttention)) for m in layers.values()
         )
         has_mamba = any(isinstance(m, MambaBase) for m in layers.values())
-        if has_attention and not self.runner._unified_kv_layout:
+        hma_enabled = not self.runner.scheduler_config.disable_hybrid_kv_cache_manager
+        self.runner._subpage_kernel_block_size = (
+            resolve_subpage_packing_block_size(
+                layers,
+                self.runner.vllm_config,
+                self.runner.kv_cache_dtype,
+                cast("type[PallasAttentionBackend]", backend_cls),
+                block_size,
+            )
+            if hma_enabled
+            and has_attention
+            and not has_mamba
+            and not any(is_cache_for_ds_v4(m) for m in layers.values())
+            and not self.runner._unified_kv_layout
+            and backend_cls is not None
+            else None
+        )
+        subpage_packing = self.runner._subpage_kernel_block_size is not None
+        attn_block_size = self.runner._subpage_kernel_block_size or block_size
+        if subpage_packing:
+            self.runner._hybrid_uniform_page_size_bytes = None
+        elif has_attention and not self.runner._unified_kv_layout:
             self._update_attention_page_size_padded(layers, block_size)
             if has_mamba:
                 self._update_mamba_page_size_padded(layers, block_size)
 
-        hma_enabled = not self.runner.scheduler_config.disable_hybrid_kv_cache_manager
+        # Compact-mamba sizing (above) gave the GDN layers their own slot
+        # arrays, indexed by the runner's per-request slot ids: their scheduler
+        # blocks are never read.
+        runner_owns_mamba_slots = (
+            not self.runner._unified_kv_layout
+            and not self.runner._uniform_mamba_layout
+            and self.runner._mamba_num_blocks is not None
+        )
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         # DSv4 layers whose specs must reach vLLM verbatim; see
         # `is_cache_for_ds_v4`.
         ds_v4_layers: set[str] = set()
+        # Sparse MLA layers sized from their allocated (nope, rope) specs,
+        # which the normalizer's dense MLA page formula does not model.
+        sparse_mla_layers: set[str] = set()
         for layer_name, attn_module in layers.items():
             # Linear Attention path
             if isinstance(attn_module, MambaBase):
                 spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
                 if spec is not None:
-                    kv_cache_spec[layer_name] = spec
+                    kv_cache_spec[layer_name] = maybe_runner_slot_mamba_spec(
+                        spec,
+                        self.runner.vllm_config,
+                        runner_owns_slots=runner_owns_mamba_slots,
+                    )
             # DSv4's attention, SWA, compressor and indexer caches all build
             # their own specs, as the reference does.
             elif is_cache_for_ds_v4(attn_module):
@@ -306,26 +402,29 @@ class KVCacheManager:
                     assert backend_cls is not None
                     _warn_if_kv_cache_is_padded(
                         cast("type[_TpuKVCacheBackend]", backend_cls),
-                        block_size,
+                        attn_block_size,
                         attn_module.num_kv_heads,
                         attn_module.head_size,
                         self.runner.kv_cache_dtype,
                     )
-                    page_size_padded = (
-                        self.runner._hybrid_uniform_page_size_bytes
-                        if self.runner._hybrid_uniform_page_size_bytes is not None
-                        else cast(
+                    page_size_padded: int | None
+                    if subpage_packing:
+                        # vLLM unifies the pages by rescaling `block_size`.
+                        page_size_padded = None
+                    elif self.runner._hybrid_uniform_page_size_bytes is not None:
+                        page_size_padded = self.runner._hybrid_uniform_page_size_bytes
+                    else:
+                        page_size_padded = cast(
                             "type[_TpuKVCacheBackend]", backend_cls
                         ).get_kv_cache_page_size_bytes(
-                            block_size,
+                            attn_block_size,
                             attn_module.num_kv_heads,
                             attn_module.head_size,
                             self.runner.kv_cache_dtype,
                         )
-                    )
                     if attn_module.sliding_window is not None:
                         kv_cache_spec[layer_name] = SlidingWindowSpec(
-                            block_size=block_size,
+                            block_size=attn_block_size,
                             num_kv_heads=attn_module.num_kv_heads,
                             head_size=attn_module.head_size,
                             dtype=self.runner.kv_cache_dtype,
@@ -334,7 +433,7 @@ class KVCacheManager:
                         )
                     else:
                         kv_cache_spec[layer_name] = FullAttentionSpec(
-                            block_size=block_size,
+                            block_size=attn_block_size,
                             num_kv_heads=attn_module.num_kv_heads,
                             head_size=attn_module.head_size,
                             dtype=self.runner.kv_cache_dtype,
@@ -353,6 +452,28 @@ class KVCacheManager:
             # MLAAttention path
             elif isinstance(attn_module, MLAAttention):
                 if layer_name in kv_cache_spec:
+                    continue
+                sparse_page_size = (
+                    None
+                    if self.runner._hybrid_uniform_page_size_bytes is not None
+                    else sparse_mla_page_size_bytes(
+                        attn_module, block_size, self.runner.kv_cache_dtype
+                    )
+                )
+                if sparse_page_size is not None:
+                    # Published as `customize_spec` would, but from the
+                    # (nope, rope) arrays actually allocated.
+                    kv_cache_spec[layer_name] = MLAAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=1,
+                        head_size=attn_module.head_size,
+                        dtype=self.runner.kv_cache_dtype,
+                        cache_dtype_str=cache_dtype_str,
+                        page_size_padded=sparse_page_size,
+                        num_head_slots=1,
+                        state_content_bytes=sparse_page_size // block_size,
+                    )
+                    sparse_mla_layers.add(layer_name)
                     continue
                 page_size_padded = (
                     self.runner._hybrid_uniform_page_size_bytes
@@ -380,6 +501,15 @@ class KVCacheManager:
                 )
             else:
                 continue
+
+        for layer_name, attn_module in layers.items():
+            if (
+                layer_name in kv_cache_spec
+                and getattr(attn_module, "is_draft_layer", False) is True
+            ):
+                kv_cache_spec[layer_name] = dataclasses.replace(
+                    kv_cache_spec[layer_name], is_draft=True
+                )
 
         # Note: that each shared layer's target actually owns a KV cache (and
         # that the shared layer was not itself allocated one) is enforced later
@@ -421,8 +551,9 @@ class KVCacheManager:
             kv_cache_spec,
             self.runner.kv_cache_dtype,
             enable_unified_kv_layout=self.runner._unified_kv_layout,
-            exempt_layers=ds_v4_layers,
+            exempt_layers=ds_v4_layers | sparse_mla_layers,
             attention_backend=cast("type[PallasAttentionBackend] | None", backend_cls),
+            pin_page_size=not subpage_packing,
         )
         if (
             hma_enabled
@@ -430,6 +561,7 @@ class KVCacheManager:
             and not has_mamba
             and not ds_v4_layers
             and not self.runner._unified_kv_layout
+            and not subpage_packing
         ):
             assert backend_cls is not None
             kv_cache_spec = self._pad_native_attention_regions(
@@ -630,21 +762,14 @@ class KVCacheManager:
         layers already report equal `page_size_bytes` and
         `unify_kv_cache_spec_page_size` is a no-op.
 
-        NOTE: Cannot leave `page_size_padded=None` on every layer, because
-        vLLM core uses `page_size_padded` to size `num_blocks` against the HBM
-        budget. With `page_size_padded=None`, that sizing falls back to
-        generic page-size formula (https://github.com/vllm-project/vllm/blob/48aa8d8d7529d2314858d8487cc0a21789fc7ec1/vllm/v1/kv_cache_interface.py#L204-L218)
-        which has no notion of TPU's packing/alignment rules (e.g.
-        fp8 packs 4 elements per 32-bit lane, so `num_kv_heads * 2` gets
-        rounded up to a multiple of 4 in the actual TPU tensor -- see
-        `get_kv_cache_shape`). Where that rounding changes the byte count --
-        e.g. a GQA layer TP-sharded down to a single KV head -- the real TPU
-        allocation ends up larger than vLLM's generic formula accounted for,
-        so `num_blocks` is silently oversized and HBM usage silently exceeds
-        `gpu_memory_utilization`'s target, instead of failing loudly the way
-        this assertion does. `page_size_padded` has to stay pinned to the
-        true, packing-aware size on every layer; this function's job is only
-        to make sure every layer is pinned to the *same* one.
+        NOTE: When sub-page packing is off (i.e. whenever this helper is
+        called), specs cannot leave `page_size_padded=None` without
+        `customize_spec`, because vLLM's generic `real_page_size_bytes`
+        formula has no notion of TPU's packing/alignment rules (e.g. fp8 packs
+        4 elements per 32-bit lane, so `num_kv_heads * 2` rounds up to a
+        multiple of 4 in `get_kv_cache_shape`). Pinning `page_size_padded` to
+        the max packing-aware TPU page keeps all groups on one uniform page
+        when `resolve_subpage_packing_block_size` does not apply.
         """
         attn_page_sizes = set()
         backend_cls = cast(
@@ -664,7 +789,10 @@ class KVCacheManager:
                 )
             elif isinstance(m, MLAAttention):
                 attn_page_sizes.add(
-                    PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+                    sparse_mla_page_size_bytes(
+                        m, block_size, self.runner.kv_cache_dtype
+                    )
+                    or PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
                         block_size,
                         1,
                         m.head_size,
@@ -682,7 +810,9 @@ class KVCacheManager:
                 "Pure-attention hybrid KV cache: padding every layer "
                 "spec to %d bytes (max of native sizes %s). Avoids "
                 "vLLM's unify_kv_cache_spec_page_size leaving a stale "
-                "page_size_padded behind when layer head_dims differ.",
+                "page_size_padded behind when layer head_dims differ. "
+                "Note: A model mixing sparse and dense MLA layers pads "
+                "to the dense size, neutralizing sparse MLA RoPE savings.",
                 uniform_page_size_bytes,
                 sorted(attn_page_sizes),
             )
@@ -731,7 +861,15 @@ class KVCacheManager:
         if block_size is None:
             block_size = self.runner.vllm_config.cache_config.block_size
         assert block_size is not None
-        attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
+        attn_page_size_bytes = (
+            sparse_mla_page_size_bytes(
+                first_attn_module,
+                block_size,
+                self.runner.kv_cache_dtype,
+            )
+            if isinstance(first_attn_module, MLAAttention)
+            else None
+        ) or attention_backend.get_kv_cache_page_size_bytes(
             block_size,
             num_kv_heads,
             first_attn_module.head_size,
@@ -772,7 +910,7 @@ class KVCacheManager:
         #   e.g. 10 full-attn      + 30 mamba     → min (1 attn + 3 mamba)
         #
         # This duplicates the heuristic from
-        # `vllm/v1/core/kv_cache_utils.py::_get_kv_cache_groups_uniform_page_size`.
+        # `vllm/v1/core/kv_cache_planning.py::_get_kv_cache_groups_uniform_page_size`.
         # We can't call it directly because vLLM's grouping needs a fully
         # populated spec dict, while we need the group layout *before* we
         # can finish creating the specs (padding depends on grouping,
@@ -812,14 +950,14 @@ class KVCacheManager:
         self.runner._hybrid_uniform_page_size_bytes = int(uniform_page_size_bytes)
         self.runner.cache_config.mamba_page_size_padded = int(uniform_page_size_bytes)
 
-        # Prefer compact-mamba sizing: cap each mamba layer at
+        # Prefer the compact-mamba layout: cap each mamba layer at
         # `max_num_reqs + 1` recurrent slots and give the freed HBM to the
         # attention pool. Mamba state is recurrent — one slot per active
         # request — so the uniform layout wastes `num_blocks - max_num_reqs`
-        # mamba slots forever. On success this pins
-        # `num_gpu_blocks_override` to the (larger) attention block count and
-        # sets `_mamba_num_blocks`.
-        self._maybe_set_compact_mamba_num_blocks_override(
+        # mamba slots forever. On success this sets `_mamba_num_blocks`; the
+        # (larger) attention block count is set after the profile run, by
+        # `size_compact_mamba_kv_cache`.
+        self._maybe_select_compact_mamba_layout(
             attn_page_size_bytes,
             int(unpadded_mamba_page_size),
             num_attn_groups,
@@ -827,8 +965,8 @@ class KVCacheManager:
             group_size,
         )
 
-        # Fallback (compact sizing skipped, e.g. CPU-only tests or a
-        # user-pinned num_gpu_blocks_override): pin vLLM's num_blocks via the two-step
+        # Fallback (compact layout not selected, e.g. a KV connector or
+        # CPU-only tests): pin vLLM's num_blocks via the two-step
         # flooring that keeps peak HBM within `gpu_memory_utilization ×
         # total_hbm` at high utilization. See `_maybe_set_num_blocks_override`
         # for the formula and rationale; the short version is that vLLM's
@@ -847,11 +985,10 @@ class KVCacheManager:
         Matches `TPUWorker.determine_available_memory()`: the
         `utils.compute_hbm_budget` result (which reserves the
         `gpu_memory_utilization` cap minus
-        `utils.estimate_kv_connector_hbm_reserve` (HBM a connector allocates
-        after profile_run, such as the offload H2D
-        staging pool). Sizing overrides against this budget keeps them from
-        filling the connector reserve back up with KV blocks and defeating
-        the worker-side subtraction.
+        `TPUModelRunner.post_profile_hbm_reserves` (HBM allocated after
+        profile_run, such as the offload H2D staging pool). Sizing overrides
+        against this budget keeps them from filling these reserves back up
+        with KV blocks and defeating the worker-side subtraction.
         """
         if kv_cache_memory_bytes := self.runner.cache_config.kv_cache_memory_bytes:
             return kv_cache_memory_bytes
@@ -860,11 +997,10 @@ class KVCacheManager:
         )
         return utils.min_across_ep_dp(
             self.runner.vllm_config.parallel_config,
-            budget.available
-            - utils.estimate_kv_connector_hbm_reserve(self.runner.vllm_config),
+            budget.available - sum(self.runner.post_profile_hbm_reserves()),
         )
 
-    def _maybe_set_compact_mamba_num_blocks_override(
+    def _maybe_select_compact_mamba_layout(
         self,
         attn_page_size_bytes: int,
         unpadded_mamba_page_size_bytes: int,
@@ -872,9 +1008,8 @@ class KVCacheManager:
         num_mamba_groups: int,
         group_size: int,
     ) -> None:
-        """Cap mamba layers at `max_num_reqs + 1` recurrent slots and pin
-        `cache_config.num_gpu_blocks_override` so the freed HBM grows the
-        attention pool.
+        """Cap mamba layers at `max_num_reqs + 1` recurrent slots so the freed
+        HBM grows the attention pool.
 
         Tradeoff vs. the uniform num_blocks layout
         ------------------------------------------
@@ -889,6 +1024,21 @@ class KVCacheManager:
         (`AttentionMetadata.mamba_state_indices`) rather than by
         `block_tables[:, 0]`, since the mamba leading dim is now smaller than
         the attention pool.
+
+        When the attention pool is sized
+        --------------------------------
+        This runs before the worker's profile run, so the HBM free here still
+        includes the profile run's activations, and a count pinned here would
+        make the worker skip the profile run. So this only selects the layout
+        (failing early if the mamba slots cannot fit: the post-profile budget
+        is no larger); `size_compact_mamba_kv_cache` sets the attention block
+        count after the profile run.
+
+        A `num_gpu_blocks_override` already set (`--num-gpu-blocks-override`)
+        pins the attention pool to that count instead of the budget's: the
+        mamba slots stay compact, and HBM the pin leaves unused stays free, so
+        a deployment can allocate only the KV its traffic needs. The uniform
+        layout would instead pad every attention block to the mamba page.
 
         Sizing math
         -----------
@@ -915,22 +1065,27 @@ class KVCacheManager:
                 kv-cache group); the same value passed to
                 `_maybe_set_num_blocks_override`.
 
-        On success: sets `cache_config.num_gpu_blocks_override` (attention
-        block count) and `_mamba_num_blocks`. Raises when the KV budget cannot
-        hold the mamba slots; the remaining precondition-fail paths leave both
-        unset so the caller falls back to uniform sizing.
+        On success: sets `_mamba_num_blocks` and, unless the count is pinned,
+        keeps the inputs for `size_compact_mamba_kv_cache`. Raises when the KV
+        budget cannot hold the mamba slots (unless the count is pinned); the
+        remaining precondition-fail paths leave both unset so the caller
+        falls back to uniform sizing.
         """
         if self.runner._uniform_mamba_layout:
             logger.info("Compact mamba sizing skipped.")
             return
-        cache_config = self.runner.cache_config
-        if cache_config.num_gpu_blocks_override is not None:
-            return
+        # Only the user's --num-gpu-blocks-override can be set this early:
+        # every caller of get_kv_cache_spec (the engine, the drafter's
+        # load_model) runs before determine_available_memory, where
+        # size_compact_mamba_kv_cache sets it. A later call would read that
+        # count as a pin and check it against a budget the KV cache already
+        # fills.
+        pinned_blocks = self.runner.cache_config.num_gpu_blocks_override
         if group_size <= 0:
             return
 
         avail = self._available_kv_cache_hbm()
-        if avail <= 0:
+        if avail <= 0 and pinned_blocks is None:
             return
 
         # +1 reserves slot 0 as the null/sentinel block (never handed to a
@@ -940,62 +1095,114 @@ class KVCacheManager:
         # `num_spec + 1` consecutive slots so the GDN kernel can checkpoint
         # the state after every speculative window position (see
         # `_init_mamba_slot_pool` for the rollback scheme).
-        mamba_num_blocks = self.runner.max_num_reqs * self.runner._mamba_slot_stride + 1
-
-        avail_per_tensor = avail // group_size
-        mamba_per_tensor = (
-            num_mamba_groups * mamba_num_blocks * unpadded_mamba_page_size_bytes
+        sizing = _CompactMambaSizing(
+            attn_page_size_bytes=attn_page_size_bytes,
+            unpadded_mamba_page_size_bytes=unpadded_mamba_page_size_bytes,
+            num_attn_groups=num_attn_groups,
+            num_mamba_groups=num_mamba_groups,
+            group_size=group_size,
+            mamba_num_blocks=(
+                self.runner.max_num_reqs * self.runner._mamba_slot_stride + 1
+            ),
         )
-        # Falling back to the uniform layout here would pad every block to the
-        # mamba page and silently shrink the pool by ~50x, which surfaces as a
-        # throughput collapse rather than a misconfiguration. Fail loudly.
-        attn_per_tensor_avail = avail_per_tensor - mamba_per_tensor
-        if attn_per_tensor_avail <= 0:
-            raise ValueError(
-                f"Compact-mamba KV sizing does not fit: mamba slots alone need "
-                f"{mamba_per_tensor} B per layer region (mamba_num_blocks="
-                f"{mamba_num_blocks} x num_mamba_groups={num_mamba_groups} x "
-                f"mamba_unpadded={unpadded_mamba_page_size_bytes}), but the "
-                f"per-tensor KV budget is {avail_per_tensor} B. Raise "
-                f"`gpu_memory_utilization` or lower `max_num_seqs`."
+        if pinned_blocks is not None:
+            # The worker skips its profile run for a pinned count, and there
+            # is nothing to size after it.
+            budget_blocks = max(sizing.attn_blocks_that_fit(avail), 0)
+            if pinned_blocks > budget_blocks:
+                logger.warning(
+                    "[kv-sizing] num_gpu_blocks_override=%d attention blocks "
+                    "exceed the %d the measured KV budget holds next to %d "
+                    "compact mamba slots; the allocation may not fit in HBM.",
+                    pinned_blocks,
+                    budget_blocks,
+                    sizing.mamba_num_blocks,
+                )
+            self.runner._mamba_num_blocks = sizing.mamba_num_blocks
+            self._log_compact_mamba_split(
+                int(pinned_blocks), sizing, avail, pinned=True
             )
+            return
+        # Raises now, before the profile run, if the mamba slots cannot fit.
+        self._compact_mamba_attn_num_blocks(sizing, avail)
+        self.runner._mamba_num_blocks = sizing.mamba_num_blocks
+        self._compact_mamba_sizing = sizing
 
-        attn_num_blocks = attn_per_tensor_avail // (
-            num_attn_groups * attn_page_size_bytes
-        )
-        if attn_num_blocks <= 0:
-            raise ValueError(
-                f"Compact-mamba KV sizing does not fit: no attention blocks "
-                f"remain (avail_per_tensor={avail_per_tensor} B, "
-                f"mamba_per_tensor={mamba_per_tensor} B). Raise "
-                f"`gpu_memory_utilization` or lower `max_num_seqs`."
-            )
+    def size_compact_mamba_kv_cache(self, avail: int) -> None:
+        """Set `cache_config.num_gpu_blocks_override` to the compact-mamba
+        attention block count that fits in `avail`.
 
-        cache_config.num_gpu_blocks_override = int(attn_num_blocks)
-        self.runner._mamba_num_blocks = int(mamba_num_blocks)
+        `TPUWorker.determine_available_memory` calls this with the KV budget
+        it hands vLLM: measured after its profile run, or
+        `kv_cache_memory_bytes`, which skips the profile run. The executors
+        then copy the count to the engine. A no-op unless get_kv_cache_spec
+        selected the compact layout.
+        """
+        sizing = self._compact_mamba_sizing
+        if sizing is None:
+            return
+        attn_num_blocks = self._compact_mamba_attn_num_blocks(sizing, avail)
+        self.runner.cache_config.num_gpu_blocks_override = attn_num_blocks
+        self._log_compact_mamba_split(attn_num_blocks, sizing, avail)
 
+    @staticmethod
+    def _log_compact_mamba_split(
+        attn_num_blocks: int,
+        sizing: _CompactMambaSizing,
+        avail: int,
+        pinned: bool = False,
+    ) -> None:
         # Total HBM = group_size regions, each holding num_attn_groups
         # attention blocks + num_mamba_groups mamba slots.
         attn_bytes = (
-            group_size * num_attn_groups * attn_num_blocks * attn_page_size_bytes
+            sizing.group_size
+            * sizing.num_attn_groups
+            * attn_num_blocks
+            * sizing.attn_page_size_bytes
         )
-        mamba_bytes = (
-            group_size
-            * num_mamba_groups
-            * mamba_num_blocks
-            * unpadded_mamba_page_size_bytes
-        )
+        mamba_bytes = sizing.group_size * sizing.mamba_per_tensor_bytes
         logger.info(
             "Compact-mamba KV cache: num_gpu_blocks_override=%d (attn), "
             "_mamba_num_blocks=%d. HBM split: attn=%.2f GiB; "
-            "mamba=%.2f GiB; total=%.2f GiB / avail=%.2f GiB.",
+            "mamba=%.2f GiB; total=%.2f GiB / avail=%.2f GiB.%s",
             attn_num_blocks,
-            mamba_num_blocks,
+            sizing.mamba_num_blocks,
             attn_bytes / (2**30),
             mamba_bytes / (2**30),
             (attn_bytes + mamba_bytes) / (2**30),
             avail / (2**30),
+            " Attention blocks pinned by num_gpu_blocks_override." if pinned else "",
         )
+
+    @staticmethod
+    def _compact_mamba_attn_num_blocks(sizing: _CompactMambaSizing, avail: int) -> int:
+        """Attention blocks per layer that fit in `avail` next to the compact
+        mamba slots. Raises when none do."""
+        avail_per_tensor = avail // sizing.group_size
+        mamba_per_tensor = sizing.mamba_per_tensor_bytes
+        # Falling back to the uniform layout here would pad every block to the
+        # mamba page and silently shrink the pool by ~50x, which surfaces as a
+        # throughput collapse rather than a misconfiguration. Fail loudly.
+        if avail_per_tensor <= mamba_per_tensor:
+            raise ValueError(
+                f"Compact-mamba KV sizing does not fit: mamba slots alone need "
+                f"{mamba_per_tensor} B per layer region (mamba_num_blocks="
+                f"{sizing.mamba_num_blocks} x num_mamba_groups="
+                f"{sizing.num_mamba_groups} x mamba_unpadded="
+                f"{sizing.unpadded_mamba_page_size_bytes}), but the "
+                f"per-tensor KV budget is {avail_per_tensor} B. "
+                f"{_COMPACT_MAMBA_FIT_HINT}"
+            )
+
+        attn_num_blocks = sizing.attn_blocks_that_fit(avail)
+        if attn_num_blocks <= 0:
+            raise ValueError(
+                f"Compact-mamba KV sizing does not fit: no attention blocks "
+                f"remain (avail_per_tensor={avail_per_tensor} B, "
+                f"mamba_per_tensor={mamba_per_tensor} B). "
+                f"{_COMPACT_MAMBA_FIT_HINT}"
+            )
+        return int(attn_num_blocks)
 
     def _maybe_set_num_blocks_override(
         self, attn_page_size_bytes: int, uniform_page_size_bytes: int, group_size: int
@@ -1329,6 +1536,8 @@ class KVCacheManager:
             for gid in range(len(self.runner.kv_cache_config.kv_cache_groups))
         }
         if self.runner._unified_kv_layout:
+            # The unified pool stores GDN state in the scheduler's blocks.
+            check_runner_slot_groups(kv_cache_config, runner_owns_slots=False)
             self._initialize_unified_kv_cache(kv_cache_config)
             return
         backend_cls = cast(
@@ -1357,17 +1566,50 @@ class KVCacheManager:
                     "KV cache groups > 1."
                 )
 
-        block_sizes = [
-            group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
-        ]
+        group_specs = [group.kv_cache_spec for group in kv_cache_config.kv_cache_groups]
+        subpage_kbs = self.runner._subpage_kernel_block_size
+        subpage_packed = (
+            subpage_kbs is not None and len({s.block_size for s in group_specs}) > 1
+        )
+        if subpage_packed:
+            assert subpage_kbs is not None
+            assert subpage_kbs == min(s.block_size for s in group_specs)
+            kernel_block_sizes = [subpage_kbs] * len(group_specs)
+        else:
+            kernel_block_sizes = [s.block_size for s in group_specs]
 
-        self.runner.may_reinitialize_input_batch(kv_cache_config, block_sizes)
+        attn_subpage_layout: dict[str, tuple[int, int]] = {}
+        for group, kbs in zip(kv_cache_config.kv_cache_groups, kernel_block_sizes):
+            if isinstance(group.kv_cache_spec, AttentionSpec):
+                split = group.kv_cache_spec.block_size // kbs
+                for layer_name in group.layer_names:
+                    if layer_name not in self.runner.shared_kv_cache_layers:
+                        attn_subpage_layout[layer_name] = (kbs, split)
+        for layer_name, target_name in self.runner.shared_kv_cache_layers.items():
+            if target_name in attn_subpage_layout:
+                attn_subpage_layout[layer_name] = attn_subpage_layout[target_name]
+
+        self.runner.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
 
         # Populate self.attn_groups directly with a single shared TPU builder
         # per group; bypasses parent's initialize_attn_backend (per-backend
         # get_builder_cls dispatch, cudagraph-mode resolution, cp compat
         # checks) — all GPU-relevant and unused on TPU.
         self.runner.attn_groups = []
+        if subpage_packed:
+            # The widest attention block table is the one the kernel reads.
+            widest_gid = max(
+                (
+                    gid
+                    for gid, group in enumerate(kv_cache_config.kv_cache_groups)
+                    if isinstance(group.kv_cache_spec, AttentionSpec)
+                ),
+                key=lambda gid: (
+                    self.runner.input_batch.block_table[gid].max_num_blocks_per_req
+                ),
+            )
+            self.runner._attention_kernel_block_size = kernel_block_sizes[widest_gid]
+            self.runner._attention_kv_cache_group_id = widest_gid
         for gid, group in enumerate(kv_cache_config.kv_cache_groups):
             builder = AttentionMetadataBuilder(
                 group.kv_cache_spec,
@@ -1548,6 +1790,9 @@ class KVCacheManager:
                 tuple[torch.Tensor, ...],
             ],
         ] = {}
+        # Caches allocated on the device below (shared attention regions, then
+        # per-layer attention and mamba caches), flushed after the loop.
+        device_caches: list[torch.Tensor] = []
 
         def allocate_attention_region(
             region: tuple[int, int],
@@ -1573,10 +1818,13 @@ class KVCacheManager:
                     f"budget: region={region}, allocated={allocated_bytes}, "
                     f"required={required_bytes}, budget={budget}"
                 )
+            # Allocate on the device: a host tensor staged through `.to()` costs
+            # about twice the cache size in host RAM per worker.
             caches = tuple(
-                torch.zeros(shape, dtype=dtype).to(self.runner.device)
+                torch.zeros(shape, dtype=dtype, device=self.runner.device)
                 for shape, dtype in geometry
             )
+            device_caches.extend(caches)
             if native_caches is not None:
                 native_caches[key] = caches
             return caches
@@ -1604,18 +1852,28 @@ class KVCacheManager:
                     len(attention_specs) <= 1
                     or len(attention_specs) != len(layer_specs)
                     or attention_specs[0][1].page_size_bytes != region[1]
-                    or not can_share_attention_cache(
-                        [spec for _, spec in attention_specs], backend_cls
-                    )
+                ):
+                    continue
+                # Every layer of a packed model shares the kernel block size
+                # `initialize_kv_cache` selected, whichever groups this region holds.
+                kernel_block_size = attn_subpage_layout.get(
+                    attention_specs[0][0], (attention_specs[0][1].block_size, 1)
+                )[0]
+                if not can_share_attention_cache(
+                    [spec for _, spec in attention_specs],
+                    backend_cls,
+                    kernel_block_size,
                 ):
                     continue
                 shared_attention_caches[region] = materialize_shared_attention_cache(
                     layer_specs=attention_specs,
                     tensor_size=kv_cache_config.num_blocks * region[1],
                     num_blocks=kv_cache_config.num_blocks,
+                    kernel_block_size=kernel_block_size,
                     attn_backend=backend_cls,
                     device=self.runner.device,
                 )
+            device_caches.extend(shared_attention_caches.values())
 
         for kv_cache_tensor in [] if _is_ds_v4 else kv_cache_config.kv_cache_tensors:
             # Each descriptor names layers within the whole backing allocation;
@@ -1646,8 +1904,11 @@ class KVCacheManager:
                     ):
                         cache_shape = (mamba_num_blocks, *shape)
                         mamba_states.append(
-                            torch.zeros(cache_shape, dtype=dtype).to(self.runner.device)
+                            torch.zeros(
+                                cache_shape, dtype=dtype, device=self.runner.device
+                            )
                         )
+                    device_caches.extend(mamba_states)
                     kv_caches[layer_name] = tuple(mamba_states)
                 elif isinstance(kv_cache_spec, MLAAttentionSpec):
                     attn_module = self.runner.vllm_config.compilation_config.static_forward_context.get(  # noqa: E501
@@ -1715,9 +1976,12 @@ class KVCacheManager:
                         kv_caches[layer_name] = bundle_view_by_name[layer_name]
                     else:
                         assert backend_cls is not None
+                        kbs, subpage_split = attn_subpage_layout.get(
+                            layer_name, (kv_cache_spec.block_size, 1)
+                        )
                         kv_cache_shape = backend_cls.get_kv_cache_shape(
-                            num_blocks,
-                            kv_cache_spec.block_size,
+                            num_blocks * subpage_split,
+                            kbs,
                             kv_cache_spec.num_kv_heads,
                             kv_cache_spec.head_size,
                             kv_cache_spec.dtype,
@@ -1728,6 +1992,12 @@ class KVCacheManager:
                         )[0]
                 else:
                     raise NotImplementedError
+
+        # torch_tpu defers a device zero-fill until first use. Flush these caches
+        # so the precompile below sees them in HBM, as the unified path flushes
+        # its pool (where PJRT donates only buffers with no pending write).
+        if device_caches:
+            synchronize_tensors(device_caches)
 
         self._add_shared_kv_cache_aliases(kv_caches)
 
@@ -1759,10 +2029,6 @@ class KVCacheManager:
         # Pre-build and cache bundled RPA kernels across all attention layers before
         # torch.compile tracing.
         if self.runner._kv_cache_bundle is not None:
-            from vllm_torchtpu.layers.adapter.attention import (
-                PallasAttentionBackendImpl,
-            )
-
             layers = get_layers_from_vllm_config(self.runner.vllm_config, Attention)
             # Only enter wrapper context when eligible attention layers are present.
             eligible = [
@@ -1811,11 +2077,14 @@ class KVCacheManager:
         # Initialize the compact-mamba slot allocator now that the true mamba
         # block count is known. When compact sizing was skipped, mamba shares
         # the attention `num_blocks`, so the pool spans that range instead.
+        owns_mamba_slots = False
         if (
             allocated_mamba_num_blocks is not None
             and not self.runner._uniform_mamba_layout
         ):
             self.runner._init_mamba_slot_pool(allocated_mamba_num_blocks)
+            owns_mamba_slots = True
+        check_runner_slot_groups(kv_cache_config, runner_owns_slots=owns_mamba_slots)
 
         # Compact pool counterpart of the read-offset buffer allocated in
         # `initialize_kv_cache`, indexed over the mamba slot pool rather
@@ -1834,6 +2103,14 @@ class KVCacheManager:
             self.runner.mamba_slot_read_offsets = torch.zeros(
                 allocated_mamba_num_blocks, dtype=torch.int32
             ).to(self.runner.device)
+
+        static_ctx = self.runner.vllm_config.compilation_config.static_forward_context
+        for layer_name, (_, split) in attn_subpage_layout.items():
+            attn_mod = static_ctx.get(layer_name)
+            if isinstance(attn_mod, Attention) and isinstance(
+                attn_mod.impl, PallasAttentionBackendImpl
+            ):
+                attn_mod.impl.set_subpage_split(split)
 
         # Precompile after KV cache allocation so XLA's buffer assignment sees
         # the same HBM pressure as runtime.

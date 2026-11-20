@@ -1,6 +1,6 @@
 # Testing & CI Guide
 
-`vllm-torchtpu` runs continuous integration on Buildkite (`.buildkite/pipeline_tests.yml`), with each step in a Kubernetes pod: CPU pods for unmarked tests and TPU v7x slices (1x1x1 and 2x2x1) for `tpu_test` and `multichip` tests.
+`vllm-torchtpu` runs continuous integration on Buildkite (`.buildkite/pipeline_cpu.yml` and `.buildkite/pipeline_tests.yml`), with each step in a Kubernetes pod: CPU pods for unmarked tests and TPU v7x slices (1x1x1 and 2x2x1) for `tpu_test` and `multichip` tests.
 
 ---
 
@@ -12,7 +12,7 @@ Install the `test` dependency group before running `pytest`:
 uv pip install --prerelease=allow -e . --group vllm --group test
 ```
 
-The commands below match the exact marker expressions and file filters executed in `.buildkite/pipeline_tests.yml`:
+The commands below match the exact marker expressions and file filters executed in `.buildkite/pipeline_cpu.yml` and `.buildkite/pipeline_tests.yml`:
 
 ### 1. Fast CPU Unit Tests (No TPU Required)
 

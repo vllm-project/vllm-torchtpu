@@ -23,11 +23,6 @@ from vllm_torchtpu.experimental.export.api import (
     TextOnlyLLMExportConfig,
 )
 from vllm_torchtpu.experimental.export.exporter import export
-from vllm_torchtpu.experimental.export.rope_patch import (
-    compute_mrope_dim_modalities,
-    is_in_graph_rope_eligible,
-    patch_in_graph_rotary_embedding,
-)
 from vllm_torchtpu.experimental.export.universal_adapter import (
     UniversalVllmExportableLLM,
     build_export_config_from_vllm,
@@ -39,6 +34,11 @@ from vllm_torchtpu.experimental.export.validator import (
     parse_mlir_main_signature,
     validate_exported_model_dir,
     validate_mlir_custom_calls,
+)
+from vllm_torchtpu.rope_patch import (
+    compute_mrope_dim_modalities,
+    is_in_graph_rope_eligible,
+    patch_in_graph_rotary_embedding,
 )
 
 __all__ = [

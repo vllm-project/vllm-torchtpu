@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
@@ -198,7 +199,10 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(
         if sc_lanes == "no-tpu-info":
             raise ValueError("unsupported device kind")
         return types.SimpleNamespace(
-            sparse_core=sc_info, num_lanes=128, vmem_capacity_bytes=64 << 20
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            sparse_core=sc_info,
+            num_lanes=128,
+            vmem_capacity_bytes=64 << 20,
         )
 
     monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", get_tpu_info)
@@ -947,8 +951,133 @@ def test_fused_moe_func_int4_packed_matches_reference():
     )
 
 
+def _unfused_silu_and_mul_moe(hidden_states, w1, w2, topk_weights, topk_ids):
+    """Unfused bfloat16 MoE: w13 GEMM -> bfloat16 -> SiluAndMul -> w2 GEMM ->
+    bfloat16, then the float32 top-k combine."""
+    num_tokens, topk = topk_ids.shape
+    ids = topk_ids.reshape(-1)
+    x = jnp.repeat(hidden_states, topk, axis=0).astype(jnp.float32)
+    gate_up = jnp.einsum(
+        "rk,rkn->rn",
+        x,
+        w1[ids].astype(jnp.float32),
+        precision=jax.lax.Precision.HIGHEST,
+    ).astype(jnp.bfloat16)
+    gate, up = jnp.split(gate_up, 2, axis=-1)
+    act = jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16) * up
+    down = jnp.einsum(
+        "rk,rkn->rn",
+        act.astype(jnp.float32),
+        w2[ids].astype(jnp.float32),
+        precision=jax.lax.Precision.HIGHEST,
+    ).astype(jnp.bfloat16)
+    weighted = down.astype(jnp.float32) * topk_weights.reshape(-1, 1)
+    return weighted.reshape(num_tokens, topk, -1).sum(axis=1).astype(jnp.bfloat16)
+
+
+@pytest.mark.tpu_test
+def test_fused_moe_func_silu_bf16_matches_unfused_silu_and_mul():
+    """With float32 top-k weights, activation="silu_bf16" reproduces the
+    unfused bfloat16 SiluAndMul MoE, and "silu_bf16" reaches gmm_v2."""
+    _require_tpu()
+
+    num_tokens, hidden, inter, num_experts, topk = 64, 512, 256, 8, 2
+    k_h, k_r, k_w1, k_w2 = jax.random.split(jax.random.key(1100), 4)
+    hidden_states = jax.random.normal(k_h, (num_tokens, hidden), jnp.bfloat16)
+    w1 = (
+        jax.random.normal(k_w1, (num_experts, hidden, 2 * inter)) * hidden**-0.5
+    ).astype(jnp.bfloat16)
+    w2 = (jax.random.normal(k_w2, (num_experts, inter, hidden)) * inter**-0.5).astype(
+        jnp.bfloat16
+    )
+    scores = jax.nn.softmax(jax.random.normal(k_r, (num_tokens, num_experts)))
+    topk_weights, topk_ids = jax.lax.top_k(scores, topk)
+    topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+    topk_ids = topk_ids.astype(jnp.int32)
+    expected = np.asarray(
+        _unfused_silu_and_mul_moe(hidden_states, w1, w2, topk_weights, topk_ids)
+    )
+
+    args = (hidden_states, w1, w2, None, None, None, None, topk_weights, topk_ids)
+    kwargs = dict(
+        topk=topk, use_ep=False, use_sparse_core=False, topk_weights_float32=True
+    )
+    fused_moe_func.clear_cache()
+    try:
+        hlo = fused_moe_func.lower(*args, activation="silu_bf16", **kwargs).as_text()
+        assert "act_silu_bf16" in hlo
+        silu_bf16 = np.asarray(fused_moe_func(*args, activation="silu_bf16", **kwargs))
+        silu = np.asarray(fused_moe_func(*args, activation="silu", **kwargs))
+    finally:
+        fused_moe_func.clear_cache()
+
+    # Every element within 2 bfloat16 ULPs; most are bit-equal.
+    assert np.isfinite(silu_bf16.astype(np.float32)).all()
+    np.testing.assert_allclose(
+        silu_bf16.astype(np.float32),
+        expected.astype(np.float32),
+        rtol=2**-6,
+        atol=2**-10,
+    )
+    bf16_equal = np.mean(silu_bf16 == expected)
+    fp32_equal = np.mean(silu == expected)
+    assert bf16_equal > 0.99, (bf16_equal, fp32_equal)
+    # Reverting to float32 intermediates must fail the check above.
+    assert fp32_equal < 0.9, (bf16_equal, fp32_equal)
+
+
+@pytest.mark.tpu_test
+def test_fused_moe_func_topk_weights_dtype_follows_the_setting():
+    """The setting, not the incoming dtype, picks the combine dtype: float32
+    weights from a custom routing function are rounded to the activation dtype
+    when it is off, and bfloat16 weights are combined in float32 when on."""
+    _require_tpu()
+
+    num_tokens, hidden, inter, num_experts, topk = 64, 512, 256, 8, 2
+    k_h, k_r, k_w1, k_w2 = jax.random.split(jax.random.key(7), 4)
+    hidden_states = jax.random.normal(k_h, (num_tokens, hidden), jnp.bfloat16)
+    w1 = (jax.random.normal(k_w1, (num_experts, hidden, 2 * inter)) * 0.05).astype(
+        jnp.bfloat16
+    )
+    w2 = (jax.random.normal(k_w2, (num_experts, inter, hidden)) * 0.05).astype(
+        jnp.bfloat16
+    )
+    scores = jax.nn.softmax(jax.random.normal(k_r, (num_tokens, num_experts)))
+    weights_f32, topk_ids = jax.lax.top_k(scores, topk)
+    topk_ids = topk_ids.astype(jnp.int32)
+    weights_bf16 = weights_f32.astype(jnp.bfloat16)
+
+    def run(weights, topk_weights_float32):
+        return np.asarray(
+            fused_moe_func(
+                hidden_states,
+                w1,
+                w2,
+                None,
+                None,
+                None,
+                None,
+                weights,
+                topk_ids,
+                topk=topk,
+                use_ep=False,
+                use_sparse_core=False,
+                topk_weights_float32=topk_weights_float32,
+            )
+        )
+
+    np.testing.assert_array_equal(run(weights_f32, False), run(weights_bf16, False))
+    np.testing.assert_array_equal(
+        run(weights_bf16, True), run(weights_bf16.astype(jnp.float32), True)
+    )
+
+
 def _fake_tpu_info(sparse_core):
-    return types.SimpleNamespace(sparse_core=sparse_core)
+    # A chip the SparseCore kernels are validated on; only the SparseCore
+    # geometry varies across these tests.
+    return types.SimpleNamespace(
+        chip_version=pltpu.ChipVersion.TPU_7X, sparse_core=sparse_core
+    )
 
 
 def _fake_sc_info(num_lanes, num_cores, num_subcores):
@@ -1011,6 +1140,16 @@ def test_onehot_threshold_auto_zero_without_sparse_core(monkeypatch):
     monkeypatch.setattr(
         fused_moe_gmm.pltpu, "get_tpu_info", lambda: _fake_tpu_info(None)
     )
+    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
+
+
+def test_onehot_threshold_auto_zero_for_unvalidated_sparse_core_chip(monkeypatch):
+    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
+    # TPU8i reports a SparseCore, but the SparseCore gather/reduce kernels are
+    # not validated on it, so the one-hot path is off.
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_8I, 1)
+    assert info.sparse_core is not None
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", lambda: info)
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
 
@@ -1197,3 +1336,185 @@ def test_moe_gmm_onehot_combine_zeroes_uncomputed_rows(monkeypatch):
     )
 
     assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))
+
+
+def _count_primitive(jaxpr, name: str) -> int:
+    """Occurrences of primitive `name` in `jaxpr`, including nested jaxprs
+    (jnp.argsort is jit-wrapped, so its sort sits one level down)."""
+    count = 0
+    for eqn in jaxpr.eqns:
+        count += eqn.primitive.name == name
+        for param in eqn.params.values():
+            inner = getattr(param, "jaxpr", param)
+            if hasattr(inner, "eqns"):
+                count += _count_primitive(inner, name)
+    return count
+
+
+@pytest.mark.parametrize("routing", ["uniform", "skewed"])
+@pytest.mark.parametrize("skip_padded_tokens", [False, True])
+@pytest.mark.parametrize(
+    ("num_tokens", "use_ep", "use_sparse_core", "threshold", "expected_sorts"),
+    [
+        # Ragged permute keeps its single packed sort so SparseCore gather
+        # async overlap is preserved.
+        (32, True, True, 511, 1),
+        (32, True, True, 512, 0),
+        (32, False, False, 0, 0),
+        # 2,048 rows: last shape inside the single-sort envelope, so the
+        # counting sort still replaces it; only the packed value sort remains.
+        (128, False, False, 0, 1),
+        # 2,560 rows: outside it, the three-sort form is untouched.
+        (160, False, False, 0, 3),
+    ],
+)
+def test_prepare_routed_counting_sort_eliminates_redundant_sorts(
+    monkeypatch,
+    num_tokens,
+    use_ep,
+    use_sparse_core,
+    threshold,
+    expected_sorts,
+    skip_padded_tokens,
+    routing,
+):
+    topk, hidden, local_num_experts = 16, 16, 56
+    k_h, k_idx, k_mask = jax.random.split(jax.random.key(42), 3)
+    hidden_states = jax.random.normal(k_h, (num_tokens, hidden), dtype=jnp.bfloat16)
+    if routing == "skewed":
+        # Every route lands on one expert, so a single bucket holds all M
+        # rows (512 at 32 tokens, 2,048 at 128): the f32 rank prefixes exceed
+        # 256, where a precision downgrade of the counting sort's einsums
+        # would round them and the positions would stop being a permutation.
+        raw_idx = jnp.full((num_tokens, topk), 3, dtype=jnp.int32)
+    else:
+        raw_idx = jax.random.randint(
+            k_idx,
+            (num_tokens, topk),
+            minval=0,
+            maxval=local_num_experts,
+            dtype=jnp.int32,
+        )
+        # Include duplicate (token, expert) routes (MTP-style) and masked EP routes.
+        raw_idx = raw_idx.at[:, 1].set(raw_idx[:, 0])
+    is_local = jax.random.bernoulli(k_mask, p=0.25, shape=(num_tokens, topk))
+    topk_indices = jnp.where(is_local, raw_idx, -1) if use_ep else raw_idx
+    topk_weights = jnp.linspace(
+        0.01, 0.2, num_tokens * topk, dtype=jnp.bfloat16
+    ).reshape(num_tokens, topk)
+    if skip_padded_tokens:
+        # The last two tokens are padding: zero routing weight drops them.
+        topk_weights = topk_weights.at[-2:].set(0.0)
+
+    # Mock ragged_gather_v2 on non-TPU hosts so EP ragged_permute traces cleanly.
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "ragged_gather_v2",
+        lambda hs, idx, _off, _cnt: hs[idx],
+    )
+
+    common = dict(
+        local_num_experts=local_num_experts,
+        topk=topk,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=threshold,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+    cs_out = prepare_routed_gmm_inputs(
+        hidden_states, topk_indices, topk_weights, **common
+    )
+
+    with monkeypatch.context() as m:
+        m.setattr(fused_moe_gmm, "_COUNTING_SORT_SCATTER_MAX_ROWS", 0)
+        m.setattr(
+            fused_moe_gmm, "_counting_sort_positions", lambda *a, **kw: (None, None)
+        )
+        ref_out = prepare_routed_gmm_inputs(
+            hidden_states, topk_indices, topk_weights, **common
+        )
+
+    for got, want in zip(cs_out, ref_out):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+    if routing == "skewed":
+        # Pin the permutation property directly on the rank contraction, not
+        # just through the end-to-end comparison above.
+        flat = topk_indices.reshape(-1)
+        sort_keys = jnp.where(flat >= 0, flat, local_num_experts)
+        positions, counts = fused_moe_gmm._counting_sort_positions(
+            sort_keys, local_num_experts + 1
+        )
+        assert positions is not None and counts is not None
+        np.testing.assert_array_equal(
+            np.sort(np.asarray(positions)), np.arange(sort_keys.shape[0])
+        )
+        assert int(np.asarray(counts).sum()) == sort_keys.shape[0]
+        assert int(np.asarray(counts).max()) > fused_moe_gmm._COUNTING_SORT_BLOCK // 2
+
+    jaxpr = jax.make_jaxpr(
+        lambda h, idx, w: prepare_routed_gmm_inputs(h, idx, w, **common)
+    )(hidden_states, topk_indices, topk_weights)
+    num_sorts = _count_primitive(jaxpr.jaxpr, "sort")
+    assert num_sorts == expected_sorts, (
+        f"Expected {expected_sorts} comparison sort ops, got {num_sorts}"
+    )
+    assert _count_primitive(jaxpr.jaxpr, "cumsum") == 0
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "use_ep", "use_sparse_core", "threshold", "expected_sorts"),
+    [
+        # Non-EP TP and EP one-hot inside the single-sort envelope: with the
+        # counting sort stood down they return to the packed single sort.
+        (32, False, False, 0, 1),
+        (32, True, True, 512, 1),
+        # Ragged permute keeps the counting sort regardless of the knob.
+        (32, True, True, 511, 1),
+    ],
+)
+def test_prepare_routed_counting_sort_env_gate_restores_sorts(
+    monkeypatch, num_tokens, use_ep, use_sparse_core, threshold, expected_sorts
+):
+    topk, hidden, local_num_experts = 16, 16, 56
+    k_h, k_idx, k_mask = jax.random.split(jax.random.key(7), 3)
+    hidden_states = jax.random.normal(k_h, (num_tokens, hidden), dtype=jnp.bfloat16)
+    raw_idx = jax.random.randint(
+        k_idx, (num_tokens, topk), minval=0, maxval=local_num_experts, dtype=jnp.int32
+    )
+    is_local = jax.random.bernoulli(k_mask, p=0.25, shape=(num_tokens, topk))
+    topk_indices = jnp.where(is_local, raw_idx, -1) if use_ep else raw_idx
+    topk_weights = jnp.linspace(
+        0.01, 0.2, num_tokens * topk, dtype=jnp.bfloat16
+    ).reshape(num_tokens, topk)
+    monkeypatch.setattr(
+        fused_moe_gmm, "ragged_gather_v2", lambda hs, idx, _off, _cnt: hs[idx]
+    )
+    common = dict(
+        local_num_experts=local_num_experts,
+        topk=topk,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=threshold,
+        skip_padded_tokens=False,
+    )
+    on_out = prepare_routed_gmm_inputs(
+        hidden_states, topk_indices, topk_weights, **common
+    )
+
+    with monkeypatch.context() as m:
+        m.setattr(fused_moe_gmm, "_COUNTING_SORT", False)
+        m.setattr(fused_moe_gmm, "_SINGLE_SORT", True)
+        off_out = prepare_routed_gmm_inputs(
+            hidden_states, topk_indices, topk_weights, **common
+        )
+        jaxpr = jax.make_jaxpr(
+            lambda h, idx, w: prepare_routed_gmm_inputs(h, idx, w, **common)
+        )(hidden_states, topk_indices, topk_weights)
+
+    for got, want in zip(off_out, on_out):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    num_sorts = _count_primitive(jaxpr.jaxpr, "sort")
+    assert num_sorts == expected_sorts, (
+        f"Expected {expected_sorts} comparison sort ops, got {num_sorts}"
+    )

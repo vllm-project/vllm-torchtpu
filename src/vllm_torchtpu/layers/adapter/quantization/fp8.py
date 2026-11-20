@@ -43,7 +43,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from math import gcd
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import torch
 from vllm.model_executor.layers.attention import Attention
@@ -406,11 +406,6 @@ def _quantize_and_format_single_moe_weight(
     return w, w_scale
 
 
-# Bytes of the float32 copy one requantization chunk dequantizes at a time.
-# The quantized chunk, its scales and the formatting temporaries come on top.
-_REQUANT_CHUNK_BYTES = 1 << 30
-
-
 def _requantize_expert_chunks(
     weight: torch.Tensor,
     scale: torch.Tensor | None,
@@ -431,7 +426,7 @@ def _requantize_expert_chunks(
     """
     num_experts = weight.shape[0]
     per_expert = weight[0].numel() * 4
-    per_chunk = max(1, _REQUANT_CHUNK_BYTES // per_expert)
+    per_chunk = max(1, envs.TPU_MOE_REQUANT_CHUNK_BYTES // per_expert)
     weights, scales = [], []
     for start in range(0, num_experts, per_chunk):
         end = min(start + per_chunk, num_experts)
@@ -783,14 +778,22 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
 
-    def __init__(self, quant_config: Fp8Config, moe_config):
+    def __init__(
+        self,
+        quant_config: Fp8Config,
+        moe_config,
+        weight_scale_name: Literal["weight_scale", "weight_scale_inv"] | None = None,
+    ):
         FusedMoEMethodBase.__init__(self, moe_config)
         self.quant_config = quant_config
         self.weight_block_size = quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
-        self.weight_scale_name = (
-            "weight_scale_inv" if self.block_quant else "weight_scale"
-        )
+        # Native fp8 checkpoints name block scales `weight_scale_inv`.
+        if weight_scale_name is None:
+            weight_scale_name = (
+                "weight_scale_inv" if self.block_quant else "weight_scale"
+            )
+        self.weight_scale_name = weight_scale_name
         # Native allocation/loading reads these states in vLLM 0.29.
         # maybe_roundup_sizes refines them when a TP shard is smaller than a
         # checkpoint block.
@@ -1070,6 +1073,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             )
             return
         prebuild_fused_moe_kernel(
+            topk_weights_float32=self._tpu_topk_weights_float32,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
@@ -1174,7 +1178,12 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
-        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        topk_weights, topk_ids = moe_routing.route(
+            layer,
+            x,
+            router_logits,
+            topk_weights_float32=self._tpu_topk_weights_float32,
+        )
 
         # Either reason to take the collectives from vLLM leaves the routing
         # tensors local here, still holding this rank's own tokens. (The third
@@ -1193,6 +1202,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).
         kwargs = {
+            "topk_weights_float32": self._tpu_topk_weights_float32,
             "hidden_states": x,
             "w1": layer.w13_weight,
             "w2": layer.w2_weight,

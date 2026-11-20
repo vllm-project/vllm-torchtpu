@@ -35,6 +35,7 @@ Choose your preferred installation method below:
 ## Prerequisites
 
 - **Python 3.12** (`>=3.12,<3.13`). Pre-built `tpu-sync-torch` and `torch_tpu` wheels target CPython 3.12.
+- **`libibverbs.so.1`**. The `tpu-sync-torch` extension links it and fails to import without it. The project's Docker image installs it; on a host or in a container that lacks it, install your distribution's `libibverbs1` package (for example `apt-get install libibverbs1`).
 - We recommend using `uv` for installing dependencies as it is significantly faster than standard `pip`.
 
 ---
@@ -153,7 +154,7 @@ VLLM_TARGET_DEVICE=empty pip install -e . --group vllm \
 
 ## Option 3: Install `vllm` and `vllm-torchtpu-core` Separately (Cross-Repo Development)
 
-Follow these steps when developing or debugging both `vllm` and `vllm-torchtpu-core` in separate local checkouts (or installing `vllm-torchtpu-core` without `--group vllm`). Currently, `vllm==0.32.0` is supported.
+Follow these steps when developing or debugging both `vllm` and `vllm-torchtpu-core` in separate local checkouts (or installing `vllm-torchtpu-core` without `--group vllm`). Currently, `vllm==0.33.0` is supported.
 
 ### Using `uv` (Recommended)
 
@@ -163,7 +164,7 @@ source ~/uv_venv/bin/activate
 export UV_TORCH_BACKEND=cpu
 
 # 1. Clone and install vLLM in editable mode (with common dependencies)
-git clone --depth 1 --branch v0.32.0 https://github.com/vllm-project/vllm.git ~/vllm
+git clone --depth 1 --branch v0.33.0 https://github.com/vllm-project/vllm.git ~/vllm
 VLLM_TARGET_DEVICE="empty" uv pip install -e ~/vllm
 
 # 2. Clone and install vllm-torchtpu-core only (without --group vllm)
@@ -181,7 +182,7 @@ source ~/pip_venv/bin/activate
 pip install --upgrade pip
 
 # 1. Clone and install vLLM in editable mode (with common dependencies)
-git clone --depth 1 --branch v0.32.0 https://github.com/vllm-project/vllm.git ~/vllm
+git clone --depth 1 --branch v0.33.0 https://github.com/vllm-project/vllm.git ~/vllm
 VLLM_TARGET_DEVICE="empty" pip install \
   --extra-index-url https://download.pytorch.org/whl/cpu \
   -e ~/vllm
@@ -204,7 +205,7 @@ pip install \
 
 | Flag | Purpose |
 | :--- | :--- |
-| `--group vllm` | Installs pinned upstream `vllm` (`v0.32.0`) from source. |
+| `--group vllm` | Installs pinned upstream `vllm` (`v0.33.0`) from source. |
 | `--group test` | Installs `pytest`, `pytest-mock`, `pytest-cov`, `parameterized`, and `vllm_test_utils`. |
 | `--extra benchmarking` | Installs `lm-eval`, `evalscope`, `datasets`, and `runai-model-streamer[gcs]`. |
 | `--extra omni` | Installs `vllm-omni` for multimodal diffusion models (e.g., FLUX, Wan2.2). |

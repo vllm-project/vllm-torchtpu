@@ -539,6 +539,12 @@ def test_sol_fingerprint_is_role_invariant_and_layout_specific():
     assert payload_a["fa_kernel_page_tokens"] == 128
     assert payload_a["pool_lane_width"] == 128
     assert "kv_rows" not in payload_a
+    assert set(payload_a["gdn_state_unit_bytes"]) == {
+        "gdn_conv_k",
+        "gdn_conv_q",
+        "gdn_conv_v",
+        "gdn_ssm",
+    }
     assert fp_a == sol.canonical_fingerprint(payload_a)
     # A token-major peer cannot produce this fingerprint: the module refuses
     # its manifest outright (and the schema token differs anyway).

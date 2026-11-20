@@ -71,6 +71,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     fused_moe_gmm,
     prebuild_fused_moe_kernel,
     quantize_native_fp4_kmajor,
+    resolve_activation_name,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -81,7 +82,7 @@ from vllm_torchtpu.layers.core.quant_methods import MXFP4, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import (
     dequantize_mxfp4_packed,
     dequantize_tensor,
-    e8m0_to_fp32,
+    e8m0_to_fp32_bits,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
@@ -169,14 +170,12 @@ def _dequantize_mxfp4_packed_on_device(
     axis: int,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """`dequantize_mxfp4_packed`, bit for bit, without leaving the device.
+    """Dequantize packed FP4 weights and scales on their current device.
 
-    The e8m0 scales are decoded on CPU, since `torch.ldexp` overflows on TPU
-    (see `e8m0_to_fp32`); they are 1/16 of the packed bytes. The fp4 nibbles
-    are decoded with selects rather than a LUT gather. Every product is an
-    fp4 value times a power of two, so it is exact in fp32 and in bf16.
+    Scales retain the CPU decoder's float32 bit patterns. The FP4 nibbles
+    are decoded with selects rather than a LUT gather.
     """
-    scale = e8m0_to_fp32(scale_u8.to("cpu")).to(weight_packed.device)
+    scale = e8m0_to_fp32_bits(scale_u8)
 
     def decode(nibble: torch.Tensor) -> torch.Tensor:
         exponent = (nibble >> 1) & 3
@@ -197,11 +196,6 @@ def _dequantize_mxfp4_packed_on_device(
     unpacked = torch.stack([decode(packed & 0x0F), decode(packed >> 4)], dim=-1)
     unpacked = unpacked.reshape(*weight_packed.shape[:-1], -1)
     return dequantize_tensor(unpacked, scale, axis, out_dtype)
-
-
-def _get_activation_str(activation) -> str:
-    """Convert MoEActivation enum or string to plain string."""
-    return activation.value if hasattr(activation, "value") else str(activation)
 
 
 class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
@@ -242,7 +236,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
     def _resolve_tpu_activation(self, layer) -> str:
         # Deliberately not get_fused_moe_activation: that also encodes the
         # situ beta parameters, which this kernel path does not take.
-        return _get_activation_str(layer.activation)
+        return resolve_activation_name(layer.activation)
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         assert isinstance(layer, RoutedExperts)
@@ -312,6 +306,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         prebuild_fused_moe_kernel(
+            topk_weights_float32=self._tpu_topk_weights_float32,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
@@ -340,10 +335,15 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         # input_ids is forwarded for DeepSeek-V4 hash routing; mxfp4 is the only
         # method that supplies it, matching the pre-consolidation behavior.
         topk_weights, topk_ids = moe_routing.route(
-            layer, x, router_logits, input_ids=input_ids
+            layer,
+            x,
+            router_logits,
+            input_ids=input_ids,
+            topk_weights_float32=self._tpu_topk_weights_float32,
         )
 
         kwargs = {
+            "topk_weights_float32": self._tpu_topk_weights_float32,
             "hidden_states": x,
             "w1": layer.w13_weight,
             "w2": layer.w2_weight,
@@ -695,6 +695,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=device)
         prebuild_fused_moe_kernel(
+            topk_weights_float32=self._tpu_topk_weights_float32,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,

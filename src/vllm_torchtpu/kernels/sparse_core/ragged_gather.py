@@ -21,6 +21,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
+from vllm_torchtpu.kernels.sparse_core.support import get_sparse_core_info
 
 
 def main_kernel(
@@ -250,7 +251,7 @@ def ragged_gather(
 
     dtype = x.dtype
 
-    sc_info = pltpu.get_tpu_info().sparse_core
+    sc_info = get_sparse_core_info()
     if sc_info is None:
         # Sparse core is not available. Fallback to regular gather.
         return x[indices]

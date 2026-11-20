@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from typing import Any
@@ -22,7 +23,15 @@ from typing import Any
 import pytest
 
 from . import conftest as omni_conftest
-from .conftest import OmniRunner, _OmniRunnerManager, omni_fixture_lock
+from .conftest import (
+    _TPU_BOOTSTRAP_ENV_VARS,
+    OmniRunner,
+    _OmniRunnerManager,
+    omni_fixture_lock,
+)
+from .conftest import (
+    cleanup_test_environment as _real_cleanup_test_environment,
+)
 
 pytestmark = pytest.mark.omni
 _EVENTS: list[tuple[str, str]] = []
@@ -126,3 +135,37 @@ def test_omni_runner_seed_configuration() -> None:
     r_extra = manager.get_or_create(("model-extra-seed", None, {"seed": 100}))
     assert r_extra.omni.kwargs["seed"] == 100
     manager.close()
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "vllm_omni.diffusion.diffusion_engine",
+        "vllm_omni.entrypoints.openai.api_server",
+        "vllm_omni.entrypoints.cli.main",
+    ],
+)
+def test_vllm_omni_cold_import_subprocesses(module_name: str) -> None:
+    import subprocess
+
+    result = subprocess.run(
+        [sys.executable, "-c", f"import {module_name}"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_cleanup_test_environment_clears_tpu_bootstrap_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("vllm.distributed.cleanup_dist_env_and_memory", lambda: None)
+    monkeypatch.setattr(omni_conftest, "wait_for_tpu_release", lambda: None)
+    for var in _TPU_BOOTSTRAP_ENV_VARS:
+        monkeypatch.setenv(var, "stale-value")
+
+    _real_cleanup_test_environment()
+
+    for var in _TPU_BOOTSTRAP_ENV_VARS:
+        assert var not in os.environ

@@ -108,6 +108,7 @@ def _routing_layer(topk=10, renormalize=True):
         e_score_correction_bias=None,
         routed_scaling_factor=1.0,
         moe_config=SimpleNamespace(experts_per_token=topk),
+        capture_fn=None,
     )
 
 
@@ -207,6 +208,7 @@ def test_routing_path_compiles_fullgraph(monkeypatch, impl):
         "scoring_func",
         "e_score_correction_bias",
         "routed_scaling_factor",
+        "capture_fn",
     ],
 )
 def test_route_requires_declared_routing_fields(monkeypatch, field):
@@ -249,3 +251,117 @@ def test_route_hash_table_scales_by_the_layer_factor():
     )
     assert ids.tolist() == [[2, 3], [0, 1]]
     torch.testing.assert_close(weights, torch.full((2, 2), 0.5))
+
+
+def test_get_topk_weights_dtype():
+    torch = pytest.importorskip("torch")
+    assert moe_routing._get_topk_weights_dtype(torch.bfloat16, False) == torch.bfloat16
+    assert moe_routing._get_topk_weights_dtype(torch.float16, False) == torch.float16
+    assert moe_routing._get_topk_weights_dtype(torch.bfloat16, True) == torch.float32
+    assert moe_routing._get_topk_weights_dtype(torch.float16, True) == torch.float32
+
+
+def test_select_experts_honours_topk_weights_float32(monkeypatch):
+    torch = pytest.importorskip("torch")
+    hidden = torch.randn(4, 8, dtype=torch.bfloat16)
+    logits = torch.randn(4, 16)
+    layer = _routing_layer(topk=2)
+
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+
+    weights_bf16, _ = moe_routing.select_experts(
+        hidden_states=hidden,
+        router_logits=logits,
+        topk=2,
+        renormalize=True,
+        scoring_fn="softmax",
+        layer=layer,
+        topk_weights_float32=False,
+    )
+    assert weights_bf16.dtype == torch.bfloat16
+
+    weights_fp32, _ = moe_routing.select_experts(
+        hidden_states=hidden,
+        router_logits=logits,
+        topk=2,
+        renormalize=True,
+        scoring_fn="softmax",
+        layer=layer,
+        topk_weights_float32=True,
+    )
+    assert weights_fp32.dtype == torch.float32
+    torch.testing.assert_close(weights_fp32.bfloat16(), weights_bf16)
+
+
+def test_uniform_random_routing_honours_topk_weights_float32():
+    torch = pytest.importorskip("torch")
+    hidden = torch.randn(4, 8, dtype=torch.bfloat16)
+    logits = torch.randn(4, 16)
+
+    weights_bf16, _ = moe_routing._uniform_random_routing(
+        hidden, logits, topk=2, topk_weights_float32=False
+    )
+    assert weights_bf16.dtype == torch.bfloat16
+
+    weights_fp32, _ = moe_routing._uniform_random_routing(
+        hidden, logits, topk=2, topk_weights_float32=True
+    )
+    assert weights_fp32.dtype == torch.float32
+
+
+@pytest.mark.parametrize("branch", ["simulated", "custom_routing_function", "default"])
+def test_route_captures_the_ids_it_returns(monkeypatch, branch):
+    """Every routing branch publishes through the one hook, once.
+
+    `is`, not `equal`: the capturer must record the tensor the kernel consumes,
+    so a branch that captures a recomputed copy fails here.
+    """
+    import torch
+
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+    layer = _routing_layer(topk=2)
+    hidden = torch.ones(3, 4)
+    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0]] * 3)
+    if branch == "simulated":
+        chosen = (torch.ones(3, 2), torch.zeros(3, 2, dtype=torch.int32))
+        monkeypatch.setattr(
+            moe_routing, "maybe_simulate_routing", lambda *a, **k: chosen
+        )
+    elif branch == "custom_routing_function":
+        chosen = (torch.ones(3, 2), torch.ones(3, 2, dtype=torch.int32))
+        layer.custom_routing_function = lambda **k: chosen
+
+    captured = []
+    layer.capture_fn = captured.append
+    _, topk_ids = moe_routing.route(layer, hidden, logits)
+
+    assert len(captured) == 1
+    assert captured[0] is topk_ids
+
+
+def test_route_with_a_capture_fn_traces_fullgraph(monkeypatch):
+    """vLLM traces the MoE forward with fullgraph=True, where a graph break is
+    an error and not a fallback, so the hook has to survive dynamo.
+
+    backend="eager" keeps this about the Python path, which is
+    device-independent.
+    """
+    torch = pytest.importorskip("torch")
+    torch._dynamo.reset()
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+    layer = _routing_layer(topk=2)
+    table = torch.full((8, 2), -1, dtype=torch.int32)
+    layer.capture_fn = lambda ids: table[: ids.shape[0]].copy_(ids)
+    hidden = torch.ones(4, 4)
+    logits = torch.randn(4, 8)
+
+    compiled = torch.compile(
+        lambda h, r: moe_routing.route(layer, h, r),
+        fullgraph=True,
+        backend="eager",
+        dynamic=False,
+    )
+    _, topk_ids = compiled(hidden, logits)
+
+    assert torch.equal(table[:4], topk_ids.to(torch.int32))
+    assert torch.equal(table[4:], torch.full((4, 2), -1, dtype=torch.int32))

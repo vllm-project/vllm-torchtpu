@@ -16,42 +16,6 @@
 import numpy as np
 import torch
 
-# Failure messages of assert_numerical_parity for a numeric mismatch. Must-fail
-# controls match on it, so other AssertionErrors, such as a shape mismatch, do
-# not satisfy them.
-NUMERIC_MISMATCH_PATTERN = r"Cosine similarity|Mismatched elements"
-
-
-def assert_numerical_parity(
-    actual: torch.Tensor,
-    reference: torch.Tensor,
-    atol: float = 1e-2,
-    rtol: float = 1e-2,
-    min_cos_sim: float = 0.999,
-):
-    """Assert cosine similarity and floating-point tolerance bounds."""
-    a_flat = actual.flatten().float()
-    r_flat = reference.flatten().float()
-
-    norm_a = torch.linalg.norm(a_flat)
-    norm_r = torch.linalg.norm(r_flat)
-    assert norm_a > 0 and norm_r > 0, (
-        f"Zero or NaN norm (actual {float(norm_a)}, reference {float(norm_r)}); "
-        "cannot compare directions"
-    )
-    cos_sim = float(torch.dot(a_flat, r_flat) / (norm_a * norm_r))
-    assert cos_sim >= min_cos_sim, (
-        f"Cosine similarity {cos_sim:.5f} fell below minimum required {min_cos_sim}"
-    )
-
-    torch.testing.assert_close(
-        actual.float(),
-        reference.float(),
-        atol=atol,
-        rtol=rtol,
-        msg=lambda m: f"TPU kernel output diverged from CPU baseline\n{m}",
-    )
-
 
 def compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
     """Global (single-window) SSIM, mean over RGB channels."""
@@ -79,3 +43,87 @@ def high_freq_energy(img: np.ndarray) -> float:
         - img[1:-1, 2:]
     )
     return float(np.abs(laplacian).mean())
+
+
+def compare_video_to_golden(video: np.ndarray, golden: np.ndarray) -> dict[str, float]:
+    """Compare two uint8 [F, H, W, 3] videos with the Flux golden-test metrics.
+
+    Returns the mean per-frame MAE and SSIM (single window, per channel), the
+    largest per-channel mean shift, and the video-to-golden ratios of
+    high-frequency energy (mean absolute Laplacian: drops with blur, rises with
+    noise) and of motion (mean absolute difference between consecutive frames).
+    """
+    if video.shape != golden.shape:
+        raise ValueError(f"video shape {video.shape} != golden {golden.shape}")
+    x = video.astype(np.float64) / 255.0
+    y = golden.astype(np.float64) / 255.0
+    hw = (1, 2)
+    mu_x, mu_y = x.mean(hw, keepdims=True), y.mean(hw, keepdims=True)
+    cov = ((x - mu_x) * (y - mu_y)).mean(hw, keepdims=True)
+    var_x, var_y = x.var(hw, keepdims=True), y.var(hw, keepdims=True)
+    c1, c2 = 0.01**2, 0.03**2
+    ssim = (
+        (2 * mu_x * mu_y + c1)
+        * (2 * cov + c2)
+        / ((mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2))
+    )
+    hf_x, hf_y = (
+        np.abs(
+            4 * v[:, 1:-1, 1:-1]
+            - v[:, :-2, 1:-1]
+            - v[:, 2:, 1:-1]
+            - v[:, 1:-1, :-2]
+            - v[:, 1:-1, 2:]
+        ).mean()
+        for v in (x, y)
+    )
+    motion_x, motion_y = (np.abs(np.diff(v, axis=0)).mean() for v in (x, y))
+    return {
+        "mae": float(np.abs(x - y).mean()),
+        "ssim": float(ssim.mean()),
+        "mean_shift": float(np.abs(mu_x.mean(0) - mu_y.mean(0)).max()),
+        "hf_ratio": float(hf_x / max(hf_y, 1e-9)),
+        "motion_ratio": float(motion_x / max(motion_y, 1e-9)),
+    }
+
+
+def assert_parity(
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    *,
+    name: str,
+    max_rel_l2: float | None = None,
+    max_abs: float | None = None,
+) -> None:
+    """Assert ``actual`` matches ``reference`` on each gate that is provided.
+
+    - ``max_rel_l2``: ``||actual - reference|| / ||reference||`` upper bound.
+    - ``max_abs``: largest elementwise absolute difference upper bound.
+
+    At least one gate is required. Metrics are computed in fp64.
+    """
+    assert max_rel_l2 is not None or max_abs is not None, f"{name}: no gate given"
+    assert actual.shape == reference.shape, (
+        f"{name}: shape ({tuple(actual.shape)}) != ({tuple(reference.shape)})"
+    )
+    actual_flat = actual.detach().cpu().double().flatten()
+    reference_flat = reference.detach().cpu().double().flatten()
+    diff = actual_flat - reference_flat
+    if max_rel_l2 is not None:
+        rel_l2 = float(diff.norm() / reference_flat.norm())
+        assert rel_l2 <= max_rel_l2, (
+            f"{name}: relative L2 error {rel_l2:.4e} exceeds max {max_rel_l2:.2e}"
+        )
+    if max_abs is not None:
+        abs_err = float(diff.abs().max())
+        assert abs_err <= max_abs, (
+            f"{name}: max absolute error {abs_err:.4e} exceeds max {max_abs:.2e}"
+        )
+
+
+def assert_all_loaded(loaded: set[str], module: torch.nn.Module) -> None:
+    """Assert that every parameter of ``module`` was populated by ``load_weights``."""
+    missing = {name for name, _ in module.named_parameters()} - loaded
+    assert not missing, (
+        f"vllm-omni parameters not loaded from checkpoint: {sorted(missing)[:10]}"
+    )

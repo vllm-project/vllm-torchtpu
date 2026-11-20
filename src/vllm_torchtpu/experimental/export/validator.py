@@ -401,3 +401,78 @@ def validate_exported_model_dir(output_dir: str) -> None:
                         f"{actual_out['shape']}"
                     )
                 _check_dtype(m_out, actual_out["dtype"], where)
+
+    _check_draft(meta, functions)
+
+
+# `speculative_config.method` values that declare the exported drafter (`draft`).
+DRAFTER_METHODS = ("mtp", "dspark")
+
+
+def _check_draft(meta: dict[str, Any], functions: dict[str, Any]) -> None:
+    """The drafting contract across functions (`draft`).
+
+    An artifact declaring a drafter method (`speculative_config.method` in
+    `DRAFTER_METHODS`) exports `draft` for exactly the `forward` buckets;
+    each variant takes intermediates the forward returns under the same name
+    and shape (`hidden_states` for an MTP layer, `aux_hidden_states` for a
+    DSpark draft model) and returns `draft_tokens` `[max_num_seqs, k]`.
+    """
+    serving = meta.get("serving_config") or {}
+    speculative = serving.get("speculative_config") or {}
+    draft = functions.get("draft")
+    method = speculative.get("method")
+    if method in DRAFTER_METHODS and not draft:
+        raise ValueError(
+            f"speculative_config declares method {method!r} but the artifact "
+            "exports no draft"
+        )
+    if not draft:
+        return
+    forward = functions.get("forward") or {}
+    if set(draft) != set(forward):
+        raise ValueError(
+            f"draft buckets {sorted(draft, key=int)} differ from forward buckets "
+            f"{sorted(forward, key=int)}"
+        )
+    k = int(speculative.get("num_speculative_tokens", 1))
+    want_draft = [int(serving.get("max_num_seqs", 0)), k]
+    for bucket, spec in draft.items():
+        where = f"draft_bucket{bucket}"
+        returned = {
+            o.get("name"): o
+            for o in forward[bucket].get("outputs", [])
+            if o.get("argument_type") == "intermediate"
+        }
+        taken = [
+            i
+            for i in spec.get("inputs", [])
+            if i.get("argument_type") == "intermediate"
+        ]
+        if not taken:
+            raise ValueError(f"{where} must take an intermediate forward returns")
+        for inp in taken:
+            name = inp.get("name")
+            out = returned.get(name)
+            if out is None:
+                raise ValueError(
+                    f"{where} takes intermediate {name}, which forward_bucket"
+                    f"{bucket} does not return (it returns {sorted(returned)})"
+                )
+            if (inp.get("shape"), inp.get("dtype")) != (
+                out.get("shape"),
+                out.get("dtype"),
+            ):
+                raise ValueError(
+                    f"{where} takes {name} {inp.get('dtype')}{inp.get('shape')}, "
+                    f"forward returns {out.get('dtype')}{out.get('shape')}"
+                )
+        draft_out = [
+            o for o in spec.get("outputs", []) if o.get("name") == "draft_tokens"
+        ]
+        if (
+            len(draft_out) != 1
+            or draft_out[0].get("shape") != want_draft
+            or (canonical_dtype(draft_out[0].get("dtype", "")) != "i32")
+        ):
+            raise ValueError(f"{where} must return draft_tokens i32{want_draft}")

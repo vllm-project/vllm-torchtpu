@@ -35,6 +35,9 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     config as compressor_config,
 )
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
+    RunLocalStateSpec,
+)
 from vllm_torchtpu.layers.core.attention_metadata import attention_block_table_width
 from vllm_torchtpu.logger import init_logger
 
@@ -104,6 +107,23 @@ class DsV4KVCacheAllocator:
         swa_layer_groups: list[list[str]] = []
         state_layer_names: list[str] = []
         for group in kv_cache_config.kv_cache_groups:
+            # vLLM's grouping compares neither the spec type nor prefix
+            # caching, so a cacheable window of the same size and block size
+            # can share a group with the run-local state; one side would then
+            # be prefix-cached wrongly. Layers keep their own spec only in the
+            # packed layout DSv4 uses; a merged group spec maps every layer
+            # to one spec, so this check cannot see a mix there.
+            run_local = {
+                isinstance(per_layer_spec(layer_name), RunLocalStateSpec)
+                for layer_name in group.layer_names
+                if layer_name not in self.runner.shared_kv_cache_layers
+            }
+            if len(run_local) > 1:
+                raise ValueError(
+                    "DeepSeek-V4 cache group mixes RunLocalStateSpec layers, "
+                    "which are not prefix-cacheable, with prefix-cacheable "
+                    f"layers: layers={group.layer_names}"
+                )
             swa_in_group: list[str] = []
             for layer_name in group.layer_names:
                 if layer_name in self.runner.shared_kv_cache_layers:

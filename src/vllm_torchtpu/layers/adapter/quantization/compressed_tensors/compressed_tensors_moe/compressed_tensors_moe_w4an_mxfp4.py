@@ -39,7 +39,7 @@ from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_ten
     get_cpu_weight_loader_hook,
     release_memory_to_os,
 )
-from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32
+from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32_bits
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 if TYPE_CHECKING:
@@ -184,8 +184,8 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         w2_weight_scale = self._loaded_data(layer.w2_weight_scale).to("tpu")
 
         # Convert e8m0 scales to fp32
-        w13_scale = e8m0_to_fp32(w13_weight_scale)
-        w2_scale = e8m0_to_fp32(w2_weight_scale)
+        w13_scale = e8m0_to_fp32_bits(w13_weight_scale)
+        w2_scale = e8m0_to_fp32_bits(w2_weight_scale)
 
         requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
         if requant_block is not None:
@@ -266,6 +266,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         prebuild_fused_moe_kernel(
+            topk_weights_float32=self._tpu_topk_weights_float32,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=use_ep,
@@ -282,7 +283,12 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
-        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        topk_weights, topk_ids = moe_routing.route(
+            layer,
+            x,
+            router_logits,
+            topk_weights_float32=self._tpu_topk_weights_float32,
+        )
 
         return self.apply_with_routing(
             layer,
@@ -313,13 +319,16 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         )
         # Ensure correct type for routing inputs
         topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
+        topk_weights = topk_weights.to(
+            torch.float32 if self._tpu_topk_weights_float32 else x.dtype
+        )
 
         topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
             topk_ids, topk_weights, is_local_tensor=pipelined
         )
 
         kwargs = {
+            "topk_weights_float32": self._tpu_topk_weights_float32,
             "hidden_states": x,
             "w1": layer.w13_weight,
             "w2": layer.w2_weight,

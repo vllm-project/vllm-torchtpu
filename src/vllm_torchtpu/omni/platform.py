@@ -95,6 +95,10 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         return False
 
     @classmethod
+    def supports_talker_mtp_graph_capture(cls) -> bool:
+        return False
+
+    @classmethod
     def set_device(cls, device: torch.device | int) -> None:
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
         if world_size > 1:
@@ -214,7 +218,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
-        return "vllm_torchtpu.worker.tpu_worker.TPUWorker"
+        return "vllm_torchtpu.omni.worker.tpu_ar_worker.TPUARWorker"
 
     @classmethod
     def get_omni_generation_worker_cls(cls) -> str:

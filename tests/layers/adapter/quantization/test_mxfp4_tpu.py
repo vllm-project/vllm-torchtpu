@@ -261,7 +261,7 @@ class TestMxfp4MoETPU:
         assert w2_weight_scale.shape[0] == w2_weight_processed.shape[0]
 
 
-def test_device_dequant_matches_cpu_reference_bit_for_bit():
+def test_device_dequant_matches_cpu_reference_bit_for_bit(device):
     # The select-based decode must reproduce the LUT reference exactly for
     # every packed byte (all 16 x 16 nibble pairs), in fp32 and bf16.
     from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
@@ -277,6 +277,42 @@ def test_device_dequant_matches_cpu_reference_bit_for_bit():
 
     for out_dtype in (torch.float32, torch.bfloat16):
         expected = dequantize_mxfp4_packed(packed, scale, -1, out_dtype)
-        actual = _dequantize_mxfp4_packed_on_device(packed, scale, -1, out_dtype)
+        actual = _dequantize_mxfp4_packed_on_device(
+            packed.to(device), scale.to(device), -1, out_dtype
+        ).cpu()
         assert actual.dtype == expected.dtype
-        assert torch.equal(actual, expected)
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "experts,w13_blocks,w2_blocks,second_minor",
+    [
+        (24, 14, 6, True),  # DeepSeek-V4: 7168 / 512 and 3072 / 512
+        (16, 32, 8, False),  # Qwen3.8: 8192 / 256 and 2048 / 256
+        (12, 14, 8, False),  # 12 experts pad less than 14 blocks
+    ],
+)
+def test_staged_scale_layout_is_the_one_prebuild_reads(
+    device, experts, w13_blocks, w2_blocks, second_minor
+):
+    """The op reads each scale table in the layout torch_tpu stages it in."""
+    from vllm_torchtpu.layers.adapter import fused_moe_ep
+
+    layer = torch.nn.Module()
+    for name, blocks in (
+        ("w13_weight_scale", w13_blocks),
+        ("w2_weight_scale", w2_blocks),
+    ):
+        scale = torch.ones(experts, blocks, 1, 256, device=device)
+        setattr(layer, name, torch.nn.Parameter(scale, requires_grad=False))
+    predicted = [
+        fused_moe_ep._scales_expert_second_minor(layer.w13_weight_scale),
+        fused_moe_ep._scales_expert_second_minor(layer.w2_weight_scale),
+    ]
+    fused_moe_ep.register_fused_scale_buffers(layer)
+    staged = [
+        fused_moe_ep._staged_scale_layout(layer._tpu_fused_w13_scale),
+        fused_moe_ep._staged_scale_layout(layer._tpu_fused_w2_scale),
+    ]
+    assert predicted == [second_minor] * 2
+    assert staged == [[2, 0, 1] if second_minor else [2, 1, 0]] * 2

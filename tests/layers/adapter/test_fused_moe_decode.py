@@ -14,7 +14,8 @@
 """Token-cap dispatch of the fused-MoE-decode op's per-rank body: up to
 FUSED_MOE_DECODE_KERNEL_MAX_TOKENS the kernel serves it; above, the GMM MoE
 fallback. Admission and fallback of GLM-5.2's convention (ungated shared
-expert, routed scale). No TPU needed: the kernels are stubs."""
+expert, routed scale). Which modules arm_runner_models arms, with and without
+a draft model. No TPU needed: the kernels are stubs."""
 
 from types import SimpleNamespace
 
@@ -133,6 +134,33 @@ def test_glm_admission(monkeypatch):
     assert bridge._admit(_glm_runner(other), 2) is None
 
 
+def test_admission_declines_silu_bf16(monkeypatch):
+    """The kernel fuses float32 SiLU; a "silu_bf16" layer must stay on gmm_v2
+    for every token count, or one server would mix two roundings."""
+    import vllm.distributed
+
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    runner = _glm_runner(DeepseekV2MLP(256, 128))
+    assert bridge._admit(runner, 2) is not None
+    runner._quant_method._tpu_activation_str = "silu_bf16"
+    assert bridge._admit(runner, 2) is None
+
+
+def test_admission_declines_topk_weights_float32(monkeypatch):
+    """The kernel rounds the top-k weights to bfloat16; under
+    tpu_moe_topk_weights_float32 the layer keeps gmm_v2's float32 combine."""
+    import vllm.distributed
+
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    runner = _glm_runner(DeepseekV2MLP(256, 128))
+    runner._quant_method._tpu_topk_weights_float32 = True
+    assert bridge._admit(runner, 2) is None
+
+
 def test_admission_declines_attention_narrower_than_mesh(monkeypatch):
     """PCP2 (or DP2) at TP1: the EP group spans the mesh, attention does not, so
     MoERunner still runs a collective after the op."""
@@ -182,3 +210,62 @@ def test_glm_fallback_scales_routed_only(monkeypatch):
     shared = (np.asarray(jax.nn.silu(gate_up[:, :2])) * gate_up[:, 2:]) @ w2s
     np.testing.assert_allclose(got, 2.5 * x + shared, rtol=1e-4, atol=1e-4)
     assert not np.allclose(got, 2.5 * (x + shared), rtol=1e-2, atol=1e-2)
+
+
+class _Runner:
+    """The parts of the TPU runner arm_runner_models reads."""
+
+    def __init__(self, drafter):
+        self.model = torch.nn.Linear(1, 1)
+        self.drafter = drafter
+
+    @property
+    def _async_drafter(self):
+        # TPUModelRunner._async_drafter asserts the drafter is a DFlash/Eagle3
+        # proposer, so it raises for no drafter and for an n-gram one alike;
+        # arm_runner_models must never touch it.
+        raise AssertionError("_async_drafter read")
+
+
+def _record_arms(monkeypatch):
+    armed = []
+    monkeypatch.setattr(
+        bridge,
+        "arm_fused_moe_decode",
+        lambda model, what="model": armed.append((model, what)) or 1,
+    )
+    return armed
+
+
+@pytest.mark.parametrize(
+    "drafter",
+    [None, SimpleNamespace()],
+    ids=["no-spec-decoding", "ngram-without-draft-model"],
+)
+def test_arm_runner_models_without_a_draft_model(monkeypatch, drafter):
+    """Only the target is armed, and the asserting _async_drafter property is
+    never touched."""
+    armed = _record_arms(monkeypatch)
+    runner = _Runner(drafter)
+    assert bridge.arm_runner_models(runner) == 1
+    assert armed == [(runner.model, "target model")]
+
+
+def test_arm_runner_models_arms_the_draft_model(monkeypatch):
+    armed = _record_arms(monkeypatch)
+    drafter = SimpleNamespace(draft_model=torch.nn.Linear(1, 1))
+    runner = _Runner(drafter)
+    assert bridge.arm_runner_models(runner) == 2
+    assert armed == [
+        (runner.model, "target model"),
+        (drafter.draft_model, "draft model"),
+    ]
+
+
+def test_arm_runner_models_skips_a_draft_that_is_the_target(monkeypatch):
+    """A drafter sharing the target module is not armed twice."""
+    armed = _record_arms(monkeypatch)
+    runner = _Runner(None)
+    runner.drafter = SimpleNamespace(draft_model=runner.model)
+    assert bridge.arm_runner_models(runner) == 1
+    assert armed == [(runner.model, "target model")]

@@ -266,21 +266,29 @@ def _need_devices(dcp_size):
         pytest.skip(f"needs {dcp_size} devices, have {n}")
 
 
-def _dcp_case(dcp_size, seed):
-    """Records plus the positional args and kwargs of one sharded DCP call."""
+def _dcp_case(dcp_size, seed, compression_ratio=1, interleave_size=1, seq_len=None):
+    """Records plus the positional args and kwargs of one sharded DCP call.
+
+    `seq_len` is in uncompressed tokens and defaults to filling the cache.
+    """
     rec = _global_records(KV_LEN)
     kq, kw = jax.random.split(jax.random.key(seed))
     q = (jax.random.normal(kq, (Q_LEN, H_IDX, D_IDX), jnp.float32) * 0.5).astype(
         jnp.float8_e4m3fn
     )
     weights = jax.random.normal(kw, (Q_LEN, H_IDX), jnp.float32).astype(jnp.bfloat16)
+    if seq_len is None:
+        seq_len = KV_LEN * compression_ratio
 
-    # interleave_size=1: global position g lives on rank g % dcp_size at local
-    # index g // dcp_size, so the shards are a strided de-interleave.
+    # Compressed position g lives on rank (g // c) % dcp_size, in chunks of
+    # c = interleave_size // compression_ratio, so each rank's shard is every
+    # dcp_size-th chunk.
+    interleave_c = interleave_size // compression_ratio
     vpages = KV_LEN // (PAGE_SIZE * dcp_size)
+    chunks = rec.reshape(-1, dcp_size, interleave_c, WIDTH)
     shards = jnp.concatenate(
         [
-            rec[r::dcp_size].reshape(vpages, PAGE_SIZE // 4, 4, WIDTH)
+            chunks[:, r].reshape(vpages, PAGE_SIZE // 4, 4, WIDTH)
             for r in range(dcp_size)
         ],
         0,
@@ -292,7 +300,7 @@ def _dcp_case(dcp_size, seed):
         q,
         weights,
         shards,
-        jnp.array([KV_LEN], jnp.int32),
+        jnp.array([seq_len], jnp.int32),
         jnp.arange(vpages, dtype=jnp.int32),
         jnp.array([0, Q_LEN], jnp.int32),
         jnp.array([0, 0, 1], jnp.int32),
@@ -300,9 +308,9 @@ def _dcp_case(dcp_size, seed):
     kwargs = dict(
         mesh=mesh,
         k=K,
-        compression_ratio=1,
+        compression_ratio=compression_ratio,
         dcp_size=dcp_size,
-        interleave_size=1,
+        interleave_size=interleave_size,
         num_kv_pages_per_block=2,
         num_queries_per_block=128,
     )
@@ -353,6 +361,41 @@ def test_dcp_reassembles_the_unsharded_global_topk(dcp_size, a2a_merge):
         assert got == want, (
             f"token {t}: {len(want - got)} missing, {len(got - want)} spurious"
         )
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("interleave_size", [4, 16, 64])
+def test_dcp_rows_see_only_complete_groups(dcp_size, interleave_size):
+    """Each rank's rows stop at the compressed groups complete so far.
+
+    A ratio-4 prefill from position 0 gives row t (t + 1) // 4 visible groups:
+    the first three rows see none, most rows stop partway through a chunk, and
+    at interleave 64 some ranks own nothing at all. The sequence fits in k, so
+    every visible group must win, on exactly one rank, and nothing else may.
+    """
+    _need_devices(dcp_size)
+    ratio = 4
+    _, args, kwargs = _dcp_case(
+        dcp_size,
+        3,
+        compression_ratio=ratio,
+        interleave_size=interleave_size,
+        seq_len=Q_LEN,
+    )
+    interleave_c = interleave_size // ratio
+
+    local_topk = np.asarray(streamindex_topk_dcp(*args, **kwargs)).reshape(
+        dcp_size, Q_LEN, K
+    )
+
+    for t in range(Q_LEN):
+        got = []
+        for r in range(dcp_size):
+            row = local_topk[r, t]
+            for local in row[row >= 0].tolist():
+                got.append(int(cp_local_to_global(local, r, dcp_size, interleave_c)))
+        assert sorted(got) == list(range((t + 1) // ratio)), f"token {t}: {got}"
 
 
 @pytest.mark.multichip

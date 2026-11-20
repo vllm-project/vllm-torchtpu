@@ -20,6 +20,7 @@ operations, to match the JAX reference implementation in
 
 Key functions:
 - e8m0_to_fp32: Convert e8m0 (8-bit exponent) scales to float32
+- e8m0_to_fp32_bits: Decode e8m0 scales to CPU-compatible bits on device
 - unpack_uint8_to_fp4: Unpack uint8 to FP4 e2m1 float values
 - dequantize_mxfp4_packed: Dequantize MXFP4 packed weights
 - quantize_tensor_to_fp4: Quantize float tensor to FP4 with block scaling
@@ -38,6 +39,9 @@ from collections.abc import Sequence
 import jax.numpy as jnp
 import torch
 
+# Defined once in kernels/fp8_wire.py; re-exported for existing importers.
+from vllm_torchtpu.kernels.fp8_wire import FP8_E4M3_MAX as FP8_E4M3_MAX
+
 # MXFP4 block size as stored in checkpoints
 MXFP4_BLOCK_SIZE = 32
 
@@ -50,9 +54,6 @@ REQUANTIZED_BLOCK_SIZE = 512
 # for the uint8 form used throughout this module.
 E8M0_MIN_EXP = -127
 E8M0_MAX_EXP = 127
-
-# Same value as jnp.finfo(jnp.float8_e4m3fn).max (448.0).
-FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 
 
 def dtype_max(dtype: jnp.dtype) -> float:
@@ -115,6 +116,7 @@ def e8m0_to_fp32(u8: torch.Tensor) -> torch.Tensor:
         float32 tensor with actual scale values.
 
     FIXME: TPU-specific behavior difference for large exponents (u8 >= 254).
+        Use `e8m0_to_fp32_bits` for device-safe decoding.
         - u8=254 -> exponent=127 -> 2^127 ≈ 1.7e38
         - On CPU: torch.ldexp correctly returns 1.7e38
         - On TPU: torch.ldexp overflows to inf (due to float32 limits)
@@ -126,6 +128,17 @@ def e8m0_to_fp32(u8: torch.Tensor) -> torch.Tensor:
     ones = torch.ones_like(u8, dtype=torch.float32)
     result = torch.ldexp(ones, exponents)
     return result
+
+
+def e8m0_to_fp32_bits(u8: torch.Tensor) -> torch.Tensor:
+    """Decode scale bytes on their device with the CPU ldexp result's bits.
+
+    Byte zero is the subnormal 2**-127. Byte 255 retains the existing
+    decoder's infinity result rather than changing its reserved-byte policy.
+    """
+    exponent_bits = u8.to(torch.int32) << 23
+    bits = torch.where(u8 == 0, 1 << 22, exponent_bits)
+    return bits.contiguous().view(torch.float32)
 
 
 def unpack_uint8_to_fp4(packed: torch.Tensor) -> torch.Tensor:

@@ -48,51 +48,6 @@ class Dtypes:
     conv_state: jnp.dtype
 
 
-@dataclasses.dataclass(frozen=True)
-class StateRegion:
-    """Copy-plan for one state region of an indexed external state source.
-
-    A slot's region spans ``nblocks`` consecutive source blocks starting
-    ``kb0`` blocks into the slot's window, rows ``[row0, row0 + nrows)``
-    of each — one contiguous DMA per slot. The raw bytes are accessed
-    through a typed view (``view_dtype`` elements, ``lane_split``-way
-    128-lane split); the leading ``rows_used`` typed rows carry the
-    state, the rest is zero padding.
-    """
-
-    kb0: int
-    nblocks: int
-    row0: int
-    nrows: int
-    view_dtype: jnp.dtype
-    lane_split: int
-    rows_used: int
-    # Optional static typed-row permutation between the pool's stored row
-    # order and the kernel's logical row order: logical_rows[i] is stored
-    # at typed row rows_perm[i].  None or the identity means the stored
-    # order IS the logical order.  Used by the QK pair-blocked conv layout,
-    # where full-width states interleave Q and K row-pairs per tap so that
-    # one whole pool token holds one head-pair's Q and K rows.
-    rows_perm: tuple[int, ...] | None = None
-
-
-@dataclasses.dataclass(frozen=True)
-class StateSourcePlan:
-    """States live in an indexed external source instead of dense per-slot
-    tensors: each state index owns a window of ``stride`` consecutive
-    source blocks holding both state regions.
-
-    The plan describes one checkpoint's geometry. With speculative
-    decoding every checkpoint is an independent source block named by
-    ``MetadataRef.s_idx_to_ckpt_indices`` and reuses this same geometry,
-    so nothing here varies with the verify window."""
-
-    stride: int
-    conv: StateRegion
-    recurrent: StateRegion
-    whole_block_dma: bool = False
-
-
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class GDNConfig:
@@ -111,7 +66,6 @@ class GDNConfig:
     # unbounded one; see `fused_conv1d_gdn` for the two and their validation.
     gate_lower_bound: float | None = None
     num_buffers: int = 2
-    state_plan: StateSourcePlan | None = None
     # Max tokens per speculative verify window (= num_speculative_tokens + 1),
     # which is also the number of state checkpoints kept per sequence. The
     # kernel reads a sequence's initial state from
@@ -122,6 +76,25 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # Indicate the use of unified pool.
+    is_shared: bool = False
+
+    @property
+    def conv_hbm_offset(self) -> int:
+        if self.is_shared:
+            # In Unified pool. Conv state is stored after recurrent state.
+            # Offset is calculated via recurrent state size.
+            lane_bytes = pltpu.get_tpu_info().num_lanes * 4
+            lane_elements = (
+                lane_bytes // jnp.dtype(self.dtypes.recurrent_state).itemsize
+            )
+            num_elements = self.v_dim_size * self.kq_head_dim
+            return num_elements // lane_elements
+        return 0
+
+    @property
+    def recurrent_hbm_offset(self) -> int:
+        return 0
 
     @property
     def chunk_size(self) -> int:
@@ -159,13 +132,13 @@ class GDNConfig:
 
     @property
     def triangular_block_size(self) -> int:
-        """Sub-block size of the chunked KDA intra-chunk solve.
+        """Sub-block size of the chunked GDN and KDA intra-chunk solves.
 
-        The diagonal sub-blocks are evaluated on the VPU/XLU with exact
-        pairwise gate differences and the off-diagonal ones as MXU GEMMs,
-        so this trades the two units off against each other: raising it
-        moves work from MXU to XLU. More value heads already means more
-        XLU work, hence the smaller blocks there.
+        The diagonal sub-blocks are evaluated on the VPU/XLU (forward
+        substitution, plus KDA's exact pairwise gate differences) and the
+        off-diagonal ones as MXU GEMMs, so this trades the two units off
+        against each other: raising it moves work from MXU to XLU. More value
+        heads already means more XLU work, hence the smaller blocks there.
         """
         # Within-block forward substitution issues head_groups * B / 2 broadcasts
         # per token. At 1 head group (<= 8 heads), B = 16 is optimal.
@@ -173,6 +146,13 @@ class GDNConfig:
         #   B inversely with head_groups (head_groups * B <= 16).
         # - KDA also tiles Aqk and L into O(1 / B^2) sub-block matmuls per token,
         #   so scale B^2 inversely with head_groups (head_groups * B**2 <= 16**2).
+        #
+        # B must divide the chunk: the intra-chunk solve walks the chunk in
+        # whole sub-blocks and `invert_triangular_matrix` rejects a non-dividing
+        # B (e.g. 24 local value heads, Qwen3.5/3.6-27B at TP=2, would get
+        # B = 16 // 3 = 5, which does not divide a 128-row chunk).
+        # Chunk sizes are powers of two, so pick the largest power of two
+        # that satisfies the budget instead of the exact quotient.
         head_groups = pl.cdiv(self.num_v_heads, 8)
         if self.is_kda:
             for b in (16, 8, 4):
@@ -180,7 +160,10 @@ class GDNConfig:
                     return b
             return 2
         # GDN: between-block updates scale as 1 / B.
-        return max(2, min(16, 16 // head_groups))
+        for b in (16, 8, 4):
+            if head_groups * b <= 16:
+                return b
+        return 2
 
     @property
     def use_recurrent(self) -> bool:

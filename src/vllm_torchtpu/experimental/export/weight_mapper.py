@@ -16,8 +16,10 @@
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
+
+from vllm_torchtpu import envs
 
 
 def _resolve_submod_and_param(
@@ -162,12 +164,23 @@ def infer_weight_sharding(
                 "f_b_proj",
                 "g_b_proj",
                 "attn_sink",
+                # The MTP predictor's column-parallel fc (Qwen3.5, Qwen3-Next).
+                ".fc.",
+                # Muse Spark's MoE projection to the expert width.
+                ".pre_expert_proj.",
             )
         ):
             return ["tp"]
         return [None]
 
     if rank == 2:
+        if ".in_proj_qkvz." in weight_name and envs.TPU_GDN_QKVZ_KERNEL_LAYOUT:
+            # TODO: shard dim 1 once this reads the layer's layout marker
+            # (`exporter.py` calls this without the model).
+            raise NotImplementedError(
+                "The AOT export shards in_proj_qkvz in vLLM's [n_out, n_in] "
+                "layout; unset TPU_GDN_QKVZ_KERNEL_LAYOUT to export at TP > 1."
+            )
         if (
             weight_name.endswith("embed_tokens.weight")
             or weight_name == "lm_head.weight"
@@ -176,6 +189,8 @@ def infer_weight_sharding(
             or weight_name.endswith(".down_proj.weight")
             or weight_name.endswith(".out_proj.weight")
             or weight_name.endswith(".wo_b.weight")
+            # Muse Spark's MoE projection back from the expert width.
+            or weight_name.endswith(".post_expert_proj.weight")
             or ".in_proj_qkvz." in weight_name
         ):
             return ["tp", None]
@@ -199,6 +214,8 @@ def infer_weight_sharding(
                 "f_b_proj",
                 "g_b_proj",
                 "compressor.fused_wkv_wgate",
+                ".fc.",
+                ".pre_expert_proj.",
             )
         ):
             return [None, "tp"]
@@ -223,3 +240,35 @@ def infer_weight_sharding(
         return [None, None, None, None]
 
     return [None] * rank
+
+
+# Embedding names a tied LM head shares, most specific first.
+_EMBEDDING_NAMES = (
+    "model.embed_tokens.weight",
+    "embed_tokens.weight",
+    "transformer.wte.weight",
+)
+
+
+def tied_lm_head_alias(names: Iterable[str]) -> tuple[str, str] | None:
+    """`(lm_head name, embedding name)` when the LM head is tied to the embedding.
+
+    None for an untied head. A tied head has no parameter of its own, so no
+    `lm_head.weight` is among `names`; it then projects with the language model's
+    embedding. A multimodal model nests the language model, so
+    `language_model.model.embed_tokens.weight` gives `language_model.lm_head.weight`.
+    """
+    names = list(names)
+    if any(n == "lm_head.weight" or n.endswith(".lm_head.weight") for n in names):
+        return None
+    found = []
+    for n in names:
+        for rank, emb in enumerate(_EMBEDDING_NAMES):
+            if n == emb or n.endswith("." + emb):
+                found.append(
+                    (rank, len(n), f"{n[: len(n) - len(emb)]}lm_head.weight", n)
+                )
+                break
+    # The language model's embedding: the most specific name (`model.embed_tokens`,
+    # not an MTP head's `mtp.embed_tokens`), then the outermost.
+    return min(found)[2:] if found else None

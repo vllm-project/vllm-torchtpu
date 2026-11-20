@@ -430,6 +430,9 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
         return None
     if qm._tpu_activation_str != "silu":
         return None
+    if qm._tpu_topk_weights_float32:
+        # The kernel rounds the top-k weights to bfloat16.
+        return None
     if getattr(layer, "w13_bias", None) is not None or (
         getattr(layer, "w2_bias", None) is not None
     ):
@@ -654,10 +657,11 @@ def arm_runner_models(model_runner: Any) -> int:
     model (the MTP layer). Called once after the drafter has loaded, when every
     module has its final weight layout."""
     armed = arm_fused_moe_decode(model_runner.model, "target model")
-    for name in ("drafter", "_async_drafter"):
-        drafter = getattr(model_runner, name, None)
-        draft = getattr(drafter, "draft_model", None) or getattr(drafter, "model", None)
-        if isinstance(draft, torch.nn.Module) and draft is not model_runner.model:
-            armed += arm_fused_moe_decode(draft, "draft model")
-            break
+    # `drafter` only: the runner's `_async_drafter` is the same object behind an
+    # isinstance assert, which raises (not AttributeError, so getattr's default
+    # does not catch it) without a DFlash/Eagle3 drafter: no spec decoding, or
+    # n-gram. Every model-backed TPU proposer keeps its module in draft_model.
+    draft = getattr(getattr(model_runner, "drafter", None), "draft_model", None)
+    if isinstance(draft, torch.nn.Module) and draft is not model_runner.model:
+        armed += arm_fused_moe_decode(draft, "draft model")
     return armed

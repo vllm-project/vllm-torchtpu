@@ -191,6 +191,11 @@ for cs_var in PREFILL_COMPILE_SIZES DECODE_COMPILE_SIZES; do
   fi
 done
 
+# MAX_NUM_BATCHED_TOKENS is the prefill token budget. Decode gets its own, by
+# default its largest compile size: the platform rejects a budget a step could
+# not pad to.
+DECODE_MAX_NUM_BATCHED_TOKENS="${DECODE_MAX_NUM_BATCHED_TOKENS:-$(tr ',' '\n' <<<"${DECODE_COMPILE_SIZES}" | sort -n | tail -n 1)}"
+
 # ---------------------------------------------------------------------------
 # Port management and conflict resolution
 # ---------------------------------------------------------------------------
@@ -256,7 +261,6 @@ common_args=(
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
   --kv-cache-dtype fp8
   --language-model-only
-  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
   --max-num-seqs "${MAX_NUM_SEQS}"
   --no-disable-hybrid-kv-cache-manager
   --attention-backend "${ATTENTION_BACKEND}"
@@ -308,6 +312,7 @@ prefill_args=(
   --host 0.0.0.0
   --port "${PREFILL_PORT}"
   "${common_args[@]}"
+  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
   --compilation-config "${prefill_compilation_config}"
   --tensor-parallel-size "${PREFILL_TP}"
   --prefill-context-parallel-size "${PREFILL_PCP}"
@@ -330,6 +335,7 @@ decode_args=(
   --host 0.0.0.0
   --port "${DECODE_PORT}"
   "${common_args[@]}"
+  --max-num-batched-tokens "${DECODE_MAX_NUM_BATCHED_TOKENS}"
   --compilation-config "${decode_compilation_config}"
   --tensor-parallel-size "${DECODE_TP}"
   --prefill-context-parallel-size 1
@@ -383,6 +389,7 @@ DECODE_DP_MASTER_PORT=${DECODE_DP_MASTER_PORT}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}
 MAX_MODEL_LEN=${MAX_MODEL_LEN}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS}
+DECODE_MAX_NUM_BATCHED_TOKENS=${DECODE_MAX_NUM_BATCHED_TOKENS}
 MAX_NUM_SEQS=${MAX_NUM_SEQS}
 ATTENTION_BACKEND=${ATTENTION_BACKEND}
 MAMBA_CACHE_MODE=${MAMBA_CACHE_MODE}
