@@ -1095,3 +1095,30 @@ def test_ltx2_per_batch_timestep_patch(monkeypatch):
     assert torch.all(kw_cond["timestep"][:, :4] == 0.0)
     assert torch.all(kw_cond["timestep"][:, 4:] == 900.0)
     assert kw_cond["audio_timestep"].shape == (2,)
+
+
+def test_ltx2_per_batch_timestep_patch_fails_on_signature_drift(monkeypatch):
+    from vllm_omni.diffusion.models.ltx2.ltx2_guidance import LTXGuidanceExecutor
+
+    def _drifted_denoise(self, ts, forward_ctx, *, video_token_count):
+        del self, ts, forward_ctx, video_token_count
+        return {}
+
+    monkeypatch.setattr(
+        ltx2_runtime.LTXRuntime, "_denoise_timestep_kwargs", _drifted_denoise
+    )
+    with pytest.raises(RuntimeError, match="signature drifted"):
+        patches._patch_ltx2_per_batch_timestep()
+
+    monkeypatch.setattr(
+        ltx2_runtime.LTXRuntime,
+        "_denoise_timestep_kwargs",
+        _UPSTREAM_DENOISE_TIMESTEP_KWARGS,
+    )
+    monkeypatch.setattr(
+        LTXGuidanceExecutor,
+        "timestep_kwargs",
+        staticmethod(lambda ts, video_token_count, audio_token_count: {}),
+    )
+    with pytest.raises(RuntimeError, match="expand_for_sequence_parallel"):
+        patches._patch_ltx2_per_batch_timestep()

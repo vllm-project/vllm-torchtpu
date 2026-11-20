@@ -688,6 +688,9 @@ def _patch_ltx2_per_batch_timestep() -> None:
     #     LTXI2VConditioningMixin._denoise_timestep_kwargs (which is sharded
     #     by the SP plan), while keeping audio_timestep 1-D (B,).
     # -------------------------------------------------------------------------
+    import inspect
+
+    from vllm_omni.diffusion.models.ltx2.ltx2_guidance import LTXGuidanceExecutor
     from vllm_omni.diffusion.models.ltx2.ltx2_runtime import LTXRuntime
 
     if getattr(
@@ -696,6 +699,31 @@ def _patch_ltx2_per_batch_timestep() -> None:
         False,
     ):
         return
+
+    # Fail loudly at patch-install time if upstream changes the replaced
+    # method's signature or drops expand_for_sequence_parallel.
+    expected_params = (
+        "self",
+        "ts",
+        "forward_ctx",
+        "denoise_ctx",
+        "video_token_count",
+        "audio_token_count",
+    )
+    actual_params = tuple(
+        inspect.signature(LTXRuntime._denoise_timestep_kwargs).parameters
+    )
+    if actual_params != expected_params:
+        raise RuntimeError(
+            "LTXRuntime._denoise_timestep_kwargs signature drifted from "
+            f"vllm-omni 0.32.0rc1: expected {expected_params}, got {actual_params}."
+        )
+    guidance_params = inspect.signature(LTXGuidanceExecutor.timestep_kwargs).parameters
+    if "expand_for_sequence_parallel" not in guidance_params:
+        raise RuntimeError(
+            "LTXGuidanceExecutor.timestep_kwargs no longer accepts "
+            "'expand_for_sequence_parallel'; review _patch_ltx2_per_batch_timestep."
+        )
 
     def _per_batch_denoise_timestep_kwargs(
         self: Any,
