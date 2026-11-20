@@ -48,6 +48,13 @@ Scope: the local host DRAM tier. The flag is refused with a global registry, a p
 store group, a storage tier or a shared-memory host pool: the classes register different
 region counts by stage, and Raiden's transfer spec for those paths wants equal worker
 geometry.
+
+TIER-X2 (``VLLM_TPU_OFFLOAD_TIER_X2=1``) lifts the first two refusals: ``shard_plan`` cuts
+each class into shards of one per-worker region count, each shard store joins the global
+registry under its own pool group and key namespace, Raiden's evict sweep demotes its cold
+blocks to that group's store nodes on another host, and a miss reads them back with
+``read_remote``. A group then belongs to several classes (the shards of one) and every key
+goes to each.
 """
 
 from __future__ import annotations
