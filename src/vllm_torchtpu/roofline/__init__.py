@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU roofline serving, memory, collective, and execution modeling."""
+"""Analytical TPU serving roofline, step floor, and mesh solver."""
 
 from __future__ import annotations
 
@@ -23,29 +23,12 @@ from .chips import (
     ChipSpec,
     SliceTopology,
 )
-from .collectives import (
-    Collective,
-    CollectiveConfig,
-    torus_collective_s,
-)
-from .constants import (
-    ACTIVATION_HULL_SCHEMA,
-    SUPPORTED_MODEL_TYPES,
-)
-from .geometry import (
-    LayerCounts,
-    ModelGeometry,
-    count_layer_types,
-    from_hf_config,
-)
+from .collectives import Collective, CollectiveConfig, torus_collective_s
+from .constants import ACTIVATION_HULL_SCHEMA, SUPPORTED_MODEL_TYPES
+from .geometry import LayerCounts, ModelGeometry, count_layer_types, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
-from .modules import (
-    Dtypes,
-    ModuleCost,
-    Parallel,
-    StepShape,
-    pass_costs,
-)
+from .memory import HbmBreakdown, KvFitInput, SeqKvLayout, hbm_footprint_per_core_bytes
+from .modules import Dtypes, ModuleCost, Parallel, StepShape, pass_costs
 from .occupancy import (
     ActivationRegime,
     ExpertActivationModel,
@@ -57,13 +40,17 @@ from .occupancy import (
     parse_activation_spec,
 )
 from .serving import ConcurrencyRow, ServingRequest, plan
-from .step import (
-    FloorOptions,
-    SpecShape,
-    StepFloor,
-    spec_cycle_floor,
-    step_floor,
+from .solver import (
+    ParetoPoint,
+    PoolMeshPlan,
+    ScenarioOverrides,
+    ServingPlan,
+    SolveOptions,
+    TrafficScenario,
+    build_example_scenario,
+    solve_serving_plan,
 )
+from .step import FloorOptions, SpecShape, StepFloor, spec_cycle_floor, step_floor
 
 __all__ = [
     "ACTIVATION_HULL_SCHEMA",
@@ -81,26 +68,38 @@ __all__ = [
     "ExpertActivationModel",
     "ExpertDispatch",
     "FloorOptions",
+    "HbmBreakdown",
+    "KvFitInput",
     "LayerCounts",
     "ModelGeometry",
     "ModuleCost",
     "Parallel",
+    "ParetoPoint",
+    "PoolMeshPlan",
+    "ScenarioOverrides",
+    "SeqKvLayout",
+    "ServingPlan",
     "ServingRequest",
     "SliceTopology",
+    "SolveOptions",
     "SpecShape",
     "StepFloor",
     "StepShape",
+    "TrafficScenario",
     "active_experts_envelope",
     "bernoulli_expected_experts",
+    "build_example_scenario",
     "count_layer_types",
     "dtypes_from_hf_config",
     "from_hf_config",
+    "hbm_footprint_per_core_bytes",
     "load_activation_hull",
     "load_hf_config",
     "min_experts_per_ep_shard",
     "parse_activation_spec",
     "pass_costs",
     "plan",
+    "solve_serving_plan",
     "spec_cycle_floor",
     "step_floor",
     "torus_collective_s",
