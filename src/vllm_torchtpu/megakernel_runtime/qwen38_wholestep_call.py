@@ -158,6 +158,11 @@ BUCKET_TUNE: dict[int, dict[str, Any]] = {
     24: {"rel_fetch": True},
     32: {"rel_fetch": True},
 }
+# VLLM_TPU_MK_BUCKET_TUNE_WIDE=1 (default off): rel_fetch at b48/b64 too (the L45 partial-cycle
+# hang is fixed; exos c32 served env: b48 -266/-245, b64 -104/-105 us per call at ctx 20K/50K,
+# output hash identical, ~/q38f/mkc32/mk_c32_budget.md section 8).
+if os.environ.get("VLLM_TPU_MK_BUCKET_TUNE_WIDE", "0") == "1":
+    BUCKET_TUNE.update({48: {"rel_fetch": True}, 64: {"rel_fetch": True}})
 
 
 def _tile_value(v: Any) -> Any:
