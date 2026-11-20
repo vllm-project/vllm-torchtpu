@@ -183,6 +183,9 @@ DISPATCHED_DIRECTLY = [
     ("runner.tpu_runner", "_fused_greedy_verify_from_logits"),
     ("runner.tpu_runner", "TPUModelRunner.compute_selected_topk_candidates"),
     ("runner.tpu_runner", "TPUModelRunner.sample_from_packed_candidates"),
+    ("spec_decode.eagle3", "Eagle3Proposer._draft_async_prepare_inputs"),
+    ("spec_decode.eagle3", "Eagle3Proposer._draft_loop_seq_lens"),
+    ("spec_decode.eagle3", "Eagle3Proposer._draft_add_delta"),
 ]
 
 

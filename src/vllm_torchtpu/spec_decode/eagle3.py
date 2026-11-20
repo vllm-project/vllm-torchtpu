@@ -1619,7 +1619,7 @@ class Eagle3Proposer:
         )
 
     @_static_shape_args
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _draft_post_step0_fused(
         self,
         hidden: torch.Tensor,
@@ -1697,7 +1697,7 @@ class Eagle3Proposer:
         )
 
     @_static_shape_args
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _draft_async_prepare_inputs(
         self,
         input_ids: torch.Tensor,
@@ -1807,7 +1807,7 @@ class Eagle3Proposer:
         return draft_input_ids, gather_indices, num_rejected_out
 
     @_static_shape_args
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _draft_loop_seq_lens(
         self,
         base_seq_lens: torch.Tensor,
@@ -1817,7 +1817,7 @@ class Eagle3Proposer:
         return base_seq_lens + delta - num_rejected_dev
 
     @_static_shape_args
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _draft_add_delta(
         self,
         x: torch.Tensor,
@@ -1826,7 +1826,7 @@ class Eagle3Proposer:
         return x + delta
 
     @_static_shape_args
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _draft_stack_tokens(
         self,
         *toks: torch.Tensor,
