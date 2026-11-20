@@ -651,3 +651,85 @@ def test_gmm_fp8_moe_tuned_table_shape_matches_reference(
     )
     assert actual.shape == expected.shape
     assert _relative_l2(actual, expected) < _FP8_MOE_TOLERANCE
+
+
+# GMM1, the fused gate/up projection the GMM1 table covers: k=4096, n=2048 (gate
+# then up, 1024 columns each), fuse_act="silu", 80 rows over 64 local experts.
+_FP8_MOE_GMM1_K, _FP8_MOE_GMM1_N = 4096, 2048
+
+
+def _fp8_moe_gmm1_inputs(as_arrays=True):
+    """bf16 rows and an FP8 gate/up weight with one scale per output channel."""
+    rows, slots = int(sum(_TUNED_TABLE_SIZES)), len(_TUNED_TABLE_SIZES)
+    k, n = _FP8_MOE_GMM1_K, _FP8_MOE_GMM1_N
+    if not as_arrays:
+        return (
+            jax.ShapeDtypeStruct((rows, k), jnp.bfloat16),
+            jax.ShapeDtypeStruct((slots, k, n), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((slots, 1, 1, n), jnp.float32),
+        )
+    lhs_key, rhs_key = jax.random.split(jax.random.key(1))
+    lhs = jax.random.uniform(lhs_key, (rows, k), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(rhs_key, (slots, k, n), jnp.bfloat16, -1, 1)
+    rhs_q, rhs_scale = quantize_tensor(rhs, jnp.float8_e4m3fn, axis=1, block_size=k)
+    return lhs, rhs_q, jnp.expand_dims(rhs_scale, axis=2)
+
+
+@pytest.mark.parametrize("tuned", [False, True], ids=["main_tiles", "tuned_tiles"])
+def test_the_fused_gate_up_case_takes_the_gmm1_table_and_hoist(monkeypatch, tuned):
+    """On TPU7x (chip description only), the GMM1 device case below takes the
+    GMM1 table's tiles and hoists the rhs scale exactly when TUNED_FP8_MOE is
+    set, and never streams (only non-fused projections stream)."""
+    info = gmm_v2_module.pltpu.get_tpu_info_for_chip(
+        gmm_v2_module.pltpu.ChipVersion.TPU_7X, 1
+    )
+    monkeypatch.setattr(gmm_v2_module.pltpu, "get_tpu_info", lambda: info)
+    monkeypatch.setattr(gmm_v2_module, "RHS_STREAM", True)
+    monkeypatch.setattr(gmm_v2_module, "TUNED_FP8_MOE", tuned)
+    lhs, rhs, rhs_scale = _fp8_moe_gmm1_inputs(as_arrays=False)
+    cfgs = gmm_v2_module.make_gmm_configs(
+        lhs,
+        rhs,
+        rhs_scale,
+        None,
+        jax.ShapeDtypeStruct((len(_TUNED_TABLE_SIZES),), jnp.int32),
+        jax.ShapeDtypeStruct((1,), jnp.int32),
+        tile_info=gmm_v2_module.calculate_tiling,
+        vmem_limit_bytes=int(info.vmem_capacity_bytes * 0.9),
+        out_dtype=None,
+        acc_dtype=None,
+        maybe_quantize_lhs=True,
+        zero_initialize=True,
+        fuse_act="silu",
+    )
+    tiles = (cfgs.tiles.tile_m, cfgs.tiles.bucket_base)
+    assert (tiles == gmm_v2_module._FP8_MOE_GMM1_TILES[80]) is tuned
+    assert gmm_v2_module.hoist_rhs_scale(cfgs) is tuned
+    assert not gmm_v2_module.use_rhs_stream(cfgs)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("tuned", [False, True], ids=["main_tiles", "tuned_tiles"])
+def test_gmm_fp8_moe_fused_gate_up_matches_reference(monkeypatch, tuned):
+    """GMM1 with the fused SiLU-and-multiply, on the default tiles and order and
+    on the tuned GMM1 tiles with the hoisted rhs scale, against the unquantized
+    reference followed by the same activation."""
+    _require_tpu()
+    lhs, rhs, rhs_scale = _fp8_moe_gmm1_inputs()
+    sizes = jnp.asarray(_TUNED_TABLE_SIZES, dtype=jnp.int32)
+    raw = reference_gmm(lhs, rhs, sizes, rhs_scale=rhs_scale)
+    raw_gate, raw_up = jnp.split(raw, 2, axis=-1)
+    expected = apply_act_fn(
+        interleave_lane(raw_gate, raw_up).astype(jnp.float32), "silu"
+    ).astype(lhs.dtype)
+    monkeypatch.setattr(gmm_v2_module, "TUNED_FP8_MOE", tuned)
+    jax.clear_caches()
+    try:
+        actual = gmm_v2(lhs, rhs, sizes, rhs_scale=rhs_scale, fuse_act="silu")
+    finally:
+        jax.clear_caches()
+    assert actual.shape == expected.shape == (lhs.shape[0], _FP8_MOE_GMM1_N // 2)
+    # The lhs is quantized to fp8 per 512-wide block in the kernel and not in
+    # the reference, and the product of the two projections compounds that
+    # error; a wrong expert's weights or scales are off by more than 100%.
+    assert _relative_l2(actual, expected) < 2 * _FP8_MOE_TOLERANCE
