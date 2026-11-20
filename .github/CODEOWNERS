@@ -234,3 +234,7 @@
 # Entrypoints & E2E Tests
 /tests/entrypoints/ @Lumosis @theminghuang @maxwillzq @Nanfang-Li @QiliangCui
 /tests/e2e/ @Lumosis @theminghuang @maxwillzq @Nanfang-Li @QiliangCui
+
+# Serving Roofline Planner
+/src/vllm_torchtpu/roofline/ @brianseung-google @annyan09023 @bigeye @guowei-dev @benliangw
+/tests/roofline/ @brianseung-google @annyan09023 @bigeye @guowei-dev @benliangw
