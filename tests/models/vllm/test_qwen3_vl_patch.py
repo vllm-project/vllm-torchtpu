@@ -157,9 +157,20 @@ def test_maybe_patch_qwen3_vl_video_hf_text_keeps_outputs(
         )
         return processor(prompt, mm_items=mm_items, hf_processor_mm_kwargs={})
 
+    tokenized = []
+    tokenizer_cls = type(processor.info.get_tokenizer())
+    upstream_tokenize = tokenizer_cls.__call__
+
+    def tokenize(self, text=None, *args, **kwargs):
+        tokenized.append(text)
+        return upstream_tokenize(self, text, *args, **kwargs)
+
+    monkeypatch.setattr(tokenizer_cls, "__call__", tokenize)
     want = run()
+    calls = len(tokenized)
     assert qwen3_vl_patch.maybe_patch_qwen3_vl_video_hf_text(model_config) is None
     got = run()
+    assert len(tokenized) - calls == calls - 1  # the video's text is not tokenized
     assert got["prompt_token_ids"] == want["prompt_token_ids"]
     for modality in ("image", "video"):
         for got_item, want_item in zip(

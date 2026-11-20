@@ -80,13 +80,9 @@ def test_pooled_copies_match_upstream(rows):
         slot.release()
 
 
-def test_arena_reuses_the_lowest_free_slot():
-    """A freed slot is written again before an untouched one."""
+def test_touched_arena_takes_items_in_turn():
+    """The creator's touch leaves an empty arena that takes items in turn."""
     arena = ShmTensorArena.__new__(ShmTensorArena)
-    patch_mod._init_arena(arena, n_reader=1, slot_bytes=1 << 20, n_slots=3)
+    patch_mod._init_arena(arena, n_reader=1, slot_bytes=1 << 20, n_slots=2)
     t = torch.ones(1 << 20, dtype=torch.uint8)
-    assert patch_mod.write_tensor(arena, t) == 0
-    assert patch_mod.write_tensor(arena, t) == 1
-    with arena._meta(0) as meta:
-        meta[1] = 1  # the one reader is done with slot 0
-    assert patch_mod.write_tensor(arena, t) == 0
+    assert [patch_mod.write_tensor(arena, t) for _ in range(3)] == [0, 1, None]

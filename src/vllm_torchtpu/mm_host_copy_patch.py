@@ -25,13 +25,14 @@ spin after every parallel region in the engine and worker loops (the reason
 vLLM keeps those processes at one torch thread). The copies move bytes, so the
 tensors are unchanged.
 
-`write_tensor` also takes the lowest free slot instead of the next one in
-turn. A slot's tmpfs pages are allocated and mapped by the first write and
-read through it, so upstream's round-robin made each of a fresh server's first
-8 large items pay that: 12.5 ms to write a 32 MB item into a new slot against
-1.3-1.5 into a used one. Sequential requests now keep reusing the same slots,
-and the creator touches slot 0 once at startup (`_init_arena`), so the first
-request finds it allocated too.
+The arena's creator also touches every slot once at creation (`_init_arena`).
+A slot's tmpfs pages are allocated by their first write, and the arena hands
+out its 8 slots in turn, so each of a fresh server's first 8 large items paid
+that: 12.5 ms to write a 32 MB item into a new slot against 1.3-1.5 into a
+used one. The slots keep upstream's order, so a slot freed by its readers is
+written again only after the 7 others: TPU slots are not pinned, and the arena
+gates a release on an upload's completion only for pinned ones. The pool also
+runs the API server's image resizes (`mm_resize_patch`).
 
 `write_tensor` is a drop-in for its namesake in `vllm.distributed.
 device_communicators.shm_tensor_arena`, written to move there unchanged.
@@ -96,18 +97,22 @@ def copy_bytes_(pairs: Sequence[tuple[torch.Tensor, torch.Tensor]]) -> None:
 
 
 def _init_arena(self: shm_tensor_arena.ShmTensorArena, *args, **kwargs) -> None:
-    """Upstream's constructor; the creator then writes slot 0 once, which
-    allocates its tmpfs pages before the first request needs them."""
+    """Upstream's constructor; the creator then writes every slot once, which
+    allocates their tmpfs pages before a request needs them."""
     UPSTREAM_ARENA_INIT(self, *args, **kwargs)
     if self.is_creator:
-        with self._slot(0, self.slot_bytes) as slot_mv:
-            slot = torch.frombuffer(slot_mv, dtype=torch.uint8)
-            slot.fill_(0)
-            del slot
+
+        def touch(idx: int) -> None:
+            with self._slot(idx, self.slot_bytes) as slot_mv:
+                slot = torch.frombuffer(slot_mv, dtype=torch.uint8)
+                slot.fill_(0)
+                del slot
+
+        list(host_pool().map(touch, range(self.n_slots)))
 
 
 def write_tensor(self: shm_tensor_arena.ShmTensorArena, t: torch.Tensor) -> int | None:
-    """Copy tensor bytes into the lowest free slot; return slot idx or None
+    """Copy tensor bytes into a free slot; return slot idx or None
     (caller must then fall back to the default pickle path)."""
     nbytes = t.numel() * t.element_size()
     if nbytes > self.slot_bytes:
@@ -120,7 +125,8 @@ def write_tensor(self: shm_tensor_arena.ShmTensorArena, t: torch.Tensor) -> int 
     except RuntimeError:
         return None
     shm_tensor_arena.memory_fence()
-    for idx in range(self.n_slots):
+    for probe in range(self.n_slots):
+        idx = (self._next_slot + probe) % self.n_slots
         with self._meta(idx) as meta:
             free = meta[0] == 0 or sum(meta[1:]) == self.n_reader
             if not free:
@@ -138,6 +144,7 @@ def write_tensor(self: shm_tensor_arena.ShmTensorArena, t: torch.Tensor) -> int 
             shm_tensor_arena.memory_fence()
             meta[0] = 1
             shm_tensor_arena.memory_fence()
+        self._next_slot = (idx + 1) % self.n_slots
         return idx
     self._fallbacks += 1
     if self._fallbacks == 1 or self._fallbacks % 100 == 0:
@@ -188,8 +195,7 @@ def _flat_reduce_data(
 
 def patch_mm_host_copies() -> None:
     """Run the arena write and the workers' batch concatenation on the copy
-    pool, with the arena's slots reused lowest first and slot 0 touched at
-    creation."""
+    pool, with the arena's slots touched at creation."""
     shm_tensor_arena.ShmTensorArena.__init__ = _init_arena
     shm_tensor_arena.ShmTensorArena.write_tensor = write_tensor
     inputs.MultiModalFlatField._reduce_data = _flat_reduce_data

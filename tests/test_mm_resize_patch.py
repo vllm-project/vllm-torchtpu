@@ -58,9 +58,10 @@ BICUBIC, BILINEAR = tvF.InterpolationMode.BICUBIC, tvF.InterpolationMode.BILINEA
 )
 @pytest.mark.parametrize("interpolation", [BICUBIC, BILINEAR])
 @pytest.mark.parametrize("antialias", [True, False])
-def test_strips_match_torchvision(shape, size, interpolation, antialias):
+def test_strips_match_torchvision(monkeypatch, shape, size, interpolation, antialias):
     """Every output byte, and the layout, equal one tvF.resize call on the
     channels-last view a PIL image converts to."""
+    monkeypatch.setattr(patch_mod, "host_threads", lambda: 8)  # strips on any host
     hwc = np.random.default_rng(0).integers(0, 256, shape, dtype=np.uint8)
     image = torch.from_numpy(hwc).movedim(-1, -3)
     want = tvF.resize(

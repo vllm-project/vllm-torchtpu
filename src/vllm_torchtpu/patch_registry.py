@@ -151,7 +151,6 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu.mm_resize_patch:patch_mm_resize_strips", _ACTIVE),
     Patch("vllm_torchtpu.mm_host_copy_patch:patch_mm_host_copies", _ENGINE),
-    Patch("vllm_torchtpu.mm_engine_arena_patch:patch_mm_engine_arena", _ENGINE),
     # Platform runtime configuration.
     Patch(
         "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE

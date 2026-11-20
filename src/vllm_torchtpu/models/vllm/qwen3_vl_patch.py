@@ -503,10 +503,13 @@ def maybe_patch_qwen3_vl_video_hf_text(
     video processor computes them without the text. Dropping the text takes
     the HF step of Cosmos3-Super's 9360-patch video from 10.8 to 7.5 ms (its
     3.9 ms tokenizer call goes). The call is told apart by its `videos`, which
-    upstream pops from the data of its other call.
+    upstream pops from the data of its other call. Only an HF processor whose
+    call is `ProcessorMixin.__call__` drops the text, as that call reads the
+    text for the tokenizer alone; a processor with its own call keeps it.
     """
     if model_config is None or not _has_qwen3_vl_vision(model_config):
         return False
+    from transformers.processing_utils import ProcessorMixin
     from vllm.model_executor.models import qwen3_vl
     from vllm.multimodal.processing import context
 
@@ -525,7 +528,11 @@ def maybe_patch_qwen3_vl_video_hf_text(
 
         @functools.wraps(upstream_call)
         def call_hf_processor(self, hf_processor, data, *args, **kwargs):
-            if getattr(_qwen3_vl_hf_main, "active", False) and "videos" in data:
+            if (
+                getattr(_qwen3_vl_hf_main, "active", False)
+                and "videos" in data
+                and type(hf_processor).__call__ is ProcessorMixin.__call__
+            ):
                 data = {k: v for k, v in data.items() if k != "text"}
             return upstream_call(self, hf_processor, data, *args, **kwargs)
 
