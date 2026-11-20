@@ -1138,13 +1138,11 @@ def _patch_ltx2_async_guidance_step() -> None:
         guidance_parallel_ready: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del self
-        if not (
+        if (
             guidance_parallel_ready
             and parallel_state.get_classifier_free_guidance_world_size() > 1
         ):
-            synchronize_tensors(list(latents), wait=False)
-            return latents
-        latents = tuple(tensor.contiguous() for tensor in latents)
+            latents = tuple(tensor.contiguous() for tensor in latents)
         synchronize_tensors(list(latents), wait=False)
         return latents
 

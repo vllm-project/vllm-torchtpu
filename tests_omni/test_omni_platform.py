@@ -827,6 +827,7 @@ def table_syncs(monkeypatch):
     syncs = []
 
     def record(tensors, wait):
+        assert wait is False
         syncs.append(tensors)
 
     monkeypatch.setattr("vllm_torchtpu.utils.synchronize_tensors", record)
