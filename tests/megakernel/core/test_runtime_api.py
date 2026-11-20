@@ -49,6 +49,7 @@ from vllm_torchtpu.megakernel.core.modules import GDN, GQA, Embedding, MoE, Norm
 from vllm_torchtpu.megakernel.core.pool.config import CacheExec, with_cache
 from vllm_torchtpu.megakernel.core.profile import DEFAULT_PROFILE, Profile
 from vllm_torchtpu.megakernel.core.runtime import (
+    Bucket,
     BucketPolicy,
     JaxStepMetaOps,
     SentinelVariantPlan,
@@ -1578,6 +1579,30 @@ def test_no_kw_rejects_legacy_and_unknown_kwargs():
             unknown=1,
         )
 
+
+def test_build_warmup_plan_shapes_and_sentinels():
+    """`build_warmup_plan` warms each bucket over the shapes the driver runs
+    (`Bucket.runner_shapes`) and plans non-overlapping sentinel pages."""
+    g = ModelGeometry(
+        L=4,
+        att_every=4,
+        H=256,
+        NH=4,
+        NKV=1,
+        HD=256,
+        ROT=64,
+        KH=2,
+        VH=4,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=2,
+        I=256,
+        IS=256,
+        theta=10_000_000.0,
+        zero_centered_norm=True,
+    )
+    ms = synth_hybrid_spec(g, R=1)
     # `build_warmup_plan` takes `(T, B)` `bucket_keys` directly: default keys
     # match the pre-generalization `WarmupStepPlan` list byte-for-byte, and
     # `T=8` verify keys produce plans for `(8, b)` with `spv = spp * 8`.
@@ -1662,3 +1687,21 @@ def test_no_kw_rejects_legacy_and_unknown_kwargs():
         SentinelVariantPlan((8, False, False), 3, 51, 255, 8, True),
     ]
     assert n_save_t8 == 375
+    pads, pairs = (16, 32), ((8, 4), (16, 4))
+    for T, b in default_keys:
+        shapes = Bucket(T, b).runner_shapes(
+            pads, pairs, ckpt_window=4, max_pages_per_seq=4
+        )
+        got = [s for s in steps_def if (s.tokens_per_seq, s.bucket_t) == (T, b)]
+        want = [(x.tok_pad, x.req_pad, x.blk_pad, x.ckpt_cols) for x in shapes]
+        assert [(s.tok_pad, s.req_pad, s.blk_pad, s.c_cols) for s in got] == want
+    for s in steps_t8:
+        (x,) = Bucket(s.tokens_per_seq, s.bucket_t).runner_shapes(
+            (), (), ckpt_window=4, max_pages_per_seq=4
+        )
+        assert (s.tok_pad, s.req_pad, s.blk_pad, s.c_cols) == (
+            x.tok_pad,
+            x.req_pad,
+            x.blk_pad,
+            x.ckpt_cols,
+        )

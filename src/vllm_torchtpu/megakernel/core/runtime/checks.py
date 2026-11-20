@@ -31,6 +31,7 @@ from ..errors import MegakernelConfigError, MegakernelLayoutError
 from ..exec_spec import ExecSpec
 from ..spec import ModelSpec
 from .constants import MTP_VERIFY_TOKENS
+from .contract import Bucket
 from .layout_facts import dtype_name
 
 
@@ -301,7 +302,6 @@ def build_warmup_plan(
     is_eager: bool = False,
 ) -> tuple[list[WarmupStepPlan], list[tuple[int, int]], int]:
     """Build `(warmup_steps, warmed_buckets, n_save)` for `warmup()`."""
-    ckpt_cols = max(1, ckpt_window)
     pinfo = pool_schedule_info(spec)
     pps, spp = pinfo.pages_per_slot, pinfo.slots_per_pool
     all_bkts = list(bucket_keys)
@@ -321,13 +321,13 @@ def build_warmup_plan(
         if eager_skip and v_key in checked:
             continue
         warmed_buckets.append(bkt)
-        if runner_tok_pads and req_block_pairs:
-            pads = [p for p in runner_tok_pads if p >= b]
-            tok_pad = pads[0] if pads else runner_tok_pads[-1]
-            shapes = [(tok_pad, r, k) for r, k in req_block_pairs]
-        else:
-            shapes = [(b, b // T, max_pages_per_seq)]
-        for tok_pad, req_pad, blk_pad in shapes:
+        shapes = Bucket(T, b).runner_shapes(
+            runner_tok_pads,
+            req_block_pairs,
+            ckpt_window=ckpt_window,
+            max_pages_per_seq=max_pages_per_seq,
+        )
+        for shape in shapes:
             if eager_skip and v_key in checked:
                 break
             v_idx, has_t1 = len(checked), any(k[0] == 1 for k in checked)
@@ -345,8 +345,8 @@ def build_warmup_plan(
                 sub_s, gdn_p0 = (T if disjoint else 0), pps * gdn_base
                 s_args = (v_key, kv_page, gdn_base, gdn_p0, sub_s, disjoint)
                 sent = SentinelVariantPlan(*s_args)
-            w_args = (T, b, tok_pad, req_pad, blk_pad, max(T, ckpt_cols), sent)
-            steps.append(WarmupStepPlan(*w_args))
+            pads = (shape.tok_pad, shape.req_pad, shape.blk_pad, shape.ckpt_cols)
+            steps.append(WarmupStepPlan(T, b, *pads, sent))
     return steps, warmed_buckets, n_save
 
 
