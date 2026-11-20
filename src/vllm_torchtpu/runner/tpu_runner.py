@@ -9861,6 +9861,7 @@ def _glue_check_report(runner: Any) -> None:
     runner._glue_check_n = {}
 
 
+@torch.no_grad()
 def _glue_post_verify(
     runner: Any, mamba_indices: Any, next_tokens: torch.Tensor, num_reqs: int, md: Any, state: Any
 ) -> bool:
@@ -9911,6 +9912,7 @@ def _glue_post_verify(
     return True
 
 
+@torch.no_grad()
 def _glue_assemble(runner: Any, drafts: Any, next_tokens_per_chunk: list, state: Any):
     """`_assemble_async_spec_substitution` for the step `_glue_post_verify`
     folded, with the source already padded to sample_tokens' bound (so its
