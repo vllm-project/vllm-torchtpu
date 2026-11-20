@@ -242,10 +242,13 @@ def test_merge_mode_constants():
         assert envs.TPU_MLA_FUSED_XCHG_MAX_TOKENS == 0  # off by default
 
 
-# The 4-chip buckets' fused-bucket levers: "step16" in place of "step8".
+# glm-agentx's own "step16" in place of "step8" (as TPU_MLA_DECODE_BODY_LEVERS
+# can set it), and the levers the 4-chip resolver selects on fused buckets:
+# the same plus the internal "quad8" (the step's softmax in 8-token groups).
 _STEP16_LEVERS = tuple(
     "step16" if v == "step8" else v for v in sparse_mla.DECODE_BODY_DEFAULT
 )
+_4CHIP_LEVERS = (*_STEP16_LEVERS, sparse_mla.DECODE_QUAD8_LEVER)
 _CPU8_WORKER_ENV = "_MLA_FUSED_SMALL_A2A_CPU8_WORKER"
 _N_DCP = 8
 _CPU8_ENV = {
@@ -323,7 +326,7 @@ def test_4chip_buckets_on_gate_and_bucket_config():
                 send_max_tokens=16,
                 merge_max_tokens=16,
                 mtp_merge_max_tokens=16,
-                decode_levers=_STEP16_LEVERS,
+                decode_levers=_4CHIP_LEVERS,
             )
             # Unfused buckets (e.g. T=32) keep DECODE_BODY_DEFAULT without step16.
             unfused_cfg = ai.resolve_fused_small_a2a_config(
@@ -522,6 +525,37 @@ def test_4chip_buckets_rejects_xchg_max_tokens():
         cfg = ai.resolve_fused_small_a2a_config()
         assert cfg.decode_levers == sparse_mla.DECODE_BODY_DEFAULT
         assert cp_mla.fused_small_a2a_applies(32)
+
+
+def test_quad8_lever_is_internal():
+    # "quad8" comes only from the 4-chip resolver, beside "quad".
+    from vllm_torchtpu.layers.core import attention_interface as ai
+
+    assert sparse_mla.DECODE_QUAD8_LEVER == "quad8"
+    assert sparse_mla.DECODE_QUAD8_LEVER not in sparse_mla.DECODE_BODY_LEVERS
+    named = ",".join(_4CHIP_LEVERS)
+    for knob in ("", "1"):
+        env = {
+            **GATE_ENV,
+            "TPU_MLA_DECODE_BODY_LEVERS": named,
+            "TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS": knob,
+        }
+        with (
+            mock.patch.dict(os.environ, env),
+            pytest.raises(ValueError, match="'quad8' is internal"),
+        ):
+            ai.resolve_fused_small_a2a_config()
+    # Plain "step16" from the knob: no "quad8"; nor without "quad".
+    plain = {**GATE_ENV, "TPU_MLA_DECODE_BODY_LEVERS": ",".join(_STEP16_LEVERS)}
+    with mock.patch.dict(os.environ, plain):
+        assert ai.resolve_fused_small_a2a_config().decode_levers == _STEP16_LEVERS
+    no_quad = {
+        **GATE_ENV,
+        "TPU_MLA_DECODE_BODY_LEVERS": "tr,step8",
+        "TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS": "1",
+    }
+    with mock.patch.dict(os.environ, no_quad):
+        assert ai.resolve_fused_small_a2a_config().decode_levers == ("tr", "step16")
 
 
 def test_resolve_config_dynamo_no_lru_cache_warning():
@@ -821,9 +855,9 @@ def test_cpu8_hlo_byte_identical_off_and_step16_subpass(_cpu8_worker_run: bool):
             return fn.lower(ql, qp, nc, rc, tk, pt, cq, dist, rt).as_text()
 
         for t_sub in (4, 8):
-            assert lower_srpa(t_sub, sparse_mla.DECODE_BODY_DEFAULT) == lower_srpa(
-                t_sub, _STEP16_LEVERS
-            )
+            ref = lower_srpa(t_sub, sparse_mla.DECODE_BODY_DEFAULT)
+            assert lower_srpa(t_sub, _STEP16_LEVERS) == ref
+            assert lower_srpa(t_sub, _4CHIP_LEVERS) == ref
 
         # 2. Control buckets T=4 and T=32 lower identically with knob OFF vs ON.
         sh_rep = NamedSharding(mesh, P())
@@ -1518,6 +1552,104 @@ def _run_dcp8_backbone_and_mtp_suite(mesh, *, is_cpu_interpret: bool) -> None:
         assert np.isfinite(y_on.astype(np.float32)).all()
         nd_mtp, ulp_mtp = _bf16_ulp_diff(y_on, y_off)
         assert nd_mtp == 0 and ulp_mtp == 0
+
+
+def test_cpu8_quad8_group_reaches_only_the_4chip_step16(
+    _cpu8_worker_run: bool,
+):
+    """Only the 4-chip resolver's "step16" stacks "quad" in 8-token groups.
+
+    The "quad8" group size (DECODE_QUAD8_GROUP_TOKENS) must not reach any
+    program built without "quad8": changing it leaves the StableHLO of every
+    such bucket byte-identical, for the default body levers, without "step8"
+    and with glm-agentx's own "step16" (one 16-token softmax and 16-token KV
+    staging, as on the base branch), at small-chunk 16 (the env default, where
+    the 32-token bucket is a regular chunk) and 32. The 4-chip levers' 16-token
+    steps do change with it and differ from plain "step16", so the comparison
+    can fail and the 4-chip path takes the grouping.
+    """
+    if not _cpu8_worker_run:
+        return
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
+
+    num_pages = 8
+
+    def lower_srpa(t_sub: int, levers: tuple[str, ...], small: int) -> str:
+        # The kernel entry point is itself jitted: drop its trace cache so the
+        # patched module constant is read again on every lowering.
+        jax.clear_caches()
+        ql = jax.ShapeDtypeStruct((t_sub, 64, 512), jnp.bfloat16)
+        qp = jax.ShapeDtypeStruct((t_sub, 64, 256), jnp.bfloat16)
+        nc = jax.ShapeDtypeStruct((num_pages, 256, 128), jnp.uint32)
+        rc = jax.ShapeDtypeStruct((num_pages, 64, 128), jnp.uint32)
+        tk = jax.ShapeDtypeStruct((t_sub, 2048), jnp.int32)
+        pt = jax.ShapeDtypeStruct((num_pages,), jnp.int32)
+        cq = jax.ShapeDtypeStruct((2,), jnp.int32)
+        dist = jax.ShapeDtypeStruct((3,), jnp.int32)
+        rt = jax.ShapeDtypeStruct((t_sub, 2, 128), jnp.float32)
+
+        @jax.jit
+        def fn(ql, qp, nc, rc, tk, pt, cq, dist, rt):
+            return sparse_mla.sparse_ragged_paged_attention(
+                ql,
+                nc,
+                rc,
+                tk,
+                pt,
+                cq,
+                dist,
+                q_pe=qp,
+                q_rope_table=rt,
+                lse_in_kernel=True,
+                sm_scale=0.125,
+                k_scale=1.0,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=512,
+                small_chunk_batch_size=4,
+                small_chunk_tokens=small,
+                lse_lane_dense=True,
+                lse_mask_empty=True,
+                fused_window_prep=True,
+                decode_row_widths=(128, 256, 384),
+                decode_body_levers=levers,
+            )
+
+        return fn.lower(ql, qp, nc, rc, tk, pt, cq, dist, rt).as_text()
+
+    default = sparse_mla.DECODE_BODY_DEFAULT
+    assert "step16" not in default
+    no_step8 = tuple(v for v in default if v != "step8")
+    with (
+        mock.patch.dict(os.environ, dict(_CPU8_ENV), clear=False),
+        pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()),
+        mock.patch.object(pltpu, "get_tpu_info", return_value=None),
+        mock.patch.object(
+            native_sc_gather, "dsa_gather_native_sc", _fake_gather_poisoned
+        ),
+    ):
+        os.environ.pop("TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS", None)
+        for levers in (default, no_step8, _STEP16_LEVERS):
+            for small in (16, 32):
+                for t_sub in (4, 8, 16, 32, 64):
+                    ref = lower_srpa(t_sub, levers, small)
+                    with mock.patch.object(sparse_mla, "DECODE_QUAD8_GROUP_TOKENS", 4):
+                        moved = lower_srpa(t_sub, levers, small)
+                    assert moved == ref, (levers, small, t_sub)
+
+        # The 4-chip levers' 16-token steps (the 16-token bucket at small-chunk
+        # 32, the 32-token bucket at the default 16) depend on the group size
+        # and differ from plain "step16".
+        for t_sub, small in ((16, 32), (32, 16)):
+            ref = lower_srpa(t_sub, _4CHIP_LEVERS, small)
+            assert ref != lower_srpa(t_sub, _STEP16_LEVERS, small), (t_sub, small)
+            with mock.patch.object(sparse_mla, "DECODE_QUAD8_GROUP_TOKENS", 4):
+                assert lower_srpa(t_sub, _4CHIP_LEVERS, small) != ref, (t_sub, small)
 
 
 def test_cpu8_backbone_t8_t16_and_mtp_t16_numerics(_cpu8_worker_run: bool):

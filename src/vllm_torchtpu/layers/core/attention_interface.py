@@ -1112,12 +1112,19 @@ def _mixed_body_small_levers(value: str) -> tuple[str, ...]:
 
 def _decode_body_levers(value: str) -> tuple[str, ...]:
     """TPU_MLA_DECODE_BODY_LEVERS -> the decode body's lever tuple ("1" =
-    `DECODE_BODY_DEFAULT`, else a comma list; empty / "0" = off)."""
+    `DECODE_BODY_DEFAULT`, else a comma list; empty / "0" = off). The internal
+    lever `DECODE_QUAD8_LEVER` is not accepted here."""
     if not value or value == "0":
         return ()
     if value == "1":
         return sparse_mla_kernel.DECODE_BODY_DEFAULT
-    return tuple(v.strip() for v in value.split(",") if v.strip())
+    levers = tuple(v.strip() for v in value.split(",") if v.strip())
+    if sparse_mla_kernel.DECODE_QUAD8_LEVER in levers:
+        raise ValueError(
+            f"TPU_MLA_DECODE_BODY_LEVERS: {sparse_mla_kernel.DECODE_QUAD8_LEVER!r} "
+            "is internal (TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS sets it)"
+        )
+    return levers
 
 
 def _pack_lane_dense(values: jax.Array, token_bytes: int) -> jax.Array:
@@ -1261,8 +1268,9 @@ def resolve_fused_small_a2a_config(
     `tl = T * (num_q_heads // dcp_size) <= 128`. On a `fused_bucket`, a spec
     listing a bucket above "step8"'s tokens swaps "step8" for "step16", so a
     16-token bucket runs attention, the exchange and the merge in one grid
-    step. Set together with TPU_MLA_FUSED_XCHG_MAX_TOKENS (its multi-step
-    exchange; the combination is not measured), it raises.
+    step, with the internal lever "quad8" beside "quad" (the step's softmax
+    in 8-token groups). Set together with TPU_MLA_FUSED_XCHG_MAX_TOKENS (its
+    multi-step exchange; the combination is not measured), it raises.
     """
     bucket_spec = (envs.TPU_MLA_FUSED_SMALL_A2A_BUCKETS or "").strip()
     levers = _decode_body_levers(envs.TPU_MLA_DECODE_BODY_LEVERS or "")
@@ -1362,6 +1370,8 @@ def resolve_fused_small_a2a_config(
         # gate resolves this inside torch.compile'd code.
         i = levers.index("step8")
         levers = (*levers[:i], "step16", *levers[i + 1 :])
+        if "quad" in levers:
+            levers = (*levers, sparse_mla_kernel.DECODE_QUAD8_LEVER)
     return FusedSmallA2AConfig(
         bucket_spec=spec,
         send_max_tokens=max(send_max, opt_max),
