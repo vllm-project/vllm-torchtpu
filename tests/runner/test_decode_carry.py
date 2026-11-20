@@ -43,7 +43,7 @@ def qwen3_5_draft_path_rule(monkeypatch):
     from vllm_torchtpu.spec_decode import draft_path_rules
 
     monkeypatch.setattr(draft_path_rules, "_RULES", [hooks.mtp_draft_path])
-    monkeypatch.setattr(hooks, "has_calibrated_shape", lambda _model_config: True)
+    monkeypatch.setattr(hooks, "_has_calibrated_shape", lambda _model_config: True)
     monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
 
 
