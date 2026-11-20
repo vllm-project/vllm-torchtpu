@@ -32,6 +32,7 @@ chunking (``TPU_PP_LONE_PROMPT_CHUNKS``, ``TPU_PP_EQUAL_COST_CHUNKS``);
 
 import dataclasses
 import math
+import typing
 from dataclasses import dataclass
 from typing import Any
 
@@ -80,7 +81,8 @@ def parse(raw: Any) -> PPSchedulerOptions:
             f"additional_config.{SECTION} must be a JSON object, "
             f"got {type(raw).__name__}"
         )
-    fields = {f.name: f.type for f in dataclasses.fields(PPSchedulerOptions)}
+    hints = typing.get_type_hints(PPSchedulerOptions)
+    fields = {f.name: hints[f.name] for f in dataclasses.fields(PPSchedulerOptions)}
     unknown = sorted(set(raw) - set(fields))
     if unknown:
         raise ValueError(

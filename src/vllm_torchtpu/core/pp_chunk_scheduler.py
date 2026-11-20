@@ -137,10 +137,8 @@ class DivergentHitResolver(Protocol):
 def _retains_hybrid_state(vllm_config: Any) -> bool:
     """Whether this engine keeps hybrid-state snapshots: a KV producer
     (``retention_wanted``) serving one of ``RETENTION_ARCHITECTURES``."""
-    model_config = getattr(vllm_config, "model_config", None)
-    architectures = getattr(model_config, "architectures", None) or ()
     return retention_wanted(vllm_config) and not RETENTION_ARCHITECTURES.isdisjoint(
-        architectures
+        vllm_config.model_config.architectures or ()
     )
 
 
@@ -368,10 +366,11 @@ class TpuPipelineChunkScheduler(Scheduler):
             return
         window = list(islice(queue, self._paw_sort_window))
         free_blocks = self._get_num_free_blocks()
-        free_blocks_for_ext = free_blocks
-        if self._is_kv_producer:
-            reserved = self._inflight_prefill_reserved_blocks()
-            free_blocks_for_ext = max(0, free_blocks - reserved)
+        # The sort runs on a KV producer only (_init_paw_sort), whose async
+        # loads reserve blocks before the host-tier hit can land.
+        free_blocks_for_ext = max(
+            0, free_blocks - self._inflight_prefill_reserved_blocks()
+        )
         # The step's wall time, the clock _promote_warmest ages on.
         now = self._now()
         keys = [
@@ -426,11 +425,9 @@ class TpuPipelineChunkScheduler(Scheduler):
         warmth = local_warmth + ext_warmth
         uncached = max(num_tokens - warmth, 0)
         eff_uncached = self._quad_cost(uncached, warmth)
-        arrival = request.arrival_time
-        rate = self._get_paw_aging_rate()
-        aged = eff_uncached - rate * max(0.0, now - arrival)
+        aged = eff_uncached - self._get_paw_aging_rate() * _wait_seconds(request, now)
         started = request.num_preemptions > 0 or request.num_computed_tokens > 0
-        return (0 if fits_hbm else 1, 0 if started else 1, aged, arrival)
+        return (0 if fits_hbm else 1, 0 if started else 1, aged, request.arrival_time)
 
     def _get_paw_aging_rate(self) -> float:
         """Uncached prompt tokens credited per second a request has waited
@@ -487,7 +484,7 @@ class TpuPipelineChunkScheduler(Scheduler):
         rate = self._get_paw_aging_rate()
         aging = 0.0
         if rate > 0:
-            aging = rate * _wait_seconds(request, time.time() if now is None else now)
+            aging = rate * _wait_seconds(request, self._now() if now is None else now)
         if self._is_kv_consumer:
             tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
             return (tier, hbm_eff_cost - aging, request.arrival_time), local_warmth
