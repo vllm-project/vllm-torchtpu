@@ -226,37 +226,36 @@ def _kernel(
     p_dtype = jnp.bfloat16 if w_ref.dtype == jnp.bfloat16 else jnp.float32
     lane = lax.broadcasted_iota(jnp.int32, (1, _CHUNK_ROWS), 1)
 
-    def chunk(c, carry):
+    def product(c):
         local = rows - c * _CHUNK_ROWS
         p = jnp.zeros((rows.shape[0], _CHUNK_ROWS), jnp.float32)
         for j in range(topk):
             p = jnp.where(local[:, j : j + 1] == lane, w[:, j : j + 1], p)
         start = pl.multiple_of(c * _CHUNK_ROWS, _CHUNK_ROWS)
         xs = buf[parity, pl.ds(start, _CHUNK_ROWS), :]
-        p = p.astype(p_dtype)
-        xs = xs.astype(p_dtype)
+        return jnp.dot(
+            p.astype(p_dtype), xs.astype(p_dtype), preferred_element_type=jnp.float32
+        )
 
+    # Chunks before the last accumulate in VMEM; the last one's product is
+    # added on the way to the output, so the sum is not stored and reloaded.
+    def chunk(c, carry):
         @pl.when(c == 0)
         def _():
-            acc[...] = jnp.dot(p, xs, preferred_element_type=jnp.float32)
+            acc[...] = product(c)
 
         @pl.when(c > 0)
         def _():
-            acc[...] += jnp.dot(p, xs, preferred_element_type=jnp.float32)
+            acc[...] += product(c)
 
         return carry
 
-    lax.fori_loop(0, n_chunks, chunk, 0)
+    lax.fori_loop(0, n_chunks - 1, chunk, 0)
 
-    @pl.when(n_chunks == 0)
-    def _():
-        out_ref[...] = jnp.zeros_like(out_ref)
-
-    @pl.when(n_chunks > 0)
-    def _():
-        out_ref[...] = acc[...].astype(out_ref.dtype)
-
-    if shared:
+    def finish(total):
+        if not shared:
+            out_ref[...] = total.astype(out_ref.dtype)
+            return
         act = act_ref[...]
         for c0 in range(0, hidden, _SHARED_COLS):
             cols = slice(c0, c0 + _SHARED_COLS)
@@ -264,8 +263,20 @@ def _kernel(
             y = (y.astype(jnp.bfloat16).astype(jnp.float32) * s2s_ref[:, cols]).astype(
                 jnp.bfloat16
             )
-            routed = out_ref[:, cols].astype(jnp.float32)
+            routed = total[:, cols].astype(out_ref.dtype).astype(jnp.float32)
             out_ref[:, cols] = (routed + y.astype(jnp.float32)).astype(out_ref.dtype)
+
+    @pl.when(n_chunks == 0)
+    def _():
+        finish(jnp.zeros(acc.shape, jnp.float32))
+
+    @pl.when(n_chunks == 1)
+    def _():
+        finish(product(0))
+
+    @pl.when(n_chunks > 1)
+    def _():
+        finish(acc[...] + product(n_chunks - 1))
 
 
 @functools.partial(jax.jit, static_argnames=("topk", "interpret"))
