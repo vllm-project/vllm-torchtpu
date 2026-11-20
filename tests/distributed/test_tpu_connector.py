@@ -9278,6 +9278,48 @@ class TestStage3AsyncOptionsThroughGetFinished:
         assert worker._stage3_early_send_terminals == {}
         assert worker._stage3_registered_sends == {}
 
+    def test_a_kept_terminal_of_a_released_request_is_dropped(self):
+        """A terminal kept while a release-only step was pending matches no
+        registration once the step ends: it is dropped (as an unmatched
+        terminal always was), not left behind."""
+        worker, engine, _, _ = _stage3_option_producer({"async_register": True})
+        entered, release = threading.Event(), threading.Event()
+
+        def held(metadata):
+            entered.set()
+            release.wait(5.0)
+
+        worker._maybe_delay_stage3_registration_for_test = held
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_release["r1"] = 77
+        with _stage3_option_env():
+            worker._submit_stage3_registration(meta)
+            worker._stage3_register_gate.set()
+            assert entered.wait(5.0)
+            engine.poll_results = [(["r1"], [], [])]
+            assert worker.get_finished() == (set(), set())
+            assert worker._stage3_early_send_terminals == {"r1": False}
+            release.set()
+            worker._reap_stage3_registrations({"r1"})
+            assert worker.get_finished() == (set(), set())
+        assert worker._stage3_early_send_terminals == {}
+        assert worker._stage3_send_outcomes == {}
+
+    @pytest.mark.parametrize("registered", [False, True])
+    def test_settling_applies_a_kept_terminal_only_to_a_registered_request(
+        self, registered
+    ):
+        """At the end of a side-thread step, a kept terminal is applied to a
+        request the step left registered and dropped otherwise (a tombstoned
+        replay, a duplicate, a failed registration)."""
+        worker, _, _, _ = _stage3_option_producer({"async_register": True})
+        worker._stage3_early_send_terminals = {"r1": True, "r2": False}
+        if registered:
+            worker._stage3_registered_sends["r1"] = MagicMock(uuid=77)
+        worker._settle_stage3_early_send_terminals(frozenset({"r1"}))
+        assert worker._stage3_early_send_terminals == {"r2": False}
+        assert worker._stage3_send_outcomes == ({"r1": "failed"} if registered else {})
+
     def test_a_completed_send_completes_on_the_side_thread(self):
         worker, engine, facade, side = _stage3_option_producer({"async_complete": True})
         threads: list[str] = []

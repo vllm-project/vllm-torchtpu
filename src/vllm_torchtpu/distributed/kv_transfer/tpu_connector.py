@@ -4417,10 +4417,28 @@ class TPURaidenConnectorWorker:
             if facade is None:
                 facade = self._new_raiden_controller_facade(address)
                 self._stage3_register_local.facade = facade
-            self._register_stage3_request_blocks(metadata, facade=facade)
+            try:
+                self._register_stage3_request_blocks(metadata, facade=facade)
+            finally:
+                self._settle_stage3_early_send_terminals(req_ids)
 
         future = self._stage3_register_executor.submit(_run)
         self._stage3_register_futures.append((future, req_ids))
+
+    def _settle_stage3_early_send_terminals(self, req_ids: frozenset[str]) -> None:
+        """Settles the native terminals kept for a side-thread registration
+        step's requests: one whose request is now registered is applied, any
+        other is dropped (a released or tombstoned request, a replay, or a
+        registration that failed), as an unmatched terminal always was."""
+        with self._stage3_poll_lock:
+            for req_id in req_ids:
+                failed = self._stage3_early_send_terminals.pop(req_id, None)
+                if failed is None or req_id not in self._stage3_registered_sends:
+                    continue
+                if failed:
+                    self._stage3_send_outcomes[req_id] = "failed"
+                else:
+                    self._stage3_send_outcomes.setdefault(req_id, "done")
 
     def _reap_stage3_registrations(self, finished_req_ids: set[str] | None) -> None:
         """Waits for the registrations of the finished requests and raises
