@@ -475,7 +475,12 @@ def calculate_block_sizes(
 
     # Fixed value based on experimental results.
     decode_batch_size = 8
-    prefill_batch_size = 2
+    # A call that holds a long prefill chunk spends the VMEM of a second item on
+    # 2x larger q and kv tiles instead: most of its blocks lie below the causal
+    # diagonal, where larger tiles run faster. Measured on v7x (8 q heads per kv
+    # head, head_dim 128, 8192-token chunk): -4% with no earlier tokens, -12% with
+    # 57344; at 6144 tokens and below the diagonal blocks dominate and 2 wins.
+    prefill_batch_size = 1 if serve_cfgs.total_q_tokens >= 8192 else 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size)
