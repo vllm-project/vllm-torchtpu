@@ -197,8 +197,11 @@ def test_ngram_hash_state_ensure_cache_and_empty_inputs(
         state.ensure_cache()
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
     assert state.ensure_cache() and state.block_size == 8
-    assert state._cache.numel() == 16
-    assert state.ensure_cache()
+    # 2 blocks x 8 slots, plus the trailing dummy slot for masked writes.
+    assert state._cache.numel() == 17
+    # Re-ensuring the same bound KV cache keeps the cache (no extra padding).
+    cache_before = state._cache
+    assert state.ensure_cache() and state._cache is cache_before
 
     # block_size comes from the SWA module, never from kv_cache.shape: the bound
     # tensor may be the overlaid CSA page `[num_pages, page_size, 4, 128]`.
@@ -208,7 +211,7 @@ def test_ngram_hash_state_ensure_cache_and_empty_inputs(
     assert (
         state.ensure_cache()
         and state.block_size == 256
-        and state._cache.numel() == 2048
+        and state._cache.numel() == 2049
     )
     # Slot 256 (block 1 * 256 + 0) must write and read cleanly without IndexError.
     h_p256 = state(
@@ -301,7 +304,10 @@ def _reference_hashes(
     block_table: torch.Tensor | None,
     cache: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Scalar transcription of upstream ``_hash_ids_kernel`` (vLLM v0.33.0)."""
+    """Scalar transcription of upstream ``_hash_ids_kernel`` (vLLM v0.33.0).
+
+    ``cache`` holds the real slots only (no trailing dummy slot).
+    """
     dead_id = engram_mod.upstream.DEAD_ID
     token_map = state.token_map.tolist()
     multipliers = state.multipliers.tolist()
@@ -338,9 +344,14 @@ def _reference_hashes(
                 else:
                     logical = min(max(past, 0), len(table[0]) * block_size - 1)
                     row = table[min(req, len(table) - 1)]
-                    slot = row[logical // block_size] * block_size
-                    slot += logical % block_size
-                    src = slots[min(max(slot, 0), len(slots) - 1)]
+                    block = row[logical // block_size]
+                    slot = block * block_size + logical % block_size
+                    # TPU deviation: the null block 0 (or an unmapped -1) holds
+                    # no history, so it reads as DEAD instead of clamped slot 0.
+                    if block <= 0:
+                        src = dead_id
+                    else:
+                        src = slots[min(max(slot, 0), len(slots) - 1)]
                 blocked = blocked or past < 0 or src == dead_id
                 term = (state.pad_id if blocked else src) * multipliers[layer][shift]
                 # Upstream bounds the multipliers so this product never wraps.
@@ -400,7 +411,9 @@ def test_ngram_hash_state_matches_reference_hash(
     tm = state.token_map.tolist()
     assert state._cache[4].item() == tm[5]
     assert state._cache[6].item() == engram_mod.upstream.DEAD_ID
-    expected = _reference_hashes(state, ids, pos, qsl, dead, lb, lbd, bt, state._cache)
+    expected = _reference_hashes(
+        state, ids, pos, qsl, dead, lb, lbd, bt, state._cache[:-1]
+    )
     assert torch.equal(hashes, expected)
 
     # Hand-derived values. Token 0 (position 0), layer 0, 2-gram: position -1
@@ -425,8 +438,18 @@ def test_ngram_hash_state_matches_reference_hash(
     ]
 
     # Stateless (V2 runner): history the lookback window misses hashes as pad.
+    # Keyword arguments use upstream's NgramHashState.forward parameter names.
     state.use_slot_cache = False
-    stateless = state(ids, pos, qsl, dead, lb, lbd, None, None)
+    stateless = state(
+        input_ids=ids,
+        positions=pos,
+        query_start_loc=qsl,
+        dead_mask=dead,
+        lookback_token_ids=lb,
+        lookback_dead_mask=lbd,
+        slot_mapping=None,
+        block_table=None,
+    )
     expected = _reference_hashes(state, ids, pos, qsl, dead, lb, lbd, None, None)
     assert torch.equal(stateless, expected)
     assert not torch.equal(stateless[5], hashes[5])
@@ -552,10 +575,16 @@ def test_engram_module_staging_and_forward(monkeypatch: pytest.MonkeyPatch) -> N
     assert eng_off.is_staged() is True
     assert eng_off._staged_raw is not None and eng_off._staged_raw.ndim == 1
     assert eng_off.staged_device_tensors() == ()
+    # max_num_batched_tokens=8: a larger batch must not fall back silently.
+    with pytest.raises(ValueError, match="num_tokens=9"):
+        eng_off.prepare_embeddings(torch.zeros((9, 4), dtype=torch.int32))
 
     hashes = torch.zeros((4, 4), dtype=torch.int32)
     eng_off.prepare_embeddings(hashes)
     assert len(eng_off.staged_device_tensors()) == 2
+    # Forward needing more tokens than the last prepare staged is an error.
+    with pytest.raises(RuntimeError, match="num_tokens=8"):
+        eng_off._ready_rows(8)
     eng_off.prepare_embeddings(hashes)
     h_in = torch.ones((4, 4, 32), dtype=torch.bfloat16)
     assert eng_off(h_in[:0], hashes[:0]).shape == (0, 4, 32)
@@ -688,41 +717,26 @@ def _reference_engram_forward(
     return out
 
 
-class _MockNativeSWA(torch.nn.Module):
-    block_size: int = 4
-    null_block: bool = False
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.kv_cache: Any = torch.tensor([])
-
-    def bind_kv_cache(self, cache: Any, *, raw_cache: Any = None) -> None:
-        self.kv_cache = cache
-        self.null_block = raw_cache is not None
-
-
-def test_ngram_hash_state_protects_native_null_block(
+def test_ngram_hash_state_skips_null_block_and_padded_slots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify NgramHashState never writes to or reads from reserved null_block 0."""
+    """Verify writes skip null block 0 and padded slots, and block 0 reads as DEAD."""
     state = _make_ngram_state(monkeypatch)
-    swa_native = _MockNativeSWA()
-    swa_native.bind_kv_cache(
-        torch.zeros((3, 1, 4, 64), dtype=torch.bfloat16),
-        raw_cache=torch.zeros((3, 128), dtype=torch.int32),
+    state.swa_cache_module = SimpleNamespace(
+        block_size=4, kv_cache=torch.zeros((3, 1, 4, 64), dtype=torch.bfloat16)
     )
-    assert swa_native.null_block is True
-    state.swa_cache_module = swa_native
     assert state.ensure_cache() and state._cache is not None
+    # 3 blocks x 4 slots, plus the trailing dummy slot for masked writes.
+    assert state._cache.numel() == 13
     state._cache[:4].fill_(777)
 
-    # Warmup / padding slots in block 0 (0..3) must be ignored; block 2 (8..11) writes.
-    ids = torch.tensor([5, 6], dtype=torch.int32)
-    pos = torch.tensor([0, 0], dtype=torch.int32)
-    qsl = torch.tensor([0, 1, 2], dtype=torch.int32)
-    dead = torch.zeros(2, dtype=torch.bool)
-    lb = torch.full((2, 3), -1, dtype=torch.int32)
-    lbd = torch.zeros((2, 3), dtype=torch.bool)
+    # Null-block slot 0 and padded slot -1 are dropped; block 2 (slot 8) writes.
+    ids = torch.tensor([5, 6, 7], dtype=torch.int32)
+    pos = torch.tensor([0, 0, 0], dtype=torch.int32)
+    qsl = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    dead = torch.zeros(3, dtype=torch.bool)
+    lb = torch.full((3, 3), -1, dtype=torch.int32)
+    lbd = torch.zeros((3, 3), dtype=torch.bool)
     state(
         ids,
         pos,
@@ -730,14 +744,16 @@ def test_ngram_hash_state_protects_native_null_block(
         dead,
         lb,
         lbd,
-        torch.tensor([0, 8], dtype=torch.int32),
-        torch.tensor([[0], [2]], dtype=torch.int32),
+        torch.tensor([0, 8, -1], dtype=torch.int32),
+        torch.tensor([[0], [2], [0]], dtype=torch.int32),
     )
-    assert state._cache[:4].tolist() == [777, 777, 777, 777]
-    assert state._cache[8].item() == state.token_map[6].item()
+    expected_cache = torch.zeros(12, dtype=torch.int32)
+    expected_cache[:4] = 777
+    expected_cache[8] = state.token_map[6]
+    assert torch.equal(state._cache[:-1], expected_cache)
 
-    # Fallback on evicted null_block=0 must treat block 0 as DEAD_ID -> pad_id,
-    # matching an empty/unmapped (-1) block rather than reading poisoned 777!
+    # Fallback on null block 0 must read as DEAD_ID -> pad_id, matching an
+    # unmapped (-1) block rather than reading the poisoned 777.
     h_null = state(
         torch.tensor([7], dtype=torch.int32),
         torch.tensor([4], dtype=torch.int32),
@@ -798,7 +814,7 @@ def test_tpu_engram_dequant_and_forward(
         lb_cpu,
         lbd_cpu,
         bt_cpu,
-        state._cache.cpu(),
+        state._cache[:-1].cpu(),
     )
     assert torch.equal(h_slot_tpu.cpu(), h_slot_ref)
 

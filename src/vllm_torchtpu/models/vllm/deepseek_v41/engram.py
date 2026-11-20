@@ -18,7 +18,7 @@ from __future__ import annotations
 import tempfile
 from collections.abc import Callable
 from contextlib import ExitStack
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -42,22 +42,26 @@ _TPU_LANE_ALIGNMENT: int = 128
 _WORD_BYTES: int = 4
 _DEFAULT_ENGRAM_BLOCK_SIZE: int = 32
 _DUMMY_SCALE_INV: int = 127
-
-
-@runtime_checkable
-class _NullBlockCache(Protocol):
-    """Cache view protocol exposing whether physical block ``0`` is reserved."""
-
-    @property
-    def null_block(self) -> bool: ...
+# vLLM's BlockPool reserves physical block 0 as the null block: it never holds
+# a live request's tokens, but padded slot_mapping / block_table entries may
+# point into it.
+_NULL_BLOCK_ID: int = 0
 
 
 def _write_slot_cache(
     cache: Tensor, slots: Tensor, values: Tensor, valid: Tensor
 ) -> None:
-    """Write ``values`` into 1-D ``cache`` at ``slots`` where ``valid`` is True."""
-    valid_slots = slots.masked_fill(~valid, -1)[valid].long()
-    cache[(valid_slots,)] = values[valid]
+    """Write ``values`` into 1-D ``cache`` at ``slots`` where ``valid`` is True.
+
+    Keeps the write shape static to avoid dynamic-shape recompiles, following
+    the JAX KV cache writers (``kernels/mla/kv_cache_utils.py``), which point
+    invalid rows at an out-of-bounds page that the scatter drops. Torch indexing
+    cannot go out of bounds, so invalid rows go to a dummy slot ``cache[-1]``
+    instead, which is never read.
+    """
+    dummy_slot = cache.numel() - 1
+    index = torch.where(valid, slots, dummy_slot).long()
+    cache[index] = values
 
 
 def dequant_fp8_rows(
@@ -246,10 +250,10 @@ class NgramHashState(upstream.NgramHashState):
         - Created: ``forward`` return ``int32[tokens, layers,
           n_hash_cols]`` hash index tensors.
         - Used: ``input_ids``, ``positions``, ``query_start_loc``, ``dead_mask``,
-          ``lookback_ids``, ``lookback_dead``, and ``block_table``.
+          ``lookback_token_ids``, ``lookback_dead_mask``, and ``block_table``.
         - Changed: ``ensure_cache`` updates ``block_size`` and ``_cache``;
           ``forward`` updates ``_cache`` at active ``slot_mapping`` slots outside
-          ``null_block=0``.
+          the null block ``0``.
     """
 
     def ensure_cache(self) -> bool:
@@ -258,7 +262,8 @@ class NgramHashState(upstream.NgramHashState):
         ``VllmDeepseekV4SWACache.get_kv_cache_spec`` finalizes ``block_size``
         after construction, and the bound ``kv_cache`` may be the overlaid CSA
         page tensor, so the logical block size comes from the module and never
-        from ``kv_cache.shape``.
+        from ``kv_cache.shape``. The slot cache gets one extra trailing dummy
+        slot for masked writes (see ``_write_slot_cache``).
 
         Returns:
             ``True`` when the slot cache (or SWA KV cache) is ready for hashing.
@@ -270,24 +275,29 @@ class NgramHashState(upstream.NgramHashState):
         if self.use_slot_cache and self.block_size != block_size:
             self.block_size = block_size
             self._kv_cache_ref = None
-        return super().ensure_cache()
+        kv_cache = cast(Tensor, swa.kv_cache)
+        # super() reallocates `_cache` only when a new KV cache is bound (and
+        # then updates `_kv_cache_ref`), so check for that before calling it.
+        rebind = self._kv_cache_ref is None or self._kv_cache_ref() is not kv_cache
+        ready = super().ensure_cache()
+        if ready and self.use_slot_cache and rebind:
+            assert self._cache is not None
+            # Append the dummy slot for `_write_slot_cache`, once per allocation.
+            self._cache = F.pad(self._cache, (0, 1))
+        return ready
 
-    # pyrefly: ignore[bad-override-param-name]
     def forward(
         self,
         input_ids: Tensor,
         positions: Tensor,
         query_start_loc: Tensor,
         dead_mask: Tensor,
-        lookback_ids: Tensor,
-        lookback_dead: Tensor,
+        lookback_token_ids: Tensor,
+        lookback_dead_mask: Tensor,
         slot_mapping: Tensor | None,
         block_table: Tensor | None,
     ) -> Tensor:
-        """Update slot cache (skipping ``null_block=0``) and compute n-gram hashes."""
-        swa: object = self.swa_cache_module
-        min_block = 1 if isinstance(swa, _NullBlockCache) and swa.null_block else 0
-
+        """Update slot cache (skipping the null block) and compute n-gram hashes."""
         token_count = input_ids.numel()
         mapped_batch: Tensor | None = None
         if token_count > 0 and self.use_slot_cache:
@@ -295,8 +305,10 @@ class NgramHashState(upstream.NgramHashState):
             slots = slot_mapping[:token_count]
             mapped_raw = self.token_map.index_select(0, input_ids.int())
             mapped_batch = mapped_raw.masked_fill(dead_mask, upstream.DEAD_ID)
+            # Also drops padded slots (-1), like upstream's `slot >= 0`.
+            first_live_slot = (_NULL_BLOCK_ID + 1) * self.block_size
             _write_slot_cache(
-                self._cache, slots, mapped_batch, slots >= min_block * self.block_size
+                self._cache, slots, mapped_batch, slots >= first_live_slot
             )
 
         def fallback_slot_lookup(past: Tensor, reqs: Tensor, window: Tensor) -> Tensor:
@@ -304,9 +316,12 @@ class NgramHashState(upstream.NgramHashState):
                 return torch.full_like(window, self.pad_id)
             assert self._cache is not None and block_table is not None
             block_size = self.block_size
-            num_cols = block_table.shape[1]
+            num_rows, num_cols = block_table.shape
+            # Real slots only; the trailing dummy slot is never read.
+            num_slots = self._cache.numel() - 1
             logical_pos = past.int().clamp(0, num_cols * block_size - 1)
-            table_idx = (reqs.int() * num_cols + logical_pos // block_size).reshape(-1)
+            table_rows = reqs.int().clamp(max=num_rows - 1)
+            table_idx = (table_rows * num_cols + logical_pos // block_size).reshape(-1)
             blocks = (
                 block_table.int()
                 .reshape(-1)
@@ -314,12 +329,13 @@ class NgramHashState(upstream.NgramHashState):
                 .view_as(logical_pos)
             )
             cache_slots = (blocks * block_size + logical_pos % block_size).clamp(
-                0, self._cache.numel() - 1
+                0, num_slots - 1
             )
             gathered = self._cache.index_select(0, cache_slots.reshape(-1)).view_as(
                 cache_slots
             )
-            return gathered.masked_fill(blocks < min_block, upstream.DEAD_ID)
+            # Null-block (and unmapped -1) entries hold no history.
+            return gathered.masked_fill(blocks <= _NULL_BLOCK_ID, upstream.DEAD_ID)
 
         tables = (self.token_map, self.multipliers, self.primes, self.offsets)
         return self._hash(
@@ -328,8 +344,8 @@ class NgramHashState(upstream.NgramHashState):
             positions,
             query_start_loc,
             dead_mask,
-            lookback_ids,
-            lookback_dead,
+            lookback_token_ids,
+            lookback_dead_mask,
             fallback_slot_lookup,
             mapped_batch,
         )
@@ -361,7 +377,8 @@ class NgramHashState(upstream.NgramHashState):
         reqs = (rows.unsqueeze(1) >= query_bounds[1:].unsqueeze(0)).sum(
             dim=-1, dtype=torch.int32
         )
-        reqs = reqs.clamp(max=lookback_ids.shape[0] - 1)
+        # Padding rows past the last query boundary belong to the last request.
+        reqs = reqs.clamp(max=query_bounds.numel() - 2)
         first_token_idx = query_bounds.index_select(0, reqs).clamp(max=token_count - 1)
         chunk_start_pos = pos_i32.index_select(0, first_token_idx)
 
@@ -573,8 +590,7 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         torch.index_select(
             scales, 0, flat_rows, out=scale_out.view(-1, scales.shape[1])
         )
-        if not bool(valid.all()):
-            scale_out.masked_fill_(~valid.unsqueeze(-1), _INVALID_SCALE)
+        scale_out.masked_fill_(~valid.unsqueeze(-1), _INVALID_SCALE)
 
     def lookup(
         self,
@@ -741,35 +757,44 @@ class Engram(upstream.Engram):
 
         Args:
             hash_ids: ``int32[num_tokens, n_hash_cols]`` hash indices (Used).
+
+        Raises:
+            ValueError: If ``num_tokens`` exceeds the host-offload staging size.
         """
         num_tokens = hash_ids.shape[0]
-        if self._staged_raw is not None and num_tokens <= self._staging_shape[0]:
-            staged, view = self._staged_pair(num_tokens)
-            if num_tokens > 0:
-                _, cols, head_dim = self._staging_shape
-                blocks = self._scale_blocks
-                words_per_token = self._words_per_tok
-                raw_bytes = num_tokens * cols * head_dim
-                scale_bytes = num_tokens * cols * blocks
-                host_buf = self._host_slot(
-                    num_tokens,
-                    raw_bytes,
-                    num_tokens * words_per_token * _WORD_BYTES,
-                )
-                host_buf[raw_bytes + scale_bytes :] = _INVALID_SCALE
-                host_raw = host_buf[:raw_bytes].view(num_tokens, cols, head_dim)
-                host_scale = host_buf[raw_bytes : raw_bytes + scale_bytes].view(
-                    num_tokens, cols, blocks
-                )
-                cast(ParallelEngramEmbedding, self.embed_tokens).gather_raw(
-                    hash_ids, host_raw, host_scale
-                )
-                # Whole-tensor 1-D int32 copy updates the captured root buffer in place.
-                staged.copy_(host_buf.view(torch.int32), non_blocking=False)
-            self._active_staged = staged
-            self._active_raw = view
+        if self._staged_raw is None:
+            super().prepare_embeddings(hash_ids)
             return
-        super().prepare_embeddings(hash_ids)
+        max_tokens = self._staging_shape[0]
+        if num_tokens > max_tokens:
+            raise ValueError(
+                f"Engram staging holds at most {max_tokens} tokens, "
+                f"got num_tokens={num_tokens}"
+            )
+        staged, view = self._staged_pair(num_tokens)
+        if num_tokens > 0:
+            _, cols, head_dim = self._staging_shape
+            blocks = self._scale_blocks
+            words_per_token = self._words_per_tok
+            raw_bytes = num_tokens * cols * head_dim
+            scale_bytes = num_tokens * cols * blocks
+            host_buf = self._host_slot(
+                num_tokens,
+                raw_bytes,
+                num_tokens * words_per_token * _WORD_BYTES,
+            )
+            host_buf[raw_bytes + scale_bytes :] = _INVALID_SCALE
+            host_raw = host_buf[:raw_bytes].view(num_tokens, cols, head_dim)
+            host_scale = host_buf[raw_bytes : raw_bytes + scale_bytes].view(
+                num_tokens, cols, blocks
+            )
+            cast(ParallelEngramEmbedding, self.embed_tokens).gather_raw(
+                hash_ids, host_raw, host_scale
+            )
+            # Whole-tensor 1-D int32 copy updates the captured root buffer in place.
+            staged.copy_(host_buf.view(torch.int32), non_blocking=False)
+        self._active_staged = staged
+        self._active_raw = view
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         """Unpack, dequantize, and DP-gather staged rows for ``num_tokens``."""
@@ -795,6 +820,11 @@ class Engram(upstream.Engram):
             )
             _, active = self._staged_pair(fallback_tokens)
         staged_tokens = active.shape[0]
+        if dp_size == 1 and staged_tokens < num_tokens:
+            raise RuntimeError(
+                f"Engram staged {staged_tokens} tokens in prepare_embeddings, "
+                f"but forward needs num_tokens={num_tokens}"
+            )
         by_word = active.view(raw_words_per_tok + scale_words_per_tok, staged_tokens)
         raw = _unpack_bytes(
             by_word[:raw_words_per_tok].reshape(-1),
