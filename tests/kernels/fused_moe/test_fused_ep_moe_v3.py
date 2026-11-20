@@ -936,13 +936,16 @@ def _run_case(name, mode, result_rows):
     valid = [real - (short if d % 2 else 0) for d in range(D)]
     config = Config(result_rows=result_rows, sorted_rows=sorted_rows)
     shard_index = jnp.arange(D, dtype=jnp.int32).reshape(D, 1) if bridge else None
-    # The rows past each shard's valid count reach the layer as NaN.
+    # The rows past each shard's valid count reach the layer as finite rows
+    # that are far from zero. NaN rows would not show a layer that ignores
+    # the count: the row quantization zeroes a row with no finite scale, and
+    # a zero row's expert output is zero.
     padding = np.ones((x.shape[0], 1), bool)
     padding[_valid_rows(real, valid)] = False
 
     def run(x, w1, w2, s1, s2, logits):
         return fused_ep_moe(
-            jnp.where(padding, jnp.nan, x),
+            jnp.where(padding, 1.0 + jnp.abs(x), x),
             w1,
             w2,
             s1,
@@ -985,8 +988,8 @@ def test_fused_ep_moe_matches_the_reference(eight_tpu7x_cores, mode, name, resul
     """Every value within one bf16 step of the reference, except fewer than
     1 in 1000. The same check must fail on the layer's own output with two
     tokens' rows swapped, and with one row zeroed. The rows past a shard's
-    valid count (short_shards) reach the layer as NaN, route nowhere and
-    must come back exactly zero."""
+    valid count (short_shards) reach the layer as finite rows far from zero,
+    route nowhere and must come back exactly zero."""
     got, want, rows = _run_case(name, mode, result_rows)
     report = _compare(got, want, rows)
     assert report["pass"], report
