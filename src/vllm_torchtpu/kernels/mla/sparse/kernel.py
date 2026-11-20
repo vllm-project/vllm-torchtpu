@@ -1757,10 +1757,11 @@ def send_layout_lanes(num_tokens: int, num_heads: int, world: int) -> int:
 def send_layout_supported(
     num_tokens: int, num_heads: int, world: int, vdim: int, batch_size: int
 ) -> bool:
-    """Whether the kernel can write the send buffer for this geometry: one lse
-    word row per destination (`2 * T * L <= V`), a power-of-two `L`, and grid
-    steps whose `batch_size * L` partial rows fill whole 16-row tiles."""
-    if world < 2 or num_heads % world or vdim % 128:
+    """Whether the kernel can write the send buffer for this geometry: at least
+    one token, one lse word row per destination (`2 * T * L <= V`), a
+    power-of-two `L`, and grid steps whose `batch_size * L` partial rows fill
+    whole 16-row tiles."""
+    if num_tokens <= 0 or world < 2 or num_heads % world or vdim % 128:
         return False
     per = num_heads // world
     rows = num_tokens * per
@@ -2695,21 +2696,13 @@ def _attention_kernel(
         hi = lax.shift_right_arithmetic(bits, jnp.int32(16))
         # The low half as a signed 16-bit value (the packed merge's words).
         lo = ((bits & 0xFFFF) ^ 0x8000) - 0x8000
-        lane = lax.broadcasted_iota(jnp.int32, x.shape, 1)
         lo_src = pltpu.roll(lo, send_rows % lanes, 1) if send_rows % lanes else lo
         if fault == "send_lse_lo_skip":
             lo_src = jnp.zeros_like(lo_src)
-        src = jnp.where(
-            lane < num_q_heads,
-            hi,
-            jnp.where(
-                (lane >= send_rows) & (lane < send_rows + num_q_heads), lo_src, 0
-            ),
-        )
         # Sublane d of the result is rolled by d*L once at the end (one
         # strided roll, shifts below a vreg width); before it, lane j of
         # sublane d holds what lands at J = (j + d*L) mod lanes. Token t's
-        # source row, rolled by t*L - (W-1)*L, puts head d*L+l (lane
+        # source rows, rolled by t*L - (W-1)*L, put head d*L+l (lane
         # (W-1-d)*L + l) at J = t*L + l and its lo half at rows + t*L + l, so
         # each lane takes the token whose words cover its J.
         shape = (send_world, lanes)
@@ -2720,14 +2713,37 @@ def _attention_kernel(
         tok = lax.shift_right_logical(
             big_j & (send_rows - 1), jnp.int32(send_per.bit_length() - 1)
         )
-        tok = jnp.where(big_j < 2 * send_rows, tok, -1)
+        if send_rows < num_q_heads:
+            # num_tokens < send_world: the hi lanes [0, heads) and the lo lanes
+            # [rows, rows + heads) of one source row overlap, so the hi and lo
+            # rows are rolled and picked separately. Neither needs a mask: a
+            # token picks only hi lanes below heads and lo lanes inside
+            # [rows, rows + heads).
+            parts = (
+                (hi, jnp.where(big_j < send_rows, tok, -1)),
+                (
+                    lo_src,
+                    jnp.where((big_j >= send_rows) & (big_j < 2 * send_rows), tok, -1),
+                ),
+            )
+        else:
+            lane = lax.broadcasted_iota(jnp.int32, x.shape, 1)
+            src = jnp.where(
+                lane < num_q_heads,
+                hi,
+                jnp.where(
+                    (lane >= send_rows) & (lane < send_rows + num_q_heads), lo_src, 0
+                ),
+            )
+            parts = ((src, jnp.where(big_j < 2 * send_rows, tok, -1)),)
         acc = jnp.zeros(shape, jnp.int32)
         for t in range(num_tokens):
             shift = (t * send_per - (send_world - 1) * send_per) % lanes
-            row = src[t : t + 1, :]
-            if shift:
-                row = pltpu.roll(row, shift, 1)
-            acc = jnp.where(tok == t, jnp.broadcast_to(row, shape), acc)
+            for part, part_tok in parts:
+                row = part[t : t + 1, :]
+                if shift:
+                    row = pltpu.roll(row, shift, 1)
+                acc = jnp.where(part_tok == t, jnp.broadcast_to(row, shape), acc)
         acc = pltpu.roll(acc, 0, 1, stride=send_per, stride_axis=0)
         if lanes < o_dim:
             acc = jnp.concatenate(
