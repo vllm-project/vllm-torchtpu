@@ -1142,12 +1142,14 @@ def kernel_main(
         zero_out_end(out_ref, cast(jax.Array, semaphore_ref), zero_size, dims=cfgs.dims)
 
 
-# Empirically tuned (tile_m, bucket_base) schedule on TPU v7x-8 across all
-# 19 Align-8 token buckets (size_m = T * topk, topk = 10) for Qwen3.5 FP8 MoE
+# Empirically tuned (tile_m, bucket_base) schedule on TPU v7x-8 across the
+# Align-8 token buckets (size_m = T * topk, topk = 10) for Qwen3.5 FP8 MoE
 # (GMM1: K=4096, N=2048, fuse_act="silu"; GMM2: K=1024, N=4096, fuse_act=None)
 # under both 80-slot (64 primary + 16 replicated) and 64-slot local expert layouts.
+# Keys are row counts gmm_v2 passes after padding the bf16 rows to their
+# 16-row sublane tile; the 4-token bucket (40 rows, padded to 48) has no entry
+# and takes the heuristic.
 _FP8_MOE_GMM1_TILES: dict[int, tuple[int, int]] = {
-    40: (16, 8),
     80: (64, 16),
     160: (64, 32),
     240: (64, 32),
@@ -1169,7 +1171,6 @@ _FP8_MOE_GMM1_TILES: dict[int, tuple[int, int]] = {
 }
 
 _FP8_MOE_GMM2_TILES: dict[int, tuple[int, int]] = {
-    40: (16, 16),
     80: (16, 16),
     160: (64, 32),
     240: (128, 32),
