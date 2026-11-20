@@ -23,9 +23,10 @@ rows and 14.6% at 112 rows (tpu7x, standalone kernel benchmark), and the
 decode step 4.3% / 3.8% faster in the engine than with 8 lanes. The result is
 not bit-exact against 8 lanes (max abs 4.3e-4, bf16 rounding scale).
 
-Only that measured shape is in the table, and only for long-context
-deployments (``max_model_len`` of at least the measured ~98K tokens); every
-other layer keeps the wrapper's default. The attention backend looks the table
+Only that measured shape is in the table, keyed on the chip it was measured
+on (TPU7x), and only for long-context deployments (``max_model_len`` of at
+least the measured ~98K tokens); every other layer, and every other chip,
+keeps the wrapper's default. The attention backend looks the table
 up only for layers that take the tuned tiles (its ``tuned_tiles``), so the
 lanes of other models do not change. The lanes reach the batched kernel entry
 only: the two decode-context-parallel passes (`cp_attention`) keep the
@@ -34,11 +35,13 @@ wrapper's 8 lanes, since the table was measured on the batched decode kernel.
 
 from typing import Any
 
+import jax.experimental.pallas.tpu as pltpu
 import torch
 
-# (kv heads per device, head_dim, fp8 KV cache) -> decode lanes.
-_DECODE_LANES: dict[tuple[int, int, bool], int] = {
-    (1, 256, True): 4,
+# (chip, kv heads per device, head_dim, fp8 KV cache) -> decode lanes.
+# pltpu.ChipVersion is the chip key, typed object as in the tuned prefill table.
+_DECODE_LANES: dict[tuple[object, int, int, bool], int] = {
+    (pltpu.ChipVersion.TPU_7X, 1, 256, True): 4,
 }
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 # The context the table entries were measured at (tokens per sequence).
@@ -47,15 +50,18 @@ DECODE_LANES_MIN_MODEL_LEN = 98304
 
 def decode_lanes(
     *,
+    chip_version: pltpu.ChipVersion,
     num_kv_heads: int,
     head_dim: int,
     kv_cache_dtype: torch.dtype | None,
     max_model_len: int,
 ) -> int | None:
-    """Decode lanes for a layer of this shape, or None for the default."""
+    """Decode lanes for a layer of this shape on this chip, or None for the
+    default."""
     if max_model_len < DECODE_LANES_MIN_MODEL_LEN:
         return None
-    return _DECODE_LANES.get((num_kv_heads, head_dim, kv_cache_dtype in _FP8_DTYPES))
+    is_fp8 = kv_cache_dtype in _FP8_DTYPES
+    return _DECODE_LANES.get((chip_version, num_kv_heads, head_dim, is_fp8))
 
 
 def kernel_kwargs(lanes: int | None) -> dict[str, Any]:
