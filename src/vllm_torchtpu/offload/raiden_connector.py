@@ -52,7 +52,9 @@ Core mechanisms:
   the free queue (no pin): if the allocator takes it before its store
   finishes, the memory-reuse flush above cancels or drains the store. Blocks
   are stored as the HBM prefix cache holds them, so a tier hit serves what an
-  HBM hit on the same block would.
+  HBM hit on the same block would. A lookup refreshes only the tier's copies
+  past the request's HBM hit, so the tier's LRU order follows what HBM
+  dropped.
 """
 
 from __future__ import annotations
@@ -80,6 +82,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
+    RequestOffloadState,
     TransferJobStatus,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
@@ -319,6 +322,29 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         if self._lazy is not None:
             self._lazy.gpu_block_pool = gpu_block_pool
+
+    def _touch(self, req_status: RequestOffloadState) -> None:
+        """Under lazy offload, refresh only the chunks past the HBM hit.
+
+        A lookup touches every key of the request, the prefix HBM serves
+        included. A lazy tier holds what HBM dropped, so refreshing its copies
+        of blocks HBM still serves would keep them at the Most Recently Used
+        end, and the tier would evict the blocks HBM actually dropped first.
+        The tier holds no partial-tail entries in lazy mode (request stores
+        are off), so there is no boundary key to refresh either.
+        """
+        if self._lazy is None:
+            super()._touch(req_status)
+            return
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            served = (
+                req_status.num_locally_computed_tokens // group_config.tokens_per_chunk
+            )
+            self.manager.touch(
+                group_state.offload_keys[served:], req_status.req_context
+            )
 
     def _schedule_lazy_stores(self) -> set[int]:
         """Park store jobs for the cached HBM blocks the allocator takes next.
