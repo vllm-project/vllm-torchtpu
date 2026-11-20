@@ -220,8 +220,13 @@ def _detect_target_tpu() -> str:
             "Cannot detect the TPU generation (neither TPU_ACCELERATOR_TYPE nor "
             "the GCE metadata accelerator-type is available); pass --target-tpu."
         )
-    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
-    name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
+    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu").strip()
+    name = {
+        "v5litepod": "v5e",
+        "v7x": "7x",
+        "v8i": "8i",
+        "v8t": "8t",
+    }.get(name, name)
     try:
         return str(pltpu.ChipVersion(name).value)
     except ValueError as e:

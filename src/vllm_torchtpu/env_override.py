@@ -119,6 +119,7 @@ def _fetch_tpu_type_from_metadata() -> str | None:
             "http://metadata.google.internal/computeMetadata/v1/"
             "instance/attributes/accelerator-type",
             headers={"Metadata-Flavor": "Google"},
+            timeout=2.0,
         )
         if resp.status_code == 200 and resp.text:
             return resp.text
