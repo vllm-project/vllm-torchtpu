@@ -13,7 +13,7 @@
 # limitations under the License.
 """The offloading scheduler's host-tier hit estimate.
 
-``PrefixAwareScheduler._external_warmth`` ranks waiting requests by it, so a
+``TpuPipelineChunkScheduler._external_warmth`` ranks waiting requests by it, so a
 request whose prefix is in the host tier is not sorted as a cold prompt. These
 run the real lookup (upstream OffloadingConnectorScheduler) and the real
 RaidenOffloadingManager over the fake store, on a full-attention group and a
