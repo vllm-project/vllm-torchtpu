@@ -93,6 +93,45 @@ def _config():
     )
 
 
+def _stub_dcp(monkeypatch, build_op, rank=0):
+    """Replace the DCP group (two ranks: all_gather repeats this rank's tensor,
+    reduce_scatter doubles it), the op builder and the sync, and start from an
+    empty DCP kernel registry. Returns a layer with the KV scales the kernels
+    read."""
+    # The cases compile the forward of up to three layers each; start from a
+    # clean dynamo cache so they do not add up to its recompile limit.
+    torch._dynamo.reset()
+    group = SimpleNamespace(
+        world_size=2,
+        rank_in_group=rank,
+        all_gather=lambda tensor, dim: torch.cat([tensor, tensor], dim=dim),
+        reduce_scatter=lambda tensor, dim: (2 * tensor).chunk(2, dim)[rank],
+    )
+    monkeypatch.setattr(attention, "_get_dcp_group", lambda: group)
+    monkeypatch.setattr(cp_attention, "get_dcp_group", lambda: group)
+    monkeypatch.setattr(cp_attention, "_DCP_KERNEL_REGISTRY", {})
+    monkeypatch.setattr(cp_attention, "_build_dcp_kernel_op", build_op)
+    monkeypatch.setattr(cp_attention, "synchronize_tensors", lambda *a, **k: None)
+    return SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
+
+
+def _dcp_forward(impl, layer, compiled):
+    """`impl`'s DCP forward of three one-token decode sequences, under
+    torch.compile (eager backend, full graph) when `compiled`."""
+    metadata = SimpleNamespace(
+        seq_lens=torch.tensor([2, 3, 4], dtype=torch.int32),
+        block_tables=torch.zeros(3, 2, dtype=torch.int32),
+        query_start_loc=torch.arange(4, dtype=torch.int32),
+        request_distribution=torch.tensor([3, 3, 3], dtype=torch.int32),
+    )
+    query = torch.ones(3, 8, 256)
+    key = torch.ones(3, 1, 256)
+    forward = impl._run_dcp_forward
+    if compiled:
+        forward = torch.compile(forward, backend="eager", fullgraph=True)
+    return forward(layer, query, key, key, torch.empty(1), metadata)
+
+
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("tiles", [False, True])
@@ -103,9 +142,6 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
     model opting its layers in sets them, so the forward must look the ops up
     with those values too. Such a layer has 4 decode lanes, which the DCP
     passes do not take: they keep the wrapper's 8."""
-    # Every case compiles the forward of three layers; start from a clean
-    # dynamo cache so the cases do not add up to its recompile limit.
-    torch._dynamo.reset()
     built, calls = [], []
 
     def build_op(_name, fn):
@@ -119,18 +155,7 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
 
         return kernel
 
-    group = SimpleNamespace(
-        world_size=2,
-        rank_in_group=rank,
-        all_gather=lambda tensor, dim: torch.cat([tensor, tensor], dim=dim),
-        reduce_scatter=lambda tensor, dim: (2 * tensor).chunk(2, dim)[rank],
-    )
-    monkeypatch.setattr(attention, "_get_dcp_group", lambda: group)
-    monkeypatch.setattr(cp_attention, "get_dcp_group", lambda: group)
-    monkeypatch.setattr(cp_attention, "_DCP_KERNEL_REGISTRY", {})
-    monkeypatch.setattr(cp_attention, "_build_dcp_kernel_op", build_op)
-    monkeypatch.setattr(cp_attention, "synchronize_tensors", lambda *a, **k: None)
-    layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
+    layer = _stub_dcp(monkeypatch, build_op, rank)
     implementations = []
     # The third layer must reuse NHD's ops after HND has populated the registry.
     for layout in ("LBNHC", "LBHNC", "LBNHC"):
@@ -163,14 +188,6 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
         is not implementations[1].rpa_dcp_new_kernel
     )
 
-    metadata = SimpleNamespace(
-        seq_lens=torch.tensor([2, 3, 4], dtype=torch.int32),
-        block_tables=torch.zeros(3, 2, dtype=torch.int32),
-        query_start_loc=torch.arange(4, dtype=torch.int32),
-        request_distribution=torch.tensor([3, 3, 3], dtype=torch.int32),
-    )
-    query = torch.ones(3, 8, 256)
-    key = torch.ones(3, 1, 256)
     for impl, expected_layout in zip(
         implementations,
         (
@@ -181,17 +198,14 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
     ):
         # The per-layer layout must survive even if the current config changes.
         get_current_vllm_config().cache_config.kv_cache_layout = "LBHNC"
-        forward = impl._run_dcp_forward
-        if compiled:
-            forward = torch.compile(forward, backend="eager", fullgraph=True)
-        output = forward(layer, query, key, key, torch.empty(1), metadata)
+        output = _dcp_forward(impl, layer, compiled)
         assert calls[-2:] == [
             (expected_layout, AttentionScope.CACHE_ONLY, (3, 16, 256)),
             (expected_layout, AttentionScope.NEW_TOKENS_ONLY, (3, 8, 256)),
         ]
         # Two cached partials (value=1, weight=1 each) and one new partial
         # (value=3, weight=1), including both production LSE merges.
-        torch.testing.assert_close(output, torch.full_like(query, 5 / 3))
+        torch.testing.assert_close(output, torch.full((3, 8, 256), 5 / 3))
     assert len(built) == 4  # Forward must reuse the prebuilt ops for each layout.
     assert all(type(fn.keywords["kv_layout"]) is KVLayout for fn in built)
 
@@ -206,9 +220,6 @@ def test_dcp_forward_reuses_the_ops_built_with_the_layer_modes_and_tiles(
     and tuned tiles. On a registry miss it would build an op while
     torch.compile traces the forward, which torch_tpu's jax_op cannot do under
     dynamo."""
-    # As in the layout test: the cases must not add up to dynamo's recompile
-    # limit.
-    torch._dynamo.reset()
     built = []
 
     def build_op(_name, fn):
@@ -219,18 +230,7 @@ def test_dcp_forward_reuses_the_ops_built_with_the_layer_modes_and_tiles(
 
         return kernel
 
-    group = SimpleNamespace(
-        world_size=2,
-        rank_in_group=0,
-        all_gather=lambda tensor, dim: torch.cat([tensor, tensor], dim=dim),
-        reduce_scatter=lambda tensor, dim: tensor.chunk(2, dim)[0],
-    )
-    monkeypatch.setattr(attention, "_get_dcp_group", lambda: group)
-    monkeypatch.setattr(cp_attention, "get_dcp_group", lambda: group)
-    monkeypatch.setattr(cp_attention, "_DCP_KERNEL_REGISTRY", {})
-    monkeypatch.setattr(cp_attention, "_build_dcp_kernel_op", build_op)
-    monkeypatch.setattr(cp_attention, "synchronize_tensors", lambda *a, **k: None)
-    layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
+    layer = _stub_dcp(monkeypatch, build_op)
     pv_static = NativeFp8(pv=Fp8Operand.STATIC)
     modes = native_fp8_scope.AttentionModes(
         native_fp8=pv_static, native_fp8_prefill=pv_static, decode_exp2=True
@@ -249,18 +249,7 @@ def test_dcp_forward_reuses_the_ops_built_with_the_layer_modes_and_tiles(
     assert all(fn.keywords["tuned_tiles"] is True for fn in built)
     assert all(fn.keywords["skip_empty_mixed"] is True for fn in built)
 
-    metadata = SimpleNamespace(
-        seq_lens=torch.tensor([2, 3, 4], dtype=torch.int32),
-        block_tables=torch.zeros(3, 2, dtype=torch.int32),
-        query_start_loc=torch.arange(4, dtype=torch.int32),
-        request_distribution=torch.tensor([3, 3, 3], dtype=torch.int32),
-    )
-    query = torch.ones(3, 8, 256)
-    key = torch.ones(3, 1, 256)
-    forward = impl._run_dcp_forward
-    if compiled:
-        forward = torch.compile(forward, backend="eager", fullgraph=True)
-    forward(layer, query, key, key, torch.empty(1), metadata)
+    _dcp_forward(impl, layer, compiled)
     assert len(built) == 2  # No op is built in the forward pass.
 
 

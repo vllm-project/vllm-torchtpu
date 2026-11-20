@@ -100,8 +100,9 @@ class _FakeOp:
 
 @pytest.fixture
 def registered(monkeypatch):
-    """Fresh kernel registry; records every (op_name, wrapped_fn) registered."""
+    """Fresh kernel registries; records every (op_name, wrapped_fn) registered."""
     monkeypatch.setattr(PallasAttentionBackendImpl, "_kernel_registry", {})
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_bundled_kernel_registry", {})
     monkeypatch.setattr(
         PallasAttentionBackendImpl,
         "_select_kernel_mesh",
@@ -205,9 +206,7 @@ def test_builder_gives_a_draft_its_own_full_precision_op(
     assert _rpa_call_kwargs(monkeypatch, d_fn, 9) == {}
 
 
-def test_builder_unchanged_with_the_modes_off(
-    monkeypatch, registered, cpu_vllm_config_context
-):
+def test_builder_unchanged_with_the_modes_off(registered, cpu_vllm_config_context):
     target, draft = _batched_impl(), _batched_impl()
     draft.is_attention_draft = True
     with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
