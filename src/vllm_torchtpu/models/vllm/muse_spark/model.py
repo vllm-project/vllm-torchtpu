@@ -75,6 +75,7 @@ from vllm.models.muse_spark.common.moe import (  # noqa: E402
     MuseSparkMoEConfig,
 )
 from vllm.models.muse_spark.common.omni import OMNI_WEIGHTS_MAPPER  # noqa: E402
+from vllm.sequence import IntermediateTensors  # noqa: E402
 from vllm.transformers_utils.configs.muse_spark import (  # noqa: E402
     MuseSparkDSparkConfig,
 )
@@ -448,6 +449,19 @@ class TPUMuseSparkModel(up.MuseSpark1xModel):
             prefix=prefix,
             layer_type=layer_type,
         )
+
+    def forward(  # type: ignore[override]
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        res = super().forward(input_ids, positions, intermediate_tensors, inputs_embeds)
+        if isinstance(res, tuple):
+            output, aux_states = res
+            return output, [s.to(self.default_dtype) for s in aux_states]
+        return res
 
 
 class TPUMuseSparkForCausalLM(up.MuseSpark1xForCausalLM):
