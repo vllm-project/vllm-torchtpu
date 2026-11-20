@@ -5865,6 +5865,20 @@ class TPUModelRunner(GPUModelRunner):
 
             arm_runner_models(self)
 
+        # Fuse the shared expert (+ gate + TP reduce) into the De-Dup MoE layer.
+        if os.environ.get("DEDUP_MOE_FUSE_SHARED", "").strip().lower() not in (
+            "",
+            "0",
+            "false",
+            "off",
+            "no",
+        ):
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+                arm_dedup_fuse_shared_models,
+            )
+
+            arm_dedup_fuse_shared_models(self)
+
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
 
