@@ -132,7 +132,9 @@ def _model_dir(tmp_path):
     return str(d)
 
 
-def _make_sched(tmp_path, prefetch=0, num_blocks=2000, role="kv_consumer", reserve=8):
+def _make_configs(tmp_path, prefetch=0, num_blocks=2000, role="kv_consumer"):
+    """The engine and KV cache configs of a test scheduler. Building the
+    VllmConfig runs the platform's checks, which apply the registry patches."""
     vllm_config = VllmConfig(
         scheduler_config=SchedulerConfig(
             max_num_seqs=CAP,
@@ -175,6 +177,10 @@ def _make_sched(tmp_path, prefetch=0, num_blocks=2000, role="kv_consumer", reser
             )
         ],
     )
+    return vllm_config, kv_cache_config
+
+
+def _build_sched(vllm_config, kv_cache_config, prefetch=0, reserve=8):
     s = PrefixAwareScheduler(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
@@ -189,6 +195,11 @@ def _make_sched(tmp_path, prefetch=0, num_blocks=2000, role="kv_consumer", reser
         s._kv_prefetch_n = prefetch
     s._kv_prefetch_reserve = reserve
     return s
+
+
+def _make_sched(tmp_path, prefetch=0, num_blocks=2000, role="kv_consumer", reserve=8):
+    configs = _make_configs(tmp_path, prefetch, num_blocks, role)
+    return _build_sched(*configs, prefetch=prefetch, reserve=reserve)
 
 
 _none_hash_ready = False
@@ -541,10 +552,13 @@ _WRAPPED = (
 def test_building_the_scheduler_leaves_the_vllm_classes_alone(tmp_path, monkeypatch):
     # The epoch and change-log wrappers are patch-registry entries applied at
     # engine start; the constructor only opts its own block pool in, so a
-    # test that builds the scheduler leaves no class patch behind. Start from
-    # vLLM's own methods, whatever ran earlier in the process.
+    # test that builds the scheduler leaves no class patch behind. The
+    # configs are built first: building the VllmConfig applies the registry
+    # patches. Then start from vLLM's own methods, whatever ran earlier in
+    # the process, and build only the scheduler.
+    configs = _make_configs(tmp_path, prefetch=2)
     for cls, name in _WRAPPED:
         monkeypatch.setattr(cls, name, inspect.unwrap(cls.__dict__[name]))
     before = {(cls, name): cls.__dict__[name] for cls, name in _WRAPPED}
-    _make_sched(tmp_path, prefetch=2)
+    _build_sched(*configs, prefetch=2)
     assert {(cls, name): cls.__dict__[name] for cls, name in _WRAPPED} == before
