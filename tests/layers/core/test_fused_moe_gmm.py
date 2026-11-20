@@ -1197,3 +1197,70 @@ def test_moe_gmm_onehot_combine_zeroes_uncomputed_rows(monkeypatch):
     )
 
     assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))
+
+
+def _fp8_moe_gmm_kwargs(rows=8, hidden=8, inter=256):
+    """Kwargs for a moe_gmm call with fp8 weights and one scale per column, the
+    weights gmm_fused_moe takes."""
+    fp8 = jnp.float8_e4m3fn
+    return {
+        **_small_moe_gmm_kwargs(),
+        "w1": jnp.ones((1, hidden, 2 * inter), dtype=fp8),
+        "w1_scale": jnp.ones((1, 1, 1, 2 * inter), dtype=jnp.float32),
+        "w2": jnp.ones((1, inter, hidden), dtype=fp8),
+        "w2_scale": jnp.ones((1, 1, 1, hidden), dtype=jnp.float32),
+        "group_sizes": jnp.array([rows], dtype=jnp.int32),
+        "onehot_moe_permute_threshold": rows,
+    }
+
+
+@pytest.mark.parametrize(
+    ("one_stream", "weights", "fused"),
+    [
+        (False, "fp8, one scale per column", False),
+        (True, "fp8, one scale per column", True),
+        (True, "with a bias", False),
+        (True, "with block scales", False),
+    ],
+)
+def test_moe_gmm_one_stream_replaces_both_calls_where_the_kernel_is_exact(
+    monkeypatch, one_stream, weights, fused
+):
+    """TPU_MOE_GMM_ONE_STREAM: moe_gmm runs gmm_fused_moe instead of the 2
+    gmm_v2 calls only for fp8 weights with one scale per column and no bias,
+    and combines its rows exactly as it combines the second call's rows."""
+    kwargs = _fp8_moe_gmm_kwargs()
+    if weights == "with a bias":
+        kwargs["w1_bias"] = jnp.zeros((1, 1, 512), dtype=jnp.float32)
+    if weights == "with block scales":
+        kwargs["w1_scale"] = jnp.ones((1, 2, 1, 512), dtype=jnp.float32)
+    rows = kwargs["argsort_revert_indices"].size
+    expert_rows = (
+        jax.random.normal(jax.random.key(5), (rows, 8), dtype=jnp.float32) / 10
+    ).astype(jnp.bfloat16)
+    calls = []
+
+    def two_calls(lhs, *args, **kw):
+        calls.append("gmm_v2")
+        return expert_rows if kw.get("fuse_act") is None else lhs
+
+    def one_call(x, w1, w1_scale, w2, w2_scale, group_sizes, group_offset, **kw):
+        calls.append("gmm_fused_moe")
+        assert kw == {"fuse_act": "silu"}
+        assert group_offset.shape == ()
+        return expert_rows
+
+    monkeypatch.setattr(fused_moe_gmm, "_ONE_STREAM", one_stream)
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", two_calls)
+    monkeypatch.setattr(fused_moe_gmm.gmm_fused_moe, "gmm_fused_moe", one_call)
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *a, **k: 1)
+
+    out = fused_moe_gmm.moe_gmm(**kwargs)
+
+    assert calls == (["gmm_fused_moe"] if fused else ["gmm_v2", "gmm_v2"])
+    monkeypatch.setattr(fused_moe_gmm, "_ONE_STREAM", False)
+    calls.clear()
+    reference = fused_moe_gmm.moe_gmm(**kwargs)
+    np.testing.assert_array_equal(
+        np.asarray(out).view(np.uint16), np.asarray(reference).view(np.uint16)
+    )

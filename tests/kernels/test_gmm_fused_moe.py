@@ -24,7 +24,7 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 GROUPS, HIDDEN, INTER = 16, 1024, 512
 
 
-def _weights():
+def _weights(hidden: int = HIDDEN, inter: int = INTER):
     keys = jax.random.split(jax.random.key(7), 4)
 
     def weight(key, shape):
@@ -34,10 +34,10 @@ def _weights():
         return jax.random.uniform(key, shape, jnp.float32, 0.5, 1.5) * 0.02
 
     return (
-        weight(keys[0], (GROUPS, HIDDEN, 2 * INTER)),
-        scale(keys[1], (GROUPS, 1, 1, 2 * INTER)),
-        weight(keys[2], (GROUPS, INTER, HIDDEN)),
-        scale(keys[3], (GROUPS, 1, 1, HIDDEN)),
+        weight(keys[0], (GROUPS, hidden, 2 * inter)),
+        scale(keys[1], (GROUPS, 1, 1, 2 * inter)),
+        weight(keys[2], (GROUPS, inter, hidden)),
+        scale(keys[3], (GROUPS, 1, 1, hidden)),
     )
 
 
@@ -90,4 +90,37 @@ def test_gmm_fused_moe_matches_two_gmm_v2_calls(group_sizes):
     np.testing.assert_array_equal(
         np.asarray(actual[:rows]).view(np.uint16),
         np.asarray(expected[:rows]).view(np.uint16),
+    )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "group_sizes",
+    [
+        # 2,048 and 4,096 prefill tokens, 8 routes each, over 16 EP ranks: the
+        # rows of one rank's 16 experts, uneven as routing makes them.
+        [0, 9, 23, 31, 40, 48, 52, 57, 61, 66, 70, 78, 85, 97, 121, 186],
+        [3, 18, 46, 62, 80, 95, 104, 113, 121, 130, 142, 155, 171, 198, 254, 356],
+    ],
+)
+def test_gmm_fused_moe_matches_two_gmm_v2_calls_at_glm52_prefill_shapes(group_sizes):
+    """GLM-5.2's expert shapes on one EP rank of the prefill leg (hidden 6144,
+    inter 2048, 16 experts): the kernel's output equals the 2 gmm_v2 calls
+    bit for bit."""
+    if jax.default_backend() != "tpu":
+        pytest.fail(f"Expected JAX TPU backend, got {jax.default_backend()}.")
+    hidden, inter = 6144, 2048
+    w1, s1, w2, s2 = _weights(hidden, inter)
+    rows = int(sum(group_sizes))
+    x = jax.random.normal(jax.random.key(3), (rows, hidden), jnp.bfloat16)
+    sizes = jnp.array(group_sizes, dtype=jnp.int32)
+
+    expected = _two_calls(x, w1, s1, w2, s2, sizes)
+    actual = gmm_fused_moe.gmm_fused_moe(
+        x, w1, s1, w2, s2, sizes, jnp.array(0, dtype=jnp.int32), fuse_act="silu"
+    )
+
+    assert gmm_fused_moe.supports(w1, s1, None, w2, s2, None, "silu", None)
+    np.testing.assert_array_equal(
+        np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16)
     )
