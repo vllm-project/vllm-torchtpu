@@ -46,6 +46,67 @@ def test_dp_decoder_bucket_preserves_empty_local_plan(
     assert coordinated.query_start_loc == plan.query_start_loc
 
 
+@pytest.mark.parametrize("local_rows", [0, 3, 4])
+def test_small_bucket_skips_the_dp_all_reduce(monkeypatch, local_rows):
+    """A bucket within the local limit takes the whole bucket on every rank."""
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import ced
+
+    monkeypatch.setattr(
+        ced, "get_dp_group", lambda: SimpleNamespace(world_size=4, cpu_group=None)
+    )
+
+    def reduce(count, op, group):
+        raise AssertionError("no all-reduce within the local bucket limit")
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    plan = ced.DecoderReplayPlan(
+        tuple(range(local_rows)), tuple(range(local_rows + 1)), (0,) * local_rows,
+        4 if local_rows else 0,
+    )
+    coordinated = ced.coordinate_decoder_replay(plan, 4, local_bucket_max=8)
+    assert coordinated.padded_num_tokens == 4
+    assert coordinated.indices == plan.indices
+    assert ced.coordinate_decoder_replay(None, 4, local_bucket_max=8) is None
+
+
+def test_bucket_above_the_local_limit_still_reduces(monkeypatch):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import ced
+
+    monkeypatch.setattr(
+        ced, "get_dp_group", lambda: SimpleNamespace(world_size=4, cpu_group=None)
+    )
+    calls = []
+
+    def reduce(count, op, group):
+        calls.append(int(count.item()))
+        count.fill_(128)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    plan = ced.DecoderReplayPlan((0,), (0, 1), (0,), 8)
+    coordinated = ced.coordinate_decoder_replay(plan, 128, local_bucket_max=8)
+    assert calls == [8] and coordinated.padded_num_tokens == 128
+
+
+@pytest.mark.parametrize(
+    "indices,padded,prefix,expected",
+    [
+        ((0, 1, 2, 3), 4, False, True),
+        ((0, 1, 2), 4, False, False),
+        ((0, 1, 2), 4, True, True),
+        ((1, 2), 4, True, False),
+        ((0, 1, 2), 8, True, False),
+    ],
+)
+def test_identity_plan(monkeypatch, indices, padded, prefix, expected):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import ced, model
+
+    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_CED_PREFIX_IDENTITY", prefix)
+    plan = ced.DecoderReplayPlan(
+        indices, tuple(range(len(indices) + 1)), (0,) * len(indices), padded
+    )
+    assert model._identity_plan(plan, 4) is expected
+
+
 def _plan_metadata(bounds, lengths, prompts, hits=None):
     return SimpleNamespace(
         query_start_loc_cpu=tuple(bounds),

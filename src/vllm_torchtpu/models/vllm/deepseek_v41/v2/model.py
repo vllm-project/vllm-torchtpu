@@ -70,6 +70,22 @@ if TYPE_CHECKING:
     from ..common.host_transfer import EngramHashDownload, PreparedEngramUpload
 
 
+def _identity_plan(plan, num_tokens: int) -> bool:
+    """Whether the decoder can read and write the encoder rows in place.
+
+    Exact identity: every row kept, in order, at the full bucket. With
+    ``TPU_DEEPSEEK_V41_CED_PREFIX_IDENTITY``, also a plan that keeps rows
+    ``0 .. kept-1`` in order and pads to the full bucket (3 decode rows in
+    bucket 4): rows ``kept ..`` are padding in both layouts.
+    """
+    if plan.padded_num_tokens != num_tokens:
+        return False
+    kept = len(plan.indices)
+    if kept != num_tokens and not envs.TPU_DEEPSEEK_V41_CED_PREFIX_IDENTITY:
+        return False
+    return plan.indices == tuple(range(kept))
+
+
 @dataclass
 class _EngramPrefetch:
     inputs: HostEngramInputs
@@ -947,7 +963,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             else None
         )
         if context.dp_metadata is not None:
-            plan = coordinate_decoder_replay(plan, positions.shape[0])
+            plan = coordinate_decoder_replay(
+                plan,
+                positions.shape[0],
+                envs.TPU_DEEPSEEK_V41_CED_LOCAL_BUCKET_MAX,
+            )
         if plan is not None and plan.padded_num_tokens == 0:
             # The scheduler ignores logits for incomplete prefills. The
             # encoder has still published every global KV row for this chunk;
@@ -985,10 +1005,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             )
         else:
             num_tokens = positions.shape[0]
-            if (
-                envs.TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY
-                and plan.padded_num_tokens == num_tokens
-                and plan.indices == tuple(range(num_tokens))
+            if envs.TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY and _identity_plan(
+                plan, num_tokens
             ):
                 # Every row replays in place (steady decode): gathering and
                 # scattering by the identity only copies rows.
@@ -1061,11 +1079,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         # the decoder output in original row order: skip the scatter back.
         # The plan itself still fed the decoder its query bounds and replay
         # starts above.
-        identity = (
-            plan is not None
-            and plan.padded_num_tokens == total_rows
-            and plan.indices == tuple(range(total_rows))
-        )
+        identity = plan is not None and _identity_plan(plan, total_rows)
         if identity:
             # Serving evidence that steady decode takes the scatter-free path.
             logger.info_once("CED decoder replay is identity; skip scatter")

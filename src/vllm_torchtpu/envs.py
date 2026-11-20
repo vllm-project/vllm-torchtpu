@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY: bool = True
+    TPU_DEEPSEEK_V41_CED_PREFIX_IDENTITY: bool = False
+    TPU_DEEPSEEK_V41_CED_LOCAL_BUCKET_MAX: int = 0
     TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE: bool = True
@@ -424,6 +426,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # identity (v2/model.py). Outputs are unchanged.
     "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY": env_bool(
         "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY", default=True
+    ),
+    # CED: also take the identity path when the decoder keeps the first `kept`
+    # rows in place and pads to the full token bucket, for example 3 decode
+    # rows in bucket 4. The padding rows then carry the encoder's padding rows
+    # instead of copies of the last row; both are masked and never sampled.
+    # Saves the eager index upload, four row gathers and the index_copy
+    # scatter of every such step. Real rows are unchanged.
+    "TPU_DEEPSEEK_V41_CED_PREFIX_IDENTITY": env_bool(
+        "TPU_DEEPSEEK_V41_CED_PREFIX_IDENTITY", default=False
+    ),
+    # CED with DP: for a token bucket of at most this many tokens, every DP
+    # rank runs the decoder at the full bucket without the Gloo all-reduce
+    # that agrees on the decoder bucket. The bucket itself is already the
+    # same on every rank, so the ranks still agree. 0 keeps the all-reduce
+    # for every bucket. Example: 8 skips it for decode buckets 4 and 8.
+    "TPU_DEEPSEEK_V41_CED_LOCAL_BUCKET_MAX": env_int(
+        "TPU_DEEPSEEK_V41_CED_LOCAL_BUCKET_MAX", default=0
     ),
     # Engram n-gram hash on device as one fused program with exact 64-bit
     # arithmetic on uint32 pairs (kernels/engram_hash.py), instead of the
