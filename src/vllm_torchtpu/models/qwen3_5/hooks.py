@@ -242,10 +242,7 @@ def is_measured_target(model_config) -> bool:
     Any other Qwen3.5 checkpoint (main's CI model, Qwen3.5-35B-A3B, among
     them) or device keeps main's arithmetic and code: those levers change the
     last bits of the forward pass, which is not a free choice where they were
-    not measured. A config without ``architectures`` (the stand-ins callers
-    hand the patch registry) is not a target either."""
-    if getattr(model_config, "architectures", None) is None:
-        return False
+    not measured."""
     if not settings.is_qwen3_5(model_config):
         return False
     if _is_calibrated(model_config):
