@@ -9,11 +9,14 @@ tokens; when any row applies a mask, the search runs.
 
 import contextlib
 from types import MethodType, SimpleNamespace
+from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
 from vllm_torchtpu.layers.adapter.sample import rejection_sampler as rs
+from vllm_torchtpu.layers.adapter.sample import top_k_top_p
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import MASK_FLAG_COMBINATIONS
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.tpu_runner import PaddedSamplingParams, TPUModelRunner
@@ -134,6 +137,45 @@ def test_sampling_without_masks_skips_searches_with_same_tokens(seed, eager_reje
     full = _reject(eager_rejection, inputs, top_k, top_p, True, True)
     skipped = _reject(eager_rejection, inputs, top_k, top_p, False, False)
     assert torch.equal(full, skipped)
+
+
+@pytest.fixture
+def searches(monkeypatch):
+    """Records which cutoff searches run: topk_mask and topp_mask."""
+    ran = []
+    for name in ("topk_mask", "topp_mask"):
+        search = getattr(top_k_top_p, name)
+
+        def spy(*args, _name=name, _search=search, **kwargs):
+            ran.append(_name)
+            return _search(*args, **kwargs)
+
+        monkeypatch.setattr(top_k_top_p, name, spy)
+    return ran
+
+
+@pytest.mark.parametrize("use_top_k, use_top_p", MASK_FLAG_COMBINATIONS)
+def test_every_sampler_runs_only_the_searches_its_flags_ask_for(
+    use_top_k, use_top_p, searches, eager_rejection
+):
+    """Rows here set top-k and top-p, so a search that ran despite a False
+    flag would show up; each entry point runs exactly the flagged ones."""
+    inputs = _sampler_inputs(0)
+    logits, temperatures, u, _ = inputs
+    top_k = torch.full((ROWS, 1), 3, dtype=torch.int32)
+    top_p = torch.full((ROWS, 1), 0.5)
+    expected = ["topk_mask"] * use_top_k + ["topp_mask"] * use_top_p
+
+    top_k_top_p.apply_top_k_top_p(
+        logits, top_k, top_p, use_top_k=use_top_k, use_top_p=use_top_p
+    )
+    assert searches == expected
+    searches.clear()
+    _sample(logits, temperatures, u, top_k, top_p, use_top_k, use_top_p)
+    assert searches == expected
+    searches.clear()
+    _reject(eager_rejection, inputs, top_k, top_p, use_top_k, use_top_p)
+    assert searches == expected
 
 
 @pytest.mark.parametrize(
@@ -433,3 +475,109 @@ def test_spec_warmup_runs_every_flag_combination(monkeypatch):
     variants = [(True, (False, False))] + [(False, f) for f in MASK_FLAG_COMBINATIONS]
     assert single == [(P, *v) for P in (8, 16) for v in variants]
     assert batched == [(R, *v) for R in (2, 4) for v in variants]
+
+
+class _Event:
+    def record(self):
+        pass
+
+    def synchronize(self):
+        pass
+
+
+def _sample_tokens_runner(spec_decode_metadata_list, params_by_start, calls):
+    """Two chunks of one request each, sampled at temperature 1.0."""
+    req_ids = ["r0", "r1"]
+
+    def rejection_sampler(**kwargs):
+        calls.append(("reject", kwargs))
+        return torch.zeros((2, 2), dtype=torch.int32)
+
+    runner = SimpleNamespace(
+        execute_model_state=SimpleNamespace(
+            scheduler_output=SimpleNamespace(
+                num_scheduled_tokens={"r0": 1, "r1": 1}, finished_req_ids=set()
+            ),
+            draft_chunks=[],
+            logits_list=[torch.zeros((2, VOCAB)), torch.zeros((2, VOCAB))],
+            num_reqs_list=[1, 1],
+            spec_decode_metadata_list=spec_decode_metadata_list,
+            mamba_state_indices_list=None,
+        ),
+        input_batch=SimpleNamespace(
+            max_num_logprobs=None,
+            num_reqs=2,
+            req_ids=req_ids,
+            req_id_to_index={"r0": 0, "r1": 1},
+            all_greedy=False,
+            num_tokens_no_spec=[1, 1],
+            token_ids_cpu=np.zeros((2, 8), dtype=np.int32),
+        ),
+        requests={
+            r: SimpleNamespace(num_computed_tokens=0, num_tokens=1, output_token_ids=[])
+            for r in req_ids
+        },
+        speculative_config=SimpleNamespace(method="ngram", num_speculative_tokens=1),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        _is_async_drafter=False,
+        is_pooling_model=False,
+        spec_decode_manager=SimpleNamespace(propose_draft_token_ids=lambda **kw: None),
+        _get_sampling_generator=lambda: None,
+        _build_padded_sampling_params=lambda start, end, logits: params_by_start[start],
+        sample_from_logits_func=_record(calls),
+        rejection_sampler=_RejectionSampler(rejection_sampler),
+        spec_gather_bonus_and_target_logits=lambda logits, b, t: (logits, logits),
+        _update_mamba_slot_read_offsets=lambda *args: None,
+        _update_num_xla_graphs=lambda *args: None,
+        _stage_timing=MagicMock(),
+    )
+    runner._stage_timing.take_samples.return_value = ([], [])
+    for name in (
+        "_sample_spec_verify_chunk",
+        "maybe_wait_for_kv_save",
+        "get_finished_kv_transfers",
+    ):
+        setattr(runner, name, MethodType(getattr(TPUModelRunner, name), runner))
+    return runner
+
+
+@pytest.mark.parametrize("use_top_k, use_top_p", MASK_FLAG_COMBINATIONS)
+@pytest.mark.parametrize("spec_step", [True, False], ids=["spec", "non_spec"])
+def test_sample_tokens_passes_each_chunk_its_own_flags(
+    monkeypatch, spec_step, use_top_k, use_top_p
+):
+    """A spec step with a verify chunk and a chunk without drafts, and a step
+    without drafts: every sampler call gets the flags of its own chunk."""
+    monkeypatch.setattr(torch, "tpu", SimpleNamespace(Event=_Event), raising=False)
+    monkeypatch.setattr(tpu_runner, "has_kv_transfer_group", lambda: False)
+    first, second = (use_top_k, use_top_p), (not use_top_k, not use_top_p)
+    params_by_start = {
+        start: PaddedSamplingParams(
+            temperatures=torch.ones((2, 1)),
+            top_k=torch.zeros((2, 1), dtype=torch.int32),
+            top_p=torch.ones((2, 1)),
+            use_top_k=flags[0],
+            use_top_p=flags[1],
+        )
+        for start, flags in ((0, first), (1, second))
+    }
+    md = SimpleNamespace(
+        bonus_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
+        target_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
+        draft_token_ids=torch.zeros((2,), dtype=torch.int32),
+        draft_lengths=torch.ones((2,), dtype=torch.int32),
+        segment_ids=torch.tensor([0, 1], dtype=torch.int64),
+        group_indices=torch.tensor([0, 0], dtype=torch.int64),
+    )
+    calls = []
+    runner = _sample_tokens_runner(
+        [md if spec_step else None, None], params_by_start, calls
+    )
+
+    TPUModelRunner.sample_tokens(runner, None)
+
+    seen = [(kind, (k["use_top_k"], k["use_top_p"])) for kind, k in calls]
+    if spec_step:
+        assert seen == [("sample", first), ("reject", first), ("sample", second)]
+    else:
+        assert seen == [("sample", first), ("sample", second)]

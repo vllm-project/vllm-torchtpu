@@ -3265,7 +3265,8 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     assert seen_recover_dtypes == [torch.float32]
     seen_u_dtypes.clear()
 
-    # 3 & 4. sample_tokens (both non-speculative and speculative non-verify chunk)
+    # 3 & 4. sample_tokens on a step without drafts, with and without a
+    # speculative config (test_sampling_mask_flags.py covers a spec step).
     for spec_method in (None, "ngram"):
         scheduler_output = SimpleNamespace(
             num_scheduled_tokens={"r0": 1, "r1": 1},
@@ -3328,5 +3329,5 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
-    # Every sampling call site passes the chunk's top-k/top-p flags.
+    # The verify chunk's bonus sampler and both steps pass the chunk's flags.
     assert seen_mask_flags == [(False, False)] * 3
