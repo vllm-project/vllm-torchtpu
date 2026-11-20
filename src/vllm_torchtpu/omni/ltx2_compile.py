@@ -11,32 +11,51 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dynamo-traceable sequence/CFG-parallel primitives for LTX-2 / LTX-2.3 DiT.
+"""Dynamo-traceable sequence/CFG-parallel primitives and TPU diffusion compile.
 
-Stacked PR #3444 activates ``_patch_ltx2_traceable_collectives`` and
-``_patch_ltx2_symmetric_perturbation_masks`` on the compiled path
-(``enforce_eager=False``) and initializes
-``LTX2VideoToAudioParallelAttention._tpu_head_idx`` per rank outside
-``torch.compile``. Leaving them inactive in eager mode avoids adding
-compile-only mask allocations to eager runs.
+Provides:
+- Dynamo-traceable Ulysses / video-to-audio SP collectives and symmetric CFG
+  perturbation masks for LTX-2 / LTX-2.3 DiT.
+- Shared-block ``torch.compile(backend='tpu', fullgraph=True, dynamic=False)``
+  for ``LTX2Pipeline`` and ``LTX2TwoStagePipeline`` plus allowlisted
+  ``backend='tpu'`` regional/full compilation for verified diffusion families
+  (``FluxTransformer2DModel`` and ``QwenImageTransformer2DModel``) without
+  enabling ``OmniTpuPlatform.supports_torch_inductor()``.
 """
 
 from __future__ import annotations
 
+import functools
+import types
 from typing import Any
 
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
+from torch.nn.utils import stateless
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.omni.patches import _ulysses_all_to_all_4d_layout
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.omni.rope import _first_half_lanes
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 logger = init_logger(__name__)
 
 _V2A_SP_PATCHED = "_tpu_v2a_sp_patched"
 _PERTURBATION_SYM_PATCHED = "_tpu_perturbation_sym_patched"
+_LTX2_COMPILE_PATCHED = "_tpu_ltx2_compile_patched"
+_TPU_DIFFUSION_COMPILE_PATCHED = "_tpu_diffusion_compile_patched"
+_ROPE_KEYS = frozenset(
+    {
+        "video_rotary_emb",
+        "audio_rotary_emb",
+        "ca_video_rotary_emb",
+        "ca_audio_rotary_emb",
+    }
+)
+# Caps compiled rotary-table copies across changing resolutions/layouts when
+# slots change shape instead of overwriting in place.
+_MAX_COMPILED_ROPE_CACHE_ENTRIES = 16
 
 
 def _funcol_all_to_all_single(send_buf: torch.Tensor, group: Any) -> torch.Tensor:
@@ -263,3 +282,432 @@ def _patch_ltx2_symmetric_perturbation_masks() -> None:
     setattr(_sym_predict_parallel_guidance, _PERTURBATION_SYM_PATCHED, True)
     exec_cls.predict_parallel_guidance = _sym_predict_parallel_guidance
     logger.info("Applied TPU patch: symmetric LTX-2 CFG perturbation masks.")
+
+
+def _ensure_zero_offset(
+    val: Any,
+    rope_cache: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor]] | None = None,
+    slot: Any = None,
+) -> Any:
+    """Materialize strided or non-zero-offset views before compiled block entry."""
+    if isinstance(val, torch.Tensor):
+        if (
+            val.is_contiguous()
+            and val.storage_offset() == 0
+            and val.untyped_storage().nbytes() == val.numel() * val.element_size()
+        ):
+            return val
+        if rope_cache is not None:
+            ptr = val.untyped_storage().data_ptr()
+            if ptr != 0:
+                # One entry per rotary slot and view layout: each request builds
+                # new tables, whose copy replaces the previous request's entry
+                # (and releases its full tables) instead of piling up next to it.
+                key = (
+                    slot,
+                    val.storage_offset(),
+                    tuple(val.shape),
+                    val.stride(),
+                    val.dtype,
+                    val.device,
+                )
+                entry = rope_cache.get(key)
+                if entry is not None and entry[0].untyped_storage().data_ptr() == ptr:
+                    return entry[1]
+                mat = fresh_buffer(val)
+                synchronize_tensors(mat, wait=False)
+                if (
+                    entry is None
+                    and len(rope_cache) >= _MAX_COMPILED_ROPE_CACHE_ENTRIES
+                ):
+                    rope_cache.clear()
+                rope_cache[key] = (val, mat)
+                return mat
+        mat = torch.empty(val.shape, dtype=val.dtype, device=val.device)
+        mat.copy_(val)
+        synchronize_tensors(mat, wait=False)
+        return mat
+    if isinstance(val, tuple):
+        return tuple(
+            _ensure_zero_offset(x, rope_cache, (slot, i)) for i, x in enumerate(val)
+        )
+    return val
+
+
+def _install_shared_block_compile(transformer: torch.nn.Module) -> None:
+    """Compile ONE shared block function and bind all LTX-2 blocks to it.
+
+    Upstream provenance (vllm-omni 0.32.0rc1):
+    ``vllm_omni/diffusion/models/ltx2/ltx2_transformer.py``
+    (``LTX2VideoTransformer3DModel.transformer_blocks`` and
+    ``LTX2VideoTransformerBlock``).
+
+    Compiling each block separately would trigger N distinct XLA compilations
+    of the same block graph. ``stateless._reparametrize_module`` swaps each
+    block's parameters and buffers into ``blocks[0]`` so every block executes
+    the single compiled graph. If any block has a different parameter or buffer
+    key set (for example, heterogeneous phase-adapter LoRA targets), compilation
+    is skipped so blocks never silently reuse ``blocks[0]`` tensors.
+
+    REMOVAL / FIX CONDITION:
+    Remove once vLLM-Omni supports shared-block ``torch.compile`` on TPU for
+    LTX-2 transformer blocks natively.
+    """
+    blocks = transformer.transformer_blocks
+    if len(blocks) == 0:
+        return
+    if getattr(transformer, "_tpu_shared_blocks_compiled", False):
+        return
+
+    template_block = blocks[0]
+    expected_param_keys = {k for k, _ in template_block.named_parameters()}
+    expected_buffer_keys = {k for k, _ in template_block.named_buffers()}
+    for idx, blk in enumerate(blocks[1:], start=1):
+        param_keys = {k for k, _ in blk.named_parameters()}
+        buffer_keys = {k for k, _ in blk.named_buffers()}
+        if param_keys != expected_param_keys or buffer_keys != expected_buffer_keys:
+            logger.warning(
+                "Skipping shared-block TPU torch.compile: block %d has different "
+                "parameter/buffer keys from block 0; running eager.",
+                idx,
+            )
+            return
+
+    from vllm_omni.diffusion.distributed.parallel_state import (
+        get_sequence_parallel_world_size,
+        get_sp_group,
+    )
+
+    device = next(transformer.parameters()).device
+    cfg = transformer.config
+    inner_dim = cfg.num_attention_heads * cfg.attention_head_dim
+    audio_inner_dim = cfg.audio_num_attention_heads * cfg.audio_attention_head_dim
+    _first_half_lanes(inner_dim, cfg.attention_head_dim, device)
+    _first_half_lanes(audio_inner_dim, cfg.audio_attention_head_dim, device)
+
+    sp_world = get_sequence_parallel_world_size()
+    if sp_world > 1:
+        sp_group = get_sp_group()
+        uworld = sp_group.ulysses_world_size
+        if uworld > 1:
+            if cfg.audio_num_attention_heads % uworld != 0:
+                raise ValueError(
+                    "LTX-2 shared-block compile requires audio_num_attention_heads "
+                    f"divisible by ulysses_world_size, got "
+                    f"audio_num_attention_heads={cfg.audio_num_attention_heads} "
+                    f"and ulysses_world_size={uworld}."
+                )
+            urank = sp_group.ulysses_rank
+            heads_per_rank = cfg.audio_num_attention_heads // uworld
+            start = urank * heads_per_rank
+            head_idx = torch.arange(
+                start, start + heads_per_rank, dtype=torch.int32, device=device
+            )
+            synchronize_tensors(head_idx, wait=False)
+            from vllm_omni.diffusion.models.ltx2.ltx2_sequence_parallel import (
+                LTX2VideoToAudioParallelAttention,
+            )
+
+            for blk in blocks:
+                inner_attn = blk.video_to_audio_attn.attn
+                if inner_attn.ltx_sp_mode == "video_to_audio":
+                    if inner_attn._video_to_audio_strategy is None:
+                        inner_attn._video_to_audio_strategy = (
+                            LTX2VideoToAudioParallelAttention(
+                                sp_group,
+                                use_sync=inner_attn.use_sync,
+                            )
+                        )
+                    inner_attn._video_to_audio_strategy._tpu_head_idx = head_idx
+
+    orig_block_forward = type(template_block).forward
+    rope_view_cache: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor]] = {}
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _compiled_block_step(
+        params_and_buffers: dict[str, torch.Tensor],
+        hidden_states: torch.Tensor,
+        audio_hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        audio_encoder_hidden_states: torch.Tensor,
+        block_kwargs: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with stateless._reparametrize_module(template_block, params_and_buffers):
+            return orig_block_forward(
+                template_block,
+                hidden_states,
+                audio_hidden_states,
+                encoder_hidden_states,
+                audio_encoder_hidden_states,
+                **block_kwargs,
+            )
+
+    for blk in blocks:
+        state_dict_tensors: dict[str, torch.Tensor] = {}
+        for k, p in blk.named_parameters():
+            state_dict_tensors[k] = p.detach()
+        for k, b in blk.named_buffers():
+            state_dict_tensors[k] = b.detach()
+
+        def _make_bound_forward(pb: dict[str, torch.Tensor]) -> Any:
+            @functools.wraps(orig_block_forward)
+            def _bound_forward(
+                _self: Any,
+                hidden_states: torch.Tensor,
+                audio_hidden_states: torch.Tensor,
+                encoder_hidden_states: torch.Tensor,
+                audio_encoder_hidden_states: torch.Tensor,
+                **kwargs: Any,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                hidden_states = _ensure_zero_offset(hidden_states)
+                audio_hidden_states = _ensure_zero_offset(audio_hidden_states)
+                encoder_hidden_states = _ensure_zero_offset(encoder_hidden_states)
+                audio_encoder_hidden_states = _ensure_zero_offset(
+                    audio_encoder_hidden_states
+                )
+                clean_kwargs = {
+                    k: _ensure_zero_offset(
+                        v, rope_view_cache if k in _ROPE_KEYS else None, k
+                    )
+                    for k, v in kwargs.items()
+                }
+                return _compiled_block_step(
+                    pb,
+                    hidden_states,
+                    audio_hidden_states,
+                    encoder_hidden_states,
+                    audio_encoder_hidden_states,
+                    clean_kwargs,
+                )
+
+            return _bound_forward
+
+        bound_fn = _make_bound_forward(state_dict_tensors)
+        blk.forward = types.MethodType(bound_fn, blk)  # type: ignore[method-assign]
+
+    transformer._tpu_shared_blocks_compiled = True  # type: ignore[attr-defined]
+    logger.info(
+        "Installed shared torch.compile(backend='tpu', fullgraph=True, dynamic=False) "
+        "callable across %d LTX2VideoTransformerBlock modules.",
+        len(blocks),
+    )
+
+
+def _activate_ltx2_compile_runtime_hooks() -> None:
+    """Install traceable collectives, symmetric masks, and fresh-timestep forward.
+
+    Upstream provenance (vllm-omni 0.32.0rc1):
+    ``vllm_omni/diffusion/models/ltx2/ltx2_transformer.py``
+    (``LTX2VideoTransformer3DModel.forward``).
+
+    Clones ``timestep`` / ``sigma`` views into fresh zero-offset buffers before
+    entering the compiled transformer blocks (preventing per-step view-offset
+    recompilations) and issues a non-blocking flush of transformer outputs
+    before CFG-parallel guidance ``all_gather``.
+
+    REMOVAL / FIX CONDITION:
+    Remove once TorchTPU handles non-zero-offset scalar views without
+    recompiling and flushes ``ulysses_pg`` outputs before ``cfg_pg``
+    collectives automatically.
+    """
+    from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
+
+    model_cls = ltx2_transformer.LTX2VideoTransformer3DModel
+    if getattr(model_cls.forward, _LTX2_COMPILE_PATCHED, False):
+        return
+
+    _patch_ltx2_traceable_collectives()
+    _patch_ltx2_symmetric_perturbation_masks()
+
+    orig_model_forward = model_cls.forward
+
+    @functools.wraps(orig_model_forward)
+    def _fresh_ltx2_forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        audio_hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        audio_encoder_hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        audio_timestep: torch.Tensor | None = None,
+        *args: Any,
+        sigma: torch.Tensor | None = None,
+        audio_sigma: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        to_sync: list[torch.Tensor] = []
+
+        def _fresh(t: torch.Tensor | None) -> torch.Tensor | None:
+            if isinstance(t, torch.Tensor):
+                c = t.clone(memory_format=torch.contiguous_format)
+                to_sync.append(c)
+                return c
+            return t
+
+        timestep = _fresh(timestep)  # type: ignore[assignment]
+        audio_timestep = _fresh(audio_timestep)
+        sigma = _fresh(sigma)
+        audio_sigma = _fresh(audio_sigma)
+        if to_sync:
+            synchronize_tensors(to_sync, wait=False)
+
+        res = orig_model_forward(
+            self,
+            hidden_states,
+            audio_hidden_states,
+            encoder_hidden_states,
+            audio_encoder_hidden_states,
+            timestep,
+            audio_timestep,
+            *args,
+            sigma=sigma,
+            audio_sigma=audio_sigma,
+            **kwargs,
+        )
+        # Flush ulysses_pg output tensors before cfg_pg guidance all_gather.
+        out_tensors: list[torch.Tensor] = []
+        if isinstance(res, tuple):
+            out_tensors = [t for t in res if isinstance(t, torch.Tensor)]
+        else:
+            for attr in ("sample", "audio_sample"):
+                t = getattr(res, attr, None)
+                if isinstance(t, torch.Tensor):
+                    out_tensors.append(t)
+        if out_tensors:
+            synchronize_tensors(out_tensors, wait=False)
+        return res
+
+    setattr(_fresh_ltx2_forward, _LTX2_COMPILE_PATCHED, True)
+    model_cls.forward = _fresh_ltx2_forward
+
+
+@functools.cache
+def _verified_tpu_compile_transformer_types() -> tuple[type[torch.nn.Module], ...]:
+    """Diffusion transformer classes verified with ``backend='tpu'`` compile.
+
+    Flux and Qwen-Image pass end-to-end TPU v7x verification with regional
+    ``backend='tpu'`` compilation. Unverified models (including Wan, whose
+    ``@run_once`` Pallas custom ops fail Dynamo schema tracing) stay eager.
+    LTX-2 uses shared-block compilation in ``_apply_tpu_diffusion_compile``.
+    """
+    from vllm_omni.diffusion.models.flux.flux_transformer import (
+        FluxTransformer2DModel,
+    )
+    from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
+        QwenImageTransformer2DModel,
+    )
+
+    return (FluxTransformer2DModel, QwenImageTransformer2DModel)
+
+
+def _compile_verified_tpu_transformer(
+    pipeline: Any, od_config: Any, attr_name: str
+) -> None:
+    """Compile one allowlisted diffusion transformer with ``backend='tpu'``.
+
+    Upstream provenance (vllm-omni 0.32.0rc1):
+    ``vllm_omni/diffusion/worker/diffusion_model_runner.py``
+    (``DiffusionModelRunner._compile_transformer``) and
+    ``vllm_omni/diffusion/compile.py`` (``regionally_compile``).
+
+    Mirrors upstream granularity dispatch (``full`` vs ``regional``) with
+    ``backend='tpu', dynamic=False`` for verified diffusion transformer
+    families only; unverified models log once and stay eager.
+
+    REMOVAL / FIX CONDITION:
+    Remove once vLLM-Omni supports platform-provided ``torch.compile`` kwargs
+    and per-model TPU compile allowlisting in ``DiffusionModelRunner``.
+    """
+    model = getattr(pipeline, attr_name, None)
+    if model is None:
+        return
+    if not isinstance(model, _verified_tpu_compile_transformer_types()):
+        logger.info_once(
+            "Model runner: skipping TPU torch.compile for unverified "
+            "transformer %s (%s); running eager.",
+            attr_name,
+            type(model).__name__,
+        )
+        return
+    from vllm_omni.diffusion import compile as diffusion_compile
+
+    compile_kwargs = {"backend": "tpu", "dynamic": False}
+    if od_config.diffusion_compile_granularity == "full":
+        model.compile(**compile_kwargs)
+        compiled_model = model
+    else:
+        compiled_model = diffusion_compile.regionally_compile(model, **compile_kwargs)
+    setattr(pipeline, attr_name, compiled_model)
+
+
+def _apply_tpu_diffusion_compile(pipeline: Any, od_config: Any) -> None:
+    """Apply ``backend='tpu'`` compilation to verified diffusion pipelines."""
+    if od_config.enforce_eager or pipeline is None:
+        return
+    from vllm_omni.diffusion.models.ltx2 import (
+        pipeline_ltx2,
+        pipeline_ltx2_two_stage,
+    )
+
+    # The two-stage pipeline shares LTXRuntime and the LTX-2 transformer block
+    # with LTX2Pipeline but does not subclass it. Both expose ``transformer``
+    # (``dit_modules=("transformer",)``) with no ``transformer_2``.
+    if isinstance(
+        pipeline,
+        (pipeline_ltx2.LTX2Pipeline, pipeline_ltx2_two_stage.LTX2TwoStagePipeline),
+    ):
+        _activate_ltx2_compile_runtime_hooks()
+        if pipeline.transformer is not None:
+            _install_shared_block_compile(pipeline.transformer)
+        return
+
+    transformer_attrs = getattr(pipeline, "_dit_modules", None) or (
+        "transformer",
+        "transformer_2",
+    )
+    for attr_name in transformer_attrs:
+        _compile_verified_tpu_transformer(pipeline, od_config, attr_name)
+
+
+def apply_ltx2_compile_patches() -> None:
+    """Hook diffusion model loading to run ``backend='tpu'`` compilation.
+
+    Upstream provenance (vllm-omni 0.32.0rc1):
+    ``vllm_omni/diffusion/worker/diffusion_model_runner.py``
+    (``DiffusionModelRunner.load_model`` calling ``enable_offload_backend``
+    right before the ``torch.compile`` block).
+
+    ``OmniTpuPlatform.supports_torch_inductor()`` stays ``False`` because
+    non-diffusion Omni models (Qwen3 code predictor, VoxCPM2 talker) and
+    upstream pipeline ``setup_compile()`` hooks use it to enable default-backend
+    Inductor compile. Wrapping ``diffusion_model_runner.enable_offload_backend``
+    delegates to the original offloader and runs ``backend='tpu'`` compilation
+    for verified diffusion families at the exact post-load / pre-cache boundary.
+
+    REMOVAL / FIX CONDITION:
+    Remove once vLLM-Omni exposes a platform hook for non-Inductor diffusion
+    ``torch.compile`` backends instead of gating diffusion compile on
+    ``supports_torch_inductor()``.
+    """
+    from vllm_omni.diffusion.worker import diffusion_model_runner
+
+    orig_enable_offload = diffusion_model_runner.enable_offload_backend
+    if getattr(orig_enable_offload, _TPU_DIFFUSION_COMPILE_PATCHED, False):
+        return
+
+    @functools.wraps(orig_enable_offload)
+    def _tpu_enable_offload_and_compile(
+        od_config: Any,
+        pipeline: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        pipeline, offload_backend = orig_enable_offload(
+            od_config, pipeline, *args, **kwargs
+        )
+        _apply_tpu_diffusion_compile(pipeline, od_config)
+        return pipeline, offload_backend
+
+    setattr(_tpu_enable_offload_and_compile, _TPU_DIFFUSION_COMPILE_PATCHED, True)
+    diffusion_model_runner.enable_offload_backend = _tpu_enable_offload_and_compile
+    logger.info("Applied TPU patch: diffusion backend='tpu' torch.compile hook.")

@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
+import weakref
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -18,16 +20,28 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch.testing._internal.distributed.fake_pg import FakeStore
+from vllm_omni.diffusion import compile as diffusion_compile
 from vllm_omni.diffusion.attention.parallel import ulysses as ulysses_mod
-from vllm_omni.diffusion.distributed import comm
+from vllm_omni.diffusion.distributed import comm, parallel_state
+from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 from vllm_omni.diffusion.models.ltx2 import (
     ltx2_guidance,
+    ltx2_transformer,
+    pipeline_ltx2,
+    pipeline_ltx2_audio,
+    pipeline_ltx2_two_stage,
 )
 from vllm_omni.diffusion.models.ltx2 import (
     ltx2_sequence_parallel as ltx2_sp_mod,
 )
+from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
+    QwenImageTransformer2DModel,
+)
+from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
+from vllm_omni.diffusion.worker import diffusion_model_runner
 
 from vllm_torchtpu.omni import ltx2_compile
+from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
 pytestmark = pytest.mark.omni
 
@@ -36,6 +50,7 @@ _UPSTREAM_PREDICT_PARALLEL = ltx2_guidance.LTXGuidanceExecutor.predict_parallel_
 _UPSTREAM_SEQ_A2A = comm.SeqAllToAll4D
 _UPSTREAM_V2A_PRE = ltx2_sp_mod.LTX2VideoToAudioParallelAttention.pre_attention
 _UPSTREAM_V2A_POST = ltx2_sp_mod.LTX2VideoToAudioParallelAttention.post_attention
+_UPSTREAM_LTX2_FORWARD = ltx2_transformer.LTX2VideoTransformer3DModel.forward
 
 
 @contextmanager
@@ -338,3 +353,428 @@ def test_symmetric_perturbation_masks_across_cfg_ranks(
             torch.tensor([1.0, 0.0]),
         )
         assert sync_log == []
+
+
+def test_ensure_zero_offset_and_rope_cache(sync_log):
+    full = torch.randn(2, 1, 8, 16)
+    assert ltx2_compile._ensure_zero_offset(full) is full
+    assert len(sync_log) == 0
+
+    cache = {}
+    view0 = full[:, :, 0:4, :]
+    view1 = full[:, :, 4:8, :]
+    m0 = ltx2_compile._ensure_zero_offset(view0, cache)
+    assert m0.is_contiguous() and m0.storage_offset() == 0
+    torch.testing.assert_close(m0, view0, rtol=0, atol=0)
+    assert ltx2_compile._ensure_zero_offset(full[:, :, 0:4, :], cache) is m0
+    assert len(sync_log) == 1
+
+    m1 = ltx2_compile._ensure_zero_offset(view1, cache)
+    assert m1.storage_offset() == 0
+    torch.testing.assert_close(m1, view1, rtol=0, atol=0)
+    assert len(sync_log) == 2
+
+
+def test_rope_cache_keeps_only_the_current_request_tables(sync_log):
+    # Each request builds new tables; their shard copies replace the previous
+    # request's, which are then released, and cos and sin (same layout) keep
+    # separate entries.
+    cache = {}
+    old = None
+    for _ in range(5):
+        tables = (torch.randn(2, 1, 8, 16), torch.randn(2, 1, 8, 16))
+        for _block in range(3):
+            views = tuple(t[:, :, 4:8, :] for t in tables)
+            got = ltx2_compile._ensure_zero_offset(views, cache, "video_rotary_emb")
+            for g, v in zip(got, views, strict=True):
+                torch.testing.assert_close(g, v, rtol=0, atol=0)
+        assert len(cache) == 2
+        assert len(sync_log) == 2  # one copy of cos and of sin per request
+        assert old is None or old() is None
+        old = weakref.ref(tables[0])
+        del tables, views, got
+        sync_log.clear()  # the fixture's record holds the copies too
+        gc.collect()
+
+
+def test_shared_block_compile_binds_one_graph_across_blocks(monkeypatch, sync_log):
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 1)
+
+    real_compile = torch.compile
+    compile_calls = []
+    compiled_graphs = []
+
+    def _counting_eager(gm, example_inputs):
+        del example_inputs
+        compiled_graphs.append(gm)
+        return gm
+
+    def _eager_compile(fn=None, *, backend="inductor", fullgraph=False, dynamic=None):
+        compile_calls.append((backend, fullgraph, dynamic))
+        if fn is None:
+            return lambda m: real_compile(
+                m, backend=_counting_eager, fullgraph=fullgraph, dynamic=dynamic
+            )
+        return real_compile(
+            fn, backend=_counting_eager, fullgraph=fullgraph, dynamic=dynamic
+        )
+
+    monkeypatch.setattr(torch, "compile", _eager_compile)
+    torch._dynamo.reset()
+
+    class _ToyBlock(torch.nn.Module):
+        def __init__(self, scale: float, bias_val: float) -> None:
+            super().__init__()
+            self.lin = torch.nn.Linear(4, 4, bias=False)
+            self.register_buffer("bias_buf", torch.tensor(bias_val))
+            with torch.no_grad():
+                self.lin.weight.copy_(torch.eye(4) * scale)
+
+        def forward(self, hs, ahs, ehs, aehs, **kwargs):
+            del ehs, aehs
+            mask = kwargs["video_self_attention_mask"]
+            return (self.lin(hs) + self.bias_buf) * mask, ahs + 1.0
+
+    class _ToyTransformer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(
+                num_attention_heads=2,
+                attention_head_dim=4,
+                audio_num_attention_heads=2,
+                audio_attention_head_dim=4,
+            )
+            self.transformer_blocks = torch.nn.ModuleList(
+                [_ToyBlock(2.0, 1.0), _ToyBlock(3.0, 2.0), _ToyBlock(5.0, 3.0)]
+            )
+
+    try:
+        model = _ToyTransformer()
+        ltx2_compile._install_shared_block_compile(model)
+        ltx2_compile._install_shared_block_compile(model)  # idempotent
+        assert compile_calls == [("tpu", True, False)]
+
+        mask = torch.ones(1, 1, 1)
+        for _step in range(2):
+            x = torch.ones(1, 2, 4)
+            a = torch.zeros(1, 2, 4)
+            e = torch.zeros(1, 2, 4)
+            for blk in model.transformer_blocks:
+                x, a = blk(x, a, e, e, video_self_attention_mask=mask)
+            # (((1*2 + 1)*3 + 2)*5 + 3) = 58
+            torch.testing.assert_close(x, torch.full((1, 2, 4), 58.0))
+            torch.testing.assert_close(a, torch.full((1, 2, 4), 3.0))
+
+        # All 3 blocks across both steps share a single fullgraph=True graph.
+        assert len(compiled_graphs) == 1
+    finally:
+        torch._dynamo.reset()
+
+
+def test_shared_block_compile_skips_heterogeneous_buffers(monkeypatch):
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 1)
+    compile_calls = []
+    monkeypatch.setattr(
+        torch,
+        "compile",
+        lambda *args, **kwargs: compile_calls.append((args, kwargs)) or (lambda f: f),
+    )
+
+    class _Block(torch.nn.Module):
+        def __init__(self, with_adapter: bool) -> None:
+            super().__init__()
+            self.lin = torch.nn.Linear(2, 2, bias=False)
+            if with_adapter:
+                self.register_buffer("lora_a", torch.zeros(2, 2))
+
+    class _Transformer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.transformer_blocks = torch.nn.ModuleList([_Block(True), _Block(False)])
+
+    model = _Transformer()
+    ltx2_compile._install_shared_block_compile(model)
+    assert compile_calls == []
+    assert not getattr(model, "_tpu_shared_blocks_compiled", False)
+
+
+def test_shared_block_compile_initializes_sp_v2a_head_idx(monkeypatch, sync_log):
+    sp_group = SimpleNamespace(
+        ring_world_size=1,
+        ulysses_world_size=2,
+        ulysses_rank=1,
+        ulysses_group="fake_pg",
+    )
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(parallel_state, "get_sp_group", lambda: sp_group)
+    monkeypatch.setattr(torch, "compile", lambda *args, **kwargs: (lambda fn: fn))
+
+    class _SpBlock(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.ones(1))
+            inner = SimpleNamespace(
+                ltx_sp_mode="video_to_audio",
+                use_sync=False,
+                _video_to_audio_strategy=None,
+            )
+            self.video_to_audio_attn = SimpleNamespace(attn=inner)
+
+    class _SpTransformer(torch.nn.Module):
+        def __init__(self, audio_heads: int) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(
+                num_attention_heads=4,
+                attention_head_dim=4,
+                audio_num_attention_heads=audio_heads,
+                audio_attention_head_dim=4,
+            )
+            self.transformer_blocks = torch.nn.ModuleList([_SpBlock(), _SpBlock()])
+
+    model = _SpTransformer(audio_heads=6)
+    ltx2_compile._install_shared_block_compile(model)
+    expected = torch.tensor([3, 4, 5], dtype=torch.int32)
+    for blk in model.transformer_blocks:
+        strat = blk.video_to_audio_attn.attn._video_to_audio_strategy
+        assert isinstance(strat, ltx2_sp_mod.LTX2VideoToAudioParallelAttention)
+        torch.testing.assert_close(strat._tpu_head_idx, expected, rtol=0, atol=0)
+    assert len(sync_log) == 1
+    assert sync_log[0][1] is False
+
+    bad_model = _SpTransformer(audio_heads=5)
+    with pytest.raises(ValueError, match="divisible by ulysses_world_size"):
+        ltx2_compile._install_shared_block_compile(bad_model)
+
+
+def test_fresh_ltx2_forward_flushes_outputs(monkeypatch, sync_log):
+    monkeypatch.setattr(ltx2_compile, "_patch_ltx2_traceable_collectives", lambda: None)
+    monkeypatch.setattr(
+        ltx2_compile, "_patch_ltx2_symmetric_perturbation_masks", lambda: None
+    )
+    monkeypatch.setattr(
+        ltx2_transformer.LTX2VideoTransformer3DModel,
+        "forward",
+        lambda self, *args, **kwargs: (
+            torch.ones(1, 4),
+            torch.ones(1, 2),
+        ),
+    )
+
+    ltx2_compile._activate_ltx2_compile_runtime_hooks()
+    dummy = object.__new__(ltx2_transformer.LTX2VideoTransformer3DModel)
+    got = ltx2_transformer.LTX2VideoTransformer3DModel.forward(
+        dummy,
+        torch.zeros(1, 4),
+        torch.zeros(1, 2),
+        torch.zeros(1, 4),
+        torch.zeros(1, 2),
+        torch.tensor([500.0]),
+        torch.tensor([500.0]),
+        sigma=torch.tensor([0.5]),
+    )
+    assert len(got) == 2
+    assert len(sync_log) == 2
+    assert len(sync_log[0][0]) == 3 and sync_log[0][1] is False
+    assert len(sync_log[1][0]) == 2 and sync_log[1][1] is False
+
+
+@pytest.mark.parametrize(
+    ("model_cls", "should_compile"),
+    [
+        (FluxTransformer2DModel, True),
+        (QwenImageTransformer2DModel, True),
+        (WanTransformer3DModel, False),
+        (torch.nn.Module, False),
+    ],
+)
+def test_tpu_diffusion_compile_hook_gates_to_verified_families(
+    monkeypatch, model_cls, should_compile
+):
+    offload_calls = []
+
+    def _fake_enable_offload(od_config, pipeline, device=None):
+        offload_calls.append((od_config, pipeline, device))
+        return pipeline, "offload-token"
+
+    monkeypatch.setattr(
+        diffusion_model_runner, "enable_offload_backend", _fake_enable_offload
+    )
+    regional_calls = []
+    sentinel = object()
+
+    def _fake_regionally_compile(model, **kwargs):
+        regional_calls.append((model, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(
+        diffusion_compile, "regionally_compile", _fake_regionally_compile
+    )
+    skip_logs = []
+    monkeypatch.setattr(
+        ltx2_compile.logger,
+        "info_once",
+        lambda msg, *args: skip_logs.append(msg % args if args else msg),
+    )
+
+    ltx2_compile.apply_ltx2_compile_patches()
+    patched = diffusion_model_runner.enable_offload_backend
+    ltx2_compile.apply_ltx2_compile_patches()  # idempotent
+    assert diffusion_model_runner.enable_offload_backend is patched
+
+    model = object.__new__(model_cls)
+    torch.nn.Module.__init__(model)
+    pipeline = SimpleNamespace(transformer=model)
+    od_config = SimpleNamespace(
+        enforce_eager=False,
+        diffusion_compile_granularity="regional",
+    )
+
+    out_pipeline, token = diffusion_model_runner.enable_offload_backend(
+        od_config, pipeline, device="tpu"
+    )
+    assert out_pipeline is pipeline
+    assert token == "offload-token"
+    assert offload_calls == [(od_config, pipeline, "tpu")]
+
+    if should_compile:
+        assert regional_calls == [(model, {"backend": "tpu", "dynamic": False})]
+        assert pipeline.transformer is sentinel
+        assert skip_logs == []
+    else:
+        assert regional_calls == []
+        assert pipeline.transformer is model
+        assert len(skip_logs) == 1
+        assert model_cls.__name__ in skip_logs[0]
+
+
+def test_tpu_diffusion_compile_hook_ltx2_and_inductor_isolation(monkeypatch):
+    # Platform flag stays False so non-diffusion models (Qwen3 code predictor,
+    # VoxCPM2 talker) and upstream Inductor setup_compile() hooks stay eager.
+    assert OmniTpuPlatform.supports_torch_inductor() is False
+
+    monkeypatch.setattr(
+        diffusion_model_runner,
+        "enable_offload_backend",
+        lambda od_config, pipeline, device=None: (pipeline, None),
+    )
+    hooks_activated = []
+    shared_compiled = []
+    monkeypatch.setattr(
+        ltx2_compile,
+        "_activate_ltx2_compile_runtime_hooks",
+        lambda: hooks_activated.append(True),
+    )
+    monkeypatch.setattr(
+        ltx2_compile,
+        "_install_shared_block_compile",
+        lambda tr: shared_compiled.append(tr),
+    )
+    regional_calls = []
+    monkeypatch.setattr(
+        diffusion_compile,
+        "regionally_compile",
+        lambda model, **kwargs: regional_calls.append((model, kwargs)) or model,
+    )
+
+    ltx2_compile.apply_ltx2_compile_patches()
+
+    # 1. LTX2Pipeline compiles via shared-block compile when enforce_eager=False.
+    ltx_pipe = object.__new__(pipeline_ltx2.LTX2Pipeline)
+    torch.nn.Module.__init__(ltx_pipe)
+    tr1 = torch.nn.Module()
+    ltx_pipe.transformer = tr1
+
+    eager_cfg = SimpleNamespace(
+        enforce_eager=True, diffusion_compile_granularity="regional"
+    )
+    compile_cfg = SimpleNamespace(
+        enforce_eager=False, diffusion_compile_granularity="regional"
+    )
+
+    diffusion_model_runner.enable_offload_backend(eager_cfg, ltx_pipe)
+    assert hooks_activated == []
+    assert shared_compiled == []
+
+    diffusion_model_runner.enable_offload_backend(compile_cfg, ltx_pipe)
+    assert hooks_activated == [True]
+    assert shared_compiled == [tr1]
+    assert regional_calls == []
+
+    # 1b. The two-stage pipeline (not an LTX2Pipeline subclass) uses the same
+    # shared-block compile instead of falling back to eager.
+    two_stage_pipe = object.__new__(pipeline_ltx2_two_stage.LTX2TwoStagePipeline)
+    torch.nn.Module.__init__(two_stage_pipe)
+    tr2 = torch.nn.Module()
+    two_stage_pipe.transformer = tr2
+    assert not isinstance(two_stage_pipe, pipeline_ltx2.LTX2Pipeline)
+    diffusion_model_runner.enable_offload_backend(eager_cfg, two_stage_pipe)
+    assert shared_compiled == [tr1]
+    diffusion_model_runner.enable_offload_backend(compile_cfg, two_stage_pipe)
+    assert shared_compiled == [tr1, tr2]
+    assert regional_calls == []
+    shared_compiled.pop()
+
+    # 2. Upstream custom setup_compile() pipelines (e.g. LTX2TextToAudioPipeline)
+    # are neither compiled as LTX2Pipeline nor allowed to invoke Inductor setup_compile.
+    audio_pipe = object.__new__(pipeline_ltx2_audio.LTX2TextToAudioPipeline)
+    torch.nn.Module.__init__(audio_pipe)
+    audio_pipe.transformer = torch.nn.Module()
+    upstream_setup_calls = []
+    monkeypatch.setattr(
+        audio_pipe,
+        "setup_compile",
+        lambda: upstream_setup_calls.append(True),
+    )
+    diffusion_model_runner.enable_offload_backend(compile_cfg, audio_pipe)
+    assert upstream_setup_calls == []
+    assert len(shared_compiled) == 1
+    assert regional_calls == []
+
+    # 3. Verified non-LTX2 models also honor enforce_eager=True.
+    flux_model = object.__new__(FluxTransformer2DModel)
+    torch.nn.Module.__init__(flux_model)
+    flux_pipe = SimpleNamespace(transformer=flux_model)
+    diffusion_model_runner.enable_offload_backend(eager_cfg, flux_pipe)
+    assert regional_calls == []
+
+
+def test_tpu_diffusion_compile_hook_full_granularity_and_missing_attr(monkeypatch):
+    monkeypatch.setattr(
+        diffusion_model_runner,
+        "enable_offload_backend",
+        lambda od_config, pipeline, device=None: (pipeline, None),
+    )
+    regional_calls = []
+    monkeypatch.setattr(
+        diffusion_compile,
+        "regionally_compile",
+        lambda model, **kwargs: regional_calls.append((model, kwargs)) or model,
+    )
+
+    ltx2_compile.apply_ltx2_compile_patches()
+
+    flux_model = object.__new__(FluxTransformer2DModel)
+    torch.nn.Module.__init__(flux_model)
+    full_calls = []
+    monkeypatch.setattr(
+        flux_model, "compile", lambda **kwargs: full_calls.append(kwargs)
+    )
+    wan_model = object.__new__(WanTransformer3DModel)
+    torch.nn.Module.__init__(wan_model)
+    monkeypatch.setattr(
+        wan_model, "compile", lambda **kwargs: full_calls.append(("wan", kwargs))
+    )
+
+    od_config = SimpleNamespace(
+        enforce_eager=False, diffusion_compile_granularity="full"
+    )
+    pipeline = SimpleNamespace(transformer=flux_model, transformer_2=None)
+    diffusion_model_runner.enable_offload_backend(od_config, pipeline)
+    assert full_calls == [{"backend": "tpu", "dynamic": False}]
+    assert regional_calls == []
+
+    # Full granularity is also skipped for unverified families like Wan.
+    pipeline.transformer = wan_model
+    diffusion_model_runner.enable_offload_backend(od_config, pipeline)
+    assert full_calls == [{"backend": "tpu", "dynamic": False}]
+    assert regional_calls == []
