@@ -38,6 +38,16 @@ def _encode_page_table(page_ids, layout, first_bank_rows):
     return (local_rows << 2) | (valid.astype(jnp.int32) << 1) | bank
 
 
+def _block_maxima(values, block):
+    """Maxima of each `block` consecutive lanes of [rows, lanes] `values`."""
+    # After the rolls, the lane ending each block holds the block's maximum.
+    for bit in range(block.bit_length() - 1):
+        values = jnp.maximum(values, pltpu.roll(values, 1 << bit, axis=1))
+    ends = jnp.arange(values.shape[1] // block) * block + block - 1
+    ends = jnp.broadcast_to(ends, (values.shape[0], ends.size))
+    return jnp.take_along_axis(values, ends, axis=1)
+
+
 def _pick(future, ends, values):
     """values[g] belongs to the tile group ending at ends[g]; the last is open."""
     picked = values[-1]
@@ -49,8 +59,13 @@ def _pick(future, ends, values):
 class _DenseKernel:
     """Refs and static tiling of one call."""
 
-    def __init__(self, smem, inputs, refs, config, info, layout, reuse_keys, fill):
-        self.out, scratch = refs
+    def __init__(
+        self, smem, inputs, refs, config, info, layout, reuse_keys, fill, block
+    ):
+        *outputs, scratch = refs
+        self.out = outputs[0]
+        # Optional per-row maxima of each `block` keys, written beside scores.
+        self.block, self.maxima_out = block, outputs[1] if block else None
         self.offsets, self.lengths, query_start = smem
         self.config, self.layout, self.reuse_keys = config, layout, reuse_keys
         self.fill_unscored = fill
@@ -63,6 +78,8 @@ class _DenseKernel:
         self.read_sem, self.write_sem, self.q_sem, self.page_sem, self.pad_sem = (
             semaphores[:5]
         )
+        if block:
+            self.maxima, self.maxima_sem = buffers[6], semaphores[5]
         self.weights = pltpu.annotate(weights, no_store=True)
         self.keys = pltpu.annotate(keys, no_store=True)
         self.tokens, self.heads, self.dim = self.q.shape
@@ -104,6 +121,9 @@ class _DenseKernel:
         for slot in (2 * pair, 2 * pair + 1)[: self.tiles]:
             src = self.scores.at[slot]
             _dma_rows(src, src, self.write_sem.at[slot], self.counts[slot], wait=True)
+            if self.block:
+                src, sem = self.maxima.at[slot], self.maxima_sem.at[slot]
+                _dma_rows(src, src, sem, self.counts[slot], wait=True)
         src = self.padding.at[pl.ds(0, 1)]
         dst = self.out.at[pl.ds(0, 1), pl.ds(0, self.key_tile)]
         row = pltpu.make_async_copy(src, dst, self.pad_sem.at[pair])
@@ -215,6 +235,11 @@ class _QueryBlock:
         src, sem = k.scores.at[slot], k.write_sem.at[slot]
         dst = k.out.at[:, pl.ds(tile * k.key_tile, k.key_tile)]
         _dma_rows(src, dst, sem, self.query.count, wait, dst_start=self.first_row)
+        if k.block:
+            blocks = k.key_tile // k.block
+            src, sem = k.maxima.at[slot], k.maxima_sem.at[slot]
+            dst = k.maxima_out.at[:, pl.ds(tile * blocks, blocks)]
+            _dma_rows(src, dst, sem, self.query.count, wait, dst_start=self.first_row)
 
     def owner(self, future):
         """Request row and local tile of a future tile."""
@@ -278,6 +303,10 @@ class _QueryBlock:
             bound = jnp.where(valid, column, jnp.iinfo(jnp.int32).max)
             scaled = jnp.where(remaining > bound, scaled, -jnp.inf)
             k.scores[self.output_slot(tile), :, pl.ds(column, PAGE_RECORDS)] = scaled
+            if k.block:
+                window = pl.ds(column // k.block, PAGE_RECORDS // k.block)
+                maxima = _block_maxima(scaled, k.block)
+                k.maxima[self.output_slot(tile), :, window] = maxima
 
     def emit_tile(self, tile, prefetch, count):
         """Score the first `count` fragments of `tile`; the rest are -inf."""
@@ -319,6 +348,10 @@ class _QueryBlock:
             start, width = count * k.mxu_size, k.key_tile - count * k.mxu_size
             fill = jnp.full((k.q_tile, width), -jnp.inf, jnp.float32)
             k.scores[self.output_slot(tile), :, pl.ds(start, width)] = fill
+            if k.block:
+                blocks = width // k.block
+                window = pl.ds(start // k.block, blocks)
+                k.maxima[self.output_slot(tile), :, window] = fill[:, :blocks]
             if prefetch:
                 k.load_rest(metadata, following)
 
@@ -429,6 +462,7 @@ def _kernel(static, offsets, lengths, query_start, inputs, *refs):
         "query_count",
         "reuse_keys",
         "fill_unscored",
+        "block_maxima",
     )
 )
 def fp8_paged_mqa_logits(
@@ -447,7 +481,8 @@ def fp8_paged_mqa_logits(
     query_count: int | None = None,
     reuse_keys: bool = False,
     fill_unscored: bool = True,
-) -> jax.Array:
+    block_maxima: int = 0,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Return FP32 scores for the query window; invalid scored positions are -inf.
 
     Args:
@@ -470,6 +505,10 @@ def fp8_paged_mqa_logits(
             row. False leaves them unwritten, so the output costs only the live
             context; scored tiles stay -inf past each row's length. Use it only
             when every reader masks each row at its length.
+        block_maxima: Also return FP32 [query rows, cdiv(max_model_len, b)]
+            maxima of each row's `b`-key blocks of the scores, for a
+            power-of-two `b` dividing 128; 0 returns the scores alone. Scored
+            tiles hold them as the scores do; requires fill_unscored=False.
     """
     tokens, heads, dim = q.shape
     tokens = tokens if query_count is None else query_count
@@ -491,8 +530,20 @@ def fp8_paged_mqa_logits(
         issue_depth=depth or config.issue_depth,
     )
     width = pl.cdiv(max_model_len, key_tile) * key_tile
+    block = block_maxima
+    if block and (
+        fill_unscored or block & (block - 1) or PAGE_RECORDS % block or block < 2
+    ):
+        raise ValueError(
+            "Block maxima need unfilled tiles and a power-of-two block size "
+            f"dividing {PAGE_RECORDS}"
+        )
     if tokens == 0 or width == 0:
-        return jnp.empty((tokens, max_model_len), jnp.float32)
+        scores = jnp.empty((tokens, max_model_len), jnp.float32)
+        if block:
+            maxima = jnp.empty((tokens, pl.cdiv(max_model_len, block)), jnp.float32)
+            return scores, maxima
+        return scores
     info = cast(pltpu.TpuInfo, pltpu.get_tpu_info())
     page_count = width // layout.page_size
     tile_pages = config.key_tile // layout.page_size
@@ -512,14 +563,28 @@ def fp8_paged_mqa_logits(
             pltpu.SMEM((8,), jnp.int32),
             pltpu.SMEM((4 * page_count,), jnp.int32),
             pltpu.VMEM((tile, config.key_tile), jnp.float32),
+        )
+        + (
+            (pltpu.VMEM((4, tile, config.key_tile // block), jnp.float32),)
+            if block
+            else ()
         ),
-        tuple(dma(s) for s in ((config.key_buffers,), (4, tile), (2,), (4,), (2,))),
+        tuple(
+            dma(s)
+            for s in ((config.key_buffers,), (4, tile), (2,), (4,), (2,))
+            + ((4, tile),) * bool(block)
+        ),
     )
     hbm, vmem = (pl.BlockSpec(memory_space=s) for s in (pltpu.HBM, pltpu.VMEM))
     inputs = (q, weights * q_scale, banks, table)
     reuse_keys = reuse_keys and width <= config.key_buffers * config.key_tile
-    kernel = partial(_kernel, (config, info, layout, reuse_keys, fill_unscored))
+    kernel = partial(_kernel, (config, info, layout, reuse_keys, fill_unscored, block))
     out_shape = jax.ShapeDtypeStruct((tokens, width), jnp.float32)
+    if block:
+        out_shape = (
+            out_shape,
+            jax.ShapeDtypeStruct((tokens, width // block), jnp.float32),
+        )
     result = pl.pallas_call(
         kernel,
         out_shape=out_shape,
@@ -527,7 +592,7 @@ def fp8_paged_mqa_logits(
             num_scalar_prefetch=3,
             grid=(1,),
             in_specs=((hbm, vmem, tuple(hbm for _ in banks), hbm),),
-            out_specs=hbm,
+            out_specs=(hbm, hbm) if block else hbm,
             scratch_shapes=(scratch,),
         ),
         compiler_params=pltpu.CompilerParams(
@@ -537,4 +602,7 @@ def fp8_paged_mqa_logits(
         ),
         name="fp8_paged_mqa_logits_dense",
     )(query_start_loc, context_lens, jnp.asarray(query_start, jnp.int32), inputs)
+    if block:
+        scores, maxima = result
+        return scores[:, :max_model_len], maxima[:, : pl.cdiv(max_model_len, block)]
     return result[:, :max_model_len]

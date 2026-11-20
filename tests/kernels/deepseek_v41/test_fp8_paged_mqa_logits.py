@@ -245,3 +245,57 @@ def test_resident_tiles_match_streamed_scores():
         )
 
     np.testing.assert_array_equal(scores(True), scores(False))
+
+
+@pytest.mark.parametrize("weight_sign", [1, -1])
+def test_block_maxima_match_scores(weight_sign):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Packed FP8 scoring requires TPU")
+    rng = np.random.default_rng(7)
+    page_size, max_model_len, block = 256, 262144, 8
+    counts = np.array([6, 6, 4])
+    # Half and whole tiles, a short row, a row ending inside a block, empty rows.
+    bases = np.array([1000, 2 * 65536 + 3, 0])
+    lengths = np.concatenate([b + 5 * np.arange(c) for b, c in zip(bases, counts)])
+    per_request = max_model_len // page_size
+    layout = PackedFP8Layout(len(counts) * per_request, page_size=page_size)
+    table = rng.permutation(layout.pages).reshape(len(counts), per_request)
+    table[1, 600] = -1
+    keys = jnp.asarray(rng.normal(size=(layout.pages * page_size, 128)), jnp.bfloat16)
+    pool, _ = _pack(keys, layout)
+    tokens = len(lengths)
+    q = jnp.asarray(rng.normal(size=(tokens, 32, 128)), jnp.float8_e4m3fn)
+    # Negative weights give negative and signed-zero scores.
+    weights = jnp.asarray(
+        weight_sign * rng.uniform(0.01, 0.1, (tokens, 32)), jnp.float32
+    )
+
+    def run(block_maxima):
+        return fp8_paged_mqa_logits(
+            q,
+            jnp.asarray(pool),
+            weights,
+            jnp.asarray(lengths, jnp.int32),
+            jnp.asarray(table, jnp.int32),
+            query_start_loc=jnp.asarray(
+                np.concatenate(([0], np.cumsum(counts))), jnp.int32
+            ),
+            max_model_len=max_model_len,
+            q_scale=jnp.ones_like(weights),
+            query_size=6,
+            cache_layout=layout,
+            fill_unscored=False,
+            block_maxima=block_maxima,
+        )
+
+    plain = np.asarray(run(0))
+    scores, maxima = (np.asarray(x) for x in run(block))
+    assert maxima.shape == (tokens, max_model_len // block)
+    for row, length in enumerate(lengths):
+        blocks = -(-length // block)
+        # Scores are unchanged; maxima cover every block a reader may load.
+        np.testing.assert_array_equal(
+            scores[row, : blocks * block], plain[row, : blocks * block]
+        )
+        expected = scores[row, : blocks * block].reshape(blocks, block).max(-1)
+        np.testing.assert_array_equal(maxima[row, :blocks], expected)
