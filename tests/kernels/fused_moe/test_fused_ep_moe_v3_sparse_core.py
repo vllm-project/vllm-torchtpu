@@ -343,12 +343,15 @@ def test_gather_rows_prefix_writes_the_live_prefix(tpu7x, live_blocks):
 #  pairs) and the others are three chunks per subcore, so the ring's slots
 #  are reused. "padded_table" hands a token table longer than its drop row,
 #  as the layer does when the bound is not a whole number of 128 rows: the
-#  rows from the drop row on must stay zero.
+#  rows from the drop row on must stay zero. "padded_table_two_planes" does
+#  so with two scale planes, where plane 1's dropped pairs carry its own
+#  drop row (the drop row plus the plane's offset), inside the table.
 SCATTER_CASES = {
     "run_is_chunk": (2, 4, 80, 96, 512, 1, 0),
     "ring_reuse": (2, 4, 1000, 1024, 6144, 1, 0),
     "two_planes": (4, 2, 600, 640, 3072, 2, 0),
     "padded_table": (2, 4, 1000, 1024, 6144, 1, 96),
+    "padded_table_two_planes": (2, 4, 1000, 1024, 6144, 2, 96),
 }
 
 
