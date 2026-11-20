@@ -155,7 +155,9 @@ def run_moe_v3(
         # as a partition-id. So the layer runs without its jit and without
         # side effects, and the shard's index goes in as data: rank, int32
         # [ep, 1], each shard's mesh index, the adapter's device tensor.
-        drop_nan_rows = valid_tokens is not None
+        # A row with a NaN logit routes nowhere, as in main's fused EP v2
+        # kernel, whose softmax leaves such a row no finite score; rows past
+        # valid_tokens route nowhere without it.
         return fused_ep_moe(
             x,
             w1,
@@ -169,7 +171,7 @@ def run_moe_v3(
             tile_rows=TILE_ROWS,
             weight_format=WEIGHT_FORMAT,
             activation=activation,
-            drop_nan_rows=drop_nan_rows,
+            drop_nan_rows=True,
             config=config,
             shard_index=rank,
             experts_per_shard=experts_per_shard,
