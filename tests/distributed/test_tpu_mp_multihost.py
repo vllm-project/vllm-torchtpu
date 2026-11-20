@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import socket
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock, call
@@ -20,6 +21,7 @@ from unittest.mock import Mock, call
 import pytest
 
 from vllm_torchtpu.distributed import tpu_mp_multihost as mp
+from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.platforms import tpu_platform
 
 
@@ -35,6 +37,9 @@ def isolated_environment(monkeypatch):
         "TORCH_TPU_XPROF_SESSION_ID",
         "TPU_NUM_HOSTS",
         "NODE_RANK",
+        "LWS_LEADER_ADDRESS",
+        "LWS_WORKER_INDEX",
+        "LWS_GROUP_SIZE",
         mp._DONE_SENTINEL,
         mp._DP_DONE_SENTINEL,
     ):
@@ -208,3 +213,115 @@ def test_failed_bootstrap_can_retry(bootstrap):
     rendezvous.side_effect = None
     mp.prepare_mp_multihost_env(config)
     assert os.environ[mp._DONE_SENTINEL] == "2"
+
+
+def test_mp_lws_worker_index_mismatch_raises_only_on_ipv6(monkeypatch, bootstrap):
+    rendezvous, _ = bootstrap
+    monkeypatch.setenv("LWS_LEADER_ADDRESS", "leader.svc.cluster.local")
+    monkeypatch.setenv("LWS_GROUP_SIZE", "2")
+    monkeypatch.setenv("LWS_WORKER_INDEX", "1")
+    nnodes_cfg = SimpleNamespace(
+        nnodes=2,
+        node_rank=0,
+        local_world_size=4,
+        master_addr="10.0.0.1",
+        master_port=9000,
+    )
+    dp_cfg = SimpleNamespace(
+        data_parallel_size=4,
+        data_parallel_size_local=2,
+        data_parallel_rank=0,
+        data_parallel_rpc_port=9000,
+        data_parallel_master_ip="10.0.0.1",
+        world_size=2,
+    )
+    # IPv4 LWS deployments never use LWS DNS host substitution, so custom
+    # node_rank != LWS_WORKER_INDEX continues to work without raising.
+    mp.prepare_mp_multihost_env(nnodes_cfg)
+    assert mp.prepare_mp_multihost_dp_env(dp_cfg, 8)
+
+    monkeypatch.delenv(mp._DONE_SENTINEL)
+    monkeypatch.delenv(mp._DP_DONE_SENTINEL)
+    rendezvous.return_value = (["2001:db8::9", "2001:db8::a"], "session")
+    with pytest.raises(ValueError, match="LWS_WORKER_INDEX"):
+        mp.prepare_mp_multihost_env(nnodes_cfg)
+    with pytest.raises(ValueError, match="LWS_WORKER_INDEX"):
+        mp.prepare_mp_multihost_dp_env(dp_cfg, 8)
+
+
+def test_mp_lws_subgroup_disables_worker_index_fallback(monkeypatch, bootstrap):
+    bootstrap[0].return_value = (["2001:db8::9", "2001:db8::a"], "session")
+    monkeypatch.setenv("LWS_LEADER_ADDRESS", "leader.svc.cluster.local")
+    monkeypatch.setenv("LWS_GROUP_SIZE", "4")
+    monkeypatch.setenv("LWS_WORKER_INDEX", "2")
+    seen_flags: list[bool] = []
+
+    def _fake_resolve(host_ips, *, ordered_by_worker_id=False, hostnames_by_ip=None):
+        seen_flags.append(ordered_by_worker_id)
+        return {ip: f"host-{i}" for i, ip in enumerate(host_ips)}
+
+    monkeypatch.setattr(mp, "resolve_slicebuilder_hosts", _fake_resolve)
+    config = SimpleNamespace(
+        nnodes=2,
+        node_rank=0,
+        local_world_size=4,
+        master_addr="leader.svc.cluster.local",
+        master_port=9000,
+    )
+    mp.prepare_mp_multihost_env(config)
+    assert seen_flags == [False]
+
+
+@pytest.mark.parametrize("mode", ["nnodes", "dp"])
+def test_mp_ipv6_slicebuilder_substitutes_lws_hostnames(monkeypatch, bootstrap, mode):
+    rendezvous, topology = bootstrap
+    rendezvous.return_value = (["2001:db8::9", "2001:db8::a"], "session")
+    leader_dns = "vllm-lws-0.vllm-lws.default.svc.cluster.local"
+    worker1_dns = "vllm-lws-0-1.vllm-lws.default.svc.cluster.local"
+    dns_to_ip = {
+        leader_dns: "2001:db8::9",
+        worker1_dns: "2001:db8::a",
+    }
+    monkeypatch.setenv("LWS_LEADER_ADDRESS", leader_dns)
+    monkeypatch.setenv("LWS_GROUP_SIZE", "2")
+    monkeypatch.setenv("LWS_WORKER_INDEX", "0")
+    monkeypatch.setattr(
+        dist_utils.socket,
+        "getaddrinfo",
+        lambda host, *a, **kw: (
+            [(socket.AF_INET6, 0, 0, "", (dns_to_ip[host], 0, 0, 0))]
+            if host in dns_to_ip
+            else (_ for _ in ()).throw(socket.gaierror(f"unknown {host}"))
+        ),
+    )
+
+    if mode == "nnodes":
+        mp.prepare_mp_multihost_env(
+            SimpleNamespace(
+                nnodes=2,
+                node_rank=0,
+                local_world_size=4,
+                master_addr=leader_dns,
+                master_port=9000,
+            )
+        )
+    else:
+        assert mp.prepare_mp_multihost_dp_env(
+            SimpleNamespace(
+                data_parallel_size=4,
+                data_parallel_size_local=2,
+                data_parallel_rank=0,
+                data_parallel_rpc_port=9000,
+                data_parallel_master_ip=leader_dns,
+                world_size=2,
+            ),
+            8,
+        )
+
+    topology.assert_called_once_with(8)
+    expected = ",".join(
+        f"{host}:{8070 + slot}"
+        for host in (leader_dns, worker1_dns)
+        for slot in range(4)
+    )
+    assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == expected

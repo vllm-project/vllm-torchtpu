@@ -452,6 +452,10 @@ class TestTpuCompilerCache:
             "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
             "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
             "TPU_LIBRARY_PATH",
+            "TPU_VISIBLE_DEVICE_PATHS",
+            "LWS_WORKER_INDEX",
+            "LWS_GROUP_SIZE",
+            "LWS_LEADER_ADDRESS",
         }
 
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED

@@ -36,6 +36,10 @@ if TYPE_CHECKING:
     TPU_NAME: str | None = None
     TPU_LIBRARY_PATH: str | None = None
     TPU_WORKER_ID: str | None = None
+    TPU_VISIBLE_DEVICE_PATHS: str = ""
+    LWS_WORKER_INDEX: int | None = None
+    LWS_GROUP_SIZE: int = 1
+    LWS_LEADER_ADDRESS: str = ""
     TPU_MULTIHOST_BACKEND: str = ""
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     PYTHON_TRACER_LEVEL: int = 1
@@ -328,6 +332,32 @@ def env_nonnegative_int(env_name: str, default: int) -> Callable[[], int]:
     return _nonnegative(env_int(env_name, default), env_name)
 
 
+def env_positive_int(env_name: str, default: int) -> Callable[[], int]:
+    """Integer knob that must be >= 1."""
+    parse = env_int(env_name, default)
+
+    def _get_positive_int_env() -> int:
+        value = parse()
+        if value < 1:
+            raise ValueError(f"Invalid value '{value}' for {env_name}: must be >= 1.")
+        return value
+
+    return _get_positive_int_env
+
+
+def env_optional_nonnegative_int(env_name: str) -> Callable[[], int | None]:
+    """Optional integer knob (>= 0 when set; unset or empty reads as ``None``)."""
+    parse_int = env_nonnegative_int(env_name, 0)
+
+    def _get_optional_nonnegative_int_env() -> int | None:
+        value = os.getenv(env_name)
+        if value is None or value.strip() == "":
+            return None
+        return parse_int()
+
+    return _get_optional_nonnegative_int_env
+
+
 def _nonnegative(parse: Callable[[], Any], env_name: str) -> Callable[[], Any]:
     """Wrap a number parser so a negative value raises instead of passing."""
 
@@ -546,6 +576,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_LIBRARY_PATH": lambda: os.getenv("TPU_LIBRARY_PATH", None),
     # Worker ID for multi-host TPU setups
     "TPU_WORKER_ID": lambda: os.getenv("TPU_WORKER_ID", None),
+    # Comma-separated /dev/vfio/* paths injected by bare-metal K8s device plugins
+    "TPU_VISIBLE_DEVICE_PATHS": env_str("TPU_VISIBLE_DEVICE_PATHS", ""),
+    # 0-indexed pod ordinal injected by Kubernetes LeaderWorkerSet (LWS)
+    "LWS_WORKER_INDEX": env_optional_nonnegative_int("LWS_WORKER_INDEX"),
+    # Pods per replica group injected by Kubernetes LeaderWorkerSet (LWS)
+    "LWS_GROUP_SIZE": env_positive_int("LWS_GROUP_SIZE", 1),
+    # Leader pod DNS address injected by Kubernetes LeaderWorkerSet (LWS)
+    "LWS_LEADER_ADDRESS": env_str("LWS_LEADER_ADDRESS", ""),
     # Backend for multi-host communication on TPU. "" auto-detects: "mp" is
     # used whenever --nnodes > 1 and this isn't set to "ray"; set explicitly
     # to "mp" to force it (e.g. to silence the auto-detection log line).

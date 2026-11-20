@@ -217,8 +217,9 @@ def _detect_target_tpu() -> str:
     accelerator_type = tpu_info.get_tpu_type()
     if not accelerator_type:
         raise RuntimeError(
-            "Cannot detect the TPU generation (neither TPU_ACCELERATOR_TYPE nor "
-            "the GCE metadata accelerator-type is available); pass --target-tpu."
+            "Cannot detect the TPU generation (TPU_ACCELERATOR_TYPE, local VFIO "
+            "sysfs, and GCE metadata accelerator-type are all unavailable); "
+            "pass --target-tpu."
         )
     name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
     name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
