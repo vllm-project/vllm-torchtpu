@@ -384,18 +384,23 @@ def test_key_off_touches_nothing(monkeypatch):
     assert not [a for a in vars(fx.r) if a.startswith("_glue")]
 
 
-def test_key_registered_default_off_and_compile_hashed(monkeypatch):
+def test_key_registered_default_off_and_compile_ignored(monkeypatch):
+    """Registered, default off, and compile-ignored: the keys pick which
+    programs run (each keyed by its own graph), so the compile hash and the
+    env factors are the same with or without them (no cold cache for a flag-off
+    or flag-on run of this tree)."""
     monkeypatch.delenv("VLLM_TPU_GLUE_FOLD", raising=False)
     monkeypatch.delenv("VLLM_TPU_GLUE_FOLD_CHECK", raising=False)
     assert envs.VLLM_TPU_GLUE_FOLD is False and envs.VLLM_TPU_GLUE_FOLD_CHECK == 0
     for key in ("VLLM_TPU_GLUE_FOLD", "VLLM_TPU_GLUE_FOLD_CHECK"):
         assert key in envs.environment_variables
-        # it changes the compiled program set, like VLLM_TPU_VERIFY_FUSED: hashed
-        assert key not in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+        assert key in tpu_compiler._TPU_COMPILE_ENV_IGNORED
     off = tpu_compiler._tpu_compile_env_factors()
     monkeypatch.setenv("VLLM_TPU_GLUE_FOLD", "1")
+    monkeypatch.setenv("VLLM_TPU_GLUE_FOLD_CHECK", "100")
+    assert envs.VLLM_TPU_GLUE_FOLD is True and envs.VLLM_TPU_GLUE_FOLD_CHECK == 100
     on = tpu_compiler._tpu_compile_env_factors()
-    assert off["VLLM_TPU_GLUE_FOLD"] is False and on["VLLM_TPU_GLUE_FOLD"] is True
+    assert off == on and "VLLM_TPU_GLUE_FOLD" not in on
 
 
 def test_engages_only_on_a_single_chunk_async_spec_step(monkeypatch):
@@ -525,7 +530,7 @@ def test_program_counts(rows, k, capsys):
     stock_eager = len(ops_asm) + len(ops_sub) + len(ops_warm) + len(ops_ext)
     stock_runs = 1 + 1 + (1 if ops_warm else 0) + 1  # eager runs between programs
     print(
-        f"Q38GLUE PROGRAMS rows={n * (1 + k)}/{fx.N} k={k} reqs={n}: stock compiled {stock_compiled} + eager aten "
+        f"\nQ38GLUE PROGRAMS rows={n * (1 + k)}/{fx.N} k={k} reqs={n}: stock compiled {stock_compiled} + eager aten "
         f"{stock_eager} (asm {len(ops_asm)} sub {len(ops_sub)} warm {len(ops_warm)} extract {len(ops_ext)}) in "
         f"{stock_runs} eager runs -> program bounds [{stock_compiled + stock_runs}, {stock_compiled + stock_eager}]; "
         f"fold compiled 4 = graphs post {len(g_post)} asm {len(g_asm)} sub {len(g_sub)} pre {len(g_pre)}, "

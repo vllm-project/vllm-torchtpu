@@ -315,6 +315,12 @@ _TPU_COMPILE_ENV_IGNORED = {
     # waits for the previous step's copy; the seed rows, their programs and
     # every model program are the same.
     "VLLM_TPU_L6_SEED_SPEC",
+    # q38 DEC-STEP-3 GLUE_FOLD (runner/tpu_runner.py _glue_*): which programs
+    # run the async spec step's integer glue (four folded programs or the
+    # stock ones, and the check's copies); each is keyed by its own graph and
+    # no program compiles differently.
+    "VLLM_TPU_GLUE_FOLD",
+    "VLLM_TPU_GLUE_FOLD_CHECK",
     # Engine-core cap on remote KV loads started a pass (core/kv_load_pacing.py).
     "VLLM_TPU_KV_LOAD_STARTS_PER_STEP",
     # New-request prompt arrays (core/prompt_token_array.py).
