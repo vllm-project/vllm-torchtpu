@@ -531,10 +531,10 @@ class HybridStateRetention:
         blocks = getattr(new_computed_blocks, "blocks", None)
         if not blocks:
             return False
-        managers = getattr(self.coordinator, "single_type_managers", None) or ()
+        managers = self.coordinator.single_type_managers
         for group in self.mamba_groups:
             for gid in group.group_ids:
-                if gid >= len(blocks) or gid >= len(managers) or not blocks[gid]:
+                if gid >= len(blocks) or not blocks[gid]:
                     continue
                 cached = getattr(managers[gid], "cached_blocks_this_step", None)
                 if cached and getattr(blocks[gid][-1], "block_hash", None) in cached:
@@ -551,17 +551,7 @@ class HybridStateRetention:
         pool = self.block_pool
         if pool is None:
             return 0
-        get_free = getattr(pool, "get_num_free_blocks", None)
-        if callable(get_free):
-            return int(get_free())
-        q = getattr(pool, "free_block_queue", None)
-        if hasattr(q, "num_free_blocks"):
-            return int(q.num_free_blocks)
-        if hasattr(q, "q"):
-            return len(q.q)
-        if isinstance(q, (list, tuple, set)):
-            return len(q)
-        return 0
+        return int(pool.get_num_free_blocks())
 
     def num_pinned_blocks(self) -> int:
         """Return total number of physical Mamba blocks currently pinned across
