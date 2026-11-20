@@ -66,7 +66,7 @@ def _mq_roundtrip(obj):
     return pickle.loads(data, buffers=oob), data, oob
 
 
-def _new_req(ids, **sp_kwargs):
+def _new_req(ids, req_kwargs=None, **sp_kwargs):
     return NewRequestData(
         req_id="r",
         prompt_token_ids=ids,
@@ -76,6 +76,7 @@ def _new_req(ids, **sp_kwargs):
         block_ids=([1, 2],),
         num_computed_tokens=0,
         lora_request=None,
+        **(req_kwargs or {}),
     )
 
 
@@ -173,6 +174,24 @@ def test_exclusions_and_small_prompts():
     assert pack_new_request_prompt_ids(so) == 0
     assert all(type(r.prompt_token_ids) is list for r in cases)
     assert pack_prompt_ids([1, 2**40]) is None
+
+
+@pytest.mark.parametrize(
+    "req_kwargs",
+    [
+        {"prompt_embeds": torch.zeros(5000, 8)},
+        {"prompt_is_token_ids": [True] * 5000},
+    ],
+    ids=["prompt_embeds", "prompt_is_token_ids"],
+)
+def test_prompt_embeds_and_mixed_inputs_keep_the_list(req_kwargs):
+    """The exclusions read vLLM's own NewRequestData fields: the request is
+    built through its constructor, so a renamed field fails here instead of
+    letting an embeds request be packed."""
+    req = _new_req(list(range(5000)), req_kwargs)
+    so = SimpleNamespace(scheduled_new_reqs=[req])
+    assert pack_new_request_prompt_ids(so) == 0
+    assert type(req.prompt_token_ids) is list
 
 
 def test_scheduler_hook_packs():
