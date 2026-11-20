@@ -24,9 +24,19 @@ from jax._src.state import indexing
 from jax._src.state import types as state_types
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
+from kernels.gdn.v3.vmem_test_utils import (
+    get_vmem_declared_bytes,
+    weight_refs_vmem_bytes,
+)
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, config, tiling, wrapper
+from vllm_torchtpu.kernels.gdn.v3 import (
+    compute_gdn,
+    config,
+    memory_ref,
+    tiling,
+    wrapper,
+)
 
 
 def _l2_normalize(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
@@ -625,6 +635,94 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                         window_size=1,
                     )
                     self.assertEqual(got, expected, msg=label)
+
+    def test_gdn_vmem_declared_bytes_matches_create_allocs(self) -> None:
+        """Verify 0 B delta between declared VMEM bytes and create_allocs."""
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        with use_abstract_mesh(mesh):
+            d_k = d_v = 128
+            kernel_size = 4
+            tpu_info = pltpu.get_tpu_info()
+            num_lanes = tpu_info.num_lanes
+            num_sublanes = tpu_info.num_sublanes
+            f32 = jnp.dtype(jnp.float32)
+            bf16 = jnp.dtype(jnp.bfloat16)
+            dummy_meta = memory_ref.MetadataRef(
+                num_tiles=None,
+                p_id_to_s_idx=None,
+                p_id_to_r_base=None,
+                p_id_to_r_size=None,
+                p_id_is_first_tile=None,
+                p_id_is_last_tile=None,
+                s_idx_has_initial_state=None,
+                s_idx_to_state_indices=None,
+                s_idx_to_read_offset=None,
+                s_idx_to_ckpt_indices=None,
+            )
+            cases = [
+                (mode, n_kq, n_v, tile_size, window_size)
+                for mode in (config.GDNMode.BATCHED, config.GDNMode.PER_SEQ)
+                for n_kq, n_v, tile_size, window_size in (
+                    (2, 8, 8, 1),
+                    (2, 8, 8, 4),
+                    (8, 32, 4, 1),
+                    (16, 64, 32, 1),
+                )
+                if not (mode == config.GDNMode.PER_SEQ and window_size > 1)
+            ]
+            for mode, n_kq, n_v, tile_size, window_size in cases:
+                dim_size = 2 * n_kq * d_k + n_v * d_v
+                cfg = config.GDNConfig(
+                    mode=mode,
+                    dtypes=config.Dtypes(
+                        act_in=f32,
+                        act_out=bf16,
+                        compute=f32,
+                        recurrent_state=f32,
+                        conv_state=f32,
+                    ),
+                    batch_size=512,
+                    dim_size=dim_size,
+                    kernel_size=kernel_size,
+                    tile_size=tile_size,
+                    num_kq_heads=n_kq,
+                    num_v_heads=n_v,
+                    kq_head_dim=d_k,
+                    v_head_dim=d_v,
+                    attention_mode=config.AttentionMode.GDN,
+                    window_size=window_size,
+                )
+                allocs = memory_ref.create_allocs(
+                    metadata_ref=dummy_meta,
+                    qkv_ref=f32,
+                    b_ref=f32,
+                    a_ref=f32,
+                    out_ref=bf16,
+                    conv_state_ref=f32,
+                    recurrent_state_ref=f32,
+                    cfg=cfg,
+                )
+                alloc_bytes = sum(
+                    int(np.prod(a.window_ref.shape))
+                    * jnp.dtype(a.window_ref.dtype).itemsize
+                    for a in allocs
+                    if a.window_ref is not None
+                )
+                scratch_bytes = sum(
+                    int(np.prod(s.shape)) * jnp.dtype(s.dtype).itemsize
+                    for s in cfg.get_scratch_shape_dict().values()
+                    if s is not None
+                )
+                weights_bytes = weight_refs_vmem_bytes(cfg, num_lanes, num_sublanes)
+                declared = get_vmem_declared_bytes(
+                    cfg,
+                    conv_state_dim_size=dim_size,
+                    num_lanes=num_lanes,
+                    num_sublanes=num_sublanes,
+                )
+                self.assertEqual(declared, alloc_bytes + scratch_bytes + weights_bytes)
 
 
 class GDNStatePipelineRaceTest(parameterized.TestCase):
@@ -2020,6 +2118,7 @@ class GDNAttentionTest(parameterized.TestCase):
 
         for n_kq, n_v, num_seqs, num_spec_tokens, prefill_len, num_decodes in [
             (2, 8, 16, 3, 16, 0),  # TP8 DCP=4 c=16 MTP=3: 16-tok prefill in B=16
+            (2, 8, 16, 3, 0, 16),  # TP8 DCP=4 c=16 MTP=3 warmup: 16 decodes, B=16
             (8, 24, 16, 0, 12, 4),  # 27B TP2: 24 heads -> B=4 (was 5, truncated C)
             (8, 32, 16, 0, 12, 4),  # DP4TP2: 4 decodes + 12-tok prefill in B=16
             (16, 64, 16, 0, 12, 4),  # DP8: 4 decodes + 12-tok prefill in B=16
@@ -2036,7 +2135,7 @@ class GDNAttentionTest(parameterized.TestCase):
                 init_rec = jax.random.normal(
                     k9, (num_blocks, n_v, d_k, d_v), dtype=jnp.float32
                 )
-                active_seqs = num_decodes + 1
+                active_seqs = num_decodes + (1 if prefill_len > 0 else 0)
                 state_indices = jnp.arange(num_seqs, dtype=jnp.int32) * window
                 common_kwargs = dict(
                     qkv=jax.random.normal(k1, (batch_size, dim), dtype=jnp.bfloat16),
@@ -2059,7 +2158,7 @@ class GDNAttentionTest(parameterized.TestCase):
                     ),
                     seq_lens=jnp.array(
                         [10] * num_decodes
-                        + [prefill_len + 10]
+                        + ([prefill_len + 10] if prefill_len > 0 else [])
                         + [0] * (num_seqs - active_seqs),
                         dtype=jnp.int32,
                     ),
