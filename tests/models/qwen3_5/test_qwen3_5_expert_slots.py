@@ -22,9 +22,11 @@ import yaml
 
 from tests.models.qwen3_5.test_qwen3_5_hooks import (
     CREDIT_EP8,
+    FUSED_EP_V3_ENV,
     LAYERS,
     SLOT_LAYER_BYTES,
     _run_hook,
+    _set_moe_env,
     _vllm_config,
 )
 from vllm_torchtpu.distributed import collectives_options
@@ -45,6 +47,13 @@ def _tpu7x(monkeypatch):
     """The measured runs were on TPU7x, and the hook applies the calibrated KV
     budget only on a TPU7x device."""
     monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
+
+
+@pytest.fixture(autouse=True)
+def _fused_ep_v3(monkeypatch):
+    """The TP8 decode legs' environment selects fused EP MoE v3, the kernel the
+    hook applies the calibrated KV budget with."""
+    _set_moe_env(monkeypatch, FUSED_EP_V3_ENV)
 
 
 @pytest.fixture
