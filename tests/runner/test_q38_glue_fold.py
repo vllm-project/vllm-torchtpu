@@ -221,10 +221,11 @@ def _run_pair(monkeypatch, fx_kwargs):
         fx = _fixture(**fx_kwargs)
         with patch.object(tao, "assemble_spec_next_tokens", wraps=tao.assemble_spec_next_tokens) as asm_spy, \
              patch.object(tao, "compute_num_rejected", wraps=tao.compute_num_rejected) as rej_spy, \
-             patch.object(tr, "_substitute_placeholder_token", wraps=_SUBST_BODY) as sub_spy:
+             patch.object(tr, "_substitute_placeholder_token", wraps=_SUBST_BODY) as sub_spy, \
+             patch.object(tao, "extract_draft_token_ids", wraps=tao.extract_draft_token_ids) as ext_spy:
             on = _step(fx, fold=True)
         stats = fx.r._glue_stats
-    return off, on, stats, (asm_spy.call_count, rej_spy.call_count, sub_spy.call_count)
+    return off, on, stats, (asm_spy.call_count, rej_spy.call_count, sub_spy.call_count, ext_spy.call_count)
 
 
 @pytest.mark.parametrize("rows,k", SHAPES)
@@ -242,7 +243,7 @@ def test_flag_on_matches_stock_bitwise(monkeypatch, rows, k, n_off, groups_n):
     assert stats["post"] == 1 and stats["asm"] == 1 and stats["sub"] == 1
     assert stats["pre"] + stats["pre_id"] == 1
     assert (stats["pre_id"] == 1) == (n_off == 0)  # full batch in order -> fast path 1
-    assert spies == (0, 0, 0)
+    assert spies == (0, 0, 0, 0)
 
 
 @pytest.mark.parametrize("nt_dtype", [torch.int32, torch.int64])
