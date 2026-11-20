@@ -137,6 +137,29 @@ def exclusive_spawn(local_world_size: int) -> Iterator[None]:
 
 
 @contextlib.contextmanager
+def spawn_env(values: dict[str, str]) -> Iterator[None]:
+    """Set `values` in os.environ for one spawn, then restore what was there.
+
+    The child copies the environment when it starts, so the parent need not
+    keep a worker's binding afterwards; restoring it keeps one spawn's values
+    from reaching the next spawn or the parent's own later code. Use inside
+    `exclusive_spawn`: os.environ is process-wide.
+    """
+    # A snapshot to put back, not a config read (those go through envs.py).
+    before = os.environ.copy()
+    saved = {name: before.get(name) for name in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for name, old in saved.items():
+            if old is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old
+
+
+@contextlib.contextmanager
 def _large_spawn_pipes(local_world_size: int) -> Iterator[None]:
     # Only under _SPAWN_LOCK: the swap below is process-wide.
     import multiprocessing.popen_spawn_posix as popen_spawn_posix

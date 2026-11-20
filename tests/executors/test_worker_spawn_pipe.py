@@ -196,8 +196,6 @@ def patched_spawn(monkeypatch):
             "vllm_torchtpu.worker.tpu_rank_binding.get_tpu_worker_binding",
             binding,
         )
-        # The wrapper writes each spawn's RANK into os.environ.
-        monkeypatch.setenv("RANK", "unset")
         monkeypatch.setenv("VLLM_TPU_DEVICE_ORDER", "")
         vllm_torchtpu._patch_multiproc_worker_global_rank_env()
         return multiproc_executor.WorkerProc.make_worker_process
@@ -291,3 +289,35 @@ def test_spawns_from_several_threads_take_turns(patched_spawn):
     assert all(swapped)
     assert sorted(ranks) == [(i, str(i)) for i in range(8)]
     assert popen_spawn_posix.os is os
+
+
+@pytest.mark.parametrize("raises", [False, True])
+@pytest.mark.parametrize("before", [None, "7"], ids=["unset", "set"])
+def test_the_spawn_env_is_restored_after_the_spawn(
+    patched_spawn, monkeypatch, raises, before
+):
+    """The child sees its binding while it starts; afterwards the parent's
+    environment is what it was, so no spawn's binding reaches the next one."""
+    if before is None:
+        monkeypatch.delenv("RANK", raising=False)
+    else:
+        monkeypatch.setenv("RANK", before)
+    install, _ = patched_spawn
+    seen = []
+
+    def make_worker_process(vllm_config, local_rank, rank, *args, **kwargs):
+        seen.append(os.environ["RANK"])
+        if raises:
+            raise RuntimeError("spawn failed")
+        return "handle"
+
+    spawn = install(make_worker_process)
+    config = SimpleNamespace(parallel_config=SimpleNamespace(local_world_size=8))
+    if raises:
+        with pytest.raises(RuntimeError):
+            spawn(config, 3, 3)
+    else:
+        assert spawn(config, 3, 3) == "handle"
+
+    assert seen == ["3"]
+    assert os.environ.get("RANK") == before

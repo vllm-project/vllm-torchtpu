@@ -687,7 +687,7 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
     from vllm.v1.executor.multiproc_executor import WorkerProc
 
-    from vllm_torchtpu.executors.worker_spawn import exclusive_spawn
+    from vllm_torchtpu.executors.worker_spawn import exclusive_spawn, spawn_env
     from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
     if getattr(WorkerProc, "_tpu_global_rank_env_patch", False):
@@ -702,7 +702,7 @@ def _patch_multiproc_worker_global_rank_env() -> None:
         # return before the child has imported.
         with exclusive_spawn(pc.local_world_size):
             binding = get_tpu_worker_binding(pc, rank, local_rank, env=_os.environ)
-            _os.environ.update(binding.as_env())
+            env = binding.as_env()
             # VLLM_TPU_DEVICE_ORDER lists a physical device per local rank,
             # so consecutive ranks (a two-device pipeline stage) can sit on
             # different chips; TorchTPU reads TPU_VISIBLE_DEVICES at import,
@@ -710,8 +710,8 @@ def _patch_multiproc_worker_global_rank_env() -> None:
             order = envs.VLLM_TPU_DEVICE_ORDER
             if order:
                 device = [int(x) for x in order.split(",")][binding.local_rank]
-                _os.environ["TPU_VISIBLE_CHIPS"] = str(device)
-                _os.environ["TPU_VISIBLE_DEVICES"] = str(device)
+                env["TPU_VISIBLE_CHIPS"] = str(device)
+                env["TPU_VISIBLE_DEVICES"] = str(device)
                 logger.info(
                     "Applied TPU patch: worker spawn env local rank %d -> device %d "
                     "(VLLM_TPU_DEVICE_ORDER=%s)",
@@ -735,7 +735,10 @@ def _patch_multiproc_worker_global_rank_env() -> None:
                 binding.local_rank_offset,
                 binding.init_local_rank,
             )
-            return _orig(vllm_config, local_rank, rank, *args, **kwargs)
+            # The child copies os.environ when it starts; restore the parent's
+            # afterwards so this binding does not leak into the next spawn.
+            with spawn_env(env):
+                return _orig(vllm_config, local_rank, rank, *args, **kwargs)
 
     WorkerProc.make_worker_process = staticmethod(_wrapped)
     WorkerProc._tpu_global_rank_env_patch = True
