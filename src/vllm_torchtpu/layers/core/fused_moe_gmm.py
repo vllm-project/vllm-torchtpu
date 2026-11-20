@@ -809,7 +809,7 @@ def fused_moe_func(
         )
     ):
         logger.info_once(
-            "Selected experimental small-batch MoE (max tokens %d)",
+            "Selected the experimental few-token MoE kernel (max tokens %d)",
             lowtok_max_tokens,
         )
         route = moe_lowtok_routing_table(topk_ids, topk_weights, w1.shape[0])

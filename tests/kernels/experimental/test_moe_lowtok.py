@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Parity, routing edge cases and admission for the small-batch MoE kernel.
+"""Parity, routing edge cases and admission for the few-token MoE kernel.
 
 TPU tests compile the kernel; the interpreted tests run with JAX_PLATFORMS=cpu
 and check indexing and arithmetic, not TPU resource capacity.
@@ -292,7 +292,8 @@ _NINE_WINNERS = [20, 40, 60, 80, 120, 140, 160, 180, 220]
 
 
 def _tied_router_input(rows, from_logits, seed):
-    """Qwen3.5 router rows whose first four hold ties the selected set depends on.
+    """512-expert top-10 router rows whose first four hold ties the selected set
+    depends on.
 
     Row 0 ties ids 5 and 511 for the 10th place under nine clear winners, row
     1 is a padded token with every score equal, row 2 ties twelve ids
