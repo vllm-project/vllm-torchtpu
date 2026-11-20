@@ -249,6 +249,7 @@ def _routing_moe_jax(
     fp8_dispatch: bool,
     gmm_plan: tuple,
     fp8_dispatch_min_rows: int = 0,
+    pack_before_gather: bool = False,
 ) -> jax.Array:
     """tokamax routing_moe over the EP mesh on this rank's routed rows (x, top-k
     weights and ids sharded on axis 0); returns this rank's rows. Pure JAX, so
@@ -272,7 +273,8 @@ def _routing_moe_jax(
     moe_plan = tk_plan.RoutingMoEPlan(
         remote_scatter=remote_scatter, scatter_format=_scatter_format(fp8_combine)
     )
-    if not (fp8_dispatch and rows >= fp8_dispatch_min_rows):
+    use_fp8 = fp8_dispatch and rows >= fp8_dispatch_min_rows
+    if not (use_fp8 or pack_before_gather):
         return tk_modular.routing_moe(
             x,
             weights,
@@ -293,10 +295,17 @@ def _routing_moe_jax(
             ep_shard_idx=ep_shard_idx,
         )
 
-    # fp8 dispatch: tokamax's layer with the rows replicated (use_sp=False), so
-    # it gathers nothing itself; with remote scatter its per-device result is
-    # already this rank's tokens, so the replicated layout's output all-gather
-    # is dropped.
+    # pyrefly: ignore[missing-import]
+    from tokamax._src.ops.experimental.routing_moe.common import layout_util
+
+    # The bridge gathers the rows itself (fp8 dispatch, or packing them before
+    # the gather) and runs tokamax's layer with the rows replicated
+    # (use_sp=False), so it gathers nothing itself; with remote scatter its
+    # per-device result is already this rank's tokens, so the replicated
+    # layout's output all-gather is dropped. pack_before_gather puts each
+    # rank's rows into tokamax's compact layout before the gather (a relayout
+    # of this rank's rows, not of the gathered array), which needs a tokamax
+    # that takes a 4-D compact x.
     class _LocalOutput(tk_config.RoutingMoEConfig):
         @property
         def output_collective(self):
@@ -317,15 +326,31 @@ def _routing_moe_jax(
         **{f.name: getattr(base, f.name) for f in dataclasses.fields(base)}
     )
 
+    def gather(a):
+        return lax.all_gather(a, EP_AXIS_NAME, axis=0, tiled=True)
+
+    def compact(a):
+        return a.reshape(layout_util.to_compact_shape(a.shape, a.dtype))
+
     def local(x_l, w_l, ids_l, w1_l, w2_l, s1_l, s2_l, idx_l):
-        q, scale = _quantize_rows(x_l)
-        q = lax.all_gather(q, EP_AXIS_NAME, axis=0, tiled=True)
-        scale = lax.all_gather(scale, EP_AXIS_NAME, axis=0, tiled=True)
+        if not use_fp8:
+            x_all = gather(compact(x_l))
+        elif pack_before_gather:
+            q, scale = _quantize_rows(x_l)
+            q_all = gather(compact(q))
+            scale_all = gather(scale).reshape(-1, 1, 1, 1)
+            x_all = (q_all.astype(jnp.float32) * scale_all).astype(x_l.dtype)
+            x_all = x_all.reshape(
+                layout_util.to_compact_shape((x_all.shape[0], x_l.shape[1]), x_l.dtype)
+            )
+        else:
+            q, scale = _quantize_rows(x_l)
+            x_all = _dequantize_rows(gather(q), gather(scale), x_l.dtype)
         ids_all = lax.all_gather(ids_l, EP_AXIS_NAME, axis=0, tiled=True)
         # _routing_moe_local slices this rank's weight rows back out.
         w_all = lax.all_gather(w_l, EP_AXIS_NAME, axis=0, tiled=True)
         return tk_modular._routing_moe_local(
-            _dequantize_rows(q, scale, x_l.dtype),
+            x_all,
             w_all,
             ids_all,
             w1_l,
@@ -365,6 +390,7 @@ def _build_op(
     fp8_dispatch: bool = False,
     gmm_plan: tuple = (),
     fp8_dispatch_min_rows: int = 0,
+    pack_before_gather: bool = False,
 ):
     key = (
         topk,
@@ -378,6 +404,7 @@ def _build_op(
         fp8_dispatch,
         gmm_plan,
         fp8_dispatch_min_rows,
+        pack_before_gather,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -444,6 +471,7 @@ def _build_op(
             fp8_dispatch=fp8_dispatch,
             gmm_plan=gmm_plan,
             fp8_dispatch_min_rows=fp8_dispatch_min_rows,
+            pack_before_gather=pack_before_gather,
         )
         return jax.shard_map(
             lambda out_l: layout.restore(out_l, EP_AXIS_NAME),
