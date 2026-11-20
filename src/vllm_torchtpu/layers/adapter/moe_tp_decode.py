@@ -54,6 +54,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.distributed import parallel_state
+from vllm_torchtpu.distributed import expert_placement
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
     fused_moe_prefill,
@@ -96,6 +97,10 @@ _BUFFERS = (
     "_moe_tp_decode_rank",
     "_moe_tp_decode_e0",
 )
+# An armed layer under a static expert placement: its slots table (logical ->
+# physical, replicated) and this rank's expert columns, int32 [1, local] (the
+# logical expert each local slot holds, per-rank data like the e0 buffer).
+_PLACED_BUFFERS = ("_moe_tp_decode_slots", "_moe_tp_decode_cols")
 # A wrong rank or mesh hangs the self-test's all-reduce: dump every stack and
 # exit instead.
 SELFTEST_TIMEOUT_S = 300
@@ -140,6 +145,9 @@ class _OpStatics:
     hbm_operands: bool = False
     # TPU_ONE_ROW_ALL_REDUCE: the in-kernel all-reduce's one-row path.
     ar_one_shot: bool = False
+    # A static expert placement (_PLACED_BUFFERS): routing stays in the
+    # router's logical order and the selected ids move after the top-k.
+    placed: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -374,10 +382,11 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
     )
 
 
-def _route(x, scores, bias, is_pad, st):
+def _route(x, scores, bias, is_pad, st, slots=None):
     """select_experts as the unarmed path runs it (ids from the biased scores,
     renormalized unbiased weights in bf16), then
-    zero_routing_weights_for_padding: (weights, ids)."""
+    zero_routing_weights_for_padding: (weights, ids). `slots` (a placement's
+    logical -> physical table) moves the selected ids after the top-k."""
     bias = bias.astype(jnp.float32)
     if st.router_bias:
         w, ids = router_select_bias(scores, bias[None, :], st.topk)
@@ -389,6 +398,8 @@ def _route(x, scores, bias, is_pad, st):
     total = jnp.where(jnp.isnan(total), total, jnp.maximum(total, _SUM_FLOOR))
     w = (w / total).astype(x.dtype)
     w = jnp.where(is_pad[:, None], jnp.zeros_like(w), w)
+    if slots is not None:
+        ids = jnp.take(slots, ids, axis=0)
     return w, ids
 
 
@@ -409,6 +420,7 @@ def _prefill_chain(
     axis,
     x_q=None,
     x_scale=None,
+    slots=None,
 ):
     """The layer's output, summed over `axis`, from the fused MoE prefill
     kernel (FUSED_MOE_PREFILL_KERNEL) on this op's routing, as
@@ -431,7 +443,7 @@ def _prefill_chain(
         " (V2, stage A)" if prefill is fused_moe_prefill_stage_a else "",
         x.shape[0],
     )
-    w, ids = _route(x, scores, bias, is_pad, st)
+    w, ids = _route(x, scores, bias, is_pad, st, slots)
     prequant = {}
     if x_q is not None and prefill is fused_moe_prefill_stage_a:
         prequant = {"x_q": x_q, "x_scale": x_scale}
@@ -456,13 +468,27 @@ def _prefill_chain(
 
 
 def _tp_chain(
-    x, scores, bias, is_pad, w13, w2, s13, s2, sw13, ss13, sw2, ss2, st, e0=None
+    x,
+    scores,
+    bias,
+    is_pad,
+    w13,
+    w2,
+    s13,
+    s2,
+    sw13,
+    ss13,
+    sw2,
+    ss2,
+    st,
+    e0=None,
+    slots=None,
 ):
     """This rank's partial as the unarmed path computes it: _route,
     fused_moe_func (under EP with experts_start e0, so the SparseCore EP
     dispatch and combine), the shared expert's two quantized linears around
     SiluAndMul, and shared + scale * routed in bf16."""
-    w, ids = _route(x, scores, bias, is_pad, st)
+    w, ids = _route(x, scores, bias, is_pad, st, slots)
     routed = fused_moe_func(
         x,
         w13,
@@ -509,8 +535,12 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
         ss2,
         rank,
         e0,
-        *prequant,
+        *extra,
     ):
+        # _PLACED_BUFFERS under a placement, else the optional prequant rows.
+        slots, cols = extra if statics.placed else (None, None)
+        prequant = () if statics.placed else extra
+        columns = None if cols is None else cols.reshape(-1)
         n = x.shape[0]  # static: torch_tpu exports one program per token count
         is_pad = pad_mask[:n]  # replicated, so n_valid agrees on every rank
         n_valid = n - jnp.sum(is_pad.astype(jnp.int32))
@@ -548,6 +578,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                     fast=statics.fast,
                     hbm_operands=statics.hbm_operands,
                     ar_one_shot=statics.ar_one_shot,
+                    expert_columns=columns,
                 )[:n]
         if kernel.can_use_moe_tp_decode(
             x,
@@ -572,12 +603,15 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 fast=statics.fast,
                 hbm_operands=statics.hbm_operands,
                 ar_one_shot=statics.ar_one_shot,
+                expert_columns=columns,
             )
         if statics.prefill_above is not None and n > statics.prefill_above:
             return _prefill_chain(
-                x, scores, bias, is_pad, *weights, statics, axis, *prequant
+                x, scores, bias, is_pad, *weights, statics, axis, *prequant, slots=slots
             ).astype(x.dtype)
-        partial = _tp_chain(x, scores, bias, is_pad, *weights, statics, e0.reshape(()))
+        partial = _tp_chain(
+            x, scores, bias, is_pad, *weights, statics, e0.reshape(()), slots
+        )
         return lax.psum(partial, axis)
 
     return body
@@ -591,10 +625,15 @@ def _get_op(mesh, statics: _OpStatics, prequant: bool = False):
     op = _OPS.get(key)
     if op is not None:
         return op
+    if prequant and statics.placed:
+        raise NotImplementedError("the prequant op does not take an expert placement")
     axis = mesh.axis_names[0]
     # Operands as moe_tp_decode_forward passes them; bias and the padding mask
-    # are replicated, everything else is per rank.
+    # (and a placement's slots table) are replicated, everything else is per
+    # rank.
     specs = (P(axis), P(axis), P(), P()) + (P(axis),) * (12 if prequant else 10)
+    if statics.placed:
+        specs += (P(), P(axis))
     body = _op_body(statics, int(mesh.size), axis)
 
     sharded = jax.shard_map(
@@ -664,13 +703,50 @@ def _get_op(mesh, statics: _OpStatics, prequant: bool = False):
             x_scale,
         )
 
+    def fn_placed(
+        x: jax.Array,
+        scores: jax.Array,
+        bias: jax.Array,
+        pad_mask: jax.Array,
+        w13: jax.Array,
+        w2: jax.Array,
+        s13: jax.Array,
+        s2: jax.Array,
+        sw13: jax.Array,
+        ss13: jax.Array,
+        sw2: jax.Array,
+        ss2: jax.Array,
+        rank: jax.Array,
+        e0: jax.Array,
+        slots: jax.Array,
+        cols: jax.Array,
+    ) -> jax.Array:
+        return run(
+            x,
+            scores,
+            bias,
+            pad_mask,
+            w13,
+            w2,
+            s13,
+            s2,
+            sw13,
+            ss13,
+            sw2,
+            ss2,
+            rank,
+            e0,
+            slots,
+            cols,
+        )
+
     name = "pallas::moe_tp_decode" + (f"_{len(_OPS)}" if _OPS else "")
     # torch_tpu annotates the partition specs as tuples of axis-name tuples, but
     # jax_op takes PartitionSpecs at runtime, as main's other call sites pass them.
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
         name,
-        fn_prequant if prequant else fn,
+        fn_placed if statics.placed else fn_prequant if prequant else fn,
         mesh=mesh,
         input_partition_specs=specs,
         output_partition_specs=P(axis),
@@ -872,6 +948,15 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
         for name, tensor in zip(_BUFFERS, (*adm.shared, bias, rank, e0)):
             layer.register_buffer(name, tensor, persistent=False)
         statics = adm.statics
+        slots = getattr(layer, expert_placement.SLOTS_ATTR, None)
+        if slots is not None:
+            local = layer.w13_weight.shape[0]
+            start = adm.experts_start
+            cols = torch.argsort(slots.cpu())[start : start + local]
+            placed = (slots, cols.to(torch.int32).view(1, local).to(slots.device))
+            for name, tensor in zip(_PLACED_BUFFERS, placed):
+                layer.register_buffer(name, tensor, persistent=False)
+            statics = dataclasses.replace(statics, placed=True)
         # TPU_MOE_TP_DECODE_HBM_OPERANDS: "drafter" (MTP layer only) or "all".
         mode = envs.TPU_MOE_TP_DECODE_HBM_OPERANDS
         if mode not in ("", "0", "drafter", "all"):
@@ -923,7 +1008,9 @@ def moe_tp_decode_forward(
     slot = getattr(layer, PREQUANT_MOE_ATTR, None)
     prequant = None if slot is None else slot.value
     op = getattr(quant_method, _OP_ATTR)
-    extra: tuple = ()
+    extra: tuple = tuple(
+        getattr(layer, n) for n in _PLACED_BUFFERS if hasattr(layer, n)
+    )
     if slot is not None and prequant is not None:
         slot.value = None
         op = getattr(quant_method, _OP_PREQUANT_ATTR)

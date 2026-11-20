@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Static expert placement: LPT tables and the table tool
-(`distributed/expert_placement.py`)."""
+"""Static expert placement: LPT tables, their validation, and the checkpoint
+relabelling (`distributed/expert_placement.py`)."""
 
 import json
+import re
 
 import numpy as np
 import pytest
@@ -39,6 +40,41 @@ def _group_load(rows, slot):
     return load
 
 
+def _table(slots, **over):
+    t = dict(
+        format=ep_place.TABLE_FORMAT,
+        num_experts=E,
+        ep_size=EP,
+        ep_tp_size=TP,
+        layers={str(k): np.asarray(v).tolist() for k, v in slots.items()},
+    )
+    t.update(over)
+    return t
+
+
+def _load(table):
+    return ep_place.ExpertPlacement.from_table(
+        table, num_experts=E, moe_layers=LAYERS, ep_size=EP, ep_tp_size=TP
+    )
+
+
+def _checkpoint(seed):
+    rng = np.random.default_rng(seed)
+    out = []
+    for layer in LAYERS:
+        p = f"model.layers.{layer}.mlp"
+        out.append((f"{p}.gate.weight", torch.randn(E, 16, dtype=torch.bfloat16)))
+        out.append((f"{p}.gate.e_score_correction_bias", torch.randn(E)))
+        out.append((f"{p}.shared_experts.gate_proj.weight", torch.randn(8, 16)))
+        for e in range(E):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                for suffix in ("weight", "weight_scale_inv"):
+                    out.append((f"{p}.experts.{e}.{proj}.{suffix}", torch.randn(2, 2)))
+    out.append(("model.layers.0.mlp.gate_proj.weight", torch.randn(8, 16)))
+    out.append(("model.norm.weight", torch.from_numpy(rng.standard_normal(16))))
+    return out
+
+
 def test_lpt_balances_the_groups_and_is_a_permutation():
     rows = _skewed_rows(0)
     slot = ep_place.lpt_slots(rows, EP, TP)
@@ -53,6 +89,63 @@ def test_lpt_balances_the_groups_and_is_a_permutation():
     assert _group_load(np.full(E, 7), balanced).tolist() == [56] * (EP // TP)
 
 
+def test_identity_table_relabels_nothing():
+    ckpt = _checkpoint(1)
+    ident = _load(_table({k: np.arange(E) for k in LAYERS}))
+    out = list(ident.relabel(iter(ckpt)))
+    assert [n for n, _ in out] == [n for n, _ in ckpt]
+    for (_, a), (_, b) in zip(ckpt, out):
+        assert a.dtype == b.dtype and torch.equal(a, b)
+    for name, _ in ckpt:
+        m = re.search(r"\.mlp\.experts\.(\d+)\.", name)
+        assert ident.physical_expert_id(name) == (m and int(m.group(1)))
+
+
+def test_permutation_moves_experts_and_keeps_the_router():
+    rng = np.random.default_rng(2)
+    slots = {k: rng.permutation(E) for k in LAYERS}
+    place = _load(_table(slots))
+    ckpt = dict(_checkpoint(3))
+    out = dict(place.relabel(iter(ckpt.items())))
+    assert len(out) == len(ckpt)
+    for layer, s in slots.items():
+        p = f"model.layers.{layer}.mlp"
+        # Routing stays logical: the ids move after the top-k.
+        for name in (f"{p}.gate.weight", f"{p}.gate.e_score_correction_bias"):
+            assert out[name] is ckpt[name]
+        for e in range(E):
+            src = f"{p}.experts.{e}.down_proj.weight_scale_inv"
+            dst = f"{p}.experts.{s[e]}.down_proj.weight_scale_inv"
+            assert torch.equal(out[dst], ckpt[src])
+            assert place.physical_expert_id(src) == s[e]
+    shared = "model.layers.3.mlp.shared_experts.gate_proj.weight"
+    assert out[shared] is ckpt[shared]
+    assert (
+        out["model.layers.0.mlp.gate_proj.weight"]
+        is ckpt["model.layers.0.mlp.gate_proj.weight"]
+    )
+
+
+@pytest.mark.parametrize(
+    "table, match",
+    [
+        (_table({3: np.arange(E), 4: np.arange(E)}, format="x"), "is for"),
+        (_table({3: np.arange(E), 4: np.arange(E)}, num_experts=16), "is for"),
+        (_table({3: np.arange(E), 4: np.arange(E)}, ep_size=16), "is for"),
+        (_table({3: np.arange(E), 4: np.arange(E)}, ep_tp_size=1), "is for"),
+        (_table({3: np.arange(E)}), "MoE layers"),
+        (_table({3: np.arange(E), 4: np.arange(E), 5: np.arange(E)}), "MoE layers"),
+        (_table({3: np.arange(E), 4: np.r_[np.arange(E - 1), 0]}), "permutation"),
+        (_table({3: np.arange(E), 4: np.arange(E - 1)}), "permutation"),
+        (_table({3: np.arange(E), 4: np.arange(E) + 0.5}), "permutation"),
+        (_table({3: np.arange(E)}, layers={"3": list(range(E)), "x": []}), "maps"),
+    ],
+)
+def test_malformed_or_mismatched_tables_raise(table, match):
+    with pytest.raises(ValueError, match=match):
+        _load(table)
+
+
 def test_table_tool_writes_lpt_of_the_dump(tmp_path):
     stats = dict(
         format=ep_place.STATS_FORMAT,
@@ -63,17 +156,26 @@ def test_table_tool_writes_lpt_of_the_dump(tmp_path):
     )
     (tmp_path / "stats.json").write_text(json.dumps(stats))
     ep_place.main([str(tmp_path / "stats.json"), str(tmp_path / "table.json")])
-    assert json.loads((tmp_path / "table.json").read_text()) == dict(
-        format=ep_place.TABLE_FORMAT,
-        num_experts=E,
-        ep_size=EP,
-        ep_tp_size=TP,
-        layers={
-            str(k): ep_place.lpt_slots(_skewed_rows(k), EP, TP).tolist() for k in LAYERS
-        },
-    )
+    place = _load(json.loads((tmp_path / "table.json").read_text()))
+    for k in LAYERS:
+        assert (
+            place.slots[k].tolist()
+            == ep_place.lpt_slots(_skewed_rows(k), EP, TP).tolist()
+        )
     with pytest.raises(ValueError, match="dump"):
         ep_place.table_from_stats(dict(stats, format="x"))
+
+
+def test_physical_ids_map_selected_experts_through_the_slots():
+    slots = np.random.default_rng(4).permutation(E)
+    layer = torch.nn.Module()
+    ids = torch.randint(0, E, (5, 3), dtype=torch.int32)
+    assert ep_place.physical_ids(layer, ids) is ids
+    layer.register_buffer(ep_place.SLOTS_ATTR, torch.tensor(slots, dtype=torch.int32))
+    got = ep_place.physical_ids(layer, ids)
+    assert got.dtype == ids.dtype and torch.equal(
+        got, torch.tensor(slots)[ids.long()].int()
+    )
 
 
 _HANDED: dict = {}
@@ -108,13 +210,32 @@ def _adapters(monkeypatch):
 def test_ops_handed_to_jax_op_are_annotated_and_alias_nothing(monkeypatch):
     import jax
     import jax.numpy as jnp
+    from jax.sharding import Mesh
 
-    _, moe_prefill_sp, _ = _adapters(monkeypatch)
+    fused_moe_ep, moe_prefill_sp, moe_tp_decode = _adapters(monkeypatch)
     monkeypatch.setattr(moe_prefill_sp, "jax_op", _check_annotated)
+    monkeypatch.setattr(fused_moe_ep, "jax_op", _check_annotated)
+    monkeypatch.setattr(moe_tp_decode.pallas, "jax_op", _check_annotated)
     monkeypatch.setattr(moe_prefill_sp, "_LOAD_OPS", {})
+    monkeypatch.setattr(fused_moe_ep, "_OPS", {})
+    monkeypatch.setattr(moe_tp_decode, "_OPS", {})
     _HANDED.clear()
     moe_prefill_sp._build_load_op(8)
-    assert len(_HANDED) == 1, sorted(_HANDED)
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ("d",))
+    fused_moe_ep._build_op(
+        mesh, 8, True, "silu", None, True, has_score_bias=True, has_expert_slots=True
+    )
+    statics = moe_tp_decode._OpStatics(
+        topk=8,
+        routed_scale=1.0,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        use_ep=True,
+        placed=True,
+    )
+    moe_tp_decode._get_op(mesh, statics)
+    assert len(_HANDED) == 3, sorted(_HANDED)
     # The counter's program: no donated operand, no input/output alias.
     (count,) = (f for n, f in _HANDED.items() if "load_counts" in n)
     avals = (
@@ -150,3 +271,59 @@ def test_load_counts_accumulate_into_the_buffer(monkeypatch):
     assert getattr(mlp, moe_prefill_sp.LOAD_ATTR) is buf
     assert returned[0] is not buf
     assert torch.equal(buf, torch.arange(E, dtype=torch.int32) + 1)
+
+
+def test_active_validates_a_dumped_table_without_a_current_vllm_config(
+    tmp_path, monkeypatch
+):
+    # vLLM calls load_model with no current config; a config-less lookup of
+    # the EP x TP split answers 1, while the dump writes the served split.
+    from types import SimpleNamespace
+
+    import vllm.config
+
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    monkeypatch.setattr(
+        vllm.config, "get_current_vllm_config_or_none", lambda: None, raising=False
+    )
+    monkeypatch.setattr(moe_hierarchical, "_default_ep_tp", None)
+    monkeypatch.setattr(ep_place, "_PLACEMENT", {})
+    assert moe_hierarchical.ep_tp_size() == 1
+    parallel = SimpleNamespace(
+        enable_expert_parallel=True,
+        enable_eplb=False,
+        data_parallel_size=1,
+        prefill_context_parallel_size=1,
+        expert_placement_strategy="linear",
+        tensor_parallel_size=16,
+        use_sequence_parallel_moe=False,
+    )
+    hf = SimpleNamespace(
+        num_hidden_layers=5,
+        first_k_dense_replace=3,
+        architectures=["GlmMoeDsaForCausalLM"],
+    )
+    path = tmp_path / "table.json"
+    cfg = SimpleNamespace(
+        additional_config={ep_place.CONFIG_KEY: str(path)},
+        parallel_config=parallel,
+        load_config=SimpleNamespace(load_format="runai_streamer"),
+        model_config=SimpleNamespace(get_num_experts=lambda: E, hf_config=hf),
+    )
+    served = moe_hierarchical.ep_tp_size_for(cfg)
+    assert served == 2
+    slots = np.random.default_rng(6).permutation(E)
+    path.write_text(
+        json.dumps(
+            dict(
+                format=ep_place.TABLE_FORMAT,
+                num_experts=E,
+                ep_size=16,
+                ep_tp_size=served,
+                layers={"3": slots.tolist(), "4": list(range(E))},
+            )
+        )
+    )
+    place = ep_place.active(cfg)
+    assert np.array_equal(place.slots[3], slots) and len(place.slots) == 2

@@ -64,6 +64,11 @@ local experts are compacted, and a ring item is one (expert, _I_CHUNK-column
 chunk of I) pair: the gate and up chunks of w13 and the matching w2 rows, so
 VMEM per slot is the TP16 slot whatever I is. The all-reduce still sums every
 rank, so each rank's partial covers its experts x its columns.
+
+Expert placement (expert_columns): local expert e answers to routing column
+expert_columns[e] instead of experts_start + e, so the router keeps its own
+(logical) column order and tie rule while the weights sit wherever a static
+placement put them; only the three lookups of a local expert's column change.
 """
 
 import functools
@@ -125,6 +130,30 @@ class _Meta:
 
 def _split_entry(n_valid_ref, rank_ref, e0_ref, *refs, **kwargs):
     return _kernel(_Meta((n_valid_ref, rank_ref, e0_ref)), *refs, **kwargs)
+
+
+def _placed_entry(
+    n_valid_ref,
+    rank_ref,
+    e0_ref,
+    cols_s_ref,
+    x_ref,
+    scores_ref,
+    bias_ref,
+    cols_v_ref,
+    *refs,
+    **kwargs,
+):
+    """_split_entry with expert_columns, in SMEM and as a lane vector."""
+    return _kernel(
+        _Meta((n_valid_ref, rank_ref, e0_ref)),
+        x_ref,
+        scores_ref,
+        bias_ref,
+        *refs,
+        columns=(cols_s_ref, cols_v_ref),
+        **kwargs,
+    )
 
 
 def _i_chunk(i: int, max_i_chunk: int = _I_CHUNK) -> int:
@@ -202,6 +231,7 @@ def kernel_name(
     nb=None,
     ic=None,
     split_meta=True,
+    placed=False,
 ) -> str:
     if nb is None:
         nb = _NUM_BUFFERS
@@ -222,6 +252,8 @@ def kernel_name(
         name += "-fast"
     if ar_one_shot:
         name += "-os"
+    if placed:
+        name += "-pl"
     return name
 
 
@@ -380,15 +412,16 @@ def _route_fast(scores, bias, n_valid, *, topk):
     return jnp.where(jnp.logical_and(chosen, valid), w.astype(jnp.float32), 0.0), flag
 
 
-def _compact_vector(wtab, e0, local):
+def _compact_vector(wtab, e0, local, columns=None):
     """The compaction on the vector units: ([1, W] f32, [1, 1] f32) = the local
     ids (0 <= id < local) of the experts any row of wtab picked, ascending, in
     lanes [0, count), and count; W = local rounded up to the lane count.
 
     A one-hot matmul moves the window [e0, e0 + local) of the hit row to lanes
-    [0, local) (e0 is runtime data); expert e is the j-th active one when j
-    experts below it are hit and it is hit. All sums are of 0/1 values or of
-    one id, so f32 holds them exactly."""
+    [0, local) (e0 is runtime data), or column columns[0, e] to lane e when
+    the [1, W] int32 `columns` (expert_columns) is given; expert e is the j-th
+    active one when j experts below it are hit and it is hit. All sums are of
+    0/1 values or of one id, so f32 holds them exactly."""
     f32 = jnp.float32
     e_pad = wtab.shape[1]
     lanes = 128
@@ -396,7 +429,8 @@ def _compact_vector(wtab, e0, local):
     hit = jnp.any(wtab != 0, axis=0, keepdims=True).astype(f32)
     rows = lax.broadcasted_iota(jnp.int32, (e_pad, w), 0)
     cols = lax.broadcasted_iota(jnp.int32, (e_pad, w), 1)
-    window = jnp.where(jnp.logical_and(rows == cols + e0, cols < local), 1.0, 0.0)
+    source = cols + e0 if columns is None else jnp.broadcast_to(columns, (e_pad, w))
+    window = jnp.where(jnp.logical_and(rows == source, cols < local), 1.0, 0.0)
     loc = jnp.dot(
         jnp.broadcast_to(hit, (8, e_pad)), window, preferred_element_type=f32
     )[0:1]
@@ -500,6 +534,7 @@ def _kernel(
     routed_scale,
     ar_spec,
     fast=False,
+    columns=None,
 ):
     all_reduce.prologue(ar_spec)
     m, h = x_ref.shape
@@ -511,6 +546,10 @@ def _kernel(
     rank = meta_ref[1]
     # First global expert this rank holds (0 under plain TP).
     e0 = meta_ref[2]
+
+    def column(e):
+        """The routing column local expert e answers to."""
+        return e0 + e if columns is None else columns[0][e]
 
     # The shared slice does not depend on routing: load it first.
     shared_copies = (
@@ -534,7 +573,12 @@ def _kernel(
     def store_active():
         # Rows 2 and 3 of the hit table: the active local experts, ascending,
         # and their count (the vector compaction replaces the scalar one).
-        ids, n_active = _compact_vector(wtab_ref[...], e0, local_experts)
+        ids, n_active = _compact_vector(
+            wtab_ref[...],
+            e0,
+            local_experts,
+            None if columns is None else columns[1][...],
+        )
         hits_v_ref[2:3, 0 : ids.shape[1]] = ids.astype(jnp.int32)
         hits_v_ref[3:4, :] = jnp.broadcast_to(
             n_active, (1, hits_v_ref.shape[1])
@@ -612,8 +656,7 @@ def _kernel(
         # Appends expert e to active_ids_ref if any row picked it. The store
         # is unconditional, so the loop body has no branch: count <= e, a
         # later hit overwrites the entry, and no read touches one >= count.
-        # Local expert e is global column e0 + e.
-        hit = hits_s_ref[0, e0 + e] != 0
+        hit = hits_s_ref[0, column(e)] != 0
         active_ids_ref[count] = e
         return count + hit.astype(jnp.int32)
 
@@ -686,10 +729,10 @@ def _kernel(
 
     def finish(step, slot, acc1):
         e = active(lax.div(step, nc)) if nc > 1 else active(step)
-        # Each row's routing weight for expert e (global column e0 + e of the
-        # routing table, 0 for rows that did not pick it).
+        # Each row's routing weight for expert e (its column of the routing
+        # table, 0 for rows that did not pick it).
         coeff = jnp.sum(
-            jnp.where(expert_columns == e0 + e, wtab_ref[...], 0.0),
+            jnp.where(expert_columns == column(e), wtab_ref[...], 0.0),
             axis=1,
             keepdims=True,
         )
@@ -820,6 +863,7 @@ def moe_tp_decode(
     ar_one_shot: bool = False,
     max_i_chunk: int = _I_CHUNK,
     split_meta: bool = True,
+    expert_columns=None,
 ):
     """The layer's bf16 [N, D] output, summed over the n_ranks TP ranks.
 
@@ -852,6 +896,9 @@ def moe_tp_decode(
         one valid row exchanges it in one round instead of two. Same bits.
       max_i_chunk: upper bound on intermediate columns per ring item.
       split_meta: pass n_valid / rank / experts_start as three [1] scalars.
+      expert_columns: int32 [El] or None, the routing column of each local
+        expert under a static expert placement (module docstring); None is
+        experts_start + arange(El). Needs split_meta.
 
     Returns:
       bf16(sum over ranks of each rank's shared + routed_scale * routed),
@@ -883,6 +930,12 @@ def moe_tp_decode(
     if e_pad != num_experts:
         scores = jnp.pad(scores, ((0, 0), (0, e_pad - num_experts)))
         bias = jnp.pad(bias, (0, e_pad - num_experts), constant_values=-jnp.inf)
+    placed = expert_columns is not None
+    if placed and (not split_meta or expert_columns.shape != (experts,)):
+        raise ValueError(
+            f"expert_columns needs split_meta and one column per local expert "
+            f"({experts}); got {tuple(expert_columns.shape)}"
+        )
     if split_meta:
         metas = tuple(
             jnp.asarray(v, jnp.int32).reshape(1) for v in (n_valid, rank, experts_start)
@@ -913,9 +966,18 @@ def moe_tp_decode(
         weights = tuple(
             pltpu.with_memory_space_constraint(w, pltpu.HBM) for w in weights
         )
+    columns, column_specs, column_vecs = (), [], ()
+    if placed:
+        cols = expert_columns.astype(jnp.int32)
+        w = pl.cdiv(experts, info.num_lanes) * info.num_lanes
+        # Lanes past the local experts match no routing column.
+        columns = (cols,)
+        column_specs = [vmem]
+        column_vecs = (jnp.pad(cols, (0, w - experts), constant_values=-1)[None],)
+    entry = _placed_entry if placed else _split_entry if split_meta else _kernel
     return pl.pallas_call(
         functools.partial(
-            _split_entry if split_meta else _kernel,
+            entry,
             local_experts=experts,
             n_chunks=i // ic,
             topk=topk,
@@ -925,8 +987,8 @@ def moe_tp_decode(
         ),
         out_shape=jax.ShapeDtypeStruct((m, h), x.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=len(metas),
-            in_specs=[vmem, vmem, vmem, *[hbm] * 8],
+            num_scalar_prefetch=len(metas) + len(columns),
+            in_specs=[vmem, vmem, vmem, *column_specs, *[hbm] * 8],
             out_specs=vmem,
             scratch_shapes=[
                 pltpu.VMEM((nb, h, 2 * ic), FP8),
@@ -968,11 +1030,14 @@ def moe_tp_decode(
             nb=nb,
             ic=ic,
             split_meta=split_meta,
+            placed=placed,
         ),
     )(
         *metas,
+        *columns,
         x,
         scores,
         bias.reshape(1, e_pad),
+        *column_vecs,
         *weights,
     )

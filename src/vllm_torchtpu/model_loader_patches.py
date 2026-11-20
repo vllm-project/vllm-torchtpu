@@ -61,6 +61,7 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed import expert_placement
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -72,10 +73,19 @@ logger = init_logger(__name__)
 _EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
 
 
-def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
+def _should_skip(
+    name: str,
+    local_expert_ids: set[int],
+    placement: "expert_placement.ExpertPlacement | None" = None,
+) -> bool:
     from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
 
-    expert_id = parse_expert_id(name)
+    # Under a placement a rank keeps the experts it holds in physical order.
+    expert_id = (
+        parse_expert_id(name)
+        if placement is None
+        else placement.physical_expert_id(name)
+    )
     if expert_id is None:
         return False
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
@@ -165,6 +175,7 @@ def _sharded_runai_weights_iterator(
     hf_weights_files: list[str],
     local_expert_ids: set[int],
     use_tqdm_on_load: bool,
+    placement: "expert_placement.ExpertPlacement | None" = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Stream only this rank's tensors from the safetensors files.
 
@@ -216,7 +227,7 @@ def _sharded_runai_weights_iterator(
         for path, meta in zip(hf_weights_files, metas):
             pos = meta.offset
             for tensor_meta, size in zip(meta.tensors_metadata, meta.read_sizes):
-                if _should_skip(tensor_meta.name, local_expert_ids):
+                if _should_skip(tensor_meta.name, local_expert_ids, placement):
                     skipped += 1
                     skipped_bytes += size
                     # A zero-byte skip leaves the byte stream contiguous, so
@@ -314,6 +325,13 @@ def patch_runai_sharded_expert_streaming() -> None:
     original_get_iterator = rsl.RunaiModelStreamerLoader._get_weights_iterator
 
     def _get_weights_iterator(self, model_or_path: str, revision: str | None):
+        from vllm.config import get_current_vllm_config
+
+        placement = expert_placement.active(get_current_vllm_config())
+        weights = _local_weights_iterator(self, model_or_path, revision, placement)
+        return weights if placement is None else placement.relabel(weights)
+
+    def _local_weights_iterator(self, model_or_path, revision, placement):
         try:
             local_expert_ids = _compute_local_expert_ids()
         except AttributeError:
@@ -343,7 +361,10 @@ def patch_runai_sharded_expert_streaming() -> None:
             )
         hf_weights_files = self._prepare_weights(model_or_path, revision)
         return _sharded_runai_weights_iterator(
-            hf_weights_files, local_expert_ids, self.load_config.use_tqdm_on_load
+            hf_weights_files,
+            local_expert_ids,
+            self.load_config.use_tqdm_on_load,
+            placement,
         )
 
     rsl.RunaiModelStreamerLoader._get_weights_iterator = _get_weights_iterator

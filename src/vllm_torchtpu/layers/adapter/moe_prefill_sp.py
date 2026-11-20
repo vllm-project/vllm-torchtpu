@@ -421,6 +421,7 @@ def _moe(mlp: Any, x: torch.Tensor, num_tokens: int, tp: int) -> torch.Tensor:
         router_logits,
         rank,
         experts.e_score_correction_bias,
+        getattr(experts, expert_placement.SLOTS_ATTR, None),
     )
     scale = getattr(mlp, SCALE_ATTR)
     if scale != 1.0:

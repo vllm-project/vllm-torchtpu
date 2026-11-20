@@ -37,6 +37,8 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_prefill_only_kv_len_threshold"
 )
 
+# (expert_placement.CONFIG_KEY stays hashed by path: a placed program differs
+# from an unplaced one in operand arity only and reads the table as a buffer.)
 # Diagnostics-only knob: it steers profiling and never changes the compiled
 # graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps it out of the
 # TPU compile cache key.
