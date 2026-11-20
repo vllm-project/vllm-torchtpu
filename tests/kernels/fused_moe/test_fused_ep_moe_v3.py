@@ -578,7 +578,9 @@ def test_the_tables_program_addresses_every_mesh_axis(one_cpu_shard, monkeypatch
     """On a mesh with a replica axis, the transport rounds the shard-tables
     program hosts address peers by every axis, as the start program's do:
     an exchange keyed on the expert axis alone gives remote copies a
-    one-coordinate device id on a two-axis mesh."""
+    one-coordinate device id on a two-axis mesh. The replica axis has size
+    1 (more than one replica is refused), so this checks only that every
+    axis is named in the device ids, not that a real replica mesh runs."""
     from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, transport
 
     seen = []
@@ -902,8 +904,8 @@ def _run_case(name, mode, result_rows):
     x, logits, w1, w2, s1, s2 = _world(experts, real, routing)
     mesh = Mesh(np.asarray(jax.devices()[:D]), (MESH_AXIS,))
     sharded = NamedSharding(mesh, P(MESH_AXIS))
-    weights = _with_copy_slots((w1, w2, s1, s2), COPY_SLOTS.get(name, 0))
-    args = [jax.device_put(a, sharded) for a in (x, *weights, logits)]
+    expert_weights = _with_copy_slots((w1, w2, s1, s2), COPY_SLOTS.get(name, 0))
+    args = [jax.device_put(a, sharded) for a in (x, *expert_weights, logits)]
     valid = [real - (short if d % 2 else 0) for d in range(D)]
     config = Config(result_rows=result_rows, sorted_rows=sorted_rows)
     shard_index = jnp.arange(D, dtype=jnp.int32).reshape(D, 1) if bridge else None
