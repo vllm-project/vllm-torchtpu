@@ -377,17 +377,14 @@ def test_hook_writes_the_page_only_where_it_applies(monkeypatch, layout, page):
     logger.warning_once.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "layout,written", [("HND", True), ("NHD", False), (None, False)]
-)
-def test_hook_reads_the_layout_vllm_will_resolve(monkeypatch, layout, written):
-    """vLLM runs the hook before it resolves the layout, so the hook reads
-    VLLM_KV_CACHE_LAYOUT when the cache config holds none yet."""
+def _hook_engine(monkeypatch, layout):
+    """A Qwen3.5-397B producer for the hook alone, with VLLM_KV_CACHE_LAYOUT
+    set to `layout` (unset for None) and no layout on the cache config."""
     if layout is None:
         monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     else:
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", layout)
-    config = SimpleNamespace(
+    return SimpleNamespace(
         kv_transfer_config=SimpleNamespace(kv_role="kv_producer"),
         parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
         model_config=SimpleNamespace(
@@ -396,6 +393,9 @@ def test_hook_reads_the_layout_vllm_will_resolve(monkeypatch, layout, written):
         cache_config=SimpleNamespace(kv_cache_layout=None),
         additional_config={},
     )
+
+
+def _apply_hook(config):
     from vllm import envs as vllm_envs
 
     was_cached = vllm_envs._is_envs_cache_enabled()
@@ -405,7 +405,55 @@ def test_hook_reads_the_layout_vllm_will_resolve(monkeypatch, layout, written):
     finally:
         if was_cached:
             vllm_envs.enable_envs_cache()
+
+
+@pytest.mark.parametrize(
+    "layout,written",
+    [("HND", True), ("LBHNC", True), ("NHD", False), ("LBNHC", False), (None, False)],
+)
+def test_hook_reads_the_layout_vllm_will_resolve(monkeypatch, layout, written):
+    """vLLM runs the hook before it resolves the layout, so the hook reads
+    VLLM_KV_CACHE_LAYOUT when the cache config holds none yet, under its
+    legacy name or its layout name alike."""
+    config = _hook_engine(monkeypatch, layout)
+    _apply_hook(config)
     assert ("tpu_kv_transfer" in config.additional_config) is written
+
+
+def test_the_hook_reads_layout_names_as_vllm_does():
+    """For every name vLLM accepts, the hook's reading is vLLM's; an unknown
+    name is refused by both. vLLM's parser is private, so only this test
+    imports it: a change to vLLM's names fails here, not at plugin load."""
+    from vllm.config.cache import _LAYOUT_COMPAT_ALIASES, _layout_from_name
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    assert qwen3_5_hooks._KV_LAYOUT_ALIASES == _LAYOUT_COMPAT_ALIASES
+    names = [m.name for m in KVCacheLayout] + list(_LAYOUT_COMPAT_ALIASES)
+    assert {n: qwen3_5_hooks._kv_layout(n) for n in names} == {
+        n: _layout_from_name(n) for n in names
+    }
+    # Names are case- and space-sensitive in vLLM, so every variant of a
+    # valid name is refused by both, as are other strings.
+    variants = {
+        v
+        for n in names
+        for v in (n.lower(), n.capitalize(), f" {n}", f"{n} ", f"{n}\n")
+        if v not in names
+    }
+    for name in sorted(variants | {"HDN", "ND", "", "LB"}):
+        with pytest.raises(ValueError, match="Unknown KV cache layout"):
+            qwen3_5_hooks._kv_layout(name)
+        with pytest.raises(ValueError):
+            _layout_from_name(name)
+
+
+@pytest.mark.parametrize("layout", ["HDN", ""])
+def test_a_misspelt_layout_fails_with_vllms_message(monkeypatch, layout):
+    """vLLM refuses a VLLM_KV_CACHE_LAYOUT outside its choices when the hook
+    reads it, naming the variable and the valid values."""
+    config = _hook_engine(monkeypatch, layout)
+    with pytest.raises(ValueError, match="VLLM_KV_CACHE_LAYOUT.*Valid options"):
+        _apply_hook(config)
 
 
 def test_pcp_engine_honours_the_setting(monkeypatch):

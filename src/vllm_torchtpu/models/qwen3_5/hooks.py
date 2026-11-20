@@ -53,10 +53,19 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
 from jax.experimental.pallas import tpu as pltpu
+from vllm import envs as vllm_envs
 from vllm.model_executor.models.config import Qwen3_5ForConditionalGenerationConfig
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_torchtpu import additional_config_sections, tpu_info
 from vllm_torchtpu.core.scheduler_utils import kv_roles
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    configs as batched_rpa_configs,
+)
+from vllm_torchtpu.layers.adapter.attention import (
+    KV_LAYOUT_BY_VLLM_LAYOUT,
+    KV_TRANSFER_SECTION,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.qwen3_5 import settings
 
@@ -130,8 +139,23 @@ def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
     cache_config.prefix_match_unit = 128
 
 
-# vLLM's compatibility names for two KV cache layouts (VLLM_KV_CACHE_LAYOUT).
+# vLLM's legacy names for two KV cache layouts, which VLLM_KV_CACHE_LAYOUT
+# accepts. vLLM's own parser (vllm.config.cache) is private, so the hook reads
+# names itself; test_raiden_pd_kernel_page checks it against vLLM's parser for
+# every name vLLM accepts.
 _KV_LAYOUT_ALIASES = {"NHD": "LBNHC", "HND": "LBHNC"}
+
+
+def _kv_layout(name: str) -> KVCacheLayout:
+    """The KV cache layout a name gives, as vLLM reads it: a layout's own name
+    or one of vLLM's legacy aliases."""
+    try:
+        return KVCacheLayout[_KV_LAYOUT_ALIASES.get(name, name)]
+    except KeyError:
+        valid = [m.name for m in KVCacheLayout] + list(_KV_LAYOUT_ALIASES)
+        raise ValueError(
+            f"Unknown KV cache layout {name!r}. Valid layouts: {valid}"
+        ) from None
 
 
 def _kv_layout_is_seq_along_lane(vllm_config: VllmConfig) -> bool:
@@ -144,19 +168,13 @@ def _kv_layout_is_seq_along_lane(vllm_config: VllmConfig) -> bool:
     else the attention backend's first one. The TPU connectors require no
     layout and every TPU attention backend lists a head-along-sublane layout
     first, so without an explicit layout the cache is head-along-sublane.
+    vLLM refuses a ``VLLM_KV_CACHE_LAYOUT`` outside its choices when the
+    variable is read.
     """
-    from vllm import envs as vllm_envs
-    from vllm.v1.kv_cache_layout import KVCacheLayout
-
-    from vllm_torchtpu.kernels.experimental.batched_rpa import (
-        configs as batched_rpa_configs,
-    )
-    from vllm_torchtpu.layers.adapter.attention import KV_LAYOUT_BY_VLLM_LAYOUT
-
     name = vllm_config.cache_config.kv_cache_layout or vllm_envs.VLLM_KV_CACHE_LAYOUT
     if name is None:
         return False
-    layout = KVCacheLayout[_KV_LAYOUT_ALIASES.get(name, name)]
+    layout = _kv_layout(name)
     return (
         KV_LAYOUT_BY_VLLM_LAYOUT.get(layout)
         is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
@@ -180,8 +198,6 @@ def _apply_kv_transfer_page(vllm_config: VllmConfig) -> None:
     # warn about a setting the user never wrote.
     if not _kv_layout_is_seq_along_lane(vllm_config):
         return
-    from vllm_torchtpu.layers.adapter.attention import KV_TRANSFER_SECTION
-
     additional_config = cast("dict[str, Any]", vllm_config.additional_config)
     # An explicit section, valid or not, is the user's: the platform validates it.
     if KV_TRANSFER_SECTION in additional_config:
