@@ -1079,8 +1079,10 @@ class Qwen35Program:
         ):
             pos_in = positions
         elif tokens_per_seq > 1:
+            # `seq_lens` is `num_computed_tokens + T`: positions `seq_len - T ..
+            # seq_len - 1` (as `resolve_step_positions`).
             offsets = torch.arange(
-                1 - tokens_per_seq, 1, dtype=torch.int32, device=fb_1d.device
+                -tokens_per_seq, 0, dtype=torch.int32, device=fb_1d.device
             ).unsqueeze(0)
             pos_in = (fb_1d.unsqueeze(1) + offsets).clamp(min=0).reshape(-1)
         else:

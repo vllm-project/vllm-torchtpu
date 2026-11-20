@@ -69,6 +69,7 @@ from vllm_torchtpu.megakernel.core.runtime import (
 from vllm_torchtpu.megakernel.core.runtime.contract import (  # noqa: E402
     Bucket,
     LayoutDecline,
+    StepDecision,
 )
 from vllm_torchtpu.models.qwen3_5 import (  # noqa: E402
     megakernel as qwen_plugin,
@@ -788,6 +789,35 @@ def test_prepare_step_metadata_decode_and_verify() -> None:
         tokens_per_seq=4,
     )
     assert pos_mrope_t4.tolist() == [9, 10, 11, 12, 24, 25, 26, 27]
+
+
+@pytest.mark.parametrize(
+    ("T", "want"), [(1, [9, 24]), (4, [6, 7, 8, 9, 21, 22, 23, 24])]
+)
+def test_forward_positions_fallback_from_seq_lens(T: int, want: list[int]) -> None:
+    """Without usable `positions`, `forward` puts a sequence's `T` tokens at
+    `seq_len - T .. seq_len - 1` (`seq_lens` is the length after the step)."""
+    seen: dict[str, torch.Tensor] = {}
+
+    def step_fn(ids: torch.Tensor, pos_in: torch.Tensor, *_: Any) -> torch.Tensor:
+        seen["pos"] = pos_in.clone()
+        return torch.zeros((ids.shape[0], 4))
+
+    prog = object.__new__(qwen_adapter.Qwen35Program)
+    prog._prepared = (
+        SimpleNamespace(
+            block_tables=torch.zeros((2, 2), dtype=torch.int32),
+            seq_lens=torch.tensor([10, 25], dtype=torch.int32),
+        ),
+        [SimpleNamespace(mamba_state_indices=torch.tensor([1, 5]))] * 3,
+    )
+    prog.view, prog._zero_roff_1d = None, torch.zeros((1,), dtype=torch.int32)
+    prog.w_flat, prog.raw_pools = (), ()
+    ctx = SimpleNamespace(input_ids=torch.zeros((2 * T,), dtype=torch.int32))
+    ctx.positions = None
+    fwd = SimpleNamespace(steps={(T, 2 * T): step_fn}, num_tokens=2 * T)
+    prog.forward(StepDecision(True, "mk", 2, T, 2 * T), ctx, fwd)
+    assert seen["pos"].tolist() == want
 
 
 def test_block_tables_1d_reshape_most_model_len() -> None:
