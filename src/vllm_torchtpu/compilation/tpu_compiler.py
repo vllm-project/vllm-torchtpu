@@ -696,10 +696,9 @@ class TpuCompilerAdaptor(CompilerInterface):
             # This is the positional dtype-and-shape check that
             # BucketExecutables.get falls back to when it cannot match the
             # inputs by name in the in-memory hand-over, extended across
-            # processes; the artifact
-            # was saved for this same subgraph and bucket, so nothing here is
-            # matched by name or reordered. It earns its place because
-            # nothing else validates the entry against the
+            # processes; the artifact was saved for this same subgraph and
+            # bucket, so nothing here is matched by name or reordered. It earns
+            # its place because nothing else validates the entry against the
             # graph: torch_tpu injects a synthetic cache_info and stubs out
             # generate_guards_expression, and replaying a pickle we wrote
             # ourselves never goes through AOTAutogradCache.try_load.
