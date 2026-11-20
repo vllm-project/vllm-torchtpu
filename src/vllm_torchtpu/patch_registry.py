@@ -149,6 +149,7 @@ PATCHES = (
     Patch(
         "vllm_torchtpu.mm_processor_threads_patch:patch_mm_processor_threads", _ACTIVE
     ),
+    Patch("vllm_torchtpu.mm_resize_patch:patch_mm_resize_strips", _ACTIVE),
     Patch("vllm_torchtpu.mm_host_copy_patch:patch_mm_host_copies", _ENGINE),
     # Platform runtime configuration.
     Patch(
