@@ -17,22 +17,39 @@ kernel never writes past it (rpa_kernel reads it with bounds checks off)."""
 from types import SimpleNamespace
 
 import jax
+import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs, schedule
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    configs,
+    schedule,
+    schedule_cp,
+    wrapper,
+)
 
 _MULT = configs.RpaConfigs.max_schedule_size_multiplier
 
 
-def _mult(mode, num_seqs, tokens, bq, bkv, batch, pages=2050, ub=128):
+def _mult(
+    mode,
+    num_seqs,
+    tokens,
+    bq,
+    bkv,
+    batch,
+    pages=2050,
+    ub=128,
+    scope=configs.AttentionScope.FULL,
+):
     serve = SimpleNamespace(
         num_seqs=num_seqs,
         total_q_tokens=tokens,
         pages_per_seq=pages,
         page_size=128,
         max_schedule_size_multiplier=16,
+        attention_scope=scope,
     )
     cfgs = SimpleNamespace(
         serve=serve, mode=mode, bq_sz=bq, bkv_sz=bkv, batch_size=batch, max_steps_ub=ub
@@ -49,6 +66,85 @@ def test_multiplier_covers_the_worst_case_pairs():
     assert _mult(configs.RpaCase.DECODE, 32, 8192, 4, 4096, 8) == 16
     # Capped; past the cap the kernel drops steps instead of writing OOB.
     assert _mult(configs.RpaCase.MIXED, 1024, 1 << 20, 16, 16, 1) == 128
+
+
+@pytest.mark.parametrize(
+    ("mode", "tokens", "bq", "bkv", "batch"),
+    [
+        (configs.RpaCase.DECODE, 64, 4, 4096, 8),
+        (configs.RpaCase.MIXED, 2048, 256, 1024, 2),
+    ],
+)
+def test_the_dcp4_decode_legs_new_token_pass_keeps_16_chunks(
+    mode, tokens, bq, bkv, batch
+):
+    """The new-token pass of a TP8 + DCP4 decode leg (16 sequences, a
+    262,144-token context over 4 ranks: 512 pages of 128 per rank, at most
+    2,048 tokens per step) needs far fewer than the serving value's 16
+    chunks."""
+    new_tokens = configs.AttentionScope.NEW_TOKENS_ONLY
+    assert _mult(mode, 16, tokens, bq, bkv, batch, pages=512, scope=new_tokens) == 16
+
+
+def test_a_dcp_new_token_pass_gets_a_schedule_for_all_its_steps(monkeypatch):
+    """The new-token pass (NEW_TOKENS_ONLY) under context parallelism visits
+    the KV blocks of the sequence's new tokens at their global positions,
+    which can span more blocks than the rank-local block table: one
+    8,192-token sequence over a 1,024-token local table (CP 8) takes 528
+    steps of 256-token blocks. The schedule must hold all of them; one sized
+    for the local table drops the steps past it. Runs the schedule kernel in
+    Pallas TPU interpret mode on TPU7x's chip info."""
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda *args, **kwargs: info)
+    tokens, cp, page, pages_per_seq, blk = 8192, 8, 16, 64, 256
+    serve = configs.ServingConfigs(
+        num_seqs=1,
+        page_size=page,
+        total_q_tokens=tokens,
+        num_page_indices=pages_per_seq,
+        dtype_q=jnp.dtype(jnp.bfloat16),
+        dtype_kv=jnp.dtype(jnp.bfloat16),
+        dtype_out=jnp.dtype(jnp.bfloat16),
+        kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+        cp_group_size=cp,
+        attention_scope=configs.AttentionScope.NEW_TOKENS_ONLY,
+        return_lse=True,
+        # Size the schedule by the worst case alone, without the serving
+        # value's 16 chunks.
+        max_schedule_size_multiplier=1,
+    )
+    cfgs = configs.RpaConfigs(
+        block=configs.BlockSizes(bq_sz=blk, bq_c_sz=blk, bkv_sz=blk, batch_size=1),
+        model=configs.ModelConfigs(
+            num_q_heads=2,
+            num_kv_heads=1,
+            head_dim=128,
+            mask_value=-1e30,
+            sm_scale=1.0,
+            soft_cap=None,
+            sliding_window=None,
+        ),
+        serve=serve,
+        mode=configs.RpaCase.MIXED,
+        vmem_limit_bytes=64 << 20,
+    )
+    # q block j of the new tokens visits KV blocks 0..j: 32 * 33 / 2 steps.
+    steps = (tokens // blk) * (tokens // blk + 1) // 2
+    assert pages_per_seq * page * cp == tokens and steps > cfgs.max_steps_ub
+    i32 = lambda x: jnp.asarray(x, jnp.int32)  # noqa: E731
+    out = schedule.generate_rpa_metadata(
+        i32([0, tokens]),  # cu_q_lens
+        i32([0]),  # q_offsets: no cached tokens
+        i32([0]),  # kv_cache_lens
+        i32([tokens]),  # kv_new_lens
+        i32([0, 0, 1]),  # distribution: one MIXED sequence
+        jnp.arange(pages_per_seq, dtype=jnp.int32),  # rank-local page_indices
+        cfgs,
+        computer_cls=schedule_cp.CPMetadataComputer,
+        extra_scalars=(i32([1]),),  # cp_rank
+        interpret=pltpu.InterpretParams(),
+    )
+    assert int(jax.device_get(out.actual_steps)[0]) == steps
 
 
 @pytest.mark.tpu_test
@@ -116,10 +212,6 @@ def test_a_worst_case_past_the_cap_warns_at_trace_time(monkeypatch, num_seqs, wa
     """1M-token block tables: 8 sequences fit the HBM schedule; 1024 do not,
     and the wrapper says so once while tracing instead of dropping steps
     silently."""
-    import jax.experimental.pallas.tpu as pltpu
-
-    from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper
-
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda *args, **kwargs: info)
     calls = []

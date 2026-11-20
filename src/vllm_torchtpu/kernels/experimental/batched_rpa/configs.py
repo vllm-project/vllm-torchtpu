@@ -222,17 +222,34 @@ MAX_SCHEDULE_CHUNKS = 128
 
 
 def worst_case_schedule_chunks(cfgs: "RpaConfigs") -> int:
-    """Chunks of `cfgs.max_steps_ub` steps the shape's worst case fills: every
-    sequence at the block table's full length, pairing each of its q blocks
-    with each of its KV blocks."""
+    """Chunks of `cfgs.max_steps_ub` steps the shape's worst case fills: each
+    q block of each sequence paired with every KV block it can visit. That is
+    every block of a full block table, except in the new-token pass
+    (NEW_TOKENS_ONLY), which visits only the blocks of the sequence's new
+    tokens; under context parallelism those are global positions, so they
+    can span more blocks than the rank-local block table holds."""
     # DECODE: one q block per sequence. Its range holds only 1-token decodes
     # and speculative verify windows of at most decode_query_size tokens,
     # which is the DECODE bq.
-    q_blocks = cfgs.serve.num_seqs
+    extra_q_blocks = 0
     if cfgs.mode != RpaCase.DECODE:
-        q_blocks += cfgs.serve.total_q_tokens // cfgs.bq_sz
-    kv_tokens = cfgs.serve.pages_per_seq * cfgs.serve.page_size
-    steps = pl.cdiv(q_blocks * pl.cdiv(kv_tokens, cfgs.bkv_sz), cfgs.batch_size)
+        extra_q_blocks = cfgs.serve.total_q_tokens // cfgs.bq_sz
+    if cfgs.serve.attention_scope == AttentionScope.NEW_TOKENS_ONLY:
+        # The j-th q block of a sequence visits the KV blocks from the one
+        # holding the sequence's first new token to the one holding the q
+        # block's last token (schedule.py's q_loop), at most visits(j) of
+        # them. visits grows with j, so the worst case puts every q block
+        # past the sequences' first ones in one sequence.
+        def visits(j: int) -> int:
+            return pl.cdiv((j + 1) * cfgs.bq_sz - 1, cfgs.bkv_sz) + 1
+
+        pairs = cfgs.serve.num_seqs * visits(0)
+        pairs += sum(visits(j) for j in range(1, extra_q_blocks + 1))
+    else:
+        kv_tokens = cfgs.serve.pages_per_seq * cfgs.serve.page_size
+        q_blocks = cfgs.serve.num_seqs + extra_q_blocks
+        pairs = q_blocks * pl.cdiv(kv_tokens, cfgs.bkv_sz)
+    steps = pl.cdiv(pairs, cfgs.batch_size)
     return pl.cdiv(steps, cfgs.max_steps_ub)
 
 
