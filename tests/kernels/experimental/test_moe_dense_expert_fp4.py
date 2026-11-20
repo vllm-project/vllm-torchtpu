@@ -291,3 +291,29 @@ def test_fused_routing_matches_routing_first(monkeypatch, m, i, use_ep, topk):
     np.testing.assert_array_equal(
         np.asarray(got, np.float32), np.asarray(want, np.float32)
     )
+
+
+@pytest.mark.parametrize("m", [24, 32])
+def test_one_tile_experts_match_both_tiles(m):
+    """Experts routed only from rows 0-15, only from rows 16+, and from both:
+    the kernel's one-tile skip is bit-identical to evaluating every row."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    h, i, e, topk = 512, 1024, 12, 4
+    x, w1, w2, s1, s2, weights, _ = _inputs(m, h, i, e, topk, seed=m)
+    ids = np.zeros((m, topk), np.int32)
+    for t in range(m):
+        base = 0 if t < 16 else 4  # experts 0-3 tile 0 only, 4-7 tile 1 only
+        ids[t] = [base + (t + j) % 4 for j in range(topk)]
+    ids[:, 3] = 8 + np.arange(m) % 4  # experts 8-11 from both tiles
+    ids = jnp.asarray(ids)
+    out = kernel.dense_expert_moe_fp4(x, w1, w2, s1, s2, weights, ids)
+    # Per token, the same experts with the other tokens' routes dropped: each
+    # expert then serves rows of one tile or both as above, the dense path.
+    want = np.zeros(out.shape, np.float32)
+    for t in range(m):
+        one = jnp.full((m, topk), -1, jnp.int32).at[t].set(ids[t])
+        want[t] = np.asarray(
+            kernel.dense_expert_moe_fp4(x, w1, w2, s1, s2, weights, one), np.float32
+        )[t]
+    np.testing.assert_array_equal(np.asarray(out, np.float32), want)
