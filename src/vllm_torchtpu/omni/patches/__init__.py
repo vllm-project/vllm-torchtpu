@@ -973,7 +973,11 @@ def _patch_ltx2_guidance_sigma_scalar() -> None:
         scheduler: Any, *, refresh: bool = False
     ) -> tuple[float, ...] | None:
         sigmas_t = getattr(scheduler, "sigmas", None)
-        if not isinstance(sigmas_t, torch.Tensor) or sigmas_t.ndim != 1:
+        if (
+            sigmas_t is None
+            or not isinstance(sigmas_t, torch.Tensor)
+            or sigmas_t.ndim != 1
+        ):
             return None
         key = id(sigmas_t)
         # Inference tensors have no version counter; the per-stage refresh
