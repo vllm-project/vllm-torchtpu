@@ -32,11 +32,12 @@ On TPU the built kernel runs over the two cores of one chip, one shard each,
 on routing tables from ``routing_tables``' reference passes: every routed
 row's arrival on its token's shard, through the remote push or the local
 hop, is checked against the numpy reference of its expert's FFN, at the
-per-shard shape of the Qwen3.5-397B decode layer and at a small shape that
-fetches rows through the token windows.
+per-shard shape of the Qwen3.5-397B decode layer and at small shapes for
+every form the build takes: rows fetched through the token windows, bf16
+weights, blocked row and intermediate scales, and the shard index as an
+operand.
 """
 
-import functools
 import importlib
 from typing import NamedTuple
 
@@ -54,8 +55,9 @@ from vllm_torchtpu.kernels.fused_moe.v3 import routing_tables as tables
 
 ffn_kernel = importlib.import_module("vllm_torchtpu.kernels.fused_moe.v3.ffn_kernel")
 
-# The build test_fused_ep_moe_v3.py's small world takes: 16 experts over 8
-# shards, 24 rows per shard at top-k 4, hidden 1024, intermediate 128.
+# A small layer's build: 16 experts over 8 shards (2 a shard), hidden 1024,
+# intermediate 128, 32-row tiles, and 928 routed rows a shard (the no-drop
+# bound for 24 tokens a shard at top-k 4).
 BUILD = dict(
     experts_per_shard=2,
     tile_rows=32,
@@ -291,6 +293,16 @@ class KernelCase(NamedTuple):
     result_rows: str
     elementwise_dtype: str
     sorted_rows: bool
+    weight_format: str = "fp8"
+    activation_block: int = 0
+    token_block: int | None = None
+    shard_index_operand: bool = False
+
+    @property
+    def row_block(self):
+        """The token rows' scale block: activation_block when token_block is
+        None (the build's rule), 0 for one scale per row."""
+        return self.activation_block if self.token_block is None else self.token_block
 
 
 # Two shards, the two cores of one TPU7x chip, so the runs for the other shard
@@ -298,7 +310,17 @@ class KernelCase(NamedTuple):
 # The first two are the per-shard shape of the Qwen3.5-397B decode layer (64
 # local experts of 4096 x 1024, tile 128, fp8 weights, bf16 element-wise
 # products, rows sorted into expert order) with fp8 and with bf16 result
-# rows; the third fetches each row through the token windows.
+# rows; the third fetches each row through the token windows. The others
+# take the small shape through each other form the build takes: bf16
+# weights (no weight scales); 128-value blocks of the token rows' and the
+# intermediate's scales (four scale planes), of the token rows' only and of
+# the intermediate's only; and the shard's index as an operand (the torch
+# bridge's form), with sorted rows as the bridge's decode calls use.
+SMALL = (2, 4, 512, 256, 32, 4, 64, "fp8", "float32")
+# With blocked scales, the blocks of a token row (and of the intermediate)
+# are drawn at these very different sizes, so a scale taken from the wrong
+# block or plane is far off.
+BLOCK_GAINS = np.array([1.0, 6.0, 0.25, 3.0], np.float32)
 KERNEL_CASES = {
     "measured_fp8_rows": KernelCase(
         2, 64, 4096, 1024, 128, 10, 128, "fp8", "bfloat16", True
@@ -306,9 +328,16 @@ KERNEL_CASES = {
     "measured_bf16_rows": KernelCase(
         2, 64, 4096, 1024, 128, 10, 128, "bf16", "bfloat16", True
     ),
-    "small_token_windows": KernelCase(
-        2, 4, 512, 256, 32, 4, 64, "fp8", "float32", False
+    "small_token_windows": KernelCase(*SMALL, False),
+    "small_bf16_weights": KernelCase(*SMALL, False, weight_format="bf16"),
+    "small_blocked_scales": KernelCase(*SMALL, True, activation_block=128),
+    "small_blocked_token_rows": KernelCase(
+        *SMALL, False, activation_block=0, token_block=128
     ),
+    "small_blocked_intermediate": KernelCase(
+        *SMALL, False, activation_block=128, token_block=0
+    ),
+    "small_shard_index_operand": KernelCase(*SMALL, True, shard_index_operand=True),
 }
 
 
@@ -359,33 +388,46 @@ def _kernel_routing(case, seed=3):
     return indices, routing
 
 
-@functools.cache
-def _kernel_inputs(*shape):
-    """For one shape (KernelCase's first seven fields): the routing, the fp8
-    token rows and their scales, the experts' fp8 weights and per-channel
-    scales, and every routed pair's reference row (bf16, before the result
-    rows' rounding). Each expert's weights are one fp8 matrix with its rows
-    rolled by an amount of its own (97 and 89 are odd, so no two experts
-    share a roll) and scales of its own, so every expert computes something
-    different from one drawn matrix."""
-    case = KernelCase(*shape, "fp8", "float32", True)
-    shards, local, hidden, inter = shape[:4]
+def _block_gains(width, block):
+    """A gain per value of a row `width` wide: BLOCK_GAINS over its blocks."""
+    return np.resize(BLOCK_GAINS, width // block).repeat(block)
+
+
+def _kernel_inputs(case):
+    """For one case: the routing, the fp8 token rows and their scales (one
+    per row or per row_block values), the experts' weights (fp8 with
+    per-channel scales, or bf16 with none), and every routed pair's
+    reference row (bf16, before the result rows' rounding). Each expert's
+    weights are one matrix with its rows rolled by an amount of its own (97
+    and 89 are odd, so no two experts share a roll), and fp8 weights also
+    scales of their own, so every expert computes something different from
+    one drawn matrix. With blocked scales the blocks are drawn at
+    BLOCK_GAINS' sizes."""
+    shards, local, hidden, inter = case[:4]
     num_experts = shards * local
+    fp8_weights = case.weight_format == "fp8"
     indices, routing = _kernel_routing(case)
     rng = np.random.default_rng(4)
     tokens = indices.shape[0]
     x = _bf16(
         rng.standard_normal((tokens, hidden)) * rng.uniform(0.2, 3.0, (tokens, 1))
     )
-    rows, row_scales = _quantize_np(x, 0)
     w1 = rng.standard_normal((hidden, 2 * inter)).astype(np.float32) / 8
     w2 = rng.standard_normal((inter, hidden)).astype(np.float32) / 8
+    if case.row_block:
+        x = _bf16(x * _block_gains(hidden, case.row_block))
+    if case.activation_block:
+        gains = _block_gains(inter, case.activation_block)
+        w1 = w1 * np.concatenate([gains, gains])  # the gate and up halves
+    rows, row_scales = _quantize_np(x, case.row_block)
     s1 = (np.abs(w1).max(axis=0, keepdims=True) / 448).astype(np.float32)
     s2 = (np.abs(w2).max(axis=0, keepdims=True) / 448).astype(np.float32)
-    w1 = (w1 / s1).astype(FP8_NP)
-    w2 = (w2 / s2).astype(FP8_NP)
-    w1_all = np.empty((num_experts, hidden, 2 * inter), FP8_NP)
-    w2_all = np.empty((num_experts, inter, hidden), FP8_NP)
+    weight_np = FP8_NP if fp8_weights else ml_dtypes.bfloat16
+    if fp8_weights:
+        w1, w2 = w1 / s1, w2 / s2
+    w1, w2 = w1.astype(weight_np), w2.astype(weight_np)
+    w1_all = np.empty((num_experts, hidden, 2 * inter), weight_np)
+    w2_all = np.empty((num_experts, inter, hidden), weight_np)
     for e in range(num_experts):
         w1_all[e] = np.roll(w1, 97 * e, axis=0)
         w2_all[e] = np.roll(w2, 89 * e, axis=0)
@@ -401,21 +443,21 @@ def _kernel_inputs(*shape):
             row_scales[token],
             w1_all[e].astype(np.float32),
             w2_all[e].astype(np.float32),
-            s1_all[e : e + 1],
-            s2_all[e : e + 1],
-            0,
-            0,
+            s1_all[e : e + 1] if fp8_weights else None,
+            s2_all[e : e + 1] if fp8_weights else None,
+            case.activation_block,
+            case.row_block,
             bf16_rows=True,
         )
-    weights = (w1_all, w2_all, s1_all, s2_all)
+    weights = (w1_all, w2_all) + ((s1_all, s2_all) if fp8_weights else ())
     return indices, routing, rows.astype(FP8_NP), row_scales, weights, want
 
 
-def _kernel_world(case):
+def _kernel_world(case, inputs):
     """(every shard's kernel operands stacked on their first axis, each
     routed pair's row in the stacked arrival rows, each pair's reference
-    row, every shard's expert rows)."""
-    indices, routing, rows, row_scales, weights, want = _kernel_inputs(*case[:7])
+    row, every shard's expert rows), from the case's _kernel_inputs."""
+    indices, routing, rows, row_scales, weights, want = inputs
     shards, local = case.num_shards, case.experts_per_shard
     num_experts = shards * local
     routed_rows, arrival_rows = _kernel_geometry(case)
@@ -433,10 +475,15 @@ def _kernel_world(case):
         live = local_row < routed_rows
         token_of_row = np.zeros(table_rows, np.int32)
         token_of_row[local_row[live]] = pair_token[live]
-        token_scales = np.zeros(
-            layout.scale_table_rows(routed_rows) * layout.LANES, np.int32
-        )
-        token_scales[local_row[live]] = row_scales[pair_token[live], 0].view(np.int32)
+        # One plane per scale of a row, each the plane's words for every
+        # routed row.
+        plane_words = layout.scale_table_rows(routed_rows) * layout.LANES
+        planes = row_scales.shape[1]
+        token_scales = np.zeros(planes * plane_words, np.int32)
+        for plane in range(planes):
+            token_scales[plane * plane_words + local_row[live]] = row_scales[
+                pair_token[live], plane
+            ].view(np.int32)
         per_shard.append(
             (
                 *tables.shard_transport_tables(routing, s, **split),
@@ -456,6 +503,8 @@ def _kernel_world(case):
         np.concatenate([np.asarray(shard[i]) for shard in per_shard])
         for i in range(len(per_shard[0]))
     ) + tuple(weights)
+    if case.shard_index_operand:
+        operands += (np.arange(shards, dtype=np.int32),)
     arrival_index = (pair_token // case.tokens_per_shard) * arrival_rows + np.asarray(
         routing.arrival_row
     ).reshape(-1)
@@ -474,19 +523,32 @@ def _kernel_program(case):
         hidden=case.hidden,
         inter=case.inter,
         num_shards=case.num_shards,
-        weight_format="fp8",
+        weight_format=case.weight_format,
         routed_rows=routed_rows,
         result_rows=case.result_rows,
         elementwise_dtype=case.elementwise_dtype,
         sorted_rows=case.sorted_rows,
+        activation_block=case.activation_block,
+        token_block=case.token_block,
+        shard_index_operand=case.shard_index_operand,
     )
+    # The seven tables, the seven per-shard operands, then w1 and w2 and,
+    # for fp8 weights, their scales; last the shard's index in operand form.
+    n_weights = 4 if case.weight_format == "fp8" else 2
 
     def shard(*operands):
-        return run(operands[:7], *operands[7:], arrival_rows=arrival_rows)
+        weights = operands[14 : 14 + n_weights] + (None,) * (4 - n_weights)
+        return run(
+            operands[:7],
+            *operands[7:14],
+            *weights,
+            arrival_rows=arrival_rows,
+            shard_index=operands[-1] if case.shard_index_operand else None,
+        )
 
     mesh = Mesh(np.asarray(jax.devices()[: case.num_shards]), (layout.MESH_AXIS,))
     split = PartitionSpec(layout.MESH_AXIS)
-    n_operands = 7 + 11
+    n_operands = 14 + n_weights + int(case.shard_index_operand)
     program = jax.jit(
         jax.shard_map(
             shard,
@@ -517,6 +579,23 @@ def _row_errors(got, want):
     return np.sqrt(np.mean((got - want) ** 2, axis=1) / np.mean(want**2, axis=1))
 
 
+@pytest.fixture(scope="module")
+def kernel_inputs():
+    """_kernel_inputs for each case, shared by the cases of one shape and
+    freed after the module: the Qwen3.5-397B shape's host weights alone are
+    about 1.6 GB of fp8."""
+    built = {}
+
+    def inputs(case):
+        key = (*case[:7], case.weight_format, case.activation_block, case.token_block)
+        if key not in built:
+            built[key] = _kernel_inputs(case)
+        return built[key]
+
+    yield inputs
+    built.clear()
+
+
 @pytest.fixture
 def on_tpu7x(monkeypatch):
     """Skip unless the chip is a generation the package supports (a fixture,
@@ -529,7 +608,7 @@ def on_tpu7x(monkeypatch):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("name", list(KERNEL_CASES))
-def test_the_built_kernel_matches_numpy_on_tpu(on_tpu7x, name):
+def test_the_built_kernel_matches_numpy_on_tpu(on_tpu7x, kernel_inputs, name):
     """Every routed pair's arrival row, on its token's shard, against the
     numpy reference of its expert's FFN on its token's row. The routing
     gives some experts several tiles and leaves one per shard without rows.
@@ -541,7 +620,9 @@ def test_the_built_kernel_matches_numpy_on_tpu(on_tpu7x, name):
     case = KERNEL_CASES[name]
     if jax.device_count() < case.num_shards:
         pytest.skip(f"needs {case.num_shards} TPU cores")
-    operands, arrival_index, want, expert_rows = _kernel_world(case)
+    operands, arrival_index, want, expert_rows = _kernel_world(
+        case, kernel_inputs(case)
+    )
     assert expert_rows.max() > case.tile_rows and expert_rows.min() == 0
     got = _kernel_arrivals(case, operands)[arrival_index]
     if case.result_rows == "fp8":
