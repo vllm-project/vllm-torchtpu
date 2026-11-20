@@ -1297,6 +1297,10 @@ def _fine_prefix_hashes_safe(kv_transfer_config) -> bool:
     reach the same answer as the engine, which sees the parent."""
     if _is_raiden_glm_dcp_identity_producer(kv_transfer_config):
         return True
+    # TPUDecodeBenchConnector reads no block hashes: it claims whatever the
+    # local prefix cache misses, at any alignment, and moves no KV.
+    if getattr(kv_transfer_config, "kv_connector", None) == "TPUDecodeBenchConnector":
+        return True
     return bool(
         envs.use_raiden_glm_admission()
         and envs.TPU_RAIDEN_GLM_DCP_IDENTITY
@@ -1359,6 +1363,49 @@ def _patch_raiden_identity_keeps_cp_interleave() -> None:
     logger.info(
         "Applied TPU patch: Raiden GLM DCP identity keeps cp_kv_cache_interleave_size."
     )
+
+
+def _patch_decode_bench_keeps_cp_interleave() -> None:
+    """Keep the configured DCP interleave under TPUDecodeBenchConnector.
+
+    The pinned vLLM resets cp_kv_cache_interleave_size to the block size for
+    any KV connector (see _patch_raiden_identity_keeps_cp_interleave). The
+    decode-bench connector moves no KV, so that reset would only change the
+    decode attention layout away from the deployment being measured.
+    """
+    from functools import wraps
+
+    from vllm.config import VllmConfig
+
+    # Same string as decode_bench_connector.CONNECTOR_NAME; not imported so
+    # the patch does not pull the upstream connector module in at startup.
+    connector_name = "TPUDecodeBenchConnector"
+    if VllmConfig.__dict__.get("_tpu_decode_bench_keep_interleave_patch", False):
+        return
+    original = VllmConfig.adjust_dcp_kv_cache_interleave_size
+
+    @wraps(original)
+    def adjust_dcp_kv_cache_interleave_size(self, kv_cache_config) -> None:
+        transfer = self.kv_transfer_config
+        if transfer is None or transfer.kv_connector != connector_name:
+            return original(self, kv_cache_config)
+        parallel = self.parallel_config
+        if parallel.decode_context_parallel_size <= 1:
+            return
+        # The deprecated dcp_kv_cache_interleave_size still wins, as upstream.
+        if parallel.dcp_kv_cache_interleave_size > 1 and (
+            parallel.cp_kv_cache_interleave_size
+            != parallel.dcp_kv_cache_interleave_size
+        ):
+            parallel.cp_kv_cache_interleave_size = parallel.dcp_kv_cache_interleave_size
+        logger.info(
+            "[guard] %s kept cp_kv_cache_interleave_size=%d",
+            connector_name,
+            parallel.cp_kv_cache_interleave_size,
+        )
+
+    VllmConfig.adjust_dcp_kv_cache_interleave_size = adjust_dcp_kv_cache_interleave_size
+    VllmConfig._tpu_decode_bench_keep_interleave_patch = True
 
 
 def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
