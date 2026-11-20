@@ -1698,9 +1698,9 @@ def test_set_additional_forward_context_caches_dp_num_tokens_tpu_tensor(monkeypa
     to_calls = []
 
     class FakeCpuTensor:
-        def __init__(self, vals):
+        def __init__(self, vals, dtype=torch.int32):
             self.device = SimpleNamespace(type="cpu")
-            self.dtype = torch.int32
+            self.dtype = dtype
             self._vals = list(vals)
 
         def numel(self):
@@ -1713,7 +1713,7 @@ def test_set_additional_forward_context_caches_dp_num_tokens_tpu_tensor(monkeypa
             return list(self._vals)
 
         def to(self, device):
-            to_calls.append((tuple(self._vals), device))
+            to_calls.append((tuple(self._vals), device, self.dtype))
             return SimpleNamespace(dtype=self.dtype, vals=tuple(self._vals))
 
     dp_metadata_1 = SimpleNamespace(num_tokens_across_dp_cpu=FakeCpuTensor([64]))
@@ -1726,8 +1726,17 @@ def test_set_additional_forward_context_caches_dp_num_tokens_tpu_tensor(monkeypa
     assert (
         dp_metadata_2.num_tokens_across_dp_cpu is dp_metadata_1.num_tokens_across_dp_cpu
     )
-    assert to_calls == [((64,), "tpu")]
+    assert to_calls == [((64,), "tpu", torch.int32)]
 
     TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata_3)
     assert dp_metadata_3.num_tokens_across_dp_cpu.vals == (16,)
     assert len(to_calls) == 2
+
+    # The same counts in another dtype get their own entry, reused after.
+    for _ in range(2):
+        dp_metadata = SimpleNamespace(
+            num_tokens_across_dp_cpu=FakeCpuTensor([64], dtype=torch.int64)
+        )
+        TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata)
+        assert dp_metadata.num_tokens_across_dp_cpu.dtype == torch.int64
+    assert to_calls[2:] == [((64,), "tpu", torch.int64)]
