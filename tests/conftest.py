@@ -84,6 +84,19 @@ def _reset_warning_once():
     vllm.logger._print_warning_once.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _empty_shared_mamba_ops():
+    """Isolate the shared recurrent `pallas.jax_op` cache across tests."""
+    mod_name = "vllm_torchtpu.layers.adapter.custom_ops.mamba_op_utils"
+    mod = sys.modules.get(mod_name)
+    if mod is not None:
+        mod._shared_mamba_ops.clear()
+    yield
+    mod_after = sys.modules.get(mod_name)
+    if mod_after is not None:
+        mod_after._shared_mamba_ops.clear()
+
+
 @pytest.fixture
 def vllm_config_context():
     """Run backend helpers with the same resolved layout as worker startup."""
