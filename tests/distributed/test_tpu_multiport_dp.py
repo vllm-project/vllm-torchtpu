@@ -23,7 +23,7 @@ from vllm.platforms.interface import Platform
 from vllm.v1.engine.core import EngineCoreProc
 
 import vllm_torchtpu as plugin
-from vllm_torchtpu import envs, patch_registry
+from vllm_torchtpu import patch_registry
 from vllm_torchtpu.distributed import tpu_multiport_dp as mpdp
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
@@ -168,13 +168,13 @@ def test_multi_node_is_rejected(monkeypatch):
 
 
 def test_ray_backend_is_rejected(monkeypatch):
-    monkeypatch.setattr(envs, "TPU_MULTIHOST_BACKEND", "ray")
+    monkeypatch.setenv("TPU_MULTIHOST_BACKEND", "ray")
     with pytest.raises(NotImplementedError, match="TPU_MULTIHOST_BACKEND=ray"):
         mpdp.validate(_vllm_config(_child_config(0), ON))
 
 
 def test_validation_is_a_no_op_with_the_option_off(monkeypatch):
-    monkeypatch.setattr(envs, "TPU_MULTIHOST_BACKEND", "ray")
+    monkeypatch.setenv("TPU_MULTIHOST_BACKEND", "ray")
     pc = _child_config(0, external_lb=False)
     pc.nnodes = 2
     mpdp.validate(_vllm_config(pc, {}))
@@ -262,9 +262,9 @@ def isolated_registry(monkeypatch):
     monkeypatch.setattr(patch_registry, "_active_stages", set())
 
 
-@pytest.mark.parametrize("flag,raises", [(True, False), (False, True)])
+@pytest.mark.parametrize("flag", [True, False])
 def test_registration_lets_core_indexed_device_ids_through(
-    monkeypatch, isolated_registry, flag, raises
+    monkeypatch, isolated_registry, flag
 ):
     """DPSupervisor hands rank 2 of DP4 x TP2 --device-ids [4, 5]; with four
     chips in TPU_VISIBLE_CHIPS, vLLM rejects that unless the platform stops
@@ -290,17 +290,18 @@ def test_registration_lets_core_indexed_device_ids_through(
         "vllm_torchtpu.distributed.tpu_multiport_dp:install_device_ids_patch"
         in patch_registry._applied
     )
-    if raises:
-        with pytest.raises(ValueError, match="out of range"):
-            _resolve_device_ids([4, 5], {})
-        assert TpuPlatform.device_control_env_var == "TPU_VISIBLE_CHIPS"
-    else:
-        assert _resolve_device_ids([4, 5], ON) == [4, 5]
+    additional = ON if flag else {}
+    if flag:
+        assert _resolve_device_ids([4, 5], additional) == [4, 5]
         assert (
             TpuPlatform.device_control_env_var
             == Platform.device_control_env_var
             == "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
         )
+    else:
+        with pytest.raises(ValueError, match="out of range"):
+            _resolve_device_ids([4, 5], additional)
+        assert TpuPlatform.device_control_env_var == "TPU_VISIBLE_CHIPS"
 
 
 def test_device_ids_patch_is_installed_once(monkeypatch):
