@@ -419,6 +419,9 @@ def _expert_placement_copy_factors() -> dict[str, Any] | None:
     layers it places hold primaries plus copies, and the grouped MoE path is
     bounded to the primaries (a static argument). None without copies, so a
     permutation table, or none, keeps the key it had."""
+    # Deferred: importing it loads the vllm_torchtpu.layers package (its
+    # attention and linear layers and the model registry), which this module
+    # does not otherwise import.
     from vllm_torchtpu.layers.adapter import expert_placement
 
     placement = expert_placement.current()
