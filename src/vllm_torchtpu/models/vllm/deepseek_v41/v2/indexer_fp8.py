@@ -19,13 +19,14 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
     PAGE_RECORDS,
-    PAGE_ROWS,
     PackedFP8Layout,
     read_fp8_records,
     write_fp8_records,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.candidates import (
     PreparedCandidates,
+    candidate_key_rows,
+    candidate_region_rows,
     prepare_candidates,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.dense_logits import (
@@ -207,8 +208,16 @@ def initialize_fp8_indexer() -> None:
         groups = tokens
         count *= 2
         key_pages = (count * block + PAGE_RECORDS - 1) // PAGE_RECORDS
+        fragment = min(block, PackedFP8Layout(*layout).page_size)
+        key_rows = candidate_key_rows(
+            groups,
+            key_pages * (PAGE_RECORDS // fragment),
+            fragment,
+            PackedFP8Layout(*layout).page_size,
+            len(banks),
+        )
         return (
-            banks[0].new_empty((groups * key_pages * PAGE_ROWS, 128)),
+            banks[0].new_empty((key_rows, 128)),
             candidates.new_empty(candidates.shape),
             requests.new_empty((groups + 1,)),
             requests.new_empty((tokens,), dtype=torch.bool),
@@ -383,6 +392,9 @@ def _score_and_select_candidates(
             output_width=candidate_token_capacity,
             query_start=start,
             query_count=query_chunk_size,
+            group_rows=candidate_region_rows(
+                candidate_block_ids.shape[1], candidate_block_size
+            ),
         )
         return (
             scores

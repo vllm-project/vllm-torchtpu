@@ -70,6 +70,15 @@ def prepare_candidates(
     metadata = prepare_candidate_metadata(
         pages, candidates, requests_ids, layout, block, width
     )
+    fragment = min(block, layout.page_size)
+    region_rows = (
+        metadata.physical_block_ids.shape[1] // (PAGE_RECORDS // fragment) * PAGE_ROWS
+    )
+    if region_rows != candidate_region_rows(candidates.shape[1], block):
+        raise ValueError(
+            f"Candidate K regions of {region_rows} rows, expected "
+            f"{candidate_region_rows(candidates.shape[1], block)}"
+        )
     keys = gather_candidate_keys(
         banks,
         metadata.physical_block_ids,
@@ -775,6 +784,72 @@ def resolve_candidate_blocks(
     return jnp.where(valid, pages * per_page + safe % per_page, -1)
 
 
+def _gather_config(block: int, page_size: int, num_banks: int) -> tuple[int, int]:
+    """(ids per gather step, pipeline buffers) of `gather_candidate_keys`."""
+    info = plsc.get_sparse_core_info()
+    config = PAGED_MQA_FRAGMENT_GATHER_CONFIG.get((block, page_size, num_banks))
+    if config is None:
+        group = max(info.num_lanes, min(128, 1024 // block))
+        buffers = min(
+            2,
+            info.vmem_capacity_bytes
+            // (group * PAGE_ROWS * (block + num_banks) * 4 + 4096),
+        )
+        config = PAGED_MQA_GATHER_CONFIG.get((block, num_banks), (group, buffers))
+    return config
+
+
+def candidate_key_rows(
+    groups: int, blocks: int, block: int, page_size: int, num_banks: int
+) -> int:
+    """Rows of the K array `gather_candidate_keys` returns.
+
+    The gather kernel writes whole steps of ids, so its output is rounded up
+    to the SparseCore units times the ids per step, past the
+    ``groups * blocks // (PAGE_RECORDS // block) * PAGE_ROWS`` rows of the
+    per-group regions. The array is returned untrimmed, because slicing the
+    exact rows off copies the whole gathered K (8.25 GiB for 2,048 queries with
+    16,384 candidate tokens each); consumers address each region by the region
+    size (`candidate_region_rows`), not by the array size.
+
+    Example: 2,048 groups of 4,096 blocks of 8 tokens, 16 blocks per page,
+    32 units x 96 ids per step: the 8,388,608 ids are padded to 8,389,632, so
+    the array has 524,352 pages (17,303,616 rows) for 524,288 region pages.
+
+    Uses only integer arithmetic, so it also takes symbolic sizes (the
+    fake implementation of the prepare op calls it during tracing).
+
+    Args:
+        groups: Query groups (rows of the physical block ids).
+        blocks: Physical blocks per group (columns of the physical block ids,
+            a multiple of the blocks per page).
+        block: Tokens per gathered block, at most page_size.
+        page_size: Tokens per cache page.
+        num_banks: Physical cache banks.
+
+    Returns:
+        The number of rows of the returned K array.
+    """
+    info = plsc.get_sparse_core_info()
+    units = info.num_cores * info.num_subcores
+    group, _ = _gather_config(block, page_size, num_banks)
+    per_page = PAGE_RECORDS // block
+    steps = (groups * blocks + units * group - 1) // (units * group)
+    return steps * group * units // per_page * PAGE_ROWS
+
+
+def candidate_region_rows(candidates_per_query: int, block: int) -> int:
+    """Rows of one query group's region in the gathered candidate K.
+
+    A group is a pair of queries, so its region holds up to twice one query's
+    candidate blocks, in whole packed pages of PAGE_RECORDS tokens. Example:
+    2,048 candidate blocks of 8 tokens per query give
+    ceil(2 x 2,048 x 8 / 128) = 256 pages of PAGE_ROWS = 33 rows, 8,448 rows.
+    """
+    pages = (2 * candidates_per_query * block + PAGE_RECORDS - 1) // PAGE_RECORDS
+    return pages * PAGE_ROWS
+
+
 def gather_candidate_keys(
     banks: tuple[jax.Array, ...],
     physical_block_ids: jax.Array,
@@ -793,21 +868,13 @@ def gather_candidate_keys(
         layout: Packed cache storage layout.
 
     Returns:
-        Packed int32 K of shape [packed_rows, PAGE_RECORDS], with equal-sized
-        contiguous regions per group; skipped tiles remain uninitialized.
+        Packed int32 K of shape [candidate_key_rows(...), PAGE_RECORDS]: equal
+        contiguous regions per group, then unused rows; skipped tiles remain
+        uninitialized.
     """
     info = plsc.get_sparse_core_info()
     lanes, units = info.num_lanes, info.num_cores * info.num_subcores
-    config = PAGED_MQA_FRAGMENT_GATHER_CONFIG.get((block, layout.page_size, len(banks)))
-    if config is None:
-        group = max(lanes, min(128, 1024 // block))
-        buffers = min(
-            2,
-            info.vmem_capacity_bytes
-            // (group * PAGE_ROWS * (block + len(banks)) * 4 + 4096),
-        )
-        config = PAGED_MQA_GATHER_CONFIG.get((block, len(banks)), (group, buffers))
-    group, buffers = config
+    group, buffers = _gather_config(block, layout.page_size, len(banks))
     count = physical_block_ids.size
     per_page = PAGE_RECORDS // block
     source_per_page = layout.page_size // block
@@ -1020,4 +1087,6 @@ def gather_candidate_keys(
                 lambda last=last: write(active - last - 1, wait=True)
             )
 
-    return kernel(banks, ids, control)[: count // per_page * PAGE_ROWS]
+    # Untrimmed (see candidate_key_rows): the slice to the regions' rows
+    # would copy the whole gathered K.
+    return kernel(banks, ids, control)

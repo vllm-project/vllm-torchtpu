@@ -59,7 +59,17 @@ def candidate_windows(
 
 
 def _kernel(
-    offsets, windows, query_start, inputs, out, scratch, *, config, info, resident
+    offsets,
+    windows,
+    query_start,
+    inputs,
+    out,
+    scratch,
+    *,
+    config,
+    info,
+    resident,
+    group_rows,
 ):
     q, weights, pool = inputs
     queries, keys, scores, counts, read_sem, write_sem, q_sem = scratch
@@ -69,7 +79,6 @@ def _kernel(
     q_tile, mxu, sublanes = config.query_tile, info.mxu_column_size, info.num_sublanes
     pairs = PACKED_FP8_PREPARED_PAIRS
     begin, width = query_start[()], out.shape[1]
-    group_rows = pool.shape[0] // (offsets.shape[0] - 1)
     next_query = partial(
         _next_query_tile, offsets=offsets, tile_size=q_tile, end=begin + out.shape[0]
     )
@@ -336,7 +345,7 @@ def _kernel(
         release(slot)
 
 
-@jax.jit(static_argnames=("output_width", "query_count"))
+@jax.jit(static_argnames=("output_width", "query_count", "group_rows"))
 def fp8_gathered_mqa_logits(
     q: jax.Array,
     keys: jax.Array,
@@ -347,6 +356,7 @@ def fp8_gathered_mqa_logits(
     output_width: int,
     query_start: jax.Array | int = 0,
     query_count: int | None = None,
+    group_rows: int | None = None,
 ) -> jax.Array:
     """Score pair unions and emit fixed-width contiguous per-query windows.
 
@@ -354,14 +364,22 @@ def fp8_gathered_mqa_logits(
     end2]. Each query owns [start, end1) and [split, end2); all other scores
     are -inf. Output column zero corresponds to ``start``. K retains one
     equal-sized packed union region per group, independently of output width.
+    ``group_rows`` is the rows of one region; None means ``keys`` holds exactly
+    one region per group. Rows of ``keys`` after the regions are ignored.
     """
     rows = q.shape[0] if query_count is None else query_count
     if rows == 0 or output_width == 0:
         return jnp.empty((rows, output_width), jnp.float32)
     info = cast(pltpu.TpuInfo, pltpu.get_tpu_info())
     groups = query_start_loc.shape[0] - 1
-    group_rows = keys.shape[0] // groups
-    if keys.shape != (groups * group_rows, PAGE_RECORDS) or group_rows % PAGE_ROWS:
+    if group_rows is None:
+        group_rows = keys.shape[0] // groups
+    # `gather_candidate_keys` leaves unused rows after the regions.
+    if (
+        keys.shape[1:] != (PAGE_RECORDS,)
+        or keys.shape[0] < groups * group_rows
+        or group_rows % PAGE_ROWS
+    ):
         raise ValueError("Gathered K must contain equal packed regions per group")
     if windows.shape != (q.shape[0], 4) or windows.dtype != jnp.int32:
         raise ValueError("Query windows must be int32 [queries, 4]")
@@ -370,10 +388,11 @@ def fp8_gathered_mqa_logits(
         raise ValueError("Output width exceeds gathered K capacity")
     tile = pl.cdiv(capacity, info.mxu_column_size) * info.mxu_column_size
     padded_rows = tile // PAGE_RECORDS * PAGE_ROWS
-    keys = jnp.pad(
-        keys.reshape(groups, group_rows, PAGE_RECORDS),
-        ((0, 0), (0, padded_rows - group_rows), (0, 0)),
-    ).reshape(-1, PAGE_RECORDS)
+    if padded_rows != group_rows:
+        keys = jnp.pad(
+            keys[: groups * group_rows].reshape(groups, group_rows, PAGE_RECORDS),
+            ((0, 0), (0, padded_rows - group_rows), (0, 0)),
+        ).reshape(-1, PAGE_RECORDS)
     config = replace(PACKED_FP8_PREPARED_MQA_CONFIG, key_tile=tile)
     width = pl.cdiv(output_width, PAGE_RECORDS) * PAGE_RECORDS
     q_tile, heads, dim = config.query_tile, q.shape[1], q.shape[2]
@@ -395,7 +414,13 @@ def fp8_gathered_mqa_logits(
     )
     hbm, vmem = (pl.BlockSpec(memory_space=s) for s in (pltpu.HBM, pltpu.VMEM))
     return pl.pallas_call(
-        partial(_kernel, config=config, info=info, resident=resident),
+        partial(
+            _kernel,
+            config=config,
+            info=info,
+            resident=resident,
+            group_rows=padded_rows,
+        ),
         out_shape=jax.ShapeDtypeStruct((rows, width), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
