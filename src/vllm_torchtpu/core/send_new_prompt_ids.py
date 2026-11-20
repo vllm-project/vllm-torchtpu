@@ -81,7 +81,7 @@ class Header:
         return ids
 
     @classmethod
-    def decode(cls, ids: list[int]) -> Header | None:
+    def decode(cls, ids: list[int] | None) -> Header | None:
         if not ids or ids[0] != MARK:
             return None
         return cls(*ids[1:HEADER_IDS])
@@ -301,11 +301,11 @@ def send_new_prompt_ids(capacity: int) -> None:
 
     @functools.wraps(upstream)
     async def add_request_async(self, request: EngineCoreRequest) -> None:
-        if not eligible(request):
+        ids = request.prompt_token_ids
+        if ids is None or not eligible(request):
             await upstream(self, request)
             return
         sent = self.__dict__.setdefault("_tpu_sent_prompts", SentPrompts(capacity))
-        ids = request.prompt_token_ids
         header = sent.header(ids)
         short = msgspec.structs.replace(
             request, prompt_token_ids=header.encode(ids[header.shared :])

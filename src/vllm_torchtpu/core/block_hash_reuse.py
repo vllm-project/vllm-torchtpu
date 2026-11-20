@@ -224,17 +224,19 @@ def reusing_block_hasher(
     block_bytes = block_size * array("I").itemsize
 
     def request_block_hasher(request: Request) -> list[BlockHash]:
+        prompt = request.prompt_token_ids
         if (
-            request.block_hashes
+            prompt is None
+            or request.block_hashes
             or not extra_keys_only_on_first_block(request)
-            or request.num_tokens != len(request.prompt_token_ids)
+            or request.num_tokens != len(prompt)
         ):
             return upstream(request)
         blocks = request.num_tokens // block_size
         if blocks == 0:
             return []
         token_ids = request.all_token_ids
-        tokens = packed(request.prompt_token_ids, blocks, block_size)
+        tokens = packed(prompt, blocks, block_size)
         first_keys, _ = kv_cache_utils.generate_block_hash_extra_keys(
             request, 0, block_size, 0
         )
