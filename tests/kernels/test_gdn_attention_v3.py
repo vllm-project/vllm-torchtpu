@@ -879,7 +879,104 @@ class GDNL2NormTest(parameterized.TestCase):
 
 
 class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
-    """CPU checks for single-token decode [k, q] projection fusion."""
+    """CPU checks for fused [k, q] recurrent GDN contractions."""
+
+    @staticmethod
+    def _per_seq_token_loop_oracle(
+        qkv: tuple[jax.Array, jax.Array, jax.Array],
+        gates: tuple[jax.Array, jax.Array],
+        state: jax.Array,
+        cfgs: config.GDNConfig,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Run un-fused per-sequence 2-dot reference recurrence."""
+        q_seq, k_seq, v_seq = qkv
+        gating_seq, beta_seq = gates
+        out_list = []
+        state_list = []
+        for c_idx in range(cfgs.chunk_size):
+            q_curr = jnp.repeat(q_seq[:, c_idx], cfgs.v_per_kq_head, axis=0)
+            k_curr = jnp.repeat(k_seq[:, c_idx], cfgs.v_per_kq_head, axis=0)
+            v_curr = v_seq[:, c_idx]
+            k_curr_t = compute_gdn.fused_transpose_broadcast(
+                k_curr, src_dim=2, dst_dim=1
+            )
+            beta_curr = beta_seq[:, c_idx]
+            gating_curr = gating_seq[:, c_idx]
+
+            state_updated = state * gating_curr
+            v_updated = jax.lax.dot(
+                k_curr,
+                state_updated,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            ).astype(cfgs.dtypes.compute)
+            v_new = beta_curr * (v_curr - v_updated)
+            state = state_updated + k_curr_t * v_new
+            out = jax.lax.dot(
+                q_curr,
+                state,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            ).astype(cfgs.dtypes.compute)
+            out_list.append(out[:, 0, :])
+            if c_idx >= cfgs.chunk_size - cfgs.window_size:
+                state_list.append(state)
+        return jnp.stack(out_list, axis=0), jnp.stack(state_list, axis=0)
+
+    @classmethod
+    def _run_per_seq_reference(
+        cls,
+        inputs: dict[str, jax.Array],
+        cfg: config.GDNConfig,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Compute per-sequence 2-dot reference outputs and checkpoints."""
+        compute_dtype = cfg.dtypes.compute
+        mask_dtype = compute_gdn.get_mask_dtype(compute_dtype)
+        iota = jax.lax.broadcasted_iota(
+            mask_dtype, (cfg.seq_tile_size, 1, cfg.chunk_size, 1, 1), 2
+        )
+        mask = iota < inputs["real_sizes"].reshape(-1, 1, 1, 1, 1).astype(mask_dtype)
+        q_masked = compute_gdn.l2_norm(
+            jnp.where(mask, inputs["q_compact"].astype(compute_dtype), 0)
+        ) * (cfg.kq_head_dim**-0.5)
+        k_masked = compute_gdn.l2_norm(
+            jnp.where(mask, inputs["k_compact"].astype(compute_dtype), 0)
+        )
+        v_masked = jnp.where(mask, inputs["v_compact"].astype(compute_dtype), 0)
+        beta_ref = compute_gdn.fused_transpose_broadcast(
+            jnp.where(
+                mask, jax.nn.sigmoid(inputs["b_compact"].astype(compute_dtype)), 0
+            ),
+            src_dim=4,
+            dst_dim=1,
+        )[:, : cfg.num_v_heads]
+        a_log_view = inputs["a_log"].reshape(1, 1, 1, 1, -1).astype(compute_dtype)
+        dt_bias_view = inputs["dt_bias"].reshape(1, 1, 1, 1, -1).astype(compute_dtype)
+        gating_ref = compute_gdn.fused_transpose_broadcast(
+            jnp.exp(
+                jnp.where(
+                    mask,
+                    -jnp.exp(a_log_view)
+                    * jax.nn.softplus(
+                        inputs["a_compact"].astype(compute_dtype) + dt_bias_view
+                    ),
+                    0,
+                )
+            ),
+            src_dim=4,
+            dst_dim=1,
+        )[:, : cfg.num_v_heads]
+        ref_outs, ref_states = [], []
+        for seq_idx in range(cfg.seq_tile_size):
+            out_seq, state_seq = cls._per_seq_token_loop_oracle(
+                (q_masked[seq_idx], k_masked[seq_idx], v_masked[seq_idx]),
+                (gating_ref[seq_idx], beta_ref[seq_idx]),
+                inputs["state_prev"][seq_idx],
+                cfg,
+            )
+            ref_outs.append(out_seq)
+            ref_states.append(state_seq)
+        return jnp.stack(ref_outs, axis=0), jnp.stack(ref_states, axis=0)
 
     def test_recurrent_gdn_fused_qk_decode_contraction(self):
         """Decode recurrence fuses [k, q] state contractions into one dot_general."""
@@ -909,7 +1006,7 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
         mesh = AbstractMesh(
             (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
         )
-        with use_abstract_mesh(mesh):
+        with use_abstract_mesh(mesh), jax.default_matmul_precision("highest"):
             aligned_v = cfg.aligned_num_v_heads
             rngs = iter(jax.random.split(jax.random.key(7), 8))
             real_sizes = jnp.array([1, 1, 0, 1], dtype=jnp.int32)
@@ -963,7 +1060,6 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
             mask = (real_sizes > 0).reshape(seq_tile, 1, 1, 1, 1)
             q_m = compute_gdn.l2_norm(jnp.where(mask, q_compact, 0.0)) * (d_k**-0.5)
             k_m = compute_gdn.l2_norm(jnp.where(mask, k_compact, 0.0))
-            k_t = compute_gdn.fused_transpose_broadcast(k_m, src_dim=4, dst_dim=3)
             v_m = jnp.where(mask, v_compact, 0.0)
             beta = jnp.where(mask, jax.nn.sigmoid(b_compact), 0.0)
             gating_log = jnp.exp(
@@ -983,13 +1079,9 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
 
             ref_outs, ref_states = [], []
             for idx in range(seq_tile):
-                o_i, s_i = compute_gdn.recurrent_gdn_per_seq(
-                    q_m[idx],
-                    k_m[idx],
-                    k_t[idx],
-                    v_m[idx],
-                    gating_log[idx],
-                    beta[idx],
+                o_i, s_i = self._per_seq_token_loop_oracle(
+                    (q_m[idx], k_m[idx], v_m[idx]),
+                    (gating_log[idx], beta[idx]),
                     state_prev[idx],
                     cfg,
                 )
@@ -1004,6 +1096,171 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
             np.testing.assert_allclose(
                 state_fused[2, 0], state_prev[2], rtol=0.0, atol=0.0
             )
+
+    def test_recurrent_gdn_batched_multi_token_window_with_ragged_masks(self) -> None:
+        """Batched recurrent_gdn matches 2-dot reference and emits rank-3 dots."""
+        spec_window_size = 4
+        kq_head_dim = v_head_dim = 128
+        seq_tile_size = 8
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        # Tolerances bound rounding differences between two sequential matmuls
+        # and the fused [k, q] matmul plus rank-1 output correction (1e-4 in f32,
+        # 2e-2 in bf16 with 7-bit mantissa across 4 sequential steps).
+        cases = [
+            (1, 2, 8, jnp.float32, 1e-4),
+            (1, 2, 8, jnp.bfloat16, 2e-2),
+            (spec_window_size, 2, 6, jnp.float32, 1e-4),
+            (spec_window_size, 2, 8, jnp.float32, 1e-4),
+            (spec_window_size, 2, 8, jnp.bfloat16, 2e-2),
+        ]
+        with use_abstract_mesh(mesh), jax.default_matmul_precision("highest"):
+            for window_size, num_kq_heads, num_v_heads, compute_dtype, tol in cases:
+                dim_size = 2 * num_kq_heads * kq_head_dim + num_v_heads * v_head_dim
+                cfg = config.GDNConfig(
+                    mode=config.GDNMode.BATCHED,
+                    dtypes=config.Dtypes(
+                        act_in=jnp.dtype(compute_dtype),
+                        act_out=jnp.dtype(compute_dtype),
+                        compute=jnp.dtype(compute_dtype),
+                        recurrent_state=jnp.dtype(jnp.float32),
+                        conv_state=jnp.dtype(jnp.float32),
+                    ),
+                    batch_size=seq_tile_size * window_size,
+                    dim_size=dim_size,
+                    kernel_size=4,
+                    tile_size=seq_tile_size,
+                    num_kq_heads=num_kq_heads,
+                    num_v_heads=num_v_heads,
+                    kq_head_dim=kq_head_dim,
+                    v_head_dim=v_head_dim,
+                    num_buffers=2,
+                    window_size=window_size,
+                    attention_mode=config.AttentionMode.GDN,
+                )
+                aligned_v_heads = cfg.aligned_num_v_heads
+                real_sizes = jnp.array(
+                    [
+                        window_size,
+                        max(1, window_size - 1),
+                        window_size,
+                        1,
+                        window_size,
+                        window_size,
+                        0,
+                        window_size,
+                    ],
+                    dtype=jnp.int32,
+                )
+                inputs = {
+                    "real_sizes": real_sizes,
+                    "q_compact": jax.random.normal(
+                        jax.random.key(42),
+                        (seq_tile_size, num_kq_heads, window_size, 1, kq_head_dim),
+                        dtype=compute_dtype,
+                    ),
+                    "k_compact": jax.random.normal(
+                        jax.random.key(43),
+                        (seq_tile_size, num_kq_heads, window_size, 1, kq_head_dim),
+                        dtype=compute_dtype,
+                    ),
+                    "v_compact": jax.random.normal(
+                        jax.random.key(44),
+                        (seq_tile_size, num_v_heads, window_size, 1, v_head_dim),
+                        dtype=compute_dtype,
+                    ),
+                    "b_compact": jax.random.normal(
+                        jax.random.key(45),
+                        (seq_tile_size, 1, window_size, 1, aligned_v_heads),
+                        dtype=compute_dtype,
+                    ),
+                    "a_compact": jax.random.normal(
+                        jax.random.key(46),
+                        (seq_tile_size, 1, window_size, 1, aligned_v_heads),
+                        dtype=compute_dtype,
+                    ),
+                    "state_prev": jax.random.normal(
+                        jax.random.key(47),
+                        (seq_tile_size, num_v_heads, kq_head_dim, v_head_dim),
+                        dtype=jnp.float32,
+                    ),
+                    "a_log": jax.random.normal(
+                        jax.random.key(48), (aligned_v_heads,), dtype=jnp.float32
+                    ),
+                    "dt_bias": jax.random.normal(
+                        jax.random.key(49), (aligned_v_heads,), dtype=jnp.float32
+                    ),
+                }
+                call_args = (
+                    inputs["real_sizes"],
+                    inputs["q_compact"],
+                    inputs["k_compact"],
+                    inputs["v_compact"],
+                    inputs["b_compact"],
+                    inputs["a_compact"],
+                    inputs["state_prev"],
+                    inputs["a_log"],
+                    inputs["dt_bias"],
+                    cfg,
+                )
+                jaxpr = jax.make_jaxpr(compute_gdn.recurrent_gdn, static_argnums=(9,))(
+                    *call_args
+                )
+                dot_eqns = [
+                    eqn
+                    for eqn in jaxpr.jaxpr.eqns
+                    if eqn.primitive.name == "dot_general"
+                ]
+                self.assertLen(dot_eqns, window_size)
+                for eqn in dot_eqns:
+                    self.assertEqual(
+                        eqn.invars[0].aval.shape,
+                        (seq_tile_size * num_v_heads, 2, kq_head_dim),
+                    )
+                    self.assertEqual(
+                        eqn.invars[1].aval.shape,
+                        (seq_tile_size * num_v_heads, kq_head_dim, v_head_dim),
+                    )
+
+                out, state = compute_gdn.recurrent_gdn(*call_args)
+                ref_out, ref_state = self._run_per_seq_reference(inputs, cfg)
+
+                np.testing.assert_allclose(
+                    np.asarray(out, np.float32),
+                    np.asarray(ref_out, np.float32),
+                    rtol=tol,
+                    atol=tol,
+                )
+                np.testing.assert_allclose(
+                    np.asarray(state, np.float32),
+                    np.asarray(ref_state, np.float32),
+                    rtol=tol,
+                    atol=tol,
+                )
+                # Masked-out rows and trailing checkpoints are bit-exact.
+                np.testing.assert_allclose(
+                    np.asarray(out[6], np.float32), 0.0, rtol=0.0, atol=0.0
+                )
+                np.testing.assert_allclose(
+                    np.asarray(state[6, -1], np.float32),
+                    np.asarray(inputs["state_prev"][6], np.float32),
+                    rtol=0.0,
+                    atol=0.0,
+                )
+                if window_size == spec_window_size:
+                    np.testing.assert_allclose(
+                        np.asarray(state[1, 3], np.float32),
+                        np.asarray(state[1, 2], np.float32),
+                        rtol=0.0,
+                        atol=0.0,
+                    )
+                    np.testing.assert_allclose(
+                        np.asarray(state[3, 3], np.float32),
+                        np.asarray(state[3, 0], np.float32),
+                        rtol=0.0,
+                        atol=0.0,
+                    )
 
 
 @pytest.mark.tpu_test

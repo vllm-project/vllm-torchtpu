@@ -47,7 +47,13 @@ from kernels.gdn.v3.vmem_test_utils import (
 )
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref, tiling, wrapper
+from vllm_torchtpu.kernels.gdn.v3 import (
+    compute_kda,
+    config,
+    memory_ref,
+    tiling,
+    wrapper,
+)
 
 
 class _TracedKdaInputs(NamedTuple):
@@ -1373,3 +1379,264 @@ class KdaTilingAndValidationTest(parameterized.TestCase):
                 ),
                 ["fused_conv1d_kda_per_seq_b1_c64"],
             )
+
+    @staticmethod
+    def _l2_norm_f32_oracle(x: jax.Array, eps: float = 1e-6) -> jax.Array:
+        """L2-normalize along the last dimension using float32 accumulation."""
+        x_f32 = x.astype(jnp.float32)
+        inv_norm = jax.lax.rsqrt(jnp.sum(x_f32 * x_f32, axis=-1, keepdims=True) + eps)
+        return (x_f32 * inv_norm).astype(x.dtype)
+
+    @staticmethod
+    def _per_seq_kda_token_loop_oracle(
+        qkv: tuple[jax.Array, jax.Array, jax.Array],
+        gates: tuple[jax.Array, jax.Array],
+        state_prev: jax.Array,
+        cfg: config.GDNConfig,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Run un-fused per-sequence 2-dot reference KDA recurrence."""
+        q_masked, k_masked, v_masked = qkv
+        gating_decay, beta_masked = gates
+        contract_dk = (((2,), (1,)), ((0,), (0,)))
+        ref_outs, ref_states = [], []
+        for seq_idx in range(cfg.seq_tile_size):
+            state = state_prev[seq_idx]
+            out_seq, state_seq = [], []
+            for chunk_idx in range(cfg.chunk_size):
+                q_heads = jnp.repeat(
+                    q_masked[seq_idx, :, chunk_idx], cfg.v_per_kq_head, axis=0
+                )[:, None, :]
+                k_heads = jnp.repeat(
+                    k_masked[seq_idx, :, chunk_idx], cfg.v_per_kq_head, axis=0
+                )[:, None, :]
+                k_heads_t = jnp.swapaxes(k_heads, 1, 2)
+                state_updated = state * gating_decay[seq_idx, :, chunk_idx, :, None]
+                v_updated = jax.lax.dot(
+                    k_heads,
+                    state_updated,
+                    dimension_numbers=contract_dk,
+                    preferred_element_type=jnp.float32,
+                )
+                v_new = beta_masked[seq_idx, :, chunk_idx : chunk_idx + 1] * (
+                    v_masked[seq_idx, :, chunk_idx : chunk_idx + 1] - v_updated
+                )
+                state = state_updated + k_heads_t * v_new
+                out = jax.lax.dot(
+                    q_heads,
+                    state,
+                    dimension_numbers=contract_dk,
+                    preferred_element_type=jnp.float32,
+                )
+                out_seq.append(out[:, 0, :])
+                state_seq.append(state)
+            ref_outs.append(jnp.stack(out_seq, axis=0))
+            ref_states.append(jnp.stack(state_seq, axis=0))
+        return jnp.stack(ref_outs, axis=0), jnp.stack(ref_states, axis=0)
+
+    def test_recurrent_kda_batched_multi_token_window_with_ragged_masks(self) -> None:
+        """Batched recurrent_kda matches per-seq 2-dot reference across W=1, 4."""
+        spec_window_size = 4
+        seq_tile_size = 8
+        num_kq_heads = 4
+        num_v_heads = 8
+        kq_head_dim = v_head_dim = 128
+        dim_size = 2 * num_kq_heads * kq_head_dim + num_v_heads * v_head_dim
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        with use_abstract_mesh(mesh), jax.default_matmul_precision("highest"):
+            cases = [
+                (window_size, act_dtype, gate_lower_bound)
+                for window_size in (1, spec_window_size)
+                for act_dtype in (jnp.float32, jnp.bfloat16)
+                for gate_lower_bound in (None, -5.0)
+            ]
+            for window_size, act_dtype, gate_lower_bound in cases:
+                cfg = config.GDNConfig(
+                    mode=config.GDNMode.BATCHED,
+                    dtypes=config.Dtypes(
+                        act_in=jnp.dtype(act_dtype),
+                        act_out=jnp.dtype(act_dtype),
+                        compute=jnp.dtype(jnp.float32),
+                        recurrent_state=jnp.dtype(jnp.float32),
+                        conv_state=jnp.dtype(jnp.float32),
+                    ),
+                    batch_size=seq_tile_size * window_size,
+                    dim_size=dim_size,
+                    kernel_size=4,
+                    tile_size=seq_tile_size,
+                    num_kq_heads=num_kq_heads,
+                    num_v_heads=num_v_heads,
+                    kq_head_dim=kq_head_dim,
+                    v_head_dim=v_head_dim,
+                    num_buffers=2,
+                    window_size=window_size,
+                    attention_mode=config.AttentionMode.KDA,
+                    gate_lower_bound=gate_lower_bound,
+                )
+                real_sizes = jnp.array(
+                    [
+                        window_size,
+                        max(1, window_size - 1),
+                        window_size,
+                        1,
+                        window_size,
+                        window_size,
+                        0,
+                        window_size,
+                    ],
+                    dtype=jnp.int32,
+                )
+                q_compact = jax.random.normal(
+                    jax.random.key(42),
+                    (seq_tile_size, num_kq_heads, window_size, 1, kq_head_dim),
+                    dtype=act_dtype,
+                )
+                k_compact = jax.random.normal(
+                    jax.random.key(43),
+                    (seq_tile_size, num_kq_heads, window_size, 1, kq_head_dim),
+                    dtype=act_dtype,
+                )
+                v_compact = jax.random.normal(
+                    jax.random.key(44),
+                    (seq_tile_size, num_v_heads, window_size, 1, v_head_dim),
+                    dtype=act_dtype,
+                )
+                b_compact = jax.random.normal(
+                    jax.random.key(45),
+                    (seq_tile_size, 1, window_size, 1, cfg.aligned_num_v_heads),
+                    dtype=act_dtype,
+                )
+                a_compact = jax.random.normal(
+                    jax.random.key(46),
+                    (seq_tile_size, num_v_heads, window_size, 1, kq_head_dim),
+                    dtype=act_dtype,
+                )
+                state_prev = jax.random.normal(
+                    jax.random.key(47),
+                    (seq_tile_size, num_v_heads, kq_head_dim, v_head_dim),
+                    dtype=jnp.float32,
+                )
+                a_log = jax.random.normal(
+                    jax.random.key(48), (num_v_heads,), dtype=jnp.float32
+                )
+                dt_bias = jax.random.normal(
+                    jax.random.key(49), (num_v_heads, kq_head_dim), dtype=jnp.float32
+                )
+
+                jaxpr = jax.make_jaxpr(compute_kda.recurrent_kda, static_argnums=(9,))(
+                    real_sizes,
+                    q_compact,
+                    k_compact,
+                    v_compact,
+                    b_compact,
+                    a_compact,
+                    state_prev,
+                    a_log,
+                    dt_bias,
+                    cfg,
+                )
+                dot_eqns = [
+                    eqn
+                    for eqn in jaxpr.jaxpr.eqns
+                    if eqn.primitive.name == "dot_general"
+                ]
+                self.assertLen(dot_eqns, window_size)
+                for eqn in dot_eqns:
+                    self.assertEqual(
+                        eqn.invars[0].aval.shape,
+                        (cfg.tile_size * cfg.num_v_heads, 2, cfg.kq_head_dim),
+                    )
+                    self.assertEqual(
+                        eqn.invars[1].aval.shape,
+                        (
+                            cfg.tile_size * cfg.num_v_heads,
+                            cfg.kq_head_dim,
+                            cfg.v_head_dim,
+                        ),
+                    )
+
+                out, state = compute_kda.recurrent_kda(
+                    real_sizes,
+                    q_compact,
+                    k_compact,
+                    v_compact,
+                    b_compact,
+                    a_compact,
+                    state_prev,
+                    a_log,
+                    dt_bias,
+                    cfg,
+                )
+                iota = jax.lax.broadcasted_iota(
+                    jnp.int32, (seq_tile_size, 1, window_size, 1, 1), 2
+                )
+                mask = iota < real_sizes.reshape(-1, 1, 1, 1, 1)
+                q_masked = self._l2_norm_f32_oracle(
+                    jnp.where(mask, q_compact.astype(jnp.float32), 0.0)
+                ) * (kq_head_dim**-0.5)
+                k_masked = self._l2_norm_f32_oracle(
+                    jnp.where(mask, k_compact.astype(jnp.float32), 0.0)
+                )
+                v_masked = jnp.where(mask, v_compact.astype(jnp.float32), 0.0)
+                beta_masked = jnp.where(
+                    mask, jax.nn.sigmoid(b_compact.astype(jnp.float32)), 0.0
+                )
+                beta_masked = jnp.swapaxes(beta_masked, 1, 4)[:, :num_v_heads, :, 0, :]
+                gating_log = jnp.where(
+                    mask,
+                    compute_kda.activate_gate(
+                        a_compact,
+                        a_log.reshape(1, num_v_heads, 1, 1, 1),
+                        dt_bias.reshape(1, num_v_heads, 1, 1, kq_head_dim),
+                        cfg,
+                    ),
+                    0.0,
+                )
+                gating_decay = jnp.exp(gating_log)[:, :, :, 0, :]
+                ref_out, ref_state = self._per_seq_kda_token_loop_oracle(
+                    (
+                        q_masked[:, :, :, 0, :],
+                        k_masked[:, :, :, 0, :],
+                        v_masked[:, :, :, 0, :],
+                    ),
+                    (gating_decay, beta_masked),
+                    state_prev,
+                    cfg,
+                )
+
+                np.testing.assert_allclose(
+                    np.asarray(out, np.float32),
+                    np.asarray(ref_out, np.float32),
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
+                np.testing.assert_allclose(
+                    np.asarray(state, np.float32),
+                    np.asarray(ref_state, np.float32),
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
+                # Masked-out rows and trailing checkpoints are bit-exact.
+                np.testing.assert_allclose(
+                    np.asarray(out[6], np.float32), 0.0, rtol=0.0, atol=0.0
+                )
+                np.testing.assert_allclose(
+                    np.asarray(state[6, -1], np.float32),
+                    np.asarray(state_prev[6], np.float32),
+                    rtol=0.0,
+                    atol=0.0,
+                )
+                if window_size == spec_window_size:
+                    np.testing.assert_allclose(
+                        np.asarray(state[1, 3], np.float32),
+                        np.asarray(state[1, 2], np.float32),
+                        rtol=0.0,
+                        atol=0.0,
+                    )
+                    np.testing.assert_allclose(
+                        np.asarray(state[3, 3], np.float32),
+                        np.asarray(state[3, 0], np.float32),
+                        rtol=0.0,
+                        atol=0.0,
+                    )
