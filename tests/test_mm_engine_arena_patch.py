@@ -24,6 +24,7 @@ from vllm.distributed.device_communicators.shm_tensor_arena import ShmTensorAren
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from vllm_torchtpu import mm_engine_arena_patch as patch_mod
+from vllm_torchtpu import mm_host_copy_patch
 
 PINNED_VLLM_VERSION = "0.33.0"
 PINNED_SOURCE_HASHES = {
@@ -56,11 +57,18 @@ def test_upstream_sources_unchanged(name, fn):
     )
 
 
-def _sender():
+def _sender(monkeypatch):
     """A sender whose arena has 3 slots of one large tensor each."""
-    sender = patch_mod.ArenaTensorSender()
-    sender._arena = ShmTensorArena(n_reader=1, slot_bytes=_big().nbytes, n_slots=3)
-    return sender
+
+    def small_arena(n_reader, *args, **kwargs):
+        if args or kwargs:  # a reader attaching by the sender's handle
+            return ShmTensorArena(n_reader, *args, **kwargs)
+        return ShmTensorArena(n_reader, _big().nbytes, n_slots=3)
+
+    monkeypatch.setattr(patch_mod, "ShmTensorArena", small_arena)
+    # Served together: the arena takes the lowest free slot.
+    monkeypatch.setattr(ShmTensorArena, "write_tensor", mm_host_copy_patch.write_tensor)
+    return patch_mod.ArenaTensorSender()
 
 
 def _big():
@@ -69,10 +77,10 @@ def _big():
     return torch.randint(0, 256, (rows, 1536), dtype=torch.uint8, generator=gen)
 
 
-def test_encoder_round_trip():
+def test_encoder_round_trip(monkeypatch):
     """Through vLLM's encoder and decoder, a large tensor arrives as a view
     of an arena slot and a small one inline, both with the sent bytes."""
-    sender = _sender()
+    sender = _sender(monkeypatch)
     encoder = MsgpackEncoder(oob_tensor_consumer=sender)
     decoder = MsgpackDecoder(
         list[torch.Tensor], oob_tensor_provider=patch_mod.ArenaTensorReceiver()
@@ -83,17 +91,15 @@ def test_encoder_round_trip():
     assert sender._arena.write_tensor(big) == 1  # the large one took slot 0
 
 
-def test_slot_frees_after_the_view_dies():
+def test_slot_frees_after_the_view_dies(monkeypatch):
     """A slot stays taken while EngineCore holds its view, and is written
-    again once the view is gone."""
-    sender, receiver = _sender(), patch_mod.ArenaTensorReceiver()
+    again as soon as the view is gone."""
+    sender, receiver = _sender(monkeypatch), patch_mod.ArenaTensorReceiver()
     big = _big()
-    shape = tuple(big.shape)
     meta = sender(big)
     assert meta["slot"] == 0
-    view = receiver("uint8", shape, meta)
-    assert sender(big)["slot"] == 1  # slot 0 is still read
+    view = receiver("uint8", tuple(big.shape), meta)[1:]
+    assert sender(big)["slot"] == 1  # slot 0 is still read, through a slice
     del view
     gc.collect()
-    receiver("uint8", shape, sender(big))  # the next read retires slot 0
     assert sender(big)["slot"] == 0

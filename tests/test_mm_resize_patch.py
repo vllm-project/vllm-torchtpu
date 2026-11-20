@@ -25,9 +25,7 @@ from torchvision.transforms.v2 import functional as tvF
 from vllm_torchtpu import mm_resize_patch as patch_mod
 
 PINNED_TRANSFORMERS_VERSION = "5.20.2"
-PINNED_SOURCE_HASH = (
-    "3f84c32c17b2f8d659e41a2e0bf6f2bb6cae383d2c52a92b9cbf9d98ade07041"
-)
+PINNED_SOURCE_HASH = "3f84c32c17b2f8d659e41a2e0bf6f2bb6cae383d2c52a92b9cbf9d98ade07041"
 
 
 @pytest.mark.skipif(
@@ -55,6 +53,7 @@ BICUBIC, BILINEAR = tvF.InterpolationMode.BICUBIC, tvF.InterpolationMode.BILINEA
         ((999, 1201, 4), (999, 640)),  # one pass only, 4 channels
         ((641, 1003, 3), (1300, 1003)),
         ((2, 600, 700, 3), (513, 1025)),  # a batch of images
+        ((3, 2000, 3), (5, 70000)),  # fewer rows than strips
     ],
 )
 @pytest.mark.parametrize("interpolation", [BICUBIC, BILINEAR])
@@ -64,7 +63,9 @@ def test_strips_match_torchvision(shape, size, interpolation, antialias):
     channels-last view a PIL image converts to."""
     hwc = np.random.default_rng(0).integers(0, 256, shape, dtype=np.uint8)
     image = torch.from_numpy(hwc).movedim(-1, -3)
-    want = tvF.resize(image, list(size), interpolation=interpolation, antialias=antialias)
+    want = tvF.resize(
+        image, list(size), interpolation=interpolation, antialias=antialias
+    )
     got = patch_mod.resize_in_strips(image, size, interpolation, antialias)
     assert torch.equal(got, want)
     assert got.stride() == want.stride()

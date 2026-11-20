@@ -524,10 +524,10 @@ def maybe_patch_qwen3_vl_video_hf_text(
                 _qwen3_vl_hf_main.active = False
 
         @functools.wraps(upstream_call)
-        def call_hf_processor(self, hf_processor, data, kwargs={}):
+        def call_hf_processor(self, hf_processor, data, *args, **kwargs):
             if getattr(_qwen3_vl_hf_main, "active", False) and "videos" in data:
                 data = {k: v for k, v in data.items() if k != "text"}
-            return upstream_call(self, hf_processor, data, kwargs)
+            return upstream_call(self, hf_processor, data, *args, **kwargs)
 
         processor_cls._apply_hf_processor_main = _apply_hf_processor_main
         context.InputProcessingContext.call_hf_processor = call_hf_processor

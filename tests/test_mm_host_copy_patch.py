@@ -26,9 +26,7 @@ from vllm_torchtpu import mm_host_copy_patch as patch_mod
 
 PINNED_VLLM_VERSION = "0.33.0"
 PINNED_SOURCE_HASHES = {
-    "__init__": (
-        "f550f1794a43766b415fbf3adf0728becc071a585e00d45d0b63cc43ff26b1e7"
-    ),
+    "__init__": ("f550f1794a43766b415fbf3adf0728becc071a585e00d45d0b63cc43ff26b1e7"),
     "write_tensor": (
         "b68dfda05bea53ee9522e65519f14519d6a0c2cff2f393fc3717bd2b2e23afee"
     ),

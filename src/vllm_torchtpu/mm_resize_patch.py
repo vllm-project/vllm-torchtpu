@@ -45,12 +45,14 @@ from vllm_torchtpu.mm_host_copy_patch import host_pool, host_threads
 # The upstream method this module reproduces; the tests pin its source.
 UPSTREAM_RESIZE = backends.TorchvisionBackend.resize
 
-# A strip below this many output pixels costs less than handing it to a thread
-# (~20 us): the kernel writes ~1.7 ns per pixel (9 ms for 3040x1760).
+# The kernel writes ~1.7 ns per output pixel (9 ms for 3040x1760), so a strip of
+# this many pixels runs ~0.2 ms, ten times what handing it to a thread costs.
 MIN_STRIP_PIXELS = 1 << 17
 
 
 def _bounds(n: int, parts: int) -> list[tuple[int, int]]:
+    """`parts` contiguous ranges covering range(n), none empty."""
+    parts = min(parts, n)
     return [(n * i // parts, n * (i + 1) // parts) for i in range(parts)]
 
 
@@ -83,7 +85,9 @@ def resize_in_strips(
     *lead, c, h, w = image.shape
     strips = min(host_threads(), h2 * w2 // MIN_STRIP_PIXELS)
     if strips < 2 or (h, w) == (h2, w2) or not _native_uint8(image, interpolation):
-        return tvF.resize(image, list(size), interpolation=interpolation, antialias=antialias)
+        return tvF.resize(
+            image, list(size), interpolation=interpolation, antialias=antialias
+        )
 
     def one(src: np.ndarray, out_size: list[int]) -> np.ndarray:
         t = torch.from_numpy(src).permute(2, 0, 1)
@@ -137,9 +141,11 @@ def resize(
         or image.device.type != "cpu"
     ):
         backends.logger.warning_once(
-            "LANCZOS resample requires torchvision >= 0.27 and processing on CPU; it is not supported on CUDA or for "
-            "torchvision < 0.27. Falling back to BICUBIC which approximates LANCZOS. To match the original model exactly"
-            ", upgrade torchvision and move the tensors to CPU before resizing, or use a PIL backend image processor instead."
+            "LANCZOS resample requires torchvision >= 0.27 and processing on CPU; "
+            "it is not supported on CUDA or for torchvision < 0.27. Falling back "
+            "to BICUBIC which approximates LANCZOS. To match the original model "
+            "exactly, upgrade torchvision and move the tensors to CPU before "
+            "resizing, or use a PIL backend image processor instead."
         )
         interpolation = tvF.InterpolationMode.BICUBIC
 
@@ -164,8 +170,8 @@ def resize(
         new_size = (size.height, size.width)
     else:
         raise ValueError(
-            "Size must contain 'height' and 'width' keys, or 'max_height' and 'max_width', or 'shortest_edge' key. Got"
-            f" {size}."
+            "Size must contain 'height' and 'width' keys, or 'max_height' and "
+            f"'max_width', or 'shortest_edge' key. Got {size}."
         )
 
     # Workaround for torch.compile issue with uint8 on AMD GPUs

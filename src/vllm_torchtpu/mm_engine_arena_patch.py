@@ -15,8 +15,9 @@
 
 The API server sends each request to EngineCore over a ZMQ ipc socket, the
 pixels as zero-copy frames. A unix socket still copies them twice in the
-kernel, once into it and once out. Here they take the shared-memory tensor arena EngineCore
-already uses for its workers: the API server writes each tensor of at least
+kernel, once into it and once out. Here they take the shared-memory tensor
+arena EngineCore already uses for its workers: the API server writes each
+tensor of at least
 `MIN_BYTES` into a slot of its own arena (1.3 ms for 32 MB on the copy pool,
 see `mm_host_copy_patch`), the message carries the slot, and EngineCore reads
 a zero-copy view of it. The slot frees once EngineCore drops the tensor. A
@@ -34,8 +35,10 @@ from __future__ import annotations
 
 import functools
 import math
+import weakref
 from typing import Any
 
+import numpy as np
 import torch
 from vllm.distributed.device_communicators.shm_tensor_arena import (
     _ARENA_MIN_BYTES,
@@ -54,10 +57,11 @@ MIN_BYTES = _ARENA_MIN_BYTES
 
 class ArenaTensorSender(OOBTensorConsumer):
     """API server end: writes large CPU tensors into its arena (one reader,
-    EngineCore), made on first use."""
+    EngineCore). The arena is made here, at startup, so creating it and
+    touching its first slot (`mm_host_copy_patch`) is not a request's cost."""
 
     def __init__(self) -> None:
-        self._arena: ShmTensorArena | None = None
+        self._arena = ShmTensorArena(n_reader=1)
 
     def new_message(self) -> None:
         """Slots carry no per-message state."""
@@ -72,8 +76,6 @@ class ArenaTensorSender(OOBTensorConsumer):
             and tensor.nbytes >= MIN_BYTES
         ):
             return None
-        if self._arena is None:
-            self._arena = ShmTensorArena(n_reader=1)
         slot = self._arena.write_tensor(tensor)
         if slot is None:
             return None
@@ -81,8 +83,12 @@ class ArenaTensorSender(OOBTensorConsumer):
 
 
 class ArenaTensorReceiver:
-    """EngineCore end: a zero-copy view of the slot; the slot frees at the
-    next call after the view's storage dies."""
+    """EngineCore end: a zero-copy view of the slot, which frees as soon as the
+    view's storage dies. Upstream's readers wait for their next dequeue (and a
+    CUDA event when pinned) because an H2D copy may still read the slot; this
+    reader never copies to a device, and the next request's pixels are written
+    before EngineCore reads its message, so a deferred release would hand them
+    a new, unallocated slot."""
 
     def __init__(self) -> None:
         self._arenas: dict[str, ShmTensorArena] = {}
@@ -96,22 +102,34 @@ class ArenaTensorReceiver:
             arena = self._arenas[name] = ShmTensorArena(
                 n_reader, slot_bytes, n_slots, name=name, reader_rank=0
             )
-        arena.flush_releases()
+        slot = meta["slot"]
         torch_dtype = getattr(torch, dtype)
         nbytes = math.prod(shape) * torch_dtype.itemsize
-        return arena.get_tensor(meta["slot"], nbytes, torch_dtype, tuple(shape))
+        # As in `ShmTensorArena.get_tensor`: the storage holds the only
+        # reference to `holder`, so the finalizer runs when the storage dies.
+        holder = np.frombuffer(arena._slot(slot, nbytes), dtype=np.uint8)
+        weakref.finalize(holder, arena._mark_released, [slot])
+        return torch.from_numpy(holder).view(torch_dtype).view(tuple(shape))
 
 
 @functools.wraps(UPSTREAM_CLIENT_INIT)
 def _client_init(self: core_client.MPClient, *args: Any, **kwargs: Any) -> None:
     UPSTREAM_CLIENT_INIT(self, *args, **kwargs)
     encoder = getattr(self, "encoder", None)
-    if encoder is not None and encoder.oob_tensor_consumer is None:
+    model_config = self.vllm_config.model_config
+    if (
+        encoder is not None
+        and encoder.oob_tensor_consumer is None
+        and model_config is not None
+        and model_config.is_multimodal_model
+    ):
         encoder.oob_tensor_consumer = ArenaTensorSender()
 
 
 @functools.wraps(UPSTREAM_PROCESS_INPUT_SOCKETS)
-def _process_input_sockets(self: core.EngineCoreProc, *args: Any, **kwargs: Any) -> None:
+def _process_input_sockets(
+    self: core.EngineCoreProc, *args: Any, **kwargs: Any
+) -> None:
     if self.tensor_ipc_receiver is None:
         self.tensor_ipc_receiver = ArenaTensorReceiver()
     return UPSTREAM_PROCESS_INPUT_SOCKETS(self, *args, **kwargs)
