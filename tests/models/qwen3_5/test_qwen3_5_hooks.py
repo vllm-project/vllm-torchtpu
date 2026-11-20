@@ -28,6 +28,7 @@ from vllm.model_executor.models.config import (
 )
 
 from vllm_torchtpu import additional_config_sections, envs, tpu_info
+from vllm_torchtpu.layers.adapter import expert_placement
 from vllm_torchtpu.models.qwen3_5 import hooks, settings
 from vllm_torchtpu.models.qwen3_5.hooks import TPUQwen35MoeConfig
 from vllm_torchtpu.models.vllm import register_models
@@ -68,12 +69,12 @@ def test_hook_extends_vllms_qwen3_5_hook():
 # 3 x hidden x moe_intermediate = 3 x 4096 x 1024 B.
 HIDDEN, INTER, EXPERTS, LAYERS = 4096, 1024, 512, 60
 SLOT_LAYER_BYTES = 3 * HIDDEN * INTER
-# Main's placement only permutes experts: 512 / EP8 = 64 slots per rank, 16
-# fewer than the 80 the budget was measured with, in each of the 60 layers:
-# 960 slot-layers, so a TP8 + DCP4 decode leg gets 33.5e9 B + 960 x 3 x 4096 x
-# 1024 B = 45,579,595,520 B here. (The validation entries' record runs placed
-# 68 slots per rank with an expert table that has copies, a later change, and
-# ran with 42,509,364,992 B.)
+# Without a placement table, or with one that only permutes experts, a rank
+# holds 512 / EP8 = 64 slots, 16 fewer than the 80 the budget was measured
+# with, in each of the 60 layers: 960 slot-layers, so a TP8 + DCP4 decode leg
+# gets 33.5e9 B + 960 x 3 x 4096 x 1024 B = 45,579,595,520 B. (The validation
+# entries' TP8 decode legs place 68 slots per rank with the copies table,
+# TP8_TABLE, and get 42,509,364,992 B: RECORDED_DECODE_KV_BYTES.)
 CREDIT_EP8 = (80 - 64) * LAYERS * SLOT_LAYER_BYTES
 
 
@@ -652,6 +653,31 @@ def test_pcp4_prefill_leg_hashes_in_whole_scheduler_blocks(shape):
 
 VALIDATION = pathlib.Path(hooks.__file__).parent / "validation"
 POINTS = sorted(VALIDATION.glob("p[0-9][0-9]-*.yaml"))
+# The tables the decode legs' $EXPERT_PLACEMENT_TABLE stands for (README.md):
+# 68 slots per rank (64 experts, 4 copies) on the TP8 points, a permutation of
+# the 512 experts (64 per rank) on the DP4 x TP2 point.
+TP8_TABLE = VALIDATION / "expert_placement_tp8_ep8_agentx_corr_c32.json"
+DP8_TABLE = VALIDATION / "expert_placement_dp8_ep8.json"
+
+
+def placement_table(path: pathlib.Path) -> pathlib.Path:
+    """The table $EXPERT_PLACEMENT_TABLE stands for in this point's decode leg."""
+    return DP8_TABLE if "dp4tp2" in path.stem else TP8_TABLE
+
+
+def _set_placement(monkeypatch, env: dict, path: pathlib.Path) -> None:
+    """Sets TPU_EXPERT_PLACEMENT as the leg ``env`` of point ``path`` has it,
+    the placeholder resolved to the point's table (unset if absent), and
+    forgets any table read so far. A plain attribute another test's
+    monkeypatch.setattr left on envs.py is dropped, as in _set_moe_env."""
+    if "TPU_EXPERT_PLACEMENT" in vars(envs):
+        monkeypatch.delattr(envs, "TPU_EXPERT_PLACEMENT")
+    if "TPU_EXPERT_PLACEMENT" in env:
+        assert env["TPU_EXPERT_PLACEMENT"] == "$EXPERT_PLACEMENT_TABLE"
+        monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(placement_table(path)))
+    else:
+        monkeypatch.delenv("TPU_EXPERT_PLACEMENT", raising=False)
+    expert_placement.clear_cache()
 
 
 def _flag(args: list[str], name: str, default: str | None) -> str | None:
@@ -676,29 +702,38 @@ def _leg_config(leg: dict) -> SimpleNamespace:
     )
 
 
-# The KV budget each point's decode leg gets on this tree: TP8 + DCP4 legs the
-# auto budget with main's permutation placement; p01's DP4 x TP2 leg passes
-# --kv-cache-memory-bytes, which is kept.
-DECODE_KV_BYTES = {
+# The KV budget each point's decode leg ran with, as the record runs logged
+# it: every TP8 + DCP4 leg the auto budget with the copies table, 33.5e9 B +
+# (12 x 60 - 4) x 3 x 4096 x 1024 B (68 slots per rank in the 60 layers, and
+# the drafter's 4 copy slots); p01's DP4 x TP2 leg its
+# --kv-cache-memory-bytes, which the hook keeps.
+RECORDED_DECODE_KV_BYTES = {
     "p01": 39_500_000_000,
-    "p05": 33_500_000_000 + CREDIT_EP8,
-    "p08": 33_500_000_000 + CREDIT_EP8,
-    "p10": 33_500_000_000 + CREDIT_EP8,
-    "p12": 33_500_000_000 + CREDIT_EP8,
+    "p05": 42_509_364_992,
+    "p08": 42_509_364_992,
+    "p10": 42_509_364_992,
+    "p12": 42_509_364_992,
 }
 
 
+@pytest.fixture
+def placement_cache():
+    yield
+    expert_placement.clear_cache()
+
+
 @pytest.mark.parametrize("path", POINTS, ids=lambda p: p.stem)
-def test_validation_points_keep_their_defaults(path, monkeypatch):
+def test_validation_points_keep_their_defaults(path, monkeypatch, placement_cache):
     """Every point's prefill leg gets the 128-token unit and stays on
-    gpu_memory_utilization; every decode leg keeps the default unit and gets
-    its budget, with the MoE kernel its environment selects: the measured
-    legs are unchanged."""
+    gpu_memory_utilization; every decode leg keeps the default unit and, with
+    the MoE kernel and expert placement table its environment selects, gets
+    the KV budget its record run logged: the measured legs are unchanged."""
     with path.open() as f:
         legs = yaml.safe_load(f)["legs"]
     configs = {}
     for name in ("prefill", "decode"):
         _set_moe_env(monkeypatch, legs[name]["env"])
+        _set_placement(monkeypatch, legs[name]["env"], path)
         configs[name] = _run_hook(_leg_config(legs[name]))
     prefill, decode = configs["prefill"], configs["decode"]
     assert prefill.kv_transfer_config.kv_role == "kv_producer"
@@ -707,7 +742,7 @@ def test_validation_points_keep_their_defaults(path, monkeypatch):
     assert decode.kv_transfer_config.kv_role == "kv_consumer"
     assert decode.cache_config.prefix_match_unit is None
     point = path.name.split("-")[0]
-    assert decode.cache_config.kv_cache_memory_bytes == DECODE_KV_BYTES[point]
+    assert decode.cache_config.kv_cache_memory_bytes == RECORDED_DECODE_KV_BYTES[point]
 
 
 def test_the_budget_admits_exactly_the_entries_auto_budget_layouts(monkeypatch):
