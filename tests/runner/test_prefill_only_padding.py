@@ -13,17 +13,39 @@
 # limitations under the License.
 """Prefill-only MTP: the worker strips draft-placeholder rows vLLM padded onto a
 final prompt token (a serving crash: computed 126208, scheduled 2, prompt
-126209)."""
+126209), and vLLM's scheduler counts them as rejected drafts."""
 
 import dataclasses
+import json
 import types
 
 import pytest
+import torch
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    ModelConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
+from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.request import Request
+from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner, _strip_prefill_only_padding
@@ -112,6 +134,19 @@ def test_leaves_real_drafts_and_in_prompt_steps_alone():
     assert so.num_scheduled_tokens["b"] == 2
 
 
+@pytest.mark.parametrize("computed", [126209, 126300])
+def test_leaves_steps_past_the_prompt_alone(computed):
+    """Under async scheduling a decode or verify step also carries -1
+    placeholders. It starts at or past the end of the prompt, so the step
+    without them still crosses it: untouched, and the runner's guard refuses
+    it."""
+    cached = _so({"r": 2}, {"r": [-1]}, cached=_cached(["r"], [computed]))
+    assert _strip_prefill_only_padding(cached, _requests([("r", 126209)])) is cached
+    new = _so({"n": 2}, {"n": [-1]}, new=[_new("n", computed, 126209)])
+    assert _strip_prefill_only_padding(new, _requests()) is new
+    assert new.num_scheduled_tokens == {"n": 2}
+
+
 class _Stop(Exception):
     pass
 
@@ -186,3 +221,109 @@ def test_a_request_skipped_in_the_last_step_is_stripped():
     (out,) = seen
     assert out.num_scheduled_tokens == {"r": 1}
     assert "r" not in out.scheduled_spec_decode_tokens
+
+
+def _scheduler(tmp_path, scheduler_cls, chunk):
+    """vLLM's scheduler over a 2-layer OPT config and a 16-block cache."""
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["OPTForCausalLM"],
+                "model_type": "opt",
+                "hidden_size": 64,
+                "num_attention_heads": 2,
+                "num_hidden_layers": 2,
+                "ffn_dim": 128,
+                "max_position_embeddings": 2048,
+                "vocab_size": 1000,
+            }
+        )
+    )
+    vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=8,
+            max_num_batched_tokens=chunk,
+            max_model_len=2048,
+            enable_chunked_prefill=True,
+            is_encoder_decoder=False,
+            watermark=0.0,
+            async_scheduling=scheduler_cls is AsyncScheduler,
+        ),
+        model_config=ModelConfig(
+            model=str(tmp_path),
+            tokenizer=str(tmp_path),
+            skip_tokenizer_init=True,
+            dtype="float16",
+            seed=42,
+            max_model_len=2048,
+        ),
+        cache_config=CacheConfig(
+            block_size=16,
+            gpu_memory_utilization=0.9,
+            cache_dtype="auto",
+            enable_prefix_caching=False,
+        ),
+        parallel_config=ParallelConfig(),
+        device_config=DeviceConfig(device="cpu"),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=16,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer0"],
+                FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=32, dtype=torch.float16
+                ),
+            )
+        ],
+    )
+    vllm_config.cache_config.num_gpu_blocks = 16
+    register_all_kvcache_specs(vllm_config)
+    return scheduler_cls(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+        block_size=16,
+    )
+
+
+def _sampled(so, tokens):
+    req_ids = list(so.num_scheduled_tokens)
+    return ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={r: i for i, r in enumerate(req_ids)},
+        sampled_token_ids=[tokens] * len(req_ids),
+    )
+
+
+@pytest.mark.parametrize("scheduler_cls", [Scheduler, AsyncScheduler])
+def test_the_scheduler_counts_the_dropped_placeholder_as_rejected(
+    tmp_path, scheduler_cls
+):
+    """vLLM's scheduler, reading its own step, rolls the placeholder the worker
+    dropped back as a rejected draft: the request ends the step at its prompt
+    length with no output placeholder left, holding the sampled token."""
+    prompt = 33
+    scheduler = _scheduler(tmp_path, scheduler_cls, chunk=prompt - 1)
+    request = Request(
+        "r",
+        list(range(1, prompt + 1)),
+        SamplingParams(max_tokens=4, detokenize=False),
+        None,
+    )
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {"r": prompt - 1}
+    scheduler.update_from_output(first, _sampled(first, []))
+    # The serving crash's state: one prompt token left and a -1 placeholder.
+    request.spec_token_ids = [-1]
+    step = scheduler.schedule()
+    assert step.num_scheduled_tokens == {"r": 2}
+    assert step.scheduled_spec_decode_tokens == {"r": [-1]}
+    ran = _strip_prefill_only_padding(step, _requests([("r", prompt)]))
+    assert ran.num_scheduled_tokens == {"r": 1}
+    scheduler.update_from_output(step, _sampled(ran, [7]))
+    assert request.num_computed_tokens == prompt
+    assert request.num_output_placeholders == 0
+    assert list(request.output_token_ids) == [7]
