@@ -30,11 +30,13 @@ from vllm_torchtpu.runner.utils import (
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
     PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
     RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY,
+    VOCAB_PARALLEL_SAMPLING_KEY,
 )
 
 KEY = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY
 PREFILL_KEY = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY
 RAIDEN_TELEMETRY_KEY = RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY
+SAMPLING_KEY = VOCAB_PARALLEL_SAMPLING_KEY
 
 # Class attributes the patch stamps onto VllmConfig, which monkeypatch cannot
 # roll back on its own because they did not exist beforehand.
@@ -202,6 +204,11 @@ def test_patch_is_idempotent(patched_compute_hash):
 
 
 def test_ignored_keys_match_the_keys_the_runner_reads():
-    assert {KEY, PREFILL_KEY, RAIDEN_TELEMETRY_KEY} == (
+    assert {KEY, PREFILL_KEY, RAIDEN_TELEMETRY_KEY, SAMPLING_KEY} == (
         HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
     )
+
+
+def test_vocab_parallel_sampling_setting_reuses_compile_cache(patched_compute_hash):
+    baseline = patched_compute_hash(_StubVllmConfig())
+    assert patched_compute_hash(_StubVllmConfig({SAMPLING_KEY: "all"})) == baseline

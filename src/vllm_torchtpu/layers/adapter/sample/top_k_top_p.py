@@ -22,6 +22,7 @@ from collections.abc import Callable, Sequence
 import torch
 
 MASKED_LOGIT_VALUE = -1e12
+SAMPLING_EPS = 1e-5
 # 128 matches the native TPU (8, 128) vector tile / 128-element lane width
 # and evenly divides standard padded vocabs (e.g. 248,320 = 1,940 * 128;
 # 152,064 = 1,188 * 128; 128,256 = 1,002 * 128), ensuring per-block amax
@@ -364,3 +365,10 @@ def random_sampler_variants(num_blocks: int) -> list[tuple[int, bool]]:
     if num_blocks:
         variants.append((num_blocks, True))
     return variants
+
+
+def gumbel_noise_from_uniform(u: torch.Tensor) -> torch.Tensor:
+    """Transforms Uniform(0, 1) draws into standard Gumbel(0, 1) variates."""
+    finfo = torch.finfo(u.dtype)
+    u_clamped = torch.clamp(u, min=finfo.tiny, max=1.0 - finfo.eps)
+    return -torch.log(-torch.log(u_clamped))
