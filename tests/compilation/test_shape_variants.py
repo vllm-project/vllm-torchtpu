@@ -1187,6 +1187,51 @@ def test_input_delta_reads_an_int_inputs_sources_off_its_symbol():
     assert "= 4 in this trace" in named
 
 
+OTHER_SIZE = TensorPropertySource(LocalSource("other"), TensorProperty.SIZE, 0)
+
+
+@pytest.mark.parametrize("read_by_the_other_trace", [HIDDEN_SIZE, OTHER_SIZE])
+def test_input_delta_matches_each_source_of_an_int_inputs_symbol(
+    read_by_the_other_trace,
+):
+    """Duck sizing gives the earlier trace's hidden size one symbol with two
+    sources; the current trace pinned whichever one it reads. The refusal
+    finds the pinned symbol through either source on its own, not through the
+    joined source text or the first source only."""
+    env = ShapeEnv()
+    symbol = env.create_symbol(4, HIDDEN_SIZE, dynamic_dim=DimDynamic.DUCK)
+    assert env.create_symbol(4, OTHER_SIZE, dynamic_dim=DimDynamic.DUCK) == symbol
+    assert [s.name for s in env.var_to_sources[symbol]] == [
+        HIDDEN_SIZE.name,
+        OTHER_SIZE.name,
+    ]
+    stored_metas = {
+        "s_pos": _token_symint(env, POSITIONS_SIZE, hint=8),
+        "s_hid": env.create_symintnode(symbol, hint=4, source=HIDDEN_SIZE),
+        "hidden": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+    }
+    current_env = ShapeEnv()
+    current_metas = {
+        "s_pos": _token_symint(current_env, POSITIONS_SIZE, hint=8),
+        "hidden": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+    }
+    assert _token_symint(current_env, read_by_the_other_trace) == 4  # pinned
+    stored = _int_graph(["s_pos", "s_hid", "hidden", "weight"], stored_metas)
+    current = _int_graph(["s_pos", "hidden", "weight"], current_metas)
+    session = shape_variants.BucketExecutables()
+    session.put("dir", "key", stored, lambda *a: a)
+
+    with pytest.raises(shape_variants.ShapeSpecializationError) as info:
+        session.get("dir", "key", current)
+
+    named = str(info.value).split("Named, earlier trace: ")[1]
+    assert named.startswith("s_hid SymInt")
+    assert f"from {HIDDEN_SIZE.name}, {OTHER_SIZE.name}" in named
+    assert "= 4 in this trace" in named
+
+
 def test_input_delta_names_the_earlier_trace_for_an_input_only_this_one_takes():
     metas = _int_metas()
     sources = {"s_pos": POSITIONS_SIZE, "s_hid": HIDDEN_SIZE}
