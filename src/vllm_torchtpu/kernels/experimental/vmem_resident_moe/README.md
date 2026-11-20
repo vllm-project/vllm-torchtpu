@@ -178,9 +178,9 @@ identical. µs per step:
   It is 0.58 after 4 steps and ~2.9 after 8 (bisect job
   `j-0ec45276-ea87-433f-af5c`, every rows / wire / quantize-once variant).
   The f32 wire stays at 1e-6 at any step count. `layer_bench.py` therefore
-  checks at a fixed 4 steps, with the f32 wire as the regression check. Only
-  an accuracy eval of a served model can settle whether a bf16 all-reduce is
-  acceptable.
+  checks at a fixed 4 steps, with the f32 wire as the regression check. The
+  owner accepted the bf16 wire for this experiment without a served-model
+  accuracy eval (2026-11-20).
 * Noise: the no-AR arms do not depend on the wire dtype, yet B = 64
   streamed/no-AR read 17.4 µs in one run and 22.3 µs in the other, and B = 1
   rows swing by ~2 µs. A single run resolves about ±25%. Rows below 1.2× are
