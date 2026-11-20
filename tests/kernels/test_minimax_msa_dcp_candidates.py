@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """MSA DCP candidates: picking from the token-major score rows equals picking
-from the gathered scores.
+from the gathered scores, and the merge of the ranks' candidates does not
+depend on their order.
 
 ``interpret=True`` runs the kernel body on the host; it does not gate Mosaic
 lowering.
@@ -57,3 +58,33 @@ def test_token_rows_match_gathered_scores(tokens: int, rank: int) -> None:
     got = _pick(scores, pos, rank, rows=rows)
     for w, g in zip(want, got):
         np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+
+
+def _reference_merge(candidates: np.ndarray) -> np.ndarray:
+    """Per token: the real candidates by score descending, then block."""
+    out = -np.ones(candidates.shape[1:2] + (_TOPK,), np.int32)
+    for t in range(candidates.shape[1]):
+        s = candidates[:, t, :_TOPK].reshape(-1)
+        b = candidates[:, t, _TOPK:].reshape(-1).astype(np.int32)
+        order = sorted((-s[i], b[i]) for i in range(s.size) if s[i] > -np.inf)
+        picked = [blk for _, blk in order[:_TOPK]]
+        out[t, : len(picked)] = picked
+    return out
+
+
+@pytest.mark.parametrize("tokens", [8, 48])
+def test_merge_ignores_rank_order(tokens: int) -> None:
+    rng = np.random.default_rng(tokens)
+    ranks = []
+    for rank in range(2):
+        scores = rng.integers(-2, 3, (tokens, _TOPK)).astype(np.float32)
+        scores[rng.random((tokens, _TOPK)) < 0.2] = -np.inf
+        blocks = 2 * rng.permuted(np.tile(np.arange(64), (tokens, 1)), axis=1)
+        blocks = (blocks[:, :_TOPK] + rank).astype(np.float32)
+        blocks[scores == -np.inf] = -1
+        ranks.append(np.concatenate([scores, blocks], axis=1))
+    ordered = np.stack(ranks)
+    want = _reference_merge(ordered)
+    for candidates in (ordered, ordered[::-1]):
+        got = msa_dcp.merge_head_candidates(jnp.asarray(candidates), _TOPK)
+        np.testing.assert_array_equal(np.asarray(got)[:, 0], want)

@@ -497,11 +497,10 @@ def merge_candidates(candidates: jax.Array, topk: int) -> jax.Array:
     """Global selection ``[T, topk]`` (``-1`` padded) from every rank's
     packed candidates ``[dcp, T, 2 * topk]``, in `msa_select.select_blocks`'s
     order: score descending, ties to the lower block."""
-    dcp, num_tokens, _ = candidates.shape
-    scores = candidates[..., :topk]
-    blocks = candidates[..., topk:].astype(jnp.int32)
-    s = scores.transpose(1, 0, 2).reshape(num_tokens, dcp * topk)
-    b = blocks.transpose(1, 0, 2).reshape(num_tokens, dcp * topk)
+    # Each rank's slice side by side, not a transpose of the stack: the
+    # concatenation fuses into the ranking, the transpose was relaid out.
+    s = jnp.concatenate([c[:, :topk] for c in candidates], axis=1)
+    b = jnp.concatenate([c[:, topk:] for c in candidates], axis=1).astype(jnp.int32)
     # The real candidates (score > -inf) are distinct blocks: a rank picks
     # distinct columns and ranks hold disjoint blocks. So each one's place in
     # the order is the number of real candidates ahead of it, and the merge
@@ -584,8 +583,9 @@ def merge_head_candidates(
     candidates: jax.Array, topk: int, interpret: bool = False
 ) -> jax.Array:
     """`merge_candidates` per KV head: ``[dcp, T, G * 2 * topk]`` (each
-    rank's `pack_candidates` of its ``G`` heads, head-major) -> selection
-    ``[T, G, topk]``."""
+    rank's `pack_candidates` of its ``G`` heads, head-major, the ranks in any
+    order) -> selection ``[T, G, topk]``. The real candidates are distinct
+    blocks, so both merges order them by (score, block) alone."""
     dcp, num_tokens, width = candidates.shape
     num_heads = width // (2 * topk)
     if dcp * topk < _KERNEL_MERGE_MIN_CANDIDATES:
@@ -1019,32 +1019,15 @@ def merge_partials(
     )(lse.astype(jnp.float32), parts, *([hadamard] if rotated else []))
 
 
-def gather_by_permute(x: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Array:
-    """Every rank's `x` in rank order, ``[dcp, *x.shape]``, by ``dcp - 1``
-    collective permutes (rank ``r`` gets rank ``r + s``'s `x` from shift
-    ``s``). For decode-sized operands of a DCP pair (two cores of one
-    chip): each XLA all-gather there blocks the TensorCore for its latency
-    (3.2 us per layer at c4 b3, j-c71e5160). Across chips (DCP 8) the
-    permutes' starts cost more than the all-gather (c64 twin j-f92f5540)."""
-    out = jnp.zeros((dcp, *x.shape), x.dtype)
-    out = jax.lax.dynamic_update_index_in_dim(out, x, rank, 0)
-    for shift in range(1, dcp):
-        perm = [(src, (src - shift) % dcp) for src in range(dcp)]
-        received = jax.lax.ppermute(x, axis, perm)
-        out = jax.lax.dynamic_update_index_in_dim(
-            out, received, (rank + shift) % dcp, 0
-        )
-    return out
-
-
 def all_to_all_by_permute(
     x: jax.Array, rank: jax.Array, axis: str, dcp: int
 ) -> jax.Array:
     """`jax.lax.all_to_all` of ``x [dcp, ...]`` along its leading axis (block
     ``d`` goes to rank ``d``; block ``s`` of the result came from rank
-    ``s``), by `gather_by_permute`'s permutes. For decode-sized blocks: each
-    XLA all-to-all costs its latency on the TensorCore (~1.3 us per layer at
-    c4 decode, j-c71e5160)."""
+    ``s``), by ``dcp - 1`` collective permutes (rank ``r`` gets rank ``r +
+    s``'s block from shift ``s``). For decode-sized blocks: each XLA
+    all-to-all costs its latency on the TensorCore (~1.3 us per layer at c4
+    decode, j-c71e5160)."""
     out = jnp.zeros_like(x)
     own = jax.lax.dynamic_index_in_dim(x, rank, 0, False)
     out = jax.lax.dynamic_update_index_in_dim(out, own, rank, 0)
@@ -1139,7 +1122,13 @@ def attend_and_merge(
     # step's partials by XLA's all-to-all, which writes them in place.
     small = dcp == 2 and num_tokens <= DCP_SMALL_BATCH_TOKENS
     if small:
-        cand_all = gather_by_permute(candidates, rank, axis, dcp)
+        # A pair's candidates by one permute: an XLA all-gather blocks the
+        # TensorCore for its latency (3.2 us per layer at c4 b3, j-c71e5160).
+        # The merge does not depend on the ranks' order (`merge_head_candidates`),
+        # so no zeros, rank-indexed updates or relayouts build a rank-ordered copy.
+        assert dcp == 2, "the swap below pairs two ranks"
+        received = jax.lax.ppermute(candidates, axis, [(0, 1), (1, 0)])
+        cand_all = jnp.stack([candidates, received])
     else:
         cand_all = jax.lax.all_gather(candidates, axis, axis=0)
     out, lse = msa_attend_dcp(
