@@ -18,7 +18,7 @@ from __future__ import annotations
 import tempfile
 from collections.abc import Callable
 from contextlib import ExitStack
-from typing import Protocol, cast, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 import torch
 import torch.distributed as dist
@@ -32,6 +32,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.deepseek_v41.common import engram as upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
@@ -254,26 +255,20 @@ class NgramHashState(upstream.NgramHashState):
     def ensure_cache(self) -> bool:
         """Synchronize ``block_size`` with ``swa_cache_module`` and allocate slots.
 
+        ``VllmDeepseekV4SWACache.get_kv_cache_spec`` finalizes ``block_size``
+        after construction, and the bound ``kv_cache`` may be the overlaid CSA
+        page tensor, so the logical block size comes from the module and never
+        from ``kv_cache.shape``.
+
         Returns:
             ``True`` when the slot cache (or SWA KV cache) is ready for hashing.
         """
-        swa = cast(DeepseekV4SWACache, self.swa_cache_module)
-        kv_cache = cast(Tensor, swa.kv_cache)
         # We shouldn't invoke this method within a compiled function.
         assert not torch.compiler.is_compiling()
-
-        if kv_cache.numel():
-            resolved_block_size: int | None = int(
-                kv_cache.shape[2] if kv_cache.ndim == 4 else kv_cache.shape[1]
-            )
-        else:
-            resolved_block_size = cast(int | None, swa.block_size)
-        if (
-            self.use_slot_cache
-            and resolved_block_size is not None
-            and self.block_size != resolved_block_size
-        ):
-            self.block_size = int(resolved_block_size)
+        swa = cast(DeepseekV4SWACache, self.swa_cache_module)
+        block_size = int(swa.block_size)
+        if self.use_slot_cache and self.block_size != block_size:
+            self.block_size = block_size
             self._kv_cache_ref = None
         return super().ensure_cache()
 
@@ -452,17 +447,28 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
     ) -> None:
         # NOTE(cross-boundary-contract): Call nn.Module.__init__(self) directly
         # instead of super().__init__ to bypass upstream common/engram.py:981 CUDA
-        # is_uva_available() queries on TPU. Assumes positive head_sizes from
-        # EngramLayout.primes; dp_shared_memory is gated on cpu_offload and sets
-        # self.dp_size = 1, while use_thp is retained for upstream constructor
-        # signature compatibility.
+        # is_uva_available() queries on TPU. The argument checks below mirror
+        # upstream; use_thp is retained for upstream constructor signature
+        # compatibility.
         nn.Module.__init__(self)
+        assert head_sizes and all(size > 0 for size in head_sizes)
+        assert sum(head_sizes) <= num_embeddings
         # TODO(Wenqin): we could add a new flag for TPU to keep only the first
         # layer of Engram on HBM.
         self.cpu_offload = bool(cpu_offload)
-        self.dp_shared_memory = bool(dp_shared_memory) and self.cpu_offload
+        self.dp_shared_memory = bool(dp_shared_memory)
         self.use_thp = use_thp
-        self.dp_size = 1 if self.dp_shared_memory else get_engram_dp_size()
+        self.dp_size = get_engram_dp_size()
+        if self.dp_shared_memory:
+            if not self.cpu_offload:
+                raise ValueError("dp_shared_memory requires cpu_offload=True")
+            if self.dp_size <= 1:
+                raise ValueError(
+                    "dp_shared_memory requires a node-local Engram DP group with "
+                    f"size > 1; effective Engram DP size is {self.dp_size}."
+                )
+            # DP replicas share one host table, so heads are only TP-sharded.
+            self.dp_size = 1
         self.num_embeddings = num_embeddings
         self.dim = dim
         self.block_size = block_size
@@ -471,6 +477,10 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
 
         num_shards, head_rank = super()._get_shard_info()
         self.part_n_hash_cols = -(-self.n_hash_cols // num_shards)
+        assert (num_shards - 1) * self.part_n_hash_cols < self.n_hash_cols, (
+            f"Engram sharding leaves ranks without hash heads: "
+            f"{self.n_hash_cols} heads over {num_shards} shards"
+        )
         self.head_start = head_rank * self.part_n_hash_cols
         head_end = self.head_start + self.part_n_hash_cols
         vocab_start = sum(head_sizes[: self.head_start])
@@ -603,6 +613,30 @@ class Engram(upstream.Engram):
     # constructs ``torch.cuda.Stream``/``Event`` and invokes Triton
     # ``_fused_engram_post_wkv_kernel``.
     """
+
+    def __init__(
+        self,
+        config: Any,
+        quant_config: QuantizationConfig | None,
+        layout: upstream.EngramLayout,
+        layer_hash_index: int,
+        use_sequence_parallel: bool,
+        prefix: str,
+        prefetch_stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        if use_sequence_parallel:
+            raise NotImplementedError(
+                "TPU Engram does not support sequence parallelism yet"
+            )
+        super().__init__(
+            config,
+            quant_config,
+            layout,
+            layer_hash_index,
+            use_sequence_parallel,
+            prefix,
+            prefetch_stream,
+        )
 
     def _create_embedding(
         self,

@@ -197,18 +197,13 @@ def test_ngram_hash_state_ensure_cache_and_empty_inputs(
         state.ensure_cache()
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
     assert state.ensure_cache() and state.block_size == 8
+    assert state._cache.numel() == 16
     assert state.ensure_cache()
 
-    # 4-D KV cache `(blocks, 1, 16, dim)` resolves block_size=16, never 1.
+    # block_size comes from the SWA module, never from kv_cache.shape: the bound
+    # tensor may be the overlaid CSA page `[num_pages, page_size, 4, 128]`.
     state.swa_cache_module = SimpleNamespace(
-        kv_cache=torch.zeros((3, 1, 16, 32), dtype=torch.bfloat16)
-    )
-    assert (
-        state.ensure_cache() and state.block_size == 16 and state._cache.numel() == 48
-    )
-    state.swa_cache_module = SimpleNamespace(
-        block_size=16,
-        kv_cache=torch.zeros((8, 256, 32), dtype=torch.bfloat16),
+        block_size=256, kv_cache=torch.zeros((8, 1, 4, 128), dtype=torch.uint8)
     )
     assert (
         state.ensure_cache()
@@ -266,6 +261,177 @@ def test_ngram_hash_state_slot_cache_and_fallback_modes(
     assert torch.equal(h_slot[:3], h_noslot1[:3])
 
 
+_REAL_HASH_CFG = SimpleNamespace(
+    engram_layer_ids=(0, 3),
+    engram_num_embeddings=(512, 512),
+    engram_max_ngram_size=4,
+    engram_n_heads=2,
+    engram_head_dim=32,
+    engram_compressed_vocab_size=32,
+    engram_pad_token_id=0,
+    engram_vocab_size=32,
+)
+
+
+def _make_real_ngram_state(monkeypatch: pytest.MonkeyPatch) -> NgramHashState:
+    """``NgramHashState`` with upstream primes, offsets and int64 multipliers."""
+    state = _make_ngram_state(monkeypatch)
+    layout = engram_mod.upstream.EngramLayout(_REAL_HASH_CFG)
+    vocab = layout.compressed_vocab_size
+    # Raw ids 0..39 collapse onto 32 compressed ids, like the tokenizer map.
+    state.token_map = (torch.arange(40, dtype=torch.int32) * 7 + 3) % vocab
+    state.multipliers = engram_mod.upstream.compute_hash_multipliers(
+        layout.layer_ids, layout.max_ngram_size, vocab
+    )
+    state.primes = torch.tensor(layout.primes)
+    state.offsets = layout.offsets
+    state.pad_id = int(state.token_map[layout.pad_token_id])
+    state.lookback_depth = layout.max_ngram_size - 1
+    return state
+
+
+def _reference_hashes(
+    state: NgramHashState,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    dead_mask: torch.Tensor,
+    lookback_ids: torch.Tensor,
+    lookback_dead: torch.Tensor,
+    block_table: torch.Tensor | None,
+    cache: torch.Tensor | None,
+) -> torch.Tensor:
+    """Scalar transcription of upstream ``_hash_ids_kernel`` (vLLM v0.33.0)."""
+    dead_id = engram_mod.upstream.DEAD_ID
+    token_map = state.token_map.tolist()
+    multipliers = state.multipliers.tolist()
+    primes = state.primes.tolist()
+    offsets = state.offsets.tolist()
+    ids, pos = input_ids.tolist(), positions.tolist()
+    qsl, dead = query_start_loc.tolist(), dead_mask.tolist()
+    lb, lbd = lookback_ids.tolist(), lookback_dead.tolist()
+    table = block_table.tolist() if block_table is not None else []
+    slots = cache.tolist() if cache is not None else None
+    num_tokens, num_reqs = len(ids), len(qsl) - 1
+    num_layers, max_ngram = len(multipliers), len(multipliers[0])
+    num_heads = len(primes[0][0])
+    depth = len(lb[0])
+    block_size = state.block_size
+    out = torch.zeros(
+        (num_tokens, num_layers, (max_ngram - 1) * num_heads), dtype=torch.int64
+    )
+    for t in range(num_tokens):
+        req = min(sum(t >= end for end in qsl[1:]), num_reqs - 1)
+        chunk_start = pos[min(qsl[req], num_tokens - 1)]
+        for layer in range(num_layers):
+            rolling, blocked = 0, False
+            for shift in range(max_ngram):
+                past = pos[t] - shift
+                col = chunk_start - 1 - past
+                if past >= chunk_start:
+                    src_idx = max(t - shift, 0)
+                    src = dead_id if dead[src_idx] else token_map[ids[src_idx]]
+                elif 0 <= col < depth and lb[req][col] >= 0:
+                    src = dead_id if lbd[req][col] else token_map[lb[req][col]]
+                elif slots is None:
+                    src = state.pad_id
+                else:
+                    logical = min(max(past, 0), len(table[0]) * block_size - 1)
+                    row = table[min(req, len(table) - 1)]
+                    slot = row[logical // block_size] * block_size
+                    slot += logical % block_size
+                    src = slots[min(max(slot, 0), len(slots) - 1)]
+                blocked = blocked or past < 0 or src == dead_id
+                term = (state.pad_id if blocked else src) * multipliers[layer][shift]
+                # Upstream bounds the multipliers so this product never wraps.
+                assert 0 <= term < 2**63
+                rolling ^= term
+                if shift > 0:
+                    for head in range(num_heads):
+                        c = (shift - 1) * num_heads + head
+                        prime = primes[layer][shift - 1][head]
+                        out[t, layer, c] = rolling % prime + offsets[layer][c]
+    return out.to(torch.int32)
+
+
+def _reference_hash_inputs() -> tuple[torch.Tensor, ...]:
+    """Three requests covering every history tier, plus one padded token.
+
+    - req 0: prefill at positions 0..4 with a dead token (n-grams hit pos < 0).
+    - req 1: decode at position 10; position 9 comes from ``lookback_ids``,
+      positions 8 and 7 from the slot cache (slots 28 and 27).
+    - req 2: chunk at positions 6..7; position 5 from ``lookback_ids``,
+      position 4 is dead in ``lookback_dead``, position 3 is dead in the cache.
+    """
+    ids = torch.tensor([5, 9, 13, 17, 39, 30, 2, 11, 0], dtype=torch.int32)
+    pos = torch.tensor([0, 1, 2, 3, 4, 10, 6, 7, 0], dtype=torch.int32)
+    qsl = torch.tensor([0, 5, 6, 8], dtype=torch.int32)
+    dead = torch.tensor([False, False, True, False, False, False, False, False, False])
+    lb = torch.tensor([[-1, -1, -1], [25, -1, -1], [11, 12, -1]], dtype=torch.int32)
+    lbd = torch.tensor(
+        [[False, False, False], [False, False, False], [False, True, False]]
+    )
+    slots = torch.tensor([4, 5, 6, 7, 8, 30, 18, 19, -1], dtype=torch.int32)
+    bt = torch.tensor([[1, 2, 0], [5, 6, 7], [3, 4, 0]], dtype=torch.int32)
+    return ids, pos, qsl, dead, lb, lbd, slots, bt
+
+
+def _seed_hash_history(state: NgramHashState) -> None:
+    """Slot-cache entries written by earlier steps (see ``_reference_hash_inputs``)."""
+    assert state._cache is not None
+    state._cache[27] = 21
+    state._cache[28] = 22
+    state._cache[15] = engram_mod.upstream.DEAD_ID
+
+
+def test_ngram_hash_state_matches_reference_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check hash values against an independent scalar transcription."""
+    state = _make_real_ngram_state(monkeypatch)
+    state.swa_cache_module = SimpleNamespace(
+        block_size=4, kv_cache=torch.zeros((8, 4, 16), dtype=torch.bfloat16)
+    )
+    assert state.ensure_cache() and state._cache is not None
+    _seed_hash_history(state)
+    ids, pos, qsl, dead, lb, lbd, slots, bt = _reference_hash_inputs()
+
+    hashes = state(ids, pos, qsl, dead, lb, lbd, slots, bt)
+    tm = state.token_map.tolist()
+    assert state._cache[4].item() == tm[5]
+    assert state._cache[6].item() == engram_mod.upstream.DEAD_ID
+    expected = _reference_hashes(state, ids, pos, qsl, dead, lb, lbd, bt, state._cache)
+    assert torch.equal(hashes, expected)
+
+    # Hand-derived values. Token 0 (position 0), layer 0, 2-gram: position -1
+    # is blocked, so it hashes as pad.
+    mult = state.multipliers.tolist()
+    primes = state.primes.tolist()
+    offsets = state.offsets.tolist()
+    pad = state.pad_id
+    rolling = (tm[5] * mult[0][0]) ^ (pad * mult[0][1])
+    assert hashes[0, 0, :2].tolist() == [
+        rolling % primes[0][0][h] + offsets[0][h] for h in range(2)
+    ]
+    # Token 5 (req 1, position 10), layer 1, 4-gram: batch, lookback, then cache.
+    rolling = (
+        (tm[30] * mult[1][0])
+        ^ (tm[25] * mult[1][1])
+        ^ (22 * mult[1][2])
+        ^ (21 * mult[1][3])
+    )
+    assert hashes[5, 1, 4:].tolist() == [
+        rolling % primes[1][2][h] + offsets[1][4 + h] for h in range(2)
+    ]
+
+    # Stateless (V2 runner): history the lookback window misses hashes as pad.
+    state.use_slot_cache = False
+    stateless = state(ids, pos, qsl, dead, lb, lbd, None, None)
+    expected = _reference_hashes(state, ids, pos, qsl, dead, lb, lbd, None, None)
+    assert torch.equal(stateless, expected)
+    assert not torch.equal(stateless[5], hashes[5])
+
+
 def test_parallel_engram_embedding_modes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
@@ -314,10 +480,25 @@ def test_parallel_engram_embedding_modes(
         broadcast_object=lambda obj: obj,
     )
     monkeypatch.setattr(engram_mod, "get_engram_dp_group", lambda: fake_grp)
+    with pytest.raises(ValueError, match="requires cpu_offload=True"):
+        ParallelEngramEmbedding(
+            20, 32, (10, 10), block_size=32, cpu_offload=False, dp_shared_memory=True
+        )
+    with pytest.raises(ValueError, match="size > 1"):
+        ParallelEngramEmbedding(
+            20, 32, (10, 10), block_size=32, cpu_offload=True, dp_shared_memory=True
+        )
+    monkeypatch.setattr(engram_mod, "get_engram_dp_size", lambda: 2)
     emb_shm = ParallelEngramEmbedding(
         20, 32, (10, 10), block_size=32, cpu_offload=True, dp_shared_memory=True
     )
-    assert emb_shm._storage()[0].shape == (20, 32)
+    assert emb_shm.dp_size == 1 and emb_shm._storage()[0].shape == (20, 32)
+
+    # 6 heads over 4 TP shards (2 per shard) would leave the last shard empty.
+    monkeypatch.setattr(engram_mod, "get_engram_dp_size", lambda: 1)
+    monkeypatch.setattr(engram_mod, "get_tensor_model_parallel_world_size", lambda: 4)
+    with pytest.raises(AssertionError, match="without hash heads"):
+        ParallelEngramEmbedding(60, 32, (10,) * 6, block_size=32)
 
 
 def test_engram_module_staging_and_forward(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -361,6 +542,8 @@ def test_engram_module_staging_and_forward(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(
         engram_mod.upstream, "get_current_vllm_config", lambda: _make_vcfg(True)
     )
+    with pytest.raises(NotImplementedError, match="sequence parallelism"):
+        Engram(cfg, None, layout, 0, True, "model.layers.0.engram")
     eng_off = Engram(cfg, None, layout, 0, False, "model.layers.0.engram")
     eng_off.embed_tokens.weight.data.fill_(1.0)
     eng_off.embed_tokens.weight_scale_inv.data.fill_(127)
@@ -457,6 +640,53 @@ def test_engram_module_staging_and_forward(monkeypatch: pytest.MonkeyPatch) -> N
     nan_masked = eng_off._ready_rows(2)
     assert not torch.isnan(nan_masked).any() and torch.all(nan_masked == 0.0)
 
+    # Gating forward vs an independent transcription of the upstream kernel.
+    gen_fw = torch.Generator().manual_seed(7)
+    for param, scale in (
+        (eng_hbm.q_weight, 1.0),
+        (eng_hbm.k_weight, 1.0),
+        (eng_hbm.wkv.weight, 0.05),
+    ):
+        param.data.copy_(torch.randn(param.shape, generator=gen_fw) * scale)
+    h_fw = torch.randint(0, n_rows, (4, 4), generator=gen_fw, dtype=torch.int32)
+    x_fw = torch.randn((4, 4, 32), generator=gen_fw).to(torch.bfloat16)
+    eng_hbm.prepare_embeddings(h_fw)
+    kv_fw = eng_hbm.wkv(eng_hbm.embed(h_fw).flatten(-2))
+    for mask in (None, torch.tensor([True, False, True, True])):
+        torch.testing.assert_close(
+            eng_hbm(x_fw, h_fw, token_mask=mask),
+            _reference_engram_forward(eng_hbm, x_fw, kv_fw, mask),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+
+def _reference_engram_forward(
+    eng: Engram,
+    hidden_states: torch.Tensor,
+    kv: torch.Tensor,
+    token_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Scalar transcription of upstream ``_fused_engram_post_wkv_kernel``."""
+    dim, hc_mult = eng.dim, eng.hc_mult
+    out = torch.empty_like(hidden_states)
+    for t in range(hidden_states.shape[0]):
+        value = kv[t, hc_mult * dim :].float()
+        for hc in range(hc_mult):
+            hidden = hidden_states[t, hc].float()
+            key = kv[t, hc * dim : (hc + 1) * dim].float()
+            q = eng.q_weight[hc].float()
+            k = eng.k_weight[hc].float()
+            hidden_rms = torch.rsqrt((hidden * hidden).sum() / dim + eng.eps)
+            key_rms = torch.rsqrt((key * key).sum() / dim + eng.eps)
+            dot = (hidden * q * k * key).sum() * hidden_rms * key_rms / dim**0.5
+            gate_input = torch.sqrt(torch.clamp(dot.abs(), min=eng.clamp_value))
+            gate = torch.sigmoid(-gate_input if dot < 0 else gate_input)
+            if token_mask is not None and not bool(token_mask[t]):
+                gate = torch.zeros_like(gate)
+            out[t, hc] = (hidden + gate * value).to(out.dtype)
+    return out
+
 
 class _MockNativeSWA(torch.nn.Module):
     block_size: int = 4
@@ -546,46 +776,41 @@ def test_tpu_engram_dequant_and_forward(
     assert deq.shape == (4, 64)
     assert deq[0].sum().item() == 64.0 and deq[3, 32:].sum().item() == 0.0
 
-    # Verify NgramHashState on TPU vs CPU host hashing.
-    state = _make_ngram_state(monkeypatch).to(dev)
+    # Verify NgramHashState on TPU (real int64 multipliers) vs the reference.
+    state = _make_real_ngram_state(monkeypatch).to(dev)
     state.swa_cache_module = SimpleNamespace(
-        kv_cache=torch.zeros((2, 1, 8, 16), dtype=torch.bfloat16, device=dev)
+        block_size=4,
+        kv_cache=torch.zeros((8, 4, 16), dtype=torch.bfloat16, device=dev),
     )
-    assert state.ensure_cache() and state.block_size == 8
-    ids_cpu = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
-    pos_cpu = torch.tensor([0, 1, 2, 5], dtype=torch.int32)
-    qsl_cpu = torch.tensor([0, 3, 4], dtype=torch.int32)
-    dead_cpu = torch.tensor([False, False, False, False])
-    lb_cpu = torch.tensor([[-1, -1, -1], [4, -1, -1]], dtype=torch.int32)
-    lbd_cpu = torch.zeros((2, 3), dtype=torch.bool)
-    slots_tpu = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=dev)
-    bt_tpu = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32, device=dev)
+    assert state.ensure_cache() and state._cache is not None
+    assert state._cache.device.type == "tpu"
+    _seed_hash_history(state)
+    inputs_cpu = _reference_hash_inputs()
+    ids_cpu, pos_cpu, qsl_cpu, dead_cpu, lb_cpu, lbd_cpu, _, bt_cpu = inputs_cpu
+    h_slot_tpu = state(*(t.to(dev) for t in inputs_cpu))
+    assert h_slot_tpu.device.type == "tpu"
+    h_slot_ref = _reference_hashes(
+        state,
+        ids_cpu,
+        pos_cpu,
+        qsl_cpu,
+        dead_cpu,
+        lb_cpu,
+        lbd_cpu,
+        bt_cpu,
+        state._cache.cpu(),
+    )
+    assert torch.equal(h_slot_tpu.cpu(), h_slot_ref)
 
-    h_slot_tpu = state(
-        ids_cpu.to(dev),
-        pos_cpu.to(dev),
-        qsl_cpu.to(dev),
-        dead_cpu.to(dev),
-        lb_cpu.to(dev),
-        lbd_cpu.to(dev),
-        slots_tpu,
-        bt_tpu,
-    )
-    assert h_slot_tpu.shape == (4, 2, 6) and h_slot_tpu.device.type == "tpu"
     state.use_slot_cache = False
     h_noslot_tpu = state(
-        ids_cpu.to(dev),
-        pos_cpu.to(dev),
-        qsl_cpu.to(dev),
-        dead_cpu.to(dev),
-        lb_cpu.to(dev),
-        lbd_cpu.to(dev),
+        *(t.to(dev) for t in inputs_cpu[:6]),
         None,
         None,
     )
-    state_cpu = _make_ngram_state(monkeypatch)
-    state_cpu.use_slot_cache = False
-    h_host = state_cpu(ids_cpu, pos_cpu, qsl_cpu, dead_cpu, lb_cpu, lbd_cpu, None, None)
+    h_host = _reference_hashes(
+        state, ids_cpu, pos_cpu, qsl_cpu, dead_cpu, lb_cpu, lbd_cpu, None, None
+    )
     assert torch.equal(h_noslot_tpu.cpu(), h_host)
 
     # Verify POSIX /dev/shm storage + 1-D int32 H2D staging + Engram.forward().
@@ -593,7 +818,8 @@ def test_tpu_engram_dequant_and_forward(
     monkeypatch.setattr(
         engram_mod.upstream, "get_tensor_model_parallel_rank", lambda: 0
     )
-    monkeypatch.setattr(engram_mod, "get_engram_dp_size", lambda: 1)
+    # dp_shared_memory needs an Engram DP group of size > 1.
+    monkeypatch.setattr(engram_mod, "get_engram_dp_size", lambda: 2)
     monkeypatch.setattr(
         engram_mod.dist,
         "all_gather_object",
@@ -612,7 +838,7 @@ def test_tpu_engram_dequant_and_forward(
         hc_mult=4,
         rms_norm_eps=1e-6,
         engram_layer_ids=(0,),
-        engram_num_embeddings=(256,),
+        engram_num_embeddings=(512,),
         engram_max_ngram_size=4,
         engram_n_heads=2,
         engram_head_dim=32,
@@ -670,7 +896,8 @@ def test_tpu_engram_dequant_and_forward(
         mod.q_weight.data.copy_(q_w.to(m_dev))
         mod.k_weight.data.copy_(k_w.to(m_dev))
 
-    layer_hashes = h_host[:, 0, :]
+    # Same layout as _REAL_HASH_CFG, so layer 0 hashes index this table.
+    layer_hashes = h_host[:4, 0, :]
     h_in = torch.randn((4, 4, 32), generator=gen, dtype=torch.bfloat16)
     mask = torch.tensor([True, False, True, True], dtype=torch.bool)
 
