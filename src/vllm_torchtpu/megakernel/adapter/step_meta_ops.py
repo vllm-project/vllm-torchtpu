@@ -78,11 +78,8 @@ class TorchStepMetaOps:
     ) -> torch.Tensor:
         return table_2d.gather(1, col_idx_1d.unsqueeze(1))
 
-    def expand_1d_to_2d(
-        self, x_1d: torch.Tensor, cols: int, *, contiguous: bool = True
-    ) -> torch.Tensor:
-        out = x_1d.unsqueeze(1).expand(x_1d.shape[0], cols)
-        return out.contiguous() if contiguous else out
+    def expand_1d_to_2d(self, x_1d: torch.Tensor, cols: int) -> torch.Tensor:
+        return x_1d.unsqueeze(1).expand(x_1d.shape[0], cols)
 
     def concat_cols(self, col0: torch.Tensor, col1: torch.Tensor) -> torch.Tensor:
         return torch.cat([col0, col1], dim=1)

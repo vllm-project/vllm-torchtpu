@@ -925,6 +925,7 @@ class Qwen35Program:
                     has_roff=True,
                     use_ckpt_2d=c_cols > 1,
                     ops=TorchStepMetaOps(),
+                    validate=True,
                 )
                 ex_s, _, _ = mk_rt.bucket_exec_spec(
                     self.spec,

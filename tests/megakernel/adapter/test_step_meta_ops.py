@@ -486,3 +486,33 @@ def test_torch_and_jax_step_meta_ops_pack_bitwise_like_the_reference() -> None:
             assert r_t.dtype == torch.int32 and h_t.dtype == torch.int32
             assert torch.equal(r_t, h_t)
             assert np.array_equal(r_t.numpy(), np.asarray(j_t))
+
+
+def test_duplicate_write_slots_checked_only_under_validate() -> None:
+    """`TorchStepMetaOps` declares the `StepMetaOps` distinct-slot check, and
+    `pack_step_meta` runs it only with `validate=True` (on CPU tensors)."""
+    from vllm_torchtpu.megakernel.core.runtime import StepMetaOps
+
+    assert isinstance(_TORCH_OPS, StepMetaOps)
+    s = torch.tensor([1, 2], dtype=torch.int32)
+    c_dup = torch.tensor([[3, 3], [4, 5]], dtype=torch.int32)
+    r = torch.zeros((4,), dtype=torch.int32)
+
+    def pack(validate: bool) -> torch.Tensor:
+        return pack_step_meta(
+            torch.arange(4, dtype=torch.int32),
+            torch.arange(4, dtype=torch.int32),
+            torch.tensor([[7], [8]], dtype=torch.int32),
+            ((s, c_dup, r),),
+            bucket_t=4,
+            tokens_per_seq=2,
+            max_pages_per_seq=1,
+            has_roff=True,
+            use_ckpt_2d=True,
+            ops=_TORCH_OPS,
+            validate=validate,
+        ).ckpt_b
+
+    assert pack(False)[0].tolist() == [[3, 3], [4, 5]]
+    with pytest.raises(ValueError, match="2 distinct positive checkpoint slots"):
+        pack(True)

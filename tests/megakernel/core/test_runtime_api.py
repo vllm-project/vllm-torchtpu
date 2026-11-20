@@ -347,6 +347,119 @@ def test_pack_step_meta_and_resolve_step_positions_jax():
         )
 
 
+def test_pack_step_meta_t1_read_column_and_1d_table_fallback():
+    """`T=1` with a 2-D `c_raw` and `has_roff`: column 0 reads `c[s, roff[s]]`
+    (`roff` clipped to the window), column 1 writes the base slot, and only
+    negative read offsets are kept. A 1-D table that `s0.shape[0]` doesn't
+    divide is reshaped by `max_pages_per_seq`."""
+    ops = JaxStepMetaOps()
+    s0 = jnp.asarray([1, 5, 7, 0], dtype=jnp.int32)
+    c0 = jnp.asarray(
+        [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [0, 0, 0, 0]], dtype=jnp.int32
+    )
+    r0 = jnp.zeros((8,), dtype=jnp.int32).at[1].set(2).at[5].set(9).at[7].set(-1)
+    bt_1d = jnp.asarray([10, 11, 12, 20, 21, 22, 30, 31, 32], dtype=jnp.int32)
+    kw: dict[str, Any] = dict(
+        bucket_t=4, tokens_per_seq=1, max_pages_per_seq=3, has_roff=True, ops=ops
+    )
+    ids, pos = jnp.arange(1, 5, dtype=jnp.int32), jnp.arange(10, 14, dtype=jnp.int32)
+    meta = pack_step_meta(ids, pos, bt_1d, [(s0, c0, r0)], use_ckpt_2d=True, **kw)
+    np.testing.assert_array_equal(
+        np.asarray(meta.ckpt_b[0]), [[3, 1], [8, 5], [9, 7], [0, 0]]
+    )
+    np.testing.assert_array_equal(np.asarray(meta.roff_b[0]), [0, 0, -1, 0])
+    np.testing.assert_array_equal(
+        np.asarray(meta.pt_b), [[10, 11, 12], [20, 21, 22], [30, 31, 32], [0, 0, 0]]
+    )
+    np.testing.assert_array_equal(np.asarray(meta.ids_b), [1, 2, 3, 0])
+    np.testing.assert_array_equal(np.asarray(meta.pos_b), [10, 11, 12, 0])
+    # Without the 2-D window the read column is the base slot.
+    meta_1d = pack_step_meta(ids, pos, bt_1d, [(s0, c0, r0)], use_ckpt_2d=False, **kw)
+    np.testing.assert_array_equal(np.asarray(meta_1d.ckpt_b[0, :, 0]), [1, 5, 7, 0])
+    with pytest.raises(ValueError, match="is not divisible by"):
+        pack_step_meta(ids, pos, bt_1d[:7], [(s0, c0, r0)], use_ckpt_2d=True, **kw)
+
+
+def test_pack_step_meta_validate_rejects_duplicate_write_slots():
+    """`validate=True` rejects an active `T>1` row without `T` distinct positive
+    write slots (concrete inputs only); the check doesn't run otherwise."""
+    s_raw = jnp.asarray([1, 2], dtype=jnp.int32)
+    c_dup = jnp.asarray([[3, 3], [4, 5]], dtype=jnp.int32)
+    r_raw = jnp.zeros((4,), dtype=jnp.int32)
+
+    def pack(c_raw: Any, *, validate: bool) -> Any:
+        return pack_step_meta(
+            jnp.arange(4, dtype=jnp.int32),
+            jnp.arange(4, dtype=jnp.int32),
+            jnp.asarray([[7], [8]], dtype=jnp.int32),
+            [(s_raw, c_raw, r_raw)],
+            bucket_t=4,
+            tokens_per_seq=2,
+            max_pages_per_seq=1,
+            has_roff=True,
+            use_ckpt_2d=True,
+            validate=validate,
+        )
+
+    with pytest.raises(ValueError, match="2 distinct positive checkpoint slots"):
+        pack(c_dup, validate=True)
+    pack(jnp.asarray([[3, 6], [4, 5]], dtype=jnp.int32), validate=True)
+    np.testing.assert_array_equal(
+        np.asarray(pack(c_dup, validate=False).ckpt_b[0]), [[3, 3], [4, 5]]
+    )
+    traced = jax.jit(lambda c: pack(c, validate=True).ckpt_b)(c_dup)
+    np.testing.assert_array_equal(np.asarray(traced[0]), [[3, 3], [4, 5]])
+    assert isinstance(JaxStepMetaOps(), mk_rt.StepMetaOps)
+
+
+def test_align_cache_exec_aligns_ctx_to_kv_blk():
+    """`align_cache_exec` sets `ctx` to the largest `kv_blk` multiple the page
+    table holds (never below `base_exec.ctx`) and binds the paged KV cache."""
+    g = ModelGeometry(
+        L=4,
+        att_every=4,
+        H=256,
+        NH=4,
+        NKV=1,
+        HD=256,
+        ROT=64,
+        KH=2,
+        VH=4,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=2,
+        I=256,
+        IS=256,
+        moe_tp=False,
+        theta=10_000_000.0,
+    )
+    tiles = dataclasses.replace(TINY_TILES, bank=512 << 10)
+    base = ExecSpec(R=1, B=4, T=1, ctx=256, interpret=True, stack_e=False)
+    for kv_blk, mpps, want_ctx in ((128, 3, 384), (256, 3, 256), (256, 5, 512)):
+        ex0 = dataclasses.replace(
+            base, tiles=tiles.with_modules({"gqa": {"kv_blk": kv_blk}})
+        )
+        ex = align_cache_exec(
+            ex0, DEFAULT_PROFILE, g, num_pages=96, page_size=128, max_pages_per_seq=mpps
+        )
+        assert ex.ctx == want_ctx, (kv_blk, mpps)
+        cx = ex.cache
+        assert (cx.paged_kv, cx.num_pages, cx.page_size) == (True, 96, 128)
+        assert cx.max_pages_per_seq == mpps
+    # A page table shorter than `base_exec.ctx` keeps `ctx`; GQA's
+    # `derive_params` then rejects it (`max_pages_per_seq < ctx // page_size`).
+    ex_short = align_cache_exec(
+        dataclasses.replace(base, tiles=tiles.with_modules({"gqa": {"kv_blk": 128}})),
+        DEFAULT_PROFILE,
+        g,
+        num_pages=96,
+        page_size=128,
+        max_pages_per_seq=1,
+    )
+    assert ex_short.ctx == 256
+
+
 _SYNTH_ROUTING_DEFAULT_HF_CONFIG: dict[str, Any] = {
     "architectures": ["SynthMoeForCausalLM"],
     "model_type": "synth_moe",

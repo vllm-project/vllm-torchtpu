@@ -22,7 +22,6 @@ from typing import Any, Protocol, runtime_checkable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental import pallas as pl
 
 
 @dataclass(frozen=True)
@@ -56,15 +55,17 @@ class StepMetaOps(Protocol):
     def clip(self, x: Any, lo: int, hi: int | None = None) -> Any: ...
     def take_1d(self, table_1d: Any, idx_1d: Any) -> Any: ...
     def take_col_2d(self, table_2d: Any, col_idx_1d: Any) -> Any: ...
-    def expand_1d_to_2d(
-        self, x_1d: Any, cols: int, *, contiguous: bool = True
-    ) -> Any: ...
+    def expand_1d_to_2d(self, x_1d: Any, cols: int) -> Any: ...
     def concat_cols(self, col0: Any, col1: Any) -> Any: ...
     def stack_dim0(self, xs: Sequence[Any]) -> Any: ...
     def where(self, cond: Any, x: Any, y: Any) -> Any: ...
     def gt_zero(self, x: Any) -> Any: ...
     def lt_zero(self, x: Any) -> Any: ...
     def logical_and(self, a: Any, b: Any) -> Any: ...
+    def check_distinct_cols_2d(self, ckpt_g: Any, T: int) -> None:
+        """`check_ckpt_write_cols_distinct` on a host value; a no-op on traced
+        or device values (`pack_step_meta(validate=True)` only)."""
+        ...
 
 
 class JaxStepMetaOps:
@@ -122,8 +123,7 @@ class JaxStepMetaOps:
         idx = jnp.asarray(col_idx_1d, dtype=jnp.int32)[:, None]
         return jnp.take_along_axis(t_arr, idx, axis=1)
 
-    def expand_1d_to_2d(self, x_1d: Any, cols: int, *, contiguous: bool = True) -> Any:
-        del contiguous
+    def expand_1d_to_2d(self, x_1d: Any, cols: int) -> Any:
         arr = jnp.asarray(x_1d).reshape(-1, 1)
         return jnp.broadcast_to(arr, (arr.shape[0], cols))
 
@@ -151,6 +151,11 @@ class JaxStepMetaOps:
 
     def logical_and(self, a: Any, b: Any) -> Any:
         return jnp.asarray(a, dtype=jnp.bool_) & jnp.asarray(b, dtype=jnp.bool_)
+
+    def check_distinct_cols_2d(self, ckpt_g: Any, T: int) -> None:
+        if isinstance(ckpt_g, jax.core.Tracer):
+            return
+        check_ckpt_write_cols_distinct(ckpt_g, T)
 
 
 _JAX_STEP_META_OPS = JaxStepMetaOps()
@@ -200,10 +205,7 @@ def check_ckpt_write_cols_distinct(ckpt_2d: Any, tokens_per_seq: int) -> None:
     T = tokens_per_seq
     if T <= 1:
         return
-    rows = (
-        ckpt_2d.tolist() if hasattr(ckpt_2d, "tolist") else np.asarray(ckpt_2d).tolist()
-    )
-    for row in rows:
+    for row in np.asarray(ckpt_2d).tolist():
         r_t = [int(x) for x in row[:T]]
         if r_t[0] > 0 and (any(x <= 0 for x in r_t) or len(set(r_t)) < T):
             raise ValueError(
@@ -211,22 +213,6 @@ def check_ckpt_write_cols_distinct(ckpt_2d: Any, tokens_per_seq: int) -> None:
                 f"slots per active sequence when tokens_per_seq={T} > 1 "
                 f"(got row {r_t})"
             )
-
-
-def _assert_distinct_ckpt_cols_if_host(
-    ckpt_g: Any, T: int, eff_ops: Any, *, validate: bool
-) -> None:
-    chk = getattr(eff_ops, "check_distinct_cols_2d", None)
-    if chk is not None:
-        chk(ckpt_g, T)
-        return
-    if not (validate or pl.enable_debug_checks.value):
-        return
-    if isinstance(ckpt_g, jax.core.Tracer) or not isinstance(
-        ckpt_g, (np.ndarray, jax.Array)
-    ):
-        return
-    check_ckpt_write_cols_distinct(np.asarray(ckpt_g), T)
 
 
 def pack_step_meta(
@@ -313,8 +299,8 @@ def pack_step_meta(
             ckpt_g,
             eff_ops.zeros_like_i32(ckpt_g),
         )
-        if T > 1:
-            _assert_distinct_ckpt_cols_if_host(ckpt_g, T, eff_ops, validate=validate)
+        if T > 1 and validate:
+            eff_ops.check_distinct_cols_2d(ckpt_g, T)
         roff_g = eff_ops.where(act_g, roff_g, eff_ops.zeros_like_i32(roff_g))
         ckpt_rows.append(ckpt_g)
         roff_rows.append(roff_g)
@@ -326,9 +312,7 @@ def pack_step_meta(
         ckpt_b = eff_ops.stack_dim0(ckpt_rows)
         roff_b = eff_ops.stack_dim0(roff_rows)
         act_seq = eff_ops.gt_zero(ckpt_b[0, :, 0])
-        act_tok = eff_ops.reshape(
-            eff_ops.expand_1d_to_2d(act_seq, T, contiguous=False), (B,)
-        )
+        act_tok = eff_ops.reshape(eff_ops.expand_1d_to_2d(act_seq, T), (B,))
         zero_b = eff_ops.zeros_i32((B,), like=ids_padded)
         ids_b = eff_ops.where(act_tok, ids_padded, zero_b)
         pos_b = eff_ops.where(act_tok, pos_padded, zero_b)
