@@ -9510,6 +9510,10 @@ class TPUModelRunner(GPUModelRunner):
                         self.max_num_reqs,
                     )
                     synchronize_tensors(out_asm2)
+            # sample_tokens runs the assembly programs above in its caller's
+            # grad mode; execute_model runs the rejected-token programs below
+            # under its no_grad, and dynamo guards on grad mode.
+            with self._precompile_timed("async_spec_rejection"), torch.no_grad():
                 rej_warm = torch.zeros(
                     self.max_num_reqs, dtype=torch.int32, device=self.device
                 )
@@ -9544,7 +9548,12 @@ class TPUModelRunner(GPUModelRunner):
                             )
                         )
                     ).to(self.device)
+                    # Two tensors, as serving passes the final and target
+                    # logits indices: dynamo guards on a repeated input.
                     logits_idx_warm = torch.zeros(
+                        (num_tokens,), dtype=torch.int32, device=self.device
+                    )
+                    target_logits_idx_warm = torch.zeros(
                         (num_tokens,), dtype=torch.int32, device=self.device
                     )
                     for knr in sorted(knr_buckets):
@@ -9583,7 +9592,7 @@ class TPUModelRunner(GPUModelRunner):
                             subst_idx_warm,
                             next_tpu_warm,
                             logits_idx_warm,
-                            logits_idx_warm,
+                            target_logits_idx_warm,
                         )
                         synchronize_tensors((*out_sub, *out_sub_pl, *out_sub_dr))
                         if next_tpu_warm_i64 is not None:
@@ -9609,7 +9618,7 @@ class TPUModelRunner(GPUModelRunner):
                                         subst_idx_warm,
                                         next_tpu_warm_i64,
                                         logits_idx_warm,
-                                        logits_idx_warm,
+                                        target_logits_idx_warm,
                                     ),
                                 )
                             )

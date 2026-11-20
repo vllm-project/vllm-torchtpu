@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -908,10 +909,13 @@ def _assembly_warmup_calls(
     async_drafter=True,
     runner_fields=None,
     with_dtypes=False,
+    with_modes=False,
+    programs=None,
 ):
     """Run _precompile_async_spec_assembly on a stub runner and record the
     shapes (and, `with_dtypes`, the dtypes) each assembly program was warmed
-    with."""
+    with. `with_modes` records each call's grad mode and arguments instead;
+    `programs` runs the named programs in place of the recorder."""
     calls: dict[str, list[tuple]] = {name: [] for name in _ASSEMBLY_PROGRAMS}
 
     def spec(a):
@@ -921,13 +925,17 @@ def _assembly_warmup_calls(
 
     def recorder(name):
         def record(*args):
-            calls[name].append(tuple(spec(a) for a in args))
+            if with_modes:
+                calls[name].append((torch.is_grad_enabled(), args))
+            else:
+                calls[name].append(tuple(spec(a) for a in args))
             return (torch.zeros(1),)
 
         return record
 
     for name in _ASSEMBLY_PROGRAMS:
-        monkeypatch.setattr(async_output, name, recorder(name))
+        program = (programs or {}).get(name)
+        monkeypatch.setattr(async_output, name, program or recorder(name))
     monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
     runner = SimpleNamespace(
         _is_async_drafter=async_drafter,
@@ -948,6 +956,137 @@ def _assembly_warmup_calls(
         setattr(runner, name, value)
     tpu_runner.TPUModelRunner._precompile_async_spec_assembly(runner)  # type: ignore[arg-type]
     return calls
+
+
+# The step after a spec verify step: sample_tokens assembles the next tokens and
+# the rejected counts, and execute_model (under its no_grad) subtracts them.
+_SAMPLE_TOKENS_PROGRAMS = (
+    "_compiled_pad_non_spec_next_tokens",
+    "_compiled_assemble_prefill_bootstrap",
+    "_compiled_assemble_spec_and_rejected",
+    "_compiled_assemble_two_chunks_spec_and_rejected",
+)
+_EXECUTE_MODEL_PROGRAMS = (
+    "_compiled_subtract_num_rejected_tokens",
+    "_compiled_subtract_and_substitute_placeholder_token",
+    "_compiled_subtract_and_substitute_draft_token_ids",
+)
+
+
+def test_async_spec_assembly_warmup_takes_each_programs_serving_guards(monkeypatch):
+    """Dynamo guards on grad mode and on a repeated input. sample_tokens runs
+    the assembly programs in its caller's grad mode and execute_model runs the
+    rejected-token programs under no_grad, so each is warmed in its own mode;
+    the draft-token program gets the final and target logits indices as two
+    tensors, as serving passes them."""
+    calls = _assembly_warmup_calls(monkeypatch, most=4, with_modes=True)
+    for names, grad in (
+        (_SAMPLE_TOKENS_PROGRAMS, True),
+        (_EXECUTE_MODEL_PROGRAMS, False),
+    ):
+        for name in names:
+            assert calls[name], name
+            assert {mode for mode, _ in calls[name]} == {grad}, name
+    for _, args in calls["_compiled_subtract_and_substitute_draft_token_ids"]:
+        assert args[8] is not args[9]
+
+
+class _StepStopped(Exception):
+    pass
+
+
+class _EntryRunner:
+    """A runner stand-in that runs `call` at the entry point's first read of
+    it, inside the grad mode the entry point gives its body, then stops."""
+
+    def __init__(self, call):
+        self._call = call
+
+    def __getattr__(self, name):
+        self._call()
+        raise _StepStopped
+
+
+def _inside(entry, call) -> None:
+    """Run `call` inside TPUModelRunner.`entry` (execute_model or
+    sample_tokens), in the grad mode serving gives that entry's body."""
+    with pytest.raises(_StepStopped):
+        getattr(tpu_runner.TPUModelRunner, entry)(_EntryRunner(call), None)
+
+
+def _counting_compile(name, compiles):
+    """The real program `name`, compiled whole on a backend that records each
+    compile; dynamo's guards decide whether a call reuses a graph, whatever
+    the backend."""
+    from vllm_torchtpu.spec_decode.eagle3 import _static_shape_args
+
+    def backend(gm, example_inputs):
+        compiles.append(name)
+        return gm.forward
+
+    fn = inspect.unwrap(getattr(async_output, name))
+    return _static_shape_args(
+        torch.compile(fn, backend=backend, fullgraph=True, dynamic=False)
+    )
+
+
+def test_the_warmed_rejected_token_programs_serve_without_compiling(monkeypatch):
+    """The real placeholder and draft-token programs, warmed by
+    _precompile_async_spec_assembly and then called from inside execute_model
+    as _prepare_inputs calls them, and the real one-chunk assembly called from
+    inside sample_tokens: no serving call compiles."""
+    torch._dynamo.reset()
+    try:
+        compiles: list[str] = []
+        names = (*_EXECUTE_MODEL_PROGRAMS[1:], "_compiled_assemble_spec_and_rejected")
+        programs = {name: _counting_compile(name, compiles) for name in names}
+        _assembly_warmup_calls(monkeypatch, programs=programs)
+        warmed = len(compiles)
+        knr, n, bound, k = 8, 16, 8 * (1 + 3), 3
+
+        def subtract_args():
+            return (
+                torch.zeros(knr, dtype=torch.int32),
+                torch.zeros(n, dtype=torch.int32),
+                torch.zeros(knr, dtype=torch.int32),
+                torch.from_numpy(np.full(knr, -1, dtype=np.int32)),
+                torch.from_numpy(np.full(n, -1, dtype=np.int32)),
+                torch.zeros(n, dtype=torch.int32),
+                # Destinations in row 0, sources in row 1 (-1: padding).
+                torch.from_numpy(
+                    np.stack(
+                        (np.zeros(n, dtype=np.int32), np.full(n, -1, dtype=np.int32))
+                    )
+                ),
+                torch.zeros(bound, dtype=torch.int32),
+            )
+
+        def prepare_inputs():
+            async_output._compiled_subtract_and_substitute_placeholder_token(
+                *subtract_args()
+            )
+            # Final and target logits indices: two tensors of the metadata.
+            async_output._compiled_subtract_and_substitute_draft_token_ids(
+                *subtract_args(),
+                torch.zeros(n, dtype=torch.int32),
+                torch.zeros(n, dtype=torch.int32),
+            )
+
+        _inside("execute_model", prepare_inputs)
+
+        def assemble():
+            async_output._compiled_assemble_spec_and_rejected(
+                torch.zeros((4, k + 1), dtype=torch.int32),
+                torch.zeros((8, k), dtype=torch.int32),
+                torch.zeros(4, dtype=torch.int32),
+                bound,
+                knr,
+            )
+
+        _inside("sample_tokens", assemble)
+        assert len(compiles) == warmed, compiles[warmed:]
+    finally:
+        torch._dynamo.reset()
 
 
 def test_async_spec_assembly_warmup_covers_every_bucket(monkeypatch):
@@ -1312,7 +1451,6 @@ def test_sample_tokens_rolls_back_through_the_rule_after_the_drafter():
     the deferred rollback runs after the drafter's propose call (structural:
     sample_tokens needs a TPU-backed runner to execute)."""
     import ast
-    import inspect
 
     import vllm_torchtpu.runner.tpu_runner as tr
 
