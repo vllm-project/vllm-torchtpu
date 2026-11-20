@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Experimental gated RMS norm fused with the next linear's fp8 quantization."""
+"""Gated RMS norm fused with the next linear's fp8 quantization."""
 
 from vllm_torchtpu.models.qwen3_5.kernels.gated_norm_quant.kernel import (
     gated_norm_quant,

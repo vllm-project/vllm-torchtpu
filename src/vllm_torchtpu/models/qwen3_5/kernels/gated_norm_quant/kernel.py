@@ -34,8 +34,7 @@ TARGET_VREG_BUDGET = 64  # Hardware VREG count per TPU core (256 KiB)
 # under the 32 MiB scoped default (it sets no vmem_limit_bytes); the budget
 # holds the unsharded GDN width (64 heads x 128 = 8192 columns, TP1 under
 # pipeline parallelism) to 200 rows (128 once legal_tile divides a step)
-# and leaves widths of 1638 columns or
-# less at the 512-row cap.
+# and leaves widths of 3276 columns or less at the 512-row cap.
 TILE_VMEM_BUDGET_BYTES = 16 << 20
 # Bytes per element of a block across its buffers: two bf16 inputs and one
 # fp8 output, double buffered.
