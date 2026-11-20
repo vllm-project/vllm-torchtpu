@@ -23,7 +23,13 @@ import torch
 from vllm.distributed import parallel_state
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.adapter import expert_placement
+from vllm_torchtpu.kernels.fused_moe.v3 import layer as kernel_layer
+from vllm_torchtpu.kernels.fused_moe.v3 import layout as kernel_layout
+from vllm_torchtpu.layers.adapter import (
+    expert_placement,
+    moe_routing,
+    sequence_parallel,
+)
 from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as v3
 
 pytestmark = pytest.mark.cpu_test
@@ -90,8 +96,6 @@ def test_tensor_parallel_gate_refuses_a_first_sliced_bucket_below_it(
     sequence-parallel step is sliced, so the first sliced bucket is one row)
     or 256 (32 rows per rank): the first sliced bucket is below the gate, so
     a few-token cap is refused."""
-    from vllm_torchtpu.layers.adapter import sequence_parallel
-
     monkeypatch.setattr(sequence_parallel, "DEFAULT_MIN_ROWS", threshold)
     groups(1, 8)
     with pytest.raises(ValueError, match="leave steps between the two kernels"):
@@ -105,8 +109,6 @@ def test_tensor_parallel_gate_is_checked_at_the_first_sliced_bucket(
     legs ran; the threshold defaults to 0 until a model follows each step's
     form): 64 rows per rank at the first sliced bucket, which meets the TP8
     gate of 33."""
-    from vllm_torchtpu.layers.adapter import sequence_parallel
-
     monkeypatch.setattr(sequence_parallel, "DEFAULT_MIN_ROWS", 512)
     groups(1, 8)
     v3.check_kernel_threshold(ep=8, tp=8, lowtok_cap=448)
@@ -180,8 +182,6 @@ def test_the_bridge_asks_the_kernel_for_its_lowering_by_argument(monkeypatch):
     effects and with the rank tensor as the shard index, as arguments of
     that call; the kernel package has no process-wide flags left that a
     bridge could set for every other caller."""
-    from vllm_torchtpu.kernels.fused_moe.v3 import layer, layout
-
     calls = []
     monkeypatch.setattr(v3, "fused_ep_moe", lambda *a, **kw: calls.append(kw))
     run_moe = v3.run_moe_v3(
@@ -200,9 +200,9 @@ def test_the_bridge_asks_the_kernel_for_its_lowering_by_argument(monkeypatch):
     assert kwargs["wrap_in_jit"] is False
     assert kwargs["shard_index"] is rank
     for module, flag in (
-        (layer, "WRAP_IN_JIT"),
-        (layout, "SIDE_EFFECTS"),
-        (layout, "SHARD_INDEX_OPERAND"),
+        (kernel_layer, "WRAP_IN_JIT"),
+        (kernel_layout, "SIDE_EFFECTS"),
+        (kernel_layout, "SHARD_INDEX_OPERAND"),
     ):
         assert not hasattr(module, flag), flag
 
@@ -263,8 +263,6 @@ def test_the_batch_floor_counts_one_scheduler_batch_per_dp_rank(
     """Under TP with sequence parallelism the TP ranks of a DP rank split one
     scheduler batch, so the batch floor sees ep // tp batches, not ep: 4 at
     DP4 x TP2 (EP 8), 1 at TP8 (EP 8)."""
-    from vllm_torchtpu.layers.adapter import sequence_parallel
-
     batches = []
     monkeypatch.setattr(v3, "_max_node_tokens", lambda n: batches.append(n) or 4096)
     monkeypatch.setattr(v3, "_tensor_parallel_size", lambda: tp)
@@ -302,8 +300,6 @@ def test_routing_the_v3_router_cannot_compute_is_refused(armed, routing):
 def test_simulated_routing_is_refused(armed, monkeypatch):
     """uniform_random simulation is served by the v2 kernel through routing
     operands; the v3 kernel routes by itself, so it is refused."""
-    from vllm_torchtpu.layers.adapter import moe_routing
-
     monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", object())
     monkeypatch.setattr(moe_routing, "_strategy_name", "uniform_random")
     assert not _prebuild(_layer(slots=4))
