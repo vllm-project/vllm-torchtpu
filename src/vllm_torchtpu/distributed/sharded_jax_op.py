@@ -138,8 +138,10 @@ def sharded_jax_op(
         },
     )
     # One output spec per output leaf: JaxCallable zips them with the out avals.
-    output_specs = jax.tree.leaves(
-        output_partition_specs, is_leaf=lambda s: isinstance(s, PartitionSpec)
+    output_specs = tuple(
+        jax.tree.leaves(
+            output_partition_specs, is_leaf=lambda s: isinstance(s, PartitionSpec)
+        )
     )
     # torch_tpu 0.2.0 annotates the specs as tuples of axis-name tuples and
     # donate_argnums as a list; JaxCallable takes PartitionSpecs, as main's
