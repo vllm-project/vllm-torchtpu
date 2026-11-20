@@ -807,3 +807,120 @@ class SparseMlaLseTest(parameterized.TestCase):
             counts,
         )
         np.testing.assert_allclose(merged, whole, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "chunks, min_tokens, num_tokens, expected",
+    [
+        (0, 1024, 4096, 1),  # off
+        (1, 1024, 4096, 1),  # one chunk is the unsplit merge
+        (4, 1024, 4096, 4),
+        (4, 1024, 512, 1),  # below the minimum bucket
+        (4, 0, 16, 1),  # 16 / 4 = 4 rows, not a multiple of 8
+        (2, 0, 16, 2),
+    ],
+)
+def test_merge_chunks(chunks, min_tokens, num_tokens, expected, monkeypatch):
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_MERGE_CHUNKED", chunks, raising=False)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS", min_tokens, raising=False
+    )
+    assert cp_mla.merge_chunks(num_tokens) == expected
+
+
+class _RowGroup:
+    """A DCP group whose collectives act on the rows they are given.
+
+    `all_gather` stacks this rank's lse rows with the same rows of every
+    peer, and `reduce_scatter` sums the same rows of every peer's weighted
+    term. Rows are located by value in the rank's full lse, so the group also
+    serves a merge called on a token slice.
+    """
+
+    def __init__(self, outputs, lses, rank):
+        self.world_size = len(lses)
+        self.rank_in_group = rank
+        self._outputs = outputs
+        self._lses = lses
+        self._rows = None
+
+    def _locate(self, lse_rows):
+        full = self._lses[self.rank_in_group]
+        for start in range(full.shape[0] - lse_rows.shape[0] + 1):
+            if torch.equal(full[start : start + lse_rows.shape[0]], lse_rows):
+                return slice(start, start + lse_rows.shape[0])
+        raise AssertionError("rows not found")
+
+    def all_gather(self, tensor, dim=0):
+        assert dim == 0 and tensor.shape[0] == 1
+        self._rows = self._locate(tensor[0])
+        return self._lses[:, self._rows].clone()
+
+    def reduce_scatter(self, tensor, dim=-1):
+        rows = self._rows
+        total = None
+        for rank in range(self.world_size):
+            lse = self._lses[rank, rows]
+            merged = torch.logsumexp(self._lses[:, rows], dim=0)
+            weight = torch.exp(lse - merged).unsqueeze(-1)
+            term = self._outputs[rank, rows].to(torch.float32) * weight
+            term = torch.where(weight > 0, term, torch.zeros_like(term))
+            term = term.to(tensor.dtype)
+            total = term if total is None else total + term
+        width = total.shape[dim] // self.world_size
+        return total.narrow(dim, self.rank_in_group * width, width)
+
+
+@pytest.mark.parametrize("rs_out_precision", [False, True])
+def test_chunked_merge_is_bit_identical(rs_out_precision, monkeypatch):
+    """Four 16-row chunks of a 64-token merge give exactly the unsplit result."""
+    rng = np.random.default_rng(7)
+    outputs, lses = _partials(rng, 4, tokens=64, empty=((1, 3), (2, 40)))
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_RS_OUT_PRECISION", rs_out_precision, raising=False
+    )
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False, raising=False)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS", 0, raising=False
+    )
+    results = {}
+    for chunks in (0, 4):
+        monkeypatch.setattr(cp_mla.envs, "TPU_DCP_MERGE_CHUNKED", chunks, raising=False)
+        per_rank = []
+        for rank in range(4):
+            group = _RowGroup(outputs, lses, rank)
+            monkeypatch.setattr(cp_mla, "get_dcp_group", lambda g=group: g)
+            per_rank.append(
+                cp_mla.merge_lse_partials_scatter_heads(outputs[rank], lses[rank])
+            )
+        results[chunks] = torch.cat(per_rank, dim=1)
+    assert torch.equal(results[0], results[4])
+    np.testing.assert_allclose(
+        results[4].numpy(),
+        _reference_merge(outputs, lses),
+        rtol=2e-2 if rs_out_precision else 1e-5,
+        atol=2e-2 if rs_out_precision else 1e-5,
+    )
+
+
+def test_drafter_merge_is_never_chunked(monkeypatch):
+    """The MTP drafter is traced once for every bucket, so it keeps one merge."""
+    rng = np.random.default_rng(8)
+    outputs, lses = _partials(rng, 2, tokens=64)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_MERGE_CHUNKED", 4, raising=False)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS", 0, raising=False
+    )
+    calls = []
+
+    def spy(output, lse, group, rs_dtype=None):
+        calls.append(output.shape[0])
+        return output[:, : output.shape[1] // 2]
+
+    monkeypatch.setattr(cp_mla, "cp_lse_ag_out_rs", spy)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: _RowGroup(outputs, lses, 0))
+    cp_mla.merge_lse_partials_scatter_heads(outputs[0], lses[0], is_backbone=False)
+    assert calls == [64]
+    calls.clear()
+    cp_mla.merge_lse_partials_scatter_heads(outputs[0], lses[0], is_backbone=True)
+    assert calls == [16, 16, 16, 16]

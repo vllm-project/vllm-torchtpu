@@ -134,7 +134,47 @@ def merge_lse_partials_scatter_heads(
         return merge_lse_partials_all_to_all(output, lse, group)
 
     rs_dtype = output.dtype if envs.TPU_DCP_RS_OUT_PRECISION and is_backbone else None
-    return cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype)
+    # Like the all-to-all choice above, the chunk count reads the token count
+    # at trace time, so only the backbone (traced per bucket) may chunk.
+    chunks = merge_chunks(output.shape[0]) if is_backbone else 1
+    if chunks == 1:
+        return cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype)
+    step = output.shape[0] // chunks
+    return torch.cat(
+        [
+            cp_lse_ag_out_rs(
+                output[c * step : (c + 1) * step],
+                lse[c * step : (c + 1) * step],
+                group,
+                rs_dtype=rs_dtype,
+            )
+            for c in range(chunks)
+        ],
+        dim=0,
+    )
+
+
+def merge_chunks(num_tokens: int) -> int:
+    """Returns how many token chunks the reduce-scatter merge is split into.
+
+    Args:
+      num_tokens: the step's padded token count (the bucket size).
+
+    Returns:
+      `TPU_DCP_MERGE_CHUNKED` if it is above 1, `num_tokens` reaches
+      `TPU_DCP_MERGE_CHUNKED_MIN_TOKENS`, and `num_tokens` splits into that
+      many chunks whose length is a multiple of 8; otherwise 1. For example,
+      with the knob at 4 and the default minimum, 4096 tokens give 4 chunks of
+      1024 and 16 tokens give 1.
+    """
+    chunks = envs.TPU_DCP_MERGE_CHUNKED
+    if (
+        chunks <= 1
+        or num_tokens < envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS
+        or num_tokens % (8 * chunks)
+    ):
+        return 1
+    return chunks
 
 
 def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:

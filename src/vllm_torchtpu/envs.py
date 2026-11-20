@@ -27,6 +27,8 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_RS_OUT_PRECISION: bool = True
+    TPU_DCP_MERGE_CHUNKED: int = 0
+    TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -463,6 +465,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Backbone MLA merge: reduce-scatter the weighted outputs in the output's
     # precision (bf16), half f32's bytes. MTP drafter stays f32; 0 = f32.
     "TPU_DCP_RS_OUT_PRECISION": env_bool("TPU_DCP_RS_OUT_PRECISION", default=True),
+    # Split the backbone's reduce-scatter MLA merge of a bucket of at least
+    # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens into this many equal token chunks.
+    # 0 or 1 keeps one merge. A bucket that does not split into chunks of a
+    # multiple of 8 rows (the f32 sublane tile) also keeps one merge. Each row
+    # depends only on its own lse, so the result is bit-identical; only the
+    # schedule changes: chunk k's SparseCore-offloaded reduce-scatter can run
+    # while the TensorCore gathers and weights chunk k + 1. Example: a 4096-token
+    # mixed step with TPU_DCP_MERGE_CHUNKED=4 merges four 1024-token chunks.
+    "TPU_DCP_MERGE_CHUNKED": env_nonnegative_int("TPU_DCP_MERGE_CHUNKED", 0),
+    "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS", 1024
+    ),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins
     # them in VMEM and its output aliases q_nope (512 wide), instead of the
