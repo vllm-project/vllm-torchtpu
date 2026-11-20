@@ -880,8 +880,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
     # Reduced-precision modes of this layer's batched RPA kernels; off unless
     # the model turns them on (native_fp8_scope).
     attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF
-    # Set by the runner on a speculative draft's attention layers before
-    # their kernels are built: those layers keep full precision.
+    # Set on a speculative draft's attention layers before their kernels are
+    # built (by the TPU runner, the DFlash proposer and the export path):
+    # those layers keep full precision.
     is_attention_draft: bool = False
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
