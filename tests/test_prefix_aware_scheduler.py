@@ -940,12 +940,16 @@ def short_first_scheduler(
     short_step: bool = False,
     compile_sizes: tuple[int, ...] = (16, CHUNK, 2 * CHUNK, BUDGET),
     num_blocks: int = 4000,
+    take_oldest: bool = False,
 ) -> PrefixAwareScheduler:
     monkeypatch.setenv(
         "TPU_PREFIX_AWARE_SHORT_PROMPTS",
         ("first-short-step" if short_step else "first") if on else "off",
     )
     monkeypatch.setenv("TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX", "1" if hold else "0")
+    monkeypatch.setenv(
+        "TPU_PREFIX_AWARE_SHORTS_TAKE_OLDEST_CHUNK", "1" if take_oldest else "0"
+    )
     return make_scheduler(
         follow,
         budget=budget,
@@ -1034,16 +1038,26 @@ def test_an_unknown_short_prompts_mode_is_refused(monkeypatch):
         make_scheduler(False)
 
 
+@pytest.mark.parametrize("take_oldest", [False, True])
 @pytest.mark.parametrize("short_step", [False, True])
-def test_long_prefills_alone_keep_the_whole_budget(monkeypatch, short_step):
-    scheduler = short_first_scheduler(monkeypatch, short_step=short_step)
+def test_long_prefills_alone_keep_the_whole_budget(
+    monkeypatch, short_step, take_oldest
+):
+    scheduler = short_first_scheduler(
+        monkeypatch, short_step=short_step, take_oldest=take_oldest
+    )
     two_long_prefills(scheduler)
     assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK}
 
 
+@pytest.mark.parametrize("take_oldest", [False, True])
 @pytest.mark.parametrize("short_step", [False, True])
-def test_a_waiting_long_prompt_gets_no_reservation(monkeypatch, short_step):
-    scheduler = short_first_scheduler(monkeypatch, short_step=short_step)
+def test_a_waiting_long_prompt_gets_no_reservation(
+    monkeypatch, short_step, take_oldest
+):
+    scheduler = short_first_scheduler(
+        monkeypatch, short_step=short_step, take_oldest=take_oldest
+    )
     two_long_prefills(scheduler)
     add(scheduler, "other", SHORT + 25, first_token=50_000)
     assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK}
@@ -1084,6 +1098,48 @@ def test_the_oldest_long_prefill_keeps_its_full_chunk(monkeypatch):
     for i in range(3):
         add(scheduler, f"s{i}", 47, first_token=50_000 + 100 * i)
     assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK - 47, "s0": 47}
+
+
+@pytest.mark.parametrize("short_step", [False, True])
+def test_a_short_prompt_behind_a_short_prefill_takes_the_oldest_long_chunk(
+    monkeypatch, short_step
+):
+    off = short_first_scheduler(monkeypatch, short_step=short_step)
+    on = short_first_scheduler(monkeypatch, short_step=short_step, take_oldest=True)
+    for scheduler in (off, on):
+        two_long_prefills(scheduler)
+        add(scheduler, "s1", 2 * CHUNK + 60, first_token=50_000)
+        step(scheduler)
+        add(scheduler, "s2", 31, first_token=60_000)
+    assert step(off) == {"long1": CHUNK, "s1": CHUNK}
+    assert step(on) == {"long1": CHUNK - 31, "s1": CHUNK, "s2": 31}
+
+
+def test_waiting_short_prompts_take_the_oldest_long_chunk(monkeypatch):
+    scheduler = short_first_scheduler(monkeypatch, take_oldest=True)
+    two_long_prefills(scheduler)
+    for i in range(3):
+        add(scheduler, f"s{i}", 47, first_token=50_000 + 100 * i)
+    assert step(scheduler) == {"long1": 2 * CHUNK - 2 * 47, "s0": 47, "s1": 47}
+    assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK - 47, "s2": 47}
+    assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK}
+
+
+def test_short_prompts_take_the_oldest_long_chunk_only_with_short_prompts_first(
+    monkeypatch,
+):
+    with pytest.raises(NotImplementedError, match="short prompts first"):
+        short_first_scheduler(monkeypatch, on=False, take_oldest=True)
+
+
+def test_a_long_prefill_a_prompt_waits_for_keeps_its_chunk_from_short_prompts(
+    monkeypatch,
+):
+    scheduler = short_first_scheduler(monkeypatch, hold=True, take_oldest=True)
+    two_long_prefills(scheduler)
+    add(scheduler, "child", 2000 + 16, first_token=30_000)
+    add(scheduler, "short", 31, first_token=50_000)
+    assert step(scheduler) == {"long1": CHUNK - 31, "long2": CHUNK, "short": 31}
 
 
 def test_fewest_uncached_tokens_go_first(monkeypatch):
@@ -1159,14 +1215,21 @@ def test_no_free_sequence_slot_means_no_reservation(monkeypatch):
     assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK}
 
 
+@pytest.mark.parametrize("take_oldest", [False, True])
 @pytest.mark.parametrize("short_step", [False, True])
 @pytest.mark.parametrize("follow", [False, True])
-def test_every_prompt_token_is_computed_once(monkeypatch, follow, short_step):
+def test_every_prompt_token_is_computed_once(
+    monkeypatch, follow, short_step, take_oldest
+):
     rng = random.Random(0)
     sizes = [2, 22, 59, CHUNK + 1, 156, SHORT, SHORT + 1, 937]
     prompts = {f"r{i}": rng.choice(sizes) for i in range(24)}
     scheduler = short_first_scheduler(
-        monkeypatch, follow=follow, max_num_seqs=6, short_step=short_step
+        monkeypatch,
+        follow=follow,
+        max_num_seqs=6,
+        short_step=short_step,
+        take_oldest=take_oldest,
     )
     computed = dict.fromkeys(prompts, 0)
     pending = list(prompts.items())
