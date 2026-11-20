@@ -10743,7 +10743,21 @@ class TPUModelRunner(GPUModelRunner):
                         total = self._spec_step_total(P)
                         if buckets.needs_retrace(P) and total is not None:
                             self._retrace_eagle_draft()
-                            self._warmup_spec_first_pass(total, idx=i)
+                            if not self._warmup_spec_first_pass(total, idx=i):
+                                # The retrace dropped the refusals and the
+                                # draft's trace; going on would leave the
+                                # draft to one trace after the window, with
+                                # one form for every bucket.
+                                raise RuntimeError(
+                                    "spec-decode warmup could not run the MTP "
+                                    f"draft's first pass of {total} tokens for "
+                                    f"token bucket {P} (above max_model_len="
+                                    f"{self.max_model_len}) after retracing the "
+                                    "draft (see the warning or error above); "
+                                    "refusing to start a server whose draft "
+                                    "would serve that bucket with the other "
+                                    "side's graph"
+                                )
                         continue
                     if buckets.needs_retrace(P):
                         self._retrace_eagle_draft()
