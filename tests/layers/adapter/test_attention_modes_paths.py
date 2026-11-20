@@ -49,10 +49,10 @@ def cpu_vllm_config_context():
         yield
 
 
-def _impl(cls, modes=_MODES, draft=False):
+def _impl(cls, modes=_MODES, draft=False, head_size=256):
     impl = cls(
         num_heads=8,
-        head_size=256,
+        head_size=head_size,
         scale=1 / 16,
         num_kv_heads=1,
         alibi_slopes=None,
@@ -77,6 +77,14 @@ def test_pcp_streaming_refuses_a_layer_with_modes():
         impl._build_rpa_kernel(None, None, None, use_pcp_streaming=True)
 
 
+def test_head_dim_64_refuses_a_layer_with_modes():
+    """head_dim 64 runs ragged_paged_attention_hd64 whatever the entry, and
+    that kernel has no modes."""
+    impl = _impl(attention.PallasBatchedRPAAttentionBackendImpl, head_size=64)
+    with _context(), pytest.raises(NotImplementedError, match="hd64"):
+        impl._build_rpa_kernel(None, None, None)
+
+
 def test_an_entry_without_modes_refuses_a_layer_with_modes():
     impl = _impl(attention.PallasAttentionBackendImpl)
     with _context(), pytest.raises(NotImplementedError, match="no reduced-precision"):
@@ -98,25 +106,37 @@ def _past_the_refusal(*args, **kwargs):
 
 
 @pytest.mark.parametrize(
-    ("build", "next_step"),
+    ("cls", "head_size", "build", "next_step"),
     [
         (
+            attention.PallasAttentionBackendImpl,
+            256,
             lambda impl: impl._build_rpa_kernel(
                 None, None, None, use_pcp_streaming=True
             ),
             "_select_kernel_mesh",
         ),
         (
+            attention.PallasBatchedRPAAttentionBackendImpl,
+            64,
+            lambda impl: impl._build_rpa_kernel(None, None, None),
+            "_select_kernel_mesh",
+        ),
+        (
+            attention.PallasAttentionBackendImpl,
+            256,
             lambda impl: impl._build_bundled_kernel(None, None, None),
             "get_vllm_model_wrapper_context",
         ),
     ],
-    ids=["pcp-streaming", "bundled"],
+    ids=["pcp-streaming", "head-dim-64", "bundled"],
 )
-def test_a_draft_layer_with_target_modes_is_not_refused(monkeypatch, build, next_step):
+def test_a_draft_layer_with_target_modes_is_not_refused(
+    monkeypatch, cls, head_size, build, next_step
+):
     """A draft runs every mode off, so the refusal does not apply to it: the
     build goes on to its next step."""
-    impl = _impl(attention.PallasAttentionBackendImpl, draft=True)
+    impl = _impl(cls, draft=True, head_size=head_size)
     if next_step == "_select_kernel_mesh":
         monkeypatch.setattr(impl, next_step, _past_the_refusal)
     else:
