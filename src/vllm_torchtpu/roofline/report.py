@@ -23,6 +23,7 @@ from pathlib import Path
 
 from .chips import CHIPS, ChipSpec, chip_catalog, count_hosts, format_constant_display
 from .constants import (
+    DEFAULT_CHIPS_PER_HOST,
     DEFAULT_GPU_MEMORY_UTILIZATION,
     MAX_EMBEDDED_CANDIDATES,
     MAX_SVG_BG_POINTS,
@@ -809,17 +810,27 @@ def _downsample_embedded_candidates(
     return list(raw_cands[::stride][:MAX_EMBEDDED_CANDIDATES])
 
 
-def _pool_inline_label(pool: Mapping[str, object], *, has_moe: bool) -> str:
+def _pool_inline_label(
+    pool: Mapping[str, object],
+    *,
+    has_moe: bool,
+    chip: ChipSpec | None = None,
+) -> str:
     """Format one-line pool summary with submodule axes and slice counts."""
     axes_str = format_submodule_parallelism(pool, has_moe=has_moe)
-    slice_str = pool_slice_summary(pool)
+    slice_str = pool_slice_summary(pool, chip=chip)
     return f"{axes_str} · {slice_str}"
 
 
-def _pool_cell_html(pool: Mapping[str, object], *, has_moe: bool) -> str:
+def _pool_cell_html(
+    pool: Mapping[str, object],
+    *,
+    has_moe: bool,
+    chip: ChipSpec | None = None,
+) -> str:
     """Render two-line HTML table cell separating submodule axes from slice meta."""
     axes_str = format_submodule_parallelism(pool, has_moe=has_moe)
-    slice_str = pool_slice_summary(pool)
+    slice_str = pool_slice_summary(pool, chip=chip)
     return (
         f'<td><div class="pool-main"><code>{_escape(axes_str)}</code></div>'
         f'<div class="pool-sub">{_escape(slice_str)}</div></td>'
@@ -830,6 +841,7 @@ def _extract_recommended_view(
     rec: Mapping[str, object] | None,
     *,
     has_moe: bool = False,
+    chip: ChipSpec | None = None,
 ) -> tuple[dict[str, object], list[Mapping[str, object]], str]:
     """Extract display metrics, instance pools, and summary for recommended."""
     if rec is not None and rec.get("slo_verdict") != SLO_VERDICT_RULED_OUT:
@@ -842,7 +854,7 @@ def _extract_recommended_view(
             pools_list.append(d_pool)
         pools_summary = " + ".join(
             f"{str(p.get('role', '')).capitalize()}: "
-            f"{_pool_inline_label(p, has_moe=has_moe)}"
+            f"{_pool_inline_label(p, has_moe=has_moe, chip=chip)}"
             for p in pools_list
         )
         floor = _as_mapping(rec.get("decode_floor"))
@@ -971,16 +983,17 @@ def _pools_display(
     candidate_point: Mapping[str, object],
     *,
     has_moe: bool = False,
+    chip: ChipSpec | None = None,
 ) -> str:
     """Join prefill and decode pool labels for summary headings."""
     prefill_pool = _as_mapping(candidate_point.get("prefill_pool"))
     decode_pool = _as_mapping(candidate_point.get("decode_pool"))
     if prefill_pool:
         return (
-            f"P [{_pool_inline_label(prefill_pool, has_moe=has_moe)}] + "
-            f"D [{_pool_inline_label(decode_pool, has_moe=has_moe)}]"
+            f"P [{_pool_inline_label(prefill_pool, has_moe=has_moe, chip=chip)}] + "
+            f"D [{_pool_inline_label(decode_pool, has_moe=has_moe, chip=chip)}]"
         )
-    return _pool_inline_label(decode_pool, has_moe=has_moe)
+    return _pool_inline_label(decode_pool, has_moe=has_moe, chip=chip)
 
 
 def _rank_label(rank: int, frontier_role: str) -> str:
@@ -1005,6 +1018,7 @@ def _render_table_rows(
     *,
     is_disagg: bool | None = None,
     has_moe: bool = False,
+    chip: ChipSpec | None = None,
 ) -> str:
     """Format top candidate layout options into one HTML table row per rank."""
     entries = _table_entries(top_k, reference)
@@ -1028,15 +1042,16 @@ def _render_table_rows(
         decode_pool = _as_mapping(candidate_point.get("decode_pool"))
         if disagg:
             prefill_cell = (
-                _pool_cell_html(prefill_pool, has_moe=has_moe)
+                _pool_cell_html(prefill_pool, has_moe=has_moe, chip=chip)
                 if prefill_pool
                 else "<td>-</td>"
             )
             pool_cells = (
-                f"{prefill_cell}{_pool_cell_html(decode_pool, has_moe=has_moe)}"
+                f"{prefill_cell}"
+                f"{_pool_cell_html(decode_pool, has_moe=has_moe, chip=chip)}"
             )
         else:
-            pool_cells = _pool_cell_html(decode_pool, has_moe=has_moe)
+            pool_cells = _pool_cell_html(decode_pool, has_moe=has_moe, chip=chip)
         rows.append(
             f"<tr>"
             f"<td>{_rank_label(rank, frontier_role)}</td>"
@@ -1061,13 +1076,14 @@ def _render_table_launch_list(
     reference: Mapping[str, object] | None = None,
     *,
     has_moe: bool = False,
+    chip: ChipSpec | None = None,
 ) -> str:
     """Render one collapsed launch command per table row, below the table."""
     blocks: list[str] = []
     for rank, entry in enumerate(_table_entries(top_k, reference), 1):
         frontier_role = str(entry.get("frontier_role", "candidate"))
         candidate_point = _as_mapping(entry.get("point"))
-        pools_text = _pools_display(candidate_point, has_moe=has_moe)
+        pools_text = _pools_display(candidate_point, has_moe=has_moe, chip=chip)
         summary = (
             f"Launch command for {_rank_label(rank, frontier_role)} "
             f"({frontier_role}): {pools_text}"
@@ -1101,7 +1117,7 @@ def _build_dynamic_chip_spec(
     fallback: ChipSpec,
     chip_name: str,
 ) -> ChipSpec:
-    """Build ChipSpec when payload lacks an embedded catalog."""
+    """Build ChipSpec from serialized payload chip_spec mapping."""
     return ChipSpec(
         name=chip_name,
         hbm_bytes=int(_as_float(chip_spec.get("hbm_bytes"), float(fallback.hbm_bytes))),
@@ -1129,7 +1145,49 @@ def _build_dynamic_chip_spec(
         ),
         dcn_bw=_as_float(chip_spec.get("dcn_bw"), fallback.dcn_bw),
         pcie_bw=_as_float(chip_spec.get("pcie_bw"), fallback.pcie_bw),
+        int8_flops=_as_float(chip_spec.get("int8_flops"), fallback.int8_flops),
+        fp4_flops=_as_float(chip_spec.get("fp4_flops"), fallback.fp4_flops),
+        int4_flops=_as_float(chip_spec.get("int4_flops"), fallback.int4_flops),
+        ici_links_per_chip=_as_int(
+            chip_spec.get("ici_links_per_chip"), fallback.ici_links_per_chip
+        ),
+        min_torus_dim=_as_int(chip_spec.get("min_torus_dim"), fallback.min_torus_dim),
+        num_lanes=_as_int(chip_spec.get("num_lanes"), fallback.num_lanes),
+        num_sublanes=_as_int(chip_spec.get("num_sublanes"), fallback.num_sublanes),
+        physical_alignment_elems=_as_int(
+            chip_spec.get("physical_alignment_elems"), fallback.physical_alignment_elems
+        ),
+        smem_page_table_bytes=_as_int(
+            chip_spec.get("smem_page_table_bytes"), fallback.smem_page_table_bytes
+        ),
+        dma_granule_bytes=_as_int(
+            chip_spec.get("dma_granule_bytes"), fallback.dma_granule_bytes
+        ),
+        subchannel_block_k_floor=_as_int(
+            chip_spec.get("subchannel_block_k_floor"), fallback.subchannel_block_k_floor
+        ),
+        vector_flops=_as_float(chip_spec.get("vector_flops"), fallback.vector_flops),
+        mxu_lhs_rows_bf16=_as_int(
+            chip_spec.get("mxu_lhs_rows_bf16"), fallback.mxu_lhs_rows_bf16
+        ),
+        mxu_lhs_rows_fp8=_as_int(
+            chip_spec.get("mxu_lhs_rows_fp8"), fallback.mxu_lhs_rows_fp8
+        ),
+        has_sparse_core=bool(
+            chip_spec.get("has_sparse_core", fallback.has_sparse_core)
+        ),
+        provenance=str(chip_spec.get("provenance") or fallback.provenance),
     )
+
+
+def _payload_chip_spec(payload: Mapping[str, object]) -> ChipSpec | None:
+    """Reconstruct ChipSpec from payload['chip_spec'] when present."""
+    chip_spec = _as_mapping(payload.get("chip_spec"))
+    if not chip_spec:
+        return None
+    fallback = CHIPS["tpu7x"]
+    chip_name = str(chip_spec.get("name") or payload.get("chip") or fallback.name)
+    return _build_dynamic_chip_spec(chip_spec, fallback, chip_name)
 
 
 def _format_catalog_entry_row(key: str, entry: Mapping[str, object]) -> str:
@@ -1381,7 +1439,10 @@ def _render_crossover_stat_html(payload: Mapping[str, object]) -> str:
 
 
 def _format_bound_family_label(
-    entry: Mapping[str, object], *, has_moe: bool = False
+    entry: Mapping[str, object],
+    *,
+    has_moe: bool = False,
+    chip: ChipSpec | None = None,
 ) -> str:
     """Format a candidate family key cleanly for the L1 handoff table."""
     raw_fam = entry.get("family")
@@ -1394,12 +1455,15 @@ def _format_bound_family_label(
         return ", ".join(f"{k}={v}" for k, v in raw_fam.items()) or "-"
     members = _as_sequence(entry.get("members"))
     if members and isinstance(members[0], Mapping) and "decode_pool" in members[0]:
-        return _pools_display(members[0], has_moe=has_moe)
+        return _pools_display(members[0], has_moe=has_moe, chip=chip)
     return str(members[0]) if members else "-"
 
 
 def _format_bound_family_members(
-    entry: Mapping[str, object], *, has_moe: bool = False
+    entry: Mapping[str, object],
+    *,
+    has_moe: bool = False,
+    chip: ChipSpec | None = None,
 ) -> str:
     """Format member count and distinct pool labels inside one candidate family."""
     member_count = _as_int(entry.get("member_count"), 0)
@@ -1407,9 +1471,9 @@ def _format_bound_family_members(
     labels: list[str] = []
     for member in members:
         if isinstance(member, Mapping) and "decode_pool" in member:
-            labels.append(_pools_display(member, has_moe=has_moe))
+            labels.append(_pools_display(member, has_moe=has_moe, chip=chip))
         elif isinstance(member, Mapping) and "tp" in member:
-            labels.append(_pool_inline_label(member, has_moe=has_moe))
+            labels.append(_pool_inline_label(member, has_moe=has_moe, chip=chip))
         elif member is not None:
             labels.append(str(member))
     count_prefix = f"{member_count} total: " if member_count > 0 else ""
@@ -1423,10 +1487,11 @@ def _render_bound_family_row(
     entry: Mapping[str, object],
     *,
     has_moe: bool = False,
+    chip: ChipSpec | None = None,
 ) -> str:
     """Render one bound-ordered candidate family row for L1 handoff."""
     rank = _as_int(entry.get("rank"), rank_idx)
-    family_label = _format_bound_family_label(entry, has_moe=has_moe)
+    family_label = _format_bound_family_label(entry, has_moe=has_moe, chip=chip)
     min_bound_tpot = _as_float(entry.get("min_bound_tpot_ms"))
     min_bound_ttft = _as_float(entry.get("min_bound_ttft_ms"))
     env_tpot_raw = entry.get("min_envelope_tpot_ms")
@@ -1436,7 +1501,7 @@ def _render_bound_family_row(
     binding = str(entry.get("binding") or "-")
     any_not_ruled_out = bool(entry.get("any_not_ruled_out", True))
     verdict_str = "yes" if any_not_ruled_out else "ruled_out"
-    members_str = _format_bound_family_members(entry, has_moe=has_moe)
+    members_str = _format_bound_family_members(entry, has_moe=has_moe, chip=chip)
     return (
         "<tr>"
         f"<td><code>c={_escape(conc_key)}</code></td>"
@@ -1456,6 +1521,7 @@ def _render_bound_families_section(
     payload: Mapping[str, object],
     *,
     has_moe: bool = False,
+    chip: ChipSpec | None = None,
 ) -> list[str]:
     """Render guarded Bound-Ordered Candidate Families (L1 Handoff) section."""
     raw_by_conc = _as_mapping(payload.get("bound_families_by_concurrency"))
@@ -1473,6 +1539,7 @@ def _render_bound_families_section(
                         rank_idx,
                         entry,
                         has_moe=has_moe,
+                        chip=chip,
                     )
                 )
     if not rows:
@@ -1502,6 +1569,7 @@ def _render_concurrency_skyline_section(
     payload: Mapping[str, object],
     *,
     has_moe: bool = False,
+    chip: ChipSpec | None = None,
 ) -> list[str]:
     """Render per-concurrency Top-K candidates with collapsible launch commands."""
     raw_skyline = _as_mapping(payload.get("concurrency_top_k"))
@@ -1518,7 +1586,7 @@ def _render_concurrency_skyline_section(
             pt = _as_mapping(entry.get("point"))
             if not pt:
                 continue
-            label = _pools_display(pt, has_moe=has_moe)
+            label = _pools_display(pt, has_moe=has_moe, chip=chip)
             bound_ms = _as_float(pt.get("bound_tpot_ms"))
             tput = _as_float(pt.get("token_throughput_per_chip"))
             inter = _as_float(pt.get("est_interactivity_tok_s"))
@@ -1577,14 +1645,59 @@ def _format_dtype_bytes(byte_value: object) -> str:
     return f"{byte_value}B"
 
 
-def _render_header_meta_suffix(payload: Mapping[str, object]) -> str:
+def _render_glossary_unit_item(
+    payload: Mapping[str, object],
+    report_chip: ChipSpec | None,
+) -> str:
+    """Render the Core / Chip / Host / Slice glossary bullet for the active chip."""
+    tpu7x_spec = CHIPS["tpu7x"]
+    if report_chip is None or (
+        report_chip.name == tpu7x_spec.name
+        and report_chip.cores_per_chip == tpu7x_spec.cores_per_chip
+        and report_chip.chips_per_host == tpu7x_spec.chips_per_host
+    ):
+        return (
+            "<li><strong>Core / Chip / Host / Slice:</strong> On TPU v7x, "
+            "1 chip = 2 TensorCores; 1 host = 4 chips (8 TensorCores); "
+            "<code>2x2x1</code> = 4 chips / 1 host, "
+            "<code>2x2x2</code> = 8 chips / 2 hosts. The prefix "
+            "<code>1x</code> or <code>5x</code> counts independent "
+            "vLLM server instances.</li>"
+        )
+    cores_per_chip = report_chip.cores_per_chip
+    chips_per_host = report_chip.chips_per_host
+    cores_per_host = cores_per_chip * chips_per_host
+    chip_core_unit = "TensorCore" if cores_per_chip == 1 else "TensorCores"
+    host_core_unit = "TensorCore" if cores_per_host == 1 else "TensorCores"
+    host_fit = _as_mapping(payload.get("single_host_fit"))
+    raw_topo = host_fit.get("topology") if host_fit is not None else None
+    host_topo = (
+        str(raw_topo) if isinstance(raw_topo, str) and raw_topo else f"{chips_per_host}"
+    )
+    chip_name_esc = html.escape(report_chip.name)
+    host_topo_esc = html.escape(host_topo)
+    return (
+        f"<li><strong>Core / Chip / Host / Slice:</strong> On {chip_name_esc}, "
+        f"1 chip = {cores_per_chip} {chip_core_unit}; "
+        f"1 host = {chips_per_host} chips ({cores_per_host} {host_core_unit}); "
+        f"<code>{host_topo_esc}</code> = {chips_per_host} chips / 1 host. "
+        "The prefix <code>1x</code> or <code>5x</code> counts independent "
+        "vLLM server instances.</li>"
+    )
+
+
+def _render_header_meta_suffix(
+    payload: Mapping[str, object],
+    *,
+    chips_per_host: int = DEFAULT_CHIPS_PER_HOST,
+) -> str:
     """Format budget, pin, and dtype metadata suffix for the report header."""
     chip_budget = _as_mapping(payload.get("chip_budget")) or {}
     budget_chips = _as_int(chip_budget.get("max_chips", payload.get("budget", 0)))
     budget_source = str(
         chip_budget.get("budget_source", payload.get("budget_source", "flag"))
     )
-    budget_hosts = count_hosts(budget_chips)
+    budget_hosts = count_hosts(budget_chips, chips_per_host=chips_per_host)
     budget_text = (
         f"Search Budget: {budget_chips} chips / {format_host_count(budget_hosts)} "
         f"({budget_source})"
@@ -1642,10 +1755,22 @@ def _render_single_host_fit_card(
     *,
     has_moe: bool,
 ) -> str:
-    """Render Single-Host 2x2x1 Fit Verdict card when present in payload."""
+    """Render single-host slice fit verdict card when present in payload."""
     single_host_fit = _as_mapping(payload.get("single_host_fit"))
     if not single_host_fit:
         return ""
+    chip_spec = _as_mapping(payload.get("chip_spec")) or {}
+    topo = str(single_host_fit.get("topology") or "2x2x1")
+    chips_per_host = _as_int(
+        single_host_fit.get("chips_per_host"),
+        _as_int(chip_spec.get("chips_per_host"), CHIPS["tpu7x"].chips_per_host),
+    )
+    cores_per_chip = _as_int(
+        chip_spec.get("cores_per_chip"), CHIPS["tpu7x"].cores_per_chip
+    )
+    cores_per_host = _as_int(
+        single_host_fit.get("cores_per_host"), chips_per_host * cores_per_chip
+    )
     is_feasible = bool(single_host_fit.get("feasible", False))
     fit_status = str(single_host_fit.get("status", "REJECTED"))
     fit_reason = str(single_host_fit.get("reason", ""))
@@ -1653,15 +1778,17 @@ def _render_single_host_fit_card(
     hbm_limit_gb = _as_float(single_host_fit.get("hbm_limit_gb"))
     submod_best = single_host_fit.get("best_submodule_parallelism") if has_moe else None
     raw_best = (
-        submod_best if submod_best else single_host_fit.get("best_parallelism", "TP8")
+        submod_best
+        if submod_best
+        else single_host_fit.get("best_parallelism", f"TP{cores_per_host}")
     )
     best_parallelism = "N/A" if raw_best is None else str(raw_best)
     bg_color = "#dcfce7" if is_feasible else "#fee2e2"
     text_color = "#166534" if is_feasible else "#991b1b"
     return (
         '  <section id="single-host-fit" class="card">\n'
-        "    <h2>Single-Host 2x2x1 Fit Verdict "
-        "(1 host, 4 chips, 8 TensorCores)</h2>\n"
+        f"    <h2>Single-Host {_escape(topo)} Fit Verdict "
+        f"(1 host, {chips_per_host} chips, {cores_per_host} TensorCores)</h2>\n"
         '    <div style="font-size:14px; margin-top:8px;">\n'
         f'      <span class="badge" style="background:{bg_color}; '
         f'color:{text_color}; font-weight:bold;">{_escape(fit_status)}</span> '
@@ -1797,6 +1924,12 @@ def render_html(payload: Mapping[str, object]) -> str:
     top_k = [_as_mapping(x) for x in _as_sequence(payload.get("top_k"))]
     model = str(payload.get("model") or "Model")
     chip = str(payload.get("chip") or "TPU")
+    report_chip = _payload_chip_spec(payload)
+    chips_per_host = (
+        report_chip.chips_per_host
+        if report_chip is not None
+        else CHIPS["tpu7x"].chips_per_host
+    )
     has_moe = _detect_has_moe(payload, candidates)
 
     embedded_payload = dict(payload)
@@ -1816,7 +1949,7 @@ def render_html(payload: Mapping[str, object]) -> str:
         ]
 
     rec_fields, pools_list, pools_summary = _extract_recommended_view(
-        rec, has_moe=has_moe
+        rec, has_moe=has_moe, chip=report_chip
     )
     decode_floor_raw = rec_fields["decode_floor"]
     decode_floor = _as_mapping(decode_floor_raw) if decode_floor_raw else None
@@ -1840,11 +1973,13 @@ def render_html(payload: Mapping[str, object]) -> str:
         reference=ref_report,
         is_disagg=table_is_disagg,
         has_moe=has_moe,
+        chip=report_chip,
     )
     top_table_launch_list = _render_table_launch_list(
         top_k,
         reference=ref_report,
         has_moe=has_moe,
+        chip=report_chip,
     )
     crossover_stat_html = _render_crossover_stat_html(payload)
 
@@ -1852,10 +1987,12 @@ def render_html(payload: Mapping[str, object]) -> str:
     scen_isl = _as_int(scenario.get("isl"))
     scen_osl = _as_int(scenario.get("osl"))
     scen_hit = _as_float(scenario.get("prefix_hit_rate"))
-    meta_suffix = _render_header_meta_suffix(payload)
+    meta_suffix = _render_header_meta_suffix(payload, chips_per_host=chips_per_host)
     sh_fit_html = _render_single_host_fit_card(payload, has_moe=has_moe)
     rec_chips_int = _as_int(rec_fields["chips"])
-    rec_hosts_str = format_host_count(count_hosts(rec_chips_int))
+    rec_hosts_str = format_host_count(
+        count_hosts(rec_chips_int, chips_per_host=chips_per_host)
+    )
 
     html_parts = [
         "<!DOCTYPE html>",
@@ -2008,13 +2145,8 @@ def render_html(payload: Mapping[str, object]) -> str:
             '    <details class="glossary"><summary>'
             "Glossary of Physical Units, Submodule Axes &amp; Roles</summary>"
             "<ul>"
-            "<li><strong>Core / Chip / Host / Slice:</strong> On TPU v7x, "
-            "1 chip = 2 TensorCores; 1 host = 4 chips (8 TensorCores); "
-            "<code>2x2x1</code> = 4 chips / 1 host, "
-            "<code>2x2x2</code> = 8 chips / 2 hosts. The prefix "
-            "<code>1x</code> or <code>5x</code> counts independent "
-            "vLLM server instances.</li>"
-            "<li><strong>Attention vs. MoE Submodule Axes:</strong> "
+            + _render_glossary_unit_item(payload, report_chip)
+            + "<li><strong>Attention vs. MoE Submodule Axes:</strong> "
             "<code>Attn: TP / DP / PCP / DCP</code> partitions attention "
             "heads, request replicas, prefill sequence chunks, and KV cache; "
             "<code>MoE: EP</code> shards whole routed experts across those "
@@ -2036,8 +2168,10 @@ def render_html(payload: Mapping[str, object]) -> str:
             "</ul></details>"
         ),
         "  </section>",
-        *_render_concurrency_skyline_section(payload, has_moe=has_moe),
-        *_render_bound_families_section(payload, has_moe=has_moe),
+        *_render_concurrency_skyline_section(
+            payload, has_moe=has_moe, chip=report_chip
+        ),
+        *_render_bound_families_section(payload, has_moe=has_moe, chip=report_chip),
         *_render_assumptions_card(payload),
         "  <footer>",
         "    Analytical roofline report generated by "

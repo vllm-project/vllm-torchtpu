@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from .chips import (
+    CHIP_TOPOLOGIES,
     CHIPS,
     SUPPORTED_CHIPS,
     TOPOLOGIES,
@@ -24,6 +25,9 @@ from .chips import (
     ConstantSpec,
     SliceTopology,
     chip_catalog,
+    load_chip_spec,
+    register_chip,
+    topologies_for_chip,
 )
 from .collectives import (
     Collective,
@@ -138,6 +142,7 @@ from .step import (
 __all__ = [
     "ACTIVATION_HULL_SCHEMA",
     "CHIPS",
+    "CHIP_TOPOLOGIES",
     "DEFAULT_GPU_MEMORY_UTILIZATION",
     "DEFAULT_TOP_K",
     "EXAMPLE_CONCURRENCIES",
@@ -215,6 +220,7 @@ __all__ = [
     "kv_bytes_per_token_per_layer",
     "layer_ffn_kinds",
     "load_activation_hull",
+    "load_chip_spec",
     "load_hf_config",
     "max_ep_load_ratio",
     "min_experts_per_ep_shard",
@@ -228,6 +234,7 @@ __all__ = [
     "pool_cli_args",
     "pool_label",
     "reference_layout_report",
+    "register_chip",
     "render_html",
     "solve_serving_plan",
     "spec_cycle_floor",
@@ -235,6 +242,7 @@ __all__ = [
     "supports",
     "sweep_prefix_hit_crossovers",
     "top_layouts",
+    "topologies_for_chip",
     "torus_collective_s",
     "unpadded_strict_resource_times",
     "write_html",

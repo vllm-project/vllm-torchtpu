@@ -43,7 +43,8 @@ from .modules import (
     ModuleCost,
     Parallel,
     StepShape,
-    _split_matmul_flops,
+    _MatmulBuckets,
+    _route_matmul_flops,
     _strict_sub_byte_unpack_vector_flops,
     _sub_byte_unpack_vector_flops,
     pass_costs,
@@ -177,6 +178,71 @@ def _dedup_module_collectives(
     return coll_counts, coll_samples
 
 
+def _div_peak(flops: float, peak: float, *, precision: str) -> float:
+    """Divide precision FLOPs by chip peak, guarding unsupported precision."""
+    if flops == 0.0:
+        return 0.0
+    if peak <= 0.0:
+        msg = (
+            f"chip does not support {precision} matrix compute "
+            f"(peak={peak}, required_flops={flops})"
+        )
+        raise ValueError(msg)
+    return flops / peak
+
+
+def _precision_time_s(
+    buckets: _MatmulBuckets,
+    chip: ChipSpec,
+    *,
+    scale: float = 1.0,
+) -> float:
+    """Sum per-precision matrix times across all hardware precision peaks."""
+    pairs = (
+        ("fp8", buckets.fp8, chip.fp8_flops),
+        ("bf16", buckets.bf16, chip.bf16_flops),
+        ("int8", buckets.int8, chip.int8_flops),
+        ("fp4", buckets.fp4, chip.fp4_flops),
+        ("int4", buckets.int4, chip.int4_flops),
+    )
+    return sum(
+        _div_peak(flops * scale, peak, precision=name) for name, flops, peak in pairs
+    )
+
+
+def _module_nominal_buckets(module: ModuleCost) -> _MatmulBuckets:
+    """Return nominal per-precision FLOP buckets for one module."""
+    return _MatmulBuckets(
+        fp8=module.fp8_flops,
+        bf16=module.bf16_flops,
+        int8=module.int8_flops,
+        fp4=module.fp4_flops,
+        int4=module.int4_flops,
+    )
+
+
+def _module_strict_buckets(module: ModuleCost) -> _MatmulBuckets:
+    """Return strict lower-bound per-precision FLOP buckets for one module."""
+    return _MatmulBuckets(
+        fp8=module.strict_fp8_flops,
+        bf16=module.strict_bf16_flops,
+        int8=module.strict_int8_flops,
+        fp4=module.strict_fp4_flops,
+        int4=module.strict_int4_flops,
+    )
+
+
+def _module_envelope_buckets(module: ModuleCost) -> _MatmulBuckets:
+    """Return activation-envelope per-precision FLOP buckets for one module."""
+    return _MatmulBuckets(
+        fp8=module.envelope_fp8_flops,
+        bf16=module.envelope_bf16_flops,
+        int8=module.envelope_int8_flops,
+        fp4=module.envelope_fp4_flops,
+        int4=module.envelope_int4_flops,
+    )
+
+
 def module_serial_s(
     module: ModuleCost,
     chip: ChipSpec,
@@ -187,8 +253,7 @@ def module_serial_s(
     """Return single-module serial time across HBM, matmul, and vector units."""
     return max(
         module.hbm_bytes / chip.hbm_bw,
-        (module.fp8_flops * matmul_scale) / chip.fp8_flops
-        + (module.bf16_flops * matmul_scale) / chip.bf16_flops,
+        _precision_time_s(_module_nominal_buckets(module), chip, scale=matmul_scale),
         (module.vector_flops * vector_scale) / chip.vector_flops,
     )
 
@@ -202,37 +267,29 @@ def _sum_module_resources(
     """Sum per-module HBM, FLOPs, vector, ICI, and serial module execution times."""
     tot_hbm_b = 0.0
     tot_hbm_min_b = 0.0
-    tot_fp8 = 0.0
-    tot_bf16 = 0.0
-    tot_fp8_min = 0.0
-    tot_bf16_min = 0.0
+    tot_nom = _MatmulBuckets()
+    tot_min = _MatmulBuckets()
     tot_vector = 0.0
     tot_vector_min = 0.0
     tot_ici_b = 0.0
     mod_serial_s = 0.0
     vector_peak = chip.vector_flops
     for m in modules:
-        hbm_bytes = m.hbm_bytes
-        fp8_flops = m.fp8_flops
-        bf16_flops = m.bf16_flops
-        vector_flops = m.vector_flops
-        tot_hbm_b += hbm_bytes
+        tot_hbm_b += m.hbm_bytes
         tot_hbm_min_b += m.strict_hbm_bytes
-        tot_fp8 += fp8_flops
-        tot_bf16 += bf16_flops
-        tot_fp8_min += m.strict_fp8_flops
-        tot_bf16_min += m.strict_bf16_flops
-        tot_vector += vector_flops
+        tot_nom = tot_nom + _module_nominal_buckets(m)
+        tot_min = tot_min + _module_strict_buckets(m)
+        tot_vector += m.vector_flops
         tot_vector_min += m.strict_vector_flops
         if has_finite_ici:
             tot_ici_b += m.ici_bytes
         mod_serial_s += module_serial_s(m, chip)
     hbm_s = tot_hbm_b / chip.hbm_bw
-    matmul_s = tot_fp8 / chip.fp8_flops + tot_bf16 / chip.bf16_flops
+    matmul_s = _precision_time_s(tot_nom, chip)
     vector_s = tot_vector / vector_peak
     ici_s = tot_ici_b / chip.ici_bw if has_finite_ici else 0.0
     hbm_bound_s = tot_hbm_min_b / chip.hbm_bw
-    matmul_bound_s = tot_fp8_min / chip.fp8_flops + tot_bf16_min / chip.bf16_flops
+    matmul_bound_s = _precision_time_s(tot_min, chip)
     # Strict vector counts are per element; a word holds up to
     # VECTOR_MAX_ELEMENTS_PER_WORD packed elements, so this rate bounds every dtype.
     vector_bound_s = tot_vector_min / (VECTOR_MAX_ELEMENTS_PER_WORD * vector_peak)
@@ -254,11 +311,12 @@ def _sum_envelope_resources(
 ) -> tuple[float, float]:
     """Sum per-module activation-envelope memory and matrix-compute spans."""
     total_bytes_envelope = sum(module.envelope_hbm_bytes for module in modules)
-    total_fp8_envelope = sum(module.envelope_fp8_flops for module in modules)
-    total_bf16_envelope = sum(module.envelope_bf16_flops for module in modules)
+    tot_env = _MatmulBuckets()
+    for module in modules:
+        tot_env = tot_env + _module_envelope_buckets(module)
     return (
         total_bytes_envelope / chip.hbm_bw,
-        total_fp8_envelope / chip.fp8_flops + total_bf16_envelope / chip.bf16_flops,
+        _precision_time_s(tot_env, chip),
     )
 
 
@@ -285,7 +343,9 @@ def combine_modules(
     ) = _sum_module_resources(modules, chip, has_finite_ici=has_finite_ici)
     mesh_axes = eff_parallel.mesh_axes if eff_parallel is not None else None
     ranks_per_chip = (
-        eff_parallel.ranks_per_chip if eff_parallel is not None else chip.cores_per_chip
+        eff_parallel.ranks_per_chip
+        if eff_parallel is not None and eff_parallel.ranks_per_chip is not None
+        else chip.cores_per_chip
     )
     use_torus = topology is not None or mesh_axes is not None
 
@@ -350,38 +410,42 @@ def combine_modules(
     )
 
 
-def _div_peak(total: float, peak: float) -> float:
-    """Divide resource work by peak rate, returning zero when peak is non-positive."""
-    return 0.0 if peak <= 0.0 else total / peak
+def _scale_opt(val: float | None, k: int) -> float | None:
+    """Scale an optional float metric by ``k`` draft steps."""
+    return None if val is None else val * k
 
 
-def _scale_opt(value: float | None, count: int) -> float | None:
-    """Scale an optional metric by an integer multiplier."""
-    return None if value is None else value * count
-
-
-def _scale_draft_module(module: ModuleCost, spec_k: int) -> ModuleCost:
-    """Scale one draft-layer ModuleCost across spec_k speculative draft steps."""
+def _scale_draft_module(module: ModuleCost, k: int) -> ModuleCost:
+    """Scale one draft module's per-step resources across ``k`` draft steps."""
     scaled_unique = (
         None
         if module.unique_collectives is None
-        else tuple((c, cnt * spec_k) for c, cnt in module.unique_collectives)
+        else tuple((c, cnt * k) for c, cnt in module.unique_collectives)
     )
     return ModuleCost(
         name=f"draft_{module.name}",
-        hbm_bytes=module.hbm_bytes * spec_k,
-        fp8_flops=module.fp8_flops * spec_k,
-        bf16_flops=module.bf16_flops * spec_k,
-        collectives=module.collectives * spec_k,
-        hbm_bytes_min=_scale_opt(module.hbm_bytes_min, spec_k),
+        hbm_bytes=module.hbm_bytes * k,
+        fp8_flops=module.fp8_flops * k,
+        bf16_flops=module.bf16_flops * k,
+        fp4_flops=module.fp4_flops * k,
+        int8_flops=module.int8_flops * k,
+        int4_flops=module.int4_flops * k,
+        collectives=module.collectives * k,
+        hbm_bytes_min=_scale_opt(module.hbm_bytes_min, k),
         unique_collectives=scaled_unique,
-        fp8_flops_min=_scale_opt(module.fp8_flops_min, spec_k),
-        bf16_flops_min=_scale_opt(module.bf16_flops_min, spec_k),
-        vector_flops=module.vector_flops * spec_k,
-        strict_vector_flops=module.strict_vector_flops * spec_k,
-        hbm_bytes_envelope=_scale_opt(module.hbm_bytes_envelope, spec_k),
-        fp8_flops_envelope=_scale_opt(module.fp8_flops_envelope, spec_k),
-        bf16_flops_envelope=_scale_opt(module.bf16_flops_envelope, spec_k),
+        fp8_flops_min=_scale_opt(module.fp8_flops_min, k),
+        bf16_flops_min=_scale_opt(module.bf16_flops_min, k),
+        fp4_flops_min=_scale_opt(module.fp4_flops_min, k),
+        int8_flops_min=_scale_opt(module.int8_flops_min, k),
+        int4_flops_min=_scale_opt(module.int4_flops_min, k),
+        vector_flops=module.vector_flops * k,
+        strict_vector_flops=module.strict_vector_flops * k,
+        hbm_bytes_envelope=_scale_opt(module.hbm_bytes_envelope, k),
+        fp8_flops_envelope=_scale_opt(module.fp8_flops_envelope, k),
+        bf16_flops_envelope=_scale_opt(module.bf16_flops_envelope, k),
+        fp4_flops_envelope=_scale_opt(module.fp4_flops_envelope, k),
+        int8_flops_envelope=_scale_opt(module.int8_flops_envelope, k),
+        int4_flops_envelope=_scale_opt(module.int4_flops_envelope, k),
     )
 
 
@@ -424,13 +488,20 @@ def _draft_fc_module(
     batch: int,
     dt: Dtypes,
     spec_k: int,
+    *,
+    chip: ChipSpec,
 ) -> ModuleCost:
     """Construct the ModuleCost for spec_k speculative draft projection passes."""
     fc_elems = DRAFT_PROJECTION_HIDDEN_VECTORS * float(
         geom.hidden * geom.hidden // parallel.tp
     )
-    fc_fp8, fc_bf16 = _split_matmul_flops(batch, fc_elems, dt.w_aux, dt.act)
-    coll_cfg = CollectiveConfig(parallel.ar_algo, parallel.ranks_per_chip)
+    fc_buckets = _route_matmul_flops(batch, fc_elems, dt.w_aux, dt.act, chip=chip)
+    eff_ranks = (
+        parallel.ranks_per_chip
+        if parallel.ranks_per_chip is not None
+        else chip.cores_per_chip
+    )
+    coll_cfg = CollectiveConfig(parallel.ar_algo, eff_ranks)
     fc_unit = (
         make(
             "draft_fc_ag",
@@ -445,8 +516,11 @@ def _draft_fc_module(
     return ModuleCost(
         name="draft_fc",
         hbm_bytes=fc_elems * dt.w_aux * spec_k,
-        fp8_flops=fc_fp8 * spec_k,
-        bf16_flops=fc_bf16 * spec_k,
+        fp8_flops=fc_buckets.fp8 * spec_k,
+        bf16_flops=fc_buckets.bf16 * spec_k,
+        fp4_flops=fc_buckets.fp4 * spec_k,
+        int8_flops=fc_buckets.int8 * spec_k,
+        int4_flops=fc_buckets.int4 * spec_k,
         collectives=(fc_unit,) * spec_k if fc_unit is not None else (),
         unique_collectives=((fc_unit, spec_k),) if fc_unit is not None else (),
     )
@@ -457,6 +531,8 @@ def _strip_moe_routed_unpack(
     parallel: Parallel,
     dt: Dtypes,
     vector_m: float,
+    *,
+    chip: ChipSpec | None = None,
 ) -> float:
     """Remove per-step routed expert unpack vector FLOPs when stripping weights."""
     if dt.w_expert >= FP8_BYTES:
@@ -481,17 +557,23 @@ def _strip_moe_routed_unpack(
     )
     eh = geom.routed_expert_hidden if geom.routed_expert_hidden > 0 else geom.hidden
     r_elems_min = ed_min * float(n_m * pp_s * GLU_MATMUL_COUNT * eh * width)
-    unpack_vector = _sub_byte_unpack_vector_flops(r_elems_min, dt.w_expert)
+    unpack_vector = _sub_byte_unpack_vector_flops(
+        r_elems_min,
+        dt.w_expert,
+        chip=chip,
+        weight_dtype=dt.w_expert_dtype,
+        act=dt.act,
+    )
     return max(0.0, vector_m - _strict_sub_byte_unpack_vector_flops(unpack_vector))
 
 
 def _zero_weight_strict_hbm_vector(
     module: ModuleCost,
     zero_map: dict[str, ModuleCost],
-    step_ctx: tuple[ModelGeometry, Parallel, Dtypes],
+    step_ctx: tuple[ModelGeometry, Parallel, Dtypes, ChipSpec],
 ) -> tuple[float, float]:
     """Return strict (hbm_bytes, vector_flops) with weight-loading work subtracted."""
-    geom, parallel, dt = step_ctx
+    geom, parallel, dt, chip = step_ctx
     zero_mod = zero_map.get(module.name)
     if module.name in ("moe", "mlp", "lm_head"):
         hbm_m = 0.0
@@ -501,7 +583,7 @@ def _zero_weight_strict_hbm_vector(
     zero_vector = zero_mod.strict_vector_flops if zero_mod is not None else 0.0
     vector_m = max(0.0, module.strict_vector_flops - zero_vector)
     if module.name == "moe":
-        vector_m = _strip_moe_routed_unpack(geom, parallel, dt, vector_m)
+        vector_m = _strip_moe_routed_unpack(geom, parallel, dt, vector_m, chip=chip)
     return hbm_m, vector_m
 
 
@@ -531,6 +613,7 @@ def unpadded_strict_resource_times(
             mxu_lhs_rows_fp8=1,
             fp8_to_bf16_ratio=fp8_ratio,
             unpadded_linear=True,
+            chip=chip,
         )
 
     mods: list[ModuleCost] = list(_eval_mods(geom, shape))
@@ -541,7 +624,11 @@ def unpadded_strict_resource_times(
         )
         one_draft = _eval_mods(draft_geom, draft_shape)
         mods.extend(_scale_draft_module(mod, opts.spec_k) for mod in one_draft)
-        mods.append(_draft_fc_module(geom, parallel, shape.batch, opts.dt, opts.spec_k))
+        mods.append(
+            _draft_fc_module(
+                geom, parallel, shape.batch, opts.dt, opts.spec_k, chip=chip
+            )
+        )
 
     zero_map: dict[str, ModuleCost] = {}
     if opts.zero_weights:
@@ -551,11 +638,14 @@ def unpadded_strict_resource_times(
     tot_hbm_min_b = 0.0
     tot_fp8_min = 0.0
     tot_bf16_min = 0.0
+    tot_int8_min = 0.0
+    tot_fp4_min = 0.0
+    tot_int4_min = 0.0
     tot_vector_min = 0.0
     for mod in mods:
         if opts.zero_weights:
             hbm_m, vector_m = _zero_weight_strict_hbm_vector(
-                mod, zero_map, (geom, parallel, opts.dt)
+                mod, zero_map, (geom, parallel, opts.dt, chip)
             )
         else:
             hbm_m = mod.strict_hbm_bytes
@@ -563,6 +653,9 @@ def unpadded_strict_resource_times(
         tot_hbm_min_b += hbm_m
         tot_fp8_min += mod.strict_fp8_flops
         tot_bf16_min += mod.strict_bf16_flops
+        tot_int8_min += mod.strict_int8_flops
+        tot_fp4_min += mod.strict_fp4_flops
+        tot_int4_min += mod.strict_int4_flops
         tot_vector_min += vector_m
 
     sf_comb = combine_modules(
@@ -572,13 +665,24 @@ def unpadded_strict_resource_times(
         topology=opts.topology,
         parallel=parallel,
     )
-    matmul_s = _div_peak(tot_fp8_min, chip.fp8_flops) + _div_peak(
-        tot_bf16_min, chip.bf16_flops
+    matmul_s = _precision_time_s(
+        _MatmulBuckets(
+            fp8=tot_fp8_min,
+            bf16=tot_bf16_min,
+            int8=tot_int8_min,
+            fp4=tot_fp4_min,
+            int4=tot_int4_min,
+        ),
+        chip,
     )
     return (
-        _div_peak(tot_hbm_min_b, chip.hbm_bw),
+        _div_peak(tot_hbm_min_b, chip.hbm_bw, precision="hbm"),
         matmul_s,
-        _div_peak(tot_vector_min, VECTOR_MAX_ELEMENTS_PER_WORD * chip.vector_flops),
+        _div_peak(
+            tot_vector_min,
+            VECTOR_MAX_ELEMENTS_PER_WORD * chip.vector_flops,
+            precision="vector",
+        ),
         sf_comb.coll_bound_s,
     )
 
@@ -605,6 +709,7 @@ def step_floor(
             mxu_lhs_rows_fp8=chip.mxu_lhs_rows_fp8,
             activation_model=opts.activation_model,
             fp8_to_bf16_ratio=fp8_ratio,
+            chip=chip,
         ),
         chip,
         collective_latency_s=opts.collective_latency_s,
@@ -641,6 +746,7 @@ def spec_cycle_floor(
             mxu_lhs_rows_fp8=chip.mxu_lhs_rows_fp8,
             activation_model=opts.activation_model,
             fp8_to_bf16_ratio=fp8_ratio,
+            chip=chip,
         )
     )
     if spec.k <= 0:
@@ -666,9 +772,10 @@ def spec_cycle_floor(
         mxu_lhs_rows_fp8=chip.mxu_lhs_rows_fp8,
         activation_model=opts.activation_model,
         fp8_to_bf16_ratio=fp8_ratio,
+        chip=chip,
     )
 
-    draft_fc = _draft_fc_module(geom, parallel, spec.batch, opts.dt, spec.k)
+    draft_fc = _draft_fc_module(geom, parallel, spec.batch, opts.dt, spec.k, chip=chip)
     verify_mods.extend(_scale_draft_module(m, spec.k) for m in one_draft)
     verify_mods.append(draft_fc)
     return combine_modules(

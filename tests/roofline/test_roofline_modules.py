@@ -21,6 +21,7 @@ from dataclasses import replace as dc_replace
 from typing import TYPE_CHECKING
 
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 if TYPE_CHECKING:
     from vllm_torchtpu.roofline.modules import ModuleCost
@@ -40,6 +41,7 @@ from vllm_torchtpu.roofline import (
     pass_costs,
     step_floor,
 )
+from vllm_torchtpu.roofline import chips as rf_chips
 from vllm_torchtpu.roofline.constants import (
     BF16_BYTES,
     DEFAULT_VECTOR_TO_BF16_RATIO,
@@ -55,6 +57,7 @@ from vllm_torchtpu.roofline.modules import (
     experts_touched,
     kv_bytes_per_token_per_layer,
 )
+from vllm_torchtpu.roofline.step import combine_modules
 
 DOC_DTYPES = Dtypes(kv=2.0, w_aux=1.0)
 
@@ -1722,17 +1725,22 @@ def test_kda_linear_attention_hbm_matches_head_shapes(
     )
 
 
-_ZERO_FP8_TEST_CTX = 128
+_V5E_TEST_CTX = 128
 
 
-def test_pass_costs_zero_fp8_ratio_emits_no_fp8_attention_work() -> None:
-    """Verify explicit zero fp8_to_bf16_ratio keeps FP8 KV attention in BF16."""
+def test_pass_costs_and_combine_modules_on_tpu5e_with_fp8_kv() -> None:
+    """Verify pass_costs and combine_modules handle FP8 KV on TPU_V5E."""
+    v5e_chip = rf_chips.from_jax("tpu5e", pltpu.ChipVersion.TPU_V5E)
+    assert v5e_chip.fp8_flops == 0.0
     geom = from_hf_config(QWEN35_CFG)
+    par = Parallel(tp=1)
     mods = pass_costs(
         geom,
-        Parallel(tp=1),
-        StepShape(batch=1, rows_per_seq=1, context=_ZERO_FP8_TEST_CTX),
+        par,
+        StepShape(batch=1, rows_per_seq=1, context=_V5E_TEST_CTX),
         Dtypes(w_dense=BF16_BYTES, w_expert=BF16_BYTES, kv=FP8_BYTES),
-        fp8_to_bf16_ratio=0.0,
+        chip=v5e_chip,
     )
     assert all(mod.strict_fp8_flops == 0.0 for mod in mods)
+    sf = combine_modules(mods, v5e_chip, parallel=par)
+    assert sf.hard_floor_s > 0.0

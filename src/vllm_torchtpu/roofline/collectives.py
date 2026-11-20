@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING, Literal
 from .constants import (
     AR_PHASES,
     DEFAULT_CORES_PER_CHIP,
-    MIN_TORUS_DIM,
     WRAPPED_LANES_PER_AXIS,
 )
 
@@ -41,7 +40,7 @@ class CollectiveConfig:
     """Algorithm and per-chip rank packing parameters for a collective."""
 
     algo: Algo = "one_shot"
-    ranks_per_chip: int = DEFAULT_CORES_PER_CHIP
+    ranks_per_chip: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +95,12 @@ def make(
         total_ranks,
         wire,
         hops,
-        offchip_share(total_ranks, collective_config.ranks_per_chip),
+        offchip_share(
+            total_ranks,
+            collective_config.ranks_per_chip
+            if collective_config.ranks_per_chip is not None
+            else DEFAULT_CORES_PER_CHIP,
+        ),
         kind,
         payload,
     )
@@ -110,10 +114,11 @@ def padded_rows(rows: int, tp: int, residual: str) -> int:
 def submesh_for_group(
     group: int,
     topology: SliceTopology | None,
-    ranks_per_chip: int = DEFAULT_CORES_PER_CHIP,
+    ranks_per_chip: int | None = None,
     mesh_axes: tuple[int, int, int, int] | None = None,
 ) -> tuple[int, int, int, int]:
     """Pack `group` ranks inner-to-outer across (d2d, x, y, z) physical bounds."""
+    eff_ranks = ranks_per_chip if ranks_per_chip is not None else DEFAULT_CORES_PER_CHIP
     if group <= 1:
         return (1, 1, 1, 1)
     if topology is not None and group > topology.num_cores:
@@ -134,7 +139,7 @@ def submesh_for_group(
     elif topology is not None:
         bounds = (topology.cores_per_chip, *topology.chip_axes)
     else:
-        intra_chip_degree = math.gcd(group, ranks_per_chip)
+        intra_chip_degree = math.gcd(group, eff_ranks)
         return (intra_chip_degree, group // intra_chip_degree, 1, 1)
 
     remaining_ranks = group
@@ -152,7 +157,7 @@ def submesh_for_group(
 def collective_ici_hops(
     collective: Collective,
     topology: SliceTopology | None = None,
-    ranks_per_chip: int = DEFAULT_CORES_PER_CHIP,
+    ranks_per_chip: int | None = None,
     mesh_axes: tuple[int, int, int, int] | None = None,
 ) -> int:
     """Unloaded one-way or two-phase physical ICI hops traversed by a collective."""
@@ -162,8 +167,9 @@ def collective_ici_hops(
         if collective.offchip <= 0.0:
             return 0
         return collective.hops
+    eff_ranks = ranks_per_chip if ranks_per_chip is not None else DEFAULT_CORES_PER_CHIP
     _, axis_x, axis_y, axis_z = submesh_for_group(
-        collective.group, topology, ranks_per_chip, mesh_axes
+        collective.group, topology, eff_ranks, mesh_axes
     )
     if axis_x * axis_y * axis_z <= 1:
         return 0
@@ -283,11 +289,7 @@ def _count_cut_links(
     for axis_idx, ext in enumerate(axes):
         if ext <= 1:
             continue
-        if (
-            ext >= MIN_TORUS_DIM
-            and topology is not None
-            and topology.axis_wrapped(axis_idx, ext)
-        ):
+        if topology is not None and topology.axis_wrapped(axis_idx, ext):
             links_in += WRAPPED_LANES_PER_AXIS
         else:
             links_in += 1

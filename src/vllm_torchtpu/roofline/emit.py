@@ -18,10 +18,19 @@ from __future__ import annotations
 import math
 import re
 import shlex
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Final, TypedDict, cast
+from typing import TYPE_CHECKING, Final, TypedDict, Unpack, cast
 
-from .chips import CHIPS, JAX_VERSION, ChipSpec, chip_catalog, count_hosts
+from .chips import (
+    CHIPS,
+    JAX_VERSION,
+    ChipSpec,
+    SliceTopology,
+    chip_catalog,
+    count_hosts,
+    topologies_for_chip,
+)
 from .constants import (
     DEEP_PP_THRESHOLD,
     DEFAULT_CHIPS_PER_HOST,
@@ -46,7 +55,7 @@ from .constants import (
 from .occupancy import ExpertActivationModel
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable
 
     from .modules import Dtypes
     from .solver import ParetoPoint, PoolMeshPlan, ServingPlan
@@ -71,8 +80,6 @@ _ATTN_DISPLAY_AXES: tuple[tuple[str, str], ...] = tuple(
 )
 # Sub-1e-9 tok/s guard (~1e7 * float64 ulp at 1e5 tok/s) for 2D Pareto envelope ties.
 FRONTIER_2D_TIE_TOLERANCE: Final[float] = 1e-9
-_FALLBACK_HBM_GB: Final[float] = 96.0
-_FALLBACK_HBM_BYTES: Final[float] = _FALLBACK_HBM_GB * float(UNIT_GIGA)
 _DEFAULT_ACTIVATION_REGIME: Final[str] = ExpertActivationModel().regime
 
 
@@ -86,6 +93,8 @@ class LaunchOptions:
     spec_tokens: int = 0
     mtp_layers: int = 0
     hbm_reserve_gb: float = 0.0
+    chip: ChipSpec | None = None
+    topologies: Mapping[str, SliceTopology] | None = None
 
 
 class PointLaunchPayload(TypedDict):
@@ -247,18 +256,35 @@ def format_host_count(hosts: int) -> str:
     return "1 host" if hosts == 1 else f"{hosts} hosts"
 
 
-def _pool_slice_counts(pool: Mapping[str, object]) -> tuple[int, str, int]:
+def _pool_slice_counts(
+    pool: Mapping[str, object],
+    *,
+    topologies: Mapping[str, SliceTopology] | None = None,
+) -> tuple[int, str, int]:
     """Return (instance_count, topology_name, total_chips) for a pool mapping."""
     instance_count = _pool_int(pool.get("instances"))
     topology_name = str(pool.get("topology", ""))
     chips_per_instance = _pool_int(pool.get("chips_per_instance"), default=0)
-    if chips_per_instance <= 0 and topology_name in TOPOLOGY_AXES:
-        topology_dimensions = TOPOLOGY_AXES[topology_name]
-        chips_per_instance = (
-            topology_dimensions[0] * topology_dimensions[1] * topology_dimensions[2]
-        )
+    if chips_per_instance <= 0:
+        if topologies is not None and topology_name in topologies:
+            chips_per_instance = topologies[topology_name].num_chips
+        elif topology_name in TOPOLOGY_AXES:
+            topology_dimensions = TOPOLOGY_AXES[topology_name]
+            chips_per_instance = (
+                topology_dimensions[0] * topology_dimensions[1] * topology_dimensions[2]
+            )
     total_chips = chips_per_instance * max(1, instance_count)
     return instance_count, topology_name, total_chips
+
+
+def _format_slice_hw(total_chips: int, chip: ChipSpec | None) -> tuple[str, int]:
+    """Return host description and TensorCore count for a slice chip total."""
+    chips_per_host = chip.chips_per_host if chip is not None else DEFAULT_CHIPS_PER_HOST
+    cores_per_chip = chip.cores_per_chip if chip is not None else DEFAULT_CORES_PER_CHIP
+    host_description = format_host_count(
+        count_hosts(total_chips, chips_per_host=chips_per_host)
+    )
+    return host_description, total_chips * cores_per_chip
 
 
 def format_submodule_parallelism(
@@ -284,31 +310,43 @@ def format_submodule_parallelism(
     return f"Attn: {attn_text} · MoE: {moe_text}"
 
 
-def pool_slice_summary(pool: Mapping[str, object]) -> str:
+def pool_slice_summary(
+    pool: Mapping[str, object],
+    *,
+    chip: ChipSpec | None = None,
+    topologies: Mapping[str, SliceTopology] | None = None,
+) -> str:
     """Format compact instance and slice hardware counts without parallelism axes."""
-    instance_count, topology_name, total_chips = _pool_slice_counts(pool)
+    instance_count, topology_name, total_chips = _pool_slice_counts(
+        pool, topologies=topologies
+    )
     if total_chips <= 0:
         return f"{instance_count}x {topology_name}"
-    host_description = format_host_count(count_hosts(total_chips))
-    cores = total_chips * DEFAULT_CORES_PER_CHIP
+    host_description, cores = _format_slice_hw(total_chips, chip)
     return (
         f"{instance_count}x {topology_name} · "
         f"{total_chips} chips ({host_description}, {cores} cores)"
     )
 
 
-def pool_label(pool: Mapping[str, object]) -> str:
+def pool_label(
+    pool: Mapping[str, object],
+    *,
+    chip: ChipSpec | None = None,
+    topologies: Mapping[str, SliceTopology] | None = None,
+) -> str:
     """Return a concise pool label.
 
     Example: ``4x 2x2x2 (32 chips, 8 hosts, 64 cores): TP16 x EP16 x DCP2``.
     """
-    instance_count, topology_name, total_chips = _pool_slice_counts(pool)
+    instance_count, topology_name, total_chips = _pool_slice_counts(
+        pool, topologies=topologies
+    )
     instance_prefix = f"{instance_count}x "
     layout_text = format_parallelism(pool)
     if total_chips <= 0:
         return f"{instance_prefix}{topology_name}: {layout_text}"
-    host_description = format_host_count(count_hosts(total_chips))
-    cores = total_chips * DEFAULT_CORES_PER_CHIP
+    host_description, cores = _format_slice_hw(total_chips, chip)
     pool_description = f" ({total_chips} chips, {host_description}, {cores} cores)"
     return f"{instance_prefix}{topology_name}{pool_description}: {layout_text}"
 
@@ -1161,10 +1199,16 @@ def point_launch_args(
         )
         p_chips = p_pool.instances * p_pool.chips_per_instance
         d_chips = d_pool.instances * d_pool.chips_per_instance
+        prefill_label = pool_label(
+            asdict(p_pool), chip=opts.chip, topologies=opts.topologies
+        )
+        decode_label = pool_label(
+            asdict(d_pool), chip=opts.chip, topologies=opts.topologies
+        )
         commands = [
-            f"# provision: prefill {pool_label(asdict(p_pool))} ({p_chips} chips)",
+            f"# provision: prefill {prefill_label} ({p_chips} chips)",
             prefill_cmd,
-            f"# provision: decode {pool_label(asdict(d_pool))} ({d_chips} chips)",
+            f"# provision: decode {decode_label} ({d_chips} chips)",
             decode_cmd,
             (
                 "# note: disaggregated KV transfer / connector flags are not "
@@ -1212,11 +1256,14 @@ def emit_launch_args(
     *,
     dtypes: Dtypes | None = None,
     model: str | None = None,
+    chip: ChipSpec | None = None,
+    topologies: Mapping[str, SliceTopology] | None = None,
 ) -> LaunchPayload:
     """Emit ``vllm serve`` CLI flags and commands for the top-ranked L1 candidate."""
     kv_str = (
         "fp8" if (dtypes is not None and dtypes.kv <= KV_DTYPE_BYTES["fp8"]) else "auto"
     )
+    eff_chip = chip if chip is not None else CHIPS.get(plan.chip)
     warnings = list(plan.warnings)
     recommended_point = plan.recommended
     if (
@@ -1251,6 +1298,8 @@ def emit_launch_args(
             spec_tokens=eff_spec,
             mtp_layers=plan_mtp,
             hbm_reserve_gb=plan.hbm_reserve_gb,
+            chip=eff_chip,
+            topologies=topologies,
         ),
     )
     if _servable_model(model) is None:
@@ -1265,18 +1314,55 @@ def emit_launch_args(
     }
 
 
-def _compute_single_host_fit(plan: ServingPlan) -> dict[str, object]:
-    """Compute single-host 2x2x1 fit verdict, capacity, and status."""
-    four_chip_points = [
+def _resolve_single_host_topology(
+    chips_per_host: int,
+    chip: ChipSpec | None,
+    topologies: Mapping[str, SliceTopology] | Sequence[SliceTopology] | None,
+) -> str:
+    """Return single-host slice topology name matching ``chips_per_host``."""
+    if topologies is not None:
+        topo_seq = (
+            list(topologies.values())
+            if isinstance(topologies, Mapping)
+            else list(topologies)
+        )
+    elif chip is not None:
+        topo_seq = list(topologies_for_chip(chip).values())
+    else:
+        topo_seq = list(topologies_for_chip("tpu7x").values())
+    return next(
+        (topo.name for topo in topo_seq if topo.num_chips == chips_per_host),
+        f"{chips_per_host}chip",
+    )
+
+
+def _compute_single_host_fit(
+    plan: ServingPlan,
+    *,
+    chip: ChipSpec | None = None,
+    topologies: Mapping[str, SliceTopology] | Sequence[SliceTopology] | None = None,
+) -> dict[str, object]:
+    """Compute single-host slice fit verdict, capacity, and status."""
+    eff_chip = chip if chip is not None else CHIPS.get(plan.chip)
+    chips_per_host = (
+        eff_chip.chips_per_host if eff_chip is not None else DEFAULT_CHIPS_PER_HOST
+    )
+    cores_per_chip = (
+        eff_chip.cores_per_chip if eff_chip is not None else DEFAULT_CORES_PER_CHIP
+    )
+    cores_per_host = chips_per_host * cores_per_chip
+    host_topo = _resolve_single_host_topology(chips_per_host, eff_chip, topologies)
+    host_desc = f"(1 host, {chips_per_host} chips, {cores_per_host} TensorCores)"
+    host_points = [
         pt
         for pt in (*plan.frontier, *plan.candidates)
-        if pt.total_chips == DEFAULT_CHIPS_PER_HOST
-        and pt.decode_pool.topology == "2x2x1"
+        if pt.total_chips == chips_per_host
+        and pt.decode_pool.topology == host_topo
         and pt.prefill_pool is None
     ]
-    if four_chip_points:
+    if host_points:
         best_pt = max(
-            four_chip_points,
+            host_points,
             key=lambda point: (
                 SLO_VERDICT_RANK[point.slo_verdict],
                 point.token_throughput_per_chip,
@@ -1286,7 +1372,10 @@ def _compute_single_host_fit(plan: ServingPlan) -> dict[str, object]:
         return {
             "feasible": True,
             "status": "FEASIBLE",
-            "reason": "Fits single-host 2x2x1 (1 host, 4 chips, 8 TensorCores)",
+            "reason": f"Fits single-host {host_topo} {host_desc}",
+            "topology": host_topo,
+            "chips_per_host": chips_per_host,
+            "cores_per_host": cores_per_host,
             "hbm_used_gb": round(pool.hbm_used_gb, 2),
             "hbm_limit_gb": round(pool.hbm_limit_gb, 2),
             "best_parallelism": format_parallelism(asdict(pool)),
@@ -1294,8 +1383,7 @@ def _compute_single_host_fit(plan: ServingPlan) -> dict[str, object]:
                 asdict(pool), has_moe=plan.has_moe
             ),
         }
-    chip_spec = CHIPS.get(plan.chip)
-    per_core_bytes = chip_spec.hbm_bytes if chip_spec else _FALLBACK_HBM_BYTES
+    per_core_bytes = eff_chip.hbm_bytes if eff_chip else CHIPS["tpu7x"].hbm_bytes
     effective_limit_bytes = max(
         0.0,
         per_core_bytes * plan.gpu_memory_utilization
@@ -1304,23 +1392,27 @@ def _compute_single_host_fit(plan: ServingPlan) -> dict[str, object]:
     limit_gb = round(effective_limit_bytes / float(UNIT_GIGA), 2)
     if plan.mode == "disagg":
         reason = (
-            "Disaggregated mode selected; single-host 2x2x1 requires mixed mode "
-            "(1 host, 4 chips, 8 TensorCores)"
+            f"Disaggregated mode selected; single-host {host_topo} requires mixed mode "
+            f"{host_desc}"
         )
-    elif 0 < plan.budget < DEFAULT_CHIPS_PER_HOST:
+    elif 0 < plan.budget < chips_per_host:
         reason = (
             f"Chip budget ({plan.budget}) is below 1 host "
-            f"(2x2x1 requires {DEFAULT_CHIPS_PER_HOST} chips, 8 TensorCores)"
+            f"({host_topo} requires {chips_per_host} chips, "
+            f"{cores_per_host} TensorCores)"
         )
     else:
         reason = (
-            "No feasible 2x2x1 layout within HBM, SMEM, head-divisibility, or "
-            "SLO bounds (1 host, 4 chips, 8 TensorCores)"
+            f"No feasible {host_topo} layout within HBM, SMEM, head-divisibility, or "
+            f"SLO bounds {host_desc}"
         )
     return {
         "feasible": False,
         "status": "REJECTED",
         "reason": reason,
+        "topology": host_topo,
+        "chips_per_host": chips_per_host,
+        "cores_per_host": cores_per_host,
         "hbm_used_gb": 0.0,
         "hbm_limit_gb": limit_gb,
         "best_parallelism": None,
@@ -1594,11 +1686,14 @@ def attach_reference_report(
     *,
     dtypes: Dtypes | None = None,
     model: str | None = None,
+    chip: ChipSpec | None = None,
+    topologies: Mapping[str, SliceTopology] | None = None,
 ) -> SolvePayload:
     """Attach a reference-layout report with resolved launch args to a payload."""
     kv_str = (
         "fp8" if (dtypes is not None and dtypes.kv <= KV_DTYPE_BYTES["fp8"]) else "auto"
     )
+    eff_chip = chip if chip is not None else CHIPS.get(plan.chip)
     eff_spec = (
         plan.spec_tokens if plan.spec_tokens > 0 else (plan.scenario.spec_tokens or 0)
     )
@@ -1609,6 +1704,8 @@ def attach_reference_report(
         spec_tokens=eff_spec,
         mtp_layers=plan.mtp_layers,
         hbm_reserve_gb=plan.hbm_reserve_gb,
+        chip=eff_chip,
+        topologies=topologies,
     )
     ref_dict = dict(reference)
     ref_launch: Mapping[str, object] | None = None
@@ -1631,20 +1728,33 @@ def attach_reference_report(
     return cast("SolvePayload", updated)
 
 
+class _BuildSolvePayloadOpts(TypedDict, total=False):
+    """Optional arguments for ``build_solve_payload``."""
+
+    dtypes: Dtypes | None
+    model: str | None
+    top_k: int
+    topologies: Mapping[str, SliceTopology] | Sequence[SliceTopology] | None
+
+
 def build_solve_payload(
     plan: ServingPlan,
     *,
     chip: ChipSpec,
-    dtypes: Dtypes | None = None,
-    model: str | None = None,
-    top_k: int = DEFAULT_TOP_K,
+    **opts: Unpack[_BuildSolvePayloadOpts],
 ) -> SolvePayload:
     """Build ``solve/v2`` JSON payload with provenance, chip catalog, and Top-K."""
+    dtypes = opts.get("dtypes")
+    model = opts.get("model")
+    top_k = opts.get("top_k", DEFAULT_TOP_K)
+    topologies = opts.get("topologies")
     kv_str = (
         "fp8" if (dtypes is not None and dtypes.kv <= KV_DTYPE_BYTES["fp8"]) else "auto"
     )
     payload: dict[str, object] = _plan_dict(plan)
-    payload["single_host_fit"] = _compute_single_host_fit(plan)
+    payload["single_host_fit"] = _compute_single_host_fit(
+        plan, chip=chip, topologies=topologies
+    )
     target_chips = (
         plan.recommended.total_chips if plan.recommended is not None else plan.budget
     )
@@ -1726,20 +1836,27 @@ def build_solve_payload(
     eff_spec = (
         plan.spec_tokens if plan.spec_tokens > 0 else (plan.scenario.spec_tokens or 0)
     )
-    opts = LaunchOptions(
+    topo_map: Mapping[str, SliceTopology] | None = (
+        {topo.name: topo for topo in topologies}
+        if isinstance(topologies, Sequence)
+        else topologies
+    )
+    launch_opts = LaunchOptions(
         kv_dtype=kv_str,
         gpu_memory_utilization=plan.gpu_memory_utilization,
         model=model,
         spec_tokens=eff_spec,
         mtp_layers=plan.mtp_layers,
         hbm_reserve_gb=plan.hbm_reserve_gb,
+        chip=chip,
+        topologies=topo_map,
     )
     top_entries: list[TopKEntry] = [
         {
             "frontier_role": role,
             "margin_vs_rank1_pct": margin,
             "point": asdict(pt),
-            "launch": point_launch_args(pt, opts),
+            "launch": point_launch_args(pt, launch_opts),
         }
         for pt, role, margin in top_layout_roles(top_pts, plan.frontier)
     ]
@@ -1751,14 +1868,14 @@ def build_solve_payload(
                 "frontier_role": role,
                 "margin_vs_rank1_pct": margin,
                 "point": asdict(pt),
-                "launch": point_launch_args(pt, opts),
+                "launch": point_launch_args(pt, launch_opts),
             }
             for pt, role, margin in top_layout_roles(conc_pts)
         ]
         for conc, conc_pts in skyline_by_conc.items()
     }
     payload["bound_families_by_concurrency"] = build_bound_families_by_concurrency(
-        plan, opts
+        plan, launch_opts
     )
     payload["solver_assumptions"] = get_solver_assumptions(chip)
     if dtypes is not None:
