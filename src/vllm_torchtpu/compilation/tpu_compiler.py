@@ -413,7 +413,9 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
 
 def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     """Hash TPU-specific factors used by both AOT and piecewise caches."""
-    # Deferred: tpu_info imports Pallas, which this module otherwise avoids.
+    # Deferred: tpu_info imports Pallas and the quantize helpers import JAX,
+    # which this module otherwise avoids.
+    from vllm_torchtpu.kernels.quantized_matmul import util as quantized_matmul_util
     from vllm_torchtpu.tpu_info import get_libtpu_cache_key
 
     cache_config = vllm_config.cache_config
@@ -448,6 +450,9 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         # are hashed only through the outcome, so changing one of them without
         # flipping the gate keeps the cache.
         "gdn_prefill_checkpoint": prefill_checkpoint_enabled(vllm_config),
+        # Read when the quantize kernels are traced, and set by a model's
+        # numerics rule rather than by the config, so hash its value.
+        "quantize_reciprocal_scale": quantized_matmul_util.RECIPROCAL_SCALE,
         "scheduler": {
             "max_model_len": vllm_config.model_config.max_model_len,
             "max_num_batched_tokens": scheduler_config.max_num_batched_tokens,

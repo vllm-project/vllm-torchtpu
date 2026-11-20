@@ -166,6 +166,24 @@ class TestTpuCompilerCache:
         assert enabled == enabled_block_unit
         assert disabled_fine_unit == disabled
 
+    def test_tpu_hash_covers_the_quantize_scale_form(self, monkeypatch):
+        """The reciprocal-scale flag changes the traced quantize graph without
+        changing the config, so an executable traced with one value must not
+        be found under the other's key."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+        from vllm_torchtpu.kernels.quantized_matmul import util
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            monkeypatch.setattr(util, "RECIPROCAL_SCALE", False)
+            division = compute_tpu_compilation_hash(self._config())
+            monkeypatch.setattr(util, "RECIPROCAL_SCALE", True)
+            reciprocal = compute_tpu_compilation_hash(self._config())
+
+        assert division != reciprocal
+
     def test_tpu_hash_covers_plugin_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 
