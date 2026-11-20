@@ -1078,6 +1078,13 @@ def _patch_ltx2_async_guidance_step() -> None:
     same CFG-world-size guard and ``.contiguous()`` materialization while
     flushing via ``synchronize_tensors(list(latents), wait=False)``.
 
+    Every other step (``cfg_parallel_size == 1``, or a single-pass phase such
+    as the two-stage refine) is flushed too, without the copy. Upstream skips
+    the sync there, but its ``velocity_from_x0`` ``.item()`` cut the lazy graph
+    every step; ``_patch_ltx2_guidance_sigma_scalar`` removes that read, so
+    without this flush the whole loop and the decoder would trace into one
+    TPU program.
+
     REMOVAL / FIX CONDITION:
     Remove once vLLM-Omni gates the blocking ``synchronize()`` in
     ``LTXRuntime._synchronize_guidance_parallel_step_output`` to CUDA (or
@@ -1105,6 +1112,8 @@ def _patch_ltx2_async_guidance_step() -> None:
             guidance_parallel_ready
             and parallel_state.get_classifier_free_guidance_world_size() > 1
         ):
+            if not torch.compiler.is_compiling():
+                synchronize_tensors(list(latents), wait=False)
             return latents
         latents = tuple(tensor.contiguous() for tensor in latents)
         synchronize_tensors(list(latents), wait=False)

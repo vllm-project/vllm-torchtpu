@@ -1555,22 +1555,34 @@ def test_ltx2_async_guidance_step_avoids_blocking_sync(monkeypatch, table_syncs)
     a = torch.randn(2, 2).t()
     assert not v.is_contiguous()
 
-    # Single-rank CFG skips contiguous copy and sync.
+    # Single-rank CFG keeps the latents as-is but still flushes every step:
+    # with cached sigmas nothing else cuts the lazy graph.
     monkeypatch.setattr(
         parallel_state, "get_classifier_free_guidance_world_size", lambda: 1
     )
     out_single = patched(None, (v, a), guidance_parallel_ready=True)
-    assert out_single[0] is v and len(table_syncs) == 0
+    assert out_single[0] is v and out_single[1] is a
+    assert len(table_syncs) == 1
+    assert table_syncs[0][0] is v and table_syncs[0][1] is a
 
-    # Multi-rank CFG with guidance_parallel_ready=False is also a no-op.
+    # A single-pass phase (guidance_parallel_ready=False, e.g. the two-stage
+    # refine) under multi-rank CFG also flushes without copying.
     monkeypatch.setattr(
         parallel_state, "get_classifier_free_guidance_world_size", lambda: 2
     )
     out_not_ready = patched(None, (v, a), guidance_parallel_ready=False)
-    assert out_not_ready[0] is v and len(table_syncs) == 0
+    assert out_not_ready[0] is v and out_not_ready[1] is a
+    assert len(table_syncs) == 2
+    assert table_syncs[1][0] is v and table_syncs[1][1] is a
 
     # Multi-rank CFG materializes contiguous latents and flushes non-blocking.
     out_multi = patched(None, (v, a), guidance_parallel_ready=True)
     assert out_multi[0].is_contiguous() and out_multi[1].is_contiguous()
     torch.testing.assert_close(out_multi[0], v)
-    assert len(table_syncs) == 1 and len(table_syncs[0]) == 2
+    assert len(table_syncs) == 3 and len(table_syncs[2]) == 2
+    assert table_syncs[2][0] is out_multi[0]
+
+    # Under torch.compile the single-pass path does not flush.
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    out_traced = patched(None, (v, a), guidance_parallel_ready=False)
+    assert out_traced[0] is v and len(table_syncs) == 3
