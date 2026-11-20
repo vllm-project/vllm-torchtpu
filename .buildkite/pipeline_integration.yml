@@ -24,7 +24,6 @@
 # is validated on v7x only (Qwen3.5 GDN prefill with PCP > 1, see
 # _VALIDATED_PCP_RAGGED_EXCHANGE_CHIPS in
 # src/vllm_torchtpu/layers/core/gdn_attention.py; Kimi-K3, two cores per chip).
-# tests/scripts/test_tpu_generations.py lists each such step with its reason.
 # Every step that sets TPU_ACCELERATOR_TYPE takes it from the generation, never
 # a fixed chip.
 #

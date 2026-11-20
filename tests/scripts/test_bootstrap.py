@@ -2338,6 +2338,29 @@ class TestBootstrapUnits(unittest.TestCase):
                     refused.annotations[-1][:2], ("error", "ci-tpu-generations")
                 )
                 self.assertEqual(refused.uploads, [])
+                message = refused.annotations[-1][2]
+                self.assertIn("CI_TPU_GENERATIONS=all", message)
+                self.assertIn("leave it unset", message)
+
+        # A build whose only per-generation lane does not list the generation
+        # has no step to run, and says so rather than upload nothing.
+        files = {
+            **gens.TPU_GENERATION_FILES,
+            ".buildkite/pipeline_perf.yml": (gens.TPU_V7X,),
+        }
+        with mock.patch.object(gens, "TPU_GENERATION_FILES", files):
+            refused = self._run_bootstrap(
+                {
+                    "BUILDKITE_SOURCE": "ui",
+                    "CI_TPU_GENERATIONS": "v6e",
+                    "CI_SUITE": "perf",
+                },
+                raises=bp.BootstrapError,
+            )
+        style, context, message = refused.annotations[-1]
+        self.assertEqual((style, context), ("error", "ci-tpu-generations"))
+        self.assertIn("no lane of this build has any", message)
+        self.assertEqual(refused.uploads, [])
 
     def test_stamped_upload_fails_closed(self) -> None:
         bp = self.bp

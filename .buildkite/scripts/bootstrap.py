@@ -449,9 +449,9 @@ def tpu_generations_note(ctx: BuildContext, suite: Suite) -> str | None:
         raise BootstrapError(
             f"ERROR: CI_TPU_GENERATIONS={value} runs one TPU generation, which "
             "only a UI or API build that is not a PR, merge-queue, /ci, release, "
-            "tag or integration build may do; set CI_TPU_GENERATIONS="
-            f"{tpu_generations.CI_TPU_GENERATIONS_ALL} to run every generation, "
-            "or leave it unset to run the default ones"
+            "tag or integration build may do; set "
+            f"CI_TPU_GENERATIONS={tpu_generations.CI_TPU_GENERATIONS_ALL} to run "
+            "every generation, or leave it unset to run the default ones"
         )
     # Each lane of the build in TPU_GENERATION_FILES, with the generations its
     # file lists.
