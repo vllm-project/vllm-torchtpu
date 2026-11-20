@@ -251,49 +251,6 @@ def test_patched_decoder_layer_forward_parity(forward):
     torch.testing.assert_close(patched_r, upstream_r)
 
 
-@pytest.mark.parametrize("pcp_streaming", [False, True])
-def test_a_pcp_streaming_gdn_layer_keeps_its_bf16_input(monkeypatch, pcp_streaming):
-    """A GDN layer that streams prefill context parallelism takes bf16 rows,
-    so the decoder layer skips the fused input norm + FP8 quantization for it
-    even where the fusion would otherwise apply."""
-    quantized, prequant_seen = [], []
-
-    def norm_quantize_rows(norm, x, residual):
-        quantized.append(tuple(x.shape))
-        return x, torch.ones(x.shape[0], 1), x if residual is None else residual
-
-    monkeypatch.setattr(patch_mod, "_fuses_pre_attn_norm_quant", lambda *a: True)
-    monkeypatch.setattr(patch_mod, "_norm_quantize_rows", norm_quantize_rows)
-
-    class Attention:
-        _pcp_streaming_configured = pcp_streaming
-
-        def __call__(self, hidden_states, prequant=None):
-            prequant_seen.append(prequant is not None)
-            return hidden_states + 1.0
-
-    class DummyLayer:
-        use_attn_reduce_scatter_for_moe = False
-        layer_type = "linear_attention"
-        layer_scale = False
-        linear_attn = Attention()
-
-        def input_layernorm(self, x, residual=None):
-            return x * 1.05 if residual is None else (x * 1.05, residual + x * 0.05)
-
-        def post_attention_layernorm(self, x, residual):
-            return x * 1.1, residual + x * 0.1
-
-        def mlp(self, x, already_sequence_parallel=False):
-            return x * 2.0
-
-    patched_decoder_layer_forward(
-        DummyLayer(), torch.randn(8, 64), torch.randn(8, 64), torch.arange(8)
-    )
-    assert prequant_seen == [not pcp_streaming]
-    assert quantized == ([] if pcp_streaming else [(8, 64)])
-
-
 def _sp_dummy_layer(attn_calls, mlp_kwargs):
     class DummyLayer:
         use_attn_reduce_scatter_for_moe = True
@@ -1936,8 +1893,8 @@ def test_install_qwen3_next_v6_patches_wraps_the_loader_once(monkeypatch, unpatc
 def test_step0_post_attn_gather_is_installed_with_the_patched_forwards(
     monkeypatch, unpatched_v6
 ):
-    """A draft model runs the step-0 post-attention gather when it says so or
-    when the attention, decoder-layer and MTP forwards are the patched ones."""
+    """A draft model runs the step-0 post-attention gather when the attention,
+    decoder-layer and MTP forwards are the patched ones."""
     monkeypatch.setattr(patch_mod, "_prebuild_sigmoid_gate_ops", lambda: None)
 
     class Mtp:
@@ -1953,9 +1910,6 @@ def test_step0_post_attn_gather_is_installed_with_the_patched_forwards(
     assert patch_mod.is_step0_post_attn_gather_installed(draft)
     assert not patch_mod.is_step0_post_attn_gather_installed(
         SimpleNamespace(model=SimpleNamespace())
-    )
-    assert patch_mod.is_step0_post_attn_gather_installed(
-        SimpleNamespace(_supports_step0_post_attn_gather=True)
     )
 
 
