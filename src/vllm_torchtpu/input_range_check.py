@@ -33,7 +33,8 @@ REMEMBERED_PROMPTS = 64
 
 
 class TokenizerOutputs:
-    """The id lists the renderer's tokenizer built, kept until their range check claims them."""
+    """The id lists the renderer's tokenizer built, kept until their range check claims
+    them."""
 
     def __init__(self, capacity: int = REMEMBERED_PROMPTS) -> None:
         self.capacity = capacity
@@ -47,7 +48,8 @@ class TokenizerOutputs:
                 self.lists.popitem(last=False)
 
     def claim(self, ids: object) -> bool:
-        """True when ``ids`` is a list the tokenizer built; it is forgotten either way."""
+        """True when ``ids`` is a list the tokenizer built; it is forgotten
+        either way."""
         with self.lock:
             remembered = self.lists.pop(id(ids), None)
         return remembered is ids
@@ -71,7 +73,9 @@ def patch_skip_tokenizer_id_range_check() -> None:
     validate_model_input = InputProcessor._validate_model_input
 
     def _build_tokens_prompt(token_ids, prompt, *, offset_mapping=None):
-        tokens_prompt = build_tokens_prompt(token_ids, prompt, offset_mapping=offset_mapping)
+        tokens_prompt = build_tokens_prompt(
+            token_ids, prompt, offset_mapping=offset_mapping
+        )
         TOKENIZER_OUTPUTS.remember(tokens_prompt["prompt_token_ids"])
         return tokens_prompt
 
@@ -79,7 +83,9 @@ def patch_skip_tokenizer_id_range_check() -> None:
         if prompt_input["type"] == "token" and TOKENIZER_OUTPUTS.claim(
             prompt_input["prompt_token_ids"]
         ):
-            self._validate_prompt_len(len(prompt_input["prompt_token_ids"]), prompt_type)
+            self._validate_prompt_len(
+                len(prompt_input["prompt_token_ids"]), prompt_type
+            )
             return
         validate_model_input(self, prompt_input, prompt_type)
 
@@ -87,5 +93,6 @@ def patch_skip_tokenizer_id_range_check() -> None:
     InputProcessor._validate_model_input = _validate_model_input
     InputProcessor._tpu_skip_tokenizer_id_range_check = True
     logger.info(
-        "VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK: prompt ids from the server's tokenizer skip the vocabulary range check"
+        "VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK: prompt ids from the server's "
+        "tokenizer skip the vocabulary range check"
     )

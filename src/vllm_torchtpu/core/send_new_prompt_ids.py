@@ -67,7 +67,14 @@ class Header:
     total: int
 
     def encode(self, new_ids: list[int]) -> list[int]:
-        ids = [MARK, self.shared_slot, self.shared, self.last_shared_id, self.keep_slot, self.total]
+        ids = [
+            MARK,
+            self.shared_slot,
+            self.shared,
+            self.last_shared_id,
+            self.keep_slot,
+            self.total,
+        ]
         ids.extend(new_ids)
         return ids
 
@@ -99,7 +106,8 @@ def eligible(request: EngineCoreRequest) -> bool:
 
 
 def first_difference(a: list[Any], b: list[Any], start: int, end: int) -> int:
-    """The first index in ``[start, end)`` where ``a`` and ``b`` differ, given that they differ there."""
+    """The first index in ``[start, end)`` where ``a`` and ``b`` differ, given that they
+    differ there."""
     while end - start > 1:
         middle = (start + end) // 2
         if a[start:middle] == b[start:middle]:
@@ -118,7 +126,8 @@ def shared_length(a: list[Any], b: list[Any]) -> int:
 
 
 def shared_ids(ids: list[int], kept: KeptPrompt, probes: int) -> int:
-    """The number of leading ids ``ids`` shares with ``kept``, whose first ``probes`` probes it matches.
+    """The number of leading ids ``ids`` shares with ``kept``, whose first ``probes``
+    probes it matches.
 
     The ids up to the first probe that differs are compared at once, and only
     the probe interval that holds the first difference is searched.
@@ -134,7 +143,8 @@ def shared_ids(ids: list[int], kept: KeptPrompt, probes: int) -> int:
 
 
 class SentPrompts:
-    """The API server's numbered slots of recent prompts, and the header of each new one."""
+    """The API server's numbered slots of recent prompts, and the header of each new
+    one."""
 
     def __init__(self, capacity: int) -> None:
         self.capacity = capacity
@@ -142,13 +152,16 @@ class SentPrompts:
         self.counts = Counts()
 
     def header(self, ids: list[int]) -> Header:
-        """The slot ``ids`` shares the most leading ids with, and the slot it will be kept in."""
+        """The slot ``ids`` shares the most leading ids with, and the slot it will be
+        kept in."""
         slot, shared = self.most_shared(ids)
         extends = slot != NO_SLOT and shared == len(self.kept[slot].ids)
         keep_slot = slot if extends else self.free_slot(slot)
         if shared < PROBE_EVERY:
             slot, shared = NO_SLOT, 0
-        return Header(slot, shared, ids[shared - 1] if shared else 0, keep_slot, len(ids))
+        return Header(
+            slot, shared, ids[shared - 1] if shared else 0, keep_slot, len(ids)
+        )
 
     def keep(self, header: Header, ids: list[int]) -> None:
         if header.shared_slot != NO_SLOT:
@@ -167,7 +180,10 @@ class SentPrompts:
         for slot, kept in reversed(self.kept.items()):
             if best_probes == len(probes):
                 break
-            if len(kept.probes) <= best_probes or kept.probes[best_probes] != probes[best_probes]:
+            if (
+                len(kept.probes) <= best_probes
+                or kept.probes[best_probes] != probes[best_probes]
+            ):
                 continue
             count = shared_length(probes, kept.probes)
             if count > best_probes:
@@ -181,18 +197,23 @@ class SentPrompts:
             (
                 (len(kept.ids), slot)
                 for slot, kept in self.kept.items()
-                if 0 < len(kept.ids) <= len(ids) and ids[len(kept.ids) - 1] == kept.ids[-1]
+                if 0 < len(kept.ids) <= len(ids)
+                and ids[len(kept.ids) - 1] == kept.ids[-1]
             ),
             reverse=True,
         )
         for length, slot in candidates:
             kept = self.kept[slot]
-            if ids[PROBE_EVERY - 1 : length : PROBE_EVERY] == kept.probes and ids[:length] == kept.ids:
+            if (
+                ids[PROBE_EVERY - 1 : length : PROBE_EVERY] == kept.probes
+                and ids[:length] == kept.ids
+            ):
                 return slot
         return NO_SLOT
 
     def free_slot(self, shared_slot: int) -> int:
-        """A new slot while there is room, else the least recently used slot other than ``shared_slot``."""
+        """A new slot while there is room, else the least recently used slot other than
+        ``shared_slot``."""
         if len(self.kept) < self.capacity:
             return len(self.kept)
         return next((slot for slot in self.kept if slot != shared_slot), shared_slot)
@@ -212,7 +233,8 @@ class Counts:
     def log(self, side: str, kept: int) -> None:
         if self.requests == 1 or self.requests % SUMMARY_EVERY_REQUESTS == 0:
             logger.info(
-                "VLLM_TPU_SEND_NEW_PROMPT_IDS: %s %d requests, %d of %d prompt ids, with %d kept prompts",
+                "VLLM_TPU_SEND_NEW_PROMPT_IDS: %s %d requests, %d of %d prompt "
+                "ids, with %d kept prompts",
                 side,
                 self.requests,
                 self.sent_ids,
@@ -233,17 +255,20 @@ class ReceivedPrompts:
             full = ids[HEADER_IDS:]
         else:
             kept = self.kept[header.shared_slot]
-            if len(kept) < header.shared or kept[header.shared - 1] != header.last_shared_id:
+            if (
+                len(kept) < header.shared
+                or kept[header.shared - 1] != header.last_shared_id
+            ):
                 raise ValueError(
-                    f"VLLM_TPU_SEND_NEW_PROMPT_IDS: slot {header.shared_slot} does not hold the "
-                    f"API server's {header.shared} shared ids"
+                    f"VLLM_TPU_SEND_NEW_PROMPT_IDS: slot {header.shared_slot} does "
+                    f"not hold the API server's {header.shared} shared ids"
                 )
             full = kept[: header.shared]
             full.extend(ids[HEADER_IDS:])
         if len(full) != header.total:
             raise ValueError(
-                f"VLLM_TPU_SEND_NEW_PROMPT_IDS: joined {len(full)} prompt ids, the API server "
-                f"sent a prompt of {header.total}"
+                f"VLLM_TPU_SEND_NEW_PROMPT_IDS: joined {len(full)} prompt ids, "
+                f"the API server sent a prompt of {header.total}"
             )
         self.kept[header.keep_slot] = full
         self.counts.add(header)
@@ -262,7 +287,9 @@ def send_new_prompt_ids(capacity: int) -> None:
             sent = self.__dict__.setdefault("_tpu_sent_prompts", SentPrompts(capacity))
             header = sent.header(request.prompt_token_ids)
             ids = header.encode(request.prompt_token_ids[header.shared :])
-            frames = self.encoder.encode(msgspec.structs.replace(request, prompt_token_ids=ids))
+            frames = self.encoder.encode(
+                msgspec.structs.replace(request, prompt_token_ids=ids)
+            )
             sent.keep(header, request.prompt_token_ids)
         else:
             frames = self.encoder.encode(request)
@@ -274,7 +301,8 @@ def send_new_prompt_ids(capacity: int) -> None:
 
 
 def receive_new_prompt_ids(capacity: int) -> None:
-    """The engine core joins each request's kept and new prompt ids before it builds the request."""
+    """The engine core joins each request's kept and new prompt ids before it builds the
+    request."""
     from vllm.v1.engine.core import EngineCore
 
     upstream = EngineCore.preprocess_add_request
@@ -284,7 +312,9 @@ def receive_new_prompt_ids(capacity: int) -> None:
         header = Header.decode(request.prompt_token_ids)
         if header is not None:
             received = self.__dict__.setdefault("_tpu_received_prompts", {})
-            clients = received.setdefault(request.client_index, ReceivedPrompts(capacity))
+            clients = received.setdefault(
+                request.client_index, ReceivedPrompts(capacity)
+            )
             request.prompt_token_ids = clients.join(header, request.prompt_token_ids)
         return upstream(self, request)
 
@@ -292,7 +322,8 @@ def receive_new_prompt_ids(capacity: int) -> None:
 
 
 def patch_send_new_prompt_ids() -> None:
-    """Send the engine core only the prompt ids it has not seen (VLLM_TPU_SEND_NEW_PROMPT_IDS)."""
+    """Send the engine core only the prompt ids it has not seen
+    (VLLM_TPU_SEND_NEW_PROMPT_IDS)."""
     from vllm_torchtpu import envs
 
     capacity = envs.VLLM_TPU_SEND_NEW_PROMPT_IDS
@@ -306,7 +337,7 @@ def patch_send_new_prompt_ids() -> None:
     receive_new_prompt_ids(capacity)
     EngineCore._tpu_send_new_prompt_ids = True
     logger.info(
-        "VLLM_TPU_SEND_NEW_PROMPT_IDS: prompts carry only the ids after those they share "
-        "with one of the %d most recent prompts",
+        "VLLM_TPU_SEND_NEW_PROMPT_IDS: prompts carry only the ids after those "
+        "they share with one of the %d most recent prompts",
         capacity,
     )

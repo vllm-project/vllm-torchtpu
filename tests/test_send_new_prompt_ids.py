@@ -51,21 +51,36 @@ class Engine:
 
     def receive(self, message):
         _, *frames = message
-        request, _ = EngineCore.preprocess_add_request(self, self.decoder.decode(frames))
+        request, _ = EngineCore.preprocess_add_request(
+            self, self.decoder.decode(frames)
+        )
         return request.prompt_token_ids
 
 
 @pytest.fixture
 def patched(monkeypatch):
-    monkeypatch.setattr(AsyncMPClient, "add_request_async", AsyncMPClient.add_request_async)
-    monkeypatch.setattr(EngineCore, "preprocess_add_request", EngineCore.preprocess_add_request)
+    monkeypatch.setattr(
+        AsyncMPClient, "add_request_async", AsyncMPClient.add_request_async
+    )
+    monkeypatch.setattr(
+        EngineCore, "preprocess_add_request", EngineCore.preprocess_add_request
+    )
     snp.send_new_prompt_ids(capacity=8)
     snp.receive_new_prompt_ids(capacity=8)
 
 
 def _request(request_id, ids, **fields):
     return EngineCoreRequest(
-        request_id, ids, None, SamplingParams(max_tokens=8), None, 0.0, None, None, None, **fields
+        request_id,
+        ids,
+        None,
+        SamplingParams(max_tokens=8),
+        None,
+        0.0,
+        None,
+        None,
+        None,
+        **fields,
     )
 
 
@@ -79,7 +94,8 @@ def _fresh(ids):
 
 
 def _conversations(rng, conversations=12, turns=8):
-    """Interleaved multi-turn prompts with a shared system prompt, edited turns and new conversations."""
+    """Interleaved multi-turn prompts with a shared system prompt, edited turns and new
+    conversations."""
     system = [rng.randrange(1000, 150000) for _ in range(3 * PROBE_EVERY + 7)]
     prompts = {c: list(system) for c in range(conversations)}
     order = [c for c in range(conversations) for _ in range(turns)]
@@ -90,7 +106,10 @@ def _conversations(rng, conversations=12, turns=8):
             prompts[c] = list(system)
         elif roll < 0.25:
             del prompts[c][-rng.randrange(1, 300) :]
-        prompts[c] += [rng.randrange(1000, 150000) for _ in range(rng.randrange(1, 2 * PROBE_EVERY))]
+        prompts[c] += [
+            rng.randrange(1000, 150000)
+            for _ in range(rng.randrange(1, 2 * PROBE_EVERY))
+        ]
         yield prompts[c]
 
 
@@ -103,7 +122,9 @@ def test_every_prompt_is_rebuilt_exactly(patched, fresh):
         ids = _fresh(prompt) if fresh else list(prompt)
         message = _send(client, _request(f"r{n}", ids))
         assert engine.receive(message) == prompt
-        sent += len(MsgpackDecoder(EngineCoreRequest).decode(message[1:]).prompt_token_ids)
+        sent += len(
+            MsgpackDecoder(EngineCoreRequest).decode(message[1:]).prompt_token_ids
+        )
         received += len(prompt)
     assert sent < received / 2
 
@@ -116,16 +137,22 @@ def test_a_prompt_that_differs_between_probes_is_rebuilt_exactly(patched):
     for n, prompt in enumerate([kept, edited + [1, 2, 3]]):
         assert engine.receive(_send(client, _request(f"r{n}", list(prompt)))) == prompt
     header = Header.decode(
-        MsgpackDecoder(EngineCoreRequest).decode(client.messages[-1][1:]).prompt_token_ids
+        MsgpackDecoder(EngineCoreRequest)
+        .decode(client.messages[-1][1:])
+        .prompt_token_ids
     )
     assert header.shared == 5 * PROBE_EVERY + 3
 
 
 def test_unshared_and_short_prompts_are_sent_whole(patched):
     client, engine = Client(), Engine()
-    for n, prompt in enumerate([[5] * 10, [6] * 3 * PROBE_EVERY, [5] * 11, list(range(PROBE_EVERY))]):
+    for n, prompt in enumerate(
+        [[5] * 10, [6] * 3 * PROBE_EVERY, [5] * 11, list(range(PROBE_EVERY))]
+    ):
         message = _send(client, _request(f"r{n}", list(prompt)))
-        header = Header.decode(MsgpackDecoder(EngineCoreRequest).decode(message[1:]).prompt_token_ids)
+        header = Header.decode(
+            MsgpackDecoder(EngineCoreRequest).decode(message[1:]).prompt_token_ids
+        )
         assert header.shared == 0
         assert engine.receive(message) == prompt
 
@@ -134,11 +161,13 @@ def test_unshared_and_short_prompts_are_sent_whole(patched):
     "fields", [{"resumable": True}, {"prompt_is_token_ids": [True] * (2 * PROBE_EVERY)}]
 )
 def test_ineligible_requests_are_sent_unchanged(patched, fields):
-    client, engine = Client(), Engine()
+    client = Client()
     prompt = list(range(2 * PROBE_EVERY))
     _send(client, _request("a", list(prompt)))
     message = _send(client, _request("b", list(prompt), **fields))
-    assert MsgpackDecoder(EngineCoreRequest).decode(message[1:]).prompt_token_ids == prompt
+    assert (
+        MsgpackDecoder(EngineCoreRequest).decode(message[1:]).prompt_token_ids == prompt
+    )
 
 
 def test_each_client_has_its_own_slots(patched):
@@ -147,14 +176,19 @@ def test_each_client_has_its_own_slots(patched):
     for turn in range(4):
         for client in clients:
             prompt = base + [client.client_index] * (turn + 1)
-            message = _send(client, _request(f"{client.client_index}-{turn}", list(prompt)))
+            message = _send(
+                client, _request(f"{client.client_index}-{turn}", list(prompt))
+            )
             assert engine.receive(message) == prompt
 
 
 def test_the_kept_prompt_sharing_the_most_ids_is_chosen():
     sent = SentPrompts(capacity=4)
     base = list(range(8 * PROBE_EVERY))
-    kept = [base[: 6 * PROBE_EVERY + 5] + [-1] * PROBE_EVERY, base[: 3 * PROBE_EVERY] + [-2] * 5 * PROBE_EVERY]
+    kept = [
+        base[: 6 * PROBE_EVERY + 5] + [-1] * PROBE_EVERY,
+        base[: 3 * PROBE_EVERY] + [-2] * 5 * PROBE_EVERY,
+    ]
     for ids in kept + [[-3] * 8 * PROBE_EVERY]:
         sent.keep(sent.header(ids), ids)
     header = sent.header(base)
@@ -185,6 +219,10 @@ def test_a_wrong_slot_fails_the_request():
 def test_shared_length_matches_a_scan(seed):
     rng = random.Random(seed)
     a = [rng.randrange(3) for _ in range(rng.randrange(0, 20000))]
-    b = a[: rng.randrange(0, len(a) + 1)] + [rng.randrange(3) for _ in range(rng.randrange(0, 9000))]
-    expected = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+    b = a[: rng.randrange(0, len(a) + 1)] + [
+        rng.randrange(3) for _ in range(rng.randrange(0, 9000))
+    ]
+    expected = next(
+        (i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b))
+    )
     assert shared_length(a, b) == expected

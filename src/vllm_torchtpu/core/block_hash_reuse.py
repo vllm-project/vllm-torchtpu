@@ -68,9 +68,13 @@ def packed(token_ids: list[int], blocks: int, block_size: int) -> bytes:
 
 
 def longest_extended(
-    tokens: bytes, candidates: list[tuple[int, KeptPrompt]], blocks: int, block_bytes: int
+    tokens: bytes,
+    candidates: list[tuple[int, KeptPrompt]],
+    blocks: int,
+    block_bytes: int,
 ) -> tuple[int | None, int]:
-    """The longest kept prompt whose full blocks all lead ``tokens``, and its block count.
+    """The longest kept prompt whose full blocks all lead ``tokens``, and its block
+    count.
 
     A multi-turn prompt usually extends its previous turn's prompt, so the
     kept prompts whose last full block reappears at the same place are
@@ -80,7 +84,9 @@ def longest_extended(
         (len(kept.hashes), key, kept)
         for key, kept in candidates
         if len(kept.hashes) <= blocks
-        and tokens[(len(kept.hashes) - 1) * block_bytes : len(kept.hashes) * block_bytes]
+        and tokens[
+            (len(kept.hashes) - 1) * block_bytes : len(kept.hashes) * block_bytes
+        ]
         == kept.tokens[-block_bytes:]
     ]
     for count, key, kept in sorted(extended, key=lambda item: item[0], reverse=True):
@@ -89,8 +95,11 @@ def longest_extended(
     return None, 0
 
 
-def shared_blocks(tokens: bytes, kept: bytes, start: int, limit: int, block_bytes: int) -> int:
-    """How many leading blocks ``tokens`` and ``kept`` share, given the first ``start`` are shared.
+def shared_blocks(
+    tokens: bytes, kept: bytes, start: int, limit: int, block_bytes: int
+) -> int:
+    """How many leading blocks ``tokens`` and ``kept`` share, given the first ``start``
+    are shared.
 
     Grows the compared span by doubling and restarts at one block after a
     mismatch, so a long shared stretch takes a few memcmp calls.
@@ -98,7 +107,10 @@ def shared_blocks(tokens: bytes, kept: bytes, start: int, limit: int, block_byte
     shared, step = start, 1
     while shared < limit:
         end = min(shared + step, limit)
-        if tokens[shared * block_bytes : end * block_bytes] == kept[shared * block_bytes : end * block_bytes]:
+        if (
+            tokens[shared * block_bytes : end * block_bytes]
+            == kept[shared * block_bytes : end * block_bytes]
+        ):
             shared, step = end, step * 2
         elif step == 1:
             break
@@ -108,7 +120,10 @@ def shared_blocks(tokens: bytes, kept: bytes, start: int, limit: int, block_byte
 
 
 def longest_shared_blockwise(
-    tokens: bytes, candidates: list[tuple[int, KeptPrompt]], blocks: int, block_bytes: int
+    tokens: bytes,
+    candidates: list[tuple[int, KeptPrompt]],
+    blocks: int,
+    block_bytes: int,
 ) -> tuple[int | None, int]:
     """The most recent kept prompt sharing the most leading blocks with ``tokens``.
 
@@ -122,9 +137,13 @@ def longest_shared_blockwise(
     best_key, best, shared = None, None, 0
     for key, kept in reversed(candidates):
         limit = min(len(kept.hashes), blocks)
-        if best is not None and (limit <= shared or kept.hashes[shared - 1] != best.hashes[shared - 1]):
+        if best is not None and (
+            limit <= shared or kept.hashes[shared - 1] != best.hashes[shared - 1]
+        ):
             continue
-        reach = shared_blocks(tokens, kept.tokens, shared if best is not None else 1, limit, block_bytes)
+        reach = shared_blocks(
+            tokens, kept.tokens, shared if best is not None else 1, limit, block_bytes
+        )
         if best is None or reach > shared:
             best_key, best, shared = key, kept, reach
     return best_key, shared
@@ -145,13 +164,16 @@ class RecentPrompts:
     def longest_shared(
         self, tokens: bytes, first_hash: BlockHash, blocks: int, block_bytes: int
     ) -> tuple[int | None, int, bool]:
-        """The longest kept prompt that ``tokens`` extends, else the one sharing the most leading blocks.
+        """The longest kept prompt that ``tokens`` extends, else the one sharing the
+        most leading blocks.
 
         Returns its key, the number of shared blocks and whether ``tokens``
         extends all of its full blocks.
         """
         candidates = [
-            (key, kept) for key, kept in self._prompts.items() if kept.hashes[0] == first_hash
+            (key, kept)
+            for key, kept in self._prompts.items()
+            if kept.hashes[0] == first_hash
         ]
         key, shared = longest_extended(tokens, candidates, blocks, block_bytes)
         if key is not None:
@@ -193,7 +215,8 @@ def reusing_block_hasher(
     upstream: Callable[[Request], list[BlockHash]],
     capacity: int,
 ) -> Callable[[Request], list[BlockHash]]:
-    """Upstream's request block hasher, with a new prompt's shared blocks taken from a recent prompt."""
+    """Upstream's request block hasher, with a new prompt's shared blocks taken from a
+    recent prompt."""
     from vllm.v1.core import kv_cache_utils
 
     recent = RecentPrompts(capacity)
@@ -212,16 +235,27 @@ def reusing_block_hasher(
             return []
         token_ids = request.all_token_ids
         tokens = packed(request.prompt_token_ids, blocks, block_size)
-        first_keys, _ = kv_cache_utils.generate_block_hash_extra_keys(request, 0, block_size, 0)
-        first = kv_cache_utils.hash_block_tokens(hash_fn, None, token_ids[:block_size], first_keys)
+        first_keys, _ = kv_cache_utils.generate_block_hash_extra_keys(
+            request, 0, block_size, 0
+        )
+        first = kv_cache_utils.hash_block_tokens(
+            hash_fn, None, token_ids[:block_size], first_keys
+        )
         with recent.lock:
-            key, shared, extends_kept = recent.longest_shared(tokens, first, blocks, block_bytes)
-            hashes = recent.hashes(key)[:shared] if shared else [first]
+            key, shared, extends_kept = recent.longest_shared(
+                tokens, first, blocks, block_bytes
+            )
+            hashes = (
+                recent.hashes(key)[:shared] if shared and key is not None else [first]
+            )
         reused = len(hashes) if shared else 0
         parent = hashes[-1]
         for block in range(len(hashes), blocks):
             parent = kv_cache_utils.hash_block_tokens(
-                hash_fn, parent, token_ids[block * block_size : (block + 1) * block_size], None
+                hash_fn,
+                parent,
+                token_ids[block * block_size : (block + 1) * block_size],
+                None,
             )
             hashes.append(parent)
         with recent.lock:
@@ -231,8 +265,8 @@ def reusing_block_hasher(
             counts.reused_blocks += reused
             if counts.requests == 1 or counts.requests % SUMMARY_EVERY_REQUESTS == 0:
                 logger.info(
-                    "VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS: %d requests, %d of %d prompt blocks "
-                    "reused from %d kept prompts",
+                    "VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS: %d requests, %d of %d "
+                    "prompt blocks reused from %d kept prompts",
                     counts.requests,
                     counts.reused_blocks,
                     counts.blocks,
@@ -240,8 +274,8 @@ def reusing_block_hasher(
                 )
         return hashes
 
-    request_block_hasher.recent = recent
-    request_block_hasher.counts = counts
+    setattr(request_block_hasher, "recent", recent)  # noqa: B010
+    setattr(request_block_hasher, "counts", counts)  # noqa: B010
     return request_block_hasher
 
 
@@ -262,9 +296,11 @@ def patch_block_hash_reuse() -> None:
     @functools.wraps(upstream_factory)
     def get_request_block_hasher(hash_block_size, caching_hash_fn):
         upstream = upstream_factory(hash_block_size, caching_hash_fn)
-        return reusing_block_hasher(hash_block_size, caching_hash_fn, upstream, capacity)
+        return reusing_block_hasher(
+            hash_block_size, caching_hash_fn, upstream, capacity
+        )
 
-    get_request_block_hasher._tpu_block_hash_reuse = True
+    setattr(get_request_block_hasher, "_tpu_block_hash_reuse", True)  # noqa: B010
     kv_cache_utils.get_request_block_hasher = get_request_block_hasher
     core.get_request_block_hasher = get_request_block_hasher
     logger.info(

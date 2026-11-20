@@ -72,7 +72,8 @@ _AGREEING_CHARS = 64
 
 @dataclass
 class TokenizedPrompt:
-    """A prompt's ids and, per added token, where it starts and ends and the ids up to its end."""
+    """A prompt's ids and, per added token, where it starts and ends and the ids up to
+    its end."""
 
     text: str
     ids: list[int]
@@ -96,7 +97,8 @@ class SharedPrefix:
 
     @property
     def whole(self) -> bool:
-        """Whether the new prompt extends this prompt through its last added token, so it replaces it."""
+        """Whether the new prompt extends this prompt through its last added token, so
+        it replaces it."""
         return self.tokens == len(self.prompt.token_ends)
 
     def join(self, rest: TokenizedPrompt, text: str) -> TokenizedPrompt:
@@ -107,7 +109,8 @@ class SharedPrefix:
         return TokenizedPrompt(
             text=text,
             ids=joined,
-            token_starts=prompt.token_starts[:tokens] + [s + end for s in rest.token_starts],
+            token_starts=prompt.token_starts[:tokens]
+            + [s + end for s in rest.token_starts],
             token_ends=prompt.token_ends[:tokens] + [e + end for e in rest.token_ends],
             ids_through_token=prompt.ids_through_token[:tokens]
             + [n + ids for n in rest.ids_through_token],
@@ -141,7 +144,8 @@ def shared_prefix_length(a: str, b: str) -> int:
 
 
 class RecentPrompts:
-    """The most recent tokenized prompts, searched for the longest prefix a new prompt can reuse."""
+    """The most recent tokenized prompts, searched for the longest prefix a new prompt
+    can reuse."""
 
     def __init__(self, added_tokens: list[str], max_prompts: int):
         self._max_prompts = max_prompts
@@ -160,7 +164,9 @@ class RecentPrompts:
                 and prompt.token_ends[-1] > best.end
                 and _agree_before(text, prompt.text, best.end)
             ):
-                best = self._longer(best, prompt, shared_prefix_length(text, prompt.text))
+                best = self._longer(
+                    best, prompt, shared_prefix_length(text, prompt.text)
+                )
         return best
 
     @staticmethod
@@ -188,7 +194,9 @@ class RecentPrompts:
         start, end = prompt.token_starts[token], prompt.token_ends[token]
         first = max(0, end - self._longest_token + 1)
         text = prompt.text
-        return not any(text[p:end] in self._token_prefixes for p in range(first, start + 1))
+        return not any(
+            text[p:end] in self._token_prefixes for p in range(first, start + 1)
+        )
 
     def add(self, prompt: TokenizedPrompt, replaces: TokenizedPrompt | None) -> None:
         if replaces is not None:
@@ -213,7 +221,9 @@ class SegmentTokenizer:
         self._backend = copy.deepcopy(backend)
         self._backend.no_truncation()
         self._backend.no_padding()
-        self._miss_encoder = _fastokens_of(self._backend) if use_fastokens else self._backend
+        self._miss_encoder = (
+            _fastokens_of(self._backend) if use_fastokens else self._backend
+        )
         added = self._backend.get_added_tokens_decoder()
         self._added_id = {tok.content: tid for tid, tok in added.items()}
         alts: list[str] = sorted(self._added_id, key=len, reverse=True)
@@ -263,7 +273,9 @@ class SegmentTokenizer:
             prompt = prefix.join(self.encode_pieces(text[prefix.end :]), text)
             reused = prefix.ids
         with self._lock:
-            self._recent.add(prompt, replaces=prefix.prompt if prefix and prefix.whole else None)
+            self._recent.add(
+                prompt, replaces=prefix.prompt if prefix and prefix.whole else None
+            )
         return prompt.ids, reused
 
     def encode_pieces(self, text: str) -> TokenizedPrompt:
@@ -332,7 +344,9 @@ def _fastokens_of(backend: Any) -> Any:
     try:
         return _import_fastokens().Tokenizer.from_json_str(backend.to_str())
     except Exception as exc:
-        logger.warning("VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS: keeping the HF encoder: %s", exc)
+        logger.warning(
+            "VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS: keeping the HF encoder: %s", exc
+        )
         return backend
 
 
@@ -349,6 +363,8 @@ def _import_fastokens() -> Any:
     spec = importlib.util.spec_from_file_location(
         "fastokens", package / "__init__.py", submodule_search_locations=[str(package)]
     )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load fastokens from {package}")
     module = importlib.util.module_from_spec(spec)
     sys.modules["fastokens"] = module
     spec.loader.exec_module(module)
@@ -369,7 +385,10 @@ _INSTANCES_LOCK = threading.Lock()
 
 
 def get_segment_tokenizer(
-    tokenizer: Any, max_cached_tokens: int, max_prompts: int = 0, use_fastokens: bool = False
+    tokenizer: Any,
+    max_cached_tokens: int,
+    max_prompts: int = 0,
+    use_fastokens: bool = False,
 ):
     """One ``SegmentTokenizer`` per vLLM tokenizer object, or None if ineligible."""
     key = id(tokenizer)
@@ -385,7 +404,9 @@ def get_segment_tokenizer(
         else:
             reason = SegmentTokenizer.eligible(backend)
         if reason is None:
-            seg = SegmentTokenizer(backend, max_cached_tokens, max_prompts, use_fastokens)
+            seg = SegmentTokenizer(
+                backend, max_cached_tokens, max_prompts, use_fastokens
+            )
             logger.info(
                 "VLLM_TPU_SEGMENT_TOKENIZE: piecewise prompt tokenization on "
                 "(%d added tokens, cache %d tokens, ~12 B/token, prefix reuse "

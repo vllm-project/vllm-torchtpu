@@ -2227,7 +2227,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Engine core: the number of recent prompts whose block hashes a new prompt
     # reuses for the blocks it shares with them (core/block_hash_reuse.py).
     # Exact; 0 keeps none and hashes every block.
-    "VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS": env_int("VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS", 0),
+    "VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS": env_int(
+        "VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS", 0
+    ),
     # API server: prompt ids the server's own tokenizer made skip the max/min
     # scan that checks each lies in the vocabulary (input_range_check.py).
     # Exact; prompts sent as ids keep the check.

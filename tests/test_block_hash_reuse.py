@@ -43,7 +43,8 @@ def _hashers(capacity=64):
 
 
 def _conversation_prompts(rng, conversations=12, turns=10):
-    """Interleaved multi-turn prompts: shared system prompt, growing turns, some edits and resets."""
+    """Interleaved multi-turn prompts: shared system prompt, growing turns, some edits
+    and resets."""
     system = [rng.randrange(1000, 150000) for _ in range(5 * BLOCK_SIZE + 3)]
     prompts = {c: list(system) for c in range(conversations)}
     order = [c for c in range(conversations) for _ in range(turns)]
@@ -56,7 +57,9 @@ def _conversation_prompts(rng, conversations=12, turns=10):
             prompt[cut] = rng.randrange(1000, 150000)
         elif roll < 0.15:
             del prompt[rng.randrange(len(system), len(prompt) + 1) :]
-        prompt.extend(rng.randrange(1000, 150000) for _ in range(rng.randrange(1, 6 * BLOCK_SIZE)))
+        prompt.extend(
+            rng.randrange(1000, 150000) for _ in range(rng.randrange(1, 6 * BLOCK_SIZE))
+        )
         yield f"{c}", list(prompt)
 
 
@@ -68,10 +71,14 @@ def test_longest_shared_matches_a_block_by_block_search():
         kept = []
         for _ in range(rng.randrange(1, 6)):
             tokens = stem + [rng.randrange(3) for _ in range(rng.randrange(0, 6) * 4)]
-            hashes = [hash(tuple(tokens[: (b + 1) * 4])) for b in range(len(tokens) // 4)]
+            hashes = [
+                hash(tuple(tokens[: (b + 1) * 4])) for b in range(len(tokens) // 4)
+            ]
             recent.keep(KeptPrompt(packed(tokens, len(tokens) // 4, 4), hashes), None)
             kept.append(tokens)
-        new = list(rng.choice(kept)) + [rng.randrange(3) for _ in range(rng.randrange(0, 4) * 4)]
+        new = list(rng.choice(kept)) + [
+            rng.randrange(3) for _ in range(rng.randrange(0, 4) * 4)
+        ]
         if rng.random() < 0.5:
             new[rng.randrange(len(new))] += 1
         new = new[: len(new) // 4 * 4]
@@ -83,7 +90,8 @@ def test_longest_shared_matches_a_block_by_block_search():
                 continue
             shared = 0
             while (shared + 1) * 4 <= min(len(tokens), len(new)) and (
-                tokens[shared * 4 : (shared + 1) * 4] == new[shared * 4 : (shared + 1) * 4]
+                tokens[shared * 4 : (shared + 1) * 4]
+                == new[shared * 4 : (shared + 1) * 4]
             ):
                 shared += 1
             longest_shared = max(longest_shared, shared)
@@ -114,9 +122,14 @@ def test_freshly_decoded_ids_reuse_as_shared_ones_do():
     upstream, reusing = _hashers()
     rng = random.Random(4)
     previous = [rng.randrange(1000, 150000) for _ in range(9 * BLOCK_SIZE)]
-    prompt = [int(str(token)) for token in previous] + [rng.randrange(1000, 150000) for _ in range(2 * BLOCK_SIZE)]
+    prompt = [int(str(token)) for token in previous] + [
+        rng.randrange(1000, 150000) for _ in range(2 * BLOCK_SIZE)
+    ]
     _request("previous", previous, reusing)
-    assert _request("r", prompt, reusing).block_hashes == _request("r", prompt, upstream).block_hashes
+    assert (
+        _request("r", prompt, reusing).block_hashes
+        == _request("r", prompt, upstream).block_hashes
+    )
     assert reusing.counts.reused_blocks == 9
 
 
@@ -160,7 +173,11 @@ def test_a_prompt_sharing_only_the_system_prompt_keeps_the_other_conversation():
 
 def test_the_check_fails_when_tokens_are_not_compared(monkeypatch):
     def longest_by_length(tokens, candidates, blocks, block_size):
-        fitting = [(len(kept.hashes), key) for key, kept in candidates if len(kept.hashes) <= blocks]
+        fitting = [
+            (len(kept.hashes), key)
+            for key, kept in candidates
+            if len(kept.hashes) <= blocks
+        ]
         return (max(fitting)[1], max(fitting)[0]) if fitting else (None, 0)
 
     monkeypatch.setattr(block_hash_reuse, "longest_extended", longest_by_length)
@@ -178,7 +195,9 @@ def test_patch_installs_only_when_enabled(monkeypatch):
 
     from vllm_torchtpu import envs
 
-    monkeypatch.setattr(kv_cache_utils, "get_request_block_hasher", get_request_block_hasher)
+    monkeypatch.setattr(
+        kv_cache_utils, "get_request_block_hasher", get_request_block_hasher
+    )
     monkeypatch.setattr(core, "get_request_block_hasher", get_request_block_hasher)
     monkeypatch.setenv("VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS", "0")
     block_hash_reuse.patch_block_hash_reuse()
