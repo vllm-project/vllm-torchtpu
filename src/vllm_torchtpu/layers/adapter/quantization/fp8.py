@@ -1190,15 +1190,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # Armed layer: the runner no longer runs the shared expert or the
             # all-reduce, so this returns the reduced shared + routed sum.
             return moe_tp_decode_forward(self, layer, x, router_logits)
-        if moe_lowtok_scores.serves(self._moe_lowtok_scores_op, x):
-            op = self._moe_lowtok_scores_op
-            return moe_lowtok_scores.apply(op, layer, x, router_logits)
-        return self._apply_grouped(layer, x, router_logits)
+        return VllmFp8MoEMethodTPU._apply_grouped(self, layer, x, router_logits)
 
     def _apply_grouped(
         self, layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
     ) -> torch.Tensor:
         """The grouped-matmul path: route, then fused_moe_gmm."""
+        if moe_lowtok_scores.serves(self._moe_lowtok_scores_op, x):
+            op = self._moe_lowtok_scores_op
+            assert op is not None
+            return moe_lowtok_scores.apply(op, layer, x, router_logits)
         activation_str = self._tpu_activation_str
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"

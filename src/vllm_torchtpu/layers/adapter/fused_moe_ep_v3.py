@@ -340,13 +340,14 @@ def _check_deployment(layer) -> None:
     # Read off the config, not `get_tp_group()`: a draft model's weight load
     # rewrites the group coordinator to width 1.
     tp = get_current_vllm_config().parallel_config.tensor_parallel_size
-    if tp > 1:
+    if tp > 1 and not layer.moe_config.moe_parallel_config.is_sequence_parallel:
         raise NotImplementedError(
-            f"MOE_FUSED_EP_KERNEL_IMPL=v3 serves data parallelism with expert "
-            f"parallelism only; tensor_parallel_size={tp} replicates every "
-            "token on each TP rank, so the kernel would do tp_size times the "
-            "expert work. Use --data-parallel-size with "
-            "--tensor-parallel-size=1, or MOE_FUSED_EP_KERNEL_IMPL=v2."
+            f"MOE_FUSED_EP_KERNEL_IMPL=v3 needs each rank's own tokens; "
+            f"tensor_parallel_size={tp} replicates every token on each TP rank, "
+            "so the kernel would do tp_size times the expert work. Use "
+            "--data-parallel-size with --tensor-parallel-size=1, "
+            "TPU_MOE_SEQUENCE_PARALLEL=1 (Qwen3.5 MoE under TP + EP), "
+            "or MOE_FUSED_EP_KERNEL_IMPL=v2."
         )
     pcp = _pcp_size(layer)
     if pcp > 1:
@@ -367,6 +368,18 @@ def _check_deployment(layer) -> None:
         )
 
 
+def _draft_layer_outside_sequence_parallelism(layer) -> bool:
+    """Whether this is an MTP draft layer next to a TP sequence-parallel target."""
+    from vllm.config import get_current_vllm_config
+
+    tp = get_current_vllm_config().parallel_config.tensor_parallel_size
+    return (
+        tp > 1
+        and envs.TPU_MOE_SEQUENCE_PARALLEL
+        and not layer.moe_config.moe_parallel_config.is_sequence_parallel
+    )
+
+
 def prebuild_fused_moe_ep_v3(
     layer, topk: int, renormalize: bool, activation: str
 ) -> ArmedOp | None:
@@ -378,8 +391,11 @@ def prebuild_fused_moe_ep_v3(
     deployment v3 cannot serve; returns None for a layer it declines, which
     keeps the grouped-matmul path.
     """
-    _check_deployment(layer)
-    armed = _prebuild(layer, topk, renormalize, activation)
+    if _draft_layer_outside_sequence_parallelism(layer):
+        armed: ArmedOp | str = "an MTP draft under TP, outside sequence parallelism"
+    else:
+        _check_deployment(layer)
+        armed = _prebuild(layer, topk, renormalize, activation)
     _ARMING["armed" if isinstance(armed, ArmedOp) else armed] += 1
     return armed if isinstance(armed, ArmedOp) else None
 

@@ -166,6 +166,22 @@ def test_an_unservable_deployment_raises(v3, monkeypatch, fault, match):
     assert not v3.built
 
 
+def test_arms_under_tp_with_sequence_parallelism(v3):
+    v3.config.parallel_config.tensor_parallel_size = 8
+    layer = _layer()
+    layer.moe_config.moe_parallel_config.is_sequence_parallel = True
+    armed = _prebuild(layer)
+    assert armed.run is v3.built[0][2]
+
+
+def test_declines_draft_outside_sequence_parallelism_under_tp(v3, monkeypatch):
+    v3.config.parallel_config.tensor_parallel_size = 8
+    monkeypatch.setenv("TPU_MOE_SEQUENCE_PARALLEL", "1")
+    layer = _layer()
+    assert _prebuild(layer) is None
+    assert not v3.built
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
