@@ -17,7 +17,9 @@ import re
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 import torch
 
@@ -299,6 +301,36 @@ def test_in_op_row_cap_dispatches_lowtok_or_fused_moe_func(
         assert scores.fused_moe_func.call_args.kwargs["num_primary_experts"] == (
             64 if has_copies else None
         )
+
+
+@pytest.mark.parametrize("weights_f32", ["0", "1"])
+def test_grouped_fallback_leaves_the_weight_dtype_to_fused_moe_func(
+    monkeypatch, weights_f32
+):
+    """Above the cap the routing weights reach fused_moe_func in float32, as
+    the softmax computes them, and fused_moe_func casts them by
+    TPU_MOE_TOPK_WEIGHTS_FLOAT32 exactly as it does for the grouped path; a
+    cast to the activations' bf16 in the op would discard the option."""
+    monkeypatch.setenv("TPU_MOE_TOPK_WEIGHTS_FLOAT32", weights_f32)
+    monkeypatch.setenv("TPU_MOE_ROUTER_TOPK", "sort")
+    monkeypatch.setattr(scores, "_ARMED_MAX_TOKENS", 0)
+    monkeypatch.setattr(scores, "fused_moe_func", Mock(return_value="gmm"))
+    rows = 3
+    x = jnp.zeros((rows, 8), dtype=jnp.bfloat16)
+    # Logits whose top-2 softmax weights bf16 cannot hold exactly.
+    logits = jnp.array(
+        [[0.1, 1.3, 0.0, 0.7], [2.0, -1.0, 0.3, 0.2], [0.0, 0.0, 0.5, 0.45]],
+        dtype=jnp.float32,
+    )
+    w13 = jnp.zeros((4, 8, 16), dtype=jnp.float8_e4m3fn)
+    w2 = jnp.zeros((4, 8, 8), dtype=jnp.float8_e4m3fn)
+    s13 = jnp.ones((4, 1, 1, 16), dtype=jnp.float32)
+    s2 = jnp.ones((4, 1, 1, 8), dtype=jnp.float32)
+    scores._moe_scores_fn(x, logits, w13, w2, s13, s2, jnp.int32(0), topk=2)
+    weights = scores.fused_moe_func.call_args.args[7]
+    top2 = jax.lax.top_k(logits, 2)[0]
+    assert weights.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(weights), jax.nn.softmax(top2, axis=-1))
 
 
 @pytest.mark.parametrize("skip_padded", [False, True])
