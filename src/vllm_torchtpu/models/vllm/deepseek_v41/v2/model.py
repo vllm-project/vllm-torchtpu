@@ -128,6 +128,59 @@ def _with_window_starts(context, first, positions, reuse=None):
     )
 
 
+def _reused(reuse: dict, slot: str, key: tuple, build):
+    """``build()``, or its last result in ``slot`` while ``key`` is unchanged.
+
+    A steady decode batch replays the same plan every step; its small device
+    tensors are uploaded once instead of once per step.
+    """
+    entry = reuse.get(slot)
+    if entry is None or entry[0] != key:
+        entry = (key, build())
+        reuse[slot] = entry
+    return entry[1]
+
+
+def _replay_rows(plan, positions, reuse: dict):
+    """Decoder row indices (padding rows at the extra row) and their gather."""
+    num_tokens = positions.shape[0]
+
+    def rows():
+        # The extra output row absorbs padded scatter writes. Reusing row zero
+        # for padding would overwrite a real request's first result.
+        indices = torch.tensor(
+            plan.indices + (num_tokens,) * (plan.padded_num_tokens - len(plan.indices)),
+            dtype=torch.int64,
+            device=positions.device,
+        )
+        return indices, indices.clamp(max=num_tokens - 1)
+
+    key = (plan.indices, plan.padded_num_tokens, num_tokens, positions.device)
+    return _reused(reuse, "rows", key, rows)
+
+
+def _replay_bounds(plan, positions, reuse: dict):
+    """The decoder's query bounds, replay starts and padding mask."""
+
+    def bounds():
+        device = positions.device
+        return (
+            torch.tensor(plan.query_start_loc, dtype=torch.int32, device=device),
+            torch.tensor(plan.replay_starts, dtype=positions.dtype, device=device),
+            torch.arange(plan.padded_num_tokens, device=device) >= len(plan.indices),
+        )
+
+    key = (
+        plan.query_start_loc,
+        plan.replay_starts,
+        plan.padded_num_tokens,
+        len(plan.indices),
+        positions.dtype,
+        positions.device,
+    )
+    return _reused(reuse, "bounds", key, bounds)
+
+
 def _scatter_decoder_rows(
     tensor: torch.Tensor, indices: torch.Tensor, total_rows: int
 ) -> torch.Tensor:
@@ -426,6 +479,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
     @cached_property
     def _window_starts_upload(self) -> dict:
         """Last window-starts upload (TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS)."""
+        return {}
+
+    @cached_property
+    def _replay_upload(self) -> dict:
+        """Last decoder replay plan tensors (``_replay_rows``, ``_replay_bounds``)."""
         return {}
 
     @cached_property
@@ -1003,24 +1061,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 decoder_positions, decoder_ids = positions, input_ids
                 decoder_hidden, decoder_mix = hidden, pre_mix
             else:
-                # The extra output row absorbs padded scatter writes. Reusing
-                # row zero for padding would overwrite a real request's first
-                # result.
-                indices = torch.tensor(
-                    plan.indices
-                    + (num_tokens,) * (plan.padded_num_tokens - len(plan.indices)),
-                    dtype=torch.int64,
-                    device=positions.device,
-                )
-                gather = indices.clamp(max=num_tokens - 1)
+                indices, gather = _replay_rows(plan, positions, self._replay_upload)
                 decoder_positions = positions[gather]
                 decoder_ids = input_ids[gather] if input_ids is not None else None
                 decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
-            bounds = torch.tensor(
-                plan.query_start_loc, dtype=torch.int32, device=positions.device
-            )
-            replay_starts = torch.tensor(
-                plan.replay_starts, dtype=positions.dtype, device=positions.device
+            bounds, replay_starts, decoder_padding = _replay_bounds(
+                plan, positions, self._replay_upload
             )
             decoder_metadata = {
                 key: replace(
@@ -1029,9 +1075,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # pyrefly: ignore[unbound-name]
                 for key, value in metadata.items()
             }
-            decoder_padding = torch.arange(
-                plan.padded_num_tokens, device=positions.device
-            ) >= len(plan.indices)
         decoder_context = replace(
             context,
             dp_metadata=(
