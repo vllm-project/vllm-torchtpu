@@ -37,9 +37,7 @@ def _pas(on=True, inflight=0, running=0, max_running=16):
 
 @pytest.fixture
 def base7():
-    with patch.object(
-        Scheduler, "_inflight_prefill_reserved_blocks", return_value=7, create=True
-    ):
+    with patch.object(Scheduler, "_inflight_prefill_reserved_blocks", return_value=7):
         yield
 
 
