@@ -248,3 +248,109 @@ def test_row_paired_lse_gather_compiles_with_a_symbolic_row_count():
     for rows in (8, 12):
         lse = torch.randn(rows, H)
         torch.testing.assert_close(compiled(lse), gather(lse))
+
+
+def _built_lse_reduce_scatter(monkeypatch, op, cap):
+    monkeypatch.setattr(cp_mla, "_LSE_RS_OPS", {False: op, True: op})
+    monkeypatch.setattr(cp_mla, "_LSE_RS_WORLD", 16)
+    monkeypatch.setattr(cp_mla, "_DCP_RANK", torch.zeros(1, dtype=torch.int32))
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_MERGE_LSE_RS_MAX_TOKENS", cap, raising=False
+    )
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_MERGE_RS_BF16", 1, raising=False)
+
+
+@pytest.mark.parametrize(
+    "tokens, chunks, cap, applies",
+    [
+        (1024, 2, 2048, True),
+        (2048, 2, 2048, True),
+        (4096, 8, 2048, False),  # over the cap
+        (4096, 8, 0, False),  # more attention chunks than the op takes
+        (4096, 4, 0, True),
+    ],
+)
+def test_lse_reduce_scatter_takes_buckets_up_to_the_cap(
+    monkeypatch, tokens, chunks, cap, applies
+):
+    _built_lse_reduce_scatter(monkeypatch, None, cap)
+    assert cp_mla.lse_rs_applies(tokens, chunks, 64, 512, 256, 2) is applies
+
+
+@pytest.mark.parametrize("rs_bf16", [0, 2])
+def test_lse_reduce_scatter_takes_only_the_bf16_reduce_scatter_merge(
+    monkeypatch, rs_bf16
+):
+    """The kernel rounds every partial sum to bf16, as the merge of
+    TPU_DCP_MERGE_RS_BF16=1 does; the f32 merge and the all-to-all merge keep
+    their own arithmetic."""
+    _built_lse_reduce_scatter(monkeypatch, None, 2048)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_MERGE_RS_BF16", rs_bf16)
+    assert not cp_mla.lse_rs_applies(2048, 2, 64, 512, 256, 2)
+
+
+def test_lse_reduce_scatter_takes_only_bf16_partials(monkeypatch):
+    """A float32 attention output keeps the chunked merge: the kernel reads 2
+    bf16 heads from each 32-bit word."""
+    _built_lse_reduce_scatter(monkeypatch, None, 2048)
+    monkeypatch.setattr(cp_mla, "lse_rs_applies", lambda *a: True)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: None)
+    monkeypatch.setattr(cp_mla, "_merge_chunks", lambda tokens: 2)
+    monkeypatch.setattr(cp_mla, "_retain_rank", lambda x: x)
+    taken = []
+    monkeypatch.setattr(
+        cp_mla, "_merge_lse_rs", lambda *a: taken.append("lse_rs") or "lse_rs"
+    )
+    monkeypatch.setattr(
+        cp_mla, "_merge_chunked", lambda *a, **k: taken.append("chunked") or "chunked"
+    )
+    w_uv = torch.zeros(H, C, V, dtype=torch.bfloat16)
+    lse = torch.zeros(T, H)
+    for dtype in (torch.float32, torch.bfloat16):
+        output = torch.zeros(T, H, C, dtype=dtype)
+        cp_mla.merge_lse_partials_scatter_heads_vspace(output, lse, w_uv, None)
+    assert taken == ["chunked", "lse_rs"]
+
+
+def test_lse_reduce_scatter_needs_its_ops_built(monkeypatch):
+    _built_lse_reduce_scatter(monkeypatch, None, 2048)
+    monkeypatch.setattr(cp_mla, "_LSE_RS_OPS", {})
+    assert not cp_mla.lse_rs_applies(2048, 2, 64, 512, 256, 2)
+
+
+@pytest.mark.parametrize("scaled", [False, True])
+def test_lse_reduce_scatter_gets_each_attention_chunk_as_an_operand(
+    monkeypatch, scaled
+):
+    """The op takes the 2 attention chunks, the last repeated to fill its 4
+    operands, W_UV (and its scale per head and V column), the f32
+    log-sum-exps and the rank; its heads-major result comes back token-major."""
+    calls = []
+    heads_out = H // D
+
+    def op(*args):
+        calls.append(args)
+        return (
+            torch.arange(heads_out * T * V, dtype=torch.float32)
+            .reshape(heads_out, T, V)
+            .to(torch.bfloat16)
+        )
+
+    _built_lse_reduce_scatter(monkeypatch, op, 2048)
+    rng = np.random.default_rng(3)
+    output = torch.from_numpy(rng.standard_normal((T, H, C)).astype(np.float32))
+    lse = torch.from_numpy(rng.standard_normal((T, H)).astype(np.float32))
+    w_uv = torch.zeros(H, C, V)
+    w_scale = torch.arange(H, dtype=torch.float32).reshape(H, 1) if scaled else None
+    got = cp_mla._merge_lse_rs(output, lse, w_uv, w_scale, 2)
+
+    (args,) = calls
+    half = T // 2
+    for part, rows in zip(args[:4], (0, half, half, half)):
+        assert torch.equal(part, output[rows : rows + half])
+    assert args[4] is w_uv
+    if scaled:
+        assert torch.equal(args[5], w_scale.expand(H, V))
+    assert args[-2].dtype == torch.float32 and torch.equal(args[-2], lse)
+    assert got.dtype == output.dtype
+    assert torch.equal(got, op().transpose(0, 1).to(output.dtype))
