@@ -2447,6 +2447,11 @@ class TestInputStagingFence:
             TPUModelRunner._dummy_run(
                 runner, num_tokens=16, num_reqs=4, num_blocks=4, dp_lockstep=dp_lockstep
             )
+            # An idle DP participant runs one placeholder row; warmup fills
+            # the batch with one-token requests.
+            expected = [0, 1, 1, 1, 1] if dp_lockstep else [0, 1, 2, 3, 4]
+            ctx = runner._attn_metadata_builder_ctx
+            assert ctx.query_start_loc.tolist() == expected
             # Only this run's staged table is still held, by its own fence.
             assert runner._unfenced_h2d_sources == []
             assert len(runner._fenced_h2d_sources) == 1

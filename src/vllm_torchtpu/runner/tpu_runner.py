@@ -5447,7 +5447,11 @@ class TPUModelRunner(GPUModelRunner):
             )
         else:
             input_ids = torch.zeros((num_tokens), dtype=torch.int32).to(self.device)
-            actual_num_reqs = min(num_tokens, num_reqs)
+            # An idle DP participant (dp_lockstep) serves no request: one
+            # placeholder row and padding, so its forward costs what a
+            # one-token step costs instead of a bucket of one-token requests,
+            # which its busy peers would wait for at every EP exchange.
+            actual_num_reqs = 1 if dp_lockstep else min(num_tokens, num_reqs)
         inputs_embeds = None
         if self.uses_mrope:
             position_ids = torch.zeros((3, num_tokens), dtype=torch.int32).to(
