@@ -192,14 +192,18 @@ def arm(hidden: int, device: torch.device) -> bool:
     refusal = _refusal()
     mesh = None if refusal else build_ep_mesh()  # collective
     mesh_index = -1 if mesh is None else ep_mesh_index()
-    seen = _gather(dict(refusal=refusal, mesh_index=mesh_index))
+    table = None if mesh is None else _two_level_table(mesh)
+    seen = _gather(dict(refusal=refusal, mesh_index=mesh_index, table=table))
     if any(s["refusal"] for s in seen):
         logger.warning("tp_all_reduce: not armed: %s", [s["refusal"] for s in seen])
         return False
     if sorted(s["mesh_index"] for s in seen) != list(range(tp.world_size)):
         raise RuntimeError(f"tp_all_reduce: mesh indices are not 0..n-1: {seen}")
+    if any(s["table"] != table for s in seen):
+        # Every rank must run the same kernel: the two differ in their DMAs.
+        logger.warning("tp_all_reduce: ranks disagree on the chip table; flat only")
+        table = None
     n = int(mesh.size)
-    table = _two_level_table(mesh)
     op = _make_op(mesh, max_bytes, table)
     rank = torch.tensor([[mesh_index]], dtype=torch.int32, device=device)
     failures = _gather(_selftest(op, rank, mesh_index, n, hidden, max_bytes, device))
