@@ -60,6 +60,23 @@ def get_dp_size(parallel_config) -> int:
     )
 
 
+def min_across_ep_dp(parallel_config, value: int) -> int:
+    """Return the minimum of `value` across the DP engines coupled by EP.
+
+    EP-coupled engines must compile identical programs, so a value baked into
+    them (such as the KV cache size) has to agree; uncoupled engines keep theirs.
+    """
+    if get_dp_size(parallel_config) == 1 or not parallel_config.enable_expert_parallel:
+        return value
+    from vllm.distributed.parallel_state import get_dp_group
+
+    t = torch.tensor([value], dtype=torch.int64, device="cpu")
+    torch.distributed.all_reduce(
+        t, op=torch.distributed.ReduceOp.MIN, group=get_dp_group().cpu_group
+    )
+    return int(t.item())
+
+
 def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
     usage = []
     multihost_backend = envs.TPU_MULTIHOST_BACKEND
