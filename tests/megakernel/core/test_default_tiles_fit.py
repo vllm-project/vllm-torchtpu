@@ -92,11 +92,12 @@ def test_kernel_build_fits_unset_tiles():
 def test_fit_sizes_default_tiles_for_the_device_chip(monkeypatch):
     spec = MODEL_SPECS["synth_full_ep"]
     ex = mk.ExecSpec(B=8, T=1, R=8, ctx=4096)
-    chip = default_chip.ChipBudget(name="test_chip", vmem_mib=62, smem_mib=2)
+    chip = default_chip.ChipBudget(name="test_chip", vmem_mib=48, smem_mib=2)
     monkeypatch.setitem(
         default_chip.CHIP_BUDGETS, default_chip._first_device_kind(), chip
     )
-    assert vmem.fit_default_tiles(spec, ex).tiles.smem_mib == 2
+    fitted = vmem.fit_default_tiles(spec, ex)
+    assert fitted.tiles.vmem_mib == 48 and fitted.tiles.smem_mib == 2
 
 
 def test_plan_and_build_scratch_fit_unset_tiles_like_build():

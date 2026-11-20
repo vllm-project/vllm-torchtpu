@@ -53,7 +53,8 @@ def _coerce_canonical_hf_entry(
         arr = jnp.asarray(hf[d.name])
     elif d.transform.fuse_into and d.transform.fuse_into in hf:
         f_arr = jnp.asarray(hf[d.transform.fuse_into])
-        ax, off, arr = d.transform.fuse_axis % f_arr.ndim, 0, f_arr
+        ax = int(has_layer_dim) + (d.transform.fuse_axis % len(d.shape))
+        off, arr = 0, f_arr
         for m in fuse_members[d.transform.fuse_into]:
             w = int(m.shape[d.transform.fuse_axis % len(m.shape)])
             if m.name == d.name:
@@ -144,10 +145,16 @@ def random_spec_logical_weights(
         if counts.get(m.name, 0) > 0
     ]
     n_keys = 32 + sum(
-        (len(m.hf_params(g=geom)) if m.has_hf_params else 0)
-        + 4 * len(m.weights(geom, ex))
+        (
+            len(m.hf_params(g=geom))
+            if m.has_hf_params
+            else sum(
+                len(w.fuse_from or (w.name,)) * (1 if w.layout == "stacked" else nl)
+                for w in m.weights(geom, ex)
+            )
+        )
         + len(m.smalls(geom, ex))
-        for m, _ in active_mods
+        for m, nl in active_mods
     )
     it = iter(jax.random.split(key, max(32, n_keys)))
 
@@ -164,13 +171,8 @@ def random_spec_logical_weights(
         return jnp.ones(sh, dtype=d.dtype) + raw if mean == 1.0 else raw + mean
 
     logical_weights: dict[str, Any] = {}
-    moe_tp = bool(getattr(geom, "moe_tp", True))
-    has_eplb = (
-        not moe_tp
-        and hasattr(geom, "EW")
-        and hasattr(geom, "ER")
-        and int(geom.EW(R)) > int(geom.ER(R))
-    )
+    moe_tp = bool(geom.moe_tp)
+    has_eplb = not moe_tp and int(geom.E) > 0 and int(geom.EW(R)) > int(geom.ER(R))
 
     for mod, n_l in active_mods:
         if mod.has_hf_params:
@@ -256,7 +258,7 @@ def random_spec_logical_weights(
             if mod.has_hf_params
             else set()
         )
-        norm_base = 0.0 if getattr(geom, "zero_centered_norm", False) else 1.0
+        norm_base = 0.0 if geom.zero_centered_norm else 1.0
         for sf in mod.smalls(geom, ex):
             if sf.name == "ecopy":
                 if "ecopy" not in logical_weights and has_eplb:
@@ -289,7 +291,7 @@ def random_spec_logical_weights(
                 )
 
     if "final_norm" not in logical_weights:
-        fn_base = 0.0 if getattr(geom, "zero_centered_norm", False) else 1.0
+        fn_base = 0.0 if geom.zero_centered_norm else 1.0
         logical_weights["final_norm"] = (
             fn_base + jax.random.normal(next(it), (int(geom.H),), dtype=F32) * 0.05
         )
@@ -311,7 +313,8 @@ def random_spec_inputs(
     keys = jax.random.split(key, 2 + len(mods))
     k_w, k_hid, *k_mods = keys
 
-    base_pos = jnp.arange(1, ex.NS + 1, dtype=I32) * min(16, max(1, ex.ctx // 4))
+    raw_base = jnp.arange(1, ex.NS + 1, dtype=I32) * min(16, max(1, ex.ctx // 4))
+    base_pos = raw_base % max(1, ex.ctx - ex.T + 1)
     pos = (
         base_pos
         if ex.T == 1
@@ -390,6 +393,7 @@ def pack_spec_inputs(
 
 
 __all__ = [
+    "coerce_canonical_hf_entry",
     "pack_spec_inputs",
     "random_spec_inputs",
     "random_spec_logical_weights",
