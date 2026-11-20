@@ -57,8 +57,8 @@ def _reference(scores, pos, rank, dcp, init_blocks, local_blocks):
     [
         (300, 512, 2, 1, 40_000, 0, 1),  # 128-row blocks, few chunks visible
         (300, 512, 2, 0, 130_000, 1, 1),  # every chunk visible in some block
-        (5, 256, 8, 3, 9_000, 0, 1),  # decode-sized: one 8-row block, full width
-        (40, 96, 4, 2, 20_000, 1, 2),  # one 40-row block of fewer columns than 128
+        (5, 256, 8, 3, 9_000, 0, 1),  # decode-sized: one padded 128-row block
+        (40, 96, 4, 2, 20_000, 1, 2),  # one padded 128-row block, < 128 columns
         (300, 384, 2, 0, 60_000, 0, 1),  # widths 128, 256 and the full 384
         (128, 512, 2, 1, 50_000, 0, 1),  # the fewest rows that pick widths
         (129, 512, 2, 0, 50_000, 0, 1),  # one block of all its rows

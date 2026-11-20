@@ -485,7 +485,8 @@ def local_candidates(
     # row of the block.
     block_rows = min(block_rows, max(8, -(-num_tokens // 8) * 8))
     # 128-row transposed blocks (rows on the lanes) where they pad less, and for
-    # a batch of one block's rows or fewer (decode): there they pick with
+    # a batch of at most 128 rows (decode; 2 x 128 for 184 rows was slower in
+    # the c48 twin, `_DECODE_CANDIDATE_TOKENS`): they pick with
     # elementwise maxima, where a row-major block of a few rows chains three
     # cross-lane reductions per pick (7,389 cycles at 8 rows, AOT): 6.5 ->
     # 4.6 us per call at 8-40 rows, bit-identical (bench j-05ee4bfa). Not for
