@@ -65,7 +65,16 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_rank_order,
 )
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
-from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
+from vllm_torchtpu.kernels.fused_moe.v3 import (
+    LANES,
+    MESH_AXIS,
+    SUPPORTED_GENERATIONS,
+    Config,
+    fused_ep_moe,
+    supported_on,
+    transport,
+)
+from vllm_torchtpu.kernels.fused_moe.v3.layer import expert_buffers_that_fit
 from vllm_torchtpu.layers.adapter.fused_moe_ep import (
     _max_node_tokens,
     _pcp_size,
@@ -590,6 +599,9 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
         or _unsupported_reason(
             w1, w2, w1_scale, w2_scale, local_experts, hidden, inter, activation
         )
+        or _unsupported_kernel_reason(
+            mesh, topk=topk, hidden=hidden, inter=inter, local_experts=local_experts
+        )
     )
     if reason is not None:
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
@@ -749,6 +761,56 @@ def _unsupported_reason(
         )
     if _squeeze_channel_scale(w2_scale, local_experts, hidden) is None:
         return "w2_scale is not the per-output-channel form the kernel takes"
+    return None
+
+
+def _unsupported_kernel_reason(
+    mesh, *, topk: int, hidden: int, inter: int, local_experts: int
+) -> str | None:
+    """Why the kernel would refuse this layer when its first forward is
+    traced, or None.
+
+    These are the kernel's checks that read only the chip, the mesh and the
+    layer's widths, never a step's token count. Inside the compiled forward
+    they can only raise, so they are made here, and a layer they refuse
+    keeps the grouped-matmul path.
+    """
+    device = mesh.devices.flat[0]
+    # `supported_on` reads the chip record only for a TPU device.
+    if not supported_on(device):
+        return (
+            f"the kernel is built and tested on TPU generations "
+            f"{SUPPORTED_GENERATIONS} only, and the mesh's devices are "
+            f"{device.device_kind}"
+        )
+    # The FFN program's build check: rows of whole LANES-lane blocks and
+    # experts at least one block wide.
+    if hidden < LANES or hidden % LANES or inter < LANES:
+        return (
+            f"hidden={hidden}, inter={inter}: the kernel's FFN takes rows of "
+            f"whole {LANES}-lane blocks and an intermediate width of at least "
+            f"{LANES}"
+        )
+    config = served_config(
+        hidden=hidden, inter=inter, experts_per_shard=local_experts, top_k=topk
+    )
+    try:
+        transport.check_width(mesh.shape[EP_AXIS_NAME])
+        expert_buffers_that_fit(
+            local_experts,
+            TILE_ROWS,
+            hidden,
+            inter,
+            config=config,
+            weight_format=WEIGHT_FORMAT,
+            activation_block=config.activation_block,
+            result_rows=config.result_rows,
+            token_block=config.token_rows_block,
+        )
+    except ValueError as error:
+        # Each raises ValueError only to refuse: a mesh width the transport
+        # cannot take, or not even two whole-expert weight slots in VMEM.
+        return str(error)
     return None
 
 
