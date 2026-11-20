@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
+    TPU_PROFILER_NAMED_SCOPES: bool = True
     TPU_GREEDY_HEAD_BACKEND: str = "auto"
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
@@ -796,6 +797,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The trace directory and iteration limits come from `profiler_config`;
     # this only selects which profiler consumes them.
     "USE_PHASED_PROFILER": env_bool("USE_PHASED_PROFILER"),
+    # Label model phases (stage, layer, mHC, attention, MoE) with TorchTPU
+    # name scopes, shown in XProf's framework name-scope hierarchy. Needs
+    # torch_tpu with `named_scope` (0.3.0+); a no-op otherwise. Scopes only
+    # change op metadata, but cached executables keep the scopes they were
+    # first compiled with, so the value stays in the compile hash.
+    "TPU_PROFILER_NAMED_SCOPES": env_bool("TPU_PROFILER_NAMED_SCOPES", True),
     # Migration selector: remove after fused-head E2E/quality qualification.
     # Auto selects the qualified fused head; logits explicitly disables it.
     "TPU_GREEDY_HEAD_BACKEND": env_with_choices(

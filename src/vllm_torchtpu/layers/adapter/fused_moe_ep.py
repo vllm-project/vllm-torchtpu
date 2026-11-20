@@ -67,6 +67,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
 )
 from vllm_torchtpu.layers.adapter import expert_load as expert_load_tap
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.tracing.named_scope import scoped
 
 logger = init_logger(__name__)
 
@@ -659,6 +660,7 @@ def _operand_fn(call, names, outputs=1):
     return fn
 
 
+@scoped("fused_moe_ep")
 def fused_moe_ep(
     owner: Any,
     hidden_states: torch.Tensor,

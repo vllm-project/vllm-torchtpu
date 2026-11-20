@@ -24,6 +24,7 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import (
     csa2_pipeline,
 )
 from vllm_torchtpu.kernels.mla.paged_swa import swa_word_pages, write_swa_word_pool
+from vllm_torchtpu.tracing.named_scope import scoped
 
 if TYPE_CHECKING:
     from .cache import PagedCacheRows
@@ -540,6 +541,7 @@ def publish_swa(
         cache.raw_hi.copy_(high)
 
 
+@scoped("csa2_attention")
 def attention(
     q: torch.Tensor,
     swa: "PagedCacheRows",
@@ -664,6 +666,7 @@ def project_out(
     return _ops["project_out"](output, wa, sa, wb, sb)
 
 
+@scoped("swa_metadata")
 def prepare_swa(
     table: torch.Tensor,
     starts: torch.Tensor,
@@ -684,6 +687,7 @@ def prepare_swa(
     )
 
 
+@scoped("swa_metadata")
 def prepare_swa_tables(
     tables: tuple[torch.Tensor, ...],
     starts: torch.Tensor,
@@ -705,6 +709,7 @@ def prepare_swa_tables(
     )
 
 
+@scoped("swa_metadata_and_kv_write")
 def prepare_publish_swa(
     table: torch.Tensor,
     starts: torch.Tensor,

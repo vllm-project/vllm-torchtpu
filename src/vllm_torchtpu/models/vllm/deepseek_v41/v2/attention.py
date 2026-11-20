@@ -27,6 +27,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     WEIGHT_FLIPPED_ATTR,
 )
 from vllm_torchtpu.layers.core import table_lookup
+from vllm_torchtpu.tracing.named_scope import named_scope, scoped
 from vllm_torchtpu.utils import synchronize_tensors
 
 from . import csa2_adapter, indexer_fp8, preprocess_ops
@@ -734,6 +735,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         o = o_padded[:, : self.n_local_heads, :]
         return self._o_proj(o, positions)
 
+    @scoped("qkv_a_proj")
     def _run_parallel_input_projections(self, hidden_states):
         qr_kv = self._fused_wqa_wkv_gemm(hidden_states)
         kv_score = (
@@ -767,6 +769,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             self.kv_norm(qr_kv[:, self.q_lora_rank :]),
         )
 
+    @scoped("qkv_a_proj")
     def _qa_kv_norm_rope(self, hidden_states, positions, *, emit_qr=True):
         """Fused ``_fused_wqa_wkv_gemm`` -> ``_split_qkv_and_norm`` -> SWA ``_rotate``.
 
@@ -904,6 +907,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )
         self._compressor_layout_fields = dataclasses.astuple(layout)
 
+    @scoped("compressed_kv_write")
     def _write_csa2_global_kv(self, hidden_states, positions):
         """Fused compressor: one kernel projects, pools (reading and writing the
         ratio-2 state ring), normalizes, rotates and CSA2-encodes the records."""
@@ -1052,6 +1056,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             latent, group_positions, index_k.kv_cache, index_slots, valid
         )
 
+    @scoped("compressed_kv_write")
     def _write_global_kv(self, kv_score, positions):
         metadata = get_forward_context().attn_metadata
         latent = self.compressor(kv_score, positions)
@@ -1176,6 +1181,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )
         self._produce_index_k(latent, group_positions, index_cache, index_slots, valid)
 
+    @scoped("encoder_global_kv")
     def write_encoder_global_kv(
         self, hidden_states, positions, *, sp_sharded: bool = False
     ):
@@ -1192,6 +1198,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             kv_score = sp_all_gather(kv_score)[: positions.shape[0]]
         self._write_global_kv(kv_score, positions)
 
+    @scoped("prepare_and_attend")
     def _prepare_tpu(
         self,
         hidden_states,
@@ -1564,42 +1571,49 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 if swa_row_slots is not None
                 else None
             )
-        if self._fused_preprocess:
-            # Shares the step's gathered rows with the Q-A/KV kernel.
-            q = preprocess_ops.qb_rope()(
-                qr, self.wq_b.weight, self.wq_b.weight_scale, self._rope_rows(positions)
-            )
-        else:
-            # V4.1 normalizes qr before projection; neither route renormalizes q.
-            if (
-                self._q_projection_rope_op is not None
-                and qr.dtype == torch.bfloat16
-                and positions.dtype == torch.int32
-                and self._tpu_rope_cache.dtype == torch.float32
-            ):
-                q = self._q_projection_rope_op(
+        with named_scope("q_b_proj"):
+            if self._fused_preprocess:
+                # Shares the step's gathered rows with the Q-A/KV kernel.
+                q = preprocess_ops.qb_rope()(
                     qr,
                     self.wq_b.weight,
                     self.wq_b.weight_scale,
-                    positions,
-                    self._tpu_rope_cache,
+                    self._rope_rows(positions),
                 )
             else:
-                # Other weight/rotary layouts retain the original model path.
-                q = _value(self.wq_b(qr)).reshape(-1, self.n_local_heads, self.head_dim)
-                q = self._rotate(q, positions)
+                # V4.1 normalizes qr before projection; neither route renormalizes q.
+                if (
+                    self._q_projection_rope_op is not None
+                    and qr.dtype == torch.bfloat16
+                    and positions.dtype == torch.int32
+                    and self._tpu_rope_cache.dtype == torch.float32
+                ):
+                    q = self._q_projection_rope_op(
+                        qr,
+                        self.wq_b.weight,
+                        self.wq_b.weight_scale,
+                        positions,
+                        self._tpu_rope_cache,
+                    )
+                else:
+                    # Other weight/rotary layouts retain the original model path.
+                    q = _value(self.wq_b(qr)).reshape(
+                        -1, self.n_local_heads, self.head_dim
+                    )
+                    q = self._rotate(q, positions)
         # Match upstream's plain BF16 cache selected by this backend. Packed
         # FP8/NVFP4 cache numerics must not be imposed on BF16 cache rows.
         if not self._fused_preprocess:
             kv = self._rotate(kv, positions)
-        if self._csa2:
-            assert csa2_write_records is not None
-            if not swa_published:
-                csa2_adapter.publish_swa(
-                    swa_cache, csa2_write_records, kv.reshape(-1, 512)
-                )
-        else:
-            _insert(swa_cache, swa_slots, kv, swa_valid)
+        with named_scope("swa_kv_write"):
+            if self._csa2:
+                assert csa2_write_records is not None
+                if not swa_published:
+                    csa2_adapter.publish_swa(
+                        swa_cache, csa2_write_records, kv.reshape(-1, 512)
+                    )
+            else:
+                _insert(swa_cache, swa_slots, kv, swa_valid)
         weights = None
         if self.compressor is not None and not self._ced_global_from_encoder:
             if self._fused_preprocess:
@@ -1807,6 +1821,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         output.copy_(result.masked_fill(swa_invalid_3d, 0))
         return None
 
+    @scoped("indexer_topk")
     def _select_paged_indices(
         self,
         qr,
@@ -2122,6 +2137,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 "(TP1, FP8 KV) " + "; ".join(problems)
             )
 
+    @scoped("o_proj")
     def _o_proj(self, output, positions):
         assert output.dtype == torch.bfloat16
         assert output.shape[1:] == (self.n_local_heads, self.head_dim)

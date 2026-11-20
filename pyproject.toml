@@ -39,7 +39,10 @@ dependencies = [
     # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
     # not at install time.
     "torchvision==0.28.0",
-    "torch-tpu==0.2.0rc1",
+    # Development build with `torch.tpu.profiler.named_scope` (torch_tpu
+    # 8a8279c8), for XProf name-scope profiling. Not an official release; it
+    # lives on the transient development index below.
+    "torch-tpu==0.3.0.dev20261117221416",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload; the
     # import name is `tpu_sync`. The wheel bundles one extension per
@@ -250,5 +253,11 @@ name = "torch-tpu-registry"
 url = "https://us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/"
 explicit = true
 
+[[tool.uv.index]]
+name = "torch-tpu-dev-registry"
+# Development builds; needs read access to ml-oss-artifacts-transient.
+url = "https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+explicit = true
+
 [tool.uv.sources]
-torch-tpu = { index = "torch-tpu-registry" }
+torch-tpu = { index = "torch-tpu-dev-registry" }

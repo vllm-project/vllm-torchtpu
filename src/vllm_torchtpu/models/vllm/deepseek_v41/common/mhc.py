@@ -16,6 +16,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op im
     get_shifted_post_pre_rms_op,
 )
 from vllm_torchtpu.layers.adapter.normalization import rms_norm
+from vllm_torchtpu.tracing.named_scope import scoped
 
 
 def _pre_gates(
@@ -697,6 +698,7 @@ def initialize_mhc_post():
     _post_op = get_mhc_post_op()
 
 
+@scoped("mhc_post")
 def post(x, residual, post_layer_mix, comb_res_mix):
     if residual.device.type == "tpu":
         assert _post_op is not None
@@ -738,6 +740,7 @@ def initialize_flat_collapse():
     )
 
 
+@scoped("mhc_collapse")
 def flat_collapse(x, pre_mix):
     """``collapse`` without XLA's FP32 ``[T, 4, D]`` relayout copy.
 
@@ -769,6 +772,7 @@ def _default_pre_mix(residual: torch.Tensor, dtype: torch.dtype) -> torch.Tensor
     return torch.zeros_like(residual[:, :, 0], dtype=dtype) + first_stream
 
 
+@scoped("mhc_pre")
 def pre(
     residual,
     fn,
@@ -831,6 +835,7 @@ def _residual_mean(residual: torch.Tensor) -> torch.Tensor:
     return (summed * 0.25).to(residual.dtype)
 
 
+@scoped("mhc_post_pre")
 def shifted_post_pre(
     x,
     residual,
