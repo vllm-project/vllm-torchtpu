@@ -45,6 +45,7 @@ _V2A_SP_PATCHED = "_tpu_v2a_sp_patched"
 _PERTURBATION_SYM_PATCHED = "_tpu_perturbation_sym_patched"
 _LTX2_COMPILE_PATCHED = "_tpu_ltx2_compile_patched"
 _TPU_DIFFUSION_COMPILE_PATCHED = "_tpu_diffusion_compile_patched"
+_MXU_GATE_PATCHED = "_tpu_ltx2_mxu_gate_patched"
 _ROPE_KEYS = frozenset(
     {
         "video_rotary_emb",
@@ -60,6 +61,197 @@ _MAX_COMPILED_ROPE_CACHE_ENTRIES = 16
 
 def _funcol_all_to_all_single(send_buf: torch.Tensor, group: Any) -> torch.Tensor:
     return funcol.all_to_all_single(send_buf, None, None, group)
+
+
+def _build_gate_expand_matrix(
+    heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    cols = torch.arange(heads * head_dim, device=device) // head_dim
+    rows = torch.arange(heads, device=device).unsqueeze(1)
+    return (rows == cols.unsqueeze(0)).to(dtype=dtype)
+
+
+@functools.cache
+def _cached_gate_expand_matrix(
+    heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    # Build on the host (also under a non-host default device) and upload so
+    # the cached matrix is a materialized device buffer from the first eager
+    # call rather than a deferred graph.
+    return _build_gate_expand_matrix(heads, head_dim, dtype, torch.device("cpu")).to(
+        device=device
+    )
+
+
+def _patch_ltx2_mxu_gated_attention() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once vLLM-Omni or TorchTPU/XLA lowers the
+    # per-head gate broadcast in LTX2AudioVideoAttnProcessor.__call__ without
+    # 4D relayout copies.
+    #
+    # Source: Copied from vllm-omni 0.32.0rc1
+    #   (vllm_omni/diffusion/models/ltx2/ltx2_transformer.py::
+    #   LTX2AudioVideoAttnProcessor.__call__), because the gate multiply sits
+    #   between attention / perturbation_mask and to_out, so wrapping cannot
+    #   replace only that expression.
+    # Problem: In LTX-2.3 gated attention,
+    #   (hidden_states.unflatten(2, (attn.heads, attn.head_dim)) *
+    #   gates.unsqueeze(-1)).flatten(2, 3) forces 4D data-formatting relayout
+    #   copies across the gated self- and cross-attention layers in every block.
+    # Fix (differences from upstream vllm-omni 0.32.0rc1):
+    #   - When hidden_states and gates are bfloat16, expand gates from
+    #     (B, T, H) to (B, T, H * D) via a bit-exact (H, H * D) MXU indicator
+    #     matmul (one 1.0 entry per column) and multiply on the 3D
+    #     (B, T, H * D) layout. Non-bfloat16 inputs take the original 4D path.
+    #   - Unwrap tuple returns from attn.to_gate_logits (matching _project_qkv
+    #     and to_out[0]).
+    #   - Mask prep, QKV projection, QK norm, TP RoPE slicing, interleaved and
+    #     split RoPE dispatch, attention call, perturbation_mask, and to_out
+    #     are unchanged from upstream.
+    # Scope:
+    #   - Under tensor parallelism, LTX2Attention.__init__ sets attn.heads to
+    #     the per-rank head count (query_num_heads = total_num_heads // tp) and
+    #     builds to_gate_logits as ColumnParallelLinear(gather_output=False),
+    #     so (attn.heads, attn.head_dim) matches upstream under TP.
+    #   - Inside torch.compile, _build_gate_expand_matrix builds the matrix
+    #     inline on-device for fullgraph=True tracing. Outside compile,
+    #     _cached_gate_expand_matrix builds it on CPU and uploads it once per
+    #     (heads, head_dim, dtype, device).
+    #   - Installed by apply_ltx2_compile_patches (active for both compiled and
+    #     eager LTX-2.3 runs).
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+    from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
+
+    proc_cls = ltx2_transformer.LTX2AudioVideoAttnProcessor
+    if getattr(proc_cls.__call__, _MXU_GATE_PATCHED, False):
+        return
+
+    def _mxu_gated_attn_call(
+        self: Any,
+        attn: Any,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        query_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        key_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        perturbation_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        is_self_attention = encoder_hidden_states is None
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if is_self_attention else encoder_hidden_states.shape
+        )
+
+        attention_mask = self._prepare_attention_mask(
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=attention_mask,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+        )
+
+        gate_logits: torch.Tensor | None = None
+        if attn.to_gate_logits is not None:
+            gate_logits = attn.to_gate_logits(hidden_states)
+            if isinstance(gate_logits, tuple):
+                gate_logits = gate_logits[0]
+
+        if is_self_attention:
+            encoder_hidden_states = hidden_states
+
+        query, key, value = self._project_qkv(
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            is_self_attention=is_self_attention,
+        )
+
+        query = attn.norm_q(query).to(dtype=value.dtype)
+        key = attn.norm_k(key).to(dtype=value.dtype)
+
+        if query_rotary_emb is not None:
+            query_rotary_emb = self._slice_rope_for_tp(query_rotary_emb, attn)
+            if key_rotary_emb is not None:
+                key_rotary_emb = self._slice_rope_for_tp(key_rotary_emb, attn)
+            if attn.rope_type == "interleaved":
+                query = ltx2_transformer.apply_interleaved_rotary_emb(
+                    query, query_rotary_emb
+                )
+                key = ltx2_transformer.apply_interleaved_rotary_emb(
+                    key,
+                    key_rotary_emb if key_rotary_emb is not None else query_rotary_emb,
+                )
+            elif attn.rope_type == "split":
+                query = ltx2_transformer.apply_split_rotary_emb(
+                    query, query_rotary_emb, head_dim=attn.head_dim
+                )
+                key = ltx2_transformer.apply_split_rotary_emb(
+                    key,
+                    key_rotary_emb if key_rotary_emb is not None else query_rotary_emb,
+                    head_dim=attn.head_dim,
+                )
+
+        query = query.to(dtype=value.dtype)
+        key = key.to(dtype=value.dtype)
+
+        query = query.unflatten(2, (attn.heads, attn.head_dim))
+        key = key.unflatten(2, (attn.heads, attn.head_dim))
+        value_heads = value.unflatten(2, (attn.heads, attn.head_dim))
+
+        attn_metadata = (
+            AttentionMetadata(attn_mask=attention_mask)
+            if attention_mask is not None
+            else None
+        )
+        hidden_states = attn.attn(query, key, value_heads, attn_metadata)
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+        if perturbation_mask is not None:
+            hidden_states = hidden_states * perturbation_mask + value * (
+                1 - perturbation_mask
+            )
+
+        if gate_logits is not None:
+            gates = 2.0 * torch.sigmoid(gate_logits)
+            if hidden_states.dtype == torch.bfloat16 and gates.dtype == torch.bfloat16:
+                expand_mat = (
+                    _build_gate_expand_matrix(
+                        attn.heads,
+                        attn.head_dim,
+                        gates.dtype,
+                        hidden_states.device,
+                    )
+                    if torch.compiler.is_compiling()
+                    else _cached_gate_expand_matrix(
+                        attn.heads,
+                        attn.head_dim,
+                        gates.dtype,
+                        hidden_states.device,
+                    )
+                )
+                hidden_states = hidden_states * torch.matmul(gates, expand_mat)
+            else:
+                hidden_states = (
+                    hidden_states.unflatten(2, (attn.heads, attn.head_dim))
+                    * gates.unsqueeze(-1)
+                ).flatten(2, 3)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
+
+    setattr(_mxu_gated_attn_call, _MXU_GATE_PATCHED, True)
+    proc_cls.__call__ = _mxu_gated_attn_call
+    logger.info("Applied TPU patch: MXU channel-expanded LTX-2.3 gated attention.")
 
 
 def _functional_all_to_all_4d(
@@ -690,6 +882,8 @@ def apply_ltx2_compile_patches() -> None:
     ``supports_torch_inductor()``.
     """
     from vllm_omni.diffusion.worker import diffusion_model_runner
+
+    _patch_ltx2_mxu_gated_attention()
 
     orig_enable_offload = diffusion_model_runner.enable_offload_backend
     if getattr(orig_enable_offload, _TPU_DIFFUSION_COMPILE_PATCHED, False):
