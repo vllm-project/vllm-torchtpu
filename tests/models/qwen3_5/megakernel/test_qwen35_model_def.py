@@ -219,7 +219,7 @@ def _independent_qwen35_spec(
     gqa_mod = GQAModule(
         pool_layout=play, prefix="self_attn", qk_norm=True, output_gate=True
     )
-    moe_mod = MoEModule(prefix="mlp", shared_gate=True)
+    moe_mod = MoEModule(geometry=g, prefix="mlp", shared_gate=True)
     if g.att_every == 1:
         mixer = mk.SwitchSlot("mixer", branches=(gqa_mod,), branch_counts=(1,))
     else:
