@@ -134,7 +134,9 @@ def test_dp_draft_decision_includes_ready_peers_and_idle_ranks(peer_needs_draft)
         num_tokens_paddings=[128, 2048],
         _expert_relayout=None,
         _dp_step_index=0,
+        _dp_step_reduce=False,  # a multi-host group: the gloo all-reduce
     )
+    runner._dp_step_max = lambda t, g: TPUModelRunner._dp_step_max(runner, t, g)
 
     def reduce(tensor, **kwargs):
         assert tensor.tolist() == [0] * 10
@@ -171,7 +173,9 @@ def test_dp_step_carries_the_relayout_fields_and_calls_the_controller():
         _expert_relayout=Controller(),
         _dp_step_index=41,
         max_num_reqs=1,
+        _dp_step_reduce=False,
     )
+    runner._dp_step_max = lambda t, g: TPUModelRunner._dp_step_max(runner, t, g)
 
     def reduce(tensor, **kwargs):
         assert tensor.tolist()[5:] == [0x5A5A, -0x5A5A, -3, 0, 0]
@@ -185,6 +189,30 @@ def test_dp_step_carries_the_relayout_fields_and_calls_the_controller():
         TPUModelRunner._dp_coordinated_step(runner, 0, 0)
     assert runner._dp_step_index == 42
     assert seen == [(42, (0x5A5A, -0x5A5A, -2), "decode")]
+
+
+@pytest.mark.parametrize("one_host", [True, False])
+def test_dp_step_max_reduces_through_shared_memory_on_one_host(one_host):
+    runner = SimpleNamespace(_dp_step_reduce=None)
+    t = torch.tensor([3, -3], dtype=torch.int64)
+    host_reduce = MagicMock(return_value=torch.tensor([5, -1]))
+    with (
+        patch(
+            "vllm_torchtpu.distributed.host_allreduce.usable",
+            return_value=one_host,
+        ),
+        patch(
+            "vllm_torchtpu.distributed.host_allreduce.HostMaxAllReduce",
+            return_value=host_reduce,
+        ) as make,
+        patch.object(torch.distributed, "all_reduce") as gloo,
+        patch.object(torch.distributed, "get_world_size", return_value=8),
+    ):
+        for _ in range(2):
+            TPUModelRunner._dp_step_max(runner, t, "cpu-group")
+    assert make.call_count == int(one_host)
+    assert host_reduce.call_count == 2 * int(one_host)
+    assert gloo.call_count == 2 * int(not one_host)
 
 
 def test_non_lockstep_partial_prefill_skips_proposals():

@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -166,6 +166,8 @@ from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+
+    from vllm_torchtpu.distributed.host_allreduce import HostMaxAllReduce
 
 
 @dataclass
@@ -769,6 +771,9 @@ class TPUModelRunner(GPUModelRunner):
         # identical on every rank) and the dynamic expert re-layout
         # controller the worker arms after warm-up (expert_relayout.py).
         self._dp_step_index: int = 0
+        # Decided on the first step (_dp_step_max): the shared-memory reducer,
+        # or False to keep the gloo all-reduce.
+        self._dp_step_reduce: HostMaxAllReduce | Literal[False] | None = None
         self._expert_relayout: Any = None
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
@@ -3585,6 +3590,40 @@ class TPUModelRunner(GPUModelRunner):
                 return True
         return False
 
+    def _dp_step_max(
+        self, t: torch.Tensor, cpu_group: torch.distributed.ProcessGroup
+    ) -> torch.Tensor:
+        """Element-wise max of `t` over the DP group, once per step.
+
+        A one-host group reduces through shared memory: a gloo all-reduce over
+        8 ranks costs ~1 ms of loopback round trips on every rank's serving
+        thread, on the path to the step's first device program.
+        """
+        if self._dp_step_reduce is None:
+            from torch.distributed.constants import default_pg_timeout
+
+            from vllm_torchtpu.distributed import host_allreduce
+
+            use_shm = host_allreduce.usable(cpu_group)
+            self._dp_step_reduce = (
+                host_allreduce.HostMaxAllReduce(
+                    cpu_group, t.numel(), default_pg_timeout.total_seconds()
+                )
+                if use_shm
+                else False
+            )
+            logger.info_once(
+                "DP step metadata all-reduce over %d ranks: %s",
+                torch.distributed.get_world_size(cpu_group),
+                "shared memory" if use_shm else "gloo (ranks not on one x86 host)",
+            )
+        if self._dp_step_reduce is False:
+            torch.distributed.all_reduce(
+                t, op=torch.distributed.ReduceOp.MAX, group=cpu_group
+            )
+            return t
+        return self._dp_step_reduce(t)
+
     def _dp_coordinated_step(
         self,
         local_num_tokens: int,
@@ -3628,9 +3667,7 @@ class TPUModelRunner(GPUModelRunner):
             dtype=torch.int64,
             device="cpu",
         )
-        torch.distributed.all_reduce(
-            t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
-        )
+        t = self._dp_step_max(t, get_dp_group().cpu_group)
         self._dp_step_index += 1
         bucket = _get_padded_token_len(self.num_tokens_paddings, int(t[0].item()))
         if controller is not None:
