@@ -353,6 +353,7 @@ if TYPE_CHECKING:
     TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS: int = 256
     TPU_PREFILL_SEQ_PARALLEL_EP: bool = False
     TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: bool = False
+    TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_GATHER: bool = False
     TPU_MOE_PREFILL_GATHER_ONCE: bool = False
     TPU_MOE_PREFILL_ROTATED_COLLECTIVES: bool = False
     TPU_MOE_PREFILL_COMBINE_SCATTER: bool = False
@@ -2592,6 +2593,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the rotated kernel on every 2x2x2 slice, with TPU_PREFILL_SEQ_PARALLEL_EP.
     "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER": env_bool(
         "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER"
+    ),
+    # TPU_PREFILL_SEQ_PARALLEL_EP on a 2x2x2 slice of 2-core chips: the split
+    # EP MoE op gathers each combine chunk's rows and routes with the rotated
+    # halving-doubling all-gather (kernels/experimental/rotated_collectives.py)
+    # on the TensorCores, one kernel each, instead of XLA's ring all-gathers.
+    # A gather copies: the same values. Other meshes log a warning and keep
+    # XLA's. Migration switch: delete it, taking the rotated kernel on every
+    # 2x2x2 slice, with TPU_PREFILL_SEQ_PARALLEL_EP.
+    "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_GATHER": env_bool(
+        "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_GATHER"
     ),
     # TPU_PREFILL_SEQ_PARALLEL: the split MoE op all-gathers each core's rows
     # once, in core order, instead of once per combine chunk: the routes, their

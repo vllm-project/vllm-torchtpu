@@ -1689,6 +1689,51 @@ def rotated_scatter_rows(x, rank, table, axis_name):
     )
 
 
+def rotated_gather_rows(x, rank, table, axis_name):
+    """`gather_rows` of x [rows, h] bf16 as one rotated_collectives all-gather
+    per combine chunk on the TensorCore, with `table` (peer_table
+    "all_gather") and `rank` (this core's mesh index, int32 [1]); the same
+    rows, copied. Another dtype, or a chunk shape the kernel does not take,
+    keeps gather_rows."""
+    chunk = x.shape[0] // token_chunks(x.shape[0] * lax.axis_size(axis_name))
+    if x.dtype != jnp.bfloat16 or not rotated_collectives.all_gather_supports(
+        chunk, x.shape[1]
+    ):
+        return gather_rows(x, axis_name)
+    return rotated_collectives.all_gather_chunks(
+        x, rank, jnp.asarray(table), axis=axis_name, chunk=chunk
+    )
+
+
+def rotated_gather_words(w, rank, table, axis_name):
+    """`gather_rows` of int32 words w [rows, k] as one rotated_collectives
+    all-gather per combine chunk. The kernel takes whole 16-row tiles of at
+    least one 128-lane tile per part, so each chunk's words are laid out as
+    rows of 128 lanes, padded with zero words to a multiple of 16 rows and
+    with zero columns to the kernel's narrowest width; the receiver drops the
+    padding. The same words, copied."""
+    ranks = lax.axis_size(axis_name)
+    chunk = w.shape[0] // token_chunks(w.shape[0] * ranks)
+    words = chunk * w.shape[1]
+    lanes = rotated_collectives.LANES
+    tile = 16 * lanes
+    packed_rows = -(-words // tile) * 16
+    width = len(rotated_collectives.ROTATIONS) * lanes
+    table = jnp.asarray(table)
+
+    def call(c):
+        flat = jnp.pad(c.reshape(-1), (0, packed_rows * lanes - words))
+        packed = jnp.pad(flat.reshape(packed_rows, lanes), ((0, 0), (0, width - lanes)))
+        (out,) = rotated_collectives.all_gather_many(
+            (packed,), rank, table, axis=axis_name
+        )
+        out = out[:, :lanes].reshape(ranks, packed_rows * lanes)[:, :words]
+        return out.reshape(ranks * chunk, w.shape[1])
+
+    outs = [call(w[c * chunk : (c + 1) * chunk]) for c in range(w.shape[0] // chunk)]
+    return outs[0] if len(outs) == 1 else jnp.concatenate(outs, 0)
+
+
 def combine(
     slab,
     slab_row,

@@ -74,6 +74,8 @@ from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kern
     gather_routes,
     gather_rows,
     own_rows,
+    rotated_gather_rows,
+    rotated_gather_words,
     rotated_scatter_rows,
     scatter_rows,
 )
@@ -129,8 +131,8 @@ _E0_BUFFERS: dict[tuple[str, int], torch.Tensor] = {}
 # TPU_MOE_PREFILL_ROTATED_COLLECTIVES: (chip coords, core on chip) per mesh
 # index of each op mesh the rotated collectives run over (None: XLA's).
 _ROTATED_PLACES: dict[Any, list | None] = {}
-# TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: the same per EP op mesh, found
-# by arm_token_split_op (None: XLA's reduce-scatter).
+# TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER and _GATHER: the same per EP op
+# mesh, found by arm_token_split_op (None: XLA's reduce-scatter and gathers).
 _EP_SCATTER_PLACES: dict[Any, list | None] = {}
 _SELFTEST_DONE = False
 
@@ -708,7 +710,9 @@ def _split_body(statics: _OpStatics, n_ranks: int, axis: str, rotated=None):
     return body
 
 
-def _ep_split_body(statics: _OpStatics, n_ranks: int, axis: str, rs_table=None):
+def _ep_split_body(
+    statics: _OpStatics, n_ranks: int, axis: str, rs_table=None, ag_table=None
+):
     """The op's per-rank body for TPU_PREFILL_SEQ_PARALLEL_EP on an
     expert-parallel layer: x and scores hold this core's rows of the step
     (`own_rows`), and so does the output. Each core routes its own rows; the
@@ -720,7 +724,10 @@ def _ep_split_body(statics: _OpStatics, n_ranks: int, axis: str, rs_table=None):
     (TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER): the rotated reduce-scatter's
     peer table over the op's mesh, numpy int32; the reduce-scatter then runs as
     one rotated kernel per combine chunk, the core's mesh index from `rank`,
-    and a shape the kernel does not take keeps XLA's."""
+    and a shape the kernel does not take keeps XLA's. `ag_table`
+    (TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_GATHER): the rotated all-gather's
+    peer table; the rows and the routes are then gathered by the rotated
+    kernel, one call each per combine chunk, the same values copied."""
 
     def body(
         x,
@@ -745,11 +752,15 @@ def _ep_split_body(statics: _OpStatics, n_ranks: int, axis: str, rs_table=None):
         is_pad = own_rows(pad_mask[:n], rank.reshape(()), n_ranks)
         w, ids = _route(x, scores, bias, is_pad, statics)
         topk = ids.shape[1]
-        routes = gather_rows(
-            jnp.concatenate([ids.astype(jnp.int32), _as_words(w)], 1), axis
-        )
+        words = jnp.concatenate([ids.astype(jnp.int32), _as_words(w)], 1)
+        if ag_table is not None:
+            routes = rotated_gather_words(words, rank.reshape(1), ag_table, axis)
+            rows = rotated_gather_rows(x, rank.reshape(1), ag_table, axis)
+        else:
+            routes = gather_rows(words, axis)
+            rows = gather_rows(x, axis)
         partial = _routed_partial(
-            gather_rows(x, axis),
+            rows,
             _from_words(routes[:, topk:], w.dtype),
             routes[:, :topk],
             w13,
@@ -788,11 +799,16 @@ def _get_op(mesh, statics: _OpStatics, prequant: bool = False, split: bool = Fal
         assert not prequant
         places = _EP_SCATTER_PLACES.get(mesh)
         rs_table = (
-            None
-            if places is None
-            else rotated_collectives.peer_table(places, "reduce_scatter")
+            rotated_collectives.peer_table(places, "reduce_scatter")
+            if places is not None and envs.TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER
+            else None
         )
-        body = _ep_split_body(statics, int(mesh.size), axis, rs_table)
+        ag_table = (
+            rotated_collectives.peer_table(places, "all_gather")
+            if places is not None and envs.TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_GATHER
+            else None
+        )
+        body = _ep_split_body(statics, int(mesh.size), axis, rs_table, ag_table)
     elif split:
         body = _split_body(statics, int(mesh.size), axis, _rotated_tables(mesh))
     else:
@@ -995,21 +1011,21 @@ def _rotated_places(topo: _Topology) -> list | None:
 
 
 def _ep_scatter_places(mesh) -> list | None:
-    """TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: the EP op mesh's chip
-    places over the EP group, as prefill_token_split finds them for
+    """TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER or _GATHER: the EP op mesh's
+    chip places over the EP group, as prefill_token_split finds them for
     TPU_PREFILL_ROTATED_COLLECTIVES (small_all_reduce_op.rotated_places), or
-    None and XLA's reduce-scatter."""
+    None and XLA's reduce-scatter and gathers."""
     if (index := ep_mesh_index()) is None:
         logger.warning(
-            "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: there is no EP group; "
-            "XLA's collectives"
+            "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER/_GATHER: there is no EP "
+            "group; XLA's collectives"
         )
         return None
     return small_all_reduce_op.rotated_places(
         mesh,
         index,
-        "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER",
-        "the split EP MoE's reduce-scatters",
+        "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER/_GATHER",
+        "the split EP MoE's reduce-scatter or gathers",
     )
 
 
@@ -1268,10 +1284,14 @@ def arm_token_split_op(layer: Any, slot: Any) -> tuple[Any, int, torch.Tensor] |
     stage-A prefill kernel (FUSED_MOE_PREFILL_KERNEL_V2). An expert-parallel
     layer arms under TPU_PREFILL_SEQ_PARALLEL_EP, above the kernel's largest
     token count, where its op runs the EP path; with
-    TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER the first such layer finds
-    its mesh's chip places (collective) for the rotated reduce-scatter
-    (prefill_token_split.check_env checks the switches at platform
-    activation)."""
+    TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER or _GATHER the first such
+    layer finds its mesh's chip places (collective) for the rotated
+    reduce-scatter or gathers (prefill_token_split.check_env checks the
+    switches at platform activation)."""
+    rotated_ep = (
+        envs.TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER
+        or envs.TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_GATHER
+    )
     op = getattr(layer.quant_method, _OP_ATTR, None)
     if op is None:
         return None
@@ -1282,10 +1302,7 @@ def arm_token_split_op(layer: Any, slot: Any) -> tuple[Any, int, torch.Tensor] |
     if statics.use_ep:
         if not envs.TPU_PREFILL_SEQ_PARALLEL_EP:
             return None
-        if (
-            envs.TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER
-            and mesh not in _EP_SCATTER_PLACES
-        ):
+        if rotated_ep and mesh not in _EP_SCATTER_PLACES:
             _EP_SCATTER_PLACES[mesh] = _ep_scatter_places(mesh)
         setattr(layer.quant_method, _OP_SPLIT_ATTR, _get_op(mesh, statics, split=True))
         setattr(layer, TOKEN_SPLIT_MOE_ATTR, slot)

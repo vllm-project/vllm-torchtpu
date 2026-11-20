@@ -326,20 +326,22 @@ def test_flag_off_keeps_the_stock_rmsnorm():
 
 
 @pytest.mark.parametrize(
-    ("split", "ep", "rotated", "error"),
+    ("split", "ep", "scatter", "gather", "error"),
     [
-        (False, False, False, None),
-        (True, True, True, None),
-        (True, False, True, "ROTATED_SCATTER needs TPU_PREFILL_SEQ_PARALLEL_EP=1"),
-        (False, True, False, "_EP needs TPU_PREFILL_SEQ_PARALLEL=1"),
+        (False, False, False, False, None),
+        (True, True, True, True, None),
+        (True, False, True, False, "SCATTER needs TPU_PREFILL_SEQ_PARALLEL_EP=1"),
+        (True, False, False, True, "GATHER needs TPU_PREFILL_SEQ_PARALLEL_EP=1"),
+        (False, True, False, False, "_EP needs TPU_PREFILL_SEQ_PARALLEL=1"),
     ],
 )
-def test_ep_switches_need_the_split(monkeypatch, split, ep, rotated, error):
+def test_ep_switches_need_the_split(monkeypatch, split, ep, scatter, gather, error):
     """A switch set without the one it builds on fails at platform activation,
     before the forward is patched."""
     monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL", split)
     monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP", ep)
-    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER", rotated)
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER", scatter)
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_GATHER", gather)
     if error is None:
         prefill_token_split.check_env()
         return

@@ -57,6 +57,7 @@ from vllm_torchtpu.kernels.experimental import rotated_collectives
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
     gather_rows,
     own_rows,
+    rotated_gather_rows,
     rotated_scatter_rows,
     scatter_rows,
     token_chunks,
@@ -104,17 +105,6 @@ def token_fn(mesh, kind: str):
     return fn, specs, rows
 
 
-def _rotated_gather(x, rank, table, axis, ranks):
-    """This core's rows x of every core, one rotated all-gather per combine
-    chunk; a shape the kernel does not take keeps XLA's all-gather."""
-    chunk = x.shape[0] // token_chunks(x.shape[0] * ranks)
-    if not rotated_collectives.all_gather_supports(chunk, x.shape[1]):
-        return gather_rows(x, axis)
-    return rotated_collectives.all_gather_chunks(
-        x, rank, jnp.asarray(table), axis=axis, chunk=chunk
-    )
-
-
 def rotated_fn(mesh, kind: str, places):
     """The JAX function of the rotated `kind` ("scatter" or "gather") over the
     MoE op's mesh: (x, rank) with the core's mesh index as data, one kernel
@@ -130,7 +120,7 @@ def rotated_fn(mesh, kind: str, places):
         return rotated_scatter_rows(x, rank, table, axis)
 
     def gather(x, rank):
-        return _rotated_gather(x, rank, table, axis, ranks)
+        return rotated_gather_rows(x, rank, table, axis)
 
     local, rows = {
         "scatter": (scatter, lambda n: n // ranks),
@@ -206,7 +196,7 @@ def quantized_gather_fn(mesh, places, projections: int = 1):
             rotated_collectives.all_gather_supports(chunk, width, weights[0][0].dtype)
             and rotated_collectives.all_gather_supports(chunk, block_width)
         ):
-            block = _rotated_gather(padded([q, rest], rows), rank, table, axis, ranks)
+            block = rotated_gather_rows(padded([q, rest], rows), rank, table, axis)
             return (
                 *(
                     xla_quantized_matmul(block[:, :width], w_q, w_s)
@@ -622,14 +612,15 @@ def _model_forward(
 
 def check_env() -> None:
     """The expert-parallel split switches' prerequisites; raises."""
-    if (
-        envs.TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER
-        and not envs.TPU_PREFILL_SEQ_PARALLEL_EP
-    ):
-        raise ValueError(
-            "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER needs "
-            "TPU_PREFILL_SEQ_PARALLEL_EP=1"
-        )
+    for switch in ("ROTATED_SCATTER", "ROTATED_GATHER"):
+        if (
+            getattr(envs, f"TPU_PREFILL_SEQ_PARALLEL_EP_{switch}")
+            and not envs.TPU_PREFILL_SEQ_PARALLEL_EP
+        ):
+            raise ValueError(
+                f"TPU_PREFILL_SEQ_PARALLEL_EP_{switch} needs "
+                "TPU_PREFILL_SEQ_PARALLEL_EP=1"
+            )
     if envs.TPU_PREFILL_SEQ_PARALLEL_EP and not envs.TPU_PREFILL_SEQ_PARALLEL:
         raise ValueError("TPU_PREFILL_SEQ_PARALLEL_EP needs TPU_PREFILL_SEQ_PARALLEL=1")
 
