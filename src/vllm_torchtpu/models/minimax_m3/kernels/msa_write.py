@@ -298,7 +298,8 @@ def write_runs(
 
     A `Rows` target's data slots past each run's last token are zeroed: the
     8-bit decode attention (`msa_attention_lse._kernel`) multiplies a page's
-    unseen values by p = 0 unmasked, so no slot it reads may hold NaN bytes.
+    unseen values by p = 0 unmasked, and its prefill tiles (`DIRECT_T`) feed
+    the keys to the MXU unmasked, so no slot they read may hold NaN bytes.
     Any other writer of these caches must keep that invariant.
 
     The caches share the page geometry (same pages, slots per page). Tokens

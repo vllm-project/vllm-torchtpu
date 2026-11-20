@@ -87,8 +87,9 @@ KERNEL_LIMITS = True
 FP4_TRANSPOSED = True
 # `attend_t` feeds 8-bit pages to the MXU as stored (a bf16 x fp8 dot is
 # exact): no per-page widening on the VPU; the token mask rides as fp8
-# columns of -_FP8_MASK beside the keys (scores are log2 units below 83, so
-# exp2 of a masked one is 0).
+# columns of -_FP8_MASK beside the keys (`MAX_FREE` scores stay below
+# _MAX_FREE_SCORE_BOUND * log2(e) ~ 108 in log2 units, so exp2 of a masked one
+# is 0). It relies on `msa_write` zeroing the slots past a page's newest token.
 DIRECT_T = True
 _FP8_MASK = 448.0  # e4m3fn's largest magnitude
 _LOG2_E = math.log2(math.e)
@@ -1317,7 +1318,9 @@ def _chunked_call(
             q = q.transpose(1, 0, 2)
         num_q_heads, num_tokens, _ = q.shape
     num_heads = selected.shape[1]
-    if num_tokens == 0 and not isinstance(q, tuple):
+    if num_tokens == 0 and isinstance(q, tuple):
+        raise ValueError("a query pair needs tokens")
+    if num_tokens == 0:
         if head_major:
             return q, jnp.zeros((num_q_heads, 0), jnp.float32)
         return q.transpose(1, 0, 2), jnp.zeros((0, num_q_heads), jnp.float32)
@@ -1432,7 +1435,9 @@ def _chunk_work(selected, num_q_heads, dtype, block_q, pages_per_step, fp4=False
         pages_per_step,
         align=_merged_store_rows(block_q, num_q_heads // num_heads, dtype),
         most=PREFILL_TILES_PER_STEP_4BIT
-        if fp4 and num_tokens > msa_attention.SMALL_BATCH_TOKENS
+        if fp4
+        and block_q < msa_attention.DEFAULT_BLOCK_Q
+        and num_tokens > msa_attention.SMALL_BATCH_TOKENS
         else None,
     )
     return step, num_chunks, pad, selected, packed

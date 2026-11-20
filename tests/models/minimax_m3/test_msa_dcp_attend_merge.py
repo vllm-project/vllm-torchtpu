@@ -148,7 +148,7 @@ def _spmd(q, kvs, scs, cands, meta, fp4):
     [
         ([8, 8, 200, 100], [3000, 5000, 8800, 3900], 320),  # mixed, padded tail
         ([8, 8], [3000, 5000], 16),  # decode
-        ([8, 1100], [3000, 2900], 1152),  # prefill-sized: permutes, all-to-all
+        ([8, 1100], [3000, 2900], 1152),  # prefill-sized: query pair, permutes
     ],
 )
 def test_attend_and_merge_matches_dcp_reference(q_lens, ctx_lens, num_tokens, fp4):

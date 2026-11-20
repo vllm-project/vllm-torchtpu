@@ -999,8 +999,9 @@ def msa_attend_dcp(
     rank's candidates. Returns
     the partial head-major, as the kernel writes it, ``(out [G * Hg, T, D],
     lse [G * Hg, T] f32)``: the LSE merge reduce-scatters heads along the
-    leading axis (`ops.msa.merge_head_partials`), or the merge's all-to-all
-    sends each rank its block (`attend_and_merge`).
+    leading axis (`ops.msa.merge_head_partials`), or `attend_and_merge`
+    sends each rank its block (a pair: a permute of the peer's heads).
+    ``q`` may be a pair of head-major arrays holding the heads in order.
     """
     num_tokens = jax.tree.leaves(q)[0].shape[1 if q_head_major else 0]
     rank = rank_array(rank)[0]
@@ -1269,7 +1270,7 @@ def merge_split_partials(
         out_shape=jax.ShapeDtypeStruct((num_tokens, num_heads * head_dim), out.dtype),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         interpret=interpret,
-        name="minimax_m3_msa_dcp_merge_pair_partials",
+        name="minimax_m3_msa_dcp_merge_split_partials",
     )(
         lse.astype(jnp.float32),
         peer_lse.astype(jnp.float32),
@@ -1508,23 +1509,31 @@ def attend_and_merge(
     `scale_cache` and `hadamard`) and packed ``candidates [T, 2 * topk]`` ->
     its heads' merged output ``[T, Hl * D]``.
 
-    A prefill-sized step all-gathers the query heads and candidates (a pair
-    swaps them by permutes), runs
+    A prefill-sized step all-gathers the query heads and candidates, runs
     `msa_attend_dcp` over the group's heads, and sends each rank's head block
     of the partial and its LSEs to their owner by all-to-all for
     `merge_partials`. As XLA collectives in one program they move the
     head-major buffers as laid out; torch's all-to-all of them cost ~890 us
-    per layer at 8K tokens (c4 twin, j-c60806bf). A decode-sized step of a
+    per layer at 8K tokens (c4 twin, j-c60806bf). A pair (`SPLIT_PAIR_QUERIES`)
+    swaps the queries by a permute, attends the two halves in place, and
+    permutes back the peer's heads' partials (`merge_split_partials`). A
+    decode-sized step of a
     pair swaps own and peer halves by permutes instead (`_swap_with_row`),
     and the shortest of them plan inside the attention kernel
     (`_attend_pair_decode`)."""
     num_heads, num_tokens, head_dim = q.shape
     rank = rank_array(rank)[0]
-    # Decode-sized operands of a pair move by permutes (latency); a prefill
-    # step's partials by XLA's all-to-all, which writes them in place. The
+    # Decode-sized operands of a pair move by permutes (latency), and its
     # candidates' bits ride the query permute as one more 16-bit head row.
     small = dcp == 2 and num_tokens <= DCP_SMALL_BATCH_TOKENS and 4 * topk <= head_dim
-    pair = dcp == 2 and not small and SPLIT_PAIR_QUERIES
+    # (8-row LSE blocks of the merge; a 0-token step keeps the plain path.)
+    pair = (
+        dcp == 2
+        and not small
+        and SPLIT_PAIR_QUERIES
+        and num_heads % 8 == 0
+        and num_tokens > 0
+    )
     if small:
         # Own heads and candidates first, the peer's second: every slice is
         # static (rank-indexed updates and slices of the permute buffers were
