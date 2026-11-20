@@ -16,9 +16,10 @@
 The window holds the fetched cache tokens from lane 0 and the fetched new
 tokens from the next 128-lane boundary. Every other lane is undefined here
 (all bits set, an fp8, bf16 and f32 NaN). The prefill stitch writes the whole
-block: cached lanes, then the new tokens, then zeros. The decode stitch writes
-only the columns that hold the stitch boundary: the lanes before it, the new
-tokens, then zeros.
+block: cached lanes, then the new tokens, then zeros when V is not masked on
+load (`mask_invalid_v` off). With V masked it leaves the lanes past the valid
+tokens as the roll fills them. The decode stitch writes only the columns that
+hold the stitch boundary: the lanes before it, the new tokens, then zeros.
 """
 
 import jax
@@ -94,13 +95,8 @@ def _window(cfgs, cache, new, new_tok_offset):
 _CASES = [(300, 40, 17), (256, 64, 0), (43, 150, 100), (300, 0, 0), (0, 0, 0)]
 
 
-@pytest.mark.parametrize(("cache", "new", "offset"), _CASES)
-@pytest.mark.parametrize("mask_invalid_v", [False, True])
-def test_prefill_stitch_zeroes_every_lane_past_the_valid_tokens(
-    cache, new, offset, mask_invalid_v
-):
-    """With V masked on load the lanes past the valid tokens are left as the
-    roll fills them; only the valid lanes are checked then."""
+def _prefill_stitch(mask_invalid_v, cache, new, offset):
+    """The prefill stitch's block for one window, and the expected block."""
     cfgs = _cfgs(bq_sz=256, bkv_sz=512, mask_invalid_v=mask_invalid_v)
     window, cache_end, want = _window(cfgs, cache, new, offset)
 
@@ -114,8 +110,21 @@ def test_prefill_stitch_zeroes_every_lane_past_the_valid_tokens(
         jnp.asarray(window), jnp.int32(cache), jnp.int32(cache_end), offset, new
     )
     got = np.asarray(got).reshape(window.shape[0], cfgs.bkv_sz)
-    checked = cfgs.bkv_sz if not mask_invalid_v else cache + new
-    np.testing.assert_array_equal(got[:, :checked], want[:, :checked])
+    return got, want[:, : cfgs.bkv_sz]
+
+
+@pytest.mark.parametrize(("cache", "new", "offset"), _CASES)
+def test_prefill_stitch_zeroes_every_lane_past_the_valid_tokens(cache, new, offset):
+    got, want = _prefill_stitch(False, cache, new, offset)
+    np.testing.assert_array_equal(got, want)
+
+
+@pytest.mark.parametrize(("cache", "new", "offset"), _CASES)
+def test_prefill_stitch_with_v_masked_places_the_valid_tokens(cache, new, offset):
+    """With V masked on load the lanes past the valid tokens keep what the
+    roll brings in, so only the cached and new-token lanes are checked."""
+    got, want = _prefill_stitch(True, cache, new, offset)
+    np.testing.assert_array_equal(got[:, : cache + new], want[:, : cache + new])
 
 
 @pytest.mark.parametrize("bq_sz", [1, 4])
