@@ -69,6 +69,9 @@ def patched(monkeypatch, upstream):
     monkeypatch.setattr(
         InputProcessor, "_tpu_skip_tokenizer_id_range_check", False, raising=False
     )
+    monkeypatch.setattr(
+        input_range_check, "TOKENIZER_OUTPUTS", input_range_check.TokenizerOutputs()
+    )
     monkeypatch.setenv("VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK", "1")
     input_range_check.patch_skip_tokenizer_id_range_check()
 

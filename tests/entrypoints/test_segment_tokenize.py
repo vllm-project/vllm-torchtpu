@@ -180,9 +180,7 @@ def test_prefix_reuse_skips_an_end_an_added_token_can_cross(monkeypatch):
     assert seg.encode_reusing(second) == (want, 1)
 
     unchecked = SegmentTokenizer(tok, max_cached_tokens=10_000, max_prompts=8)
-    monkeypatch.setattr(
-        unchecked._recent, "_split_ends_at", lambda prompt, token: True, raising=False
-    )
+    monkeypatch.setattr(unchecked._recent, "_split_ends_at", lambda prompt, token: True)
     unchecked.encode(first)
     assert unchecked.encode(second) != want
 
