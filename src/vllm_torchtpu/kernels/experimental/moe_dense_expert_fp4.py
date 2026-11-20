@@ -56,6 +56,14 @@ _SWIGLU_LIMIT = 7.0
 _SWIGLU_ALPHA = 1.703125
 # VMEM for the kernel's small operands.
 _VMEM_HEADROOM = 1 << 20
+# `_vmem_limit_bytes` at decode sizes: token scratch plus compiler temporaries
+# per token element, and a margin. tpu7x AOT compiles (libtpu 0.0.50) of the
+# MiniMax-M3 EP8 call (h 6144, i 3072, shared 384) need 50.3 MiB at 16 rows
+# and 52.7 MiB at 32; XLA keeps the call's neighbours in VMEM only with
+# limits up to ~53.7 MiB.
+_CALIBRATED_ROWS = 32
+_CALIBRATED_TOKEN_BYTES = 24
+_CALIBRATED_MARGIN = 256 << 10
 
 
 class SharedExpert(NamedTuple):
@@ -154,16 +162,35 @@ def can_use_dense_expert_fp4(
     )
 
 
-def _vmem_bytes(m: int, h: int, chunk: int, i_s: int) -> int:
-    """VMEM of one call: the weight ring (VMEM holds fp4 one byte per
-    element), its scales, the shared expert's weights, the token-sized scratch
-    and the compiler's token-sized temporaries (~16 bytes per element,
-    measured with tpu7x AOT compiles at 16 and 64 rows)."""
+def _vmem_limit_bytes(m: int, h: int, chunk: int, i_s: int, vmem_capacity: int) -> int:
+    """The call's VMEM limit. VMEM it reserves cannot hold the activations live
+    across it (the residual stream, its operands and output): XLA spills them
+    to HBM, and each op that reads or writes one pays an HBM round trip. At up
+    to _CALIBRATED_ROWS rows the limit is the measured need (the token
+    temporaries at _CALIBRATED_TOKEN_BYTES, not `_vmem_bytes`'s budget);
+    larger calls keep the whole of VMEM."""
+    mp = m + (-m % _ROW_ALIGN)
+    if mp > _CALIBRATED_ROWS:
+        return vmem_capacity
+    need = _weight_vmem_bytes(h, chunk, i_s) + mp * h * _CALIBRATED_TOKEN_BYTES
+    return min(vmem_capacity, need + _CALIBRATED_MARGIN)
+
+
+def _weight_vmem_bytes(h: int, chunk: int, i_s: int) -> int:
+    """The weight ring (VMEM holds fp4 one byte per element), its scales and
+    the shared expert's weights."""
     weights = 3 * h * chunk
     scales = (2 * (h // _QUANT_BLOCK) * chunk + (chunk // _QUANT_BLOCK) * h) * 4
+    return _NUM_BUFFERS * (weights + scales) + 3 * h * i_s
+
+
+def _vmem_bytes(m: int, h: int, chunk: int, i_s: int) -> int:
+    """VMEM of one call: `_weight_vmem_bytes`, the token-sized scratch and the
+    compiler's token-sized temporaries (~16 bytes per element, measured with
+    tpu7x AOT compiles at 16 and 64 rows)."""
     mp = m + (-m % _ROW_ALIGN)
     tokens = mp * h * (2 + 4 + 4 + 2 + (2 if i_s else 0) + 16)
-    return _NUM_BUFFERS * (weights + scales) + 3 * h * i_s + tokens
+    return _weight_vmem_bytes(h, chunk, i_s) + tokens
 
 
 def _kernel(
@@ -491,7 +518,11 @@ def dense_expert_moe_fp4(
                 *shared_scratch,
             ],
         ),
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=info.vmem_capacity_bytes),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=_vmem_limit_bytes(
+                mk, h, chunk, i_s, info.vmem_capacity_bytes
+            )
+        ),
         name=f"dense_expert_moe_fp4-e_{experts}-m_{mp}-h_{h}-i_{i}-c_{chunk}"
         + (f"-s_{i_s}" if i_s else ""),
     )(

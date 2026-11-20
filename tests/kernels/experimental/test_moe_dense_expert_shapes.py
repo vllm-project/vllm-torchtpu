@@ -389,6 +389,24 @@ def test_fp4_chunk_fits_minimax_m3_ep8_buffers_in_tpu7x_vmem(m, i_s, expected):
     assert moe_dense_expert_fp4._chunk(m, 6144, 3072, i_s, 64 << 20) == expected
 
 
+@pytest.mark.parametrize("m, limit", [(8, 53493760), (16, 53493760), (32, 55853056)])
+def test_fp4_vmem_limit_leaves_vmem_for_the_neighbours(m, limit):
+    # tpu7x AOT compiles at these limits fit, and keep the call's operands and
+    # output in VMEM; 54 MiB and up put them in HBM.
+    chunk = moe_dense_expert_fp4._chunk(m, 6144, 3072, 384, 64 << 20)
+    assert (
+        moe_dense_expert_fp4._vmem_limit_bytes(m, 6144, chunk, 384, 64 << 20) == limit
+    )
+    assert limit < 54 << 20
+
+
+def test_fp4_vmem_limit_keeps_all_of_vmem_above_the_calibrated_rows():
+    chunk = moe_dense_expert_fp4._chunk(48, 6144, 3072, 384, 64 << 20)
+    assert moe_dense_expert_fp4._vmem_limit_bytes(48, 6144, chunk, 384, 64 << 20) == (
+        64 << 20
+    )
+
+
 def test_fp4_shared_alpha_is_the_bf16_rounding_of_1_702():
     alpha = moe_dense_expert_fp4._SWIGLU_ALPHA
     assert alpha == float(jnp.bfloat16(1.702))
