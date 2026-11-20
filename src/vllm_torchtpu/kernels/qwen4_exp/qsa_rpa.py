@@ -7,6 +7,7 @@ Prefill reuses KV tiles through block-sparse attention; decode uses batched RPA,
 or the fused sparse GQA decode kernel under VLLM_TPU_QSA_FUSED_SPARSE_DECODE.
 """
 
+import os
 import dataclasses
 import functools
 
@@ -1324,7 +1325,9 @@ def qsa_attention(
             if covered < len(starts) - 1:
                 fits = fits & (starts[covered] == starts[-1])
             operands = (query, gate, blocks, lengths, table, starts, cache, first)
-            if not _UNION_ROUTE:
+            # VLLM_TPU_QSA_UNION_NOROUTE=1 (bench): always the union path, no lax.cond
+            # (wrong for a step whose requests hold more than max_query_len rows).
+            if not _UNION_ROUTE or os.environ.get("VLLM_TPU_QSA_UNION_NOROUTE") == "1":
                 out, lse = by_union(operands)
                 return out, lse, cache
             out, lse = jax.lax.cond(fits, by_union, by_rows, operands)
