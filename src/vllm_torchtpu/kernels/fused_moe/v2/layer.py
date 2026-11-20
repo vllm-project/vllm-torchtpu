@@ -771,6 +771,7 @@ def fused_ep_moe_v2(
             pairs_g = scale_bits_g = None
             expert_blocks = jnp.zeros((T * topk // block, block), jnp.int32)
         else:
+            run_streams = ()  # read only under the run copy
             pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
                 exchange, layout, t_local, topk, e_total
             )
@@ -797,7 +798,11 @@ def fused_ep_moe_v2(
                 None, me, gathered=gathered, **plan_kw
             )
         else:
-            routing = build_routing_tables(pairs_g.reshape(T, topk), **plan_kw)
+            # pairs_g is None only under the run copy, which needs the
+            # sharded plan.
+            routing = build_routing_tables(
+                cast(jax.Array, pairs_g).reshape(T, topk), **plan_kw
+            )
         block_tables = shard_transport_tables_in_blocks(
             routing, me, e_total=e_total, ep=ep
         )
@@ -829,6 +834,7 @@ def fused_ep_moe_v2(
         # plan pass drops out of the program as well. The barrier then holds
         # the sort; a scale-slab scatter left past the lookup's budget reads
         # slab_row outside it, which has not been measured either way.
+        run_scale_slab = None  # set where the run copy builds both tables
         if tables_by_run_copy:
             scale_rows = act_scale_slab_rows(ragged_stride)
             src_rows, out_rows = slab_run_copy_rows(t_local, topk, ep, ragged_stride)
