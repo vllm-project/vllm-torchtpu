@@ -30,6 +30,7 @@ the cap is the grouped matmul.
 """
 
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -405,6 +406,8 @@ def _built_op(mesh):
 
     return dict(
         name=registered["name"],
+        fake_operands=list(inspect.signature(registered["fake"]).parameters),
+        program_operands=list(inspect.signature(registered["fn"]).parameters),
         axes=list(view.axis_names),
         device_ids=[[d.id for d in row] for row in np.asarray(view.devices)],
         mesh_order=[[d.id for d in row] for row in devices.reshape(DP, TP)],
@@ -656,6 +659,8 @@ def test_build_op_registers_the_program_on_the_mesh_view_with_the_armed_cap(
     at the cap, the all-gather path one row per engine above it."""
     built = on_8_devices["built_op"]
     assert built["name"] == f"pallas::moe_lowtok_fused_k{TOPK}"
+    # The fake takes the program's operands, by name.
+    assert built["fake_operands"] == built["program_operands"], built
     assert built["axes"] == ["dp", "tp"]
     assert built["device_ids"] == built["mesh_order"]
     assert built["specs"]

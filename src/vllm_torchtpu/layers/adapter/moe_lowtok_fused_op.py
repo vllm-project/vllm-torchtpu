@@ -114,21 +114,30 @@ def prebuild() -> None:
     dp = int(get_dp_group().world_size)
     index = ep_mesh_index()
     assert index is not None  # build_ep_mesh found the EP group
-    if (
-        dp * tp != cores
-        or dp < 2
-        or tp != fused_collectives.TP_PAIR
-        or not small_all_reduce_op.tp_group_is_one_chip(
-            tp, "The moe_lowtok fused collectives"
-        )
-        or not small_all_reduce_op.groups_match_mesh(index, tp, dp)
-    ):
+    if dp * tp != cores or dp < 2 or tp != fused_collectives.TP_PAIR:
         logger.debug(
-            "moe_lowtok fused collectives not armed: dp=%d x tp=%d is not the "
-            "%d-core EP mesh with each chip's TP pair on consecutive cores",
+            "moe_lowtok fused collectives not armed: dp=%d x tp=%d is not a "
+            "DP x TP%d layout of the %d-core EP mesh",
             dp,
             tp,
+            fused_collectives.TP_PAIR,
             cores,
+        )
+        return
+    # Each check below logs once when it keeps the op off a DP x TP2 layout.
+    if not small_all_reduce_op.tp_group_is_one_chip(
+        tp, "The moe_lowtok fused collectives"
+    ):
+        return
+    if not small_all_reduce_op.groups_match_mesh(index, tp, dp):
+        logger.warning_once(
+            "moe_lowtok fused collectives not armed: on this dp=%d x tp=%d "
+            "layout the TP groups are not the EP mesh's blocks of %d "
+            "consecutive cores, or the DP groups not the cores with one TP "
+            "index; the layer keeps the XLA collectives",
+            dp,
+            tp,
+            tp,
         )
         return
     _DP, _TP = dp, tp
@@ -216,7 +225,7 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
         axis_names=(fused_collectives.DP_AXIS, fused_collectives.TP_AXIS),
     )
 
-    def fake(x, *_args):
+    def fake(x, scores, w13, w2, s13, s2, experts_start, rank):
         return torch.empty_like(x)
 
     op = sharded_jax_op(
