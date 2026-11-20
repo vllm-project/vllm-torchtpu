@@ -82,7 +82,7 @@ RESULT_ROWS = ("fp8", "bf16")
 # (they hold NaN here, so a read shows in the output).
 COPY_SLOTS = {"copy_slots": 2}
 # The serving bridge passes each shard's index as an operand
-# (layout.SHARD_INDEX_OPERAND, no side effects); the kernel's own mode reads
+# (no side effects, no jit of the layer's own); the kernel's own mode reads
 # the mesh axis. mode: (shard index operand, sorted rows, cases)
 MODES = {
     "bridge_sorted": (True, True, list(CASES)),
@@ -468,9 +468,8 @@ def test_one_bf16_step_flags_every_single_row_error(interpret, result_rows):
 
 @pytest.fixture
 def one_cpu_shard(monkeypatch):
-    """A TPU7x chip record, empty kernel and layer caches, and the module
-    flags restored afterwards. Returns a function that traces the layer on a
-    one-shard mesh of the CPU device."""
+    """A TPU7x chip record and empty kernel and layer caches. Returns a
+    function that traces the layer on a one-shard mesh of the CPU device."""
     import jax
     import jax.numpy as jnp
     from jax._src.pallas.mosaic import tpu_info
@@ -479,7 +478,6 @@ def one_cpu_shard(monkeypatch):
 
     from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
     from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
-    from vllm_torchtpu.kernels.fused_moe.v3 import layout as v3_layout
     from vllm_torchtpu.kernels.fused_moe.v3.rowquant import FP8
 
     def tpu7x():
@@ -492,12 +490,6 @@ def one_cpu_shard(monkeypatch):
     monkeypatch.setattr(tpu_info, "get_tpu_info", tpu7x)
     monkeypatch.setattr(ffn_kernel, "_BUILD_CACHE", {})
     monkeypatch.setattr(v3_layer, "_LAYER_CACHE", {})
-    for module, flag in (
-        (v3_layer, "WRAP_IN_JIT"),
-        (v3_layout, "SIDE_EFFECTS"),
-        (v3_layout, "SHARD_INDEX_OPERAND"),
-    ):
-        monkeypatch.setattr(module, flag, getattr(module, flag))
     tokens, hidden, inter, experts = 32, 256, 128, 8
     shapes = (
         jax.ShapeDtypeStruct((tokens, hidden), jnp.bfloat16),
@@ -508,7 +500,8 @@ def one_cpu_shard(monkeypatch):
         jax.ShapeDtypeStruct((tokens, experts), jnp.float32),
     )
 
-    def trace(shard_index=None, axes=(MESH_AXIS,), **kwargs):
+    def trace(shard_index=None, axes=(MESH_AXIS,), structured=False, **kwargs):
+        """The traced layer's text, or with `structured` the ClosedJaxpr."""
         kwargs.setdefault("config", Config(result_rows="bf16"))
         cpu = np.asarray(jax.devices("cpu")[:1]).reshape((1,) * len(axes))
         mesh = Mesh(cpu, axes)
@@ -530,19 +523,63 @@ def one_cpu_shard(monkeypatch):
             )
 
         with jax.default_device(jax.devices("cpu")[0]):
-            return str(jax.make_jaxpr(run)(*shapes))
+            traced = jax.make_jaxpr(run)(*shapes)
+        return traced if structured else str(traced)
 
     return trace
 
 
 @pytest.mark.cpu_test
-def test_a_shard_index_without_the_operand_mode_is_refused(one_cpu_shard):
-    """The programs read layout.SHARD_INDEX_OPERAND when they are built; an
-    index handed in with the flag off is refused before anything is built."""
+@pytest.mark.parametrize("side_effects", [True, False], ids=["effects", "no_effects"])
+@pytest.mark.parametrize("wrap_in_jit", [True, False], ids=["jit", "no_jit"])
+@pytest.mark.parametrize("with_index", [False, True], ids=["mesh_axis", "operand"])
+def test_each_lowering_argument_reaches_the_programs(
+    one_cpu_shard, monkeypatch, side_effects, wrap_in_jit, with_index
+):
+    """The three lowering choices the torch bridge makes are arguments of
+    the layer, and each reaches the programs it governs: `side_effects` is
+    what the transport and shard-tables programs declare to XLA,
+    `wrap_in_jit` whether the layer's shard_map sits in a jit of its own,
+    and a shard index handed in is what every program reads instead of
+    the mesh axis."""
+    import jax
     import jax.numpy as jnp
 
-    with pytest.raises(ValueError, match="shard_index must be None"):
-        one_cpu_shard(shard_index=jnp.zeros((1, 1), jnp.int32))
+    from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS
+
+    axes_read = []
+    axis_index = jax.lax.axis_index
+
+    def record(axis_name):
+        axes_read.append(axis_name)
+        return axis_index(axis_name)
+
+    monkeypatch.setattr(jax.lax, "axis_index", record)
+    traced = one_cpu_shard(
+        shard_index=jnp.zeros((1, 1), jnp.int32) if with_index else None,
+        side_effects=side_effects,
+        wrap_in_jit=wrap_in_jit,
+        structured=True,
+    )
+    assert ("has_side_effects=True" in str(traced)) == side_effects
+    outer = {eqn.primitive.name for eqn in traced.jaxpr.eqns}
+    assert ("shard_map" not in outer) == wrap_in_jit, outer
+    assert (MESH_AXIS in axes_read) == (not with_index)
+
+
+@pytest.mark.cpu_test
+def test_a_shard_index_operand_takes_a_mesh_of_the_expert_axis_alone(one_cpu_shard):
+    """With the index as data, nothing may read another axis's index (the
+    torch bridge's export refuses the partition-id it lowers to), so a
+    mesh with any other axis is refused before anything is built."""
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS
+
+    with pytest.raises(ValueError, match="whose only axis"):
+        one_cpu_shard(
+            shard_index=jnp.zeros((1, 1), jnp.int32), axes=(MESH_AXIS, "replica")
+        )
 
 
 @pytest.mark.cpu_test
@@ -552,22 +589,19 @@ def test_a_shard_index_without_the_operand_mode_is_refused(one_cpu_shard):
 def test_both_shard_index_modes_build_in_one_process(one_cpu_shard, bridge_first):
     """The bridge's operand mode and the kernel's mesh-axis mode, one after
     the other with the caches kept: each gets programs built for its own
-    mode (the FFN build reads the flag, so a build cached on its arguments
-    alone would hand one mode's program to the other)."""
+    mode (the FFN build's form is one of its arguments, so neither mode is
+    handed a build cached for the other)."""
     import jax.numpy as jnp
 
-    from vllm_torchtpu.kernels.fused_moe.v3 import layout as v3_layout
-
     def bridge():
-        v3_layout.SHARD_INDEX_OPERAND, v3_layout.SIDE_EFFECTS = True, False
-        return one_cpu_shard(shard_index=jnp.zeros((1, 1), jnp.int32))
+        return one_cpu_shard(
+            shard_index=jnp.zeros((1, 1), jnp.int32), side_effects=False
+        )
 
     def own():
-        v3_layout.SHARD_INDEX_OPERAND, v3_layout.SIDE_EFFECTS = False, True
         return one_cpu_shard()
 
-    # Without the flag in the FFN build's key, the second mode is handed the
-    # first mode's program and the call raises ValueError.
+    # Handed the other mode's FFN program, the second call raises ValueError.
     first, second = (bridge, own) if bridge_first else (own, bridge)
     first()
     second()
@@ -596,22 +630,17 @@ def test_the_tables_program_addresses_every_mesh_axis(one_cpu_shard, monkeypatch
 
 
 @pytest.mark.cpu_test
-def test_the_layer_cache_keys_on_the_module_flags(one_cpu_shard):
-    """A build per value of each flag the build bakes in: the jit wrapper
-    (WRAP_IN_JIT) and the programs' side-effect declaration
-    (layout.SIDE_EFFECTS). The third, layout.SHARD_INDEX_OPERAND, is covered
-    by the shard-index mode tests above."""
+def test_the_layer_cache_keys_on_the_lowering_arguments(one_cpu_shard):
+    """A build per value of each lowering argument the build bakes in: the
+    jit wrapper and the programs' side-effect declaration. The shard-index
+    form is covered by the shard-index mode tests above."""
     from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
-    from vllm_torchtpu.kernels.fused_moe.v3 import layout as v3_layout
 
-    v3_layer.WRAP_IN_JIT = True
-    wrapped = one_cpu_shard()
-    v3_layer.WRAP_IN_JIT = False
-    bare = one_cpu_shard()
+    wrapped = one_cpu_shard(wrap_in_jit=True)
+    bare = one_cpu_shard(wrap_in_jit=False)
     assert len(v3_layer._LAYER_CACHE) == 2 and bare != wrapped
-    v3_layout.SIDE_EFFECTS = not v3_layout.SIDE_EFFECTS
-    one_cpu_shard()
-    one_cpu_shard()
+    one_cpu_shard(side_effects=False)
+    one_cpu_shard(side_effects=False)
     assert len(v3_layer._LAYER_CACHE) == 3
 
 
@@ -896,8 +925,6 @@ def _run_case(name, mode, result_rows):
     from jax.sharding import PartitionSpec as P
 
     from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
-    from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
-    from vllm_torchtpu.kernels.fused_moe.v3 import layout as v3_layout
 
     bridge, sorted_rows, _ = MODES[mode]
     experts, real, routing, short = CASES[name]
@@ -932,14 +959,12 @@ def _run_case(name, mode, result_rows):
             shard_index=shard_index,
             valid_tokens=jnp.asarray(valid, jnp.int32),
             drop_nan_rows=True,
+            # The bridge modes run with the lowering the torch bridge asks for.
+            side_effects=not bridge,
+            wrap_in_jit=not bridge,
         )
 
-    # The bridge modes run with the module flags the torch bridge sets.
-    with pytest.MonkeyPatch.context() as flags:
-        flags.setattr(v3_layout, "SHARD_INDEX_OPERAND", bridge)
-        flags.setattr(v3_layout, "SIDE_EFFECTS", not bridge)
-        flags.setattr(v3_layer, "WRAP_IN_JIT", not bridge)
-        got = np.asarray(jax.block_until_ready(jax.jit(run)(*args)))
+    got = np.asarray(jax.block_until_ready(jax.jit(run)(*args)))
     rows = _valid_rows(real, valid)
     weights, chosen = _routes(logits, real, valid)
     want = _reference(x, w1, w2, s1, s2, weights, chosen, rows, config)
