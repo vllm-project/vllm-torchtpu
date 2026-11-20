@@ -33,7 +33,9 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
+from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
 
@@ -206,7 +208,23 @@ class MiniMaxM3Model(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        self._configure_max_free()
         return loaded_params
+
+    def _configure_max_free(self) -> None:
+        """TPU_MINIMAX_M3_MSA_MAX_FREE=1: bounds every layer's MSA scores from
+        the loaded q / k norms and turns the max-free softmax on under the
+        kernels' limit (`msa_attention_lse.configure_max_free`). Off: no-op."""
+        if not envs.TPU_MINIMAX_M3_MSA_MAX_FREE:
+            return
+        bounds = [
+            layer.self_attn.score_bound()
+            for layer in self.layers
+            if isinstance(getattr(layer, "self_attn", None), MiniMaxM3SparseAttention)
+        ]
+        if not bounds:
+            return
+        msa_attention_lse.configure_max_free(max(bounds))  # logs the bound
 
 
 class MiniMaxM3SparseForCausalLM(nn.Module):

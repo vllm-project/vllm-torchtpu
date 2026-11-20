@@ -285,6 +285,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
     TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT: str = ""
+    TPU_MINIMAX_M3_MSA_MAX_FREE: bool = False
+    TPU_MINIMAX_M3_MSA_MXU_MASK: bool = False
 
 
 def env_with_choices(
@@ -1864,6 +1866,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION": env_str(
         "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION", ""
+    ),
+    # MiniMax M3 MSA sparse attention softmax with no running max: at load the
+    # model bounds |q . k| * head_dim**-0.5 from its q / k RMS-norm weights
+    # (times the KV cache's key rounding); when every layer's bound is <= 75,
+    # every MSA attention kernel (prefill and decode, DCP or not, all cache
+    # dtypes) exponentiates scores against 0 instead of a running max, with
+    # no max reduction or rescale. Not bitwise. Default off.
+    "TPU_MINIMAX_M3_MSA_MAX_FREE": env_bool(
+        "TPU_MINIMAX_M3_MSA_MAX_FREE", default=False
+    ),
+    # With TPU_MINIMAX_M3_MSA_MAX_FREE in effect: the 8/16-bit transposed
+    # (prefill) MSA attention path takes each token's key mask from the QK
+    # matmul (an extra head_dim-wide key column block of 0 / -1e30, a one-hot
+    # of the token beside the queries) instead of a select per score.
+    # Ignored without max-free. Default off.
+    "TPU_MINIMAX_M3_MSA_MXU_MASK": env_bool(
+        "TPU_MINIMAX_M3_MSA_MXU_MASK", default=False
     ),
     # MiniMax M3 MSA cross-layer block-selection reuse (IndexCache) on
     # decode-sized steps under DCP (`models.minimax_m3.index_reuse`): the
