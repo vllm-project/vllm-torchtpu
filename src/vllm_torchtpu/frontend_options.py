@@ -28,7 +28,6 @@ The detokenizer patch only applies in the API server processes; the
 tokenization cache is only reached through vLLM's renderer.
 """
 
-import importlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -88,47 +87,44 @@ def get(vllm_config: Any) -> FrontendOptions:
 
 def install_tokenize_prefix_cache(vllm_config: Any = None) -> bool | None:
     """patch_registry installer of ``tokenize_prefix_cache``."""
-    return _install(
-        vllm_config,
-        "tokenize_prefix_cache",
-        "vllm_torchtpu.frontend_tokcache",
-        "maybe_install_tokenize_prefix_cache",
-        lambda options: {"max_tokens": options.tokenize_prefix_cache_max_tokens},
-    )
+    options = None if vllm_config is None else get(vllm_config)
+    if options is None or not options.tokenize_prefix_cache:
+        return False
+
+    def install() -> None:
+        from vllm_torchtpu import frontend_tokcache
+
+        frontend_tokcache.maybe_install_tokenize_prefix_cache(
+            max_tokens=options.tokenize_prefix_cache_max_tokens
+        )
+
+    return _install("tokenize_prefix_cache", install)
 
 
 def install_detok_prompt_tail(vllm_config: Any = None) -> bool | None:
     """patch_registry installer of ``detok_prompt_tail``."""
-    return _install(
-        vllm_config,
-        "detok_prompt_tail",
-        "vllm_torchtpu.frontend_fix",
-        "maybe_install_detok_prompt_tail",
-    )
+    options = None if vllm_config is None else get(vllm_config)
+    if options is None or not options.detok_prompt_tail:
+        return False
+
+    def install() -> None:
+        from vllm_torchtpu import frontend_fix
+
+        frontend_fix.maybe_install_detok_prompt_tail()
+
+    return _install("detok_prompt_tail", install)
 
 
-def _install(
-    vllm_config: Any,
-    name: str,
-    module: str,
-    installer: str,
-    installer_kwargs: Callable[[FrontendOptions], dict[str, Any]] = lambda _: {},
-) -> bool | None:
-    """Install option ``name``'s patch with ``module.installer`` when the engine
-    config turns it on, passing it ``installer_kwargs(options)``.
+def _install(name: str, install: Callable[[], None]) -> None:
+    """Run the patch installer of option ``name``, which the engine config
+    turns on; it imports its module only then.
 
-    Off, this returns False, which keeps the registry entry eligible: a later
-    engine config built in the same process may still turn it on. A patch that
-    cannot be installed logs a warning and leaves vLLM's own path in place; it
-    never stops the server from starting.
+    An installer returns False when its option is off, which keeps the
+    registry entry eligible: a later engine config built in the same process
+    may still turn it on. A patch that cannot be installed logs a warning and
+    leaves vLLM's own path in place; it never stops the server from starting.
     """
-    if vllm_config is None:
-        return False
-    options = get(vllm_config)
-    if not getattr(options, name):
-        return False
     try:
-        getattr(importlib.import_module(module), installer)(**installer_kwargs(options))
+        install()
     except Exception as e:
         logger.warning("%s.%s: install failed (%r)", SECTION, name, e)
-    return None

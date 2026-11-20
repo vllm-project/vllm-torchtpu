@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
 import unittest
+import weakref
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -212,6 +215,15 @@ def test_installed_cache_uses_the_deployed_sizes():
     )
 
 
+def test_only_a_hugging_face_fast_tokenizer_gets_a_cache():
+    """The cache copies the Rust tokenizer behind a PreTrainedTokenizerFast; any
+    other tokenizer keeps vLLM's tokenization, whatever attributes it has."""
+    fast = _toy_hf_tokenizer()
+    assert tokcache_mod._build_cache_for(fast) is not None
+    lookalike = SimpleNamespace(backend_tokenizer=fast.backend_tokenizer)
+    assert tokcache_mod._build_cache_for(lookalike) is None
+
+
 @pytest.fixture
 def patched_renderer(monkeypatch):
     """A real HfRenderer around the toy tokenizer, with the tokenization cache
@@ -283,6 +295,46 @@ def test_first_unexpected_error_turns_the_cache_off(patched_renderer, monkeypatc
         expected = unpatched(renderer, dict(prompt), params)
         assert renderer._tokenize_prompt(dict(prompt), params) == expected
     assert len(calls) == 1
+
+
+class _SilentLogger:
+    """Drops every record: a captured record would keep the exception, its
+    frames and the cache alive."""
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None
+
+
+@pytest.mark.parametrize("cause", ["error", "verify_mismatch"])
+def test_a_cache_that_turns_off_is_dropped(patched_renderer, monkeypatch, cause):
+    """Once the cache turns off, by an unexpected error or a verify mismatch,
+    the wrapper drops it, so its entries are freed."""
+    renderer, _ = patched_renderer
+    monkeypatch.setattr(tokcache_mod, "logger", _SilentLogger())
+    refs = []
+    build = tokcache_mod._build_cache_for
+
+    def tracked(*args, **kwargs):
+        cache = build(*args, **kwargs)
+        refs.append(weakref.ref(cache))
+        return cache
+
+    monkeypatch.setattr(tokcache_mod, "_build_cache_for", tracked)
+    params = TokenizeParams(max_total_tokens=None)
+    renderer._tokenize_prompt({"prompt": _turns(1)}, params)
+    (ref,) = refs
+    assert ref()._entries
+    if cause == "error":
+
+        def broken(self, text):
+            raise RuntimeError("tokenizer state lost")
+
+        monkeypatch.setattr(tokcache_mod.PrefixTokenCache, "encode", broken)
+    else:
+        ref().disabled = True
+    renderer._tokenize_prompt({"prompt": _turns(2)}, params)
+    gc.collect()
+    assert ref() is None
 
 
 def test_installed_wrapper_builds_its_cache_with_the_token_limit(
