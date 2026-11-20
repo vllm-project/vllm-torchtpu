@@ -100,6 +100,7 @@ def _pallas_rpa_kernel_dcp(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    prefill_max_bkv_sz: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One DCP pass (CACHE_ONLY or NEW_TOKENS_ONLY). Returns (new_kv_cache,
     output, lse). decode_query_size widens the DECODE bucket so speculative
@@ -132,6 +133,7 @@ def _pallas_rpa_kernel_dcp(
         cp_rank=cp_rank_arr,
         attention_scope=attention_scope,
         decode_query_size=decode_query_size,
+        prefill_max_bkv_sz=prefill_max_bkv_sz,
         return_lse=True,
         kv_layout=kv_layout,
     )
@@ -199,6 +201,7 @@ def build_dcp_kernels(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    prefill_max_bkv_sz: int = 0,
 ) -> tuple:
     """Build and cache the CACHE_ONLY and NEW_TOKENS_ONLY jax_ops.
 
@@ -211,6 +214,7 @@ def build_dcp_kernels(
     # The adapter uses batched_rpa's equivalent enum. Normalize here so both
     # entry points bind LONGCTX's enum and share ops for the same layout.
     kv_layout = _batched_rpa_configs.KVLayout(kv_layout)
+    resolved_max_bkv = prefill_max_bkv_sz if prefill_max_bkv_sz > 0 else None
     base_key = (
         sliding_window,
         sm_scale,
@@ -222,6 +226,7 @@ def build_dcp_kernels(
         cp_rank,
         kv_layout,
         decode_query_size,
+        resolved_max_bkv,
     )
     cache_key = ("dcp_cache", *base_key)
     new_key = ("dcp_new", *base_key)
@@ -242,6 +247,7 @@ def build_dcp_kernels(
             attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
+            prefill_max_bkv_sz=resolved_max_bkv,
         )
         cached_cache = _DCP_KERNEL_REGISTRY[cache_key] = _build_dcp_kernel_op(
             f"pallas::rpa_dcp_cache_{_alloc_instance_id()}", fn
@@ -258,6 +264,7 @@ def build_dcp_kernels(
             attention_scope=_batched_rpa_configs.AttentionScope.NEW_TOKENS_ONLY,
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
+            prefill_max_bkv_sz=resolved_max_bkv,
         )
         cached_new = _DCP_KERNEL_REGISTRY[new_key] = _build_dcp_kernel_op(
             f"pallas::rpa_dcp_new_{_alloc_instance_id()}", fn
@@ -289,6 +296,7 @@ def forward_with_dcp(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    prefill_max_bkv_sz: int = 0,
 ) -> torch.Tensor:
     """Two-pass DCP attention forward.
     1. CACHE_ONLY: query is all-gathered by heads to attend every rank's KV
@@ -317,6 +325,7 @@ def forward_with_dcp(
         cp_rank=dcp_rank,
         kv_layout=kv_layout,
         decode_query_size=decode_query_size,
+        prefill_max_bkv_sz=prefill_max_bkv_sz,
     )
 
     query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)
