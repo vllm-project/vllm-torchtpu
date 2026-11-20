@@ -148,7 +148,7 @@ def test_a_draft_layer_with_target_modes_is_not_refused(
         build(impl)
 
 
-def test_export_marks_the_mtp_drafts_attention(monkeypatch):
+def test_draft_attention_impls_collects_only_the_drafts(monkeypatch):
     class FakeAttention(torch.nn.Module):
         def __init__(self):
             super().__init__()
