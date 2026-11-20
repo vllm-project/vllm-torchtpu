@@ -474,8 +474,12 @@ def test_shared_pieces_reach_another_process(tmp_path):
     queue = ctx.Queue()
     child = ctx.Process(target=_encode_in_child, args=(str(tmp_path), texts, queue))
     child.start()
-    ids, shared_hits = queue.get(timeout=120)
-    child.join(timeout=60)
+    try:
+        ids, shared_hits = queue.get(timeout=120)
+        child.join(timeout=60)
+    finally:
+        child.kill()
+    assert child.exitcode == 0
     assert ids == [tok.encode(t, add_special_tokens=False).ids for t in texts]
     assert shared_hits > 0
 
@@ -518,7 +522,7 @@ def test_shared_writes_are_bounded(tmp_path):
     for _ in range(300):
         seg.encode(_long_text(rng, 3))
     store = seg._shared
-    assert 0 < store._written_tokens <= 2000
+    assert 0 < store._written_bytes <= 2000
     assert sorted(os.listdir(store.dir)) == sorted(
         os.path.basename(path) for path, _ in store._written
     )
@@ -552,3 +556,73 @@ def test_unwritable_shared_dir_keeps_encoding(tmp_path):
     assert seg._shared._write_failed
     assert seg.shared_hits == 0
     assert not seg._shared._written
+
+
+def test_shared_file_with_too_long_text_length_is_not_used(tmp_path):
+    tok = _toy_tokenizer()
+    seg = _shared_seg(tok, str(tmp_path))
+    piece = CORPUS[:100]
+    text = piece.encode()
+    with open(seg._shared._path(text), "wb") as f:
+        f.write(SharedPieceStore._HEADER.pack(SharedPieceStore._MAGIC, len(text) + 8))
+        f.write(text)
+    assert seg.encode(piece) == tok.encode(piece, add_special_tokens=False).ids
+    assert seg.shared_hits == 0
+
+
+def test_start_trims_piece_files_of_earlier_runs(tmp_path):
+    tok = _toy_tokenizer()
+    old_dir = tmp_path / ("0" * 16)
+    old_dir.mkdir()
+    for i in range(10):
+        path = old_dir / f"{i:032x}"
+        path.write_bytes(b"x" * 100)
+        os.utime(path, (i, i))
+    (old_dir / f"{10:032x}.123.abc.tmp").write_bytes(b"x" * 100)
+    unrelated = tmp_path / "notes"
+    unrelated.mkdir()
+    (unrelated / f"{0:032x}").write_bytes(b"x" * 1000)
+    (old_dir / "notes.txt").write_bytes(b"x" * 1000)
+
+    _shared_seg(tok, str(tmp_path), max_written=450)
+
+    assert sorted(os.listdir(old_dir)) == sorted(
+        [f"{i:032x}" for i in (7, 8, 9)] + [f"{10:032x}.123.abc.tmp", "notes.txt"]
+    )
+    assert os.listdir(unrelated) == [f"{0:032x}"]
+
+
+def test_digest_ignores_truncation_and_padding_state():
+    tok = _toy_tokenizer()
+    digest = tokenizer_digest(tok)
+    tok.enable_truncation(16)
+    tok.enable_padding(length=32)
+    assert tokenizer_digest(tok) == digest
+
+
+def test_shared_dir_that_cannot_be_created(tmp_path, monkeypatch):
+    pytest.importorskip("vllm")
+    from vllm.renderers import base as renderer_base
+
+    from vllm_torchtpu import segment_tokenize as st
+
+    not_a_dir = tmp_path / "file"
+    not_a_dir.write_bytes(b"")
+    monkeypatch.setattr(st, "_INSTANCES", {})
+    from transformers import PreTrainedTokenizerFast
+
+    tok = _toy_tokenizer()
+    hf = PreTrainedTokenizerFast(tokenizer_object=tok)
+    seg = st.get_segment_tokenizer(hf, 1 << 20, shared_dir=str(not_a_dir / "sub"))
+    assert seg is not None and seg._shared is None
+    text = _long_text(random.Random(10), 3)
+    assert seg.encode(text) == tok.encode(text, add_special_tokens=False).ids
+
+    cls = renderer_base.BaseRenderer
+    monkeypatch.setattr(cls, "_tokenize_prompt", cls.__dict__["_tokenize_prompt"])
+    monkeypatch.setattr(cls, "_tpu_segment_tokenize", False, raising=False)
+    monkeypatch.setenv("VLLM_TPU_SEGMENT_TOKENIZE", "1")
+    monkeypatch.setenv("VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR", str(not_a_dir))
+    with pytest.raises(FileExistsError):
+        st.patch_renderer_segment_tokenize()
+    assert not cls._tpu_segment_tokenize

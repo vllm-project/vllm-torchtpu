@@ -50,7 +50,9 @@ text, holding the text and its ids; a process that misses its own cache reads
 the file and uses its ids only when the stored text equals the piece. The
 directory name carries a digest of the tokenizer, so only an identical
 tokenizer reads the ids. Files are written to a temporary name and renamed,
-so a reader sees a whole file or none.
+so a reader sees a whole file or none. Each process removes its oldest
+writes past 128 MiB, and a starting process removes the oldest files under
+the directory past the same bound, so files of earlier runs do not pile up.
 """
 
 from __future__ import annotations
@@ -59,9 +61,11 @@ import bisect
 import contextlib
 import copy
 import hashlib
+import json
 import os
 import re
 import struct
+import tempfile
 import threading
 from array import array
 from collections import OrderedDict, deque
@@ -87,19 +91,50 @@ class SharedPieceStore:
 
     File layout: magic, text byte count, the piece's UTF-8 text, then its ids
     as native uint32. A file is used only when its text equals the piece.
+
+    Each process removes its own oldest writes past ``max_written_bytes``, and
+    on start removes the oldest piece files under the root, those of earlier
+    runs and other tokenizers included, past the same bound. The root then
+    holds at most ``max_written_bytes`` per running process plus one more.
     """
 
     _MAGIC = b"SPv1"
     _HEADER = struct.Struct("=4sQ")
+    _DIGEST = re.compile(r"[0-9a-f]{16}")
+    _PIECE_FILE = re.compile(r"[0-9a-f]{32}(\..+\.tmp)?")
 
-    def __init__(self, root: str, tokenizer_digest: str, max_written_tokens: int):
+    def __init__(self, root: str, tokenizer_digest: str, max_written_bytes: int):
         self.dir = os.path.join(root, tokenizer_digest)
         os.makedirs(self.dir, exist_ok=True)
-        self._max_written_tokens = max_written_tokens
+        self._max_written_bytes = max_written_bytes
         self._written: deque[tuple[str, int]] = deque()
-        self._written_tokens = 0
+        self._written_bytes = 0
         self._write_failed = False
-        self._tmp_suffix = f".{os.getpid()}.tmp"
+        self._trim(root)
+
+    def _trim(self, root: str) -> None:
+        """Remove the oldest piece files under ``root`` past ``max_written_bytes``."""
+        files = []
+        with contextlib.suppress(OSError), os.scandir(root) as subdirs:
+            for subdir in subdirs:
+                if not self._DIGEST.fullmatch(subdir.name) or not subdir.is_dir(
+                    follow_symlinks=False
+                ):
+                    continue
+                with contextlib.suppress(OSError), os.scandir(subdir.path) as entries:
+                    for entry in entries:
+                        if not self._PIECE_FILE.fullmatch(entry.name):
+                            continue
+                        with contextlib.suppress(OSError):
+                            stat = entry.stat(follow_symlinks=False)
+                            files.append((stat.st_mtime, stat.st_size, entry.path))
+        total = sum(size for _, size, _ in files)
+        for _, size, path in sorted(files):
+            if total <= self._max_written_bytes:
+                break
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+            total -= size
 
     def _path(self, text: bytes) -> str:
         return os.path.join(self.dir, hashlib.blake2b(text, digest_size=16).hexdigest())
@@ -115,21 +150,30 @@ class SharedPieceStore:
             return None
         magic, text_len = self._HEADER.unpack_from(data)
         end = header + text_len
-        if magic != self._MAGIC or (len(data) - end) % 4 or data[header:end] != text:
+        if (
+            magic != self._MAGIC
+            or end > len(data)
+            or (len(data) - end) % 4
+            or data[header:end] != text
+        ):
             return None
         ids = array("I")
         ids.frombytes(data[end:])
         return ids
 
     def put(self, text: bytes, ids: list[int]) -> None:
-        if self._write_failed or len(ids) > self._max_written_tokens:
+        size = self._HEADER.size + len(text) + 4 * len(ids)
+        if self._write_failed or size > self._max_written_bytes:
             return
         path = self._path(text)
         if os.path.exists(path):
             return
-        tmp = path + self._tmp_suffix
+        tmp = None
         try:
-            with open(tmp, "wb") as f:
+            fd, tmp = tempfile.mkstemp(
+                dir=self.dir, prefix=os.path.basename(path) + ".", suffix=".tmp"
+            )
+            with os.fdopen(fd, "wb") as f:
                 f.write(self._HEADER.pack(self._MAGIC, len(text)))
                 f.write(text)
                 f.write(array("I", ids).tobytes())
@@ -142,20 +186,27 @@ class SharedPieceStore:
                 self.dir,
                 e,
             )
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
+            if tmp is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
             return
-        self._written.append((path, len(ids)))
-        self._written_tokens += len(ids)
-        while self._written_tokens > self._max_written_tokens:
-            old_path, old_tokens = self._written.popleft()
-            self._written_tokens -= old_tokens
+        self._written.append((path, size))
+        self._written_bytes += size
+        while self._written_bytes > self._max_written_bytes:
+            old_path, old_size = self._written.popleft()
+            self._written_bytes -= old_size
             with contextlib.suppress(OSError):
                 os.unlink(old_path)
 
 
 def tokenizer_digest(backend: Any) -> str:
-    return hashlib.sha256(backend.to_str().encode()).hexdigest()[:16]
+    """A digest of the tokenizer, without the truncation and padding state that
+    transformers sets on a shared backend per call."""
+    config = json.loads(backend.to_str())
+    config["truncation"] = None
+    config["padding"] = None
+    text = json.dumps(config, sort_keys=True)
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 @dataclass
@@ -464,10 +515,10 @@ def _backend_of(tokenizer: Any) -> Any:
     return backend
 
 
-# Tokens each process keeps written in the shared directory, beyond which its
-# oldest writes are removed: ~8 B/token (piece text plus uint32 ids), so
-# 128 MiB of /dev/shm per API server process.
-_SHARED_WRITTEN_TOKENS = 1 << 24
+# Bytes of piece files each process keeps written in the shared directory,
+# beyond which its oldest writes are removed: ~8 B/token (piece text plus
+# uint32 ids), so about 16M tokens of /dev/shm per API server process.
+_SHARED_WRITTEN_BYTES = 128 << 20
 
 _INSTANCES: dict[int, SegmentTokenizer | None] = {}
 _INSTANCES_LOCK = threading.Lock()
@@ -496,16 +547,26 @@ def get_segment_tokenizer(
         if reason is None:
             shared = None
             if shared_dir:
-                shared = SharedPieceStore(
-                    shared_dir, tokenizer_digest(backend), _SHARED_WRITTEN_TOKENS
-                )
-                logger.info(
-                    "VLLM_TPU_SEGMENT_TOKENIZE: pid %d shares pieces in %s "
-                    "(keeps up to %d tokens of its own writes).",
-                    os.getpid(),
-                    shared.dir,
-                    _SHARED_WRITTEN_TOKENS,
-                )
+                try:
+                    shared = SharedPieceStore(
+                        shared_dir, tokenizer_digest(backend), _SHARED_WRITTEN_BYTES
+                    )
+                except OSError as e:
+                    logger.warning(
+                        "VLLM_TPU_SEGMENT_TOKENIZE: pid %d shares no pieces: "
+                        "cannot create its directory under %s: %s",
+                        os.getpid(),
+                        shared_dir,
+                        e,
+                    )
+                else:
+                    logger.info(
+                        "VLLM_TPU_SEGMENT_TOKENIZE: pid %d shares pieces in %s "
+                        "(keeps up to %d bytes of its own writes).",
+                        os.getpid(),
+                        shared.dir,
+                        _SHARED_WRITTEN_BYTES,
+                    )
             seg = SegmentTokenizer(
                 backend, max_cached_tokens, max_prompts, use_fastokens, shared
             )
@@ -556,6 +617,9 @@ def patch_renderer_segment_tokenize() -> None:
     max_prompts = envs.VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS
     use_fastokens = envs.VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS
     shared_dir = envs.VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR
+    if shared_dir:
+        # A path that cannot be a directory fails here, at startup.
+        os.makedirs(shared_dir, exist_ok=True)
 
     def _tokenize_prompt(self, prompt, params):
         kwargs = params.get_encode_kwargs()

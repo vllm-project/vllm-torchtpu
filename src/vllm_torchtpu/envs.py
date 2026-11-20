@@ -2243,8 +2243,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Directory (e.g. /dev/shm/vllm-tpu-pieces) where every API server process
     # of the container shares the segment tokenizer's encoded pieces, so a turn
     # served by another process than its session's previous turn reuses the
-    # history's ids. Empty: each process keeps its own cache only.
-    "VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR": lambda: os.getenv(
+    # history's ids. Each process keeps up to 128 MiB of its own writes there
+    # and on start trims older files to the same bound. Empty: each process
+    # keeps its own cache only.
+    "VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR": env_str(
         "VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR", ""
     ),
     # API server: prime the detokenizer with this many prompt-tail tokens; 0 = off.
