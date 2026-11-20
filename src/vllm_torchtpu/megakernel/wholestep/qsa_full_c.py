@@ -361,6 +361,21 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             return ranged()
         return jax.lax.cond(nv <= cut, ranged, full)
 
+    def _thr_tiers(self, S: int, RS: int) -> tuple:
+        """Static score-row tiers of VLLM_TPU_MK_QSA_THR_FAST "r": S/2, 3S/4, S (served
+        256 / 384 / 512), each a whole number of score chunks (`RS` rows) and of 128-row
+        prefix chunks when S is (`ix.exclusive_prefix`)."""
+        ok = lambda x: x % RS == 0 and (x % 128 == 0 or S % 128)  # noqa: E731
+        return tuple(x for x in (S // 2, 3 * S // 4) if x and ok(x)) + (S,)
+
+    def _by_tier(self, nv: Any, tiers: tuple, fn: Any) -> Any:
+        """`fn(Sx)` for the smallest tier `Sx` with `Sx * 128 >= nv` (scalar visible
+        groups): one static scan per tier, chosen by nested conds."""
+        if len(tiers) == 1:
+            return fn(tiers[0])
+        return jax.lax.cond(nv <= tiers[0] * 128, lambda: fn(tiers[0]),
+                            lambda: self._by_tier(nv, tiers[1:], fn))
+
     def _nvis_plan(self, ctx: Any, nv: Any, CH: int) -> tuple:
         """(count, base row of chunk i) of the `CH`-row score chunks holding groups < `nv`
         (scalar), in score-position order: under `compressed_dcp` rank 0's half's visible
@@ -761,6 +776,25 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     v = jnp.maximum(v, ctx.extra[NVIS][r0 + i])
                 return v
 
+            RS = S // NC
+            # VLLM_TPU_MK_QSA_THR_FAST "r": static row tiers (not under compressed_dcp, whose
+            # score positions are not in group order).
+            tiers = self._thr_tiers(S, RS) if self.thr_tiers and not cdcp else ()
+
+            def thr_full(nvm: Any) -> Any:
+                """`ix.thresholds` of rows [lo, lo + n) over all S score rows, or (tiers) over
+                the smallest tier holding `nvm` (scalar max n_vis) groups: the rows past it
+                are invisible (-1) and count nothing."""
+                def scan(Sx: int) -> Any:
+                    sc = pltpu.bitcast(
+                        scr["qi_s"][pl.ds(s0, n), pl.ds(0, Sx // RS)].reshape(n, Sx, 128), I32
+                    )
+                    idx = ids[:, :Sx]
+                    return ix.thresholds(jnp.where(idx < nv, sc, -1), idx, nv, K, G,
+                                         **self.thr_kw)
+
+                return self._by_tier(nvm, tiers, scan) if tiers else scan(S)
+
             if cdcp and n % self.dcp == 0:
                 # Both pair ranks hold every row's scores: each finds the thresholds of its
                 # share of the rows (the bisection is most of the selection) and the pair swaps
@@ -779,7 +813,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                         sc = pltpu.bitcast(
                             scr["qi_s"][pl.ds(s0 + o, h)].reshape(h, S, 128), I32
                         )
-                        return ix.thresholds(jnp.where(ids_h < nv_h, sc, -1), ids_h, nv_h, K, G)
+                        return ix.thresholds(jnp.where(ids_h < nv_h, sc, -1), ids_h, nv_h, K, G,
+                                             **self.thr_kw)
 
                     with ctx.stream.sc("qsa_thr", 2):
                         thr, tmax = self._nvis_route(
@@ -790,7 +825,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0 + o, h)].reshape(h, S, 128), I32)
                     with ctx.stream.sc("qsa_thr", 2):
                         thr, tmax = ix.thresholds(
-                            jnp.where(ids_h < nv_h, sc, -1), ids_h, nv_h, K, G
+                            jnp.where(ids_h < nv_h, sc, -1), ids_h, nv_h, K, G, **self.thr_kw
                         )
                 scr["qi_th"][pl.ds(lo + o, h)] = jnp.broadcast_to(thr, (h, 1, 128))
                 scr["qi_tm"][pl.ds(lo + o, h)] = jnp.broadcast_to(tmax, (h, 1, 128))
@@ -808,8 +843,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 nvm = nv_max(lo, n)
 
                 def full_n() -> Any:
-                    sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0, n)].reshape(n, S, 128), I32)
-                    return ix.thresholds(jnp.where(ids < nv, sc, -1), ids, nv, K, G)
+                    return thr_full(nvm)
 
                 with ctx.stream.sc("qsa_thr", 2):
                     thr, tmax = self._nvis_route(
@@ -819,10 +853,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 scr["qi_th"][pl.ds(lo, n)] = jnp.broadcast_to(thr, (n, 1, 128))
                 scr["qi_tm"][pl.ds(lo, n)] = jnp.broadcast_to(tmax, (n, 1, 128))
             else:
-                sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0, n)].reshape(n, S, 128), I32)
-                bits = jnp.where(ids < nv, sc, -1)
                 with ctx.stream.sc("qsa_thr", 2):
-                    thr, tmax = ix.thresholds(bits, ids, nv, K, G)
+                    thr, tmax = thr_full(nv_max(lo, n) if tiers else None)
                 scr["qi_th"][pl.ds(lo, n)] = jnp.broadcast_to(thr, (n, 1, 128))
                 scr["qi_tm"][pl.ds(lo, n)] = jnp.broadcast_to(tmax, (n, 1, 128))
             scr["qi_nv"][pl.ds(lo, n)] = jnp.broadcast_to(nv, (n, 1, 128))
@@ -853,13 +885,23 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 return tail(r, *full_row(r), carry)
 
             def full_row(r: Any) -> Any:
+                if not tiers:
+                    return scan_row(r, S, consts, lid)
+
+                def scan(Sx: int) -> Any:
+                    cx = ix.compact_consts(Sx, K)
+                    return scan_row(r, Sx, cx, cx[-1])
+
+                return self._by_tier(ctx.extra[NVIS][r], tiers, scan)
+
+            def scan_row(r: Any, Sx: int, consts: Any, lid: Any) -> Any:
+                """Row `r`'s selection and compaction over score rows [0, Sx) (Sx < S: a
+                row tier holding all its visible groups)."""
                 nvr = scr["qi_nv"][r][:, :1]
                 ga = ctx.extra[CTXQ][r // T] // 4
-                b = jnp.where(
-                    lid < nvr,
-                    pltpu.bitcast(scr["qi_s"][r - lo + s0].reshape(S, 128), I32),
-                    -1,
-                )
+                sc = scr["qi_s"][r - lo + s0] if Sx == S else scr["qi_s"][
+                    r - lo + s0, pl.ds(0, Sx // RS)]
+                b = jnp.where(lid < nvr, pltpu.bitcast(sc.reshape(Sx, 128), I32), -1)
                 th, tm = scr["qi_th"][r][:, :1], scr["qi_tm"][r][:, :1]
                 ov = nvr > K
                 sel = (ov & ((b > th) | ((b == th) & (lid <= tm)))) | (~ov & (b >= 0))
@@ -876,7 +918,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 if (
                     self.union_attn
                 ):  # row bit r - lo of every pool-path group it selects
-                    scr["qu_code"][...] = scr["qu_code"][...] | jnp.where(
+                    rows = pl.ds(0, Sx)
+                    scr["qu_code"][rows] = scr["qu_code"][rows] | jnp.where(
                         sel & (lid < ga), jnp.left_shift(1, r - lo), 0
                     )
                 pos = ix.compact_row(

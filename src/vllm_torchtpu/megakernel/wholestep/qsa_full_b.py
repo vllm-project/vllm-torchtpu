@@ -269,6 +269,19 @@ class QSAFullIndexedBlock(QSAFullBlock):
         # 3: also the bisection `NVIS_DIGIT` bits per pass (fewer dependent count passes).
         self.nvis_digit = NVIS_DIGIT if self.select_nvis and int(select_nvis) >= 3 else 1
         self.nvis_rows = tuple(int(x) for x in nvis_rows)
+        # VLLM_TPU_MK_QSA_THR_FAST (default off; exact): the full-scan selection's
+        # thresholds skip the id passes unless a tie is truncated (t), stop the value
+        # passes once the count at `lo` is exactly the budget (e), and scan only the
+        # smallest static row tier {S/2, 3S/4, S} that holds the visible groups, for the
+        # thresholds and the row compaction (r). "1" = all; letters pick parts (ablation).
+        # VLLM_TPU_MK_QSA_THR_EXIT = "bit,every": first while-loop bit, passes per trip.
+        fast = os.environ.get("VLLM_TPU_MK_QSA_THR_FAST", "0")
+        fast = "ter" if fast == "1" else "" if fast == "0" else fast
+        ex_bit, ex_every = (int(x) for x in
+                            os.environ.get("VLLM_TPU_MK_QSA_THR_EXIT", "19,2").split(","))
+        self.thr_kw = dict(tie_skip="t" in fast,
+                           early_exit=(ex_bit, ex_every) if "e" in fast else ())
+        self.thr_tiers = "r" in fast
         if self.select_nvis:
             S, rs = max_groups // 128, max_groups // 128 // self.n_chunks
             Sh = S // (self.dcp if compressed_dcp else 1)
@@ -686,7 +699,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         bits = jnp.where(
             ids < nv, pltpu.bitcast(scr["qi_s"][...].reshape(MB, S, 128), I32), -1
         )
-        thr, tmax = ix.thresholds(bits, ids, nv, K, G)
+        thr, tmax = ix.thresholds(bits, ids, nv, K, G, **self.thr_kw)
         scr["qi_th"][...] = jnp.broadcast_to(thr, (MB, 1, 128))
         scr["qi_tm"][...] = jnp.broadcast_to(tmax, (MB, 1, 128))
         scr["qi_nv"][...] = jnp.broadcast_to(nv, (MB, 1, 128))
