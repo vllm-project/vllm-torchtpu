@@ -28,6 +28,7 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 
 from vllm_torchtpu.distributed.hier_reduce_scatter import moe_combine_reduce_scatter
+from vllm_torchtpu.layers.adapter import small_all_reduce_op
 
 
 class TpuNullAll2AllManager(All2AllManagerBase):
@@ -47,6 +48,14 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
     def _moe_group(self, is_sequence_parallel: bool):
         group = get_ep_group() if is_sequence_parallel else get_dp_group()
         return group if group.world_size > 1 else None
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        # Every TP all-reduce (row-parallel output projections, GDN out-proj,
+        # vocab embedding, MoE reduce_results) comes through here.
+        return small_all_reduce_op.all_reduce_or(input_, self.ranks, super().all_reduce)
+
+    def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:
+        return get_dp_group().all_gather(x, dim=0)
 
     def dispatch_router_logits(
         self,
@@ -92,4 +101,8 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states
-        return moe_combine_reduce_scatter(group, hidden_states)
+        if is_sequence_parallel:
+            return moe_combine_reduce_scatter(group, hidden_states)
+        return small_all_reduce_op.dp_combine_or(
+            hidden_states, lambda x: moe_combine_reduce_scatter(group, x)
+        )

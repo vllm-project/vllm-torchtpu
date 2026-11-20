@@ -225,6 +225,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MEGAKERNEL: str = ""
     VLLM_TPU_EXPERIMENTAL_USE_RUST: bool = False
     VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY: str = ""
+    TPU_SMALL_ALL_REDUCE: bool = False
 
 
 def env_with_choices(
@@ -1329,48 +1330,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
     ),
-    # Pooling models: run LAST/CLS/MEAN embed pooling through the AOT-compiled
-    # static pooler over the (token, request) bucket grid. 0 falls back to the
-    # eager vLLM pooler (finished-mask gating still applies).
-    "VLLM_TPU_STATIC_POOLER": env_bool("VLLM_TPU_STATIC_POOLER", True),
-    # Pooling models: KV cache token budget. -1 (default) derives a
-    # deterministic cap from the scheduler config, 0 disables the cap (all
-    # post-profile HBM goes to KV), N > 0 caps KV at N tokens.
-    "VLLM_TPU_POOLING_KV_CACHE_TOKENS": env_int("VLLM_TPU_POOLING_KV_CACHE_TOKENS", -1),
-    # SrptPrefillScheduler: consecutive steps a running prefill chunk may go
-    # without getting one KV block of tokens before it moves ahead of the
-    # other prefill chunks and is no longer held (0 disables hold-back).
-    # Prefixed with VLLM_ so vLLM's Ray worker env propagation
-    # copies it automatically to DP/Ray engine-core actors.
-    "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
-        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
-    ),
-    # SrptPrefillScheduler: cap on a step's attention work, sum of
-    # n * (context + n / 2) over its scheduled chunks; while some DP rank
-    # decodes, prefill chunks are shrunk to stay under it (0 disables).
-    "VLLM_TPU_SRPT_ATTN_WORK_CAP": env_nonnegative_int(
-        "VLLM_TPU_SRPT_ATTN_WORK_CAP", 0
-    ),
-    # SrptPrefillScheduler: a chunk shrunk by the attention work cap ends on a
-    # multiple of this many tokens, rounded down (the attention kernel's query
-    # tile).
-    "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
-        "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
-    ),
-    # Enable and configure the fused Pallas megakernel ("1"/"true" for defaults,
-    # "ep"/"tp" for mode, or "mode=tp,buckets=8:16:32,verify_buckets=4:8:16,ab=1").
-    "VLLM_TPU_MEGAKERNEL": env_str("VLLM_TPU_MEGAKERNEL", ""),
-    # Opt in to serving models with the native Rust runtime (rvllm) behind `vllm serve`.
-    # Encompasses both HTTP frontend and engine backend.
-    # Experimental, off by default until rvllm reaches feature parity.
-    "VLLM_TPU_EXPERIMENTAL_USE_RUST": env_bool(
-        "VLLM_TPU_EXPERIMENTAL_USE_RUST", default=False
-    ),
     # The rvllm binary; takes the same values as the launcher's --rvllm-binary.
     # When unset, rvllm is looked up on PATH.
     "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY": env_str(
         "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", default=""
     ),
+    # --- Small collectives ---
+    # Run small decode-step TP all-reduces and DP MoE combines as Pallas
+    # kernels (kernels/experimental/small_collectives) instead of XLA's.
+    "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE"),
 }
 
 
