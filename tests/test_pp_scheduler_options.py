@@ -377,13 +377,15 @@ def test_retention_is_scoped_to_the_qwen3_5_moe_architectures(architecture, reta
     assert ("retention" in calls) is retained
 
 
-# -- default behaviour: the scheduler as it was without options ----------------
+# -- default behaviour: every option off -----------------------------------------
 
 
 def _reference_step_limit(cost, pp_size, running, waiting, granularity=None):
-    """Main's lone-prompt spread, as the scheduler had it before the options
-    existed: waiting requests by their computed tokens and no (chunk, prefix)
-    pairs; without a cost model, main's ``step_limit``."""
+    """The lone-prompt step limit with every option off: the pending tokens of
+    the running and waiting requests, each counted from its computed tokens and
+    with no (chunk, prefix) pairs, cut into the chunk share whose spread
+    finishes them soonest on the cost model; without a cost model, main's
+    ``step_limit``."""
 
     def end(r):
         return max(r.num_prompt_tokens, r.num_tokens - 1)
@@ -671,7 +673,7 @@ def test_the_prefill_legs_are_kv_producers_not_consumers():
         assert not s._is_kv_consumer and s._is_kv_producer, name
 
 
-# -- what the prefix-aware admission borrows from PrefixAwareScheduler ----------
+# -- the prefix-aware admission's promotion, free-block count and estimate -----
 
 
 def _promote(head, other, warmth, free_blocks, step_time, aging=3_000.0):
@@ -725,6 +727,19 @@ def test_promotion_ages_the_head_and_the_window_to_the_step_time():
     # The head is the warmer one: it stays first (the window's other
     # requests must be aged to the step time too).
     assert _promote(new_warm, old_cold, warmth, 10_000, step_time=1_000.0) == "new-warm"
+
+
+def test_a_ranking_without_a_time_ages_to_the_step_time():
+    """A ranking called during schedule() without a time ages the request to
+    the step's wall time, as the promotion does, not to the real clock."""
+    s = _sched(_paw_aging_tok_per_s=3_000.0, _step_wall_time=1_000.0)
+    s._prefix_warmth = lambda request: 2_000
+    s._get_block_size = lambda: 2_176
+    request = _waiting("r", 990.0)
+    assert s._rank_and_warmth(request) == s._rank_and_warmth(request, now=1_000.0)
+    s._step_wall_time = None
+    with patch.object(pp_chunk_scheduler.time, "time", return_value=1_005.0):
+        assert s._rank_and_warmth(request) == s._rank_and_warmth(request, now=1_005.0)
 
 
 def test_free_blocks_count_the_blocks_retention_pins():

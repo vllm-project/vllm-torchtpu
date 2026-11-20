@@ -29,6 +29,7 @@ import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 
+from vllm_torchtpu.core import pp_chunk_scheduler
 from vllm_torchtpu.core.pp_chunk_scheduler import (
     ExternalHitEstimator,
     TpuPipelineChunkScheduler,
@@ -235,8 +236,9 @@ def test_external_hit_counts_when_it_fits():
 
 
 def test_the_aging_reads_the_arrival_time_directly():
-    """vLLM's Request always has arrival_time: a request without it is an
-    error, not a request that never ages."""
+    """The sort key and the promotion's ranking both age a request by
+    _wait_seconds. vLLM's Request always has arrival_time: a request without
+    it is an error, not a request that never ages."""
     assert _wait_seconds(SimpleNamespace(arrival_time=10.0), 12.5) == 2.5
     assert _wait_seconds(SimpleNamespace(arrival_time=20.0), 12.5) == 0.0
     with pytest.raises(AttributeError, match="arrival_time"):
@@ -273,8 +275,12 @@ def test_prefix_aware_scheduler_itself_does_not_sort():
     # admission alone: only the pipeline chunk scheduler sorts.
     assert not hasattr(PrefixAwareScheduler, "_sort_waiting_queue")
     now = time.time()
-    reqs = [_req("big_cold", 90_000, now - 2), _req("small_warm", 92_000, now - 1)]
-    s = _prefix_aware_scheduler(reqs, {"small_warm": 90_000})
+    reqs = [
+        _req("big_cold", 90_000, now - 3),
+        _req("mid_warm", 91_000, now - 2),
+        _req("small_warm", 92_000, now - 1),
+    ]
+    s = _prefix_aware_scheduler(reqs, {"mid_warm": 45_000, "small_warm": 90_000})
     seen = {}
 
     def base_schedule(*args, **kwargs):
@@ -283,8 +289,9 @@ def test_prefix_aware_scheduler_itself_does_not_sort():
 
     with patch.object(AsyncScheduler, "schedule", side_effect=base_schedule):
         s.schedule()
-    # The promotion moved the warmest request to the head; nothing sorted.
-    assert seen["order"] == ["small_warm", "big_cold"]
+    # The promotion moved the warmest request to the head and left the rest
+    # in arrival order; a sort would have put mid_warm before big_cold.
+    assert seen["order"] == ["small_warm", "big_cold", "mid_warm"]
 
 
 # ---------------- the connector's host-tier estimate ----------------
@@ -333,8 +340,6 @@ def test_the_estimate_is_asked_past_the_local_hit():
 
 
 def test_a_failing_estimate_is_logged_and_counts_as_zero():
-    from vllm_torchtpu.core import pp_chunk_scheduler
-
     estimator = _Estimator(fail=True)
     s = _warmth_scheduler(estimator)
     # The module's logger resolves lazily to vLLM's logger of this name.
