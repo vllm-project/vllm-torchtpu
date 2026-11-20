@@ -27,10 +27,12 @@ from .constants import (
     CAUSAL_MIDPOINT_HALF,
     DEFAULT_CORES_PER_CHIP,
     FP8_BYTES,
+    GLU_MATMUL_COUNT,
     HBM_MIN_PACKING_DIVISOR,
     HBM_PACKING_NUMERATOR,
     HEAD_DIM_PACKING_THRESHOLD,
     MATMUL_FLOP_PER_MAC,
+    NON_GATED_MATMUL_COUNT,
     SPARSE_MLA_SCALE_BYTES,
     SUBCHANNEL_BLOCK_K_FLOOR,
     VECTOR_MAX_ELEMENTS_PER_WORD,
@@ -1926,14 +1928,15 @@ def _routed_moe_layout(
     expert_hidden = (
         geom.routed_expert_hidden if geom.routed_expert_hidden > 0 else geom.hidden
     )
-    routed_unit = float(n_m_eff * 3 * expert_hidden * width)
+    ffn_mats = geom.ffn_num_matrices
+    routed_unit = float(n_m_eff * ffn_mats * expert_hidden * width)
     routed_elems = ed * routed_unit
     routed_elems_min = ed_min * routed_unit
     isr_tp = max(1, geom.shared_inter // tp) if geom.shared_inter > 0 else 0
     isr_eff = geom.shared_inter if parallel.residual == "sp" else isr_tp
-    shared_elems = float(n_m_eff * 3 * geom.hidden * isr_eff)
+    shared_elems = float(n_m_eff * ffn_mats * geom.hidden * isr_eff)
     shared_mxu_elems = float(
-        n_m_eff * 3 * geom.hidden * _align_mxu(isr_eff, eval_context)
+        n_m_eff * ffn_mats * geom.hidden * _align_mxu(isr_eff, eval_context)
     )
     router_elems = float(n_m_eff * geom.hidden * geom.num_experts)
     moe_w_bytes = (
@@ -1966,10 +1969,10 @@ def _routed_moe_layout(
     )
     per_rank_moe_inter = float(unsharded_moe_inter_mxu) / float(eff_moe_div)
     routed_act_elems = float(
-        n_m_eff * geom.top_k * 3 * expert_hidden * per_rank_moe_inter
+        n_m_eff * geom.top_k * ffn_mats * expert_hidden * per_rank_moe_inter
     )
     routed_act_elems_min = float(
-        n_m_eff * geom.top_k * 3 * expert_hidden * (geom.moe_inter / eff_moe_div)
+        n_m_eff * geom.top_k * ffn_mats * expert_hidden * (geom.moe_inter / eff_moe_div)
     )
     routed_rows = global_rows if is_ep else eval_context.rows
     sh_rows: int | float = (
@@ -2020,17 +2023,26 @@ def _routed_moe_vector_flops(
     _, _, routed_unpack = eval_context.chip.matmul_peak_kind(
         dt.w_expert, dt.act, weight_dtype=dt.w_expert_dtype
     )
+    ffn_act_vector = (
+        1.0
+        if geom.ffn_num_matrices == NON_GATED_MATMUL_COUNT
+        else float(GLU_MATMUL_COUNT)
+    )
     sh_vector = (
-        float(n_m_eff * 3.0 * layout.sh_rows * layout.isr_eff)
+        float(n_m_eff * ffn_act_vector * layout.sh_rows * layout.isr_eff)
         if layout.isr_eff > 0
         else 0.0
     )
     routed_vector = float(
-        n_m_eff * 3.0 * layout.routed_rows * layout.per_rank_moe_inter * geom.top_k
+        n_m_eff
+        * ffn_act_vector
+        * layout.routed_rows
+        * layout.per_rank_moe_inter
+        * geom.top_k
     )
     routed_vector_min = float(
         n_m_eff
-        * 3.0
+        * ffn_act_vector
         * layout.routed_rows
         * (geom.moe_inter / layout.eff_moe_div)
         * geom.top_k
@@ -2308,9 +2320,13 @@ def _compute_moe_mlp_costs(
     if n_dense_ffn > 0 and geom.dense_inter > 0:
         n_d_eff = n_dense_ffn * eval_context.pp_scale
         mlp_inter = geom.dense_inter // tp
-        mlp_elems = float(n_d_eff * 3 * geom.hidden * mlp_inter)
+        ffn_mats = geom.ffn_num_matrices
+        ffn_act_vector = (
+            1.0 if ffn_mats == NON_GATED_MATMUL_COUNT else float(GLU_MATMUL_COUNT)
+        )
+        mlp_elems = float(n_d_eff * ffn_mats * geom.hidden * mlp_inter)
         mlp_mxu_elems = float(
-            n_d_eff * 3 * geom.hidden * _align_mxu(mlp_inter, eval_context)
+            n_d_eff * ffn_mats * geom.hidden * _align_mxu(mlp_inter, eval_context)
         )
         mlp_buckets = _route_matmul_flops(
             eval_context.rows,
@@ -2355,7 +2371,7 @@ def _compute_moe_mlp_costs(
             d_par,
             unpadded_linear=eval_context.unpadded_linear,
         ) * max(1, round(n_d_eff))
-        mlp_swiglu = float(n_d_eff * 3.0 * eval_context.rows * mlp_inter)
+        mlp_swiglu = float(n_d_eff * ffn_act_vector * eval_context.rows * mlp_inter)
         mlp_mix = float(
             n_d_eff
             * (
