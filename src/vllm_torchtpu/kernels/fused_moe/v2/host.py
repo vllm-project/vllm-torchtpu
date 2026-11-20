@@ -1041,14 +1041,19 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None):
     before any of this; the clip is written so that it would hold on its own.
     """
     T, K = routing.pair_grid
-    # The token number of each routed pair is a counted repeat, not a
-    # division: pair i belongs to token i // K, which is the token index
-    # broadcast K times. K is the selection width and need not be a power
-    # of two, so this is the spelling that removes the division rather
-    # than the one that shifts it.
-    token_of_pair = jnp.broadcast_to(
-        jnp.arange(T, dtype=jnp.int32)[:, None], (T, K)
-    ).reshape(-1)
+    # The token number of each routed pair: pair i belongs to token i // K.
+    # A power-of-two K is a shift of the flat pair index. Avoid the
+    # [T, K]-broadcast spelling there: the K-wide minor axis pads to full
+    # lane tiles and XLA relayouts it to flat (~8 us per MoE layer on TPU).
+    # Any other K keeps the counted repeat, which removes the division.
+    if K & (K - 1) == 0:
+        token_of_pair = jnp.right_shift(
+            jnp.arange(T * K, dtype=jnp.int32), jnp.int32(K.bit_length() - 1)
+        )
+    else:
+        token_of_pair = jnp.broadcast_to(
+            jnp.arange(T, dtype=jnp.int32)[:, None], (T, K)
+        ).reshape(-1)
     row = (
         local_slab_rows(routing, me, shard_stride=shard_stride)
         if rows is None
