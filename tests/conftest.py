@@ -63,10 +63,18 @@ def pytest_collection_modifyitems(items):
             item.nodeid.split("::")[0],
         )
     )
-    # JAX raises rather than falling back to the CPU when the chips are busy,
-    # and the pin must not leak into a session with device tests (they would
-    # skip), so it is decided over the whole collection. jax reads
-    # JAX_PLATFORMS once, at import, so a loaded jax is updated as well.
+
+
+def _pin_jax_for_a_host_only_session(items):
+    """Pin JAX to the CPU for a session of nothing but ``cpu_test`` tests.
+
+    JAX raises rather than falling back to the CPU when the chips are busy,
+    and the pin must not leak into a session with device tests (they would
+    skip), so it is decided over the tests that will run: the caller,
+    pytest_collection_finish, runs after every pytest_collection_modifyitems,
+    including pytest's -m/-k deselection. jax reads JAX_PLATFORMS once, at
+    import, so a loaded jax is updated as well.
+    """
     if (
         items
         and not os.environ.get("JAX_PLATFORMS")
@@ -284,6 +292,7 @@ def pytest_collection_finish(session):
     Checked here rather than left to CI because the failure is invisible to any
     run that does not collect the offending file and an engine test together.
     """
+    _pin_jax_for_a_host_only_session(session.items)
     if "jax" not in sys.modules:
         return
     from jax._src import xla_bridge

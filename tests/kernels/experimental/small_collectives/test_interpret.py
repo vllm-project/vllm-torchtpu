@@ -32,6 +32,8 @@ import sys
 
 import pytest
 
+pytestmark = pytest.mark.cpu_test
+
 N = 8
 HIDDEN = N * 128
 # The EP rank at each index of a TPU7x host's mesh in device-id order: local
