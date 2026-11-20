@@ -8909,7 +8909,7 @@ class TestStage3LatePoll:
                 )
                 poller.start()
                 # Long enough for an unblocked poll to finish.
-                poller.join(0.5)
+                poller.join(0.1)
                 pollers.append(poller)
 
         fan_out = threading.current_thread()
