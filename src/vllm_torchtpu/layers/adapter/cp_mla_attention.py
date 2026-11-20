@@ -259,13 +259,18 @@ def _all_to_all_with_lse(
     recv = _all_to_all(payload, group)
 
     o_recv = recv[..., :local, :]
-    l_recv = recv[..., local, :]
+    # Copy out only the lse lanes before reinterpreting them. A dtype view of
+    # a slice of `recv` made torch_tpu reinterpret the whole received payload
+    # (an int16 copy of all [world, T, local + 1, V] elements, 13-19 us per
+    # layer at T = 16 on v7x), while the lanes themselves are a few KB.
+    l_lanes = recv[..., local, :num_l].contiguous()
     if dtype.itemsize == 2:
-        hi_r = l_recv[..., :local].view(torch.int16).to(torch.int32)
-        lo_r = l_recv[..., local : 2 * local].view(torch.int16).to(torch.int32) & 0xFFFF
+        l_int = l_lanes.view(torch.int16).to(torch.int32)
+        hi_r = l_int[..., :local]
+        lo_r = l_int[..., local : 2 * local] & 0xFFFF
         l_bits = torch.bitwise_left_shift(hi_r, 16) | lo_r
     else:
-        l_bits = l_recv[..., :local].view(torch.int32)
+        l_bits = l_lanes.view(torch.int32)
     return o_recv, l_bits.view(torch.float32)
 
 
