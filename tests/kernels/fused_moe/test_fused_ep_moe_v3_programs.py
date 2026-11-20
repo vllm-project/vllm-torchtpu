@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Two of fused EP MoE v3's Pallas programs, run directly in TPU interpret
-mode on CPU against references written out here.
+mode on CPU against references written out here (the routing message's
+padding on a TPU7x chip too).
 
 ``select_kernel.select_top_k`` (the router's top-k and its renormalized
 weights) and ``combine.weighted_sum`` (each token's k-ordered weighted sum of
@@ -33,8 +34,6 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.fused_moe.v3 import combine, select_kernel
 
-pytestmark = pytest.mark.cpu_test
-
 LANES = 128
 
 
@@ -52,6 +51,23 @@ def interpret(monkeypatch):
         yield
 
 
+@pytest.fixture(
+    params=[
+        pytest.param("interpret", marks=pytest.mark.cpu_test),
+        pytest.param("tpu", marks=pytest.mark.tpu_test),
+    ]
+)
+def interpret_or_chip(request, monkeypatch):
+    """The program in TPU interpret mode on CPU, or on the TPU chip."""
+    if request.param == "tpu":
+        yield
+        return
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    monkeypatch.setattr(tpu_info, "get_tpu_info", _tpu7x)
+    with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()):
+        yield
+
+
 def _logits(rows, experts, seed=0):
     rng = np.random.default_rng(seed)
     return rng.standard_normal((rows, experts)).astype(np.float32)
@@ -60,6 +76,7 @@ def _logits(rows, experts, seed=0):
 # ---- select_top_k ----
 
 
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("renormalize", [False, True], ids=["raw", "renormalized"])
 @pytest.mark.parametrize("experts,top_k", [(64, 4), (512, 10)])
 def test_select_top_k_matches_lax_top_k(interpret, renormalize, experts, top_k):
@@ -76,6 +93,7 @@ def test_select_top_k_matches_lax_top_k(interpret, renormalize, experts, top_k):
         np.testing.assert_array_equal(np.asarray(weights), np.asarray(values))
 
 
+@pytest.mark.cpu_test
 def test_select_top_k_breaks_ties_toward_the_lower_expert(interpret):
     logits = _logits(8, 64)
     logits[:, 5] = logits[:, 9] = logits[:, 40] = 10.0  # a three-way tie
@@ -85,6 +103,7 @@ def test_select_top_k_breaks_ties_toward_the_lower_expert(interpret):
     np.testing.assert_array_equal(np.asarray(indices)[:, :3], [[5, 9, 40]] * 8)
 
 
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("renormalize", [False, True], ids=["raw", "renormalized"])
 def test_select_top_k_routes_rows_past_the_valid_count_nowhere(interpret, renormalize):
     """Rows past valid_tokens get weight zero, raw or renormalized, and so
@@ -115,6 +134,7 @@ def test_select_top_k_routes_rows_past_the_valid_count_nowhere(interpret, renorm
         np.testing.assert_array_equal(weights[kept], np.asarray(values))
 
 
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("renormalize", [False, True], ids=["raw", "renormalized"])
 def test_select_top_k_gives_slots_past_a_rows_finite_scores_weight_zero(
     interpret, renormalize
@@ -133,6 +153,7 @@ def test_select_top_k_gives_slots_past_a_rows_finite_scores_weight_zero(
     np.testing.assert_allclose(row[:2], want, rtol=1e-6, atol=0)
 
 
+@pytest.mark.cpu_test
 def test_select_top_k_refuses_drop_nan_rows_on_raw_scores():
     """drop_nan_rows changes which rows route; raw scores would ignore it."""
     with pytest.raises(ValueError, match="drop_nan_rows"):
@@ -145,31 +166,45 @@ def test_select_top_k_refuses_drop_nan_rows_on_raw_scores():
         )
 
 
-def test_select_top_k_routing_message_marks_rows_past_the_valid_count(interpret):
+@pytest.mark.parametrize(
+    "padding_rows,scale_rows", [(0, 0), (4, 4)], ids=["unpadded", "padded"]
+)
+def test_select_top_k_routing_message_marks_rows_past_the_valid_count(
+    interpret_or_chip, padding_rows, scale_rows
+):
     """In the routing-message layout the layer uses (`message_rows`; word
     k * rows + r is row r's slot k), rows past valid_tokens carry the
     unrouted index `num_experts` on every slot, and valid rows carry
-    lax.top_k's experts."""
+    lax.top_k's experts. Padded, as the layer pads it: past the index rows,
+    pair rows up to `pair_rows` route nowhere and the scale rows after them
+    start zero. The first of the two grid steps writes them; both steps'
+    index rows land in the same block."""
     rows, experts, top_k, valid = 256, 64, 4, 200
     logits = _logits(rows, experts, seed=3)
-    message_rows = rows * top_k // LANES
+    index_rows = rows * top_k // LANES
+    pair_rows = index_rows + padding_rows
+    message_rows = pair_rows + scale_rows
     weights, message = select_kernel.select_top_k(
         jnp.asarray(logits),
         top_k=top_k,
         block_rows=LANES,
         renormalize=True,
         message_rows=message_rows,
+        pair_rows=pair_rows,
         valid_tokens=jnp.asarray([valid], jnp.int32),
     )
     message = np.asarray(message)
     assert message.shape == (message_rows, LANES)
-    by_slot = message.reshape(top_k, rows)
+    by_slot = message[:index_rows].reshape(top_k, rows)
     _, want_indices = jax.lax.top_k(jnp.asarray(logits[:valid]), top_k)
     np.testing.assert_array_equal(by_slot[:, :valid].T, np.asarray(want_indices))
     assert (by_slot[:, valid:] == experts).all()
+    assert (message[index_rows:pair_rows] == experts).all()
+    assert not message[pair_rows:].any()
     assert not np.asarray(weights)[valid:].any()
 
 
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("drop_nan_rows", [False, True], ids=["keep", "drop_nan"])
 def test_select_top_k_routing_message_routes_slots_past_finite_scores_nowhere(
     interpret, drop_nan_rows
@@ -243,6 +278,7 @@ SUM_FORMS = {
 }
 
 
+@pytest.mark.cpu_test
 def test_the_sum_forms_cover_both_staging_dtypes():
     stage = {
         name: combine._stage_dtype(dtype, hidden // LANES)
@@ -252,6 +288,7 @@ def test_the_sum_forms_cover_both_staging_dtypes():
     assert stage["bf16_sum_bf16_staging"] == jnp.bfloat16
 
 
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("form", list(SUM_FORMS))
 @pytest.mark.parametrize("fp8_rows", [False, True], ids=["bf16_rows", "fp8_rows"])
 def test_weighted_sum_matches_the_k_ordered_sum(interpret, fp8_rows, form):
@@ -286,6 +323,7 @@ def test_weighted_sum_matches_the_k_ordered_sum(interpret, fp8_rows, form):
     assert _off_fraction(got, want) < 1e-3
 
 
+@pytest.mark.cpu_test
 def test_weighted_sum_drops_a_zero_weight_route_with_a_bad_scale(interpret):
     """A route of weight zero reads a row nobody wrote, whose scale is
     whatever was there: a NaN or Inf scale must not reach the token."""
@@ -320,6 +358,7 @@ def _off_fraction(got, want):
     return float((np.abs(got - want) > 2.0**-7 * np.abs(want) + 1e-5).mean())
 
 
+@pytest.mark.cpu_test
 def test_weighted_sum_rows_are_not_interchangeable(interpret):
     """Control: the same rows with two slots' weights swapped are off the
     reference almost everywhere, so the comparison above sees a slot mix-up."""
