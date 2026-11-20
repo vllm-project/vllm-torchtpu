@@ -28,23 +28,28 @@ rather than an error:
    against head-0 pages on ranks 0..3. An MLA cache is one latent that every
    rank holds, so every DCP size vLLM admits holds one head, including the
    PCP manager's DCP = TP x PCP (GLM-5.2 at TP2, PCP4, DCP8).
-2. The Raiden connector names a decode engine's layout from its parallel
-   sizes (``TPURaidenConnectorWorker._raiden_qwen35_admission_topology`` and
-   ``_raiden_glm_admission_topology`` in
-   ``distributed/kv_transfer/tpu_connector.py``): tp{T}dcp{D}_decode only for
-   dp == 1. With attention-DP it returns dp{N}[tp{T}]_decode without reading
-   DCP, so the producer and consumer would disagree on the page owner. The
-   check covers every engine with a KV transfer config, whatever its role or
-   connector name: ``TPUConnector`` runs that worker when its Raiden backend
-   is switched on, and a MultiConnector hands each child a copy of the engine
-   config with the child's own role (``kv_both``), so neither the name nor the
-   role tells whether the naming runs.
+2. The Raiden connector names a decode engine's layout from its parallel sizes.
+   ``TPURaidenConnectorWorker._raiden_qwen35_admission_topology`` (in
+   ``distributed/kv_transfer/tpu_connector.py``) names tp{T}dcp{D}_decode only
+   for dp == 1; with attention-DP it returns dp{N}[tp{T}]_decode without
+   reading DCP, so the producer and consumer would disagree on the page owner.
+   (``_raiden_glm_admission_topology`` refuses a consumer with both DP and TP
+   above 1, so DCP above 1 cannot reach it there.) The check covers an engine
+   one of whose connectors runs that worker: a ``TPUConnector`` whose Raiden
+   backend is on (always for ``TPURaidenConnector``), on its own or as a
+   MultiConnector child, whatever its role. An engine whose connectors are all
+   others, an offload connector for example, never runs that naming. The check
+   leaves PCP > 1 alone: pcp_validation.py refuses DCP with PCP on the default
+   PCP path, and under the PCP manager every Raiden admission topology refuses
+   a PCP > 1 consumer, and a PCP > 1 producer with DP > 1, so no name drops the
+   DCP axis.
 
 pcp_validation.py and the PCP manager own the other PCP x DCP rules.
 """
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any
 
@@ -93,6 +98,59 @@ def admissible_dcp_sizes(
     return tuple(d for d in range(1, ranks_per_head + 1) if ranks_per_head % d == 0)
 
 
+def _child_configs(vllm_config: Any) -> list[Any]:
+    """The engine configs a MultiConnector builds its children from: per entry
+    of ``kv_connector_extra_config["connectors"]``, a shallow copy of the
+    engine config whose KV transfer config is that entry with the engine's
+    ``engine_id``."""
+    from vllm.config import KVTransferConfig
+
+    transfer = vllm_config.kv_transfer_config
+    children = []
+    for entry in transfer.kv_connector_extra_config.get("connectors", []):
+        child = copy.copy(vllm_config)
+        child.kv_transfer_config = KVTransferConfig(
+            **entry, engine_id=transfer.engine_id
+        )
+        children.append(child)
+    return children
+
+
+def _raiden_connector(vllm_config: Any) -> str | None:
+    """The class name of the engine's first connector that runs
+    ``TPURaidenConnectorWorker``, or None.
+
+    The classes are resolved as vLLM resolves them, MultiConnector children
+    on the configs MultiConnector builds them from, and a ``TPUConnector`` is
+    judged by the backend choice it makes itself.
+    """
+    # Deferred: the connector modules are heavy, and only an attention-DP
+    # engine with DCP and a KV transfer config gets here.
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+    from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+        MultiConnector,
+    )
+
+    from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+        TPUConnector,
+        _use_raiden_connector,
+    )
+
+    connector_cls = KVConnectorFactory.get_connector_class(
+        vllm_config.kv_transfer_config
+    )
+    if issubclass(connector_cls, MultiConnector):
+        for child in _child_configs(vllm_config):
+            if (name := _raiden_connector(child)) is not None:
+                return name
+        return None
+    if issubclass(connector_cls, TPUConnector) and (
+        connector_cls.force_raiden_connector or _use_raiden_connector(vllm_config)
+    ):
+        return connector_cls.__name__
+    return None
+
+
 class DcpStaticSupportValidator:
     @staticmethod
     def from_vllm_config(vllm_config: Any) -> DcpStaticConfig:
@@ -138,14 +196,17 @@ class DcpStaticSupportValidator:
                     f"be one of {list(admissible)}."
                 )
         if config.dp_size > 1 and config.kv_role is not None and config.pcp_size == 1:
-            raise NotImplementedError(
-                f"data_parallel_size={config.dp_size} with "
-                f"decode_context_parallel_size={config.dcp_size} on a KV "
-                f"{config.kv_role}: the Raiden connector names this layout "
-                "dp{N}[tp{T}]_decode without the DCP axis, so the peers would "
-                "disagree on page ownership. Use dp 1 (tp{T}dcp{D}_decode) until "
-                "the connector names the dp x tp x dcp layout."
-            )
+            raiden = _raiden_connector(vllm_config)
+            if raiden is not None:
+                raise NotImplementedError(
+                    f"data_parallel_size={config.dp_size} with "
+                    f"decode_context_parallel_size={config.dcp_size} on a KV "
+                    f"{config.kv_role}: {raiden} runs the Raiden connector "
+                    "worker, which names this layout dp{N}[tp{T}]_decode without "
+                    "the DCP axis, so the peers would disagree on page "
+                    "ownership. Use dp 1 (tp{T}dcp{D}_decode) until the "
+                    "connector names the dp x tp x dcp layout."
+                )
         logger.info(
             "DCP admitted: dcp=%d tp=%d pcp=%d kv_heads=%d%s, "
             "page-interleaved ownership page %% dcp.",

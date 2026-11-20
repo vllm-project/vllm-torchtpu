@@ -477,6 +477,33 @@ class TestTpuPlatform:
             with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
 
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_attention_dp_with_pcp_and_dcp_stops_at_the_pcp_check(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, monkeypatch
+    ):
+        """The DCP admission leaves attention-DP with DCP alone when PCP > 1:
+        on the default PCP path the PCP check refuses DCP with PCP first."""
+        monkeypatch.setattr(tpu_platform.envs, "USE_TPU_PCP_MANAGER", False)
+        vllm_config.model_config.get_total_num_kv_heads = lambda: 2
+        vllm_config.model_config.use_mla = False
+        pc = vllm_config.parallel_config
+        pc.tensor_parallel_size = 4
+        pc.prefill_context_parallel_size = 2
+        pc.decode_context_parallel_size = 2
+        pc.data_parallel_size = 2
+        vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector="TPURaidenConnector",
+            kv_connector_module_path=(
+                "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
+            ),
+            kv_role="kv_consumer",
+        )
+        with pytest.raises(NotImplementedError, match="PCP runner path"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
     @pytest.mark.parametrize(
         "tp,pcp,dcp,kv_heads,use_mla,refused",
         [

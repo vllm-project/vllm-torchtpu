@@ -13,7 +13,7 @@
 # limitations under the License.
 """Static DCP admission: the two TPU contracts vLLM does not check.
 
-A DCP group must hold one KV head, and the Raiden admission has no
+A DCP group must hold one KV head, and the Raiden connector has no
 dp x tp x dcp consumer layout. Each violation would be a wrong answer at
 runtime, so what is pinned here is that startup refuses it with the admissible
 set named, and admits every layout that keeps them, the PCP manager's
@@ -28,11 +28,40 @@ import torch
 
 # Initialize vLLM's plugin registry before importing the plugin package.
 import vllm  # noqa: F401
+from vllm.config import KVTransferConfig
 
 from vllm_torchtpu.platforms.dcp_validation import (
     DcpStaticSupportValidator,
     admissible_dcp_sizes,
 )
+
+_TPU_CONNECTOR = "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
+
+
+def _connector(name, module, role, extra=None):
+    return {
+        "kv_connector": name,
+        "kv_connector_module_path": module,
+        "kv_role": role,
+        "kv_connector_extra_config": extra or {},
+    }
+
+
+def _multi(role, *children):
+    return _connector(
+        "TPUMultiConnector",
+        "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector",
+        role,
+        {"connectors": list(children)},
+    )
+
+
+_RAIDEN = _connector("TPURaidenConnector", _TPU_CONNECTOR, "kv_consumer")
+_OFFLOAD = _connector(
+    "TPURaidenOffloadingConnector", "vllm_torchtpu.offload.raiden_connector", "kv_both"
+)
+# TPUConnector picks its backend: ZMQ-shm unless the Raiden one is switched on.
+_TPU_ZMQ = _connector("TPUConnector", _TPU_CONNECTOR, "kv_consumer")
 
 
 def _vllm_config(
@@ -43,7 +72,7 @@ def _vllm_config(
     dp_size=1,
     kv_heads=2,
     use_mla=False,
-    kv_role=None,
+    connector=None,
 ):
     model_config = None
     if kv_heads is not None:
@@ -59,7 +88,7 @@ def _vllm_config(
             data_parallel_size=dp_size,
         ),
         kv_transfer_config=(
-            None if kv_role is None else SimpleNamespace(kv_role=kv_role)
+            None if connector is None else KVTransferConfig(**connector)
         ),
     )
 
@@ -128,7 +157,7 @@ def test_admissible_sizes_are_vllms_groups_that_hold_one_head(tp, pcp, heads):
 )
 def test_plan_layouts_are_admitted(tp, dcp):
     config = DcpStaticSupportValidator.validate_platform_config(
-        _vllm_config(tp_size=tp, dcp_size=dcp, kv_role="kv_consumer")
+        _vllm_config(tp_size=tp, dcp_size=dcp, connector=_RAIDEN)
     )
     assert config.dcp_size == dcp
     assert config.enabled is (dcp > 1)
@@ -203,19 +232,159 @@ def test_no_model_config_keeps_only_the_vllm_rule():
     assert config.total_num_kv_heads == 0
 
 
-def test_attention_dp_consumer_with_dcp_is_refused_until_admission_names_it():
-    with pytest.raises(NotImplementedError, match="dp x tp x dcp"):
+@pytest.fixture
+def no_raiden_env(monkeypatch):
+    """TPUConnector's environment switches for its Raiden backend, unset."""
+    monkeypatch.delenv("TPU_KV_RESHARD_TRANSPORT", raising=False)
+    monkeypatch.delenv("TPU_USE_RAIDEN_CONNECTOR", raising=False)
+
+
+@pytest.mark.parametrize(
+    "connector,name",
+    [
+        (_RAIDEN, "TPURaidenConnector"),
+        (_multi("kv_producer", _RAIDEN, _OFFLOAD), "TPURaidenConnector"),
+        (
+            _connector(
+                "TPUConnector",
+                _TPU_CONNECTOR,
+                "kv_consumer",
+                {"use_raiden_connector": True},
+            ),
+            "TPUConnector",
+        ),
+    ],
+    ids=["raiden", "raiden_in_a_multi_connector", "tpu_connector_raiden_backend"],
+)
+def test_attention_dp_with_dcp_is_refused_where_a_connector_runs_raiden(
+    no_raiden_env, connector, name
+):
+    with pytest.raises(NotImplementedError, match=f"{name} runs the Raiden"):
         DcpStaticSupportValidator.validate_platform_config(
-            _vllm_config(tp_size=4, dcp_size=2, dp_size=2, kv_role="kv_consumer")
+            _vllm_config(tp_size=4, dcp_size=2, dp_size=2, connector=connector)
         )
-    # Without a KV transfer there is no Raiden admission to disagree with.
-    DcpStaticSupportValidator.validate_platform_config(
-        _vllm_config(tp_size=4, dcp_size=2, dp_size=2)
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [None, _OFFLOAD, _multi("kv_both", _OFFLOAD), _TPU_ZMQ],
+    ids=["no_kv_transfer", "offload", "offload_in_a_multi_connector", "zmq_shm"],
+)
+def test_attention_dp_with_dcp_is_admitted_without_a_raiden_connector(
+    no_raiden_env, connector
+):
+    """None of these connectors runs the Raiden layout naming."""
+    config = DcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(tp_size=4, dcp_size=2, dp_size=2, connector=connector)
     )
+    assert config.enabled and config.dp_size == 2
+
+
+def _vllm_multi(role, *children):
+    """vLLM's own MultiConnector, by its registry name."""
+    return {
+        "kv_connector": "MultiConnector",
+        "kv_role": role,
+        "kv_connector_extra_config": {"connectors": list(children)},
+    }
+
+
+_OFFLOAD_SIZED = {
+    **_OFFLOAD,
+    "kv_connector_extra_config": {"cpu_bytes_to_use": 1 << 30},
+}
+
+
+def _tpu_connector(use_raiden):
+    return _connector(
+        "TPUConnector",
+        _TPU_CONNECTOR,
+        "kv_consumer",
+        {"use_raiden_connector": use_raiden, "late_poll": True},
+    )
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        _multi("kv_producer", _RAIDEN, _OFFLOAD_SIZED),
+        _multi("kv_consumer", _tpu_connector(True), _OFFLOAD),
+        _multi("kv_consumer", _tpu_connector(False), _OFFLOAD_SIZED),
+        _multi("kv_producer", _multi("kv_producer", _RAIDEN, _OFFLOAD), _OFFLOAD),
+        _vllm_multi("kv_consumer", _tpu_connector(True), _OFFLOAD_SIZED),
+    ],
+    ids=[
+        "raiden_and_sized_offload",
+        "tpu_connector_raiden_on",
+        "tpu_connector_raiden_off",
+        "nested_multi",
+        "vllm_multi_connector",
+    ],
+)
+def test_multiconnector_children_are_the_configs_vllm_builds_them_from(connector):
+    """The check reads a MultiConnector's children from the public KV transfer
+    config fields. vLLM's MultiConnector builds the same child configs (in its
+    private _get_connector_classes_and_configs, compared here so that a change
+    in vLLM fails this test rather than the check), each with its entry's own
+    extra config, where use_raiden_connector lives."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+        MultiConnector,
+    )
+
+    from vllm_torchtpu.platforms.dcp_validation import _child_configs
+
+    config = _vllm_config(connector=connector)
+    ours = [child.kv_transfer_config for child in _child_configs(config)]
+    vllms = [
+        child.kv_transfer_config
+        for _, child in MultiConnector._get_connector_classes_and_configs(config)
+    ]
+    assert ours == vllms
+    entries = connector["kv_connector_extra_config"]["connectors"]
+    assert [c.kv_connector_extra_config for c in ours] == [
+        e["kv_connector_extra_config"] for e in entries
+    ]
+    assert {c.engine_id for c in ours} == {config.kv_transfer_config.engine_id}
+
+
+def test_multiconnector_children_cannot_set_their_own_engine_id():
+    """vLLM's MultiConnector refuses an entry with its own engine_id, and so
+    does the check's reading of it."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+        MultiConnector,
+    )
+
+    from vllm_torchtpu.platforms.dcp_validation import _child_configs
+
+    own_id = {**_OFFLOAD, "engine_id": "offload-0"}
+    config = _vllm_config(connector=_multi("kv_producer", _RAIDEN, own_id))
+    with pytest.raises(TypeError, match="engine_id"):
+        _child_configs(config)
+    with pytest.raises(TypeError, match="engine_id"):
+        MultiConnector._get_connector_classes_and_configs(config)
+
+
+def test_tpu_connector_raiden_transport_switch_is_refused(no_raiden_env, monkeypatch):
+    """TPU_KV_RESHARD_TRANSPORT=raiden puts every TPUConnector on Raiden."""
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
+    with pytest.raises(NotImplementedError, match="TPUConnector runs the Raiden"):
+        DcpStaticSupportValidator.validate_platform_config(
+            _vllm_config(tp_size=4, dcp_size=2, dp_size=2, connector=_TPU_ZMQ)
+        )
+
+
+def test_pcp_engines_leave_attention_dp_with_dcp_to_the_pcp_checks(no_raiden_env):
+    """pcp_validation refuses DCP with PCP on the default path, and every
+    Raiden admission topology refuses PCP > 1 under DP > 1, so this check
+    does not."""
+    config = DcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(tp_size=4, pcp_size=2, dcp_size=2, dp_size=2, connector=_RAIDEN)
+    )
+    assert config.enabled
 
 
 def test_dcp_one_is_a_no_op():
     config = DcpStaticSupportValidator.validate_platform_config(
-        _vllm_config(tp_size=8, dcp_size=1, dp_size=2, kv_role="kv_consumer")
+        _vllm_config(tp_size=8, dcp_size=1, dp_size=2, connector=_RAIDEN)
     )
     assert not config.enabled
