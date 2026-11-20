@@ -28,12 +28,13 @@
 set -euo pipefail
 
 if [ -n "${K3_ENGINE_IMAGE:-}" ] && [ -n "${K3_ENGINE_VLLM_RS:-}" ]; then
-  # The given image plus vllm-rs built from that vLLM ref.
-  TAG="${K3_ENGINE_IMAGE}-vllmrs"
+  # The given image plus numactl and vllm-rs built from that vLLM ref (the
+  # -numactl suffix keeps it apart from the earlier -vllmrs images without numactl).
+  TAG="${K3_ENGINE_IMAGE}-vllmrs-numactl"
   if docker manifest inspect "${TAG}" >/dev/null 2>&1; then
     echo "--- ${TAG} is already in the registry"
   else
-    echo "--- Building ${TAG}: ${K3_ENGINE_IMAGE} + vllm-rs at vLLM ${K3_ENGINE_VLLM_RS}"
+    echo "--- Building ${TAG}: ${K3_ENGINE_IMAGE} + numactl + vllm-rs at vLLM ${K3_ENGINE_VLLM_RS}"
     bash .buildkite/scripts/cleanup_docker.sh
     DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.vllm-rs \
       --build-arg BASE_IMAGE="${K3_ENGINE_IMAGE}" --build-arg VLLM_REF="${K3_ENGINE_VLLM_RS}" \

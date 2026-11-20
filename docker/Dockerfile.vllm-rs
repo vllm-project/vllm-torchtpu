@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# BASE_IMAGE plus vLLM's Rust frontend (vllm-rs) built from VLLM_REF, for an
-# engine image that has none (build_k3_engine_image.sh, K3_ENGINE_VLLM_RS).
+# BASE_IMAGE plus numactl and vLLM's Rust frontend (vllm-rs) built from VLLM_REF,
+# for an engine image that has neither (build_k3_engine_image.sh, K3_ENGINE_VLLM_RS).
 # The build stage is the one the Kimi-K3 megakernel engine images used.
 ARG BASE_IMAGE
 FROM python:3.12-slim-bookworm AS rust-build
@@ -44,5 +44,7 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
     vllm-rs --version
 
 FROM ${BASE_IMAGE}
+# numactl: vLLM runs each worker under it when a server passes --numa-bind.
+RUN apt-get update && apt-get install -y --no-install-recommends numactl && rm -rf /var/lib/apt/lists/*
 COPY --from=rust-build /usr/local/bin/vllm-rs /usr/local/bin/vllm-rs
 ENV VLLM_RUST_FRONTEND_PATH=/usr/local/bin/vllm-rs
