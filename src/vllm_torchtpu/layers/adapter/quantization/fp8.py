@@ -1283,10 +1283,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 activation_str,
                 use_fused_kernel=_fused_kernel_takes(x.shape[0], step_min_tokens()),
             )
-        if moe_lowtok_scores.serves(self._moe_lowtok_scores_op, x):
-            op = self._moe_lowtok_scores_op
-            assert op is not None
-            return moe_lowtok_scores.apply(op, layer, x, router_logits)
+        if self._moe_lowtok_scores_op is not None:
+            return moe_lowtok_scores.apply(
+                self._moe_lowtok_scores_op, layer, x, router_logits
+            )
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
@@ -1401,10 +1401,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             retain_fused_ep_graph_inputs,
         )
 
-        if moe_lowtok_scores.serves(self._moe_lowtok_scores_op, x):
-            op = self._moe_lowtok_scores_op
-            assert op is not None
-            out = moe_lowtok_scores.apply(op, layer, x, router_logits)
+        if self._moe_lowtok_scores_op is not None:
+            out = moe_lowtok_scores.apply(
+                self._moe_lowtok_scores_op, layer, x, router_logits
+            )
             return retain_fused_ep_graph_inputs(out)
         # A layer with copy tables always has the scores op, which returned
         # above, so this path never needs to keep them as graph inputs.

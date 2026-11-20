@@ -264,19 +264,13 @@ def test_summary_counts_entries_and_declines(enabled, monkeypatch):
     assert scores._LAYERS == []
 
 
-@pytest.mark.parametrize("rows", [1, 128, 129, 256])
-def test_serves_checks_only_op_presence(rows):
-    """The row-count fork lives inside the JAX op so torch tracing stays uniform."""
-    x = torch.empty(rows, 8)
-    assert scores.serves(Mock(), x)
-    assert not scores.serves(None, x)
-
-
 @pytest.mark.parametrize("has_copies", [False, True])
 @pytest.mark.parametrize("rows, lowtok", [(64, True), (65, False)])
 def test_in_op_row_cap_dispatches_lowtok_or_fused_moe_func(
     monkeypatch, rows, lowtok, has_copies
 ):
+    """The row-count fork lives inside the JAX op so torch tracing stays
+    uniform."""
     monkeypatch.setattr(scores, "_ARMED_MAX_TOKENS", 64)
     monkeypatch.setenv("TPU_MOE_ROUTER_TOPK", "sort")
     monkeypatch.setattr(scores, "moe_lowtok", Mock(return_value="lowtok"))
