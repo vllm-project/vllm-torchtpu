@@ -26,6 +26,19 @@ the fewest tiles per copy. On a tpu7x 2x2x1 (8 TensorCores) it all-reduces
 bf16[8, 6144] in 8.3 us against 14.6 us for XLA's TensorCore all-reduce, and
 bf16[24, 6144] in 12.1 us against 18.3 us; at 64 rows the two meet.
 
+Above TWO_LEVEL_MIN_VIEW_BYTES the view's bytes, not the hops, set the time,
+and `all_reduce_two_level` runs a chip-aware variant on meshes of two-core
+chips: the two cores of a chip first exchange halves and sum them (rounded to
+bf16), the cores of one parity then reduce-scatter and all-gather their half
+across chips, and the chip's two cores swap halves last. The cross-chip
+traffic per core halves (the flat kernel sends six of eight chunks off chip in
+each phase, and both cores of a chip receive the same chunks); the on-chip
+hops are cheap. On a tpu7x 2x2x1 (bf16 [rows, 6144], chained, us per call)
+flat / two-level / XLA: 14.0 / 13.0 / 19.1 at 32 rows, 19.2 / 16.7 / 20.1 at
+48, 23.5 / 19.9 / 22.7 at 64; at 24 rows the flat kernel is ahead (12.5 /
+12.8). Its sum rounds twice (the pair sum, then the total), so its bits differ
+from the flat kernel's.
+
 kernels/experimental/moe_tp_decode/all_reduce.py runs the same protocol as a
 fused kernel's epilogue (row paths by n_valid, the own chunk by local DMA);
 its `standalone` on the same views takes 9.0 us at 8 rows and 12.7 at 24, so
@@ -48,6 +61,9 @@ _TILE_ROWS = 16  # bf16 sublane tiling
 _LANES = 128
 # Input, output and the n receive slots live in VMEM: ~3x the view.
 MAX_VIEW_BYTES = 4 << 20
+# Views above this take the two-level kernel where the mesh allows it: the
+# measured crossover on tpu7x 2x2x1 lies between 24 and 32 rows of 6144.
+TWO_LEVEL_MIN_VIEW_BYTES = 24 * 6144 * 2
 
 
 def view_shape(rows: int, hidden: int, n: int) -> tuple[int, int, int]:
@@ -145,4 +161,179 @@ def all_reduce(x: jax.Array, rank: jax.Array, n: int) -> jax.Array:
     # Relayout to [rows, hidden] here: left to XLA, the reshape sinks into the
     # consumer (the residual add + RMSNorm), which then runs on the [16, w] view
     # at 0.78 us instead of 0.15 us.
+    return lax.optimization_barrier(out.reshape(padded, hidden)[:rows])
+
+
+def two_level_table(chips: list[list[int]]) -> tuple[int, ...] | None:
+    """The two-level kernel's static table for a mesh whose indices sit on
+    `chips` (each the mesh indices of one chip, chips in one fixed order), or
+    None when a chip does not hold exactly two of them or there is one chip.
+    Row i: (partner, pos, half, group...), flattened: the other index on i's
+    chip, i's chip position, which half of the view i reduces (0 for the lower
+    index of its chip), and the indices of that half, one per chip in order."""
+    if len(chips) < 2 or any(len(c) != 2 for c in chips):
+        return None
+    pairs = [sorted(c) for c in chips]
+    rows = {}
+    for pos, pair in enumerate(pairs):
+        for half, me in enumerate(pair):
+            group = [p[half] for p in pairs]
+            rows[me] = (pair[1 - half], pos, half, *group)
+    return tuple(v for i in sorted(rows) for v in rows[i])
+
+
+@functools.cache
+def _call_two_level(n: int, m: int, h: int):
+    chips = n // 2
+    width = 3 + chips  # table row
+    half_w = h // 2
+    w = half_w // chips  # one chip's piece of a half: the view's chunk, h / n
+
+    def kernel(rank_ref, tab_ref, x_ref, out_ref, pair_in, pair_sum, recv, red, *sems):
+        send_sem, recv_sem = sems
+        me = rank_ref[0]
+        row = me * width
+        partner, pos, half = tab_ref[row], tab_ref[row + 1], tab_ref[row + 2]
+        barrier = pltpu.get_barrier_semaphore()
+        for d in range(n):
+            pl.semaphore_signal(barrier, inc=1, device_id=(d,), device_id_type=_MESH)
+        pl.semaphore_wait(barrier, n)
+
+        # Receive semaphores: [0, chips) the partner's pieces of my half,
+        # [chips, 2 chips) the cross-chip reduce-scatter by sender position,
+        # [2 chips, 3 chips) the cross-chip all-gather by sender position,
+        # [3 chips, 4 chips) the partner's pieces of its half.
+        sends = []
+
+        def send(src, dst, k, sem, device):
+            copy = pltpu.make_async_remote_copy(
+                src,
+                dst,
+                send_sem.at[k],
+                recv_sem.at[sem],
+                device_id=(device,),
+                device_id_type=_MESH,
+            )
+            copy.start()
+            sends.append(copy)
+
+        def wait(ref, sem):
+            pltpu.make_async_copy(ref, ref, recv_sem.at[sem]).wait_recv()
+
+        def cols(ref, start):
+            if isinstance(start, int):
+                return ref.at[:, pl.ds(start, w)]
+            return ref.at[:, pl.ds(pl.multiple_of(start, w), w)]
+
+        def piece(q):  # chip q's piece of my half, in view columns
+            return half * half_w + q * w
+
+        def peer(q):  # the device reducing my half's piece q
+            return tab_ref[row + 3 + q]
+
+        # The partner's half, piece by piece, so each pair sum can leave early.
+        for q in range(chips):
+            send(
+                cols(x_ref, (1 - half) * half_w + q * w),
+                cols(pair_in, q * w),
+                q,
+                q,
+                partner,
+            )
+        for i in range(1, chips + 1):
+            q = lax.rem(pos + i, chips)  # my own piece last
+            wait(cols(pair_in, q * w), q)
+            mine = x_ref[:, pl.ds(pl.multiple_of(piece(q), w), w)].astype(F32)
+            other = pair_in[:, pl.ds(pl.multiple_of(q * w, w), w)].astype(F32)
+            # Lower index first, so both chips' cores sum alike.
+            total = jnp.where(half == 0, mine + other, other + mine)
+            pair_sum[:, pl.ds(pl.multiple_of(q * w, w), w)] = total.astype(BF16)
+            if i < chips:
+                send(
+                    cols(pair_sum, q * w),
+                    recv.at[pos],
+                    chips - 1 + i,
+                    chips + pos,
+                    peer(q),
+                )
+        recv[pos] = pair_sum[:, pl.ds(pl.multiple_of(pos * w, w), w)]
+        for i in range(1, chips):
+            q = lax.rem(pos + chips - i, chips)
+            wait(recv.at[q], chips + q)
+        acc = recv[0].astype(F32)
+        for q in range(1, chips):
+            acc = acc + recv[q].astype(F32)
+        red[...] = acc.astype(BF16)
+
+        mine_at = piece(pos)
+        out_ref[:, pl.ds(pl.multiple_of(mine_at, w), w)] = red[...]
+        k = 2 * chips - 1
+        for i in range(1, chips):
+            send(
+                red,
+                cols(out_ref, mine_at),
+                k,
+                2 * chips + pos,
+                peer(lax.rem(pos + i, chips)),
+            )
+            k += 1
+        send(red, cols(out_ref, mine_at), k, 3 * chips + pos, partner)
+        k += 1
+        # Forward each gathered piece of my half to the partner as it lands.
+        for i in range(1, chips):
+            q = lax.rem(pos + chips - i, chips)
+            wait(cols(out_ref, piece(q)), 2 * chips + q)
+            send(
+                cols(out_ref, piece(q)),
+                cols(out_ref, piece(q)),
+                k,
+                3 * chips + q,
+                partner,
+            )
+            k += 1
+        for q in range(chips):
+            wait(cols(out_ref, (1 - half) * half_w + q * w), 3 * chips + q)
+        for copy in sends:
+            copy.wait_send()
+
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    view = m * h * jnp.dtype(BF16).itemsize
+    sends = 4 * chips - 2  # pair pieces, reduce-scatter, gathers, forwards
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((m, h), BF16),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[vmem],
+            out_specs=vmem,
+            scratch_shapes=[
+                pltpu.VMEM((m, half_w), BF16),
+                pltpu.VMEM((m, half_w), BF16),
+                pltpu.VMEM((chips, m, w), BF16),
+                pltpu.VMEM((m, w), BF16),
+                pltpu.SemaphoreType.DMA((sends,)),
+                pltpu.SemaphoreType.DMA((4 * chips,)),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=COLLECTIVE_ID, vmem_limit_bytes=4 * view + (1 << 20)
+        ),
+        name=f"tp_all_reduce-two_level-m_{m}-h_{h}-n_{n}",
+    )
+
+
+def all_reduce_two_level(
+    x: jax.Array, rank: jax.Array, table: tuple[int, ...], n: int
+) -> jax.Array:
+    """`all_reduce` by the two-level kernel; table is `two_level_table` of
+    the mesh."""
+    rows, hidden = x.shape
+    padded, m, w = view_shape(rows, hidden, n)
+    xp = jnp.pad(x, ((0, padded - rows), (0, 0))) if padded != rows else x
+    out = _call_two_level(n, m, w)(
+        rank.reshape(1).astype(jnp.int32),
+        jnp.asarray(table, dtype=jnp.int32),
+        xp.reshape(m, w),
+    )
+    # As in all_reduce.
     return lax.optimization_barrier(out.reshape(padded, hidden)[:rows])

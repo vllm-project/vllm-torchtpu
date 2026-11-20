@@ -23,9 +23,12 @@ that, TpuDeviceCommunicator.all_reduce of the TP group sends every 2-D bf16
 tensor through one torch op. Inside it the token count is static (torch_tpu
 exports one program per count): the kernel serves views up to the byte cap,
 and a larger tensor (a prefill chunk) takes a psum over the same mesh, which
-XLA lowers as it lowers the usual all-reduce. The kernel's output bits can
-differ from XLA's all-reduce: it sums in f32 in rank order and rounds once;
-every rank gets the same bits.
+XLA lowers as it lowers the usual all-reduce. Views above
+kernel.TWO_LEVEL_MIN_VIEW_BYTES take the kernel's two-level variant when every
+chip of the mesh holds two of its devices. The kernel's output bits can
+differ from XLA's all-reduce: it sums in f32 in rank order and rounds once
+(the two-level variant rounds the on-chip pair sums too); every rank gets the
+same bits.
 """
 
 import dataclasses
@@ -50,7 +53,9 @@ logger = init_logger(__name__)
 
 # A wrong rank or mesh hangs the self-test's barrier: dump every stack and exit.
 SELFTEST_TIMEOUT_S = 300
-_SELFTEST_ROWS = (8, 24)
+# 8 and 24 rows take the flat kernel, 32 and 48 the two-level one; rows whose
+# view the cap refuses are skipped.
+_SELFTEST_ROWS = (8, 24, 32, 48)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -63,21 +68,32 @@ class _Armed:
 _ARMED: _Armed | None = None
 
 
-def _body(n: int, max_bytes: int, axis: str):
+def _body(n: int, max_bytes: int, axis: str, table: tuple[int, ...] | None):
     def body(x, rank):
         rows, hidden = x.shape
-        if 0 < kernel.view_bytes(rows, hidden, n) <= max_bytes:
-            return kernel.all_reduce(x, rank, n)
-        return lax.psum(x, axis)
+        view = kernel.view_bytes(rows, hidden, n)
+        if not 0 < view <= max_bytes:
+            return lax.psum(x, axis)
+        if table is not None and view > kernel.TWO_LEVEL_MIN_VIEW_BYTES:
+            return kernel.all_reduce_two_level(x, rank, table, n)
+        return kernel.all_reduce(x, rank, n)
 
     return body
 
 
-def _make_op(mesh, max_bytes: int):
+def _two_level_table(mesh) -> tuple[int, ...] | None:
+    """kernel.two_level_table of the mesh's chips, by device coordinates."""
+    chips: dict[tuple, list[int]] = {}
+    for index, device in enumerate(mesh.devices.flat):
+        chips.setdefault(tuple(device.coords), []).append(index)
+    return kernel.two_level_table([chips[c] for c in sorted(chips)])
+
+
+def _make_op(mesh, max_bytes: int, table: tuple[int, ...] | None):
     axis = mesh.axis_names[0]
     specs = (P(axis), P(axis))
     sharded = jax.shard_map(
-        _body(int(mesh.size), max_bytes, axis),
+        _body(int(mesh.size), max_bytes, axis, table),
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
@@ -129,12 +145,14 @@ def _selftest_inputs(n: int, rows: int, hidden: int) -> np.ndarray:
 
 
 def _selftest(
-    op, rank: torch.Tensor, mesh_index: int, n: int, hidden: int, device
+    op, rank: torch.Tensor, mesh_index: int, n: int, hidden: int, max_bytes: int, device
 ) -> list:
     failures = []
     faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
     try:
         for rows in _SELFTEST_ROWS:
+            if kernel.view_bytes(rows, hidden, n) > max_bytes:
+                continue
             x = _selftest_inputs(n, rows, hidden)
             mine = torch.from_numpy(x[mesh_index]).to(torch.bfloat16).to(device)
             got = op(mine, rank).to(torch.float32).cpu().numpy()
@@ -170,19 +188,22 @@ def arm(hidden: int, device: torch.device) -> bool:
     if sorted(s["mesh_index"] for s in seen) != list(range(tp.world_size)):
         raise RuntimeError(f"tp_all_reduce: mesh indices are not 0..n-1: {seen}")
     n = int(mesh.size)
-    op = _make_op(mesh, max_bytes)
+    table = _two_level_table(mesh)
+    op = _make_op(mesh, max_bytes, table)
     rank = torch.tensor([[mesh_index]], dtype=torch.int32, device=device)
-    failures = _gather(_selftest(op, rank, mesh_index, n, hidden, device))
+    failures = _gather(_selftest(op, rank, mesh_index, n, hidden, max_bytes, device))
     if any(failures):
         raise RuntimeError(
             f"tp_all_reduce: self-test failed (rows per rank): {failures}"
         )
     _ARMED = _Armed(ranks=tuple(int(r) for r in tp.ranks), op=op, rank=rank)
     logger.info(
-        "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B views",
+        "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B "
+        "views, two-level above %s B",
         n,
         mesh_index,
         max_bytes,
+        "no" if table is None else kernel.TWO_LEVEL_MIN_VIEW_BYTES,
     )
     return True
 
