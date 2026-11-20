@@ -303,10 +303,8 @@ class TestLoRAEngine:
         assert not lora_llm.llm_engine.list_loras()
         base = _greedy(lora_llm, None)
         entries = lora_llm.collective_rpc(_xla_cache_entries)
-        assert _greedy(lora_llm, adapters["a"]) != base
-        # The first swap still traces the slot write once more: Dynamo guards
-        # on the torch thread count, which the worker lowers after warm-up.
         graphs = lora_llm.collective_rpc(_dynamo_graphs)
+        assert _greedy(lora_llm, adapters["a"]) != base
 
         # "b" fills the second slot and "c" replaces "a".
         for name in ("b", "c", "swap0", "swap1", "swap2"):
