@@ -68,7 +68,7 @@ def _runner():
         max_num_reqs=192,
         vocab_size=4,
         _hidden_states_dtype=torch.float32,
-        device="cpu",
+        device=torch.device("cpu"),
         spec_bonus_and_target_logits=_logits,
         spec_gather_bonus_and_target_logits=_logits,
         _precompile_timed=lambda name: contextlib.nullcontext(),
@@ -213,7 +213,7 @@ def test_rotated_sweep_holds_no_collective(monkeypatch, synthetic, optional_path
         vocab_size=2 * CANDIDATE_BLOCK if optional_paths else 16,
         _greedy_head_owner=object() if optional_paths else None,
         _hidden_states_dtype=torch.float32,
-        device="cpu",
+        device=torch.device("cpu"),
         _precompile_timed=lambda name: contextlib.nullcontext(),
     )
     runner.spec_bonus_and_target_logits = functools.partial(

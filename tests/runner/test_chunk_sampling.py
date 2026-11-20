@@ -611,7 +611,7 @@ def test_packed_topk_candidates_never_meet_a_processor() -> None:
     packed = torch.zeros((4, 64))
     events: list[str] = []
 
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="reached a plain chunk"):
         runner._sample_plain_chunk(
             packed,
             cur_start_idx=0,
@@ -626,7 +626,7 @@ def test_packed_topk_candidates_never_meet_a_processor() -> None:
             processors=[_PlainRecorder("p1", 50, 100.0, events)],
             topk_candidates_packed=True,
         )
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="reached a verify chunk"):
         runner._sample_spec_verify_chunk(
             packed,
             _verify_md([30, 31]),

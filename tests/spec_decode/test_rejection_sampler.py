@@ -1215,7 +1215,8 @@ def test_rejection_sampler_greedy_path_ignores_draft_probs(device):
 
 
 def test_fused_verify_and_sample_candidates(device):
-    """Fused candidate-space bonus sampling + rejection sampling matches full-vocab."""
+    """Fused candidate-space bonus sampling + rejection sampling gives the
+    expected tokens, and the same tokens as the packed-candidate run."""
     vocab_size = 512
     num_blocks = 2  # 2 * 128 = 256 candidates
     num_cand = num_blocks * 128

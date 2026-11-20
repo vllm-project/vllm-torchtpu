@@ -6024,10 +6024,7 @@ class TPUModelRunner(GPUModelRunner):
         drawing from the dedicated generator, so without the candidate
         samplers the random stream is unchanged.
         """
-        return (
-            getattr(self.device, "type", None) == "tpu"
-            and envs.TPU_SAMPLER_TOPK_CANDIDATES > 0
-        )
+        return self.device.type == "tpu" and envs.TPU_SAMPLER_TOPK_CANDIDATES > 0
 
     @torch.no_grad()
     def _update_mamba_slot_read_offsets(
@@ -6376,7 +6373,9 @@ class TPUModelRunner(GPUModelRunner):
             logits = self._mask_min_tokens(logits, min_tokens_rows, min_toks)
         # _topk_candidates_this_step keeps a step with a thinking-token budget
         # on the full logits, so packed candidates never meet a processor.
-        assert not (topk_candidates_packed and processors)
+        assert not (topk_candidates_packed and processors), (
+            "packed top-k candidates reached a plain chunk with processors"
+        )
         if not top_tokens:
             for proc in processors:
                 logits = proc.apply(logits)
@@ -6501,7 +6500,9 @@ class TPUModelRunner(GPUModelRunner):
         elif topk_candidates_packed:
             # _topk_candidates_this_step keeps thinking-budget steps off the
             # packed candidates.
-            assert not processors
+            assert not processors, (
+                "packed top-k candidates reached a verify chunk with processors"
+            )
             padded_num_reqs = md.bonus_logits_indices.shape[0]
             req_temperatures, req_top_k, req_top_p = self._build_padded_sampling_params(
                 cur_start_idx,
@@ -8579,7 +8580,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     dummy_u_cand = (
                         None
-                        if getattr(self.device, "type", None) == "tpu"
+                        if self.device.type == "tpu"
                         else torch.zeros(
                             (num_reqs, num_packed_cand),
                             dtype=torch.float32,
@@ -8873,7 +8874,7 @@ class TPUModelRunner(GPUModelRunner):
         # As at serving time (_sample_spec_verify_chunk): the fused verify
         # programs run on TPU with the stock rejection sampler, and draw their
         # uniforms in-graph there.
-        warm_fused = getattr(self.device, "type", None) == "tpu" and isinstance(
+        warm_fused = self.device.type == "tpu" and isinstance(
             self.rejection_sampler, RejectionSampler
         )
         with self._precompile_timed("rejection_sampler"):
@@ -9119,7 +9120,7 @@ class TPUModelRunner(GPUModelRunner):
             target_argmax=target_argmax,
         )
         synchronize_tensors(out)
-        if getattr(self.device, "type", None) == "tpu" and isinstance(
+        if self.device.type == "tpu" and isinstance(
             self.rejection_sampler, RejectionSampler
         ):
             # The fused program _sample_spec_verify_chunk runs on TPU.
@@ -11079,7 +11080,8 @@ class TPUModelRunner(GPUModelRunner):
     def compute_selected_topk_candidates(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
     ) -> torch.Tensor:
-        assert self._greedy_head_owner is not None
+        if self._greedy_head_owner is None:
+            raise RuntimeError("packed top-k candidates require a greedy head owner")
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return greedy_top_tokens.topk_candidates(self._greedy_head_owner, selected)
 
@@ -11087,7 +11089,8 @@ class TPUModelRunner(GPUModelRunner):
     def compute_topk_candidates_from_hidden_states(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        assert self._greedy_head_owner is not None
+        if self._greedy_head_owner is None:
+            raise RuntimeError("packed top-k candidates require a greedy head owner")
         return greedy_top_tokens.topk_candidates(self._greedy_head_owner, hidden_states)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)

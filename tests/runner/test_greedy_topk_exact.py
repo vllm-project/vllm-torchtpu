@@ -20,7 +20,7 @@ shard's candidates really are its exact local top-32: a single shard can hold
 all of the global top-k.
 
 ``_extract_local_topk32_torch`` (bf16 fallback head, the target model's path)
-and ``_extract_local_topk32_jax`` (W8A8/W4A8 fused head) are extracted from the
+and ``_extract_local_topk32_jax`` (W8A8 fused head) are extracted from the
 source with ``ast`` (the module imports vLLM / torch_tpu) and compared against
 an exact ``topk``.
 """

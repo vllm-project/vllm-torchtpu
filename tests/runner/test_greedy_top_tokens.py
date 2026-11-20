@@ -791,9 +791,10 @@ def test_tpu_topk_candidates_contain_global_top20(
     monkeypatch, vocab_size, dtype, tp_size
 ):
     gen = torch.Generator().manual_seed(200 + vocab_size + tp_size)
-    # Give every row 20 clearly separated top tokens placed across up to 8
-    # blocks of 64 per shard so both the 2-stage block reducer (shard_vocab >= 512)
-    # and direct topk fallback (shard_vocab < 512) preserve the exact global Top-20.
+    # Give every row 20 clearly separated top tokens placed across several
+    # blocks of 64 per shard so both the 2-stage block reducer (shard_vocab >=
+    # 2048, 32 blocks of 64) and the direct topk fallback (shard_vocab < 2048)
+    # preserve the exact global Top-20.
     weight = (torch.randn(vocab_size, 16, generator=gen) * 0.1).to(dtype)
     hidden_states = torch.zeros(5, 16, dtype=dtype)
     per_rank = math.ceil(vocab_size / tp_size)
