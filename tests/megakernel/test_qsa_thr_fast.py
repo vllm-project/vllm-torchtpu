@@ -125,8 +125,9 @@ def test_tie_skip_without_truncation_check_is_caught():
                                       ([6000, 100], True)])
 def test_kernel_thr_fast_bit_identical(monkeypatch, ctx, zero):
     """The step kernel (long mode, union attention, 16 score rows: tiers 8 / 12 / 16) with
-    VLLM_TPU_MK_QSA_THR_FAST=1 gives bit-identical ids, residuals, keys and rings: requests
-    in each tier, a select-all request, and all-zero keys (every row a truncated tie)."""
+    VLLM_TPU_MK_QSA_THR_FAST (1 = ter2, ter, tec2) gives bit-identical ids, residuals, keys
+    and rings: requests in each tier, a select-all request, and all-zero keys (every row a
+    truncated tie)."""
     from test_wholestep import _run_c
 
     ck_fn = (lambda ck: jnp.zeros_like(ck)) if zero else None
