@@ -313,3 +313,13 @@ def test_malformed_setting_is_refused(section, match):
             SimpleNamespace(additional_config={"tpu_kv_transfer": section})
         )
     assert kv_transfer_page_option(SimpleNamespace(additional_config={})) is None
+
+
+@pytest.mark.parametrize("page", [512, 4096])
+def test_pcp_engine_honours_a_page_only_its_list_has(monkeypatch, page):
+    """A PCP engine's page list goes up to 4096 tokens; a page past 256 is
+    honoured there."""
+    with _engine(
+        monkeypatch, kv_role="kv_producer", pcp=4, section={"kernel_page_tokens": page}
+    ):
+        assert BATCHED.get_supported_kernel_block_sizes() == [page]
