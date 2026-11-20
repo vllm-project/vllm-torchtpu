@@ -117,7 +117,7 @@ class TPUMultiConnector(MultiConnector):
         Upstream's MultiConnector requires every child. The offloading child
         restores the lagging recurrent state from the host tier by itself, so
         a disagg producer next to it (which never loads) must not veto the
-        capability. PrefixAwareScheduler then asks that child, through
+        capability. TpuPipelineChunkScheduler then asks that child, through
         ``resolve_divergent_local_hit_tokens``, how much of the hit to keep.
 
         This applies only on a producer whose kv_connector_extra_config sets

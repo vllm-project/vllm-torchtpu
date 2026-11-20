@@ -232,7 +232,7 @@ class TestTPUMultiConnectorDivergentHitWarning:
 
 
 class TestTPUMultiConnectorHybridHitForwarding:
-    """The prefix-hit hooks PrefixAwareScheduler calls on the connector."""
+    """The prefix-hit hooks TpuPipelineChunkScheduler calls on the connector."""
 
     @staticmethod
     def _multi(*children, producer_divergent_hits=True):
