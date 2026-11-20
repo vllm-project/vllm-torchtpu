@@ -680,6 +680,13 @@ def test_warmup_scope_survives_a_failure():
     assert shape_variants._deferred is None
 
 
+def test_in_warmup_holds_only_inside_the_warmup():
+    assert not shape_variants.in_warmup()
+    with shape_variants.warmup():
+        assert shape_variants.in_warmup()
+    assert not shape_variants.in_warmup()
+
+
 def test_a_guard_the_range_cannot_express_still_refuses():
     """The guard list is read, not just var_to_range.
 
@@ -1285,13 +1292,6 @@ def test_input_delta_names_the_earlier_trace_for_an_input_only_this_one_takes():
     # What the earlier trace's ShapeEnv knows of the symbol s_hid reads.
     assert "in the earlier trace" in named
     assert "in this trace" not in named
-
-
-def test_in_warmup_holds_only_inside_the_warmup():
-    assert not shape_variants.in_warmup()
-    with shape_variants.warmup():
-        assert shape_variants.in_warmup()
-    assert not shape_variants.in_warmup()
 
 
 def test_input_delta_names_the_int_input_one_trace_dropped():

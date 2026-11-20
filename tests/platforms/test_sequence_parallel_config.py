@@ -78,7 +78,7 @@ def test_sequence_parallel_compile_sizes(configure_sp_moe, tp, original, expecte
     assert compilation_config.compile_sizes == expected
 
 
-def test_by_default_every_bucket_follows_mains_rule(configure_sp_moe):
+def test_default_threshold_keeps_only_tp_aligned_buckets(configure_sp_moe):
     """Until a model follows each step's form, no step runs replicated, so
     every compile size must split over TP as on main."""
     parallel_config = SimpleNamespace(
