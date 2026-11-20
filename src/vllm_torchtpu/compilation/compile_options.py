@@ -18,9 +18,10 @@
 
 Every option defaults to off, which is main's behaviour. The options change
 how compiled programs are guarded and called, so the section stays in the
-compile-cache key. The worker applies them with :func:`apply` when it is
-built, before any compiled function runs; the torch.compile hook in
-``fast_dispatch`` is installed at import but does nothing until then.
+compile-cache key. They act on the functions compiled with
+``fast_dispatch.tpu_compile``. The worker applies them with :func:`apply` when
+it is built, before any compiled function runs; until then those functions
+behave as plain ``torch.compile`` ones.
 """
 
 import dataclasses
@@ -90,7 +91,7 @@ def get(vllm_config: "VllmConfig | None") -> CompileOptions:
 
 
 def apply(vllm_config: "VllmConfig | None") -> CompileOptions:
-    """Arm the torch.compile hook of this process with the engine's options."""
+    """Arm this process's ``tpu_compile`` functions with the engine's options."""
     from vllm_torchtpu.compilation import fast_dispatch
 
     options = get(vllm_config)
