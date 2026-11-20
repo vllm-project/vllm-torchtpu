@@ -23,7 +23,9 @@ ids with its own kept copy, so no id is guessed. Both sides change a slot
 only for an add request, and add requests reach the engine core in the order
 the API server sends them, on one socket. The engine core checks the prompt's
 length and the last shared id against the API server's, and fails the request
-if either differs.
+if either differs. A failed request also empties the slot it was to be kept
+in, so a later request that shares ids from that slot fails instead of joining
+ids the API server does not have there.
 
 A kept prompt is replaced only by a prompt that extends it, so a prompt that
 shares only the system prompt with another conversation's prompt does not
@@ -251,6 +253,19 @@ class ReceivedPrompts:
         self.counts = Counts()
 
     def join(self, header: Header, ids: list[int]) -> list[int]:
+        """The full prompt, a list of its own: the request may change it in place, as
+        the producer side of a KV transfer drops the last prompt id."""
+        try:
+            full = self.joined(header, ids)
+        except ValueError:
+            self.kept[header.keep_slot] = []
+            raise
+        self.kept[header.keep_slot] = full
+        self.counts.add(header)
+        self.counts.log("the engine core joined", sum(1 for kept in self.kept if kept))
+        return list(full)
+
+    def joined(self, header: Header, ids: list[int]) -> list[int]:
         if header.shared_slot == NO_SLOT:
             full = ids[HEADER_IDS:]
         else:
@@ -270,9 +285,6 @@ class ReceivedPrompts:
                 f"VLLM_TPU_SEND_NEW_PROMPT_IDS: joined {len(full)} prompt ids, "
                 f"the API server sent a prompt of {header.total}"
             )
-        self.kept[header.keep_slot] = full
-        self.counts.add(header)
-        self.counts.log("the engine core joined", sum(1 for kept in self.kept if kept))
         return full
 
 

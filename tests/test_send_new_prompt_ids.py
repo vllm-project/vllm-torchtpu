@@ -215,6 +215,26 @@ def test_a_wrong_slot_fails_the_request():
         received.join(Header(0, 3, 3, 1, 5), [-1, 0, 3, 3, 1, 5, 9])
 
 
+def test_a_change_to_the_request_prompt_leaves_the_kept_one(patched):
+    client, engine = Client(), Engine()
+    first = list(range(3 * PROBE_EVERY))
+    received = engine.receive(_send(client, _request("a", list(first))))
+    received.pop()
+    second = first + [7, 8, 9]
+    assert engine.receive(_send(client, _request("b", list(second)))) == second
+
+
+def test_a_failed_join_empties_the_slot_it_keeps():
+    received = ReceivedPrompts(capacity=2)
+    received.join(Header(-1, 0, 0, 0, 3), [-1, -1, 0, 0, 0, 3, 1, 2, 3])
+    received.join(Header(-1, 0, 0, 1, 3), [-1, -1, 0, 0, 1, 3, 4, 2, 3])
+    with pytest.raises(ValueError, match="does not hold"):
+        received.join(Header(0, 3, 9, 1, 4), [-1, 0, 3, 9, 1, 4, 5])
+    assert received.kept[1] == []
+    with pytest.raises(ValueError, match="does not hold"):
+        received.join(Header(1, 3, 3, 1, 4), [-1, 1, 3, 3, 1, 4, 5])
+
+
 @pytest.mark.parametrize("seed", range(20))
 def test_shared_length_matches_a_scan(seed):
     rng = random.Random(seed)
