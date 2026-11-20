@@ -21,6 +21,7 @@ import torch
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 
+from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
 from vllm_torchtpu.layers.adapter.sample.token_bitmask import unpack_token_bitmask
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
@@ -401,13 +402,13 @@ class StructuredDecodingManager:
         )
         return self.pin_invalid_draft_tokens(invalid_mask, draft_token_ids)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def pin_invalid_draft_tokens(
         self, invalid_mask: torch.Tensor, draft_token_ids: torch.Tensor
     ) -> torch.Tensor:
         return torch.where(invalid_mask, -1, draft_token_ids)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def structured_decode(
         self,
         require_struct_decoding: torch.Tensor,
