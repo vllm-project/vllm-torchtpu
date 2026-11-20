@@ -337,6 +337,14 @@ def _ensure_tpu_quant_ops_registered() -> dict[str, Any]:
     return _TPU_QUANT_OPS
 
 
+def _has_vocab_padding(lm_head: torch.nn.Module) -> bool:
+    """Whether the head pads its vocabulary: the same answer on every rank,
+    so all ranks build one program, although only the last shard holds the
+    padding rows (its own count is the ``num_org_vocab_padding`` buffer)."""
+    head = cast("VocabParallelEmbedding", lm_head)
+    return head.org_vocab_size_padded > head.org_vocab_size
+
+
 def _quantized_head_local_max(
     processor: LogitsProcessor,
     lm_head: torch.nn.Module,
@@ -352,11 +360,7 @@ def _quantized_head_local_max(
             0,
         )
     )
-    has_vocab_padding = (
-        isinstance(pad_buf, torch.Tensor)
-        and getattr(processor, "vocab_size", 0)
-        < getattr(processor, "padded_vocab_size", 0)
-    ) or (not isinstance(pad_buf, torch.Tensor) and num_pad_int > 0)
+    has_vocab_padding = _has_vocab_padding(lm_head)
 
     if hidden_states.device.type == "tpu":
         ops = _ensure_tpu_quant_ops_registered()
@@ -389,9 +393,7 @@ def _quantized_head_local_max(
         cast(torch.Tensor, lm_head._w8a8_scale).float().unsqueeze(0)
     )
 
-    if isinstance(pad_buf, torch.Tensor) and (
-        getattr(processor, "vocab_size", 0) < getattr(processor, "padded_vocab_size", 0)
-    ):
+    if isinstance(pad_buf, torch.Tensor) and _has_vocab_padding(lm_head):
         shard_vocab = logits.shape[-1]
         col_idx = torch.arange(shard_vocab, device=logits.device, dtype=torch.int32)
         valid_cols = shard_vocab - pad_buf.to(device=logits.device, dtype=torch.int32)
@@ -471,9 +473,7 @@ def tpu_get_top_tokens(
         logits = logits * self.scale
 
     pad_buf: Any = getattr(lm_head, "num_org_vocab_padding", None)
-    if isinstance(pad_buf, torch.Tensor) and (
-        getattr(self, "vocab_size", 0) < getattr(self, "padded_vocab_size", 0)
-    ):
+    if isinstance(pad_buf, torch.Tensor) and _has_vocab_padding(lm_head):
         shard_vocab = logits.shape[-1]
         col_idx = torch.arange(shard_vocab, device=logits.device, dtype=torch.int32)
         valid_cols = shard_vocab - pad_buf.to(device=logits.device, dtype=torch.int32)
@@ -581,11 +581,7 @@ def _quantized_head_local_topk(
             0,
         )
     )
-    has_vocab_padding = (
-        isinstance(pad_buf, torch.Tensor)
-        and getattr(processor, "vocab_size", 0)
-        < getattr(processor, "padded_vocab_size", 0)
-    ) or (not isinstance(pad_buf, torch.Tensor) and num_pad_int > 0)
+    has_vocab_padding = _has_vocab_padding(lm_head)
 
     if hidden_states.device.type == "tpu":
         ops = _ensure_tpu_quant_ops_registered()
@@ -619,9 +615,7 @@ def _quantized_head_local_topk(
     )
     logits = logits.to(hidden_states.dtype)
 
-    if isinstance(pad_buf, torch.Tensor) and (
-        getattr(processor, "vocab_size", 0) < getattr(processor, "padded_vocab_size", 0)
-    ):
+    if isinstance(pad_buf, torch.Tensor) and _has_vocab_padding(lm_head):
         shard_vocab = logits.shape[-1]
         col_idx = torch.arange(shard_vocab, device=logits.device, dtype=torch.int32)
         valid_cols = shard_vocab - pad_buf.to(device=logits.device, dtype=torch.int32)
