@@ -37,9 +37,9 @@ HBM copy before the kernel. To avoid that 2.30 GiB/pool copy in 1-launch mode
      path **opt-in** (`fused_pool_io=False` by default everywhere) and verify
      both `check_fused_pooled_step_hlo` and outer `torch_tpu` donation IR on
      every compiled bucket when enabled. `make_pooled_step` /
-     `make_flat_pooled_step` raise `ValueError` for a fused build with
-     `donate_pools=False`, and the vLLM driver IR-checks every fused bucket
-     during warmup (eager mode included).
+     `make_flat_pooled_step` raise `MegakernelConfigError` (a `RuntimeError`)
+     for a fused build with `donate_pools=False`, and the vLLM driver IR-checks
+     every fused bucket during warmup (eager mode included).
 
 2. **On CPU (`ex.interpret != False`)**:
    - `GQAModule.outputs` declares `O[POOL_STATE_NAME]` (`access="w"`), and
@@ -55,6 +55,7 @@ from typing import Any
 from .cache_common import should_fuse_pool_io
 from .cache_hlo import check_fused_pooled_step_hlo
 from .exec_spec import ExecSpec
+from .pool.config import FUSED_POOL_IO_MAX_B, FUSED_POOL_IO_MIN_B_HI
 
 
 def make_flat_fused_pooled_step(
@@ -64,8 +65,8 @@ def make_flat_fused_pooled_step(
     *,
     donate_pools: bool = True,
     fused_pool_io: bool | str = True,
-    max_b_low: int = 24,
-    min_b_hi: int = 56,
+    max_b_low: int = FUSED_POOL_IO_MAX_B,
+    min_b_hi: int = FUSED_POOL_IO_MIN_B_HI,
 ) -> tuple[Any, tuple[Any, ...], tuple[Any, ...], tuple[int, ...]]:
     """Build an experimental flat-signature `shard_map` step with `fused_pool_io`."""
     from . import cache
@@ -88,8 +89,8 @@ def make_fused_pooled_step(
     *,
     donate_pools: bool = True,
     fused_pool_io: bool | str = True,
-    max_b_low: int = 24,
-    min_b_hi: int = 56,
+    max_b_low: int = FUSED_POOL_IO_MAX_B,
+    min_b_hi: int = FUSED_POOL_IO_MIN_B_HI,
 ) -> Any:
     """Build an experimental `jax.jit` `shard_map` step with `fused_pool_io`.
 

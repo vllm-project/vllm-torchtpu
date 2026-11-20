@@ -1132,13 +1132,15 @@ def test_donate_pools_all_call_shapes_no_pool_copy():
     assert all(buf.is_deleted() for buf in r4)
 
     # Also verify check_pooled_step_hlo negative cases
-    bad_single_cc, _ = mk.check_pooled_step_hlo("tpu_custom_call scatter_pool_states")
-    assert not bad_single_cc
-    bad_copy, _ = mk.check_pooled_step_hlo(
-        "tpu_custom_call tpu_custom_call scatter_pool_states "
+    bad_single_cc, msg_cc = mk.check_pooled_step_hlo(
+        "HloModule m\ntpu_custom_call scatter_pool_states"
+    )
+    assert not bad_single_cc and "megakernel" in msg_cc
+    bad_copy, msg_copy = mk.check_pooled_step_hlo(
+        "HloModule m\ntpu_custom_call tpu_custom_call scatter_pool_states "
         "%c = f8e4m3fn[64,2,64,4,128] copy(%p)"
     )
-    assert not bad_copy
+    assert not bad_copy and "full-pool" in msg_copy
 
 
 @pytest.mark.parametrize("T,B", [(1, 2), (2, 4)])

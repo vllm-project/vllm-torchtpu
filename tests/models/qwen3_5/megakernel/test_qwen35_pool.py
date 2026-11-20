@@ -117,7 +117,7 @@ def test_qwen35_pool_layout_matches_geometry():
 def test_check_pooled_step_hlo_uses_layout_page_shape():
     """Full-pool copies are matched on the layout's page shape."""
     lay = mk.PoolLayout(hd=128, kvh=2)  # pages (4, 32, 4, 128)
-    head = "tpu_custom_call tpu_custom_call scatter_pool_states\n"
+    head = "HloModule m\ntpu_custom_call tpu_custom_call scatter_pool_states\n"
     copy_lay = head + "%c = f8e4m3fn[64,4,32,4,128] copy(%p)"
     copy_default = head + "%c = f8e4m3fn[64,2,64,4,128] copy(%p)"
     staging = head + "%c = f8e4m3fn[5,4,32,4,128] copy(%p)"
@@ -125,6 +125,9 @@ def test_check_pooled_step_hlo_uses_layout_page_shape():
     assert mk.check_pooled_step_hlo(copy_default, layout=lay)[0]
     assert mk.check_pooled_step_hlo(staging, layout=lay)[0]
     assert not mk.check_pooled_step_hlo(copy_default)[0]
+    # StableHLO MLIR text (no `HloModule`) cannot be scanned for pool copies.
+    ok_mlir, msg_mlir = mk.check_pooled_step_hlo(staging.replace("HloModule", ""))
+    assert not ok_mlir and "compile().as_text()" in msg_mlir
 
 
 def test_full_pooled_step_att_every_2():

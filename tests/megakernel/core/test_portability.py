@@ -402,7 +402,7 @@ def test_b7_file_line_and_noqa_caps():
 
     capped_globs = (
         "__init__.py",
-        "cache.py",
+        "cache*.py",
         "collectives/*.py",
         "derive.py",
         "model_def.py",

@@ -11,188 +11,131 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Sharded body of the pooled step: `shard_map` specs and the per-rank
-gather / megakernel / scatter."""
+"""Sharding of the pooled step: `shard_map` specs of the step metadata, the
+host-side per-rank checkpoint bounds check, and the sharded call of the
+per-rank body (`cache_flat.run_local`)."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import Any
 
 import jax
-import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from . import kernel
-from .cache_common import (
-    ModeTag,
-    resolve_active_seqs_mode,
-    unwrap_active_seqs,
-    validate_page_table_shape,
-)
+from .cache_common import PooledBuild, validate_page_table_shape
+from .cache_flat import local_meta, run_local
 from .pool import check_ckpt_bounds
-from .pool.config import cache_exec, with_cache
-
-if TYPE_CHECKING:
-    from .cache_pooled import PooledBuild
+from .pool.backend import resolve_active_seqs
+from .pool.config import cache_exec
 
 
-def run_local(
-    b: PooledBuild,
-    pos: Any,
-    hidden: Any,
-    weights: dict[str, Any],
-    raw_pools: tuple[jax.Array, ...],
-    page_table: jax.Array,
-    ckpt_indices: jax.Array | None,
-    read_offsets: jax.Array | None,
-    extra_tuple: tuple[Any, ...],
-    active_seqs: Any,
-) -> tuple[jax.Array, tuple[jax.Array, ...]]:
-    """One rank's step: unpack weights, run the kernel, write the pools back."""
-    pb, ex_paged, use_fused, use_gpr = b.pb, b.ex_paged, b.use_fused, b.use_gpr
-    call, w_names, s_names, o_names = b.call, b.w_names, b.s_names, b.o_names
-    wsh, has_rec, pool_key, pt_key = b.wsh, b.has_rec, b.pool_key, b.pt_key
-    max_pt, _get_compiled = b.max_pt, b.get_compiled
-    active_seqs = unwrap_active_seqs(active_seqs)
-    raw_6d = raw_pools[0].ndim == 6
-    raw_in = tuple(r.squeeze(0) for r in raw_pools) if raw_6d else tuple(raw_pools)
-    if page_table.ndim == 3:
-        page_table = page_table.squeeze(0)
-    if page_table.shape[-1] > max_pt:
-        page_table = page_table[..., :max_pt]
-    if ckpt_indices is not None and ckpt_indices.ndim == 4:
-        ckpt_indices = ckpt_indices.squeeze(0)
-    if read_offsets is not None and read_offsets.ndim == 3:
-        read_offsets = read_offsets.squeeze(0)
-    if (
-        active_seqs is not None
-        and not isinstance(active_seqs, str)
-        and active_seqs.ndim == 2
-    ):
-        active_seqs = active_seqs.squeeze(0)
+@jax.tree_util.register_pytree_node_class
+@dataclass(frozen=True)
+class ModeTag:
+    """Zero-leaf pytree wrapper for string modes like `'from_ckpt'` in `jax.jit`."""
 
-    w = [
-        tuple(
-            kernel.unpack_local_weight(
-                x,
-                kernel.target_weight_shape(wsh[k]),
-                name=k,
-                allow_merged_tiles=True,
+    mode: str
+
+    def tree_flatten(self) -> tuple[tuple[()], str]:
+        return (), self.mode
+
+    @classmethod
+    def tree_unflatten(cls, aux_data: str, children: tuple[()]) -> ModeTag:
+        del children
+        return cls(aux_data)
+
+
+def wrap_active_seqs(active_seqs: Any) -> Any:
+    """Wrap an `active_seqs` mode string so it passes `jax.jit` as static data."""
+    if isinstance(active_seqs, str):
+        if active_seqs not in ("from_ckpt", "all"):
+            raise ValueError(
+                f"Unsupported active_seqs mode {active_seqs!r}; "
+                "expected 'from_ckpt', 'all', None, or an int32/bool mask array"
             )
-            for x in weights[k]
-        )
-        if isinstance(weights[k], tuple)
-        else kernel.unpack_local_weight(
-            weights[k],
-            kernel.target_weight_shape(wsh[k]),
-            name=k,
-            allow_merged_tiles=True,
-        )
-        for k in w_names
-    ]
+        return ModeTag(active_seqs)
+    return active_seqs
 
-    if use_fused or use_gpr:
-        act_mode_l, active_mask_l = resolve_active_seqs_mode(
-            active_seqs, default_mode="from_ckpt" if has_rec else "all"
-        )
-        if has_rec and cache_exec(ex_paged).check_ckpt_bounds:
-            check_ckpt_bounds(
-                ckpt_indices,
-                cache_exec(ex_paged).num_pages,
-                pb.layout,
-                act_mode=act_mode_l,
-                active_mask=active_mask_l,
-                read_offsets=read_offsets,
-            )
-        ckpt_2d_l = bool(ckpt_indices is not None and ckpt_indices.ndim == 2)
-        ckpt_k_l = (
-            int(ckpt_indices.shape[-1]) if ckpt_indices is not None else ex_paged.T
-        )
-        roff_1d_l = bool(read_offsets is not None and read_offsets.ndim == 1)
-        call_l, info_l = _get_compiled(act_mode_l, ckpt_2d_l, ckpt_k_l, roff_1d_l)
-        p_l = info_l["plan"]
-        st_map_f: dict[str, Any] = {
-            pool_key: raw_in,
-            pt_key: page_table,
-        }
-        if has_rec:
-            st_map_f["ckpt_indices"] = ckpt_indices
-            st_map_f["read_offsets"] = read_offsets
-        if act_mode_l == "ref":
-            st_map_f["active_seqs"] = active_mask_l
-        s_args_f = [st_map_f[k] for k in p_l.s_names]
-        out_vals_f = call_l(pos, hidden, *w, *s_args_f, *extra_tuple)
-        if not isinstance(out_vals_f, (tuple, list)):
-            out_vals_f = (out_vals_f,)
-        out_map_f = dict(zip(p_l.o_names, out_vals_f))
-        hid = out_map_f["hidden"]
-        if use_fused:
-            raw_out = tuple(out_map_f[pool_key]) if pool_key in out_map_f else raw_in
-        else:
-            ex_scatter = (
-                with_cache(ex_paged, pool_gather=False, fused_pool_io=False)
-                if pb.layout.conv_itemsize == 4
-                else ex_paged
-            )
-            raw_out = pb.scatter_states(
-                ex_scatter,
-                raw_in,
-                pos,
-                page_table,
-                out_map_f,
-                ckpt_indices if has_rec else None,
-                active_seqs,
-            )
-        if raw_6d:
-            raw_out = tuple(jnp.expand_dims(r, 0) for r in raw_out)
-        return hid, raw_out
 
-    gathered = (
-        pb.gather_states(
-            ex_paged,
-            raw_in,
-            ckpt_indices,
-            read_offsets,
-            active_seqs,
-        )
-        if (has_rec and pb.gather_states is not None)
-        else {}
-    )
-
-    st_map: dict[str, Any] = {
-        **gathered,
-        pool_key: raw_in,
-        pt_key: page_table,
-    }
-    s_args = [st_map[k] for k in s_names]
-    out_vals = call(pos, hidden, *w, *s_args, *extra_tuple)
-    if not isinstance(out_vals, (tuple, list)):
-        out_vals = (out_vals,)
-    out_map = dict(zip(o_names, out_vals))
-    hid = out_map["hidden"]
-
-    raw_out = pb.scatter_states(
-        ex_paged,
-        raw_in,
-        pos,
-        page_table,
-        out_map,
-        ckpt_indices if has_rec else None,
-        active_seqs,
-    )
-
-    if raw_6d:
-        raw_out = tuple(jnp.expand_dims(r, 0) for r in raw_out)
-    return hid, raw_out
+def unwrap_active_seqs(active_seqs: Any) -> Any:
+    return active_seqs.mode if isinstance(active_seqs, ModeTag) else active_seqs
 
 
 def _meta_spec(b: PooledBuild, arr: Any, ns_dim: int, max_unsharded_ndim: int = 2) -> P:
     ex_paged = b.ex_paged
-    if isinstance(arr, ModeTag) or arr is None or ex_paged.R <= 1:
+    if isinstance(arr, (ModeTag, str)) or arr is None or ex_paged.R <= 1:
         return P()
     if arr.ndim > max_unsharded_ndim:
         return P("tp") if arr.shape[0] == ex_paged.R else P()
     return P("tp") if arr.shape[0] == ex_paged.R * ns_dim else P()
+
+
+def meta_specs(
+    b: PooledBuild, page_table: Any, ckpt: Any, roff: Any, active: Any
+) -> dict[str, P]:
+    """`shard_map` spec of each step metadata array: `P("tp")` for rank-folded
+    (leading `R * n` or rank-leading `R`) arrays, else replicated."""
+    ns, slots = b.ex_paged.NS, b.rec_slots
+    ckpt_2d = ckpt is not None and ckpt.ndim == 2
+    roff_1d = roff is not None and roff.ndim == 1
+    return {
+        b.pt_key: _meta_spec(b, page_table, ns, max_unsharded_ndim=2),
+        "ckpt_indices": _meta_spec(
+            b, ckpt, ns if ckpt_2d else slots, max_unsharded_ndim=3
+        ),
+        "read_offsets": _meta_spec(
+            b, roff, ns if roff_1d else slots, max_unsharded_ndim=2
+        ),
+        "active_seqs": _meta_spec(b, active, ns, max_unsharded_ndim=1),
+    }
+
+
+def check_ckpt_bounds_per_rank(
+    b: PooledBuild, page_table: Any, ckpt: Any, roff: Any, active_seqs: Any
+) -> None:
+    """Host-side `check_ckpt_bounds` on the metadata each rank receives.
+
+    Slices rank-folded arrays exactly like `raw_step` shards them
+    (`meta_specs`), so `(R * NS, K)` / `(R, ...)` metadata is checked per rank.
+    """
+    ex, active_seqs = b.ex_paged, unwrap_active_seqs(active_seqs)
+    specs = meta_specs(b, page_table, ckpt, roff, active_seqs)
+    arrs = {
+        b.pt_key: page_table,
+        "ckpt_indices": ckpt,
+        "read_offsets": roff,
+        "active_seqs": active_seqs,
+    }
+
+    def _rank(k: str, r: int) -> Any:
+        x = arrs[k]
+        if specs[k] != P("tp"):
+            return x
+        n = x.shape[0] // ex.R
+        return x[r * n : (r + 1) * n]
+
+    for r in range(ex.R):
+        _, ckpt_r, roff_r, act_r = local_meta(
+            b,
+            _rank(b.pt_key, r),
+            _rank("ckpt_indices", r),
+            _rank("read_offsets", r),
+            _rank("active_seqs", r),
+        )
+        act_mode, mask = resolve_active_seqs(
+            act_r, default_mode="from_ckpt", ns=ex.NS, has_recurrent=b.has_rec
+        )
+        check_ckpt_bounds(
+            ckpt_r,
+            cache_exec(ex).num_pages,
+            b.pb.layout,
+            act_mode=act_mode,
+            active_mask=mask,
+            read_offsets=roff_r,
+            ns=ex.NS,
+            min_k=ex.T,
+        )
 
 
 def raw_step(
@@ -208,9 +151,8 @@ def raw_step(
     *extra_tuple: Any,
 ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
     """Shard the pooled step's arguments and run `run_local` per rank."""
-    mesh, ex_paged, extras, has_rec = b.mesh, b.ex_paged, b.extras, b.has_rec
-    rec_slots, pt_key = b.rec_slots, b.pt_key
-    validate_page_table_shape(page_table, ex_paged)
+    pt_key = b.pt_key
+    validate_page_table_shape(page_table, b.ex_paged)
     ws = {
         k: tuple(P("tp") for _ in weights[k])
         if isinstance(weights[k], tuple)
@@ -218,36 +160,16 @@ def raw_step(
         for k in weights
     }
     raw_spec = tuple(P("tp") for _ in raw_pools)
-    extra_specs = tuple(P("tp") if x.memory_space == "hbm" else P() for x in extras)
+    extra_specs = tuple(P("tp") if x.memory_space == "hbm" else P() for x in b.extras)
 
+    all_specs = meta_specs(b, page_table, ckpt_indices, read_offsets, active_wrapped)
     meta: dict[str, Any] = {pt_key: page_table}
-    meta_specs: dict[str, Any] = {
-        pt_key: _meta_spec(b, page_table, ex_paged.NS, max_unsharded_ndim=2)
-    }
-    if has_rec:
+    if b.has_rec:
         meta["ckpt_indices"] = ckpt_indices
         meta["read_offsets"] = read_offsets
-        meta_specs["ckpt_indices"] = _meta_spec(
-            b,
-            ckpt_indices,
-            ex_paged.NS
-            if (ckpt_indices is not None and ckpt_indices.ndim == 2)
-            else rec_slots,
-            max_unsharded_ndim=3,
-        )
-        meta_specs["read_offsets"] = _meta_spec(
-            b,
-            read_offsets,
-            ex_paged.NS
-            if (read_offsets is not None and read_offsets.ndim == 1)
-            else rec_slots,
-            max_unsharded_ndim=2,
-        )
     if active_wrapped is not None:
         meta["active_seqs"] = active_wrapped
-        meta_specs["active_seqs"] = _meta_spec(
-            b, active_wrapped, ex_paged.NS, max_unsharded_ndim=1
-        )
+    m_specs = {k: all_specs[k] for k in meta}
 
     def local_pos(
         pos_l: Any,
@@ -267,13 +189,13 @@ def raw_step(
             meta_l.get("ckpt_indices"),
             meta_l.get("read_offsets"),
             extra_l,
-            meta_l.get("active_seqs"),
+            unwrap_active_seqs(meta_l.get("active_seqs")),
         )
 
     return jax.shard_map(
         local_pos,
-        mesh=mesh,
-        in_specs=(P(), P("tp"), ws, raw_spec, meta_specs) + extra_specs,
+        mesh=b.mesh,
+        in_specs=(P(), P("tp"), ws, raw_spec, m_specs) + extra_specs,
         out_specs=(P("tp"), raw_spec),
         check_vma=False,
     )(pos, hidden, weights, raw_pools, meta, *extra_tuple)

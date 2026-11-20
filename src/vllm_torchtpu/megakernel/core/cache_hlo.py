@@ -15,7 +15,22 @@
 
 from __future__ import annotations
 
+import dataclasses
+
+import jax.numpy as jnp
+
 from .pool import POOL_KERNEL_NAMES, PoolLayout
+
+# HLO primitive type names of the non-fp8 page dtypes (fp8 maps by prefix).
+_HLO_DTYPES = {"bfloat16": "bf16", "float16": "f16", "float32": "f32"}
+
+
+def _hlo_dtype(dtype: object) -> str:
+    """HLO primitive type name of `dtype` (e.g. `float8_e4m3fn` -> `f8e4m3fn`)."""
+    name = jnp.dtype(dtype).name
+    if name.startswith("float8_"):
+        return "f8" + name.removeprefix("float8_")
+    return _HLO_DTYPES.get(name, name)
 
 
 def check_fused_pooled_step_hlo(
@@ -59,11 +74,24 @@ def check_pooled_step_hlo(
     checkpoint-slot (`pages_per_slot`-page) staging slices materialized in CPU
     interpret mode while flagging any full-pool HBM copy
     (`num_pages >= min_pool_pages`).
+
+    `hlo_text` must be XLA HLO text (`HloModule ...`), preferably the compiled
+    module (`jax.jit(...).lower(...).compile().as_text()`); StableHLO MLIR text
+    (`.lower(...).as_text()`) is rejected, since its pool copies cannot be matched.
     """
+    if "HloModule" not in hlo_text:
+        return (
+            False,
+            "not XLA HLO text (no 'HloModule'); pass the compiled module "
+            "text, `jax.jit(...).lower(...).compile().as_text()`",
+        )
     lay = PoolLayout() if layout is None else layout
-    page_size = lay.page_size if page_size is None else page_size
-    kvh = lay.kvh if kvh is None else kvh
-    hd = lay.hd if hd is None else hd
+    lay = dataclasses.replace(
+        lay,
+        page_size=lay.page_size if page_size is None else page_size,
+        kvh=lay.kvh if kvh is None else kvh,
+        hd=lay.hd if hd is None else hd,
+    )
     if kernel_names is None:
         kernel_names = POOL_KERNEL_NAMES
     n_tpu_cc = hlo_text.count("tpu_custom_call")
@@ -97,10 +125,11 @@ def check_pooled_step_hlo(
             f"(found {n_tpu_cc} tpu_custom_call, need >={min_cc})"
         )
         return False, msg
-    pool_suffix = f",{2 * kvh},{hd // 4},4,{page_size}]"
+    pool_suffix = "," + ",".join(map(str, lay.kv_page_shape)) + "]"
+    page_ty = f"= {_hlo_dtype(lay.page_dtype)}["
     for line in hlo_text.splitlines():
         if pool_suffix in line and (
-            "copy-start(" in line or ("= f8e4m3fn[" in line and "copy(" in line)
+            "copy-start(" in line or (page_ty in line and "copy(" in line)
         ):
             prefix = line.split(pool_suffix, 1)[0]
             dim_str = prefix.rsplit("[", 1)[-1].rsplit(",", 1)[-1].strip()
