@@ -361,7 +361,10 @@ def test_prequant_matmul_equals_the_quantizing_matmul():
 def test_build_ops_registers_with_the_real_op_bridge(monkeypatch):
     """`pallas.jax_op` validates the JAX function's signature, including its
     return annotation, at registration; the host stand-in above does not."""
-    # Seeded so the op's name is one no other test in the session registers.
+    # _build_ops names the op by how many it holds
+    # (gdn_gated_norm_out_proj_{len(_out_proj_ops)}) and torch's op registry
+    # lasts the whole session; the other tests start from an empty dict, so 901
+    # placeholders give this one a name they never reach.
     monkeypatch.setattr(
         gated_norm_quant_op, "_out_proj_ops", {("unused", i): None for i in range(901)}
     )
