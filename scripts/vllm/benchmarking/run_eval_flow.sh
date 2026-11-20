@@ -170,6 +170,8 @@ if [ "$SKIP_PERF_CHECK" = "0" ]; then
     if [ -f "$PERF_BASELINE" ]; then
         echo "Perf baseline for $TPU_CHIP: $PERF_BASELINE"
     else
+        # TODO(#<issue>): fail here instead of warning, once every perf-lane
+        # config has a baseline or passes --skip-perf-check.
         echo "::warning::No perf baseline for $TPU_CHIP at $PERF_BASELINE; reporting without the perf gate. Calibrate and check in a baseline to gate this config, or pass --skip-perf-check to report on purpose."
     fi
 fi

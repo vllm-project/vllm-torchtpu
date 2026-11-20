@@ -57,7 +57,7 @@ live server: once for performance, and once for each accuracy task.
 Compares the benchmark JSON to `baselines/perf/<chip>/<config>.baseline.json`,
 with a 5% tolerance. Baselines are per TPU chip. `run_eval_flow.sh` reads the
 chip from `TPU_ACCELERATOR_TYPE`, or from the GCE metadata when unset
-(`tpu7x-8` is chip `v7x`; `v6e-8` and `tpu6e` are `v6e`):
+(`tpu7x-8` is chip `v7x`; `v6e-8` is `v6e`):
 
 - A chip with no baseline for the config reports its numbers without the gate
   and prints a `::warning::` saying so. Check in a calibrated baseline to gate
@@ -228,7 +228,7 @@ prints the rows without posting them.
 | `PORT` | `8000` | Server port |
 | `BENCHMARK_MODE` | `serving` | Runner mode: `serving` or `spec_bench` (also `--mode`) |
 | `BENCHMARK_WARMUP_RUNS` | `0` | Full benchmark passes to discard before writing each gated result |
-| `TPU_ACCELERATOR_TYPE` | GCE metadata | The TPU's accelerator type (`tpu7x`, `v6e-8`). `run_eval_flow.sh` reads the chip from it to pick the perf baselines |
+| `TPU_ACCELERATOR_TYPE` | GCE metadata | The TPU's accelerator type (`tpu7x`, `v6e-8`). `run_eval_flow.sh` reads the chip from it to pick the perf baselines. It reads the machine that runs the script, so a `--host` run must set it to the server's type |
 | `EVAL_SOFT_FAIL` | `0` | `1` downgrades an eval regression to a `::warning` instead of failing the step. Perf regressions still fail. For a config whose eval baseline is new and whose run-to-run spread is not yet known — prefer it to `soft_fail` on the Buildkite step, which would mask the perf gate too. Forwarded into the pod by `.buildkite/kubernetes/common.sh` |
 | `RANGE_RATIO_STYLE` (config var) | `symmetric` | How `RANDOM_RANGE_RATIO` is interpreted: `symmetric` = vllm bench serve native `[(1-r)L, (1+r)L]`; `min` = benchmark_serving.py-style `[rL, L]`, translated for vllm bench serve |
 | `SPEC_METHOD` (config var) | (empty) | Speculative decoding method (`ngram`, `eagle3`, `mtp`, `dflash`, `dspark`); required when any `K > 0` |

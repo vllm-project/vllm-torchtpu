@@ -39,8 +39,6 @@ def _uncached_chip_version():
         (" TPU7X-8\n", pltpu.ChipVersion.TPU_7X),
         ("v6e", pltpu.ChipVersion.TPU_V6E),
         ("v6e-8", pltpu.ChipVersion.TPU_V6E),
-        ("tpu6e", pltpu.ChipVersion.TPU_V6E),
-        ("tpu6e-8", pltpu.ChipVersion.TPU_V6E),
         ("v5litepod-8", pltpu.ChipVersion.TPU_V5E),
     ],
 )
@@ -49,7 +47,7 @@ def test_an_accelerator_type_names_its_chip(accelerator_type, chip):
     assert tpu_info.get_chip_version(accelerator_type) is chip
 
 
-@pytest.mark.parametrize("accelerator_type", ["tpu6ee", "v6ee", "tpu7xx", "foo-8"])
+@pytest.mark.parametrize("accelerator_type", ["tpu6e", "v6ee", "tpu7xx", "foo-8"])
 def test_a_type_that_names_no_chip(accelerator_type, caplog):
     # The strict lookup raises. get_chip_version takes the type for TPU7x and
     # says so.

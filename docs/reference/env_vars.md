@@ -19,7 +19,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_MULTIHOST_BACKEND` | `""` (`mp` default, or `"ray"`) | Selects the multi-host execution backend (`"ray"` uses `RayDistributedExecutorV2`; unset uses native multiprocessing `mp`). See [Multi-Host Serving](../user_guide/multihost.md). |
 | `TORCH_TPU_BASE_PORT` | `8070` | Base TCP port for `torch_tpu` worker slice-builder communication. |
 | `TORCH_TPU_MP_RENDEZVOUS_PORT` | `None` | Optional explicit TCP port for multi-host `mp` `TCPStore` rendezvous. |
-| `TPU_ACCELERATOR_TYPE` | `None` | Explicit accelerator type override (e.g., `"tpu7x"`, `"v6e-8"`) when running offline compilation or CPU tests. |
+| `TPU_ACCELERATOR_TYPE` | `None` | Explicit accelerator type override (e.g., `"tpu7x"`, `"v6e-8"`) when running offline compilation or CPU tests. `run_eval_flow.sh` also reads the chip from it to pick the perf baselines (`baselines/perf/<chip>/`). |
 | `TPU_LIBRARY_PATH` | `None` | `libtpu.so` loaded by the TPU runtime. `import libtpu` sets it to the pip package's own library. A custom path (any other file) takes precedence over an installed `libtpu` package: a fingerprint of that file replaces the package version in the compile and Raiden layout cache keys, and the minimum libtpu version check is skipped. |
 
 ---

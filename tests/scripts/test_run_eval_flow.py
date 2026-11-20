@@ -13,11 +13,13 @@
 # limitations under the License.
 """run_eval_flow.sh gates a run on the perf baselines of the chip it is on."""
 
+import json
 import os
 import pathlib
 import subprocess
 import sys
 
+import pytest
 from jax.experimental.pallas import tpu as pltpu
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -25,7 +27,7 @@ _BENCHMARKING = pathlib.Path("scripts/vllm/benchmarking")
 _PERF_BASELINES = _REPO_ROOT / _BENCHMARKING / "baselines" / "perf"
 
 
-def _run_eval_flow(tmp_path, accelerator_type, config, *extra_args):
+def _run_eval_flow(tmp_path, accelerator_type, config, *extra_args, check_exit=None):
     """Runs run_eval_flow.sh against a server that is already up (--host).
 
     The script reaches python3 by name, and the baselines and the benchmark by
@@ -41,7 +43,22 @@ def _run_eval_flow(tmp_path, accelerator_type, config, *extra_args):
     benchmarking.mkdir(parents=True)
     (benchmarking / "baselines").symlink_to(_REPO_ROOT / _BENCHMARKING / "baselines")
     benchmark = benchmarking / "run_benchmarks.sh"
-    benchmark.write_text("#!/usr/bin/env bash\nexit 3\n")
+    if check_exit is None:
+        benchmark.write_text("#!/usr/bin/env bash\nexit 3\n")
+    else:
+        # The benchmark passes and leaves the config.json the script reads, so
+        # the run reaches the perf gate. The stand-in check records its
+        # arguments and exits with check_exit.
+        benchmark.write_text(
+            "#!/usr/bin/env bash\n"
+            'while [ $# -gt 0 ]; do [ "$1" = --results-dir ] && dir="$2"; shift; done\n'
+            'echo \'{"model": "m", "eval_tolerance": 0.05}\' > "$dir/config.json"\n'
+        )
+        (benchmarking / "check_regression.py").write_text(
+            "import json, os, sys\n"
+            "open(os.environ['CHECK_ARGS'], 'w').write(json.dumps(sys.argv[1:]))\n"
+            "sys.exit(int(os.environ['CHECK_EXIT']))\n"
+        )
     benchmark.chmod(0o755)
     src_dir = str(_REPO_ROOT / "src")
     pythonpath = (
@@ -67,6 +84,8 @@ def _run_eval_flow(tmp_path, accelerator_type, config, *extra_args):
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": pythonpath,
             "TPU_ACCELERATOR_TYPE": accelerator_type,
+            "CHECK_ARGS": str(tmp_path / "check_args.json"),
+            "CHECK_EXIT": str(check_exit or 0),
         },
         capture_output=True,
         text=True,
@@ -91,6 +110,17 @@ def test_tpu7x_run_gates_on_v7x_baseline(tmp_path):
     assert result.returncode == 3, result.stderr
     picked = _BENCHMARKING / "baselines" / "perf" / "v7x" / baseline.name
     assert f"Perf baseline for v7x: {picked}\n" in result.stdout
+
+
+@pytest.mark.parametrize("check_exit", [0, 1])
+def test_v7x_perf_check_gets_the_v7x_baseline_and_gates_the_run(tmp_path, check_exit):
+    baseline = min(_PERF_BASELINES.glob("v7x/*.baseline.json"))
+    config = baseline.name.removesuffix(".baseline.json")
+    result = _run_eval_flow(tmp_path, "tpu7x-8", config, check_exit=check_exit)
+    args = json.loads((tmp_path / "check_args.json").read_text())
+    picked = _BENCHMARKING / "baselines" / "perf" / "v7x" / baseline.name
+    assert args[args.index("--baseline") + 1] == str(picked)
+    assert result.returncode == check_exit, result.stderr
 
 
 def test_chip_without_baseline_reports_without_perf_gate(tmp_path):
