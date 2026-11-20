@@ -17,9 +17,11 @@
 the tokens other shards own and sums the shards: an all-reduce at decode, and a
 reduce-scatter of a `[tokens, hidden]` partial under sequence-parallel prefill.
 Exactly one shard contributes each row, so the sum is that row. With the shards
-all-gathered once at load, every rank looks its tokens up locally instead: the
-same rows (up to the sign of a zero), no collective, and a sequence-parallel
-rank reads only its own tokens' rows.
+all-gathered once at load, a sequence-parallel prefill rank looks its own
+tokens up locally instead: the same rows (up to the sign of a zero), and no
+collective. Decode buckets keep the vocab-parallel lookup and its all-reduce:
+short prompts prefilled in decode buckets came back with wrong tokens when
+they read the replica too.
 
 The replica costs `vocab_padded * hidden * itemsize` bytes per rank, and only
 serves tables without added (LoRA) vocabulary, where the shards concatenate to
@@ -35,6 +37,13 @@ from vllm.model_executor.layers import vocab_parallel_embedding as vpe
 from vllm_torchtpu.utils import fresh_buffer
 
 FULL_WEIGHT_ATTR = "_tpu_replicated_embedding_weight"
+SHARD_BOUND_NAMES = (
+    "org_vocab_start_index",
+    "org_vocab_end_index",
+    "num_org_vocab_padding",
+    "added_vocab_start_index",
+    "added_vocab_end_index",
+)
 
 
 def can_replicate(embed: Any, tp: int) -> bool:
@@ -85,6 +94,31 @@ def arm_if_eligible(
         return False
     arm(embed, all_gather_rows)
     return True
+
+
+def retain_table(embed: object, out: torch.Tensor) -> torch.Tensor:
+    """`out` unchanged, with `embed`'s replicated table lifted into the trace.
+
+    The sequence-parallel prefill buckets read the table and the decode
+    buckets do not; bucket hand-over needs both traces to lift it.
+    """
+    full = full_weight(embed)
+    if full is None:
+        return out
+    # Avoid a module-level import: this module is imported where the
+    # VocabParallelEmbedding.forward patch is installed (platform activation,
+    # every process), and the attention adapter registers a vLLM attention
+    # backend on import.
+    from vllm_torchtpu.layers.adapter.attention import (  # noqa: PLC0415 -- see above
+        _retain_buffers,
+    )
+
+    return _retain_buffers(out, full)
+
+
+def shard_operands(embed: Any) -> tuple[torch.Tensor | None, ...]:
+    """What the vocab-parallel lookup reads: the shard and its five bounds."""
+    return (embed.weight, *(getattr(embed, name, None) for name in SHARD_BOUND_NAMES))
 
 
 def full_weight(embed: object) -> torch.Tensor | None:

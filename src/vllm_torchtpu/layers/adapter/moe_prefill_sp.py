@@ -738,6 +738,11 @@ def patched_model_forward(
             input_ids = _retain_buffers(input_ids, *first_keep)
             own_ids = own_rows(input_ids, fused_moe_ep.rank_operand(), tp)
             hidden_states = replicated_embedding.lookup(full_table, own_ids)
+            # The decode buckets keep the vocab-parallel lookup: lift what it
+            # reads so both traces hand buckets over with the same inputs.
+            hidden_states = _retain_buffers(
+                hidden_states, *replicated_embedding.shard_operands(self.embed_tokens)
+            )
     else:
         hidden_states = self.embed_input_ids(input_ids)
     # Avoid ShapeSpecializationError on warmup bucket handover: when

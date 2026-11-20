@@ -26,6 +26,7 @@ import vllm.distributed
 from vllm.model_executor.layers import vocab_parallel_embedding as vpe
 
 import vllm_torchtpu
+from vllm_torchtpu.layers.adapter import attention
 from vllm_torchtpu.layers.adapter import moe_prefill_sp as sp
 from vllm_torchtpu.layers.adapter import replicated_embedding as rep
 
@@ -182,20 +183,42 @@ def test_should_gather_and_register_only_when_eligible(eligible):
     assert len(gathers) == (1 if eligible else 0)
 
 
-def test_should_skip_the_all_reduce_in_decode_forward_when_replicated():
+def test_should_keep_the_masked_all_reduce_in_decode_forward_when_replicated():
     shards = _shards(_padded_table())
-    ids = torch.tensor([5, 27, 9], dtype=torch.int32)
+    ids = torch.tensor([5, 27, 9, 0], dtype=torch.int32)
     embed = _arm_rank(shards, rank=3)
-    vllm_torchtpu._patch_vllm_vocab_parallel_embedding()  # noqa: SLF001 -- installs the patched forward under test
+    reference = _shard_sum_reference(shards, ids)
+    reduced, retained = [], []
 
-    with patch.object(
-        vllm.distributed,
-        "tensor_model_parallel_all_reduce",
-        side_effect=AssertionError("all-reduce on a replicated table"),
+    def _all_reduce(partial):
+        reduced.append(partial.clone())
+        return reference.clone()
+
+    def _retain(out, *buffers):
+        retained.extend(id(b) for b in buffers)
+        return out
+
+    with (
+        patch.object(
+            vllm.distributed,
+            "tensor_model_parallel_all_reduce",
+            side_effect=_all_reduce,
+        ),
+        patch.object(attention, "_retain_buffers", side_effect=_retain),
     ):
         got = embed(ids)
 
-    torch.testing.assert_close(got, _shard_sum_reference(shards, ids), rtol=0, atol=0)
+    # The rank's own masked partial goes into the all-reduce, as without a replica.
+    start = 3 * embed.weight.shape[0]
+    expected_partial = torch.stack(
+        [
+            embed.weight[t - start] if start <= t < ORG_VOCAB else embed.weight[0] * 0
+            for t in ids.tolist()
+        ]
+    )
+    torch.testing.assert_close(reduced[0], expected_partial, rtol=0, atol=0)
+    torch.testing.assert_close(got, reference, rtol=0, atol=0)
+    assert id(rep.full_weight(embed)) in retained
 
 
 class _KeepLayer:
@@ -268,6 +291,22 @@ def test_should_look_up_only_own_rows_in_sequence_parallel_forward():
     )
 
 
+def test_should_lift_the_decode_lookup_operands_in_sequence_parallel_forward():
+    shards = _shards(_padded_table())
+    embed = _arm_rank(shards, rank=1)
+    events: list = []
+
+    _run_sp_forward(
+        embed,
+        torch.arange(8, dtype=torch.int64),
+        torch.tensor([[1]], dtype=torch.int32),
+        events,
+    )
+
+    retained = {i for e in events if e != "rank_operand" for i in e[1]}
+    assert {id(t) for t in rep.shard_operands(embed)} <= retained
+
+
 def test_should_lift_rank_through_layer_keep_before_reading_rank_operand():
     shards = _shards(_padded_table())
     rank_buf = torch.tensor([[1]], dtype=torch.int32)
@@ -283,3 +322,15 @@ def test_should_lift_rank_through_layer_keep_before_reading_rank_operand():
     first_rank = events.index("rank_operand")
     keeps_before = [e for e in events[:first_rank] if e != "rank_operand"]
     assert any(id(rank_buf) in ids for _tag, ids in keeps_before)
+
+
+def test_should_not_touch_the_trace_when_the_table_is_not_replicated():
+    embed = _shards(_padded_table())[0]
+    out = torch.ones(2, HIDDEN, dtype=torch.bfloat16)
+
+    with patch.object(
+        attention, "_retain_buffers", side_effect=AssertionError("retained")
+    ):
+        got = rep.retain_table(embed, out)
+
+    assert got is out
