@@ -906,6 +906,15 @@ class _DraftHeadOwnerProxy(torch.nn.Module):
         self.lm_head = lm_head
 
 
+def _materialize(tensor: torch.Tensor) -> None:
+    """Run the deferred graph that produces a TPU tensor now
+    (synchronize_tensors); other devices compute eagerly."""
+    if tensor.device.type == "tpu":
+        from vllm_torchtpu.utils import synchronize_tensors
+
+        synchronize_tensors([tensor])
+
+
 class _VocabParallelDraftHead(torch.nn.Module):
     """The draft's BF16 greedy head split over all DP x TP ranks.
 
@@ -956,6 +965,10 @@ class _VocabParallelDraftHead(torch.nn.Module):
             weight.detach()[dp_rank * n : (dp_rank + 1) * n].clone(),
             requires_grad=False,
         )
+        # Materialize the slice now, as quantize_lm_head does its weights: a
+        # deferred clone would keep the whole source head alive past its
+        # release, into the KV cache's memory profile.
+        _materialize(self.weight)
         self.quant_method = base_head.quant_method
         self.tp_size = tp_size
         self.dp_size = dp_size
@@ -1039,10 +1052,10 @@ def _vocab_parallel_draft_top_tokens(
 
 def vocab_parallel_draft_owner(owner: torch.nn.Module) -> torch.nn.Module:
     """``owner`` with its BF16 head replaced by a ``_VocabParallelDraftHead``
-    when the DP / EP / TP groups allow it (EP group = DP x TP with rank
-    ``dp * tp_size + tp``, TP shard divisible by DP); ``owner`` unchanged
-    otherwise. The caller decides that the draft runs under EP-DP lockstep
-    with a TP-sharded head."""
+    when the DP / EP / TP group sizes allow it (EP group = DP x TP, TP shard
+    divisible by DP); ``owner`` unchanged otherwise. The EP group must order
+    its ranks ``dp * tp_size + tp``, or it raises. The caller decides that the
+    draft runs under EP-DP lockstep with a TP-sharded head."""
     from vllm.distributed.parallel_state import (
         get_dp_group,
         get_ep_group,
@@ -1066,13 +1079,6 @@ def vocab_parallel_draft_owner(owner: torch.nn.Module) -> torch.nn.Module:
         reason = f"head tp_size {head.tp_size} != TP group {tp_size}"
     elif int(ep.world_size) != dp_size * tp_size:
         reason = f"EP group {ep.world_size} != DP {dp_size} x TP {tp_size}"
-    elif int(ep.rank_in_group) != int(dp.rank_in_group) * tp_size + int(
-        tp.rank_in_group
-    ):
-        reason = (
-            f"EP rank {ep.rank_in_group} != DP rank {dp.rank_in_group} x "
-            f"{tp_size} + TP rank {tp.rank_in_group}"
-        )
     elif weight.shape[0] % dp_size:
         reason = f"TP shard of {weight.shape[0]} rows not divisible by DP {dp_size}"
     if reason is not None:
@@ -1081,6 +1087,19 @@ def vocab_parallel_draft_owner(owner: torch.nn.Module) -> torch.nn.Module:
             reason,
         )
         return owner
+    # The checks above read group sizes, the same on every rank, so every rank
+    # keeps or replaces its head alike. This one reads the rank's own place in
+    # the EP group: under an EP order other than DP-major it could hold on
+    # some ranks (rank (0, 0) always does) and not on others, and the head's
+    # DP and EP collectives would run on part of the group. vLLM builds the EP
+    # group DP-major (initialize_model_parallel), so refuse anything else.
+    if int(ep.rank_in_group) != int(dp.rank_in_group) * tp_size + int(tp.rank_in_group):
+        raise NotImplementedError(
+            f"Vocab-parallel draft head: EP rank {ep.rank_in_group} != DP rank "
+            f"{dp.rank_in_group} x {tp_size} + TP rank {tp.rank_in_group}. It "
+            "needs the EP group in DP-major order (rank dp * tp_size + tp), as "
+            "vLLM's initialize_model_parallel builds it."
+        )
     vp_head = _VocabParallelDraftHead(
         head, int(dp.rank_in_group), dp_size, int(tp.rank_in_group), tp_size
     )
