@@ -497,7 +497,7 @@ def local_candidates(
         live_rows is None
         and num_tokens <= _DECODE_CANDIDATE_TOKENS
         and (
-            num_tokens <= block_rows
+            num_tokens <= _TRANSPOSED_ROWS
             or rows_128 < -(-num_tokens // block_rows) * block_rows
         )
     ):
