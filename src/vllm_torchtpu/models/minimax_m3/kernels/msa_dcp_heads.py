@@ -67,6 +67,30 @@ _PAGES_PER_STEP = 64
 # tokens 1.248 ms at 32-page groups), for two permutes of half a step's
 # queries and outputs between the replicas (one chip's cores at c64).
 _SPLIT_PAGES_PER_STEP = 32
+# The replicas take alternate blocks of this many tokens rather than the two
+# halves: a step's halves differ in work (the decode rows a mixed step puts
+# first attend nothing here; later chunk tokens see more pages), and the
+# replica with less waits at the next exchange (c64 DCP 4 twin, per-core
+# kernel time up to 2.2x, j-867fc577). A block is a whole 64-token tile.
+_INTERLEAVE_TOKENS = 64
+
+
+def _interleave(x: jax.Array, axis: int = 0) -> jax.Array:
+    """``x``'s `_INTERLEAVE_TOKENS`-token blocks along `axis`, even blocks
+    first, then odd: each replica's half (`_replica_rows`) holds alternate
+    blocks."""
+    shape = x.shape
+    n = shape[axis] // (2 * _INTERLEAVE_TOKENS)
+    x = x.reshape(shape[:axis] + (n, 2, _INTERLEAVE_TOKENS) + shape[axis + 1 :])
+    return jnp.swapaxes(x, axis, axis + 1).reshape(shape)
+
+
+def _deinterleave(x: jax.Array, axis: int = 0) -> jax.Array:
+    """Inverse of `_interleave`."""
+    shape = x.shape
+    n = shape[axis] // (2 * _INTERLEAVE_TOKENS)
+    x = x.reshape(shape[:axis] + (2, n, _INTERLEAVE_TOKENS) + shape[axis + 1 :])
+    return jnp.swapaxes(x, axis, axis + 1).reshape(shape)
 
 
 def merge_partials(
@@ -499,6 +523,10 @@ def _head_parallel_attend(
     split = replicas == 2 and num_tokens % (2 * _BLOCK_Q) == 0
     rows = num_tokens // replicas if split else num_tokens
     offset = rank % replicas * rows if split else 0
+    interleave = split and num_tokens % (2 * _INTERLEAVE_TOKENS) == 0
+    if interleave:
+        q, candidates = _interleave(q), _interleave(candidates)
+        tokens = tuple(_interleave(x) for x in tokens)
 
     selected = _own_selection(
         candidates,
@@ -578,6 +606,8 @@ def _head_parallel_attend(
         lo = cu[jnp.min(jnp.where(in_round, seq_idx, max_num_seqs - 1))]
         hi = cu[jnp.max(jnp.where(in_round, seq_idx + 1, 0))]
         lo, hi = (jnp.clip(x - offset, 0, rows) for x in (lo, hi))
+        if interleave:  # a request's rows are spread over the half
+            lo, hi = 0, rows
         page_table = jnp.arange(dcp * num_pages, dtype=jnp.int32)
 
         attend = functools.partial(
@@ -629,6 +659,8 @@ def _head_parallel_attend(
     _, acc = jax.lax.cond(first < max_num_seqs, more_rounds, lambda s: s, (first, acc))
     if split:
         acc = _replica_heads(acc, rank, axis=axis, dcp=dcp)
+    if interleave:
+        acc = _deinterleave(acc, axis=1)
     return acc
 
 

@@ -163,6 +163,10 @@ def _spmd(q, kvs, scs, cands, meta, **kw):
         ([8, 8, 200, 100], [3000, 5000, 8800, 3900], 320, 64, 2048, 11),
         # A decode after a prefill: the decode rows are no prefix of the step.
         ([8, 200, 8, 100], [3000, 8800, 5000, 3900], 320, 64, 2048, 12),
+        # 384 tokens: the replicas take alternate 64-token blocks
+        # (`_interleave`), over two rounds and over 48-row windows.
+        ([8, 8, 200, 100], [3000, 5000, 8800, 3900], 384, 64, 2048, 12),
+        ([8, 8, 200, 100], [3000, 5000, 8800, 3900], 384, 64, 48, 12),
         # The same step below the head-parallel size: DCP attention only.
         ([8, 8, 200, 100], [3000, 5000, 8800, 3900], 320, 1 << 20, 2048, 12),
     ],
