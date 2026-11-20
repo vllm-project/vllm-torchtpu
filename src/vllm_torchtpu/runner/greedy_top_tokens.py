@@ -42,7 +42,9 @@ samples and verifies over the ``32 * tp_size`` candidates.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping, Sequence
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -945,7 +947,6 @@ class _VocabParallelDraftHead(torch.nn.Module):
         base_head: torch.nn.Module,
         dp_rank: int,
         dp_size: int,
-        tp_rank: int,
         tp_size: int,
     ) -> None:
         super().__init__()
@@ -973,8 +974,6 @@ class _VocabParallelDraftHead(torch.nn.Module):
         self.tp_size = tp_size
         self.dp_size = dp_size
         self.num_slices = dp_size * tp_size
-        from types import SimpleNamespace
-
         self.shard_indices = SimpleNamespace(
             org_vocab_start_index=start, num_org_vocab_padding=n - valid
         )
@@ -1100,9 +1099,7 @@ def vocab_parallel_draft_owner(owner: torch.nn.Module) -> torch.nn.Module:
             "needs the EP group in DP-major order (rank dp * tp_size + tp), as "
             "vLLM's initialize_model_parallel builds it."
         )
-    vp_head = _VocabParallelDraftHead(
-        head, int(dp.rank_in_group), dp_size, int(tp.rank_in_group), tp_size
-    )
+    vp_head = _VocabParallelDraftHead(head, int(dp.rank_in_group), dp_size, tp_size)
     logger.info(
         "Vocab-parallel draft head: draft lm_head over DP%d x TP%d "
         "= %d slices; this rank: vocab [%d, %d), weight %s %s (was %s per TP "
@@ -1136,8 +1133,6 @@ def bf16_head_twin(head: torch.nn.Module) -> torch.nn.Module:
     layout as loaded. The weight tensor is the same one, not a copy: no
     extra memory is used until the target's weight is dropped.
     """
-    import copy
-
     twin = copy.copy(head)
     state = twin.__dict__
     for table in ("_parameters", "_buffers", "_modules"):
@@ -1176,13 +1171,12 @@ def draft_bf16_head_of(target_head: object) -> torch.nn.Module | None:
     return getattr(target_head, "__dict__", {}).get(_DRAFT_BF16_HEAD_ATTR)
 
 
-def release_draft_bf16_head(target_head: object) -> None:
-    """Drops the BF16 head kept for a draft that does not read it."""
+def release_draft_bf16_head(target_head: object, reason: str) -> None:
+    """Drops the BF16 head kept for a draft that no longer reads it; ``reason``
+    says why in the log."""
     state = getattr(target_head, "__dict__", None)
     if state is not None and state.pop(_DRAFT_BF16_HEAD_ATTR, None) is not None:
-        logger.info(
-            "The draft does not use the BF16 copy of the target's lm_head; released it."
-        )
+        logger.info("Released the BF16 copy of the target's lm_head: %s.", reason)
 
 
 def release_twin_behind_vocab_parallel_head(
@@ -1212,7 +1206,9 @@ def release_twin_behind_vocab_parallel_head(
     ]
     for module, name in holders:
         setattr(module, name, owner.lm_head)
-    release_draft_bf16_head(target_head)
+    release_draft_bf16_head(
+        target_head, "the vocab-parallel draft head holds its own slice"
+    )
     return True
 
 

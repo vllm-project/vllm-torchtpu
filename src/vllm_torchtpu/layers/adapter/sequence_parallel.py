@@ -58,6 +58,8 @@ _FOLLOWS_STEP_FORM = False
 # The MTP proposer records it (`spec_decode/eagle3.py`, `_draft_rows_sliced`
 # and `sequence_parallel.set_active` before each draft forward).
 DRAFT_RECORDS_STEP_FORM = True
+# With the switch on, _HAS_DRAFTER no longer changes gates_rows(); it and
+# set_has_drafter stay with their two callers until a follow-up drops them.
 _HAS_DRAFTER = False
 
 

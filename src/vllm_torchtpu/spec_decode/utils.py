@@ -488,7 +488,9 @@ def maybe_share_lm_head(
     from vllm_torchtpu.runner import greedy_top_tokens
 
     if not share_lm_head:
-        greedy_top_tokens.release_draft_bf16_head(target_lm_head)
+        greedy_top_tokens.release_draft_bf16_head(
+            target_lm_head, "the draft has its own lm_head"
+        )
     else:
         # The target's head may be quantized in place (W8A8 FP8, the Qwen3.5
         # quantize_target_lm_head setting); the draft then takes the BF16 twin
@@ -534,15 +536,27 @@ def maybe_share_lm_head(
         if not tp_layout_matches:
             # The draft did not bind the BF16 twin: it keeps the head it
             # loaded, or the replicated copy just gathered from the twin.
-            greedy_top_tokens.release_draft_bf16_head(target_lm_head)
+            greedy_top_tokens.release_draft_bf16_head(
+                target_lm_head,
+                "the draft keeps another TP layout's head (its own, or a "
+                "replicated copy gathered from this one)",
+            )
         if tp_layout_matches or materialize_if_mismatched:
+            if not tp_layout_matches:
+                source = "a replicated copy the draft gathered from " + (
+                    "the BF16 copy of the checkpoint head"
+                    if bf16_head is not None
+                    else "the target's head"
+                )
+            elif bf16_head is not None:
+                source = "the draft's own BF16 copy of the checkpoint head"
+            else:
+                source = "the draft shares the target's head module"
             logger.info(
                 "Draft lm_head precision: %s (target lm_head: %s; %s).",
                 greedy_top_tokens.head_precision(draft_lm_head),
                 greedy_top_tokens.head_precision(target_lm_head),
-                "the draft's own BF16 copy of the checkpoint head"
-                if bf16_head is not None
-                else "the draft shares the target's head module",
+                source,
             )
 
     # We must override _gather_logits for replicated draft models even if we don't share

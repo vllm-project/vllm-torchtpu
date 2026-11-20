@@ -563,15 +563,11 @@ class Eagle3Proposer:
         from vllm_torchtpu.runner import greedy_top_tokens
 
         assert self.draft_model is not None
-        if greedy_top_tokens.release_twin_behind_vocab_parallel_head(
+        greedy_top_tokens.release_twin_behind_vocab_parallel_head(
             self._draft_greedy_head_owner,
             self.draft_model,
             target_lm_head_of(target_model),
-        ):
-            logger.info(
-                "Released the BF16 copy of the target's lm_head: the "
-                "vocab-parallel draft head holds its own slice."
-            )
+        )
 
     def _validate_mtp_layer_count(self) -> None:
         """One nextn layer only: the proposer's per-step wiring assumes it.

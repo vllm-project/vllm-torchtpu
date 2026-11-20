@@ -7988,7 +7988,7 @@ class TPUModelRunner(GPUModelRunner):
                 )
             else:
                 logger.info(
-                    "TPU_GREEDY_TOP_TOKENS under expert-parallel data parallelism "
+                    "Greedy top tokens under expert-parallel data parallelism "
                     "with a tensor-parallel LM head: the target keeps full logits "
                     "(the program idle engines replay); the draft head keeps the "
                     "vocab-parallel argmax."
