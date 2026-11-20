@@ -327,6 +327,7 @@ def outer_kernel(
         "conv_dtype",
         "attention_mode",
         "gate_lower_bound",
+        "beta_scale",
         "kernel_act_dtype",
         "kernel_conv_weight_dtype",
     ),
@@ -356,6 +357,7 @@ def fused_conv1d_gdn(
     kernel_size: int,
     attention_mode: config.AttentionMode = config.AttentionMode.GDN,
     gate_lower_bound: float | None = None,
+    beta_scale: float = 1.0,
     recurrent_dtype: jnp.dtype | None = None,
     conv_dtype: jnp.dtype | None = None,
     num_spec_tokens: int = 0,
@@ -429,6 +431,9 @@ def fused_conv1d_gdn(
             `gate_lower_bound * sigmoid(exp(A_log) * (g + dt_bias))` (every K3
             variant, at -5.0). Different functions of the same weights, so a
             mismatch with the model's KDA config silently changes the decay.
+        beta_scale: KDA only. Scales the delta-rule step size,
+            `beta = beta_scale * sigmoid(b)`. 1.0 (Kimi) keeps beta in
+            [0, 1]; OLMo 3.5 uses 2.0 (allow_neg_eigval).
         num_spec_tokens: Number of speculative draft tokens (0 gives the
             plain 1-token-per-sequence decode path).
         batched_only: Run only the leading decode/verify segment.
@@ -503,6 +508,13 @@ def fused_conv1d_gdn(
                 "support."
             )
 
+    if beta_scale != 1.0 and not is_kda:
+        raise ValueError(
+            f"beta_scale only applies to KDA; got attention_mode={attention_mode}."
+        )
+    if beta_scale <= 0:
+        raise ValueError(f"beta_scale must be positive; got {beta_scale}.")
+
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
     assert conv_weight.shape == (dim, 1, kernel_size)
@@ -541,6 +553,13 @@ def fused_conv1d_gdn(
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
     num_lanes = pltpu.get_tpu_info().num_lanes
+    # The unified pool addresses its state regions in lane-row granules
+    # (`_GranuleStateRef._granule_width`), which a wider value head would
+    # straddle.
+    if is_shared and d_v > num_lanes:
+        raise NotImplementedError(
+            f"The unified KV pool requires d_v <= {num_lanes}; got d_v={d_v}."
+        )
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
@@ -677,6 +696,7 @@ def fused_conv1d_gdn(
             v_head_dim=d_v,
             attention_mode=attention_mode,
             gate_lower_bound=gate_lower_bound,
+            beta_scale=beta_scale,
             dtypes=config.Dtypes(
                 act_in=act_in_dtype,
                 act_out=act_out_dtype,
