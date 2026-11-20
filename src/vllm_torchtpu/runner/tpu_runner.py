@@ -6313,6 +6313,10 @@ class TPUModelRunner(GPUModelRunner):
 
             arm_runner_models(self)
 
+        from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
+
+        moe_lowtok_scores.log_summary()
+
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
 

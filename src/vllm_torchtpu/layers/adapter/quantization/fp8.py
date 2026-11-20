@@ -94,6 +94,7 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
+from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     VllmQuantLinearConfig,
@@ -777,6 +778,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
+    _moe_lowtok_scores_op: torch.library.CustomOpDef | None = None
 
     def __init__(
         self,
@@ -1064,6 +1066,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+        self._moe_lowtok_scores_op = moe_lowtok_scores.prebuild(
+            self, layer, activation_str
+        )
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(
                 layer,
@@ -1174,6 +1179,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # Armed layer: the runner no longer runs the shared expert or the
             # all-reduce, so this returns the reduced shared + routed sum.
             return moe_tp_decode_forward(self, layer, x, router_logits)
+        if moe_lowtok_scores.serves(self._moe_lowtok_scores_op, x):
+            op = self._moe_lowtok_scores_op
+            return moe_lowtok_scores.apply(op, layer, x, router_logits)
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
