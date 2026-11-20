@@ -82,7 +82,7 @@ from .attention import KimiDeltaAttention, MultiHeadLatentAttention, kda_state_d
 from .collective_ops import TokenShardCollectives
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
-from .moe import KimiMoE
+from .moe import KimiMoE, pad_router_weights
 
 logger = init_logger(__name__)
 
@@ -447,6 +447,15 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         return MambaStateCopyFuncCalculator.kda_state_copy_func()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # A non-uniformly pruned checkpoint's router rows are padded to each
+        # layer's built expert count.
+        padded = {
+            m.layer_idx: (m.num_experts_ckpt, m.num_experts_padded)
+            for m in self.modules()
+            if isinstance(m, KimiMoE) and m.num_experts_padded > m.num_experts_ckpt
+        }
+        if padded:
+            weights = pad_router_weights(weights, padded)
         expert_params_mapping = (
             fused_moe_make_expert_params_mapping(
                 self,
