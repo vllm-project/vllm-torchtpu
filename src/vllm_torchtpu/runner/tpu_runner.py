@@ -1011,7 +1011,13 @@ class TPUModelRunner(GPUModelRunner):
         self._token_padding_state: token_padding.TokenPaddingState | None = None
 
         self._init_phased_profiling()
-        self._stage_timing = RunnerStageTiming(profiler_rank)
+        # The timings reach a metrics sink only through the KV connector's
+        # stats (get_finished_kv_transfers); without a connector they would be
+        # recorded on the serving thread every step and then discarded.
+        self._stage_timing = RunnerStageTiming(
+            profiler_rank,
+            enabled=self.vllm_config.kv_transfer_config is not None,
+        )
 
     def _init_num_reqs_caps(self) -> None:
         # Pallas SMEM-aware num_reqs caps. DeepSeek-V4.1 v2

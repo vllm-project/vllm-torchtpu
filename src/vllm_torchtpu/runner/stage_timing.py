@@ -24,10 +24,13 @@ class _PendingTiming:
 class RunnerStageTiming:
     MAX_IN_FLIGHT_DEVICE_TIMINGS = 1024
 
-    def __init__(self, rank: int):
+    def __init__(self, rank: int, enabled: bool = True):
         self._rank = str(rank)
+        self._enabled = enabled
         self._cpu_samples: list[tuple[str, str, float]] = []
         self._device_samples: list[tuple[str, str, float]] = []
+        if not enabled:
+            return
         # Check Event support before serving; synchronization stays off the
         # serving thread after startup.
         event = TpuEvent()
@@ -51,16 +54,28 @@ class RunnerStageTiming:
                 self._device_samples.append((self._rank, pending.stage, seconds))
             self._slots.release()
 
+    def host_stage(self, stage: str) -> contextlib.AbstractContextManager[None]:
+        if not self._enabled:
+            return contextlib.nullcontext()
+        return self._host_stage(stage)
+
+    def stage(self, stage: str) -> contextlib.AbstractContextManager[None]:
+        # Disabled timing costs the serving thread nothing: no device events,
+        # no hand-off to the collector thread.
+        if not self._enabled:
+            return contextlib.nullcontext()
+        return self._device_stage(stage)
+
     @contextlib.contextmanager
-    def host_stage(self, stage: str) -> Iterator[None]:
+    def _host_stage(self, stage: str) -> Iterator[None]:
         cpu_start = time.perf_counter()
         yield
         self._cpu_samples.append((self._rank, stage, time.perf_counter() - cpu_start))
 
     @contextlib.contextmanager
-    def stage(self, stage: str) -> Iterator[None]:
+    def _device_stage(self, stage: str) -> Iterator[None]:
         if not self._slots.acquire(blocking=False):
-            with self.host_stage(stage):
+            with self._host_stage(stage):
                 yield
             return
 
@@ -82,6 +97,8 @@ class RunnerStageTiming:
     def take_samples(
         self,
     ) -> tuple[list[tuple[str, str, float]], list[tuple[str, str, float]]]:
+        if not self._enabled:
+            return [], []
         cpu, self._cpu_samples = self._cpu_samples, []
         with self._samples_lock:
             device, self._device_samples = self._device_samples, []
