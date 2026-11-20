@@ -143,6 +143,32 @@ def test_memo_holds_objects_without_weak_references_alive():
     assert not fd._memo_live((ref,), [_Slotted()])
 
 
+class _SlottedOwner:
+    """An argument object that takes no weak reference."""
+
+    __slots__ = ("n",)
+
+    def __init__(self, n):
+        self.n = n
+
+
+def test_a_full_memo_still_stores_new_entries(memo_on):
+    # Entries keyed by objects without weak references hold them strongly and
+    # never die, so a call site handed a new such object every step fills the
+    # memo. The oldest entries then make room, so later keys still hit.
+    w = _wrapped(_fn_owner)
+    x = torch.arange(4.0)
+    for _ in range(fd._MEMO_MAX_ENTRIES + 6):
+        torch.testing.assert_close(w(x, _SlottedOwner(3)), x * 3)
+    assert len(w._fast_dispatch_state["memo"]) <= fd._MEMO_MAX_ENTRIES
+    steady = _SlottedOwner(3)
+    torch.testing.assert_close(w(x, steady), x * 3)
+    torch.testing.assert_close(w(x, steady), x * 3)
+    hits = fd._MEMO_STATS["hit"]
+    torch.testing.assert_close(w(x, steady), x * 3)
+    assert fd._MEMO_STATS["hit"] == hits + 1
+
+
 def test_memo_default_off_leaves_dispatch_unchanged(monkeypatch):
     monkeypatch.setitem(fd._CONFIG, "fast", True)
     monkeypatch.setitem(fd._MEMO, "on", False)
