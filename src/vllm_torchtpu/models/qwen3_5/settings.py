@@ -49,18 +49,27 @@ SECTION = "qwen3_5"
 # released Qwen3.5-397B-A17B checkpoints declare.
 ARCHITECTURES = frozenset({"Qwen3_5MoeForConditionalGeneration"})
 
+# Field metadata key of a setting whose consumer runs only where the Qwen3.5
+# model patch does: Qwen3.5-397B-A17B's checkpoint shape on TPU7x
+# (kernels/measured.is_measured_checkpoint). ``get`` refuses such a setting set
+# away from its default on any other engine, where nothing would honour it.
+MEASURED_ONLY = "measured_only"
+
 
 @dataclasses.dataclass(frozen=True)
 class Qwen35Settings:
     """The Qwen3.5 settings of one engine. Fields are added by the change that
     implements them; keep them sorted by name."""
 
-    quantize_target_lm_head: bool = False
+    quantize_target_lm_head: bool = dataclasses.field(
+        default=False, metadata={MEASURED_ONLY: True}
+    )
     """Quantize the target model's LM head to W8A8 FP8 in place after loading
     (models/vllm/qwen3_next_patch.py). The MTP draft keeps a BF16 copy of the
     checkpoint head. Off by default: it is a quality/speed trade-off (the
     target's logits are computed in FP8), measured in the trade-offs-on
-    validation arms."""
+    validation arms. Runs with the Qwen3.5 model patch, so only for
+    Qwen3.5-397B-A17B's checkpoint shape on TPU7x (MEASURED_ONLY)."""
 
 
 def _field_types() -> dict[str, Any]:
@@ -142,6 +151,30 @@ def _section(vllm_config: VllmConfig) -> Any:
     return None
 
 
+def _check_measured_only(vllm_config: VllmConfig, result: Qwen35Settings) -> None:
+    """Raise on a MEASURED_ONLY setting set away from its default on an engine
+    the Qwen3.5 model patch does not run on: its consumer never runs there, so
+    the setting would be accepted and change nothing."""
+    names = [
+        f.name
+        for f in dataclasses.fields(result)
+        if f.metadata.get(MEASURED_ONLY) and getattr(result, f.name) != f.default
+    ]
+    if not names:
+        return
+    # Lazy: kernels.measured imports hooks, which imports this module.
+    from vllm_torchtpu.models.qwen3_5.kernels import measured
+
+    if measured.is_measured_checkpoint(vllm_config.model_config):
+        return
+    raise NotImplementedError(
+        f"additional_config[{SECTION!r}] {names} run only with the Qwen3.5 "
+        "model patch, which serves Qwen3.5-397B-A17B's checkpoint shape on "
+        "TPU7x (this engine's checkpoint or TPU chip differs, or the chip "
+        "cannot be read: is TPU_ACCELERATOR_TYPE set?). Remove them here."
+    )
+
+
 def get(vllm_config: VllmConfig) -> Qwen35Settings:
     """The Qwen3.5 settings of this engine.
 
@@ -151,7 +184,9 @@ def get(vllm_config: VllmConfig) -> Qwen35Settings:
     """
     raw = _section(vllm_config)
     if is_qwen3_5(vllm_config.model_config):
-        return parse(raw)
+        result = parse(raw)
+        _check_measured_only(vllm_config, result)
+        return result
     if raw is not None:
         archs = (
             list(vllm_config.model_config.architectures or ())
