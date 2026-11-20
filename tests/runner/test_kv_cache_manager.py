@@ -593,7 +593,7 @@ class TestKVCacheManager:
         "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
         return_value=False,
     )
-    @patch("vllm.v1.worker.gpu_input_batch.InputBatch")
+    @patch("vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch.InputBatch")
     def test_initialize_kv_cache_hybrid_duplication(
         self,
         mock_input_batch,
@@ -701,7 +701,7 @@ class TestKVCacheManager:
         "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
         return_value=False,
     )
-    @patch("vllm.v1.worker.gpu_input_batch.InputBatch")
+    @patch("vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch.InputBatch")
     def test_initialize_kv_cache_compact_mamba(
         self,
         mock_input_batch,
@@ -1150,7 +1150,7 @@ class TestKVCacheManager:
         "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
         return_value=False,
     )
-    @patch("vllm.v1.worker.gpu_input_batch.InputBatch")
+    @patch("vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch.InputBatch")
     def test_initialize_kv_cache_binds_shared_layer_to_target_cache(
         self, mock_input_batch, mock_has_kv_transfer, mock_bind_kv_cache, mock_get_shape
     ):
@@ -1200,7 +1200,7 @@ class TestKVCacheManager:
         "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
         return_value=False,
     )
-    @patch("vllm.v1.worker.gpu_input_batch.InputBatch")
+    @patch("vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch.InputBatch")
     def test_initialize_kv_cache_rejects_missing_shared_target(
         self, mock_input_batch, mock_has_kv_transfer
     ):
@@ -1234,7 +1234,7 @@ class TestKVCacheManager:
         "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
         return_value=False,
     )
-    @patch("vllm.v1.worker.gpu_input_batch.InputBatch")
+    @patch("vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch.InputBatch")
     def test_initialize_kv_cache_rejects_duplicate_shared_allocation(
         self, mock_input_batch, mock_has_kv_transfer
     ):
@@ -1337,11 +1337,11 @@ class TestKVCacheManager:
                 return_value=False,
             ),
             patch(
-                "vllm.v1.worker.kv_connector_model_runner_mixin.has_kv_transfer_group",
+                "vllm_torchtpu.runner.vllm_v1.worker.kv_connector_model_runner_mixin.has_kv_transfer_group",
                 return_value=True,
             ),
             patch(
-                "vllm.v1.worker.kv_connector_model_runner_mixin.get_kv_transfer_group",
+                "vllm_torchtpu.runner.vllm_v1.worker.kv_connector_model_runner_mixin.get_kv_transfer_group",
                 return_value=cross_layer_connector,
             ),
             patch("vllm_torchtpu.envs.VLLM_TPU_BLOCK_MAJOR_KV", True),

@@ -47,7 +47,8 @@ if TYPE_CHECKING:
     from vllm import SamplingParams
     from vllm.config.reasoning import ReasoningConfig
     from vllm.v1.core.sched.output import SchedulerOutput
-    from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
+    from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import CachedRequestState
 
 logger = init_logger(__name__)
 

@@ -15,11 +15,14 @@
 
 import pytest
 import torch
-from vllm.v1.worker.block_table import MultiGroupBlockTable, SlotMappingMode
 
 from vllm_torchtpu.runner.kernel_block_table import (
     KernelBlockTable,
     install_kernel_block_tables,
+)
+from vllm_torchtpu.runner.vllm_v1.worker.block_table import (
+    MultiGroupBlockTable,
+    SlotMappingMode,
 )
 
 MAX_NUM_REQS = 4

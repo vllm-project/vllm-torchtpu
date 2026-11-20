@@ -53,7 +53,6 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
-from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 from tests.runner.runner_input_test_utils import attention_layer_mock
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
@@ -80,6 +79,7 @@ from vllm_torchtpu.runner.kernel_block_table import (
     install_kernel_block_tables,
 )
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
+from vllm_torchtpu.runner.vllm_v1.worker.block_table import MultiGroupBlockTable
 from vllm_torchtpu.tpu_info import get_chip_version
 
 BACKEND = PallasBatchedRPAAttentionBackend

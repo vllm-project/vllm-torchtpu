@@ -38,7 +38,11 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         VocabParallelEmbedding,
     )
-    from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+
+    from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import (
+        CachedRequestState,
+        InputBatch,
+    )
 
 logger = init_logger(__name__)
 

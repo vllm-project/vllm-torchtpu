@@ -32,9 +32,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from vllm.v1.outputs import LogprobsTensors
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import CachedRequestState
 
 logger = init_logger(__name__)
 

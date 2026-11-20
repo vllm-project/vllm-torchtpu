@@ -81,12 +81,10 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     DraftTokenIds,
+    KVConnectorOutput,
     LogprobsTensors,
     ModelRunnerOutput,
 )
-from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
@@ -209,6 +207,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUModelRunnerOutput,
     LogprobsChunk,
 )
+from vllm_torchtpu.runner.vllm_v1.spec_decode.ngram_proposer import NgramProposer
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_torchtpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
     StepCostTable,
@@ -852,7 +852,9 @@ class TPUModelRunner(GPUModelRunner):
             def get_pooling_metadata(batch):
                 return build_pooling_metadata(batch, getattr(self, "requests", None))
 
-            from vllm.v1.worker.gpu_input_batch import InputBatch as GPUInputBatch
+            from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import (
+                InputBatch as GPUInputBatch,
+            )
 
             GPUInputBatch.get_pooling_metadata = get_pooling_metadata
             self.input_batch.get_pooling_metadata = lambda: get_pooling_metadata(
