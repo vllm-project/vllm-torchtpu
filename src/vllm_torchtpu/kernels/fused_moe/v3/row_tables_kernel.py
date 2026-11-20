@@ -236,10 +236,11 @@ def scatter_row_tables(
         Token t's scale in plane p is the f32 bits of word
         (t // tokens_per_shard) * message_words + scale_offset +
         p * plane_words + t % tokens_per_shard.
-      token_table: [routed_rows] int32, zeroed.
+      token_table: [table rows] int32, zeroed, at least routed_rows rows;
+        the rows from routed_rows on stay zero.
       scale_table: [n_scales * scale words] int32, zeroed; plane p of a
-        row's scales at word p * scale words + row, scale words >=
-        routed_rows.
+        row's scales at word p * scale words + row, scale words >= the
+        token table's rows.
       n_scales: scale words per token (one, or one per activation block).
       plane_words: words between one token's scale planes in its shard's
         routing message.

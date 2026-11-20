@@ -747,6 +747,18 @@ def fused_ep_moe(
       no_gate: a single projection with no gate half.
       config: a Config. None takes Config.for_shape: the defaults, with the
         fields TUNED_BY_SHAPE holds for this shape on top.
+      shard_index: int32 [num_shards, 1], each shard's own index, handed to
+        the programs as data instead of read from the mesh axis (the torch
+        bridge's form: under its export a mesh-axis index lowers to a
+        partition-id XLA's SPMD partitioner refuses). Only with
+        layout.SHARD_INDEX_OPERAND set, where None takes an arange.
+      experts_per_shard: the experts each shard routes over. None splits
+        the weights' experts evenly over the shards; fewer than that when
+        each shard's block of the weights ends with copy slots (an expert
+        placement's copies), which are never selected or read.
+      valid_tokens: int32 [num_shards], each shard's count of real rows.
+        The rows from it on route nowhere, enter the exchange as zeros and
+        come back as zero.
 
     Returns:
       [tokens, hidden] in x's dtype, sharded like x.
