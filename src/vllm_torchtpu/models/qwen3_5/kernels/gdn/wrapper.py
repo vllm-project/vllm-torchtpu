@@ -36,7 +36,12 @@
 #   ceilings at every shape), the per-step trims (one pad for b and a, a_log
 #   and dt_bias padded once) and, for verify windows at
 #   config.FUSED_1DOT_SHAPES, the fused 1-dot recurrence (use_fused_1dot).
-#   Every other shape keeps main's tiles (MAIN_MIXED_TILE_SIZE) and code.
+#   Every other shape keeps main's tiles (MAIN_MIXED_TILE_SIZE) and code,
+#   apart from the next change.
+# - The verify-window tile cap (tiling.spec_window_tile_cap) counts the output
+#   at its dtype's width, where the source counts 2 bytes, so at any shape an
+#   f32 activation's static decode tile can be one sequence smaller than the
+#   source's; a bf16 activation gets the same cap.
 # - Verify read offsets into a caller's checkpoint table (ckpt_indices) are
 #   clipped to the window.
 # No change targets AttentionMode.KDA, which this copy's callers never pass;
