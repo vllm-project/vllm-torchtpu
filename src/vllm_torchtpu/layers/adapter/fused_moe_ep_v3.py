@@ -515,8 +515,9 @@ def sequence_parallel_threshold_unset(layer) -> bool:
         return False
     from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
 
-    layer_is_sp = bool(getattr(layer.moe_config, "is_sequence_parallel", False))
-    return _sp.enabled() and layer_is_sp and _sp.min_rows() == 0
+    return (
+        _sp.enabled() and layer.moe_config.is_sequence_parallel and _sp.min_rows() == 0
+    )
 
 
 def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) -> None:
@@ -585,13 +586,13 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
         )
         if _sp.min_rows() // tp < gate:
             logger.warning_once(
-                "Fused EP MoE: the sequence-parallel threshold of %d rows gives "
-                "%d rows per rank at the first sequence-parallel step, below "
-                "this layout's step gate of %d, so the kernel's share of the SP "
-                "steps is decided by a traced row-count guard; a bucket at "
-                "exactly %d tokens may fail to trace (see _fused_kernel_takes). "
-                "The layout's entries in the two tables should give a threshold "
-                "of at least %d rows.",
+                "Fused EP MoE: the sequence-parallel row threshold of %d rows "
+                "gives %d rows per rank at the first sequence-parallel step, "
+                "below this layout's step gate of %d (STEP_MIN_TOKENS_BY_LAYOUT), "
+                "so a traced row-count guard decides which sequence-parallel "
+                "steps take the kernel, and a compile size of exactly %d tokens "
+                "may fail to trace. Give this layout a row threshold of at least "
+                "%d rows in sequence_parallel's row table.",
                 _sp.min_rows(),
                 _sp.min_rows() // tp,
                 gate,

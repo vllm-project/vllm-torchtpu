@@ -1280,7 +1280,6 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer,
                 x,
                 router_logits,
-                activation_str,
                 use_fused_kernel=_fused_kernel_takes(x.shape[0], step_min_tokens()),
             )
         if self._moe_lowtok_scores_op is not None:
@@ -1346,7 +1345,6 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
-        activation_str: str,
         *,
         use_fused_kernel: bool = True,
     ) -> torch.Tensor:
@@ -1377,9 +1375,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             return token_padding.retain_padding_graph_input(out)
 
         ep = get_ep_group()
-        sequence_parallel_flag = getattr(
-            layer.moe_config, "is_sequence_parallel", False
-        )
+        sequence_parallel_flag = layer.moe_config.is_sequence_parallel
         dispatched = ep.dispatch_router_logits(x, router_logits, sequence_parallel_flag)
         assert len(dispatched) == 2
         gathered_x, gathered_logits = dispatched
