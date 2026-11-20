@@ -1288,6 +1288,27 @@ def test_a_held_prompt_is_looked_up_once(monkeypatch, short_first):
     assert scheduler._uncached_by_request == {}
 
 
+def test_a_released_prompt_counts_the_blocks_cached_while_it_was_held(monkeypatch):
+    """The child is first looked up while the parent has computed 4 of the 40
+    blocks they share, too many uncached tokens for a short prompt. Once the
+    parent has computed them, the child has one block left and starts as a
+    short prompt beside the two long prefills, before the parent ends."""
+    scheduler = short_first_scheduler(monkeypatch, hold=True)
+    parent_tokens = list(range(60 * BLOCK))
+    scheduler.add_request(make_request("parent", parent_tokens))
+    assert step(scheduler) == {"parent": CHUNK}
+    add(scheduler, "long", 2000, first_token=30_000)
+    child_tokens = parent_tokens[: 40 * BLOCK] + list(range(90_000, 90_000 + BLOCK))
+    scheduler.add_request(make_request("child", child_tokens))
+    assert step(scheduler) == {"parent": CHUNK, "long": CHUNK}
+    assert scheduler._uncached_by_request["child"] > SHORT
+    parent = scheduler.requests["parent"]
+    while "child" not in (scheduled := step(scheduler)):
+        assert parent.num_computed_tokens <= 40 * BLOCK, "the child missed its step"
+    assert scheduled["child"] == BLOCK
+    assert parent.num_computed_tokens == 40 * BLOCK + CHUNK
+
+
 def test_a_long_prefill_a_prompt_waits_for_keeps_its_full_chunk(monkeypatch):
     scheduler = short_first_scheduler(monkeypatch, hold=True)
     two_long_prefills(scheduler)

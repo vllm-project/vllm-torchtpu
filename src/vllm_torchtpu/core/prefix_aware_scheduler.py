@@ -199,6 +199,7 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
         self._short_step = False
         self._skip_short_prompts = False
         self._carriers: set[str] = set()
+        self._held_last_step: set[str] = set()
 
         if self.policy != SchedulingPolicy.FCFS and (
             self.short_prompt_tokens is not None or self.hold_shared_prefix
@@ -371,7 +372,23 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
     def _hold_prompts_behind_running_prefixes(self) -> list[Request]:
         """Take out of the waiting queue, for this step, every prompt whose
         first uncached block a running prefill has still to compute, and mark
-        those prefills as carriers."""
+        those prefills as carriers.
+
+        A prompt the hold lets go loses the cache hit looked up while it was
+        held, so the short-prompt count looks it up again with the blocks the
+        prefill has cached since."""
+        held = self._held_prompts()
+        held_ids = {request.request_id for request in held}
+        for request_id in self._held_last_step - held_ids:
+            self._uncached_by_request.pop(request_id, None)
+        self._held_last_step = held_ids
+        if held:
+            waiting = self.waiting
+            assert isinstance(waiting, FCFSRequestQueue)
+            waiting.remove_requests(held)
+        return held
+
+    def _held_prompts(self) -> list[Request]:
         if self._pause_state != PauseState.UNPAUSED:
             return []
         prefills = [r for r in self.running if r.is_prefill_chunk]
@@ -383,10 +400,6 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
             if carrier is not None:
                 held.append(request)
                 self._carriers.add(carrier)
-        if held:
-            waiting = self.waiting
-            assert isinstance(waiting, FCFSRequestQueue)
-            waiting.remove_requests(held)
         return held
 
     def _carrier_of(self, request: Request, prefills: list[Request]) -> str | None:
