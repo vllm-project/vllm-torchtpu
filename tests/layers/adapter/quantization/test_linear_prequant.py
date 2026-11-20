@@ -20,8 +20,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_torchtpu.layers.adapter import linear_common
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+from vllm_torchtpu.layers.adapter.quantization import fp8
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedLinearMethod,
@@ -51,7 +51,7 @@ def test_fp8_method_runs_the_prequant_matmul_on_the_kn_weight(
         seen.update(x_q=x_q, x_s=x_s, w_q=w_q, w_s=w_s)
         return torch.ones(x_q.shape[0], w_q.shape[-1])
 
-    monkeypatch.setattr(linear_common, "quantized_matmul_prequant", prequant)
+    monkeypatch.setattr(fp8, "quantized_matmul_prequant", prequant)
     weight = torch.randn(_K, _N).to(torch.float8_e4m3fn)
     layer = SimpleNamespace(
         weight=weight.t() if keep_vllm_layout else weight,
@@ -62,6 +62,7 @@ def test_fp8_method_runs_the_prequant_matmul_on_the_kn_weight(
     bias = torch.full((_N,), 2.0) if with_bias else None
     x_q, x_s = _rows()
     method = object.__new__(VllmFp8LinearMethodTPU)
+    method.w8a16_max_rows = 0
     out = method.apply_prequant(layer, x_q, x_s, bias)
     assert seen["x_q"] is x_q and seen["x_s"] is x_s
     assert seen["w_s"] is layer.weight_scale
@@ -99,7 +100,7 @@ def test_fp8_method_runs_apply_on_the_dequantized_rows_for_other_weights(
         raise AssertionError("the pre-quantized matmul must not run")
 
     monkeypatch.setattr(VllmFp8LinearMethodTPU, "apply", apply)
-    monkeypatch.setattr(linear_common, "quantized_matmul_prequant", prequant)
+    monkeypatch.setattr(fp8, "quantized_matmul_prequant", prequant)
     weight = (torch.randn(_K, _N) * 4).to(weight_dtype)
     layer = SimpleNamespace(
         weight=weight.t() if keep_vllm_layout else weight,
@@ -110,6 +111,7 @@ def test_fp8_method_runs_apply_on_the_dequantized_rows_for_other_weights(
     bias = torch.full((_N,), 2.0) if with_bias else None
     x_q, x_s = _rows()
     method = object.__new__(VllmFp8LinearMethodTPU)
+    method.w8a16_max_rows = 0
     out = method.apply_prequant(layer, x_q, x_s, bias)
     assert seen["layer"] is layer and seen["bias"] is bias
     assert seen["x"].dtype == torch.bfloat16

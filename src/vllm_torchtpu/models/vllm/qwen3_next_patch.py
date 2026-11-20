@@ -1040,15 +1040,19 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
 def _takes_prequant_rows(proj: Any) -> bool:
     """Whether `proj` is an FP8 linear with per-channel scales whose
     `apply_prequant` takes `linear_common.quantize_rows` rows, reproducing
-    what its plain forward computes from the bf16 rows."""
+    what its plain forward computes from the bf16 rows (the method's
+    `serves_prequant_rows`: for the TPU FP8 method, scales of the output
+    width and no W8A16 small steps)."""
     weight: Any = getattr(proj, "weight", None)
     weight_scale: Any = getattr(proj, "weight_scale", None)
+    method = getattr(proj, "quant_method", None)
     return bool(
         isinstance(weight, torch.Tensor)
         and weight.dtype == torch.float8_e4m3fn
         and isinstance(weight_scale, torch.Tensor)
         and weight_scale.ndim == 1
-        and isinstance(proj.quant_method, linear_common.PrequantLinearMethod)
+        and isinstance(method, linear_common.PrequantLinearMethod)
+        and method.serves_prequant_rows(proj)
     )
 
 
