@@ -26,6 +26,7 @@ import torch
 from runner_output_test_utils import (
     _assert_same_logprobs_lists,
     _blocking_logprobs_lists,
+    _pre_copy_state,
     _sample_tokens_runner,
 )
 from vllm.config import (
@@ -3356,6 +3357,7 @@ class TestAsyncSpecDecodeTokenAccounting:
             discard_sampled_tokens_req_indices=[],
             num_draft_per_req=num_draft_0,
             wait_for_copy=copy_mock_0.wait_for_copy,
+            copy_state=_pre_copy_state(copy_mock_0.wait_for_copy.return_value),
         )
         TPUModelRunner._modify_prev_results(runner)
 
@@ -3397,6 +3399,7 @@ class TestAsyncSpecDecodeTokenAccounting:
             discard_sampled_tokens_req_indices=[],
             num_draft_per_req=num_draft_1,
             wait_for_copy=copy_mock_1.wait_for_copy,
+            copy_state=_pre_copy_state(copy_mock_1.wait_for_copy.return_value),
         )
         TPUModelRunner._modify_prev_results(runner)
 
@@ -3440,6 +3443,7 @@ class TestAsyncSpecDecodeTokenAccounting:
             discard_sampled_tokens_req_indices=[],
             num_draft_per_req=num_draft_2,
             wait_for_copy=copy_mock_2.wait_for_copy,
+            copy_state=_pre_copy_state(copy_mock_2.wait_for_copy.return_value),
         )
         TPUModelRunner._modify_prev_results(runner)
 
@@ -3486,6 +3490,7 @@ class TestAsyncSpecDecodeTokenAccounting:
             discard_sampled_tokens_req_indices=[],
             num_draft_per_req={0: 3, 1: 3},
             wait_for_copy=copy_mock.wait_for_copy,
+            copy_state=_pre_copy_state(copy_mock.wait_for_copy.return_value),
         )
 
         TPUModelRunner._modify_prev_results(runner)
@@ -3514,6 +3519,7 @@ class TestAsyncSpecDecodeTokenAccounting:
             discard_sampled_tokens_req_indices=[],
             num_draft_per_req=None,
             wait_for_copy=copy_mock.wait_for_copy,
+            copy_state=_pre_copy_state(copy_mock.wait_for_copy.return_value),
         )
 
         TPUModelRunner._modify_prev_results(runner)
@@ -3576,6 +3582,7 @@ class TestAsyncSpecDecodeTokenAccounting:
             discard_sampled_tokens_req_indices=[],
             num_draft_per_req={0: 3},
             wait_for_copy=copy_mock.wait_for_copy,
+            copy_state=_pre_copy_state(copy_mock.wait_for_copy.return_value),
         )
         TPUModelRunner._modify_prev_results(runner)
 
@@ -3723,6 +3730,7 @@ def test_flush_keeps_zero_token_async_results_until_waited():
 
     class FakeCopyState:
         sampled_token_ids_cpu = torch.tensor([[7]], dtype=torch.int32)
+        sampled_token_ids_list = [[7]]
 
         def wait(self):
             events.append("wait")

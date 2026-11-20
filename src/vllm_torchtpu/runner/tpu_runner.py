@@ -2739,11 +2739,7 @@ class TPUModelRunner(GPUModelRunner):
             entry[1].extend(p[0] for p in pairs)
             entry[2].extend(p[1] for p in pairs)
 
-        dev_type = (
-            self.device.type
-            if isinstance(self.device, torch.device)
-            else str(self.device)
-        )
+        dev_type = self.device.type
         can_fuse_spec_seed_rollback = (
             spec_seed
             and len(per_raw_spec_inputs) == 1
@@ -3543,15 +3539,11 @@ class TPUModelRunner(GPUModelRunner):
         pre_next_tokens_cpu = pre_next_tokens_cpu[:n_pre_reqs]
         max_gen_len = pre_next_tokens_cpu.shape[-1]
 
-        copy_state = getattr(self._pre_async_results, "copy_state", None)
-        if copy_state is not None and isinstance(copy_state, AsyncTPUCopyState):
-            raw_rows = copy_state.sampled_token_ids_list[:n_pre_reqs]
-        else:
-            raw_rows = (
-                pre_next_tokens_cpu.unsqueeze(-1).tolist()
-                if pre_next_tokens_cpu.dim() == 1
-                else pre_next_tokens_cpu.tolist()
-            )
+        # wait_for_copy returned tokens, so the copy state is set; its cached
+        # rows are the same tokens as nested lists.
+        copy_state = self._pre_async_results.copy_state
+        assert copy_state is not None
+        raw_rows = copy_state.sampled_token_ids_list[:n_pre_reqs]
 
         if max_gen_len == 1:
             valid_sampled_token_ids = [row[:] for row in raw_rows]
@@ -3568,11 +3560,7 @@ class TPUModelRunner(GPUModelRunner):
         num_tokens_no_spec = self.input_batch.num_tokens_no_spec
         token_ids_cpu = self.input_batch.token_ids_cpu
         max_model_len_cap = token_ids_cpu.shape[1]
-        pre_next_np = (
-            pre_next_tokens_cpu.numpy()
-            if isinstance(pre_next_tokens_cpu, torch.Tensor)
-            else None
-        )
+        pre_next_np = pre_next_tokens_cpu.numpy()
 
         for pre_req_idx, req_state, seq_len, req_id in pre_request_seq_lens:
             sampled_ids = valid_sampled_token_ids[pre_req_idx]
@@ -3620,7 +3608,7 @@ class TPUModelRunner(GPUModelRunner):
             )
             if n_sampled == 1:
                 token_ids_cpu[req_idx, start_idx] = sampled_ids[0]
-            elif pre_next_np is not None and (
+            elif (
                 n_sampled == max_gen_len
                 or raw_rows[pre_req_idx][:n_sampled] == sampled_ids
             ):
@@ -6037,10 +6025,7 @@ class TPUModelRunner(GPUModelRunner):
         ctx = self._attn_metadata_builder_ctx
         groups_ids = tuple(id(g) for g in groups)
         cached_stacked = ctx._stacked_mamba_groups
-        if (
-            isinstance(cached_stacked, torch.Tensor)
-            and ctx._stacked_mamba_groups_ids == groups_ids
-        ):
+        if cached_stacked is not None and ctx._stacked_mamba_groups_ids == groups_ids:
             stacked = cached_stacked
         else:
             stacked = _stack_or_single_mamba_groups(groups)
