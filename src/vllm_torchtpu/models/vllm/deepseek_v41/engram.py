@@ -160,12 +160,12 @@ def _dp_gather_engram_rows(staged: torch.Tensor, num_tokens: int) -> torch.Tenso
 class TpuDPSharedEngramStorage(upstream.DPSharedEngramStorage):
     """POSIX ``/dev/shm`` host weights shared across a node-local Engram DP group.
 
-    # TODO(upstream): ``vllm/models/deepseek_v41/common/engram.py:813,847`` calls
-    # CUDA ``cudaHostRegister``/``cudaHostUnregister`` and ``get_accelerator_view``.
-    # ``torch-tpu <= 0.2.0`` lacks ``TpuPinnedAllocator``; post-``0.2.0``
-    # ``GetTpuPinnedAllocator()`` allocates from the ``16 GiB``
-    # ``TPU_PREMAPPED_BUFFER_SIZE`` pool and lacks in-place ``MAP_SHARED``
-    # ``/dev/shm`` host-pointer registration.
+    # TODO(upstream): Drop this override once upstream ``DPSharedEngramStorage``
+    # stops requiring CUDA ``cudaHostRegister``/``cudaHostUnregister`` and
+    # ``get_accelerator_view``, or torch-tpu can register a ``MAP_SHARED``
+    # ``/dev/shm`` mapping in place. ``torch-tpu <= 0.2.0`` lacks
+    # ``TpuPinnedAllocator``; post-``0.2.0`` ``GetTpuPinnedAllocator()`` only
+    # allocates from the ``16 GiB`` ``TPU_PREMAPPED_BUFFER_SIZE`` pool.
     """
 
     def _allocate(self, num_bytes: int) -> torch.Tensor:
@@ -374,11 +374,15 @@ class NgramHashState(upstream.NgramHashState):
         rows = torch.arange(token_count, dtype=torch.int32, device=device)
         query_bounds = query_start_loc.int()
         pos_i32 = positions.int()
-        reqs = (rows.unsqueeze(1) >= query_bounds[1:].unsqueeze(0)).sum(
-            dim=-1, dtype=torch.int32
-        )
-        # Padding rows past the last query boundary belong to the last request.
-        reqs = reqs.clamp(max=query_bounds.numel() - 2)
+        # Each token's request: mark interior request starts and cumsum, as in
+        # qwen4_exp/ple.py (cheaper on TPU than a [tokens, reqs] comparison).
+        # Starts at or past token_count land in a dropped overflow slot, and
+        # padding rows past the last query boundary map to the last request.
+        num_reqs = query_bounds.numel() - 1
+        starts = query_bounds[1:num_reqs].clamp(max=token_count)
+        marks = torch.zeros(token_count + 1, dtype=torch.int32, device=device)
+        marks.index_add_(0, starts, torch.ones_like(starts))
+        reqs = marks[:token_count].cumsum(0, dtype=torch.int32).clamp(max=num_reqs - 1)
         first_token_idx = query_bounds.index_select(0, reqs).clamp(max=token_count - 1)
         chunk_start_pos = pos_i32.index_select(0, first_token_idx)
 
@@ -447,9 +451,10 @@ class NgramHashState(upstream.NgramHashState):
 class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
     """TPU-adapted ``ParallelEngramEmbedding`` supporting HBM and ``/dev/shm`` offload.
 
-    # TODO(upstream): ``vllm/models/deepseek_v41/common/engram.py:981,1002,1143``
-    # requires CUDA ``is_uva_available()``, ``torch.cuda.get_device_properties``,
-    # and Triton ``_engram_lookup_kernel``.
+    # TODO(upstream): Call ``super().__init__`` and drop ``gather_raw``/``lookup``
+    # once upstream ``ParallelEngramEmbedding`` no longer requires CUDA
+    # ``is_uva_available()``, ``torch.cuda.get_device_properties`` and the Triton
+    # ``_engram_lookup_kernel``.
     """
 
     def __init__(
@@ -462,11 +467,9 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         dp_shared_memory: bool = False,
         use_thp: bool = False,
     ) -> None:
-        # NOTE(cross-boundary-contract): Call nn.Module.__init__(self) directly
-        # instead of super().__init__ to bypass upstream common/engram.py:981 CUDA
-        # is_uva_available() queries on TPU. The argument checks below mirror
-        # upstream; use_thp is retained for upstream constructor signature
-        # compatibility.
+        # Call nn.Module.__init__ directly: upstream's __init__ queries CUDA
+        # (is_uva_available, device properties), which fails on TPU. The
+        # argument checks below mirror upstream's.
         nn.Module.__init__(self)
         assert head_sizes and all(size > 0 for size in head_sizes)
         assert sum(head_sizes) <= num_embeddings
@@ -474,6 +477,8 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         # layer of Engram on HBM.
         self.cpu_offload = bool(cpu_offload)
         self.dp_shared_memory = bool(dp_shared_memory)
+        # Kept for upstream signature compatibility; transparent huge pages are
+        # not implemented on TPU, so this flag is currently a no-op.
         self.use_thp = use_thp
         self.dp_size = get_engram_dp_size()
         if self.dp_shared_memory:
@@ -625,9 +630,9 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
 class Engram(upstream.Engram):
     """TPU-adapted ``Engram`` with 1-D ``int32`` host staging and PyTorch gating.
 
-    # TODO(upstream): ``vllm/models/deepseek_v41/common/engram.py:1603,1711``
-    # constructs ``torch.cuda.Stream``/``Event`` and invokes Triton
-    # ``_fused_engram_post_wkv_kernel``.
+    # TODO(upstream): Drop the ``forward``/staging overrides once upstream
+    # ``Engram`` no longer constructs ``torch.cuda.Stream``/``Event`` or calls
+    # the Triton ``_fused_engram_post_wkv_kernel``.
     """
 
     def __init__(
@@ -671,7 +676,7 @@ class Engram(upstream.Engram):
         )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
-        """Initialize per-bucket 1-D ``int32`` device staging and host ring state."""
+        """Initialize per-bucket 1-D ``int32`` device and host staging state."""
         dp_tokens = max_tokens * self.embed_tokens.dp_size
         cols = self.embed_tokens.part_n_hash_cols
         self.staged_rows = torch.empty(dp_tokens, cols, head_dim, dtype=torch.bfloat16)
@@ -681,8 +686,7 @@ class Engram(upstream.Engram):
         self._active_staged: torch.Tensor | None = None
         self._active_raw: torch.Tensor | None = None
         self._staged_by_tokens: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        self._host_ring_by_tokens: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        self._host_ring_idx: dict[int, int] = {}
+        self._host_buf_by_tokens: dict[int, torch.Tensor] = {}
         if not self.embed_tokens.cpu_offload:
             return
 
@@ -693,7 +697,7 @@ class Engram(upstream.Engram):
         self._scale_blocks = blocks
         self._words_per_tok = words_per_token
         self._staging_shape = (dp_tokens, cols, head_dim)
-        init = torch.zeros(dp_tokens * words_per_token, dtype=torch.int32)
+        init = torch.zeros(dp_tokens * words_per_token, dtype=torch.int32, device="cpu")
         init[dp_tokens * raw_words :].fill_(-1)
         self._staged_raw = init.to(self.staged_rows.device)
 
@@ -708,8 +712,10 @@ class Engram(upstream.Engram):
             if num_tokens == max_tokens:
                 staged = self._staged_raw
             else:
-                # init staged buffer on CPU to avoid create new graph on TPU.
-                init = torch.zeros(num_tokens * words_per_token, dtype=torch.int32)
+                # Init the staged buffer on CPU to avoid creating a new graph on TPU.
+                init = torch.zeros(
+                    num_tokens * words_per_token, dtype=torch.int32, device="cpu"
+                )
                 init[raw_words:].fill_(-1)
                 staged = init.to(self._staged_raw.device)
             view = staged.view(num_tokens, words_per_token)
@@ -731,8 +737,13 @@ class Engram(upstream.Engram):
             if tensor is not None and tensor.numel() > 0
         )
 
-    def _host_slot(self, num_tokens: int, raw_bytes: int, total_bytes: int) -> Tensor:
-        """Return the next alternating CPU staging buffer for ``num_tokens``.
+    def _host_buf(self, num_tokens: int, raw_bytes: int, total_bytes: int) -> Tensor:
+        """Return the CPU staging buffer for ``num_tokens``.
+
+        One buffer per bucket is enough because the H2D ``copy_`` is synchronous,
+        so the buffer is free again once ``prepare_embeddings`` returns. Bytes
+        past ``raw_bytes`` start as ``_INVALID_SCALE``; ``gather_raw`` only ever
+        rewrites the scale bytes, so the padding tail stays invalid.
 
         Note: ``torch-tpu <= 0.2.0`` does not register ``TpuPinnedAllocator``
         (``is_pin_memory_available() -> False``, so ``Tensor.pin_memory()``
@@ -740,17 +751,12 @@ class Engram(upstream.Engram):
         allocates from the ``16 GiB`` ``TPU_PREMAPPED_BUFFER_SIZE`` pool, while
         PJRT transfers standard CPU buffers directly during synchronous ``copy_``.
         """
-        ring = self._host_ring_by_tokens.get(num_tokens)
-        if ring is None:
-            buf_a = torch.zeros(total_bytes, dtype=torch.uint8, device="cpu")
-            buf_b = torch.zeros(total_bytes, dtype=torch.uint8, device="cpu")
-            buf_a[raw_bytes:].fill_(_INVALID_SCALE)
-            buf_b[raw_bytes:].fill_(_INVALID_SCALE)
-            ring = (buf_a, buf_b)
-            self._host_ring_by_tokens[num_tokens] = ring
-        slot_idx = self._host_ring_idx.get(num_tokens, 0)
-        self._host_ring_idx[num_tokens] = slot_idx ^ 1
-        return ring[slot_idx]
+        buf = self._host_buf_by_tokens.get(num_tokens)
+        if buf is None:
+            buf = torch.zeros(total_bytes, dtype=torch.uint8, device="cpu")
+            buf[raw_bytes:].fill_(_INVALID_SCALE)
+            self._host_buf_by_tokens[num_tokens] = buf
+        return buf
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
         """Gather host FP8/E8M0 rows and copy into the 1-D ``int32`` device buffer.
@@ -778,12 +784,11 @@ class Engram(upstream.Engram):
             words_per_token = self._words_per_tok
             raw_bytes = num_tokens * cols * head_dim
             scale_bytes = num_tokens * cols * blocks
-            host_buf = self._host_slot(
+            host_buf = self._host_buf(
                 num_tokens,
                 raw_bytes,
                 num_tokens * words_per_token * _WORD_BYTES,
             )
-            host_buf[raw_bytes + scale_bytes :] = _INVALID_SCALE
             host_raw = host_buf[:raw_bytes].view(num_tokens, cols, head_dim)
             host_scale = host_buf[raw_bytes : raw_bytes + scale_bytes].view(
                 num_tokens, cols, blocks
