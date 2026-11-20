@@ -72,13 +72,14 @@ that prefill keeps its full chunk.
 With TPU_PREFIX_AWARE_SHORT_PROMPTS=first-short-step, a step that starts a
 short waiting prompt beside a running long prefill holds fewer tokens: short
 prompts' chunks first, then running long prefills in admission order; in such
-a step the oldest long prefill does not keep its full chunk, so a lone long
-prompt is slowed down too. A step's time grows with its tokens, so the smaller
-step reaches the short prompt's first token sooner. Its size is the smallest
-compiled step size (compilation_config.compile_sizes) that holds one full
-chunk (long_prefill_token_threshold) and is smaller than the full step, so a
-short prompt's first chunk fits and the step pads to no larger size. The chunk
-limit and every request's tokens stay the same; only the order and grouping of
+a step neither the oldest long prefill nor a prefill a held prompt waits for
+keeps its full chunk, so a lone long prompt is slowed down too. A step's time
+grows with its tokens, so the smaller step reaches the short prompt's first
+token sooner. Its size is the smallest compiled step size
+(compilation_config.compile_sizes) that holds one full chunk
+(long_prefill_token_threshold) and is smaller than the full step, so a short
+prompt's first chunk fits and the step pads to no larger size. The chunk limit
+and every request's tokens stay the same; only the order and grouping of
 prompt chunks change.
 
 Enable with:
@@ -357,14 +358,9 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
         prefills = [r for r in self.running if r.is_prefill_chunk]
         if all(self._is_short_prompt(r) for r in prefills):
             return False
-        running_short = sum(
-            self._chunk(r.num_tokens - r.num_computed_tokens)
-            for r in prefills
-            if self._is_short_prompt(r)
-        )
         _, started = fit_short_prompts(
             ((None, chunk) for chunk in self._short_waiting_chunks()),
-            running_short,
+            self._short_prefill_chunks(prefills),
             self.short_step_tokens,
             self._free_sequence_slots(),
         )
@@ -441,6 +437,9 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
         )
 
     def _keeps_full_chunk(self, request: Request) -> bool:
+        """Whether this running long prefill keeps its full chunk beside short
+        prompts: the oldest long prefill and every prefill a held prompt waits
+        for do, except in a short step, where every long prefill gives way."""
         if self._short_step:
             return False
         longs = (
@@ -476,18 +475,21 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
         )
         if free_tokens <= 0:
             return 0
-        reserved = sum(
-            self._chunk(r.num_tokens - r.num_computed_tokens)
-            for r in prefills
-            if self._is_short_prompt(r)
-        )
         reserved, _ = fit_short_prompts(
             ((None, chunk) for chunk in self._short_waiting_chunks()),
-            reserved,
+            self._short_prefill_chunks(prefills),
             free_tokens,
             self._free_sequence_slots(),
         )
         return min(reserved, free_tokens)
+
+    def _short_prefill_chunks(self, prefills: list[Request]) -> int:
+        """Tokens of this step's chunks of the running short prefills."""
+        return sum(
+            self._chunk(r.num_tokens - r.num_computed_tokens)
+            for r in prefills
+            if self._is_short_prompt(r)
+        )
 
     def _short_waiting_chunks(self) -> list[int]:
         """First-step chunks of the short waiting prompts, in admission order."""
