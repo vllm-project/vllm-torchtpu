@@ -31,11 +31,15 @@ attention exit and the dense FFN exit (RowParallelLinear), the MoE FFN exit
 (the runner's tensor_model_parallel_all_reduce) and the embedding, because
 all of them call the same GroupCoordinator.all_reduce.
 
-vLLM traces with a dynamic token dimension and torch_tpu exports one program
-per token count, so the row count is static only inside the op's JAX body.
-The body picks the path there: the Pallas kernel for the armed row counts,
-lax.psum (the XLA all-reduce) for any other count. Every rank traces the same
-shape, so every rank takes the same path.
+`maybe_all_reduce` routes an all-reduce to the op only when its row count is
+one of the armed row counts. Every other all-reduce, for example a prefill
+step of 4096 tokens, keeps the communicator's own XLA all-reduce, as it would
+with the op unarmed. The row count is a concrete int at that point: vLLM
+compiles the graph once per token count (the TPU platform disables dynamic
+compile ranges), and torch_tpu runs vllm.all_reduce's implementation with
+inputs of that one shape. A symbolic row count (torch.SymInt) is not routed,
+because reading its value would add a shape guard. Every rank compiles the
+same shapes, so every rank takes the same path.
 
 All rows travel: the kernel's n_valid is the padded row count. The true token
 count exists on device only as token_padding's mask, which is set only with
@@ -50,10 +54,10 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import torch
-from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
+from torch.fx.experimental.symbolic_shapes import is_concrete_int
 from torch_tpu._internal import pallas
 from vllm.distributed import parallel_state
 
@@ -78,6 +82,7 @@ class _Armed:
     rank: torch.Tensor  # this rank's mesh index, int32 [1, 1]
     ranks: tuple[int, ...]  # global ranks of the TP group
     hidden: int
+    buckets: tuple[int, ...]  # row counts the kernel serves
 
 
 _ARMED: _Armed | None = None
@@ -99,16 +104,23 @@ def row_buckets(n_ranks: int, hidden: int, max_rows: int, info) -> tuple[int, ..
     )
 
 
-def _op_body(n_ranks: int, buckets: tuple[int, ...], axis: str):
-    """The op's per-rank body under shard_map over `axis`: x is this rank's
-    bf16 [rows, hidden] partial and rank its int32 [1, 1] mesh index. Returns
-    the sum over the n_ranks ranks, from the Pallas kernel when rows is in
-    `buckets`, else from lax.psum."""
+def _op_body(n_ranks: int, buckets: tuple[int, ...]):
+    """The op's per-rank body under shard_map: x is this rank's bf16
+    [rows, hidden] partial and rank its int32 [1, 1] mesh index. Returns the
+    sum over the n_ranks ranks from the Pallas kernel.
+
+    Raises:
+        ValueError: At trace time, when rows is not in `buckets`.
+            `maybe_all_reduce` routes only the armed row counts here.
+    """
 
     def body(x, rank):
         rows, hidden = x.shape  # static: one exported program per token count
         if rows not in buckets:
-            return lax.psum(x, axis)
+            raise ValueError(
+                f"pallas_all_reduce: {rows} rows reached the op; it serves "
+                f"only rows {list(buckets)}"
+            )
         spec = all_reduce.make_spec(n_ranks, rows, hidden)
         # n_valid = rows: every row is reduced (see the module docstring).
         meta = jnp.stack(
@@ -124,7 +136,7 @@ def _build_op(mesh, buckets: tuple[int, ...]):
     axis = mesh.axis_names[0]
     specs = (P(axis), P(axis))
     sharded = jax.shard_map(
-        _op_body(int(mesh.size), buckets, axis),
+        _op_body(int(mesh.size), buckets),
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
@@ -179,8 +191,7 @@ def arm(hidden: int, device: torch.device) -> bool:
 
     Collective over the TP group: every rank must call it. The ranks first
     agree on the plan, then run the op on known inputs at every served row
-    count and at the next multiple of the row tile, which takes the psum
-    path.
+    count.
 
     Args:
         hidden: The model's hidden size, the last dimension of the TP
@@ -226,10 +237,7 @@ def arm(hidden: int, device: torch.device) -> bool:
     n_ranks = int(topo.mesh.size)
     op = _build_op(topo.mesh, buckets)
     rank = _rank_tensor(device, mesh_index)
-    fallback_rows = buckets[-1] + info.get_sublane_tiling(jnp.bfloat16)
-    failures = _selftest(
-        op, rank, mesh_index, n_ranks, hidden, (*buckets, fallback_rows), device
-    )
+    failures = _selftest(op, rank, mesh_index, n_ranks, hidden, buckets, device)
     seen = _gather(dict(mesh_index=mesh_index, failures=failures))
     if any(s["failures"] for s in seen):
         raise RuntimeError(
@@ -237,7 +245,7 @@ def arm(hidden: int, device: torch.device) -> bool:
             f"failing row counts): {seen}"
         )
     tp_ranks = tuple(int(r) for r in parallel_state.get_tp_group().ranks)
-    _ARMED = _Armed(op=op, rank=rank, ranks=tp_ranks, hidden=hidden)
+    _ARMED = _Armed(op=op, rank=rank, ranks=tp_ranks, hidden=hidden, buckets=buckets)
     logger.info(
         "pallas_all_reduce: armed for bf16 [rows, %d] over %d ranks, rows %s "
         "(mesh index %d)",
@@ -251,13 +259,21 @@ def arm(hidden: int, device: torch.device) -> bool:
 
 def maybe_all_reduce(x: torch.Tensor, ranks) -> torch.Tensor | None:
     """The sum of x over the group `ranks` through the armed op, or None when
-    the op does not serve this all-reduce (not armed, another group, another
-    dtype, rank or last dimension). Row counts the kernel does not serve take
-    the psum path inside the op.
+    the op does not serve this all-reduce. The caller then runs its own XLA
+    all-reduce.
+
+    The op serves x only when it is armed for the group `ranks`, x is bf16
+    [rows, hidden] at the armed hidden size, and rows is a concrete int in the
+    armed row counts. Example: armed with rows (16, 32), a [32, 6144] decode
+    partial goes to the op, while a [4096, 6144] prefill partial and a
+    [24, 6144] partial return None.
 
     Args:
         x: This rank's partial.
         ranks: Global ranks of the group to reduce over.
+
+    Returns:
+        The reduced tensor, or None.
     """
     armed = _ARMED
     if (
@@ -267,5 +283,10 @@ def maybe_all_reduce(x: torch.Tensor, ranks) -> torch.Tensor | None:
         or x.dim() != 2
         or x.shape[1] != armed.hidden
     ):
+        return None
+    rows = x.shape[0]
+    # is_concrete_int reads a SymInt without a guard, so a symbolic row count
+    # keeps the XLA all-reduce and adds no recompile.
+    if not is_concrete_int(rows) or int(rows) not in armed.buckets:
         return None
     return armed.op(x, armed.rank)

@@ -14,6 +14,9 @@
 """pallas_all_reduce (TPU_PALLAS_SMALL_ALL_REDUCE_MAX_ROWS): the op body on 16
 CPU devices, the communicator's routing and arming.
 
+Only the armed row counts reach the op. Every other row count keeps the
+communicator's XLA all-reduce (DeviceCommunicatorBase.all_reduce).
+
 The 16-device check runs this file as a script in a subprocess, because the
 host device count (XLA_FLAGS) must be set before JAX starts. It uses TPU
 interpret mode with the race detector, so it checks the path choice, the DMA
@@ -48,10 +51,11 @@ N_RANKS = 16
 # GLM-5.2's hidden size; the decode TP all-reduce is bf16 [16 or 32, 6144].
 HIDDEN = 6144
 MAX_ROWS = 32
-# Row counts the op body runs: 16 and 32 take the kernel; 48 (above the cap)
-# and 8 (below one bf16 row tile) take the psum.
+# Row counts the kernel serves at MAX_ROWS. 48 (above the cap), 8 (below one
+# bf16 row tile) and 24 (not a multiple of 16) are not served: the op body
+# refuses them, and the communicator keeps the XLA all-reduce for them.
 KERNEL_ROWS = (16, 32)
-PSUM_ROWS = (48, 8)
+UNSERVED_ROWS = (48, 8, 24)
 ENV = "TPU_PALLAS_SMALL_ALL_REDUCE_MAX_ROWS"
 
 
@@ -100,13 +104,10 @@ def test_kernel_rows_equal_the_rank_order_f32_sum(on_16_devices, rows):
     assert case["selftest_ok"], case
 
 
-@pytest.mark.parametrize("rows", PSUM_ROWS)
-def test_other_rows_take_the_psum(on_16_devices, rows):
+@pytest.mark.parametrize("rows", UNSERVED_ROWS)
+def test_op_body_refuses_unserved_rows(on_16_devices, rows):
     case = on_16_devices["cases"][str(rows)]
-    assert not case["pallas_call"], case
-    assert case["ranks_identical"], case
-    # Small integer partials: every order of summation is exact in bf16.
-    assert case["integer_exact"], case
+    assert case["refused"], case
 
 
 def _interpret(fn, *args):
@@ -132,7 +133,7 @@ def _worker():
     buckets = pallas_all_reduce.row_buckets(N_RANKS, HIDDEN, MAX_ROWS, _tpu7x())
     run = jax.jit(
         jax.shard_map(
-            pallas_all_reduce._op_body(N_RANKS, buckets, "d"),
+            pallas_all_reduce._op_body(N_RANKS, buckets),
             mesh=mesh,
             in_specs=(P("d"), P("d")),
             out_specs=P("d"),
@@ -146,17 +147,13 @@ def _worker():
 
     def call(partials):
         """partials: f32 [n, rows, h], exact in bf16 -> (out [n, rows, h] f32,
-        races found). The psum path has no Pallas call, so no interpreter
-        state and no races."""
+        races found)."""
         rows = partials.shape[1]
         x = jax.device_put(
             jnp.asarray(partials.reshape(N_RANKS * rows, HIDDEN), jnp.bfloat16),
             NamedSharding(mesh, P("d")),
         )
-        if rows in buckets:
-            out, races = _interpret(run, x, rank_ids)
-        else:
-            out, races = np.asarray(jax.block_until_ready(run(x, rank_ids))), False
+        out, races = _interpret(run, x, rank_ids)
         return out.astype(np.float32).reshape(N_RANKS, rows, HIDDEN), races
 
     def identical(out):
@@ -165,47 +162,45 @@ def _worker():
 
     result = {"buckets": list(buckets), "cases": {}}
     rng = np.random.default_rng(0)
-    for rows in KERNEL_ROWS + PSUM_ROWS:
+    for rows in UNSERVED_ROWS:
+        probe = jnp.zeros((N_RANKS * rows, HIDDEN), jnp.bfloat16)
+        try:
+            jax.make_jaxpr(run)(probe, rank_ids)
+            refused = False
+        except ValueError as e:
+            refused = "reached the op" in str(e)
+        result["cases"][str(rows)] = {"refused": refused}
+    for rows in KERNEL_ROWS:
         probe = jnp.zeros((N_RANKS * rows, HIDDEN), jnp.bfloat16)
         case = {
             "pallas_call": "pallas_call" in str(jax.make_jaxpr(run)(probe, rank_ids))
         }
-        if rows in KERNEL_ROWS:
-            partials = np.asarray(
-                jnp.asarray(rng.standard_normal((N_RANKS, rows, HIDDEN)), jnp.bfloat16),
-                np.float32,
-            )
-            want = partials[0].copy()
-            for r in range(1, N_RANKS):
-                want = want + partials[r]
-            want = np.asarray(jnp.asarray(want, jnp.bfloat16), np.float32)
-            out, races = call(partials)
-            spec = all_reduce.make_spec(N_RANKS, rows, HIDDEN)
-            exact = all_reduce.selftest_inputs(spec)
-            out_exact, races_exact = call(exact)
-            case.update(
-                races_found=races or races_exact,
-                ranks_identical=identical(out) and identical(out_exact),
-                random_bit_exact=bool(
-                    np.array_equal(
-                        out.view(np.uint32),
-                        np.broadcast_to(want, out.shape).view(np.uint32),
-                    )
-                ),
-                selftest_ok=all(
-                    all_reduce.selftest_ok(spec, exact, out_exact[r], rows)
-                    for r in range(N_RANKS)
-                ),
-            )
-        else:
-            partials = rng.integers(-5, 6, (N_RANKS, rows, HIDDEN)).astype(np.float32)
-            out, _ = call(partials)
-            case.update(
-                ranks_identical=identical(out),
-                integer_exact=bool(
-                    np.array_equal(out, np.broadcast_to(partials.sum(0), out.shape))
-                ),
-            )
+        partials = np.asarray(
+            jnp.asarray(rng.standard_normal((N_RANKS, rows, HIDDEN)), jnp.bfloat16),
+            np.float32,
+        )
+        want = partials[0].copy()
+        for r in range(1, N_RANKS):
+            want = want + partials[r]
+        want = np.asarray(jnp.asarray(want, jnp.bfloat16), np.float32)
+        out, races = call(partials)
+        spec = all_reduce.make_spec(N_RANKS, rows, HIDDEN)
+        exact = all_reduce.selftest_inputs(spec)
+        out_exact, races_exact = call(exact)
+        case.update(
+            races_found=races or races_exact,
+            ranks_identical=identical(out) and identical(out_exact),
+            random_bit_exact=bool(
+                np.array_equal(
+                    out.view(np.uint32),
+                    np.broadcast_to(want, out.shape).view(np.uint32),
+                )
+            ),
+            selftest_ok=all(
+                all_reduce.selftest_ok(spec, exact, out_exact[r], rows)
+                for r in range(N_RANKS)
+            ),
+        )
         result["cases"][str(rows)] = case
     print("RESULT " + json.dumps(result))
 
@@ -235,6 +230,7 @@ def armed(monkeypatch):
             rank=torch.zeros(1, 1, dtype=torch.int32),
             ranks=tuple(range(N_RANKS)),
             hidden=HIDDEN,
+            buckets=KERNEL_ROWS,
         ),
     )
     return op
@@ -254,12 +250,37 @@ def _ones(*shape, dtype=torch.bfloat16):
     return torch.ones(*shape, dtype=dtype)
 
 
-def test_tp_all_reduce_routes_to_the_op(armed, communicator):
-    # Any row count reaches the op; the op body picks kernel or psum.
-    for rows in (16, 32, 48, 8192):
+def test_armed_row_counts_route_to_the_op(armed, communicator):
+    for rows in KERNEL_ROWS:
         out = communicator.all_reduce(_ones(rows, HIDDEN))
         assert torch.equal(out, _ones(rows, HIDDEN) * N_RANKS)
-    assert armed.calls == 4
+    assert armed.calls == len(KERNEL_ROWS)
+
+
+# 4096: a prefill step's token count.
+@pytest.mark.parametrize("rows", (*UNSERVED_ROWS, 64, 4096))
+def test_other_row_counts_keep_the_xla_all_reduce(armed, communicator, rows):
+    x = _ones(rows, HIDDEN)
+    assert torch.equal(communicator.all_reduce(x), x + 1)
+    assert armed.calls == 0
+
+
+def test_symbolic_row_count_keeps_the_xla_all_reduce(armed, communicator):
+    """A backed SymInt with hint 16 (an armed row count): reading its value
+    would add a guard, so the communicator must keep the XLA all-reduce."""
+    from torch._dynamo.source import ConstantSource
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    shape_env = ShapeEnv()
+    symbol = shape_env.create_symbol(16, ConstantSource("rows"))
+    rows = shape_env.create_symintnode(symbol, hint=16)
+    with FakeTensorMode(shape_env=shape_env):
+        x = torch.empty(rows, HIDDEN, dtype=torch.bfloat16)
+        assert isinstance(x.shape[0], torch.SymInt)
+        communicator.all_reduce(x)
+    assert armed.calls == 0
+    assert not shape_env.guards
 
 
 @pytest.mark.parametrize(
@@ -362,13 +383,13 @@ def arming(monkeypatch):
     return h
 
 
-def test_arm_self_tests_the_buckets_and_the_psum_row_count(arming):
+def test_arm_self_tests_the_buckets(arming):
     assert pallas_all_reduce.arm(HIDDEN, torch.device("cpu"))
-    # 16 and 32 take the kernel; 48 checks the psum path.
-    assert arming.selftest_rows == (16, 32, 48)
+    assert arming.selftest_rows == KERNEL_ROWS
     armed = pallas_all_reduce._ARMED
     assert armed is not None
     assert armed.hidden == HIDDEN and armed.ranks == tuple(range(N_RANKS))
+    assert armed.buckets == KERNEL_ROWS
 
 
 def test_arm_refuses_a_topology_it_cannot_serve(arming, monkeypatch):
