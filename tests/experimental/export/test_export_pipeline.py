@@ -3418,3 +3418,77 @@ def test_load_vllm_model_hooks_fused_norm_quant_and_summaries(monkeypatch) -> No
     assert out is target
     assert installed == [target]
     assert summaries == ["lowtok", "v3"]
+
+
+def test_sequence_parallel_chunk_selects_slice_by_per_rank_constant(
+    monkeypatch,
+) -> None:
+    """sequence_parallel_chunk slices by a per-rank buffer during export forward."""
+    import sys
+    import types
+
+    from vllm.model_executor.models import utils as model_utils
+
+    # Simulate a model module binding `sequence_parallel_chunk` by value at import.
+    fake_model_mod: Any = types.ModuleType("vllm.model_executor.models._fake_sp_test")
+    fake_model_mod.sequence_parallel_chunk = model_utils.sequence_parallel_chunk
+    monkeypatch.setitem(
+        sys.modules, "vllm.model_executor.models._fake_sp_test", fake_model_mod
+    )
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.use_sequence_parallel = True
+            self.weight = nn.Parameter(torch.zeros(1))
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return fake_model_mod.sequence_parallel_chunk(x)
+
+    model = Model()
+    with (
+        mock.patch("vllm.distributed.model_parallel_is_initialized", return_value=True),
+        mock.patch(
+            "vllm.distributed.get_tensor_model_parallel_world_size", return_value=4
+        ),
+        mock.patch("vllm.distributed.get_tensor_model_parallel_rank", return_value=2),
+    ):
+        assert universal_adapter._patch_sequence_parallel_chunk(model) == 1
+
+    assert model.export_sp_tp_rank.tolist() == [2]
+
+    # Divisible token count: 8 rows split across 4 ranks -> rank 2 keeps rows [4:6].
+    x_even = torch.arange(32.0).reshape(8, 4)
+    torch.testing.assert_close(model(x_even), x_even[4:6])
+
+    # Unaligned token count: 5 rows pads to 8 -> rank 2 keeps row 4 and 1 zero-pad row.
+    x_odd = torch.arange(20.0).reshape(5, 4)
+    expected_odd = torch.stack([x_odd[4], torch.zeros(4)])
+    torch.testing.assert_close(model(x_odd), expected_odd)
+
+    # functional_call substitutes the buffer per device, mimicking export execution.
+    params = dict(model.named_parameters())
+    buffers_r3 = {"export_sp_tp_rank": torch.tensor([3], dtype=torch.long)}
+    out_r3 = torch.func.functional_call(model, {**params, **buffers_r3}, (x_even,))
+    torch.testing.assert_close(out_r3, x_even[6:8])
+
+
+def test_load_vllm_model_rejects_v3_with_non_identity_ep_rank_order(
+    monkeypatch,
+) -> None:
+    target = nn.Module()
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v3")
+    monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
+    monkeypatch.setattr("vllm.distributed.model_parallel_is_initialized", lambda: True)
+    monkeypatch.setattr(
+        "vllm_torchtpu.distributed.ep_mesh.ep_rank_order",
+        lambda: (0, 1, 6, 7, 2, 3, 4, 5),
+    )
+    monkeypatch.setattr(universal_adapter, "run_model_loader", lambda _cfg: target)
+    cfg = SimpleNamespace(
+        load_config=SimpleNamespace(load_format="dummy"),
+        device_config=SimpleNamespace(device=None),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    with pytest.raises(RuntimeError, match="MOE_FUSED_EP_SORTED_GATHER"):
+        universal_adapter.load_vllm_model(cfg, load_format="dummy")
