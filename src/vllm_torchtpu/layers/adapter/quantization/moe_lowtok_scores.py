@@ -351,7 +351,7 @@ def _moe_scores_fn(
         w2_scale,
         None,
         None,
-        topk_weights.astype(x.dtype),
+        topk_weights,
         topk_ids,
         experts_start,
         topk=topk,
