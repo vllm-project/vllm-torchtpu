@@ -16,9 +16,11 @@
 On the expert-parallel MoE layers of the Qwen3.5 checkpoint, device and
 expert-parallel size it was measured at (`enabled`, `max_tokens`), a layer whose
 routing is a plain softmax top-k with renormalized weights hands its router
-scores to `pallas::moe_lowtok_scores_k{k}` (or
-`pallas::moe_lowtok_scores_copies_k{k}_r{r}_o{o}` when placed by a
-`TPU_EXPERT_PLACEMENT` table with copy slots). Inside the JAX op, shapes at or
+scores to `pallas::moe_lowtok_scores_k{k}` (suffixed `_p{n}` when a
+`TPU_EXPERT_PLACEMENT` table with copy slots bounds the layer's grouped
+fallback to `n` local slots), or to
+`pallas::moe_lowtok_scores_copies_k{k}_r{r}_o{o}` when that table places the
+layer. Inside the JAX op, shapes at or
 below the expert-parallel size's row cap (`max_tokens`) dispatch to
 `moe_lowtok` (which selects
 experts in-kernel and, for copy-enabled layers, greedily picks the less-loaded
@@ -291,7 +293,11 @@ def _moe_scores_fn(
     ranks: int = 8,
     owned: int = 64,
     has_copies: bool = False,
+    num_primary_experts: int | None = None,
 ) -> jax.Array:
+    """The scores op's body. Above the row cap the grouped fallback bounds the
+    layer's local slots at ``owned`` for the copy-aware op, else at
+    ``num_primary_experts`` (``expert_placement.primary_experts``)."""
     if x.shape[0] <= _ARMED_MAX_TOKENS:
         if has_copies:
             return moe_lowtok(
@@ -330,11 +336,6 @@ def _moe_scores_fn(
         topk_logits, topk_ids = jax.lax.top_k(logits_f32, topk)
     valid_row = topk_logits[:, :1] > -3.0e38
     topk_weights = jnp.where(valid_row, jax.nn.softmax(topk_logits, axis=-1), 0.0)
-    num_primary_experts = (
-        owned
-        if has_copies
-        else (int(expert_placement.owned()) if expert_placement.has_copies() else None)
-    )
     return fused_moe_func(
         x,
         w13,
@@ -353,12 +354,13 @@ def _moe_scores_fn(
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=None,
         skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,
-        num_primary_experts=num_primary_experts,
+        num_primary_experts=owned if has_copies else num_primary_experts,
     )
 
 
-def _build_op(topk: int) -> torch.library.CustomOpDef:
-    op = _OPS.get(topk)
+def _build_op(topk: int, num_primary_experts: int | None) -> torch.library.CustomOpDef:
+    key = (topk, num_primary_experts)
+    op = _OPS.get(key)
     if op is not None:
         return op
 
@@ -382,15 +384,19 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
             w2_scale,
             experts_start,
             topk=topk,
+            num_primary_experts=num_primary_experts,
         )
 
-    op = jax_op(f"pallas::moe_lowtok_scores_k{topk}", moe)
+    name = f"pallas::moe_lowtok_scores_k{topk}"
+    if num_primary_experts is not None:
+        name += f"_p{num_primary_experts}"
+    op = jax_op(name, moe)
 
     def _fake(x, *_args):
         return torch.empty_like(x)
 
     op.register_fake(_fake)
-    _OPS[topk] = op
+    _OPS[key] = op
     return op
 
 
@@ -493,7 +499,9 @@ def prebuild(
             int(expert_placement.owned()),
         )
     cast("TpuRoutedExperts", layer)._lowtok_has_copies = False
-    return _build_op(layer.moe_config.experts_per_token)
+    return _build_op(
+        layer.moe_config.experts_per_token, expert_placement.primary_experts(layer)
+    )
 
 
 def _owner(method: Any) -> str | None:

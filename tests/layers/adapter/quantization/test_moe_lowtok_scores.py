@@ -110,8 +110,10 @@ def test_disabled_builds_and_logs_nothing(monkeypatch):
 
 
 def test_plain_softmax_router_moves_into_the_kernel(enabled):
+    """Without a placement table every local slot is a primary, so the op's
+    grouped fallback gets no bound (expert_placement.primary_experts)."""
     assert scores.prebuild(method(), make_layer(), "silu") is enabled
-    scores._build_op.assert_called_once_with(10)
+    scores._build_op.assert_called_once_with(10, None)
 
 
 @pytest.mark.parametrize(
@@ -264,19 +266,17 @@ def test_summary_counts_entries_and_declines(enabled, monkeypatch):
     assert scores._LAYERS == []
 
 
-@pytest.mark.parametrize("has_copies", [False, True])
+@pytest.mark.parametrize("num_primary_experts", [None, 4])
 @pytest.mark.parametrize("rows, lowtok", [(64, True), (65, False)])
 def test_in_op_row_cap_dispatches_lowtok_or_fused_moe_func(
-    monkeypatch, rows, lowtok, has_copies
+    monkeypatch, rows, lowtok, num_primary_experts
 ):
     """The row-count fork lives inside the JAX op so torch tracing stays
-    uniform."""
+    uniform; above the cap the grouped fallback gets the op's primary count."""
     monkeypatch.setattr(scores, "_ARMED_MAX_TOKENS", 64)
     monkeypatch.setenv("TPU_MOE_ROUTER_TOPK", "sort")
     monkeypatch.setattr(scores, "moe_lowtok", Mock(return_value="lowtok"))
     monkeypatch.setattr(scores, "fused_moe_func", Mock(return_value="gmm"))
-    monkeypatch.setattr(scores.expert_placement, "has_copies", lambda: has_copies)
-    monkeypatch.setattr(scores.expert_placement, "owned", lambda: 64)
     x = jnp.zeros((rows, 8), dtype=jnp.bfloat16)
     s = jnp.ones((rows, 16), dtype=jnp.float32) / 16.0
     w13 = jnp.zeros((4, 8, 16), dtype=jnp.float8_e4m3fn)
@@ -284,7 +284,17 @@ def test_in_op_row_cap_dispatches_lowtok_or_fused_moe_func(
     s13 = jnp.ones((4, 1, 1, 16), dtype=jnp.float32)
     s2 = jnp.ones((4, 1, 1, 8), dtype=jnp.float32)
     start = jnp.int32(0)
-    out = scores._moe_scores_fn(x, s, w13, w2, s13, s2, start, topk=2)
+    out = scores._moe_scores_fn(
+        x,
+        s,
+        w13,
+        w2,
+        s13,
+        s2,
+        start,
+        topk=2,
+        num_primary_experts=num_primary_experts,
+    )
     assert out == ("lowtok" if lowtok else "gmm")
     if lowtok:
         scores.moe_lowtok.assert_called_once()
@@ -292,8 +302,9 @@ def test_in_op_row_cap_dispatches_lowtok_or_fused_moe_func(
     else:
         scores.moe_lowtok.assert_not_called()
         scores.fused_moe_func.assert_called_once()
-        assert scores.fused_moe_func.call_args.kwargs["num_primary_experts"] == (
-            64 if has_copies else None
+        assert (
+            scores.fused_moe_func.call_args.kwargs["num_primary_experts"]
+            == num_primary_experts
         )
 
 
@@ -383,8 +394,8 @@ def test_fp8_forward_takes_the_scores_entry_when_armed(monkeypatch, armed):
 def test_op_is_built_once_per_topk_and_fakes_the_row_shape():
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    op = scores._build_op(10)
-    assert scores._build_op(10) is op
+    op = scores._build_op(10, None)
+    assert scores._build_op(10, None) is op
     layer = make_layer()
     with FakeTensorMode():
         x = torch.empty(4, 512, dtype=torch.bfloat16)
@@ -451,6 +462,9 @@ def test_copy_enabled_placement_arms_60_backbone_plus_1_mtp_draft_layer(
     mtp_layer.layer_name = "mtp.layers.0.mlp.experts"
     assert scores.prebuild(method(), mtp_layer, "silu") is enabled
     assert mtp_layer._lowtok_has_copies is False
+    # Its grouped fallback bound: every one of its 64 slots is a primary
+    # (expert_placement.primary_experts for an unplaced layer).
+    scores._build_op.assert_called_once_with(10, 64)
 
     scores.log_summary()
     line = info.call_args.args[0] % info.call_args.args[1:]
