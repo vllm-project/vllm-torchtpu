@@ -161,6 +161,7 @@ def _step(fx, fold: bool):
     chunks, idx, rej, ndraft = r._assemble_async_spec_substitution(
         fx.drafts, [fx.nt], state
     )
+    r._asm_len = chunks[0].shape[0]  # the source length before the tail pad
     ntt = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
     bound = r.max_num_reqs * (1 + fx.k)
     if ntt.shape[0] < bound:
@@ -225,6 +226,9 @@ def _run_pair(monkeypatch, fx_kwargs):
              patch.object(tao, "extract_draft_token_ids", wraps=tao.extract_draft_token_ids) as ext_spy:
             on = _step(fx, fold=True)
         stats = fx.r._glue_stats
+    # the asm program returns the source already at sample_tokens' bound, so
+    # the tail's eager pad does nothing (its program is folded, not moved)
+    assert fx.r._asm_len == fx.r.max_num_reqs * (1 + fx.k), (fx.r._asm_len, fx.r.max_num_reqs, fx.k)
     return off, on, stats, (asm_spy.call_count, rej_spy.call_count, sub_spy.call_count, ext_spy.call_count)
 
 
