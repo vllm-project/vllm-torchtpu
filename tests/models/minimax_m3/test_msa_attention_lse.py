@@ -237,7 +237,11 @@ def test_lse_unselected_nan_pages_do_not_leak(dtype):
     local_limit[real] = rng.integers(1, PAGE // 2, real.sum())
     poisoned = kv_rows.copy()
     poisoned[table[6:]] = np.nan
-    poisoned[table[5], local_limit.max() :] = np.nan
+    # 8-bit pages enter the MXU as stored (`DIRECT_T`, as the decode tiles'
+    # `direct` path): they rely on `msa_write` zeroing the slots past a
+    # page's newest token, so only wider pages hold NaN there.
+    eight_bit = np.dtype(dtype).itemsize == 1 and msa_attention_lse.DIRECT_T
+    poisoned[table[5], local_limit.max() :] = 0.0 if eight_bit else np.nan
     got = msa_sparse_attention_lse(
         q,
         pack(poisoned, dtype),

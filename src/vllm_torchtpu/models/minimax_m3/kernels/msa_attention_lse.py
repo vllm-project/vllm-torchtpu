@@ -82,6 +82,12 @@ KERNEL_LIMITS = True
 # 4-bit tiles of 16+ tokens run `attend_t` with the K / V scales folded into
 # their bf16 rows, as the 8/16-bit caches do.
 FP4_TRANSPOSED = True
+# `attend_t` feeds 8-bit pages to the MXU as stored (a bf16 x fp8 dot is
+# exact): no per-page widening on the VPU; the token mask rides as fp8
+# columns of -_FP8_MASK beside the keys (scores are log2 units below 83, so
+# exp2 of a masked one is 0).
+DIRECT_T = True
+_FP8_MASK = 448.0  # e4m3fn's largest magnitude
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -190,6 +196,16 @@ def _kernel(
         page_size = rows_per_page * (msa_fp4.TOKENS_PER_WORD if fp4 else packing)
         # 8-bit pages of `attend` reach the MXU without an unpack.
         direct = not fp4 and not transposed and packing == 4
+        # ... and of `attend_t` (`DIRECT_T`, with the MXU mask).
+        direct_t = (
+            DIRECT_T
+            and not fp4
+            and transposed
+            and packing == 4
+            and MXU_MASK
+            and MAX_FREE
+            and block_q <= head_dim
+        )
         half = w % ring
         first = (meta & msa_attention._FIRST_BIT) != 0
         last = (meta & msa_attention._LAST_BIT) != 0
@@ -288,19 +304,21 @@ def _kernel(
 
         kv_refs = [buf_ref.at[half, g] for g in range(pages_per_step)]
         widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
-        if direct:
+        if direct or direct_t:
             # The step reads the slots up to its width; those past the group's
             # pages are stale (any bytes at first use): their values are zeroed,
-            # p @ v multiplying them by p = 0.
+            # p @ v multiplying them by p = 0 (and `attend_t`'s keys too: its
+            # additive mask needs finite scores).
             span = jnp.int32(widths[-1])
             for width in reversed(widths[:-1]):
                 span = jnp.where(count <= width, width, span)
 
             def zero(g, carry):
+                lanes = row_width if direct_t else row_width // 2
                 values = (
                     buf_ref.at[half, g]
                     .bitcast(jnp.uint32)
-                    .at[0, :, 0, pl.ds(row_width // 2, row_width // 2)]
+                    .at[0, :, 0, pl.ds(row_width - lanes, lanes)]
                 )
                 values[...] = jnp.zeros(values.shape, jnp.uint32)
                 return carry
@@ -388,7 +406,7 @@ def _kernel(
             mxu_mask = MXU_MASK and MAX_FREE and block_q <= head_dim
             row_slots = (
                 jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
-                if packing == 4 or fp4
+                if (packing == 4 and not direct_t) or fp4
                 else msa_attention._bitcast_slots(rows_per_page, packing)
             )  # [S, 1]
             sel_t = selected_ref[...].T  # [K, Bq]
@@ -418,6 +436,13 @@ def _kernel(
                     v_col = sv.reshape(page_size, 1)
                     values.append((rows[:, head_dim:] * v_col).astype(jnp.bfloat16))
                     rows = (rows[:, :head_dim] * k_col).astype(jnp.bfloat16)
+                elif direct_t:
+                    # As stored (words bitcast, rows in `row_slots` order).
+                    # Slots past a page's newest token are zero (`msa_write`),
+                    # stale ring slots were zeroed above: every key is finite.
+                    words = kv_ref.bitcast(jnp.uint32)[0, :, 0, :]
+                    rows = pltpu.bitcast(words, kv_ref.dtype)
+                    values.append(rows[:, head_dim:])
                 elif packing == 4 and mxu_mask:  # an additive mask needs finite keys
                     rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
                     rows = jnp.where(row_slots < seen, rows, 0)
@@ -432,7 +457,8 @@ def _kernel(
                     # [K | A]: A[key, t] = -_MASK_BIAS where token t does not
                     # see the key; lanes past Bq meet zero query columns.
                     limit = jnp.pad(limit, ((0, 0), (0, head_dim - block_q)))
-                    bias = jnp.where(row_slots < limit, 0.0, -_MASK_BIAS)
+                    masked = -_FP8_MASK if direct_t else -_MASK_BIAS
+                    bias = jnp.where(row_slots < limit, 0.0, masked)
                     keys.append(
                         jnp.concatenate(
                             [rows[:, :head_dim], bias.astype(rows.dtype)], 1
@@ -466,7 +492,7 @@ def _kernel(
             ones = jnp.ones((v.shape[0], _SUM_ROWS), v.dtype)
             pv = jax.lax.dot_general(
                 jnp.concatenate([v, ones], axis=1),
-                p.astype(v.dtype),
+                p.astype(jnp.bfloat16),  # bf16 x fp8 dot for 8-bit `direct_t`
                 (((0,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
             )  # [D + _SUM_ROWS, rows]
