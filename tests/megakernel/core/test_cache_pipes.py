@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax._src import dispatch
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -31,12 +32,14 @@ from vllm_torchtpu.megakernel.core import (
     _builtins,
     cache,
     cache_common,
+    cache_experimental,
     decls,
     fused_io_hook,
     model_def,
     planner,
     pool,
 )
+from vllm_torchtpu.megakernel.core import kernel as mk_kernel
 from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.core.modules.gdn import GDNModule
@@ -315,7 +318,9 @@ def test_flat_pooled_step_checks_ckpt_bounds_in_kernel_io_paths(
         meta = c.meta(ckpt=ckpt_bad)
     with pytest.raises((ValueError, jax.errors.JaxRuntimeError), match=msg):
         jax.block_until_ready(flat_fn(*c.flat_args(c.pools(), *meta)))
-    # A clean step replaces the failed runtime token of the debug callback.
+    # The failed callback's error stays in JAX's effect tokens, and every later
+    # computation with effects would re-raise it: reset them.
+    dispatch.runtime_tokens.clear()
     jax.block_until_ready(flat_fn(*c.flat_args(c.pools(), *c.meta())))
     if T > 1:  # trace-time shape admission: ckpt_indices narrower than T
         narrow = c.meta(ckpt=np.asarray(c.ckpt)[..., :1])
@@ -370,7 +375,7 @@ def test_pooled_steps_validate_only_the_resolved_exec_spec(monkeypatch):
         built.append(ex_k)
         raise _Built
 
-    monkeypatch.setattr(cache_common.kernel, "build", _build)
+    monkeypatch.setattr(mk_kernel, "build", _build)
     with pytest.raises(_Built):
         cache.make_flat_pooled_step(mesh, spec, ex, fused_pool_io=False)
     with pytest.raises(_Built):
@@ -493,3 +498,18 @@ def test_should_fuse_pool_io_without_registered_hook(monkeypatch):
     assert cache.should_fuse_pool_io(spec, ex, fused_pool_io=False) is False
     with pytest.raises(MegakernelConfigError, match="fused pool I/O"):
         cache.should_fuse_pool_io(spec, ex, fused_pool_io=True)
+
+
+def test_cache_experimental_wrappers_build_fused_steps():
+    """The experimental wrappers build fused steps and keep the donation guard."""
+    spec = synth_hybrid_spec(L=2, att_every=2, R=R, VH=4)
+    ex = _make_paged_ex(B=4, T=1)
+    mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
+    step = cache_experimental.make_fused_pooled_step(mesh, spec, ex)
+    assert step.info["use_fused"] is True
+    _, _, _, donated = cache_experimental.make_flat_fused_pooled_step(mesh, spec, ex)
+    assert donated
+    with pytest.raises(MegakernelConfigError, match="donate_pools=True"):
+        cache_experimental.make_flat_fused_pooled_step(
+            mesh, spec, ex, donate_pools=False
+        )
