@@ -289,6 +289,68 @@ def test_should_match_separate_indexer_and_mla_with_distinct_block_tables(
     np.testing.assert_array_equal(np.asarray(got_flat), np.asarray(ref_flat))
     np.testing.assert_array_equal(np.asarray(got_own_v), np.asarray(ref_own_v))
     np.testing.assert_array_equal(np.asarray(got_lead_v), np.asarray(ref_lead_v))
+
+    # Fused single-shard_map o_proj path matches project_sequence_rows_from_v bit-exact.
+    if tie_after_idx_max_cap == 4:
+        rng_o = np.random.default_rng(910)
+        k_full = ref_own_v.shape[1] * ref_own_v.shape[2]
+        half_k = k_full // 2
+        hidden = 16
+        w_o_fp8 = jnp.asarray(
+            rng_o.standard_normal((k_full, hidden)) * 0.5, jnp.float8_e4m3fn
+        )
+        w_o_shd = jax.device_put(
+            jnp.concatenate(
+                [
+                    w_o_fp8[:half_k] if r % 2 == 0 else w_o_fp8[half_k:]
+                    for r in range(4)
+                ],
+                axis=0,
+            ),
+            shd,
+        )
+        s_o_shd = jax.device_put(
+            jnp.tile(
+                jnp.asarray(rng_o.uniform(0.01, 0.05, (hidden,)), jnp.float32), (4,)
+            ),
+            shd,
+        )
+        ref_proj = tp.project_sequence_rows_from_v(
+            layout, mesh, AXIS, ref_lead_v, ref_own_v, rank_ids, w_o_shd, s_o_shd
+        )
+        got_proj, got_flat_o = tp.unified_indexer_mla_with_lead_oproj(
+            layout,
+            mesh,
+            AXIS,
+            idx_cache,
+            q_idx,
+            w_idx,
+            idx_bt,
+            nope_cache,
+            rope_cache,
+            q,
+            q_pe,
+            mla_bt,
+            seq_lens,
+            qsl,
+            dist,
+            select_topk=_ref_select_topk,
+            attend=_ref_attend,
+            lead_partial=lead_partial,
+            lead_lse=lead_lse,
+            w_uv=w_uv,
+            w_o=w_o_shd,
+            w_o_scale=s_o_shd,
+            num_tokens=num_tokens,
+            rank_ids=rank_ids,
+            w_uv_replicated=True,
+            tie_after_idx_max_cap=tie_after_idx_max_cap,
+            epilogue_3d=True,
+        )
+        np.testing.assert_array_equal(np.asarray(got_flat_o), np.asarray(ref_flat))
+        np.testing.assert_array_equal(
+            np.asarray(got_proj).view(np.uint16), np.asarray(ref_proj).view(np.uint16)
+        )
     # Anti-cancellation check: reusing mla_bt for idx_bt MUST diverge.
     wrong_own_v, _, wrong_flat = tp.unified_indexer_mla_with_lead(
         layout,

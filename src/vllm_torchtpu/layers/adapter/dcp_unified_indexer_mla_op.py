@@ -442,7 +442,7 @@ def build_unified_indexer_attention_op(
                 page_gather.gather_pages, row_width=rope_spec.token_bytes // 4
             ),
         )
-        tail_out, lead_v, tail_flat = dcp_token_parallel.unified_indexer_mla_with_lead(
+        attn_out, tail_flat = dcp_token_parallel.unified_indexer_mla_with_lead_oproj(
             layout,
             mesh,
             DCP_AXIS_NAME,
@@ -463,11 +463,14 @@ def build_unified_indexer_attention_op(
             lead_partial=partial,
             lead_lse=lse,
             w_uv=w_uv,
+            w_o=w_o,
+            w_o_scale=s_o,
             num_tokens=num_tokens,
             rank_ids=rank_ids,
             read_pages=read_pages,
             w_uv_replicated=True,
             tie_after_idx_max_cap=tie_after_idx_max_cap,
+            epilogue_3d=envs.TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT,
         )
         full_topk = jax.shard_map(
             lambda h, t: jnp.concatenate([h, t], axis=0),
@@ -476,16 +479,6 @@ def build_unified_indexer_attention_op(
             out_specs=shd,
             check_vma=False,
         )(head_topk, tail_flat)
-        attn_out = dcp_token_parallel.project_sequence_rows_from_v(
-            layout,
-            mesh,
-            DCP_AXIS_NAME,
-            lead_v,
-            tail_out,
-            rank_ids,
-            w_o,
-            s_o,
-        )
         return index_cache, kv_cache_nope, kv_cache_rope, full_topk, attn_out
 
     def _make_wrapper(kv_sharded: bool):

@@ -1460,7 +1460,7 @@ def indexer_topk(
     )
 
 
-def unified_indexer_mla_with_lead(
+def _unified_indexer_mla_core(
     layout: TokenParallelLayout,
     mesh: Mesh,
     axis_name: str,
@@ -1487,13 +1487,13 @@ def unified_indexer_mla_with_lead(
     read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
     w_uv_replicated: bool = False,
     tie_after_idx_max_cap: int = 0,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Run token-parallel indexer top-k, latent gather, lead merge, and MLA together.
-
-    Returns `(own_v [dcp*R, H, V], lead_v [S, H, V], tail_flat_topk [dcp*R, K])`
-    bit-identical to separate `indexer_topk(..., flat_topk_cap_strided=True)` and
-    `sparse_mla_attention_with_lead(..., flat_topk_cap_strided=True)`.
-    """
+    w_o: jax.Array | None = None,
+    w_o_scale: jax.Array | None = None,
+    epilogue_3d: bool = True,
+) -> tuple[jax.Array, ...]:
+    if (w_o is None) != (w_o_scale is None):
+        raise ValueError("w_o and w_o_scale must be passed together")
+    has_oproj = w_o is not None
     dcp = layout.dcp_size
     sharded = P(axis_name)
     rep = P()
@@ -1514,8 +1514,15 @@ def unified_indexer_mla_with_lead(
         lead_part_local,
         lead_lse_local,
         w_uv_local,
-        *rank_arg,
+        *extra_args,
     ):
+        idx = 0
+        n_rank = 1 if rank_ids is not None else 0
+        rank_arg = extra_args[idx : idx + n_rank]
+        idx += n_rank
+        w_o_local = s_o_local = None
+        if has_oproj:
+            w_o_local, s_o_local = extra_args[idx], extra_args[idx + 1]
         rank = _rank(rank_arg, axis_name, dcp)
         # Avoid propagating the SparseCore writer's 32-word view across the cap
         # switch: keep latent cache arrays in their [pages, rows, 128] layout.
@@ -1536,6 +1543,18 @@ def unified_indexer_mla_with_lead(
             if w_uv_replicated
             else lax.all_gather(w_uv_local, axis_name, axis=0, tiled=True)
         )
+        use_3d_epilogue = False
+        if has_oproj and epilogue_3d:
+            assert w_o_local is not None and s_o_local is not None
+            use_3d_epilogue = _can_use_3d_fp8_epilogue(
+                layout,
+                w_uv_all.shape[0],
+                rows,
+                w_uv_all.shape[2],
+                q_tok.dtype,
+                w_o_local,
+                s_o_local,
+            )
 
         def branch(cap: int) -> Callable[[], tuple[jax.Array, jax.Array, jax.Array]]:
             def run() -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -1572,19 +1591,49 @@ def unified_indexer_mla_with_lead(
                 g_nope, g_rope, lp_t, ll_t = lax.optimization_barrier(
                     (g_nope, g_rope, lead_part_local, lead_lse_local)
                 )
-                lead_v = _merge_lead_partial_to_v(
-                    lp_t, ll_t, w_uv_all, axis_name, q_tok.dtype
-                )
+                if use_3d_epilogue:
+                    lead_v = _merge_lead_partial_to_v_hrv(
+                        lp_t, ll_t, w_uv_all, axis_name, q_tok.dtype
+                    )
+                else:
+                    lead_v = _merge_lead_partial_to_v(
+                        lp_t, ll_t, w_uv_all, axis_name, q_tok.dtype
+                    )
                 out = attend(q_tok, g_nope, g_rope, flat, rr.num_rows, q_pe_tok)
-                out = _project_w_uv(out, w_uv_all)
+                out = (
+                    _project_w_uv_hrv(out, w_uv_all)
+                    if use_3d_epilogue
+                    else _project_w_uv(out, w_uv_all)
+                )
                 return out, lead_v, flat
 
             return run
 
-        return _switch_on_cap(layout, jnp.sum(pages), branch)
+        out, lead_v, flat = _switch_on_cap(layout, jnp.sum(pages), branch)
+        if has_oproj:
+            assert w_o_local is not None and s_o_local is not None
+            w_o_arr, s_o_arr = w_o_local, s_o_local
+            if use_3d_epilogue:
+                rank_vec = jnp.asarray(
+                    rank_arg[0] if rank_arg else jnp.reshape(rank, (1,)),
+                    dtype=jnp.int32,
+                )
+                projected = _project_hrv_pair_halves_local(
+                    layout, out, lead_v, rank_vec, w_o_arr, s_o_arr, axis_name
+                )
+            else:
+                projected = _shift_and_project_local(
+                    layout, out, lead_v, rank, w_o_arr, s_o_arr, axis_name
+                )
+            return projected, flat
+        return out, lead_v, flat
 
-    extra = () if rank_ids is None else (rank_ids,)
+    extra: tuple[jax.Array, ...] = () if rank_ids is None else (rank_ids,)
+    if has_oproj:
+        assert w_o is not None and w_o_scale is not None
+        extra = (*extra, w_o, w_o_scale)
     w_uv_spec = rep if w_uv_replicated else sharded
+    out_specs = (sharded, sharded) if has_oproj else (sharded, rep, sharded)
     return jax.shard_map(
         _local,
         mesh=mesh,
@@ -1606,7 +1655,7 @@ def unified_indexer_mla_with_lead(
             w_uv_spec,
         )
         + (sharded,) * len(extra),
-        out_specs=(sharded, rep, sharded),
+        out_specs=out_specs,
         check_vma=False,
     )(
         index_cache,
@@ -1623,6 +1672,332 @@ def unified_indexer_mla_with_lead(
         request_distribution,
         lead_partial,
         lead_lse,
+        w_uv,
+        *extra,
+    )
+
+
+def unified_indexer_mla_with_lead(
+    layout: TokenParallelLayout,
+    mesh: Mesh,
+    axis_name: str,
+    index_cache: jax.Array,
+    q_idx: jax.Array,
+    w_idx: jax.Array,
+    idx_block_tables: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    q: jax.Array,
+    q_pe: jax.Array,
+    mla_block_tables: jax.Array,
+    seq_lens: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    *,
+    select_topk: SelectTopkFn,
+    attend: Callable[..., jax.Array],
+    lead_partial: jax.Array,
+    lead_lse: jax.Array,
+    w_uv: jax.Array,
+    num_tokens: int,
+    rank_ids: jax.Array | None = None,
+    read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
+    w_uv_replicated: bool = False,
+    tie_after_idx_max_cap: int = 0,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Run token-parallel indexer top-k, latent gather, lead merge, and MLA together.
+
+    Returns `(own_v [dcp*R, H, V], lead_v [S, H, V], tail_flat_topk [dcp*R, K])`
+    bit-identical to separate `indexer_topk(..., flat_topk_cap_strided=True)` and
+    `sparse_mla_attention_with_lead(..., flat_topk_cap_strided=True)`.
+    """
+    own_v, lead_v, flat = _unified_indexer_mla_core(
+        layout,
+        mesh,
+        axis_name,
+        index_cache,
+        q_idx,
+        w_idx,
+        idx_block_tables,
+        kv_cache_nope,
+        kv_cache_rope,
+        q,
+        q_pe,
+        mla_block_tables,
+        seq_lens,
+        query_start_loc,
+        request_distribution,
+        select_topk=select_topk,
+        attend=attend,
+        lead_partial=lead_partial,
+        lead_lse=lead_lse,
+        w_uv=w_uv,
+        num_tokens=num_tokens,
+        rank_ids=rank_ids,
+        read_pages=read_pages,
+        w_uv_replicated=w_uv_replicated,
+        tie_after_idx_max_cap=tie_after_idx_max_cap,
+    )
+    return own_v, lead_v, flat
+
+
+def unified_indexer_mla_with_lead_oproj(
+    layout: TokenParallelLayout,
+    mesh: Mesh,
+    axis_name: str,
+    index_cache: jax.Array,
+    q_idx: jax.Array,
+    w_idx: jax.Array,
+    idx_block_tables: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    q: jax.Array,
+    q_pe: jax.Array,
+    mla_block_tables: jax.Array,
+    seq_lens: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    *,
+    select_topk: SelectTopkFn,
+    attend: Callable[..., jax.Array],
+    lead_partial: jax.Array,
+    lead_lse: jax.Array,
+    w_uv: jax.Array,
+    w_o: jax.Array,
+    w_o_scale: jax.Array,
+    num_tokens: int,
+    rank_ids: jax.Array | None = None,
+    read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
+    w_uv_replicated: bool = False,
+    tie_after_idx_max_cap: int = 0,
+    epilogue_3d: bool = True,
+) -> tuple[jax.Array, jax.Array]:
+    """Run unified indexer + sparse MLA + sequence-row o_proj in one shard_map."""
+    projected, flat = _unified_indexer_mla_core(
+        layout,
+        mesh,
+        axis_name,
+        index_cache,
+        q_idx,
+        w_idx,
+        idx_block_tables,
+        kv_cache_nope,
+        kv_cache_rope,
+        q,
+        q_pe,
+        mla_block_tables,
+        seq_lens,
+        query_start_loc,
+        request_distribution,
+        select_topk=select_topk,
+        attend=attend,
+        lead_partial=lead_partial,
+        lead_lse=lead_lse,
+        w_uv=w_uv,
+        num_tokens=num_tokens,
+        rank_ids=rank_ids,
+        read_pages=read_pages,
+        w_uv_replicated=w_uv_replicated,
+        tie_after_idx_max_cap=tie_after_idx_max_cap,
+        w_o=w_o,
+        w_o_scale=w_o_scale,
+        epilogue_3d=epilogue_3d,
+    )
+    return projected, flat
+
+
+def _sparse_mla_in_branch_qb_core(
+    layout: TokenParallelLayout,
+    mesh: Mesh,
+    axis_name: str,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    q_c_own: jax.Array,
+    w_qb: jax.Array,
+    s_qb: jax.Array,
+    w_uk_t: jax.Array,
+    cos_sin: jax.Array,
+    head_topk: jax.Array,
+    flat_topk: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    *,
+    fused_qb: Callable[..., tuple[jax.Array, jax.Array, jax.Array, jax.Array]],
+    lead_attend: Callable[..., tuple[jax.Array, jax.Array]],
+    tail_attend: Callable[..., jax.Array],
+    w_uv: jax.Array,
+    num_tokens: int,
+    rank_ids: jax.Array | None = None,
+    read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
+    w_uv_replicated: bool = False,
+    flat_topk_cap_strided: bool = False,
+    free_nobar_max_cap: int = 8,
+    w_o: jax.Array | None = None,
+    w_o_scale: jax.Array | None = None,
+    epilogue_3d: bool = True,
+) -> Any:
+    if (w_o is None) != (w_o_scale is None):
+        raise ValueError("w_o and w_o_scale must be passed together")
+    has_oproj = w_o is not None
+    dcp = layout.dcp_size
+    s = layout.split_rows
+    sharded = P(axis_name)
+    rep = P()
+
+    def _local(
+        nope,
+        rope,
+        qc_r,
+        wqb_r,
+        sqb_r,
+        wuk_r,
+        cs_r,
+        h_topk_r,
+        f_topk_r,
+        sl,
+        bt,
+        qsl,
+        dist,
+        w_uv_local,
+        *extra_args,
+    ):
+        idx = 0
+        n_rank = 1 if rank_ids is not None else 0
+        rank_arg = extra_args[idx : idx + n_rank]
+        idx += n_rank
+        w_o_local = s_o_local = None
+        if has_oproj:
+            w_o_local, s_o_local = extra_args[idx], extra_args[idx + 1]
+        rank = _rank(rank_arg, axis_name, dcp)
+        # Avoid propagating the SparseCore writer's 32-word view across the cap
+        # switch: keep latent cache arrays in their [pages, rows, 128] layout.
+        nope, rope = lax.optimization_barrier((nope, rope))
+        pages, offsets = step_pages(layout, sl, qsl, dist[2])
+        page_ids = gather_page_ids(layout, bt, pages, offsets, nope.shape[0])
+        rr = rank_rows(layout, rank, num_tokens, sl, qsl, dist[2])
+        rows = layout.rows_per_rank(num_tokens)
+        w_uv_all = (
+            w_uv_local
+            if w_uv_replicated
+            else lax.all_gather(w_uv_local, axis_name, axis=0, tiled=True)
+        )
+        use_3d_epilogue = False
+        if has_oproj and epilogue_3d:
+            assert w_o_local is not None and s_o_local is not None
+            use_3d_epilogue = _can_use_3d_fp8_epilogue(
+                layout,
+                w_uv_all.shape[0],
+                rows,
+                w_uv_all.shape[2],
+                qc_r.dtype,
+                w_o_local,
+                s_o_local,
+            )
+
+        def branch(cap: int) -> Callable[[], tuple[jax.Array, jax.Array]]:
+            def run() -> tuple[jax.Array, jax.Array]:
+                g_nope, g_rope = gather_latent(
+                    nope, rope, page_ids[:cap], axis_name, read_pages
+                )
+                flat = (
+                    f_topk_r
+                    if flat_topk_cap_strided
+                    else restride_flat_rows(layout, f_topk_r, cap)
+                )
+                ql_head, ql_tail, qpe_head, qpe_tail = fused_qb(
+                    qc_r, wqb_r, sqb_r, wuk_r, cs_r, s
+                )
+                if cap > free_nobar_max_cap:
+                    # Avoid SparseCore contention between lead_mla and SC-offloaded
+                    # gather_latent on caps >= 12: hold lead_mla behind a barrier
+                    # until gather_latent completes while pure-TC fused_qb overlaps
+                    # gather_latent; smaller caps leave fused_qb free to overlap
+                    # Chunk-0 SparseCore KV gather.
+                    g_nope, g_rope, ql_head, qpe_head = lax.optimization_barrier(
+                        (g_nope, g_rope, ql_head, qpe_head)
+                    )
+                lead_partial, lead_lse = lead_attend(
+                    ql_head, qpe_head, nope, rope, h_topk_r, bt, sl, qsl, dist
+                )
+                if use_3d_epilogue:
+                    lead_v = _merge_lead_partial_to_v_hrv(
+                        lead_partial, lead_lse, w_uv_all, axis_name, ql_tail.dtype
+                    )
+                else:
+                    lead_v = _merge_lead_partial_to_v(
+                        lead_partial, lead_lse, w_uv_all, axis_name, ql_tail.dtype
+                    )
+                out = tail_attend(ql_tail, g_nope, g_rope, flat, rr.num_rows, qpe_tail)
+                out = (
+                    _project_w_uv_hrv(out, w_uv_all)
+                    if use_3d_epilogue
+                    else _project_w_uv(out, w_uv_all)
+                )
+                return out, lead_v
+
+            return run
+
+        out, lead_v = _switch_on_cap(layout, jnp.sum(pages), branch)
+        if has_oproj:
+            assert w_o_local is not None and s_o_local is not None
+            w_o_arr, s_o_arr = w_o_local, s_o_local
+            if use_3d_epilogue:
+                rank_vec = jnp.asarray(
+                    rank_arg[0] if rank_arg else jnp.reshape(rank, (1,)),
+                    dtype=jnp.int32,
+                )
+                return _project_hrv_pair_halves_local(
+                    layout, out, lead_v, rank_vec, w_o_arr, s_o_arr, axis_name
+                )
+            return _shift_and_project_local(
+                layout, out, lead_v, rank, w_o_arr, s_o_arr, axis_name
+            )
+        return out, lead_v
+
+    extra: tuple[jax.Array, ...] = () if rank_ids is None else (rank_ids,)
+    if has_oproj:
+        assert w_o is not None and w_o_scale is not None
+        extra = (*extra, w_o, w_o_scale)
+    w_uv_spec = rep if w_uv_replicated else sharded
+    out_specs = sharded if has_oproj else (sharded, rep)
+    return jax.shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(
+            sharded,
+            sharded,
+            sharded,
+            rep,
+            rep,
+            rep,
+            sharded,
+            sharded,
+            sharded,
+            rep,
+            rep,
+            rep,
+            rep,
+            w_uv_spec,
+        )
+        + (sharded,) * len(extra),
+        out_specs=out_specs,
+        check_vma=False,
+    )(
+        kv_cache_nope,
+        kv_cache_rope,
+        q_c_own,
+        w_qb,
+        s_qb,
+        w_uk_t,
+        cos_sin,
+        head_topk,
+        flat_topk,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
         w_uv,
         *extra,
     )
@@ -1664,101 +2039,10 @@ def sparse_mla_attention_with_in_branch_qb(
     `sparse_mla_attention_with_lead` within 1 bf16 ULP on `lead_v` and bit-exact
     on `own_v`.
     """
-    dcp = layout.dcp_size
-    s = layout.split_rows
-    sharded = P(axis_name)
-    rep = P()
-
-    def _local(
-        nope,
-        rope,
-        qc_r,
-        wqb_r,
-        sqb_r,
-        wuk_r,
-        cs_r,
-        h_topk_r,
-        f_topk_r,
-        sl,
-        bt,
-        qsl,
-        dist,
-        w_uv_local,
-        *rank_arg,
-    ):
-        rank = _rank(rank_arg, axis_name, dcp)
-        # Avoid propagating the SparseCore writer's 32-word view across the cap
-        # switch: keep latent cache arrays in their [pages, rows, 128] layout.
-        nope, rope = lax.optimization_barrier((nope, rope))
-        pages, offsets = step_pages(layout, sl, qsl, dist[2])
-        page_ids = gather_page_ids(layout, bt, pages, offsets, nope.shape[0])
-        rr = rank_rows(layout, rank, num_tokens, sl, qsl, dist[2])
-        w_uv_all = (
-            w_uv_local
-            if w_uv_replicated
-            else lax.all_gather(w_uv_local, axis_name, axis=0, tiled=True)
-        )
-
-        def branch(cap: int) -> Callable[[], tuple[jax.Array, jax.Array]]:
-            def run() -> tuple[jax.Array, jax.Array]:
-                g_nope, g_rope = gather_latent(
-                    nope, rope, page_ids[:cap], axis_name, read_pages
-                )
-                flat = (
-                    f_topk_r
-                    if flat_topk_cap_strided
-                    else restride_flat_rows(layout, f_topk_r, cap)
-                )
-                ql_head, ql_tail, qpe_head, qpe_tail = fused_qb(
-                    qc_r, wqb_r, sqb_r, wuk_r, cs_r, s
-                )
-                if cap > free_nobar_max_cap:
-                    # Avoid SparseCore contention between lead_mla and SC-offloaded
-                    # gather_latent on caps >= 12: hold lead_mla behind a barrier
-                    # until gather_latent completes while pure-TC fused_qb overlaps
-                    # gather_latent; smaller caps leave fused_qb free to overlap
-                    # Chunk-0 SparseCore KV gather.
-                    g_nope, g_rope, ql_head, qpe_head = lax.optimization_barrier(
-                        (g_nope, g_rope, ql_head, qpe_head)
-                    )
-                lead_partial, lead_lse = lead_attend(
-                    ql_head, qpe_head, nope, rope, h_topk_r, bt, sl, qsl, dist
-                )
-                lead_v = _merge_lead_partial_to_v(
-                    lead_partial, lead_lse, w_uv_all, axis_name, ql_tail.dtype
-                )
-                out = tail_attend(ql_tail, g_nope, g_rope, flat, rr.num_rows, qpe_tail)
-                return _project_w_uv(out, w_uv_all), lead_v
-
-            return run
-
-        return _switch_on_cap(layout, jnp.sum(pages), branch)
-
-    extra = () if rank_ids is None else (rank_ids,)
-    w_uv_spec = rep if w_uv_replicated else sharded
-    return jax.shard_map(
-        _local,
-        mesh=mesh,
-        in_specs=(
-            sharded,
-            sharded,
-            sharded,
-            rep,
-            rep,
-            rep,
-            sharded,
-            sharded,
-            sharded,
-            rep,
-            rep,
-            rep,
-            rep,
-            w_uv_spec,
-        )
-        + (sharded,) * len(extra),
-        out_specs=(sharded, rep),
-        check_vma=False,
-    )(
+    return _sparse_mla_in_branch_qb_core(
+        layout,
+        mesh,
+        axis_name,
         kv_cache_nope,
         kv_cache_rope,
         q_c_own,
@@ -1772,6 +2056,80 @@ def sparse_mla_attention_with_in_branch_qb(
         block_tables,
         query_start_loc,
         request_distribution,
-        w_uv,
-        *extra,
+        fused_qb=fused_qb,
+        lead_attend=lead_attend,
+        tail_attend=tail_attend,
+        w_uv=w_uv,
+        num_tokens=num_tokens,
+        rank_ids=rank_ids,
+        read_pages=read_pages,
+        w_uv_replicated=w_uv_replicated,
+        flat_topk_cap_strided=flat_topk_cap_strided,
+        free_nobar_max_cap=free_nobar_max_cap,
+    )
+
+
+def sparse_mla_attention_with_in_branch_qb_oproj(
+    layout: TokenParallelLayout,
+    mesh: Mesh,
+    axis_name: str,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    q_c_own: jax.Array,
+    w_qb: jax.Array,
+    s_qb: jax.Array,
+    w_uk_t: jax.Array,
+    cos_sin: jax.Array,
+    head_topk: jax.Array,
+    flat_topk: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    *,
+    fused_qb: Callable[..., tuple[jax.Array, jax.Array, jax.Array, jax.Array]],
+    lead_attend: Callable[..., tuple[jax.Array, jax.Array]],
+    tail_attend: Callable[..., jax.Array],
+    w_uv: jax.Array,
+    w_o: jax.Array,
+    w_o_scale: jax.Array,
+    num_tokens: int,
+    rank_ids: jax.Array | None = None,
+    read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
+    w_uv_replicated: bool = False,
+    flat_topk_cap_strided: bool = False,
+    free_nobar_max_cap: int = 8,
+    epilogue_3d: bool = True,
+) -> jax.Array:
+    """Run in-branch `q_b`, lead MLA, sparse MLA, and o_proj in one shard_map."""
+    return _sparse_mla_in_branch_qb_core(
+        layout,
+        mesh,
+        axis_name,
+        kv_cache_nope,
+        kv_cache_rope,
+        q_c_own,
+        w_qb,
+        s_qb,
+        w_uk_t,
+        cos_sin,
+        head_topk,
+        flat_topk,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        fused_qb=fused_qb,
+        lead_attend=lead_attend,
+        tail_attend=tail_attend,
+        w_uv=w_uv,
+        num_tokens=num_tokens,
+        rank_ids=rank_ids,
+        read_pages=read_pages,
+        w_uv_replicated=w_uv_replicated,
+        flat_topk_cap_strided=flat_topk_cap_strided,
+        free_nobar_max_cap=free_nobar_max_cap,
+        w_o=w_o,
+        w_o_scale=w_o_scale,
+        epilogue_3d=epilogue_3d,
     )

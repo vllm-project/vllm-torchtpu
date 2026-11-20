@@ -384,6 +384,68 @@ def test_should_match_separate_fused_qb_and_lead_on_four_devices(
         np.asarray(ref_lead_v.view(jnp.uint16)),
     )
 
+    # Fused single-shard_map o_proj path matches project_sequence_rows_from_v bit-exact.
+    if free_nobar_max_cap == 4 and flat_topk_cap_strided:
+        rng_o = np.random.default_rng(920)
+        k_full = ref_own_v.shape[1] * ref_own_v.shape[2]
+        half_k = k_full // 2
+        hidden = 16
+        w_o_fp8 = jnp.asarray(
+            rng_o.standard_normal((k_full, hidden)) * 0.5, jnp.float8_e4m3fn
+        )
+        w_o_shd = put(
+            jnp.concatenate(
+                [
+                    w_o_fp8[:half_k] if r % 2 == 0 else w_o_fp8[half_k:]
+                    for r in range(dcp)
+                ],
+                axis=0,
+            ),
+            shd,
+        )
+        s_o_shd = put(
+            jnp.tile(
+                jnp.asarray(rng_o.uniform(0.01, 0.05, (hidden,)), jnp.float32), (dcp,)
+            ),
+            shd,
+        )
+        ref_proj = tp.project_sequence_rows_from_v(
+            layout, mesh, AXIS, ref_lead_v, ref_own_v, rank_ids, w_o_shd, s_o_shd
+        )
+        got_proj = tp.sparse_mla_attention_with_in_branch_qb_oproj(
+            layout,
+            mesh,
+            AXIS,
+            nope_c,
+            rope_c,
+            qc_own,
+            w_qb,
+            s_qb,
+            w_uk_t,
+            cos_sin,
+            head_topk,
+            flat_topk,
+            seq_lens,
+            bt,
+            qsl,
+            dist,
+            fused_qb=fused_qb_rope_absorb_split_qpe_ref,
+            lead_attend=_ref_lead_attend,
+            tail_attend=_ref_tail_attend,
+            w_uv=w_uv,
+            w_o=w_o_shd,
+            w_o_scale=s_o_shd,
+            num_tokens=num_tokens,
+            rank_ids=rank_ids,
+            w_uv_replicated=True,
+            flat_topk_cap_strided=flat_topk_cap_strided,
+            free_nobar_max_cap=free_nobar_max_cap,
+            epilogue_3d=True,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(got_proj).view(np.uint16), np.asarray(ref_proj).view(np.uint16)
+        )
+
 
 def test_should_pass_torch_tpu_pallas_verify_signature_for_in_branch_qb_wrappers(
     monkeypatch,

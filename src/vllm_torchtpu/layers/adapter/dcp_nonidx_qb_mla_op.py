@@ -370,7 +370,7 @@ def build_in_branch_qb_attention_op(
                 page_gather.gather_pages, row_width=rope_spec.token_bytes // 4
             ),
         )
-        tail_out, lead_v = dcp_token_parallel.sparse_mla_attention_with_in_branch_qb(
+        attn_out = dcp_token_parallel.sparse_mla_attention_with_in_branch_qb_oproj(
             layout,
             mesh,
             DCP_AXIS_NAME,
@@ -391,22 +391,15 @@ def build_in_branch_qb_attention_op(
             lead_attend=_lead_attend,
             tail_attend=tail_attend,
             w_uv=w_uv,
+            w_o=w_o,
+            w_o_scale=s_o,
             num_tokens=num_tokens,
             rank_ids=rank_ids,
             read_pages=read_pages,
             w_uv_replicated=True,
             flat_topk_cap_strided=True,
             free_nobar_max_cap=free_nobar_max_cap,
-        )
-        attn_out = dcp_token_parallel.project_sequence_rows_from_v(
-            layout,
-            mesh,
-            DCP_AXIS_NAME,
-            lead_v,
-            tail_out,
-            rank_ids,
-            w_o,
-            s_o,
+            epilogue_3d=envs.TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT,
         )
         return kv_cache_nope, kv_cache_rope, attn_out
 
