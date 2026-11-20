@@ -404,7 +404,7 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
 # ---------------------------------------------------------------------------
 
 
-def test_ced_dispatches_encoder_before_host_bucket_coordination(monkeypatch):
+def test_ced_coordinates_buckets_while_the_encoder_is_dispatched(monkeypatch):
     from vllm.forward_context import DPMetadata
 
     @dataclass
@@ -438,7 +438,12 @@ def test_ced_dispatches_encoder_before_host_bucket_coordination(monkeypatch):
     def coordinate(plan, count):
         assert plan is None and count == 4
         order.append("coordinate")
-        return plan
+
+        def finish():
+            order.append("wait")
+            return plan
+
+        return finish
 
     def decoder(ids, positions, inputs_embeds, encoder_pre_mix):
         order.append("decoder")
@@ -447,7 +452,7 @@ def test_ced_dispatches_encoder_before_host_bucket_coordination(monkeypatch):
 
     monkeypatch.setattr(v2_model.upstream, "get_forward_context", Context)
     monkeypatch.setattr(v2_model, "synchronize_tensors", dispatch)
-    monkeypatch.setattr(v2_model, "coordinate_decoder_replay", coordinate)
+    monkeypatch.setattr(v2_model, "start_decoder_replay_coordination", coordinate)
     model = _model_stub(
         start_layer=0,
         _ced_boundary=1,
@@ -462,7 +467,7 @@ def test_ced_dispatches_encoder_before_host_bucket_coordination(monkeypatch):
     )
     assert torch.equal(output, torch.ones(4, 16))
     assert aux[0] is auxiliary
-    assert order == ["encoder", "dispatch", "coordinate", "decoder"]
+    assert order == ["coordinate", "encoder", "dispatch", "wait", "decoder"]
 
 
 def test_model_forward_full_and_ced_paths(monkeypatch: pytest.MonkeyPatch):

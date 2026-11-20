@@ -51,9 +51,9 @@ from .attention import (
 from .attention_kernels import initialize_paged_attention
 from .cache import initialize_cache_ops
 from .ced import (
-    coordinate_decoder_replay,
     plan_decoder_replay,
     prefix_replay_enabled,
+    start_decoder_replay_coordination,
 )
 from .engram import Engram, NgramHashState, engram_cache_slots
 from .host_engram import (
@@ -853,6 +853,26 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 if envs.TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS
                 else None,
             )
+        if self._ced_enabled:
+            # The decoder bucket depends only on scheduling metadata: start the
+            # DP agreement now and wait for it after the encoder is enqueued.
+            plan = (
+                plan_decoder_replay(
+                    first,
+                    self._ced_window,
+                    positions.shape[0],
+                    self._ced_compile_sizes,
+                )
+                # pyrefly: ignore[unbound-name]
+                if first is not None
+                else None
+            )
+            finish_plan = (
+                start_decoder_replay_coordination(plan, positions.shape[0])
+                # pyrefly: ignore[unbound-name]
+                if context.dp_metadata is not None
+                else lambda: plan
+            )
         offload_engram = self._has_cpu_offloaded_engram()
         if offload_engram:
             input_ids_prep = (
@@ -931,22 +951,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             encoder_aux = []
         # pyrefly: ignore[unbound-name]
         if context.dp_metadata is not None and hidden.device.type == "tpu":
-            # Host bucket coordination depends only on scheduling metadata.
-            # Enqueue the encoder before Gloo waits for other DP replicas.
+            # Enqueue the encoder before waiting for the other DP replicas.
             synchronize_tensors((hidden, pre_mix, *encoder_aux), wait=False)
-        plan = (
-            plan_decoder_replay(
-                first,
-                self._ced_window,
-                positions.shape[0],
-                self._ced_compile_sizes,
-            )
-            # pyrefly: ignore[unbound-name]
-            if first is not None
-            else None
-        )
-        if context.dp_metadata is not None:
-            plan = coordinate_decoder_replay(plan, positions.shape[0])
+        # pyrefly: ignore[unbound-name]
+        plan = finish_plan()
         if plan is not None and plan.padded_num_tokens == 0:
             # The scheduler ignores logits for incomplete prefills. The
             # encoder has still published every global KV row for this chunk;

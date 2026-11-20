@@ -1,5 +1,6 @@
 """Host planning for decoder SWA bounded replay across scheduled chunks."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import torch
@@ -31,22 +32,31 @@ class DecoderReplayPlan:
     padded_num_tokens: int
 
 
-def coordinate_decoder_replay(
+def start_decoder_replay_coordination(
     plan: DecoderReplayPlan | None, num_tokens: int
-) -> DecoderReplayPlan | None:
-    """Make every EP participant enter the decoder with the same row bucket."""
+) -> Callable[[], DecoderReplayPlan | None]:
+    """Start agreeing on one decoder row bucket across EP participants.
+
+    The returned call waits for the DP all-reduce and gives the coordinated
+    plan, so the caller can enqueue other work while the replicas meet.
+    """
     group = get_dp_group()
     if group.world_size == 1:
-        return plan
+        return lambda: plan
     count = torch.tensor(
         [num_tokens if plan is None else plan.padded_num_tokens],
         dtype=torch.int64,
         device="cpu",
     )
-    torch.distributed.all_reduce(
-        count, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group
+    work = torch.distributed.all_reduce(
+        count, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group, async_op=True
     )
-    return replace(plan, padded_num_tokens=int(count.item())) if plan else None
+
+    def finish() -> DecoderReplayPlan | None:
+        work.wait()
+        return replace(plan, padded_num_tokens=int(count.item())) if plan else None
+
+    return finish
 
 
 def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
