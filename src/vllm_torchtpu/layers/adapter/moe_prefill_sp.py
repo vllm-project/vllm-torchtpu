@@ -413,7 +413,7 @@ class _GatherProjections(_OProjReduceScatter):
         torch.Tensor
         | tuple[torch.Tensor, torch.Tensor]
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        torch.Tensor | None,
+        torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
     ]:
         qkv = mla.fused_qkv_a_proj(x)[0]
         indexer = mla.indexer if not mla.skip_topk else None
@@ -457,10 +457,33 @@ class _GatherProjections(_OProjReduceScatter):
                     and dcp_token_parallel_op.serves_sequence_row_oproj(mla.o_proj)
                 )
                 qc_head_shift_op = getattr(tp_op, "qc_head_shift_op", None)
-                if use_sharded_kv and indexer is None and qc_head_shift_op is not None:
+                if use_sharded_kv and qc_head_shift_op is not None:
                     assert positions_local is not None
-                    q_c_qrows = qc_head_shift_op(q_c_local, tp_op.rank)
-                    return (q_c_qrows, kv_lora_local, positions_local), None
+                    if indexer is None:
+                        q_c_qrows = qc_head_shift_op(q_c_local, tp_op.rank)
+                        return (q_c_qrows, kv_lora_local, positions_local), None
+                    if getattr(
+                        getattr(
+                            getattr(indexer, "indexer_op", None), "topk_op_tp", None
+                        ),
+                        "serves_sharded_k",
+                        False,
+                    ):
+                        kw_local = indexer.wk_weights_proj(x)[0]
+                        k_dim = int(indexer.head_dim)
+                        k_local, w_local = kw_local.split(
+                            [k_dim, kw_local.shape[-1] - k_dim], dim=-1
+                        )
+                        qcw_qrows = qc_head_shift_op(
+                            torch.cat([q_c_local, w_local], dim=-1), tp_op.rank
+                        )
+                        q_c_qrows, w_qrows = qcw_qrows.split(
+                            [q_lora, w_local.shape[-1]], dim=-1
+                        )
+                        return (
+                            (q_c_qrows, kv_lora_local, positions_local),
+                            (k_local, w_qrows, positions_local),
+                        )
                 qc_head_packed = q_c_local[:s].reshape(rows_local, cols_qc)
                 parts = (
                     [qc_head_packed]
@@ -523,7 +546,7 @@ class _ShardedKVGatherProjections(_OProjReduceScatter):
         torch.Tensor
         | tuple[torch.Tensor, torch.Tensor]
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        torch.Tensor | None,
+        torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
     ]:
         # Avoid eager slicing in patched_model_forward: calling
         # fused_moe_ep.rank_operand() before layer 0's _retain_buffers(*keep)
@@ -718,6 +741,11 @@ def patched_model_forward(
         return UPSTREAM_MODEL_FORWARD(
             self, input_ids, positions, intermediate_tensors, inputs_embeds
         )
+    # Avoid leaving the lifted `num_tokens` SymInt symbolic inside AOT export:
+    # when all layers take sharded KV/indexer paths, no later op equates the
+    # lifted token symbol to a concrete tensor dim, leaving `_embed_reduce_scatter`'s
+    # `aten.empty([floordiv, H])` symbolic and failing static lowering.
+    positions = positions.view(num_tokens, *positions.shape[1:])
     if inputs_embeds is not None:
         hidden_states = inputs_embeds
     elif (
@@ -726,6 +754,7 @@ def patched_model_forward(
         and input_ids.ndim == 1
     ):
         tp = _check_divides(num_tokens)
+        input_ids = input_ids.view(num_tokens)
         full_table = replicated_embedding.full_weight(self.embed_tokens)
         if full_table is None:
             hidden_states = _embed_reduce_scatter(self.embed_tokens, input_ids)

@@ -26,13 +26,16 @@ import torch
 from torch import fx, nn
 from torch._dynamo.backends.common import aot_autograd
 from torch._functorch._aot_autograd.schemas import SerializableAOTDispatchCompiler
+from torch._functorch.aot_autograd import aot_module_simplified
 from torch._functorch.partitioners import min_cut_rematerialization_partition
 from torch._inductor.output_code import OutputCode
+from torch._subclasses.fake_tensor import FakeTensor
 from torch_tpu._internal.compile._backend import (
     _TPU_DECOMPOSITIONS,
     _serialization_context,
 )
 from vllm.compilation.decorators import support_torch_compile
+from vllm.compilation.piecewise_backend import create_concrete_args
 from vllm.config import (
     CompilationConfig,
     CompilationMode,
@@ -1181,3 +1184,146 @@ def test_should_route_post_attn_norm_to_fused_oproj_ar():
         )
     assert got is sentinel
     fused.assert_called_once_with(attn_out, w.o_proj, res_in, norm_w, 1e-6)
+
+
+@torch.library.custom_op("test_moe_prefill_sp::rs_inplace", mutates_args=("out",))
+def _test_rs_inplace(out: torch.Tensor, inp: torch.Tensor) -> None:
+    del out, inp
+
+
+@_test_rs_inplace.register_fake
+def _(out: torch.Tensor, inp: torch.Tensor) -> None:
+    del out, inp
+
+
+@torch.library.custom_op("test_moe_prefill_sp::ag_inplace", mutates_args=("out",))
+def _test_ag_inplace(out: torch.Tensor, inp: torch.Tensor) -> None:
+    del out, inp
+
+
+@_test_ag_inplace.register_fake
+def _(out: torch.Tensor, inp: torch.Tensor) -> None:
+    del out, inp
+
+
+def test_should_concretize_embed_reduce_scatter_empty_shape_under_aot_concrete_args():
+    tp, num_tokens, hidden = 4, 1024, 16
+    rank = torch.zeros((1, 1), dtype=torch.int32)
+    embed_weight = torch.randn(32, hidden, dtype=torch.bfloat16)
+
+    def fake_reduce_scatter(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        input_tensor = tensor.movedim(0, dim).contiguous()
+        chunk_size = input_tensor.shape[0] // tp
+        out = torch.empty(
+            (chunk_size,) + input_tensor.shape[1:],
+            dtype=input_tensor.dtype,
+            device=input_tensor.device,
+        )
+        _test_rs_inplace(out, input_tensor)
+        return out.movedim(0, dim).contiguous()
+
+    def fake_all_gather(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        sz = tensor.size()
+        out = torch.empty(
+            (sz[0] * tp,) + sz[1:], dtype=tensor.dtype, device=tensor.device
+        )
+        _test_ag_inplace(out, tensor)
+        return (
+            out.reshape((tp,) + sz)
+            .movedim(0, dim)
+            .reshape(sz[:dim] + (tp * sz[dim],) + sz[dim + 1 :])
+        )
+
+    shard_indices = SimpleNamespace(
+        org_vocab_start_index=0,
+        org_vocab_end_index=32,
+        num_org_vocab_padding=0,
+        added_vocab_start_index=32,
+        added_vocab_end_index=32,
+    )
+    embed = SimpleNamespace(
+        shard_indices=shard_indices,
+        org_vocab_start_index=0,
+        org_vocab_end_index=32,
+        num_org_vocab_padding=0,
+        added_vocab_start_index=32,
+        added_vocab_end_index=32,
+        quant_method=SimpleNamespace(embedding=lambda _e, idx: embed_weight[idx]),
+    )
+
+    class _ShardedOnlyLayer(nn.Module):
+        def forward(
+            self, positions, hidden_states, residual, _scale, gather_group=None
+        ):
+            pos_local = sp.own_rows(positions, rank, tp)
+            return hidden_states + pos_local.to(hidden_states.dtype).unsqueeze(-1), (
+                hidden_states if residual is None else residual
+            )
+
+    layer = _ShardedOnlyLayer()
+    setattr(layer, sp.KEEP_ATTR, ())
+
+    model = SimpleNamespace(
+        embed_tokens=embed,
+        layers=[layer],
+        start_layer=0,
+        end_layer=1,
+        norm=lambda h, r: (h + r, r),
+    )
+    setattr(model, sp.KEEP_ATTR, True)
+    setattr(model, sp.EMBED_RS_ATTR, True)
+
+    captured: list[fx.GraphModule] = []
+
+    def capture_backend(gm: fx.GraphModule, _example_inputs):
+        captured.append(gm)
+        return gm
+
+    def run_model(input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        return sp.patched_model_forward(model, input_ids, positions)
+
+    with (
+        patch.object(sp, "applies", new=lambda _n: True),
+        patch.object(sp, "get_tensor_model_parallel_world_size", new=lambda: tp),
+        patch.object(
+            sp, "tensor_model_parallel_reduce_scatter", new=fake_reduce_scatter
+        ),
+        patch.object(sp, "tensor_model_parallel_all_gather", new=fake_all_gather),
+        patch.object(sp.small_all_reduce_op, "retain", new=lambda h: h),
+        patch.object(sp.envs, "TPU_DCP_TP_SHARDED_KV_WRITE", False),
+    ):
+        compiled = torch.compile(run_model, backend=capture_backend, fullgraph=True)
+        input_ids = torch.zeros(num_tokens, dtype=torch.long)
+        positions = torch.zeros(num_tokens, dtype=torch.long)
+        torch._dynamo.mark_dynamic(input_ids, 0)  # noqa: SLF001 -- mirrors vLLM @support_torch_compile dynamic dim mark
+        torch._dynamo.mark_dynamic(positions, 0)  # noqa: SLF001 -- mirrors vLLM @support_torch_compile dynamic dim mark
+        compiled(input_ids, positions)
+
+    assert len(captured) == 1
+    gm = captured[0]
+    concrete_args = create_concrete_args(gm, num_tokens)
+    fake_mode = next(
+        (t.fake_mode for t in concrete_args if isinstance(t, FakeTensor)), None
+    )
+    assert fake_mode is not None
+    tracing_ctx = torch._guards.TracingContext(fake_mode)  # noqa: SLF001 -- mirrors TpuCompilerAdaptor._run_backend
+
+    empty_shape_args: list[list[object]] = []
+
+    def inspect_fw(fw_gm: fx.GraphModule, _fw_args):
+        for node in fw_gm.graph.nodes:
+            if (
+                node.op == "call_function"
+                and node.target == torch.ops.aten.empty.memory_format
+            ):
+                empty_shape_args.append(list(node.args[0]))
+        return fw_gm
+
+    with torch._guards.tracing(tracing_ctx):  # noqa: SLF001 -- mirrors TpuCompilerAdaptor._run_backend
+        aot_module_simplified(gm, concrete_args, fw_compiler=inspect_fw)
+
+    assert empty_shape_args, "Expected aten.empty.memory_format nodes in AOT graph"
+    for shape in empty_shape_args:
+        assert all(isinstance(dim, int) for dim in shape), (
+            f"Symbolic dim leaked into aten.empty shape: {shape!r}"
+        )

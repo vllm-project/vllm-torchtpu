@@ -440,6 +440,7 @@ def test_should_dispatch_unified_attention_and_update_topk_buffer_in_place():
         w_o,
         *,
         kv_sharded: bool = False,
+        k_sharded: bool = False,
     ):
         captured_calls.append(
             {
@@ -448,6 +449,7 @@ def test_should_dispatch_unified_attention_and_update_topk_buffer_in_place():
                 "idx_dist": idx_dist.clone(),
                 "mla_dist": mla_dist.clone(),
                 "kv_sharded": kv_sharded,
+                "k_sharded": k_sharded,
                 "w_uv_dtype": w_uv.dtype,
             }
         )
@@ -649,6 +651,7 @@ def test_should_pass_torch_tpu_pallas_verify_signature_for_unified_op_wrappers(
         layer, impl, indexer_op, layout, q_replicated=True, callbacks=cb
     )
     assert op is not None
-    assert len(registered) == 2
+    assert getattr(op, "serves_sharded_k", False) is True
+    assert len(registered) == 3
     expected_arity = 22 if has_lane else 21
     assert all(len(specs) == expected_arity for _, _, specs, _ in registered)

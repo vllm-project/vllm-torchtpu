@@ -25,8 +25,12 @@ import pytest
 import torch
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
+from vllm.config import CompilationConfig, CompilationMode
+from vllm.model_executor import custom_op as custom_op_mod
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed import dcp as dcp_mod
 from vllm_torchtpu.kernels.mla import dcp_token_parallel, kv_cache_utils
 from vllm_torchtpu.layers.adapter import dcp_token_parallel_op as tp_op_mod
 from vllm_torchtpu.layers.adapter import moe_prefill_sp as sp
@@ -557,7 +561,10 @@ def test_should_route_sharded_kv_through_mla_wrapper_with_local_rope_and_oproj(
             q_dcp_replicated,
             sp_o_proj,
             kv_sharded=False,
+            unified_indexer_inputs=None,
+            in_branch_qb_inputs=None,
         ):
+            del unified_indexer_inputs, in_branch_qb_inputs
             captured.update(
                 q_pair=q_pair,
                 kv_c_normed=kv_c_normed,
@@ -1081,3 +1088,258 @@ def test_should_use_qc_head_shift_op_only_on_non_indexer_layers(with_indexer: bo
             assert shift_calls == [r]
             assert ag_calls == []
             assert pre_kw is None
+
+
+def test_should_shift_qc_and_weights_together_when_indexer_serves_sharded_k() -> None:
+    tp, s, rows_local, q_lora, kv_dim, k_dim, w_dim = 4, 2, 8, 16, 12, 8, 4
+    num_tokens = tp * rows_local
+    torch.manual_seed(77)
+    full_qc = torch.randn(num_tokens, q_lora, dtype=torch.bfloat16)
+    full_kv = torch.randn(num_tokens, kv_dim, dtype=torch.bfloat16)
+    full_kw = torch.randn(num_tokens, k_dim + w_dim, dtype=torch.bfloat16)
+    full_x = torch.arange(num_tokens, dtype=torch.float32).unsqueeze(-1)
+    # Non-zero prefix-cached position offsets.
+    positions = 4096 + torch.arange(num_tokens, dtype=torch.int32)
+    full_qcw = torch.cat([full_qc, full_kw[:, k_dim:]], dim=-1)
+
+    for r in range(tp):
+        lo, hi = r * rows_local, (r + 1) * rows_local
+        rank_t = torch.tensor(r, dtype=torch.int32)
+        ag_calls: list[int] = []
+        shift_calls: list[tuple[int, int]] = []
+
+        def _fake_shift(
+            local_mat: torch.Tensor,
+            rk: torch.Tensor,
+            _r=r,
+            _calls=shift_calls,
+        ) -> torch.Tensor:
+            rank_i = int(rk.item())
+            assert rank_i == _r
+            _calls.append((rank_i, int(local_mat.shape[-1])))
+            head0 = full_qcw[:s]
+            tail = (
+                full_qcw[(rank_i + 1) * rows_local : (rank_i + 1) * rows_local + s]
+                if rank_i < tp - 1
+                else local_mat[-1:].expand(s, -1)
+            )
+            return torch.cat([head0, local_mat[s:], tail], dim=0)
+
+        tp_op = SimpleNamespace(
+            layout=dcp_token_parallel.TokenParallelLayout(
+                dcp_size=tp,
+                page_size=16,
+                interleave_size=4,
+                max_pages=8,
+                split_rows=s,
+            ),
+            q_replicated=True,
+            rank=rank_t,
+            serves_sharded_kv=True,
+            qc_head_shift_op=_fake_shift,
+        )
+
+        def _qkv_proj(x: torch.Tensor) -> tuple[torch.Tensor, None]:
+            idx = x.squeeze(-1).long()
+            return torch.cat([full_qc[idx], full_kv[idx]], dim=-1), None
+
+        def _wk_proj(x: torch.Tensor) -> tuple[torch.Tensor, None]:
+            idx = x.squeeze(-1).long()
+            return full_kw[idx], None
+
+        mla = SimpleNamespace(
+            fused_qkv_a_proj=_qkv_proj,
+            indexer=SimpleNamespace(
+                head_dim=k_dim,
+                wk_weights_proj=_wk_proj,
+                indexer_op=SimpleNamespace(
+                    topk_op_tp=SimpleNamespace(q_own_rows=True, serves_sharded_k=True)
+                ),
+            ),
+            skip_topk=False,
+            is_sparse=True,
+            g_proj=None,
+            o_proj=SimpleNamespace(),
+            mla_attn=SimpleNamespace(sparse_mla_tp_op=tp_op),
+            gate_is_fused=False,
+            kimi_preprocess=None,
+            q_lora_rank=q_lora,
+        )
+        group = sp._ShardedKVGatherProjections(positions, tp)  # noqa: SLF001 -- exercises per-step gatherer contract directly
+        with (
+            patch.object(envs, "TPU_DCP_TP_SHARDED_KV_WRITE", True),
+            patch.object(envs, "TPU_DCP_TP_PREFILL_LOCAL_OPROJ", True),
+            patch.object(tp_op_mod, "applies", return_value=True),
+            patch.object(tp_op_mod, "serves_sequence_row_oproj", return_value=True),
+            patch.object(sp, "get_tensor_model_parallel_world_size", return_value=tp),
+            patch.object(
+                sp.fused_moe_ep, "rank_operand", return_value=rank_t.view(1, 1)
+            ),
+            patch.object(
+                sp,
+                "tensor_model_parallel_all_gather",
+                side_effect=lambda t, dim, _calls=ag_calls: _calls.append(t.shape[-1]),
+            ),
+        ):
+            pre_qkv, pre_kw = group.project_gather(mla, full_x[lo:hi], num_tokens)
+
+        assert ag_calls == []
+        assert shift_calls == [(r, q_lora + w_dim)]
+        assert isinstance(pre_qkv, tuple) and len(pre_qkv) == 3
+        assert isinstance(pre_kw, tuple) and len(pre_kw) == 3
+        got_qc, got_kv_local, got_pos_local = pre_qkv
+        got_k_local, got_w_qrows, got_k_pos = pre_kw
+        q_idx = tp_op_mod.q_rows(tp_op, num_tokens)
+        torch.testing.assert_close(
+            got_qc, full_qc.index_select(0, q_idx), rtol=0, atol=0
+        )
+        torch.testing.assert_close(got_kv_local, full_kv[lo:hi], rtol=0, atol=0)
+        torch.testing.assert_close(got_pos_local, positions[lo:hi], rtol=0, atol=0)
+        torch.testing.assert_close(got_k_local, full_kw[lo:hi, :k_dim], rtol=0, atol=0)
+        torch.testing.assert_close(
+            got_w_qrows, full_kw[:, k_dim:].index_select(0, q_idx), rtol=0, atol=0
+        )
+        torch.testing.assert_close(got_k_pos, positions[lo:hi], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("permuted", [True, False])
+def test_should_match_replicated_indexer_forward_with_sharded_k(
+    permuted: bool,
+) -> None:
+    tp, s, rows_local = 4, 2, 8
+    num_tokens = tp * rows_local
+    n_head, head_dim, rope_dim, q_lora = 4, 32, 16, 16
+    torch.manual_seed(2026 + int(permuted))
+
+    ind = mla_attention_op.VllmTPUIndexer.__new__(mla_attention_op.VllmTPUIndexer)
+    torch.nn.Module.__init__(ind)
+    ind.n_head = n_head
+    ind.head_dim = head_dim
+    ind.rope_dim = rope_dim
+    ind.softmax_scale = head_dim**-0.5
+    ind._rope_neox_permuted = permuted  # noqa: SLF001 -- exercises permuted vs fallback RoPE branch
+    w_qb = torch.nn.Linear(q_lora, n_head * head_dim, bias=False).to(torch.bfloat16)
+    ind.wq_b = lambda x: (w_qb(x), None)  # type: ignore[assignment]
+    ind.k_norm = torch.nn.LayerNorm(head_dim).to(torch.bfloat16)
+
+    captured: list[tuple[tuple, dict]] = []
+
+    def _capture(*args, **kwargs):
+        captured.append((args, kwargs))
+        return torch.zeros((args[1].shape[0], 4), dtype=torch.int32)
+
+    ind.indexer_op = _capture  # type: ignore[assignment]
+    cfg = CompilationConfig(mode=CompilationMode.NONE, custom_ops=["none"])
+    with patch.object(custom_op_mod, "get_cached_compilation_config", lambda: cfg):
+        rotary_emb = RotaryEmbedding(
+            head_size=rope_dim,
+            rotary_dim=rope_dim,
+            max_position_embeddings=8192,
+            base=10000,
+            is_neox_style=False,
+            dtype=torch.bfloat16,
+        )
+
+    positions = 512 + torch.arange(num_tokens, dtype=torch.int64)
+    full_kw = torch.randn(num_tokens, head_dim + n_head, dtype=torch.bfloat16)
+    rank = 2
+    lo, hi = rank * rows_local, (rank + 1) * rows_local
+    tp_op = SimpleNamespace(
+        layout=dcp_token_parallel.TokenParallelLayout(
+            dcp_size=tp, page_size=16, interleave_size=4, max_pages=8, split_rows=s
+        ),
+        rank=torch.tensor(rank, dtype=torch.int32),
+    )
+    q_rows = tp_op_mod.q_rows(tp_op, num_tokens)
+    qr = torch.randn(q_rows.shape[0], q_lora, dtype=torch.bfloat16)
+    dummy_hidden = torch.zeros((num_tokens, 4), dtype=torch.bfloat16)
+
+    ind.forward(dummy_hidden, qr, positions, rotary_emb, kw=full_kw, q_rows=q_rows)
+    ind.forward(
+        dummy_hidden[:rows_local],
+        qr,
+        positions,
+        rotary_emb,
+        kw=(
+            full_kw[lo:hi, :head_dim],
+            full_kw[:, head_dim:].index_select(0, q_rows),
+            positions[lo:hi],
+        ),
+        q_rows=q_rows,
+    )
+
+    (rep_args, rep_kw), (sh_args, sh_kw) = captured
+    assert rep_kw == {}
+    assert sh_kw == {"k_sharded": True}
+    torch.testing.assert_close(
+        sh_args[1].view(torch.uint8), rep_args[1].view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(sh_args[2], rep_args[2][lo:hi], rtol=0, atol=0)
+    torch.testing.assert_close(sh_args[3], rep_args[3], rtol=0, atol=0)
+
+
+def test_should_build_and_dispatch_sharded_k_indexer_op(monkeypatch) -> None:
+    built: list[tuple[str, tuple]] = []
+
+    def _fake_pcp_op(name, fn, *, input_partition_specs, **kwargs):
+        del fn, kwargs
+        built.append((name, tuple(input_partition_specs)))
+
+        class _Op:
+            def __init__(self, op_name: str):
+                self.op_name = op_name
+
+            def register_fake(self, _f):
+                return None
+
+            def __call__(self, *args):
+                # Return (new_cache, flat_topk) tagged with which op ran.
+                tag = 1 if "sharded_k" in self.op_name else 0
+                return args[2], torch.full(
+                    (args[0].shape[0], 4), tag, dtype=torch.int32
+                )
+
+        return _Op(name)
+
+    layout = dcp_token_parallel.TokenParallelLayout(
+        dcp_size=4, page_size=16, interleave_size=4, max_pages=8, split_rows=2
+    )
+    monkeypatch.setattr(tp_op_mod, "pcp_streaming_jax_op", _fake_pcp_op)
+    monkeypatch.setattr(
+        tp_op_mod, "_sharded_rank_ids", lambda: torch.tensor([0], dtype=torch.int32)
+    )
+    monkeypatch.setattr(
+        dcp_mod, "dcp_lane_operand", lambda: torch.tensor([0], dtype=torch.int32)
+    )
+    monkeypatch.setattr(
+        tp_op_mod, "get_or_create_dcp_mesh", lambda axis_name: "idx_sharded_mesh"
+    )
+    idx_stub = SimpleNamespace(
+        topk_tokens=4,
+        k_cache=SimpleNamespace(prefix="model.layers.0.self_attn.indexer"),
+        _shared_meta=True,
+    )
+    op = tp_op_mod.build_indexer_op(idx_stub, layout, q_own_rows=True)
+    assert getattr(op, "serves_sharded_k", False) is True
+    assert len(built) == 2
+    assert "sharded_k" not in built[0][0]
+    assert built[0][1][3] == P()
+    assert "sharded_k" in built[1][0]
+    assert built[1][1][3] == P("dcp")
+
+    cache = torch.zeros((2, 16), dtype=torch.uint8)
+    args = (
+        torch.zeros((10, 4, 16), dtype=torch.uint8),
+        torch.zeros((10, 4), dtype=torch.bfloat16),
+        cache,
+        torch.zeros((8, 17), dtype=torch.uint8),
+        torch.zeros((2,), dtype=torch.int32),
+        torch.zeros((2, 2), dtype=torch.int32),
+        torch.zeros((3,), dtype=torch.int32),
+        torch.zeros((3,), dtype=torch.int32),
+    )
+    idx_holder = SimpleNamespace(topk_op_tp=op)
+    out_rep = tp_op_mod.indexer_rows(idx_holder, *args)
+    out_sh = tp_op_mod.indexer_rows(idx_holder, *args, k_sharded=True)
+    assert int(out_rep[0, 0].item()) == 0
+    assert int(out_sh[0, 0].item()) == 1

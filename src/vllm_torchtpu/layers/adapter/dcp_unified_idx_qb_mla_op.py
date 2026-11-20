@@ -193,6 +193,7 @@ def build_unified_indexer_in_branch_qb_op(
         lane_ids: jax.Array | None,
         *,
         kv_sharded: bool,
+        k_sharded: bool = False,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
         live = [
             sharer
@@ -244,6 +245,7 @@ def build_unified_indexer_in_branch_qb_op(
             kv_layout=kv_layout,
             rank_ids=rank_ids,
             compact=k_write_compact,
+            k_sharded=k_sharded,
         )
 
         def _write_kv_once(nope, rope, kv_c, k_pe_in, sl, bt, qsl, rk):
@@ -530,7 +532,7 @@ def build_unified_indexer_in_branch_qb_op(
         )(head_topk, tail_flat)
         return index_cache, kv_cache_nope, kv_cache_rope, full_topk, attn_out
 
-    def _make_wrapper(kv_sharded: bool):
+    def _make_wrapper(kv_sharded: bool, k_sharded: bool = False):
         if has_lane:
 
             def _w_lane(
@@ -585,6 +587,7 @@ def build_unified_indexer_in_branch_qb_op(
                     so,
                     ln,
                     kv_sharded=kv_sharded,
+                    k_sharded=k_sharded,
                 )
 
             return _w_lane
@@ -640,6 +643,7 @@ def build_unified_indexer_in_branch_qb_op(
                 so,
                 None,
                 kv_sharded=kv_sharded,
+                k_sharded=k_sharded,
             )
 
         return _w_nolane
@@ -705,15 +709,16 @@ def build_unified_indexer_in_branch_qb_op(
 
         return _fake
 
-    def _in_specs(kv_sharded: bool) -> tuple[P, ...]:
+    def _in_specs(kv_sharded: bool, k_sharded: bool = False) -> tuple[P, ...]:
         kv_spec = shd if kv_sharded else rep
+        kp_spec = shd if k_sharded else rep
         base = (
             shd,  # index_cache
             shd,  # kv_cache_nope
             shd,  # kv_cache_rope
             shd,  # q_idx_bytes
             shd,  # w_idx
-            rep,  # k_packed
+            kp_spec,  # k_packed
             shd,  # q_c_own
             rep,  # w_qb
             rep,  # s_qb
@@ -786,6 +791,7 @@ def build_unified_indexer_in_branch_qb_op(
         sharers.append(weakref.ref(target_layer))
 
     sharded_kv_op = None
+    sharded_kv_k_op = None
     if envs.TPU_DCP_TP_SHARDED_KV_WRITE:
 
         def _build_sharded(op_name: str):
@@ -804,6 +810,24 @@ def build_unified_indexer_in_branch_qb_op(
             "unified_indexer_in_branch_qb_tp_oproj_sharded_kv",
             cache_key,
             _build_sharded,
+        )
+
+        def _build_sharded_k(op_name: str):
+            built = pcp_streaming_jax_op(
+                op_name,
+                _make_wrapper(kv_sharded=True, k_sharded=True),
+                donate_argnums=(0, 1, 2),
+                mesh=mesh,
+                input_partition_specs=_in_specs(kv_sharded=True, k_sharded=True),
+                output_partition_specs=out_specs,
+            )
+            built.register_fake(_make_fake(kv_sharded=True))
+            return built, layers
+
+        sharded_kv_k_op, _ = get_shared_jax_op(
+            "unified_indexer_in_branch_qb_tp_oproj_sharded_kv_k",
+            cache_key,
+            _build_sharded_k,
         )
 
     def run(
@@ -825,9 +849,17 @@ def build_unified_indexer_in_branch_qb_op(
         w_o: tuple[torch.Tensor, torch.Tensor],
         *,
         kv_sharded: bool = False,
+        k_sharded: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         nope_cache, rope_cache = kv_cache
-        selected = sharded_kv_op if kv_sharded else plain_op
+        if k_sharded:
+            if not kv_sharded:
+                raise RuntimeError(
+                    "unified indexer+in-branch-qb sharded K requires kv_sharded=True"
+                )
+            selected = sharded_kv_k_op
+        else:
+            selected = sharded_kv_op if kv_sharded else plain_op
         if selected is None:
             raise RuntimeError(
                 "unified indexer+in-branch-qb sharded KV op requested but not built"
@@ -866,6 +898,7 @@ def build_unified_indexer_in_branch_qb_op(
 
     run.layout = layout  # type: ignore[attr-defined]
     run.serves_sharded_kv = sharded_kv_op is not None  # type: ignore[attr-defined]
+    run.serves_sharded_k = sharded_kv_k_op is not None  # type: ignore[attr-defined]
     return run
 
 
@@ -912,6 +945,7 @@ def unified_indexer_in_branch_qb_attention(
         w_uv_arg,
         w_o,
         kv_sharded=kv_sharded,
+        k_sharded=unified_inputs.k_sharded,
     )
     unified_inputs.indexer_op._write_topk_rows(full_topk.shape[0], full_topk)  # noqa: SLF001 -- updates shared topk buffer in place
     return _retain_rank(attn_out)

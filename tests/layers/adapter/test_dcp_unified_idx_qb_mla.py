@@ -586,12 +586,18 @@ def test_should_pass_torch_tpu_pallas_verify_signature_for_unified_idx_qb_wrappe
     registered: list[tuple[str, Any, Any, tuple[Any, ...], tuple[Any, ...]]] = []
 
     class _FakeBuiltOp:
-        def __init__(self) -> None:
+        def __init__(self, name: str) -> None:
+            self.name = name
             self.fake_fn: Any = None
+            self.calls: int = 0
 
         def register_fake(self, fn: Any) -> Any:
             self.fake_fn = fn
             return fn
+
+        def __call__(self, *args: Any) -> tuple[torch.Tensor, ...]:
+            self.calls += 1
+            return self.fake_fn(*args)
 
     def _capture_jax_op(
         name: str,
@@ -608,7 +614,7 @@ def test_should_pass_torch_tpu_pallas_verify_signature_for_unified_idx_qb_wrappe
         assert pallas_impl._infer_static_argnums(sig) == ()  # noqa: SLF001 -- every operand must bind as jax.Array
         pallas_impl._get_torch_signature(sig)  # noqa: SLF001 -- verify Torch schema translation succeeds
         assert len(sig.parameters) == len(input_partition_specs)
-        built_op = _FakeBuiltOp()
+        built_op = _FakeBuiltOp(name)
         registered.append(
             (name, fn, built_op, input_partition_specs, output_partition_specs)
         )
@@ -646,13 +652,17 @@ def test_should_pass_torch_tpu_pallas_verify_signature_for_unified_idx_qb_wrappe
     )
     assert op is not None
     assert getattr(op, "serves_sharded_kv", False) is True
-    assert len(registered) == 2
+    assert getattr(op, "serves_sharded_k", False) is True
+    assert len(registered) == 3
     expected_arity = 24 if has_lane else 23
     for name, _, built_op, in_specs, out_specs in registered:
         assert len(in_specs) == expected_arity
         assert len(out_specs) == 5
+        is_sharded_k = "sharded_kv_k" in name
+        assert in_specs[5] == (P(AXIS) if is_sharded_k else P())
         is_sharded = "sharded_kv" in name
         kv_rows = 16 if is_sharded else 64
+        k_rows = 16 if is_sharded_k else 64
         lane_args = (torch.zeros((1,), dtype=torch.int32),) if has_lane else ()
         fake_outs = built_op.fake_fn(
             torch.zeros((4, 3, 4, 32), dtype=torch.uint8),
@@ -660,7 +670,7 @@ def test_should_pass_torch_tpu_pallas_verify_signature_for_unified_idx_qb_wrappe
             torch.zeros((4, 8, 16), dtype=torch.bfloat16),
             torch.zeros((32, 2, 12), dtype=torch.uint8),
             torch.ones((32, 2), dtype=torch.bfloat16),
-            torch.zeros((64, 13), dtype=torch.uint8),
+            torch.zeros((k_rows, 13), dtype=torch.uint8),
             torch.zeros((32, 12), dtype=torch.bfloat16),
             torch.zeros((12, 48), dtype=torch.float8_e4m3fn),
             torch.ones((48,), dtype=torch.float32),
@@ -685,6 +695,70 @@ def test_should_pass_torch_tpu_pallas_verify_signature_for_unified_idx_qb_wrappe
         assert fake_outs[3].dtype == torch.int32
         assert fake_outs[4].shape == (16, 32)
         assert fake_outs[4].dtype == torch.bfloat16
+
+    qb_in = in_branch_mod.InBranchQbInputs(
+        q_c=torch.zeros((32, 12), dtype=torch.bfloat16),
+        w_qb=torch.zeros((12, 48), dtype=torch.float8_e4m3fn),
+        s_qb=torch.ones((48,), dtype=torch.float32),
+        w_uk_t=torch.ones((4, 8, 8), dtype=torch.bfloat16),
+        cos_sin=torch.zeros((32, 4), dtype=torch.bfloat16),
+    )
+    with pytest.raises(RuntimeError, match="requires kv_sharded=True"):
+        op(
+            torch.zeros((4, 3, 4, 32), dtype=torch.uint8),
+            (
+                torch.zeros((4, 32, 8), dtype=torch.bfloat16),
+                torch.zeros((4, 8, 16), dtype=torch.bfloat16),
+            ),
+            torch.zeros((32, 2, 12), dtype=torch.uint8),
+            torch.ones((32, 2), dtype=torch.bfloat16),
+            torch.zeros((16, 13), dtype=torch.uint8),
+            qb_in,
+            torch.zeros((64, 8), dtype=torch.bfloat16),
+            torch.zeros((64, 4), dtype=torch.bfloat16),
+            torch.zeros((8,), dtype=torch.int32),
+            torch.zeros((16,), dtype=torch.int32),
+            torch.zeros((16,), dtype=torch.int32),
+            torch.zeros((9,), dtype=torch.int32),
+            torch.zeros((3,), dtype=torch.int32),
+            torch.zeros((3,), dtype=torch.int32),
+            torch.ones((4, 8, 6), dtype=torch.bfloat16),
+            (
+                torch.zeros((24, 32), dtype=torch.float8_e4m3fn),
+                torch.ones((32,), dtype=torch.float32),
+            ),
+            kv_sharded=False,
+            k_sharded=True,
+        )
+    topk_out, attn_out = op(
+        torch.zeros((4, 3, 4, 32), dtype=torch.uint8),
+        (
+            torch.zeros((4, 32, 8), dtype=torch.bfloat16),
+            torch.zeros((4, 8, 16), dtype=torch.bfloat16),
+        ),
+        torch.zeros((32, 2, 12), dtype=torch.uint8),
+        torch.ones((32, 2), dtype=torch.bfloat16),
+        torch.zeros((16, 13), dtype=torch.uint8),
+        qb_in,
+        torch.zeros((16, 8), dtype=torch.bfloat16),
+        torch.zeros((16, 4), dtype=torch.bfloat16),
+        torch.zeros((8,), dtype=torch.int32),
+        torch.zeros((16,), dtype=torch.int32),
+        torch.zeros((16,), dtype=torch.int32),
+        torch.zeros((9,), dtype=torch.int32),
+        torch.zeros((3,), dtype=torch.int32),
+        torch.zeros((3,), dtype=torch.int32),
+        torch.ones((4, 8, 6), dtype=torch.bfloat16),
+        (
+            torch.zeros((24, 32), dtype=torch.float8_e4m3fn),
+            torch.ones((32,), dtype=torch.float32),
+        ),
+        kv_sharded=True,
+        k_sharded=True,
+    )
+    assert topk_out.shape == (32, TOPK)
+    assert attn_out.shape == (16, 32)
+    assert registered[2][2].calls == 1
 
 
 def test_should_dispatch_unified_idx_qb_attention_and_update_topk_buffer_in_place():
@@ -723,6 +797,7 @@ def test_should_dispatch_unified_idx_qb_attention_and_update_topk_buffer_in_plac
         w_o,
         *,
         kv_sharded: bool = False,
+        k_sharded: bool = False,
     ):
         del (
             index_cache,
@@ -744,6 +819,7 @@ def test_should_dispatch_unified_idx_qb_attention_and_update_topk_buffer_in_plac
                 "idx_dist": idx_dist.clone(),
                 "mla_dist": mla_dist.clone(),
                 "kv_sharded": kv_sharded,
+                "k_sharded": k_sharded,
                 "w_uv_dtype": w_uv.dtype,
             }
         )
@@ -868,7 +944,7 @@ def test_should_defer_fused_qb_on_active_indexer_only_when_unified_qb_op_and_cac
         indexer_op = types.SimpleNamespace(
             topk_op_tp=types.SimpleNamespace(q_own_rows=True),
             has_live_unified_cache=lambda: live_cache,
-            prepare_unified_inputs=lambda q, k, w: (
+            prepare_unified_inputs=lambda q, k, w, *, k_sharded=False: (
                 sentinel_unified if live_cache else None
             ),
         )
@@ -1136,3 +1212,77 @@ def test_should_route_backend_forward_to_unified_idx_qb_attention(monkeypatch):
             kv_sharded=True,
             in_branch_qb_inputs=qb_in,
         )
+
+
+def test_should_forward_k_sharded_flag_through_unified_idx_qb_and_unified_mla():
+    seen_qb: list[dict[str, Any]] = []
+    seen_mla: list[dict[str, Any]] = []
+
+    def _rec_qb(*args, kv_sharded: bool = False, k_sharded: bool = False):
+        del args
+        seen_qb.append({"kv_sharded": kv_sharded, "k_sharded": k_sharded})
+        return torch.zeros((20, 4), dtype=torch.int32), torch.zeros((16, 6))
+
+    def _rec_mla(*args, kv_sharded: bool = False, k_sharded: bool = False):
+        del args
+        seen_mla.append({"kv_sharded": kv_sharded, "k_sharded": k_sharded})
+        return torch.zeros((20, 4), dtype=torch.int32), torch.zeros((16, 6))
+
+    idx_op = types.SimpleNamespace(
+        k_cache=types.SimpleNamespace(kv_cache=torch.zeros((4, 8), dtype=torch.uint8)),
+        _write_topk_rows=lambda n, rows: rows,
+    )
+    meta = types.SimpleNamespace(
+        seq_lens=torch.tensor([64, 32], dtype=torch.int32),
+        block_tables=torch.tensor([2, 4, 6, 8], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 16, 20], dtype=torch.int32),
+        request_distribution=torch.tensor([2, 3, 5], dtype=torch.int32),
+    )
+    unified_in = unified_op_mod.UnifiedIndexerInputs(
+        indexer_op=idx_op,
+        q_bytes=torch.zeros((20, 2, 12), dtype=torch.uint8),
+        weights=torch.ones((20, 2), dtype=torch.bfloat16),
+        k_packed=torch.zeros((16, 13), dtype=torch.uint8),
+        idx_metadata=meta,
+        k_sharded=True,
+    )
+    qb_in = in_branch_mod.InBranchQbInputs(
+        q_c=torch.zeros((20, 16), dtype=torch.bfloat16),
+        w_qb=torch.zeros((16, 48), dtype=torch.float8_e4m3fn),
+        s_qb=torch.ones((48,), dtype=torch.float32),
+        w_uk_t=torch.ones((4, 8, 8), dtype=torch.bfloat16),
+        cos_sin=torch.ones((20, 4), dtype=torch.bfloat16),
+    )
+    layer = types.SimpleNamespace(
+        sparse_mla_unified_idx_qb_op=_rec_qb,
+        sparse_mla_unified_tp_op=_rec_mla,
+        W_UV_tp_all=torch.ones((4, 8, 6), dtype=torch.bfloat16),
+    )
+    kv_cache = (torch.zeros((4, 16, 8)), torch.zeros((4, 4, 16)))
+    w_o = (torch.zeros((24, 6)), torch.ones((6,)))
+
+    unified_qb_mod.unified_indexer_in_branch_qb_attention(
+        layer,
+        kv_cache,
+        qb_in,
+        torch.zeros((16, 8), dtype=torch.bfloat16),
+        torch.zeros((16, 1, 4), dtype=torch.bfloat16),
+        unified_in,
+        meta,
+        w_o,
+        kv_sharded=True,
+    )
+    unified_op_mod.unified_indexer_attention(
+        layer,
+        kv_cache,
+        torch.zeros((20, 4, 8), dtype=torch.bfloat16),
+        torch.zeros((20, 4, 4), dtype=torch.bfloat16),
+        torch.zeros((16, 8), dtype=torch.bfloat16),
+        torch.zeros((16, 1, 4), dtype=torch.bfloat16),
+        unified_in,
+        meta,
+        w_o,
+        kv_sharded=True,
+    )
+    assert seen_qb == [{"kv_sharded": True, "k_sharded": True}]
+    assert seen_mla == [{"kv_sharded": True, "k_sharded": True}]

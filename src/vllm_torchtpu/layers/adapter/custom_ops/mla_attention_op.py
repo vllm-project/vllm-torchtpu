@@ -496,6 +496,7 @@ def _cp_scatter_indexer_k(
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
     rank_ids: jax.Array | None = None,
     compact: bool = False,
+    k_sharded: bool = False,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
 
@@ -522,9 +523,24 @@ def _cp_scatter_indexer_k(
         raise ValueError(
             f"writer='xla' only supports HEAD_ALONG_SUBLANE, got {kv_layout}."
         )
+    if k_sharded and writer != "pallas":
+        raise ValueError(f"k_sharded requires writer='pallas', got {writer!r}.")
 
     def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens, *rank_arg):
         rank = rank_arg[0][0] if rank_arg else cp_rank_as_data(axis_name, cp_size)
+        if k_sharded:
+            return kv_cache_append.sharded_kv_append_dcp(
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                rank,
+                dcp_size=cp_size,
+                interleave_size=interleave_size,
+                axis_name=axis_name,
+                kv_layout=kv_layout,
+            )
         if writer == "pallas":
             return coalesced_kv_append_dcp(
                 cache_kv,
@@ -586,11 +602,12 @@ def _cp_scatter_indexer_k(
 
     replicated = jax.sharding.PartitionSpec()
     sharded = jax.sharding.PartitionSpec(axis_name)
+    k_spec = sharded if k_sharded else replicated
     rank_args = () if rank_ids is None else (rank_ids,)
     return jax.shard_map(
         _local,
         mesh=mesh,
-        in_specs=(sharded, replicated, replicated, replicated, replicated)
+        in_specs=(sharded, k_spec, replicated, replicated, replicated)
         + (sharded,) * len(rank_args),
         out_specs=sharded,
         check_vma=False,
@@ -1232,12 +1249,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         k: torch.Tensor,
         weights: torch.Tensor,
         qb_overlap: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        k_sharded: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         """`qb_overlap=(x, w_q, w_s)` (TPU_INDEXER_QB_OVERLAP) also returns the
         MLA q_b projection of `x`, computed under the SparseCore top-k: a pair
         `(topk, q)`, `q` None where the op did not run (the caller then runs
         the projection itself)."""
-        rows, q = self._forward_impl(hidden_states, q_values, k, weights, qb_overlap)
+        rows, q = self._forward_impl(
+            hidden_states, q_values, k, weights, qb_overlap, k_sharded=k_sharded
+        )
         return rows if qb_overlap is None else (rows, q)
 
     def _forward_impl(
@@ -1247,6 +1267,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         k: torch.Tensor,
         weights: torch.Tensor,
         qb_overlap: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+        *,
+        k_sharded: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert q_values.dtype == torch.float8_e4m3fn, (
             f"streamindex_topk expects fp8 q, got {q_values.dtype}"
@@ -1284,6 +1306,12 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
         q_b_out = None
         num_rows = hidden_states.shape[0]
+        topk_op_tp = getattr(self, "topk_op_tp", None)
+        step_tokens = (
+            k.shape[0] * topk_op_tp.layout.dcp_size
+            if (k_sharded and topk_op_tp is not None)
+            else hidden_states.shape[0]
+        )
         topk_op_dcp_qb = getattr(self, "topk_op_dcp_qb", None)
         if qb_overlap is not None and topk_op_dcp_qb is not None:
             # Same op plus the MLA q_b projection, run under the top-k.
@@ -1298,9 +1326,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
                 *qb_overlap,
             )
-        elif getattr(
-            self, "topk_op_tp", None
-        ) is not None and dcp_token_parallel_op.applies(hidden_states.shape[0]):
+        elif topk_op_tp is not None and dcp_token_parallel_op.applies(step_tokens):
+            extra_idx = {"k_sharded": True} if k_sharded else {}
             topk_indices = dcp_token_parallel_op.indexer_rows(
                 self,
                 q_values.view(torch.uint8),
@@ -1311,8 +1338,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 page_indices,
                 cu_q_lens,
                 distribution,
+                **extra_idx,
             )
             num_rows = topk_indices.shape[0]
+        elif k_sharded:
+            raise ValueError("k_sharded requires token-parallel topk_op_tp")
         elif self.topk_op_dcp is not None:
             # DCP replicates the queries, so the token
             # inputs are already the whole batch in request-major order. What
@@ -1368,6 +1398,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         q_values: torch.Tensor,
         k: torch.Tensor,
         weights: torch.Tensor,
+        *,
+        k_sharded: bool = False,
     ) -> dcp_unified_indexer_mla_op.UnifiedIndexerInputs | None:
         assert q_values.dtype == torch.float8_e4m3fn, (
             f"streamindex_topk expects fp8 q, got {q_values.dtype}"
@@ -1394,6 +1426,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             weights=weights,
             k_packed=k_quant_packed,
             idx_metadata=metadata,
+            k_sharded=k_sharded,
         )
 
     def _write_topk_rows(
@@ -1564,18 +1597,26 @@ class VllmTPUIndexer(Indexer):
         positions,
         rotary_emb,
         *,
-        kw: torch.Tensor | None = None,
+        kw: (
+            torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
         q_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         # Fused wk + weights_proj: one GEMM, then split
-        if kw is None:
-            kw, _ = self.wk_weights_proj(hidden_states)
-        k = kw[:, : self.head_dim]
-        weights = kw[:, self.head_dim :]
-        if q_rows is not None:
-            weights = weights.index_select(0, q_rows)
+        if isinstance(kw, tuple):
+            k, weights, k_positions = kw
+            k_sharded = True
+        else:
+            if kw is None:
+                kw, _ = self.wk_weights_proj(hidden_states)
+            k = kw[:, : self.head_dim]
+            weights = kw[:, self.head_dim :]
+            if q_rows is not None:
+                weights = weights.index_select(0, q_rows)
+            k_positions = positions
+            k_sharded = False
         q_positions = positions if q_rows is None else positions.index_select(0, q_rows)
 
         k = self.k_norm(k)
@@ -1589,7 +1630,7 @@ class VllmTPUIndexer(Indexer):
             # TPU_INDEXER_QPREP_FUSED: q rope + per-(token, head) amax + fp8
             # cast in one pass over the [T, H*D] wq_b output, written straight
             # in the [T, H, D] layout the top-k op reads.
-            k = rope_half_split_leading(rotary_emb, positions, k, self.rope_dim)
+            k = rope_half_split_leading(rotary_emb, k_positions, k, self.rope_dim)
             c, s_ = rope_half_split_leading_cs(
                 rotary_emb, q_positions, q, self.head_dim, self.rope_dim
             )
@@ -1599,7 +1640,7 @@ class VllmTPUIndexer(Indexer):
             if permuted and rope_half_split_leading_supported(rotary_emb):
                 # Half-split columns: rope the whole head in place, no split/cat.
                 q = rope_half_split_leading(rotary_emb, q_positions, q, self.rope_dim)
-                k = rope_half_split_leading(rotary_emb, positions, k, self.rope_dim)
+                k = rope_half_split_leading(rotary_emb, k_positions, k, self.rope_dim)
             else:
                 q_pe, q_nope = torch.split(
                     q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
@@ -1612,12 +1653,16 @@ class VllmTPUIndexer(Indexer):
                     if permuted
                     else rotary_emb
                 )
-                if q_rows is None:
+                if q_rows is None and not k_sharded:
                     q_pe, k_pe = rope_fn(positions, q_pe, k_pe.unsqueeze(1))
                 else:
                     k_pe_u = k_pe.unsqueeze(1)
-                    q_pe = rope_fn(q_positions, q_pe, k_pe_u.index_select(0, q_rows))[0]
-                    k_pe = rope_fn(positions, k_pe_u, k_pe_u)[1]
+                    q_pe = rope_fn(
+                        q_positions,
+                        q_pe,
+                        q_pe[:, :1, :] if k_sharded else k_pe_u.index_select(0, q_rows),
+                    )[0]
+                    k_pe = rope_fn(k_positions, k_pe_u, k_pe_u)[1]
                 # A key was passed in, so one comes back.
                 assert k_pe is not None
                 # Note: RoPE (NeoX) can introduce extra leading dimensions during
@@ -1639,6 +1684,8 @@ class VllmTPUIndexer(Indexer):
             q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
             q_scale = q_scale.view(-1, self.n_head, 1)
 
+        # q_scale is fp32, so fold it in and cast back: the kernel expects the
+        # weights in the activation dtype.
         weights_dtype = weights.dtype
         weights = (
             weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
@@ -1654,7 +1701,9 @@ class VllmTPUIndexer(Indexer):
         positions,
         rotary_emb,
         q_b_layer: torch.nn.Module | None = None,
-        kw: torch.Tensor | None = None,
+        kw: (
+            torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
         q_rows: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         """Run the TPU indexer forward pass, optionally overlapping MLA q_b_proj.
@@ -1662,21 +1711,40 @@ class VllmTPUIndexer(Indexer):
         `q_b_layer` (TPU_INDEXER_QB_OVERLAP): also return `q_b_layer(qr)`,
         run inside the top-k op, as `(topk, q)`; `q` None where the op could
         not take it (the caller runs `q_b_layer` itself). `kw`: the
-        `wk_weights_proj` output, when the caller already projected the rows
-        (only their count is then read from `hidden_states`). `q_rows`: when
-        `qr` holds only the rows this rank attends (`s + T // dcp`).
+        `wk_weights_proj` output (or `(k_local, weights_qrows, k_positions)`
+        when K is rank-sharded). `q_rows`: when `qr` holds only the rows this
+        rank attends (`s + T // dcp`).
         """
         q_fp8, k, weights = self.prepare_inputs(
             hidden_states, qr, positions, rotary_emb, kw=kw, q_rows=q_rows
         )
-        return self._finish_forward(hidden_states, qr, q_fp8, k, weights, q_b_layer)
+        return self._finish_forward(
+            hidden_states,
+            qr,
+            q_fp8,
+            k,
+            weights,
+            q_b_layer,
+            k_sharded=isinstance(kw, tuple),
+        )
 
-    def _finish_forward(self, hidden_states, qr, q_fp8, k, weights, q_b_layer):
+    def _finish_forward(
+        self,
+        hidden_states,
+        qr,
+        q_fp8,
+        k,
+        weights,
+        q_b_layer,
+        *,
+        k_sharded: bool = False,
+    ):
+        extra = {"k_sharded": True} if k_sharded else {}
         if q_b_layer is None:
-            return self.indexer_op(hidden_states, q_fp8, k, weights)
+            return self.indexer_op(hidden_states, q_fp8, k, weights, **extra)
         operands = _qb_overlap_operands(q_b_layer)
         if operands is None:
-            return self.indexer_op(hidden_states, q_fp8, k, weights), None
+            return self.indexer_op(hidden_states, q_fp8, k, weights, **extra), None
         if envs.TPU_MLA_DECODE_LOCAL_Q_AG and not getattr(
             q_b_layer, "qrep_active", False
         ):
@@ -1686,7 +1754,7 @@ class VllmTPUIndexer(Indexer):
             )
         qb_x = qr.reshape(-1, qr.shape[-1])
         return self.indexer_op(
-            hidden_states, q_fp8, k, weights, qb_overlap=(qb_x, *operands)
+            hidden_states, q_fp8, k, weights, qb_overlap=(qb_x, *operands), **extra
         )
 
 
@@ -2731,7 +2799,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 else:
                     pre_qc_qrows, kv_lora = pre_qkv
                 hidden_states = (
-                    pre_kw if (kv_sharded and pre_kw is not None) else kv_lora
+                    pre_kw
+                    if (kv_sharded and isinstance(pre_kw, torch.Tensor))
+                    else kv_lora
                 )
             else:
                 hidden_states = pre_qkv
@@ -3032,6 +3102,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             else "sparse_mla_unified_tp_op",
             None,
         )
+        k_sharded = isinstance(pre_kw, tuple)
         unified_idx_inputs = None
         if (
             self.is_sparse
@@ -3042,6 +3113,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             and llama_4_scaling is None
             and unified_op is not None
             and (not kv_sharded or getattr(unified_op, "serves_sharded_kv", False))
+            and (not k_sharded or getattr(unified_op, "serves_sharded_k", False))
             and indexer_qrows is not None
             and (
                 fused_qb_out is not None
@@ -3059,7 +3131,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 q_rows=indexer_qrows,
             )
             unified_idx_inputs = self.indexer.indexer_op.prepare_unified_inputs(
-                q_idx_fp8, k_idx, w_idx
+                q_idx_fp8, k_idx, w_idx, k_sharded=k_sharded
             )
 
         topk_indices = None

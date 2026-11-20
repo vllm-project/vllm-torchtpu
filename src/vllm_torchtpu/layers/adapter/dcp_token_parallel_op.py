@@ -1754,6 +1754,8 @@ def build_indexer_op(
         after: jax.Array | None,
         rank_ids: jax.Array | None,
         lane_ids: jax.Array | None = None,
+        *,
+        k_sharded: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
         if after is not None:
             (cache_kv,) = _after_reads(cache_kv, after=after)
@@ -1784,6 +1786,7 @@ def build_indexer_op(
             kv_layout=kv_layout,
             rank_ids=rank_ids,
             compact=k_write_compact,
+            k_sharded=k_sharded,
         )
         q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
 
@@ -1911,7 +1914,7 @@ def build_indexer_op(
         )(head, tail)
         return cache_kv, full
 
-    def _build_idx_wrapper():
+    def _build_idx_wrapper(k_sharded: bool = False):
         if fused_subbatch:
             if not has_rank:
 
@@ -1925,7 +1928,20 @@ def build_indexer_op(
                     cql: jax.Array,
                     dist: jax.Array,
                 ) -> tuple[jax.Array, jax.Array]:
-                    return _run(qb, w, kv, kp, sl, pi, cql, dist, None, None, None)
+                    return _run(
+                        qb,
+                        w,
+                        kv,
+                        kp,
+                        sl,
+                        pi,
+                        cql,
+                        dist,
+                        None,
+                        None,
+                        None,
+                        k_sharded=k_sharded,
+                    )
 
                 return f0
             if not has_lane:
@@ -1941,7 +1957,20 @@ def build_indexer_op(
                     dist: jax.Array,
                     rk: jax.Array,
                 ) -> tuple[jax.Array, jax.Array]:
-                    return _run(qb, w, kv, kp, sl, pi, cql, dist, None, rk, None)
+                    return _run(
+                        qb,
+                        w,
+                        kv,
+                        kp,
+                        sl,
+                        pi,
+                        cql,
+                        dist,
+                        None,
+                        rk,
+                        None,
+                        k_sharded=k_sharded,
+                    )
 
                 return f1
 
@@ -1957,7 +1986,20 @@ def build_indexer_op(
                 rk: jax.Array,
                 ln: jax.Array,
             ) -> tuple[jax.Array, jax.Array]:
-                return _run(qb, w, kv, kp, sl, pi, cql, dist, None, rk, ln)
+                return _run(
+                    qb,
+                    w,
+                    kv,
+                    kp,
+                    sl,
+                    pi,
+                    cql,
+                    dist,
+                    None,
+                    rk,
+                    ln,
+                    k_sharded=k_sharded,
+                )
 
             return f2
 
@@ -1974,7 +2016,20 @@ def build_indexer_op(
                 dist: jax.Array,
                 af: jax.Array,
             ) -> tuple[jax.Array, jax.Array]:
-                return _run(qb, w, kv, kp, sl, pi, cql, dist, af, None, None)
+                return _run(
+                    qb,
+                    w,
+                    kv,
+                    kp,
+                    sl,
+                    pi,
+                    cql,
+                    dist,
+                    af,
+                    None,
+                    None,
+                    k_sharded=k_sharded,
+                )
 
             return u0
 
@@ -1990,7 +2045,20 @@ def build_indexer_op(
             af: jax.Array,
             rk: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
-            return _run(qb, w, kv, kp, sl, pi, cql, dist, af, rk, None)
+            return _run(
+                qb,
+                w,
+                kv,
+                kp,
+                sl,
+                pi,
+                cql,
+                dist,
+                af,
+                rk,
+                None,
+                k_sharded=k_sharded,
+            )
 
         return u1
 
@@ -2021,7 +2089,7 @@ def build_indexer_op(
     def _build_idx_op(op_name: str):
         built = pcp_streaming_jax_op(
             op_name,
-            _build_idx_wrapper(),
+            _build_idx_wrapper(k_sharded=False),
             donate_argnums=(2,),
             mesh=mesh,
             input_partition_specs=in_specs,
@@ -2030,47 +2098,70 @@ def build_indexer_op(
         built.register_fake(_fake)
         return built
 
-    op = get_shared_jax_op(
-        "streamidx_topk_tp",
-        (
-            id(mesh),
-            layout,
-            bool(q_own_rows),
-            int(topk),
-            chunk_tokens,
-            bool(hist_merge),
-            bool(a2a_merge),
-            int(a2a_min_tokens),
-            small_bucket,
-            kv_cache_mode,
-            bool(skip_empty_decode),
-            bool(skip_empty_decode_chunked),
-            mixed_bkvp,
-            bool(decode_pack),
-            shared_meta,
-            bool(k_write_compact),
-            bool(fused_subbatch),
-            global_group,
-            has_rank,
-            small_ag,
-            has_lane,
-        ),
-        _build_idx_op,
+    op_key = (
+        id(mesh),
+        layout,
+        bool(q_own_rows),
+        int(topk),
+        chunk_tokens,
+        bool(hist_merge),
+        bool(a2a_merge),
+        int(a2a_min_tokens),
+        small_bucket,
+        kv_cache_mode,
+        bool(skip_empty_decode),
+        bool(skip_empty_decode_chunked),
+        mixed_bkvp,
+        bool(decode_pack),
+        shared_meta,
+        bool(k_write_compact),
+        bool(fused_subbatch),
+        global_group,
+        has_rank,
+        small_ag,
+        has_lane,
     )
+    op = get_shared_jax_op("streamidx_topk_tp", op_key, _build_idx_op)
 
-    def run(*args: torch.Tensor) -> torch.Tensor:
+    sharded_k_op = None
+    if q_own_rows and fused_subbatch and has_rank:
+        sharded_k_in_specs = in_specs[:3] + (sharded,) + in_specs[4:]
+
+        def _build_sharded_k_op(op_name: str):
+            built = pcp_streaming_jax_op(
+                op_name,
+                _build_idx_wrapper(k_sharded=True),
+                donate_argnums=(2,),
+                mesh=mesh,
+                input_partition_specs=sharded_k_in_specs,
+                output_partition_specs=(sharded, sharded),
+            )
+            built.register_fake(_fake)
+            return built
+
+        sharded_k_op = get_shared_jax_op(
+            "streamidx_topk_tp_sharded_k", op_key, _build_sharded_k_op
+        )
+
+    def run(*args: torch.Tensor, k_sharded: bool = False) -> torch.Tensor:
         extra = ()
         if rank_tensor is not None:
             extra = (*extra, rank_tensor)
         if lane_tensor is not None:
             extra = (*extra, lane_tensor)
-        new_cache, flat = op(*args, *extra)
+        selected_op = sharded_k_op if k_sharded else op
+        if selected_op is None:
+            raise ValueError(
+                "k_sharded requires q_own_rows, fused_subbatch, and rank_ids"
+            )
+        new_cache, flat = selected_op(*args, *extra)
         args[2].copy_(new_cache)
         return flat
 
     run.layout = layout  # type: ignore[attr-defined]
     run.q_own_rows = q_own_rows  # type: ignore[attr-defined]
     run.fused_subbatch = fused_subbatch  # type: ignore[attr-defined]
+    run.serves_sharded_k = sharded_k_op is not None  # type: ignore[attr-defined]
     return run
 
 
@@ -2084,10 +2175,13 @@ def indexer_rows(
     page_indices: torch.Tensor,
     cu_q_lens: torch.Tensor,
     distribution: torch.Tensor,
+    *,
+    k_sharded: bool = False,
 ) -> torch.Tensor:
     """`[split_rows + T / dcp, topk]`: the DCP sub-batch's rank-local top-k,
     then this rank's token-parallel rows (see the module docstring)."""
     if getattr(indexer.topk_op_tp, "fused_subbatch", False):
+        extra = {"k_sharded": True} if k_sharded else {}
         return indexer.topk_op_tp(
             q_bytes,
             weights,
@@ -2097,7 +2191,10 @@ def indexer_rows(
             page_indices,
             cu_q_lens,
             distribution,
+            **extra,
         )
+    if k_sharded:
+        raise ValueError("k_sharded requires fused_subbatch")
     s = indexer.topk_op_tp.layout.split_rows
     q_own = getattr(indexer.topk_op_tp, "q_own_rows", False)
     seq_s, qsl_s, dist_s = dcp_rows_metadata(seq_lens, cu_q_lens, distribution, s)

@@ -43,14 +43,38 @@ import jax.numpy as jnp
 OOB_PAGE = 2**30
 # Flat destination row that marks a token as "do not write".
 SKIP_ROW = -1
+_SHARDED_COMPACT_BLOCK = 256
+SHARDED_A2A_FAST_CAP = 128
 
 __all__ = [
     "OOB_PAGE",
+    "SHARDED_A2A_FAST_CAP",
     "SKIP_ROW",
+    "build_sharded_dcp_a2a_plan",
     "get_dcp_page_and_slot",
     "get_dst_rows",
     "get_page_and_slot",
+    "sharded_a2a_cap",
+    "sharded_a2a_fast_seq_limit",
 ]
+
+
+def _row_positions_for_tokens(
+    tok_1d: jax.Array,
+    seq_lens: jax.Array,
+    query_start_loc: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    num_seqs = seq_lens.shape[0]
+    tok = tok_1d[:, None]
+    member = (tok >= query_start_loc[None, :-1]) & (tok < query_start_loc[None, 1:])
+    seq_id = jnp.sum(
+        jnp.where(member, jnp.arange(num_seqs, dtype=jnp.int32)[None, :], 0),
+        axis=1,
+    )
+    # pos = seq_lens[s] - q_len[s] + (tok - query_start_loc[s]).
+    pos_offset = seq_lens - query_start_loc[1:]
+    pos = tok[:, 0] + jnp.sum(jnp.where(member, pos_offset[None, :], 0), axis=1)
+    return seq_id, pos, jnp.any(member, axis=1)
 
 
 def _row_positions(
@@ -77,17 +101,9 @@ def _row_positions(
     Returns:
       `(seq_id, pos, in_batch)`, each `[num_tokens]`.
     """
-    num_seqs = seq_lens.shape[0]
-    tok = jnp.arange(num_tokens, dtype=jnp.int32)[:, None]
-    member = (tok >= query_start_loc[None, :-1]) & (tok < query_start_loc[None, 1:])
-    seq_id = jnp.sum(
-        jnp.where(member, jnp.arange(num_seqs, dtype=jnp.int32)[None, :], 0),
-        axis=1,
+    return _row_positions_for_tokens(
+        jnp.arange(num_tokens, dtype=jnp.int32), seq_lens, query_start_loc
     )
-    # pos = seq_lens[s] - q_len[s] + (tok - query_start_loc[s]).
-    pos_offset = seq_lens - query_start_loc[1:]
-    pos = tok[:, 0] + jnp.sum(jnp.where(member, pos_offset[None, :], 0), axis=1)
-    return seq_id, pos, jnp.any(member, axis=1)
 
 
 def _lookup_page(
@@ -221,3 +237,104 @@ def get_dst_rows(page: jax.Array, slot: jax.Array, page_size: int) -> jax.Array:
     return jnp.where(page < OOB_PAGE, page * page_size + slot, SKIP_ROW).astype(
         jnp.int32
     )
+
+
+def sharded_a2a_cap(
+    rows_local: int, *, num_seqs: int, dcp_size: int, interleave_size: int
+) -> int:
+    # Exact supremum over rows_local contiguous rows with <= num_seqs sequences:
+    # each sequence contributes <= (L_i + (dcp - 1) * il) // dcp rows to any rank.
+    raw = (rows_local + num_seqs * (dcp_size - 1) * interleave_size) // dcp_size
+    return min(rows_local, ((raw + 15) // 16) * 16)
+
+
+def sharded_a2a_fast_seq_limit(
+    rows_local: int, *, dcp_size: int, interleave_size: int
+) -> int:
+    if dcp_size <= 1:
+        return 0
+    headroom = SHARDED_A2A_FAST_CAP * dcp_size - rows_local + (dcp_size - 1)
+    if headroom <= 0:
+        return 0
+    return headroom // ((dcp_size - 1) * interleave_size)
+
+
+def build_sharded_dcp_a2a_plan(
+    rows_local: int,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    dcp_rank: jax.Array | int,
+    *,
+    page_size: int,
+    num_pages: int,
+    dcp_size: int,
+    interleave_size: int,
+    cap: int,
+    axis_name: str,
+) -> tuple[jax.Array, jax.Array]:
+    """Map rank-sharded local rows to per-owner send indices and received dst_rows."""
+    if dcp_size < 1 or interleave_size < 1:
+        raise ValueError(
+            f"dcp_size={dcp_size} and interleave_size={interleave_size} must be >= 1."
+        )
+    if page_size % interleave_size:
+        raise ValueError(
+            f"interleave_size={interleave_size} must divide page_size={page_size}."
+        )
+    tok = jnp.asarray(dcp_rank, dtype=jnp.int32) * jnp.int32(rows_local) + jnp.arange(
+        rows_local, dtype=jnp.int32
+    )
+    seq_id, pos, in_batch = _row_positions_for_tokens(tok, seq_lens, query_start_loc)
+    safe_pos = jnp.maximum(pos, 0)
+    virtual_page_size = page_size * dcp_size
+    cycle = dcp_size * interleave_size
+    offset = safe_pos % virtual_page_size
+    raw_page, ordinal_valid = _lookup_page(
+        block_tables, seq_lens.shape[0], seq_id, safe_pos // virtual_page_size
+    )
+    valid = (
+        in_batch
+        & (pos >= 0)
+        & ordinal_valid
+        & (raw_page >= 0)
+        & (raw_page < num_pages * dcp_size)
+    )
+    owner = jnp.where(valid, (offset % cycle) // interleave_size, jnp.int32(-1))
+    slot = (offset // cycle) * interleave_size + offset % interleave_size
+    dst_page = jnp.where(
+        valid, jnp.mod(raw_page, jnp.int32(num_pages)), jnp.int32(OOB_PAGE)
+    )
+
+    owners = jnp.arange(dcp_size, dtype=jnp.int32)[:, None]
+    csum = jnp.cumsum((owner[None, :] == owners).astype(jnp.int32), axis=1)
+    counts = csum[:, -1]
+    j = jnp.arange(cap, dtype=jnp.int32)[None, :, None]
+    if (
+        rows_local >= 2 * _SHARDED_COMPACT_BLOCK
+        and rows_local % _SHARDED_COMPACT_BLOCK == 0
+    ):
+        num_blocks = rows_local // _SHARDED_COMPACT_BLOCK
+        csum_b = csum.reshape(dcp_size, num_blocks, _SHARDED_COMPACT_BLOCK)
+        blk = jnp.sum(
+            (csum_b[:, :, _SHARDED_COMPACT_BLOCK - 1][:, None, :] <= j).astype(
+                jnp.int32
+            ),
+            axis=2,
+        )
+        blk_c = jnp.minimum(blk, num_blocks - 1)
+        d_idx = jnp.arange(dcp_size, dtype=jnp.int32)[:, None]
+        in_blk = jnp.sum((csum_b[d_idx, blk_c] <= j).astype(jnp.int32), axis=2)
+        send_idx = jnp.minimum(blk * _SHARDED_COMPACT_BLOCK + in_blk, rows_local - 1)
+    else:
+        send_idx = jnp.sum((csum[:, None, :] <= j).astype(jnp.int32), axis=2)
+        send_idx = jnp.minimum(send_idx, rows_local - 1)
+
+    keep = jnp.arange(cap, dtype=jnp.int32)[None, :] < counts[:, None]
+    send_page = jnp.where(keep, dst_page[send_idx], jnp.int32(OOB_PAGE))
+    send_slot = jnp.where(keep, slot[send_idx], jnp.int32(0))
+    send_dst = get_dst_rows(send_page, send_slot, page_size)
+    recv_dst = jax.lax.all_to_all(
+        send_dst, axis_name, split_axis=0, concat_axis=0, tiled=False
+    )
+    return send_idx, recv_dst

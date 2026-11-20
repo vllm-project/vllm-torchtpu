@@ -774,3 +774,46 @@ def test_should_accumulate_lead_partial_psum_in_float32_without_bf16_cancellatio
     np.testing.assert_allclose(got, expected_bf16, rtol=0.0, atol=1e-2)
     np.testing.assert_array_equal(got[2], 0.0)
     np.testing.assert_array_equal(got[3], 2.0)
+
+
+@pytest.mark.parametrize("stride_pages", [4, 12, 16, 24, 44])
+@pytest.mark.parametrize(
+    ("dcp", "il", "ps"),
+    [(16, 4, 256), (4, 4, 16), (3, 4, 24)],
+)
+def test_should_match_divmod_reference_for_flat_rows_power_of_two_and_fallback(
+    stride_pages: int, dcp: int, il: int, ps: int
+):
+    lay = tp.TokenParallelLayout(
+        dcp_size=dcp,
+        interleave_size=il,
+        page_size=ps,
+        split_rows=4,
+        max_pages=44,
+    )
+    rng = np.random.default_rng(1111 + stride_pages + dcp * 17)
+    raw = rng.integers(-4, dcp * ps * 10, size=(32, 64), dtype=np.int32)
+    pos = np.where(raw < 0, -1, raw).astype(np.int32)
+    # Include exact boundary positions around virtual pages and negative sentinels.
+    pos[0, :6] = np.array([-1, 0, il - 1, il, dcp * il, dcp * ps - 1], dtype=np.int32)
+    row_offsets = rng.integers(0, 4, size=(32,), dtype=np.int32)
+
+    got = np.asarray(
+        tp.flat_rows(
+            lay, jnp.asarray(pos), jnp.asarray(row_offsets), stride_pages=stride_pages
+        )
+    )
+    # Independent scalar reference oracle.
+    want = np.full_like(pos, -1)
+    vps = dcp * ps
+    for r in range(pos.shape[0]):
+        ro = int(row_offsets[r])
+        for c in range(pos.shape[1]):
+            p = int(pos[r, c])
+            if p >= 0:
+                owner = (p // il) % dcp
+                in_vp = p % vps
+                slot = (in_vp // (dcp * il)) * il + (in_vp % il)
+                page = owner * stride_pages + ro + (p // vps)
+                want[r, c] = page * ps + slot
+    np.testing.assert_array_equal(got, want)
