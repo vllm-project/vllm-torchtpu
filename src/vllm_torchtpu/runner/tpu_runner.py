@@ -164,7 +164,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
-from vllm_torchtpu.platforms.tpu_platform import mtp_kv_only_step0_config_reason
 from vllm_torchtpu.runner import (
     greedy_top_tokens,
     prompt_logprobs,
@@ -214,6 +213,7 @@ from vllm_torchtpu.spec_decode.adaptive_verification import (
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+from vllm_torchtpu.spec_decode.mtp_kv_only import mtp_kv_only_step0_config_reason
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     fit_rows,

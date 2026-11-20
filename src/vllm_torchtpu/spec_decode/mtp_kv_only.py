@@ -62,6 +62,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2MLAAttention,
 )
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -91,6 +92,34 @@ def _mtp_layer(
         DeepSeekMultiTokenPredictorLayer,
         predictor.layers[str(predictor.mtp_start_layer_idx)],
     )
+
+
+def mtp_kv_only_step0_config_reason(
+    vllm_config: VllmConfig, pcp_enabled: bool
+) -> str | None:
+    """Why this configuration keeps the MTP draft's single step-0 pass
+    (TPU_MTP_KV_ONLY_STEP0), or None when the draft may take the two passes.
+
+    Decided from the configuration alone, before any weights load, so every
+    process and pipeline stage agrees. Read by
+    `TpuPlatform.check_and_update_config` (the startup log), by the proposer
+    at load (whether to build the two passes) and by
+    `TPUModelRunner._warmup_mtp_prefill` (whether to add the two-pass warmup
+    step on every pipeline stage). The draft's own structure (one DSA MTP
+    layer, one MLA layer and one indexer cache) is checked when it loads
+    (`_layout_unsupported_reason`).
+    """
+    if not envs.TPU_MTP_KV_ONLY_STEP0:
+        return "TPU_MTP_KV_ONLY_STEP0 is 0"
+    spec = vllm_config.speculative_config
+    method = spec.method if spec is not None else None
+    if method != "mtp":
+        return f"the draft method is {method!r}"
+    # TODO: support PCP: it localizes the gather indices per rank, which
+    #   pass 2's row selection does not model yet.
+    if pcp_enabled:
+        return "prefill context parallelism is on"
+    return None
 
 
 def kv_only_unsupported_reason(mtp: nn.Module) -> str | None:

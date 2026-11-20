@@ -42,7 +42,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
-from vllm_torchtpu.platforms.tpu_platform import mtp_kv_only_step0_config_reason
+from vllm_torchtpu.spec_decode.mtp_kv_only import mtp_kv_only_step0_config_reason
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,

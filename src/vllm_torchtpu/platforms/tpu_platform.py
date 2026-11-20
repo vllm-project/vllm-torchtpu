@@ -363,38 +363,19 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
         )
 
 
-def mtp_kv_only_step0_config_reason(
-    vllm_config: "VllmConfig", pcp_enabled: bool
-) -> str | None:
-    """Why this configuration keeps the MTP draft's single step-0 pass
-    (TPU_MTP_KV_ONLY_STEP0), or None when the draft may take the two passes.
-
-    Read before any weights load (`TpuPlatform.check_and_update_config`) and
-    by the proposer at load. The draft's own structure (one DSA MTP layer,
-    one MLA layer and one indexer cache) is checked when it loads
-    (spec_decode/mtp_kv_only.py).
-    """
-    if not envs.TPU_MTP_KV_ONLY_STEP0:
-        return "TPU_MTP_KV_ONLY_STEP0 is 0"
-    spec = vllm_config.speculative_config
-    method = spec.method if spec is not None else None
-    if method != "mtp":
-        return f"the draft method is {method!r}"
-    # TODO: support PCP: it localizes the gather indices per rank, which
-    #   pass 2's row selection does not model yet.
-    if pcp_enabled:
-        return "prefill context parallelism is on"
-    return None
-
-
 def _log_mtp_kv_only_step0(vllm_config: "VllmConfig", pcp_enabled: bool) -> None:
-    """Say up front when an MTP draft keeps the single step-0 pass."""
-    spec = vllm_config.speculative_config
-    if spec is None or spec.method != "mtp":
+    """Say up front when a draft keeps the single step-0 pass
+    (TPU_MTP_KV_ONLY_STEP0)."""
+    if vllm_config.speculative_config is None:
         return
+    # MTP draft logic; imported only when there is a draft.
+    from vllm_torchtpu.spec_decode.mtp_kv_only import (
+        mtp_kv_only_step0_config_reason,
+    )
+
     reason = mtp_kv_only_step0_config_reason(vllm_config, pcp_enabled)
     if reason is not None:
-        logger.info("MTP draft step 0 keeps the single pass: %s.", reason)
+        logger.info("MTP KV-only draft step 0 is off: %s.", reason)
 
 
 def _validate_lora_config(vllm_config: "VllmConfig") -> None:
