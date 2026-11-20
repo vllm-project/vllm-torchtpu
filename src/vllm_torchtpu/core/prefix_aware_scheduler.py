@@ -295,6 +295,8 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
                 self.waiting.prepend_request(request)
         if self.short_prompt_tokens is not None:
             self._note_admitted_prompts(output)
+        elif self.hold_shared_prefix:
+            self._forget_requests_that_left_waiting()
         if self.follow_shared_prefix:
             self._restore_rejoined_places()
         return output
@@ -403,7 +405,9 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
             or request.skip_reading_prefix_cache
         ):
             return None
-        cached = self._cached_prefix_tokens(request) // self.hash_block_size
+        cached = (request.num_tokens - self._uncached_once(request)) // (
+            self.hash_block_size
+        )
         readable = (request.num_tokens - 1) // self.hash_block_size
         for prefill in prefills:
             index = max(cached, prefill.num_computed_tokens // self.hash_block_size)
@@ -533,7 +537,6 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
             self._uncached_admitted.setdefault(
                 new.req_id, request.num_prompt_tokens - new.num_computed_tokens
             )
-            self._uncached_by_request.pop(new.req_id, None)
         self._forget_requests_that_left()
 
     def _forget_requests_that_left(self) -> None:

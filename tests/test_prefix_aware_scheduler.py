@@ -1272,6 +1272,22 @@ def test_a_waiting_prompt_skips_the_chunk_a_follower_computes(monkeypatch):
     assert prefilled(both, "child") == BLOCK
 
 
+@pytest.mark.parametrize("short_first", [False, True])
+def test_a_held_prompt_is_looked_up_once(monkeypatch, short_first):
+    scheduler = short_first_scheduler(monkeypatch, on=short_first, hold=True)
+    parent_and_child(scheduler)
+    lookups = []
+    look_up = scheduler._look_up_uncached
+    scheduler._look_up_uncached = lambda request: lookups.append(
+        request.request_id
+    ) or look_up(request)
+    for _ in range(3):
+        assert "child" not in step(scheduler)
+    assert lookups == ["child"]
+    prefilled(scheduler, "child")
+    assert scheduler._uncached_by_request == {}
+
+
 def test_a_long_prefill_a_prompt_waits_for_keeps_its_full_chunk(monkeypatch):
     scheduler = short_first_scheduler(monkeypatch, hold=True)
     two_long_prefills(scheduler)
