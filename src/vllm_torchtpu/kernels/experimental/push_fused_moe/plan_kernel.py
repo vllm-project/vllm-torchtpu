@@ -106,12 +106,29 @@ def _tables(r3, seg3, me, *, ep, g, n_pre, tile_m, light_prepush=0):
     local_base = _lane_excl_cumsum(ea)
 
     # Visit lists: experts with rows, most rows first, ties by index
-    # (v2's expert_visit_list key, ranked by compare).
-    key = jnp.where(real, lane - ea * g, i32(2**30))
-    rank = zero
+    # (v2's expert_visit_list key, ranked by compare). From here on the
+    # visit tables are worked in the [e or v, d] layout they are stored in
+    # (experts, then visits, on sublanes): rank is a permutation of [0, g)
+    # over each destination's experts, so expert e of destination d lands on
+    # sublane rank[d, e] by selects alone (gathering per visit instead costs
+    # a cross-lane reduction per visit and table).
+    gr = -(-g // 8) * 8
+    sub = lax.broadcasted_iota(i32, (gr, LANES), 0)
+    col = lax.broadcasted_iota(i32, (gr, LANES), 1)  # destination d
+
+    def to_t(x):
+        return _transpose(x)[:gr]
+
+    def row_of(x, e):
+        return jnp.broadcast_to(x[e : e + 1], (gr, LANES))
+
+    ea_t = to_t(ea)
+    real_t = (sub < g) & (col < ep)
+    key = jnp.where(real_t, sub - ea_t * g, i32(2**30))
+    rank = jnp.zeros((gr, LANES), i32)
     for e in range(g):
-        rank = rank + (key[:, e : e + 1] < key).astype(i32)
-    n_visit = jnp.sum((real & (ea > 0)).astype(i32), 1, keepdims=True)  # [d, 1]
+        rank = rank + (row_of(key, e) < key).astype(i32)
+    n_visit = jnp.sum((real_t & (ea_t > 0)).astype(i32), 0, keepdims=True)  # [1, d]
     if light_prepush:
         # The SparseCore pre-push carries the n_pre LIGHTEST experts with
         # rows (lightest at 0), so it moves the fewest bytes. The rest follow
@@ -134,49 +151,38 @@ def _tables(r3, seg3, me, *, ep, g, n_pre, tile_m, light_prepush=0):
         rank = jnp.where(
             light, n_visit - 1 - rank, jnp.where(rank < m, rest + n_lp, rank)
         )
-    visit = zero
-    for v in range(g):
-        col = jnp.sum(_sel(real & (rank == v), lane), 1, keepdims=True)
-        visit = jnp.where(lane == v, jnp.minimum(col, g - 1), visit)
-    live = real & (lane < n_visit)
-
-    def by_visit(tbl):
-        out = zero
-        for v in range(g):
-            hit = (lane == visit[:, v : v + 1]) & real
-            col = jnp.sum(_sel(hit, tbl), 1, keepdims=True)
-            out = jnp.where(lane == v, col, out)
-        return _sel(live, out)  # [d, v]
-
-    cnt = by_visit(mine)
-    src_off = by_visit(seg3)
-    dst_row = by_visit(local_base + run_me)
-    seg_a = (row << 24) | (visit << 16) | cnt
-    seg_a = jnp.where(real, seg_a, 0)
-    seg_c = _sel(cnt > 0, dst_row)
+    tables = [to_t(x) for x in (mine, seg3, local_base + run_me)]
+    visit_t = jnp.zeros((gr, LANES), i32)
+    got = [visit_t] * len(tables)
+    for e in range(g):
+        hit = sub == row_of(rank, e)
+        visit_t = jnp.where(hit, e, visit_t)
+        got = [jnp.where(hit, row_of(x, e), o) for x, o in zip(tables, got)]
+    live_t = (sub < n_visit) & (col < ep)  # [v, d]
+    cnt_t, src_off_t, dst_t = (_sel(live_t, x) for x in got)
+    seg_a_t = jnp.where(sub < g, (col << 24) | (visit_t << 16) | cnt_t, 0)
+    seg_c_t = _sel(cnt_t > 0, dst_t)
     recv = jnp.sum(r_dme, 0, keepdims=True)  # [1, e]
-    remote = _sel(row != me, cnt)
-    my_visit = jnp.sum(_sel(row == me, visit), 0, keepdims=True)  # [1, v]
-    me_live = jnp.sum(_sel(row == me, live.astype(i32)), 0, keepdims=True) > 0
+    my_visit = jnp.sum(_sel(row == me, _transpose(visit_t)[:ep]), 0, keepdims=True)
     lane1 = lane[:1]
-    rows_at_v = jnp.zeros((1, LANES), i32)
-    for v in range(g):
-        hit = lane1 == my_visit[:, v : v + 1]
-        val = jnp.sum(_sel(hit, recv), 1, keepdims=True)
-        rows_at_v = jnp.where(lane1 == v, val, rows_at_v)
-    rows_at_v = _sel(me_live, rows_at_v)
-    remote_v = jnp.sum(remote, 0, keepdims=True)  # [1, v]
-    pre = lane1 < n_pre
-    odd = (lane1 & 1) == 1
     real1 = lane1 < g
+    # rows_at_v (rows this shard receives at its visit v), summed over the
+    # pre-push positions straight from the expert layout: column me of rank
+    # is my visit of each expert.
+    recv_t = jnp.sum(to_t(r_dme), 1, keepdims=True)  # [e, 1]
+    at_me = (col == me) & (sub < g) & (rank < n_visit)
+    pre_e = at_me & (rank < n_pre)
+    odd_e = (rank & 1) == 1
+    pre_v = (col != me) & (sub < n_pre)
+    odd_v = (sub & 1) == 1
     sc = [
-        jnp.sum(_sel(pre & ~odd & real1, rows_at_v)),
-        jnp.sum(_sel(pre & odd & real1, rows_at_v)),
-        jnp.sum(_sel(pre & ~odd & real1, remote_v)),
-        jnp.sum(_sel(pre & odd & real1, remote_v)),
+        jnp.sum(_sel(pre_e & ~odd_e, recv_t)),
+        jnp.sum(_sel(pre_e & odd_e, recv_t)),
+        jnp.sum(_sel(pre_v & ~odd_v, cnt_t)),
+        jnp.sum(_sel(pre_v & odd_v, cnt_t)),
     ]
-    n_remote = jnp.sum(_sel((lane1 >= n_pre) & real1, remote_v))
-    n_sent = jnp.sum(cnt)
+    n_remote = jnp.sum(_sel((col != me) & (sub >= n_pre), cnt_t))
+    n_sent = jnp.sum(cnt_t)
     vec = jnp.zeros((1, LANES), i32)
     for j, val in enumerate(sc):
         vec = jnp.where(lane1 == j, val, vec)
@@ -260,7 +266,7 @@ def _tables(r3, seg3, me, *, ep, g, n_pre, tile_m, light_prepush=0):
     run_base = run_start_se + slab_base
 
     return dict(
-        seg=(_transpose(seg_a), _transpose(src_off), _transpose(seg_c)),
+        seg=(seg_a_t, src_off_t, seg_c_t),
         small=(meta, my_visit, counts_sc, expert_rows, slab_base),
         kernel_tables=(
             run_start_t >> ROWBLK_SHIFT,
