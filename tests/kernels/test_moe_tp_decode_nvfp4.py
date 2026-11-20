@@ -505,11 +505,34 @@ def _metrics(
 )
 @pytest.mark.parametrize(
     "rows, admitted",
-    [(16, True), (32, True), (64, True), (8, False), (48, False), (128, False)],
+    # 128 (an NVFP4-only row count) depends on the layout; see below.
+    [(16, True), (32, True), (64, True), (8, False), (48, False), (160, False)],
 )
 def test_admits_decode_buckets(monkeypatch, cfg, rows, admitted):
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
     shapes = _shapes(rows, cfg)
+    assert (
+        kernel.can_use_moe_tp_decode_nvfp4(*shapes, topk=cfg["topk"], n_ranks=N_RANKS)
+        is admitted
+    )
+
+
+@pytest.mark.parametrize(
+    "cfg, admitted",
+    [
+        (SMALL_TP8, True),
+        (SMALL_EP2TP4, True),
+        # EP2xTP4 with 512-column w2 blocks fits VMEM at 128 rows; TP8 and the
+        # 256-column w2 blocks do not.
+        (GLM52_EP2TP4, True),
+        (GLM52_TP8, False),
+        (GLM52_EP2TP4_B256, False),
+    ],
+)
+def test_admits_128_rows_where_vmem_fits(monkeypatch, cfg, admitted):
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    assert kernel.ROW_BUCKETS[-1] == 128
+    shapes = _shapes(128, cfg)
     assert (
         kernel.can_use_moe_tp_decode_nvfp4(*shapes, topk=cfg["topk"], n_ranks=N_RANKS)
         is admitted
@@ -630,11 +653,17 @@ def test_default_vmem_headroom_and_kernel_name(monkeypatch):
                 info,
                 spec,
             )
-            assert plan_def is not None
-            assert cap_bytes - plan_def[1] >= 11 * 2**20
-            assert kernel.can_use_moe_tp_decode_nvfp4(
+            admitted = kernel.can_use_moe_tp_decode_nvfp4(
                 *shps, topk=cfg["topk"], n_ranks=N_RANKS
             )
+            assert admitted == (plan_def is not None)
+            if rows <= 64:
+                assert admitted
+                assert cap_bytes - plan_def[1] >= 11 * 2**20
+            # The larger row counts are admitted exactly when their plan fits
+            # the cap; on TPU7x EP2xTP4 plans 128 rows with 0.2 MiB to spare and
+            # TP8 does not fit.
+            assert admitted or (rows == 128 and cfg is GLM52_TP8)
 
 
 def test_kept_levers_tpu7x_lowering(monkeypatch):
@@ -695,7 +724,8 @@ def test_kept_levers_tpu7x_lowering(monkeypatch):
             assert "tpu_custom_call" in hlo
 
 
-def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
+@pytest.mark.parametrize("m", [16, 128])  # 128: the NVFP4-only row count
+def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch, m):
     """Execute ``_kernel`` directly on CPU across partial/tail active counts,
     verifying ``fast=True`` vs ``fast=False`` and ``w2_n_chunk`` 0-ULP bitwise
     identity plus clean semaphore pairing and NaN-poisoned padding masking."""
@@ -843,7 +873,7 @@ def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
     monkeypatch.setattr(all_reduce, "prologue", lambda spec: None)
     monkeypatch.setattr(all_reduce, "epilogue", fake_epilogue)
 
-    m, h, fs, topk = 16, 1024, 128, 4
+    h, fs, topk = 1024, 128, 4
     b13, b2 = h // Q_BLOCK, 1
     nb = kernel._NUM_BUFFERS
     for cfg_i, el, counts in (
@@ -1567,6 +1597,8 @@ def _eval_oracles(mesh: Mesh, cfg: dict, sharded_weights, x, scores, bias, n_val
         (64, 8),
         (64, 33),
         (64, 64),
+        (128, 97),
+        (128, 128),
     ],
 )
 def test_small_shape_kernel_padding_and_buckets(rows: int, n_valid: int):
@@ -4086,6 +4118,109 @@ def test_selftest_covers_only_untested_buckets(monkeypatch):
     nvfp4_runner2 = h.make_runner("model.layers.1.mlp", "nvfp4")
     h.arm_in_runner_order(h.Model(nvfp4_runner2))
     assert len(tested) == 1
+
+
+@pytest.mark.parametrize(
+    "flag, on, rows",
+    [
+        # Unset / off: the row counts up to 64, although this layer's VMEM plan
+        # fits 128 rows.
+        (None, False, (16, 32, 64)),
+        ("0", False, (16, 32, 64)),
+        ("1", True, kernel.ROW_BUCKETS),  # every row count fits VMEM here
+    ],
+)
+def test_rows_above_64_flag_sets_admitted_row_counts(monkeypatch, flag, on, rows):
+    """TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64 adds the row counts above 64 to
+    what arming admits and reaches the op body through the statics."""
+    h = _build_precedence_harness(monkeypatch)
+    if flag is None:
+        monkeypatch.delenv("TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64", raising=False)
+    else:
+        monkeypatch.setenv("TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64", flag)
+    admitted = h.pm.adapter._admit(
+        h.make_runner("model.layers.0.mlp", "nvfp4"), N_RANKS
+    )
+    assert admitted.rows == tuple(rows)
+    assert admitted.statics.rows_above_64 is on
+
+
+def test_default_row_counts_stay_at_64_when_the_fp8_kernel_grows(monkeypatch):
+    """With TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64 off, the NVFP4 op stays at up
+    to 64 rows even when the FP8 kernel gains larger row counts (e.g. 80 / 96):
+    those, like 128, change which path 65-128-token steps take and need the
+    flag."""
+    from vllm_torchtpu.layers.adapter import moe_tp_decode_nvfp4 as adapter
+
+    assert adapter._row_buckets(False) == (16, 32, 64)
+    monkeypatch.setattr(kernel, "ROW_BUCKETS", (16, 32, 64, 80, 96, 128))
+    assert adapter._row_buckets(False) == (16, 32, 64)
+    assert adapter._row_buckets(True) == (16, 32, 64, 80, 96, 128)
+
+
+@pytest.mark.parametrize("on", [False, True])
+@pytest.mark.parametrize(
+    "cfg, fits_128",
+    [
+        (SMALL_TP8, True),
+        (SMALL_EP2TP4, True),
+        (GLM52_EP2TP4, True),
+        (GLM52_TP8, False),
+        (GLM52_EP2TP4_B256, False),
+    ],
+)
+def test_op_body_runs_128_rows_with_the_flag_where_vmem_fits(
+    monkeypatch, cfg, fits_128, on
+):
+    """At 128 tokens the NVFP4 op runs the decode kernel only with
+    TPU_MOE_TP_DECODE_NVFP4_ROWS_ABOVE_64 on and a VMEM plan that fits 128 rows,
+    else _tp_chain + psum; with the flag off every layout dispatches as before
+    the 128-row count."""
+    pm = _build_precedence_harness(monkeypatch).pm
+    tags: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        pm.adapter.kernel,
+        "moe_tp_decode_nvfp4",
+        lambda x_in, *_a, **_k: tags.append(("nvfp4_kernel", x_in.shape[0]))
+        or jnp.zeros_like(x_in),
+    )
+    monkeypatch.setattr(
+        pm.fp8_decode,
+        "_tp_chain",
+        lambda x_in, *_a, **_k: tags.append(("tp_chain", x_in.shape[0]))
+        or jnp.zeros_like(x_in),
+    )
+    body = pm.adapter._op_body(
+        pm.adapter._OpStatics(
+            topk=cfg["topk"],
+            routed_scale=ROUTED_SCALE,
+            activation="silu",
+            use_sparse_core=False,
+            onehot_threshold=0,
+            use_ep=cfg["ep"] > 1,
+            rows_above_64=on,
+        ),
+        n_ranks=N_RANKS,
+        axis="d",
+    )
+    sds = jax.ShapeDtypeStruct
+    for n_tok in (64, 128, 160):
+        x, scores, bias, *weights = _shapes(n_tok, cfg)
+        ops = (
+            x,
+            scores,
+            bias,
+            sds((n_tok,), jnp.bool_),
+            *weights,
+            sds((1, 1), jnp.int32),
+            sds((1, 1), jnp.int32),
+        )
+        # Trace only: the GLM-5.2 weights are not materialized.
+        jax.eval_shape(
+            jax.vmap(body, axis_name="d"), *(sds((2, *a.shape), a.dtype) for a in ops)
+        )
+    at_128 = "nvfp4_kernel" if on and fits_128 else "tp_chain"
+    assert tags == [("nvfp4_kernel", 64), (at_128, 128), ("tp_chain", 160)]
 
 
 def test_c1_pre_load_admission_preserves_block16_and_bit_exact_fallback(monkeypatch):

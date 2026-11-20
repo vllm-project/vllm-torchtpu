@@ -87,6 +87,9 @@ _HASHES = {
     ("nvfp4", "ep2tp4", 64, (("fast", True),)): (
         "dfc287b95def0bb0760398782cc8e1a14349e441ef5d3a90208e3bc6550e7184"
     ),
+    ("nvfp4", "ep2tp4", 128, (("fast", True),)): (
+        "6eac72a7695e7261e54bc2e4a552ff7ccde0feb044de8e39602be2bc8fc5c53c"
+    ),
     ("nvfp4", "ep2tp4", 16, (("fast", True), ("split_meta", False))): (
         "d8a11b24ead52db1a8ae8e0f72f6a4ef1ab83eb2e6640dc9062ad1e8532514c6"
     ),
