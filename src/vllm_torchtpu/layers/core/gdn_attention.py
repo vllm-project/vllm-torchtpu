@@ -25,6 +25,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 from vllm import envs
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
     pcp_wrapper as gdn_pcp_fused_wrapper,
 )
@@ -33,7 +34,10 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     derive_gdn_head_geometry,
 )
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_mesh_shape_product
+
+logger = init_logger(__name__)
 
 _GDN_TP_AXIS_NAME = "tp"
 
@@ -822,6 +826,45 @@ def _as_logical_block_pool(
     return recurrent_state.reshape(-1, pool_block_tokens, *pool_shape[2:])
 
 
+@functools.cache
+def gdn_pooled_form() -> str:
+    """The V3 pooled kernel form selected by `TPU_GDN_TABLES_IN_KERNEL`."""
+    form = "tables" if tpu_envs.TPU_GDN_TABLES_IN_KERNEL else "two_calls"
+    logger.info("GDN pooled kernel form: %s", form)
+    return form
+
+
+# Tables form minus two calls per layer call at Qwen3.5-397B TP8 (8 local
+# value heads): -1.1..-2.5 us at 8-32 decode rows for every max_seqs 8-64 and
+# -2.6..-3.0 us under speculation (j-3dd2292f), -1.1/-2.0 us at 48 rows, and
+# +2..+3 us at 64 rows, where the one call carrying a 64-row per-sequence tile
+# is 8 us slower every second call (j-90103bc4).
+_TABLES_FORM_MAX_ROWS = 48
+# At 64 local value heads (DP8) it is -2..-5 us at 8 and 64-256 rows but +5 us
+# at 16 and 32 (j-82796d57), which no row bound separates: two calls there.
+_TABLES_FORM_MAX_LOCAL_V_HEADS = 8
+
+
+@functools.cache
+def gdn_pooled_form_for_step(form: str, rows: int, n_v: int) -> str:
+    """`form` narrowed to the steps where the tables form measured faster.
+
+    `rows` is the step's padded row bucket and `n_v` the local value heads,
+    both static per compiled step.
+    """
+    if form != "tables":
+        return form
+    if rows > _TABLES_FORM_MAX_ROWS or n_v > _TABLES_FORM_MAX_LOCAL_V_HEADS:
+        form = "two_calls"
+    logger.info(
+        "GDN pooled kernel form at %d rows, %d local value heads: %s",
+        rows,
+        n_v,
+        form,
+    )
+    return form
+
+
 def run_jax_gdn_attention_pooled_local(
     mixed_qkv: jnp.ndarray,
     b: jnp.ndarray,
@@ -848,6 +891,7 @@ def run_jax_gdn_attention_pooled_local(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    gdn_form: str = "two_calls",
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
@@ -886,6 +930,7 @@ def run_jax_gdn_attention_pooled_local(
         num_spec_tokens=num_spec_tokens,
         prefill_ckpt_offsets=prefill_ckpt_offsets,
         prefill_ckpt_indices=prefill_ckpt_indices,
+        gdn_form=gdn_pooled_form_for_step(gdn_form, mixed_qkv.shape[0], n_v),
     )
     return pool.reshape(pool_shape), output
 
@@ -917,6 +962,7 @@ def run_jax_gdn_attention_pooled(
     num_spec_tokens: int = 0,
     prefill_ckpt_offsets: jnp.ndarray | None = None,
     prefill_ckpt_indices: jnp.ndarray | None = None,
+    gdn_form: str = "two_calls",
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -953,6 +999,8 @@ def run_jax_gdn_attention_pooled(
           checkpoint query offsets (0 for none).
         prefill_ckpt_indices: Optional (max_reqs,) int32 destination block IDs
           for prefill checkpoints (-1 for none).
+        gdn_form: V3 pooled kernel form, from `gdn_pooled_form()`, narrowed per
+          step by `gdn_pooled_form_for_step`.
 
     Returns:
         A tuple containing:
@@ -1026,6 +1074,7 @@ def run_jax_gdn_attention_pooled(
         pool_block_tokens=pool_block_tokens,
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
+        gdn_form=gdn_form,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,
