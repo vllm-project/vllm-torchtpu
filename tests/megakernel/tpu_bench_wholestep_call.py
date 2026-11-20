@@ -101,7 +101,7 @@ def main():
                     help="key-stream kernel pages per DMA (VLLM_TPU_MEGAKERNEL wholekeymp=N; needs "
                     "--kb 512 for N > 1: a 512-token block column holds 4 consecutive pages)")
     ap.add_argument("--key-slots", type=int, default=2,
-                    help="key-stream ring slots (VLLM_TPU_MEGAKERNEL wholekeyslots=N)")
+                    help="key-stream ring slots (VLLM_TPU_MEGAKERNEL wholekeyslots=N; -1 = auto)")
     ap.add_argument("--kb", type=int, default=128, choices=(128, 512),
                     help="pool block tokens (the served tables address 512-token blocks)")
     ap.add_argument("--score-arm", default="", choices=("", "dma", "compute"),
@@ -225,7 +225,7 @@ def main():
                 pages_per_seq=pps,
                 carrier="fp8",
                 n_layers=n_att,
-                **indexed_options(),
+                **indexed_options(B),
             ),
             hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
         )
@@ -235,7 +235,7 @@ def main():
             specs.append(wholestep_spec(
                 g, R, L=1, first="qsa", pool_gdn=True, qsa=dict(budget=a.budget), step=True,
                 indexed=dict(max_groups=a.max_groups, pages_per_seq=pps, carrier="fp8",
-                             n_layers=1, **indexed_options()),
+                             n_layers=1, **indexed_options(B)),
                 hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
             ))
         key = jax.random.PRNGKey(0)

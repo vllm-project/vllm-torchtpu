@@ -89,8 +89,23 @@ UNION_PHYS: bool = False
 KEY_MP: int = 0
 # `...,wholekeyslots=N` (N > 2): the key stream's ring has N slots, so N - 1 chunks of 32
 # kernel pages are in flight while one is scored (`QSAFullIndexedBlock.key_slots`). Same keys,
-# same scores.
+# same scores. `wholekeyslots=auto` (KEY_SLOTS_AUTO): the most slots that fit scoped VMEM in
+# the row bucket (`key_slots_for`).
 KEY_SLOTS: int = 2
+KEY_SLOTS_AUTO = -1
+
+
+def key_slots_for(B: int | None) -> int:
+    """Key-ring slots of the `B`-row whole-step kernel. `auto`: 4 up to 48 rows, 3 above.
+    Each slot is 512 KiB of VMEM; measured with tpu_bench_wholestep_call (200K context, served
+    MK env): 4 slots fit at b8-b32 (b16 with ~20 KiB to spare; 5 slots: 62.49M of 62.01M) and
+    at b48 under main-KV DCP-2, and are 0.39 MiB over at b64 under DCP-2 (62.39M of 62.06M),
+    where 3 fit. Without a bucket (the operand-packing spec, which has no scratch): 2."""
+    if KEY_SLOTS != KEY_SLOTS_AUTO:
+        return KEY_SLOTS
+    if B is None:
+        return 2
+    return 4 if B <= 48 else 3
 
 
 def union_stats_on() -> bool:
@@ -102,9 +117,9 @@ def compressed_dcp() -> bool:
     return main_kv_dcp() > 1 and bool(envs.VLLM_TPU_QSA_COMPRESSED_DCP)
 
 
-def indexed_options() -> dict:
+def indexed_options(B: int | None = None) -> dict:
     """The served indexer options (`LONG_CONTEXT`, the request-sharded selection, union attention,
-    the main-KV DCP size, compressed-key DCP)."""
+    the main-KV DCP size, compressed-key DCP) of the `B`-row kernel (key-ring slots)."""
     return dict(
         LONG_CONTEXT, shard_index=SHARD_INDEX, union_attn=UNION_ATTN, union_stats=union_stats_on(),
         loop_requests=LOOP_REQUESTS, union_phys=UNION_ATTN and UNION_PHYS, dcp=main_kv_dcp(),
@@ -113,7 +128,7 @@ def indexed_options() -> dict:
         xreq_prefetch=envs.VLLM_TPU_MK_QSA_XREQ_PREFETCH,
         select_nvis=envs.VLLM_TPU_MK_QSA_SELECT_NVIS,
         manager_pages=KEY_MP,
-        key_slots=KEY_SLOTS,
+        key_slots=key_slots_for(B),
     )
 
 
@@ -341,7 +356,7 @@ def build_wholestep_call(
                 pages_per_seq=pps,
                 carrier="fp8",
                 n_layers=n_layers,
-                **indexed_options(),
+                **indexed_options(B),
                 **main_call_options(),
             ),
             hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
