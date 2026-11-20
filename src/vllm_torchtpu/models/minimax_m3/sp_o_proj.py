@@ -203,7 +203,7 @@ def sp_o_proj(o_proj: nn.Module, attn: torch.Tensor, pieces: int = 1) -> torch.T
     TPU_MINIMAX_M3_SP_A2A_E4M3 sends the heads as e4m3 rows (power-of-two
     row scales) and contracts e4m3 x e4m3, one all-to-all and o_proj per
     row piece of the shard (``pieces``), so a piece's o_proj can run while
-    the next piece crosses."""
+    the next piece crosses; the bf16 path ignores ``pieces``."""
     tp = get_tp_group().world_size
     rows, k = attn.shape
     w = _full_weight(o_proj, tp)

@@ -336,18 +336,21 @@ def _piece_major_rows(
 
 
 def _ffn_pieces(shard_rows: int, tp_size: int) -> int:
-    """Row pieces of an SP layer's FFN gathers (TPU_MINIMAX_M3_SP_FFN_PIECES
-    on steps of at least TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS tokens); 1
-    unless every piece keeps whole sp_norm row blocks."""
+    """Row pieces of an SP layer's gathers (TPU_MINIMAX_M3_SP_FFN_PIECES on
+    steps of at least TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS tokens); 1
+    unless every piece keeps whole 32-row e4m3 tiles (a piece that does not
+    fill whole sp_norm blocks takes the unfused norm, as such a shard does)."""
     pieces = envs.TPU_MINIMAX_M3_SP_FFN_PIECES
     if (
         pieces <= 1
         or shard_rows * tp_size < envs.TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS
+        or shard_rows % (pieces * _PIECE_ROW_TILE)
     ):
         return 1
-    if shard_rows % (pieces * sp_norm.BLOCK_ROWS):
-        return 1
     return pieces
+
+
+_PIECE_ROW_TILE = 32
 
 
 _FP8_MAX = 448.0
