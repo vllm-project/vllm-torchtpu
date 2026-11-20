@@ -193,7 +193,6 @@ from vllm_torchtpu.runner import (
 from vllm_torchtpu.runner import fast_forward_context as _ffc
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
-from vllm_torchtpu.runner.fast_forward_context import fast_set_forward_context
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -5490,7 +5489,11 @@ class TPUModelRunner(GPUModelRunner):
                     num_reqs=num_reqs,
                     **trace_kwargs,
                 ),
-                (fast_set_forward_context if _ffc.enabled() else set_forward_context)(
+                (
+                    _ffc.fast_set_forward_context
+                    if _ffc.enabled()
+                    else set_forward_context
+                )(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens_padded,

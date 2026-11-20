@@ -91,6 +91,7 @@ def test_cached_context_matches_stock_and_swaps_metadata():
         f2 = _fields(second)
     s_d, s_dp = stock
     f_d, f_dp = f2
+    assert f_dp == s_dp
     assert f_d.keys() == s_d.keys()
     for k in s_d:
         if k == "additional_kwargs":
