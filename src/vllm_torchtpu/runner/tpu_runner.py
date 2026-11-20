@@ -115,6 +115,8 @@ from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import (
     dp_vocab_parallel,
     expert_placement,
+    sequence_parallel,
+    small_all_reduce_op,
     token_padding,
 )
 from vllm_torchtpu.layers.adapter.attention import (
@@ -1207,6 +1209,9 @@ class TPUModelRunner(GPUModelRunner):
 
         self.speculative_config = self.vllm_config.speculative_config
         speculative_config = self.speculative_config
+        # Before the model loads: the sequence-parallel row threshold depends
+        # on whether a drafter runs (sequence_parallel.gates_rows).
+        sequence_parallel.set_has_drafter(speculative_config is not None)
         # The producer populates draft context KV without generating proposals.
         self._is_dspark_pd_producer = bool(
             transfer_config is not None
@@ -6406,6 +6411,7 @@ class TPUModelRunner(GPUModelRunner):
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()
+        small_all_reduce_op.prebuild(self.vllm_config)
 
     def _initialize_quantization_kernels(self):
         from vllm_torchtpu.layers.adapter.linear_common import (
@@ -6767,13 +6773,11 @@ class TPUModelRunner(GPUModelRunner):
                 layer_name: attn_metadata for layer_name in self._attn_layer_names
             }
 
-        padding_state = getattr(self, "_token_padding_state", None)
-        if padding_state is not None:
-            # Every row of a warmup step is padding; a profile step's real
-            # tokens are its requests' query tokens.
-            padding_state.update(
-                sum(profile_query_lens) if profiling else 0, num_tokens
-            )
+        # Every row of a warmup step is padding; a profile step's real
+        # tokens are its requests' query tokens.
+        self._token_padding_update(
+            num_tokens, sum(profile_query_lens) if profiling else 0
+        )
         self._record_input_staging_fence()
         intermediate_tensors = None
         if through_handoff:
@@ -9165,18 +9169,52 @@ class TPUModelRunner(GPUModelRunner):
                 )
         self._refresh_smem_request_caps(kv_cache_config)
 
-    def _token_padding_update(self, num_tokens_padded: int) -> None:
-        """Record which of this step's token rows are padding."""
+    def _token_padding_update(
+        self,
+        num_tokens_padded: int,
+        num_valid_tokens: int | None = None,
+        rows_sliced: bool | None = None,
+    ) -> None:
+        """Record which of this step's token rows are padding.
+
+        `num_valid_tokens` is the step's real token count; None takes it from
+        the sequence layout plan (the ALL layout only, else no row is
+        padding). `rows_sliced` says whether the forward about to run slices
+        its rows over TP (each rank owns `num_tokens_padded // tp` rows): the
+        mask is then this rank's slice. Otherwise it covers all
+        `num_tokens_padded` rows, which every rank holds. None takes the
+        decision the target forward makes, `sequence_parallel.step_rows_are_sliced`:
+        sliced only when the step is sequence-parallel and the model follows
+        each step's form. A model that does not (main's forwards) gets the full
+        mask, as on main, because its MoE paths read the mask over all of a
+        step's rows: written for a forward that reads every row, the per-rank
+        slice marks other ranks' real rows as padding and the MoE drops their
+        experts.
+        """
         padding_state = getattr(self, "_token_padding_state", None)
         if padding_state is None:
             return
-        plan = self._last_sequence_layout_plan
-        if plan is not None and plan.kind is SequenceLayoutKind.ALL:
-            num_valid_tokens = min(plan.local_num_tokens, num_tokens_padded)
+        if num_valid_tokens is not None:
+            valid_tokens = min(num_valid_tokens, num_tokens_padded)
         else:
-            # Padding-mask support is currently limited to the ALL layout.
-            num_valid_tokens = num_tokens_padded
-        padding_state.update(num_valid_tokens, num_tokens_padded)
+            plan = self._last_sequence_layout_plan
+            if plan is not None and plan.kind is SequenceLayoutKind.ALL:
+                valid_tokens = min(plan.local_num_tokens, num_tokens_padded)
+            else:
+                # Padding-mask support is currently limited to the ALL layout.
+                valid_tokens = num_tokens_padded
+        tp_size = self.parallel_config.tensor_parallel_size
+        if rows_sliced is None:
+            rows_sliced = sequence_parallel.step_rows_are_sliced(num_tokens_padded)
+        if rows_sliced and tp_size > 1:
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            chunk = num_tokens_padded // tp_size
+            tp_rank = get_tensor_model_parallel_rank()
+            rank_valid = max(0, min(chunk, valid_tokens - tp_rank * chunk))
+            padding_state.update(rank_valid, chunk)
+        else:
+            padding_state.update(valid_tokens, num_tokens_padded)
 
     def forward_model(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
@@ -9184,6 +9222,9 @@ class TPUModelRunner(GPUModelRunner):
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
         kwargs = {}
+        sequence_parallel.set_active(
+            sequence_parallel.step_is_sequence_parallel(positions.shape[-1])
+        )
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
         out = self.model(

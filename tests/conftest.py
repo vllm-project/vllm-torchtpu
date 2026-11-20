@@ -34,6 +34,12 @@ import pytest
 import torch
 
 
+def _needs_no_chip(item):
+    """Whether the test declares it runs on the host (``cpu_test``). A session
+    of nothing but such tests runs with JAX pinned to the CPU."""
+    return item.get_closest_marker("cpu_test") is not None
+
+
 def pytest_collection_modifyitems(items):
     """Run whole-slice worker-spawning tests before in-process TPU tests.
 
@@ -57,6 +63,18 @@ def pytest_collection_modifyitems(items):
             item.nodeid.split("::")[0],
         )
     )
+    # JAX raises rather than falling back to the CPU when the chips are busy,
+    # and the pin must not leak into a session with device tests (they would
+    # skip), so it is decided over the whole collection. jax reads
+    # JAX_PLATFORMS once, at import, so a loaded jax is updated as well.
+    if (
+        items
+        and not os.environ.get("JAX_PLATFORMS")
+        and all(_needs_no_chip(item) for item in items)
+    ):
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        if "jax" in sys.modules:
+            sys.modules["jax"].config.update("jax_platforms", "cpu")
 
 
 def pytest_addoption(parser):
@@ -246,6 +264,25 @@ def device(request):
         except Exception as e:
             pytest.fail(f"TPU requested but failed to initialize: {e}")
     return torch.device("cpu")
+
+
+@pytest.fixture
+def accelerator_type(monkeypatch):
+    """Sets the accelerator type ``tpu_info`` reads: ``accelerator_type(value)``.
+    Its chip lookups are cached, so the caches are cleared on each call and at
+    teardown."""
+    from vllm_torchtpu import tpu_info
+
+    def clear_chip_caches():
+        tpu_info.find_chip_version.cache_clear()
+        tpu_info.get_chip_version.cache_clear()
+
+    def use(value):
+        monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: value)
+        clear_chip_caches()
+
+    yield use
+    clear_chip_caches()
 
 
 def pytest_collection_finish(session):

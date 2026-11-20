@@ -63,6 +63,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    PrequantLinearMethod,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -90,7 +91,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
+class VllmUnquantizedLinearMethod(UnquantizedLinearMethod, PrequantLinearMethod):
     """Dense linear on the canonical (k, n) weight layout.
 
     vLLM's stock `UnquantizedLinearMethod` runs `F.linear(x, W)` with `W`
@@ -149,6 +150,31 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         orig_out_shape = (*x.shape[:-1], weight.shape[-1])
         x_2d = x.reshape(-1, x.shape[-1])
         return torch.addmm(bias, x_2d, weight).reshape(orig_out_shape)
+
+    def apply_prequant(
+        self,
+        layer: torch.nn.Module,
+        x_q: torch.Tensor,
+        x_s: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply unquantized linear to pre-quantized FP8 rows `(x_q, x_s)`:
+        contract `x_q.to(weight.dtype) @ weight`, then scale the `[m, n_out]`
+        result by `x_s` in float32. The cast rows are an `[m, k]` buffer in
+        the weight's dtype unless XLA fuses the cast into the matmul; no
+        float32 dequantized rows are built. The product is rounded to the
+        weight's dtype before the scale and again after it."""
+        layer = cast("TpuLinear", layer)
+        weight = layer.weight
+        x_cast = x_q.to(weight.dtype)
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            out = torch.nn.functional.linear(x_cast, weight)
+        else:
+            out = torch.matmul(x_cast, weight)
+        out_f32 = out.to(torch.float32) * x_s
+        if bias is not None:
+            out_f32 = out_f32 + bias.to(torch.float32)
+        return out_f32.to(weight.dtype)
 
 
 @register_quantization_config(get_tpu_quant_method(UNQUANTIZED))

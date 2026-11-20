@@ -88,6 +88,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    PrequantLinearMethod,
     quantized_matmul,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
@@ -1350,7 +1351,7 @@ def _wrap_block_scale_weight_loader(weight_loader: Callable) -> Callable:
 
 
 @register_weight_loader_v2_supported_method
-class VllmFp8LinearMethodTPU(Fp8LinearMethod):
+class VllmFp8LinearMethodTPU(Fp8LinearMethod, PrequantLinearMethod):
     """
     TPU FP8 linear method that keeps weights in FP8 at runtime and quantizes
     activations dynamically inside a Pallas matmul bridge, unless
@@ -1712,6 +1713,40 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         layer.weight_scale = embed_tokens.weight_scale
         setattr(layer, KEEP_VLLM_LAYOUT_ATTR, True)
         return layer
+
+    def apply_prequant(
+        self,
+        layer: torch.nn.Module,
+        x_q: torch.Tensor,
+        x_s: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply the layer to rows already quantized per row: the
+        sequence-parallel FP8 all-gather hands the projections FP8 rows and
+        their scales (layers/adapter/sequence_parallel).
+
+        The pre-quantized matmul takes a float8_e4m3fn weight with
+        per-channel scales, the form it was measured with. Any other weight
+        (block scales from REQUANTIZE_BLOCK_SIZE, or an int8 or float8_e5m2
+        weight from REQUANTIZE_WEIGHT_DTYPE) runs `apply` on the dequantized
+        rows instead, the path its plain forward takes."""
+        from vllm_torchtpu.layers.adapter.linear_common import (
+            quantized_matmul_prequant,
+        )
+
+        layer = cast("TpuLinear", layer)
+        weight = layer.weight
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            weight = weight.transpose(0, 1)
+        if weight.dtype != torch.float8_e4m3fn or layer.weight_scale.shape != (
+            weight.shape[-1],
+        ):
+            rows = (x_q.to(torch.float32) * x_s).to(torch.bfloat16)
+            return self.apply(layer, rows, bias)
+        out = quantized_matmul_prequant(x_q, x_s, weight, layer.weight_scale)
+        if bias is not None:
+            out = out + bias
+        return out
 
 
 def resolve_online_fp8(
