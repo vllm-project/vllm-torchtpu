@@ -230,7 +230,7 @@ from vllm_torchtpu.tracing.utils import (
     extract_kv_lens_for_tracing,
     extract_request_ids_for_tracing,
 )
-from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.interfaces import SupportsPP
@@ -9273,7 +9273,12 @@ class TPUModelRunner(GPUModelRunner):
         """
         if self._pp_topk_buffer is None:
             return tensors
-        return {**tensors, _TOPK_INDICES: self._pp_topk_buffer[:rows].clone()}
+        # A buffer of its own: torch_tpu may satisfy a clone of a view by
+        # aliasing the table's buffer (fresh_buffer documents this for copy_),
+        # and the next forward donates that buffer while this transfer can
+        # still be queued, so the send would fail with "called on deleted or
+        # donated buffer".
+        return {**tensors, _TOPK_INDICES: fresh_buffer(self._pp_topk_buffer[:rows])}
 
     def _sample_tokens_pp_intermediate_stage(self) -> ModelRunnerOutput:
         """Sampling runs on the last stage only; earlier stages report just
