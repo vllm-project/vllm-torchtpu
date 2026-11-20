@@ -197,7 +197,7 @@ def _setup(mesh, geometry=(E, H, INTER, TOPK)):
 def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
     """``run(*case)`` on ``mesh``: the kernel's output of every core
     [DP * TP, rows, hidden] bf16 and the float32 reference of the engines'
-    rows (float64)."""
+    rows (float64; None with ``with_reference=False``)."""
     import jax
     import numpy as np
     from jax.sharding import PartitionSpec as P
@@ -209,7 +209,7 @@ def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
     h = geometry[1]
     experts = P(("dp", "tp"))
 
-    def run(rows, fp8, edit=None):
+    def run(rows, fp8, edit=None, with_reference=True):
         x, logits = inputs(rows)
         if edit is not None:
             x, logits = edit(x, logits)
@@ -244,7 +244,8 @@ def _case_runner(mesh, geometry=(E, H, INTER, TOPK)):
             out = np.asarray(
                 jax.block_until_ready(f(x, logits, w13, w2, s13, s2, starts, ranks))
             )
-        return out.reshape(DP * TP, rows, h), reference(x, logits)
+        want = reference(x, logits) if with_reference else None
+        return out.reshape(DP * TP, rows, h), want
 
     return run
 
@@ -277,7 +278,7 @@ def _junk_summary(run, rows, fp8, junk, geometry=(E, H, INTER, TOPK)):
         return masked(jnp.asarray(x, jnp.bfloat16), logits)
 
     base, want = run(rows, fp8, masked)
-    got, _ = run(rows, fp8, planted)
+    got, _ = run(rows, fp8, planted, with_reference=False)
     bits = got.view(np.uint16).reshape(DP, TP, rows, h)
     base_bits = base.view(np.uint16).reshape(DP, TP, rows, h)
     engines = np.concatenate([base[TP * d] for d in range(DP)]).astype(np.float64)
