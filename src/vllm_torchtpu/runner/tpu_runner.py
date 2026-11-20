@@ -1426,13 +1426,14 @@ class TPUModelRunner(GPUModelRunner):
         # Sampling-param uploads per batch layout.
         self._sampling_params_dev_cache: dict[tuple, Any] = {}
         # `attention_metadata.stage_block_table_uploads`: the staged Mamba
-        # products per walk key (at most `STAGED_PRODUCTS_CACHE_SIZE`), and
-        # the last table views of a walk without Mamba groups, with the upload
-        # they view (its id is part of the key, so it must stay alive).
+        # products per walk key (at most `STAGED_PRODUCTS_CACHE_SIZE`), and,
+        # per upload slot (a full walk, each targeted walk), the last table
+        # views of a walk without Mamba groups as `(key, upload, views)`: the
+        # upload's id is part of the key, so it must stay alive.
         self._stage_products_cache: dict[tuple, tuple[torch.Tensor, tuple]] = {}
-        self._cached_staged_block_tables_key: tuple | None = None
-        self._cached_staged_block_tables: dict[int, torch.Tensor] | None = None
-        self._cached_staged_block_tables_dev: torch.Tensor | None = None
+        self._staged_block_table_views: dict[
+            str, tuple[tuple, torch.Tensor, dict[int, torch.Tensor]]
+        ] = {}
 
         self.speculative_config = self.vllm_config.speculative_config
         speculative_config = self.speculative_config

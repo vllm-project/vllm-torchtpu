@@ -149,9 +149,7 @@ def _make_runner(
     runner._cached_comb_key = None
     runner._cached_comb_views = None
     runner._stage_products_cache = {}
-    runner._cached_staged_block_tables_key = None
-    runner._cached_staged_block_tables = None
-    runner._cached_staged_block_tables_dev = None
+    runner._staged_block_table_views = {}
     runner._upload_unless_unchanged = types.MethodType(
         TPUModelRunner._upload_unless_unchanged, runner
     )
