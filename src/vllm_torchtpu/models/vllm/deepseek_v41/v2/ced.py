@@ -32,9 +32,19 @@ class DecoderReplayPlan:
 
 
 def coordinate_decoder_replay(
-    plan: DecoderReplayPlan | None, num_tokens: int
+    plan: DecoderReplayPlan | None, num_tokens: int, local_bucket_max: int = 0
 ) -> DecoderReplayPlan | None:
-    """Make every EP participant enter the decoder with the same row bucket."""
+    """Make every EP participant enter the decoder with the same row bucket.
+
+    ``num_tokens`` is the step's token bucket, which DP lockstep already makes
+    equal on every rank. When it is at most ``local_bucket_max``, every rank
+    uses the whole bucket for the decoder without communicating, so the ranks
+    agree without the Gloo all-reduce. Example: with ``local_bucket_max=8``, a
+    decode step in bucket 4 enters the decoder with 4 rows on every rank, even
+    on a rank whose plan kept 3 rows.
+    """
+    if 0 < num_tokens <= local_bucket_max:
+        return replace(plan, padded_num_tokens=num_tokens) if plan else None
     group = get_dp_group()
     if group.world_size == 1:
         return plan
