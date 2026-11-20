@@ -487,7 +487,9 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
                 )
 
                 layers = vllm_config.compilation_config.static_forward_context
-                draft_impls = _draft_attention_impls(draft)
+                draft_impls = _draft_attention_impls(draft) | _draft_attention_impls(
+                    separate_draft
+                )
                 for attn_layer in layers.values():
                     if isinstance(attn_layer, AttentionLayerBase):
                         impl = getattr(attn_layer, "impl", None)
@@ -512,9 +514,10 @@ MTP_DRAFT_ATTR = "_export_mtp_draft"
 
 
 def _draft_attention_impls(draft: nn.Module | None) -> set[int]:
-    """The ids of the attention impls inside the MTP draft. Its attention
-    layers share the target's static forward context, so the export loop
-    tells them apart by the module tree they belong to."""
+    """The ids of the attention impls inside a draft model: the MTP draft or
+    a separate DFlash/DSpark draft. Their attention layers share the target's
+    static forward context, so the export loop tells them apart by the module
+    tree they belong to."""
     if draft is None:
         return set()
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase

@@ -13,10 +13,11 @@
 # limitations under the License.
 """Reduced-precision attention modes reach only kernels that run them.
 
-The PCP streaming kernel, kernel entries without `attention_modes` and the
-bundled block-major kernel refuse a layer that asks for modes instead of
-dropping them, and the export path builds the MTP draft's attention kernels
-with every mode off.
+The PCP streaming kernel, the head_dim 64 kernel, kernel entries without
+`attention_modes` and the bundled block-major kernel refuse a layer that asks
+for modes instead of dropping them, and the export path builds a draft's
+attention kernels (the MTP draft's or a separate DFlash/DSpark draft's) with
+every mode off.
 """
 
 from types import SimpleNamespace
@@ -24,9 +25,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.attention import Attention
+from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
-from vllm_torchtpu.experimental.export import universal_adapter
+from vllm_torchtpu.experimental.export import draft_model, universal_adapter
 from vllm_torchtpu.kernels.experimental.batched_rpa.configs import (
     Fp8Operand,
     NativeFp8,
@@ -163,12 +166,11 @@ def test_export_marks_the_mtp_drafts_attention(monkeypatch):
     assert universal_adapter._draft_attention_impls(None) == set()
 
 
-def test_export_builds_the_mtp_drafts_kernels_with_modes_off(monkeypatch):
-    """load_vllm_model marks the draft's attention before building its
-    kernels, so the draft's kernels run every mode off and the target's keep
-    the target's modes."""
-    from vllm.model_executor.layers.attention import Attention
-    from vllm.platforms import current_platform
+@pytest.mark.parametrize("separate", [False, True], ids=["mtp", "dflash"])
+def test_export_builds_the_drafts_kernels_with_modes_off(monkeypatch, separate):
+    """load_vllm_model marks a draft's attention before building its kernels,
+    the MTP draft's or a separate DFlash/DSpark draft's, so the draft's
+    kernels run every mode off and the target's keep the target's modes."""
 
     def attention_layer(impl):
         layer = object.__new__(Attention)
@@ -183,7 +185,7 @@ def test_export_builds_the_mtp_drafts_kernels_with_modes_off(monkeypatch):
     config.compilation_config.static_forward_context.update(
         {
             "model.layers.3.self_attn.attn": target_attn,
-            "mtp.layers.0.self_attn.attn": draft_attn,
+            "draft.layers.0.self_attn.attn": draft_attn,
         }
     )
     built = {}
@@ -206,7 +208,14 @@ def test_export_builds_the_mtp_drafts_kernels_with_modes_off(monkeypatch):
         universal_adapter, "_create_single_device_tpu_mesh", lambda: None
     )
     monkeypatch.setattr(universal_adapter, "run_model_loader", lambda cfg: target)
-    monkeypatch.setattr(universal_adapter, "_load_mtp_draft", lambda cfg, t: draft)
+    monkeypatch.setattr(
+        universal_adapter, "_load_mtp_draft", lambda cfg, t: None if separate else draft
+    )
+    monkeypatch.setattr(
+        draft_model,
+        "load_draft_model",
+        lambda cfg, t, mesh: draft if separate else None,
+    )
     monkeypatch.setattr(
         current_platform, "update_block_size_for_backend", lambda cfg: None
     )
@@ -214,4 +223,7 @@ def test_export_builds_the_mtp_drafts_kernels_with_modes_off(monkeypatch):
     model = universal_adapter.load_vllm_model(config, load_format="dummy")
 
     assert built == {id(target_attn): _MODES, id(draft_attn): native_fp8_scope.OFF}
-    assert getattr(model, universal_adapter.MTP_DRAFT_ATTR) is draft
+    attr = (
+        draft_model.DRAFT_MODEL_ATTR if separate else universal_adapter.MTP_DRAFT_ATTR
+    )
+    assert getattr(model, attr) is draft
