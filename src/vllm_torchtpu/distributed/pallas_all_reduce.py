@@ -53,8 +53,9 @@ logger = init_logger(__name__)
 
 # A wrong rank or mesh hangs the self-test's barrier: dump every stack and exit.
 SELFTEST_TIMEOUT_S = 300
-# 8 and 24 rows take the flat kernel, 32 and 48 the two-level one; rows whose
-# view the cap refuses are skipped.
+# At hidden 6144 over 8 ranks: 8 and 24 rows take the flat kernel, 32 and 48
+# the two-level one (kernel.TWO_LEVEL_MIN_VIEW_BYTES); rows whose view the cap
+# refuses are skipped.
 _SELFTEST_ROWS = (8, 24, 32, 48)
 
 
@@ -82,10 +83,15 @@ def _body(n: int, max_bytes: int, axis: str, table: tuple[int, ...] | None):
 
 
 def _two_level_table(mesh) -> tuple[int, ...] | None:
-    """kernel.two_level_table of the mesh's chips, by device coordinates."""
+    """kernel.two_level_table of the mesh's chips, by device coordinates; None
+    (the flat kernel only) when the devices expose none."""
     chips: dict[tuple, list[int]] = {}
     for index, device in enumerate(mesh.devices.flat):
-        chips.setdefault(tuple(device.coords), []).append(index)
+        coords = getattr(device, "coords", None)
+        if coords is None:
+            logger.warning("tp_all_reduce: mesh devices expose no coords")
+            return None
+        chips.setdefault(tuple(coords), []).append(index)
     return kernel.two_level_table([chips[c] for c in sorted(chips)])
 
 

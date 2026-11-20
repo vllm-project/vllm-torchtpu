@@ -30,14 +30,11 @@ Above TWO_LEVEL_MIN_VIEW_BYTES the view's bytes, not the hops, set the time,
 and `all_reduce_two_level` runs a chip-aware variant on meshes of two-core
 chips: the two cores of a chip first exchange halves and sum them (rounded to
 bf16), the cores of one parity then reduce-scatter and all-gather their half
-across chips, and the chip's two cores swap halves last. The cross-chip
-traffic per core halves (the flat kernel sends six of eight chunks off chip in
-each phase, and both cores of a chip receive the same chunks); the on-chip
-hops are cheap. On a tpu7x 2x2x1 (bf16 [rows, 6144], chained, us per call)
-flat / two-level / XLA: 14.0 / 13.0 / 19.1 at 32 rows, 19.2 / 16.7 / 20.1 at
-48, 23.5 / 19.9 / 22.7 at 64; at 24 rows the flat kernel is ahead (12.5 /
-12.8). Its sum rounds twice (the pair sum, then the total), so its bits differ
-from the flat kernel's.
+across chips, and each gathered piece goes on to the chip's other core as it
+lands. The flat kernel sends six of eight chunks off chip in each phase, and
+both cores of a chip receive the same chunks; the two-level one sends half
+those bytes off chip and adds two on-chip hops. Its sum rounds twice (the pair
+sum, then the total), so its bits differ from the flat kernel's.
 
 kernels/experimental/moe_tp_decode/all_reduce.py runs the same protocol as a
 fused kernel's epilogue (row paths by n_valid, the own chunk by local DMA);
@@ -61,8 +58,11 @@ _TILE_ROWS = 16  # bf16 sublane tiling
 _LANES = 128
 # Input, output and the n receive slots live in VMEM: ~3x the view.
 MAX_VIEW_BYTES = 4 << 20
-# Views above this take the two-level kernel where the mesh allows it: the
-# measured crossover on tpu7x 2x2x1 lies between 24 and 32 rows of 6144.
+# Views above this take the two-level kernel where the mesh allows it. On a
+# tpu7x 2x2x1 a cross-chip DMA hop measured ~3.3 us plus ~75 GB/s per core and
+# an on-chip hop ~1.1 us, so halving the off-chip bytes (3/4 of the view per
+# core) pays for the two on-chip hops from ~200 KiB; chained per-call times put
+# the crossover between 24 rows of 6144 (flat ahead) and 32 (two-level ahead).
 TWO_LEVEL_MIN_VIEW_BYTES = 24 * 6144 * 2
 
 
@@ -245,8 +245,7 @@ def _call_two_level(n: int, m: int, h: int):
             wait(cols(pair_in, q * w), q)
             mine = x_ref[:, pl.ds(pl.multiple_of(piece(q), w), w)].astype(F32)
             other = pair_in[:, pl.ds(pl.multiple_of(q * w, w), w)].astype(F32)
-            # Lower index first, so both chips' cores sum alike.
-            total = jnp.where(half == 0, mine + other, other + mine)
+            total = mine + other
             pair_sum[:, pl.ds(pl.multiple_of(q * w, w), w)] = total.astype(BF16)
             if i < chips:
                 send(
