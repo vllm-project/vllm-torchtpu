@@ -88,14 +88,30 @@ def pci_numa_node(device: str) -> int | None:
     return node if node >= 0 else None
 
 
+def _prefer_node_memory(node: int) -> str:
+    """Prefer NUMA node `node`'s memory for the calling thread's allocations
+    through libnuma, and say what the memory policy is now. libnuma requires
+    numa_available() to be called first and to not return -1 before any other
+    call; without the library, or where it returns -1, the policy is left as
+    it was."""
+    try:
+        libnuma = ctypes.CDLL("libnuma.so.1")
+    except OSError:
+        return "memory policy unchanged (libnuma unavailable)"
+    if libnuma.numa_available() == -1:
+        return "memory policy unchanged (libnuma reports no NUMA support)"
+    libnuma.numa_set_preferred(ctypes.c_int(node))
+    return "memory preferred there"
+
+
 def bind_to_chip_numa_node(local_rank: int, local_ranks: int) -> None:
     """Narrow the calling thread's CPU set to its chip's NUMA node and prefer
     the node's memory for its allocations; threads it starts afterwards inherit
     both. `local_rank` is this worker's index among the host's
     `local_ranks` workers. A failure before the CPU set is narrowed is logged
-    and leaves placement unchanged. Without libnuma the CPU set is still
-    narrowed and only the memory policy is left as it was, which the log line
-    says."""
+    and leaves placement unchanged. Without libnuma, or where libnuma reports
+    no NUMA support, the CPU set is still narrowed and only the memory policy
+    is left as it was, which the log line says."""
     devices = tpu_pci_devices()
     chip = chip_for_local_rank(local_rank, local_ranks, len(devices))
     if chip is None:
@@ -145,11 +161,7 @@ def bind_to_chip_numa_node(local_rank: int, local_ranks: int) -> None:
             e,
         )
         return
-    memory = "memory preferred there"
-    try:
-        ctypes.CDLL("libnuma.so.1").numa_set_preferred(ctypes.c_int(node))
-    except (OSError, AttributeError):
-        memory = "memory policy unchanged (libnuma unavailable)"
+    memory = _prefer_node_memory(node)
     logger.info(
         "NUMA bind: chip %d (%s) -> node %d, %d CPUs, %s",
         chip,
