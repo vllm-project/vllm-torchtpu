@@ -92,6 +92,8 @@ def apply_omni_model_specific_patches() -> None:
     _patch_ltx2_per_batch_timestep()
     _patch_ltx2_guidance_sigma_scalar()
     _patch_ltx2_async_guidance_step()
+    _patch_ltx2_fast_attention_dispatch()
+    _patch_ulysses_inference_all_to_all_4d()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -1151,3 +1153,210 @@ def _patch_ltx2_async_guidance_step() -> None:
     logger.info(
         "Applied TPU patch: non-blocking async guidance-parallel step boundary."
     )
+
+
+_LTX2_FAST_ATTENTION_DISPATCH_PATCHED = "_tpu_ltx2_fast_attention_dispatch_patched"
+_ULYSSES_INFERENCE_A2A_PATCHED = "_tpu_ulysses_inference_all_to_all_4d_patched"
+
+
+def _patch_ltx2_fast_attention_dispatch() -> None:
+    """Skip per-call ``inspect.signature`` reflection in ``LTX2Attention``.
+
+    Upstream provenance (vllm-omni 0.32.0rc1):
+    ``vllm_omni/diffusion/models/ltx2/ltx2_transformer.py``
+    (``LTX2Attention.forward``).
+
+    Upstream ``LTX2Attention.forward`` calls
+    ``inspect.signature(self.processor.__call__)`` and builds filtered kwargs on
+    all 288 attention calls per step (11,520 calls per 40-step run, about
+    19 ms/step of host time per worker under 8-worker load). The plain 6-arg
+    call on the default ``LTX2AudioVideoAttnProcessor`` (which accepts
+    ``perturbation_mask``) goes straight to the processor. Any other processor,
+    or extra kwargs, takes upstream's filtering path with the signature cached
+    per processor class.
+
+    REMOVAL / FIX CONDITION:
+    Remove once vLLM-Omni caches the processor signature in
+    ``LTX2Attention.forward``.
+    """
+    import inspect
+    import types
+
+    from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
+
+    attention_cls = ltx2_transformer.LTX2Attention
+    default_processor_cls = ltx2_transformer.LTX2AudioVideoAttnProcessor
+    if getattr(attention_cls.forward, _LTX2_FAST_ATTENTION_DISPATCH_PATCHED, False):
+        return
+
+    sig_cache: dict[Any, frozenset[str]] = {}
+
+    def _fast_ltx2_attention_forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        query_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        key_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        *,
+        perturbation_mask: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        processor = self.processor
+        if not kwargs and type(processor) is default_processor_cls:
+            return processor(
+                self,
+                hidden_states,
+                encoder_hidden_states,
+                attention_mask,
+                query_rotary_emb,
+                key_rotary_emb,
+                perturbation_mask=perturbation_mask,
+            )
+        if perturbation_mask is not None:
+            kwargs["perturbation_mask"] = perturbation_mask
+        if isinstance(processor, types.MethodType):
+            cache_key: Any = processor.__func__
+            proc_name = getattr(cache_key, "__qualname__", cache_key.__name__)
+        elif isinstance(processor, (types.FunctionType, types.BuiltinFunctionType)):
+            cache_key = processor
+            proc_name = getattr(processor, "__qualname__", processor.__name__)
+        else:
+            cache_key = type(processor)
+            proc_name = cache_key.__name__
+        attn_parameters = sig_cache.get(cache_key)
+        if attn_parameters is None:
+            attn_parameters = frozenset(inspect.signature(processor).parameters.keys())
+            sig_cache[cache_key] = attn_parameters
+        unused_kwargs = [k for k in kwargs if k not in attn_parameters]
+        if unused_kwargs:
+            logger.warning(
+                "attention_kwargs %s are not expected by %s and will be ignored.",
+                unused_kwargs,
+                proc_name,
+            )
+        return processor(
+            self,
+            hidden_states,
+            encoder_hidden_states,
+            attention_mask,
+            query_rotary_emb,
+            key_rotary_emb,
+            **{k: v for k, v in kwargs.items() if k in attn_parameters},
+        )
+
+    setattr(_fast_ltx2_attention_forward, _LTX2_FAST_ATTENTION_DISPATCH_PATCHED, True)
+    attention_cls.forward = _fast_ltx2_attention_forward
+    logger.info("Applied TPU patch: fast LTX-2 attention processor dispatch.")
+
+
+def _patch_ulysses_inference_all_to_all_4d() -> None:
+    """Run inference Ulysses 4D all-to-all without autograd boxing.
+
+    Upstream provenance (vllm-omni 0.32.0rc1):
+    ``vllm_omni/diffusion/distributed/comm.py`` (``all_to_all_4D`` and
+    ``SeqAllToAll4D``).
+
+    Scope: process-wide. ``comm.all_to_all_4D`` and ``SeqAllToAll4D`` are shared
+    by every Ulysses model (LTX-2, Wan, Kandinsky6, ...); every module that
+    imports ``SeqAllToAll4D`` binds the same class, so setting ``apply`` once
+    covers them all. ``SeqAllToAll4D`` defines no backward, so skipping
+    ``torch.autograd.Function.apply`` (called 288 times per LTX-2 step under
+    ``torch.no_grad()``) changes nothing but host time. The ``(1, 2)`` layout
+    uses one ``permute`` instead of upstream's chained transposes (``(2, 1)``
+    was already a single ``transpose(0, 2)``) and both are bit-exact with
+    upstream. ``use_sync=True``, ``_output_destination``,
+    a world size of 1 and other index pairs go to upstream ``all_to_all_4D``.
+    Modules that imported ``all_to_all_4D`` by name keep upstream's function.
+
+    REMOVAL / FIX CONDITION:
+    Remove once vLLM-Omni's inference ``SeqAllToAll4D`` / ``all_to_all_4D``
+    skip autograd boxing and the double transpose.
+    """
+    from vllm_omni.diffusion.distributed import comm
+
+    if getattr(comm.all_to_all_4D, _ULYSSES_INFERENCE_A2A_PATCHED, False):
+        return
+
+    orig_all_to_all_4d = comm.all_to_all_4D
+
+    def _fast_all_to_all_4d(
+        input: torch.Tensor,
+        scatter_idx: int = 2,
+        gather_idx: int = 1,
+        group: Any = None,
+        use_sync: bool = False,
+        *,
+        _output_destination: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert input.dim() == 4, (
+            f"input must be 4D tensor, got {input.dim()} and shape {input.shape}"
+        )
+        seq_world_size = torch.distributed.get_world_size(group)
+        if (
+            (scatter_idx, gather_idx) not in ((2, 1), (1, 2))
+            or seq_world_size <= 1
+            or use_sync
+            or _output_destination is not None
+        ):
+            return orig_all_to_all_4d(
+                input,
+                scatter_idx,
+                gather_idx,
+                group=group,
+                use_sync=use_sync,
+                _output_destination=_output_destination,
+            )
+        if scatter_idx == 2:
+            bs, shard_seqlen, hc, hs = input.shape
+            send_buf = (
+                input.reshape(
+                    bs, shard_seqlen, seq_world_size, hc // seq_world_size, hs
+                )
+                .permute(2, 1, 0, 3, 4)
+                .contiguous()
+            )
+            recv_buf = torch.empty_like(send_buf)
+            torch.distributed.all_to_all_single(recv_buf, send_buf, group=group)
+            return (
+                recv_buf.reshape(
+                    shard_seqlen * seq_world_size, bs, hc // seq_world_size, hs
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
+        bs, seqlen, shard_hc, hs = input.shape
+        send_buf = (
+            input.reshape(bs, seq_world_size, seqlen // seq_world_size, shard_hc, hs)
+            .permute(1, 3, 2, 0, 4)
+            .contiguous()
+        )
+        recv_buf = torch.empty_like(send_buf)
+        torch.distributed.all_to_all_single(recv_buf, send_buf, group=group)
+        return (
+            recv_buf.reshape(
+                shard_hc * seq_world_size, seqlen // seq_world_size, bs, hs
+            )
+            .permute(2, 1, 0, 3)
+            .contiguous()
+        )
+
+    def _fast_seq_all_to_all_4d_apply(
+        group: Any,
+        input: torch.Tensor,
+        scatter_idx: int,
+        gather_idx: int,
+        use_sync: bool = False,
+    ) -> torch.Tensor:
+        return _fast_all_to_all_4d(
+            input,
+            scatter_idx,
+            gather_idx,
+            group=group,
+            use_sync=use_sync,
+        )
+
+    setattr(_fast_all_to_all_4d, _ULYSSES_INFERENCE_A2A_PATCHED, True)
+    comm.all_to_all_4D = _fast_all_to_all_4d
+    comm.SeqAllToAll4D.apply = staticmethod(_fast_seq_all_to_all_4d_apply)
+    logger.info("Applied TPU patch: inference Ulysses all_to_all_4D without autograd.")

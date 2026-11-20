@@ -25,6 +25,7 @@ from diffusers.pipelines.ltx2.vocoder import UpSample1d
 from vllm_omni.diffusion import ipc
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.distributed import comm as diffusion_comm
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.diffusion.models.ltx2 import (
@@ -90,6 +91,9 @@ _UPSTREAM_GUIDE_MODALITY = ltx2_guidance.LTXGuidanceExecutor._guide_modality
 _UPSTREAM_SYNC_GUIDANCE_STEP = (
     ltx2_runtime.LTXRuntime._synchronize_guidance_parallel_step_output
 )
+_UPSTREAM_LTX2_ATTN_FORWARD = ltx2_transformer.LTX2Attention.forward
+_UPSTREAM_ALL_TO_ALL_4D = diffusion_comm.all_to_all_4D
+_UPSTREAM_SEQ_ALL_TO_ALL_4D_APPLY = diffusion_comm.SeqAllToAll4D.apply
 
 
 def test_register_omni_tpu_platform(monkeypatch):
@@ -1607,3 +1611,241 @@ def test_ltx2_async_guidance_step_avoids_blocking_sync(monkeypatch, table_syncs)
 
     # No path calls upstream's blocking device synchronize.
     assert blocking_syncs == []
+
+
+def test_ltx2_fast_attention_dispatch(monkeypatch):
+    import inspect
+
+    monkeypatch.setattr(
+        ltx2_transformer.LTX2Attention, "forward", _UPSTREAM_LTX2_ATTN_FORWARD
+    )
+    patches._patch_ltx2_fast_attention_dispatch()
+    patches._patch_ltx2_fast_attention_dispatch()  # idempotent
+    assert ltx2_transformer.LTX2Attention.forward is not _UPSTREAM_LTX2_ATTN_FORWARD
+
+    def default_call(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        query_rotary_emb=None,
+        key_rotary_emb=None,
+        perturbation_mask=None,
+    ):
+        del attn, encoder_hidden_states, attention_mask
+        del query_rotary_emb, key_rotary_emb
+        out = hidden_states
+        return out if perturbation_mask is None else out + perturbation_mask
+
+    class _ExtraKwProc:
+        def __call__(
+            self,
+            attn,
+            hidden_states,
+            encoder_hidden_states=None,
+            attention_mask=None,
+            query_rotary_emb=None,
+            key_rotary_emb=None,
+            *,
+            perturbation_mask=None,
+            extra_accepted=None,
+        ):
+            out = default_call(
+                None, attn, hidden_states, perturbation_mask=perturbation_mask
+            )
+            return out if extra_accepted is None else out + extra_accepted
+
+    class _NoMaskProc:
+        def __call__(
+            self,
+            attn,
+            hidden_states,
+            encoder_hidden_states=None,
+            attention_mask=None,
+            query_rotary_emb=None,
+            key_rotary_emb=None,
+        ):
+            return hidden_states * 2
+
+    monkeypatch.setattr(
+        ltx2_transformer.LTX2AudioVideoAttnProcessor, "__call__", default_call
+    )
+    dummy_attn = object.__new__(ltx2_transformer.LTX2Attention)
+    torch.nn.Module.__init__(dummy_attn)
+    x = torch.ones(2, 4, 8)
+    pmask = torch.full((2, 1, 1), 2.0)
+
+    def both(*args, **kwargs):
+        got = dummy_attn(*args, **kwargs)
+        want = _UPSTREAM_LTX2_ATTN_FORWARD(dummy_attn, *args, **kwargs)
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+        return got
+
+    with patch.object(inspect, "signature", wraps=inspect.signature) as spy_sig:
+        # The default processor's plain call never reflects.
+        dummy_attn.processor = ltx2_transformer.LTX2AudioVideoAttnProcessor()
+        spy_sig.reset_mock()
+        dummy_attn(x, perturbation_mask=pmask)
+        dummy_attn(x)
+        assert spy_sig.call_count == 0
+        torch.testing.assert_close(dummy_attn(x, perturbation_mask=pmask), x + 2.0)
+
+        # Extra kwargs reflect once per processor class, then hit the cache.
+        dummy_attn.processor = _ExtraKwProc()
+        spy_sig.reset_mock()
+        dummy_attn(x, perturbation_mask=pmask, extra_accepted=1.0, ignored_kw=9.0)
+        out = dummy_attn(x, perturbation_mask=pmask, extra_accepted=1.0, ignored_kw=9.0)
+        assert spy_sig.call_count == 1
+        torch.testing.assert_close(out, x + 3.0)
+
+    # A custom processor without perturbation_mask is not handed one (it is
+    # filtered out with upstream's warning), matching upstream in every case.
+    dummy_attn.processor = _NoMaskProc()
+    both(x)
+    both(x, perturbation_mask=pmask)
+    dummy_attn.processor = _ExtraKwProc()
+    both(x, perturbation_mask=pmask, extra_accepted=1.0, ignored_kw=9.0)
+
+    # Distinct plain-function processors must not collide on type(processor)
+    # in sig_cache.
+    def _fn_proc_a(
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        query_rotary_emb=None,
+        key_rotary_emb=None,
+        *,
+        alpha=0.0,
+    ):
+        del attn, encoder_hidden_states, attention_mask
+        del query_rotary_emb, key_rotary_emb
+        return hidden_states + alpha
+
+    def _fn_proc_b(
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        query_rotary_emb=None,
+        key_rotary_emb=None,
+        *,
+        beta=0.0,
+    ):
+        del attn, encoder_hidden_states, attention_mask
+        del query_rotary_emb, key_rotary_emb
+        return hidden_states + beta
+
+    dummy_attn.processor = _fn_proc_a
+    torch.testing.assert_close(dummy_attn(x, alpha=2.0, beta=5.0), x + 2.0)
+    dummy_attn.processor = _fn_proc_b
+    torch.testing.assert_close(dummy_attn(x, alpha=2.0, beta=5.0), x + 5.0)
+
+
+def test_ulysses_inference_all_to_all_4d(monkeypatch):
+    from vllm_omni.diffusion.attention.parallel import ulysses as ulysses_mod
+    from vllm_omni.diffusion.distributed import comm
+    from vllm_omni.diffusion.models.ltx2 import ltx2_sequence_parallel
+
+    # Every importer binds the one SeqAllToAll4D class, so one assignment
+    # covers them all.
+    assert ulysses_mod.SeqAllToAll4D is comm.SeqAllToAll4D
+    assert ltx2_sequence_parallel.SeqAllToAll4D is comm.SeqAllToAll4D
+
+    delegated: list[dict] = []
+    sentinel = torch.zeros(1)
+
+    def upstream_spy(*args, **kwargs):
+        delegated.append(kwargs)
+        if kwargs.get("_output_destination") is not None:
+            return sentinel
+        return _UPSTREAM_ALL_TO_ALL_4D(*args, **kwargs)
+
+    monkeypatch.setattr(comm, "all_to_all_4D", upstream_spy)
+    monkeypatch.setattr(comm.SeqAllToAll4D, "apply", _UPSTREAM_SEQ_ALL_TO_ALL_4D_APPLY)
+    patches._patch_ulysses_inference_all_to_all_4d()
+    patches._patch_ulysses_inference_all_to_all_4d()  # idempotent
+    assert comm.all_to_all_4D is not upstream_spy
+    assert comm.SeqAllToAll4D.apply is not _UPSTREAM_SEQ_ALL_TO_ALL_4D_APPLY
+
+    # Bit-exact with upstream for (2, 1) and (1, 2) across 4 simulated ranks,
+    # through both all_to_all_4D and SeqAllToAll4D.apply.
+    world_size = 4
+    monkeypatch.setattr(
+        torch.distributed, "get_world_size", lambda group=None: world_size
+    )
+
+    def _run_simulated_world(fn, rank_inputs, scatter_idx, gather_idx):
+        captured_sends = []
+
+        def collect_send(recv_buf, send_buf, group=None):
+            del group
+            captured_sends.append(send_buf.clone())
+            recv_buf.zero_()
+
+        monkeypatch.setattr(torch.distributed, "all_to_all_single", collect_send)
+        for r in range(world_size):
+            fn(rank_inputs[r], scatter_idx, gather_idx, group="pg")
+        # Transpose rank chunks across the world: recv[dst, src] = send[src, dst]
+        transposed = torch.stack(captured_sends, dim=0).transpose(0, 1).contiguous()
+        outputs = []
+        for r in range(world_size):
+            monkeypatch.setattr(
+                torch.distributed,
+                "all_to_all_single",
+                lambda recv_buf, send_buf, group=None, rr=transposed[r]: recv_buf.copy_(
+                    rr
+                ),
+            )
+            outputs.append(fn(rank_inputs[r], scatter_idx, gather_idx, group="pg"))
+        return outputs
+
+    def _via_seq_apply(t, scatter_idx, gather_idx, group="pg"):
+        return comm.SeqAllToAll4D.apply(group, t, scatter_idx, gather_idx, False)
+
+    torch.manual_seed(0)
+    for shape, scatter_idx, gather_idx in (
+        ((2, 3, 8, 4), 2, 1),
+        ((2, 12, 2, 4), 1, 2),
+    ):
+        inputs = [torch.randn(*shape) for _ in range(world_size)]
+        want = _run_simulated_world(
+            _UPSTREAM_ALL_TO_ALL_4D, inputs, scatter_idx, gather_idx
+        )
+        for fn in (comm.all_to_all_4D, _via_seq_apply):
+            got = _run_simulated_world(fn, inputs, scatter_idx, gather_idx)
+            for g, w in zip(got, want, strict=True):
+                torch.testing.assert_close(g, w, rtol=0, atol=0)
+    assert delegated == []
+
+    # use_sync=True goes to upstream, which synchronizes.
+    sync_calls: list[bool] = []
+    monkeypatch.setattr(
+        comm.current_omni_platform, "synchronize", lambda: sync_calls.append(True)
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_to_all_single",
+        lambda recv_buf, send_buf, group=None: recv_buf.copy_(send_buf),
+    )
+    x = torch.randn(2, 3, 8, 4)
+    comm.all_to_all_4D(x, 2, 1, group="pg", use_sync=True)
+    assert sync_calls == [True] and len(delegated) == 1
+
+    # _output_destination goes to upstream's owned-destination path.
+    dest = torch.empty(1, 3, 8, 4)
+    assert comm.all_to_all_4D(x, 1, 2, group="pg", _output_destination=dest) is (
+        sentinel
+    )
+    assert delegated[-1]["_output_destination"] is dest
+
+    # A world size of 1 returns upstream's fresh contiguous copy.
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 1)
+    out = comm.all_to_all_4D(x.transpose(1, 2), 2, 1, group="pg")
+    assert out is not x and out.is_contiguous()
+    torch.testing.assert_close(out, x.transpose(1, 2), rtol=0, atol=0)
+
+    # Non-4D input fails like upstream.
+    with pytest.raises(AssertionError, match="4D"):
+        comm.all_to_all_4D(torch.randn(2, 3, 4), 2, 1, group="pg")
