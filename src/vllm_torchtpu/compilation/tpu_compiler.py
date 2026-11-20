@@ -306,6 +306,10 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # `prefill_checkpoint_enabled` decides whether the GDN op traces with
     # prefill checkpoint operands or with constant None inputs.
     "vllm_torchtpu/gdn_pool_layout.py",
+    # `resolve_subpage_packing_block_size` decides whether the RPA op is built
+    # with a `subpage_split`, which scales its block tables. The packed and
+    # padded layouts can share pool and block-table shapes.
+    "vllm_torchtpu/kv_cache_spec_normalizer.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/routed_experts_capturer.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",

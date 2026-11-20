@@ -44,6 +44,8 @@ Click a family to see its architecture-specific TPU support.
 
 See the [TPU v7x serving recipes](../deployment/v7x_recipes.md) for the exact slice topologies, parallelism layouts, and `vllm serve` flags used for the CI checkpoints. The [TPU v6e serving recipes](../deployment/v6e_recipes.md) are reference configurations that are not run in CI.
 
+**Block size with two attention page sizes (Gemma 4).** On TPU v7x with `--attention-backend CUSTOM`, sliding-window and global layers whose KV pages differ by an integer factor share one pool. The layers with the smaller page use a scheduler block that is a multiple of the kernel page, and prefix-cache hits align to the larger scheduler block. With an explicit `--block-size`, that value is the kernel page: `--block-size 256` gives 256- and 512-token scheduler blocks. Without the flag, the kernel page may be 128 tokens even where the default block size is 256. Speculative decoding, a KV connector, PCP or DCP above 1, and `VLLM_KV_CACHE_LAYOUT=HND` keep the padded layout instead: one block size for all layers, with the smaller pages padded to the larger one. `VLLM_TPU_BLOCK_MAJOR_KV=1` does not support two attention page sizes.
+
 ---
 
 ## Feature Support

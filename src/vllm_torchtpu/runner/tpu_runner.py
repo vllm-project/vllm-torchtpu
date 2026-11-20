@@ -872,6 +872,9 @@ class TPUModelRunner(GPUModelRunner):
         # Set by `_update_*_page_size_padded` for hybrid attention
         # models so vLLM sees a uniform page size across groups.
         self._hybrid_uniform_page_size_bytes: int | None = None
+        # Set by `get_kv_cache_spec` when pure-attention HMA sub-page packing
+        # builds unpinned specs at a kernel block size.
+        self._subpage_kernel_block_size: int | None = None
 
         # Compact-mamba sizing.
         # When set, mamba/GDN layers allocate only `_mamba_num_blocks`
