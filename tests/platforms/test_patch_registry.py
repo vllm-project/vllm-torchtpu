@@ -263,6 +263,13 @@ def test_manifest_preserves_lifecycle_dependencies():
         "install_tokenize_prefix_cache",
         "install_detok_prompt_tail",
     ]
+    # install_epoch and install are generic names: check those two in full.
+    change_log = stages["engine_core"].index("install_epoch")
+    engine_core = [p.target for p in reg.PATCHES if "engine_core" in p.stages]
+    assert engine_core[change_log : change_log + 2] == [
+        "vllm_torchtpu.core.prefix_change_log:install_epoch",
+        "vllm_torchtpu.core.prefix_change_log:install",
+    ]
     assert stages["platform_activation"] == (
         stages["worker_init"] + api_server + stages["model_load"]
     )
