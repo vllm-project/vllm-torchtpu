@@ -48,8 +48,10 @@ scaling.
 from math import lcm
 from typing import TYPE_CHECKING, Any, cast
 
+import jax
 import jax.numpy as jnp
 import torch
+from torch_tpu._internal import pallas
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
@@ -409,6 +411,33 @@ class _ExpertSlice:
         ):
             tensor = getattr(layer, name, None)
             setattr(self, name, None if tensor is None else tensor[start:stop])
+
+
+def _concatenate_experts(parts: list[jax.Array]) -> jax.Array:
+    return jnp.concatenate(parts, axis=0)
+
+
+_concatenate_experts_op: Any = None
+
+
+def _join_expert_slices(parts: list[torch.Tensor]) -> torch.Tensor:
+    """Concatenate prepared expert slices along the expert axis (dim 0).
+
+    FP4 slices (``torch.float4_e2m1fn_x2``) are joined in JAX: torch_tpu's
+    ``torch.cat`` aborts on them, because the device buffer holds the
+    logical FP4 shape (last axis twice the torch shape) and the concatenation
+    output check compares it against the torch shape
+    (``tensor_to_buffer.cc``: "Cannot assign buffer of size 1258291200 to
+    tensor of shape [96, 5120, 2560]"). Other dtypes use ``torch.cat``.
+    """
+    global _concatenate_experts_op
+    if parts[0].dtype != torch.float4_e2m1fn_x2:
+        return torch.cat(parts, dim=0)
+    if _concatenate_experts_op is None:
+        _concatenate_experts_op = pallas.jax_op(
+            "pallas::mxfp4_concatenate_experts", _concatenate_experts
+        )
+    return _concatenate_experts_op(parts)
 
 
 def _with_leading_dim(tensor: torch.Tensor, size: int) -> torch.Tensor:
@@ -818,7 +847,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         if len(parts) == 1:
             return (*parts[0], op)
         joined = tuple(
-            None if column[0] is None else torch.cat(column, dim=0)
+            None if column[0] is None else _join_expert_slices(list(column))
             for column in zip(*parts)
         )
         del parts
