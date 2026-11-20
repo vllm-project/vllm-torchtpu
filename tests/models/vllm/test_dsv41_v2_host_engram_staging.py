@@ -176,6 +176,8 @@ class TestEngramModuleStagingAndEmbed:
             block_size=16,
             tp_size=1,
             gather_raw=MagicMock(),
+            tpu_dp_shared_memory=False,
+            node_size=1,
         )
         engram.embed_tokens = embed_tokens
         return engram
@@ -184,7 +186,7 @@ class TestEngramModuleStagingAndEmbed:
         from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common
 
         engram = self._create_mock_engram(cpu_offload=True)
-        engram.embed_tokens.dp_size = 8
+        engram.embed_tokens.dp_size = engram.embed_tokens.node_size = 8
         engram.embed_tokens.n_hash_cols = 16
         engram._init_staging(max_tokens=16, head_dim=32)
         assert engram._host_raw.shape == (16, 16, 32)
@@ -369,7 +371,7 @@ class TestModelEngramPreparation:
         for index in range(2):
             engram = TestEngramModuleStagingAndEmbed()._create_mock_engram(True)
             engram.layer_hash_index = index
-            engram.embed_tokens.dp_size = 2
+            engram.embed_tokens.dp_size = engram.embed_tokens.node_size = 2
             engram.embed_tokens.gather_raw = gather
             engram._init_staging(7, 32)
             stagers.append(engram)

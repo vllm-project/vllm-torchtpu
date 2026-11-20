@@ -5,11 +5,10 @@
 With ``TPU_DEEPSEEK_V41_ENGRAM_HBM=first`` (only the first Engram layer, which
 only layer 0 can hide; later layers keep the host path, overlapped with the
 layers before them; the default ``auto`` selects it on EP groups of >= 16
-ranks) or ``all``, each DP rank uploads the head shard of the
-node-local Engram table that the host-offload path already loads into its host
-memory (``ParallelEngramEmbedding`` with ``dp_size`` = node-local Engram DP
-size) into HBM once, and every step's lookup becomes one SPMD op over the EP
-mesh:
+ranks) or ``all``, each DP rank uploads its head shard of the node-local
+Engram table (``ParallelEngramEmbedding.node_head_shard``: the rows a
+head-sharded host table already holds, or the same rows of a DP-shared one)
+into HBM once, and every step's lookup becomes one SPMD op over the EP mesh:
 
 1. all-gather of the node's n-gram hashes (``axis_index_groups`` = node),
 2. each rank gathers its heads' FP8 bytes / E8M0 scale bytes for every token
@@ -18,10 +17,10 @@ mesh:
    shard order, dequantized to bf16 -- the rows ``Engram._ready_rows`` returns.
 
 The host path's D2H of the hashes, its two gloo collectives (hash all-gather,
-row all-to-all), the host gather and the H2D upload all leave the step; the
-device lookup costs ~0.1 ms per Engram layer at 288 decode tokens per rank.
-The tables take HBM away from the KV cache (~11.8 GiB per DeepSeek-V4.1-Flash
-Engram layer per rank with an 8-rank node).
+row all-to-all; none for a DP-shared table), the host gather and the H2D
+upload all leave the step; the device lookup costs ~0.1 ms per Engram layer at
+288 decode tokens per rank. The tables take HBM away from the KV cache
+(~11.8 GiB per DeepSeek-V4.1-Flash Engram layer per rank with an 8-rank node).
 """
 
 import os
@@ -62,13 +61,15 @@ def should_use_hbm_lookup(
     staged_raw: torch.Tensor | None,
     dp_size: int,
     layer_hash_index: int,
+    dp_shared: bool = False,
 ) -> bool:
     """Whether an Engram layer should serve its rows from HBM.
 
     Engram layers call this once and cache the answer. ``auto`` acts as
-    ``first`` on EP groups of at least ``AUTO_MIN_EP_SIZE`` ranks and as
-    ``off`` otherwise. An explicitly set mode that cannot apply raises; the
-    default falls back to the host path with a warning naming the reason.
+    ``first`` on EP groups of at least ``AUTO_MIN_EP_SIZE`` ranks with
+    head-sharded host tables and as ``off`` otherwise (``dp_shared`` tables
+    need an explicit mode). An explicitly set mode that cannot apply raises;
+    the default falls back to the host path with a warning naming the reason.
     """
     mode = envs.TPU_DEEPSEEK_V41_ENGRAM_HBM.lower()
     explicit = _ENV in os.environ and mode != "auto"
@@ -77,7 +78,7 @@ def should_use_hbm_lookup(
     group = get_ep_group()
     if mode == "auto":
         ep_size = int(group.world_size) if group is not None else 1
-        if ep_size < AUTO_MIN_EP_SIZE:
+        if ep_size < AUTO_MIN_EP_SIZE or dp_shared:
             return False
         mode = "first"
     if mode == "off" or (mode == "first" and layer_hash_index != 0):
@@ -86,10 +87,7 @@ def should_use_hbm_lookup(
     if staged_raw is None or staged_raw.device.type != "tpu":
         reason = "Engram CPU offload with TPU staging is not active"
     elif dp_size <= 1:
-        reason = (
-            "the host tables are not head-sharded across a node-local DP "
-            "group (e.g. dp_shared_memory)"
-        )
+        reason = "there is no node-local Engram DP group to shard the table over"
     elif _tp_size() != 1:
         # The lookup groups blocks of dp_size consecutive EP mesh indices as
         # one node; that layout is only established for TP1 (DP == EP).

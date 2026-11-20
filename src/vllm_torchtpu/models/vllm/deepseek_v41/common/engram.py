@@ -10,7 +10,7 @@ import mmap
 import tempfile
 from contextlib import ExitStack
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 import jax
 import numpy as np
@@ -698,6 +698,16 @@ class DPSharedEngramStorage(upstream.DPSharedEngramStorage):
         return self.weight, self.weight_scale_inv
 
 
+class HeadShard(NamedTuple):
+    """One rank's hash heads and their global table rows, over ``node_size`` ranks."""
+
+    node_size: int
+    head_start: int
+    part_cols: int
+    vocab_start: int
+    vocab_end: int
+
+
 class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
     """Reuse upstream head sharding and checkpoint loaders; support Host DRAM."""
 
@@ -722,11 +732,15 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
 
     def __init__(
         self,
+        num_embeddings: int,
+        dim: int,
+        head_sizes: tuple[int, ...],
         *args,
         cpu_offload: bool | None = None,
         dp_shared_memory: bool = False,
         **kwargs,
     ):
+        self.head_sizes = tuple(head_sizes)
         # Upstream's own `cpu_offload` means a pinned table read through UVA
         # (CUDA only) and it resets the attribute in `__init__`; keep it False
         # and track the TPU host table separately.
@@ -749,7 +763,9 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             torch.cuda,
             get_device_properties=lambda _: SimpleNamespace(multi_processor_count=0),
         ):
-            super().__init__(*args, cpu_offload=False, **kwargs)
+            super().__init__(
+                num_embeddings, dim, head_sizes, *args, cpu_offload=False, **kwargs
+            )
         if self.tpu_dp_shared_memory:
             self.dp_size = 1
         upstream.set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
@@ -762,6 +778,43 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         if self.tpu_dp_shared_memory:
             return self.tp_size, upstream.get_tensor_model_parallel_rank()
         return super()._get_shard_info()
+
+    @property
+    def node_size(self) -> int:
+        """Ranks of the node-local Engram DP group the heads shard over (1: none)."""
+        if not self.tpu_dp_shared_memory:
+            return self.dp_size
+        group = upstream.get_engram_dp_group()
+        return group.world_size if group is not None else 1
+
+    def node_head_shard(self) -> HeadShard:
+        """This rank's head shard over the node-local Engram DP group.
+
+        A head-sharded host table holds exactly this shard. A DP-shared table
+        holds every head; the shard is then the one upstream's head sharding
+        would give this rank over the group (``engram_hbm`` serves it from HBM).
+        """
+        if not self.tpu_dp_shared_memory:
+            return HeadShard(
+                self.dp_size,
+                self.head_start,
+                self.part_n_hash_cols,
+                self.vocab_start_idx,
+                self.vocab_end_idx,
+            )
+        group = upstream.get_engram_dp_group()
+        assert group is not None  # dp_shared_memory requires one (see __init__)
+        part_cols = -(-self.n_hash_cols // group.world_size)
+        # Upstream's head-sharding precondition: every rank holds a head.
+        assert (group.world_size - 1) * part_cols < self.n_hash_cols
+        head_start = group.rank_in_group * part_cols
+        return HeadShard(
+            group.world_size,
+            head_start,
+            part_cols,
+            sum(self.head_sizes[:head_start]),
+            sum(self.head_sizes[: head_start + part_cols]),
+        )
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.tpu_dp_shared_memory:
@@ -1154,15 +1207,17 @@ class Engram(upstream.Engram):
         if self._uses_hbm is None:
             from .engram_hbm import should_use_hbm_lookup
 
+            emb = self.embed_tokens
             self._uses_hbm = should_use_hbm_lookup(
                 staged_raw=self._staged_raw,
-                dp_size=int(self.embed_tokens.dp_size),
+                dp_size=emb.node_size,
                 layer_hash_index=int(self.layer_hash_index),
+                dp_shared=emb.tpu_dp_shared_memory,
             )
         return self._uses_hbm
 
     def upload_hbm_table(self):
-        """Copy this rank's host head shard to HBM once; returns
+        """Copy this rank's head shard of the host table to HBM once; returns
         (table, scales, shard metadata, rows per rank)."""
         if self._hbm_table is not None:
             return self._hbm_table
@@ -1171,12 +1226,16 @@ class Engram(upstream.Engram):
         from .engram_hbm import build_lookup_op, gather_shard_meta, upload_table
 
         emb = self.embed_tokens
+        shard = emb.node_head_shard()
         weight, scales = emb._storage()
+        # Host rows start at the table's own first row (vocab_start_idx).
+        local = slice(
+            shard.vocab_start - emb.vocab_start_idx,
+            shard.vocab_end - emb.vocab_start_idx,
+        )
+        weight, scales = weight[local], scales[local]
         meta = gather_shard_meta(
-            int(emb.head_start),
-            int(emb.vocab_start_idx),
-            int(emb.vocab_end_idx),
-            int(weight.shape[0]),
+            shard.head_start, shard.vocab_start, shard.vocab_end, int(weight.shape[0])
         )
         rows = max(m[3] for m in meta)
         device = cast(torch.Tensor, self._staged_raw).device
@@ -1196,11 +1255,11 @@ class Engram(upstream.Engram):
         self._hbm_op = build_lookup_op(
             int(self.layer_hash_index),
             int(emb.n_hash_cols),
-            int(emb.part_n_hash_cols),
+            shard.part_cols,
             rows,
             int(self._host_raw.shape[-1]),
             int(emb.block_size),
-            int(emb.dp_size),
+            shard.node_size,
             meta,
         )
         logger.info(

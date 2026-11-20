@@ -143,6 +143,13 @@ def test_default_is_auto_and_enables_first_from_ep16(monkeypatch):
     assert _gate(monkeypatch, "auto", ep=16, explicit=True, dp_size=1) is False
 
 
+def test_dp_shared_tables_need_an_explicit_mode(monkeypatch):
+    # auto keeps DP-shared host tables on the host path, whatever the EP size.
+    assert _gate(monkeypatch, "auto", ep=16, dp_shared=True) is False
+    assert _gate(monkeypatch, "first", ep=8, explicit=True, dp_shared=True) is True
+    assert _gate(monkeypatch, "all", explicit=True, dp_shared=True) is True
+
+
 def test_explicit_modes_and_gating(monkeypatch):
     assert _gate(monkeypatch, "first", ep=8, explicit=True) is True
     assert _gate(monkeypatch, "first", explicit=True, layer_hash_index=1) is False
@@ -285,3 +292,79 @@ def test_step_hashes_eager_gathers_up_front():
     host = step.for_layer(host_layer)
     assert torch.equal(host, device + 100)
     assert step.for_layer(host_layer) is host and len(calls) == 1
+
+
+def _embedding(dp_shared: bool, head_sizes, *, dp_size=1, head_start=0, vocab=(0, 0)):
+    from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common
+
+    emb = common.ParallelEngramEmbedding.__new__(common.ParallelEngramEmbedding)
+    emb.tpu_dp_shared_memory = dp_shared
+    emb.head_sizes = tuple(head_sizes)
+    emb.n_hash_cols = len(head_sizes)
+    emb.dp_size = dp_size
+    emb.head_start = head_start
+    emb.part_n_hash_cols = -(-len(head_sizes) // dp_size)
+    emb.vocab_start_idx, emb.vocab_end_idx = vocab
+    return emb
+
+
+def test_dp_shared_table_shards_heads_like_a_head_sharded_one(monkeypatch):
+    from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common
+
+    sizes = [5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43]
+    offsets = np.cumsum([0, *sizes])
+    shards = []
+    for rank in range(NODE):
+        group = SimpleNamespace(world_size=NODE, rank_in_group=rank)
+        monkeypatch.setattr(common.upstream, "get_engram_dp_group", lambda g=group: g)
+        shards.append(_embedding(True, sizes).node_head_shard())
+    part = len(sizes) // NODE
+    for rank, shard in enumerate(shards):
+        # Upstream's head sharding of the same table over the same group.
+        assert shard == common.HeadShard(
+            NODE,
+            rank * part,
+            part,
+            int(offsets[rank * part]),
+            int(offsets[(rank + 1) * part]),
+        )
+    # Together the shards cover every row once.
+    assert [s.vocab_start for s in shards[1:]] == [s.vocab_end for s in shards[:-1]]
+    assert shards[-1].vocab_end == sum(sizes)
+
+
+def test_head_sharded_table_is_its_own_shard():
+    emb = _embedding(False, [5, 7, 11, 13], dp_size=2, head_start=2, vocab=(12, 36))
+    assert emb.node_head_shard() == (2, 2, 2, 12, 36)
+
+
+def test_dp_shared_hbm_layer_is_not_staged_on_host():
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.engram import Engram
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
+        DeepseekV41Model,
+        _StepHashes,
+    )
+
+    calls: list[str] = []
+
+    def engram(uses_hbm: bool) -> Engram:
+        e = Engram.__new__(Engram)
+        torch.nn.Module.__init__(e)
+        e._uses_hbm = uses_hbm
+        e.layer_hash_index = 0
+        e.embed_tokens = SimpleNamespace(host_offload=True, dp_size=1)
+        e.start_prepared_embeddings = lambda h: calls.append("host gather")
+        e.activate_prepared_embeddings = lambda n, u: calls.append("activate")
+        e.prepare_embeddings = lambda h: calls.append("prepare")
+        return e
+
+    model = DeepseekV41Model.__new__(DeepseekV41Model)
+    torch.nn.Module.__init__(model)
+    model.layers = [SimpleNamespace(engram=engram(True))]
+    step = _StepHashes(torch.zeros((4, 1, COLS)), lambda h: h, eager=False)
+    model._stage_engram_layers(0, 1, step)
+    assert calls == ["prepare"]  # Engram.prepare_embeddings returns for HBM layers
+    calls.clear()
+    model.layers = [SimpleNamespace(engram=engram(False))]
+    model._stage_engram_layers(0, 1, step)
+    assert calls == ["host gather", "activate"]

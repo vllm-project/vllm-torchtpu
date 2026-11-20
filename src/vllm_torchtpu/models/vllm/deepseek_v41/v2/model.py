@@ -712,7 +712,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     gathered_hashes = step_hashes.for_layer(engram)
                     if (
                         isinstance(engram, Engram)
-                        and engram.embed_tokens.host_offload
+                        and _stages_engram_on_host(layer)
                         and engram.embed_tokens.dp_size == 1
                     ):
                         upload = (
@@ -791,8 +791,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         engrams = [
             layer.engram
             for layer in islice(self.layers, self.start_layer, end)
-            if isinstance(layer.engram, Engram)
-            and layer.engram.embed_tokens.host_offload
+            if isinstance(layer.engram, Engram) and _stages_engram_on_host(layer)
         ]
         # Predicting work must never introduce an unmatched DP collective.
         if not engrams or any(engram.embed_tokens.dp_size != 1 for engram in engrams):
