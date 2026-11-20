@@ -39,17 +39,24 @@ def case():
     return sched, x0, gate, ws, reference(sched, x0, gate, ws)
 
 
-def _run(arm, sched, x0, gate, ws):
+def _run(arm, sched, x0, gate, ws, hoist=True):
     f = build(
-        arm, items=sched.items, vmem_limit_bytes=32 * 2**20, interpret=True, **DIMS
+        arm,
+        items=sched.items,
+        vmem_limit_bytes=32 * 2**20,
+        interpret=True,
+        hoist=hoist,
+        **DIMS,
     )
     return f(sched, x0, gate, ws)[:TOKENS]
 
 
+@pytest.mark.parametrize("hoist", [True, False])
 @pytest.mark.parametrize("arm", ARMS)
-def test_matches_reference(case, arm):
+def test_matches_reference(case, arm, hoist):
     sched, x0, gate, ws, ref = case
-    assert jnp.max(jnp.abs(_run(arm, sched, x0, gate, ws) - ref[:TOKENS])) <= 1e-5
+    out = _run(arm, sched, x0, gate, ws, hoist=hoist)
+    assert jnp.max(jnp.abs(out - ref[:TOKENS])) <= 1e-5
 
 
 def test_oracle_rejects_corrupted_expert(case):

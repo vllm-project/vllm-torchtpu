@@ -80,7 +80,11 @@ def _quant(x):
 
 def expert_ffn(x, wg, wu, wd, sg, su, sd):
     """SwiGLU expert with per-token dynamic fp8 activations, fp32 accumulate."""
-    xq, sx = _quant(x)
+    return expert_ffn_q(*_quant(x), wg, wu, wd, sg, su, sd)
+
+
+def expert_ffn_q(xq, sx, wg, wu, wd, sg, su, sd):
+    """``expert_ffn`` on an input already quantized by ``_quant``."""
     g = jnp.dot(xq, wg, preferred_element_type=jnp.float32) * sx * sg
     u = jnp.dot(xq, wu, preferred_element_type=jnp.float32) * sx * su
     hq, sh = _quant(g * jax.nn.sigmoid(g) * u)
@@ -91,14 +95,21 @@ def _rmsnorm(a):
     return a * jax.lax.rsqrt(jnp.mean(a * a, axis=-1, keepdims=True) + EPS)
 
 
-def _item(t, sched, gate_ref, x_scr, acc_scr, weights):
+def _item(t, sched, gate_ref, x_scr, acc_scr, weights, q_scr):
     step_of, expert_of, first_of, last_of = sched
 
     @pl.when(first_of[t] == 1)
     def _():
         acc_scr[...] = jnp.zeros_like(acc_scr)
+        if q_scr is not None:  # quantize the step input once, not per expert
+            xq, sx = _quant(x_scr[...])
+            q_scr[0][...] = xq
+            q_scr[1][...] = jnp.broadcast_to(sx, q_scr[1].shape)
 
-    y = expert_ffn(x_scr[...], *weights)
+    if q_scr is None:
+        y = expert_ffn(x_scr[...], *weights)
+    else:
+        y = expert_ffn_q(q_scr[0][...], q_scr[1][:, :1], *weights)
     # gate_ref is lane-replicated [N, E, B, 128]; column 0 is the routing weight.
     acc_scr[...] += y * gate_ref[step_of[t], expert_of[t]][:, :1]
 
@@ -107,7 +118,9 @@ def _item(t, sched, gate_ref, x_scr, acc_scr, weights):
         x_scr[...] = _rmsnorm(acc_scr[...])
 
 
-def _resident_kernel(*refs, items):
+def _resident_kernel(*refs, items, hoist):
+    q_scr = tuple(refs[-2:]) if hoist else None
+    refs = refs[:-2] if hoist else refs
     sched, (x0, gate, wg, wu, wd, sg, su, sd) = refs[:4], refs[4:12]
     out, x_scr, acc_scr = refs[12:]
     x_scr[...] = x0[...].astype(jnp.float32)
@@ -115,14 +128,16 @@ def _resident_kernel(*refs, items):
     def body(t, carry):
         e = sched[1][t]
         w = (wg[e], wu[e], wd[e], sg[e], su[e], sd[e])
-        _item(t, sched, gate, x_scr, acc_scr, w)
+        _item(t, sched, gate, x_scr, acc_scr, w, q_scr)
         return carry
 
     jax.lax.fori_loop(0, items, body, 0)
     out[...] = x_scr[...]
 
 
-def _streamed_kernel(*refs, items):
+def _streamed_kernel(*refs, items, hoist):
+    q_scr = tuple(refs[-2:]) if hoist else None
+    refs = refs[:-2] if hoist else refs
     sched, (x0, gate, sg, su, sd), hbm = refs[:4], refs[4:9], refs[9:12]
     out, x_scr, acc_scr, wg_buf, wu_buf, wd_buf, sem = refs[12:]
     bufs = (wg_buf, wu_buf, wd_buf)
@@ -150,15 +165,29 @@ def _streamed_kernel(*refs, items):
             c.wait()
         e = sched[1][t]
         w = (wg_buf[slot], wu_buf[slot], wd_buf[slot], sg[e], su[e], sd[e])
-        _item(t, sched, gate, x_scr, acc_scr, w)
+        _item(t, sched, gate, x_scr, acc_scr, w, q_scr)
         return carry
 
     jax.lax.fori_loop(0, items, body, 0)
     out[...] = x_scr[...]
 
 
+def quant_scratch(rows, hidden):
+    """VMEM scratch for the once-per-step quantized input and its row scales."""
+    return [pltpu.VMEM((rows, hidden), F8), pltpu.VMEM((rows, 128), jnp.float32)]
+
+
 def build(
-    arm, *, experts, hidden, inter, rows, items, vmem_limit_bytes, interpret=False
+    arm,
+    *,
+    experts,
+    hidden,
+    inter,
+    rows,
+    items,
+    vmem_limit_bytes,
+    interpret=False,
+    hoist=True,
 ):
     """Jitted ``f(schedule, x0, gate, weights) -> [rows, hidden] f32`` for one arm."""
     if arm not in ARMS:
@@ -177,9 +206,11 @@ def build(
             pltpu.VMEM((2, inter, hidden), F8),
             pltpu.SemaphoreType.DMA((3, 2)),
         ]
+    if hoist:
+        scratch += quant_scratch(rows, hidden)
     extra = {"interpret": pltpu.InterpretParams()} if interpret else {}
     call = pl.pallas_call(
-        functools.partial(kernel, items=items),
+        functools.partial(kernel, items=items, hoist=hoist),
         out_shape=jax.ShapeDtypeStruct((rows, hidden), jnp.float32),
         in_specs=in_specs,
         out_specs=vmem,

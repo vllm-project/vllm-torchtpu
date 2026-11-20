@@ -37,12 +37,11 @@ import numpy as np
 from vllm_torchtpu.kernels.experimental.vmem_resident_moe import kernel as K
 from vllm_torchtpu.kernels.experimental.vmem_resident_moe import layer as L
 
-ARMS = (
-    ("resident", True),
-    ("streamed", True),
-    ("resident", False),
-    ("streamed", False),
+ARMS = tuple(
+    (w, sync) for sync in ("ar", "barrier", "none") for w in ("resident", "streamed")
 )
+ARM_NAME = {"ar": "ar", "barrier": "barrier", "none": "noar"}
+NAME_SYNC = {v: k for k, v in ARM_NAME.items()}
 
 
 def _emit(tag, obj):
@@ -88,7 +87,12 @@ def main():
     p.add_argument("--top-k", type=int, default=8)
     p.add_argument("--hidden", type=int, default=2816)
     p.add_argument("--inter", type=int, default=704)
-    p.add_argument("--rows", type=int, default=0, help="0: B rounded up to 16")
+    p.add_argument("--rows", type=int, default=0, help="0: B rounded up to 32")
+    p.add_argument(
+        "--per-item-quant",
+        action="store_true",
+        help="quantize the input per expert (the pre-hoist kernel)",
+    )
     p.add_argument("--ar-dtype", default="bfloat16", choices=["float32", "bfloat16"])
     p.add_argument("--batches", default="1,16,64")
     p.add_argument("--steps", default="4,16")
@@ -109,13 +113,15 @@ def main():
     ar_dtype = jnp.dtype(a.ar_dtype)
 
     def dims_for(tokens):
-        rows = a.rows or max(16, -(-tokens // 16) * 16)
+        rows = a.rows or max(32, -(-tokens // 32) * 32)
         return dict(base, rows=rows)
 
     def common_for(tokens):
         return dict(
             vmem_limit_bytes=a.vmem_limit_mib * 2**20,
             ar_dtype=ar_dtype,
+            hoist=not a.per_item_quant,
+            wire_rows=max(16, -(-tokens // 16) * 16),
             **dims_for(tokens),
         )
 
@@ -148,11 +154,11 @@ def main():
     if a.point:
         arm, b = a.point.split(":")
         b = int(b)
-        w, ar = arm.split("_")[0], arm.endswith("_ar")
+        w, sync = arm.split("_")[0], NAME_SYNC[arm.split("_")[1]]
         t, items = {}, {}
         for n in (n_lo, n_hi):
             *_, args, starts = _setup(mesh, dims_for(b), b, n, a.top_k, b)
-            f = L.build_layer(mesh, weights=w, allreduce=ar, steps=n, **common_for(b))
+            f = L.build_layer(mesh, weights=w, allreduce=sync, steps=n, **common_for(b))
             t[n] = _time(f, args, a.reps)
             items[n] = int(starts[:, -1].max())
         us = (t[n_hi] - t[n_lo]) / (n_hi - n_lo) * 1e6
@@ -160,7 +166,8 @@ def main():
         metrics = {
             "arm": arm,
             "weights": w,
-            "allreduce": ar,
+            "sync": sync,
+            "hoist": not a.per_item_quant,
             "B": b,
             "us_per_step": us,
             "tokens_per_s": b / (us * 1e-6),
@@ -183,25 +190,32 @@ def main():
         return
 
     for b in (int(v) for v in a.batches.split(",")):
-        row = {"B": b, "rows": dims_for(b)["rows"], "ar_dtype": a.ar_dtype}
-        for w, ar in ARMS:
+        row = {
+            "B": b,
+            "rows": dims_for(b)["rows"],
+            "ar_dtype": a.ar_dtype,
+            "hoist": not a.per_item_quant,
+        }
+        for w, sync in ARMS:
             t = {}
             items = {}
             for n in (n_lo, n_hi):
                 *_, args, starts = _setup(mesh, dims_for(b), b, n, a.top_k, b)
                 f = L.build_layer(
-                    mesh, weights=w, allreduce=ar, steps=n, **common_for(b)
+                    mesh, weights=w, allreduce=sync, steps=n, **common_for(b)
                 )
                 t[n] = _time(f, args, a.reps)
                 items[n] = int(starts[:, -1].max())
-            name = f"{w}_{'ar' if ar else 'noar'}"
+            name = f"{w}_{ARM_NAME[sync]}"
             row[name] = {
                 "us_per_step": (t[n_hi] - t[n_lo]) / (n_hi - n_lo) * 1e6,
                 "max_items_per_device": [items[n_lo], items[n_hi]],
             }
         r = {k: v["us_per_step"] for k, v in row.items() if isinstance(v, dict)}
-        row["allreduce_us_resident"] = r["resident_ar"] - r["resident_noar"]
-        row["allreduce_us_streamed"] = r["streamed_ar"] - r["streamed_noar"]
+        for w in ("resident", "streamed"):
+            row[f"allreduce_us_{w}"] = r[f"{w}_ar"] - r[f"{w}_noar"]
+            row[f"sync_imbalance_us_{w}"] = r[f"{w}_barrier"] - r[f"{w}_noar"]
+            row[f"wire_us_{w}"] = r[f"{w}_ar"] - r[f"{w}_barrier"]
         row["speedup_with_ar"] = r["streamed_ar"] / r["resident_ar"]
         row["speedup_no_ar"] = r["streamed_noar"] / r["resident_noar"]
         _emit("RESULT", row)

@@ -82,7 +82,12 @@ def main():
     p.add_argument("--experts", type=int, default=8)
     p.add_argument("--hidden", type=int, default=2816)
     p.add_argument("--inter", type=int, default=704)
-    p.add_argument("--rows", type=int, default=64, help="padded token rows")
+    p.add_argument("--rows", type=int, default=0, help="0: B rounded up to 32")
+    p.add_argument(
+        "--per-item-quant",
+        action="store_true",
+        help="quantize the input per expert (the pre-hoist kernel)",
+    )
     p.add_argument("--batches", default="1,4,16,64")
     p.add_argument("--steps", default="4,16", help="two step counts for the slope")
     p.add_argument("--reps", type=int, default=30)
@@ -108,10 +113,19 @@ def main():
         ),
     )
 
-    dims = dict(experts=a.experts, hidden=a.hidden, inter=a.inter, rows=a.rows)
-    common = dict(
-        vmem_limit_bytes=a.vmem_limit_mib * 2**20, interpret=a.interpret, **dims
-    )
+    def dims_for(tokens):
+        rows = a.rows or max(32, -(-tokens // 32) * 32)
+        return dict(experts=a.experts, hidden=a.hidden, inter=a.inter, rows=rows)
+
+    def common_for(tokens):
+        return dict(
+            vmem_limit_bytes=a.vmem_limit_mib * 2**20,
+            interpret=a.interpret,
+            hoist=not a.per_item_quant,
+            **dims_for(tokens),
+        )
+
+    dims, common = dims_for(a.check_tokens), common_for(a.check_tokens)
     n_lo, n_hi = (int(v) for v in a.steps.split(","))
     arms = a.arms.split(",")
     key = jax.random.PRNGKey(0)
@@ -157,14 +171,19 @@ def main():
 
     arms = [x for x in arms if x not in failed]
     for b in (int(v) for v in a.batches.split(",")):
-        row = {"B": b, "experts": a.experts}
+        row = {
+            "B": b,
+            "experts": a.experts,
+            "rows": dims_for(b)["rows"],
+            "hoist": not a.per_item_quant,
+        }
         for arm in arms:
             meas = {}
             for n in (n_lo, n_hi):
                 sched, x0, gate, ws = K.make_inputs(
-                    key, tokens=b, steps=n, seed=b, **dims
+                    key, tokens=b, steps=n, seed=b, **dims_for(b)
                 )
-                f = _runner(arm, sched, n, common)
+                f = _runner(arm, sched, n, common_for(b))
                 meas[n] = (*_time(f, (x0, gate, ws), a.reps), sched.items)
             (m0, mn0, t0), (m1, mn1, t1) = meas[n_lo], meas[n_hi]
             slope = (m1 - m0) / (n_hi - n_lo)

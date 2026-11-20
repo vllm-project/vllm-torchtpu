@@ -35,7 +35,7 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from .kernel import F8, _rmsnorm, expert_ffn
+from .kernel import F8, _quant, _rmsnorm, expert_ffn, expert_ffn_q, quant_scratch
 
 PERCALL_ARMS = ("percall_vmem", "percall_constrained", "percall_streamed")
 
@@ -50,12 +50,28 @@ def step_schedule(sched, steps: int, experts: int):
     return jnp.asarray(count), jnp.asarray(order)
 
 
-def _vmem_step_kernel(cnt, order, x, gate, wg, wu, wd, sg, su, sd, out, acc):
+def _quant_once(x, q):
+    if q is None:
+        return None
+    xq, sx = _quant(x[...])
+    q[0][...] = xq
+    q[1][...] = jnp.broadcast_to(sx, q[1].shape)
+    return q
+
+
+def _ffn(x, q, *w):
+    if q is None:
+        return expert_ffn(x[...], *w)
+    return expert_ffn_q(q[0][...], q[1][:, :1], *w)
+
+
+def _vmem_step_kernel(cnt, order, x, gate, wg, wu, wd, sg, su, sd, out, acc, *q):
     acc[...] = jnp.zeros_like(acc)
+    q = _quant_once(x, q or None)
 
     def body(i, c):
         e = order[i]
-        y = expert_ffn(x[...], wg[e], wu[e], wd[e], sg[e], su[e], sd[e])
+        y = _ffn(x, q, wg[e], wu[e], wd[e], sg[e], su[e], sd[e])
         acc[...] += y * gate[e][:, :1]
         return c
 
@@ -64,10 +80,11 @@ def _vmem_step_kernel(cnt, order, x, gate, wg, wu, wd, sg, su, sd, out, acc):
 
 
 def _streamed_step_kernel(cnt, order, x, gate, sg, su, sd, *refs):
-    hbm, (out, acc, wg_buf, wu_buf, wd_buf, sem) = refs[:3], refs[3:]
+    hbm, (out, acc, wg_buf, wu_buf, wd_buf, sem), q = refs[:3], refs[3:9], refs[9:]
     bufs = (wg_buf, wu_buf, wd_buf)
     n = cnt[0]
     acc[...] = jnp.zeros_like(acc)
+    q = _quant_once(x, q or None)
 
     def copies(i, slot):
         e = order[i]
@@ -93,7 +110,7 @@ def _streamed_step_kernel(cnt, order, x, gate, sg, su, sd, *refs):
             c.wait()
         e = order[i]
         w = (wg_buf[slot], wu_buf[slot], wd_buf[slot], sg[e], su[e], sd[e])
-        acc[...] += expert_ffn(x[...], *w) * gate[e][:, :1]
+        acc[...] += _ffn(x, q, *w) * gate[e][:, :1]
         return carry
 
     jax.lax.fori_loop(0, n, body, 0)
@@ -101,7 +118,15 @@ def _streamed_step_kernel(cnt, order, x, gate, sg, su, sd, *refs):
 
 
 def build_percall(
-    arm, *, experts, hidden, inter, rows, vmem_limit_bytes, interpret=False
+    arm,
+    *,
+    experts,
+    hidden,
+    inter,
+    rows,
+    vmem_limit_bytes,
+    interpret=False,
+    hoist=True,
 ):
     """Jitted ``f(count, order, x0, gate, weights) -> [rows, hidden] f32``."""
     if arm not in PERCALL_ARMS:
@@ -120,6 +145,8 @@ def build_percall(
         ]
     else:
         kernel, in_specs = _vmem_step_kernel, [smem] * 2 + [vmem] * 8
+    if hoist:
+        scratch += quant_scratch(rows, hidden)
     extra = {"interpret": pltpu.InterpretParams()} if interpret else {}
     call = pl.pallas_call(
         kernel,

@@ -43,7 +43,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from .kernel import F8, _rmsnorm, expert_ffn
+from .kernel import F8, _quant, _rmsnorm, expert_ffn, expert_ffn_q, quant_scratch
 
 AXIS = "x"
 
@@ -68,14 +68,18 @@ def device_schedules(sched, steps, experts, devices):
     return starts, flat
 
 
-def _allreduce(acc, send, recv, ssem, rsem, parity, rounds):
-    """Recursive doubling; ``send`` is None for an f32 wire, else a cast buffer."""
+def _allreduce(acc, send, recv, ssem, rsem, parity, rounds, wire):
+    """Recursive doubling over the first ``wire`` rows of ``acc``.
+
+    ``send`` is None for an f32 wire, else a cast buffer of the wire dtype.
+    """
     me = lax.axis_index(AXIS)
+    rows = pl.ds(0, wire)
     for r in range(rounds):
         if send is not None:
-            send[...] = acc[...].astype(send.dtype)
+            send[...] = acc[rows, :].astype(send.dtype)
         c = pltpu.make_async_remote_copy(
-            src_ref=acc if send is None else send,
+            src_ref=acc.at[rows] if send is None else send,
             dst_ref=recv.at[parity, r],
             send_sem=ssem.at[parity, r],
             recv_sem=rsem.at[parity, r],
@@ -85,9 +89,17 @@ def _allreduce(acc, send, recv, ssem, rsem, parity, rounds):
         c.start()
         c.wait_recv()
         c.wait_send()
-        mine = acc[...] if send is None else send[...].astype(jnp.float32)
+        mine = acc[rows, :] if send is None else send[...].astype(jnp.float32)
         # Both sides add the same two wire values, so replicas stay identical.
-        acc[...] = mine + recv[parity, r].astype(jnp.float32)
+        acc[rows, :] = mine + recv[parity, r].astype(jnp.float32)
+
+
+def _step_barrier(sem, rounds):
+    """The all-reduce's partner pattern with no data: one signal/wait per round."""
+    me = lax.axis_index(AXIS)
+    for r in range(rounds):
+        pl.semaphore_signal(sem.at[r], device_id=(me ^ (1 << r),))
+        pl.semaphore_wait(sem.at[r], 1)
 
 
 def _barrier(rounds):
@@ -98,9 +110,13 @@ def _barrier(rounds):
     pl.semaphore_wait(sem, rounds)
 
 
-def _layer_kernel(*refs, steps, rounds, resident, allreduce, cast):
+def _layer_kernel(*refs, steps, rounds, resident, sync, cast, hoist, wire):
     starts, flat, x0, gate = refs[:4]
-    send = None
+    q_scr = bsem = send = None
+    if hoist:
+        refs, q_scr = refs[:-2], refs[-2:]
+    if sync == "barrier":
+        refs, bsem = refs[:-1], refs[-1]
     if cast:
         refs, send = refs[:-1], refs[-1]
     if resident:
@@ -124,12 +140,16 @@ def _layer_kernel(*refs, steps, rounds, resident, allreduce, cast):
             for c in copies(0, 0):
                 c.start()
 
-    if allreduce:
+    if sync != "none":
         _barrier(rounds)
     x[...] = x0[...].astype(jnp.float32)
 
     def step(s, carry):
         acc[...] = jnp.zeros_like(acc)
+        if hoist:  # quantize the step input once, not per expert
+            xq, sx = _quant(x[...])
+            q_scr[0][...] = xq
+            q_scr[1][...] = jnp.broadcast_to(sx, q_scr[1].shape)
 
         def item(i, c):
             e = flat[i]
@@ -146,17 +166,26 @@ def _layer_kernel(*refs, steps, rounds, resident, allreduce, cast):
                 for cp in copies(i, slot):
                     cp.wait()
                 w = (wg_buf[slot], wu_buf[slot], wd_buf[slot], sg[e], su[e], sd[e])
-            acc[...] += expert_ffn(x[...], *w) * gate[s, e][:, :1]
+            if hoist:
+                y = expert_ffn_q(q_scr[0][...], q_scr[1][:, :1], *w)
+            else:
+                y = expert_ffn(x[...], *w)
+            acc[...] += y * gate[s, e][:, :1]
             return c
 
         lax.fori_loop(starts[s], starts[s + 1], item, 0)
-        if allreduce:
-            _allreduce(acc, send, recv, ssem, rsem, s % 2, rounds)
+        if sync == "ar":
+            _allreduce(acc, send, recv, ssem, rsem, s % 2, rounds, wire)
+        elif sync == "barrier":
+            _step_barrier(bsem, rounds)
         x[...] = _rmsnorm(acc[...])
         return carry
 
     lax.fori_loop(0, steps, step, 0)
     out[...] = x[...]
+
+
+SYNCS = ("ar", "barrier", "none")
 
 
 def build_layer(
@@ -172,8 +201,20 @@ def build_layer(
     vmem_limit_bytes,
     interpret=False,
     ar_dtype=jnp.float32,
+    hoist=True,
+    wire_rows=None,
 ):
-    """Jitted ``f(starts, flat, x0, gate, *w) -> [D * rows, hidden]`` on ``mesh``."""
+    """Jitted ``f(starts, flat, x0, gate, *w) -> [D * rows, hidden]`` on ``mesh``.
+
+    ``allreduce`` is True ("ar"), False ("none") or one of ``SYNCS``; "barrier"
+    keeps the all-reduce's per-step partner synchronisation but moves no data.
+    ``rows`` must be a multiple of 32 when ``hoist`` (fp8 scratch); ``wire_rows``
+    (default ``rows``) is how many rows the all-reduce sends.
+    """
+    sync = {True: "ar", False: "none"}.get(allreduce, allreduce)
+    if sync not in SYNCS:
+        raise ValueError(f"allreduce must be bool or one of {SYNCS}, got {allreduce!r}")
+    wire = wire_rows or rows
     devices = mesh.shape[AXIS]
     rounds = int(np.log2(devices))
     if 2**rounds != devices:
@@ -185,7 +226,7 @@ def build_layer(
     scratch = [
         pltpu.VMEM((rows, hidden), jnp.float32),
         pltpu.VMEM((rows, hidden), jnp.float32),
-        pltpu.VMEM((2, max(rounds, 1), rows, hidden), ar_dtype),
+        pltpu.VMEM((2, max(rounds, 1), wire, hidden), ar_dtype),
         pltpu.SemaphoreType.DMA((2, max(rounds, 1))),
         pltpu.SemaphoreType.DMA((2, max(rounds, 1))),
     ]
@@ -201,9 +242,13 @@ def build_layer(
         ]
     cast = jnp.dtype(ar_dtype) != jnp.dtype(jnp.float32)
     if cast:
-        scratch.append(pltpu.VMEM((rows, hidden), ar_dtype))
+        scratch.append(pltpu.VMEM((wire, hidden), ar_dtype))
+    if sync == "barrier":
+        scratch.append(pltpu.SemaphoreType.REGULAR((max(rounds, 1),)))
+    if hoist:
+        scratch += quant_scratch(rows, hidden)
     params = dict(vmem_limit_bytes=int(vmem_limit_bytes))
-    if allreduce:
+    if sync != "none":
         params["collective_id"] = 0
     call = pl.pallas_call(
         functools.partial(
@@ -211,8 +256,10 @@ def build_layer(
             steps=steps,
             rounds=rounds,
             resident=resident,
-            allreduce=allreduce,
+            sync=sync,
             cast=cast,
+            hoist=hoist,
+            wire=wire,
         ),
         out_shape=jax.ShapeDtypeStruct((rows, hidden), jnp.float32),
         in_specs=in_specs,
