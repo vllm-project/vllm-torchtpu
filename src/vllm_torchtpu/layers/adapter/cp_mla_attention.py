@@ -165,12 +165,22 @@ def merge_lse_partials_all_to_all(
     # Destination-major: [world, T, local, V] and [world, T, local].
     o_send = output.reshape(num_tokens, world, local, vdim).transpose(0, 1)
     l_send = lse.to(torch.float32).reshape(num_tokens, world, local).transpose(0, 1)
-    if envs.TPU_DCP_LSE_MERGE_A2A_FUSED_LSE and output.dtype.itemsize in (2, 4):
+    if (
+        envs.TPU_DCP_LSE_MERGE_A2A_FUSED_LSE
+        and output.dtype.itemsize in (2, 4)
+        and _lse_lanes(local, output.dtype) <= vdim
+    ):
         o_recv, l_recv = _all_to_all_with_lse(o_send, l_send, group)
     else:
         o_recv = _all_to_all(o_send, group)
         l_recv = _all_to_all(l_send, group)
     return _merge_received(o_recv, l_recv).to(output.dtype)
+
+
+def _lse_lanes(local: int, dtype: torch.dtype) -> int:
+    """Lanes of `dtype` that carry `local` f32 lse values bit-exactly: two
+    16-bit halves each for a 2-byte dtype, one element each for 4 bytes."""
+    return 2 * local if dtype.itemsize == 2 else local
 
 
 def _all_to_all_with_lse(
@@ -186,38 +196,39 @@ def _all_to_all_with_lse(
     the two parts and rebuilds the f32 lse from the same bits, so the
     received values are bit-identical to those of the two-collective path.
 
-    Payload layout: `[world, T, local * V + L]`. Row `(d, t)` holds the
-    `local * V` partial values of token `t` for rank `d`, then an lse block of
-    `L` lanes, where `L` is the lse width rounded up to a multiple of 128.
-    The layout follows the TPU memory tiling of a 2-byte array, which is 16
-    rows by 128 lanes:
+    Payload layout: `[world, T, local + 1, V]`. Rows `[0, local)` of the
+    second-minor dimension are the partials of token `t` for rank `d`,
+    unchanged. Row `local` is one extra `V`-lane row that carries the token's
+    lse values; its unused lanes are zero. The payload keeps the partials'
+    own layout:
 
-    - The minor dimension `local * V + L` is a multiple of 128 when
-      `local * V` is, and the partials end on a 128-lane boundary. The
-      split after the exchange is then a tile-aligned slice that a consumer
-      fusion reads in place.
-    - The second-minor dimension is the token count, the same as in the
-      separate partials exchange.
-    - A flat `[world, T * local * V + 2 * T * local]` row is avoided. XLA
-      splits a minor dimension that large (32,896 at the sizes below) into
-      `[2, 16448]`. 16,448 is not a multiple of 128, so XLA inserts a
-      relayout copy of the whole payload after the exchange.
+    - The minor dimension stays `V`, and no reshape merges `local` and `V`
+      into one dimension. On TPU, a merged minor dimension (`local * V` or
+      larger) gave the all-to-all operand a different tiling from the
+      partials, and XLA inserted a relayout copy of the whole payload before
+      or after the exchange.
+    - The partials and the lse row are joined by a concatenation on dim -2,
+      and split again by slices on dim -2. Both are tile-aligned in the minor
+      dimension, so XLA can build the payload in one fusion and the consumer
+      fusion can read the received slices in place.
 
     For 2-byte partials, each f32 lse is sent as two 16-bit halves: lanes
-    `[0, local)` of the block hold the high halves and lanes
+    `[0, local)` of the lse row hold the high halves and lanes
     `[local, 2 * local)` the low halves. The halves are computed with
     integer shifts and masks, and each half is reinterpreted as one element
     of the partials' dtype. A reinterpretation between two dtypes of equal
     width keeps the shape. Viewing f32 as pairs of 16-bit values would add a
     minor dimension of size 2, which the TPU tiling pads to 128 lanes and
     relayouts. For 4-byte partials, each lse is reinterpreted as one element.
-    The unused lanes of the block are zero.
+    The caller must ensure that the lse lanes fit in one row, that is
+    `_lse_lanes(local, dtype) <= V`.
 
-    Example: world 16, T = 16, 4 local heads, V = 512, bf16 partials. Each
-    row holds 4 * 512 = 2,048 partial values, then a block of 128 lanes whose
-    first 8 lanes are the high and low halves of the token's 4 lse values.
-    The all-to-all moves bf16[16, 16, 2176], 6.25% more bytes than the
-    partials alone.
+    Example: world 16, T = 16, 4 local heads, V = 512, bf16 partials. The
+    payload is bf16[16, 16, 5, 512]. Row 4 of token `t` holds the high halves
+    of the token's 4 lse values in lanes 0-3, the low halves in lanes 4-7,
+    and zeros in lanes 8-511. The TPU tiling of a 2-byte array pads the
+    second-minor dimension to 16 rows, so the padded payload has the same
+    size in memory as the padded partials alone.
 
     Args:
       o_send: `[world, T, local, V]` partials in a 2- or 4-byte dtype. Block
@@ -229,8 +240,10 @@ def _all_to_all_with_lse(
       `(o_recv, l_recv)`: `[world, T, local, V]` in `o_send.dtype` and
       `[world, T, local]` f32. Block `r` of each came from rank `r`.
     """
-    world, num_tokens, local, vdim = o_send.shape
+    local, vdim = o_send.shape[-2:]
     dtype = o_send.dtype
+    num_l = _lse_lanes(local, dtype)
+    assert num_l <= vdim, (local, vdim, dtype)
     bits = l_send.contiguous().view(torch.int32)
     if dtype.itemsize == 2:
         # Each half is a value in [-32768, 32767], so the int16 conversion
@@ -240,28 +253,19 @@ def _all_to_all_with_lse(
         l_vals = torch.cat([hi, lo], dim=-1).to(torch.int16).view(dtype)
     else:
         l_vals = bits.view(dtype)
-    num_l = l_vals.shape[-1]
-    l_lanes = -(-num_l // 128) * 128
-    l_block = torch.nn.functional.pad(l_vals, (0, l_lanes - num_l))
+    l_row = torch.nn.functional.pad(l_vals, (0, vdim - num_l)).unsqueeze(-2)
 
-    num_o = local * vdim
-    payload = torch.cat(
-        [o_send.reshape(world, num_tokens, num_o), l_block], dim=-1
-    )
+    payload = torch.cat([o_send, l_row], dim=-2)
     recv = _all_to_all(payload, group)
 
-    o_recv = recv[..., :num_o].reshape(world, num_tokens, local, vdim)
+    o_recv = recv[..., :local, :]
+    l_recv = recv[..., local, :]
     if dtype.itemsize == 2:
-        hi_r = recv[..., num_o : num_o + local].view(torch.int16).to(torch.int32)
-        lo_r = (
-            recv[..., num_o + local : num_o + 2 * local]
-            .view(torch.int16)
-            .to(torch.int32)
-            & 0xFFFF
-        )
+        hi_r = l_recv[..., :local].view(torch.int16).to(torch.int32)
+        lo_r = l_recv[..., local : 2 * local].view(torch.int16).to(torch.int32) & 0xFFFF
         l_bits = torch.bitwise_left_shift(hi_r, 16) | lo_r
     else:
-        l_bits = recv[..., num_o : num_o + local].view(torch.int32)
+        l_bits = l_recv[..., :local].view(torch.int32)
     return o_recv, l_bits.view(torch.float32)
 
 

@@ -607,9 +607,36 @@ def test_fused_lse_flag_selects_one_all_to_all(
     assert len(calls) == expect_calls * world
     assert len(rs_calls) == (0 if expect_calls else world)
     if expect_calls == 1:
-        # One row per destination and token: the partials, then a 128-lane
-        # block that carries the token's lse as high and low bf16 halves.
-        assert set(calls) == {(world, tokens, local * vdim + 128)}
+        # The partials in their own layout, plus one extra V-lane row per
+        # destination and token that carries the token's lse as high and low
+        # bf16 halves.
+        assert set(calls) == {(world, tokens, local + 1, vdim)}
+
+
+def test_fused_lse_needs_lse_lanes_to_fit_in_one_row(monkeypatch):
+    """With 4 local heads, bf16 partials need 8 lse lanes in the extra row. At
+    V = 4 they do not fit, so the merge keeps the two all-to-alls, and the
+    result is still bit-identical."""
+    calls = []
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_FUSED_LSE", True, raising=False
+    )
+    outputs, lses = _hard_partials(np.random.default_rng(41), 4, vdim=4)
+    hub = _ExchangeHub(4)
+
+    def run(rank):
+        group = _A2AGroup(hub, rank)
+        return cp_mla.merge_lse_partials_all_to_all(outputs[rank], lses[rank], group)
+
+    def recording_all_to_all(x, group):
+        calls.append(tuple(x.shape))
+        return group.all_to_all(x)
+
+    monkeypatch.setattr(cp_mla, "_all_to_all", recording_all_to_all)
+    with concurrent.futures.ThreadPoolExecutor(4) as pool:
+        got = torch.cat(list(pool.map(run, range(4))), dim=1)
+    assert len(calls) == 2 * 4
+    assert _bf16_close(got, _reference_merge(outputs.float(), lses))
 
 
 @pytest.mark.parametrize(
