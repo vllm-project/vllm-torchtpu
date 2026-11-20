@@ -1041,17 +1041,20 @@ class PallasAttentionBackendImpl(AttentionImpl):
             return existing
         if modes.any() and (
             use_pcp_streaming
+            or self.head_size == 64
             or "attention_modes" not in inspect.signature(self._kernel_entry).parameters
         ):
             # Only the batched RPA entry runs reduced-precision modes; the PCP
-            # streaming kernel and the other entries would drop them. Checked
-            # on a cache miss only: the modes are part of the key, so a cached
-            # kernel has passed this check.
-            kernel = (
-                "the PCP streaming RPA kernel"
-                if use_pcp_streaming
-                else self._kernel_entry.__name__
-            )
+            # streaming kernel, the head_dim 64 kernel that
+            # sharded_ragged_paged_attention switches to, and the other entries
+            # would drop them. Checked on a cache miss only: the modes are part
+            # of the key, so a cached kernel has passed this check.
+            if use_pcp_streaming:
+                kernel = "the PCP streaming RPA kernel"
+            elif self.head_size == 64:
+                kernel = "ragged_paged_attention_hd64, which runs head_size 64,"
+            else:
+                kernel = self._kernel_entry.__name__
             raise NotImplementedError(
                 f"{kernel} has no reduced-precision attention modes, but this "
                 f"layer asks for {modes}; leave attention_modes off for it."
