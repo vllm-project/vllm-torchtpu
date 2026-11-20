@@ -379,10 +379,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
     _checkpoint_alignment: int | None = None
     # An output projection fused with the gated norm, called as
-    # fn(layer, core_attn_out, z) with z as [tokens, local value dim], or None
-    # for RMSNormGated followed by out_proj. A model rule sets it on the
-    # layers it serves once their weights are loaded.
-    fused_output_projection: Callable[..., torch.Tensor] | None = None
+    # fn(layer, core_attn_out, z) with z 2D ([tokens, local value dim]) or 3D
+    # (the pooled PCP op's), or None for RMSNormGated followed by out_proj. A
+    # model rule sets it on the layers it serves once their weights are loaded.
+    fused_output_projection: (
+        Callable[[Any, torch.Tensor, torch.Tensor], torch.Tensor] | None
+    ) = None
 
     # Narrowed to the layer that _create_conv1d installs.
     # pyrefly: ignore[bad-override-mutable-attribute]
