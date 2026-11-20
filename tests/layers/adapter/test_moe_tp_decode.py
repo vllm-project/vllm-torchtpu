@@ -53,6 +53,35 @@ class _Fp8Linear(torch.nn.Module):
         )
 
 
+class _CheckpointFp8Linear(torch.nn.Module):
+    """A shared-expert linear of a block-quantized FP8 checkpoint, loaded but
+    before VllmFp8LinearMethodTPU.process_weights_after_loading: the
+    checkpoint's [n, k] weight and its block scales under both names, as the
+    method's create_weights registers them."""
+
+    BLOCK = 128
+
+    def __init__(self, k, n, linear_config, *, reduce_results=None):
+        super().__init__()
+        self.quant_method = fp8_mod.VllmFp8LinearMethodTPU(
+            fp8_mod.VllmFp8Config(
+                is_checkpoint_fp8_serialized=True,
+                weight_block_size=[self.BLOCK, self.BLOCK],
+            ),
+            linear_config,
+        )
+        self.weight = torch.nn.Parameter(
+            (torch.randn(n, k) / math.sqrt(k)).to(FP8), requires_grad=False
+        )
+        scale = torch.rand(n // self.BLOCK, k // self.BLOCK) + 0.5
+        self.weight_scale_inv = torch.nn.Parameter(scale, requires_grad=False)
+        self.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+        self.logical_widths = [n]
+        self.bias = None
+        if reduce_results is not None:
+            self.reduce_results = reduce_results
+
+
 class _SharedMLP(torch.nn.Module):
     """DeepseekV2MLP's structure (reduce_results=False); forward counts calls."""
 
@@ -252,7 +281,7 @@ def harness(monkeypatch):
 
     monkeypatch.setattr(moe_tp_decode, "_selftest", selftest)
     monkeypatch.setattr(moe_tp_decode, "_RANK_BUFFER", None)
-    monkeypatch.setattr(moe_tp_decode, "_SELFTEST_DONE", False)
+    monkeypatch.setattr(moe_tp_decode, "_SELFTESTED_BUCKETS", set())
     monkeypatch.setattr(moe_tp_decode, "logger", _Log(h.logs))
     return h
 
@@ -416,6 +445,56 @@ def test_refuses_a_topology_it_cannot_serve(harness, monkeypatch):
     model = harness.model({})
     assert moe_tp_decode.arm(model) == 0
     assert "no EP group" in harness.logs[-1] and "mesh index -1" in harness.logs[-1]
+
+
+@pytest.mark.parametrize(
+    ("kernel", "block", "dtype", "admitted"),
+    [
+        pytest.param(False, None, "float8_e4m3fn", True, id="per-channel"),
+        pytest.param(True, 128, "float8_e4m3fn", False, id="blockwise"),
+        pytest.param(True, 4096, "float8_e4m3fn", True, id="block-wider-than-k"),
+        pytest.param(False, None, "int8", False, id="int8"),
+    ],
+)
+def test_pre_load_admission_predicts_an_fp8_checkpoint_shared_expert(
+    harness, kernel, block, dtype, admitted
+):
+    """Before an FP8-checkpoint shared expert's weights are processed, pre-load
+    admission takes it exactly when processing leaves it per-channel FP8 (a
+    block wider than K falls back to per-channel), with the layout processing
+    produces; a blockwise or non-FP8 requantization is refused before and
+    after."""
+    linear_config = SimpleNamespace(
+        enable_quantized_matmul_kernel=kernel,
+        requant_block_size=block,
+        requant_weight_dtype=dtype,
+    )
+    runner = harness.runner("model.layers.0.mlp.experts")
+    mlp = runner.shared_experts._layer
+    mlp.gate_up_proj = _CheckpointFp8Linear(H, 2 * FS, linear_config)
+    mlp.down_proj = _CheckpointFp8Linear(FS, H, linear_config, reduce_results=False)
+    unflipped = moe_tp_decode._shared_slice(runner)
+    assert unflipped == "a shared-expert weight is not K-major"
+
+    predicted = moe_tp_decode._shared_slice(runner, pre_load=True)
+    for lin in (mlp.gate_up_proj, mlp.down_proj):
+        lin.quant_method.process_weights_after_loading(lin)
+    loaded = moe_tp_decode._shared_slice(runner)
+
+    if not admitted:
+        refusal = "the shared expert is not FP8 with per-channel scales"
+        assert predicted == loaded == refusal
+        return
+    assert not isinstance(predicted, str) and not isinstance(loaded, str)
+    assert [(tuple(p.shape), p.dtype) for p in predicted] == [
+        (tuple(s.shape), s.dtype) for s in map(moe_tp_decode._sds, loaded)
+    ]
+    assert [tuple(p.shape) for p in predicted] == [
+        (H, 2 * FS),
+        (2 * FS,),
+        (FS, H),
+        (H,),
+    ]
 
 
 @pytest.mark.parametrize(

@@ -5417,6 +5417,14 @@ class TPUModelRunner(GPUModelRunner):
                 )
 
                 arm_runner_models(self)
+        if envs.USE_MOE_TP_DECODE_NVFP4_KERNEL:
+            from vllm_torchtpu.layers.adapter import moe_tp_decode_nvfp4
+
+            if moe_tp_decode_nvfp4.should_arm():
+                draft = (
+                    self._async_drafter.draft_model if self._is_async_drafter else None
+                )
+                moe_tp_decode_nvfp4.arm(self.model, draft)
 
         # After moe_tp_decode and its prequant pairing: the split reuses their ops.
         if envs.TPU_PREFILL_SEQ_PARALLEL:
