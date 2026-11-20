@@ -30,6 +30,8 @@ chip. The arguments they refuse, and the order of the scatter's copies and
 waits in its traced program, are checked on CPU.
 """
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -186,6 +188,35 @@ def test_no_scale_plane_is_scattered_before_every_plane_gather_landed(
     assert checked == n_scales
 
 
+def _scatter_name(n_scales, **kwargs):
+    """The name of the scatter program built for 32 shards of 1024 tokens'
+    pairs (a 1024-pair run per subcore) at `n_scales` planes."""
+    operands, shape_kwargs = _scatter_shapes(
+        32 * 1024, 1024, tokens=1024, n_scales=n_scales
+    )
+    traced = jax.make_jaxpr(
+        lambda *ops: row_tables_kernel.scatter_row_tables(
+            *ops, **shape_kwargs, **kwargs
+        )
+    )(*operands)
+    (name,) = set(re.findall(r"fused_ep_row_tables_\w+", str(traced)))
+    return name
+
+
+@pytest.mark.cpu_test
+def test_the_scatter_chunk_shrinks_so_its_ring_fits_a_subcore(tpu7x_record):
+    """The ring holds ring x chunk words of routed rows and tokens and, per
+    scale plane, three more such buffers. At one plane the default chunk is
+    the largest of up to 640 pairs that divides the run (512 here); at 32
+    planes a 512-pair chunk's ring of 4 would be 0.8 MB, over a TPU7x vector
+    subcore's 512 KiB of VMEM, so the chunk shrinks to 256 pairs (0.4 MB).
+    An explicit chunk that does not fit is refused."""
+    assert _scatter_name(1) == "fused_ep_row_tables_c512x4"
+    assert _scatter_name(32) == "fused_ep_row_tables_c256x4_p32"
+    with pytest.raises(ValueError, match="bytes of VMEM"):
+        _scatter_name(32, chunk=512)
+
+
 @pytest.mark.cpu_test
 def test_the_config_takes_the_scatter_ring_the_scatter_takes():
     """Config refuses a one-slot scatter ring, as scatter_row_tables does (a
@@ -275,6 +306,8 @@ def test_gather_rows_prefix_writes_the_live_prefix(tpu7x, live_blocks):
         ring=ring,
     )
     live = n_subcores * run_live
+    # With no live block the prefix is empty and this compares two empty
+    # arrays: that case shows only that the call returns.
     np.testing.assert_array_equal(
         _as_bits(got)[:live], _as_bits(rows)[np.asarray(index)[:live]]
     )
