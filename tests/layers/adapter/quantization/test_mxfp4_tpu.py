@@ -245,3 +245,44 @@ def test_device_dequant_matches_cpu_reference_bit_for_bit(device):
         ).cpu()
         assert actual.dtype == expected.dtype
         assert torch.equal(actual, expected)
+
+
+def test_prepare_in_expert_slices_matches_whole_layer(device, monkeypatch):
+    # Preparing the experts in slices (here 3, 3 and 2 of 8 experts) must give
+    # the same bits as preparing the whole layer at once, for the weights,
+    # their scales and the biases, and must release the source weights.
+    layer, method = _build_layer_and_method(device)
+    names = (
+        "w13_weight",
+        "w13_weight_scale",
+        "w2_weight",
+        "w2_weight_scale",
+        "w13_bias",
+        "w2_bias",
+    )
+    sources = {name: getattr(layer, name).data.cpu() for name in names}
+    activation = method._set_tpu_activation(layer)
+
+    def prepare(experts_per_slice):
+        for name in names:
+            setattr(
+                layer,
+                name,
+                torch.nn.Parameter(sources[name].to(device), requires_grad=False),
+            )
+        monkeypatch.setenv(
+            "VLLM_TPU_MXFP4_PREPARE_CHUNK_EXPERTS", str(experts_per_slice)
+        )
+        prepared = method._prepare_expert_weights(layer, activation, device)
+        assert not hasattr(layer, "w13_weight")
+        assert not hasattr(layer, "w2_weight_scale")
+        return prepared
+
+    whole = prepare(0)
+    sliced = prepare(3)
+    assert whole[-1] is None and sliced[-1] is None  # GMM path: no fused op
+    for expected, actual in zip(whole[:-1], sliced[:-1]):
+        assert expected.shape == actual.shape
+        assert expected.dtype == actual.dtype
+        expected, actual = expected.cpu(), actual.cpu()
+        assert torch.equal(expected.view(torch.uint8), actual.view(torch.uint8))

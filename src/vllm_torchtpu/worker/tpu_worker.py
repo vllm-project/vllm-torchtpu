@@ -728,6 +728,7 @@ class TPUWorker(WorkerBase):
 
         patch_registry.apply("model_load", model_config=self.model_config)
         self.model_runner.load_model()
+        self._log_device_memory("after load_model")
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
@@ -746,7 +747,23 @@ class TPUWorker(WorkerBase):
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
         gc_policy.arm_after_warmup()
+        self._log_device_memory("after compile_or_warm_up_model")
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
+
+    def _log_device_memory(self, stage: str) -> None:
+        """Log this worker's TPU memory at a start-up stage.
+
+        Enabled by VLLM_TPU_MXFP4_PREPARE_LOG_HBM, which also logs the memory
+        around each MXFP4 expert layer's preparation, so one variable shows
+        where device memory goes from weight loading to serving.
+        """
+        if envs.VLLM_TPU_MXFP4_PREPARE_LOG_HBM:
+            logger.info(
+                "Device memory %s | rank=%s | %s",
+                stage,
+                self.rank,
+                utils.device_memory_summary(),
+            )
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
         """Kernel-iteration hot-reload: re-import the reloadable kernel
@@ -794,6 +811,9 @@ class TPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        self._log_device_memory(
+            f"after KV cache allocation ({kv_cache_config.num_blocks} blocks)"
+        )
 
     def get_node_kv_ip_port(self) -> tuple[int, str, int]:
         node_id = dist_utils.get_node_id()

@@ -86,7 +86,7 @@ from vllm_torchtpu.layers.core.quantization import (
     materialize_static_scale,
 )
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import device_memory_summary, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
@@ -387,6 +387,35 @@ def _row_padded_flat_block_scale(scale: torch.Tensor) -> torch.Tensor:
     padded = torch.nn.functional.pad(scale.squeeze(2), (0, 0, 0, rows - blocks))
     flat = padded.reshape(experts * rows, n).clone()
     return materialize_static_scale(flat)
+
+
+class _ExpertSlice:
+    """The experts ``[start, stop)`` of a routed-experts layer's weights.
+
+    Exposes the attributes ``_dequantize_and_pad`` reads (``w13_weight``,
+    ``w13_weight_scale``, ``w2_weight``, ``w2_weight_scale`` and the
+    optional ``w13_bias`` and ``w2_bias``) as slices along the expert axis,
+    so a slice of experts is prepared by the same code as a whole layer.
+    """
+
+    def __init__(self, layer: torch.nn.Module, start: int, stop: int):
+        for name in (
+            "w13_weight",
+            "w13_weight_scale",
+            "w2_weight",
+            "w2_weight_scale",
+            "w13_bias",
+            "w2_bias",
+        ):
+            tensor = getattr(layer, name, None)
+            setattr(self, name, None if tensor is None else tensor[start:stop])
+
+
+def _with_leading_dim(tensor: torch.Tensor, size: int) -> torch.Tensor:
+    """A meta tensor of ``tensor``'s shape and dtype with dim 0 set to ``size``."""
+    return torch.empty(
+        (size, *tensor.shape[1:]), dtype=tensor.dtype, device="meta"
+    )
 
 
 # TODO(upstream): Replace this subclass with upstream vLLM's MXFP4 method once
@@ -698,6 +727,103 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             w2_weight_scale,
         )
 
+    def _prepare_expert_weights(
+        self,
+        layer: "TpuRoutedExperts",
+        activation_str: str,
+        device: torch.device,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        Any | None,
+    ]:
+        """Dequantize, pad and requantize the experts, a slice at a time.
+
+        Every step of the preparation (MXFP4 decode, w1/w3 concatenation,
+        transpose, padding, FP4 requantization in blocks along K) works on
+        one expert at a time, so preparing the experts in slices and joining
+        the results along the expert axis gives the same bits as preparing
+        the whole layer at once. The slices bound the device memory of the
+        intermediates. Prepared whole, one layer of DeepSeek-V4.1-Flash with
+        96 experts per device holds a padded bfloat16 w13 of
+        96 x 5120 x 5120 x 2 B = 4.7 GiB and the quantizer's float32 copy of
+        it at the same time. A slice of 8 experts holds 1/12 of that. Each
+        slice is synchronized before the next one starts, so its
+        intermediates are freed. The source weights are released before the
+        slices are joined, so the layer's peak is the source weights plus
+        the prepared slices, or the prepared slices plus the joined result.
+
+        Args:
+            layer: The routed-experts layer whose MXFP4 source weights
+                (``w13_weight``, ``w2_weight`` and their scales) are loaded.
+            activation_str: The kernel activation name, passed to the fused
+                EP admission.
+            device: The device the prepared weights are placed on.
+
+        Returns:
+            ``(w13, w2, w13_scale, w2_scale, w13_bias, w2_bias, op)``: the
+            requantized weights and their float32 block scales, the padded
+            biases (``None`` without biases), and the fused EP op, or
+            ``None`` when the layer runs the GMM path. The source weights are
+            released from ``layer``.
+        """
+        num_experts = layer.w13_weight.shape[0]
+        step = envs.VLLM_TPU_MXFP4_PREPARE_CHUNK_EXPERTS
+        if step <= 0 or step >= num_experts:
+            step = num_experts
+        op = None
+        parts = []
+        for start in range(0, num_experts, step):
+            (
+                w13_weight_padded,
+                w2_weight_padded,
+                w13_bias_padded,
+                w2_bias_padded,
+                orig_intermediate,
+            ) = self._dequantize_and_pad(
+                _ExpertSlice(layer, start, min(start + step, num_experts))
+            )
+            if start == 0:
+                # Decided before the quantization, not after: the two paths
+                # differ only in whether the fp4 pairs cross the bridge
+                # packed, and that is an argument to the quantizer. The
+                # admission reads only shapes, so it is given the whole
+                # layer's shapes on meta tensors.
+                op = self._prebuild_w4a8(
+                    layer,
+                    activation_str,
+                    _with_leading_dim(w13_weight_padded, num_experts),
+                    _with_leading_dim(w2_weight_padded, num_experts),
+                    orig_intermediate,
+                )
+            quantized = self._requantize_native_fp4(
+                w13_weight_padded,
+                w2_weight_padded,
+                orig_intermediate,
+                device,
+                pack=op is None,
+            )
+            del w13_weight_padded, w2_weight_padded
+            part = (*quantized, w13_bias_padded, w2_bias_padded)
+            if step < num_experts:
+                synchronize_tensors(
+                    [t for t in part if t is not None and t.device.type == "tpu"]
+                )
+            parts.append(part)
+        self._release_source_weights(layer)
+        if len(parts) == 1:
+            return (*parts[0], op)
+        joined = tuple(
+            None if column[0] is None else torch.cat(column, dim=0)
+            for column in zip(*parts)
+        )
+        del parts
+        return (*joined, op)
+
     def _release_source_weights(self, layer: RoutedExperts):
         del layer.w13_weight, layer.w2_weight
         del layer.w13_weight_scale, layer.w2_weight_scale
@@ -720,36 +846,17 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             register_score_bias_buffer,
         )
 
-        (
-            w13_weight_padded,
-            w2_weight_padded,
-            w13_bias_padded,
-            w2_bias_padded,
-            orig_intermediate,
-        ) = self._dequantize_and_pad(layer)
-        # Decided before the quantization, not after: the two paths differ
-        # only in whether the fp4 pairs cross the bridge packed, and that is
-        # an argument to the quantizer.
-        op = self._prebuild_w4a8(
-            layer,
-            activation_str,
-            w13_weight_padded,
-            w2_weight_padded,
-            orig_intermediate,
-        )
+        log_hbm = envs.VLLM_TPU_MXFP4_PREPARE_LOG_HBM and device.type == "tpu"
+        hbm_before = device_memory_summary(device) if log_hbm else ""
         (
             w13_weight_processed,
             w2_weight_processed,
             w13_weight_scale,
             w2_weight_scale,
-        ) = self._requantize_native_fp4(
-            w13_weight_padded,
-            w2_weight_padded,
-            orig_intermediate,
-            device,
-            pack=op is None,
-        )
-        self._release_source_weights(layer)
+            w13_bias_padded,
+            w2_bias_padded,
+            op,
+        ) = self._prepare_expert_weights(layer, activation_str, device)
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight_processed, requires_grad=False)
@@ -765,7 +872,14 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 w2_bias_padded.to(device), requires_grad=False
             )
 
-        to_sync = [layer.w13_weight, layer.w2_weight]
+        # The scales are synchronized too. A scale that stays deferred keeps
+        # the graph that produces it, and that graph keeps its device inputs.
+        to_sync = [
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+        ]
         if hasattr(layer, "w13_bias") and layer.w13_bias is not None:
             to_sync.append(layer.w13_bias)
         if hasattr(layer, "w2_bias") and layer.w2_bias is not None:
@@ -776,6 +890,13 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             "DeepSeek-V4 MXFP4 weights prepared for %s.",
             "fused EP W4A8" if op is not None else "GMM",
         )
+        if log_hbm:
+            logger.info(
+                "MXFP4 prepare HBM | layer=%s | before: %s | after: %s",
+                getattr(layer, "layer_name", "?"),
+                hbm_before,
+                device_memory_summary(device),
+            )
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=device)

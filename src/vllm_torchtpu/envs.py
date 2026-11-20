@@ -189,6 +189,8 @@ if TYPE_CHECKING:
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
+    VLLM_TPU_MXFP4_PREPARE_CHUNK_EXPERTS: int = 8
+    VLLM_TPU_MXFP4_PREPARE_LOG_HBM: bool = False
     VLLM_TPU_DEBUG_PCP_LAYOUT: bool = False
     TPU_LOCAL_RANK_OFFSET: int = 0
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
@@ -1211,6 +1213,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Dequantize and pad MXFP4 expert weights on the TPU, where they already
     # sit after loading, instead of round-tripping them through host memory.
     "VLLM_TPU_MXFP4_DEVICE_DEQUANT": env_bool("VLLM_TPU_MXFP4_DEVICE_DEQUANT", True),
+    # Experts per slice when MXFP4 expert weights are prepared on the TPU
+    # (dequantize, pad, requantize). Bounds the device memory of the
+    # intermediates to that many experts; the result is bit-identical for any
+    # value. 0 prepares the whole layer at once.
+    "VLLM_TPU_MXFP4_PREPARE_CHUNK_EXPERTS": env_int(
+        "VLLM_TPU_MXFP4_PREPARE_CHUNK_EXPERTS", 8
+    ),
+    # Log device memory before and after each MXFP4 expert layer is prepared.
+    "VLLM_TPU_MXFP4_PREPARE_LOG_HBM": env_bool("VLLM_TPU_MXFP4_PREPARE_LOG_HBM"),
     # Log the PCP sequence layout window on every step.
     "VLLM_TPU_DEBUG_PCP_LAYOUT": env_bool("VLLM_TPU_DEBUG_PCP_LAYOUT"),
     # Added to every worker's local rank when it binds to a physical chip.

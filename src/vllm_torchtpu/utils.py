@@ -91,6 +91,52 @@ def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
     return usage
 
 
+def device_memory_summary(device: Any = None) -> str:
+    """This process's TPU memory in GiB as one log field, for diagnostics.
+
+    Reports the torch allocator's in-use and peak bytes
+    (``torch.accelerator.memory_allocated`` and ``max_memory_allocated``),
+    the device's free and total bytes (``torch.accelerator.get_memory_info``)
+    and the PJRT counters of the first local JAX device (``bytes_in_use``,
+    ``peak_bytes_in_use``, ``bytes_limit``). A counter the runtime does not
+    provide is left out, so the result is ``"n/a"`` when none is available.
+
+    Args:
+        device: The torch device to query; ``None`` means the current one.
+
+    Returns:
+        A string such as ``"alloc=81.20 alloc_peak=88.02 free=13.11
+        total=94.74 pjrt_in_use=81.63 pjrt_peak=88.40 pjrt_limit=94.74"``.
+    """
+    gib = float(1 << 30)
+    fields = []
+    for name, read in (
+        ("alloc", lambda: torch.accelerator.memory_allocated(device)),
+        ("alloc_peak", lambda: torch.accelerator.max_memory_allocated(device)),
+    ):
+        try:
+            fields.append(f"{name}={read() / gib:.2f}")
+        except Exception:  # noqa: BLE001 - diagnostics only
+            pass
+    try:
+        free, total = torch.accelerator.get_memory_info(device)
+        fields.append(f"free={free / gib:.2f} total={total / gib:.2f}")
+    except Exception:  # noqa: BLE001 - diagnostics only
+        pass
+    try:
+        stats = jax.local_devices()[0].memory_stats() or {}
+        for name, key in (
+            ("pjrt_in_use", "bytes_in_use"),
+            ("pjrt_peak", "peak_bytes_in_use"),
+            ("pjrt_limit", "bytes_limit"),
+        ):
+            if key in stats:
+                fields.append(f"{name}={stats[key] / gib:.2f}")
+    except Exception:  # noqa: BLE001 - diagnostics only
+        pass
+    return " ".join(fields) or "n/a"
+
+
 def get_device_name(num_devices: int | None = None):
     kind = jax.devices()[0].device_kind
     if "TPU" not in kind:
