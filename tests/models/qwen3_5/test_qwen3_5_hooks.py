@@ -27,7 +27,7 @@ from vllm.model_executor.models.config import (
     Qwen3_5ForConditionalGenerationConfig,
 )
 
-from vllm_torchtpu import additional_config_sections, tpu_info
+from vllm_torchtpu import additional_config_sections, envs, tpu_info
 from vllm_torchtpu.models.qwen3_5 import hooks, settings
 from vllm_torchtpu.models.qwen3_5.hooks import TPUQwen35MoeConfig
 from vllm_torchtpu.models.vllm import register_models
@@ -141,8 +141,15 @@ def _tpu7x(monkeypatch):
 
 def _set_moe_env(monkeypatch, env: dict) -> None:
     """Sets the fused EP MoE variables as ``env`` has them (unset if absent),
-    so the hook reads its MoE kernel through envs.py's own readers."""
+    so the hook reads its MoE kernel through envs.py's own readers.
+
+    envs.py reads these names lazily, so monkeypatch.setattr on one of them in
+    another test restores a plain module attribute holding the value it read,
+    and that attribute hides the reader from every later test in the process.
+    Such an attribute is dropped for this test."""
     for name in ("USE_MOE_FUSED_EP_KERNEL", "MOE_FUSED_EP_KERNEL_IMPL"):
+        if name in vars(envs):
+            monkeypatch.delattr(envs, name)
         if name in env:
             monkeypatch.setenv(name, str(env[name]))
         else:
