@@ -23,12 +23,12 @@ this build claims (``additional_config_sections``), and applies the TPU
 defaults below. Engines of other architectures get none of this.
 
 Each default fills a value only when the user left it unset, so an explicit
-command-line value always wins. The KV budget and the prefix match unit apply
-only on the engines they were measured on: Qwen3.5-397B-A17B on TPU7x, in the
-roles and layouts of the validation entries (``validation/``). The kernel
-page applies to either leg of a KV-transfer pair of that checkpoint shape on
-any chip, because it only makes the two legs page alike. Every other engine
-keeps main's behaviour.
+command-line value always wins. Every default below but the kernel page
+applies only on the engines it was measured on: Qwen3.5-397B-A17B on TPU7x,
+in the roles and layouts of the validation entries (``validation/``). The
+kernel page applies to either leg of a KV-transfer pair of that checkpoint
+shape on any chip, because it only makes the two legs page alike. Every other
+engine keeps main's behaviour.
 
 - ``prefix_match_unit``: 128 tokens on a prefill (``kv_producer``) leg
   without prefill or decode context parallelism (the entries' PP8 prefill
