@@ -45,6 +45,7 @@ from torch_tpu._internal import pallas
 from vllm.distributed import parallel_state
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed.chip_topology import get_chip_topology
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
 from vllm_torchtpu.kernels.collectives import tp_all_reduce as kernel
 from vllm_torchtpu.logger import init_logger
@@ -83,16 +84,20 @@ def _body(n: int, max_bytes: int, axis: str, table: tuple[int, ...] | None):
 
 
 def _two_level_table(mesh) -> tuple[int, ...] | None:
-    """kernel.two_level_table of the mesh's chips, by device coordinates; None
-    (the flat kernel only) when the devices expose none."""
-    chips: dict[tuple, list[int]] = {}
-    for index, device in enumerate(mesh.devices.flat):
-        coords = getattr(device, "coords", None)
-        if coords is None:
-            logger.warning("tp_all_reduce: mesh devices expose no coords")
-            return None
-        chips.setdefault(tuple(coords), []).append(index)
-    return kernel.two_level_table([chips[c] for c in sorted(chips)])
+    """kernel.two_level_table of the mesh's chips (chip_topology's grouping of
+    device ids); None, the flat kernel only, when the grouping is unknown."""
+    topology = get_chip_topology()
+    if topology is None:
+        return None
+    index = {int(d.id): i for i, d in enumerate(mesh.devices.flat)}
+    if sorted(index) != sorted(d for chip in topology.chips for d in chip):
+        logger.warning(
+            "tp_all_reduce: mesh devices %s are not the chips' %s",
+            sorted(index),
+            topology.chips,
+        )
+        return None
+    return kernel.two_level_table([[index[d] for d in chip] for chip in topology.chips])
 
 
 def _make_op(mesh, max_bytes: int, table: tuple[int, ...] | None):
