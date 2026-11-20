@@ -131,3 +131,14 @@ class TPUMuseSparkConfig(VerifyAndUpdateConfig):
                 "Muse Spark on TPU does not support TPU_EXPERT_PLACEMENT: the "
                 "fused post-norm MoE op routes directly from router_w_kmajor."
             )
+        mm_cfg = getattr(vllm_config.model_config, "multimodal_config", None)
+        if mm_cfg is not None and getattr(mm_cfg, "mm_encoder_tp_mode", None) == "data":
+            raise NotImplementedError(
+                "Muse Spark on TPU does not support mm_encoder_tp_mode='data'; "
+                "use the default mm_encoder_tp_mode='weights'."
+            )
+        sc = getattr(vllm_config, "scheduler_config", None)
+        if sc is not None and getattr(sc, "disable_chunked_mm_input", False):
+            raise NotImplementedError(
+                "Muse Spark on TPU does not support --disable-chunked-mm-input."
+            )

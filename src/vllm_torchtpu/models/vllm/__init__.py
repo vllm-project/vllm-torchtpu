@@ -26,7 +26,8 @@ _QWEN35_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MTP"
 _QWEN35_MOE_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MoeMTP"
 _QWEN4_EXP_MODEL = "vllm_torchtpu.models.vllm.qwen4_exp.model:Qwen4ExpForCausalLM"
 _MUSE_SPARK_MODEL = (
-    "vllm_torchtpu.models.vllm.muse_spark.model:MuseSparkForConditionalGeneration"
+    "vllm_torchtpu.models.vllm.muse_spark.multimodal:"
+    "TPUMuseSparkForConditionalGeneration"
 )
 
 

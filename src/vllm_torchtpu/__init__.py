@@ -1573,7 +1573,7 @@ def _patch_vllm_merge_multimodal_embeddings() -> None:
     patched_fn = vllm_utils._merge_multimodal_embeddings
     for mod_name, mod in list(sys.modules.items()):
         if (
-            mod_name.startswith("vllm.model_executor.models")
+            mod_name.startswith(("vllm.model_executor.models", "vllm.models."))
             and hasattr(mod, "_merge_multimodal_embeddings")
             and mod._merge_multimodal_embeddings is not patched_fn
         ):
