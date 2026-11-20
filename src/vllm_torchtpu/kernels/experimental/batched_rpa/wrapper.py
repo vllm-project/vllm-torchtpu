@@ -839,11 +839,12 @@ def ragged_paged_attention(
         skip_kv_update=skip_kv_update,
         mask_invalid_v=mask_invalid_v,
     )
-    if serve_cfgs.native_fp8.any() and not pltpu.get_tpu_info().fp8_ops_per_second:
+    tpu_info = pltpu.get_tpu_info()
+    if serve_cfgs.native_fp8.any() and not tpu_info.fp8_ops_per_second:
         raise ValueError(
             f"native_fp8={serve_cfgs.native_fp8} runs matmuls in fp8 on the MXU, "
-            f"which this chip ({pltpu.get_tpu_info().chip_version}) does not "
-            "have; leave native_fp8 off."
+            f"which this chip ({tpu_info.chip_version}) does not have; leave "
+            "native_fp8 off."
         )
 
     if prepared_inputs is None:
