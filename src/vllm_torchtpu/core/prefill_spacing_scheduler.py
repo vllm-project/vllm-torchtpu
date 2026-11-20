@@ -44,7 +44,11 @@ warmest-first admission, each step this scheduler:
   priced as a long-chunk step: the next step may admit a long one. Unlike the
   fixed debt, prefill then runs as soon as every such request can afford the
   step. At most ``VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S`` of steps in a row are
-  deferred this way.
+  deferred this way. ``VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON_S`` protects only
+  requests whose projected remaining decode time fits in that horizon, so a
+  hold is short and carries its request to the last token, and
+  ``VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S`` stops holding once the oldest pending
+  prefill arrived that long ago.
 
 Select with ``--scheduler-cls``
 ``vllm_torchtpu.core.prefill_spacing_scheduler.PrefillSpacingScheduler``.
@@ -88,6 +92,9 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self.max_starved_steps = envs.VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS
         self.tpot_target_s = envs.VLLM_TPU_PREFILL_TPOT_TARGET_MS / 1e3
         self.max_hold_s = envs.VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S
+        self.hold_horizon_s = envs.VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON_S
+        self.max_wait_s = envs.VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S
+        self._wait_releases = 0
         # Decoding request id -> when it was first scheduled to decode, and
         # its output tokens at the previous step (TPOT projection).
         self._decode_t0: dict[str, float] = {}
@@ -121,6 +128,14 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             self.max_starved_steps,
             self.tpot_target_s * 1e3,
         )
+        if self.tpot_target_s > 0 and (self.hold_horizon_s > 0 or self.max_wait_s > 0):
+            logger.info(
+                "PrefillSpacingScheduler TPOT hold horizon on "
+                "(VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON_S=%.2f, "
+                "VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S=%.2f)",
+                self.hold_horizon_s,
+                self.max_wait_s,
+            )
 
     def _promote_warmest(self, queue: RequestQueue) -> None:
         """Sort the whole window warmest first (once per step) and keep the
@@ -196,6 +211,9 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self._track_decoders(decoders, now)
         pending = bool(queue) or any(r.is_prefill_chunk for r in self.running)
         hold = pending and self._short_of_slack(decoders, now)
+        if hold and self.max_wait_s > 0 and self._oldest_wait_s(queue) > self.max_wait_s:
+            self._wait_releases += 1
+            hold = False
         if not hold:
             self._held_since = None
         elif self._held_since is None:
@@ -205,6 +223,18 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             self._held_since = None
             hold = False
         return hold
+
+    def _oldest_wait_s(self, queue: RequestQueue | None) -> float:
+        """Seconds since the oldest pending prefill (waiting, or a running
+        prompt chunk) arrived; arrival times are wall-clock."""
+        oldest = None
+        for r in self.running:
+            if r.is_prefill_chunk and (oldest is None or r.arrival_time < oldest):
+                oldest = r.arrival_time
+        for r in queue or ():
+            if oldest is None or r.arrival_time < oldest:
+                oldest = r.arrival_time
+        return 0.0 if oldest is None else time.time() - oldest
 
     def _track_decoders(self, decoders: list[Request], now: float) -> None:
         tokens = rows = 0
@@ -239,7 +269,11 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             steps_left = max(r.max_tokens - r.num_output_tokens, 0) / max(
                 self._tokens_per_step, 1.0
             )
-            projected_s = now - t0 + steps_left * decode_s
+            left_s = steps_left * decode_s
+            if self.hold_horizon_s > 0 and left_s > self.hold_horizon_s:
+                # Too far from its last token for a short hold to carry it.
+                continue
+            projected_s = now - t0 + left_s
             slack_s = self.tpot_target_s * (r.max_tokens - 1) - projected_s
             # A request already past the target is not protected: holding
             # prefill for it cannot bring it back under.
@@ -328,10 +362,12 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self._long_steps += kind == _LONG
         if self._steps % _LOG_EVERY == 0:
             logger.info(
-                "PrefillSpacingScheduler: steps=%d long=%d spacing=%d step_s=%s",
+                "PrefillSpacingScheduler: steps=%d long=%d spacing=%d "
+                "wait_releases=%d step_s=%s",
                 self._steps,
                 self._long_steps,
                 self._spacing_steps,
+                self._wait_releases,
                 {k: round(v, 4) for k, v in self._step_s.items()},
             )
 

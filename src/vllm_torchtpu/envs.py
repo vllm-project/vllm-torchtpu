@@ -261,6 +261,8 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_SPACING_MIN_TOKENS: int = 8192
     VLLM_TPU_PREFILL_TPOT_TARGET_MS: float = 0.0
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
+    VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON_S: float = 0.0
+    VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S: float = 0.0
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
@@ -1678,6 +1680,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # target alone may defer prefill for; the next step then runs prefill.
     "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S": env_nonnegative_float(
         "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S", 10.0
+    ),
+    # PrefillSpacingScheduler: the TPOT target protects only decoding requests
+    # whose projected remaining decode time is at most this many seconds, so a
+    # hold is spent on requests it can carry to their last token instead of
+    # deferring prefill for the rest of a long decode. 0 protects every request.
+    "VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON_S": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON_S", 0.0
+    ),
+    # PrefillSpacingScheduler: the TPOT target does not defer prefill while the
+    # oldest pending prefill (waiting, or a running prompt chunk) arrived more
+    # than this many seconds ago, which bounds the TTFT a hold can add. 0 = off.
+    "VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S", 0.0
     ),
     # MiniMax M3 DCP steps of at most this many tokens merge the attention
     # partials with one packed all-to-all instead of an LSE all-gather plus an
