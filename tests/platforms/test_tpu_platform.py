@@ -1137,17 +1137,26 @@ def test_dp_forward_context_keeps_host_sizes_before_device_upload(monkeypatch):
     device_sizes = object()
     metadata = SimpleNamespace(num_tokens_across_dp_cpu=sizes)
     original_to = torch.Tensor.to
+    uploads = []
 
     def upload(tensor, *args, **kwargs):
-        if tensor is sizes:
-            assert args == ("tpu",)
+        if args == ("tpu",):
+            assert tensor.dtype == torch.int32 and tensor.tolist() == [0, 2048]
+            uploads.append(tensor)
             return device_sizes
         return original_to(tensor, *args, **kwargs)
 
     monkeypatch.setattr(torch.Tensor, "to", upload)
+    tpu_platform._num_tokens_across_dp_on_device.cache_clear()
     additional = TpuPlatform.set_additional_forward_context(dp_metadata=metadata)
     assert metadata.num_tokens_across_dp_cpu is device_sizes
     assert additional["tpu_num_tokens_across_dp_cpu"] == (0, 2048)
     sizes.fill_(99)
     assert additional["tpu_num_tokens_across_dp_cpu"] == (0, 2048)
+    # The same sizes on a later forward reuse the upload.
+    again = SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor([0, 2048]).int())
+    TpuPlatform.set_additional_forward_context(dp_metadata=again)
+    assert again.num_tokens_across_dp_cpu is device_sizes
+    assert len(uploads) == 1
+    tpu_platform._num_tokens_across_dp_on_device.cache_clear()
     assert TpuPlatform.set_additional_forward_context() == {}
