@@ -31,9 +31,18 @@ from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     VllmMLAAttention,
     VllmMultiHeadLatentAttentionWrapper,
     _dcp_indexer_a2a_for_bucket,
+    _local_q_proj_columns,
+    _use_local_q_for_bucket,
 )
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
-from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+    VllmFp8LinearMethodTPU,
+    _format_linear_scale_for_runtime,
+)
+from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+    VllmUnquantizedLinearMethod,
+)
+from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 
@@ -332,6 +341,7 @@ def test_mla_wrapper_rope_preserves_activation_dtype():
     wrapper.rotary_emb = lambda _positions, q_pe, k_pe: (q_pe.float(), k_pe.float())
     wrapper.is_sparse = False
     wrapper.dcp_q_replicate = False
+    wrapper.dcp_q_replicate_min_tokens = 0
     wrapper.dcp_group_size = 1
     wrapper.g_proj = None
     wrapper.gate_is_fused = False
@@ -839,6 +849,7 @@ def _run_qrep_wrapper(rank_in_group, is_sparse=True, run_forward=True):
     wrapper.num_heads = local_heads
     wrapper.v_head_dim = 2
     wrapper.dcp_q_replicate = True
+    wrapper.dcp_q_replicate_min_tokens = 0
     wrapper.dcp_group_size = group_size
     wrapper.is_sparse = is_sparse
     wrapper.indexer = None
@@ -1095,6 +1106,338 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     )
     assert len(unfused_calls) == 2
     assert len(fused_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "min_tokens", "is_backbone", "expected"),
+    [
+        (16, 64, True, True),  # decode buckets take the local heads
+        (32, 64, True, True),
+        (64, 64, True, True),  # the threshold itself takes the local heads
+        (4096, 64, True, False),  # the prefill bucket keeps the replicated q
+        (16, 0, True, False),  # 0: replicated q in every bucket
+        (16, 64, False, False),  # the MTP drafter keeps the replicated q
+    ],
+)
+def test_dcp_q_replicate_is_chosen_per_bucket(
+    num_tokens, min_tokens, is_backbone, expected
+):
+    assert (
+        _use_local_q_for_bucket(num_tokens, min_tokens, is_backbone=is_backbone)
+        is expected
+    )
+
+
+def test_dcp_q_replicate_min_tokens_off_never_compares_the_token_count():
+    """At 0, and in the MTP drafter, the token count must not be compared: a
+    comparison on a traced size adds a guard that splits the graph by bucket."""
+
+    class _NoCompare(int):
+        def __le__(self, _other):
+            raise AssertionError("the token count was compared")
+
+    assert _use_local_q_for_bucket(_NoCompare(16), 0, is_backbone=True) is False
+    assert _use_local_q_for_bucket(_NoCompare(16), 64, is_backbone=False) is False
+
+
+def test_dcp_q_replicate_min_tokens_env_default_and_forwarding(monkeypatch):
+    monkeypatch.delenv("TPU_DCP_Q_REPLICATE_MIN_TOKENS", raising=False)
+    assert envs.environment_variables["TPU_DCP_Q_REPLICATE_MIN_TOKENS"]() == 0
+    monkeypatch.setenv("TPU_DCP_Q_REPLICATE_MIN_TOKENS", "64")
+    assert envs.environment_variables["TPU_DCP_Q_REPLICATE_MIN_TOKENS"]() == 64
+    monkeypatch.setenv("TPU_DCP_Q_REPLICATE_MIN_TOKENS", "-1")
+    with pytest.raises(ValueError, match="TPU_DCP_Q_REPLICATE_MIN_TOKENS"):
+        envs.environment_variables["TPU_DCP_Q_REPLICATE_MIN_TOKENS"]()
+    assert "TPU_DCP_Q_REPLICATE_MIN_TOKENS" in TpuPlatform.additional_env_vars
+
+
+def _fp8_runtime_weight(ckpt_weight, block_size):
+    """The fp8 runtime (weight, scale) the TPU linear method stores for a
+    checkpoint `[n_out, n_in]` weight: quantized per output channel, the scale
+    in its runtime layout, the weight flipped to `[n_in, n_out]`."""
+    weight, scale = quantize_tensor(
+        ckpt_weight, torch.float8_e4m3fn, axis=-1, block_size=block_size
+    )
+    scale = _format_linear_scale_for_runtime(
+        scale, blockwise_kernel=block_size is not None
+    )
+    return weight.transpose(0, 1).contiguous(), scale
+
+
+def _fake_group_q_proj(weight, scale, group_size, rank_in_group, method):
+    q_proj = SimpleNamespace(
+        quant_method=method,
+        weight=weight,
+        weight_scale=scale,
+        bias=None,
+        group_size=group_size,
+        rank_in_group=rank_in_group,
+    )
+    setattr(q_proj, WEIGHT_FLIPPED_ATTR, True)
+    return q_proj
+
+
+@pytest.mark.parametrize("block_size", [None, 128])
+def test_local_q_proj_columns_equal_the_unreplicated_tp_shard(block_size):
+    """The local columns of the DCP-group q_b_proj must be bit-identical to the
+    weight and scale a plain ColumnParallelLinear loads on the same rank
+    (VLLM_DCP_Q_REPLICATE=0): rows `[rank * n, (rank + 1) * n)` of the
+    checkpoint weight, quantized on their own."""
+    group_size, n_local, n_in = 4, 192, 256
+    torch.manual_seed(0)
+    ckpt = torch.randn(group_size * n_local, n_in)
+    group_weight, group_scale = _fp8_runtime_weight(ckpt, block_size)
+    method = VllmFp8LinearMethodTPU.__new__(VllmFp8LinearMethodTPU)
+    for rank in range(group_size):
+        shard = ckpt[rank * n_local : (rank + 1) * n_local]
+        want_weight, want_scale = _fp8_runtime_weight(shard, block_size)
+        got_weight, got_scale = _local_q_proj_columns(
+            _fake_group_q_proj(group_weight, group_scale, group_size, rank, method)
+        )
+        assert got_weight.is_contiguous() and got_weight.dtype == want_weight.dtype
+        assert torch.equal(got_weight.view(torch.uint8), want_weight.view(torch.uint8))
+        assert got_scale is not None
+        assert torch.equal(got_scale, want_scale)
+
+
+def test_local_q_proj_columns_rejects_unsupported_projections():
+    method = VllmFp8LinearMethodTPU.__new__(VllmFp8LinearMethodTPU)
+    weight = torch.zeros(8, 16, dtype=torch.float8_e4m3fn)
+    q_proj = _fake_group_q_proj(weight, torch.ones(16), 2, 0, method)
+    q_proj.bias = torch.zeros(16)
+    with pytest.raises(ValueError, match="TPU_DCP_Q_REPLICATE_MIN_TOKENS"):
+        _local_q_proj_columns(q_proj)
+    q_proj = _fake_group_q_proj(weight, torch.ones(16), 2, 0, MagicMock())
+    with pytest.raises(ValueError, match="TPU_DCP_Q_REPLICATE_MIN_TOKENS"):
+        _local_q_proj_columns(q_proj)
+
+
+class _GroupQProj(_FakeQProj):
+    """An unquantized DCP-group q projection that really multiplies."""
+
+    def __init__(self, weight, group_size, rank_in_group):
+        super().__init__(group_size, rank_in_group)
+        self.weight = weight
+        self.bias = None
+        self.quant_method = VllmUnquantizedLinearMethod.__new__(
+            VllmUnquantizedLinearMethod
+        )
+        setattr(self, WEIGHT_FLIPPED_ATTR, True)
+
+    def __call__(self, hidden):
+        return torch.matmul(hidden, self.weight), None
+
+
+def _run_min_tokens_wrapper(num_tokens, *, replicate, min_tokens, rank=1):
+    """Run the sparse DCP MLA wrapper end to end through the backend forward.
+
+    `replicate` builds the VLLM_DCP_Q_REPLICATE=1 wiring (a DCP-group
+    q_proj holding every head of the group); otherwise the
+    VLLM_DCP_Q_REPLICATE=0 wiring (a q_proj holding this rank's TP shard,
+    which is the same columns of the same random weight). The attention
+    kernel, the head all-gather and the LSE merge are fakes that record what
+    reaches them; everything between them is the real code.
+
+    Returns:
+      `(output, gathered, kernel_q)`: the wrapper output, the q tensors the
+      head all-gather received, and the `(ql_nope, q_pe)` the kernel received.
+    """
+    dcp_size, local_heads, hidden_size = 2, 16, 64
+    impl, layer, _, _ = _make_impl_and_layer(num_tokens=num_tokens)
+    impl.dcp_size = dcp_size
+    torch.manual_seed(1)
+    layer.W_UK_T_dcp_qrep = torch.randn(local_heads * dcp_size, 128, 512) * 0.05
+    layer.W_UK_T_dcp_qrep_scale = None
+    layer.W_UK_T = layer.W_UK_T_dcp_qrep[rank * local_heads : (rank + 1) * local_heads]
+    group_weight = torch.randn(hidden_size, dcp_size * local_heads * 192) * 0.05
+    kv_a_out = torch.randn(num_tokens, 512 + 64)
+    hidden_states = torch.randn(num_tokens, hidden_size)
+    kv_cache = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+
+    kernel_q = []
+
+    def _kernel(_cache, ql_nope, q_pe, *_rest):
+        kernel_q.append((ql_nope, q_pe))
+        return ql_nope * 2.0, torch.zeros(ql_nope.shape[:2])
+
+    layer.sparse_mla_dcp_op = _kernel
+
+    wrapper = VllmMultiHeadLatentAttentionWrapper.__new__(
+        VllmMultiHeadLatentAttentionWrapper
+    )
+    torch.nn.Module.__init__(wrapper)
+    wrapper.kimi_preprocess = None
+    wrapper.q_lora_rank = None
+    wrapper.kv_lora_rank = 512
+    wrapper.qk_nope_head_dim = 128
+    wrapper.qk_rope_head_dim = 64
+    wrapper.qk_head_dim = 192
+    wrapper.num_heads = local_heads
+    wrapper.v_head_dim = 128
+    wrapper.is_sparse = True
+    wrapper.indexer = None
+    wrapper.skip_topk = True
+    wrapper.topk_indices_buffer = torch.zeros((num_tokens, 8), dtype=torch.int32)
+    wrapper.kv_a_proj_with_mqa = lambda _hidden: (kv_a_out, None)
+    wrapper.kv_a_layernorm = lambda value: value
+    wrapper.rotary_emb = None
+    wrapper.g_proj = None
+    wrapper.gate_is_fused = False
+    wrapper.o_proj = lambda value: (value, None)
+    width = local_heads * 192
+    if replicate:
+        q_proj = _GroupQProj(group_weight, dcp_size, rank)
+        wrapper.dcp_q_replicate = True
+        wrapper.dcp_group_size = dcp_size
+        wrapper.dcp_q_replicate_min_tokens = min_tokens
+    else:
+        shard = group_weight[:, rank * width : (rank + 1) * width].contiguous()
+        q_proj = lambda hidden: (torch.matmul(hidden, shard), None)  # noqa: E731
+        wrapper.dcp_q_replicate = False
+        wrapper.dcp_group_size = 1
+        wrapper.dcp_q_replicate_min_tokens = 0
+    wrapper.q_proj = q_proj
+
+    attn = SimpleNamespace(q_proj_local_weight=None, q_proj_local_scale=None)
+    if replicate and min_tokens > 0:
+        attn.q_proj_local_weight, attn.q_proj_local_scale = _local_q_proj_columns(
+            q_proj
+        )
+
+    def _mla_attn(q, kv_c_normed, k_pe, **kwargs):
+        return impl.forward(
+            layer=layer,
+            q=q,
+            kv_c_normed=kv_c_normed,
+            k_pe=k_pe,
+            kv_cache=kv_cache,
+            attn_metadata=MagicMock(),
+            topk_indices=kwargs["topk_indices"],
+            q_dcp_replicated=kwargs["q_dcp_replicated"],
+        )
+
+    wrapper.mla_attn = MagicMock(side_effect=_mla_attn)
+    wrapper.mla_attn.q_proj_local_weight = attn.q_proj_local_weight
+    wrapper.mla_attn.q_proj_local_scale = attn.q_proj_local_scale
+
+    gathered = []
+
+    def _gather(nope, pe, _rank):
+        gathered.append((nope, pe))
+        return nope.repeat(1, dcp_size, 1), pe.repeat(1, dcp_size, 1)
+
+    with (
+        patch.object(attention_adapter, "all_gather_q_nope_pe_heads", _gather),
+        patch.object(
+            attention_adapter,
+            "merge_lse_partials_scatter_heads",
+            lambda out, _lse, **_kw: out[
+                :, rank * local_heads : (rank + 1) * local_heads
+            ],
+        ),
+    ):
+        output = VllmMultiHeadLatentAttentionWrapper.forward(
+            wrapper,
+            positions=torch.arange(num_tokens),
+            hidden_states=hidden_states,
+        )
+    return output, gathered, kernel_q
+
+
+def _assert_same_run(got, want):
+    got_out, got_gathered, got_kernel = got
+    want_out, want_gathered, want_kernel = want
+    assert torch.equal(got_out, want_out)
+    assert len(got_gathered) == len(want_gathered)
+    for got_pair, want_pair in zip(
+        got_gathered + got_kernel, want_gathered + want_kernel
+    ):
+        for got_t, want_t in zip(got_pair, want_pair):
+            assert torch.equal(got_t, want_t)
+
+
+@pytest.mark.parametrize("num_tokens", [16, 32])
+def test_dcp_q_replicate_min_tokens_decode_bucket_is_the_unreplicated_path(
+    num_tokens,
+):
+    """At 64, a decode bucket under query replication computes exactly what
+    VLLM_DCP_Q_REPLICATE=0 computes: local heads, then the head all-gather."""
+    got = _run_min_tokens_wrapper(num_tokens, replicate=True, min_tokens=64)
+    want = _run_min_tokens_wrapper(num_tokens, replicate=False, min_tokens=0)
+    assert len(got[1]) == 1  # the head all-gather ran
+    assert got[1][0][0].shape[1] == 16  # on this rank's 16 heads
+    _assert_same_run(got, want)
+
+
+def test_dcp_q_replicate_min_tokens_prefill_bucket_keeps_the_replicated_path():
+    """At 64, the 4096-token bucket computes exactly what query replication
+    computes with the knob at 0: no head all-gather, all group heads."""
+    got = _run_min_tokens_wrapper(4096, replicate=True, min_tokens=64)
+    want = _run_min_tokens_wrapper(4096, replicate=True, min_tokens=0)
+    assert got[1] == []  # no head all-gather
+    assert got[2][0][0].shape[1] == 32  # the kernel saw all group heads
+    _assert_same_run(got, want)
+
+
+def test_dcp_q_replicate_min_tokens_zero_keeps_qrep_in_decode():
+    """At 0 (the default), decode buckets stay on the replicated path."""
+    got = _run_min_tokens_wrapper(16, replicate=True, min_tokens=0)
+    assert got[1] == []
+    assert got[2][0][0].shape[1] == 32
+
+
+def test_dcp_q_replicate_min_tokens_drafter_keeps_qrep(monkeypatch):
+    """The MTP drafter is traced once for every bucket, so even its decode
+    buckets keep the replicated query."""
+    from vllm.compilation import backends as vllm_compilation_backends
+
+    monkeypatch.setattr(vllm_compilation_backends, "model_tag", "eagle_head")
+    got = _run_min_tokens_wrapper(16, replicate=True, min_tokens=64)
+    want = _run_min_tokens_wrapper(16, replicate=True, min_tokens=0)
+    assert got[1] == []
+    _assert_same_run(got, want)
+
+
+def test_dcp_q_replicate_min_tokens_local_path_is_rank_independent():
+    """The local path reads this rank's heads from a weight tensor, not from a
+    rank-dependent slice, so ranks 0 and 2 trace the same graph and precompile
+    peer replay can share their artifacts."""
+    from vllm_torchtpu.compilation.tpu_compiler import _graph_fingerprint
+
+    def _fingerprint(rank):
+        torch._dynamo.reset()
+        wrapper = _run_qrep_wrapper(rank_in_group=rank, run_forward=False)
+        wrapper.dcp_q_replicate_min_tokens = 64
+        # The replicated projection must not run: its output would be None.
+        wrapper.q_proj._out = None
+        group_weight = torch.randn(8, 2 * 4 * 5, dtype=torch.bfloat16)
+        mla_attn = torch.nn.Module()
+        mla_attn.q_proj_local_weight = group_weight[:, rank * 10 : rank * 10 + 10]
+        mla_attn.q_proj_local_scale = None
+        mla_attn.forward = lambda q, kv_c, k_pe, **kw: (
+            q[0].sum(dim=(-1, -2)).unsqueeze(-1) + kv_c[:, :1] + k_pe[:, 0, :1]
+        )
+        wrapper.mla_attn = mla_attn
+        captured = []
+
+        def _capture(gm, _example_inputs):
+            captured.append(_graph_fingerprint(gm))
+            return gm.forward
+
+        compiled = torch.compile(wrapper.forward, backend=_capture, fullgraph=True)
+        compiled(
+            positions=torch.arange(3),
+            hidden_states=torch.ones((3, 8), dtype=torch.bfloat16),
+        )
+        assert len(captured) == 1 and captured[0] is not None
+        return captured[0]
+
+    assert _fingerprint(0) == _fingerprint(2)
 
 
 def test_mla_forward_uses_context_without_runtime_kv_scale_state():
