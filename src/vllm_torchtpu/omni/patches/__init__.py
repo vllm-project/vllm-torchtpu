@@ -27,6 +27,7 @@ qwen3omni_thinker.py.
 """
 
 import weakref
+from collections.abc import Callable
 from functools import cache as run_once
 from typing import Any
 
@@ -1250,6 +1251,61 @@ def _patch_ltx2_fast_attention_dispatch() -> None:
     logger.info("Applied TPU patch: fast LTX-2 attention processor dispatch.")
 
 
+def _eager_all_to_all_single(send_buf: torch.Tensor, group: Any) -> torch.Tensor:
+    recv_buf = torch.empty_like(send_buf)
+    torch.distributed.all_to_all_single(recv_buf, send_buf, group=group)
+    return recv_buf
+
+
+def _ulysses_all_to_all_4d_layout(
+    input: torch.Tensor,
+    scatter_idx: int,
+    gather_idx: int,
+    seq_world_size: int,
+    group: Any,
+    all_to_all_fn: Callable[[torch.Tensor, Any], torch.Tensor],
+) -> torch.Tensor:
+    """Shared ``(2, 1)`` / ``(1, 2)`` 4D Ulysses all-to-all layout transform.
+
+    Parameterised by ``all_to_all_fn`` so the eager inference patch and the
+    Dynamo-traceable functional-collective path share one layout definition.
+    """
+    if scatter_idx == 2 and gather_idx == 1:
+        bs, shard_seqlen, hc, hs = input.shape
+        send_buf = (
+            input.reshape(bs, shard_seqlen, seq_world_size, hc // seq_world_size, hs)
+            .permute(2, 1, 0, 3, 4)
+            .contiguous()
+        )
+        recv_buf = all_to_all_fn(send_buf, group)
+        return (
+            recv_buf.reshape(
+                shard_seqlen * seq_world_size, bs, hc // seq_world_size, hs
+            )
+            .transpose(0, 1)
+            .contiguous()
+        )
+    if scatter_idx == 1 and gather_idx == 2:
+        bs, seqlen, shard_hc, hs = input.shape
+        send_buf = (
+            input.reshape(bs, seq_world_size, seqlen // seq_world_size, shard_hc, hs)
+            .permute(1, 3, 2, 0, 4)
+            .contiguous()
+        )
+        recv_buf = all_to_all_fn(send_buf, group)
+        return (
+            recv_buf.reshape(
+                shard_hc * seq_world_size, seqlen // seq_world_size, bs, hs
+            )
+            .permute(2, 1, 0, 3)
+            .contiguous()
+        )
+    raise RuntimeError(
+        f"Invalid (scatter_idx, gather_idx)=({scatter_idx}, {gather_idx}); "
+        "expected (2, 1) or (1, 2)"
+    )
+
+
 def _patch_ulysses_inference_all_to_all_4d() -> None:
     """Run inference Ulysses 4D all-to-all without autograd boxing.
 
@@ -1307,38 +1363,13 @@ def _patch_ulysses_inference_all_to_all_4d() -> None:
                 use_sync=use_sync,
                 _output_destination=_output_destination,
             )
-        if scatter_idx == 2:
-            bs, shard_seqlen, hc, hs = input.shape
-            send_buf = (
-                input.reshape(
-                    bs, shard_seqlen, seq_world_size, hc // seq_world_size, hs
-                )
-                .permute(2, 1, 0, 3, 4)
-                .contiguous()
-            )
-            recv_buf = torch.empty_like(send_buf)
-            torch.distributed.all_to_all_single(recv_buf, send_buf, group=group)
-            return (
-                recv_buf.reshape(
-                    shard_seqlen * seq_world_size, bs, hc // seq_world_size, hs
-                )
-                .transpose(0, 1)
-                .contiguous()
-            )
-        bs, seqlen, shard_hc, hs = input.shape
-        send_buf = (
-            input.reshape(bs, seq_world_size, seqlen // seq_world_size, shard_hc, hs)
-            .permute(1, 3, 2, 0, 4)
-            .contiguous()
-        )
-        recv_buf = torch.empty_like(send_buf)
-        torch.distributed.all_to_all_single(recv_buf, send_buf, group=group)
-        return (
-            recv_buf.reshape(
-                shard_hc * seq_world_size, seqlen // seq_world_size, bs, hs
-            )
-            .permute(2, 1, 0, 3)
-            .contiguous()
+        return _ulysses_all_to_all_4d_layout(
+            input,
+            scatter_idx,
+            gather_idx,
+            seq_world_size,
+            group,
+            _eager_all_to_all_single,
         )
 
     def _fast_seq_all_to_all_4d_apply(
