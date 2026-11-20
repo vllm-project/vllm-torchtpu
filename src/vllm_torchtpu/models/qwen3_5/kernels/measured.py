@@ -43,8 +43,8 @@ GDN_VALUE_HEADS = frozenset({64, 32, 8})
 
 def is_measured_checkpoint(model_config) -> bool:
     """Qwen3.5-397B-A17B's checkpoint shape on a TPU7x device: the calibrated
-    shape of ``hooks._is_calibrated`` (the KV budget's rule), which reads the
-    device only once the shape matches."""
+    shape of ``hooks._is_calibrated`` (the serving defaults' rule), which
+    reads the device only once the shape matches."""
     return hooks._is_calibrated(model_config)
 
 
