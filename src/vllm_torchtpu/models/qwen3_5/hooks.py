@@ -397,7 +397,7 @@ def mtp_draft_path(vllm_config: VllmConfig) -> bool:
         spec is None
         or spec.method != "mtp"
         or not settings.is_qwen3_5(model_config)
-        or not has_calibrated_shape(model_config)
+        or not _has_calibrated_shape(model_config)
     ):
         return False
     chip = _chip_family()
