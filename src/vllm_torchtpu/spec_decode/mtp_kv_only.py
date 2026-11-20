@@ -200,8 +200,10 @@ class _KvOnlyDecoderLayer(nn.Module):
     def __init__(self, block: DeepseekV2DecoderLayer, write: Any) -> None:
         super().__init__()
         self.input_layernorm = block.input_layernorm
-        # Read by the MTP layer's forward after the decoder layer.
-        self.use_sequence_parallel_moe = block.use_sequence_parallel_moe
+        # Read by the MTP layer's forward after the decoder layer, which
+        # all-gathers a sequence-parallel MoE's token shards. This stand-in
+        # returns every row unsharded, so there is nothing to gather.
+        self.use_sequence_parallel_moe = False
         self._write = write
 
     def forward(

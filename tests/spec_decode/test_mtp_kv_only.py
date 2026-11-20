@@ -109,11 +109,13 @@ def _embedding(gen, hidden):
     return embed
 
 
-def _upstream_mtp(self_attn: nn.Module, seed=0, hidden=MTP_HIDDEN) -> DeepSeekMTP:
+def _upstream_mtp(
+    self_attn: nn.Module, seed=0, hidden=MTP_HIDDEN, sequence_parallel_moe=False
+) -> DeepSeekMTP:
     gen = torch.Generator().manual_seed(seed)
     block = _module(
         DeepseekV2DecoderLayer,
-        use_sequence_parallel_moe=False,
+        use_sequence_parallel_moe=sequence_parallel_moe,
         use_mha=False,
         input_layernorm=_rms_norm(gen, hidden),
         self_attn=self_attn,
@@ -168,6 +170,28 @@ def test_kv_only_stand_in_sees_the_attention_input():
     kv_layer = predictor.layers["78"]
     assert kv_layer is not layer and kv_layer.eh_proj is layer.eh_proj
     assert predictor.embed_tokens is mtp.model.embed_tokens
+
+
+def test_kv_only_stand_in_skips_the_sequence_parallel_gather(monkeypatch):
+    """With a sequence-parallel MoE the MTP layer all-gathers its decoder
+    layer's token shards; the stand-in returns every row unsharded, so pass 1
+    must not run that gather."""
+    from vllm.model_executor.models import deepseek_mtp
+
+    def no_gather(*_args, **_kwargs):
+        raise AssertionError("pass 1 all-gathered the decoder layer's output")
+
+    monkeypatch.setattr(deepseek_mtp, "tensor_model_parallel_all_gather", no_gather)
+    mtp = _upstream_mtp(_Capture(), sequence_parallel_moe=True)
+    input_ids, positions, hidden = _mtp_inputs()
+    seen = []
+    predictor = mtp_kv_only.kv_only_predictor(mtp, lambda pos, h: seen.append(h))
+    with torch.no_grad():
+        out, _ = predictor(input_ids, positions, hidden)
+    assert len(seen) == 1
+    assert out.shape == hidden.shape
+    # The draft's own decoder layer keeps its sequence-parallel MoE.
+    assert mtp.model.layers["78"].mtp_block.use_sequence_parallel_moe
 
 
 # ---------------------------------------------------------------------------
