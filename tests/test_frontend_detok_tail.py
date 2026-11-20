@@ -227,23 +227,6 @@ def test_prompt_tail_view_delegates():
     assert r.prompt_token_ids == [1, 2, 3, 4]
 
 
-def test_install_patches_vllm_detokenizer(monkeypatch):
-    cls = vllm_detok.FastIncrementalDetokenizer
-    orig = cls.__init__
-    monkeypatch.setattr(ff, "_DETOK_INSTALLED", False)
-    try:
-        assert ff.maybe_install_detok_prompt_tail()
-        assert cls.__init__ is not orig
-        assert cls.__init__.__wrapped__ is orig
-        # A second install leaves the first patch in place.
-        patched = cls.__init__
-        assert ff.maybe_install_detok_prompt_tail() is False
-        assert cls.__init__ is patched
-    finally:
-        cls.__init__ = orig
-        ff._DETOK_INSTALLED = False
-
-
 @pytest.fixture
 def detok_cls(monkeypatch):
     """vLLM's FastIncrementalDetokenizer, restored after the test."""
@@ -251,6 +234,17 @@ def detok_cls(monkeypatch):
     monkeypatch.setattr(cls, "__init__", cls.__init__)
     monkeypatch.setattr(ff, "_DETOK_INSTALLED", False)
     return cls
+
+
+def test_install_patches_vllm_detokenizer(detok_cls):
+    orig = detok_cls.__init__
+    assert ff.maybe_install_detok_prompt_tail()
+    assert detok_cls.__init__ is not orig
+    assert detok_cls.__init__.__wrapped__ is orig
+    # A second install leaves the first patch in place.
+    patched = detok_cls.__init__
+    assert ff.maybe_install_detok_prompt_tail() is False
+    assert detok_cls.__init__ is patched
 
 
 def _in_process(monkeypatch, name):

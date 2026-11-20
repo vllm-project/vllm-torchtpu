@@ -55,11 +55,11 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
 # owns the name) never change a compiled program.
 RUNNER_OPTIONS_SECTION = runner_options.SECTION
 
-# Diagnostics-only knobs, and the host-only section of the API-server patches
-# (`frontend_options`): they steer profiling or the host and never change
-# the compiled graph, so
-# `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the TPU compile
-# cache key.
+# Keys that never change the compiled graph: the diagnostics-only profiler
+# knobs above, which only steer profiling, and the host-only sections, each
+# imported from the module that reads it.
+# `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the TPU
+# compile cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
     {
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
