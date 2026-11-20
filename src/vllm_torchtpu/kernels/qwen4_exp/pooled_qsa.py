@@ -2810,6 +2810,10 @@ def compressed_dcp_blocks(vals_pair, pos_pair, block_topk, *, topk=None):
     return jnp.where(kept == dcp_select.EMPTY, -1, kept).astype(jnp.int32)
 
 
+# Row counts traced with the row-block sort (log once each).
+SORT_ROWS_TRACED: set = set()
+
+
 def _sort_rows(x):
     """``jnp.sort(x, axis=1)``; under q38 DEC-STEP-3's VLLM_TPU_QSA_DCP_SORT_ROWS
     = N, a step of more than N rows sorts row blocks of at most N rows (as equal
@@ -2822,6 +2826,13 @@ def _sort_rows(x):
         return jnp.sort(x, axis=1)
     parts = -(-rows // limit)
     size = -(-rows // parts)
+    if rows not in SORT_ROWS_TRACED:
+        SORT_ROWS_TRACED.add(rows)
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(
+            "q38 DEC-STEP-3 DCP_SORT_ROWS traced: rows %d in %d blocks of <= %d", rows, parts, size
+        )
     return jnp.concatenate(
         [jnp.sort(x[i : i + size], axis=1) for i in range(0, rows, size)], axis=0
     )

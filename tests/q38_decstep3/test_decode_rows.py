@@ -280,3 +280,21 @@ def test_r7_selected_tokens_lowering(clean, rows):
     on = _lower_tpu(fn, *specs)
     print(f"R7 rows {rows}: scatters off {off.count('stablehlo.scatter')} on {on.count('stablehlo.scatter')}")
     assert off.count("stablehlo.scatter") > 0 and on.count("stablehlo.scatter") == 0
+
+
+# ---------------- R8 engagement markers (traced once per shape; none with the keys off)
+
+
+def test_r8_markers(clean):
+    import vllm_torchtpu.kernels.gdn.v3.wrapper as gw
+
+    qsa_rpa.ROWS_GLUE_TRACED.clear(); pooled_qsa.SORT_ROWS_TRACED.clear(); gw._GATE_GLUE_TRACED.clear()
+    blocks = jnp.zeros((448, 512), jnp.int32); lengths = jnp.full((448,), 100, jnp.int32)
+    x = jnp.zeros((448, 1024), jnp.int32); b = jnp.zeros((448, 32), jnp.float32)
+    qsa_rpa.selected_tokens(blocks, lengths, 2048, 4); pooled_qsa._sort_rows(x); gw.pack_gate_inputs(b, b, 0, 96, 448)
+    assert not qsa_rpa.ROWS_GLUE_TRACED and not pooled_qsa.SORT_ROWS_TRACED and not gw._GATE_GLUE_TRACED
+    clean.setenv(GLUE, "1"); clean.setenv(SORT, "384")
+    for _ in range(2):
+        qsa_rpa.selected_tokens(blocks, lengths, 2048, 4); pooled_qsa._sort_rows(x); gw.pack_gate_inputs(b, b, 0, 96, 448)
+    assert qsa_rpa.ROWS_GLUE_TRACED == {("selected_tokens", 448)}
+    assert pooled_qsa.SORT_ROWS_TRACED == {448} and gw._GATE_GLUE_TRACED == {448}

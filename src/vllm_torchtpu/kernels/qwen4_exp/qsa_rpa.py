@@ -428,6 +428,8 @@ def union_call_requests(rows, max_query_len):
 
 # (rows, request slots) of the programs traced with WIDE calls (log once each).
 WIDE_TRACED: dict = {}
+# (site, rows) traced under VLLM_TPU_DECODE_ROWS_GLUE (log once each).
+ROWS_GLUE_TRACED: set = set()
 
 
 def union_page_slots(budget, ratio, tile, rows=4):
@@ -1679,6 +1681,9 @@ def selected_tokens(blocks, lengths, token_topk, compress_ratio):
     if envs.VLLM_TPU_DECODE_ROWS_GLUE:
         # q38 DEC-STEP-3: the same tail fill as selects over the columns, not
         # a scatter (a scatter_fusion above 384 rows); one column a row each.
+        if ("selected_tokens", len(blocks)) not in ROWS_GLUE_TRACED:
+            ROWS_GLUE_TRACED.add(("selected_tokens", len(blocks)))
+            logger.info("q38 DEC-STEP-3 ROWS_GLUE traced: selected_tokens rows %d", len(blocks))
         columns = jnp.arange(selected.shape[1], dtype=count.dtype)[None, :]
         for tail in range(compress_ratio - 1):
             token = lengths // compress_ratio * compress_ratio + tail
