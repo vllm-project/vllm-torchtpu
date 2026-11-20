@@ -359,6 +359,42 @@ def _off_fraction(got, want):
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "hidden,rows_dtype,rows_sublanes",
+    [
+        (4096, jnp.float8_e4m3fn, 32),
+        (1024, jnp.float8_e4m3fn, 32),
+        (1024, jnp.bfloat16, 16),
+    ],
+    ids=["fp8_4096", "fp8_1024", "bf16_1024"],
+)
+def test_weighted_sum_counts_its_blocks_as_vmem_holds_them(
+    interpret, hidden, rows_dtype, rows_sublanes
+):
+    """The VMEM limit is twice the step's blocks as TPU7x tiles them: a
+    token's rows are lane blocks deep, padded to the dtype's sublane tile,
+    so 8 blocks of fp8 (hidden 1024) take 32 sublanes, four times their
+    size. At hidden 4096 (32 blocks) nothing is padded."""
+    tokens, top_k, f32 = 128, 10, 4
+    lane_blocks = hidden // LANES
+    stage_dtype = combine._stage_dtype(jnp.float32, lane_blocks)
+    assert stage_dtype == jnp.float32
+    got = combine._weighted_sum_vmem_bytes(
+        tokens_per_tile=tokens,
+        top_k=top_k,
+        lane_blocks=lane_blocks,
+        hidden=hidden,
+        rows_dtype=rows_dtype,
+        out_dtype=jnp.bfloat16,
+        stage_dtype=stage_dtype,
+    )
+    rows = tokens * top_k * rows_sublanes * LANES * jnp.dtype(rows_dtype).itemsize
+    out = tokens * hidden * 2
+    staging = tokens * lane_blocks * LANES * f32
+    assert got == 2 * rows + 2 * out + staging
+
+
+@pytest.mark.cpu_test
 def test_weighted_sum_rows_are_not_interchangeable(interpret):
     """Control: the same rows with two slots' weights swapped are off the
     reference almost everywhere, so the comparison above sees a slot mix-up."""
