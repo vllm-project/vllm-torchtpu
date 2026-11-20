@@ -1077,7 +1077,7 @@ def _mark_pre_attn_norm_quant(layer: Any) -> None:
         attn = getattr(layer, "linear_attn", None)
         main = "in_proj_qkvz"
         names = ("in_proj_qkvz", "in_proj_qkv", "in_proj_z", "in_proj_ba")
-        # The pooled PCP forward reads hidden_states and drops `prequant`.
+        # The pooled PCP forward reads hidden_states and refuses `prequant`.
         if getattr(attn, "_pcp_streaming_configured", False):
             attn = None
     else:
@@ -1313,8 +1313,7 @@ def patched_decoder_layer_forward(
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         # FP8 rows go only to a layer whose attention's main projection takes
-        # them (`_mark_pre_attn_norm_quant`); any other gathers bf16 rows, as
-        # on main.
+        # them (`_mark_pre_attn_norm_quant`); any other gathers bf16 rows.
         if (
             input_is_sliced
             and sequence_parallel.fp8_gather()
