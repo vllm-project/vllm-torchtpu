@@ -58,10 +58,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-# Baseline expert-slot count per EP rank (64 primary + 16 replicated slots)
-# used as the reference point when computing per-rank HBM KV capacity credit.
-_QWEN35_SAFE_KV_SLOTS = 80
-
 # The defaults were measured for this checkpoint shape (Qwen3.5-397B-A17B's
 # text config) on TPU7x devices.
 _CALIBRATED_SHAPE = {"num_experts": 512, "hidden_size": 4096, "num_hidden_layers": 60}
@@ -73,9 +69,11 @@ _CALIBRATED_DECODE_LAYOUTS = frozenset({(8, 1, 4)})
 # The MoE kernel those legs ran (MOE_FUSED_EP_KERNEL_IMPL): its scratch is
 # part of the HBM the budget leaves for activations.
 _CALIBRATED_MOE_KERNEL = "v3"
-# The budget at 80 expert slots per rank (64 primary + 16 replicated slots),
-# reserving about 2.5 GiB of HBM for runtime activations and program-load
-# scratch buffers.
+# The expert slots per rank (64 primary + 16 replicated) the budget was
+# measured with; _expert_slot_kv_credit adjusts it for every slot fewer or more.
+_CALIBRATED_EXPERT_SLOTS = 80
+# The budget at those slots, reserving about 2.5 GiB of HBM for runtime
+# activations and program-load scratch buffers.
 _CALIBRATED_KV_BYTES = 33_500_000_000
 
 
@@ -127,7 +125,7 @@ def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, int]:
     slot_layers = 0 if placement is None else -placement.copies_per_rank
     for layer in range(text.num_hidden_layers):
         is_placed = placement is not None and layer in placement.layers
-        slot_layers += _QWEN35_SAFE_KV_SLOTS - (placed if is_placed else unplaced)
+        slot_layers += _CALIBRATED_EXPERT_SLOTS - (placed if is_placed else unplaced)
     slot_bytes = 3 * text.hidden_size * text.moe_intermediate_size
     return slot_layers * slot_bytes, placed
 
