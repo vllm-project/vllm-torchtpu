@@ -799,9 +799,13 @@ def fill_metadata(
         metadata_ref: Metadata that is used to determine the group id and m offsets
             for each gmm tile.
         cfgs: GmmConfigs.
+        run_to_group_ref: Optional SMEM [size_group]. When given, entry r gets
+            the group id of the r-th run of consecutive gm tiles (one run per
+            group with rows), which the rhs stream reads to prefetch slabs.
 
     Returns:
-        The number of gm tiles to process lhs with given group offset.
+        The number of gm tiles to process lhs with given group offset, and with
+        run_to_group_ref, the tuple (num_gm, num_runs).
     """
 
     group_offset = group_offset_ref[0]

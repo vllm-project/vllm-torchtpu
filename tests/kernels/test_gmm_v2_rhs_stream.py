@@ -78,8 +78,9 @@ _SIZES_AND_GARBAGE = [5, 7, 9, 12, 0, 0, 0, 0, 3, 3, 3, 3]
 @pytest.mark.parametrize(
     "lhs_groups, offset, sizes, first, bound",
     [
-        # No local group has rows: nothing is streamed, and the search never
-        # reads past the lhs groups (index 8 holds garbage).
+        # No local group has rows: nothing is streamed. The search's last check
+        # also reads index 8 (jnp.logical_and evaluates both sides) and drops
+        # it; the garbage there shows that value cannot decide the result.
         (8, 4, _SIZES_AND_GARBAGE, 4, 4),
         (8, 4, [5, 7, 9, 12, 0, 6, 0, 0], 1, 4),
         # A copy-slot rhs at offset 0: the bound is the lhs groups.
