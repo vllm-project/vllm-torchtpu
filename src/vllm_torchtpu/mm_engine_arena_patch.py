@@ -15,14 +15,15 @@
 
 The API server sends each request to EngineCore over a ZMQ ipc socket, the
 pixels as zero-copy frames. A unix socket still copies them twice in the
-kernel, once into it and once out: 6-7 ms for a 3-image request's 36 MB of
-pixels, at ~6 GB/s. Here they take the shared-memory tensor arena EngineCore
+kernel, once into it and once out. Here they take the shared-memory tensor arena EngineCore
 already uses for its workers: the API server writes each tensor of at least
 `MIN_BYTES` into a slot of its own arena (1.3 ms for 32 MB on the copy pool,
 see `mm_host_copy_patch`), the message carries the slot, and EngineCore reads
 a zero-copy view of it. The slot frees once EngineCore drops the tensor. A
 tensor the arena cannot take, as when all its slots are in use, takes the
-socket as before.
+socket as before. The hop from the renderer to EngineCore takes 3.9 ms instead
+of 8.0 for a 3-image request (36 MB of pixels), 2.8 instead of 4.6 for a
+9360-patch video.
 
 The two ends ride on msgspec's out-of-band tensor seam (vLLM's
 `OOBTensorConsumer` and tensor provider), which vLLM's own `torch_shm`

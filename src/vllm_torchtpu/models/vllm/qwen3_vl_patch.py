@@ -501,9 +501,9 @@ def maybe_patch_qwen3_vl_video_hf_text(
     then vLLM pops the ids and builds the video's tokens itself
     (`get_video_repl`); only the video fields come from that call, and the
     video processor computes them without the text. Dropping the text takes
-    the tokenizer (3.9 ms) out of Cosmos3-Super's 9360-patch video. The call is
-    told apart by its `videos`, which upstream pops from the data of its other
-    call.
+    the HF step of Cosmos3-Super's 9360-patch video from 10.8 to 7.5 ms (its
+    3.9 ms tokenizer call goes). The call is told apart by its `videos`, which
+    upstream pops from the data of its other call.
     """
     if model_config is None or not _has_qwen3_vl_vision(model_config):
         return False
