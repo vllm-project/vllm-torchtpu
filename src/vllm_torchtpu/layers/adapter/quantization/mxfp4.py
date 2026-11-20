@@ -979,6 +979,23 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 w2_scale,
                 persistent=False,
             )
+            if envs.VLLM_TPU_MXFP4_RELEASE_UNPADDED_SCALES:
+                # The fused kernel reads only the row-padded copies above
+                # (expert_mover moves those too), so the unpadded float32
+                # scales are replaced by empty placeholders: 27.5 MiB per
+                # layer of 96 experts, 1.1 GiB over DeepSeek-V4.1-Flash's 40.
+                synchronize_tensors([w13_scale, w2_scale])
+                for name in ("w13_weight_scale", "w2_weight_scale"):
+                    setattr(
+                        layer,
+                        name,
+                        torch.nn.Parameter(
+                            torch.empty(
+                                (0,), dtype=torch.float32, device=device
+                            ),
+                            requires_grad=False,
+                        ),
+                    )
             if expert_placement.expert_slot_table(layer) is not None:
                 # The kernel's e_total is this rank's slots times the EP width.
                 expert_load.register(

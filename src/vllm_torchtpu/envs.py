@@ -191,6 +191,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
     VLLM_TPU_MXFP4_PREPARE_CHUNK_EXPERTS: int = 8
     VLLM_TPU_MXFP4_PREPARE_LOG_HBM: bool = False
+    VLLM_TPU_MXFP4_RELEASE_UNPADDED_SCALES: bool = False
     VLLM_TPU_DEBUG_PCP_LAYOUT: bool = False
     TPU_LOCAL_RANK_OFFSET: int = 0
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
@@ -1222,6 +1223,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Log device memory before and after each MXFP4 expert layer is prepared.
     "VLLM_TPU_MXFP4_PREPARE_LOG_HBM": env_bool("VLLM_TPU_MXFP4_PREPARE_LOG_HBM"),
+    # Free the unpadded float32 MXFP4 expert scales of a fused EP layer once
+    # the row-padded copies the kernel reads exist (1.1 GiB per device for
+    # DeepSeek-V4.1-Flash at EP4).
+    "VLLM_TPU_MXFP4_RELEASE_UNPADDED_SCALES": env_bool(
+        "VLLM_TPU_MXFP4_RELEASE_UNPADDED_SCALES"
+    ),
     # Log the PCP sequence layout window on every step.
     "VLLM_TPU_DEBUG_PCP_LAYOUT": env_bool("VLLM_TPU_DEBUG_PCP_LAYOUT"),
     # Added to every worker's local rank when it binds to a physical chip.
