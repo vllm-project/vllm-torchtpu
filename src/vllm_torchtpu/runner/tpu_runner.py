@@ -708,16 +708,6 @@ def _order_prefills_and_publish_swaps(
         runner.input_batch.refresh_metadata()
 
 
-def _h2d_temp(runner, host: torch.Tensor) -> torch.Tensor:
-    """non_blocking upload of a temporary host tensor for ``runner``.
-
-    An alias of ``stage_h2d_upload``, which keeps ``host`` alive until the
-    runner's next input-staging fence has been synchronized (TorchTPU reads
-    the source when the transfer runs, not when it is enqueued).
-    """
-    return stage_h2d_upload(runner, host)
-
-
 def _spec_warmup_all_token_ids(
     req_ids: list[str], num_computed_tokens: list[int]
 ) -> dict[str, list[int]]:
@@ -2821,22 +2811,22 @@ class TPUModelRunner(GPUModelRunner):
                 # New-owner rows are uniform, so the fused gather selects
                 # their state block whatever the source's offset holds.
                 assert self.mamba_slot_read_offsets is not None
-                rollback_dst_t = _h2d_temp(
+                rollback_dst_t = stage_h2d_upload(
                     self,
                     torch.tensor(self._pad_to_bucket(spec_dsts), dtype=torch.long),
                 )
-                state_t = _h2d_temp(
+                state_t = stage_h2d_upload(
                     self,
                     torch.tensor(self._pad_to_bucket(all_state_srcs), dtype=torch.long),
                 )
-                ckpt_t = _h2d_temp(
+                ckpt_t = stage_h2d_upload(
                     self,
                     torch.tensor(
                         self._pad_to_bucket(all_ckpt_rows, pad=[0] * window),
                         dtype=torch.int32,
                     ),
                 )
-                dst_t = _h2d_temp(
+                dst_t = stage_h2d_upload(
                     self,
                     torch.tensor(self._pad_to_bucket(all_dsts), dtype=torch.int32),
                 )
@@ -2849,7 +2839,7 @@ class TPUModelRunner(GPUModelRunner):
             src_t = self._spec_seed_sources(
                 all_state_srcs, all_ckpt_rows, all_new_owners
             )
-            dst_t = _h2d_temp(self, torch.tensor(all_dsts, dtype=torch.int32))
+            dst_t = stage_h2d_upload(self, torch.tensor(all_dsts, dtype=torch.int32))
             src_t, dst_t = self._expand_pool_split(src_t, dst_t)
             entry = per_raw_dev.setdefault(key, (raws, [], []))
             entry[1].append(src_t)
@@ -3043,10 +3033,10 @@ class TPUModelRunner(GPUModelRunner):
                 for block_copy in copies
             ]
             mgr_pairs = self._pad_to_bucket(mgr_pairs, pad=(0, 0))
-            mgr_src_t = _h2d_temp(
+            mgr_src_t = stage_h2d_upload(
                 self, torch.tensor([s for s, _ in mgr_pairs], dtype=torch.long)
             )
-            mgr_dst_t = _h2d_temp(
+            mgr_dst_t = stage_h2d_upload(
                 self, torch.tensor([d for _, d in mgr_pairs], dtype=torch.long)
             )
             _rollback_offsets_migrate(read_offsets, mgr_src_t, mgr_dst_t)
@@ -3058,10 +3048,10 @@ class TPUModelRunner(GPUModelRunner):
             for j in range(split)
         ]
         pairs = self._pad_to_bucket(pairs, pad=(0, 0))
-        src_t = _h2d_temp(
+        src_t = stage_h2d_upload(
             self, torch.tensor([src for src, _ in pairs], dtype=torch.int32)
         )
-        dst_t = _h2d_temp(
+        dst_t = stage_h2d_upload(
             self, torch.tensor([dst for _, dst in pairs], dtype=torch.int32)
         )
         self._copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
@@ -3133,10 +3123,10 @@ class TPUModelRunner(GPUModelRunner):
                 for j in range(split)
             ]
             pairs = self._pad_to_bucket(pairs, pad=(0, 0))
-            src_t = _h2d_temp(
+            src_t = stage_h2d_upload(
                 self, torch.tensor([s for s, _ in pairs], dtype=torch.int32)
             )
-            dst_t = _h2d_temp(
+            dst_t = stage_h2d_upload(
                 self, torch.tensor([d for _, d in pairs], dtype=torch.int32)
             )
             copy_pool_blocks(pools, src_t, dst_t)
@@ -3351,7 +3341,7 @@ class TPUModelRunner(GPUModelRunner):
                 subst_cache[subst_key] = substitution_indices
         else:
             # Both index rows in one host-to-device copy.
-            substitution_indices = _h2d_temp(
+            substitution_indices = stage_h2d_upload(
                 self,
                 torch.from_numpy(
                     _padded_substitution_indices(
@@ -4329,7 +4319,7 @@ class TPUModelRunner(GPUModelRunner):
             request_major_input_ids_cpu_padded.narrow(0, 0, global_num_tokens).copy_(
                 request_major_input_ids_cpu
             )
-            request_major_input_ids = _h2d_temp(
+            request_major_input_ids = stage_h2d_upload(
                 self, request_major_input_ids_cpu_padded
             )
         if zero_pad_tail:
@@ -4580,11 +4570,11 @@ class TPUModelRunner(GPUModelRunner):
             if spec_decode_metadata is not None:
                 logits_indices = spec_decode_metadata.final_logits_indices
             elif logits_indices_cpu is not None:
-                logits_indices = _h2d_temp(self, logits_indices_cpu)
+                logits_indices = stage_h2d_upload(self, logits_indices_cpu)
             else:
                 # Indices at which we sample (positions of last token in the
                 # sequence). Padded to avoid recompiling when `num_reqs` varies.
-                logits_indices = _h2d_temp(
+                logits_indices = stage_h2d_upload(
                     self, self.query_start_loc_cpu[1 : padded_num_reqs + 1] - 1
                 )
 
@@ -5928,7 +5918,6 @@ class TPUModelRunner(GPUModelRunner):
         self,
         indices_per_group: list[torch.Tensor] | None,
         next_tokens: torch.Tensor | None,
-        num_reqs: int,
     ) -> torch.Tensor | None:
         """Scatter this chunk's mamba read offsets into the slot-indexed buffer.
 
@@ -6592,7 +6581,7 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
                     read_offsets = self._update_mamba_slot_read_offsets(
-                        mamba_indices, next_tokens, num_reqs
+                        mamba_indices, next_tokens
                     )
                     spec_boundary_state.copy_states(self, boundary_plan, read_offsets)
                     if needs_logprobs:
@@ -6661,7 +6650,7 @@ class TPUModelRunner(GPUModelRunner):
                         )
                     # Non-verify chunk in a spec step: reset the read offsets
                     # (the latest state checkpoint is at the group base).
-                    self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
+                    self._update_mamba_slot_read_offsets(mamba_indices, None)
                 self._update_num_xla_graphs("spec_step")
                 cur_start_idx = cur_end_idx
         else:
@@ -6673,7 +6662,7 @@ class TPUModelRunner(GPUModelRunner):
                 cur_end_idx = cur_start_idx + num_reqs
                 # Non-spec step (prefill / plain decode): reset the mamba
                 # read offsets so the next step resumes from the group base.
-                self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
+                self._update_mamba_slot_read_offsets(mamba_indices, None)
                 tb_chunk = (
                     None
                     if tb_step is None
@@ -8364,16 +8353,24 @@ class TPUModelRunner(GPUModelRunner):
         It runs when a step's logits rows do not cover its tokens (a verify
         step that also schedules prefill tokens), so the fused substitute and
         extract above does not apply. Its logits and target indices have the
-        padded logits length L; its input is cut to L when every draft lies
-        below L (`_draft_extract_input_ids`), and is otherwise the step's N > L
-        padded tokens. Called under no_grad.
+        padded logits length L, at most the bucket of `max_num_reqs * (K + 1)`
+        rows; its input is cut to L when every draft lies below L
+        (`_draft_extract_input_ids`), and is otherwise the step's N > L padded
+        tokens. Called under no_grad.
         """
         from vllm_torchtpu.runner.tpu_runner_async_output import (
             _compiled_extract_draft_token_ids,
         )
 
+        assert self.speculative_config is not None
+        k = self.speculative_config.num_speculative_tokens
         paddings = list(self.num_tokens_paddings)
+        max_logits_len = _get_padded_token_len(
+            paddings, min(self.max_num_reqs * (k + 1), paddings[-1])
+        )
         for i, length in enumerate(paddings):
+            if length > max_logits_len:
+                break
             # Two tensors, as serving passes: dynamo guards on a repeated
             # input, so a graph warmed with one tensor in both places would
             # not serve a call with two.
@@ -10430,7 +10427,7 @@ class TPUModelRunner(GPUModelRunner):
             top_p_cpu[:num_active_reqs].copy_(top_p_slice)
 
         # Synchronous: temporaries whose device copies are cached and reused
-        # by every later step with the same sampling params (see _h2d_temp).
+        # by every later step with the same sampling params (see stage_h2d_upload).
         out = (
             temps_cpu.unsqueeze(1).to(logits.device),
             top_k_cpu.unsqueeze(1).to(logits.device),

@@ -167,16 +167,25 @@ def test_substitution_precompile_runs_under_no_grad(recorded):
     assert not any(recorded["substitute"] + recorded["fused"])
 
 
-def test_the_separate_draft_extract_is_warmed_at_every_reachable_shape(recorded):
+@pytest.mark.parametrize(
+    "max_num_reqs, max_logits_len",
+    # The logits length L is at most the bucket of max_num_reqs * (1 + K) rows.
+    [(MAX_NUM_REQS, 64), (4, 16)],
+)
+def test_the_separate_draft_extract_is_warmed_at_every_reachable_shape(
+    recorded, max_num_reqs, max_logits_len
+):
     """A step whose logits rows do not cover its tokens extracts its drafts
     apart: logits and target indices of the padded logits length L, and an
     input cut to L, or the step's N > L tokens when a draft lies past L."""
-    TPUModelRunner._precompile_substitute_placeholder_token(_runner())
+    runner = _runner()
+    runner.max_num_reqs = max_num_reqs
+    TPUModelRunner._precompile_substitute_placeholder_token(runner)
     expected = {
         (num_tokens, length, length)
         for length in NUM_TOKENS_PADDINGS
         for num_tokens in NUM_TOKENS_PADDINGS
-        if num_tokens >= length
+        if max_logits_len >= length and num_tokens >= length
     }
     shapes = [call[:3] for call in recorded["extract"]]
     assert sorted(shapes) == sorted(expected)

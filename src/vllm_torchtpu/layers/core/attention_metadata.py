@@ -204,10 +204,11 @@ class AttentionMetadataBuilderContext:
     staged_mamba_products: dict | None = None
     # Optional host-side bound `(seq_lens_hi_np[:num_reqs], max_rejected)` (or
     # `(..., sub_mask)`) on active requests' sequence lengths so
-    # `stage_block_table_uploads` can reuse cached per-group block tables and
-    # mamba state/checkpoint indices whenever every active request's state
-    # block column `(seq_len - 1) // block_size` is invariant across
-    # `[seq_lens_hi - max_rejected, seq_lens_hi]`.
+    # `stage_block_table_uploads` can reuse the cached mamba state/checkpoint
+    # indices (the staged-products cache) whenever every active request's
+    # state block column `(seq_len - 1) // block_size` is invariant across
+    # `[seq_lens_hi - max_rejected, seq_lens_hi]`. Block-table reuse comes from
+    # the content compare in `_stage_unless_unchanged`, not from this bound.
     mamba_seq_lens_bounds: tuple[Any, ...] | None = None
     # The walk's mamba group state indices, for the runner's read-offset reset
     # to reuse: one [G, num_reqs] tensor stacked from several groups, or the
@@ -323,9 +324,10 @@ def _staged_walk_products_compiled(
       stacked as one `[G, num_reqs]` tensor when G > 1).
 
     Issued for every staged walk that misses the runner's caches, dummy runs
-    included, so warmup and lockstep ranks dispatch the same program sequence;
-    `stage_block_table_uploads` skips it when an unchanged upload hits the
-    table-view or staged-products cache.
+    included; `stage_block_table_uploads` skips it when an unchanged upload
+    hits the table-view or staged-products cache. A hit depends on each rank's
+    own tables, so lockstep ranks may dispatch different program sequences,
+    which is safe because the program has no collectives.
     """
     return _staged_walk_products(
         staged_dev,

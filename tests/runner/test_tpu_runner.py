@@ -2345,7 +2345,7 @@ class TestMambaSlotReadOffsets:
         )
         # Must not raise even with real-looking args.
         runner._update_mamba_slot_read_offsets(
-            [torch.tensor([1, 4])], torch.tensor([[10, -1]]), 2
+            [torch.tensor([1, 4])], torch.tensor([[10, -1]])
         )
 
     def test_verify_offsets_are_num_accepted_minus_one(self):
@@ -2357,7 +2357,7 @@ class TestMambaSlotReadOffsets:
         next_tokens = torch.tensor(
             [[10, 11, 12], [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]]
         )
-        runner._update_mamba_slot_read_offsets([state_indices], next_tokens, 2)
+        runner._update_mamba_slot_read_offsets([state_indices], next_tokens)
         assert int(runner.mamba_slot_read_offsets[1]) == 2  # 3 valid - 1
         assert int(runner.mamba_slot_read_offsets[4]) == 0  # 1 valid - 1
 
@@ -2368,7 +2368,7 @@ class TestMambaSlotReadOffsets:
         runner.mamba_slot_read_offsets[1] = 2
         runner.mamba_slot_read_offsets[4] = 1
         runner._update_mamba_slot_read_offsets(
-            [torch.tensor([1, 4], dtype=torch.int32)], None, 2
+            [torch.tensor([1, 4], dtype=torch.int32)], None
         )
         assert int(runner.mamba_slot_read_offsets[1]) == 0
         assert int(runner.mamba_slot_read_offsets[4]) == 0
@@ -2378,10 +2378,10 @@ class TestMambaSlotReadOffsets:
         land there harmlessly and never touch an active group base."""
         runner = self._make_runner(num_blocks=8)
         runner.mamba_slot_read_offsets[1] = 2
-        # num_reqs = 1 active (slot 1); position 1 is padding -> slot 0.
+        # One active request (slot 1); position 1 is padding -> slot 0.
         state_indices = torch.tensor([1, 0], dtype=torch.int32)
         next_tokens = torch.tensor([[10, 11], [INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
-        runner._update_mamba_slot_read_offsets([state_indices], next_tokens, 1)
+        runner._update_mamba_slot_read_offsets([state_indices], next_tokens)
         assert int(runner.mamba_slot_read_offsets[1]) == 1  # 2 valid - 1
         # Null slot only ever gets 0; active groups untouched by the tail.
         assert int(runner.mamba_slot_read_offsets[0]) == 0
@@ -2395,13 +2395,13 @@ class TestMambaSlotReadOffsets:
         next_tokens = torch.tensor(
             [[10, 11, 12], [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]]
         )
-        runner._update_mamba_slot_read_offsets([group0, group1], next_tokens, 2)
+        runner._update_mamba_slot_read_offsets([group0, group1], next_tokens)
         for block, expected in ((3, 2), (7, 0), (11, 2), (5, 0)):
             assert int(runner.mamba_slot_read_offsets[block]) == expected
 
     def test_unified_empty_group_list_is_noop(self):
         runner = self._make_runner(num_blocks=8)
-        runner._update_mamba_slot_read_offsets([], torch.tensor([[1, 2]]), 1)
+        runner._update_mamba_slot_read_offsets([], torch.tensor([[1, 2]]))
         assert int(runner.mamba_slot_read_offsets.sum()) == 0
 
     def test_bucketed_next_tokens_shorter_than_state_indices_padded_in_graph(self):
@@ -2413,7 +2413,7 @@ class TestMambaSlotReadOffsets:
         next_tokens = torch.tensor(
             [[10, 11, 12], [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]]
         )
-        runner._update_mamba_slot_read_offsets([state_indices], next_tokens, 2)
+        runner._update_mamba_slot_read_offsets([state_indices], next_tokens)
         assert int(runner.mamba_slot_read_offsets[1]) == 2
         assert int(runner.mamba_slot_read_offsets[4]) == 0
         assert int(runner.mamba_slot_read_offsets[0]) == 0

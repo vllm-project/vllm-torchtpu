@@ -149,9 +149,7 @@ def _verify_step(runner, raws, starts, drafts, accepted, host_ahead):
     before = [raw.clone() for raw in raws]
     # Every row's read offset lands on the null block.
     indices = [torch.zeros(seq_lens.shape[0], dtype=torch.int32)]
-    read_offsets = runner._update_mamba_slot_read_offsets(
-        indices, next_tokens, num_reqs
-    )
+    read_offsets = runner._update_mamba_slot_read_offsets(indices, next_tokens)
     spec_boundary_state.copy_states(runner, plan, read_offsets)
     return plan, before
 

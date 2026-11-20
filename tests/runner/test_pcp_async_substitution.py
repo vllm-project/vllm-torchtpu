@@ -311,7 +311,7 @@ _SUBSTITUTION_CASE_NAMES = [
     "all_padding",
     "decode",
     "mixed_prefill_decode",
-    "mtp_partial_acceptance",
+    "mtp_uneven_schedule",
     "unpadded",
 ]
 
@@ -338,9 +338,9 @@ def _substitution_case(name):
             ),
         ),
         # MTP k=3: each request's source span starts at position * 4. Every
-        # rejected count is zero here, so partial acceptance shows only as
-        # requests that schedule fewer tokens this step.
-        "mtp_partial_acceptance": (
+        # rejected count is zero here: the requests schedule different token
+        # counts this step, and none is rejected.
+        "mtp_uneven_schedule": (
             16,
             _mtp_substitution_indices(
                 3, {"a": 4, "b": 2, "c": 1}, {"a": 1, "b": 0, "c": 2}

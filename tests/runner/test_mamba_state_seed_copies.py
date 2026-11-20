@@ -576,7 +576,7 @@ def test_spec_crossing_offset_past_the_row_falls_back_to_the_state_block():
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(10, 11)]
 
 
-def test_spec_crossing_uniform_candidates_skips_device_gather_and_resets_offset():
+def test_spec_crossing_uniform_candidates_skip_spec_seed_sources_and_reset_offset():
     # Prefix-cache resume (no prior state_pos) with ckpt_window=3 builds
     # uniform candidate rows [src, src, src]; the CPU fast path must skip
     # _spec_seed_sources while still resetting the destination read offset.
