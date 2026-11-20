@@ -572,7 +572,7 @@ def _spec_logprob_row_tokens(
 
 
 @_static_shape_args
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _fused_greedy_verify_from_top_tokens(
     tokens: torch.Tensor,
     bonus_logits_indices: torch.Tensor,
@@ -604,7 +604,7 @@ def _fused_greedy_verify_from_top_tokens(
 
 
 @_static_shape_args
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _fused_greedy_verify_from_logits(
     logits: torch.Tensor,
     bonus_logits_indices: torch.Tensor,
@@ -12463,7 +12463,7 @@ class TPUModelRunner(GPUModelRunner):
             raise RuntimeError("greedy top-token path requires a greedy head owner")
         return greedy_top_tokens.top_tokens(self._greedy_head_owner, hidden_states)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def compute_selected_topk_candidates(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
     ) -> torch.Tensor:
@@ -12472,7 +12472,7 @@ class TPUModelRunner(GPUModelRunner):
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return greedy_top_tokens.topk_candidates(self._greedy_head_owner, selected)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def compute_topk_candidates_from_hidden_states(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -12576,7 +12576,7 @@ class TPUModelRunner(GPUModelRunner):
         final_logits = torch.where(is_greedy, logits, noisy_logits)
         return torch.argmax(final_logits, dim=-1, keepdim=True)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def sample_from_packed_candidates(
         self,
         packed_candidates: torch.Tensor,

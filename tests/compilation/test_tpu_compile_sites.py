@@ -176,6 +176,13 @@ DISPATCHED_DIRECTLY = [
     ("runner.tpu_runner", "_clear_read_offsets_compiled"),
     ("runner.tpu_runner", "_update_read_offsets_verify_compiled"),
     ("runner.tpu_runner_async_output", "_compiled_extract_draft_token_ids"),
+    (
+        "layers.adapter.sample.rejection_sampler",
+        "_fused_spec_verify_and_sample_candidates",
+    ),
+    ("runner.tpu_runner", "_fused_greedy_verify_from_logits"),
+    ("runner.tpu_runner", "TPUModelRunner.compute_selected_topk_candidates"),
+    ("runner.tpu_runner", "TPUModelRunner.sample_from_packed_candidates"),
 ]
 
 

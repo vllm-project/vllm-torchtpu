@@ -753,7 +753,7 @@ def _assemble_output_tokens(
     return selected_tokens[:batch_size]
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _fused_spec_verify_and_sample_candidates(
     logits: torch.Tensor,
     draft_token_ids: torch.Tensor,
