@@ -346,7 +346,6 @@ def _has_vocab_padding(lm_head: torch.nn.Module) -> bool:
 
 
 def _quantized_head_local_max(
-    processor: LogitsProcessor,
     lm_head: torch.nn.Module,
     hidden_states: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -393,7 +392,7 @@ def _quantized_head_local_max(
         cast(torch.Tensor, lm_head._w8a8_scale).float().unsqueeze(0)
     )
 
-    if isinstance(pad_buf, torch.Tensor) and _has_vocab_padding(lm_head):
+    if isinstance(pad_buf, torch.Tensor) and has_vocab_padding:
         shard_vocab = logits.shape[-1]
         col_idx = torch.arange(shard_vocab, device=logits.device, dtype=torch.int32)
         valid_cols = shard_vocab - pad_buf.to(device=logits.device, dtype=torch.int32)
@@ -427,7 +426,7 @@ def tpu_get_top_tokens(
     quant_mode = getattr(lm_head, "_quant_mode", None)
     if quant_mode == "fp8" and embedding_bias is None and self.soft_cap is None:
         local_max_vals, local_max_indices = _quantized_head_local_max(
-            self, lm_head, hidden_states
+            lm_head, hidden_states
         )
         vocab_start = getattr(
             lm_head,
@@ -567,7 +566,6 @@ def _extract_local_topk32_torch(
 
 
 def _quantized_head_local_topk(
-    processor: LogitsProcessor,
     lm_head: torch.nn.Module,
     hidden_states: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -615,7 +613,7 @@ def _quantized_head_local_topk(
     )
     logits = logits.to(hidden_states.dtype)
 
-    if isinstance(pad_buf, torch.Tensor) and _has_vocab_padding(lm_head):
+    if isinstance(pad_buf, torch.Tensor) and has_vocab_padding:
         shard_vocab = logits.shape[-1]
         col_idx = torch.arange(shard_vocab, device=logits.device, dtype=torch.int32)
         valid_cols = shard_vocab - pad_buf.to(device=logits.device, dtype=torch.int32)
@@ -648,9 +646,7 @@ def tpu_get_topk_candidates(
     tp_size = lm_head.tp_size
     quant_mode = getattr(lm_head, "_quant_mode", None)
     if quant_mode == "fp8" and embedding_bias is None and self.soft_cap is None:
-        local_vals, local_indices = _quantized_head_local_topk(
-            self, lm_head, hidden_states
-        )
+        local_vals, local_indices = _quantized_head_local_topk(lm_head, hidden_states)
         if self.scale != 1.0:
             local_vals = local_vals * self.scale
     else:
@@ -662,9 +658,7 @@ def tpu_get_topk_candidates(
             logits = logits * self.scale
 
         pad_buf: Any = getattr(lm_head, "num_org_vocab_padding", None)
-        if isinstance(pad_buf, torch.Tensor) and (
-            getattr(self, "vocab_size", 0) < getattr(self, "padded_vocab_size", 0)
-        ):
+        if isinstance(pad_buf, torch.Tensor) and _has_vocab_padding(lm_head):
             shard_vocab = logits.shape[-1]
             col_idx = torch.arange(shard_vocab, device=logits.device, dtype=torch.int32)
             valid_cols = shard_vocab - pad_buf.to(

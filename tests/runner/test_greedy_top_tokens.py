@@ -664,18 +664,30 @@ def test_log_step_path_logs_each_path_once():
     ]
 
 
-def _vocab_parallel_top_tokens_dim0(weight, hidden_states, tp_size, monkeypatch):
+def _resolved_owners(weight, tp_size, quantize, python_pad):
+    """One resolved head owner per TP shard, with vLLM's stock LogitsProcessor
+    (each shard quantized to W8A8 FP8 first with `quantize`). With
+    `python_pad`, every shard's Python padding count is overwritten after its
+    tensor buffers are registered, so only the buffer knows the padding."""
+    owners = []
+    for shard in _shards(weight, tp_size):
+        if quantize:
+            greedy_top_tokens.quantize_lm_head(shard, "fp8")
+        owner = _Owner(shard)
+        owner.logits_processor.vocab_size = weight.shape[0]
+        greedy_top_tokens.resolve_head_owner(owner, dp_lockstep=False)
+        if python_pad is not None:
+            shard.shard_indices.num_org_vocab_padding = python_pad
+        owners.append(owner)
+    return owners
+
+
+def _vocab_parallel_top_tokens_dim0(
+    weight, hidden_states, tp_size, monkeypatch, quantize=False, python_pad=None
+):
     """Play back tensor_model_parallel_all_gather honoring dim=0 (as
     DeviceCommunicatorBase.all_gather does on TPU)."""
-    vocab = weight.shape[0]
-    shards = _shards(weight, tp_size)
-    owners = []
-    for shard in shards:
-        owner = _Owner(shard)
-        owner.logits_processor.vocab_size = vocab
-        owner.logits_processor.padded_vocab_size = shard.weight.shape[0] * tp_size
-        greedy_top_tokens.resolve_head_owner(owner, dp_lockstep=False)
-        owners.append(owner)
+    owners = _resolved_owners(weight, tp_size, quantize, python_pad)
 
     recorded = []
     seen_dims = []
@@ -736,23 +748,39 @@ def test_bfloat16_negative_zero_and_positive_zero_ties(monkeypatch, tp_size):
     assert torch.equal(got, _full_logits_tokens(weight, hidden_states))
 
 
+@pytest.mark.parametrize("quantize", [False, True], ids=["bf16", "w8a8"])
+@pytest.mark.parametrize("path", ["top_tokens", "topk_candidates"])
+def test_every_rank_masks_its_padding_from_the_head_buffer(monkeypatch, path, quantize):
+    """Each rank masks its vocab padding with the head's num_org_vocab_padding
+    buffer, a program input, so every rank runs one compiled program. Here the
+    shards' Python padding counts are zeroed, so a path that decided or masked
+    from them would let a padding row (built to win) through."""
+    gen = torch.Generator().manual_seed(7)
+    vocab, tp_size = 301, 4  # 76 rows per rank; the last rank pads 3
+    weight = torch.randn(vocab, 32, generator=gen) * 0.01
+    hidden_states = torch.rand(7, 32, generator=gen) + 0.1
+    if path == "top_tokens":
+        got = _vocab_parallel_top_tokens_dim0(
+            weight, hidden_states, tp_size, monkeypatch, quantize, python_pad=0
+        )
+        assert int(got.max()) < vocab
+        if not quantize:
+            assert torch.equal(got, _full_logits_tokens(weight, hidden_states))
+    else:
+        packed = _vocab_parallel_topk_candidates_dim0(
+            weight, hidden_states, tp_size, monkeypatch, quantize, python_pad=0
+        )
+        num_cand = greedy_top_tokens.LOCAL_TOPK_CANDIDATES * tp_size
+        cand_logits, cand_ids = packed[:, :num_cand], packed[:, num_cand:]
+        assert int(cand_ids[cand_logits > -1e30].max()) < vocab
+
+
 def _vocab_parallel_topk_candidates_dim0(
-    weight, hidden_states, tp_size, monkeypatch, quantize=False
+    weight, hidden_states, tp_size, monkeypatch, quantize=False, python_pad=None
 ):
     """Play back tensor_model_parallel_all_gather honoring dim=0 for
-    tpu_get_topk_candidates across all TP shards (each shard quantized to
-    W8A8 FP8 first with `quantize`)."""
-    vocab = weight.shape[0]
-    shards = _shards(weight, tp_size)
-    owners = []
-    for shard in shards:
-        if quantize:
-            greedy_top_tokens.quantize_lm_head(shard, "fp8")
-        owner = _Owner(shard)
-        owner.logits_processor.vocab_size = vocab
-        owner.logits_processor.padded_vocab_size = shard.weight.shape[0] * tp_size
-        greedy_top_tokens.resolve_head_owner(owner, dp_lockstep=False)
-        owners.append(owner)
+    tpu_get_topk_candidates across all TP shards."""
+    owners = _resolved_owners(weight, tp_size, quantize, python_pad)
 
     recorded = []
     seen_dims = []
@@ -1166,22 +1194,19 @@ def test_w8a8_head_pallas_ops_on_tpu(num_pad):
         )
         for dev in ("cpu", tpu)
     }
-    processor = _Owner(heads["cpu"]).logits_processor
-    processor.vocab_size = vocab_shard - num_pad
-    processor.padded_vocab_size = vocab_shard
     want = torch.tensor(winners, dtype=torch.int32)
 
     _, cpu_ids = greedy_top_tokens._quantized_head_local_max(
-        processor, heads["cpu"], hidden_states
+        heads["cpu"], hidden_states
     )
     _, tpu_ids = greedy_top_tokens._quantized_head_local_max(
-        processor, heads[tpu], hidden_states.to(tpu)
+        heads[tpu], hidden_states.to(tpu)
     )
     assert torch.equal(cpu_ids, want)
     assert torch.equal(tpu_ids.cpu().to(torch.int32), want)
 
     vals, ids = greedy_top_tokens._quantized_head_local_topk(
-        processor, heads[tpu], hidden_states.to(tpu)
+        heads[tpu], hidden_states.to(tpu)
     )
     vals, ids = vals.cpu(), ids.cpu().to(torch.int64)
     k = greedy_top_tokens.LOCAL_TOPK_CANDIDATES
@@ -1225,8 +1250,8 @@ def test_quantize_lm_head_is_w8a8_fp8_or_bf16_only():
     ids=["qwen3_5_397b", "vocab_151936", "vocab_50257"],
 )
 def test_vocab_padding_is_decided_from_the_head(vocab_size, padded):
-    """vLLM's LogitsProcessor has no padded_vocab_size, so the W8A8 head paths
-    decide from the head: padding exists when org_vocab_size_padded exceeds
+    """vLLM's LogitsProcessor has no padded_vocab_size, so the head paths (W8A8
+    and BF16) decide from the head: padding exists when org_vocab_size_padded exceeds
     org_vocab_size, the same answer on every rank. The Qwen3.5-397B vocabulary
     (248320) is a multiple of vLLM's 64-entry padding, so its heads have none
     at any TP size; a 50257-token vocabulary pads to 50304."""
