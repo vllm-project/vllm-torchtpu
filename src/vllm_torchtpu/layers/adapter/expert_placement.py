@@ -397,13 +397,6 @@ def has_applied_layers() -> bool:
     return bool(_APPLIED_LAYERS)
 
 
-def _require() -> Placement:
-    placement = current()
-    if placement is None:
-        raise RuntimeError("no expert placement: TPU_EXPERT_PLACEMENT is unset")
-    return placement
-
-
 # The table's facts by the names the MoE methods ask for them; neither needs a
 # table.
 def has_copies() -> bool:
