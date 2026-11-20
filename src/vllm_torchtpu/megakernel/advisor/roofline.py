@@ -268,19 +268,25 @@ def _boundary_fill_drain_s(
     scope_context: _ScopeContext,
     boundary_cfg: tuple[int, int, bool, float],
     efficiencies: tuple[float, float] = (1.0, 1.0),
+    *,
+    sync_hop_factor: float = BOUNDARY_SYNC_HOP_FACTOR,
+    include_first_slot_hbm: bool = True,
 ) -> float:
     """Return inter-call cold-slot fill, row-tile sync, and stage sync seconds."""
     boundary_count, n_splits, tiled, sync_stage_s = boundary_cfg
     eta_hbm, eta_ici = efficiencies
-    per_call_s = (scope_context.first_slot_bytes / scope_context.bw_hbm) / eta_hbm + (
-        BOUNDARY_SYNC_HOP_FACTOR * scope_context.lat_coll
-    ) / eta_ici
+    first_slot_s = (
+        (scope_context.first_slot_bytes / scope_context.bw_hbm) / eta_hbm
+        if include_first_slot_hbm
+        else 0.0
+    )
+    per_call_s = first_slot_s + (sync_hop_factor * scope_context.lat_coll) / eta_ici
     tiled_sync_s = (
         (
             (n_splits - 1)
             * 2
             * scope_context.layers_local
-            * BOUNDARY_SYNC_HOP_FACTOR
+            * sync_hop_factor
             * scope_context.lat_coll
         )
         / eta_ici
@@ -542,10 +548,19 @@ def _compute_scope_collective_times(
         WorkloadSpec,
         Mapping[str, object] | None,
         InCallExpertMode,
+        int,
+        bool,
     ],
 ) -> tuple[float, float, int, float, bool, int, int, bool, float, bool]:
     """Compute sync stage, comm time, xla factor, measured AR, and step hop/saving."""
-    n_splits, workload, declaration, expert_mode = coll_cfg
+    (
+        n_splits,
+        workload,
+        declaration,
+        expert_mode,
+        per_op_call_factor,
+        allow_measured_ar,
+    ) = coll_cfg
     decl_coll = declared_collectives(declaration)
     eff_num_ar = (
         ceil(
@@ -564,9 +579,13 @@ def _compute_scope_collective_times(
     bw_hbm = scope_context.bw_hbm
 
     measured_ar_s = (
-        scope_context.measured_ar_xla_s
-        if scope == "per_op"
-        else scope_context.measured_ar_in_kernel_s
+        (
+            scope_context.measured_ar_xla_s
+            if scope == "per_op"
+            else scope_context.measured_ar_in_kernel_s
+        )
+        if allow_measured_ar
+        else None
     )
     has_measured_ar = measured_ar_s is not None and scope_context.eff_tp > 1
     measured_ar_total_s = (
@@ -575,9 +594,7 @@ def _compute_scope_collective_times(
         else 0.0
     )
     xla_ar_factor = (
-        PER_OP_COLLECTIVE_CALL_FACTOR
-        if scope == "per_op" and scope_context.eff_tp > 1
-        else 1
+        per_op_call_factor if scope == "per_op" and scope_context.eff_tp > 1 else 1
     )
     xla_hbm_coll_bytes = (
         2.0 * eff_num_ar * scope_context.token_residual_bytes
@@ -588,6 +605,7 @@ def _compute_scope_collective_times(
     step_call_mult = 1
     if decl_coll is not None:
         steps_to_price = decl_coll.steps
+        step_call_mult = per_op_call_factor if scope == "per_op" else 1
     elif (
         not scope_context.has_dsa
         and workload.dcp > 1
@@ -601,7 +619,7 @@ def _compute_scope_collective_times(
                 calls_per_layer=DEFAULT_DECLARED_CALLS_PER_LAYER,
             ),
         )
-        step_call_mult = PER_OP_COLLECTIVE_CALL_FACTOR if scope == "per_op" else 1
+        step_call_mult = per_op_call_factor if scope == "per_op" else 1
     else:
         steps_to_price = ()
     has_declared_routed = any(
@@ -824,20 +842,10 @@ def _compute_scope_matmuls(
     scope_context: _ScopeContext,
     profile: ModelProfile,
     workload: WorkloadSpec,
-    *args: object,
-    **kwargs: object,
+    matmul_inputs: tuple[float, float, bool] = (1.0, 0.0, False),
 ) -> tuple[float, float, float, float, float]:
     """Compute baseline/upper matmul times, vector op counts, and rate."""
-    if args and isinstance(args[0], tuple):
-        moe_pad_factor, routed_bytes_streamed, bf16_attention_upper = args[0]
-    elif len(args) > 1:
-        moe_pad_factor = float(str(args[0]))
-        routed_bytes_streamed = float(str(args[1]))
-        bf16_attention_upper = bool(kwargs.get("bf16_attention_upper", False))
-    else:
-        moe_pad_factor = 1.0
-        routed_bytes_streamed = 0.0
-        bf16_attention_upper = False
+    moe_pad_factor, routed_bytes_streamed, bf16_attention_upper = matmul_inputs
     chip_spec = scope_context.chip_spec
     vec_rate = chip_spec.vector_f32_ops_per_s or (chip_spec.bf16_flops_per_s / 128.0)
     eff_tp = max(1, scope_context.eff_tp)
@@ -1199,18 +1207,19 @@ def _compute_scope_achievable_step(
     aux_terms: tuple[
         tuple[float, float, float],
         tuple[float, float],
-        tuple[int, int, int, bool, bool],
+        tuple[int, int, int, int, bool, bool],
     ] = (
         (0.0, 0.0, 1.0),
         (0.0, 0.0),
-        (1, 1, 0, False, False),
+        (1, 1, 1, 0, False, False),
     ),
 ) -> tuple[float, float, float, float, float]:
     """Compute achievable and upper-band step components for one FusionScope."""
     vector_terms, measured_ar_split, dsa_ach_cfg = aux_terms
     (
         n_splits,
-        xla_ar_factor,
+        ach_xla_factor,
+        upper_xla_factor,
         indexer_achievable_extra_hops,
         bf16_attention_upper,
         has_declared_dcp,
@@ -1275,7 +1284,7 @@ def _compute_scope_achievable_step(
         (vec_ops_dense, vec_rate),
         (
             n_splits,
-            xla_ar_factor,
+            ach_xla_factor,
             scope_context.lat_coll,
             False,
             False,
@@ -1309,7 +1318,7 @@ def _compute_scope_achievable_step(
         (vec_ops_dense, vec_rate),
         (
             n_splits,
-            xla_ar_factor,
+            upper_xla_factor,
             scope_context.lat_coll_upper,
             bf16_attention_upper,
             False,
@@ -1362,16 +1371,168 @@ def _routed_achievable_ratio(
     )
 
 
+def _resolve_upper_and_achievable_collectives(
+    scope: FusionScope,
+    eval_ctx: _ScopeContext,
+    profile: ModelProfile,
+    workload_cfg: tuple[
+        WorkloadSpec,
+        WorkloadSpec,
+        Mapping[str, object] | None,
+        InCallExpertMode,
+    ],
+    floor_cfg: tuple[
+        int,
+        int,
+        bool,
+        bool,
+        tuple[bool, bool],
+        float,
+        int,
+        int,
+        int,
+        bool,
+        float,
+    ],
+) -> tuple[
+    tuple[float, int, float, float, float],
+    tuple[float, float, int, float, float, float, float, float],
+]:
+    """Resolve analytical peak-upper and calibrated achievable collective terms."""
+    workload, in_call_workload, declaration, expert_mode = workload_cfg
+    (
+        n_ops,
+        n_splits,
+        tiled,
+        comm_in_core,
+        upper_priors,
+        comm_s,
+        floor_xla_factor,
+        eff_num_ar,
+        step_hops_floor,
+        has_declared_routed,
+        pipeline_fill_drain_s,
+    ) = floor_cfg
+    upper_boundary_fill, upper_per_op_coll_factor = upper_priors
+    if upper_per_op_coll_factor:
+        (
+            sync_stage_upper_s,
+            comm_upper_s,
+            upper_xla_factor,
+            _,
+            _,
+            _,
+            step_hops_upper,
+            _,
+            _,
+            _,
+        ) = _compute_scope_collective_times(
+            scope,
+            eval_ctx,
+            profile,
+            (
+                n_splits,
+                workload,
+                declaration,
+                expert_mode,
+                PER_OP_COLLECTIVE_CALL_FACTOR,
+                False,
+            ),
+        )
+    else:
+        sync_stage_upper_s = pipeline_fill_drain_s
+        comm_upper_s = comm_s
+        upper_xla_factor = floor_xla_factor
+        step_hops_upper = step_hops_floor
+    if upper_boundary_fill:
+        upper_fill_drain_s = _boundary_fill_drain_s(
+            eval_ctx,
+            (n_ops - 1, n_splits, tiled, sync_stage_upper_s),
+            sync_hop_factor=BOUNDARY_SYNC_HOP_FACTOR,
+            include_first_slot_hbm=True,
+        )
+    else:
+        upper_fill_drain_s = sync_stage_upper_s
+    ar_extra_upper_s, a2a_extra_upper_s = _upper_collective_extras(
+        eval_ctx,
+        n_splits,
+        upper_xla_factor,
+        (False, eff_num_ar, step_hops_upper, has_declared_routed),
+    )
+    (
+        sync_stage_ach_s,
+        comm_ach_s,
+        ach_xla_factor,
+        measured_ar_total_s,
+        has_measured_ar,
+        _,
+        step_hops_ach,
+        _,
+        _,
+        _,
+    ) = _compute_scope_collective_times(
+        scope,
+        eval_ctx,
+        profile,
+        (
+            n_splits,
+            workload,
+            declaration,
+            expert_mode,
+            PER_OP_COLLECTIVE_CALL_FACTOR,
+            True,
+        ),
+    )
+    measured_in_comm_s, measured_in_sync_s = (
+        (measured_ar_total_s, 0.0) if comm_in_core else (0.0, measured_ar_total_s)
+    )
+    achievable_fill_drain_s = _achievable_fill_drain_s(
+        scope,
+        eval_ctx,
+        profile,
+        in_call_workload,
+        (n_ops, n_splits, sync_stage_ach_s),
+    )
+    ar_extra_ach_s, a2a_extra_ach_s = _upper_collective_extras(
+        eval_ctx,
+        n_splits,
+        ach_xla_factor,
+        (has_measured_ar, eff_num_ar, step_hops_ach, has_declared_routed),
+    )
+    return (
+        (
+            comm_upper_s,
+            upper_xla_factor,
+            ar_extra_upper_s,
+            a2a_extra_upper_s,
+            upper_fill_drain_s,
+        ),
+        (
+            sync_stage_ach_s,
+            comm_ach_s,
+            ach_xla_factor,
+            ar_extra_ach_s,
+            a2a_extra_ach_s,
+            measured_in_comm_s,
+            measured_in_sync_s,
+            achievable_fill_drain_s,
+        ),
+    )
+
+
 def _evaluate_single_scope(
     scope: FusionScope,
     scope_context: _ScopeContext,
     profile: ModelProfile,
     workload: WorkloadSpec,
-    scope_eval_cfg: tuple[float, bool],
+    scope_eval_cfg: tuple[float, bool, tuple[bool, bool]],
 ) -> tuple[ScopeEstimate, float, float]:
     """Evaluate one FusionScope against VMEM, HBM, matmul, and collective bounds."""
-    sub_pure_us, bf16_attention_upper = scope_eval_cfg
+    sub_pure_us, bf16_attention_upper, upper_priors = scope_eval_cfg
     declaration = find_declaration(profile.name, scope, scope_context.eff_tp, workload)
+    coll_declaration = declaration or find_declaration(
+        profile.name, "whole_step", scope_context.eff_tp, workload
+    )
     expert_mode = resolve_declared_expert_mode(
         declaration, workload, scope_context.active_tokens, scope_context.l_moe
     )
@@ -1424,11 +1585,11 @@ def _evaluate_single_scope(
     (
         sync_stage_s,
         comm_s,
-        xla_ar_factor,
-        measured_ar_total_s,
-        has_measured_ar,
+        floor_xla_factor,
+        _,
+        _,
         eff_num_ar,
-        step_hops,
+        step_hops_floor,
         has_declared_routed,
         step_strict_saving_s,
         has_declared_dcp,
@@ -1436,18 +1597,51 @@ def _evaluate_single_scope(
         scope,
         eval_ctx,
         profile,
-        (n_splits, workload, declaration, expert_mode),
+        (n_splits, workload, coll_declaration, expert_mode, 1, False),
     )
     comm_in_core = overlapped_comm or not is_fused_multi
-    measured_in_comm_s, measured_in_sync_s = (
-        (measured_ar_total_s, 0.0) if comm_in_core else (0.0, measured_ar_total_s)
-    )
-    # Each tile boundary adds a sync hop per layer. The residual bytes moved
-    # there are already in act_bytes.
     pipeline_fill_drain_s = _boundary_fill_drain_s(
         eval_ctx,
         (n_ops - 1, n_splits, tiled, sync_stage_s),
+        sync_hop_factor=0.0,
+        include_first_slot_hbm=False,
     )
+    upper_coll_terms, ach_coll_terms = _resolve_upper_and_achievable_collectives(
+        scope,
+        eval_ctx,
+        profile,
+        (workload, in_call_workload, coll_declaration, expert_mode),
+        (
+            n_ops,
+            n_splits,
+            tiled,
+            comm_in_core,
+            upper_priors,
+            comm_s,
+            floor_xla_factor,
+            eff_num_ar,
+            step_hops_floor,
+            has_declared_routed,
+            pipeline_fill_drain_s,
+        ),
+    )
+    (
+        comm_upper_s,
+        upper_xla_factor,
+        ar_extra_upper_s,
+        a2a_extra_upper_s,
+        upper_fill_drain_s,
+    ) = upper_coll_terms
+    (
+        sync_stage_ach_s,
+        comm_ach_s,
+        ach_xla_factor,
+        ar_extra_ach_s,
+        a2a_extra_ach_s,
+        measured_in_comm_s,
+        measured_in_sync_s,
+        achievable_fill_drain_s,
+    ) = ach_coll_terms
     (
         t_matmul,
         t_matmul_upper,
@@ -1492,7 +1686,7 @@ def _evaluate_single_scope(
             (vec_ops_dense, vec_rate),
             (
                 n_splits,
-                xla_ar_factor,
+                floor_xla_factor,
                 eval_ctx.lat_coll,
                 False,
                 False,
@@ -1518,13 +1712,6 @@ def _evaluate_single_scope(
     routed_ach_ratio = _routed_achievable_ratio(
         eval_ctx, profile, declaration, workload, expert_mode
     )
-    achievable_fill_drain_s = _achievable_fill_drain_s(
-        scope,
-        eval_ctx,
-        profile,
-        in_call_workload,
-        (n_ops, n_splits, sync_stage_s),
-    )
     indexer_achievable_extra_hops = _indexer_achievable_extra_hops(
         scope, eval_ctx, n_splits, has_declared_dcp=has_declared_dcp
     )
@@ -1542,8 +1729,8 @@ def _evaluate_single_scope(
             hbm_time_s,
             routed_hbm_s,
             t_moe,
-            comm_s,
-            sync_stage_s,
+            comm_ach_s,
+            sync_stage_ach_s,
             achievable_fill_drain_s,
             repass_spill_us,
             t_matmul_upper,
@@ -1553,25 +1740,23 @@ def _evaluate_single_scope(
             (measured_in_comm_s, measured_in_sync_s),
             (
                 n_splits,
-                xla_ar_factor,
+                ach_xla_factor,
+                upper_xla_factor,
                 indexer_achievable_extra_hops,
                 bf16_attention_upper,
                 has_declared_dcp,
             ),
         ),
     )
-    ar_extra_s, a2a_extra_s = _upper_collective_extras(
-        eval_ctx,
-        n_splits,
-        xla_ar_factor,
-        (has_measured_ar, eff_num_ar, step_hops, has_declared_routed),
-    )
     roof_upper_us = (
         _core_time(
-            hbm_time_s, chain_upper_s, comm_s + ar_extra_s, fused=overlapped_comm
+            hbm_time_s,
+            chain_upper_s,
+            comm_upper_s + ar_extra_upper_s,
+            fused=overlapped_comm,
         )
-        + a2a_extra_s
-        + pipeline_fill_drain_s
+        + a2a_extra_upper_s
+        + upper_fill_drain_s
     ) * 1e6
     step_upper_us = max(
         step_us,
@@ -1588,9 +1773,9 @@ def _evaluate_single_scope(
             moe_pad_factor * routed_ach_ratio,
             eta_moe,
             t_hbm_ach,
-            comm_s,
-            ar_extra_s,
-            a2a_extra_s,
+            comm_ach_s,
+            ar_extra_ach_s,
+            a2a_extra_ach_s,
             sync_comm_extra_s,
             achievable_fill_drain_s,
             repass_spill_us,
@@ -1601,14 +1786,13 @@ def _evaluate_single_scope(
         (
             (vec_ops_dense, vec_ops_moe * routed_ach_ratio, vec_rate),
             measured_in_comm_s,
-            (n_splits, xla_ar_factor, indexer_achievable_extra_hops, has_declared_dcp),
+            (n_splits, ach_xla_factor, indexer_achievable_extra_hops, has_declared_dcp),
         ),
     )
     ar_strict_saving_s = (
-        0.0
-        if has_measured_ar
-        else eff_num_ar * (eval_ctx.ar_transfer_time_s - eval_ctx.ar_transfer_strict_s)
-    ) + step_strict_saving_s
+        eff_num_ar * (eval_ctx.ar_transfer_time_s - eval_ctx.ar_transfer_strict_s)
+        + step_strict_saving_s
+    )
     w_step_strict, step_floor_strict_us = _compute_strict_step_floor(
         eval_ctx,
         profile,
@@ -1619,7 +1803,7 @@ def _evaluate_single_scope(
             overlapped_comm,
             n_splits,
             n_ops,
-            xla_ar_factor,
+            floor_xla_factor,
             has_declared_dcp,
         ),
         (
@@ -1733,7 +1917,7 @@ def _evaluate_whole_step_microbatched(
     scope_context: _ScopeContext,
     profile: ModelProfile,
     workload: WorkloadSpec,
-    scope_eval_cfg: tuple[float, bool],
+    scope_eval_cfg: tuple[float, bool, tuple[bool, bool]],
 ) -> tuple[ScopeEstimate, float, float]:
     """Price whole_step above its single-call row limit as separate full calls.
 
@@ -1826,6 +2010,7 @@ def _evaluate_scopes(
     workload: WorkloadSpec,
     *,
     bf16_attention_upper: bool = True,
+    upper_priors: tuple[bool, bool] = (True, True),
 ) -> tuple[list[ScopeEstimate], dict[FusionScope, float]]:
     """Evaluate every FusionScope against VMEM, HBM, and matmul bounds."""
     scopes_order: tuple[FusionScope, ...] = (
@@ -1838,7 +2023,7 @@ def _evaluate_scopes(
     raw_step_map: dict[FusionScope, float] = {}
     sub_pure_us = 0.0
     for scope in scopes_order:
-        cfg = (sub_pure_us, bf16_attention_upper)
+        cfg = (sub_pure_us, bf16_attention_upper, upper_priors)
         est, step_us, sub_pure_us = (
             _evaluate_whole_step_microbatched(scope_context, profile, workload, cfg)
             if scope == "whole_step"
@@ -2924,12 +3109,15 @@ def _resolve_collective_call_prior(
         else 0.0
     )
     lo_s = (
-        scope_context.ar_transfer_time_s
-        + call_factor * scope_context.ar_base_lat_s
-        + hbm_staging_s
+        scope_context.ar_transfer_time_s + scope_context.ar_base_lat_s + hbm_staging_s
     )
     extra_hop_s = max(0.0, scope_context.lat_coll_upper - scope_context.lat_coll)
-    hi_s = lo_s + call_factor * scope_context.ar_intra_hops * extra_hop_s
+    hi_s = (
+        scope_context.ar_transfer_time_s
+        + call_factor
+        * (scope_context.ar_base_lat_s + scope_context.ar_intra_hops * extra_hop_s)
+        + hbm_staging_s
+    )
     lo_us = round(lo_s * 1e6, QUANTILE_DECIMALS)
     hi_us = round(hi_s * 1e6, QUANTILE_DECIMALS)
     return ResolvedCollectiveCall(

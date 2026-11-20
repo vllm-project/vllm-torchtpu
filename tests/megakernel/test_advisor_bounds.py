@@ -56,7 +56,8 @@ from vllm_torchtpu.megakernel.advisor.verdict import (
 from vllm_torchtpu.megakernel.advisor.vmem import _mesh_divisibility_reasons
 from vllm_torchtpu.megakernel.core import runtime as core_runtime
 from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
-from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec, Tiles
+from vllm_torchtpu.megakernel.core.exec_spec import MAX_BATCH_ROWS, ExecSpec, Tiles
+from vllm_torchtpu.megakernel.core.profile import _NUMERICS_GRID_R
 
 QWEN35_08B_CFG = {
     "model_type": "qwen3_5",
@@ -873,7 +874,7 @@ def test_unchunked_pp_prefill_preserves_window() -> None:
         float(rep_half_window.metrics["compiler_proof_gain_pct"]["value"])
         == expected_gain_pct
     )
-    assert expected_gain_pct > 0.0
+    assert single_half.step_upper_us < per_op_half.step_upper_us
 
     rep_microbatched = advisor.advise(
         model_profile,
@@ -894,13 +895,10 @@ def test_unchunked_pp_prefill_preserves_window() -> None:
 
 def test_core_limits_literals_match_megakernel_core() -> None:
     """Verify CORE_LIMITS matches megakernel/core/exec_spec.py and profile.py."""
-    mk_dir = Path(advisor.__file__).resolve().parent.parent
-    exec_text = (mk_dir / "core" / "exec_spec.py").read_text("utf-8")
-    prof_text = (mk_dir / "core" / "profile.py").read_text("utf-8")
     tiles_default = Tiles()
     lim = advisor.CORE_LIMITS
-    assert f"MAX_BATCH_ROWS = {lim.max_batch_rows}" in exec_text
-    assert "_NUMERICS_GRID_R = (1, 2, 4, 8, 16)" in prof_text
+    assert lim.max_batch_rows == MAX_BATCH_ROWS
+    assert lim.verified_ranks == _NUMERICS_GRID_R
 
     assert lim.max_batch_rows == constants.CORE_LIMITS.max_batch_rows
     assert lim.verified_ranks == constants.CORE_LIMITS.verified_ranks
@@ -1726,18 +1724,14 @@ def test_vector_unit_fp4_dequant_floor() -> None:
         scope_context,
         model_profile,
         workload,
-        1.0,
-        10.0 * 1e9,
-        bf16_attention_upper=False,
+        (1.0, 10.0 * 1e9, False),
     )
     # B2: verify per_op / single_layer scaling of streamed weight params with n_splits
     res_2x = _compute_scope_matmuls(
         scope_context,
         model_profile,
         workload,
-        1.0,
-        20.0 * 1e9,
-        bf16_attention_upper=False,
+        (1.0, 20.0 * 1e9, False),
     )
     # Doubling weight bytes from 10 GB to 20 GB doubles streamed weight time
     expected_ratio = (20.0 * 1e9) / (10.0 * 1e9)
@@ -1749,9 +1743,7 @@ def test_vector_unit_fp4_dequant_floor() -> None:
         scope_context,
         model_profile,
         workload,
-        1.0,
-        routed_bytes,
-        bf16_attention_upper=False,
+        (1.0, routed_bytes, False),
     )
     unpack_ops = 2 * routed_bytes / constants.DTYPE_BYTES["mxfp4"]
     expected_vector_us = (
@@ -1842,6 +1834,7 @@ def test_fastest_tiled_scope_arithmetic_intensity_streams_weights_once() -> None
         tp=8,
         ep=8,
         vmem_budget_mib=20,
+        dispatch_regime="unfused_eager",
     )
     c7x = advisor.resolve_chip_spec("tpu7x")
     report = advisor.advise(model_profile, workload, c7x)
@@ -1908,11 +1901,15 @@ def test_evaluate_corners_matches_step_upper_us(
         box.launch_gap_us[0],
         round(box.collective_s[0] * 1e6, 3),
         box.attn_dots[0],
+        "low",
+        "low",
     )
     high_corner = (
         box.launch_gap_us[1],
         round(box.collective_s[1] * 1e6, 3),
         box.attn_dots[-1],
+        "high",
+        "high",
     )
     scope = next(s for s in report.scopes if s.scope == "whole_step")
     corner_tol_us = 0.05
@@ -2300,7 +2297,7 @@ def test_strict_vector_floor_uses_packed_element_rate() -> None:
     scope_context = _build_scope_context(profile, workload, chip_spec)
     routed_bytes = whole_step.w_step_strict_gb * 1e9 - scope_context.w_static
     vector_counts = _compute_scope_matmuls(
-        scope_context, profile, workload, 1.0, routed_bytes, bf16_attention_upper=False
+        scope_context, profile, workload, (1.0, routed_bytes, False)
     )
     vector_elements = vector_counts[2] + vector_counts[3]
     packed_element_rate = (
@@ -2750,11 +2747,20 @@ def test_achievable_adds_collectives_while_floor_and_corners_stay_overlapped() -
         * chip_spec.collective_latency_s
         * 1e6
     )
+    ach_boundary_fill_us = (
+        (whole_step.ops_per_step - 1)
+        * (
+            constants.DENSE_SLOT_DEFAULT_BYTES / chip_spec.hbm_bw_bytes_per_s
+            + constants.BOUNDARY_SYNC_HOP_FACTOR * chip_spec.collective_latency_s
+        )
+        * 1e6
+    )
     expected_ach_us = (
         max(whole_step.hbm_us, whole_step.chain_us)
         + whole_step.comm_us
         + extra_indexer_radix_us
         + whole_step.fill_drain_us
+        + ach_boundary_fill_us
         + whole_step.repass_spill_us
         + whole_step.launch_us
     )
@@ -2961,17 +2967,27 @@ def test_per_op_achievable_prices_operator_kernel_boundaries() -> None:
         + constants.PER_OP_BASE_FFN_KERNELS_PER_LAYER
         + constants.PER_OP_SHARED_EXPERT_KERNELS_PER_LAYER
     ) * qwen_profile.num_layers
-    extra_boundaries = expected_operator_calls - expected_sublayer_ops
     per_boundary_us = (
         constants.DENSE_SLOT_DEFAULT_BYTES / chip_spec.hbm_bw_bytes_per_s
         + constants.BOUNDARY_SYNC_HOP_FACTOR * chip_spec.collective_latency_s
     ) * 1e6
+    expected_xla_ar_delta_us = (
+        qwen_profile.ar_slots_per_layer
+        * qwen_profile.num_layers
+        * (constants.PER_OP_COLLECTIVE_CALL_FACTOR - 1)
+        * round(math.log2(workload.tp))
+        * chip_spec.collective_latency_s
+        * 1e6
+    )
+    expected_delta_us = (
+        expected_operator_calls - 1
+    ) * per_boundary_us + expected_xla_ar_delta_us
     # Difference of two 0.01 us-rounded step latencies -> <= 2 * 0.005 = 0.01 us.
     rounding_tol_us = 2 * 0.005
     assert per_op_scope.ops_per_step == expected_sublayer_ops
     assert (
         per_op_scope.step_achievable_us - per_op_scope.step_bound_us
-        == pytest.approx(extra_boundaries * per_boundary_us, abs=rounding_tol_us)
+        == pytest.approx(expected_delta_us, abs=rounding_tol_us)
     )
 
 
@@ -3336,10 +3352,12 @@ def test_glm_moe_dsa_sparse_attention_indexer_and_dcp_bounds() -> None:
     chip_spec = advisor.resolve_chip_spec("tpu7x")
     # Closed-form first-principles predictions for GLM-5.2 TP16 x DCP8 verify
     # (spec_tokens=3, context=131076) on TPU v7x: (floor_ms, achievable_ms).
+    # Pure hardware floors exclude the 5.13 us cold-slot fill/drain term removed
+    # from step_bound_us (2.888, 7.123, 11.210 ms).
     expected_ms_by_batch = {
         1: (2.89, 4.74),
-        4: (7.13, 9.70),
-        8: (11.22, 14.71),
+        4: (7.12, 9.70),
+        8: (11.21, 14.71),
     }
     # 0.005 ms half-ULP of 2-decimal prediction + 0.005 ms half-ULP of built output.
     ledger_tol_ms = 2 * 0.005
@@ -3454,11 +3472,15 @@ def test_glm_moe_dsa_evaluate_corners_matches_step_upper_us() -> None:
         box.launch_gap_us[0],
         round(box.collective_s[0] * 1e6, 3),
         box.attn_dots[0],
+        "low",
+        "low",
     )
     high_corner = (
         box.launch_gap_us[1],
         round(box.collective_s[1] * 1e6, 3),
         box.attn_dots[-1],
+        "high",
+        "high",
     )
     # 0.01 us 2-decimal display quantum + 0.005 us float-rounding slack.
     display_round_tol_us = 0.015
@@ -3733,3 +3755,104 @@ def test_core_sync_checks_bucket_cap_and_module_families(
     ]
     assert len(bucket_cap_mismatches) == 1
     assert len(bucket_top_mismatches) == 1
+
+
+def test_floors_use_low_band_factors_and_exclude_first_slot_hbm() -> None:
+    """Verify floors use low factor band ends without first-slot HBM double-count."""
+    qwen_profile = advisor.resolve_model_profile("qwen3.5-397b")
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    workload = advisor.WorkloadSpec(
+        phase="decode",
+        batch=4,
+        context=4096,
+        osl=1,
+        tp=8,
+        ep=1,
+        dispatch_regime="zero_floor",
+    )
+    report = advisor.advise(qwen_profile, workload, chip_spec)
+    per_op = next(s for s in report.scopes if s.scope == "per_op")
+    assert per_op.fill_drain_us == 0.0
+    assert per_op.step_floor_strict_us <= per_op.step_bound_us < per_op.step_upper_us
+
+    scope_context = _build_scope_context(qwen_profile, workload, chip_spec)
+    expected_floor_comm_us = (
+        scope_context.num_ar
+        * (scope_context.ar_transfer_time_s + scope_context.ar_base_lat_s)
+        + 2.0
+        * scope_context.num_ar
+        * scope_context.token_residual_bytes
+        / scope_context.bw_hbm
+    ) * 1e6
+    # 0.005 us half-ULP display rounding on comm_us + 0.005 us float sum slack.
+    comm_tol_us = 2 * 0.005
+    assert per_op.comm_us == pytest.approx(expected_floor_comm_us, abs=comm_tol_us)
+    # Regression check for _resolve_collective_call_prior: uncalibrated XLA band
+    # starts at 1x ar_base_lat_s and tops out at PER_OP_COLLECTIVE_CALL_FACTOR.
+    xla_call_band = report.metrics["collective_call_us_xla"]["band"]
+    assert isinstance(xla_call_band, list)
+    hbm_staging_s = 2.0 * scope_context.token_residual_bytes / scope_context.bw_hbm
+    expected_xla_lo_us = (
+        scope_context.ar_transfer_time_s + scope_context.ar_base_lat_s + hbm_staging_s
+    ) * 1e6
+    extra_hop_s = max(0.0, scope_context.lat_coll_upper - scope_context.lat_coll)
+    expected_xla_hi_us = (
+        scope_context.ar_transfer_time_s
+        + constants.PER_OP_COLLECTIVE_CALL_FACTOR
+        * (scope_context.ar_base_lat_s + scope_context.ar_intra_hops * extra_hop_s)
+        + hbm_staging_s
+    ) * 1e6
+    # 5e-5 us half-ULP at QUANTILE_DECIMALS=4 + 5e-5 us float slack.
+    call_band_tol_us = 1e-4
+    assert float(xla_call_band[0]) == pytest.approx(
+        expected_xla_lo_us, abs=call_band_tol_us
+    )
+    assert float(xla_call_band[1]) == pytest.approx(
+        expected_xla_hi_us, abs=call_band_tol_us
+    )
+
+
+def test_core_sync_checks_max_ar_slots_per_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify verify_core_limits_sync catches max_ar_slots_per_layer drift."""
+    assert spec_bridge.verify_core_limits_sync() == []
+    drifted_values = (
+        advisor.CORE_LIMITS.max_ar_slots_per_layer - 1,
+        advisor.CORE_LIMITS.max_ar_slots_per_layer + 1,
+    )
+    for drifted_slots in drifted_values:
+        monkeypatch.setattr(
+            spec_bridge,
+            "CORE_LIMITS",
+            dataclasses.replace(
+                advisor.CORE_LIMITS,
+                max_ar_slots_per_layer=drifted_slots,
+            ),
+        )
+        messages = spec_bridge.verify_core_limits_sync()
+        slot_mismatches = [
+            msg for msg in messages if msg.startswith("max_ar_slots_per_layer:")
+        ]
+        assert len(slot_mismatches) >= 1
+
+
+def test_declared_layout_collectives_shared_symmetrically_across_scopes() -> None:
+    """Verify undeclared scopes share the layout's declared collective schedule."""
+    kimi_batch = 16
+    kimi_mesh = 32
+    workload = advisor.WorkloadSpec(
+        phase="decode",
+        batch=kimi_batch,
+        tp=kimi_mesh,
+        ep=kimi_mesh,
+        dcp=kimi_mesh,
+    )
+    report = advisor.advise("kimi-k3", workload, "tpu7x")
+    by_scope = {scope.scope: scope for scope in report.scopes}
+    whole_step = by_scope["whole_step"]
+    single_layer = by_scope["single_layer"]
+    per_op = by_scope["per_op"]
+    assert single_layer.comm_us == whole_step.comm_us
+    assert per_op.comm_us >= whole_step.comm_us
+    assert whole_step.step_bound_us < per_op.step_bound_us
