@@ -51,6 +51,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutKind,
     SequenceLayoutPlan,
 )
+from vllm_torchtpu.spec_decode import draft_path_rules
 
 if TYPE_CHECKING:
     import torch
@@ -67,8 +68,6 @@ def rule_holds(scheduler_config: SchedulerConfig, vllm_config: VllmConfig) -> bo
     configuration a model-provided draft-path rule covers
     (spec_decode/draft_path_rules.py). The runner decides it once, in
     __init__ (TPUModelRunner._decode_carry_enabled)."""
-    from vllm_torchtpu.spec_decode import draft_path_rules
-
     return bool(
         scheduler_config.async_scheduling
         and scheduler_config.max_num_seqs == 1
@@ -144,11 +143,10 @@ def clear(runner: TPUModelRunner) -> None:
     runner._decode_carry_state = None
 
 
-# The mrope position buffer is read through a cached numpy view of the whole
-# CPU tensor instead of a torch slice per call. Same values, same dtype.
-
-
 def _host_positions(runner: TPUModelRunner, total: int) -> np.ndarray:
+    """The host positions of the step's first `total` tokens as int64. The
+    mrope position buffer is read through a cached numpy view of the whole CPU
+    tensor instead of a torch slice per call: same values, same dtype."""
     if runner.uses_mrope:
         cpu = runner.mrope_positions.cpu
         cached = runner._mrope_np_view
