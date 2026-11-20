@@ -25,6 +25,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.candidates import (
     PreparedCandidates,
+    candidate_group_capacity,
     candidate_key_rows,
     candidate_region_rows,
     prepare_candidates,
@@ -205,7 +206,9 @@ def initialize_fp8_indexer() -> None:
 
     def fake_prepare(banks, page_table, candidates, requests, layout, block, width):
         tokens, count = candidates.shape
-        groups = tokens
+        groups = candidate_group_capacity(
+            tokens, page_table.shape[0], minimum=torch.sym_min
+        )
         count *= 2
         key_pages = (count * block + PAGE_RECORDS - 1) // PAGE_RECORDS
         fragment = min(block, PackedFP8Layout(*layout).page_size)
