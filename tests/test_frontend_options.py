@@ -18,9 +18,17 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from vllm.config import VllmConfig
 
-from vllm_torchtpu import frontend_fix, frontend_options, frontend_tokcache
+from vllm_torchtpu import (
+    frontend_fix,
+    frontend_options,
+    frontend_tokcache,
+    patch_registry,
+)
 from vllm_torchtpu.frontend_options import FrontendOptions
+from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
 _INSTALLERS = {
     "tokenize_prefix_cache": (frontend_tokcache, "maybe_install_tokenize_prefix_cache"),
@@ -140,8 +148,6 @@ def test_failed_install_does_not_stop_startup(monkeypatch):
 
 
 def test_each_callback_is_registered_for_platform_activation_with_the_config():
-    from vllm_torchtpu import patch_registry
-
     entries = {
         p.target: p
         for p in patch_registry.PATCHES
@@ -156,14 +162,10 @@ def test_each_callback_is_registered_for_platform_activation_with_the_config():
 
 
 def test_section_is_kept_out_of_the_compile_cache_key():
-    from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
-
     assert frontend_options.SECTION in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
 
 def _platform_patches():
-    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
-
     return (
         patch("vllm_torchtpu.patch_registry.apply"),
         patch.object(TpuPlatform, "_prepare_singlehost_tpu_env"),
@@ -173,8 +175,6 @@ def _platform_patches():
 
 
 def test_platform_hook_applies_the_registry_with_the_engine_config():
-    from vllm.config import VllmConfig
-
     p1, p2, p3 = _platform_patches()
     with p1 as apply, p2, p3:
         config = VllmConfig(
@@ -192,8 +192,6 @@ def test_platform_hook_applies_the_registry_with_the_engine_config():
 )
 def test_platform_hook_rejects_a_bad_host_only_section(installed, additional):
     """Before any patch installs and before a worker starts."""
-    from vllm.config import VllmConfig
-
     p1, p2, p3 = _platform_patches()
     with p1 as apply, p2, p3, pytest.raises(ValueError, match="additional_config"):
         VllmConfig(additional_config=additional)
