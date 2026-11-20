@@ -243,8 +243,8 @@ def calculate_block_sizes(
     ``decode_batch_size`` is the most sequences one decode step works on
     concurrently; 8 is the experimentally chosen default.
 
-    ``tuned_tiles`` applies the tile rules tuned with this kernel (a model
-    rule in the attention backend turns them on):
+    ``tuned_tiles``, which callers opt in to, applies the tile rules tuned
+    with this kernel:
     - decode VMEM counts the compute tiles once rather than per lane, plus the
       K/V tiles and sub-chunk scores Mosaic spills when q is split, against a
       cap of 85% of VMEM with an fp8 KV cache and 75% otherwise;
@@ -467,11 +467,12 @@ def calculate_block_sizes(
     ) -> configs.BlockSizes:
         """Loop through different block sizes to find the most optimal one."""
 
-        # Even if we loose some potential performance, we want to avoid OOM at all
-        # costs. Therefore, we conservatively only use 80% of the VMEM budget.
-        # With the tuned tiles, decode compute tiles are not replicated across
-        # batch_size, allowing a 0.85 VMEM cap so bkv_sz reaches 4096 (32 pages).
-        # Without them, decode VMEM is counted and capped like prefill.
+        # Even if we lose some potential performance, we want to avoid OOM at all
+        # costs, so only part of the VMEM budget is used: 80% by default. With
+        # the tuned tiles, decode compute tiles are not replicated across
+        # batch_size, which allows a decode cap of 85% with an fp8 KV cache (so
+        # bkv_sz reaches 4096, 32 pages) and 75% otherwise. Without them, decode
+        # VMEM is counted and capped like prefill.
         tuned_decode = tuned_tiles and fixed_bq_sz is not None
         decode_vmem_frac = 0.85 if is_fp8_kv else 0.75
         capped_vmem_limit_bytes = vmem_limit_bytes * (
@@ -538,7 +539,7 @@ def calculate_block_sizes(
 
         if tuned_tiles and fixed_bq_sz is None:
             # Clamp prefill/mixed bq_sz to the aligned total_q_tokens bucket so
-            # small decode buckets do not allocate 1024-token Q/O VMEM buffers.
+            # small token buckets do not allocate 1024-token Q/O VMEM buffers.
             max_useful_bq_sz = max(
                 mxu_column_size,
                 utils.align_to(serve_cfgs.total_q_tokens, mxu_column_size),
