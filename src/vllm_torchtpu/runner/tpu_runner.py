@@ -46,7 +46,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     set_current_vllm_config,
 )
-from vllm.distributed import get_pcp_group
+from vllm.distributed import get_pcp_group, get_tensor_model_parallel_rank
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -9153,8 +9153,6 @@ class TPUModelRunner(GPUModelRunner):
                 valid_tokens = num_tokens_padded
         tp_size = self.parallel_config.tensor_parallel_size
         if rows_sliced and tp_size > 1:
-            from vllm.distributed import get_tensor_model_parallel_rank
-
             chunk = num_tokens_padded // tp_size
             tp_rank = get_tensor_model_parallel_rank()
             rank_valid = max(0, min(chunk, valid_tokens - tp_rank * chunk))

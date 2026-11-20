@@ -13,6 +13,7 @@
 # limitations under the License.
 """Row gating of sequence-parallel MoE: which steps slice their rows."""
 
+import importlib
 from types import SimpleNamespace
 
 import pytest
@@ -112,8 +113,6 @@ def test_set_active_decides_sliced_versus_replicated(monkeypatch, active):
 def test_before_any_step_is_recorded_the_rows_are_sliced():
     """A forward traced before the runner records a step's form (or by a
     caller that records none) takes main's sliced path."""
-    import importlib
-
     fresh = importlib.reload(sp)
     assert fresh.is_active() is True
     assert fresh.rows_are_replicated(True) is False
