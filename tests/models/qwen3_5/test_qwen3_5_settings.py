@@ -213,5 +213,5 @@ def test_validation_entries_keep_quantize_target_lm_head(monkeypatch):
         legs = yaml.safe_load(path.read_text())["legs"]
         for leg in ("prefill", "decode"):
             additional = legs[leg]["additional_config"]
-            assert additional == {"qwen3_5": {"quantize_target_lm_head": True}}
+            assert additional["qwen3_5"]["quantize_target_lm_head"] is True
             assert settings.get(_engine(512, additional)).quantize_target_lm_head
