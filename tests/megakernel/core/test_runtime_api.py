@@ -265,11 +265,24 @@ def test_pack_step_meta_and_resolve_step_positions_jax():
     )
     np.testing.assert_array_equal(np.asarray(pos_t1), np.array([4, 9], dtype=np.int32))
 
+    # `seq_lens` is the length after this step (`num_computed_tokens + T`), so a
+    # sequence's `T` tokens sit at `seq_len - T .. seq_len - 1`.
     pos_t4 = resolve_step_positions(
         None, seq_lens, num_reqs=2, tokens_per_seq=4, like=seq_lens, ops=ops
     )
     np.testing.assert_array_equal(
-        np.asarray(pos_t4), np.array([2, 3, 4, 5, 7, 8, 9, 10], dtype=np.int32)
+        np.asarray(pos_t4), np.array([1, 2, 3, 4, 6, 7, 8, 9], dtype=np.int32)
+    )
+    pos_t2_short = resolve_step_positions(
+        None,
+        jnp.asarray([1, 3], dtype=jnp.int32),
+        num_reqs=2,
+        tokens_per_seq=2,
+        like=seq_lens,
+        ops=ops,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(pos_t2_short), np.array([0, 0, 1, 2], dtype=np.int32)
     )
 
     # Short positions triggers fallback to seq_lens; M-RoPE 2D positions are preserved

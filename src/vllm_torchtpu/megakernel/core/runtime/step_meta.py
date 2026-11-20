@@ -165,7 +165,12 @@ def resolve_step_positions(
     like: Any,
     ops: StepMetaOps | None = None,
 ) -> Any:
-    """Resolve flat per-token step positions from `positions` or `seq_lens`."""
+    """Resolve flat per-token step positions from `positions` or `seq_lens`.
+
+    `seq_lens` follows the runner's convention (`num_computed_tokens + T`, the
+    length after this step), so the `T` tokens of a sequence sit at positions
+    `seq_len - T .. seq_len - 1`.
+    """
     eff_ops = _JAX_STEP_META_OPS if ops is None else ops
     T = tokens_per_seq
     active_rows = num_reqs * T
@@ -183,13 +188,11 @@ def resolve_step_positions(
         if eff_ops.numel(pos_flat) >= active_rows:
             return pos_flat[:active_rows]
     seq_l = eff_ops.slice_or_pad_1d(fb_1d, num_reqs)
-    if T > 1:
-        offsets = eff_ops.reshape(eff_ops.arange_i32(1 - T, 1, like=like), (1, T))
-        return eff_ops.reshape(
-            eff_ops.clip(eff_ops.reshape(seq_l, (-1, 1)) + offsets, 0),
-            (-1,),
-        )
-    return eff_ops.clip(seq_l - 1, 0)
+    offsets = eff_ops.reshape(eff_ops.arange_i32(-T, 0, like=like), (1, T))
+    return eff_ops.reshape(
+        eff_ops.clip(eff_ops.reshape(seq_l, (-1, 1)) + offsets, 0),
+        (-1,),
+    )
 
 
 def check_ckpt_write_cols_distinct(ckpt_2d: Any, tokens_per_seq: int) -> None:

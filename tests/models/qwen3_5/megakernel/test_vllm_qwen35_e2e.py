@@ -763,7 +763,8 @@ def test_prepare_step_metadata_decode_and_verify() -> None:
         max_pages_per_seq=2,
         tokens_per_seq=4,
     )
-    assert pos_none_t4.tolist() == [7, 8, 9, 10, 22, 23, 24, 25]
+    # `seq_lens` is the length after the step: positions `seq_len - 4 .. seq_len - 1`.
+    assert pos_none_t4.tolist() == [6, 7, 8, 9, 21, 22, 23, 24]
 
     pos_short_t4, _, _, _ = prepare_step_metadata(
         attn_md=attn_md,
@@ -774,7 +775,7 @@ def test_prepare_step_metadata_decode_and_verify() -> None:
         max_pages_per_seq=2,
         tokens_per_seq=4,
     )
-    assert pos_short_t4.tolist() == [7, 8, 9, 10, 22, 23, 24, 25]
+    assert pos_short_t4.tolist() == [6, 7, 8, 9, 21, 22, 23, 24]
 
     mrope_row = torch.tensor([9, 10, 11, 12, 24, 25, 26, 27], dtype=torch.int32)
     pos_mrope_t4, _, _, _ = prepare_step_metadata(
