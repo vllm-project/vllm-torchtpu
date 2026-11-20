@@ -41,7 +41,7 @@ def _need_devices(dcp_size):
         pytest.skip(f"needs {dcp_size} devices, have {len(jax.devices())}")
 
 
-def _run(scores, lengths, k, lanes=False):
+def _run(scores, lengths, k, lanes=False, **kwargs):
     """scores f32[dcp, b, n], lengths i32[dcp, b] -> i32[dcp, b, k].
 
     `lanes` puts a leading size-1 axis on the mesh, as the served DCP mesh
@@ -56,7 +56,7 @@ def _run(scores, lengths, k, lanes=False):
 
     def local(s, ln, bounds):
         return sparsecore_topk_dcp(
-            s[0], k, ln[0], bounds, dcp_size=dcp_size, axis_name=AXIS
+            s[0], k, ln[0], bounds, dcp_size=dcp_size, axis_name=AXIS, **kwargs
         )[None]
 
     fn = jax.jit(
@@ -156,6 +156,34 @@ def test_parts_longer_than_tile_memory_are_streamed():
     n = 2 * ROW_WORDS + 4096
     scores, lengths = _case(dcp_size, 4, n, ROW_WORDS + 1, n, 3)
     _check(_run(scores, lengths, 2048), scores, lengths, 2048)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 8])
+@pytest.mark.parametrize(
+    "variant",
+    [{}, {"one_round": True}, {"pack16": True}],
+    ids=["default", "one_round", "pack16"],
+)
+@pytest.mark.parametrize(
+    "b,levels",
+    [
+        (16, 0),  # one row per subcore: gated one-round exchange
+        (64, 0),  # two rows per subcore
+        (256, 0),  # owner exchange; streamed survivors compacted
+        (256, 1),  # constant rows overflow compaction and stream
+    ],
+)
+def test_matches_the_two_round_streaming_kernel(dcp_size, variant, b, levels):
+    """Every switch must give the old path's output exactly, order included."""
+    _need_devices(dcp_size)
+    k = 2048
+    n = 40960
+    scores, lengths = _case(dcp_size, b, n, 24576, n, 11, levels)
+    new = _run(scores, lengths, k, **variant)
+    old = _run(scores, lengths, k, one_round=False, no_restream=False)
+    np.testing.assert_array_equal(new, old)
+    _check(new, scores, lengths, k)
 
 
 @pytest.mark.multichip
