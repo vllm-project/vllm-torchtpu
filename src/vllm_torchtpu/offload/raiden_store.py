@@ -158,6 +158,10 @@ X2_COUNTERS = (
     "remote_read_blocks",
     "remote_read_blocks_done",
     "remote_read_blocks_failed",
+    "store_probe_lookups",
+    "store_probe_us",
+    "store_remote_skips",
+    "store_held_skips",
 )
 
 # TIER-X2: most keys remembered as registry misses at once; past it the expired
@@ -1118,13 +1122,18 @@ class RaidenOffloadingManager(OffloadingManager):
     def _keys_needing_store(self, keys) -> list[OffloadKey]:
         """Keys not in flight and not wholly resident (host or a peer). The
         probe pins then releases, so a resident key moves to the LRU's MRU
-        end, which is the victim policy's order for a key evicted again."""
+        end, which is the victim policy's order for a key evicted again.
+
+        TIER-X2: a key the host pool misses is also checked against the
+        registry (``_x2_cluster_resident``): one this shard's store node holds
+        is resident, not saved again."""
         keys_to_store: list[OffloadKey] = []
         resident_statuses = (
             self._block_status.HOST,
             self._block_status.HOST_AND_HBM,
             self._block_status.REMOTE,
         )
+        x2 = self.__dict__.get("_x2", False)
         for key in keys:
             if key in self._inflight_store_keys:
                 continue
@@ -1134,8 +1143,31 @@ class RaidenOffloadingManager(OffloadingManager):
                 block.status in resident_statuses for _, block in matches
             ):
                 continue
+            if x2 and self._x2_cluster_resident(sub_hashes, resident_statuses):
+                continue
             keys_to_store.append(key)
         return keys_to_store
+
+    def _x2_cluster_resident(self, sub_hashes: list[bytes], resident_statuses) -> bool:
+        """TIER-X2: whether every sub-hash is held here or on this shard's store
+        node, by the registry. Such a key must not be saved again. Raiden's
+        evict sweep keeps a node's copy when the node already holds the hash
+        (WriteRemote answers WRITE_ALL_EXIST and the sweep frees the local copy),
+        so a second save of recomputed bytes would be dropped at its next
+        demotion and a later peer read would land the node's older bytes, not
+        the bytes last saved (smoke j-a44349b7: 29 keys mismatched on main.r1,
+        keys.r1 and keys.r2). A local-only probe never sees a node's block."""
+        counts = self._x2_counts
+        t0 = time.perf_counter()
+        matches = self._probe(sub_hashes, enable_global=True)
+        counts["store_probe_lookups"] += 1
+        counts["store_probe_us"] += int((time.perf_counter() - t0) * 1e6)
+        if len(matches) == len(sub_hashes) and all(
+            block.status in resident_statuses for _, block in matches
+        ):
+            counts["store_remote_skips"] += 1
+            return True
+        return False
 
     def prepare_victim_store(self, keys) -> list[OffloadKey]:
         """Admission for blocks HBM is evicting (victim policy): the keys to
@@ -1253,8 +1285,25 @@ class RaidenOffloadingManager(OffloadingManager):
         and dispatches save() for exactly those; completion is tracked
         asynchronously by the finalizer. A directory state that lookup cannot
         account for fails the job closed (rollback + recompute).
+
+        TIER-X2: a shard saves only the keys it chose in ``prepare_store`` /
+        ``prepare_victim_store`` (the keys it put in flight). A sharded class
+        sends a key to every shard once any shard needs it; a shard that holds
+        the key here or on its store node must not save it again
+        (``_x2_cluster_resident``).
         """
         assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
+        if self.__dict__.get("_x2", False):
+            chosen = [i for i, key in enumerate(keys) if key in self._inflight_store_keys]
+            if len(chosen) < len(keys):
+                self._x2_counts["store_held_skips"] += len(keys) - len(chosen)
+                keys = [keys[i] for i in chosen]
+                device_block_ids = [device_block_ids[i] for i in chosen]
+            if not keys:
+                self._finished.append(
+                    FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=True)
+                )
+                return
         with self._eviction_lock:
             for key in keys:
                 self._evicted_sub_hashes.pop(key, None)
