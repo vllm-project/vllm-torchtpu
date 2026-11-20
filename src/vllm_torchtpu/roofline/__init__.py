@@ -37,11 +37,14 @@ from .collectives import (
 )
 from .constants import (
     ACTIVATION_HULL_SCHEMA,
+    BENIGN_HF_METADATA_KEYS,
     DEFAULT_GPU_MEMORY_UTILIZATION,
     DEFAULT_TOP_K,
     EXAMPLE_CONCURRENCIES,
     EXAMPLE_SLO_TIERS,
+    INSPECT_SCHEMA,
     MAX_EMBEDDED_CANDIDATES,
+    NON_GATED_MLP_MODEL_TYPES,
     SOLVE_SCHEMA,
     SUPPORTED_MODEL_TYPES,
 )
@@ -69,6 +72,7 @@ from .emit import (
     top_layouts,
 )
 from .geometry import (
+    KeyTracker,
     LayerCounts,
     ModelGeometry,
     UnsupportedArchitectureError,
@@ -77,13 +81,20 @@ from .geometry import (
     layer_ffn_kinds,
     supports,
 )
-from .hf_loader import dtypes_from_hf_config, load_hf_config
+from .hf_loader import (
+    ConfigAudit,
+    audit_hf_config,
+    dtypes_from_hf_config,
+    load_hf_config,
+)
 from .memory import (
     HbmBreakdown,
     KvFitInput,
+    ParamBreakdown,
     SeqKvLayout,
     hbm_breakdown_per_core_bytes,
     hbm_footprint_per_core_bytes,
+    param_counts,
 )
 from .modules import (
     Dtypes,
@@ -141,6 +152,7 @@ from .step import (
 
 __all__ = [
     "ACTIVATION_HULL_SCHEMA",
+    "BENIGN_HF_METADATA_KEYS",
     "CHIPS",
     "CHIP_TOPOLOGIES",
     "DEFAULT_GPU_MEMORY_UTILIZATION",
@@ -148,7 +160,9 @@ __all__ = [
     "EXAMPLE_CONCURRENCIES",
     "EXAMPLE_SCENARIOS",
     "EXAMPLE_SLO_TIERS",
+    "INSPECT_SCHEMA",
     "MAX_EMBEDDED_CANDIDATES",
+    "NON_GATED_MLP_MODEL_TYPES",
     "SOLVE_SCHEMA",
     "SUPPORTED_CHIPS",
     "SUPPORTED_MODEL_TYPES",
@@ -160,6 +174,7 @@ __all__ = [
     "Collective",
     "CollectiveConfig",
     "ConcurrencyRow",
+    "ConfigAudit",
     "ConstantSpec",
     "Dtypes",
     "ExpertActivationModel",
@@ -167,6 +182,7 @@ __all__ = [
     "FloorOptions",
     "FloorTimes",
     "HbmBreakdown",
+    "KeyTracker",
     "KvFitInput",
     "LaunchOptions",
     "LaunchPayload",
@@ -174,6 +190,7 @@ __all__ = [
     "ModelGeometry",
     "ModuleCost",
     "Parallel",
+    "ParamBreakdown",
     "ParetoPoint",
     "PointLaunchPayload",
     "PoolMeshPlan",
@@ -196,6 +213,7 @@ __all__ = [
     "X_bound",
     "X_cap_pool",
     "active_experts_envelope",
+    "audit_hf_config",
     "bernoulli_expected_experts",
     "bound_tpot_ms",
     "bound_ttft_ms",
@@ -224,6 +242,7 @@ __all__ = [
     "load_hf_config",
     "max_ep_load_ratio",
     "min_experts_per_ep_shard",
+    "param_counts",
     "pareto_skyline_by_concurrency",
     "parse_activation_spec",
     "parse_layout",

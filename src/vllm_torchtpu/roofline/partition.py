@@ -21,7 +21,12 @@ from typing import TYPE_CHECKING
 
 from .constants import NON_FULL_ATTN_TOKENS
 from .geometry import layer_ffn_kinds
-from .memory import HbmBreakdown, SeqKvLayout, hbm_breakdown_per_core_bytes
+from .memory import (
+    HbmBreakdown,
+    SeqKvLayout,
+    _compute_w_head,
+    hbm_breakdown_per_core_bytes,
+)
 
 if TYPE_CHECKING:
     from .chips import ChipSpec
@@ -96,7 +101,8 @@ def _pp_layer_prefixes(
     else:
         w_mtp_total = 0.0
     w_lm = w_embed + w_mtp_total
-    w_head_both = 2.0 * w_embed
+    emb_single, lm_single = _compute_w_head(geom, dtypes, tp, pp=1)
+    w_head_single = emb_single + lm_single
 
     layer_w: list[float] = []
     layer_kv: list[float] = []
@@ -118,7 +124,7 @@ def _pp_layer_prefixes(
             mtp_layers=0,
         )
         bd_i = hbm_breakdown_per_core_bytes(g_i, dtypes, par1, layout, chip=chip)
-        layer_w.append(max(0.0, bd_i.weights - w_head_both))
+        layer_w.append(max(0.0, bd_i.weights - w_head_single))
         layer_kv.append(bd_i.kv)
         layer_st.append(bd_i.state)
         is_full.append(0 if geom.layer_types[idx] in NON_FULL_ATTN_TOKENS else 1)

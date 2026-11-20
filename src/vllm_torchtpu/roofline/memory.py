@@ -23,18 +23,34 @@ from typing import TYPE_CHECKING
 from .chips import CHIPS, ChipSpec
 from .constants import (
     BYTES_PER_PAGE_ENTRY,
-    GLU_MATMUL_COUNT,
     MAX_CTX_TOKENS_FOR_SMALL_PAGE,
     RPA_MAX_PAGE_TOKENS,
     RPA_MIN_PAGE_TOKENS,
     STEP_FLOOR_CACHE_MAXSIZE,
 )
 from .geometry import LayerCounts, count_layer_types
-from .modules import kv_bytes_per_token_per_layer
+from .modules import Dtypes, Parallel, kv_bytes_per_token_per_layer
 
 if TYPE_CHECKING:
     from .geometry import ModelGeometry
-    from .modules import Dtypes, Parallel
+
+
+@dataclass(frozen=True, slots=True)
+class ParamBreakdown:
+    """Unsharded model parameter count breakdown matching HBM weight terms."""
+
+    attention: float
+    linear_attention: float
+    dense_ffn: float
+    moe_routed_ffn: float
+    moe_shared_ffn: float
+    router: float
+    embedding: float
+    lm_head: float
+    mtp: float
+    hc: float
+    total_params: float
+    active_params_per_token: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,26 +217,27 @@ def compute_w_rec(
     return w_rec
 
 
-def compute_w_ffn(
+def _compute_ffn_component_bytes(
     geom: ModelGeometry,
     dt: Dtypes,
     parallel: Parallel,
-) -> tuple[float, float]:
-    """Compute per-core dense and routed MoE FFN weight bytes."""
+) -> tuple[float, float, float, float]:
+    """Compute per-core (dense_ffn, moe_routed_ffn, moe_shared_ffn, router) bytes."""
     tp = max(1, parallel.tp)
     pp = max(1, parallel.pp)
     is_ep = parallel.moe == "ep" and parallel.ep > 1
     ep_ranks = parallel.ep if is_ep else tp
-    w_ffn = 0.0
     w_dense_ffn = 0.0
+    w_routed_ffn = 0.0
+    w_shared_ffn = 0.0
+    w_router = 0.0
     n_moe_ffn, n_dense_ffn = geom.ffn_layer_counts()
     if n_dense_ffn > 0 and geom.dense_inter > 0:
         w_dense_ffn = (
-            float(n_dense_ffn * GLU_MATMUL_COUNT * geom.hidden * geom.dense_inter)
+            float(n_dense_ffn * geom.ffn_num_matrices * geom.hidden * geom.dense_inter)
             * dt.w_dense
             / (tp * pp)
         )
-        w_ffn += w_dense_ffn
     if n_moe_ffn > 0:
         routed_div = ep_ranks * pp if is_ep else tp * pp
         expert_width = (
@@ -231,11 +248,11 @@ def compute_w_ffn(
         expert_hidden = (
             geom.routed_expert_hidden if geom.routed_expert_hidden > 0 else geom.hidden
         )
-        w_ffn += (
+        w_routed_ffn = (
             float(
                 n_moe_ffn
                 * geom.num_experts
-                * GLU_MATMUL_COUNT
+                * geom.ffn_num_matrices
                 * expert_hidden
                 * expert_width
             )
@@ -243,7 +260,7 @@ def compute_w_ffn(
             / routed_div
         )
         if geom.routed_expert_hidden > 0:
-            w_ffn += (
+            w_routed_ffn += (
                 float(n_moe_ffn * 2 * geom.hidden * geom.routed_expert_hidden)
                 * dt.w_dense
                 / (tp * pp)
@@ -254,13 +271,25 @@ def compute_w_ffn(
                 if parallel.residual == "sp"
                 else max(1, geom.shared_inter // tp)
             )
-            w_ffn += (
-                float(n_moe_ffn * GLU_MATMUL_COUNT * geom.hidden * isr_eff)
+            w_shared_ffn = (
+                float(n_moe_ffn * geom.ffn_num_matrices * geom.hidden * isr_eff)
                 * dt.w_dense
                 / pp
             )
-        w_ffn += float(n_moe_ffn * geom.hidden * geom.num_experts) * dt.router / pp
-    return w_ffn, w_dense_ffn
+        w_router = float(n_moe_ffn * geom.hidden * geom.num_experts) * dt.router / pp
+    return w_dense_ffn, w_routed_ffn, w_shared_ffn, w_router
+
+
+def compute_w_ffn(
+    geom: ModelGeometry,
+    dt: Dtypes,
+    parallel: Parallel,
+) -> tuple[float, float]:
+    """Compute per-core dense and routed MoE FFN weight bytes."""
+    w_dense_ffn, w_routed_ffn, w_shared_ffn, w_router = _compute_ffn_component_bytes(
+        geom, dt, parallel
+    )
+    return w_dense_ffn + w_routed_ffn + w_shared_ffn + w_router, w_dense_ffn
 
 
 def _compute_w_mtp(
@@ -294,7 +323,9 @@ def _compute_w_mtp(
     n_moe_ffn, n_dense_ffn = geom.ffn_layer_counts()
     if geom.mtp_inter > 0:
         mtp_ffn = (
-            float(GLU_MATMUL_COUNT * geom.hidden * geom.mtp_inter) * dt.w_dense / tp
+            float(geom.ffn_num_matrices * geom.hidden * geom.mtp_inter)
+            * dt.w_dense
+            / tp
         )
     elif geom.num_experts > 0:
         if n_moe_ffn > 0:
@@ -389,6 +420,113 @@ def _compute_kv_and_state(
     return kv_bytes, st_bytes
 
 
+def _compute_w_head(
+    geom: ModelGeometry,
+    dt: Dtypes,
+    tp: int,
+    pp: int,
+) -> tuple[float, float]:
+    """Compute per-core (embedding, lm_head) weight bytes for tied or untied heads."""
+    emb = float(geom.vocab * geom.hidden) * dt.lm_head / (tp * pp)
+    lm_head = 0.0 if geom.tie_word_embeddings else emb
+    return emb, lm_head
+
+
+def _compute_w_hc(geom: ModelGeometry, dt: Dtypes, tp: int, pp: int) -> float:
+    """Compute per-core hyper-connection weight bytes."""
+    if geom.hc_mult <= 1:
+        return 0.0
+    return (
+        float(geom.num_layers * (geom.hc_mult**2) * geom.hidden)
+        * dt.w_dense
+        / float(tp * pp)
+    )
+
+
+_UNIT_DTYPES = Dtypes(
+    w_dense=1.0,
+    w_expert=1.0,
+    w_aux=1.0,
+    kv=1.0,
+    state=1.0,
+    conv=1.0,
+    router=1.0,
+    lm_head=1.0,
+)
+_UNIT_PARALLEL = Parallel(tp=1, pp=1, ep=1, moe="tp_slice")
+
+
+def param_counts(geom: ModelGeometry) -> ParamBreakdown:
+    """Return unsharded model parameter counts aligned 1:1 with HBM weight bytes.
+
+    Shares the exact per-component element calculations with
+    :func:`hbm_breakdown_per_core_bytes`, intentionally omitting normalization
+    weights, linear biases, PLE parameters, and KDA auxiliary parameters that
+    HBM weight sizing does not model.
+    """
+    counts = count_layer_types(geom)
+    attention = compute_w_attn(geom, _UNIT_DTYPES, _UNIT_PARALLEL, counts)
+    linear_attention = compute_w_rec(geom, _UNIT_DTYPES, _UNIT_PARALLEL, counts)
+    dense_ffn, moe_routed_ffn, moe_shared_ffn, router = _compute_ffn_component_bytes(
+        geom, _UNIT_DTYPES, _UNIT_PARALLEL
+    )
+    w_ffn = dense_ffn + moe_routed_ffn + moe_shared_ffn + router
+    mtp = _compute_w_mtp(
+        geom,
+        _UNIT_DTYPES,
+        _UNIT_PARALLEL,
+        (attention, counts.attn_total),
+        (w_ffn, dense_ffn),
+    )
+    embedding, lm_head = _compute_w_head(geom, _UNIT_DTYPES, tp=1, pp=1)
+    hc = _compute_w_hc(geom, _UNIT_DTYPES, tp=1, pp=1)
+    total_params = (
+        attention
+        + linear_attention
+        + dense_ffn
+        + moe_routed_ffn
+        + moe_shared_ffn
+        + router
+        + embedding
+        + lm_head
+        + mtp
+        + hc
+    )
+    inactive_routed = 0.0
+    if geom.num_experts > 0:
+        expert_hidden = (
+            geom.routed_expert_hidden if geom.routed_expert_hidden > 0 else geom.hidden
+        )
+        n_moe_ffn, _ = geom.ffn_layer_counts()
+        mtp_moe_layers = (
+            geom.mtp_layers
+            if (n_moe_ffn > 0 and geom.mtp_layers > 0 and geom.mtp_inter <= 0)
+            else 0
+        )
+        inactive_experts = max(0, geom.num_experts - geom.top_k)
+        inactive_routed = float(
+            (n_moe_ffn + mtp_moe_layers)
+            * inactive_experts
+            * geom.ffn_num_matrices
+            * expert_hidden
+            * geom.moe_inter
+        )
+    return ParamBreakdown(
+        attention=attention,
+        linear_attention=linear_attention,
+        dense_ffn=dense_ffn,
+        moe_routed_ffn=moe_routed_ffn,
+        moe_shared_ffn=moe_shared_ffn,
+        router=router,
+        embedding=embedding,
+        lm_head=lm_head,
+        mtp=mtp,
+        hc=hc,
+        total_params=total_params,
+        active_params_per_token=max(0.0, total_params - inactive_routed),
+    )
+
+
 @lru_cache(maxsize=STEP_FLOOR_CACHE_MAXSIZE)
 def hbm_breakdown_per_core_bytes(
     geom: ModelGeometry,
@@ -404,7 +542,8 @@ def hbm_breakdown_per_core_bytes(
     w_attn = compute_w_attn(geom, dt, parallel, counts)
     w_rec = compute_w_rec(geom, dt, parallel, counts)
     w_ffn, w_dense_ffn = compute_w_ffn(geom, dt, parallel)
-    w_head = float(2 * geom.vocab * geom.hidden) * dt.lm_head / (tp * pp)
+    w_emb, w_lm_head = _compute_w_head(geom, dt, tp, pp)
+    w_head = w_emb + w_lm_head
     w_mtp = _compute_w_mtp(
         geom,
         dt,
@@ -412,13 +551,7 @@ def hbm_breakdown_per_core_bytes(
         (w_attn, counts.attn_total),
         (w_ffn, w_dense_ffn),
     )
-    w_hc = (
-        float(geom.num_layers * (geom.hc_mult**2) * geom.hidden)
-        * dt.w_dense
-        / float(tp * pp)
-        if geom.hc_mult > 1
-        else 0.0
-    )
+    w_hc = _compute_w_hc(geom, dt, tp, pp)
     weights = w_attn + w_rec + w_ffn + w_head + w_mtp + w_hc
     kv, state = _compute_kv_and_state(geom, dt, parallel, layout, chip=chip)
     return HbmBreakdown(

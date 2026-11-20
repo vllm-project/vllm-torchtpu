@@ -45,6 +45,7 @@ from .constants import (
     EXAMPLE_SLO_TIERS,
     EXPERT_DTYPE_BYTES,
     FP8_BYTES,
+    INSPECT_SCHEMA,
     KV_DTYPE_BYTES,
     MIN_INSTANCES,
     MIN_TOP_K,
@@ -70,7 +71,11 @@ from .emit import (
     top_layouts,
 )
 from .geometry import from_hf_config
-from .hf_loader import dtypes_from_hf_config, load_hf_config
+from .hf_loader import (
+    audit_hf_config,
+    dtypes_from_hf_config,
+    load_hf_config,
+)
 from .modules import Dtypes, Parallel, StepShape
 from .occupancy import ExpertActivationModel, parse_activation_spec
 from .report import write_html
@@ -140,7 +145,7 @@ _BENCH_INT_FLAGS: Final[dict[str, str]] = {
 _DEFAULT_CMD_ISL: Final[int] = 1024
 _DEFAULT_CMD_OSL: Final[int] = 128
 _EXIT_EMPTY_FRONTIER: Final[int] = 1
-_EXIT_ERROR: Final[int] = 2
+EXIT_ERROR: Final[int] = 2
 
 
 def _normalize_tokens(raw_cmd: str) -> list[str]:
@@ -251,6 +256,15 @@ def _add_model_source(p: argparse.ArgumentParser) -> None:
         help=(
             "Hugging Face model ID, local directory, or config.json path "
             "(unit: id_or_path, scope: model)."
+        ),
+    )
+    p.add_argument(
+        "--allow-unlisted-model-type",
+        action="store_true",
+        default=False,
+        help=(
+            "Bypass closed model_type allowlist when structural config checks pass "
+            "(unit: flag, scope: model)."
         ),
     )
 
@@ -704,6 +718,7 @@ def build_parser() -> argparse.ArgumentParser:
         prefill_topology=None,
         decode_topology=None,
         reference_layout=None,
+        allow_unlisted_model_type=False,
     )
     _add_shared_chip_flags(parser, is_root=True)
     sub = parser.add_subparsers(dest="cmd", required=False)
@@ -843,6 +858,12 @@ def build_parser() -> argparse.ArgumentParser:
             "(unit: tokens, scope: step)."
         ),
     )
+
+    p_inspect = sub.add_parser(
+        "inspect", help="Audit HF config onboarding readiness and parameter counts."
+    )
+    _add_model_source(p_inspect)
+    _add_shared_chip_flags(p_inspect, is_root=False)
     return parser
 
 
@@ -1669,7 +1690,7 @@ def _dispatch_solve_family(
         )
     except ValueError as exc:
         sys.stderr.write(f"error: {exc}\n")
-        return _EXIT_ERROR
+        return EXIT_ERROR
     splan = _apply_cmd_postprocess(splan, scen, serve_parsed, cmd_max_model_len)
     ref_report = _build_cli_reference_report(
         splan, geom, parsed_ref, args, solve_opts, chip=chip
@@ -1887,9 +1908,75 @@ def _resolve_model_src(
     return str(serve_parsed.get("model") or bench_parsed.get("model") or "")
 
 
+def _write_inspect_text(payload: Mapping[str, object]) -> None:
+    """Write human-readable config inspection summary to stdout."""
+    lines = [
+        f"schema_version: {payload['schema_version']}",
+        f"chip: {payload['chip']}",
+        f"onboarding_tier: {payload['onboarding_tier']}",
+        f"model_type: {payload['model_type'] or '<omitted>'}",
+        f"model_type_status: {payload['model_type_status']}",
+    ]
+    params = payload.get("param_counts")
+    if isinstance(params, Mapping):
+        lines.append(
+            "param_counts: "
+            f"total={params['total_params']:.0f}, "
+            f"active={params['active_params_per_token']:.0f}"
+        )
+    unmapped = payload.get("unmapped_structural_keys")
+    ignored = payload.get("ignored_non_text_keys")
+    reasons = payload.get("blocking_reasons")
+    lines.append(f"unmapped_structural_keys: {unmapped}")
+    lines.append(f"ignored_non_text_keys: {ignored}")
+    if reasons:
+        lines.append(f"blocking_reasons: {reasons}")
+    sys.stdout.write("\n".join(lines) + "\n")
+
+
+def _dispatch_inspect_cmd(
+    args: argparse.Namespace,
+    src: str,
+    chip: ChipSpec,
+) -> int:
+    """Audit HF config onboarding readiness before geometry loading fails."""
+    try:
+        cfg = load_hf_config(src)
+    except (FileNotFoundError, ValueError, RuntimeError, OSError) as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return EXIT_ERROR
+    audit = audit_hf_config(
+        cfg, allow_unlisted_model_type=args.allow_unlisted_model_type
+    )
+    payload: dict[str, object] = {
+        "schema_version": INSPECT_SCHEMA,
+        "chip": chip.name,
+        "onboarding_tier": audit.onboarding_tier,
+        "model_type": audit.model_type,
+        "model_type_status": audit.model_type_status,
+        "layer_counts": (
+            asdict(audit.layer_counts) if audit.layer_counts is not None else None
+        ),
+        "param_counts": (
+            asdict(audit.param_counts) if audit.param_counts is not None else None
+        ),
+        "dtypes": asdict(audit.dtypes) if audit.dtypes is not None else None,
+        "unmapped_structural_keys": list(audit.unmapped_structural_keys),
+        "ignored_non_text_keys": list(audit.ignored_non_text_keys),
+        "blocking_reasons": list(audit.blocking_reasons),
+    }
+    if args.json:
+        sys.stdout.write(json.dumps(payload) + "\n")
+    else:
+        _write_inspect_text(payload)
+    return 0 if audit.onboarding_tier == "tier0_ready" else EXIT_ERROR
+
+
 def _load_cli_geometry(
     src: str,
     serve_parsed: dict[str, object],
+    *,
+    allow_unlisted_model_type: bool = False,
 ) -> tuple[dict[str, object], ModelGeometry]:
     """Load HF config and parse ModelGeometry with CLI quantization fallback."""
     cfg = load_hf_config(src)
@@ -1902,7 +1989,10 @@ def _load_cli_geometry(
         q_val = str(serve_parsed["quantization"]).lower()
         if q_val and q_val != "none":
             cfg = {**cfg, "quantization_config": {"quant_method": q_val}}
-    return (cfg, from_hf_config(cfg))
+    return (
+        cfg,
+        from_hf_config(cfg, allow_unlisted_model_type=allow_unlisted_model_type),
+    )
 
 
 def _resolve_cli_chip(
@@ -1929,7 +2019,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(raw_argv)
     resolved_chip = _resolve_cli_chip(args)
     if resolved_chip is None:
-        return _EXIT_ERROR
+        return EXIT_ERROR
     chip, chip_topologies = resolved_chip
     if args.assumptions:
         return _render_assumptions_view(chip, as_json=args.json)
@@ -1955,11 +2045,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(
             "One of --config, --model, or --from-serve-cmd with a model is required."
         )
+    if args.cmd == "inspect":
+        return _dispatch_inspect_cmd(args, src, chip)
     try:
-        cfg, geom = _load_cli_geometry(src, serve_parsed)
+        cfg, geom = _load_cli_geometry(
+            src,
+            serve_parsed,
+            allow_unlisted_model_type=args.allow_unlisted_model_type,
+        )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         sys.stderr.write(f"error: {exc}\n")
-        return _EXIT_ERROR
+        return EXIT_ERROR
     if is_solve_cmd:
         return _dispatch_solve_family(
             args,

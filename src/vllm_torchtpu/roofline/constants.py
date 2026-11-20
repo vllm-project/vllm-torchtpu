@@ -223,6 +223,7 @@ HBM_MIN_PACKING_DIVISOR: float = 0.5
 SPARSE_MLA_SCALE_BYTES: float = 4.0
 HEAD_DIM_PACKING_THRESHOLD: int = 64
 GLU_MATMUL_COUNT: int = 3
+NON_GATED_MATMUL_COUNT: int = 2
 DEFAULT_MAX_INSTANCES: int = 16
 DEFAULT_HBM_RESERVE_GB: float = 0.0
 DEFAULT_PREFILL_CHUNK: int = 2048
@@ -272,6 +273,7 @@ ZERO_THINK_TIME_WARNING: str = (
 # Versioned solve JSON payload and top-K diversity selection constants.
 SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v2"
 CHIP_SPEC_SCHEMA: str = "vllm_torchtpu.roofline.chip_spec/v1"
+INSPECT_SCHEMA: str = "vllm_torchtpu.roofline.inspect/v1"
 VALID_CHIP_PROVENANCE: frozenset[str] = frozenset(
     {"public_spec", "jax_tpu_info", "measured_microbench", "projected"}
 )
@@ -368,6 +370,35 @@ MULTIMODAL_KEYS: tuple[str, ...] = (
     "video_config",
     "mm_projector_type",
     "image_token_index",
+)
+NON_GATED_MLP_MODEL_TYPES: frozenset[str] = frozenset({"opt", "gpt2", "gpt_neox"})
+BENIGN_HF_METADATA_KEYS: frozenset[str] = frozenset(
+    {
+        "_name_or_path",
+        "architectures",
+        "attention_bias",
+        "attention_dropout",
+        "auto_map",
+        "bos_token_id",
+        "cls_token_id",
+        "eos_token_id",
+        "id2label",
+        "initializer_range",
+        "label2id",
+        "layer_norm_eps",
+        "max_position_embeddings",
+        "mlp_bias",
+        "model_max_length",
+        "pad_token_id",
+        "rms_norm_eps",
+        "rope_scaling",
+        "rope_theta",
+        "sep_token_id",
+        "tokenizer_class",
+        "transformers_version",
+        "unk_token_id",
+        "use_cache",
+    }
 )
 HYBRID_PATTERN_MAP: dict[str, str] = {
     "*": "full_attention",

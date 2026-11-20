@@ -15,22 +15,26 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
 from .constants import (
     BLOCK_PARALLEL_ENABLED,
+    GLU_MATMUL_COUNT,
     HYBRID_PATTERN_MAP,
     HYBRID_SSM_MODEL_TYPES,
     LAYER_TYPE_MAP,
     LINEAR_ATTENTION_LAYER_TOKENS,
     MULTIMODAL_KEYS,
+    NON_GATED_MATMUL_COUNT,
+    NON_GATED_MLP_MODEL_TYPES,
     SUPPORTED_MODEL_TYPES,
     VALID_LAYER_TOKENS,
     WEIGHT_BLOCK_DIM_LEN,
 )
 
 __all__ = [
+    "KeyTracker",
     "LayerCounts",
     "ModelGeometry",
     "UnsupportedArchitectureError",
@@ -38,6 +42,96 @@ __all__ = [
     "from_hf_config",
     "supports",
 ]
+
+
+class KeyTracker(Mapping[str, object]):
+    """Read-only mapping wrapper that records dotted paths on value reads."""
+
+    def __init__(
+        self,
+        data: Mapping[str, object],
+        *,
+        prefix: str = "",
+        consumed: set[str] | None = None,
+    ) -> None:
+        """Initialize tracker over ``data`` sharing a consumed-path set."""
+        self._data = data
+        self._prefix = prefix
+        self._consumed: set[str] = consumed if consumed is not None else set()
+        self._children: dict[str, KeyTracker] = {}
+
+    @property
+    def raw_data(self) -> Mapping[str, object]:
+        """Return the underlying mapping without recording key reads."""
+        return self._data
+
+    @property
+    def consumed_keys(self) -> frozenset[str]:
+        """Return dotted key paths whose values were accessed."""
+        return frozenset(self._consumed)
+
+    def _path(self, key: str) -> str:
+        """Return dotted key path relative to this mapping prefix."""
+        return f"{self._prefix}.{key}" if self._prefix else key
+
+    def __contains__(self, key: object) -> bool:
+        """Check key presence without marking it as consumed."""
+        return key in self._data
+
+    def __getitem__(self, key: str) -> object:
+        """Return value for ``key`` and record its dotted path as consumed."""
+        val = self._data[key]
+        path = self._path(key)
+        self._consumed.add(path)
+        if isinstance(val, Mapping) and not isinstance(val, KeyTracker):
+            child = self._children.get(key)
+            if child is None:
+                child = KeyTracker(val, prefix=path, consumed=self._consumed)
+                self._children[key] = child
+            return child
+        return val
+
+    def __iter__(self) -> Iterator[str]:
+        """Iterate keys without marking them as consumed."""
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        """Return key count of the underlying mapping."""
+        return len(self._data)
+
+    def __str__(self) -> str:
+        """Format underlying mapping string without marking keys consumed."""
+        return repr(self._data)
+
+    def __repr__(self) -> str:
+        """Format underlying mapping representation without marking keys consumed."""
+        return repr(self._data)
+
+
+def _first_present(mapping: Mapping[str, object], *keys: str) -> object:
+    """Return first truthy value across ``keys``, reading all present aliases."""
+    chosen: object = None
+    for key in keys:
+        if key in mapping:
+            val = mapping[key]
+            if not chosen and val:
+                chosen = val
+    return chosen
+
+
+def _first_non_none(
+    mappings: Sequence[Mapping[str, object]],
+    *keys: str,
+) -> object:
+    """Return first non-None value across scopes and keys without short-circuiting."""
+    chosen: object = None
+    for mapping in mappings:
+        for key in keys:
+            if key in mapping:
+                val = mapping[key]
+                if chosen is None and val is not None:
+                    chosen = val
+    return chosen
 
 
 def _as_mapping(value: object) -> Mapping[str, object]:
@@ -145,6 +239,8 @@ class ModelGeometry:
     global_head_dim: int = 0
     ffn_kinds: tuple[str, ...] = ()
     routed_expert_hidden: int = 0
+    ffn_num_matrices: int = GLU_MATMUL_COUNT
+    tie_word_embeddings: bool = False
 
     def ffn_layer_counts(self) -> tuple[int, int]:
         """Return (n_moe_ffn, n_dense_ffn) counted from layer_ffn_kinds."""
@@ -270,32 +366,61 @@ def _resolve_attn_output_gate(
     cfg: Mapping[str, object],
 ) -> bool:
     """Resolve whether attention output gating is enabled in text or root config."""
-    raw_flag = tc.get("attn_output_gate", cfg.get("attn_output_gate"))
+    scopes = (tc, cfg) if tc is not cfg else (tc,)
+    raw_flag = _first_non_none(scopes, "attn_output_gate")
+    raw_gate_type = _first_non_none(scopes, "output_gate_type")
     if raw_flag is not None and bool(raw_flag):
         return True
-    raw_gate_type = tc.get("output_gate_type", cfg.get("output_gate_type"))
     if isinstance(raw_gate_type, str):
         return raw_gate_type.strip().lower() not in ("", "none", "false")
     return False
 
 
-def supports(cfg: Mapping[str, object]) -> None:
+def _validate_layer_types(text_cfg: Mapping[str, object], *, has_gdn: bool) -> None:
+    """Validate optional hybrid_override_pattern and layer_types declarations."""
+    hybrid_pattern = text_cfg.get("hybrid_override_pattern")
+    if isinstance(hybrid_pattern, str):
+        pattern_text = hybrid_pattern.strip()
+        if any(ch not in HYBRID_PATTERN_MAP for ch in pattern_text):
+            msg = f"Unsupported hybrid_override_pattern tokens in {pattern_text!r}"
+            raise UnsupportedArchitectureError(msg)
+
+    raw_types = _as_sequence(text_cfg.get("layer_types"))
+    if raw_types is None:
+        return
+    for layer_tok in raw_types:
+        layer_kind = str(layer_tok)
+        if layer_kind not in VALID_LAYER_TOKENS:
+            msg = (
+                f"Unknown layer_type {layer_kind!r}; supported tokens: "
+                f"{sorted(VALID_LAYER_TOKENS)}"
+            )
+            raise UnsupportedArchitectureError(msg)
+        if layer_kind == "mamba" and not has_gdn:
+            msg = "Layer token 'mamba' requires GDN/KDA head dimensions"
+            raise UnsupportedArchitectureError(msg)
+
+
+def supports(
+    cfg: Mapping[str, object],
+    *,
+    allow_unlisted_model_type: bool = False,
+) -> None:
     """Validate that cfg maps onto modeled attention, recurrence, and FFN families."""
     text_cfg = _validate_text_config(cfg)
-    mtype = (
-        str(text_cfg.get("model_type") or cfg.get("model_type") or "").strip().lower()
-    )
+    scopes = (text_cfg, cfg) if text_cfg is not cfg else (text_cfg,)
+    model_type = str(_first_non_none(scopes, "model_type") or "").strip().lower()
 
     has_gdn = _has_gdn_kda_heads(text_cfg)
 
     # Fail closed on unlisted model types or unsupported SSMs
-    if mtype:
-        if mtype not in SUPPORTED_MODEL_TYPES:
-            msg = f"Unrecognized or unsupported model_type {mtype!r}; fails closed"
+    if model_type:
+        if model_type not in SUPPORTED_MODEL_TYPES and not allow_unlisted_model_type:
+            msg = f"Unrecognized or unsupported model_type {model_type!r}; fails closed"
             raise UnsupportedArchitectureError(msg)
-        if mtype in HYBRID_SSM_MODEL_TYPES and not has_gdn:
+        if model_type in HYBRID_SSM_MODEL_TYPES and not has_gdn:
             msg = (
-                f"Hybrid state-space model_type {mtype!r} "
+                f"Hybrid state-space model_type {model_type!r} "
                 "missing required GDN/KDA head keys"
             )
             raise UnsupportedArchitectureError(msg)
@@ -307,38 +432,62 @@ def supports(cfg: Mapping[str, object]) -> None:
         raise UnsupportedArchitectureError(msg)
 
     _validate_modeled_attention_variants(text_cfg)
-
-    raw_types = _as_sequence(text_cfg.get("layer_types"))
-    if raw_types is None:
-        return
-    for layer_tok in raw_types:
-        tok_s = str(layer_tok)
-        if tok_s not in VALID_LAYER_TOKENS:
-            msg = (
-                f"Unknown layer_type {tok_s!r}; supported tokens: "
-                f"{sorted(VALID_LAYER_TOKENS)}"
-            )
-            raise UnsupportedArchitectureError(msg)
-        if tok_s == "mamba" and not has_gdn:
-            msg = "Layer token 'mamba' requires GDN/KDA head dimensions"
-            raise UnsupportedArchitectureError(msg)
+    _validate_layer_types(text_cfg, has_gdn=has_gdn)
 
 
-def _is_kda_config(tc: Mapping[str, object], cfg: Mapping[str, object]) -> bool:
-    """Return True when config declares KDA-style linear attention capabilities."""
+def _is_kda_config(tc: Mapping[str, object]) -> bool:
+    """Return True when config declares KDA-style linear attention keys."""
     lin_cfg = _as_mapping(tc.get("linear_attn_config"))
-    if lin_cfg.get("short_conv_kernel_size") or lin_cfg.get("kda"):
+    if (
+        lin_cfg.get("kda_layers") is not None
+        or lin_cfg.get("short_conv_kernel_size")
+        or lin_cfg.get("kda")
+    ):
         return True
-    model_type = str(tc.get("model_type") or cfg.get("model_type") or "").lower()
-    if model_type.startswith("kimi") or model_type == "kda":
-        return True
-    raw_archs = _as_sequence(cfg.get("architectures") or tc.get("architectures")) or ()
-    return any("kimi" in str(arch).lower() for arch in raw_archs)
+    raw_types = _as_sequence(tc.get("layer_types")) or ()
+    return any(str(tok) in ("kda", "kda_attention") for tok in raw_types)
+
+
+def _parse_dsa_layer_set(
+    tc: Mapping[str, object],
+    cfg: Mapping[str, object],
+    num_layers: int,
+) -> set[int] | None:
+    """Return 0-based DSA layer indices when dsa_layers/indexer_layers is set."""
+    scopes = (tc, cfg) if tc is not cfg else (tc,)
+    raw_dsa = _first_non_none(scopes, "dsa_layers", "indexer_layers")
+    if raw_dsa is None:
+        return None
+    seq = _as_sequence(raw_dsa)
+    if seq is None:
+        msg = f"Expected sequence for dsa_layers/indexer_layers, got {raw_dsa!r}"
+        raise ValueError(msg)
+    if seq and all(isinstance(item, bool) for item in seq):
+        if len(seq) != num_layers:
+            msg = (
+                f"Boolean dsa_layers length {len(seq)} "
+                f"!= num_hidden_layers {num_layers}"
+            )
+            raise ValueError(msg)
+        return {idx for idx, flag in enumerate(seq) if flag}
+    indices: set[int] = set()
+    for item in seq:
+        idx = item if isinstance(item, int) and not isinstance(item, bool) else None
+        if idx is None:
+            msg = (
+                "dsa_layers/indexer_layers must contain integer indices or a "
+                f"boolean mask of length {num_layers}, got {item!r}"
+            )
+            raise ValueError(msg)
+        if idx < 0 or idx >= num_layers:
+            msg = f"dsa_layers index {idx} out of range [0, {num_layers})"
+            raise ValueError(msg)
+        indices.add(idx)
+    return indices
 
 
 def _infer_pattern_layer_types(
     tc: Mapping[str, object],
-    cfg: Mapping[str, object],
     num_layers: int,
     specs: tuple[int, int, int],
 ) -> tuple[str, ...]:
@@ -363,7 +512,7 @@ def _infer_pattern_layer_types(
             if (kv_lora_rank > 0 and index_topk > 0)
             else ("mla" if kv_lora_rank > 0 else "full_attention")
         )
-        lin_tok = "kda" if _is_kda_config(tc, cfg) else "linear_attention"
+        lin_tok = "kda" if _is_kda_config(tc) else "linear_attention"
         return tuple(
             att_tok if (i + 1) % interval == 0 else lin_tok for i in range(num_layers)
         )
@@ -373,13 +522,13 @@ def _infer_pattern_layer_types(
             "full_attention" if _as_int(v, 0) == 1 else "linear_attention"
             for v in attn_list
         )
-    hyb_pat = tc.get("hybrid_override_pattern")
-    if isinstance(hyb_pat, str) and len(hyb_pat.strip()) == num_layers:
-        pat_s = hyb_pat.strip()
-        if any(ch not in HYBRID_PATTERN_MAP for ch in pat_s):
-            msg = f"Unsupported hybrid_override_pattern tokens in {pat_s!r}"
+    hybrid_pattern = tc.get("hybrid_override_pattern")
+    if isinstance(hybrid_pattern, str) and len(hybrid_pattern.strip()) == num_layers:
+        pattern_text = hybrid_pattern.strip()
+        if any(ch not in HYBRID_PATTERN_MAP for ch in pattern_text):
+            msg = f"Unsupported hybrid_override_pattern tokens in {pattern_text!r}"
             raise UnsupportedArchitectureError(msg)
-        return tuple(HYBRID_PATTERN_MAP[ch] for ch in pat_s)
+        return tuple(HYBRID_PATTERN_MAP[ch] for ch in pattern_text)
     sw_pat = _as_int(
         tc.get("sliding_window_pattern") or tc.get("_sliding_window_pattern"), 0
     )
@@ -400,6 +549,12 @@ def _infer_pattern_layer_types(
     return default_layers
 
 
+_MLA_OR_FULL_ATTN_TOKENS: frozenset[str] = frozenset(
+    {tok for tok, fam in LAYER_TYPE_MAP.items() if fam in ("mla", "dsa")}
+    | {"full_attention", "attention"}
+)
+
+
 def _resolve_layer_types(
     tc: Mapping[str, object],
     cfg: Mapping[str, object],
@@ -407,6 +562,8 @@ def _resolve_layer_types(
     specs: tuple[int, int, int],
 ) -> tuple[str, ...]:
     """Resolve sequence of layer type strings for each transformer layer."""
+    kv_lora_rank, _, _ = specs
+    dsa_set = _parse_dsa_layer_set(tc, cfg, num_layers)
     raw_types = _as_sequence(tc.get("layer_types"))
     if raw_types is not None:
         if len(raw_types) != num_layers:
@@ -420,8 +577,16 @@ def _resolve_layer_types(
                 supported = sorted(VALID_LAYER_TOKENS)
                 msg = f"Unknown layer_type {token!r}; supported tokens: {supported}"
                 raise ValueError(msg)
-        return layer_types
-    return _infer_pattern_layer_types(tc, cfg, num_layers, specs)
+    else:
+        layer_types = _infer_pattern_layer_types(tc, num_layers, specs)
+    if dsa_set is not None and kv_lora_rank > 0:
+        return tuple(
+            ("dsa" if idx in dsa_set else "mla")
+            if layer_tok in _MLA_OR_FULL_ATTN_TOKENS
+            else layer_tok
+            for idx, layer_tok in enumerate(layer_types)
+        )
+    return layer_types
 
 
 # Config keys that name the routed experts per token, in lookup order. A sampling
@@ -439,25 +604,21 @@ def _resolve_moe_dimensions(
 ) -> tuple[int, int, int, int, int]:
     """Resolve (num_experts, top_k, moe_inter, num_shared_experts, shared_inter)."""
     num_experts = _as_int(
-        tc.get("num_experts")
-        or tc.get("n_routed_experts")
-        or tc.get("num_local_experts")
+        _first_present(tc, "num_experts", "n_routed_experts", "num_local_experts")
     )
     dense_inter = _as_int(
-        tc.get("intermediate_size") or tc.get("dense_intermediate_size")
+        _first_present(tc, "intermediate_size", "dense_intermediate_size")
     )
-    moe_inter = _as_int(tc.get("moe_intermediate_size") or tc.get("latent_moe_dim"))
+    moe_inter = _as_int(_first_present(tc, "moe_intermediate_size", "latent_moe_dim"))
     if num_experts > 0 and moe_inter == 0 and dense_inter > 0:
         moe_inter = dense_inter
 
-    num_shared = _as_int(tc.get("n_shared_experts") or tc.get("num_shared_experts"))
+    num_shared = _as_int(_first_present(tc, "n_shared_experts", "num_shared_experts"))
     shared_inter = _as_int(tc.get("shared_expert_intermediate_size"))
     if shared_inter == 0 and num_shared > 0 and moe_inter > 0:
         shared_inter = num_shared * moe_inter
 
-    top_k = _as_int(
-        next((tc[key] for key in _ROUTED_EXPERTS_PER_TOKEN_KEYS if tc.get(key)), None)
-    )
+    top_k = _as_int(_first_present(tc, *_ROUTED_EXPERTS_PER_TOKEN_KEYS))
     if num_experts > 0 and top_k <= 0:
         accepted_keys = ", ".join(_ROUTED_EXPERTS_PER_TOKEN_KEYS)
         msg = f"MoE config names no routed experts per token ({accepted_keys})"
@@ -487,9 +648,8 @@ def _resolve_ffn_kinds(
             "moe" if (i + 1) % interleave_step == 0 else "dense"
             for i in range(num_layers)
         )
-    first_k_dense = _as_int(
-        tc.get("first_k_dense_replace", cfg.get("first_k_dense_replace", 0))
-    )
+    scopes = (tc, cfg) if tc is not cfg else (tc,)
+    first_k_dense = _as_int(_first_non_none(scopes, "first_k_dense_replace") or 0)
     if num_experts > 0:
         return tuple("dense" if i < first_k_dense else "moe" for i in range(num_layers))
     return ("dense",) * num_layers
@@ -600,12 +760,40 @@ def _resolve_block_parallel(tc: Mapping[str, object], cfg: Mapping[str, object])
     return max(1, _as_int(raw_bp, 1))
 
 
-def from_hf_config(cfg: Mapping[str, object]) -> ModelGeometry:
+def _resolve_ffn_num_matrices(
+    tc: Mapping[str, object],
+    cfg: Mapping[str, object],
+    model_type: str,
+) -> int:
+    """Resolve per-layer FFN matrix multiplier (2 non-gated, 3 gated)."""
+    scopes = (tc, cfg) if tc is not cfg else (tc,)
+    raw_num_matrices = _first_non_none(scopes, "ffn_num_matrices")
+    if raw_num_matrices is not None:
+        num_matrices = _as_int(raw_num_matrices)
+        if num_matrices not in (NON_GATED_MATMUL_COUNT, GLU_MATMUL_COUNT):
+            msg = f"Unsupported ffn_num_matrices={num_matrices!r}; expected 2 or 3"
+            raise ValueError(msg)
+        return num_matrices
+    raw_gated = _first_non_none(scopes, "is_gated_mlp")
+    if raw_gated is not None:
+        return GLU_MATMUL_COUNT if bool(raw_gated) else NON_GATED_MATMUL_COUNT
+    if model_type in NON_GATED_MLP_MODEL_TYPES:
+        return NON_GATED_MATMUL_COUNT
+    return GLU_MATMUL_COUNT
+
+
+def from_hf_config(
+    cfg: Mapping[str, object],
+    *,
+    allow_unlisted_model_type: bool = False,
+) -> ModelGeometry:
     """Build ModelGeometry from a raw or nested HF config mapping."""
-    supports(cfg)
+    supports(cfg, allow_unlisted_model_type=allow_unlisted_model_type)
     sub = _as_mapping(cfg.get("text_config"))
     tc: Mapping[str, object] = sub if sub else cfg
     _validate_modeled_attention_variants(tc)
+    scopes = (tc, cfg) if tc is not cfg else (tc,)
+    model_type = str(_first_non_none(scopes, "model_type") or "").strip().lower()
     hidden = _as_int(tc["hidden_size"])
     num_layers = _as_int(tc["num_hidden_layers"])
     num_heads = _as_int(tc["num_attention_heads"])
@@ -638,41 +826,39 @@ def from_hf_config(cfg: Mapping[str, object]) -> ModelGeometry:
         tc, cfg, num_layers, (kv_lora_rank, index_topk, sliding_window)
     )
     dense_inter = _as_int(
-        tc.get("intermediate_size") or tc.get("dense_intermediate_size")
+        _first_present(tc, "intermediate_size", "dense_intermediate_size")
     )
     num_experts, top_k, moe_inter, num_shared, shared_inter = _resolve_moe_dimensions(
         tc
     )
     ffn_kinds = _resolve_ffn_kinds(tc, cfg, num_layers, num_experts)
+    ffn_num_matrices = _resolve_ffn_num_matrices(tc, cfg, model_type)
     lin_k_heads, lin_v_heads, lin_k_dim, lin_v_dim, conv_kernel = (
         _resolve_linear_attention_dimensions(
             tc, layer_types, (num_heads, num_kv_heads, head_dim)
         )
     )
     mtp_layers = _resolve_mtp_layers(tc, cfg)
-    ple_dim = _as_int(tc.get("per_layer_input_dim") or tc.get("ple_dim"))
-    first_k = _as_int(
-        tc.get("first_k_dense_replace", cfg.get("first_k_dense_replace", 0))
-    )
+    ple_dim = _as_int(_first_present(tc, "per_layer_input_dim", "ple_dim"))
+    first_k = _as_int(_first_non_none(scopes, "first_k_dense_replace") or 0)
     compress_ratios = _resolve_compress_ratios(tc, cfg, num_layers)
     block_parallel = _resolve_block_parallel(tc, cfg)
-    mtp_inter = _as_int(
-        tc.get("mtp_intermediate_size", cfg.get("mtp_intermediate_size", 0))
-    )
+    mtp_inter = _as_int(_first_non_none(scopes, "mtp_intermediate_size") or 0)
     raw_hc = (
-        tc.get("mhc_num_streams")
-        or tc.get("hc_mult")
-        or tc.get("hc_count")
-        or tc.get("hyper_connection_mult")
-        or cfg.get("mhc_num_streams")
-        or cfg.get("hc_mult")
-        or cfg.get("hc_count")
-        or cfg.get("hyper_connection_mult")
+        _first_non_none(
+            scopes,
+            "mhc_num_streams",
+            "hc_mult",
+            "hc_count",
+            "hyper_connection_mult",
+        )
         or 1
     )
     hc_mult = max(1, _as_int(raw_hc, 1))
+    tie_word_embeddings = bool(_first_non_none(scopes, "tie_word_embeddings") or False)
+    vocab = _as_int(_first_non_none(scopes, "vocab_size") or 0)
 
-    qcfg = _as_mapping(tc.get("quantization_config") or cfg.get("quantization_config"))
+    qcfg = _as_mapping(_first_non_none(scopes, "quantization_config"))
     raw_wbs = _as_sequence(qcfg.get("weight_block_size"))
     weight_block_size = (
         (
@@ -700,7 +886,7 @@ def from_hf_config(cfg: Mapping[str, object]) -> ModelGeometry:
         top_k=top_k,
         moe_inter=moe_inter,
         shared_inter=shared_inter,
-        vocab=_as_int(tc.get("vocab_size", cfg.get("vocab_size", 0))),
+        vocab=vocab,
         mtp_layers=mtp_layers,
         dense_inter=dense_inter,
         hc_mult=hc_mult,
@@ -725,4 +911,6 @@ def from_hf_config(cfg: Mapping[str, object]) -> ModelGeometry:
         ffn_kinds=ffn_kinds,
         weight_block_size=weight_block_size,
         routed_expert_hidden=_as_int(tc.get("routed_expert_hidden_size", 0)),
+        ffn_num_matrices=ffn_num_matrices,
+        tie_word_embeddings=tie_word_embeddings,
     )

@@ -34,6 +34,7 @@ from .constants import (
     EXAMPLE_CONCURRENCIES,
     EXAMPLE_SLO_TIERS,
     FP8_BYTES,
+    LINEAR_ATTENTION_LAYER_TOKENS,
     MIN_DISAGG_INSTANCES,
     MIN_MOE_INTERMEDIATE_ALIGNMENT,
     NO_FEASIBLE_LAYOUT_WARNING,
@@ -431,17 +432,14 @@ def _valid_head_tp(geom: ModelGeometry, tp: int) -> bool:
     return geom.num_kv_heads % tp == 0 or tp % geom.num_kv_heads == 0
 
 
-def _has_gdn_layers(geom: ModelGeometry) -> bool:
-    """Check whether any layer type in geometry belongs to gated delta net."""
-    return any(
-        tok in ("linear_attention", "gdn", "gated_deltanet", "mamba")
-        for tok in geom.layer_types
-    )
+def _has_recurrent_layers(geom: ModelGeometry) -> bool:
+    """Check whether any layer type in geometry uses recurrent linear attention."""
+    return any(tok in LINEAR_ATTENTION_LAYER_TOKENS for tok in geom.layer_types)
 
 
 def _valid_gdn_degree(geom: ModelGeometry, degree: int) -> bool:
     """Check hardware and runtime GDN head divisibility for TP*PCP degree."""
-    if degree <= 1 or not _has_gdn_layers(geom):
+    if degree <= 1 or not _has_recurrent_layers(geom):
         return True
     if geom.linear_v_heads <= 0 or geom.linear_k_heads <= 0:
         return True
@@ -462,7 +460,7 @@ def _valid_raiden_gdn_pair(
     decode_parallel: Parallel,
 ) -> bool:
     """Check runtime disaggregated prefill/decode GDN state transfer compatibility."""
-    if not _has_gdn_layers(geom):
+    if not _has_recurrent_layers(geom):
         return True
     if geom.linear_v_heads <= 0 or geom.linear_k_heads <= 0:
         return True

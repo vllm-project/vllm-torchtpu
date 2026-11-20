@@ -32,7 +32,6 @@ from .constants import (
     ACTIVATION_BYTES_BF16,
     DRAFT_PROJECTION_HIDDEN_VECTORS,
     FP8_BYTES,
-    GLU_MATMUL_COUNT,
     STEP_FLOOR_CACHE_MAXSIZE,
     UNIT_COLL_CACHE_MAXSIZE,
     VECTOR_MAX_ELEMENTS_PER_WORD,
@@ -556,7 +555,7 @@ def _strip_moe_routed_unpack(
         else (geom.moe_inter if parallel.moe == "ep" else geom.moe_inter // parallel.tp)
     )
     eh = geom.routed_expert_hidden if geom.routed_expert_hidden > 0 else geom.hidden
-    r_elems_min = ed_min * float(n_m * pp_s * GLU_MATMUL_COUNT * eh * width)
+    r_elems_min = ed_min * float(n_m * pp_s * geom.ffn_num_matrices * eh * width)
     unpack_vector = _sub_byte_unpack_vector_flops(
         r_elems_min,
         dt.w_expert,
