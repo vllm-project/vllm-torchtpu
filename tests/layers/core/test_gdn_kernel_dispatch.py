@@ -28,6 +28,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import torch
 from jax.sharding import Mesh
 
 from vllm_torchtpu.gdn_pool_layout import (
@@ -322,8 +323,6 @@ def test_ba_halves_are_views_only_for_the_qwen3_5_moe_architectures(
 ):
     """The Qwen3.5 MoE architectures hand the b and a halves to the GDN op as
     chunk views; every other architecture gets contiguous copies."""
-    import torch
-
     ba = torch.arange(24, dtype=torch.float32).reshape(3, 8)
     b, a = gdn_attention_op._split_ba(_layer(architecture), ba)
     assert torch.equal(b, ba[:, :4]) and torch.equal(a, ba[:, 4:])
@@ -333,8 +332,6 @@ def test_ba_halves_are_views_only_for_the_qwen3_5_moe_architectures(
 
 def test_ba_split_follows_the_layer_not_the_engine():
     """The layer's own model config decides, as it does for the kernel."""
-    import torch
-
     ba = torch.arange(24, dtype=torch.float32).reshape(3, 8)
     with set_vllm_model_wrapper_context(mesh=None, vllm_config=_vllm_config(KIMI)):
         b, _ = gdn_attention_op._split_ba(_layer(QWEN), ba)
@@ -348,8 +345,6 @@ def test_the_pooled_pcp_op_keeps_contiguous_ba_halves(monkeypatch):
     """The pooled PCP op runs gdn_pcp_fused rather than the kernel the dispatch
     selects, so even the Qwen3.5 MoE architectures hand it contiguous
     b and a halves."""
-    import torch
-
     attn = _attn(QWEN)
     ba = torch.arange(NUM_TOKENS * 2 * N_V, dtype=torch.float32).reshape(
         NUM_TOKENS, 2 * N_V
