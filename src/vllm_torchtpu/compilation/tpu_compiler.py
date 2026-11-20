@@ -310,6 +310,9 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
     # Same for the TP decode MoE op, whose body this module builds.
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
+    # And the dense fp4 shared-expert fold, which picks the operands and the
+    # path of the fused MoE op.
+    "vllm_torchtpu/layers/adapter/dense_fp4_shared.py",
     # Still listed: on this base `pp_shift.py` is a second caller, so the
     # module stays even though the fused EP op no longer needs it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",
