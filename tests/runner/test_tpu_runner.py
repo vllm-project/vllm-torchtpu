@@ -4254,6 +4254,148 @@ def test_truncate_rope_caches_keeps_speculative_slack(monkeypatch):
     )
 
 
+def test_precompile_timed_and_sample_tokens_share_dynamo_trace():
+    """A graph traced inside _precompile_timed is reused by sample_tokens.
+
+    Both run under no_grad even when the caller has grad enabled, so Dynamo's
+    grad mode guard matches and the graph is not traced again.
+    """
+    from torch._dynamo.testing import CompileCounter
+
+    counter = CompileCounter()
+    compiled_add = torch.compile(lambda x: x + 1, backend=counter, fullgraph=True)
+    x = torch.zeros(4)
+    grad_states = []
+    runner = SimpleNamespace(
+        execute_model_state=None,
+        _pp_is_last=False,
+        _sample_tokens_pp_intermediate_stage=lambda: (
+            grad_states.append(torch.is_grad_enabled()),
+            compiled_add(x),
+        )[-1],
+        _update_num_xla_graphs=lambda _name: None,
+    )
+    with torch.enable_grad():
+        with TPUModelRunner._precompile_timed(runner, "test_pass"):
+            assert not torch.is_grad_enabled()
+            compiled_add(x)
+        TPUModelRunner.sample_tokens(runner, None)
+        assert torch.is_grad_enabled()
+    assert grad_states == [False]
+    assert counter.frame_count == 1
+
+
+def test_precompile_substitute_placeholder_token_matches_2d_sampled_tokens(monkeypatch):
+    """_precompile_substitute_placeholder_token warms [num_reqs, 1] int64
+    next_tokens matching selected_token_ids parked by non-spec sample_tokens,
+    so _apply_async_token_substitution reuses the trace with no view or recompile.
+    """
+    from torch._dynamo.testing import CompileCounter
+
+    from vllm_torchtpu.runner import tpu_runner as tpu_runner_mod
+
+    counter = CompileCounter()
+    orig_fn = tpu_runner_mod._substitute_placeholder_token._torchdynamo_orig_callable
+    compiled_sub = torch.compile(
+        orig_fn, backend=counter, fullgraph=True, dynamic=False
+    )
+    monkeypatch.setattr(tpu_runner_mod, "_substitute_placeholder_token", compiled_sub)
+    monkeypatch.setattr(tpu_runner_mod, "synchronize_tensors", lambda _out: None)
+
+    runner = SimpleNamespace(
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        num_reqs_paddings=[8],
+        num_tokens_paddings=[16],
+        _is_async_drafter=False,
+        speculative_config=None,
+        max_num_reqs=8,
+        device=torch.device("cpu"),
+        _fast_token_substitution=False,
+        _update_num_xla_graphs=lambda _name: None,
+    )
+    runner._precompile_timed = TPUModelRunner._precompile_timed.__get__(runner)
+
+    with torch.enable_grad():
+        TPUModelRunner._precompile_substitute_placeholder_token(runner)
+        assert counter.frame_count == 1
+
+        selected = torch.tensor(
+            [[101], [202], [0], [0], [0], [0], [0], [0]], dtype=torch.int64
+        )
+        runner._pre_async_results = SimpleNamespace(next_tokens_tpu=selected)
+        input_ids = torch.zeros(16, dtype=torch.int32)
+        input_ids[0] = -1
+        input_ids[5] = -1
+        with torch.no_grad():
+            out = TPUModelRunner._apply_async_token_substitution(
+                runner,
+                input_ids,
+                np.array([0, 5], dtype=np.int32),
+                np.array([0, 1], dtype=np.int32),
+            )
+
+    assert counter.frame_count == 1
+    assert int(out[0].item()) == 101
+    assert int(out[5].item()) == 202
+
+
+def test_load_model_eagerly_initializes_sampling_generator_before_transfers(
+    monkeypatch,
+):
+    """load_model allocates and seeds _sampling_generator before weight loading
+    so Step 0's sample_tokens never calls THPGenerator_pynew while async H2D
+    transfers from _prepare_inputs are in flight.
+    """
+    from vllm_torchtpu.runner import tpu_runner as tpu_runner_mod
+
+    events: list[str] = []
+    real_device = torch.device
+
+    # CPU-only CI runs without torch_tpu registering the "tpu" device backend.
+    monkeypatch.setattr(
+        torch,
+        "device",
+        lambda dev, *args, **kwargs: (
+            real_device("cpu") if dev == "tpu" else real_device(dev, *args, **kwargs)
+        ),
+    )
+
+    class _StopAfterModelLoad(RuntimeError):
+        pass
+
+    def spy_get_sampling_generator(self):
+        events.append("init_sampling_generator")
+        return TPUModelRunner._get_sampling_generator(self)
+
+    def fake_get_tpu_quantization_config(_vllm_config):
+        events.append("get_tpu_quantization_config")
+        raise _StopAfterModelLoad
+
+    monkeypatch.setattr(
+        tpu_runner_mod,
+        "get_tpu_quantization_config",
+        fake_get_tpu_quantization_config,
+    )
+
+    runner = SimpleNamespace(
+        device_config=SimpleNamespace(device=real_device("cpu")),
+        device=real_device("cpu"),
+        vllm_config=SimpleNamespace(device_config=None, quant_config=None),
+        model_config=SimpleNamespace(quantization=None, seed=42),
+        is_pooling_model=False,
+        _sampling_generator=None,
+    )
+    runner._get_sampling_generator = spy_get_sampling_generator.__get__(runner)
+
+    with pytest.raises(_StopAfterModelLoad):
+        TPUModelRunner.load_model(runner)
+
+    assert events == ["init_sampling_generator", "get_tpu_quantization_config"]
+    assert isinstance(runner._sampling_generator, torch.Generator)
+    assert runner._sampling_generator.initial_seed() == 42
+    assert TPUModelRunner._get_sampling_generator(runner) is runner._sampling_generator
+
+
 class TestLogitsAtDpVocabRows:
     """TPU_DP_VOCAB_PARALLEL: every logits batch reaches the compiled logits
     program at the step's DP-wide request bucket, padded and sliced outside

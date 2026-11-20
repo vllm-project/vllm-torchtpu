@@ -266,3 +266,33 @@ def test_disabled_paths_do_not_touch_the_cache(check, eager, monkeypatch):
         torch, "tpu", SimpleNamespace(_get_cache_stats=boom), raising=False
     )
     runner._update_num_xla_graphs("init")
+
+
+def test_a_dynamo_retrace_is_reported_when_the_xla_cache_did_not_grow(monkeypatch):
+    """What the XLA counter alone cannot show.
+
+    After a guard miss Dynamo traces the function again and the backend reuses
+    the cached XLA program, so no XLA entry appears for the retrace.
+    """
+    dynamo_stats = torch._dynamo.utils.counters["stats"]
+    monkeypatch.setitem(dynamo_stats, "unique_graphs", 5)
+    runner = make_runner()
+    set_cache(monkeypatch, [entry(0, read_count=3)])
+    capture(runner, "init")
+
+    monkeypatch.setitem(dynamo_stats, "unique_graphs", 7)
+    text = capture(runner, "decoding_step")
+
+    assert "Dynamo traced 2 graphs since the last check (7 in total)" in text
+    assert "No new compiled graphs" in text
+
+
+def test_no_dynamo_report_without_a_new_trace(monkeypatch):
+    monkeypatch.setitem(torch._dynamo.utils.counters["stats"], "unique_graphs", 5)
+    runner = make_runner()
+    set_cache(monkeypatch, [entry(0, read_count=3)])
+    capture(runner, "init")
+
+    text = capture(runner, "decoding_step")
+
+    assert "Dynamo traced" not in text

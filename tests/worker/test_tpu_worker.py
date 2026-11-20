@@ -624,29 +624,12 @@ def test_kv_connector_handshake_metadata_uses_pp_tp_rank_key(
     assert worker.get_kv_connector_handshake_metadata() == {(2, 3): metadata}
 
 
-def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
-    events = []
-    config = object()
-    monkeypatch.setattr(
-        patch_registry, "apply", lambda stage, **kwargs: events.append((stage, kwargs))
-    )
-    monkeypatch.setattr(
-        "vllm_torchtpu.worker.tpu_worker._release_free_host_heap",
-        lambda: events.append("release"),
-    )
-    worker = SimpleNamespace(
-        model_config=config,
-        model_runner=SimpleNamespace(load_model=lambda: events.append("load")),
-    )
-    TPUWorker.load_model(worker)
-    assert events == [("model_load", {"model_config": config}), "load", "release"]
-
-
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])
-@pytest.mark.parametrize("speculative", [False, True])
-def test_warmup_restores_runtime_threads_without_overriding_user_choice(
-    monkeypatch, managed_by_vllm, runtime_threads, speculative
+def test_load_model_patches_loads_releases_then_sets_runtime_threads(
+    monkeypatch, managed_by_vllm, runtime_threads
 ):
+    """Weights load at the startup thread count. The serving count is set
+    after that, and a user's own OMP_NUM_THREADS is left as it is."""
     from vllm.utils.torch_utils import OMP_NUM_THREADS_SET_BY_VLLM
 
     monkeypatch.setenv("OMP_NUM_THREADS", "2")
@@ -654,37 +637,85 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
         monkeypatch.setenv(OMP_NUM_THREADS_SET_BY_VLLM, "1")
     else:
         monkeypatch.delenv(OMP_NUM_THREADS_SET_BY_VLLM, raising=False)
-
-    warmup_threads = []
-
-    def capture_model():
-        warmup_threads.append(torch.get_num_threads())
-
+    events = []
+    config = object()
+    monkeypatch.setattr(
+        patch_registry, "apply", lambda stage, **kwargs: events.append((stage, kwargs))
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker._release_free_host_heap",
+        lambda: events.append(("release", torch.get_num_threads())),
+    )
     worker = SimpleNamespace(
-        model_runner=SimpleNamespace(capture_model=capture_model),
-        compilation_config=SimpleNamespace(compilation_time=0.0),
-        speculative_config=object() if speculative else None,
+        model_config=config,
+        model_runner=SimpleNamespace(
+            load_model=lambda: events.append(("load", torch.get_num_threads()))
+        ),
     )
     previous_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(2)
-        with (
-            patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap") as freeze,
-            patch(
-                "vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"
-            ) as gc_debug,
-        ):
-            result = TPUWorker.compile_or_warm_up_model(worker)
-        freeze.assert_called_once_with()
-        gc_debug.assert_called_once_with()
-        # Speculative decoding warms up at the serving thread count; other
-        # models keep the startup count during warm-up.
-        assert warmup_threads == [runtime_threads if speculative else 2]
+        TPUWorker.load_model(worker)
+        assert events == [
+            ("model_load", {"model_config": config}),
+            ("load", 2),
+            ("release", 2),
+        ]
         assert torch.get_num_threads() == runtime_threads
-        assert result.language_model == worker.compilation_config.compilation_time
-        assert result.encoder == 0.0
     finally:
         torch.set_num_threads(previous_threads)
+
+
+def test_warmup_freezes_heap_and_reports_compilation_time():
+    capture_model = MagicMock()
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(capture_model=capture_model),
+        compilation_config=SimpleNamespace(compilation_time=0.0),
+    )
+    with (
+        patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap") as freeze,
+        patch(
+            "vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"
+        ) as gc_debug,
+    ):
+        result = TPUWorker.compile_or_warm_up_model(worker)
+    capture_model.assert_called_once_with()
+    freeze.assert_called_once_with()
+    gc_debug.assert_called_once_with()
+    assert result.language_model == worker.compilation_config.compilation_time
+    assert result.encoder == 0.0
+
+
+def test_precompile_timed_and_execute_dummy_batch_share_dynamo_trace():
+    """A graph traced inside _precompile_timed is reused by an idle DP step.
+
+    Both run under no_grad even when the caller has grad enabled, so Dynamo's
+    grad mode guard matches and the graph is not traced again.
+    """
+    from torch._dynamo.testing import CompileCounter
+
+    counter = CompileCounter()
+    compiled_add = torch.compile(lambda x: x + 1, backend=counter, fullgraph=True)
+    x = torch.zeros(4)
+    grad_states = []
+
+    def _run_dp_idle_pairing(_bucket, _num_chunks):
+        grad_states.append(torch.is_grad_enabled())
+        compiled_add(x)
+
+    runner = SimpleNamespace(
+        _dp_coordinated_step=lambda *_args: (16, 1),
+        _run_dp_idle_pairing=_run_dp_idle_pairing,
+        _update_num_xla_graphs=lambda _name: None,
+    )
+    with torch.enable_grad():
+        with TPUModelRunner._precompile_timed(runner, "test_pass"):
+            assert not torch.is_grad_enabled()
+            compiled_add(x)
+        TPUWorker.execute_dummy_batch(SimpleNamespace(model_runner=runner))
+        assert torch.is_grad_enabled()
+    assert grad_states == [False]
+    assert counter.frame_count == 1
 
 
 def test_real_patch_entrypoints_in_spawned_processes():
