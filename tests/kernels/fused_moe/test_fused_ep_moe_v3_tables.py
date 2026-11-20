@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Fused EP MoE v3's shard-tables kernel (``routing_tables_kernel``), run in
-TPU interpret mode on CPU, one shard at a time with the shard's index as an
-operand.
+TPU interpret mode on CPU (the tables it zeroes on a TPU7x chip too), one
+shard at a time with the shard's index as an operand.
 
 The kernel reads three tables (block offsets, packed shifts and expert bases)
 back through a one-hot matmul as three biased bytes, which are exact only in
@@ -37,8 +37,6 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.fused_moe.v3 import routing_tables as tables
 from vllm_torchtpu.kernels.fused_moe.v3 import routing_tables_kernel as kernel
 
-pytestmark = pytest.mark.cpu_test
-
 LANES = 128
 ROW_BLOCK = 8
 
@@ -59,6 +57,27 @@ def interpret(monkeypatch):
         yield
 
 
+@pytest.fixture(
+    params=[
+        pytest.param("interpret", marks=pytest.mark.cpu_test),
+        pytest.param("tpu", marks=pytest.mark.tpu_test),
+    ]
+)
+def interpret_or_chip(request, monkeypatch):
+    """Whether the kernel runs in TPU interpret mode on CPU (True) or on the
+    TPU chip (False)."""
+    if request.param == "tpu":
+        yield False
+        return
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    monkeypatch.setattr(tpu_info, "get_tpu_info", _tpu7x)
+    with (
+        jax.default_device(jax.devices("cpu")[0]),
+        pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()),
+    ):
+        yield True
+
+
 def _bounds(num_shards, num_experts, tokens, top_k, tile_rows, distinct=True):
     """check_lookup_range's arguments for a call of `tokens` per shard."""
     pairs = tokens * top_k
@@ -75,6 +94,7 @@ def _bounds(num_shards, num_experts, tokens, top_k, tile_rows, distinct=True):
     )
 
 
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("tokens", [32, 256, 1024, 4096])
 def test_the_qwen35_decode_shapes_are_in_range(tokens):
     """EP8, 512 experts, top-k 10, tile 128 (the Qwen3.5-397B decode legs, at
@@ -82,6 +102,7 @@ def test_the_qwen35_decode_shapes_are_in_range(tokens):
     kernel.check_lookup_range(**_bounds(8, 512, tokens, 10, 128))
 
 
+@pytest.mark.cpu_test
 def test_a_wide_mesh_is_refused():
     """EP32, 256 experts, top-k 8, 2048 tokens per shard, tile 32: the last
     shard's expert base is about 31 * 526,112, past the biased range."""
@@ -91,6 +112,7 @@ def test_a_wide_mesh_is_refused():
         kernel.check_lookup_range(**bounds)
 
 
+@pytest.mark.cpu_test
 def test_routing_without_distinct_experts_has_the_wider_bound():
     """A shard that may send all its pairs to one expert (a caller's routing)
     shifts arrival rows by up to (shards - 1) * pairs: at EP8 and 1024 tokens
@@ -100,6 +122,7 @@ def test_routing_without_distinct_experts_has_the_wider_bound():
         kernel.check_lookup_range(**_bounds(8, 512, 1024, 10, 128, distinct=False))
 
 
+@pytest.mark.cpu_test
 def test_the_shard_index_is_read_from_the_axis_the_peers_are_addressed_on():
     """Without a shard_index operand the kernel reads the shard's index from
     `axis`, and its hosted transport addresses the peers on MESH_AXIS: any
@@ -139,7 +162,7 @@ def _messages(unrouted=0, seed=0):
     return jnp.asarray(pairs.reshape(SHARDS, -1, LANES)), pairs
 
 
-def _shard_tables(messages, shard, routed_rows_per_shard):
+def _shard_tables(messages, shard, routed_rows_per_shard, interpret=True, **kwargs):
     pairs_per_shard = TOKENS * TOP_K
     return kernel.shard_tables_kernel(
         messages,
@@ -151,9 +174,10 @@ def _shard_tables(messages, shard, routed_rows_per_shard):
         row_block=ROW_BLOCK,
         slot_field=tables.alignment_slot_field(SHARDS),
         axis="d",
-        interpret=True,
+        interpret=interpret,
         shard_index=jnp.asarray([shard], jnp.int32),
         pairs_per_expert=TOKENS,
+        **kwargs,
     )
 
 
@@ -174,6 +198,7 @@ def low_edge_lookup(monkeypatch):
     return edge
 
 
+@pytest.mark.cpu_test
 def test_the_check_admits_exact_calls_only(interpret, low_edge_lookup):
     """The most routed rows per shard the check admits (the edge over the
     shard count): every pair of shard 1's experts keeps its routed row."""
@@ -186,6 +211,7 @@ def test_the_check_admits_exact_calls_only(interpret, low_edge_lookup):
         _shard_tables(messages, 1, routed_rows + TILE)
 
 
+@pytest.mark.cpu_test
 def test_the_check_refuses_the_call_the_lookup_would_corrupt(
     interpret, low_edge_lookup, monkeypatch
 ):
@@ -202,6 +228,7 @@ def test_the_check_refuses_the_call_the_lookup_would_corrupt(
     assert _own_pairs_dropped(routed_row, pairs, 1, routed_rows) == owned > 0
 
 
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("unrouted", [0, 17], ids=["all_routed", "unrouted_tokens"])
 def test_shard_tables_match_the_reference(interpret, unrouted):
     """Every table the kernel emits for each shard, against routing_tables'
@@ -257,3 +284,44 @@ def test_shard_tables_match_the_reference(interpret, unrouted):
             np.asarray(tables.visit_order(want_rows, EXPERTS // SHARDS)),
         )
         np.testing.assert_array_equal(np.asarray(run_rows), np.asarray(ref.run_rows))
+
+
+# The shard-tables call also zeroes the scatter's token and scale tables, a
+# block per grid step. This world's call has 5 steps (2 groups of 8 blocks of
+# 128 pairs, twice, and one more).
+ZERO_WORDS_PER_STEP = 1024
+
+
+@pytest.mark.parametrize(
+    "zero_tables",
+    [(896, 3200), (12_800,)],
+    ids=["one_block_and_four", "past_the_steps"],
+)
+def test_the_tables_to_zero_come_back_zero(interpret_or_chip, zero_tables):
+    """Every word of each table comes back zero. At 1024 words a step, an
+    896-word table is one ragged block and a 3200-word table four blocks, the
+    last ragged; a 12,800-word table would need 13 such blocks, more than the
+    grid's 5 steps, so it is zeroed in 3072-word blocks, the last ragged."""
+    messages, _ = _messages()
+    routed_rows = tables.routed_rows_bound(SHARDS * TOKENS, TOP_K, EXPERTS, TILE)
+    outs = _shard_tables(
+        messages,
+        0,
+        routed_rows,
+        interpret=interpret_or_chip,
+        zero_tables=zero_tables,
+        zero_words_per_step=ZERO_WORDS_PER_STEP,
+    )
+    zeroed = outs[8:]
+    assert [tuple(z.shape) for z in zeroed] == [(n,) for n in zero_tables]
+    for z in zeroed:
+        np.testing.assert_array_equal(np.asarray(z), 0)
+
+
+@pytest.mark.cpu_test
+def test_more_than_two_tables_to_zero_are_refused():
+    """The call zeroes the scatter's two tables, no more."""
+    messages, _ = _messages()
+    routed_rows = tables.routed_rows_bound(SHARDS * TOKENS, TOP_K, EXPERTS, TILE)
+    with pytest.raises(ValueError, match="3 tables to zero"):
+        _shard_tables(messages, 0, routed_rows, zero_tables=(1024, 1024, 1024))
