@@ -391,9 +391,10 @@ def eager_subtract_programs(monkeypatch):
     return called
 
 
-def _prepare_runner(carry_on):
+def _prepare_runner(carry_on, token_paddings):
     """A batch-1 async MTP decode runner (K=3) on the _prepare_inputs stand-in
-    of the runner tests, its sequence lengths staged on 'TPU'."""
+    of the runner tests, its sequence lengths staged on 'TPU' and its host
+    input ids still holding an earlier step's."""
     from runner_input_test_utils import _make_runner
 
     from vllm_torchtpu.runner.speculative_decoding_manager import (
@@ -405,9 +406,14 @@ def _prepare_runner(carry_on):
         num_computed_tokens=[20],
         prompt_tokens=[20],
         scheduled_tokens=[D],
-        token_paddings=[4, 8, 16],
+        token_paddings=list(token_paddings),
         pcp_size=1,
     )
+    runner.input_ids_cpu += 1000 + torch.arange(
+        len(runner.input_ids_cpu), dtype=torch.int32
+    )
+    # The request's 20 committed tokens and step 0's 1 + K placeholders.
+    runner.input_batch.num_tokens_no_spec = np.array([20 + D], dtype=np.int32)
     runner.scheduler_config.async_scheduling = True
     runner.speculative_config = types.SimpleNamespace(num_speculative_tokens=K)
     runner.spec_decode_manager = SpeculativeDecodingManager(runner)
@@ -427,18 +433,27 @@ def _prepare_runner(carry_on):
     return runner
 
 
-def _results(runner, rejected, step):
+def _results(runner, req_state, rejected, step):
     """The previous step's async results for the one request: `rejected` of its
-    K drafts rejected, its next tokens distinct per step."""
-    from vllm_torchtpu.runner.tpu_runner_async_output import AsyncPreResults
+    K drafts rejected, so its copied-back row holds 1 + K - rejected sampled
+    tokens, and its next tokens distinct per step."""
+    from runner_output_test_utils import _host_copy_state
+
+    from vllm_torchtpu.runner.tpu_runner_async_output import (
+        INVALID_TOKEN_ID,
+        AsyncPreResults,
+    )
 
     bound = runner.max_num_reqs * D
+    row = [500 + 10 * step + j for j in range(D - rejected)]
+    row += [INVALID_TOKEN_ID] * rejected
     pre = AsyncPreResults(
         req_ids=["req0"],
         next_tokens_tpu=torch.arange(bound, dtype=torch.int32) + 100 * step,
-        request_seq_lens=[],
+        request_seq_lens=[(0, req_state, 0, "req0")],
         discard_sampled_tokens_req_indices=[],
         req_id_to_index_copy={"req0": 0},
+        copy_state=_host_copy_state([torch.tensor([row], dtype=torch.int32)], [1]),
         spec_decode_num_rejected_tokens=torch.tensor(
             [rejected] + [0] * (runner.max_num_reqs - 1), dtype=torch.int32
         ),
@@ -448,18 +463,23 @@ def _results(runner, rejected, step):
     return pre
 
 
-def _decode_steps(called, *, carry_on, verify_drafts_at_last_step=True):
+def _decode_steps(
+    called, *, carry_on, verify_drafts_at_last_step=True, token_paddings=(4, 8, 16)
+):
     """Two steady async-spec decode steps through _prepare_inputs, as the
     runner runs them: step N consumes step N-1's results (2 drafts rejected),
-    _modify_prev_results reads that count back, and step N+1 consumes step N's
-    results (1 rejected), the host having advanced by 1 + K - 2. Returns the
-    runner, each step's (seq_lens, position_ids, input_ids, draft_token_ids)
-    and the subtraction programs called per step."""
+    TPUModelRunner._modify_prev_results reads that count back from the copied
+    tokens, and step N+1 consumes step N's results (1 rejected), the host
+    having advanced by 1 + K - 2. Returns the runner, each step's (seq_lens,
+    position_ids, input_ids, draft_token_ids), the subtraction programs called
+    per step, and per readback the number of the results read back and the
+    runner's recorded rejected counts."""
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
-    runner = _prepare_runner(carry_on)
-    outs, calls = [], []
-    pre_prev = _results(runner, rejected=2, step=0)
+    runner = _prepare_runner(carry_on, token_paddings)
+    req_state = types.SimpleNamespace(output_token_ids=[0] * D)
+    outs, calls, recorded = [], [], []
+    pre_prev = _results(runner, req_state, rejected=2, step=0)
     for step, verify in ((1, True), (2, verify_drafts_at_last_step)):
         runner._pre_async_results = pre_prev
         scheduler_output = types.SimpleNamespace(
@@ -479,26 +499,35 @@ def _decode_steps(called, *, carry_on, verify_drafts_at_last_step=True):
             )
         )
         calls.append(list(called))
+        # sample_tokens: roll back the previous step's placeholders (with the
+        # carry on, recording its rejected count), then add this step's.
+        TPUModelRunner._modify_prev_results(runner)
+        recorded.append((pre_prev.decode_carry_seq, runner._decode_carry_rej))
+        runner.input_batch.num_tokens_no_spec[0] += D
+        req_state.output_token_ids += [0] * D
         rejected = int(pre_prev.spec_decode_num_rejected_tokens[0])
-        dc.record_rejected(runner, pre_prev, {"req0": rejected})
-        pre_prev = _results(runner, rejected=1, step=step)
+        pre_prev = _results(runner, req_state, rejected=1, step=step)
         runner.input_batch.num_computed_tokens_cpu[0] += D - rejected
-    return runner, outs, calls
+    return runner, outs, calls, recorded
 
 
 def test_prepare_inputs_carries_a_steady_step_like_the_upload_path(
     eager_subtract_programs,
 ):
-    """With the carry on, the second steady step feeds the previous step's
-    corrected device tensors to the carry program instead of uploading, and
-    its sequence lengths, positions, input ids and drafts equal the upload
+    """With the carry on, _modify_prev_results records each step's rejected
+    count under that step's number, the second steady step feeds the previous
+    step's corrected device tensors to the carry program instead of uploading,
+    and its sequence lengths, positions, input ids and drafts equal the upload
     path's."""
-    upload, upload_outs, upload_calls = _decode_steps(
+    upload, upload_outs, upload_calls, upload_rec = _decode_steps(
         eager_subtract_programs, carry_on=False
     )
-    carried, carried_outs, carried_calls = _decode_steps(
+    carried, carried_outs, carried_calls, carried_rec = _decode_steps(
         eager_subtract_programs, carry_on=True
     )
+    assert [rej for _, rej in upload_rec] == [None, None]
+    (seq1, rej1), (seq2, rej2) = carried_rec
+    assert rej1 == (seq1, {"req0": 2}) and rej2 == (seq2, {"req0": 1})
     assert upload_calls == [["_compiled_subtract_and_substitute_draft_token_ids"]] * 2
     assert carried_calls == [
         ["_compiled_subtract_and_substitute_draft_token_ids"],
@@ -517,15 +546,40 @@ def test_prepare_inputs_reuploads_when_the_fused_path_is_not_taken(
     """A carried step whose subtraction does not take the draft-token program
     (no drafts to verify) uploads its inputs after all, matches the upload path
     and clears the carried state."""
-    _, upload_outs, _ = _decode_steps(
+    _, upload_outs, _, _ = _decode_steps(
         eager_subtract_programs, carry_on=False, verify_drafts_at_last_step=False
     )
-    carried, carried_outs, carried_calls = _decode_steps(
+    carried, carried_outs, carried_calls, _ = _decode_steps(
         eager_subtract_programs, carry_on=True, verify_drafts_at_last_step=False
     )
     assert carried_calls[1] == ["_compiled_subtract_and_substitute_placeholder_token"]
     assert carried_outs == upload_outs
     assert carried._decode_carry_state is None
+
+
+def test_a_padded_carried_step_substitutes_every_real_slot_over_zero_padding(
+    eager_subtract_programs,
+):
+    """What makes a carried step equal the upload path, where the step pads
+    (4 tokens in an 8-token bucket) and the host buffer holds an earlier
+    step's ids: every real slot takes its id from the previous step's device
+    tokens (source index above -1, padding sources -1), and the input-id
+    padding is zero on the host and in the carried tensor."""
+    _, upload_outs, _, _ = _decode_steps(
+        eager_subtract_programs, carry_on=False, token_paddings=(8, 16)
+    )
+    carried, carried_outs, carried_calls, _ = _decode_steps(
+        eager_subtract_programs, carry_on=True, token_paddings=(8, 16)
+    )
+    assert carried_calls[1] == [
+        "_compiled_carry_subtract_and_substitute_draft_token_ids"
+    ]
+    destinations, sources = carried._cached_substitution_indices.tolist()
+    assert destinations[:D] == list(range(D))
+    assert min(sources[:D]) >= 0 and sources[D:] == [-1] * (8 - D)
+    assert carried.input_ids_cpu[D:8].tolist() == [0] * (8 - D)
+    assert carried_outs[1][2][D:] == [0] * (8 - D)
+    assert carried_outs == upload_outs
 
 
 @pytest.mark.parametrize(
