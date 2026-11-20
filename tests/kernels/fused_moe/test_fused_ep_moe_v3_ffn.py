@@ -23,10 +23,10 @@ plain JAX against a numpy reference written out step by step, with one
 scale per row and one per 128-value block, for the token rows and the
 intermediate alike and each on its own.
 
-The build reads ``layout.SHARD_INDEX_OPERAND``: in the torch bridge's mode
-the shard's index is one more scalar-prefetch operand. The memoized build
-must key on it, or a process that builds in one mode and calls in the other
-gets a program with the wrong operand list.
+The build's ``shard_index_operand`` form (the torch bridge's) takes the
+shard's index as one more scalar-prefetch operand. The memoized build must
+key on it, or a process that builds in one form and calls in the other gets
+a program with the wrong operand list.
 
 On TPU the built kernel runs over the two cores of one chip, one shard each,
 on routing tables from ``routing_tables``' reference passes: every routed
@@ -83,16 +83,13 @@ def tpu7x(monkeypatch):
 
 
 @pytest.mark.cpu_test
-def test_a_build_is_reused_within_its_operand_mode_only(tpu7x, monkeypatch):
-    monkeypatch.setattr(layout, "SHARD_INDEX_OPERAND", False)
-    own_mode = ffn_kernel.ffn_kernel(**BUILD)
-    assert ffn_kernel.ffn_kernel(**BUILD) is own_mode
-    monkeypatch.setattr(layout, "SHARD_INDEX_OPERAND", True)
-    operand_mode = ffn_kernel.ffn_kernel(**BUILD)
-    assert operand_mode is not own_mode
-    assert ffn_kernel.ffn_kernel(**BUILD) is operand_mode
-    monkeypatch.setattr(layout, "SHARD_INDEX_OPERAND", False)
-    assert ffn_kernel.ffn_kernel(**BUILD) is own_mode
+@pytest.mark.parametrize("first", [False, True], ids=["own_first", "operand_first"])
+def test_a_build_is_reused_within_its_operand_form_only(tpu7x, first):
+    built = {}
+    for form in (first, not first, first, not first):
+        run = ffn_kernel.ffn_kernel(**BUILD, shard_index_operand=form)
+        assert built.setdefault(form, run) is run
+    assert built[False] is not built[True]
 
 
 # ---- the per-expert arithmetic, against numpy ----
