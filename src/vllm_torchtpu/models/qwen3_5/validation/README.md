@@ -54,11 +54,7 @@ change that adds the capability removes it from that list. The entry tests
 check that this tree's `envs.py` accepts every other environment value. A leg
 run here without the listed values uses fused EP MoE v2 and main's
 permutation placement, so the `record` numbers are not expected to
-reproduce on this tree. The record run's TP8 + DCP4 decode legs also took
-their KV cache size from a budget the record tree's config hook calibrated
-with fused EP MoE v3 (their `serve_args` pass no `--kv-cache-memory-bytes`);
-the change that adds v3 adds that budget, and until then those legs size
-their KV cache by `--gpu-memory-utilization`.
+reproduce on this tree.
 
 ## Reading a gate entry
 
