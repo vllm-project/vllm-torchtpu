@@ -346,3 +346,93 @@ def test_data_parallel_engine_core_is_unchanged(engine_core, monkeypatch):
     data_parallel = sys.modules["vllm.v1.engine.core"].DPEngineCoreProc
     core = data_parallel()
     assert core.step_fn == core.step_with_batch_queue
+
+
+@pytest.fixture
+def real_engine_core(monkeypatch):
+    """vLLM's EngineCore with its __init__ and the patch flag restored after
+    the test."""
+    core_module = pytest.importorskip("vllm.v1.engine.core")
+    engine_core = core_module.EngineCore
+    monkeypatch.setattr(engine_core, "__init__", engine_core.__init__)
+    monkeypatch.setattr(engine_core, "_tpu_deferred_step_patch", False, raising=False)
+    monkeypatch.setattr(deferred_step.envs, "TPU_DEFER_STEP", True, raising=False)
+    return core_module
+
+
+def test_real_engine_core_classes_keep_what_the_patch_uses(real_engine_core):
+    import inspect
+
+    engine_core = real_engine_core.EngineCore
+    engine_core_proc = real_engine_core.EngineCoreProc
+    assert issubclass(engine_core_proc, engine_core)
+    assert issubclass(real_engine_core.DPEngineCoreProc, engine_core_proc)
+    step = inspect.getsource(engine_core.step_with_batch_queue)
+    for name in (
+        "self.batch_queue",
+        "self.scheduler.schedule(",
+        "self.scheduler.update_from_output(",
+        "self.model_executor.sample_tokens(",
+    ):
+        assert name in step
+    init = inspect.getsource(engine_core.__init__)
+    for name in (
+        "self.batch_queue_size",
+        "self.is_pooling_model",
+        "self.step_fn",
+        "self.step_with_batch_queue",
+    ):
+        assert name in init
+    assert "self.input_queue = queue.Queue" in inspect.getsource(
+        engine_core_proc.__init__
+    )
+
+
+def _real_core(cls, batch_queue_size=2):
+    core = cls.__new__(cls)
+    core.batch_queue_size = batch_queue_size
+    core.batch_queue = deque(maxlen=batch_queue_size)
+    core.is_pooling_model = False
+    core.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1)
+    )
+    core.scheduler = SimpleNamespace(schedule=None, update_from_output=None)
+    core.model_executor = SimpleNamespace(sample_tokens=None)
+    return core
+
+
+def test_patch_installs_once_on_the_real_engine_core(real_engine_core, monkeypatch):
+    engine_core = real_engine_core.EngineCore
+    state = {}
+
+    def init(self, *args, **kwargs):
+        self.__dict__.update(state["core"].__dict__)
+        self.step_fn = self.step_with_batch_queue
+
+    monkeypatch.setattr(engine_core, "__init__", init)
+    deferred_step.patch_engine_core_deferred_step()
+    patched = engine_core.__init__
+    deferred_step.patch_engine_core_deferred_step()
+    assert engine_core.__init__ is patched is not init
+
+    for cls, installed in (
+        (real_engine_core.EngineCoreProc, True),
+        (real_engine_core.DPEngineCoreProc, False),
+        (engine_core, False),
+    ):
+        state["core"] = _real_core(cls)
+        core = cls.__new__(cls)
+        engine_core.__init__(core)
+        stepper = getattr(core.step_fn, "__self__", None)
+        assert isinstance(stepper, deferred_step.DeferredStepper) is installed
+        assert (core.step_fn == core.step_with_batch_queue) is not installed
+
+
+def test_blocker_on_the_real_engine_core_classes(real_engine_core):
+    blocker = deferred_step._blocker
+    assert blocker(_real_core(real_engine_core.EngineCoreProc)) is None
+    assert "in-process" in blocker(_real_core(real_engine_core.EngineCore))
+    assert "data parallelism" in blocker(_real_core(real_engine_core.DPEngineCoreProc))
+    assert "two steps" in blocker(
+        _real_core(real_engine_core.EngineCoreProc, batch_queue_size=1)
+    )
