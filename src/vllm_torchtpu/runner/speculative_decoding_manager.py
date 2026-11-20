@@ -370,8 +370,9 @@ class SpeculativeDecodingManager:
                         padded_logits_length,
                     ),
                 )
-            # draft_token_ids depends on this step's input_ids_cpu content —
-            # always re-extracted; uploaded unless deferred.
+            # draft_token_ids depends on this step's input_ids_cpu content:
+            # always re-extracted and uploaded (the deferred case returned
+            # above).
             all_token_ids = self.runner.input_ids_cpu.numpy()
             draft_token_ids = all_token_ids[draft_input_indices]
             padded_draft_token_ids = np.zeros(padded_logits_length, dtype=np.int32)

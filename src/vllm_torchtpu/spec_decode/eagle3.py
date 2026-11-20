@@ -1747,7 +1747,9 @@ class Eagle3Proposer:
                 ``[total_reqs]`` device tensor of the just-sampled tokens.
 
         Returns (sync) a list of length num_reqs, each inner list holding K
-        draft tokens; or (return_device) the ``[num_reqs, K]`` device tensor.
+        draft tokens; or (return_device) the ``[num_reqs, K]`` device tensor,
+        or chunk 0's whole padded ``[p, K]`` block when the runner set
+        ``_skip_next_multi_chunk_draft_cat``.
         """
         runner = self.runner
         self._draft_md_cache.clear()

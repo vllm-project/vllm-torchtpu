@@ -1136,7 +1136,7 @@ class TPUModelRunner(GPUModelRunner):
         """The bucketed Eagle3 drafter's padded per-chunk drafts when ``drafts``
         is its last device output and it has one padded block per chunk, else
         None (another drafter, or drafts from elsewhere)."""
-        drafter = getattr(self, "drafter", None)
+        drafter = self.drafter
         if (
             not isinstance(drafter, Eagle3Proposer)
             or drafts is not drafter._last_propose_device_out
@@ -4894,9 +4894,9 @@ class TPUModelRunner(GPUModelRunner):
         async_spec_max_rejected = 0
         qx_sub_mask = None
         sub_pairs: tuple[tuple[int | None, int], ...] | None = None
-        _pending_rejected_sub: (
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
-        ) = None
+        pending_rejected_sub: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = (
+            None
+        )
         self._fused_async_subst_done = False
         if (
             self.scheduler_config.async_scheduling
@@ -4957,7 +4957,7 @@ class TPUModelRunner(GPUModelRunner):
                 seq_idx_dev = torch.from_numpy(seq_idx_np).to(self.device)
                 pos_idx_dev = torch.from_numpy(pos_idx_np).to(self.device)
                 sub_cache[sub_key] = (seq_idx_dev, pos_idx_dev, qx_sub_mask)
-            _pending_rejected_sub = (
+            pending_rejected_sub = (
                 self._pre_async_results.spec_decode_num_rejected_tokens,
                 seq_idx_dev,
                 pos_idx_dev,
@@ -5013,7 +5013,7 @@ class TPUModelRunner(GPUModelRunner):
                         )
                     )
 
-        if _pending_rejected_sub is not None:
+        if pending_rejected_sub is not None:
             from vllm_torchtpu.runner.tpu_runner_async_output import (
                 _compiled_subtract_and_substitute_draft_token_ids,
                 _compiled_subtract_and_substitute_placeholder_token,
@@ -5021,8 +5021,8 @@ class TPUModelRunner(GPUModelRunner):
                 subtract_num_rejected_tokens,
             )
 
-            num_rejected_dev, seq_idx_dev, pos_idx_dev = _pending_rejected_sub
-            # _pending_rejected_sub comes from the previous step's results.
+            num_rejected_dev, seq_idx_dev, pos_idx_dev = pending_rejected_sub
+            # pending_rejected_sub comes from the previous step's results.
             pre_async = self._pre_async_results
             assert pre_async is not None
             if seq_lens.device.type == "tpu":
@@ -9451,11 +9451,8 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         knr_buckets = {self.num_reqs_max_model_len}
-        num_reqs_most = getattr(self, "num_reqs_most_model_len", None)
-        if (
-            getattr(self, "most_model_len", None) is not None
-            and num_reqs_most is not None
-        ):
+        num_reqs_most = self.num_reqs_most_model_len
+        if self.most_model_len is not None and num_reqs_most is not None:
             knr_buckets.add(num_reqs_most)
         bound = self.max_num_reqs * (1 + k)
         req_loop_pairs, two_chunk_pairs = _async_spec_assembly_shapes(self)
@@ -10515,8 +10512,8 @@ class TPUModelRunner(GPUModelRunner):
                         w
                         for w in (
                             *self.num_reqs_paddings,
-                            getattr(self, "num_reqs_max_model_len", None),
-                            getattr(self, "num_reqs_most_model_len", None),
+                            self.num_reqs_max_model_len,
+                            self.num_reqs_most_model_len,
                         )
                         if w is not None
                     }

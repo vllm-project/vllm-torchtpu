@@ -161,7 +161,7 @@ def _verify_outputs(num_reqs: list[int], tpu_typed: bool):
 
 
 def _runner(
-    drafter: Eagle3Proposer, draft_tp: int = 2, kv_role: str | None = None
+    drafter: Eagle3Proposer, draft_tp: int = 2, kv_producer: bool = False
 ) -> TPUModelRunner:
     runner = object.__new__(TPUModelRunner)
     runner.device = torch.device("cpu")
@@ -174,9 +174,7 @@ def _runner(
     )
     runner._pp_is_last = True
     runner.vllm_config = SimpleNamespace(
-        kv_transfer_config=None
-        if kv_role is None
-        else SimpleNamespace(is_kv_producer=kv_role != "kv_consumer")
+        kv_transfer_config=SimpleNamespace(is_kv_producer=True) if kv_producer else None
     )
     runner.drafter = drafter
     runner._adaptive_verification = None
@@ -307,7 +305,7 @@ def test_the_concat_stays_where_nothing_takes_each_chunks_drafts(monkeypatch, ca
     runner = _runner(
         drafter,
         draft_tp=1 if case == "replicated_draft" else 2,
-        kv_role="kv_producer" if case == "kv_producer_fencing_its_kv_writes" else None,
+        kv_producer=case == "kv_producer_fencing_its_kv_writes",
     )
     if case == "kv_producer_fencing_its_kv_writes":
         monkeypatch.setattr(
