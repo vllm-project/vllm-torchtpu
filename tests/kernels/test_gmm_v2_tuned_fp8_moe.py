@@ -64,11 +64,19 @@ def _tiles(rows, k, n, groups, fuse_act):
 
 # rows, (k, n), groups, fuse_act, default tiles, tuned tiles. Qwen3-30B-A3B's
 # gate/up projection at TP8 (128 experts, 2 x 128 padded columns) for 16 and
-# 64 tokens; Qwen3.5's gate/up at 80 expert slots for 8 tokens (a table entry).
+# 64 tokens (fewer than 32 rows per group: 2 buckets); the same shapes at 64
+# groups with 64 rows per group (4 buckets) and with 200 rows per group, fused
+# (8 buckets) and not (tile_m doubled); Qwen3.5's gate/up at 80 expert slots
+# for 8 tokens and its down projection at 64 slots for 16 tokens (one entry of
+# each tuned table).
 CASES = [
     (128, (2048, 256), 128, "silu", (128, 2048, 128, 128), (128, 2048, 128, 64)),
     (512, (2048, 256), 128, "silu", (512, 2048, 128, 128), (128, 2048, 128, 64)),
+    (4096, (2048, 256), 64, None, (512, 2048, 256, 128), (256, 2048, 256, 64)),
+    (12800, (2048, 256), 64, "silu", (512, 2048, 128, 128), (512, 2048, 128, 64)),
+    (12800, (2048, 256), 64, None, (512, 2048, 256, 128), (512, 2048, 256, 128)),
     (80, (4096, 2048), 80, "silu", (80, 4096, 1024, 80), (64, 4096, 1024, 16)),
+    (160, (1024, 4096), 64, None, (128, 1024, 4096, 128), (64, 1024, 4096, 32)),
 ]
 
 
@@ -96,6 +104,22 @@ def test_on_takes_the_tuned_tiles_and_hoists_the_scale(
     # One per-channel rhs block spans the k tile, which holds several 512-wide
     # lhs blocks: the case where the hoist changes the bf16 rounding.
     assert hoist is True
+
+
+@pytest.mark.parametrize(
+    "table",
+    [gmm_v2._FP8_MOE_GMM1_TILES, gmm_v2._FP8_MOE_GMM2_TILES],
+    ids=["gmm1", "gmm2"],
+)
+def test_every_tuned_table_entry_is_a_row_count_gmm_v2_passes(table):
+    """gmm_v2 pads the bf16 rows to their sublane tile before it asks for tiles,
+    and an entry's bucket base must cover that tile, so a key that is not a
+    multiple of it, or a smaller bucket base, could never be selected."""
+    sublane = gmm_v2.pltpu.get_tpu_info().get_sublane_tiling(jnp.bfloat16)
+    assert sublane == 16
+    for rows, (tile_m, bucket_base) in table.items():
+        assert gmm_v2.align_to(rows, sublane) == rows
+        assert bucket_base >= sublane and tile_m <= rows
 
 
 def test_set_tuned_fp8_moe_switches_it(monkeypatch):
