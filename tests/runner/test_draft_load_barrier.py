@@ -78,7 +78,9 @@ def test_the_world_group_gets_the_cpu_timeout_only_when_set(seconds):
 
 def test_init_device_hands_the_timeout_to_the_world_group():
     """init_device passes the helper's arguments to init_distributed_environment;
-    without them the world group falls back to gloo's 30 min."""
+    without them the world TCPStore keeps torch's 30 min default. The world
+    group's gloo cpu_group takes its timeout from the vLLM config either way
+    (the two-rank test below)."""
     source = textwrap.dedent(inspect.getsource(tpu_worker.TPUWorker.init_device))
     calls = [
         node
