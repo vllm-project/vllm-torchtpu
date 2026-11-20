@@ -174,18 +174,20 @@ def _single_device_dcp_mesh(axis_names: tuple[str, str]) -> Any:
 def _dcp_stage_mesh(
     axis_names: tuple[str, str], shape: tuple[int, int], stage_size: int
 ) -> Any:
-    """The ``(lane, DCP)`` mesh over one pipeline stage, built on the stage's
-    TP group so its kernels launch on the stage's devices only."""
+    """The ``(lane, DCP)`` mesh over one pipeline stage, built on the group
+    that spans the stage (the DCP group under PCP x DCP, else the TP group)
+    so its kernels launch on the stage's devices only."""
     from vllm.distributed.parallel_state import get_tp_group
 
-    tp_group = get_tp_group()
-    if int(tp_group.world_size) != stage_size:
-        raise NotImplementedError(
-            "DCP with pipeline parallelism needs a stage made of one TP group: "
-            f"TP={tp_group.world_size}, stage of {stage_size} ranks."
-        )
-    layout = get_cp_group_layout(tp_group)
-    return get_stage_mesh(axis_names, shape, tp_group, layout.device_ids)
+    for group in (get_dcp_group(), get_tp_group()):
+        if group is not None and int(group.world_size) == stage_size:
+            layout = get_cp_group_layout(group)
+            return get_stage_mesh(axis_names, shape, group, layout.device_ids)
+    raise NotImplementedError(
+        "DCP with pipeline parallelism needs a stage made of one DCP or TP "
+        f"group: DCP={get_dcp_world_size()}, "
+        f"TP={get_tp_group().world_size}, stage of {stage_size} ranks."
+    )
 
 
 def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
@@ -194,8 +196,9 @@ def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
     The mesh spans the whole world, or this worker's pipeline stage under
     pipeline parallelism, so it carries a leading axis for the TP lanes DCP
     does not shard over. The kernels still collect only over `axis_name`,
-    which gives one independent DCP group per lane. Under `dcp == tp` the shape is `(1, world)` and the
-    device order is the one the single-axis builder used to produce.
+    which gives one independent DCP group per lane. Under `dcp == tp` the
+    shape is `(1, world)` and the device order is the one the single-axis
+    builder used to produce.
 
     The axis name defaults to `DCP_AXIS_NAME`; the kernels take the same
     constant from here, so a caller that overrides it has to override it in
