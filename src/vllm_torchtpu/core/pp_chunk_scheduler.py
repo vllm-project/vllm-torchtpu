@@ -62,13 +62,10 @@ from vllm_torchtpu.core.hybrid_retention import (
 )
 from vllm_torchtpu.core.pp_chunks import StepCostModel, chunk_pairs, step_limit
 from vllm_torchtpu.core.prefix_aware_scheduler import (
-    _TIER_FREE_BLOCK_FIT,
     _TIER_NORMAL,
     _TIER_PREEMPTED,
-    ExternalHitEstimator,
     PrefixAwareScheduler,
     _is_decoding,
-    _wait_seconds,
     memo_local_prefix_cache_hit,
     trim_resend_token_ids,
 )
@@ -87,6 +84,33 @@ SCHEDULER_CLS = "vllm_torchtpu.core.pp_chunk_scheduler.TpuPipelineChunkScheduler
 RETENTION_ARCHITECTURES = frozenset(
     {"Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"}
 )
+
+
+# A request whose uncached blocks fit the free blocks while the head's do not
+# ranks ahead of PrefixAwareScheduler's tiers.
+_TIER_FREE_BLOCK_FIT = _TIER_PREEMPTED - 1
+
+
+def _wait_seconds(request: Any, now: float) -> float:
+    """Seconds since ``request.arrival_time``.
+
+    ``arrival_time`` is the wall-clock time (``time.time()``) at which this
+    engine's API server received the request; on a disaggregated prefill leg
+    that is the proxy's prefill hop. It covers time in the waiting queue and
+    time in ``running``, and does not reset on preemption.
+    """
+    return max(now - request.arrival_time, 0.0)
+
+
+@runtime_checkable
+class ExternalHitEstimator(Protocol):
+    """A KV connector that estimates how many prompt tokens past a request's
+    local hit a lookup would load from its external tier (the Raiden
+    offloading connector and the TPU multi-connector)."""
+
+    def estimate_external_hit_tokens(
+        self, request: Any, num_local_tokens: int
+    ) -> int: ...
 
 
 @runtime_checkable
@@ -150,9 +174,6 @@ class TpuPipelineChunkScheduler(Scheduler):
     _get_prefix_cache_epoch: Any = PrefixAwareScheduler._get_prefix_cache_epoch
     _get_block_size: Any = PrefixAwareScheduler._get_block_size
     _prefix_warmth: Any = PrefixAwareScheduler._prefix_warmth
-    _external_warmth: Any = PrefixAwareScheduler._external_warmth
-    _get_paw_aging_rate: Any = PrefixAwareScheduler._get_paw_aging_rate
-    _now: Any = PrefixAwareScheduler._now
     _select_waiting_queue_for_scheduling: Any = (
         PrefixAwareScheduler._select_waiting_queue_for_scheduling
     )
@@ -210,13 +231,15 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._quadratic_cost = options.quadratic_cost
         self._prefix_aware = options.prefix_aware
         self._paw_aging_tok_per_s = options.paw_aging_tok_per_s
+        # The wall time of the schedule() call in progress (None between
+        # steps), which the prefix-aware ranking ages requests against.
+        self._step_wall_time: float | None = None
         self._srpf_running = options.prefix_aware
         self._promote_waiting = (
             options.prefix_aware
             and scheduler_options.get(self.vllm_config).promote_warmest
         )
-        # The connector's host-tier estimate, read by the borrowed
-        # _external_warmth.
+        # The connector's host-tier estimate, read by _external_warmth.
         self._hit_estimator: ExternalHitEstimator | None = (
             self.connector if isinstance(self.connector, ExternalHitEstimator) else None
         )
@@ -417,6 +440,48 @@ class TpuPipelineChunkScheduler(Scheduler):
             or getattr(request, "num_computed_tokens", 0) > 0
         )
         return (0 if fits_hbm else 1, 0 if started else 1, aged, arrival)
+
+    def _get_paw_aging_rate(self) -> float:
+        """Uncached prompt tokens credited per second a request has waited
+        (option paw_aging_tok_per_s; 0 turns the aging off)."""
+        return float(self._paw_aging_tok_per_s)
+
+    def _now(self) -> float:
+        """The wall time of the schedule() call in progress, so every ranking
+        of a step ages requests against one clock; time.time() between
+        steps."""
+        now = self._step_wall_time
+        return time.time() if now is None else now
+
+    def _external_warmth(self, request: Any, local_warmth: int) -> int:
+        """Prompt tokens past ``local_warmth`` the connector expects to load
+        from its external tier (``_hit_estimator``); 0 on a KV consumer,
+        without an estimating connector, or with less than a block past the
+        local hit. A failing estimate counts as 0; it is logged once per
+        exception type (``warning_once`` keys on the arguments, so the request
+        and the exception text go to the debug log instead)."""
+        if self._is_kv_consumer:
+            return 0
+        estimator = self._hit_estimator
+        if estimator is None:
+            return 0
+        if request.num_tokens - local_warmth < self._get_block_size():
+            return 0
+        try:
+            estimate = estimator.estimate_external_hit_tokens(request, local_warmth)
+            return max(0, int(estimate or 0))
+        except Exception as exc:
+            logger.warning_once(
+                "estimate_external_hit_tokens raised %s; a request whose "
+                "estimate fails is ranked by its local prefix hit only.",
+                type(exc).__name__,
+            )
+            logger.debug(
+                "estimate_external_hit_tokens failed for request %s: %r",
+                request.request_id,
+                exc,
+            )
+            return 0
 
     def _rank_and_warmth(
         self,

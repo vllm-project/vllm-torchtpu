@@ -20,6 +20,7 @@ quadratic pricing (option quadratic_cost) off and on. PrefixAwareScheduler
 does not sort.
 """
 
+import logging
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -28,12 +29,12 @@ import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 
-from vllm_torchtpu.core.pp_chunk_scheduler import TpuPipelineChunkScheduler
-from vllm_torchtpu.core.pp_chunks import StepCostModel
-from vllm_torchtpu.core.prefix_aware_scheduler import (
+from vllm_torchtpu.core.pp_chunk_scheduler import (
     ExternalHitEstimator,
-    PrefixAwareScheduler,
+    TpuPipelineChunkScheduler,
 )
+from vllm_torchtpu.core.pp_chunks import StepCostModel
+from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
 
 BUCKETS = [4096, 8192, 12288, 16384]
 
@@ -91,6 +92,7 @@ def _scheduler(
     prefix-aware admission on; the sort runs on a KV producer."""
     s = TpuPipelineChunkScheduler.__new__(TpuPipelineChunkScheduler)
     s._paw_aging_tok_per_s = float(aging)
+    s._step_wall_time = None
     if window is not None:
         s._PAW_SORT_WINDOW = window
     _waiting(s, requests, warmth)
@@ -120,7 +122,6 @@ def _prefix_aware_scheduler(requests, warmth):
     s._paw_prompt_tokens = 0
     s._paw_scoring_broken = False
     s._is_kv_consumer = False
-    s._hit_estimator = None
     s._kv_prefetch_n = 0
     s._kv_prefetch_cap = None
     s._promote_warmest_switch = True
@@ -295,31 +296,18 @@ class _Estimator:
 
 
 def _warmth_scheduler(estimator, consumer=False):
-    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s = TpuPipelineChunkScheduler.__new__(TpuPipelineChunkScheduler)
     s._is_kv_consumer = consumer
     s._hit_estimator = estimator
     s.block_size = 2176
     return s
 
 
-def test_the_estimate_needs_the_named_interface(monkeypatch):
+def test_the_estimate_needs_the_named_interface():
+    # The pipeline chunk scheduler keeps a connector as its estimator only
+    # through this interface (test_pp_scheduler_options checks its __init__).
     assert isinstance(_Estimator(), ExternalHitEstimator)
     assert not isinstance(SimpleNamespace(), ExternalHitEstimator)
-
-    def fake_init(self, *args, **kwargs):
-        self.vllm_config = SimpleNamespace(
-            kv_transfer_config=None, additional_config=None
-        )
-        self.connector = self._test_connector
-        self.kv_cache_manager = MagicMock()
-
-    monkeypatch.setattr(AsyncScheduler, "__init__", fake_init)
-    for connector, expected in ((_Estimator(), True), (SimpleNamespace(), False)):
-        monkeypatch.setattr(
-            PrefixAwareScheduler, "_test_connector", connector, raising=False
-        )
-        s = PrefixAwareScheduler()
-        assert (s._hit_estimator is connector) is expected
 
 
 def test_the_estimate_is_asked_past_the_local_hit():
@@ -336,11 +324,12 @@ def test_the_estimate_is_asked_past_the_local_hit():
 
 
 def test_a_failing_estimate_is_logged_and_counts_as_zero():
-    from vllm_torchtpu.core import prefix_aware_scheduler
+    from vllm_torchtpu.core import pp_chunk_scheduler
 
     estimator = _Estimator(fail=True)
     s = _warmth_scheduler(estimator)
-    log = prefix_aware_scheduler.logger
+    # The module's logger resolves lazily to vLLM's logger of this name.
+    log = logging.getLogger("vllm." + pp_chunk_scheduler.__name__)
     # The real warning_once runs; only the logger's output is captured.
     with (
         patch.object(log, "warning") as warn,

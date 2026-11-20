@@ -100,6 +100,8 @@ def _sched(cost=None, running=(), waiting=(), **attrs) -> TpuPipelineChunkSchedu
     s._waits = 0
     s._retention = None
     s._hit_estimator = None
+    s._paw_aging_tok_per_s = 0.0
+    s._step_wall_time = None
     s._transfer_poller = None
     s._hit_resolver = None
     s.kv_cache_manager = SimpleNamespace(enable_caching=False)
