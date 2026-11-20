@@ -20,6 +20,7 @@ the eager backend, which runs on CPU and keeps Dynamo's guards and cache
 entries.
 """
 
+import functools
 import inspect
 import os
 import subprocess
@@ -235,6 +236,71 @@ def test_hook_passes_other_calls_through_unchanged(model, args, kwargs):
         seen.clear()
         assert hook(**kwargs)(target) is result
         assert seen == [(target, (), kwargs)]
+
+
+def _stand_in_compile(monkeypatch, result=None):
+    """torch.compile replaced by a stand-in that records the keyword arguments
+    of each call and compiles the "tpu" backend as "eager" (or returns
+    ``result`` when given)."""
+    real_compile = torch.compile
+    calls = []
+
+    def stand_in(model=None, *args, **kwargs):
+        calls.append(
+            {k: dict(v) if isinstance(v, dict) else v for k, v in kwargs.items()}
+        )
+        if result is not None:
+            return result(model)
+        if kwargs.get("backend") == "tpu":
+            kwargs = {**kwargs, "backend": "eager"}
+        return real_compile(model, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "compile", stand_in)
+    return calls
+
+
+def test_tpu_compile_compiles_with_the_filter_and_wraps(monkeypatch):
+    calls = _stand_in_compile(monkeypatch)
+
+    def f(x):
+        return x * 2 + 1
+
+    wrapped = fast_dispatch.tpu_compile(f)
+    assert calls == [
+        {**ELIGIBLE, "options": {"guard_filter_fn": fast_dispatch._drop_global_state}}
+    ]
+    assert wrapped._fast_dispatch_state["entries"] == []
+    assert wrapped._torchdynamo_orig_callable is f
+    # Decorated before the options are known: disarmed it calls the compiled
+    # function; armed, the first call goes through Dynamo and records the
+    # entry, and the next ones dispatch directly.
+    assert _calls(wrapped, 2) == [0, 0]
+    fast_dispatch.configure(fast=True, drop_global_state=False)
+    assert _calls(wrapped, 3) == [2, 1]
+
+
+def test_tpu_compile_returns_the_function_when_dynamo_is_disabled(monkeypatch):
+    """With TORCHDYNAMO_DISABLE=1, torch.compile returns the function itself."""
+    _stand_in_compile(monkeypatch, result=lambda model: model)
+
+    def f(x):
+        return x * 2 + 1
+
+    assert fast_dispatch.tpu_compile(f) is f
+
+
+@pytest.mark.parametrize("target", ["module", "bound method", "partial"])
+def test_tpu_compile_takes_only_plain_functions(target):
+    """The wrapper binds a plain function's own code and closure; anything
+    else is refused at decoration rather than dispatched wrongly."""
+    if target == "module":
+        model = _Module()
+    elif target == "bound method":
+        model = _Module().forward
+    else:
+        model = functools.partial(lambda x: x)
+    with pytest.raises(TypeError, match="plain function"):
+        fast_dispatch.tpu_compile(model)
 
 
 def test_disarmed_wrapper_only_calls_the_compiled_function():
