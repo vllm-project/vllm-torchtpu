@@ -649,7 +649,7 @@ def _sample_packed(packed, temperatures, u, top_k, top_p):
     runner = SimpleNamespace(
         _apply_temperature=TPUModelRunner._apply_temperature.__get__(object())
     )
-    fn = TPUModelRunner.sample_from_packed_candidates._torchdynamo_orig_callable
+    fn = inspect.unwrap(TPUModelRunner.sample_from_packed_candidates)
     return fn(runner, packed, temperatures, u, top_k, top_p)
 
 

@@ -20,21 +20,24 @@ shard's candidates really are its exact local top-32: a single shard can hold
 all of the global top-k.
 
 ``_extract_local_topk32_torch`` (bf16 fallback head, the target model's path)
-and ``_extract_local_topk32_jax`` (W8A8 fused head) are extracted from the
-source with ``ast`` (the module imports vLLM / torch_tpu) and compared against
-an exact ``topk``.
+and ``_extract_local_topk32_jax`` (W8A8 fused head) are compared against an
+exact ``topk``. The JAX helper is nested in ``_ensure_tpu_quant_ops_registered``
+(which registers TPU ops), so it is extracted from the source with ``ast``.
 """
 
 import ast
-import pathlib
+import inspect
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
 
-SRC = (
-    pathlib.Path(__file__).resolve().parents[2]
-    / "src/vllm_torchtpu/runner/greedy_top_tokens.py"
+from vllm_torchtpu.runner import greedy_top_tokens
+from vllm_torchtpu.runner.greedy_top_tokens import (
+    LOCAL_TOPK_CANDIDATES,
+    _extract_local_topk32_torch,
 )
 
 VOCAB = 248320  # Qwen3.5 padded vocab
@@ -42,61 +45,35 @@ TP = 8
 SHARD = VOCAB // TP  # 31040 = 485 blocks of 64
 
 
-def _load():
-    text = SRC.read_text()
-    tree = ast.parse(text)
-    ns = {"torch": torch}
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name)
-            and t.id
-            in (
-                "LOCAL_TOPK_CANDIDATES",
-                "_LOCAL_TOPK_BLOCK_SIZE",
-                "_LOCAL_TOPK_NUM_BLOCKS",
-            )
-            for t in node.targets
-        ):
-            exec(compile(ast.Module([node], []), str(SRC), "exec"), ns)
-    for node in tree.body:
-        if (
-            isinstance(node, ast.FunctionDef)
-            and node.name == "_extract_local_topk32_torch"
-        ):
-            exec(compile(ast.Module([node], []), str(SRC), "exec"), ns)
-        if (
-            isinstance(node, ast.FunctionDef)
-            and node.name == "_ensure_tpu_quant_ops_registered"
-        ):
-            for inner in node.body:
-                if (
-                    isinstance(inner, ast.FunctionDef)
-                    and inner.name == "_extract_local_topk32_jax"
-                ):
-                    import jax
-                    import jax.numpy as jnp
-
-                    ns["jax"] = jax
-                    ns["jnp"] = jnp
-                    exec(compile(ast.Module([inner], []), str(SRC), "exec"), ns)
-    assert "_extract_local_topk32_torch" in ns
-    assert "_extract_local_topk32_jax" in ns
-    return ns
+def _load_jax_helper():
+    ns = dict(vars(greedy_top_tokens), jax=jax, jnp=jnp)
+    outer = next(
+        node
+        for node in ast.parse(inspect.getsource(greedy_top_tokens)).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_ensure_tpu_quant_ops_registered"
+    )
+    inner = next(
+        node
+        for node in outer.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_extract_local_topk32_jax"
+    )
+    exec(compile(ast.Module([inner], []), greedy_top_tokens.__file__, "exec"), ns)
+    return ns["_extract_local_topk32_jax"]
 
 
-NS = _load()
-K = NS["LOCAL_TOPK_CANDIDATES"]
+_extract_local_topk32_jax = _load_jax_helper()
+K = LOCAL_TOPK_CANDIDATES
 
 
 def _torch_impl(x: torch.Tensor):
-    v, i = NS["_extract_local_topk32_torch"](x)
+    v, i = _extract_local_topk32_torch(x)
     return v.float(), i.long()
 
 
 def _jax_impl(x: torch.Tensor):
-    import jax.numpy as jnp
-
-    v, i = NS["_extract_local_topk32_jax"](jnp.asarray(x.float().numpy()))
+    v, i = _extract_local_topk32_jax(jnp.asarray(x.float().numpy()))
     return torch.from_numpy(np.asarray(v)).float(), torch.from_numpy(
         np.asarray(i)
     ).long()
