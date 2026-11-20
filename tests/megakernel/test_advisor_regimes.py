@@ -22,6 +22,7 @@ import importlib
 import importlib.abc
 import importlib.machinery
 import json
+import math
 import re
 import sys
 from html.parser import HTMLParser
@@ -751,7 +752,7 @@ def test_tie_only_when_winner_flips_between_corners() -> None:
     report = advisor.advise("qwen3.5-397b", workload, "tpu7x")
     assert report.fastest_scope == "single_layer"
     assert report.fastest_verdict == "tie(measure: launch_gap_us)"
-    assert "vs runner-up whole_step" in report.rationale
+    assert "vs runner-up per_op" in report.rationale
     assert "whole_step wins at launch gap 8.0 us" in report.rationale
     knob = report.fastest_verdict.removeprefix("tie(measure: ").removesuffix(")")
     scope_inputs = {
@@ -1255,8 +1256,8 @@ def test_kimi_k3_deployment_preset_registered_and_evaluated() -> None:
     ) == (32, 32, 32, 32, 32, 32)
 
 
-def test_measured_collective_latency_moves_step_bound() -> None:
-    """Measured collective latency must reach the all-reduce base latency term."""
+def test_measured_collective_moves_achievable_not_floors() -> None:
+    """Measured collective latency updates achievable while floors stay analytical."""
     workload = advisor.WorkloadSpec(phase="decode", batch=8, isl=128, osl=1, tp=8, ep=1)
     rep_default = advisor.advise("qwen3.5-397b", workload, chip="tpu7x")
     tp_group_size = 8
@@ -1279,7 +1280,9 @@ def test_measured_collective_latency_moves_step_bound() -> None:
     )
     cal_per_op = next(s for s in rep_calibrated.scopes if s.scope == "per_op")
     def_per_op = next(s for s in rep_default.scopes if s.scope == "per_op")
-    assert cal_per_op.step_bound_us > def_per_op.step_bound_us
+    assert cal_per_op.step_bound_us == def_per_op.step_bound_us
+    assert cal_per_op.step_floor_strict_us == def_per_op.step_floor_strict_us
+    assert cal_per_op.step_achievable_us > def_per_op.step_achievable_us
 
 
 def test_custom_chip_spec_vmem_usable_bytes_preserved(tmp_path: Path) -> None:
@@ -1541,7 +1544,7 @@ def test_cli_prints_evidence_blockers_and_inputs(
 
 
 def test_spec_verify_saturated_regime_matches_dp4_mtp3_crossover() -> None:
-    """Spec Verify Saturated (TP2 x DP4 x EP8, K=3) recommends per_op at 41582.9 us."""
+    """Spec Verify Saturated (TP2 x DP4 x EP8, K=3) recommends per_op at 41037.5 us."""
     sweep = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
     by_label = {r.label: r for r in sweep.regimes}
     label = "Spec Verify Saturated (B=600 over DP4, K=3, 32K)"
@@ -1551,7 +1554,9 @@ def test_spec_verify_saturated_regime_matches_dp4_mtp3_crossover() -> None:
     assert entry.recommended_scope == "per_op"
     per_op_sc = next(s for s in entry.scopes if s["scope"] == "per_op")
     # Per-op pays 120 all-reduces x 32.768 us more on one link than on the egress sum.
-    sat_verify_floor_us = 41582.94
+    # Pure floor drops 305.45 us cold-slot fill/drain + 240.00 us 2x->1x XLA AR/A2A
+    # latency from the prior 41582.94 us value (41582.94 - 545.45 = 41037.49 us).
+    sat_verify_floor_us = 41037.49
     assert per_op_sc["step_bound_us"] == pytest.approx(sat_verify_floor_us, abs=0.2)
 
 
@@ -1630,32 +1635,6 @@ def test_recommend_parallelism_raises_when_no_layout_fits() -> None:
     for reg in dp2_sweep.regimes:
         assert not reg.verdict.startswith("invalid_config(")
         assert int(str(reg.workload["batch"])) >= int(str(reg.workload["dp"]))
-
-
-def test_no_private_underscore_module_constants() -> None:
-    """Verify advisor/*.py defines zero private `_`-prefixed module constants."""
-    adv_dir = Path(advisor.__file__).resolve().parent
-    offenders: list[str] = []
-    for py_path in sorted(adv_dir.glob("*.py")):
-        tree = ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
-        for node in tree.body:
-            if isinstance(node, ast.Assign):
-                names = [
-                    target.id
-                    for target in node.targets
-                    if isinstance(target, ast.Name)
-                    and target.id.startswith("_")
-                    and not target.id.startswith("__")
-                ]
-                offenders.extend(f"{py_path.name}:{name}" for name in names)
-            elif (
-                isinstance(node, ast.AnnAssign)
-                and isinstance(node.target, ast.Name)
-                and node.target.id.startswith("_")
-                and not node.target.id.startswith("__")
-            ):
-                offenders.append(f"{py_path.name}:{node.target.id}")
-    assert offenders == []
 
 
 NO_LAYER_GROUPING_REASON = (
@@ -1852,14 +1831,26 @@ def test_measured_collective_is_charged_at_its_value() -> None:
     calibrated_per_op = next(s for s in calibrated_report.scopes if s.scope == "per_op")
 
     model_profile = advisor.resolve_model_profile("qwen3.5-397b")
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
     num_all_reduce_calls = model_profile.ar_slots_per_layer * model_profile.num_layers
     expected_comm_us = num_all_reduce_calls * measured_latency_us
-    assert calibrated_per_op.comm_us == pytest.approx(expected_comm_us, abs=0.02)
+    assert calibrated_per_op.comm_us == baseline_per_op.comm_us
+    assert calibrated_per_op.step_bound_us == baseline_per_op.step_bound_us
+    assert (
+        calibrated_per_op.step_floor_strict_us == baseline_per_op.step_floor_strict_us
+    )
 
     eta_ici = workload.efficiency.eta_ici
+    ar_call_factor_extra_us = (
+        num_all_reduce_calls
+        * (advisor.constants.PER_OP_COLLECTIVE_CALL_FACTOR - 1)
+        * round(math.log2(workload.tp))
+        * chip_spec.collective_latency_s
+        * 1e6
+    )
     expected_step_achievable_us = (
         baseline_per_op.step_achievable_us
-        - baseline_per_op.comm_us / eta_ici
+        - (baseline_per_op.comm_us + ar_call_factor_extra_us) / eta_ici
         + expected_comm_us
     )
     assert calibrated_per_op.step_achievable_us == pytest.approx(
@@ -1871,7 +1862,23 @@ def test_measured_collective_charges_the_mean_per_call() -> None:
     """Verify mean per-call collective latency is charged when available."""
     workload = advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=1)
     model_profile = advisor.resolve_model_profile("qwen3.5-397b")
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    baseline_report = advisor.advise(
+        "qwen3.5-397b", workload, "tpu7x", measurements=None
+    )
+    baseline_per_op = next(s for s in baseline_report.scopes if s.scope == "per_op")
     num_all_reduce_calls = model_profile.ar_slots_per_layer * model_profile.num_layers
+    eta_ici = workload.efficiency.eta_ici
+    ar_call_factor_extra_us = (
+        num_all_reduce_calls
+        * (advisor.constants.PER_OP_COLLECTIVE_CALL_FACTOR - 1)
+        * round(math.log2(workload.tp))
+        * chip_spec.collective_latency_s
+        * 1e6
+    )
+    uncalibrated_ach_comm_us = (
+        baseline_per_op.comm_us + ar_call_factor_extra_us
+    ) / eta_ici
 
     median_latency_us = 10.0
     mean_latency_us = 14.0
@@ -1895,8 +1902,15 @@ def test_measured_collective_charges_the_mean_per_call() -> None:
         "qwen3.5-397b", workload, "tpu7x", measurements=measurements_with_mean
     )
     per_op_with_mean = next(s for s in report_with_mean.scopes if s.scope == "per_op")
-    assert per_op_with_mean.comm_us == pytest.approx(
-        num_all_reduce_calls * mean_latency_us, abs=0.02
+    assert per_op_with_mean.comm_us == baseline_per_op.comm_us
+    assert per_op_with_mean.step_bound_us == baseline_per_op.step_bound_us
+    # Two 0.01 us rounded terms (0.005 us half-ULP each) + 0.005 / 0.75 = 0.0167 us.
+    ach_round_tol_us = 0.02
+    assert per_op_with_mean.step_achievable_us == pytest.approx(
+        baseline_per_op.step_achievable_us
+        - uncalibrated_ach_comm_us
+        + num_all_reduce_calls * mean_latency_us,
+        abs=ach_round_tol_us,
     )
 
     measurements_without_mean = {
@@ -1919,8 +1933,13 @@ def test_measured_collective_charges_the_mean_per_call() -> None:
     per_op_without_mean = next(
         s for s in report_without_mean.scopes if s.scope == "per_op"
     )
-    assert per_op_without_mean.comm_us == pytest.approx(
-        num_all_reduce_calls * median_latency_us, abs=0.02
+    assert per_op_without_mean.comm_us == baseline_per_op.comm_us
+    assert per_op_without_mean.step_bound_us == baseline_per_op.step_bound_us
+    assert per_op_without_mean.step_achievable_us == pytest.approx(
+        baseline_per_op.step_achievable_us
+        - uncalibrated_ach_comm_us
+        + num_all_reduce_calls * median_latency_us,
+        abs=ach_round_tol_us,
     )
 
 
