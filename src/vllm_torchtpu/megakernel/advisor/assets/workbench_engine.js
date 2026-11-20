@@ -962,9 +962,6 @@
         dcpMergeOps
       );
     }
-    const flopsMoe = expertsLoc > 0
-      ? (2.0 * activeTokens * epDp * lMoe * topK *
-         routedExpParams * expertsLoc / nExp) : 0.0;
     const bufSlots = wl.dmaBuffers || wl.dma_buffers || 2;
     const dBank = (wl.tiles && wl.tiles.bank)
       ? wl.tiles.bank : ((rpObj && rpObj.dense_slot_bytes)
@@ -973,7 +970,6 @@
       ? wl.tiles.ebank : ((rpObj && rpObj.expert_slot_bytes)
       ? rpObj.expert_slot_bytes : (wl.expertSlotBytes || CORE_LIM.ebank));
     const slDenseStaging = Math.min(bufSlots * dBank, bufSlots * layerDenseBytes);
-    const slExpertStaging = Math.min(bufSlots * eBank, Math.trunc(bufSlots * expBytes));
     const firstSlot = Math.min(
       dBank, Math.max(262144, Math.floor(layerDenseBytes / 4))
     );
@@ -1007,10 +1003,6 @@
     const rFloor = rowFloor(lMoe > 0 ? p.expert_dtype : p.weight_dtype, ch);
     const iciEg = ch.ici_egress_bw_bytes_per_s;
     const iciLink = ch.ici_link_bw_bytes_per_s;
-    const a2aTime = epDp > 1
-      ? (2.0 * (epDp - 1) / epDp * Math.min(Math.max(1, topK), epDp) *
-         tokResBytes / iciEg)
-      : 0.0;
     const ppStageTime = pp > 1
       ? (tokResBytes / iciLink + latColl) : 0.0;
     const pcpRingTime = (effPcp > 1 && lAttn > 0)
@@ -1276,73 +1268,90 @@
         actBytes += perOpIndexerScoreRoundtripBytes * lIndexer * activeTokens * indexerCtxLocal +
           perOpDsaKvRoundtripFactor * dsaKvGatherBytes;
       }
-      const declColl = (moeDecl && moeDecl.collectives && typeof moeDecl.collectives === 'object')
-        ? moeDecl.collectives : null;
+      const layoutCollDecl = moeDecl || findDeclaration(p, 'whole_step', effTp, wl);
+      const declColl = (
+        layoutCollDecl && layoutCollDecl.collectives && typeof layoutCollDecl.collectives === 'object'
+      ) ? layoutCollDecl.collectives : null;
       const effNumAr = (declColl && typeof declColl.all_reduces === 'number')
         ? Math.ceil(declColl.all_reduces * layersLocal / Math.max(1, L))
         : numAr;
-      const measuredArS = sc === 'per_op' ? measuredArXlaS : measuredArInKernelS;
-      const hasMeasuredAr = measuredArS !== null && effTp > 1;
-      const measuredArTotalS = hasMeasuredAr ? (effNumAr * nSplits * measuredArS) : 0.0;
-      const xlaArFactor = (sc === 'per_op' && effTp > 1) ? perOpCollFactor : 1;
-      const xlaHbmCollBytes = (!hasMeasuredAr && sc === 'per_op' && effTp > 1)
-        ? 2.0 * effNumAr * tokResBytes : 0.0;
-      let stepsToPrice = [];
-      let stepCallMult = 1;
-      if (declColl) {
-        stepsToPrice = Array.isArray(declColl.steps) ? declColl.steps : [];
-      } else if (
-        !hasDsa &&
-        dcp > 1 &&
-        (dcp & (dcp - 1)) === 0 &&
-        (wl.phase === 'decode' || wl.phase === 'verify')
-      ) {
-        stepsToPrice = [{
-          kind: 'dcp_gather', group_size: dcp, calls_per_layer: defaultCallsPerLayer
-        }];
-        stepCallMult = sc === 'per_op' ? perOpCollFactor : 1;
-      }
-      const hasDeclaredRouted = stepsToPrice.some(st => st && st.kind === 'routed_transport');
-      const hasDeclaredDcp = stepsToPrice.some(
-        st => st && (st.kind === 'dcp_gather' || st.kind === 'split_kv')
-      );
-      let stepTransferS = 0.0, stepStrictS = 0.0, stepHops = 0;
-      const stepCtx = { activeTokens, effTp, lMoe, lAttn, nhLoc, iciLink, iciEg };
-      for (const stItem of stepsToPrice) {
-        const stepTerms = computeCollectiveStepTerms(
-          stItem, p, stepCtx, nSplits, stepCallMult, expertMode, collectiveSeed
-        );
-        stepTransferS += stepTerms.transferS;
-        stepStrictS += stepTerms.strictEgressS;
-        stepHops += stepTerms.hops;
-      }
-      const priceDsaDcp = hasDsa && dcpPostAttnHops > 0 && !hasDeclaredDcp;
-      const dcpPostHopsTotal = priceDsaDcp
-        ? (nSplits * xlaArFactor * dcpPostAttnHops) : 0;
-      stepHops += dcpPostHopsTotal;
-      const dcpPostTransferScopeS = priceDsaDcp ? dcpPostAttnTransferS : 0.0;
-      const stepCollS = stepTransferS + dcpPostTransferScopeS + stepHops * latColl;
       const overlappedComm = isFusedMulti && nSplits === 1;
-      const arAndPcpS = (hasMeasuredAr
-        ? measuredArTotalS
-        : (effNumAr * (arInfo.xferS + nSplits * xlaArFactor * arInfo.latS) +
-           xlaHbmCollBytes / bwHbm)
-      ) + pcpRingTime + stepCollS;
-      const a2aSyncS = hasDeclaredRouted
-        ? 0.0
-        : ((lMoe > 0 && scopeEpDp > 1)
-           ? lMoe * (scopeA2aTime + 2 * nSplits * xlaArFactor * latColl) : 0.0);
-      const dcnSyncS = hasMeasuredAr
-        ? 0.0 : (effNumAr * nSplits * xlaArFactor * arInfo.interLatS);
-      const syncStageS = overlappedComm
-        ? (dcnSyncS + ppStageTime + a2aSyncS)
-        : (isFusedMulti ? (arAndPcpS + ppStageTime + a2aSyncS) : 0.0);
-      const commS = overlappedComm
-        ? (arAndPcpS - dcnSyncS)
-        : (isFusedMulti ? 0.0 : (arAndPcpS + ppStageTime + a2aSyncS));
+      const computeScopeCollectives = (callFactorVal, allowMeasuredAr) => {
+        const measuredArS = allowMeasuredAr
+          ? (sc === 'per_op' ? measuredArXlaS : measuredArInKernelS)
+          : null;
+        const hasMeasuredAr = measuredArS !== null && effTp > 1;
+        const measuredArTotalS = hasMeasuredAr ? (effNumAr * nSplits * measuredArS) : 0.0;
+        const xlaArFactor = (sc === 'per_op' && effTp > 1) ? callFactorVal : 1;
+        const xlaHbmCollBytes = (!hasMeasuredAr && sc === 'per_op' && effTp > 1)
+          ? 2.0 * effNumAr * tokResBytes : 0.0;
+        let stepsToPrice = [];
+        let stepCallMult = 1;
+        if (declColl) {
+          stepsToPrice = Array.isArray(declColl.steps) ? declColl.steps : [];
+          stepCallMult = sc === 'per_op' ? callFactorVal : 1;
+        } else if (
+          !hasDsa &&
+          dcp > 1 &&
+          (dcp & (dcp - 1)) === 0 &&
+          (wl.phase === 'decode' || wl.phase === 'verify')
+        ) {
+          stepsToPrice = [{
+            kind: 'dcp_gather', group_size: dcp, calls_per_layer: defaultCallsPerLayer
+          }];
+          stepCallMult = sc === 'per_op' ? callFactorVal : 1;
+        }
+        const hasDeclaredRouted = stepsToPrice.some(st => st && st.kind === 'routed_transport');
+        const hasDeclaredDcp = stepsToPrice.some(
+          st => st && (st.kind === 'dcp_gather' || st.kind === 'split_kv')
+        );
+        let stepTransferS = 0.0, stepStrictS = 0.0, stepHops = 0;
+        const stepCtx = { activeTokens, effTp, lMoe, lAttn, nhLoc, iciLink, iciEg };
+        for (const stItem of stepsToPrice) {
+          const stepTerms = computeCollectiveStepTerms(
+            stItem, p, stepCtx, nSplits, stepCallMult, expertMode, collectiveSeed
+          );
+          stepTransferS += stepTerms.transferS;
+          stepStrictS += stepTerms.strictEgressS;
+          stepHops += stepTerms.hops;
+        }
+        const priceDsaDcp = hasDsa && dcpPostAttnHops > 0 && !hasDeclaredDcp;
+        const dcpPostHopsTotal = priceDsaDcp
+          ? (nSplits * xlaArFactor * dcpPostAttnHops) : 0;
+        stepHops += dcpPostHopsTotal;
+        const dcpPostTransferScopeS = priceDsaDcp ? dcpPostAttnTransferS : 0.0;
+        const stepCollS = stepTransferS + dcpPostTransferScopeS + stepHops * latColl;
+        const arAndPcpS = (hasMeasuredAr
+          ? measuredArTotalS
+          : (effNumAr * (arInfo.xferS + nSplits * xlaArFactor * arInfo.latS) +
+             xlaHbmCollBytes / bwHbm)
+        ) + pcpRingTime + stepCollS;
+        const a2aSyncS = hasDeclaredRouted
+          ? 0.0
+          : ((lMoe > 0 && scopeEpDp > 1)
+             ? lMoe * (scopeA2aTime + 2 * nSplits * xlaArFactor * latColl) : 0.0);
+        const dcnSyncS = hasMeasuredAr
+          ? 0.0 : (effNumAr * nSplits * xlaArFactor * arInfo.interLatS);
+        const syncStageS = overlappedComm
+          ? (dcnSyncS + ppStageTime + a2aSyncS)
+          : (isFusedMulti ? (arAndPcpS + ppStageTime + a2aSyncS) : 0.0);
+        const commS = overlappedComm
+          ? (arAndPcpS - dcnSyncS)
+          : (isFusedMulti ? 0.0 : (arAndPcpS + ppStageTime + a2aSyncS));
+        return {
+          syncStageS, commS, xlaArFactor, measuredArTotalS, hasMeasuredAr,
+          stepHops, hasDeclaredRouted, hasDeclaredDcp, stepTransferS, stepStrictS
+        };
+      };
+      const floorColl = computeScopeCollectives(1, false);
+      const upperColl = computeScopeCollectives(perOpCollFactor, false);
+      const achColl = computeScopeCollectives(perOpCollFactor, true);
+      const commS = floorColl.commS;
+      const hasDeclaredRouted = floorColl.hasDeclaredRouted;
+      const hasDeclaredDcp = floorColl.hasDeclaredDcp;
       const commInCore = overlappedComm || !isFusedMulti;
-      const measuredInCommS = commInCore ? measuredArTotalS : 0.0;
-      const measuredInSyncS = commInCore ? 0.0 : measuredArTotalS;
+      const measuredInCommS = commInCore ? achColl.measuredArTotalS : 0.0;
+      const measuredInSyncS = commInCore ? 0.0 : achColl.measuredArTotalS;
       const effStateBytes = kvReadBytes + recRwBytes;
       const minEffFloor = Number(DATA.min_efficiency_floor);
       const syncHopFactor = Number(DATA.boundary_sync_hop_factor);
@@ -1358,17 +1367,23 @@
       ) {
         throw new Error('Missing required per-op kernel or boundary seed constants in DATA');
       }
-      const boundaryFillDrainS = (boundaries, effHbmVal, effIciVal) => {
-        const perCallS = (firstSlot / bwHbm) / effHbmVal +
-          (syncHopFactor * latColl) / effIciVal;
+      const boundaryFillDrainS = (
+        boundaries, syncStageVal, effHbmVal, effIciVal, syncHopVal, includeFirstSlotHbm
+      ) => {
+        const firstSlotS = includeFirstSlotHbm ? ((firstSlot / bwHbm) / effHbmVal) : 0.0;
+        const perCallS = firstSlotS + (syncHopVal * latColl) / effIciVal;
         const tiledSyncS = tiled
-          ? (((nSplits - 1) * 2 * layersLocal * syncHopFactor * latColl) / effIciVal)
+          ? (((nSplits - 1) * 2 * layersLocal * syncHopVal * latColl) / effIciVal)
           : 0.0;
-        return (boundaries * perCallS + syncStageS) + tiledSyncS;
+        return (boundaries * perCallS + syncStageVal) + tiledSyncS;
       };
-      // Each tile boundary adds a sync hop per layer. The residual bytes moved there
-      // are already in actBytes.
-      const fillDrainS = boundaryFillDrainS(nOps - 1, 1.0, 1.0);
+      // Floor excludes cold-slot HBM fill and boundary sync-hop priors.
+      const fillDrainS = boundaryFillDrainS(
+        nOps - 1, floorColl.syncStageS, 1.0, 1.0, 0.0, false
+      );
+      const upperFillDrainS = boundaryFillDrainS(
+        nOps - 1, upperColl.syncStageS, 1.0, 1.0, syncHopFactor, true
+      );
       const vecRate = ch.vector_f32_ops_per_s || (ch.bf16_flops_per_s / 128.0);
       const subchannelKThresh = DATA.subchannel_block_k_threshold || 512;
       const subchannelVecOps = DATA.subchannel_vec_ops_per_block || 2.0;
@@ -1410,7 +1425,7 @@
       // under neither the dense compute nor the collectives.
       const routedHbmS = weightPasses * (wStep - wStatic) / bwHbm;
       const dsaStageSeconds = (
-        latCollVal, bf16Upper, strictMode, effDenseVal, effHbmVal, effIciVal
+        latCollVal, bf16Upper, strictMode, effDenseVal, effHbmVal, effIciVal, xlaFactorVal
       ) => {
         if (!hasDsa) return 0.0;
         const effVecRate = strictMode
@@ -1424,13 +1439,15 @@
         const tPreDsa = Math.max(tPreMatmul, (vecPreDsa / effVecRate) / effDenseVal);
         const tDsaCompute = Math.max(tDsaMatmul, (vecOpsDsa / effVecRate) / effDenseVal);
         const dcpQueryAllGatherS = (dcpQueryAllGatherHops > 0 && !hasDeclaredDcp)
-          ? ((dcpQueryAllGatherTransferS + nSplits * xlaArFactor * dcpQueryAllGatherHops * latCollVal) / effIciVal)
+          ? ((dcpQueryAllGatherTransferS + nSplits * xlaFactorVal * dcpQueryAllGatherHops * latCollVal) / effIciVal)
           : 0.0;
         const dsaBytes = strictMode ? dsaKvStrictBytes : dsaKvGatherBytes;
         const dsaHbmS = (dsaBytes / bwHbm) / effHbmVal;
         return Math.max(tPreDsa, dcpQueryAllGatherS) + Math.max(tDsaCompute, dsaHbmS);
       };
-      const dsaStageS = dsaStageSeconds(latColl, false, false, 1.0, 1.0, 1.0);
+      const dsaStageS = dsaStageSeconds(
+        latColl, false, false, 1.0, 1.0, 1.0, floorColl.xlaArFactor
+      );
       const chainS = routedChain(tDense, routedHbmS, tMoe, tVecMoe, dsaStageS);
       const roofCoreS = coreTime(tHbm, chainS, commS, isFusedMulti);
       const roofUs = (roofCoreS + fillDrainS) * 1e6;
@@ -1469,7 +1486,9 @@
             : 0)
       );
       const boundaryCount = sc === 'per_op' ? (perOpCalls - 1) : (nOps - 1);
-      const achFillDrainS = boundaryFillDrainS(boundaryCount, effHbm, effIci);
+      const achFillDrainS = boundaryFillDrainS(
+        boundaryCount, achColl.syncStageS, effHbm, effIci, syncHopFactor, true
+      );
       const tMoeAch = ((moePadFactor * routedAchRatio * scopeFlopsMoe) / peakE) / effMoe;
       const tVecMoeAch = ((vecOpsMoe * routedAchRatio) / vecRate) / effDense;
       const tHbmAch = (tHbm + (routedAchRatio - 1.0) * routedHbmS) / effHbm;
@@ -1477,14 +1496,14 @@
         sc !== 'per_op' && !hasDeclaredDcp && hasDsa && isSparseGather && dcpHops > 0
       ) ? ((indexerRadixPasses - 1) * lIndexer * nSplits * dcpHops) : 0;
       const indexerAchievableExtraS = indexerAchievableExtraHops * latColl;
-      const unmeasuredCommS = Math.max(0.0, commS - measuredInCommS);
+      const unmeasuredCommS = Math.max(0.0, achColl.commS - measuredInCommS);
       const tCommAch = measuredInCommS + (unmeasuredCommS + indexerAchievableExtraS) / effIci;
-      const unmeasuredSyncS = Math.max(0.0, syncStageS - measuredInSyncS);
+      const unmeasuredSyncS = Math.max(0.0, achColl.syncStageS - measuredInSyncS);
       const syncExtraS = isFusedMulti
         ? unmeasuredSyncS * (1.0 / effIci - 1.0) : 0.0;
       const routedHbmAchS = (routedHbmS * routedAchRatio) / effHbm;
       const dsaStageAchS = dsaStageSeconds(
-        latColl, false, false, effDense, effHbm, effIci
+        latColl, false, false, effDense, effHbm, effIci, achColl.xlaArFactor
       );
       const chainAchS = routedChain(
         tDenseAch, routedHbmAchS, tMoeAch, tVecMoeAch, dsaStageAchS
@@ -1492,22 +1511,30 @@
       const achCoreS = Math.max(tHbmAch, chainAchS) + tCommAch + syncExtraS;
       const stepAchUs = (achCoreS + achFillDrainS) * 1e6 + repassUs + launchUs + scopeHostHeadUs;
       const extraLatS = Math.max(0.0, latCollHi - latColl);
-      const arHopsTotal = hasMeasuredAr
-        ? 0 : (effNumAr * nSplits * xlaArFactor * arInfo.intraHops);
-      const arExtraS = (arHopsTotal + stepHops) * extraLatS;
-      const a2aCnt = hasDeclaredRouted
-        ? 0 : ((lMoe > 0 && scopeEpDp > 1) ? (2 * lMoe * nSplits * xlaArFactor) : 0);
-      const a2aExtraS = a2aCnt * extraLatS;
-      const dsaStageHiS = dsaStageSeconds(latCollHi, true, false, 1.0, 1.0, 1.0);
+      const arHopsUpper = effNumAr * nSplits * upperColl.xlaArFactor * arInfo.intraHops;
+      const arExtraUpperS = (arHopsUpper + upperColl.stepHops) * extraLatS;
+      const a2aCntUpper = hasDeclaredRouted
+        ? 0 : ((lMoe > 0 && scopeEpDp > 1) ? (2 * lMoe * nSplits * upperColl.xlaArFactor) : 0);
+      const a2aExtraUpperS = a2aCntUpper * extraLatS;
+      const dsaStageHiS = dsaStageSeconds(
+        latCollHi, true, false, 1.0, 1.0, 1.0, upperColl.xlaArFactor
+      );
       const chainHiS = routedChain(
         tDenseUpper, routedHbmS, tMoe, tVecMoe, dsaStageHiS
       );
-      const roofHiCoreS = coreTime(tHbm, chainHiS, commS + arExtraS, overlappedComm) +
-        a2aExtraS;
-      const roofHiUs = (roofHiCoreS + fillDrainS) * 1e6;
+      const roofHiCoreS = coreTime(
+        tHbm, chainHiS, upperColl.commS + arExtraUpperS, overlappedComm
+      ) + a2aExtraUpperS;
+      const roofHiUs = (roofHiCoreS + upperFillDrainS) * 1e6;
       const stepHiUs = Math.max(
         stepUs, roofHiUs + repassUs + nOps * lgBox.hi + scopeHostHeadUs
       );
+      const arHopsAch = achColl.hasMeasuredAr
+        ? 0 : (effNumAr * nSplits * achColl.xlaArFactor * arInfo.intraHops);
+      const arExtraAchS = (arHopsAch + achColl.stepHops) * extraLatS;
+      const a2aCntAch = hasDeclaredRouted
+        ? 0 : ((lMoe > 0 && scopeEpDp > 1) ? (2 * lMoe * nSplits * achColl.xlaArFactor) : 0);
+      const a2aExtraAchS = a2aCntAch * extraLatS;
       const tMatmulDenseUpperAch = ((attnIsBf16 || isPrefOrMix) && flopsKv > 0)
         ? (((flopsDense - flopsKv) / peakW) / effDense +
            (flopsKv / bf16Peak) / effDense)
@@ -1518,15 +1545,15 @@
       );
       const indexerAchievableExtraHiS = indexerAchievableExtraHops * latCollHi;
       const tCommHiAch = measuredInCommS +
-        (unmeasuredCommS + arExtraS + indexerAchievableExtraHiS) / effIci;
+        (unmeasuredCommS + arExtraAchS + indexerAchievableExtraHiS) / effIci;
       const dsaStageHiAchS = dsaStageSeconds(
-        latCollHi, true, false, effDense, effHbm, effIci
+        latCollHi, true, false, effDense, effHbm, effIci, achColl.xlaArFactor
       );
       const chainHiAchS = routedChain(
         tDenseHiAch, routedHbmAchS, tMoeAch, tVecMoeAch, dsaStageHiAchS
       );
       const achHiCoreS = Math.max(tHbmAch, chainHiAchS) + tCommHiAch +
-        syncExtraS + (a2aExtraS / effIci);
+        syncExtraS + (a2aExtraAchS / effIci);
       const stepAchHiUs = Math.max(
         stepAchUs, stepHiUs,
         (achHiCoreS + achFillDrainS) * 1e6 + repassUs + nOps * lgBox.hi + scopeHostHeadUs
@@ -1559,15 +1586,16 @@
       const tDenseStrict = Math.max(
         tMatmulStrict - tMoeStrict, vecOpsDenseStrict / strictVecRate
       );
-      const dsaStageStrictS = dsaStageSeconds(latColl, false, true, 1.0, 1.0, 1.0);
+      const dsaStageStrictS = dsaStageSeconds(
+        latColl, false, true, 1.0, 1.0, 1.0, floorColl.xlaArFactor
+      );
       const chainStrictS = routedChain(
         tDenseStrict, routedStrictS, tMoeStrict, tVecMoeStrict, dsaStageStrictS
       );
       // The strict floor prices all-reduce transfer at the egress sum. That transfer sits
       // in commS, or in the sync stage of fillDrainS when a fused scope runs several passes.
-      const arStrictSavingS = (hasMeasuredAr
-        ? 0.0 : effNumAr * (arInfo.xferS - arInfo.xferStrictS)) +
-        (stepTransferS - stepStrictS);
+      const arStrictSavingS = effNumAr * (arInfo.xferS - arInfo.xferStrictS) +
+        (floorColl.stepTransferS - floorColl.stepStrictS);
       const commStrictS = commS - (commInCore ? arStrictSavingS : 0.0);
       const fillDrainStrictS = fillDrainS - (commInCore ? 0.0 : arStrictSavingS);
       const roofCoreStrictS = coreTime(tHbmStrict, chainStrictS, commStrictS, isFusedMulti);
@@ -1628,7 +1656,10 @@
     const candidates = hbmFits
       ? (feas.length ? feas : [scopes[0]])
       : [scopes[0]];
-    candidates.sort((a, b) => (a.rawStepUs - b.rawStepUs) ||
+    const floorTieEpsUs = Number(DATA.floor_tie_epsilon_us || 1e-6);
+    candidates.sort((a, b) => (
+      Math.round(a.rawStepUs / floorTieEpsUs) - Math.round(b.rawStepUs / floorTieEpsUs)
+    ) || (a.step_upper_us - b.step_upper_us) ||
       (a.ops_per_step - b.ops_per_step));
     const winner = candidates[0], runnerUp = candidates[1] || winner;
     const supFeas = candidates.filter(s =>

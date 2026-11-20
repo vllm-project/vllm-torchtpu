@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import shutil
 import signal
@@ -1126,6 +1127,100 @@ def test_js_engine_physical_validation_vmem_overflow_and_tps_parity(
             )
 
 
+def _assert_measured_collective_js_parity(
+    py_reports: list[advisor.AdvisorReport],
+    records: list[dict[str, object]],
+    tolerance_abs: float,
+) -> None:
+    """Assert Python/JS scope parity across measured-collective arms."""
+    for py_report, record in zip(py_reports, records, strict=True):
+        eval_payload = cast("dict[str, object]", record["eval"])
+        js_scopes = cast("dict[str, dict[str, float]]", eval_payload["scopes"])
+        for scope_name in ("per_op", "whole_step"):
+            py_scope = next(s for s in py_report.scopes if s.scope == scope_name)
+            js_scope = js_scopes[scope_name]
+            assert js_scope["comm_us"] == pytest.approx(
+                py_scope.comm_us, abs=tolerance_abs
+            )
+            assert js_scope["step_floor_strict_us"] == pytest.approx(
+                py_scope.step_floor_strict_us, abs=tolerance_abs
+            )
+            assert js_scope["step_bound_us"] == pytest.approx(
+                py_scope.step_bound_us, abs=tolerance_abs
+            )
+            assert js_scope["step_upper_us"] == pytest.approx(
+                py_scope.step_upper_us, abs=tolerance_abs
+            )
+            assert js_scope["step_achievable_us"] == pytest.approx(
+                py_scope.step_achievable_us, abs=tolerance_abs
+            )
+            assert js_scope["step_achievable_upper_us"] == pytest.approx(
+                py_scope.step_achievable_upper_us, abs=tolerance_abs
+            )
+
+
+def _assert_measured_collective_invariants(
+    py_reports: list[advisor.AdvisorReport],
+    model_profile: advisor.ModelProfile,
+    workload: advisor.WorkloadSpec,
+    chip_spec: advisor.ChipSpec,
+    tolerance_abs: float,
+) -> None:
+    """Assert floors stay analytical while achievable steps apply measured AR calls."""
+    num_all_reduce_calls = model_profile.ar_slots_per_layer * model_profile.num_layers
+    eta_ici = workload.efficiency.eta_ici
+    ar_call_factor_extra_us = (
+        num_all_reduce_calls
+        * (advisor.constants.PER_OP_COLLECTIVE_CALL_FACTOR - 1)
+        * round(math.log2(workload.tp))
+        * chip_spec.collective_latency_s
+        * 1e6
+    )
+    baseline_per_op = next(s for s in py_reports[0].scopes if s.scope == "per_op")
+    baseline_whole_step = next(
+        s for s in py_reports[0].scopes if s.scope == "whole_step"
+    )
+
+    xla_mean_rate_us = 18.0
+    arm1_per_op = next(s for s in py_reports[1].scopes if s.scope == "per_op")
+    arm1_whole = next(s for s in py_reports[1].scopes if s.scope == "whole_step")
+    assert arm1_per_op.comm_us == baseline_per_op.comm_us
+    assert arm1_per_op.step_bound_us == baseline_per_op.step_bound_us
+    assert arm1_per_op.step_floor_strict_us == baseline_per_op.step_floor_strict_us
+    assert arm1_per_op.step_upper_us == baseline_per_op.step_upper_us
+    assert arm1_per_op.step_achievable_us == pytest.approx(
+        baseline_per_op.step_achievable_us
+        - (baseline_per_op.comm_us + ar_call_factor_extra_us) / eta_ici
+        + num_all_reduce_calls * xla_mean_rate_us,
+        abs=tolerance_abs,
+    )
+    assert arm1_whole.comm_us == baseline_whole_step.comm_us
+    assert arm1_whole.step_achievable_us == baseline_whole_step.step_achievable_us
+
+    in_kernel_mean_rate_us = 11.0
+    arm2_per_op = next(s for s in py_reports[2].scopes if s.scope == "per_op")
+    arm2_whole = next(s for s in py_reports[2].scopes if s.scope == "whole_step")
+    assert arm2_whole.comm_us == baseline_whole_step.comm_us
+    assert arm2_whole.step_bound_us == baseline_whole_step.step_bound_us
+    assert arm2_whole.step_floor_strict_us == baseline_whole_step.step_floor_strict_us
+    assert arm2_whole.step_upper_us == baseline_whole_step.step_upper_us
+    assert arm2_whole.step_achievable_us == pytest.approx(
+        baseline_whole_step.step_achievable_us
+        - baseline_whole_step.comm_us / eta_ici
+        + num_all_reduce_calls * in_kernel_mean_rate_us,
+        abs=tolerance_abs,
+    )
+    assert arm2_per_op.comm_us == baseline_per_op.comm_us
+    assert arm2_per_op.step_achievable_us == baseline_per_op.step_achievable_us
+
+    arm3_per_op = next(s for s in py_reports[3].scopes if s.scope == "per_op")
+    arm3_whole = next(s for s in py_reports[3].scopes if s.scope == "whole_step")
+    assert arm3_per_op.comm_us == baseline_per_op.comm_us
+    assert arm3_whole.comm_us == baseline_whole_step.comm_us
+    assert arm3_per_op.step_achievable_us == baseline_per_op.step_achievable_us
+    assert arm3_whole.step_achievable_us == baseline_whole_step.step_achievable_us
+
+
 def test_engine_parity_measured_collective(tmp_path: Path) -> None:
     """Verify parity between Python and JS engines for calibrated collective calls."""
     js_runtime = shutil.which("node") or shutil.which("gjs")
@@ -1229,54 +1324,9 @@ def test_engine_parity_measured_collective(tmp_path: Path) -> None:
     records = json.loads(out_json.read_text(encoding="utf-8"))
 
     tolerance_abs = 0.05
-    for py_rep, rec in zip(py_reports, records, strict=True):
-        js_scopes = rec["eval"]["scopes"]
-        for scope_name in ("per_op", "whole_step"):
-            py_scope = next(s for s in py_rep.scopes if s.scope == scope_name)
-            js_scope = js_scopes[scope_name]
-            assert js_scope["comm_us"] == pytest.approx(
-                py_scope.comm_us, abs=tolerance_abs
-            )
-            assert js_scope["step_achievable_us"] == pytest.approx(
-                py_scope.step_achievable_us, abs=tolerance_abs
-            )
-
-    num_all_reduce_calls = model_profile.ar_slots_per_layer * model_profile.num_layers
-
-    baseline_per_op = next(s for s in py_reports[0].scopes if s.scope == "per_op")
-    baseline_whole_step = next(
-        s for s in py_reports[0].scopes if s.scope == "whole_step"
-    )
-
-    xla_mean_rate_us = 18.0
-    assert next(
-        s for s in py_reports[1].scopes if s.scope == "per_op"
-    ).comm_us == pytest.approx(
-        num_all_reduce_calls * xla_mean_rate_us, abs=tolerance_abs
-    )
-    assert (
-        next(s for s in py_reports[1].scopes if s.scope == "whole_step").comm_us
-        == baseline_whole_step.comm_us
-    )
-
-    in_kernel_mean_rate_us = 11.0
-    assert next(
-        s for s in py_reports[2].scopes if s.scope == "whole_step"
-    ).comm_us == pytest.approx(
-        num_all_reduce_calls * in_kernel_mean_rate_us, abs=tolerance_abs
-    )
-    assert (
-        next(s for s in py_reports[2].scopes if s.scope == "per_op").comm_us
-        == baseline_per_op.comm_us
-    )
-
-    assert (
-        next(s for s in py_reports[3].scopes if s.scope == "per_op").comm_us
-        == baseline_per_op.comm_us
-    )
-    assert (
-        next(s for s in py_reports[3].scopes if s.scope == "whole_step").comm_us
-        == baseline_whole_step.comm_us
+    _assert_measured_collective_js_parity(py_reports, records, tolerance_abs)
+    _assert_measured_collective_invariants(
+        py_reports, model_profile, workload, chip_spec, tolerance_abs
     )
 
 
