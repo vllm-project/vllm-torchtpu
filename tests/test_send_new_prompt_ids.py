@@ -8,7 +8,11 @@ import pytest
 from vllm import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core import EngineCore
-from vllm.v1.engine.core_client import AsyncMPClient
+from vllm.v1.engine.core_client import (
+    AsyncMPClient,
+    DPAsyncMPClient,
+    DPLBAsyncMPClient,
+)
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from vllm_torchtpu.core import send_new_prompt_ids as snp
@@ -29,6 +33,8 @@ class Client:
         self.encoder = MsgpackEncoder()
         self.core_engine = b"\x00\x00"
         self.messages = []
+
+    _send_input = AsyncMPClient._send_input
 
     def _send_input_message(self, message, engine):
         self.messages.append(message)
@@ -180,6 +186,34 @@ def test_each_client_has_its_own_slots(patched):
                 client, _request(f"{client.client_index}-{turn}", list(prompt))
             )
             assert engine.receive(message) == prompt
+
+
+def test_data_parallel_clients_keep_their_own_add_request(patched):
+    assert "add_request_async" in DPAsyncMPClient.__dict__
+    assert DPLBAsyncMPClient.add_request_async is DPAsyncMPClient.add_request_async
+    assert DPAsyncMPClient.add_request_async is not AsyncMPClient.add_request_async
+
+
+def test_patch_installs_only_when_enabled(monkeypatch):
+    upstream_add = AsyncMPClient.add_request_async
+    upstream_preprocess = EngineCore.preprocess_add_request
+    monkeypatch.setattr(AsyncMPClient, "add_request_async", upstream_add)
+    monkeypatch.setattr(EngineCore, "preprocess_add_request", upstream_preprocess)
+    monkeypatch.setattr(EngineCore, "_tpu_send_new_prompt_ids", False, raising=False)
+    monkeypatch.setenv("VLLM_TPU_SEND_NEW_PROMPT_IDS", "0")
+    snp.patch_send_new_prompt_ids()
+    assert AsyncMPClient.add_request_async is upstream_add
+    assert EngineCore.preprocess_add_request is upstream_preprocess
+
+    monkeypatch.setenv("VLLM_TPU_SEND_NEW_PROMPT_IDS", "8")
+    snp.patch_send_new_prompt_ids()
+    add = AsyncMPClient.add_request_async
+    preprocess = EngineCore.preprocess_add_request
+    assert add.__wrapped__ is upstream_add
+    assert preprocess.__wrapped__ is upstream_preprocess
+    snp.patch_send_new_prompt_ids()
+    assert AsyncMPClient.add_request_async is add
+    assert EngineCore.preprocess_add_request is preprocess
 
 
 def test_the_kept_prompt_sharing_the_most_ids_is_chosen():

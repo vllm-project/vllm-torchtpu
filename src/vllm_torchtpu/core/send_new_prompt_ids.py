@@ -289,25 +289,29 @@ class ReceivedPrompts:
 
 
 def send_new_prompt_ids(capacity: int) -> None:
-    """The API server's client sends each prompt's new ids with a header."""
-    from vllm.v1.engine import EngineCoreRequestType
+    """The API server's client sends each prompt's new ids with a header.
+
+    Only ``AsyncMPClient`` sends this way. ``DPAsyncMPClient`` and
+    ``DPLBAsyncMPClient`` override ``add_request_async`` to choose an engine
+    per request, so they send whole prompts.
+    """
     from vllm.v1.engine.core_client import AsyncMPClient
 
+    upstream = AsyncMPClient.add_request_async
+
+    @functools.wraps(upstream)
     async def add_request_async(self, request: EngineCoreRequest) -> None:
-        request.client_index = self.client_index
-        if eligible(request):
-            sent = self.__dict__.setdefault("_tpu_sent_prompts", SentPrompts(capacity))
-            header = sent.header(request.prompt_token_ids)
-            ids = header.encode(request.prompt_token_ids[header.shared :])
-            frames = self.encoder.encode(
-                msgspec.structs.replace(request, prompt_token_ids=ids)
-            )
-            sent.keep(header, request.prompt_token_ids)
-        else:
-            frames = self.encoder.encode(request)
-        message = (EngineCoreRequestType.ADD.value, *frames)
-        await asyncio.shield(self._send_input_message(message, self.core_engine))
-        self._ensure_output_queue_task()
+        if not eligible(request):
+            await upstream(self, request)
+            return
+        sent = self.__dict__.setdefault("_tpu_sent_prompts", SentPrompts(capacity))
+        ids = request.prompt_token_ids
+        header = sent.header(ids)
+        short = msgspec.structs.replace(
+            request, prompt_token_ids=header.encode(ids[header.shared :])
+        )
+        sent.keep(header, ids)
+        await asyncio.shield(upstream(self, short))
 
     AsyncMPClient.add_request_async = add_request_async
 
