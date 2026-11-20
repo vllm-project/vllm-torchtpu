@@ -36,7 +36,7 @@ MOST_MODEL_LEN_REQS = 16
 class _Manager:
     """PCP manager stand-in that records the requests it sizes chunks from."""
 
-    def __init__(self, per_chunk, plan=None):
+    def __init__(self, per_chunk=None, plan=None):
         self.per_chunk = per_chunk
         self.seen = []
         self.sharding_plan = plan
@@ -147,7 +147,7 @@ def _substitution_runner(manager):
 
 
 def test_async_substitution_goes_through_the_manager_plan():
-    runner = _substitution_runner(_Manager(per_chunk=1, plan=_Plan()))
+    runner = _substitution_runner(_Manager(plan=_Plan()))
     cur, src = TPUModelRunner._prepare_async_token_substitution_indices(
         runner, 0, 3, np.asarray([1, 1, 1], dtype=np.int32)
     )

@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Ensure environment overrides are applied before any other imports,
-# especially torch_tpu which might read them at import time.
 """TPU model runner orchestrating input preparation, XLA graph execution, and sampling.
 
 Manages persistent device buffers, asynchronous H2D metadata uploads, hybrid
 KV/GDN state updates, and multi-step speculative decoding on TPU.
 """
 
+# Ensure environment overrides are applied before any other imports,
+# especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import bisect
@@ -606,7 +606,13 @@ def _substitute_and_extract_draft_token_ids(
     target_logits_indices: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused async token substitution + draft token extraction in one TPU program."""
-    assert substitution_indices.shape == (2, input_ids.shape[0])
+    torch._assert(
+        substitution_indices.shape[0] == 2
+        and substitution_indices.shape[1] == input_ids.shape[0],
+        "fused substitution indices must be [2, len(input_ids)]: "
+        f"substitution_indices.shape={tuple(substitution_indices.shape)}, "
+        f"input_ids.shape[0]={input_ids.shape[0]}",
+    )
     token_in_tpu_cur_input_indices = substitution_indices[0]
     token_in_tpu_pre_next_tokens_indices = substitution_indices[1]
     mask = token_in_tpu_pre_next_tokens_indices > -1
@@ -1411,7 +1417,9 @@ class TPUModelRunner(GPUModelRunner):
         # distribution views (at most 32) with the last one used.
         self._uniform_sched_arr_cache: dict[tuple[int, int], np.ndarray] = {}
         self._prepare_inputs_idx_cache: dict[tuple, Any] = {}
-        self._async_subtract_idx_cache: dict[tuple, tuple] = {}
+        self._async_subtract_idx_cache: dict[
+            tuple, tuple[torch.Tensor, torch.Tensor, np.ndarray]
+        ] = {}
         self._comb_views_cache: dict[
             tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]
         ] = {}
@@ -4360,15 +4368,8 @@ class TPUModelRunner(GPUModelRunner):
             )
             sub_cache = self._async_subtract_idx_cache
             cached_sub = sub_cache.get(sub_key)
-            if cached_sub is not None and len(cached_sub) == 3:
+            if cached_sub is not None:
                 seq_idx_dev, pos_idx_dev, qx_sub_mask = cached_sub
-            elif cached_sub is not None:
-                seq_idx_dev, pos_idx_dev = cached_sub
-                qx_sub_mask = np.fromiter(
-                    (pos is not None for pos, _ in sub_pairs),
-                    dtype=np.bool_,
-                    count=num_reqs,
-                )
             else:
                 qx_sub_mask = np.fromiter(
                     (pos is not None for pos, _ in sub_pairs),

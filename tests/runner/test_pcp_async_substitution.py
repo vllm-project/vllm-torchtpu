@@ -337,8 +337,9 @@ def _substitution_case(name):
                 scheduled_tokens=[16, 1, 1],
             ),
         ),
-        # MTP k=3: each request's source span starts at position * 4; a request
-        # whose drafts were rejected schedules fewer tokens this step.
+        # MTP k=3: each request's source span starts at position * 4. Every
+        # rejected count is zero here, so partial acceptance shows only as
+        # requests that schedule fewer tokens this step.
         "mtp_partial_acceptance": (
             16,
             _mtp_substitution_indices(
@@ -376,10 +377,10 @@ def test_one_upload_index_rows_equal_the_two_separate_rows(case):
     assert torch.equal(out, expected)
 
 
-@pytest.mark.parametrize("fast", [False, True])
-def test_async_substitution_uploads_one_index_tensor(fast):
-    num_tokens, (cur_indices, src_indices) = _substitution_case("mixed_prefill_decode")
-    runner = SimpleNamespace(
+def _substitution_runner(fast):
+    """The runner state `_apply_async_token_substitution` reads, with
+    `_fast_token_substitution` set to `fast`."""
+    return SimpleNamespace(
         _fast_token_substitution=fast,
         device=torch.device("cpu"),
         _pre_async_results=SimpleNamespace(
@@ -391,6 +392,12 @@ def test_async_substitution_uploads_one_index_tensor(fast):
         _cached_subst_key=None,
         _cached_substitution_indices=None,
     )
+
+
+@pytest.mark.parametrize("fast", [False, True])
+def test_async_substitution_uploads_one_index_tensor(fast):
+    num_tokens, (cur_indices, src_indices) = _substitution_case("mixed_prefill_decode")
+    runner = _substitution_runner(fast)
     input_ids = torch.zeros(num_tokens, dtype=torch.int32)
     with patch.object(tpu_runner, "_substitute_placeholder_token") as kernel:
         for _ in range(2):
@@ -413,18 +420,7 @@ def test_async_substitution_cache_hits_each_layout_and_evicts_the_oldest():
     """The device copy of each index layout is uploaded once and served again
     from the cache, also after another layout ran in between; at 256 layouts
     the oldest goes first."""
-    runner = SimpleNamespace(
-        _fast_token_substitution=True,
-        device=torch.device("cpu"),
-        _pre_async_results=SimpleNamespace(
-            next_tokens_tpu=torch.arange(4, dtype=torch.int64)
-        ),
-        _registered_h2d_sources=set(),
-        _unfenced_h2d_sources=[],
-        _async_subst_dev_cache={},
-        _cached_subst_key=None,
-        _cached_substitution_indices=None,
-    )
+    runner = _substitution_runner(fast=True)
     one = np.zeros(1, dtype=np.int32)
 
     def indices(num_tokens):
