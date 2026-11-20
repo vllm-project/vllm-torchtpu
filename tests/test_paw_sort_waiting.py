@@ -307,7 +307,9 @@ def test_the_estimate_needs_the_named_interface(monkeypatch):
     assert not isinstance(SimpleNamespace(), ExternalHitEstimator)
 
     def fake_init(self, *args, **kwargs):
-        self.vllm_config = SimpleNamespace(kv_transfer_config=None)
+        self.vllm_config = SimpleNamespace(
+            kv_transfer_config=None, additional_config=None
+        )
         self.connector = self._test_connector
         self.kv_cache_manager = MagicMock()
 
