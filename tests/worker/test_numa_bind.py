@@ -192,11 +192,16 @@ def test_bind_leaves_an_engine_with_a_rank_offset_alone():
         {"DEBUG_TPU_LOCAL_RANK_OFFSET": "4"},
         # Worker spawn pins local rank r to device order[r].
         {"VLLM_TPU_DEVICE_ORDER": "0,4,1,5"},
+        # The Ray executor runs each worker on the chip Ray assigned it, and
+        # vLLM's parallel config counts a two-host TP16 engine's 16 workers
+        # as one host's.
+        {"TPU_MULTIHOST_BACKEND": "ray"},
     ],
 )
 def test_bind_leaves_an_engine_with_moved_ranks_alone(monkeypatch, env):
-    """TP4 on devices 4-7, or in the order 0,4,1,5: mapping local ranks 0-3
-    onto the host's first devices would bind some of them to the wrong node."""
+    """TP4 on devices 4-7, in the order 0,4,1,5, or on Ray's chips: mapping
+    local ranks 0-3 onto the host's first devices would bind some of them to
+    the wrong node."""
     from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
     for name, value in env.items():

@@ -88,8 +88,10 @@ def pci_numa_node(device: str) -> int | None:
 def bind_to_chip_numa_node(local_rank: int, local_ranks: int) -> None:
     """Narrow this process's CPU set to its chip's NUMA node and prefer the
     node's memory. `local_rank` is this worker's index among the host's
-    `local_ranks` workers. Every failure is logged and leaves placement
-    unchanged."""
+    `local_ranks` workers. A failure before the CPU set is narrowed is logged
+    and leaves placement unchanged. Without libnuma the CPU set is still
+    narrowed and only the memory policy is left as it was, which the log line
+    says."""
     devices = tpu_pci_devices()
     chip = chip_for_local_rank(local_rank, local_ranks, len(devices))
     if chip is None:
