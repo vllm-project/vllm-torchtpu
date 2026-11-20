@@ -15,6 +15,7 @@
 full-logits argmax, and when a step may take it."""
 
 import contextlib
+import inspect
 import logging
 import math
 import subprocess
@@ -84,12 +85,19 @@ def test_importing_the_module_does_not_patch_logits_processor():
 class _HeadShard(torch.nn.Module):
     """One rank's slice of a vocab-parallel LM head (rows [start, start+n))."""
 
-    def __init__(self, weight, start, tp_size, num_pad):
+    def __init__(self, weight, start, tp_size, num_pad, org_vocab_size=None):
         super().__init__()
         self.weight = weight
         self.tp_size = tp_size
         self.shard_indices = SimpleNamespace(
             org_vocab_start_index=start, num_org_vocab_padding=num_pad
+        )
+        # The whole head's vocabulary, padded and real (VocabParallelEmbedding).
+        self.org_vocab_size_padded = weight.shape[0] * tp_size
+        self.org_vocab_size = (
+            self.org_vocab_size_padded - num_pad
+            if org_vocab_size is None
+            else org_vocab_size
         )
         self.quant_method = SimpleNamespace(
             apply=lambda layer, x, bias=None: x @ layer.weight.T
@@ -120,7 +128,7 @@ def _shards(weight, tp_size):
         start = rank * per_rank
         num_pad = max(0, start + per_rank - vocab) if start < vocab else per_rank
         shards.append(
-            _HeadShard(padded[start : start + per_rank], start, tp_size, num_pad)
+            _HeadShard(padded[start : start + per_rank], start, tp_size, num_pad, vocab)
         )
     return shards
 
@@ -1208,3 +1216,27 @@ def test_quantize_lm_head_is_w8a8_fp8_or_bf16_only():
     for mode in ("fp4", "w4a8", "fp4_g128"):
         with pytest.raises(ValueError, match="Unsupported LM-head quantization"):
             greedy_top_tokens.quantize_lm_head(_HeadShard(weight, 0, 1, 0), mode)
+
+
+@pytest.mark.parametrize(
+    "vocab_size,padded",
+    [(248320, False), (151936, False), (50257, True)],
+    ids=["qwen3_5_397b", "vocab_151936", "vocab_50257"],
+)
+def test_vocab_padding_is_decided_from_the_head(vocab_size, padded):
+    """vLLM's LogitsProcessor has no padded_vocab_size, so the W8A8 head paths
+    decide from the head: padding exists when org_vocab_size_padded exceeds
+    org_vocab_size, the same answer on every rank. The Qwen3.5-397B vocabulary
+    (248320) is a multiple of vLLM's 64-entry padding, so its heads have none
+    at any TP size; a 50257-token vocabulary pads to 50304."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        DEFAULT_VOCAB_PADDING_SIZE,
+        pad_vocab_size,
+    )
+
+    assert "padded_vocab_size" not in inspect.getsource(LogitsProcessor)
+    head = SimpleNamespace(
+        org_vocab_size=vocab_size,
+        org_vocab_size_padded=pad_vocab_size(vocab_size, DEFAULT_VOCAB_PADDING_SIZE),
+    )
+    assert greedy_top_tokens._has_vocab_padding(head) is padded
