@@ -8409,10 +8409,15 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors(out)
 
     def _precompile_compute_topk_candidates(self) -> None:
+        """Warm the packed top-k candidate programs, under no_grad as
+        execute_model calls them (dynamo guards on grad mode)."""
         if _packed_candidates_owner(self._greedy_head_owner) is None:
             return
         hsize = self.model_config.get_hidden_size()
-        with self._precompile_timed("compute_selected_topk_candidates"):
+        with (
+            self._precompile_timed("compute_selected_topk_candidates"),
+            torch.no_grad(),
+        ):
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
@@ -8424,7 +8429,10 @@ class TPUModelRunner(GPUModelRunner):
                     synchronize_tensors(out)
         if not self.get_pcp_planner().uses_selected_logits_hidden_states:
             return
-        with self._precompile_timed("compute_topk_candidates_from_hidden_states"):
+        with (
+            self._precompile_timed("compute_topk_candidates_from_hidden_states"),
+            torch.no_grad(),
+        ):
             for num_seqs in self._from_hidden_states_lengths():
                 dummy_hidden = torch.zeros(
                     (num_seqs, hsize),

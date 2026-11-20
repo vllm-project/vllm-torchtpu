@@ -812,6 +812,92 @@ def _vocab_parallel_topk_candidates_dim0(
     return out
 
 
+class _StepStopped(Exception):
+    pass
+
+
+class _EntryRunner:
+    """A runner stand-in that runs `call` at execute_model's first read of it,
+    inside the grad mode execute_model gives its body, then stops."""
+
+    def __init__(self, call):
+        self._call = call
+
+    def __getattr__(self, name):
+        self._call()
+        raise _StepStopped
+
+
+@pytest.mark.parametrize("pcp", [False, True])
+def test_the_warmed_topk_candidates_serve_execute_model_without_compiling(
+    monkeypatch, pcp
+):
+    """execute_model computes a step's packed top-k candidates under its
+    no_grad, and dynamo guards on grad mode. The real candidate programs,
+    warmed by _precompile_compute_topk_candidates and then called from inside
+    execute_model at a warmed shape, do not compile again."""
+    torch._dynamo.reset()
+    try:
+        gen = torch.Generator().manual_seed(5)
+        owner = _Owner(_HeadShard(torch.randn(256, 16, generator=gen), 0, 1, 0))
+        greedy_top_tokens.resolve_head_owner(owner, dp_lockstep=False)
+        compiles = []
+
+        def backend(gm, example_inputs):
+            compiles.append(len(example_inputs))
+            return gm.forward
+
+        def compiled(method):
+            fn = inspect.unwrap(getattr(TPUModelRunner, method))
+            return torch.compile(fn, backend=backend, fullgraph=True, dynamic=False)
+
+        selected, from_hidden = (
+            compiled("compute_selected_topk_candidates"),
+            compiled("compute_topk_candidates_from_hidden_states"),
+        )
+        runner = SimpleNamespace(
+            _greedy_head_owner=owner,
+            model_config=SimpleNamespace(get_hidden_size=lambda: 16),
+            num_tokens_paddings=[8, 16],
+            num_reqs_paddings=[4, 8],
+            max_num_reqs=8,
+            _is_async_drafter=False,
+            _hidden_states_dtype=torch.float32,
+            device=torch.device("cpu"),
+            _precompile_timed=lambda _label: contextlib.nullcontext(),
+            get_pcp_planner=lambda: SimpleNamespace(
+                uses_selected_logits_hidden_states=pcp
+            ),
+        )
+        runner.compute_selected_topk_candidates = lambda h, i: selected(runner, h, i)
+        runner.compute_topk_candidates_from_hidden_states = lambda h: from_hidden(
+            runner, h
+        )
+        runner._selected_logits_lengths = lambda n: (
+            TPUModelRunner._selected_logits_lengths(runner, n)
+        )
+        runner._from_hidden_states_lengths = lambda: (
+            TPUModelRunner._from_hidden_states_lengths(runner)
+        )
+        monkeypatch.setattr(tpu_runner, "_packed_candidates_owner", lambda o: o)
+        monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+        TPUModelRunner._precompile_compute_topk_candidates(runner)
+        warmed = len(compiles)
+
+        def serve():
+            runner.compute_selected_topk_candidates(
+                torch.zeros(16, 16), torch.zeros(8, dtype=torch.int32)
+            )
+            if pcp:
+                runner.compute_topk_candidates_from_hidden_states(torch.zeros(8, 16))
+
+        with pytest.raises(_StepStopped):
+            TPUModelRunner.execute_model(_EntryRunner(serve), None)
+        assert len(compiles) == warmed, compiles[warmed:]
+    finally:
+        torch._dynamo.reset()
+
+
 @pytest.mark.parametrize("vocab_size", [301, 2100])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
