@@ -72,6 +72,11 @@ class PrequantLinearMethod:
     ) -> torch.Tensor:
         raise NotImplementedError
 
+    def serves_prequant_rows(self, layer: torch.nn.Module) -> bool:
+        """Whether `apply_prequant` on `layer` computes what `apply` computes
+        from the bf16 rows the FP8 rows were quantized from."""
+        return True
+
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
     """Return the activation quant dtype paired with a given weight dtype.

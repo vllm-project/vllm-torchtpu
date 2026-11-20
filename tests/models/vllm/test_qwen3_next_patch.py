@@ -1383,6 +1383,25 @@ def test_takes_prequant_rows_dispatches_on_the_method_class():
     assert not patch_mod._takes_prequant_rows(None)
 
 
+def _fp8_method(w8a16_max_rows=0):
+    method = VllmFp8LinearMethodTPU.__new__(VllmFp8LinearMethodTPU)
+    method.w8a16_max_rows = w8a16_max_rows
+    return method
+
+
+def test_takes_prequant_rows_follows_what_the_fp8_method_serves():
+    """The TPU FP8 method takes pre-quantized rows only where its pre-quantized
+    matmul computes what `apply` would: one scale per output column, and no
+    W8A16 small steps (the pre-quantized matmul is W8A8)."""
+    assert patch_mod._takes_prequant_rows(_proj(quant_method=_fp8_method()))
+    assert not patch_mod._takes_prequant_rows(
+        _proj(scale_shape=(2,), quant_method=_fp8_method())
+    )
+    assert not patch_mod._takes_prequant_rows(
+        _proj(quant_method=_fp8_method(w8a16_max_rows=8))
+    )
+
+
 def test_mark_pre_attn_norm_quant():
     """Eligible: a GemmaRMSNorm and an FP8 per-channel main projection. Exact:
     every projection of the attention input is FP8 per-channel."""
@@ -1961,9 +1980,7 @@ def _decoder_layer(cls, qkv_weight_dtype):
         "weight_scale", nn.Parameter(torch.ones(96), requires_grad=False)
     )
     qkv_proj.quant_method = (
-        object.__new__(VllmFp8LinearMethodTPU)
-        if qkv_weight_dtype == torch.float8_e4m3fn
-        else SimpleNamespace()
+        _fp8_method() if qkv_weight_dtype == torch.float8_e4m3fn else SimpleNamespace()
     )
     layer.self_attn = nn.Module()
     layer.self_attn.qkv_proj = qkv_proj
