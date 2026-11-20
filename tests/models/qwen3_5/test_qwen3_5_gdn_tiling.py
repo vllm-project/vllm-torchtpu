@@ -181,6 +181,16 @@ def test_a_caller_chunk_is_capped_at_the_vmem_fit():
         ),
         # KDA verify windows stay at one sequence, override or not.
         (dict(default_tile=4, dyn_tile=None, num_spec_tokens=3, is_kda=True), 1),
+        (
+            dict(
+                default_tile=4,
+                dyn_tile=None,
+                num_spec_tokens=3,
+                is_kda=True,
+                override=2,
+            ),
+            1,
+        ),
     ],
 )
 def test_select_decode_tile_size(kwargs, expected):
