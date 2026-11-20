@@ -404,6 +404,7 @@ def _manager_kwargs(monkeypatch, spec):
 
     built = MagicMock()
     monkeypatch.setattr(raiden_store, "RaidenOffloadingManager", built)
+    monkeypatch.setattr(raiden_store, "x2_wait_registry", lambda address: 0.0)
     monkeypatch.setattr(
         "vllm_torchtpu.offload.tier_classes.TieredOffloadingManager",
         lambda plan, managers, check=False: NS(plan=plan, managers=managers),

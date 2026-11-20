@@ -17,8 +17,13 @@
 import vllm_torchtpu.env_override  # noqa: F401
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.offload import tier_x2_sidecar as _tier_x2_sidecar
 
 logger = init_logger(__name__)
+
+# TIER-X2 sidecars (the global registry on the prefill pod, the host store nodes on the decode
+# pod): inert unless the pod's environment names them (Q38X2_REGISTRY_PORT / Q38X2_NODES).
+_tier_x2_sidecar.maybe_start()
 
 
 def _patch_vllm_compact_mamba_streaming_input() -> None:
