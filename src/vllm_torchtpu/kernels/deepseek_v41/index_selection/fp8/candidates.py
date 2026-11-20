@@ -97,7 +97,16 @@ def prepare_candidate_metadata(
     block: int,
     width: int,
 ) -> CandidateMetadata:
-    """Pair queries of even-sized requests; odd-sized requests stay unpaired.
+    """Pair consecutive queries of each request into groups that share gathered K.
+
+    Queries are paired two by two inside each run of equal request IDs
+    (padding rows, request -1, form their own runs); the last query of an
+    odd-sized run stays alone. Each query keeps its own candidates and
+    window, so the grouping changes which K bytes are gathered together, not
+    any score. The number of groups is therefore at most
+    `candidate_group_capacity(tokens, requests)`, about half the queries, and
+    every per-group array (and the gathered K, one region per group) is sized
+    for that many groups instead of one per query.
 
     Args:
         pages: Dense [requests, max_pages_per_request] physical page table;
@@ -124,18 +133,23 @@ def prepare_candidate_metadata(
     # log2(tokens) levels of tiny serial slice/pad ops.
     first = lax.cummax(jnp.where(begin_mask, rows, 0))
     end = lax.cummin(jnp.where(end_mask, rows + 1, tokens), reverse=True)
-    paired = valid & ((end - first) % 2 == 0)
+    # Pair rows two by two from the start of their run; an odd run's last row
+    # stays alone. Example: runs of 3, 2 and 1 rows give groups
+    # [0, 1] [2] [3, 4] [5].
+    length = end - first
+    paired = (rows - first) < length - length % 2
     starts = ~paired | ((rows - first) % 2 == 0)
     groups = jnp.cumsum(starts.astype(jnp.int32)) - 1
+    capacity = candidate_group_capacity(tokens, pages.shape[0])
     if tokens <= 4096:
-        # Decode sizes: (tokens + 1) x tokens compares fuse into one cheap op.
+        # Decode sizes: (capacity + 1) x tokens compares fuse into one cheap op.
         offsets = jnp.searchsorted(
-            groups, jnp.arange(tokens + 1), side="left", method="compare_all"
+            groups, jnp.arange(capacity + 1), side="left", method="compare_all"
         )
     else:
         # Group g begins at the g-th start row; trailing groups are empty at
         # tokens. Linear in tokens, where compare_all grows quadratically.
-        (offsets,) = jnp.nonzero(starts, size=tokens + 1, fill_value=tokens)
+        (offsets,) = jnp.nonzero(starts, size=capacity + 1, fill_value=tokens)
     sizes = jnp.diff(offsets)
 
     direct = False
@@ -358,7 +372,11 @@ def canonical_candidate_blocks(
 
     @pl.kernel(
         out_type=(
-            jax.ShapeDtypeStruct((rows, per_query if direct else columns), jnp.int32),
+            # Direct preparation writes one window per query, not per group.
+            jax.ShapeDtypeStruct(
+                (candidates.shape[0], per_query) if direct else (rows, columns),
+                jnp.int32,
+            ),
             jax.ShapeDtypeStruct((rows, columns), jnp.int32),
             jax.ShapeDtypeStruct((rows, alignment), jnp.int32),
         ),
@@ -836,6 +854,39 @@ def candidate_key_rows(
     per_page = PAGE_RECORDS // block
     steps = (groups * blocks + units * group - 1) // (units * group)
     return steps * group * units // per_page * PAGE_ROWS
+
+
+def candidate_group_capacity(
+    tokens: int, request_slots: int, minimum: Callable[[int, int], int] = min
+) -> int:
+    """Static upper bound on the query groups of `prepare_candidate_metadata`.
+
+    Groups pair queries inside runs of equal request IDs, so a run of n rows
+    makes ceil(n / 2) groups. Each request's rows are contiguous and padding
+    rows trail them, so there are at most request_slots + 1 runs, and even
+    if padding sat between every two requests there would be at most
+    2 * request_slots + 1. The groups are then at most
+    (tokens + 2 * request_slots + 1) / 2, that is at most
+    (tokens + 1) // 2 + request_slots, and never more than one per query.
+
+    Example: a 2,048-token prefill step with a page table of 8 request slots
+    has at most 1,024 + 8 = 1,032 groups instead of 2,048, which halves
+    the gathered candidate K (8.25 GiB to 4.16 GiB for 2,048 candidate blocks
+    of 8 tokens per query).
+
+    Uses only integer arithmetic, so it also takes symbolic sizes when the
+    caller passes a symbolic minimum (``torch.sym_min`` in the fake
+    implementation of the prepare op).
+
+    Args:
+        tokens: Query rows of the step.
+        request_slots: Rows of the step's page table (request slots).
+        minimum: The minimum of two sizes.
+
+    Returns:
+        The number of group rows every per-group array is sized for.
+    """
+    return minimum(tokens, (tokens + 1) // 2 + request_slots)
 
 
 def candidate_region_rows(candidates_per_query: int, block: int) -> int:
