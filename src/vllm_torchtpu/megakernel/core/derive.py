@@ -19,22 +19,25 @@ import dataclasses
 from collections.abc import Mapping
 from typing import Any
 
-from .decls import REQUIRED, _lookup_raw_key, _sub_cfg
+from . import decls, schedule, validate
+from .decls import REQUIRED, _sub_cfg
 from .errors import MegakernelConfigError
 from .geometry import ModelGeometry
 from .modules.gdn import GDNModule
 from .modules.gqa import GQAModule
 from .modules.moe import MoEModule
 from .pool import PoolLayout
-from .schedule import (
-    FromHFLayerTypes,
-    ModuleOrBinding,
-    ResolvedSchedule,
-    Schedule,
-    _module_cls_of,
-)
+from .schedule import FromHFLayerTypes, ModuleOrBinding, ResolvedSchedule, Schedule
 from .spec import LayerType, ModelSpec, Module, SwitchSlot
-from .validate import describe_binding, model_label, validate_norms
+
+
+def _pub_vars(obj: Any) -> dict[str, Any]:
+    return {k: v for k, v in vars(obj).items() if k[:1] != "_" and v is not None}
+
+
+def _hf_str_key(v: Any) -> str | None:
+    k = v[0] if isinstance(v, tuple) else v
+    return k if isinstance(k, str) else None
 
 
 def _merged_cfg(hf_config: Any, extras: Mapping[str, Any]) -> dict[str, Any]:
@@ -43,11 +46,9 @@ def _merged_cfg(hf_config: Any, extras: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(src, Mapping):
             base.update(src)
         elif src is not None:
-            base.update(
-                {k: v for k, v in vars(src).items() if k[:1] != "_" and v is not None}
-            )
+            base.update(_pub_vars(src))
     for k, v in extras.items():
-        if _lookup_raw_key(hf_config, k) is REQUIRED and v is not None:
+        if decls._lookup_raw_key(hf_config, k) is REQUIRED and v is not None:
             base[k] = v
     return base
 
@@ -57,14 +58,27 @@ def instantiate_spec_module(
 ) -> Module:
     """Instantiate a `ModelSpec` `Module` from a `ModuleBinding` or return `m`."""
     if isinstance(m, Module):
+        if isinstance(m, MoEModule) and g is not None:
+            m._check_option_consistency(g)
+            if m.geometry != g:
+                m_kw = dict(geometry=g, prefix=m.prefix, shared_gate=m.shared_gate)
+                return type(m)(
+                    **m_kw,
+                    moe_tp=m._explicit_moe_tp,
+                    e_slots=m._explicit_e_slots,
+                    weight_dtypes=m.weight_dtypes,
+                )
         return m
     opts = {k: v for k, v in m.options.items() if v is not None}
     if issubclass(m.module_cls, GQAModule):
         return m.module_cls(pool_layout=pool_layout, prefix=m.prefix, **opts)
+    g_gate = getattr(g, "gdn_gate", None)
     if issubclass(m.module_cls, GDNModule) and (
-        getattr(g, "gdn_gate", "silu") != "silu" or "gate" in opts
+        (g_gate is not None and g_gate != "silu") or "gate" in opts
     ):
-        opts["gate"] = str(getattr(g, "gdn_gate", opts["gate"]))
+        opts["gate"] = str(opts["gate"] if g_gate is None else g_gate)
+    if issubclass(m.module_cls, MoEModule) and g is not None:
+        return m.module_cls(geometry=g, prefix=m.prefix, **opts)
     return m.module_cls(prefix=m.prefix, **opts)
 
 
@@ -86,14 +100,12 @@ def derive_model_geometry(
         object.__setattr__(g, "_model_def", cls)
         return g
 
-    mname = model_label(cls)
+    mname = validate.model_label(cls)
     if not isinstance(cls.schedule, Schedule):
         raise MegakernelConfigError(f"ModelDef {mname!r}: `schedule` must be Schedule")
     cfg = cls._effective_hf_config(hf_config)
     top = cls._from_hf_decl().resolve(cfg)
-    L = int(top["layers"])
-    H = int(top["hidden"])
-    eps = float(top["eps"])
+    L, H, eps = int(top["layers"]), int(top["hidden"]), float(top["eps"])
     gdn_l2_eps = float(top["gdn_l2_eps"]) if "gdn_l2_eps" in top else 1e-6
     sched = cls.schedule.resolve(cfg, L)
     merged = _merged_cfg(
@@ -106,19 +118,19 @@ def derive_model_geometry(
             "gdn_gate": top.get("gdn_gate"),
         },
     )
-    for rope_key in ("rope_parameters", "rope_scaling"):
-        rope_sub = _sub_cfg(cfg, rope_key) or merged.get(rope_key)
-        if rope_sub is not None:
-            rtype = (
-                rope_sub.get("rope_type", rope_sub.get("type"))
-                if isinstance(rope_sub, Mapping)
-                else getattr(rope_sub, "rope_type", getattr(rope_sub, "type", None))
-            )
-            if rtype not in (None, "default"):
-                raise MegakernelConfigError(
-                    f"ModelDef {mname!r}: unsupported {rope_key} rope_type={rtype!r}; "
-                    "megakernel requires unscaled ('default') RoPE"
-                )
+    for root in (cfg, _sub_cfg(cfg, "text_config")):
+        for rope_key in ("rope_parameters", "rope_scaling"):
+            rope_sub = _sub_cfg(root, rope_key) if root is not None else None
+            if rope_sub is not None:
+                rtype = _sub_cfg(rope_sub, "rope_type")
+                if rtype is None:
+                    rtype = _sub_cfg(rope_sub, "type")
+                if rtype not in (None, "default"):
+                    raise MegakernelConfigError(
+                        f"ModelDef {mname!r}: unsupported {rope_key} "
+                        f"rope_type={rtype!r}; megakernel requires unscaled "
+                        "('default') RoPE"
+                    )
     gqa_b = cls._find_binding(GQAModule, sched)
     if gqa_b is None:
         raise MegakernelConfigError(f"ModelDef {mname!r} has no GQAModule in schedule")
@@ -145,46 +157,37 @@ def derive_model_geometry(
     if moe_b is None:
         raise MegakernelConfigError(f"ModelDef {mname!r} has no MoEModule in schedule")
     exp_spec = moe_b.fields.get("experts", "num_experts")
-    exp_key = exp_spec[0] if isinstance(exp_spec, tuple) else exp_spec
-    if isinstance(exp_key, str):
-        raw_e = _lookup_raw_key(merged, exp_key)
-        if (
-            raw_e is REQUIRED
-            or raw_e is None
-            or (isinstance(raw_e, (int, float)) and raw_e <= 0)
-        ):
-            raise MegakernelConfigError(
-                f"{cls.__name__} supports MoE checkpoints only "
-                f"(missing or non-positive {exp_key!r})"
-            )
+    exp_key = _hf_str_key(exp_spec) or "experts"
+    exp_als = tuple(
+        a for a, t in moe_b.module_cls.FIELD_ALIASES.items() if t == "experts"
+    )
+    try:
+        raw_e = decls._resolve_field_spec(
+            merged,
+            "experts",
+            exp_spec,
+            REQUIRED,
+            exp_als,
+            explicit="experts" in moe_b.explicit_fields,
+        )
+    except ValueError:
+        raw_e = REQUIRED
+    if not (isinstance(raw_e, int) and not isinstance(raw_e, bool) and raw_e > 0):
+        raise MegakernelConfigError(
+            f"{cls.__name__} supports MoE checkpoints only "
+            f"(missing or non-positive {exp_key!r})"
+        )
     moe_g = moe_b.resolve(merged)
     eff_tp = bool(moe_g.moe_tp) if moe_tp is None else bool(moe_tp)
     eff_slots = int(moe_g.e_slots) if e_slots is None else int(e_slots)
-    zc = validate_norms(cls, sched, merged, eps, model_name=mname)
-    g = cls.geometry_cls(
-        L=L,
-        att_every=sched.att_every,
-        H=H,
-        NH=NH,
-        NKV=NKV,
-        HD=HD,
-        ROT=ROT,
-        KH=KH,
-        VH=VH,
-        KD=KD,
-        VD=VD,
-        E=int(moe_g.E),
-        TOPK=int(moe_g.TOPK),
-        I=int(moe_g.I),
-        IS=int(moe_g.IS),
-        moe_tp=eff_tp,
-        e_slots=eff_slots,
-        eps=eps,
-        gdn_l2_eps=gdn_l2_eps,
-        theta=theta,
-        zero_centered_norm=zc,
-        gdn_gate=gdn_gate,
+    zc = validate.validate_norms(cls, sched, merged, eps, model_name=mname)
+    g_kw: dict[str, Any] = dict(
+        L=L, att_every=sched.att_every, H=H, NH=NH, NKV=NKV, HD=HD, ROT=ROT
     )
+    g_kw.update(KH=KH, VH=VH, KD=KD, VD=VD, E=int(moe_g.E), TOPK=int(moe_g.TOPK))
+    g_kw.update(I=int(moe_g.I), IS=int(moe_g.IS), moe_tp=eff_tp, e_slots=eff_slots)
+    g_kw.update(eps=eps, gdn_l2_eps=gdn_l2_eps, theta=theta, zero_centered_norm=zc)
+    g = cls.geometry_cls(**g_kw, gdn_gate=gdn_gate)
     object.__setattr__(g, "_model_def", cls)
     return g
 
@@ -201,9 +204,9 @@ def derive_model_spec(
     """Derive `ModelSpec` (`LayerType` + `SwitchSlot`s), failing closed on overrides."""
     g = cls.derive_geometry(hf_config_or_geom, moe_tp=moe_tp, e_slots=e_slots)
     sched = cls.resolve_schedule(g)
-    mname = model_label(cls)
+    mname = validate.model_label(cls)
     ovs = cls.schedule.overrides if isinstance(cls.schedule, Schedule) else {}
-    validate_norms(
+    validate.validate_norms(
         cls, sched, None, g.eps, expected_zc=g.zero_centered_norm, model_name=mname
     )
     for slot_name, seq in (
@@ -215,12 +218,11 @@ def derive_model_spec(
         )
         for lyr, b in enumerate(seq):
             if b != canon_n:
-                got_desc = describe_binding(b, canon_n)
-                exp_desc = describe_binding(canon_n)
+                got_d = validate.describe_binding(b, canon_n)
+                exp_d = validate.describe_binding(canon_n)
                 raise MegakernelConfigError(
                     f"ModelDef {mname!r}: layer {lyr} slot {slot_name!r} binding "
-                    f"{got_desc} cannot be represented in ModelSpec "
-                    f"(expected {exp_desc})"
+                    f"{got_d} cannot be represented in ModelSpec (expected {exp_d})"
                 )
     p = sched.att_every
     canon_att = next(
@@ -238,27 +240,26 @@ def derive_model_spec(
     for lyr, b in enumerate(sched.mixer):
         exp_m = canon_att if (lyr + 1) % p == 0 else canon_rec
         if b != exp_m:
-            got_desc = describe_binding(b, exp_m)
-            exp_desc = describe_binding(exp_m)
+            got_d = validate.describe_binding(b, exp_m)
+            exp_d = validate.describe_binding(exp_m)
             raise MegakernelConfigError(
-                f"ModelDef {mname!r}: layer {lyr} slot 'mixer' binding {got_desc} "
-                f"cannot be represented in ModelSpec (expected {exp_desc})"
+                f"ModelDef {mname!r}: layer {lyr} slot 'mixer' binding {got_d} "
+                f"cannot be represented in ModelSpec (expected {exp_d})"
             )
     canon_ffn = next(
         (
             b
             for i, b in enumerate(sched.ffn)
             if "ffn" not in ovs.get(i, {})
-            and issubclass(_module_cls_of(b), MoEModule)
-            and getattr(_module_cls_of(b), "routed_experts", True)
+            and issubclass(schedule._module_cls_of(b), MoEModule)
         ),
         None,
     )
     for lyr, b in enumerate(sched.ffn):
         if canon_ffn is None or b != canon_ffn:
-            got_desc = describe_binding(b, canon_ffn)
+            got_d = validate.describe_binding(b, canon_ffn)
             raise MegakernelConfigError(
-                f"ModelDef {mname!r}: layer {lyr} slot 'ffn' binding {got_desc} "
+                f"ModelDef {mname!r}: layer {lyr} slot 'ffn' binding {got_d} "
                 "cannot be represented in ModelSpec"
             )
     play = None if R is None else cls.pool_layout(g, R=R)
@@ -267,7 +268,8 @@ def derive_model_spec(
     for b in sched.mixer[:p]:
         mod = (
             gdn_module
-            if gdn_module is not None and issubclass(_module_cls_of(b), GDNModule)
+            if gdn_module is not None
+            and issubclass(schedule._module_cls_of(b), GDNModule)
             else instantiate_spec_module(b, pool_layout=play, g=g)
         )
         if branches and branches[-1].name == mod.name:
@@ -277,12 +279,12 @@ def derive_model_spec(
             counts.append(1)
     mixer_slot = SwitchSlot("mixer", tuple(branches), tuple(counts))
     assert canon_ffn is not None
-    ffn_mod = instantiate_spec_module(canon_ffn)
+    ffn_mod = instantiate_spec_module(canon_ffn, g=g)
     own_lt = cls.__dict__.get("layer_type_name") if isinstance(cls, type) else None
-    lt_name = own_lt or (
-        cls.layer_type_name
-        if cls.__dict__.get("name")
-        else f"{mname.replace('_', '')}_layer"
+    lt_name = (
+        own_lt
+        or (cls.layer_type_name if cls.__dict__.get("name") else None)
+        or f"{mname.replace('_', '')}_layer"
     )
     return ModelSpec(
         name=mname,
@@ -301,10 +303,12 @@ def _synth_layer_types(cls: Any, g: ModelGeometry) -> tuple[str, list[str]] | No
         raise MegakernelConfigError(f"Invalid layers L={g.L}, att_every={g.att_every}")
     m = cls.schedule.mixer.mapping
     att_k = next(
-        (k for k, b in m.items() if issubclass(_module_cls_of(b), GQAModule)), None
+        (k for k, b in m.items() if issubclass(schedule._module_cls_of(b), GQAModule)),
+        None,
     )
     rec_k = next(
-        (k for k, b in m.items() if issubclass(_module_cls_of(b), GDNModule)), None
+        (k for k, b in m.items() if issubclass(schedule._module_cls_of(b), GDNModule)),
+        None,
     )
     if att_k is None or (g.att_every > 1 and rec_k is None):
         raise MegakernelConfigError(
@@ -316,7 +320,7 @@ def _synth_layer_types(cls: Any, g: ModelGeometry) -> tuple[str, list[str]] | No
 
 def resolve_model_schedule(cls: Any, hf_config_or_geom: Any = None) -> ResolvedSchedule:
     """Resolve per-layer schedule for `hf_config_or_geom`."""
-    mname = model_label(cls)
+    mname = validate.model_label(cls)
     if not isinstance(cls.schedule, Schedule):
         raise MegakernelConfigError(f"ModelDef {mname!r}: `schedule` must be Schedule")
     if isinstance(hf_config_or_geom, ModelGeometry):
@@ -334,8 +338,7 @@ def hf_config_for_geometry(
     out = _merged_cfg(cls._effective_hf_config(hf_config), {})
     updates: dict[str, Any] = {}
     for k, v in cls._from_hf_decl().fields.items():
-        hf_k = v[0] if isinstance(v, tuple) else v
-        if isinstance(hf_k, str):
+        if (hf_k := _hf_str_key(v)) is not None:
             if k == "layers":
                 updates[hf_k] = int(g.L)
             elif k == "hidden":
@@ -347,12 +350,8 @@ def hf_config_for_geometry(
                 updates[hf_k] = min(v_sz, int(max_vocab))
     sched = cls.resolve_schedule(g)
     gqa_m = {"heads": int(g.NH), "kv_heads": int(g.NKV), "head_dim": int(g.HD)}
-    gdn_m: dict[str, Any] = {
-        "k_heads": int(g.KH),
-        "v_heads": int(g.VH),
-        "k_dim": int(g.KD),
-        "v_dim": int(g.VD),
-    }
+    gdn_m: dict[str, Any] = {"k_heads": int(g.KH), "v_heads": int(g.VH)}
+    gdn_m.update(k_dim=int(g.KD), v_dim=int(g.VD))
     gdn_b = cls._find_binding(GDNModule, sched)
     if gdn_b and (
         "gate" in gdn_b.explicit_fields
@@ -368,15 +367,16 @@ def hf_config_for_geometry(
     ):
         if b is not None:
             for canon, val in mapping.items():
-                spec_v = b.fields.get(canon)
-                hf_k = spec_v[0] if isinstance(spec_v, tuple) else spec_v
-                if isinstance(hf_k, str):
+                if (hf_k := _hf_str_key(b.fields.get(canon))) is not None:
                     updates[hf_k] = val
     if (synth := _synth_layer_types(cls, g)) is not None:
         updates[synth[0]] = synth[1]
     out.update(updates)
-    if isinstance(out.get("text_config"), Mapping):
-        out["text_config"] = {**out["text_config"], **updates}
+    tc = out.get("text_config")
+    if isinstance(tc, Mapping):
+        out["text_config"] = {**tc, **updates}
+    elif tc is not None:
+        out["text_config"] = {**_pub_vars(tc), **updates}
     return out
 
 

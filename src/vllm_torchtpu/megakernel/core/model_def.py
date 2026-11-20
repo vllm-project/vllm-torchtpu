@@ -134,6 +134,15 @@ class ModelDef:
     def _find_binding(
         cls, target_cls: type[Module], sched: ResolvedSchedule
     ) -> ModuleBinding | None:
+        ovs = cls.schedule.overrides if isinstance(cls.schedule, Schedule) else {}
+        for slot_name, seq in (("mixer", sched.mixer), ("ffn", sched.ffn)):
+            for i, b in enumerate(seq):
+                if (
+                    slot_name not in ovs.get(i, {})
+                    and isinstance(b, ModuleBinding)
+                    and issubclass(b.module_cls, target_cls)
+                ):
+                    return b
         for b in (*sched.mixer, *sched.ffn):
             if isinstance(b, ModuleBinding) and issubclass(b.module_cls, target_cls):
                 return b
@@ -176,7 +185,7 @@ class ModelDef:
         g = cls.derive_geometry(hf_config_or_geom)
         return pool.make_pool_backend(
             cls.pool_layout(g, R=R),
-            check=getattr(g, "check", None),
+            check=g.check,
             rec_chunk=GDNModule.chunk_rows,
         )
 
@@ -253,6 +262,11 @@ def register_model(
     replace: bool = False,
 ) -> Callable[[type[ModelDef]], type[ModelDef]]:
     """Class decorator registering a declarative `ModelDef` subclass."""
+    if isinstance(hf_architectures, (str, bytes)):
+        raise MegakernelConfigError(
+            f"register_model({name!r}): hf_architectures must be a sequence of "
+            f"strings, got {hf_architectures!r}"
+        )
     archs = tuple(hf_architectures)
     mtypes = (
         ()

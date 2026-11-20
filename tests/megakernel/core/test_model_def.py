@@ -19,10 +19,12 @@ import dataclasses
 import inspect
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from tests.megakernel.core.megakernel_fakes import TINY_TILES
@@ -38,6 +40,7 @@ from vllm_torchtpu.megakernel.core import (
     spec,
     validate,
 )
+from vllm_torchtpu.megakernel.core.decls import REQUIRED
 from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.core.model_def import (
@@ -210,10 +213,12 @@ def assert_specs_equal(spec_a: ModelSpec, spec_b: ModelSpec) -> None:
         assert_modules_equal(ba, bb)
 
 
-class _DenseMLPModule(MoEModule):
+class _DenseMLPModule(Module):
     """Test-only dense-FFN override module (shared SwiGLU MLP, no routed experts)."""
 
-    routed_experts = False
+    name = "dense_mlp"
+    GEOMETRY_FIELDS = {"shared_inter": ("shared_expert_intermediate_size", REQUIRED)}
+    OPTIONS = {"shared_gate": True}
 
     def reference(
         self,
@@ -224,9 +229,8 @@ class _DenseMLPModule(MoEModule):
         g: Any = None,
         ex: ExecSpec,
         layer_idx: int = 0,
-        moe_tp: bool | None = None,
+        **_: Any,
     ) -> tuple[jax.Array, Any]:
-        del moe_tp
         geom = self._require_geometry(g)
         R, B = ex.R, ex.B
         ISR = int(geom.IS) // R
@@ -832,9 +836,6 @@ def test_synthetic_model_def_every2_spec_reference_and_override_errors(
 
     dense_mlp = _DenseMLPModule.bind(
         prefix="mlp",
-        experts="num_experts",
-        top_k="num_experts_per_tok",
-        inter="moe_intermediate_size",
         shared_inter="shared_expert_intermediate_size",
         shared_gate=True,
     )
@@ -925,3 +926,321 @@ def test_synthetic_model_def_every2_spec_reference_and_override_errors(
         ) as fn_exc:
             fn_call()
         assert "layer " not in str(fn_exc.value)
+
+
+def test_model_def_random_reference_step_matches_independent_loop_and_norm_renames(
+    isolated_model_registry,
+):
+    """`reference_step` with random non-zero weights matches an independent loop
+    across `T=1`, `T=2` verify, `pool_io=True`, and `Norm.bind(..., rename=...)`."""
+    from vllm_torchtpu.megakernel.core.ops import rmsnorm
+    from vllm_torchtpu.megakernel.core.weights.spec_inputs import random_spec_inputs
+
+    hf_cfg = {
+        "hidden_size": 256,
+        "num_hidden_layers": 4,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 500_000.0,
+        "partial_rotary_factor": 0.25,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "num_experts": 128,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 256,
+        "shared_expert_intermediate_size": 256,
+    }
+
+    @register_model(name="synth_rand_ref")
+    class SynthRandRef(ModelDef):
+        default_hf_config = hf_cfg
+        geometry = FromHF(
+            hidden="hidden_size",
+            layers="num_hidden_layers",
+            eps="rms_norm_eps",
+            rope_theta="rope_theta",
+            rope_partial=("partial_rotary_factor", 1.0),
+        )
+        attn = GQA.bind(
+            prefix="self_attn",
+            heads="num_attention_heads",
+            kv_heads="num_key_value_heads",
+            head_dim="head_dim",
+            qk_norm=True,
+            output_gate=True,
+        )
+        linear = GDN.bind(
+            prefix="linear_attn",
+            k_heads="linear_num_key_heads",
+            v_heads="linear_num_value_heads",
+            k_dim="linear_key_head_dim",
+            v_dim="linear_value_head_dim",
+            conv_kernel="linear_conv_kernel_dim",
+        )
+        moe = MoE.bind(
+            prefix="mlp",
+            experts="num_experts",
+            top_k="num_experts_per_tok",
+            inter="moe_intermediate_size",
+            shared_inter="shared_expert_intermediate_size",
+            shared_gate=True,
+        )
+        schedule = Schedule(
+            mixer=Every(n=2, last=attn, rest=linear),
+            ffn=moe,
+            pre_norm=Norm.bind(
+                "input_layernorm",
+                zero_centered=True,
+                rename={"in_norm": "renamed_pre_ln"},
+            ),
+            post_norm=Norm.bind(
+                "post_attention_layernorm",
+                zero_centered=True,
+                rename={"post_norm": "renamed_post_ln"},
+            ),
+        )
+        final_norm = Norm.bind(
+            "model.norm",
+            zero_centered=True,
+            rename={"final_norm": "renamed_final_ln"},
+        )
+
+    g = SynthRandRef.derive_geometry(hf_cfg)
+    ms = SynthRandRef.to_model_spec(g, R=2)
+
+    for t_val, pool_io in ((1, False), (2, True)):
+        ex = ExecSpec(R=2, B=2 * t_val, T=t_val, ctx=128, interpret=True)
+        pos, hid, w_spec, st_in = random_spec_inputs(
+            jax.random.PRNGKey(30 + t_val), ms, ex
+        )
+        spec_out, spec_st = reference.spec_reference_step(
+            ms, g, ex, pos, hid, w_spec, st_in, paged_kv=pool_io, pool_io=pool_io
+        )
+        # Move norm weights under their renamed keys and poison default keys so
+        # dropping `rename` in `composed_reference_step` would produce wrong values.
+        w_renamed = dict(w_spec)
+        w_renamed["renamed_pre_ln"] = w_renamed.pop("in_norm")
+        w_renamed["renamed_post_ln"] = w_renamed.pop("post_norm")
+        w_renamed["renamed_final_ln"] = w_renamed.pop("final_norm")
+        w_renamed["in_norm"] = jnp.full_like(w_renamed["renamed_pre_ln"], 99.0)
+        w_renamed["post_norm"] = jnp.full_like(w_renamed["renamed_post_ln"], -77.0)
+        w_renamed["final_norm"] = jnp.full_like(w_renamed["renamed_final_ln"], 55.0)
+
+        got_out, got_st = SynthRandRef.reference_step(
+            g, ex, pos, hid, w_renamed, st_in, paged_kv=pool_io, pool_io=pool_io
+        )
+        assert not jnp.allclose(got_out, 0.0)
+        np.testing.assert_array_equal(np.asarray(got_out), np.asarray(spec_out))
+        assert set(got_st) == set(spec_st)
+        for k in spec_st:
+            np.testing.assert_array_equal(np.asarray(got_st[k]), np.asarray(spec_st[k]))
+
+        # Independent manual layer loop calling module `.reference()` directly.
+        gqa_ref = GQAModule(geometry=g, qk_norm=True, output_gate=True)
+        gdn_ref = GDNModule(geometry=g)
+        moe_ref = MoEModule(geometry=g, shared_gate=True)
+        step_st, c_in, r_in, ngdn, vh, kd, vd = reference.prepare_reference_step_state(
+            st_in, g, ex, pool_io=pool_io, include_gdn_defaults=True
+        )
+        res = hid[: ex.B].astype(F32)
+        for lyr in range(g.L):
+            x_m = rmsnorm(
+                res, w_renamed["renamed_pre_ln"][lyr], g.eps, zero_centered=True
+            )
+            if (lyr + 1) % g.att_every == 0:
+                m_d, step_st = gqa_ref.reference(
+                    w_spec,
+                    x_m,
+                    step_st,
+                    g=g,
+                    ex=ex,
+                    pos=pos,
+                    att_idx=lyr // g.att_every,
+                    layer_idx=lyr,
+                    paged_kv=pool_io,
+                )
+            else:
+                m_d, step_st = gdn_ref.reference(
+                    w_spec,
+                    x_m,
+                    step_st,
+                    g=g,
+                    ex=ex,
+                    gdn_idx=lyr - lyr // g.att_every,
+                    layer_idx=lyr,
+                    multi_layer=True,
+                )
+            res = round_bf16(res + m_d)
+            x_f = rmsnorm(
+                res, w_renamed["renamed_post_ln"][lyr], g.eps, zero_centered=True
+            )
+            f_d, step_st = moe_ref.reference(
+                w_spec, x_f, step_st, g=g, ex=ex, layer_idx=lyr
+            )
+            res = round_bf16(res + f_d)
+        manual_out = rmsnorm(
+            res, w_renamed["renamed_final_ln"], g.eps, zero_centered=True
+        ).astype(BF16)
+        manual_st = reference.finalize_reference_step_state(
+            step_st, c_in, r_in, ngdn, vh, kd, vd, ex, pool_io=pool_io
+        )
+        np.testing.assert_array_equal(np.asarray(got_out), np.asarray(manual_out))
+        for k in manual_st:
+            np.testing.assert_array_equal(
+                np.asarray(got_st[k]), np.asarray(manual_st[k])
+            )
+
+
+def test_derive_regressions_sigmoid_moe_overrides_shrink_rope_and_experts(
+    isolated_model_registry,
+):
+    """Cover #3609 review regressions across `derive.py` and `model_def.py`."""
+    base_cfg = {
+        "vocab_size": 64000,
+        "hidden_size": 1024,
+        "num_hidden_layers": 8,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 500_000.0,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "k_heads": 8,
+        "v_heads": 16,
+        "k_dim": 128,
+        "v_dim": 128,
+        "conv_kernel": 4,
+        "num_experts": 128,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 512,
+        "shared_expert_intermediate_size": 512,
+        "gdn_gate_act": "sigmoid",
+        "layer_types": (["linear_attention", "full_attention"] * 4),
+    }
+
+    attn = GQA.bind("self_attn")
+    gdn_hf_gate = GDN.bind("linear_attn")
+    moe_def = MoE.bind("mlp", experts=("num_experts", 128))
+    in_norm = Norm.bind("input_layernorm", zero_centered=True)
+    post_norm = Norm.bind("post_attention_layernorm", zero_centered=True)
+    final_norm_b = Norm.bind("model.norm", zero_centered=True)
+
+    # 1) HF-config `sigmoid` gate without `opts["gate"]` works in `to_model_spec`.
+    @register_model(name="sigmoid_hf_model")
+    class SigmoidHFModel(ModelDef):
+        default_hf_config = base_cfg
+        geometry = FromHF(
+            hidden="hidden_size",
+            layers="num_hidden_layers",
+            vocab="vocab_size",
+            eps="rms_norm_eps",
+            gdn_gate="gdn_gate_act",
+        )
+        schedule = Schedule(
+            mixer=FromHFLayerTypes(
+                "layer_types", {"full_attention": attn, "linear_attention": gdn_hf_gate}
+            ),
+            ffn=moe_def,
+            pre_norm=in_norm,
+            post_norm=post_norm,
+        )
+        final_norm = final_norm_b
+
+    spec_sig = SigmoidHFModel.to_model_spec(base_cfg, moe_tp=False, e_slots=24, R=8)
+    gdn_branch = next(m for m in spec_sig.all_modules() if isinstance(m, GDNModule))
+    moe_slot = next(m for m in spec_sig.all_modules() if isinstance(m, MoEModule))
+    assert gdn_branch.gate == "sigmoid"
+    # 2) MoE module in ModelSpec matches geometry moe_tp / e_slots overrides.
+    assert spec_sig.config.moe_tp is False and spec_sig.config.e_slots == 24
+    assert moe_slot.moe_tp is False and moe_slot.e_slots == 24
+    assert moe_slot.hf_params()  # works without passing g explicitly
+
+    # Explicit MoE.bind(moe_tp=True) fails closed in to_model_spec when moe_tp=False.
+    class _PinnedTPModel(SigmoidHFModel):
+        schedule = Schedule(
+            mixer=Every(n=2, last=attn, rest=gdn_hf_gate),
+            ffn=MoE.bind("mlp", moe_tp=True),
+            pre_norm=in_norm,
+            post_norm=post_norm,
+        )
+
+    with pytest.raises(MegakernelConfigError, match="moe_tp"):
+        _PinnedTPModel.to_model_spec(base_cfg, moe_tp=False, R=8)
+
+    # 3) Layer-0 overrides do not hijack canonical geometry / hf_config_for_geometry.
+    ov_attn = GQA.bind("self_attn", heads=32, kv_heads=8, head_dim=256)
+    ov_moe = MoE.bind("mlp", experts=256, top_k=4, inter=2048, shared_inter=2048)
+
+    class _Layer0OverriddenModel(SigmoidHFModel):
+        schedule = Schedule(
+            mixer=Every(n=2, last=attn, rest=gdn_hf_gate),
+            ffn=moe_def,
+            pre_norm=in_norm,
+            post_norm=post_norm,
+            overrides={0: {"ffn": ov_moe}, 1: {"mixer": ov_attn}},
+        )
+
+    g_ov = _Layer0OverriddenModel.derive_geometry(base_cfg)
+    assert (g_ov.NH, g_ov.NKV, g_ov.E, g_ov.TOPK, g_ov.I) == (8, 2, 128, 2, 512)
+
+    # 4) hf_config_for_geometry + shrink_hf_config on Every & FromHFLayerTypes,
+    #    including Mapping and non-Mapping (SimpleNamespace) text_config.
+    for model_cls in (SigmoidHFModel, _PinnedTPModel):
+        shrunk_d = model_cls.shrink_hf_config(
+            {"model_type": "m", "text_config": dict(base_cfg)}, periods=1, R=8
+        )
+        g_exp = model_cls.shrink(base_cfg, periods=1, R=8)
+        assert model_cls.derive_geometry(shrunk_d) == g_exp
+        ns_cfg = SimpleNamespace(
+            model_type="m", text_config=SimpleNamespace(**base_cfg)
+        )
+        shrunk_ns = model_cls.shrink_hf_config(ns_cfg, periods=1, R=8)
+        assert isinstance(shrunk_ns["text_config"], dict)
+        assert model_cls.derive_geometry(shrunk_ns) == g_exp
+        capped = derive.hf_config_for_geometry(model_cls, g_exp, ns_cfg, max_vocab=1024)
+        assert capped["vocab_size"] == 1024
+        assert capped["text_config"]["vocab_size"] == 1024
+
+    # 5) Scaled RoPE inside `text_config` fails even with default top-level RoPE.
+    nested_yarn = {
+        **base_cfg,
+        "rope_parameters": {"rope_type": "default", "rope_theta": 500_000.0},
+        "text_config": {**base_cfg, "rope_parameters": {"rope_type": "yarn"}},
+    }
+    with pytest.raises(MegakernelConfigError, match="yarn"):
+        SigmoidHFModel.derive_geometry(nested_yarn)
+
+    # 6) Tuple default on `experts`, alias lookup, and bool rejection.
+    cfg_no_exp = {k: v for k, v in base_cfg.items() if k != "num_experts"}
+    assert SigmoidHFModel.derive_geometry(cfg_no_exp).E == 128
+
+    class _AliasMoEModel(SigmoidHFModel):
+        schedule = Schedule(
+            mixer=Every(n=2, last=attn, rest=gdn_hf_gate),
+            ffn=MoE.bind("mlp"),
+            pre_norm=in_norm,
+            post_norm=post_norm,
+        )
+
+    assert _AliasMoEModel.derive_geometry({**cfg_no_exp, "E": 96}).E == 96
+    assert _AliasMoEModel.derive_geometry({**cfg_no_exp, "experts": 64}).E == 64
+    with pytest.raises(MegakernelConfigError, match="supports MoE checkpoints only"):
+        _AliasMoEModel.derive_geometry({**cfg_no_exp, "num_experts": True})
+
+    # Bare string `hf_architectures` fails; class-body `name` keeps `layer_type_name`.
+    with pytest.raises(MegakernelConfigError, match="hf_architectures"):
+        register_model(name="bad_str_arch", hf_architectures="NotATuple")(  # type: ignore[arg-type]
+            SigmoidHFModel
+        )
+
+    class _NamedInBodyModel(SigmoidHFModel):
+        name = "named_in_body"
+
+    assert (
+        _NamedInBodyModel.to_model_spec(base_cfg, R=8).layer_type.name
+        == "namedinbody_layer"
+    )

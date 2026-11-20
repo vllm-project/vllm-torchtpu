@@ -53,6 +53,25 @@ def _make_ref_module(m: ModuleOrBinding | None, g: ModelGeometry) -> Module | No
     return m.module_cls(geometry=g, prefix=m.prefix, **opts)
 
 
+def _norm_weight(
+    orig: ModuleOrBinding | None,
+    mod: Module,
+    logical_weights: Mapping[str, Any],
+    fallback: str,
+) -> Any:
+    if not isinstance(mod, NormModule):
+        return logical_weights[fallback]
+    canon = mod.canonical_param_name(mod.prefix)
+    key = (
+        orig.rename.get(canon, canon)
+        if isinstance(orig, ModuleBinding)
+        else mod.renamed_param_name(mod.prefix)
+    )
+    if key != canon:
+        return logical_weights[key]
+    return logical_weights[key if key in logical_weights else fallback]
+
+
 def prepare_reference_step_state(
     logical_states: Mapping[str, Any],
     g: Any,
@@ -64,8 +83,7 @@ def prepare_reference_step_state(
     """Prepare mutable `step_state` dict (including GDN `conv_out`/`rec_out`)."""
     R, B, T, NS = ex.R, ex.B, ex.T, ex.NS
     # Forward all logical state keys into `step_state` so custom module states
-    # reach `reference` / `module_oracle` unmodified; `_compare_state_dict`
-    # requires the kernel to return every state key present in `ref_st`.
+    # reach `Module.reference()` unmodified and survive in the returned dict.
     step_state: dict[str, Any] = dict(logical_states)
     CR, HR = round_up(3 * B, 8), round_up(3 + T, 8)
     vh = KD = VD = 0
@@ -165,12 +183,7 @@ def composed_reference_step(
             raise MegakernelConfigError(
                 f"layer {lyr} slot 'pre_norm' is None (kernel requires pre_norm)"
             )
-        pre_key = (
-            pre_mod.renamed_param_name(pre_mod.prefix, g)
-            if isinstance(pre_mod, NormModule)
-            else "in_norm"
-        )
-        pre_w = logical_weights[pre_key if pre_key in logical_weights else "in_norm"]
+        pre_w = _norm_weight(sched.pre_norm[lyr], pre_mod, logical_weights, "in_norm")
         x_mix = pre_mod.reference(pre_w[lyr], res, g=g)[0]
         mix_mod = _make_ref_module(sched.mixer[lyr], g)
         if mix_mod is None:
@@ -186,7 +199,7 @@ def composed_reference_step(
         elif isinstance(mix_mod, GDNModule):
             mix_kw = {"gdn_idx": b_idx, "layer_idx": lyr, "multi_layer": True}
         else:
-            mix_kw = {"branch_idx": b_idx, "layer_idx": lyr}
+            mix_kw = {"branch_idx": b_idx, "layer_idx": lyr, "pos": pos}
         mix_delta, step_state = mix_mod.reference(
             logical_weights, x_mix, step_state, g=g, ex=ex, **mix_kw
         )
@@ -196,14 +209,9 @@ def composed_reference_step(
             raise MegakernelConfigError(
                 f"layer {lyr} slot 'post_norm' is None (kernel requires post_norm)"
             )
-        post_key = (
-            post_mod.renamed_param_name(post_mod.prefix, g)
-            if isinstance(post_mod, NormModule)
-            else "post_norm"
+        post_w = _norm_weight(
+            sched.post_norm[lyr], post_mod, logical_weights, "post_norm"
         )
-        post_w = logical_weights[
-            post_key if post_key in logical_weights else "post_norm"
-        ]
         x_ffn = post_mod.reference(post_w[lyr], res, g=g)[0]
         ffn_mod = _make_ref_module(sched.ffn[lyr], g)
         if ffn_mod is None:
@@ -214,14 +222,9 @@ def composed_reference_step(
         res = round_bf16(res + ffn_delta)
 
     fn_mod = _make_ref_module(final_norm, g)
-    if fn_mod is None:
+    if fn_mod is None or final_norm is None:
         raise MegakernelConfigError("final_norm is None (kernel requires final_norm)")
-    fn_key = (
-        fn_mod.renamed_param_name(fn_mod.prefix, g)
-        if isinstance(fn_mod, NormModule)
-        else "final_norm"
-    )
-    fn_w = logical_weights[fn_key if fn_key in logical_weights else "final_norm"]
+    fn_w = _norm_weight(final_norm, fn_mod, logical_weights, "final_norm")
     out_b = fn_mod.reference(fn_w, res, g=g, out_dtype=BF16)[0]
     out_states = finalize_reference_step_state(
         step_state, conv_in, rec_in, ngdn, vh, KD, VD, ex, pool_io=pool_io
