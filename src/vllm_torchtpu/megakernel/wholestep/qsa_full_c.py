@@ -366,7 +366,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         256 / 384 / 512), each a whole number of score chunks (`RS` rows) and of 128-row
         prefix chunks when S is (`ix.exclusive_prefix`)."""
         ok = lambda x: x % RS == 0 and (x % 128 == 0 or S % 128)  # noqa: E731
-        return tuple(x for x in (S // 2, 3 * S // 4) if x and ok(x)) + (S,)
+        lows = (S // 2,) if self.tier_two else (S // 2, 3 * S // 4)
+        return tuple(x for x in lows if x and ok(x)) + (S,)
 
     def _by_tier(self, nv: Any, tiers: tuple, fn: Any) -> Any:
         """`fn(Sx)` for the smallest tier `Sx` with `Sx * 128 >= nv` (scalar visible
@@ -779,7 +780,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             RS = S // NC
             # VLLM_TPU_MK_QSA_THR_FAST "r": static row tiers (not under compressed_dcp, whose
             # score positions are not in group order).
-            tiers = self._thr_tiers(S, RS) if self.thr_tiers and not cdcp else ()
+            tiers_all = self._thr_tiers(S, RS) if not cdcp else ()
+            tiers = tiers_all if self.thr_tiers else ()
+            ctiers = tiers_all if self.cmp_tiers else ()
 
             def thr_full(nvm: Any) -> Any:
                 """`ix.thresholds` of rows [lo, lo + n) over all S score rows, or (tiers) over
@@ -885,14 +888,14 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 return tail(r, *full_row(r), carry)
 
             def full_row(r: Any) -> Any:
-                if not tiers:
+                if not ctiers:
                     return scan_row(r, S, consts, lid)
 
                 def scan(Sx: int) -> Any:
                     cx = ix.compact_consts(Sx, K)
                     return scan_row(r, Sx, cx, cx[-1])
 
-                return self._by_tier(ctx.extra[NVIS][r], tiers, scan)
+                return self._by_tier(ctx.extra[NVIS][r], ctiers, scan)
 
             def scan_row(r: Any, Sx: int, consts: Any, lid: Any) -> Any:
                 """Row `r`'s selection and compaction over score rows [0, Sx) (Sx < S: a
