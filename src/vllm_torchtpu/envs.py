@@ -267,6 +267,9 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_SPACING_MIN_TOKENS: int = 8192
     VLLM_TPU_PREFILL_TPOT_TARGET_MS: float = 0.0
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
+    VLLM_TPU_PREFILL_TPOT_PRICED: bool = False
+    VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON: float = 1.0
+    VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S: float = 0.0
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS: int = 0
@@ -1731,6 +1734,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # target alone may defer prefill for; the next step then runs prefill.
     "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S": env_nonnegative_float(
         "VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S", 10.0
+    ),
+    # PrefillSpacingScheduler: while the TPOT target defers prefill, still run
+    # whole remaining prefills up to the largest prefill-token bin (512-4096)
+    # whose measured step time fits every decoding request's slack.
+    "VLLM_TPU_PREFILL_TPOT_PRICED": env_bool("VLLM_TPU_PREFILL_TPOT_PRICED"),
+    # PrefillSpacingScheduler: the TPOT target defers prefill while a decoding
+    # request's slack is below this many long-chunk step prices (long minus
+    # decode step time). Above 1 it also covers the step async scheduling has
+    # already queued when the decision is made.
+    "VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON", 1.0
+    ),
+    # PrefillSpacingScheduler: the TPOT target does not defer prefill while a
+    # pending prefill (waiting or chunking) arrived more than this many seconds
+    # ago, which bounds how long holds starve a prompt's TTFT. 0 turns it off.
+    "VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S", 0.0
     ),
     # MiniMax M3 DCP steps of at most this many tokens merge the attention
     # partials with one packed all-to-all instead of an LSE all-gather plus an
