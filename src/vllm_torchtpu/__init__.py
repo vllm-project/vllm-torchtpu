@@ -793,7 +793,11 @@ def _patch_vllm_offloading_config_build() -> None:
     def build_offloading_config_tpu(vllm_config, kv_cache_config):
         pcp = vllm_config.parallel_config.prefill_context_parallel_size
         dcp = vllm_config.parallel_config.decode_context_parallel_size
-        if pcp <= 1 and dcp > 1:
+        from vllm_torchtpu import envs as _envs
+
+        # The PCP manager keeps the KV cache DCP-sharded only (DCP = TP x PCP),
+        # so its pages span `dcp` ranks, not `dcp x pcp`.
+        if (pcp <= 1 or _envs.USE_TPU_PCP_MANAGER) and dcp > 1:
             return build_offloading_config_dcp(vllm_config, kv_cache_config, dcp)
         if pcp <= 1:
             return original_build(vllm_config, kv_cache_config)
@@ -1361,6 +1365,21 @@ def _patch_raiden_identity_keeps_cp_interleave() -> None:
     )
 
 
+def _pcp_manager_dcp_only_kv(parallel_config) -> bool:
+    """True when USE_TPU_PCP_MANAGER keeps the KV cache DCP-sharded only.
+
+    The PCP manager requires decode_context_parallel_size ==
+    tensor_parallel_size * prefill_context_parallel_size, and pages then span
+    the dcp ranks alone, as under plain DCP.
+    """
+    from vllm_torchtpu import envs as _envs
+
+    pcp = int(parallel_config.prefill_context_parallel_size or 1)
+    return bool(_envs.USE_TPU_PCP_MANAGER) and int(
+        parallel_config.decode_context_parallel_size or 1
+    ) == int(parallel_config.tensor_parallel_size or 1) * pcp
+
+
 def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
     """Return the fine prefix-hit unit for a single-group DCP model, or None.
 
@@ -1389,7 +1408,14 @@ def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
         unit is None
         or not cache_config.enable_prefix_caching
         or dcp <= 1
-        or parallel_config.prefill_context_parallel_size != 1
+        # Upstream PCP shards KV over dcp x pcp ranks, so a fine hit would split
+        # a logical page across PCP. The PCP manager keeps DCP = TP x PCP: KV
+        # pages span the dcp ranks only (the scheduler hashes with
+        # pcp_world_size=1), exactly as without PCP.
+        or (
+            parallel_config.prefill_context_parallel_size != 1
+            and not _pcp_manager_dcp_only_kv(parallel_config)
+        )
         # P/D connectors consume block hashes at block granularity. CPU
         # offloading connectors do not, nor does a Raiden GLM DCP identity
         # producer (it ships whole pages) with a Raiden offload tier next to it
@@ -1471,7 +1497,8 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
                 ):
                     logger.warning(
                         "prefix_match_unit=%s is not applied under DCP for this "
-                        "config (needs prefix caching, no PCP, no KV connector, "
+                        "config (needs prefix caching, no PCP unless USE_TPU_PCP_MANAGER, "
+                        "no KV connector, "
                         "a single full-attention/MLA group, and a unit smaller "
                         "than block_size*dcp); prefix hits stay block-aligned.",
                         vllm_config.cache_config.prefix_match_unit,

@@ -65,6 +65,13 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS: int = 2048
     TPU_MLA_DECODE_BODY_LEVERS: str = "1"
     TPU_DCP_MLA_MIXED_KERNEL_V2: bool = True
+    USE_TPU_PCP_MANAGER: bool = False
+    TPU_PCP_INDEXER_SAL: bool = False
+    TPU_PCP_PACKED_ROPE: bool = False
+    TPU_PCP_KV_WORKSPACE_TOKENS: int = 1048576
+    TPU_PCP_KV_CHUNK_TOKENS: int = 65536
+    TPU_PCP_WS_NO_ZERO_FILL: bool = False
+    TPU_PCP_GATHER_HOIST: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -839,6 +846,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copies through the LSE merge. Bit-identical outputs. On by default on
     # glm-agentx (it replaces the branch's TPU_DCP_MLA_SPLIT_Q_LSE).
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=True),
+    # Run PCP through `runner/pcp/manager.py` (PCP x DCP KV gather).
+    "USE_TPU_PCP_MANAGER": env_bool("USE_TPU_PCP_MANAGER", default=False),
+    # PCP manager: allow the SEQ_ALONG_LANE ('sal') indexer K cache (132 B per
+    # token instead of HEAD_ALONG_SUBLANE's 256). The split-prefill top-k then
+    # writes with the SAL writer and gathers a SAL workspace. Off: 'sal' falls
+    # back to (or, if explicit, is rejected in favour of) HEAD_ALONG_SUBLANE.
+    "TPU_PCP_INDEXER_SAL": env_bool("TPU_PCP_INDEXER_SAL", default=False),
+    # PCP manager: allow TPU_SPARSE_MLA_PACKED_ROPE (64 B rope per token, eight
+    # tokens per cache row, instead of one padded 128-byte row). The split
+    # prefill gathers whole pages into its workspace, so the packed rows carry
+    # over and the attention kernel expands them (`packed_rope=True`).
+    "TPU_PCP_PACKED_ROPE": env_bool("TPU_PCP_PACKED_ROPE", default=False),
+    # PCP manager: max context tokens one forward's prefills may gather.
+    "TPU_PCP_KV_WORKSPACE_TOKENS": env_int("TPU_PCP_KV_WORKSPACE_TOKENS", 1048576),
+    # PCP manager: context tokens gathered per all-gather chunk.
+    "TPU_PCP_KV_CHUNK_TOKENS": env_int("TPU_PCP_KV_CHUNK_TOKENS", 65536),
+    # PCP manager split prefill: do not zero the latent KV workspace
+    # (TPU_PCP_KV_WORKSPACE_TOKENS rows) before the chunks land on every layer;
+    # only gathered rows are ever attended. Same output.
+    "TPU_PCP_WS_NO_ZERO_FILL": env_bool("TPU_PCP_WS_NO_ZERO_FILL", default=False),
+    # PCP manager split prefill: gather the latent workspace's first chunk in
+    # the split-row write op, outside the attention's lax.cond / chunk loop,
+    # so XLA can run it as an async all-gather. Same output. It is only async
+    # as a SparseCore all-gather: NoPE + RoPE are one 36 MiB collective per
+    # 64k-token chunk, so also set SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES at
+    # or below 33554432 (default 64 MiB on v7x keeps it a synchronous
+    # TensorCore all-gather). XLA does not overlap it across a lax.cond (the
+    # indexer's), only with top-level work (e.g. the q projections).
+    "TPU_PCP_GATHER_HOIST": env_bool("TPU_PCP_GATHER_HOIST", default=False),
     # DCP sparse MLA: chunks of at most this many query tokens take the
     # decode-sized (small-chunk) path -- TPU_DCP_MLA_SMALL_CHUNK_BATCH tokens
     # per grid step and the one-atom live-bounded SparseCore gather

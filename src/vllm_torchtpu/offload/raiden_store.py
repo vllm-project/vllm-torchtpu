@@ -2282,7 +2282,13 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             f"{config.cache.blocks_per_chunk}"
         )
         parallel = config.parallel
-        assert not (parallel.pcp_size > 1 and parallel.dcp_size > 1), (
+        from vllm_torchtpu import envs as _tpu_envs
+
+        # The PCP manager keeps the KV cache DCP-sharded only (DCP = TP x PCP):
+        # each rank still stores its own rank-local pages, and a scheduler
+        # block spans dcp ranks rather than pcp x dcp.
+        pcp_manager = bool(_tpu_envs.USE_TPU_PCP_MANAGER)
+        assert pcp_manager or not (parallel.pcp_size > 1 and parallel.dcp_size > 1), (
             "TPURaidenOffloadingConnector: concurrent PCP and DCP is not "
             f"supported: got pcp={parallel.pcp_size}, dcp={parallel.dcp_size}"
         )
@@ -2330,7 +2336,11 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         # scales by pcp_size * dcp_size so OffloadKey spans match scheduler blocks.
         for group_config, group in zip(config.groups, kv_cache_config.kv_cache_groups):
             if isinstance(group.kv_cache_spec, AttentionSpec):
-                expected_cp_scale = parallel.pcp_size * parallel.dcp_size
+                expected_cp_scale = (
+                    parallel.dcp_size
+                    if pcp_manager
+                    else parallel.pcp_size * parallel.dcp_size
+                )
                 assert group_config.tokens_per_block == (
                     group.kv_cache_spec.block_size * expected_cp_scale
                 ), (

@@ -879,6 +879,7 @@ def test_decode_prologue_impl_routes_to_rope_op(monkeypatch):
         attn_mod.PallasMLAttentionBackendImpl
     )
     impl.dcp_size = g
+    impl.pcp_kv_gather = False
     monkeypatch.setattr(
         attn_mod,
         "merge_lse_partials_scatter_heads",
