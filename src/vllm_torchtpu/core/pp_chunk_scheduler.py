@@ -212,8 +212,10 @@ class TpuPipelineChunkScheduler(Scheduler):
             kv_transfer_config is not None
             and kv_transfer_config.kv_role == "kv_producer"
         )
-        # As in PrefixAwareScheduler: kv_both (an offloading connector on an
-        # aggregated engine) is also a producer, so it is not a consumer here.
+        # As in PrefixAwareScheduler: vLLM's role properties count kv_both (an
+        # offloading connector on an aggregated engine) as a producer too, so
+        # it is not a consumer here; nor is it a producer above, so it has
+        # neither role.
         self._is_kv_consumer = (
             kv_transfer_config is not None
             and kv_transfer_config.is_kv_consumer

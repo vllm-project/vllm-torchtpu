@@ -212,7 +212,6 @@ def test_external_hit_counts_when_it_fits():
         _req("dram_small", 100_000, now - 1),  # 2,000 uncached after a DRAM load
     ]
     s = _scheduler(reqs, {"hbm_mid": 22_000, "dram_small": 10_000})
-    s._is_kv_consumer = False
     s._hit_estimator = SimpleNamespace(
         estimate_external_hit_tokens=lambda r, local: 88_000
         if r.request_id == "dram_small"
@@ -222,8 +221,6 @@ def test_external_hit_counts_when_it_fits():
     # Without room for the loaded blocks the DRAM hit does not count.
     reqs = [_req("hbm_mid", 30_000, now - 2), _req("dram_small", 100_000, now - 1)]
     s = _scheduler(reqs, {"hbm_mid": 22_000, "dram_small": 10_000})
-    s._is_kv_consumer = False
-    s._is_kv_producer = True
     s._hit_estimator = SimpleNamespace(
         estimate_external_hit_tokens=lambda r, local: 88_000
         if r.request_id == "dram_small"
