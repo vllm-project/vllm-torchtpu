@@ -269,6 +269,61 @@ def test_a_failed_join_empties_the_slot_it_keeps():
         received.join(Header(1, 3, 3, 1, 4), [-1, 1, 3, 3, 1, 4, 5])
 
 
+class FailingClient(Client):
+    """A client whose send fails for the named requests, before or after upstream queues
+    the message."""
+
+    def __init__(self, failing, after_queue):
+        super().__init__()
+        self.failing = failing
+        self.after_queue = after_queue
+
+    def _send_input(self, request_type, request, engine=None):
+        self.sending = request.request_id
+        if self.sending in self.failing and not self.after_queue:
+            raise TypeError("cannot encode the request")
+        return Client._send_input(self, request_type, request, engine)
+
+    def _ensure_output_queue_task(self):
+        if self.sending in self.failing and self.after_queue:
+            raise RuntimeError("the output task failed")
+
+
+@pytest.mark.parametrize("after_queue", [False, True])
+def test_a_failed_send_keeps_no_prompt_in_its_slot(patched, after_queue):
+    client, engine = FailingClient({"b"}, after_queue), Engine()
+    first = list(range(3 * PROBE_EVERY))
+    assert engine.receive(_send(client, _request("a", list(first)))) == first
+    second = first + [7, 8, 9]
+    queued = len(client.messages)
+    with pytest.raises((TypeError, RuntimeError)):
+        asyncio.run(AsyncMPClient.add_request_async(client, _request("b", second)))
+    if len(client.messages) > queued:
+        engine.receive(client.messages[-1])
+    client.failing = set()
+    third = second + [10, 11]
+    assert engine.receive(_send(client, _request("c", list(third)))) == third
+
+
+def test_a_request_added_while_an_earlier_send_fails_is_rebuilt_exactly(patched):
+    client, engine = FailingClient({"b"}, after_queue=False), Engine()
+    first = list(range(3 * PROBE_EVERY))
+    assert engine.receive(_send(client, _request("a", list(first)))) == first
+    second = first + [7, 8, 9]
+    third = second + [10, 11]
+
+    async def add_both():
+        return await asyncio.gather(
+            AsyncMPClient.add_request_async(client, _request("b", list(second))),
+            AsyncMPClient.add_request_async(client, _request("c", list(third))),
+            return_exceptions=True,
+        )
+
+    failed, added = asyncio.run(add_both())
+    assert isinstance(failed, TypeError) and added is None
+    assert engine.receive(client.messages[-1]) == third
+
+
 @pytest.mark.parametrize("seed", range(20))
 def test_shared_length_matches_a_scan(seed):
     rng = random.Random(seed)

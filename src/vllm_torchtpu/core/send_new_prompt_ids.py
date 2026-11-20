@@ -21,11 +21,14 @@ ones into the full prompt before it builds the request.
 Why it is exact: the API server decides every slot and compares the shared
 ids with its own kept copy, so no id is guessed. Both sides change a slot
 only for an add request, and add requests reach the engine core in the order
-the API server sends them, on one socket. The engine core checks the prompt's
-length and the last shared id against the API server's, and fails the request
-if either differs. A failed request also empties the slot it was to be kept
-in, so a later request that shares ids from that slot fails instead of joining
-ids the API server does not have there.
+the API server sends them, on one socket. The API server sends one eligible
+request at a time and keeps its prompt only once upstream has sent it; if the
+send fails, it empties the slot, since it cannot tell whether the engine core
+got the request. The engine core checks the prompt's length and the last
+shared id against the API server's, and fails the request if either differs.
+A failed request also empties the slot it was to be kept in, so a later
+request that shares ids from that slot fails instead of joining ids the API
+server does not have there.
 
 A kept prompt is replaced only by a prompt that extends it, so a prompt that
 shares only the system prompt with another conversation's prompt does not
@@ -39,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import functools
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -152,6 +156,27 @@ class SentPrompts:
         self.capacity = capacity
         self.kept: OrderedDict[int, SlotPrompt] = OrderedDict()
         self.counts = Counts()
+        self.sending = asyncio.Lock()
+
+    async def send(
+        self,
+        request: EngineCoreRequest,
+        ids: list[int],
+        upstream: Callable[[EngineCoreRequest], Awaitable[None]],
+    ) -> None:
+        """Sends ``request`` with only the ids after those it shares, one request at a
+        time, and keeps its prompt once ``upstream`` has sent it."""
+        async with self.sending:
+            header = self.header(ids)
+            short = msgspec.structs.replace(
+                request, prompt_token_ids=header.encode(ids[header.shared :])
+            )
+            try:
+                await upstream(short)
+            except BaseException:
+                self.forget(header.keep_slot)
+                raise
+            self.keep(header, ids)
 
     def header(self, ids: list[int]) -> Header:
         """The slot ``ids`` shares the most leading ids with, and the slot it will be
@@ -172,6 +197,12 @@ class SentPrompts:
         self.kept.move_to_end(header.keep_slot)
         self.counts.add(header)
         self.counts.log("the API server sent", len(self.kept))
+
+    def forget(self, slot: int) -> None:
+        """Empties ``slot`` and makes it the first to be reused."""
+        if slot in self.kept:
+            self.kept[slot] = SlotPrompt.of([])
+            self.kept.move_to_end(slot, last=False)
 
     def most_shared(self, ids: list[int]) -> tuple[int, int]:
         extended = self.longest_extended(ids)
@@ -306,12 +337,7 @@ def send_new_prompt_ids(capacity: int) -> None:
             await upstream(self, request)
             return
         sent = self.__dict__.setdefault("_tpu_sent_prompts", SentPrompts(capacity))
-        header = sent.header(ids)
-        short = msgspec.structs.replace(
-            request, prompt_token_ids=header.encode(ids[header.shared :])
-        )
-        sent.keep(header, ids)
-        await asyncio.shield(upstream(self, short))
+        await asyncio.shield(sent.send(request, ids, functools.partial(upstream, self)))
 
     AsyncMPClient.add_request_async = add_request_async
 
