@@ -37,6 +37,11 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+# Share of the VMEM limit the heuristic's tiles may fill (decode with the tuned
+# tiles has its own caps), and the tuned prefill table's tiles too: headroom
+# against VMEM OOM at the cost of some tile size.
+_VMEM_FRACTION = 0.8
+
 
 def prepare_inputs(
     q: jax.Array,
@@ -497,7 +502,7 @@ def calculate_block_sizes(
         )
         decode_vmem_frac = 0.85 if is_fp8_kv else 0.75
         capped_vmem_limit_bytes = vmem_limit_bytes * (
-            decode_vmem_frac if tuned_decode else 0.8
+            decode_vmem_frac if tuned_decode else _VMEM_FRACTION
         )
 
         # To maximize MXU, we want bkv_sz to be at least MXU size.
@@ -586,7 +591,7 @@ def calculate_block_sizes(
             serve_cfgs,
             tpu_info,
             fits=lambda b: calculate_vmem_usage(b.batch_size, b.bq_sz, b.bkv_sz)
-            < vmem_limit_bytes * 0.8,
+            < vmem_limit_bytes * _VMEM_FRACTION,
         )
 
     return decode_block_sizes, prefill_block_sizes

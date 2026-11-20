@@ -47,6 +47,10 @@ def _create_mock_tpu_info(
     return mock
 
 
+def _unknown_chip(*args, **kwargs):
+    raise ValueError("Unsupported TPU device kind")
+
+
 @pytest.mark.parametrize(
     "generation,chip_version,is_8bit,expected_bq_c_min",
     [
@@ -263,10 +267,6 @@ def test_tpu_info_falls_back_to_tpu7x_only_without_a_tpu(
     else:
         with pytest.raises(ValueError, match="Unsupported TPU device kind"):
             configs.get_tpu_info()
-
-
-def _unknown_chip(*args, **kwargs):
-    raise ValueError("Unsupported TPU device kind")
 
 
 def test_schedule_sizes_need_no_tpu_backend(monkeypatch):
