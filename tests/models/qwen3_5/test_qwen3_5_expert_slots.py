@@ -22,12 +22,15 @@ import yaml
 
 from tests.models.qwen3_5.test_qwen3_5_hooks import (
     CREDIT_EP8,
+    DP8_TABLE,
     FUSED_EP_V3_ENV,
     LAYERS,
     SLOT_LAYER_BYTES,
+    TP8_TABLE,
     _run_hook,
     _set_moe_env,
     _vllm_config,
+    placement_table,
 )
 from vllm_torchtpu.distributed import collectives_options
 from vllm_torchtpu.layers.adapter import expert_placement
@@ -37,8 +40,6 @@ from vllm_torchtpu.models.qwen3_5 import hooks
 pytestmark = pytest.mark.cpu_test
 
 VALIDATION = pathlib.Path(qwen3_5.__file__).parent / "validation"
-TP8_TABLE = VALIDATION / "expert_placement_tp8_ep8_agentx_corr_c32.json"
-DP8_TABLE = VALIDATION / "expert_placement_dp8_ep8.json"
 POINTS = sorted(VALIDATION.glob("p*.yaml"))
 
 
@@ -130,8 +131,7 @@ def test_decode_legs_place_their_experts_with_a_table_here(path):
     entry = yaml.safe_load(path.read_text())
     decode, prefill = entry["legs"]["decode"], entry["legs"]["prefill"]
     assert decode["env"]["TPU_EXPERT_PLACEMENT"] == "$EXPERT_PLACEMENT_TABLE"
-    table = DP8_TABLE if "dp4tp2" in path.stem else TP8_TABLE
-    placement = expert_placement.parse(json.loads(table.read_text()))
+    placement = expert_placement.parse(json.loads(placement_table(path).read_text()))
     # TP8 decode carries the copies table, DP4 x TP2 decode the permutation.
     want = 64 if "dp4tp2" in path.stem else 68
     assert placement.slots_per_rank == want
