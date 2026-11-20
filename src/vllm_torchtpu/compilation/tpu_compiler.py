@@ -694,8 +694,9 @@ class TpuCompilerAdaptor(CompilerInterface):
             # Not what makes the bundled entry safe -- that comes from wrapper
             # and executable being one object, with no lookup left to drift.
             # This is the positional dtype-and-shape check that
-            # BucketExecutables.get falls back to for renamed placeholders in
-            # the in-memory hand-over, extended across processes; the artifact
+            # BucketExecutables.get falls back to when it cannot match the
+            # inputs by name in the in-memory hand-over, extended across
+            # processes; the artifact
             # was saved for this same subgraph and bucket, so nothing here is
             # matched by name or reordered. It earns its place because
             # nothing else validates the entry against the
