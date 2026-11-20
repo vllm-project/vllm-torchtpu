@@ -1598,6 +1598,9 @@ def sparse_mla_attention_dcp(
             # Largest chunk (tokens) that takes the small-chunk path (16 =
             # kernel default).
             small_chunk_tokens=small_chunk_tokens,
+            # Avoid 1-atom SC gather underutilization at m>=16 decode buckets;
+            # keep 1 atom for m<=8 where narrow rows saturate fewer subcores.
+            small_chunk_gather_atoms=4 if q.shape[0] >= 16 else 1,
             lse_mask_empty=mask_in_kernel,
             fused_window_prep=fused_prep,
             mixed_live_gather=envs.TPU_DCP_MLA_MIXED_LIVE,

@@ -18,12 +18,15 @@ tests/kernels/experimental/small_collectives; the warmup hand-over between the
 two sides of the row fork in tests/compilation/test_shape_variants.py.
 """
 
+import types
 from unittest.mock import Mock
 
 import pytest
 import torch
+import vllm.distributed.parallel_state as ps
 
 from vllm_torchtpu.layers.adapter import small_all_reduce_op as op
+from vllm_torchtpu.layers.adapter import token_padding
 
 pytestmark = pytest.mark.cpu_test
 
@@ -511,7 +514,7 @@ def test_decode_block_takes_the_fused_kernel(fused, rows):
 @pytest.mark.parametrize(
     "rows,layer",
     [
-        (17, _RowParallel()),  # above the kernel's 16 rows
+        (65, _RowParallel()),  # above the kernel's 64 rows
         (4, _RowParallel(k=2048, n=16384)),  # not a measured shape
         (4, _RowParallel(bias=torch.zeros(N_OPROJ))),
         (4, _RowParallel(reduce_results=False)),
@@ -521,7 +524,7 @@ def test_decode_block_takes_the_fused_kernel(fused, rows):
         (4, _RowParallel(_tpu_prequant_slot=object())),
     ],
     ids=[
-        "rows17",
+        "rows65",
         "shape",
         "bias",
         "no_reduce",
@@ -669,9 +672,11 @@ def test_prebuild_one_row_build_needs_the_padding_flag(monkeypatch, skip_padded)
     monkeypatch.setattr(op.envs, "TPU_FUSED_OPROJ_AR", True)
     monkeypatch.setattr(op.envs, "TPU_ONE_ROW_ALL_REDUCE", True)
     monkeypatch.setattr(op.envs, "TPU_MOE_SKIP_PADDED_TOKENS", skip_padded)
-    for name in ("_AR_OP", "_AR_SIZED_OP", "_RS_OP", "_RANK", "_MM_AR_OP"):
+    for name in ("_AR_OP", "_AR_SIZED_OP", "_RS_OP", "_RANK", "_MM_AR_OP", "_MESH"):
         monkeypatch.setattr(op, name, None)
     monkeypatch.setattr(op, "_MM_AR_ONE_ROW", False)
+    monkeypatch.setattr(op, "_MM_AR_RN_OPS", {})
+    monkeypatch.setattr(op, "_PENDING_RMSNORM_EPS", set())
     monkeypatch.setattr(
         op,
         "build_ep_mesh",
@@ -705,3 +710,219 @@ def test_one_row_flag_defaults_on_and_zero_turns_it_off(monkeypatch):
     assert envs.environment_variables["TPU_ONE_ROW_ALL_REDUCE"]() is True
     monkeypatch.setenv("TPU_ONE_ROW_ALL_REDUCE", "0")
     assert envs.environment_variables["TPU_ONE_ROW_ALL_REDUCE"]() is False
+
+
+def _norm(hidden=N_OPROJ, eps=1e-6, **extra):
+    attrs = {
+        "has_weight": True,
+        "variance_size_override": None,
+        "variance_epsilon": eps,
+        "weight": torch.ones(hidden, dtype=torch.bfloat16),
+    }
+    attrs.update(extra)
+    return types.SimpleNamespace(**attrs)
+
+
+@pytest.mark.parametrize(
+    "rows,expected",
+    [(4, False), (5, True), (8, True), (16, True), (64, True), (65, False)],
+)
+def test_should_gate_fused_rmsnorm_to_m5_through_m64(
+    fused, monkeypatch, rows, expected
+):
+    rn_mock = Mock(name="mm_ar_rn_op")
+    monkeypatch.setattr(op, "_MM_AR_RN_OPS", {1e-6: rn_mock})
+    assert op.can_fuse_rmsnorm(rows, _RowParallel(), _norm()) is expected
+
+
+def test_should_reject_ineligible_norm_for_fused_rmsnorm(fused, monkeypatch):
+    rn_mock = Mock(name="mm_ar_rn_op")
+    monkeypatch.setattr(op, "_MM_AR_RN_OPS", {1e-6: rn_mock})
+    layer = _RowParallel()
+    assert not op.can_fuse_rmsnorm(8, layer, _norm(eps=1e-5))
+    assert not op.can_fuse_rmsnorm(8, layer, _norm(has_weight=False))
+    assert not op.can_fuse_rmsnorm(8, layer, _norm(variance_size_override=64))
+    assert not op.can_fuse_rmsnorm(8, layer, _norm(_prequant_slot=object()))
+    assert not op.can_fuse_rmsnorm(8, layer, _norm(hidden=N_OPROJ - 128))
+
+
+def test_should_build_rmsnorm_op_regardless_of_prepare_and_prebuild_order(monkeypatch):
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_DRAFT", False)
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_VALID_ROWS", False)
+    monkeypatch.setattr(op.envs, "TPU_FUSED_OPROJ_AR", True)
+    monkeypatch.setattr(op.envs, "TPU_FUSED_OPROJ_AR_WAVES", True)
+    monkeypatch.setattr(op.envs, "TPU_ONE_ROW_ALL_REDUCE", True)
+    monkeypatch.setattr(op.envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: True)
+    for name in ("_AR_OP", "_AR_SIZED_OP", "_RS_OP", "_RANK", "_MM_AR_OP", "_MESH"):
+        monkeypatch.setattr(op, name, None)
+    monkeypatch.setattr(op, "_MM_AR_ONE_ROW", False)
+    monkeypatch.setattr(op, "_MM_AR_RN_OPS", {})
+    monkeypatch.setattr(op, "_PENDING_RMSNORM_EPS", set())
+    monkeypatch.setattr(
+        op,
+        "build_ep_mesh",
+        lambda: types.SimpleNamespace(shape={op.EP_AXIS_NAME: CORES}),
+    )
+    monkeypatch.setattr(
+        op, "get_ep_group", lambda: types.SimpleNamespace(ranks=list(MESH))
+    )
+    monkeypatch.setattr(op, "ep_mesh_index", lambda: 0)
+    monkeypatch.setattr(op.torch, "tensor", lambda *a, **k: "rank")
+    monkeypatch.setattr(op, "_build_all_reduce", lambda mesh, psum_above=None: "ar")
+    monkeypatch.setattr(op, "_build_reduce_scatter", lambda mesh: "rs")
+    monkeypatch.setattr(
+        op, "_build_matmul_all_reduce_one_row", lambda mesh, waves: "mm_ar_one_row"
+    )
+    built = []
+    monkeypatch.setattr(
+        op,
+        "_build_matmul_all_reduce_rmsnorm",
+        lambda mesh, waves, eps, one_row: (built.append((eps, one_row)) or f"rn_{eps}"),
+    )
+    group = types.SimpleNamespace(ranks=list(MESH))
+    monkeypatch.setattr(ps, "get_dp_group", lambda: group)
+    monkeypatch.setattr(ps, "get_tp_group", lambda: group)
+    layer = _RowParallel()
+
+    # Prepared before prebuild (load_model -> _initialize_pallas_kernels order).
+    op.prepare_rmsnorm_op(1e-6)
+    assert not op.can_fuse_rmsnorm(8, layer, _norm(eps=1e-6))
+    op.prebuild()
+    assert op.can_fuse_rmsnorm(8, layer, _norm(eps=1e-6))
+    assert not op.can_fuse_rmsnorm(8, layer, _norm(eps=1e-5))
+    # Prepared after prebuild builds immediately.
+    op.prepare_rmsnorm_op(1e-5)
+    assert op.can_fuse_rmsnorm(8, layer, _norm(eps=1e-5))
+    assert built == [(1e-6, True), (1e-5, True)]
+
+
+def test_should_keep_rank_before_norm_weight_for_bucket_handover(one_row, monkeypatch):
+    """m=4 unfused and m=8 fused lift (w, w_s, mask, rank, norm_w) in the same order."""
+    rn_mock = Mock(
+        name="mm_ar_rn_op", return_value=(_block(8, N_OPROJ), _block(8, N_OPROJ))
+    )
+    rank_t = torch.tensor([3], dtype=torch.int32)
+    monkeypatch.setattr(op, "_RANK", rank_t)
+    monkeypatch.setattr(op, "_MM_AR_RN_OPS", {1e-6: rn_mock})
+    layer = _RowParallel()
+    norm = _norm()
+    x = _block(8, hidden=K_OPROJ)
+    res = _block(8, hidden=N_OPROJ)
+    out = op.row_parallel_or_rmsnorm(x, layer, res, norm.weight, 1e-6)
+    assert out is rn_mock.return_value
+    (block, w, w_s, n_valid, rank, res_arg, nw_arg), _ = rn_mock.call_args
+    torch.testing.assert_close(block, x, rtol=0, atol=0)
+    assert w is layer.weight and w_s is layer.weight_scale and rank is rank_t
+    assert n_valid.tolist() == [1]
+    assert res_arg is res and nw_arg is norm.weight
+
+    with pytest.raises(RuntimeError, match="ineligible"):
+        op.row_parallel_or_rmsnorm(
+            _block(4, hidden=K_OPROJ), layer, _block(4, N_OPROJ), norm.weight, 1e-6
+        )
+
+
+def test_should_lift_identical_fx_buffers_between_m4_unfused_and_m8_fused(monkeypatch):
+    """Dynamo traces of m=4 unfused vs m=8 fused lift the exact same buffer sequence."""
+    rank_t = torch.tensor([0], dtype=torch.int32)
+    state = token_padding.TokenPaddingState.create(64, "cpu")
+    state.update(1, 64)
+    monkeypatch.setattr(op, "_RANK", rank_t)
+    monkeypatch.setattr(op, "_CORES", CORES)
+    monkeypatch.setattr(op, "_MM_AR_ONE_ROW", True)
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+    monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: True)
+
+    def fake_mm_ar(x, w, w_s, n_valid, rank):
+        return (x @ w.to(x.dtype)) * w_s.to(x.dtype) + (
+            n_valid[0].to(x.dtype) + rank[0].to(x.dtype)
+        ) * 0.0
+
+    def fake_mm_ar_rn(x, w, w_s, n_valid, rank, residual, norm_w):
+        y = fake_mm_ar(x, w, w_s, n_valid, rank) + residual
+        return y * norm_w, y
+
+    monkeypatch.setattr(op, "_MM_AR_OP", fake_mm_ar)
+    monkeypatch.setattr(op, "_MM_AR_RN_OPS", {1e-6: fake_mm_ar_rn})
+
+    layer = _RowParallel()
+    norm = _norm()
+    lifted_by_rows: dict[int, set[tuple[str, int]]] = {}
+
+    def capture(rows: int):
+        def backend(gm, example_inputs):
+            phs = [n.name for n in gm.graph.nodes if n.op == "placeholder"]
+            # Match shape_variants._handover_inputs contract: identical set of
+            # lifted (placeholder_name, tensor_id) regardless of lift order.
+            lifted_by_rows[rows] = {
+                (name, id(t))
+                for name, t in zip(phs, example_inputs, strict=True)
+                if name not in ("l_x_", "l_res_")
+            }
+            return gm
+
+        return backend
+
+    def step(x, res):
+        if op.can_fuse_rmsnorm(x.shape[0], layer, norm):
+            return op.row_parallel_or_rmsnorm(x, layer, res, norm.weight, 1e-6)
+        out = op.row_parallel_or(x, layer)
+        s = out + res
+        return s * norm.weight, s
+
+    for rows in (4, 8):
+        torch.compiler.reset()
+        compiled = torch.compile(step, backend=capture(rows), fullgraph=True)
+        compiled(_block(rows, K_OPROJ), _block(rows, N_OPROJ))
+    torch.compiler.reset()
+    assert lifted_by_rows[4] == lifted_by_rows[8] and len(lifted_by_rows[4]) == 5
+
+
+def test_should_not_specialize_dynamic_rows_at_m8(monkeypatch):
+    """Dynamic dim 0 at m=8 must not collapse to constant s0==8 alongside s0<=8."""
+    rank_t = torch.tensor([0], dtype=torch.int32)
+    state = token_padding.TokenPaddingState.create(64, "cpu")
+    state.update(1, 64)
+    monkeypatch.setattr(op, "_RANK", rank_t)
+    monkeypatch.setattr(op, "_CORES", CORES)
+    monkeypatch.setattr(op, "_MM_AR_ONE_ROW", True)
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+    monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: True)
+    monkeypatch.setattr(
+        op,
+        "_MM_AR_OP",
+        lambda x, w, w_s, nv, rk: (x @ w.to(x.dtype)) * w_s.to(x.dtype),
+    )
+    monkeypatch.setattr(
+        op,
+        "_MM_AR_RN_OPS",
+        {
+            1e-6: lambda x, w, w_s, nv, rk, res, nw: (
+                ((x @ w.to(x.dtype)) * w_s.to(x.dtype) + res) * nw,
+                (x @ w.to(x.dtype)) * w_s.to(x.dtype) + res,
+            )
+        },
+    )
+    layer = _RowParallel()
+    norm = _norm()
+
+    def step(x, res):
+        # Co-existing upper bound discharged by small-A2A decode dispatch (<= 8).
+        small = x.shape[0] <= 8
+        if op.can_fuse_rmsnorm(x.shape[0], layer, norm):
+            y, r = op.row_parallel_or_rmsnorm(x, layer, res, norm.weight, 1e-6)
+            return (y + r) if small else y
+        return op.row_parallel_or(x, layer)
+
+    torch.compiler.reset()
+    x = _block(8, K_OPROJ)
+    res = _block(8, N_OPROJ)
+    torch._dynamo.mark_dynamic(x, 0)  # noqa: SLF001 -- torch._dynamo is PyTorch's mark_dynamic API
+    torch._dynamo.mark_dynamic(res, 0)  # noqa: SLF001 -- torch._dynamo is PyTorch's mark_dynamic API
+    compiled = torch.compile(step, backend="eager", fullgraph=True)
+    out = compiled(x, res)
+    torch.compiler.reset()
+    assert out.shape == (8, N_OPROJ)

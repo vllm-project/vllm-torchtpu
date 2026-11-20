@@ -50,6 +50,7 @@ from vllm_torchtpu.compilation import shape_variants, tpu_compiler
 from vllm_torchtpu.layers.adapter import fused_moe_ep as bridge
 from vllm_torchtpu.layers.adapter import moe_prefill_sp as sp
 from vllm_torchtpu.layers.adapter import rmsnorm
+from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
 from vllm_torchtpu.layers.adapter.linear_common import PREQUANT_ATTR, PrequantSlot
 
 
@@ -1036,3 +1037,138 @@ def test_should_order_shared_before_routed_and_preserve_rank_for_edge_bit_patter
         assert torch.isnan(out[0, 0])
     else:
         torch.testing.assert_close(out[0, 0], shared_out[0, 0] + routed_out[0, 0] * 2.0)
+
+
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_should_fuse_decode_post_attn_norm_when_eligible(with_residual):
+    rows, hidden = 8, 6144
+    positions = torch.arange(rows, dtype=torch.int32)
+    hidden_in = torch.ones((rows, hidden), dtype=torch.bfloat16) * 2.0
+    residual_in = (
+        torch.ones((rows, hidden), dtype=torch.bfloat16) * 3.0
+        if with_residual
+        else None
+    )
+    norm_w = torch.ones((hidden,), dtype=torch.bfloat16) * 0.5
+    seen_post_attn = []
+
+    def fake_mla_attn(_pos, h, _scale, prefill_group=None, post_attn_norm=None):
+        assert prefill_group is None and post_attn_norm is not None
+        res_arg, w_arg, eps_arg = post_attn_norm
+        seen_post_attn.append((res_arg, w_arg, eps_arg))
+        return h + res_arg, res_arg * 2.0
+
+    fake_mla_attn.o_proj = object()
+    fake_mla_attn.mla_attn = SimpleNamespace(W_O_dcp_qrep=None)
+
+    def input_ln(h, res=None):
+        if res is None:
+            return h * 1.5
+        return h * 1.5, res + h
+
+    post_ln = SimpleNamespace(
+        weight=norm_w,
+        variance_epsilon=1e-6,
+        has_weight=True,
+        variance_size_override=None,
+    )
+    layer = SimpleNamespace(
+        use_sequence_parallel_moe=False,
+        use_mha=False,
+        input_layernorm=input_ln,
+        post_attention_layernorm=post_ln,
+        self_attn=SimpleNamespace(mla_attn=fake_mla_attn),
+        mlp=lambda h: h * 4.0,
+    )
+    setattr(layer, sp.KEEP_ATTR, ())
+
+    with (
+        patch.object(sp, "applies", return_value=False),
+        patch.object(sp.envs, "TPU_FUSED_OPROJ_AR", True),
+        patch.object(sp.small_all_reduce_op, "can_fuse_rmsnorm", return_value=True),
+    ):
+        out, out_res = sp.patched_decoder_layer_forward(
+            layer, positions, hidden_in, residual_in
+        )
+
+    assert len(seen_post_attn) == 1
+    res_arg, w_arg, eps_arg = seen_post_attn[0]
+    expected_res = hidden_in if not with_residual else residual_in + hidden_in
+    torch.testing.assert_close(res_arg, expected_res)
+    assert w_arg is norm_w and eps_arg == 1e-6
+    torch.testing.assert_close(out, (hidden_in * 1.5 + expected_res) * 4.0)
+    torch.testing.assert_close(out_res, expected_res * 2.0)
+
+
+def test_should_fall_back_to_upstream_decode_when_post_attn_norm_ineligible():
+    rows, hidden = 4, 6144
+    positions = torch.arange(rows, dtype=torch.int32)
+    hidden_in = torch.ones((rows, hidden), dtype=torch.bfloat16)
+    residual_in = torch.zeros((rows, hidden), dtype=torch.bfloat16)
+    layer = SimpleNamespace(
+        use_sequence_parallel_moe=False,
+        use_mha=False,
+        self_attn=SimpleNamespace(mla_attn=None),
+    )
+    setattr(layer, sp.KEEP_ATTR, ())
+    sentinel = (hidden_in * 2.0, residual_in)
+    with (
+        patch.object(sp, "applies", return_value=False),
+        patch.object(sp.envs, "TPU_FUSED_OPROJ_AR", True),
+        patch.object(sp, "UPSTREAM_DECODER_LAYER_FORWARD", return_value=sentinel) as up,
+    ):
+        got = sp.patched_decoder_layer_forward(layer, positions, hidden_in, residual_in)
+    assert got is sentinel and up.call_count == 1
+
+
+def test_should_route_post_attn_norm_to_fused_oproj_ar():
+    cls = mla_op.VllmTPUMultiHeadLatentAttentionWrapper
+    w = cls.__new__(cls)
+    torch.nn.Module.__init__(w)
+    w.kimi_preprocess = None
+    w.q_lora_rank = None
+    w.kv_lora_rank = 8
+    w.qk_nope_head_dim = 4
+    w.qk_rope_head_dim = 4
+    w.qk_head_dim = 8
+    w.num_heads = 2
+    w.v_head_dim = 4
+    w.dcp_q_replicate = False
+    w.dcp_group_size = 1
+    w.fused_qkv_a_proj = None
+    w.q_b_proj = None
+    w.kv_a_proj_with_mqa = lambda x: (
+        torch.zeros((x.shape[0], 12), dtype=x.dtype),
+        None,
+    )
+    w.q_proj = lambda x: (torch.zeros((x.shape[0], 16), dtype=x.dtype), None)
+    w.q_a_layernorm = lambda x: x
+    w.kv_a_layernorm = lambda x: x
+    w.rotary_emb = None
+    w.is_sparse = False
+    w.indexer = None
+    w.skip_topk = True
+    w.g_proj = None
+    w.gate_is_fused = False
+    attn_out = torch.ones((8, 8), dtype=torch.bfloat16)
+
+    def _fake_mla(*_a, **_kw):
+        return attn_out
+
+    _fake_mla.W_O_dcp_qrep = None
+    w.mla_attn = _fake_mla
+    w.o_proj = object()
+    res_in = torch.ones((8, 16), dtype=torch.bfloat16) * 2.0
+    norm_w = torch.ones((16,), dtype=torch.bfloat16) * 0.5
+    sentinel = (res_in * 3.0, res_in * 4.0)
+    with patch.object(
+        mla_op.small_all_reduce_op, "row_parallel_or_rmsnorm", return_value=sentinel
+    ) as fused:
+        got = cls.forward(
+            w,
+            positions=torch.arange(8, dtype=torch.int32),
+            hidden_states=torch.zeros((8, 16), dtype=torch.bfloat16),
+            post_attn_norm=(res_in, norm_w, 1e-6),
+        )
+    assert got is sentinel
+    fused.assert_called_once_with(attn_out, w.o_proj, res_in, norm_w, 1e-6)

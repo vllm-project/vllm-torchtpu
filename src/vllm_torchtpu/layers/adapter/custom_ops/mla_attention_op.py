@@ -2557,7 +2557,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
         prefill_group=None,
-    ) -> torch.Tensor:
+        post_attn_norm: tuple[torch.Tensor, torch.Tensor, float] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         q_c = None
         kv_lora = None
         output_gate = None
@@ -2974,6 +2975,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 )
         if prefill_group is not None:
             return prefill_group.project_reduce_scatter(attn_out, self.o_proj)
+        if post_attn_norm is not None:
+            res_in, norm_w, norm_eps = post_attn_norm
+            return small_all_reduce_op.row_parallel_or_rmsnorm(
+                attn_out, self.o_proj, res_in, norm_w, norm_eps
+            )
         if envs.TPU_FUSED_OPROJ_AR:
             return small_all_reduce_op.row_parallel_or(attn_out, self.o_proj)
         return self.o_proj(attn_out)[0]

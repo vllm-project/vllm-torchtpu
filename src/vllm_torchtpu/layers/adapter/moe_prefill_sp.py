@@ -604,6 +604,54 @@ def _sequence_parallel_layer_forward(
     return _moe(layer.mlp, hidden_states, num_tokens, tp), residual
 
 
+def _can_fuse_decode_post_attn_norm(
+    layer: Any,
+    hidden_states: torch.Tensor,
+) -> bool:
+    if (
+        not envs.TPU_FUSED_OPROJ_AR
+        or getattr(layer, "use_sequence_parallel_moe", False)
+        or getattr(layer, "use_mha", False)
+        or hidden_states.dim() != 2
+        or hidden_states.dtype != torch.bfloat16
+    ):
+        return False
+    mla = getattr(getattr(layer, "self_attn", None), "mla_attn", None)
+    if (
+        mla is None
+        or getattr(getattr(mla, "mla_attn", None), "W_O_dcp_qrep", None) is not None
+    ):
+        return False
+    return small_all_reduce_op.can_fuse_rmsnorm(
+        hidden_states.shape[0],
+        getattr(mla, "o_proj", None),
+        getattr(layer, "post_attention_layernorm", None),
+    )
+
+
+def _decode_fused_post_attn_layer_forward(
+    layer: Any,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    llama_4_scaling: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if residual is None:
+        residual = hidden_states
+        hidden_states = layer.input_layernorm(hidden_states)
+    else:
+        hidden_states, residual = layer.input_layernorm(hidden_states, residual)
+    norm = layer.post_attention_layernorm
+    hidden_states, residual = layer.self_attn.mla_attn(
+        positions,
+        hidden_states,
+        llama_4_scaling,
+        post_attn_norm=(residual, norm.weight, float(norm.variance_epsilon)),
+    )
+    hidden_states = layer.mlp(hidden_states)
+    return hidden_states, residual
+
+
 def patched_decoder_layer_forward(
     self,
     positions: torch.Tensor,
@@ -620,6 +668,10 @@ def patched_decoder_layer_forward(
         )
     hidden_states = _retain_buffers(hidden_states, *keep)
     if not applies(positions.shape[0]):
+        if _can_fuse_decode_post_attn_norm(self, hidden_states):
+            return _decode_fused_post_attn_layer_forward(
+                self, positions, hidden_states, residual, llama_4_scaling
+            )
         return UPSTREAM_DECODER_LAYER_FORWARD(
             self, positions, hidden_states, residual, llama_4_scaling
         )
@@ -871,6 +923,10 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
     del shared_parts
     for layer in layers[first:]:
         setattr(layer, KEEP_ATTR, _keep_list(layer.mlp))
+        if getattr(layer, "post_attention_layernorm", None) is not None:
+            small_all_reduce_op.prepare_rmsnorm_op(
+                float(layer.post_attention_layernorm.variance_epsilon)
+            )
 
     dense_armed = 0
     dense_group = _dense_group_size(tp, group)
@@ -897,6 +953,10 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             rmsnorm.disarm_post_attention_prequant(layer)
             setattr(layer.mlp, DENSE_OP, dense_op)
             setattr(layer, KEEP_ATTR, _keep_list_dense(layer.mlp))
+            if getattr(layer, "post_attention_layernorm", None) is not None:
+                small_all_reduce_op.prepare_rmsnorm_op(
+                    float(layer.post_attention_layernorm.variance_epsilon)
+                )
         dense_armed = len(dense_layers)
 
     embed_rs = (first == 0 or dense_armed == first) and _can_embed_reduce_scatter(

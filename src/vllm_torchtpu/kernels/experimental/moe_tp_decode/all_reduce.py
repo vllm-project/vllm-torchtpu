@@ -112,6 +112,17 @@ class AllReduceSpec:
     def fold(self) -> bool:
         return self.lane_groups >= 2 and self.fold_rows >= 1
 
+    @property
+    def d2d_first(self) -> bool:
+        """Use 1-barrier pair-first + half-world RS/AG on full m>=32 buckets."""
+        return (
+            self.n >= 4
+            and self.n % 2 == 0
+            and self.m >= 32
+            and self.h % 2 == 0
+            and self.chunk % self.lanes == 0
+        )
+
 
 def one_shot_supported(h: int, info) -> bool:
     """Whether one row of h columns folds into one row tile of whole lane groups."""
@@ -144,11 +155,13 @@ def kernel_name(spec: AllReduceSpec) -> str:
 def _scratch_names(spec: AllReduceSpec) -> tuple[str, ...]:
     fold = ("q",) if spec.fold else ()
     one = ("one",) if spec.one_shot else ()
+    d2d = ("d2d_recv", "d2d_sems") if spec.d2d_first else ()
     return (
         "recv",
         "red",
         *fold,
         *one,
+        *d2d,
         "rs_send",
         "rs_recv",
         "ag_send",
@@ -170,11 +183,20 @@ def scratch_shapes(spec: AllReduceSpec) -> list:
         if spec.one_shot
         else []
     )
+    d2d = (
+        [
+            pltpu.VMEM((m, spec.h // 2), BF16),
+            pltpu.SemaphoreType.DMA((4,)),
+        ]
+        if spec.d2d_first
+        else []
+    )
     return [
         pltpu.VMEM((n, m, w), BF16),
         pltpu.VMEM((m, w), BF16),
         *fold,
         *one,
+        *d2d,
         *[pltpu.SemaphoreType.DMA((n,)) for _ in range(4)],
         pltpu.SemaphoreType.DMA((2,)),
     ]
@@ -192,6 +214,8 @@ def vmem_bytes(spec: AllReduceSpec, info) -> int:
     if spec.one_shot:
         block = (spec.tile_rows, spec.row_tile_width)
         total += t((n, *block), BF16) + 2 * t(block, F32)
+    if spec.d2d_first:
+        total += t((m, h // 2), BF16)
     return total
 
 
@@ -318,6 +342,115 @@ def _exchange(spec, me, buf, rows, cols, s):
         copy.wait_send()
 
 
+def _half_world_rs_ag(spec, pair, bit, buf, rows, col_off, cw, steps, s):
+    """RS + f32 sum + AG over n/2 pair peers at rank `dst_p * 2 + bit`."""
+    n_pairs = spec.n // 2
+
+    def chunk(p_idx):
+        return buf.at[
+            pl.ds(0, rows), pl.ds(pl.multiple_of(col_off + p_idx * cw, cw), cw)
+        ]
+
+    def slot(p_idx):
+        return s["recv"].at[p_idx, pl.ds(0, rows), pl.ds(0, cw)]
+
+    red = s["red"].at[pl.ds(0, rows), pl.ds(0, cw)]
+    own = pltpu.make_async_copy(chunk(pair), slot(pair), s["loc"].at[0])
+    own.start()
+    rs = []
+    for idx, st in enumerate(steps):
+        dst_p = lax.rem(pair + st, n_pairs)
+        cp = pltpu.make_async_remote_copy(
+            chunk(dst_p),
+            slot(pair),
+            s["rs_send"].at[idx],
+            s["rs_recv"].at[pair],
+            device_id=(dst_p * 2 + bit,),
+            device_id_type=_MESH,
+        )
+        cp.start()
+        rs.append(cp)
+    own.wait()
+    for st in steps:
+        src_p = lax.rem(pair + (n_pairs - st), n_pairs)
+        pltpu.make_async_copy(
+            slot(src_p), slot(src_p), s["rs_recv"].at[src_p]
+        ).wait_recv()
+    red[...] = _sum_slots(
+        lambda q: s["recv"][q, pl.ds(0, rows), pl.ds(0, cw)], n_pairs
+    ).astype(red.dtype)
+    own_ag = pltpu.make_async_copy(red, chunk(pair), s["loc"].at[1])
+    own_ag.start()
+    ag = []
+    for idx, st in enumerate(steps):
+        dst_p = lax.rem(pair + st, n_pairs)
+        cp = pltpu.make_async_remote_copy(
+            red,
+            chunk(pair),
+            s["ag_send"].at[idx],
+            s["ag_recv"].at[pair],
+            device_id=(dst_p * 2 + bit,),
+            device_id_type=_MESH,
+        )
+        cp.start()
+        ag.append(cp)
+    own_ag.wait()
+    for st in steps:
+        src_p = lax.rem(pair + (n_pairs - st), n_pairs)
+        pltpu.make_async_copy(
+            chunk(src_p), chunk(src_p), s["ag_recv"].at[src_p]
+        ).wait_recv()
+    return rs, ag
+
+
+def _exchange_d2d_first(spec, me, buf, rows, s):
+    """1-barrier pair-first RS + half-world RS/AG + pair AG over [rows, h]."""
+    half_h = spec.h // 2
+    n_pairs = spec.n // 2
+    cw = half_h // n_pairs
+    bit = lax.bitwise_and(me, jnp.int32(1))
+    pair = lax.shift_right_logical(me, jnp.int32(1))
+    partner = lax.bitwise_xor(me, jnp.int32(1))
+    my_off = bit * half_h
+    peer_off = (1 - bit) * half_h
+    my_slice = buf.at[pl.ds(0, rows), pl.ds(pl.multiple_of(my_off, half_h), half_h)]
+    peer_slice = buf.at[pl.ds(0, rows), pl.ds(pl.multiple_of(peer_off, half_h), half_h)]
+    d2d_buf = s["d2d_recv"].at[pl.ds(0, rows), pl.ds(0, half_h)]
+    d2d_sems = s["d2d_sems"]
+
+    pair_rs = pltpu.make_async_remote_copy(
+        peer_slice,
+        d2d_buf,
+        d2d_sems.at[0],
+        d2d_sems.at[1],
+        device_id=(partner,),
+        device_id_type=_MESH,
+    )
+    pair_rs.start()
+    pltpu.make_async_copy(d2d_buf, d2d_buf, d2d_sems.at[1]).wait_recv()
+    my_slice[...] = (my_slice[...].astype(F32) + d2d_buf[...].astype(F32)).astype(
+        my_slice.dtype
+    )
+
+    steps = tuple(range(1, n_pairs))
+    rs, ag = _half_world_rs_ag(spec, pair, bit, buf, rows, my_off, cw, steps, s)
+
+    pair_rs.wait_send()
+    pair_ag = pltpu.make_async_remote_copy(
+        my_slice,
+        my_slice,
+        d2d_sems.at[2],
+        d2d_sems.at[3],
+        device_id=(partner,),
+        device_id_type=_MESH,
+    )
+    pair_ag.start()
+    pltpu.make_async_copy(peer_slice, peer_slice, d2d_sems.at[3]).wait_recv()
+    pair_ag.wait_send()
+    for copy in (*rs, *ag):
+        copy.wait_send()
+
+
 def _run_path(spec, kind, me, nv, partial, out_ref, s, barrier):
     """One row path (fold / trim / full): stage, barrier wait, exchange."""
     m, h, tr = spec.m, spec.h, spec.tile_rows
@@ -330,7 +463,10 @@ def _run_path(spec, kind, me, nv, partial, out_ref, s, barrier):
         _stage_rows(out_ref, partial, nv)
         buf = out_ref if rows == m else out_ref.at[pl.ds(0, rows)]
     pl.semaphore_wait(barrier, spec.n)
-    _exchange(spec, me, buf, rows, cols, s)
+    if kind == "full" and spec.d2d_first:
+        _exchange_d2d_first(spec, me, buf, rows, s)
+    else:
+        _exchange(spec, me, buf, rows, cols, s)
     if kind == "fold":
         _unfold(spec, s["q"][...].astype(F32), nv, out_ref)
 
