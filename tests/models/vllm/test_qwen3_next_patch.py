@@ -1010,6 +1010,7 @@ def test_cat768_fp8_fusion_and_weight_deletion():
         )
         gu_mod.bias = None
         setattr(gu_mod, WEIGHT_FLIPPED_ATTR, True)
+        gu_mod.quant_method = _fp8_method()
 
         down_mod = nn.Module()
         down_mod.register_parameter(
@@ -1020,6 +1021,7 @@ def test_cat768_fp8_fusion_and_weight_deletion():
         )
         down_mod.bias = None
         setattr(down_mod, WEIGHT_FLIPPED_ATTR, True)
+        down_mod.quant_method = _fp8_method()
 
         se_gate_mod = nn.Module()
         se_gate_mod.register_parameter(
@@ -1112,8 +1114,10 @@ def test_an_unflipped_fp8_shared_expert_is_checked_again_after_the_flip():
 
     gate_up = linear(fp8((hidden_dim, 2 * n_inter)), torch.ones(2 * n_inter))
     gate_up.quant_method = object.__new__(_Fp8Method)
+    gate_up.quant_method.w8a16_max_rows = 0
     down = linear(fp8((n_inter, hidden_dim)), torch.ones(hidden_dim))
     setattr(down, WEIGHT_FLIPPED_ATTR, True)
+    down.quant_method = _fp8_method()
     moe = nn.Module()
     moe.gate = linear(torch.randn(n_gate, hidden_dim, dtype=torch.bfloat16))
     moe.shared_expert = SimpleNamespace(
@@ -1146,6 +1150,7 @@ def test_the_shared_expert_gate_weight_takes_a_host_round_trip(monkeypatch):
                 "weight_scale", nn.Parameter(scale, requires_grad=False)
             )
             setattr(mod, WEIGHT_FLIPPED_ATTR, True)
+            mod.quant_method = _fp8_method()
         mod.bias = None
         return mod
 
@@ -1178,6 +1183,48 @@ def test_the_shared_expert_gate_weight_takes_a_host_round_trip(monkeypatch):
     torch.testing.assert_close(
         moe._fused_se_gate_weight.data, w_se_gate.reshape(hidden_dim), rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("w8a16_max_rows", [0, 64])
+def test_the_fused_fp8_ops_take_a_projection_whose_method_runs_w8a8(w8a16_max_rows):
+    """The sigmoid-gate o_proj op and the fused router/shared-expert op
+    quantize their rows and run a W8A8 matmul, so they take an FP8 per-channel
+    projection only where its method serves pre-quantized rows: not where it
+    runs small steps W8A16 (TPU_FP8_LINEAR_W8A16_MAX_ROWS)."""
+    hidden_dim, n_gate, n_inter = 512, 128, 64
+    w8a8 = w8a16_max_rows == 0
+
+    def linear(weight, fp8_scale=None):
+        mod = nn.Module()
+        mod.register_parameter("weight", nn.Parameter(weight, requires_grad=False))
+        if fp8_scale is not None:
+            mod.register_parameter(
+                "weight_scale", nn.Parameter(fp8_scale, requires_grad=False)
+            )
+            setattr(mod, WEIGHT_FLIPPED_ATTR, True)
+            mod.quant_method = _fp8_method(w8a16_max_rows)
+        mod.bias = None
+        return mod
+
+    def fp8(shape):
+        return (torch.randn(*shape) * 0.02).to(torch.float8_e4m3fn)
+
+    o_proj = linear(fp8((hidden_dim, hidden_dim)), torch.ones(hidden_dim))
+    attention = SimpleNamespace(o_proj=o_proj)
+    rows = torch.zeros(4, hidden_dim, dtype=torch.bfloat16)
+    assert patch_mod._can_use_pal_gate_q(attention, rows, rows) is w8a8
+
+    moe = nn.Module()
+    moe.gate = linear(torch.randn(n_gate, hidden_dim, dtype=torch.bfloat16))
+    moe.shared_expert = SimpleNamespace(
+        gate_up_proj=linear(fp8((hidden_dim, 2 * n_inter)), torch.ones(2 * n_inter)),
+        down_proj=linear(fp8((n_inter, hidden_dim)), torch.ones(hidden_dim)),
+        act_fn=F.silu,
+    )
+    moe.shared_expert_gate = linear(
+        torch.randn(1, hidden_dim, dtype=torch.bfloat16) * 0.02
+    )
+    assert maybe_setup_fused_gate_se(moe) is w8a8
 
 
 def _bf16_jnp(t: torch.Tensor):

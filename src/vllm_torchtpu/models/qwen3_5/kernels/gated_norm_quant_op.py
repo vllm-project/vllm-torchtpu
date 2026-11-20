@@ -115,10 +115,17 @@ def unsupported_reason(layer: QwenGatedDeltaNetAttention) -> str | None:
         return "out_proj has a bias"
     if not out_proj.input_is_parallel:
         return "out_proj input is not parallel"
-    if getattr(out_proj.quant_method, "w8a16_max_rows", 0):
+    method = out_proj.quant_method
+    if not (
+        isinstance(method, linear_common.PrequantLinearMethod)
+        and method.serves_prequant_rows(out_proj)
+    ):
         # The fused path always quantizes the rows (W8A8); keep the linear's
         # own small-step W8A16 when TPU_FP8_LINEAR_W8A16_MAX_ROWS opts into it.
-        return "out_proj runs small steps W8A16 (TPU_FP8_LINEAR_W8A16_MAX_ROWS)"
+        return (
+            "out_proj's method does not serve pre-quantized rows (it runs "
+            "small steps W8A16 under TPU_FP8_LINEAR_W8A16_MAX_ROWS)"
+        )
     return None
 
 
