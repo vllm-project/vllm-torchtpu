@@ -13,9 +13,14 @@
 # limitations under the License.
 """Chunk size of the token-parallel split's sparse MLA gather + attention."""
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.layers.adapter import dcp_token_parallel_op
 from vllm_torchtpu.layers.core import attention_interface
@@ -47,17 +52,17 @@ def _call_attend_capturing_kwargs(monkeypatch) -> dict:
     return captured
 
 
-def test_should_use_128_row_chunks_when_env_unset(monkeypatch):
+def test_should_use_256_row_chunks_when_env_unset(monkeypatch):
     monkeypatch.delenv(ENV, raising=False)
 
     kwargs = dcp_token_parallel_op.attend_chunk_kwargs(
         attention_interface.sparse_mla_chunk_kwargs()
     )
 
-    assert kwargs == {CHUNK_KWARG: 128}
+    assert kwargs == {CHUNK_KWARG: 256}
 
 
-@pytest.mark.parametrize("value", [16, 64, 256])
+@pytest.mark.parametrize("value", [16, 64, 128, 256])
 def test_should_keep_env_chunk_when_env_set(monkeypatch, value):
     monkeypatch.setenv(ENV, str(value))
 
@@ -81,12 +86,12 @@ def test_should_differ_from_kernel_default():
     )
 
 
-def test_should_pass_128_row_chunks_to_kernel_when_env_unset(monkeypatch):
+def test_should_pass_256_row_chunks_to_kernel_when_env_unset(monkeypatch):
     monkeypatch.delenv(ENV, raising=False)
 
     kwargs = _call_attend_capturing_kwargs(monkeypatch)
 
-    assert kwargs[CHUNK_KWARG] == 128
+    assert kwargs[CHUNK_KWARG] == 256
 
 
 def test_should_pass_env_chunk_to_kernel_when_env_set(monkeypatch):
@@ -95,3 +100,77 @@ def test_should_pass_env_chunk_to_kernel_when_env_set(monkeypatch):
     kwargs = _call_attend_capturing_kwargs(monkeypatch)
 
     assert kwargs[CHUNK_KWARG] == 64
+
+
+def test_should_filter_mixed_live_widths_and_forward_batch_override(monkeypatch):
+    captured: dict = {}
+
+    def fake_kernel(q, *_args, **kwargs):
+        captured.update(kwargs)
+        return (
+            jnp.zeros((q.shape[0], q.shape[1], 512), jnp.bfloat16),
+            jnp.zeros((q.shape[0], q.shape[1]), jnp.float32),
+        )
+
+    monkeypatch.setattr(sparse_mla_kernel, "sparse_ragged_paged_attention", fake_kernel)
+    monkeypatch.setenv("TPU_DCP_MLA_TOPK_CAP", "256")
+    devs = jax.devices()
+    if len(devs) < 2:
+        pytest.skip(f"needs >=2 JAX devices, got {len(devs)}")
+    dcp = 2
+    mesh = Mesh(np.array(devs[:dcp]), ("dcp",))
+    shd = NamedSharding(mesh, P("dcp"))
+    nope_spec = kv_cache_utils.SparseMLAKVCacheSpec.create(
+        kv_cache_utils.KVCacheType.NOPE,
+        kv_cache_utils.KVCacheLayout.SPARSECORE,
+        4,
+        16,
+        512,
+        4,
+    )
+    rope_spec = kv_cache_utils.SparseMLAKVCacheSpec.create(
+        kv_cache_utils.KVCacheType.ROPE,
+        kv_cache_utils.KVCacheLayout.SPARSECORE,
+        4,
+        16,
+        64,
+        4,
+        packed_rope=True,
+    )
+
+    attention_interface.sparse_mla_attention_dcp(
+        jnp.zeros((64, 4, 512), jnp.bfloat16),
+        jnp.zeros((64, 4, 64), jnp.bfloat16),
+        jnp.zeros((64, 512), jnp.float8_e4m3fn),
+        jnp.zeros((64, 64), jnp.float8_e4m3fn),
+        jax.device_put(
+            jnp.zeros(
+                (dcp * nope_spec.shape[0], *nope_spec.shape[1:]), nope_spec.jax_dtype
+            ),
+            shd,
+        ),
+        jax.device_put(
+            jnp.zeros(
+                (dcp * rope_spec.shape[0], *rope_spec.shape[1:]), rope_spec.jax_dtype
+            ),
+            shd,
+        ),
+        jax.device_put(jnp.full((dcp * 64, 512), -1, jnp.int32), shd),
+        jnp.array([64], jnp.int32),
+        jnp.zeros((1, 4), jnp.int32),
+        jnp.array([0, 64], jnp.int32),
+        jnp.array([0, 0, 1], jnp.int32),
+        mesh,
+        nope_spec,
+        rope_spec,
+        dcp_size=dcp,
+        interleave_size=4,
+        dcp_axis_name="dcp",
+        skip_kv_write=True,
+        merge_pieces=False,
+        mixed_live_widths_override=(128, 256, 384),
+        attention_kernel_batch_size=8,
+    )
+
+    assert captured["mixed_live_widths"] == (128,)
+    assert captured["attention_kernel_batch_size"] == 8

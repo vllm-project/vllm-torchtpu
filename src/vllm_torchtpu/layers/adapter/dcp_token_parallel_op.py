@@ -76,14 +76,13 @@ SPLIT_ROWS_ALIGN = 16
 GATHER_CAPS = (4, 8, 12, 16, 20, 24, 32, 44)
 # Query rows per sparse MLA gather + attention chunk on the split's own rows
 # when TPU_SPARSE_MLA_CHUNK_TOKENS is unset.
-# Avoid the kernel default of 64 here: it doubles the per-layer gather +
-# attention launches over a split's 1024 rows, and each launch boundary
-# exposes a SparseCore gather wait (~60 us/layer slower at 16K tokens).
-ATTEND_CHUNK_TOKENS = 128
+# Avoid smaller 64/128-row chunks here: 256-row chunks halve SparseCore/TensorCore
+# chunk boundaries over a split's 1024 rows while keeping default 16-row batches.
+ATTEND_CHUNK_TOKENS = 256
 
 
 def attend_chunk_kwargs(env_chunk_kwargs: dict[str, int]) -> dict[str, int]:
-    """The split attend's chunk kwargs: the env override, else 128 rows."""
+    """The split attend's chunk kwargs: the env override, else 256 rows."""
     if env_chunk_kwargs:
         return env_chunk_kwargs
     return {"gather_and_attention_chunk_size": ATTEND_CHUNK_TOKENS}
@@ -669,6 +668,10 @@ def build_attention_op(
         k_pe_lead = (
             jnp.zeros((s, k_pe.shape[-1]), k_pe.dtype) if kv_sharded else k_pe[:s]
         )
+        lead_live_widths = (
+            (128, 256, 384) if envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS == "256,384" else None
+        )
+        lead_batch_size = 8 if s <= 64 and s % 8 == 0 else None
         _, _, partial, lse = sparse_mla_attention_dcp(
             q_dcp,
             pe_dcp,
@@ -691,6 +694,8 @@ def build_attention_op(
             dcp_rank_ids=rank_ids,
             merge_pieces=False,
             skip_kv_write=True,
+            mixed_live_widths_override=lead_live_widths,
+            attention_kernel_batch_size=lead_batch_size,
         )
         if w_o is not None:
             assert s_o is not None and w_uv is not None and rank_ids is not None
@@ -1389,6 +1394,51 @@ def build_attention_op(
                 _build_oproj_sharded_kv_op,
             )
 
+    qc_head_shift_op = None
+    if q_replicated and oproj_sharded_kv_op is not None and rank_tensor is not None:
+        split_rows = layout.split_rows
+
+        def _qc_head_shift(q_c_local: jax.Array, rk: jax.Array) -> jax.Array:
+            return jax.shard_map(
+                lambda qc, r: dcp_token_parallel.gather_qc_head_rows(
+                    qc,
+                    r,
+                    dcp_size=dcp,
+                    split_rows=split_rows,
+                    axis_name=DCP_AXIS_NAME,
+                ),
+                mesh=mesh,
+                in_specs=(sharded, sharded),
+                out_specs=sharded,
+                check_vma=False,
+            )(q_c_local, rk)
+
+        def _fake_qc_head_shift(
+            q_c_local: torch.Tensor, rk: torch.Tensor
+        ) -> torch.Tensor:
+            del rk
+            return q_c_local.new_empty(
+                (q_c_local.shape[0] + split_rows, q_c_local.shape[1])
+            )
+
+        def _build_qc_head_shift_op(op_name: str):
+            built = pcp_streaming_jax_op(
+                op_name,
+                _qc_head_shift,
+                donate_argnums=(),
+                mesh=mesh,
+                input_partition_specs=(sharded, sharded),
+                output_partition_specs=sharded,
+            )
+            built.register_fake(_fake_qc_head_shift)
+            return built, layers
+
+        qc_head_shift_op, _ = get_shared_jax_op(
+            "dcp_qc_head_shift",
+            (id(mesh), dcp, split_rows),
+            _build_qc_head_shift_op,
+        )
+
     def run(
         kv_cache: tuple[torch.Tensor, torch.Tensor],
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -1472,6 +1522,7 @@ def build_attention_op(
     run.fused_subbatch = fused_subbatch  # type: ignore[attr-defined]
     run.serves_oproj = oproj_op is not None  # type: ignore[attr-defined]
     run.serves_sharded_kv = oproj_sharded_kv_op is not None  # type: ignore[attr-defined]
+    run.qc_head_shift_op = qc_head_shift_op  # type: ignore[attr-defined]
     # This rank's DCP index as data, for `q_rows` (built here, outside Dynamo).
     from vllm_torchtpu.distributed.dcp import dcp_rank_operand
 

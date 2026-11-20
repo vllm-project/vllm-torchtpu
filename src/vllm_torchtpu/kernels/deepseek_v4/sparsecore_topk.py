@@ -62,11 +62,24 @@ NUM_BUCKETS = 256
 # memory). Parts up to this long are double-buffered across waves; a longer part
 # (up to twice this) fills the whole buffer and is fetched single-buffered.
 MAX_SLICE_WORDS = 32 * 1024
+# Larger double-buffer half for single-subcore (p == 1) multi-wave rows that
+# allocate no cooperative shared buffers.
+_MAX_P1_DBLBUF_WORDS = 56 * 1024
+# Safe per-subcore local tile-memory budget in 32-bit words (leaves margin
+# below the per-subcore ceiling for compiler spills and alignment).
+_SC_SAFE_SUBCORE_WORDS = 126 * 1024
 # Unroll factor for the loops that walk the whole resident slice.
 SCAN_UNROLL = 8
 
 L0_SHIFT = 24
 REFINEMENT_LEVELS = ((16, 0xFF), (8, 0xFF), (0, 0xFF))
+_DEFAULT_REFINEMENT_LEVELS = tuple((s, m, NUM_BUCKETS) for s, m in REFINEMENT_LEVELS)
+# 3-pass (11 + 11 + 10) radix schedule for single-subcore wide-batch rows: cuts
+# one full-row scan from the 4-pass 8-bit schedule while keeping bit-exact top-k.
+_WIDE_L0_BITS = 11
+_WIDE_L0_SHIFT = 32 - _WIDE_L0_BITS
+_WIDE_L0_BUCKETS = 1 << _WIDE_L0_BITS
+_WIDE_REFINEMENT_LEVELS = ((10, 0x7FF, 2048), (0, 0x3FF, 1024))
 MONO_MASK = 0x7FFFFFFF
 BITS_NEG_INF = int(np.array(-np.inf, np.float32).view(np.int32))
 KEY_NEG_INF = int(np.int32(BITS_NEG_INF) ^ np.int32(0x7FFFFFFF))
@@ -118,6 +131,8 @@ def _topk_body(
     rank_major_dcp: int = 0,
     coop_v2: bool = False,
     merge_coop_dcp: int = 0,
+    wide_radix: bool = False,
+    max_slice_half: int = MAX_SLICE_WORDS,
 ):
     dcp_merge = local_idxs_hbm is not None
     if rank_major_dcp:
@@ -126,6 +141,11 @@ def _topk_body(
         assert dcp_merge and p == 1 and num_waves == 1
         assert n == rank_major_dcp * k and slice_len == n
     merge_coop = merge_coop_dcp > 0
+    if wide_radix:
+        assert p == 1 and not dcp_merge and not coop_v2 and not merge_coop
+    l0_shift = _WIDE_L0_SHIFT if wide_radix else L0_SHIFT
+    l0_buckets = _WIDE_L0_BUCKETS if wide_radix else NUM_BUCKETS
+    ref_levels = _WIDE_REFINEMENT_LEVELS if wide_radix else _DEFAULT_REFINEMENT_LEVELS
     # TPU_SC_TOPK_COOP_V2: the winner gather at P > 1. "shared": each subcore
     # scatters its winners straight into the group's staging slot at its prefix
     # offset (P >= 4: fewer winners per subcore, so the single-word scatter is
@@ -331,7 +351,7 @@ def _topk_body(
             i_hi = jnp.clip(row_eff_len - lo, 0, cap)
         walk_chunks = _cdiv_dyn(i_hi)
 
-        zero_hist(NUM_BUCKETS // LANES)
+        zero_hist(l0_buckets // LANES)
 
         @pl.when(i_hi > 0)
         def _():
@@ -345,34 +365,43 @@ def _topk_body(
             def hist0_body(i):
                 key = monotone_key(scores_vmem[pl.ds(i * LANES, LANES)])
                 scores_vmem[pl.ds(i * LANES, LANES)] = key
-                bucket = jnp.right_shift(key, L0_SHIFT) + jnp.int32(NUM_BUCKETS // 2)
+                bucket = jnp.right_shift(key, l0_shift) + jnp.int32(l0_buckets // 2)
                 hist_add(bucket, key > neg_inf_key)
 
             plsc.parallel_loop(0, walk_chunks, unroll=SCAN_UNROLL)(hist0_body)
 
         if fused_reduce:
             exchange_hist(0, active)
-            total, _ = reduce_scan(NUM_BUCKETS // LANES)
+            total, _ = reduce_scan(l0_buckets // LANES)
         else:
             sync_and_reduce_hist(0, active)
-            total = scan_glob(NUM_BUCKETS // LANES)
+            total = scan_glob(l0_buckets // LANES)
         keep_all = total <= k
 
-        b_star = find_bucket(NUM_BUCKETS // LANES, total - k)
+        b_star = find_bucket(l0_buckets // LANES, total - k)
         cum_at = vec_at(glob_vmem, b_star)
         cum_lo = jnp.where(b_star > 0, vec_at(glob_vmem, jnp.maximum(b_star - 1, 0)), 0)
         c_hi = total - cum_at
         cnt = cum_at - cum_lo
         quota = k - c_hi
 
-        prefix = b_star - jnp.int32(NUM_BUCKETS // 2)
-        shift = jnp.int32(L0_SHIFT)
+        prefix = b_star - jnp.int32(l0_buckets // 2)
+        shift = jnp.int32(l0_shift)
         done = keep_all | (quota == cnt)
 
         def level(
-            lvl_shift, slot, prefix, shift, c_hi, quota, cnt, done, lvl_mask=0xFF
+            lvl_shift,
+            slot,
+            prefix,
+            shift,
+            c_hi,
+            quota,
+            cnt,
+            done,
+            lvl_mask=0xFF,
+            lvl_buckets=NUM_BUCKETS,
         ):
-            hist_bound = jnp.where(done, 0, NUM_BUCKETS // LANES)
+            hist_bound = jnp.where(done, 0, lvl_buckets // LANES)
             zero_hist(hist_bound)
             active_walk = jnp.where(done, 0, walk_chunks)
             lo_excl, hi_incl = key_window(prefix, shift)
@@ -426,8 +455,16 @@ def _topk_body(
 
             carry = lax.fori_loop(0, len(REFINEMENT_LEVELS), lvl_iter, carry)
         else:
-            for lvl_idx, (lvl_shift, lvl_mask) in enumerate(REFINEMENT_LEVELS, start=1):
-                carry = level(lvl_shift, lvl_idx % 2, *carry, lvl_mask=lvl_mask)
+            for lvl_idx, (lvl_shift, lvl_mask, lvl_buckets) in enumerate(
+                ref_levels, start=1
+            ):
+                carry = level(
+                    lvl_shift,
+                    lvl_idx % 2,
+                    *carry,
+                    lvl_mask=lvl_mask,
+                    lvl_buckets=lvl_buckets,
+                )
         prefix, shift, c_hi, quota, cnt, done = carry
 
         if callable(merge_owner):
@@ -1077,7 +1114,7 @@ def _topk_body(
     # fetches just its part; at p == 1 that is the row's first row_length
     # words. Every subcore copies all the row lengths in once.
     pltpu.sync_copy(lengths_hbm, meta_vmem)
-    _, half = _slice_buffer(num_waves, slice_len)
+    _, half = _slice_buffer(num_waves, slice_len, max_slice_half)
 
     def wave_info(wave):
         """Row length, busy flag and this subcore's column range."""
@@ -1189,17 +1226,40 @@ COOP_V2_TESTED_SHAPES = frozenset(
 )
 
 
-def _slice_buffer(num_waves: int, slice_len: int) -> tuple[int, int]:
+def _slice_buffer(
+    num_waves: int, slice_len: int, max_half: int = MAX_SLICE_WORDS
+) -> tuple[int, int]:
     """(words, half) of a subcore's slice buffer on the wave loop.
 
-    Two halves of up to MAX_SLICE_WORDS let a part that fits one be fetched
-    while the previous wave's part is selected; a part up to the whole buffer
-    still fits, single-buffered. One wave needs no second half.
+    Two halves of up to ``max_half`` let a part that fits one be fetched while
+    the previous wave's part is selected; a part up to the whole buffer still
+    fits, single-buffered. One wave needs no second half.
     """
     if num_waves == 1:
         return slice_len, slice_len
-    half = min(slice_len, MAX_SLICE_WORDS)
+    half = min(slice_len, max_half)
     return max(2 * half, slice_len), half
+
+
+def _p1_wide_radix_and_half(
+    *,
+    p: int,
+    wave_loop: bool,
+    b: int,
+    padded_b: int,
+    k: int,
+    slice_len: int,
+    return_scores: bool,
+) -> tuple[bool, int]:
+    if p != 1 or not wave_loop:
+        return False, MAX_SLICE_WORDS
+    base_fixed = (k + LANES) * (2 if return_scores else 1) + (padded_b + LANES)
+    wide_fixed = (_WIDE_L0_BUCKETS + LANES) + base_fixed
+    use_wide = b >= 32 and (wide_fixed + slice_len) <= _SC_SAFE_SUBCORE_WORDS
+    fixed = wide_fixed if use_wide else (NUM_BUCKETS + LANES) + base_fixed
+    avail_half = ((_SC_SAFE_SUBCORE_WORDS - fixed) // 2 // LANES) * LANES
+    max_half = min(_MAX_P1_DBLBUF_WORDS, max(MAX_SLICE_WORDS, avail_half))
+    return use_wide, max_half
 
 
 def _sc_topk_direct(
@@ -1308,8 +1368,18 @@ def _sc_topk_direct(
     shared_gather = coop_v2 and p >= 4
     async_gather = coop_v2 and p < 4
     peer_n = p if async_gather else 1
+    wide_radix, max_slice_half = _p1_wide_radix_and_half(
+        p=p,
+        wave_loop=wave_loop,
+        b=b,
+        padded_b=padded_b,
+        k=k,
+        slice_len=slice_len,
+        return_scores=return_scores,
+    )
+    hist_words = _WIDE_L0_BUCKETS if wide_radix else NUM_BUCKETS
     scratch_types = (
-        pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),  # glob_vmem
+        pltpu.VMEM((hist_words + LANES,), jnp.int32),  # glob_vmem
         pltpu.VMEM((k + LANES,), jnp.int32),  # rowbuf_vmem
         pltpu.VMEM((k + LANES,), jnp.int32) if return_scores else None,  # keybuf_vmem
         pltpu.VMEM((p * NUM_BUCKETS + LANES,), jnp.int32)
@@ -1334,7 +1404,7 @@ def _sc_topk_direct(
         if (p > 1 and return_scores)
         else None,  # shared_key_vmem
         pltpu.VMEM((padded_b + LANES,), jnp.int32) if wave_loop else None,  # meta_vmem
-        pltpu.VMEM((_slice_buffer(num_waves, slice_len)[0],), jnp.int32)
+        pltpu.VMEM((_slice_buffer(num_waves, slice_len, max_slice_half)[0],), jnp.int32)
         if wave_loop
         else None,  # slices_vmem
         pltpu.SemaphoreType.DMA((2,)) if wave_loop else None,  # slice_sems
@@ -1364,6 +1434,8 @@ def _sc_topk_direct(
         return_scores=return_scores,
         rank_major_dcp=rank_major_dcp,
         coop_v2=coop_v2,
+        wide_radix=wide_radix,
+        max_slice_half=max_slice_half,
     )
     if local_idxs is not None:
         orig_body = body_fn
@@ -1381,6 +1453,7 @@ def _sc_topk_direct(
         if cost_bytes > 0 and b <= 32
         else None
     )
+    suffix = ("_v2" if coop_v2 else "") + ("_w11" if wide_radix else "")
     out = pl.kernel(
         body_fn,
         out_type=out_type,
@@ -1390,7 +1463,7 @@ def _sc_topk_direct(
         scratch_types=scratch_types,
         mesh=mesh,
         cost_estimate=cost,
-        name=f"sc_topk_direct_b{b}_n{n}_k{k}_p{p}{'_v2' if coop_v2 else ''}",
+        name=f"sc_topk_direct_b{b}_n{n}_k{k}_p{p}{suffix}",
     )(words.reshape(-1), lengths_in, *extra_inputs)
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(

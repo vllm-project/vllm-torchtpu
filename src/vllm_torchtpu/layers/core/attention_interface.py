@@ -1208,6 +1208,8 @@ def sparse_mla_attention_dcp(
     fused_merge: bool = False,
     merge_pieces: bool = True,
     skip_kv_write: bool = False,
+    mixed_live_widths_override: tuple[int, ...] | None = None,
+    attention_kernel_batch_size: int | None = None,
 ) -> tuple[jax.Array, ...]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1529,6 +1531,18 @@ def sparse_mla_attention_dcp(
             if topk_cap
             else sparse_mla_chunk_kwargs()
         )
+        if attention_kernel_batch_size is not None:
+            chunk_kwargs = {
+                **chunk_kwargs,
+                "attention_kernel_batch_size": attention_kernel_batch_size,
+            }
+        live_widths = (
+            tuple(w for w in mixed_live_widths_override if not topk_cap or w < topk_cap)
+            if mixed_live_widths_override is not None
+            else tuple(
+                int(w) for w in envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS.split(",") if w
+            )
+        )
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
         local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
@@ -1587,9 +1601,7 @@ def sparse_mla_attention_dcp(
             lse_mask_empty=mask_in_kernel,
             fused_window_prep=fused_prep,
             mixed_live_gather=envs.TPU_DCP_MLA_MIXED_LIVE,
-            mixed_live_widths=tuple(
-                int(w) for w in envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS.split(",") if w
-            ),
+            mixed_live_widths=live_widths,
             mixed_body_levers=_mixed_body_levers(
                 envs.TPU_DCP_MLA_MIXED_BODY, envs.TPU_DCP_MLA_MIXED_KERNEL_V2
             ),

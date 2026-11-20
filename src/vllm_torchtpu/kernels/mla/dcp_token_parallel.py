@@ -492,6 +492,33 @@ def dequantize_row_shards(
     return w.reshape(-1, n)
 
 
+def gather_qc_head_rows(
+    q_c_local: jax.Array,
+    rank: jax.Array,
+    *,
+    dcp_size: int,
+    split_rows: int,
+    axis_name: str,
+) -> jax.Array:
+    """Assemble `[split_rows + R, Q_LORA]` via `ppermute` and rank-0 broadcast."""
+    r = rank.reshape(())
+    head_local = q_c_local[:split_rows]
+    perm = [(i, (i - 1) % dcp_size) for i in range(dcp_size)]
+    from_next = lax.ppermute(head_local, axis_name, perm)
+    # Avoid an all-gather of every rank's head slice: only rank 0's head is
+    # broadcast, and a bf16 psum with (dcp_size - 1) exact zeros is bit-exact
+    # for finite values while sending 256 KB instead of 4.19 MB at dcp=16.
+    head0 = lax.psum(
+        jnp.where(r == 0, head_local, jnp.zeros_like(head_local)), axis_name
+    )
+    tail_s = jnp.where(
+        r < dcp_size - 1,
+        from_next,
+        jnp.broadcast_to(q_c_local[-1:], (split_rows, q_c_local.shape[-1])),
+    )
+    return jnp.concatenate([head0, q_c_local[split_rows:], tail_s], axis=0)
+
+
 def token_rows_to_sequence_rows(
     layout: TokenParallelLayout,
     own_rows: jax.Array,

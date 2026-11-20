@@ -430,6 +430,11 @@ class _GatherProjections(_OProjReduceScatter):
                     and getattr(mla, "o_proj", None) is not None
                     and dcp_token_parallel_op.serves_sequence_row_oproj(mla.o_proj)
                 )
+                qc_head_shift_op = getattr(tp_op, "qc_head_shift_op", None)
+                if use_sharded_kv and indexer is None and qc_head_shift_op is not None:
+                    assert positions_local is not None
+                    q_c_qrows = qc_head_shift_op(q_c_local, tp_op.rank)
+                    return (q_c_qrows, kv_lora_local, positions_local), None
                 qc_head_packed = q_c_local[:s].reshape(rows_local, cols_qc)
                 parts = (
                     [qc_head_packed]

@@ -910,3 +910,174 @@ def test_should_lift_rank_buffer_through_layer_keep_before_positions_slice(
         in placeholders_by_mode["prefill"]
     )
     assert not any("fused_moe_ep" in name for name in placeholders_by_mode["prefill"])
+
+
+def test_should_match_all_gather_bit_exact_when_gathering_qc_head_rows():
+    mesh = _make_16dev_mesh()
+    dcp, rows_local, split_rows, q_lora = 16, 128, 16, 64
+    rng = np.random.default_rng(7711)
+    full_qc = jnp.asarray(
+        (rng.standard_normal((dcp * rows_local, q_lora)) * 3.5).astype(np.float32),
+        dtype=jnp.bfloat16,
+    )
+    # Include exact zero and sentinel rows at rank boundaries and tail.
+    full_qc = full_qc.at[0, :].set(jnp.bfloat16(0.0))
+    full_qc = full_qc.at[-1, :].set(jnp.bfloat16(-123.5))
+    shd = P("dcp")
+    qc_shd = jax.device_put(full_qc, NamedSharding(mesh, shd))
+    ranks_shd = _sharded_array(np.arange(dcp, dtype=np.int32), mesh)
+
+    def _ref_ag(qc_l, rk):
+        all_heads = jax.lax.all_gather(qc_l[:split_rows], "dcp", axis=0, tiled=False)
+        r = rk.reshape(())
+        next_r = jnp.minimum(r + 1, dcp - 1)
+        tail_s = jnp.where(
+            r < dcp - 1,
+            all_heads[next_r],
+            jnp.broadcast_to(qc_l[-1:], (split_rows, q_lora)),
+        )
+        return jnp.concatenate([all_heads[0], qc_l[split_rows:], tail_s], axis=0)
+
+    def _got_pperm(qc_l, rk):
+        return dcp_token_parallel.gather_qc_head_rows(
+            qc_l, rk, dcp_size=dcp, split_rows=split_rows, axis_name="dcp"
+        )
+
+    want = jax.jit(
+        jax.shard_map(
+            _ref_ag, mesh=mesh, in_specs=(shd, shd), out_specs=shd, check_vma=False
+        )
+    )(qc_shd, ranks_shd)
+    got = jax.jit(
+        jax.shard_map(
+            _got_pperm, mesh=mesh, in_specs=(shd, shd), out_specs=shd, check_vma=False
+        )
+    )(qc_shd, ranks_shd)
+
+    np.testing.assert_array_equal(
+        np.asarray(jax.lax.bitcast_convert_type(got, jnp.uint16)),
+        np.asarray(jax.lax.bitcast_convert_type(want, jnp.uint16)),
+    )
+
+
+@pytest.mark.parametrize("with_indexer", [False, True], ids=["non_indexer", "indexer"])
+def test_should_use_qc_head_shift_op_only_on_non_indexer_layers(with_indexer: bool):
+    tp, rows_local, s, q_lora, kv_dim, kw_dim = 4, 32, 8, 16, 24, 12
+    num_tokens = tp * rows_local
+    torch.manual_seed(919)
+    full_qc = torch.randn(num_tokens, q_lora, dtype=torch.bfloat16)
+    full_kv = torch.randn(num_tokens, kv_dim, dtype=torch.bfloat16)
+    full_kw = torch.randn(num_tokens, kw_dim, dtype=torch.bfloat16)
+    positions = torch.arange(num_tokens, dtype=torch.int32)
+    full_x = torch.arange(num_tokens, dtype=torch.int32).unsqueeze(-1)
+    cols_qc = (s * q_lora) // rows_local
+
+    for r in range(tp):
+        lo, hi = r * rows_local, (r + 1) * rows_local
+        rank_t = torch.tensor([r], dtype=torch.int32)
+        shift_calls: list[int] = []
+        ag_calls: list[int] = []
+
+        def _fake_shift(
+            qc_local: torch.Tensor, rk: torch.Tensor, _calls=shift_calls
+        ) -> torch.Tensor:
+            _calls.append(int(rk.item()))
+            ri = int(rk.item())
+            head0 = full_qc[:s]
+            tail = (
+                full_qc[(ri + 1) * rows_local : (ri + 1) * rows_local + s]
+                if ri < tp - 1
+                else qc_local[-1:].expand(s, -1)
+            )
+            return torch.cat([head0, qc_local[s:], tail], dim=0)
+
+        tp_op = SimpleNamespace(
+            layout=dcp_token_parallel.TokenParallelLayout(
+                dcp_size=tp,
+                page_size=16,
+                interleave_size=4,
+                max_pages=8,
+                split_rows=s,
+            ),
+            q_replicated=True,
+            rank=rank_t,
+            serves_sharded_kv=True,
+            qc_head_shift_op=_fake_shift,
+        )
+
+        def _qkv_proj(x: torch.Tensor) -> tuple[torch.Tensor, None]:
+            idx = x.squeeze(-1).long()
+            return torch.cat([full_qc[idx], full_kv[idx]], dim=-1), None
+
+        def _wk_proj(x: torch.Tensor) -> tuple[torch.Tensor, None]:
+            idx = x.squeeze(-1).long()
+            return full_kw[idx], None
+
+        expected_ag = torch.cat(
+            [
+                full_qc.view(tp, rows_local, q_lora)[:, :s, :].reshape(
+                    num_tokens, cols_qc
+                ),
+                full_kw,
+            ],
+            dim=-1,
+        )
+
+        def _fake_ag(
+            t: torch.Tensor,
+            dim: int,
+            _calls=ag_calls,
+            _expected=expected_ag,
+        ) -> torch.Tensor:
+            assert dim == 0
+            _calls.append(t.shape[-1])
+            return _expected
+
+        mla = SimpleNamespace(
+            fused_qkv_a_proj=_qkv_proj,
+            indexer=SimpleNamespace(
+                wk_weights_proj=_wk_proj,
+                indexer_op=SimpleNamespace(topk_op_tp=SimpleNamespace(q_own_rows=True)),
+            )
+            if with_indexer
+            else None,
+            skip_topk=not with_indexer,
+            is_sparse=True,
+            g_proj=None,
+            o_proj=SimpleNamespace(),
+            mla_attn=SimpleNamespace(sparse_mla_tp_op=tp_op),
+            gate_is_fused=False,
+            kimi_preprocess=None,
+            q_lora_rank=q_lora,
+        )
+        group = sp._ShardedKVGatherProjections(positions, tp)  # noqa: SLF001 -- exercises per-step gatherer contract directly
+        with (
+            patch.object(envs, "TPU_DCP_TP_SHARDED_KV_WRITE", True),
+            patch.object(envs, "TPU_DCP_TP_PREFILL_LOCAL_OPROJ", True),
+            patch.object(tp_op_mod, "applies", return_value=True),
+            patch.object(tp_op_mod, "serves_sequence_row_oproj", return_value=True),
+            patch.object(sp, "get_tensor_model_parallel_world_size", return_value=tp),
+            patch.object(
+                sp.fused_moe_ep, "rank_operand", return_value=rank_t.view(1, 1)
+            ),
+            patch.object(sp, "tensor_model_parallel_all_gather", side_effect=_fake_ag),
+        ):
+            pre_qkv, pre_kw = group.project_gather(mla, full_x[lo:hi], num_tokens)
+
+        assert isinstance(pre_qkv, tuple) and len(pre_qkv) == 3
+        got_qc, got_kv_local, got_pos_local = pre_qkv
+        q_idx = tp_op_mod.q_rows(tp_op, num_tokens)
+        torch.testing.assert_close(
+            got_qc, full_qc.index_select(0, q_idx), rtol=0, atol=0
+        )
+        torch.testing.assert_close(got_kv_local, full_kv[lo:hi], rtol=0, atol=0)
+        torch.testing.assert_close(got_pos_local, positions[lo:hi], rtol=0, atol=0)
+        if with_indexer:
+            assert shift_calls == []
+            assert ag_calls == [cols_qc + kw_dim]
+            assert pre_kw is not None
+            torch.testing.assert_close(pre_kw, full_kw, rtol=0, atol=0)
+        else:
+            assert shift_calls == [r]
+            assert ag_calls == []
+            assert pre_kw is None
