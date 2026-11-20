@@ -725,6 +725,8 @@ def _validation_tpu_info(monkeypatch, mxu_column_size: int = 256) -> None:
             vmem_capacity_bytes=64 * 1024 * 1024,
             fp8_ops_per_second=0,
             int8_ops_per_second=0,
+            get_sublane_tiling=lambda dtype: 8
+            * (32 // jax.dtypes.itemsize_bits(dtype)),
         ),
     )
 
