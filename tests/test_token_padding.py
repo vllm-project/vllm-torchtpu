@@ -28,6 +28,32 @@ def test_dummy_batch_is_all_padding():
     assert state.get_local_padding_mask(6).tolist() == [True] * 6
 
 
+def test_update_reuses_cached_mask_without_aliasing():
+    state = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
+    state.update(3, 6)
+    state.update(0, 4)
+    state.update(3, 6)
+    assert (
+        state.get_local_padding_mask(8).tolist()
+        == [False] * 3 + [True] * 3 + [False] * 2
+    )
+    # The cached copy is not the live mask: refreshing one leaves the other.
+    state.local_padding_mask.fill_(False)
+    state.update(0, 4)
+    assert state.get_local_padding_mask(8).tolist() == [True] * 4 + [False] * 4
+
+
+def test_device_mask_cache_is_bounded():
+    limit = token_padding._MAX_DEVICE_MASKS
+    rows = limit + 8
+    state = TokenPaddingState(local_padding_mask=torch.zeros(rows, dtype=torch.bool))
+    for valid in range(rows):
+        state.update(valid, rows)
+    assert len(state._device_masks) == limit
+    state.update(0, rows)  # evicted: rebuilt from the host
+    assert state.get_local_padding_mask(rows).all()
+
+
 def test_zero_routing_weights_for_padding_zeroes_weights_keeps_ids(monkeypatch):
     provider = TokenPaddingState(local_padding_mask=torch.zeros(4, dtype=torch.bool))
     token_padding.set_padding_state(provider)

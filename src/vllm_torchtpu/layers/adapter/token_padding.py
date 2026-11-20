@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
 
 import torch
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -20,11 +21,20 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 _padding_state: "TokenPaddingState | None" = None
 
 
+_MAX_DEVICE_MASKS = 64
+
+
 @dataclass
 class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
+    # Recently used masks already on the device, by (valid, padded) rows.
+    # Decode steps repeat a handful of these, so the mask is refreshed with an
+    # async device copy instead of a synchronous host-to-device one.
+    _device_masks: OrderedDict[tuple[int, int], torch.Tensor] = field(
+        default_factory=OrderedDict, repr=False
+    )
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
@@ -35,10 +45,19 @@ class TokenPaddingState:
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
+        key = (local_valid_tokens, local_padded_tokens)
+        device_mask = self._device_masks.get(key)
+        if device_mask is not None:
+            self._device_masks.move_to_end(key)
+            self.local_padding_mask.copy_(device_mask)
+            return
         host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
         self.local_padding_mask.copy_(host)
+        self._device_masks[key] = self.local_padding_mask.clone()
+        if len(self._device_masks) > _MAX_DEVICE_MASKS:
+            self._device_masks.popitem(last=False)
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]
