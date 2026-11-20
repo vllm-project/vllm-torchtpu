@@ -540,7 +540,7 @@ def order_prefills_by_kv_len(
     start: int,
     end: int,
     scheduler_output,
-) -> None:
+) -> bool:
     """Order requests `[start, end)` by KV length, longest first.
 
     Used only with the opt-in masked-dense MLA routing, which can run a
@@ -548,7 +548,11 @@ def order_prefills_by_kv_len(
     The routing re-derives and validates any split on device, so this order
     affects performance only. Ties keep their current order, and
     `swap_states` moves every request-associated buffer with its request.
+
+    Returns:
+        Whether any request moved.
     """
+    moved = False
     tail: list[str] = []
     kv_lens: dict[str, int] = {}
     position: dict[str, int] = {}
@@ -570,6 +574,8 @@ def order_prefills_by_kv_len(
             runner.input_batch.swap_states(dst, src)
             position[displaced] = src
             position[req_id] = dst
+            moved = True
+    return moved
 
 
 def maybe_order_prefills_by_kv_len(
@@ -578,9 +584,14 @@ def maybe_order_prefills_by_kv_len(
     num_reqs: int,
     scheduler_output,
     spec_decode_tokens,
-) -> None:
-    """Order prefill requests by KV length when every layer was admitted."""
+) -> bool:
+    """Order prefill requests by KV length when every layer was admitted.
+
+    Returns:
+        Whether any request moved.
+    """
     if not spec_decode_tokens and getattr(
         runner, "_masked_dense_groups_requests", None
     ):
-        order_prefills_by_kv_len(runner, num_decode, num_reqs, scheduler_output)
+        return order_prefills_by_kv_len(runner, num_decode, num_reqs, scheduler_output)
+    return False

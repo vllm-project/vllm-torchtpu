@@ -892,6 +892,32 @@ def _spec_warmup_num_output_tokens(requests: Any, req_ids: list[str]) -> list[in
     return [len(requests[req_id].output_token_ids) for req_id in req_ids]
 
 
+def _order_prefills_and_publish_swaps(
+    runner: Any,
+    num_decode: int,
+    num_reqs: int,
+    scheduler_output: "SchedulerOutput",
+    spec_decode_tokens: Any,
+    *,
+    swapped: bool,
+) -> None:
+    """Finish `_reorder_batch_for_rpa`: apply the opt-in MLA order of the
+    prefill tail by KV length, then publish the step's swaps, if any.
+
+    `swap_states` queues each swap as a batch update that vLLM applies in
+    `InputBatch.refresh_metadata`, which `_update_states` already ran this
+    step, and the output's request-index snapshot is keyed on the old order.
+    """
+    if (
+        mla_dispatch.maybe_order_prefills_by_kv_len(
+            runner, num_decode, num_reqs, scheduler_output, spec_decode_tokens
+        )
+        or swapped
+    ):
+        runner._cached_output_req_ids_key = None
+        runner.input_batch.refresh_metadata()
+
+
 def _h2d_temp(runner, host: torch.Tensor) -> torch.Tensor:
     """non_blocking upload of a temporary host tensor for ``runner``.
 
@@ -2559,8 +2585,13 @@ class TPUModelRunner(GPUModelRunner):
                 if seg == 0:
                     num_decode += 1
             if ordered:
-                mla_dispatch.maybe_order_prefills_by_kv_len(
-                    self, num_decode, num_reqs, scheduler_output, spec_decode_tokens
+                _order_prefills_and_publish_swaps(
+                    self,
+                    num_decode,
+                    num_reqs,
+                    scheduler_output,
+                    spec_decode_tokens,
+                    swapped=False,
                 )
                 return num_decode, num_decode
         elif self._static_verify_q_len is None:
@@ -2586,8 +2617,13 @@ class TPUModelRunner(GPUModelRunner):
                 else:
                     prev_seg = 2
             if ordered:
-                mla_dispatch.maybe_order_prefills_by_kv_len(
-                    self, num_decode, num_reqs, scheduler_output, spec_decode_tokens
+                _order_prefills_and_publish_swaps(
+                    self,
+                    num_decode,
+                    num_reqs,
+                    scheduler_output,
+                    spec_decode_tokens,
+                    swapped=False,
                 )
                 return num_decode, num_windowed
 
@@ -2644,12 +2680,14 @@ class TPUModelRunner(GPUModelRunner):
                 lambda r: scheduler_output.num_scheduled_tokens[r] == q_len,
             )
             self._num_static_verify_reqs = num_full - num_decode
-        mla_dispatch.maybe_order_prefills_by_kv_len(
-            self, num_decode, num_reqs, scheduler_output, spec_decode_tokens
+        _order_prefills_and_publish_swaps(
+            self,
+            num_decode,
+            num_reqs,
+            scheduler_output,
+            spec_decode_tokens,
+            swapped=swapped,
         )
-        if swapped:
-            self._cached_output_req_ids_key = None
-            self.input_batch.refresh_metadata()
         return num_decode, num_windowed
 
     def _build_attention_metadata(
