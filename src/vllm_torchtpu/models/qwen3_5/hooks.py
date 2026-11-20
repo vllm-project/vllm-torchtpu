@@ -113,8 +113,9 @@ def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, int]:
     runs logged that budget), and it leaves copies x 3 x hidden x
     moe_intermediate bytes (48 MiB for 4 copies at Qwen3.5-397B-A17B's shape)
     unspent where the drafter's layer is not placed."""
-    # Imported here: importing the vllm_torchtpu.layers package registers the
-    # models, which imports this module.
+    # Imported here, not at the module top: every vLLM process imports this
+    # module through the general plugin (register_models), and only the
+    # measured decode layout's budget reads the placement.
     from vllm_torchtpu.layers.adapter import expert_placement
 
     text = model_config.hf_text_config
