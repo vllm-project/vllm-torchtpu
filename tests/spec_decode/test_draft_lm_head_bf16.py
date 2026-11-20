@@ -432,10 +432,13 @@ def test_target_lm_head_stays_bf16_by_default(monkeypatch):
 
 
 def _engine_config(architectures, section=None):
+    """An engine config of Qwen3.5-397B-A17B's text config, the checkpoint the
+    target-head quantization runs on (with a TPU7x chip, which the test sets)."""
     from types import SimpleNamespace as NS
 
+    text = NS(num_experts=512, hidden_size=4096, num_hidden_layers=60)
     return NS(
-        model_config=NS(architectures=architectures),
+        model_config=NS(architectures=architectures, hf_text_config=text),
         additional_config={} if section is None else {"qwen3_5": section},
     )
 
@@ -443,7 +446,10 @@ def _engine_config(architectures, section=None):
 def test_quantize_target_lm_head_follows_the_qwen3_5_setting(monkeypatch):
     import vllm.config
 
+    from vllm_torchtpu.models.qwen3_5 import hooks
     from vllm_torchtpu.models.vllm import qwen3_next_patch
+
+    monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
 
     qwen35 = ["Qwen3_5MoeForConditionalGeneration"]
     cases = [
