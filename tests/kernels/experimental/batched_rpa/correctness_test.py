@@ -1056,20 +1056,24 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         self.assertTrue(_assert_cache_equal(actual_kvc, expected_kvc).item())
 
     @parameterized.product(
-        case=["mixed_runs", "mixed_empty"],
+        case=["mixed_runs", "mixed_empty", "decode_alone"],
         return_lse=[False, True],
         skip_empty_mixed=[False, True],
     )
     def test_ragged_paged_attention_skip_empty_mixed_cond(
         self, case, return_lse, skip_empty_mixed
     ):
-        """A 16-token call, more than decode_query_size, so with
-        skip_empty_mixed MIXED runs under its lax.cond: "mixed_runs" has two
+        """With skip_empty_mixed, a 16-token call, more than
+        decode_query_size, runs MIXED under its lax.cond: "mixed_runs" has two
         4-token decodes and an 8-token chunk in MIXED (the true branch);
         "mixed_empty" has four 4-token decodes and an empty MIXED range (the
-        false branch, which passes o and the KV cache through). Outputs and
-        the cache match the reference, and the LSE matches the call without
-        the skip."""
+        false branch, which passes o and the KV cache through). "decode_alone"
+        is a 4-token call, so DECODE runs alone over every sequence, including
+        the 3-token chunk the distribution puts in MIXED. Outputs and the
+        cache match the reference, and with the skip the LSE matches the call
+        without it: bit for bit where both run the same kernels, and within
+        bf16 rounding in "decode_alone", where DECODE computes the chunk that
+        MIXED computes without the skip."""
         if not jtu.is_device_tpu_at_least(version=4):
             self.skipTest("Expect TPUv4+")
         rng = np.random.default_rng(1234)
@@ -1082,10 +1086,12 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         pages_per_seq = 4
         if case == "mixed_runs":
             seqs, dist = [(4, 260), (4, 100), (8, 300)], (2, 2, 3)
-        else:
+        elif case == "mixed_empty":
             seqs, dist = [(4, 260), (4, 100), (4, 300), (4, 37)], (4, 4, 4)
+        else:
+            seqs, dist = [(1, 260), (3, 100)], (1, 1, 2)
         tokens = sum(q for q, _ in seqs)
-        assert tokens == 16
+        assert tokens == (4 if case == "decode_alone" else 16)
 
         def rand(shape):
             return jnp.array(rng.random(shape, dtype=np.float32), dtype=dtype)
@@ -1129,10 +1135,13 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         actual, actual_kvc = result[0], result[1]
         self.assertAllClose(actual, expected, atol=0.2, rtol=0.2)
         self.assertTrue(_assert_cache_equal(actual_kvc, expected_kvc).item())
-        if return_lse:
-            np.testing.assert_array_equal(
-                np.asarray(result[2]), np.asarray(run(False)[2])
-            )
+        if return_lse and skip_empty_mixed:
+            lse = np.asarray(result[2], np.float32)
+            lse_without_skip = np.asarray(run(False)[2], np.float32)
+            if case == "decode_alone":
+                np.testing.assert_allclose(lse, lse_without_skip, rtol=2e-2, atol=2e-2)
+            else:
+                np.testing.assert_array_equal(lse, lse_without_skip)
 
     @parameterized.product(tuned_tiles=[False, True])
     def test_ragged_paged_attention_tuned_tiles(self, tuned_tiles):

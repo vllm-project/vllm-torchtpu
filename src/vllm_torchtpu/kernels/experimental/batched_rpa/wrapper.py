@@ -699,11 +699,12 @@ def ragged_paged_attention(
             (see `calculate_block_sizes`). Defaults to False: the heuristic's
             tiles.
         skip_empty_mixed: Skip the MIXED call when it has no sequences: a call
-            of at most decode_query_size tokens runs DECODE alone over every
-            sequence, and any other call runs MIXED under a `lax.cond` on its
-            sequence range. Defaults to False: DECODE and MIXED both run on
-            every call. One conditional per attention layer changes how XLA
-            schedules and places the whole compiled step.
+            of at most decode_query_size tokens, and at most the DECODE bq_sz,
+            without context parallelism (cp_group_size None) runs DECODE alone
+            over every sequence, and any other call runs MIXED under a
+            `lax.cond` on its sequence range. Defaults to False: DECODE and
+            MIXED both run on every call. One conditional per attention layer
+            changes how XLA schedules and places the whole compiled step.
         cp_group_size: Size of the context parallelism (CP) group. KV cache is
             sharded across devices in this group. Defaults to None.
         cp_rank: Rank of the current device within the CP group, which determine
