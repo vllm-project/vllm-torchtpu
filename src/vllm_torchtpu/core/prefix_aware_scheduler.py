@@ -86,7 +86,6 @@ class _Follower:
     """A running prefill that waits while another request caches its chunks."""
 
     cached_at_step_start: int | None = None
-    cache_grew: bool = True
 
 
 @dataclass
@@ -191,9 +190,7 @@ class PrefixAwareScheduler(AsyncScheduler):
     def _chunk_is_cached(self, request: Request, chunk_end: int) -> bool:
         """Whether every token of this running prefill's next chunk is cached.
 
-        Such a request waits this step as a follower, and records whether the
-        cached prefix grew since the step started, that is whether another
-        request is still caching the same prompt this step.
+        Such a request waits this step as a follower.
         """
         request_id = request.request_id
         cached = (
@@ -205,9 +202,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             self._followers.pop(request_id, None)
             self._followed_steps.pop(request_id, None)
             return False
-        follower = self._followers.setdefault(request_id, _Follower())
-        if follower.cached_at_step_start is not None:
-            follower.cache_grew = cached > follower.cached_at_step_start
+        self._followers.setdefault(request_id, _Follower())
         self._followed_steps[request_id] = self._followed_steps.get(request_id, 0) + 1
         self._num_followed_steps += 1
         return True
@@ -223,7 +218,11 @@ class PrefixAwareScheduler(AsyncScheduler):
 
     def _update_followers(self) -> None:
         """Preempt each follower whose cached prefix stopped growing in the
-        last step, so its admission takes the cached tokens."""
+        last step, so its admission takes the cached tokens.
+
+        The cached prefix is compared between step starts, so a follower that
+        the last step did not reach, for example because the requests ahead of
+        it used the token budget, still sees its sibling's growth."""
         for request_id, rejoin in list(self._rejoins.items()):
             request = self.requests.get(request_id)
             if request is None or request.status not in (
@@ -246,9 +245,9 @@ class PrefixAwareScheduler(AsyncScheduler):
                 self._followed_steps.pop(request_id, None)
                 continue
             cached = self._cached_prompt_tokens(request)
-            if follower.cache_grew:
+            start = follower.cached_at_step_start
+            if start is None or cached > start:
                 follower.cached_at_step_start = cached
-                follower.cache_grew = False
                 continue
             del self._followers[request_id]
             followed_steps = self._followed_steps.pop(request_id, 0)

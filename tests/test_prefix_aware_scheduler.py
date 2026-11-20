@@ -852,12 +852,41 @@ def test_paused_scheduler_preempts_no_follower():
         request = make_request("r", prompt(6, 8 * BLOCK))
         scheduler.add_request(request)
         request.status = RequestStatus.RUNNING
-        scheduler._followers["r"] = _Follower(cache_grew=False)
+        scheduler._followers["r"] = _Follower(cached_at_step_start=0)
         scheduler._pause_state = state
         scheduler._update_followers()
         assert ("r" in scheduler._followers) is kept
         assert request.status == RequestStatus.RUNNING
         assert not scheduler._rejoins
+
+
+def test_follower_the_last_step_did_not_reach_waits_while_its_prefix_grows():
+    """A follower that the last step did not reach, for example because the
+    requests ahead of it used the token budget, is kept while its cached
+    prefix grows between step starts, and preempted once it stops."""
+    from vllm_torchtpu.core.prefix_aware_scheduler import _Follower
+
+    scheduler = make_scheduler(True)
+    request = make_request("r", prompt(9, 8 * BLOCK))
+    scheduler.requests["r"] = request
+    scheduler.running.append(request)
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 2 * BLOCK
+    cached = iter([3 * BLOCK, 4 * BLOCK, 5 * BLOCK, 5 * BLOCK])
+    scheduler._cached_prompt_tokens = lambda r: next(cached)
+    scheduler._followers["r"] = _Follower()
+
+    for expected in (3 * BLOCK, 4 * BLOCK, 5 * BLOCK):
+        scheduler._update_followers()
+        assert scheduler._followers["r"].cached_at_step_start == expected
+        assert request.status == RequestStatus.RUNNING
+        assert not scheduler._rejoins
+
+    scheduler._update_followers()
+    assert request.status == RequestStatus.PREEMPTED
+    assert "r" not in scheduler._followers
+    assert scheduler._rejoins["r"].computed_tokens == 2 * BLOCK
+    assert request not in scheduler.running
 
 
 def test_finished_and_waiting_requests_leave_or_keep_their_entries():
