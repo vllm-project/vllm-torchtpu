@@ -70,6 +70,7 @@ class ParallelLMHead(torch.nn.Module):
         )
         self.tp_size = 1
         self.org_vocab_size = VOCAB
+        self.org_vocab_size_padded = VOCAB
         self.embedding_dim = HIDDEN
         self.shard_indices = SimpleNamespace(
             org_vocab_start_index=0, num_org_vocab_padding=0
