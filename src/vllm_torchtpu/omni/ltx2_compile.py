@@ -81,11 +81,51 @@ def _cached_gate_expand_matrix(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    return _build_gate_expand_matrix(heads, head_dim, dtype, device)
+    # Build on the host (also under a non-host default device) and upload so
+    # the cached matrix is a materialized device buffer from the first eager
+    # call rather than a deferred graph.
+    return _build_gate_expand_matrix(heads, head_dim, dtype, torch.device("cpu")).to(
+        device=device
+    )
 
 
 def _patch_ltx2_mxu_gated_attention() -> None:
-    """Expand LTX-2.3 per-head attention gates on MXU without 4D relayout copies."""
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once vLLM-Omni or TorchTPU/XLA lowers the
+    # per-head gate broadcast in LTX2AudioVideoAttnProcessor.__call__ without
+    # 4D relayout copies.
+    #
+    # Source: Copied from vllm-omni 0.32.0rc1
+    #   (vllm_omni/diffusion/models/ltx2/ltx2_transformer.py::
+    #   LTX2AudioVideoAttnProcessor.__call__), because the gate multiply sits
+    #   between attention / perturbation_mask and to_out, so wrapping cannot
+    #   replace only that expression.
+    # Problem: In LTX-2.3 gated attention,
+    #   (hidden_states.unflatten(2, (attn.heads, attn.head_dim)) *
+    #   gates.unsqueeze(-1)).flatten(2, 3) forces 4D data-formatting relayout
+    #   copies across the gated self- and cross-attention layers in every block.
+    # Fix (differences from upstream vllm-omni 0.32.0rc1):
+    #   - When hidden_states and gates are bfloat16, expand gates from
+    #     (B, T, H) to (B, T, H * D) via a bit-exact (H, H * D) MXU indicator
+    #     matmul (one 1.0 entry per column) and multiply on the 3D
+    #     (B, T, H * D) layout. Non-bfloat16 inputs take the original 4D path.
+    #   - Unwrap tuple returns from attn.to_gate_logits (matching _project_qkv
+    #     and to_out[0]).
+    #   - Mask prep, QKV projection, QK norm, TP RoPE slicing, interleaved and
+    #     split RoPE dispatch, attention call, perturbation_mask, and to_out
+    #     are unchanged from upstream.
+    # Scope:
+    #   - Under tensor parallelism, LTX2Attention.__init__ sets attn.heads to
+    #     the per-rank head count (query_num_heads = total_num_heads // tp) and
+    #     builds to_gate_logits as ColumnParallelLinear(gather_output=False),
+    #     so (attn.heads, attn.head_dim) matches upstream under TP.
+    #   - Inside torch.compile, _build_gate_expand_matrix builds the matrix
+    #     inline on-device for fullgraph=True tracing. Outside compile,
+    #     _cached_gate_expand_matrix builds it on CPU and uploads it once per
+    #     (heads, head_dim, dtype, device).
+    #   - Installed by apply_ltx2_compile_patches (active for both compiled and
+    #     eager LTX-2.3 runs).
+    # -------------------------------------------------------------------------
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
     from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
 

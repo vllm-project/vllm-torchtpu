@@ -781,44 +781,76 @@ def test_tpu_diffusion_compile_hook_full_granularity_and_missing_attr(monkeypatc
     assert regional_calls == []
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("use_gates", [True, False])
-def test_mxu_gated_attention_matches_upstream(monkeypatch, dtype, use_gates):
+def _make_mxu_gated_attn_harness(
+    monkeypatch,
+    *,
+    dtype: torch.dtype,
+    use_gates: bool,
+    rope_type: str = "split",
+    heads: int = 4,
+    head_dim: int = 8,
+    cross_dim: int | None = None,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+):
+    assert not getattr(_UPSTREAM_ATTN_PROC_CALL, ltx2_compile._MXU_GATE_PATCHED, False)
     monkeypatch.setattr(
         ltx2_transformer.LTX2AudioVideoAttnProcessor,
         "__call__",
         _UPSTREAM_ATTN_PROC_CALL,
     )
+    monkeypatch.setattr(
+        ltx2_transformer, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    monkeypatch.setattr(
+        ltx2_transformer, "get_tensor_model_parallel_rank", lambda: tp_rank
+    )
     ltx2_compile._patch_ltx2_mxu_gated_attention()
+    patched = ltx2_transformer.LTX2AudioVideoAttnProcessor.__call__
     ltx2_compile._patch_ltx2_mxu_gated_attention()  # idempotent
+    assert ltx2_transformer.LTX2AudioVideoAttnProcessor.__call__ is patched
 
     torch.manual_seed(0)
-    heads, head_dim = 4, 8
     dim = heads * head_dim
+    kv_in_dim = dim if cross_dim is None else cross_dim
     gate_proj = torch.nn.Linear(dim, heads).to(dtype=dtype) if use_gates else None
     q_proj = torch.nn.Linear(dim, dim, bias=False).to(dtype=dtype)
-    k_proj = torch.nn.Linear(dim, dim, bias=False).to(dtype=dtype)
-    v_proj = torch.nn.Linear(dim, dim, bias=False).to(dtype=dtype)
+    k_proj = torch.nn.Linear(kv_in_dim, dim, bias=False).to(dtype=dtype)
+    v_proj = torch.nn.Linear(kv_in_dim, dim, bias=False).to(dtype=dtype)
     out_proj = torch.nn.Linear(dim, dim, bias=False).to(dtype=dtype)
+    norm_q = torch.nn.RMSNorm(dim).to(dtype=dtype)
+    norm_k = torch.nn.RMSNorm(dim).to(dtype=dtype)
+
+    def _sdpa_stub(q, k, v, meta=None):
+        mask = meta.attn_mask if meta is not None else None
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            attn_mask=mask,
+        )
+        return out.transpose(1, 2)
 
     class _StubAttn(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.heads = heads
             self.head_dim = head_dim
-            self.rope_type = "split"
+            self.rope_type = rope_type
             self.to_gate_logits = gate_proj
-            self.norm_q = torch.nn.Identity()
-            self.norm_k = torch.nn.Identity()
+            self.norm_q = norm_q
+            self.norm_k = norm_k
             self.to_out = torch.nn.ModuleList([out_proj, torch.nn.Identity()])
-            self.attn = lambda q, k, v, meta=None: (q + k + v) * 0.25
+            self.attn = _sdpa_stub
 
+    mask_prep_args: list[tuple[int, int]] = []
     proc = ltx2_transformer.LTX2AudioVideoAttnProcessor()
-    monkeypatch.setattr(
-        proc,
-        "_prepare_attention_mask",
-        lambda **kw: kw["attention_mask"],
-    )
+
+    def _recording_prepare_mask(**kw):
+        mask_prep_args.append((kw["batch_size"], kw["sequence_length"]))
+        return kw["attention_mask"]
+
+    monkeypatch.setattr(proc, "_prepare_attention_mask", _recording_prepare_mask)
     monkeypatch.setattr(
         proc,
         "_project_qkv",
@@ -828,13 +860,297 @@ def test_mxu_gated_attention_matches_upstream(monkeypatch, dtype, use_gates):
             v_proj(encoder_hidden_states),
         ),
     )
+    return proc, _StubAttn(), mask_prep_args
 
-    attn_mod = _StubAttn()
-    hs = torch.randn(2, 6, dim, dtype=dtype)
-    pmask = torch.tensor([[[1.0]], [[0.0]]], dtype=dtype)
 
-    got = proc(attn_mod, hs, perturbation_mask=pmask)
-    want = _UPSTREAM_ATTN_PROC_CALL(proc, attn_mod, hs, perturbation_mask=pmask)
+def _make_rope_tables(
+    rope_type: str,
+    batch: int,
+    tokens: int,
+    heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if rope_type == "split":
+        angles = torch.randn(batch, heads, tokens, head_dim // 2, dtype=torch.float32)
+    else:
+        angles = torch.randn(batch, tokens, heads * head_dim, dtype=torch.float32)
+    return torch.cos(angles).to(dtype=dtype), torch.sin(angles).to(dtype=dtype)
+
+
+def _install_gate_matrix_spies(monkeypatch):
+    ltx2_compile._cached_gate_expand_matrix.cache_clear()
+    orig_build = ltx2_compile._build_gate_expand_matrix
+    orig_cached = ltx2_compile._cached_gate_expand_matrix
+    build_calls: list[tuple[int, int, torch.dtype, str, bool]] = []
+    cached_calls: list[tuple[int, int, torch.dtype, str, bool]] = []
+
+    def spy_build(heads, head_dim, dtype, device):
+        build_calls.append(
+            (heads, head_dim, dtype, str(device), torch.compiler.is_compiling())
+        )
+        return orig_build(heads, head_dim, dtype, device)
+
+    def spy_cached(heads, head_dim, dtype, device):
+        cached_calls.append(
+            (heads, head_dim, dtype, str(device), torch.compiler.is_compiling())
+        )
+        return orig_cached(heads, head_dim, dtype, device)
+
+    monkeypatch.setattr(ltx2_compile, "_build_gate_expand_matrix", spy_build)
+    monkeypatch.setattr(ltx2_compile, "_cached_gate_expand_matrix", spy_cached)
+    return build_calls, cached_calls
+
+
+def test_cached_gate_expand_matrix_built_on_host(monkeypatch):
+    # Building on the host and uploading keeps the cached matrix a materialized
+    # device buffer from the first eager call (no deferred device-side arange).
+    orig_arange = torch.arange
+    arange_devices: list[object] = []
+
+    def recording_arange(*args, **kwargs):
+        arange_devices.append(kwargs.get("device"))
+        return orig_arange(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "arange", recording_arange)
+    ltx2_compile._cached_gate_expand_matrix.cache_clear()
+    target = torch.device("meta")
+    with torch.device("meta"):
+        mat = ltx2_compile._cached_gate_expand_matrix(4, 8, torch.bfloat16, target)
+    assert arange_devices == [torch.device("cpu"), torch.device("cpu")]
+    assert mat.device == target
+    assert mat.dtype == torch.bfloat16
+    assert mat.shape == (4, 32)
+    assert ltx2_compile._cached_gate_expand_matrix(4, 8, torch.bfloat16, target) is mat
+    assert len(arange_devices) == 2
+    ltx2_compile._cached_gate_expand_matrix.cache_clear()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    (
+        "is_cross",
+        "rope_type",
+        "use_q_rope",
+        "use_k_rope",
+        "use_mask",
+        "use_pmask",
+        "use_gates",
+        "tp_size",
+    ),
+    [
+        pytest.param(
+            False, "split", False, False, False, True, True, 1, id="self_pmask_gated"
+        ),
+        pytest.param(
+            False,
+            "split",
+            False,
+            False,
+            False,
+            False,
+            True,
+            1,
+            id="self_no_pmask_gated",
+        ),
+        pytest.param(
+            False, "split", False, False, False, True, False, 1, id="self_no_gates"
+        ),
+        pytest.param(
+            False,
+            "split",
+            True,
+            False,
+            True,
+            False,
+            True,
+            1,
+            id="self_split_rope_fallback_mask",
+        ),
+        pytest.param(
+            False,
+            "interleaved",
+            True,
+            False,
+            True,
+            True,
+            True,
+            1,
+            id="self_interleaved_rope_fallback_mask",
+        ),
+        pytest.param(
+            True,
+            "split",
+            True,
+            True,
+            True,
+            False,
+            True,
+            1,
+            id="cross_split_rope_mask_gated",
+        ),
+        pytest.param(
+            True,
+            "interleaved",
+            True,
+            True,
+            True,
+            False,
+            False,
+            1,
+            id="cross_interleaved_rope_mask_no_gates",
+        ),
+        pytest.param(
+            False,
+            "split",
+            True,
+            False,
+            False,
+            False,
+            True,
+            2,
+            id="tp2_split_rope_gated",
+        ),
+    ],
+)
+def test_mxu_gated_attention_matches_upstream(
+    monkeypatch,
+    dtype,
+    is_cross,
+    rope_type,
+    use_q_rope,
+    use_k_rope,
+    use_mask,
+    use_pmask,
+    use_gates,
+    tp_size,
+):
+    heads, head_dim = 4, 8
+    dim = heads * head_dim
+    cross_dim = dim + 8 if is_cross else None
+    proc, attn_mod, mask_prep_args = _make_mxu_gated_attn_harness(
+        monkeypatch,
+        dtype=dtype,
+        use_gates=use_gates,
+        rope_type=rope_type,
+        heads=heads,
+        head_dim=head_dim,
+        cross_dim=cross_dim,
+        tp_size=tp_size,
+        tp_rank=tp_size - 1,
+    )
+    build_calls, cached_calls = _install_gate_matrix_spies(monkeypatch)
+
+    batch, t_q = 2, 6
+    t_kv = 4 if is_cross else t_q
+    hs = torch.randn(batch, t_q, dim, dtype=dtype)
+    ehs = torch.randn(batch, t_kv, cross_dim, dtype=dtype) if is_cross else None
+    q_rope = (
+        _make_rope_tables(rope_type, batch, t_q, heads * tp_size, head_dim, dtype)
+        if use_q_rope
+        else None
+    )
+    k_rope = (
+        _make_rope_tables(rope_type, batch, t_kv, heads * tp_size, head_dim, dtype)
+        if use_k_rope
+        else None
+    )
+    mask = None
+    if use_mask:
+        mask = torch.ones(batch, 1, 1, t_kv, dtype=torch.bool)
+        mask[:, :, :, -1] = False
+    pmask = torch.tensor([[[1.0]], [[0.0]]], dtype=dtype) if use_pmask else None
+
+    call_kwargs = {
+        "encoder_hidden_states": ehs,
+        "attention_mask": mask,
+        "query_rotary_emb": q_rope,
+        "key_rotary_emb": k_rope,
+        "perturbation_mask": pmask,
+    }
+    got = proc(attn_mod, hs, **call_kwargs)
+    patched_mask_args = list(mask_prep_args)
+    mask_prep_args.clear()
+    want = _UPSTREAM_ATTN_PROC_CALL(proc, attn_mod, hs, **call_kwargs)
+
     assert got.dtype == dtype
+    assert patched_mask_args == mask_prep_args == [(batch, t_kv)]
     # One 1.0 entry per column in expand_mat makes bf16 indicator matmul bit-exact.
     torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    if use_gates and dtype == torch.bfloat16:
+        assert len(cached_calls) == 1 and cached_calls[0][4] is False
+        assert len(build_calls) == 1 and build_calls[0][3] == "cpu"
+        # Second eager call hits the cache without rebuilding.
+        proc(attn_mod, hs, **call_kwargs)
+        assert len(cached_calls) == 2
+        assert len(build_calls) == 1
+    else:
+        assert cached_calls == []
+        assert build_calls == []
+
+    if use_mask:
+        no_mask_out = proc(attn_mod, hs, **{**call_kwargs, "attention_mask": None})
+        assert not torch.equal(got, no_mask_out)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "use_gates"),
+    [
+        pytest.param(torch.bfloat16, True, id="bf16_gated"),
+        pytest.param(torch.bfloat16, False, id="bf16_no_gates"),
+        pytest.param(torch.float32, True, id="fp32_gated"),
+    ],
+)
+def test_mxu_gated_attention_torch_compile_fullgraph(monkeypatch, dtype, use_gates):
+    # Under torch.compile(fullgraph=True), the bf16 gated path must take the
+    # inline _build_gate_expand_matrix branch (skipping the eager LRU cache)
+    # and match upstream bit-for-bit without graph breaks.
+    heads, head_dim = 4, 8
+    dim = heads * head_dim
+    proc, attn_mod, _ = _make_mxu_gated_attn_harness(
+        monkeypatch,
+        dtype=dtype,
+        use_gates=use_gates,
+        rope_type="split",
+        heads=heads,
+        head_dim=head_dim,
+    )
+    build_calls, cached_calls = _install_gate_matrix_spies(monkeypatch)
+
+    batch, tokens = 2, 6
+    hs = torch.randn(batch, tokens, dim, dtype=dtype)
+    q_rope = _make_rope_tables("split", batch, tokens, heads, head_dim, dtype)
+    mask = torch.ones(batch, 1, 1, tokens, dtype=torch.bool)
+    mask[:, :, :, -1] = False
+    pmask = torch.tensor([[[1.0]], [[0.0]]], dtype=dtype)
+
+    def _run(x, cos, sin, m, pm):
+        return proc(
+            attn_mod,
+            x,
+            attention_mask=m,
+            query_rotary_emb=(cos, sin),
+            perturbation_mask=pm,
+        )
+
+    torch._dynamo.reset()
+    compiled_run = torch.compile(_run, backend="eager", fullgraph=True)
+    got = compiled_run(hs, q_rope[0], q_rope[1], mask, pmask)
+    want = _UPSTREAM_ATTN_PROC_CALL(
+        proc,
+        attn_mod,
+        hs,
+        attention_mask=mask,
+        query_rotary_emb=q_rope,
+        perturbation_mask=pmask,
+    )
+
+    assert got.dtype == dtype
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    assert cached_calls == []
+    if use_gates and dtype == torch.bfloat16:
+        assert len(build_calls) == 1
+        assert build_calls[0][4] is True
+    else:
+        assert build_calls == []
