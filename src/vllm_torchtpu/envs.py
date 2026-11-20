@@ -355,6 +355,7 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE: bool = False
     VLLM_TPU_OFFLOAD_TIER_X2: bool = False
     VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS: int = 1000
+    VLLM_TPU_OFFLOAD_DIVERGENT_HITS: bool = False
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TPU_MAMBA_CHECKPOINT_RETENTION: bool = True
     VLLM_TPU_MAMBA_DECODE_CHECKPOINT: bool = True
@@ -2446,6 +2447,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # every time). A key stored or demoted meanwhile is at worst found late.
     "VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS": env_int(
         "VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS", 1000
+    ),
+    # Prefill with the host tier (TPURaidenOffloadingConnector) on a hybrid model:
+    # report "divergent local hybrid hits", so the local prefix hit is the
+    # attention groups' cached run (core/divergent_hybrid_hits.py) even when HBM
+    # keeps no recurrent-state checkpoint at its end, and the host tier's load
+    # supplies the state at the boundary it restores. Without it a hot shared
+    # head that lives only in HBM (the victim policy never stores a block HBM
+    # keeps) cuts every tier hit to 0: the local hit falls to the last HBM
+    # checkpoint, often 0, and the tier lookup starts there and misses block 0
+    # (hole_diag_1120.md). A pure PD producer child of the multi connector
+    # never loads and does not veto. Same bytes as a tier hit; scheduler-only.
+    "VLLM_TPU_OFFLOAD_DIVERGENT_HITS": env_bool(
+        "VLLM_TPU_OFFLOAD_DIVERGENT_HITS", default=False
     ),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.

@@ -15,7 +15,10 @@ Fields, in scheduler blocks of ``block`` tokens unless named ``*_tokens``:
 - ``local_tokens`` / ``tier_tokens``: the hits the scheduler took (``tier_tokens`` is None for a deferred lookup).
 - ``hbm_attn``: attention blocks cached in HBM, contiguous from block 0.
 - ``hbm_ckpts``: boundaries up to ``cap`` with every state group cached in HBM (the last 8, ascending).
-- ``tier_attn``: attention blocks in the tier contiguous from the HBM hit; ``tier_attn_any``: in the tier anywhere.
+- ``tier_attn``: attention blocks in the tier contiguous from the HBM hit; ``tier_attn_any``: attention blocks the
+  tier holds, counted inside the resident prefix of one probe over every group's keys in order. A store lookup answers
+  only up to its first miss, so a chain whose block 0 is missing from the tier counts 0 here (and adds nothing to
+  ``union_*``) even when the tier holds the rest of it; ``tier_runs`` shows such blocks.
 - ``tier_ckpts``: boundaries with every state group in the tier (the last 8).
 - ``union_attn``: blocks present in either level, contiguous from 0; ``union_ckpt``: the rightmost boundary inside
   it with a checkpoint in either level.
@@ -24,9 +27,14 @@ Fields, in scheduler blocks of ``block`` tokens unless named ``*_tokens``:
   attention class gives the end of its run of blocks from the HBM hit (``tier_attn`` is the shortest of them); a state
   class gives the boundaries where every one of its groups has a checkpoint (the last 8). A hit cut short because one
   class lacked its partner shows as classes that disagree.
+- ``tier_runs`` (tier classes only): per attention class, the runs ``[start, end)`` of the prompt's blocks up to
+  ``cap`` that every group of the class holds, each block probed on its own without pins (the last 8 runs). A split
+  chain (head only in HBM, the rest and its checkpoint in the tier) shows a run that starts past block 0 while
+  ``tier_class`` reads 0.
 
-The HBM side is read in ``KVCacheManager.get_computed_blocks`` (the scheduler's local lookup, which runs just before
-the connector's) and kept on the request; the tier side is probed without pinning, so the line moves nothing in either
+The HBM side is read in ``KVCacheManager.get_computed_blocks`` or, when the connector takes divergent hybrid hits
+(VLLM_TPU_OFFLOAD_DIVERGENT_HITS), ``get_computed_blocks_for_connector`` (the scheduler's local lookup, which runs
+just before the connector's) and kept on the request; the tier side is probed without pinning, so the line moves nothing in either
 LRU. Host only.
 
 The same flag writes one ``tier-restore`` line per host-tier load job, when the job ends (``RestoreLog``). A request's
@@ -198,6 +206,7 @@ def log_lookup(sched, request, local_tokens: int, tier_tokens: int | None) -> No
     if isinstance(manager, TieredOffloadingManager):
         keys_of = {g.group_idx: list(gs.offload_keys[:cap]) for g, gs in zip(configs, req_status.group_states)}
         line["tier_class"] = class_presence(manager, keys_of, local_tokens // block)
+        line["tier_runs"] = class_runs(manager, keys_of)
     setattr(request, _LOGGED_ATTR, True)
     logger.info("prefix-lookup %s", json.dumps(line, separators=(",", ":")))
 
@@ -223,6 +232,32 @@ def class_presence(manager, keys_of: dict[int, list], local_blocks: int) -> dict
     return out
 
 
+def class_runs(manager, keys_of: dict[int, list]) -> dict:
+    """Per attention class, the runs ``[start, end)`` of a request's blocks that every group of the class holds, each
+    block probed on its own (``host_resident_prefix`` of one key: no pins, no LRU move), the last ``_LAST``."""
+    out: dict = {}
+    for tier_class, class_manager in zip(manager.classes, manager.managers):
+        if tier_class.per_checkpoint:
+            continue
+        groups = [keys_of[g] for g in tier_class.groups if g in keys_of]
+        if not groups:
+            continue
+        runs: list[list[int]] = []
+        start = None
+        n = min(len(keys) for keys in groups)
+        for b in range(n):
+            held = all(class_manager.host_resident_prefix([keys[b]]) == 1 for keys in groups)
+            if held and start is None:
+                start = b
+            elif not held and start is not None:
+                runs.append([start, b])
+                start = None
+        if start is not None:
+            runs.append([start, n])
+        out[tier_class.name] = runs[-_LAST:]
+    return out
+
+
 def patch_prefix_lookup_log() -> None:
     """Wraps KVCacheManager.get_computed_blocks to record the HBM side and Scheduler.add_request to write the
     arrival line. Inert unless the flag is set."""
@@ -231,20 +266,23 @@ def patch_prefix_lookup_log() -> None:
     _patch_request_arrival()
     from vllm.v1.core.kv_cache_manager import KVCacheManager
 
-    original = KVCacheManager.get_computed_blocks
-    if getattr(original, _PATCH_FLAG, False):
-        return
+    # Both local lookups: get_computed_blocks_for_connector is the one the scheduler calls when the connector takes
+    # divergent hybrid hits; record_hbm keeps the first record, so a fallback to get_computed_blocks adds nothing.
+    for name in ("get_computed_blocks", "get_computed_blocks_for_connector"):
+        original = getattr(KVCacheManager, name, None)
+        if original is None or getattr(original, _PATCH_FLAG, False):
+            continue
 
-    def get_computed_blocks(self, request):
-        out = original(self, request)
-        try:
-            record_hbm(self, request)
-        except Exception:  # a diagnostic must never fail a schedule pass
-            logger.exception("prefix-lookup: HBM presence failed for %s", request.request_id)
-        return out
+        def wrapped(self, request, _original=original):
+            out = _original(self, request)
+            try:
+                record_hbm(self, request)
+            except Exception:  # a diagnostic must never fail a schedule pass
+                logger.exception("prefix-lookup: HBM presence failed for %s", request.request_id)
+            return out
 
-    setattr(get_computed_blocks, _PATCH_FLAG, True)
-    KVCacheManager.get_computed_blocks = get_computed_blocks
+        setattr(wrapped, _PATCH_FLAG, True)
+        setattr(KVCacheManager, name, wrapped)
     logger.info("Applied TPU patch: per-request prefix lookup line (VLLM_TPU_PREFIX_LOOKUP_LOG).")
 
 

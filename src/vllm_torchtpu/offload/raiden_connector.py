@@ -363,6 +363,32 @@ def _build_tier_check(connector_worker, kv_caches, group_regions) -> TierCheck:
     return TierCheck(regions, live, rank)
 
 
+def divergent_hits_restore_state(
+    kv_cache_config: KVCacheConfig, offloaded_group_ids: Iterable[int]
+) -> bool:
+    """Whether every load from this host tier restores the recurrent state at the
+    boundary it ends on, so a local hit that adopted no state is complete once the
+    load lands (VLLM_TPU_OFFLOAD_DIVERGENT_HITS).
+
+    True when the model has prefix-cacheable state (Mamba-kind: GDN, PLE) groups
+    and the tier offloads every one of them: the connector looks a state group up
+    as a one-chunk window that ends exactly at the hit
+    (``OffloadingConnectorScheduler._lookup_complete_chunks``), so no tier hit
+    exists without each state group's checkpoint at that boundary, and the load
+    writes it. A model with no state group gains nothing from a divergent hit, and
+    a state group the tier does not hold could never be restored.
+    """
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    state = {
+        gid
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups)
+        if group.kv_cache_spec.prefix_cacheable
+        and isinstance(group.kv_cache_spec, MambaSpec)
+    }
+    return bool(state) and state <= set(offloaded_group_ids)
+
+
 @dataclass
 class _ParkedStore:
     """A store job parked until every worker rank acknowledges the device fence."""
@@ -393,6 +419,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             self.manager
         )
         self._fence_pending: dict[int, _ParkedStore] = {}
+        # VLLM_TPU_OFFLOAD_DIVERGENT_HITS: every load restores the state groups
+        # at its boundary (read by the connector's
+        # supports_divergent_local_hybrid_hits).
+        self._restores_state = divergent_hits_restore_state(
+            kv_cache_config, [g.group_idx for g in self.config.kv_group_configs]
+        )
         # With the tier classes a drain that times out stops the engine: the
         # source blocks are about to be reused under a live DMA, and a save
         # that lands later would publish their new bytes under the old hash.
@@ -407,6 +439,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             self._enable_victim_policy(spec, vllm_config)
         if tpu_envs.VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE:
             self._enable_exclusive_restore()
+
+    @property
+    def restores_state_with_every_load(self) -> bool:
+        """Every tier load restores each state group at its boundary
+        (``divergent_hits_restore_state``)."""
+        return bool(self.__dict__.get("_restores_state", False))
 
     def host_resident_tokens(self, request: Request, num_local_tokens: int) -> int:
         """Prompt tokens past ``num_local_tokens`` that every offloaded group
@@ -831,6 +869,27 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         for; these pages are opaque bytes to this connector.
         """
         return None
+
+    @property
+    def supports_divergent_local_hybrid_hits(self) -> bool:
+        """VLLM_TPU_OFFLOAD_DIVERGENT_HITS on a scheduler whose every load
+        restores the state groups (``divergent_hits_restore_state``).
+
+        The scheduler then takes the local hit as the attention groups' cached
+        run (``core/divergent_hybrid_hits.divergent_local_hit``), adopting no
+        state block unless every state group holds one exactly there, and asks
+        this connector for the rest: a tier hit from that boundary brings the
+        attention blocks past it and every state group's checkpoint at its end.
+        When the tier finds nothing, vLLM's scheduler falls back to the hit every
+        group agrees on (``get_computed_blocks``). Off (the default) reports
+        False, the upstream value.
+        """
+        if not tpu_envs.VLLM_TPU_OFFLOAD_DIVERGENT_HITS:
+            return False
+        scheduler = self.__dict__.get("connector_scheduler")
+        return bool(
+            scheduler is not None and scheduler.restores_state_with_every_load
+        )
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:
