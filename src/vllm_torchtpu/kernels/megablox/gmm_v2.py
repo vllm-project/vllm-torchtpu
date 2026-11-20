@@ -150,6 +150,18 @@ def _get_lhs_sublane_size(dtype: jnp.dtype, size_m: int) -> int:
     return size_lhs_sublane
 
 
+def compact_scale_tile_fits(tile_k: int, quant_block_size: int, size_k: int) -> bool:
+    """Whether a K tile's compact uint8 scale rows form a valid block.
+
+    Compact scales put a tile's quant blocks on the sublane axis of an 8-bit
+    array, so the tile must hold a multiple of the uint8 sublane tiling, or all
+    of K's blocks.
+    """
+    blocks = pl.cdiv(tile_k, quant_block_size)
+    scale_rows = pltpu.get_tpu_info().get_sublane_tiling(jnp.uint8)
+    return blocks % scale_rows == 0 or blocks * quant_block_size == size_k
+
+
 def get_packing_factor(storage_dtype: jnp.dtype, quant_dtype: jnp.dtype | None) -> int:
     if quant_dtype is None or quant_dtype == storage_dtype:
         return 1
@@ -1085,6 +1097,19 @@ def calculate_tiling(
             num_k_tiles += 1
             tile_k = align_to(dims.size_k, num_k_tiles * num_lanes) // num_k_tiles
 
+    if rhs_cfgs.has_compact_scale:
+        qbs = cast(int, rhs_cfgs.quant_block_size)
+        while (
+            not compact_scale_tile_fits(tile_k, qbs, dims.size_k) and tile_k > num_lanes
+        ):
+            num_k_tiles += 1
+            tile_k = align_to(dims.size_k, num_k_tiles * num_lanes) // num_k_tiles
+        if not compact_scale_tile_fits(tile_k, qbs, dims.size_k):
+            raise ValueError(
+                f"No tile_k for compact E4M3 scales with size_k={dims.size_k} and "
+                f"quant block size {qbs}"
+            )
+
     if tile_n == 0 or tile_k == 0:
         final_estimate = _gmm_vmem_estimate(tile_m, tile_n, tile_k)
         raise ValueError(
@@ -1445,6 +1470,15 @@ def gmm_v2(
         raise ValueError(
             f"Compact E4M3 scales (dtype {rhs_scale.dtype}, shape {rhs_scale.shape}) "
             "require rhs_global_scale"
+        )
+    if cfgs.rhs_cfgs.has_compact_scale and not compact_scale_tile_fits(
+        tiles.tile_k, cast(int, cfgs.rhs_cfgs.quant_block_size), dims.size_k
+    ):
+        raise ValueError(
+            f"Compact E4M3 scales need tile_k to cover all {dims.size_k} rows or a "
+            f"multiple of {pltpu.get_tpu_info().get_sublane_tiling(jnp.uint8)} "
+            f"quant blocks; got tile_k={tiles.tile_k}, quant block size "
+            f"{cfgs.rhs_cfgs.quant_block_size}"
         )
     if rhs_global_scale is not None:
         if (

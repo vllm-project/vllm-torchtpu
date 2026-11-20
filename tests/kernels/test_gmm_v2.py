@@ -27,6 +27,8 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    Dimensions,
+    InputConfigs,
     TileSizes,
     apply_act_fn,
     calculate_tiling,
@@ -716,6 +718,37 @@ def test_gmm_v2_nvfp4_global_scale_rounds_once():
     _assert_bitwise_equal(actual, fp32_product)
 
 
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    ("size_k", "tile_info"),
+    [
+        (640, TileSizes(tile_m=128, tile_k=640, tile_n=256, bucket_base=128)),
+        (2880, calculate_tiling),
+    ],
+    ids=["tile_k_640_all_blocks", "size_k_2880_auto_tiles"],
+)
+def test_gmm_v2_compact_scales_with_k_off_512(size_k, tile_info):
+    """Compact scale tiles that hold all of K's blocks, or a K that auto tiling
+    must split on a 512-row boundary, decode every weight exactly."""
+    _require_tpu()
+
+    num_groups, size_n = 2, 256
+    packed, scale = make_nvfp4_rhs(jax.random.key(11), num_groups, size_k, size_n)
+    global_scale = make_global_scale(jax.random.key(12), num_groups, size_n)
+    expected = dequantize_nvfp4_kmajor(
+        packed, scale.astype(jnp.float32) * global_scale, jnp.bfloat16
+    )
+
+    actual = read_back_nvfp4_rhs(
+        packed,
+        jax.lax.bitcast_convert_type(scale, jnp.uint8),
+        rhs_global_scale=global_scale,
+        tile_info=tile_info,
+    )
+
+    _assert_bitwise_equal(actual, expected)
+
+
 def _validation_tpu_info(monkeypatch, mxu_column_size: int = 256) -> None:
     monkeypatch.setattr(
         "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
@@ -731,8 +764,8 @@ def _validation_tpu_info(monkeypatch, mxu_column_size: int = 256) -> None:
     )
 
 
-def _nvfp4_validation_call(rhs_scale, rhs_global_scale):
-    num_groups, size_k, size_n = 2, 512, 256
+def _nvfp4_validation_call(rhs_scale, rhs_global_scale, size_k=512, tile_k=512):
+    num_groups, size_n = 2, 256
     packed, _ = make_nvfp4_rhs(jax.random.key(6), num_groups, size_k, size_n)
     return gmm_v2(
         jnp.zeros((num_groups * 8, size_k), jnp.bfloat16),
@@ -742,8 +775,48 @@ def _nvfp4_validation_call(rhs_scale, rhs_global_scale):
         rhs_global_scale=rhs_global_scale,
         rhs_quant_dtype=jnp.float4_e2m1fn,
         maybe_quantize_lhs=False,
-        tile_info=TileSizes(tile_m=16, tile_k=512, tile_n=256, bucket_base=16),
+        tile_info=TileSizes(tile_m=16, tile_k=tile_k, tile_n=256, bucket_base=16),
     )
+
+
+def test_gmm_v2_rejects_compact_scale_tiles_off_the_sublane_tiling(monkeypatch):
+    _validation_tpu_info(monkeypatch)
+    _, scale = make_nvfp4_rhs(jax.random.key(15), 2, 1024, 256)
+    with pytest.raises(ValueError, match="got tile_k=384, quant block size 16"):
+        _nvfp4_validation_call(
+            jax.lax.bitcast_convert_type(scale, jnp.uint8),
+            make_global_scale(jax.random.key(16), 2, 256),
+            size_k=1024,
+            tile_k=384,
+        )
+
+
+@pytest.mark.parametrize("size_k", [640, 1024, 2880, 4096, 7168])
+@pytest.mark.parametrize("fuse_act", [None, "silu"])
+def test_calculate_tiling_aligns_compact_scale_tiles(monkeypatch, size_k, fuse_act):
+    _validation_tpu_info(monkeypatch)
+    dims = Dimensions(
+        size_m=1024,
+        size_k=size_k,
+        size_n=4096,
+        size_group=8,
+        size_lhs_group=8,
+        size_lhs_sublane=16,
+    )
+    rhs_cfgs = InputConfigs(
+        quant_dtype=jnp.float4_e2m1fn,
+        quant_block_size=16,
+        dtype=jnp.uint8,
+        has_scale=True,
+        has_global_scale=True,
+        has_compact_scale=True,
+    )
+    lhs_cfgs = InputConfigs(quant_dtype=None, quant_block_size=512, dtype=jnp.bfloat16)
+
+    tiles = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, 48 * 1024 * 1024, fuse_act)
+
+    blocks = tiles.tile_k // 16
+    assert blocks % 32 == 0 or tiles.tile_k == size_k, tiles
 
 
 def test_gmm_v2_rejects_compact_scales_without_global_scale(monkeypatch):
