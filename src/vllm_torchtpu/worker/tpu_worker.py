@@ -234,7 +234,7 @@ class TPUWorker(WorkerBase):
             return
         remap = _device_remap(local_rank_offset)
         if remap is not None:
-            logger.info("NUMA bind: %s moves the ranks; placement unchanged", remap)
+            logger.info("NUMA bind: %s; placement unchanged", remap)
             return
         pc = self.parallel_config
         dp_size_local = (pc.data_parallel_size_local or dp_size) if dp_size > 1 else 1
