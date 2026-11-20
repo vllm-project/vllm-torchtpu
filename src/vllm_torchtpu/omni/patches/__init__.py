@@ -677,7 +677,12 @@ def _patch_ltx2_per_batch_timestep() -> None:
     #   - LTX2VideoTransformer3DModel._build_sp_plan declares
     #     SequenceParallelInput(split_dim=1, expected_dims=2, split_output=False)
     #     on timestep, so 1-D (B,) tensors skip sequence sharding and stay
-    #     replicated across SP ranks.
+    #     replicated across SP ranks. They take the dimension-mismatch path of
+    #     SequenceParallelSplitHook._prepare_sp_input
+    #     (vllm_omni/diffusion/hooks/sequence_parallel.py), which logs
+    #     "Expected tensor with 2 dims, got 1. Skipping split." through
+    #     warning_once: under SP every rank prints it once for T2V, and it is
+    #     expected.
     #   - Conditioned I2V requests with a conditioning_mask still override
     #     timestep with the 2-D (B, T_video) masked tensor in
     #     LTXI2VConditioningMixin._denoise_timestep_kwargs (which is sharded
