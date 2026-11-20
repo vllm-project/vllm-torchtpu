@@ -24,7 +24,11 @@ from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 
 from vllm_torchtpu.kernels.collectives.hierrs_tc import config as hrs_config
-from vllm_torchtpu.kernels.collectives.hierrs_tc import dispatch, kernel_stream
+from vllm_torchtpu.kernels.collectives.hierrs_tc import (
+    dispatch,
+    kernel_oneshot_rs_ag,
+    kernel_stream,
+)
 from vllm_torchtpu.kernels.collectives.hierrs_tc import wrapper as hrs
 from vllm_torchtpu.kernels.fp8_wire import FP8_E4M3_MAX
 from vllm_torchtpu.kernels.quantized_matmul.util import quantize_block
@@ -113,6 +117,41 @@ def _reduce_scatter_epilogue(
         mesh=mesh,
         in_specs=(sharded, sharded, replicated, replicated, replicated),
         out_specs=sharded if next_norm_weight is None else (sharded,) * 3,
+        check_vma=False,
+    )(x, residual, post_norm_weight, scale, next_norm_weight)
+
+
+def _reduce_scatter_epilogue_oneshot(
+    x, residual, post_norm_weight, scale, next_norm_weight, *, mesh, order
+):
+    """Outputs are stacked by mesh index so every rank's gather is checked."""
+    axis = mesh.axis_names[0]
+    sharded, replicated = P(axis, None), P()
+
+    def local(x, residual, post_norm_weight, scale, next_norm_weight):
+        res_out, gathered_out, xs_out = (
+            kernel_oneshot_rs_ag.reduce_scatter_epilogue_oneshot_local(
+                x,
+                residual,
+                post_norm_weight=post_norm_weight,
+                scale=scale,
+                next_norm_weight=next_norm_weight,
+                eps=_EPS,
+                axis_name=axis,
+                order=order,
+            )
+        )
+        return (
+            (res_out, gathered_out)
+            if next_norm_weight is None
+            else (res_out, gathered_out, xs_out)
+        )
+
+    return jax.shard_map(
+        local,
+        mesh=mesh,
+        in_specs=(sharded, sharded, replicated, replicated, replicated),
+        out_specs=(sharded, sharded) if next_norm_weight is None else (sharded,) * 3,
         check_vma=False,
     )(x, residual, post_norm_weight, scale, next_norm_weight)
 
@@ -810,6 +849,146 @@ class HierarchicalReduceScatterTest(jtu.JaxTestCase):
                 msg="two runs on identical input disagree -- race, not precision",
             )
 
+    def _check_oneshot_epilogue(
+        self,
+        *,
+        rows: int,
+        hidden: int,
+        order: tuple[int, ...],
+        post_norm: bool,
+        with_scale: bool,
+        next_norm: bool,
+    ) -> None:
+        self._requires_devices(8)
+        axis_name, n = "x", 8
+        chunk = rows // n
+        mesh = _make_mesh(n, axis_name)
+        sharding = jax.sharding.NamedSharding(mesh, P(axis_name, None))
+        seed = rows + hidden + order[2] + 2 * post_norm + 4 * with_scale + 8 * next_norm
+        keys = jax.random.split(jax.random.key(seed), 4)
+        x = jax.random.normal(keys[0], (n * rows, hidden), dtype=jnp.bfloat16)
+        residual = jax.random.normal(keys[1], (rows, hidden), dtype=jnp.bfloat16)
+
+        def weight(key):
+            return 1.0 + 0.1 * jax.random.normal(key, (hidden,), dtype=jnp.bfloat16)
+
+        post_norm_weight = weight(keys[2]) if post_norm else None
+        next_norm_weight = weight(keys[3]) if next_norm else None
+        scale = jnp.asarray([0.75], jnp.bfloat16) if with_scale else None
+
+        def run():
+            out = _reduce_scatter_epilogue_oneshot(
+                jax.device_put(x, sharding),
+                jax.device_put(residual, sharding),
+                post_norm_weight,
+                scale,
+                next_norm_weight,
+                mesh=mesh,
+                order=order,
+            )
+            return [np.asarray(a) for a in out]
+
+        first = run()
+        ref = np.asarray(x, np.float32).reshape(n, n, chunk, hidden).sum(axis=0)
+        ref_mesh = ref[list(order)]
+        if post_norm:
+            ref_mesh = _rms_norm(ref_mesh, np.asarray(post_norm_weight, np.float32))
+        ref_mesh = ref_mesh + np.asarray(residual, np.float32).reshape(n, chunk, hidden)
+        if with_scale:
+            ref_mesh = ref_mesh * 0.75
+
+        got_res = first[0].astype(np.float32).reshape(n, chunk, hidden)
+        snr = _snr_db(jnp.asarray(ref_mesh), jnp.asarray(got_res - ref_mesh))
+        self.assertGreater(snr, _MIN_BF16_SNR_DB, msg=f"residual SNR {snr:.1f} dB")
+
+        inv_order = [order.index(r) for r in range(n)]
+        expected_rank_res = got_res[inv_order].reshape(rows, hidden)
+
+        if next_norm:
+            _, x_q_all, x_scale_all = first
+            x_q_by_dev = x_q_all.reshape(n, rows, hidden)
+            x_scale_by_dev = x_scale_all.reshape(n, rows, 1)
+            for dev in range(1, n):
+                self.assertTrue(np.array_equal(x_q_by_dev[0], x_q_by_dev[dev]))
+                self.assertTrue(
+                    np.array_equal(
+                        x_scale_by_dev[0].view(np.uint32),
+                        x_scale_by_dev[dev].view(np.uint32),
+                    )
+                )
+            expected_norm = _rms_norm(
+                expected_rank_res, np.asarray(next_norm_weight, np.float32)
+            )
+            dequantized = (
+                np.asarray(x_q_by_dev[0].view(jnp.float8_e4m3fn), np.float32)
+                * x_scale_by_dev[0]
+            )
+            snr = _snr_db(
+                jnp.asarray(expected_norm), jnp.asarray(dequantized - expected_norm)
+            )
+            self.assertGreater(snr, _MIN_FP8_SNR_DB, msg=f"FP8 gather SNR {snr:.1f} dB")
+            ref_scale = quantize_block(
+                jnp.asarray(expected_norm, jnp.bfloat16), -1, jnp.float8_e4m3fn
+            )[1]
+            np.testing.assert_allclose(
+                x_scale_by_dev[0],
+                np.asarray(ref_scale, np.float32).reshape(rows, 1),
+                rtol=2e-2,
+            )
+        else:
+            _, gathered_res = first
+            gathered_by_dev = gathered_res.reshape(n, rows, hidden)
+            for dev in range(1, n):
+                self.assertTrue(
+                    np.array_equal(
+                        gathered_by_dev[0].view(np.uint16),
+                        gathered_by_dev[dev].view(np.uint16),
+                    )
+                )
+            np.testing.assert_array_equal(
+                gathered_by_dev[0].astype(np.float32), expected_rank_res
+            )
+
+        for a, b in zip(first, run()):
+            self.assertTrue(
+                np.array_equal(a.view(np.uint8), b.view(np.uint8)),
+                msg="two runs on identical input disagree -- race, not precision",
+            )
+
+    @parameterized.product(
+        order=[tuple(range(8)), _TPU7X_RANK_AT_MESH_INDEX],
+        post_norm=[False, True],
+        with_scale=[False, True],
+        next_norm=[False, True],
+    )
+    def test_oneshot_epilogue_optional_operands(
+        self, order, post_norm, with_scale, next_norm
+    ):
+        """All optional operand combinations at rows=128 (16 rows/rank)."""
+        self._check_oneshot_epilogue(
+            rows=128,
+            hidden=1024,
+            order=order,
+            post_norm=post_norm,
+            with_scale=with_scale,
+            next_norm=next_norm,
+        )
+
+    @parameterized.product(
+        rows=[128, 256, 512, 1024],
+        next_norm=[False, True],
+    )
+    def test_oneshot_epilogue_token_counts_odd_half_lanes(self, rows, next_norm):
+        """Decode token buckets with odd `(hidden // 2) // 128` (`hidden=768`)."""
+        self._check_oneshot_epilogue(
+            rows=rows,
+            hidden=768,
+            order=_TPU7X_RANK_AT_MESH_INDEX,
+            post_norm=True,
+            with_scale=True,
+            next_norm=next_norm,
+        )
+
 
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class HierarchicalReduceScatterPlanningTest(jtu.JaxTestCase):
@@ -850,6 +1029,30 @@ class HierarchicalReduceScatterPlanningTest(jtu.JaxTestCase):
         self.assertIsNone(two_chip[4])
         assert two_chip[0] is not None
         self.assertEqual(two_chip[0][0][1], 2)
+
+    def test_oneshot_supported_shapes(self):
+        self.assertTrue(kernel_oneshot_rs_ag.supports_oneshot_rs_ag(128, 5376))
+        self.assertTrue(kernel_oneshot_rs_ag.supports_oneshot_rs_ag(256, 5376))
+        self.assertTrue(kernel_oneshot_rs_ag.supports_oneshot_rs_ag(512, 5376))
+        self.assertTrue(kernel_oneshot_rs_ag.supports_oneshot_rs_ag(1024, 5376))
+        self.assertTrue(kernel_oneshot_rs_ag.supports_oneshot_rs_ag(128, 768))
+        # Single-shot RS + AG is 8-device only; TP=4 keeps XLA all-reduce below 512.
+        self.assertFalse(
+            kernel_oneshot_rs_ag.supports_oneshot_rs_ag(128, 5376, num_devices=4)
+        )
+        # Sub-128 or non-multiple-of-128 rows require call-time padding and are
+        # left to native XLA all-reduce.
+        self.assertFalse(kernel_oneshot_rs_ag.supports_oneshot_rs_ag(64, 5376))
+        self.assertFalse(kernel_oneshot_rs_ag.supports_oneshot_rs_ag(192, 5376))
+        self.assertFalse(kernel_oneshot_rs_ag.supports_oneshot_rs_ag(0, 5376))
+        self.assertFalse(kernel_oneshot_rs_ag.supports_oneshot_rs_ag(1032, 5376))
+        # Aligned row counts above the 1024-row cap exceed single-shot VMEM budget.
+        self.assertFalse(kernel_oneshot_rs_ag.supports_oneshot_rs_ag(1152, 5376))
+        self.assertFalse(kernel_oneshot_rs_ag.supports_oneshot_rs_ag(2048, 5376))
+        self.assertFalse(kernel_oneshot_rs_ag.supports_oneshot_rs_ag(128, 128))
+        self.assertFalse(kernel_oneshot_rs_ag.supports_oneshot_rs_ag(128, 257))
+        self.assertFalse(kernel_oneshot_rs_ag.supports_oneshot_rs_ag(128, 5376 + 128))
+        self.assertFalse(kernel_oneshot_rs_ag.supports_oneshot_rs_ag(128, 8192))
 
     @parameterized.parameters(False, True)
     def test_micro_batch_floor(self, fp8_comm):
