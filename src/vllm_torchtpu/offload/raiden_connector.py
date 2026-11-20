@@ -624,7 +624,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             # on every lookup that ran (one deferred for in-flight transfers
             # did not).
             self._touch(req_status)
-        if not num_hit_tokens:
+        if num_hit_tokens == 0:
             local_hit = int(getattr(request, "_tpu_local_hit_tokens", 0) or 0)
             if local_hit > num_computed_tokens and req_status is not None:
                 req_status.num_locally_computed_tokens = local_hit
