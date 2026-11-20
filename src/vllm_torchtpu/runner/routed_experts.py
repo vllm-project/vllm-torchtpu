@@ -54,18 +54,14 @@ def hbm_reserve_bytes(vllm_config: VllmConfig, token_paddings: list[int]) -> int
     which lives until `use_capturer` swaps in our capturer, and the forward
     tables that serving keeps until their step's output is processed, for up
     to `max_concurrent_batches` steps. Each forward runs at least one request,
-    and its table holds its bucket's rows: at most twice its tokens, or the
-    smallest bucket. The tables are counted at uint16, the widest output
-    dtype, and on every rank: only the first TP rank keeps them, but vLLM
-    sizes every rank's KV cache by the smallest budget.
+    and its table holds its bucket's rows: the smallest bucket, or less than
+    R times its tokens, where R is the largest ratio between neighboring
+    buckets. The tables are counted at uint16, the widest output dtype, and
+    on every rank: only the first TP rank keeps them, but vLLM sizes every
+    rank's KV cache by the smallest budget.
     """
     if not vllm_config.aux_output_config.enabled:
         return 0
-    # The bound above needs buckets that at most double.
-    assert all(
-        larger <= 2 * smaller
-        for smaller, larger in zip(token_paddings, token_paddings[1:])
-    ), f"token buckets {token_paddings} more than double"
     model_config = vllm_config.model_config
     row_size = (
         model_config.get_total_num_hidden_layers()
@@ -74,9 +70,16 @@ def hbm_reserve_bytes(vllm_config: VllmConfig, token_paddings: list[int]) -> int
     scheduler_config = vllm_config.scheduler_config
     max_num_batched_tokens = scheduler_config.max_num_batched_tokens
     vllm_table_bytes = torch.int32.itemsize * max_num_batched_tokens * row_size
-    step_rows = (
-        2 * max_num_batched_tokens + scheduler_config.max_num_seqs * token_paddings[0]
+    # R times the step's tokens, rounded up. With one bucket, every forward
+    # pads to it, which the second term already counts.
+    padded_tokens = max(
+        (
+            -(-larger * max_num_batched_tokens // smaller)
+            for smaller, larger in zip(token_paddings, token_paddings[1:])
+        ),
+        default=0,
     )
+    step_rows = padded_tokens + scheduler_config.max_num_seqs * token_paddings[0]
     tables_bytes = (
         torch.uint16.itemsize
         * row_size

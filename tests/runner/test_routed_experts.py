@@ -196,10 +196,30 @@ def test_hbm_reserve_covers_the_forward_tables_in_flight(monkeypatch):
 
     assert reserve == 2 * (2 * 64 + 8 * 16) * 12 * 2
     assert reserve > 64 * 12 * 4
-    with pytest.raises(AssertionError, match="more than double"):
-        routed_experts.hbm_reserve_bytes(vllm_config, [16, 64])
     vllm_config.aux_output_config = AuxOutputConfig()
     assert routed_experts.hbm_reserve_bytes(vllm_config, paddings) == 0
+
+
+def test_hbm_reserve_covers_buckets_that_jump_more_than_double(monkeypatch):
+    """A user's `compile_sizes` can jump more than 2x, here 8x. Seven
+    forwards of 9 tokens each pad to 64 rows, 448 in all, which a bound of
+    twice the step's tokens (2 * 64 + 8 * 8 = 192) would miss. The reserve
+    must cover every step of equal-sized forwards."""
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    vllm_config = capture_utils.make_vllm_config()
+    vllm_config.aux_output_config = AuxOutputConfig(enable_return_routed_experts=True)
+    paddings = [8, 64]
+    scheduler_config = vllm_config.scheduler_config
+    num_tokens = scheduler_config.max_num_batched_tokens
+
+    reserve = routed_experts.hbm_reserve_bytes(vllm_config, paddings)
+
+    step_rows = reserve // (12 * 2 * vllm_config.max_concurrent_batches)
+    assert step_rows == 8 * 64 + 8 * 8
+    for forward_tokens in range(1, num_tokens + 1):
+        num_forwards = min(num_tokens // forward_tokens, scheduler_config.max_num_seqs)
+        bucket = min(size for size in paddings if size >= forward_tokens)
+        assert num_forwards * bucket <= step_rows, forward_tokens
 
 
 def _step_runner(capture, model, chunks, bucket):
