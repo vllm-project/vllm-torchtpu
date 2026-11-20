@@ -213,6 +213,10 @@ def _get_sigmoid_gate_o_proj_op() -> Callable:
 
 
 def _is_fp8_per_channel_linear(proj: Any) -> bool:
+    """Whether `proj` is a flipped, bias-free FP8 per-channel linear whose
+    method serves pre-quantized rows, so the fused ops' W8A8 matmul on rows
+    they quantize computes what its `apply` would (not so for a method that
+    runs small steps W8A16, TPU_FP8_LINEAR_W8A16_MAX_ROWS)."""
     weight = getattr(proj, "weight", None)
     weight_scale = getattr(proj, "weight_scale", None)
     if weight is None or weight_scale is None:
@@ -226,6 +230,12 @@ def _is_fp8_per_channel_linear(proj: Any) -> bool:
     if weight_scale.shape != (weight.shape[-1],):
         return False
     if not getattr(proj, WEIGHT_FLIPPED_ATTR, False):
+        return False
+    method = getattr(proj, "quant_method", None)
+    if not (
+        isinstance(method, linear_common.PrequantLinearMethod)
+        and method.serves_prequant_rows(proj)
+    ):
         return False
     return getattr(proj, "bias", None) is None or bool(
         getattr(proj, "skip_bias_add", False)
