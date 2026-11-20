@@ -254,7 +254,7 @@ def _kernel(
             keys, values, masks = [], [], []
             for g, kv_ref in enumerate(kv_refs[:width]):
                 page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
-                hit = jnp.max((sel_t == page).astype(jnp.int32), axis=0, keepdims=True)
+                hit = _any_hit(sel_t == page, axis=0)
                 limit = jnp.where(local_page == page, local_limit, page_size)
                 limit = jnp.where(page >= 0, limit * hit, 0)  # [1, Bq]
                 seen = jnp.max(limit)
@@ -324,9 +324,7 @@ def _kernel(
             keys, values, masks, k_scales, v_scales = [], [], [], [], []
             for g, kv_ref in enumerate(kv_refs[:width]):
                 page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
-                is_selected = jnp.max(
-                    (selected == page).astype(jnp.int32), axis=1, keepdims=True
-                )
+                is_selected = _any_hit(selected == page, axis=1)
                 limit = jnp.where(local_page == page, local_limit, page_size)
                 limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
                 seen = jnp.max(limit)
@@ -433,6 +431,15 @@ def _kernel(
 
     b = pl.program_id(0)
     jax.lax.fori_loop(block_start_ref[b], block_start_ref[b + 1], loop, 0)
+
+
+def _any_hit(matches, axis):
+    """0/1 int32 whether any of `matches` holds along `axis` (kept). Reduced
+    in f32: an int32 cross-lane max lowers to two f32 ones (its 16-bit
+    halves), which the decode step's dependence chain waits on per page."""
+    return jnp.max(matches.astype(jnp.float32), axis=axis, keepdims=True).astype(
+        jnp.int32
+    )
 
 
 def _merged_store_rows(block_q: int, num_heads: int, dtype) -> int:
