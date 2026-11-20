@@ -84,6 +84,17 @@ def _identity(out):
     return out
 
 
+def _setenv(monkeypatch, name: str, value: str) -> None:
+    """Sets an envs.py variable through the environment, so the forward reads
+    it through envs.py's own reader. A plain module attribute that an earlier
+    test's monkeypatch.setattr left on envs.py (older pytest releases restore
+    the value getattr returned) would hide that reader, so it is dropped for
+    this test."""
+    if name in vars(envs):
+        monkeypatch.delattr(envs, name)
+    monkeypatch.setenv(name, value)
+
+
 @pytest.fixture
 def v3(monkeypatch):
     """An FP8 MoE method whose layer fused EP v3 armed, with the kernel, the
@@ -104,8 +115,8 @@ def v3(monkeypatch):
         calls.grouped.append(kwargs["hidden_states"].shape[0])
         return torch.zeros_like(kwargs["hidden_states"])
 
-    monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", True)
-    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", False)
+    _setenv(monkeypatch, "USE_MOE_FUSED_EP_KERNEL", "1")
+    _setenv(monkeypatch, "TPU_MOE_SKIP_PADDED_TOKENS", "0")
     monkeypatch.setattr(fused_moe_ep_v3, "_OP", object())
     monkeypatch.setattr(fused_moe_ep_v3, "fused_moe_ep", fused)
     monkeypatch.setattr(fused_moe_ep_v3, "step_min_tokens", lambda: GATE)
