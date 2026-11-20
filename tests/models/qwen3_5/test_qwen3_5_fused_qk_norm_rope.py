@@ -184,7 +184,10 @@ def test_the_op_registers_with_the_real_bridge_and_its_fake_gives_the_shapes(
     """The real ``pallas.jax_op`` (not the host stand-in) accepts the op, and
     its fake gives the outputs' shapes and dtypes under FakeTensorMode."""
     monkeypatch.setattr(fused, "pallas", pallas)
-    # A name no other test in the session registers.
+    # _build_op names an op by how many it holds (qk_norm_rope_gate_{len(_ops)})
+    # and torch's op registry lasts the whole session; the other tests start
+    # from an empty dict, so 901 placeholders give this one a name they never
+    # reach.
     monkeypatch.setattr(fused, "_ops", {("unused", i): None for i in range(901)})
     key = (HEADS, KV_HEADS, HEAD_DIM, ROT, 1e-6)
     fused._build_op(key)
