@@ -97,8 +97,7 @@ def _rpa_kernels(kv_layout, **kwargs):
     def walk(j):
         for eqn in j.eqns:
             if eqn.primitive.name == "pallas_call":
-                name = eqn.params.get("name") or eqn.params.get("name_and_src_info")
-                name = str(getattr(name, "name", name))
+                name = eqn.params["name"]
                 if name.startswith("RPA"):
                     kernels[name] = str(eqn.params["jaxpr"])
                 continue
