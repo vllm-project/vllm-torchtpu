@@ -366,20 +366,21 @@ def apply_kernel_numerics(model_config) -> bool | None:
     single-sort cap (layers/core/fused_moe_gmm.NONEP_PERMUTE, "sorts" by
     default; same metadata, one sort fewer); select them before the model's
     kernels are traced. Other models keep main's arithmetic and code. Returns
-    False while no model config is available, so the patch registry tries
-    again at model load.
+    False without a model config and for any model other than the measured
+    target: the patch registry marks a patch done by its target, not by
+    model, so a later load of the measured target in the same process still
+    turns them on.
     """
-    if model_config is None:
+    if not is_measured_target(model_config):
         return False
-    if is_measured_target(model_config):
-        from vllm_torchtpu.kernels.megablox import gmm_v2
-        from vllm_torchtpu.kernels.quantized_matmul import util
-        from vllm_torchtpu.layers.core import fused_moe_gmm
+    from vllm_torchtpu.kernels.megablox import gmm_v2
+    from vllm_torchtpu.kernels.quantized_matmul import util
+    from vllm_torchtpu.layers.core import fused_moe_gmm
 
-        util.set_reciprocal_scale(True)
-        gmm_v2.set_rhs_stream(True)
-        gmm_v2.set_tuned_fp8_moe(True)
-        fused_moe_gmm.set_nonep_permute("two_sorts")
+    util.set_reciprocal_scale(True)
+    gmm_v2.set_rhs_stream(True)
+    gmm_v2.set_tuned_fp8_moe(True)
+    fused_moe_gmm.set_nonep_permute("two_sorts")
     return None
 
 
