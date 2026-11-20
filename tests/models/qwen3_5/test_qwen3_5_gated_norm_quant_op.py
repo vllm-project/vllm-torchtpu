@@ -373,7 +373,8 @@ def test_build_ops_registers_with_the_real_op_bridge(monkeypatch):
     rows, value_dim, head_dim, hidden = 24, 4 * 128, 128, 256
     with FakeTensorMode():
         out = op(
-            torch.empty(rows, value_dim, dtype=torch.bfloat16),
+            # core_attn_out as output_projection passes it: [rows, heads, dim].
+            torch.empty(rows, value_dim // head_dim, head_dim, dtype=torch.bfloat16),
             torch.empty(rows, value_dim, dtype=torch.bfloat16),
             torch.empty(head_dim, dtype=torch.float32),
             torch.empty(value_dim, hidden, dtype=torch.float8_e4m3fn),
