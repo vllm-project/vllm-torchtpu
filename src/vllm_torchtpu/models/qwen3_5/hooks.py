@@ -94,7 +94,7 @@ def _chip_family() -> str | None:
     return None if chip_version is None else chip_version.value
 
 
-def has_calibrated_shape(model_config) -> bool:
+def _has_calibrated_shape(model_config) -> bool:
     """Whether the checkpoint has the calibrated shape (Qwen3.5-397B-A17B's
     text config), whatever the device."""
     text = model_config.hf_text_config
@@ -105,7 +105,7 @@ def _is_calibrated(model_config) -> bool:
     """Whether the defaults were measured for this checkpoint and device:
     the calibrated checkpoint shape on a TPU7x device. Any other shape, a
     smaller device or an unknown device keeps main's behaviour."""
-    return has_calibrated_shape(model_config) and _chip_family() == _CALIBRATED_CHIP
+    return _has_calibrated_shape(model_config) and _chip_family() == _CALIBRATED_CHIP
 
 
 def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
@@ -192,7 +192,7 @@ def _apply_kv_transfer_page(vllm_config: VllmConfig) -> None:
         return
     if vllm_config.parallel_config.prefill_context_parallel_size > 1:
         return
-    if not has_calibrated_shape(vllm_config.model_config):
+    if not _has_calibrated_shape(vllm_config.model_config):
         return
     # On another layout the page would not apply, and the platform would
     # warn about a setting the user never wrote.
