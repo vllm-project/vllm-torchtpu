@@ -61,7 +61,8 @@ def _blocks(
     vmem_limit_bytes=64 * 1024 * 1024,
     **chip,
 ):
-    # The PP=8 stage geometry: 32 q heads, 2 KV heads, head_dim 256, fp8 KV, page 128.
+    # By default the PP=8 stage geometry: 32 q heads, 2 KV heads, head_dim 256,
+    # fp8 KV, page 128.
     model = configs.ModelConfigs(
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
