@@ -274,14 +274,6 @@ def _routing_unsupported_reason(layer: RoutedExperts) -> str | None:
     return None
 
 
-def _graph_unsupported_reason() -> str | None:
-    """Kept for backwards compatibility; the row-count fork now runs inside
-    the JAX op per compiled shape, so non-backbone graphs (e.g. `eagle_head`)
-    also arm the `scores` entry without forking the PyTorch Dynamo trace.
-    """
-    return None
-
-
 def _moe_scores_fn(
     x: jax.Array,
     scores: jax.Array,
@@ -488,7 +480,7 @@ def prebuild(
     unsupported = _unsupported_reason(layer, activation)
     routing = None
     if not unsupported:
-        routing = _graph_unsupported_reason() or _routing_unsupported_reason(layer)
+        routing = _routing_unsupported_reason(layer)
     entry = None if unsupported else ("ids" if routing else "scores")
     _LAYERS.append(_Verdict(method, layer.layer_name, entry, unsupported or routing))
     if entry != "scores":
@@ -558,11 +550,6 @@ def log_summary() -> None:
         reasons,
         _ARMED_MAX_TOKENS,
     )
-
-
-def serves(op: torch.library.CustomOpDef | None, x: torch.Tensor) -> bool:
-    del x
-    return op is not None
 
 
 def apply(
