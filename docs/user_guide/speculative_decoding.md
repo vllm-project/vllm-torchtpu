@@ -47,7 +47,7 @@ vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
   }'
 ```
 
-On TPU7x, for a single-layer DSA MTP draft (`DeepSeek-V3.2`, `GLM-5.2`) without prefill context parallelism, draft step 0 of a large prefill chunk runs as a KV-only pass over every row, then the full layer on each request's last row, where that is faster than the single pass. It is on by default; `TPU_MTP_KV_ONLY_STEP0=0` turns it off. See the [Environment Variables Reference](../reference/env_vars.md).
+On TPU7x, for a single-layer DSA MTP draft (`DeepSeek-V3.2`, `GLM-5.2`) without prefill context parallelism, draft step 0 of a large prefill chunk runs as a KV-only pass over every row, then the full layer on each request's last row, where that is faster than the single pass.
 
 ---
 

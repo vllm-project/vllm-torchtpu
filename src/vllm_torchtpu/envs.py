@@ -1293,7 +1293,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # indexer-K caches for every row; pass 2 runs the full layer on one row per
     # request, the only rows a draft token is read from. On for the drafts that
     # support it on TPU7x, where the table was measured; 0 keeps the single
-    # pass everywhere.
+    # pass everywhere. A rollout kill switch (R-6.2): remove it once the
+    # two-pass step 0 has been the default in serving for one release with no
+    # need to turn it off.
     "TPU_MTP_KV_ONLY_STEP0": env_bool("TPU_MTP_KV_ONLY_STEP0", default=True),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
