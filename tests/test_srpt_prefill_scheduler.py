@@ -349,7 +349,7 @@ def test_failed_hold_backs_off_exponentially_per_target(shared_model_config):
     assert set(scheduler.schedule().num_scheduled_tokens) == {"stuck"}
 
 
-def test_a_decode_leg_promotes_the_waiting_queues_once_per_step(
+def test_a_decode_leg_runs_the_queue_selection_once_per_step(
     shared_model_config, monkeypatch
 ):
     """vLLM 0.33's Scheduler.schedule has no waiting-queue selection hook of
