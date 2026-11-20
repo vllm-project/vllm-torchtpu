@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -579,10 +580,13 @@ def test_metadata_has_one_serving_config_with_what_the_runtime_reads(tmp_path) -
         "tensor_parallel_size",
         "pipeline_parallel_size",
         "data_parallel_size",
+        "attention_decode_query_size",
         "tokenizer_config",
         "checkpoint_config",
     }
     assert (serving["vocab_size"], serving["num_blocks"]) == (32, 16)
+    # A model without Pallas attention layers decodes one token per request.
+    assert serving["attention_decode_query_size"] == 1
     # The checkpoint format every export writes (Zarr v2 arrays in an OCDBT database).
     assert serving["checkpoint_config"] == {"format": "zarr2_ocdbt"}
 
@@ -623,6 +627,138 @@ def test_metadata_declares_the_speculative_config_it_was_exported_with(
         exporter.export(_TinyTorchExportableLLM(cfg), out_dir)
     meta = json.loads(Path(out_dir, "metadata.json").read_text())
     assert meta["serving_config"]["speculative_config"] == speculative
+
+
+@pytest.mark.parametrize(
+    ("additional", "expected"),
+    [
+        (
+            {"gaad": True, "hybrid_prefix_snapshots": 256},
+            {"gaad": True, "hybrid_prefix_snapshots": 256},
+        ),
+        ({}, None),
+        (None, None),
+    ],
+)
+def test_metadata_additional_config(
+    tmp_path,
+    additional: dict[str, Any] | None,
+    expected: dict[str, Any] | None,
+) -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny-torch",
+        vocab_size=32,
+        hidden_size=16,
+        num_layers=1,
+        num_q_heads=2,
+        num_kv_heads=2,
+        head_dim=8,
+        block_size=8,
+        num_blocks=16,
+        max_num_seqs=8,
+        max_model_len=64,
+        token_buckets=(8,),
+        req_buckets=(8,),
+        emit_byte_tokenizer=True,
+        additional_config=additional,
+    )
+    out_dir = str(tmp_path / "exported")
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_torch_callable_to_mlir,
+    ):
+        exporter.export(_TinyTorchExportableLLM(cfg), out_dir)
+    meta = json.loads(Path(out_dir, "metadata.json").read_text())
+    if expected is None:
+        assert "additional_config" not in meta["serving_config"]
+    else:
+        assert meta["serving_config"]["additional_config"] == expected
+
+
+def test_export_config_rejects_non_json_additional_config() -> None:
+    with pytest.raises(TypeError, match="JSON-serializable"):
+        api.TextOnlyLLMExportConfig(
+            model_name="tiny-torch",
+            additional_config={"bad": object()},
+        )
+
+
+class _TinyVerifyingExportableLLM(_TinyTorchExportableLLM):
+    """The tiny model whose attention decodes 4-token verify windows."""
+
+    def attention_decode_query_size(self) -> int:
+        return 4
+
+
+def test_metadata_records_the_attention_decode_width(tmp_path) -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny-torch",
+        vocab_size=32,
+        hidden_size=16,
+        num_layers=1,
+        num_q_heads=2,
+        num_kv_heads=2,
+        head_dim=8,
+        block_size=8,
+        num_blocks=16,
+        max_num_seqs=8,
+        max_model_len=64,
+        token_buckets=(8,),
+        req_buckets=(8, 32),
+        emit_byte_tokenizer=True,
+    )
+    out_dir = str(tmp_path / "exported")
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_torch_callable_to_mlir,
+    ):
+        exporter.export(_TinyVerifyingExportableLLM(cfg), out_dir)
+    meta = json.loads(Path(out_dir, "metadata.json").read_text())
+    assert meta["serving_config"]["attention_decode_query_size"] == 4
+
+
+def _pallas_attention_layer(decode_query_size: int) -> Any:
+    from vllm.model_executor.layers.attention import Attention
+
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+
+    impl = object.__new__(PallasAttentionBackendImpl)
+    impl.decode_query_size = decode_query_size
+    layer = object.__new__(Attention)
+    layer.impl = impl
+    return layer
+
+
+@pytest.mark.parametrize(
+    ("widths", "want"),
+    [
+        # Target and sharded draft layers decoding K + 1 = 4 tokens.
+        ((4, 4), 4),
+        # A tp=1 draft layer on the 1-wide local kernel.
+        ((4, 4, 1), 1),
+        # No Pallas attention layers.
+        ((), 1),
+    ],
+)
+def test_attention_decode_width_is_the_narrowest_pallas_decode_stage(
+    widths: tuple[int, ...], want: int
+) -> None:
+    layers = {
+        f"layers.{i}.self_attn.attn": _pallas_attention_layer(w)
+        for i, w in enumerate(widths)
+    }
+    # A layer of another backend does not narrow the decode stage.
+    other = _pallas_attention_layer(1)
+    other.impl = SimpleNamespace(decode_query_size=1)
+    layers["layers.9.self_attn.attn"] = other
+    cfg = api.TextOnlyLLMExportConfig(model_name="tiny", num_layers=1)
+    adapter = _adapter_without_model(cfg)
+    adapter._vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context=layers)
+    )
+    assert adapter.attention_decode_query_size() == want
 
 
 def _export_metadata(tmp_path: Path) -> dict[str, Any]:
@@ -706,6 +842,10 @@ def test_parse_args_takes_the_vllm_serve_command_line(capsys) -> None:
             "1024",
             "--block-size",
             "32",
+            "--max-verify-tokens",
+            "8",
+            "--debug-taps",
+            "model.layers.0",
             "--port",
             "8001",
             "--default-chat-template-kwargs",
@@ -716,7 +856,11 @@ def test_parse_args_takes_the_vllm_serve_command_line(capsys) -> None:
         ]
     )
     assert args.model == "Qwen/Qwen3-0.6B"
-    assert (args.max_model_len, args.block_size) == (1024, 32)
+    assert (args.max_model_len, args.block_size, args.max_verify_tokens) == (
+        1024,
+        32,
+        8,
+    )
     ignored = capsys.readouterr().err
     for flag in [
         "--port",
@@ -725,8 +869,41 @@ def test_parse_args_takes_the_vllm_serve_command_line(capsys) -> None:
         "--tool-call-parser",
     ]:
         assert flag in ignored, ignored
-    for flag in ["--max-model-len", "--block-size", "--output-dir"]:
+    for flag in [
+        "--max-model-len",
+        "--block-size",
+        "--output-dir",
+        "--max-verify-tokens",
+        "--debug-taps",
+    ]:
         assert flag not in ignored, ignored
+
+
+def test_export_options_are_never_reported_as_ignored_frontend_args() -> None:
+    parser = cli.build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--model",
+            "Qwen/Qwen3-0.6B",
+            "--output-dir",
+            "/tmp/out",
+            "--target-tpu",
+            "7x",
+            "--token-buckets",
+            "16,32",
+            "--req-buckets",
+            "8,16",
+            "--num-blocks",
+            "64",
+            "--max-verify-tokens",
+            "8",
+            "--debug-taps",
+            "model.layers.0",
+            "--export-mode",
+            "model",
+        ]
+    )
+    assert cli.ignored_frontend_args(parser, args) == []
 
 
 def test_artifact_model_name_records_the_model_id_not_its_location(
@@ -858,6 +1035,7 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
     hf_dir = tmp_path / "hf_ckpt"
     hf_dir.mkdir()
     (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
+    (hf_dir / "tokenizer_config.json").write_text(json.dumps({}))
     with open(hf_dir / "config.json", "w") as f:
         json.dump(
             {
@@ -877,37 +1055,21 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
         num_layers=2,
         mrope_section=[4, 6, 6],
     ).to(torch.bfloat16)
-    vllm_cfg = SimpleNamespace(
-        model_config=SimpleNamespace(
-            model=str(hf_dir),
-            dtype="bfloat16",
-            max_model_len=128,
-            hf_config=SimpleNamespace(
-                vocab_size=64,
-                hidden_size=32,
-                num_hidden_layers=2,
-                num_attention_heads=2,
-                num_key_value_heads=2,
-                head_dim=16,
-                eos_token_id=[2, 0],
-                architectures=["Qwen2_5_VLForConditionalGeneration"],
-            ),
-        ),
-        cache_config=SimpleNamespace(block_size=8, num_gpu_blocks=16),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=1,
-            data_parallel_size=1,
-            pipeline_parallel_size=1,
-            use_sequence_parallel_moe=False,
-            is_moe_model=False,
-        ),
-        compilation_config=SimpleNamespace(
-            compile_sizes=[8, 16],
-            fast_moe_cold_start=False,
-            static_forward_context={},
-        ),
+    vllm_cfg = _mock_vllm_config(
+        str(hf_dir),
+        max_model_len=128,
+        block_size=8,
+        num_gpu_blocks=16,
+        compile_sizes=[8, 16],
     )
+    vllm_cfg.model_config.hf_config = SimpleNamespace(
+        num_attention_heads=2,
+        eos_token_id=[2, 0],
+        architectures=["Qwen2_5_VLForConditionalGeneration"],
+    )
+    vllm_cfg.parallel_config.use_sequence_parallel_moe = False
+    vllm_cfg.parallel_config.is_moe_model = False
+    vllm_cfg.compilation_config.fast_moe_cold_start = False
 
     out_dir = str(tmp_path / "exported_mrope")
     args = cli.parse_args(
@@ -948,14 +1110,147 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
     assert not os.path.exists(os.path.join(out_dir, "serving_checkpoint"))
 
 
+def _mock_vllm_config(
+    model: str,
+    *,
+    max_model_len: int = 2048,
+    max_num_seqs: int = 8,
+    block_size: int = 16,
+    num_gpu_blocks: int | None = None,
+    compile_sizes: list[int] | None = None,
+    static_forward_context: dict[str, Any] | None = None,
+    speculative_config: Any = None,
+    additional_config: dict[str, Any] | None = None,
+    **model_config_fields: Any,
+) -> Any:
+    """A `VllmConfig` stand-in with every field the export reads."""
+    hf_config = SimpleNamespace(num_attention_heads=2, eos_token_id=2)
+    model_config = SimpleNamespace(
+        model=model,
+        dtype="bfloat16",
+        max_model_len=max_model_len,
+        hf_config=hf_config,
+        hf_text_config=hf_config,
+        get_vocab_size=lambda: 64,
+        get_hidden_size=lambda: 32,
+        get_total_num_hidden_layers=lambda: 2,
+        get_total_num_kv_heads=lambda: 2,
+        get_head_size=lambda: 16,
+        uses_mrope=False,
+        try_get_generation_config=dict,
+    )
+    vars(model_config).update(model_config_fields)
+    return SimpleNamespace(
+        model_config=model_config,
+        cache_config=SimpleNamespace(
+            block_size=block_size,
+            num_gpu_blocks=num_gpu_blocks,
+            num_gpu_blocks_override=None,
+            kv_cache_memory_bytes=None,
+            gpu_memory_utilization=0.9,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        compilation_config=SimpleNamespace(
+            compile_sizes=compile_sizes,
+            static_forward_context=static_forward_context or {},
+        ),
+        speculative_config=speculative_config,
+        additional_config={} if additional_config is None else additional_config,
+    )
+
+
+def test_build_export_config_requires_every_vllm_config_field(
+    tmp_path: Path,
+) -> None:
+    build = universal_adapter.build_export_config_from_vllm
+    cfg = build(_mock_vllm_config(str(tmp_path)))
+    assert (cfg.vocab_size, cfg.hidden_size, cfg.num_layers) == (64, 32, 2)
+    assert (cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim) == (2, 2, 16)
+    assert (cfg.max_num_seqs, cfg.max_model_len, cfg.eos_token_id) == (8, 2048, 2)
+    # A field vLLM renames or drops fails the export instead of taking a default.
+    for section, field in (
+        ("model_config", "max_model_len"),
+        ("model_config", "get_vocab_size"),
+        ("cache_config", "block_size"),
+        ("scheduler_config", "max_num_seqs"),
+        ("parallel_config", "decode_context_parallel_size"),
+        ("compilation_config", "compile_sizes"),
+    ):
+        vllm_config = _mock_vllm_config(str(tmp_path))
+        delattr(getattr(vllm_config, section), field)
+        with pytest.raises(AttributeError, match=field):
+            build(vllm_config)
+    vllm_config = _mock_vllm_config(str(tmp_path))
+    delattr(vllm_config, "additional_config")
+    with pytest.raises(AttributeError, match="additional_config"):
+        build(vllm_config)
+
+
+@pytest.mark.parametrize(
+    ("additional", "expected"),
+    [
+        (
+            {"gaad": True, "hybrid_prefix_snapshots": 256},
+            {"gaad": True, "hybrid_prefix_snapshots": 256},
+        ),
+        ({}, None),
+    ],
+)
+def test_build_export_config_copies_additional_config(
+    tmp_path: Path,
+    additional: dict[str, Any],
+    expected: dict[str, Any] | None,
+) -> None:
+    cfg = universal_adapter.build_export_config_from_vllm(
+        _mock_vllm_config(str(tmp_path), additional_config=additional)
+    )
+    assert cfg.additional_config == expected
+
+
+def test_build_export_config_sizes_an_unprofiled_kv_pool(tmp_path: Path) -> None:
+    build = universal_adapter.build_export_config_from_vllm
+    assert build(_mock_vllm_config(str(tmp_path))).num_blocks == 512
+    assert build(_mock_vllm_config(str(tmp_path), num_gpu_blocks=40)).num_blocks == 40
+    vllm_config = _mock_vllm_config(str(tmp_path))
+    vllm_config.cache_config.num_gpu_blocks_override = 24
+    assert build(vllm_config).num_blocks == 24
+
+
+def test_build_export_config_reads_eos_from_the_generation_config(
+    tmp_path: Path,
+) -> None:
+    build = universal_adapter.build_export_config_from_vllm
+    for no_eos in (
+        SimpleNamespace(num_attention_heads=2, eos_token_id=None),
+        # PretrainedConfig subclasses such as Qwen3_5MoeConfig omit the attribute.
+        SimpleNamespace(num_attention_heads=2),
+    ):
+        vllm_config = _mock_vllm_config(
+            str(tmp_path),
+            hf_config=no_eos,
+            hf_text_config=no_eos,
+            try_get_generation_config=lambda: {"eos_token_id": [200020, 200021]},
+        )
+        assert build(vllm_config).eos_token_id == 200020
+        vllm_config.model_config.try_get_generation_config = dict
+        with pytest.raises(ValueError, match="declares eos_token_id"):
+            build(vllm_config)
+
+
 def test_build_export_config_raises_block_size_to_fit_smem(tmp_path: Path) -> None:
     def cfg(max_num_seqs: int, max_model_len: int, block_size: int = 16) -> Any:
-        return SimpleNamespace(
-            model_config=SimpleNamespace(
-                model=str(tmp_path), dtype="bfloat16", max_model_len=max_model_len
-            ),
-            cache_config=SimpleNamespace(block_size=block_size),
-            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        return _mock_vllm_config(
+            str(tmp_path),
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
+            block_size=block_size,
         )
 
     build = universal_adapter.build_export_config_from_vllm
@@ -978,30 +1273,23 @@ def test_build_export_config_reads_model_shape_from_vllm_model_config(
 
     class PerLayerHfConfig:
         num_attention_heads = 32
-        hidden_size = 5376
-        vocab_size = 262144
+        eos_token_id = 1
 
         def __getattr__(self, name: str) -> Any:
             if name in ("num_key_value_heads", "head_dim"):
                 raise AmbiguousPerLayerAttributeError(f"{name!r} is per layer")
             raise AttributeError(name)
 
-    model_config = SimpleNamespace(
-        model=str(tmp_path),
-        dtype="bfloat16",
-        max_model_len=2048,
-        hf_config=PerLayerHfConfig(),
-        get_total_num_kv_heads=lambda: 4,
-        get_head_size=lambda: 512,
-        get_total_num_hidden_layers=lambda: 60,
-        get_vocab_size=lambda: 262144,
-        get_hidden_size=lambda: 5376,
-    )
     cfg = universal_adapter.build_export_config_from_vllm(
-        SimpleNamespace(
-            model_config=model_config,
-            cache_config=SimpleNamespace(block_size=16),
-            scheduler_config=SimpleNamespace(max_num_seqs=8),
+        _mock_vllm_config(
+            str(tmp_path),
+            hf_config=PerLayerHfConfig(),
+            hf_text_config=PerLayerHfConfig(),
+            get_total_num_kv_heads=lambda: 4,
+            get_head_size=lambda: 512,
+            get_total_num_hidden_layers=lambda: 60,
+            get_vocab_size=lambda: 262144,
+            get_hidden_size=lambda: 5376,
         )
     )
 
@@ -1027,15 +1315,12 @@ def test_build_export_config_pages_kv_at_the_attention_kernels_block_size(
     attn.attn_backend = RpaBackend
 
     def cfg(block_size: int) -> Any:
-        return SimpleNamespace(
-            model_config=SimpleNamespace(
-                model=str(tmp_path), dtype="bfloat16", max_model_len=2048
-            ),
-            cache_config=SimpleNamespace(block_size=block_size, num_gpu_blocks=100),
-            scheduler_config=SimpleNamespace(max_num_seqs=64),
-            compilation_config=SimpleNamespace(
-                static_forward_context={"layers.3.self_attn.attn": attn}
-            ),
+        return _mock_vllm_config(
+            str(tmp_path),
+            max_num_seqs=64,
+            block_size=block_size,
+            num_gpu_blocks=100,
+            static_forward_context={"layers.3.self_attn.attn": attn},
         )
 
     build = universal_adapter.build_export_config_from_vllm
@@ -1059,12 +1344,10 @@ def test_build_export_config_req_buckets_cover_speculative_verify_rows(
             if num_speculative_tokens is None
             else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
         )
-        return SimpleNamespace(
-            model_config=SimpleNamespace(
-                model=str(tmp_path), dtype="bfloat16", max_model_len=128
-            ),
-            cache_config=SimpleNamespace(block_size=16),
-            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        return _mock_vllm_config(
+            str(tmp_path),
+            max_model_len=128,
+            max_num_seqs=max_num_seqs,
             speculative_config=spec,
         )
 
@@ -1265,12 +1548,9 @@ def test_max_verify_tokens_loads_vllm_with_a_drafterless_speculative_config(
     assert cli.export_speculative_config(spec) == spec
     # The artifact declares none, and its forced verify rows skip the LM head, so
     # the request buckets cover one row per request.
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            model=str(tmp_path), dtype="bfloat16", max_model_len=128
-        ),
-        cache_config=SimpleNamespace(block_size=16),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
+    vllm_config = _mock_vllm_config(
+        str(tmp_path),
+        max_model_len=128,
         speculative_config=SimpleNamespace(num_speculative_tokens=3),
     )
     cfg = universal_adapter.build_export_config_from_vllm(
@@ -1293,7 +1573,9 @@ def test_max_verify_tokens_loads_vllm_with_a_drafterless_speculative_config(
         num_speculative_tokens=2,
     )
     assert cfg.req_buckets == (8, 16, 24)
-    args = SimpleNamespace(speculative_config=mtp, max_verify_tokens=2)
+    args = SimpleNamespace(
+        speculative_config=mtp, tensor_parallel_size=1, max_verify_tokens=2
+    )
     with pytest.raises(ValueError, match="must exceed"):
         cli.run_export_from_args(args, vllm_config=vllm_config)
 
@@ -1358,6 +1640,7 @@ def test_companion_files_are_copied_and_declared_in_serving_config(tmp_path) -> 
     (hf_dir / "generation_config.json").write_text(
         json.dumps({"eos_token_id": [2, 0], "do_sample": False})
     )
+    (hf_dir / "tokenizer_config.json").write_text(json.dumps({"bos_token": "<s>"}))
     out_dir = tmp_path / "artifact"
     out_dir.mkdir()
     cfg = api.TextOnlyLLMExportConfig(
@@ -1370,9 +1653,15 @@ def test_companion_files_are_copied_and_declared_in_serving_config(tmp_path) -> 
         "source": {"TokenizerPath": {"path": "tokenizer.json"}}
     }
     assert serving_config["generation_config"] == {"path": "generation_config.json"}
-    for name in ("tokenizer.json", "generation_config.json"):
+    assert serving_config["hf_config"] == {"path": "config.json"}
+    assert serving_config["hf_tokenizer_config"] == {"path": "tokenizer_config.json"}
+    for name in (
+        "tokenizer.json",
+        "generation_config.json",
+        "config.json",
+        "tokenizer_config.json",
+    ):
         assert (out_dir / name).read_text() == (hf_dir / name).read_text()
-    assert not (out_dir / "config.json").exists()
 
 
 def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
@@ -1382,6 +1671,7 @@ def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
     hf_dir.mkdir()
     (hf_dir / "config.json").write_text(json.dumps({"eos_token_id": 2}))
     (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
+    (hf_dir / "tokenizer_config.json").write_text(json.dumps({}))
     out_dir = tmp_path / "artifact"
     out_dir.mkdir()
     cfg = api.TextOnlyLLMExportConfig(
@@ -1392,6 +1682,39 @@ def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
 
     assert "generation_config" not in serving_config
     assert not (out_dir / "generation_config.json").exists()
+
+
+@pytest.mark.parametrize("missing", ["config.json", "tokenizer_config.json"])
+def test_companion_files_require_hf_config_files(tmp_path, missing: str) -> None:
+    hf_dir = tmp_path / "hf_ckpt"
+    hf_dir.mkdir()
+    (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
+    for name in ("config.json", "tokenizer_config.json"):
+        if name != missing:
+            (hf_dir / name).write_text(json.dumps({}))
+    out_dir = tmp_path / "artifact"
+    out_dir.mkdir()
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", vocab_size=64, hf_checkpoint_dir=str(hf_dir)
+    )
+
+    with pytest.raises(FileNotFoundError, match=re.escape(missing)):
+        exporter._emit_model_companion_files(cfg, str(out_dir))
+
+
+def test_byte_tokenizer_artifact_declares_no_hf_config_files(tmp_path) -> None:
+    out_dir = tmp_path / "artifact"
+    out_dir.mkdir()
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", vocab_size=64, emit_byte_tokenizer=True
+    )
+
+    serving_config = exporter._emit_model_companion_files(cfg, str(out_dir))
+
+    assert serving_config == {
+        "tokenizer_config": {"source": {"TokenizerPath": {"path": "tokenizer.json"}}}
+    }
+    assert sorted(os.listdir(out_dir)) == ["tokenizer.json"]
 
 
 @pytest.mark.parametrize(
@@ -1428,6 +1751,8 @@ def test_chat_template_is_written_and_declared_like_huggingface_finds_it(
     hf_dir = tmp_path / "hf_ckpt"
     hf_dir.mkdir()
     (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
+    (hf_dir / "config.json").write_text(json.dumps({}))
+    (hf_dir / "tokenizer_config.json").write_text(json.dumps({}))
     for name, text in files.items():
         (hf_dir / name).write_text(text)
     out_dir = tmp_path / "artifact"
@@ -1447,18 +1772,12 @@ def test_chat_template_is_written_and_declared_like_huggingface_finds_it(
 
 
 def _parallel_vllm_cfg(tmp_path: Path, tp: int, dp: int, pp: int) -> Any:
-    return SimpleNamespace(
-        model_config=SimpleNamespace(
-            model=str(tmp_path), dtype="bfloat16", max_model_len=128
-        ),
-        cache_config=SimpleNamespace(block_size=16),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=tp,
-            data_parallel_size=dp,
-            pipeline_parallel_size=pp,
-        ),
-    )
+    vllm_config = _mock_vllm_config(str(tmp_path), max_model_len=128)
+    parallel_config = vllm_config.parallel_config
+    parallel_config.tensor_parallel_size = tp
+    parallel_config.data_parallel_size = dp
+    parallel_config.pipeline_parallel_size = pp
+    return vllm_config
 
 
 @pytest.mark.parametrize(("dp", "pp"), [(2, 1), (1, 2)])
@@ -1587,7 +1906,7 @@ def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> N
         if repo != "org/tiny":
             raise OSError(f"{repo} is not on the Hub")
         fetched.append((filename, kwargs.get("local_files_only", False)))
-        if filename == "generation_config.json":
+        if filename in ("generation_config.json", "tokenizer_config.json"):
             assert kwargs["_raise_exceptions_for_missing_entries"] is False
             return None
         return str(snapshot / filename)
@@ -1605,6 +1924,7 @@ def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> N
         ("config.json", False),
         ("tokenizer.json", False),
         ("generation_config.json", False),
+        ("tokenizer_config.json", False),
     ]
 
 
@@ -2185,6 +2505,41 @@ def test_layer_state_specs_declare_the_mla_latent_cache(
     assert kv.shape == (16, 1024 // packing, packing, 640)
 
 
+def test_layer_state_specs_take_the_kv_shape_of_the_layers_backend() -> None:
+    """The KV state is the shape the runner allocates: the layer's backend's,
+    read under the model's config, which names the KV cache layout (the
+    batched RPA backend lays out `VLLM_KV_CACHE_LAYOUT=HND` differently)."""
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+
+    vllm_config = object()
+    seen: list[str] = []
+
+    class _LayoutBackend(PallasAttentionBackend):
+        @staticmethod
+        def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size, dt):
+            seen.append("shape")
+            return (num_blocks, num_kv_heads, block_size, head_size)
+
+    layer = SimpleNamespace(impl=_pallas_impl(None), attn_backend=_LayoutBackend)
+    adapter = _adapter_without_model(
+        api.TextOnlyLLMExportConfig(model_name="tiny", num_blocks=7, block_size=16)
+    )
+    with mock.patch("vllm.config.set_current_vllm_config") as set_config:
+        set_config.return_value.__enter__.side_effect = lambda: seen.append("set")
+        adapter._vllm_config = vllm_config
+        kv = adapter._layer_state_specs([layer])[0][0]
+    assert kv.shape == (7, 2, 16, 128)
+    set_config.assert_called_once_with(vllm_config)
+    assert seen == ["set", "shape"]
+    # A layer without a Pallas backend of its own keeps the base layout.
+    adapter._vllm_config = None
+    plain = SimpleNamespace(impl=_pallas_impl(None))
+    base = adapter._layer_state_specs([plain])[0][0]
+    assert base.shape == tuple(
+        PallasAttentionBackend.get_kv_cache_shape(7, 16, 2, 128, torch.bfloat16)
+    )
+
+
 def test_layer_state_specs_reject_sparse_mla() -> None:
     from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackendImpl
 
@@ -2744,6 +3099,73 @@ def test_mtp_draft_follows_the_contract(tmp_path) -> None:
     assert mtp_state["index"] == len(target_states)
     draft = [o for o in variant["outputs"] if o["name"] == "draft_tokens"]
     assert draft[0]["shape"] == [8, 1] and draft[0]["dtype"] == "i32"
+
+
+class _SlotMtpExportableLLM(_TinyMtpExportableLLM):
+    """The tiny MTP model whose draft can run for only the first `draft_slots`
+    requests, as the universal adapter's drafters do."""
+
+    def mtp_draft(  # type: ignore[override]
+        self, weights, kv_caches, *, draft_slots=None, **controls
+    ):
+        kvs, tokens = super().mtp_draft(weights, kv_caches, **controls)
+        n = tokens.shape[0] if draft_slots is None else draft_slots
+        pad = tokens.new_zeros((tokens.shape[0] - n, tokens.shape[1]))
+        return kvs, torch.cat([tokens[:n], pad])
+
+
+def test_draft_slot_counts_are_powers_of_two_up_to_a_buckets_requests() -> None:
+    assert exporter.draft_slot_counts(16, 64) == [1, 2, 4, 8, 16]
+    assert exporter.draft_slot_counts(1024, 64) == [1, 2, 4, 8, 16, 32, 64]
+    assert exporter.draft_slot_counts(48, 64) == [1, 2, 4, 8, 16, 32, 48]
+    assert exporter.draft_slot_counts(8, 1) == [1]
+
+
+def test_a_draft_taking_draft_slots_is_one_module_branching_on_the_request_count(
+    tmp_path,
+) -> None:
+    plain = json.loads(
+        Path(_export_mtp(tmp_path / "plain"), "metadata.json").read_text()
+    )["functions"]["draft"]
+    out_dir = _export_mtp(tmp_path / "slots", _SlotMtpExportableLLM)
+    functions = json.loads(Path(out_dir, "metadata.json").read_text())["functions"]
+    # The artifact contract is unchanged: the same executables, inputs and outputs.
+    assert functions["draft"] == plain
+    for bucket in ("8", "16"):
+        mlir = Path(out_dir, functions["draft"][bucket]["file_path"]).read_text()
+        assert mlir.count('"stablehlo.case"') == 1
+        assert f"_slots{max(exporter.draft_slot_counts(int(bucket), 8))}" not in mlir
+        found = re.findall(r"func\.func private @branch_(\d+)\(", mlir)
+        branches = sorted(int(n) for n in found)
+        assert branches == exporter.draft_slot_counts(int(bucket), 8)
+        # The composed `@main` keeps the donated state aliased to its output.
+        main = mlir[mlir.index("func.func public @main") :].split("\n", 1)[0]
+        assert "tf.aliasing_output" in main or "jax.buffer_donor" in main
+
+
+class _KvSharingMtpExportableLLM(_TinyMtpExportableLLM):
+    """The tiny MTP model whose draft reads the target's KV (Gemma 4's
+    assistant) instead of keeping its own."""
+
+    def mtp_state_indices(self) -> list[int]:
+        return [0]
+
+
+def test_a_kv_sharing_mtp_draft_takes_the_target_kv_state(tmp_path) -> None:
+    out_dir = _export_mtp(tmp_path, _KvSharingMtpExportableLLM)
+    functions = json.loads(Path(out_dir, "metadata.json").read_text())["functions"]
+    forward_state = next(
+        i for i in functions["forward"]["16"]["inputs"] if i["argument_type"] == "state"
+    )
+    variant = functions["draft"]["16"]
+    states = [i for i in variant["inputs"] if i["argument_type"] == "state"]
+    # One buffer: the forward's state, under its name and index, donated and
+    # returned as the forward returns it.
+    assert [(s["name"], s["index"]) for s in states] == [("kv_cache_layer_0", 0)]
+    for key in ("shape", "dtype", "sharding", "buffer_donor"):
+        assert states[0].get(key) == forward_state.get(key), key
+    out = [o for o in variant["outputs"] if o["argument_type"] == "state"]
+    assert [(o["name"], o["index"]) for o in out] == [("kv_cache_out_layer_0", 0)]
 
 
 class _TappableMtpExportableLLM(_TinyMtpExportableLLM):

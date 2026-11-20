@@ -408,8 +408,11 @@ def test_refused_when_the_expert_blocks_are_not_equal():
     assert _prebuild(_layer(global_num_experts=4 * _STUB_EP)) == "op"
 
 
-def test_refused_on_a_non_silu_activation():
-    assert _prebuild(_layer(), activation="gelu") is None
+@pytest.mark.parametrize("activation", ["gelu", "silu_bf16"])
+def test_refused_on_a_non_silu_activation(activation):
+    # "silu_bf16" (additional_config tpu_moe_silu_bf16) needs bfloat16
+    # roundings this kernel does not fuse, so such a layer must stay on gmm_v2.
+    assert _prebuild(_layer(), activation=activation) is None
 
 
 def test_refused_when_the_layer_carries_expert_biases():
@@ -992,7 +995,7 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
         monkeypatch.setattr(
             nvfp4.moe_routing,
             "route",
-            lambda *args: (
+            lambda *args, **kwargs: (
                 torch.ones(2, 2, dtype=torch.bfloat16),
                 torch.zeros(2, 2, dtype=torch.int32),
             ),

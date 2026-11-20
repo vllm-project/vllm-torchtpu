@@ -37,13 +37,17 @@ client for every registered platform including TPU. Nothing here needs one, but
 do not read the fixture as a claim that the chips stay free.
 """
 
+import types
+
 import numpy as np
 import pytest
 
 jax = pytest.importorskip("jax")
 jnp = jax.numpy
 
-from vllm_torchtpu.kernels.fused_moe.v2 import host  # noqa: E402
+from jax.experimental.pallas import tpu as pltpu  # noqa: E402
+
+from vllm_torchtpu.kernels.fused_moe.v2 import host, kernel  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -353,6 +357,189 @@ def test_padded_tokens_are_dropped_from_routing_tables(
         _assert_arrays_equal(whole_visit, shard_visit, shard=me)
         if all_padded:
             assert int(np.asarray(whole_visit[1]).item()) == 0
+
+
+def _plan_counts(idx, *, ep, t_local, e_total):
+    """The [ep, e_total] count table the sharded plan exchanges."""
+    flat = np.asarray(idx)
+    return np.stack(
+        [
+            np.bincount(
+                flat[d * t_local : (d + 1) * t_local][
+                    flat[d * t_local : (d + 1) * t_local] < e_total
+                ],
+                minlength=e_total,
+            )
+            for d in range(ep)
+        ]
+    ).astype(np.int32)
+
+
+def _pad_half_of_each_shard(idx, *, ep, t_local, e_total):
+    """Padding rows as the layer marks them: every selection set to e_total.
+
+    The second half of each shard's rows, and all of shard 1's.
+    """
+    idx = np.asarray(idx).copy()
+    for d in range(ep):
+        start = d * t_local if d == 1 else d * t_local + t_local // 2
+        idx[start : (d + 1) * t_local, :] = e_total
+    return jnp.asarray(idx)
+
+
+@pytest.mark.parametrize("ep,t_local,g_local,topk", GEOMETRIES)
+@pytest.mark.parametrize("routing", ["uniform", "skewed", "padded"])
+@pytest.mark.parametrize("sharded", [False, True], ids=["replicated", "sharded"])
+def test_slab_scatter_set_builds_the_add_tables(
+    ep, t_local, g_local, topk, routing, sharded
+):
+    """Both slab tables come out of a scatter-set as they do of an add.
+
+    That is what lets the chip rule (host.slab_tables_on_tensorcore) pick the
+    form by the SparseCore alone. Every live row takes at most one pair and the
+    slab starts at zero; the only rows the two forms can disagree on are
+    dropped or past the slab's last row, where the kernel never reads. Padding
+    rows (expert id e_total) go off-shard in both plans, so they stay out of
+    the live rows too.
+    """
+    idx, kwargs = _routing_inputs(
+        ep, t_local, g_local, topk, skew=routing == "skewed", seed=3
+    )
+    e_total = kwargs["e_total"]
+    stride = kwargs["shard_stride"]
+    if routing == "padded":
+        idx = _pad_half_of_each_shard(idx, ep=ep, t_local=t_local, e_total=e_total)
+    whole = host.build_routing_tables(idx, **kwargs)
+    counts = _plan_counts(idx, ep=ep, t_local=t_local, e_total=e_total)
+    # Row-scale bit patterns as the routing exchange carries them: one
+    # positive f32 per token, repeated over its selections.
+    rng = np.random.default_rng(4)
+    tokens = ep * t_local
+    scale_bits = jnp.asarray(
+        np.repeat((rng.random(tokens, dtype=np.float32) + 0.5).view(np.int32), topk)
+    )
+    scale_size = host.act_scale_slab_rows(stride) * host.HIDDEN_LANE_BLOCK
+
+    for me in range(ep):
+        plan = (
+            host.build_routing_tables_sharded(
+                idx,
+                jnp.int32(me),
+                all_gather_rows=lambda _row: jnp.asarray(counts),
+                **kwargs,
+            )
+            if sharded
+            else whole
+        )
+        rows = host.local_slab_rows(plan, me, shard_stride=stride)
+        gather_add, gather_set = (
+            host.shard_token_gather(
+                plan, me, shard_stride=stride, rows=rows, by_set=by_set
+            )
+            for by_set in (False, True)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(gather_set),
+            np.asarray(gather_add),
+            err_msg=f"token-gather table, shard {me}",
+        )
+        scale_add, scale_set = (
+            host.slab_scatter(scale_size, rows, scale_bits, by_set=by_set)
+            for by_set in (False, True)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(scale_set)[:stride],
+            np.asarray(scale_add)[:stride],
+            err_msg=f"activation-scale slab, shard {me}",
+        )
+
+
+@pytest.mark.parametrize(
+    "chip,on_tensorcore",
+    [
+        ("TPU_7X", False),  # SparseCore 2 x 16: XLA offloads the scatter-add
+        ("TPU_8T", False),  # 2 x 16
+        ("TPU_V6E", False),  # 2 x 16
+        ("TPU_V5P", False),  # 4 x 16: four SparseCores, all full
+        ("TPU_8I", True),  # 1 x 4: the scatters stay on the TensorCore
+        ("TPU_V5E", False),  # no SparseCore: the set is unmeasured, keep the add
+    ],
+)
+def test_slab_tables_follow_the_sparse_core(chip, on_tensorcore):
+    """Only a chip whose SparseCore has at most 4 subcores builds on the TensorCore."""
+    info = pltpu.get_tpu_info_for_chip(getattr(pltpu.ChipVersion, chip), 1)
+    assert host.slab_tables_on_tensorcore(info) is on_tensorcore
+
+
+@pytest.mark.parametrize(
+    "smem,tokens,fits",
+    [
+        (None, 131072, True),  # TPU8i's record: 1 MiB, so the full 512 KiB
+        (None, 131073, False),
+        (512 * 1024, 65536, True),  # half the SMEM, so half the budget
+        (512 * 1024, 65537, False),
+    ],
+)
+def test_scale_slab_budget_follows_the_chips_smem(smem, tokens, fits):
+    """The lookup's scale table takes at most half of the chip's SMEM."""
+    if smem is None:
+        info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_8I, 1)
+    else:
+        info = types.SimpleNamespace(smem_capacity_bytes=smem)
+    assert kernel.scale_slab_fits(tokens, info) is fits
+
+
+@pytest.mark.parametrize(
+    "ep,t_local,g_local,topk",
+    GEOMETRIES + [pytest.param(32, 48, 16, 10, id="qwen38_ep32_g16_t48")],
+)
+@pytest.mark.parametrize("routing", ["uniform", "skewed", "padded"])
+@pytest.mark.parametrize("seed", [0, 1])
+def test_sorted_token_gather_is_the_scattered_one(
+    ep, t_local, g_local, topk, routing, seed
+):
+    """The sort build gives the scatter's table, from either plan builder.
+
+    Skewed routing is the case that matters most: most runs are empty or odd,
+    so the padding elements the sort carries are live on some runs and not on
+    others. Padded routing puts expert id e_total on whole rows and on all of
+    one shard, which the sort has to key off-shard as the plans do.
+    """
+    idx, kwargs = _routing_inputs(
+        ep, t_local, g_local, topk, skew=routing == "skewed", seed=seed
+    )
+    e_total = kwargs["e_total"]
+    stride = kwargs["shard_stride"]
+    if routing == "padded":
+        idx = _pad_half_of_each_shard(idx, ep=ep, t_local=t_local, e_total=e_total)
+    assert host.token_gather_sort_fits(ep * t_local, topk, e_total=e_total, ep=ep)
+    whole = host.build_routing_tables(idx, **kwargs)
+    counts = jnp.asarray(_plan_counts(idx, ep=ep, t_local=t_local, e_total=e_total))
+    for me in range(ep):
+        shard = host.build_routing_tables_sharded(
+            idx, jnp.int32(me), all_gather_rows=lambda _row: counts, **kwargs
+        )
+        for plan in (whole, shard):
+            np.testing.assert_array_equal(
+                np.asarray(
+                    host.shard_token_gather_sorted(
+                        idx,
+                        plan,
+                        jnp.int32(me),
+                        e_total=e_total,
+                        ep=ep,
+                        shard_stride=stride,
+                    )
+                ),
+                np.asarray(host.shard_token_gather(plan, me, shard_stride=stride)),
+                err_msg=f"shard {me}",
+            )
+
+
+def test_token_gather_sort_keys_fit_the_served_shapes():
+    """Qwen3.8's EP32 prefill step is far inside the int32 key range."""
+    assert host.token_gather_sort_fits(16384, 10, e_total=512, ep=32)
+    assert not host.token_gather_sort_fits(2**24, 10, e_total=512, ep=32)
 
 
 def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens():

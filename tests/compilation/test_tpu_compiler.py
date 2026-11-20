@@ -16,6 +16,7 @@ import contextlib
 import importlib
 import os
 import re
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -333,14 +334,10 @@ class TestTpuCompilerCache:
             path.relative_to(source_root).as_posix()
             for path in tpu_compiler._iter_runtime_cache_key_files(source_root)
         }
-        # sharded_jax_op is the legacy helper some ops still register with.
         custom_op_boundaries = {
             path.relative_to(source_root).as_posix()
             for path in (source_root / "vllm_torchtpu").rglob("*.py")
-            if any(
-                marker in path.read_text()
-                for marker in ("pallas.jax_op", "sharded_jax_op(")
-            )
+            if "pallas.jax_op" in path.read_text()
         }
         excluded_files = set(tpu_compiler._RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
         excluded_dirs = tuple(
@@ -360,6 +357,7 @@ class TestTpuCompilerCache:
         }
         assert {
             "vllm_torchtpu/gdn_pool_layout.py",
+            "vllm_torchtpu/kv_cache_spec_normalizer.py",
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
@@ -788,8 +786,9 @@ class TestTpuCompilerCache:
         )
 
     def test_load_self_heal_overwrites_stale_artifact(self, tmp_path, fake_backend):
-        """When `load` encounters an unreadable artifact, it recompiles and
-        overwrites the file so the next `load` replays from disk."""
+        """When `load` encounters an unreadable artifact, it recompiles,
+        overwrites the file so the next `load` replays from disk, and runs the
+        artifact it just saved rather than the in-process result."""
         import pickle
 
         import torch
@@ -812,8 +811,8 @@ class TestTpuCompilerCache:
             ("stale_bucket", str(stale), True), graph, [], 0, Range(start=2, end=2)
         )
         assert fake_backend.compiled == ["compiled"]
-        assert fake_backend.replayed == []
-        assert healed() == "compiled"
+        assert fake_backend.replayed == ["entry-from-rank-compiled"]
+        assert healed() == "entry-from-rank-compiled"
         with open(stale, "rb") as f:
             saved = pickle.load(f)
         assert isinstance(saved, TpuCompilationHandle)
@@ -823,7 +822,7 @@ class TestTpuCompilerCache:
             ("stale_bucket", str(stale), True), graph, [], 0, Range(start=2, end=2)
         )
         assert fake_backend.compiled == ["compiled"]
-        assert fake_backend.replayed == ["entry-from-rank-compiled"]
+        assert fake_backend.replayed == ["entry-from-rank-compiled"] * 2
         assert warm() == "entry-from-rank-compiled"
 
     def test_load_with_disabled_cache_keeps_stale_file(self, tmp_path, fake_backend):
@@ -972,13 +971,112 @@ class TestTpuCompilerCache:
         fn, handle = compile(b)
 
         assert compiled == [0]
-        assert replayed == ["entry-from-rank-0"]
+        # Each compiling rank also reloads the artifact it saved.
+        assert replayed == ["entry-from-rank-0", "entry-from-rank-0"]
         assert fn() == "entry-from-rank-0"
         key, path, _ = handle
         assert path == os.path.join(b.cache_dir, key)
         assert os.path.samefile(path, os.path.join(a.cache_dir, key))
         assert sorted(os.listdir(tmp_path / "hash")) == ["rank_0_0", "rank_1_0"]
         assert os.listdir(b.cache_dir) == [key]
+
+    def test_a_compiled_bucket_runs_from_its_saved_artifact(
+        self, tmp_path, monkeypatch
+    ):
+        """The compiling rank runs the runnable rebuilt from the artifact it
+        saved, as replaying ranks and warm starts do, and drops the in-process
+        compile result, whose device tensors would otherwise count against
+        the KV budget."""
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        (a,), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+        built = []
+        real_backend = tpu_compiler._tpu_backend
+
+        def backend(graph, example_inputs):
+            result = real_backend(graph, example_inputs)
+            built.append(weakref.ref(result))
+            return result
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", backend)
+        fn, handle = compile(a)
+
+        assert compiled == [0]
+        assert replayed == ["entry-from-rank-0"]
+        assert fn() == "entry-from-rank-0"
+        assert handle is not None
+        assert built[0]() is None
+
+    def test_a_stale_artifact_recompiled_in_load_runs_from_the_new_one(
+        self, tmp_path, monkeypatch
+    ):
+        """`load`'s self-heal path also runs the artifact it re-saved, not the
+        in-process result, so a warm start that recompiles a stale artifact
+        holds no extra HBM either."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        (a,), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+        _, handle = compile(a)
+        with open(handle[1], "wb") as f:
+            f.write(b"stale")
+
+        built = []
+        real_backend = tpu_compiler._tpu_backend
+
+        def backend(graph, example_inputs):
+            result = real_backend(graph, example_inputs)
+            built.append(weakref.ref(result))
+            return result
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", backend)
+        fn = a.load(
+            handle,
+            torch.fx.symbolic_trace(lambda x: x * 2 + 1),
+            [],
+            0,
+            Range(start=1, end=4096),
+        )
+
+        assert compiled == [0, 0]
+        assert fn() == "entry-from-rank-0"
+        assert replayed[-1] == "entry-from-rank-0"
+        assert built[0]() is None
+
+    def test_the_in_process_result_is_kept_when_the_reload_fails(
+        self, tmp_path, monkeypatch
+    ):
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        (a,), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+        monkeypatch.setattr(TpuCompilerAdaptor, "_replay", lambda *args, **kw: None)
+        fn, handle = compile(a)
+
+        assert compiled == [0]
+        assert fn() == 0
+        assert handle is not None
+
+    def test_nothing_is_reloaded_without_a_saved_artifact(self, tmp_path, monkeypatch):
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        (a,), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+        monkeypatch.setattr(TpuCompilerAdaptor, "_save_handle", lambda *a, **k: False)
+        fn, handle = compile(a)
+
+        assert compiled == [0]
+        assert replayed == []
+        assert fn() == 0
+        assert handle is None
 
     def test_a_peer_artifact_of_another_graph_is_not_replayed(
         self, tmp_path, monkeypatch
@@ -994,7 +1092,8 @@ class TestTpuCompilerCache:
         compile(b, torch.fx.symbolic_trace(lambda x: x * 2 + 2))
 
         assert compiled == [0, 1]
-        assert replayed == []
+        # Each compiling rank also reloads the artifact it saved.
+        assert replayed == ["entry-from-rank-0", "entry-from-rank-1"]
         assert not os.path.samefile(
             os.path.join(a.cache_dir, "artifact_bucket"),
             os.path.join(b.cache_dir, "artifact_bucket"),
@@ -1038,7 +1137,8 @@ class TestTpuCompilerCache:
         with wait_for_peer_artifact(0.05):
             compile(b)
         assert compiled == [1]
-        assert replayed == []
+        # Each compiling rank also reloads the artifact it saved.
+        assert replayed == ["entry-from-rank-1"]
 
     def test_a_rank_stops_waiting_when_the_owner_cannot_save(
         self, tmp_path, monkeypatch
@@ -1198,7 +1298,8 @@ class TestTpuCompilerCache:
             _, handle = compile(b)
 
         assert compiled == [0, 1]
-        assert replayed == []
+        # Each compiling rank also reloads the artifact it saved.
+        assert replayed == ["entry-from-rank-0", "entry-from-rank-1"]
         key, path, _ = handle
         assert not os.path.samefile(path, os.path.join(a.cache_dir, key))
         with open(path, "rb") as f:
@@ -1217,7 +1318,8 @@ class TestTpuCompilerCache:
         fn, handle = compile(b, _trace_all_reduce_graph("7"))
 
         assert compiled == [0]
-        assert replayed == ["entry-from-rank-0"]
+        # Each compiling rank also reloads the artifact it saved.
+        assert replayed == ["entry-from-rank-0", "entry-from-rank-0"]
         assert fn() == "entry-from-rank-0"
         key, path, _ = handle
         assert a.cache_dir is not None

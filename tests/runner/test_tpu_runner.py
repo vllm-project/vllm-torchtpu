@@ -1451,6 +1451,7 @@ class TestTPURunner:
         self.runner.cache_config = vllm_config.cache_config
         self.runner.scheduler_config = vllm_config.scheduler_config
         self.runner._hybrid_uniform_page_size_bytes = None
+        self.runner._subpage_kernel_block_size = None
         self.runner.max_num_reqs = 16
         self.runner.max_model_len = 1024
         self.runner.max_num_tokens = 2048
@@ -1512,6 +1513,7 @@ class TestTPURunner:
         self.runner.supports_mm_inputs = False
         self.runner.vllm_config.compilation_config.compile_sizes = [16, 2048]
         self.runner._make_buffer = GPUModelRunner._make_buffer.__get__(self.runner)
+        self.runner.input_batch = SimpleNamespace(thinking_budget_state_holder=None)
 
         with (
             patch.object(GPUModelRunner, "__init__", return_value=None),
@@ -3449,6 +3451,21 @@ def test_upload_unless_unchanged_reuses_only_identical_values(device):
     assert zf is not z and zf.dtype == torch.float32
     z22 = upload("z", torch.zeros(2, 2, dtype=torch.float32))
     assert z22 is not zf and tuple(z22.shape) == (2, 2)
+
+
+def test_upload_unless_unchanged_can_copy_synchronously():
+    """Code after the input-staging fence (``sample_tokens()``) asks for a
+    synchronous copy; repeated values still reuse the previous upload."""
+    runner = SimpleNamespace(device=torch.device("cpu"), _h2d_reuse={})
+    host = MagicMock()
+    host.dtype, host.shape = torch.int32, (2,)
+    host.numpy.return_value.tobytes.return_value = b"\x01"
+    dev = TPUModelRunner._upload_unless_unchanged(runner, "k", host, non_blocking=False)
+    host.to.assert_called_once_with(runner.device, non_blocking=False)
+    again = TPUModelRunner._upload_unless_unchanged(
+        runner, "k", host, non_blocking=False
+    )
+    assert again is dev and host.to.call_count == 1
 
 
 def test_relayout_tables_reaches_the_draft_model(monkeypatch):

@@ -60,7 +60,7 @@ from vllm.models.qwen4_exp.common.hyperconnection import (
     HyperConnectionConfig,
 )
 
-from vllm_torchtpu.models.vllm.qwen4_exp.ple import Qwen4ExpPLELayer
+from vllm_torchtpu.models.qwen4_exp.ple import Qwen4ExpPLELayer
 
 
 def _hc_config(vllm_config: VllmConfig) -> HyperConnectionConfig:

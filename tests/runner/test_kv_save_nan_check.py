@@ -235,6 +235,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     runner = SimpleNamespace(
         _pp_handoff=None if pp_is_last else handoff,
         _dp_step_other_decode=False,
+        _thinking_budget=None,
         _pp_is_first=True,
         _pp_is_last=pp_is_last,
         _pp_pending_scheduler_output=None,
@@ -254,6 +255,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         _is_async_drafter=False,
         _greedy_top_tokens_this_step=lambda: False,
         _min_tokens_batch_state=lambda: {},
+        _repetition_penalty=SimpleNamespace(begin_step=lambda _batch: False),
         vllm_config=SimpleNamespace(),
         maybe_setup_kv_connector=lambda *_args, **_kwargs: None,
         input_batch=SimpleNamespace(

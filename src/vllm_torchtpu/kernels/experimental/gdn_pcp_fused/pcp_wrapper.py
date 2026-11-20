@@ -49,7 +49,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
+    TPU_TILE_ROWS,
     config,
+    fused_qkvz_pcp_dma_row_alignment,
     kernel,
     memory_ref,
     pcp_metadata,
@@ -71,7 +73,7 @@ class _ProjectionConfig:
     kq_replication_factor: int
 
 
-_TPU_TILE_ROWS = 8
+_TPU_TILE_ROWS = TPU_TILE_ROWS
 _TPU_TILE_COLUMNS = 128
 
 
@@ -1517,7 +1519,7 @@ def fused_qkvz_projection_pcp_gdn(
         )
     if comm_chunk_size <= 0:
         raise ValueError("comm_chunk_size must be positive.")
-    dma_row_alignment = 8 * (4 // hidden_states.dtype.itemsize)
+    dma_row_alignment = fused_qkvz_pcp_dma_row_alignment(hidden_states.dtype.itemsize)
     if comm_chunk_size % dma_row_alignment != 0:
         raise ValueError(
             "comm_chunk_size must align to the TPU VMEM row tile: "

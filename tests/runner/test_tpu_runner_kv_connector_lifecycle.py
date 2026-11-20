@@ -76,6 +76,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         _pp_handoff=None,
         _dp_step_other_decode=False,
         num_prompt_logprobs={},
+        _thinking_budget=None,
         execute_model_state=SimpleNamespace(
             scheduler_output=scheduler_output,
             draft_chunks=[],
@@ -120,6 +121,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         _get_sampling_generator=lambda: None,
         _greedy_sample=lambda _logits: torch.tensor([7]),
         _min_tokens_batch_state=lambda: {},
+        _repetition_penalty=SimpleNamespace(begin_step=lambda _batch: False),
         _sample_spec_verify_chunk=lambda *_args: torch.tensor([[7, -1]]),
         _update_mamba_slot_read_offsets=lambda *_args: None,
         _update_num_xla_graphs=lambda *_args: None,

@@ -17,6 +17,9 @@ Selected with `VLLM_KV_CACHE_LAYOUT=HND`, which drives both this fork and the
 mainline batched-RPA kernel.
 """
 
+import dataclasses
+from collections.abc import Callable
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -133,6 +136,98 @@ def test_seq_along_lane_matches_head_along_sublane(kv_len, q_len, distribution):
     assert np.isfinite(out_lane).all()
 
 
+@dataclasses.dataclass(frozen=True)
+class _Batch:
+    """Three requests (q lens 1, 3, 2) with fresh KV, and how to run them."""
+
+    query: jnp.ndarray
+    key: jnp.ndarray
+    value: jnp.ndarray
+    q_lens: tuple[int, ...]
+    starts: np.ndarray
+    head_dim: int
+    page_size: int
+    scales: tuple[jnp.ndarray | None, jnp.ndarray | None]
+    scale_flags: dict[str, object]
+    run: Callable[..., tuple[jnp.ndarray, ...]]
+
+
+def _quantize_per_token(x, scale_dtype):
+    """fp8 with one scale per token and head: (x_fp8 [T, H, D], scale [T, H])."""
+    scale = jnp.max(jnp.abs(x), axis=-1, keepdims=True) / float(
+        jnp.finfo(jnp.float8_e4m3fn).max
+    )
+    scale = jnp.where(scale == 0, 1.0, scale)
+    return (x / scale).astype(jnp.float8_e4m3fn), scale[..., 0].astype(scale_dtype)
+
+
+def _gqa_batch(
+    kv_layout, q_heads_per_kv, *, seed, head_dim=128, per_token_scale=False
+) -> _Batch:
+    """Multiple KV heads and unequal request lengths, through decode and prefill."""
+    rng = np.random.default_rng(seed)
+    q_lens = (1, 3, 2)
+    starts = np.cumsum((0, *q_lens)).astype(np.int32)
+    num_kv_heads, page_size = 2, 128
+    num_q_heads = num_kv_heads * q_heads_per_kv
+    num_tokens = sum(q_lens)
+
+    def random_array(shape, dtype):
+        return jnp.asarray(rng.normal(0, 0.5, shape), dtype)
+
+    query = random_array((num_tokens, num_q_heads, head_dim), jnp.bfloat16)
+    kv_shape = (num_tokens, num_kv_heads, head_dim)
+    scales, scale_flags, scale_dtype = (None, None), {}, None
+    if per_token_scale:
+        scale_dtype = jnp.bfloat16
+        key, k_scale = _quantize_per_token(
+            random_array(kv_shape, jnp.float32), scale_dtype
+        )
+        value, v_scale = _quantize_per_token(
+            random_array(kv_shape, jnp.float32), scale_dtype
+        )
+        scales = (k_scale, v_scale)
+        scale_flags = {
+            "use_per_token_scale": True,
+            "per_token_scale_dtype": scale_dtype,
+        }
+    else:
+        key = random_array(kv_shape, jnp.float8_e4m3fn)
+        value = random_array(kv_shape, jnp.float8_e4m3fn)
+    # Reserve two pages per request for the default 256-token KV block.
+    cache_shape = wrapper.get_kv_cache_shape(
+        6,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        key.dtype,
+        kv_layout=kv_layout,
+        use_per_token_scale=per_token_scale,
+        scale_dtype=scale_dtype,
+    )
+
+    def run(queries, keys, values, **kwargs):
+        # LONGCTX routes prefill through the MIXED segment, as in the
+        # existing parity cases above; its standalone PREFILL pass is unused.
+        return wrapper.ragged_paged_attention(
+            queries,
+            keys,
+            values,
+            jnp.zeros(cache_shape, key.dtype),
+            jnp.asarray(q_lens, jnp.int32),
+            jnp.array([4, 0, 2, 5, 1, 3], jnp.int32),
+            jnp.asarray(starts),
+            jnp.array([1, 1, 3], jnp.int32),
+            sm_scale=head_dim**-0.5,
+            kv_layout=kv_layout,
+            **kwargs,
+        )
+
+    return _Batch(
+        query, key, value, q_lens, starts, head_dim, page_size, scales, scale_flags, run
+    )
+
+
 @pytest.mark.parametrize("kv_layout", list(configs.KVLayout))
 @pytest.mark.parametrize("q_heads_per_kv", [3, 10])
 def test_return_lse_preserves_gqa_heads(kv_layout, q_heads_per_kv):
@@ -141,40 +236,12 @@ def test_return_lse_preserves_gqa_heads(kv_layout, q_heads_per_kv):
     Exercise multiple KV heads, small and non-power-of-two Q groups, and
     unequal request lengths through both decode and prefill scheduling.
     """
-    rng = np.random.default_rng(42)
-    q_lens = (1, 3, 2)
-    starts = np.cumsum((0, *q_lens)).astype(np.int32)
-    num_kv_heads, head_dim = 2, 128
-    num_q_heads = num_kv_heads * q_heads_per_kv
-    num_tokens = sum(q_lens)
-
-    def random_array(shape, dtype):
-        return jnp.asarray(rng.normal(0, 0.5, shape), dtype)
-
-    query = random_array((num_tokens, num_q_heads, head_dim), jnp.bfloat16)
-    key = random_array((num_tokens, num_kv_heads, head_dim), jnp.float8_e4m3fn)
-    value = random_array((num_tokens, num_kv_heads, head_dim), jnp.float8_e4m3fn)
-    # Reserve two pages per request for the default 256-token KV block.
-    shape = wrapper.get_kv_cache_shape(
-        6, 128, num_kv_heads, head_dim, key.dtype, kv_layout=kv_layout
-    )
+    batch = _gqa_batch(kv_layout, q_heads_per_kv, seed=42)
+    query, key, value = batch.query, batch.key, batch.value
+    starts, head_dim = batch.starts, batch.head_dim
 
     def run(return_lse):
-        # LONGCTX routes prefill through the MIXED segment, as in the
-        # existing parity cases above; its standalone PREFILL pass is unused.
-        return wrapper.ragged_paged_attention(
-            query,
-            key,
-            value,
-            jnp.zeros(shape, key.dtype),
-            jnp.asarray(q_lens, jnp.int32),
-            jnp.array([4, 0, 2, 5, 1, 3], jnp.int32),
-            jnp.asarray(starts),
-            jnp.array([1, 1, 3], jnp.int32),
-            sm_scale=head_dim**-0.5,
-            kv_layout=kv_layout,
-            return_lse=return_lse,
-        )
+        return batch.run(query, key, value, return_lse=return_lse)
 
     out_without_lse, cache_without_lse = run(False)
     output, cache, lse = run(True)
@@ -213,3 +280,86 @@ def test_return_lse_preserves_gqa_heads(kv_layout, q_heads_per_kv):
     np.testing.assert_allclose(
         np.asarray(lse, np.float32), expected_lse, atol=4e-2, rtol=1e-2
     )
+
+
+_SAL = configs.KVLayout.SEQ_ALONG_LANE
+_PARITY_CASES = [
+    # kv_layout, q_heads_per_kv, mode, head_dim, return_lse, per_token_scale
+    *(
+        (layout, q, mode, 128, False, False)
+        for layout in configs.KVLayout
+        for q in (3, 10)
+        for mode in ("prepared", "raw", "both")
+    ),
+    *((layout, 3, "both", 64, False, False) for layout in configs.KVLayout),
+    *((layout, 3, "both", 128, True, False) for layout in configs.KVLayout),
+    *((_SAL, 3, mode, 128, False, True) for mode in ("prepared", "raw", "both")),
+]
+
+
+@pytest.mark.parametrize(
+    "kv_layout,q_heads_per_kv,mode,head_dim,return_lse,per_token_scale", _PARITY_CASES
+)
+def test_prepared_inputs_and_raw_output_match_default(  # noqa: PLR0913 - the case's fields
+    kv_layout, q_heads_per_kv, mode, head_dim, return_lse, per_token_scale
+):
+    """prepared_inputs and return_raw_output, alone or together, match the default.
+
+    With prepared_inputs the placeholders are zeros, so the test fails if the
+    wrapper packs queries/keys/values instead of using the prepared buffers.
+    """
+    b = _gqa_batch(
+        kv_layout,
+        q_heads_per_kv,
+        seed=0,
+        head_dim=head_dim,
+        per_token_scale=per_token_scale,
+    )
+    k_scale, v_scale = b.scales
+    dynamic = {"dynamic_k_scale": k_scale, "dynamic_v_scale": v_scale}
+    dynamic = {k: v for k, v in dynamic.items() if v is not None}
+    want = b.run(
+        b.query, b.key, b.value, return_lse=return_lse, **b.scale_flags, **dynamic
+    )
+
+    kwargs: dict[str, object] = {"return_lse": return_lse, **b.scale_flags}
+    queries, keys, values = b.query, b.key, b.value
+    if mode in ("prepared", "both"):
+        kwargs["prepared_inputs"] = wrapper.prepare_inputs(
+            b.query,
+            b.key,
+            b.value,
+            b.query.dtype,
+            b.key.dtype,
+            k_scale,
+            v_scale,
+            kv_layout=kv_layout,
+            page_size=b.page_size,
+        )
+        queries, keys, values = (jnp.zeros_like(x) for x in (b.query, b.key, b.value))
+    else:
+        kwargs.update(dynamic)
+    if mode in ("raw", "both"):
+        kwargs["return_raw_output"] = True
+    got = b.run(queries, keys, values, **kwargs)
+
+    out = got[0]
+    if mode in ("raw", "both"):
+        q_packing = 2  # bf16
+        aligned_heads = -(-q_heads_per_kv // q_packing) * q_packing
+        aligned_dim = -(-head_dim // 128) * 128
+        num_kv_heads = b.key.shape[1]
+        assert out.shape == (
+            num_kv_heads,
+            b.query.shape[0],
+            aligned_heads // q_packing,
+            q_packing,
+            aligned_dim,
+        )
+        out = wrapper.prepare_outputs(out)[:, :, :q_heads_per_kv, :head_dim]
+        out = out.swapaxes(0, 1).reshape(b.query.shape)
+    assert len(got) == len(want)
+    for g, w in zip((out, *got[1:]), want, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(g, np.float32), np.asarray(w, np.float32)
+        )
