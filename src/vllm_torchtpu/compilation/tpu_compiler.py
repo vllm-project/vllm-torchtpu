@@ -299,6 +299,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Engine-core step timing and scheduling order only; every step keeps a
     # compiled step size.
     "TPU_DEFER_STEP",
+    "TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX",
+    "TPU_PREFIX_AWARE_SHORT_PROMPTS",
     "VLLM_TPU_FOLLOW_SHARED_PREFIX",
 }
 
