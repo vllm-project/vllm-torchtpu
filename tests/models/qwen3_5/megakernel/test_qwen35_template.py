@@ -53,6 +53,7 @@ from vllm_torchtpu.megakernel.core import Profile, register_profile
 from vllm_torchtpu.megakernel.core import profile as profile_mod
 from vllm_torchtpu.megakernel.core.runtime import (
     EligibilityResult,
+    LayoutDecline,
     facts_from_pool_layout,
 )
 from vllm_torchtpu.models.qwen3_5 import megakernel as qwen_plugin
@@ -236,6 +237,75 @@ def test_pool_slot_check_uses_first_recurrent_layer_and_skips_without_one(
     monkeypatch.setattr(drv, "_framework_slot_facts", never, raising=False)
     drv._check_pool_layout_facts(SimpleNamespace(), object())
     assert drv.pool_layout_facts is None
+
+
+def test_pool_slot_check_keeps_the_framework_facts_decline_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A named decline from the framework's slot facts (e.g. a pool it can't
+    read, `pool_layout_mismatch`) reaches the vote as is; other errors become
+    `pool_layout_unknown`."""
+    drv = _slot_check_driver([SimpleNamespace(linear_attn=object())])
+    named = EligibilityResult(False, "pool_layout_mismatch", "unreadable pool")
+
+    def declines(*_a: Any) -> Any:
+        raise LayoutDecline(named)
+
+    monkeypatch.setattr(drv, "_framework_slot_facts", declines, raising=False)
+    with pytest.raises(LayoutDecline) as exc:
+        drv._check_pool_layout_facts(SimpleNamespace(), object())
+    assert exc.value.result is named
+
+    def breaks(*_a: Any) -> Any:
+        raise ValueError("no such dtype")
+
+    monkeypatch.setattr(drv, "_framework_slot_facts", breaks, raising=False)
+    with pytest.raises(LayoutDecline) as exc:
+        drv._check_pool_layout_facts(SimpleNamespace(), object())
+    assert exc.value.result.code == "pool_layout_unknown"
+
+
+def test_framework_slot_facts_read_the_runner_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The template passes the view's cache block size, resolved KV cache
+    layout and PCP size to the framework's slot facts."""
+    from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
+    from vllm_torchtpu.megakernel.adapter import pool_facts
+
+    monkeypatch.setattr(
+        pool_facts.gpl, "DEFAULT_POOLED_GDN_CONV_STATE_DTYPE", "torch.bfloat16"
+    )
+    monkeypatch.delenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", raising=False)
+    drv = _slot_check_driver([])
+    la = SimpleNamespace(
+        get_state_dtype=lambda: (torch.bfloat16, torch.bfloat16),
+        tp_head_geometry=derive_gdn_head_geometry(16, 64, 8),
+        head_k_dim=128,
+        head_v_dim=128,
+        conv_kernel_size=4,
+    )
+    pool = torch.empty((96, 2, 64, 4, 128), dtype=torch.float8_e4m3fn, device="meta")
+
+    def view(layout: str, pcp: int) -> Any:
+        cache = SimpleNamespace(
+            get_resolved_kv_cache_layout=lambda: SimpleNamespace(name=layout)
+        )
+        return SimpleNamespace(
+            cache_block_size=640,
+            vllm_config=SimpleNamespace(
+                cache_config=cache,
+                parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp),
+            ),
+        )
+
+    mk = facts_from_pool_layout(drv.spec.cache_backend.layout, 8)
+    assert drv._framework_slot_facts(view("LBHNC", 1), la, pool) == mk
+    nhd = drv._framework_slot_facts(view("LBNHC", 1), la, pool)
+    assert nhd.page_size == 2 and nhd != mk
+    with pytest.raises(LayoutDecline) as exc:
+        drv._framework_slot_facts(view("LBHNC", 2), la, pool)
+    assert exc.value.result.code == "pool_layout_unknown"
 
 
 # --- shorthand vs plugin key: identical programs ----------------------------------
@@ -489,6 +559,7 @@ def _false_result_codes(path: Path, *func_names: str) -> set[str]:
 
 def test_every_template_decline_is_in_the_vote_table() -> None:
     import vllm_torchtpu.megakernel.core as mk_lib
+    from vllm_torchtpu.megakernel.adapter import pool_facts
 
     codes = driver_mod.vote_codes(qwen_plugin.SPEC.decline_codes)
     assert codes[-1] == "other" and len(set(codes)) == len(codes)
@@ -502,11 +573,13 @@ def test_every_template_decline_is_in_the_vote_table() -> None:
     scanned = _false_result_codes(Path(adapter.__file__))
     scanned |= _false_result_codes(lib / "validate.py", "validate_model_hf_config")
     scanned |= _false_result_codes(lib / "runtime" / "layout_facts.py")
+    scanned |= _false_result_codes(Path(pool_facts.__file__))
     elig = lib / "runtime" / "eligibility.py"
     post = _false_result_codes(elig, "check_post_mesh_eligibility")
     # create passes no mesh_size and no device_kind
     scanned |= post - {"mesh_size_mismatch", "unsupported_tpu_chip"}
     assert {"pool_layout_mismatch", "conv_state_dtype_unsupported"} <= scanned
+    assert "pool_layout_unknown" in scanned
     assert {"non_moe_checkpoint", "invalid_geometry", "geometry_mismatch"} <= scanned
     assert scanned <= _QWEN_DECLINES, sorted(scanned - _QWEN_DECLINES)
     assert {"unsupported_tpu_chip", "empty_buckets"} <= post

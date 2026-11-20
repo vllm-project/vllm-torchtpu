@@ -16,7 +16,8 @@
 Built only from what vllm-torchtpu itself uses to lay out the pool: the GDN
 layer's declared state dtypes, resolved through `gdn_pool_layout` exactly as
 the block-size derivation and the stock kernel's state plan resolve them, the
-cache block size, the raw pool tensor, and the conv-order switch.
+layer's TP head geometry, the cache block size, the resolved KV cache layout,
+the raw pool tensor, and the conv-order switch.
 """
 
 from __future__ import annotations
@@ -24,6 +25,14 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import vllm_torchtpu.envs as envs
+from vllm_torchtpu import gdn_pool_layout as gpl
+from vllm_torchtpu.megakernel.core.runtime.contract import (
+    POOL_LAYOUT_MISMATCH,
+    POOL_LAYOUT_UNKNOWN,
+    EligibilityResult,
+    LayoutDecline,
+)
 from vllm_torchtpu.megakernel.core.runtime.layout_facts import (
     CONV_ORDER_TAPS_QKV,
     PoolLayoutFacts,
@@ -33,32 +42,31 @@ from vllm_torchtpu.megakernel.core.runtime.layout_facts import (
 # Conv element order with Q/K head pairs interleaved (`TPU_GDN_CONV_QK_PAIR_LAYOUT`).
 CONV_ORDER_QK_PAIR = "qk_pair"
 
+# The page axis that holds a pool page's tokens, by the name of vLLM's
+# resolved `KVCacheLayout` (`cache_config.get_resolved_kv_cache_layout()`).
+# HND (`LBHNC`, SEQ_ALONG_LANE, the megakernel's) pages are
+# `(2 * kvh, hd / pack, pack, page_size)`; NHD (`LBNHC`, HEAD_ALONG_SUBLANE,
+# `PallasAttentionBackend.get_kv_cache_shape`) pages are
+# `(page_size, 2 * kvh / pack, pack, hd)`. Any other layout is declined.
+_PAGE_TOKEN_AXIS = {"LBHNC": -1, "LBNHC": 0}
+_PAGE_RANK = 4
 
-def _itemsize(dt: Any) -> int:
-    size = getattr(dt, "itemsize", None)
-    if isinstance(size, int):
-        return size
-    import numpy as np
 
-    return int(np.dtype(dtype_name(dt)).itemsize)
+def _mismatch(detail: str) -> LayoutDecline:
+    msg = f"Megakernel can't use the framework's pool: {detail}; skipping."
+    return LayoutDecline(EligibilityResult(False, POOL_LAYOUT_MISMATCH, msg))
 
 
-def runner_block_size(runner: Any) -> int | None:
-    """The cache block size the framework sizes one recurrent slot with."""
-    for cfg in (
-        getattr(getattr(runner, "vllm_config", None), "cache_config", None),
-        getattr(runner, "cache_config", None),
-    ):
-        bs = getattr(cfg, "block_size", None)
-        if bs:
-            return int(bs)
-    return None
+def _unknown(detail: str) -> LayoutDecline:
+    msg = (
+        f"Megakernel can't describe the framework's recurrent pool slot: {detail}; "
+        "skipping."
+    )
+    return LayoutDecline(EligibilityResult(False, POOL_LAYOUT_UNKNOWN, msg))
 
 
 def conv_qk_pair_layout_enabled() -> bool:
-    from vllm_torchtpu import envs as tpu_envs
-
-    return bool(getattr(tpu_envs, "TPU_GDN_CONV_QK_PAIR_LAYOUT", False))
+    return envs.TPU_GDN_CONV_QK_PAIR_LAYOUT
 
 
 def framework_pool_layout_facts(
@@ -66,26 +74,49 @@ def framework_pool_layout_facts(
     pool: Any,
     linear_attn: Any,
     block_size: int,
+    kv_layout: Any,
+    pcp_size: int,
     conv_qk_pair: bool,
 ) -> PoolLayoutFacts:
     """Describe one rank's slot the way the framework lays it out.
 
     `pool` is the per-rank raw pool `(num_pages, *page_shape)`; `linear_attn`
-    is one of the GDN layers that alias it.
+    is one of the GDN layers that alias it. `block_size` is the cache block
+    size (`RunnerView.cache_block_size`), which the stock pooled GDN kernel
+    also uses as one rank's slot (`pool_block_tokens`). `kv_layout` is the
+    runner's `cache_config.get_resolved_kv_cache_layout()` and `pcp_size` its
+    `parallel_config.prefill_context_parallel_size`.
+
+    Raises `LayoutDecline` (`pool_layout_unknown`) under PCP or for a KV
+    layout it doesn't know, and (`pool_layout_mismatch`) for a pool whose
+    pages it can't read as whole-granule token rows.
     """
-    from vllm_torchtpu import gdn_pool_layout as gpl
+    if pcp_size != 1:
+        raise _unknown(
+            f"prefill context parallel size {pcp_size} shards the TP-local GDN "
+            "heads again per PCP rank, which these facts don't describe"
+        )
+    axis = _PAGE_TOKEN_AXIS.get(kv_layout.name)
+    if axis is None:
+        raise _unknown(f"KV cache layout {kv_layout.name} isn't one of HND or NHD")
+    page_shape = tuple(int(d) for d in pool.shape[1:])
+    if len(page_shape) != _PAGE_RANK or min(page_shape) <= 0:
+        raise _mismatch(f"pool page shape {page_shape} isn't a {_PAGE_RANK}-D page")
+    page_size = page_shape[axis]
+    token_bytes = math.prod(page_shape) * pool.dtype.itemsize // page_size
+    if token_bytes % gpl.GRANULE_BYTES != 0:
+        raise _mismatch(
+            f"a {kv_layout.name} page {page_shape} of {dtype_name(pool.dtype)} has "
+            f"{token_bytes}-byte token rows, not whole {gpl.GRANULE_BYTES}-byte "
+            "granules"
+        )
 
     conv_dt, ssm_dt = gpl.pooled_gdn_state_dtypes(tuple(linear_attn.get_state_dtype()))
     geom = linear_attn.tp_head_geometry
-    n_kq = int(geom.local_num_kq_heads)
-    n_v = int(linear_attn.num_v_heads) // int(linear_attn.tp_size)
-    d_k, d_v = int(linear_attn.head_k_dim), int(linear_attn.head_v_dim)
-    kernel_size = int(linear_attn.conv_kernel_size)
-    conv_dim = 2 * n_kq * d_k + n_v * d_v
-
-    page_shape = tuple(int(d) for d in pool.shape[1:])
-    page_size = page_shape[-1]
-    token_bytes = math.prod(page_shape) * _itemsize(pool.dtype) // page_size
+    n_kq, n_v = geom.local_num_kq_heads, geom.local_num_v_heads
+    d_k, d_v = linear_attn.head_k_dim, linear_attn.head_v_dim
+    kernel_size = linear_attn.conv_kernel_size
+    conv_dim = geom.local_conv_dim(d_k, d_v)
     ssm_bytes = gpl.pooled_gdn_ssm_state_bytes(
         num_v_heads=n_v, head_k_dim=d_k, head_v_dim=d_v, dtype=ssm_dt
     )
@@ -100,12 +131,12 @@ def framework_pool_layout_facts(
         page_shape=page_shape,
         page_size=page_size,
         token_bytes=token_bytes,
-        slot_tokens=int(block_size),
+        slot_tokens=block_size,
         ssm_dtype=dtype_name(ssm_dt),
-        ssm_bytes=int(ssm_bytes),
+        ssm_bytes=ssm_bytes,
         ssm_offset_bytes=0,
         conv_dtype=dtype_name(conv_dt),
-        conv_bytes=int(conv_bytes),
+        conv_bytes=conv_bytes,
         conv_offset_bytes=state.ssm_tokens * token_bytes,
         conv_order=CONV_ORDER_QK_PAIR if conv_qk_pair else CONV_ORDER_TAPS_QKV,
         local_kh=n_kq,
@@ -121,5 +152,4 @@ __all__ = [
     "CONV_ORDER_QK_PAIR",
     "conv_qk_pair_layout_enabled",
     "framework_pool_layout_facts",
-    "runner_block_size",
 ]

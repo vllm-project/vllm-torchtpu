@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from vllm_torchtpu import gdn_pool_layout as gpl
+from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
 from vllm_torchtpu.megakernel.adapter.pool_facts import framework_pool_layout_facts
 from vllm_torchtpu.megakernel.core.runtime import (
     PoolLayoutFacts,
@@ -44,9 +45,7 @@ def _qwen35_gdn_layer() -> Any:
     its pool slot from (`VllmGatedDeltaNetAttention`)."""
     return SimpleNamespace(
         get_state_dtype=lambda: (torch.bfloat16, torch.bfloat16),
-        tp_head_geometry=SimpleNamespace(local_num_kq_heads=16 // TP),
-        num_v_heads=64,
-        tp_size=TP,
+        tp_head_geometry=derive_gdn_head_geometry(16, 64, TP),
         head_k_dim=128,
         head_v_dim=128,
         conv_kernel_size=4,
@@ -89,6 +88,8 @@ def test_qwen35_framework_slot_matches_its_pool_layout(
         pool=pool,
         linear_attn=_qwen35_gdn_layer(),
         block_size=640,
+        kv_layout=SimpleNamespace(name="LBHNC"),
+        pcp_size=1,
         conv_qk_pair=False,
     )
     assert fw == _mk_facts()

@@ -523,13 +523,13 @@ class Qwen35Program:
     def _framework_slot_facts(
         self, view: RunnerView, linear_attn: Any, pool: torch.Tensor
     ) -> mk_rt.PoolLayoutFacts:
-        block = view.cache_block_size
-        if block is None:
-            raise ValueError("runner has no cache_config.block_size")
+        cfg = view.vllm_config
         return framework_pool_layout_facts(
             pool=pool,
             linear_attn=linear_attn,
-            block_size=block,
+            block_size=view.cache_block_size,
+            kv_layout=cfg.cache_config.get_resolved_kv_cache_layout(),
+            pcp_size=cfg.parallel_config.prefill_context_parallel_size,
             conv_qk_pair=conv_qk_pair_layout_enabled(),
         )
 
@@ -581,6 +581,8 @@ class Qwen35Program:
             return
         try:
             fw_facts = self._framework_slot_facts(view, linear_attn, pool)
+        except LayoutDecline:  # already a named decline
+            raise
         except (AttributeError, TypeError, ValueError) as exc:
             msg = (
                 "can't derive the framework's recurrent pool slot layout "

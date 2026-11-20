@@ -18,6 +18,7 @@ the same slot (`megakernel.adapter.pool_facts`)."""
 from __future__ import annotations
 
 import dataclasses
+import enum
 from types import SimpleNamespace
 from typing import Any
 
@@ -27,12 +28,14 @@ import pytest
 import torch
 
 from vllm_torchtpu import gdn_pool_layout as gpl
+from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
 from vllm_torchtpu.megakernel.adapter.pool_facts import (
+    conv_qk_pair_layout_enabled,
     framework_pool_layout_facts,
-    runner_block_size,
 )
 from vllm_torchtpu.megakernel.core.pool.layout import PoolLayout
 from vllm_torchtpu.megakernel.core.runtime import (
+    LayoutDecline,
     PoolLayoutFacts,
     compare_layout_facts,
     facts_from_pool_layout,
@@ -67,6 +70,14 @@ _FACTS = PoolLayoutFacts(
 )
 
 
+class _KVLayout(enum.Enum):
+    """Stand-in for vLLM's `KVCacheLayout` (the facts read only `.name`)."""
+
+    LBHNC = "HND"
+    LBNHC = "NHD"
+    BLNHC = "block-major NHD"
+
+
 def _mk_facts(layout: PoolLayout = _LAYOUT) -> PoolLayoutFacts:
     return facts_from_pool_layout(layout, TP)
 
@@ -76,9 +87,7 @@ def _gdn_layer(ssm_dtype: torch.dtype = torch.bfloat16) -> Any:
     pool slot from, for the same heads as `_LAYOUT`."""
     return SimpleNamespace(
         get_state_dtype=lambda: (torch.bfloat16, ssm_dtype),
-        tp_head_geometry=SimpleNamespace(local_num_kq_heads=16 // TP),
-        num_v_heads=64,
-        tp_size=TP,
+        tp_head_geometry=derive_gdn_head_geometry(16, 64, TP),
         head_k_dim=128,
         head_v_dim=128,
         conv_kernel_size=4,
@@ -98,7 +107,12 @@ def bf16_conv_pool(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _fw_facts(**kw: Any) -> PoolLayoutFacts:
     args: dict[str, Any] = dict(
-        pool=_pool(), linear_attn=_gdn_layer(), block_size=640, conv_qk_pair=False
+        pool=_pool(),
+        linear_attn=_gdn_layer(),
+        block_size=640,
+        kv_layout=_KVLayout.LBHNC,
+        pcp_size=1,
+        conv_qk_pair=False,
     )
     args.update(kw)
     return framework_pool_layout_facts(**args)
@@ -177,26 +191,59 @@ def test_layout_differences_are_declined(bf16_conv_pool: None) -> None:
     assert "slot_tokens: megakernel=512 framework=640" in res.message
 
 
-def test_runner_block_size() -> None:
-    assert runner_block_size(SimpleNamespace()) is None
-    vc = SimpleNamespace(cache_config=SimpleNamespace(block_size=640))
-    assert runner_block_size(SimpleNamespace(vllm_config=vc)) == 640
-    cc = SimpleNamespace(block_size=1152)
-    assert runner_block_size(SimpleNamespace(cache_config=cc)) == 1152
+def _fp8_pool(*page_shape: int) -> torch.Tensor:
+    return torch.empty((8, *page_shape), dtype=torch.float8_e4m3fn, device="meta")
 
 
-def test_framework_as_checked_out_matches_or_declines_by_conv_dtype() -> None:
-    """With the tree's own `gdn_pool_layout` default: a bf16 conv pool matches a
-    bf16-conv `PoolLayout`; an fp32 one (the stock GDN kernel's only option
-    once it requires fp32 conv) doesn't (`conv_state_dtype_unsupported`); the
-    driver then switches to an f32-conv layout before comparing."""
-    fw = _fw_facts()
+def test_framework_nhd_pool_reads_tokens_from_the_first_page_axis(
+    bf16_conv_pool: None,
+) -> None:
+    """An NHD pool page is `(page_size, 2 * kvh / pack, pack, hd)`: the facts
+    take the page size from axis 0, so the layout comparison names it. Even a
+    page whose dims happen to equal the megakernel's HND page doesn't match."""
+    # `PallasAttentionBackend.get_kv_cache_shape(n, 128, 1, 256, fp8)`.
+    fw = _fw_facts(pool=_fp8_pool(128, 1, 4, 256), kv_layout=_KVLayout.LBNHC)
+    assert (fw.page_size, fw.token_bytes) == (128, 1024)
     res = compare_layout_facts(_mk_facts(), fw)
-    if fw.conv_dtype == "bfloat16":
-        assert res.eligible
-    else:
-        assert fw.conv_dtype == "float32"
-        assert not res.eligible and res.code == "conv_state_dtype_unsupported"
+    assert not res.eligible and res.code == "pool_layout_mismatch"
+    assert "page_size:" not in res.message and "token_bytes:" in res.message
+
+    fw = _fw_facts(kv_layout=_KVLayout.LBNHC)
+    assert fw.page_shape == _mk_facts().page_shape
+    assert (fw.page_size, fw.token_bytes) == (2, 32768)
+    res = compare_layout_facts(_mk_facts(), fw)
+    assert not res.eligible and res.code == "pool_layout_mismatch"
+    assert "page_size: megakernel=128 framework=2" in res.message
+
+
+@pytest.mark.parametrize(
+    ("kw", "code", "match"),
+    [
+        # HND, 1 KV head of 128 dims in fp8: 256-byte token rows.
+        (dict(pool=_fp8_pool(2, 32, 4, 128)), "pool_layout_mismatch", "granules"),
+        (dict(pool=_fp8_pool(2, 64, 512)), "pool_layout_mismatch", "4-D page"),
+        (dict(kv_layout=_KVLayout.BLNHC), "pool_layout_unknown", "BLNHC"),
+        (dict(pcp_size=2), "pool_layout_unknown", "prefill context parallel"),
+    ],
+)
+def test_framework_slot_it_cannot_describe_is_a_layout_decline(
+    kw: dict[str, Any], code: str, match: str
+) -> None:
+    """A pool the facts can't read (non-granule token rows, another page
+    rank), a KV layout they don't know and PCP are named declines, not raw
+    errors that would vote `bind_error`."""
+    with pytest.raises(LayoutDecline, match=match) as exc:
+        _fw_facts(**kw)
+    assert exc.value.result.code == code and not exc.value.result.eligible
+
+
+def test_conv_qk_pair_layout_enabled_reads_the_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "1")
+    assert conv_qk_pair_layout_enabled() is True
+    monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "0")
+    assert conv_qk_pair_layout_enabled() is False
 
 
 def test_f32_conv_pool_layout_matches_an_fp32_conv_framework(
