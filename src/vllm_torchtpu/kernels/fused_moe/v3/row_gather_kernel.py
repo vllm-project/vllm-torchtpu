@@ -589,7 +589,7 @@ def gather_rows_and_scales(
         scratch_types=scratch_types,
         compiler_params=pltpu.CompilerParams(**COMPILER_PARAMS),
         name=f"fused_ep_gather_rows_b{block_rows}x{ring}"
-        f"{'' if with_scales else '_bf16'}",
+        f"{'' if with_scales else '_noscale'}",
     )
     outs = program(*operands)
     return (outs[0], outs[1]) if with_scales else (outs[0], None)

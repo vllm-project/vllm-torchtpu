@@ -47,8 +47,6 @@ The schedule is static: sends(), arrivals() and the wait bookkeeping are
 plain Python over relative addresses, so a test simulates the whole exchange
 without a device, and the kernels only turn relative addresses into peers
 with one XOR of the shard index.
-
-Hypercube and peer-to-peer remote DMA token exchange primitives across EP ranks.
 """
 
 import math
