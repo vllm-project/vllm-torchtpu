@@ -514,6 +514,8 @@ def calculate_block_sizes(
         "fast_kv_fetch",
         "kv_slot",
         "compact_kv_schedule",
+        "kv_skip_group",
+        "schedule_in_hbm",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -561,6 +563,8 @@ def ragged_paged_attention(
     fast_kv_fetch: bool = False,
     kv_slot: int | None = None,
     compact_kv_schedule: bool = False,
+    kv_skip_group: int = 0,
+    schedule_in_hbm: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -634,6 +638,14 @@ def ragged_paged_attention(
         compact_kv_schedule: Keep one KV-cache schedule entry per lane-tile
             (read-only HEAD_ALONG_SUBLANE only); admits larger decode KV
             blocks within the SMEM schedule budget. Defaults to False.
+        kv_skip_group: With compact_kv_schedule, issue each lane-tile's page
+            DMAs in groups of this many pages and skip the groups past the
+            tile's tokens (no zero-size DMAs). Same DMAs with data and the same
+            results. 0 (default) issues every page slot.
+        schedule_in_hbm: The schedule kernel's array outputs are typed HBM,
+            so XLA keeps them where the attention kernel reads them instead of
+            placing them in VMEM and copying each one to HBM. Same schedule.
+            Defaults to False.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -723,7 +735,10 @@ def ragged_paged_attention(
         fast_kv_fetch=fast_kv_fetch,
         kv_slot=kv_slot,
         compact_kv_schedule=compact_kv_schedule,
+        kv_skip_group=kv_skip_group,
     )
+    if kv_skip_group and not compact_kv_schedule:
+        raise ValueError("kv_skip_group needs compact_kv_schedule")
     if compact_kv_schedule and not (
         kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE and skip_kv_update
     ):
@@ -849,13 +864,15 @@ def ragged_paged_attention(
             kv_cache_lens,
             kv_new_lens,
             distribution,
-            # The slot only changes which pair the kernel unpacks; one schedule
-            # serves both layers of a paired page.
+            # The slot only changes which pair the kernel unpacks and the skip
+            # group only how the fetch issues; one schedule serves them all.
             cfgs=dataclasses.replace(
-                cfgs, serve=dataclasses.replace(cfgs.serve, kv_slot=None)
+                cfgs,
+                serve=dataclasses.replace(cfgs.serve, kv_slot=None, kv_skip_group=0),
             ),
             computer_cls=computer_cls,
             extra_scalars=extra_scalars,
+            hbm_outputs=schedule_in_hbm,
         )
         result = kernel.rpa_kernel(
             cu_q_lens,

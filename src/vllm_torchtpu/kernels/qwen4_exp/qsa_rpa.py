@@ -106,6 +106,24 @@ def _log_partition_once(batch, budget):
         )
 
 
+_FLAGS_LOGGED = False
+
+
+def _log_rpa_flags_once(skip_empty, rows, bkv_size):
+    """Trace-time proof (once per process, outside Dynamo) that the decode
+    RPA call carries VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY / VLLM_TPU_RPA_SCHEDULE_HBM."""
+    global _FLAGS_LOGGED
+    if not _FLAGS_LOGGED:
+        _FLAGS_LOGGED = True
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).warning(
+            "QSA decode RPA flags active: SKIP_EMPTY=%d SCHEDULE_HBM=%d "
+            "(first traced call: %d rows, %d-key tiles)",
+            skip_empty, int(envs.VLLM_TPU_RPA_SCHEDULE_HBM), rows, bkv_size,
+        )
+
+
 def _owned_first(blocks, owned):
     """Each row's owned entries at the front in their input order (a stable
     partition), the other columns ``int32 max``. Equal to sorting
@@ -203,6 +221,7 @@ def _rpa_attention_batch(
     slot_read=False,
     compact=False,
     fast_fetch=False,
+    skip_empty=0,
     dcp=None,
     return_lse=False,
     ascending=False,
@@ -250,6 +269,8 @@ def _rpa_attention_batch(
         bq_sz=1, bq_c_sz=1, bkv_sz=bkv_size, batch_size=batch_size
     )
     prefill = configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=bkv_size, batch_size=1)
+    if (compact and skip_empty) or envs.VLLM_TPU_RPA_SCHEDULE_HBM:
+        _log_rpa_flags_once(skip_empty if compact else 0, len(q), bkv_size)
     result = wrapper.ragged_paged_attention(
         query,
         dummy_k,
@@ -274,6 +295,10 @@ def _rpa_attention_batch(
         fast_kv_fetch=fast_fetch,
         kv_slot=kv_slot,
         compact_kv_schedule=compact,
+        # VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY / VLLM_TPU_RPA_SCHEDULE_HBM: same
+        # results; passed only when set so the default call is unchanged.
+        **({"kv_skip_group": skip_empty} if compact and skip_empty else {}),
+        **({"schedule_in_hbm": True} if envs.VLLM_TPU_RPA_SCHEDULE_HBM else {}),
         **({"return_lse": True} if return_lse else {}),
     )
     out, next_cache = result[0], result[1]
@@ -369,6 +394,11 @@ def rpa_attention(
                 compact=True,
                 bkv_size=bkv_size,
                 batch_size=lanes,
+                **(
+                    {"skip_empty": envs.VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY}
+                    if envs.VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY
+                    else {}
+                ),
             )
             if compact
             else {}

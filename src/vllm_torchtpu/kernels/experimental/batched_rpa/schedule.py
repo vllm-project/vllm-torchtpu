@@ -889,19 +889,33 @@ def generate_rpa_metadata(
     computer_cls: type[BaseMetadataComputer] = BaseMetadataComputer,
     extra_scalars: Sequence[jax.Array] = (),
     interpret=False,
+    hbm_outputs: bool = False,
 ) -> RpaSchedule:
-    """Generates RPA metadata schedule using the specified computer_cls."""
+    """Generates RPA metadata schedule using the specified computer_cls.
+
+    ``hbm_outputs`` types the array outputs as HBM. ``out_specs``' memory space
+    only shapes the kernel's view of an output; where XLA allocates the buffer
+    follows the out_shape aval, and an untyped one may land in VMEM, from which
+    XLA copies it to HBM for the RPA kernel. ``actual_steps`` stays untyped:
+    the RPA kernel reads it through SMEM.
+    """
     schedule_shaped_dtype = computer_cls.get_rpa_schedule(cfgs)
     schedule_hbm = computer_cls.get_rpa_schedule(
         cfgs, multiplier=cfgs.max_schedule_size_multiplier
     )
+    out_shape = schedule_hbm
+    if hbm_outputs:
+        out_shape = jax.tree.map(
+            lambda x: pltpu.HBM(x.shape, x.dtype) if np.prod(x.shape) > 1 else x,
+            schedule_hbm,
+        )
     return pl.pallas_call(
         functools.partial(
             rpa_metadata_schedule_kernel,
             cfgs=cfgs,
             computer_cls=computer_cls,
         ),
-        out_shape=schedule_hbm,
+        out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=6,
             in_specs=[],

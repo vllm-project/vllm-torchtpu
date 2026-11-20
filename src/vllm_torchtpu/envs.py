@@ -222,6 +222,10 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS: int = 0
     VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP: bool = False
     VLLM_TPU_QSA_INDEXER_TOKEN_SHARD: bool = False
+    VLLM_TPU_RPA_SCHEDULE_HBM: bool = False
+    VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY: int = 0
+    VLLM_TPU_QSA_INDEXER_DENSE_STEP: bool = False
+    VLLM_TPU_QSA_INDEXER_TAIL_SKIP: int = 0
     VLLM_TPU_QSA_DECODE_TOKEN_SHARD: bool = False
     VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD: bool = False
     VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD_MIN_TOKENS: int = 256
@@ -1420,6 +1424,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # precedence over VLLM_TPU_QSA_INDEXER_SHARD in that graph.
     "VLLM_TPU_QSA_INDEXER_TOKEN_SHARD": env_bool(
         "VLLM_TPU_QSA_INDEXER_TOKEN_SHARD", default=False
+    ),
+    # Batched RPA (QSA decode): type the schedule kernel's array outputs as
+    # HBM, where the attention kernel reads them. Untyped, XLA may place them
+    # in VMEM and copy each one to HBM before every attention call. Same
+    # schedule, same results.
+    "VLLM_TPU_RPA_SCHEDULE_HBM": env_bool("VLLM_TPU_RPA_SCHEDULE_HBM"),
+    # Qwen4-exp QSA decode RPA with VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE: issue a
+    # lane-tile's page DMAs in groups of this many pages and skip the groups
+    # past the tile's last page (they would only issue zero-size DMAs). Same
+    # DMAs with data, same results. 0 (default) issues every page slot.
+    "VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY": env_nonnegative_int(
+        "VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY", 0
+    ),
+    # Qwen4-exp shared-stream decode indexer (VLLM_TPU_QSA_DECODE_QUERY_BLOCK):
+    # score a per-token block from a head-major q block on whole vregs, with
+    # strided loads of the key block and of the head sums, and take the page
+    # ids of a KV block from its first table row without per-page carries or
+    # end clamps. Same scores, bit for bit, as the per-token expression.
+    "VLLM_TPU_QSA_INDEXER_DENSE_STEP": env_bool(
+        "VLLM_TPU_QSA_INDEXER_DENSE_STEP", default=False
+    ),
+    # Qwen4-exp shared-stream decode indexer: a KV block's page DMAs stop at
+    # the last group of this many kernel pages that holds keys of its sequence
+    # (0: whole blocks). The skipped keys are masked; vLLM's null-block tail
+    # entries otherwise make every rank read pool page 0.
+    "VLLM_TPU_QSA_INDEXER_TAIL_SKIP": env_nonnegative_int(
+        "VLLM_TPU_QSA_INDEXER_TAIL_SKIP", 0
     ),
     # Qwen4-exp pooled QSA with VLLM_TPU_QSA_COMPRESSED_DCP, the replicated
     # (non-SP) backbone, i.e. decode / verify and the small prefill buckets:

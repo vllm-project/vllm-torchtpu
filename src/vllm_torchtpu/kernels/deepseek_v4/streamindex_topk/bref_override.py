@@ -14,12 +14,15 @@
 """Custom BufferedRef overrides for StreamIndex Top-K kernel."""
 
 import dataclasses
+import functools
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import metadata
 
 
 def _step_offset(meta_ref: Any, chunk_idx: int):
@@ -71,6 +74,18 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
     coalesce_entries: bool = dataclasses.field(
         default=False, metadata=dict(static=True)
     )
+    # Page ids from the block's first table row with the static offset, no
+    # per-page carry or end clamp (see `copy_in`).
+    lean_addresses: bool = dataclasses.field(
+        default=False, metadata=dict(static=True)
+    )
+    # (group pages, keys per page, block keys, compression shift, cp_size,
+    # interleave_c): copy only the groups of `group pages` kernel pages that
+    # hold keys of the step's sequence; the source tuple then also carries
+    # seq_lens_ref and cp_rank_ref. None copies whole blocks.
+    tail_skip: tuple[int, int, int, int, int, int] | None = dataclasses.field(
+        default=None, metadata=dict(static=True)
+    )
 
     @classmethod
     def create(  # pytype: disable=signature-mismatch
@@ -89,6 +104,8 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         chunk_idx: int = 0,
         table_expansion: tuple[int, int, int] = (1, 1, 0),
         coalesce_entries: bool = False,
+        lean_addresses: bool = False,
+        tail_skip: tuple[int, int, int, int, int, int] | None = None,
     ):
         assert buffer_type == pltpu.BufferType.INPUT
         standard_ref = pltpu.BufferedRef.create(
@@ -108,6 +125,8 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             chunk_idx=chunk_idx,
             table_expansion=table_expansion,
             coalesce_entries=coalesce_entries,
+            lean_addresses=lean_addresses,
+            tail_skip=tail_skip,
             **{
                 f.name: getattr(standard_ref, f.name)
                 for f in dataclasses.fields(pltpu.BufferedRef)
@@ -130,6 +149,8 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         chunk_idx: int = 0,
         table_expansion: tuple[int, int, int] = (1, 1, 0),
         coalesce_entries: bool = False,
+        lean_addresses: bool = False,
+        tail_skip: tuple[int, int, int, int, int, int] | None = None,
         **kwargs: Any,
     ):
         return cls.create(
@@ -147,6 +168,8 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             chunk_idx=chunk_idx,
             table_expansion=table_expansion,
             coalesce_entries=coalesce_entries,
+            lean_addresses=lean_addresses,
+            tail_skip=tail_skip,
         )
 
     def page_id(self, page_indices_ref: jax.Ref, seq: Any, start: Any, i: int) -> Any:
@@ -178,12 +201,41 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         run = jnp.where(over, expansion - 1, run)
         return page_indices_ref[entry] * stride + offset + run
 
+    def _num_groups(self):
+        return -(-self.bkv_p // self.tail_skip[0])
+
+    def _groups_with_keys(self, src_ref: Any, p_id: Any) -> Any:
+        """Page groups of step `p_id`'s block that hold keys of its sequence,
+        at least one."""
+        _, _, meta_ref, seq_lens_ref, cp_rank_ref = src_ref
+        group, keys_per_page, bkv_sz, shift, cp_size, interleave_c = self.tail_skip
+        kv = seq_lens_ref[meta_ref.batch_tile_idx[p_id]] >> shift
+        local = metadata.cp_local_length(kv, cp_rank_ref[0], cp_size, interleave_c)
+        rem = local - meta_ref.bkv_idx[p_id] * bkv_sz
+        group_keys = group * keys_per_page
+        return jnp.clip((rem + group_keys - 1) // group_keys, 1, self._num_groups())
+
+    def _for_groups(self, src_ref: Any, p_id: Any, body: Any) -> None:
+        """body(first page, pages) for each page group with keys of the step's
+        sequence; one call over the whole block without tail_skip."""
+        if self.tail_skip is None:
+            body(0, self.bkv_p)
+            return
+        group = self.tail_skip[0]
+        count = self._groups_with_keys(src_ref, p_id)
+        for g in range(self._num_groups()):
+            run = functools.partial(body, g * group, min(group, self.bkv_p - g * group))
+            if g == 0:
+                run()
+            else:
+                pl.when(g < count)(run)
+
     def copy_in(  # pytype: disable=attribute-error
         self,
         src_ref: tuple[jax.Ref, jax.Ref, Any],
         grid_indices: tuple[int | jax.Array, ...],
     ):
-        cache_kv_hbm, page_indices_ref, meta_ref = src_ref
+        cache_kv_hbm, page_indices_ref, meta_ref = src_ref[:3]
         p_id = grid_indices[0] + _step_offset(meta_ref, self.chunk_idx)
         batch_tile_idx = meta_ref.batch_tile_idx[p_id]
         bkv_idx = meta_ref.bkv_idx[p_id]
@@ -203,6 +255,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             )
         )
         max_hbm_pages = reshaped_cache_hbm_ref.shape[0]
+        num_page_indices = page_indices_ref.shape[0]
         effective_seq_idx = batch_tile_idx
 
         expansion = self.table_expansion[0]
@@ -213,51 +266,95 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             # descriptors). Clamped tails read in-bounds pages past the
             # sequence, which the scores mask like any other.
             run = expansion * self.page_size_per_kv_packing
+            _, stride, page_offset = self.table_expansion
             for batch_idx in range(self.seq_batch_size):
                 kv_p_start = bkv_idx * self.bkv_p
-                for e in range(self.bkv_p // expansion):
-                    page = self.page_id(
-                        page_indices_ref,
-                        effective_seq_idx + batch_idx,
-                        kv_p_start,
-                        e * expansion,
-                    )
-                    offset = jnp.minimum(
+                # Sequences and blocks start on whole entries (pages_per_seq
+                # and bkv_p are multiples of the expansion), so entry e of the
+                # block is its first entry plus e. An entry past the table
+                # clamps to the last one: its keys lie past the sequence and
+                # are masked, whatever page they come from.
+                first = (
+                    (effective_seq_idx + batch_idx) * (self.pages_per_seq // expansion)
+                    + bkv_idx * (self.bkv_p // expansion)
+                    if self.lean_addresses
+                    else None
+                )
+
+                def entries(first_page, pages, batch_idx=batch_idx,
+                            kv_p_start=kv_p_start, first=first):
+                    for e in range(first_page // expansion,
+                                   (first_page + pages) // expansion):
+                        if self.lean_addresses:
+                            entry = jnp.minimum(first + e, num_page_indices - 1)
+                            page = page_indices_ref[entry] * stride + page_offset
+                        else:
+                            page = self.page_id(
+                                page_indices_ref,
+                                effective_seq_idx + batch_idx,
+                                kv_p_start,
+                                e * expansion,
+                            )
+                        offset = jnp.minimum(
+                            page * self.page_size_per_kv_packing,
+                            jnp.maximum(0, max_hbm_pages - run),
+                        )
+                        pltpu.make_async_copy(
+                            reshaped_cache_hbm_ref.at[pl.ds(offset, run)],
+                            vmem_dst.at[  # pytype: disable=attribute-error
+                                batch_idx, pl.ds(e * run, run)
+                            ],
+                            sem,
+                        ).start()
+
+                self._for_groups(src_ref, p_id, entries)
+            return
+
+        # With whole blocks per sequence row (pages_per_seq a multiple of
+        # bkv_p) a block's pages never leave its row, so the end clamp of
+        # `page_id` is dropped.
+        lean = (
+            self.lean_addresses
+            and expansion == 1
+            and self.pages_per_seq % self.bkv_p == 0
+        )
+        for batch_idx in range(self.seq_batch_size):
+            kv_p_start = bkv_idx * self.bkv_p
+            row = (
+                (effective_seq_idx + batch_idx) * self.pages_per_seq + kv_p_start
+                if lean
+                else None
+            )
+
+            def pages_of(first_page, pages, batch_idx=batch_idx,
+                         kv_p_start=kv_p_start, row=row):
+                for i in range(first_page, first_page + pages):
+                    if lean:
+                        page = page_indices_ref[row + i]
+                    else:
+                        page = self.page_id(
+                            page_indices_ref, effective_seq_idx + batch_idx,
+                            kv_p_start, i,
+                        )
+                    safe_page_offset = jnp.minimum(
                         page * self.page_size_per_kv_packing,
-                        jnp.maximum(0, max_hbm_pages - run),
+                        jnp.maximum(0, max_hbm_pages - self.page_size_per_kv_packing),
                     )
                     pltpu.make_async_copy(
-                        reshaped_cache_hbm_ref.at[pl.ds(offset, run)],
+                        reshaped_cache_hbm_ref.at[
+                            pl.ds(safe_page_offset, self.page_size_per_kv_packing)
+                        ],
                         vmem_dst.at[  # pytype: disable=attribute-error
-                            batch_idx, pl.ds(e * run, run)
+                            batch_idx,
+                            pl.ds(
+                                i * self.page_size_per_kv_packing,
+                                self.page_size_per_kv_packing,
+                            ),
                         ],
                         sem,
                     ).start()
-            return
 
-        for batch_idx in range(self.seq_batch_size):
-            kv_p_start = bkv_idx * self.bkv_p
-            for i in range(self.bkv_p):
-                page = self.page_id(
-                    page_indices_ref, effective_seq_idx + batch_idx, kv_p_start, i
-                )
-                safe_page_offset = jnp.minimum(
-                    page * self.page_size_per_kv_packing,
-                    jnp.maximum(0, max_hbm_pages - self.page_size_per_kv_packing),
-                )
-                pltpu.make_async_copy(
-                    reshaped_cache_hbm_ref.at[
-                        pl.ds(safe_page_offset, self.page_size_per_kv_packing)
-                    ],
-                    vmem_dst.at[  # pytype: disable=attribute-error
-                        batch_idx,
-                        pl.ds(
-                            i * self.page_size_per_kv_packing,
-                            self.page_size_per_kv_packing,
-                        ),
-                    ],
-                    sem,
-                ).start()
+            self._for_groups(src_ref, p_id, pages_of)
 
     def wait_in(
         self,
@@ -272,11 +369,22 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
         vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
-        pltpu.make_async_copy(
-            vmem_dst,
-            vmem_dst,
-            sem,
-        ).wait()
+        if self.tail_skip is None:
+            pltpu.make_async_copy(
+                vmem_dst,
+                vmem_dst,
+                sem,
+            ).wait()
+            return
+        # The bytes of the groups copy_in issued for this step, group by group.
+        p_id = grid_indices[0] + _step_offset(src_ref[2], self.chunk_idx)
+        ps = self.page_size_per_kv_packing
+
+        def wait_group(first_page, pages):
+            rows = vmem_dst.at[:, pl.ds(first_page * ps, pages * ps)]
+            pltpu.make_async_copy(rows, rows, sem).wait()
+
+        self._for_groups(src_ref, p_id, wait_group)
 
 
 @jax.tree_util.register_dataclass

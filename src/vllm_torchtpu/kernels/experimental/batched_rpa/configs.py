@@ -188,6 +188,10 @@ class ServingConfigs:
     # the fetch derives each page's size. Shrinks the SMEM schedule by the
     # pages per KV block, which admits larger KV blocks.
     compact_kv_schedule: bool = False
+    # With compact_kv_schedule: issue a lane-tile's page DMAs in groups of this
+    # many pages, each group only when the tile has a token in it, so the pages
+    # past the tile's last one cost no zero-size DMAs. 0 issues every slot.
+    kv_skip_group: int = 0
 
     @property
     def max_decode_bkv_p_new(self) -> int:
