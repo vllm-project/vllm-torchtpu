@@ -315,7 +315,8 @@ class DSparkDeepseekV41Model(nn.Module):
         hidden_states = post(hidden_states, residual, post_mix, res_mix)
         assert pre_mix is not None
         if (
-            hidden_states.shape[1] == 4
+            hidden_states.device.type == "tpu"
+            and hidden_states.shape[1] == 4
             and hidden_states.dtype == torch.bfloat16
             and pre_mix.dtype == torch.float32
         ):

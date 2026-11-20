@@ -548,9 +548,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_DEEPSEEK_V41_MHC_EARLY_PREP", default=True
     ),
     # Shifted mHC: compute the next layer's gates inside the seam kernel (no
-    # second gate kernel) and pass them between layers through HBM, so no gate
-    # tensor is copied out of and back into VMEM around the layer between two
-    # seams. Takes precedence over RESIDENT_GATES. Outputs are unchanged.
+    # second gate kernel); the next seam reads them from HBM, so they are not
+    # copied back into VMEM ahead of it. Takes precedence over RESIDENT_GATES.
+    # Outputs are unchanged.
     "TPU_DEEPSEEK_V41_MHC_FUSED_GATES": env_bool(
         "TPU_DEEPSEEK_V41_MHC_FUSED_GATES", default=True
     ),
