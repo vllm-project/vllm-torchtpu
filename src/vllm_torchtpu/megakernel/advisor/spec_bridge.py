@@ -19,6 +19,7 @@ import ast
 import dataclasses
 import pkgutil
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 try:
@@ -27,6 +28,8 @@ try:
     from ..core import exec_spec, planner
     from ..core import modules as core_modules
     from ..core import profile as core_profile
+    from ..core import spec as core_spec
+    from ..core.collectives import params as collectives_params
     from ..core.profiles import default as default_profiles
     from ..core.runtime import policy as runtime_policy
 except (ImportError, RuntimeError):
@@ -34,6 +37,8 @@ except (ImportError, RuntimeError):
     exec_spec = None
     planner = None
     core_profile = None
+    core_spec = None
+    collectives_params = None
     default_profiles = None
     runtime_policy = None
     core_modules = None
@@ -41,7 +46,7 @@ except (ImportError, RuntimeError):
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from ..core.exec_spec import ExecSpec
+    from ..core.exec_spec import ExecSpec, Tiles
     from ..core.spec import ModelSpec
     from .chips import ChipSpec
 
@@ -75,11 +80,105 @@ def _read_numerics_grid_r(profile_file: str | None) -> tuple[int, ...]:
     return ()
 
 
+def _make_ar_probe_spec(num_slots: int, probe_hidden: int) -> ModelSpec:
+    """Build a minimal synthetic ModelSpec with `num_slots` all-reduce slots."""
+    if core_spec is None:
+        msg = "Megakernel core package requires JAX to verify CORE_LIMITS sync."
+        raise MegakernelPlannerUnavailableError(msg)
+    slots = []
+    for slot_idx in range(num_slots):
+        probe_module = core_spec.Module()
+        probe_module.name = f"_advisor_ar_probe_{slot_idx}"
+        probe_module.reduction = "allreduce"
+        slots.append(probe_module)
+    return core_spec.ModelSpec(
+        name="_advisor_ar_slot_probe",
+        config=SimpleNamespace(L=1, H=probe_hidden),
+        layer_type=core_spec.LayerType(
+            name="_advisor_ar_slot_layer",
+            slots=tuple(slots),
+        ),
+    )
+
+
+def _probe_max_ar_slots_planner(
+    limit: int,
+    probe_exec_spec: ExecSpec,
+    probe_hidden: int,
+) -> list[str]:
+    """Verify core planner accepts `limit` AR slots and rejects `limit + 1`."""
+    if planner is None:
+        msg = "Megakernel core package requires JAX to verify CORE_LIMITS sync."
+        raise MegakernelPlannerUnavailableError(msg)
+    mismatches: list[str] = []
+    try:
+        plan_ok = planner.plan(
+            _make_ar_probe_spec(limit, probe_hidden), probe_exec_spec
+        )
+    except MegakernelConfigError as exc:
+        mismatches.append(
+            f"max_ar_slots_per_layer: core planner rejected {limit} AR slots ({exc})"
+        )
+    else:
+        planned_slots = sum(x is not None for x in plan_ok.slot_ar_index)
+        if planned_slots != limit:
+            mismatches.append(
+                f"max_ar_slots_per_layer: advisor={limit!r} != "
+                f"planned_ar_slots={planned_slots!r}"
+            )
+    try:
+        planner.plan(_make_ar_probe_spec(limit + 1, probe_hidden), probe_exec_spec)
+    except MegakernelConfigError:
+        pass
+    else:
+        mismatches.append(
+            f"max_ar_slots_per_layer: core planner accepted {limit + 1} AR slots "
+            f"(exceeds advisor={limit!r})"
+        )
+    return mismatches
+
+
+def _verify_max_ar_slots_sync(tiles: Tiles) -> list[str]:
+    """Verify CORE_LIMITS.max_ar_slots_per_layer against scratch and planner."""
+    if (
+        exec_spec is None
+        or planner is None
+        or core_spec is None
+        or collectives_params is None
+    ):
+        msg = "Megakernel core package requires JAX to verify CORE_LIMITS sync."
+        raise MegakernelPlannerUnavailableError(msg)
+    limit = CORE_LIMITS.max_ar_slots_per_layer
+    if limit < 1:
+        return [f"max_ar_slots_per_layer: advisor={limit!r} must be >= 1"]
+    mismatches: list[str] = []
+    # Minimum 128-lane native vector-width multiple for col_chunk/k_tile.
+    probe_hidden = 128
+    # B=4 single-token decode across R=8 (smallest hierarchical collective rank
+    # in core/collectives/params.py and CORE_LIMITS.verified_ranks).
+    probe_exec_spec = exec_spec.ExecSpec(B=4, T=1, R=8)
+    ring_scratch = collectives_params.ring_scratch(
+        collectives_params.comm_params(probe_exec_spec, tiles, H=probe_hidden)
+    )
+    for sem_key in ("ar_ssem", "ar_rsem"):
+        sem_slots = int(ring_scratch[sem_key].shape[1])
+        if sem_slots != limit:
+            mismatches.append(
+                f"max_ar_slots_per_layer: advisor={limit!r} != "
+                f"core {sem_key}.shape[1]={sem_slots!r}"
+            )
+    mismatches.extend(_probe_max_ar_slots_planner(limit, probe_exec_spec, probe_hidden))
+    return mismatches
+
+
 def verify_core_limits_sync() -> list[str]:
     """Compare advisor CORE_LIMITS against live `megakernel/core` definitions."""
     if (
         exec_spec is None
+        or planner is None
         or core_profile is None
+        or core_spec is None
+        or collectives_params is None
         or default_profiles is None
         or runtime_policy is None
         or core_modules is None
@@ -145,6 +244,7 @@ def verify_core_limits_sync() -> list[str]:
             f"advisor top {advisor_top} > core MAX_BUCKET_ROWS "
             f"{runtime_policy.MAX_BUCKET_ROWS}"
         )
+    mismatches.extend(_verify_max_ar_slots_sync(tiles))
     return mismatches
 
 

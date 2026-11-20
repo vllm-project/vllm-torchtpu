@@ -33,6 +33,9 @@ SUPPORTED_CHIPS: frozenset[str] = frozenset({"tpu7x", "v6e"})
 DEFAULT_ROW_LIMIT: int = 80
 HBM_UTILIZATION_CAP: float = 0.95
 DEFAULT_COLLECTIVE_LATENCY_US_BRACKET: tuple[float, float] = (1.0, 5.0)
+# Absorbs IEEE-754 float64 1-ULP reassociation noise (~3.6e-12 us at ~2e4 us)
+# while staying 1e4x below the 0.01 us display rounding quantum.
+FLOOR_TIE_EPSILON_US: float = 1e-6
 
 ADVISOR_DIR = Path(__file__).resolve().parent
 CALIBRATION_DIR = ADVISOR_DIR / "data" / "calibration"
@@ -381,10 +384,18 @@ PER_OP_STEP_SETTLE_CMD = (
 DECODING_SEQS_SETTLE_CMD = (
     "Pass --decoding-seqs <N> or --output-tok-s <rate> --mean-tpot-ms <ms>"
 )
+BOUNDARY_SYNC_SETTLE_CMD = (
+    "Run an A/B step trace comparing per_op vs fused boundary fill/drain"
+)
+PER_OP_COLLECTIVE_FACTOR_SETTLE_CMD = (
+    "Run an A/B step trace comparing per_op vs fused all-reduce latency"
+)
 CORNER_AXES: Mapping[str, int] = {
     "launch_gap_us": 0,
     "collective_latency_us": 1,
     "prefill_attn_dot_dtype": 2,
+    "boundary_sync_hop_factor": 3,
+    "per_op_collective_call_factor": 4,
 }
 
 DEFAULT_CHIP = "tpu7x"

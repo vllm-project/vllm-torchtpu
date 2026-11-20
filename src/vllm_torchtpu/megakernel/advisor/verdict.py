@@ -24,17 +24,20 @@ from .chips import ChipSpec, resolve_chip_spec
 from .constants import (
     AB_KNOB,
     BOUNDARY_SYNC_HOP_FACTOR,
+    BOUNDARY_SYNC_SETTLE_CMD,
     CORE_LIMITS,
     CORNER_AXES,
     DECODING_SEQS_SETTLE_CMD,
     DOT_BF16,
     DOT_FP8,
     EQUAL_SPLIT_GROUP_COUNTS,
+    FLOOR_TIE_EPSILON_US,
     GAIN_BASIS_E2E,
     GAIN_BASIS_ESTIMATE,
     HOST_HEAD_SETTLE_CMD,
     LAYER_GROUP_PRICING_NOTE,
     PER_OP_COLLECTIVE_CALL_FACTOR,
+    PER_OP_COLLECTIVE_FACTOR_SETTLE_CMD,
     PER_OP_STEP_SETTLE_CMD,
     SETTLE_CMD,
 )
@@ -73,7 +76,7 @@ if TYPE_CHECKING:
 
     from .roofline import _ScopeContext
 
-Corner = tuple[float, float, str]
+Corner = tuple[float, float, str, str, str]
 
 
 @dataclass(frozen=True)
@@ -141,38 +144,53 @@ def _evaluate_corners(
 ) -> dict[Corner, dict[FusionScope, float]]:
     """Step time of every feasible scope at every corner of the assumed box.
 
-    Every scope at a corner sees the same launch gap, collective latency, and
-    attention dtype. Collective latency moves only the all-reduce and cross-DP
-    MoE hop term, as in `step_upper_us`, so the all-low corner equals
-    `step_bound_us` and the all-high corner equals `step_upper_us`.
+    Every scope at a corner sees the same launch gap, collective latency,
+    attention dtype, boundary fill/drain end, and per-op collective call-factor
+    end. Collective latency moves only the
+    all-reduce and cross-DP MoE hop term, as in `step_upper_us`, so the
+    all-low corner equals `step_bound_us` and the all-high corner equals
+    `step_upper_us`.
     """
     table: dict[Corner, dict[FusionScope, float]] = {}
     for lg in dict.fromkeys(box.launch_gap_us):
         for coll in dict.fromkeys(box.collective_s):
             for dot in box.attn_dots:
-                est, _ = _evaluate_scopes(
-                    replace(
-                        scope_context,
-                        lat_coll_upper=coll,
-                        launch_gap_upper_us=lg,
-                    ),
-                    profile,
-                    replace(workload, op_overhead_us=lg),
-                    bf16_attention_upper=dot == DOT_BF16,
-                )
-                table[(lg, round(coll * 1e6, 3), dot)] = {
-                    e.scope: e.step_upper_us for e in est if e.feasible
-                }
+                for boundary_end in ("low", "high"):
+                    for coll_factor_end in ("low", "high"):
+                        est, _ = _evaluate_scopes(
+                            replace(
+                                scope_context,
+                                lat_coll_upper=coll,
+                                launch_gap_upper_us=lg,
+                            ),
+                            profile,
+                            replace(workload, op_overhead_us=lg),
+                            bf16_attention_upper=dot == DOT_BF16,
+                            upper_priors=(
+                                boundary_end == "high",
+                                coll_factor_end == "high",
+                            ),
+                        )
+                        table[
+                            (
+                                lg,
+                                round(coll * 1e6, 3),
+                                dot,
+                                boundary_end,
+                                coll_factor_end,
+                            )
+                        ] = {e.scope: e.step_upper_us for e in est if e.feasible}
     return table
 
 
 def _corner_winners(
     corners: Mapping[Corner, Mapping[FusionScope, float]],
     ops: Mapping[FusionScope, int],
+    upper_by_scope: Mapping[FusionScope, float],
 ) -> dict[Corner, FusionScope]:
-    """Fastest scope at each corner; fewer launches break exact ties."""
+    """Fastest scope at each corner; peak upper then fewer launches break ties."""
     return {
-        c: min(steps, key=lambda s: (steps[s], ops[s]))
+        c: min(steps, key=lambda s: (steps[s], upper_by_scope[s], ops[s]))
         for c, steps in corners.items()
         if steps
     }
@@ -190,7 +208,7 @@ def _margin_swing(
     swing = 0.0
     for c_a, steps_a in corners.items():
         for c_b, steps_b in corners.items():
-            moved_only_axis = all(c_a[k] == c_b[k] for k in range(3) if k != idx)
+            moved_only_axis = all(c_a[k] == c_b[k] for k in range(len(c_a)) if k != idx)
             if c_a == c_b or not moved_only_axis:
                 continue
             if pair <= steps_a.keys() and pair <= steps_b.keys():
@@ -312,29 +330,6 @@ def _append_gain_assumptions(
         }
         for eta_name in eta_fields
     )
-    if scope_context.eff_tp > 1 and not ctx.collectives_measured:
-        unresolved.append(
-            {
-                "name": "per_op_collective_call_factor",
-                "value": float(PER_OP_COLLECTIVE_CALL_FACTOR),
-                "band": [1.0, float(PER_OP_COLLECTIVE_CALL_FACTOR)],
-                "unit": "x",
-                "sensitivity_us": 0.0,
-                "affects": "gain",
-                "how_to_settle": SETTLE_CMD,
-            }
-        )
-    unresolved.append(
-        {
-            "name": "boundary_sync_hop_factor",
-            "value": float(BOUNDARY_SYNC_HOP_FACTOR),
-            "band": [0.0, float(BOUNDARY_SYNC_HOP_FACTOR)],
-            "unit": "hops",
-            "sensitivity_us": 0.0,
-            "affects": "gain",
-            "how_to_settle": SETTLE_CMD,
-        }
-    )
 
 
 def _append_support_and_config_assumptions(
@@ -416,8 +411,10 @@ def _collect_unresolved_assumptions(
 ) -> list[dict[str, object]]:
     """Collect and sort unresolved ASSUMED inputs by step-time sensitivity.
 
-    `CORNER_AXES` (`launch_gap_us`, `collective_latency_us`, and
-    `prefill_attn_dot_dtype`) remain the sole entries with `affects == 'scope'`.
+    `CORNER_AXES` (`launch_gap_us`, `collective_latency_us`,
+    `prefill_attn_dot_dtype`, `boundary_sync_hop_factor`, and
+    `per_op_collective_call_factor`) remain the sole entries with
+    `affects == 'scope'`.
     """
     corners, best_scope, challenger = contest
     workload = ctx.workload
@@ -486,6 +483,29 @@ def _collect_unresolved_assumptions(
                 ),
                 "affects": "scope",
                 "how_to_settle": "Inspect compiler profile HLO attention dot precision",
+            }
+        )
+    unresolved.append(
+        {
+            "name": "boundary_sync_hop_factor",
+            "value": float(BOUNDARY_SYNC_HOP_FACTOR),
+            "band": [0.0, float(BOUNDARY_SYNC_HOP_FACTOR)],
+            "unit": "hops",
+            "sensitivity_us": scope_sens("boundary_sync_hop_factor", 0.0),
+            "affects": "scope",
+            "how_to_settle": BOUNDARY_SYNC_SETTLE_CMD,
+        }
+    )
+    if scope_context.eff_tp > 1:
+        unresolved.append(
+            {
+                "name": "per_op_collective_call_factor",
+                "value": float(PER_OP_COLLECTIVE_CALL_FACTOR),
+                "band": [1.0, float(PER_OP_COLLECTIVE_CALL_FACTOR)],
+                "unit": "x",
+                "sensitivity_us": scope_sens("per_op_collective_call_factor", 0.0),
+                "affects": "scope",
+                "how_to_settle": PER_OP_COLLECTIVE_FACTOR_SETTLE_CMD,
             }
         )
     _append_gain_assumptions(unresolved, ctx)
@@ -728,12 +748,16 @@ def _resolve_flags_and_verdict(
     ]
     feasible_others = [e for e in estimates if e.feasible and e.scope != best.scope]
     runner_up = (
-        min(feasible_others, key=lambda e: (e.step_bound_us, e.ops_per_step))
+        min(
+            feasible_others,
+            key=lambda e: (e.step_bound_us, e.step_upper_us, e.ops_per_step),
+        )
         if feasible_others
         else None
     )
     ops = {e.scope: e.ops_per_step for e in estimates}
-    winners = _corner_winners(corners, ops) if hbm_fits else {}
+    upper_by_scope = {e.scope: e.step_upper_us for e in estimates}
+    winners = _corner_winners(corners, ops, upper_by_scope) if hbm_fits else {}
     flip = next(((c, w) for c, w in winners.items() if w != best.scope), None)
     challenger = flip[1] if flip else (runner_up.scope if runner_up else None)
     unresolved = _collect_unresolved_assumptions(
@@ -1236,7 +1260,10 @@ def _format_advise_reason(
     others = [e for e in estimates if e.feasible and e.scope != best.scope]
     text = f"{best.scope} ({best.step_bound_us:.1f} us)"
     if others:
-        ru = min(others, key=lambda e: (e.step_bound_us, e.ops_per_step))
+        ru = min(
+            others,
+            key=lambda e: (e.step_bound_us, e.step_upper_us, e.ops_per_step),
+        )
         delta = ru.step_bound_us - best.step_bound_us
         pct = 100.0 * delta / max(1e-9, best.step_bound_us)
         text += (
@@ -1263,10 +1290,11 @@ def _flip_note(flip: tuple[Corner, FusionScope] | None) -> str:
     """Name the scope that wins at the corner where the verdict flips."""
     if flip is None:
         return ""
-    (lg, coll, dot), alt = flip
+    (lg, coll, dot, boundary_end, coll_factor_end), alt = flip
     return (
         f"; {alt} wins at launch gap {lg:.1f} us, collective "
-        f"{coll:.2f} us/hop, {dot} attention"
+        f"{coll:.2f} us/hop, {dot} attention ({boundary_end} boundary fill, "
+        f"{coll_factor_end} per-op collective factor)"
     )
 
 
@@ -1335,7 +1363,14 @@ def _assemble_advisor_report(
         if hbm_fits
         else [estimates[0]]
     )
-    best = min(candidates, key=lambda e: (raw_step_map[e.scope], e.ops_per_step))
+    best = min(
+        candidates,
+        key=lambda e: (
+            round(raw_step_map[e.scope] / FLOOR_TIE_EPSILON_US),
+            e.step_upper_us,
+            e.ops_per_step,
+        ),
+    )
     supported_candidates = [
         e
         for e in candidates
@@ -1344,7 +1379,11 @@ def _assemble_advisor_report(
     recommended = (
         min(
             supported_candidates,
-            key=lambda e: (raw_step_map[e.scope], e.ops_per_step),
+            key=lambda e: (
+                round(raw_step_map[e.scope] / FLOOR_TIE_EPSILON_US),
+                e.step_upper_us,
+                e.ops_per_step,
+            ),
         )
         if hbm_fits
         else estimates[0]
