@@ -587,8 +587,11 @@ def _select_fp8_indexer_jax(
     )
     pool = banks[0] if len(banks) == 1 else banks
 
-    def score(start, rows, inputs, *, pipelined, group=None):
-        """Scores of `rows` queries from `start`; decode tiles share the inputs."""
+    def score(start, rows, inputs, *, pipelined, group=None, maxima=False):
+        """Scores of `rows` queries from `start`; decode tiles share the inputs.
+
+        `maxima` also returns the scores' block maxima for block top-k.
+        """
         shared = pipelined and prefill_chunk_rows is None
         queries, row_weights, row_lengths = (
             inputs[:3]
@@ -614,6 +617,9 @@ def _select_fp8_indexer_jax(
             query_start=start if shared else 0,
             query_count=rows,
             reuse_keys=prefill_chunk_rows is not None and capacity == key_tile,
+            # The scorer holds every score; reducing them there saves block
+            # top-k a SparseCore pass over the whole visible row.
+            block_maxima=select_block if maxima else 0,
         )
         if group is None:
             return scores
@@ -670,6 +676,7 @@ def _select_fp8_indexer_jax(
             inputs[2], tile * chunk_rows, chunk_rows
         )
         if block_select:
+            scores, maxima = scores
             # One SparseCore pass ranks the block maxima for both outputs.
             return block_topk.block_topk(
                 scores,
@@ -677,6 +684,7 @@ def _select_fp8_indexer_jax(
                 k=topk,
                 block_size=select_block,
                 publish=candidates.shape[1] if publish_rows else 0,
+                maxima=maxima,
                 scheduling_group_id=group,
             )
         selected = select_topk(
@@ -714,7 +722,7 @@ def _select_fp8_indexer_jax(
         padded // chunk_rows,
         lambda tile: tile * chunk_rows,
         lambda start, group: score(
-            start, chunk_rows, inputs, pipelined=True, group=group
+            start, chunk_rows, inputs, pipelined=True, group=group, maxima=block_select
         ),
         select,
         write,

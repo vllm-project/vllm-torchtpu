@@ -151,7 +151,7 @@ def block_topk(
     # Given maxima are read in whole chunks of their row.
     maxima_chunk = math.gcd(block_width, 8192)
     inputs = (scores, token_lengths)
-    if given:
+    if maxima is not None:
         columns = min(maxima.shape[1], block_width)
         maxima = jnp.pad(maxima[:, :columns], ((0, 0), (0, block_width - columns)))
         inputs += (maxima,)
@@ -267,6 +267,7 @@ def block_topk(
 
         def read_maxima(row_id, live_blocks):
             """Copy the chunks of given maxima that hold the visible blocks."""
+            assert maxima_ref is not None
 
             def copy(c):
                 window = pl.ds(c * maxima_chunk, maxima_chunk)
