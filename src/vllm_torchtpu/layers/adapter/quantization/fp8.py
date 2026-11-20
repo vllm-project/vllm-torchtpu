@@ -1247,9 +1247,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     def requantize_moe_layer_weights(self, layer: torch.nn.Module) -> bool:
         """Requantize one RoutedExperts layer's weights and scales in place.
 
-        Pure per-rank tensor conversion (no cross-rank collectives), so it may
-        run either per layer during streaming load or at end-of-load. Returns
-        False if the layer was already requantized.
+        Per-rank tensor conversion. Under USE_MOE_TP_DECODE_NVFP4_KERNEL its
+        pre-load admission reads the op's topology, which
+        moe_tp_decode_nvfp4.resolve_preload_topology gathers before loading
+        starts (TPUModelRunner.load_model); with that resolved it runs no
+        cross-rank collectives, so it may run either per layer during
+        streaming load or at end-of-load. Returns False if the layer was
+        already requantized.
         """
         if getattr(layer, MOE_REQUANT_RECORD_ATTR, None) is not None:
             return False

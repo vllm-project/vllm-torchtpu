@@ -50,6 +50,8 @@ _BUFFERS = (
 )
 
 _OPS: dict[tuple, Any] = {}
+# The op's topology for precheck_admission, set by resolve_preload_topology.
+_PRELOAD_TOPOLOGY: fp8_decode._Topology | str | None = None
 # w13, w2 and (s13, s2) of a routed-expert layout, before the weights exist.
 _RoutedSds = tuple[
     jax.ShapeDtypeStruct,
@@ -205,6 +207,31 @@ def _admit(
     )
 
 
+def resolve_preload_topology() -> None:
+    """Resolve the op's topology for ``precheck_admission`` before any weight
+    loads. Collective (``moe_tp_decode._topology`` gathers device ids over the
+    EP group), so every rank must call it at the same point:
+    ``TPUModelRunner.load_model`` does, before the model loader starts."""
+    global _PRELOAD_TOPOLOGY
+    _PRELOAD_TOPOLOGY = fp8_decode._topology()
+
+
+def _preload_topology() -> fp8_decode._Topology | str:
+    """The topology ``resolve_preload_topology`` resolved, else gathered now
+    with a warning. Loaders call ``precheck_admission`` per layer, during
+    streaming load (``VLLM_TPU_MOE_EARLY_REQUANT``) wherever each rank
+    completes the layer, where a gather can meet a peer's other collective."""
+    if _PRELOAD_TOPOLOGY is not None:
+        return _PRELOAD_TOPOLOGY
+    logger.warning_once(
+        "moe_tp_decode_nvfp4: the op's topology was not resolved before weight "
+        "loading (resolve_preload_topology), so pre-load admission gathers EP "
+        "device ids for every layer it checks; that is only safe when every "
+        "rank checks the same layers in the same order"
+    )
+    return fp8_decode._topology()
+
+
 def precheck_admission(
     layer: Any,
     *,
@@ -212,7 +239,8 @@ def precheck_admission(
     clamp_per_matrix: bool = True,
 ) -> str | None:
     """Return ``None`` if ``layer`` will arm after load-time requantization,
-    else a human-readable refusal reason."""
+    else a human-readable refusal reason. Runs no collective once
+    ``resolve_preload_topology`` has run."""
     runner = fp8_decode.routed_experts_runner(layer)
     if runner is None:
         return "routed experts layer has no MoERunner"
@@ -233,7 +261,7 @@ def precheck_admission(
         )
     if isinstance(proposed, str):
         return proposed
-    topo = fp8_decode._topology()
+    topo = _preload_topology()
     res = fp8_decode._admit_runner(
         runner,
         topo,

@@ -3601,6 +3601,76 @@ def test_arm_fp8_method_layer_and_dispatch_apply_monolithic(monkeypatch):
     assert calls[0][7] is layer.w2_weight_scale_inv
 
 
+def _count_ep_device_id_gathers(monkeypatch, rt, n_ranks: int) -> list[int]:
+    """Run the real ``moe_tp_decode._topology`` over stand-in TP = EP groups
+    of ``n_ranks`` ranks (device id = rank, mesh cached), and return the list
+    each EP device-id gather (an ``all_gather_object``) appends to."""
+    ep_mesh = importlib.import_module("vllm_torchtpu.distributed.ep_mesh")
+    group = SimpleNamespace(ranks=list(range(n_ranks)), world_size=n_ranks)
+    gathers: list[int] = []
+
+    def collect(grp, rank, _device_id):
+        gathers.append(rank)
+        return {r: r for r in grp.ranks}
+
+    monkeypatch.setattr(ep_mesh, "_collect_rank_to_device_id", collect)
+    monkeypatch.setattr(ep_mesh, "get_ep_group", lambda: group)
+    monkeypatch.setattr(ep_mesh, "_get_current_global_rank", lambda: 0)
+    monkeypatch.setattr(ep_mesh, "_get_tpu_global_device_id", lambda: 0)
+    monkeypatch.setattr(ep_mesh, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setattr(ep_mesh, "get_dcp_world_size", lambda: 1)
+    monkeypatch.setitem(
+        ep_mesh._MESH_CACHE,
+        (ep_mesh.EP_AXIS_NAME, tuple(range(n_ranks))),
+        SimpleNamespace(size=n_ranks, axis_names=(ep_mesh.EP_AXIS_NAME,)),
+    )
+    fp8_decode = rt.adapter.fp8_decode
+    monkeypatch.setattr(fp8_decode, "get_ep_group", lambda: group)
+    monkeypatch.setattr(fp8_decode.parallel_state, "get_tp_group", lambda: group)
+    monkeypatch.setattr(rt.torch.distributed, "get_world_size", lambda *_a: n_ranks)
+    return gathers
+
+
+def test_precheck_admission_reuses_the_topology_resolved_before_loading(
+    monkeypatch,
+):
+    """Loaders run the pre-load admission per layer, and under streaming load
+    wherever each rank completes the layer, so it must not gather: the EP
+    device ids are gathered once by resolve_preload_topology before loading,
+    and every admission reuses that topology. Unresolved, each admission
+    gathers again and warns."""
+    rt = _load_runtime_modules(monkeypatch)
+    adapter = rt.adapter
+    cfg, n_ranks = FP8_REQUANT_LAYOUTS["ep2xtp8"]
+    topology = adapter.fp8_decode._topology
+    _fake_fp8_method_topology(monkeypatch, rt, cfg, n_ranks, ep_rank=0)
+    monkeypatch.setattr(adapter.fp8_decode, "_topology", topology)
+    gathers = _count_ep_device_id_gathers(monkeypatch, rt, n_ranks)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        adapter,
+        "logger",
+        SimpleNamespace(warning_once=lambda msg, *_a, **_k: warnings.append(msg)),
+    )
+    monkeypatch.setattr(adapter, "_PRELOAD_TOPOLOGY", None)
+    layers = [_fp8_method_runner(rt, cfg, n_ranks, form="checkpoint") for _ in range(3)]
+
+    adapter.resolve_preload_topology()
+    resolved = len(gathers)
+    topo = adapter._PRELOAD_TOPOLOGY
+    assert resolved > 0
+    assert isinstance(topo, adapter.fp8_decode._Topology)
+    assert topo.mesh.size == n_ranks and topo.mesh_index == 0
+    for _runner, _qm, layer in layers:
+        assert adapter.precheck_admission(layer, requant_block=512) is None
+    assert len(gathers) == resolved and warnings == []
+
+    monkeypatch.setattr(adapter, "_PRELOAD_TOPOLOGY", None)
+    assert adapter.precheck_admission(layers[0][2], requant_block=512) is None
+    assert len(gathers) == 2 * resolved
+    assert len(warnings) == 1 and "resolve_preload_topology" in warnings[0]
+
+
 def _load_precedence_modules(monkeypatch):
     """Load real NVFP4, FP8 TP decode, fused MoE decode, and MoERunner bridges."""
     rt = _load_runtime_modules(monkeypatch)
@@ -4555,6 +4625,9 @@ def test_c1_pre_load_admission_preserves_block16_and_bit_exact_fallback(monkeypa
     fake_mesh = SimpleNamespace(size=N_RANKS, axis_names=("d",), shape={"d": N_RANKS})
     topo = SimpleNamespace(mesh=fake_mesh, mesh_index=0)
     monkeypatch.setattr(fp8_decode, "_topology", lambda: topo)
+    # Resolved before loading, as TPUModelRunner.load_model does: the loads
+    # below then log only their refusals.
+    monkeypatch.setattr(adapter, "_PRELOAD_TOPOLOGY", topo)
     monkeypatch.setattr(fp8_decode, "_check_ranks_agree", lambda _d: None)
     monkeypatch.setattr(fp8_decode, "_selftest", lambda *_a: [])
     monkeypatch.setattr(fp8_decode, "_gather", lambda d: [d])

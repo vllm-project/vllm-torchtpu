@@ -109,22 +109,29 @@ gives the kernel's operands exactly (scales held as `w*_weight_scale_inv`):
 
 When `USE_MOE_TP_DECODE_NVFP4_KERNEL=1` and `TPU_MOE_SKIP_PADDED_TOKENS=1` are
 set alongside other MoE kernel flags, admission is partitioned per layer by
-quantization method (`VllmNvfp4MoEMethod` for NVFP4 layers,
-`VllmFp8MoEMethodTPU` for FP8 layers, `VllmUnquantizedFusedMoEMethod` for BF16
-layers):
+quantization method and routed-expert layout: `VllmNvfp4MoEMethod` for NVFP4
+layers; `VllmFp8MoEMethodTPU` for FP8-checkpoint layers, either requantized to
+this kernel's native FP4 (`MOE_REQUANTIZE_WEIGHT_DTYPE=fp4` and admitted before
+loading, as above) or kept FP8 or packed FP4 (another
+`MOE_REQUANTIZE_WEIGHT_DTYPE`, the MTP layer kept FP8, or refused before
+loading); `VllmUnquantizedFusedMoEMethod` for BF16 layers:
 
-| Co-enabled flag(s) | NVFP4 layers (`n <= 64`) | NVFP4 layers (`n > 64`) | FP8 layers (`n <= 64`) | FP8 layers (`n > 64`) | BF16 layers (all `n`) |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| *(none)* | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | Unarmed (`fused_moe_gmm`) | Unarmed (`fused_moe_gmm`) | Unarmed (`fused_moe_gmm`) |
-| `USE_MOE_TP_DECODE_KERNEL=1` | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | `moe_tp_decode` | `_tp_chain` (`n <= 256` or EP); `fused_moe_prefill` (`n > 256`, TP, prefill on) | Unarmed (`fused_moe_gmm`) |
-| `FUSED_MOE_DECODE_KERNEL=1` *(with or without `USE_MOE_TP_DECODE_KERNEL=1`)* | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | `fused_moe_decode` | `fused_moe_decode` (`n <= 256`); `fused_moe_prefill` (`n > 256`, TP, prefill on) or FP8 GMM | Unarmed (`fused_moe_gmm`) |
-| `FUSED_MOE_PREFILL_KERNEL=1` *(default `1`, no FP8 decode flag)* | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | Unarmed (`fused_moe_gmm`) | Unarmed (`fused_moe_gmm`) | Unarmed (`fused_moe_gmm`) |
-| `USE_MOE_FUSED_EP_KERNEL=1` *(pure EP admitted; `+ MOE_FUSED_EP_ENABLE_W4A8=1` or `adaptive` on NVFP4)* | `fused_moe_ep` / `adaptive_fused_moe` | `fused_moe_ep` / `adaptive_fused_moe` | `fused_moe_ep` / `adaptive_fused_moe` | `fused_moe_ep` / `adaptive_fused_moe` | Unarmed (`fused_moe_gmm`) |
-| `USE_MOE_FUSED_EP_KERNEL=1` *(`TP` or `EP x TP` with `tp > 1`)* | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | `moe_tp_decode` if `USE_MOE_TP_DECODE_KERNEL=1`, else unarmed | `_tp_chain` / `fused_moe_prefill` if `USE_MOE_TP_DECODE_KERNEL=1`, else unarmed | Unarmed (`fused_moe_gmm`) |
+| Co-enabled flag(s) | NVFP4 layers (`n <= 64`) | NVFP4 layers (`n > 64`) | FP8 requantized to native FP4 (`n <= 64`) | FP8 requantized to native FP4 (`n > 64`) | FP8 kept FP8 or packed FP4 (`n <= 64`) | FP8 kept FP8 or packed FP4 (`n > 64`) | BF16 layers (all `n`) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| *(none)* | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | Unarmed (`fused_moe_gmm`) | Unarmed (`fused_moe_gmm`) | Unarmed (`fused_moe_gmm`) |
+| `USE_MOE_TP_DECODE_KERNEL=1` | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | `moe_tp_decode` | `_tp_chain` (`n <= 256` or EP); `fused_moe_prefill` (`n > 256`, TP, prefill on) | Unarmed (`fused_moe_gmm`) |
+| `FUSED_MOE_DECODE_KERNEL=1` *(with or without `USE_MOE_TP_DECODE_KERNEL=1`)* | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | `fused_moe_decode` | `fused_moe_decode` (`n <= 256`); `fused_moe_prefill` (`n > 256`, TP, prefill on) or FP8 GMM | Unarmed (`fused_moe_gmm`) |
+| `FUSED_MOE_PREFILL_KERNEL=1` *(default `1`, no FP8 decode flag)* | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | Unarmed (`fused_moe_gmm`) | Unarmed (`fused_moe_gmm`) | Unarmed (`fused_moe_gmm`) |
+| `USE_MOE_FUSED_EP_KERNEL=1` *(pure EP admitted; `+ MOE_FUSED_EP_ENABLE_W4A8=1` or `adaptive` on NVFP4)* | `fused_moe_ep` / `adaptive_fused_moe` | `fused_moe_ep` / `adaptive_fused_moe` | `fused_moe_ep` / `adaptive_fused_moe` | `fused_moe_ep` / `adaptive_fused_moe` | `fused_moe_ep` / `adaptive_fused_moe` | `fused_moe_ep` / `adaptive_fused_moe` | Unarmed (`fused_moe_gmm`) |
+| `USE_MOE_FUSED_EP_KERNEL=1` *(`TP` or `EP x TP` with `tp > 1`)* | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | `moe_tp_decode_nvfp4` | `_tp_chain` (`gmm_v2` W4A16 + `psum`) | `moe_tp_decode` if `USE_MOE_TP_DECODE_KERNEL=1`, else unarmed | `_tp_chain` / `fused_moe_prefill` if `USE_MOE_TP_DECODE_KERNEL=1`, else unarmed | Unarmed (`fused_moe_gmm`) |
 
 - **No cross-dtype stand-down:** FP8-only flags (`USE_MOE_TP_DECODE_KERNEL`,
   `FUSED_MOE_DECODE_KERNEL`, `FUSED_MOE_PREFILL_KERNEL`,
-  `TPU_MOE_FP8_ALL_GATHER`) neither arm nor disable NVFP4 layers; `256` above
+  `TPU_MOE_FP8_ALL_GATHER`) neither arm nor disable NVFP4 layers or FP8 layers
+  requantized to native FP4: `moe_tp_decode` and `fused_moe_decode` arm before
+  this kernel but take FP8 experts only, so they refuse FP4 ones. For the same
+  reason, in the rows where `moe_tp_decode` or `fused_moe_decode` serves FP8
+  experts, packed FP4 experts stay on `fused_moe_gmm` at every `n`. `256` above
   is `FUSED_MOE_DECODE_KERNEL_MAX_TOKENS`.
 - **NVFP4 stand-downs:** `moe_tp_decode_nvfp4` yields only when another kernel
   or collective wrapper serves the NVFP4 layer—an admitted fused-EP op
