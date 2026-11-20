@@ -31,10 +31,11 @@ Each leg (`prefill`, `decode`) lists:
   `$MODEL` and `$SERVED_MODEL` are the model path and served name.
 - `env`: the environment the leg set, limited to variables this package
   declares in `envs.py`. `$EXPERT_PLACEMENT_TABLE` is the path of the
-  decode leg's expert placement table, one of the two `expert_placement_*`
-  tables in this directory: the permutation of the 512 experts over 8 ranks
-  for the DP4 x TP2 point, and the table with 68 slots per rank (64 experts
-  and 4 copies) for the TP8 points.
+  decode leg's expert placement table in this directory:
+  `expert_placement_dp8_ep8.json` for the DP4 x TP2 point, a permutation of
+  the 512 experts over its 8 expert-parallel ranks (64 per rank, no copies),
+  and `expert_placement_tp8_ep8_agentx_corr_c32.json` for the TP8 points,
+  68 slots per rank (64 experts and 4 copies).
   Per-pod wiring (ports, hosts, engine ids, cache directories) is
   deployment-specific and not recorded.
 - `additional_config`: the `--additional-config` JSON for the leg. The
@@ -52,8 +53,8 @@ rules or `additional_config` options change by change, and each change that
 turns one that the points use into a setting or section updates the entries.
 A value that this tree cannot run yet is kept as the record run used it and
 listed under `not_yet_supported`, per leg, with what it needs: a capability
-this tree lacks, or a file it does not ship (p01's permutation table); the
-change that adds the capability removes it from that list. The entry tests
+this tree lacks or a file it does not ship; the change that adds the
+capability removes it from that list. The entry tests
 check that this tree's `envs.py` accepts every other environment value.
 
 ## Reading a gate entry
