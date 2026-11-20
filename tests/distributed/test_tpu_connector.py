@@ -9157,3 +9157,87 @@ class TestStage3AsyncComplete:
                 concurrent.futures.wait([future], timeout=5)
                 worker._reap_stage3_async_completes()
         assert facade.complete_request_blocks.call_count == 5
+
+
+def _stage3_option_producer(extra_config):
+    """A Stage-3 producer rank with the given connector options, a fake
+    engine, the runner's controller client and a separate side-thread
+    client (what _new_raiden_controller_facade hands the side threads)."""
+    worker = _make_raiden_worker(
+        tp_rank=0,
+        tp_size=1,
+        is_producer=True,
+        dp_size=1,
+        pcp_size=8,
+        block_size=4096,
+        extra_config=extra_config,
+    )
+    engine = _FakeRaidenEngine()
+    engine.poll_results = []
+    facade = _FakeRaidenControllerFacade()
+    side = _FakeRaidenControllerFacade()
+    worker._raiden_transfer_engine = engine
+    worker._raiden_controller_facade = facade
+    worker._raiden_controller_address = "prefill-controller.test:27000"
+    worker._raiden_work_unit = SimpleNamespace(
+        job_name="prefill",
+        job_replica_id="rank0",
+        data_name="kv.fa",
+        data_replica_idx=0,
+    )
+    worker._local_raiden_transfer_rank = MagicMock(return_value=0)
+    worker._new_raiden_controller_facade = MagicMock(return_value=side)
+    return worker, engine, facade, side
+
+
+def _stage3_send_meta(req_id, uuid):
+    meta = TPUConnectorMetadata()
+    meta.reqs_to_send[req_id] = MagicMock(
+        uuid=uuid, local_block_ids=[0, 1], num_tokens=65_023, expiration_time=1e20
+    )
+    return meta
+
+
+@contextlib.contextmanager
+def _stage3_option_env():
+    # The FA token bytes registration-time lowering reads from the admitted
+    # pools, as TestTPURaidenConnectorWorker gives its producers.
+    with (
+        _stage3_worker_env(),
+        patch(f"{_MOD}.dist_utils.get_stage3_status_probe_s", return_value=3600.0),
+        patch.object(
+            TPURaidenConnectorWorker, "_stage3_fa_token_bytes", return_value=1024
+        ),
+    ):
+        yield
+
+
+class TestStage3AsyncOptionsThroughGetFinished:
+    """async_register and async_complete driven through process_send_load and
+    get_finished, the calls the model runner makes."""
+
+    @pytest.mark.parametrize("failed", [False, True], ids=["done", "failed"])
+    def test_a_terminal_before_the_registration_is_recorded_is_kept(self, failed):
+        """The controller can serve the consumer before the side thread's
+        RPC returns and the registration is recorded; the native terminal
+        that comes in meanwhile is kept for the registration."""
+        worker, engine, _, side = _stage3_option_producer({"async_register": True})
+        entered, release = threading.Event(), threading.Event()
+
+        def held_register(**kwargs):
+            entered.set()
+            release.wait(5.0)
+
+        side.register_request_blocks = held_register
+        with _stage3_option_env():
+            worker.process_send_load(_stage3_send_meta("r1", 77))
+            worker._stage3_register_gate.set()
+            assert entered.wait(5.0)
+            engine.poll_results = [([], [], ["r1"]) if failed else (["r1"], [], [])]
+            assert worker.get_finished() == (set(), set())
+            release.set()
+            worker._reap_stage3_registrations({"r1"})
+            done_sending, _ = worker.get_finished()
+        assert done_sending == {"r1"}
+        assert worker._stage3_early_send_terminals == {}
+        assert worker._stage3_registered_sends == {}
