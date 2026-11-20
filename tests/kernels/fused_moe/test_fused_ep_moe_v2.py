@@ -754,6 +754,87 @@ def test_split_stages_with_a_reordered_gather_are_bit_exact(sharded_plan):
     assert not np.array_equal(np.asarray(wrong), np.asarray(fused))
 
 
+# Decode-size steps, 8 tokens a shard, at shapes the routing-plan kernel
+# admits: 8 local experts top-4, and DeepSeek-V4.1's 48 local experts top-6.
+PLAN_KERNEL_SHAPES = [
+    dict(hidden=512, inter=256, e_total=64, topk=4, tokens=64),
+    dict(hidden=512, inter=256, e_total=384, topk=6, tokens=64),
+]
+
+
+@pytest.mark.parametrize("stage", ["fused", "compute"])
+@pytest.mark.parametrize(
+    "shape", PLAN_KERNEL_SHAPES, ids=lambda s: f"e{s['e_total']}k{s['topk']}"
+)
+def test_routing_plan_kernel_is_bit_exact_with_the_xla_plan(monkeypatch, shape, stage):
+    """plan_kernel builds the sharded plan in one Pallas kernel and hands the
+    expert kernel its packed tables; the layer's output may not change, for
+    the fused layer and for compute over a gather in another order."""
+    mesh = _mesh()
+    weights = _make_weights(
+        mesh,
+        30,
+        hidden=shape["hidden"],
+        inter=shape["inter"],
+        e_total=shape["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        31,
+        tokens=shape["tokens"],
+        hidden=shape["hidden"],
+        e_total=shape["e_total"],
+    )
+    common = dict(
+        topk=shape["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+        sharded_plan=True,
+    )
+    plans = []
+    routing_plan = layer.routing_plan
+
+    def recorded_plan(exchange, rank, plan_shape, **kwargs):
+        plans.append(plan_shape)
+        return routing_plan(exchange, rank, plan_shape, **kwargs)
+
+    monkeypatch.setattr(layer, "routing_plan", recorded_plan)
+
+    def run(plan_kernel):
+        if stage == "fused":
+            return fused_ep_moe_v2(
+                x, *weights, gating, plan_kernel=plan_kernel, **common
+            )
+        q, router_weights, payload = fused_ep_moe_v2(
+            x, *weights, gating, stage="route", plan_kernel=plan_kernel, **common
+        )
+        order = (0, 1, 6, 7, 2, 3, 4, 5)
+        blocks = np.asarray(q).reshape((EP, -1) + q.shape[1:])
+        gathered = blocks[np.asarray(order)].reshape(q.shape)
+        q_g = jax.device_put(
+            np.concatenate([gathered] * EP), NamedSharding(mesh, P(AXIS))
+        )
+        return fused_ep_moe_v2(
+            x,
+            *weights,
+            gating,
+            stage="compute",
+            routed=(q_g, router_weights, payload),
+            gather_positions=tuple(order.index(i) for i in range(EP)),
+            plan_kernel=plan_kernel,
+            **common,
+        )
+
+    want = run(False)
+    assert plans == []
+    got = run(True)
+    assert plans, "the routing-plan kernel did not run"
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
 @pytest.fixture(scope="module")
 def production_weights():
     """The Qwen3.5-397B MoE weights, fp8 e4m3 with per-channel scales.
