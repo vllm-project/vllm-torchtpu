@@ -1881,6 +1881,20 @@ class TestHostTierRecency(unittest.TestCase):
         ]
 
 
+class _RecordingLock:
+    """A manager lock that records whether it is held."""
+
+    def __init__(self):
+        self.held = False
+
+    def __enter__(self):
+        self.held = True
+
+    def __exit__(self, *exc):
+        self.held = False
+        return False
+
+
 class TestOffloadConnectorOptions(unittest.TestCase):
     """max_async_loads, fence_after_draft and host_tier_recency are opt-in
     kv_connector_extra_config options: unset, the connector behaves as before."""
@@ -1902,7 +1916,7 @@ class TestOffloadConnectorOptions(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _connector_option({"max_async_loads": bad}, "max_async_loads", 0)
 
-    def _capped(self, cap):
+    def _capped(self, cap, manager_lock=None, probe=None):
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
             OffloadingConnectorScheduler,
         )
@@ -1910,6 +1924,8 @@ class TestOffloadConnectorOptions(unittest.TestCase):
         from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 
         sched = object.__new__(TPURaidenOffloadingScheduler)
+        # vLLM's default manager lock, which RaidenOffloadingManager keeps.
+        sched.manager = SimpleNamespace(lock=manager_lock or contextlib.nullcontext())
         sched.config = SimpleNamespace(
             kv_group_configs=(SimpleNamespace(tokens_per_chunk=4),),
             supports_partial_tail=False,
@@ -1920,7 +1936,7 @@ class TestOffloadConnectorOptions(unittest.TestCase):
         sched._req_status = {"r1": req_status}
         sched._max_async_load_reqs = cap
         sched._touch = MagicMock()
-        sched._quiet_lookup = MagicMock(return_value=8)
+        sched._quiet_lookup = probe or MagicMock(return_value=8)
         req = SimpleNamespace(request_id="r1")
         with patch.object(
             OffloadingConnectorScheduler,
@@ -1997,6 +2013,22 @@ class TestOffloadConnectorOptions(unittest.TestCase):
     def test_cap_defers_a_hit_while_loads_are_in_flight(self):
         self.assertEqual(self._capped(1), ((None, False), False))
         self.assertEqual(self._capped(2), ((8, True), True))
+
+    def test_the_cap_probe_runs_in_the_step_region(self):
+        """On a step's first request the cap's probe is the hook's first
+        manager call: the hook opens schedule()'s step region for it, as
+        upstream's hook does before its own lookup, and leaves it open for
+        the rest of the step."""
+        lock = _RecordingLock()
+        held: list[bool] = []
+
+        def probe(req_status, base_tokens):
+            held.append(lock.held)
+            return 8
+
+        self.assertEqual(self._capped(1, lock, probe), ((None, False), False))
+        self.assertEqual(held, [True])
+        self.assertTrue(lock.held)
 
 
 class TestWorkerSideConnector(unittest.TestCase):
@@ -5094,7 +5126,12 @@ class TestPartialTailLookupWithRecency(unittest.TestCase):
         )
         req_status = MagicMock(transfer_jobs=set())
         sched._req_status = {"r1": req_status}
-        sched._touch = MagicMock()
+        # The touch is the step's first manager call: it runs in the step
+        # region the hook opens.
+        lock = _RecordingLock()
+        sched.manager = SimpleNamespace(lock=lock)
+        held: list[bool] = []
+        sched._touch = MagicMock(side_effect=lambda status: held.append(lock.held))
         req = SimpleNamespace(request_id="r1")
         # A local hit of 6 ends inside the second 4-token chunk.
         self.assertEqual(sched.get_num_new_matched_tokens(req, 6), (0, False))
@@ -5102,6 +5139,7 @@ class TestPartialTailLookupWithRecency(unittest.TestCase):
         req_status.update_offload_keys.assert_called_once_with()
         req_status.update_num_hit_chunks.assert_called_once_with(6)
         sched._touch.assert_called_once_with(req_status)
+        self.assertEqual(held, [True])
 
 
 if __name__ == "__main__":
