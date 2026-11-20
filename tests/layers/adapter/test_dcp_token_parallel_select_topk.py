@@ -74,10 +74,10 @@ def _invoke_select_topk(
     return captured
 
 
-def test_should_widen_bkvp_and_keep_256_chunks_when_natural_kv_at_or_below_64k():
+def test_should_keep_bkvp8_and_256_chunks_when_natural_kv_at_16k():
     call = _invoke_select_topk(
         num_rows=1024,
-        natural_shape=(256, 33, 4, 256),
+        natural_shape=(64, 33, 4, 256),
         kv_layout=KVLayout.SEQ_ALONG_LANE,
         chunk_tokens=256,
         mixed_bkvp=4,
@@ -89,15 +89,33 @@ def test_should_widen_bkvp_and_keep_256_chunks_when_natural_kv_at_or_below_64k()
     assert list(call["args"][6]) == [0, 0, 1]
 
 
+def test_should_use_bkvp8_and_128_chunks_when_natural_kv_at_32k():
+    call = _invoke_select_topk(
+        num_rows=1024,
+        natural_shape=(128, 33, 4, 256),
+        kv_layout=KVLayout.SEQ_ALONG_LANE,
+        chunk_tokens=256,
+        mixed_bkvp=4,
+    )
+    kw = call["kwargs"]
+    assert kw["num_kv_pages_per_block"] == (2, 2, 8)
+    assert kw["chunk_tokens"] == 128
+    assert kw["decode_as_mixed"] is True
+
+
 @pytest.mark.parametrize(
-    ("kv_layout", "natural_shape"),
+    ("kv_layout", "natural_shape", "expected_bkvp"),
     [
-        (KVLayout.SEQ_ALONG_LANE, (320, 33, 4, 256)),
-        (KVLayout.HEAD_ALONG_SUBLANE, (320, 64, 4, 256)),
+        (KVLayout.SEQ_ALONG_LANE, (192, 33, 4, 256), 16),
+        (KVLayout.SEQ_ALONG_LANE, (256, 33, 4, 256), 16),
+        (KVLayout.SEQ_ALONG_LANE, (320, 33, 4, 256), 16),
+        (KVLayout.HEAD_ALONG_SUBLANE, (320, 64, 4, 256), 16),
+        # Non-multiple-of-16 page count must avoid KV padding by staying at bkvp=8.
+        (KVLayout.SEQ_ALONG_LANE, (200, 33, 4, 256), 8),
     ],
 )
-def test_should_use_128_token_chunks_when_natural_kv_exceeds_64k(
-    kv_layout: KVLayout, natural_shape: tuple[int, int, int, int]
+def test_should_use_128_chunks_and_aligned_bkvp16_when_natural_kv_at_or_above_48k(
+    kv_layout: KVLayout, natural_shape: tuple[int, int, int, int], expected_bkvp: int
 ):
     call = _invoke_select_topk(
         num_rows=1024,
@@ -107,7 +125,7 @@ def test_should_use_128_token_chunks_when_natural_kv_exceeds_64k(
         mixed_bkvp=4,
     )
     kw = call["kwargs"]
-    assert kw["num_kv_pages_per_block"] == (2, 2, 8)
+    assert kw["num_kv_pages_per_block"] == (2, 2, expected_bkvp)
     assert kw["chunk_tokens"] == 128
     assert kw["decode_as_mixed"] is True
 
@@ -130,3 +148,12 @@ def test_should_preserve_caller_knobs_when_outside_adaptive_regime():
     )
     assert explicit_wide["kwargs"]["num_kv_pages_per_block"] == (2, 2, 16)
     assert explicit_wide["kwargs"]["chunk_tokens"] == 256
+
+    unset_bkvp = _invoke_select_topk(
+        num_rows=1024,
+        natural_shape=(320, 33, 4, 256),
+        chunk_tokens=256,
+        mixed_bkvp=None,
+    )
+    assert unset_bkvp["kwargs"]["num_kv_pages_per_block"] == (2, 2, 2)
+    assert unset_bkvp["kwargs"]["chunk_tokens"] == 128

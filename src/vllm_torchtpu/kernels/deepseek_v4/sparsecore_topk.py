@@ -55,6 +55,10 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk_compact import (
+    select_compact_p1_mode,
+    sparsecore_topk_compact_p1,
+)
 
 LANES = 16
 NUM_BUCKETS = 256
@@ -1213,15 +1217,21 @@ def _topk_body(
 
 
 # (b, n, p) shapes on which TPU_SC_TOPK_COOP_V2 is proven bitwise on hardware:
-# the DCP8 decode buckets T = 4 / 8 / 16 of the local top-k (n = 1M / 8), and
-# the a2a merge's stage 2 at T = 64 / 128 (b = T / 8 rows of n = 8 * 2048).
+# DCP8 decode buckets (n = 1M / 8), DCP16 160K decode buckets (n = 10K..16K),
+# and the a2a merge's stage 2 at DCP8 (n = 16384) and DCP16 (n = 32768).
 COOP_V2_TESTED_SHAPES = frozenset(
     {
         (4, 131072, 8),
         (8, 131072, 4),
         (16, 131072, 2),
+        (4, 16384, 8),
         (8, 16384, 4),
         (16, 16384, 2),
+        (4, 10240, 4),
+        (8, 10240, 4),
+        (16, 10240, 2),
+        (16, 12288, 2),
+        (4, 32768, 8),
     }
 )
 
@@ -1303,6 +1313,17 @@ def _sc_topk_direct(
             )
     else:
         b, n = scores.shape
+        if local_idxs is None and not return_scores:
+            compact_mode = select_compact_p1_mode(b, n, k, return_scores=False)
+            if compact_mode is not None:
+                return sparsecore_topk_compact_p1(
+                    scores,
+                    k,
+                    row_lengths,
+                    mode=compact_mode,
+                    write_empty=write_empty,
+                    scheduling_group_id=scheduling_group_id,
+                )
     info = pltpu.get_tpu_info()
     sc = info.sparse_core
     if sc is None:

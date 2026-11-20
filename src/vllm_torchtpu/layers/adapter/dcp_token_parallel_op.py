@@ -275,7 +275,9 @@ def make_attend(
 
 
 _TP_STREAMIDX_MIN_BKVP = 8
-_TP_STREAMIDX_WIDE_KV_TOKENS = 65536
+_TP_STREAMIDX_WIDE_BKVP = 16
+_TP_STREAMIDX_WIDE_BKVP_KV_TOKENS = 49152
+_TP_STREAMIDX_WIDE_KV_TOKENS = 16384
 _TP_STREAMIDX_WIDE_CHUNK_TOKENS = 128
 
 
@@ -292,16 +294,24 @@ def _token_parallel_streamidx_knobs(
         if kv_layout == KVLayout.SEQ_ALONG_LANE
         else natural_shape[1] * natural_shape[2]
     )
-    tp_mixed_bkvp = (
-        max(mixed_bkvp, _TP_STREAMIDX_MIN_BKVP)
-        if mixed_bkvp is not None and num_pages >= _TP_STREAMIDX_MIN_BKVP
-        else mixed_bkvp
-    )
+    kv_tokens = num_pages * page_tokens
+    if mixed_bkvp is None:
+        tp_mixed_bkvp = None
+    elif (
+        kv_tokens >= _TP_STREAMIDX_WIDE_BKVP_KV_TOKENS
+        and num_pages >= _TP_STREAMIDX_WIDE_BKVP
+        and num_pages % _TP_STREAMIDX_WIDE_BKVP == 0
+    ):
+        tp_mixed_bkvp = max(mixed_bkvp, _TP_STREAMIDX_WIDE_BKVP)
+    elif num_pages >= _TP_STREAMIDX_MIN_BKVP:
+        tp_mixed_bkvp = max(mixed_bkvp, _TP_STREAMIDX_MIN_BKVP)
+    else:
+        tp_mixed_bkvp = mixed_bkvp
     tp_chunk_tokens = (
         _TP_STREAMIDX_WIDE_CHUNK_TOKENS
         if (
             chunk_tokens == 256
-            and num_pages * page_tokens > _TP_STREAMIDX_WIDE_KV_TOKENS
+            and kv_tokens > _TP_STREAMIDX_WIDE_KV_TOKENS
             and num_rows >= 256
             and num_rows % _TP_STREAMIDX_WIDE_CHUNK_TOKENS == 0
         )
