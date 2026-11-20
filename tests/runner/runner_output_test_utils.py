@@ -130,6 +130,12 @@ def _host_copy_state(chunks, lengths, **kwargs):
     )
 
 
+def _pre_copy_state(tokens):
+    """The copy state of a previous step whose sampled tokens reached the
+    host as `tokens`, as `AsyncPreResults.copy_state` holds it."""
+    return _host_copy_state([tokens], [tokens.shape[0]])
+
+
 def _blocking_logprobs_lists(chunks):
     """Reference for the logprobs of a step without drafts, built the way
     sample_tokens built them with a blocking copy before the copy was

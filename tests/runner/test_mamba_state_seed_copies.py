@@ -113,7 +113,7 @@ def _make_self(
         # the runner is constructed).
         cache_config=SimpleNamespace(block_size=BLOCK_SIZE),
         block_size=BLOCK_SIZE,
-        device="cpu",
+        device=torch.device("cpu"),
         mamba_slot_read_offsets=read_offsets,
         _pending_mamba_state_copies=[],
         _unfenced_h2d_sources=[],
