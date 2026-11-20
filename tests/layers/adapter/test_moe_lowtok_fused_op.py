@@ -27,10 +27,18 @@ import vllm.distributed.parallel_state as ps
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME
 from vllm_torchtpu.kernels.experimental.small_collectives import common as sc_common
+from vllm_torchtpu.layers.adapter import (
+    fused_moe_ep,
+    fused_moe_ep_v3,
+    sequence_parallel,
+    small_all_reduce_op,
+    token_padding,
+)
 from vllm_torchtpu.layers.adapter import moe_lowtok_fused_op as op
-from vllm_torchtpu.layers.adapter import small_all_reduce_op
+from vllm_torchtpu.layers.adapter.quantization import fp8
 
 pytestmark = pytest.mark.cpu_test
 
@@ -204,8 +212,6 @@ def test_prebuild_checks_the_layout_once(monkeypatch, fresh):
 
 @pytest.fixture
 def replicated(monkeypatch):
-    from vllm_torchtpu.layers.adapter import sequence_parallel
-
     monkeypatch.setattr(sequence_parallel, "_ACTIVE", False)
 
 
@@ -230,8 +236,6 @@ def test_serves_a_replicated_step_of_a_scores_layer(monkeypatch, replicated):
     ids=["unarmed", "no_scores_entry", "copy_slots", "not_sp_layer", "sliced_step"],
 )
 def test_does_not_serve(monkeypatch, armed, scores_op, copies, sp, active):
-    from vllm_torchtpu.layers.adapter import sequence_parallel
-
     monkeypatch.setattr(op, "_ARMED", armed)
     monkeypatch.setattr(sequence_parallel, "_ACTIVE", active)
     assert op.serves(_layer(copies), scores_op, is_sequence_parallel=sp) is False
@@ -240,8 +244,6 @@ def test_does_not_serve(monkeypatch, armed, scores_op, copies, sp, active):
 def test_retain_is_the_identity_when_unarmed(monkeypatch):
     """Unarmed, even in the warmup and with the small collectives' mesh rank
     buffer set: that buffer is not this op's."""
-    from vllm_torchtpu.compilation import shape_variants
-
     monkeypatch.setattr(shape_variants, "in_warmup", lambda: True)
     monkeypatch.setattr(op, "_RANK", None)
     monkeypatch.setattr(small_all_reduce_op, "_RANK", torch.tensor([float("nan")]))
@@ -251,8 +253,6 @@ def test_retain_is_the_identity_when_unarmed(monkeypatch):
 
 def test_retain_reads_the_rank_buffer_in_the_warmup(monkeypatch):
     """A live read: a NaN rank buffer poisons the result."""
-    from vllm_torchtpu.compilation import shape_variants
-
     monkeypatch.setattr(shape_variants, "in_warmup", lambda: True)
     monkeypatch.setattr(op, "_RANK", torch.tensor([float("nan"), 0.0]))
     assert torch.isnan(op.retain(torch.zeros(4, 8))).all()
@@ -292,8 +292,6 @@ def test_apply_masks_padded_rows_and_passes_the_programs_operand_order(
     this engine's rows; the router logits, with each padded row at -inf under
     TPU_MOE_SKIP_PADDED_TOKENS (this engine's own mask, no DP gather);
     w13, w2, their scales; experts_start as [1]; the rank buffer."""
-    from vllm_torchtpu.layers.adapter import token_padding
-
     _set_env(monkeypatch, "TPU_MOE_SKIP_PADDED_TOKENS", skip_padded)
     build, rank = recorded_op
     layer = _served_layer()
@@ -327,8 +325,6 @@ def test_apply_masks_padded_rows_and_passes_the_programs_operand_order(
 
 @pytest.fixture
 def v3_method(monkeypatch):
-    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
-
     ep = Mock(name="ep_group")
     ep.dispatch_router_logits.return_value = (
         torch.zeros(4, 8, dtype=torch.bfloat16),
@@ -337,13 +333,13 @@ def v3_method(monkeypatch):
     ep.combine.return_value = torch.full((4, 8), 7.0, dtype=torch.bfloat16)
     monkeypatch.setattr(ps, "get_ep_group", lambda: ep)
     monkeypatch.setattr(small_all_reduce_op, "_RANK", None)
-    method = MagicMock(spec=VllmFp8MoEMethodTPU)
+    method = MagicMock(spec=fp8.VllmFp8MoEMethodTPU)
     method._moe_lowtok_scores_op = object()
     method.apply_monolithic_external_dispatch.return_value = torch.zeros(4, 8)
     layer = SimpleNamespace(moe_config=SimpleNamespace(is_sequence_parallel=True))
 
     def call(x, logits):
-        return VllmFp8MoEMethodTPU._apply_owning_dispatch_v3(
+        return fp8.VllmFp8MoEMethodTPU._apply_owning_dispatch_v3(
             method, layer, x, logits, use_fused_kernel=False
         )
 
@@ -455,9 +451,6 @@ def _fp8_moe_layer(monkeypatch, calls, v3_arms_the_layer=True):
     """An FP8 MoE layer and its method, with the weight processing's
     prebuilds recorded in ``calls`` in order; fused EP v3's op is built and
     its prebuild arms the layer or refuses it."""
-    from vllm_torchtpu.layers.adapter import fused_moe_ep, fused_moe_ep_v3
-    from vllm_torchtpu.layers.adapter.quantization import fp8
-
     experts, hidden, inter = 1, 512, 256
     layer = torch.nn.Module()
     layer.activation = "silu"

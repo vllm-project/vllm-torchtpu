@@ -79,7 +79,7 @@ Q35_OP_CASES = {
     "q35_op_below_cap_64": (64, True, True),
     "q35_op_above_cap_128": (128, False, False),
 }
-# The row of each engine-0 block whose logits are all -inf.
+# The row of each engine's block whose logits are all -inf.
 PADDED_ROW = 3
 # Junk in each engine's padded row (all -inf logits, so no expert takes it),
 # which the kernel must not mix into the other rows: rows per engine, FP8
@@ -311,6 +311,8 @@ def _op_runner(mesh, cap, geometry=(E, H, INTER, TOPK), scores_cap=None):
     from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
 
     (w13, w2, s13, s2), starts, ranks, inputs, reference = _setup(mesh, geometry)
+    # Set directly: the interpret checks run in their own subprocess, and the
+    # multichip tests take the armed_scores_cap fixture, which restores it.
     moe_lowtok_scores._ARMED_MAX_TOKENS = cap if scores_cap is None else scores_cap
     topk = geometry[3]
     fn = moe_lowtok_fused_op.program(mesh, topk, cap)
@@ -377,6 +379,7 @@ def _built_op(mesh):
         registered.update(kwargs, name=name, fn=fn)
         return object()
 
+    # Patched directly: only the interpret checks' subprocess runs this.
     op.build_ep_mesh = lambda: Mesh(devices, (EP_AXIS_NAME,))
     op.sharded_jax_op = record
     op._DP, op._TP = DP, TP
@@ -707,6 +710,7 @@ def _call(rows=32, experts=E, logit_cols=None, **kwargs):
     ],
 )
 def test_refuses_unsupported_calls(kwargs, match):
+    kwargs = dict(kwargs)
     rows = kwargs.pop("rows", 32)
     with pytest.raises(ValueError, match=match):
         _call(rows=rows, **kwargs)
