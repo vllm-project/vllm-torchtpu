@@ -660,9 +660,12 @@ class PrefixAwareScheduler(AsyncScheduler):
             return "idle"
         if getattr(out, "preempted_req_ids", None):
             return "preempted"
-        # The admission check the scan stops at.
+        # The admission check the scan stops at. On a KV prefetch step,
+        # max_num_active_reqs is lifted until the step ends; the cap is the
+        # value prefetch saved.
         num_active = len(self.running) + self.num_waiting_for_streaming_input
-        if num_active >= self.max_num_active_reqs:
+        cap = self._kv_prefetch_cap
+        if num_active >= (self.max_num_active_reqs if cap is None else cap):
             return "max_running"
         if (
             getattr(out, "total_num_scheduled_tokens", 0)

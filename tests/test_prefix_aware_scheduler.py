@@ -382,6 +382,7 @@ def test_waiting_loop_stop_reason_and_admission_telemetry():
     s.block_size = 640
     s._inflight_prefills = set()
     s._decode_throttle_switch = False
+    s._kv_prefetch_cap = None
     out = SimpleNamespace(total_num_scheduled_tokens=640, num_scheduled_tokens={})
 
     s._step_wait_event = None
@@ -404,6 +405,11 @@ def test_waiting_loop_stop_reason_and_admission_telemetry():
     s.deferred_waiting = set()
     s.running = [object()] * 32
     assert s._waiting_loop_stop_reason(out, 1) == "max_running"
+    # On a KV prefetch step the cap is lifted (here by 8) until the step
+    # ends; a full running set still stops the loop at the cap.
+    s._kv_prefetch_cap, s.max_num_active_reqs = 32, 40
+    assert s._waiting_loop_stop_reason(out, 1) == "max_running"
+    s._kv_prefetch_cap, s.max_num_active_reqs = None, 32
     s.running = []
     s.waiting = []
     assert s._waiting_loop_stop_reason(out, 0) == "idle"
