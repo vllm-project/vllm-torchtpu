@@ -479,10 +479,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         Scans the first `window_blocks` blocks of the free queue in eviction
         order and parks one store job per whole cached block the tier does
         not hold yet, and per partly filled one when partial blocks are on.
-        The block is left in place: a store job is watched
-        through `_block_id_to_pending_jobs`, so when the allocator takes the
-        block, `build_connector_meta` cancels the job if it has not launched
-        and drains it if it has, before the block is written.
+        The block is left in place: a store job is watched through
+        `_block_id_to_pending_jobs`, so when the allocator takes the block,
+        `build_connector_meta` cancels the job if it has not launched and
+        drains it if it has, before the block is written.
         """
         lazy = self._lazy
         assert lazy is not None

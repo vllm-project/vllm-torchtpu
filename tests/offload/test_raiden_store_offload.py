@@ -4010,7 +4010,6 @@ class TestLazyPartialBlocks(unittest.TestCase):
     serve them, on a request whose prompt continues the stored one."""
 
     TPC = 4  # tokens per block; one hash per token, so 4 hash boundaries
-    NUM_WORKERS = 2
 
     def _make(self, partial=True, hashes_per_chunk=4):
         helper = TestLazyOffload()

@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import random
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -581,14 +582,15 @@ def make_scheduler(
             )
         ],
     )
-    scheduler = PrefixAwareScheduler(
-        vllm_config=vllm_config,
-        kv_cache_config=kv_cache_config,
-        structured_output_manager=StructuredOutputManager(vllm_config),
-        block_size=BLOCK,
-        log_stats=True,
-    )
-    scheduler.follow_shared_prefix = follow
+    with patch.dict(os.environ, {"VLLM_TPU_FOLLOW_SHARED_PREFIX": str(int(follow))}):
+        scheduler = PrefixAwareScheduler(
+            vllm_config=vllm_config,
+            kv_cache_config=kv_cache_config,
+            structured_output_manager=StructuredOutputManager(vllm_config),
+            block_size=BLOCK,
+            log_stats=True,
+        )
+    assert scheduler.follow_shared_prefix is follow
     return scheduler
 
 

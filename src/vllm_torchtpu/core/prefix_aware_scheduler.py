@@ -75,6 +75,8 @@ from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY = 1000
+# Shortest time between two logs of the follow-shared-prefix totals.
+_FOLLOW_STATS_INTERVAL_S = 30.0
 
 # Priority tiers: lower values admit earlier.
 _TIER_PREEMPTED = 1
@@ -128,6 +130,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._num_followed_steps = 0
         self._num_rejoins = 0
         self._num_followed_tokens = 0
+        self._follow_stats_logged_at: float | None = None
 
         logger.info(
             "PrefixAwareScheduler ACTIVE (window=%d, tier_warmth=%s, "
@@ -290,14 +293,22 @@ class PrefixAwareScheduler(AsyncScheduler):
         taken = max(rejoin.hit_tokens - rejoin.computed_tokens, 0)
         self._num_rejoins += 1
         self._num_followed_tokens += taken
-        logger.info(
+        logger.debug(
             "follow shared prefix: %s took %d cached tokens past its own %d "
-            "after %d followed steps (total: %d rejoins, %d followed steps, "
-            "%d cached tokens taken)",
+            "after %d followed steps",
             request.request_id,
             taken,
             rejoin.computed_tokens,
             rejoin.followed_steps,
+        )
+        now = time.monotonic()
+        last = self._follow_stats_logged_at
+        if last is not None and now - last < _FOLLOW_STATS_INTERVAL_S:
+            return
+        self._follow_stats_logged_at = now
+        logger.info(
+            "follow shared prefix totals: %d rejoins, %d followed steps, "
+            "%d cached tokens taken",
             self._num_rejoins,
             self._num_followed_steps,
             self._num_followed_tokens,
