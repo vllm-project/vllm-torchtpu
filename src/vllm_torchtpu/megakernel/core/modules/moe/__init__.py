@@ -11,13 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MoE module parameters, tunables, and routing helpers."""
+"""MoE module package: `MoEModule` (`MoE`) and its parameters / tunables."""
 
+from .module import MoEModule
 from .params import MoEDebug, MoEParams, MoETunables
 from .topk import topk_rows_on_lanes
 
+MoE = MoEModule
+
 __all__ = [
+    "MoE",
     "MoEDebug",
+    "MoEModule",
     "MoEParams",
     "MoETunables",
     "topk_rows_on_lanes",
