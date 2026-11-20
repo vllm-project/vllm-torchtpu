@@ -984,6 +984,146 @@ _spec_tail_compiled = _static_shape_args(
 )
 
 
+def _prep_fold_impl(
+    seq_lens,
+    positions,
+    num_rejected,
+    seq_lens_subtract_indices,
+    positions_subtract_indices,
+    next_tokens,
+    logits_indices,
+    target_logits_indices,
+    starts,
+    state_indices,
+    store,
+    scalars,
+    previous,
+    current,
+    *,
+    num_tokens: int,
+    ids_dtype: torch.dtype,
+    window: bool,
+    pooled: bool,
+    spec_window: int,
+    eos_token_id: int,
+    ngram_size: int,
+):
+    """VLLM_TPU_PREFWD_PREP_FOLD: a steady verify step's pre-forward prep as
+    one function, so it compiles to one program instead of three or four: the
+    async-spec rejected-count correction (`subtract_num_rejected_tokens`), the
+    1:1 token substitution with the verified-draft gather
+    (`_subst_prefix_extract_impl`) and the qwen4 step inputs
+    (`fused_step_inputs`, functional). The existing functions, unchanged, in
+    the order the unfolded step runs them; integer ops only, so the outputs
+    are bitwise the unfolded ones. Returns (seq_lens, positions, input ids,
+    drafts, context, history, slots, valid_tokens, record)."""
+    from vllm_torchtpu.models.vllm.qwen4_exp.inputs import fused_step_inputs
+    from vllm_torchtpu.runner.tpu_runner_async_output import (
+        subtract_num_rejected_tokens,
+    )
+
+    seq_lens, positions = subtract_num_rejected_tokens(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+    )
+    ids, drafts = _subst_prefix_extract_impl(
+        next_tokens, num_tokens, ids_dtype, logits_indices, target_logits_indices
+    )
+    prepped = fused_step_inputs(
+        starts,
+        seq_lens,
+        state_indices,
+        store,
+        scalars,
+        previous,
+        current,
+        ids,
+        window=window,
+        pooled=pooled,
+        spec_window=spec_window,
+        eos_token_id=eos_token_id,
+        ngram_size=ngram_size,
+        functional=True,
+    )
+    return (seq_lens, positions, ids, drafts, *prepped)
+
+
+_prep_fold_compiled = _static_shape_args(
+    torch.compile(_prep_fold_impl, backend="tpu", fullgraph=True, dynamic=False)
+)
+
+
+def _prep_fold_reference(*args, fault: bool = False, **static):
+    """VLLM_TPU_PREFWD_PREP_FOLD_CHECK: the unfolded sequence the folded program
+    replaces, eagerly (`fault`: seq_lens - 1, the positive control)."""
+    from vllm_torchtpu.models.vllm.qwen4_exp.inputs import fused_step_inputs
+    from vllm_torchtpu.runner.tpu_runner_async_output import (
+        extract_draft_token_ids,
+        subtract_num_rejected_tokens,
+    )
+
+    seq_lens, positions, num_rejected, seq_idx, pos_idx, src, logits, target = args[:8]
+    starts, state_indices, store, scalars, previous, current = args[8:]
+    if fault:
+        seq_lens = seq_lens - 1
+    seq_lens, positions = subtract_num_rejected_tokens(
+        seq_lens, positions, num_rejected, seq_idx, pos_idx
+    )
+    ids = _subst_prefix_impl(src, static["num_tokens"], static["ids_dtype"])
+    drafts = extract_draft_token_ids(ids, logits, target)
+    prepped = fused_step_inputs(
+        starts,
+        seq_lens,
+        state_indices,
+        store,
+        scalars,
+        previous,
+        current,
+        ids,
+        window=static["window"],
+        pooled=static["pooled"],
+        spec_window=static["spec_window"],
+        eos_token_id=static["eos_token_id"],
+        ngram_size=static["ngram_size"],
+        functional=True,
+    )
+    return (seq_lens, positions, ids, drafts, *prepped)
+
+
+def _prep_fold_key(args, static) -> tuple:
+    """What the folded program's compiled graph is specialized on: every tensor
+    input's shape and dtype, which inputs are the same tensor, and the static
+    arguments. Serving folds only keys warmup compiled."""
+    leaves: list[torch.Tensor] = []
+    for a in args:
+        leaves.extend(a if isinstance(a, tuple) else (a,))
+    first = {}
+    sig = tuple(
+        (tuple(t.shape), t.dtype, first.setdefault(id(t), i))
+        for i, t in enumerate(leaves)
+    )
+    return sig, tuple(sorted(static.items()))
+
+
+def _prep_fold_shapes(
+    max_num_reqs: int, width: int, num_tokens_paddings: list[int]
+) -> set[tuple[int, int]]:
+    """(rejected-count rows, token bucket) of the steady verify steps the fold
+    can serve: the 1:1 substitution needs `n * width` verify tokens to fill a
+    token bucket exactly, and the previous step's rejected counts have the
+    request count's exact or bucketed rows (as `_subtract_rejected_shapes`)."""
+    shapes: set[tuple[int, int]] = set()
+    buckets = set(num_tokens_paddings)
+    for n in range(1, max_num_reqs + 1):
+        if n * width in buckets:
+            for rows in {n, _get_padded_num_reqs_with_upper_limit(n, max_num_reqs)}:
+                shapes.add((rows, n * width))
+    return shapes
+
+
 logger = init_logger(__name__)
 
 
@@ -4058,6 +4198,185 @@ class TPUModelRunner(GPUModelRunner):
             return 0
         return int(self.speculative_config.num_speculative_tokens) + 1
 
+    def _subtract_rejected(
+        self, seq_lens: torch.Tensor, subtract_idx: tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Async spec: the previous step's rejected-count correction of
+        `seq_lens` and `self.position_ids`, for `_prepare_inputs`."""
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            subtract_num_rejected_tokens,
+        )
+
+        assert self._pre_async_results is not None
+        # The compiled program only for shapes warmup compiled (steady
+        # decode); prefill/mixed steps keep the eager ops rather than
+        # compiling mid-serve.
+        num_rejected = self._pre_async_results.spec_decode_num_rejected_tokens
+        compiled_shapes = self.__dict__.get("_subtract_compiled_shapes", ())
+        subtract_shape = (
+            num_rejected.shape[0],
+            self.position_ids.shape[-1],
+            seq_lens.shape[0],
+        )
+        if (
+            envs.VLLM_TPU_SUBTRACT_REJECTED_PAD_ROWS
+            and subtract_shape not in compiled_shapes
+        ):
+            # Prefill/mixed step: the (rows, token bucket) pair follows the
+            # previous step's batch, and each new pair compiled the eager
+            # correction mid-serve (45-95 ms on every rank). Padded rows
+            # leave one shape per bucket, precompiled below.
+            num_rejected = _pad_rejected_rows_compiled(num_rejected, self.max_num_reqs)
+            subtract_shape = (num_rejected.shape[0], *subtract_shape[1:])
+        subtract = (
+            _subtract_num_rejected_tokens_compiled
+            if envs.VLLM_TPU_SUBTRACT_REJECTED_COMPILED
+            and subtract_shape in compiled_shapes
+            else subtract_num_rejected_tokens
+        )
+        return subtract(
+            seq_lens,
+            self.position_ids,
+            num_rejected,
+            *subtract_idx,
+        )
+
+    def _prep_fold_precheck(
+        self,
+        start_index: int,
+        num_reqs: int,
+        end_index: int,
+        num_scheduled_tokens_per_req: np.ndarray,
+        padded_total_num_scheduled_tokens: int,
+        layout_plan: Any,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """VLLM_TPU_PREFWD_PREP_FOLD, host side: whether this chunk can run its
+        prep as the folded program (`_try_prep_fold` checks the rest), and if so
+        its substitution indices (host only, so computed early). Folds only the
+        one-chunk steady verify step whose substitution is the 1:1 slice of the
+        previous step's source; everything else keeps today's programs."""
+        adapter = self.model_adapter
+        pre = self._pre_async_results
+        if not (
+            self.scheduler_config.async_scheduling
+            and self.speculative_config is not None
+            and pre is not None
+            and pre.next_tokens_tpu is not None
+            and pre.next_tokens_tpu.dim() == 1
+            and start_index == 0
+            and end_index == self.input_batch.num_reqs
+            and getattr(self, "_dp_step_num_chunks", 1) in (None, 1)
+            and not self._pcp_enabled
+            and self._pp_wave is None
+            and not self.supports_mm_inputs
+            and not self.uses_mrope
+            and self.lora_config is None
+            and layout_plan.kind is SequenceLayoutKind.ALL
+            and not envs.VLLM_TPU_DRAFT_SHARD_ARGMAX
+            and adapter is not None
+            and getattr(adapter, "prep_fold_supported", lambda: False)()
+            and int(num_scheduled_tokens_per_req.sum())
+            == padded_total_num_scheduled_tokens
+            and pre.next_tokens_tpu.numel() >= padded_total_num_scheduled_tokens
+        ):
+            return None
+        cur, src = self._prepare_async_token_substitution_indices(
+            start_index, num_reqs, num_scheduled_tokens_per_req
+        )
+        identity = np.arange(padded_total_num_scheduled_tokens, dtype=np.int32)
+        if not (np.array_equal(cur, identity) and np.array_equal(src, identity)):
+            return None
+        return cur, src
+
+    def _try_prep_fold(
+        self,
+        seq_lens: torch.Tensor,
+        subtract_idx: tuple[torch.Tensor, torch.Tensor],
+        spec_decode_metadata: Any,
+        query_start_loc: torch.Tensor,
+        mamba_state_indices: torch.Tensor | None,
+        start_index: int,
+        num_reqs: int,
+    ) -> torch.Tensor | None:
+        """VLLM_TPU_PREFWD_PREP_FOLD: run the chunk's rejected-count correction,
+        token substitution, verified-draft gather and model-adapter step inputs
+        as one warmed program (`_prep_fold_impl`). Sets `self.position_ids`,
+        stashes the rest in `self._prep_fold_out` for execute_model and the
+        adapter, and returns the corrected seq_lens; None (nothing run) if the
+        step does not qualify or its shapes were not warmed."""
+        num_tokens = self.position_ids.shape[-1]
+        md = spec_decode_metadata
+        if (
+            md is None
+            or md.final_logits_indices.shape[0] != num_tokens
+            or md.target_logits_indices.shape[0] != num_tokens
+        ):
+            return None
+        assert self._pre_async_results is not None
+        assert self._pre_async_results.spec_decode_num_rejected_tokens is not None
+        adapter_args, static = self.model_adapter.prep_fold_args(
+            start_index, num_reqs, query_start_loc, mamba_state_indices
+        )
+        args = (
+            seq_lens,
+            self.position_ids,
+            self._pre_async_results.spec_decode_num_rejected_tokens,
+            *subtract_idx,
+            self._pre_async_results.next_tokens_tpu,
+            md.final_logits_indices,
+            md.target_logits_indices,
+            *adapter_args,
+        )
+        static = dict(num_tokens=num_tokens, ids_dtype=self.input_ids.dtype, **static)
+        key = _prep_fold_key(args, static)
+        if key not in self.__dict__.get("_prep_fold_keys", ()):
+            missed = self.__dict__.setdefault("_prep_fold_missed", set())
+            if key not in missed:
+                missed.add(key)
+                logger.info("PREFWD_PREP_FOLD: key %s not warmed, unfolded path", key)
+            return None
+        if envs.VLLM_TPU_PREFWD_PREP_FOLD == 2:
+            logger.info_once(
+                "PREFWD_PREP_FOLD=2: the spec-tail/draft-cat fold is not "
+                "implemented; folding level 1 only"
+            )
+        out = _prep_fold_compiled(*args, **static)
+        if envs.VLLM_TPU_PREFWD_PREP_FOLD_CHECK not in ("", "0"):
+            self._prep_fold_check(args, static, out)
+        seq_lens, self.position_ids, ids, drafts, *prepped = out
+        self._prep_fold_out = dict(
+            ids=ids,
+            drafts=drafts,
+            prepped=tuple(prepped),
+            row_start=start_index,
+            num_requests=num_reqs,
+        )
+        return seq_lens
+
+    def _prep_fold_check(self, args, static, out) -> None:
+        """VLLM_TPU_PREFWD_PREP_FOLD_CHECK: compare the folded outputs with the
+        unfolded ops run eagerly on the same inputs (`fault`: on seq_lens - 1).
+        Counts stay on device; one host read every 500 checks logs them."""
+        ref = _prep_fold_reference(
+            *args, fault=envs.VLLM_TPU_PREFWD_PREP_FOLD_CHECK == "fault", **static
+        )
+        got_leaves = [*out[:-1], *out[-1]]
+        ref_leaves = [*ref[:-1], *ref[-1]]
+        bad = sum(
+            (g != r).sum().to(torch.int64) for g, r in zip(got_leaves, ref_leaves)
+        )
+        if getattr(self, "_prep_fold_bad", None) is None:
+            self._prep_fold_bad = torch.zeros((), dtype=torch.int64, device=bad.device)
+            self._prep_fold_checks = 0
+        self._prep_fold_bad += bad
+        self._prep_fold_checks += 1
+        if self._prep_fold_checks % 500 == 1:
+            logger.info(
+                "PREFWD_PREP_FOLD check: %d mismatches in %d checked steps",
+                int(self._prep_fold_bad.item()),
+                self._prep_fold_checks,
+            )
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4319,6 +4638,13 @@ class TPUModelRunner(GPUModelRunner):
             )
             target_num_reqs = self.num_reqs_most_model_len
 
+        # VLLM_TPU_PREFWD_PREP_FOLD: the substitution indices computed early
+        # and the deferred correction's indices, when the step may fold.
+        fold_level = envs.VLLM_TPU_PREFWD_PREP_FOLD
+        prep_fold_subst = prep_fold_subtract = None
+        if fold_level:
+            self._prep_fold_out = None
+
         # Async spec: seq_lens/positions were advanced optimistically (every
         # draft from the previous step assumed accepted). Subtract the real
         # per-request rejected count on-device, keyed by req position.
@@ -4333,10 +4659,6 @@ class TPUModelRunner(GPUModelRunner):
             and self._pre_async_results.spec_decode_num_rejected_tokens is not None
             and self._pre_async_results.req_id_to_index_copy
         ):
-            from vllm_torchtpu.runner.tpu_runner_async_output import (
-                subtract_num_rejected_tokens,
-            )
-
             subtract_idx = None
             subtract_key = None
             if steady is not None:
@@ -4374,40 +4696,23 @@ class TPUModelRunner(GPUModelRunner):
                 if steady is not None:
                     steady.subtract_key = subtract_key
                     steady.subtract_idx = subtract_idx
-            # The compiled program only for shapes warmup compiled (steady
-            # decode); prefill/mixed steps keep the eager ops rather than
-            # compiling mid-serve.
-            num_rejected = self._pre_async_results.spec_decode_num_rejected_tokens
-            compiled_shapes = self.__dict__.get("_subtract_compiled_shapes", ())
-            subtract_shape = (
-                num_rejected.shape[0],
-                self.position_ids.shape[-1],
-                seq_lens.shape[0],
-            )
-            if (
-                envs.VLLM_TPU_SUBTRACT_REJECTED_PAD_ROWS
-                and subtract_shape not in compiled_shapes
-            ):
-                # Prefill/mixed step: the (rows, token bucket) pair follows the
-                # previous step's batch, and each new pair compiled the eager
-                # correction mid-serve (45-95 ms on every rank). Padded rows
-                # leave one shape per bucket, precompiled below.
-                num_rejected = _pad_rejected_rows_compiled(
-                    num_rejected, self.max_num_reqs
+            if fold_level:
+                prep_fold_subst = self._prep_fold_precheck(
+                    start_index,
+                    num_reqs,
+                    end_index,
+                    num_scheduled_tokens_per_req,
+                    padded_total_num_scheduled_tokens,
+                    layout_plan,
                 )
-                subtract_shape = (num_rejected.shape[0], *subtract_shape[1:])
-            subtract = (
-                _subtract_num_rejected_tokens_compiled
-                if envs.VLLM_TPU_SUBTRACT_REJECTED_COMPILED
-                and subtract_shape in compiled_shapes
-                else subtract_num_rejected_tokens
-            )
-            seq_lens, self.position_ids = subtract(
-                seq_lens,
-                self.position_ids,
-                num_rejected,
-                *subtract_idx,
-            )
+            if prep_fold_subst is not None:
+                # VLLM_TPU_PREFWD_PREP_FOLD: the correction may run inside the
+                # folded prep program below; decided there.
+                prep_fold_subtract = subtract_idx
+            else:
+                seq_lens, self.position_ids = self._subtract_rejected(
+                    seq_lens, subtract_idx
+                )
 
         # For decode-only case, cache constant device tensors to skip H2D.
         # query_start_loc, logits_indices, and request_distribution don't
@@ -4590,6 +4895,23 @@ class TPUModelRunner(GPUModelRunner):
             mamba_request_distribution = combined_device[3:6]
         assert request_distribution is not None
 
+        if prep_fold_subtract is not None:
+            folded_seq_lens = self._try_prep_fold(
+                seq_lens,
+                prep_fold_subtract,
+                spec_decode_metadata,
+                query_start_loc,
+                mamba_state_indices,
+                start_index,
+                num_reqs,
+            )
+            if folded_seq_lens is not None:
+                seq_lens = folded_seq_lens
+            else:
+                seq_lens, self.position_ids = self._subtract_rejected(
+                    seq_lens, prep_fold_subtract
+                )
+
         host_phases.mark("prep_host_and_uploads")
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
@@ -4651,11 +4973,15 @@ class TPUModelRunner(GPUModelRunner):
             self.set_active_loras(self.input_batch, padded_num_scheduled_tokens_per_req)
 
         # Prepare token substitution indices
-        cur_input_indices, pre_next_tokens_indices = (
-            self._prepare_async_token_substitution_indices(
-                start_index, num_reqs, num_scheduled_tokens_per_req
+        if prep_fold_subst is not None:
+            # Host only, computed early for the fold check (same values).
+            cur_input_indices, pre_next_tokens_indices = prep_fold_subst
+        else:
+            cur_input_indices, pre_next_tokens_indices = (
+                self._prepare_async_token_substitution_indices(
+                    start_index, num_reqs, num_scheduled_tokens_per_req
+                )
             )
-        )
 
         if not envs.VLLM_TPU_SEED_COPIES_LATE:
             self._collect_mamba_state_seed_copies(
@@ -5322,11 +5648,19 @@ class TPUModelRunner(GPUModelRunner):
                 # read offset; clear it before this chunk's forward gathers it.
                 self._reset_read_offsets_for_new_requests(start_index, num_reqs)
 
+            # VLLM_TPU_PREFWD_PREP_FOLD: this chunk's input ids and verified
+            # drafts already came from the folded prep program.
+            folded = (
+                self.__dict__.get("_prep_fold_out")
+                if envs.VLLM_TPU_PREFWD_PREP_FOLD
+                else None
+            )
             fuse_extract = bool(
                 envs.VLLM_TPU_SUBST_EXTRACT_FUSED
                 and self.scheduler_config.async_scheduling
                 and spec_decode_metadata is not None
                 and len(cur_input_indices) > 0
+                and folded is None
             )
             self._subst_extract_out = None
             if fuse_extract:
@@ -5336,9 +5670,13 @@ class TPUModelRunner(GPUModelRunner):
                     spec_decode_metadata.target_logits_indices,
                 )
             pending_extract = None
-            input_ids = self._apply_async_token_substitution(
-                self.input_ids, cur_input_indices, pre_next_tokens_indices
-            )
+            if folded is not None:
+                input_ids = folded["ids"]
+                self._subst_extract_out = folded["drafts"]
+            else:
+                input_ids = self._apply_async_token_substitution(
+                    self.input_ids, cur_input_indices, pre_next_tokens_indices
+                )
             self.__dict__.pop("_subst_extract_req", None)
             host_phases.mark("seed_reset_subst")
             # Async spec: the drafts the target verifies live in the substituted
@@ -5481,6 +5819,8 @@ class TPUModelRunner(GPUModelRunner):
                         input_ids,
                     )
                 )
+            if folded is not None:
+                self._prep_fold_out = None
 
             host_phases.mark("adapter_prepare_inputs")
             if seed_late:
@@ -8725,6 +9065,7 @@ class TPUModelRunner(GPUModelRunner):
                         self.num_tokens_paddings,
                         (self.num_reqs_max_model_len, self.num_reqs_most_model_len),
                     )
+            self._precompile_prep_fold()
 
             # Precompile multimodal vision encoder graphs
             self.encoder_cudagraph_manager = maybe_create_mm_encoder_manager(
@@ -9182,6 +9523,64 @@ class TPUModelRunner(GPUModelRunner):
                         bound,
                     )
                 )
+
+    def _precompile_prep_fold(self) -> None:
+        """VLLM_TPU_PREFWD_PREP_FOLD: compile the folded prep program for every
+        steady verify step it can serve (`_prep_fold_shapes`, both source
+        dtypes, each request-slot count), under no_grad like execute_model, and
+        record the keys: serving folds only these, so it never compiles."""
+        adapter = getattr(self, "model_adapter", None)
+        if not (
+            envs.VLLM_TPU_PREFWD_PREP_FOLD
+            and self.speculative_config
+            and self.scheduler_config.async_scheduling
+            and adapter is not None
+            and getattr(adapter, "prep_fold_supported", lambda: False)()
+        ):
+            return
+        start = time.perf_counter()
+        k = self.speculative_config.num_speculative_tokens
+        bound = self.max_num_reqs * (1 + k)
+        targets = {
+            n for n in (self.num_reqs_max_model_len, self.num_reqs_most_model_len) if n
+        }
+        shapes = _prep_fold_shapes(self.max_num_reqs, 1 + k, self.num_tokens_paddings)
+        keys: set[tuple] = set()
+
+        def dev(shape, dtype, fill=0):
+            return torch.full(shape, fill, dtype=dtype).to(self.device)
+
+        with torch.no_grad():
+            for target in sorted(targets):
+                starts = dev((target + 1,), self.query_start_loc_cpu.dtype)
+                state = dev((target,), torch.int32)
+                adapter_args, static = adapter.prep_fold_warm_args(starts, state)
+                for rows, tokens in sorted(shapes):
+                    if rows > target:
+                        continue
+                    for src_dtype in (torch.int32, torch.int64):
+                        args = (
+                            dev((target,), self.seq_lens_cpu.dtype),
+                            dev((tokens,), self.positions_cpu.dtype),
+                            dev((rows,), torch.int32),
+                            dev((target,), torch.int32, -1),
+                            dev((tokens,), torch.int32, -1),
+                            dev((bound,), src_dtype),
+                            dev((tokens,), torch.int32),
+                            dev((tokens,), torch.int32),
+                            *adapter_args,
+                        )
+                        kw = dict(num_tokens=tokens, ids_dtype=self.input_ids_cpu.dtype)
+                        kw.update(static)
+                        out = _prep_fold_compiled(*args, **kw)
+                        synchronize_tensors([*out[:-1], *out[-1]])
+                        keys.add(_prep_fold_key(args, kw))
+        self._prep_fold_keys = frozenset(keys)
+        logger.info(
+            "PREFWD_PREP_FOLD: warmed %d keys in %.1f s",
+            len(keys),
+            time.perf_counter() - start,
+        )
 
     def _precompile_mamba_rollback_helpers(self) -> None:
         """Warm the compiled rollback scatters at every bucket length.
