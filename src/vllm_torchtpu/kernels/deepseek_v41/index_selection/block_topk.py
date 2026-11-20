@@ -62,11 +62,11 @@ def _vmem_words(rows, width, block_width, k, blocks, block_size, buffers, reside
     )
 
 
-def _plan(rows, width, block_width, k, blocks, block_size):
+def _plan(rows, width, block_width, k, blocks, block_size, allow_resident=True):
     """(resident, buffers): resident rows when they fit, double-buffered if room."""
     capacity = plsc.get_sparse_core_info().vmem_capacity_bytes
     sizes = (rows, width, block_width, k, blocks, block_size)
-    for resident in (True, False):
+    for resident in (True, False)[not allow_resident :]:
         for buffers in (2, 1):
             if 4 * _vmem_words(*sizes, buffers, resident) <= capacity:
                 return resident, buffers
@@ -99,6 +99,7 @@ def block_topk(
     k: int,
     block_size: int,
     publish: int = 0,
+    maxima: jax.Array | None = None,
     scheduling_group_id: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Return ascending top-k key IDs per row, padded with -1.
@@ -111,6 +112,11 @@ def block_topk(
         publish: Also return the IDs of the `publish` highest block maxima,
             the newest visible block forced first; ascending, -1 padded, and
             ties keep the lowest IDs.
+        maxima: Optional FP32 [rows, cdiv(width, block_size) or more] maxima
+            of each row's `block_size`-key blocks, as `scores` holds them;
+            blocks past a row's length are never read. Given, the kernel
+            reads them instead of reducing the scores, and fetches only the
+            chosen blocks' keys.
         scheduling_group_id: Optional XLA scheduling-group ID.
     """
     rows, width = scores.shape
@@ -126,15 +132,31 @@ def block_topk(
     blocks = default_blocks(k, lanes, forced=bool(publish))
     candidates = blocks * block_size
     block_width = pl.cdiv(pl.cdiv(width, block_size), alignment) * alignment
+    given = maxima is not None
+    if given and (
+        maxima.dtype != jnp.float32
+        or maxima.shape[0] != rows
+        or maxima.shape[1] < pl.cdiv(width, block_size)
+    ):
+        raise ValueError("Block maxima must be FP32 [rows, blocks] or wider")
     lengths = jnp.clip(lengths.astype(jnp.int32), 0, width)
     # 1-D: a [rows, lanes] buffer pads each row to 128 lanes in VMEM.
     token_lengths = jnp.pad(lengths, (0, _length_words(rows) - rows))
-    plan = _plan(rows, width, block_width, k, blocks, block_size)
+    plan = _plan(
+        rows, width, block_width, k, blocks, block_size, allow_resident=not given
+    )
     assert plan is not None
     resident, buffers = plan
     chunk = _chunk(width)
+    # Given maxima are read in whole chunks of their row.
+    maxima_chunk = math.gcd(block_width, 8192)
+    inputs = (scores, token_lengths)
+    if given:
+        columns = min(maxima.shape[1], block_width)
+        maxima = jnp.pad(maxima[:, :columns], ((0, 0), (0, block_width - columns)))
+        inputs += (maxima,)
     # Streamed rows read scores in two alternating chunks.
-    score_words = buffers * width if resident else 2 * chunk
+    score_words = buffers * width if resident else lanes if given else 2 * chunk
     mesh = plsc.VectorSubcoreMesh(
         core_axis_name="core",
         subcore_axis_name="subcore",
@@ -159,6 +181,7 @@ def block_topk(
             # Streamed rows: the chosen blocks' keys, fetched from HBM.
             fetched=pltpu.VMEM((lanes if resident else candidates,), jnp.float32),
             score_sems=pltpu.SemaphoreType.DMA((2,)),
+            maxima_sem=pltpu.SemaphoreType.DMA,
             output_sem=pltpu.SemaphoreType.DMA,
             length_sem=pltpu.SemaphoreType.DMA,
             publish_sem=pltpu.SemaphoreType.DMA,
@@ -170,8 +193,7 @@ def block_topk(
     def kernel(
         score_ref,
         length_ref,
-        out_ref,
-        *publish_refs,
+        *refs,
         score_buffers,
         maxima,
         histogram,
@@ -181,11 +203,15 @@ def block_topk(
         limits,
         fetched,
         score_sems,
+        maxima_sem,
         output_sem,
         length_sem,
         publish_sem,
         fetch_sem,
     ):
+        maxima_ref, (out_ref, *publish_refs) = (
+            (refs[0], refs[1:]) if given else (None, refs)
+        )
         radix = Radix(histogram, lanes)
         strided = [radix.lane_ids * block_size + j for j in range(block_size)]
         first = jax.lax.axis_index("core") * mesh.num_subcores
@@ -239,6 +265,19 @@ def block_topk(
                     start = c * (chunk // block_size) + i * lanes
                     maxima[pl.ds(start, lanes)] = block_max(window)
 
+        def read_maxima(row_id, live_blocks):
+            """Copy the chunks of given maxima that hold the visible blocks."""
+
+            def copy(c):
+                window = pl.ds(c * maxima_chunk, maxima_chunk)
+                return pltpu.make_async_copy(
+                    maxima_ref.at[row_id, window], maxima.at[window], maxima_sem
+                )
+
+            reads = pl.cdiv(live_blocks, maxima_chunk)
+            pl.loop(0, reads)(lambda c: copy(c).start())
+            pl.loop(0, reads)(lambda c: copy(0).wait())
+
         def fetch_blocks(row_id, count):
             """DMA the keys of the first `count` chosen blocks into `fetched`."""
 
@@ -277,7 +316,9 @@ def block_topk(
             live_blocks = pl.cdiv(tokens, block_size)
             block_chunks = pl.cdiv(live_blocks, lanes)
             base = slot * width
-            if not resident:
+            if given:
+                read_maxima(row_id, live_blocks)
+            elif not resident:
                 stream_maxima(row_id, tokens)
             radix.clear()
 
@@ -364,7 +405,7 @@ def block_topk(
             last_row = first + ((rows - 1 - first) // stride) * stride
             pltpu.make_async_copy(output, out_ref.at[last_row], output_sem).wait()
 
-    result = kernel(scores, token_lengths)
+    result = kernel(*inputs)
     if scheduling_group_id is not None:
         result = jax.tree.map(
             lambda x: xla_metadata.set_xla_metadata(
