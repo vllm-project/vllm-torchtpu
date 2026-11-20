@@ -25,8 +25,11 @@ import torch
 NEG = -3.0e38
 
 
-def rowmax_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """``torch.topk(scores, k, dim=-1)`` without the sort.
+def rowmax_topk(
+    scores: torch.Tensor, k: int, values: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``torch.topk(scores, k, dim=-1)`` without the sort; with ``values``,
+    ``values.gather(-1, indices)`` as the weights.
 
     Returns ``(values, indices)``, values descending and indices int32. Ties
     resolve to the lowest expert id; the sort path leaves them undefined,
@@ -43,18 +46,20 @@ def rowmax_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tenso
     masked = torch.finfo(scores.dtype).min
 
     cur = torch.where(scores > NEG, scores, NEG)
-    values, indices = [], []
+    maxima, indices = [], []
     for _ in range(k):
         m = torch.amax(cur, dim=-1, keepdim=True)
         # Lowest column attaining the max; the rest fill with the last expert
         # so the min never selects a phantom.
         idx = torch.amin(torch.where(cur == m, iota, n - 1), dim=-1, keepdim=True)
-        values.append(m)
+        maxima.append(m)
         indices.append(idx)
         cur = torch.where(iota == idx, masked, cur)
 
-    weights = torch.cat(values, dim=-1)
     ids = torch.cat(indices, dim=-1)
+    if values is not None:
+        return values.gather(-1, ids.long()), ids
+    weights = torch.cat(maxima, dim=-1)
     # No score above the sentinel means no real maximum: keep the row
     # poisonous so the caller's renormalization propagates it.
     weights = torch.where(weights[..., :1] <= NEG, torch.nan, weights)

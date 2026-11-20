@@ -322,8 +322,12 @@ def select_experts(
         bias_shape = [1] * (scores.dim() - 1) + [-1]
         bias = e_score_correction_bias.float().view(bias_shape)
         scores_for_choice = scores + bias
-        _, topk_ids = _topk(scores_for_choice, topk)
-        topk_weights = scores.gather(-1, topk_ids.long())
+        if _ROUTER_TOPK == "rowmax":
+            # The kernel picks the unbiased scores itself, without a gather.
+            topk_weights, topk_ids = rowmax_select(scores_for_choice, topk, scores)
+        else:
+            _, topk_ids = _topk(scores_for_choice, topk)
+            topk_weights = scores.gather(-1, topk_ids.long())
     else:
         topk_weights, topk_ids = _topk(scores, topk)
 

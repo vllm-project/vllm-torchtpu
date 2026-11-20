@@ -21,7 +21,7 @@ elsewhere as the identical plain-torch algorithm in
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.router_topk import router_topk
+from vllm_torchtpu.kernels.router_topk import router_topk, router_topk_pick
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 
@@ -39,12 +39,25 @@ _op = pallas.jax_op("pallas::moe_router_topk", router_topk)
 _op.register_fake(_fake_router_topk)
 
 
-def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sort-free ``topk`` over the expert axis of ``[rows, experts]`` scores."""
+def _fake_router_topk_pick(scores: torch.Tensor, values: torch.Tensor, topk: int):
+    return _fake_router_topk(scores, topk)
+
+
+_pick_op = pallas.jax_op("pallas::moe_router_topk_pick", router_topk_pick)
+_pick_op.register_fake(_fake_router_topk_pick)
+
+
+def rowmax_select(
+    scores: torch.Tensor, topk: int, values: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sort-free ``topk`` over the expert axis of ``[rows, experts]`` scores;
+    with ``values``, weighs by ``values`` at the selected experts."""
     if scores.device.type != "tpu":
-        return rowmax_topk(scores, topk)
+        return rowmax_topk(scores, topk, values)
     if scores.dim() != 2:
         raise ValueError(
             f"router top-k kernel expects [rows, experts], got {scores.shape}"
         )
+    if values is not None:
+        return _pick_op(scores.float(), values.float(), topk)
     return _op(scores.float(), topk)

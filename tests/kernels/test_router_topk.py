@@ -164,3 +164,43 @@ def test_kernel_ties_and_nan_match_the_reference():
 def test_grid_rounds_up_over_the_tuned_block(rows, grid):
     block = min(MAX_BLOCK_ROWS, rows)
     assert -(-rows // block) == grid
+
+
+@pytest.mark.parametrize("rows", [8, 24, 48, 1040])
+def test_pick_weighs_by_values_at_the_selected_experts(rows):
+    """Biased selection, unbiased weights: the kernel's pick is the gather."""
+    rng = np.random.default_rng(rows)
+    values = rng.random((rows, 128), dtype=np.float32)
+    bias = rng.standard_normal(128, dtype=np.float32) * 0.1
+    scores = values + bias
+    kw, ki = select(jnp.asarray(scores), 4, interpret=True, values=jnp.asarray(values))
+    _, ref_i = select(jnp.asarray(scores), 4, interpret=True)
+    np.testing.assert_array_equal(np.asarray(ki), np.asarray(ref_i))
+    np.testing.assert_array_equal(
+        np.asarray(kw), np.take_along_axis(values, np.asarray(ki), axis=1)
+    )
+    rw, ri = rowmax_topk(torch.from_numpy(scores), 4, torch.from_numpy(values))
+    np.testing.assert_array_equal(np.asarray(kw), rw.numpy())
+    np.testing.assert_array_equal(np.asarray(ki), ri.numpy())
+
+
+@pytest.mark.parametrize("bad", [np.nan, -np.inf])
+def test_pick_on_ties_and_bad_rows_is_the_gather(bad):
+    """Ties, a partly and a wholly bad row: the pick still equals the gather."""
+    rng = np.random.default_rng(7)
+    values = rng.random((8, 128), dtype=np.float32)
+    scores = values.copy()
+    scores[0, :] = 0.5  # all tied
+    scores[1, ::3] = bad
+    scores[2, :] = bad
+    values[3, 5] = bad  # a bad weight at a selectable column
+    scores[3, 5] = 2.0
+    kw, ki = select(jnp.asarray(scores), 4, interpret=True, values=jnp.asarray(values))
+    _, ref_i = select(jnp.asarray(scores), 4, interpret=True)
+    np.testing.assert_array_equal(np.asarray(ki), np.asarray(ref_i))
+    np.testing.assert_array_equal(
+        np.asarray(kw), np.take_along_axis(values, np.asarray(ki), axis=1)
+    )
+    rw, ri = rowmax_topk(torch.from_numpy(scores), 4, torch.from_numpy(values))
+    np.testing.assert_array_equal(np.asarray(kw), rw.numpy())
+    np.testing.assert_array_equal(np.asarray(ki), ri.numpy())
