@@ -414,6 +414,32 @@ class TestTpuCompilerCache:
             )
             assert self._sc_offload_flags() == expected
 
+    @pytest.mark.parametrize(
+        "value,all_reduce,all_gather",
+        [
+            ("auto", 4194304, _TPU_VMEM_BYTES_PER_TENSOR_CORE["tpu7x"]),
+            ("12345", 12345, 12345),
+        ],
+    )
+    def test_env_override_sc_offload_threshold_tpu7x(
+        self, value, all_reduce, all_gather
+    ):
+        """In auto mode tpu7x offloads all-reduces from 4 MiB and all-gathers
+        from the VMEM size; an explicit value sets both."""
+        env_mock = {
+            "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": value,
+            "TPU_ACCELERATOR_TYPE": "tpu7x-8",
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
+            import vllm_torchtpu.env_override
+
+            importlib.reload(vllm_torchtpu.env_override)
+
+            assert self._sc_offload_flags() == [
+                f"--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes={all_reduce}",
+                f"--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes={all_gather}",
+            ]
+
     @pytest.mark.parametrize("value", ["banana", "-1"])
     def test_env_override_sc_offload_bad_value_raises(self, value):
         """A value that is not "auto" or a non-negative integer stops the

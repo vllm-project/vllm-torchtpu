@@ -106,6 +106,15 @@ _TPU_VMEM_BYTES_PER_TENSOR_CORE = {
     "v7x": 67108864,
 }
 
+# All-reduce SC-offload threshold where it differs from the VMEM one: on tpu7x
+# the offloaded hierarchical all-reduce beats the TensorCore one from 4 MiB up
+# (a prefill chunk's residual all-reduces); smaller ones, most decode ones, stay
+# on the TC.
+_TPU_SC_ALL_REDUCE_OFFLOAD_BYTES = {
+    "tpu7x": 4194304,
+    "v7x": 4194304,
+}
+
 
 def _fetch_tpu_type_from_metadata() -> str | None:
     # Inline the GCE metadata probe instead of delegating to
@@ -142,10 +151,22 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
     if override is not None:
         return override if override > 0 else None
 
+    return _chip_family_value(_TPU_VMEM_BYTES_PER_TENSOR_CORE)
+
+
+def _resolve_sc_all_reduce_offload_threshold_bytes() -> int | None:
+    # The family's all-reduce entry applies only in auto mode.
+    vmem = _resolve_sc_offload_threshold_bytes()
+    if vmem is None or envs.SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES is not None:
+        return vmem
+    return _chip_family_value(_TPU_SC_ALL_REDUCE_OFFLOAD_BYTES) or vmem
+
+
+def _chip_family_value(table: dict[str, int]) -> int | None:
     tpu_type = _tpu_type()
     if not tpu_type:
         return None
-    for prefix, size in _TPU_VMEM_BYTES_PER_TENSOR_CORE.items():
+    for prefix, size in table.items():
         if tpu_type.startswith(prefix):
             return size
     return None
@@ -205,16 +226,19 @@ if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
 # raise the SC-offload threshold to the per-tensor-core VMEM capacity so
 # typical per-layer AR/AG collectives run on TensorCore instead of being
 # offloaded to SparseCore. The chip family is detected from
-# TPU_ACCELERATOR_TYPE / GCE metadata and mapped to a VMEM constant above;
-# each flag is added only if the user hasn't supplied it explicitly.
+# TPU_ACCELERATOR_TYPE / GCE metadata and mapped to a VMEM constant above
+# (all-reduces: _TPU_SC_ALL_REDUCE_OFFLOAD_BYTES first, which offloads tpu7x's
+# prefill-sized ones); each flag is added only if the user hasn't supplied it.
 _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
-if _sc_offload_bytes is not None:
-    for _flag_name in (
+for _flag_name, _bytes in (
+    (
         "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
-        "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
-    ):
-        if not _user_has_flag(_flag_name):
-            _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
+        _resolve_sc_all_reduce_offload_threshold_bytes(),
+    ),
+    ("--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes", _sc_offload_bytes),
+):
+    if _bytes is not None and not _user_has_flag(_flag_name):
+        _libtpu_extra_args.append(f"{_flag_name}={_bytes}")
 
 # --xla_tpu_enable_sparse_core_hierarchical_all_reduce: run whatever
 # all-reduces libtpu offloads to the SparseCore (e.g. a prefill step's
