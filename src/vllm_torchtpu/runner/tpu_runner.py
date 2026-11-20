@@ -6284,6 +6284,10 @@ class TPUModelRunner(GPUModelRunner):
             apply_topk_topp=apply_topk_topp,
         )
 
+    # Like execute_model: the warm-up traces this step's programs under
+    # no_grad and dynamo guards on grad mode, so with grad on the first served
+    # verify step re-traced the steady tail and hung the engine.
+    @torch.no_grad()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
