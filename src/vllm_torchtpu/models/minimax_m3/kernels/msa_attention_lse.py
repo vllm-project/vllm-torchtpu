@@ -64,7 +64,8 @@ def _kernel(
     local_limit_ref,  # [Bq, 1] visible slots of the local page
     kv_hbm_ref,  # [pages, S / p, p, G * 2D] the whole cache, in HBM
     *refs,  # [scale pages (4-bit)], [aliased out, lse], out, lse, m, l, acc,
-    # page buffers, semaphores, [scale buffers, semaphores (4-bit)]
+    # page buffers, semaphores, [scale buffers, semaphores (4-bit)],
+    # [scores (transposed)]
     sm_scale: float,
     aliased: bool = False,
     fp4_rows: tuple[int, int] | str | None = None,
@@ -101,6 +102,8 @@ def _kernel(
     (the last entry is the call's group count); the query, selection and
     output blocks hold those tiles."""
     fp4 = fp4_rows is not None
+    if transposed:  # a group's masked scores (`attend_t`)
+        *refs, s_scr = refs
     tail = refs[len(refs) - (9 if fp4 else 7) :]
     o_ref, lse_ref, m_ref, l_ref, acc_ref, buf_ref, sem_ref = tail[:7]
     scale_hbm_ref = refs[0] if fp4 else None
@@ -278,7 +281,21 @@ def _kernel(
             s = jnp.where(mask, s, -jnp.inf)
             m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
             m_new = jnp.maximum(m_prev, jnp.max(s, axis=0, keepdims=True))
-            p = jnp.exp2(s - m_new)
+            scores = s_scr.at[pl.ds(0, width * page_size)]
+            scores[...] = s
+            # exp2 and p @ v read the scores back in a block of their own, so no
+            # score stays live across the max: held in registers, the [W * S,
+            # rows] tile spilled ~3 vector stores and ~4 loads per score vreg.
+            # `count` > 0 always holds here; the `pl.when` is only the block
+            # boundary.
+            pl.when(count > 0)(
+                functools.partial(attend_t_rest, single, scores, v, m_prev, m_new)
+            )
+
+        def attend_t_rest(single, scores, v, m_prev, m_new):
+            """`attend_t` from the max on: the softmax update of a group whose
+            masked scores are in `scores`."""
+            p = jnp.exp2(scores[...] - m_new)
             l_cur = jnp.sum(p, axis=0, keepdims=True)
             pv = jax.lax.dot_general(
                 v,
@@ -592,6 +609,19 @@ def _attention_call(
             ),
             pltpu.SemaphoreType.DMA((ring, 1)),
             *scale_scratch,
+            # `attend_t`'s masked scores of a group: pages_per_step * page_size *
+            # rows f32 (8 MiB at 32 pages of 32-token tiles), within
+            # `_VMEM_LIMIT_BYTES` with the page ring.
+            *(
+                [
+                    pltpu.VMEM(
+                        (pages_per_step * rows_per_page * packing, num_heads * block_q),
+                        jnp.float32,
+                    )
+                ]
+                if transposed
+                else []
+            ),
         ],
     )
     num_inputs = 4 + 5 + len(scale_inputs)
