@@ -59,6 +59,13 @@ def mark_padding(num_valid_tokens: int, num_padded_tokens: int) -> None:
         _padding_state.update(num_valid_tokens, num_padded_tokens)
 
 
+def local_padding_mask(num_tokens: int) -> torch.Tensor | None:
+    """This rank's padding mask for `num_tokens` rows, or None without state."""
+    if _padding_state is None:
+        return None
+    return _padding_state.get_local_padding_mask(num_tokens)
+
+
 def zero_routing_weights_for_padding(
     topk_ids: torch.Tensor, topk_weights: torch.Tensor, is_local_tensor: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:

@@ -1280,6 +1280,7 @@ class TestOnlineFp8Quantization:
 
     def test_custom_routing_called(self):
         """FP8 apply_monolithic should use custom_routing_function when present."""
+        from functools import partial
         from unittest.mock import MagicMock, patch
 
         from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
@@ -1300,6 +1301,9 @@ class TestOnlineFp8Quantization:
         method._use_adaptive_fused_moe = False
         method._moe_lowtok_scores_op = None
         method._tpu_activation_str = "silu"
+        # The routing lives in the grouped path, which the spec'd mock would
+        # otherwise replace; run the real one.
+        method._apply_grouped = partial(VllmFp8MoEMethodTPU._apply_grouped, method)
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
 

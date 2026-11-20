@@ -144,10 +144,15 @@ class VllmMoERunner(MoERunner):
         # Asked of this layer's quant method, because arming is per layer: a
         # model whose layers do not all qualify must not have one armed layer
         # answer for the rest.
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fused_moe_ep_v3_supported,
+        )
+
         owner = self._quant_method
         return (
             fused_moe_ep_supported(owner)
             or adaptive_fused_moe_supported(owner)
+            or fused_moe_ep_v3_supported(owner)
             or _upstream_fused_output_is_reduced(self)
         )
 
@@ -159,8 +164,16 @@ class VllmMoERunner(MoERunner):
         # _patch_moe_explicit_pcp_collectives.
         if self.moe_config.pcp_size <= 1:
             return False
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fused_moe_ep_v3_supported,
+        )
+
         owner = self._quant_method
-        return fused_moe_ep_supported(owner) or adaptive_fused_moe_supported(owner)
+        return (
+            fused_moe_ep_supported(owner)
+            or adaptive_fused_moe_supported(owner)
+            or fused_moe_ep_v3_supported(owner)
+        )
 
     def _maybe_dispatch(self, hidden_states, router_logits):
         if self._fused_ep_owns_pcp_collectives():
