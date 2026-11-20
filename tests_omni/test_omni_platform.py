@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import copy
 import gc
 import os
 import weakref
@@ -1404,23 +1405,12 @@ def test_ltx2_split_rope_torch_compile_skips_lane_cache(ltx2, table_syncs):
         omni_rope._first_half_lanes.cache_clear()
 
 
-def test_ltx2_guidance_sigma_scalar_cache(monkeypatch):
-    # Restore true module-level upstream methods (captured before autouse
-    # _omni_model_patches) and keep the real LTXGuidanceExecutor.predict_noise
-    # so we verify its state.video / state.audio identity and sigma indexing.
-    monkeypatch.setattr(
-        ltx2_denoise,
-        "prepare_scheduler_stage",
-        lambda pipeline, req, *a, **kw: (
-            SimpleNamespace(sigmas=torch.tensor([0.8, 0.4, 0.0])),
-            None,
-            torch.tensor([800.0, 400.0]),
-        ),
-    )
+def _ltx2_sigma_harness(monkeypatch, prepare):
+    """Real predict_noise with a spy on the real _guide_modality."""
+    monkeypatch.setattr(ltx2_denoise, "prepare_scheduler_stage", prepare)
     monkeypatch.setattr(
         ltx2_guidance.LTXGuidanceExecutor, "predict_noise", _UPSTREAM_PREDICT_NOISE
     )
-
     seen_calls: list[tuple[torch.Tensor, float | None]] = []
 
     def spy_guide(
@@ -1449,26 +1439,19 @@ def test_ltx2_guidance_sigma_scalar_cache(monkeypatch):
     monkeypatch.setattr(
         ltx2_guidance.LTXGuidanceExecutor, "_guide_modality", staticmethod(spy_guide)
     )
-
     patches._patch_ltx2_guidance_sigma_scalar()
     patches._patch_ltx2_guidance_sigma_scalar()  # idempotent
-
-    vid_sched = SimpleNamespace(sigmas=torch.tensor([1.0, 0.5, 0.0]))
 
     def _dummy_transformer(**kw):
         return kw["hidden_states"] * 0.5, kw["audio_hidden_states"] * 0.25
 
     pipe = SimpleNamespace(
-        scheduler=vid_sched,
+        scheduler=SimpleNamespace(sigmas=torch.tensor([1.0, 0.5, 0.0])),
         _build_transformer_kwargs=lambda _fctx, _dctx, **kw: kw,
         _transformer_cache_context=lambda _name: contextlib.nullcontext(),
         transformer=_dummy_transformer,
         _video_guidance_model_sigma=lambda sigma, _dctx: sigma,
     )
-    aud_sched, _, _ = ltx2_denoise.prepare_scheduler_stage(pipe, None)
-    assert vid_sched._tpu_sigma_scalars == pytest.approx((1.0, 0.5, 0.0))
-    assert aud_sched._tpu_sigma_scalars == pytest.approx((0.8, 0.4, 0.0))
-
     plan = ltx2_guidance.LTXGuidancePlan.build(
         ltx2_guidance.LTXGuidanceSpec(
             video=ltx2_guidance.LTXModalityGuidance(cfg_scale=3.0),
@@ -1482,43 +1465,55 @@ def test_ltx2_guidance_sigma_scalar_cache(monkeypatch):
         negative_connector_audio_prompt_embeds=torch.zeros(1, 2, 2),
     )
     state = SimpleNamespace(video=torch.randn(1, 4, 4), audio=torch.randn(1, 2, 2))
-    fctx = SimpleNamespace(
-        guidance_parallel_ready=False,
-        prompt_context=prompt_ctx,
-        attention_kwargs=None,
-        audio_scheduler=aud_sched,
-        original_audio_num_frames=None,
+
+    def make_fctx(audio_scheduler, parallel=False):
+        return SimpleNamespace(
+            guidance_parallel_ready=parallel,
+            prompt_context=prompt_ctx,
+            attention_kwargs=None,
+            audio_scheduler=audio_scheduler,
+            original_audio_num_frames=None,
+        )
+
+    def predict(fctx, ts=500.0):
+        seen_calls.clear()
+        ltx2_guidance.LTXGuidanceExecutor().predict_noise(
+            pipe, plan, 1, torch.tensor([ts]), state, fctx, None
+        )
+        assert len(seen_calls) == 2
+        for sigma, scalar in seen_calls:
+            assert scalar is not None
+            assert scalar == sigma.to(torch.float32).item()
+        return [scalar for _, scalar in seen_calls]
+
+    return pipe, make_fctx, predict
+
+
+def _no_tpu_attrs(obj):
+    return not [k for k in vars(obj) if k.startswith("_tpu_")]
+
+
+def test_ltx2_guidance_sigma_scalar_cache(monkeypatch):
+    # The real predict_noise (and predict_parallel_guidance via
+    # guidance_parallel_ready=True) passes state.video / state.audio and gets
+    # the cached float32 sigma for both modalities.
+    pipe, make_fctx, predict = _ltx2_sigma_harness(
+        monkeypatch,
+        lambda pipeline, req, *a, **kw: (
+            SimpleNamespace(sigmas=torch.tensor([0.8, 0.4, 0.0])),
+            None,
+            torch.tensor([800.0, 400.0]),
+        ),
     )
-    executor = ltx2_guidance.LTXGuidanceExecutor()
+    aud_sched, _, _ = ltx2_denoise.prepare_scheduler_stage(pipe, None)
+    assert _no_tpu_attrs(pipe.scheduler) and _no_tpu_attrs(aud_sched)
+    assert predict(make_fctx(aud_sched)) == pytest.approx([0.5, 0.4])
 
-    # Real predict_noise (non-parallel CFG) passes state.video / state.audio and
-    # injects matching float32 sigma_scalar for both modalities.
-    executor.predict_noise(pipe, plan, 1, torch.tensor([500.0]), state, fctx, None)
-    assert len(seen_calls) == 2
-    for sigma, scalar in seen_calls:
-        assert scalar is not None
-        assert scalar == sigma.to(torch.float32).item()
-    assert [s for _, s in seen_calls] == pytest.approx([0.5, 0.4])
+    # Replacing scheduler.sigmas with a new tensor refreshes the scalars.
+    pipe.scheduler.sigmas = torch.tensor([0.9, 0.25, 0.0])
+    assert predict(make_fctx(aud_sched), ts=250.0) == pytest.approx([0.25, 0.4])
 
-    # Replacing scheduler.sigmas with new storage refreshes the cached scalars.
-    vid_sched.sigmas = torch.tensor([0.9, 0.25, 0.0])
-    seen_calls.clear()
-    executor.predict_noise(pipe, plan, 1, torch.tensor([250.0]), state, fctx, None)
-    assert len(seen_calls) == 2
-    for sigma, scalar in seen_calls:
-        assert scalar is not None
-        assert scalar == sigma.to(torch.float32).item()
-    assert [s for _, s in seen_calls] == pytest.approx([0.25, 0.4])
-
-    # Real predict_parallel_guidance (entered via predict_noise when
-    # guidance_parallel_ready=True) also receives the cached scalars.
-    fctx_par = SimpleNamespace(
-        guidance_parallel_ready=True,
-        prompt_context=prompt_ctx,
-        attention_kwargs=None,
-        audio_scheduler=aud_sched,
-        original_audio_num_frames=None,
-    )
+    # The CFG-parallel path receives the cached scalars too.
     monkeypatch.setattr(ltx2_guidance, "get_guidance_parallel_world_size", lambda: 2)
     monkeypatch.setattr(ltx2_guidance, "get_guidance_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -1528,13 +1523,34 @@ def test_ltx2_guidance_sigma_scalar_cache(monkeypatch):
             all_gather=lambda val, separate_tensors=True: [val, val]
         ),
     )
-    seen_calls.clear()
-    executor.predict_noise(pipe, plan, 1, torch.tensor([250.0]), state, fctx_par, None)
-    assert len(seen_calls) == 2
-    for sigma, scalar in seen_calls:
-        assert scalar is not None
-        assert scalar == sigma.to(torch.float32).item()
-    assert [s for _, s in seen_calls] == pytest.approx([0.25, 0.4])
+    fctx_par = make_fctx(aud_sched, parallel=True)
+    assert predict(fctx_par, ts=250.0) == pytest.approx([0.25, 0.4])
+
+
+def test_ltx2_guidance_sigma_scalar_cache_never_serves_stale_sigmas(monkeypatch):
+    # Regression: the cache was validated by storage address and stored on the
+    # scheduler. Upstream prepare_scheduler_stage deep-copies the video
+    # scheduler into audio_scheduler, and a new schedule can land at the old
+    # address (simulated here by writing it into the same storage), so the
+    # previous schedule's scalars were served.
+    def prepare(pipeline, schedule, *a, **kw):
+        audio_scheduler = copy.deepcopy(pipeline.scheduler)
+        pipeline.scheduler.sigmas.copy_(schedule)
+        audio_scheduler.sigmas = schedule.clone()
+        return audio_scheduler, None, schedule[:-1] * 1000
+
+    pipe, make_fctx, predict = _ltx2_sigma_harness(monkeypatch, prepare)
+    for values in ([1.0, 0.5, 0.0], [0.9, 0.25, 0.0], [0.8, 0.125, 0.0]):
+        aud_sched, _, _ = ltx2_denoise.prepare_scheduler_stage(
+            pipe, torch.tensor(values)
+        )
+        assert _no_tpu_attrs(pipe.scheduler) and _no_tpu_attrs(aud_sched)
+        assert predict(make_fctx(aud_sched)) == pytest.approx([values[1]] * 2)
+
+    # An in-place schedule edit between stages is seen through the version
+    # counter.
+    pipe.scheduler.sigmas.copy_(torch.tensor([0.7, 0.375, 0.0]))
+    assert predict(make_fctx(aud_sched)) == pytest.approx([0.375, 0.125])
 
 
 def test_ltx2_async_guidance_step_avoids_blocking_sync(monkeypatch, table_syncs):
@@ -1544,6 +1560,12 @@ def test_ltx2_async_guidance_step_avoids_blocking_sync(monkeypatch, table_syncs)
         ltx2_runtime.LTXRuntime,
         "_synchronize_guidance_parallel_step_output",
         _UPSTREAM_SYNC_GUIDANCE_STEP,
+    )
+    blocking_syncs: list[bool] = []
+    monkeypatch.setattr(
+        ltx2_runtime.current_omni_platform,
+        "synchronize",
+        lambda *args, **kwargs: blocking_syncs.append(True),
     )
     patches._patch_ltx2_async_guidance_step()
     patched = ltx2_runtime.LTXRuntime._synchronize_guidance_parallel_step_output
@@ -1582,7 +1604,5 @@ def test_ltx2_async_guidance_step_avoids_blocking_sync(monkeypatch, table_syncs)
     assert len(table_syncs) == 3 and len(table_syncs[2]) == 2
     assert table_syncs[2][0] is out_multi[0]
 
-    # Under torch.compile the single-pass path does not flush.
-    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    out_traced = patched(None, (v, a), guidance_parallel_ready=False)
-    assert out_traced[0] is v and len(table_syncs) == 3
+    # No path calls upstream's blocking device synchronize.
+    assert blocking_syncs == []

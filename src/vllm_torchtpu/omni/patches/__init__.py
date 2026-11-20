@@ -908,6 +908,9 @@ def _patch_ltx2_per_batch_timestep() -> None:
 
 
 _LTX2_GUIDANCE_SIGMA_SCALAR_PATCHED = "_tpu_ltx2_guidance_sigma_scalar_patched"
+# Live entries are one video and one audio schedule per stage; the bound only
+# drops entries whose sigma tensors are gone.
+_MAX_SIGMA_CACHE_ENTRIES = 8
 _LTX2_ASYNC_STEP_PATCHED = "_tpu_ltx2_async_step_patched"
 
 
@@ -932,6 +935,18 @@ def _patch_ltx2_guidance_sigma_scalar() -> None:
     supplying ``sigma_scalar`` eliminates all per-step D2H host syncs while
     preserving the exact IEEE-754 ``float32`` scalar value.
 
+    The cache lives in this closure, keyed by the sigma tensor's identity (a
+    weakref) and version counter, never by storage address and never on the
+    scheduler: ``prepare_scheduler_stage`` deep-copies ``pipeline.scheduler``
+    into ``audio_scheduler``, and a freed schedule's address can be reused by
+    the next one. Each scheduler stage also refreshes it unconditionally.
+
+    Limitations: ``combine_cfg_velocity`` (``ltx2_guidance.py``) still calls
+    ``.item()`` per call. It is reached only through the generic
+    ``combine_cfg_noise`` CFG-parallel hook, not through ``predict_noise``.
+    Removing these reads also removes the per-step graph cut they made; the
+    step flush in ``_patch_ltx2_async_guidance_step`` replaces it.
+
     REMOVAL / FIX CONDITION:
     Remove once vLLM-Omni pre-materializes scheduler sigmas on CPU and passes
     ``sigma_scalar`` from ``LTXGuidanceExecutor.predict_noise`` /
@@ -951,23 +966,37 @@ def _patch_ltx2_guidance_sigma_scalar() -> None:
     orig_predict_noise = executor_cls.predict_noise
     orig_guide_modality = executor_cls._guide_modality
     active_step_sigma_map: dict[int, float | None] = {}
+    # id(sigmas) -> (weakref to sigmas, version counter or None, scalars).
+    sigma_cache: dict[int, tuple[Any, int | None, tuple[float, ...]]] = {}
 
-    def _ensure_sigma_scalars(scheduler: Any) -> tuple[float, ...] | None:
+    def _ensure_sigma_scalars(
+        scheduler: Any, *, refresh: bool = False
+    ) -> tuple[float, ...] | None:
         sigmas_t = getattr(scheduler, "sigmas", None)
-        # The explicit None check narrows for pyrefly, where torch is `Any`.
-        if sigmas_t is None or not isinstance(sigmas_t, torch.Tensor):
+        if not isinstance(sigmas_t, torch.Tensor) or sigmas_t.ndim != 1:
             return None
-        ptr = sigmas_t.untyped_storage().data_ptr()
-        cached_ptr = getattr(scheduler, "_tpu_sigma_scalars_ptr", None)
-        cached_scalars = getattr(scheduler, "_tpu_sigma_scalars", None)
-        if cached_scalars is not None and cached_ptr == ptr and ptr != 0:
-            return cached_scalars
+        key = id(sigmas_t)
+        # Inference tensors have no version counter; the per-stage refresh
+        # covers schedules rebuilt in inference mode.
+        version = None if sigmas_t.is_inference() else sigmas_t._version
+        entry = sigma_cache.get(key)
+        if (
+            not refresh
+            and entry is not None
+            and entry[0]() is sigmas_t
+            and entry[1] == version
+        ):
+            return entry[2]
         scalars = tuple(
             float(x)
             for x in sigmas_t.detach().to(device="cpu", dtype=torch.float32).tolist()
         )
-        scheduler._tpu_sigma_scalars = scalars
-        scheduler._tpu_sigma_scalars_ptr = ptr
+        if len(sigma_cache) >= _MAX_SIGMA_CACHE_ENTRIES:
+            for dead in [k for k, e in sigma_cache.items() if e[0]() is None]:
+                del sigma_cache[dead]
+            if len(sigma_cache) >= _MAX_SIGMA_CACHE_ENTRIES:
+                sigma_cache.clear()
+        sigma_cache[key] = (weakref.ref(sigmas_t), version, scalars)
         return scalars
 
     def _cached_prepare_scheduler_stage(
@@ -979,9 +1008,8 @@ def _patch_ltx2_guidance_sigma_scalar() -> None:
         audio_scheduler, video_audio_step_adapter, timesteps_tensor = (
             orig_prepare_scheduler_stage(pipeline, request_inputs, *args, **kwargs)
         )
-        if not torch.compiler.is_compiling():
-            _ensure_sigma_scalars(getattr(pipeline, "scheduler", None))
-            _ensure_sigma_scalars(audio_scheduler)
+        _ensure_sigma_scalars(getattr(pipeline, "scheduler", None), refresh=True)
+        _ensure_sigma_scalars(audio_scheduler, refresh=True)
         return audio_scheduler, video_audio_step_adapter, timesteps_tensor
 
     def _predict_noise_with_cached_sigma(
@@ -995,21 +1023,18 @@ def _patch_ltx2_guidance_sigma_scalar() -> None:
         denoise_ctx: Any,
         preserve_positive_velocity: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not torch.compiler.is_compiling():
-            v_scalars = _ensure_sigma_scalars(getattr(pipeline, "scheduler", None))
-            a_scalars = _ensure_sigma_scalars(
-                getattr(forward_ctx, "audio_scheduler", None)
-            )
-            active_step_sigma_map[id(state.video)] = (
-                v_scalars[index]
-                if v_scalars is not None and 0 <= index < len(v_scalars)
-                else None
-            )
-            active_step_sigma_map[id(state.audio)] = (
-                a_scalars[index]
-                if a_scalars is not None and 0 <= index < len(a_scalars)
-                else None
-            )
+        v_scalars = _ensure_sigma_scalars(getattr(pipeline, "scheduler", None))
+        a_scalars = _ensure_sigma_scalars(getattr(forward_ctx, "audio_scheduler", None))
+        active_step_sigma_map[id(state.video)] = (
+            v_scalars[index]
+            if v_scalars is not None and 0 <= index < len(v_scalars)
+            else None
+        )
+        active_step_sigma_map[id(state.audio)] = (
+            a_scalars[index]
+            if a_scalars is not None and 0 <= index < len(a_scalars)
+            else None
+        )
         try:
             return orig_predict_noise(
                 self,
@@ -1083,7 +1108,8 @@ def _patch_ltx2_async_guidance_step() -> None:
     the sync there, but its ``velocity_from_x0`` ``.item()`` cut the lazy graph
     every step; ``_patch_ltx2_guidance_sigma_scalar`` removes that read, so
     without this flush the whole loop and the decoder would trace into one
-    TPU program.
+    TPU program. This runs in the host denoise loop, never under
+    ``torch.compile``.
 
     REMOVAL / FIX CONDITION:
     Remove once vLLM-Omni gates the blocking ``synchronize()`` in
@@ -1112,8 +1138,7 @@ def _patch_ltx2_async_guidance_step() -> None:
             guidance_parallel_ready
             and parallel_state.get_classifier_free_guidance_world_size() > 1
         ):
-            if not torch.compiler.is_compiling():
-                synchronize_tensors(list(latents), wait=False)
+            synchronize_tensors(list(latents), wait=False)
             return latents
         latents = tuple(tensor.contiguous() for tensor in latents)
         synchronize_tensors(list(latents), wait=False)
