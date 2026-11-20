@@ -764,7 +764,9 @@ def test_experts_that_do_not_split_over_the_shards_are_refused():
         )
 
 
-def _admit(w1_shape, w2_shape, *, hidden, shards, tokens, experts_per_shard=None):
+def _admit(
+    w1_shape, w2_shape, *, hidden, shards, tokens, experts_per_shard=None, top_k=2
+):
     """Calls fused_ep_moe on abstract fp8 weights of the given shapes over a
     stand-in mesh of `shards` shards, with scales and logits that fit w1."""
     import types
@@ -786,7 +788,7 @@ def _admit(w1_shape, w2_shape, *, hidden, shards, tokens, experts_per_shard=None
         abstract((experts, w1_shape[-1]), jnp.float32),
         abstract((experts, hidden), jnp.float32),
         abstract((tokens, routed), jnp.float32),
-        top_k=2,
+        top_k=top_k,
         renormalize=True,
         mesh=mesh,
         tile_rows=TILE_ROWS,
@@ -824,15 +826,17 @@ class _Admitted(Exception):
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("experts", [512, 544], ids=["dp4tp2", "tp8"])
 def test_the_qwen3_5_decode_weight_shapes_are_admitted(monkeypatch, experts):
-    """The Qwen3.5-397B-A17B decode calls' weights pass the shape checks:
-    hidden 4096, intermediate 1024, eight shards of 64 routed experts, the
-    TP8 binding's weights with 4 copy slots a shard (68)."""
+    """The Qwen3.5-397B-A17B decode calls' weights pass every check before
+    the build: hidden 4096, intermediate 1024, eight shards of 64 routed
+    experts, the TP8 binding's weights with 4 copy slots a shard (68), whose
+    routed experts, top_k and router logits are checked against the 512
+    routed experts, not the 544 slots."""
     from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer
 
-    def admitted(**kwargs):
+    def admitted(*args, **kwargs):
         raise _Admitted
 
-    monkeypatch.setattr(v3_layer, "check_tested_routing", admitted)
+    monkeypatch.setattr(v3_layer, "check_tested", admitted)
     with pytest.raises(_Admitted):
         _admit(
             (experts, 4096, 2048),
@@ -841,6 +845,19 @@ def test_the_qwen3_5_decode_weight_shapes_are_admitted(monkeypatch, experts):
             shards=8,
             tokens=8 * 128,
             experts_per_shard=64,
+        )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("top_k", [0, 17])
+def test_a_top_k_outside_the_routed_experts_is_refused(top_k):
+    """top_k is checked once, against the experts the kernel routes over
+    (here all 16 weight slots), and the error names that range."""
+    with pytest.raises(
+        ValueError, match=f"top_k {top_k}: the kernel routes over 16 experts"
+    ):
+        _admit(
+            (16, 256, 256), (16, 128, 256), hidden=256, shards=8, tokens=32, top_k=top_k
         )
 
 

@@ -793,10 +793,6 @@ def fused_ep_moe(
     tokens, hidden = x.shape
     num_experts = w1.shape[0]
     inter = w1.shape[2] // (1 if no_gate else 2)
-    if not 1 <= top_k <= num_experts:
-        raise ValueError(
-            f"top_k {top_k}: the kernel takes 1 to {num_experts} selections per token"
-        )
     if routing is not None:
         routing_indices, routing_weights = routing
         for name, r in (("indices", routing_indices), ("weights", routing_weights)):
