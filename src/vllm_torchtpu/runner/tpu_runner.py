@@ -1009,6 +1009,15 @@ class TPUModelRunner(GPUModelRunner):
 
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
+        # Last padded sampling params per (rows, dtype): host copies and the
+        # device tensors uploaded from them (_build_padded_sampling_params).
+        self._padded_sampling_params: dict[
+            tuple[int, torch.dtype],
+            tuple[
+                tuple[torch.Tensor, ...],
+                tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+            ],
+        ] = {}
 
         self._init_phased_profiling()
         # The timings reach a metrics sink only through the KV connector's
@@ -7403,11 +7412,18 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx]
         )
 
-        return (
-            temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+        # A batch keeps its sampling params from step to step: reuse the last
+        # upload when the padded rows are unchanged (the consumers only read).
+        host = (temps_cpu, top_k_cpu, top_p_cpu)
+        key = (padded_num_reqs, logits.dtype)
+        cached = self._padded_sampling_params.get(key)
+        if cached is not None and all(map(torch.equal, cached[0], host)):
+            return cached[1]
+        temps, top_k, top_p = (
+            t.unsqueeze(1).to(logits.device, non_blocking=True) for t in host
         )
+        self._padded_sampling_params[key] = (host, (temps, top_k, top_p))
+        return temps, top_k, top_p
 
     def _init_fused_greedy_head(self) -> None:
         self._fused_greedy_head: FusedGreedyHead | None = None

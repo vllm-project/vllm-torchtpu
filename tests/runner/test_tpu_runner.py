@@ -3292,3 +3292,28 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+
+
+def test_padded_sampling_params_reuse_the_last_upload():
+    temps = torch.tensor([0.7, 1.0, 0.0])
+    runner = SimpleNamespace(
+        vocab_size=100,
+        input_batch=SimpleNamespace(
+            temperature_cpu_tensor=temps,
+            top_k_cpu_tensor=torch.tensor([5, 100, 0], dtype=torch.int32),
+            top_p_cpu_tensor=torch.tensor([0.9, 1.0, 1.0]),
+        ),
+        _padded_sampling_params={},
+    )
+    logits = torch.zeros(4, 8)
+    build = TPUModelRunner._build_padded_sampling_params
+
+    first = build(runner, 0, 3, logits)
+    assert first[0].view(-1).tolist() == pytest.approx([0.7, 1.0, 0.0, 1.0])
+    assert first[1].view(-1).tolist() == [5, 0, 0, 0]
+    assert all(a is b for a, b in zip(build(runner, 0, 3, logits), first))
+
+    temps[0] = 0.5
+    changed = build(runner, 0, 3, logits)
+    assert changed[0] is not first[0]
+    assert changed[0].view(-1).tolist() == pytest.approx([0.5, 1.0, 0.0, 1.0])
