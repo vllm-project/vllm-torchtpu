@@ -19,7 +19,11 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 import pytest
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs, flash_attention
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    configs,
+    flash_attention,
+    wrapper,
+)
 
 
 def _serve(**kw):
@@ -86,7 +90,6 @@ def test_p_prescaled_needs_exp2_and_static_pv():
 
 def _wrapper_serving_config(monkeypatch, **kwargs):
     """The ServingConfigs keyword arguments the wrapper resolves for one call."""
-    from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper
 
     class _Stop(Exception):
         pass
@@ -136,8 +139,6 @@ def test_wrapper_accepts_static_decode_modes(monkeypatch):
 def test_exp2_dropped_for_an_lse_or_soft_cap_call_is_logged(
     monkeypatch, return_lse, soft_cap
 ):
-    from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper
-
     warnings = []
     monkeypatch.setattr(
         wrapper,
