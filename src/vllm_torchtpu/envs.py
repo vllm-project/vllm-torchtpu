@@ -403,6 +403,8 @@ if TYPE_CHECKING:
     VLLM_TPU_DRAFT_ROWS_FRESH: bool = False
     VLLM_TPU_DRAFT_CARRY_ROWS_FRESH: bool = False
     VLLM_TPU_SUBST_EXTRACT_FUSED: bool = False
+    VLLM_TPU_PREFWD_PREP_FOLD: int = 0
+    VLLM_TPU_PREFWD_PREP_FOLD_CHECK: str = ""
     VLLM_TPU_EXTRACT_DRAFTS_COMPILED: bool = False
     VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD: bool = False
     VLLM_TPU_WARM_SERVING_THREADS: bool = False
@@ -2568,6 +2570,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # also gathers the verified draft tokens (extract_draft_token_ids), one
     # program instead of two. Same values.
     "VLLM_TPU_SUBST_EXTRACT_FUSED": env_bool("VLLM_TPU_SUBST_EXTRACT_FUSED"),
+    # Async spec decode, steady one-chunk verify steps with the qwen4 fused step
+    # inputs: run the rejected-count correction, the 1:1 token substitution with
+    # the verified-draft gather, and fused_step_inputs as one compiled program
+    # (1) instead of three or four. Folds only shapes warmed before serving;
+    # every other step keeps today's programs. 2 (also folding the previous
+    # step's spec tail and draft cat) is not implemented and runs as 1. Same
+    # values.
+    "VLLM_TPU_PREFWD_PREP_FOLD": lambda: int(
+        env_with_choices("VLLM_TPU_PREFWD_PREP_FOLD", "0", ["", "0", "1", "2"])() or 0
+    ),
+    # With VLLM_TPU_PREFWD_PREP_FOLD: also run the unfolded ops eagerly on every
+    # folded step and count mismatches on device, logged every 500 checks
+    # (`fault` perturbs the reference: the positive control).
+    "VLLM_TPU_PREFWD_PREP_FOLD_CHECK": env_with_choices(
+        "VLLM_TPU_PREFWD_PREP_FOLD_CHECK", "", ["", "0", "1", "fault"]
+    ),
     # Async spec decode: gather the verified drafts (extract_draft_token_ids)
     # with one static-shape compiled program per (token bucket, padded logits
     # length), all warmed before serving. Eager, the gather compiled each new

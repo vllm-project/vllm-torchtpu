@@ -380,6 +380,13 @@ class Qwen4ExpAdapter:
         return history
 
     def prepare_inputs(self, snapshot):
+        folded = (
+            getattr(self.runner, "_prep_fold_out", None)
+            if envs.VLLM_TPU_PREFWD_PREP_FOLD
+            else None
+        )
+        if folded is not None:
+            return self._finish_prep_fold(snapshot, folded)
         if (
             envs.VLLM_TPU_QWEN4_FUSED_PREP
             and envs.VLLM_TPU_QWEN4_NGRAM_WINDOW != "check"
@@ -481,24 +488,22 @@ class Qwen4ExpAdapter:
         self._scalars_prev = (key, dev)
         return dev
 
-    def _prepare_inputs_fused(self, snapshot):
-        """VLLM_TPU_QWEN4_FUSED_PREP: ``prepare_inputs`` with its device work in
-        one compiled program (``fused_step_inputs``) fed by at most two uploads."""
+    def _fused_host_args(self, row_start, num_requests, rows, token_store):
+        """``fused_step_inputs``'s host-built inputs for one chunk: the scalars
+        array (recording this chunk's rows for the next step), the speculative
+        record pair and the n-gram store (with the window, its upload)."""
         import numpy as np
 
         runner = self.runner
-        ctx = runner._attn_metadata_builder_ctx
-        starts = ctx.query_start_loc
-        rows = starts.shape[0] - 1
         scalars = np.full(2 + (rows if self.spec_window else 0), -1, dtype=np.int64)
-        scalars[0] = snapshot.row_start
-        scalars[1] = snapshot.num_requests
+        scalars[0] = row_start
+        scalars[1] = num_requests
         if self.spec_window:
             req_ids = runner.input_batch.req_ids
-            for i in range(snapshot.num_requests):
-                req_id = req_ids[snapshot.row_start + i]
+            for i in range(num_requests):
+                req_id = req_ids[row_start + i]
                 scalars[2 + i] = self._previous_rows.get(req_id, -1)
-                self._current_rows[req_id] = snapshot.row_start + i
+                self._current_rows[req_id] = row_start + i
             previous, current = self._recent_buffers(runner.device)
         else:
             previous = current = None
@@ -509,15 +514,114 @@ class Qwen4ExpAdapter:
                 ngram_window_from_host(
                     runner.input_batch.token_ids_cpu_tensor.numpy(),
                     runner.input_batch.num_computed_tokens_cpu,
-                    snapshot.row_start,
-                    snapshot.num_requests,
+                    row_start,
+                    num_requests,
                     rows,
                     width,
                     self.config.eos_token_id,
                 )
             )
         else:
-            store = snapshot.token_store
+            store = token_store
+        return scalars, previous, current, window, store
+
+    def prep_fold_supported(self):
+        """VLLM_TPU_PREFWD_PREP_FOLD: ``prepare_inputs`` runs the functional
+        fused program, the only form the runner's folded prep reproduces."""
+        return bool(
+            self.spec_window
+            and envs.VLLM_TPU_QWEN4_FUSED_PREP
+            and envs.VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL
+            and envs.VLLM_TPU_QWEN4_NGRAM_WINDOW != "check"
+            and not envs.VLLM_TPU_QWEN4_FUSED_PREP_CHECK
+        )
+
+    def _prep_fold_static(self, window):
+        return dict(
+            window=window,
+            pooled=self.pooled,
+            spec_window=self.spec_window,
+            eos_token_id=self.config.eos_token_id,
+            ngram_size=self.config.ngram_size,
+        )
+
+    def prep_fold_args(self, row_start, num_requests, starts, state_indices):
+        """VLLM_TPU_PREFWD_PREP_FOLD: ``fused_step_inputs``'s inputs other than
+        seq_lens and the ids, as (tensors, static kwargs), for the runner's
+        folded prep program. Records this chunk's rows exactly as
+        ``_prepare_inputs_fused`` does (idempotent, so an unfolded fallback
+        repeating it is harmless); ``prepare_inputs`` then takes the folded
+        outputs (``_finish_prep_fold``)."""
+        rows = starts.shape[0] - 1
+        scalars, previous, current, window, store = self._fused_host_args(
+            row_start, num_requests, rows, self.token_store
+        )
+        tensors = (
+            starts,
+            starts if self.pooled else state_indices,
+            store,
+            self._scalars_upload(scalars),
+            previous,
+            current,
+        )
+        return tensors, self._prep_fold_static(window)
+
+    def prep_fold_warm_args(self, starts, state_indices):
+        """``prep_fold_args``'s shapes and dtypes, without the bookkeeping, for
+        warmup (as ``precompile_fused_inputs`` builds them)."""
+        runner = self.runner
+        device = runner.device
+        rows = starts.shape[0] - 1
+        window = envs.VLLM_TPU_QWEN4_NGRAM_WINDOW == "1"
+        if window:
+            width = max(self.spec_window - 1, 0) + self.config.ngram_size - 1
+            store = torch.zeros((rows, width + 1), dtype=torch.int64).to(device)
+        else:
+            host = runner.input_batch.token_ids_cpu_tensor
+            store = torch.zeros(tuple(host.shape), dtype=host.dtype).to(device)
+        scalars = torch.full((2 + rows,), -1, dtype=torch.int64)
+        scalars[:2] = 0
+        previous, current = self._recent_buffers(device)
+        tensors = (
+            starts,
+            starts if self.pooled else state_indices,
+            store,
+            scalars.to(device),
+            previous,
+            current,
+        )
+        return tensors, self._prep_fold_static(window)
+
+    def _finish_prep_fold(self, snapshot, folded):
+        """``_prepare_inputs_fused``'s result from the folded prep program's
+        outputs: only the block tables are left to read."""
+        assert folded["ids"] is snapshot.input_ids
+        assert folded["row_start"] == snapshot.row_start
+        assert folded["num_requests"] == snapshot.num_requests
+        context, history, slots, valid_tokens, record = folded["prepped"]
+        self._recent[1] = record
+        starts = self.runner._attn_metadata_builder_ctx.query_start_loc
+        tables = self._block_tables(snapshot, starts.shape[0] - 1)
+        return dict(
+            query_start_loc=starts,
+            ngram_context=history,
+            state_slots=slots,
+            context_lens=context,
+            valid_tokens=valid_tokens,
+            main_block_table=tables[0],
+            compressed_block_table=tables[1],
+        )
+
+    def _prepare_inputs_fused(self, snapshot):
+        """VLLM_TPU_QWEN4_FUSED_PREP: ``prepare_inputs`` with its device work in
+        one compiled program (``fused_step_inputs``) fed by at most two uploads."""
+        runner = self.runner
+        ctx = runner._attn_metadata_builder_ctx
+        starts = ctx.query_start_loc
+        rows = starts.shape[0] - 1
+        scalars, previous, current, window, store = self._fused_host_args(
+            snapshot.row_start, snapshot.num_requests, rows, snapshot.token_store
+        )
         state_indices = starts if self.pooled else ctx.mamba_state_indices
         check = envs.VLLM_TPU_QWEN4_FUSED_PREP_CHECK
         reference = None
