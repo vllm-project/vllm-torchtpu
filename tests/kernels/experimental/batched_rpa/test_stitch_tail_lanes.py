@@ -39,7 +39,7 @@ def _tpu7x_info(monkeypatch):
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda *args, **kwargs: info)
 
 
-def _cfgs(bq_sz, bkv_sz):
+def _cfgs(bq_sz, bkv_sz, mask_invalid_v=None):
     return configs.RpaConfigs(
         block=configs.BlockSizes(
             bq_sz=bq_sz, bq_c_sz=min(bq_sz, 32), bkv_sz=bkv_sz, batch_size=1
@@ -60,6 +60,7 @@ def _cfgs(bq_sz, bkv_sz):
             dtype_kv=jnp.dtype(jnp.bfloat16),
             dtype_out=jnp.dtype(jnp.bfloat16),
             kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+            mask_invalid_v=mask_invalid_v,
         ),
         mode=configs.RpaCase.MIXED,
         vmem_limit_bytes=64 << 20,
@@ -94,8 +95,13 @@ _CASES = [(300, 40, 17), (256, 64, 0), (43, 150, 100), (300, 0, 0), (0, 0, 0)]
 
 
 @pytest.mark.parametrize(("cache", "new", "offset"), _CASES)
-def test_prefill_stitch_zeroes_every_lane_past_the_valid_tokens(cache, new, offset):
-    cfgs = _cfgs(bq_sz=256, bkv_sz=512)
+@pytest.mark.parametrize("mask_invalid_v", [False, True])
+def test_prefill_stitch_zeroes_every_lane_past_the_valid_tokens(
+    cache, new, offset, mask_invalid_v
+):
+    """With V masked on load the lanes past the valid tokens are left as the
+    roll fills them; only the valid lanes are checked then."""
+    cfgs = _cfgs(bq_sz=256, bkv_sz=512, mask_invalid_v=mask_invalid_v)
     window, cache_end, want = _window(cfgs, cache, new, offset)
 
     @jax.jit
@@ -108,7 +114,8 @@ def test_prefill_stitch_zeroes_every_lane_past_the_valid_tokens(cache, new, offs
         jnp.asarray(window), jnp.int32(cache), jnp.int32(cache_end), offset, new
     )
     got = np.asarray(got).reshape(window.shape[0], cfgs.bkv_sz)
-    np.testing.assert_array_equal(got, want[:, : cfgs.bkv_sz])
+    checked = cfgs.bkv_sz if not mask_invalid_v else cache + new
+    np.testing.assert_array_equal(got[:, :checked], want[:, :checked])
 
 
 @pytest.mark.parametrize("bq_sz", [1, 4])
@@ -116,7 +123,7 @@ def test_prefill_stitch_zeroes_every_lane_past_the_valid_tokens(cache, new, offs
 def test_decode_stitch_zeroes_the_written_columns_past_the_valid_tokens(
     bq_sz, cache, new
 ):
-    cfgs = _cfgs(bq_sz=bq_sz, bkv_sz=512)
+    cfgs = _cfgs(bq_sz=bq_sz, bkv_sz=512, mask_invalid_v=False)
     offset = 5
     window, cache_end, want = _window(cfgs, cache, new, offset)
 
