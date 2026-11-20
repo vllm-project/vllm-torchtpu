@@ -36,7 +36,6 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
-    PrequantLinearMethod,
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.models.qwen3_5 import hooks as qwen3_5_hooks
@@ -1327,7 +1326,7 @@ def _proj(
     return SimpleNamespace(
         weight=torch.zeros(4, 4, dtype=dtype),
         weight_scale=torch.ones(scale_shape),
-        quant_method=PrequantLinearMethod() if quant_method is None else quant_method,
+        quant_method=_fp8_method() if quant_method is None else quant_method,
     )
 
 
