@@ -407,8 +407,9 @@ def prepare_routed_gmm_inputs(
 
     ``nonep_permute`` selects the metadata construction of the non-EP path
     above the single-sort row cap: "sorts" (the forward permutation, its
-    inverse and a packed sort for the token ids) or "two_sorts" (the token
-    ids by division of the forward permutation).
+    inverse, and the token ids by a packed sort or, when the keys do not
+    pack, a gather) or "two_sorts" (the token ids by division of the forward
+    permutation).
     """
     if nonep_permute not in _NONEP_PERMUTES:
         raise ValueError(f"unknown non-EP permute {nonep_permute!r}")
