@@ -26,6 +26,7 @@ from torch import nn
 from torch._dynamo import mark_dynamic
 from torch._dynamo import reset as reset_dynamo
 from vllm.compilation.backends import split_graph
+from vllm.model_executor.models import qwen3_next
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5DecoderLayer,
     Qwen3_5Model,
@@ -140,10 +141,28 @@ class _StubMlp:
 
 
 @dataclass
-class _StubPpGroup:
-    """Stub pipeline-parallel group carrying world_size."""
+class _StubParallelConfig:
+    """Stub vLLM ParallelConfig carrying pipeline_parallel_size."""
 
-    world_size: int = 1
+    pipeline_parallel_size: int = 1
+
+
+@dataclass
+class _StubVllmConfig:
+    """Stub vLLM config carrying parallel_config."""
+
+    parallel_config: _StubParallelConfig = field(default_factory=_StubParallelConfig)
+
+
+@dataclass(frozen=True)
+class _StubPpGroup:
+    """Stub single-rank pipeline-parallel group for real Qwen3NextModel.forward."""
+
+    is_first_rank: bool = True
+    is_last_rank: bool = True
+
+
+_SINGLE_RANK_PP_GROUP = _StubPpGroup()
 
 
 @dataclass
@@ -152,7 +171,7 @@ class _StubDecoderLayer:
 
     layer_type: str = "full_attention"
     use_attn_reduce_scatter_for_moe: bool = False
-    sharded_spine: bool = True
+    uses_sharded_residual: bool = True
     layer_scale: bool = False
     input_layernorm: Any = None
     post_attention_layernorm: Any = None
@@ -163,12 +182,38 @@ class _StubDecoderLayer:
     mlp: _StubMlp = field(default_factory=_StubMlp)
 
 
-@dataclass
-class _StubModel:
-    """Stub Qwen3.5 model container carrying start_layer and decoder layers."""
+class _IdentityModelNorm(nn.Module):
+    """Identity final norm matching Qwen3NextModel's (hidden, residual) contract."""
 
-    start_layer: int
-    layers: list[_StubDecoderLayer]
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return hidden_states and residual unchanged."""
+        return hidden_states, residual
+
+
+def _build_real_qwen3_5_model(
+    layers: list[nn.Module],
+    norm: nn.Module,
+    *,
+    aux_hidden_state_layers: tuple[int, ...] = (),
+    embed_tokens: nn.Module | None = None,
+) -> Qwen3_5Model:
+    """Construct a minimal real Qwen3_5Model via __new__ for forward-path tests."""
+    model = Qwen3_5Model.__new__(Qwen3_5Model)
+    nn.Module.__init__(model)
+    model_any: Any = model
+    model_any.do_not_compile = True
+    model_any.start_layer = 0
+    model_any.end_layer = len(layers)
+    model_any.layers = nn.ModuleList(layers)
+    model_any.norm = norm
+    model_any.aux_hidden_state_layers = aux_hidden_state_layers
+    if embed_tokens is not None:
+        model_any.embed_tokens = embed_tokens
+    return model
 
 
 @dataclass(frozen=True)
@@ -266,16 +311,12 @@ def _as_decoder_layer(stub: _StubDecoderLayer) -> Qwen3_5DecoderLayer:
     return cast("Qwen3_5DecoderLayer", stub)
 
 
-def _as_model(stub: _StubModel | _FakeBackbone) -> Qwen3_5Model:
-    """Cast a stub or fake backbone to Qwen3_5Model for model forward patch helpers."""
-    return cast("Qwen3_5Model", stub)
-
-
 def test_maybe_patch_waits_for_model_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verifies patch registration returns and class method patching."""
     monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP", False)
+    monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER", False)
     assert qwen3_5_patch.maybe_patch_qwen3_5_attn_moe_overlap(None) is None
 
     monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP", True)
@@ -307,16 +348,63 @@ def test_maybe_patch_waits_for_model_config(
         )
         assert Qwen3_5DecoderLayer.__init__ is patched_decoder_init
         assert Qwen3_5DecoderLayer.forward is overlap_forward
+        assert Qwen3_5Model.forward is orig_model_fwd
+    finally:
+        Qwen3_5DecoderLayer.__init__ = orig_init
+        if had_fwd:
+            Qwen3_5DecoderLayer.forward = orig_fwd
+        elif "forward" in Qwen3_5DecoderLayer.__dict__:
+            del Qwen3_5DecoderLayer.forward
+        if had_model_fwd:
+            Qwen3_5Model.forward = orig_model_fwd
+        elif "forward" in Qwen3_5Model.__dict__:
+            del Qwen3_5Model.forward
+
+
+def test_maybe_patch_only_wraps_model_forward_when_fp8_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Qwen3_5Model.forward is wrapped only when FP8 overlap all-gather is enabled."""
+    monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP", True)
+    monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", False)
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", False)
+    cfg_moe = _StubModelConfig(
+        hf_text_config=_StubHfTextConfig(model_type="qwen3_5_moe_text")
+    )
+    orig_init = Qwen3_5DecoderLayer.__init__
+    had_fwd = "forward" in Qwen3_5DecoderLayer.__dict__
+    orig_fwd = Qwen3_5DecoderLayer.forward
+    had_model_fwd = "forward" in Qwen3_5Model.__dict__
+    orig_model_fwd = Qwen3_5Model.forward
+    try:
+        monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER", False)
+        assert (
+            qwen3_5_patch.maybe_patch_qwen3_5_attn_moe_overlap(
+                _as_model_config(cfg_moe)
+            )
+            is None
+        )
+        assert Qwen3_5DecoderLayer.__init__ is patched_decoder_init
+        assert Qwen3_5DecoderLayer.forward is overlap_forward
+        assert Qwen3_5Model.forward is orig_model_fwd
+
+        monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER", True)
+        assert (
+            qwen3_5_patch.maybe_patch_qwen3_5_attn_moe_overlap(
+                _as_model_config(cfg_moe)
+            )
+            is None
+        )
         assert Qwen3_5Model.forward is overlap_model_forward
     finally:
         Qwen3_5DecoderLayer.__init__ = orig_init
         if had_fwd:
             Qwen3_5DecoderLayer.forward = orig_fwd
-        else:
+        elif "forward" in Qwen3_5DecoderLayer.__dict__:
             del Qwen3_5DecoderLayer.forward
         if had_model_fwd:
             Qwen3_5Model.forward = orig_model_fwd
-        else:
+        elif "forward" in Qwen3_5Model.__dict__:
             del Qwen3_5Model.forward
 
 
@@ -529,7 +617,7 @@ def test_forward_matches_upstream(
     def run_rank(rank: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Execute single TP rank overlap forward."""
         rank_layer = _StubDecoderLayer(
-            sharded_spine=True,
+            uses_sharded_residual=True,
             input_layernorm=input_norm,
             post_attention_layernorm=post_norm,
             layer_type=layer_type,
@@ -602,7 +690,7 @@ def test_overlap_disabled_when_compiling_outside_shape_variants_warmup(
 
     d = 16
     layer = _StubDecoderLayer(
-        sharded_spine=True,
+        uses_sharded_residual=True,
         input_layernorm=_CpuRMSNorm(d),
         post_attention_layernorm=_CpuRMSNorm(d),
         layer_type="full_attention",
@@ -628,42 +716,59 @@ def test_overlap_disabled_when_compiling_outside_shape_variants_warmup(
     assert calls == ["rs", "ag", "ag", "ar"]
 
 
+def _populate_stub_decoder_layer(layer: Qwen3_5DecoderLayer, layer_type: str) -> None:
+    """Populate minimal decoder layer attributes for simulated __init__."""
+    layer_obj: Any = layer
+    layer_obj.use_attn_reduce_scatter_for_moe = False
+    layer_obj.layer_type = layer_type
+    layer_obj.self_attn = _StubSelfAttn(o_proj=_StubProj(reduce_results=True))
+    layer_obj.linear_attn = None
+    layer_obj.mlp = _StubMlp(
+        tp_size=2,
+        replicate_shared_expert=False,
+        experts=_StubExperts(
+            gate=object(),
+            moe_config=_StubMoeConfig(skip_final_all_reduce=False),
+        ),
+    )
+
+
+def _fake_decoder_orig_init(
+    self: Qwen3_5DecoderLayer,
+    vllm_config: object,
+    layer_type: str,
+    prefix: str = "",
+) -> None:
+    """Populate stub decoder layer attributes during simulated __init__."""
+    _ = (vllm_config, prefix)
+    _populate_stub_decoder_layer(self, layer_type)
+
+
 def test_patched_init_configures_layer(monkeypatch: pytest.MonkeyPatch) -> None:
     """_patched_init runs _orig_init and configures layer attributes."""
     init_calls: list[tuple[object, str, str]] = []
 
-    def fake_orig_init(
+    def recording_orig_init(
         self: Qwen3_5DecoderLayer,
         vllm_config: object,
         layer_type: str,
         prefix: str = "",
     ) -> None:
-        """Populate stub layer attributes during simulated __init__."""
+        """Record init arguments and populate stub layer attributes."""
         init_calls.append((vllm_config, layer_type, prefix))
-        layer_obj: Any = self
-        layer_obj.use_attn_reduce_scatter_for_moe = False
-        layer_obj.layer_type = layer_type
-        layer_obj.self_attn = _StubSelfAttn(o_proj=_StubProj(reduce_results=True))
-        layer_obj.linear_attn = None
-        layer_obj.mlp = _StubMlp(
-            tp_size=2,
-            replicate_shared_expert=False,
-            experts=_StubExperts(
-                gate=object(),
-                moe_config=_StubMoeConfig(skip_final_all_reduce=False),
-            ),
-        )
+        _populate_stub_decoder_layer(self, layer_type)
 
-    monkeypatch.setattr(qwen3_5_patch, "_orig_init", fake_orig_init)
+    monkeypatch.setattr(qwen3_5_patch, "_orig_init", recording_orig_init)
+    vllm_cfg = _StubVllmConfig()
     dummy_layer = _StubDecoderLayer()
     patched_decoder_init(
         _as_decoder_layer(dummy_layer),
-        "cfg",
+        vllm_cfg,
         "full_attention",
         prefix="model.layers.0",
     )
-    assert init_calls == [("cfg", "full_attention", "model.layers.0")]
-    assert dummy_layer.sharded_spine is True
+    assert init_calls == [(vllm_cfg, "full_attention", "model.layers.0")]
+    assert dummy_layer.uses_sharded_residual is True
     assert dummy_layer.self_attn.o_proj.reduce_results is False
     assert dummy_layer.mlp.experts.gate is None
     assert dummy_layer.mlp.experts.moe_config.skip_final_all_reduce is True
@@ -671,53 +776,54 @@ def test_patched_init_configures_layer(monkeypatch: pytest.MonkeyPatch) -> None:
     dummy_mtp = _StubDecoderLayer()
     patched_decoder_init(
         _as_decoder_layer(dummy_mtp),
-        "cfg",
+        vllm_cfg,
         "full_attention",
         prefix="mtp.layers.0",
     )
-    assert dummy_mtp.sharded_spine is False
+    assert dummy_mtp.uses_sharded_residual is False
 
 
-def test_configure_layer_rejects_pp_when_fp8_overlap_enabled(
+def test_patched_init_rejects_pp_when_fp8_overlap_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_configure_layer rejects PP > 1 when FP8 overlap all-gather is enabled."""
-    layer = _StubDecoderLayer(
-        layer_type="full_attention",
-        use_attn_reduce_scatter_for_moe=False,
-        self_attn=_StubSelfAttn(o_proj=_StubProj(reduce_results=True)),
-        mlp=_StubMlp(
-            tp_size=2,
-            replicate_shared_expert=False,
-            experts=_StubExperts(
-                gate="router", moe_config=_StubMoeConfig(skip_final_all_reduce=False)
-            ),
-        ),
+    """_patched_init rejects PP > 1 when FP8 overlap all-gather is enabled."""
+    monkeypatch.setattr(qwen3_5_patch, "_orig_init", _fake_decoder_orig_init)
+    pp2_cfg = _StubVllmConfig(
+        parallel_config=_StubParallelConfig(pipeline_parallel_size=2)
     )
+    pp1_cfg = _StubVllmConfig(
+        parallel_config=_StubParallelConfig(pipeline_parallel_size=1)
+    )
+
     monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER", True)
-    monkeypatch.setattr(qwen3_5_patch, "model_parallel_is_initialized", lambda: True)
-    monkeypatch.setattr(
-        qwen3_5_patch, "get_pp_group", lambda: _StubPpGroup(world_size=2)
-    )
     with pytest.raises(ValueError, match="pipeline parallelism"):
-        configure_layer(_as_decoder_layer(layer))
+        patched_decoder_init(
+            _as_decoder_layer(_StubDecoderLayer()),
+            pp2_cfg,
+            "full_attention",
+            prefix="model.layers.0",
+        )
 
-    monkeypatch.setattr(
-        qwen3_5_patch, "get_pp_group", lambda: _StubPpGroup(world_size=1)
+    patched_decoder_init(
+        _as_decoder_layer(_StubDecoderLayer()),
+        pp1_cfg,
+        "full_attention",
+        prefix="model.layers.0",
     )
-    configure_layer(_as_decoder_layer(layer))
 
-    monkeypatch.setattr(
-        qwen3_5_patch, "get_pp_group", lambda: _StubPpGroup(world_size=2)
-    )
     monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER", False)
-    configure_layer(_as_decoder_layer(layer))
+    patched_decoder_init(
+        _as_decoder_layer(_StubDecoderLayer()),
+        pp2_cfg,
+        "full_attention",
+        prefix="model.layers.0",
+    )
 
 
-def test_overlap_forward_mtp_layer_skips_sharded_spine(
+def test_overlap_forward_mtp_layer_skips_uses_sharded_residual(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """MTP predictor layers with sharded_spine=False skip FP8 gather and RS."""
+    """MTP predictor layers with uses_sharded_residual=False skip FP8 gather and RS."""
     monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER", True)
     monkeypatch.setattr(qwen3_5_patch, "_MIN_PER_CHIP_SIZE_MB", 0)
     wire_log: list[str] = []
@@ -739,7 +845,7 @@ def test_overlap_forward_mtp_layer_skips_sharded_spine(
     hidden_size = 64
     num_tokens = 16
     layer = _StubDecoderLayer(
-        sharded_spine=False,
+        uses_sharded_residual=False,
         input_layernorm=_CpuRMSNorm(hidden_size),
         post_attention_layernorm=_CpuRMSNorm(hidden_size),
         layer_type="full_attention",
@@ -786,7 +892,7 @@ def test_overlap_forward_collective_schedule_by_token_regime(
     )
     norm = _CpuRMSNorm(d).to(torch.bfloat16)
     layer = _StubDecoderLayer(
-        sharded_spine=True,
+        uses_sharded_residual=True,
         input_layernorm=norm,
         post_attention_layernorm=norm,
         layer_type="full_attention",
@@ -844,7 +950,7 @@ def test_overlap_forward_narrows_padded_all_gather(
     seen_shapes: list[tuple[torch.Size, torch.Size]] = []
     d = 16
     layer = _StubDecoderLayer(
-        sharded_spine=True,
+        uses_sharded_residual=True,
         input_layernorm=_CpuRMSNorm(d),
         post_attention_layernorm=_CpuRMSNorm(d),
         layer_type="full_attention",
@@ -894,7 +1000,17 @@ def _fp8_round_trip_tol(x: torch.Tensor) -> tuple[float, float]:
     return rtol, fp8_subnorm_atol + out_subnorm_atol
 
 
-def _assert_fp8_spine_parity(
+# Guard against zero-norm denominator in relative RMSE calculations.
+_REL_RMSE_NORM_FLOOR = 1e-12
+
+
+def _relative_rmse(actual: torch.Tensor, expected_f32: torch.Tensor) -> float:
+    """Return L2 relative RMSE between actual and float32 expected tensors."""
+    diff_f32 = actual.detach().float() - expected_f32
+    return float(diff_f32.norm() / expected_f32.norm().clamp(min=_REL_RMSE_NORM_FLOOR))
+
+
+def _assert_fp8_residual_parity(
     actual: torch.Tensor,
     expected: torch.Tensor,
     *,
@@ -904,12 +1020,38 @@ def _assert_fp8_spine_parity(
     """Bounds zero-mean residual-stream parity from FP8 gather + bf16 accum terms."""
     rel_budget = fp8_gathers * _FP8_BF16_ROUND_RTOL + tp_size * _BF16_ACCUM_EPS
     expected_f32 = expected.detach().float()
-    diff_f32 = actual.detach().float() - expected_f32
-    rel_rmse = float(diff_f32.norm() / expected_f32.norm().clamp(min=1e-12))
-    assert rel_rmse <= rel_budget
+    assert _relative_rmse(actual, expected_f32) <= rel_budget
     atol = rel_budget * float(expected_f32.abs().max())
     torch.testing.assert_close(actual, expected, rtol=rel_budget, atol=atol)
     return rel_budget, atol
+
+
+def _fp8_quantize_dequantize_ref(x: torch.Tensor) -> torch.Tensor:
+    """Quantize and dequantize rows in float8_e4m3fn using independent math."""
+    fp8_max = float(_FP8_E4M3_FINFO.max)
+    work_dtype = torch.float32 if x.dtype == torch.float16 else x.dtype
+    x_work = x.to(work_dtype)
+    row_amax = x_work.abs().amax(dim=-1, keepdim=True)
+    scale = (row_amax / fp8_max).clamp(min=torch.finfo(work_dtype).tiny)
+    quantized = (x_work / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    return (quantized.to(work_dtype) * scale).to(x.dtype)
+
+
+def _assert_tight_fp8_ref_parity(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    norm_steps: int,
+    tp_size: int,
+) -> tuple[float, float]:
+    """Bounds parity against an FP8-quantized CPU ref from bf16 accumulation terms."""
+    rel_rmse_budget = norm_steps * _BF16_ACCUM_EPS
+    max_abs_factor = (norm_steps + tp_size) * _BF16_ACCUM_EPS
+    expected_f32 = expected.detach().float()
+    assert _relative_rmse(actual, expected_f32) <= rel_rmse_budget
+    atol = max_abs_factor * float(expected_f32.abs().max())
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=atol)
+    return rel_rmse_budget, atol
 
 
 def _run_on_tp_threads[T](tp_size: int, fn: Callable[[int], T]) -> list[T]:
@@ -1027,7 +1169,7 @@ def _run_single_layer_with_wire_capture(
 
         is_linear = cfg.layer_type == "linear_attention"
         rank_layer = _StubDecoderLayer(
-            sharded_spine=True,
+            uses_sharded_residual=True,
             input_layernorm=input_norm,
             post_attention_layernorm=post_norm,
             layer_type=cfg.layer_type,
@@ -1105,7 +1247,7 @@ def test_overlap_forward_fp8_flag_uses_fp8_h_gather_and_reduce_scatter(
     assert expert_dtypes_bf16 == [torch.bfloat16]
     stream_fp8 = out_fp8 + res_fp8
     stream_bf16 = out_bf16 + res_bf16
-    _assert_fp8_spine_parity(stream_fp8, stream_bf16, fp8_gathers=1, tp_size=2)
+    _assert_fp8_residual_parity(stream_fp8, stream_bf16, fp8_gathers=1, tp_size=2)
 
 
 def test_overlap_forward_fp8_mid_stack_full_attention_with_layer_scale(
@@ -1143,7 +1285,7 @@ def test_overlap_forward_fp8_mid_stack_full_attention_with_layer_scale(
     assert expert_dtypes_fp8 == [torch.bfloat16]
     stream_fp8 = out_fp8 + res_fp8
     stream_bf16 = out_bf16 + res_bf16
-    _assert_fp8_spine_parity(stream_fp8, stream_bf16, fp8_gathers=2, tp_size=2)
+    _assert_fp8_residual_parity(stream_fp8, stream_bf16, fp8_gathers=2, tp_size=2)
 
 
 def test_non_overlap_branch_ignores_fp8_flag(
@@ -1161,46 +1303,155 @@ def test_non_overlap_branch_ignores_fp8_flag(
     assert torch.equal(out_fp8, out_bf16)
 
 
-def _build_two_layer_stub_model(
+@dataclass(frozen=True)
+class _TwoLayerWeights:
+    """Shared norm, router, attention, and expert weights for 2-layer stack tests."""
+
+    norms: list[_CpuRMSNorm]
+    gates: list[nn.Linear]
+    attn_projs: list[list[nn.Linear]]
+    expert_projs: list[list[nn.Linear]]
+
+
+class _OverlapDecoderLayerModule(nn.Module):
+    """Decoder layer nn.Module delegating forward to _overlap_forward."""
+
+    def __init__(
+        self,
+        layer_type: str,
+        norms: tuple[_CpuRMSNorm, _CpuRMSNorm],
+        attn_linear: nn.Linear,
+        mlp: _StubMlp,
+    ) -> None:
+        """Initialize layer modules and overlap flags."""
+        super().__init__()
+        self.layer_type = layer_type
+        self.use_attn_reduce_scatter_for_moe = False
+        self.uses_sharded_residual = True
+        self.layer_scale = False
+        self.input_layernorm, self.post_attention_layernorm = norms
+        self.linear_attn = lambda hidden_states: attn_linear(hidden_states)
+        self.self_attn = lambda hidden_states, *_args, **_kwargs: attn_linear(
+            hidden_states
+        )
+        self.mlp = mlp
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run _overlap_forward on this decoder layer."""
+        return overlap_forward(
+            cast("Qwen3_5DecoderLayer", self), hidden_states, residual, positions
+        )
+
+
+def _build_two_layer_weights(
+    num_layers: int, tp_size: int, hidden_size: int
+) -> _TwoLayerWeights:
+    """Create deterministic bf16 weights for a 2-layer TP overlap stack."""
+    # Two norms per decoder layer plus one final output norm.
+    norms = [
+        _CpuRMSNorm(hidden_size).to(torch.bfloat16) for _ in range(2 * num_layers + 1)
+    ]
+    gates = [
+        nn.Linear(hidden_size, 8, bias=False).to(torch.bfloat16)
+        for _ in range(num_layers)
+    ]
+    attn_projs = [
+        [
+            nn.Linear(hidden_size, hidden_size, bias=False).to(torch.bfloat16)
+            for _ in range(tp_size)
+        ]
+        for _ in range(num_layers)
+    ]
+    expert_projs = [
+        [
+            nn.Linear(hidden_size, hidden_size, bias=False).to(torch.bfloat16)
+            for _ in range(tp_size)
+        ]
+        for _ in range(num_layers)
+    ]
+    return _TwoLayerWeights(
+        norms=norms, gates=gates, attn_projs=attn_projs, expert_projs=expert_projs
+    )
+
+
+def _build_two_layer_real_model(
     rank: int,
     tp_size: int,
-    norms: list[_CpuRMSNorm],
-    gates: list[nn.Linear],
-    projs: tuple[list[list[nn.Linear]], list[list[nn.Linear]]],
-) -> _StubModel:
-    """Build a multi-layer stub model for a single TP rank."""
-    attn_projs, expert_projs = projs
-    layers: list[_StubDecoderLayer] = []
-    for layer_index, gate_linear in enumerate(gates):
-        attn_linear = attn_projs[layer_index][rank]
-        expert_linear = expert_projs[layer_index][rank]
+    weights: _TwoLayerWeights,
+    *,
+    with_aux: bool,
+) -> Qwen3_5Model:
+    """Build a real Qwen3_5Model instance via __new__ for a single TP rank."""
+    layers: list[nn.Module] = []
+    for layer_index, gate_linear in enumerate(weights.gates):
+        attn_linear = weights.attn_projs[layer_index][rank]
+        expert_linear = weights.expert_projs[layer_index][rank]
+        mlp = _StubMlp(
+            tp_size=tp_size,
+            gate=lambda hidden, gate=gate_linear: (gate(hidden), None),
+            experts=lambda hidden_states, *_args, expert=expert_linear, **_kwargs: (
+                expert(hidden_states)
+            ),
+        )
         layers.append(
-            _StubDecoderLayer(
-                sharded_spine=True,
-                input_layernorm=norms[2 * layer_index],
-                post_attention_layernorm=norms[2 * layer_index + 1],
+            _OverlapDecoderLayerModule(
                 layer_type=(
                     "linear_attention" if layer_index == 0 else "full_attention"
                 ),
-                layer_scale=False,
-                linear_attn=(lambda hidden_states, a=attn_linear: a(hidden_states)),
-                self_attn=(
-                    lambda hidden_states, *_args, a=attn_linear, **_kwargs: a(
-                        hidden_states
-                    )
+                norms=(
+                    weights.norms[2 * layer_index],
+                    weights.norms[2 * layer_index + 1],
                 ),
-                mlp=_StubMlp(
-                    tp_size=tp_size,
-                    gate=(lambda h, g=gate_linear: (g(h), None)),
-                    experts=(
-                        lambda hidden_states, *_args, e=expert_linear, **_kwargs: e(
-                            hidden_states
-                        )
-                    ),
-                ),
+                attn_linear=attn_linear,
+                mlp=mlp,
             )
         )
-    return _StubModel(start_layer=0, layers=layers)
+    aux_layers = (1,) if with_aux else ()
+    return _build_real_qwen3_5_model(
+        layers=layers,
+        norm=weights.norms[-1],
+        aux_hidden_state_layers=aux_layers,
+    )
+
+
+def _run_two_layer_fp8_reference(
+    inputs: torch.Tensor,
+    weights: _TwoLayerWeights,
+    *,
+    with_aux: bool,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Run single-process 2-layer CPU reference with FP8 gather quantization."""
+    hidden_states = inputs.clone()
+    residual: torch.Tensor | None = None
+    aux_outputs: list[torch.Tensor] = []
+    for layer_index, (layer_attn_projs, layer_expert_projs) in enumerate(
+        zip(weights.attn_projs, weights.expert_projs, strict=True)
+    ):
+        input_norm = weights.norms[2 * layer_index]
+        post_norm = weights.norms[2 * layer_index + 1]
+        if residual is None:
+            residual = hidden_states
+            hidden_states = input_norm(hidden_states)
+        else:
+            hidden_states, residual = input_norm(hidden_states, residual)
+            hidden_states = _fp8_quantize_dequantize_ref(hidden_states)
+        attn_sum = torch.stack(
+            [proj(hidden_states) for proj in layer_attn_projs], dim=0
+        ).sum(dim=0)
+        post_normed, residual = post_norm(attn_sum, residual)
+        moe_input = _fp8_quantize_dequantize_ref(post_normed)
+        hidden_states = torch.stack(
+            [proj(moe_input) for proj in layer_expert_projs], dim=0
+        ).sum(dim=0)
+        if with_aux and layer_index == 0:
+            aux_outputs.append(hidden_states + residual)
+    final_hidden, _ = weights.norms[-1](hidden_states, residual)
+    return final_hidden, aux_outputs
 
 
 def _extract_matching_rank_outputs(
@@ -1224,103 +1475,99 @@ def _extract_matching_rank_outputs(
     return first, []
 
 
+def _run_two_layer_real_stack(
+    monkeypatch: pytest.MonkeyPatch,
+    weights: _TwoLayerWeights,
+    inputs: torch.Tensor,
+    *,
+    fp8_flag: bool,
+    with_aux: bool,
+) -> tuple[torch.Tensor, list[torch.Tensor], list[str]]:
+    """Execute the real 2-layer Qwen3_5Model stack across TP threads."""
+    tp_size = len(weights.attn_projs[0])
+    positions = torch.arange(inputs.shape[0])
+    monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER", fp8_flag)
+    wire_log: list[tuple[str, torch.Size, torch.dtype]] = []
+    _install_logged_collectives(monkeypatch, tp_size, wire_log)
+
+    def run_rank(
+        rank: int,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """Build and execute real 2-layer Qwen3_5Model on one TP rank."""
+        model = _build_two_layer_real_model(rank, tp_size, weights, with_aux=with_aux)
+        out = overlap_model_forward(
+            model, None, positions, inputs_embeds=inputs.clone()
+        )
+        assert isinstance(out, torch.Tensor | tuple)
+        return out
+
+    res_ranks = _run_on_tp_threads(tp_size, run_rank)
+    rank0_ops = [
+        f"ag:{dtype}"
+        if op == "all_gather"
+        else ("rs" if op == "reduce_scatter" else "ar")
+        for op, _, dtype in wire_log
+    ]
+    rank0_out, rank0_aux = _extract_matching_rank_outputs(res_ranks, tp_size)
+    return rank0_out, rank0_aux, rank0_ops
+
+
 @pytest.mark.parametrize("with_aux", [False, True])
-def test_overlap_model_forward_sharded_spine_matches_bf16_stack(
+def test_overlap_model_forward_uses_sharded_residual_matches_fp8_ref(
     monkeypatch: pytest.MonkeyPatch,
     *,
     with_aux: bool,
 ) -> None:
-    """Verify 2-layer stack keeps residual sharded and gathers output at exit."""
+    """Verify real Qwen3_5Model.forward matches FP8-quantized CPU ref and bf16 stack."""
     monkeypatch.setattr(qwen3_5_patch, "_MIN_PER_CHIP_SIZE_MB", 0)
+    monkeypatch.setattr(qwen3_next, "get_pp_group", lambda: _SINGLE_RANK_PP_GROUP)
     torch.manual_seed(19)
     tp_size = 2
     num_layers = 2
-    n = 16
-    d = 64
-    x = torch.randn(n, d, dtype=torch.bfloat16)
-    pos = torch.arange(n)
+    inputs = torch.randn(16, 64, dtype=torch.bfloat16)
+    weights = _build_two_layer_weights(num_layers, tp_size, inputs.shape[-1])
 
-    # Two norms per decoder layer plus one final output norm.
-    norms = [_CpuRMSNorm(d).to(torch.bfloat16) for _ in range(2 * num_layers + 1)]
-    gates = [nn.Linear(d, 8, bias=False).to(torch.bfloat16) for _ in range(num_layers)]
-    attn_projs = [
-        [nn.Linear(d, d, bias=False).to(torch.bfloat16) for _ in range(tp_size)]
-        for _ in range(num_layers)
-    ]
-    expert_projs = [
-        [nn.Linear(d, d, bias=False).to(torch.bfloat16) for _ in range(tp_size)]
-        for _ in range(num_layers)
-    ]
-
-    def run_stack(
-        *, fp8_flag: bool
-    ) -> tuple[torch.Tensor, list[torch.Tensor], list[str]]:
-        """Execute the 2-layer stack across TP threads under the given FP8 flag."""
-        monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER", fp8_flag)
-        wire_log: list[tuple[str, torch.Size, torch.dtype]] = []
-        _install_logged_collectives(monkeypatch, tp_size, wire_log)
-
-        def fake_orig_model_forward(
-            model_self: _StubModel,
-            input_ids: torch.Tensor | None = None,
-            positions: torch.Tensor | None = None,
-            intermediate_tensors: object = None,
-            inputs_embeds: torch.Tensor | None = None,
-            **_kwargs: object,
-        ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-            """Run stub model layers sequentially and optionally return aux state."""
-            _ = (input_ids, intermediate_tensors, inputs_embeds)
-            h = x.clone()
-            res: torch.Tensor | None = None
-            aux: list[torch.Tensor] = []
-            for idx, layer in enumerate(model_self.layers):
-                h, res = overlap_forward(_as_decoder_layer(layer), h, res, positions)
-                assert res is not None
-                if with_aux and idx == 0:
-                    aux.append(h + res)
-            h, _ = norms[-1](h, res)
-            return (h, aux) if with_aux else h
-
-        monkeypatch.setattr(
-            qwen3_5_patch, "_orig_model_forward", fake_orig_model_forward
-        )
-
-        def run_rank(
-            rank: int,
-        ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-            """Build and execute stub 2-layer model on one TP rank."""
-            model = _build_two_layer_stub_model(
-                rank, tp_size, norms, gates, (attn_projs, expert_projs)
-            )
-            return overlap_model_forward(_as_model(model), None, pos)
-
-        res_ranks = _run_on_tp_threads(tp_size, run_rank)
-        rank0_ops = [
-            f"ag:{dt}"
-            if op == "all_gather"
-            else ("rs" if op == "reduce_scatter" else "ar")
-            for op, _, dt in wire_log
-        ]
-        rank0_out, rank0_aux = _extract_matching_rank_outputs(res_ranks, tp_size)
-        return rank0_out, rank0_aux, rank0_ops
-
-    out_fp8, aux_fp8, ops_fp8 = run_stack(fp8_flag=True)
-    out_bf16, aux_bf16, ops_bf16 = run_stack(fp8_flag=False)
+    out_fp8, aux_fp8, ops_fp8 = _run_two_layer_real_stack(
+        monkeypatch, weights, inputs, fp8_flag=True, with_aux=with_aux
+    )
+    out_bf16, aux_bf16, ops_bf16 = _run_two_layer_real_stack(
+        monkeypatch, weights, inputs, fp8_flag=False, with_aux=with_aux
+    )
+    out_ref, aux_ref = _run_two_layer_fp8_reference(inputs, weights, with_aux=with_aux)
     assert "ar" not in ops_fp8
     assert ops_bf16.count("ar") == num_layers
-    assert out_fp8.shape == (n, d)
-    stack_rtol, stack_atol = _assert_fp8_spine_parity(
-        out_fp8, out_bf16, fp8_gathers=3, tp_size=tp_size
+    assert out_fp8.shape == inputs.shape
+    # Layer 0 runs 1 pre-MoE gather; each subsequent layer adds 2 gathers.
+    stack_fp8_gathers = 2 * num_layers - 1
+    stack_rtol, stack_atol = _assert_fp8_residual_parity(
+        out_fp8, out_bf16, fp8_gathers=stack_fp8_gathers, tp_size=tp_size
     )
     with pytest.raises(AssertionError):
         torch.testing.assert_close(
             torch.zeros_like(out_fp8), out_bf16, rtol=stack_rtol, atol=stack_atol
         )
+    norm_steps = 2 * num_layers + 1
+    tight_rel_rmse_budget, _ = _assert_tight_fp8_ref_parity(
+        out_fp8, out_ref, norm_steps=norm_steps, tp_size=tp_size
+    )
+    perturbed = (out_fp8 * (1.0 + 2.0 * tight_rel_rmse_budget)).to(out_fp8.dtype)
+    _assert_fp8_residual_parity(
+        perturbed, out_bf16, fp8_gathers=stack_fp8_gathers, tp_size=tp_size
+    )
+    with pytest.raises(AssertionError):
+        _assert_tight_fp8_ref_parity(
+            perturbed, out_ref, norm_steps=norm_steps, tp_size=tp_size
+        )
     if with_aux:
         assert len(aux_fp8) == 1
-        assert aux_fp8[0].shape == (n, d)
-        _assert_fp8_spine_parity(
+        assert aux_fp8[0].shape == inputs.shape
+        _assert_fp8_residual_parity(
             aux_fp8[0], aux_bf16[0], fp8_gathers=1, tp_size=tp_size
+        )
+        # Aux output is captured after layer 0 (2 norms: input + post-attention).
+        aux_norm_steps = 2
+        _assert_tight_fp8_ref_parity(
+            aux_fp8[0], aux_ref[0], norm_steps=aux_norm_steps, tp_size=tp_size
         )
 
 
@@ -1421,10 +1668,11 @@ class _FakeDecoderLayer(nn.Module):
         """Initialize norms, attention, and MoE MLP."""
         super().__init__()
         self.layer_type = layer_type
+        self.use_attn_reduce_scatter_for_moe = False
         self.input_layernorm = _FakeRMSNorm(d)
         self.post_attention_layernorm = _FakeRMSNorm(d)
         self.layer_scale = False
-        self.sharded_spine = True
+        self.uses_sharded_residual = True
         if layer_type == "linear_attention":
             self.linear_attn: _FakeLinearAttn | None = _FakeLinearAttn(d)
             self.self_attn: _FakeFullAttn | None = None
@@ -1433,46 +1681,16 @@ class _FakeDecoderLayer(nn.Module):
             self.self_attn = _FakeFullAttn(d)
         self.mlp = _FakeMLP(d)
 
-
-class _FakeBackbone(nn.Module):
-    """Fake 2-layer Qwen3.5 backbone for TorchDynamo trace handover tests."""
-
-    def __init__(self, d: int, vocab_size: int = 100) -> None:
-        """Initialize embedding and 2 decoder layers."""
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, d, dtype=torch.bfloat16)
-        self.layers = nn.ModuleList(
-            [
-                _FakeDecoderLayer(d, "linear_attention"),
-                _FakeDecoderLayer(d, "full_attention"),
-            ]
-        )
-        self.start_layer = 0
-
-    def orig_forward(
+    def forward(
         self,
-        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
-        intermediate_tensors: object = None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Run embedding followed by _overlap_forward across layers."""
-        _ = (intermediate_tensors, inputs_embeds)
-        assert input_ids is not None
-        hidden_states = self.embed(input_ids)
-        residual = None
-        for layer in self.layers:
-            layer_any: Any = layer
-            hidden_states, residual = overlap_forward(
-                layer_any, hidden_states, residual, positions
-            )
-        return hidden_states
-
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """Run _overlap_model_forward over the fake backbone."""
-        out = overlap_model_forward(_as_model(self), input_ids, positions)
-        assert isinstance(out, torch.Tensor)
-        return out
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run _overlap_forward over this fake decoder layer."""
+        return overlap_forward(
+            cast("Qwen3_5DecoderLayer", self), hidden_states, residual, positions
+        )
 
 
 @pytest.mark.usefixtures("_reset_dynamo_state")
@@ -1488,12 +1706,18 @@ def test_overlap_model_forward_shape_variants_handover_across_traces(
     # First trace stays below the overlap threshold; second trace meets it.
     small_tokens = 8
     large_tokens = 64
-    model = _FakeBackbone(d, vocab_size=vocab_size)
+    model = _build_real_qwen3_5_model(
+        layers=[
+            _FakeDecoderLayer(d, "linear_attention"),
+            _FakeDecoderLayer(d, "full_attention"),
+        ],
+        norm=_IdentityModelNorm(),
+        embed_tokens=nn.Embedding(vocab_size, d, dtype=torch.bfloat16),
+    )
 
     monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER", True)
-    monkeypatch.setattr(
-        qwen3_5_patch, "_orig_model_forward", _FakeBackbone.orig_forward
-    )
+    monkeypatch.setattr(qwen3_next, "get_pp_group", lambda: _SINGLE_RANK_PP_GROUP)
+    monkeypatch.setattr(Qwen3_5Model, "forward", overlap_model_forward)
     monkeypatch.setattr(qwen3_5_patch, "_overlap_min_tokens", lambda *_a: large_tokens)
     monkeypatch.setattr(
         qwen3_5_patch,
@@ -1578,11 +1802,9 @@ def test_run_on_tp_threads_propagates_worker_exception() -> None:
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float16])
-@pytest.mark.parametrize("block_size", [None, 32])
 def test_fp8_gather_round_trip(
     monkeypatch: pytest.MonkeyPatch,
     dtype: torch.dtype,
-    block_size: int | None,
 ) -> None:
     """Verify _fp8_gather round-trips within analytical bounds and trims padded rows."""
     tp_size = 2
@@ -1603,13 +1825,12 @@ def test_fp8_gather_round_trip(
     torch.manual_seed(7)
     x = (torch.randn(rows, hidden) * 3.0).to(dtype)
     x[3].zero_()
-    out = fp8_gather(x, num_tokens, block_size=block_size)
+    out = fp8_gather(x, num_tokens)
 
-    expected_scale_cols = 1 if block_size is None else hidden // block_size
     expected_scale_dtype = torch.float32 if dtype == torch.float16 else dtype
     assert wire_log == [
         ((rows, hidden), torch.int8),
-        ((rows, expected_scale_cols), expected_scale_dtype),
+        ((rows, 1), expected_scale_dtype),
     ]
     assert out.dtype == dtype
     assert out.shape == (num_tokens, hidden)
@@ -1622,10 +1843,10 @@ def test_fp8_gather_round_trip(
     torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
 
 
-def test_fp8_gather_large_magnitude_and_non_dividing_block(
+def test_fp8_gather_large_magnitude(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify float16-max magnitude bf16 rows round-trip and bad block_size raises."""
+    """Verify float16-max magnitude bf16 rows round-trip without overflow."""
     tp_size = 2
 
     def mock_all_gather(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
@@ -1644,10 +1865,6 @@ def test_fp8_gather_large_magnitude_and_non_dividing_block(
     out = fp8_gather(x, 16)
     rtol, _ = _fp8_round_trip_tol(x[0])
     torch.testing.assert_close(out[0], x[0], rtol=rtol, atol=0.0)
-
-    x_non_div = (torch.randn(8, 96) * 3.0).to(torch.bfloat16)
-    with pytest.raises(ValueError, match="divisible by block_size"):
-        fp8_gather(x_non_div, 16, block_size=64)
 
 
 @pytest.mark.parametrize("magnitude", [1e-4, 1e-5])
@@ -1710,10 +1927,10 @@ def test_fp8_gather_negative_control_unscaled_exceeds_tolerance(
         torch.testing.assert_close(corrupted, ref, rtol=rtol, atol=atol)
 
 
-def test_fp8_gather_rejects_invalid_rank_and_block_size(
+def test_fp8_gather_rejects_invalid_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify _fp8_gather rejects invalid rank and block_size pre-collective."""
+    """Verify _fp8_gather rejects invalid rank pre-collective."""
     collective_calls = 0
 
     def counting_all_gather(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
@@ -1730,26 +1947,38 @@ def test_fp8_gather_rejects_invalid_rank_and_block_size(
         fp8_gather(torch.randn(16, dtype=torch.bfloat16), 32)
     assert collective_calls == 0
 
-    x = torch.randn(4, 64, dtype=torch.bfloat16)
-    for bad_block_size in (0, -64):
-        with pytest.raises(ValueError, match="positive block_size"):
-            fp8_gather(x, 8, block_size=bad_block_size)
-    assert collective_calls == 0
+
+class _PassthroughDecoderLayer(nn.Module):
+    """Passthrough decoder layer with uses_sharded_residual=False for exit tests."""
+
+    def __init__(self, tp_size: int = 2) -> None:
+        """Initialize layer attributes required by Qwen3NextModel and exit guard."""
+        super().__init__()
+        self.use_attn_reduce_scatter_for_moe = False
+        self.uses_sharded_residual = False
+        self.mlp = _StubMlp(tp_size=tp_size)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return hidden_states unchanged without running collectives."""
+        _ = positions
+        return hidden_states, residual
 
 
-def test_overlap_model_forward_skips_exit_gather_when_not_sharded_spine(
+def test_overlap_model_forward_skips_exit_gather_when_not_sharded_residual(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify _overlap_model_forward skips gather when sharded_spine is False."""
+    """Skip exit gather when uses_sharded_residual is False."""
     monkeypatch.setattr(qwen3_5_patch, "_MIN_PER_CHIP_SIZE_MB", 0)
     monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER", True)
+    monkeypatch.setattr(qwen3_next, "get_pp_group", lambda: _SINGLE_RANK_PP_GROUP)
 
     expected = torch.randn(16, 64, dtype=torch.bfloat16)
     collective_calls = 0
-
-    def fake_orig_model_forward(*_args: object, **_kwargs: object) -> torch.Tensor:
-        """Return unsharded output directly."""
-        return expected
 
     def counting_all_gather(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
         """Count TP all-gather calls."""
@@ -1757,15 +1986,16 @@ def test_overlap_model_forward_skips_exit_gather_when_not_sharded_spine(
         collective_calls += 1
         return torch.cat([tensor, tensor], dim=dim)
 
-    monkeypatch.setattr(qwen3_5_patch, "_orig_model_forward", fake_orig_model_forward)
     monkeypatch.setattr(
         qwen3_5_patch, "tensor_model_parallel_all_gather", counting_all_gather
     )
 
-    model = _StubModel(
-        start_layer=0,
-        layers=[_StubDecoderLayer(sharded_spine=False, mlp=_StubMlp(tp_size=2))],
+    model = _build_real_qwen3_5_model(
+        layers=[_PassthroughDecoderLayer(tp_size=2)],
+        norm=_IdentityModelNorm(),
     )
-    out = overlap_model_forward(_as_model(model), None, torch.arange(16))
+    out = overlap_model_forward(
+        model, None, torch.arange(expected.shape[0]), inputs_embeds=expected
+    )
     assert out is expected
     assert collective_calls == 0

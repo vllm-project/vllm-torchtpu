@@ -35,8 +35,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.distributed import (
-    get_pp_group,
-    model_parallel_is_initialized,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
@@ -87,7 +85,7 @@ def _narrow_all_gather(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
     return tensor_model_parallel_all_gather(x, 0).narrow(0, 0, num_tokens)
 
 
-def _is_sharded_spine_active(
+def _is_sharded_residual_active(
     layer: Qwen3_5DecoderLayer,
     num_tokens: int,
     hidden_size: int,
@@ -97,7 +95,7 @@ def _is_sharded_spine_active(
     layer_any: Any = layer
     return (
         envs.TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER
-        and layer_any.sharded_spine
+        and layer_any.uses_sharded_residual
         and _is_overlap_active(
             num_tokens, hidden_size, layer_any.mlp.tp_size, element_size
         )
@@ -107,8 +105,6 @@ def _is_sharded_spine_active(
 def _fp8_gather(
     x: torch.Tensor,
     num_tokens: int,
-    *,
-    block_size: int | None = None,
 ) -> torch.Tensor:
     """All-gather activations in FP8 with scales and trim to num_tokens."""
     if x.ndim < _MIN_FP8_GATHER_NDIM:
@@ -117,14 +113,9 @@ def _fp8_gather(
             f"got shape={tuple(x.shape)}."
         )
         raise ValueError(msg)
-    if block_size is not None and block_size <= 0:
-        msg = f"_fp8_gather expects positive block_size, got {block_size}."
-        raise ValueError(msg)
     quant_dtype = torch.float8_e4m3fn
     work_dtype = torch.float32 if x.dtype == torch.float16 else x.dtype
-    q, scale = quantize_tensor(
-        x.to(work_dtype), quant_dtype, axis=-1, block_size=block_size
-    )
+    q, scale = quantize_tensor(x.to(work_dtype), quant_dtype, axis=-1)
     # Transport FP8 payload bytes as int8 for TP collective dtype support.
     q_deq = (
         _narrow_all_gather(q.view(torch.int8), num_tokens)
@@ -132,13 +123,7 @@ def _fp8_gather(
         .to(work_dtype)
     )
     scale = _narrow_all_gather(scale.to(work_dtype), num_tokens)
-    if block_size is None or block_size == x.shape[-1]:
-        return (q_deq * scale).to(x.dtype)
-    return (
-        (q_deq.unflatten(-1, (-1, block_size)) * scale.unsqueeze(-1))
-        .flatten(-2)
-        .to(x.dtype)
-    )
+    return (q_deq * scale).to(x.dtype)
 
 
 def _configure_layer(layer: Qwen3_5DecoderLayer) -> None:
@@ -146,15 +131,6 @@ def _configure_layer(layer: Qwen3_5DecoderLayer) -> None:
     mlp: Any = layer.mlp
     if mlp.tp_size <= 1:
         raise ValueError("TPU_ATTN_MOE_OVERLAP requires TP > 1")
-    if (
-        envs.TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER
-        and model_parallel_is_initialized()
-        and get_pp_group().world_size > 1
-    ):
-        msg = (
-            "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER does not support pipeline parallelism"
-        )
-        raise ValueError(msg)
     if layer.use_attn_reduce_scatter_for_moe:
         raise ValueError("TPU_ATTN_MOE_OVERLAP does not support sequence-parallel MoE")
     if mlp.replicate_shared_expert:
@@ -183,11 +159,19 @@ def _patched_init(
     prefix: str = "",
 ) -> None:
     """Initialize Qwen3.5 decoder layer and configure MoE overlap."""
+    if (
+        envs.TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER
+        and vllm_config.parallel_config.pipeline_parallel_size > 1
+    ):
+        msg = (
+            "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER does not support pipeline parallelism"
+        )
+        raise ValueError(msg)
     _orig_init(self, vllm_config, layer_type, prefix=prefix)
     _configure_layer(self)
     # The MTP predictor forward has no exit gather.
     layer_any: Any = self
-    layer_any.sharded_spine = "mtp" not in prefix.split(".")
+    layer_any.uses_sharded_residual = "mtp" not in prefix.split(".")
 
 
 def _overlap_forward(
@@ -204,7 +188,7 @@ def _overlap_forward(
     overlap = _is_overlap_active(
         num_tokens, hidden_states.shape[-1], tp_size, hidden_states.element_size()
     )
-    fp8_overlap = _is_sharded_spine_active(
+    fp8_overlap = _is_sharded_residual_active(
         self, num_tokens, hidden_states.shape[-1], hidden_states.element_size()
     )
     is_first_layer = residual is None
@@ -283,11 +267,11 @@ def _overlap_model_forward(
         return out
     num_tokens = positions.shape[-1]
     first_layer: Any = self.layers[self.start_layer]
-    if not first_layer.sharded_spine:
+    if not first_layer.uses_sharded_residual:
         return out
     is_tuple = isinstance(out, tuple)
     hidden_states: torch.Tensor = out[0] if is_tuple else out
-    if not _is_sharded_spine_active(
+    if not _is_sharded_residual_active(
         first_layer,
         num_tokens,
         hidden_states.shape[-1],
@@ -327,6 +311,7 @@ def maybe_patch_qwen3_5_attn_moe_overlap(
         )
     Qwen3_5DecoderLayer.__init__ = _patched_init
     Qwen3_5DecoderLayer.forward = _overlap_forward
-    Qwen3_5Model.forward = _overlap_model_forward
+    if envs.TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER:
+        Qwen3_5Model.forward = _overlap_model_forward
     logger.info("Applied TPU patch: Qwen3.5 MoE attention-to-MoE collective overlap.")
     return None
