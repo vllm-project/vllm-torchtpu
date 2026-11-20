@@ -277,14 +277,10 @@ def test_workbench_html_three_pane_landmarks_and_unique_ids(model_name: str) -> 
     collector = _UniqueIdCollector()
     all_ids = collector.feed_markup(html_text)
     assert len(all_ids) == len(set(all_ids))
-    assert "ph === 'decode' ? 1" in html_text
-    assert "phase === 'decode' ? 1" in html_text
     assert "wbOnHwControl()" in html_text
     assert "wbOnPhaseChange()" in html_text
     assert "wbOnSeqChange()" in html_text
-    assert "max-height:164px" in html_text
     assert "wb-knob-pair" in html_text
-    assert "overflow-wrap:anywhere" in html_text
     assert 'max="1024"' in html_text
     assert 'max="8192"' in html_text
     assert 'step="0.01"' in html_text

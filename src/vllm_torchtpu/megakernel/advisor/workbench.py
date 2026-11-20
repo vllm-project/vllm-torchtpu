@@ -81,8 +81,8 @@ def render_workbench_body(
     """Render the 3-pane Fusion Workbench HTML shell."""
     tabs_html = ""
     vmem_init, vmem_max = vmem_bounds_mib
-    m_e, c_e = _esc_attr(model_name), _esc_attr(chip_name)
-    l_e, s_e = _esc_attr(layout_label), _esc_attr(mode_source)
+    model_escaped, chip_escaped = _esc_attr(model_name), _esc_attr(chip_name)
+    layout_escaped, source_escaped = _esc_attr(layout_label), _esc_attr(mode_source)
     phases = tuple((p, p) for p in ("decode", "verify", "prefill", "mixed"))
     dma_o, al_o = (("2", "2 slots"), ("3", "3 slots")), (("1", "on"), ("0", "off"))
     hw_fn = "wbOnHwControl()"
@@ -99,7 +99,7 @@ def render_workbench_body(
         + "</div>"
     )
     pair_wl = _sknob("phase", "Phase", "decode", phases, "wbOnPhaseChange()") + _sknob(
-        "layout", "Parallelism", l_e, (), "wbOnLayoutPresetChange()"
+        "layout", "Parallelism", layout_escaped, (), "wbOnLayoutPresetChange()"
     )
     mesh_drawer = (
         '<details class="wb-eta-details" id="wb-mesh-details">'
@@ -205,9 +205,10 @@ def render_workbench_body(
         )
     )
     return f"""  <header class="wb-topbar" id="wb-topbar"><div class="wb-brand">
-  <h1>Megakernel Fusion Workbench &middot; {m_e}</h1><div class="wb-sub">Chip:
-  <strong>{c_e}</strong> &middot; Mesh: <strong id="wb-active-layout">{l_e}</strong>
-  ({s_e})</div></div><div class="wb-verdict-wrap">
+  <h1>Megakernel Fusion Workbench &middot; {model_escaped}</h1><div class="wb-sub">Chip:
+  <strong>{chip_escaped}</strong> &middot; Mesh:
+  <strong id="wb-active-layout">{layout_escaped}</strong>
+  ({source_escaped})</div></div><div class="wb-verdict-wrap">
   <span class="wb-verdict-pill" id="wb-verdict-pill">BUILD WHOLE_STEP</span>
   <div class="wb-verdict-meta tabular" id="wb-verdict-summary">-</div></div>
   <div class="wb-top-kpis">{kpis}</div><div class="wb-actions">
