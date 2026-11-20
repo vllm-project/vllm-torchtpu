@@ -187,6 +187,37 @@ def x2_expand_env(name: str, value: str) -> str:
     return out
 
 
+def x2_wait_registry(address: str, timeout_s: float | None = None) -> float:
+    """TIER-X2: waits until the global registry accepts a connection (its sidecar starts with the pod,
+    the shard stores register with it at construction); seconds waited. Refused after the timeout
+    (Q38X2_REGISTRY_WAIT_S, default 600)."""
+    if timeout_s is None:
+        timeout_s = float(os.environ.get("Q38X2_REGISTRY_WAIT_S", "600"))
+    host, _, port = address.rpartition(":")
+    host = host.strip("[]")
+    t0 = time.monotonic()
+    noted = False
+    while True:
+        try:
+            with socket.create_connection((host, int(port)), timeout=1.0):
+                return time.monotonic() - t0
+        except OSError:
+            pass
+        if time.monotonic() - t0 >= timeout_s:
+            raise ValueError(
+                f"TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_X2: the global registry at "
+                f"{address} did not answer within {timeout_s:.0f} s (is Q38X2_REGISTRY_PORT set "
+                "on this leg?)"
+            )
+        if not noted:
+            logger.info(
+                "TPURaidenOffloadingConnector: TIER-X2: waiting for the global registry at %s",
+                address,
+            )
+            noted = True
+        time.sleep(0.5)
+
+
 def x2_shard_namespace(key_namespace: bytes, shard: str) -> bytes:
     """A shard's own key namespace: the shards of one class hold the same keys, and
     the registry maps a key's bytes to one owner, so each shard's keys must differ."""
@@ -3050,6 +3081,14 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         plan = self.tier_plan
         assert plan is not None
         factor = self.device_block_size_factor
+        if self.tier_x2 and stores is None:
+            waited = x2_wait_registry(self.global_registry_address)
+            logger.info(
+                "TPURaidenOffloadingConnector: TIER-X2: the global registry at %s answered "
+                "after %.1f s",
+                self.global_registry_address,
+                waited,
+            )
         managers = []
         for tier_class in plan.classes:
             capacity = plan.capacity(tier_class)
