@@ -64,6 +64,18 @@ def carrier_pages_per_block(pool: Any) -> int:
     return math.prod(pool.shape[1:]) * pool.dtype.itemsize // (rows * width * 2)
 
 
+def manager_page_table(cktab: Any, mp: int, lp: int, physical: int) -> Any:
+    """The per-kernel-page key table `[..., n_ck]` as a table of runs of `mp` consecutive
+    kernel pages: entry m = `cktab[..., m * mp] // mp`, and the kernel copies pages
+    `[entry * mp, entry * mp + mp)`. Exact when `mp` divides the `lp` kernel pages of a block
+    column (`compressed_kernel_pages`: page `block * physical + slot * lp + j`, j < lp, so a
+    column's pages are consecutive) and the block stride `physical`; refused otherwise (two
+    block columns are not adjacent in general)."""
+    assert mp > 0 and lp % mp == 0 and physical % mp == 0, (mp, lp, physical)
+    assert cktab.shape[-1] % mp == 0, (cktab.shape, mp)
+    return cktab[..., ::mp] // mp
+
+
 def _layer_batched_tables(pool, tables, slots, live, ctx, n_req, nreq, pages_per_seq, n_ck, lp):
     """`qsa_step_inputs`' per-layer table and ring prep for all layers at once
     (VLLM_TPU_MK_WHOLE_BATCHED_INPUTS): `[layers, nreq, cols]` page tables and one ring
@@ -109,6 +121,7 @@ def qsa_step_inputs(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     layer_major_tables: bool = False,
+    manager_pages: int = 0,
 ) -> dict[str, Any]:
     """`{name: array}` of the stage-C QSA extras for `len(tables)` QSA layers.
 
@@ -119,6 +132,8 @@ def qsa_step_inputs(
     rows: head-pair offset 0). `layer_major_tables`: page tables `[layers, requests,
     cols]`
     (the indexer's `hbm_tables` form) instead of `[layers * requests, cols]`.
+    `manager_pages` = N > 0: `qsa_cktab` holds one entry per run of N consecutive kernel pages,
+    `first page // N` (`QSAFullIndexedBlock.manager_pages`); N divides a block column's pages.
     """
     n_req = len(context)
     nreq = M // T
@@ -172,6 +187,8 @@ def qsa_step_inputs(
         stack = jnp.stack if layer_major_tables else jnp.concatenate
         mtab, cktab, ring = stack(mtab), stack(cktab), jnp.concatenate(rings)
 
+    if manager_pages:
+        cktab = manager_page_table(cktab, manager_pages, lp, carrier_pages_per_block(pool))
     # Gather the rows, then widen: converting the whole [max_model_len, 128] table every
     # step cost
     # 64 us (xprof j-1e002dca, convert f32[262144,128]); same values.

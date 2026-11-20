@@ -83,6 +83,14 @@ LOOP_REQUESTS: bool = False
 # per request, so each attention copy issues from one SMEM load (same addresses; RPAd's
 # recipe).
 UNION_PHYS: bool = False
+# `...,wholekeymp=N` (N divides the kernel pages of a pool block column: 2 or 4 served): the
+# indexer's key stream copies N consecutive kernel pages per DMA (`manager_pages`) instead of
+# one 16 KiB page per DMA. 0 = per page. Same keys, same scores.
+KEY_MP: int = 0
+# `...,wholekeyslots=N` (N > 2): the key stream's ring has N slots, so N - 1 chunks of 32
+# kernel pages are in flight while one is scored (`QSAFullIndexedBlock.key_slots`). Same keys,
+# same scores.
+KEY_SLOTS: int = 2
 
 
 def union_stats_on() -> bool:
@@ -104,6 +112,8 @@ def indexed_options() -> dict:
         async_dma=envs.VLLM_TPU_MK_QSEL_ASYNC,
         xreq_prefetch=envs.VLLM_TPU_MK_QSA_XREQ_PREFETCH,
         select_nvis=envs.VLLM_TPU_MK_QSA_SELECT_NVIS,
+        manager_pages=KEY_MP,
+        key_slots=KEY_SLOTS,
     )
 
 
@@ -436,6 +446,7 @@ def build_wholestep_call(
             k_scale=scales[0],
             v_scale=scales[1],
             layer_major_tables=LONG_CONTEXT["hbm_tables"],
+            manager_pages=KEY_MP,
         )
         return tuple(d[n] for n in names)
 

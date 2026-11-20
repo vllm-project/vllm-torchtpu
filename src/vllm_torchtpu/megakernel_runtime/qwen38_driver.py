@@ -861,6 +861,15 @@ class Qwen38SegmentDriver:
             from . import qwen38_wholestep_call
 
             qwen38_wholestep_call.UNION_PHYS = True
+        keymp = _parse_int(raw, "wholekeymp")
+        keyslots = _parse_int(raw, "wholekeyslots")
+        if keymp or keyslots:
+            from . import qwen38_wholestep_call
+
+            qwen38_wholestep_call.KEY_MP = keymp or 0
+            qwen38_wholestep_call.KEY_SLOTS = keyslots or 2
+            logger.info("Qwen3.8 whole-step key stream: %d pages per DMA, %d ring slots",
+                        keymp or 1, keyslots or 2)
         if _parse_flag(raw, "wholeloop", False):
             from . import qwen38_wholestep_call
 
