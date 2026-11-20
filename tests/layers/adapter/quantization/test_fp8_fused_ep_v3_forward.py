@@ -138,6 +138,7 @@ def _layer(sequence_parallel_flag):
         w2_weight_scale_inv=torch.ones(2, 1, 1, 8),
         _experts_start=torch.zeros((), dtype=torch.int32),
         _gmm_primary_experts=None,
+        _lowtok_has_copies=False,
         moe_config=SimpleNamespace(
             is_sequence_parallel=sequence_parallel_flag, experts_per_token=2
         ),

@@ -58,6 +58,7 @@ def make_layer(experts=64, hidden=512, inter=256, use_ep=True):
         w13_weight_scale_inv=meta(experts, 1, 1, 2 * inter, dtype=torch.float32),
         w2_weight_scale_inv=meta(experts, 1, 1, hidden, dtype=torch.float32),
         _experts_start=torch.tensor(192, dtype=torch.int32),
+        _lowtok_has_copies=False,
     )
 
 
@@ -107,6 +108,16 @@ def test_disabled_builds_and_logs_nothing(monkeypatch):
     assert scores._LAYERS == []
     logs.warning.assert_not_called()
     logs.info.assert_not_called()
+
+
+def test_prebuild_gives_every_layer_the_copy_flag(monkeypatch):
+    """The FP8 forward reads the flag directly on every layer it loads, one
+    the rule leaves on the default MoE path included."""
+    monkeypatch.setattr(scores, "enabled", lambda vllm_config: False)
+    layer = make_layer()
+    del layer._lowtok_has_copies
+    assert scores.prebuild(method(), layer, "silu") is None
+    assert layer._lowtok_has_copies is False
 
 
 def test_plain_softmax_router_moves_into_the_kernel(enabled):
