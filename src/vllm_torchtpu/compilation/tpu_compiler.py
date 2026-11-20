@@ -286,6 +286,13 @@ _TPU_COMPILE_ENV_IGNORED = {
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+    # Host-side prompt path only: API-server tokenization and prompt checks,
+    # and the prompt ids and block hashes the engine core receives.
+    "VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS",
+    "VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS",
+    "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS",
+    "VLLM_TPU_SEND_NEW_PROMPT_IDS",
+    "VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
