@@ -387,7 +387,10 @@ def _kernel(
 
         @pl.when((e >= 0) & (e < experts))
         def local():
-            active_ref[e] = 1
+            # Bit h: a token of the h-th _ROW_ALIGN-row tile routes to e.
+            active_ref[e] = active_ref[e] | jnp.where(
+                r // topk >= _ROW_ALIGN, 2, 1
+            ).astype(jnp.int32)
             if sparse:
                 counts_ref[e] += first_route(r, e).astype(jnp.int32)
 
@@ -656,26 +659,44 @@ def _kernel(
             return
         slot = unit % slots
         c = unit % num_chunks
-        down = expert_mlp(x_pad_ref[...], slot)
+        e = active_ids_ref[unit // num_chunks]
 
-        @pl.when(c == 0)
-        def first():
-            expert_acc_ref[...] = down
+        def run(rows):
+            down = expert_mlp(x_pad_ref[rows, :], slot)
 
-        @pl.when(c > 0)
-        def rest():
-            expert_acc_ref[...] += down
+            @pl.when(c == 0)
+            def first():
+                expert_acc_ref[rows, :] = down
 
-        @pl.when(c == num_chunks - 1)
-        def finish():
-            e = active_ids_ref[unit // num_chunks]
-            columns = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
-            coeff = jnp.sum(
-                jnp.where(columns == e, coeff_ref[...], 0), axis=1, keepdims=True
-            )
-            out_e = expert_acc_ref[...].astype(out_ref.dtype).astype(f32)
-            # Zero routing must suppress even a non-finite unused output.
-            acc_ref[...] += jnp.where(coeff != 0, out_e * coeff, 0)
+            @pl.when(c > 0)
+            def rest():
+                expert_acc_ref[rows, :] += down
+
+            @pl.when(c == num_chunks - 1)
+            def finish():
+                columns = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
+                columns = columns[rows, :]
+                coeff = jnp.sum(
+                    jnp.where(columns == e, coeff_ref[rows, :], 0),
+                    axis=1,
+                    keepdims=True,
+                )
+                out_e = expert_acc_ref[rows, :].astype(out_ref.dtype).astype(f32)
+                # Zero routing must suppress even a non-finite unused output.
+                acc_ref[rows, :] += jnp.where(coeff != 0, out_e * coeff, 0)
+
+        if mp != 2 * _ROW_ALIGN:
+            run(slice(None))
+            return
+        # Two row tiles: an expert whose routes all lie in one tile runs only
+        # that tile (the other's rows would all carry zero coefficients).
+        halves = active_ref[e]
+        for bits, rows in (
+            (3, slice(None)),
+            (1, slice(0, _ROW_ALIGN)),
+            (2, slice(_ROW_ALIGN, mp)),
+        ):
+            pl.when(halves == bits)(functools.partial(run, rows))
 
     def body(unit, carry):
         for copy in transfers(unit):
