@@ -92,6 +92,10 @@ def _shapes(m, h, i, e):
         (16, 1536, 1536, 2),
         (16, 512, 512, 129),
         (1024, 8192, 4096, 512),
+        # Rows that are a multiple of 8 but not of 16: the entry pads them to
+        # 16 inside (test_expanded_shapes_match_routed_reference).
+        (8, 512, 512, 4),
+        (24, 512, 512, 4),
     ],
 )
 @pytest.mark.parametrize("skip_padded_tokens", [False, True])
@@ -178,6 +182,9 @@ def test_hidden_contracting_axis_also_needs_gmm_quantization(
 @pytest.mark.parametrize(
     "shape",
     [
+        # Rows must be a multiple of 8.
+        (4, 512, 512, 4),
+        (12, 512, 512, 4),
         (15, 512, 512, 4),
         (16, 768, 512, 4),
         (16, 512, 704, 4),
@@ -364,6 +371,10 @@ def test_copy_slots_past_the_primaries_contribute_nothing(monkeypatch, m):
         (256, 128, False),
         (272, 272, True),
         (15, 1024, False),
+        # 8-row alignment: admitted at 8 and 24 rows, refused at 12.
+        (8, 1024, True),
+        (24, 1024, True),
+        (12, 1024, False),
     ],
 )
 def test_token_threshold_dispatch_and_resource_failure_propagation(
