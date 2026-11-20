@@ -180,6 +180,21 @@ def candidate_block_scores(
     return jnp.where(jnp.arange(blocks)[None, :] == last[:, None], jnp.inf, reduced)
 
 
+def visible_block_scores(
+    maxima: jax.Array, lengths: jax.Array, *, block_size: int
+) -> jax.Array:
+    """`candidate_block_scores` from the scores' block maxima.
+
+    Blocks at or past each row's length may hold anything; they become -inf,
+    and the newest visible block is forced to win.
+    """
+    lengths = jnp.clip(lengths, 0, maxima.shape[1] * block_size)
+    blocks = jnp.arange(maxima.shape[1])[None, :]
+    live = pl.cdiv(lengths, block_size)[:, None]
+    visible = jnp.where(blocks < live, maxima, -jnp.inf)
+    return jnp.where(blocks == live - 1, jnp.inf, visible)
+
+
 def _candidate_block_scores(scores, lengths, block_size, config):
     rows, width = scores.shape
     row_tile, block_tile = config

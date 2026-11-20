@@ -38,3 +38,22 @@ def test_block_maxima_ignore_columns_past_each_length(rows):
     np.testing.assert_array_equal(
         np.asarray(actual), _reference(scores, lengths, block_size)
     )
+
+
+def test_visible_block_scores_match_masked_reduction():
+    width, block_size, rows = 65536, 8, 8
+    rng = np.random.default_rng(11)
+    lengths = rng.integers(1, width, rows)
+    lengths[:4] = (0, 8, 9, width)
+    scores = rng.normal(size=(rows, width)).astype(np.float32)
+    scores[np.arange(width)[None, :] >= lengths[:, None]] = -np.inf
+    maxima = scores.reshape(rows, -1, block_size).max(-1)
+    # Blocks past a length may hold anything.
+    blocks = np.arange(maxima.shape[1])[None, :]
+    maxima[blocks >= -(-lengths[:, None] // block_size)] = np.nan
+    actual = publication.visible_block_scores(
+        jnp.asarray(maxima), jnp.asarray(lengths, jnp.int32), block_size=block_size
+    )
+    np.testing.assert_array_equal(
+        np.asarray(actual), _reference(scores, lengths, block_size)
+    )

@@ -80,41 +80,53 @@ def test_block_topk(rows, width, distribution, publish):
             np.testing.assert_array_equal(np.asarray(result[1])[row], expected)
 
 
-def _block_maxima(scores):
+def _block_maxima(scores, block=BLOCK):
     """Block maxima in radix order: a block holding +0 has maximum +0."""
-    blocks = scores.reshape(scores.shape[0], -1, BLOCK)
+    blocks = scores.reshape(scores.shape[0], -1, block)
     maxima = blocks.max(-1)
     positive_zero = ((blocks == 0) & ~np.signbit(blocks)).any(-1)
     maxima[(maxima == 0) & positive_zero] = np.float32(0.0)
     return maxima
 
 
+@pytest.mark.parametrize("block,maxima_block", [(BLOCK, None), (2 * BLOCK, BLOCK)])
 @pytest.mark.parametrize("publish", [0, PUBLISH])
 @pytest.mark.parametrize("rows,width,distribution", CASES[:5])
-def test_given_maxima_match_reduced(rows, width, distribution, publish):
+def test_given_maxima_match_reduced(
+    rows, width, distribution, publish, block, maxima_block
+):
     if jax.default_backend() != "tpu":
         pytest.skip("SparseCore top-k requires TPU")
-    if not is_supported(rows, width, K, BLOCK):
+    if not (
+        is_supported(rows, width, K, block)
+        and is_supported(
+            rows, width, K, block, given_maxima=True, maxima_block=maxima_block
+        )
+    ):
         pytest.skip("Block maxima of this width do not fit SparseCore VMEM")
     rng = np.random.default_rng(29)
     scores = _scores(distribution, rows, width, rng)
     lengths = rng.integers(0, width + 1, rows).astype(np.int32)
     lengths[:4] = (0, 1, 513, width)
     scores[np.arange(width)[None, :] >= lengths[:, None]] = -np.inf
-    maxima = _block_maxima(scores)
-    # Blocks past a row's length are never read.
-    maxima[np.arange(maxima.shape[1])[None, :] * BLOCK >= lengths[:, None]] = np.nan
+    # Given maxima may be finer than the blocks; block top-k folds them.
+    given_block = maxima_block or block
+    maxima = _block_maxima(scores, given_block)
+    # Maxima of blocks past a row's length are never read.
+    starts = np.arange(maxima.shape[1]) * given_block // block * block
+    maxima[starts[None, :] >= lengths[:, None]] = np.nan
 
     def run(**extra):
         return block_topk(
             jnp.asarray(scores),
             jnp.asarray(lengths),
             k=K,
-            block_size=BLOCK,
+            block_size=block,
             publish=publish,
             **extra,
         )
 
-    reduced, given = run(), run(maxima=jnp.asarray(maxima))
+    reduced = run()
+    given = run(maxima=jnp.asarray(maxima), maxima_block=maxima_block)
     for a, b in zip(jax.tree.leaves(reduced), jax.tree.leaves(given)):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
