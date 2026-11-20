@@ -273,15 +273,20 @@ class QSAFullIndexedBlock(QSAFullBlock):
         # thresholds skip the id passes unless a tie is truncated (t), stop the value
         # passes once the count at `lo` is exactly the budget (e), and scan only the
         # smallest static row tier {S/2, 3S/4, S} that holds the visible groups, for the
-        # thresholds and the row compaction (r). "1" = all; letters pick parts (ablation).
+        # thresholds and the row compaction (r). "1" = "te" (exos: the tiers' extra static
+        # copies slow every rank's select at b16); letters pick parts.
         # VLLM_TPU_MK_QSA_THR_EXIT = "bit,every": first while-loop bit, passes per trip.
         fast = os.environ.get("VLLM_TPU_MK_QSA_THR_FAST", "0")
-        fast = "ter" if fast == "1" else "" if fast == "0" else fast
+        fast = "te" if fast == "1" else "" if fast == "0" else fast
         ex_bit, ex_every = (int(x) for x in
                             os.environ.get("VLLM_TPU_MK_QSA_THR_EXIT", "19,2").split(","))
         self.thr_kw = dict(tie_skip="t" in fast,
                            early_exit=(ex_bit, ex_every) if "e" in fast else ())
-        self.thr_tiers = "r" in fast
+        # Tiers for the thresholds (h) / the compaction (c) / both (r); "2": tiers S/2, S only
+        # (each tier is one more static copy of the scan: code size).
+        self.thr_tiers = "r" in fast or "h" in fast
+        self.cmp_tiers = "r" in fast or "c" in fast
+        self.tier_two = "2" in fast
         if self.select_nvis:
             S, rs = max_groups // 128, max_groups // 128 // self.n_chunks
             Sh = S // (self.dcp if compressed_dcp else 1)

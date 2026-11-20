@@ -134,7 +134,7 @@ def test_kernel_thr_fast_bit_identical(monkeypatch, ctx, zero):
                          max_groups=2048, ck_fn=ck_fn)
     monkeypatch.setenv("VLLM_TPU_MK_QSA_THR_FAST", "0")
     base = run()
-    for fast, exit_ in (("1", "19,2"), ("ter", "30,1")):
+    for fast, exit_ in (("1", "19,2"), ("ter", "30,1"), ("tec2", "19,2")):
         monkeypatch.setenv("VLLM_TPU_MK_QSA_THR_FAST", fast)
         monkeypatch.setenv("VLLM_TPU_MK_QSA_THR_EXIT", exit_)
         got = run()
