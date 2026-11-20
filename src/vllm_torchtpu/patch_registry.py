@@ -97,6 +97,12 @@ PATCHES = (
         _ENGINE,
     ),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
+    # Host admission costs (inert unless their flags are on).
+    Patch(
+        "vllm_torchtpu.core.prompt_token_array:patch_prompt_token_array",
+        ("engine_core",),
+    ),
+    Patch("vllm_torchtpu.runner.gc_at_waits:patch_gc_at_waits", _ENGINE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_force_v1_runner_tpu", _ACTIVE),

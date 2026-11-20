@@ -759,6 +759,33 @@ def _prefix_aware_load_enabled() -> bool:
     return _prefix_aware_load_requested() and _prefix_aware_load_supported()
 
 
+def _split_held_stage3_loads(
+    metadata: TPUConnectorMetadata,
+) -> tuple[TPUConnectorMetadata, TPUConnectorMetadata | None]:
+    """Splits a consumer's load entries into those handled now and the
+    held ones that start a transfer, each in scheduler order.
+
+    Release-only and fail-only entries start no transfer and join no TP
+    vote; they stay with the entries handled now, as does anything that is
+    not Stage-3 load metadata (_submit_stage3_loads rejects it there).
+    """
+    now: dict[str, Any] = {}
+    held: dict[str, Any] = {}
+    for req_id, req_meta in metadata.reqs_to_load.items():
+        starts_transfer = (
+            isinstance(req_meta, _Stage3LoadMeta)
+            and not req_meta.release_only
+            and not req_meta.fail_only
+        )
+        (held if starts_transfer else now)[req_id] = req_meta
+    if not held:
+        return metadata, None
+    return (
+        TPUConnectorMetadata(reqs_to_load=now),
+        TPUConnectorMetadata(reqs_to_load=held),
+    )
+
+
 def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
     if _use_raiden_stage3_transport():
         return True
@@ -1009,6 +1036,29 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
             wait_for_completion=wait_for_completion,
             report_completion=report_completion,
         )
+
+    def start_load_kv_holding_loads(self) -> TPUConnectorMetadata | None:
+        """Runs start_load_kv but holds back a Stage-3 consumer's loads.
+
+        Returns the entries that start a transfer, in their scheduler order,
+        for submit_held_loads (TPU_RAIDEN_STAGE3_SUBMIT_AFTER_DISPATCH), or
+        None when nothing is held: no such entry this step, a producer, or a
+        backend that runs its loads here in full.
+        """
+        assert self.connector_worker is not None
+        assert isinstance(self._connector_metadata, TPUConnectorMetadata)
+        if not self.use_raiden:
+            self.start_load_kv(None)
+            return None
+        worker = cast(TPURaidenConnectorWorker, self.connector_worker)
+        return worker.process_send_load(
+            self._connector_metadata, hold_stage3_loads=True
+        )
+
+    def submit_held_loads(self, held: TPUConnectorMetadata) -> None:
+        """Submits the entries start_load_kv_holding_loads returned."""
+        worker = cast(TPURaidenConnectorWorker, self.connector_worker)
+        worker.submit_held_stage3_loads(held)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Layer-wise load is not supported on TPU."""
@@ -4103,7 +4153,14 @@ class TPURaidenConnectorWorker:
         metadata: TPUConnectorMetadata,
         wait_for_completion: bool = False,
         report_completion: bool = True,
-    ) -> None:
+        hold_stage3_loads: bool = False,
+    ) -> TPUConnectorMetadata | None:
+        """Registers a producer's sends or starts a consumer's loads.
+
+        With ``hold_stage3_loads`` a Stage-3 consumer handles its release-only
+        and fail-only entries here and returns the entries that start a
+        transfer, unsubmitted, for submit_held_stage3_loads.
+        """
         engine = self._ensure_raiden_transfer_engine()
         if self.is_producer:
             if self.vllm_config.speculative_config is not None and any(
@@ -4145,6 +4202,11 @@ class TPURaidenConnectorWorker:
             return
 
         if self._raiden_stage3_enabled():
+            if hold_stage3_loads:
+                assert not wait_for_completion
+                metadata, held = _split_held_stage3_loads(metadata)
+                self._submit_stage3_loads(metadata, engine)
+                return held
             # Inline mode waits for the loads below, so the coordination RPCs
             # must have run before the wait loop starts polling.
             self._submit_stage3_loads(metadata, engine, synchronous=wait_for_completion)
@@ -5521,6 +5583,16 @@ class TPURaidenConnectorWorker:
             return
         self._stage3_submit_queue.put(_release)
         self._ensure_stage3_submit_workers()
+
+    def submit_held_stage3_loads(self, held: TPUConnectorMetadata) -> None:
+        """Submits the load entries process_send_load held back.
+
+        Every TP rank calls it at the same point of the same step with the
+        same entries, before get_finished tests _stage3_tp_submits, so the
+        per-load readiness votes pair up and the set is identical on every
+        rank at that test.
+        """
+        self._submit_stage3_loads(held, self._ensure_raiden_transfer_engine())
 
     def _submit_stage3_loads(
         self,

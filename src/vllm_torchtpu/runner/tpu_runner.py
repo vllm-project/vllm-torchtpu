@@ -80,6 +80,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.core import prompt_token_array
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
@@ -1133,6 +1134,10 @@ class TPUModelRunner(GPUModelRunner):
         # The step whose KV-connector progress an intermediate stage still
         # owes in sample_tokens.
         self._pp_pending_scheduler_output: SchedulerOutput | None = None
+        # Stage-3 loads the connector held back in this step's
+        # maybe_setup_kv_connector (TPU_RAIDEN_STAGE3_SUBMIT_AFTER_DISPATCH),
+        # submitted and dropped at the start of get_finished_kv_transfers.
+        self._held_kv_loads: Any = None
 
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
@@ -1144,6 +1149,15 @@ class TPUModelRunner(GPUModelRunner):
             profiler_rank, enabled=self._stage_timing_has_consumer()
         )
         host_phases.set_rank(profiler_rank)
+        logger.info(
+            "Decode admission switches rank=%d: "
+            "TPU_RAIDEN_STAGE3_SUBMIT_AFTER_DISPATCH=%s "
+            "VLLM_TPU_PROMPT_TOKEN_ARRAY=%s VLLM_TPU_GC_AT_WAITS=%s",
+            profiler_rank,
+            "ON" if dist_utils.get_stage3_submit_after_dispatch() else "off",
+            "ON" if envs.VLLM_TPU_PROMPT_TOKEN_ARRAY else "off",
+            "ON" if envs.VLLM_TPU_GC_AT_WAITS else "off",
+        )
         if envs.TPU_FOREACH_MUTATION_EPILOGUE:
             from vllm_torchtpu.compilation import foreach_epilogue
 
@@ -1320,6 +1334,11 @@ class TPUModelRunner(GPUModelRunner):
             return
         kv_connector = get_kv_transfer_group()
         assert scheduler_output.kv_connector_metadata is not None
+        # Every step reaches get_finished_kv_transfers, which submits the
+        # loads held in it, before the next step gets here; this keeps any
+        # step that would not from dropping them or reordering them behind a
+        # later step's connector work.
+        self._submit_held_kv_loads(kv_connector)
         # Upstream parity (gpu_model_runner calls this before every forward;
         # base-class default is a no-op): lets connectors with async saves
         # fence in-flight stores whose source blocks the scheduler is about
@@ -1332,8 +1351,28 @@ class TPUModelRunner(GPUModelRunner):
             kv_connector.start_load_kv(
                 None, wait_for_completion=True, report_completion=report_completion
             )
-        else:
+            return
+        hold = (
+            getattr(kv_connector, "start_load_kv_holding_loads", None)
+            if dist_utils.get_stage3_submit_after_dispatch()
+            else None
+        )
+        if hold is None:
             kv_connector.start_load_kv(None)
+        else:
+            # The loaded requests wait in WAITING_FOR_REMOTE_KVS, outside this
+            # step's batch, so the forward does not need their submit.
+            self._held_kv_loads = hold()
+
+    def _submit_held_kv_loads(self, kv_connector) -> None:
+        """Submits the loads held in maybe_setup_kv_connector, then drops
+        them; a no-op when none are held. Every TP rank runs the same steps
+        through the same calls, so the submits' collectives pair up."""
+        held = self._held_kv_loads
+        if held is None:
+            return
+        kv_connector.submit_held_loads(held)
+        self._held_kv_loads = None
 
     def maybe_wait_for_kv_save(self) -> None:
         if has_kv_transfer_group():
@@ -1344,6 +1383,9 @@ class TPUModelRunner(GPUModelRunner):
             self._stage_timing.take_samples()
             return None, None, None, set(), None, None
         kv_connector = get_kv_transfer_group()
+        # The step's forward and drafter are dispatched by now. The held loads
+        # are submitted before get_finished tests the TP submit set.
+        self._submit_held_kv_loads(kv_connector)
         finished_sending, finished_recving = kv_connector.get_finished(
             scheduler_output.finished_req_ids
         )
@@ -2694,6 +2736,7 @@ class TPUModelRunner(GPUModelRunner):
             if use_page_local_copy or use_dense_copy
             else scheduler_output
         )
+        prompt_token_array.own_prompt_arrays(scheduler_output.scheduled_new_reqs)
         result = super()._update_states(base_output)
         # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:

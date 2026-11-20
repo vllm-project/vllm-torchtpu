@@ -221,6 +221,8 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_hybrid_kv_load_failure_recovery",
         "_patch_vllm_same_step_prefix_hits",
         "patch_disable_eagle_block_drop",
+        "patch_prompt_token_array",
+        "patch_gc_at_waits",
         "_patch_vllm_merge_multimodal_embeddings",
     ]
     assert stages["platform_activation"] == (

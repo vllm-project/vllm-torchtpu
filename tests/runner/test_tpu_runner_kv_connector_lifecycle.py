@@ -73,6 +73,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
             mamba_state_indices_list=None,
             pooler_output_list=[],
             top_tokens=False,
+            vp_target=False,
         ),
         input_batch=SimpleNamespace(
             max_num_logprobs=None,
@@ -110,10 +111,15 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         _assemble_async_prefill_bootstrap=lambda *_args: async_source,
         _update_placeholder=lambda *_args: {"r0": 0},
         _stage_timing=MagicMock(),
+        _held_kv_loads=None,
     )
     runner._stage_timing.take_samples.return_value = ([], [])
     runner._async_drafter = runner.drafter
-    for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+    for name in (
+        "maybe_wait_for_kv_save",
+        "get_finished_kv_transfers",
+        "_submit_held_kv_loads",
+    ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     return runner
 

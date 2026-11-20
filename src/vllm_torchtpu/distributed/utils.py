@@ -130,6 +130,14 @@ def get_stage3_deferred_submit_enabled() -> bool:
     return envs.TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT
 
 
+def get_stage3_submit_after_dispatch() -> bool:
+    """Whether a Stage-3 consumer submits a step's loads after its forward
+    and drafter are dispatched rather than before the forward (default off).
+    The loaded requests are not in that step's batch, so its forward does not
+    need them."""
+    return bool(envs.TPU_RAIDEN_STAGE3_SUBMIT_AFTER_DISPATCH)
+
+
 def get_stage3_registration_wait_s() -> float:
     """Total budget for deferred Stage-3 submit re-attempts, bounded by the
     overall pull timeout. The producer's registration rides a later producer

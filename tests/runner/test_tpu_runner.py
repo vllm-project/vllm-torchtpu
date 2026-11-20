@@ -441,7 +441,8 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids(
     connector.get_block_ids_with_load_errors_group_index.return_value = 2
     connector.build_connector_worker_meta.return_value = {"jobs": []}
     connector.get_kv_connector_stats.return_value = stats
-    runner = SimpleNamespace(_stage_timing=MagicMock())
+    runner = SimpleNamespace(_stage_timing=MagicMock(), _held_kv_loads=None)
+    runner._submit_held_kv_loads = TPUModelRunner._submit_held_kv_loads.__get__(runner)
     runner._stage_timing.take_samples.return_value = (cpu_samples, device_samples)
     scheduler_output = SimpleNamespace(finished_req_ids={"finished"})
 
@@ -833,11 +834,16 @@ class TestTPURunner:
     def teardown_method(self):
         self._find_non_ssm_backend_patcher.stop()
 
-    def test_maybe_setup_kv_connector_fences_preemptions_before_bind(self):
+    @pytest.mark.parametrize("submit_after_dispatch", [False, True])
+    def test_maybe_setup_kv_connector_fences_preemptions_before_bind(
+        self, submit_after_dispatch
+    ):
         """Upstream parity: handle_preemptions must run before
         bind_connector_metadata / start_load_kv so connectors with async
         saves (OffloadingConnector jobs_to_flush) can fence in-flight
-        stores before the forward overwrites their source blocks."""
+        stores before the forward overwrites their source blocks. With
+        TPU_RAIDEN_STAGE3_SUBMIT_AFTER_DISPATCH the load call is the
+        holding form."""
         self.runner.maybe_setup_kv_connector = (
             TPUModelRunner.maybe_setup_kv_connector.__get__(self.runner)
         )
@@ -854,17 +860,28 @@ class TestTPURunner:
                 "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
                 return_value=connector,
             ),
+            patch(
+                "vllm_torchtpu.runner.tpu_runner.dist_utils."
+                "get_stage3_submit_after_dispatch",
+                return_value=submit_after_dispatch,
+            ),
         ):
             self.runner.maybe_setup_kv_connector(scheduler_output)
 
         connector.handle_preemptions.assert_called_once_with(meta)
         connector.bind_connector_metadata.assert_called_once_with(meta)
-        connector.start_load_kv.assert_called_once_with(None)
+        if submit_after_dispatch:
+            load = "start_load_kv_holding_loads"
+            connector.start_load_kv_holding_loads.assert_called_once_with()
+            connector.start_load_kv.assert_not_called()
+        else:
+            load = "start_load_kv"
+            connector.start_load_kv.assert_called_once_with(None)
         names = [c[0] for c in connector.mock_calls]
         assert (
             names.index("handle_preemptions")
             < names.index("bind_connector_metadata")
-            < names.index("start_load_kv")
+            < names.index(load)
         )
 
     def test_mrope_positions_buffer_is_int32(self):
@@ -2849,9 +2866,14 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _update_mamba_slot_read_offsets=lambda *_args: None,
             _update_num_xla_graphs=lambda *_args: None,
             _stage_timing=MagicMock(),
+            _held_kv_loads=None,
         )
         runner._stage_timing.take_samples.return_value = ([], [])
-        for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+        for name in (
+            "maybe_wait_for_kv_save",
+            "get_finished_kv_transfers",
+            "_submit_held_kv_loads",
+        ):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 
         TPUModelRunner.sample_tokens(runner, None)

@@ -11,6 +11,8 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
+from vllm_torchtpu.runner import gc_at_waits
+
 INVALID_TOKEN_ID = -1
 
 
@@ -124,6 +126,8 @@ class AsyncTPUCopyState:
     def wait(self) -> None:
         if self.completed:
             return
+        if gc_at_waits.ENABLED and gc_at_waits.event_pending(self.copy_ready_event):
+            gc_at_waits.collect_due()
         self.copy_ready_event.synchronize()
         self.chunks_tpu = None
         self._spec_logprobs_tpu = None

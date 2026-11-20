@@ -257,6 +257,7 @@ if TYPE_CHECKING:
     TPU_P2P_WAIT_PULL_TIMEOUT: int = 120
     TPU_RAIDEN_STAGE3_STATUS_PROBE_S: float = 1.0
     TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT: bool = True
+    TPU_RAIDEN_STAGE3_SUBMIT_AFTER_DISPATCH: bool = False
     TPU_RAIDEN_STAGE3_REGISTER_AHEAD: bool = True
     TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S: float = 30.0
     TPU_RAIDEN_TEST_REGISTRATION_DELAY_S: float = 0.0
@@ -310,6 +311,8 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_HOST_PHASES: int = 0
+    VLLM_TPU_PROMPT_TOKEN_ARRAY: bool = False
+    VLLM_TPU_GC_AT_WAITS: bool = False
     VLLM_TPU_LOG_STEP_BUCKETS: int = 0
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
@@ -2078,6 +2081,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT": env_bool(
         "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT", default=True
     ),
+    # Consumer: a step's Stage-3 loads are submitted, with their TP readiness
+    # vote, once its forward and drafter are dispatched (at the start of the
+    # runner's get_finished_kv_transfers) instead of before the forward.
+    # Host-only.
+    "TPU_RAIDEN_STAGE3_SUBMIT_AFTER_DISPATCH": env_bool(
+        "TPU_RAIDEN_STAGE3_SUBMIT_AFTER_DISPATCH", default=False
+    ),
     # On by default: a PCP, TP or DP Stage-3 producer registers a request's
     # KV blocks in the step that completes its prompt rather than in the step
     # after its finish response (pipeline producers always do).
@@ -2279,6 +2289,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log each rank's per-step host time by runner phase every N steps
     # (0 = off); runner/host_phases.py.
     "VLLM_TPU_HOST_PHASES": env_nonnegative_int("VLLM_TPU_HOST_PHASES", 0),
+    # Engine core: a new request's prompt reaches the workers as an int32
+    # array instead of a list (core/prompt_token_array.py). Host-only.
+    "VLLM_TPU_PROMPT_TOKEN_ARRAY": env_bool(
+        "VLLM_TPU_PROMPT_TOKEN_ARRAY", default=False
+    ),
+    # Engine core and workers: due garbage collections run while the main
+    # thread waits on a message queue or a token copy (runner/gc_at_waits.py).
+    # Host-only.
+    "VLLM_TPU_GC_AT_WAITS": env_bool("VLLM_TPU_GC_AT_WAITS", default=False),
     # Log each rank's cumulative step counts per padded token bucket every N
     # steps (0 = off); runner/step_buckets.py.
     "VLLM_TPU_LOG_STEP_BUCKETS": env_nonnegative_int("VLLM_TPU_LOG_STEP_BUCKETS", 0),
