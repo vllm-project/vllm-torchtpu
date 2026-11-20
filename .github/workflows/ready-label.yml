@@ -19,6 +19,8 @@ concurrency:
 jobs:
   ready-label:
     name: Check for Ready Label
+    # partner/release-0.0.1 is unmaintained; its CI is retired.
+    if: github.base_ref != 'partner/release-0.0.1' && github.ref != 'refs/heads/partner/release-0.0.1'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Require the ready label

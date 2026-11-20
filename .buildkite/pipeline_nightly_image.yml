@@ -14,6 +14,7 @@
 
 steps:
   - group: "Publish Nightly Docker Images"
+    if: 'build.branch != "partner/release-0.0.1" && build.pull_request.base_branch != "partner/release-0.0.1"'
     key: "publish_nightly_images_group"
     steps:
       - label: ":docker: Build and Publish Nightly Images (ci, dev, prod)"

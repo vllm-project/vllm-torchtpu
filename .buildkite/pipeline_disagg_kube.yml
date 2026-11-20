@@ -25,6 +25,7 @@ steps:
   # published from a Dockerfile carrying buildkite-agent; until then the pod
   # cannot publish its own results.
   - label: ":docker: Build the benchmark image"
+    if: 'build.branch != "partner/release-0.0.1" && build.pull_request.base_branch != "partner/release-0.0.1"'
     key: "build_kube_disagg_image"
     agents:
       queue: cpu_64_core
@@ -35,6 +36,7 @@ steps:
       - docker push "$$WORKLOAD_IMAGE"
 
   - label: ":kubernetes: :tpu: Kube P/D Disaggregated Benchmark"
+    if: 'build.branch != "partner/release-0.0.1" && build.pull_request.base_branch != "partner/release-0.0.1"'
     depends_on: "build_kube_disagg_image"
     # Covers queueing as well as running, so that the launcher's own limits are
     # what stop a step and not this.
@@ -75,6 +77,7 @@ steps:
   # step in pipeline_perf_kube.yml, which needs one of the same slices; the
   # slices also serve Kimi-K3 development, so CI keeps to that window.
   - label: ":kubernetes: :tpu: Kimi-K3 1P1D (TPU v7x 2x2x4 x2)"
+    if: 'build.branch != "partner/release-0.0.1" && build.pull_request.base_branch != "partner/release-0.0.1"'
     depends_on: "build_kube_disagg_image"
     timeout_in_minutes: 1440
     agents:

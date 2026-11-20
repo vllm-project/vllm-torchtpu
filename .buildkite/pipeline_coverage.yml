@@ -28,6 +28,7 @@
 steps:
 
   - label: ":docker: Build and Push Dev Image"
+    if: 'build.branch != "partner/release-0.0.1" && build.pull_request.base_branch != "partner/release-0.0.1"'
     key: build_docker
     agents:
       queue: cpu_64_core
@@ -35,6 +36,7 @@ steps:
       - bash .buildkite/scripts/setup_docker_env.sh
 
   - label: "coverage: 2-chip (not multichip)"
+    if: 'build.branch != "partner/release-0.0.1" && build.pull_request.base_branch != "partner/release-0.0.1"'
     key: cov_2chip
     depends_on: build_docker
     agents:
@@ -52,6 +54,7 @@ steps:
       - "perf_eval_results/coverage_2chip.dat*"
 
   - label: "coverage: 8-chip (multichip)"
+    if: 'build.branch != "partner/release-0.0.1" && build.pull_request.base_branch != "partner/release-0.0.1"'
     key: cov_8chip
     depends_on: build_docker
     agents:
@@ -69,6 +72,7 @@ steps:
       - "perf_eval_results/coverage_8chip.dat*"
 
   - label: "coverage: combine + report"
+    if: 'build.branch != "partner/release-0.0.1" && build.pull_request.base_branch != "partner/release-0.0.1"'
     key: cov_combine
     depends_on:
       - cov_2chip

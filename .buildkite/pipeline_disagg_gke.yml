@@ -14,6 +14,7 @@
 
 steps:
   - label: ":k8s: :tpu: GKE P/D Disaggregated Benchmark & BigQuery Upload"
+    if: 'build.branch != "partner/release-0.0.1" && build.pull_request.base_branch != "partner/release-0.0.1"'
     key: "gke_pd_disagg_benchmark"
     timeout_in_minutes: 630
     agents:

@@ -8,7 +8,11 @@ on:
 
 jobs:
   pre-commit:
-    if: github.repository == 'vllm-project/vllm-torchtpu'
+    # partner/release-0.0.1 is unmaintained; its CI is retired.
+    if: >-
+      github.repository == 'vllm-project/vllm-torchtpu' &&
+      github.base_ref != 'partner/release-0.0.1' &&
+      github.ref != 'refs/heads/partner/release-0.0.1'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
