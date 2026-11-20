@@ -279,7 +279,7 @@ def _kernel(
         finish(acc[...] + product(n_chunks - 1))
 
 
-@functools.partial(jax.jit, static_argnames=("topk", "interpret"))
+@functools.partial(jax.jit, static_argnames=("topk", "fallback", "interpret"))
 def tc_combine(
     x: jax.Array,
     pos: jax.Array,
@@ -289,6 +289,7 @@ def tc_combine(
     *,
     topk: int,
     shared_down: tuple[jax.Array, jax.Array, jax.Array] | None = None,
+    fallback: bool = True,
     interpret=False,
 ) -> jax.Array:
     """out[t] = sum_j where(valid, weights * x[pos], 0) over j < topk, f32
@@ -296,7 +297,11 @@ def tc_combine(
     grouped by local expert (sizes `group_sizes`), tokens ascending within a
     group; `pos`, `weights`, `valid` are flat [T * topk] in token-major order.
     ``shared_down`` (activation [T, i_s] bf16, w2 [i_s, H] e4m3, s2 [1, H]
-    f32) adds bf16(bf16(act @ w2) * s2) to the bf16 sum, in bf16."""
+    f32) adds bf16(bf16(act @ w2) * s2) to the bf16 sum, in bf16.
+    ``fallback=False`` drops the gather fallback for rows out of token order
+    (a caller whose routes come from a stable sort by expert never takes it):
+    the plain kernel call lets XLA overlap an async collective with it, which
+    it does not across the conditional."""
     num_tokens = pos.shape[0] // topk
     hidden = x.shape[1]
     num_experts = group_sizes.shape[0]
@@ -352,6 +357,8 @@ def tc_combine(
     )
     # A block needs more tiles than the buffer holds only if some expert's
     # rows are not in token order; then take the plain gather.
+    if not fallback:
+        return combine(tiles, counts, valid_rows, rows, w, x, *shared_operands)
     return lax.cond(
         jnp.any(counts > maxt),
         lambda: _gather_combine(x, pos, weights, valid, topk, shared_down),

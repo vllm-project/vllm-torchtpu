@@ -868,18 +868,30 @@ def moe_gmm(
             fuse = shared_down is not None and tc_combine.supported(
                 *tc_args, gmm2_res.dtype, shared_inter=shared_down[0].shape[1]
             )
-            return _add_shared_down(
-                tc_combine.tc_combine(
+            pieces = _combine_pieces(num_tokens, tc_args[1:], gmm2_res.dtype)
+            per = num_tokens // pieces
+            out = []
+            for i in range(pieces):
+                routes = slice(i * per * topk, (i + 1) * per * topk)
+                piece_shared = None
+                if shared_down is not None:
+                    act, w2, s2 = shared_down
+                    piece_shared = (act[i * per : (i + 1) * per], w2, s2)
+                routed = tc_combine.tc_combine(
                     gmm2_res,
-                    argsort_revert_indices,
-                    topk_weights_flat,
-                    valid_mask_flat,
+                    argsort_revert_indices[routes],
+                    topk_weights_flat[routes],
+                    valid_mask_flat[routes],
                     group_sizes,
                     topk=topk,
-                    shared_down=shared_down if fuse else None,
-                ).astype(x.dtype),
-                None if fuse else shared_down,
-            )
+                    shared_down=piece_shared if fuse else None,
+                    # The routes are sorted stably by expert (above), so
+                    # each expert's rows are in token order.
+                    fallback=pieces == 1,
+                ).astype(x.dtype)
+                # Per piece, so a piece's consumer need not wait for the rest.
+                out.append(_add_shared_down(routed, None if fuse else piece_shared))
+            return out[0] if pieces == 1 else jnp.concatenate(out)
         return _add_shared_down(
             ragged_gather_reduce(
                 gmm2_res,
@@ -897,6 +909,18 @@ def moe_gmm(
     token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
     # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
     return _add_shared_down(token_topk_hidden.sum(axis=1).astype(x.dtype), shared_down)
+
+
+_COMBINE_PIECES_MIN_TOKENS = 4096
+
+
+def _combine_pieces(num_tokens: int, args: tuple, dtype) -> int:
+    """TPU_MOE_TC_COMBINE_PIECES on steps of at least 4096 tokens whose
+    pieces the kernel takes; else 1."""
+    pieces = envs.TPU_MOE_TC_COMBINE_PIECES
+    if pieces <= 1 or num_tokens < _COMBINE_PIECES_MIN_TOKENS or num_tokens % pieces:
+        return 1
+    return pieces if tc_combine.supported(num_tokens // pieces, *args, dtype) else 1
 
 
 # MiniMaxM3Mxfp8LinearMethod materializes the bf16 weight from this many rows.

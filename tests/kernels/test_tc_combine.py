@@ -187,3 +187,34 @@ def test_shared_down_matches_unfused(hidden, inter):
         got, np.asarray(ref.astype(jnp.float32)), rtol=1e-2, atol=2e-2
     )
     assert tc_combine.supported(8192, 6144, 4, 16, jnp.bfloat16, shared_inter=384)
+
+
+def test_token_pieces_equal_the_whole():
+    """fused_moe_gmm's TPU_MOE_TC_COMBINE_PIECES: consecutive token pieces of
+    the routes, combined one call each, give the whole call's rows."""
+    x, pos, w, valid, group_sizes = _routes(1024, 256, 0.5, 9)
+    args = (
+        jnp.asarray(x, jnp.bfloat16),
+        jnp.asarray(pos),
+        jnp.asarray(w, jnp.bfloat16),
+    )
+    whole = tc_combine.tc_combine(
+        *args, jnp.asarray(valid), jnp.asarray(group_sizes), topk=TOPK, interpret=True
+    )
+    half = 512 * TOPK
+    pieces = [
+        tc_combine.tc_combine(
+            args[0],
+            args[1][sl],
+            args[2][sl],
+            jnp.asarray(valid)[sl],
+            jnp.asarray(group_sizes),
+            topk=TOPK,
+            fallback=False,
+            interpret=True,
+        )
+        for sl in (slice(0, half), slice(half, 2 * half))
+    ]
+    np.testing.assert_array_equal(
+        np.asarray(jnp.concatenate(pieces), np.float32), np.asarray(whole, np.float32)
+    )
