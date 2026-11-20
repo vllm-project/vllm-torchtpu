@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 import torch
 from einops import rearrange
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
 from vllm_torchtpu.layers.adapter import linear_common
@@ -360,6 +361,20 @@ def test_prequant_matmul_equals_the_quantizing_matmul():
 def test_build_ops_registers_with_the_real_op_bridge(monkeypatch):
     """`pallas.jax_op` validates the JAX function's signature, including its
     return annotation, at registration; the host stand-in above does not."""
-    monkeypatch.setattr(gated_norm_quant_op, "_out_proj_ops", {})
+    # Seeded so the op's name is one no other test in the session registers.
+    monkeypatch.setattr(
+        gated_norm_quant_op, "_out_proj_ops", {("unused", i): None for i in range(901)}
+    )
     gated_norm_quant_op._build_ops(1e-6)
-    assert list(gated_norm_quant_op._out_proj_ops) == [1e-6]
+    op = gated_norm_quant_op._out_proj_ops[1e-6]
+    rows, value_dim, head_dim, hidden = 24, 4 * 128, 128, 256
+    with FakeTensorMode():
+        out = op(
+            torch.empty(rows, value_dim, dtype=torch.bfloat16),
+            torch.empty(rows, value_dim, dtype=torch.bfloat16),
+            torch.empty(head_dim, dtype=torch.float32),
+            torch.empty(value_dim, hidden, dtype=torch.float8_e4m3fn),
+            torch.empty(hidden, dtype=torch.float32),
+        )
+    assert out.shape == (rows, hidden)
+    assert out.dtype == torch.bfloat16

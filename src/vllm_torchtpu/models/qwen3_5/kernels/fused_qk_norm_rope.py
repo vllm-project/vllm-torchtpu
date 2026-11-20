@@ -140,6 +140,10 @@ def _unsupported_reason(layer: torch.nn.Module, model_config) -> str | None:
         # The kernel reads rot columns, [cos | sin]; a compacted cache
         # (layers/adapter/rotary_embedding.py) holds fewer.
         return f"the rope cache holds {width} of the {rot} rotary columns"
+    if not (0 < rot <= layer.head_dim and rot % 2 == 0):
+        return (
+            f"rotary_dim {rot} is not an even width in (0, head_dim {layer.head_dim}]"
+        )
     if mm_config is not None and not mm_config.language_model_only:
         return "multimodal positions need M-RoPE; serve with --language-model-only"
     heads = (layer.num_heads, layer.num_kv_heads)
@@ -178,8 +182,6 @@ def _prebuild(layer: torch.nn.Module, model_config) -> bool:
             reason,
         )
         return False
-    rot = layer.rotary_emb.rotary_dim
-    assert 0 < rot <= layer.head_dim and rot % 2 == 0, (rot, layer.head_dim)
     _build_op(_op_key(layer))
     _log_armed_rows(get_current_vllm_config())
     return True
