@@ -2506,6 +2506,72 @@ def test_relayout_tables_reaches_the_draft_model(monkeypatch):
     assert seen == []
 
 
+@pytest.mark.parametrize("flag", ["0", "1"])
+def test_load_model_resolves_moe_tp_decode_nvfp4_topology_before_loading(
+    monkeypatch, flag
+):
+    """USE_MOE_TP_DECODE_NVFP4_KERNEL: the op's topology (a gather over the EP
+    group) is resolved before the model loader runs, where every rank arrives
+    in the same order; the loaders' per-layer pre-load admission only reads it.
+    With the flag unset, loading starts as before."""
+    from vllm_torchtpu.layers.adapter import moe_tp_decode_nvfp4
+
+    events: list[str] = []
+    topo = object()
+
+    class _Loading(Exception):
+        pass
+
+    def load_model(**_kwargs):
+        events.append("load")
+        raise _Loading
+
+    class _TorchOffTpu:
+        """torch, with the runner's TPU device built as CPU off a TPU."""
+
+        device = staticmethod(lambda _kind: torch.device("cpu"))
+
+        def __getattr__(self, name):
+            return getattr(torch, name)
+
+    monkeypatch.setenv("USE_MOE_TP_DECODE_NVFP4_KERNEL", flag)
+    monkeypatch.setattr(moe_tp_decode_nvfp4, "_PRELOAD_TOPOLOGY", None)
+    monkeypatch.setattr(
+        moe_tp_decode_nvfp4.fp8_decode,
+        "_topology",
+        lambda: events.append("topology") or topo,
+    )
+    monkeypatch.setattr(tpu_runner, "torch", _TorchOffTpu())
+    monkeypatch.setattr(tpu_runner, "get_tpu_quantization_config", lambda _c: None)
+    monkeypatch.setattr(
+        tpu_runner,
+        "get_model_loader",
+        lambda _c: SimpleNamespace(load_model=load_model),
+    )
+    monkeypatch.setattr(
+        tpu_runner,
+        "set_vllm_model_wrapper_context",
+        lambda **_k: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        tpu_runner, "set_current_vllm_config", lambda _c: contextlib.nullcontext()
+    )
+    runner = SimpleNamespace(
+        device_config=SimpleNamespace(),
+        vllm_config=SimpleNamespace(),
+        model_config=SimpleNamespace(quantization=None),
+        load_config=None,
+        mesh=None,
+    )
+
+    with pytest.raises(_Loading):
+        TPUModelRunner.load_model(runner)
+
+    on = flag == "1"
+    assert events == (["topology", "load"] if on else ["load"])
+    assert moe_tp_decode_nvfp4._PRELOAD_TOPOLOGY is (topo if on else None)
+
+
 def test_rope_cache_row_major_default_steps_aside_for_multimodal(monkeypatch):
     """The default relayout skips a multimodal model (its vision graphs can
     take an activation shaped like the rope cache, which the shape-keyed entry

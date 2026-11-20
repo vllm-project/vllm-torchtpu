@@ -5247,6 +5247,13 @@ class TPUModelRunner(GPUModelRunner):
         )
         self.vllm_config.quant_config = get_tpu_quantization_config(self.vllm_config)
 
+        if envs.USE_MOE_TP_DECODE_NVFP4_KERNEL:
+            # Collective: before any weight streams in, so every rank runs it
+            # here; the loaders' per-layer pre-load admission then runs none.
+            from vllm_torchtpu.layers.adapter import moe_tp_decode_nvfp4
+
+            moe_tp_decode_nvfp4.resolve_preload_topology()
+
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
         with (
@@ -5384,6 +5391,14 @@ class TPUModelRunner(GPUModelRunner):
                 )
 
                 arm_runner_models(self)
+        if envs.USE_MOE_TP_DECODE_NVFP4_KERNEL:
+            from vllm_torchtpu.layers.adapter import moe_tp_decode_nvfp4
+
+            if moe_tp_decode_nvfp4.should_arm():
+                draft = (
+                    self._async_drafter.draft_model if self._is_async_drafter else None
+                )
+                moe_tp_decode_nvfp4.arm(self.model, draft)
 
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()

@@ -65,6 +65,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
 )
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -474,6 +475,30 @@ def _squeeze_channel_scale_checked(scale: torch.Tensor) -> torch.Tensor:
     return s
 
 
+def register_fused_scale_buffers(layer) -> None:
+    """Stage squeezed FP4 scale tables as non-persistent buffers on `layer`."""
+    tables = []
+    w13_param = (
+        "w13_weight_scale"
+        if hasattr(layer, "w13_weight_scale")
+        else "w13_weight_scale_inv"
+    )
+    w2_param = (
+        "w2_weight_scale"
+        if hasattr(layer, "w2_weight_scale")
+        else "w2_weight_scale_inv"
+    )
+    for param, buf in (
+        (w13_param, "_tpu_fused_w13_scale"),
+        (w2_param, "_tpu_fused_w2_scale"),
+    ):
+        table = fresh_buffer(getattr(layer, param).squeeze(2))
+        layer.register_buffer(buf, table, persistent=False)
+        tables.append(table)
+    if tables and tables[0].device.type == "tpu":
+        synchronize_tensors(tables)
+
+
 def prebuild_fused_moe_ep(
     layer,
     topk: int,
@@ -575,8 +600,16 @@ def prebuild_fused_moe_ep(
             weights = (
                 layer.w13_weight,
                 layer.w2_weight,
-                layer.w13_weight_scale,
-                layer.w2_weight_scale,
+                getattr(
+                    layer,
+                    "w13_weight_scale",
+                    getattr(layer, "w13_weight_scale_inv", None),
+                ),
+                getattr(
+                    layer,
+                    "w2_weight_scale",
+                    getattr(layer, "w2_weight_scale_inv", None),
+                ),
             )
         else:
             weights = (
