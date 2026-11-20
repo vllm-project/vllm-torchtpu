@@ -630,7 +630,7 @@ class TestTpuPlatform:
     ):
         """check_and_update_config hands the page check the backend the
         engine's layers run: the default one, CUSTOM's batched RPA, or, for an
-        MLA model whatever --attention-backend names, the MLA backend."""
+        MLA model, whatever --attention-backend names, the MLA backend."""
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
         from vllm_torchtpu.layers.adapter import attention
