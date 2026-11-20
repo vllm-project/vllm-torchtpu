@@ -62,6 +62,7 @@ def all_buckets_sequence_parallel(monkeypatch):
 def test_sequence_parallel_compile_sizes(configure_sp_moe, tp, original, expected):
     parallel_config = SimpleNamespace(
         use_sequence_parallel_moe=True,
+        data_parallel_size=1,
         tensor_parallel_size=tp,
         pipeline_parallel_size=1,
     )
@@ -82,6 +83,7 @@ def test_by_default_every_bucket_follows_mains_rule(configure_sp_moe):
     every compile size must split over TP as on main."""
     parallel_config = SimpleNamespace(
         use_sequence_parallel_moe=True,
+        data_parallel_size=1,
         tensor_parallel_size=8,
         pipeline_parallel_size=1,
     )
@@ -117,6 +119,7 @@ def test_sequence_parallel_keeps_buckets_below_min_rows(
     monkeypatch.setattr(sequence_parallel, "DEFAULT_MIN_ROWS", 512)
     parallel_config = SimpleNamespace(
         use_sequence_parallel_moe=True,
+        data_parallel_size=1,
         tensor_parallel_size=8,
         pipeline_parallel_size=1,
     )
@@ -163,6 +166,7 @@ def test_sequence_parallel_buckets_follow_the_engines_layout(
 def test_sequence_parallel_rejects_empty_compile_sizes(configure_sp_moe):
     parallel_config = SimpleNamespace(
         use_sequence_parallel_moe=True,
+        data_parallel_size=1,
         tensor_parallel_size=8,
         pipeline_parallel_size=1,
     )
@@ -182,6 +186,7 @@ def test_sequence_parallel_rejects_empty_compile_sizes(configure_sp_moe):
 def test_sequence_parallel_rejects_largest_size_dropped(configure_sp_moe):
     parallel_config = SimpleNamespace(
         use_sequence_parallel_moe=True,
+        data_parallel_size=1,
         tensor_parallel_size=8,
         pipeline_parallel_size=1,
     )
@@ -202,6 +207,7 @@ def test_sequence_parallel_rejects_largest_size_dropped(configure_sp_moe):
 def test_sequence_parallel_rejects_unvalidated_arch(configure_sp_moe, arch):
     parallel_config = SimpleNamespace(
         use_sequence_parallel_moe=True,
+        data_parallel_size=1,
         tensor_parallel_size=8,
         pipeline_parallel_size=1,
     )
@@ -222,6 +228,7 @@ def test_sequence_parallel_rejects_unvalidated_arch(configure_sp_moe, arch):
 def test_sequence_parallel_admits_mtp(configure_sp_moe):
     parallel_config = SimpleNamespace(
         use_sequence_parallel_moe=True,
+        data_parallel_size=1,
         tensor_parallel_size=8,
         pipeline_parallel_size=1,
     )
@@ -240,6 +247,7 @@ def test_sequence_parallel_admits_mtp(configure_sp_moe):
 def test_sequence_parallel_rejects_non_mtp_speculative(configure_sp_moe, method):
     parallel_config = SimpleNamespace(
         use_sequence_parallel_moe=True,
+        data_parallel_size=1,
         tensor_parallel_size=8,
         pipeline_parallel_size=1,
     )
@@ -257,6 +265,7 @@ def test_sequence_parallel_rejects_non_mtp_speculative(configure_sp_moe, method)
 def test_sequence_parallel_rejects_pipeline_parallel(configure_sp_moe):
     parallel_config = SimpleNamespace(
         use_sequence_parallel_moe=True,
+        data_parallel_size=1,
         tensor_parallel_size=8,
         pipeline_parallel_size=2,
     )

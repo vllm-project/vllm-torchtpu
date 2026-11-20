@@ -19,7 +19,8 @@ the step about to run (``set_active``), and the TPU communicator reads it to
 dispatch and combine the MoE rows accordingly.
 """
 
-from typing import Any
+from vllm.config import ParallelConfig
+from vllm.distributed import parallel_state
 
 from vllm_torchtpu import envs
 
@@ -44,17 +45,15 @@ DEFAULT_MIN_ROWS = 0
 _MIN_ROWS_BY_LAYOUT: dict[tuple[int, int], int] = {}
 
 
-def _layout(parallel_config: Any = None) -> tuple[int, int] | None:
+def _layout(parallel_config: ParallelConfig | None = None) -> tuple[int, int] | None:
     """(data_parallel_size, tensor_parallel_size) of ``parallel_config``, or of
     this process's initialized model-parallel groups; None when neither is
     available (for example, before the workers set up their groups)."""
     if parallel_config is not None:
         return (
-            int(getattr(parallel_config, "data_parallel_size", 1)),
-            int(getattr(parallel_config, "tensor_parallel_size", 1)),
+            int(parallel_config.data_parallel_size),
+            int(parallel_config.tensor_parallel_size),
         )
-    from vllm.distributed import parallel_state
-
     if not parallel_state.model_parallel_is_initialized():
         return None
     return (
@@ -63,7 +62,7 @@ def _layout(parallel_config: Any = None) -> tuple[int, int] | None:
     )
 
 
-def min_rows(parallel_config: Any = None) -> int:
+def min_rows(parallel_config: ParallelConfig | None = None) -> int:
     """The row threshold for the layout of ``parallel_config``, or of this
     process's model-parallel groups when it is None."""
     layout = _layout(parallel_config)
