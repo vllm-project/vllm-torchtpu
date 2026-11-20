@@ -57,7 +57,6 @@ import torch
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
-from torch.fx.experimental.symbolic_shapes import is_concrete_int
 from torch_tpu._internal import pallas
 from vllm.distributed import parallel_state
 
@@ -285,8 +284,11 @@ def maybe_all_reduce(x: torch.Tensor, ranks) -> torch.Tensor | None:
     ):
         return None
     rows = x.shape[0]
-    # is_concrete_int reads a SymInt without a guard, so a symbolic row count
-    # keeps the XLA all-reduce and adds no recompile.
-    if not is_concrete_int(rows) or int(rows) not in armed.buckets:
+    # A symbolic row count is a torch.SymInt, not an int. The isinstance check
+    # reads no value from it, so it adds no guard and no recompile, and the
+    # XLA all-reduce is kept. Dynamo traces this function (the embedding's
+    # all-reduce reaches it inside a compiled graph), so the check must also
+    # be traceable: torch.fx's is_concrete_int is on Dynamo's skip list.
+    if not isinstance(rows, int) or rows not in armed.buckets:
         return None
     return armed.op(x, armed.rank)

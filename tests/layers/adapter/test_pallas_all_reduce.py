@@ -283,6 +283,22 @@ def test_symbolic_row_count_keeps_the_xla_all_reduce(armed, communicator):
     assert not shape_env.guards
 
 
+@pytest.mark.parametrize("rows", (16, 24))
+def test_routing_traces_under_dynamo(armed, communicator, rows):
+    """Dynamo traces the communicator inside compiled model code (the
+    embedding's tensor-parallel all-reduce). The routing check must trace in
+    one graph without calling a function on Dynamo's skip list, and pick the
+    same path as in eager mode: rows 16 is armed, rows 24 is not."""
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        communicator.all_reduce, backend="eager", fullgraph=True, dynamic=False
+    )
+    x = _ones(rows, HIDDEN)
+    want = x * N_RANKS if rows in KERNEL_ROWS else x + 1
+    assert torch.equal(compiled(x), want)
+    assert armed.calls == (1 if rows in KERNEL_ROWS else 0)
+
+
 @pytest.mark.parametrize(
     "x",
     [
