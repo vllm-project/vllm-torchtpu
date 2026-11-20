@@ -1437,7 +1437,7 @@ def _union_ratio(selected, tile):
 # (c64 head-parallel shape); fp8 32 -> 64 0.60 -> 0.50 at ~1.6, even at ~3.3.
 WIDE_BLOCK_Q = 64
 # "auto" (as above), "on" (every such call) or "off" (`TPU_MINIMAX_M3_MSA_WIDE_TILES`).
-WIDE_TILES = "auto"
+WIDE_TILES = "off"
 WIDE_TILE_MIN_TOKENS = msa_attention.SMALL_BATCH_TOKENS
 _WIDE_TILE_MAX_RATIO = {"fp4": 4.0, "8bit": 3.0}
 # Bitmap width of `_union_ratio`: a rank's blocks of a 256K-token request
