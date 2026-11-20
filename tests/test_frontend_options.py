@@ -88,6 +88,13 @@ def test_get_reads_the_section():
     )
 
 
+def test_get_needs_an_engine_config():
+    """An object without additional_config (a model config passed by mistake,
+    or an upstream rename) fails instead of reading as all options off."""
+    with pytest.raises(AttributeError, match="additional_config"):
+        frontend_options.get(SimpleNamespace(model="Qwen/Qwen3.5-397B-A17B"))
+
+
 @pytest.mark.parametrize(
     "raw, message",
     [
