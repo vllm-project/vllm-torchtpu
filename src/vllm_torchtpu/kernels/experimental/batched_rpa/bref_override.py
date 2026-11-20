@@ -13,6 +13,7 @@
 # limitations under the License.
 import abc
 import dataclasses
+import functools
 from typing import Any, cast
 
 import jax
@@ -359,15 +360,31 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
                 p0 = schedule_ref.dma_kv_cache[block_idx, b, 0, 0]
                 tokens = schedule_ref.dma_kv_cache[block_idx, b, 0, 2]
                 tokens = jnp.where(is_no_op, 0, tokens)
-                for i in range(self.cfgs.bkv_p_cache):
-                    sz = jnp.clip(tokens - i * page_size, 0, page_size)
-                    p_idx = jnp.minimum(p0 + i, last_index) if i else p0
-                    src_off = page_indices_ref[p_idx] * page_size
-                    pltpu.make_async_copy(
-                        kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
-                        vmem_dst.at[b, pl.ds(i * page_size, sz)],
-                        sem,
-                    ).start()
+
+                def compact_pages(lo, hi, b=b, p0=p0, tokens=tokens):
+                    for i in range(lo, hi):
+                        sz = jnp.clip(tokens - i * page_size, 0, page_size)
+                        p_idx = jnp.minimum(p0 + i, last_index) if i else p0
+                        src_off = page_indices_ref[p_idx] * page_size
+                        pltpu.make_async_copy(
+                            kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
+                            vmem_dst.at[b, pl.ds(i * page_size, sz)],
+                            sem,
+                        ).start()
+
+                group = self.cfgs.serve.kv_skip_group
+                pages = self.cfgs.bkv_p_cache
+                if not group:
+                    compact_pages(0, pages)
+                else:
+                    # A group past the tile's last token would only issue
+                    # zero-size DMAs; the wait counts bytes, so skipping them
+                    # changes nothing it waits for.
+                    for lo in range(0, pages, group):
+                        hi = min(lo + group, pages)
+                        pl.when(tokens > lo * page_size)(
+                            functools.partial(compact_pages, lo, hi)
+                        )
             else:
                 # Lean per-page fetch: a tile's cache pages are consecutive
                 # page-table entries landing at i * page_size, so only the

@@ -764,6 +764,10 @@ def get_kernel_metadata(
     cfgs: configs.RpaConfigs,
 ) -> dict[str, str | int | float]:
     cfgs_dict = dataclasses.asdict(cfgs)
+    # Kernels without kv_skip_group keep the metadata, and so the compiled
+    # program and its cache key, they had before the field.
+    if not cfgs.serve.kv_skip_group:
+        del cfgs_dict["serve"]["kv_skip_group"]
     ret = {}
     for path, val in jax.tree_util.tree_leaves_with_path(cfgs_dict):
         key = jax.tree_util.keystr(path, simple=True, separator=".")

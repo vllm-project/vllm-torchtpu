@@ -1512,6 +1512,8 @@ def _select_blocks(
                     # page when the KV block holds whole pool pages (e.g.
                     # VLLM_TPU_QSA_DECODE_KV_BLOCK=3328 = 8 x 13 x 32 keys).
                     coalesce_entries=envs.VLLM_TPU_QSA_DECODE_POOL_PAGE_DMA,
+                    dense_step=envs.VLLM_TPU_QSA_INDEXER_DENSE_STEP,
+                    tail_skip=envs.VLLM_TPU_QSA_INDEXER_TAIL_SKIP,
                 ),
                 decode_passes=not mixed_only,
                 hoist_step_metadata=envs.VLLM_TPU_QSA_INDEXER_HOIST_META,
