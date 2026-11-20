@@ -83,23 +83,32 @@ class PcpStaticSupportValidator:
         kv_cache_layout: str,
     ) -> PcpStaticConfig:
         config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
-        if (
-            config.enabled
-            and kv_cache_layout == "HND"
-            and config.interleave_size % 128 != 0
-        ):
+        if envs.USE_TPU_PCP_MANAGER:
+            from vllm_torchtpu.runner.pcp.manager import (
+                PcpShardingPlanName,
+                validate_pcp_manager_config,
+            )
+
+            plan = validate_pcp_manager_config(vllm_config)
+            if (
+                plan is PcpShardingPlanName.INTERLEAVED
+                and kv_cache_layout == "HND"
+                and config.interleave_size % 128 != 0
+            ):
+                raise ValueError(
+                    "PCP with HND KV cache layout requires "
+                    "cp_kv_cache_interleave_size to be a multiple of 128, "
+                    f"got {config.interleave_size}."
+                )
+            return config
+        if not config.enabled:
+            return config
+        if kv_cache_layout == "HND" and config.interleave_size % 128 != 0:
             raise ValueError(
                 "PCP with HND KV cache layout requires "
                 "cp_kv_cache_interleave_size to be a multiple of 128, "
                 f"got {config.interleave_size}."
             )
-        if envs.USE_TPU_PCP_MANAGER:
-            # TODO(weiyulin): Once we merge two PCP paths, we will validate
-            # in one place. For now, PcpManager.from_vllm_config validates the
-            # config in the workers.
-            return config
-        if not config.enabled:
-            return config
 
         if config.dcp_size > 1:
             raise NotImplementedError("PCP runner path does not support DCP yet.")

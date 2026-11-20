@@ -1514,6 +1514,14 @@ class TestTPURunner:
         self.runner.vllm_config.compilation_config.compile_sizes = [16, 2048]
         self.runner._make_buffer = GPUModelRunner._make_buffer.__get__(self.runner)
         self.runner.input_batch = SimpleNamespace(thinking_budget_state_holder=None)
+        # The spec'd mock stubs methods; run the real buffer allocation.
+        for name in (
+            "_init_token_buckets_and_host_buffers",
+            "_backbone_token_paddings",
+        ):
+            setattr(
+                self.runner, name, getattr(TPUModelRunner, name).__get__(self.runner)
+            )
 
         with (
             patch.object(GPUModelRunner, "__init__", return_value=None),

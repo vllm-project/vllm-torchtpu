@@ -483,7 +483,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
-    # Run PCP through `runner/pcp/manager.py` (PCP x DCP KV gather).
+    # Run PCP through `runner/pcp/manager.py`.
     "USE_TPU_PCP_MANAGER": env_bool("USE_TPU_PCP_MANAGER", default=False),
     # PCP manager: max context tokens one forward's prefills may gather.
     "TPU_PCP_KV_WORKSPACE_TOKENS": env_int("TPU_PCP_KV_WORKSPACE_TOKENS", 1048576),
