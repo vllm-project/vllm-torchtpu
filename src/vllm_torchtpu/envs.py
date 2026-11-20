@@ -636,8 +636,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # speculative decoding, no KV connector); everything else keeps vLLM's
     # stock accounting either way. Read by the model runner;
     # TpuPlatform.additional_env_vars forwards it to Ray data-parallel engine
-    # actors. See
-    # core/runner_slot_mamba.py.
+    # actors. See core/runner_slot_mamba.py.
     "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS": env_bool(
         "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", default=True
     ),

@@ -477,7 +477,8 @@ class TpuPlatform(Platform):
 
     # Knobs every rank must see the same way: forwarded to vLLM's Ray
     # data-parallel engine actors (`_forward_knobs_to_ray_dp_actors`), except
-    # the host topology in `_HOST_ENV_VARS`.
+    # the host topology in `_HOST_ENV_VARS` and the names this package writes
+    # itself (`PACKAGE_WRITTEN_ENV_VARS`).
     additional_env_vars: list[str] = [
         "TPU_CHIPS_PER_HOST_BOUNDS",
         "TPU_HOST_BOUNDS",
