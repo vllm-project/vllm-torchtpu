@@ -261,14 +261,14 @@ def watch(root: str, env=None, poll_s: float = 1.0, stop_after_s: float | None =
     if env.get(REGISTRY_PORT):
         port = int(env[REGISTRY_PORT])
         reg = _install(os.path.join(root, *REGISTRY_BIN), "global_registry_server", env)
-        p = subprocess.Popen([reg, f"--port={port}"], stdin=subprocess.DEVNULL)
+        p = subprocess.Popen([reg, f"--port={port}"], stdin=subprocess.DEVNULL, env=dict(env))
         procs.append(("registry", p, {"host": "127.0.0.1", "port": port, "up": False, "t": time.monotonic()}))
         _say(f"Q38X2_REGISTRY_START pid={p.pid} port={port}", env)
     if env.get(NODES):
         node = _install(os.path.join(root, *NODE_BIN), "kv_cache_host_store_node_main", env)
         ip = _expand(NODE_IP, env.get(NODE_IP, ""), env)
         for shard, port, argv in node_commands(env, node):
-            p = subprocess.Popen(argv, stdin=subprocess.DEVNULL)
+            p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, env=dict(env))
             procs.append((shard, p, {"host": ip, "port": port, "up": False, "t": time.monotonic()}))
             _say(f"Q38X2_NODE_START shard={shard} pid={p.pid} " + " ".join(argv[1:]), env)
     nodes = [x for x in procs if x[0] != "registry"]
