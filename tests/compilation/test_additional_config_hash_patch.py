@@ -209,7 +209,7 @@ def test_ignored_keys_match_the_keys_the_runner_reads():
 
 
 def test_runner_options_section_does_not_change_the_hash(patched_compute_hash):
-    """The runner's telemetry options never change a compiled program, so
+    """The runner's host-side options never change a compiled program, so
     turning one on must not force a recompile."""
     baseline = patched_compute_hash(_StubVllmConfig({"some_plugin_knob": 1}))
     assert (

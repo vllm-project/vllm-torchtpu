@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The KV-transfer stage timings are on by default, as on main, when the KV
-connector has a stats sink to feed; ``tpu_runner.stage_timing`` turns them
-off."""
+"""The KV-transfer stage timings are on by default when the KV connector has a
+stats sink to feed; ``tpu_runner.stage_timing`` turns them off."""
 
 from types import SimpleNamespace
 
@@ -38,7 +37,7 @@ def test_stage_timing_enabled(stage_timing, kv_uses, want):
     assert TPUModelRunner._stage_timing_enabled(options, kv_uses) is want
 
 
-def test_stage_timing_is_on_by_default_as_on_main():
+def test_stage_timing_is_on_by_default():
     options = runner_options.get(SimpleNamespace(additional_config={}))
     assert options.stage_timing is True
     assert TPUModelRunner._stage_timing_enabled(options, True) is True
