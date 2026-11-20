@@ -687,6 +687,34 @@ _KV_CONNECTOR_OUTPUT_SUPPORTS_FAILED_RECVING = (
 )
 
 
+def kv_early_poll_refusals(transfer_config: Any, connector: Any) -> list[str]:
+    """Why QWEN4_EXP_PD_EARLY_POLL cannot run with this KV connector (empty:
+    it can). The early poll gives up the drafter-first order a save needs: a
+    KV producer publishes and fences the drafter's KV writes, and an
+    offloading connector records its save fence in get_finished. A Raiden PD
+    consumer has neither (its wait_for_save is TPUConnector's no-op)."""
+    from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+        TPUConnector,
+        TPURaidenConnector,
+    )
+
+    why = []
+    if (
+        transfer_config is None
+        or not transfer_config.is_kv_consumer
+        or transfer_config.is_kv_producer
+    ):
+        why.append("only on a KV consumer that is not also a producer")
+    if not isinstance(connector, TPURaidenConnector):
+        why.append(
+            "only with a Raiden PD consumer connector, not "
+            + type(connector).__name__
+        )
+    elif type(connector).wait_for_save is not TPUConnector.wait_for_save:
+        why.append(type(connector).__name__ + " has a save path (wait_for_save)")
+    return why
+
+
 def _build_kv_connector_output(
     *,
     finished_sending: set[str] | None,
@@ -1525,6 +1553,12 @@ class TPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().wait_for_save()
 
     def get_finished_kv_transfers(self, scheduler_output):
+        early = self.__dict__.pop("_kv_early_poll_result", None)
+        if early is not None:
+            # QWEN4_EXP_PD_EARLY_POLL: this step's poll already ran, before the
+            # previous-results wait (_early_poll_kv_connector); hand its result
+            # to the stock call site after the drafter.
+            return early
         if not has_kv_transfer_group():
             self._stage_timing.take_samples()
             return None, None, None, set(), None, None
@@ -1579,6 +1613,42 @@ class TPUModelRunner(GPUModelRunner):
             invalid_block_group_index,
             kv_connector_stats,
         )
+
+    def _kv_early_poll(self) -> bool:
+        """QWEN4_EXP_PD_EARLY_POLL engaged on this runner (decided once, at the
+        first step that asks; the same on every rank: the key and the KV
+        transfer config are)."""
+        on = self.__dict__.get("_kv_early_poll_on")
+        if on is None:
+            on = self._decide_kv_early_poll()
+            self._kv_early_poll_on = on
+        return on
+
+    def _decide_kv_early_poll(self) -> bool:
+        if not envs.QWEN4_EXP_PD_EARLY_POLL:
+            return False
+        if not has_kv_transfer_group():
+            logger.info("q38 EARLY_POLL engaged=0 reason=no KV connector")
+            return False
+        why = kv_early_poll_refusals(
+            self.vllm_config.kv_transfer_config, get_kv_transfer_group()
+        )
+        if why:
+            raise ValueError("QWEN4_EXP_PD_EARLY_POLL is refused: " + "; ".join(why))
+        logger.info(
+            "q38 EARLY_POLL engaged=1 connector=%s (KV poll before the previous-results wait)",
+            type(get_kv_transfer_group()).__name__,
+        )
+        return True
+
+    def _early_poll_kv_connector(self, scheduler_output) -> None:
+        """QWEN4_EXP_PD_EARLY_POLL: sample_tokens' save and poll, run right
+        after the step's deferred submit and before the previous-results wait.
+        The stock call site after the drafter receives this result from
+        get_finished_kv_transfers and builds the step's output from it as
+        before."""
+        self.maybe_wait_for_kv_save()
+        self._kv_early_poll_result = self.get_finished_kv_transfers(scheduler_output)
 
     def kv_connector_no_forward(
         self, scheduler_output, vllm_config
@@ -5891,6 +5961,13 @@ class TPUModelRunner(GPUModelRunner):
             # the host until the forward ends: submit the step's loads now.
             self._submit_deferred_kv_loads()
             host_phases.mark("kv_load_submit")
+        if self._kv_early_poll():
+            # q38 DEC-STEP-2 (QWEN4_EXP_PD_EARLY_POLL): a PD consumer polls its
+            # connector here, while the device still runs the previous step,
+            # off the host chain that starts when the wait below returns and
+            # ends at the next forward's dispatch.
+            self._early_poll_kv_connector(scheduler_output)
+            host_phases.mark("kv_poll_early")
         if self.scheduler_config.async_scheduling and not defer_prev_wait:
             self._modify_prev_results()
 
