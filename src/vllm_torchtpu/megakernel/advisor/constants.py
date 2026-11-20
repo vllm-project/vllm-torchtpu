@@ -32,6 +32,7 @@ class UnsupportedChipError(errors.MegakernelConfigError, ValueError):
 SUPPORTED_CHIPS: frozenset[str] = frozenset({"tpu7x", "v6e"})
 DEFAULT_ROW_LIMIT: int = 80
 HBM_UTILIZATION_CAP: float = 0.95
+DEFAULT_COLLECTIVE_LATENCY_US_BRACKET: tuple[float, float] = (1.0, 5.0)
 
 ADVISOR_DIR = Path(__file__).resolve().parent
 CALIBRATION_DIR = ADVISOR_DIR / "data" / "calibration"
@@ -193,10 +194,14 @@ DEFAULT_SOURCES_7X: Mapping[str, str] = {
     ),
     "ici_link_bw_bytes_per_s": ("ASSUMED: 100 GB/s/link unidirectional ICI link prior"),
     "collective_latency_s": (
-        "ASSUMED: [1.0, 5.13] us/hop floor prior; calibrate via trace"
+        f"ASSUMED: [{DEFAULT_COLLECTIVE_LATENCY_US_BRACKET[0]:.1f}, "
+        f"{DEFAULT_COLLECTIVE_LATENCY_US_BRACKET[1]:.1f}] us/hop floor prior; "
+        "calibrate via trace"
     ),
     "collective_latency_us_bracket": (
-        "ASSUMED: [1.0, 5.13] us/hop bracket; calibrate via trace"
+        f"ASSUMED: [{DEFAULT_COLLECTIVE_LATENCY_US_BRACKET[0]:.1f}, "
+        f"{DEFAULT_COLLECTIVE_LATENCY_US_BRACKET[1]:.1f}] us/hop bracket; "
+        "calibrate via trace"
     ),
     "dcn_bw_gbps": "ASSUMED: 100 Gbps/chip nominal host DCN egress prior",
     "dcn_bw_gbps_bracket": (
@@ -277,10 +282,14 @@ DEFAULT_SOURCES_PUBLIC: Mapping[str, str] = {
         "ASSUMED: Cloud TPU interconnect unidirectional per-link ICI prior"
     ),
     "collective_latency_s": (
-        "ASSUMED: [1.0, 5.0] us/hop floor prior; calibrate via trace"
+        f"ASSUMED: [{DEFAULT_COLLECTIVE_LATENCY_US_BRACKET[0]:.1f}, "
+        f"{DEFAULT_COLLECTIVE_LATENCY_US_BRACKET[1]:.1f}] us/hop floor prior; "
+        "calibrate via trace"
     ),
     "collective_latency_us_bracket": (
-        "ASSUMED: [1.0, 5.0] us/hop bracket; calibrate via trace"
+        f"ASSUMED: [{DEFAULT_COLLECTIVE_LATENCY_US_BRACKET[0]:.1f}, "
+        f"{DEFAULT_COLLECTIVE_LATENCY_US_BRACKET[1]:.1f}] us/hop bracket; "
+        "calibrate via trace"
     ),
     "dcn_bw_gbps": "ASSUMED: 100 Gbps/chip nominal host DCN egress prior",
     "dcn_bw_gbps_bracket": (
@@ -427,7 +436,6 @@ SUBCHANNEL_VPU_OPS_PER_BLOCK = 2.0
 VECTOR_MAX_ELEMENTS_PER_WORD = 4
 VECTOR_SUB_BYTE_ELEMENTS_PER_WORD = 8
 SUB_BYTE_EXPERT_DTYPES: frozenset[str] = frozenset({"nvfp4", "mxfp4", "fp4", "int4"})
-CHIPS_PER_HOST = 4
 CORES_PER_HOST = 8
 
 DEFAULT_LAUNCH_GAP_FLOOR_US = 1.0
@@ -465,7 +473,6 @@ CORNER_AXES: Mapping[str, int] = {
 DEFAULT_CHIP = "tpu7x"
 DEFAULT_PREFILL_ISL = 4096
 DEFAULT_SPEC_TOKENS = 3
-RECOMMEND_TP_CANDIDATES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64)
 RECOMMEND_DEFAULT_BATCH = 16
 RECOMMEND_HIGH_BATCH = 64
 RECOMMEND_HIGH_CTX = 32768
@@ -525,7 +532,6 @@ XPLANE_DEVICE_PLANE_PREFIX = "/device:"
 XPLANE_SPARSE_FILTER = "sparse"
 COLLECTIVE_IGNORE_SUFFIXES: tuple[str, ...] = ("-done", ".done")
 XLA_MODULE_MARKERS: tuple[str, ...] = ("xla module", "xla_module")
-STEP_EVENT_MARKERS: tuple[str, ...] = ("step", "model_step", "step_num")
 COLLECTIVE_PATH_XLA = "xla"
 COLLECTIVE_PATH_IN_KERNEL = "in_kernel"
 VALID_COLLECTIVE_PATHS: frozenset[str] = frozenset(
