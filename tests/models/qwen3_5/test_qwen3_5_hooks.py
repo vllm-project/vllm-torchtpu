@@ -32,10 +32,8 @@ from vllm_torchtpu.models.qwen3_5 import hooks, settings
 from vllm_torchtpu.models.qwen3_5.hooks import TPUQwen35MoeConfig
 from vllm_torchtpu.models.vllm import register_models
 
-# The real lookups, before the autouse fixtures (here and in conftest.py)
-# replace them.
+# The real lookup, before the autouse fixture replaces it.
 _REAL_CHIP_FAMILY = hooks._chip_family
-_REAL_MOE_KERNEL = hooks._moe_kernel
 TPU7X = pltpu.ChipVersion.TPU_7X.value
 
 QWEN35 = "Qwen3_5MoeForConditionalGeneration"
@@ -66,17 +64,8 @@ def test_hook_extends_vllms_qwen3_5_hook():
     assert issubclass(TPUQwen35MoeConfig, Qwen3_5ForConditionalGenerationConfig)
 
 
-# Qwen3.5-397B-A17B's text config. One FP8 expert slot in one MoE layer takes
-# 3 x hidden x moe_intermediate = 3 x 4096 x 1024 B.
+# Qwen3.5-397B-A17B's text config.
 HIDDEN, INTER, EXPERTS, LAYERS = 4096, 1024, 512, 60
-SLOT_LAYER_BYTES = 3 * HIDDEN * INTER
-# Main's placement only permutes experts: 512 / EP8 = 64 slots per rank, 16
-# fewer than the 80 the budget was measured with, in each of the 60 layers:
-# 960 slot-layers, so a TP8 + DCP4 decode leg gets 33.5e9 B + 960 x 3 x 4096 x
-# 1024 B = 45,579,595,520 B here. (The validation entries' record runs placed
-# 68 slots per rank with an expert table that has copies, a later change, and
-# ran with 42,509,364,992 B.)
-CREDIT_EP8 = (80 - 64) * LAYERS * SLOT_LAYER_BYTES
 
 
 def _vllm_config(
@@ -146,135 +135,9 @@ def _run_hook(cfg) -> SimpleNamespace:
     return cfg
 
 
-def test_tp8_dcp4_decode_leg_gets_the_calibrated_budget():
-    cfg = _run_hook(_vllm_config())
-    assert cfg.cache_config.kv_cache_memory_bytes == 33_500_000_000 + CREDIT_EP8
-    assert cfg.cache_config.kv_cache_memory_bytes == 45_579_595_520
-
-
-# The decode batch caps of the validation entries' TP8 + DCP4 legs.
-@pytest.mark.parametrize("seqs", [1, 3, 8, 16])
-def test_tp8_dcp4_budget_at_the_entries_batch_caps(seqs):
-    cfg = _run_hook(_vllm_config(dcp=4, max_num_seqs=seqs))
-    assert cfg.cache_config.kv_cache_memory_bytes == 33_500_000_000 + CREDIT_EP8
-
-
-@pytest.mark.parametrize(
-    "layout",
-    [
-        # Pipeline parallelism: a stage holds only its own layers, and the slot
-        # credit, which counts every MoE layer on every rank, does not model it.
-        dict(kv_role=None, tp=1, pp=8, dcp=1, max_num_seqs=32),
-        dict(kv_role="kv_consumer", tp=1, pp=8, dcp=1, max_num_seqs=32),
-        dict(kv_role=None, tp=4, pp=2, dcp=1, max_num_seqs=32),
-        dict(tp=8, pp=2),
-        # Experts over 4 ranks: 128 slots per rank, more than the 80 the budget
-        # was measured with, so the credit is negative.
-        dict(tp=4, dcp=1),
-        dict(tp=2, dp=2, dcp=1),
-        # Experts over 16 ranks.
-        dict(tp=8, dp=2),
-        # Main's nightly TP1 x DP8 decode leg.
-        dict(tp=1, dp=8, dcp=1, max_num_seqs=32),
-        # The DP4 x TP2 decode leg without its pinned 39.5e9 B: the auto value
-        # (44.58e9 B) failed program allocation at that leg's shape.
-        dict(tp=2, dp=4, dcp=1, max_num_seqs=28),
-        # TP8 at a decode context parallel size no entry ran.
-        dict(dcp=1),
-        dict(dcp=2),
-        dict(dcp=8),
-        # No expert parallelism: the slot count does not apply.
-        dict(ep=False),
-        # PCP: vLLM folds it into the EP size.
-        dict(tp=8, pcp=2),
-    ],
-    ids=[
-        "pp8-tp1-mixed",
-        "pp8-tp1-decode",
-        "pp2-tp4-mixed",
-        "pp2-tp8-decode",
-        "ep4",
-        "dp2-tp2",
-        "ep16",
-        "dp8-tp1",
-        "dp4-tp2",
-        "tp8-dcp1",
-        "tp8-dcp2",
-        "tp8-dcp8",
-        "no-ep",
-        "pcp2-tp8",
-    ],
-)
-def test_unmeasured_layouts_keep_mains_behaviour(layout):
-    """The budget was measured on TP8 + DCP4 decode legs with expert
-    parallelism and no PP or PCP. Any other layout stays on
-    gpu_memory_utilization, where the slot credit could go negative or the
-    budget not fit."""
-    cfg = _run_hook(_vllm_config(**layout))
-    assert cfg.cache_config.kv_cache_memory_bytes is None
-
-
-@pytest.mark.parametrize("kv_role", ["kv_consumer", None, "kv_producer", "kv_both"])
-def test_explicit_kv_cache_memory_bytes_is_kept(kv_role):
-    cfg = _run_hook(_vllm_config(kv_role=kv_role, kv_cache_memory_bytes=39_500_000_000))
-    assert cfg.cache_config.kv_cache_memory_bytes == 39_500_000_000
-
-
-def test_kv_producer_stays_on_gpu_memory_utilization():
-    cfg = _run_hook(_vllm_config(kv_role="kv_producer", tp=1, dcp=1, max_num_seqs=32))
-    assert cfg.cache_config.kv_cache_memory_bytes is None
-
-
-@pytest.mark.parametrize("kv_role", [None, "kv_both"])
-def test_mixed_engine_keeps_mains_behaviour(kv_role):
-    """The budget was measured on decode legs only."""
-    cfg = _run_hook(_vllm_config(kv_role=kv_role))
-    assert cfg.cache_config.kv_cache_memory_bytes is None
-
-
-@pytest.mark.parametrize("kernel", [None, "v2", "adaptive"])
-def test_the_budget_needs_the_fused_ep_v3_kernel(monkeypatch, kernel):
-    """The decode legs ran the budget with fused EP MoE v3; with v2, the
-    adaptive kernel or the grouped-matmul MoE (no fused EP) the same layout
-    stays on gpu_memory_utilization."""
-    monkeypatch.setattr(hooks, "_moe_kernel", lambda: kernel)
-    assert _run_hook(_vllm_config()).cache_config.kv_cache_memory_bytes is None
-
-
-@pytest.mark.parametrize(
-    ("use", "impl", "kernel"),
-    [
-        (None, None, None),
-        ("0", None, None),
-        ("1", None, "v2"),
-        (None, "v2", "v2"),
-        (None, "adaptive", "adaptive"),
-    ],
-)
-def test_the_moe_kernel_is_the_fused_ep_selection(monkeypatch, use, impl, kernel):
-    for name, value in (
-        ("USE_MOE_FUSED_EP_KERNEL", use),
-        ("MOE_FUSED_EP_KERNEL_IMPL", impl),
-    ):
-        if value is None:
-            monkeypatch.delenv(name, raising=False)
-        else:
-            monkeypatch.setenv(name, value)
-    assert _REAL_MOE_KERNEL() == kernel
-
-
-def test_a_text_config_without_moe_fields_fails_loudly():
-    """A calibrated checkpoint whose text config lacks the MoE fields fails at
-    engine start rather than getting a budget without the slot credit."""
-    cfg = _vllm_config()
-    del cfg.model_config.hf_text_config.moe_intermediate_size
-    with pytest.raises(AttributeError, match="moe_intermediate_size"):
-        _run_hook(cfg)
-
-
 # Main's nightly Qwen3.5-397B-A17B configs (models/qwen3_5/README.md): C1, a
 # TP1 x DP8 engine with expert parallelism, and C3's TP1 x PCP8 prefill and
-# TP1 x DP8 decode legs. None of them was measured with the defaults.
+# TP1 x DP8 decode legs. None of them was measured with the default.
 NIGHTLY_CONFIGS = {
     "c1-interleaved": dict(kv_role=None, tp=1, dp=8, dcp=1, max_num_seqs=256),
     "c3-prefill": dict(kv_role="kv_producer", tp=1, pcp=8, dcp=1, max_num_seqs=8),
@@ -373,9 +236,9 @@ def test_our_model_resolves_through_the_hook(restore_config_map):
     from vllm.config import VllmConfig
 
     register_models()
-    cfg = _vllm_config()
+    cfg = _measured_prefill_leg()
     VllmConfig.try_verify_and_update_config(cfg)
-    assert cfg.cache_config.kv_cache_memory_bytes == 33_500_000_000 + CREDIT_EP8
+    assert cfg.cache_config.prefix_match_unit == 128
 
 
 # Names no change will register: real section names (tpu_scheduler, ...) stop
@@ -390,7 +253,7 @@ def test_unread_tpu_section_fails_at_engine_start(key):
 
 
 def test_known_and_foreign_sections_pass():
-    cfg = _vllm_config(
+    cfg = _measured_prefill_leg(
         additional={
             "qwen3_5": {},
             "tpu_online_fp8": {},
@@ -403,7 +266,7 @@ def test_known_and_foreign_sections_pass():
         }
     )
     _run_hook(cfg)
-    assert cfg.cache_config.kv_cache_memory_bytes == 33_500_000_000 + CREDIT_EP8
+    assert cfg.cache_config.prefix_match_unit == 128
 
 
 @pytest.mark.parametrize("arch", OTHER_ARCHS)
@@ -413,37 +276,6 @@ def test_other_models_are_not_checked(restore_config_map, arch):
     register_models()
     cfg = _vllm_config(arch, additional={"tpu_typo": {}})
     VllmConfig.try_verify_and_update_config(cfg)
-
-
-# The calibrated budget applies only where it was measured: Qwen3.5-397B-A17B's
-# checkpoint shape on TPU7x. Anything else keeps main's gpu_memory_utilization.
-
-
-def test_calibrated_shape_on_tpu7x_gets_the_budget():
-    cfg = _run_hook(_vllm_config())
-    assert cfg.cache_config.kv_cache_memory_bytes == 45_579_595_520
-
-
-@pytest.mark.parametrize(
-    "field, value",
-    [("num_experts", 256), ("hidden_size", 2048), ("num_hidden_layers", 40)],
-)
-def test_other_checkpoint_of_the_architecture_keeps_mains_behaviour(field, value):
-    cfg = _vllm_config()
-    setattr(cfg.model_config.hf_text_config, field, value)
-    assert _run_hook(cfg).cache_config.kv_cache_memory_bytes is None
-
-
-@pytest.mark.parametrize("chip", ["v6e", "v5e", "v5p", "7", None])
-def test_smaller_or_unknown_device_keeps_mains_behaviour(monkeypatch, chip):
-    monkeypatch.setattr(hooks, "_chip_family", lambda: chip)
-    assert _run_hook(_vllm_config()).cache_config.kv_cache_memory_bytes is None
-
-
-def test_explicit_budget_is_kept_on_any_device(monkeypatch):
-    monkeypatch.setattr(hooks, "_chip_family", lambda: "v6e")
-    cfg = _run_hook(_vllm_config(kv_cache_memory_bytes=12_000_000_000))
-    assert cfg.cache_config.kv_cache_memory_bytes == 12_000_000_000
 
 
 @pytest.mark.parametrize(
@@ -460,7 +292,7 @@ def test_explicit_budget_is_kept_on_any_device(monkeypatch):
 )
 def test_chip_family_reads_the_accelerator_type(accelerator_type, value, family):
     """tpu_info resolves the chip, and an unknown one stays unknown (no TPU7x
-    default), so it never gets the calibrated budget."""
+    default), so it never gets the calibrated default."""
     accelerator_type(value)
     assert _REAL_CHIP_FAMILY() == family
 
@@ -508,7 +340,7 @@ def test_other_checkpoint_prefill_leg_keeps_mains_prefix_match_unit(field, value
     assert _run_hook(cfg).cache_config.prefix_match_unit is None
 
 
-@pytest.mark.parametrize("chip", ["v6e", "v5p", None])
+@pytest.mark.parametrize("chip", ["v6e", "v5e", "v5p", "7", None])
 def test_other_device_prefill_leg_keeps_mains_prefix_match_unit(monkeypatch, chip):
     monkeypatch.setattr(hooks, "_chip_family", lambda: chip)
     assert _run_hook(_measured_prefill_leg()).cache_config.prefix_match_unit is None
@@ -639,71 +471,22 @@ def _leg_config(leg: dict) -> SimpleNamespace:
     )
 
 
-# The KV budget each point's decode leg gets on this tree: TP8 + DCP4 legs the
-# auto budget with main's permutation placement; p01's DP4 x TP2 leg passes
-# --kv-cache-memory-bytes, which is kept.
-DECODE_KV_BYTES = {
-    "p01": 39_500_000_000,
-    "p05": 33_500_000_000 + CREDIT_EP8,
-    "p08": 33_500_000_000 + CREDIT_EP8,
-    "p10": 33_500_000_000 + CREDIT_EP8,
-    "p12": 33_500_000_000 + CREDIT_EP8,
-}
-
-
-def _leg_moe_kernel(leg: dict) -> str | None:
-    """The fused EP MoE implementation a leg's environment selects, read as
-    envs.py reads it (``_moe_kernel``)."""
-    env = leg.get("env") or {}
-    impl = env.get("MOE_FUSED_EP_KERNEL_IMPL")
-    use = impl is not None or env.get("USE_MOE_FUSED_EP_KERNEL", "0") in ("1", "true")
-    return (impl or "v2") if use else None
-
-
 @pytest.mark.parametrize("path", POINTS, ids=lambda p: p.stem)
-def test_validation_points_keep_their_defaults(path, monkeypatch):
-    """Every point's prefill leg gets the 128-token unit and stays on
-    gpu_memory_utilization; every decode leg keeps the default unit and gets
-    its budget, with the MoE kernel its environment selects: the measured
-    legs are unchanged."""
+def test_validation_points_keep_their_defaults(path):
+    """Every point's prefill leg gets the 128-token unit; every decode leg
+    keeps the default unit. The KV cache size stays what each leg passes: p01's
+    decode leg its --kv-cache-memory-bytes, every other leg none (its
+    --gpu-memory-utilization)."""
     with path.open() as f:
         legs = yaml.safe_load(f)["legs"]
-    configs = {}
-    for name in ("prefill", "decode"):
-        kernel = _leg_moe_kernel(legs[name])
-        monkeypatch.setattr(hooks, "_moe_kernel", lambda kernel=kernel: kernel)
-        configs[name] = _run_hook(_leg_config(legs[name]))
-    prefill, decode = configs["prefill"], configs["decode"]
+    prefill = _run_hook(_leg_config(legs["prefill"]))
+    decode = _run_hook(_leg_config(legs["decode"]))
     assert prefill.kv_transfer_config.kv_role == "kv_producer"
     assert prefill.cache_config.prefix_match_unit == 128
     assert prefill.cache_config.kv_cache_memory_bytes is None
     assert decode.kv_transfer_config.kv_role == "kv_consumer"
     assert decode.cache_config.prefix_match_unit is None
-    point = path.name.split("-")[0]
-    assert decode.cache_config.kv_cache_memory_bytes == DECODE_KV_BYTES[point]
-
-
-def test_the_budget_admits_exactly_the_entries_auto_budget_layouts():
-    """The calibrated decode layouts (TP, DP, DCP) are exactly those of the
-    point entries' decode legs that run on the auto budget (no
-    --kv-cache-memory-bytes), and every such leg runs the calibrated MoE
-    kernel; the gates reuse those legs."""
-    layouts = set()
-    for path in POINTS:
-        with path.open() as f:
-            decode = yaml.safe_load(f)["legs"]["decode"]
-        args = decode["serve_args"]
-        if "--kv-cache-memory-bytes" in args:
-            continue
-        assert _leg_moe_kernel(decode) == hooks._CALIBRATED_MOE_KERNEL, path.name
-        layouts.add(
-            tuple(
-                int(_flag(args, name, "1"))
-                for name in (
-                    "--tensor-parallel-size",
-                    "--data-parallel-size",
-                    "--decode-context-parallel-size",
-                )
-            )
-        )
-    assert layouts == hooks._CALIBRATED_DECODE_LAYOUTS
+    explicit = _flag(legs["decode"]["serve_args"], "--kv-cache-memory-bytes", None)
+    assert decode.cache_config.kv_cache_memory_bytes == (
+        None if explicit is None else int(explicit)
+    )
