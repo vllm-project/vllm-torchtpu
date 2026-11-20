@@ -522,7 +522,7 @@ def _compiled_pad_non_spec_next_tokens(
 
 
 @_static_shape_args
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _compiled_subtract_and_substitute_placeholder_token(
     seq_lens: torch.Tensor,
     positions: torch.Tensor,
@@ -576,7 +576,7 @@ def _compiled_carry_subtract_and_substitute_draft_token_ids(
 
 
 @_static_shape_args
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _compiled_subtract_and_substitute_draft_token_ids(
     seq_lens: torch.Tensor,
     positions: torch.Tensor,
@@ -604,7 +604,7 @@ def _compiled_subtract_and_substitute_draft_token_ids(
 
 
 @_static_shape_args
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _compiled_assemble_spec_and_rejected(
     next_tokens: torch.Tensor,
     drafts: torch.Tensor,
@@ -638,7 +638,7 @@ def _compiled_assemble_spec_and_rejected(
 
 
 @_static_shape_args
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _compiled_assemble_two_chunks_spec_and_rejected(
     nt0: torch.Tensor,
     drafts0: torch.Tensor,
@@ -689,7 +689,7 @@ def _compiled_assemble_two_chunks_spec_and_rejected(
 
 
 @_static_shape_args
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _compiled_assemble_prefill_bootstrap(
     selected_tokens: torch.Tensor,
     padded_drafts: torch.Tensor,

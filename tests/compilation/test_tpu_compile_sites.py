@@ -186,6 +186,17 @@ DISPATCHED_DIRECTLY = [
     ("spec_decode.eagle3", "Eagle3Proposer._draft_async_prepare_inputs"),
     ("spec_decode.eagle3", "Eagle3Proposer._draft_loop_seq_lens"),
     ("spec_decode.eagle3", "Eagle3Proposer._draft_add_delta"),
+    ("runner.tpu_runner", "_compiled_assemble_spec_rejected_and_read_offsets"),
+    (
+        "runner.tpu_runner_async_output",
+        "_compiled_subtract_and_substitute_placeholder_token",
+    ),
+    (
+        "runner.tpu_runner_async_output",
+        "_compiled_subtract_and_substitute_draft_token_ids",
+    ),
+    ("runner.tpu_runner_async_output", "_compiled_assemble_spec_and_rejected"),
+    ("runner.tpu_runner_async_output", "_compiled_assemble_prefill_bootstrap"),
 ]
 
 

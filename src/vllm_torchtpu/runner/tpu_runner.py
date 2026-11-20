@@ -638,7 +638,7 @@ def _fused_greedy_verify_from_logits(
 
 
 @_static_shape_args
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _compiled_assemble_spec_rejected_and_read_offsets(
     next_tokens: torch.Tensor,
     drafts: torch.Tensor,
@@ -688,7 +688,7 @@ def _compiled_assemble_spec_rejected_and_read_offsets(
 
 
 @_static_shape_args
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _compiled_assemble_two_chunks_spec_rejected_and_read_offsets(
     nt0: torch.Tensor,
     drafts0: torch.Tensor,
