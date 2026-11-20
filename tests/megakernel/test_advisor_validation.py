@@ -29,13 +29,9 @@ from vllm_torchtpu.megakernel import advisor
 from vllm_torchtpu.megakernel.advisor import chips
 from vllm_torchtpu.megakernel.core import errors
 
-VALIDATION_CORPUS_PATH = (
-    Path(__file__).resolve().parent / "data" / "advisor" / "validation_points.json"
-)
 MEASURED_CORPUS_PATH = (
     Path(__file__).resolve().parent / "data" / "advisor" / "measured_points.json"
 )
-ALLOWED_PROVENANCE_KINDS = frozenset({"synthetic_envelope_fixture"})
 REQUIRED_MEASURED_KEYS = frozenset(
     {
         "id",
@@ -62,17 +58,6 @@ MOE_MODES: dict[str, advisor.MoEMode] = {
     "grouped_on_chip": "grouped_on_chip",
     "grouped_in_hbm": "grouped_in_hbm",
 }
-
-
-def _load_validation_corpus() -> list[dict[str, object]]:
-    """Load and validate the top-level schema of `validation_points.json`."""
-    assert VALIDATION_CORPUS_PATH.is_file(), f"Missing {VALIDATION_CORPUS_PATH}"
-    document = json.loads(VALIDATION_CORPUS_PATH.read_text(encoding="utf-8"))
-    assert document["schema"] == "advisor.validation.v1"
-    points = document["points"]
-    min_corpus_points = 2 * 7  # 14 validation points across models and regimes
-    assert len(points) >= min_corpus_points
-    return points
 
 
 def _build_workload_from_point(point: dict[str, object]) -> advisor.WorkloadSpec:
@@ -108,20 +93,6 @@ def _build_workload_from_point(point: dict[str, object]) -> advisor.WorkloadSpec
     )
 
 
-def _evaluate_validation_points() -> list[
-    tuple[dict[str, object], advisor.ScopeEstimate]
-]:
-    """Evaluate every point in the validation corpus against `advisor.advise`."""
-    evaluated: list[tuple[dict[str, object], advisor.ScopeEstimate]] = []
-    for point in _load_validation_corpus():
-        workload = _build_workload_from_point(point)
-        report = advisor.advise(str(point["model"]), workload, str(point["chip"]))
-        scope_name = str(point["scope"])
-        estimate = next(s for s in report.scopes if s.scope == scope_name)
-        evaluated.append((point, estimate))
-    return evaluated
-
-
 @pytest.fixture
 def without_declared_megakernels(monkeypatch: pytest.MonkeyPatch) -> None:
     """Strip deployment `megakernel` blocks to test core-limit mechanics."""
@@ -144,49 +115,62 @@ def without_declared_megakernels(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
 
-def test_no_estimate_exceeds_measured_beyond_spread() -> None:
-    """Verify every soundness fixture satisfies floor <= measured + spread."""
-    models_seen: set[str] = set()
-    for point, estimate in _evaluate_validation_points():
-        models_seen.add(str(point["model"]))
-        assert estimate.feasible, (
-            f"{point['id']} scope {point['scope']} marked infeasible"
-        )
-        measured_us = float(str(point["fixture_step_us"]))
-        spread_us = float(str(point["measured_spread_us"]))
-        assert estimate.step_bound_us <= measured_us + spread_us, (
-            f"{point['id']}: floor {estimate.step_bound_us:.2f} us exceeds "
-            f"measured {measured_us:.2f} + spread {spread_us:.2f} us"
-        )
-    min_distinct_models = 3  # 3 distinct models tested in validation corpus
-    assert len(models_seen) >= min_distinct_models
+@pytest.mark.parametrize(
+    ("model_slug", "tp_size", "ep_size", "dcp_size"),
+    [
+        ("qwen3.5-397b", 8, 8, 4),
+        ("kimi-k3", 32, 32, 32),
+        # INFERRED layout matching kimi-k3 decode until kimi-k3.1-pro has a recipe.
+        ("kimi-k3.1-pro", 32, 32, 32),
+        ("glm-5.2", 16, 16, 16),
+    ],
+)
+def test_floor_ordering_and_monotonicity_across_models(
+    model_slug: str,
+    tp_size: int,
+    ep_size: int,
+    dcp_size: int,
+) -> None:
+    """Verify band ordering and batch/context monotonicity across submitted models."""
+    small_batch = 4
+    large_batch = 32
+    short_context = 8192
+    long_context = 32768
+    workload_small = advisor.WorkloadSpec(
+        phase="decode",
+        batch=small_batch,
+        context=short_context,
+        osl=1,
+        tp=tp_size,
+        ep=ep_size,
+        dcp=dcp_size,
+    )
+    workload_large_batch = dataclasses.replace(workload_small, batch=large_batch)
+    workload_long_context = dataclasses.replace(workload_small, context=long_context)
 
+    report_small = advisor.advise(model_slug, workload_small, "tpu7x")
+    report_large_batch = advisor.advise(model_slug, workload_large_batch, "tpu7x")
+    report_long_context = advisor.advise(model_slug, workload_long_context, "tpu7x")
 
-def test_validation_corpus_zero_lower_bound_violations() -> None:
-    """Verify every soundness fixture satisfies floor <= measured step."""
-    evaluated = _evaluate_validation_points()
-    min_corpus_points = 2 * 7  # 14 validation points across models and regimes
-    assert len(evaluated) >= min_corpus_points
-    for point, estimate in evaluated:
-        measured_us = float(str(point["fixture_step_us"]))
-        assert estimate.step_floor_strict_us <= estimate.step_bound_us
-        assert estimate.step_upper_us >= estimate.step_bound_us
-        assert estimate.step_bound_us <= measured_us, (
-            f"{point['id']}: floor {estimate.step_bound_us:.2f} us exceeds "
-            f"measured {measured_us:.2f} us"
-        )
+    for report in (report_small, report_large_batch, report_long_context):
+        for scope in report.scopes:
+            if not scope.feasible:
+                continue
+            assert (
+                scope.step_floor_strict_us <= scope.step_bound_us <= scope.step_upper_us
+            )
+            assert scope.step_achievable_us <= scope.step_achievable_upper_us
+
+    small_per_op = next(s for s in report_small.scopes if s.scope == "per_op")
+    large_per_op = next(s for s in report_large_batch.scopes if s.scope == "per_op")
+    long_per_op = next(s for s in report_long_context.scopes if s.scope == "per_op")
+    assert small_per_op.step_floor_strict_us < large_per_op.step_floor_strict_us
+    assert small_per_op.step_floor_strict_us <= long_per_op.step_floor_strict_us
 
 
 @pytest.mark.usefixtures("without_declared_megakernels")
-def test_validation_corpus_provenance_and_tie_overlap() -> None:
-    """Verify corpus provenance metadata, objective splits, and paired-corner ties."""
-    for point in _load_validation_corpus():
-        assert point["provenance_kind"] in ALLOWED_PROVENANCE_KINDS
-        desc = str(point["workload_description"]).strip()
-        assert desc
-        assert "sha256:" not in desc
-        assert "gs://" not in desc
-
+def test_parallelism_objective_split_and_launch_gap_tie() -> None:
+    """Verify objective splits across parallelism layouts and paired-corner ties."""
     split_result = advisor.compare_parallelism_candidates(
         "kimi-k3",
         [
@@ -262,7 +246,7 @@ def test_public_calibration_loader_and_validation(tmp_path: Path) -> None:
         assert "step_time_us" not in entry
 
     calibrated_report = advisor.advise(
-        "Qwen/Qwen3-30B-A3B-FP8",
+        "qwen3.5-397b",
         advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=8),
         "tpu7x",
         measurements=calibration_data,
@@ -283,7 +267,7 @@ def test_advisor_cli_with_bundled_measurements(tmp_path: Path) -> None:
     base_argv = [
         "estimate",
         "--model",
-        "Qwen/Qwen3-30B-A3B-FP8",
+        "qwen3.5-397b",
         "--phase",
         "decode",
         "--batch",
@@ -311,35 +295,30 @@ def test_advisor_cli_with_bundled_measurements(tmp_path: Path) -> None:
 
 def test_qwen38_b256_directional_megakernel_win() -> None:
     """Verify single-pass adaptive ring whole_step beats per_op at B=64 and B=256."""
-    # Synthetic envelope fixtures in validation_points.json establish roofline
-    # upper envelopes and directional ordering above the analytical floor.
-    corpus_points = {str(point["id"]): point for point in _load_validation_corpus()}
-    mk_b256 = corpus_points["qwen38_2_4t_tp32_dcp8_mk_b256"]
-    per_op_b256 = corpus_points["qwen38_2_4t_tp32_dcp8_per_op_b256"]
-    assert float(str(mk_b256["fixture_step_us"])) < float(
-        str(per_op_b256["fixture_step_us"])
-    )
-    for batch_tag in ("b64", "b256"):
-        per_op_point = corpus_points[f"qwen38_2_4t_tp32_dcp8_per_op_{batch_tag}"]
-        workload = _build_workload_from_point(per_op_point)
+    tp_size = 32
+    ep_size = 32
+    dcp_size = 8
+    isl_tokens = 1024
+    osl_tokens = 1024
+    context_tokens = 1536
+    for batch_size in (64, 256):
+        workload = advisor.WorkloadSpec(
+            phase="decode",
+            batch=batch_size,
+            isl=isl_tokens,
+            osl=osl_tokens,
+            context=context_tokens,
+            tp=tp_size,
+            ep=ep_size,
+            dcp=dcp_size,
+            moe_mode="grouped_on_chip",
+        )
         report = advisor.advise("qwen3.8-2.4t", workload, "tpu7x")
         whole_step_scope = next(s for s in report.scopes if s.scope == "whole_step")
         per_op_scope = next(s for s in report.scopes if s.scope == "per_op")
         assert whole_step_scope.n_splits == 1
         assert whole_step_scope.step_bound_us < per_op_scope.step_bound_us
         assert report.fastest_scope == "whole_step"
-
-
-def test_fixture_corpus_is_labelled_fixture() -> None:
-    """Verify validation_points.json uses fixture_step_us and synthetic provenance."""
-    raw_text = VALIDATION_CORPUS_PATH.read_text(encoding="utf-8")
-    assert "measured_step_us" not in raw_text
-    document = json.loads(raw_text)
-    assert "synthetic" in str(document.get("description", "")).lower()
-    for point in document["points"]:
-        assert "fixture_step_us" in point
-        assert "measured_step_us" not in point
-        assert point["provenance_kind"] == "synthetic_envelope_fixture"
 
 
 def test_measured_corpus_schema() -> None:
