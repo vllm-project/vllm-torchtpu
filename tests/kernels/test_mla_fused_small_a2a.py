@@ -94,8 +94,35 @@ def test_gate_cap():
     assert not _applies(8, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="4")
     assert _applies(4, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="4")
     # A cap above the step8 step would leave a two-step grid: off everywhere.
-    assert not _applies(4, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="16")
+    assert not _applies(4, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="64")
     assert not _applies(4, TPU_DCP_MLA_SMALL_CHUNK_TOKENS="4")
+
+
+def test_should_auto_enable_fused_small_a2a_up_to_32_when_dcp16_unset():
+    class _Group:
+        def __init__(self, world_size: int) -> None:
+            self.world_size = world_size
+
+    with mock.patch.object(cp_mla, "get_dcp_group", return_value=_Group(16)):
+        assert [
+            t
+            for t in (4, 8, 16, 32, 64)
+            if _applies(t, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS=None)
+        ] == [4, 8, 16, 32]
+    with mock.patch.object(cp_mla, "get_dcp_group", return_value=_Group(8)):
+        assert [
+            t
+            for t in (4, 8, 16, 32, 64)
+            if _applies(t, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS=None)
+        ] == [4, 8]
+
+
+def test_should_clamp_decode_topk_cap_for_dcp16():
+    assert ai.resolve_decode_topk_cap(512, 16, 2048, decode_bucket=True) == 256
+    assert ai.resolve_decode_topk_cap(512, 16, 2048, decode_bucket=False) == 512
+    assert ai.resolve_decode_topk_cap(512, 8, 2048, decode_bucket=True) == 512
+    assert ai.resolve_decode_topk_cap(128, 16, 2048, decode_bucket=True) == 128
+    assert ai.resolve_decode_topk_cap(0, 16, 2048, decode_bucket=True) == 0
 
 
 def test_gate_compares_tokens_once():

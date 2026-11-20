@@ -39,12 +39,12 @@ import jax
 import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
+
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 from vllm_torchtpu.kernels.lse_rescale import lse_rescale_quantize
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
-
-from vllm_torchtpu import envs
 
 if envs.TPU_DCP_MERGE_VSPACE_FUSED:
     # Registers the fused V-space operand ops at import, never in a trace.
@@ -81,9 +81,9 @@ def local_q_all_gather_op():
     TPU_MLA_DECODE_LOCAL_Q_AG). `rank` / `lane` are `dcp_rank_operand` /
     `dcp_lane_operand`. Build it outside Dynamo (load time)."""
     from jax.sharding import PartitionSpec as P
+
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
     from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
-
     from vllm_torchtpu.kernels.quantized_matmul.fp8_window_all_gather import (
         fp8_window_all_gather,
     )
@@ -923,6 +923,7 @@ def _retain_rank(out: torch.Tensor) -> torch.Tensor:
 def _build_ragged_all_to_all(world: int, skip: int = 0):
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
+
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
     from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 
@@ -1042,9 +1043,9 @@ def _build_send_unpack(world: int):
     import jax.numpy as jnp
     from jax import lax
     from jax.sharding import PartitionSpec as P
+
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
     from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
-
     from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
 
     mesh = get_or_create_dcp_mesh()
@@ -1106,18 +1107,30 @@ _SEND_GROUP_OPS: dict = {}
 _SEND_SMALL_OPS: dict = {}
 
 
+def _send_small_a2a_max_tokens(dcp_size: int) -> int:
+    if envs.is_set("TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS"):
+        return envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
+    # Avoid two-step ragged_all_to_all at m=16,32 under DCP>=16 where decode
+    # topk_cap=256 fits in 32 MiB VMEM; keep cap=8 at DCP<=8 (topk_cap=512).
+    if dcp_size >= 16:
+        return 32
+    return envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
+
+
 def send_small_a2a_applies(num_tokens: int) -> bool:
     """Whether `merge_send_layout` exchanges this bucket with the Pallas
     small all-to-all (`TPU_DCP_MLA_SEND_SMALL_A2A`): `T <= cap` on the static
     bucket size, and only where the indexer's small all-gather already lifts
     the lane operand on every bucket (so no bucket lifts a buffer another
     does not)."""
+    group = get_dcp_group()
+    dcp_size = 1 if group is None else int(group.world_size)
     return bool(
         envs.TPU_DCP_MLA_SEND_SMALL_A2A
         and envs.TPU_DCP_INDEXER_SMALL_AG
         and envs.TPU_SC_TOPK_DCP_MERGE_FLAT
         and envs.TPU_DCP_RANK_OPERAND
-        and num_tokens <= envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
+        and num_tokens <= _send_small_a2a_max_tokens(dcp_size)
     )
 
 
@@ -1138,6 +1151,7 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
         return False
     group = get_dcp_group()
     dcp_size = 1 if group is None else int(group.world_size)
+    max_tokens = _send_small_a2a_max_tokens(dcp_size)
     value = envs.TPU_MLA_DECODE_BODY_LEVERS
     levers = (
         sparse_kernel.DECODE_BODY_DEFAULT
@@ -1151,10 +1165,8 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
         and dcp_mla_topk_cap(dcp_size)
         and envs.TPU_DCP_MLA_FUSED_PREP
         and envs.TPU_MLA_DECODE_ROW_WIDTHS
-        and envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
-        <= sparse_kernel.DECODE_STEP8_TOKENS
-        and envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
-        <= envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS
+        and max_tokens <= sparse_kernel.DECODE_STEP8_TOKENS
+        and max_tokens <= envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS
     )
 
 
@@ -1203,7 +1215,6 @@ def send_small_unpack_local(
     from vllm_torchtpu.kernels.experimental.small_collectives.all_to_all import (
         small_all_to_all,
     )
-
     from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
 
     block = x.shape[0] // world
@@ -1223,6 +1234,7 @@ def send_small_unpack_local(
 
 def _build_send_small(world: int):
     from jax.sharding import PartitionSpec as P
+
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
     from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 
@@ -1334,6 +1346,7 @@ def send_group_unpack_local(
 
 def _build_send_group(world: int, group_rows: int):
     from jax.sharding import PartitionSpec as P
+
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
     from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 
@@ -1560,6 +1573,7 @@ def prebuild_sized_merge(world: int) -> None:
     if not envs.TPU_MTP_DCP_MERGE_SIZED or world <= 1 or world in _SIZED_MERGE_OPS:
         return
     from jax.sharding import PartitionSpec as P
+
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
     from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 

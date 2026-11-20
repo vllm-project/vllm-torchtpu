@@ -1048,6 +1048,17 @@ def dcp_mla_topk_cap(dcp_size: int) -> int:
     return topk_cap
 
 
+def resolve_decode_topk_cap(
+    topk_cap: int, dcp_size: int, topk: int, *, decode_bucket: bool
+) -> int:
+    # Avoid VMEM spill at m=16,32 fused decode exchange under DCP>=16: per-rank
+    # count is ~topk/dcp_size (128 at topk=2048, dcp=16), so cap=256 halves
+    # gather/VMEM scratch while the exact overflow pass handles >256 rows.
+    if decode_bucket and dcp_size >= 16 and topk_cap > 256 and topk > 256:
+        return 256
+    return topk_cap
+
+
 def _mixed_body_levers(value: str, kernel_v2: bool = False) -> tuple[str, ...]:
     """TPU_DCP_MLA_MIXED_BODY -> the live body's lever tuple ("1" = default set),
     plus the stage-A levers with TPU_DCP_MLA_MIXED_KERNEL_V2."""
@@ -1516,7 +1527,12 @@ def sparse_mla_attention_dcp(
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         # The capped path (and its chunk) applies only where the kernel takes
         # it: SparseCore caches and a top-k wider than the cap.
-        topk_cap = dcp_mla_topk_cap(dcp_size)
+        topk_cap = resolve_decode_topk_cap(
+            dcp_mla_topk_cap(dcp_size),
+            dcp_size,
+            topk_idx.shape[-1],
+            decode_bucket=decode_bucket,
+        )
         if not (
             topk_cap
             and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
@@ -1612,7 +1628,13 @@ def sparse_mla_attention_dcp(
             kv_write_fault=None if kv_write_fault == "wrong_owner" else kv_write_fault,
             mixed_fused_prep=envs.TPU_DCP_MLA_MIXED_FUSED_PREP,
             decode_row_widths=(
-                tuple(int(w) for w in envs.TPU_MLA_DECODE_ROW_WIDTHS.split(",") if w)
+                tuple(
+                    w
+                    for w in (
+                        int(x) for x in envs.TPU_MLA_DECODE_ROW_WIDTHS.split(",") if x
+                    )
+                    if w < topk_cap
+                )
                 if topk_cap
                 else ()
             ),

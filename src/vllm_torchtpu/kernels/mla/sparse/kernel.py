@@ -1444,7 +1444,7 @@ DECODE_BODY_LEVERS = (
     # kv_len is 0 -- every key is zeroed and masked, so they attend nothing.
     "step8",
 )
-DECODE_STEP8_TOKENS = 8
+DECODE_STEP8_TOKENS = 32
 # The measured set (decode probes 02 / 04 / 05): "step8" runs 8 tokens per
 # attention grid step and "quad" stacks them in one softmax; "nofill" and
 # "q128" measured no gain.
