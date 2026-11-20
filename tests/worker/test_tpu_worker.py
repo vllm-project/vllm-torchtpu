@@ -15,6 +15,7 @@
 
 import multiprocessing
 import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -23,12 +24,18 @@ import pytest
 import torch
 from vllm.config import ParallelConfig
 from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 
 import vllm_torchtpu as plugin
 from vllm_torchtpu import patch_registry, utils
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-from vllm_torchtpu.worker.tpu_worker import TPUWorker, _configure_tpu_process_env
+from vllm_torchtpu.worker.tpu_worker import (
+    TPUWorker,
+    _configure_tpu_process_env,
+    _DeferredNoForwardOutput,
+    _LatePollModelRunnerOutput,
+)
 
 
 def test_configure_tpu_process_env_sets_world_size_only_for_multiple_ranks(monkeypatch):
@@ -993,8 +1000,6 @@ class TestLatePollWorkerGates:
 
     @staticmethod
     def _worker(pollers):
-        import threading
-
         worker = object.__new__(TPUWorker)
         worker._stage3_late_poller_list = pollers
         worker._dummy_batch_cv = threading.Condition()
@@ -1004,10 +1009,6 @@ class TestLatePollWorkerGates:
         return worker
 
     def test_sample_tokens_adds_the_late_loads_with_the_option(self):
-        from vllm.v1.outputs import AsyncModelRunnerOutput
-
-        from vllm_torchtpu.worker.tpu_worker import _LatePollModelRunnerOutput
-
         class _Out(AsyncModelRunnerOutput):
             def get_output(self):
                 return SimpleNamespace(kv_connector_output=None)
@@ -1035,8 +1036,6 @@ class TestLatePollWorkerGates:
     def test_execute_model_defers_only_a_zero_token_async_dp_step(
         self, tokens, async_scheduling, dp, pollers, deferred
     ):
-        from vllm_torchtpu.worker.tpu_worker import _DeferredNoForwardOutput
-
         output = SimpleNamespace(kv_connector_output=None)
         worker = self._worker(pollers)
         worker.scheduler_config.async_scheduling = async_scheduling
@@ -1069,8 +1068,6 @@ class TestLatePollWorkerGates:
         assert worker._dummy_batch_count == 1
 
     def test_a_zero_token_step_polls_after_the_dummy_batch_that_follows(self):
-        import threading
-
         seen_count: list[int] = []
 
         def poll():
@@ -1098,13 +1095,6 @@ class TestLatePollSalvage:
     get_kv_connector_output(); the wrappers pass the wrapped one through."""
 
     def test_wrappers_return_the_wrapped_connector_output(self):
-        from vllm.v1.outputs import AsyncModelRunnerOutput
-
-        from vllm_torchtpu.worker.tpu_worker import (
-            _DeferredNoForwardOutput,
-            _LatePollModelRunnerOutput,
-        )
-
         kv = object()
 
         class _Inner(AsyncModelRunnerOutput):
