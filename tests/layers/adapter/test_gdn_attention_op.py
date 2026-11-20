@@ -1938,3 +1938,78 @@ def test_flipped_qkvz_fp8_block_weight_is_the_kept_one_transposed(
     assert kept_weight.shape == weight.shape
     torch.testing.assert_close(flipped_weight, kept_weight.T, rtol=0, atol=0)
     torch.testing.assert_close(flipped_scale, kept_scale, rtol=0, atol=0)
+
+
+def test_shared_mamba_jax_op_requires_donate_argnums_and_extracts_metadata(
+    monkeypatch,
+) -> None:
+    """Verify `get_shared_mamba_jax_op` and `extract_mamba_step_metadata` contracts."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_torchtpu.layers.adapter.custom_ops import mamba_op_utils
+
+    with pytest.raises(TypeError):
+        # `donate_argnums` is required keyword-only (no Mamba-only default).
+        mamba_op_utils.get_shared_mamba_jax_op(  # type: ignore[call-arg]
+            "test_op", (1,), lambda x, s: (s, x), 4
+        )
+
+    calls: list[tuple[str, tuple[int, ...]]] = []
+
+    def _fake_pallas_jax_op(name: str, fn, donate_argnums: tuple[int, ...] = ()):
+        del fn
+        calls.append((name, donate_argnums))
+
+        def _op(
+            x: torch.Tensor, pool: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return pool + 1.0, x * 2.0
+
+        _op.register_fake = lambda _f: None
+        return _op
+
+    monkeypatch.setattr(mamba_op_utils.pallas, "jax_op", _fake_pallas_jax_op)
+    op1 = mamba_op_utils.get_shared_mamba_jax_op(
+        "test_pooled", (8,), lambda x, p: (p, x), (2, 4), donate_argnums=(1,)
+    )
+    op2 = mamba_op_utils.get_shared_mamba_jax_op(
+        "test_pooled", (8,), lambda x, p: (p, x), (2, 4), donate_argnums=(1,)
+    )
+    assert len(calls) == 1 and calls[0][1] == (1,)
+    x_t = torch.ones((3, 2, 4))
+    pool_t = torch.zeros((2, 4))
+    out_t = op1(x_t, pool_t)
+    assert torch.equal(out_t, torch.full((3, 2, 4), 2.0))
+    assert torch.equal(pool_t, torch.ones((2, 4)))
+    _ = op2
+
+    # Dedicated `mamba_state_indices` vs unified-pool flattened `block_tables`:
+    qsl_t = torch.tensor([0, 3, 5], dtype=torch.int32)
+    dist_t = torch.tensor([0, 2, 2], dtype=torch.int32)
+    mamba_dist_t = torch.tensor([1, 1, 2], dtype=torch.int32)
+    seq_t = torch.tensor([3, 2], dtype=torch.int32)
+    bt_1d = torch.tensor([7, 9, 4, 5], dtype=torch.int32)
+
+    meta_pooled = SimpleNamespace(
+        mamba_state_indices=None,
+        block_tables=bt_1d,
+        query_start_loc=qsl_t,
+        request_distribution=dist_t,
+        mamba_request_distribution=mamba_dist_t,
+        seq_lens=seq_t,
+    )
+    slots_out, _, dist_out, _ = mamba_op_utils.extract_mamba_step_metadata(
+        "layers.0", meta_pooled
+    )
+    assert torch.equal(slots_out, torch.tensor([7, 4], dtype=torch.int32))
+    assert torch.equal(dist_out, mamba_dist_t)
+
+    monkeypatch.setattr(
+        mamba_op_utils,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"layers.0": meta_pooled}),
+    )
+    slots_fc, _, _, _ = mamba_op_utils.extract_mamba_step_metadata("layers.0")
+    assert torch.equal(slots_fc, torch.tensor([7, 4], dtype=torch.int32))
