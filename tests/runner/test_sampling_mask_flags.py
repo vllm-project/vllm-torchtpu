@@ -252,37 +252,184 @@ def test_warmup_compiles_every_flag_combination(monkeypatch):
     expected = [(True, True, True)] + [(False, *f) for f in MASK_FLAG_COMBINATIONS]
     assert warmed == expected * 2
 
-    rejected = []
+
+def _signature(args, kwargs):
+    """Dtype and shape of each tensor argument, and every other value."""
+
+    def describe(value):
+        if isinstance(value, torch.Tensor):
+            return value.dtype, tuple(value.shape)
+        return value
+
+    return [describe(a) for a in args], {k: describe(v) for k, v in kwargs.items()}
+
+
+def _flags_of(signature):
+    return signature[1]["use_top_k"], signature[1]["use_top_p"]
+
+
+def _verify_runner(top_k, top_p, samples, rejections):
+    """A runner whose samplers and gathers run eagerly and record their inputs."""
+    runner = _params_runner(top_k, top_p)
+    runner._build_padded_sampling_params = runner.build
+    runner._apply_temperature = MethodType(TPUModelRunner._apply_temperature, runner)
+    sample = MethodType(TPUModelRunner.sample_from_logits.__wrapped__, runner)
+
+    def sample_from_logits(*args, **kwargs):
+        samples.append(_signature(args, kwargs))
+        return sample(*args, **kwargs)
 
     def rejection_sampler(**kwargs):
         if kwargs.get("do_sampling"):
-            rejected.append((kwargs["use_top_k"], kwargs["use_top_p"]))
+            rejections.append(_signature((), kwargs))
         return torch.zeros((2, 2), dtype=torch.int32)
 
-    runner = SimpleNamespace(
+    runner.sample_from_logits_func = sample_from_logits
+    runner.rejection_sampler = _RejectionSampler(rejection_sampler)
+    runner._greedy_sample = MethodType(TPUModelRunner._greedy_sample, runner)
+    for name in (
+        "spec_bonus_and_target_token_ids",
+        "spec_gather_bonus_and_target_logits",
+    ):
+        method = getattr(TPUModelRunner, name).__wrapped__
+        setattr(runner, name, MethodType(method, runner))
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=1)
+    return runner
+
+
+def test_rejection_warmup_matches_the_verify_step_inputs(monkeypatch):
+    """Each non-greedy rejection program the precompile warms gets the dtypes,
+    shapes and flags a verify step passes, so the step finds it compiled. The
+    bonus tokens are sample_from_logits' int64, not the greedy prelude's int32.
+    """
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **kw: None)
+    rows, reqs, dtype = 4, 2, torch.bfloat16
+    warm_samples, warm_rejections = [], []
+    runner = _verify_runner([0, 0], [1.0, 1.0], warm_samples, warm_rejections)
+    runner.__dict__.update(
         _is_async_drafter=True,
-        speculative_config=SimpleNamespace(num_speculative_tokens=1),
-        rejection_sampler=_RejectionSampler(rejection_sampler),
-        num_tokens_paddings=[4],
-        num_reqs_paddings=[2],
-        max_num_reqs=2,
+        num_tokens_paddings=[rows],
+        num_reqs_paddings=[reqs],
+        max_num_reqs=reqs,
         _fused_greedy_head=None,
-        vocab_size=VOCAB,
-        _hidden_states_dtype=torch.float32,
+        _hidden_states_dtype=dtype,
         device=torch.device("cpu"),
-        _spec_verify_bucket_reachable=lambda tokens, reqs: True,
-        spec_bonus_and_target_token_ids=lambda logits, b, t: (
-            torch.zeros(b.shape[0], dtype=torch.int32),
-            torch.zeros(t.shape[0], dtype=torch.int32),
-        ),
-        spec_gather_bonus_and_target_logits=lambda logits, b, t: (
-            logits[: b.shape[0]],
-            logits,
-        ),
-        _greedy_sample=lambda logits: torch.zeros(
-            (logits.shape[0], 1), dtype=torch.int32
-        ),
+        _spec_verify_bucket_reachable=lambda tokens, n: True,
         _precompile_timed=lambda name: contextlib.nullcontext(),
     )
     TPUModelRunner._precompile_rejection_sampler(runner)
-    assert rejected == list(MASK_FLAG_COMBINATIONS)
+    assert [_flags_of(r) for r in warm_rejections] == list(MASK_FLAG_COMBINATIONS)
+    bonus_samples = [s for s in warm_samples if not s[1]["all_greedy"]]
+    assert [_flags_of(s) for s in bonus_samples] == list(MASK_FLAG_COMBINATIONS)
+
+    md = SimpleNamespace(
+        bonus_logits_indices=torch.zeros(reqs, dtype=torch.int32),
+        target_logits_indices=torch.zeros(rows, dtype=torch.int32),
+        draft_token_ids=torch.zeros(rows, dtype=torch.int32),
+        draft_lengths=torch.zeros(reqs, dtype=torch.int32),
+        segment_ids=torch.zeros(rows, dtype=torch.int64),
+        group_indices=torch.zeros(rows, dtype=torch.int32),
+    )
+    for flags, warm_sample, warm_rejection in zip(
+        MASK_FLAG_COMBINATIONS, bonus_samples, warm_rejections
+    ):
+        samples, rejections = [], []
+        runner = _verify_runner(
+            [3 if flags[0] else 0, 0],
+            [0.5 if flags[1] else 1.0, 1.0],
+            samples,
+            rejections,
+        )
+        TPUModelRunner._sample_spec_verify_chunk(
+            runner,
+            torch.zeros((rows, VOCAB), dtype=dtype),
+            md,
+            grammar_output=None,
+            scheduler_output=SimpleNamespace(),
+            cur_start_idx=0,
+            cur_end_idx=2,
+            all_greedy=False,
+            sampling_generator=None,
+        )
+        assert samples == [warm_sample]
+        assert rejections == [warm_rejection]
+        assert rejections[0][1]["bonus_token_ids"] == (torch.int64, (reqs,))
+
+
+def _capture_warmup_requests(monkeypatch):
+    """A runner whose warmup steps record their new requests' SamplingParams."""
+    monkeypatch.setattr(tpu_runner, "_spec_warmup_group_num_blocks", lambda *a: 1)
+    params = []
+
+    def execute_model(scheduler_output):
+        params.extend(r.sampling_params for r in scheduler_output.scheduled_new_reqs)
+
+    runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=1),
+        kv_cache_config=SimpleNamespace(num_blocks=64, kv_cache_groups=[None]),
+        max_model_len=64,
+        max_num_tokens=64,
+        max_num_reqs=4,
+        execute_model=execute_model,
+        sample_tokens=lambda grammar_output: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+    )
+    return runner, params
+
+
+def _flags_of_request(sampling_params):
+    """The step flags a request with these SamplingParams gives its chunk."""
+    runner = _params_runner([sampling_params.top_k], [sampling_params.top_p])
+    params = runner.build(0, 1, torch.zeros((1, VOCAB)))
+    return params.use_top_k, params.use_top_p
+
+
+@pytest.mark.parametrize("mask_flags", MASK_FLAG_COMBINATIONS)
+def test_spec_warmup_requests_set_the_masks_they_warm(monkeypatch, mask_flags):
+    """A non-greedy warmup request runs the real verify step with the top-k and
+    top-p flags it is asked to warm."""
+    runner, params = _capture_warmup_requests(monkeypatch)
+    assert TPUModelRunner._warmup_one_spec_request(
+        runner, 8, idx=0, greedy=False, mask_flags=mask_flags
+    )
+    TPUModelRunner._warmup_spec_batch(
+        runner, 2, 8, greedy=False, short=True, mask_flags=mask_flags
+    )
+    assert len(params) == 3
+    for sampling_params in params:
+        assert sampling_params.temperature == 1.0
+        assert _flags_of_request(sampling_params) == mask_flags
+
+
+def test_spec_warmup_runs_every_flag_combination(monkeypatch):
+    """The real spec-decode warmup runs the greedy path and the non-greedy path
+    once per flag combination, for single requests and for batches."""
+    monkeypatch.setattr(tpu_runner.envs, "SPEC_WARMUP", True, raising=False)
+    single, batched = [], []
+
+    def warmup_one_spec_request(P, idx, quiet=False, greedy=True, mask_flags=None):
+        single.append((P, greedy, mask_flags))
+        return True
+
+    def warmup_spec_batch(R, P, greedy=True, mask_flags=None):
+        batched.append((R, greedy, mask_flags))
+
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        _is_async_drafter=True,
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_xla_graphs=0,
+        _precompile_timed=lambda name: contextlib.nullcontext(),
+        num_tokens_paddings=[8, 16],
+        num_reqs_paddings=[1, 2, 4],
+        max_model_len=64,
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        drafter=SimpleNamespace(),
+        _warmup_one_spec_request=warmup_one_spec_request,
+        _warmup_spec_batch=warmup_spec_batch,
+    )
+    TPUModelRunner._warmup_spec_decode(runner)
+    variants = [(True, (False, False))] + [(False, f) for f in MASK_FLAG_COMBINATIONS]
+    assert single == [(P, *v) for P in (8, 16) for v in variants]
+    assert batched == [(R, *v) for R in (2, 4) for v in variants]
