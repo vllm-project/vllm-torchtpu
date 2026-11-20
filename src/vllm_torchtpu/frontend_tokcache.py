@@ -386,31 +386,24 @@ class PrefixTokenCache:
 _INSTALLED = False
 
 
-def _rust_backend(tokenizer):
-    """The ``tokenizers.Tokenizer`` behind a Hugging Face fast tokenizer, or
-    None (``backend_tokenizer`` is the public name, ``_tokenizer`` the
-    attribute behind it)."""
-    return getattr(tokenizer, "backend_tokenizer", None) or getattr(
-        tokenizer, "_tokenizer", None
-    )
-
-
 def _build_cache_for(
     tokenizer, max_tokens: int = MAX_TOKENS
 ) -> PrefixTokenCache | None:
     """Create the cache around a private copy of the Rust tokenizer."""
     try:
         from tokenizers import Tokenizer
+        from transformers import PreTrainedTokenizerFast
     except Exception:  # pragma: no cover
         return None
-    backend = _rust_backend(tokenizer)
-    if backend is None or not isinstance(backend, Tokenizer):
+    if not isinstance(tokenizer, PreTrainedTokenizerFast):
         logger.warning(
-            "%s tokenizer %s has no Rust backend; not enabled",
+            "%s tokenizer %s is not a Hugging Face fast tokenizer, so it has no "
+            "Rust backend to copy; not enabled",
             _LOG_PREFIX,
             type(tokenizer).__name__,
         )
         return None
+    backend: Tokenizer = tokenizer.backend_tokenizer
     boundary_id = tokenizer.convert_tokens_to_ids(BOUNDARY)
     if not isinstance(boundary_id, int) or boundary_id < 0:
         logger.warning("%s %s not in vocab; not enabled", _LOG_PREFIX, BOUNDARY)
@@ -468,8 +461,8 @@ def maybe_install_tokenize_prefix_cache(max_tokens: int = MAX_TOKENS) -> bool:
 
     orig = rbase.BaseRenderer._tokenize_prompt
     cache_lock = threading.Lock()
-    # "off": set by the first unexpected error; from then on every prompt takes
-    # vLLM's own tokenization.
+    # "off": set by the first unexpected error or a verify mismatch; from then
+    # on every prompt takes vLLM's own tokenization and the cache is dropped.
     state: dict = {"cache": None, "tried": False, "off": False}
 
     def _get_cache(renderer):
@@ -503,7 +496,11 @@ def maybe_install_tokenize_prefix_cache(max_tokens: int = MAX_TOKENS) -> bool:
                 kw = params.get_encode_kwargs()
                 if set(kw) <= {"truncation", "max_length", "add_special_tokens"}:
                     cache = _get_cache(self)
-                    if cache is not None and not cache.disabled:
+                    if cache is not None and cache.disabled:
+                        # A verify mismatch turned it off for good: free its entries.
+                        state["off"] = True
+                        state["cache"] = None
+                    elif cache is not None:
                         ids = cache.encode(prompt["prompt"])
                         max_len = kw.get("max_length")
                         if not (
@@ -515,8 +512,9 @@ def maybe_install_tokenize_prefix_cache(max_tokens: int = MAX_TOKENS) -> bool:
         except Exception as e:  # never break serving
             # The first unexpected error turns the cache off for good: a vLLM
             # change that breaks this wrapper would otherwise fail, and log, on
-            # every request.
+            # every request. Dropping the cache frees its entries.
             state["off"] = True
+            state["cache"] = None
             logger.warning(
                 "%s %s in the cached tokenization (%s); the cache is off and "
                 "every prompt now uses vLLM's tokenization",
