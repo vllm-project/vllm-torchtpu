@@ -65,19 +65,12 @@ def test_large_pipe_holds_a_vllm_config_sized_payload():
         os.close(w)
 
 
-@pytest.mark.parametrize(
-    "local_world_size, switch", [(1, None), (8, "0")], ids=["one-worker", "off"]
-)
-def test_the_default_pipes_are_kept(monkeypatch, local_world_size, switch):
+def test_one_worker_keeps_the_default_pipes():
     """One local worker has no start to overlap with, so its pipes stay
     default-sized instead of keeping 1 MiB charged to the user for its
-    lifetime; TPU_PARALLEL_WORKER_SPAWN=0 keeps them default-sized too."""
-    if switch is None:
-        monkeypatch.delenv("TPU_PARALLEL_WORKER_SPAWN", raising=False)
-    else:
-        monkeypatch.setenv("TPU_PARALLEL_WORKER_SPAWN", switch)
-    assert spawn_pipe_size(local_world_size) == 0
-    with exclusive_spawn(local_world_size):
+    lifetime."""
+    assert spawn_pipe_size(1) == 0
+    with exclusive_spawn(1):
         assert popen_spawn_posix.os is os
 
 
@@ -101,12 +94,34 @@ def test_multi_worker_pipes_are_1_mib_capped_at_the_system_maximum(monkeypatch):
     assert spawn_pipe_size(8) == 512 << 10
 
 
-def test_an_unreadable_pipe_max_size_requests_1_mib(monkeypatch):
+@pytest.mark.parametrize(
+    "error",
+    [OSError("ENOENT"), ValueError("not a number")],
+    ids=["oserror", "valueerror"],
+)
+def test_an_unreadable_pipe_max_size_requests_1_mib_and_warns(monkeypatch, error):
+    calls = []
+    monkeypatch.setattr(
+        worker_spawn.logger,
+        "warning_once",
+        lambda msg, *args, **kwargs: calls.append((msg, args)),
+    )
+
     def unreadable():
-        raise OSError("ENOENT")
+        raise error
 
     monkeypatch.setattr(worker_spawn, "_pipe_max_size", unreadable)
     assert spawn_pipe_size(8) == 1 << 20
+
+    assert len(calls) == 1
+    msg, args = calls[0]
+    assert msg % args == (
+        f"Could not read /proc/sys/fs/pipe-max-size ({error}); requesting "
+        f"{1 << 20}-byte worker spawn pipes."
+    )
+    # warning_once caches on its args: an exception object would warn again
+    # on every call and keep the traceback alive.
+    assert [type(a) for a in args] == [str, int]
 
 
 def test_a_failed_resize_falls_back_and_warns_with_plain_args(monkeypatch):
@@ -203,18 +218,9 @@ def patched_spawn(monkeypatch):
     return install, calls
 
 
-@pytest.mark.parametrize(
-    "local_world_size, switch", [(1, None), (8, "0")], ids=["one-worker", "off"]
-)
-def test_the_spawn_wrapper_keeps_the_real_os(
-    patched_spawn, monkeypatch, local_world_size, switch
-):
-    """One local worker, or the switch off: the wrapper still serializes the
-    binding env writes, but popen_spawn_posix keeps the real os module."""
-    if switch is None:
-        monkeypatch.delenv("TPU_PARALLEL_WORKER_SPAWN", raising=False)
-    else:
-        monkeypatch.setenv("TPU_PARALLEL_WORKER_SPAWN", switch)
+def test_the_spawn_wrapper_keeps_the_real_os_for_one_worker(patched_spawn):
+    """One local worker: the wrapper still serializes the binding env writes,
+    but popen_spawn_posix keeps the real os module."""
     install, seen = patched_spawn
 
     def make_worker_process(vllm_config, local_rank, rank, *args, **kwargs):
@@ -222,9 +228,7 @@ def test_the_spawn_wrapper_keeps_the_real_os(
         return "handle"
 
     spawn = install(make_worker_process)
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(local_world_size=local_world_size)
-    )
+    config = SimpleNamespace(parallel_config=SimpleNamespace(local_world_size=1))
     assert spawn(config, 0, 0) == "handle"
 
     assert seen == [os]

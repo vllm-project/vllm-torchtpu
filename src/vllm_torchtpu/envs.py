@@ -204,7 +204,6 @@ if TYPE_CHECKING:
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
     VLLM_TPU_DEBUG_PCP_LAYOUT: bool = False
     TPU_LOCAL_RANK_OFFSET: int = 0
-    TPU_PARALLEL_WORKER_SPAWN: bool = True
     VLLM_TPU_DEVICE_ORDER: str = ""
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
     TORCH_TPU_BASE_PORT: int = 8070
@@ -1265,9 +1264,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Added to every worker's local rank when it binds to a physical chip.
     # worker/tpu_rank_binding.py reads it from the env mapping it is given.
     "TPU_LOCAL_RANK_OFFSET": env_int("TPU_LOCAL_RANK_OFFSET", 0),
-    # Start a host's multiproc workers in parallel (executors/worker_spawn.py).
-    # 0 restores the serial, rank-ordered start; on by default.
-    "TPU_PARALLEL_WORKER_SPAWN": env_bool("TPU_PARALLEL_WORKER_SPAWN", default=True),
     # Physical device index per local rank ("0,2,1,3,4,6,5,7"); empty = native.
     "VLLM_TPU_DEVICE_ORDER": lambda: os.getenv("VLLM_TPU_DEVICE_ORDER", ""),
     # Same offset for the legacy worker init path; debug only.

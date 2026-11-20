@@ -683,11 +683,13 @@ def _patch_multiproc_worker_global_rank_env() -> None:
     this shim exposes the unified single-host DP*TP slice to TorchTPU without
     changing the worker rank arguments passed through vLLM.
     """
+    import contextlib
     import os as _os
 
+    from vllm.utils.system_utils import set_env_var
     from vllm.v1.executor.multiproc_executor import WorkerProc
 
-    from vllm_torchtpu.executors.worker_spawn import exclusive_spawn, spawn_env
+    from vllm_torchtpu.executors.worker_spawn import exclusive_spawn
     from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
     if getattr(WorkerProc, "_tpu_global_rank_env_patch", False):
@@ -737,7 +739,9 @@ def _patch_multiproc_worker_global_rank_env() -> None:
             )
             # The child copies os.environ when it starts; restore the parent's
             # afterwards so this binding does not leak into the next spawn.
-            with spawn_env(env):
+            with contextlib.ExitStack() as stack:
+                for name, value in env.items():
+                    stack.enter_context(set_env_var(name, value))
                 return _orig(vllm_config, local_rank, rank, *args, **kwargs)
 
     WorkerProc.make_worker_process = staticmethod(_wrapped)

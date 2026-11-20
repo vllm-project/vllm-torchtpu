@@ -31,9 +31,6 @@ size is bounded. The fix holds while the payload fits; a larger payload blocks
 again and the starts serialize as before. If a pipe cannot be resized, that
 spawn keeps the default pipe and a warning is logged once.
 
-`TPU_PARALLEL_WORKER_SPAWN=0` turns this off and restores the serial,
-rank-ordered start (`TpuMultiprocExecutor._can_start_workers_concurrently`).
-
 DP engine cores, which vLLM's `CoreEngineProcManager` starts with the same
 payload, are not covered.
 
@@ -54,7 +51,6 @@ import os
 import threading
 from collections.abc import Iterator
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -111,9 +107,9 @@ def spawn_pipe_size(local_world_size: int) -> int:
     """Bytes requested for each spawn pipe; 0 leaves the pipes alone.
 
     A single local worker has no start to overlap with, so its pipes keep the
-    default size; so do all spawns with TPU_PARALLEL_WORKER_SPAWN=0.
+    default size.
     """
-    if local_world_size <= 1 or not envs.TPU_PARALLEL_WORKER_SPAWN:
+    if local_world_size <= 1:
         return 0
     try:
         return min(_SPAWN_PIPE_BYTES, _pipe_max_size())
@@ -134,29 +130,6 @@ def exclusive_spawn(local_world_size: int) -> Iterator[None]:
     starts more than one worker."""
     with _SPAWN_LOCK, _large_spawn_pipes(local_world_size):
         yield
-
-
-@contextlib.contextmanager
-def spawn_env(values: dict[str, str]) -> Iterator[None]:
-    """Set `values` in os.environ for one spawn, then restore what was there.
-
-    The child copies the environment when it starts, so the parent need not
-    keep a worker's binding afterwards; restoring it keeps one spawn's values
-    from reaching the next spawn or the parent's own later code. Use inside
-    `exclusive_spawn`: os.environ is process-wide.
-    """
-    # A snapshot to put back, not a config read (those go through envs.py).
-    before = os.environ.copy()
-    saved = {name: before.get(name) for name in values}
-    os.environ.update(values)
-    try:
-        yield
-    finally:
-        for name, old in saved.items():
-            if old is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = old
 
 
 @contextlib.contextmanager
