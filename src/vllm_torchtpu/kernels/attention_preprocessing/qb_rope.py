@@ -12,7 +12,9 @@ coefficients from VMEM.
 Every block size comes from a ``QBRopeConfig`` (tuning table or
 ``default_config``). The FP8 qr encoding and RoPE coefficients of a whole
 token segment stay resident in VMEM, so long inputs run as several segments,
-each writing its rows of one aliased output.
+each writing its rows of one aliased output. Small single-tile calls can read
+their first head pairs from an XLA-staged VMEM copy (``head``) instead of
+streaming them.
 """
 
 import functools
@@ -29,7 +31,9 @@ from vllm_torchtpu.kernels.attention_preprocessing.rope_gather import (
     _quantize_rows,
 )
 from vllm_torchtpu.kernels.attention_preprocessing.tuned_block_sizes import (
+    QB_RESIDENT_HEAD_PAIRS,
     QB_ROPE_TUNING,
+    RESIDENT_WEIGHT_MAX_TOKENS,
     QBRopeConfig,
 )
 
@@ -37,6 +41,9 @@ from vllm_torchtpu.kernels.attention_preprocessing.tuned_block_sizes import (
 # stored into it (token tiles, quantization fragments) must be a multiple of 32.
 _ROW_ALIGN = 32
 _BF16_ROW_TILE = 16  # rows of one BF16 (16, 128) tile
+# Headroom over the ``vmem_bytes`` estimate when the call asks only for what it
+# needs (as in qa_rope).
+_VMEM_MARGIN = 8 * 1024 * 1024
 
 
 def _qb_rope_kernel(
@@ -54,7 +61,11 @@ def _qb_rope_kernel(
     aliased,
     last_rows,
     real_rows,
+    resident_head,
 ):
+    head_ref = None
+    if resident_head:
+        head_ref, *refs = refs
     if aliased:
         refs = refs[1:]  # the aliased input is read and written as the output
     (
@@ -94,13 +105,16 @@ def _qb_rope_kernel(
 
     # Weights stream per head pair on their own DMA priority, so row loads and
     # output copies (priority 0) never queue behind them. Window 0 is issued
-    # up front; window w+1 is issued pair by pair during window w's first tile.
+    # up front (past the pairs the resident head holds); window w+1 is issued
+    # pair by pair during window w's first tile.
+    head_pairs = 0 if head_ref is None else head_ref.shape[1] // (2 * head_dim)
+
     @pl.when(step == 0)
     def prologue():
         def issue(pair, _):
             weight_copy(0, pair).start(priority=1)
 
-        jax.lax.fori_loop(0, pairs, issue, None)
+        jax.lax.fori_loop(head_pairs, pairs, issue, None)
 
     @pl.when(window == 0)
     def prepare_rows():
@@ -171,15 +185,35 @@ def _qb_rope_kernel(
             def _():
                 weight_copy(window + 1, pair).start(priority=1)
 
-            weight_copy(window, pair).wait()
+            if head_ref is None:
+                weight_copy(window, pair).wait()
+            else:
+                streamed = jnp.logical_or(window > 0, pair >= head_pairs)
+                pl.when(streamed)(weight_copy(window, pair).wait)
 
         tokens = pl.ds(token_start, tb)
-        weights = weight_ref.at[window % 2, pair]
-        for half in range(2):
-            products[parity][half] = jnp.dot(
-                encoded_ref[tokens, :],
-                weights[:, pl.ds(half * head_dim, head_dim)],
-                preferred_element_type=jnp.float32,
+
+        def project(weights):
+            for half in range(2):
+                products[parity][half] = jnp.dot(
+                    encoded_ref[tokens, :],
+                    weights[:, pl.ds(half * head_dim, head_dim)],
+                    preferred_element_type=jnp.float32,
+                )
+
+        if head_ref is None:
+            project(weight_ref.at[window % 2, pair])
+        else:
+            resident = jnp.logical_and(window == 0, pair < head_pairs)
+            columns = pl.ds(
+                pl.multiple_of(
+                    jnp.minimum(pair, head_pairs - 1) * 2 * head_dim, 2 * head_dim
+                ),
+                2 * head_dim,
+            )
+            pl.when(resident)(lambda: project(head_ref.at[:, columns]))
+            pl.when(jnp.logical_not(resident))(
+                lambda: project(weight_ref.at[window % 2, pair])
             )
 
     def post(g, parity):
@@ -255,8 +289,11 @@ def _qb_rope_kernel(
             dma(last - back, "wait")
 
 
-def vmem_bytes(config: QBRopeConfig, segment, rank, heads, head_dim=512):
-    """Upper estimate of one segment call's VMEM (lane/sublane padding included)."""
+def vmem_bytes(
+    config: QBRopeConfig, segment, rank, heads, head_dim=512, row_pads=False
+):
+    """Upper estimate of one segment call's VMEM (lane/sublane padding included);
+    ``row_pads``: the call zero-pads its rows in VMEM scratch."""
     tb, hb = config.token_block, config.head_block
     resident = segment * (rank + 4 * _LANE + 2 * 4 * _LANE)  # FP8 qr, row scale, coeff
     weights = 2 * rank * hb * head_dim  # FP8 window, double-buffered
@@ -265,7 +302,10 @@ def vmem_bytes(config: QBRopeConfig, segment, rank, heads, head_dim=512):
     out_slots = config.output_slots * tb * head_dim * 4
     rope_rows = 2 * tb * _LANE * 4  # double-buffered input tile
     scales = heads * head_dim * 4
-    return resident + weights + qr_tiles + products + out_slots + rope_rows + scales
+    pads = tb * (rank * 2 + _LANE * 4) if row_pads else 0
+    return (
+        resident + weights + qr_tiles + products + out_slots + rope_rows + scales + pads
+    )
 
 
 def _largest_divisor(n, cap, multiple):
@@ -353,9 +393,11 @@ def _segment_call(
     head_dim,
     out_tokens,
     real_rows=None,
+    head=None,
 ):
     """``real_rows``: ``qr``/``rope_rows`` hold that many rows of one tile,
-    zero-padded to it in VMEM."""
+    zero-padded to it in VMEM. ``head``: window 0's weight columns, read from
+    VMEM instead of streamed."""
     tokens, rank = qr.shape
     heads = weight.shape[1] // head_dim
     tb, hb = config.token_block, config.head_block
@@ -386,6 +428,17 @@ def _segment_call(
         )
     )
     operands = [qr, weight, weight_scale, rope_rows]
+    vmem_limit = config.vmem_limit_bytes
+    if head is not None:
+        in_specs.append(pl.BlockSpec(head.shape, lambda h, t, *_: (0, 0), once))
+        operands.append(head)
+        # XLA stages the head into VMEM ahead of the call only if it fits
+        # beside the call's scoped VMEM, so ask for what the call needs.
+        vmem_limit = min(
+            vmem_limit - head.size * head.dtype.itemsize,
+            vmem_bytes(config, segment, rank, heads, head_dim, real_rows is not None)
+            + _VMEM_MARGIN,
+        )
     aliases = {}
     if out is not None:
         in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))
@@ -421,15 +474,19 @@ def _segment_call(
         aliased=out is not None,
         last_rows=last_rows,
         real_rows=real_rows,
+        resident_head=head is not None,
     )
     return pl.pallas_call(
         kernel,
         grid_spec=grid_spec,
-        out_shape=jax.ShapeDtypeStruct((out_tokens, heads, head_dim), jnp.bfloat16),
+        # The output DMAs address a u32 head-pair view of an HBM buffer, so
+        # XLA must not place the output in VMEM (it will when the call's
+        # scoped VMEM leaves room).
+        out_shape=pltpu.HBM((out_tokens, heads, head_dim), jnp.bfloat16),
         input_output_aliases=aliases,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary", "arbitrary"),
-            vmem_limit_bytes=config.vmem_limit_bytes,
+            vmem_limit_bytes=vmem_limit,
         ),
         name=f"qb_rope_t{tb}_h{hb}_s{config.output_slots}",
     )(*operands)
@@ -444,6 +501,7 @@ def fused_qb_rope(
     head_dim: int = 512,
     config: QBRopeConfig | None = None,
     exact_rows: bool = False,
+    head: jax.Array | None = None,
 ) -> jax.Array:
     """Return BF16 Q[tokens, heads, head_dim] for normalized BF16 ``qr``.
 
@@ -453,6 +511,13 @@ def fused_qb_rope(
     packed cos/sin cache. Token counts that are not a multiple of 32 are
     zero-padded internally; ``exact_rows`` writes only the real rows instead of
     slicing a padded result (same values, one copy fewer).
+
+    ``head`` is an optional copy of the first head pairs' columns of
+    ``weight`` (``head_columns(...)`` wide). A call of one token tile of at
+    most ``RESIDENT_WEIGHT_MAX_TOKENS`` rows whose first head window covers
+    them reads those pairs as a VMEM input, which XLA can stage while earlier
+    ops run, instead of starting with their weight DMAs; other calls stream
+    ``weight`` alone.
     """
     _check_projection_shapes(qr, weight, weight_scale)
     if head_dim <= 0 or weight.shape[1] % head_dim or head_dim % _LANE:
@@ -465,10 +530,11 @@ def fused_qb_rope(
         config = select_config(padded, rank, weight.shape[1], heads)
     segment = _segment_tokens(config, padded, rank, heads, head_dim)
     check_config(config, segment, heads)
+    one_tile = config.token_block == segment == padded
     # One token tile pads its rows in VMEM, where qr rows store in BF16 tiles.
     real_rows = None
     if padded != tokens:
-        if tokens % _BF16_ROW_TILE == 0 and config.token_block == segment == padded:
+        if tokens % _BF16_ROW_TILE == 0 and one_tile:
             real_rows = tokens
         else:
             qr = jnp.pad(qr, ((0, padded - tokens), (0, 0)))
@@ -476,6 +542,23 @@ def fused_qb_rope(
     weight_scale = weight_scale.reshape(-1)
     # Output DMAs move whole (8, 128) tiles of rows.
     out_tokens = tokens if exact_rows and tokens % 8 == 0 else padded
+    if head is not None:
+        columns = head.shape[1]
+        if (
+            head.shape[0] != rank
+            or head.dtype != weight.dtype
+            or not 0 < columns <= weight.shape[1]
+            or columns % (2 * head_dim)
+        ):
+            raise ValueError(
+                f"head must be a {weight.dtype} [{rank}, k * {2 * head_dim}] prefix"
+            )
+        if not (
+            one_tile
+            and padded <= RESIDENT_WEIGHT_MAX_TOKENS
+            and config.head_block * head_dim >= columns
+        ):
+            head = None
     out = None
     for offset in range(0, padded, segment):
         out = _segment_call(
@@ -490,9 +573,17 @@ def fused_qb_rope(
             head_dim=head_dim,
             out_tokens=out_tokens,
             real_rows=real_rows,
+            head=head,
         )
     assert out is not None
     return out if out_tokens == tokens else out[:tokens]
+
+
+def head_columns(rank: int, heads: int, head_dim: int = 512) -> int:
+    """Width of ``fused_qb_rope``'s ``head``: the first head pairs of the
+    single-tile (decode) configuration's first window."""
+    window = default_config(_ROW_ALIGN, rank, heads).head_block * head_dim
+    return min(window, QB_RESIDENT_HEAD_PAIRS * 2 * head_dim)
 
 
 def _check_projection_shapes(qr, weight, scale):

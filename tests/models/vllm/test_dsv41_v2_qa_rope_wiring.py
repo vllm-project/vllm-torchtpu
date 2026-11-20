@@ -207,4 +207,4 @@ def test_bridges_have_fully_annotated_signatures():
         assert all(p.default is p.empty for p in params), fn
         assert all(p.annotation is jax.Array for p in params), fn
     counts = [len(inspect.signature(fn).parameters) for fn in functions]
-    assert counts == [2, 2, 6, 6, 4, 6, 9, 10]
+    assert counts == [2, 2, 6, 6, 5, 6, 9, 10]

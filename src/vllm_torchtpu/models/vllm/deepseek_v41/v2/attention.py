@@ -1567,7 +1567,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if self._fused_preprocess:
             # Shares the step's gathered rows with the Q-A/KV kernel.
             q = preprocess_ops.qb_rope()(
-                qr, self.wq_b.weight, self.wq_b.weight_scale, self._rope_rows(positions)
+                qr,
+                self.wq_b.weight,
+                self.wq_b.weight_scale,
+                self._wq_b_head,
+                self._rope_rows(positions),
             )
         else:
             # V4.1 normalizes qr before projection; neither route renormalizes q.
@@ -1999,6 +2003,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if self._fused_preprocess:
             self._flip_compressor_weight()
             self._check_fused_weights()
+            # A copy: rebuilt here whenever wq_b is (re)loaded.
+            head = preprocess_ops.qb_rope_head(self.wq_b.weight)
+            if head.device.type == "tpu":
+                synchronize_tensors([head])
+            self.register_buffer("_wq_b_head", head, persistent=False)
             # Register before TorchDynamo captures the first model forward.
             eps = self.kv_norm.variance_epsilon
             preprocess_ops.rope_rows()

@@ -231,3 +231,35 @@ def test_vmem_row_pad_is_bitwise(tokens):
         np.testing.assert_array_equal(
             np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16)
         )
+
+
+@pytest.mark.parametrize(
+    ("tokens", "used"), [(16, True), (64, True), (256, False), (1024, False)]
+)
+def test_head_is_read_only_by_one_tile_calls(tokens, used):
+    columns = qb_rope.head_columns(1280, 64)
+    head = jax.ShapeDtypeStruct((1280, columns), jnp.float8_e4m3fn)
+    run = functools.partial(qb_rope.fused_qb_rope, exact_rows=True)
+    jaxpr = jax.make_jaxpr(lambda *a: run(*a[:4], head=a[4]))(*_shapes(tokens), head)
+    calls = [e for e in jaxpr.eqns if e.primitive.name == "pallas_call"]
+    shapes = {tuple(v.aval.shape) for e in calls for v in e.invars}
+    assert ((1280, columns) in shapes) == used
+
+
+@pytest.mark.parametrize(
+    ("tokens", "pairs"),
+    [(16, 1), (16, 2), (16, 4), (16, 8), (40, 4), (64, 4), (1024, 4)],
+)
+def test_resident_head_is_bitwise(tokens, pairs):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Requires a TPU backend")
+    positions = (np.arange(tokens) * 37) % 4096
+    qr, weight, scale, rows = _inputs(tokens, 64, positions)
+    head = weight[:, : pairs * 1024]
+    for exact_rows in (False, True):
+        run = functools.partial(qb_rope.fused_qb_rope, exact_rows=exact_rows)
+        expected = jax.jit(run)(qr, weight, scale, rows)
+        actual = jax.jit(functools.partial(run, head=head))(qr, weight, scale, rows)
+        np.testing.assert_array_equal(
+            np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16)
+        )

@@ -287,7 +287,7 @@ def test_register_matching_signatures_donations_and_names(monkeypatch):
     compress = {k: v for k, v in registered.items() if "compress" in k}
     assert sorted(compress.values()) == [(6, ()), (9, (6,)), (10, (6, 7))]
     assert registered["pallas::dsv41_rope_rows"] == (2, ())
-    assert registered["pallas::dsv41_qb_rope"] == (4, ())
+    assert registered["pallas::dsv41_qb_rope"] == (5, ())
     qa = [k for k in registered if "qa_kv_norm_rope" in k]
     assert len(qa) == 4 and len(registered) == 9
 

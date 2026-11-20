@@ -164,7 +164,11 @@ def qa_rope(emit_qr: bool, eps: float) -> Any:
 
 
 def _qb(
-    qr: jax.Array, weight: jax.Array, weight_scale: jax.Array, rope_rows: jax.Array
+    qr: jax.Array,
+    weight: jax.Array,
+    weight_scale: jax.Array,
+    weight_head: jax.Array,
+    rope_rows: jax.Array,
 ) -> jax.Array:
     if not qr.shape[0]:
         return jnp.zeros((0, weight.shape[1] // _HEAD_DIM, _HEAD_DIM), jnp.bfloat16)
@@ -174,16 +178,25 @@ def _qb(
         weight_scale,
         rope_rows,
         exact_rows=envs.TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS,
+        head=weight_head,
     )
 
 
-def _qb_fake(qr, weight, weight_scale, rope_rows):
+def _qb_fake(qr, weight, weight_scale, weight_head, rope_rows):
     return qr.new_empty((qr.shape[0], weight.shape[1] // _HEAD_DIM, _HEAD_DIM))
 
 
 def qb_rope() -> Any:
-    """``(qr, w, scale, rope_rows) -> q [T, heads, 512]`` with RoPE applied."""
+    """``(qr, w, scale, w_head, rope_rows) -> q [T, heads, 512]`` with RoPE
+    applied; ``w_head`` is ``qb_rope_head(w)``."""
     return _get("qb_rope", lambda: (_qb, _qb_fake))
+
+
+def qb_rope_head(weight: torch.Tensor) -> torch.Tensor:
+    """The ``head`` columns ``qb_rope`` reads from VMEM: a copy, made at load."""
+    rank, width = weight.shape
+    columns = qb_kernel.head_columns(rank, width // _HEAD_DIM, _HEAD_DIM)
+    return weight[:, :columns].contiguous()
 
 
 def _compress(ratio, eps, x, weight, gamma, rows, has_prev, valid, *state_and_ring):
