@@ -907,10 +907,13 @@ def _run_case(name, mode, result_rows):
     valid = [real - (short if d % 2 else 0) for d in range(D)]
     config = Config(result_rows=result_rows, sorted_rows=sorted_rows)
     shard_index = jnp.arange(D, dtype=jnp.int32).reshape(D, 1) if bridge else None
+    # The rows past each shard's valid count reach the layer as NaN.
+    padding = np.ones((x.shape[0], 1), bool)
+    padding[_valid_rows(real, valid)] = False
 
     def run(x, w1, w2, s1, s2, logits):
         return fused_ep_moe(
-            x,
+            jnp.where(padding, jnp.nan, x),
             w1,
             w2,
             s1,
@@ -954,10 +957,15 @@ RUNS = [
 def test_fused_ep_moe_matches_the_reference(eight_tpu7x_cores, mode, name, result_rows):
     """Every value within one bf16 step of the reference, except fewer than
     1 in 1000. The same check must fail on the layer's own output with two
-    tokens' rows swapped, and with one row zeroed."""
+    tokens' rows swapped, and with one row zeroed. The rows past a shard's
+    valid count (short_shards) reach the layer as NaN, route nowhere and
+    must come back exactly zero."""
     got, want, rows = _run_case(name, mode, result_rows)
     report = _compare(got, want, rows)
     assert report["pass"], report
+    dropped = np.setdiff1d(np.arange(got.shape[0]), rows)
+    assert len(dropped) == (D // 2) * CASES[name][3], dropped
+    np.testing.assert_array_equal(got[dropped], 0.0)
     swapped = got.copy()
     swapped[[rows[0], rows[1]]] = swapped[[rows[1], rows[0]]]
     zeroed = got.copy()
