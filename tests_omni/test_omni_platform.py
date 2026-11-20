@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
 import os
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1122,3 +1124,273 @@ def test_ltx2_per_batch_timestep_patch_fails_on_signature_drift(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="expand_for_sequence_parallel"):
         patches._patch_ltx2_per_batch_timestep()
+
+
+def test_ltx2_split_rope_lane_mask_built_on_host(monkeypatch):
+    # The cached lane mask is computed on the host and uploaded once: no
+    # arange is created on the target device, where it would stay a deferred
+    # graph until the first rotation reads it.
+    arange_devices = []
+    real_arange = torch.arange
+
+    def recording_arange(*args, **kwargs):
+        arange_devices.append(kwargs.get("device"))
+        return real_arange(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "arange", recording_arange)
+    omni_rope._first_half_lanes.cache_clear()
+    device = torch.device("cpu")
+    # A default device other than the host ("meta" stands in for TPU) must
+    # not move the arange off the host.
+    with torch.device("meta"):
+        lanes = omni_rope._first_half_lanes(16, 8, device)
+    assert arange_devices == ["cpu"]
+    assert lanes.device == device
+    assert lanes.tolist() == ([True] * 4 + [False] * 4) * 2
+    assert omni_rope._first_half_lanes(16, 8, device) is lanes
+    assert arange_devices == ["cpu"]
+    omni_rope._first_half_lanes.cache_clear()
+
+
+def _ltx2_sp_shard(tables, start=4, end=8):
+    # A fresh dim-2 slice of each table, as the sequence-parallel hook cuts.
+    return tuple(t[:, :, start:end, :] for t in tables)
+
+
+def test_ltx2_split_rope_tables_found_by_identity(ltx2, table_syncs, monkeypatch):
+    # Every attention layer of a forward is handed the same (cos, sin)
+    # objects: after their first rotation they are found by identity, with no
+    # storage or layout query. A fresh slice of the same tables reads them.
+    torch.manual_seed(0)
+    rope = _ltx2_rope(heads=3, head_dim=8)
+    tables = rope(_ltx2_coords(batch=2, tokens=8), out_dtype=torch.bfloat16)
+    cases = [
+        (_ltx2_sp_shard(tables), torch.randn(2, 4, 24, dtype=torch.bfloat16)),
+        (tables, torch.randn(2, 8, 24, dtype=torch.bfloat16)),  # not sharded
+    ]
+    wants = [ltx2.apply_split_rotary_emb(x, freqs, head_dim=8) for freqs, x in cases]
+    syncs = len(table_syncs)
+
+    def layout_query(self, *args, **kwargs):
+        raise AssertionError("layout query")
+
+    for name in ("is_contiguous", "storage_offset", "untyped_storage"):
+        monkeypatch.setattr(torch.Tensor, name, layout_query)
+    for (freqs, x), want in zip(cases, wants, strict=True):
+        got = ltx2.apply_split_rotary_emb(x, freqs, head_dim=8)
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    with pytest.raises(AssertionError, match="layout query"):
+        ltx2.apply_split_rotary_emb(cases[0][1], _ltx2_sp_shard(tables), head_dim=8)
+    assert len(table_syncs) == syncs
+
+
+def test_ltx2_split_rope_identity_checks_width(ltx2, table_syncs, monkeypatch):
+    # The lanes cut for tensor parallelism depend on the width of q/k, so a
+    # pair found by identity is reused only for the width it was cut for.
+    torch.manual_seed(0)
+    rope = _ltx2_rope(heads=4, head_dim=8)
+    coords = _ltx2_coords()
+    tables = rope(coords)
+    cos, sin = _UPSTREAM_ROPE_FORWARD(rope, coords)
+    monkeypatch.setattr(ltx2, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(ltx2, "get_tensor_model_parallel_rank", lambda: 1)
+    x = torch.randn(2, 5, 2 * 8)
+    want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(x, (cos[:, 2:], sin[:, 2:]), head_dim=8)
+    for _ in range(2):
+        out = ltx2.apply_split_rotary_emb(x, tables, head_dim=8)
+        torch.testing.assert_close(out, want, rtol=1e-6, atol=1e-6)
+    assert len(table_syncs) == 2  # the tables, then the lanes of rank 1
+
+    x_full = torch.randn(2, 5, 4 * 8)
+    out = ltx2.apply_split_rotary_emb(x_full, tables, head_dim=8)
+    want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(x_full, (cos, sin), head_dim=8)
+    torch.testing.assert_close(out, want, rtol=1e-6, atol=1e-6)
+    assert len(table_syncs) == 2
+
+
+def test_ltx2_split_rope_owned_tables_follow_new_tables(ltx2, table_syncs):
+    # A new request builds new tables with the same slice layout. Their owned
+    # copies replace the previous request's, whose tables are then released.
+    torch.manual_seed(0)
+    rope = _ltx2_rope(heads=3, head_dim=8)
+    x = torch.randn(2, 4, 24, dtype=torch.bfloat16)
+
+    tables = rope(_ltx2_coords(batch=2, tokens=8), out_dtype=torch.bfloat16)
+    old_table = weakref.ref(tables[0])
+    ltx2.apply_split_rotary_emb(x, _ltx2_sp_shard(tables), head_dim=8)
+
+    coords = _ltx2_coords(batch=2, tokens=8)
+    tables = rope(coords, out_dtype=torch.bfloat16)
+    syncs = len(table_syncs)
+    out = ltx2.apply_split_rotary_emb(x, _ltx2_sp_shard(tables), head_dim=8)
+    assert len(table_syncs) == syncs + 1
+    upstream = _UPSTREAM_ROPE_FORWARD(rope, coords, None, torch.bfloat16)
+    want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(x, _ltx2_sp_shard(upstream), head_dim=8)
+    torch.testing.assert_close(out, want.to(torch.bfloat16), rtol=0, atol=0)
+
+    table_syncs.clear()  # the fixture's record holds the tables too
+    gc.collect()
+    assert old_table() is None
+
+
+def test_ltx2_split_rope_rotates_views_of_unknown_storage(
+    ltx2, table_syncs, monkeypatch
+):
+    # A storage without a data pointer cannot be told apart from another, so
+    # its slices are rotated as they are, without an owned copy.
+    torch.manual_seed(0)
+    rope = _ltx2_rope(heads=3, head_dim=8)
+    coords = _ltx2_coords(batch=2, tokens=8)
+    tables = rope(coords, out_dtype=torch.bfloat16)
+    syncs = len(table_syncs)
+    monkeypatch.setattr(torch.UntypedStorage, "data_ptr", lambda self: 0)
+    x = torch.randn(2, 4, 24, dtype=torch.bfloat16)
+    upstream = _UPSTREAM_ROPE_FORWARD(rope, coords, None, torch.bfloat16)
+    want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(x, _ltx2_sp_shard(upstream), head_dim=8)
+    for _ in range(2):
+        out = ltx2.apply_split_rotary_emb(x, _ltx2_sp_shard(tables), head_dim=8)
+        torch.testing.assert_close(out, want.to(torch.bfloat16), rtol=0, atol=0)
+    assert len(table_syncs) == syncs
+
+
+@pytest.mark.parametrize(
+    "inference", [False, True], ids=["grad_mode", "inference_mode"]
+)
+def test_ltx2_split_rope_layout_change_releases_tables(ltx2, table_syncs, inference):
+    # A call with another token count (two-stage refinement, another
+    # resolution) builds tables with a new slice layout. The previous tables,
+    # the slices cut from them and their owned copies are released as soon as
+    # the rope module replaces its tables, before any rotation with the new
+    # ones. In inference mode a slice does not reference its base tensor, so
+    # there the slice (which pins the storage) is the object to watch.
+    torch.manual_seed(0)
+    rope = _ltx2_rope(heads=3, head_dim=8)
+    bf16 = torch.bfloat16
+    with torch.inference_mode(inference):
+        tables = rope(_ltx2_coords(batch=2, tokens=8), out_dtype=bf16)
+        shard = _ltx2_sp_shard(tables)
+        ltx2.apply_split_rotary_emb(
+            torch.randn(2, 4, 24, dtype=bf16), shard, head_dim=8
+        )
+        old = [weakref.ref(t) for t in (tables[0], shard[0], table_syncs[-1][0])]
+        del tables, shard
+        table_syncs.clear()  # the fixture's record holds the tables too
+
+        coords = _ltx2_coords(batch=2, tokens=12)
+        tables = rope(coords, out_dtype=bf16)
+        table_syncs.clear()
+        gc.collect()
+        assert [ref() is None for ref in old] == [True, True, True]
+
+        # The new layout rotates like upstream.
+        x = torch.randn(2, 6, 24, dtype=bf16)
+        out = ltx2.apply_split_rotary_emb(x, _ltx2_sp_shard(tables, 6, 12), head_dim=8)
+        upstream = _UPSTREAM_ROPE_FORWARD(rope, coords, None, bf16)
+        want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(
+            x, _ltx2_sp_shard(upstream, 6, 12), head_dim=8
+        )
+        torch.testing.assert_close(out, want.to(bf16), rtol=0, atol=0)
+
+
+def test_ltx2_split_rope_same_layout_tables_coexist(ltx2, table_syncs, monkeypatch):
+    # Two tables with one slice layout: under tensor parallelism the audio
+    # self-attention tables and the audio cross-attention tables have the
+    # same shape, and every block rotates with one and then the other. Each
+    # keeps its owned lanes; neither is copied again in later blocks.
+    torch.manual_seed(0)
+    ropes = [_ltx2_rope(heads=4, head_dim=8) for _ in range(2)]
+    coords = [_ltx2_coords(batch=2, tokens=5) for _ in ropes]
+    tables = [rope(c) for rope, c in zip(ropes, coords, strict=True)]
+    assert tables[0][0].shape == tables[1][0].shape
+    assert not torch.equal(tables[0][0], tables[1][0])
+    monkeypatch.setattr(ltx2, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(ltx2, "get_tensor_model_parallel_rank", lambda: 1)
+    x = torch.randn(2, 5, 2 * 8)
+    wants = []
+    for rope, c in zip(ropes, coords, strict=True):
+        cos, sin = _UPSTREAM_ROPE_FORWARD(rope, c)
+        wants.append(
+            _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(x, (cos[:, 2:], sin[:, 2:]), head_dim=8)
+        )
+    syncs = len(table_syncs)
+    for _block in range(3):
+        for freqs, want in zip(tables, wants, strict=True):
+            out = ltx2.apply_split_rotary_emb(x, freqs, head_dim=8)
+            torch.testing.assert_close(out, want, rtol=1e-6, atol=1e-6)
+    assert len(table_syncs) == syncs + 2  # one pair of owned lanes per table
+
+
+@pytest.mark.parametrize("batch", [1, 2], ids=["b1", "b2"])
+def test_ltx2_split_rope_shard_cache_reused_for_sp_views(ltx2, table_syncs, batch):
+    torch.manual_seed(0)
+    rope = _ltx2_rope(heads=3, head_dim=8)
+    coords = _ltx2_coords(batch=batch, tokens=8)
+    cos_full, sin_full = rope(coords, out_dtype=torch.bfloat16)
+    assert len(table_syncs) == 1
+
+    # Unsharded full-sequence tables need no extra shard materialization.
+    x_full = torch.randn(batch, 8, 3 * 8, dtype=torch.bfloat16)
+    ltx2.apply_split_rotary_emb(x_full, (cos_full, sin_full), head_dim=8)
+    assert len(table_syncs) == 1
+
+    # Sequence-parallel slices (both rank 0 offset=0 and rank 1 offset>0)
+    # materialize once into zero-offset contiguous buffers and reuse across blocks.
+    upstream_cos, upstream_sin = _UPSTREAM_ROPE_FORWARD(
+        rope, coords, None, torch.bfloat16
+    )
+    for rank, (start, end) in enumerate(((0, 4), (4, 8))):
+        x_shard = torch.randn(batch, 4, 3 * 8, dtype=torch.bfloat16)
+        freqs_view = (cos_full[:, :, start:end, :], sin_full[:, :, start:end, :])
+        out1 = ltx2.apply_split_rotary_emb(x_shard, freqs_view, head_dim=8)
+        assert len(table_syncs) == 2 + rank
+        # The synced copies own a buffer of the slice's shape.
+        for owned, view in zip(table_syncs[-1], freqs_view, strict=True):
+            assert torch.equal(owned, view)
+            assert owned.is_contiguous() and owned.storage_offset() == 0
+            assert owned.untyped_storage().nbytes() == view.numel() * 2
+        # Fresh view object over the same storage hits the shard cache across 48 blocks.
+        out2 = ltx2.apply_split_rotary_emb(
+            x_shard,
+            (cos_full[:, :, start:end, :], sin_full[:, :, start:end, :]),
+            head_dim=8,
+        )
+        assert len(table_syncs) == 2 + rank
+        want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(
+            x_shard,
+            (upstream_cos[:, :, start:end, :], upstream_sin[:, :, start:end, :]),
+            head_dim=8,
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(out1, want, rtol=0, atol=0)
+        torch.testing.assert_close(out2, want, rtol=0, atol=0)
+
+
+def test_ltx2_split_rope_torch_compile_skips_lane_cache(ltx2, table_syncs):
+    # Under torch.compile(fullgraph=True), split RoPE builds the lane mask
+    # inline instead of caching a FakeTensor in _first_half_lanes, and skips
+    # eager shard-cache materialization while matching upstream output exactly.
+    torch.manual_seed(0)
+    rope = _ltx2_rope(heads=3, head_dim=8)
+    coords = _ltx2_coords(batch=2, tokens=8)
+    tables = rope(coords, out_dtype=torch.bfloat16)
+    cos_shard, sin_shard = _ltx2_sp_shard(tables)
+    x = torch.randn(2, 4, 24, dtype=torch.bfloat16)
+    upstream = _UPSTREAM_ROPE_FORWARD(rope, coords, None, torch.bfloat16)
+    want = _UPSTREAM_APPLY_SPLIT_ROTARY_EMB(x, _ltx2_sp_shard(upstream), head_dim=8).to(
+        torch.bfloat16
+    )
+
+    def compiled_rotate(
+        t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        return ltx2.apply_split_rotary_emb(t, (cos, sin), head_dim=8)
+
+    omni_rope._first_half_lanes.cache_clear()
+    syncs_before = len(table_syncs)
+    try:
+        fn = torch.compile(compiled_rotate, backend="eager", fullgraph=True)
+        got = fn(x, cos_shard, sin_shard)
+        assert omni_rope._first_half_lanes.cache_info().currsize == 0
+        assert len(table_syncs) == syncs_before
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    finally:
+        omni_rope._first_half_lanes.cache_clear()
