@@ -272,10 +272,10 @@ def _apply_add_rmsnorm(o_ref, res_ref, nw_ref, norm_ref, eps: float):
     s = o_ref[...].astype(jnp.float32) + res_ref[...].astype(jnp.float32)
     o_ref[...] = s.astype(o_ref.dtype)
     inv = jax.lax.rsqrt(jnp.mean(s * s, axis=-1, keepdims=True) + jnp.float32(eps))
-    # Avoid bf16 * bf16 in Mosaic Pallas: cast both operands to f32 (matches
-    # fused_add_rmsnorm._kernel) so VPU executes natively without slow emulation.
-    normed = (s * inv).astype(nw_ref.dtype)
-    y = normed.astype(jnp.float32) * nw_ref[...].astype(jnp.float32)
+    # Avoid intermediate bf16 cast on `s * inv`: XLA TPU keeps f32 excess precision
+    # across the weight multiply, while Mosaic Pallas materializes explicit bf16
+    # rounding (~25.9% 1-ULP precision loss per layer vs unfused RMSNorm).
+    y = (s * inv) * nw_ref[...].astype(jnp.float32)
     norm_ref[...] = y.astype(norm_ref.dtype)
 
 

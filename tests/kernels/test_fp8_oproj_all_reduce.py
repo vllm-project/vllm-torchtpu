@@ -187,12 +187,23 @@ def _one_row_worker():
         )
     result["d2d_32"] = d2d_case
 
-    # Verify fused add+RMSNorm epilogue on two-shot (m=8) and pair-first (m=32).
+    # Verify fused add+RMSNorm epilogue on two-shot (m=8) and pair-first (m=32)
+    # matches f32-intermediate weight multiply (XLA TPU excess precision) bitwise
+    # and differs cleanly from bf16-truncated intermediate rounding.
     from vllm_torchtpu.kernels import (  # noqa: PLC0415 -- worker subprocess imports JAX lazily
         fused_add_rmsnorm,
     )
 
     eps = 1e-6
+
+    def ref_add_rmsnorm_f32_mul(x_in, res_in, nw_in):
+        s_f32 = x_in.astype(jnp.float32) + res_in.astype(jnp.float32)
+        new_res = s_f32.astype(x_in.dtype)
+        inv = jax.lax.rsqrt(
+            jnp.mean(s_f32 * s_f32, axis=-1, keepdims=True) + jnp.float32(eps)
+        )
+        y_out = ((s_f32 * inv) * nw_in.astype(jnp.float32)).astype(x_in.dtype)
+        return y_out, new_res
 
     def build_rn(one_row):
         def body(x, w, ws, r, nv, res, nw):
@@ -237,18 +248,26 @@ def _one_row_worker():
         for nv in (1, m_rn):
             nv_arr = jnp.asarray([nv], jnp.int32)
             base_out, r_base = interpret(one, xr, wr, wsr, rank, nv_arr)
-            ref_y, ref_res = fused_add_rmsnorm.reference(
+            ref_y, ref_res = ref_add_rmsnorm_f32_mul(
+                jnp.asarray(base_out), res_sh, nw_base
+            )
+            trunc_y, _ = fused_add_rmsnorm.reference(
                 jnp.asarray(base_out), res_sh, nw_base, eps
             )
             ref_y_u16 = np.asarray(ref_y).reshape(N_RANKS, m_rn, n).view(np.uint16)
+            trunc_y_u16 = np.asarray(trunc_y).reshape(N_RANKS, m_rn, n).view(np.uint16)
             ref_res_u16 = np.asarray(ref_res).reshape(N_RANKS, m_rn, n).view(np.uint16)
+            # Discriminating oracle check: f32-mul and bf16-truncated references
+            # must diverge significantly on these inputs (>15% of elements).
+            trunc_diff_frac = float(np.mean(ref_y_u16 != trunc_y_u16))
             (y_one, res_one), r_one = interpret(
                 rn_one, xr, wr, wsr, rank, nv_arr, res_sh, nw_sh
             )
             y_one_u16 = np.asarray(y_one).reshape(N_RANKS, m_rn, n).view(np.uint16)
             res_one_u16 = np.asarray(res_one).reshape(N_RANKS, m_rn, n).view(np.uint16)
             ok = bool(
-                np.array_equal(y_one_u16, ref_y_u16)
+                trunc_diff_frac > 0.15
+                and np.array_equal(y_one_u16, ref_y_u16)
                 and np.array_equal(res_one_u16, ref_res_u16)
                 and not r_base
                 and not r_one
@@ -306,7 +325,9 @@ def test_should_reduce_m32_pair_first_without_races(one_row_on_16_devices):
 
 
 @pytest.mark.parametrize("rows", ["8", "32"])
-def test_should_match_fused_add_rmsnorm_reference_bitwise(one_row_on_16_devices, rows):
+def test_should_match_add_rmsnorm_f32_mul_reference_bitwise(
+    one_row_on_16_devices, rows
+):
     assert all(one_row_on_16_devices["rmsnorm"][rows].values())
 
 
