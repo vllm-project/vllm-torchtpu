@@ -548,7 +548,9 @@ def _connector_option(vllm_config: VllmConfig, key: str) -> bool:
       async_complete: issue the producer's post-transfer
         complete_request_blocks RPC on a background thread.
       async_register: register a producer step's request blocks on a side
-        thread that overlaps the step's forward.
+        thread that overlaps the step's forward. Only the default admission
+        path does; DSv4, GLM and Kimi-K3 admission keep registering
+        synchronously in process_send_load.
       late_poll: on a KV consumer, report Stage-3 loads that land during a
         step with that step's output.
     """
@@ -6755,17 +6757,18 @@ class TPURaidenConnectorWorker:
             self._reap_stage3_registrations(finished_req_ids)
             # The scheduler finished these requests: their registrations
             # made ahead of the finish start the TTL clock and the status
-            # probe.
+            # probe. Under the poll lock, as every write to the registrations.
             now = time.time()
-            for req_id in finished_req_ids or ():
-                registration = self._stage3_registered_sends.get(req_id)
-                if registration is not None and registration.finish_pending:
-                    self._stage3_registered_sends[req_id] = dataclasses.replace(
-                        registration,
-                        finish_pending=False,
-                        expiration_time=now
-                        + float(dist_utils.get_p2p_wait_pull_timeout()),
-                    )
+            with self._stage3_poll_lock:
+                for req_id in finished_req_ids or ():
+                    registration = self._stage3_registered_sends.get(req_id)
+                    if registration is not None and registration.finish_pending:
+                        self._stage3_registered_sends[req_id] = dataclasses.replace(
+                            registration,
+                            finish_pending=False,
+                            expiration_time=now
+                            + float(dist_utils.get_p2p_wait_pull_timeout()),
+                        )
         with self._stage3_poll_lock:
             return self._get_finished_locked(engine, finished_req_ids, cleanup_req_ids)
 
