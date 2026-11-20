@@ -48,6 +48,8 @@ def _expert_name(expert_id: int, suffix: str) -> str:
 def test_remote_expert_packed_and_scale_skipped():
     assert _should_skip_weight_tpu(_expert_name(500, ".weight_packed"), _LOCAL)
     assert _should_skip_weight_tpu(_expert_name(500, ".weight_scale"), _LOCAL)
+    assert _should_skip_weight_tpu(_expert_name(500, ".weight_scale_inv"), _LOCAL)
+    assert _should_skip_weight_tpu(_expert_name(500, ".weight_scale_2"), _LOCAL)
     assert _should_skip_weight_tpu(_expert_name(500, ".weight"), _LOCAL)
 
 
@@ -61,6 +63,8 @@ def test_remote_expert_dsv4_scale_skipped():
 def test_local_expert_packed_and_scale_kept():
     assert not _should_skip_weight_tpu(_expert_name(27, ".weight_packed"), _LOCAL)
     assert not _should_skip_weight_tpu(_expert_name(27, ".weight_scale"), _LOCAL)
+    assert not _should_skip_weight_tpu(_expert_name(27, ".weight_scale_inv"), _LOCAL)
+    assert not _should_skip_weight_tpu(_expert_name(27, ".weight_scale_2"), _LOCAL)
 
 
 def test_remote_expert_input_scale_kept():
@@ -159,8 +163,12 @@ def test_lazy_iterator_filters_remote_packed_and_scale(tmp_path, monkeypatch):
     tensors = {
         f"{e}.0.w1.weight_packed": torch.zeros(8, dtype=torch.uint8),
         f"{e}.0.w1.weight_scale": torch.zeros(1, dtype=torch.uint8),
+        f"{e}.0.w1.weight_scale_inv": torch.zeros(1, dtype=torch.float32),
+        f"{e}.0.w1.weight_scale_2": torch.zeros(1, dtype=torch.float32),
         f"{e}.7.w1.weight_packed": torch.zeros(8, dtype=torch.uint8),
         f"{e}.7.w1.weight_scale": torch.zeros(1, dtype=torch.uint8),
+        f"{e}.7.w1.weight_scale_inv": torch.zeros(1, dtype=torch.float32),
+        f"{e}.7.w1.weight_scale_2": torch.zeros(1, dtype=torch.float32),
         f"{e}.7.w1.input_scale": torch.zeros(1, dtype=torch.float32),
         "model.layers.0.self_attn.o_proj.weight": torch.zeros(2, 2),
     }
@@ -201,13 +209,19 @@ def test_lazy_iterator_filters_remote_packed_and_scale(tmp_path, monkeypatch):
 
     assert f"{e}.0.w1.weight_packed" in yielded
     assert f"{e}.0.w1.weight_scale" in yielded
+    assert f"{e}.0.w1.weight_scale_inv" in yielded
+    assert f"{e}.0.w1.weight_scale_2" in yielded
     assert f"{e}.7.w1.input_scale" in yielded
     assert "model.layers.0.self_attn.o_proj.weight" in yielded
     assert f"{e}.7.w1.weight_packed" not in yielded
     assert f"{e}.7.w1.weight_scale" not in yielded
+    assert f"{e}.7.w1.weight_scale_inv" not in yielded
+    assert f"{e}.7.w1.weight_scale_2" not in yielded
     # Skipped tensors must never be read from disk, not just not yielded.
     assert f"{e}.7.w1.weight_packed" not in read_names
     assert f"{e}.7.w1.weight_scale" not in read_names
+    assert f"{e}.7.w1.weight_scale_inv" not in read_names
+    assert f"{e}.7.w1.weight_scale_2" not in read_names
 
 
 # ---------------------------------------------------------------------------
