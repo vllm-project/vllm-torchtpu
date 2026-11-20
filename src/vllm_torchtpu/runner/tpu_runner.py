@@ -1220,9 +1220,9 @@ class TPUModelRunner(GPUModelRunner):
     ) -> bool:
         """Whether _prepare_inputs subtracts the previous step's rejected drafts
         with the fused draft-token program (or its decode-carry form): rejected
-        counts are pending, the inputs are on TPU, every request's input ids
-        come from the device-resident source, and this step verifies drafts over
-        the whole token bucket. The decode carry keys on the same answer."""
+        counts are pending, the inputs are on TPU, at least one input id comes
+        from the device-resident source, and this step verifies drafts over the
+        whole token bucket. The decode carry keys on the same answer."""
         if pending_rejected_sub is None:
             return False
         pre_async = self._pre_async_results
@@ -3960,16 +3960,6 @@ class TPUModelRunner(GPUModelRunner):
             if not sampled_ids:
                 continue
             n_sampled = len(sampled_ids)
-            if carry_rej is not None:
-                carry_rej[req_id] = (
-                    1
-                    + (
-                        pre_num_draft_per_req.get(pre_req_idx, 0)
-                        if pre_num_draft_per_req
-                        else 0
-                    )
-                    - n_sampled
-                )
 
             # The previous step optimistically appended (1 + num_draft)
             # placeholder tokens to output_token_ids, assuming every draft was
@@ -3988,6 +3978,8 @@ class TPUModelRunner(GPUModelRunner):
                 f"{n_placeholder} optimistic placeholders -- output_token_ids "
                 "rollback would drop the wrong elements"
             )
+            if carry_rej is not None:
+                carry_rej[req_id] = n_placeholder - n_sampled
             del req_state.output_token_ids[-n_placeholder:]
             req_state.output_token_ids.extend(sampled_ids)
 
@@ -4916,11 +4908,6 @@ class TPUModelRunner(GPUModelRunner):
                 self.mrope_positions.cpu[
                     :, total_num_scheduled_tokens:padded_total_num_scheduled_tokens
                 ] = 0
-        if use_max_model_len:
-            target_num_reqs = self.num_reqs_max_model_len
-        else:
-            assert self.num_reqs_most_model_len is not None
-            target_num_reqs = self.num_reqs_most_model_len
 
         def _upload_seq_pos_ids() -> torch.Tensor:
             self.input_ids = self.input_ids_cpu[local_token_slice].to(
@@ -5140,27 +5127,24 @@ class TPUModelRunner(GPUModelRunner):
                                 _compiled_carry_subtract_and_substitute_draft_token_ids,
                             )
 
-                            carry_out = (
-                                _compiled_carry_subtract_and_substitute_draft_token_ids(
-                                    seq_lens,
-                                    self.position_ids,
-                                    carry.step_delta,
-                                    num_rejected_dev,
-                                    seq_idx_dev,
-                                    pos_idx_dev,
-                                    self.input_ids,
-                                    substitution_indices,
-                                    pre_async.next_tokens_tpu,
-                                    spec_decode_metadata.final_logits_indices,
-                                    spec_decode_metadata.target_logits_indices,
-                                )
-                            )
                             (
                                 seq_lens,
                                 self.position_ids,
                                 self.input_ids,
                                 spec_decode_metadata.draft_token_ids,
-                            ) = carry_out
+                            ) = _compiled_carry_subtract_and_substitute_draft_token_ids(
+                                seq_lens,
+                                self.position_ids,
+                                carry.step_delta,
+                                num_rejected_dev,
+                                seq_idx_dev,
+                                pos_idx_dev,
+                                self.input_ids,
+                                substitution_indices,
+                                pre_async.next_tokens_tpu,
+                                spec_decode_metadata.final_logits_indices,
+                                spec_decode_metadata.target_logits_indices,
+                            )
                         else:
                             (
                                 seq_lens,

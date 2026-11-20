@@ -897,7 +897,11 @@ _ASSEMBLY_PROGRAMS = (
     "_compiled_carry_subtract_and_substitute_draft_token_ids",
 )
 # The rejected-draft subtraction programs, warmed at every token bucket.
-_SUBTRACT_PROGRAMS = _ASSEMBLY_PROGRAMS[4:7]
+_SUBTRACT_PROGRAMS = (
+    "_compiled_subtract_num_rejected_tokens",
+    "_compiled_subtract_and_substitute_placeholder_token",
+    "_compiled_subtract_and_substitute_draft_token_ids",
+)
 
 
 def _assembly_warmup_calls(
