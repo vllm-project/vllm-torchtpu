@@ -77,7 +77,9 @@ def kernel_kwargs(modes: AttentionModes) -> dict[str, Any]:
 
 
 def scope_line(modes: AttentionModes, num_target: int, num_draft: int) -> str:
-    """The startup line that states the scope, for the compliance log check."""
+    """The startup log line that records the modes the target's attention
+    runs, that the draft runs every mode off, and how many target and draft
+    attention layers the runner found."""
     return (
         f"Native FP8 attention: target decode={modes.native_fp8} "
         f"prefill={modes.native_fp8_prefill} "
