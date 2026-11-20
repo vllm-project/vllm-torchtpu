@@ -39,6 +39,9 @@ _STEP_WIDTHS = (4, 8, 16, 24, 32, 48)
 # One step per group paid a per-step cost worth ~2-3% of the call (pool48
 # selections, 1-2 groups a tile; bench j-caec1354).
 TILES_PER_STEP = 4
+# 4-bit prefill-size calls (8-token tiles) take more: kernel bench j-479565f1,
+# c48 shape 1.193 -> 1.167 ms (rho .97), c64 head-parallel shape tps 8 -2.3 %.
+PREFILL_TILES_PER_STEP_4BIT = 16
 # Groups whose pages are in flight ahead of the running one: 4-bit groups
 # (a page and a scale page each) gain from 2 (bench j-caec1354: c64 shared
 # 2206 -> 2026, forced 2150 -> 2075 us per call), 8/16-bit ones do not.
@@ -1048,13 +1051,15 @@ def planned_attention(
     return out, lse.reshape(num_heads, num_tokens)
 
 
-def _tiles_per_step(num_tiles: int, rows: int = 1, align: int = 1) -> int:
+def _tiles_per_step(
+    num_tiles: int, rows: int = 1, align: int = 1, most: int | None = None
+) -> int:
     """The most tiles (up to `TILES_PER_STEP`) a grid step can take evenly;
     with `align`, only counts whose `rows`-row tiles fill whole `align`-row
     output windows (`_store_unaligned_rows`), or one tile."""
     return next(
         n
-        for n in range(TILES_PER_STEP, 0, -1)
+        for n in range(most or TILES_PER_STEP, 0, -1)
         if num_tiles % n == 0 and (n == 1 or n * rows % align == 0)
     )
 
@@ -1100,7 +1105,7 @@ def fits_work_row(block_q, topk, pages_per_step) -> bool:
     return block_q * topk == _LANES and groups_per_tile * pages_per_step == _LANES
 
 
-def _packed_work(selected, block_q, pages_per_step, align=1):
+def _packed_work(selected, block_q, pages_per_step, align=1, most=None):
     """`msa_attention._work_list` of each call's ``selected [C, T, K]`` as
     one int32 row per call, ``[unions | meta words | counts | step
     starts]``, and the tiles each grid step takes: a call then takes one
@@ -1113,7 +1118,7 @@ def _packed_work(selected, block_q, pages_per_step, align=1):
         )
     )(selected)
     num_tiles = selected.shape[1] // block_q
-    tiles_per_step = _tiles_per_step(num_tiles, block_q, align)
+    tiles_per_step = _tiles_per_step(num_tiles, block_q, align, most)
     groups_per_tile = msa_attention._groups_per_tile(
         block_q, selected.shape[2], pages_per_step
     )
@@ -1300,7 +1305,7 @@ def _chunked_call(
         scale_rows=scale_rows,
     )
     step, num_chunks, pad, selected, (packed, tiles_per_step) = _chunk_work(
-        selected, num_q_heads, q.dtype, block_q, pages_per_step
+        selected, num_q_heads, q.dtype, block_q, pages_per_step, scale_rows is not None
     )
     q = jnp.pad(q, ((0, 0), (0, pad), (0, 0)))
     local_page = jnp.pad(local_page, (0, pad), constant_values=-1)[:, None]
@@ -1378,7 +1383,7 @@ def _chunked_call(
     return out.transpose(1, 0, 2)[:num_tokens], lse[:num_tokens]
 
 
-def _chunk_work(selected, num_q_heads, dtype, block_q, pages_per_step):
+def _chunk_work(selected, num_q_heads, dtype, block_q, pages_per_step, fp4=False):
     """`_chunked_call`'s calls over ``selected [T, G, K]``: ``(step,
     chunks, pad, selected [G, chunks * step, K], (packed, tiles_per_step))``
     with every call's work list built in one batched pass ahead of the loop
@@ -1397,6 +1402,9 @@ def _chunk_work(selected, num_q_heads, dtype, block_q, pages_per_step):
         block_q,
         pages_per_step,
         align=_merged_store_rows(block_q, num_q_heads // num_heads, dtype),
+        most=PREFILL_TILES_PER_STEP_4BIT
+        if fp4 and num_tokens > msa_attention.SMALL_BATCH_TOKENS
+        else None,
     )
     return step, num_chunks, pad, selected, packed
 
