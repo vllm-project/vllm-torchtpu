@@ -493,7 +493,6 @@ def test_copy_slots_stay_outside_the_local_interval(
 
     monkeypatch.setattr(fused_moe_gmm, "prepare_routed_gmm_inputs", prepare)
     monkeypatch.setattr(fused_moe_gmm, "_DENSE_EXPERT_THRESHOLD", 0)
-    monkeypatch.setattr(fused_moe_gmm, "_MOE_LOWTOK_MAX_TOKENS", 0)
     slots, hidden, inter = 6, 128, 128
     with jax.disable_jit(), pytest.raises(Routed):
         fused_moe_func(
