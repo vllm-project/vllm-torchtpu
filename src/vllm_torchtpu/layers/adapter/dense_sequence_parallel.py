@@ -24,6 +24,7 @@ import torch
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.model_executor.layers.linear import LinearBase
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.layers.adapter.custom_ops import fp8_linear_op
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
@@ -35,6 +36,15 @@ from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 # (`1024` at TP=8) matches the 128-row TPU tile / streaming-RS block size while
 # keeping smaller decode/chunk steps on all-reduce (or single-shot VMEM RS+AG).
 MIN_TOKENS_PER_RANK = 128
+
+
+def validate_sequence_parallel_env(enabled: bool) -> None:
+    """Rejects sub-flags that require `tpu_dense_sequence_parallel`."""
+    if envs.TPU_DENSE_SP_HIER_RS != "off" and not enabled:
+        raise ValueError(
+            "TPU_DENSE_SP_HIER_RS requires "
+            "additional_config['tpu_dense_sequence_parallel'] = True"
+        )
 
 
 def validate_fp8_linear_for_sp(linear: LinearBase) -> VllmFp8LinearMethodTPU:

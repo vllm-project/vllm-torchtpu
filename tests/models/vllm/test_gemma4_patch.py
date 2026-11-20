@@ -16,13 +16,18 @@
 from __future__ import annotations
 
 import inspect
+import sys
 import threading
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import jax
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
+from jax.experimental.pallas import tpu as pltpu
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.models.gemma4 import (
@@ -32,9 +37,15 @@ from vllm.model_executor.models.gemma4 import (
 )
 
 from tests.tp_collective_test_utils import TPCollectiveMock
+from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import graph_fingerprint, shape_variants
+from vllm_torchtpu.distributed import chip_topology, hier_reduce_scatter
+from vllm_torchtpu.distributed.chip_topology import ChipTopology
 from vllm_torchtpu.layers.adapter import dense_sequence_parallel
-from vllm_torchtpu.layers.adapter.custom_ops import fp8_linear_op
+from vllm_torchtpu.layers.adapter.custom_ops import (
+    fp8_linear_op,
+    fused_rs_epilogue_op,
+)
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -305,6 +316,10 @@ def test_maybe_patch_waits_for_gemma4_model_config(
     assert Gemma4DecoderLayer.forward is gemma4_patch._dense_sequence_parallel_forward
 
 
+def _rms_norm_torch(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
+
+
 class _TestRMSNorm(RMSNorm):
     def __init__(self, weight: torch.Tensor, eps: float = 1e-6) -> None:
         nn.Module.__init__(self)
@@ -312,11 +327,7 @@ class _TestRMSNorm(RMSNorm):
         self.weight = nn.Parameter(weight, requires_grad=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (
-            x
-            * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
-            * self.weight
-        )
+        return _rms_norm_torch(x, self.weight, self.variance_epsilon)
 
 
 def _make_weights(seed: int, dtype: torch.dtype = torch.float64) -> dict:
@@ -331,7 +342,7 @@ def _make_weights(seed: int, dtype: torch.dtype = torch.float64) -> dict:
         "gate_up": rand(HIDDEN, 2 * INTERMEDIATE),
         "down": rand(INTERMEDIATE, HIDDEN),
         "norms": [1.0 + rand(HIDDEN) for _ in range(4)],
-        "layer_scalar": torch.tensor([0.75], dtype=dtype),
+        "layer_scalar": torch.tensor([0.5 + 0.1 * seed], dtype=dtype),
     }
 
 
@@ -404,6 +415,15 @@ def _make_layer(
     layer.enable_moe_block = False
     layer.per_layer_input_gate = None
     layer.register_buffer("layer_scalar", weights["layer_scalar"])
+    return layer
+
+
+def _as_fp8_weights(layer: Gemma4DecoderLayer) -> Gemma4DecoderLayer:
+    for proj in (layer.self_attn.qkv_proj, layer.mlp.gate_up_proj):
+        proj.weight = nn.Parameter(
+            proj.weight.to(torch.float8_e4m3fn), requires_grad=False
+        )
+        proj.weight_scale = proj.weight_scale.to(torch.float32)
     return layer
 
 
@@ -485,6 +505,7 @@ def test_patched_layer_init_matches_upstream_signature_and_configures(
         ),
         ({"gate_up_bias": True}, NotImplementedError, "gate_up_proj.*bias=None"),
         ({"bad_norm_type": True}, NotImplementedError, "RMSNorm"),
+        ({"bad_norm_eps": True}, NotImplementedError, "variance_epsilon"),
     ],
 )
 def test_configure_layer(
@@ -518,15 +539,30 @@ def test_configure_layer(
             layer.mlp.gate_up_proj.bias = nn.Parameter(torch.zeros(2 * INTERMEDIATE))
         elif name == "bad_norm_type":
             layer.post_attention_layernorm = nn.Identity()  # type: ignore[assignment]
+        elif name == "bad_norm_eps":
+            layer.post_attention_layernorm.variance_epsilon = 1e-5
         else:
             setattr(layer, name, value)
     with pytest.raises(error, match=match):
         gemma4_patch._configure_layer(layer)
 
 
-def _patch_collectives(monkeypatch: pytest.MonkeyPatch, **fakes: object) -> None:
-    import sys
+def test_hier_rs_warns_when_hidden_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`TPU_DENSE_SP_HIER_RS` logs `warning_once` when `hidden` exceeds VMEM/lane."""
+    monkeypatch.setattr(envs, "TPU_DENSE_SP_HIER_RS", "bf16")
+    warn = Mock()
+    monkeypatch.setattr(gemma4_patch.logger, "warning_once", warn)
+    # HIDDEN = 24 is not 128-lane aligned, so supports_streaming_sublayer is False.
+    layer = _make_layer(_make_weights(0), 0, tp=8)
+    gemma4_patch._configure_layer(layer)
+    assert gemma4_patch._layer_state(layer).streaming_collectives is None
+    warn.assert_called_once()
+    assert "hidden=%d" in warn.call_args.args[0]
 
+
+def _patch_collectives(monkeypatch: pytest.MonkeyPatch, **fakes: object) -> None:
     for name, fake in fakes.items():
         if name == "all_reduce":
             monkeypatch.setattr(sys.modules[__name__], "_row_all_reduce", fake)
@@ -552,16 +588,275 @@ def _patch_fp8_ops_with_float_stand_ins(monkeypatch: pytest.MonkeyPatch) -> None
     )
 
 
-@pytest.mark.parametrize("sharded", [True, False])
+def test_build_streaming_sublayer_collectives_registers_jax_ops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercises `pallas.jax_op` signature verification and FakeTensor shapes."""
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()[:1]), (fused_rs_epilogue_op.TP_AXIS_NAME,)
+    )
+    monkeypatch.setattr(
+        fused_rs_epilogue_op,
+        "_resolve_tp_mesh_and_order",
+        lambda: (mesh, (0,), (0,)),
+    )
+    monkeypatch.setattr(fused_rs_epilogue_op, "_STREAM_COLLECTIVES_CACHE", {})
+
+    for fp8_wire in (False, True):
+        ops = fused_rs_epilogue_op.build_streaming_sublayer_collectives(
+            1e-6, fp8_wire=fp8_wire
+        )
+        assert ops is not None
+        ops_alt = fused_rs_epilogue_op.build_streaming_sublayer_collectives(
+            1e-5, fp8_wire=fp8_wire
+        )
+        assert ops_alt is not None and ops_alt is not ops
+        with torch._subclasses.FakeTensorMode():
+            p = torch.empty((16, 32), dtype=torch.bfloat16)
+            r = torch.empty((2, 32), dtype=torch.bfloat16)
+            w = torch.empty((32,), dtype=torch.bfloat16)
+            s = torch.empty((1,), dtype=torch.bfloat16)
+            r1, q1, s1 = ops.norm_add_next_norm(p, r, w, w)
+            assert (r1.shape, q1.shape, s1.shape) == ((2, 32), (2, 32), (2, 1))
+            assert (r1.dtype, q1.dtype, s1.dtype) == (
+                torch.bfloat16,
+                torch.uint8,
+                torch.float32,
+            )
+            r2, q2, s2 = ops.norm_add_scale_next_norm(p, r, w, s, w)
+            assert (r2.shape, q2.shape, s2.shape) == ((2, 32), (2, 32), (2, 1))
+            r3 = ops.norm_add_scale(p, r, w, s)
+            assert (r3.shape, r3.dtype) == ((2, 32), torch.bfloat16)
+
+
+def test_topology_guard_rejects_non_tpu7x_2x2x1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejects 8-chip single-core slices (v6e-8/v5e-8), non-7x chips, and DP/PP."""
+    valid_tpu7x = ChipTopology(
+        [[0, 1], [4, 5], [2, 3], [6, 7]], [0, 1, 4, 5, 6, 7, 2, 3]
+    )
+    state = {
+        "tp": 8,
+        "world": 8,
+        "topology": valid_tpu7x,
+        "chip": pltpu.ChipVersion.TPU_7X,
+    }
+    monkeypatch.setattr(fused_rs_epilogue_op.dist, "is_available", lambda: True)
+    monkeypatch.setattr(fused_rs_epilogue_op.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        fused_rs_epilogue_op.dist, "get_world_size", lambda: state["world"]
+    )
+    monkeypatch.setattr(
+        fused_rs_epilogue_op.parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=state["tp"]),
+    )
+    monkeypatch.setattr(chip_topology, "get_chip_topology", lambda: state["topology"])
+    monkeypatch.setattr(hier_reduce_scatter, "_chip_version", lambda: state["chip"])
+
+    assert fused_rs_epilogue_op._unsupported_tp_topology_reason() is None
+
+    state["topology"] = ChipTopology([[i] for i in range(8)], list(range(8)))
+    assert "4 chips of 2 TensorCores" in (
+        fused_rs_epilogue_op._unsupported_tp_topology_reason() or ""
+    )
+
+    state["topology"] = valid_tpu7x
+    state["chip"] = pltpu.ChipVersion.TPU_V6E
+    assert "tpu7x" in (fused_rs_epilogue_op._unsupported_tp_topology_reason() or "")
+
+    state["chip"] = pltpu.ChipVersion.TPU_7X
+    state["topology"] = ChipTopology([[0, 2], [1, 3], [4, 5], [6, 7]], list(range(8)))
+    assert "chips are not paired" in (
+        fused_rs_epilogue_op._unsupported_tp_topology_reason() or ""
+    )
+
+    state["topology"] = valid_tpu7x
+    state["world"] = 16
+    assert "whole torch.distributed world" in (
+        fused_rs_epilogue_op._unsupported_tp_topology_reason() or ""
+    )
+
+    # TP=4 (two dual-core chips, e.g. one dense-DP replica) skips the host-wide
+    # 4-chip check; other TP sizes and non-7x chips are still rejected.
+    state["tp"] = state["world"] = 4
+    state["topology"] = None
+    assert fused_rs_epilogue_op._unsupported_tp_topology_reason() is None
+
+    state["chip"] = pltpu.ChipVersion.TPU_V6E
+    assert "tpu7x" in (fused_rs_epilogue_op._unsupported_tp_topology_reason() or "")
+
+    state["chip"] = pltpu.ChipVersion.TPU_7X
+    state["tp"] = state["world"] = 2
+    assert "TP=4 or TP=8" in (
+        fused_rs_epilogue_op._unsupported_tp_topology_reason() or ""
+    )
+
+
+def test_resolve_tp_mesh_and_order_refusal_agreement_and_caching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Covers `_resolve_tp_mesh_and_order` refusals, disagreement, and caching."""
+    monkeypatch.setattr(envs, "TPU_DENSE_SP_HIER_RS", "bf16")
+    monkeypatch.setattr(fused_rs_epilogue_op.dist, "is_available", lambda: True)
+    monkeypatch.setattr(fused_rs_epilogue_op.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(fused_rs_epilogue_op.dist, "get_world_size", lambda: 8)
+
+    def reset() -> Mock:
+        monkeypatch.setattr(fused_rs_epilogue_op, "_RESOLVED_TP_TOPOLOGY", None)
+        monkeypatch.setattr(fused_rs_epilogue_op, "_REFUSED_REASON", None)
+        warn = Mock()
+        monkeypatch.setattr(fused_rs_epilogue_op.logger, "warning_once", warn)
+        return warn
+
+    def fake_mesh(ids: list[int]) -> SimpleNamespace:
+        return SimpleNamespace(
+            devices=np.asarray([SimpleNamespace(id=i) for i in ids], dtype=object)
+        )
+
+    peer_reasons: list[str | None] = [None] * 6 + ["bad peer"]
+    gather_calls = 0
+
+    def counting_gather(r: str | None) -> list[str | None]:
+        nonlocal gather_calls
+        gather_calls += 1
+        return [r, *peer_reasons]
+
+    monkeypatch.setattr(hier_reduce_scatter, "_gather_reasons", counting_gather)
+    monkeypatch.setattr(
+        fused_rs_epilogue_op, "_unsupported_tp_topology_reason", lambda: None
+    )
+    warn = reset()
+    assert fused_rs_epilogue_op._resolve_tp_mesh_and_order() is None
+    assert "ranks disagree" in (fused_rs_epilogue_op._REFUSED_REASON or "")
+    warn.assert_called_once()
+    assert gather_calls == 1
+    assert fused_rs_epilogue_op._resolve_tp_mesh_and_order() is None
+    assert gather_calls == 1
+
+    peer_reasons = [None] * 7
+    monkeypatch.setattr(fused_rs_epilogue_op, "build_tp_mesh", lambda: None)
+    warn = reset()
+    assert fused_rs_epilogue_op._resolve_tp_mesh_and_order() is None
+    assert "whole torch.distributed world" in (
+        fused_rs_epilogue_op._REFUSED_REASON or ""
+    )
+    warn.assert_called_once()
+
+    monkeypatch.setattr(
+        fused_rs_epilogue_op,
+        "build_tp_mesh",
+        lambda: (fake_mesh(list(range(8, 16))), tuple(range(8))),
+    )
+    warn = reset()
+    assert fused_rs_epilogue_op._resolve_tp_mesh_and_order() is None
+    assert "0..7" in (fused_rs_epilogue_op._REFUSED_REASON or "")
+    warn.assert_called_once()
+
+    gather_calls = 0
+    order = (0, 1, 6, 7, 2, 3, 4, 5)
+    mesh = fake_mesh(list(range(8)))
+    monkeypatch.setattr(fused_rs_epilogue_op, "build_tp_mesh", lambda: (mesh, order))
+    warn = reset()
+    resolved = fused_rs_epilogue_op._resolve_tp_mesh_and_order()
+    assert resolved == (mesh, order, tuple(range(8)))
+    assert fused_rs_epilogue_op._resolve_tp_mesh_and_order() == resolved
+    assert gather_calls == 1
+    warn.assert_not_called()
+
+
+def test_hier_rs_requires_dense_sequence_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(envs, "TPU_DENSE_SP_HIER_RS", "bf16")
+    with pytest.raises(ValueError, match="tpu_dense_sequence_parallel"):
+        dense_sequence_parallel.validate_sequence_parallel_env(enabled=False)
+    dense_sequence_parallel.validate_sequence_parallel_env(enabled=True)
+
+
+def test_streaming_sublayer_tp4_vs_tp8_admission_and_carried_tail_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`supports_streaming_sublayer` scales by TP=4/8; fallbacks reject tails."""
+    v7x_info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(
+        fused_rs_epilogue_op.kernel_stream, "tpu_info", lambda: v7x_info
+    )
+    monkeypatch.setattr(
+        fused_rs_epilogue_op.kernel_stream, "_EPILOGUE_HIDDEN_SUPPORT", {}
+    )
+
+    monkeypatch.setattr(
+        fused_rs_epilogue_op,
+        "_RESOLVED_TP_TOPOLOGY",
+        (None, (0, 1, 2, 3), (0, 1, 2, 3)),
+    )
+    assert not fused_rs_epilogue_op.supports_streaming_sublayer(256, 256)
+    assert fused_rs_epilogue_op.supports_streaming_sublayer(512, 256)
+
+    monkeypatch.setattr(
+        fused_rs_epilogue_op,
+        "_RESOLVED_TP_TOPOLOGY",
+        (None, tuple(range(8)), tuple(range(8))),
+    )
+    assert not fused_rs_epilogue_op.supports_streaming_sublayer(512, 256)
+    assert fused_rs_epilogue_op.supports_streaming_sublayer(1024, 256)
+
+    layer = _make_layer(_make_weights(1), 1, tp=8, num_layers=2)
+    gemma4_patch._configure_layer(layer)
+    carried = (
+        torch.zeros(NUM_TOKENS // 8, HIDDEN),
+        torch.ones(HIDDEN),
+        torch.ones(1),
+    )
+    for min_tokens_per_rank in (NUM_TOKENS + 1, 0):
+        monkeypatch.setattr(
+            dense_sequence_parallel, "MIN_TOKENS_PER_RANK", min_tokens_per_rank
+        )
+        with pytest.raises(NotImplementedError, match="cannot carry a fused tail"):
+            gemma4_patch._dense_sequence_parallel_forward(
+                layer,
+                torch.arange(NUM_TOKENS),
+                torch.zeros(NUM_TOKENS, HIDDEN),
+                carried,
+            )
+
+
+def _fused_collectives_stand_in(
+    reduce_scatter: Callable, eps: float
+) -> fused_rs_epilogue_op.FusedSublayerCollectives:
+    def norm_add_scale(partial, residual, post_norm_weight, scale):
+        reduced = _rms_norm_torch(reduce_scatter(partial, 0), post_norm_weight, eps)
+        return (reduced + residual) * scale
+
+    def norm_add_scale_next_norm(
+        partial, residual, post_norm_weight, scale, next_norm_weight
+    ):
+        residual = norm_add_scale(partial, residual, post_norm_weight, scale)
+        normed = _rms_norm_torch(residual, next_norm_weight, eps)
+        row_scale = normed.abs().amax(-1, keepdim=True)
+        return residual, normed / row_scale, row_scale
+
+    return fused_rs_epilogue_op.FusedSublayerCollectives(
+        norm_add_next_norm=lambda partial, residual, post_norm_w, next_norm_w: (
+            norm_add_scale_next_norm(partial, residual, post_norm_w, 1.0, next_norm_w)
+        ),
+        norm_add_scale_next_norm=norm_add_scale_next_norm,
+        norm_add_scale=norm_add_scale,
+    )
+
+
+@pytest.mark.parametrize("path", ["replicated", "xla_sp", "hier_sp"])
 @pytest.mark.parametrize("tp", [2, 8])
 def test_forward_matches_upstream(
-    monkeypatch: pytest.MonkeyPatch, tp: int, sharded: bool
+    monkeypatch: pytest.MonkeyPatch, tp: int, path: str
 ) -> None:
     """Multi-rank layer stack equals upstream forward at TP=1 on every rank."""
     monkeypatch.setattr(
         dense_sequence_parallel,
         "MIN_TOKENS_PER_RANK",
-        0 if sharded else NUM_TOKENS + 1,
+        NUM_TOKENS + 1 if path == "replicated" else 0,
     )
     _patch_fp8_ops_with_float_stand_ins(monkeypatch)
     mock = TPCollectiveMock(tp)
@@ -571,6 +866,18 @@ def test_forward_matches_upstream(
         all_gather=mock.all_gather,
         reduce_scatter=mock.reduce_scatter,
     )
+    if path == "hier_sp":
+        monkeypatch.setattr(envs, "TPU_DENSE_SP_HIER_RS", "bf16")
+        monkeypatch.setattr(
+            fused_rs_epilogue_op,
+            "build_streaming_sublayer_collectives",
+            lambda eps, *, fp8_wire: _fused_collectives_stand_in(
+                mock.reduce_scatter, eps
+            ),
+        )
+        monkeypatch.setattr(
+            fused_rs_epilogue_op, "supports_streaming_sublayer", lambda *_: True
+        )
 
     weights = [_make_weights(seed) for seed in range(NUM_LAYERS)]
     g = torch.Generator().manual_seed(123)
@@ -597,7 +904,9 @@ def test_forward_matches_upstream(
                 hidden, residual = gemma4_patch._dense_sequence_parallel_forward(
                     layer, positions, hidden, residual
                 )
-                assert residual is None
+                assert (residual is not None) == (
+                    path == "hier_sp" and idx < NUM_LAYERS - 1
+                )
                 if idx == 0:
                     rows_after_layer_0[rank] = hidden.shape[0]
             outputs[rank] = hidden
@@ -617,8 +926,9 @@ def test_forward_matches_upstream(
     for out in outputs:
         assert out is not None
         torch.testing.assert_close(out, expected, rtol=1e-10, atol=1e-10)
-    if sharded:
-        assert rows_after_layer_0 == [NUM_TOKENS // tp] * tp
+    if path != "replicated":
+        rows = NUM_TOKENS if path == "hier_sp" else NUM_TOKENS // tp
+        assert rows_after_layer_0 == [rows] * tp
         assert mock.calls == {
             "all_reduce": 0,
             "reduce_scatter": 2 * NUM_LAYERS,
@@ -686,23 +996,21 @@ def test_token_buckets_share_one_graph_signature_and_rank_uniform_fingerprint(
         reduce_scatter=lambda x, dim=0: x.narrow(0, 0, x.shape[0] // tp),
     )
 
-    def make_bf16_fp8_layer(idx: int, layer_rank: int) -> Gemma4DecoderLayer:
-        layer = _make_layer(
-            _make_weights(idx, torch.bfloat16), idx, tp, layer_rank, num_layers=2
-        )
-        for proj in (layer.self_attn.qkv_proj, layer.mlp.gate_up_proj):
-            proj.weight = nn.Parameter(
-                proj.weight.to(torch.float8_e4m3fn), requires_grad=False
-            )
-            proj.weight_scale = proj.weight_scale.to(torch.float32)
-        return layer
-
     class _Stack(nn.Module):
         def __init__(self, stack_rank: int) -> None:
             super().__init__()
             self.embed = nn.Embedding(128, HIDDEN, dtype=torch.bfloat16)
             self.layers = nn.ModuleList(
-                make_bf16_fp8_layer(idx, stack_rank) for idx in range(2)
+                _as_fp8_weights(
+                    _make_layer(
+                        _make_weights(idx, torch.bfloat16),
+                        idx,
+                        tp,
+                        stack_rank,
+                        num_layers=2,
+                    )
+                )
+                for idx in range(2)
             )
             for layer in self.layers:
                 gemma4_patch._configure_layer(layer)
@@ -747,5 +1055,118 @@ def test_token_buckets_share_one_graph_signature_and_rank_uniform_fingerprint(
 
     if rank != 0:
         rank0_sigs, rank0_fps = trace_buckets(0)
+        assert signatures == rank0_sigs
+        assert fingerprints == rank0_fps
+
+
+@pytest.mark.parametrize("rank", [0, 3])
+def test_hier_collectives_trace_fullgraph_and_match_signature(
+    monkeypatch: pytest.MonkeyPatch, rank: int
+) -> None:
+    """Fused streaming RS + epilogue traces under fullgraph=True without calling
+    StrongLRUCache (`pltpu.get_tpu_info`) and matches replicated graph_signature
+    and rank-uniform fingerprints."""
+    tp = 8
+    wide_hidden = 256
+    monkeypatch.setattr(envs, "TPU_DENSE_SP_HIER_RS", "bf16")
+    fp8_linear_op.register_fp8_linear_ops()
+    _patch_collectives(
+        monkeypatch,
+        all_reduce=lambda x: x,
+        all_gather=lambda x, dim=0: x.repeat(tp, 1),
+        reduce_scatter=lambda x, dim=0: x.narrow(0, 0, x.shape[0] // tp),
+    )
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()[:1]), (fused_rs_epilogue_op.TP_AXIS_NAME,)
+    )
+    monkeypatch.setattr(
+        fused_rs_epilogue_op,
+        "_resolve_tp_mesh_and_order",
+        lambda: (mesh, tuple(range(tp)), tuple(range(tp))),
+    )
+    monkeypatch.setattr(fused_rs_epilogue_op, "_STREAM_COLLECTIVES_CACHE", {})
+    monkeypatch.setattr(
+        fused_rs_epilogue_op.kernel_stream, "_EPILOGUE_HIDDEN_SUPPORT", {}
+    )
+
+    monkeypatch.setattr(sys.modules[__name__], "HIDDEN", wide_hidden)
+
+    class _Stack(nn.Module):
+        def __init__(self, stack_rank: int) -> None:
+            super().__init__()
+            self.embed = nn.Embedding(128, wide_hidden, dtype=torch.bfloat16)
+            self.layers = nn.ModuleList(
+                _as_fp8_weights(
+                    _make_layer(
+                        _make_weights(idx, torch.bfloat16),
+                        idx,
+                        tp,
+                        stack_rank,
+                        num_layers=2,
+                    )
+                )
+                for idx in range(2)
+            )
+            for layer in self.layers:
+                gemma4_patch._configure_layer(layer)
+
+        def forward(
+            self, input_ids: torch.Tensor, positions: torch.Tensor
+        ) -> torch.Tensor:
+            hidden, residual = self.embed(input_ids), None
+            for layer in self.layers:
+                hidden, residual = gemma4_patch._dense_sequence_parallel_forward(
+                    layer, positions, hidden, residual
+                )
+            return hidden
+
+    def trace_buckets(
+        stack_rank: int,
+    ) -> tuple[list[tuple[object, ...]], list[str | None], list[set[str]]]:
+        model = _Stack(stack_rank)
+        assert (
+            gemma4_patch._layer_state(model.layers[0]).streaming_collectives is not None
+        )
+        signatures: list[tuple[object, ...]] = []
+        fingerprints: list[str | None] = []
+        seen_ops: list[set[str]] = []
+
+        def capture_backend(gm: torch.fx.GraphModule, _example_inputs: object):
+            signatures.append(shape_variants.graph_signature(gm))
+            fingerprints.append(graph_fingerprint._graph_fingerprint(gm))
+            seen_ops.append(
+                {str(n.target) for n in gm.graph.nodes if n.op == "call_function"}
+            )
+            return lambda *_args: torch.zeros(1, wide_hidden, dtype=torch.bfloat16)
+
+        with shape_variants.warmup():
+            for num_tokens in (16, 1024, 1032):
+                torch._dynamo.reset()
+                compiled = torch.compile(model, backend=capture_backend, fullgraph=True)
+                input_ids = torch.zeros(num_tokens, dtype=torch.int32)
+                positions = torch.arange(num_tokens, dtype=torch.int32)
+                torch._dynamo.mark_dynamic(input_ids, 0)
+                torch._dynamo.mark_dynamic(positions, 0)
+                compiled(input_ids, positions)
+        return signatures, fingerprints, seen_ops
+
+    def forbid_tpu_info() -> None:
+        raise AssertionError("tpu_info must not run during TorchDynamo tracing")
+
+    # Warm _EPILOGUE_HIDDEN_SUPPORT before forbidding tpu_info during tracing.
+    _Stack(0)
+    monkeypatch.setattr(fused_rs_epilogue_op.kernel_stream, "tpu_info", forbid_tpu_info)
+    monkeypatch.setattr(pltpu, "get_tpu_info", forbid_tpu_info)
+
+    signatures, fingerprints, seen_ops = trace_buckets(rank)
+    assert len(signatures) == 3
+    assert signatures[0] == signatures[1] == signatures[2]
+    assert all(fp is not None for fp in fingerprints)
+    assert any("dense_sp_rs_" in op for op in seen_ops[1])
+    assert not any("dense_sp_rs_" in op for op in seen_ops[0])
+    assert not any("dense_sp_rs_" in op for op in seen_ops[2])
+
+    if rank != 0:
+        rank0_sigs, rank0_fps, _ = trace_buckets(0)
         assert signatures == rank0_sigs
         assert fingerprints == rank0_fps

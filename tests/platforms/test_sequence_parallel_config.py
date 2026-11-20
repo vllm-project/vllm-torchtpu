@@ -296,3 +296,16 @@ def test_dense_sp_platform_rejects_unsupported_configs(
 ) -> None:
     with pytest.raises(exc_type, match=match):
         validate_dense_sp(_gemma4_vllm_config(**overrides))
+
+
+def test_hier_rs_platform_validation_and_env_forwarding(
+    monkeypatch: pytest.MonkeyPatch, validate_dense_sp
+) -> None:
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    assert "TPU_DENSE_SP_HIER_RS" in TpuPlatform.additional_env_vars
+
+    monkeypatch.setattr(envs, "TPU_DENSE_SP_HIER_RS", "fp8")
+    with pytest.raises(ValueError, match="tpu_dense_sequence_parallel"):
+        validate_dense_sp(_gemma4_vllm_config(enabled=False))

@@ -563,6 +563,7 @@ class TpuPlatform(Platform):
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
+        "TPU_DENSE_SP_HIER_RS",
     ]
 
     @classmethod
@@ -1762,7 +1763,14 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
 
 def _validate_dense_sequence_parallel(vllm_config: VllmConfig) -> None:
     """Rejects server configs incompatible with `tpu_dense_sequence_parallel`."""
-    if not dense_sequence_parallel_flag.dense_sequence_parallel_enabled(vllm_config):
+    enabled = dense_sequence_parallel_flag.dense_sequence_parallel_enabled(vllm_config)
+    # Inline check avoids importing dense_sequence_parallel during platform init.
+    if envs.TPU_DENSE_SP_HIER_RS != "off" and not enabled:
+        raise ValueError(
+            "TPU_DENSE_SP_HIER_RS requires "
+            "additional_config['tpu_dense_sequence_parallel'] = True"
+        )
+    if not enabled:
         return
     if vllm_config.model_config is None:
         return

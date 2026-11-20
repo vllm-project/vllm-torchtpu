@@ -22,27 +22,33 @@ f32 row scales into `qkv_proj` / `gate_up_proj`. Layer 0 slices its token shard
 from the replicated embedding output and the final layer all-gathers the
 residual back to `[num_tokens, H]`.
 
-`_attention_partial_sum` and `_sequence_parallel_forward` are adapted from
-upstream vLLM `vllm/model_executor/models/gemma4.py` (`Gemma4Attention` and
+When `TPU_DENSE_SP_HIER_RS=bf16|fp8` is set on a 4- or 8-TensorCore tpu7x TP
+group, eligible buckets fuse each reduce-scatter and its residual/RMSNorm/FP8
+epilogue into a single hierarchical Pallas kernel call.
+
+`_attention_partial_sum`, `_sequence_parallel_forward`, and
+`_fused_sequence_parallel_forward` are adapted from upstream vLLM
+`vllm/model_executor/models/gemma4.py` (`Gemma4Attention` and
 `Gemma4DecoderLayer` at `v0.33.0`) with these changes:
 - `o_proj` and `down_proj` keep their upstream `reduce_results` so small
   buckets delegate directly to upstream `Gemma4DecoderLayer.forward`, while
-  `_sequence_parallel_forward` invokes `quant_method.apply(..., None)` followed
-  by `reduce_scatter`.
-- `_sequence_parallel_forward` feeds `qkv_proj` and `gate_up_proj` via
-  `quantize_all_gather_linear` (quantizing each rank's shard to FP8 before the
-  gather). Upstream `k_eq_v` global-attention layers load `K` weights into both
-  `K` and `V` slots of `QKVParallelLinear`, so the `[q_size, kv_size, kv_size]`
-  split is unchanged.
+  the sequence-parallel forwards invoke `quant_method.apply(..., None)`
+  followed by `reduce_scatter` (or the fused hierarchical kernel).
+- `qkv_proj` and `gate_up_proj` consume pre-quantized FP8 rows gathered across
+  TP ranks (`k_eq_v` global-attention layers load `K` weights into both `K` and
+  `V` slots of `QKVParallelLinear` upstream, so `[q_size, kv_size, kv_size]`
+  holds).
 - Layer 0 applies `replicated_tokens` (all-reduce) or `slice_token_shard`
-  (sequence-parallel) using a per-rank int32 buffer `_tpu_sp_tp_rank` so both
+  (sequence-parallel) using a per-rank int32 buffer `_tpu_sp_tp_rank` so all
   paths lift identical Dynamo symbolic inputs and all TP ranks trace one graph
-  fingerprint for peer replay. The final layer gathers the token shard back to
-  `[num_tokens, H]`.
+  fingerprint for peer replay, and `_fused_sequence_parallel_forward` carries
+  each non-final layer's un-reduced `down_proj` tail via `Gemma4Model`'s
+  `residual` slot.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -55,9 +61,12 @@ from vllm.model_executor.models.gemma4 import (
     Gemma4MLP,
 )
 
-from vllm_torchtpu import dense_sequence_parallel_flag
+from vllm_torchtpu import dense_sequence_parallel_flag, envs
 from vllm_torchtpu.layers.adapter import dense_sequence_parallel
-from vllm_torchtpu.layers.adapter.custom_ops import fp8_linear_op
+from vllm_torchtpu.layers.adapter.custom_ops import (
+    fp8_linear_op,
+    fused_rs_epilogue_op,
+)
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -67,6 +76,12 @@ logger = init_logger(__name__)
 
 _orig_layer_init = Gemma4DecoderLayer.__init__
 _orig_layer_forward = Gemma4DecoderLayer.forward
+_CarriedSublayerTail = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+@dataclass(frozen=True)
+class _DenseSpLayerState:
+    streaming_collectives: fused_rs_epilogue_op.FusedSublayerCollectives | None = None
 
 
 def _validate_layer_norms(layer: Gemma4DecoderLayer) -> None:
@@ -82,6 +97,12 @@ def _validate_layer_norms(layer: Gemma4DecoderLayer) -> None:
                 "tpu_dense_sequence_parallel requires vLLM RMSNorm decoder norms, "
                 f"got {type(norm).__name__}"
             )
+    epsilons = {norm.variance_epsilon for norm in norms}
+    if len(epsilons) != 1:
+        raise NotImplementedError(
+            "tpu_dense_sequence_parallel requires matching variance_epsilon across "
+            f"decoder norms, got {sorted(epsilons)}"
+        )
 
 
 def _configure_layer(
@@ -123,11 +144,38 @@ def _configure_layer(
             ),
             persistent=False,
         )
+    payload = envs.TPU_DENSE_SP_HIER_RS
+    streaming_collectives = None
+    if payload != "off":
+        hidden = layer.input_layernorm.weight.shape[0]
+        if fused_rs_epilogue_op.supports_streaming_sublayer(
+            fused_rs_epilogue_op.MIN_STREAMING_RS_TOKENS, hidden
+        ):
+            streaming_collectives = (
+                fused_rs_epilogue_op.build_streaming_sublayer_collectives(
+                    layer.input_layernorm.variance_epsilon,
+                    fp8_wire=payload == "fp8",
+                )
+            )
+        else:
+            logger.warning_once(
+                "TPU_DENSE_SP_HIER_RS=%s is set, but hidden=%d does not fit "
+                "the streaming epilogue; keeping XLA reduce-scatter.",
+                payload,
+                hidden,
+            )
     cast("Any", layer)._tpu_dense_sp_num_layers = (
         num_hidden_layers
         if num_hidden_layers is not None
         else layer.self_attn.config.num_hidden_layers
     )
+    cast("Any", layer)._tpu_dense_sp = _DenseSpLayerState(
+        streaming_collectives=streaming_collectives
+    )
+
+
+def _layer_state(layer: Gemma4DecoderLayer) -> _DenseSpLayerState:
+    return cast("_DenseSpLayerState", cast("Any", layer)._tpu_dense_sp)
 
 
 def _is_last_layer(layer: Gemma4DecoderLayer) -> bool:
@@ -223,19 +271,101 @@ def _sequence_parallel_forward(
     return hidden_states
 
 
+def _fused_sequence_parallel_forward(
+    layer: Gemma4DecoderLayer,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    carried: _CarriedSublayerTail | None,
+    collectives: fused_rs_epilogue_op.FusedSublayerCollectives,
+) -> tuple[torch.Tensor, _CarriedSublayerTail | None]:
+    """Sequence-parallel forward fusing each sublayer's RS + residual epilogue.
+
+    Because `down_proj`'s fused epilogue consumes the next layer's
+    `input_layernorm.weight`, non-final layers return the un-reduced `down_proj`
+    partial sum plus `carried = (residual, post_feedforward_layernorm.weight,
+    layer_scalar)` via `Gemma4Model`'s `residual` carry slot.
+    """
+    num_tokens = positions.shape[0]
+    attn = layer.self_attn
+    if carried is None:
+        residual = dense_sequence_parallel.slice_token_shard(
+            hidden_states,
+            num_tokens,
+            cast("torch.Tensor", cast("Any", layer)._tpu_sp_tp_rank),
+            attn.o_proj.tp_size,
+        )
+        qkv = dense_sequence_parallel.quantize_all_gather_linear(
+            attn.qkv_proj, layer.input_layernorm(residual), num_tokens
+        )
+    else:
+        residual, post_norm_weight, scale = carried
+        residual, x_q, x_scale = collectives.norm_add_scale_next_norm(
+            hidden_states,
+            residual,
+            post_norm_weight,
+            scale,
+            layer.input_layernorm.weight,
+        )
+        qkv = dense_sequence_parallel.all_gather_prequantized_fp8_linear(
+            attn.qkv_proj, x_q, x_scale, num_tokens
+        )
+
+    residual, x_q, x_scale = collectives.norm_add_next_norm(
+        _attention_partial_sum(attn, positions, qkv),
+        residual,
+        layer.post_attention_layernorm.weight,
+        layer.pre_feedforward_layernorm.weight,
+    )
+    gate_up = dense_sequence_parallel.all_gather_prequantized_fp8_linear(
+        layer.mlp.gate_up_proj, x_q, x_scale, num_tokens
+    )
+    mlp_partial = _mlp_partial_sum(layer.mlp, gate_up)
+    post_norm_weight = layer.post_feedforward_layernorm.weight
+    if not _is_last_layer(layer):
+        return mlp_partial, (residual, post_norm_weight, layer.layer_scalar)
+    residual = collectives.norm_add_scale(
+        mlp_partial, residual, post_norm_weight, layer.layer_scalar
+    )
+    return dense_sequence_parallel.all_gather_tokens(residual, num_tokens), None
+
+
+def _require_no_carried_tail(residual: _CarriedSublayerTail | None) -> None:
+    if residual is not None:
+        raise NotImplementedError(
+            "tpu_dense_sequence_parallel cannot carry a fused tail into a "
+            "layer without matching fused collectives"
+        )
+
+
 def _dense_sequence_parallel_forward(
     self: Gemma4DecoderLayer,
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
-    residual: torch.Tensor | None,
+    residual: _CarriedSublayerTail | None,
     per_layer_input: torch.Tensor | None = None,
     **kwargs: object,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, _CarriedSublayerTail | torch.Tensor | None]:
     num_tokens = positions.shape[0]
     if dense_sequence_parallel.use_sequence_parallel(
         num_tokens, self.mlp.down_proj.tp_size
     ):
+        state = _layer_state(self)
+        if (
+            state.streaming_collectives is not None
+            and fused_rs_epilogue_op.supports_streaming_sublayer(
+                num_tokens, hidden_states.shape[-1]
+            )
+        ):
+            return _fused_sequence_parallel_forward(
+                self,
+                positions,
+                hidden_states,
+                residual,
+                state.streaming_collectives,
+            )
+        _require_no_carried_tail(residual)
         return _sequence_parallel_forward(self, positions, hidden_states), None
+    _require_no_carried_tail(residual)
     if self.layer_idx == 0:
         hidden_states = dense_sequence_parallel.replicated_tokens(
             hidden_states,
@@ -246,7 +376,7 @@ def _dense_sequence_parallel_forward(
         self,
         positions,
         hidden_states,
-        residual,
+        None,
         per_layer_input=per_layer_input,
         **kwargs,
     )
@@ -264,7 +394,9 @@ def maybe_patch_gemma4_dense_sequence_parallel(
     """
     if vllm_config is None:
         vllm_config = get_current_vllm_config_or_none()
-    if not dense_sequence_parallel_flag.dense_sequence_parallel_enabled(vllm_config):
+    enabled = dense_sequence_parallel_flag.dense_sequence_parallel_enabled(vllm_config)
+    dense_sequence_parallel.validate_sequence_parallel_env(enabled)
+    if not enabled:
         return False
     if model_config is None:
         return False

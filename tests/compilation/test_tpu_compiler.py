@@ -232,6 +232,31 @@ class TestTpuCompilerCache:
         assert first == first_again
         assert first != hosts_swapped
 
+    def test_tpu_hash_covers_the_tp_device_placement(self):
+        """Fused dense SP ops compile `tp_rank_order` in as a constant, so two
+        DP replicas or restarts with different rank-to-device mappings must not
+        share a compile cache entry."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+        from vllm_torchtpu.distributed import tp_mesh
+
+        ranks = (0, 1, 2, 3)
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            with patch.dict(
+                tp_mesh._GATHERED_DEVICE_IDS, {ranks: (0, 1, 2, 3)}, clear=True
+            ):
+                first = compute_tpu_compilation_hash(self._config())
+                first_again = compute_tpu_compilation_hash(self._config())
+            with patch.dict(
+                tp_mesh._GATHERED_DEVICE_IDS, {ranks: (2, 3, 0, 1)}, clear=True
+            ):
+                reordered = compute_tpu_compilation_hash(self._config())
+
+        assert first == first_again
+        assert first != reordered
+
     def test_tpu_hash_covers_native_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 
