@@ -1667,14 +1667,35 @@ class TestSchedulerUpstreamContract(unittest.TestCase):
         base.assert_called_once_with(req, 4, 8)
         sched._touch.assert_called_once_with(req_status)
 
+    def _local_hit_tail_sched(self, transfer_jobs):
+        """A request whose local HBM hit (6 tokens) ends on a partial-tail
+        boundary past the 4 tokens the scheduler asks about."""
+        sched = self._sched()
+        sched.config = SimpleNamespace(
+            kv_group_configs=(SimpleNamespace(tokens_per_chunk=4, group_idx=0),),
+            supports_partial_tail=True,
+            tokens_per_hash=2,
+        )
+        sched._partial_tail_block_size = 4
+        sched.manager = MagicMock()
+        sched._make_boundary_key = MagicMock(return_value="tail6")
+        req = SimpleNamespace(
+            request_id="r1", _tpu_local_hit_tokens=6, block_hashes=["h0", "h1", "h2"]
+        )
+        req_status = SimpleNamespace(
+            transfer_jobs=set(transfer_jobs),
+            num_locally_computed_tokens=4,
+            req_context="ctx",
+        )
+        sched._req_status["r1"] = req_status
+        return sched, req, req_status
+
     def test_matched_tokens_deferred_for_transfers_touches_nothing(self):
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
             OffloadingConnectorScheduler,
         )
 
-        sched = self._sched()
-        req = SimpleNamespace(request_id="r1")
-        sched._req_status["r1"] = SimpleNamespace(transfer_jobs={7})
+        sched, req, req_status = self._local_hit_tail_sched(transfer_jobs={7})
         with patch.object(
             OffloadingConnectorScheduler,
             "get_num_new_matched_tokens",
@@ -1682,6 +1703,26 @@ class TestSchedulerUpstreamContract(unittest.TestCase):
         ):
             self.assertEqual(sched.get_num_new_matched_tokens(req, 4), (None, False))
         sched._touch.assert_not_called()
+        # Not even the local hit's partial tail: no lookup ran.
+        sched.manager.touch.assert_not_called()
+        self.assertEqual(req_status.num_locally_computed_tokens, 4)
+
+    def test_matched_tokens_without_a_host_tier_hit_touch_the_local_hit_tail(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        sched, req, req_status = self._local_hit_tail_sched(transfer_jobs=())
+        with patch.object(
+            OffloadingConnectorScheduler,
+            "get_num_new_matched_tokens",
+            return_value=(0, False),
+        ):
+            self.assertEqual(sched.get_num_new_matched_tokens(req, 4), (0, False))
+        sched._touch.assert_called_once_with(req_status)
+        sched.manager.touch.assert_called_once_with(("tail6",), "ctx")
+        sched._make_boundary_key.assert_called_once_with(req, 0, 6, "ctx")
+        self.assertEqual(req_status.num_locally_computed_tokens, 6)
 
     def test_store_jobs_refresh_each_offloading_request_once(self):
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
