@@ -334,8 +334,9 @@ def test_vpu_diet_bit_exact_scoped(monkeypatch, scope, cp):
 
 
 def test_vpu_diet_non_pow2_k_scale(monkeypatch):
-    # The folded scale is not a power of two, so the diet keeps the original
-    # path's multiplies and only skips masks.
+    # The fold needs each factor to be a power of two: sm_scale (1/16 at
+    # head_dim 256) is one, k_scale 0.37 is not. So the diet keeps the
+    # original path's multiplies and only skips masks.
     inputs, logical, _ = _setup(jnp.float8_e4m3fn, _SHORT, seed=2)
     total = int(inputs["cu_q_lens"][-1])
     old, _ = _run(monkeypatch, inputs, diet=False, k_scale=0.37)
