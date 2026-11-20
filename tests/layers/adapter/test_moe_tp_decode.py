@@ -759,6 +759,8 @@ def test_ep_split_body_gives_each_core_its_rows_of_the_psum_path(
             "reduce_scatter_supports",
             lambda rows, hidden: False,
         )
+    # Never read: with reduce_scatter_supports False, rotated_scatter_rows
+    # falls back to scatter_rows. The table only routes the split through it.
     table = np.zeros(16, np.int32) if rotated_table else None
     split = run(moe_tp_decode._ep_split_body(statics, ranks, "ep", table), *own)
 

@@ -477,8 +477,9 @@ def test_rotated_scatter_rows_gives_each_core_the_rows_of_scatter_rows(
 ):
     """v2.rotated_scatter_rows, each core's index fed as data, against
     scatter_rows, bit for bit: integer partials keep every bf16 sum exact in
-    any order. One rotated kernel per combine chunk, none for a shape the
-    kernel does not take."""
+    any order. One reduce_scatter_chunks call in 2048-token chunks, which
+    covers both combine chunks at 4096 tokens, and none for a shape the kernel
+    does not take."""
     places = [
         ((x, y, z), c) for x in (0, 1) for y in (0, 1) for z in (0, 1) for c in (0, 1)
     ]
