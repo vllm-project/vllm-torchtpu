@@ -208,8 +208,34 @@ def build(arm, geo, mesh, layers, interpret=False):
         h, m = chain(prev[0], block[0], pinj[0], ws)
         return h[None], m[None]
 
-    return jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P("d"), P("d"), P("d"), P()), out_specs=(P("d"), P("d")),
-                                 check_vma=False))
+    return jax.shard_map(body, mesh=mesh, in_specs=(P("d"), P("d"), P("d"), P()), out_specs=(P("d"), P("d")),
+                         check_vma=False)
+
+
+def abstract(tree):
+    """Shape, dtype and sharding only (no layout) for every leaf."""
+    import jax
+    return jax.tree.map(lambda v: jax.ShapeDtypeStruct(v.shape, v.dtype, sharding=v.sharding), tree)
+
+
+def compile_auto(fn, x_or_specs, ws_or_spec, auto=True):
+    """Compile a chain with AUTO layouts for the HC weights (INJMXU-2's fix of the bench up-weight relayout, credit: the served
+    engine pins the up weight row-major once, so the kernel sees no per-call relayout; an outer jit whose in_shardings carry
+    Format(Layout.AUTO, ...) for the weights, lowered on ABSTRACT arguments). The caller lays the arrays into the compiled
+    input formats once (lay_args) and calls only the compiled executable. auto=False keeps default layouts (interpret)."""
+    import jax
+    from jax.experimental.layout import Format, Layout
+    xsh = tuple(v.sharding for v in x_or_specs)
+    wsh = [{k: Format(Layout.AUTO, v.sharding) if auto else v.sharding for k, v in d.items()} for d in ws_or_spec]
+    j = jax.jit(fn, in_shardings=xsh + (wsh,))
+    return j.lower(*abstract(tuple(x_or_specs)), abstract(ws_or_spec)).compile()
+
+
+def lay_args(comp, x, ws):
+    """Put the inputs and the weights into the compiled program's input formats (once, outside timing) -> (x, ws)."""
+    import jax
+    fm = comp.input_formats[0]
+    return tuple(jax.device_put(tuple(x), tuple(fm[:3]))), jax.device_put(ws, fm[3])
 
 
 def build_single(arm, geo, mesh, interpret=False):
@@ -527,8 +553,7 @@ def main(argv=None):
         os.replace(a.out + ".tmp", a.out)
 
     def compile_long(arm, rows, specs_or_x, ws_or_spec):
-        b = build(arm, geo, mesh, LL, a.interpret)
-        comp = b.lower(*specs_or_x, ws_or_spec).compile()
+        comp = compile_auto(build(arm, geo, mesh, LL, a.interpret), specs_or_x, ws_or_spec, auto=not a.interpret)
         txt = comp.as_text()
         cnt = None if a.interpret else kernel_counts(txt)
         eng = None if a.interpret else engaged(arm, cnt, LL)
@@ -591,11 +616,12 @@ def main(argv=None):
             t0 = time.time()
             try:
                 cl, rec = compile_long(arm, rows, x, ws)
-                cs = build(arm, geo, mesh, LS, a.interpret).lower(*x, ws[:LS]).compile()
-                o = jax.device_get(cs(*x, ws[:LS]))
+                cs = compile_auto(build(arm, geo, mesh, LS, a.interpret), x, ws[:LS])
+                al, as_ = lay_args(cl, x, ws), lay_args(cs, x, ws[:LS])
+                o = jax.device_get(cs(*as_[0], as_[1]))
                 rec["short_finite_fraction"] = float(np.mean([np.isfinite(np.asarray(v, np.float32)).mean() for v in o]))
                 rec["compile_s"] = round(time.time() - t0, 1)
-                progs[arm] = (cl, cs)
+                progs[arm] = (cl, cs, al, as_)
             except Exception as e:  # noqa: BLE001
                 rec = {"compiled": False, "error": f"{type(e).__name__}: {str(e)[:1500]}"}
                 res["errors"].append({"rows": rows, "arm": arm, "error": rec["error"]})
@@ -609,20 +635,21 @@ def main(argv=None):
             ls, ss = {k: [] for k in seq_arms}, {k: [] for k in seq_arms}
             for it in range(iters):
                 for arm in seq_arms[it % len(seq_arms):] + seq_arms[:it % len(seq_arms)]:
-                    cl, cs = progs[arm]
+                    cl, cs, al, as_ = progs[arm]
                     t0 = time.perf_counter()
-                    jax.block_until_ready(cl(*x, ws))
+                    jax.block_until_ready(cl(*al[0], al[1]))
                     ls[arm].append((time.perf_counter() - t0) * 1e6)
                     t0 = time.perf_counter()
-                    jax.block_until_ready(cs(*x, ws[:LS]))
+                    jax.block_until_ready(cs(*as_[0], as_[1]))
                     ss[arm].append((time.perf_counter() - t0) * 1e6)
             return ls, ss
 
         try:
             for arm in ran:
                 for _ in range(3):
-                    jax.block_until_ready(progs[arm][0](*x, ws))
-                    jax.block_until_ready(progs[arm][1](*x, ws[:LS]))
+                    cl, cs, al, as_ = progs[arm]
+                    jax.block_until_ready(cl(*al[0], al[1]))
+                    jax.block_until_ready(cs(*as_[0], as_[1]))
             if "S512" in ran:
                 ls, ss = time_arms(["S512"], a.iters)
                 case["base"] = per_call(ls["S512"], ss["S512"], LL, LS)
