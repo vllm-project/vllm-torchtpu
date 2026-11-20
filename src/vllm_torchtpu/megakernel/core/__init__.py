@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import importlib
+import sys
+import types
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # eager imports for type checkers and IDEs
@@ -33,15 +35,21 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         pool,
         profile,
         profiles,
+        runtime,
         spec,
         weights,
     )
-    from .collectives import AllReduceRing
+    from .collectives import (
+        AllReduceRing,
+    )
     from .dma import (
         pool_alias,
         vmem,
     )
-    from .dma.vmem import fit_default_tiles, fitted_plan
+    from .dma.vmem import (
+        fit_default_tiles,
+        fitted_plan,
+    )
     from .errors import (
         MegakernelConfigError,
         MegakernelLayoutError,
@@ -53,21 +61,21 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         default_tiles,
     )
     from .modules import (
+        GQA,
         Embedding,
         EmbeddingModule,
         GDNLinInLayout,
         GDNParams,
+        GQAModule,
         GQAParams,
         MoEDebug,
         MoEParams,
         Norm,
         NormModule,
     )
-    from .ops import (
-        col_chunk,
-        round_up,
+    from .planner import (
+        encode_ecopy,
     )
-    from .planner import encode_ecopy
     from .pool import (
         POOL_STATE_NAME,
         CacheExec,
@@ -146,67 +154,50 @@ _SUBMODULES = frozenset(
         "pool",
         "profile",
         "profiles",
+        "runtime",
         "spec",
         "weights",
     }
 )
 _LAZY: dict[str, str] = {
     "AllReduceRing": ".collectives",
-    "MegakernelConfigError": ".errors",
-    "MegakernelLayoutError": ".errors",
+    "ArrayOps": ".weights",
+    "Baseline": ".profile",
+    "CacheExec": ".pool",
+    "CompareMode": ".spec",
+    "DEFAULT_PROFILE": ".profile",
     "DebugOptions": ".exec_spec",
-    "ExecSpec": ".exec_spec",
-    "Tiles": ".exec_spec",
-    "default_tiles": ".exec_spec",
     "Embedding": ".modules",
     "EmbeddingModule": ".modules",
-    "GDNLinInLayout": ".modules",
-    "GDNParams": ".modules",
-    "GQAParams": ".modules",
-    "MoEDebug": ".modules",
-    "MoEParams": ".modules",
-    "Norm": ".modules",
-    "NormModule": ".modules",
-    "col_chunk": ".ops",
-    "round_up": ".ops",
-    "encode_ecopy": ".planner",
-    "POOL_STATE_NAME": ".pool",
-    "CacheExec": ".pool",
-    "PoolBackend": ".pool",
-    "PoolLayout": ".pool",
-    "allocate_test_layout": ".pool",
-    "cache_exec": ".pool",
-    "conv_to_raw_page": ".pool",
-    "derive_pool_layout": ".pool",
-    "kv_to_raw_page": ".pool",
-    "make_pool_backend": ".pool",
-    "raw_page_to_conv": ".pool",
-    "raw_page_to_kv": ".pool",
-    "raw_pages_to_ssm": ".pool",
-    "ssm_to_raw_pages": ".pool",
-    "with_cache": ".pool",
-    "DEFAULT_PROFILE": ".profile",
-    "Baseline": ".profile",
-    "Profile": ".profile",
-    "TileContext": ".profile",
-    "TileRule": ".profile",
-    "get_profile": ".profile",
-    "list_profiles": ".profile",
-    "model_default_profile": ".profile",
-    "register_profile": ".profile",
-    "REQUIRED": ".spec",
-    "CompareMode": ".spec",
+    "ExecSpec": ".exec_spec",
     "ExtraInput": ".spec",
     "FrozenDict": ".spec",
+    "GDNLinInLayout": ".modules",
+    "GDNParams": ".modules",
+    "GQA": ".modules",
+    "GQAModule": ".modules",
+    "GQAParams": ".modules",
     "HFParamDecl": ".spec",
+    "JaxArrayOps": ".weights",
     "KVCacheDecl": ".spec",
     "LayerType": ".spec",
+    "MegakernelConfigError": ".errors",
+    "MegakernelLayoutError": ".errors",
+    "MoEDebug": ".modules",
+    "MoEParams": ".modules",
     "ModelSpec": ".spec",
     "Module": ".spec",
     "ModuleBinding": ".spec",
+    "Norm": ".modules",
+    "NormModule": ".modules",
     "OutputRole": ".spec",
+    "POOL_STATE_NAME": ".pool",
     "ParamInit": ".spec",
     "ParamTransform": ".spec",
+    "PoolBackend": ".pool",
+    "PoolLayout": ".pool",
+    "Profile": ".profile",
+    "REQUIRED": ".spec",
     "RecurrentCacheDecl": ".spec",
     "ResolvedModuleGeometry": ".spec",
     "ScratchReq": ".spec",
@@ -214,29 +205,45 @@ _LAZY: dict[str, str] = {
     "Spec": ".spec",
     "StateDecl": ".spec",
     "SwitchSlot": ".spec",
+    "TileContext": ".profile",
+    "TileRule": ".profile",
+    "Tiles": ".exec_spec",
     "VLLMAlias": ".spec",
     "WeightDecl": ".spec",
+    "WeightSource": ".weights",
+    "allocate_test_layout": ".pool",
+    "cache_exec": ".pool",
+    "conv_to_raw_page": ".pool",
+    "default_eplb_cores": ".weights",
+    "default_tiles": ".exec_spec",
+    "derive_pool_layout": ".pool",
+    "encode_ecopy": ".planner",
+    "encode_eplb_ecopy": ".weights",
     "fit_default_tiles": ".dma.vmem",
     "fitted_plan": ".dma.vmem",
-    "pool_alias": ".dma",
-    "ArrayOps": ".weights",
-    "JaxArrayOps": ".weights",
-    "WeightSource": ".weights",
-    "default_eplb_cores": ".weights",
-    "encode_eplb_ecopy": ".weights",
+    "get_profile": ".profile",
+    "kv_to_raw_page": ".pool",
+    "list_profiles": ".profile",
+    "make_pool_backend": ".pool",
+    "model_default_profile": ".profile",
     "pack_spec_logical_weights": ".weights",
+    "pool_alias": ".dma",
+    "raw_page_to_conv": ".pool",
+    "raw_page_to_kv": ".pool",
+    "raw_pages_to_ssm": ".pool",
+    "register_profile": ".profile",
+    "ssm_to_raw_pages": ".pool",
     "vmem": ".dma",
+    "with_cache": ".pool",
 }
 
 __all__ = [
-    "DEFAULT_PROFILE",
-    "POOL_STATE_NAME",
-    "REQUIRED",
     "AllReduceRing",
     "ArrayOps",
     "Baseline",
     "CacheExec",
     "CompareMode",
+    "DEFAULT_PROFILE",
     "DebugOptions",
     "Embedding",
     "EmbeddingModule",
@@ -245,6 +252,8 @@ __all__ = [
     "FrozenDict",
     "GDNLinInLayout",
     "GDNParams",
+    "GQA",
+    "GQAModule",
     "GQAParams",
     "HFParamDecl",
     "JaxArrayOps",
@@ -260,11 +269,13 @@ __all__ = [
     "Norm",
     "NormModule",
     "OutputRole",
+    "POOL_STATE_NAME",
     "ParamInit",
     "ParamTransform",
     "PoolBackend",
     "PoolLayout",
     "Profile",
+    "REQUIRED",
     "RecurrentCacheDecl",
     "ResolvedModuleGeometry",
     "ScratchReq",
@@ -280,7 +291,6 @@ __all__ = [
     "WeightSource",
     "allocate_test_layout",
     "cache_exec",
-    "col_chunk",
     "collectives",
     "conv_to_raw_page",
     "decls",
@@ -313,7 +323,7 @@ __all__ = [
     "raw_page_to_kv",
     "raw_pages_to_ssm",
     "register_profile",
-    "round_up",
+    "runtime",
     "spec",
     "ssm_to_raw_pages",
     "vmem",
@@ -337,3 +347,21 @@ def __getattr__(name: str) -> Any:
 
 def __dir__() -> list[str]:
     return sorted(set(globals()) | set(__all__) | _SUBMODULES)
+
+
+# `verify_module` names both a submodule and the function `verify` exports.
+# The import system binds a loaded submodule on its package, which would
+# shadow the lazily resolved function; the name stays the function, as with
+# the eager `from .verify import verify_module` (the submodule stays importable
+# through `sys.modules`).
+_FUNCTION_NAMED_SUBMODULES = frozenset({"verify_module"})
+
+
+class _Package(types.ModuleType):
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in _FUNCTION_NAMED_SUBMODULES and isinstance(value, types.ModuleType):
+            return
+        super().__setattr__(name, value)
+
+
+sys.modules[__name__].__class__ = _Package
