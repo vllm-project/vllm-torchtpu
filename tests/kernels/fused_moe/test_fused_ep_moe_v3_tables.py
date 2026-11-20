@@ -100,6 +100,24 @@ def test_routing_without_distinct_experts_has_the_wider_bound():
         kernel.check_lookup_range(**_bounds(8, 512, 1024, 10, 128, distinct=False))
 
 
+def test_the_shard_index_is_read_from_the_axis_the_peers_are_addressed_on():
+    """Without a shard_index operand the kernel reads the shard's index from
+    `axis`, and its hosted transport addresses the peers on MESH_AXIS: any
+    other axis is refused before anything is built."""
+    with pytest.raises(ValueError, match="addresses its peers on"):
+        kernel.shard_tables_kernel(
+            jnp.zeros((2, 8, LANES), jnp.int32),
+            num_experts=16,
+            num_shards=2,
+            pairs_per_shard=1024,
+            routed_rows_per_shard=512,
+            block=1024,
+            row_block=ROW_BLOCK,
+            slot_field=tables.alignment_slot_field(2),
+            axis="replica",
+        )
+
+
 # A two-shard world small enough for the interpreter. Each token selects
 # TOP_K distinct experts.
 SHARDS, EXPERTS, TOP_K, TOKENS, TILE = 2, 16, 4, 256, 32

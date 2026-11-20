@@ -670,8 +670,16 @@ def shard_tables_kernel(
     address their peers by (layout.MESH_AXIS is the expert-parallel one).
     `shard_index` (an int32 [1] SMEM operand) and `side_effects` are
     transport.start_transport's; `side_effects` applies when the call hosts
-    the transport.
+    the transport. `axis` is the axis the shard's own index is read from
+    when `shard_index` is None; the peers are addressed on
+    layout.MESH_AXIS, so it must be that axis.
     """
+    if axis != layout.MESH_AXIS:
+        raise ValueError(
+            f"axis {axis!r}: the shard tables read the shard's index from the "
+            f"axis the hosted transport addresses its peers on, "
+            f"{layout.MESH_AXIS!r}"
+        )
     check_lookup_range(
         num_experts=num_experts,
         num_shards=num_shards,
