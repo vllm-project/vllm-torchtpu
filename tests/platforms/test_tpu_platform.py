@@ -288,6 +288,7 @@ class TestTpuPlatform:
         vllm_config.model_config.dtype = torch.bfloat16
         vllm_config.model_config.is_hybrid = False
         vllm_config.model_config.is_attention_free = False
+        vllm_config.model_config.use_mla = False
         vllm_config.model_config.hf_config = None
         # Set in ModelConfig.__post_init__, so the spec has no such attribute.
         vllm_config.model_config.runner_type = "generate"
@@ -605,20 +606,41 @@ class TestTpuPlatform:
         (call,) = mock_logger.warning_once.call_args_list
         assert call.args[3] == "the engine has no kv_transfer_config"
 
+    @pytest.mark.parametrize(
+        "custom,use_mla,expected",
+        [
+            (False, False, "PallasAttentionBackend"),
+            (True, False, "PallasBatchedRPAAttentionBackend"),
+            (True, True, "PallasMLAttentionBackend"),
+            (False, True, "PallasMLAttentionBackend"),
+        ],
+    )
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
     def test_kv_transfer_page_check_gets_the_attention_backend(
-        self, mock_prepare_env, mock_apply_patches, vllm_config
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        custom,
+        use_mla,
+        expected,
     ):
-        """check_and_update_config hands the page check the engine's backend:
-        the fixture's engine uses the default backend, not CUSTOM."""
-        from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+        """check_and_update_config hands the page check the backend the
+        engine's layers run: the default one, CUSTOM's batched RPA, or, for an
+        MLA model whatever --attention-backend names, the MLA backend."""
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        from vllm_torchtpu.layers.adapter import attention
 
         class Checked(Exception):
             pass
 
+        if custom:
+            vllm_config.attention_config.backend = AttentionBackendEnum.CUSTOM
+        vllm_config.model_config.use_mla = use_mla
         with (
             patch(
                 "vllm_torchtpu.layers.adapter.attention.check_kv_transfer_page",
@@ -629,7 +651,48 @@ class TestTpuPlatform:
             TpuPlatform.check_and_update_config(vllm_config)
         (call,) = check.call_args_list
         assert call.args[0] is vllm_config
-        assert call.args[2] is PallasAttentionBackend
+        assert call.args[2] is getattr(attention, expected)
+
+    @patch("vllm_torchtpu.layers.adapter.attention.logger")
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_an_mla_engine_under_custom_logs_an_ignored_kv_transfer_page(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        mock_logger,
+        vllm_config,
+        monkeypatch,
+    ):
+        """An MLA model runs the MLA backend even with --attention-backend
+        CUSTOM, which does not page by tpu_kv_transfer, so a page set for it is
+        logged as ignored, also on the seq-along-lane layout. Stopped at the
+        check that follows the page check."""
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        class Checked(Exception):
+            pass
+
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        vllm_config.attention_config.backend = AttentionBackendEnum.CUSTOM
+        vllm_config.model_config.use_mla = True
+        vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector="TPURaidenConnector", kv_role="kv_consumer"
+        )
+        vllm_config.additional_config = {"tpu_kv_transfer": {"kernel_page_tokens": 128}}
+        with (
+            patch.object(
+                tpu_platform.PcpStaticSupportValidator,
+                "validate_platform_config",
+                side_effect=Checked,
+            ),
+            pytest.raises(Checked),
+        ):
+            TpuPlatform.check_and_update_config(vllm_config)
+        (call,) = mock_logger.warning_once.call_args_list
+        assert "PallasMLAttentionBackend" in call.args[3]
 
     @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
     @patch("vllm_torchtpu.patch_registry.apply")
