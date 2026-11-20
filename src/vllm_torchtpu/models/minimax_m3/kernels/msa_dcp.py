@@ -484,14 +484,21 @@ def local_candidates(
     # `block_rows` rows mostly of padding: the kernel's topk passes scan every
     # row of the block.
     block_rows = min(block_rows, max(8, -(-num_tokens // 8) * 8))
-    # Only where 128-row blocks pad less (not one block's worth of rows, nor a
-    # multiple of 256), and not for a class with `live_rows`: its unpadded
-    # scores must hold whole blocks of the size it was planned for (below).
+    # 128-row transposed blocks (rows on the lanes) where they pad less, and for
+    # a batch of one block's rows or fewer (decode): there they pick with
+    # elementwise maxima, where a row-major block of a few rows chains three
+    # cross-lane reductions per pick (7,389 cycles at 8 rows, AOT): 6.5 ->
+    # 4.6 us per call at 8-40 rows, bit-identical (bench j-05ee4bfa). Not for
+    # a class with `live_rows`: its unpadded scores must hold whole blocks of
+    # the size it was planned for (below).
     rows_128 = -(-num_tokens // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS
     if (
         live_rows is None
-        and block_rows < num_tokens <= _DECODE_CANDIDATE_TOKENS
-        and rows_128 < -(-num_tokens // block_rows) * block_rows
+        and num_tokens <= _DECODE_CANDIDATE_TOKENS
+        and (
+            num_tokens <= block_rows
+            or rows_128 < -(-num_tokens // block_rows) * block_rows
+        )
     ):
         block_rows = _TRANSPOSED_ROWS
     if pretransposed:
