@@ -256,8 +256,11 @@ def test_steps_without_prefill_tokens_are_never_deferred(clock):
 def test_steps_without_results_are_forgotten(clock):
     core = _core(clock, 0, [])
     stepper = deferred_step.DeferredStepper(core)
+    in_flight = core.scheduler.schedule()
+    core.batch_queue.appendleft((None, in_flight, None))
     outputs = [core.scheduler.schedule() for _ in range(4 * core.batch_queue_size + 1)]
     assert len(stepper.sent) <= 4 * core.batch_queue_size
+    assert id(in_flight) in stepper.sent
     core.scheduler.update_from_output(outputs[0], None)
     assert stepper.last_end is None
 

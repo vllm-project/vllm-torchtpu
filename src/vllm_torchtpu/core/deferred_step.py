@@ -146,10 +146,12 @@ class DeferredStepper:
             sent=time.monotonic(),
         )
         # A step's record is dropped when its result is read. A step whose
-        # result is never read would stay, so the records are cleared once
-        # they hold 4 times the steps that can be in flight.
+        # result is never read would stay, so once the records hold 4 times
+        # the steps that can be in flight, only those of the steps in the
+        # batch queue are kept.
         if len(self.sent) >= 4 * self.core.batch_queue_size:
-            self.sent.clear()
+            in_flight = {id(entry[1]) for entry in self.core.batch_queue}
+            self.sent = {k: v for k, v in self.sent.items() if k in in_flight}
         self.sent[id(scheduler_output)] = step
         self.newest = step
 
