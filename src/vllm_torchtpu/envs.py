@@ -2243,9 +2243,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Directory (e.g. /dev/shm/vllm-tpu-pieces) where every API server process
     # of the container shares the segment tokenizer's encoded pieces, so a turn
     # served by another process than its session's previous turn reuses the
-    # history's ids. Each process keeps up to 128 MiB of its own writes there
-    # and on start trims older files to the same bound. Empty: each process
-    # keeps its own cache only.
+    # history's ids. Takes effect only with VLLM_TPU_SEGMENT_TOKENIZE=1. Each
+    # tokenizer of a process keeps up to 128 MiB of its own writes there, and
+    # each process trims older files to the same bound at startup. Empty: each
+    # process keeps its own cache only.
     "VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR": env_str(
         "VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR", ""
     ),

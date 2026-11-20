@@ -92,10 +92,12 @@ class SharedPieceStore:
     File layout: magic, text byte count, the piece's UTF-8 text, then its ids
     as native uint32. A file is used only when its text equals the piece.
 
-    Each process removes its own oldest writes past ``max_written_bytes``, and
-    on start removes the oldest piece files under the root, those of earlier
-    runs and other tokenizers included, past the same bound. The root then
-    holds at most ``max_written_bytes`` per running process plus one more.
+    Each store removes its own oldest writes past ``max_written_bytes``. Each
+    process also calls ``trim_piece_files`` at startup, before it serves, so
+    files of earlier runs and other tokenizers leave the root then and no
+    request waits for the scan. The root holds at most ``max_written_bytes``
+    per store of a running process, plus whatever processes that exited since
+    the last startup left.
     """
 
     _MAGIC = b"SPv1"
@@ -110,31 +112,6 @@ class SharedPieceStore:
         self._written: deque[tuple[str, int]] = deque()
         self._written_bytes = 0
         self._write_failed = False
-        self._trim(root)
-
-    def _trim(self, root: str) -> None:
-        """Remove the oldest piece files under ``root`` past ``max_written_bytes``."""
-        files = []
-        with contextlib.suppress(OSError), os.scandir(root) as subdirs:
-            for subdir in subdirs:
-                if not self._DIGEST.fullmatch(subdir.name) or not subdir.is_dir(
-                    follow_symlinks=False
-                ):
-                    continue
-                with contextlib.suppress(OSError), os.scandir(subdir.path) as entries:
-                    for entry in entries:
-                        if not self._PIECE_FILE.fullmatch(entry.name):
-                            continue
-                        with contextlib.suppress(OSError):
-                            stat = entry.stat(follow_symlinks=False)
-                            files.append((stat.st_mtime, stat.st_size, entry.path))
-        total = sum(size for _, size, _ in files)
-        for _, size, path in sorted(files):
-            if total <= self._max_written_bytes:
-                break
-            with contextlib.suppress(OSError):
-                os.unlink(path)
-            total -= size
 
     def _path(self, text: bytes) -> str:
         return os.path.join(self.dir, hashlib.blake2b(text, digest_size=16).hexdigest())
@@ -197,6 +174,31 @@ class SharedPieceStore:
             self._written_bytes -= old_size
             with contextlib.suppress(OSError):
                 os.unlink(old_path)
+
+
+def trim_piece_files(root: str, max_bytes: int) -> None:
+    """Remove the oldest piece files under ``root`` past ``max_bytes``."""
+    files = []
+    with contextlib.suppress(OSError), os.scandir(root) as subdirs:
+        for subdir in subdirs:
+            if not SharedPieceStore._DIGEST.fullmatch(subdir.name) or not subdir.is_dir(
+                follow_symlinks=False
+            ):
+                continue
+            with contextlib.suppress(OSError), os.scandir(subdir.path) as entries:
+                for entry in entries:
+                    if not SharedPieceStore._PIECE_FILE.fullmatch(entry.name):
+                        continue
+                    with contextlib.suppress(OSError):
+                        stat = entry.stat(follow_symlinks=False)
+                        files.append((stat.st_mtime, stat.st_size, entry.path))
+    total = sum(size for _, size, _ in files)
+    for _, size, path in sorted(files):
+        if total <= max_bytes:
+            break
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        total -= size
 
 
 def tokenizer_digest(backend: Any) -> str:
@@ -600,10 +602,12 @@ def patch_renderer_segment_tokenize() -> None:
         if (
             envs.VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS
             or envs.VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS
+            or envs.VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR
         ):
             logger.warning(
-                "VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS and "
-                "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS take effect only with "
+                "VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS, "
+                "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS and "
+                "VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR take effect only with "
                 "VLLM_TPU_SEGMENT_TOKENIZE=1"
             )
         return
@@ -620,6 +624,7 @@ def patch_renderer_segment_tokenize() -> None:
     if shared_dir:
         # A path that cannot be a directory fails here, at startup.
         os.makedirs(shared_dir, exist_ok=True)
+        trim_piece_files(shared_dir, _SHARED_WRITTEN_BYTES)
 
     def _tokenize_prompt(self, prompt, params):
         kwargs = params.get_encode_kwargs()

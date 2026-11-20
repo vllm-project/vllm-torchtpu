@@ -15,11 +15,15 @@ import fastokens
 import pytest
 import tokenizers
 from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers, trainers
+from transformers import PreTrainedTokenizerFast
+from vllm.renderers import base as renderer_base
 
+from vllm_torchtpu import segment_tokenize as st
 from vllm_torchtpu.segment_tokenize import (
     SegmentTokenizer,
     SharedPieceStore,
     tokenizer_digest,
+    trim_piece_files,
 )
 
 SPECIALS = [
@@ -570,8 +574,7 @@ def test_shared_file_with_too_long_text_length_is_not_used(tmp_path):
     assert seg.shared_hits == 0
 
 
-def test_start_trims_piece_files_of_earlier_runs(tmp_path):
-    tok = _toy_tokenizer()
+def _earlier_run(tmp_path):
     old_dir = tmp_path / ("0" * 16)
     old_dir.mkdir()
     for i in range(10):
@@ -583,13 +586,60 @@ def test_start_trims_piece_files_of_earlier_runs(tmp_path):
     unrelated.mkdir()
     (unrelated / f"{0:032x}").write_bytes(b"x" * 1000)
     (old_dir / "notes.txt").write_bytes(b"x" * 1000)
+    return old_dir, unrelated
 
-    _shared_seg(tok, str(tmp_path), max_written=450)
+
+def test_trim_removes_the_oldest_piece_files_of_earlier_runs(tmp_path):
+    old_dir, unrelated = _earlier_run(tmp_path)
+
+    trim_piece_files(str(tmp_path), 450)
 
     assert sorted(os.listdir(old_dir)) == sorted(
         [f"{i:032x}" for i in (7, 8, 9)] + [f"{10:032x}.123.abc.tmp", "notes.txt"]
     )
     assert os.listdir(unrelated) == [f"{0:032x}"]
+
+
+@pytest.fixture
+def unpatched_renderer(monkeypatch):
+    cls = renderer_base.BaseRenderer
+    monkeypatch.setattr(cls, "_tokenize_prompt", cls.__dict__["_tokenize_prompt"])
+    monkeypatch.setattr(cls, "_tpu_segment_tokenize", False, raising=False)
+    return cls
+
+
+def test_startup_trims_the_shared_dir_and_a_new_store_does_not(
+    tmp_path, monkeypatch, unpatched_renderer
+):
+    old_dir, _ = _earlier_run(tmp_path)
+    monkeypatch.setattr(st, "_SHARED_WRITTEN_BYTES", 450)
+    monkeypatch.setenv("VLLM_TPU_SEGMENT_TOKENIZE", "1")
+    monkeypatch.setenv("VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR", str(tmp_path))
+
+    st.patch_renderer_segment_tokenize()
+
+    kept = sorted(os.listdir(old_dir))
+    assert kept == sorted(
+        [f"{i:032x}" for i in (7, 8, 9)] + [f"{10:032x}.123.abc.tmp", "notes.txt"]
+    )
+    _shared_seg(_toy_tokenizer(), str(tmp_path), max_written=100)
+    assert sorted(os.listdir(old_dir)) == kept
+
+
+def test_shared_dir_without_segment_tokenize_warns(
+    tmp_path, monkeypatch, unpatched_renderer
+):
+    warnings = []
+    monkeypatch.setattr(st.logger, "warning", lambda *args: warnings.append(args))
+    monkeypatch.delenv("VLLM_TPU_SEGMENT_TOKENIZE", raising=False)
+    monkeypatch.setenv("VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR", str(tmp_path / "x"))
+
+    st.patch_renderer_segment_tokenize()
+
+    assert len(warnings) == 1
+    assert "VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR" in warnings[0][0]
+    assert not unpatched_renderer._tpu_segment_tokenize
+    assert not (tmp_path / "x").exists()
 
 
 def test_digest_ignores_truncation_and_padding_state():
@@ -600,16 +650,10 @@ def test_digest_ignores_truncation_and_padding_state():
     assert tokenizer_digest(tok) == digest
 
 
-def test_shared_dir_that_cannot_be_created(tmp_path, monkeypatch):
-    pytest.importorskip("vllm")
-    from vllm.renderers import base as renderer_base
-
-    from vllm_torchtpu import segment_tokenize as st
-
+def test_shared_dir_that_cannot_be_created(tmp_path, monkeypatch, unpatched_renderer):
     not_a_dir = tmp_path / "file"
     not_a_dir.write_bytes(b"")
     monkeypatch.setattr(st, "_INSTANCES", {})
-    from transformers import PreTrainedTokenizerFast
 
     tok = _toy_tokenizer()
     hf = PreTrainedTokenizerFast(tokenizer_object=tok)
@@ -618,11 +662,8 @@ def test_shared_dir_that_cannot_be_created(tmp_path, monkeypatch):
     text = _long_text(random.Random(10), 3)
     assert seg.encode(text) == tok.encode(text, add_special_tokens=False).ids
 
-    cls = renderer_base.BaseRenderer
-    monkeypatch.setattr(cls, "_tokenize_prompt", cls.__dict__["_tokenize_prompt"])
-    monkeypatch.setattr(cls, "_tpu_segment_tokenize", False, raising=False)
     monkeypatch.setenv("VLLM_TPU_SEGMENT_TOKENIZE", "1")
     monkeypatch.setenv("VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR", str(not_a_dir))
     with pytest.raises(FileExistsError):
         st.patch_renderer_segment_tokenize()
-    assert not cls._tpu_segment_tokenize
+    assert not unpatched_renderer._tpu_segment_tokenize
