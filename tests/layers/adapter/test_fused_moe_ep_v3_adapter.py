@@ -82,6 +82,22 @@ def test_few_token_cap_must_reach_the_fused_gate_across_the_node(groups, cap, me
             v3.check_kernel_threshold(ep=8, tp=1, lowtok_cap=cap)
 
 
+@pytest.mark.parametrize("threshold", [0, 256])
+def test_tensor_parallel_gate_refuses_a_first_sliced_bucket_below_it(
+    groups, monkeypatch, threshold
+):
+    """TP8 (gate 33) at a sequence-parallel threshold of 0 (the default: every
+    sequence-parallel step is sliced, so the first sliced bucket is one row)
+    or 256 (32 rows per rank): the first sliced bucket is below the gate, so
+    a few-token cap is refused."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    monkeypatch.setattr(sequence_parallel, "DEFAULT_MIN_ROWS", threshold)
+    groups(1, 8)
+    with pytest.raises(ValueError, match="leave steps between the two kernels"):
+        v3.check_kernel_threshold(ep=8, tp=8, lowtok_cap=448)
+
+
 def test_tensor_parallel_gate_is_checked_at_the_first_sliced_bucket(
     groups, monkeypatch
 ):
@@ -112,6 +128,7 @@ def _layer(slots, primaries=None, hidden=128, inter=256):
         routed_scaling_factor=1.0,
         moe_config=SimpleNamespace(
             experts_per_token=2,
+            is_sequence_parallel=False,
             moe_parallel_config=SimpleNamespace(
                 use_ep=True, pcp_size=1, is_sequence_parallel=False
             ),
@@ -133,6 +150,9 @@ def armed(monkeypatch):
     monkeypatch.setattr(v3, "_OP_CONTRACT", None)
     monkeypatch.setattr(v3, "_RANK_BUFFER", None)
     monkeypatch.setattr(v3, "_EXPERT_ORDER", None)
+    # prebuild records both process-wide.
+    monkeypatch.setattr(v3, "_TP_SIZE", None)
+    monkeypatch.setattr(v3, "_EP_SIZE", None)
     monkeypatch.setattr(
         v3, "build_ep_mesh", lambda: SimpleNamespace(shape={v3.EP_AXIS_NAME: EP})
     )
