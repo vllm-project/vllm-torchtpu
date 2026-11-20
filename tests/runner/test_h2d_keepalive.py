@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Host-only tests of the runner's uploads from temporaries: none is uploaded
-non_blocking outside the staged path, and every upload whose device copy is
-cached is synchronous, so no cached tensor can read a freed temporary. The
-staged path's keep-alive until the input-staging fence is tested in
-tests/layers/core/test_attention_metadata.py.
+non_blocking outside the staged path (the spec-decode metadata's uploads,
+whose index tensors later steps reuse, are staged too), and the runner's
+other cached uploads are synchronous, so no cached tensor can read a freed
+temporary. The staged path's keep-alive until the input-staging fence is
+tested in tests/layers/core/test_attention_metadata.py.
 
-The runner module needs vLLM + torch-tpu, so the helpers under test are
-extracted from the source with ``ast`` and run against a fake torch.
+The runner helpers under test are extracted from the source with ``ast`` and
+run against a fake torch; the spec-decode metadata test runs the real
+manager on CPU.
 """
 
 import ast
@@ -26,6 +28,10 @@ import pathlib
 import re
 import textwrap
 from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
 
 SRC = (
     pathlib.Path(__file__).resolve().parents[2]
@@ -43,9 +49,10 @@ def test_no_non_blocking_upload_of_a_temporary_remains():
             "layers/core/attention_metadata.py",
         )
     )
+    # Any device expression: self.device, device, self.runner.device, ...
     pat = re.compile(
         r"torch\.(?:tensor|from_numpy)\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)"
-        r"\s*\.to\(\s*self\.device,\s*non_blocking=True",
+        r"\s*\.to\(\s*[^,()]+,\s*non_blocking=True",
         re.S,
     )
     assert not pat.findall(src)
@@ -57,8 +64,6 @@ def test_no_non_blocking_upload_of_a_temporary_remains():
 
 
 def test_cached_subtract_indices_upload_synchronously():
-    import numpy as np
-
     src = SRC.read_text()
     i = src.index("            sub_cache = self._async_subtract_idx_cache")
     end_marker = "sub_cache[sub_key] = (seq_idx_dev, pos_idx_dev, qx_sub_mask)"
@@ -134,8 +139,6 @@ def test_cached_subst_indices_fifo_256_and_synchronous():
 def test_uniform_and_heterogeneous_sampling_params_cache():
     """_build_padded_sampling_params reuses one uniform cache entry across
     varying num_active_reqs and uploads synchronously (never _h2d_temp)."""
-    import numpy as np
-
     tree = ast.parse(SRC.read_text())
     fn_node = next(
         item
@@ -240,3 +243,54 @@ def test_uniform_and_heterogeneous_sampling_params_cache():
     assert len(uploads) == 6
     assert np.allclose(out_het[0]._arr[:4, 0], [0.6, 0.8, 0.6, 0.6])
     assert np.allclose(out_het[0]._arr[4:, 0], 1.0)
+
+
+def _staging_runner(input_ids):
+    return SimpleNamespace(
+        device=torch.device("cpu"),
+        arange_np=np.arange(100, dtype=np.int32),
+        num_tokens_paddings=[8, 16, 32, 64],
+        input_ids_cpu=input_ids,
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
+    )
+
+
+@pytest.mark.parametrize("defer", [False, True])
+def test_spec_decode_metadata_uploads_are_staged(defer):
+    """Every host array the spec-decode metadata uploads is staged until the
+    next input-staging fence: the 6 index tensors (cached for later steps) and
+    the drafts, on the uncached and the cached path and when a deferred
+    upload is made."""
+    from vllm_torchtpu.runner.speculative_decoding_manager import (
+        SpeculativeDecodingManager,
+    )
+
+    input_ids = torch.arange(1, 11, dtype=torch.int32)
+    runner = _staging_runner(input_ids)
+    manager = SpeculativeDecodingManager(runner)
+    layout = (np.array([3, 2], dtype=np.int32), np.array([4, 7], dtype=np.int32), 4)
+
+    fresh = manager.get_spec_decode_metadata(*layout, defer_draft_token_ids=defer)
+    staged = [host for host, _ in runner._unfenced_h2d_sources]
+    assert len(staged) == (6 if defer else 7)
+    device_tensors = [
+        fresh.draft_lengths,
+        fresh.target_logits_indices,
+        fresh.bonus_logits_indices,
+        fresh.final_logits_indices,
+        fresh.segment_ids,
+        fresh.group_indices,
+    ]
+    if not defer:
+        device_tensors.insert(0, fresh.draft_token_ids)
+    for host, dev in zip(staged, device_tensors, strict=True):
+        assert torch.equal(host, dev)
+
+    runner._unfenced_h2d_sources.clear()
+    manager.get_spec_decode_metadata(*layout, defer_draft_token_ids=defer)
+    assert len(runner._unfenced_h2d_sources) == (0 if defer else 1)
+    if defer:
+        uploaded = fresh.upload_deferred_draft_token_ids(runner)
+        assert len(runner._unfenced_h2d_sources) == 1
+        assert torch.equal(runner._unfenced_h2d_sources[0][0], uploaded)
