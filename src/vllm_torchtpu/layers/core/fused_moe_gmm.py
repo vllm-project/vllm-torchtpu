@@ -107,8 +107,10 @@ _COUNTING_SORT_SCATTER_MAX_ROWS = _COUNTING_SORT_BLOCK
 # cache on it (layers/adapter/fused_moe.py), so an op built under one cap is
 # never reused under another.
 _MOE_LOWTOK_MAX_TOKENS = 0
-# The routing metadata construction of the non-EP path above the single-sort
-# row cap (prepare_routed_gmm_inputs' nonep_permute) that the grouped-matmul
+# The routing metadata construction of the non-EP path wherever neither the
+# counting sort nor the single packed sort builds it (above the single-sort row
+# cap, and at any row count with TPU_MOE_COUNTING_SORT and TPU_MOE_SINGLE_SORT
+# both off; prepare_routed_gmm_inputs' nonep_permute) that the grouped-matmul
 # MoE op is built with: "sorts" by default, so every model keeps the three
 # sorts; a model rule selects "two_sorts" before its kernels are built
 # (set_nonep_permute).
@@ -406,7 +408,10 @@ def prepare_routed_gmm_inputs(
     code path.
 
     ``nonep_permute`` selects the metadata construction of the non-EP path
-    above the single-sort row cap: "sorts" (the forward permutation, its
+    wherever neither the counting sort nor the single packed sort builds it
+    (above the single-sort row cap, and at any row count with
+    TPU_MOE_COUNTING_SORT and TPU_MOE_SINGLE_SORT both off): "sorts" (the
+    forward permutation, its
     inverse, and the token ids by a packed sort or, when the keys do not
     pack, a gather) or "two_sorts" (the token ids by division of the forward
     permutation).
@@ -475,9 +480,10 @@ def prepare_routed_gmm_inputs(
         and (argsort_revert_indices is None or not packable)
         else None
     )
-    # The whole-expert path above the single-sort cap: one argsort for the
-    # forward permutation, then either a second argsort (its inverse) and a
-    # packed sort (the token ids), or the token ids by division.
+    # The non-EP path without the counting sort or the single packed sort
+    # (above the single-sort cap, or with both turned off): one argsort for
+    # the forward permutation, then either a second argsort (its inverse) and
+    # a packed sort (the token ids), or the token ids by division.
     if (
         nonep_permute == "two_sorts"
         and not use_ep
