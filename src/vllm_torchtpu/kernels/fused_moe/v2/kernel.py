@@ -358,28 +358,18 @@ def _chunked_dot(lhs, rhs_chunk, n_chunks, kb):
     return acc
 
 
-def expert_ffn_fp8(
+def _expert_gate_up_fp8(
     act_q,
     act_scale,
     w1,
-    w2,
     w1s,
+    *,
     act_fn="silu",
     w1b=None,
     wait_w1=None,
     retire_w1=None,
-    wait_w2=None,
-    retire_w2=None,
-    tp_w2s=None,
     ep_tp_size=1,
 ):
-    """One expert's FFN on eight-bit weights: the gate/up matmul, the
-    activation, the intermediate requantization and the down matmul.
-
-    act_q fp8 [m, k] and act_scale f32 [m, 1] are the row-quantized
-    activation rows. Returns the down matmul's accumulator and the
-    intermediate row scale the caller still has to apply to it.
-    """
     if wait_w1 is not None:
         wait_w1()
     if isinstance(w1, tuple):
@@ -402,11 +392,6 @@ def expert_ffn_fp8(
         )
 
         def acc1(lo, hi):
-            """Columns [lo, hi) of the logical [gate | up] accumulator.
-
-            A chunk inside one position's half is a slice of that half; a
-            chunk spanning both (only where the activation chunk is wider
-            than a half, i.e. small test shapes) joins the two pieces."""
             half, lo_j = divmod(lo, inter)
             assert (hi - 1) // inter == half, (lo, hi, inter)
             hi_j = hi - half * inter
@@ -427,6 +412,112 @@ def expert_ffn_fp8(
             retire_w1()
     mid_q, mid_scale = _intermediate_rows(
         acc1, act_scale, inter, w1s=w1s, act_fn=act_fn, w1b=w1b
+    )
+    return mid_q, mid_scale, inter
+
+
+def expert_ffn_fp8_tp_chunked_wire(
+    act_q,
+    act_scale,
+    w1,
+    w2_own_slice,
+    w2_peer_slice,
+    w1s,
+    tp_w2s_slice,
+    *,
+    hidden: int,
+    down_chunk: int,
+    act_fn="silu",
+    wait_w1=None,
+    retire_w1=None,
+    wait_w2=None,
+    retire_w2=None,
+    ep_tp_size=2,
+):
+    """Contract TP-pair FP8 expert FFN in `down_chunk` output slices into FP8 wire.
+
+    Assumes `hidden % down_chunk == 0`, `ep_tp_size == 2`, and zero biases.
+    """
+    mid_q, mid_scale, inter = _expert_gate_up_fp8(
+        act_q,
+        act_scale,
+        w1,
+        w1s,
+        act_fn=act_fn,
+        w1b=None,
+        wait_w1=wait_w1,
+        retire_w1=retire_w1,
+        ep_tp_size=ep_tp_size,
+    )
+    assert mid_scale is not None
+    i_slice = inter // ep_tp_size
+    mid_q_own = mid_q[:, :i_slice]
+    mid_q_peer = mid_q[:, i_slice : 2 * i_slice]
+    if wait_w2 is not None:
+        wait_w2()
+    # Avoid scf.for over down_chunk: static unroll preserves MXU/VPU overlap
+    # while bounding live f32 down accumulators to [m, down_chunk].
+    dn_chunks = []
+    amax_dn = None
+    for c0 in range(0, hidden, down_chunk):
+        part0 = lax.dot_general(
+            mid_q_own,
+            w2_own_slice(c0, down_chunk),
+            DN,
+            preferred_element_type=jnp.float32,
+        ) * tp_w2s_slice(0, c0, down_chunk)
+        if c0 + down_chunk == hidden and retire_w2 is not None:
+            retire_w2()
+        part1 = lax.dot_general(
+            mid_q_peer,
+            w2_peer_slice(c0, down_chunk),
+            DN,
+            preferred_element_type=jnp.float32,
+        ) * tp_w2s_slice(1, c0, down_chunk)
+        chunk_bf16 = ((part0 + part1) * mid_scale).astype(jnp.bfloat16)
+        dn_chunks.append(chunk_bf16)
+        chunk_amax = _absmax_rows(chunk_bf16)
+        amax_dn = chunk_amax if amax_dn is None else jnp.maximum(amax_dn, chunk_amax)
+    wire_scales, dn_sinv, dn_usable = _row_scale(amax_dn)
+    dn_sinv_bf16 = dn_sinv.astype(jnp.bfloat16)
+    wire_rows = jnp.concatenate(
+        [_quant_apply(chk, dn_sinv_bf16, dn_usable) for chk in dn_chunks],
+        axis=-1,
+    )
+    return wire_rows, wire_scales
+
+
+def expert_ffn_fp8(
+    act_q,
+    act_scale,
+    w1,
+    w2,
+    w1s,
+    act_fn="silu",
+    w1b=None,
+    wait_w1=None,
+    retire_w1=None,
+    wait_w2=None,
+    retire_w2=None,
+    tp_w2s=None,
+    ep_tp_size=1,
+):
+    """Contract one FP8 expert FFN into unscaled down accumulator and mid scale.
+
+    act_q fp8 [m, k] and act_scale f32 [m, 1] are the row-quantized
+    activation rows. Returns the down matmul's accumulator and the
+    intermediate row scale the caller still has to apply to it.
+    """
+    mid_q, mid_scale, inter = _expert_gate_up_fp8(
+        act_q,
+        act_scale,
+        w1,
+        w1s,
+        act_fn=act_fn,
+        w1b=w1b,
+        wait_w1=wait_w1,
+        retire_w1=retire_w1,
+        ep_tp_size=ep_tp_size,
     )
     if wait_w2 is not None:
         wait_w2()
@@ -826,6 +917,14 @@ def _build_fused_ep_moe_kernel(
     tp_w1p_slots = 2 if ep_tp_size > 1 else 0
     tp_w1_slots = 0
     tp_w2p_slots = 0
+    tp_down_chunk = host.resolve_tp_down_chunk(
+        hidden,
+        ep_tp_size=ep_tp_size,
+        weight_format=weight_format,
+        has_w1_bias=has_w1_bias,
+        has_w2_bias=has_w2_bias,
+        wire_dtype=wire_dtype,
+    )
     if ep_tp_size > 1:
         if ep_tp_size != 2:
             raise NotImplementedError(
@@ -852,6 +951,7 @@ def _build_fused_ep_moe_kernel(
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
                 wire_dtype=wire_dtype,
+                down_chunk=tp_down_chunk,
             )
             tp_w1_slots, tp_w2p_slots, tp_vmem = cand_w1, cand_w2p, cand_vmem
             if cand_vmem <= slots.limit:
@@ -1312,10 +1412,8 @@ def _build_fused_ep_moe_kernel(
             pltpu.make_async_copy(
                 z_w1_hbm.at[0], z_w1_hbm.at[0], z_recv_sems.at[0]
             ).wait()
-            if tp_w2p_slots > 1:
-                pltpu.make_async_copy(
-                    z_w2_hbm.at[0], z_w2_hbm.at[0], z_recv_sems.at[1]
-                ).wait()
+            # Avoid waiting on z_w2 here: defer z_w2 wait to visit_i + 1 == z_recv_step
+            # so inter-host Z-link w2 transfer overlaps visit z_recv_step - 1.
 
         def _z_wait_recv_w2():
             pltpu.make_async_copy(
@@ -1652,8 +1750,7 @@ def _build_fused_ep_moe_kernel(
 
                     @pl.when(visit_i + 1 == z_recv_step)
                     def _():
-                        if tp_w2p_slots == 1:
-                            _z_wait_recv_w2()
+                        _z_wait_recv_w2()
                         if tp_w1_slots == 1:
                             pltpu.make_async_copy(
                                 z_w1_hbm.at[0], w1_vm.at[0], w1_sems.at[0]
@@ -1661,6 +1758,11 @@ def _build_fused_ep_moe_kernel(
                         pltpu.make_async_copy(
                             z_w2_hbm.at[0], w2_vm.at[0], w2_sems.at[0]
                         ).start(priority=WEIGHT_DMA_PRIORITY)
+                        if tp_w2p_slots > 1:
+                            tp_w2_peer_start(
+                                visit_i + 1,
+                                lax.rem(visit_i + 1, jnp.int32(tp_w2p_slots)),
+                            )
 
                 if tp_w2p_slots == 1:
                     tp_w2_peer_start(visit_i + 1, jnp.int32(0))
@@ -1672,7 +1774,13 @@ def _build_fused_ep_moe_kernel(
                         tp_w1_local_or_z(visit_i + 2, s)
                     tp_w1_peer_start(visit_i + 2, s)
                     if tp_w2p_slots > 1:
-                        tp_w2_peer_start(visit_i + 2, s)
+                        if ep_tp_z_clone:
+
+                            @pl.when(visit_i + 2 != z_recv_step)
+                            def _():
+                                tp_w2_peer_start(visit_i + 2, s)
+                        else:
+                            tp_w2_peer_start(visit_i + 2, s)
 
         def _start_next_gate_up(visit_i, slot, last_tile):
             """`() -> ()`: start the NEXT expert's gate/up slab, called from
@@ -2298,198 +2406,252 @@ def _build_fused_ep_moe_kernel(
                         else None
                     )
                     w1b_row = w1b_vm[pl.ds(e, 1), :] if has_w1_bias else None
-                    if rhs_packed4:
-                        # The block scales apply inside
-                        # expert_ffn_blockscale, so the epilogues below must
-                        # not apply w2s again.
-                        w1s_blocks = w1s_vm[slot]  # [nb1, 2*inter] f32
-                        w2s_blocks = w2s_vm[slot]  # [nb2, hidden] f32
+                    if (
+                        not rhs_packed4
+                        and weight_format == host.WeightFormat.FP8
+                        and tp_down_chunk is not None
+                    ):
                         first_tile, last_tile = t == 0, t == n_tiles - 1
-                        w1_block, w2_block = _fp4_block_readers(
-                            slot,
-                            wait_slab=(
-                                _slab_waiter(e, slot, first_tile)
-                                if streams_weights
-                                else None
-                            ),
-                            slab_retired=(
-                                _start_next_gate_up(visit_i, slot, last_tile)
-                                if starts_next_weights
-                                else None
-                            ),
+                        tp_s = lax.rem(visit_i, jnp.int32(tp_scl_slots))
+                        tp_w1_s = lax.rem(visit_i, jnp.int32(tp_w1_slots))
+                        tp_w2p_s = lax.rem(visit_i, jnp.int32(tp_w2p_slots))
+                        retire_cond = jnp.logical_and(
+                            last_tile,
+                            jnp.logical_and(
+                                visit_i + 1 < n_tp_visit,
+                                visit_i + 1 != z_recv_step,
+                            )
+                            if ep_tp_z_clone
+                            else visit_i + 1 < n_tp_visit,
                         )
-                        acc2, mid_scale = expert_ffn_blockscale(
+                        wire_rows, wire_scales = expert_ffn_fp8_tp_chunked_wire(
                             act_rows,
                             act_scales,
-                            w1_block,
-                            w2_block,
-                            w1s_blocks,
-                            w2s_blocks,
-                            qb=rhs_qb,
-                            act_fn=act_fn,
-                            w1b=w1b_row,
-                        )
-                    elif weight_format == host.WeightFormat.INT8:
-                        w1_chunk, w2_chunk = _int8_chunk_readers(slot)
-                        acc2, mid_scale = expert_ffn_int8(
-                            act_rows,
-                            w1_chunk,
-                            w2_chunk,
-                            w1s_vm[pl.ds(slot, 1), :],
-                            n_chunks1=hidden // host.WIDEN_KCHUNK,
-                            n_chunks2=inter // host.WIDEN_KCHUNK,
-                            act_fn=act_fn,
-                            w1b=w1b_row,
-                        )
-                    elif weight_format == host.WeightFormat.BF16:
-                        acc2, mid_scale = expert_ffn_bf16(
-                            act_rows,
-                            w1_vm[slot],
-                            w2_vm[slot],
-                            act_fn=act_fn,
-                            w1b=w1b_row,
-                        )
-                    else:
-                        first_tile, last_tile = t == 0, t == n_tiles - 1
-                        # The pair schedule slots its scale tables and the
-                        # peer gate/up half by visit parity; the own gate/up
-                        # half and the down slab have one slot each.
-                        tp_s = (
-                            lax.rem(visit_i, jnp.int32(tp_scl_slots))
-                            if ep_tp_size > 1
-                            else slot
-                        )
-                        tp_w1_s = (
-                            lax.rem(visit_i, jnp.int32(tp_w1_slots))
-                            if ep_tp_size > 1
-                            else slot
-                        )
-                        tp_w2p_s = (
-                            lax.rem(visit_i, jnp.int32(tp_w2p_slots))
-                            if ep_tp_size > 1
-                            else slot
-                        )
-                        wait_slab = (
-                            _slab_waiter(e, slot, first_tile)
-                            if (streams_weights and ep_tp_size == 1)
-                            else None
-                        )
-                        acc2, mid_scale = expert_ffn_fp8(
-                            act_rows,
-                            act_scales,
-                            (
-                                (lambda: w1_vm[tp_w1_s], lambda: tp_w1p_vm[tp_s])
-                                if ep_tp_size > 1
-                                else (lambda: w1_vm[slot])
-                            ),
-                            (
-                                (lambda: w2_vm[0], lambda: tp_w2p_vm[tp_w2p_s])
-                                if ep_tp_size > 1
-                                else (lambda: w2_vm[slot])
-                            ),
+                            (lambda: w1_vm[tp_w1_s], lambda: tp_w1p_vm[tp_s]),
+                            lambda c0, cw: w2_vm[0, :, pl.ds(c0, cw)],
+                            lambda c0, cw: tp_w2p_vm[tp_w2p_s, :, pl.ds(c0, cw)],
                             w1s_vm[pl.ds(tp_s, 1), :],
+                            lambda m, c0, cw: tp_w2s_vm[
+                                pl.ds(tp_s, 1), pl.ds(m * hidden + c0, cw)
+                            ],
+                            hidden=hidden,
+                            down_chunk=tp_down_chunk,
                             act_fn=act_fn,
-                            w1b=w1b_row,
-                            wait_w1=(
-                                (
-                                    lambda: pl.when(first_tile)(
-                                        lambda: tp_wait_w1(tp_w1_s, tp_s)
-                                    )
-                                )
-                                if ep_tp_size > 1
-                                else (
-                                    (lambda: wait_slab(w1_copy, 0))
-                                    if wait_slab is not None
-                                    else None
-                                )
+                            wait_w1=lambda: pl.when(first_tile)(
+                                lambda: tp_wait_w1(tp_w1_s, tp_s)
                             ),
                             retire_w1=(
                                 (
-                                    lambda: pl.when(
-                                        jnp.logical_and(
-                                            last_tile,
-                                            jnp.logical_and(
-                                                visit_i + 1 < n_tp_visit,
-                                                visit_i + 1 != z_recv_step,
-                                            )
-                                            if ep_tp_z_clone
-                                            else visit_i + 1 < n_tp_visit,
-                                        )
-                                    )(
+                                    lambda: pl.when(retire_cond)(
                                         lambda: tp_w1_local_start(
                                             visit_i + 1, jnp.int32(0)
                                         )
                                     )
                                 )
-                                if (ep_tp_size > 1 and tp_w1_slots == 1)
-                                else (
-                                    _start_next_gate_up(visit_i, slot, last_tile)
-                                    if (starts_next_weights and ep_tp_size == 1)
-                                    else None
-                                )
-                            ),
-                            wait_w2=(
-                                (
-                                    lambda: pl.when(first_tile)(
-                                        lambda: tp_wait_w2(tp_w2p_s)
-                                    )
-                                )
-                                if ep_tp_size > 1
-                                else (
-                                    (lambda: wait_slab(w2_copy, 0))
-                                    if wait_slab is not None
-                                    else None
-                                )
-                            ),
-                            retire_w2=(
-                                (
-                                    lambda: pl.when(
-                                        jnp.logical_and(
-                                            last_tile,
-                                            jnp.logical_and(
-                                                visit_i + 1 < n_tp_visit,
-                                                visit_i + 1 != z_recv_step,
-                                            )
-                                            if ep_tp_z_clone
-                                            else visit_i + 1 < n_tp_visit,
-                                        )
-                                    )(lambda: tp_w2_local_start(visit_i + 1))
-                                )
-                                if ep_tp_size > 1
+                                if tp_w1_slots == 1
                                 else None
                             ),
-                            tp_w2s=(
-                                (
-                                    lambda m: tp_w2s_vm[
-                                        pl.ds(tp_s, 1), pl.ds(m * hidden, hidden)
-                                    ]
-                                )
-                                if ep_tp_size > 1
-                                else None
+                            wait_w2=lambda: pl.when(first_tile)(
+                                lambda: tp_wait_w2(tp_w2p_s)
+                            ),
+                            retire_w2=lambda: pl.when(retire_cond)(
+                                lambda: tp_w2_local_start(visit_i + 1)
                             ),
                             ep_tp_size=ep_tp_size,
                         )
-                    # The destination applies the router weight, not this.
-                    # Four-bit weights carry w2s inside the block sums; the
-                    # formats whose second matmul took bf16 rows return no row
-                    # scale, so the only thing left to apply is the
-                    # per-channel weight scale where the format has one. The
-                    # epilogue itself is a module-level function, so the
-                    # placement of each of these -- and the down bias's
-                    # add-once property in particular -- has a host-side
-                    # witness rather than only a device-marked one.
-                    wire_rows, wire_scales = wire_row_and_scale(
-                        acc2,
-                        mid_scale,
-                        w2s=(
-                            w2s_vm[pl.ds(slot, 1), :]
-                            if (has_scales and not rhs_packed4 and ep_tp_size == 1)
-                            else None
-                        ),
-                        w2b=w2b_vm[pl.ds(e, 1), :] if has_w2_bias else None,
-                        wire_dtype=form.wire_dtype,
-                        tile_m=height,
-                    )
+                    else:
+                        if rhs_packed4:
+                            # The block scales apply inside
+                            # expert_ffn_blockscale, so the epilogues below must
+                            # not apply w2s again.
+                            w1s_blocks = w1s_vm[slot]  # [nb1, 2*inter] f32
+                            w2s_blocks = w2s_vm[slot]  # [nb2, hidden] f32
+                            first_tile, last_tile = t == 0, t == n_tiles - 1
+                            w1_block, w2_block = _fp4_block_readers(
+                                slot,
+                                wait_slab=(
+                                    _slab_waiter(e, slot, first_tile)
+                                    if streams_weights
+                                    else None
+                                ),
+                                slab_retired=(
+                                    _start_next_gate_up(visit_i, slot, last_tile)
+                                    if starts_next_weights
+                                    else None
+                                ),
+                            )
+                            acc2, mid_scale = expert_ffn_blockscale(
+                                act_rows,
+                                act_scales,
+                                w1_block,
+                                w2_block,
+                                w1s_blocks,
+                                w2s_blocks,
+                                qb=rhs_qb,
+                                act_fn=act_fn,
+                                w1b=w1b_row,
+                            )
+                        elif weight_format == host.WeightFormat.INT8:
+                            w1_chunk, w2_chunk = _int8_chunk_readers(slot)
+                            acc2, mid_scale = expert_ffn_int8(
+                                act_rows,
+                                w1_chunk,
+                                w2_chunk,
+                                w1s_vm[pl.ds(slot, 1), :],
+                                n_chunks1=hidden // host.WIDEN_KCHUNK,
+                                n_chunks2=inter // host.WIDEN_KCHUNK,
+                                act_fn=act_fn,
+                                w1b=w1b_row,
+                            )
+                        elif weight_format == host.WeightFormat.BF16:
+                            acc2, mid_scale = expert_ffn_bf16(
+                                act_rows,
+                                w1_vm[slot],
+                                w2_vm[slot],
+                                act_fn=act_fn,
+                                w1b=w1b_row,
+                            )
+                        else:
+                            first_tile, last_tile = t == 0, t == n_tiles - 1
+                            # The pair schedule slots its scale tables and the
+                            # peer gate/up half by visit parity; the own gate/up
+                            # half and the down slab have one slot each.
+                            tp_s = (
+                                lax.rem(visit_i, jnp.int32(tp_scl_slots))
+                                if ep_tp_size > 1
+                                else slot
+                            )
+                            tp_w1_s = (
+                                lax.rem(visit_i, jnp.int32(tp_w1_slots))
+                                if ep_tp_size > 1
+                                else slot
+                            )
+                            tp_w2p_s = (
+                                lax.rem(visit_i, jnp.int32(tp_w2p_slots))
+                                if ep_tp_size > 1
+                                else slot
+                            )
+                            wait_slab = (
+                                _slab_waiter(e, slot, first_tile)
+                                if (streams_weights and ep_tp_size == 1)
+                                else None
+                            )
+                            acc2, mid_scale = expert_ffn_fp8(
+                                act_rows,
+                                act_scales,
+                                (
+                                    (lambda: w1_vm[tp_w1_s], lambda: tp_w1p_vm[tp_s])
+                                    if ep_tp_size > 1
+                                    else (lambda: w1_vm[slot])
+                                ),
+                                (
+                                    (lambda: w2_vm[0], lambda: tp_w2p_vm[tp_w2p_s])
+                                    if ep_tp_size > 1
+                                    else (lambda: w2_vm[slot])
+                                ),
+                                w1s_vm[pl.ds(tp_s, 1), :],
+                                act_fn=act_fn,
+                                w1b=w1b_row,
+                                wait_w1=(
+                                    (
+                                        lambda: pl.when(first_tile)(
+                                            lambda: tp_wait_w1(tp_w1_s, tp_s)
+                                        )
+                                    )
+                                    if ep_tp_size > 1
+                                    else (
+                                        (lambda: wait_slab(w1_copy, 0))
+                                        if wait_slab is not None
+                                        else None
+                                    )
+                                ),
+                                retire_w1=(
+                                    (
+                                        lambda: pl.when(
+                                            jnp.logical_and(
+                                                last_tile,
+                                                jnp.logical_and(
+                                                    visit_i + 1 < n_tp_visit,
+                                                    visit_i + 1 != z_recv_step,
+                                                )
+                                                if ep_tp_z_clone
+                                                else visit_i + 1 < n_tp_visit,
+                                            )
+                                        )(
+                                            lambda: tp_w1_local_start(
+                                                visit_i + 1, jnp.int32(0)
+                                            )
+                                        )
+                                    )
+                                    if (ep_tp_size > 1 and tp_w1_slots == 1)
+                                    else (
+                                        _start_next_gate_up(visit_i, slot, last_tile)
+                                        if (starts_next_weights and ep_tp_size == 1)
+                                        else None
+                                    )
+                                ),
+                                wait_w2=(
+                                    (
+                                        lambda: pl.when(first_tile)(
+                                            lambda: tp_wait_w2(tp_w2p_s)
+                                        )
+                                    )
+                                    if ep_tp_size > 1
+                                    else (
+                                        (lambda: wait_slab(w2_copy, 0))
+                                        if wait_slab is not None
+                                        else None
+                                    )
+                                ),
+                                retire_w2=(
+                                    (
+                                        lambda: pl.when(
+                                            jnp.logical_and(
+                                                last_tile,
+                                                jnp.logical_and(
+                                                    visit_i + 1 < n_tp_visit,
+                                                    visit_i + 1 != z_recv_step,
+                                                )
+                                                if ep_tp_z_clone
+                                                else visit_i + 1 < n_tp_visit,
+                                            )
+                                        )(lambda: tp_w2_local_start(visit_i + 1))
+                                    )
+                                    if ep_tp_size > 1
+                                    else None
+                                ),
+                                tp_w2s=(
+                                    (
+                                        lambda m: tp_w2s_vm[
+                                            pl.ds(tp_s, 1), pl.ds(m * hidden, hidden)
+                                        ]
+                                    )
+                                    if ep_tp_size > 1
+                                    else None
+                                ),
+                                ep_tp_size=ep_tp_size,
+                            )
+                        # The destination applies the router weight, not this.
+                        # Four-bit weights carry w2s inside the block sums; the
+                        # formats whose second matmul took bf16 rows return no row
+                        # scale, so the only thing left to apply is the
+                        # per-channel weight scale where the format has one. The
+                        # epilogue itself is a module-level function, so the
+                        # placement of each of these -- and the down bias's
+                        # add-once property in particular -- has a host-side
+                        # witness rather than only a device-marked one.
+                        wire_rows, wire_scales = wire_row_and_scale(
+                            acc2,
+                            mid_scale,
+                            w2s=(
+                                w2s_vm[pl.ds(slot, 1), :]
+                                if (has_scales and not rhs_packed4 and ep_tp_size == 1)
+                                else None
+                            ),
+                            w2b=w2b_vm[pl.ds(e, 1), :] if has_w2_bias else None,
+                            wire_dtype=form.wire_dtype,
+                            tile_m=height,
+                        )
                     wire_rows_staged = wire_rows.reshape(
                         height, lane_blocks, HIDDEN_LANE_BLOCK
                     )
@@ -2762,7 +2924,7 @@ def _build_fused_ep_moe_kernel(
                 tp_scales_starts(jnp.int32(0), jnp.int32(0))
                 tp_w1_local_or_z(jnp.int32(0), jnp.int32(0))
                 tp_w1_peer_start(jnp.int32(0), jnp.int32(0))
-                if ep_tp_z_clone and tp_w2p_slots == 1:
+                if ep_tp_z_clone:
 
                     @pl.when(z_recv_step == 0)
                     def _():
@@ -2777,7 +2939,13 @@ def _build_fused_ep_moe_kernel(
                         tp_w1_local_or_z(jnp.int32(1), jnp.int32(1))
                     tp_w1_peer_start(jnp.int32(1), jnp.int32(1))
                     if tp_w2p_slots > 1:
-                        tp_w2_peer_start(jnp.int32(1), jnp.int32(1))
+                        if ep_tp_z_clone:
+
+                            @pl.when(z_recv_step != 1)
+                            def _():
+                                tp_w2_peer_start(jnp.int32(1), jnp.int32(1))
+                        else:
+                            tp_w2_peer_start(jnp.int32(1), jnp.int32(1))
 
                 e0 = visit_sm[tp_me, 0]
 
@@ -3087,6 +3255,8 @@ def _build_fused_ep_moe_kernel(
             bias_tag += "_bf16wire"
         if ep_tp_size > 1:
             bias_tag += f"_eptp{ep_tp_size}"
+        if tp_w2p_slots > 1:
+            bias_tag += f"_w2p{tp_w2p_slots}"
         if ep_tp_z_clone:
             bias_tag += "_zclone"
         name = (

@@ -20,7 +20,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, NamedSharding
+from jax._src.pallas.mosaic import tpu_info
+from jax.experimental.pallas import tpu as pltpu
+from jax.sharding import AbstractMesh, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.fused_moe.v2 import (
@@ -973,3 +975,257 @@ def test_should_trace_sharded_ep_tp_row_split_end_to_end():
     assert out.dtype == x.dtype
     # visit has ep_tp_size + 1 + ep_tp_size = 5 rows and g_local + 2 = 6 cols.
     assert captured_visit_shape == [(5, 6)]
+
+
+def test_should_resolve_tp_down_chunk_and_fit_ep_tp2_peer_w2_slots_in_vmem():
+    assert host_mod.resolve_tp_down_chunk(6144) == 2048
+    assert host_mod.resolve_tp_down_chunk(3072) == 1024
+    assert host_mod.resolve_tp_down_chunk(2048) == 1024
+    assert host_mod.resolve_tp_down_chunk(512) == 256
+    assert host_mod.resolve_tp_down_chunk(384) is None
+    assert host_mod.resolve_tp_down_chunk(128) is None
+    assert host_mod.resolve_tp_down_chunk(6144, ep_tp_size=1) is None
+    assert host_mod.resolve_tp_down_chunk(6144, weight_format=WeightFormat.BF16) is None
+    assert host_mod.resolve_tp_down_chunk(6144, wire_dtype=jnp.bfloat16) is None
+    assert host_mod.resolve_tp_down_chunk(6144, has_w1_bias=True) is None
+    assert host_mod.resolve_tp_down_chunk(6144, has_w2_bias=True) is None
+
+    fake_info = SimpleNamespace(
+        vmem_capacity_bytes=64 * 1024 * 1024,
+        num_lanes=128,
+        generation=host_mod.MIN_GENERATION,
+        get_sublane_tiling=lambda dtype: 32 // jnp.dtype(dtype).itemsize,
+    )
+    limit_large = host_mod.fit_weight_slots(
+        16,
+        128,
+        6144,
+        2048,
+        max_distance=0,
+        weight_format=WeightFormat.FP8,
+        info=fake_info,
+    ).limit
+    vmem_chunked_w1_1_w2p_2 = host_mod.tp_pair_vmem_bytes(
+        16,
+        128,
+        6144,
+        2048,
+        tp_w1_slots=1,
+        tp_w1p_slots=2,
+        tp_w2p_slots=2,
+        tp_scl_slots=2,
+        ep_tp_size=2,
+        weight_format=WeightFormat.FP8,
+        info=fake_info,
+        down_chunk=2048,
+    )
+    vmem_chunked_w1_2_w2p_2 = host_mod.tp_pair_vmem_bytes(
+        16,
+        128,
+        6144,
+        2048,
+        tp_w1_slots=2,
+        tp_w1p_slots=2,
+        tp_w2p_slots=2,
+        tp_scl_slots=2,
+        ep_tp_size=2,
+        weight_format=WeightFormat.FP8,
+        info=fake_info,
+        down_chunk=2048,
+    )
+    assert vmem_chunked_w1_1_w2p_2 <= limit_large < vmem_chunked_w1_2_w2p_2
+
+    vmem_bf16_wire = host_mod.tp_pair_vmem_bytes(
+        4,
+        128,
+        1024,
+        512,
+        weight_format=WeightFormat.FP8,
+        wire_dtype=jnp.bfloat16,
+        info=fake_info,
+    )
+    vmem_fp4 = host_mod.tp_pair_vmem_bytes(
+        4,
+        128,
+        1024,
+        512,
+        weight_format=WeightFormat.FP4,
+        info=fake_info,
+    )
+    vmem_int8 = host_mod.tp_pair_vmem_bytes(
+        4,
+        128,
+        1024,
+        512,
+        weight_format=WeightFormat.INT8,
+        info=fake_info,
+    )
+    assert vmem_bf16_wire > 0
+    assert vmem_fp4 > vmem_int8 > 0
+
+
+def test_should_match_unchunked_fp8_wire_and_retire_w2_only_after_final_chunk():
+    rng = np.random.default_rng(29)
+    m, hidden, inter, down_chunk = 16, 512, 256, 128
+    i_slice = inter // 2
+    act_q = jnp.asarray(rng.standard_normal((m, hidden)), dtype=jnp.float8_e4m3fn)
+    act_s = jnp.asarray(
+        0.15 + 0.4 * rng.random((m, 1), dtype=np.float32), dtype=jnp.float32
+    )
+    w1_own = jnp.asarray(
+        rng.standard_normal((hidden, 2 * i_slice)), dtype=jnp.float8_e4m3fn
+    )
+    w1_peer = jnp.asarray(
+        rng.standard_normal((hidden, 2 * i_slice)), dtype=jnp.float8_e4m3fn
+    )
+    w2_own = jnp.asarray(
+        rng.standard_normal((i_slice, hidden)), dtype=jnp.float8_e4m3fn
+    )
+    w2_peer = jnp.asarray(
+        rng.standard_normal((i_slice, hidden)), dtype=jnp.float8_e4m3fn
+    )
+    w1s = jnp.asarray(
+        0.2 + 0.5 * rng.random((1, 2 * inter), dtype=np.float32), dtype=jnp.float32
+    )
+    w2s0 = jnp.asarray(
+        0.1 + 0.6 * rng.random((1, hidden), dtype=np.float32), dtype=jnp.float32
+    )
+    w2s1 = jnp.asarray(
+        0.3 + 0.8 * rng.random((1, hidden), dtype=np.float32), dtype=jnp.float32
+    )
+
+    events: list[str] = []
+
+    def own_slice(c0: int, cw: int):
+        events.append(f"own:{c0}")
+        return w2_own[:, c0 : c0 + cw]
+
+    def peer_slice(c0: int, cw: int):
+        events.append(f"peer:{c0}")
+        return w2_peer[:, c0 : c0 + cw]
+
+    def w2s_slice(member: int, c0: int, cw: int):
+        table = w2s0 if member == 0 else w2s1
+        return table[:, c0 : c0 + cw]
+
+    got_rows, got_scales = kernel_mod.expert_ffn_fp8_tp_chunked_wire(
+        act_q,
+        act_s,
+        (lambda: w1_own, lambda: w1_peer),
+        own_slice,
+        peer_slice,
+        w1s,
+        w2s_slice,
+        hidden=hidden,
+        down_chunk=down_chunk,
+        wait_w1=lambda: events.append("wait_w1"),
+        retire_w1=lambda: events.append("retire_w1"),
+        wait_w2=lambda: events.append("wait_w2"),
+        retire_w2=lambda: events.append("retire_w2"),
+        ep_tp_size=2,
+    )
+
+    ref_acc2, ref_mid_s = kernel_mod.expert_ffn_fp8(
+        act_q,
+        act_s,
+        (lambda: w1_own, lambda: w1_peer),
+        (lambda: w2_own, lambda: w2_peer),
+        w1s,
+        tp_w2s=lambda idx: w2s0 if idx == 0 else w2s1,
+        ep_tp_size=2,
+    )
+    ref_rows, ref_scales = kernel_mod.wire_row_and_scale(
+        ref_acc2,
+        ref_mid_s,
+        w2s=None,
+        w2b=None,
+        wire_dtype=jnp.float8_e4m3fn,
+        tile_m=m,
+    )
+
+    assert events == [
+        "wait_w1",
+        "retire_w1",
+        "wait_w2",
+        "own:0",
+        "peer:0",
+        "own:128",
+        "peer:128",
+        "own:256",
+        "peer:256",
+        "own:384",
+        "retire_w2",
+        "peer:384",
+    ]
+    np.testing.assert_array_equal(
+        np.asarray(got_rows).view(np.uint8),
+        np.asarray(ref_rows).view(np.uint8),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(got_scales).view(np.uint32),
+        np.asarray(ref_scales).view(np.uint32),
+    )
+
+
+@pytest.mark.parametrize(
+    ("z_clone", "wire_dtype", "expect_w2p2"),
+    [
+        (False, None, True),
+        (True, None, True),
+        (False, jnp.bfloat16, False),
+    ],
+    ids=["fp8_wire_no_zclone", "fp8_wire_zclone", "bf16_wire_fallback"],
+)
+def test_should_export_ep_tp2_w2p_schedule_and_bf16_wire_fallback_to_tpu7x_mlir(
+    z_clone: bool,
+    wire_dtype,
+    expect_w2p2: bool,
+):
+    fake_info = tpu_info.get_tpu_info_for_chip(tpu_info.ChipVersion.TPU_7X, 1)
+    mesh = AbstractMesh((16,), ("ep",))
+    sh = NamedSharding(mesh, P("ep"))
+
+    def trace_fn(x, w1, w2, w1s, w2s, g, r):
+        return fused_ep_moe_v2(
+            x,
+            w1,
+            w2,
+            w1s,
+            w2s,
+            g,
+            topk=8,
+            renormalize=True,
+            mesh=mesh,
+            capacity=128,
+            weight_format=WeightFormat.FP8,
+            wire_dtype=wire_dtype,
+            rank=r,
+            sharded_plan=True,
+            scoring_fn="sigmoid",
+            ep_tp_size=2,
+            ep_tp_row_splits=4,
+            ep_tp_z_clone=z_clone,
+            ep_tp_z_clone_delay=2,
+        )
+
+    def sds(shape, dtype):
+        return jax.ShapeDtypeStruct(shape, dtype, sharding=sh)
+
+    with (
+        patch.object(pltpu, "get_tpu_info", return_value=fake_info),
+        patch.object(tpu_info, "get_tpu_info", return_value=fake_info),
+    ):
+        exported = jax.export.export(jax.jit(trace_fn), platforms=("tpu",))(
+            sds((16384, 6144), jnp.bfloat16),
+            sds((512, 6144, 2048), jnp.float8_e4m3fn),
+            sds((512, 1024, 6144), jnp.float8_e4m3fn),
+            sds((512, 2048), jnp.float32),
+            sds((512, 6144), jnp.float32),
+            sds((16384, 256), jnp.float32),
+            sds((16, 1), jnp.int32),
+        )
+    mlir = exported.mlir_module()
+    assert "partition_id" not in mlir
+    assert ("_w2p2" in mlir) is expect_w2p2
+    assert ("_zclone" in mlir) is z_clone
+    assert ("_bf16wire" in mlir) is (wire_dtype is not None)
