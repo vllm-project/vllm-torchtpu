@@ -45,11 +45,13 @@ def test_matches_head_major_bmm(tokens):
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize("heads", [32, 64])
 @pytest.mark.parametrize("tokens", [256, 300, 4096])
-def test_head_input_matches_slice(tokens):
+def test_head_input_matches_slice(tokens, heads):
     """`absorb_q_head` of the q projection's 2-D output equals `absorb_q` of
-    its q_nope slice bit for bit, and returns each head's last 128 lanes."""
-    heads, nope, rope, rank = 32, 192, 64, 512
+    its q_nope slice bit for bit, and returns each head's last 128 lanes, at
+    the 256-token block of 32 heads and the 128-token block of 64."""
+    nope, rope, rank = 192, 64, 512
     k1, k2 = jax.random.split(jax.random.key(tokens))
     q = jax.random.normal(k1, (tokens, heads, nope + rope)).astype(jnp.bfloat16)
     w = (jax.random.normal(k2, (heads, nope, rank)) * 0.05).astype(jnp.bfloat16)
@@ -98,13 +100,19 @@ def test_head_kernel_block_follows_the_head_count(monkeypatch, heads, block):
 
 @pytest.mark.parametrize(
     ("heads", "tokens", "want"),
-    [(32, 4096, 256), (64, 4096, 128), (16, 4096, 512), (64, 100, 100)],
+    [(32, 4096, 256), (64, 4096, 128), (16, 4096, 256), (64, 100, 100)],
 )
 def test_head_block_is_the_largest_that_fits_vmem(heads, tokens, want):
     """bf16, nope 192 + rope 64, rank 512, in 56 MiB: 256 tokens at 64 heads
-    need more (measured 75.8 MiB), 128 fit."""
+    need more (measured 75.8 MiB), 128 fit. 16 heads would fit 512 but keep
+    the 256-token cap."""
     vmem = 56 * 1024 * 1024
     assert head_block_tokens(tokens, heads, 256, 192, 512, 2, vmem, 8) == want
+
+
+def test_head_block_keeps_the_cap_with_more_vmem():
+    vmem = 128 * 1024 * 1024
+    assert head_block_tokens(4096, 32, 256, 192, 512, 2, vmem, 8) == 256
 
 
 def test_head_block_refuses_a_head_count_with_no_room():

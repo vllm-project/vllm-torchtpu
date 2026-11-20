@@ -36,6 +36,8 @@ MAX_BLOCK_TOKENS = 128
 # Below this, XLA's matmul is as fast: it prefetches W_UK into VMEM under the
 # previous op, while the kernel has to read it itself (measured at decode).
 MIN_TOKENS = 256
+# The largest token block of `absorb_q_head`, the block measured at 32 heads.
+MAX_HEAD_BLOCK_TOKENS = 256
 # The raw q head lanes the sparse MLA attention kernel reads with its
 # in-kernel rope: q_nope[128:192] | q_pe.
 HEAD_TAIL_LANES = 128
@@ -77,13 +79,15 @@ def head_block_tokens(
     vmem: int,
     sublanes: int,
 ) -> int:
-    """The largest power-of-two token block of `absorb_q_head` whose VMEM fits
-    `vmem` beside the single-buffered W_UK: per token, the double-buffered
-    input row and both outputs, and the stacked copy of each output the
-    kernel builds before its relayout. 256 tokens at 32 heads, 128 at 64
+    """The largest power-of-two token block of `absorb_q_head`, at most
+    `MAX_HEAD_BLOCK_TOKENS`, whose VMEM fits `vmem` beside the single-buffered
+    W_UK: per token, the double-buffered input row and both outputs, the
+    stacked copy of each output the kernel builds before its relayout, and
+    one head's f32 dot result. 256 tokens at 32 heads, 128 at 64
     (heads x nope 192 x rank 512, bf16, 56 MiB)."""
     w_uk = heads * nope * rank
-    per_token = heads * (2 * width + 3 * rank + 3 * HEAD_TAIL_LANES)
+    dot = rank * 4 // itemsize
+    per_token = heads * (2 * width + 3 * rank + 3 * HEAD_TAIL_LANES) + dot
     fit = (vmem // itemsize - w_uk) // per_token
     # Token blocks are a multiple of the sublane count.
     if fit < sublanes:
@@ -91,7 +95,7 @@ def head_block_tokens(
             f"absorb_q_head: {heads} heads x {width} x rank {rank} leave VMEM "
             f"for {fit} tokens per block, under {sublanes}"
         )
-    return min(tokens, 1 << (fit.bit_length() - 1))
+    return min(tokens, MAX_HEAD_BLOCK_TOKENS, 1 << (fit.bit_length() - 1))
 
 
 def absorb_q_head(q2d: jax.Array, w_uk_t: jax.Array) -> tuple[jax.Array, jax.Array]:
