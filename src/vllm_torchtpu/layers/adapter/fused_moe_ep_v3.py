@@ -66,8 +66,6 @@ from vllm_torchtpu.distributed.ep_mesh import (
 )
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
-from vllm_torchtpu.kernels.fused_moe.v3 import layer as _latest_layer
-from vllm_torchtpu.kernels.fused_moe.v3 import layout as _latest_layout
 from vllm_torchtpu.layers.adapter.fused_moe_ep import (
     _max_node_tokens,
     _pcp_size,
@@ -131,16 +129,6 @@ def run_moe_v3(
     experts_per_shard: int,
 ):
     """The `run_moe` the adapter's op wraps, on the latest kernel."""
-    # The torch bridge exports the whole op as one jitted function; the
-    # layer's own inner jit is what the export path's SPMD partitioner
-    # refuses. The same partitioner wants a sharding on every side-effecting
-    # custom call (these programs' outputs carry their dependencies), and it
-    # refuses `lax.axis_index` as a partition-id, so the shard's index goes in
-    # as data (the rank tensor). Set here, on the kernel package, for every
-    # program this binding builds.
-    _latest_layer.WRAP_IN_JIT = False
-    _latest_layout.SIDE_EFFECTS = False
-    _latest_layout.SHARD_INDEX_OPERAND = True
     if MESH_AXIS not in mesh.axis_names:
         raise ValueError(
             f"the latest kernel splits the experts over the mesh axis named "
@@ -151,8 +139,13 @@ def run_moe_v3(
     )
 
     def run_moe(x, w1, w2, w1_scale, w2_scale, gating, rank, valid_tokens):
-        # rank: int32 [ep, 1], each shard's mesh index, the adapter's device
-        # tensor; it becomes the kernel's shard-index operand.
+        # The torch bridge exports the whole op as one jitted function, and
+        # the export path's SPMD partitioner refuses the layer's own inner
+        # jit, a side-effecting custom call without a sharding (these
+        # programs' outputs carry their dependencies), and `lax.axis_index`
+        # as a partition-id. So the layer runs without its jit and without
+        # side effects, and the shard's index goes in as data: rank, int32
+        # [ep, 1], each shard's mesh index, the adapter's device tensor.
         drop_nan_rows = valid_tokens is not None
         return fused_ep_moe(
             x,
@@ -172,6 +165,8 @@ def run_moe_v3(
             shard_index=rank,
             experts_per_shard=experts_per_shard,
             valid_tokens=valid_tokens,
+            side_effects=False,
+            wrap_in_jit=False,
         )
 
     return run_moe
