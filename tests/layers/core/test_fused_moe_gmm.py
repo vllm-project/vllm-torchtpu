@@ -77,6 +77,36 @@ def test_owner_output_mode_rejects_invalid_value(monkeypatch):
         getter()
 
 
+def test_topk_weights_float32_env_defaults_to_false(monkeypatch):
+    monkeypatch.delenv("TPU_MOE_TOPK_WEIGHTS_FLOAT32", raising=False)
+    getter = envs.environment_variables["TPU_MOE_TOPK_WEIGHTS_FLOAT32"]
+    assert getter() is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "True", "yes", "YES"])
+def test_topk_weights_float32_env_accepts_truthy(monkeypatch, value):
+    monkeypatch.setenv("TPU_MOE_TOPK_WEIGHTS_FLOAT32", value)
+    getter = envs.environment_variables["TPU_MOE_TOPK_WEIGHTS_FLOAT32"]
+    assert getter() is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "False", "no", "NO"])
+def test_topk_weights_float32_env_accepts_falsy(monkeypatch, value):
+    monkeypatch.setenv("TPU_MOE_TOPK_WEIGHTS_FLOAT32", value)
+    getter = envs.environment_variables["TPU_MOE_TOPK_WEIGHTS_FLOAT32"]
+    assert getter() is False
+
+
+def test_fused_moe_gmm_get_topk_weights_dtype(monkeypatch):
+    monkeypatch.setattr(fused_moe_gmm.envs, "TPU_MOE_TOPK_WEIGHTS_FLOAT32", False)
+    assert fused_moe_gmm._get_topk_weights_dtype(jnp.bfloat16) == jnp.bfloat16
+    assert fused_moe_gmm._get_topk_weights_dtype(jnp.float16) == jnp.float16
+
+    monkeypatch.setattr(fused_moe_gmm.envs, "TPU_MOE_TOPK_WEIGHTS_FLOAT32", True)
+    assert fused_moe_gmm._get_topk_weights_dtype(jnp.bfloat16) == jnp.float32
+    assert fused_moe_gmm._get_topk_weights_dtype(jnp.float16) == jnp.float32
+
+
 @pytest.mark.parametrize("configured_version", ["v1", "v2", "v3"])
 @pytest.mark.parametrize(
     "use_ep,use_sparse_core,threshold,dtype,hidden,topk,num_tokens,source_rows,sc_lanes,expected_path",
