@@ -150,8 +150,9 @@ LADDER_ARGS = (TILE_M, ROWS_ALLOC, 8, 8)
 @pytest.mark.parametrize(
     "override,want",
     [
-        (None, tuple(range(128, 513, 128))),
-        ("0", tuple(range(128, 513, 128))),
+        # Unset, the built-in ladder: HEIGHT_RUNG_EIGHTHS of the tile.
+        (None, (192, 384, 512)),
+        ("0", (192, 384, 512)),
         ("2", (256, 512)),
         ("8", tuple(range(64, 513, 64))),
         ("1", (TILE_M,)),
@@ -163,7 +164,7 @@ LADDER_ARGS = (TILE_M, ROWS_ALLOC, 8, 8)
 def test_the_height_ladder_override(monkeypatch, override, want):
     """The override is a request the ladder still has to be able to honour.
 
-    Unset and zero leave the built-in count. One is the ladder off, by the same
+    Unset and zero leave the built-in ladder. One is the ladder off, by the same
     path a count that cannot be built takes: a step that is not whole row
     blocks, or that does not divide the tile height into equal rungs, or a
     nonsense count. All of them fall back to the single full height rather than
