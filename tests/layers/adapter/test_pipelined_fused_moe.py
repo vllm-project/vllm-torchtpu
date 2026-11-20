@@ -255,6 +255,53 @@ def test_pipelined_moe_execution_flow_and_numerical_parity():
     assert len(rs_calls) == 2
 
 
+@pytest.mark.parametrize(
+    "seq_len, chunked", [(64, False), (8192, True)], ids=["one_chunk", "chunked"]
+)
+def test_the_primary_count_reaches_every_fused_moe_gmm_call(seq_len, chunked):
+    """A copy-slot layer bounds the grouped path to its primaries; the pipelined
+    wrapper passes that bound to fused_moe_gmm on its single-chunk path and on
+    every chunk of the pipelined path."""
+    dp_group = _MockCollectiveGroup(world_size=4, rank=0)
+    hidden_dim, topk = 128, 2
+    hidden_states = torch.randn(seq_len, hidden_dim, dtype=torch.bfloat16)
+    topk_weights = torch.ones(seq_len, topk, dtype=torch.bfloat16) / topk
+    topk_ids = torch.zeros(seq_len, topk, dtype=torch.int32)
+    w1 = torch.randn(6, hidden_dim, hidden_dim * 2, dtype=torch.bfloat16)
+    w2 = torch.randn(6, hidden_dim * 2, hidden_dim, dtype=torch.bfloat16)
+    kernel = MagicMock(side_effect=lambda hidden_states, **kwargs: hidden_states)
+    with (
+        patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384),
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_pcp_group",
+            return_value=None,
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_dp_group",
+            return_value=dp_group,
+        ),
+        patch("vllm_torchtpu.layers.adapter.pipelined_fused_moe.fused_moe_gmm", kernel),
+    ):
+        pipelined_fused_moe_gmm(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=None,
+            topk=topk,
+            activation="silu",
+            num_primary_experts=4,
+        )
+    assert kernel.call_count == (2 if chunked else 1)
+    for call in kernel.call_args_list:
+        assert call.kwargs["num_primary_experts"] == 4
+
+
 def test_pcp_uses_chunk_pipeline_and_not_dp_collectives():
     """Verify PCP selects its own group and executes multiple MoE chunks."""
     pcp_group = _MockCollectiveGroup(world_size=4, rank=0)
@@ -536,6 +583,9 @@ class TestMoEForwardPrecisionBranches:
         # Exercise GMM dispatch; an unset mock attribute would be truthy.
         method._use_adaptive_fused_moe = False
         method._tpu_activation_str = "silu"
+        # A copy-slot layer's bound on the grouped path (the FP8 method's
+        # _prebuild_grouped_path sets it from expert_placement.primary_experts).
+        method._gmm_primary_experts = 3
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
         topk_weights = torch.ones(4, 2, dtype=torch.bfloat16) * 0.5
@@ -572,6 +622,7 @@ class TestMoEForwardPrecisionBranches:
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
         assert bound.arguments["w1"] is layer.w13_weight
+        assert bound.arguments["num_primary_experts"] == 3
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_unquantized_apply_monolithic_dispatches_with_exact_kwargs(self, pipelined):
