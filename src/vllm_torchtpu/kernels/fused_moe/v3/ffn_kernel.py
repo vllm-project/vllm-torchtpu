@@ -82,13 +82,15 @@ class Operands:
 
 @dataclasses.dataclass(frozen=True)
 class Outputs:
-    """The kernel's output refs: arrival and outgoing rows with scales."""
+    """The kernel's output refs: arrival and outgoing rows with scales. The
+    rows are the result rows' dtype (fp8, or bf16 with result_rows="bf16",
+    when the two scale outputs are allocated and never written)."""
 
-    arrivals: object  # [arrival rows, result blocks, LANES] fp8
+    arrivals: object  # [arrival rows, result blocks, LANES]
     arrival_scales: (
         object  # [arrival rows / ROW_BLOCK, 1, ROW_BLOCK] f32, a word per row
     )
-    outgoing: object  # [routed rows, result blocks, LANES] fp8
+    outgoing: object  # [routed rows, result blocks, LANES]
     outgoing_scales: object  # [routed rows / ROW_BLOCK, 1, ROW_BLOCK] f32
 
 
@@ -379,7 +381,6 @@ def build_ffn_kernel(
     build = body.Build(
         tile_rows=tile_rows,
         hidden=hidden,
-        inter=inter,
         num_shards=num_shards,
         mesh_axes=tuple(mesh_axes),
         experts_per_shard=experts_per_shard,
@@ -388,7 +389,6 @@ def build_ffn_kernel(
         has_w2_bias=has_w2_bias,
         no_gate=no_gate,
         activation=activation,
-        pallas_transport=pallas_transport,
         weight_slots=weight_slots,
         weight_prefetch=weight_prefetch,
         result_slots=result_slots,
@@ -405,7 +405,6 @@ def build_ffn_kernel(
         result_blocks=result_blocks,
         tile_blocks=tile_blocks,
         scale_planes=scale_planes,
-        scale_lanes=scale_lanes,
         window_rows=window_rows,
     )
 

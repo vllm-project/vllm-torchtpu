@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whole-expert VMEM-staged FFN pipeline for Fused EP MoE v3.
+"""Whole-expert FFN pipeline for Fused EP MoE v3.
 
-Stages full expert slices in VMEM when tile dimensions fit within the scratchpad
-budget to minimize repeated weight DMA descriptor overhead.
+Each visited expert's two weight matrices are fetched whole into a VMEM weight
+slot, one copy each, while the next experts' weights refill the other slots.
+The build raises when the slots do not fit the VMEM budget.
 """
 
 import jax.numpy as jnp

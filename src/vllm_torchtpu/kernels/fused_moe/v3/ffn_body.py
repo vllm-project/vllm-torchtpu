@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inner MXU tile loop for quantized gate/up, SwiGLU, and down projections in
-Fused EP MoE v3."""
+"""The shared steps of the Fused EP MoE v3 FFN kernel body: the build record,
+the row and token-window streams, the per-tile FFN and result-row calls into
+ffn.py, the commits, the push to the destination shards and the drains."""
 
 import dataclasses
 
@@ -43,7 +44,6 @@ class Build:
 
     tile_rows: int
     hidden: int
-    inter: int
     num_shards: int
     experts_per_shard: int
     form: object
@@ -51,7 +51,6 @@ class Build:
     has_w2_bias: bool
     no_gate: bool
     activation: str
-    pallas_transport: bool
     weight_slots: int
     weight_prefetch: int
     result_slots: int
@@ -70,7 +69,6 @@ class Build:
     result_blocks: int
     tile_blocks: int
     scale_planes: int
-    scale_lanes: int
     window_rows: int
     mesh_axes: tuple = (
         MESH_AXIS,

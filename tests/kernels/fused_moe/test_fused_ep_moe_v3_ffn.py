@@ -177,7 +177,8 @@ BLOCKS = {
 def _expert(weight_fp8, block, token_block, *, swap_halves=False):
     """(the expert's result rows dequantized, the numpy reference)."""
     tokens_blocked = block if token_block is None else token_block
-    rows, row_scales, w1, w2, s1, s2 = _world(weight_fp8, tokens_blocked)
+    world = _world(weight_fp8, tokens_blocked)
+    rows, row_scales, w1, w2, s1, s2 = world
     if swap_halves:  # a control: the gate and up halves the wrong way round
         w1 = np.concatenate([w1[:, INTER:], w1[:, :INTER]], axis=1)
         if s1 is not None:
@@ -204,7 +205,7 @@ def _expert(weight_fp8, block, token_block, *, swap_halves=False):
     w2_scales = None if s2 is None else jnp.asarray(s2)
     q, scales = ffn.result_rows(acc2, mid_scales, w2_scales=w2_scales, w2_bias=None)
     got = np.asarray(q.astype(jnp.float32)) * np.asarray(scales)
-    want = _reference(*_world(weight_fp8, tokens_blocked), block, tokens_blocked)
+    want = _reference(*world, block, tokens_blocked)
     return got, want
 
 
