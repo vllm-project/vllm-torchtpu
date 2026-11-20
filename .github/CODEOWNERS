@@ -181,8 +181,11 @@
 /src/vllm_torchtpu/models/qwen3_5/ @mshrihari3 @benliangw @caojx-google @kyuyeunk
 /tests/models/qwen3_5/ @mshrihari3 @benliangw @caojx-google @kyuyeunk
 
+# Models: Qwen4 Experimental
+/src/vllm_torchtpu/models/qwen4_exp/ @kyuyeunk @BirdsOfAFthr
+
 # Models: Qwen4 Experimental (Alibaba)
-/src/vllm_torchtpu/models/vllm/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
+/src/vllm_torchtpu/models/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
 /tests/models/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
 
 # Models: Qwen3.8 Flash
@@ -240,3 +243,7 @@
 # Entrypoints & E2E Tests
 /tests/entrypoints/ @Lumosis @theminghuang @maxwillzq @Nanfang-Li @QiliangCui
 /tests/e2e/ @Lumosis @theminghuang @maxwillzq @Nanfang-Li @QiliangCui
+
+# Serving Roofline Planner
+/src/vllm_torchtpu/roofline/ @brianseung-google @annyan09023 @bigeye @guowei-dev @benliangw
+/tests/roofline/ @brianseung-google @annyan09023 @bigeye @guowei-dev @benliangw

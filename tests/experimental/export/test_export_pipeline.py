@@ -629,6 +629,61 @@ def test_metadata_declares_the_speculative_config_it_was_exported_with(
     assert meta["serving_config"]["speculative_config"] == speculative
 
 
+@pytest.mark.parametrize(
+    ("additional", "expected"),
+    [
+        (
+            {"gaad": True, "hybrid_prefix_snapshots": 256},
+            {"gaad": True, "hybrid_prefix_snapshots": 256},
+        ),
+        ({}, None),
+        (None, None),
+    ],
+)
+def test_metadata_additional_config(
+    tmp_path,
+    additional: dict[str, Any] | None,
+    expected: dict[str, Any] | None,
+) -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny-torch",
+        vocab_size=32,
+        hidden_size=16,
+        num_layers=1,
+        num_q_heads=2,
+        num_kv_heads=2,
+        head_dim=8,
+        block_size=8,
+        num_blocks=16,
+        max_num_seqs=8,
+        max_model_len=64,
+        token_buckets=(8,),
+        req_buckets=(8,),
+        emit_byte_tokenizer=True,
+        additional_config=additional,
+    )
+    out_dir = str(tmp_path / "exported")
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_torch_callable_to_mlir,
+    ):
+        exporter.export(_TinyTorchExportableLLM(cfg), out_dir)
+    meta = json.loads(Path(out_dir, "metadata.json").read_text())
+    if expected is None:
+        assert "additional_config" not in meta["serving_config"]
+    else:
+        assert meta["serving_config"]["additional_config"] == expected
+
+
+def test_export_config_rejects_non_json_additional_config() -> None:
+    with pytest.raises(TypeError, match="JSON-serializable"):
+        api.TextOnlyLLMExportConfig(
+            model_name="tiny-torch",
+            additional_config={"bad": object()},
+        )
+
+
 class _TinyVerifyingExportableLLM(_TinyTorchExportableLLM):
     """The tiny model whose attention decodes 4-token verify windows."""
 
@@ -1065,6 +1120,7 @@ def _mock_vllm_config(
     compile_sizes: list[int] | None = None,
     static_forward_context: dict[str, Any] | None = None,
     speculative_config: Any = None,
+    additional_config: dict[str, Any] | None = None,
     **model_config_fields: Any,
 ) -> Any:
     """A `VllmConfig` stand-in with every field the export reads."""
@@ -1106,6 +1162,7 @@ def _mock_vllm_config(
             static_forward_context=static_forward_context or {},
         ),
         speculative_config=speculative_config,
+        additional_config={} if additional_config is None else additional_config,
     )
 
 
@@ -1130,6 +1187,31 @@ def test_build_export_config_requires_every_vllm_config_field(
         delattr(getattr(vllm_config, section), field)
         with pytest.raises(AttributeError, match=field):
             build(vllm_config)
+    vllm_config = _mock_vllm_config(str(tmp_path))
+    delattr(vllm_config, "additional_config")
+    with pytest.raises(AttributeError, match="additional_config"):
+        build(vllm_config)
+
+
+@pytest.mark.parametrize(
+    ("additional", "expected"),
+    [
+        (
+            {"gaad": True, "hybrid_prefix_snapshots": 256},
+            {"gaad": True, "hybrid_prefix_snapshots": 256},
+        ),
+        ({}, None),
+    ],
+)
+def test_build_export_config_copies_additional_config(
+    tmp_path: Path,
+    additional: dict[str, Any],
+    expected: dict[str, Any] | None,
+) -> None:
+    cfg = universal_adapter.build_export_config_from_vllm(
+        _mock_vllm_config(str(tmp_path), additional_config=additional)
+    )
+    assert cfg.additional_config == expected
 
 
 def test_build_export_config_sizes_an_unprofiled_kv_pool(tmp_path: Path) -> None:

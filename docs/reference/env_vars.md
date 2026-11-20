@@ -21,6 +21,8 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TORCH_TPU_MP_RENDEZVOUS_PORT` | `None` | Optional explicit TCP port for multi-host `mp` `TCPStore` rendezvous. |
 | `TPU_ACCELERATOR_TYPE` | `None` | Explicit accelerator type override (e.g., `"tpu7x"`, `"v6e-8"`) when running offline compilation or CPU tests. |
 | `TPU_LIBRARY_PATH` | `None` | `libtpu.so` loaded by the TPU runtime. `import libtpu` sets it to the pip package's own library. A custom path (any other file) takes precedence over an installed `libtpu` package: a fingerprint of that file replaces the package version in the compile and Raiden layout cache keys, and the minimum libtpu version check is skipped. |
+| `VLLM_TPU_EXPERIMENTAL_USE_RUST` | `False` | Opt-in. Serves models with the native Rust runtime (`rvllm`) directly behind `vllm serve` (covers both HTTP frontend and engine backend). Off by default until feature parity. Cannot be combined with `VLLM_USE_RUST_FRONTEND`. |
+| `VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY` | `""` | The `rvllm` binary to run when `VLLM_TPU_EXPERIMENTAL_USE_RUST` is enabled. Takes the same values as the launcher's `--rvllm-binary`: a binary's path, or a location (`gs://`, `https://` or a directory) holding `rvllm` and its `metadata.json`. When unset, `rvllm` is looked up on `PATH`. |
 
 ---
 
@@ -85,7 +87,17 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `TPU_GDN_QKVZ_KERNEL_LAYOUT` | `False` | Opt-in. Stores the GDN `in_proj_qkvz` weight in the matmul's (k, n) layout instead of vLLM's [n_out, n_in], removing a per-step weight copy on the per-block FP8 path. Ignored with prefill context parallelism; the experimental AOT export rejects it at TP > 1. |
 | `MOE_REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time MoE expert weight requantization (e.g., `"fp4"`). |
 | `MOE_REQUANTIZE_BLOCK_SIZE` | `None` | Target block size for load-time MoE expert weight requantization. |
+| `TPU_MOE_REQUANT_CHUNK_BYTES` | `1073741824` (1 GiB) | Float32 bytes one load-time MoE requantization chunk materializes on the device. Must be > 0. Lower it if requantization runs out of device memory after loading. |
 | `VLLM_TPU_MXFP4_DEVICE_DEQUANT` | `True` | Performs MXFP4 weight dequantization on TPU device during load rather than on CPU. |
+
+### MoE reference parity
+
+RL and distillation workloads that compare TPU rollouts with an unfused `bfloat16` MoE (the GPU vLLM path: `w13` GEMM -> `bfloat16` -> `SiluAndMul` -> `w2` GEMM -> `bfloat16` -> top-k combine) can turn on two independent `--additional-config` settings, each of which changes one rounding point:
+
+- `"tpu_moe_topk_weights_float32": true` keeps the top-k routing weights and the expert combine of the grouped-matmul MoE path (`fused_moe_gmm`) in `float32` instead of the activation dtype. The `FUSED_MOE_DECODE_KERNEL` and `USE_MOE_TP_DECODE_KERNEL` kernels round the weights to `bfloat16`, so they are not used for MoE layers while it is set. It replaces the removed `TPU_MOE_TOPK_WEIGHTS_FLOAT32` environment variable; startup fails if that variable is still set.
+- `"tpu_moe_silu_bf16": true` rounds the `gmm_v2`-fused SwiGLU `gate`, `up`, and `silu(gate)` to `bfloat16`, as upstream `SiluAndMul` does. It applies only to the `silu` activation: other activations, and the clamped SiLU of DeepSeek-V4 MXFP4 layers (`silu_and_mul_with_clamp`), keep `float32` intermediates. SiLU layers then run on `gmm_v2`, so the v2 fused EP (`USE_MOE_FUSED_EP_KERNEL`), `FUSED_MOE_DECODE_KERNEL`, `USE_MOE_TP_DECODE_KERNEL`, and `TPU_MOE_DENSE_EXPERT_THRESHOLD` paths are not used for them, and `MOE_FUSED_EP_KERNEL_IMPL=adaptive` fails at startup.
+
+Both are off by default; set both (`--additional-config '{"tpu_moe_topk_weights_float32": true, "tpu_moe_silu_bf16": true}'`) to reproduce the unfused `bfloat16` MoE's rounding.
 
 ---
 

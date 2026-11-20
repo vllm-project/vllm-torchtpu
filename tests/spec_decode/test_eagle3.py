@@ -19,6 +19,7 @@ from unittest import mock
 import numpy as np
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from vllm_torchtpu.layers.core.sequence_layout import (
@@ -531,7 +532,141 @@ def test_prepare_draft_inputs_all_layout_keeps_device_seed_gathers(device, monke
     )
     assert positions is chunk.position_ids
     assert gather_indices.cpu()[:2].tolist() == [1, 4]
-    assert gather_indices.cpu()[2:].eq(0).all()
+    # Padded to the loop bucket by repeating the last request, as the sync
+    # path does.
+    assert gather_indices.cpu()[2:].eq(4).all()
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("discard", [[], [1]])
+def test_prepare_draft_inputs_device_seed_pads_to_loop_bucket(device, discard):
+    """The bootstrap seed scatter runs at the loop bucket, like the
+    host-seeded path's: padded rows repeat the last request, and a request in
+    partial prefill seeds from its next prompt token, not its sample."""
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
+        device=device,
+        requests={
+            "r1": SimpleNamespace(num_computed_tokens=0, get_token_id=lambda i: 300 + i)
+        },
+        num_tokens_paddings=[16, 32],
+        _dp_lockstep_enabled=lambda: False,
+    )
+    chunk = _make_chunk(
+        input_ids=torch.arange(16, dtype=torch.int32, device=device),
+        position_ids=torch.arange(16, dtype=torch.int32, device=device),
+        query_start_loc_np=np.array([0, 2, 5], dtype=np.int32),
+        start_index=0,
+        num_reqs=2,
+        device=device,
+    )
+    seeds = []
+    seed_input_ids = proposer._draft_seed_input_ids
+
+    def recorded(input_ids, last_token_indices, next_token_ids):
+        seeds.append(next_token_ids.cpu().tolist())
+        return seed_input_ids(input_ids, last_token_indices, next_token_ids)
+
+    proposer._draft_seed_input_ids = recorded
+    draft_input_ids, _, _, _ = proposer._prepare_draft_inputs(
+        chunk,
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=discard,
+        num_rejected_tokens_np=None,
+        # r1's next prompt token is the one at 0 computed + 3 scheduled.
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={"r1": 3}),
+        device_seed=torch.tensor([101, 999], dtype=torch.int32, device=device),
+    )
+    r1_seed = 303 if discard else 999
+    assert seeds == [[101] + [r1_seed] * 15]
+    # [0..15] left shift, then the seeds at the last slots [1, 4].
+    expected = list(range(1, 16)) + [15]
+    expected[1], expected[4] = 101, r1_seed
+    assert draft_input_ids.cpu().tolist() == expected
+
+
+class _RecordOpShapes(TorchDispatchMode):
+    """Records every aten op dispatched while active, with the shapes and
+    dtypes of its tensor inputs and outputs."""
+
+    def __init__(self):
+        super().__init__()
+        self.ops = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        tensors = [
+            (tuple(t.shape), t.dtype)
+            for t in torch.utils._pytree.tree_leaves((args, kwargs, out))
+            if isinstance(t, torch.Tensor)
+        ]
+        self.ops.append((str(func.overloadpacket), tensors))
+        return out
+
+
+@pytest.mark.parametrize("seed_source", ["device_seed", "next_tokens_device"])
+def test_draft_seed_ops_ignore_request_count_and_partial_prefill(seed_source):
+    """torch-tpu compiles its deferred eager ops per op sequence and shapes,
+    so on the device-seeded paths the seed ops are the same for any request
+    count within a bucket and whether or not a request is in partial
+    prefill; the compiled scatter itself is precompiled per bucket."""
+    device = torch.device("cpu")
+    req_ids = [f"r{i}" for i in range(8)]
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=req_ids),
+        device=device,
+        requests={
+            rid: SimpleNamespace(num_computed_tokens=0, get_token_id=lambda i: 300 + i)
+            for rid in req_ids
+        },
+        num_tokens_paddings=[16, 32],
+        _dp_lockstep_enabled=lambda: False,
+    )
+    proposer._draft_seed_input_ids = lambda input_ids, *_: input_ids
+
+    def seed_ops(num_reqs, discard):
+        # Requests 1.. of the batch, two tokens each: start_index offsets
+        # every host lookup.
+        qsl = np.arange(0, 2 * num_reqs + 1, 2, dtype=np.int32)
+        chunk = _make_chunk(
+            input_ids=torch.arange(32, dtype=torch.int32),
+            position_ids=torch.arange(32, dtype=torch.int32),
+            query_start_loc_np=qsl,
+            start_index=1,
+            num_reqs=num_reqs,
+            device=device,
+            # Padded to the sampler width + 1 by repeating the last end, as
+            # the runner uploads it.
+            attn_ctx=SimpleNamespace(
+                query_start_loc=torch.from_numpy(np.pad(qsl, (0, 8 - num_reqs), "edge"))
+            ),
+        )
+        kwargs = (
+            {"device_seed": torch.arange(100, 108, dtype=torch.int32)}
+            if seed_source == "device_seed"
+            else {"next_tokens_device": torch.full((8, 4), 7, dtype=torch.int32)}
+        )
+        with _RecordOpShapes() as rec:
+            proposer._prepare_draft_inputs(
+                chunk,
+                sampled_token_ids=None,
+                discard_sampled_tokens_req_indices=discard,
+                num_rejected_tokens_np=None,
+                scheduler_output=SimpleNamespace(
+                    num_scheduled_tokens=dict.fromkeys(req_ids, 2),
+                    scheduled_spec_decode_tokens={},
+                ),
+                **kwargs,
+            )
+        return rec.ops
+
+    # The first call also imports modules that build tensors at import time.
+    seed_ops(5, [])
+    baseline = seed_ops(5, [])
+    assert seed_ops(6, []) == baseline
+    assert seed_ops(6, [6]) == baseline
 
 
 def test_propose_delegates_carry_aggregation_after_gather():

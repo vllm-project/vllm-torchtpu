@@ -490,7 +490,7 @@ class TestNvfp4MoEMethod:
             assert mock_load.call_count == 2
             mock_reg.assert_called_once_with(layer, device=layer.w13_weight.device)
             mock_prebuild.assert_called_once_with(
-                topk=2, activation="silu", use_ep=False
+                topk_weights_float32=False, topk=2, activation="silu", use_ep=False
             )
 
         assert layer.w13_weight.shape == (E, H, two_i)
