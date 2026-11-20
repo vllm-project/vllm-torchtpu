@@ -65,6 +65,9 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk,
     streamindex_topk_dcp,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    config as streamidx_config,
+)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
     register_indexer_layer,
 )
@@ -623,6 +626,12 @@ def _streamidx_shared_meta_for(prefix: str) -> bool:
     )
 
 
+# Scheduling group slots of the PCP split-prefill top-k: past the layer and
+# fallback slots of `streamindex_topk.config`, one stride per workspace bucket.
+_PCP_TOPK_SLOT_BASE = 1 << 14
+_PCP_TOPK_SLOT_STRIDE = 1 << 10
+
+
 def pcp_prefill_topk_partition_specs():
     """`(in_specs, out_specs)` of `pcp_prefill_topk` over the DCP mesh."""
     sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
@@ -675,6 +684,7 @@ def pcp_prefill_topk(
     chunk_tokens: int | None = None,
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
     k_write_compact: bool = False,
+    scheduling_group_slot: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """PCP manager split-prefill top-k: write the split rows' K, gather the K
     workspace, top-k the local queries over it (global positions).
@@ -776,6 +786,15 @@ def pcp_prefill_topk(
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
 
             def at_size(size):
+                # Each workspace-size branch of the switch below is its own
+                # chunked pipeline, so each takes a slot of its own.
+                slot = None
+                if scheduling_group_slot is not None:
+                    slot = _PCP_TOPK_SLOT_BASE + (
+                        buckets.index(size) * _PCP_TOPK_SLOT_STRIDE
+                        + scheduling_group_slot
+                    )
+
                 def branch(cache_kv):
                     ws_kv = (ws.position_ordered_sal if sal else ws.position_ordered)(
                         ws.gather_workspace(
@@ -800,6 +819,11 @@ def pcp_prefill_topk(
                         enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                         kv_layout=kv_layout,
                         chunk_tokens=chunk_tokens,
+                        scheduling_group_slot=(
+                            streamidx_config.chunked_scheduling_group_slot(
+                                slot, q.shape[0], chunk_tokens
+                            )
+                        ),
                     ).astype(jnp.int32)
 
                 return branch
@@ -918,6 +942,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         decode_ring = _streamidx_decode_ring()
         shared_meta = self._shared_meta
 
+        # Each layer calls the same jitted kernel with the same shapes, so
+        # without its own slot every layer after the first would reuse the
+        # first one's cached trace -- and its chunked-pipeline scheduling group
+        # ids, which libtpu >= 0.0.50 rejects. The DCP twin of a layer shares
+        # its slot: only one of the two runs in a forward.
+        scheduling_group_slot = streamidx_config.layer_scheduling_group_slot(
+            self.k_cache.prefix
+        )
+
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
             weights: jax.Array,  # [num_tokens, H]
@@ -994,6 +1027,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 decode_pack=decode_pack,
                 decode_ring=decode_ring,
                 shared_meta=shared_meta,
+                scheduling_group_slot=streamidx_config.chunked_scheduling_group_slot(
+                    scheduling_group_slot, q.shape[0], chunk_tokens
+                ),
             )
             return cache_kv, topk_indices
 
@@ -1178,6 +1214,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 skip_empty_decode=skip_empty_decode,
                 skip_empty_decode_chunked=skip_empty_decode_chunked,
                 chunk_tokens=chunk_tokens,
+                scheduling_group_slot=streamidx_config.chunked_scheduling_group_slot(
+                    scheduling_group_slot, q.shape[0], chunk_tokens
+                ),
                 a2a_merge=large and a2a_merge and not hist_merge,
                 hist_merge=large and hist_merge,
                 global_scheduling_group_id=global_group,
@@ -1198,6 +1237,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Fixed arity: torch custom-op schemas take no varargs. One signature
         # per (q_b overlap, rank operand) variant; trailing operands in that
         # order. Both flags off = exactly the eight operands it always had.
+        scheduling_group_slot = streamidx_config.layer_scheduling_group_slot(
+            self.k_cache.prefix
+        )
+
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,
             weights: jax.Array,
@@ -1493,6 +1536,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             "xla": _quantized_matmul_jax,
         }[qb_mode]
 
+        scheduling_group_slot = streamidx_config.layer_scheduling_group_slot(
+            self.k_cache.prefix
+        )
+
         def _absorb_fn(
             q_out: jax.Array, w_uk_t: jax.Array
         ) -> tuple[jax.Array, jax.Array]:
@@ -1561,6 +1608,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 skip_empty_decode=skip_empty_decode,
                 skip_empty_decode_chunked=skip_empty_decode_chunked,
                 chunk_tokens=chunk_tokens,
+                scheduling_group_slot=streamidx_config.chunked_scheduling_group_slot(
+                    scheduling_group_slot, q.shape[0], chunk_tokens
+                ),
                 a2a_merge=large and a2a_merge and not hist_merge,
                 hist_merge=large and hist_merge,
                 global_scheduling_group_id=global_group,
@@ -1875,6 +1925,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         )
         k_write_compact = envs.TPU_INDEXER_K_WRITE_COMPACT
 
+        pcp_slot = streamidx_config.layer_scheduling_group_slot(self.k_cache.prefix)
+
         def _pcp_prefill_topk_jax(
             cache_kv: jax.Array,
             q_bytes: jax.Array,
@@ -1926,6 +1978,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 interleave_size=interleave_size,
                 max_model_len=max_model_len,
                 chunk_tokens=chunk_tokens,
+                scheduling_group_slot=pcp_slot,
                 **layout_kwargs,
             )
 
