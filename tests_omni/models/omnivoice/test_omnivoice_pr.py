@@ -40,6 +40,18 @@ MODEL = "k2-fsa/OmniVoice"
 SAMPLE_RATE = 24000
 ASR_MODEL = "openai/whisper-small"
 
+# vLLM-Omni's default omnivoice.yaml selects the "mp" executor, which loads the
+# model in a separate worker process. The other single-chip engine tests in this
+# lane use the "uni" default and run the engine in the pytest process, which then
+# keeps the TPU open for the rest of the session. On the lane's one-chip host a
+# separate worker started after them fails with "Failed to acquire a TPU device
+# node", so run OmniVoice in-process too.
+OMNI_RUNNER_PARAM = (
+    MODEL,
+    None,
+    {"trust_remote_code": True, "distributed_executor_backend": "uni"},
+)
+
 # Word error rate of the Whisper transcript against the input text, after
 # lowercasing and dropping punctuation. Measured on TPU v7x (torch_tpu 0.2.0,
 # vllm-omni 0.32.0rc1): 0.00 for both cases in two runs; corpus WER over 200
@@ -104,7 +116,7 @@ def asr():
 
 @pytest.mark.parametrize(
     "omni_runner",
-    [(MODEL, None, {"trust_remote_code": True})],
+    [OMNI_RUNNER_PARAM],
     indirect=True,
 )
 class TestOmniVoicePrCiOnTpu:
