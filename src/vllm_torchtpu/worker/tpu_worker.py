@@ -17,6 +17,7 @@
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import ctypes
+import gc
 import os
 import time
 from typing import Any, cast
@@ -820,6 +821,11 @@ class TPUWorker(WorkerBase):
             self.profile_capture_dir = None
             self.profile_canonical_ts = None
             self.profile_session_key = None
+            # Some of the capture's results are left in reference cycles, which
+            # only the cyclic collector frees, and on a serving worker its next
+            # full pass can be far off. Collect now so the capture does not
+            # keep several GiB of host memory on a rank until then.
+            gc.collect()
 
     def _next_profile_session_key(self) -> str:
         """Marker key for the start/stop cycle that is beginning.
