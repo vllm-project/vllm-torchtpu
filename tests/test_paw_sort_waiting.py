@@ -32,6 +32,7 @@ from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 from vllm_torchtpu.core.pp_chunk_scheduler import (
     ExternalHitEstimator,
     TpuPipelineChunkScheduler,
+    _wait_seconds,
 )
 from vllm_torchtpu.core.pp_chunks import StepCostModel
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
@@ -229,6 +230,15 @@ def test_external_hit_counts_when_it_fits():
     s._get_num_free_blocks = lambda: 45
     s._inflight_prefill_reserved_blocks = lambda: 30  # 15 left < 41 to load
     assert _order_seen_by_base_schedule(s) == ["hbm_mid", "dram_small"]
+
+
+def test_the_aging_reads_the_arrival_time_directly():
+    """vLLM's Request always has arrival_time: a request without it is an
+    error, not a request that never ages."""
+    assert _wait_seconds(SimpleNamespace(arrival_time=10.0), 12.5) == 2.5
+    assert _wait_seconds(SimpleNamespace(arrival_time=20.0), 12.5) == 0.0
+    with pytest.raises(AttributeError, match="arrival_time"):
+        _wait_seconds(SimpleNamespace(), 12.5)
 
 
 def test_window_bounds_the_sort():
