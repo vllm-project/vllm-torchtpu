@@ -31,7 +31,7 @@ from ...decls import (
 )
 from ...exec_spec import ExecSpec
 from ...fused_io_hook import fused_io
-from ...ops import BF16, F32, FP8, I32, rup
+from ...ops import BF16, F32, FP8, I32, REC, rup
 from ...pool.config import cache_exec
 from ...spec import Block, SmallField, StateDecl, WeightDecl
 from .conv import conv_step, gdn_in
@@ -54,6 +54,12 @@ from .params import (
 from .recurrence import gdn_rec, gdn_rec_chunked
 from .reference import gdn_reference
 from .states import conv_out_src, rec_drain, rec_in
+from .window_log import LOG_ROWS, window_log_on
+
+
+def _log_out(ex: ExecSpec) -> bool:
+    """The verify step records the GDN window log (`log_ckpt`)."""
+    return bool(ex.VER and ex.T > 1 and window_log_on() and not cache_exec(ex).FUSED)
 
 
 class GDNBlock(Block):
@@ -196,7 +202,7 @@ class GDNBlock(Block):
         return [
             StateDecl("conv", shape=conv_shape, dtype=F32, access="rw"),
             StateDecl(
-                "rec", shape=(ex.NS * lay.vh, lay.KD, lay.VD), dtype=BF16, access="rw"
+                "rec", shape=(ex.NS * lay.vh, lay.KD, lay.VD), dtype=REC, access="rw"
             ),
         ]
 
@@ -215,14 +221,18 @@ class GDNBlock(Block):
                 StateDecl(
                     "rec_ckpt",
                     shape=(ex.B * lay.vh, lay.KD, lay.VD),
-                    dtype=BF16,
+                    dtype=REC,
                     access="w",
                 ),
-            ]
+            ] + (
+                [StateDecl("log_ckpt", shape=(ex.NS, LOG_ROWS, lay.VD), dtype=F32, access="w")]
+                if _log_out(ex)
+                else []
+            )
         return [
             StateDecl("conv", shape=(rup(3 * ex.B, 8), lay.QKV), dtype=F32, access="w"),
             StateDecl(
-                "rec", shape=(ex.B * lay.vh, lay.KD, lay.VD), dtype=BF16, access="w"
+                "rec", shape=(ex.B * lay.vh, lay.KD, lay.VD), dtype=REC, access="w"
             ),
         ]
 
@@ -249,11 +259,13 @@ class GDNBlock(Block):
         gp: GDNParams = plan.block_params[self.name]
         if cache_exec(ex).FUSED:
             return fused_io().gdn_fused_scratch(ex, gp, plan)
+        # The fused and GPR pool readers bitcast bf16 state words into `recb`.
+        assert REC == BF16 or not gp.GPR, "VLLM_TPU_MK_GDN_REC_F32=1 needs the split gather"
         scr: dict[str, Any] = {
             "recb": (
-                pltpu.VMEM((gp.NRB, gp.CBV, gp.KD, gp.VD), BF16)
+                pltpu.VMEM((gp.NRB, gp.CBV, gp.KD, gp.VD), REC)
                 if gp.GCH
-                else pltpu.VMEM((ex.B * gp.vh, gp.KD, gp.VD), BF16)
+                else pltpu.VMEM((ex.B * gp.vh, gp.KD, gp.VD), REC)
             ),
             "sbuf": pltpu.VMEM((gp.vh, gp.KD, gp.VD), F32),
             "convb": pltpu.VMEM(
@@ -261,6 +273,9 @@ class GDNBlock(Block):
             ),
             "st_sem": pltpu.SemaphoreType.DMA((4,)),
         }
+        if _log_out(ex):
+            scr["logb"] = pltpu.VMEM((ex.NS, LOG_ROWS, gp.VD), F32)
+            scr["log_sem"] = pltpu.SemaphoreType.DMA((1,))
         if ex.VER and not gp.GCH:
             scr.update(
                 {
@@ -308,13 +323,22 @@ class GDNBlock(Block):
                 with sc("gdn_rec"):
                     gdn_rec_chunked(ctx, gp, o, slot)
             else:
-                if "gdn_state" not in skip:
+                if "gdn_state" not in skip and not ctx.ST.get("rec_in_recb", False):
                     with sc("gdn_rec_wait"):
                         for d in rec_in(ctx, gp, o):
                             d.wait()
                 if "gdn" not in skip:
                     with sc("gdn_rec"):
                         gdn_rec(ctx, gp, u, ybuf, slot)
+            if "logb" in scr and "gdn_state" not in skip:
+                # One small copy per layer (NS x 16 KiB), drained before the next
+                # layer's recurrence rewrites `logb`.
+                with sc("gdn_log_out"):
+                    cp = pltpu.make_async_copy(
+                        scr["logb"], O["log_ckpt"].at[o], scr["log_sem"].at[0]
+                    )
+                    cp.start()
+                    cp.wait()
             with sc("gdn_out"):
                 if not GCH and "gdn_state" not in skip:
                     pltpu.make_async_copy(recb, O[rec_out_key].at[o], sem.at[3]).start()
@@ -356,10 +380,13 @@ class GDNBlock(Block):
         if cache_exec(ex).FUSED:
             return {}
         if ex.VER:
-            return {
+            out = {
                 "conv_ckpt": raw_outputs["conv_ckpt"],
                 "rec_ckpt": raw_outputs["rec_ckpt"],
             }
+            if "log_ckpt" in raw_outputs:
+                out["log_ckpt"] = raw_outputs["log_ckpt"]
+            return out
         return {"conv": raw_outputs["conv"], "rec": raw_outputs["rec"]}
 
     def hf_params(self, prefix: str | None = None, g: Any = None) -> list[HFParamDecl]:

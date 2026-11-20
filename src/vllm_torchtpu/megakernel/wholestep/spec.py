@@ -28,8 +28,8 @@ from typing import Any
 from ..blocks.hc import HCSublayer
 from ..models.qwen38 import (
     QWEN38_SEGMENT,
-    Qwen38Geometry,
     Qwen38GDN,
+    Qwen38Geometry,
     Qwen38MoE,
     Qwen38ResidualGeometry,
 )
@@ -50,20 +50,32 @@ def wholestep_spec(
     step: bool = False,
     first: str = "gdn",
     tail: dict[str, Any] | None = None,
+    hc_fp8: bool = False,
 ) -> ModelSpec:
-    """`L` (a multiple of `att_every`) layers starting at a group boundary (layer 0 = GDN).
+    """`L` (a multiple of `att_every`) layers starting at a group boundary (layer 0 =
+    GDN).
 
-    `indexed`: `QSAFullIndexedBlock` options (`max_groups`, `pages_per_seq`) — the indexer,
+    `hc_fp8`: FP8 mix weights for the layers' HC(mixer) and HC(MoE) sublayers
+    (`HCSublayer(fp8_weights=True)`); the tail's HC (`tail`) stays BF16.
+
+    `indexed`: `QSAFullIndexedBlock` options (`max_groups`, `pages_per_seq`) — the
+    indexer,
     top-K and compaction run in-kernel instead of taking a selection as input.
     """
-    assert L % g.att_every == 0 or (L == 1 and first == "qsa"), (L, g.att_every)
+    # `first="qsa"` may end on a partial cycle of its QSA layer (layers 3..47:
+    # VLLM_TPU_MK_WHOLE_L45).
+    assert L % g.att_every == 0 or (first == "qsa" and L % g.att_every == 1), (
+        L,
+        g.att_every,
+    )
     if pool_gdn:
         from ..models.qwen38_gdn_pool import Qwen38PoolGDN as gdn_cls
     else:
         gdn_cls = Qwen38GDN
     gi = g.inner(R, L)  # L = 1: one QSA layer, no GDN
     hc = dict(inner_geometry=gi, nhc=g.NHC, lowrank=g.LOWRANK)
-    gdn = HCSublayer(gdn_cls(geometry=gi), ar_slot=0, **hc)
+    hcl = dict(hc, fp8_weights=hc_fp8)  # the layers' sublayers (not the tail)
+    gdn = HCSublayer(gdn_cls(geometry=gi), ar_slot=0, **hcl)
     if indexed is not None and step:  # stage C: + the step's own tokens and group
         from .qsa_full_c import QSAFullStepBlock
 
@@ -74,19 +86,29 @@ def wholestep_spec(
         qsa_block = QSAFullIndexedBlock(**indexed, **(qsa or {}))
     else:
         qsa_block = QSAFullBlock(**(qsa or {}))
-    attn = HCSublayer(qsa_block, ar_slot=0, **hc)
-    # Counts are per cycle (period = att_every): branch 0 runs at l % period < c0. `first="qsa"`
-    # starts the kernel at a QSA layer (model layers 3 .. 3+L-1: the cycle QSA, GDN, GDN, GDN),
+    attn = HCSublayer(qsa_block, ar_slot=0, **hcl)
+    # Counts are per cycle (period = att_every): branch 0 runs at l % period < c0.
+    # `first="qsa"`
+    # starts the kernel at a QSA layer (model layers 3 .. 3+L-1: the cycle QSA, GDN,
+    # GDN, GDN),
     # so the head (layers 0-2, with PLE before layer 1) can stay a separate call.
     if L == 1:  # the last model layer (47): QSA only
         mixer: Any = attn
     elif first == "qsa":
-        mixer = SwitchSlot("mixer", branches=(attn, gdn), branch_counts=(1, g.att_every - 1))
+        mixer = SwitchSlot(
+            "mixer", branches=(attn, gdn), branch_counts=(1, g.att_every - 1)
+        )
     else:
-        mixer = SwitchSlot("mixer", branches=(gdn, attn), branch_counts=(g.att_every - 1, 1))
-    moe = HCSublayer(Qwen38MoE(geometry=gi, moe_tp=False), ar_slot=1, emit_residual=True, **hc)
+        mixer = SwitchSlot(
+            "mixer", branches=(gdn, attn), branch_counts=(g.att_every - 1, 1)
+        )
+    moe = HCSublayer(
+        Qwen38MoE(geometry=gi, moe_tp=False), ar_slot=1, emit_residual=True, **hcl
+    )
     slots: tuple = (mixer, moe)
-    if tail is not None:  # + final HC mixer, lm_head, per-rank greedy top token (L = 1 only)
+    if (
+        tail is not None
+    ):  # + final HC mixer, lm_head, per-rank greedy top token (L = 1 only)
         from .tail import GreedyHead
 
         assert L == 1, L

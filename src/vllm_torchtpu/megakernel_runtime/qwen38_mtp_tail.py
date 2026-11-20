@@ -46,11 +46,17 @@ WARN_CHUNKS = 8
 
 
 def build_tail_call(
-    mesh: Any, g: Any, B: int, layout: Any, chunk: int, write: bool = True, **kwargs: Any
+    mesh: Any,
+    g: Any,
+    B: int,
+    layout: Any,
+    chunk: int,
+    write: bool = True,
+    **kwargs: Any,
 ) -> tuple[Any, tuple, tuple, tuple]:
     """`build_segment_call` for the L=1 tail at `B` rows per rank, in `chunk`-row
     kernel calls when `B > chunk`."""
-    if B <= chunk:
+    if chunk >= B:
         return build_segment_call(mesh, g, 1, B, layout, write, **kwargs)
     call_c, in_specs, out_specs, donate = build_segment_call(
         mesh, g, 1, chunk, layout, write, **kwargs
@@ -63,7 +69,9 @@ def build_tail_call(
         x = jnp.pad(x, ((0, n * chunk - B),) + ((0, 0),) * (x.ndim - 1))
         return x.reshape(n, chunk, *x.shape[1:])
 
-    split = jax.shard_map(_split, mesh=mesh, in_specs=tp, out_specs=chunked, check_vma=False)
+    split = jax.shard_map(
+        _split, mesh=mesh, in_specs=tp, out_specs=chunked, check_vma=False
+    )
     merge = jax.shard_map(
         lambda r: r.reshape(n * chunk, *r.shape[2:])[:B],
         mesh=mesh,
@@ -89,7 +97,13 @@ class MtpTailKind:
     """
 
     def __init__(self, mesh: Any, g: Any, layout: Any, write: bool, chunk: int) -> None:
-        self.mesh, self.g, self.layout, self.write, self.chunk = mesh, g, layout, write, chunk
+        self.mesh, self.g, self.layout, self.write, self.chunk = (
+            mesh,
+            g,
+            layout,
+            write,
+            chunk,
+        )
         self._calls: dict[int, Any] = {}
         self.tag = "mtp_tail" + ("" if write else "_shadow")
 
@@ -112,7 +126,7 @@ class MtpTailKind:
             log(
                 "Qwen3.8 MTP tail op built at %d rows (%s); largest so far %d",
                 B,
-                "one call" if B <= self.chunk else f"{n} x {self.chunk}-row chunks",
+                "one call" if self.chunk >= B else f"{n} x {self.chunk}-row chunks",
                 max([B, *self._calls]),
             )
             full, in_specs, outs, donate = build_tail_call(

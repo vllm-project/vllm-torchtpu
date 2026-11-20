@@ -114,7 +114,9 @@ def maybe_create(runner: Any) -> Any:
     except Exception:  # fail closed: a broken optional driver must not stop serving
         from vllm_torchtpu.logger import init_logger
 
-        init_logger(__name__).exception("Qwen3.8 megakernel driver unavailable; stock path")
+        init_logger(__name__).exception(
+            "Qwen3.8 megakernel driver unavailable; stock path"
+        )
     from .driver import maybe_create as _driver_maybe_create
 
     return _driver_maybe_create(runner)

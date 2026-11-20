@@ -2743,6 +2743,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_MK_OWN_OPERANDS": env_bool("VLLM_TPU_MK_OWN_OPERANDS", True),
 }
 
+# Megakernel runtime knobs, ported with the transplanted megakernel_runtime/ (defaults from c6fd3ab71).
+environment_variables.update(
+    {
+        "CDK_OUTPUT_DIR": env_str("CDK_OUTPUT_DIR", "/tmp/cdk_output"),
+        "VLLM_TPU_MK_ALLOW_FALLBACK": env_bool("VLLM_TPU_MK_ALLOW_FALLBACK"),
+        "VLLM_TPU_MK_BUCKET_TUNE": env_bool("VLLM_TPU_MK_BUCKET_TUNE"),
+        "VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE": env_bool("VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE"),
+        "VLLM_TPU_MK_DRAFT": env_bool("VLLM_TPU_MK_DRAFT"),
+        "VLLM_TPU_MK_HC_FP8": env_bool("VLLM_TPU_MK_HC_FP8"),
+        "VLLM_TPU_MK_HOST_PLE": env_bool("VLLM_TPU_MK_HOST_PLE"),
+        "VLLM_TPU_MK_OPERAND_DUMP": env_bool("VLLM_TPU_MK_OPERAND_DUMP", False),
+        "VLLM_TPU_MK_QSEL_ASYNC": env_bool("VLLM_TPU_MK_QSEL_ASYNC"),
+        "VLLM_TPU_MK_ROW_BUCKET": env_bool("VLLM_TPU_MK_ROW_BUCKET"),
+        "VLLM_TPU_MK_SCATTER_DEEP": env_bool("VLLM_TPU_MK_SCATTER_DEEP"),
+        "VLLM_TPU_MK_STACKED_MAMBA_OPERANDS": env_bool("VLLM_TPU_MK_STACKED_MAMBA_OPERANDS"),
+        "VLLM_TPU_MK_STACKED_QSA_WRITES": env_bool("VLLM_TPU_MK_STACKED_QSA_WRITES"),
+        "VLLM_TPU_MK_STEP_MIX_INTERVAL_S": env_float(
+            "VLLM_TPU_MK_STEP_MIX_INTERVAL_S", 10.0
+        ),
+        "VLLM_TPU_MK_TRYFWD_LEAN": env_bool("VLLM_TPU_MK_TRYFWD_LEAN"),
+        "VLLM_TPU_MK_WHOLE_BATCHED_INPUTS": env_bool("VLLM_TPU_MK_WHOLE_BATCHED_INPUTS"),
+        "VLLM_TPU_MK_WHOLE_L45": env_bool("VLLM_TPU_MK_WHOLE_L45"),
+        "VLLM_TPU_MK_WHOLE_L47": env_bool("VLLM_TPU_MK_WHOLE_L47"),
+        "VLLM_TPU_PREFLAT_FWD_ARGS": env_bool("VLLM_TPU_PREFLAT_FWD_ARGS"),
+        "VLLM_TPU_STAGED_WALK_STACKED": env_bool("VLLM_TPU_STAGED_WALK_STACKED"),
+    }
+)
+
 
 def __getattr__(name: str) -> Any:
     """

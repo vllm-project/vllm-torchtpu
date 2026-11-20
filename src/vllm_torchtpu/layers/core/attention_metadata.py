@@ -861,3 +861,22 @@ def _issue_walk_products(
             entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)
             for j, ei in enumerate(mamba_entry_indices)
         }
+
+
+# --- ported from caojx/qwen38-flash-agentx-disagg-1112 @ 9904d2e1c for the megakernel runtime ---
+def mamba_state_of(md: Any) -> Any:
+    """`md.mamba_state_indices`, or its row of the staged walk's stack when the
+    metadata carries one (VLLM_TPU_STAGED_WALK_STACKED); this tree has no stack,
+    so it is the plain attribute."""
+    stack = getattr(md, "mamba_state_stack", None)
+    if stack is None:
+        return getattr(md, "mamba_state_indices", None)
+    return stack[md.mamba_stack_row]
+
+
+def mamba_ckpt_of(md: Any) -> Any:
+    """`md.mamba_ckpt_indices`, or its row of the stack; see `mamba_state_of`."""
+    stack = getattr(md, "mamba_ckpt_stack", None)
+    if stack is None:
+        return getattr(md, "mamba_ckpt_indices", None)
+    return stack[md.mamba_stack_row]

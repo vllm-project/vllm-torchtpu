@@ -48,7 +48,9 @@ def kn(proj: Any, k: int, n: int) -> torch.Tensor:
     elif tuple(w.shape) == (n, k):
         out = w.transpose(0, 1)
     else:
-        raise ValueError(f"weight shape {tuple(w.shape)} is neither ({k},{n}) nor ({n},{k})")
+        raise ValueError(
+            f"weight shape {tuple(w.shape)} is neither ({k},{n}) nor ({n},{k})"
+        )
     assert out.dtype == torch.bfloat16, out.dtype
     return out
 
@@ -60,17 +62,32 @@ def segment_layers(g: Qwen38Geometry, s: int) -> list[int]:
     return [q + j for j in range(n)]
 
 
-def _hc_mix_operands(hc: Any, g: Qwen38Geometry) -> tuple[torch.Tensor, list[torch.Tensor]]:
+def _hc_mix_operands(
+    hc: Any, g: Qwen38Geometry
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """`(hdn [W, n_down], [hup_b [k_up, H]])` of one mixing hyper-connection."""
     W, lr = g.NHC * g.H, g.LOWRANK
     down = hc.input_mix_weight_down.weight.data  # [LR, W]
-    inj = hc.block_inject_weight.weight.data  # [NHC, W]
+    # A mixer built without the combine (`GatedResidual(use_combine=False)`: the final
+    # mixer before lm_head, the MTP draft's included) has no injection; its columns are
+    # zero (the greedy tail never reads them).
+    inj_w = getattr(hc, "block_inject_weight", None)
+    inj = (
+        inj_w.weight.data
+        if inj_w is not None
+        else torch.zeros((g.NHC, W), dtype=down.dtype, device=down.device)
+    )  # [NHC, W]
     up = hc.input_mix_weight_up.weight.data  # [W, LR]
-    assert tuple(down.shape) == (lr, W) and tuple(up.shape) == (W, lr), (down.shape, up.shape)
+    assert tuple(down.shape) == (lr, W) and tuple(up.shape) == (W, lr), (
+        down.shape,
+        up.shape,
+    )
     hdn = torch.cat([down.t(), inj.t()], dim=1)
     hdn = F.pad(hdn, (0, rup(lr + g.NHC, 128) - hdn.shape[1]))
     up_t = F.pad(up.t(), (0, 0, 0, rup(lr, 128) - lr))
-    return hdn.contiguous(), [up_t[:, b * g.H : (b + 1) * g.H].contiguous() for b in range(g.NHC)]
+    return hdn.contiguous(), [
+        up_t[:, b * g.H : (b + 1) * g.H].contiguous() for b in range(g.NHC)
+    ]
 
 
 def _lin_in(la: Any, g: Any, ex: ExecSpec) -> torch.Tensor:
@@ -86,14 +103,24 @@ def _lin_in(la: Any, g: Any, ex: ExecSpec) -> torch.Tensor:
 
 
 def _shared(mlp: Any, g: Any, ex: ExecSpec) -> tuple[torch.Tensor, torch.Tensor]:
-    """Shared expert `(sh13 [H, 2*isr], sh2 [isr, H])`, each half zero-padded to `isr`."""
+    """Shared expert `(sh13 [H, 2*isr], sh2 [isr, H])`, each half zero-padded to
+    `isr`.
+    """
     isr = g.IS // ex.R
     gu, down = mlp.shared_expert.gate_up_proj, mlp.shared_expert.down_proj
-    n_gu = gu.weight.shape[1] if getattr(gu, WEIGHT_FLIPPED_ATTR, False) else gu.weight.shape[0]
+    n_gu = (
+        gu.weight.shape[1]
+        if getattr(gu, WEIGHT_FLIPPED_ATTR, False)
+        else gu.weight.shape[0]
+    )
     half = int(n_gu) // 2
     w_gu = kn(gu, g.H, 2 * half)
     sh13 = torch.cat(
-        [F.pad(w_gu[:, :half], (0, isr - half)), F.pad(w_gu[:, half:], (0, isr - half))], dim=1
+        [
+            F.pad(w_gu[:, :half], (0, isr - half)),
+            F.pad(w_gu[:, half:], (0, isr - half)),
+        ],
+        dim=1,
     )
     w_dn = kn(down, half, g.H)
     sh2 = F.pad(w_dn, (0, 0, 0, isr - half))
@@ -148,7 +175,9 @@ def pack_segment_operands(
 
     def row(name: str, j: int, val: torch.Tensor) -> None:
         if name not in sm:
-            sm[name] = torch.zeros((L, p.smalls_layout[name][1]), dtype=torch.float32, device=dev)
+            sm[name] = torch.zeros(
+                (L, p.smalls_layout[name][1]), dtype=torch.float32, device=dev
+            )
         sm[name][j, : val.numel()] = val.reshape(-1).float()
 
     if not head:
@@ -158,12 +187,15 @@ def pack_segment_operands(
         row("qsa_out_hcn", 0, q.attn_hyper_connection.hc_norm.weight.data)
 
     if gdn:
+        assert lay is not None
         hcs = [_hc_mix_operands(layer.attn_hyper_connection, g) for layer in gdn]
         w["gdn_hdn"] = torch.stack([h[0] for h in hcs])
         for b in range(g.NHC):
             w[f"gdn_hup{b}"] = torch.stack([h[1][b] for h in hcs])
         w["lin_in"] = torch.stack([_lin_in(layer.linear_attn, gi, ex) for layer in gdn])
-        w["lin_out"] = torch.stack([kn(layer.linear_attn.out_proj, lay.Z, g.H) for layer in gdn])
+        w["lin_out"] = torch.stack(
+            [kn(layer.linear_attn.out_proj, lay.Z, g.H) for layer in gdn]
+        )
         for j, layer in enumerate(gdn, start=L - len(gdn)):
             la = layer.linear_attn
             row("gdn_hcn", j, layer.attn_hyper_connection.hc_norm.weight.data)

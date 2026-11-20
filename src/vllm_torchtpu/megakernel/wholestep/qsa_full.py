@@ -42,7 +42,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ..blocks.qsa_attn.block import SLOTS, TILE, attend_row
 from ..exec_spec import ExecSpec
-from ..ops import BF16, F32, I32, rnd, rmsnorm
+from ..ops import BF16, F32, I32, rmsnorm, rnd
 from ..spec import Block, ExtraInput, ScratchReq, SmallField, StateDecl, WeightDecl
 
 POOL = "qsa_pool"
@@ -96,7 +96,12 @@ class QSAFullBlock(Block):
         return [StateDecl(KV_NEW, (ex.M, 2 * g.HD), BF16, "w")]
 
     def host_update_states(
-        self, g: Any, ex: ExecSpec, pos: Any, states: dict[str, Any], raw_outputs: dict[str, Any]
+        self,
+        g: Any,
+        ex: ExecSpec,
+        pos: Any,
+        states: dict[str, Any],
+        raw_outputs: dict[str, Any],
     ) -> dict[str, Any]:
         """Pass the step's K / V rows through for the post-kernel cache write."""
         return {KV_NEW: raw_outputs[KV_NEW]}
@@ -112,8 +117,10 @@ class QSAFullBlock(Block):
         ]
 
     def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
-        # `acc` holds every dmatmul output: the fused projection is the widest here (5 * 128
-        # for the indexer projection); other blocks (GDN) may need more, the planner takes the max.
+        # `acc` holds every dmatmul output: the fused projection is the widest here (5 *
+        # 128
+        # for the indexer projection); other blocks (GDN) may need more, the planner
+        # takes the max.
         nh = self.nh(g, ex)
         return {"xb2": nh * g.HD, "acc": max(qkvg_width(nh, g.HD), 5 * 128)}
 
@@ -122,8 +129,10 @@ class QSAFullBlock(Block):
         return [
             ScratchReq("qf_ring", pltpu.VMEM((self.slots, TILE, 1, 4, 256), f8)),
             ScratchReq("qf_ring_sem", pltpu.SemaphoreType.DMA((self.slots,))),
-            # F32 (BF16-valued): rows are written by static single-row stores, which a packed
-            # BF16 tile or a strided per-head DMA does not lower to (Mosaic tile alignment).
+            # F32 (BF16-valued): rows are written by static single-row stores, which a
+            # packed
+            # BF16 tile or a strided per-head DMA does not lower to (Mosaic tile
+            # alignment).
             ScratchReq("qf_q", pltpu.VMEM((ex.MB, nh, g.HD), F32)),
             ScratchReq("qf_g", pltpu.VMEM((ex.MB, nh, g.HD), F32)),
             ScratchReq("qf_kv", pltpu.VMEM((ex.MB, 2 * g.HD), BF16)),
@@ -132,7 +141,7 @@ class QSAFullBlock(Block):
         ]
 
     # ------------------------------------------------------------ in kernel
-    def _project(self, ctx: Any, l: Any, slot: Any) -> Any:
+    def _project(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         """Projection, norms, RoPE: q / gate into `qf_q` / `qf_g`; returns the in-flight
         copy of `[k | v]` to this layer's `qsa_kv_new` row (waited after attention)."""
         ex, scr, g = ctx.ex, ctx.scr, ctx.g
@@ -148,10 +157,14 @@ class QSAFullBlock(Block):
         sin = scr["qf_rope"][:, rot // 2 : rot]
         qn, kn = ctx.sm(slot, "qsa_qn"), ctx.sm(slot, "qsa_kn")
         for h in range(nh):
-            q = rmsnorm(y[:, 2 * h * hd : (2 * h + 1) * hd], qn, g.eps, zero_centered=True)
+            q = rmsnorm(
+                y[:, 2 * h * hd : (2 * h + 1) * hd], qn, g.eps, zero_centered=True
+            )
             q = main_rope(q, cos, sin, rot)
             gt = y[:, (2 * h + 1) * hd : (2 * h + 2) * hd]
-            for r in range(ex.MB):  # head-major -> [MB, nh, HD] by static single-row stores
+            for r in range(
+                ex.MB
+            ):  # head-major -> [MB, nh, HD] by static single-row stores
                 scr["qf_q"][r, h : h + 1, :] = q[r : r + 1]
                 scr["qf_g"][r, h : h + 1, :] = gt[r : r + 1]
         k0 = 2 * nh * hd
@@ -200,7 +213,9 @@ class QSAFullBlock(Block):
             )
 
         zeros = tuple(jnp.zeros((ex.MB, g.HD), F32) for _ in range(nh))
-        *outs, _, _ = jax.lax.fori_loop(0, ex.MB, row, (*zeros, jnp.int32(0), jnp.int32(0)))
+        *outs, _, _ = jax.lax.fori_loop(
+            0, ex.MB, row, (*zeros, jnp.int32(0), jnp.int32(0))
+        )
         for h, o in enumerate(outs):
             scr["xb2"][:, pl.ds(h * g.HD, g.HD)] = o.astype(BF16)
         kv.wait()
@@ -210,11 +225,21 @@ class QSAFullBlock(Block):
 
 # ---------------------------------------------------------------- reference
 def project_reference(
-    mixed: jax.Array, w_qkvg: jax.Array, qn: jax.Array, kn: jax.Array, rope: jax.Array,
-    *, nh: int, hd: int, rot: int, eps: float,
+    mixed: jax.Array,
+    w_qkvg: jax.Array,
+    qn: jax.Array,
+    kn: jax.Array,
+    rope: jax.Array,
+    *,
+    nh: int,
+    hd: int,
+    rot: int,
+    eps: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Per-rank `(q [T, nh, hd], gate [T, nh, hd], k [T, hd], v [T, hd])`, BF16."""
-    y = rnd(jnp.dot(mixed.astype(BF16), w_qkvg.astype(BF16), preferred_element_type=F32))
+    y = rnd(
+        jnp.dot(mixed.astype(BF16), w_qkvg.astype(BF16), preferred_element_type=F32)
+    )
     cos, sin = rope[:, : rot // 2], rope[:, rot // 2 : rot]
     qs, gs = [], []
     for h in range(nh):
@@ -222,7 +247,9 @@ def project_reference(
         qs.append(main_rope(q, cos, sin, rot))
         gs.append(y[:, (2 * h + 1) * hd : (2 * h + 2) * hd])
     k0 = 2 * nh * hd
-    k = main_rope(rmsnorm(y[:, k0 : k0 + hd], kn, eps, zero_centered=True), cos, sin, rot)
+    k = main_rope(
+        rmsnorm(y[:, k0 : k0 + hd], kn, eps, zero_centered=True), cos, sin, rot
+    )
     v = y[:, k0 + hd : k0 + 2 * hd]
     st = lambda xs: jnp.stack(xs, axis=1).astype(BF16)  # noqa: E731
     return st(qs), st(gs), k.astype(BF16), v.astype(BF16)

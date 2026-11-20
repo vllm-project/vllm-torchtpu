@@ -17,12 +17,16 @@ Per QSA layer, after the stage-A projection:
 
   iq      = index_query(mixed @ W_idx)                      4 heads x 128, every row
   scores  = per request: its compressed keys DMA'd into VMEM, `score_rows` on the MXU
-  ids     = exact top-K per row (`indexer.thresholds` + `compact_row`), lane-major -> SMEM
-  pages   = ids + the row's partial group (if `len % 4`), kv_len = 4 min(n_vis, K) + len % 4
-  attn    = `attend_row(table=...)` (group ids -> pool micro-pages via the main table at DMA issue)
+  ids     = exact top-K per row (`indexer.thresholds` + `compact_row`), lane-major ->
+  SMEM
+  pages   = ids + the row's partial group (if `len % 4`), kv_len = 4 min(n_vis, K) + len
+  % 4
+  attn    = `attend_row(table=...)` (group ids -> pool micro-pages via the main table at
+  DMA issue)
 
 Rows are grouped by request, `ex.T` verify rows each (MTP verify). Prototype key layout:
-`qsa_ck [requests, max_groups, 128]` BF16, contiguous per request (the served cache is paged;
+`qsa_ck [requests, max_groups, 128]` BF16, contiguous per request (the served cache is
+paged;
 see DESIGN.md). Groups completed during this step are stage C.
 """
 
@@ -35,7 +39,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..blocks.qsa_attn.block import attend_row
+from ..blocks.qsa_attn.block import MICRO, attend_row
 from ..exec_spec import ExecSpec
 from ..ops import BF16, F32, I32, rnd
 from ..spec import ExtraInput, ScratchReq, SmallField, StateDecl, WeightDecl
@@ -49,7 +53,9 @@ NVIS = "qsa_nvis"  # [M] complete groups visible per row (len // 4)
 TAIL = "qsa_tail"  # [M] tokens of the row's partial group (len % 4)
 MTAB = "qsa_mtab"  # [requests, pages_per_seq] main-pool page table
 IDX_W = "idx_w"
-DBG_IQ = "qsa_dbg_iq"  # debug outputs: the kernel's index queries and selected ids per layer
+DBG_IQ = (
+    "qsa_dbg_iq"  # debug outputs: the kernel's index queries and selected ids per layer
+)
 DBG_IDS = "qsa_dbg_ids"
 UNION_SLOTS = 3  # attention ring slots with `union_attn`
 IDX_N = 4 * ix.IDX_DIM + ix.IDX_DIM  # 512 query + 128 raw-key columns
@@ -78,41 +84,80 @@ class QSAFullIndexedBlock(QSAFullBlock):
         union_stats: bool = False,
         union_phys: bool = False,
         loop_requests: bool = False,
+        dcp: int = 1,
+        compressed_dcp: bool = False,
+        async_dma: bool = False,
+        skip_idle: bool = False,
         **kw: Any,
     ) -> None:
-        """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`; "fp8" = the
-        served FP8 carrier `[kernel_pages, 16, 4, ck_width]` (32 groups per kernel page, two BF16
-        keys per carrier row), paged by `qsa_cktab [requests, max_groups // 32]` and streamed
-        `chunk_pages` pages per chunk; "bf16" = its BF16 view `[kernel_pages, 16, 2, ck_width]`
-        (CPU interpret: same layout, no in-kernel bitcast). `manager_pages` > 0: `qsa_cktab` holds
-        manager pages of that many contiguous kernel pages (served 1664-token pages: 13) and each
-        is one DMA (P4: per-kernel-page DMAs are issue-bound); `ck_lanes` = 128 reads only the
-        real lanes of each carrier row. `n_layers` > 0: per-QSA-layer metadata — the main-pool and
-        key tables are `[n_layers * requests, …]` (row = layer ordinal * requests + request) and the
-        head-pair offset `[n_layers]`, as the served pool packs layers into shared pages.
-        `hbm_tables`: the key and main page tables stay in HBM and each QSA layer's rows are
-        copied into SMEM windows `[requests, …]` at the layer's start (served contexts up to
-        262K tokens: all layers' tables do not fit SMEM). `per_request_scores`: the score
-        scratch holds one request's `T` rows (`[T, max_groups]` F32), selected before the next
+        """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
+        "fp8" = the
+        served FP8 carrier `[kernel_pages, 16, 4, ck_width]` (32 groups per kernel page,
+        two BF16
+        keys per carrier row), paged by `qsa_cktab [requests, max_groups // 32]` and
+        streamed
+        `chunk_pages` pages per chunk; "bf16" = its BF16 view `[kernel_pages, 16, 2,
+        ck_width]`
+        (CPU interpret: same layout, no in-kernel bitcast). `manager_pages` > 0:
+        `qsa_cktab` holds
+        manager pages of that many contiguous kernel pages (served 1664-token pages: 13)
+        and each
+        is one DMA (P4: per-kernel-page DMAs are issue-bound); `ck_lanes` = 128 reads
+        only the
+        real lanes of each carrier row. `n_layers` > 0: per-QSA-layer metadata — the
+        main-pool and
+        key tables are `[n_layers * requests, …]` (row = layer ordinal * requests +
+        request) and the
+        head-pair offset `[n_layers]`, as the served pool packs layers into shared
+        pages.
+        `hbm_tables`: the key and main page tables stay in HBM and each QSA layer's rows
+        are
+        copied into SMEM windows `[requests, …]` at the layer's start (served contexts
+        up to
+        262K tokens: all layers' tables do not fit SMEM). `per_request_scores`: the
+        score
+        scratch holds one request's `T` rows (`[T, max_groups]` F32), selected before
+        the next
         request is scored (an all-rows buffer is 16 MiB at 64 rows and 64K groups).
         `bounded_chunks`: each request streams only the key chunks its rows can see
-        (`ceil(n_vis / chunk groups)`, at least 1) instead of all `max_groups`; scores past a
+        (`ceil(n_vis / chunk groups)`, at least 1) instead of all `max_groups`; scores
+        past a
         row's `n_vis` are stale and masked by the selection. `shard_index` (needs
-        `per_request_scores`): each rank scores and selects only its own contiguous run of
-        `ceil(requests / R)` requests, then the ranks exchange the selected ids, lengths and
-        `g_a` flags so every rank attends every row (in-kernel remote DMA, int32: exact).
-        `union_attn` (needs `per_request_scores`): each request's verify rows attend one union of
-        their selections, streamed once (`union_attn.attend_request`). `union_stats` (needs
-        `union_attn`): per QSA layer and request, output `qsa_union_stats` lanes `[union groups,
-        sum of the rows' groups, max row groups, rows with groups]` (int32), read by the runner
-        outside the graph to measure how much a request's rows share. `union_phys` (needs
-        `union_attn`, `hbm_tables`): each request's union ids are turned into physical micro-page
-        ids by one vector pass before its tile loop (`union_attn.physical_ids`), so every copy
-        issues from one SMEM load instead of the ids -> table chain (same addresses). `loop_requests` (needs
+        `per_request_scores`): each rank scores and selects only its own contiguous run
+        of
+        `ceil(requests / R)` requests, then the ranks exchange the selected ids, lengths
+        and
+        `g_a` flags so every rank attends every row (in-kernel remote DMA, int32:
+        exact).
+        `union_attn` (needs `per_request_scores`): each request's verify rows attend one
+        union of
+        their selections, streamed once (`union_attn.attend_request`). `union_stats`
+        (needs
+        `union_attn`): per QSA layer and request, output `qsa_union_stats` lanes `[union
+        groups,
+        sum of the rows' groups, max row groups, rows with groups]` (int32), read by the
+        runner
+        outside the graph to measure how much a request's rows share. `union_phys`
+        (needs
+        `union_attn`, `hbm_tables`): each request's union ids are turned into physical
+        micro-page
+        ids by one vector pass before its tile loop (`union_attn.physical_ids`), so
+        every copy
+        issues from one SMEM load instead of the ids -> table chain (same addresses).
+        `loop_requests` (needs
         `per_request_scores`): the per-request work of a QSA layer (completed group, key
         streaming and scores, selection, recent tile) runs in a `fori_loop` over requests instead
         of a Python loop, so the kernel body, and its compile time, does not grow with the
-        bucket's request count."""
+        bucket's request count. `dcp` = 2 (VLLM_TPU_QSA_MAIN_KV_DCP, needs `union_attn`): the
+        main KV is split by token over TP rank pairs (`me`, `me ^ 1`; owner `(t // B) % 2`, one
+        table column = `2 B` tokens); each rank attends both ranks' heads over the groups it owns
+        and the pair combines the partials by LSE (`QSAFullStepBlock`). `compressed_dcp`
+        (VLLM_TPU_QSA_COMPRESSED_DCP, needs `dcp` = 2 and the carrier with `bounded_chunks`):
+        the compressed keys are split the same way (group `g` on rank `(g // gpp) % 2`, `gpp` =
+        groups per pool block; `qsa_cktab` lists a rank's own pages in local order). Both ranks
+        of a pair score the same request, each over its own groups, swap their halves of the
+        scores (in-kernel remote DMA, F32 bits: exact) and select over the whole set; with
+        `shard_index` the requests are sharded over pairs."""
         super().__init__(**kw)
         assert max_groups % 1024 == 0, max_groups  # whole (8, 128) score tiles per row
         self.max_groups, self.pps, self.debug = max_groups, pages_per_seq, debug
@@ -122,29 +167,76 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.hbm_tables, self.per_request_scores = hbm_tables, per_request_scores
         self.bounded_chunks = bounded_chunks
         self.shard_index = shard_index
-        assert not shard_index or per_request_scores, "the sharded indexer selects per request"
+        # Selection-path DMAs to distinct destinations issued together and waited once
+        # (row ids into SMEM, the new group's loads/stores) instead of start-wait pairs.
+        self.async_dma = bool(async_dma)
+        # `skip_idle` (needs `loop_requests`; the MK draft at one row per request): the
+        # per-request loops stop after the last live request (context > 0), so the 16
+        # request slots of a T = 1 tile do no work when idle. Their outputs are left
+        # unwritten: the cache writer and the caller read only live requests.
+        self.skip_idle = bool(skip_idle)
+        assert not skip_idle or loop_requests, "skip_idle bounds the request loops"
+        assert not shard_index or per_request_scores, (
+            "the sharded indexer selects per request"
+        )
         self.union_attn = union_attn
         assert not union_attn or per_request_scores, "the union is built per request"
+        self.dcp = max(int(dcp), 1)
+        assert self.dcp in (1, 2), dcp
+        assert self.dcp == 1 or union_attn, "main-KV DCP is implemented on the union path"
+        self.compressed_dcp = compressed_dcp
+        assert not compressed_dcp or (
+            self.dcp == 2 and carrier and per_request_scores and bounded_chunks
+        ), "compressed-key DCP: pair split, carrier keys, per-request bounded scores"
         if union_attn:
-            # The union path's scratch (codes, union ids, compaction) pushed the 16-row kernel
-            # past scoped VMEM (j-3d8ad822: 62.6 of 62.1 MiB; with loop_requests' row copies and
-            # 4 slots still 62.21, j-3d196b4b); a 3-slot ring (2 tiles in flight) keeps a
+            # The union path's scratch (codes, union ids, compaction) pushed the 16-row
+            # kernel
+            # past scoped VMEM (j-3d8ad822: 62.6 of 62.1 MiB; with loop_requests' row
+            # copies and
+            # 4 slots still 62.21, j-3d196b4b); a 3-slot ring (2 tiles in flight) keeps
+            # a
             # request's union stream ahead of its reads.
             self.slots = min(self.slots, UNION_SLOTS)
         self.union_stats = union_stats
         assert not union_stats or union_attn, "the stats count the union"
         self.union_phys = union_phys
-        assert not union_phys or (union_attn and hbm_tables), "phys ids: union over HBM tables"
+        assert not union_phys or (union_attn and hbm_tables), (
+            "phys ids: union over HBM tables"
+        )
         self.loop_requests = loop_requests
-        assert not loop_requests or per_request_scores, "the request loop selects per request"
+        assert not loop_requests or per_request_scores, (
+            "the request loop selects per request"
+        )
         self.chunk_pages = chunk_pages if carrier else max_groups // GPK
-        assert (max_groups // GPK) % self.chunk_pages == 0, (max_groups, self.chunk_pages)
+        assert (max_groups // GPK) % self.chunk_pages == 0, (
+            max_groups,
+            self.chunk_pages,
+        )
         assert (self.chunk_pages * GPK) % 128 == 0 and (max_groups // 128) % 8 == 0
         assert not self.mp or self.chunk_pages % self.mp == 0
+        assert not compressed_dcp or self.n_chunks % self.dcp == 0, self.n_chunks
 
     @property
     def n_chunks(self) -> int:
         return self.max_groups // GPK // self.chunk_pages
+
+    # ------------------------------------------------- compressed-key DCP (`compressed_dcp`)
+    # Score layout: rank r's own groups, in local order, fill chunks [r * NC / D, (r + 1) * NC / D)
+    # of `qi_s`; so score position p holds group `_cdcp_gid(p)` and each half is ascending.
+    def _cdcp_gpp(self, ctx: Any) -> int:
+        """Groups per pool block: the unit of the owner rule `(g // gpp) % D`."""
+        return ctx.extra[POOL].shape[1] // MICRO
+
+    def _cdcp_local_nv(self, ctx: Any, nv: Any, rk: Any) -> Any:
+        """How many of rank `rk`'s own groups are among the first `nv` (its visible prefix)."""
+        gpp, D = self._cdcp_gpp(ctx), self.dcp
+        return (nv // (D * gpp)) * gpp + jnp.clip(nv % (D * gpp) - rk * gpp, 0, gpp)
+
+    def _cdcp_gid(self, ctx: Any, p: Any) -> Any:
+        """Group id at score position `p` (`cp_local_to_global` of the half's local index)."""
+        gpp, D, Gh = self._cdcp_gpp(ctx), self.dcp, self.max_groups // self.dcp
+        loc = jax.lax.rem(p, Gh)
+        return (loc // gpp) * (D * gpp) + (p // Gh) * gpp + jax.lax.rem(loc, gpp)
 
     def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
         out = super().outputs(g, ex)
@@ -170,22 +262,26 @@ class QSAFullIndexedBlock(QSAFullBlock):
         return super().smalls(g, ex) + [SmallField("qsa_iqn", ix.IDX_DIM)]
 
     def meta_rows(self, ex: ExecSpec) -> int:
-        """Rows of the per-request tables: requests, times the QSA layers if per-layer."""
+        """Rows of the per-request tables: requests, times the QSA layers if
+        per-layer.
+        """
         return ex.M // ex.T * max(1, self.n_layers)
 
-    def row_base(self, ctx: Any, l: Any) -> Any:
+    def row_base(self, ctx: Any, l: Any) -> Any:  # noqa: E741
         """This layer's first table row (0 without per-layer metadata)."""
         if not self.n_layers:
             return 0
         return ctx.stream.sp.block_ord(l, self.name) * (ctx.ex.M // ctx.ex.T)
 
     def table_shape(self, ex: ExecSpec, cols: int) -> tuple[int, ...]:
-        """`[rows, cols]` SMEM tables, or `[layers, requests, cols]` with `hbm_tables`."""
+        """`[rows, cols]` SMEM tables, or `[layers, requests, cols]` with
+        `hbm_tables`.
+        """
         if self.hbm_tables:
             return (max(1, self.n_layers), ex.M // ex.T, cols)
         return (self.meta_rows(ex), cols)
 
-    def tab_base(self, ctx: Any, l: Any) -> Any:
+    def tab_base(self, ctx: Any, l: Any) -> Any:  # noqa: E741
         """First row of this layer's tables in the refs `tables` returns."""
         return 0 if self.hbm_tables else self.row_base(ctx, l)
 
@@ -195,12 +291,14 @@ class QSAFullIndexedBlock(QSAFullBlock):
             return ctx.scr["qi_ckw"], ctx.scr["qi_mtw"]
         return (ctx.extra[CKTAB] if self.carrier else None), ctx.extra[MTAB]
 
-    def load_tables(self, ctx: Any, l: Any) -> None:
+    def load_tables(self, ctx: Any, l: Any) -> None:  # noqa: E741
         """Copy this layer's table rows into the SMEM windows (`hbm_tables` only)."""
         if not self.hbm_tables:
             return
-        # HBM tables are [layers, requests, cols]: a layer is one whole leading-dim block (a
-        # row offset `o * requests` into a 2-D table is not tile-aligned for 12 requests).
+        # HBM tables are [layers, requests, cols]: a layer is one whole leading-dim
+        # block (a
+        # row offset `o * requests` into a 2-D table is not tile-aligned for 12
+        # requests).
         o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
         scr = ctx.scr
         cps = [
@@ -212,7 +310,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         for c in cps:
             c.wait()
 
-    def offset(self, ctx: Any, l: Any) -> Any:
+    def offset(self, ctx: Any, l: Any) -> Any:  # noqa: E741
         if not self.n_layers:
             return ctx.extra[OFFSET][0]
         return ctx.extra[OFFSET][ctx.stream.sp.block_ord(l, self.name)]
@@ -222,15 +320,26 @@ class QSAFullIndexedBlock(QSAFullBlock):
         return [
             ExtraInput(POOL, "hbm"),
             *(
-                [ExtraInput(CK, "hbm"), ExtraInput(
-                    CKTAB, "hbm" if self.hbm_tables else "smem",
-                    self.table_shape(ex, self.max_groups // GPK // (self.mp or 1)), I32)]
+                [
+                    ExtraInput(CK, "hbm"),
+                    ExtraInput(
+                        CKTAB,
+                        "hbm" if self.hbm_tables else "smem",
+                        self.table_shape(ex, self.max_groups // GPK // (self.mp or 1)),
+                        I32,
+                    ),
+                ]
                 if self.carrier
                 else [ExtraInput(CK, "hbm", (nreq, self.max_groups, ix.IDX_DIM), BF16)]
             ),
             ExtraInput(NVIS, "smem", (ex.M,), I32),
             ExtraInput(TAIL, "smem", (ex.M,), I32),
-            ExtraInput(MTAB, "hbm" if self.hbm_tables else "smem", self.table_shape(ex, self.pps), I32),
+            ExtraInput(
+                MTAB,
+                "hbm" if self.hbm_tables else "smem",
+                self.table_shape(ex, self.pps),
+                I32,
+            ),
             ExtraInput(OFFSET, "smem", (max(1, self.n_layers),), I32),
             ExtraInput(SCALES, "smem", (2,), F32),
             ExtraInput(ROPE, "hbm", (ex.M, 128), F32),
@@ -241,24 +350,50 @@ class QSAFullIndexedBlock(QSAFullBlock):
         return super().scratch(g, ex, plan) + [
             *(
                 [
-                    ScratchReq("qi_ring", pltpu.VMEM(
-                        (2, self.chunk_pages, 16, 4 if self.carrier == "fp8" else 2, self.ck_lanes),
-                        jnp.float8_e4m3fn if self.carrier == "fp8" else BF16,
-                    )),
+                    ScratchReq(
+                        "qi_ring",
+                        pltpu.VMEM(
+                            (
+                                2,
+                                self.chunk_pages,
+                                16,
+                                4 if self.carrier == "fp8" else 2,
+                                self.ck_lanes,
+                            ),
+                            jnp.float8_e4m3fn if self.carrier == "fp8" else BF16,
+                        ),
+                    ),
                     ScratchReq("qi_ring_sem", pltpu.SemaphoreType.DMA((2,))),
                 ]
                 if self.carrier
                 else [ScratchReq("qi_ck", pltpu.VMEM((G, ix.IDX_DIM), BF16))]
             ),
-            ScratchReq("qi_q", pltpu.VMEM((MB // ex.T, ex.T * ix.IDX_HEADS, ix.IDX_DIM), F32)),
-            *([ScratchReq("qi_cc", pltpu.SMEM((1,), I32))] if self.bounded_chunks else []),
-            ScratchReq("qi_s", pltpu.VMEM(
-                (ex.T if self.per_request_scores else MB, self.n_chunks, S // self.n_chunks, 128),
-                F32,
-            )),
+            ScratchReq(
+                "qi_q", pltpu.VMEM((MB // ex.T, ex.T * ix.IDX_HEADS, ix.IDX_DIM), F32)
+            ),
+            *(
+                [ScratchReq("qi_cc", pltpu.SMEM((1,), I32))]
+                if self.bounded_chunks
+                else []
+            ),
+            ScratchReq(
+                "qi_s",
+                pltpu.VMEM(
+                    (
+                        ex.T if self.per_request_scores else MB,
+                        self.n_chunks,
+                        S // self.n_chunks,
+                        128,
+                    ),
+                    F32,
+                ),
+            ),
             *(
                 [
-                    ScratchReq("qi_ckw", pltpu.SMEM((MB // ex.T, G // GPK // (self.mp or 1)), I32)),
+                    ScratchReq(
+                        "qi_ckw",
+                        pltpu.SMEM((MB // ex.T, G // GPK // (self.mp or 1)), I32),
+                    ),
                     ScratchReq("qi_mtw", pltpu.SMEM((MB // ex.T, self.pps), I32)),
                     ScratchReq("qi_tsem", pltpu.SemaphoreType.DMA((2,))),
                 ]
@@ -272,14 +407,27 @@ class QSAFullIndexedBlock(QSAFullBlock):
             ScratchReq("qi_ids", pltpu.SMEM((MB, K + 128), I32)),
             ScratchReq("qi_kvl", pltpu.SMEM((MB,), I32)),
             ScratchReq("qi_z", pltpu.VMEM((1, 128), I32)),
-            *([ScratchReq("qi_dbg", pltpu.VMEM((MB, 4 * ix.IDX_DIM), F32))] if self.debug else []),
+            *(
+                [ScratchReq("qi_dbg", pltpu.VMEM((MB, 4 * ix.IDX_DIM), F32))]
+                if self.debug
+                else []
+            ),
             ScratchReq("qi_sem", pltpu.SemaphoreType.DMA((3,))),
+            *(
+                [
+                    ScratchReq("qx_ssem", pltpu.SemaphoreType.DMA((2,))),
+                    ScratchReq("qx_rsem", pltpu.SemaphoreType.DMA((2,))),
+                    ScratchReq("qx_credit", pltpu.SemaphoreType.REGULAR((1,))),
+                ]
+                if self.compressed_dcp
+                else []
+            ),
         ]
 
     # ------------------------------------------------------------ in kernel
     def _score_request(
         self, ctx: Any, q: int, qr: jax.Array, base: Any = 0, last: bool = True, row0: Any = None,
-        first: bool | None = None,
+        first: bool | None = None, c_off: Any = 0,
     ) -> None:
         """Scores of request `q`'s `T` rows into `qi_s[q*T : (q+1)*T]` (chunk-major).
 
@@ -287,12 +435,16 @@ class QSAFullIndexedBlock(QSAFullBlock):
         across requests (`q * n_chunks + c`): request q's last chunk prefetches request q+1's
         first chunk (unless `last`), so no request starts its key stream cold; request 0's
         first chunk is issued here. `first` (default `q == 0`) marks the first request of the
-        rank's run when the indexer is sharded by request (`shard_index`)."""
+        rank's run when the indexer is sharded by request (`shard_index`). `compressed_dcp`:
+        only this rank's own groups (`qsa_cktab` lists its pages), scored into chunks from
+        `c_off` on."""
         scr, T = ctx.scr, ctx.ex.T
         r0 = q * T if row0 is None else row0
         rows = slice(r0, r0 + T)
         if not self.carrier:
-            cp = pltpu.make_async_copy(ctx.extra[CK].at[q], scr["qi_ck"], scr["qi_sem"].at[0])
+            cp = pltpu.make_async_copy(
+                ctx.extra[CK].at[q], scr["qi_ck"], scr["qi_sem"].at[0]
+            )
             cp.start()
             cp.wait()
             st = ix.score_rows(qr, scr["qi_ck"][...])  # [T, G]
@@ -308,7 +460,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
             if MP:  # one DMA per manager page of MP contiguous kernel pages
                 return [
                     pltpu.make_async_copy(
-                        ctx.extra[CK].at[pl.ds(tab[qb, c * (CH // MP) + m] * MP, MP), :, :, lanes],
+                        ctx.extra[CK].at[
+                            pl.ds(tab[qb, c * (CH // MP) + m] * MP, MP), :, :, lanes
+                        ],
                         ring.at[s, pl.ds(m * MP, MP)],
                         sems.at[s],
                     )
@@ -316,7 +470,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
                 ]
             return [
                 pltpu.make_async_copy(
-                    ctx.extra[CK].at[tab[qb, c * CH + p], :, :, lanes], ring.at[s, p], sems.at[s]
+                    ctx.extra[CK].at[tab[qb, c * CH + p], :, :, lanes],
+                    ring.at[s, p],
+                    sems.at[s],
                 )
                 for p in range(CH)
             ]
@@ -335,10 +491,14 @@ class QSAFullIndexedBlock(QSAFullBlock):
         else:  # traced (`loop_requests`)
             pl.when(first)(issue_first)
         if self.bounded_chunks:
-            # Chunks this request's rows can see (the last row sees the most); slots follow a
-            # chunk counter carried across requests, as the fixed count's `q * NC + c` does.
+            # Chunks this request's rows can see (the last row sees the most); slots
+            # follow a
+            # chunk counter carried across requests, as the fixed count's `q * NC + c`
+            # does.
             nv = ctx.extra[NVIS][q * T + T - 1]
-            n_q = jnp.clip((nv + CG - 1) // CG, 1, NC)
+            if self.compressed_dcp:
+                nv = self._cdcp_local_nv(ctx, nv, jax.lax.rem(ctx.me, self.dcp))
+            n_q = jnp.clip((nv + CG - 1) // CG, 1, NC // (self.dcp if self.compressed_dcp else 1))
             c0 = scr["qi_cc"][0]
         else:
             n_q, c0 = NC, q * NC
@@ -351,7 +511,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
                 for cp in copies(c + 1, 1 - s):
                     cp.start()
 
-            if last is not True:  # the next request's first chunk into the slot this chunk frees
+            if (
+                last is not True
+            ):  # the next request's first chunk into the slot this chunk frees
 
                 @pl.when((c + 1 == n_q) & jnp.logical_not(last))
                 def _():
@@ -360,20 +522,18 @@ class QSAFullIndexedBlock(QSAFullBlock):
 
             # One wait for the whole slot (the page copies add up to its bytes).
             pltpu.make_async_copy(ring.at[s], ring.at[s], sems.at[s]).wait()
-            if self.carrier == "fp8":  # the stock BF16KeyReader read: ref bitcast FP8 -> BF16
-                keys = ring.at[s].bitcast(BF16)[...]
-            else:
-                keys = ring[s]
+            # Stock BF16KeyReader read: ref bitcast FP8 -> BF16 when carrier == "fp8".
+            keys = ring.at[s].bitcast(BF16)[...] if self.carrier == "fp8" else ring[s]
             keys = keys.reshape(CG, W)[:, : ix.IDX_DIM]
             st = ix.score_rows(qr, keys)  # [T, CG]
-            scr["qi_s"][rows, c] = st.reshape(T, CG // 128, 128)
+            scr["qi_s"][rows, c_off + c] = st.reshape(T, CG // 128, 128)
             return carry
 
         jax.lax.fori_loop(0, n_q, chunk, 0)
         if self.bounded_chunks:
             scr["qi_cc"][0] = c0 + n_q
 
-    def _select(self, ctx: Any, l: Any, slot: Any) -> None:
+    def _select(self, ctx: Any, l: Any, slot: Any) -> None:  # noqa: E741
         ex, scr, g = ctx.ex, ctx.scr, ctx.g
         MB, T, K, G = ex.MB, ex.T, self.budget, self.max_groups
         S, rot = G // 128, self.rot
@@ -381,9 +541,13 @@ class QSAFullIndexedBlock(QSAFullBlock):
             yi = rnd(ctx.stream.dmatmul(IDX_W, scr["xb"], IDX_N))
         cos = scr["qf_rope"][:, : rot // 2]
         sin = scr["qf_rope"][:, rot // 2 : rot]
-        iq = ix.index_query(yi, ctx.sm(slot, "qsa_iqn"), cos, sin, rot, g.eps, pltpu.bitcast)
+        iq = ix.index_query(
+            yi, ctx.sm(slot, "qsa_iqn"), cos, sin, rot, g.eps, pltpu.bitcast
+        )
         nreq = MB // T
-        for q in range(nreq):  # row-major (row, head) query tile per request, static stores
+        for q in range(
+            nreq
+        ):  # row-major (row, head) query tile per request, static stores
             for t in range(T):
                 for h in range(ix.IDX_HEADS):
                     i = t * ix.IDX_HEADS + h
@@ -391,16 +555,19 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.load_tables(ctx, l)
         base = self.tab_base(ctx, l)
         for q in range(nreq):
-            self._score_request(ctx, q, scr["qi_q"][q].astype(BF16), base, last=q == nreq - 1)
+            self._score_request(
+                ctx, q, scr["qi_q"][q].astype(BF16), base, last=q == nreq - 1
+            )
         rid = jax.lax.broadcasted_iota(I32, (MB, 1, 1), 0)
         nv = jnp.zeros((MB, 1, 1), I32)
         for r in range(MB):
             nv = jnp.where(rid == r, ctx.extra[NVIS][r], nv)
-        ids = (
-            jax.lax.broadcasted_iota(I32, (MB, S, 128), 1) * 128
-            + jax.lax.broadcasted_iota(I32, (MB, S, 128), 2)
+        ids = jax.lax.broadcasted_iota(
+            I32, (MB, S, 128), 1
+        ) * 128 + jax.lax.broadcasted_iota(I32, (MB, S, 128), 2)
+        bits = jnp.where(
+            ids < nv, pltpu.bitcast(scr["qi_s"][...].reshape(MB, S, 128), I32), -1
         )
-        bits = jnp.where(ids < nv, pltpu.bitcast(scr["qi_s"][...].reshape(MB, S, 128), I32), -1)
         thr, tmax = ix.thresholds(bits, ids, nv, K, G)
         scr["qi_th"][...] = jnp.broadcast_to(thr, (MB, 1, 128))
         scr["qi_tm"][...] = jnp.broadcast_to(tmax, (MB, 1, 128))
@@ -411,18 +578,23 @@ class QSAFullIndexedBlock(QSAFullBlock):
 
         def row(r: Any, carry: Any) -> Any:
             nvr = scr["qi_nv"][r][:, :1]
-            b = jnp.where(lid < nvr, pltpu.bitcast(scr["qi_s"][r].reshape(S, 128), I32), -1)
+            b = jnp.where(
+                lid < nvr, pltpu.bitcast(scr["qi_s"][r].reshape(S, 128), I32), -1
+            )
             scr["qi_id"][r] = ix.compact_row(
                 b, scr["qi_th"][r][:, :1], scr["qi_tm"][r][:, :1], nvr, K, consts
             )
             # Columns past K are read by the last tile's copies: keep them at group 0.
             cs = [
                 pltpu.make_async_copy(
-                    scr["qi_id"].at[r], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)],
+                    scr["qi_id"].at[r],
+                    scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)],
                     scr["qi_sem"].at[1],
                 ),
                 pltpu.make_async_copy(
-                    scr["qi_z"], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)], scr["qi_sem"].at[2]
+                    scr["qi_z"],
+                    scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)],
+                    scr["qi_sem"].at[2],
                 ),
             ]
             for c in cs:
@@ -445,7 +617,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
                 scr["qi_dbg"][:, h * ix.IDX_DIM : (h + 1) * ix.IDX_DIM] = iq[h]
             o = ctx.stream.sp.block_ord(l, self.name)
             for src, dst in ((scr["qi_dbg"], DBG_IQ), (scr["qi_id"], DBG_IDS)):
-                c = pltpu.make_async_copy(src, ctx.O[dst].at[o, pl.ds(0, MB)], scr["qi_sem"].at[0])
+                c = pltpu.make_async_copy(
+                    src, ctx.O[dst].at[o, pl.ds(0, MB)], scr["qi_sem"].at[0]
+                )
                 c.start()
                 c.wait()
 
@@ -486,7 +660,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
             )
 
         zeros = tuple(jnp.zeros((ex.MB, g.HD), F32) for _ in range(nh))
-        *outs, _, _ = jax.lax.fori_loop(0, ex.MB, row, (*zeros, jnp.int32(0), jnp.int32(0)))
+        *outs, _, _ = jax.lax.fori_loop(
+            0, ex.MB, row, (*zeros, jnp.int32(0), jnp.int32(0))
+        )
         for h, o in enumerate(outs):
             scr["xb2"][:, pl.ds(h * g.HD, g.HD)] = o.astype(BF16)
         kv.wait()

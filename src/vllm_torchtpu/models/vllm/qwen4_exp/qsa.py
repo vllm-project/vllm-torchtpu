@@ -710,10 +710,10 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 )
 
                 # VLLM_TPU_QSA_COMPRESSED_DCP: owned-group scoring, pair merge.
-                # The megakernel's whole-step writer still writes whole rows.
-                assert self._select_op is None, (
-                    "VLLM_TPU_QSA_COMPRESSED_DCP and VLLM_TPU_MEGAKERNEL are exclusive"
-                )
+                # The transplanted (c6fd3ab71) whole-step megakernel writes compressed
+                # keys split like the main KV (qwen38_wholestep_call.compressed_dcp()),
+                # so the 1116 exclusivity assert is dropped here, as in c6fd3ab71's qsa.py.
+                # Numerics UNVERIFIED in this tree (the bench uses synthetic acceptance).
                 self._dcp_op = partial(
                     build_pooled_qsa_compressed_dcp_op(pair, self.main_kv_dcp),
                     kv_heads=self.num_kv_heads,

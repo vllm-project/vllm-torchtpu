@@ -22,9 +22,10 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
-from ...ops import BF16, F32, I32, rnd, rup
+from ...ops import BF16, F32, I32, REC, rnd, rup
 from .params import GDNParams
 from .states import rec_chunk
+from .window_log import write_log_row, write_log_update
 
 
 def gate_act(gate: str) -> Any:
@@ -75,9 +76,11 @@ def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
         )
         pred = jnp.sum(sb[...] * kc_, axis=1)
         delta = (v - pred) * beta[:, None]
+        if VER:
+            write_log_row(ctx, gp, s_, t_, decay, k, delta)
         sb[...] = sb[...] + kc_ * delta[:, None, :]
         out = rnd(jnp.sum(sb[...] * qc, axis=1))
-        recb[b * vh : (b + 1) * vh] = sb[...].astype(BF16)
+        recb[b * vh : (b + 1) * vh] = sb[...].astype(REC)
         val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
         val = (gnw[None, :] * val.astype(BF16)).astype(F32)
         zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
@@ -120,6 +123,8 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
 
     def rows(r0, n: int, s):
         n_pad = rup(n, 8)
+        # First request of the chunk (row chunks hold whole requests: CB % T == 0).
+        s0 = r0 // T if isinstance(r0, int) else lax.div(r0, T)
         uc = ybuf[pl.ds(r0, n_pad), 0:QKV]
         bac = ybuf[pl.ds(r0, n_pad), BA : BA + BA_PAD]
         zc = ybuf[pl.ds(r0, n_pad), QKV : QKV + Z]
@@ -146,12 +151,16 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
                 sb[...] = st[src : src + vh].astype(F32) * jnp.exp(decay)[:, None, None]
                 pred = jnp.sum(sb[...] * kc_, axis=1)
                 delta = (v - pred) * beta[:, None]
+                if VER:
+                    write_log_row(ctx, gp, s0 + bb // T, bb % T, decay, k, delta)
                 sb[...] = sb[...] + kc_ * delta[:, None, :]
                 out = rnd(jnp.sum(sb[...] * qc, axis=1))
-                st[h0 : h0 + vh] = sb[...].astype(BF16)
+                st[h0 : h0 + vh] = sb[...].astype(REC)
             else:
                 # Head-major recurrence (opt-in `GDNTunables.gdn_head_major`):
                 # per-head update with `colsk` K/Q double-buffered in `sb`.
+                if VER:
+                    write_log_row(ctx, gp, s0 + bb // T, bb % T, decay, k, None)
                 cb = (bb % NCB) * 2 * kh
                 sb[cb : cb + kh] = colsk(k)
                 sb[cb + kh : cb + 2 * kh] = colsk(q)
@@ -164,10 +173,12 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
                     s_h = st[src + h : src + h + 1].astype(F32) * eg[h : h + 1]
                     pred_h = jnp.sum(s_h * kc_h, axis=1)
                     delta_h = (v[h : h + 1] - pred_h) * beta2[h : h + 1]
+                    if VER:
+                        write_log_update(ctx, gp, s0 + bb // T, bb % T, h, delta_h)
                     s_h = s_h + kc_h * delta_h[:, None, :]
                     qc_h = sb[cb + kh + j : cb + kh + j + 1]
                     out_acc = jnp.where(hrow == h, jnp.sum(s_h * qc_h, axis=1), out_acc)
-                    st[h0 + h : h0 + h + 1] = s_h.astype(BF16)
+                    st[h0 + h : h0 + h + 1] = s_h.astype(REC)
                 out = rnd(out_acc)
             val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
             val = (gnw[None, :] * val.astype(BF16)).astype(F32)

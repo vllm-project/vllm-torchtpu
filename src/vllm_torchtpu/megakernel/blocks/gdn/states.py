@@ -228,6 +228,10 @@ def rec_chunk(ctx: Any, gp: GDNParams, o: Any, j: Any, s: Any, out: bool) -> Any
             ctx.O[rec_out_key].at[o, pl.ds(r0, n)],
             ctx.scr["rec_sem"].at[1, s],
         )
+    # A pool block may gather chunk states itself (`Qwen38PoolGDN` chunk gather).
+    rec_in_hook = ctx.ST.get("rec_chunk_in")
+    if rec_in_hook is not None:
+        return rec_in_hook(ctx, gp, o, j, s, n)
     if gp.GPR:
         return _GprRecIn(ctx, gp, o, j, s, n)
     if ex.VER:

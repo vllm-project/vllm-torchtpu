@@ -1077,11 +1077,9 @@ def validate_gdn_window_log(cfg) -> None:
             "of a PD pair it runs only on the staged decode (a TP>1 kv_consumer "
             "with TPU_RAIDEN_POOL_TAGS_PER_LAYER=1)"
         )
-    if _is_megakernel_requested(SimpleNamespace(vllm_config=cfg)):
-        reasons.append(
-            "the megakernel reads read offsets as checkpoint indices and writes "
-            "full checkpoints"
-        )
+    # The megakernel (whole-step and segment calls) folds the log before its read
+    # and writes checkpoint 0 + log (megakernel_runtime/qwen38_window_log.py).
+    del _is_megakernel_requested, SimpleNamespace
     p = cfg.parallel_config
     if p.data_parallel_size > 1:
         reasons.append(f"data parallel size {p.data_parallel_size} > 1")

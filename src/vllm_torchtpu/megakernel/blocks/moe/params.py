@@ -23,6 +23,10 @@ from ...exec_spec import ExecSpec, NumericsClass
 from ...ops import rup
 
 
+# Row-bucketed experts (`row_bucket`): rows of the small block (one bf16 sublane tile).
+RB_SMALL = 16
+
+
 @dataclass(frozen=True)
 class MoEParams:
     """Block-owned build-time parameters for `MoEBlock`."""
@@ -59,6 +63,12 @@ class MoEParams:
     # expert paths) for buckets up to `MoETunables.moe_group_rows` rows.
     group_rel: bool
     ecopy_opt: int
+    # Routed-row bucketing on the PIPE_EP expert path (`MoETunables.row_bucket`,
+    # resolved): each expert's matmuls run on its gathered routed rows, in one
+    # `rb_small`-row block or in `rb_chunk`-row chunks.
+    RB: bool
+    rb_small: int
+    rb_chunk: int
     eps: float
     zero_centered_norm: bool
 
@@ -82,6 +92,13 @@ class MoETunables:
     route_vec: bool = False
     topk_lanes: bool = False  # Batcher odd-even top-k on lanes for E >= 128
     moe_unroll: bool = False  # Unrolled expert tile loops + grouped expert refills
+    # PIPE_EP experts: gather each expert's routed rows (one-hot MXU gather) into a
+    # 16-row block (or 16/32-row chunks), run e13/e2 on those rows only, scatter-add
+    # the weighted rows into `part` (VLLM_TPU_MK_ROW_BUCKET). Rows are independent and
+    # the K tiling / expert order are unchanged, so the result equals the dense path
+    # bit for bit, up to the sign of a zero `part` entry on rows the expert does not
+    # route (blocks/moe/rowbucket.py).
+    row_bucket: bool = False
 
     # `exact`: moving the field keeps hidden states and caches bit-identical
     # (scheduling only); `approx`: changes or may change the arithmetic.
@@ -95,6 +112,7 @@ class MoETunables:
         "route_vec": "approx",  # vectorized routing policy
         "topk_lanes": "approx",  # Batcher odd-even lane top-k
         "moe_unroll": "approx",  # unrolled expert tiles (not exact on TPU, bisect)
+        "row_bucket": "approx",  # routed-row blocks (bitwise up to signed zeros)
     }
 
 
@@ -159,6 +177,14 @@ def derive_moe_params(
         and ex.R * extra + ex.R + 1 <= 128  # NCP + R + 1 <= 128 VREG lanes
         and nb_picks >= er  # elist/wlist capacity covers ER local slots
     )
+    rb_lanes = 128
+    rb = bool(
+        tt.row_bucket
+        and pipe_ep
+        and ex.MB > RB_SMALL  # one RB_SMALL-row block is the dense path
+        and ex.MR <= rb_lanes  # per-expert row codes fit one lane row
+        and g.E % rb_lanes == 0  # 128-lane rows of the per-expert row counts
+    )
     return MoEParams(
         H=g.H,
         E=g.E,
@@ -188,6 +214,10 @@ def derive_moe_params(
         unroll=bool(tt.moe_unroll or pipe_ep),
         group_rel=tt.moe_group_rows >= ex.B,
         ecopy_opt=tt.ecopy_opt,
+        RB=rb,
+        rb_small=RB_SMALL,
+        # Chunks tile MB exactly, so a chunk never runs past the [MB, .] buffers.
+        rb_chunk=32 if ex.MB % 32 == 0 else 16,
         eps=g.eps,
         zero_centered_norm=bool(getattr(g, "zero_centered_norm", True)),
     )

@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from ...exec_spec import ExecSpec
-from ...ops import BF16, F32, rnd, rup
+from ...ops import BF16, F32, REC, rnd, rup
 from .params import gdn_lin_in_layout
 
 
@@ -64,7 +64,9 @@ def gdn_reference(
     expand = vh // kh
     eps = float(getattr(g, "eps", 1e-6))
     l2_eps = float(getattr(g, "gdn_l2_eps", 1e-6))
-    gate = {"silu": jax.nn.silu, "sigmoid": jax.nn.sigmoid}[str(getattr(g, "gdn_gate", "silu"))]
+    gate = {"silu": jax.nn.silu, "sigmoid": jax.nn.sigmoid}[
+        str(getattr(g, "gdn_gate", "silu"))
+    ]
     xb = x[:B].astype(BF16).astype(F32)
 
     def _slice_sm(arr: Any) -> Any:
@@ -112,7 +114,7 @@ def gdn_reference(
             if T == 1
             else jnp.zeros((R, NS, HR, QKV), dtype=F32)
         )
-        rec_out = jnp.zeros((R, B * vh, KD, VD), dtype=BF16)
+        rec_out = jnp.zeros((R, B * vh, KD, VD), dtype=REC)
 
     gdn_partials = []
     for r in range(R):
@@ -188,7 +190,7 @@ def gdn_reference(
             delta = (v - pred) * beta[:, None]
             st_cur = st_cur + kc_ * delta[:, None, :]
             out_b = rnd(jnp.sum(st_cur * qc, axis=1))
-            rec_prev = st_cur.astype(BF16)
+            rec_prev = st_cur.astype(REC)
             rec_r_list.append(rec_prev)
             val = out_b * lax.rsqrt(
                 jnp.mean(out_b * out_b, axis=-1, keepdims=True) + eps

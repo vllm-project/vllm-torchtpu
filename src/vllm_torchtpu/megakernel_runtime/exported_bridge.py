@@ -118,7 +118,8 @@ def sharded_jax_callable(
             "output_partition_specs": str(output_partition_specs),
         },
     )
-    return pallas_impl.JaxCallable(
+    jax_callable_cls: Any = pallas_impl.JaxCallable
+    return jax_callable_cls(
         name=name,
         jit_fn=jit_fn,
         trace_key=trace_key,
@@ -308,6 +309,7 @@ def verify_pooled_step_hlo(
     )
     lowered = j_fn.lower(*avals)
     hlo_text = lowered.compile().as_text() if compile_hlo else lowered.as_text("hlo")
+    assert hlo_text is not None
     num_pages = int(raw_pools[0].shape[0])
     page_size = int(raw_pools[0].shape[-1])
     g: Any = spec.config

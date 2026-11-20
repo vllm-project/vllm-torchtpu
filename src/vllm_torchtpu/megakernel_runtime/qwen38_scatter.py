@@ -31,6 +31,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.megakernel.models.qwen38_gdn_pool import (
     CONV_ROWS,
     SSM_BLOCKS,
@@ -41,11 +42,18 @@ from vllm_torchtpu.megakernel.models.qwen38_gdn_pool import (
 from .qwen38_gdn_state import Qwen38GdnPoolLayout, _conv_windows
 
 RING = 4
-# Deep prefetch for large calls (j-0158b3f2, 64 rows = 192 checkpoints: 132.6 -> 63.3 us at ring 12 /
-# prefetch 6); at <= 32 rows it buys nothing, so small calls keep ring 4 / prefetch 1. A load-in-flight
-# depth close to the ring starves the pool writes (prefetch = ring - 2 lost at every size).
+# Deep prefetch for large calls (j-0158b3f2, 64 rows = 192 checkpoints: 132.6 -> 63.3 us
+# at ring 12 /
+# prefetch 6); at <= 32 rows it buys nothing, so small calls keep ring 4 / prefetch 1. A
+# load-in-flight
+# depth close to the ring starves the pool writes (prefetch = ring - 2 lost at every
+# size).
 AUTO_MIN_CKPTS = 144
 AUTO_RING, AUTO_PREFETCH = 12, 6
+# VLLM_TPU_MK_SCATTER_DEEP: the whole-step call scatters 33 GDN layers' checkpoints
+# (132 at 4 rows, 528 at 16). j-eaee59c4 (NL 33): 4 rows r4/p1 96 us -> r16/p12 46;
+# 16 rows r12/p6 156 -> r16/p12 140. Deep ring from 64 checkpoints.
+DEEP_MIN_CKPTS, DEEP_RING, DEEP_PREFETCH = 64, 16, 12
 
 
 def _store_typed(ref: Any, vals: Any, interpret: bool) -> None:
@@ -73,9 +81,12 @@ def scatter_gdn_ckpts_fast(
     """Same contract as `scatter_gdn_ckpts` (per-rank arrays); returns the pool.
 
     `ring` staging slots: checkpoints `i + 1 .. i + prefetch` are loaded while `i` is
-    converted, and up to `ring` pool writes are in flight (`prefetch < ring`; 1 keeps one
-    load in flight, which leaves each step waiting on its own load's latency). Unset: ring 4 /
-    prefetch 1 below `AUTO_MIN_CKPTS` checkpoints, `AUTO_RING` / `AUTO_PREFETCH` from there. Checkpoints addressed to the
+    converted, and up to `ring` pool writes are in flight (`prefetch < ring`; 1 keeps
+    one
+    load in flight, which leaves each step waiting on its own load's latency). Unset:
+    ring 4 /
+    prefetch 1 below `AUTO_MIN_CKPTS` checkpoints, `AUTO_RING` / `AUTO_PREFETCH` from
+    there. Checkpoints addressed to the
     null block 0 (rows with no request, every row of a shadow call) are not
     written, as the stock pooled GDN kernel moves no bytes for padded rows:
     the null block's pages are also read (masked) as KV, and f32 state bytes
@@ -83,8 +94,12 @@ def scatter_gdn_ckpts_fast(
     """
     NL, NS, T = write_blocks.shape
     n = NL * NS * T
+    if ring is None and prefetch is None and envs.VLLM_TPU_MK_SCATTER_DEEP and n >= DEEP_MIN_CKPTS:
+        ring, prefetch = DEEP_RING, DEEP_PREFETCH
     if ring is None and prefetch is None:
-        ring, prefetch = (AUTO_RING, AUTO_PREFETCH) if n >= AUTO_MIN_CKPTS else (RING, 1)
+        ring, prefetch = (
+            (AUTO_RING, AUTO_PREFETCH) if n >= AUTO_MIN_CKPTS else (RING, 1)
+        )
     RING_ = RING if ring is None else ring
     P = 1 if prefetch is None else prefetch
     assert 1 <= P < RING_, (prefetch, ring)
@@ -95,7 +110,9 @@ def scatter_gdn_ckpts_fast(
     per = QKV // 256
     f8 = pool.dtype
 
-    def kernel(ids_ref, rec_ref, win_ref, pool_in, pool_out, vin, cin, vout, cout, sin, sout):
+    def kernel(
+        ids_ref, rec_ref, win_ref, pool_in, pool_out, vin, cin, vout, cout, sin, sout
+    ):
         del pool_in
 
         def out_copies(slot, m):
@@ -150,11 +167,17 @@ def scatter_gdn_ckpts_fast(
             vals = vin[slot].astype(jnp.float32).reshape(vh * KD, VD)
             rows = vals.shape[0] // SSM_BLOCKS
             for j in range(SSM_BLOCKS):
-                _store_typed(vout.at[slot, j], vals[j * rows : (j + 1) * rows], interpret)
+                _store_typed(
+                    vout.at[slot, j], vals[j * rows : (j + 1) * rows], interpret
+                )
             cv = cin[slot]
             # 256-lane rows of the conv history in row-major order, padded to 16.
             crow = jnp.concatenate(
-                [cv[r : r + 1, c * 256 : (c + 1) * 256] for r in range(3) for c in range(per)]
+                [
+                    cv[r : r + 1, c * 256 : (c + 1) * 256]
+                    for r in range(3)
+                    for c in range(per)
+                ]
                 + [jnp.zeros((CONV_ROWS - 3 * per, 256), jnp.float32)],
                 axis=0,
             )
@@ -173,7 +196,7 @@ def scatter_gdn_ckpts_fast(
         for k in range(max(0, n - RING_ + P), n):
 
             @pl.when(ids_ref[k] != 0)
-            def _():
+            def _(k=k):
                 for c in out_copies(k % RING_, ids_ref[k]):
                     c.wait()
 

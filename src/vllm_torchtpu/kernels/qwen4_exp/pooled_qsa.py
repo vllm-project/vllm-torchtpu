@@ -3554,3 +3554,187 @@ def pooled_qsa_rows_step(
         max_query_len=max_query_len,
         rows=rows,
     )
+
+
+# --- ported from caojx/qwen38-flash-agentx-disagg-1112 @ 9904d2e1c for the whole-step megakernel's cache writer ---
+def write_compressed_pairs(pool, pair, write, mask, values):
+    """``write_compressed``'s per-pair writer for ``compressed_pairs`` outputs.
+
+    Rows are written in order, so a destination listed twice keeps its last
+    value; callers may concatenate several layers' pairs into one call.
+    """
+    packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
+    width = pool.shape[-1]
+    view = pool.reshape(-1, packing, width)
+
+    def per_pair_kernel(indices, active, row_mask, values_ref, old, updated):
+        t = pl.program_id(0)
+
+        @pl.when(active[t] != 0)
+        def store():
+            def copy(tile, semaphore):
+                target = updated.at[indices[t]]
+                bf = tile.bitcast(jnp.bfloat16) if pool.dtype != jnp.bfloat16 else tile
+                full_pair = (row_mask[t, 0] != 0) & (row_mask[t, 1] != 0)
+
+                @pl.when(full_pair)
+                def initialize_full_pair():
+                    # Both BF16 rows cover every byte in the packed carrier;
+                    # no old value is semantically observable.
+                    bf[...] = values_ref[0]
+
+                @pl.when(~full_pair)
+                def merge_partial_pair():
+                    pltpu.async_copy(target, tile, semaphore).wait()
+                    row = jnp.broadcast_to(jnp.arange(2)[:, None], (2, width))
+                    mask = jnp.where(row == 0, row_mask[t, 0], row_mask[t, 1]) != 0
+                    bf[...] = jnp.where(mask, values_ref[0], bf[...])
+
+                pltpu.async_copy(tile, target, semaphore).wait()
+
+            pl.run_scoped(
+                copy, pltpu.VMEM((packing, width), pool.dtype), pltpu.SemaphoreType.DMA
+            )
+
+    def update(view, indices, active, row_mask, rows):
+        return pl.pallas_call(
+            per_pair_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=3,
+                grid=(len(indices),),
+                in_specs=[
+                    pl.BlockSpec((1, 2, width), lambda t, *args: (t, 0, 0)),
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                ],
+                out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            ),
+            out_shape=jax.ShapeDtypeStruct(view.shape, view.dtype),
+            input_output_aliases={4: 0},
+        )(indices, active, row_mask, rows, view)
+
+    pair = pair.astype(jnp.int32)
+    write = write.astype(jnp.int32)
+    mask = mask.astype(jnp.int32)
+    # The compiler prefetches the rows operand into SMEM. A 4K-token step
+    # makes it 2 MiB, above v7's 1 MiB limit. Bound each write to 512 KiB.
+    bytes_per_token = 2 * width * jnp.dtype(jnp.bfloat16).itemsize
+    max_rows = max(1, (512 * 1024) // bytes_per_token)
+    chunk_size = min(len(pair), 512, 1 << (max_rows.bit_length() - 1))
+    if len(pair) <= chunk_size:
+        view = update(view, pair, write, mask, values)
+    else:
+        padding = (-len(pair)) % chunk_size
+
+        def split(x):
+            x = jnp.pad(x, ((0, padding),) + ((0, 0),) * (x.ndim - 1))
+            return x.reshape(-1, chunk_size, *x.shape[1:])
+
+        chunks = tuple(map(split, (pair, write, mask, values)))
+
+        def step(owner, inputs):
+            return update(owner, *inputs), None
+
+        view, _ = jax.lax.scan(step, view, chunks)
+    return view.reshape(pool.shape)
+
+
+def write_compressed_pairs_unique(pool, pair, write, mask, values):
+    """``write_compressed_pairs`` for steps whose writers hit distinct pairs.
+
+    The writers (``write``) are compacted to the front in order and handled by
+    one kernel step: all partial pairs are read with concurrent DMAs, merged in
+    VMEM, then all pairs written with concurrent DMAs, instead of one grid step
+    and two serial DMAs per row. Distinct destinations make the order of the
+    writes unobservable, so the pool ends with ``write_compressed_pairs``'
+    bytes. If two writers share a pair the ordered writer runs instead.
+    """
+    packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
+    width = pool.shape[-1]
+    n = len(pair)
+    write = write.astype(jnp.bool_)
+    order = jnp.argsort(~write, stable=True)
+    count = jnp.sum(write, dtype=jnp.int32)
+    pair_c = pair.astype(jnp.int32)[order]
+    mask_c = mask.astype(jnp.int32)[order]
+    values_c = values[order]
+    live = jnp.arange(n) < count
+    dup = (pair_c[:, None] == pair_c[None, :]) & live[:, None] & live[None, :]
+    unique = ~jnp.any(dup & ~jnp.eye(n, dtype=jnp.bool_))
+    view = pool.reshape(-1, packing, width)
+
+    def kernel(scalars, pair_ref, smask_ref, vmask_ref, values_ref, _old, out, buf, sem):
+        bf = buf.bitcast(jnp.bfloat16) if pool.dtype != jnp.bfloat16 else buf
+
+        def partial(i):
+            return (smask_ref[i, 0] == 0) | (smask_ref[i, 1] == 0)
+
+        def copy(i, read):
+            src, dst = out.at[pair_ref[i]], buf.at[i]
+            # Equal-sized copies share one semaphore: each wait retires one copy.
+            return pltpu.make_async_copy(*((src, dst) if read else (dst, src)), sem)
+
+        def each(fn):
+            def body(i, c):
+                fn(i)
+                return c
+
+            jax.lax.fori_loop(0, scalars[0], body, 0)
+
+        def if_partial(fn):
+            def run(i):
+                @pl.when(partial(i))
+                def _():
+                    fn(i)
+
+            return run
+
+        def merge_row(i):
+            rows = jnp.broadcast_to(jnp.arange(2)[:, None], (2, width))
+            keep = jnp.where(rows == 0, vmask_ref[i, 0], vmask_ref[i, 1]) != 0
+            bf[i] = jnp.where(keep, values_ref[i], bf[i])
+
+        @pl.when(scalars[1] != 0)
+        def concurrent():
+            each(if_partial(lambda i: copy(i, True).start()))
+            each(if_partial(lambda i: copy(i, True).wait()))
+            each(merge_row)
+            each(lambda i: copy(i, False).start())
+            each(lambda i: copy(i, False).wait())
+
+        @pl.when(scalars[1] == 0)
+        def ordered():
+            def row(i):
+                @pl.when(partial(i))
+                def _():
+                    copy(i, True).start()
+                    copy(i, True).wait()
+
+                merge_row(i)
+                copy(i, False).start()
+                copy(i, False).wait()
+
+            each(row)
+
+    view = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(1,),
+            in_specs=[
+                pl.BlockSpec((n, 2), lambda i, *_: (0, 0)),
+                pl.BlockSpec((n, 2, width), lambda i, *_: (0, 0, 0)),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[
+                pltpu.VMEM((n, packing, width), pool.dtype),
+                pltpu.SemaphoreType.DMA,
+            ],
+        ),
+        out_shape=jax.ShapeDtypeStruct(view.shape, view.dtype),
+        input_output_aliases={5: 0},
+        name="qwen4_exp_compressed_kv_unique_pairs",
+    )(jnp.stack([count, unique.astype(jnp.int32)]), pair_c, mask_c, mask_c, values_c, view)
+    return view.reshape(pool.shape)
+
+
