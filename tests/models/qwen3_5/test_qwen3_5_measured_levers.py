@@ -116,14 +116,14 @@ def test_measured_checkpoint_on_tpu7x_takes_the_kernel_numerics(arch):
 @pytest.mark.parametrize("arch", QWEN3_5_ARCHS)
 def test_mains_ci_checkpoint_keeps_mains_arithmetic(arch):
     assert hooks.is_measured_target(_model(SHAPE_35B, arch)) is False
-    assert hooks.apply_kernel_numerics(_model(SHAPE_35B, arch)) is None
+    assert hooks.apply_kernel_numerics(_model(SHAPE_35B, arch)) is False
     assert _levers() == MAINS
 
 
 @pytest.mark.parametrize("key", sorted(SHAPE_397B))
 def test_a_checkpoint_that_differs_in_one_dimension_keeps_mains_arithmetic(key):
     shape = dict(SHAPE_397B, **{key: SHAPE_397B[key] // 2})
-    assert hooks.apply_kernel_numerics(_model(shape)) is None
+    assert hooks.apply_kernel_numerics(_model(shape)) is False
     assert _levers() == MAINS
 
 
@@ -132,7 +132,7 @@ def test_the_measured_checkpoint_on_another_device_keeps_mains_arithmetic(
     monkeypatch, chip
 ):
     monkeypatch.setattr(hooks, "_chip_family", lambda: chip)
-    assert hooks.apply_kernel_numerics(_model(SHAPE_397B)) is None
+    assert hooks.apply_kernel_numerics(_model(SHAPE_397B)) is False
     assert _levers() == MAINS
 
 
@@ -143,7 +143,7 @@ def test_mains_ci_checkpoint_never_reads_the_device(monkeypatch):
         raise AssertionError("the chip was read for a checkpoint that is not measured")
 
     monkeypatch.setattr(hooks, "_chip_family", _fail)
-    assert hooks.apply_kernel_numerics(_model(SHAPE_35B)) is None
+    assert hooks.apply_kernel_numerics(_model(SHAPE_35B)) is False
     assert _levers() == MAINS
 
 
