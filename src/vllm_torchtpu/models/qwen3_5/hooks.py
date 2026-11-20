@@ -250,8 +250,9 @@ def is_measured_target(model_config) -> bool:
         return True
     logger.info_once(
         "Qwen3.5 kernel levers (reciprocal-scale quantize, tuned and streamed "
-        "FP8 MoE grouped matmul, few-token MoE kernel) left at main's "
-        "arithmetic: they were measured for Qwen3.5-397B-A17B on TPU7x only."
+        "FP8 MoE grouped matmul, two-sort non-EP MoE routing, few-token MoE "
+        "kernel) left at main's arithmetic and code: they were measured for "
+        "Qwen3.5-397B-A17B on TPU7x only."
     )
     return False
 
@@ -276,6 +277,9 @@ def apply_kernel_numerics(model_config) -> bool:
     """
     if not is_measured_target(model_config):
         return False
+    # Imported where the rule applies, not at the module top: every vLLM
+    # process imports this module through the general plugin
+    # (register_models), and only the measured target needs these kernels.
     from vllm_torchtpu.kernels.megablox import gmm_v2
     from vllm_torchtpu.kernels.quantized_matmul import util
     from vllm_torchtpu.layers.core import fused_moe_gmm
