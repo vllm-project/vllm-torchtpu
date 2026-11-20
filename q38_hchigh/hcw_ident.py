@@ -7,7 +7,7 @@ every bucket, and prints the sha256 of the lowered StableHLO text (no debug info
 sorted compile env-factor keys. The proof body compares base vs head (flag unset / 0 must equal base everywhere; WIDE=1 / 2
 must equal base below 160 rows and differ at 160-496: the probe sees the flag).
 
-usage: hcw_ident.py --out JSON
+usage: hcw_ident.py --out JSON   (deviceless: JAX_PLATFORMS unset, TPU_ACCELERATOR_TYPE=tpu7x-8)
 """
 import argparse
 import hashlib
@@ -49,8 +49,12 @@ def main():
                 order.append((f"{kind}_{'inj' if inject else 'noinj'}", name))
     finally:
         va.pallas.jax_op = real
+    import numpy as np
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
     dev = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x:2x2x1").devices[0]
-    sh = jax.sharding.SingleDeviceSharding(dev)
+    mesh = Mesh(np.array([dev]), ("d",))
+    sh = NamedSharding(mesh, PartitionSpec())
     s = lambda shape, dt=jnp.bfloat16: jax.ShapeDtypeStruct(shape, dt, sharding=sh)  # noqa: E731
     out = {"env": {k: os.environ.get(k) for k in ("TPU_QWEN4_HC_DECODE_WIDE", "TPU_QWEN4_HC_DECODE_COMPARE",
                                                   "TPU_QWEN4_HC_DECODE_TILE_ROWS")},
@@ -65,7 +69,8 @@ def main():
                 args = [s((t, W)), s((t, H)), s((t, BR), jnp.float32), s((W,)), s((LR, W)), s((W, LR))]
                 args += [s((BR, W))] if key.endswith("_inj") else []
             try:
-                txt = jax.jit(core).lower(*args).as_text()
+                with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+                    txt = jax.jit(core).lower(*args).as_text()
                 out["hash"][f"{key}@{t}"] = hashlib.sha256(txt.encode()).hexdigest()[:16]
                 out["hash"][f"{key}@{t}#wide"] = "_w1" in txt or "_w2" in txt
             except Exception as e:  # noqa: BLE001
