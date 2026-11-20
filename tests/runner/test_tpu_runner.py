@@ -288,6 +288,7 @@ def test_spec_warmup_request_verifies_k_drafts_under_dynamic_schedule():
             parallel_config=SimpleNamespace(decode_context_parallel_size=1)
         ),
         input_batch=SimpleNamespace(num_reqs=1, req_ids=["__spec_warmup_0__"]),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
         _is_async_drafter=True,
         _async_drafter=drafter,
         execute_model=lambda so: captured.append(so),
@@ -821,7 +822,7 @@ def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
         max_model_len=256,
         max_num_tokens=256,
         max_num_reqs=tpu_runner.MIN_NUM_SEQS,
-        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        scheduler_config=SimpleNamespace(max_num_seqs=4, async_scheduling=False),
         speculative_config=SimpleNamespace(num_speculative_tokens=7),
         kv_cache_config=SimpleNamespace(
             num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
@@ -857,6 +858,7 @@ def test_spec_warmup_keeps_optimistic_output_placeholders():
     runner = SimpleNamespace(
         max_model_len=256,
         speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
         kv_cache_config=SimpleNamespace(
             num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
         ),

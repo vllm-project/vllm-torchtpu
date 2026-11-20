@@ -1408,6 +1408,9 @@ class TPUModelRunner(GPUModelRunner):
         # Zero draft lengths per (rows, device), for a chunk the async-spec
         # assembly runs without spec-decode metadata.
         self._zero_draft_lengths_cache: dict[tuple[int, str], torch.Tensor] = {}
+        # Whether this step's _prepare_inputs already substituted the async
+        # tokens in the fused subtract-and-substitute program.
+        self._fused_async_subst_done = False
         # DecodeBench fills local state instead of transferring manager blocks,
         # so it can retain the compact request-indexed Mamba layout.
         transfer_config = self.vllm_config.kv_transfer_config
@@ -3570,10 +3573,8 @@ class TPUModelRunner(GPUModelRunner):
         if use_fast_slice and spec_decode_metadata is None:
             # Fast path 1: Direct device token slicing for 1:1 steady-state decode
             # Bypasses the _substitute_placeholder_token kernel entirely when unpadded.
-            # Speculative verify steps must skip this path so they run the single
-            # fused _substitute_and_extract_draft_token_ids graph instead of
-            # returning an un-extracted as_strided slice view that triggers
-            # 3x tt_jit_execute_as_strided + _compiled_extract_draft_token_ids.
+            # Speculative verify steps skip it: they need the fused
+            # _substitute_and_extract_draft_token_ids graph.
             n_subst = len(token_in_tpu_cur_input_indices)
             if (
                 n_subst == len(input_ids)
@@ -4216,7 +4217,6 @@ class TPUModelRunner(GPUModelRunner):
         if (
             len(next_tokens_per_chunk) == 1
             and padded_drafts is not None
-            and getattr(self, "max_num_reqs", None) is not None
             and next_tokens_per_chunk[0].device.type == "tpu"
             and padded_drafts[0].shape[0] >= next_tokens_per_chunk[0].shape[0]
         ):
@@ -4275,7 +4275,6 @@ class TPUModelRunner(GPUModelRunner):
         if (
             len(next_tokens_per_chunk) == 2
             and padded_drafts is not None
-            and getattr(self, "max_num_reqs", None) is not None
             and next_tokens_per_chunk[0].device.type == "tpu"
             and padded_drafts[0].shape[0] >= next_tokens_per_chunk[0].shape[0]
             and padded_drafts[1].shape[0] >= next_tokens_per_chunk[1].shape[0]
@@ -4469,7 +4468,6 @@ class TPUModelRunner(GPUModelRunner):
             len(combined_selected_tokens) == 1
             and padded_drafts is not None
             and padded_drafts[0].shape[0] >= combined_selected_tokens[0].shape[0]
-            and getattr(self, "max_num_reqs", None) is not None
             and combined_selected_tokens[0].device.type == "tpu"
         ):
             from vllm_torchtpu.runner.tpu_runner_async_output import (
@@ -5027,10 +5025,7 @@ class TPUModelRunner(GPUModelRunner):
             # _pending_rejected_sub comes from the previous step's results.
             pre_async = self._pre_async_results
             assert pre_async is not None
-            if (
-                seq_lens.device.type == "tpu"
-                and getattr(self, "max_num_reqs", None) is not None
-            ):
+            if seq_lens.device.type == "tpu":
                 if num_rejected_dev.shape[0] < self.max_num_reqs:
                     num_rejected_dev = torch.nn.functional.pad(
                         num_rejected_dev,
@@ -5920,14 +5915,14 @@ class TPUModelRunner(GPUModelRunner):
 
             draft_token_ids_before = (
                 None
-                if getattr(self, "_fused_async_subst_done", False)
+                if self._fused_async_subst_done
                 else (
                     spec_decode_metadata.draft_token_ids
                     if spec_decode_metadata is not None
                     else None
                 )
             )
-            if getattr(self, "_fused_async_subst_done", False):
+            if self._fused_async_subst_done:
                 self._fused_async_subst_done = False
                 input_ids = self.input_ids
             else:
@@ -11038,16 +11033,19 @@ class TPUModelRunner(GPUModelRunner):
         # The most requests one step may hold (see _spec_warmup_bucket_grid).
         max_seqs = int(self.scheduler_config.max_num_seqs)
         room = self.max_model_len - P
-        # The mixed steps advance the batch two steps past the decode run, so
-        # they take two steps of room from it.
+        # Mixed verify+prefill steps run after the decode run when a step can
+        # hold one more request and a prefill chunk of P beside the verifies.
+        runs_mixed = (
+            mixed and max_seqs >= R + 1 and int(self.max_num_tokens) - R * (1 + K) >= P
+        )
+        # They advance the batch two steps past the decode run, so they take
+        # two steps of room from it.
         n_decode = min(
             3 if short else max(5, K + 2),
-            max(0, room // (1 + K) - 1 - (2 if mixed else 0)),
+            max(0, room // (1 + K) - 1 - (2 if runs_mixed else 0)),
         )
         stride = TPUModelRunner._spec_warmup_nct_stride(self)
-        # The mixed verify+prefill steps after the decode run advance the
-        # batch's requests up to two more steps.
-        n_steps = n_decode + (2 if mixed else 0)
+        n_steps = n_decode + (2 if runs_mixed else 0)
         max_pos = min(self.max_model_len, P + max(n_decode * (1 + K), n_steps * stride))
         # Per-group block counts in the group's own block-table units (see
         # _warmup_one_spec_request); the per-request stride uses the widest
@@ -11127,11 +11125,7 @@ class TPUModelRunner(GPUModelRunner):
                 self.sample_tokens(None)
                 self.take_draft_token_ids()
                 nct = [x + stride for x in nct]
-            if (
-                mixed
-                and max_seqs >= R + 1
-                and int(self.max_num_tokens) - R * (1 + K) >= P
-            ):
+            if runs_mixed:
                 # Mixed verify+prefill steps at the full step budget: R verify
                 # windows plus one prefill chunk filling the budget, then two
                 # prefill requests sharing the step while the first finishes.
@@ -11221,8 +11215,7 @@ class TPUModelRunner(GPUModelRunner):
         (_spec_warmup_num_output_tokens), so vLLM's _update_states never trims
         output_token_ids under the runner's optimistic placeholders.
         """
-        sched = getattr(self, "scheduler_config", None)
-        if not getattr(sched, "async_scheduling", False):
+        if not self.scheduler_config.async_scheduling:
             return 1
         assert self.speculative_config is not None
         return 1 + self.speculative_config.num_speculative_tokens

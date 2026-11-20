@@ -267,8 +267,9 @@ class Eagle3Proposer:
         # to skip a re-pad when `drafts is _last_propose_device_out`.
         self._last_padded_drafts_per_chunk: list[torch.Tensor] | None = None
         self._last_propose_device_out: torch.Tensor | None = None
-        # Set by tpu_runner for one propose: return chunk 0's slice instead of
-        # concatenating chunks (the runner substitutes both chunks itself).
+        # Set by tpu_runner for one propose: return chunk 0's whole padded
+        # [p, K] block instead of concatenating chunks (the runner takes each
+        # chunk's drafts from _last_padded_drafts_per_chunk).
         self._skip_next_multi_chunk_draft_cat: bool = False
         # Base copies of RPA's request_distribution for draft step 0, keyed on
         # the id of the runner's packed slice (_with_base_request_distribution).
@@ -1735,7 +1736,9 @@ class Eagle3Proposer:
                 device tensor instead of host nested lists. The async path uses
                 this to pack drafts into the next-step substitution source
                 without a D2H on the critical path; the sync path keeps the
-                list return.
+                list return. When the runner set
+                ``_skip_next_multi_chunk_draft_cat``, the tensor is chunk 0's
+                whole padded ``[p, K]`` block instead.
             next_tokens_per_chunk: spec verify step (sync and async) —
                 per-chunk on-device rejection-sampler output, passed to each
                 chunk's ``_prepare_draft_inputs`` so the draft seed is read
@@ -2208,7 +2211,8 @@ class Eagle3Proposer:
                         run_draft_step(ci, step)
                     pad_dp_draft_step(step)
 
-        # Assemble [total_num_reqs, K]. Each chunk's tokens are padded to p; slice
+        # Assemble [total_num_reqs, K] (or, under skip_cat, return chunk 0's
+        # padded [p, K] block). Each chunk's tokens are padded to p; slice
         # to the real num_reqs at the end. Sync slices on the host (the [p, K] D2H
         # is constant-shape, so no recompile); async keeps the device slice
         # (matches prior behaviour for the substitution source).

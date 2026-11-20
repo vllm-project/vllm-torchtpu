@@ -405,6 +405,7 @@ def _make_sample_runner(
         _update_mamba_slot_read_offsets=lambda *_args: None,
         _update_num_xla_graphs=lambda *_args: None,
         _drafts_per_chunk=TPUModelRunner._drafts_per_chunk,
+        _zero_draft_lengths_cache={},
         _stage_timing=MagicMock(),
     )
     runner._stage_timing.take_samples.return_value = ([], [])
