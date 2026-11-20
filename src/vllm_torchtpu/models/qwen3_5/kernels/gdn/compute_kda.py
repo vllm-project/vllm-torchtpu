@@ -19,7 +19,7 @@
 # Changes from the source: none.
 # The Qwen3.5 MoE architectures never run KDA (config.AttentionMode.KDA); Kimi's
 # KDA layers call kernels/gdn/v3. The KDA code stays so that the copy diffs line
-# for line against kernels/gdn/v3 when upstream fixes are carried over.
+# for line against kernels/gdn/v3 when main's fixes to it are carried over.
 """Compute kernels for KDA (Kimi Delta Attention) linear attention.
 
 The KDA counterpart of `compute_gdn`, sharing its tiling, state layout and
