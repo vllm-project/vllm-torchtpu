@@ -41,7 +41,9 @@ class WorkerOptions:
     (an engine on part of a host, or a dense-model DP engine, which vLLM runs
     as an independent engine) is left alone, and so is an engine whose ranks
     are moved to other devices (TPU_LOCAL_RANK_OFFSET,
-    DEBUG_TPU_LOCAL_RANK_OFFSET, VLLM_TPU_DEVICE_ORDER). The inherited CPU set
+    DEBUG_TPU_LOCAL_RANK_OFFSET, VLLM_TPU_DEVICE_ORDER, or
+    TPU_MULTIHOST_BACKEND=ray, which runs each worker on the chip Ray assigned
+    it). The inherited CPU set
     is only ever narrowed. Cannot be combined with vLLM's ``--numa-bind``,
     which binds the same workers through numactl. Off by default."""
 
