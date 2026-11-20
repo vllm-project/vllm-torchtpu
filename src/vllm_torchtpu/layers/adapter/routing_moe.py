@@ -136,6 +136,9 @@ def unsupported_reason(layer) -> str | None:
         return "ROUTING_MOE_FP8_DISPATCH needs remote scatter"
     if envs.ROUTING_MOE_PACK_BEFORE_GATHER and not envs.ROUTING_MOE_REMOTE_SCATTER:
         return "ROUTING_MOE_PACK_BEFORE_GATHER needs remote scatter"
+    if envs.ROUTING_MOE_LOCAL_GROUP_SIZES and not envs.ROUTING_MOE_PACK_BEFORE_GATHER:
+        # Only the bridge's own gather (packed rows) carries the counts.
+        return "ROUTING_MOE_LOCAL_GROUP_SIZES needs ROUTING_MOE_PACK_BEFORE_GATHER"
     if envs.ROUTING_MOE_FP8_DISPATCH_TO_KERNEL and not envs.ROUTING_MOE_FP8_DISPATCH:
         return "ROUTING_MOE_FP8_DISPATCH_TO_KERNEL needs ROUTING_MOE_FP8_DISPATCH"
     return None
@@ -269,6 +272,7 @@ def _routing_moe_jax(
     fp8_dispatch_min_rows: int = 0,
     pack_before_gather: bool = False,
     fp8_to_kernel: bool = False,
+    local_group_sizes: bool = False,
 ) -> jax.Array:
     """tokamax routing_moe over the EP mesh on this rank's routed rows (x, top-k
     weights and ids sharded on axis 0); returns this rank's rows. Pure JAX, so
@@ -372,9 +376,22 @@ def _routing_moe_jax(
         else:
             q, scale = _quantize_rows(x_l)
             x_all = _dequantize_rows(gather(q), gather(scale), x_l.dtype)
-        ids_all = lax.all_gather(ids_l, EP_AXIS_NAME, axis=0, tiled=True)
+        group_sizes = None
+        if local_group_sizes:
+            # Each rank counts its own picks and the counts ride the id
+            # gather; their sum is the [rows, experts] one-hot count tokamax
+            # would otherwise take over every gathered id.
+            experts = w1_l.shape[0] * ep
+            hist = jax.nn.one_hot(ids_l.reshape(-1), experts, dtype=jnp.int32)
+            flat = gather(jnp.concatenate([ids_l.reshape(-1), hist.sum(axis=0)]))
+            flat = flat.reshape(ep, -1)
+            ids_all = flat[:, : ids_l.size].reshape(-1, ids_l.shape[1])
+            group_sizes = flat[:, ids_l.size :].sum(axis=0)
+        else:
+            ids_all = lax.all_gather(ids_l, EP_AXIS_NAME, axis=0, tiled=True)
         # _routing_moe_local slices this rank's weight rows back out.
         w_all = lax.all_gather(w_l, EP_AXIS_NAME, axis=0, tiled=True)
+        extra = {} if group_sizes is None else {"group_sizes": group_sizes}
         return tk_modular._routing_moe_local(
             x_all,
             w_all,
@@ -388,6 +405,7 @@ def _routing_moe_jax(
             idx_l,
             cfg=cfg,
             gmm_plan=plan,
+            **extra,
         )
 
     rows_spec = PartitionSpec(EP_AXIS_NAME)
@@ -418,6 +436,7 @@ def _build_op(
     fp8_dispatch_min_rows: int = 0,
     pack_before_gather: bool = False,
     fp8_to_kernel: bool = False,
+    local_group_sizes: bool = False,
 ):
     key = (
         topk,
@@ -433,6 +452,7 @@ def _build_op(
         fp8_dispatch_min_rows,
         pack_before_gather,
         fp8_to_kernel,
+        local_group_sizes,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -501,6 +521,7 @@ def _build_op(
             fp8_dispatch_min_rows=fp8_dispatch_min_rows,
             pack_before_gather=pack_before_gather,
             fp8_to_kernel=fp8_to_kernel,
+            local_group_sizes=local_group_sizes,
         )
         return jax.shard_map(
             lambda out_l: layout.restore(out_l, EP_AXIS_NAME),
@@ -577,8 +598,8 @@ def prebuild_routing_moe(
     logger.info_once(
         "[MoE]: routing_moe over %d devices, %d experts each, token replica "
         "groups %s; %s scatter, %s combine rows, %s dispatch rows (from %d rows "
-        "per device; to the kernel: %s), rows packed before the gather: %s; gmm "
-        "plan %s.",
+        "per device; to the kernel: %s), rows packed before the gather: %s, local "
+        "group sizes: %s; gmm plan %s.",
         ep,
         local_experts,
         replica_groups,
@@ -588,6 +609,7 @@ def prebuild_routing_moe(
         envs.ROUTING_MOE_FP8_DISPATCH_MIN_ROWS,
         envs.ROUTING_MOE_FP8_DISPATCH_TO_KERNEL,
         envs.ROUTING_MOE_PACK_BEFORE_GATHER,
+        envs.ROUTING_MOE_LOCAL_GROUP_SIZES,
         envs.ROUTING_MOE_GMM_PLAN or "tokamax heuristics",
     )
     return _build_op(
@@ -605,6 +627,7 @@ def prebuild_routing_moe(
         fp8_dispatch_min_rows=envs.ROUTING_MOE_FP8_DISPATCH_MIN_ROWS,
         pack_before_gather=envs.ROUTING_MOE_PACK_BEFORE_GATHER,
         fp8_to_kernel=envs.ROUTING_MOE_FP8_DISPATCH_TO_KERNEL,
+        local_group_sizes=envs.ROUTING_MOE_LOCAL_GROUP_SIZES,
     )
 
 

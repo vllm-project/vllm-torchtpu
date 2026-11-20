@@ -81,6 +81,7 @@ def _armed():
         patch.object(envs, "ROUTING_MOE_FP8_DISPATCH_MIN_ROWS", 256),
         patch.object(envs, "ROUTING_MOE_PACK_BEFORE_GATHER", False),
         patch.object(envs, "ROUTING_MOE_FP8_DISPATCH_TO_KERNEL", False),
+        patch.object(envs, "ROUTING_MOE_LOCAL_GROUP_SIZES", False),
     ):
         yield
 
@@ -234,6 +235,24 @@ def test_fp8_scale_chunk_words_hold_the_row_scale():
     octets = np.asarray(jax.lax.bitcast_convert_type(chunk, jnp.uint8), np.uint32)
     words = sum(octets[:, 0, p, :] << (8 * p) for p in range(4)).astype(np.uint32)
     assert (words.view(np.float32) == np.asarray(scale)).all()
+
+
+def test_local_group_sizes_needs_packed_gather():
+    with (
+        patch.object(envs, "ROUTING_MOE_LOCAL_GROUP_SIZES", True),
+        pytest.raises(ValueError, match="needs ROUTING_MOE_PACK_BEFORE_GATHER"),
+    ):
+        _prebuild(_layer())
+
+
+def test_local_group_sizes_follows_the_flag():
+    seen = []
+    with (
+        patch.object(envs, "ROUTING_MOE_LOCAL_GROUP_SIZES", True),
+        patch.object(envs, "ROUTING_MOE_PACK_BEFORE_GATHER", True),
+    ):
+        _prebuild(_layer(), build_op=lambda *args, **kw: seen.append(kw) or "op")
+    assert seen[0]["local_group_sizes"] is True
 
 
 def test_gmm_plan_parsing():

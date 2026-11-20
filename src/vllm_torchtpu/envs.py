@@ -116,6 +116,7 @@ if TYPE_CHECKING:
     ROUTING_MOE_FP8_DISPATCH_MIN_ROWS: int = 256
     ROUTING_MOE_PACK_BEFORE_GATHER: bool = False
     ROUTING_MOE_FP8_DISPATCH_TO_KERNEL: bool = False
+    ROUTING_MOE_LOCAL_GROUP_SIZES: bool = False
     ROUTING_MOE_GMM_PLAN: str = ""
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -923,6 +924,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ROUTING_MOE_FP8_DISPATCH_TO_KERNEL": env_bool(
         "ROUTING_MOE_FP8_DISPATCH_TO_KERNEL"
     ),
+    # routing_moe, where the bridge gathers the rows itself: each rank counts its
+    # own expert picks and the counts ride the id gather, so tokamax skips its
+    # [rows, experts] one-hot count. Needs a tokamax whose _routing_moe_local
+    # takes group_sizes (not tokamax 0.0.18).
+    "ROUTING_MOE_LOCAL_GROUP_SIZES": env_bool("ROUTING_MOE_LOCAL_GROUP_SIZES"),
     # routing_moe: tokamax RoutingGmmPlan overrides as JSON, either one object
     # of plan fields for every token count, or {"by_rows": [[max_rows, {...}],
     # ...], "default": {...}} keyed by the rows each device contributes.
