@@ -418,10 +418,12 @@ def placed(name: str) -> bool:
 
 
 def shards() -> int:
+    """The expert-parallel ranks the table places experts over."""
     return _require().shards
 
 
 def global_count() -> int:
+    """The model's routed experts, every rank's primaries together."""
     return _require().experts
 
 
@@ -436,6 +438,8 @@ def slots() -> int:
 
 
 def holder_tables(layer: int, rank: int) -> tuple[list[int], list[int], list[int]]:
+    """Placement.holder_tables: `rank`'s slot ids and each expert's primary
+    and copy ranks, in primary (router) ids."""
     return _require().holder_tables(layer, rank)
 
 
@@ -452,6 +456,7 @@ def primary_experts(layer) -> int | None:
 
 
 def hot_order(layer: int) -> list[int]:
+    """The layer's copied experts hottest first, in primary (router) ids."""
     return _require().hot_order(layer)
 
 
