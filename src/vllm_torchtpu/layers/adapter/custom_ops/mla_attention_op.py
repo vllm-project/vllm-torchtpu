@@ -80,6 +80,7 @@ from vllm_torchtpu.kernels.mla.fused_qb_absorb import (
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny, fp8_window_all_gather
 from vllm_torchtpu.layers.adapter import (
+    dcp_nonidx_qb_mla_op,
     dcp_token_parallel_op,
     dcp_unified_indexer_mla_op,
     small_all_reduce_op,
@@ -2111,6 +2112,7 @@ class VllmTPUMLAAttention(MLAAttention):
         self.sparse_mla_dcp_fused_op = None
         self.sparse_mla_tp_op = None
         self.sparse_mla_unified_tp_op = None
+        self.sparse_mla_in_branch_qb_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
@@ -2133,6 +2135,16 @@ class VllmTPUMLAAttention(MLAAttention):
                     if self.W_UV_tp_all.device.type == "tpu":
                         synchronize_tensors([self.W_UV_tp_all])
                     self._build_o_proj_pair_half(dcp_group)
+                    if self.dcp_q_replicate:
+                        build_in_branch = (
+                            dcp_nonidx_qb_mla_op.build_in_branch_qb_attention_op
+                        )
+                        self.sparse_mla_in_branch_qb_op = build_in_branch(
+                            self,
+                            impl,
+                            self.token_parallel_layout,
+                            q_replicated=True,
+                        )
                 indexer_op = getattr(self.indexer, "indexer_op", None)
                 if (
                     self.dcp_q_replicate
@@ -2267,6 +2279,7 @@ class VllmTPUMLAAttention(MLAAttention):
             sp_o_proj=kwargs.get("sp_o_proj"),
             kv_sharded=kwargs.get("kv_sharded", False),
             unified_indexer_inputs=kwargs.get("unified_indexer_inputs"),
+            in_branch_qb_inputs=kwargs.get("in_branch_qb_inputs"),
         )
 
 
@@ -2621,6 +2634,32 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             q_c, *operands, self.local_q_window, self.local_q_lane
         )
 
+    def _resolve_sp_o_proj(
+        self,
+        num_tokens: int,
+        prefill_group: Any,
+        output_gate: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not (
+            envs.TPU_DCP_TP_PREFILL_LOCAL_OPROJ
+            and prefill_group is not None
+            and self.is_sparse
+            and output_gate is None
+            and self.g_proj is None
+            and getattr(
+                getattr(self.mla_attn, "sparse_mla_tp_op", None), "serves_oproj", False
+            )
+            and dcp_token_parallel_op.applies(num_tokens)
+            and dcp_token_parallel_op.serves_sequence_row_oproj(self.o_proj)
+        ):
+            return None
+        w_half = getattr(self.mla_attn, "W_O_tp_half", None)
+        return (
+            (self.o_proj.weight, self.o_proj.weight_scale)
+            if w_half is None
+            else (w_half, self.mla_attn.W_O_tp_half_scale)
+        )
+
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if hasattr(super(), "process_weights_after_loading"):
             # torch's stubs resolve this hasattr-guarded method as a Tensor.
@@ -2723,6 +2762,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 indexer_qrows = q_rows
 
         fused_qb_out: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        in_branch_qb_inputs: dcp_nonidx_qb_mla_op.InBranchQbInputs | None = None
         if self.kimi_preprocess is not None:
             assert self.fused_qkv_a_proj is not None
             assert self.q_a_layernorm is not None
@@ -2823,14 +2863,38 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                         cos_sin = cos_sin_cache.index_select(
                             0, positions.index_select(0, q_rows)
                         )
-                        fused_qb_out = _FUSED_QB_ROPE_ABSORB_SPLIT_OP(
-                            q_c_for_q,
-                            w_qb,
-                            s_qb,
-                            w_uk_t.to(q_c_for_q.dtype),
-                            cos_sin,
-                            split_rows,
+                        in_branch_qb_op = getattr(
+                            self.mla_attn, "sparse_mla_in_branch_qb_op", None
                         )
+                        can_defer_qb = (
+                            (self.indexer is None or self.skip_topk)
+                            and in_branch_qb_op is not None
+                            and (
+                                not kv_sharded
+                                or getattr(in_branch_qb_op, "serves_sharded_kv", False)
+                            )
+                            and self._resolve_sp_o_proj(
+                                num_tokens, prefill_group, output_gate
+                            )
+                            is not None
+                        )
+                        if can_defer_qb:
+                            in_branch_qb_inputs = dcp_nonidx_qb_mla_op.InBranchQbInputs(
+                                q_c=q_c_for_q,
+                                w_qb=w_qb,
+                                s_qb=s_qb,
+                                w_uk_t=w_uk_t.to(q_c_for_q.dtype),
+                                cos_sin=cos_sin,
+                            )
+                        else:
+                            fused_qb_out = _FUSED_QB_ROPE_ABSORB_SPLIT_OP(
+                                q_c_for_q,
+                                w_qb,
+                                s_qb,
+                                w_uk_t.to(q_c_for_q.dtype),
+                                cos_sin,
+                                split_rows,
+                            )
                         q = None
                     else:
                         q = self.q_b_proj(q_c_for_q)[0]
@@ -2865,6 +2929,16 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             # reads only q_dcp_replicated.
             q_nope = ql_head[:, : self.num_heads, : self.qk_nope_head_dim]
             q_pe = q_pe_all[:, : self.num_heads, :]
+        elif in_branch_qb_inputs is not None:
+            k_pe_dtype = k_pe.dtype
+            k_pe = rope_half_split(self.rotary_emb, kv_positions, k_pe, k_pe)[1].to(
+                dtype=k_pe_dtype
+            )
+            # Dead rank-local views matching baseline dtype/ndim; the in-branch
+            # op reads only in_branch_qb_inputs.
+            q_c_ref = in_branch_qb_inputs.q_c[:1, :1].unsqueeze(1)
+            q_nope = q_c_ref.expand(1, self.num_heads, self.qk_nope_head_dim)
+            q_pe = q_c_ref.expand(1, self.num_heads, self.qk_rope_head_dim)
         else:
             assert q is not None
             # `dcp_group_size` is 1 unless query replication is on, in which case
@@ -2916,25 +2990,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # TPU_DCP_TP_PREFILL_LOCAL_OPROJ: on a sequence-parallel token-parallel
         # bucket the attention op runs o_proj (this rank's FP8 shard, gathered
         # in the op) itself and returns this rank's sequence-parallel rows.
-        sp_o_proj = None
-        if (
-            envs.TPU_DCP_TP_PREFILL_LOCAL_OPROJ
-            and prefill_group is not None
-            and self.is_sparse
-            and output_gate is None
-            and self.g_proj is None
-            and getattr(
-                getattr(self.mla_attn, "sparse_mla_tp_op", None), "serves_oproj", False
-            )
-            and dcp_token_parallel_op.applies(num_tokens)
-            and dcp_token_parallel_op.serves_sequence_row_oproj(self.o_proj)
-        ):
-            w_half = getattr(self.mla_attn, "W_O_tp_half", None)
-            sp_o_proj = (
-                (self.o_proj.weight, self.o_proj.weight_scale)
-                if w_half is None
-                else (w_half, self.mla_attn.W_O_tp_half_scale)
-            )
+        sp_o_proj = self._resolve_sp_o_proj(num_tokens, prefill_group, output_gate)
 
         unified_op = getattr(self.mla_attn, "sparse_mla_unified_tp_op", None)
         unified_idx_inputs = None
@@ -2999,6 +3055,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if fused_qb_out is not None:
             ql_head, ql_tail, q_pe_all = fused_qb_out
             q_dcp_replicated = ((ql_head, ql_tail), q_pe_all)
+        elif in_branch_qb_inputs is not None:
+            q_dcp_replicated = None
         elif self.dcp_q_replicate:
             if q_rope_table is not None:
                 # The raw q head view (q_pe un-roped) + the rope table.
@@ -3030,6 +3088,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             sp_o_proj=sp_o_proj,
             kv_sharded=kv_sharded,
             unified_indexer_inputs=unified_idx_inputs,
+            in_branch_qb_inputs=in_branch_qb_inputs,
         )
         # The two branches lift different W_UV buffers; each lifts the other's
         # too, as the bucket warmup requires (_retain_buffers: no data read).

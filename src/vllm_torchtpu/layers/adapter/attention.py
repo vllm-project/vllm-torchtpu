@@ -75,6 +75,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
 from vllm_torchtpu.layers.adapter import (
+    dcp_nonidx_qb_mla_op,
     dcp_token_parallel_op,
     dcp_unified_indexer_mla_op,
 )
@@ -2885,6 +2886,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         )
         topk_indices = kwargs.get("topk_indices")
         unified_indexer_inputs = kwargs.get("unified_indexer_inputs")
+        in_branch_qb_inputs = kwargs.get("in_branch_qb_inputs")
         has_topk = topk_indices is not None or unified_indexer_inputs is not None
         if sp_o_proj is not None and not (
             has_topk
@@ -2894,6 +2896,15 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             raise ValueError("sp_o_proj is only served on a token-parallel bucket")
         if kv_sharded and sp_o_proj is None:
             raise ValueError("kv_sharded requires sp_o_proj on a token-parallel bucket")
+        if in_branch_qb_inputs is not None and not (
+            topk_indices is not None
+            and sp_o_proj is not None
+            and dcp_token_parallel_op.applies(num_kv_tokens)
+        ):
+            raise ValueError(
+                "in_branch_qb_inputs requires topk_indices and sp_o_proj on a "
+                "token-parallel bucket"
+            )
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
         # Query replication hands us the whole DCP group's heads already, so
         # the sparse DCP path below can skip its per-step q all-gather. It is
@@ -2949,6 +2960,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 ql_tail.to(input_dtype).view(-1, attn_heads, layer.kv_lora_rank),
             )
             ql_nope = ql_nope_split[0]
+        elif in_branch_qb_inputs is not None:
+            # Deferred into dcp_nonidx_qb_mla_op.in_branch_qb_attention; skip
+            # eager W_UK_T absorption on the dead q_nope placeholder.
+            ql_nope = q_nope
         else:
             use_tp_split_absorb = (
                 has_topk
@@ -2989,10 +3004,28 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 layer.kv_cache_quantized_dtype, k_pe, value=None, k_scale=k_scale
             )
 
-        ql_nope_flat = ql_nope.view(-1, attn_heads, layer.kv_lora_rank)
-        q_pe_flat = q_pe.reshape(-1, attn_heads, pe_dim)
         kv_c_normed_flat = kv_c_normed.view(-1, layer.kv_lora_rank)
         k_pe_flat = k_pe.view(-1, layer.qk_rope_head_dim)
+        if in_branch_qb_inputs is not None:
+            assert isinstance(kv_cache, (tuple, list)) and len(kv_cache) == 2, (
+                "sparse MLA layers use a native (nope, rope) split "
+                f"cache; got {type(kv_cache)}"
+            )
+            assert topk_indices is not None and sp_o_proj is not None
+            return dcp_nonidx_qb_mla_op.in_branch_qb_attention(
+                layer,
+                (kv_cache[0], kv_cache[1]),
+                in_branch_qb_inputs,
+                kv_c_normed_flat,
+                k_pe_flat,
+                topk_indices,
+                attn_metadata,
+                w_o=sp_o_proj,
+                kv_sharded=kv_sharded,
+            )
+
+        ql_nope_flat = ql_nope.view(-1, attn_heads, layer.kv_lora_rank)
+        q_pe_flat = q_pe.reshape(-1, attn_heads, pe_dim)
 
         if has_topk:
             assert isinstance(kv_cache, (tuple, list)) and len(kv_cache) == 2, (

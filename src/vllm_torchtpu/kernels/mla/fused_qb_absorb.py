@@ -99,20 +99,30 @@ def fused_qb_rope_absorb_split_ref(
     return ql[:split_rows], ql[split_rows:], q_pe_rot
 
 
-def fused_qb_rope_absorb_split(
+def fused_qb_rope_absorb_split_qpe_ref(
     q_c: jax.Array,
     w_qb: jax.Array,
     w_s: jax.Array,
     w_uk_t: jax.Array,
     cos_sin: jax.Array,
     split_rows: int,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Map `[T, K]` q_c -> `(ql_head[s, H, R], ql_tail[T-s, H, R], q_pe[T, H, 64])`.
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    ql_head, ql_tail, q_pe_rot = fused_qb_rope_absorb_split_ref(
+        q_c, w_qb, w_s, w_uk_t, cos_sin, split_rows
+    )
+    return ql_head, ql_tail, q_pe_rot[:split_rows], q_pe_rot[split_rows:]
 
-    Fuses FP8 `q_b_proj`, NeoX half-split `q_pe` RoPE, and `W_UK_T` absorption
-    in VMEM per 8-head block so the `[T, H*(d_nope+d_pe)]` query tensor never
-    materializes in HBM. Requires `supports_fused_qb_rope_absorb_split` True.
-    """
+
+def _run_fused_qb_kernel(
+    q_c: jax.Array,
+    w_qb: jax.Array,
+    w_s: jax.Array,
+    w_uk_t: jax.Array,
+    cos_sin: jax.Array,
+    split_rows: int,
+    *,
+    split_qpe: bool,
+) -> tuple[jax.Array, ...]:
     total_tokens, k_dim = q_c.shape
     heads, d_nope, rank = w_uk_t.shape
     d_pe = cos_sin.shape[1]
@@ -153,7 +163,138 @@ def fused_qb_rope_absorb_split(
     cos_sin_128 = jnp.pad(cos_sin.astype(jnp.float32), ((0, 0), (0, 128 - d_pe)))
     w_s_2d = w_s.astype(jnp.float32).reshape(1, n_out)
 
-    def _kernel(
+    def _project_slice(
+        xq_ref, xs_ref, cs_ref, wqb_ref, ws_v, wuk_ref, t0, nrows: int
+    ) -> tuple[jax.Array, jax.Array]:
+        xq_sl = xq_ref[pl.ds(t0, nrows), :]
+        xs_sl = xs_ref[pl.ds(t0, nrows), :1]
+        c_sl = cs_ref[pl.ds(t0, nrows), :half_pe]
+        s_sl = cs_ref[pl.ds(t0, nrows), half_pe:d_pe]
+
+        # Avoid per-head q_b_proj GEMMs: projecting all 8 heads in one
+        # [nrows, K] @ [K, 8*d_q] matmul reuses xq_sl 8x across MXU tiles.
+        q_raw = lax.dot_general(
+            xq_sl,
+            wqb_ref[...],
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        q_raw = (q_raw * xs_sl * ws_v[None, :]).astype(q_c.dtype)
+
+        ql_list = []
+        qpe_list = []
+        for h in range(HEAD_BLOCK):
+            c0 = h * d_q
+            ql_h = lax.dot_general(
+                q_raw[:, c0 : c0 + d_nope],
+                wuk_ref[h],
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            ).astype(q_c.dtype)
+            ql_list.append(ql_h)
+            x1 = q_raw[:, c0 + d_nope : c0 + d_nope + half_pe].astype(jnp.float32)
+            x2 = q_raw[:, c0 + d_nope + half_pe : c0 + d_q].astype(jnp.float32)
+            qpe_h = jnp.concatenate(
+                [x1 * c_sl - x2 * s_sl, x2 * c_sl + x1 * s_sl],
+                axis=-1,
+            ).astype(q_c.dtype)
+            qpe_list.append(qpe_h)
+
+        return (
+            pltpu.einshape("htd->thd", jnp.stack(ql_list)),
+            pltpu.einshape("htd->thd", jnp.stack(qpe_list)),
+        )
+
+    in_specs = [
+        pl.BlockSpec(
+            (total_tokens, k_dim),
+            lambda hb: (0, 0),
+            pipeline_mode=pl.Buffered(1),
+        ),
+        pl.BlockSpec(
+            (total_tokens, 128),
+            lambda hb: (0, 0),
+            pipeline_mode=pl.Buffered(1),
+        ),
+        pl.BlockSpec(
+            (total_tokens, 128),
+            lambda hb: (0, 0),
+            pipeline_mode=pl.Buffered(1),
+        ),
+        pl.BlockSpec((k_dim, cols_blk), lambda hb: (0, hb)),
+        pl.BlockSpec((1, cols_blk), lambda hb: (0, hb)),
+        pl.BlockSpec((HEAD_BLOCK, d_nope, rank), lambda hb: (hb, 0, 0)),
+    ]
+    compiler_params = pltpu.CompilerParams(
+        dimension_semantics=("parallel",),
+        vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes * 7 // 8,
+    )
+
+    if split_qpe:
+
+        def _kernel_split(
+            xq_ref,
+            xs_ref,
+            cs_ref,
+            wqb_ref,
+            ws_ref,
+            wuk_ref,
+            ql_head_ref,
+            ql_tail_ref,
+            qpe_head_ref,
+            qpe_tail_ref,
+        ):
+            ws_v = ws_ref[0]
+            ql_h, qpe_h = _project_slice(
+                xq_ref, xs_ref, cs_ref, wqb_ref, ws_v, wuk_ref, 0, split_rows
+            )
+            ql_head_ref[...] = ql_h
+            qpe_head_ref[...] = qpe_h
+            if n_tail_chunks == 1:
+                ql_t, qpe_t = _project_slice(
+                    xq_ref,
+                    xs_ref,
+                    cs_ref,
+                    wqb_ref,
+                    ws_v,
+                    wuk_ref,
+                    split_rows,
+                    tail_chunk,
+                )
+                ql_tail_ref[...] = ql_t
+                qpe_tail_ref[...] = qpe_t
+            else:
+
+                def _tail_body(c, _):
+                    t0 = split_rows + c * tail_chunk
+                    ql_t, qpe_t = _project_slice(
+                        xq_ref, xs_ref, cs_ref, wqb_ref, ws_v, wuk_ref, t0, tail_chunk
+                    )
+                    ql_tail_ref[pl.ds(c * tail_chunk, tail_chunk)] = ql_t
+                    qpe_tail_ref[pl.ds(c * tail_chunk, tail_chunk)] = qpe_t
+
+                lax.fori_loop(0, n_tail_chunks, _tail_body, None)
+
+        return pl.pallas_call(
+            _kernel_split,
+            grid=(n_hblk,),
+            in_specs=in_specs,
+            out_specs=[
+                pl.BlockSpec((split_rows, HEAD_BLOCK, rank), lambda hb: (0, hb, 0)),
+                pl.BlockSpec((tail_rows, HEAD_BLOCK, rank), lambda hb: (0, hb, 0)),
+                pl.BlockSpec((split_rows, HEAD_BLOCK, d_pe), lambda hb: (0, hb, 0)),
+                pl.BlockSpec((tail_rows, HEAD_BLOCK, d_pe), lambda hb: (0, hb, 0)),
+            ],
+            out_shape=(
+                jax.ShapeDtypeStruct((split_rows, heads, rank), q_c.dtype),
+                jax.ShapeDtypeStruct((tail_rows, heads, rank), q_c.dtype),
+                jax.ShapeDtypeStruct((split_rows, heads, d_pe), q_c.dtype),
+                jax.ShapeDtypeStruct((tail_rows, heads, d_pe), q_c.dtype),
+            ),
+            compiler_params=compiler_params,
+        )(x_q, x_s_128, cos_sin_128, w_qb, w_s_2d, w_uk_t)
+
+    def _kernel_joined(
         xq_ref,
         xs_ref,
         cs_ref,
@@ -165,53 +306,15 @@ def fused_qb_rope_absorb_split(
         qpe_ref,
     ):
         ws_v = ws_ref[0]
-
-        def _project_slice(t0, nrows: int) -> tuple[jax.Array, jax.Array]:
-            xq_sl = xq_ref[pl.ds(t0, nrows), :]
-            xs_sl = xs_ref[pl.ds(t0, nrows), :1]
-            c_sl = cs_ref[pl.ds(t0, nrows), :half_pe]
-            s_sl = cs_ref[pl.ds(t0, nrows), half_pe:d_pe]
-
-            # Avoid per-head q_b_proj GEMMs: projecting all 8 heads in one
-            # [nrows, K] @ [K, 8*d_q] matmul reuses xq_sl 8x across MXU tiles.
-            q_raw = lax.dot_general(
-                xq_sl,
-                wqb_ref[...],
-                (((1,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
-            q_raw = (q_raw * xs_sl * ws_v[None, :]).astype(q_c.dtype)
-
-            ql_list = []
-            qpe_list = []
-            for h in range(HEAD_BLOCK):
-                c0 = h * d_q
-                ql_h = lax.dot_general(
-                    q_raw[:, c0 : c0 + d_nope],
-                    wuk_ref[h],
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                ).astype(q_c.dtype)
-                ql_list.append(ql_h)
-                x1 = q_raw[:, c0 + d_nope : c0 + d_nope + half_pe].astype(jnp.float32)
-                x2 = q_raw[:, c0 + d_nope + half_pe : c0 + d_q].astype(jnp.float32)
-                qpe_h = jnp.concatenate(
-                    [x1 * c_sl - x2 * s_sl, x2 * c_sl + x1 * s_sl],
-                    axis=-1,
-                ).astype(q_c.dtype)
-                qpe_list.append(qpe_h)
-
-            return (
-                pltpu.einshape("htd->thd", jnp.stack(ql_list)),
-                pltpu.einshape("htd->thd", jnp.stack(qpe_list)),
-            )
-
-        ql_h, qpe_h = _project_slice(0, split_rows)
+        ql_h, qpe_h = _project_slice(
+            xq_ref, xs_ref, cs_ref, wqb_ref, ws_v, wuk_ref, 0, split_rows
+        )
         ql_head_ref[...] = ql_h
         qpe_ref[pl.ds(0, split_rows)] = qpe_h
-
         if n_tail_chunks == 1:
-            ql_t, qpe_t = _project_slice(split_rows, tail_chunk)
+            ql_t, qpe_t = _project_slice(
+                xq_ref, xs_ref, cs_ref, wqb_ref, ws_v, wuk_ref, split_rows, tail_chunk
+            )
             ql_tail_ref[...] = ql_t
             qpe_ref[pl.ds(split_rows, tail_chunk)] = qpe_t
         else:
@@ -219,35 +322,18 @@ def fused_qb_rope_absorb_split(
             # constant across large prefill buckets (16K/32K+).
             def _tail_body(c, _):
                 t0 = split_rows + c * tail_chunk
-                ql_t, qpe_t = _project_slice(t0, tail_chunk)
+                ql_t, qpe_t = _project_slice(
+                    xq_ref, xs_ref, cs_ref, wqb_ref, ws_v, wuk_ref, t0, tail_chunk
+                )
                 ql_tail_ref[pl.ds(c * tail_chunk, tail_chunk)] = ql_t
                 qpe_ref[pl.ds(t0, tail_chunk)] = qpe_t
 
             lax.fori_loop(0, n_tail_chunks, _tail_body, None)
 
     return pl.pallas_call(
-        _kernel,
+        _kernel_joined,
         grid=(n_hblk,),
-        in_specs=[
-            pl.BlockSpec(
-                (total_tokens, k_dim),
-                lambda hb: (0, 0),
-                pipeline_mode=pl.Buffered(1),
-            ),
-            pl.BlockSpec(
-                (total_tokens, 128),
-                lambda hb: (0, 0),
-                pipeline_mode=pl.Buffered(1),
-            ),
-            pl.BlockSpec(
-                (total_tokens, 128),
-                lambda hb: (0, 0),
-                pipeline_mode=pl.Buffered(1),
-            ),
-            pl.BlockSpec((k_dim, cols_blk), lambda hb: (0, hb)),
-            pl.BlockSpec((1, cols_blk), lambda hb: (0, hb)),
-            pl.BlockSpec((HEAD_BLOCK, d_nope, rank), lambda hb: (hb, 0, 0)),
-        ],
+        in_specs=in_specs,
         out_specs=[
             pl.BlockSpec((split_rows, HEAD_BLOCK, rank), lambda hb: (0, hb, 0)),
             pl.BlockSpec((tail_rows, HEAD_BLOCK, rank), lambda hb: (0, hb, 0)),
@@ -258,8 +344,44 @@ def fused_qb_rope_absorb_split(
             jax.ShapeDtypeStruct((tail_rows, heads, rank), q_c.dtype),
             jax.ShapeDtypeStruct((total_tokens, heads, d_pe), q_c.dtype),
         ),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel",),
-            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes * 7 // 8,
-        ),
+        compiler_params=compiler_params,
     )(x_q, x_s_128, cos_sin_128, w_qb, w_s_2d, w_uk_t)
+
+
+def fused_qb_rope_absorb_split(
+    q_c: jax.Array,
+    w_qb: jax.Array,
+    w_s: jax.Array,
+    w_uk_t: jax.Array,
+    cos_sin: jax.Array,
+    split_rows: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Map `[T, K]` q_c -> `(ql_head[s, H, R], ql_tail[T-s, H, R], q_pe[T, H, 64])`.
+
+    Fuses FP8 `q_b_proj`, NeoX half-split `q_pe` RoPE, and `W_UK_T` absorption
+    in VMEM per 8-head block so the `[T, H*(d_nope+d_pe)]` query tensor never
+    materializes in HBM. Requires `supports_fused_qb_rope_absorb_split` True.
+    """
+    ql_head, ql_tail, q_pe = _run_fused_qb_kernel(
+        q_c, w_qb, w_s, w_uk_t, cos_sin, split_rows, split_qpe=False
+    )
+    return ql_head, ql_tail, q_pe
+
+
+def fused_qb_rope_absorb_split_qpe(
+    q_c: jax.Array,
+    w_qb: jax.Array,
+    w_s: jax.Array,
+    w_uk_t: jax.Array,
+    cos_sin: jax.Array,
+    split_rows: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Map `[T, K]` q_c -> `(ql_head, ql_tail, q_pe_head, q_pe_tail)` directly.
+
+    Avoids the downstream `[T, H, 64]` slice copy by writing head and tail
+    `q_pe` slices into separate outputs directly from VMEM.
+    """
+    ql_head, ql_tail, q_pe_head, q_pe_tail = _run_fused_qb_kernel(
+        q_c, w_qb, w_s, w_uk_t, cos_sin, split_rows, split_qpe=True
+    )
+    return ql_head, ql_tail, q_pe_head, q_pe_tail

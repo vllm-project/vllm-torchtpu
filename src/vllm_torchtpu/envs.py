@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_DCP_PREFILL_TOKEN_PARALLEL: bool = True
+    TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP: int = 8
+    TPU_DCP_TP_IN_BRANCH_QB_MLA: bool = True
     TPU_DCP_TP_PREFILL_LOCAL_OPROJ: bool = True
     TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES: bool = True
     TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES: bool = True
@@ -878,6 +880,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all_to_all instead of all-gathering bf16 kv_lora to every rank.
     "TPU_DCP_TP_SHARDED_KV_WRITE": env_bool(
         "TPU_DCP_TP_SHARDED_KV_WRITE", default=True
+    ),
+    # Maximum gather cap inside the in-branch q_b + sparse MLA op at which
+    # fused_qb runs without a post-gather_latent barrier so it overlaps
+    # Chunk-0 SparseCore KV gather; caps above this hold lead_mla behind the
+    # barrier so pure-TC fused_qb overlaps SparseCore-offloaded gather_latent.
+    "TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP": env_int(
+        "TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP", 8
+    ),
+    # With TPU_DCP_TP_PREFILL_LOCAL_OPROJ and query replication on non-indexer
+    # layers: defer fused q_b_proj + RoPE + absorb_q and lead MLA inside the
+    # token-parallel cap switch so pure-TC q_b overlaps gather_latent/Chunk-0.
+    "TPU_DCP_TP_IN_BRANCH_QB_MLA": env_bool(
+        "TPU_DCP_TP_IN_BRANCH_QB_MLA", default=True
     ),
     # With TPU_DCP_TP_PREFILL_LOCAL_OPROJ and query replication on indexer
     # layers: run token-parallel indexer top-k and sparse MLA inside one shared

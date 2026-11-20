@@ -1380,3 +1380,152 @@ def unified_indexer_mla_with_lead(
         w_uv,
         *extra,
     )
+
+
+def sparse_mla_attention_with_in_branch_qb(
+    layout: TokenParallelLayout,
+    mesh: Mesh,
+    axis_name: str,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    q_c_own: jax.Array,
+    w_qb: jax.Array,
+    s_qb: jax.Array,
+    w_uk_t: jax.Array,
+    cos_sin: jax.Array,
+    head_topk: jax.Array,
+    flat_topk: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    *,
+    fused_qb: Callable[..., tuple[jax.Array, jax.Array, jax.Array, jax.Array]],
+    lead_attend: Callable[..., tuple[jax.Array, jax.Array]],
+    tail_attend: Callable[..., jax.Array],
+    w_uv: jax.Array,
+    num_tokens: int,
+    rank_ids: jax.Array | None = None,
+    read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
+    w_uv_replicated: bool = False,
+    flat_topk_cap_strided: bool = False,
+    free_nobar_max_cap: int = 8,
+) -> tuple[jax.Array, jax.Array]:
+    """Run fused `q_b`, lead MLA, and token-parallel MLA in one cap switch.
+
+    Returns `(own_v [dcp*R, H, V], lead_v [S, H, V])` matching separate
+    `fused_qb_rope_absorb_split_qpe` + `sparse_mla_attention_dcp` +
+    `sparse_mla_attention_with_lead` within 1 bf16 ULP on `lead_v` and bit-exact
+    on `own_v`.
+    """
+    dcp = layout.dcp_size
+    s = layout.split_rows
+    sharded = P(axis_name)
+    rep = P()
+
+    def _local(
+        nope,
+        rope,
+        qc_r,
+        wqb_r,
+        sqb_r,
+        wuk_r,
+        cs_r,
+        h_topk_r,
+        f_topk_r,
+        sl,
+        bt,
+        qsl,
+        dist,
+        w_uv_local,
+        *rank_arg,
+    ):
+        rank = _rank(rank_arg, axis_name, dcp)
+        # Avoid propagating the SparseCore writer's 32-word view across the cap
+        # switch: keep latent cache arrays in their [pages, rows, 128] layout.
+        nope, rope = lax.optimization_barrier((nope, rope))
+        pages, offsets = step_pages(layout, sl, qsl, dist[2])
+        page_ids = gather_page_ids(layout, bt, pages, offsets, nope.shape[0])
+        rr = rank_rows(layout, rank, num_tokens, sl, qsl, dist[2])
+        w_uv_all = (
+            w_uv_local
+            if w_uv_replicated
+            else lax.all_gather(w_uv_local, axis_name, axis=0, tiled=True)
+        )
+
+        def branch(cap: int) -> Callable[[], tuple[jax.Array, jax.Array]]:
+            def run() -> tuple[jax.Array, jax.Array]:
+                g_nope, g_rope = gather_latent(
+                    nope, rope, page_ids[:cap], axis_name, read_pages
+                )
+                flat = (
+                    f_topk_r
+                    if flat_topk_cap_strided
+                    else restride_flat_rows(layout, f_topk_r, cap)
+                )
+                ql_head, ql_tail, qpe_head, qpe_tail = fused_qb(
+                    qc_r, wqb_r, sqb_r, wuk_r, cs_r, s
+                )
+                if cap > free_nobar_max_cap:
+                    # Avoid SparseCore contention between lead_mla and SC-offloaded
+                    # gather_latent on caps >= 12: hold lead_mla behind a barrier
+                    # until gather_latent completes while pure-TC fused_qb overlaps
+                    # gather_latent; smaller caps leave fused_qb free to overlap
+                    # Chunk-0 SparseCore KV gather.
+                    g_nope, g_rope, ql_head, qpe_head = lax.optimization_barrier(
+                        (g_nope, g_rope, ql_head, qpe_head)
+                    )
+                lead_partial, lead_lse = lead_attend(
+                    ql_head, qpe_head, nope, rope, h_topk_r, bt, sl, qsl, dist
+                )
+                lead_v = _merge_lead_partial_to_v(
+                    lead_partial, lead_lse, w_uv_all, axis_name, ql_tail.dtype
+                )
+                out = tail_attend(ql_tail, g_nope, g_rope, flat, rr.num_rows, qpe_tail)
+                return _project_w_uv(out, w_uv_all), lead_v
+
+            return run
+
+        return _switch_on_cap(layout, jnp.sum(pages), branch)
+
+    extra = () if rank_ids is None else (rank_ids,)
+    w_uv_spec = rep if w_uv_replicated else sharded
+    return jax.shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(
+            sharded,
+            sharded,
+            sharded,
+            rep,
+            rep,
+            rep,
+            sharded,
+            sharded,
+            sharded,
+            rep,
+            rep,
+            rep,
+            rep,
+            w_uv_spec,
+        )
+        + (sharded,) * len(extra),
+        out_specs=(sharded, rep),
+        check_vma=False,
+    )(
+        kv_cache_nope,
+        kv_cache_rope,
+        q_c_own,
+        w_qb,
+        s_qb,
+        w_uk_t,
+        cos_sin,
+        head_topk,
+        flat_topk,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        w_uv,
+        *extra,
+    )
