@@ -59,7 +59,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from . import layout
 from .layout import (
     COLLECTIVE_ID_TRANSPORT,
     LANES,
@@ -176,7 +175,9 @@ def landing_link(r, p, n_pieces):
 
 class Exchange:
     """Every slice, peer and semaphore of one shard's part of the exchange,
-    from the traced shard index."""
+    from the traced shard index. `shard_index_operand`: the program took
+    `shard` from an operand rather than the mesh axis (see
+    layout.device_coords)."""
 
     def __init__(
         self,
@@ -187,8 +188,11 @@ class Exchange:
         rows_per_shard,
         num_shards,
         mesh_axes=(MESH_AXIS,),
+        *,
+        shard_index_operand,
     ):
         self.mesh_axes = mesh_axes
+        self.shard_index_operand = shard_index_operand
         self.n = dimensions(num_shards)
         self.n_pieces = pieces(num_shards)
         self.gathered_rows, self.send_sem, self.receive_sems = (
@@ -238,19 +242,21 @@ class Exchange:
             dst_ref=self.gathered_rows.at[rows],
             send_sem=self.send_sem,
             recv_sem=sem,
-            device_id=device_coords(peer, self.mesh_axes),
+            device_id=device_coords(
+                peer, self.mesh_axes, shard_index_operand=self.shard_index_operand
+            ),
             device_id_type=pl.DeviceIdType.MESH,
         )
 
     def wait_landed(self, rows, sem):
-        """Wait for `rows` of the gathered rows to land on `sem`. Under the
-        torch bridge (layout.SHARD_INDEX_OPERAND) the wait goes on a local
-        descriptor of the same rows and semaphore: the bridge's compile
-        refuses a wait on a descriptor that
+        """Wait for `rows` of the gathered rows to land on `sem`. With the
+        shard index taken as an operand (the torch bridge's form) the wait
+        goes on a local descriptor of the same rows and semaphore: the
+        bridge's compile refuses a wait on a descriptor that
         carries a peer address ("Number of device ids must match the number
         of mesh axes ... 0D mesh"). Other callers use the remote
         descriptor's receive wait."""
-        if layout.SHARD_INDEX_OPERAND:
+        if self.shard_index_operand:
             pltpu.make_async_copy(
                 self.gathered_rows.at[rows], self.gathered_rows.at[rows], sem
             ).wait()
@@ -365,6 +371,7 @@ def finish_call(
     rows_per_shard,
     mesh_axes=(MESH_AXIS,),
     shard_index=None,
+    side_effects=True,
 ):
     """The exchange's finish as a program of its own: waits the landing of
     every arrival on this shard and the mate copies, and returns a
@@ -377,7 +384,8 @@ def finish_call(
     the arrivals land. `after` is an array the call only depends on: the
     layer hands in a slice of the scatter's output, so the finish runs
     once the scatter's wait is over, by which time the arrivals have
-    landed and the finish waits for nothing."""
+    landed and the finish waits for nothing. `shard_index` and
+    `side_effects` are start_transport's."""
 
     def kernel(*refs):
         if shard_index is not None:
@@ -396,6 +404,7 @@ def finish_call(
                 rows_per_shard,
                 num_shards,
                 mesh_axes=mesh_axes,
+                shard_index_operand=shard_index is not None,
             )
         )
         done_ref[...] = jnp.ones((1, LANES), jnp.int32)
@@ -411,7 +420,7 @@ def finish_call(
         )
         + [hbm, sem, sem, hbm],
         out_specs=vmem,
-        compiler_params=pltpu.CompilerParams(has_side_effects=layout.SIDE_EFFECTS),
+        compiler_params=pltpu.CompilerParams(has_side_effects=side_effects),
         name="fused_ep_transport_finish",
     )(
         *(() if shard_index is None else (shard_index,)),
@@ -422,14 +431,16 @@ def finish_call(
     )
 
 
-def all_shards_barrier(num_shards, mesh_axes=(MESH_AXIS,)):
+def all_shards_barrier(num_shards, mesh_axes=(MESH_AXIS,), *, shard_index_operand):
     """A barrier over every shard (peers are not only neighbours)."""
     barrier = pltpu.get_barrier_semaphore()
     for i in range(num_shards):
         pl.semaphore_signal(
             barrier,
             inc=1,
-            device_id=device_coords(jnp.int32(i), mesh_axes),
+            device_id=device_coords(
+                jnp.int32(i), mesh_axes, shard_index_operand=shard_index_operand
+            ),
             device_id_type=pl.DeviceIdType.MESH,
         )
     pl.semaphore_wait(barrier, num_shards)
@@ -483,6 +494,7 @@ def start_transport(
     mesh_axes=(MESH_AXIS,),
     shard_index=None,
     valid_tokens=None,
+    side_effects=True,
 ):
     """Quantizes the shard's rows, issues the exchange, exchanges the
     messages.
@@ -502,6 +514,22 @@ def start_transport(
         scale_base + s * tiles + tile.
       elementwise: the element type of the scaling product
         (Config.elementwise_dtype).
+      shard_index: int32 [1], this shard's index as an SMEM operand, or None
+        to read it from the mesh axis. Under torch_tpu's export bridge
+        `lax.axis_index` lowers to a partition-id that XLA's SPMD
+        partitioner refuses ("partitionId instruction is not supported for
+        SPMD partitioning"), so the bridge hands the index in as data; the
+        programs then address a mesh of MESH_AXIS alone
+        (layout.device_coords).
+      valid_tokens: int32 [1], the shard's valid row count, or None: rows
+        at or past it go out as zeros.
+      side_effects: whether the programs that issue remote copies declare
+        themselves side-effecting to XLA. The bridge passes False: its SPMD
+        partitioner refuses a side-effecting custom call that carries no
+        sharding ("Side-effect HLO must have sharding"), and every such
+        program's outputs are consumed downstream (the finish program's
+        `done` word gates the combine's index), so the declaration is not
+        what keeps them alive.
 
     Returns:
       (gathered rows [num_shards * tokens, lane blocks, LANES] fp8 with the
@@ -540,10 +568,9 @@ def start_transport(
     # Streamed from HBM a tile at a time. Without the constraint XLA stages
     # the whole block in its alternate memory first.
     rows = pltpu.with_memory_space_constraint(rows, pltpu.MemorySpace.HBM)
+    index_operand = shard_index is not None
 
     def kernel(*refs):
-        # shard_index: this shard's index as an SMEM operand (layout.
-        # SHARD_INDEX_OPERAND), else read from the mesh axis.
         if shard_index is not None:
             shard_ref, *refs = refs
             shard = shard_ref[0]
@@ -577,8 +604,9 @@ def start_transport(
             tokens,
             num_shards,
             mesh_axes=mesh_axes,
+            shard_index_operand=index_operand,
         )
-        all_shards_barrier(num_shards, mesh_axes)
+        all_shards_barrier(num_shards, mesh_axes, shard_index_operand=index_operand)
 
         def fetch_rows(i):
             return pltpu.make_async_copy(
@@ -600,7 +628,9 @@ def start_transport(
                 dst_ref=gathered_rows.at[pl.ds(shard * tokens + i * tile, rows_of(i))],
                 send_sem=mate_send_sems.at[i % 2],
                 recv_sem=receive_sems.at[MATE_TILE_SEMAPHORE],
-                device_id=device_coords(exchange.mate, mesh_axes),
+                device_id=device_coords(
+                    exchange.mate, mesh_axes, shard_index_operand=index_operand
+                ),
                 device_id_type=pl.DeviceIdType.MESH,
             )
 
@@ -610,7 +640,9 @@ def start_transport(
                 dst_ref=routing_messages.at[shard],
                 send_sem=message_send_sem,
                 recv_sem=message_receive_sem,
-                device_id=device_coords(peer, mesh_axes),
+                device_id=device_coords(
+                    peer, mesh_axes, shard_index_operand=index_operand
+                ),
                 device_id_type=pl.DeviceIdType.MESH,
             )
 
@@ -672,7 +704,7 @@ def start_transport(
             if num_shards > 1:
                 share_with_mate(i).wait_send()
         for i in range(n_tiles if num_shards > 1 else 0):
-            if layout.SHARD_INDEX_OPERAND:
+            if index_operand:
                 pltpu.make_async_copy(
                     gathered_rows.at[pl.ds(shard * tokens + i * tile, rows_of(i))],
                     gathered_rows.at[pl.ds(shard * tokens + i * tile, rows_of(i))],
@@ -682,7 +714,7 @@ def start_transport(
                 share_with_mate(i).wait_recv()
         issue_first_round(exchange)
         for _ in range(1, num_shards):
-            if layout.SHARD_INDEX_OPERAND:
+            if index_operand:
                 pltpu.make_async_copy(
                     routing_messages.at[shard],
                     routing_messages.at[shard],
@@ -728,7 +760,7 @@ def start_transport(
             pltpu.SemaphoreType.DMA,
         ],
         compiler_params=pltpu.CompilerParams(
-            collective_id=COLLECTIVE_ID_TRANSPORT, has_side_effects=layout.SIDE_EFFECTS
+            collective_id=COLLECTIVE_ID_TRANSPORT, has_side_effects=side_effects
         ),
         name="fused_ep_transport_start",
     )(*smem_args, rows, routing_message)

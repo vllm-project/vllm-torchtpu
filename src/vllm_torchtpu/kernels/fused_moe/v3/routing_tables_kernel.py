@@ -369,8 +369,8 @@ def _shard_tables_body(
     the first steps. With `hosts_transport`, the transport's middle step
     (forward rounds 2..n as their inputs land) on the last step."""
     it = iter(refs)
-    # The shard's index: an SMEM operand (layout.SHARD_INDEX_OPERAND) or
-    # the mesh axis.
+    # The shard's index: an SMEM operand (shard_tables_kernel's
+    # shard_index) or the mesh axis.
     shard_ref = next(it) if shard_operand else None
 
     def shard_of():
@@ -623,6 +623,7 @@ def _shard_tables_body(
                     gathered_rows_out.shape[0] // num_shards,
                     num_shards,
                     mesh_axes=mesh_axes,
+                    shard_index_operand=shard_operand,
                 )
             )
 
@@ -646,6 +647,7 @@ def shard_tables_kernel(
     shard_index=None,
     pairs_per_expert=None,
     mesh_axes=(layout.MESH_AXIS,),
+    side_effects=True,
 ):
     """The pallas mode's front end, from the gathered routing messages
     (`routing_messages` [num_shards, rows, LANES] int32: shard s's pair indices
@@ -666,6 +668,9 @@ def shard_tables_kernel(
     pairs_per_shard. It bounds the lookup values (check_lookup_range).
     `mesh_axes` are the mesh's axis names, which the hosted transport rounds
     address their peers by (layout.MESH_AXIS is the expert-parallel one).
+    `shard_index` (an int32 [1] SMEM operand) and `side_effects` are
+    transport.start_transport's; `side_effects` applies when the call hosts
+    the transport.
     """
     check_lookup_range(
         num_experts=num_experts,
@@ -829,9 +834,7 @@ def shard_tables_kernel(
             if hosts
             else {}
         ),
-        compiler_params=pltpu.CompilerParams(
-            has_side_effects=hosts and layout.SIDE_EFFECTS
-        ),
+        compiler_params=pltpu.CompilerParams(has_side_effects=hosts and side_effects),
         interpret=interpret,
         name="fused_ep_shard_tables",
     )(

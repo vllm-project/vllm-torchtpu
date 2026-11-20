@@ -39,7 +39,7 @@ import pytest
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.kernels.fused_moe.v3 import transport
+from vllm_torchtpu.kernels.fused_moe.v3 import layout, transport
 from vllm_torchtpu.kernels.fused_moe.v3.layout import MESH_AXIS
 
 pytestmark = pytest.mark.cpu_test
@@ -47,8 +47,9 @@ pytestmark = pytest.mark.cpu_test
 HIDDEN, PAIRS = 256, 1024
 
 
-def _trace_start(tokens):
-    """The start program over `tokens` rows on a one-shard mesh, traced."""
+def _trace_start(tokens, **kwargs):
+    """The start program over `tokens` rows on a one-shard mesh, traced, with
+    start_transport's `kwargs`."""
     mesh = Mesh(np.asarray(jax.devices("cpu")[:1]), (MESH_AXIS,))
     message_rows = transport.message_rows(tokens, PAIRS)
 
@@ -58,6 +59,7 @@ def _trace_start(tokens):
             message,
             scale_base=transport.scale_row_offset(PAIRS),
             num_shards=1,
+            **kwargs,
         )[3]
 
     program = jax.shard_map(
@@ -79,6 +81,39 @@ def test_start_traces_with_a_partial_last_tile(tokens):
     scale column is a whole tile tall and fills one message row."""
     assert transport.quant_tiles(tokens) == -(-tokens // transport.QUANT_TILE_ROWS)
     _trace_start(tokens)
+
+
+@pytest.mark.parametrize("side_effects", [True, False])
+@pytest.mark.parametrize("with_index", [False, True], ids=["mesh_axis", "operand"])
+def test_the_start_program_takes_its_lowering_form_from_its_arguments(
+    monkeypatch, side_effects, with_index
+):
+    """`side_effects` is what the program declares to XLA. A shard index
+    handed in is read from its SMEM operand, never the mesh axis, and every
+    peer address takes the operand form (the torch bridge's); without one
+    the program reads the mesh axis and addresses peers in the axis form."""
+    forms = []
+    device_coords = transport.device_coords
+
+    def record(*args, shard_index_operand):
+        forms.append(shard_index_operand)
+        return device_coords(*args, shard_index_operand=shard_index_operand)
+
+    monkeypatch.setattr(transport, "device_coords", record)
+    index = jnp.zeros((1,), jnp.int32) if with_index else None
+    text = str(_trace_start(128, side_effects=side_effects, shard_index=index))
+    assert text.count("has_side_effects=True") == int(side_effects)
+    assert forms and set(forms) == {with_index}
+    assert ("axis_index" in text) == (not with_index)
+
+
+def test_a_shard_index_operand_addresses_a_mesh_of_the_expert_axis_alone():
+    """The operand form names MESH_AXIS alone; a replica axis would need
+    lax.axis_index, which the operand form exists to avoid."""
+    assert layout.device_coords(3, shard_index_operand=True) == {MESH_AXIS: 3}
+    assert layout.device_coords(3, shard_index_operand=False) == (3,)
+    with pytest.raises(ValueError, match="one axis"):
+        layout.device_coords(3, (MESH_AXIS, "replica"), shard_index_operand=True)
 
 
 # ---- the exchange schedule, simulated ----
@@ -231,6 +266,7 @@ def test_the_receive_semaphores_are_distinct_and_in_range(width):
         0,
         transport.token_multiple(width),
         width,
+        shard_index_operand=False,
     )
     ids = [exchange.round_sem(t, link) for t in range(1, n + 1) for link in range(n)]
     ids += [exchange.mate_sem(t) for t in range(1, n + 1)]

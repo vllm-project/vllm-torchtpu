@@ -11,7 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Weight tensor relayout and lane-aligned packing utilities for Fused EP MoE v3."""
+"""Layout constants, the mesh axis and the shard addressing helpers for Fused EP
+MoE v3."""
+
+from typing import Any
+
+from jax import lax
 
 # Lane count of the vector unit: a token row is a whole number of LANES-wide
 # blocks, and every (SUBLANES, LANES) tile of 32-bit words the tables, the
@@ -37,43 +42,33 @@ MIB = 2**20
 # kernel use.
 MESH_AXIS = "d"
 
-# Whether the programs that issue remote DMAs declare themselves side-effecting
-# to XLA. True for the layer's own callers. Under torch_tpu's export bridge the
-# SPMD partitioner refuses a side-effecting custom call that carries no sharding
-# ("Side-effect HLO must have sharding"), and every such program's
-# outputs are consumed downstream (the finish program's `done` word gates the
-# combine's index), so the flag is not what keeps them alive; the bridge's
-# caller sets it False.
-SIDE_EFFECTS: bool = True
 
-# Whether the shard's own index reaches the transport and shard-tables
-# programs as an operand (an int32 [1] in SMEM, from a [num_shards, 1] array
-# the layer shards over the mesh axis) instead of `lax.axis_index`. False
-# for the layer's own callers. Under torch_tpu's export bridge `axis_index`
-# lowers to a partition-id that XLA's SPMD partitioner refuses ("partitionId
-# instruction is not supported for SPMD partitioning"), so the
-# bridge's caller sets it True and supplies the index as data.
-SHARD_INDEX_OPERAND: bool = False
-
-
-def device_coords(peer, mesh_axes=(MESH_AXIS,)):
+def device_coords(peer, mesh_axes=(MESH_AXIS,), *, shard_index_operand):
     """The mesh coordinates of shard `peer` of the expert-parallel axis, as
     a remote copy or signal takes them (pl.DeviceIdType.MESH): `peer` on
     MESH_AXIS and this core's own index on every other axis, so the cores
-    of one replica only ever address each other."""
-    from jax import lax
+    of one replica only ever address each other.
 
-    if SHARD_INDEX_OPERAND:
-        # The dict form, keyed by axis name: it names the mesh axis to Pallas
-        # (a NamedAxisEffect) without an axis lookup, so the program's mesh
-        # context is built even when nothing else references the axis.
-        # With the shard index supplied as data, the tuple form can leave
-        # the mesh without axes and fail device-coordinate validation.
-        # Axes other than MESH_AXIS keep this core's own index.
-        return {
-            axis: (peer if axis == MESH_AXIS else lax.axis_index(axis))
-            for axis in mesh_axes
-        }
+    `shard_index_operand`: the program takes its own shard index as an
+    operand instead of reading the mesh axis (under torch_tpu's export
+    bridge, where `lax.axis_index` lowers to a partition-id that XLA's SPMD
+    partitioner refuses). The mesh is then MESH_AXIS alone, and the
+    coordinates are the dict form keyed by axis name: it names the mesh
+    axis to Pallas (a NamedAxisEffect) without an axis lookup, so the
+    program's mesh context is built even when nothing else references the
+    axis, where the tuple form can leave the mesh without axes and fail
+    device-coordinate validation.
+    """
+    if shard_index_operand:
+        if tuple(mesh_axes) != (MESH_AXIS,):
+            raise ValueError(
+                f"a shard index taken as an operand addresses a mesh of the "
+                f"one axis {MESH_AXIS!r}; the other axes of {tuple(mesh_axes)} "
+                "would need lax.axis_index"
+            )
+        # Typed as pallas' device_id takes it (keys: an axis name or a tuple of them).
+        coords: dict[str | tuple[str, ...], Any] = {MESH_AXIS: peer}
+        return coords
     return tuple(
         peer if axis == MESH_AXIS else lax.axis_index(axis) for axis in mesh_axes
     )
