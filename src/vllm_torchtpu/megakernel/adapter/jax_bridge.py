@@ -77,13 +77,17 @@ def sharded_jax_callable(
 
     if name.count("::") != 1:
         raise ValueError(f"op name {name!r} must be 'namespace::op', with one '::'")
+    # torch_tpu's custom_jax_kernel stubs type the partition specs as
+    # tuple[tuple[str, ...], ...], while runtime NamedSharding takes PartitionSpecs.
+    in_specs: Any = tuple(input_partition_specs)
+    out_specs: Any = tuple(_leaf_output_specs(output_partition_specs))
     return pallas_impl.custom_jax_kernel(
         fn,
         name,
         donate_argnums=list(donate_argnums) if donate_argnums else None,
         mesh=mesh,
-        input_partition_specs=tuple(input_partition_specs),
-        output_partition_specs=tuple(_leaf_output_specs(output_partition_specs)),
+        input_partition_specs=in_specs,
+        output_partition_specs=out_specs,
         warn_deprecated=False,
     )
 

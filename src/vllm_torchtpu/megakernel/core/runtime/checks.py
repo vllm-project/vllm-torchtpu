@@ -162,6 +162,8 @@ def verify_pooled_step_hlo(
     j_kw = dict(in_shardings=in_sh, out_shardings=out_sh, donate_argnums=don)
     lowered = jax.jit(step_fn, **j_kw, keep_unused=True).lower(*avals)
     hlo_text = lowered.compile().as_text() if do_comp else lowered.as_text("hlo")
+    if hlo_text is None:
+        raise MegakernelConfigError("pooled step HLO text is unavailable")
     num_pages, page_size = int(raw_pools[0].shape[0]), int(raw_pools[0].shape[-1])
     g, pb = spec.config, spec.cache_backend
     kvh = int(g.nkv(ex.R)) if hasattr(g, "nkv") else 1
