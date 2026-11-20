@@ -7,6 +7,8 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.components import (
     StreamIndexComponents,
@@ -46,6 +48,28 @@ class BF16KeyReader:
         keys = values.reshape(rows, ref.shape[-1])[:, :width]
         return keys, jnp.ones((1, rows), jnp.float32)
 
+    def read_block(self, block_ref: Any, batch_idx: int, rows: int, width: int) -> jax.Array:
+        """``read`` of ``block_ref[batch_idx]`` straight into the matmul's tiles.
+
+        A key pair (rows 2i and 2i + 1) shares one 32-bit word per lane, and
+        word row i of the block holds lane tiles ``[0, W // 128)`` of that pair
+        back to back. Viewed as ``[rows // 2 * W // 128, 128]`` words, lane
+        tile c of every pair is a sublane-strided slice, and its bf16 bitcast
+        is the packed (16, 128) layout the q @ k matmul consumes, so no
+        relayout runs. Same keys as ``read``.
+        """
+        lane_tiles = block_ref.shape[-1] // 128
+        words = block_ref.bitcast(jnp.uint32)
+        words = words.reshape(words.shape[0], words.shape[1] * lane_tiles, 128)
+        tiles = [
+            pltpu.bitcast(
+                words[batch_idx, pl.ds(c, rows // 2, stride=lane_tiles), :],
+                jnp.bfloat16,
+            )
+            for c in range(width // 128)
+        ]
+        return tiles[0] if len(tiles) == 1 else jnp.concatenate(tiles, axis=1)
+
 
 @dataclass(frozen=True)
 class QSAIndexSchedule:
@@ -82,6 +106,8 @@ def qsa_indexing(
     per_token_scores: bool = False,
     table_expansion: tuple[int, int, int] = (1, 1, 0),
     coalesce_entries: bool = False,
+    dense_step: bool = False,
+    tail_skip: int = 0,
 ) -> StreamIndexComponents:
     return StreamIndexComponents(
         BF16KeyReader(),
@@ -89,4 +115,6 @@ def qsa_indexing(
         per_token_scores,
         table_expansion,
         coalesce_entries,
+        dense_step,
+        tail_skip,
     )
