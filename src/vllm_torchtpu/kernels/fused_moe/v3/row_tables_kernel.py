@@ -24,7 +24,7 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 from . import row_gather_kernel as gather
 from .config import SCATTER_CHUNK_PAIRS_DEFAULT, SCATTER_RING_DEFAULT
-from .layout import LANES
+from .layout import LANES, WORD_BYTES
 
 # Added to an integer before a float multiply by an inverse, so the
 # conversion back to int32 floors the exact quotient (no integer divide
@@ -250,7 +250,9 @@ def scatter_row_tables(
         extra tokens route nowhere). tokens_per_shard is the gathered rows'
         count per shard, which the token table indexes.
       chunk: pairs per chunk (whole vectors of whole tokens); None takes
-        the largest count up to `chunk_max` that divides a subcore's run.
+        the largest count up to `chunk_max` that divides a subcore's run
+        and whose ring of buffers fits a vector subcore's VMEM.
+      chunk_max: the longest chunk None may take.
       ring: chunks in flight per subcore.
 
     Returns:
@@ -338,19 +340,36 @@ def scatter_row_tables(
             f"the chip's {n_subcores} vector subcores"
         )
     run = n_pairs // n_subcores
+    # The ring's buffers: the routed rows and the tokens, then per scale
+    # plane the scale indices, the scale words and the table rows, ring x
+    # chunk words each. At most this many pairs a chunk fit a vector
+    # subcore's VMEM.
+    ring_bytes_per_pair = ring * (2 + 3 * n_scales) * WORD_BYTES
+    subcore_vmem = pltpu.get_tpu_info().sparse_core.vmem_capacity_bytes
+    fitting = subcore_vmem // ring_bytes_per_pair
     if chunk is None:
-        # The largest whole number of 128-word ring parts, up to
-        # chunk_max, that divides a subcore's run; a pair's decode
-        # does not depend on where the chunk boundaries fall. The chunk is
-        # the same at every plane count: the plane buffers grow with the
-        # planes (ring x planes x chunk words each) instead.
-        chunk = next((c for c in range(chunk_max, 0, -LANES) if run % c == 0), run)
+        # The largest whole number of 128-word ring parts, up to chunk_max
+        # and to what fits, that divides a subcore's run; a pair's decode
+        # does not depend on where the chunk boundaries fall. More scale
+        # planes take a shorter chunk.
+        top = min(chunk_max, fitting - fitting % LANES)
+        chunk = next((c for c in range(top, 0, -LANES) if run % c == 0), run)
+    if chunk > fitting:
+        raise ValueError(
+            f"chunk {chunk}: a ring of {ring} chunks with {n_scales} scale "
+            f"planes needs {chunk * ring_bytes_per_pair} bytes of buffers, "
+            f"over a vector subcore's {subcore_vmem} bytes of VMEM. A shorter "
+            "chunk or ring fits"
+        )
     if chunk % lanes or chunk % gather.SLICE_ALIGN_WORDS:
         raise ValueError(
             f"chunk {chunk} is not a whole number of {lanes}-lane "
             f"vectors and of {gather.SLICE_ALIGN_WORDS}-word slices"
         )
-    run = gather.rows_per_subcore(n_pairs, n_subcores, chunk)
+    if run % chunk:
+        raise ValueError(
+            f"a subcore's {run} pairs are not a whole number of {chunk}-pair chunks"
+        )
     if (run != chunk or n_scales > 1) and chunk % LANES:
         raise ValueError(
             f"chunk {chunk}: a ring part starts at a multiple of "
