@@ -20,12 +20,14 @@ the routed rows, over a routing-dependent prefix) and
 ``row_tables_kernel.scatter_row_tables`` (the token and scale tables the FFN
 kernel reads) run with DMA bounds checks off and reuse their ring slots, so a
 wrong slice or slot schedule reads or writes the wrong rows without an error.
-Each runs here with more blocks or chunks than ring slots, and its output is
-compared value for value with the numpy indexing it stands for.
+Each runs here with more blocks or chunks than ring slots (the scatter also
+with one chunk per subcore), and its output is compared value for value with
+the numpy indexing it stands for.
 
 The programs do not run in the TPU interpreter on CPU (its SparseCore
 lowering rejects the index-driven copies), so their output needs a TPU7x
-chip; the arguments they refuse are checked on CPU, before anything is built.
+chip. The arguments they refuse, and the order of the scatter's copies and
+waits in its traced program, are checked on CPU.
 """
 
 import jax
@@ -120,6 +122,68 @@ def test_scatter_refuses_a_short_chunk_with_several_scale_planes(tpu7x_record):
     operands, kwargs = _scatter_shapes(1024, 512, tokens=128, n_scales=2)
     with pytest.raises(ValueError, match="with one scale plane"):
         row_tables_kernel.scatter_row_tables(*operands, **kwargs)
+
+
+def _jaxprs(jaxpr):
+    """`jaxpr` and every jaxpr nested in its equations, depth first."""
+    yield jaxpr
+    for eqn in jaxpr.eqns:
+        for value in eqn.params.values():
+            for inner in value if isinstance(value, (tuple, list)) else (value,):
+                inner = getattr(inner, "jaxpr", inner)
+                if hasattr(inner, "eqns"):
+                    yield from _jaxprs(inner)
+
+
+def _base(operand):
+    """The ref a DMA operand slices (a TransformedRef's own ref)."""
+    return getattr(operand, "ref", operand)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("n_scales", [1, 2, 3])
+def test_no_scale_plane_is_scattered_before_every_plane_gather_landed(
+    tpu7x_record, n_scales
+):
+    """A ring slot's scale planes are gathered on one shared semaphore, and a
+    wait on it returns once one plane's worth of bytes has landed from any
+    of the planes' copies. So the scatter may read a plane only after every
+    plane's wait: in the traced program, the semaphore of the copies into
+    the gathered-scales buffer has no copy outstanding at any copy out of
+    that buffer. A chip that happens to land the planes in order gives the
+    right tables either way, so the check is on the program."""
+    operands, kwargs = _scatter_shapes(
+        32 * 4 * LANES, 1024, tokens=1024, n_scales=n_scales
+    )
+    traced = jax.make_jaxpr(
+        lambda *ops: row_tables_kernel.scatter_row_tables(
+            *ops, **kwargs, chunk_max=LANES, ring=2
+        )
+    )(*operands)
+    checked = 0
+    for jaxpr in _jaxprs(traced.jaxpr):
+        dmas = []
+        for eqn in jaxpr.eqns:
+            if eqn.primitive.name in ("dma_start", "dma_wait"):
+                src, dst, sem, _, _ = eqn.params["tree"].unflatten(eqn.invars)
+                dmas.append((eqn.primitive.name, _base(src), _base(dst), _base(sem)))
+        starts = [d for d in dmas if d[0] == "dma_start"]
+        # The gathered-scales buffer: copied into by one start, out of by another.
+        staged = {dst for _, _, dst, _ in starts} & {src for _, src, _, _ in starts}
+        if not staged:
+            continue
+        (scales,) = staged
+        (gather_sem,) = {sem for _, _, dst, sem in starts if dst is scales}
+        outstanding = 0
+        for prim, src, dst, sem in dmas:
+            if prim == "dma_start" and dst is scales:
+                outstanding += 1
+            elif prim == "dma_wait" and sem is gather_sem:
+                outstanding -= 1
+            elif prim == "dma_start" and src is scales:
+                assert outstanding == 0, "a scale plane is scattered before it landed"
+                checked += 1
+    assert checked == n_scales
 
 
 @pytest.mark.cpu_test
