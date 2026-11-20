@@ -55,6 +55,10 @@ MAX_ROWS = 16384
 # Marks the wrapper install_qk_norm_rope_patch puts on Qwen3NextAttention.
 _INSTALLED_ATTR = "_tpu_fused_qk_norm_rope"
 
+# The (1 + w) buffer the Qwen3.5 model patch's norm weight hoist keeps on each
+# GemmaRMSNorm after loading; without it _weight_plus_one computes (1 + w).
+_HOISTED_WEIGHT_ATTR = "_tpu_weight_plus_one"
+
 _ops: dict[tuple[int, int, int, int, float], Callable] = {}
 
 
@@ -114,9 +118,13 @@ def _build_op(key: tuple[int, int, int, int, float]) -> None:
 
 
 def _weight_plus_one(norm: torch.nn.Module) -> torch.Tensor:
-    """The norm's (1 + w), from its current weight. Never cached here: the
-    layer is built before its weights load, so a value taken then holds the
-    initial weight, not the checkpoint's."""
+    """The norm's (1 + w): the hoisted buffer when the model patch set one
+    after loading, else computed from the current weight. Never cached here:
+    the layer is built before its weights load, so a value taken then holds
+    the initial weight, not the checkpoint's."""
+    hoisted = getattr(norm, _HOISTED_WEIGHT_ATTR, None)
+    if hoisted is not None:
+        return hoisted
     return cast(torch.Tensor, norm.weight).float() + 1.0
 
 

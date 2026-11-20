@@ -206,6 +206,16 @@ def test_the_op_registers_with_the_real_bridge_and_its_fake_gives_the_shapes(
     assert (tuple(gate.shape), gate.dtype) == ((rows, HEADS * HEAD_DIM), torch.bfloat16)
 
 
+def test_fused_projection_reads_the_hoisted_norm_weight():
+    layer = _layer()
+    hoisted = layer.q_norm.weight.float() + 1.0
+    layer.q_norm._tpu_weight_plus_one = hoisted
+    fused.project_qkv_gate(layer, *_inputs(8))
+    (args,) = _HostOp.calls
+    assert args[2] is hoisted
+    torch.testing.assert_close(args[3], layer.k_norm.weight.float() + 1.0)
+
+
 def test_the_norm_weights_loaded_after_construction_reach_the_kernel():
     """A layer arms the fused path when it is built, before the loader fills
     its norm weights: the kernel must get (1 + w) of the loaded weights, not
