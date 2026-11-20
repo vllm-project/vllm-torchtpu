@@ -669,10 +669,11 @@ def test_gmm_fp8_moe_tuned_table_shape_matches_reference(
 _FP8_MOE_GMM1_K, _FP8_MOE_GMM1_N = 4096, 2048
 
 
-def _fp8_moe_gmm1_inputs(as_arrays=True):
-    """bf16 rows and an FP8 gate/up weight with one scale per output channel."""
+def _fp8_moe_gmm1_inputs(as_arrays=True, k=_FP8_MOE_GMM1_K):
+    """bf16 rows and an FP8 gate/up weight with one scale per output channel.
+    ``k`` is the contracting width; the device case uses the GMM1 table's."""
     rows, slots = int(sum(_TUNED_TABLE_SIZES)), len(_TUNED_TABLE_SIZES)
-    k, n = _FP8_MOE_GMM1_K, _FP8_MOE_GMM1_N
+    n = _FP8_MOE_GMM1_N
     if not as_arrays:
         return (
             jax.ShapeDtypeStruct((rows, k), jnp.bfloat16),
@@ -728,7 +729,10 @@ def test_the_fp8_moe_inputs_give_each_channel_and_expert_its_own_scale(which):
     channel (the fused gate/up halves) or expert (a streamed slab's scale) if
     those scales differ."""
     if which == "gmm1":
-        _, _, scale = _fp8_moe_gmm1_inputs()
+        # A short contracting width: each scale is one (slot, channel)'s amax
+        # over k, so k does not change how the scales vary, and the full
+        # 64 x 4096 x 2048 float32 weight would take 2 GiB on the CPU lane.
+        _, _, scale = _fp8_moe_gmm1_inputs(k=128)
     else:
         _, _, scale = _fp8_moe_inputs(8, _FP8_MOE_LAYOUTS["spread"][3])
     s = np.asarray(scale, dtype=np.float64)[:, 0, 0, :]
