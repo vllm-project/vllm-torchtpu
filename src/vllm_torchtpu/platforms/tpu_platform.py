@@ -1660,6 +1660,8 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
 
 def _validate_dense_sequence_parallel(vllm_config: VllmConfig) -> None:
     """Rejects server configs incompatible with `TPU_DENSE_SEQUENCE_PARALLEL=1`."""
+    if envs.TPU_DENSE_SP_HIER_RS != "off" and not envs.TPU_DENSE_SEQUENCE_PARALLEL:
+        raise ValueError("TPU_DENSE_SP_HIER_RS requires TPU_DENSE_SEQUENCE_PARALLEL=1")
     if not envs.TPU_DENSE_SEQUENCE_PARALLEL:
         return
     model_type = vllm_config.model_config.hf_text_config.model_type

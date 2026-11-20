@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     TPU_ATTN_MOE_OVERLAP: bool = False
     TPU_DENSE_SEQUENCE_PARALLEL: bool = False
+    TPU_DENSE_SP_HIER_RS: str = "off"
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
@@ -461,6 +462,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # covered so enabling it cannot break unsupported Gemma 4 checkpoints.
     "TPU_DENSE_SEQUENCE_PARALLEL": env_bool(
         "TPU_DENSE_SEQUENCE_PARALLEL", default=False
+    ),
+    # With TPU_DENSE_SEQUENCE_PARALLEL: fuse each dense SP reduce-scatter and its
+    # RMSNorm/residual/FP8-quantization epilogue in VMEM on a tpu7x TP group of
+    # 4 or 8 TensorCores (falling back to XLA reduce-scatter elsewhere). The value
+    # selects the inter-chip payload; "fp8" is lossy.
+    "TPU_DENSE_SP_HIER_RS": env_with_choices(
+        "TPU_DENSE_SP_HIER_RS", "off", ["off", "bf16", "fp8"]
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
