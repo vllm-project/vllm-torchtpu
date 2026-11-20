@@ -1,7 +1,7 @@
 # Copyright 2026 Google LLC
 # SPDX-License-Identifier: Apache-2.0
-"""The rotated reduce-scatter tests of the prefill token split on 16 host
-devices.
+"""The rotated reduce-scatter tests of the prefill token split and of the
+log-sum-exp reduce-scatter on 16 host devices.
 
 They need the 16 cores of a 2x2x2 slice, more than the multichip lane's host
 has, so they skip there. Every pallas_call in them runs interpreted, so this
@@ -19,6 +19,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 MOE = "tests/layers/adapter/test_moe_tp_decode.py"
 SPLIT = "tests/kernels/experimental/test_prefill_token_split.py"
+LSE = "tests/kernels/experimental/test_lse_reduce_scatter.py"
 # Node ids per child, run side by side (each takes 4 to 6 minutes on 8 cores),
 # and the cases each must pass.
 GROUPS = (
@@ -38,6 +39,13 @@ GROUPS = (
             f"{SPLIT}::test_rotated_scatter_rows_gives_each_core_the_rows_of_scatter_rows",
         ),
         3,
+    ),
+    (
+        (
+            f"{LSE}::test_result_is_the_softmax_merge_of_the_projections",
+            f"{LSE}::test_the_comparison_sees_the_merge_weights",
+        ),
+        2,
     ),
 )
 TIMEOUT_SECONDS = 1500
