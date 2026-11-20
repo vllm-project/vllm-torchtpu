@@ -642,3 +642,107 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
           total_sz: number of tokens copied out.
         """
         return vmem_src.at[pl.ds(0, total_sz), pl.ds(0, self.num_sublanes)]
+
+
+@dataclasses.dataclass(frozen=True)
+class StreamIndexDecodeRing:
+    """Copies of the packed decode pass's manual pipeline (TPU_STREAMIDX_DECODE_RING).
+
+    The page-major KV blocks cycle through `kv_ring` and the score blocks through
+    `scores_ring`. The kernel issues both kinds of copies without a branch, in the
+    block that holds the MXU and head-sum work: a copy past the last step moves
+    nothing, so the copies need no condition of their own.
+    """
+
+    kv_ring: Any  # VMEM [slots, 1, bkv_p * groups, kv_packing, page_size]
+    kv_sems: Any  # DMA semaphores [slots]
+    scores_ring: Any  # VMEM [score_slots, bq_sz, score_pitch, 128]
+    scores_sems: Any  # DMA semaphores [score_slots]
+    bkv_p: int
+    groups: int
+    pages_per_seq: int
+    bq_sz: int
+    num_sublanes: int
+    chunk_idx: int
+
+    def copy_kv_in(
+        self,
+        src_ref: tuple[jax.Ref, jax.Ref, Any],
+        p_id: int | jax.Array,
+        slot: int | jax.Array,
+        enabled: jax.Array,
+    ):
+        """Starts the page copies of step `p_id` into `slot`; empty unless `enabled`."""
+        cache_kv_hbm, page_indices_ref, meta_ref = src_ref
+        num_steps = meta_ref.num_steps[self.chunk_idx]
+        p_id = jnp.minimum(p_id, num_steps - 1) + _step_offset(meta_ref, self.chunk_idx)
+        page_indices_offset = (
+            meta_ref.batch_tile_idx[p_id] * self.pages_per_seq
+            + meta_ref.bkv_idx[p_id] * self.bkv_p
+        )
+        max_hbm_pages = cache_kv_hbm.shape[0]
+        num_page_indices = page_indices_ref.shape[0]
+        cache_rows = cache_kv_hbm.reshape(
+            max_hbm_pages * self.groups, *cache_kv_hbm.shape[2:]
+        )
+        groups = jnp.where(enabled, self.groups, 0)
+        sem = self.kv_sems.at[slot]
+        for i in range(self.bkv_p):
+            page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
+            safe_page = jnp.minimum(page_indices_ref[page_idx], max_hbm_pages - 1)
+            pltpu.make_async_copy(
+                cache_rows.at[pl.ds(safe_page * self.groups, groups)],
+                self.kv_ring.at[slot, 0, pl.ds(i * self.groups, groups)],
+                sem,
+            ).start()
+
+    def wait_kv_in(self, slot: int | jax.Array):
+        block = self.kv_ring.at[slot]
+        pltpu.make_async_copy(block, block, self.kv_sems.at[slot]).wait()
+
+    def _scores_block(
+        self,
+        dst_ref: tuple[Any, ...],
+        p_id: jax.Array,
+        slot: int | jax.Array,
+        enabled: bool | jax.Array | None = None,
+    ):
+        """(VMEM source, HBM destination) of step `p_id`'s scores.
+
+        Both are empty when `enabled` is false.
+        """
+        scores_hbm, _, meta_ref, start_end_seq_idx_ref = dst_ref
+        token_start, total_sz = _token_window(
+            dst_ref,
+            p_id,
+            scores_hbm.shape[0],
+            bq_sz=self.bq_sz,
+            seq_batch_size=1,
+            chunk_idx=self.chunk_idx,
+        )
+        if enabled is not None:
+            total_sz = jnp.where(enabled, total_sz, 0)
+        bkv_idx = meta_ref.bkv_idx[p_id + _step_offset(meta_ref, self.chunk_idx)]
+        src = self.scores_ring.at[slot, pl.ds(0, total_sz), pl.ds(0, self.num_sublanes)]
+        dst = scores_hbm.at[
+            pl.ds(token_start - start_end_seq_idx_ref[2], total_sz),
+            pl.ds(bkv_idx * self.num_sublanes, self.num_sublanes),
+        ]
+        return src, dst
+
+    def copy_scores_out(
+        self,
+        dst_ref: tuple[Any, ...],
+        p_id: jax.Array,
+        slot: int | jax.Array,
+        enabled: bool | jax.Array,
+    ):
+        """Starts the score copy of step `p_id` from `slot`; empty unless `enabled`."""
+        src, dst = self._scores_block(dst_ref, jnp.maximum(p_id, 0), slot, enabled)
+        pltpu.make_async_copy(src, dst, self.scores_sems.at[slot]).start()
+
+    def wait_scores_out(
+        self, dst_ref: tuple[Any, ...], p_id: jax.Array, slot: int | jax.Array
+    ):
+        src, _ = self._scores_block(dst_ref, p_id, slot)
+        pltpu.make_async_copy(src, src, self.scores_sems.at[slot]).wait()

@@ -39,6 +39,7 @@ HOST_ONLY_TEST_FILES: tuple[str, ...] = (
     "tests/distributed/test_sharded_jax_op.py",
     "tests/layers/adapter/test_small_all_reduce_op.py",
     "tests/layers/adapter/quantization/test_fp8_linear_pallas.py",
+    "tests/kernels/experimental/test_fused_moe_prefill_sum_overlap.py",
 )
 
 
