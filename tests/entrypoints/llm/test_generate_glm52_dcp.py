@@ -21,8 +21,10 @@ graph compile, neither visible in unit tests that stub upstream out.
 
 The real GLM-5.2 config, cut to four layers that keep the production
 pattern (three full indexers then a shared one; one dense MLP then MoE),
-serves a few greedy tokens at TP 8 x DCP 8 with q-replicate off and on.
-The weights are random, so only that it runs is checked, not what it says.
+serves a few greedy tokens at TP 8 x DCP 8. Per PR: the FP8 checkpoint
+this repo serves, with the model config's default (q-replicate on).
+Nightly: the NVFP4 checkpoint, and q-replicate off on the bf16 one. The
+weights are random, so only that it runs is checked, not what it says.
 
 Run with: pytest tests/entrypoints/llm/test_generate_glm52_dcp.py -v
 """
@@ -33,15 +35,16 @@ from vllm.distributed import cleanup_dist_env_and_memory
 
 pytestmark = pytest.mark.multichip
 
-GLM52_MODEL_NAME = "zai-org/GLM-5.2"
 NUM_LAYERS = 4
 HF_OVERRIDES = {
     "num_hidden_layers": NUM_LAYERS,
     "num_nextn_predict_layers": 0,
+    # vLLM builds MoE from first_k_dense_replace and the indexer layout from
+    # index_topk_pattern ("S" shares the previous layer's top-k).
     "first_k_dense_replace": 1,
-    "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
-    "indexer_types": ["full", "full", "full", "shared"],
+    "index_topk_pattern": "FFFS",
 }
+EXPECTED_SKIP_TOPK = [False, False, False, True]
 DCP_SIZE = 8
 # The production interleave; one cycle is DCP_SIZE * INTERLEAVE positions.
 INTERLEAVE = 4
@@ -62,8 +65,9 @@ def _get_local_tpu_chip_count() -> int:
         pytest.skip(f"Unable to detect local TPU chip count: {e}")
 
 
-def _mla_qrep_state(model) -> list[tuple[bool, bool, bool]]:
-    """(dcp_q_replicate, is_sparse, replicated W_UK_T present) per MLA layer."""
+def _mla_qrep_state(model) -> list[tuple[bool, bool, bool, bool]]:
+    """(dcp_q_replicate, is_sparse, replicated W_UK_T present, skip_topk) per
+    MLA layer."""
     from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
         VllmMultiHeadLatentAttentionWrapper,
     )
@@ -73,6 +77,7 @@ def _mla_qrep_state(model) -> list[tuple[bool, bool, bool]]:
             module.dcp_q_replicate,
             module.is_sparse,
             module.mla_attn.W_UK_T_dcp_qrep is not None,
+            module.skip_topk,
         )
         for module in model.modules()
         if isinstance(module, VllmMultiHeadLatentAttentionWrapper)
@@ -80,25 +85,47 @@ def _mla_qrep_state(model) -> list[tuple[bool, bool, bool]]:
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize("q_replicate", [False, True], ids=["ag_q", "q_replicate"])
-def test_glm52_dcp_generates(monkeypatch, q_replicate: bool):
+@pytest.mark.parametrize(
+    "model, dcp_q_replicate, env",
+    [
+        # None leaves q-replicate to the GLM-5.2 config hook, which turns it on.
+        pytest.param("zai-org/GLM-5.2-FP8", None, {}, id="fp8"),
+        # Block-512 MoE scales, as the NVFP4 nightly integration job serves.
+        pytest.param(
+            "nvidia/GLM-5.2-NVFP4",
+            None,
+            {"MOE_REQUANTIZE_BLOCK_SIZE": "512"},
+            marks=pytest.mark.nightly,
+            id="nvfp4",
+        ),
+        pytest.param(
+            "zai-org/GLM-5.2", False, {}, marks=pytest.mark.nightly, id="bf16-ag_q"
+        ),
+    ],
+)
+def test_glm52_dcp_generates(
+    monkeypatch, model: str, dcp_q_replicate: bool | None, env: dict[str, str]
+):
     tp_size = _get_local_tpu_chip_count()
     if tp_size < DCP_SIZE:
         pytest.skip(f"needs {DCP_SIZE} chips for TP {DCP_SIZE} x DCP {DCP_SIZE}")
-    # Upstream reads the variable only when it is set, so set it both ways
-    # rather than leave one case to the model config's default.
-    monkeypatch.setenv("VLLM_DCP_Q_REPLICATE", "1" if q_replicate else "0")
+    # The variable overrides dcp_q_replicate when set; leave the choice to it.
+    monkeypatch.delenv("VLLM_DCP_Q_REPLICATE", raising=False)
     # apply_model sends a function to the workers.
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    q_replicate = dcp_q_replicate is not False
 
     llm = LLM(
-        model=GLM52_MODEL_NAME,
+        model=model,
         hf_overrides=HF_OVERRIDES,
         load_format="dummy",
         skip_tokenizer_init=True,
         tensor_parallel_size=DCP_SIZE,
         decode_context_parallel_size=DCP_SIZE,
         cp_kv_cache_interleave_size=INTERLEAVE,
+        dcp_q_replicate=dcp_q_replicate,
         enable_expert_parallel=True,
         block_size=256,
         # The sparse MLA kernel reads an fp8 latent cache, as GLM-5.2 serves.
@@ -130,11 +157,12 @@ def test_glm52_dcp_generates(monkeypatch, q_replicate: bool):
     assert len(layers_per_rank) == DCP_SIZE
     for layers in layers_per_rank:
         assert len(layers) == NUM_LAYERS
-        for flag, is_sparse, has_qrep_weights in layers:
+        assert [skip for *_, skip in layers] == EXPECTED_SKIP_TOPK
+        for flag, is_sparse, has_qrep_weights, _ in layers:
             assert flag == q_replicate
             assert has_qrep_weights == (q_replicate and is_sparse)
         if q_replicate:
-            assert any(has_qrep_weights for _, _, has_qrep_weights in layers)
+            assert any(has_qrep_weights for _, _, has_qrep_weights, _ in layers)
 
     assert len(outputs) == NUM_PROMPTS
     for output in outputs:
