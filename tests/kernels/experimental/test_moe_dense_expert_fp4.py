@@ -256,6 +256,7 @@ def test_fused_routing_matches_routing_first(monkeypatch, m, i, use_ep, topk):
         pytest.skip("requires TPU")
     monkeypatch.setattr(wrapper, "_DENSE_FP4_MAX_TOKENS", 32)
     monkeypatch.setattr(wrapper, "_DENSE_FP4_SPARSE_MAX_TOKENS", 64)
+    jax.clear_caches()  # earlier tests traced fused_moe_func with other caps
     e = 16
     num_global = 2 * e if use_ep else e
     x, w1, w2, s1, s2, _, _ = _inputs(m, 1024, i, e, topk, seed=m)
@@ -308,8 +309,9 @@ def test_one_tile_experts_match_both_tiles(m):
     ids[:, 3] = 8 + np.arange(m) % 4  # experts 8-11 from both tiles
     ids = jnp.asarray(ids)
     out = kernel.dense_expert_moe_fp4(x, w1, w2, s1, s2, weights, ids)
-    # Per token, the same experts with the other tokens' routes dropped: each
-    # expert then serves rows of one tile or both as above, the dense path.
+    # Per token, the same experts with the other tokens' routes dropped: every
+    # expert then runs the one-tile branch, against which experts 8-11 (both
+    # tiles in the batched call) are checked.
     want = np.zeros(out.shape, np.float32)
     for t in range(m):
         one = jnp.full((m, topk), -1, jnp.int32).at[t].set(ids[t])
