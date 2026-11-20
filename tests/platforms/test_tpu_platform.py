@@ -717,7 +717,8 @@ class TestTpuPlatform:
         self, mock_prepare_env, mock_apply_patches, vllm_config, monkeypatch
     ):
         vllm_config.parallel_config.data_parallel_backend = "ray"
-        monkeypatch.delenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", raising=False)
+        # setenv, not delenv: monkeypatch then removes the value the code writes.
+        monkeypatch.setenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
         monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
 
         with _live_vllm_envs():
@@ -1145,7 +1146,7 @@ class TestForwardKnobsToRayDpActors:
     def test_vllm_then_copies_the_knob_to_the_actors(self, monkeypatch):
         from vllm.ray.ray_env import get_env_vars_to_copy
 
-        monkeypatch.delenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", raising=False)
+        monkeypatch.setenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
         monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
         assert "TPU_MOE_SKIP_PADDED_TOKENS" not in get_env_vars_to_copy()
         TpuPlatform._forward_knobs_to_ray_dp_actors(self._config())
