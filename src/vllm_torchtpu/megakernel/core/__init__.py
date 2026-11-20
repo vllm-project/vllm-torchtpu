@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     from . import (
+        collectives,
         decls,
         dma,
         errors,
@@ -34,6 +35,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         profiles,
         spec,
     )
+    from .collectives import AllReduceRing
     from .dma import pool_alias
     from .errors import (
         MegakernelConfigError,
@@ -48,6 +50,11 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     from .modules import (
         Embedding,
         EmbeddingModule,
+        GDNLinInLayout,
+        GDNParams,
+        GQAParams,
+        MoEDebug,
+        MoEParams,
         Norm,
         NormModule,
     )
@@ -113,6 +120,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
 # (e.g. `runtime.contract`) doesn't import jax through this package.
 _SUBMODULES = frozenset(
     {
+        "collectives",
         "decls",
         "dma",
         "errors",
@@ -129,6 +137,7 @@ _SUBMODULES = frozenset(
     }
 )
 _LAZY: dict[str, str] = {
+    "AllReduceRing": ".collectives",
     "MegakernelConfigError": ".errors",
     "MegakernelLayoutError": ".errors",
     "DebugOptions": ".exec_spec",
@@ -137,6 +146,11 @@ _LAZY: dict[str, str] = {
     "default_tiles": ".exec_spec",
     "Embedding": ".modules",
     "EmbeddingModule": ".modules",
+    "GDNLinInLayout": ".modules",
+    "GDNParams": ".modules",
+    "GQAParams": ".modules",
+    "MoEDebug": ".modules",
+    "MoEParams": ".modules",
     "Norm": ".modules",
     "NormModule": ".modules",
     "col_chunk": ".ops",
@@ -195,6 +209,7 @@ __all__ = [
     "DEFAULT_PROFILE",
     "POOL_STATE_NAME",
     "REQUIRED",
+    "AllReduceRing",
     "Baseline",
     "CacheExec",
     "CompareMode",
@@ -204,11 +219,16 @@ __all__ = [
     "ExecSpec",
     "ExtraInput",
     "FrozenDict",
+    "GDNLinInLayout",
+    "GDNParams",
+    "GQAParams",
     "HFParamDecl",
     "KVCacheDecl",
     "LayerType",
     "MegakernelConfigError",
     "MegakernelLayoutError",
+    "MoEDebug",
+    "MoEParams",
     "ModelSpec",
     "Module",
     "ModuleBinding",
@@ -235,6 +255,7 @@ __all__ = [
     "allocate_test_layout",
     "cache_exec",
     "col_chunk",
+    "collectives",
     "conv_to_raw_page",
     "decls",
     "default_tiles",

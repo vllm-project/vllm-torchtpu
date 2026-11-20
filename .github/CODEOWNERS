@@ -175,9 +175,15 @@
 /src/vllm_torchtpu/models/qwen3_5/ @mshrihari3 @benliangw @caojx-google @kyuyeunk
 /tests/models/qwen3_5/ @mshrihari3 @benliangw @caojx-google @kyuyeunk
 
+# Models: Qwen4 Experimental (Alibaba)
+/src/vllm_torchtpu/models/vllm/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
+/tests/models/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
+
 # Models: Qwen3.8 Flash
 /src/vllm_torchtpu/models/qwen38_flash/ @DRZDONG @caojx-google
 /tests/models/qwen38_flash/ @DRZDONG @caojx-google
+/src/vllm_torchtpu/models/qwen38_flash/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
+/tests/models/qwen38_flash/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
 
 # Megakernel (root package and shared test setup)
 /src/vllm_torchtpu/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @mshrihari3
@@ -219,6 +225,7 @@
 /src/vllm_torchtpu/tools/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /tools/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /scripts/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
+/scripts/vllm/benchmarking/agentic_benchmark/ @wenxindongwork @pv97 @sierraisland @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /tests/tools/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /tests/scripts/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /.pre-commit-config.yaml @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li

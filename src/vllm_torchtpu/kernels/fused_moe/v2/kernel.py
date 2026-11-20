@@ -31,11 +31,11 @@ from vllm_torchtpu import envs
 
 # The layout constants this kernel is built against, and the host module
 # whose accounting decides what it may declare.
+from vllm_torchtpu.kernels.fp8_wire import quant_apply, row_scale, rowquant_fp8
 from vllm_torchtpu.kernels.fused_moe.v2 import host
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     FP4,
     FP8,
-    FP8_MAX,
     HIDDEN_LANE_BLOCK,
     OUT_PARITIES,
     PACK4,
@@ -202,40 +202,8 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     return tuple(range(step, tile_m + 1, step))
 
 
-def _row_scale(amax):
-    """The row scale and its inverse, with the rows that have no usable one.
-
-    A row whose maximum is zero has nothing to scale by, and a row whose
-    maximum is not finite has nothing USEFUL to scale by: the reciprocal of
-    an infinite maximum is zero, so every finite value in that row would
-    multiply to zero and only the infinity would survive, as a NaN. That
-    leaves a plausible-looking mostly-zero row where the row's real content
-    was, and sends an infinite scale over the wire for the combine at the
-    destination shard to multiply back in. Both cases are answered the same
-    way, by the caller zeroing the row whole against `usable`: an obviously
-    empty row rather than a quietly wrong one.
-    """
-    scale = amax.astype(jnp.float32) / FP8_MAX
-    usable = jnp.isfinite(scale) & (scale > 0)
-    scale = jnp.where(usable, scale, 0.0)
-    sinv = jnp.where(usable, 1.0 / jnp.where(usable, scale, 1.0), 0.0)
-    return scale, sinv, usable
-
-
-def rowquant_fp8(x):
-    """Per-row dynamic fp8 quant, reducing and applying in bf16."""
-    amax = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
-    scale, sinv, usable = _row_scale(amax)
-    return _quant_apply(x, sinv.astype(x.dtype), usable), scale
-
-
 def _absmax_rows(x):
     return jnp.max(jnp.abs(x), axis=-1, keepdims=True)
-
-
-def _quant_apply(x, sinv_native, usable):
-    """Quantize a row, or zero it whole where its scale is unusable."""
-    return jnp.where(usable, x * sinv_native, jnp.zeros_like(x)).astype(FP8)
 
 
 def wire_row_and_scale(
@@ -327,10 +295,10 @@ def _intermediate_rows(acc1, act_scale, inter, *, w1s, act_fn, w1b, requantize=T
             amax = chunk_amax if amax is None else jnp.maximum(amax, chunk_amax)
     if not requantize:
         return jnp.concatenate(mid_chunks, axis=-1), None
-    mid_scale, mid_sinv, usable = _row_scale(amax)
+    mid_scale, mid_sinv, usable = row_scale(amax)
     sinv_bf16 = mid_sinv.astype(jnp.bfloat16)
     mid_q = jnp.concatenate(
-        [_quant_apply(chunk, sinv_bf16, usable) for chunk in mid_chunks], axis=-1
+        [quant_apply(chunk, sinv_bf16, usable) for chunk in mid_chunks], axis=-1
     )
     return mid_q, mid_scale
 
@@ -568,8 +536,15 @@ def _build_fused_ep_moe_kernel(
     act_fn="silu",
     has_w1_bias=False,
     has_w2_bias=False,
+    w1s_expert_second_minor=False,
+    w2s_expert_second_minor=False,
 ):
-    """Build the pallas_call and the function that invokes it."""
+    """Build the pallas_call and the function that invokes it.
+
+    `w1s_expert_second_minor` / `w2s_expert_second_minor` take that
+    per-contraction-block scale table as [blocks, G, N] rather than
+    [G, blocks, N]; an expert's table is then a strided slice.
+    """
     if act_fn not in ACT_FNS:
         raise NotImplementedError(
             f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}"
@@ -716,9 +691,9 @@ def _build_fused_ep_moe_kernel(
     # gate/up matmul and the next visit's first block waits for all of it.
     # Column chunks (stream_chunk output columns, whole numbers of the
     # reader's FP4_OUTPUT_CHUNK) let each chunk be refilled as soon as it
-    # is retired and landed as late as its first read, so the wire stays busy
-    # across visits. Smaller chunks lose: every wait is a scheduling fence in
-    # the unrolled matmul chain.
+    # is retired, so the wire stays busy across visits; a slab's chunks are
+    # all waited at its first read. Smaller chunks lose: every wait is a
+    # scheduling fence in the unrolled matmul chain.
     # Only where an expert is expected to fit one tile (the bound the height
     # rungs use): a multi-tile visit re-reads the slab every tile, and the
     # per-chunk predicates then cost more than the refill overlap buys.
@@ -985,6 +960,9 @@ def _build_fused_ep_moe_kernel(
             """The down weight slab of `expert`, into weight slot `slot`."""
             return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
 
+        def scale_table(hbm, expert, expert_second_minor):
+            return hbm.at[:, expert] if expert_second_minor else hbm.at[expert]
+
         def w1_chunk_copy(expert, slot, c):
             """Gate/up column chunk `c` of `expert`, into weight slot `slot`."""
             assert w1c_sems is not None
@@ -1003,11 +981,13 @@ def _build_fused_ep_moe_kernel(
 
         def w1s_copy(expert, slot):
             assert w1s_hbm is not None
-            return _slot_copy(w1s_hbm.at[expert], w1s_vm, w1s_sems, slot)
+            table = scale_table(w1s_hbm, expert, w1s_expert_second_minor)
+            return _slot_copy(table, w1s_vm, w1s_sems, slot)
 
         def w2s_copy(expert, slot):
             assert w2s_hbm is not None
-            return _slot_copy(w2s_hbm.at[expert], w2s_vm, w2s_sems, slot)
+            table = scale_table(w2s_hbm, expert, w2s_expert_second_minor)
+            return _slot_copy(table, w2s_vm, w2s_sems, slot)
 
         def weight_starts(expert, slot, scale_slot=None):
             """Start every buffer slot `slot` holds for `expert`.
@@ -1087,20 +1067,26 @@ def _build_fused_ep_moe_kernel(
 
         def _chunk_hooks(expert, visit_i, slot, first_tile, last_tile):
             """`(before, after)`, each `(which, block, n_start) -> ()`, for a
-            chunk-streamed visit: `before` lands chunk `n_start` at its first
-            block on the expert's first tile; `after` refills it with the next
-            visit's chunk after its last block on the expert's last tile."""
+            chunk-streamed visit: `before` lands every chunk of a slab at the
+            slab's first block on the expert's first tile; `after` refills a
+            chunk with the next visit's after its last block on the expert's
+            last tile."""
             copies = {1: w1_chunk_copy, 2: w2_chunk_copy}
             last_block = {1: hidden // rhs_qb - 1, 2: inter // rhs_qb - 1}
+            n_chunks = {1: n_w1_chunks, 2: n_w2_chunks}
 
             def before(which, block, n_start):
-                if block or n_start % chunk_of[which]:
+                # Every chunk of a slab is waited at the slab's first read. A
+                # wait is a scheduling fence in the unrolled matmul chain, and
+                # the refills (started a whole matmul earlier) have landed by
+                # then, so one fence per slab is cheaper than one per chunk.
+                if block or n_start:
                     return
-                c = n_start // chunk_of[which]
 
                 @pl.when(first_tile)
                 def _():
-                    copies[which](expert, slot, c).wait()
+                    for c in range(n_chunks[which]):
+                        copies[which](expert, slot, c).wait()
 
             def after(which, block, n_start):
                 ends_chunk = (n_start + FP4_OUTPUT_CHUNK) % chunk_of[which] == 0
@@ -2194,11 +2180,17 @@ def _build_fused_ep_moe_kernel(
         bias_tag = ("_w13bias" if has_w1_bias else "") + (
             "_w2bias" if has_w2_bias else ""
         )
+        # A scale table read expert-second-minor is named by its layout,
+        # {2,0,1}, so the two addressings are told apart in a profile.
+        scale_tag = ("_w13s201" if w1s_expert_second_minor else "") + (
+            "_w2s201" if w2s_expert_second_minor else ""
+        )
         name = (
             f"fused_ep_moe_v2"
             f"{format_tag}"
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
             f"{bias_tag}"
+            f"{scale_tag}"
             f"_g{g_local}_c{capacity}_nb{nbuf}"
         )
         return pl.pallas_call(
@@ -2570,4 +2562,149 @@ def build_combine_kernel(**kwargs):
             if fn is None:
                 fn = _build_combine_kernel(**kwargs)
                 _COMBINE_CACHE[key] = fn
+    return fn
+
+
+# The activation-scale slab, built by lookup rather than by scatter.
+#
+# The slab holds one f32 per slab row: the row scale of the token the row
+# computes. The XLA form scatters every routed pair's scale onto its slab row,
+# and every shard does that for ALL T * topk pairs, though only the ~1/ep that
+# land on it are kept; on a chip whose compiler leaves the scatter on the
+# TensorCore (TPU8i), that is the single largest piece of glue around the
+# kernel. Once the token-gather table exists, the slab is a lookup through it:
+# row r gets scale[token_gather[r]]. A shard's live rows are one contiguous
+# range, [0, sum of its experts' rows), so the lookup walks only those -- about
+# T * topk / ep rows rather than T * topk pairs -- on the scalar core, with the
+# per-token scales resident in SMEM. XLA's own gather costs more than the
+# scatter it would replace on TPU8i, which is why this is a kernel.
+SCALE_SLAB_WINDOW = 512
+# SMEM the per-token scale table may take: half of the 1 MiB SMEM of every
+# current chip, which leaves the rest to the two windows and Mosaic's scalar
+# working set. Above it the layer keeps the scatter.
+SCALE_SLAB_MAX_TABLE_BYTES = 512 * 1024
+
+
+def scale_slab_fits(n_tokens, info=None):
+    """Whether the lookup form's per-token table fits its SMEM budget.
+
+    The budget is SCALE_SLAB_MAX_TABLE_BYTES, or half of this chip's SMEM
+    where that is less, so a chip with a smaller SMEM keeps the scatter
+    rather than failing to allocate the table.
+    """
+    if info is None:
+        info = pltpu.get_tpu_info()
+    budget = min(SCALE_SLAB_MAX_TABLE_BYTES, info.smem_capacity_bytes // 2)
+    return n_tokens * 4 <= budget
+
+
+def _build_act_scale_slab(*, n_tokens, table_rows, out_rows):
+    """The lookup that fills the scale slab; see SCALE_SLAB_WINDOW above.
+
+    Operands: the live row count [1] (scalar prefetch), the token-gather table
+    [table_rows] i32, the per-token scale bits [n_tokens] i32 and a zero slab
+    [out_rows] i32 that the result aliases, so rows past the live range keep
+    the zero the scatter form leaves there. Rows inside the live range that no
+    pair landed on (the ROWBLK padding of each run) read token 0's scale where
+    the scatter leaves 0; the kernel never commits those rows.
+    """
+    W = SCALE_SLAB_WINDOW
+    if table_rows % W or out_rows % W:
+        raise ValueError(
+            f"the token-gather table ({table_rows} rows) and the slab "
+            f"({out_rows} rows) must be whole {W}-row windows"
+        )
+
+    def kernel(
+        live_ref, tg_hbm, scale_hbm, zero_hbm, out_hbm, scale_sm, tok_sm, val_sm, sem
+    ):
+        del zero_hbm  # aliased by out_hbm
+        cp = pltpu.make_async_copy(scale_hbm, scale_sm, sem)
+        cp.start()
+        cp.wait()
+        live = live_ref[0]
+
+        def window(i, carry):
+            start = pl.multiple_of(i * W, W)
+            fetch = pltpu.make_async_copy(tg_hbm.at[pl.ds(start, W)], tok_sm, sem)
+            fetch.start()
+            fetch.wait()
+            n = jnp.minimum(jnp.int32(W), live - start)
+
+            def lookup(j, c):
+                val_sm[j] = scale_sm[tok_sm[j]]
+                return c
+
+            def clear(j, c):
+                val_sm[j] = jnp.int32(0)
+                return c
+
+            lax.fori_loop(0, n, lookup, jnp.int32(0))
+            lax.fori_loop(n, W, clear, jnp.int32(0))
+            store = pltpu.make_async_copy(val_sm, out_hbm.at[pl.ds(start, W)], sem)
+            store.start()
+            store.wait()
+            return carry
+
+        lax.fori_loop(0, pl.cdiv(live, W), window, jnp.int32(0))
+
+    hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    call = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[hbm, hbm, hbm],
+            out_specs=hbm,
+            scratch_shapes=(
+                pltpu.SMEM((n_tokens,), jnp.int32),
+                pltpu.SMEM((W,), jnp.int32),
+                pltpu.SMEM((W,), jnp.int32),
+                pltpu.SemaphoreType.DMA,
+            ),
+            grid=(),
+        ),
+        out_shape=jax.ShapeDtypeStruct((out_rows,), jnp.int32),
+        # Operand 3 counts the scalar prefetch: (live, table, scales, zeros).
+        input_output_aliases={3: 0},
+        compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
+        name=f"fused_ep_moe_v2_scale_slab_t{n_tokens}",
+    )
+
+    def fn(live_rows, token_gather, scale_bits):
+        # Bounds checks are off in this kernel, so the operands are checked
+        # here: both are read as int32 words, the windows assume the table's
+        # length and the SMEM copy the scales'. A cast would hide a caller
+        # passing f32 scales rather than their bits.
+        for name, arr, rows in (
+            ("token_gather", token_gather, table_rows),
+            ("scale_bits", scale_bits, n_tokens),
+        ):
+            if arr.dtype != jnp.int32 or tuple(arr.shape) != (rows,):
+                raise ValueError(
+                    f"{name} must be int32[{rows}], got {arr.dtype}{list(arr.shape)}"
+                )
+        return call(
+            live_rows.astype(jnp.int32).reshape(1),
+            token_gather,
+            scale_bits,
+            jnp.zeros((out_rows,), jnp.int32),
+        )
+
+    return fn
+
+
+_SCALE_SLAB_CACHE = {}
+_SCALE_SLAB_CACHE_LOCK = threading.Lock()
+
+
+def build_act_scale_slab(**kwargs):
+    """Memoizing front door; see build_fused_ep_moe_kernel for why."""
+    key = tuple(sorted((k, str(v)) for k, v in kwargs.items()))
+    fn = _SCALE_SLAB_CACHE.get(key)
+    if fn is None:
+        with _SCALE_SLAB_CACHE_LOCK:
+            fn = _SCALE_SLAB_CACHE.get(key)
+            if fn is None:
+                fn = _build_act_scale_slab(**kwargs)
+                _SCALE_SLAB_CACHE[key] = fn
     return fn
