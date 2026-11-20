@@ -26,11 +26,12 @@ import numpy as np
 from jax.sharding import NamedSharding
 
 from .. import cache
+from ..cache_common import require_pool_backend
 from ..errors import MegakernelConfigError, MegakernelLayoutError
 from ..exec_spec import ExecSpec
-from ..pool.config import cache_exec
 from ..spec import ModelSpec
 from .constants import MTP_VERIFY_TOKENS
+from .layout_facts import dtype_name
 
 
 @dataclass(frozen=True)
@@ -44,25 +45,20 @@ class PoolScheduleInfo:
     slots_per_pool: int
     rec_pages_per_slot: int
 
-    def expected_pool_shape(
-        self, num_pages: int, kvh: int, hd: int, page_size: int
-    ) -> tuple[int, int, int, int, int]:
-        """Return the expected 5-D `(num_pages, 2*kvh, hd//4, 4, page_size)` shape."""
-        return (num_pages, 2 * kvh, hd // 4, 4, page_size)
-
 
 def pool_schedule_info(spec: ModelSpec) -> PoolScheduleInfo:
     """Extract `PoolScheduleInfo` from `spec.cache_backend`."""
-    pb = getattr(spec, "cache_backend", None)
-    lay = getattr(pb, "layout", None) if pb is not None else None
-    if pb is None or lay is None:
+    pb = spec.cache_backend
+    if pb is None:
         raise MegakernelLayoutError(
-            f"MegakernelDriver: ModelSpec {getattr(spec, 'name', '')!r} has no pool "
-            "backend layout"
+            f"MegakernelDriver: ModelSpec {spec.name!r} has no pool backend layout"
         )
+    lay = pb.layout
     rec, npools = pb.recurrent_slots_per_pool, pb.num_pools
     pps, spp = lay.pages_per_slot, lay.slots_per_pool
-    return PoolScheduleInfo(npools, rec, rec + 1, pps, spp, lay.rec_pages_per_slot)
+    # `att_every` counts real recurrent layers (`rec` is at least 1, for the
+    # leading `ckpt_indices` dim, also on a KV-only pool).
+    return PoolScheduleInfo(npools, rec, spp + 1, pps, spp, lay.rec_pages_per_slot)
 
 
 def check_compile_hlo_mesh(mesh: Any, compile_hlo_check: bool) -> None:
@@ -79,26 +75,13 @@ def check_compile_hlo_mesh(mesh: Any, compile_hlo_check: bool) -> None:
         )
 
 
-_KNOWN_DTYPES = (
-    *("float8_e4m3fn", "bfloat16", "float32", "float16"),
-    *("int32", "int64", "uint8", "bool"),
-)
 _Sds = jax.ShapeDtypeStruct
 _BktMap = Mapping[tuple[int, int], bool]
 
 
 def _any_dtype_to_jax(dt: Any) -> Any:
-    if isinstance(dt, np.dtype):
-        try:
-            return jnp.dtype(dt)
-        except TypeError:
-            pass
-    s = str(dt).strip()
-    for pfx in ("torch.", "jax.numpy.", "numpy."):
-        s = s.removeprefix(pfx)
-    if s in _KNOWN_DTYPES:
-        return getattr(jnp, "bool_" if s == "bool" else s)
-    raise TypeError(f"Unsupported dtype for megakernel HLO check: {dt!r}")
+    """`dt` (torch / jax / numpy / str) as a jax dtype."""
+    return jnp.dtype(dtype_name(dt))
 
 
 def build_global_avals(
@@ -165,14 +148,16 @@ def verify_pooled_step_hlo(
     if hlo_text is None:
         raise MegakernelConfigError("pooled step HLO text is unavailable")
     num_pages, page_size = int(raw_pools[0].shape[0]), int(raw_pools[0].shape[-1])
-    g, pb = spec.config, spec.cache_backend
-    kvh = int(g.nkv(ex.R)) if hasattr(g, "nkv") else 1
-    def_k = ("gather_gdn_states", "scatter_pool_states")
-    k_names = pb.kernel_names if pb is not None else def_k
-    hlo_kw = dict(kvh=kvh, hd=int(g.HD), min_pool_pages=max(16, num_pages))
-    fio = cache_exec(ex).FUSED
+    pb = require_pool_backend(spec)
+    # The fused-I/O decision `make_flat_pooled_step` made for this `ex`.
+    fio = cache.should_fuse_pool_io(spec, ex, fused_pool_io=None)
     return cache.check_pooled_step_hlo(
-        hlo_text, page_size, fused_pool_io=fio, kernel_names=k_names, **hlo_kw
+        hlo_text,
+        page_size,
+        layout=pb.layout,
+        min_pool_pages=max(16, num_pages),
+        fused_pool_io=fio,
+        kernel_names=pb.kernel_names,
     )
 
 
@@ -206,13 +191,17 @@ def verify_compiled_step_ir(
         if main_m is None:
             return False, "missing func.func @main signature in compiled MLIR"
         pool_sh = f"{num_pages}x{2 * kvh}x{hd // 4}x4x{page_size}xf8E4M3FN"
-        pool_pat = re.compile(rf"%arg\d+\s*:\s*tensor<{pool_sh}>(?:\s*(\{{[^}}]*\}}))?")
+        pool_pat = re.compile(rf"%arg\d+\s*:\s*tensor<{pool_sh}>")
         don_pat = re.compile(r"jax\.buffer_donor = true|tf\.aliasing_output\s*=\s*\d+")
-        matches = pool_pat.finditer(main_m.group(1))
-        n_don = sum(bool(don_pat.search(m.group(1) or "")) for m in matches)
+        # One chunk per argument: its attribute dict may nest braces (sharding).
+        args = re.split(r"(?=%arg\d+\s*:)", main_m.group(1))
+        n_don = sum(bool(pool_pat.match(a) and don_pat.search(a)) for a in args)
         if n_don < num_pools:
-            msg = f"(jax.buffer_donor = true) on @main in compiled IR, found {n_don}"
-            return False, f"expected >= {num_pools} donated pool arguments {msg}"
+            msg = "(jax.buffer_donor / tf.aliasing_output) on @main in compiled IR"
+            return (
+                False,
+                f"expected >= {num_pools} donated pool arguments {msg}, found {n_don}",
+            )
 
     extra_hlo = [hlo_text] if hlo_text and hlo_text.strip() else []
     for hlo_src in ([ir_text] if has_hlo else []) + extra_hlo:
@@ -372,17 +361,25 @@ def verify_sentinel_step(
     bucket_t: int,
     variant_key: tuple[int, bool, bool],
 ) -> None:
-    """Verify that a sentinel warmup step wrote finite outputs and updated pools."""
+    """Verify that a sentinel warmup step wrote finite outputs and changed the
+    bytes of every pool's sentinel KV page and recurrent slot."""
+    n_pools = len(kv_before)
+    if {len(kv_after), len(gdn_before), len(gdn_after)} != {n_pools}:
+        raise ValueError("verify_sentinel_step: pool lists differ in length")
     out_arr = np.asarray(out_b, dtype=np.float32)
     out_fin_ok = bool(np.isfinite(out_arr).all())
 
     def _nz(x: Any) -> int:
         return int(np.count_nonzero(np.asarray(x)))
 
-    for idx in range(len(kv_before)):
-        k0, k1 = np.asarray(kv_before[idx]), np.asarray(kv_after[idx])
-        g0, g1 = np.asarray(gdn_before[idx]), np.asarray(gdn_after[idx])
-        kv_ok, gdn_ok = not np.array_equal(k1, k0), not np.array_equal(g1, g0)
+    def _changed(before: Any, after: Any) -> bool:
+        # Bytes, not values: a NaN pattern left unchanged compares unequal.
+        b0, b1 = np.asarray(before), np.asarray(after)
+        return b0.shape != b1.shape or b0.tobytes() != b1.tobytes()
+
+    for idx in range(max(n_pools, 1)):
+        kv_ok = n_pools == 0 or _changed(kv_before[idx], kv_after[idx])
+        gdn_ok = n_pools == 0 or _changed(gdn_before[idx], gdn_after[idx])
         if not (kv_ok and gdn_ok and out_fin_ok):
             out_nz, out_fin = _nz(out_arr), int(np.isfinite(out_arr).sum())
             n_diag = min(4, len(kv_after))

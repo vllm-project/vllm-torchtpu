@@ -30,6 +30,7 @@ import pytest
 
 import vllm_torchtpu.megakernel.core as mk
 from tests.megakernel.core.megakernel_synth import TINY_TILES, synth_hybrid_spec
+from vllm_torchtpu.megakernel.core import cache as mk_cache
 from vllm_torchtpu.megakernel.core import model_def, planner, profile
 from vllm_torchtpu.megakernel.core import runtime as mk_rt
 from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
@@ -808,7 +809,161 @@ def test_checks_hlo_ir_warmup_and_sentinel():
 
     # pool_schedule_info raises MegakernelLayoutError when cache_backend is absent
     with pytest.raises(mk.MegakernelLayoutError, match="has no pool backend layout"):
-        pool_schedule_info(types.SimpleNamespace(cache_backend=None))
+        pool_schedule_info(types.SimpleNamespace(name="kv", cache_backend=None))
+
+
+@pytest.mark.parametrize(("slots", "att_every"), [(0, 1), (1, 2), (3, 4)])
+def test_pool_schedule_info_att_every_counts_recurrent_layers(slots, att_every):
+    """`att_every` is `slots_per_pool + 1`; a KV-only pool (`slots_per_pool=0`)
+    still has one leading `ckpt_indices` row (`recurrent_slots_per_pool=1`)."""
+    lay = mk.pool.PoolLayout(
+        num_pools=2,
+        slots_per_pool=slots,
+        hd=256,
+        kvh=1,
+        kh=2 if slots else 0,
+        vh=4 if slots else 0,
+        KD=128,
+        VD=128,
+    )
+    spec = types.SimpleNamespace(name="s", cache_backend=mk.pool.make_pool_backend(lay))
+    info = pool_schedule_info(spec)
+    assert (info.slots_per_pool, info.att_every) == (slots, att_every)
+    assert info.recurrent_slots_per_pool == max(1, slots)
+
+
+_POOL_TY = "tensor<64x2x64x4x128xf8E4M3FN>"
+_MLIR = """
+module @m {{
+  func.func public @main(
+    %arg0: tensor<8x1024xbf16> {{mhlo.sharding = "{{devices=[2,1]<=[2]}}"}},
+    %arg1: {ty} {attr1},
+    %arg2: {ty} {attr2}
+  ) -> (tensor<8x1024xbf16>, {ty}, {ty}) {{
+    %0 = stablehlo.custom_call @tpu_custom_call(%arg1, %arg2) : ({ty}, {ty}) -> {ty}
+    {extra}
+    return
+  }}
+}}
+"""
+_HLO = """HloModule m, input_output_alias={{ {aliases} }}
+ENTRY %main {{
+  %k = () custom-call(), custom_call_target="tpu_custom_call"
+  {extra}
+  ROOT %t = () tuple()
+}}
+"""
+_DONOR = "{jax.buffer_donor = true}"
+_SHARDED_ALIAS = (
+    '{{mhlo.sharding = "{{devices=[2,1,1,1,1]<=[2]}}", tf.aliasing_output = {i} : i32}}'
+)
+_SDY_ALIAS = (
+    '{{sdy.sharding = #sdy.sharding<@mesh, [{{"tp"}}, {{}}, {{}}, {{}}, {{}}]>, '
+    "tf.aliasing_output = {i} : i32}}"
+)
+
+
+def _mlir(attr: str, extra: str = "") -> str:
+    a1, a2 = (attr.format(i=i) if "{i}" in attr else attr for i in (1, 2))
+    return _MLIR.format(ty=_POOL_TY, attr1=a1, attr2=a2, extra=extra)
+
+
+def _hlo(n_alias: int, extra: str = "") -> str:
+    aliases = ", ".join(f"{{{i}}}: ({i + 1}, {{}}, may-alias)" for i in range(n_alias))
+    return _HLO.format(aliases=aliases, extra=extra)
+
+
+@pytest.mark.parametrize(
+    ("ir_text", "hlo_text", "want"),
+    [
+        (_mlir(_DONOR), None, "ok"),
+        # Sharded arguments: the attribute dict nests braces before the alias.
+        (_mlir(_SHARDED_ALIAS), None, "ok"),
+        (_mlir(_SDY_ALIAS), None, "ok"),
+        (_mlir('{mhlo.sharding = "{replicated}"}'), None, "donated pool arguments"),
+        (_hlo(2), None, "ok"),
+        (_hlo(1), None, "entries in HloModule input_output_alias"),
+        (_hlo(0).replace("input_output_alias={  }", ""), None, "missing input_output"),
+        (_mlir(_DONOR), _hlo(2), "ok"),
+        (_mlir(_DONOR), _hlo(1), "entries in HloModule input_output_alias"),
+        # Full-pool copies (MLIR and HLO forms) fail; one-page staging copies pass.
+        (
+            _mlir(_DONOR, f"%c = stablehlo.copy %arg1 : {_POOL_TY}"),
+            None,
+            "full-pool copy in compiled IR",
+        ),
+        (
+            _mlir(_DONOR, "%c = stablehlo.copy %s : tensor<1x2x64x4x128xf8E4M3FN>"),
+            None,
+            "ok",
+        ),
+        (
+            _hlo(2, "%cp = f8e4m3fn[64,2,64,4,128] copy(%p0)"),
+            None,
+            "full-pool copy in compiled HLO",
+        ),
+        (_hlo(2, "%cp = f8e4m3fn[1,2,64,4,128] copy(%p0)"), None, "ok"),
+        (
+            _mlir(_DONOR),
+            _hlo(2, "%cp = f8e4m3fn[64,2,64,4,128] copy(%p0)"),
+            "full-pool copy in compiled HLO",
+        ),
+    ],
+    ids=[
+        *("mlir_donor", "mlir_sharded_alias", "mlir_sdy_alias", "mlir_no_donor"),
+        *("hlo_alias", "hlo_short_alias", "hlo_no_alias", "mlir_hlo"),
+        *("mlir_hlo_short", "mlir_full_copy", "mlir_page_copy"),
+        *("hlo_full_copy", "hlo_page_copy", "mlir_hlo_full_copy"),
+    ],
+)
+def test_verify_compiled_step_ir_forms(ir_text, hlo_text, want):
+    """`verify_compiled_step_ir` on StableHLO MLIR (`@main` donors, sharded
+    argument attributes) and HloModule text (`input_output_alias`), and its
+    full-pool copy rejection in both forms."""
+    ok, msg = verify_compiled_step_ir(
+        ir_text,
+        num_pages=64,
+        page_size=128,
+        kvh=1,
+        hd=256,
+        num_pools=2,
+        hlo_text=hlo_text,
+    )
+    if want == "ok":
+        assert (ok, msg) == (True, "ok")
+    else:
+        assert not ok and want in msg, msg
+
+
+def test_verify_sentinel_step_pass_and_failures():
+    """`verify_sentinel_step` passes when every pool's KV page and recurrent
+    slot changed and the output is finite; it compares bytes, so an unchanged
+    NaN pattern counts as unchanged."""
+    kv0 = [np.zeros((4,), np.uint8), np.zeros((4,), np.uint8)]
+    kv1 = [np.ones((4,), np.uint8), np.full((4,), 2, np.uint8)]
+    out = np.ones((2, 8), np.float32)
+    kw: dict[str, Any] = dict(
+        tokens_per_seq=1, bucket_t=2, variant_key=(1, False, False)
+    )
+    verify_sentinel_step(out, kv0, kv1, kv0, kv1, **kw)
+    with pytest.raises(RuntimeError, match=r"pool\[1\].*kv_ok=False, gdn_ok=True"):
+        verify_sentinel_step(out, kv0, [kv1[0], kv0[1]], kv0, kv1, **kw)
+    with pytest.raises(RuntimeError, match=r"kv_ok=True, gdn_ok=False"):
+        verify_sentinel_step(out, kv0, kv1, kv0, kv0, **kw)
+    bad_out = out.copy()
+    bad_out[0, 0] = np.inf
+    with pytest.raises(RuntimeError, match=r"out_fin=15"):
+        verify_sentinel_step(bad_out, kv0, kv1, kv0, kv1, **kw)
+    # Non-finite output fails even with no pools to compare.
+    with pytest.raises(RuntimeError, match=r"out_fin=15"):
+        verify_sentinel_step(bad_out, [], [], [], [], **kw)
+    nan_pool = [np.full((4,), np.nan, np.float32)] * 2
+    with pytest.raises(RuntimeError, match=r"kv_ok=False"):
+        verify_sentinel_step(
+            out, nan_pool, [p.copy() for p in nan_pool], kv0, kv1, **kw
+        )
+    with pytest.raises(ValueError, match="differ in length"):
+        verify_sentinel_step(out, kv0, kv1[:1], kv0, kv1, **kw)
 
 
 def _random_hf_from_model_def(
@@ -876,7 +1031,7 @@ def _random_hf_from_model_def(
 
 
 def test_second_framework_plain_jax_adapter_on_synthetic_model_def(
-    isolated_model_registry,
+    isolated_model_registry, monkeypatch
 ):
     """Plain-JAX second framework adapter on a non-Qwen `Every(n=2)` `ModelDef`."""
     synth_hf_cfg = {
@@ -1046,9 +1201,8 @@ def test_second_framework_plain_jax_adapter_on_synthetic_model_def(
         SynthJaxRt, ex_b2, mk.MappingWeightSource(w_l), g=g, tp_rank=0
     )
 
-    pool_shape = pinfo.expected_pool_shape(
-        num_pages, max(1, g.NKV // ex_b2.R), g.HD, page_size
-    )
+    assert ms.cache_backend is not None
+    pool_shape = (num_pages, *ms.cache_backend.layout.kv_page_shape)
     assert pool_shape == (num_pages, 2, g.HD // 4, 4, page_size)
     tp_sharding = jax.sharding.NamedSharding(
         mesh, jax.sharding.PartitionSpec("tp", None, None, None, None)
@@ -1074,6 +1228,27 @@ def test_second_framework_plain_jax_adapter_on_synthetic_model_def(
         ckpt_cols=2,
     )
     assert ok_hlo, msg_hlo
+    # `paged_kv=False, fused_pool_io=True`: `make_flat_pooled_step` builds the
+    # fused paged step (no `scatter_pool_states`), and the HLO check follows
+    # that same decision (on CPU interpret either check passes, so record it).
+    real_check, fio_seen = mk_cache.check_pooled_step_hlo, []
+
+    def _check(*args: Any, **kw: Any) -> tuple[bool, str]:
+        fio_seen.append(kw["fused_pool_io"])
+        return real_check(*args, **kw)
+
+    monkeypatch.setattr(mk_cache, "check_pooled_step_hlo", _check)
+    ok_fused, msg_fused = verify_pooled_step_hlo(
+        mesh,
+        ms,
+        with_cache(ex_b2, paged_kv=False, fused_pool_io=True),
+        w_rank0["w_flat"],
+        raw_pools_rank0,
+        max_pages_per_seq=max_pages_per_seq,
+        ckpt_cols=2,
+    )
+    assert ok_fused, msg_fused
+    assert fio_seen == [True]
 
     # 3. Warmup plan + sentinel check via `make_pooled_step` + `pack_step_meta`
     warmup_steps, warmed_bkts, n_save = build_warmup_plan(

@@ -470,9 +470,7 @@ class Qwen35Program:
         num_pages = pools[0].shape[0]
         page_size = pools[0].shape[-1]
         kvh_expected = max(1, self.geom.NKV // self.base_exec.R)
-        expected_shape = pinfo.expected_pool_shape(
-            num_pages, kvh_expected, self.geom.HD, page_size
-        )
+        expected_shape = (num_pages, 2 * kvh_expected, self.geom.HD // 4, 4, page_size)
         for r, pool in enumerate(pools):
             _need_layout(
                 isinstance(pool, torch.Tensor) and pool.dtype == torch.float8_e4m3fn,
