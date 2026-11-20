@@ -29,7 +29,9 @@ buffer coordinates from the same metadata, so IndexShare layers read them
 unchanged.
 
 The choice is static per compiled bucket; a step the gather buffer cannot
-hold raises in the runner (`check_step_capacity`) instead of running.
+hold raises in the runner (`check_step_capacity`) instead of running. Under
+prefix caching the scheduler keeps every step inside the buffer
+(`core/token_parallel_page_budget.py`).
 """
 
 import functools
@@ -146,11 +148,6 @@ def check_config(vllm_config: Any, *, q_replicate: bool) -> None:
         raise NotImplementedError(
             "TPU_DCP_PREFILL_TOKEN_PARALLEL returns merged latent outputs; it "
             "does not take TPU_DCP_MLA_UV_BEFORE_MERGE / _OPROJ_ALL_REDUCE."
-        )
-    if vllm_config.cache_config.enable_prefix_caching:
-        raise NotImplementedError(
-            "TPU_DCP_PREFILL_TOKEN_PARALLEL does not take prefix caching: the "
-            "gather buffer is sized for the scheduled rows (check_step_capacity)."
         )
     if vllm_config.scheduler_config.max_num_seqs > MIN_TOKENS // 2:
         raise NotImplementedError(

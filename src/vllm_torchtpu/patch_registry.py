@@ -92,6 +92,11 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
     Patch(
+        "vllm_torchtpu.core.token_parallel_page_budget:"
+        "install_token_parallel_page_budget",
+        _ENGINE,
+    ),
+    Patch(
         "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
         _ENGINE,
     ),
