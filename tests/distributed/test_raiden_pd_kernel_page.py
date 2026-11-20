@@ -131,7 +131,8 @@ def _engine(
         if section is not None:
             config.additional_config["tpu_kv_transfer"] = section
         if arch == QWEN35:
-            # No device here: the KV budget default stays off.
+            # No TPU7x here: the defaults measured there stay off; the kernel
+            # page does not depend on the chip.
             monkeypatch.setattr(qwen3_5_hooks, "_chip_family", lambda: None)
             qwen3_5_hooks.apply_serving_defaults(config)
         with set_current_vllm_config(config):
