@@ -1151,6 +1151,41 @@ def _int_metas():
     }
 
 
+def _trace_int_metas(specialize_hidden):
+    """One trace's inputs, with a ShapeEnv of its own as each Dynamo trace
+    has; with ``specialize_hidden`` the trace pinned the hidden size to 4,
+    so its graph does not take it."""
+    env = ShapeEnv()
+    metas = {
+        "s_pos": _token_symint(env, POSITIONS_SIZE),
+        "s_hid": _token_symint(env, HIDDEN_SIZE),
+        "hidden": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+    }
+    if specialize_hidden:
+        assert metas["s_hid"] == 4  # a guard that replaces the symbol by 4
+    return metas
+
+
+def test_input_delta_reads_an_int_inputs_sources_off_its_symbol():
+    """The graphs vLLM compiles carry no GraphArg, so the refusal finds an int
+    input's sources on its symbol, in its own trace's ShapeEnv, and names
+    what the other trace's ShapeEnv concluded about the same source."""
+    stored = _int_graph(["s_pos", "s_hid", "hidden", "weight"], _trace_int_metas(False))
+    current = _int_graph(["s_pos", "hidden", "weight"], _trace_int_metas(True))
+    session = shape_variants.BucketExecutables()
+    session.put("dir", "key", stored, lambda *a: a)
+
+    with pytest.raises(shape_variants.ShapeSpecializationError) as info:
+        session.get("dir", "key", current)
+
+    named = str(info.value).split("Named, earlier trace: ")[1]
+    assert named.startswith("s_hid SymInt")
+    assert "from L['hidden'].size()[0]" in named
+    # The current trace's ShapeEnv pinned the symbol that reads that source.
+    assert "= 4 in this trace" in named
+
+
 def test_input_delta_names_the_earlier_trace_for_an_input_only_this_one_takes():
     metas = _int_metas()
     sources = {"s_pos": POSITIONS_SIZE, "s_hid": HIDDEN_SIZE}

@@ -292,21 +292,37 @@ def _input_source(graph_input: _Input) -> str | None:
     when the graph records it, else None: always for a split subgraph's
     intermediate, and for every input of the graphs vLLM compiles, whose
     GraphArgs Dynamo has deleted (an int input's symbol still names its
-    sources, see _symbol_sources)."""
+    sources, see _symbol_source_names)."""
     source = graph_input.source
     return None if source is None else source.name
 
 
-def _symbol_sources(value: Any) -> str | None:
-    """The guard sources of a SymInt's symbol, from its trace's ShapeEnv."""
+def _symbol_source_names(value: Any) -> list[str]:
+    """Where a SymInt's symbol was read from (``L['positions'].size()[0]``),
+    one name per source, from its own trace's ShapeEnv, which keeps them
+    after Dynamo has deleted the graph's GraphArgs. Empty for anything else."""
     if not isinstance(value, torch.SymInt):
-        return None
+        return []
     try:
         expr = value.node.expr
         sources = value.node.shape_env.var_to_sources.get(expr)
     except AttributeError:
-        return None
-    return ", ".join(s.name for s in sources) if sources else None
+        return []
+    return [s.name for s in sources or ()]
+
+
+def _symbol_sources(value: Any) -> str | None:
+    """The guard sources of a SymInt's symbol, from its trace's ShapeEnv."""
+    return ", ".join(_symbol_source_names(value)) or None
+
+
+def _int_input_sources(graph_input: _Input) -> list[str]:
+    """Where an int input was read from: its GraphArg's source when the graph
+    still records one, else its symbol's sources."""
+    source = _input_source(graph_input)
+    if source is not None:
+        return [source]
+    return _symbol_source_names(graph_input.value)
 
 
 def _describe_input(graph_input: _Input) -> str:
@@ -321,12 +337,13 @@ def _describe_input(graph_input: _Input) -> str:
 
 
 def _symbol_fate(
-    inputs: Sequence[_Input], source: str | None, trace: str
+    inputs: Sequence[_Input], sources: Sequence[str], trace: str
 ) -> str | None:
     """What the ShapeEnv of the trace ``inputs`` came from concluded about the
-    symbol read from ``source``: its replacement when it was specialized, else
-    its value range. ``trace`` names that trace in the text."""
-    if source is None:
+    symbol read from any of ``sources``: its replacement when it was
+    specialized, else its value range. ``trace`` names that trace in the
+    text."""
+    if not sources:
         return None
     shape_env = None
     for graph_input in inputs:
@@ -339,14 +356,14 @@ def _symbol_fate(
             break
     if shape_env is None:
         return None
-    for symbol, sources in shape_env.var_to_sources.items():
-        if any(s.name == source for s in sources):
+    for symbol, symbol_sources in shape_env.var_to_sources.items():
+        if any(s.name in sources for s in symbol_sources):
             replacement = shape_env.replacements.get(symbol)
             if replacement is not None:
                 return f"{symbol} = {replacement} in {trace}"
             value_range = shape_env.var_to_range.get(symbol)
             return f"{symbol} in {value_range} in {trace}"
-    return f"no symbol of {trace} reads {source}"
+    return f"no symbol of {trace} reads {', '.join(sources)}"
 
 
 def _signature_delta(stored: Sequence[Any], current: Sequence[Any]) -> str:
@@ -391,7 +408,7 @@ def _input_delta(stored: Sequence[_Input], current: Sequence[_Input]) -> str:
         for graph_input in inputs[:_NAMED_INPUTS_SHOWN]:
             text = _describe_input(graph_input)
             if _is_int_input(graph_input.value):
-                fate = _symbol_fate(other, _input_source(graph_input), other_trace)
+                fate = _symbol_fate(other, _int_input_sources(graph_input), other_trace)
                 if fate:
                     text += f" ({fate})"
             shown.append(text)
