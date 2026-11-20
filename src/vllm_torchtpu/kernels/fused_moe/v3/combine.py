@@ -49,6 +49,24 @@ def _stage_dtype(dtype, lane_blocks):
     return dtype if lane_blocks % _stage_align(dtype) == 0 else jnp.float32
 
 
+def _weighted_sum_vmem_bytes(
+    *, tokens_per_tile, top_k, lane_blocks, hidden, rows_dtype, out_dtype, stage_dtype
+):
+    """VMEM of one weighted-sum step: the double-buffered rows and output
+    blocks and the staging tile, each as VMEM holds it (its two minor
+    dimensions padded to the chip's tiling: fp8 rows of a few lane blocks
+    take a whole 32-sublane tile)."""
+    info = pltpu.get_tpu_info()
+    rows = (tokens_per_tile, top_k, lane_blocks, LANES)
+    return (
+        2 * device.array_vmem_bytes(rows, rows_dtype, info)
+        + 2 * device.array_vmem_bytes((tokens_per_tile, hidden), out_dtype, info)
+        + device.array_vmem_bytes(
+            (tokens_per_tile * lane_blocks, LANES), stage_dtype, info
+        )
+    )
+
+
 def _weighted_sum_body(
     *refs, tokens_per_tile, top_k, lane_blocks, hidden, unroll, with_scales, dtype
 ):
@@ -162,15 +180,16 @@ def weighted_sum(
             f"{lane_blocks} lane blocks per row: the staging tile "
             f"is stored {SUBLANES} sublanes at a time"
         )
-    staged = lane_blocks * lanes
     stage_dtype = _stage_dtype(dtype, lane_blocks)
-    # The double-buffered input and output blocks and the staging tile,
-    # with headroom, never over the chip's budget.
-    itemsize = jnp.dtype(out_dtype).itemsize
-    needed = (
-        2 * top_k * tokens_per_tile * staged * jnp.dtype(rows.dtype).itemsize
-        + 2 * tokens_per_tile * hidden * itemsize
-        + tokens_per_tile * staged * jnp.dtype(stage_dtype).itemsize
+    # The step's blocks with headroom, never over the chip's budget.
+    needed = _weighted_sum_vmem_bytes(
+        tokens_per_tile=tokens_per_tile,
+        top_k=top_k,
+        lane_blocks=lane_blocks,
+        hidden=hidden,
+        rows_dtype=rows.dtype,
+        out_dtype=out_dtype,
+        stage_dtype=stage_dtype,
     )
     vmem_limit = min(2 * needed, device.vmem_limit())
     table = pl.BlockSpec((tokens_per_tile, top_k), lambda i: (i, 0))
