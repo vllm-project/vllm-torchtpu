@@ -103,6 +103,16 @@ def test_flush_all_writes_incomplete_parameters():
     assert torch.equal(w13.data[0], torch.full((8, 4), 5.0))
 
 
+def test_flush_all_drops_the_buffers_flushes_left_behind():
+    stager = ExpertParamStager()
+    w2 = _param(1, 8, 4)
+    stager.host_param(w2)
+    assert stager.written(w2, 0, "w2")
+    assert stager._pool
+    stager.flush_all()
+    assert not stager._pool
+
+
 def test_flush_uploads_in_chunks(monkeypatch):
     from vllm_torchtpu import model_loader_patches
 
