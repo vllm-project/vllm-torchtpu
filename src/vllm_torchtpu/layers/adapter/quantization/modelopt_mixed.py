@@ -41,10 +41,7 @@ from vllm.model_executor.layers.quantization import (
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.modelopt import (
-    ModelOptFp8Config,
     ModelOptMixedPrecisionConfig,
-    ModelOptMxFp8Config,
-    ModelOptNvFp4Config,
 )
 
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
@@ -85,8 +82,6 @@ _FALLBACK_FUSED_SHARDS: dict[str, tuple[str, ...]] = {
     "gate_up_proj": ("gate_proj", "up_proj"),
 }
 
-_EXPERT_PROJ_NAMES = frozenset({"gate_proj", "up_proj", "down_proj", "w1", "w2", "w3"})
-
 _NVFP4_ALGOS = ("NVFP4", "W4A16_NVFP4")
 # ModelOpt's NVFP4 block size when a layer entry omits group_size.
 _NVFP4_DEFAULT_GROUP_SIZE = 16
@@ -110,6 +105,13 @@ def _normalize_layer_spec(
     return LayerSpec(algo, group_size)
 
 
+def _summarize_names(names: Sequence[str], limit: int = 3) -> str:
+    shown = ", ".join(names[:limit])
+    if len(names) > limit:
+        shown += f" and {len(names) - limit} more"
+    return shown
+
+
 # vLLM enables weight_loader_v2 for a method only if its class name is
 # registered. Without it, fused layers would not load their per-shard scales.
 @register_weight_loader_v2_supported_method
@@ -131,25 +133,11 @@ class _ModelOptFp8LinearMethodTPU(VllmFp8LinearMethodTPU):
 class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
     """ModelOpt MIXED_PRECISION config for TPU."""
 
-    def __init__(
-        self,
-        kv_cache_quant_method: str | None,
-        exclude_modules: list[str],
-        quantized_layers: dict[str, dict[str, Any]],
-        fp8_config: ModelOptFp8Config,
-        nvfp4_config: ModelOptNvFp4Config,
-        w4a16_nvfp4_config: ModelOptNvFp4Config,
-        mxfp8_config: ModelOptMxFp8Config,
-    ) -> None:
-        super().__init__(
-            kv_cache_quant_method=kv_cache_quant_method,
-            exclude_modules=exclude_modules,
-            quantized_layers=quantized_layers,
-            fp8_config=fp8_config,
-            nvfp4_config=nvfp4_config,
-            w4a16_nvfp4_config=w4a16_nvfp4_config,
-            mxfp8_config=mxfp8_config,
-        )
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Upstream's _from_config also passes GPU sub-configs that TPU does not
+        # use. Forwarding every argument keeps this class compatible when
+        # upstream adds another one.
+        super().__init__(*args, **kwargs)
         # ModelOpt FP8 linears store a per-tensor weight scale and a static
         # input scale. The "static" activation scheme makes the method register
         # an input_scale parameter for that tensor to load into.
@@ -162,7 +150,6 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
         # config per group_size.
         self._tpu_nvfp4_configs: dict[int, VllmNvfp4Config] = {}
         self._nvfp4_default_group_size = _NVFP4_DEFAULT_GROUP_SIZE
-        self._child_specs, self._expert_proj_specs = self._build_spec_index()
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -175,7 +162,7 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
         # that check, so it is repeated here. A config with a nested
         # "quantization" section and no "quant_method" key came from that file.
         if "quantization" in config and "quant_method" not in config:
-            producer = config.get("producer", {}).get("name")
+            producer = (config.get("producer") or {}).get("name")
             if producer != "modelopt":
                 raise ValueError(
                     "ModelOpt MIXED_PRECISION expects hf_quant_config.json "
@@ -210,36 +197,11 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
         # without its own group_size must use the top-level value or 16.
         if group_size is not None:
             cfg._nvfp4_default_group_size = group_size
-            cfg._child_specs, cfg._expert_proj_specs = cfg._build_spec_index()
         return cfg
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
         super().apply_vllm_mapper(hf_to_vllm_mapper)
-        # The mapper renames the quantized_layers keys the index is built from.
-        self._child_specs, self._expert_proj_specs = self._build_spec_index()
         map_online_fp8(self, hf_to_vllm_mapper)
-
-    def _build_spec_index(
-        self,
-    ) -> tuple[dict[str, set[LayerSpec]], dict[str, set[LayerSpec]]]:
-        """Index the quantized_layers specs by ancestor module prefix.
-
-        Returns two maps from module prefix to specs. The first holds every
-        entry under the module. The second holds only the expert projections
-        directly under the module, so ``...mlp.gate_proj`` is indexed under
-        ``...mlp``.
-        """
-        child_specs: dict[str, set[LayerSpec]] = {}
-        expert_proj_specs: dict[str, set[LayerSpec]] = {}
-        for key, info in self.quantized_layers.items():
-            spec = _normalize_layer_spec(info, self._nvfp4_default_group_size)
-            parts = key.split(".")
-            for i in range(1, len(parts)):
-                parent = ".".join(parts[:i])
-                child_specs.setdefault(parent, set()).add(spec)
-                if parts[i] in _EXPERT_PROJ_NAMES:
-                    expert_proj_specs.setdefault(parent, set()).add(spec)
-        return child_specs, expert_proj_specs
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -259,92 +221,119 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
             self._tpu_nvfp4_configs[group_size] = cfg
         return cfg
 
-    def _resolve_fused_shards(
+    def _spec(self, key: str) -> LayerSpec:
+        entry = self.quantized_layers.get(key)
+        if entry is None:
+            return _UNQUANTIZED
+        return _normalize_layer_spec(entry, self._nvfp4_default_group_size)
+
+    def _resolve_shards(
         self, prefix: str, base_candidates: Sequence[str], shard_names: Sequence[str]
-    ) -> tuple[bool, LayerSpec]:
+    ) -> LayerSpec | None:
+        """Return the one spec shared by a layer's checkpoint shards.
+
+        A shard missing from quantized_layers is unquantized, so a layer with
+        only some shards listed raises. Returns None if no shard is listed
+        under any of ``base_candidates``.
+        """
         for base_candidate in base_candidates:
-            shard_prefixes = [f"{base_candidate}.{s}" for s in shard_names]
-            if not any(sp in self.quantized_layers for sp in shard_prefixes):
+            keys = [f"{base_candidate}.{s}" for s in shard_names]
+            if not any(k in self.quantized_layers for k in keys):
                 continue
-            specs = [
-                _normalize_layer_spec(
-                    self.quantized_layers[sp], self._nvfp4_default_group_size
+            shards_by_spec: dict[LayerSpec, list[str]] = {}
+            for shard_name, key in zip(shard_names, keys):
+                shards_by_spec.setdefault(self._spec(key), []).append(shard_name)
+            if len(shards_by_spec) > 1:
+                detail = "; ".join(
+                    f"{spec}: {_summarize_names(names)}"
+                    for spec, names in shards_by_spec.items()
                 )
-                if sp in self.quantized_layers
-                else _UNQUANTIZED
-                for sp in shard_prefixes
-            ]
-            unique_specs = set(specs)
-            if len(unique_specs) > 1:
-                detail = dict(zip(shard_names, specs))
                 raise ValueError(
-                    f"Inconsistent quantization across shards of fused layer "
+                    f"Inconsistent quantization across the checkpoint shards of "
                     f"{prefix!r}: {detail}. All shards must share the same "
                     "quant_algo and group_size."
                 )
-            return True, specs[0]
-        return False, _UNQUANTIZED
+            return next(iter(shards_by_spec))
+        return None
 
     def _resolve_layer_quant_spec(self, prefix: str) -> LayerSpec:
         for candidate in self._quantized_layer_prefix_candidates(prefix):
             if candidate in self.quantized_layers:
-                return _normalize_layer_spec(
-                    self.quantized_layers[candidate], self._nvfp4_default_group_size
-                )
+                return self._spec(candidate)
+        if "." not in prefix:
+            return _UNQUANTIZED
 
         # quantized_layers keys a fused layer by its checkpoint shard names.
-        if "." in prefix:
-            base, proj_name = prefix.rsplit(".", 1)
-            base_candidates = self._quantized_layer_prefix_candidates(base)
-            if self.packed_modules_mapping and proj_name in self.packed_modules_mapping:
-                matched, spec = self._resolve_fused_shards(
-                    prefix, base_candidates, self.packed_modules_mapping[proj_name]
-                )
-                if matched:
+        # The standard qkv_proj and gate_up_proj shard names cover models whose
+        # packed_modules_mapping is empty or does not list the layer.
+        base, proj_name = prefix.rsplit(".", 1)
+        base_candidates = self._quantized_layer_prefix_candidates(base)
+        for shard_names in (
+            (self.packed_modules_mapping or {}).get(proj_name),
+            _FALLBACK_FUSED_SHARDS.get(proj_name),
+        ):
+            if shard_names:
+                spec = self._resolve_shards(prefix, base_candidates, shard_names)
+                if spec is not None:
                     return spec
-        else:
-            proj_name = prefix
+        return _UNQUANTIZED
 
-        # A module without its own entry, such as RoutedExperts, takes the one
-        # spec shared by all entries under it.
-        child_specs: set[LayerSpec] = set()
-        for candidate in self._quantized_layer_prefix_candidates(prefix):
-            child_specs |= self._child_specs.get(candidate, set())
-        if len(child_specs) > 1:
-            raise ValueError(
-                f"Mixed quantization specs under module {prefix!r}: {child_specs}."
+    def _resolve_experts_quant_spec(
+        self, layer: RoutedExperts, prefix: str
+    ) -> LayerSpec:
+        """Return the one spec shared by every expert weight of ``layer``.
+
+        Checkpoints key routed experts in one of three ways: one entry for the
+        RoutedExperts module, one entry per expert and projection
+        (``...experts.{e}.gate_proj``), or one entry per projection directly
+        under the MoE block (``...mlp.gate_proj``). In the last two layouts, a
+        missing projection or expert is unquantized, so partial coverage
+        raises instead of quantizing the missing weights.
+        """
+        candidates = self._quantized_layer_prefix_candidates(prefix)
+        for candidate in candidates:
+            if candidate in self.quantized_layers:
+                return self._spec(candidate)
+
+        proj_names = [
+            name
+            for name in (
+                layer.ckpt_gate_proj_name,
+                layer.ckpt_up_proj_name,
+                layer.ckpt_down_proj_name,
             )
-        if len(child_specs) == 1:
-            return next(iter(child_specs))
+            if name is not None
+        ]
+        num_experts = layer.moe_config.num_logical_experts
+        per_expert = [f"{e}.{p}" for e in range(num_experts) for p in proj_names]
+        spec = self._resolve_shards(prefix, candidates, per_expert)
+        if spec is not None:
+            return spec
 
-        # Some checkpoints list expert projections directly under the MoE
-        # block, such as "...moe.gate_proj". vLLM names the RoutedExperts
-        # module "...moe.experts", so its specs come from the parent block.
+        # vLLM names the module "...mlp.experts" while these checkpoints list
+        # the projections under "...mlp".
         if prefix.endswith(".experts"):
-            for candidate in self._quantized_layer_prefix_candidates(prefix):
-                parent = candidate.rsplit(".experts", 1)[0]
-                sibling_specs = self._expert_proj_specs.get(parent, set())
-                if len(sibling_specs) > 1:
-                    raise ValueError(
-                        f"Mixed quantization specs for experts {prefix!r}: "
-                        f"{sibling_specs}."
-                    )
-                if len(sibling_specs) == 1:
-                    return next(iter(sibling_specs))
-
-        # This covers qkv_proj and gate_up_proj when packed_modules_mapping is
-        # empty or does not list them.
-        fallback_shards = _FALLBACK_FUSED_SHARDS.get(proj_name)
-        if fallback_shards is not None and "." in prefix:
-            base = prefix.rsplit(".", 1)[0]
-            matched, spec = self._resolve_fused_shards(
-                prefix,
-                self._quantized_layer_prefix_candidates(base),
-                fallback_shards,
+            parent = prefix.removesuffix(".experts")
+            spec = self._resolve_shards(
+                prefix, self._quantized_layer_prefix_candidates(parent), proj_names
             )
-            if matched:
+            if spec is not None:
                 return spec
 
+        # Entries under the module that match none of the layouts above would
+        # otherwise be ignored and the experts loaded unquantized.
+        unmatched = [
+            key
+            for key in self.quantized_layers
+            for candidate in candidates
+            if key.startswith(f"{candidate}.")
+        ]
+        if unmatched:
+            raise ValueError(
+                f"quantized_layers has entries under {prefix!r} that do not "
+                f"match its expert projections {proj_names} for "
+                f"{num_experts} experts: {_summarize_names(unmatched)}."
+            )
         return _UNQUANTIZED
 
     def _get_checkpoint_quant_method(
@@ -355,7 +344,10 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
             return None
         if self.is_layer_excluded(prefix):
             return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
-        spec = self._resolve_layer_quant_spec(prefix)
+        if isinstance(layer, RoutedExperts):
+            spec = self._resolve_experts_quant_spec(layer, prefix)
+        else:
+            spec = self._resolve_layer_quant_spec(prefix)
         if spec.quant_algo is None:
             return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
 
