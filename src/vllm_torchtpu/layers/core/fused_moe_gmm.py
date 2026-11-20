@@ -911,6 +911,9 @@ def moe_gmm(
     return _add_shared_down(token_topk_hidden.sum(axis=1).astype(x.dtype), shared_down)
 
 
+# Mixed / prefill-sized steps only: decode and drafter buckets (<= 512 rows)
+# keep one combine call, and every piece keeps >= 2048 tokens (with 2 pieces)
+# like the SP pieces it feeds (TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS).
 _COMBINE_PIECES_MIN_TOKENS = 4096
 
 

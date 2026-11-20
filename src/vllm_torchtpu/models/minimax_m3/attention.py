@@ -244,6 +244,15 @@ def norm_rope_heads(
     return op(qkv, cos_sin, weight)
 
 
+def _step_rows(pieces: list[torch.Tensor]) -> torch.Tensor:
+    """Rows of the all-gathered pieces (piece i: every rank's i-th row block
+    of its shard) back in step order."""
+    tp = get_tensor_model_parallel_world_size()
+    x = torch.stack(pieces)
+    n, rows = x.shape[:2]
+    return x.view(n, tp, rows // tp, -1).transpose(0, 1).reshape(n * rows, -1)
+
+
 class MiniMaxM3SparseAttention(nn.Module):
     """GQA attention over the KV blocks the lightning indexer selects.
 
@@ -417,24 +426,34 @@ class MiniMaxM3SparseAttention(nn.Module):
         k_gain = (1.0 + self.k_norm.weight.float()).abs().max().item()
         return self.head_dim**0.5 * q_gain * k_gain * self.key_rounding
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        project: bool = True,
+    def _qkv(
+        self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     ) -> torch.Tensor:
-        """``hidden_states`` may come as e4m3 rows with per-row f32 scales
-        (an SP step's e4m3 all-gather), which qkv_proj contracts as e4m3.
-        ``project=False`` returns this rank's heads before o_proj."""
         e4m3_apply = getattr(self.qkv_proj.quant_method, "apply_e4m3_rows", None)
         if isinstance(hidden_states, tuple) and e4m3_apply is None:
             q8, row_scale = hidden_states
             hidden_states = (q8.float() * row_scale).to(torch.bfloat16)
         if isinstance(hidden_states, tuple):
             # qkv_proj is bias-free and keeps the linear's forward = apply.
-            qkv = e4m3_apply(self.qkv_proj, *hidden_states)
+            return e4m3_apply(self.qkv_proj, *hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)
+        return qkv
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list,
+        project: bool = True,
+    ) -> torch.Tensor:
+        """``hidden_states`` may come as e4m3 rows with per-row f32 scales
+        (an SP step's e4m3 all-gather), which qkv_proj contracts as e4m3, or
+        as a list of such all-gathered row pieces (model.py `_ffn_pieces`).
+        ``project=False`` returns this rank's heads before o_proj."""
+        if isinstance(hidden_states, list):
+            # An SP step's gathered row pieces: project each as it lands.
+            qkv = _step_rows([self._qkv(p) for p in hidden_states])
         else:
-            qkv, _ = self.qkv_proj(hidden_states)
+            qkv = self._qkv(hidden_states)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
             positions,

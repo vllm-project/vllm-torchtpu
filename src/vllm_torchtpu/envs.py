@@ -82,6 +82,11 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_E4M3_QKV: bool = False
     TPU_MINIMAX_M3_SP_A2A_OPROJ: str = "off"
     TPU_MINIMAX_M3_SP_A2A_E4M3: bool = False
+    TPU_MINIMAX_M3_SP_FFN_PIECES: int = 1
+    TPU_MOE_TC_COMBINE_PIECES: int = 1
+    TPU_MINIMAX_M3_SP_ATTN_PIECES: bool = False
+    TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES: bool = True
+    TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS: int = 4096
     TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = True
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS: int = 0
@@ -793,6 +798,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-to-all as e4m3 rows with power-of-two row scales, and o_proj
     # contracts e4m3 x e4m3 (a change to o_proj's input precision).
     "TPU_MINIMAX_M3_SP_A2A_E4M3": env_bool("TPU_MINIMAX_M3_SP_A2A_E4M3", default=False),
+    # "full" SP steps of at least TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS
+    # tokens norm and all-gather each layer's FFN input per row piece of the
+    # token shard (the FFN's entry work starts on a piece as it lands), run
+    # the FFN once on the pieces' rows, and reduce-scatter its output per
+    # piece. 1 = one piece (off).
+    "TPU_MINIMAX_M3_SP_FFN_PIECES": env_nonnegative_int(
+        "TPU_MINIMAX_M3_SP_FFN_PIECES", 1
+    ),
+    "TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS", 4096
+    ),
+    # TPU_MOE_TC_COMBINE on steps of at least 4096 tokens: combine the tokens
+    # in this many consecutive row pieces (one kernel call each), so a
+    # consumer of the first piece (an SP piece's reduce-scatter) can start
+    # while the next is combined. 1 = one call.
+    "TPU_MOE_TC_COMBINE_PIECES": env_nonnegative_int("TPU_MOE_TC_COMBINE_PIECES", 1),
+    # With TPU_MINIMAX_M3_SP_FFN_PIECES: the attention input is gathered in the
+    # same row pieces and qkv_proj runs on each piece as it lands; o_proj's
+    # all-to-all (TPU_MINIMAX_M3_SP_A2A_OPROJ) and projection run per piece.
+    "TPU_MINIMAX_M3_SP_ATTN_PIECES": env_bool(
+        "TPU_MINIMAX_M3_SP_ATTN_PIECES", default=False
+    ),
+    # With TPU_MINIMAX_M3_SP_FFN_PIECES: also gather the FFN input in pieces
+    # (off: only the attention side, qkv_proj and o_proj, runs per piece).
+    "TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES": env_bool(
+        "TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES", default=True
+    ),
     # MoE steps (EP or TP-MoE) of up to this many tokens with fp4 (NVFP4)
     # experts run the permutation-free dense-expert kernel (kernels/experimental/
     # moe_dense_expert_fp4.py) instead of sort + grouped GEMM + combine.

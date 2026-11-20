@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import torch
 
-_padding_state: "TokenPaddingState | None" = None
+_padding_state: "TokenPaddingState | _RowSubsetPadding | None" = None
 
 
 @dataclass
@@ -46,6 +48,39 @@ class TokenPaddingState:
 def set_padding_state(state: "TokenPaddingState | None") -> None:
     global _padding_state
     _padding_state = state
+
+
+class _RowSubsetPadding:
+    """A TokenPaddingState's mask seen through a row selection, read lazily so
+    a forward that never reads the mask does not trace it. Its mask has the
+    subset's rows only, not the base state's allocated length."""
+
+    def __init__(
+        self, base: TokenPaddingState, select: Callable[[torch.Tensor], torch.Tensor]
+    ) -> None:
+        self._base, self._select = base, select
+
+    @property
+    def local_padding_mask(self) -> torch.Tensor:
+        return self._select(self._base.local_padding_mask)
+
+    def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
+        return self.local_padding_mask[:num_tokens]
+
+
+@contextlib.contextmanager
+def padding_of_rows(select: Callable[[torch.Tensor], torch.Tensor]) -> Iterator[None]:
+    """Inside, a forward over a row subset of the step sees those rows'
+    padding: ``select`` maps the step's per-row mask to the subset's, in the
+    subset's row order (traced, so it may index the device mask)."""
+    global _padding_state
+    saved = _padding_state
+    if saved is not None:
+        _padding_state = _RowSubsetPadding(saved, select)
+    try:
+        yield
+    finally:
+        _padding_state = saved
 
 
 def mark_padding(num_valid_tokens: int, num_padded_tokens: int) -> None:

@@ -31,6 +31,23 @@ from vllm_torchtpu.layers.adapter.dense_fp4_shared import (
 )
 from vllm_torchtpu.models.minimax_m3.quant import _e4m3_matmul, _materialized_bf16
 
+Rows = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+
+def cat_rows(pieces: "Rows | list[Rows]") -> Rows:
+    """One row block from an SP step's gathered pieces (bf16 rows, or e4m3
+    rows with their f32 scales); a single block passes through."""
+    if not isinstance(pieces, list):
+        return pieces
+    if isinstance(pieces[0], tuple):
+        return tuple(torch.cat(parts) for parts in zip(*pieces))
+    return torch.cat(pieces)
+
+
+def _dequant(x: Rows) -> torch.Tensor:
+    return (x[0].float() * x[1]).to(torch.bfloat16) if isinstance(x, tuple) else x
+
+
 # The checkpoint config may omit swiglu_beta; SwiGLU-OAI's up-bias is 1.
 _DEFAULT_SWIGLU_BETA = 1.0
 
@@ -81,6 +98,7 @@ class MiniMaxM3MLP(nn.Module):
     ) -> torch.Tensor:
         """``x`` may come as e4m3 rows with per-row f32 scales (an SP step's
         e4m3 all-gather), which gate_up_proj contracts as e4m3."""
+        x = cat_rows(x)
         e4m3_apply = getattr(self.gate_up_proj.quant_method, "apply_e4m3_rows", None)
         if isinstance(x, tuple) and e4m3_apply is None:
             x = (x[0].float() * x[1]).to(torch.bfloat16)
@@ -151,17 +169,25 @@ class MiniMaxM3MoE(nn.Module):
         self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     ) -> torch.Tensor:
         """``hidden_states`` may come as e4m3 rows with per-row f32 scales (an
-        SP step's e4m3 all-gather): the router and routed experts take them
-        dequantized, a model-side shared expert contracts them as e4m3."""
+        SP step's e4m3 all-gather), or as a list of such gathered pieces: the
+        router and routed experts take them dequantized, a model-side shared
+        expert contracts them as e4m3."""
+        if isinstance(hidden_states, list):
+            # Gathered pieces: dequantize and route each as it lands.
+            xs = [_dequant(p) for p in hidden_states]
+            router_logits = torch.cat([self.gate(p)[0] for p in xs])
+            x = torch.cat(xs)
+            hidden_states = cat_rows(hidden_states)
+        else:
+            x = _dequant(hidden_states)
+            router_logits = None
         e4m3 = isinstance(hidden_states, tuple)
-        x = hidden_states
-        if e4m3:
-            x = (hidden_states[0].float() * hidden_states[1]).to(torch.bfloat16)
         routed_layer = getattr(self.experts, "routed_experts", None)
         shared = None
         if routed_layer is not None and model_side_shared(routed_layer, x.shape[0]):
             shared = shared_operands(routed_layer)
-        router_logits, _ = self.gate(x)
+        if router_logits is None:
+            router_logits, _ = self.gate(x)
         out = self.experts(hidden_states=x, router_logits=router_logits)
         if shared is None:
             return out

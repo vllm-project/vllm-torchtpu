@@ -172,3 +172,42 @@ def test_armed_rank_is_decided_for_the_whole_group(monkeypatch):
             )
             monkeypatch.setattr(par, "_ARMED", armed)
             assert (par.armed_rank(tuple(range(TP))) is not None) == want
+
+
+@pytest.mark.parametrize("pieces", [2, 4])
+def test_all_to_all_pieces_give_each_rank_its_rows(monkeypatch, ranks, pieces):
+    attn, w8, scale, ref = ranks
+    mods, _ = _prepared(monkeypatch, "gather", w8, scale)
+    monkeypatch.setenv("TPU_MINIMAX_M3_SP_A2A_E4M3", "1")
+    monkeypatch.setattr(
+        sp_o_proj,
+        "tensor_model_parallel_all_gather",
+        lambda w, dim: torch.cat([m.weight for m in mods], 0),
+    )
+    monkeypatch.setattr(
+        sp_o_proj,
+        "_quantize_op",
+        lambda x: tuple(_torch(a) for a in sp_o_proj._quantize_rows_pow2(_jax(x))),
+    )
+    monkeypatch.setattr(
+        sp_o_proj,
+        "_o_proj_e4m3_op",
+        lambda q, r, w, s: _torch(sp_o_proj._o_proj_e4m3(*map(_jax, (q, r, w, s)))),
+    )
+    rows = T // TP
+    for r in range(TP):
+        _as_rank(monkeypatch, r)
+        sent = [sp_o_proj._quantize_op(a) for a in attn]
+        calls = []
+
+        def all_to_all_rows(x, r=r, sent=sent, calls=calls):
+            part = 1 if x.shape[-1] == 1 else 0
+            piece = sum(1 for c in calls if c == part)
+            calls.append(part)
+            blocks = [s[part].view(TP, pieces, -1, s[part].shape[-1]) for s in sent]
+            return torch.cat([b[r, piece] for b in blocks])
+
+        monkeypatch.setattr(sp_o_proj, "all_to_all_rows", all_to_all_rows)
+        got = sp_o_proj.sp_o_proj(mods[r], attn[r], pieces)
+        assert got.shape == (rows, N)
+        assert _rel(got, ref[r * rows : (r + 1) * rows]) < 5e-2
