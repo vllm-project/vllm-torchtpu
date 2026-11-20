@@ -310,13 +310,15 @@ def wrap(compiled: Any, fn: types.FunctionType) -> Any:
             state["memo_count"] = count
         memo = state["memo"]
         if len(memo) >= _MEMO_MAX_ENTRIES:
-            # Drop the entries whose keyed objects are gone before giving up.
+            # Drop the entries whose keyed objects are gone, then the oldest:
+            # an entry holding an object that cannot be weakly referenced
+            # never dies, and refusing to store would end the memo's hits.
             for dead in [
                 k for k, (_, refs) in memo.items() if any(r() is None for r in refs)
             ]:
                 del memo[dead]
-            if len(memo) >= _MEMO_MAX_ENTRIES:
-                return
+            while len(memo) >= _MEMO_MAX_ENTRIES:
+                del memo[next(iter(memo))]
         objs: list = []
         key = _memo_key(args, objs)
         if key is not None and key not in memo:
