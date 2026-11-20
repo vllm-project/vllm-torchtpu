@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The two-sort routing metadata of the non-EP grouped-matmul MoE: the same
-metadata as the three sorts with one sort fewer, only on the non-EP path above
-the single-sort cap, and selected when the op is built."""
+metadata as the three sorts with one sort fewer, only on the non-EP path where
+neither the counting sort nor the single packed sort builds the metadata (above
+the single-sort cap here), and selected when the op is built."""
 
 import functools
 from unittest.mock import Mock
