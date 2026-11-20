@@ -334,10 +334,15 @@ def _gather_scratch(sc, rows, hidden, inter):
 def _gather_prologue(gid_s, wtab_ref, x_all, xs_all, g, rows):
     """Routing positions, transposed tables and the gather operand, once per call.
 
-    The gather operand is zero in every row no expert of the rank's lane block
-    takes (a padded row, whose router logits are -inf, or a row routed only to
-    other ranks): the gather is a one-hot matmul over all rows, so a NaN or
-    Inf left in such a row would reach every gathered row (0 * NaN is NaN).
+    The gather operand is zero in every row no expert in the rank's 128-lane
+    block takes: every padded row (its router logits are -inf, so it has no
+    routing weight) and every row routed only outside the block. The gather
+    is a one-hot matmul over all rows, so a NaN or Inf left in such a row
+    would reach every gathered row (0 * NaN is NaN). When ranks hold fewer
+    than LANE experts the block also holds other ranks' experts (two ranks of
+    64 at EP8 over 512 experts), and a row only they take keeps its values:
+    it has routing weight, so it is not a padded row, and the one-hot gather
+    multiplies it by exactly zero for this rank's experts.
     """
     x_g, w_blk, pos, pos_t, w_t, xs_t, counts_v, counts_s, csem, *_ = g
     g_rows = x_g.shape[0]
@@ -345,6 +350,7 @@ def _gather_prologue(gid_s, wtab_ref, x_all, xs_all, g, rows):
     first = gid_s[0, 0]
     blk = pl.multiple_of((first >> 7) << 7, LANE)
     w_rows = wtab_ref[:, pl.ds(blk, LANE)]
+    # Every lane of the block, other ranks' experts in it included.
     taken = jnp.sum(jnp.where(w_rows != 0, 1.0, 0.0), axis=1, keepdims=True)
     if g_rows > rows:
         w_rows = jnp.concatenate(
