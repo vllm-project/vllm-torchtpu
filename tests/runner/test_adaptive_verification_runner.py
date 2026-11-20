@@ -151,6 +151,9 @@ class _Batch:
     def swap_states(self, i, j):
         self.req_ids[i], self.req_ids[j] = self.req_ids[j], self.req_ids[i]
 
+    def refresh_metadata(self):
+        pass
+
     def update_req_spec_token_ids(self, request, scheduled_spec_tokens):
         self.staged_drafts[request.req_id] = len(
             scheduled_spec_tokens.get(request.req_id, ())

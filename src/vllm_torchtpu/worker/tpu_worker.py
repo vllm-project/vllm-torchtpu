@@ -27,7 +27,7 @@ import torch.profiler
 import torch_tpu  # noqa: F401
 from torch.compiler._cache import CacheArtifactManager
 from torch_tpu._internal.profiler import TpuProfilerConfig
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
     get_kv_transfer_group,
@@ -50,11 +50,14 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
+from vllm_torchtpu.compilation import compile_options
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker import worker_options
+from vllm_torchtpu.worker.numa_bind import bind_to_chip_numa_node
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
@@ -83,6 +86,26 @@ def _configure_tpu_process_env(
         os.environ.pop("WORLD_SIZE", None)
 
 
+def _world_group_init_kwargs(parallel_config: ParallelConfig) -> dict[str, Any]:
+    """The world group's timeout for init_distributed_environment, when vLLM's
+    --cpu-distributed-timeout-seconds sets one; nothing otherwise.
+
+    Gloo CPU groups wait 30 min by default. Under model-store contention a rank
+    can still be streaming weights after that while its peers sit in a CPU
+    collective (the draft load barrier on prefill, the all_gather_object of
+    build_ep_mesh on decode), and the waiters die with "Timed out waiting
+    1800000ms". The option sets the timeout of every CPU collective. This
+    passes it to init_process_group for the default group. vLLM builds the CPU
+    group of each of its group coordinators, the world group's gloo
+    ``cpu_group`` included, with ``new_group(ranks, backend="gloo",
+    timeout=...)`` read from the current vLLM config, which init_device sets
+    around both calls, so no CPU group depends on the default group's
+    timeout.
+    """
+    timeout = parallel_config.cpu_distributed_timeout
+    return {} if timeout is None else {"timeout": timeout}
+
+
 def _release_free_host_heap() -> None:
     """Return free allocator pages from model loading and compilation to the OS."""
     process = ctypes.CDLL(None)
@@ -92,6 +115,20 @@ def _release_free_host_heap() -> None:
     elif hasattr(process, "malloc_trim"):
         process.malloc_trim(0)
         logger.info("Released free host heap via glibc malloc_trim.")
+
+
+def _device_remap(local_rank_offset: int) -> str | None:
+    """The setting that runs this engine's ranks on other TPU devices than
+    their host-local rank names, or None. TPU_LOCAL_RANK_OFFSET and
+    DEBUG_TPU_LOCAL_RANK_OFFSET shift every rank; VLLM_TPU_DEVICE_ORDER maps
+    each rank to a listed device at worker spawn."""
+    if local_rank_offset:
+        return f"TPU_LOCAL_RANK_OFFSET={local_rank_offset}"
+    if envs.DEBUG_TPU_LOCAL_RANK_OFFSET:
+        return f"DEBUG_TPU_LOCAL_RANK_OFFSET={envs.DEBUG_TPU_LOCAL_RANK_OFFSET}"
+    if envs.VLLM_TPU_DEVICE_ORDER:
+        return f"VLLM_TPU_DEVICE_ORDER={envs.VLLM_TPU_DEVICE_ORDER}"
+    return None
 
 
 class TPUWorker(WorkerBase):
@@ -109,6 +146,10 @@ class TPUWorker(WorkerBase):
         devices=None,
         ip: str = "localhost",
     ):
+        # Arm this process's torch.compile hook (tpu_compile options, all off
+        # by default) before any compiled function can run.
+        compile_options.apply(vllm_config)
+
         from vllm_torchtpu import patch_registry
 
         patch_registry.apply("worker_init")
@@ -199,6 +240,26 @@ class TPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    def _maybe_bind_numa(
+        self, native_local_rank: int, dp_size: int, local_rank_offset: int = 0
+    ) -> None:
+        """Bind this worker to its chip's NUMA node when
+        ``tpu_worker.numa_bind`` is on. The host's workers are this engine's
+        local ranks times its host-local DP engines.
+
+        The bind assumes rank r runs on the host's r-th TPU device. A setting
+        that moves ranks to other devices (``_device_remap``) would make it
+        pick the wrong node, so then placement is left unchanged."""
+        if not worker_options.get(self.vllm_config).numa_bind:
+            return
+        remap = _device_remap(local_rank_offset)
+        if remap is not None:
+            logger.info("NUMA bind: %s moves the ranks; placement unchanged", remap)
+            return
+        pc = self.parallel_config
+        dp_size_local = (pc.data_parallel_size_local or dp_size) if dp_size > 1 else 1
+        bind_to_chip_numa_node(native_local_rank, pc.local_world_size * dp_size_local)
+
     def init_device(self):
         # vLLM's MultiprocExecutor passes per-engine rank/local_rank as
         # constructor args. Native vLLM DP keeps those values local to the DP
@@ -228,6 +289,10 @@ class TPUWorker(WorkerBase):
         # takes these at construction time.
         self.profile_rank = binding.rank
         self.profile_world_size = binding.world_size
+        # Before the runtime starts, so its threads and buffers follow.
+        self._maybe_bind_numa(
+            binding.native_local_rank, dp_size, binding.local_rank_offset
+        )
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
@@ -449,6 +514,7 @@ class TPUWorker(WorkerBase):
                 local_rank=local_rank_for_init,
                 distributed_init_method=dist_init_method,
                 backend=dist_backend,
+                **_world_group_init_kwargs(self.parallel_config),
             )
         # The PCP group keeps its natural rank order. Reordering it used to be
         # how the ring was chosen, on the understanding that the ring followed

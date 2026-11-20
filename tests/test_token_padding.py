@@ -32,6 +32,94 @@ def test_local_suffix_update():
     assert mask.get_local_padding_mask(8).sum().item() == 0
 
 
+def test_update_skips_the_copy_only_when_counts_repeat():
+    state = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
+    copies = []
+    real_copy = state.local_padding_mask.copy_
+
+    def counting_copy(src):
+        copies.append(src.clone())
+        return real_copy(src)
+
+    state.local_padding_mask.copy_ = counting_copy
+    # decode steps, an MTP rejection that shrinks the valid count, padding
+    # bucket growth, then back to an earlier count pair
+    steps = [(3, 4), (3, 4), (2, 4), (2, 4), (2, 8), (3, 4)]
+    for valid, padded in steps:
+        state.update(valid, padded)
+        expected = torch.zeros(8, dtype=torch.bool)
+        expected[valid:padded] = True
+        assert torch.equal(state.local_padding_mask, expected)
+    assert len(copies) == 4
+
+
+def test_update_writes_the_zero_mask_once_across_unpadded_steps():
+    """An unpadded step after another unpadded one leaves the mask as it is;
+    the padded step after them still writes its own suffix."""
+    state = TokenPaddingState.create(8, device="cpu")
+    copies = []
+    real_copy = state.local_padding_mask.copy_
+
+    def counting_copy(src):
+        copies.append(src.clone())
+        return real_copy(src)
+
+    state.local_padding_mask.copy_ = counting_copy
+    writes = []
+    for valid, padded in [(3, 6), (4, 4), (5, 5), (2, 6), (6, 6)]:
+        before = len(copies)
+        state.update(valid, padded)
+        writes.append(len(copies) - before)
+        expected = torch.zeros(8, dtype=torch.bool)
+        expected[valid:padded] = True
+        assert torch.equal(state.local_padding_mask, expected), (valid, padded)
+    # (5, 5) follows the unpadded (4, 4), so it writes nothing.
+    assert writes == [1, 1, 0, 1, 1]
+
+
+def test_the_valid_count_is_kept_for_the_step():
+    state = TokenPaddingState.create(8, device="cpu")
+    assert token_padding.get_local_valid_tokens() is None
+    with token_padding.use_padding_state(state):
+        state.update(3, 8)
+        assert token_padding.get_local_valid_tokens() is state.local_valid_tokens
+        assert token_padding.get_local_valid_tokens().tolist() == [3]
+        state.update(5, 8)
+        assert state.get_local_valid_tokens().tolist() == [5]
+
+
+def test_use_padding_state_binds_and_restores():
+    outer = TokenPaddingState.create(4, device="cpu")
+    inner = TokenPaddingState.create(4, device="cpu")
+    token_padding.set_padding_state(outer)
+    try:
+        with token_padding.use_padding_state(inner):
+            assert token_padding._padding_state is inner
+            with token_padding.use_padding_state(None):
+                assert token_padding._padding_state is None
+            assert token_padding._padding_state is inner
+        assert token_padding._padding_state is outer
+        try:
+            with token_padding.use_padding_state(inner):
+                raise RuntimeError("loop graph failed")
+        except RuntimeError:
+            pass
+        assert token_padding._padding_state is outer
+    finally:
+        token_padding.set_padding_state(None)
+
+
+def test_retain_padding_graph_input_reads_the_mask_and_keeps_the_values():
+    out = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    assert token_padding.retain_padding_graph_input(out) is out
+    state = TokenPaddingState.create(4, device="cpu")
+    with token_padding.use_padding_state(state):
+        state.update(1, 4)
+        kept = token_padding.retain_padding_graph_input(out)
+    assert kept is not out
+    assert torch.equal(kept, out)
+
+
 def test_dummy_batch_is_all_padding():
     state = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
     state.update(0, 6)

@@ -26,9 +26,12 @@ from vllm.config import VllmConfig
 
 from vllm_torchtpu import _patch_vllm_config_hash_ignore_diagnostics
 from vllm_torchtpu.runner.utils import (
+    FRONTEND_OPTIONS_SECTION,
     HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
     PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
+    RUNNER_OPTIONS_SECTION,
+    WORKER_OPTIONS_SECTION,
 )
 
 KEY = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY
@@ -200,4 +203,37 @@ def test_patch_is_idempotent(patched_compute_hash):
 
 
 def test_ignored_keys_match_the_keys_the_runner_reads():
-    assert {KEY, PREFILL_KEY} == HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+    assert {
+        KEY,
+        PREFILL_KEY,
+        FRONTEND_OPTIONS_SECTION,
+        RUNNER_OPTIONS_SECTION,
+        WORKER_OPTIONS_SECTION,
+    } == HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+
+
+def test_runner_options_section_does_not_change_the_hash(patched_compute_hash):
+    """The runner's telemetry options never change a compiled program, so
+    turning one on must not force a recompile."""
+    baseline = patched_compute_hash(_StubVllmConfig({"some_plugin_knob": 1}))
+    assert (
+        patched_compute_hash(
+            _StubVllmConfig(
+                {"some_plugin_knob": 1, RUNNER_OPTIONS_SECTION: {"stage_timing": True}}
+            )
+        )
+        == baseline
+    )
+
+
+@pytest.mark.parametrize("section", [FRONTEND_OPTIONS_SECTION, WORKER_OPTIONS_SECTION])
+def test_host_only_sections_do_not_change_the_hash(patched_compute_hash, section):
+    """The API-server patches and the worker's NUMA placement never change a
+    compiled program, so turning them on must not force a recompile."""
+    baseline = patched_compute_hash(_StubVllmConfig({"some_plugin_knob": 1}))
+    assert (
+        patched_compute_hash(
+            _StubVllmConfig({"some_plugin_knob": 1, section: {"any_option": True}})
+        )
+        == baseline
+    )

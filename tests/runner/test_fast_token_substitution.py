@@ -51,6 +51,8 @@ def test_substitution_disabled_by_default():
         _pre_async_results=SimpleNamespace(
             next_tokens_tpu=torch.tensor([101, 102, 103, 104], dtype=torch.int64)
         ),
+        _registered_h2d_sources=set(),
+        _unfenced_h2d_sources=[],
     )
     input_ids = torch.tensor([-1, -1, -1, -1], dtype=torch.int32)
     cur_indices = np.array([0, 1, 2, 3], dtype=np.int32)
@@ -92,20 +94,18 @@ def test_substitution_enabled_fast_path():
 
 
 def test_substitute_placeholder_token_rejects_mismatched_lengths():
-    """The length check names all three lengths."""
+    """The shape check names the index rows' shape and the input length."""
     with (
         torch.compiler.set_stance("force_eager"),
         pytest.raises(
             AssertionError,
-            match=r"placeholder substitution inputs must share one length: "
-            r"input_ids\.shape\[0\]=4, "
-            r"token_in_tpu_cur_input_indices\.shape\[0\]=3, "
-            r"token_in_tpu_pre_next_tokens_indices\.shape\[0\]=4",
+            match=r"placeholder substitution indices must be \[2, len\(input_ids\)\]: "
+            r"substitution_indices\.shape=\(2, 3\), "
+            r"input_ids\.shape\[0\]=4",
         ),
     ):
         _substitute_placeholder_token(
             torch.zeros(4, dtype=torch.int32),
-            torch.zeros(3, dtype=torch.int32),
-            torch.zeros(4, dtype=torch.int32),
+            torch.zeros((2, 3), dtype=torch.int32),
             torch.zeros(2, dtype=torch.int32),
         )

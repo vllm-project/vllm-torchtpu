@@ -283,6 +283,9 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/pcp_kv_gather.py",
     "vllm_torchtpu/layers/adapter/custom_ops",
     "vllm_torchtpu/layers/adapter/fused_moe.py",
+    # The small-collective bridge, whose kernels sit behind torch custom-op
+    # boundaries.
+    "vllm_torchtpu/layers/adapter/small_all_reduce_op.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
     # export is chosen from their source, so an edit here has to invalidate
@@ -520,6 +523,27 @@ def _single_size(compile_range: Range) -> int | None:
     return compile_range.start if compile_range.is_single_size() else None
 
 
+def _inline_int_placeholders(graph: fx.GraphModule, example_inputs: list[Any]) -> None:
+    """Bake a single-size compile's concrete ints into `graph` in place.
+
+    aot_autograd turns every int input back into a SymInt while a ShapeEnv is
+    live, so size arithmetic on the token count (`s // tp * tp` from the
+    sequence-parallel chunk and all-gather) reaches `torch.empty` symbolic and
+    fx_to_mlir rejects it. The placeholders stay, so the calling convention
+    and graph_signature are unchanged; only their uses see the constant.
+    """
+    inlined = False
+    for node, value in zip(shape_variants.placeholder_nodes(graph), example_inputs):
+        if type(value) is int and node.users:
+            # torch.fx annotates replace_with as a Node, but any argument
+            # value is substituted into the users' args; here it is the int.
+            # pyrefly: ignore[bad-argument-type]
+            node.replace_all_uses_with(value)
+            inlined = True
+    if inlined:
+        graph.recompile()
+
+
 class TpuCompilerAdaptor(CompilerInterface):
     """CompilerInterface implementation for TPU.
 
@@ -697,9 +721,12 @@ class TpuCompilerAdaptor(CompilerInterface):
         elif payload.signature != shape_variants.graph_signature(graph):
             # Not what makes the bundled entry safe -- that comes from wrapper
             # and executable being one object, with no lookup left to drift.
-            # This is the same check BucketExecutables.get already applies to
-            # the in-memory hand-over, extended across processes, and it earns
-            # its place because nothing else validates the entry against the
+            # This is the positional dtype-and-shape check that
+            # BucketExecutables.get falls back to for renamed placeholders in
+            # the in-memory hand-over, extended across processes; the artifact
+            # was saved for this same subgraph and bucket, so nothing here is
+            # matched by name or reordered. It earns its place because
+            # nothing else validates the entry against the
             # graph: torch_tpu injects a synthetic cache_info and stubs out
             # generate_guards_expression, and replaying a pickle we wrote
             # ourselves never goes through AOTAutogradCache.try_load.
@@ -882,10 +909,14 @@ class TpuCompilerAdaptor(CompilerInterface):
         )
 
         # aot_autograd (inside TpuBackend) requires tuple outputs. Deep-copied
-        # first because _ensure_tuple_output rewrites the output node in place
-        # and vLLM keeps its own reference to `graph`. Only the output node
-        # moves, so the placeholder signature is unaffected.
+        # first because _ensure_tuple_output rewrites the output node in place,
+        # a single-size compile's int placeholders get their concrete values
+        # inlined into their uses, and vLLM keeps its own reference to `graph`.
+        # Neither rewrite adds, drops or reorders a placeholder, so the
+        # placeholder signature is unaffected.
         graph = copy.deepcopy(graph)
+        if size is not None:
+            _inline_int_placeholders(graph, example_inputs)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         save_path = (
@@ -1008,9 +1039,12 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         logger.info("[TpuCompilerAdaptor] Loading compiled artifact from %s", path)
 
-        # Same deepcopy + output-tuple rewrite as `compile`, so the graph the
-        # artifact is checked against is shaped the way it was when saved.
+        # Same deepcopy, int inlining and output-tuple rewrite as `compile`, so
+        # the graph the artifact is checked against is shaped the way it was
+        # when saved, and the fallback compile below sees static sizes too.
         graph = copy.deepcopy(graph)
+        if size is not None:
+            _inline_int_placeholders(graph, example_inputs)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         compiled_fn = self._replay(path, graph, was_wrapped)

@@ -89,6 +89,7 @@ def _make_runner(
         cp_kv_cache_interleave_size=block_size,
         decode_context_parallel_size=1,
         pipeline_parallel_size=1,
+        tensor_parallel_size=1,
     )
     runner.vllm_config = SimpleNamespace(
         parallel_config=runner.parallel_config,
@@ -139,6 +140,18 @@ def _make_runner(
     runner._cached_logits_indices = None
     runner._cached_request_distribution = None
     runner._h2d_reuse = {}
+    runner._fast_token_substitution = False
+    runner._static_verify_q_len = None
+    runner._uniform_sched_arr_cache = {}
+    runner._prepare_inputs_idx_cache = {}
+    runner._async_subtract_idx_cache = {}
+    runner._comb_views_cache = {}
+    runner._cached_comb_key = None
+    runner._cached_comb_views = None
+    runner._stage_products_cache = {}
+    runner._cached_staged_block_tables_key = None
+    runner._cached_staged_block_tables = None
+    runner._cached_staged_block_tables_dev = None
     runner._upload_unless_unchanged = types.MethodType(
         TPUModelRunner._upload_unless_unchanged, runner
     )
@@ -176,6 +189,7 @@ def _make_runner(
     runner._collect_mamba_state_seed_copies = (
         TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner)
     )
+    runner._token_padding_update = TPUModelRunner._token_padding_update.__get__(runner)
     runner._prepare_async_token_substitution_indices = lambda *_args, **_kwargs: (
         np.array([], dtype=np.int32),
         np.array([], dtype=np.int32),
@@ -228,6 +242,7 @@ def _make_runner(
         token_ids_cpu=token_ids_cpu.numpy(),
         token_ids_cpu_tensor=token_ids_cpu,
         block_table=[_BlockTable(block_tables)],
+        refresh_metadata=lambda: None,
     )
     runner.input_batch = input_batch
 
@@ -352,6 +367,9 @@ def _make_sample_runner(
         num_prompt_logprobs={},
         _pre_async_results=None,
         _dp_step_other_decode=False,
+        _cached_output_req_ids_key=None,
+        _cached_req_id_to_index_snap={},
+        _ZERO_PLACEHOLDERS=TPUModelRunner._ZERO_PLACEHOLDERS,
         _min_tokens=min_tracker,
         _thinking_budget=tracker,
         _repetition_penalty=repetition_penalty.RepetitionPenaltyTracker(

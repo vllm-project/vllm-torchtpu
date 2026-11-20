@@ -432,6 +432,26 @@ class TestTpuPlatform:
             TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
+        "section,is_moe,error",
+        [
+            ({"small_all_reduce": 1}, True, ValueError),
+            ({"small_all_reduce": True}, False, NotImplementedError),
+        ],
+        ids=["malformed", "dense_model"],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    def test_check_and_update_config_refuses_a_bad_collectives_section(
+        self, mock_apply_patches, vllm_config, section, is_moe, error
+    ):
+        """At the config check, before any weight loads."""
+        vllm_config.additional_config = {"tpu_collectives": section}
+        vllm_config.model_config.is_moe = is_moe
+        vllm_config.parallel_config.tensor_parallel_size = 8
+        with pytest.raises(error, match="small_all_reduce"):
+            TpuPlatform.check_and_update_config(vllm_config)
+        mock_apply_patches.assert_not_called()
+
+    @pytest.mark.parametrize(
         ("mamba_cache_mode", "speculative_config", "async_scheduling", "message"),
         [
             ("all", None, False, "mamba_cache_mode='align'"),
@@ -476,6 +496,45 @@ class TestTpuPlatform:
         else:
             with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
+        "section,match",
+        [
+            ({"fast_compiled_call": 1}, "must be a bool"),
+            ({"fast_call": True}, "unknown keys"),
+            ("on", "must be a JSON object"),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    def test_malformed_tpu_compile_is_refused_at_startup(
+        self, mock_apply_patches, vllm_config, section, match
+    ):
+        """Before any worker arms the options: under a multiprocess executor
+        the workers are spawned only after this check."""
+        vllm_config.additional_config = {"tpu_compile": section}
+        with pytest.raises(ValueError, match=match):
+            TpuPlatform.check_and_update_config(vllm_config)
+        mock_apply_patches.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "section,match",
+        [
+            ({"gc_freeze": 1}, "must be a bool"),
+            ({"switch_interval_us": -1}, "must be >= 0"),
+            ({"stage_timing": "off"}, "must be a bool"),
+            ({"gc": True}, "unknown keys"),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    def test_malformed_tpu_runner_is_refused_at_startup(
+        self, mock_apply_patches, vllm_config, section, match
+    ):
+        """Before any worker builds its runner, which parses the section
+        again."""
+        vllm_config.additional_config = {"tpu_runner": section}
+        with pytest.raises(ValueError, match=match):
+            TpuPlatform.check_and_update_config(vllm_config)
+        mock_apply_patches.assert_not_called()
 
     @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
     @patch("vllm_torchtpu.patch_registry.apply")
@@ -1667,3 +1726,47 @@ def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", wait)
     with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
         _validate_peer_replay_config()
+
+
+def test_set_additional_forward_context_caches_dp_num_tokens_tpu_tensor(monkeypatch):
+    """Repeated calls with the same num_tokens_across_dp tuple reuse the cached
+    device tensor instead of calling .to('tpu') on every forward context."""
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    monkeypatch.setattr(TpuPlatform, "_dp_tokens_tpu_cache", {})
+    to_calls = []
+
+    class FakeCpuTensor:
+        def __init__(self, vals):
+            self.device = SimpleNamespace(type="cpu")
+            self.dtype = torch.int32
+            self._vals = list(vals)
+
+        def numel(self):
+            return len(self._vals)
+
+        def item(self):
+            return self._vals[0]
+
+        def tolist(self):
+            return list(self._vals)
+
+        def to(self, device):
+            to_calls.append((tuple(self._vals), device))
+            return SimpleNamespace(dtype=self.dtype, vals=tuple(self._vals))
+
+    dp_metadata_1 = SimpleNamespace(num_tokens_across_dp_cpu=FakeCpuTensor([64]))
+    dp_metadata_2 = SimpleNamespace(num_tokens_across_dp_cpu=FakeCpuTensor([64]))
+    dp_metadata_3 = SimpleNamespace(num_tokens_across_dp_cpu=FakeCpuTensor([16]))
+
+    TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata_1)
+    TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata_2)
+    assert dp_metadata_1.num_tokens_across_dp_cpu.vals == (64,)
+    assert (
+        dp_metadata_2.num_tokens_across_dp_cpu is dp_metadata_1.num_tokens_across_dp_cpu
+    )
+    assert to_calls == [((64,), "tpu")]
+
+    TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata_3)
+    assert dp_metadata_3.num_tokens_across_dp_cpu.vals == (16,)
+    assert len(to_calls) == 2
