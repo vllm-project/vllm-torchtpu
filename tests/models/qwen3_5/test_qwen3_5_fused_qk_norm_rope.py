@@ -209,7 +209,7 @@ def test_the_op_registers_with_the_real_bridge_and_its_fake_gives_the_shapes(
 def test_the_norm_weights_loaded_after_construction_reach_the_kernel():
     """A layer arms the fused path when it is built, before the loader fills
     its norm weights: the kernel must get (1 + w) of the loaded weights, not
-    of the initial ones, without the model patch's hoist."""
+    of the initial ones."""
     layer = _layer(fused_qk_norm_rope=False)
     for norm in (layer.q_norm, layer.k_norm):
         norm.weight.data.zero_()  # GemmaRMSNorm's initial weight

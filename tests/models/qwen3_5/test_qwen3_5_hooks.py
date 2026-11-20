@@ -127,7 +127,7 @@ def _vllm_config(
 
 @pytest.fixture(autouse=True)
 def _tpu7x(monkeypatch):
-    """The defaults were measured on TPU7x; tests of another device override."""
+    """The default was measured on TPU7x; tests of another device override."""
     monkeypatch.setattr(hooks, "_chip_family", lambda: TPU7X)
 
 
