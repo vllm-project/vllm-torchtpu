@@ -143,6 +143,11 @@ PATCHES = (
     # Out-of-tree FP32 rotary embedding (CUDA numerics). Must be registered
     # before any RotaryEmbedding is constructed at model load.
     Patch("vllm_torchtpu.layers.adapter.rotary_embedding", _ACTIVE),
+    # Attention layers.
+    Patch(
+        "vllm_torchtpu.layers.adapter.fused_qk_norm_rope:install_qk_norm_rope_patch",
+        _ACTIVE,
+    ),
     # Platform runtime configuration.
     Patch(
         "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE

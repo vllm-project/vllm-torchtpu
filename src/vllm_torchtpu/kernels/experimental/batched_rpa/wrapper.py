@@ -228,8 +228,13 @@ def calculate_block_sizes(
     serve_cfgs: configs.ServingConfigs,
     vmem_limit_bytes: int,
     decode_query_size: int = 1,
+    decode_batch_size: int = 8,
 ) -> tuple[configs.BlockSizes, configs.BlockSizes]:
-    """Calculate optimal block size for decode and prefill."""
+    """Calculate optimal block size for decode and prefill.
+
+    ``decode_batch_size`` is the most sequences one decode step works on
+    concurrently; 8 is the experimentally chosen default.
+    """
 
     tpu_info = pltpu.get_tpu_info()
     num_lanes = tpu_info.num_lanes
@@ -473,8 +478,6 @@ def calculate_block_sizes(
             batch_size=batch_size,
         )
 
-    # Fixed value based on experimental results.
-    decode_batch_size = 8
     prefill_batch_size = 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
@@ -505,6 +508,7 @@ def calculate_block_sizes(
         "update_kv_cache",
         "kv_layout",
         "decode_query_size",
+        "decode_batch_size",
         "cp_group_size",
         "attention_scope",
         "return_lse",
@@ -548,6 +552,7 @@ def ragged_paged_attention(
     update_kv_cache: bool | None = None,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     decode_query_size: int = 1,
+    decode_batch_size: int = 8,
     cp_group_size: int | None = None,
     cp_rank: jax.Array | None = None,
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
@@ -603,6 +608,7 @@ def ragged_paged_attention(
             is the same as skip_kv_update=True). None (default) uses skip_kv_update.
         decode_query_size: Number of query tokens in decode (1 by default, can be
             higher in case of speculative decoding).
+        decode_batch_size: Most sequences a decode step works on concurrently.
         cp_group_size: Size of the context parallelism (CP) group. KV cache is
             sharded across devices in this group. Defaults to None.
         cp_rank: Rank of the current device within the CP group, which determine
@@ -774,6 +780,7 @@ def ragged_paged_attention(
         serve_cfgs,
         vmem_limit_bytes,
         decode_query_size=decode_query_size,
+        decode_batch_size=decode_batch_size,
     )
     # Pre-allocate LSE buffer.
     lse_hbm_init: jax.Array | None = None

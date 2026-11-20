@@ -79,6 +79,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec,
 )
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
+from vllm_torchtpu.layers.adapter import batched_rpa_decode
 from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
 from vllm_torchtpu.layers.adapter.cp_attention import (
     build_dcp_kernels as _build_dcp_kernels,
@@ -565,11 +566,15 @@ def _pallas_rpa_kernel_batched(
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout,
     decode_query_size: int = 1,
+    decode_tuning: batched_rpa_decode.DecodeTuning | None = None,
     block_major: bool = False,
     subpage_split: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
+    kernel_kwargs = batched_rpa_decode.kernel_kwargs(decode_tuning, query.shape[0])
+    if decode_query_size > 1:
+        kernel_kwargs["decode_query_size"] = decode_query_size
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -587,10 +592,8 @@ def _pallas_rpa_kernel_batched(
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
         rpa_func=(
-            functools.partial(
-                ragged_paged_attention_batched, decode_query_size=decode_query_size
-            )
-            if decode_query_size > 1
+            functools.partial(ragged_paged_attention_batched, **kernel_kwargs)
+            if kernel_kwargs
             else ragged_paged_attention_batched
         ),
         sm_scale=sm_scale,
@@ -884,6 +887,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
     )
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
     decode_query_size: int = 1
+    decode_tuning: batched_rpa_decode.DecodeTuning | None = None
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -1037,6 +1041,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             max_model_len,
             pcp_kv_layout,
             self.decode_query_size,
+            self.decode_tuning,
             block_major,
             self._subpage_split,
         )
@@ -1080,6 +1085,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.use_causal_mask,
             pcp_kv_layout,
             self.decode_query_size,
+            self.decode_tuning,
             block_major,
             self._subpage_split,
         )
@@ -1122,6 +1128,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 )
             if "decode_query_size" in entry_params:
                 entry_kwargs["decode_query_size"] = self.decode_query_size
+            if "decode_tuning" in entry_params:
+                entry_kwargs["decode_tuning"] = self.decode_tuning
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(
@@ -1757,6 +1765,8 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         # head_dim 64 is rerouted to the hd64 kernel.
         if spec is not None and self.head_size != 64:
             self.decode_query_size = spec.num_speculative_tokens + 1
+        if vllm_config is not None and self.head_size != 64:
+            self.decode_tuning = batched_rpa_decode.decode_tuning(vllm_config)
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)

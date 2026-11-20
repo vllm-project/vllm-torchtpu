@@ -115,6 +115,7 @@ from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import (
     dp_vocab_parallel,
     expert_placement,
+    gated_norm_quant_op,
     token_padding,
 )
 from vllm_torchtpu.layers.adapter.attention import (
@@ -6233,6 +6234,8 @@ class TPUModelRunner(GPUModelRunner):
         self.model = model
         if self.lora_config is not None:
             self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
+        if envs.TPU_GDN_FUSED_NORM_QUANT:
+            gated_norm_quant_op.install(model)
         self._dp_vocab_logits = dp_vocab_parallel.check_layers_sharded_over_dp(
             self.model
         )
