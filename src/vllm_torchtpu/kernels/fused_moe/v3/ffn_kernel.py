@@ -234,6 +234,7 @@ def build_ffn_kernel(
     weight_dma_priority=WEIGHT_DMA_PRIORITY_DEFAULT,
     token_block=None,
     sorted_rows=False,
+    shard_index_operand=False,
 ):
     """Builds the program for one layer shape and returns the function that
     runs it (see `run` below). pallas_transport: the token buffer is the
@@ -241,6 +242,10 @@ def build_ffn_kernel(
     semaphores are operands. activation_block: values per fp8 scale of a
     row of each matmul's input (0: one scale per row); the row scales
     arrive as hidden // activation_block planes of the scale table.
+    shard_index_operand: the program takes the shard's own index as one
+    more scalar-prefetch operand (run's `shard_index`) instead of reading
+    the mesh axis, and addresses its peers in that form
+    (layout.device_coords); the torch bridge's form.
     token_block: the token rows' own rounding block when it differs
     (None: activation_block; 0: one scale per row).
     result_rows: "fp8" (rows with one scale per row) or "bf16" (rows
@@ -322,9 +327,9 @@ def build_ffn_kernel(
             f"{limit / layout.MIB:.1f} MiB budget, for {experts_per_shard} local "
             f"experts of {hidden}x{inter} at tile {tile_rows}"
         )
-    # One more scalar-prefetch table under the operand mode: the shard's
-    # own index (layout.SHARD_INDEX_OPERAND), read instead of the mesh axis.
-    n_tables = len(dataclasses.fields(Tables)) + int(layout.SHARD_INDEX_OPERAND)
+    # One more scalar-prefetch table in the operand form: the shard's own
+    # index, read instead of the mesh axis.
+    n_tables = len(dataclasses.fields(Tables)) + int(shard_index_operand)
     # Which optional operands and scratch buffers this build carries, in
     # the dataclasses' field order; the unpack below reads the flat ref
     # list by these, never by a count.
@@ -371,7 +376,7 @@ def build_ffn_kernel(
     def unpack(refs):
         it = iter(refs)
         tables = Tables(*(next(it) for _ in dataclasses.fields(Tables)))
-        shard_ref = next(it) if layout.SHARD_INDEX_OPERAND else None
+        shard_ref = next(it) if shard_index_operand else None
         operands = Operands(**take_fields(it, operand_present))
         outputs = Outputs(*(next(it) for _ in dataclasses.fields(Outputs)))
         scratch = Scratch(**take_fields(it, scratch_present))
@@ -383,6 +388,7 @@ def build_ffn_kernel(
         hidden=hidden,
         num_shards=num_shards,
         mesh_axes=tuple(mesh_axes),
+        shard_index_operand=shard_index_operand,
         experts_per_shard=experts_per_shard,
         form=form,
         has_w1_bias=has_w1_bias,
@@ -432,7 +438,9 @@ def build_ffn_kernel(
         # ---- prologue: the resident tables, the first weight refills ----
         body.resident_copies(ctx)
         whole.first_refills(ctx)
-        transport.all_shards_barrier(num_shards, build.mesh_axes)
+        transport.all_shards_barrier(
+            num_shards, build.mesh_axes, shard_index_operand=shard_index_operand
+        )
         # ---- the program ----
         if pallas_transport:
             transport.finish(
@@ -444,6 +452,7 @@ def build_ffn_kernel(
                     cast(Any, operands.tokens).shape[0] // num_shards,
                     num_shards,
                     mesh_axes=build.mesh_axes,
+                    shard_index_operand=shard_index_operand,
                 )
             )
         whole.issue_first(ctx)
@@ -454,7 +463,9 @@ def build_ffn_kernel(
             whole.initial_carry(ctx),
         )
         body.drain_transport(ctx)
-        transport.all_shards_barrier(num_shards, build.mesh_axes)
+        transport.all_shards_barrier(
+            num_shards, build.mesh_axes, shard_index_operand=shard_index_operand
+        )
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     sem = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
@@ -596,9 +607,10 @@ def build_ffn_kernel(
                 "the pallas transport takes the start call's "
                 "semaphore pair, and only it does"
             )
-        if (shard_index is not None) != layout.SHARD_INDEX_OPERAND:
+        if (shard_index is not None) != shard_index_operand:
             raise ValueError(
-                "shard_index goes with layout.SHARD_INDEX_OPERAND and only then"
+                "shard_index goes with a build made with shard_index_operand=True, "
+                "and only with it"
             )
         if token_of_row.shape != (table_rows,):
             raise ValueError(
@@ -641,21 +653,23 @@ _BUILD_CACHE = {}
 _BUILD_CACHE_LOCK = threading.Lock()
 
 
-def ffn_kernel(**kwargs):
+def ffn_kernel(*, shard_index_operand=False, **kwargs):
     """build_ffn_kernel, memoized on its arguments and on
-    layout.SHARD_INDEX_OPERAND, which the build reads (the operand mode adds
+    shard_index_operand, which the build reads (the operand mode adds
     one scalar-prefetch table and changes the unpacking), so a build made in
     one mode is never handed to the other. The cache is unbounded: one
     program per (token bucket, format, bias set, activation, config, mode)."""
     key = tuple(sorted(kwargs.items())) + (
-        ("layout.SHARD_INDEX_OPERAND", layout.SHARD_INDEX_OPERAND),
+        ("shard_index_operand", shard_index_operand),
     )
     run = _BUILD_CACHE.get(key)
     if run is None:
         with _BUILD_CACHE_LOCK:
             run = _BUILD_CACHE.get(key)
             if run is None:
-                run = build_ffn_kernel(**kwargs)
+                run = build_ffn_kernel(
+                    **kwargs, shard_index_operand=shard_index_operand
+                )
                 _BUILD_CACHE[key] = run
                 logger.debug(
                     "fused EP MoE: built program %d for %s",
