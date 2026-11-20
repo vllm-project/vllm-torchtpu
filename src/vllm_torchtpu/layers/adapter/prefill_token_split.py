@@ -22,7 +22,10 @@ own_rows``), so the MoE output needs no reordering. Per layer:
   rows of the sum;
 - the post-attention add + RMSNorm runs on the core's rows; the MoE op routes
   and quantizes them, all-gathers the fp8 rows, scales and routes, and drops
-  the all-gather after its reduce-scatter (moe_tp_decode._split_body).
+  the all-gather after its reduce-scatter (moe_tp_decode._split_body). On an
+  expert-parallel layer (TPU_PREFILL_SEQ_PARALLEL_EP) the op routes the rows,
+  all-gathers them and their routes, runs the layer's experts on every row
+  and reduce-scatters the sum (moe_tp_decode._ep_split_body).
 
 The final norm's output is all-gathered once for the LM head and the drafter.
 The layers before the first MoE layer, smaller buckets and the drafter keep
@@ -617,10 +620,27 @@ def _model_forward(
     return split_model_forward(self, positions, inputs_embeds, split)
 
 
+def check_env() -> None:
+    """The expert-parallel split switches' prerequisites; raises."""
+    if (
+        envs.TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER
+        and not envs.TPU_PREFILL_SEQ_PARALLEL_EP
+    ):
+        raise ValueError(
+            "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER needs "
+            "TPU_PREFILL_SEQ_PARALLEL_EP=1"
+        )
+    if envs.TPU_PREFILL_SEQ_PARALLEL_EP and not envs.TPU_PREFILL_SEQ_PARALLEL:
+        raise ValueError("TPU_PREFILL_SEQ_PARALLEL_EP needs TPU_PREFILL_SEQ_PARALLEL=1")
+
+
 def maybe_patch_deepseek_v2(*args: object, **kwargs: object) -> None:
     """Install the split-aware DeepseekV2Model.forward under
-    TPU_PREFILL_SEQ_PARALLEL; it is today's forward until `arm` runs."""
+    TPU_PREFILL_SEQ_PARALLEL; it is today's forward until `arm` runs. Checks
+    the split's switches first, so a bad combination fails at platform
+    activation."""
     global _UPSTREAM_MODEL_FORWARD
+    check_env()
     if not envs.TPU_PREFILL_SEQ_PARALLEL or _UPSTREAM_MODEL_FORWARD is not None:
         return None
     from vllm.model_executor.models import deepseek_v2
@@ -733,10 +753,12 @@ def _arm_quantized_gather(backbone) -> None:
 
 def arm(model: torch.nn.Module, token_buckets: list[int]) -> bool:
     """Give the target model's DeepseekV2Model a TokenSplit when every MoE
-    layer runs moe_tp_decode's stage-A prefill kernel, the attention is the
-    TPU MLA wrapper and every bucket the split serves divides into the MoE's
-    chunk blocks; otherwise log why and keep today's path. Same decision on
-    every rank (it reads only the model and the config)."""
+    layer runs moe_tp_decode's stage-A prefill kernel (or, under
+    TPU_PREFILL_SEQ_PARALLEL_EP, is an expert-parallel moe_tp_decode layer),
+    the attention is the TPU MLA wrapper and every bucket the split serves
+    divides into the MoE's chunk blocks; otherwise log why and keep today's
+    path. Same decision on every rank (it reads only the model and the
+    config)."""
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
     from vllm.model_executor.models.deepseek_v2 import DeepseekV2Model
 
@@ -763,7 +785,10 @@ def arm(model: torch.nn.Module, token_buckets: list[int]) -> bool:
         for runner in runners:
             op = arm_token_split_op(runner.routed_experts, slot)
             if op is None:
-                reason = "a MoE layer has no moe_tp_decode stage-A prefill kernel"
+                reason = (
+                    "a MoE layer has no moe_tp_decode stage-A prefill kernel "
+                    "(or, under TPU_PREFILL_SEQ_PARALLEL_EP, no expert-parallel op)"
+                )
                 break
             armed.append(op)
     if reason is None and len({id(mesh) for mesh, _, _ in armed}) != 1:

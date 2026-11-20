@@ -774,7 +774,8 @@ def _get_op(mesh, statics: _OpStatics, prequant: bool = False, split: bool = Fal
     """One jax_op per distinct closure; built at arming, never in a trace.
     `prequant`: the variant with two more per-rank operands, x_q [T, h/128,
     128] fp8 and x_scale [T] f32 (TPU_FUSED_ADD_RMSNORM_QUANT_MOE). `split`:
-    the variant over this core's rows of the step (`_split_body`)."""
+    the variant over this core's rows of the step (`_split_body`, or
+    `_ep_split_body` on an expert-parallel layer)."""
     key = (mesh, statics, prequant, split)
     op = _OPS.get(key)
     if op is not None:
@@ -1268,16 +1269,9 @@ def arm_token_split_op(layer: Any, slot: Any) -> tuple[Any, int, torch.Tensor] |
     layer arms under TPU_PREFILL_SEQ_PARALLEL_EP, above the kernel's largest
     token count, where its op runs the EP path; with
     TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER the first such layer finds
-    its mesh's chip places (collective) for the rotated reduce-scatter, which
-    needs TPU_PREFILL_SEQ_PARALLEL_EP."""
-    if (
-        envs.TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER
-        and not envs.TPU_PREFILL_SEQ_PARALLEL_EP
-    ):
-        raise ValueError(
-            "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER needs "
-            "TPU_PREFILL_SEQ_PARALLEL_EP=1"
-        )
+    its mesh's chip places (collective) for the rotated reduce-scatter
+    (prefill_token_split.check_env checks the switches at platform
+    activation)."""
     op = getattr(layer.quant_method, _OP_ATTR, None)
     if op is None:
         return None

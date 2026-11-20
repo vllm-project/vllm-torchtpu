@@ -1677,10 +1677,12 @@ def rotated_scatter_rows(x, rank, table, axis_name):
     """`scatter_rows` of x [tokens, h] bf16 as one rotated_collectives
     reduce-scatter per combine chunk on the TensorCore, with `table`
     (peer_table "reduce_scatter") and `rank` (this core's mesh index, int32
-    [1]); the same bf16 terms, added in another order. A chunk shape the kernel
-    does not take keeps scatter_rows."""
+    [1]); the same bf16 terms, added in another order. Another dtype, or a
+    chunk shape the kernel does not take, keeps scatter_rows."""
     chunk = x.shape[0] // token_chunks(x.shape[0])
-    if not rotated_collectives.reduce_scatter_supports(chunk, x.shape[1]):
+    if x.dtype != jnp.bfloat16 or not rotated_collectives.reduce_scatter_supports(
+        chunk, x.shape[1]
+    ):
         return scatter_rows(x, axis_name)
     return rotated_collectives.reduce_scatter_chunks(
         x, rank, jnp.asarray(table), axis=axis_name, chunk=chunk

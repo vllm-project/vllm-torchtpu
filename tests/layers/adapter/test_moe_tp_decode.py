@@ -972,14 +972,6 @@ def test_rotated_scatter_finds_each_ep_mesh_places_once(monkeypatch):
     assert places == {mesh: ["places"]}
 
 
-def test_rotated_scatter_needs_the_ep_split(monkeypatch):
-    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP", False)
-    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER", True)
-    layer = SimpleNamespace(quant_method=SimpleNamespace())
-    with pytest.raises(ValueError, match="needs TPU_PREFILL_SEQ_PARALLEL_EP=1"):
-        moe_tp_decode.arm_token_split_op(layer, object())
-
-
 @pytest.mark.parametrize(
     ("size", "index", "places", "reason"),
     [
