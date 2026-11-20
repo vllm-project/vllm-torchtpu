@@ -9,6 +9,7 @@ import os
 import random
 import sys
 
+import fastokens
 import pytest
 import tokenizers
 from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers, trainers
@@ -99,18 +100,12 @@ def _random_text(rng, n_parts):
     return "".join(out)
 
 
-def _needs_fastokens(fast):
-    if fast:
-        pytest.importorskip("fastokens")
-
-
 @pytest.mark.parametrize("fast", [False, True])
 def test_toy_tokenizer_matches_full_encode(fast):
-    _needs_fastokens(fast)
     tok = _toy_tokenizer()
     assert SegmentTokenizer.eligible(tok) is None
     seg = SegmentTokenizer(tok, max_cached_tokens=10_000, use_fastokens=fast)
-    assert (seg._miss_encoder is not seg._backend) == fast
+    assert isinstance(seg._miss_encoder, fastokens.Tokenizer) == fast
     rng = random.Random(0)
     for i in range(3000):
         text = _random_text(rng, rng.randrange(1, 40))
@@ -123,7 +118,6 @@ def test_toy_tokenizer_matches_full_encode(fast):
 
 @pytest.mark.parametrize("fast", [False, True])
 def test_edge_inputs(fast):
-    _needs_fastokens(fast)
     tok = _toy_tokenizer()
     seg = SegmentTokenizer(tok, max_cached_tokens=10_000, use_fastokens=fast)
     for text in [
@@ -221,12 +215,11 @@ def _conversation(rng, n_msgs, words):
 
 @pytest.mark.parametrize("fast", [False, True])
 def test_glm_chat_prompts_match_full_encode(fast):
-    _needs_fastokens(fast)
     hf = _glm_tokenizer()
     backend = hf.backend_tokenizer
     assert SegmentTokenizer.eligible(backend) is None
     seg = SegmentTokenizer(backend, max_cached_tokens=1 << 22, use_fastokens=fast)
-    assert (seg._miss_encoder is not seg._backend) == fast
+    assert isinstance(seg._miss_encoder, fastokens.Tokenizer) == fast
     rng = random.Random(2)
     for _ in range(40):
         msgs = _conversation(rng, rng.randrange(1, 30), 300)

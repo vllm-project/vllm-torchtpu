@@ -47,13 +47,10 @@ from __future__ import annotations
 
 import bisect
 import copy
-import importlib.util
 import re
-import sys
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from vllm_torchtpu.logger import init_logger
@@ -342,33 +339,14 @@ class SegmentTokenizer:
 def _fastokens_of(backend: Any) -> Any:
     """A fastokens encoder of ``backend``'s tokenizer file, else ``backend`` itself."""
     try:
-        return _import_fastokens().Tokenizer.from_json_str(backend.to_str())
+        import fastokens
+
+        return fastokens.Tokenizer.from_json_str(backend.to_str())
     except Exception as exc:
         logger.warning(
             "VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS: keeping the HF encoder: %s", exc
         )
         return backend
-
-
-def _import_fastokens() -> Any:
-    """The installed fastokens, else the copy a patch serves beside this package."""
-    try:
-        import fastokens
-
-        return fastokens
-    except ImportError:
-        package = Path(__file__).resolve().parents[1] / "fastokens"
-        if not (package / "__init__.py").is_file():
-            raise
-    spec = importlib.util.spec_from_file_location(
-        "fastokens", package / "__init__.py", submodule_search_locations=[str(package)]
-    )
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load fastokens from {package}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["fastokens"] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def _backend_of(tokenizer: Any) -> Any:
@@ -434,6 +412,15 @@ def patch_renderer_segment_tokenize() -> None:
     from vllm_torchtpu import envs
 
     if not envs.VLLM_TPU_SEGMENT_TOKENIZE:
+        if (
+            envs.VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS
+            or envs.VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS
+        ):
+            logger.warning(
+                "VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS and "
+                "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS take effect only with "
+                "VLLM_TPU_SEGMENT_TOKENIZE=1"
+            )
         return
     from vllm.renderers import base as renderer_base
 
