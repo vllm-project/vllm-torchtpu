@@ -9216,6 +9216,42 @@ class TestStage3AsyncOptionsThroughGetFinished:
     """async_register and async_complete driven through process_send_load and
     get_finished, the calls the model runner makes."""
 
+    def test_get_finished_opens_the_gate_and_waits_for_a_finished_registration(
+        self,
+    ):
+        worker, engine, facade, side = _stage3_option_producer({"async_register": True})
+        release = threading.Event()
+        threads: list[str] = []
+
+        def slow_register(**kwargs):
+            threads.append(threading.current_thread().name)
+            release.wait(5.0)
+            side.register_request_blocks_calls.append(kwargs)
+
+        side.register_request_blocks = slow_register
+        with (
+            _stage3_option_env(),
+            # Only get_finished's gate starts the side thread in time.
+            patch(f"{_MOD}._STAGE3_ASYNC_REGISTER_DELAY_S", 30.0),
+        ):
+            worker.process_send_load(_stage3_send_meta("r1", 77))
+            assert "r1" not in worker._stage3_registered_sends
+            timer = threading.Timer(0.2, release.set)
+            timer.start()
+            assert worker.get_finished({"r1"}) == (set(), set())
+            timer.join()
+            # get_finished opened the gate and returned only once r1's
+            # registration had landed.
+            assert worker._stage3_register_gate.is_set()
+            assert "r1" in worker._stage3_registered_sends
+            assert worker._stage3_register_futures == []
+            engine.poll_results = [(["r1"], [], [])]
+            done_sending, _ = worker.get_finished()
+        assert done_sending == {"r1"}
+        assert threads and threads[0].startswith("raiden-register")
+        assert [c["req_id"] for c in side.register_request_blocks_calls] == ["r1"]
+        assert facade.register_request_blocks_calls == []
+
     @pytest.mark.parametrize("failed", [False, True], ids=["done", "failed"])
     def test_a_terminal_before_the_registration_is_recorded_is_kept(self, failed):
         """The controller can serve the consumer before the side thread's
@@ -9241,3 +9277,29 @@ class TestStage3AsyncOptionsThroughGetFinished:
         assert done_sending == {"r1"}
         assert worker._stage3_early_send_terminals == {}
         assert worker._stage3_registered_sends == {}
+
+    def test_a_completed_send_completes_on_the_side_thread(self):
+        worker, engine, facade, side = _stage3_option_producer({"async_complete": True})
+        threads: list[str] = []
+
+        def complete(**kwargs):
+            threads.append(threading.current_thread().name)
+            side.complete_request_blocks_calls.append(kwargs)
+
+        side.complete_request_blocks = complete
+        with _stage3_option_env():
+            worker.process_send_load(_stage3_send_meta("r1", 77))
+            engine.poll_results = [(["r1"], [], [])]
+            done_sending, _ = worker.get_finished()
+            assert done_sending == {"r1"}
+            future, uuid, _ = worker._stage3_complete_futures["r1"]
+            future.result(timeout=5)
+            # The next poll retires the finished background complete.
+            assert worker.get_finished() == (set(), set())
+        assert uuid == 77
+        assert worker._stage3_complete_futures == {}
+        assert side.complete_request_blocks_calls == [
+            {"req_id": "r1", "uuid": 77, "unit": worker._raiden_work_unit}
+        ]
+        assert threads and threads[0].startswith("raiden-complete")
+        assert facade.complete_request_blocks_calls == []
