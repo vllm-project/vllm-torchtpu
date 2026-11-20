@@ -29,15 +29,24 @@ default guidance with CFG, STG, and modality isolation):
    ``$LTX2_GOLDEN_DIR``, default ``$HF_HOME/golden/ltx2``) is the same request
    with fp32 weights and tensor_parallel_size=4; it matches CPU fp32 diffusers
    to video MAE 0.0036.
+4. ``test_ltx2_golden_answer_multichip_ulysses_tpu``: the same golden request
+   and limits on CFG-parallel 2 x Ulysses 4 (8 TensorCores). Ulysses pads the
+   26 audio latent tokens to 28 and sends a key-padding mask to audio
+   self-attention and audio-to-video attention, a path the single-chip tests
+   never take. It is marked ``multichip``, so only the Omni Multichip
+   (Nightly) lane (tpu7x 2x2x1) runs it.
 
-All three share one engine; the module runs in about 270s on TPU v7x, well
-within the 1800s CI Nightly per-test timeout.
+The first three share one single-chip engine and run in about 270s on TPU v7x,
+well within the 1800s CI Nightly per-test timeout.
 """
 
 import numpy as np
 import pytest
 
 pytest.importorskip("vllm_omni", reason="vllm_omni is required for LTX-2 tests")
+
+from torch_tpu._internal.utils import hardware
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 
 from tests_omni.conftest import OmniRunner
 from tests_omni.models.ltx2.utils import (
@@ -148,6 +157,59 @@ def test_ltx2_seed_determinism_tpu(omni_runner: OmniRunner) -> None:
 )
 def test_ltx2_golden_answer_tpu(omni_runner: OmniRunner) -> None:
     """Compare TPU v7x bf16 video and audio with the TPU fp32 golden."""
+    out = extract_ltx2_outputs(
+        list(
+            omni_runner.generate(
+                LTX2_PROMPT,
+                build_ltx2_request(
+                    num_inference_steps=LTX2_GOLDEN_STEPS,
+                    extra_args=LTX2_GOLDEN_EXTRA_ARGS,
+                ),
+            )
+        )
+    )
+    assert_ltx2_golden_parity(out)
+
+
+# CFG-parallel 2 x Ulysses 4, passed as flat OmniRunner kwargs as in
+# tests_omni/models/wan/test_wan_multirank.py. Ulysses 4 pads the 26 audio latent
+# tokens of the golden request to 28 and masks the 2 padded keys; Ulysses 2
+# would not pad them (26 divides by 2). Before #2878 this masked path returned
+# wrong attention on torch_tpu 0.2.0 (google-pytorch/torch_tpu#5677), and this
+# test failed audio_logspec_l1 (1.366), video_ssim (0.640), video_mae (0.067)
+# and video_mean_shift (0.042); with #2878 it measured 0.330, 0.931, 0.022 and
+# 0.004.
+LTX2_MULTICHIP_DEGREES = {"cfg_parallel_size": 2, "ulysses_degree": 4}
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize(
+    "omni_runner",
+    [(get_ltx2_model(), None, LTX2_MULTICHIP_DEGREES)],
+    indirect=True,
+)
+def test_ltx2_golden_answer_multichip_ulysses_tpu(omni_runner: OmniRunner) -> None:
+    """Compare CFG-parallel 2 x Ulysses 4 video and audio with the TPU fp32 golden."""
+    world_size = DiffusionParallelConfig(**LTX2_MULTICHIP_DEGREES).world_size
+    # PCI scan: counts TPU devices without starting the TPU runtime here.
+    device_count = hardware.get_tpu_device_count()
+    assert device_count >= world_size, (
+        f"Test requires {world_size} TPU devices, found {device_count}"
+    )
+    # Fail rather than silently run unpadded if the degrees were dropped.
+    stage_parallel = omni_runner.stage_configs[0].parallel_config
+    expected = {
+        "cfg_parallel_size": 1,
+        "ulysses_degree": 1,
+        "ring_degree": 1,
+        "tensor_parallel_size": 1,
+        **LTX2_MULTICHIP_DEGREES,
+    }
+    actual = {name: getattr(stage_parallel, name) for name in expected}
+    assert actual == expected, (
+        f"Engine parallel degrees {actual} != expected {expected}"
+    )
+
     out = extract_ltx2_outputs(
         list(
             omni_runner.generate(
