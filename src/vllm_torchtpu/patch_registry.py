@@ -137,9 +137,7 @@ PATCHES = (
     # API-server detokenizer priming (VLLM_TPU_DETOK_PRIME_TOKENS).
     Patch("vllm_torchtpu.detok_prime:patch_detokenizer_prime_tail", _ACTIVE),
     # Engine-core prompt block hashing (VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS).
-    Patch(
-        "vllm_torchtpu.core.block_hash_reuse:patch_block_hash_reuse", ("engine_core",)
-    ),
+    Patch("vllm_torchtpu.core.block_hash_reuse:patch_block_hash_reuse", _ENGINE),
     # API-server prompt id range check (VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK).
     Patch(
         "vllm_torchtpu.input_range_check:patch_skip_tokenizer_id_range_check", _ACTIVE
