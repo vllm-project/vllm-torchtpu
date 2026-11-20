@@ -23,10 +23,12 @@ from jax._src import dtypes
 from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import TunedValue
 
 # How the quantizers apply the scale. False divides by it. True multiplies by
-# its reciprocal, and quantize_array then also maps an all-zero row's scale to
-# 1 and clips FP8 values to the dtype's range before the cast. It holds for
-# every quantize in the process and is read when a kernel is traced, so a
-# model's numerics rule sets it (set_reciprocal_scale) before any trace.
+# its reciprocal, and quantize_array then also computes the scale as
+# x_abs_max * (1 / dtype_max) instead of x_abs_max / dtype_max (quantize_block
+# keeps the division), maps an all-zero row's scale to 1 and clips FP8 values
+# to the dtype's range before the cast. It holds for every quantize in the
+# process and is read when a kernel is traced, so a model's numerics rule sets
+# it (set_reciprocal_scale) before any trace; the TPU compile hash includes it.
 RECIPROCAL_SCALE: bool = False
 
 
