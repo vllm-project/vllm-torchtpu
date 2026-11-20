@@ -194,15 +194,15 @@ def _ensure_tpu_quant_ops_registered() -> dict[str, Any]:
         blocks = lg_padded.reshape(t_rows, n_blocks, block_size)
         block_max = jnp.max(blocks, axis=-1)
         _, blk_ids = jax.lax.top_k(block_max, num_local_blocks)
-        local_cand512 = jnp.take_along_axis(
-            blocks, blk_ids[:, :, None], axis=1
-        ).reshape(t_rows, num_local_blocks * block_size)
+        local_cand = jnp.take_along_axis(blocks, blk_ids[:, :, None], axis=1).reshape(
+            t_rows, num_local_blocks * block_size
+        )
         intra = jnp.arange(block_size, dtype=jnp.int32)[None, None, :]
         local_ids512 = (
             blk_ids.astype(jnp.int32)[:, :, None] * block_size + intra
         ).reshape(t_rows, num_local_blocks * block_size)
         vals32, idx32 = jax.lax.top_k(
-            local_cand512.astype(jnp.float32), LOCAL_TOPK_CANDIDATES
+            local_cand.astype(jnp.float32), LOCAL_TOPK_CANDIDATES
         )
         ids32 = jnp.take_along_axis(local_ids512, idx32, axis=-1)
         return vals32, ids32.astype(jnp.int32)
@@ -552,7 +552,7 @@ def _extract_local_topk32_torch(
     block_max = blocks.amax(dim=-1)
     _, blk_ids = torch.topk(block_max, k=num_local_blocks, dim=-1)
     gather_idx = blk_ids.unsqueeze(-1).expand(-1, -1, block_size)
-    local_cand512 = torch.gather(blocks, 1, gather_idx).reshape(
+    local_cand = torch.gather(blocks, 1, gather_idx).reshape(
         t_rows, num_local_blocks * block_size
     )
     intra = torch.arange(block_size, device=logits.device, dtype=torch.int32).view(
@@ -561,7 +561,7 @@ def _extract_local_topk32_torch(
     local_ids512 = (blk_ids.to(torch.int32).unsqueeze(-1) * block_size + intra).reshape(
         t_rows, num_local_blocks * block_size
     )
-    vals32, idx32 = torch.topk(local_cand512.float(), k=LOCAL_TOPK_CANDIDATES, dim=-1)
+    vals32, idx32 = torch.topk(local_cand.float(), k=LOCAL_TOPK_CANDIDATES, dim=-1)
     ids32 = torch.gather(local_ids512, 1, idx32)
     return vals32.float(), ids32.to(torch.int32)
 
@@ -1088,7 +1088,7 @@ def topk_candidates_step_eligible(
             continue
         has_req = True
         state = requests.get(req_id)
-        params = getattr(state, "sampling_params", None) if state is not None else None
+        params = state.sampling_params if state is not None else None
         if params is None:
             return False
         if params.structured_outputs is not None:
