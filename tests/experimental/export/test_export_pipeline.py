@@ -3345,3 +3345,76 @@ def test_a_row_parallel_layer_selects_its_input_slice_by_a_per_rank_constant() -
         pytest.raises(NotImplementedError, match="adds a bias"),
     ):
         universal_adapter._patch_row_parallel_input_split(model)
+
+
+def test_run_model_loader_and_mtp_draft_set_distinct_model_tags(monkeypatch) -> None:
+    from vllm.compilation import backends as vllm_backends
+
+    seen_tags: list[str] = []
+
+    def fake_load_model(vllm_config, model_config):
+        seen_tags.append(vllm_backends.model_tag)
+        return nn.Module()
+
+    loader = SimpleNamespace(load_model=fake_load_model)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.get_model_loader", lambda _cfg: loader
+    )
+    cfg = SimpleNamespace(
+        load_config=SimpleNamespace(load_format="dummy"),
+        model_config=SimpleNamespace(),
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            draft_model_config=SimpleNamespace(runner_type="draft"),
+        ),
+    )
+    target = universal_adapter.run_model_loader(cfg)
+    assert seen_tags == ["backbone"]
+
+    monkeypatch.setattr("vllm.config.get_layers_from_vllm_config", lambda _c, _cls: {})
+    monkeypatch.setattr(
+        universal_adapter, "_share_embedding_and_lm_head", lambda _d, _t: None
+    )
+    monkeypatch.setattr(
+        universal_adapter, "_share_target_kv_cache", lambda _d, _t, _n: None
+    )
+    universal_adapter._load_mtp_draft(cfg, target)
+    assert seen_tags == ["backbone", "eagle_head"]
+
+
+def test_load_vllm_model_hooks_fused_norm_quant_and_summaries(monkeypatch) -> None:
+    from vllm_torchtpu.layers.adapter import fused_moe_ep_v3, gated_norm_quant_op
+    from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
+
+    target = nn.Module()
+    installed: list[nn.Module] = []
+    summaries: list[str] = []
+    monkeypatch.setenv("TPU_GDN_FUSED_NORM_QUANT", "1")
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v3")
+    monkeypatch.setattr(gated_norm_quant_op, "install", lambda m: installed.append(m))
+    monkeypatch.setattr(
+        moe_lowtok_scores, "log_summary", lambda: summaries.append("lowtok")
+    )
+    monkeypatch.setattr(
+        fused_moe_ep_v3, "log_arming_summary", lambda: summaries.append("v3")
+    )
+    monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
+    monkeypatch.setattr("vllm.distributed.model_parallel_is_initialized", lambda: True)
+    monkeypatch.setattr(universal_adapter, "run_model_loader", lambda _cfg: target)
+    monkeypatch.setattr(universal_adapter, "_load_mtp_draft", lambda _c, _t: None)
+    monkeypatch.setattr(
+        "vllm_torchtpu.experimental.export.draft_model.load_draft_model",
+        lambda _c, _t, _m: None,
+    )
+    monkeypatch.setattr(
+        "vllm.platforms.current_platform.update_block_size_for_backend", lambda _c: None
+    )
+    cfg = SimpleNamespace(
+        load_config=SimpleNamespace(load_format="dummy"),
+        device_config=SimpleNamespace(device=None),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    out = universal_adapter.load_vllm_model(cfg, load_format="dummy")
+    assert out is target
+    assert installed == [target]
+    assert summaries == ["lowtok", "v3"]

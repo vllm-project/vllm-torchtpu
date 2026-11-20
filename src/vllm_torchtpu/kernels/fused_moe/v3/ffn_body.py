@@ -21,6 +21,7 @@ steps; ffn_kernel.py builds the program and runs one of them.
 """
 
 import dataclasses
+from typing import Any, cast
 
 import jax.numpy as jnp
 from jax import lax
@@ -100,7 +101,7 @@ class Build:
     @property
     def rows_bf16(self):
         """bf16 token rows (Config.token_rows): the up matmul runs in bf16."""
-        return jnp.dtype(self.token_dtype) == jnp.dtype(jnp.bfloat16)
+        return jnp.dtype(cast(Any, self.token_dtype)) == jnp.dtype(jnp.bfloat16)
 
     @property
     def n_stream_blocks(self):

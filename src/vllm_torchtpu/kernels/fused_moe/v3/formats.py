@@ -14,7 +14,7 @@
 """The weight formats the kernel takes."""
 
 import enum
-from typing import NamedTuple
+from typing import Any, NamedTuple, cast
 
 import jax.numpy as jnp
 
@@ -73,7 +73,10 @@ class WeightForm(NamedTuple):
     def packed(self):
         """Four-bit weights (fp4 or int4): stored packed in 32-bit words
         and widened to fp8 in the kernel (an int4 value is exact in fp8)."""
-        return any(jnp.dtype(self.weight_dtype) == jnp.dtype(d) for d in PACKED_DTYPES)
+        return any(
+            jnp.dtype(cast(Any, self.weight_dtype)) == jnp.dtype(d)
+            for d in PACKED_DTYPES
+        )
 
     @property
     def has_scales(self):
@@ -112,6 +115,6 @@ def weight_form(weight_format):
 def weight_format_of_dtype(dtype):
     """The format carrying this weight element type, or None."""
     for weight_format, form in WEIGHT_FORMS.items():
-        if jnp.dtype(form.weight_dtype) == jnp.dtype(dtype):
+        if jnp.dtype(cast(Any, form.weight_dtype)) == jnp.dtype(dtype):
             return weight_format
     return None

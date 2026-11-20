@@ -75,8 +75,10 @@ def _unsupported_reason(layer: RoutedExperts, activation: str) -> str | None:
     """Why the kernel cannot serve this layer at all, or None."""
     if not layer.moe_config.moe_parallel_config.use_ep:
         return "it needs expert parallelism"
-    w13, w2 = layer.w13_weight, layer.w2_weight
-    s13, s2 = layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+    w13: Any = layer.w13_weight
+    w2: Any = layer.w2_weight
+    s13: Any = layer.w13_weight_scale_inv
+    s2: Any = layer.w2_weight_scale_inv
     in_dtype = layer.moe_config.in_dtype
     hidden = jax.ShapeDtypeStruct(
         (MOE_LOWTOK_MAX_TOKENS, layer.hidden_size), _jax_dtype(in_dtype)
@@ -115,7 +117,9 @@ def _routing_unsupported_reason(layer: RoutedExperts) -> str | None:
         return "e_score_correction_bias is not applied in the kernel"
     if (
         layer.use_grouped_topk
+        and layer.num_expert_group is not None
         and layer.num_expert_group > 1
+        and layer.topk_group is not None
         and layer.topk_group < layer.num_expert_group
     ):
         return "grouped top-k is not implemented in the kernel"

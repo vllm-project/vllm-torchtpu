@@ -390,6 +390,21 @@ def init_export_distributed_environment(vllm_config: Any) -> None:
     )
 
 
+@contextlib.contextmanager
+def _set_model_tag_context(tag: str) -> Any:
+    try:
+        from vllm.compilation import backends
+        from vllm.compilation.backends import set_model_tag
+    except ImportError:
+        yield
+        return
+    if backends.model_tag == tag:
+        yield
+        return
+    with set_model_tag(tag):
+        yield
+
+
 def run_model_loader(vllm_config: Any) -> nn.Module:
     """Builds the model and loads its weights with vLLM's loader for `load_config`.
 
@@ -404,7 +419,7 @@ def run_model_loader(vllm_config: Any) -> nn.Module:
         if load_format == "dummy"
         else "export.load_safetensors"
     )
-    with trace(span):
+    with trace(span), _set_model_tag_context("backbone"):
         loader = get_model_loader(vllm_config.load_config)
         # `@instrument` on `load_model` hides its signature from type checkers.
         load_model: Any = loader.load_model
@@ -505,6 +520,19 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
                 object.__setattr__(model, MTP_DRAFT_ATTR, draft)
             if separate_draft is not None:
                 object.__setattr__(model, draft_model.DRAFT_MODEL_ATTR, separate_draft)
+
+            from vllm_torchtpu import envs as tpu_envs
+            from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
+
+            if tpu_envs.TPU_GDN_FUSED_NORM_QUANT:
+                from vllm_torchtpu.layers.adapter import gated_norm_quant_op
+
+                gated_norm_quant_op.install(model)
+            moe_lowtok_scores.log_summary()
+            if tpu_envs.MOE_FUSED_EP_KERNEL_IMPL == "v3":
+                from vllm_torchtpu.layers.adapter import fused_moe_ep_v3
+
+                fused_moe_ep_v3.log_arming_summary()
             return model
 
 
@@ -537,7 +565,11 @@ def _load_mtp_draft(vllm_config: Any, target: nn.Module) -> nn.Module | None:
     draft_vllm_config = copy.copy(vllm_config)
     draft_model_config = copy.copy(spec.draft_model_config)
     draft_model_config.runner_type = "draft"
-    with trace("export.load_mtp_draft"), set_current_vllm_config(draft_vllm_config):
+    with (
+        trace("export.load_mtp_draft"),
+        _set_model_tag_context("eagle_head"),
+        set_current_vllm_config(draft_vllm_config),
+    ):
         loader = cast(
             Callable[..., torch.nn.Module],
             get_model_loader(vllm_config.load_config).load_model,

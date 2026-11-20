@@ -1196,6 +1196,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         self, layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
     ) -> torch.Tensor:
         """The grouped-matmul path: route, then fused_moe_gmm."""
+        layer = cast("TpuRoutedExperts", layer)
         if moe_lowtok_scores.serves(self._moe_lowtok_scores_op, x):
             op = self._moe_lowtok_scores_op
             assert op is not None

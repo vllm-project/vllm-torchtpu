@@ -23,6 +23,7 @@ outside it -- the MTP draft's -- keeps the eager path.
 
 import functools
 from collections.abc import Callable
+from typing import Any
 
 import jax
 import torch
@@ -47,12 +48,12 @@ _HOISTED_WEIGHT_ATTR = "_tpu_weight_plus_one"
 _ops: dict[tuple[int, int, int, int, float], Callable] = {}
 
 
-def _op_key(layer: torch.nn.Module) -> tuple[int, int, int, int, float]:
+def _op_key(layer: Any) -> tuple[int, int, int, int, float]:
     return (
-        layer.num_heads,
-        layer.num_kv_heads,
-        layer.head_dim,
-        layer.rotary_emb.rotary_dim,
+        int(layer.num_heads),
+        int(layer.num_kv_heads),
+        int(layer.head_dim),
+        int(layer.rotary_emb.rotary_dim),
         float(layer.q_norm.variance_epsilon),
     )
 
@@ -96,7 +97,7 @@ def _build_op(key: tuple[int, int, int, int, float]) -> None:
     _ops[key] = op
 
 
-def _weight_plus_one(norm: torch.nn.Module) -> torch.Tensor:
+def _weight_plus_one(norm: Any) -> torch.Tensor:
     hoisted = getattr(norm, _HOISTED_WEIGHT_ATTR, None)
     return norm.weight.float() + 1.0 if hoisted is None else hoisted
 
@@ -122,7 +123,7 @@ def _unsupported_graph_reason() -> str | None:
     return None
 
 
-def _unsupported_reason(layer: torch.nn.Module, model_config) -> str | None:
+def _unsupported_reason(layer: Any, model_config) -> str | None:
     reason = _unsupported_graph_reason()
     if reason is not None:
         return reason
@@ -152,7 +153,7 @@ def _log_armed_rows(vllm_config: VllmConfig) -> None:
     )
 
 
-def _prebuild(layer: torch.nn.Module, model_config) -> bool:
+def _prebuild(layer: Any, model_config) -> bool:
     reason = _unsupported_reason(layer, model_config)
     if reason is not None:
         logger.warning_once(
@@ -169,7 +170,7 @@ def _prebuild(layer: torch.nn.Module, model_config) -> bool:
 
 
 def project_qkv_gate(
-    layer: torch.nn.Module, qkv: torch.Tensor, positions: torch.Tensor
+    layer: Any, qkv: torch.Tensor, positions: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``Qwen3NextAttention._project_qkv_gate`` through the fused kernel."""
     q_gate, k, v = qkv.split([layer.q_size * 2, layer.kv_size, layer.kv_size], dim=-1)

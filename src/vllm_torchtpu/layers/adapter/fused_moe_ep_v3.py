@@ -40,7 +40,7 @@ zeroed so nothing of it travels, and the kernel returns zero for it.
 
 from collections import Counter
 from collections.abc import Callable
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -256,14 +256,14 @@ def _build_op(
     ) -> jax.Array:
         return run_moe(x, w1, w2, w1_scale, w2_scale, gating, experts_start, padded)
 
-    fn = moe_skip_padded if skip_padded_tokens else moe
+    fn: Any = moe_skip_padded if skip_padded_tokens else moe
     spec = PartitionSpec(EP_AXIS_NAME)
     # x, w1, w2, w1_scale, w2_scale, gating, experts_start [, padded] -- every
     # operand and the single output are sharded on axis 0 over the EP axis.
-    op = jax_op(
+    op = cast(Any, jax_op)(
         name,
         fn,
-        mesh=mesh,
+        mesh=cast(Any, mesh),
         input_partition_specs=(spec,) * (8 if skip_padded_tokens else 7),
         output_partition_specs=spec,
     )

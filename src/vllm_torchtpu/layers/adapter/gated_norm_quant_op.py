@@ -21,6 +21,7 @@ on them, instead of ``RMSNormGated`` followed by the fp8 linear.
 """
 
 from collections.abc import Callable
+from typing import Any
 
 import jax
 import torch
@@ -64,7 +65,8 @@ def _build_ops(eps: float) -> None:
 
 def unsupported_reason(layer: QwenGatedDeltaNetAttention) -> str | None:
     """Why the fused path cannot serve ``layer``, or None."""
-    norm, out_proj = layer.norm, layer.out_proj
+    norm: Any = layer.norm
+    out_proj: Any = layer.out_proj
     if not isinstance(norm, RMSNormGated):
         return f"the output norm is {type(norm).__name__}, not RMSNormGated"
     if not norm.norm_before_gate:
@@ -112,8 +114,9 @@ def install(model: torch.nn.Module) -> int:
                 f"{reason}. Unset TPU_GDN_FUSED_NORM_QUANT."
             )
     for layer in layers:
-        _build_ops(float(layer.norm.eps))
-        layer.fused_norm_quant = True
+        layer_any: Any = layer
+        _build_ops(float(layer_any.norm.eps))
+        layer_any.fused_norm_quant = True
     logger.info(
         "[GDN] TPU_GDN_FUSED_NORM_QUANT: %d layers run the gated norm and "
         "out_proj fp8 quantization as one kernel",
@@ -127,9 +130,10 @@ def output_projection(
 ) -> torch.Tensor:
     """core_attn_out, z: [tokens, local v heads, head_v_dim]."""
     tokens = core_attn_out.shape[0]
-    out_proj = layer.out_proj
-    q, s = _norm_ops[float(layer.norm.eps)](
-        core_attn_out, z.reshape(core_attn_out.shape), layer.norm.weight
+    norm: Any = layer.norm
+    out_proj: Any = layer.out_proj
+    q, s = _norm_ops[float(norm.eps)](
+        core_attn_out, z.reshape(core_attn_out.shape), norm.weight
     )
     output = linear_common.quantized_matmul_prequant(
         q.reshape(tokens, -1), s, out_proj.weight, out_proj.weight_scale

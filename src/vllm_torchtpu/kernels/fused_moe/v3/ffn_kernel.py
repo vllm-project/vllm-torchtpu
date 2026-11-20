@@ -833,7 +833,11 @@ def build_ffn_kernel(
             w2,
             *scales,
             *biases,
-            *(transport_sems if pallas_transport else ()),
+            *(
+                transport_sems
+                if pallas_transport and transport_sems is not None
+                else ()
+            ),
         )
         return arrivals, arrival_scales.reshape(arrival_rows)
 

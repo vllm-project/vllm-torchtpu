@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -355,7 +356,7 @@ def outer_kernel_tables_in_kernel(
     b_ref: jax.Array,
     a_ref: jax.Array,
     source_ref: jax.Array,
-    _: jax.Array,
+    _unused: jax.Array,
     weights_ref: memory_ref.WeightRefs,
     # Outputs.
     out_ref: jax.Array,
@@ -389,7 +390,7 @@ def outer_kernel_tables_in_kernel(
         b_ref,
         a_ref,
         source_ref,
-        _,
+        _unused,
         weights_ref,
         out_ref,
         source_out_ref,
@@ -406,7 +407,7 @@ def outer_kernel_tables_in_kernel(
             b_ref,
             a_ref,
             source_ref,
-            _,
+            _unused,
             weights_ref,
             out_ref,
             source_out_ref,
@@ -925,7 +926,7 @@ def fused_conv1d_gdn(
                 vmem_limit_bytes=vmem_limit_bytes,
             ),
             name=cfg_b.get_kernel_name() + "_tables_in_kernel",
-            metadata=cfg_b.get_metadata(),
+            metadata=cast(dict[str, str], cfg_b.get_metadata()),
         )(*raw, qkv, b, a, in_source, in_act, weights)
 
     # The first segment holds verify windows of up to `num_spec_tokens + 1`

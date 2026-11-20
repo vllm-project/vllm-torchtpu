@@ -22,6 +22,7 @@ index-driven DMA per block.
 """
 
 import functools
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -95,7 +96,7 @@ def _jax_private():
 
 def _empty_output_ref(out_type):
     new_ref, memory_space_type, _, _, out_shape_to_aval = _jax_private()
-    aval = out_shape_to_aval(out_type)
+    aval: Any = out_shape_to_aval(out_type)
     memory_space = (
         None if isinstance(aval.memory_space, memory_space_type) else aval.memory_space
     )

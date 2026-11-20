@@ -21,6 +21,7 @@ armed layer runs that path below its per-step token gate (`apply`).
 """
 
 from collections.abc import Callable
+from typing import Any
 
 import torch
 from vllm.distributed.parallel_state import get_ep_group
@@ -85,7 +86,7 @@ def apply(
             router_logits,
             layer._experts_start,
         )
-    ep = get_ep_group()
+    ep: Any = get_ep_group()
     sequence_parallel = layer.moe_config.moe_parallel_config.is_sequence_parallel
     x, router_logits = ep.dispatch_router_logits(x, router_logits, sequence_parallel)
     return ep.combine(grouped(layer, x, router_logits), sequence_parallel)

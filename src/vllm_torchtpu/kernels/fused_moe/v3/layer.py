@@ -26,6 +26,7 @@ TensorCore sum.
 
 import math
 import threading
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -942,10 +943,10 @@ def fused_ep_moe(
     weight_format = form.name
     weight_block = WEIGHT_BLOCK_DEFAULT if weight_block is None else int(weight_block)
     for name, w in (("w1", w1), ("w2", w2)):
-        if jnp.dtype(w.dtype) != jnp.dtype(form.weight_dtype):
+        if jnp.dtype(w.dtype) != jnp.dtype(cast(Any, form.weight_dtype)):
             raise ValueError(
                 f"weight format {weight_format!r} takes "
-                f"{jnp.dtype(form.weight_dtype).name} expert "
+                f"{jnp.dtype(cast(Any, form.weight_dtype)).name} expert "
                 f"weights and {name} is {jnp.dtype(w.dtype).name}"
             )
     tokens, hidden = x.shape

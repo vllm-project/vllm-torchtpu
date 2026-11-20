@@ -18,6 +18,7 @@ Config directly (the serving adapter builds one from its own settings).
 """
 
 import dataclasses
+from typing import Any, cast
 
 import jax.numpy as jnp
 
@@ -350,7 +351,7 @@ class Config:
                 f"multiple of {LANES}"
             )
         dtypes = [jnp.dtype(d) for d in ROW_SCALE_DTYPES]
-        if jnp.dtype(self.row_scale_dtype) not in dtypes:
+        if jnp.dtype(cast(Any, self.row_scale_dtype)) not in dtypes:
             raise ValueError(
                 f"row_scale_dtype {self.row_scale_dtype} is not "
                 f"one of {[d.name for d in dtypes]}"
