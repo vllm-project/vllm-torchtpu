@@ -226,10 +226,9 @@ def test_manifest_preserves_lifecycle_dependencies():
         "patch_block_hash_reuse",
         "patch_send_new_prompt_ids",
     ]
-    engine_core_only = {"patch_engine_core_deferred_step"}
-    assert [
-        name for name in stages["platform_activation"] if name not in engine_core_only
-    ] == (stages["worker_init"] + stages["model_load"])
+    assert stages["platform_activation"] == (
+        stages["worker_init"] + stages["model_load"]
+    )
     assert stages["model_load"] == [
         "maybe_patch_qwen2_5_vl",
         "maybe_patch_qwen3_vl",

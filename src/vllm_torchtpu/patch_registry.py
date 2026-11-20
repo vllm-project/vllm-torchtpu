@@ -92,10 +92,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
     Patch("vllm_torchtpu:_patch_raiden_identity_keeps_cp_interleave", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
-    Patch(
-        "vllm_torchtpu.core.deferred_step:patch_engine_core_deferred_step",
-        ("platform_activation", "engine_core"),
-    ),
+    Patch("vllm_torchtpu.core.deferred_step:patch_engine_core_deferred_step", _ENGINE),
     Patch(
         "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
         _ENGINE,
