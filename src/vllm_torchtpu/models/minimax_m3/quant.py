@@ -18,7 +18,8 @@ compressed-tensors NVFP4 scheme (`moe_quant_algo`). The target model's MXFP8
 linears stay e4m3 with one power-of-two scale per output channel
 (`requantize_mxfp8_per_channel`), which halves the weight bytes every decode
 step streams; the DSpark draft's linears are dequantized to bf16, which its
-column-parallel matmuls read raw. The experts reuse the TPU NVFP4 MoE path
+column-parallel matmuls read raw (with TPU_MINIMAX_M3_FP8_DRAFT_LINEARS its
+MLP linears stay e4m3 too). The experts reuse the TPU NVFP4 MoE path
 after renaming the compressed-tensors tensors to ModelOpt's.
 """
 
@@ -324,6 +325,11 @@ class MiniMaxM3QuantConfig(VllmNvfp4Config):
 
     # Whether bias-free MXFP8 linears stay e4m3 (set by from_config).
     fp8_linears: bool = False
+    # The DSpark draft's config (set by from_config). With
+    # TPU_MINIMAX_M3_FP8_DRAFT_LINEARS only its MLP linears stay e4m3: at its
+    # few rows the in-fusion e4m3 -> bf16 convert bounds the matmul, so the
+    # small qkv/o_proj ran slower in e4m3 while gate_up/down ran faster.
+    is_draft: bool = False
 
     @classmethod
     def get_name(cls) -> str:
@@ -356,8 +362,9 @@ class MiniMaxM3QuantConfig(VllmNvfp4Config):
             group_size=_NVFP4_GROUP,
         )
         # The draft checkpoint names its modules under the dspark prefix.
-        quant_config.fp8_linears = envs.TPU_MINIMAX_M3_FP8_LINEARS and not any(
-            name.startswith(old) for name in ignored
+        quant_config.is_draft = any(name.startswith(old) for name in ignored)
+        quant_config.fp8_linears = envs.TPU_MINIMAX_M3_FP8_LINEARS and (
+            envs.TPU_MINIMAX_M3_FP8_DRAFT_LINEARS or not quant_config.is_draft
         )
         return quant_config
 
@@ -368,7 +375,8 @@ class MiniMaxM3QuantConfig(VllmNvfp4Config):
         if isinstance(layer, LinearBase):
             if excluded:
                 return VllmUnquantizedLinearMethod()
-            return MiniMaxM3Mxfp8LinearMethod(self.fp8_linears)
+            keep_fp8 = self.fp8_linears and (not self.is_draft or ".mlp." in prefix)
+            return MiniMaxM3Mxfp8LinearMethod(keep_fp8)
         if isinstance(layer, RoutedExperts):
             if excluded:
                 return VllmUnquantizedFusedMoEMethod(self.get_moe_config(layer))

@@ -268,6 +268,8 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_TPOT_TARGET_MS: float = 0.0
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
     VLLM_TPU_PREFILL_TPOT_PRICED: bool = False
+    TPU_FP8_LM_HEAD: bool = False
+    TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = False
     VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON: float = 1.0
     VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S: float = 0.0
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
@@ -1739,6 +1741,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whole remaining prefills up to the largest prefill-token bin (512-4096)
     # whose measured step time fits every decoding request's slack.
     "VLLM_TPU_PREFILL_TPOT_PRICED": env_bool("VLLM_TPU_PREFILL_TPOT_PRICED"),
+    # MiniMax-M3's LM head (the target's, and the DSpark draft's that shares it)
+    # runs on an e4m3 copy of its weight with one scale per vocabulary row
+    # (kernels/fp8_lm_head.py): half the bytes per decode step. Changes the
+    # logits by the weight's e4m3 rounding, so it is opt-in.
+    "TPU_FP8_LM_HEAD": env_bool("TPU_FP8_LM_HEAD", default=False),
+    # The DSpark draft's MXFP8 MLP linears (gate_up/down; its qkv/o_proj stay
+    # bf16) follow TPU_MINIMAX_M3_FP8_LINEARS and stay e4m3 with per-channel
+    # power-of-two scales, halving the bytes the drafter streams every draft
+    # step. 0 (default) dequantizes every draft linear to bf16.
+    "TPU_MINIMAX_M3_FP8_DRAFT_LINEARS": env_bool(
+        "TPU_MINIMAX_M3_FP8_DRAFT_LINEARS", default=False
+    ),
     # PrefillSpacingScheduler: the TPOT target defers prefill while a decoding
     # request's slack is below this many long-chunk step prices (long minus
     # decode step time). Above 1 it also covers the step async scheduling has
