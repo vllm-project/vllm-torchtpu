@@ -111,7 +111,7 @@ def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, int]:
     primaries and copy slots; table entries past the target's layers (a
     drafter's) are not target layers. A table with copy slots also budgets
     the drafter's MoE layer for its copy slots, whether or not the table
-    places it: the measured budgets did (every TP8 decode leg of the record
+    places it: the measured budgets did (every TP8 decode leg of the measured
     runs logged that budget), and it leaves copies x 3 x hidden x
     moe_intermediate bytes (48 MiB for 4 copies at Qwen3.5-397B-A17B's shape)
     unspent where the drafter's layer is not placed."""
