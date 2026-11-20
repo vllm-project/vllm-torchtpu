@@ -11,17 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The torch.compile fast-call hook and additional_config["tpu_compile"].
+"""The tpu_compile decorator's fast dispatch and additional_config["tpu_compile"].
 
-The hook is installed when the TPU platform module loads, so it is always in
-place; these tests check that it does nothing until the options arm it, and
-that each option does what it says once armed. Functions are compiled with
-the eager backend, which runs on CPU and keeps Dynamo's guards and cache
+Functions are compiled with ``tpu_compile`` at import, before the options are
+known; these tests check that its wrapper does nothing until the options arm
+it, and that each option does what it says once armed. Functions are compiled
+with the eager backend, which runs on CPU and keeps Dynamo's guards and cache
 entries.
 """
 
 import functools
-import inspect
 import os
 import subprocess
 import sys
@@ -31,14 +30,13 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from vllm_torchtpu import patch_registry
 from vllm_torchtpu.compilation import compile_options, fast_dispatch
 from vllm_torchtpu.compilation.compile_options import CompileOptions
 
 
 @pytest.fixture(autouse=True)
 def _disarmed():
-    """Every test starts and ends with the hook disarmed (main's default)."""
+    """Every test starts and ends with the options off (main's default)."""
     fast_dispatch.configure(fast=False, drop_global_state=False)
     torch._dynamo.reset()
     yield
@@ -52,7 +50,7 @@ def _config(section=None):
 
 
 def _compiled(fn):
-    """What the hook builds for an eligible function, on the eager backend."""
+    """What tpu_compile builds for a function, on the eager backend."""
     compiled = torch.compile(
         fn,
         backend="eager",
@@ -89,153 +87,25 @@ def test_options_are_strict(raw, message):
         compile_options.parse(raw)
 
 
-def test_hook_is_installed_at_platform_import():
-    import vllm_torchtpu.platforms  # noqa: F401
-
-    assert "vllm_torchtpu.compilation.fast_dispatch:install" in patch_registry._applied
-    assert fast_dispatch._INSTALLED
-    assert torch.compile.__name__ == "compile"
-    assert torch.compile.__code__.co_name == "compile_hook"
-
-
-def _hook_with_stand_in_backend():
-    """The torch.compile hook the platform installs, built over torch's own
-    compile with the "tpu" backend standing in as "eager"; records the
-    keyword arguments each call hands torch.compile."""
-    real_compile = inspect.unwrap(torch.compile)
-    calls = []
-
-    def stand_in(model=None, *args, **kwargs):
-        calls.append(
-            {k: dict(v) if isinstance(v, dict) else v for k, v in kwargs.items()}
-        )
-        if kwargs.get("backend") == "tpu":
-            kwargs = {**kwargs, "backend": "eager"}
-        return real_compile(model, *args, **kwargs)
-
-    return fast_dispatch.make_compile_hook(stand_in), calls
-
-
-ELIGIBLE = {"backend": "tpu", "fullgraph": True, "dynamic": False}
-
-
-@pytest.mark.parametrize("form", ["direct", "decorator"])
-def test_hook_wraps_eligible_functions_and_calls_through(form):
-    hook, calls = _hook_with_stand_in_backend()
-
-    def f(x):
-        return x * 2 + 1
-
-    wrapped = hook(f, **ELIGIBLE) if form == "direct" else hook(**ELIGIBLE)(f)
-    assert calls == [
-        {**ELIGIBLE, "options": {"guard_filter_fn": fast_dispatch._drop_global_state}}
-    ]
-    assert wrapped._fast_dispatch_state["entries"] == []
-    assert wrapped._torchdynamo_orig_callable is f
-    # Disarmed it calls the compiled function; armed, the first call goes
-    # through Dynamo and records the entry, and the next ones dispatch directly.
-    assert _calls(wrapped, 2) == [0, 0]
-    fast_dispatch.configure(fast=True, drop_global_state=False)
-    assert _calls(wrapped, 3) == [2, 1]
-
-
-def test_hook_returns_the_function_when_dynamo_is_disabled():
-    """With TORCHDYNAMO_DISABLE=1, torch.compile returns the function itself."""
-
-    def f(x):
-        return x * 2 + 1
-
-    def disabled(model=None, **kwargs):
-        return model
-
-    hook = fast_dispatch.make_compile_hook(disabled)
-    assert hook(f, **ELIGIBLE) is f
-    assert hook(**ELIGIBLE)(f) is f
-
-
-def test_decorated_modules_import_with_dynamo_disabled():
-    """A module-level decorated site imports and runs with Dynamo disabled, as
-    on main: the decorator leaves the plain function."""
+def test_platform_import_leaves_torch_compile_alone():
+    """Nothing in the package replaces torch.compile: importing the platform,
+    the worker and the runner, which decorate their compiled functions, keeps
+    the torch.compile the process had."""
     code = """
 import torch
-import vllm_torchtpu.platforms  # installs the hook
-from vllm_torchtpu.kernels import partial_kv_update
-fn = partial_kv_update.pallas_index_copy_
-assert not hasattr(fn, "_fast_dispatch_state"), fn
-assert fn.__code__.co_name == "pallas_index_copy_", fn
-assert torch.compile.__code__.co_name == "compile_hook"
-print("ok")
-"""
-    env = dict(os.environ, TORCHDYNAMO_DISABLE="1")
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.strip().endswith("ok")
-
-
-def test_installing_the_hook_does_not_import_vllm():
-    """The platform_import stage runs before vLLM is imported: its targets may
-    import torch, not vLLM (tpu_patch_mechanism.md)."""
-    code = """
-import sys
-from vllm_torchtpu.compilation import fast_dispatch
-assert "vllm" not in sys.modules, "vllm imported before install"
-fast_dispatch.install()
-assert "vllm" not in sys.modules, "install imported vllm"
+before = torch.compile
+import vllm_torchtpu.platforms  # noqa: F401
+from vllm_torchtpu.runner import tpu_runner  # noqa: F401
+from vllm_torchtpu.worker import tpu_worker  # noqa: F401
+assert torch.compile is before, torch.compile
+assert hasattr(tpu_runner.TPUModelRunner.sample_from_logits, "_fast_dispatch_state")
 print("ok")
 """
     result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=600
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip().endswith("ok")
-
-
-class _Module(torch.nn.Module):
-    def forward(self, x):
-        return x
-
-
-@pytest.mark.parametrize(
-    "model,args,kwargs",
-    [
-        ("f", (), {**ELIGIBLE, "dynamic": True}),
-        ("f", (), {**ELIGIBLE, "dynamic": None}),
-        ("f", (), {**ELIGIBLE, "fullgraph": False}),
-        ("f", (), {**ELIGIBLE, "backend": "inductor"}),
-        ("f", (), {**ELIGIBLE, "mode": "reduce-overhead"}),
-        ("f", (), {**ELIGIBLE, "options": {"trace.enabled": True}}),
-        ("f", (), {**ELIGIBLE, "disable": True}),
-        ("module", (), ELIGIBLE),
-        ("f", ("tpu",), {}),
-    ],
-)
-def test_hook_passes_other_calls_through_unchanged(model, args, kwargs):
-    seen = []
-    result = object()
-
-    def stand_in(m=None, *a, **kw):
-        seen.append((m, a, kw))
-        return result
-
-    hook = fast_dispatch.make_compile_hook(stand_in)
-
-    def f(x):
-        return x
-
-    target = f if model == "f" else _Module()
-    assert hook(target, *args, **kwargs) is result
-    assert seen == [(target, args, kwargs)]
-    # The decorator form passes them through too.
-    if not args:
-        seen.clear()
-        assert hook(**kwargs)(target) is result
-        assert seen == [(target, (), kwargs)]
 
 
 def _stand_in_compile(monkeypatch, result=None):
@@ -257,6 +127,9 @@ def _stand_in_compile(monkeypatch, result=None):
 
     monkeypatch.setattr(torch, "compile", stand_in)
     return calls
+
+
+ELIGIBLE = {"backend": "tpu", "fullgraph": True, "dynamic": False}
 
 
 def test_tpu_compile_compiles_with_the_filter_and_wraps(monkeypatch):
@@ -287,6 +160,34 @@ def test_tpu_compile_returns_the_function_when_dynamo_is_disabled(monkeypatch):
         return x * 2 + 1
 
     assert fast_dispatch.tpu_compile(f) is f
+
+
+def test_decorated_modules_import_with_dynamo_disabled():
+    """A module-level decorated site imports and runs with Dynamo disabled, as
+    on main: the decorator leaves the plain function."""
+    code = """
+import torch
+from vllm_torchtpu.runner import min_tokens
+fn = min_tokens.mask_stop_tokens
+assert not hasattr(fn, "_fast_dispatch_state"), fn
+assert fn.__code__.co_name == "mask_stop_tokens", fn
+print("ok")
+"""
+    env = dict(os.environ, TORCHDYNAMO_DISABLE="1")
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().endswith("ok")
+
+
+class _Module(torch.nn.Module):
+    def forward(self, x):
+        return x
 
 
 @pytest.mark.parametrize("target", ["module", "bound method", "partial"])
@@ -419,7 +320,7 @@ def test_drop_global_state_guard_reuses_the_entry_across_threads():
     assert _num_threads_recompiles() == 1
 
 
-def test_worker_arms_the_hook_before_anything_else():
+def test_worker_arms_the_options_before_anything_else():
     from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
     class Stop(Exception):
