@@ -92,7 +92,8 @@ def apply_omni_model_specific_patches() -> None:
     _patch_ltx2_per_batch_timestep()
     _patch_ltx2_guidance_sigma_scalar()
     _patch_ltx2_async_guidance_step()
-    _patch_ltx2_fast_eager_dispatch()
+    _patch_ltx2_fast_attention_dispatch()
+    _patch_ulysses_inference_all_to_all_4d()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -1154,51 +1155,37 @@ def _patch_ltx2_async_guidance_step() -> None:
     )
 
 
-_LTX2_FAST_EAGER_DISPATCH_PATCHED = "_tpu_ltx2_fast_eager_dispatch_patched"
+_LTX2_FAST_ATTENTION_DISPATCH_PATCHED = "_tpu_ltx2_fast_attention_dispatch_patched"
+_ULYSSES_INFERENCE_A2A_PATCHED = "_tpu_ulysses_inference_all_to_all_4d_patched"
 
 
-def _patch_ltx2_fast_eager_dispatch() -> None:
-    """Eliminate Python reflection and wrapper overhead in eager Ulysses dispatch.
+def _patch_ltx2_fast_attention_dispatch() -> None:
+    """Skip per-call ``inspect.signature`` reflection in ``LTX2Attention``.
 
     Upstream provenance (vllm-omni 0.32.0rc1):
     ``vllm_omni/diffusion/models/ltx2/ltx2_transformer.py``
-    (``LTX2Attention.forward``) and
-    ``vllm_omni/diffusion/distributed/comm.py`` (``all_to_all_4D`` and
-    ``SeqAllToAll4D``).
+    (``LTX2Attention.forward``).
 
-    Host-timeline profiling of the 48-block LTX-2 denoise step showed two
-    pure-Python dispatch hotspots:
-    1. ``LTX2Attention.forward`` calls ``inspect.signature(self.processor.__call__)``
-       on all 288 attention calls per step (11,520 calls per 40-step run,
-       ~19 ms/step under 8-worker load). Fast-pathing the standard 6-arg call
-       (all LTX-2 processors in vllm-omni 0.32.0rc1 accept
-       ``perturbation_mask``) and caching processor signatures per class
-       eliminates per-call reflection.
-    2. ``SeqAllToAll4D.apply`` boxes through ``torch.autograd.Function.apply``
-       288 times per step under ``torch.no_grad()`` and performs a double
-       transpose in ``(scatter_idx=1, gather_idx=2)``. Calling
-       ``all_to_all_4D`` directly with a single ``permute`` removes autograd
-       boxing and extra transpose ops for inference (shared across Ulysses
-       diffusion models). Callers passing ``use_sync=True`` or
-       ``_output_destination`` fall back to upstream ``comm.all_to_all_4D``.
+    Upstream ``LTX2Attention.forward`` calls
+    ``inspect.signature(self.processor.__call__)`` and builds filtered kwargs on
+    all 288 attention calls per step (11,520 calls per 40-step run, about
+    19 ms/step of host time per worker under 8-worker load). The plain 6-arg
+    call on the default ``LTX2AudioVideoAttnProcessor`` (which accepts
+    ``perturbation_mask``) goes straight to the processor. Any other processor,
+    or extra kwargs, takes upstream's filtering path with the signature cached
+    per processor class.
 
     REMOVAL / FIX CONDITION:
-    Remove once vLLM-Omni caches ``inspect.signature`` in
-    ``LTX2Attention.forward`` and bypasses autograd boxing / double-transpose
-    in inference ``SeqAllToAll4D`` / ``all_to_all_4D``.
+    Remove once vLLM-Omni caches the processor signature in
+    ``LTX2Attention.forward``.
     """
     import inspect
 
-    from vllm_omni.diffusion.attention.parallel import ulysses as ulysses_mod
-    from vllm_omni.diffusion.distributed import comm
-    from vllm_omni.diffusion.models.ltx2 import ltx2_sequence_parallel
-    from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2Attention
+    from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
 
-    if getattr(
-        LTX2Attention.forward,
-        _LTX2_FAST_EAGER_DISPATCH_PATCHED,
-        False,
-    ):
+    attention_cls = ltx2_transformer.LTX2Attention
+    default_processor_cls = ltx2_transformer.LTX2AudioVideoAttnProcessor
+    if getattr(attention_cls.forward, _LTX2_FAST_ATTENTION_DISPATCH_PATCHED, False):
         return
 
     sig_cache: dict[type, frozenset[str]] = {}
@@ -1210,11 +1197,13 @@ def _patch_ltx2_fast_eager_dispatch() -> None:
         attention_mask: torch.Tensor | None = None,
         query_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         key_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        *,
         perturbation_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        if not kwargs:
-            return self.processor(
+        processor = self.processor
+        if not kwargs and type(processor) is default_processor_cls:
+            return processor(
                 self,
                 hidden_states,
                 encoder_hidden_states,
@@ -1223,30 +1212,68 @@ def _patch_ltx2_fast_eager_dispatch() -> None:
                 key_rotary_emb,
                 perturbation_mask=perturbation_mask,
             )
-        proc_cls = type(self.processor)
+        if perturbation_mask is not None:
+            kwargs["perturbation_mask"] = perturbation_mask
+        proc_cls = type(processor)
         attn_parameters = sig_cache.get(proc_cls)
         if attn_parameters is None:
             attn_parameters = frozenset(
-                inspect.signature(self.processor.__call__).parameters.keys()
+                inspect.signature(processor.__call__).parameters.keys()
             )
             sig_cache[proc_cls] = attn_parameters
-        filtered = {k: v for k, v in kwargs.items() if k in attn_parameters}
-        if perturbation_mask is not None and "perturbation_mask" in attn_parameters:
-            filtered["perturbation_mask"] = perturbation_mask
-        return self.processor(
+        unused_kwargs = [k for k in kwargs if k not in attn_parameters]
+        if unused_kwargs:
+            logger.warning(
+                "attention_kwargs %s are not expected by %s and will be ignored.",
+                unused_kwargs,
+                proc_cls.__name__,
+            )
+        return processor(
             self,
             hidden_states,
             encoder_hidden_states,
             attention_mask,
             query_rotary_emb,
             key_rotary_emb,
-            **filtered,
+            **{k: v for k, v in kwargs.items() if k in attn_parameters},
         )
+
+    setattr(_fast_ltx2_attention_forward, _LTX2_FAST_ATTENTION_DISPATCH_PATCHED, True)
+    attention_cls.forward = _fast_ltx2_attention_forward
+    logger.info("Applied TPU patch: fast LTX-2 attention processor dispatch.")
+
+
+def _patch_ulysses_inference_all_to_all_4d() -> None:
+    """Run inference Ulysses 4D all-to-all without autograd boxing.
+
+    Upstream provenance (vllm-omni 0.32.0rc1):
+    ``vllm_omni/diffusion/distributed/comm.py`` (``all_to_all_4D`` and
+    ``SeqAllToAll4D``).
+
+    Scope: process-wide. ``comm.all_to_all_4D`` and ``SeqAllToAll4D`` are shared
+    by every Ulysses model (LTX-2, Wan, Kandinsky6, ...); every module that
+    imports ``SeqAllToAll4D`` binds the same class, so setting ``apply`` once
+    covers them all. ``SeqAllToAll4D`` defines no backward, so skipping
+    ``torch.autograd.Function.apply`` (called 288 times per LTX-2 step under
+    ``torch.no_grad()``) changes nothing but host time. The ``(2, 1)`` and
+    ``(1, 2)`` layouts use one ``permute`` instead of chained transposes and
+    are bit-exact with upstream. ``use_sync=True``, ``_output_destination``,
+    a world size of 1 and other index pairs go to upstream ``all_to_all_4D``.
+    Modules that imported ``all_to_all_4D`` by name keep upstream's function.
+
+    REMOVAL / FIX CONDITION:
+    Remove once vLLM-Omni's inference ``SeqAllToAll4D`` / ``all_to_all_4D``
+    skip autograd boxing and the double transpose.
+    """
+    from vllm_omni.diffusion.distributed import comm
+
+    if getattr(comm.all_to_all_4D, _ULYSSES_INFERENCE_A2A_PATCHED, False):
+        return
 
     orig_all_to_all_4d = comm.all_to_all_4D
 
     def _fast_all_to_all_4d(
-        input_t: torch.Tensor,
+        input: torch.Tensor,
         scatter_idx: int = 2,
         gather_idx: int = 1,
         group: Any = None,
@@ -1254,83 +1281,74 @@ def _patch_ltx2_fast_eager_dispatch() -> None:
         *,
         _output_destination: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if _output_destination is not None or use_sync:
+        assert input.dim() == 4, (
+            f"input must be 4D tensor, got {input.dim()} and shape {input.shape}"
+        )
+        seq_world_size = torch.distributed.get_world_size(group)
+        if (
+            (scatter_idx, gather_idx) not in ((2, 1), (1, 2))
+            or seq_world_size <= 1
+            or use_sync
+            or _output_destination is not None
+        ):
             return orig_all_to_all_4d(
-                input_t,
+                input,
                 scatter_idx,
                 gather_idx,
                 group=group,
                 use_sync=use_sync,
                 _output_destination=_output_destination,
             )
-        seq_world_size = torch.distributed.get_world_size(group)
-        if seq_world_size <= 1:
-            return input_t
-        if scatter_idx == 2 and gather_idx == 1:
-            bs, shard_seqlen, hc, hs = input_t.shape
-            seqlen = shard_seqlen * seq_world_size
-            shard_hc = hc // seq_world_size
+        if scatter_idx == 2:
+            bs, shard_seqlen, hc, hs = input.shape
             send_buf = (
-                input_t.reshape(bs, shard_seqlen, seq_world_size, shard_hc, hs)
+                input.reshape(
+                    bs, shard_seqlen, seq_world_size, hc // seq_world_size, hs
+                )
                 .permute(2, 1, 0, 3, 4)
                 .contiguous()
             )
             recv_buf = torch.empty_like(send_buf)
             torch.distributed.all_to_all_single(recv_buf, send_buf, group=group)
             return (
-                recv_buf.reshape(seqlen, bs, shard_hc, hs).transpose(0, 1).contiguous()
-            )
-        if scatter_idx == 1 and gather_idx == 2:
-            bs, seqlen, shard_hc, hs = input_t.shape
-            hc = shard_hc * seq_world_size
-            shard_seqlen = seqlen // seq_world_size
-            send_buf = (
-                input_t.reshape(bs, seq_world_size, shard_seqlen, shard_hc, hs)
-                .permute(1, 3, 2, 0, 4)
+                recv_buf.reshape(
+                    shard_seqlen * seq_world_size, bs, hc // seq_world_size, hs
+                )
+                .transpose(0, 1)
                 .contiguous()
             )
-            recv_buf = torch.empty_like(send_buf)
-            torch.distributed.all_to_all_single(recv_buf, send_buf, group=group)
-            return (
-                recv_buf.reshape(hc, shard_seqlen, bs, hs)
-                .permute(2, 1, 0, 3)
-                .contiguous()
+        bs, seqlen, shard_hc, hs = input.shape
+        send_buf = (
+            input.reshape(bs, seq_world_size, seqlen // seq_world_size, shard_hc, hs)
+            .permute(1, 3, 2, 0, 4)
+            .contiguous()
+        )
+        recv_buf = torch.empty_like(send_buf)
+        torch.distributed.all_to_all_single(recv_buf, send_buf, group=group)
+        return (
+            recv_buf.reshape(
+                shard_hc * seq_world_size, seqlen // seq_world_size, bs, hs
             )
-        return orig_all_to_all_4d(
-            input_t,
-            scatter_idx,
-            gather_idx,
-            group=group,
-            use_sync=use_sync,
+            .permute(2, 1, 0, 3)
+            .contiguous()
         )
 
     def _fast_seq_all_to_all_4d_apply(
         group: Any,
-        input_t: torch.Tensor,
+        input: torch.Tensor,
         scatter_idx: int,
         gather_idx: int,
         use_sync: bool = False,
     ) -> torch.Tensor:
         return _fast_all_to_all_4d(
-            input_t,
+            input,
             scatter_idx,
             gather_idx,
             group=group,
             use_sync=use_sync,
         )
 
-    setattr(
-        _fast_ltx2_attention_forward,
-        _LTX2_FAST_EAGER_DISPATCH_PATCHED,
-        True,
-    )
-    LTX2Attention.forward = _fast_ltx2_attention_forward
+    setattr(_fast_all_to_all_4d, _ULYSSES_INFERENCE_A2A_PATCHED, True)
     comm.all_to_all_4D = _fast_all_to_all_4d
     comm.SeqAllToAll4D.apply = staticmethod(_fast_seq_all_to_all_4d_apply)
-    ulysses_mod.SeqAllToAll4D.apply = staticmethod(_fast_seq_all_to_all_4d_apply)
-    ltx2_sequence_parallel.SeqAllToAll4D.apply = staticmethod(
-        _fast_seq_all_to_all_4d_apply
-    )
-    logger.info(
-        "Applied TPU patch: fast LTX-2 attention dispatch and direct all_to_all_4D."
-    )
+    logger.info("Applied TPU patch: inference Ulysses all_to_all_4D without autograd.")
