@@ -319,9 +319,11 @@ def _block_scores(
     scale_cache=None,
     scale_row=None,
     index_heads=1,
+    token_rows=False,
 ):
     """`index_q` must already be rotated for a 4-bit cache; its rows fold
-    `index_heads` heads per token (`block_score_options`)."""
+    `index_heads` heads per token (`block_score_options`); see
+    `msa_indexer.block_scores` for `token_rows`."""
     return msa_indexer.block_scores(
         index_q,
         index_cache,
@@ -332,6 +334,7 @@ def _block_scores(
         **block_score_options(index_heads),
         scale_cache=scale_cache,
         scale_row=scale_row,
+        token_rows=token_rows,
         interpret=interpret,
     )
 

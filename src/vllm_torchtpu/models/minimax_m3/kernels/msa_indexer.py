@@ -796,6 +796,14 @@ def _class_scores(
     )
 
 
+class TokenRows(NamedTuple):
+    """`block_scores` of a decode step left in the kernel's token-major
+    rows: token ``t``'s scores are ``scores[rows[t]]``."""
+
+    scores: jax.Array  # [tiles * Bq, P]
+    rows: jax.Array  # [T]
+
+
 class _ClassPlan(NamedTuple):
     """`block_scores`' two tile classes. `small()` / `large()` score them
     (`ClassScores` each); `token_major` is the small class's layout."""
@@ -948,6 +956,7 @@ def class_plan(
         "large_kernel",
         "scale_row",
         "transposed_tile_q",
+        "token_rows",
         "interpret",
     ),
 )
@@ -968,8 +977,9 @@ def block_scores(
     scale_cache: jax.Array | None = None,
     scale_row: int | None = None,
     transposed_tile_q: int = _SMALL_TILE_Q_TRANSPOSED,
+    token_rows: bool = False,
     interpret: bool = False,
-) -> jax.Array:
+) -> jax.Array | TokenRows:
     """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group).
 
     Requests of at most `block_q` query tokens (decode, short chunks) are
@@ -992,6 +1002,12 @@ def block_scores(
         scales (`msa_fp4.scales_in_page`),
         the ``[pages, 8, 128]`` f32 scale cache and the row of the index-key
         scales. `index_q` must then be rotated (`msa_fp4.rotate_queries`).
+      token_rows: when the step has no large request and the small class is
+        token-major (a decode step of kernel v3) and spans the padded pages,
+        return `TokenRows` instead:
+        the scores in the kernel's rows and each token's row, for a consumer
+        that reads its rows itself (`msa_dcp.local_candidates`). Other steps
+        return the gathered scores as without it.
     Pages past a token's own page hold scores of keys it must not see, and
     pages past its request's last page are not written; callers mask both.
     """
@@ -1025,6 +1041,9 @@ def block_scores(
         return jnp.pad(rows, ((0, 0), (0, pages - rows.shape[1])))
 
     if max_large == 0:
+        # Its rows as they are, when the small class needs no column padding.
+        if token_rows and token_major and small.shape[1] == pages:
+            return TokenRows(small, small_col)
         return small_only()[:, None, :]
 
     def with_large():
