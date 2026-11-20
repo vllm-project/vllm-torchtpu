@@ -966,8 +966,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         poison the attention output via 0.0 * NaN = NaN: V is masked on load
         (SEQ_ALONG_LANE) or the kernel zeroes its KV buffers per call
         (HEAD_ALONG_SUBLANE). Covers pure decode (every sequence in the DECODE
-        range, so the DECODE kernel runs) and a partial query block
-        (q_len < bq_sz, MIXED).
+        range, so the DECODE kernel runs, with bq_sz 1 as single-token decode
+        uses it, which takes the stitch's one-token path) and a partial query
+        block (q_len < bq_sz, MIXED).
         """
         num_heads = (16, 2)
         head_dim = 128
@@ -981,8 +982,10 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         )
 
         distribution = None
+        blocks = {}
         if test_case == "decode":
             distribution = jnp.array([len(seq_lens)] * 3, dtype=jnp.int32)
+            blocks = dict(bq_sz=1, bq_csz=1)
 
         self._test_ragged_paged_attention(
             seq_lens,
@@ -995,6 +998,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             kv_layout=kv_layout,
             bkv_sz=128,
             distribution=distribution,
+            **blocks,
         )
 
     @parameterized.product(
