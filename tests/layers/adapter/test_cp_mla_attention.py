@@ -456,6 +456,161 @@ def test_positive_control_dropped_lse_shift_is_caught(monkeypatch):
     assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
 
 
+# The single all-to-all form (`TPU_DCP_LSE_MERGE_A2A_FUSED_LSE`).
+
+
+def _special_lses(lses):
+    """Overwrite some lse entries with f32 values whose bits a lossy transfer
+    would change: infinities, NaN, -0.0, a subnormal and the extremes."""
+    flat = lses.reshape(-1)
+    specials = torch.tensor(
+        [float("inf"), float("nan"), -0.0, 1e-40, 3.4028235e38, -3.4028235e38]
+    )
+    flat[5 : 5 + len(specials)] = specials
+    return lses
+
+
+def _exchange_per_rank(fn, world):
+    """Run `fn(group)` on every rank of a lockstep threaded exchange."""
+    hub = _ExchangeHub(world)
+    with concurrent.futures.ThreadPoolExecutor(world) as pool:
+        return list(pool.map(lambda rank: fn(_A2AGroup(hub, rank)), range(world)))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dcp_size,tokens", [(2, 4), (4, 16), (16, 16), (16, 32)])
+def test_fused_lse_exchange_receives_the_same_bits(
+    dtype, dcp_size, tokens, monkeypatch
+):
+    """One all-to-all hands every rank exactly the bits two would."""
+    monkeypatch.setattr(cp_mla, "_all_to_all", lambda x, group: group.all_to_all(x))
+    rng = np.random.default_rng(20261120 + dcp_size + tokens)
+    local, vdim = 4, 512
+    o_sends = torch.from_numpy(
+        rng.standard_normal((dcp_size, dcp_size, tokens, local, vdim)).astype(
+            np.float32
+        )
+    ).to(dtype)
+    l_sends = _special_lses(
+        torch.from_numpy(
+            (rng.standard_normal((dcp_size, dcp_size, tokens, local)) * 50).astype(
+                np.float32
+            )
+        )
+    )
+    fused = _exchange_per_rank(
+        lambda g: cp_mla._all_to_all_with_lse(
+            o_sends[g.rank_in_group], l_sends[g.rank_in_group], g
+        ),
+        dcp_size,
+    )
+    separate = _exchange_per_rank(
+        lambda g: (
+            cp_mla._all_to_all(o_sends[g.rank_in_group], g),
+            cp_mla._all_to_all(l_sends[g.rank_in_group], g),
+        ),
+        dcp_size,
+    )
+    for (o_f, l_f), (o_s, l_s) in zip(fused, separate):
+        assert o_f.dtype == dtype and l_f.dtype == torch.float32
+        assert o_f.shape == o_s.shape and l_f.shape == l_s.shape
+        bits = torch.int16 if dtype.itemsize == 2 else torch.int32
+        assert torch.equal(o_f.view(bits), o_s.view(bits))
+        assert torch.equal(l_f.view(torch.int32), l_s.view(torch.int32))
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
+def test_fused_lse_merge_is_bit_identical(dcp_size, monkeypatch):
+    """The whole merge output does not change by one bit."""
+    outputs, lses = _hard_partials(np.random.default_rng(29 + dcp_size), dcp_size)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_FUSED_LSE", False, raising=False
+    )
+    two = _a2a_merge_whole(outputs, lses, monkeypatch)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_FUSED_LSE", True, raising=False
+    )
+    one = _a2a_merge_whole(outputs, lses, monkeypatch)
+    assert one.dtype == two.dtype == torch.bfloat16
+    assert torch.equal(one.view(torch.int16), two.view(torch.int16))
+
+
+def test_positive_control_fused_lse_bit_check_catches_a_conversion(monkeypatch):
+    """The bit comparison must fail when the lse is converted, not bitcast, to
+    bf16 for the exchange (the lossy form the bitcast exists to avoid)."""
+    outputs, lses = _hard_partials(np.random.default_rng(31), 4)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_FUSED_LSE", False, raising=False
+    )
+    two = _a2a_merge_whole(outputs, lses, monkeypatch)
+    real_merge = cp_mla._merge_received
+    monkeypatch.setattr(
+        cp_mla,
+        "_merge_received",
+        lambda o, lse: real_merge(o, lse.to(torch.bfloat16).to(torch.float32)),
+    )
+    lossy = _a2a_merge_whole(outputs, lses, monkeypatch)
+    assert not torch.equal(lossy.view(torch.int16), two.view(torch.int16))
+
+
+@pytest.mark.parametrize(
+    "a2a,fused,is_backbone,expect_calls",
+    [
+        (True, False, True, 2),
+        (True, True, True, 1),
+        # The fused flag changes nothing on the reduce-scatter paths: with the
+        # all-to-all merge off, and for the MTP drafter.
+        (False, True, True, 0),
+        (True, True, False, 0),
+    ],
+)
+def test_fused_lse_flag_selects_one_all_to_all(
+    a2a, fused, is_backbone, expect_calls, monkeypatch
+):
+    calls = []
+
+    def recording_all_to_all(x, group):
+        calls.append(tuple(x.shape))
+        return group.all_to_all(x)
+
+    monkeypatch.setattr(cp_mla, "_all_to_all", recording_all_to_all)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", a2a, raising=False)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64, raising=False
+    )
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_FUSED_LSE", fused, raising=False
+    )
+    world, tokens, local, vdim = 4, 16, 4, 8
+    outputs, lses = _hard_partials(
+        np.random.default_rng(37), world, tokens=tokens, local_heads=local, vdim=vdim
+    )
+    hub = _ExchangeHub(world)
+    groups = [_A2AGroup(hub, r) for r in range(world)]
+    rs_calls = []
+    monkeypatch.setattr(
+        cp_mla,
+        "cp_lse_ag_out_rs",
+        lambda o, lse, g, rs_dtype=None: rs_calls.append(1) or o[:, :local],
+    )
+    state = threading.local()
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: state.group)
+
+    def run(rank):
+        state.group = groups[rank]
+        return cp_mla.merge_lse_partials_scatter_heads(
+            outputs[rank], lses[rank], is_backbone=is_backbone
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(world) as pool:
+        list(pool.map(run, range(world)))
+    assert len(calls) == expect_calls * world
+    assert len(rs_calls) == (0 if expect_calls else world)
+    if expect_calls == 1:
+        # One flat row per destination: partials, then the lse as bf16 pairs.
+        assert set(calls) == {(world, tokens * local * vdim + tokens * local * 2)}
+
+
 @pytest.mark.parametrize(
     "enabled,tokens,is_backbone,expect_a2a",
     [

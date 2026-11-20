@@ -155,6 +155,9 @@ def merge_lse_partials_all_to_all(
 
     Each rank sends head block `d` of its partial and lse to rank `d`, then
     merges its own heads locally in f32. Faster for small token counts.
+
+    With TPU_DCP_LSE_MERGE_A2A_FUSED_LSE set, the partials and the lse travel
+    in one all-to-all (`_all_to_all_with_lse`) instead of two.
     """
     world = int(group.world_size)
     num_tokens, num_heads, vdim = output.shape
@@ -162,9 +165,62 @@ def merge_lse_partials_all_to_all(
     # Destination-major: [world, T, local, V] and [world, T, local].
     o_send = output.reshape(num_tokens, world, local, vdim).transpose(0, 1)
     l_send = lse.to(torch.float32).reshape(num_tokens, world, local).transpose(0, 1)
-    o_recv = _all_to_all(o_send, group)
-    l_recv = _all_to_all(l_send, group)
+    if envs.TPU_DCP_LSE_MERGE_A2A_FUSED_LSE and output.dtype.itemsize in (2, 4):
+        o_recv, l_recv = _all_to_all_with_lse(o_send, l_send, group)
+    else:
+        o_recv = _all_to_all(o_send, group)
+        l_recv = _all_to_all(l_send, group)
     return _merge_received(o_recv, l_recv).to(output.dtype)
+
+
+def _all_to_all_with_lse(
+    o_send: torch.Tensor, l_send: torch.Tensor, group: Any
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exchange the partials and their f32 lse in a single all-to-all.
+
+    A collective has a fixed cost that does not depend on its size. At decode
+    sizes the lse block is only a few KB, so a separate all-to-all for it
+    costs about as much as its fixed cost. This function instead reinterprets
+    (bitcasts) the f32 lse bits as elements of the partials' dtype and
+    appends them to the partials of the same destination. After the
+    exchange it splits the two parts and bitcasts the lse back. A bitcast
+    moves bits without conversion, so the received values are bit-identical
+    to those of the two-collective path.
+
+    Each destination block is flattened to one row before the append. A
+    trailing axis of `V + 2` would not be a multiple of the TPU's 128-lane
+    tile and could be padded in the exchange; a flat row is padded at most
+    once, at its end.
+
+    Example: world 16, T = 16, 4 local heads, V = 512, bf16 partials. Each
+    destination row holds 16 * 4 * 512 = 32,768 partial values followed by
+    16 * 4 * 2 = 128 bf16 values that are the bits of 64 f32 lse values, so
+    the one all-to-all moves bf16[16, 32896].
+
+    Args:
+      o_send: `[world, T, local, V]` partials in a 2- or 4-byte dtype. Block
+        `d` of the leading axis goes to rank `d`.
+      l_send: `[world, T, local]` f32 log-sum-exps, blocked like `o_send`.
+      group: the DCP group.
+
+    Returns:
+      `(o_recv, l_recv)`: `[world, T, local, V]` in `o_send.dtype` and
+      `[world, T, local]` f32. Block `r` of each came from rank `r`.
+    """
+    world, num_tokens, local, vdim = o_send.shape
+    o_flat = o_send.reshape(world, num_tokens * local * vdim)
+    # [world, T * local] f32 -> [world, T * local * (4 // itemsize)].
+    l_bits = l_send.contiguous().reshape(world, num_tokens * local).view(o_send.dtype)
+    recv = _all_to_all(torch.cat([o_flat, l_bits], dim=1), group)
+    num_o = o_flat.shape[1]
+    o_recv = recv[:, :num_o].reshape(world, num_tokens, local, vdim)
+    l_recv = (
+        recv[:, num_o:]
+        .contiguous()
+        .view(torch.float32)
+        .reshape(world, num_tokens, local)
+    )
+    return o_recv, l_recv
 
 
 def _merge_received(o_recv: torch.Tensor, l_recv: torch.Tensor) -> torch.Tensor:
