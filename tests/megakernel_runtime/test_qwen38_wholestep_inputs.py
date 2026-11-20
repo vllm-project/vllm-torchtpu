@@ -227,3 +227,45 @@ def test_layer_batched_gdn_blocks_match_the_per_layer_loop(n_blocks, monkeypatch
         for a, b in zip(want, got, strict=True):
             assert a.shape == b.shape and a.dtype == b.dtype
             np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("mp", [2, 4])
+def test_manager_page_table_expands_to_the_per_page_table(mp, batched, monkeypatch):
+    """`wholekeymp=N` (manager_pages): entry m of a request's key table addresses kernel pages
+    [N m, N m + N), and expanding it gives exactly the per-page table (512-token blocks, both
+    compressed slots, two layers, a 100K and a short context, either table builder). N = 8
+    spans two block columns, which are not adjacent: refused."""
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(
+        wsi, "read_ring_and_tags",
+        lambda pool, ids, n, m: (jnp.zeros((len(ids), n), jnp.bfloat16), None),
+    )
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_WHOLE_BATCHED_INPUTS", batched, raising=False)
+    pool = jnp.zeros((4096, 512, 1, 4, 256), jnp.float8_e4m3fn)
+    nreq, T, max_groups = 2, 4, 32768
+    ctx = np.array([100_000, 3_000], np.int32)
+    rng = np.random.default_rng(3)
+    tables = []
+    for _ in range(2):
+        comp = np.zeros((nreq, 260), np.int32)
+        for q, b in enumerate(-(-ctx // 512)):
+            comp[q, :b] = rng.choice(np.arange(1, 4096), size=b, replace=False)
+        tables.append((jnp.ones((nreq, 1), jnp.int32), jnp.ones((nreq, 1024), jnp.int32),
+                       jnp.asarray(comp)))
+
+    def run(n):
+        return np.asarray(qsa_step_inputs(
+            pool, tables, [(0, 1), (1, 0)], jnp.zeros((200_000, 128), jnp.float32),
+            jnp.arange(nreq * T, dtype=jnp.int32), jnp.arange(0, nreq * T + 1, T, dtype=jnp.int32),
+            jnp.asarray(ctx), M=nreq * T, T=T, pages_per_seq=1024, max_groups=max_groups,
+            layer_major_tables=True, manager_pages=n,
+        )["qsa_cktab"])
+
+    per_page, managed = run(0), run(mp)
+    assert managed.shape[-1] * mp == per_page.shape[-1]
+    expanded = (managed[..., None] * mp + np.arange(mp)).reshape(per_page.shape)
+    np.testing.assert_array_equal(expanded, per_page)
+    with pytest.raises(AssertionError):
+        run(8)

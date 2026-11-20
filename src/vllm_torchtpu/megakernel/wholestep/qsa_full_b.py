@@ -32,6 +32,7 @@ see DESIGN.md). Groups completed during this step are stage C.
 
 from __future__ import annotations
 
+import functools
 import os
 from typing import Any
 
@@ -60,6 +61,10 @@ DBG_IQ = (
 DBG_IDS = "qsa_dbg_ids"
 UNION_SLOTS = 3  # attention ring slots with `union_attn`
 NVIS_DIGIT = int(os.environ.get("VLLM_TPU_MK_QSA_NVIS_DIGIT", "3"))  # bits per bisection pass
+# Timing-only attribution arm of the key stream (tests/megakernel/tpu_bench_wholestep_call.py
+# `--score-arm`; wrong scores): "dma" keeps the copies and waits and stores zero scores,
+# "compute" skips the copies and waits and scores the stale ring. Read at trace time.
+SCORE_ARM = ""
 IDX_N = 4 * ix.IDX_DIM + ix.IDX_DIM  # 512 query + 128 raw-key columns
 
 
@@ -77,6 +82,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         chunk_pages: int = 32,
         manager_pages: int = 0,
         ck_lanes: int = 0,
+        key_slots: int = 2,
         n_layers: int = 0,
         hbm_tables: bool = False,
         per_request_scores: bool = False,
@@ -110,7 +116,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
         and each
         is one DMA (P4: per-kernel-page DMAs are issue-bound); `ck_lanes` = 128 reads
         only the
-        real lanes of each carrier row. `n_layers` > 0: per-QSA-layer metadata — the
+        real lanes of each carrier row. `key_slots` (> 2 needs `bounded_chunks`): slots of the
+        key-stream ring, so `key_slots - 1` chunks are in flight while one is scored (2: one
+        chunk of lookahead). `n_layers` > 0: per-QSA-layer metadata — the
         main-pool and
         key tables are `[n_layers * requests, …]` (row = layer ordinal * requests +
         request) and the
@@ -169,6 +177,11 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.max_groups, self.pps, self.debug = max_groups, pages_per_seq, debug
         self.carrier, self.ck_width = carrier, ck_width
         self.mp, self.ck_lanes = manager_pages, ck_lanes or ck_width
+        self.key_slots = int(key_slots)
+        assert self.key_slots >= 2, key_slots
+        assert self.key_slots == 2 or (carrier and bounded_chunks and not compressed_dcp), (
+            "a deeper key ring: carrier keys, bounded per-request chunks, no compressed DCP"
+        )
         self.n_layers = n_layers
         self.hbm_tables, self.per_request_scores = hbm_tables, per_request_scores
         self.bounded_chunks = bounded_chunks
@@ -400,7 +413,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
                         "qi_ring",
                         pltpu.VMEM(
                             (
-                                2,
+                                self.key_slots,
                                 self.chunk_pages,
                                 16,
                                 4 if self.carrier == "fp8" else 2,
@@ -409,7 +422,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
                             jnp.float8_e4m3fn if self.carrier == "fp8" else BF16,
                         ),
                     ),
-                    ScratchReq("qi_ring_sem", pltpu.SemaphoreType.DMA((2,))),
+                    ScratchReq("qi_ring_sem", pltpu.SemaphoreType.DMA((self.key_slots,))),
                 ]
                 if self.carrier
                 else [ScratchReq("qi_ck", pltpu.VMEM((G, ix.IDX_DIM), BF16))]
@@ -502,6 +515,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
         lanes = pl.ds(0, W)
 
         def copies(c: Any, s: Any, qq: int = q) -> list[Any]:
+            if SCORE_ARM == "compute":  # timing arm: no key copies
+                return []
             tab, qb = self.tables(ctx)[0], base + qq
             if MP:  # one DMA per manager page of MP contiguous kernel pages
                 return [
@@ -524,6 +539,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
             ]
 
         first = (q == 0) if first is None else first
+        if self.key_slots > 2:
+            self._score_deep(ctx, q, qr, copies, rows, first, last, c_off)
+            return
 
         def issue_first() -> None:
             for cp in copies(0, 0):
@@ -566,18 +584,72 @@ class QSAFullIndexedBlock(QSAFullBlock):
                     for cp in copies(0, 1 - s, q + 1):
                         cp.start()
 
-            # One wait for the whole slot (the page copies add up to its bytes).
-            pltpu.make_async_copy(ring.at[s], ring.at[s], sems.at[s]).wait()
-            # Stock BF16KeyReader read: ref bitcast FP8 -> BF16 when carrier == "fp8".
-            keys = ring.at[s].bitcast(BF16)[...] if self.carrier == "fp8" else ring[s]
-            keys = keys.reshape(CG, W)[:, : ix.IDX_DIM]
-            st = ix.score_rows(qr, keys)  # [T, CG]
-            scr["qi_s"][rows, c_off + c] = st.reshape(T, CG // 128, 128)
+            self._consume(ctx, qr, s, rows, c_off + c)
             return carry
 
         jax.lax.fori_loop(0, n_q, chunk, 0)
         if self.bounded_chunks:
             scr["qi_cc"][0] = c0 + n_q
+
+    def _consume(self, ctx: Any, qr: jax.Array, s: Any, rows: slice, col: Any) -> None:
+        """Wait for ring slot `s` and score its chunk into score column `col` of `rows`."""
+        scr, T = ctx.scr, ctx.ex.T
+        ring, sems = scr["qi_ring"], scr["qi_ring_sem"]
+        CG, W = self.chunk_pages * GPK, self.ck_lanes
+        if SCORE_ARM != "compute":
+            # One wait for the whole slot (the page copies add up to its bytes).
+            pltpu.make_async_copy(ring.at[s], ring.at[s], sems.at[s]).wait()
+        if SCORE_ARM == "dma":
+            scr["qi_s"][rows, col] = jnp.zeros((T, CG // 128, 128), F32)
+            return
+        # Stock BF16KeyReader read: ref bitcast FP8 -> BF16 when carrier == "fp8".
+        keys = ring.at[s].bitcast(BF16)[...] if self.carrier == "fp8" else ring[s]
+        keys = keys.reshape(CG, W)[:, : ix.IDX_DIM]
+        st = ix.score_rows(qr, keys)  # [T, CG]
+        scr["qi_s"][rows, col] = st.reshape(T, CG // 128, 128)
+
+    def _score_deep(
+        self, ctx: Any, q: Any, qr: jax.Array, copies: Any, rows: slice, first: Any, last: Any,
+        c_off: Any,
+    ) -> None:
+        """`_score_request`'s key stream through a `key_slots`-slot ring (bounded chunks):
+        `key_slots - 1` chunks are in flight while one is scored. Chunk `c` of the rank's
+        stream (counter `c0 + c` carried across requests) lives in slot `(c0 + c) % KS`; at
+        chunk `c` the copy of chunk `c + KS - 1` goes into the slot chunk `c - 1` freed. A
+        request's last chunk prefetches the next request's first chunk (unless `last`), as
+        the 2-slot ring does; the next request issues its chunks 1..KS-2 on entry. Same keys
+        and the same scores as the 2-slot ring, only the copy schedule differs."""
+        scr, T, KS = ctx.scr, ctx.ex.T, self.key_slots
+        CG, NC = self.chunk_pages * GPK, self.n_chunks
+        nv = ctx.extra[NVIS][q * T + T - 1]
+        n_q = jnp.clip((nv + CG - 1) // CG, 1, NC)
+        c0 = jnp.where(first, 0, scr["qi_cc"][0])
+
+        def start(c: Any, pos: Any = None, qq: Any = q) -> None:
+            """Copy chunk `c` of request `qq` into the slot of stream position c0 + pos."""
+            for cp in copies(c, jax.lax.rem(c0 + (c if pos is None else pos), KS), qq):
+                cp.start()
+
+        for k in range(KS - 1):  # chunks 0..KS-2 (chunk 0 came with the previous request)
+            cond = k < n_q
+            if k == 0:
+                if isinstance(first, bool):
+                    if not first:
+                        continue
+                else:
+                    cond = cond & first
+            pl.when(cond)(functools.partial(start, k))
+
+        def chunk(c: Any, carry: Any) -> Any:
+            pl.when(c + KS - 1 < n_q)(lambda: start(c + KS - 1))
+            if last is not True:
+                # The next request's first chunk, into the slot after this request's last.
+                pl.when((c + 1 == n_q) & jnp.logical_not(last))(lambda: start(0, n_q, q + 1))
+            self._consume(ctx, qr, jax.lax.rem(c0 + c, KS), rows, c_off + c)
+            return carry
+
+        jax.lax.fori_loop(0, n_q, chunk, 0)
+        scr["qi_cc"][0] = c0 + n_q
 
     def _select(self, ctx: Any, l: Any, slot: Any) -> None:  # noqa: E741
         ex, scr, g = ctx.ex, ctx.scr, ctx.g

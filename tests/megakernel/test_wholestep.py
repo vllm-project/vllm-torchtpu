@@ -21,6 +21,7 @@ references with `project_reference` + `reference_rows` for the QSA layers.
 from __future__ import annotations
 
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -291,7 +292,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
            max_groups: int | None = None, phys: bool = False, dcp: int = 1, dcp_pool: bool = True,
            shared_kv: bool = False, cdcp: bool = False, cdcp_keys: bool = True, ck_fn=None,
            async_dma: bool = False, B: int | None = None, xreq: int = 0,
-           skip_idle: bool = False, xmerge: bool = False):
+           skip_idle: bool = False, xmerge: bool = False, key_mp: int = 0, key_slots: int = 2):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -314,7 +315,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
     if (
         long
     ):  # served long-context mode: HBM page tables, one request's scores at a time
-        d = wi.add_carrier(key, d)
+        d = wi.add_carrier(key, d, mp=key_mp)
         d["hbm_tables"] = True
     if shared_kv:  # the ranks share one KV head (a DCP pair): same K/V columns, same pool
         kv = 2 * G.HD  # `[q0|g0|..|k|v]`: K and V are the last two 256-wide column blocks
@@ -333,6 +334,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
                    bounded_chunks=True, shard_index=shard, union_attn=union,
                    union_stats=stats, union_phys=phys, loop_requests=loop, dcp=dcp,
                    compressed_dcp=cdcp, xreq_prefetch=xreq, skip_idle=skip_idle,
+                   manager_pages=key_mp, key_slots=key_slots,
                    **(dict(xmerge=True) if xmerge else {}))
     spec = wholestep_spec(
         G,
@@ -693,6 +695,30 @@ def test_request_loop_matches_unrolled():
         loop = _run_c(long=True, rank_ids=True, loop=True, **kw)
         for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new"), (7, "ids")):
             np.testing.assert_array_equal(loop[i], base[i], err_msg=f"{name} {kw}")
+
+
+@pytest.mark.parametrize("kw", [dict(union=True, loop=True),
+                                dict(shard=True, union=True, loop=True)])
+def test_key_stream_ring_and_manager_pages_bit_identical(monkeypatch, kw):
+    """VLLM_TPU_MEGAKERNEL wholekeyslots / wholekeymp: a 3- or 4-slot key ring and manager
+    pages of 2 or 4 kernel pages per DMA give bit-identical residuals, completed keys, rings
+    and selected ids. Request 0 streams 6 chunks (more than the slots), request 1 one chunk
+    (fewer than the prefetch depth, after a cross-request prefetch); unsharded the two share
+    one rank's stream (traced first/last flags), sharded each rank streams one. Positive
+    control: scoring a stale ring (`SCORE_ARM = "compute"`, what a slot read before its copy
+    lands sees) is caught."""
+    from vllm_torchtpu.megakernel.wholestep import qsa_full_b
+
+    run = functools.partial(_run_c, long=True, rank_ids=True, ctx=[6000, 100], max_groups=2048,
+                            **kw)
+    base = run()
+    for mp, ks in ((0, 3), (4, 3), (2, 4)):
+        got = run(key_mp=mp, key_slots=ks)
+        for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new"), (7, "ids")):
+            np.testing.assert_array_equal(got[i], base[i], err_msg=f"{name} mp={mp} slots={ks}")
+    monkeypatch.setattr(qsa_full_b, "SCORE_ARM", "compute")
+    bad = run(key_slots=3)
+    assert not np.array_equal(bad[7], base[7]), "stale-ring scores must change the selection"
 
 
 def test_step_tokens_match_stock_semantics():

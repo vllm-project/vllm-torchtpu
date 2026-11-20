@@ -97,6 +97,22 @@ def main():
     ap.add_argument("--phys", action="store_true",
                     help="union ids -> physical page ids per request (VLLM_TPU_MEGAKERNEL wholephys=1)")
     ap.add_argument("--slots", type=int, default=0, help="union attention ring slots (0: default)")
+    ap.add_argument("--key-mp", type=int, default=0,
+                    help="key-stream kernel pages per DMA (VLLM_TPU_MEGAKERNEL wholekeymp=N; needs "
+                    "--kb 512 for N > 1: a 512-token block column holds 4 consecutive pages)")
+    ap.add_argument("--key-slots", type=int, default=2,
+                    help="key-stream ring slots (VLLM_TPU_MEGAKERNEL wholekeyslots=N)")
+    ap.add_argument("--kb", type=int, default=128, choices=(128, 512),
+                    help="pool block tokens (the served tables address 512-token blocks)")
+    ap.add_argument("--score-arm", default="", choices=("", "dma", "compute"),
+                    help="timing-only key-stream arm (wrong scores): dma = copies + waits, zero "
+                    "scores; compute = no copies, scores of the stale ring")
+    ap.add_argument("--fill-keys", action="store_true",
+                    help="random FP8 in the requests' compressed-key and main-KV blocks (else "
+                    "zeros: equal scores, attention of zeros), so a hash sees the selection")
+    ap.add_argument("--dhash", action="store_true",
+                    help="print a device-side digest of the first call's outputs (residual "
+                    "bytes + pool sum / xor / weighted sum), for bitwise checks at long contexts")
     ap.add_argument("--profile", default="", help="jax.profiler trace dir for --profile-iters calls")
     ap.add_argument("--profile-iters", type=int, default=5)
     ap.add_argument("--stacked-meta-check", action="store_true",
@@ -128,6 +144,12 @@ def main():
         pltpu.get_tpu_info = lambda: chip
     wsc.SHARD_INDEX, wsc.UNION_ATTN, wsc.LOOP_REQUESTS = a.shard, a.union, a.loop
     wsc.UNION_PHYS = a.phys
+    wsc.KEY_MP, wsc.KEY_SLOTS = a.key_mp, a.key_slots
+    if a.score_arm:
+        from vllm_torchtpu.megakernel.wholestep import qsa_full_b
+
+        qsa_full_b.SCORE_ARM = a.score_arm
+        print("score arm:", a.score_arm, flush=True)
     if a.slots:
         from vllm_torchtpu.megakernel.wholestep import qsa_full_b
 
@@ -160,7 +182,9 @@ def main():
         nreq = B // 4
         NR = max(16, nreq)  # runner request rows (max_num_reqs)
         n_cols = pps  # table width (static); only the pages the contexts reach are allocated
-        n_used = -(-(a.ctx + 4 + nreq) // 128)
+        kb = a.kb  # pool block tokens: 128 (QSA kernel blocks) or 512 (served blocks)
+        per = 512 // kb  # pool blocks per 512-token GDN manager block
+        n_used = -(-(a.ctx + 4 + nreq) // kb)
         # Blocks: GDN 33 layers x 4 ckpts per request, QSA main + compressed per request
         # & layer.
         # Timing only: every QSA layer reads the same main / compressed pages of a
@@ -168,7 +192,7 @@ def main():
         # (a 90K-token context would otherwise need 11 x 1.4K blocks per request).
         NB = 1 + nreq * (n_gdn * 4 + n_qsa + 2 * n_used) + 8
         layout = Qwen38GdnPoolLayout(
-            pool_shape=(NB * 4, 128, 1, 4, 256), pool_dtype="float8_e4m3fn"
+            pool_shape=(NB * per, kb, 1, 4, 256), pool_dtype="float8_e4m3fn"
         )
         call, in_specs, out_specs, donate = build_wholestep_call(
             mesh,
@@ -243,7 +267,7 @@ def main():
         # (128 tokens): draw them from disjoint ranges of the kernel-granularity pool.
         NG = 1 + nreq * n_gdn * 4
         free_gdn = iter(rng.permutation(np.arange(1, NG)))
-        free = iter(rng.permutation(np.arange(4 * NG, 4 * NB)))
+        free = iter(rng.permutation(np.arange(per * NG, per * NB)))
         ctx = np.array([a.ctx + q for q in range(nreq)] + [0] * (NR - nreq), np.int32)
         qsl = np.array([min(q, nreq) * 4 for q in range(NR + 1)], np.int32)
         seq = ctx + np.where(np.arange(NR) < nreq, 4, 0)
@@ -254,7 +278,7 @@ def main():
             for q in range(nreq):
                 ck[q] = [next(free_gdn) for _ in range(4)]
                 st[q] = ck[q, 0]
-            meta += [st, np.zeros(NB * 4, np.int32), ck, qsl, seq]
+            meta += [st, np.zeros(NB * per, np.int32), ck, qsl, seq]
         tabs = []
         main = np.zeros((NR, n_cols), np.int32)
         comp = np.zeros((NR, n_cols), np.int32)
@@ -282,9 +306,20 @@ def main():
         hidden = rnd((R * B, g.NHC * g.H), jnp.bfloat16)
         # Allocated sharded: a host-side zeros of the global pool does not fit.
         pool = jax.jit(
-            lambda nb=NB: jnp.zeros((R * nb * 4, 128, 1, 4, 256), jnp.float8_e4m3fn),
+            lambda nb=NB: jnp.zeros((R * nb * per, kb, 1, 4, 256), jnp.float8_e4m3fn),
             out_shardings=tp,
-        )() if not (a.trace_only or a.aot) else rnd((R * NB * 4, 128, 1, 4, 256), jnp.float8_e4m3fn)
+        )() if not (a.trace_only or a.aot) else rnd((R * NB * per, kb, 1, 4, 256), jnp.float8_e4m3fn)
+        if a.fill_keys and not (a.trace_only or a.aot):
+            ids = jnp.asarray(np.concatenate([comp[:nreq, :n_used], main[:nreq, :n_used]]).ravel())
+
+            def fill(p, ids):
+                k = jax.random.fold_in(jax.random.PRNGKey(5), jax.lax.axis_index("tp"))
+                v = jax.random.normal(k, (ids.shape[0],) + p.shape[1:], jnp.float32) * 0.5
+                return p.at[ids].set(v.astype(p.dtype))
+
+            pool = jax.jit(jax.shard_map(fill, mesh=mesh, in_specs=(P("tp"), P()),
+                                         out_specs=P("tp"), check_vma=False),
+                           donate_argnums=0)(pool, ids)
         put = lambda x: jax.device_put(jnp.asarray(x), rep)  # noqa: E731
         if a.aot:
             put = lambda x: jax.ShapeDtypeStruct(  # noqa: E731
@@ -352,6 +387,21 @@ def main():
             hsh = hashlib.sha256(np.asarray(res).tobytes())
             hsh.update(np.asarray(jax.lax.bitcast_convert_type(pool, jnp.uint8)).tobytes())
             print(f"B={B} HASH {hsh.hexdigest()[:16]}", flush=True)
+        if a.dhash:
+            import hashlib
+
+            def digest(p):
+                u = jax.lax.bitcast_convert_type(p.reshape(p.shape[0], -1, 4), jnp.uint32)
+                w = jax.lax.broadcasted_iota(jnp.uint32, u.shape, 1) * jnp.uint32(2654435761) + 1
+                return (jnp.sum(u, axis=1),
+                        jax.lax.reduce(u, jnp.uint32(0), jax.lax.bitwise_xor, (1,)),
+                        jnp.sum(u * w, axis=1))
+
+            dig = jax.jit(digest)(pool)
+            hsh = hashlib.sha256(np.asarray(res).tobytes())
+            for x in dig:
+                hsh.update(np.asarray(x).tobytes())
+            print(f"B={B} DHASH {hsh.hexdigest()[:16]}", flush=True)
         print(
             f"B={B} first call (compile+run) {time.time() - t0:.1f} s, finite "
             f"{float(jnp.isfinite(res.astype(jnp.float32)).mean()):.4f}",
