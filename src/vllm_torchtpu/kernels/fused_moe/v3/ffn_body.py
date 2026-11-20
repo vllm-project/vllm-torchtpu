@@ -73,6 +73,9 @@ class Build:
     mesh_axes: tuple = (
         MESH_AXIS,
     )  # the mesh's axes; MESH_AXIS is the expert-parallel one
+    # The shard's index came in as an operand: peers are addressed in that
+    # form (layout.device_coords).
+    shard_index_operand: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -401,7 +404,11 @@ def push_expert(ctx, expert):
                     ],
                     send_sem=sems.push_send,
                     recv_sem=sems.push_receive,
-                    device_id=device_coords(jnp.int32(d), b.mesh_axes),
+                    device_id=device_coords(
+                        jnp.int32(d),
+                        b.mesh_axes,
+                        shard_index_operand=b.shard_index_operand,
+                    ),
                     device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
@@ -412,7 +419,11 @@ def push_expert(ctx, expert):
                     dst_ref=outputs.arrival_scales.at[pl.ds(dst_block, blocks)],
                     send_sem=sems.push_send_scales,
                     recv_sem=sems.push_receive_scales,
-                    device_id=device_coords(jnp.int32(d), b.mesh_axes),
+                    device_id=device_coords(
+                        jnp.int32(d),
+                        b.mesh_axes,
+                        shard_index_operand=b.shard_index_operand,
+                    ),
                     device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
