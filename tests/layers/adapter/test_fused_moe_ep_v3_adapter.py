@@ -175,6 +175,38 @@ def _prebuild(layer, renormalize=True):
     return getattr(layer, "_tpu_fused_ep_eligible", False)
 
 
+def test_the_bridge_asks_the_kernel_for_its_lowering_by_argument(monkeypatch):
+    """The bridge's op calls the kernel without its inner jit, without side
+    effects and with the rank tensor as the shard index, as arguments of
+    that call; the kernel package has no process-wide flags left that a
+    bridge could set for every other caller."""
+    from vllm_torchtpu.kernels.fused_moe.v3 import layer, layout
+
+    calls = []
+    monkeypatch.setattr(v3, "fused_ep_moe", lambda *a, **kw: calls.append(kw))
+    run_moe = v3.run_moe_v3(
+        SimpleNamespace(axis_names=(v3.MESH_AXIS,), shape={v3.MESH_AXIS: EP}),
+        2,
+        True,
+        "silu",
+        hidden=128,
+        inter=256,
+        experts_per_shard=4,
+    )
+    rank = object()
+    run_moe(*[None] * 6, rank, None)
+    (kwargs,) = calls
+    assert kwargs["side_effects"] is False
+    assert kwargs["wrap_in_jit"] is False
+    assert kwargs["shard_index"] is rank
+    for module, flag in (
+        (layer, "WRAP_IN_JIT"),
+        (layout, "SIDE_EFFECTS"),
+        (layout, "SHARD_INDEX_OPERAND"),
+    ):
+        assert not hasattr(module, flag), flag
+
+
 def test_a_placed_layer_streams_its_primaries_only(armed):
     """4 primaries and 2 copy slots per rank over EP 2: the kernel is built for
     the 4 primaries, which is what makes 8 experts split over 2 shards."""
