@@ -25,15 +25,15 @@ from typing import Any
 from ..cache import should_fuse_pool_io, should_use_pool_gather
 from ..exec_spec import ExecSpec
 from ..modules.gqa import GQAModule, GQATunables
-from ..pool.config import with_cache
+from ..pool.config import FUSED_POOL_IO_MAX_B, FUSED_POOL_IO_MIN_B_HI, with_cache
 from ..profile import Profile, get_profile, model_default_profile
 from ..spec import ModelSpec
 from .constants import DEFAULT_BUCKETS, DEFAULT_VERIFY_BUCKETS, FALSE_STRS
 from .policy import parse_mk_buckets, parse_mk_verify_buckets
 
 _TRUE_STRS = ("1", "true", "yes", "on")
-DEFAULT_FUSED_POOL_IO_MAX_B: int = 24
-DEFAULT_FUSED_POOL_IO_MIN_B_HI: int = 56
+DEFAULT_FUSED_POOL_IO_MAX_B: int = FUSED_POOL_IO_MAX_B
+DEFAULT_FUSED_POOL_IO_MIN_B_HI: int = FUSED_POOL_IO_MIN_B_HI
 _SPLIT_STRS = (*FALSE_STRS, "split", "3stage")
 
 
