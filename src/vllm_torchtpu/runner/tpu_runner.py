@@ -6126,6 +6126,12 @@ class TPUModelRunner(GPUModelRunner):
 
             arm_topp_kernel()
 
+        # After the drafter, which shares the target's LM head.
+        if envs.TPU_LM_HEAD_E4M3:
+            from vllm_torchtpu.layers.adapter import lm_head_e4m3
+
+            lm_head_e4m3.arm(self.model, getattr(self.drafter, "draft_model", None))
+
         # After the drafter, so its MTP layer is armed too.
         if envs.FUSED_MOE_DECODE_KERNEL:
             from vllm_torchtpu.layers.adapter.fused_moe_decode import arm_runner_models
