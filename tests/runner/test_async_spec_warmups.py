@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Warm-ups of the compiled async spec-step programs: each runs at every shape
-serving gives it, under execute_model's no_grad (dynamo guards on grad mode),
-so the first serving call at a bucket finds its graph."""
+serving gives it, in its serving call's grad mode (dynamo guards on grad mode):
+execute_model's programs under its no_grad, sample_tokens' in the caller's
+mode. So the first serving call at a bucket finds its graph."""
 
 import contextlib
+import inspect
 from types import SimpleNamespace
 
 import numpy as np
@@ -28,6 +30,8 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpeculativeDecodingManager,
 )
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.spec_decode.eagle3 import _static_shape_args
+from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
 NUM_TOKENS_PADDINGS = [16, 32, 64]
 NUM_REQS_PADDINGS = [8, 16]
@@ -49,6 +53,57 @@ def _runner():
         TPUModelRunner._precompile_draft_extract(runner)
     )
     return runner
+
+
+@pytest.fixture
+def fresh_dynamo():
+    """Dynamo's caches start and end empty, so compile counts are this test's
+    and its graphs do not outlive it."""
+    torch._dynamo.reset()
+    try:
+        yield
+    finally:
+        torch._dynamo.reset()
+
+
+def _count_compiles(monkeypatch, module, name) -> list:
+    """Replace `module.name`, a static-shape compiled program, with its
+    function compiled whole on a backend that records each compile. Dynamo's
+    guards decide whether a call reuses a graph, whatever the backend."""
+    compiles = []
+
+    def counting_backend(gm, example_inputs):
+        compiles.append(
+            [tuple(t.shape) for t in example_inputs if isinstance(t, torch.Tensor)]
+        )
+        return gm.forward
+
+    fn = inspect.unwrap(getattr(module, name))
+    compiled = torch.compile(
+        fn, backend=counting_backend, fullgraph=True, dynamic=False
+    )
+    monkeypatch.setattr(module, name, _static_shape_args(compiled))
+    return compiles
+
+
+def _inside_sample_tokens(call) -> None:
+    """Run `call` where sample_tokens' body runs, in the grad mode serving
+    gives it: inside TPUWorker.sample_tokens and TPUModelRunner.sample_tokens,
+    called as the engine calls them. A pipeline stage without a pending step
+    returns `_sample_tokens_pp_intermediate_stage()` first thing."""
+    runner = SimpleNamespace(
+        execute_model_state=None,
+        _pp_is_last=False,
+        _sample_tokens_pp_intermediate_stage=call,
+    )
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            sample_tokens=lambda grammar_output: TPUModelRunner.sample_tokens(
+                runner, grammar_output
+            )
+        )
+    )
+    TPUWorker.sample_tokens(worker, None)
 
 
 @pytest.fixture
@@ -117,6 +172,7 @@ def test_the_separate_draft_extract_is_warmed_at_every_reachable_shape(recorded)
         ([0, 1, 1, 1], [40, 2, 2, 2]),
     ],
 )
+@pytest.mark.usefixtures("fresh_dynamo")
 def test_the_warmed_draft_extract_serves_a_spec_step_without_compiling(
     monkeypatch, num_draft_tokens, num_scheduled_tokens
 ):
@@ -131,7 +187,6 @@ def test_the_warmed_draft_extract_serves_a_spec_step_without_compiling(
         compiles.append([tuple(t.shape) for t in example_inputs])
         return gm.forward
 
-    torch._dynamo.reset()
     compiled = torch.compile(
         async_output.extract_draft_token_ids,
         backend=counting_backend,
@@ -191,7 +246,31 @@ def test_non_spec_chunk_padding_is_warmed_at_every_request_bucket(monkeypatch):
     monkeypatch.setattr(async_output, "_compiled_pad_non_spec_next_tokens", pad)
     monkeypatch.setattr(runner_mod, "synchronize_tensors", lambda *_a, **_k: None)
     TPUModelRunner._precompile_non_spec_chunk_padding(_runner())
-    assert calls == [((n, 1), torch.int64, K, False) for n in NUM_REQS_PADDINGS]
+    assert calls == [((n, 1), torch.int64, K, True) for n in NUM_REQS_PADDINGS]
+
+
+@pytest.mark.usefixtures("fresh_dynamo")
+@pytest.mark.parametrize("num_reqs", NUM_REQS_PADDINGS)
+def test_the_warmed_chunk_padding_serves_sample_tokens_without_compiling(
+    monkeypatch, num_reqs
+):
+    """The real padding program, warmed as capture_model warms it and then
+    called from inside sample_tokens, as a spec step pads a draft-free chunk:
+    the serving call reuses a warmed graph. A warm-up in another grad mode
+    than sample_tokens' leaves the call to compile while serving."""
+    compiles = _count_compiles(
+        monkeypatch, async_output, "_compiled_pad_non_spec_next_tokens"
+    )
+    monkeypatch.setattr(runner_mod, "synchronize_tensors", lambda *_a, **_k: None)
+    TPUModelRunner._precompile_non_spec_chunk_padding(_runner())
+    warmed = len(compiles)
+    assert warmed == len(NUM_REQS_PADDINGS)
+
+    selected = torch.zeros((num_reqs, 1), dtype=torch.int64)
+    _inside_sample_tokens(
+        lambda: async_output._compiled_pad_non_spec_next_tokens(selected, K)
+    )
+    assert len(compiles) == warmed, compiles[warmed:]
 
 
 class _WarmupStep:

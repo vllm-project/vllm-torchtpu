@@ -9623,14 +9623,18 @@ class TPUModelRunner(GPUModelRunner):
         """Warm `_compiled_pad_non_spec_next_tokens` at every padded request
         count. In a spec step it pads the tokens of a chunk with no drafts (a
         request's first decode step, beside verifying ones), which are
-        `[padded_num_reqs, 1]` int64 whether sampled or greedy top tokens."""
+        `[padded_num_reqs, 1]` int64 whether sampled or greedy top tokens.
+
+        sample_tokens calls it outside execute_model's no_grad, and dynamo
+        guards on grad mode, so this runs in the caller's grad mode, as the
+        other sample_tokens precompiles do."""
         from vllm_torchtpu.runner.tpu_runner_async_output import (
             _compiled_pad_non_spec_next_tokens,
         )
 
         assert self.speculative_config is not None
         k = self.speculative_config.num_speculative_tokens
-        with self._precompile_timed("non-spec chunk padding"), torch.no_grad():
+        with self._precompile_timed("non-spec chunk padding"):
             for num_reqs in self.num_reqs_paddings:
                 selected = torch.zeros((num_reqs, 1), dtype=torch.int64).to(self.device)
                 synchronize_tensors(_compiled_pad_non_spec_next_tokens(selected, k))
