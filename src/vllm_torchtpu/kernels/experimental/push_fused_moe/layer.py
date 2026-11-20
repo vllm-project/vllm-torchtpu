@@ -33,6 +33,7 @@ Only data movement changes; the plan, the FFN and the combine arithmetic are
 v2's.
 """
 
+import functools
 import threading
 from typing import cast
 
@@ -55,6 +56,7 @@ from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
     build_exchange_rows_tables,
+    build_exchange_rows_tables_split,
     build_push_tables,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.routing import prepare_routing
@@ -102,7 +104,14 @@ from vllm_torchtpu.kernels.fused_moe.v2.layer import (
 )
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
-from vllm_torchtpu.kernels.quantized_matmul.shared_expert import fp8_swiglu_mlp
+from vllm_torchtpu.kernels.quantized_matmul.shared_expert import (
+    fp8_swiglu_down,
+    fp8_swiglu_gate_up,
+    fp8_swiglu_mlp,
+)
+from vllm_torchtpu.kernels.quantized_matmul.shared_expert import (
+    is_supported as shared_expert_fused,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -283,6 +292,7 @@ def fused_ep_moe_push(
     light_prepush=0,
     single_barrier=False,
     early_scale_scatter=0,
+    split_exchange=False,
     expert_slot=None,
     expert_load=None,
     shared_expert=None,
@@ -325,7 +335,10 @@ def fused_ep_moe_push(
     (plan_kernel._tables); `single_barrier` opens the expert kernel and the
     routing exchange with one barrier phase, not two; `early_scale_scatter`
     lets the scale-slab scatter run under the in-op shared expert (1: not
-    held behind it; 2: nor behind the SparseCore pre-push). The
+    held behind it; 2: nor behind the SparseCore pre-push); `split_exchange`
+    (with `exchange_tables` and the in-op shared expert on its unfused path)
+    runs the shared expert's gate_up projection while the routing exchange's
+    rows are in flight (plan_kernel.build_exchange_rows_tables_split). The
     caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
@@ -677,13 +690,13 @@ def fused_ep_moe_push(
         expert_load_l=None,
         pre_tables=None,
         x_l=None,
-        shared_l=None,
+        shared_fn=None,
     ):
         """Dispatch tables, SparseCore pre-push, plan, kernel and combine.
 
         `pre_tables`, where the exchange kernel already built them, are
-        build_push_tables' outputs; `shared_l`, the shared expert computed on
-        `x_l` between the pre-push and the kernel."""
+        build_push_tables' outputs; `shared_fn(x_l)`, the shared expert (or
+        what is left of it), computed between the pre-push and the kernel."""
         me = rank_l[0, 0]
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
@@ -772,7 +785,7 @@ def fused_ep_moe_push(
         barriered_runs = () if slim_prepush_barrier else tuple(runs)
         # The shared expert's rows come out of the same barrier as the
         # pre-push operands, so it cannot be scheduled ahead of them.
-        shared_x = (x_l,) if shared_l is not None else ()
+        shared_x = (x_l,) if shared_fn is not None else ()
         (
             q_sorted,
             seg,
@@ -803,10 +816,9 @@ def fused_ep_moe_push(
             rank=me,
         )
         shared_out = ()
-        if shared_l is not None:
-            assert shared_limit is not None
+        if shared_fn is not None:
             with jax.named_scope("moe_shared_expert"):
-                shared_out = (fp8_swiglu_mlp(*shared_x, *shared_l, limit=shared_limit),)
+                shared_out = (shared_fn(*shared_x),)
         plan_kw = dict(
             e_total=e_total,
             ep=ep,
@@ -988,6 +1000,24 @@ def fused_ep_moe_push(
         )
         pre_tables = None
         my_counts = block_hist.sum(axis=0)
+        shared_in, shared_fn = x_l, None
+        # On its unfused path the shared expert splits around the exchange.
+        split_shared = (
+            split_exchange
+            and exchange_row_gather
+            and exchange_tables
+            and shared_l is not None
+            and not shared_expert_fused(x_l, *shared_l)
+        )
+        if shared_l is not None:
+            assert shared_limit is not None
+            w13, s13, w2, s2 = shared_l
+            if split_shared:
+                shared_fn = functools.partial(fp8_swiglu_down, w2=w2, s2=s2)
+            else:
+                shared_fn = functools.partial(
+                    fp8_swiglu_mlp, w13=w13, s13=s13, w2=w2, s2=s2, limit=shared_limit
+                )
         if exchange_row_gather:
             # The sorted rows are copied by the exchange kernel itself.
             with jax.named_scope("moe_early_qsort"):
@@ -998,17 +1028,31 @@ def fused_ep_moe_push(
                     topk=topk,
                     bf16_counts=bf16_sort_counts,
                 )
-            if exchange_tables:
+            table_kw = dict(
+                ep=ep,
+                width=layout[-1],
+                n_rows=tok.shape[0],
+                count_at=layout[1],
+                e_total=e_total,
+                n_pre=n_pre,
+                tile_m=capacity,
+                light_prepush=light_prepush,
+                single_barrier=bool(single_barrier),
+            )
+            if split_shared:
+                start, done = build_exchange_rows_tables_split(**table_kw)
+                handle = start(packed, rank_l[0, 0], q_l, tok)
+                # The shared expert's gate_up runs while the rows are in flight.
+                shared_in, handle = lax.optimization_barrier((shared_in, handle))
+                with jax.named_scope("moe_shared_expert"):
+                    shared_in = fp8_swiglu_gate_up(
+                        shared_in, w13, s13, limit=shared_limit
+                    )
+                shared_in, handle = lax.optimization_barrier((shared_in, handle))
+                exchange, q_sorted, *pre_tables = done(handle, q_l, seg_start)
+            elif exchange_tables:
                 exchange, q_sorted, *pre_tables = build_exchange_rows_tables(
-                    ep=ep,
-                    width=layout[-1],
-                    n_rows=tok.shape[0],
-                    count_at=layout[1],
-                    e_total=e_total,
-                    n_pre=n_pre,
-                    tile_m=capacity,
-                    light_prepush=light_prepush,
-                    single_barrier=bool(single_barrier),
+                    **table_kw
                 )(packed, rank_l[0, 0], q_l, tok, seg_start)
             else:
                 exchange, q_sorted = build_tc_exchange_all_gather_rows(
@@ -1054,8 +1098,8 @@ def fused_ep_moe_push(
             x_l.dtype,
             expert_load_l,
             pre_tables,
-            x_l,
-            shared_l,
+            shared_in,
+            shared_fn,
         )
 
     bias_args = tuple(b for b in (w1_bias, w2_bias) if b is not None)
@@ -1144,6 +1188,7 @@ def fused_ep_moe_push(
         int(light_prepush),
         bool(single_barrier),
         int(early_scale_scatter),
+        bool(split_exchange),
     )
     out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
     out_specs = out_specs if len(out_specs) > 1 else out_specs[0]

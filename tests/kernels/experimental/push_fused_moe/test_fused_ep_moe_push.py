@@ -585,3 +585,62 @@ def test_served_dims_shared_expert_inside_is_bit_exact(shape):
     np.testing.assert_array_equal(
         got_shared.view(np.uint16), np.asarray(want_shared).view(np.uint16)
     )
+
+
+# (g_local, rows per shard, top-k): the drafter's 240 rows and a decode step
+# of the 48-slot target layer, both on the shared expert's unfused path.
+SPLIT_SHAPES = {"g9": (9, 240, 3), "g48_decode": (48, 16, 6)}
+
+
+@pytest.mark.parametrize("shape", sorted(SPLIT_SHAPES))
+def test_served_dims_split_exchange_is_bit_exact(shape):
+    """Splitting the exchange-tables kernel around the shared expert's gate_up
+    projection changes no arithmetic: routed and shared outputs match the
+    unsplit layer bit for bit."""
+    g_local, rows, topk = SPLIT_SHAPES[shape]
+    mesh = _mesh()
+    e_total = EP * g_local
+    weights = _served_fp4_weights(mesh, 91, e_total=e_total)
+    x, gating = _inputs(
+        mesh, 92, hidden=SERVED_HIDDEN, e_logical=e_total, tokens=EP * rows
+    )
+    shared = _shared_expert_weights(mesh, 93)
+    common = dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        routed_scaling_factor=2.5,
+        act_fn="silu_and_mul_with_clamp",
+        logical_intermediate_size=SERVED_LOGICAL_INTER,
+        sc_prepush=2,
+        tc_exchange=True,
+        exchange_row_gather=True,
+        table_kernel=True,
+        exchange_tables=True,
+        kernel_plan_tables=True,
+        light_prepush=2,
+        single_barrier=True,
+        shared_expert=shared,
+        shared_limit=10.0,
+    )
+
+    def layer(x, gating, split):
+        return fused_ep_moe_push(x, *weights, gating, split_exchange=split, **common)
+
+    outs = [
+        [
+            np.asarray(o)
+            for o in jax.jit(layer, static_argnums=2, compiler_options=_AS_SERVED)(
+                x, gating, split
+            )
+        ]
+        for split in (False, True)
+    ]
+    for want, got in zip(*outs):
+        assert np.isfinite(got.astype(np.float32)).all()
+        np.testing.assert_array_equal(got.view(np.uint16), want.view(np.uint16))

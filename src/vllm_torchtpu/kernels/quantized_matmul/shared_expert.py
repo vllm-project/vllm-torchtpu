@@ -357,5 +357,18 @@ def fp8_swiglu_mlp(
     """
     if is_supported(x, w13, s13, w2, s2):
         return fused_shared_expert(x, w13, s13, w2, s2, limit=limit)
+    return fp8_swiglu_down(fp8_swiglu_gate_up(x, w13, s13, limit=limit), w2, s2)
+
+
+def fp8_swiglu_gate_up(
+    x: jax.Array, w13: jax.Array, s13: jax.Array, *, limit: float
+) -> jax.Array:
+    """The first half of fp8_swiglu_mlp's unfused form: the activated
+    gate_up projection, for callers that run work between the halves."""
     gate, up = jnp.split(xla_quantized_matmul(x, w13, s13), 2, axis=-1)
-    return xla_quantized_matmul(silu_and_mul_with_clamp(gate, up, limit), w2, s2)
+    return silu_and_mul_with_clamp(gate, up, limit)
+
+
+def fp8_swiglu_down(h: jax.Array, w2: jax.Array, s2: jax.Array) -> jax.Array:
+    """The second half of fp8_swiglu_mlp's unfused form."""
+    return xla_quantized_matmul(h, w2, s2)

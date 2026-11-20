@@ -254,6 +254,7 @@ def _build_op(
             kernel_plan_tables=envs.MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES,
             light_prepush=envs.MOE_FUSED_EP_PUSH_LIGHT_PREPUSH,
             single_barrier=envs.MOE_FUSED_EP_PUSH_SINGLE_BARRIER,
+            split_exchange=envs.MOE_FUSED_EP_PUSH_SPLIT_EXCHANGE,
             early_scale_scatter=envs.MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER,
         )
         if dspark_draft and envs.TPU_DSPARK_DRAFT_MOE_TUNING:
