@@ -33,7 +33,6 @@ if TYPE_CHECKING:
 
 Stage = Literal[
     "import",
-    "platform_import",
     "general_plugin",
     "platform_activation",
     "engine_core",
@@ -68,11 +67,6 @@ _ENGINE: tuple[Stage, ...] = (*_ACTIVE, "engine_core")
 PATCHES = (
     # Environment setup and custom-op registration.
     Patch("vllm_torchtpu.env_override:_patch_jax_pallas_fori_lowering", ("import",)),
-    # Before any module applies a module-level torch.compile decorator.
-    Patch(
-        "vllm_torchtpu.compilation.fast_dispatch:install",
-        ("platform_import",),
-    ),
     # TODO(https://github.com/vllm-project/vllm-torchtpu/pull/1182): Remove
     # this patch once the pinned TorchTPU supports tuple-axis PartitionSpecs
     # in both get_global_shape and get_local_shape.
@@ -275,7 +269,6 @@ def apply(
     """
     if stage not in (
         "import",
-        "platform_import",
         "general_plugin",
         "platform_activation",
         "engine_core",

@@ -232,7 +232,6 @@ def test_manifest_preserves_lifecycle_dependencies():
         stage: [p.target.split(":")[-1] for p in reg.PATCHES if stage in p.stages]
         for stage in (
             "import",
-            "platform_import",
             "general_plugin",
             "platform_activation",
             "engine_core",
@@ -241,7 +240,6 @@ def test_manifest_preserves_lifecycle_dependencies():
         )
     }
     assert stages["import"] == ["_patch_jax_pallas_fori_lowering"]
-    assert stages["platform_import"] == ["install"]
     assert stages["general_plugin"] == ["install_device_ids_patch"]
     assert stages["engine_core"] == [
         "_patch_vllm_hybrid_pcp_block_sizes",
