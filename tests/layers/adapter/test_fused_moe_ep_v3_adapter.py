@@ -157,7 +157,7 @@ def test_a_model_that_follows_the_step_form_meets_the_few_token_kernel(
     groups(*layout)
     dp, tp = layout
     monkeypatch.setattr(sequence_parallel, "_FOLLOWS_STEP_FORM", False)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="leave steps between the two kernels"):
         v3.check_kernel_threshold(ep=dp * tp, tp=tp, lowtok_cap=448)
     sequence_parallel.follow_step_form()
     v3.check_kernel_threshold(ep=dp * tp, tp=tp, lowtok_cap=448)
