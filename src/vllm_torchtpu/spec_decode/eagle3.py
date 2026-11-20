@@ -962,8 +962,9 @@ class Eagle3Proposer:
 
             cast(Any, model).load_weights = load_weights
             cast(Any, model).is_unused_checkpoint_weight = lambda name: (
-                model_is_unused is not None and model_is_unused(name)
-            ) or any(key in name for key in shared_keys)
+                (model_is_unused is not None and model_is_unused(name))
+                or any(key in name for key in shared_keys)
+            )
             try:
                 model_loader.load_weights(model, draft_model_config)
             finally:

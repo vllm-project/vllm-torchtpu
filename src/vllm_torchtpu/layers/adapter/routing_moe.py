@@ -136,6 +136,8 @@ def unsupported_reason(layer) -> str | None:
         return "ROUTING_MOE_FP8_DISPATCH needs remote scatter"
     if envs.ROUTING_MOE_PACK_BEFORE_GATHER and not envs.ROUTING_MOE_REMOTE_SCATTER:
         return "ROUTING_MOE_PACK_BEFORE_GATHER needs remote scatter"
+    if envs.ROUTING_MOE_FP8_DISPATCH_TO_KERNEL and not envs.ROUTING_MOE_FP8_DISPATCH:
+        return "ROUTING_MOE_FP8_DISPATCH_TO_KERNEL needs ROUTING_MOE_FP8_DISPATCH"
     return None
 
 
@@ -234,6 +236,20 @@ def _dequantize_rows(q: jax.Array, scale: jax.Array, dtype) -> jax.Array:
     return (q.astype(jnp.float32) * scale).astype(dtype)
 
 
+def _fp8_scale_chunk(scale: jax.Array) -> jax.Array:
+    """f32 [t, 1] row scales -> fp8 [t, 1, 4, 128]: one compact-layout chunk
+    whose 128 32-bit words all hold the row's scale (byte p of each word at
+    packing position p, least significant first, as routing_gmm unpacks)."""
+    t = scale.shape[0]
+    words = jnp.broadcast_to(
+        lax.bitcast_convert_type(scale.astype(jnp.float32), jnp.uint32), (t, 128)
+    )
+    octets = jnp.stack(
+        [((words >> (8 * p)) & 0xFF).astype(jnp.uint8) for p in range(4)], axis=1
+    )
+    return lax.bitcast_convert_type(octets, jnp.float8_e4m3fn).reshape(t, 1, 4, 128)
+
+
 def _routing_moe_jax(
     mesh,
     x: jax.Array,
@@ -252,6 +268,7 @@ def _routing_moe_jax(
     gmm_plan: tuple,
     fp8_dispatch_min_rows: int = 0,
     pack_before_gather: bool = False,
+    fp8_to_kernel: bool = False,
 ) -> jax.Array:
     """tokamax routing_moe over the EP mesh on this rank's routed rows (x, top-k
     weights and ids sharded on axis 0); returns this rank's rows. Pure JAX, so
@@ -337,6 +354,13 @@ def _routing_moe_jax(
     def local(x_l, w_l, ids_l, w1_l, w2_l, s1_l, s2_l, idx_l):
         if not use_fp8:
             x_all = gather(compact(x_l))
+        elif fp8_to_kernel:
+            # routing_gmm takes the fp8 rows with their embedded per-row
+            # scale (a tokamax with pre-quantized x): no dequantize pass.
+            q, scale = _quantize_rows(x_l)
+            x_all = gather(
+                jnp.concatenate([compact(q), _fp8_scale_chunk(scale)], axis=1)
+            )
         elif pack_before_gather:
             q, scale = _quantize_rows(x_l)
             q_all = gather(compact(q))
@@ -393,6 +417,7 @@ def _build_op(
     gmm_plan: tuple = (),
     fp8_dispatch_min_rows: int = 0,
     pack_before_gather: bool = False,
+    fp8_to_kernel: bool = False,
 ):
     key = (
         topk,
@@ -407,6 +432,7 @@ def _build_op(
         gmm_plan,
         fp8_dispatch_min_rows,
         pack_before_gather,
+        fp8_to_kernel,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -474,6 +500,7 @@ def _build_op(
             gmm_plan=gmm_plan,
             fp8_dispatch_min_rows=fp8_dispatch_min_rows,
             pack_before_gather=pack_before_gather,
+            fp8_to_kernel=fp8_to_kernel,
         )
         return jax.shard_map(
             lambda out_l: layout.restore(out_l, EP_AXIS_NAME),
@@ -550,7 +577,8 @@ def prebuild_routing_moe(
     logger.info_once(
         "[MoE]: routing_moe over %d devices, %d experts each, token replica "
         "groups %s; %s scatter, %s combine rows, %s dispatch rows (from %d rows "
-        "per device), rows packed before the gather: %s; gmm plan %s.",
+        "per device; to the kernel: %s), rows packed before the gather: %s; gmm "
+        "plan %s.",
         ep,
         local_experts,
         replica_groups,
@@ -558,6 +586,7 @@ def prebuild_routing_moe(
         "fp8" if envs.ROUTING_MOE_FP8_COMBINE else "bf16",
         "fp8" if envs.ROUTING_MOE_FP8_DISPATCH else "bf16",
         envs.ROUTING_MOE_FP8_DISPATCH_MIN_ROWS,
+        envs.ROUTING_MOE_FP8_DISPATCH_TO_KERNEL,
         envs.ROUTING_MOE_PACK_BEFORE_GATHER,
         envs.ROUTING_MOE_GMM_PLAN or "tokamax heuristics",
     )
@@ -575,6 +604,7 @@ def prebuild_routing_moe(
         gmm_plan=parse_gmm_plan(envs.ROUTING_MOE_GMM_PLAN),
         fp8_dispatch_min_rows=envs.ROUTING_MOE_FP8_DISPATCH_MIN_ROWS,
         pack_before_gather=envs.ROUTING_MOE_PACK_BEFORE_GATHER,
+        fp8_to_kernel=envs.ROUTING_MOE_FP8_DISPATCH_TO_KERNEL,
     )
 
 

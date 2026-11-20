@@ -1056,8 +1056,8 @@ class VllmTPUMLAAttention(MLAAttention):
         )
 
         if original_mla_get_backend is not None:
-            mla_attention.get_mla_prefill_backend = (
-                lambda config: TPUDummyMLAPrefillBackend
+            mla_attention.get_mla_prefill_backend = lambda config: (
+                TPUDummyMLAPrefillBackend
             )
         if original_selector_get_backend is not None:
             selector.get_mla_prefill_backend = lambda config: TPUDummyMLAPrefillBackend

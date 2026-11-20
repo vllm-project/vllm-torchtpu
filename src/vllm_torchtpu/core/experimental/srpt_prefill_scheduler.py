@@ -449,8 +449,10 @@ class SrptPrefillScheduler(AsyncScheduler):
             candidate = (
                 max(
                     candidates,
-                    key=lambda r: alloc[r.request_id]
-                    * (r.num_computed_tokens + alloc[r.request_id] / 2),
+                    key=lambda r: (
+                        alloc[r.request_id]
+                        * (r.num_computed_tokens + alloc[r.request_id] / 2)
+                    ),
                 )
                 if left >= need
                 else candidates[0]

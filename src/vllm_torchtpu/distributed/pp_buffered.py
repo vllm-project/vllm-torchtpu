@@ -473,8 +473,9 @@ class PPBuffered:
                     if not self._has_room(transfer):
                         with TraceAnnotation("PP:PostThrottled"):
                             self._cv.wait_for(
-                                lambda t=transfer: self._post_stops()
-                                or self._has_room(t)
+                                lambda t=transfer: (
+                                    self._post_stops() or self._has_room(t)
+                                )
                             )
                 if self._post_stops():
                     # The forwards these were queued for will not run.

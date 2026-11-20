@@ -13,22 +13,27 @@ from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
 )
 
 out = fused_moe_decode(
-    rank,                 # int32[1], this rank's mesh index
-    hidden,               # [T, H] bf16, the same on every rank
-    w1, w2,               # [E, H, 2i] / [E, i, H], this rank's experts
-    w1_scale, w2_scale,   # [E, 1, 1, 2i] / [E, 1, 1, H] f32 per channel
-    shared_w1, shared_w1_scale,  # [H, 2i_s] / [1, 2i_s]
-    shared_w2, shared_w2_scale,  # [i_s, H] / [1, H]
-    shared_gate_weight,   # [H, 1], output scaled by sigmoid(hidden @ it);
-                          # None for an ungated shared expert
-    topk_weights, topk_ids,      # [T, k] from the caller's router
+    rank,  # int32[1], this rank's mesh index
+    hidden,  # [T, H] bf16, the same on every rank
+    w1,
+    w2,  # [E, H, 2i] / [E, i, H], this rank's experts
+    w1_scale,
+    w2_scale,  # [E, 1, 1, 2i] / [E, 1, 1, H] f32 per channel
+    shared_w1,
+    shared_w1_scale,  # [H, 2i_s] / [1, 2i_s]
+    shared_w2,
+    shared_w2_scale,  # [i_s, H] / [1, H]
+    shared_gate_weight,  # [H, 1], output scaled by sigmoid(hidden @ it);
+    # None for an ungated shared expert
+    topk_weights,
+    topk_ids,  # [T, k] from the caller's router
     n_ranks=8,
-    expert_start=None,    # global id of the first local expert (EP); None for TP
-    scatter_rows=False,   # True for DP attention, see below
-    routed_scale=1.0,     # scales the routed experts only (GLM-5.2: 2.5)
-    i_block=None,         # force blocked mode with this width (tests)
+    expert_start=None,  # global id of the first local expert (EP); None for TP
+    scatter_rows=False,  # True for DP attention, see below
+    routed_scale=1.0,  # scales the routed experts only (GLM-5.2: 2.5)
+    i_block=None,  # force blocked mode with this width (tests)
 )  # -> [T, H] bf16, all-reduced, identical on every rank
-   #    scatter_rows=True: [T / n_ranks, H], this rank's rows only
+#    scatter_rows=True: [T / n_ranks, H], this rank's rows only
 ```
 
 - Call it inside `shard_map` over the mesh, one call per rank.

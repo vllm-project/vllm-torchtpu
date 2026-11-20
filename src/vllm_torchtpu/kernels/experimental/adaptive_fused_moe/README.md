@@ -35,7 +35,10 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
 )
 
 plan = select_weight_buffers(
-    g_local=64, capacity=128, hidden=4096, inter=1024,
+    g_local=64,
+    capacity=128,
+    hidden=4096,
+    inter=1024,
     weight_format=WeightFormat.FP8,
 )
 ```

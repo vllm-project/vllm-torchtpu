@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     ROUTING_MOE_FP8_DISPATCH: bool = False
     ROUTING_MOE_FP8_DISPATCH_MIN_ROWS: int = 256
     ROUTING_MOE_PACK_BEFORE_GATHER: bool = False
+    ROUTING_MOE_FP8_DISPATCH_TO_KERNEL: bool = False
     ROUTING_MOE_GMM_PLAN: str = ""
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -916,6 +917,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # layout, so the gathered array needs no relayout. Needs a tokamax whose
     # _routing_moe_local takes a 4-D compact x (not tokamax 0.0.18).
     "ROUTING_MOE_PACK_BEFORE_GATHER": env_bool("ROUTING_MOE_PACK_BEFORE_GATHER"),
+    # routing_moe, with fp8 dispatch: hand routing_gmm the gathered fp8 rows
+    # with their per-row scale embedded (no dequantize pass). Needs a tokamax
+    # whose routing_gmm takes a pre-quantized x (not tokamax 0.0.18).
+    "ROUTING_MOE_FP8_DISPATCH_TO_KERNEL": env_bool(
+        "ROUTING_MOE_FP8_DISPATCH_TO_KERNEL"
+    ),
     # routing_moe: tokamax RoutingGmmPlan overrides as JSON, either one object
     # of plan fields for every token count, or {"by_rows": [[max_rows, {...}],
     # ...], "default": {...}} keyed by the rows each device contributes.

@@ -80,6 +80,7 @@ def _armed():
         patch.object(envs, "ROUTING_MOE_GMM_PLAN", ""),
         patch.object(envs, "ROUTING_MOE_FP8_DISPATCH_MIN_ROWS", 256),
         patch.object(envs, "ROUTING_MOE_PACK_BEFORE_GATHER", False),
+        patch.object(envs, "ROUTING_MOE_FP8_DISPATCH_TO_KERNEL", False),
     ):
         yield
 
@@ -214,6 +215,25 @@ def test_pack_before_gather_follows_the_flag(pack):
     with patch.object(envs, "ROUTING_MOE_PACK_BEFORE_GATHER", pack):
         _prebuild(_layer(), build_op=lambda *args, **kw: seen.append(kw) or "op")
     assert seen[0]["pack_before_gather"] is pack
+
+
+def test_fp8_to_kernel_needs_fp8_dispatch():
+    with (
+        patch.object(envs, "ROUTING_MOE_FP8_DISPATCH_TO_KERNEL", True),
+        pytest.raises(ValueError, match="needs ROUTING_MOE_FP8_DISPATCH"),
+    ):
+        _prebuild(_layer())
+
+
+def test_fp8_scale_chunk_words_hold_the_row_scale():
+    """Each of the chunk's 128 words, reassembled from its 4 packed bytes
+    (byte p at packing position p), is the row's f32 scale."""
+    scale = jnp.asarray([[0.5], [3.25e-3], [1.0e6]], jnp.float32)
+    chunk = bridge._fp8_scale_chunk(scale)
+    assert chunk.shape == (3, 1, 4, 128) and chunk.dtype == jnp.float8_e4m3fn
+    octets = np.asarray(jax.lax.bitcast_convert_type(chunk, jnp.uint8), np.uint32)
+    words = sum(octets[:, 0, p, :] << (8 * p) for p in range(4)).astype(np.uint32)
+    assert (words.view(np.float32) == np.asarray(scale)).all()
 
 
 def test_gmm_plan_parsing():
