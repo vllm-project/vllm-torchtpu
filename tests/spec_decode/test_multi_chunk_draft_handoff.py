@@ -35,6 +35,7 @@ import torch
 
 import vllm_torchtpu.runner.tpu_runner_async_output as async_output
 from tests.spec_decode.test_eagle3 import _make_chunk, _make_proposer
+from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
@@ -159,12 +160,23 @@ def _verify_outputs(num_reqs: list[int], tpu_typed: bool):
     )
 
 
-def _runner(drafter: Eagle3Proposer, draft_tp: int = 2) -> TPUModelRunner:
+def _runner(
+    drafter: Eagle3Proposer, draft_tp: int = 2, kv_role: str | None = None
+) -> TPUModelRunner:
     runner = object.__new__(TPUModelRunner)
     runner.device = torch.device("cpu")
     runner.max_num_reqs = 2 * REQ_BUCKET
     runner.speculative_config = SimpleNamespace(
-        num_speculative_tokens=K, draft_tensor_parallel_size=draft_tp
+        num_speculative_tokens=K,
+        draft_tensor_parallel_size=draft_tp,
+        method="mtp",
+        use_eagle=lambda: True,
+    )
+    runner._pp_is_last = True
+    runner.vllm_config = SimpleNamespace(
+        kv_transfer_config=None
+        if kv_role is None
+        else SimpleNamespace(is_kv_producer=kv_role != "kv_consumer")
     )
     runner.drafter = drafter
     runner._adaptive_verification = None
@@ -286,12 +298,21 @@ def test_without_the_skip_propose_concatenates_the_chunks(monkeypatch):
         "rows_over_max_num_reqs",
         "not_on_tpu",
         "other_drafter",
+        "kv_producer_fencing_its_kv_writes",
     ],
 )
 def test_the_concat_stays_where_nothing_takes_each_chunks_drafts(monkeypatch, case):
     num_reqs = [3, 2]
     drafter = _proposer(monkeypatch, num_reqs)
-    runner = _runner(drafter, draft_tp=1 if case == "replicated_draft" else 2)
+    runner = _runner(
+        drafter,
+        draft_tp=1 if case == "replicated_draft" else 2,
+        kv_role="kv_producer" if case == "kv_producer_fencing_its_kv_writes" else None,
+    )
+    if case == "kv_producer_fencing_its_kv_writes":
+        monkeypatch.setattr(
+            dist_utils, "get_stage3_register_ahead_enabled", lambda: True
+        )
     next_tokens, _ = _verify_outputs(num_reqs, tpu_typed=case != "not_on_tpu")
     scheduler_output = SimpleNamespace(
         has_structured_output_requests=case == "structured_output"

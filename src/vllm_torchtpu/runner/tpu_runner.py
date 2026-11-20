@@ -1174,8 +1174,14 @@ class TPUModelRunner(GPUModelRunner):
         (``_assemble_async_spec_substitution``). A replicated drafter (draft
         TP 1) keeps the concat, because its drafts are pinned to rank 0's
         before the assembly; so does a step with structured output, whose
-        drafts are staged for the host.
+        drafts are staged for the host. So does a KV producer that fences the
+        step's KV writes under the token copy
+        (``_fence_spec_kv_under_token_copy``): the fence enqueues the drafter
+        through the returned drafts, which without the concat depend on chunk
+        0's draft forward alone and would leave chunk 1's draft KV writes
+        behind the fence.
         """
+        assert self.speculative_config is not None  # a spec-verify step
         return (
             is_async
             and len(next_tokens_per_chunk) == 2
@@ -1186,10 +1192,8 @@ class TPUModelRunner(GPUModelRunner):
                 next_tokens_per_chunk[0].shape[0] + next_tokens_per_chunk[1].shape[0]
                 <= self.max_num_reqs
             )
-            and (
-                self.speculative_config is None
-                or self.speculative_config.draft_tensor_parallel_size != 1
-            )
+            and self.speculative_config.draft_tensor_parallel_size != 1
+            and not self._fence_spec_kv_under_token_copy
         )
 
     def _defers_prev_rollback(
