@@ -202,8 +202,11 @@ if TYPE_CHECKING:
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
+    VLLM_TPU_ASYNC_HOST_OVERLAP: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
+    VLLM_TPU_FAST_TOPK_TOPP: bool = False
+    VLLM_TPU_FAST_TOPK_TOPP_MAX_K: int = 64
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -1240,6 +1243,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    # Uses non-blocking H2D transfers and persistent per-bucket device tensor
+    # caches for DP forward-context metadata and lockstep dummy steps so host
+    # model-forward dispatch overlaps with the previous step's TPU execution.
+    "VLLM_TPU_ASYNC_HOST_OVERLAP": env_bool("VLLM_TPU_ASYNC_HOST_OVERLAP"),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
@@ -1254,6 +1261,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 1 <= top_k <= value // 2 and no grammar mask applies.
     "TPU_SAMPLER_TOPK_CANDIDATES": env_nonnegative_int(
         "TPU_SAMPLER_TOPK_CANDIDATES", 0
+    ),
+    # Exact small-k fast path for non-greedy sampling: extracts the top
+    # VLLM_TPU_FAST_TOPK_TOPP_MAX_K logits/indices once, then applies exact
+    # per-row top-k + top-p masking and Gumbel-max sampling on [B, max_k]
+    # instead of 64 full-vocab binary-search passes and [B, vocab] uniform
+    # RNG draws. Also skips top-k/top-p when no active request sets them.
+    "VLLM_TPU_FAST_TOPK_TOPP": env_bool("VLLM_TPU_FAST_TOPK_TOPP", default=False),
+    "VLLM_TPU_FAST_TOPK_TOPP_MAX_K": env_nonnegative_int(
+        "VLLM_TPU_FAST_TOPK_TOPP_MAX_K", 64
     ),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the

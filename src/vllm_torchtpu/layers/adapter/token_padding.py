@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
+
+from vllm_torchtpu import envs
 
 _padding_state: "TokenPaddingState | None" = None
 
@@ -24,6 +26,9 @@ class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
+    _async_mask_cache: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = (
+        field(default_factory=dict, repr=False)
+    )
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
@@ -34,7 +39,19 @@ class TokenPaddingState:
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
-        host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
+        max_len = int(self.local_padding_mask.shape[0])
+        if envs.VLLM_TPU_ASYNC_HOST_OVERLAP and not envs.USE_MOE_TP_DECODE_KERNEL:
+            key = (max_len, int(local_valid_tokens), int(local_padded_tokens))
+            cached = self._async_mask_cache.get(key)
+            if cached is None:
+                host = torch.zeros(max_len, dtype=torch.bool)
+                host[local_valid_tokens:local_padded_tokens] = True
+                dev = host.to(self.local_padding_mask.device, non_blocking=True)
+                cached = (dev, host)
+                self._async_mask_cache[key] = cached
+            self.local_padding_mask = cached[0]
+            return
+        host = torch.zeros(max_len, dtype=torch.bool)
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
         self.local_padding_mask.copy_(host)

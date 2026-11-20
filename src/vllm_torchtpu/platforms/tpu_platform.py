@@ -16,6 +16,8 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import atexit
+from collections import OrderedDict, deque
 import importlib.util
 import os
 import time
@@ -73,6 +75,54 @@ else:
     SamplingType = None
 
 logger = init_logger(__name__)
+
+_DP_METADATA_TPU_CACHE_MAX = 256
+_DP_METADATA_TPU_CACHE: OrderedDict[
+    tuple[int, torch.dtype, tuple[int, ...], bytes],
+    tuple[torch.Tensor, torch.Tensor],
+] = OrderedDict()
+# Keep recently evicted CPU source buffers alive while any in-flight async H2D
+# transfer finishes (pinned host memory is unavailable on TPU).
+_DP_METADATA_CPU_KEEPALIVE: deque[torch.Tensor] = deque(maxlen=32)
+
+
+def _clear_dp_metadata_tpu_cache() -> None:
+    _DP_METADATA_TPU_CACHE.clear()
+    _DP_METADATA_CPU_KEEPALIVE.clear()
+
+
+atexit.register(_clear_dp_metadata_tpu_cache)
+
+
+def _get_or_stage_dp_tokens_tpu(t: torch.Tensor) -> torch.Tensor:
+    """Return a TPU copy of CPU tensor ``t`` without synchronizing the stream.
+
+    Steady-state DP steps repeat a small set of padded token buckets (e.g.
+    ``[93, ..., 93]`` for decode or ``[1024, ..., 1024]`` for prefill). Caching
+    the materialized TPU buffer by content skips per-step H2D transfers after
+    warmup, and ``non_blocking=True`` avoids the synchronous stream barrier on
+    cache misses while ``cpu_src`` stays alive in Python.
+    """
+    # torch.tpu.current_device() is private to torch_tpu on this image and
+    # raises from user code; torch.accelerator is the public replacement.
+    dev_idx = (
+        int(torch.accelerator.current_device_index())
+        if hasattr(torch, "tpu") and torch.tpu.is_initialized()
+        else 0
+    )
+    t_contig = t.detach().contiguous()
+    key = (dev_idx, t_contig.dtype, tuple(t_contig.shape), t_contig.numpy().tobytes())
+    cached = _DP_METADATA_TPU_CACHE.get(key)
+    if cached is not None:
+        _DP_METADATA_TPU_CACHE.move_to_end(key)
+        return cached[0]
+    cpu_src = t_contig.clone()
+    tpu_t = cpu_src.to("tpu", non_blocking=True)
+    _DP_METADATA_TPU_CACHE[key] = (tpu_t, cpu_src)
+    if len(_DP_METADATA_TPU_CACHE) > _DP_METADATA_TPU_CACHE_MAX:
+        _, (_, evicted_cpu) = _DP_METADATA_TPU_CACHE.popitem(last=False)
+        _DP_METADATA_CPU_KEEPALIVE.append(evicted_cpu)
+    return tpu_t
 
 # Every map below is keyed on the number of devices in the slice, which is
 # what world_size counts and what the slice builder sizes its worker address
@@ -496,6 +546,7 @@ class TpuPlatform(Platform):
         "TPU_MOE_ROUTER_TOPK",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "TPU_DP_VOCAB_PARALLEL",
+        "VLLM_TPU_ASYNC_HOST_OVERLAP",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
         "VLLM_TPU_INDEXER_KV_CACHE_MODE",
@@ -505,6 +556,8 @@ class TpuPlatform(Platform):
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
+        "VLLM_TPU_FAST_TOPK_TOPP",
+        "VLLM_TPU_FAST_TOPK_TOPP_MAX_K",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -776,7 +829,11 @@ class TpuPlatform(Platform):
         if dp_metadata is not None:
             t = dp_metadata.num_tokens_across_dp_cpu
             if t.device.type == "cpu":
-                tpu_t = t.to("tpu")
+                tpu_t = (
+                    _get_or_stage_dp_tokens_tpu(t)
+                    if envs.VLLM_TPU_ASYNC_HOST_OVERLAP
+                    else t.to("tpu")
+                )
                 try:
                     dp_metadata.num_tokens_across_dp_cpu = tpu_t
                 except Exception:
