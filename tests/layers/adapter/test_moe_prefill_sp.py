@@ -52,6 +52,7 @@ from vllm_torchtpu.layers.adapter import moe_prefill_sp as sp
 from vllm_torchtpu.layers.adapter import rmsnorm
 from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
 from vllm_torchtpu.layers.adapter.linear_common import PREQUANT_ATTR, PrequantSlot
+from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
 def _shards(full: torch.Tensor, tp: int, dim: int) -> list[torch.Tensor]:
@@ -1181,3 +1182,141 @@ def test_should_route_post_attn_norm_to_fused_oproj_ar():
         )
     assert got is sentinel
     fused.assert_called_once_with(attn_out, w.o_proj, res_in, norm_w, 1e-6)
+
+
+def test_should_skip_final_all_gather_when_sp_sharded_output_armed():
+    num_tokens, tp, hidden = 16, 4, 8
+    rows = num_tokens // tp
+    input_ids = torch.arange(num_tokens, dtype=torch.int64)
+    positions = torch.arange(num_tokens, dtype=torch.int32)
+    embed_out = torch.randn(rows, hidden, dtype=torch.bfloat16)
+
+    def _fake_layer(_pos, x, res, _scaling):
+        return x, x if res is None else res
+
+    def _fake_norm(x, res):
+        return x, res
+
+    backbone = SimpleNamespace(
+        start_layer=0,
+        end_layer=1,
+        layers=[_fake_layer],
+        embed_tokens=object(),
+        norm=_fake_norm,
+    )
+    setattr(backbone, sp.KEEP_ATTR, True)
+    setattr(backbone, sp.EMBED_RS_ATTR, True)
+    setattr(backbone, sp.SP_OUTPUT_ATTR, True)
+
+    with (
+        patch.object(sp, "applies", return_value=True),
+        patch.object(sp, "_check_divides", return_value=tp),
+        patch.object(sp, "_embed_reduce_scatter", return_value=embed_out),
+        patch.object(sp.small_all_reduce_op, "retain", side_effect=lambda x: x),
+        patch.object(sp, "_all_rows") as all_rows_mock,
+    ):
+        out = sp.patched_model_forward(backbone, input_ids, positions)
+    assert tuple(out.shape) == (rows, hidden)
+    all_rows_mock.assert_not_called()
+
+
+def test_should_select_exact_global_rows_from_sp_sharded_hidden_states():
+    tp, rows_local, hidden = 4, 8, 16
+    num_tokens = tp * rows_local
+    torch.manual_seed(193)
+    full_hidden = torch.randn(num_tokens, hidden, dtype=torch.bfloat16)
+    # Anti-cancellation NaNs on unselected rows prove `where` never multiplies NaN*0.
+    full_hidden[2] = float("nan")
+    full_hidden[rows_local + 3] = float("nan")
+    indices = torch.tensor(
+        [0, rows_local - 1, rows_local, num_tokens - 1, 7, 17], dtype=torch.int32
+    )
+    expected = torch.index_select(full_hidden, 0, indices)
+
+    partials = []
+    for r in range(tp):
+        shard = full_hidden[r * rows_local : (r + 1) * rows_local]
+        rank_t = torch.tensor([[r]], dtype=torch.int32)
+        with patch.object(
+            sp, "tensor_model_parallel_all_reduce", side_effect=lambda x: x
+        ):
+            partials.append(sp.select_sp_hidden_states(shard, indices, rank=rank_t))
+
+    reduced = sum(p.float() for p in partials).to(torch.bfloat16)
+    assert torch.equal(reduced, expected)
+
+    # Gate checks: sharding factor resolves only for armed SP prefill buckets.
+    model = SimpleNamespace(model=SimpleNamespace())
+    setattr(model.model, sp.SP_OUTPUT_ATTR, True)
+    setattr(model.model, sp.SP_OUTPUT_TP_ATTR, tp)
+    with patch.dict(
+        "os.environ",
+        {
+            "TPU_MOE_PREFILL_SEQUENCE_PARALLEL": "1",
+            "TPU_MOE_PREFILL_SP_SHARDED_OUTPUT": "1",
+        },
+    ):
+        assert sp.sp_output_sharding(model, 16384) == tp
+        assert sp.sp_output_sharding(model, 64) == 1
+        assert sp.sp_output_sharding(model, 1025) == 1
+    with patch.dict("os.environ", {"TPU_MOE_PREFILL_SP_SHARDED_OUTPUT": "0"}):
+        assert sp.sp_output_sharding(model, 16384) == 1
+    setattr(model.model, sp.SP_OUTPUT_ATTR, False)
+    with patch.dict("os.environ", {"TPU_MOE_PREFILL_SP_SHARDED_OUTPUT": "1"}):
+        assert sp.sp_output_sharding(model, 16384) == 1
+
+
+def test_should_route_runner_sp_selected_logits_and_top_tokens_when_armed():
+    tp, rows_local, hidden, vocab = 4, 8, 12, 32
+    torch.manual_seed(194)
+    weight = torch.randn(vocab, hidden)
+    full_hidden = torch.randn(tp * rows_local, hidden)
+    indices = torch.tensor([0, 9, 17, 31], dtype=torch.int32)
+    expected_logits = torch.index_select(full_hidden, 0, indices) @ weight.T
+    expected_tokens = torch.argmax(expected_logits, dim=-1, keepdim=True)
+
+    def _get_top_tokens(head, h):
+        return torch.argmax(h @ head.T, dim=-1)
+
+    owner = SimpleNamespace(
+        logits_processor=SimpleNamespace(get_top_tokens=_get_top_tokens),
+        lm_head=weight,
+    )
+    backbone = SimpleNamespace()
+    setattr(backbone, sp.SP_OUTPUT_ATTR, True)
+    setattr(backbone, sp.SP_OUTPUT_TP_ATTR, tp)
+    model = SimpleNamespace(model=backbone, compute_logits=lambda h: h @ weight.T)
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        model=model,
+        _greedy_head_owner=owner,
+    )
+
+    with torch.compiler.set_stance("force_eager"):
+        partials = []
+        for r in range(tp):
+            shard = full_hidden[r * rows_local : (r + 1) * rows_local]
+            rank_t = torch.tensor([[r]], dtype=torch.int32)
+            with patch.object(
+                sp, "tensor_model_parallel_all_reduce", side_effect=lambda x: x
+            ):
+                partials.append(
+                    TPUModelRunner.compute_selected_sp_logits(
+                        runner, shard, indices, rank_t
+                    )
+                )
+        assert torch.allclose(sum(partials), expected_logits, atol=1e-4)
+
+        reduced_hidden = torch.index_select(full_hidden, 0, indices)
+        rank0 = torch.zeros((1, 1), dtype=torch.int32)
+        with patch.object(sp, "select_sp_hidden_states", return_value=reduced_hidden):
+            tokens = TPUModelRunner.compute_selected_sp_top_tokens(
+                runner, full_hidden[:rows_local], indices, rank0
+            )
+        assert torch.equal(tokens, expected_tokens)
+
+        pooling_runner = SimpleNamespace(is_pooling_model=True)
+        empty = TPUModelRunner.compute_selected_sp_logits(
+            pooling_runner, full_hidden[:rows_local], indices, rank0
+        )
+        assert empty.numel() == 0

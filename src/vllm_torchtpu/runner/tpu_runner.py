@@ -76,7 +76,10 @@ from vllm.v1.outputs import (
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
+
+from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
@@ -84,6 +87,19 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
+from vllm_torchtpu.layers.adapter import (
+    dcp_token_parallel_op,
+    moe_prefill_sp,
+    small_all_reduce_op,
+    token_padding,
+)
+from vllm_torchtpu.layers.adapter.attention import (
+    KV_LAYOUT_BY_VLLM_LAYOUT,
+    TPU_STR_DTYPE_TO_TORCH_DTYPE,
+    PallasAttentionBackend,
+    PallasAttentionBackendImpl,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
     copy_mamba_state_rows,
@@ -115,6 +131,8 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
+from vllm_torchtpu.runner import greedy_top_tokens, spec_precompile_shapes
+from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
     MMEncoderManager,
@@ -157,23 +175,6 @@ from vllm_torchtpu.tracing.utils import (
 )
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 from vllm_torchtpu.worker.cpu_pin import WorkerCpuPinner
-
-from vllm_torchtpu import envs, utils
-from vllm_torchtpu.compilation import shape_variants
-from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
-from vllm_torchtpu.layers.adapter import (
-    dcp_token_parallel_op,
-    small_all_reduce_op,
-    token_padding,
-)
-from vllm_torchtpu.layers.adapter.attention import (
-    KV_LAYOUT_BY_VLLM_LAYOUT,
-    TPU_STR_DTYPE_TO_TORCH_DTYPE,
-    PallasAttentionBackend,
-    PallasAttentionBackendImpl,
-)
-from vllm_torchtpu.runner import greedy_top_tokens, spec_precompile_shapes
-from vllm_torchtpu.runner import utils as runner_utils
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -4048,13 +4049,33 @@ class TPUModelRunner(GPUModelRunner):
                         hidden_states,
                         layout_plan,
                     )
+                    sp_output = hidden_states.shape[0] != num_tokens_padded and (
+                        moe_prefill_sp.sp_output_sharding(self.model, num_tokens_padded)
+                        > 1
+                    )
                     if top_tokens:
-                        logits = self.compute_selected_top_tokens(
-                            hidden_states, logits_indices
+                        logits = (
+                            self.compute_selected_sp_top_tokens(
+                                hidden_states,
+                                logits_indices,
+                                moe_prefill_sp.sp_output_rank(),
+                            )
+                            if sp_output
+                            else self.compute_selected_top_tokens(
+                                hidden_states, logits_indices
+                            )
                         )
                     else:
-                        logits = self.compute_selected_logits(
-                            hidden_states, logits_indices
+                        logits = (
+                            self.compute_selected_sp_logits(
+                                hidden_states,
+                                logits_indices,
+                                moe_prefill_sp.sp_output_rank(),
+                            )
+                            if sp_output
+                            else self.compute_selected_logits(
+                                hidden_states, logits_indices
+                            )
                         )
                 elif top_tokens:
                     logits = self.compute_top_tokens_from_hidden_states(
@@ -5366,8 +5387,6 @@ class TPUModelRunner(GPUModelRunner):
                 arm_runner_models(self)
 
         if envs.TPU_MOE_PREFILL_SEQUENCE_PARALLEL:
-            from vllm_torchtpu.layers.adapter import moe_prefill_sp
-
             moe_prefill_sp.arm(self.model, self.vllm_config)
 
     def _initialize_pallas_kernels(self):
@@ -5750,7 +5769,14 @@ class TPUModelRunner(GPUModelRunner):
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
                 _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
-                _ = self.compute_selected_logits(out, _idx)
+                if out.shape[0] != num_tokens and (
+                    moe_prefill_sp.sp_output_sharding(self.model, num_tokens) > 1
+                ):
+                    _ = self.compute_selected_sp_logits(
+                        out, _idx, moe_prefill_sp.sp_output_rank()
+                    )
+                else:
+                    _ = self.compute_selected_logits(out, _idx)
             if not dp_lockstep:
                 synchronize_tensors(out)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -6049,13 +6075,20 @@ class TPUModelRunner(GPUModelRunner):
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_selected_logits"):
             for num_tokens in self.num_tokens_paddings:
+                sp_tp = moe_prefill_sp.sp_output_sharding(self.model, num_tokens)
+                hidden_rows = num_tokens // sp_tp if sp_tp > 1 else num_tokens
                 dummy_hidden = torch.zeros(
-                    (num_tokens, hsize),
+                    (hidden_rows, hsize),
                     dtype=self._hidden_states_dtype,
                 ).to(self.device)
+                sp_rank = moe_prefill_sp.sp_output_rank() if sp_tp > 1 else None
                 for num_reqs in self.num_reqs_paddings:
                     indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
-                    out = self.compute_selected_logits(dummy_hidden, indices)
+                    out = (
+                        self.compute_selected_sp_logits(dummy_hidden, indices, sp_rank)
+                        if sp_rank is not None
+                        else self.compute_selected_logits(dummy_hidden, indices)
+                    )
                     synchronize_tensors(out)
                     logger.info(
                         "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
@@ -6122,13 +6155,22 @@ class TPUModelRunner(GPUModelRunner):
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_selected_top_tokens"):
             for num_tokens in self.num_tokens_paddings:
+                sp_tp = moe_prefill_sp.sp_output_sharding(self.model, num_tokens)
+                hidden_rows = num_tokens // sp_tp if sp_tp > 1 else num_tokens
                 dummy_hidden = torch.zeros(
-                    (num_tokens, hsize),
+                    (hidden_rows, hsize),
                     dtype=self._hidden_states_dtype,
                 ).to(self.device)
+                sp_rank = moe_prefill_sp.sp_output_rank() if sp_tp > 1 else None
                 for num_reqs in self.num_reqs_paddings:
                     indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
-                    out = self.compute_selected_top_tokens(dummy_hidden, indices)
+                    out = (
+                        self.compute_selected_sp_top_tokens(
+                            dummy_hidden, indices, sp_rank
+                        )
+                        if sp_rank is not None
+                        else self.compute_selected_top_tokens(dummy_hidden, indices)
+                    )
                     synchronize_tensors(out)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
@@ -7454,6 +7496,7 @@ class TPUModelRunner(GPUModelRunner):
         num_tokens: int,
     ) -> None:
         from vllm.compilation.wrapper import reset_compile_wrapper
+
         from vllm_torchtpu.layers.adapter.linear_common import (
             _get_quantized_matmul_fp4_op,
             _get_quantized_matmul_op,
@@ -7861,6 +7904,20 @@ class TPUModelRunner(GPUModelRunner):
         return self.model.compute_logits(selected)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_selected_sp_logits(
+        self,
+        hidden_states: torch.Tensor,
+        indices_do_sample: torch.Tensor,
+        rank: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.is_pooling_model:
+            return torch.empty((0,), device=hidden_states.device)
+        selected = moe_prefill_sp.select_sp_hidden_states(
+            hidden_states, indices_do_sample, rank
+        )
+        return self.model.compute_logits(selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits_from_hidden_states(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -7877,6 +7934,19 @@ class TPUModelRunner(GPUModelRunner):
     ) -> torch.Tensor:
         assert self._greedy_head_owner is not None
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        return greedy_top_tokens.top_tokens(self._greedy_head_owner, selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_selected_sp_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        indices_do_sample: torch.Tensor,
+        rank: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self._greedy_head_owner is not None
+        selected = moe_prefill_sp.select_sp_hidden_states(
+            hidden_states, indices_do_sample, rank
+        )
         return greedy_top_tokens.top_tokens(self._greedy_head_owner, selected)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
