@@ -77,6 +77,7 @@ from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
 from vllm_torchtpu.layers.adapter import (
     dcp_nonidx_qb_mla_op,
     dcp_token_parallel_op,
+    dcp_unified_idx_qb_mla_op,
     dcp_unified_indexer_mla_op,
 )
 from vllm_torchtpu.layers.adapter.cp_attention import (
@@ -2897,13 +2898,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         if kv_sharded and sp_o_proj is None:
             raise ValueError("kv_sharded requires sp_o_proj on a token-parallel bucket")
         if in_branch_qb_inputs is not None and not (
-            topk_indices is not None
+            has_topk
             and sp_o_proj is not None
             and dcp_token_parallel_op.applies(num_kv_tokens)
         ):
             raise ValueError(
-                "in_branch_qb_inputs requires topk_indices and sp_o_proj on a "
-                "token-parallel bucket"
+                "in_branch_qb_inputs requires topk_indices or unified_indexer_inputs "
+                "and sp_o_proj on a token-parallel bucket"
             )
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
         # Query replication hands us the whole DCP group's heads already, so
@@ -3011,7 +3012,20 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 "sparse MLA layers use a native (nope, rope) split "
                 f"cache; got {type(kv_cache)}"
             )
-            assert topk_indices is not None and sp_o_proj is not None
+            assert sp_o_proj is not None
+            if unified_indexer_inputs is not None:
+                return dcp_unified_idx_qb_mla_op.unified_indexer_in_branch_qb_attention(
+                    layer,
+                    (kv_cache[0], kv_cache[1]),
+                    in_branch_qb_inputs,
+                    kv_c_normed_flat,
+                    k_pe_flat,
+                    unified_indexer_inputs,
+                    attn_metadata,
+                    w_o=sp_o_proj,
+                    kv_sharded=kv_sharded,
+                )
+            assert topk_indices is not None
             return dcp_nonidx_qb_mla_op.in_branch_qb_attention(
                 layer,
                 (kv_cache[0], kv_cache[1]),

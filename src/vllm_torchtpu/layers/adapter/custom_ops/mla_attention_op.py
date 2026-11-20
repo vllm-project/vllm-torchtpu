@@ -82,6 +82,7 @@ from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny, fp8_window_all_ga
 from vllm_torchtpu.layers.adapter import (
     dcp_nonidx_qb_mla_op,
     dcp_token_parallel_op,
+    dcp_unified_idx_qb_mla_op,
     dcp_unified_indexer_mla_op,
     small_all_reduce_op,
 )
@@ -2112,6 +2113,7 @@ class VllmTPUMLAAttention(MLAAttention):
         self.sparse_mla_dcp_fused_op = None
         self.sparse_mla_tp_op = None
         self.sparse_mla_unified_tp_op = None
+        self.sparse_mla_unified_idx_qb_op = None
         self.sparse_mla_in_branch_qb_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
@@ -2167,6 +2169,16 @@ class VllmTPUMLAAttention(MLAAttention):
                         )
                         build_unified = unified_mod.build_unified_indexer_attention_op
                         self.sparse_mla_unified_tp_op = build_unified(
+                            self,
+                            impl,
+                            indexer_op,
+                            self.token_parallel_layout,
+                            q_replicated=True,
+                            callbacks=callbacks,
+                        )
+                        qb_mod = dcp_unified_idx_qb_mla_op
+                        build_unified_qb = qb_mod.build_unified_indexer_in_branch_qb_op
+                        self.sparse_mla_unified_idx_qb_op = build_unified_qb(
                             self,
                             impl,
                             indexer_op,
@@ -2866,19 +2878,40 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                         in_branch_qb_op = getattr(
                             self.mla_attn, "sparse_mla_in_branch_qb_op", None
                         )
-                        can_defer_qb = (
+                        unified_qb_op = getattr(
+                            self.mla_attn, "sparse_mla_unified_idx_qb_op", None
+                        )
+                        sp_o_proj_ready = (
+                            self._resolve_sp_o_proj(
+                                num_tokens, prefill_group, output_gate
+                            )
+                            is not None
+                        )
+                        can_defer_nonidx_qb = (
                             (self.indexer is None or self.skip_topk)
                             and in_branch_qb_op is not None
                             and (
                                 not kv_sharded
                                 or getattr(in_branch_qb_op, "serves_sharded_kv", False)
                             )
-                            and self._resolve_sp_o_proj(
-                                num_tokens, prefill_group, output_gate
-                            )
-                            is not None
+                            and sp_o_proj_ready
                         )
-                        if can_defer_qb:
+                        can_defer_idx_qb = (
+                            self.is_sparse
+                            and early_topk is None
+                            and self.indexer is not None
+                            and not self.skip_topk
+                            and llama_4_scaling is None
+                            and indexer_qrows is not None
+                            and unified_qb_op is not None
+                            and (
+                                not kv_sharded
+                                or getattr(unified_qb_op, "serves_sharded_kv", False)
+                            )
+                            and sp_o_proj_ready
+                            and self.indexer.indexer_op.has_live_unified_cache()
+                        )
+                        if can_defer_nonidx_qb or can_defer_idx_qb:
                             in_branch_qb_inputs = dcp_nonidx_qb_mla_op.InBranchQbInputs(
                                 q_c=q_c_for_q,
                                 w_qb=w_qb,
@@ -2992,7 +3025,13 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # in the op) itself and returns this rank's sequence-parallel rows.
         sp_o_proj = self._resolve_sp_o_proj(num_tokens, prefill_group, output_gate)
 
-        unified_op = getattr(self.mla_attn, "sparse_mla_unified_tp_op", None)
+        unified_op = getattr(
+            self.mla_attn,
+            "sparse_mla_unified_idx_qb_op"
+            if in_branch_qb_inputs is not None
+            else "sparse_mla_unified_tp_op",
+            None,
+        )
         unified_idx_inputs = None
         if (
             self.is_sparse
@@ -3004,7 +3043,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             and unified_op is not None
             and (not kv_sharded or getattr(unified_op, "serves_sharded_kv", False))
             and indexer_qrows is not None
-            and (fused_qb_out is not None or self.dcp_q_replicate)
+            and (
+                fused_qb_out is not None
+                or in_branch_qb_inputs is not None
+                or self.dcp_q_replicate
+            )
             and self.indexer.indexer_op.has_live_unified_cache()
         ):
             q_idx_fp8, k_idx, w_idx = self.indexer.prepare_inputs(

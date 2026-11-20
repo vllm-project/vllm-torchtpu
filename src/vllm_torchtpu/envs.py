@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES: bool = True
     TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES: bool = True
     TPU_DCP_TP_SHARDED_KV_WRITE: bool = True
+    TPU_DCP_TP_UNIFIED_INDEXER_IN_BRANCH_QB: bool = True
     TPU_DCP_TP_UNIFIED_INDEXER_MLA: bool = True
     TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP: int = 12
     TPU_MLA_DECODE_LOCAL_Q_AG: bool = True
@@ -902,6 +903,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # token-parallel cap switch so pure-TC q_b overlaps gather_latent/Chunk-0.
     "TPU_DCP_TP_IN_BRANCH_QB_MLA": env_bool(
         "TPU_DCP_TP_IN_BRANCH_QB_MLA", default=True
+    ),
+    # With TPU_DCP_TP_UNIFIED_INDEXER_MLA and query replication on indexer
+    # layers: defer fused q_b_proj + RoPE + absorb_q and lead MLA inside the
+    # unified cap-switch branch so pure-TC q_b overlaps SC top-k and gathers.
+    "TPU_DCP_TP_UNIFIED_INDEXER_IN_BRANCH_QB": env_bool(
+        "TPU_DCP_TP_UNIFIED_INDEXER_IN_BRANCH_QB", default=True
     ),
     # With TPU_DCP_TP_PREFILL_LOCAL_OPROJ and query replication on indexer
     # layers: run token-parallel indexer top-k and sparse MLA inside one shared
