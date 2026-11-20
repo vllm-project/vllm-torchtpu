@@ -256,3 +256,18 @@ def test_prebuild_declines_a_layer_outside_the_backbone_graph(monkeypatch):
     assert "'eagle_head' graph" in warnings[0]
     with set_current_vllm_config(_vllm_config(16, 3)):
         assert fused._prebuild(layer, model_config=None)
+
+
+def test_fused_projection_after_in_graph_rope_patch():
+    """Export removes ``cos_sin_cache`` via ``patch_in_graph_rotary_embedding``."""
+    from vllm_torchtpu.rope_patch import patch_in_graph_rotary_embedding
+
+    layer = _layer()
+    qkv, positions = _inputs(8)
+    want = Qwen3NextAttention._project_qkv_gate(layer, qkv, positions)
+    assert patch_in_graph_rotary_embedding(layer.rotary_emb) == 1
+    assert not hasattr(layer.rotary_emb, "cos_sin_cache")
+    got = fused.project_qkv_gate(layer, qkv, positions)
+    for name, a, b in zip(("q", "k", "v", "gate"), got, want):
+        assert a.shape == b.shape and a.dtype == b.dtype, name
+        torch.testing.assert_close(a, b, atol=3e-2, rtol=3e-2, msg=name)

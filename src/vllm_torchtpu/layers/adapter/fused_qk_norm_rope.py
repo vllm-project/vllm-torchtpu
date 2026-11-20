@@ -169,6 +169,23 @@ def _prebuild(layer: Any, model_config) -> bool:
     return True
 
 
+def _rotary_cos_sin(rope: Any, positions: torch.Tensor) -> torch.Tensor:
+    cos_sin_cache = getattr(rope, "cos_sin_cache", None)
+    if cos_sin_cache is not None:
+        return cos_sin_cache.index_select(0, positions.to(torch.int64))
+    from vllm_torchtpu.rope_patch import _in_graph_cos_sin
+
+    cache_dtype = rope._in_graph_rope_cache_dtype
+    return _in_graph_cos_sin(
+        positions,
+        rope._in_graph_rope_inv_freq,
+        cache_dtype,
+        cache_dtype,
+        base=getattr(rope, "base", None),
+        rotary_dim=getattr(rope, "rotary_dim", None),
+    )
+
+
 def project_qkv_gate(
     layer: Any, qkv: torch.Tensor, positions: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -177,7 +194,7 @@ def project_qkv_gate(
     if positions.ndim == 2:
         # Text-only M-RoPE: the three position rows agree.
         positions = positions[0]
-    cos_sin = layer.rotary_emb.cos_sin_cache.index_select(0, positions.to(torch.int64))
+    cos_sin = _rotary_cos_sin(layer.rotary_emb, positions)
     # Built by _prebuild: registering an op inside a traced forward is not allowed.
     q, k, gate = _ops[_op_key(layer)](
         q_gate,
