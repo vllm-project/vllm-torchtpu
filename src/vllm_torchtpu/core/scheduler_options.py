@@ -46,8 +46,7 @@ class SchedulerOptions:
     decode_inflight_throttle: bool = False
     """Throttle remote loads (``PrefixAwareScheduler`` on a KV consumer with
     decode context parallelism > 1; refused elsewhere): refuse a new load
-    while 16 are in flight or while running plus in-flight requests reach
-    ``max_num_seqs`` + 32, and otherwise reserve max(128, 8 x (running + in
+    while 16 are in flight, and otherwise reserve max(128, 8 x (running + in
     flight)) blocks. The validation entries' DCP 4 decode legs set it."""
 
 
