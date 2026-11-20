@@ -16,6 +16,11 @@ blocks laid back to back and against ``lax.all_gather(tiled=True)``, with the
 core's index read from the axis or handed in as data, on a one-axis mesh and
 on a (lane, axis) mesh like the DCP one."""
 
+import json
+import os
+import subprocess
+import sys
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -178,6 +183,109 @@ def test_rejects_a_2d_block():
 def test_rejects_a_block_of_partial_tiles():
     with pytest.raises(ValueError):
         ag.small_all_gather(jnp.zeros((1000,), jnp.int32), num_cores=8, axis=AXIS)
+
+
+@pytest.mark.cpu_test
+def test_should_reject_invalid_d2d_pair_first_core_count():
+    with pytest.raises(ValueError, match="power-of-2 num_cores >= 4"):
+        ag.small_all_gather(
+            jnp.zeros((1024,), jnp.int32),
+            num_cores=2,
+            axis=AXIS,
+            d2d_pair_first=True,
+        )
+
+
+@pytest.mark.cpu_test
+def test_should_gather_blocks_without_races_when_d2d_pair_first_on_16_cores():
+    code = """
+import contextlib, io, json, jax, jax.numpy as jnp, numpy as np
+from jax._src.pallas.mosaic import tpu_info
+from jax._src.pallas.mosaic.interpret import interpret_pallas_call
+from jax.experimental.pallas import tpu as pltpu
+from jax.sharding import Mesh, PartitionSpec as P
+from vllm_torchtpu.kernels.experimental.small_collectives import all_gather as ag
+
+def tpu7x():
+    return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+
+pltpu.get_tpu_info = tpu7x
+tpu_info.get_tpu_info = tpu7x
+devs = sorted(jax.devices("cpu"), key=lambda d: d.id)
+n, size = 16, 4096
+rng = np.random.default_rng(77)
+per_core = rng.integers(-(2**30), 2**30, size=(n, size), dtype=np.int32)
+res = {}
+for lanes in (False, True):
+    for d2d in (None, False):
+        mesh = (
+            Mesh(np.asarray(devs).reshape(2, 8), ("lane", "d"))
+            if lanes
+            else Mesh(np.asarray(devs), ("d",))
+        )
+        nc = 8 if lanes else 16
+        spec = P(("lane", "d")) if lanes else P("d")
+        ranks = np.tile(np.arange(nc, dtype=np.int32), 2 if lanes else 1)
+        lane_ids = (
+            np.repeat(np.arange(2, dtype=np.int32), nc)
+            if lanes
+            else np.zeros(n, dtype=np.int32)
+        )
+        d2d_arg = True if (lanes and d2d is None) else d2d
+
+        def body(x, r, ln, nc=nc, lanes=lanes, d2d_arg=d2d_arg):
+            a = ag.small_all_gather(
+                x, num_cores=nc, axis="d", rank=r,
+                lane_axis="lane" if lanes else None,
+                lane=ln if lanes else None,
+                d2d_pair_first=d2d_arg,
+            )
+            return ag.small_all_gather(
+                a[:x.shape[0]] ^ (x + jnp.int32(3)),
+                num_cores=nc, axis="d", rank=r,
+                lane_axis="lane" if lanes else None,
+                lane=ln if lanes else None,
+                d2d_pair_first=d2d_arg,
+            )
+
+        smap = jax.shard_map(
+            body, mesh=mesh, in_specs=(spec,) * 3, out_specs=spec, check_vma=False
+        )
+        fn = jax.jit(smap)
+        args = (
+            jnp.asarray(per_core.reshape(-1)),
+            jnp.asarray(ranks),
+            jnp.asarray(lane_ids),
+        )
+        with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams(detect_races=True)):
+            pltpu.reset_tpu_interpret_mode_state()
+            with contextlib.redirect_stdout(io.StringIO()):
+                out = np.asarray(jax.block_until_ready(fn(*args))).reshape(n, -1)
+            races = bool(interpret_pallas_call.races.races_found)
+        ok = not races
+        for c in range(n):
+            g = per_core[(c // nc) * nc : (c // nc + 1) * nc]
+            want = np.concatenate([g[0] ^ (g[j] + np.int32(3)) for j in range(nc)])
+            ok = ok and np.array_equal(out[c], want)
+        res[f"{int(lanes)}:{d2d}"] = bool(ok)
+print("RESULT " + json.dumps(res))
+"""
+    env = dict(
+        os.environ,
+        JAX_PLATFORMS="cpu",
+        XLA_FLAGS="--xla_force_host_platform_device_count=16",
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=True,
+    )
+    line = next(ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT "))
+    parsed = json.loads(line.removeprefix("RESULT "))
+    assert all(parsed.values()), parsed
 
 
 @pytest.mark.parametrize("size", [8192, 32768])

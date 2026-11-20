@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -32,14 +33,29 @@ from vllm_torchtpu.kernels.quantized_matmul import fp8_window_all_gather as wag
 
 pytestmark = pytest.mark.cpu_test
 N_RANKS = 16
-ROWS = (4, 16)
+ROWS = (4, 8, 16)
 
 
 def test_supports_the_q_b_windows():
     assert wag.supports(4, 2048, 16384, 16)
+    assert wag.supports(8, 2048, 16384, 16)
+    assert wag.supports(16, 2048, 16384, 16)
     assert not wag.supports(17, 2048, 16384, 16)  # above the skinny rows
     assert not wag.supports(4, 2048, 16384, 32)  # 512-column windows, 1024 tiles
     assert not wag.supports(4, 1024, 6144, 16)  # o_proj tiles N by 2048
+
+
+def test_should_reject_invalid_d2d_pair_first_core_count():
+    with pytest.raises(ValueError, match="power-of-2 num_cores >= 4"):
+        wag.fp8_window_all_gather(
+            jnp.zeros((8, 2048), dtype=jnp.bfloat16),
+            jnp.zeros((2048, 8192), dtype=jnp.float8_e4m3fn),
+            jnp.ones((8192,), dtype=jnp.float32),
+            jnp.zeros((1,), dtype=jnp.int32),
+            num_cores=2,
+            axis="d",
+            d2d_pair_first=True,
+        )
 
 
 def _worker():
