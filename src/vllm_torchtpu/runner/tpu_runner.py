@@ -10169,8 +10169,16 @@ class TPUModelRunner(GPUModelRunner):
         Under a pipeline every stage runs the synthetic prefills, since the
         last stage's forward takes its input from the hand-off, and there is
         no retry: a stage retrying alone would leave the others waiting.
+
+        A draft whose sequence-parallel MoE slices token buckets at or above
+        min_rows and keeps smaller ones replicated (a context-parallel
+        producer; sequence-parallel MoE excludes pipelines) gets one trace per
+        side, as in _warmup_spec_decode: the sweep runs in
+        shape_variants.warmup() and retraces the draft at a refused bucket.
         """
         if not envs.SPEC_WARMUP:
+            if not self.enforce_eager:
+                self._require_draft_traces_per_side("SPEC_WARMUP=0")
             return
         if self.enforce_eager or self.speculative_config is None:
             return
@@ -10183,11 +10191,25 @@ class TPUModelRunner(GPUModelRunner):
         )
         n0 = self.num_xla_graphs
         pipeline = self.parallel_config.pipeline_parallel_size > 1
+        drafter = self.drafter
+        per_side = (
+            isinstance(drafter, Eagle3Proposer)
+            and drafter.draft_model is not None
+            and drafter.draft_form_varies_with_rows()
+        )
         with (
             _suspend_kv_transfer_group(),
             self._precompile_timed("MTP real prefill warmup"),
+            (
+                shape_variants.warmup() if per_side else contextlib.nullcontext()
+            ) as buckets,
         ):
             for P in prompt_lens:
+                # The draft runs at the step's per-rank token bucket.
+                if buckets is not None and buckets.needs_retrace(
+                    _get_padded_token_len(self.num_tokens_paddings, cdiv(P, pcp))
+                ):
+                    self._retrace_eagle_draft()
                 if pipeline:
                     if not self._warmup_one_mtp_prefill(P):
                         raise RuntimeError(
@@ -10202,6 +10224,8 @@ class TPUModelRunner(GPUModelRunner):
                             "refusing to start a producer whose first live "
                             "proposal would hit the same failure"
                         )
+            if buckets is not None:
+                self._check_draft_buckets_built(buckets)
         logger.info(
             "MTP prefill warmup at P=%s compiled %d graphs",
             prompt_lens,
@@ -10681,6 +10705,8 @@ class TPUModelRunner(GPUModelRunner):
         serving.
         """
         if not envs.SPEC_WARMUP:
+            if not self.enforce_eager:
+                self._require_draft_traces_per_side("SPEC_WARMUP=0")
             return  # escape hatch / A-B toggle
         if self.enforce_eager:
             return
@@ -10701,31 +10727,31 @@ class TPUModelRunner(GPUModelRunner):
             # (1) First-pass / first-decode shapes depend on the prompt length:
             # sweep one synthetic request per prompt-token bucket at nr=1. Each
             # runs the REAL two-phase propose+verify+sampling dispatch, so
-            # torch-tpu emits the same fused programs serving will hit.
+            # torch-tpu emits the same fused programs serving will hit. The
+            # draft's forward may branch on its token count (the step-0
+            # gather's row slice, the sequence-parallel row threshold), so the
+            # sweep runs in shape_variants.warmup(): a bucket the draft's
+            # current trace refused gets a retrace. The loop programs keep one
+            # trace (Eagle3Proposer._trace_loop_program).
             with shape_variants.warmup() as buckets:
-                for i, P in enumerate(self.num_tokens_paddings):
-                    # A single request's prompt can't exceed max_model_len; skip
-                    # token buckets above it (they only arise as batched totals,
-                    # covered by the num_reqs sweep below). Without this, a P >
-                    # max_model_len synthetic prompt overflows token_ids_cpu
-                    # (shape [.., max_model_len]) when max_num_batched_tokens >
-                    # max_model_len, e.g. small max_model_len configs.
+                for i, P in self._spec_warmup_prompt_buckets():
                     if int(P) > self.max_model_len:
+                        # A single request's prompt can't exceed max_model_len
+                        # (its prompt would overflow token_ids_cpu), so only a
+                        # batched step reaches this bucket. Run the draft's
+                        # first pass there only if no trace has built it.
+                        total = self._spec_step_total(P)
+                        if buckets.needs_retrace(P) and total is not None:
+                            self._retrace_eagle_draft()
+                            self._warmup_spec_first_pass(total, idx=i)
                         continue
-                    if buckets.needs_retrace(int(P)):
-                        drafter = self.drafter
-                        if (
-                            isinstance(drafter, Eagle3Proposer)
-                            and drafter.draft_model is not None
-                        ):
-                            shape_variants.retrace(
-                                drafter.draft_model, drafter.draft_vllm_config
-                            )
+                    if buckets.needs_retrace(P):
+                        self._retrace_eagle_draft()
                     # Greedy and non-greedy (do_sampling=True) verify+sample are
                     # DISTINCT fused programs, so sweep both at every prompt bucket.
                     for greedy in (True, False):
                         if not self._warmup_one_spec_request(
-                            int(P), idx=i, quiet=True, greedy=greedy
+                            P, idx=i, quiet=True, greedy=greedy
                         ):
                             # First attempt cold-compiles the draft forward; a
                             # SymInt from that cold compile can leak into the
@@ -10733,7 +10759,8 @@ class TPUModelRunner(GPUModelRunner):
                             # once now that the forward is compiled and returns
                             # concrete-shaped tensors (this attempt logs loudly if it
                             # also fails).
-                            self._warmup_one_spec_request(int(P), idx=i, greedy=greedy)
+                            self._warmup_one_spec_request(P, idx=i, greedy=greedy)
+                self._check_draft_buckets_built(buckets)
             # (2) Batched spec steps. A bucketed-draft proposer depends on no
             # exact request count, so one count per program-bucket combination
             # (`_spec_warmup_bucket_grid`), each with a short decode run and a
@@ -10779,6 +10806,150 @@ class TPUModelRunner(GPUModelRunner):
                         self._warmup_spec_batch(R, prompt_buckets[-1], greedy=True)
                         self._warmup_spec_batch(R, prompt_buckets[-1], greedy=False)
         logger.info("spec-decode warmup compiled %d graphs", self.num_xla_graphs - n0)
+
+    def _spec_warmup_prompt_buckets(self) -> list[tuple[int, int]]:
+        """(index, token bucket) pairs of the nr=1 prompt sweep, in sweep
+        order: the bucket of a one-request decode step (1 + K tokens) first,
+        then the rest ascending. Every request's decode steps run the draft at
+        that bucket, so the first trace builds it, and a request whose own
+        trace refuses it later finds it handed over."""
+        assert self.speculative_config is not None
+        paddings = [int(P) for P in self.num_tokens_paddings]
+        order = list(enumerate(paddings))
+        decode = _get_padded_token_len(
+            paddings, 1 + self.speculative_config.num_speculative_tokens
+        )
+        if decode <= self.max_model_len:
+            order.insert(0, order.pop(paddings.index(decode)))
+        return order
+
+    def _spec_step_total(self, bucket: int) -> int | None:
+        """The most tokens one step's prompts can schedule that still pad to
+        `bucket`, or None when no step reaches it: each of at most
+        max_num_seqs requests schedules at most max_model_len - 1 prompt
+        tokens."""
+        below = max(
+            (int(size) for size in self.num_tokens_paddings if size < bucket),
+            default=0,
+        )
+        total = min(
+            bucket,
+            int(self.scheduler_config.max_num_seqs) * (self.max_model_len - 1),
+        )
+        return total if total > below else None
+
+    def _retrace_eagle_draft(self) -> None:
+        """Give the MTP/EAGLE draft a fresh trace inside shape_variants.warmup()
+        (see shape_variants.retrace); other drafters compile apart."""
+        drafter = self.drafter
+        if isinstance(drafter, Eagle3Proposer) and drafter.draft_model is not None:
+            shape_variants.retrace(drafter.draft_model, drafter.draft_vllm_config)
+
+    def _check_draft_buckets_built(
+        self, buckets: shape_variants.BucketExecutables
+    ) -> None:
+        """Refuse to start when the draft's warm-up left a reachable token
+        bucket to a trace that never came: it would stay a raising closure
+        and fail the first live step that pads to it. A bucket no step
+        reaches (_spec_step_total) is only reported."""
+        unreachable = sorted(
+            b
+            for b in buckets.refused
+            if b > self.max_model_len and self._spec_step_total(b) is None
+        )
+        if unreachable:
+            logger.warning(
+                "MTP draft token buckets %s stay uncompiled: above max_model_len=%d, "
+                "no step of max_num_seqs=%d requests reaches them.",
+                unreachable,
+                self.max_model_len,
+                self.scheduler_config.max_num_seqs,
+            )
+        left = sorted(set(buckets.refused) - set(unreachable))
+        if left:
+            raise shape_variants.ShapeSpecializationError(
+                f"the MTP draft's warm-up left token buckets {left} uncompiled: "
+                "no synthetic step built them. A failed step is logged above; "
+                "a context-parallel producer's sweep reaches per-rank buckets "
+                "up to min(max_model_len, max_num_batched_tokens) / "
+                "prefill_context_parallel_size, so raise max_model_len to "
+                "max_num_batched_tokens there."
+            )
+
+    def _require_draft_traces_per_side(self, reason: str) -> None:
+        """Refuse a start that would trace the MTP draft once, at its first
+        live step, when its sequence-parallel MoE slices token buckets at or
+        above min_rows and keeps smaller ones replicated: one trace would bake
+        one form into every bucket, while each step records its own form for
+        the MoE dispatch and the padding mask."""
+        drafter = self.drafter
+        if (
+            isinstance(drafter, Eagle3Proposer)
+            and drafter.draft_model is not None
+            and drafter.draft_form_varies_with_rows()
+        ):
+            raise NotImplementedError(
+                f"{reason} leaves the MTP draft to be traced once, at its first "
+                "live step, but its sequence-parallel MoE slices token buckets "
+                f"of {sequence_parallel.min_rows()} rows or more and keeps "
+                "smaller ones replicated, which takes one trace per side (the "
+                "spec-decode warm-up's shape_variants ladder). Keep "
+                "SPEC_WARMUP=1, or serve with TPU_MOE_SEQUENCE_PARALLEL=0."
+            )
+
+    def _warmup_spec_first_pass(self, total: int, idx: int) -> bool:
+        """Run one synthetic prefill step of `total` tokens through target
+        sampling and the draft's first pass, split over the fewest requests
+        whose prompts fit max_model_len: a token bucket above max_model_len is
+        reached only by a batched step. Returns True on success."""
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+
+        assert self.kv_cache_config is not None
+        cap = self.max_model_len - 1
+        lens = [cap] * (total // cap) + ([total % cap] if total % cap else [])
+        group_nblks = [
+            group.kv_cache_spec.max_num_blocks_per_req(self.vllm_config, cap + 1)
+            for group in self.kv_cache_config.kv_cache_groups
+        ]
+        nblk = max(group_nblks)
+        if int(self.kv_cache_config.num_blocks) <= len(lens) * nblk + 1:
+            logger.warning(
+                "skip spec-decode warmup first pass of %d tokens: not enough kv blocks",
+                total,
+            )
+            return False
+        rids = [f"__spec_warmup_fp{idx}_{j}__" for j in range(len(lens))]
+        try:
+            # Disjoint low block ranges from block 1, as _warmup_spec_batch.
+            reqs = [
+                NewRequestData(
+                    req_id=rid,
+                    prompt_token_ids=[0] * n,
+                    mm_features=[],
+                    sampling_params=SamplingParams(temperature=0.0),
+                    pooling_params=None,
+                    block_ids=tuple(
+                        list(range(1 + j * nblk, 1 + j * nblk + g)) for g in group_nblks
+                    ),
+                    num_computed_tokens=0,
+                    lora_request=None,
+                )
+                for j, (rid, n) in enumerate(zip(rids, lens))
+            ]
+            so = SchedulerOutput.make_empty()
+            so.scheduled_new_reqs = reqs
+            so.num_scheduled_tokens = dict(zip(rids, lens))
+            so.total_num_scheduled_tokens = total
+            assert self.execute_model(so) is None
+            self.sample_tokens(None)
+            self.take_draft_token_ids()
+        except Exception:
+            logger.exception("spec-decode warmup first pass of %d tokens failed", total)
+            return False
+        finally:
+            self._warmup_spec_decode_cleanup(rids)
+        return True
 
     def _spec_warmup_bucket_grid(self, mixed: bool) -> list[int]:
         """Request counts to warm: the first count at which any program bucket

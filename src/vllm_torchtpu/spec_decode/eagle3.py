@@ -36,6 +36,7 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.layers.adapter import (
     sequence_parallel,
     small_all_reduce_op,
@@ -332,6 +333,49 @@ class Eagle3Proposer:
             and step0_gather_indices is None
             and int(num_tokens) >= sequence_parallel.min_rows()
         )
+
+    def draft_form_varies_with_rows(self) -> bool:
+        """Whether the draft's forward slices some token buckets over TP and
+        keeps others replicated (sequence-parallel MoE under a row threshold),
+        so its compiled program needs one trace per side of `min_rows`
+        (`shape_variants.warmup()` with retraces)."""
+        return self._draft_sequence_parallel and sequence_parallel.min_rows() > 0
+
+    def _loop_rows_sliced(self) -> bool:
+        """The row form of the loop programs (`_mtp_fused_loop`,
+        `_mtp_loop_model`) at every loop bucket.
+
+        Their one trace runs outside the warm-up's per-side traces
+        (`shape_variants.outside_warmup`), so it serves every loop bucket with
+        one form: sliced when even the smallest loop bucket reaches
+        `min_rows`, else replicated, which is correct at any row count.
+        """
+        return self._draft_sequence_parallel and self._draft_rows_sliced(
+            self._padded_loop_bucket(1)
+        )
+
+    def _trace_loop_program(
+        self, program: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> None:
+        """Trace and compile a loop program on its first call: once, outside the
+        warm-up's per-side traces, so no loop bucket is left to a retrace that
+        never comes. Warns once when that one form keeps rows replicated at
+        loop buckets that reach `min_rows`."""
+        if (
+            self._draft_sequence_parallel
+            and not self._loop_rows_sliced()
+            and self._draft_rows_sliced(self._max_loop_bucket())
+        ):
+            logger.warning_once(
+                "MTP draft loop programs run with replicated rows at every loop "
+                "bucket, including those at or above the sequence-parallel row "
+                "threshold (%d): they are traced once for all loop buckets "
+                "(largest %d), and replicated rows are correct at any count.",
+                sequence_parallel.min_rows(),
+                self._max_loop_bucket(),
+            )
+        with shape_variants.outside_warmup():
+            program(*args, **kwargs)
 
     def _rank_padding_counts(
         self, num_valid_tokens: int, num_tokens: int, rows_sliced: bool
@@ -927,9 +971,9 @@ class Eagle3Proposer:
         max_p = self._mtp_fused_loop_max_p
         if max_p > 0 and hidden_states.shape[0] < max_p:
             hidden_states = _maybe_pad_dim0(hidden_states, max_p)
-        # Every loop step runs at this one row count, so one decision covers
-        # the program; it must match the draft forward's own row gating.
-        rows_sliced = self._draft_rows_sliced(num_tokens)
+        # The loop program has one row form for every loop bucket; record it
+        # for the MoE dispatch / combine and the padding mask.
+        rows_sliced = self._loop_rows_sliced()
         sequence_parallel.set_active(rows_sliced)
         loop_padding_state = self._get_loop_token_padding_state()
         if loop_padding_state is not None:
@@ -965,7 +1009,9 @@ class Eagle3Proposer:
                 # again compiled. The repeat rewrites the same KV entries;
                 # seq_lens is put back first because the program advanced it.
                 seq_lens_step1 = seq_lens.clone()
-                self._mtp_fused_loop(None, positions, hidden_states, seq_lens)
+                self._trace_loop_program(
+                    self._mtp_fused_loop, None, positions, hidden_states, seq_lens
+                )
                 seq_lens.copy_(seq_lens_step1)
                 self._mtp_fused_loop_warm = True
             return self._mtp_fused_loop(None, positions, hidden_states, seq_lens)
@@ -3088,13 +3134,19 @@ class Eagle3Proposer:
         )
 
         num_tokens = input_ids.shape[0]
+        model = self._draft_model_for_step(step_idx)
         # Record this step's row form before the compiled forward: the draft
         # runs under sequence-parallel MoE like the target (main #1562), so
         # its rows are sliced at or above min_rows and replicated below it or
-        # under the step-0 post-attention gather. The MoE dispatch / combine
-        # read this; a mismatch with the model's own chunking all-reduces
-        # sliced rows (silently wrong output).
-        rows_sliced = self._draft_rows_sliced(num_tokens, step0_gather_indices)
+        # under the step-0 post-attention gather; a loop-step program keeps
+        # its one form (_loop_rows_sliced). The MoE dispatch / combine read
+        # this; a mismatch with the model's own chunking all-reduces sliced
+        # rows (silently wrong output).
+        rows_sliced = (
+            self._loop_rows_sliced()
+            if model is self._mtp_loop_model
+            else self._draft_rows_sliced(num_tokens, step0_gather_indices)
+        )
         sequence_parallel.set_active(rows_sliced)
         num_valid_tokens = self._draft_valid_tokens(chunk, step_idx, num_tokens)
 
@@ -3106,7 +3158,6 @@ class Eagle3Proposer:
         if self.speculative_config.method == "mtp":
             kwargs["spec_step_idx"] = step_idx
 
-        model = self._draft_model_for_step(step_idx)
         if model is self._mtp_loop_model:
             loop_padding_state = self._get_loop_token_padding_state()
             if loop_padding_state is not None:
@@ -3182,7 +3233,7 @@ class Eagle3Proposer:
                 # reject, so run the step once more now that it's compiled.
                 # The repeat writes the same KV entries again, and a loop step
                 # only reads the top-k table.
-                model(**kwargs)
+                self._trace_loop_program(model, **kwargs)
                 self._mtp_loop_model_warm = True
             out = model(**kwargs)
 

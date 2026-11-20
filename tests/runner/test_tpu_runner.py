@@ -578,6 +578,7 @@ def test_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
         num_tokens_paddings=[4096],
         max_model_len=262144,
         num_xla_graphs=7,
+        drafter=None,
         _precompile_timed=lambda _label: contextlib.nullcontext(),
         _warmup_one_mtp_prefill=attempts,
     )
@@ -621,6 +622,7 @@ def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
         num_tokens_paddings=[4096],
         max_model_len=262144,
         num_xla_graphs=7,
+        drafter=None,
         _precompile_timed=lambda _label: contextlib.nullcontext(),
         _warmup_one_mtp_prefill=attempts,
     )
@@ -657,6 +659,7 @@ def test_mtp_prefill_warmup_fills_every_bucket():
         num_tokens_paddings=[512, 1024, 1536, 2048, 4096, 8192],
         max_model_len=262144,
         num_xla_graphs=7,
+        drafter=None,
         _precompile_timed=lambda _label: contextlib.nullcontext(),
         _warmup_one_mtp_prefill=attempts,
     )
@@ -691,10 +694,13 @@ def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
             max_num_seqs=32, async_scheduling=async_scheduling
         ),
         num_xla_graphs=3,
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        drafter=None,
         _precompile_timed=lambda _label: contextlib.nullcontext(),
         _warmup_one_spec_request=one,
         _warmup_spec_batch=batch,
     )
+    _bind_spec_warmup_helpers(runner)
     with (
         patch.object(tpu_runner.envs, "SPEC_WARMUP", True),
         patch.object(
@@ -888,6 +894,7 @@ def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():
         num_tokens_paddings=[512, 4096],
         max_model_len=139264,
         num_xla_graphs=7,
+        drafter=None,
         _precompile_timed=lambda _label: contextlib.nullcontext(),
         _warmup_one_mtp_prefill=attempts,
     )
@@ -937,6 +944,313 @@ def test_only_the_last_pipeline_stage_hosts_a_drafter():
     TPUModelRunner._init_speculative_decoding(middle)
     assert middle.drafter is None and middle.rejection_sampler is None
     assert middle._static_verify_q_len is None
+
+
+_SPEC_WARMUP_HELPERS = (
+    "_spec_warmup_prompt_buckets",
+    "_spec_step_total",
+    "_retrace_eagle_draft",
+    "_check_draft_buckets_built",
+    "_require_draft_traces_per_side",
+)
+
+
+def _bind_spec_warmup_helpers(runner):
+    for name in _SPEC_WARMUP_HELPERS:
+        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+
+
+class _SidedDraft:
+    """Stands in for a draft whose compiled forward branches on its token
+    count (the step-0 gather's row slice, the sequence-parallel threshold).
+    Inside shape_variants.warmup() the first call after a retrace traces at
+    its bucket and builds every bucket on that side; a bucket an earlier
+    trace built is handed over, and any other is refused in the window, as
+    shape_variants.runnable_for does (outside a window that refusal raises at
+    compile time). A call at a bucket the live trace does not serve raises."""
+
+    def __init__(self, sizes, side):
+        self.sizes = sizes
+        self.side = side
+        self.built: set[int] = set()
+        self.live: set[int] | None = None
+        self.traced_at: list[int] = []
+        self.session = None
+
+    def retrace(self):
+        self.live = None
+
+    def __call__(self, bucket):
+        if self.live is None:
+            self.traced_at.append(bucket)
+            self.live = set()
+            for size in self.sizes:
+                if size in self.built:
+                    self.live.add(size)
+                elif self.side(size) == self.side(bucket):
+                    self.built.add(size)
+                    self.live.add(size)
+                elif not tpu_runner.shape_variants.in_warmup():
+                    raise tpu_runner.shape_variants.ShapeSpecializationError(
+                        f"bucket {size} refused outside a warmup"
+                    )
+                else:
+                    self.session.refused.add(size)
+        if bucket not in self.live:
+            raise tpu_runner.shape_variants.ShapeSpecializationError(
+                f"bucket {bucket} was left to a later trace"
+            )
+
+
+def _sided_draft_runner(monkeypatch, paddings, side, *, k, max_model_len, max_num_seqs):
+    """A runner stand-in whose spec-decode warm-up drives a _SidedDraft: a
+    one-request warm-up runs the draft at its prompt bucket and at the decode
+    bucket (1 + k tokens), a first pass at its total's bucket."""
+    from vllm_torchtpu.compilation import shape_variants
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    draft = _SidedDraft(paddings, side)
+    real_warmup = shape_variants.warmup
+
+    @contextlib.contextmanager
+    def warmup():
+        with real_warmup() as buckets:
+            draft.session = buckets
+            yield buckets
+
+    def retrace(model, _config):
+        draft.session.traces += 1
+        draft.session.refused.clear()
+        model.retrace()
+
+    monkeypatch.setattr(shape_variants, "warmup", warmup)
+    monkeypatch.setattr(shape_variants, "retrace", retrace)
+    drafter = object.__new__(Eagle3Proposer)
+    drafter.draft_model = draft
+    drafter.draft_vllm_config = None
+    decode = tpu_runner._get_padded_token_len(paddings, 1 + k)
+
+    def one(P, idx, quiet=False, greedy=True):
+        try:
+            draft(P)
+            draft(decode)
+        except shape_variants.ShapeSpecializationError:
+            return False
+        return True
+
+    def first_pass(total, idx):
+        draft(tpu_runner._get_padded_token_len(paddings, total))
+        return True
+
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        _is_async_drafter=True,
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=list(paddings),
+        num_reqs_paddings=[8],
+        max_model_len=max_model_len,
+        speculative_config=SimpleNamespace(num_speculative_tokens=k),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=max_num_seqs, async_scheduling=True
+        ),
+        drafter=drafter,
+        num_xla_graphs=0,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_spec_request=MagicMock(side_effect=one),
+        _warmup_spec_first_pass=MagicMock(side_effect=first_pass),
+        _warmup_spec_batch=MagicMock(),
+        _spec_warmup_bucket_grid=lambda mixed: [],
+    )
+    _bind_spec_warmup_helpers(runner)
+    return runner, draft
+
+
+def _run_spec_warmup(runner):
+    with (
+        patch.object(tpu_runner.envs, "SPEC_WARMUP", True),
+        patch.object(
+            tpu_runner,
+            "_suspend_kv_transfer_group",
+            return_value=contextlib.nullcontext(),
+        ),
+    ):
+        TPUModelRunner._warmup_spec_decode(runner)
+
+
+@pytest.mark.parametrize(
+    ("paddings", "k", "order"),
+    [
+        # The measured decode layouts: the decode bucket is the smallest one,
+        # so the sweep keeps its ascending order.
+        ([8, 16, 24, 32, 48, 64], 3, [8, 16, 24, 32, 48, 64]),
+        ([4, 8, 16, 24, 32], 3, [4, 8, 16, 24, 32]),
+        # Buckets below 1 + K: the decode bucket goes first.
+        ([2, 4, 8, 16], 4, [8, 2, 4, 16]),
+    ],
+)
+def test_spec_warmup_sweeps_the_decode_bucket_first(paddings, k, order):
+    runner = SimpleNamespace(
+        num_tokens_paddings=paddings,
+        max_model_len=4096,
+        speculative_config=SimpleNamespace(num_speculative_tokens=k),
+    )
+    pairs = TPUModelRunner._spec_warmup_prompt_buckets(runner)
+    assert [P for _, P in pairs] == order
+    assert all(paddings[i] == P for i, P in pairs)
+
+
+def test_spec_warmup_traces_the_draft_for_its_decode_bucket_before_smaller_prompts(
+    monkeypatch,
+):
+    """With token buckets below 1 + K, a request's decode steps run the draft
+    at a bucket on another side of its forward's token-count branch than its
+    prompt (here the step-0 gather's 4- and 8-row slices). Swept in plain
+    ascending order, the first request traced the draft at its prompt bucket,
+    and its own decode step hit the refused decode bucket before any retrace;
+    the decode bucket now goes first, and every request runs."""
+    runner, draft = _sided_draft_runner(
+        monkeypatch,
+        [2, 4, 8, 16],
+        lambda n: 0 if n <= 4 else 1 if n <= 8 else 2,
+        k=4,
+        max_model_len=4096,
+        max_num_seqs=1,
+    )
+    _run_spec_warmup(runner)
+
+    assert draft.traced_at == [8, 2, 16]
+    assert draft.live == {2, 4, 8, 16}
+    assert all(
+        call.kwargs.get("quiet")
+        for call in runner._warmup_one_spec_request.call_args_list
+    ), "a first attempt failed and was retried"
+
+
+def test_spec_warmup_builds_draft_buckets_only_batched_steps_reach(monkeypatch):
+    """A bucket above max_model_len is reached only by a step of several
+    requests. When no trace built it, the warm-up retraces the draft and runs
+    one first pass of that many tokens; before, the bucket stayed a raising
+    closure for the first such live step."""
+    runner, draft = _sided_draft_runner(
+        monkeypatch,
+        [8, 16, 32, 64],
+        lambda n: n >= 32,
+        k=3,
+        max_model_len=20,
+        max_num_seqs=4,
+    )
+    _run_spec_warmup(runner)
+
+    assert draft.traced_at == [8, 32]
+    assert runner._warmup_spec_first_pass.call_args_list == [((32,), {"idx": 2})]
+    for bucket in (8, 16, 32, 64):
+        draft(bucket)
+
+
+def test_spec_warmup_reports_draft_buckets_no_step_reaches(monkeypatch):
+    """One request of at most max_model_len - 1 tokens pads to 16 here, so
+    that bucket is warmed through a first pass; 32 is above anything one step
+    can schedule, so it stays uncompiled and the start goes on."""
+    runner, draft = _sided_draft_runner(
+        monkeypatch,
+        [8, 16, 32],
+        lambda n: 0 if n <= 8 else 1 if n <= 16 else 2,
+        k=3,
+        max_model_len=10,
+        max_num_seqs=1,
+    )
+    _run_spec_warmup(runner)
+
+    assert runner._warmup_spec_first_pass.call_args_list == [((9,), {"idx": 1})]
+    assert draft.live == {8, 16}
+
+
+def test_draft_bucket_check_refuses_a_reachable_bucket_left_uncompiled():
+    runner = SimpleNamespace(
+        num_tokens_paddings=[8, 16, 32],
+        max_model_len=10,
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+    )
+    _bind_spec_warmup_helpers(runner)
+    buckets = SimpleNamespace(refused={32})
+    TPUModelRunner._check_draft_buckets_built(runner, buckets)
+    buckets.refused = {16, 32}
+    with pytest.raises(
+        tpu_runner.shape_variants.ShapeSpecializationError, match=r"\[16\]"
+    ):
+        TPUModelRunner._check_draft_buckets_built(runner, buckets)
+
+
+@pytest.mark.parametrize("varies", [True, False])
+@pytest.mark.parametrize("warmup", ["_warmup_spec_decode", "_warmup_mtp_prefill"])
+def test_no_spec_warmup_refuses_a_draft_that_needs_one_trace_per_side(varies, warmup):
+    """SPEC_WARMUP=0 leaves the draft to be traced once at its first live step;
+    a draft whose sequence-parallel MoE takes one form per side of min_rows
+    cannot serve every bucket from one trace, so the start is refused."""
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    drafter = object.__new__(Eagle3Proposer)
+    drafter.draft_model = object()
+    drafter.draft_form_varies_with_rows = lambda: varies
+    runner = SimpleNamespace(enforce_eager=False, drafter=drafter)
+    _bind_spec_warmup_helpers(runner)
+    expectation = (
+        pytest.raises(NotImplementedError, match="SPEC_WARMUP=0")
+        if varies
+        else contextlib.nullcontext()
+    )
+    with patch.object(tpu_runner.envs, "SPEC_WARMUP", False), expectation:
+        getattr(TPUModelRunner, warmup)(runner)
+
+
+@pytest.mark.parametrize("varies", [True, False])
+def test_mtp_prefill_warmup_traces_a_sided_draft_per_side(monkeypatch, varies):
+    """A context-parallel producer whose draft takes one form per side of
+    min_rows sweeps its prompts in shape_variants.warmup() and retraces the
+    draft at the first per-rank bucket on the other side. One whose draft
+    keeps one form (the measured prefill legs, without sequence-parallel
+    MoE) sweeps as before, outside any window, with one trace."""
+    paddings = [512, 1024, 2048]
+    runner, draft = _sided_draft_runner(
+        monkeypatch,
+        paddings,
+        (lambda n: n >= 1024) if varies else (lambda n: 0),
+        k=1,
+        max_model_len=262144,
+        max_num_seqs=8,
+    )
+    runner.drafter.draft_form_varies_with_rows = lambda: varies
+    windows = []
+
+    def attempt(P, quiet=False):
+        windows.append(tpu_runner.shape_variants.in_warmup())
+        try:
+            draft(tpu_runner._get_padded_token_len(paddings, -(-P // 2)))
+        except tpu_runner.shape_variants.ShapeSpecializationError:
+            return False
+        return True
+
+    runner.parallel_config = SimpleNamespace(
+        pipeline_parallel_size=1, prefill_context_parallel_size=2
+    )
+    runner.scheduler_config.max_num_batched_tokens = 4096
+    runner._warmup_one_mtp_prefill = MagicMock(side_effect=attempt)
+    with (
+        patch.object(tpu_runner.envs, "SPEC_WARMUP", True),
+        patch.object(
+            tpu_runner,
+            "_suspend_kv_transfer_group",
+            return_value=contextlib.nullcontext(),
+        ),
+    ):
+        TPUModelRunner._warmup_mtp_prefill(runner)
+
+    # One attempt per prompt, each succeeding first time.
+    assert runner._warmup_one_mtp_prefill.call_args_list == [
+        ((P,), {"quiet": True}) for P in (1024, 2048, 4096)
+    ]
+    assert windows == [varies] * 3
+    assert draft.traced_at == ([512, 1024] if varies else [512])
 
 
 def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():

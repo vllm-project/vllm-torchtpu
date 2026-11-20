@@ -551,6 +551,23 @@ def in_warmup() -> bool:
     return _session is not None
 
 
+@contextlib.contextmanager
+def outside_warmup() -> Iterator[None]:
+    """Scope, inside :func:`warmup`, whose traces run as they would outside it.
+
+    For a module no ladder retraces: a token-count branch reads the caller's
+    decision instead of leaving a guard, so the one trace serves every bucket,
+    and nothing is left to a later trace that would never come. A guard that
+    still refuses a bucket raises here, at compile time.
+    """
+    global _session
+    saved, _session = _session, None
+    try:
+        yield
+    finally:
+        _session = saved
+
+
 def runnable_for(
     cache_dir: str | None, key: str, graph: fx.GraphModule, size: int | None = None
 ) -> Callable[..., Any] | None:

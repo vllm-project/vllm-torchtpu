@@ -1294,6 +1294,25 @@ def test_input_delta_names_the_earlier_trace_for_an_input_only_this_one_takes():
     assert "in this trace" not in named
 
 
+def test_outside_warmup_suspends_the_window_and_restores_it():
+    """Inside outside_warmup() a trace runs as outside the window: in_warmup()
+    is False, the AOT key carries no trace tag, and nothing is recorded as
+    refused or handed over. The window, with its refusals, comes back after."""
+    with shape_variants.warmup() as buckets:
+        buckets.refused.add(512)
+        with shape_variants.outside_warmup():
+            assert not shape_variants.in_warmup()
+            assert shape_variants.aot_cache_tag() is None
+            shape_variants.remember(None, "key", None, lambda: None)  # a no-op here
+        assert shape_variants.in_warmup()
+        assert shape_variants.aot_cache_tag() == "trace0"
+        assert buckets.refused == {512}
+        assert buckets.get(None, "key", None) is None
+    with shape_variants.outside_warmup():
+        assert not shape_variants.in_warmup()
+    assert not shape_variants.in_warmup()
+
+
 def test_input_delta_names_the_int_input_one_trace_dropped():
     metas = _int_metas()
     sources = {"s_pos": POSITIONS_SIZE, "s_hid": HIDDEN_SIZE}
