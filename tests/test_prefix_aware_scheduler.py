@@ -939,6 +939,7 @@ def short_first_scheduler(
     hold: bool = False,
     short_step: bool = False,
     compile_sizes: tuple[int, ...] = (16, CHUNK, 2 * CHUNK, BUDGET),
+    num_blocks: int = 4000,
 ) -> PrefixAwareScheduler:
     monkeypatch.setenv(
         "TPU_PREFIX_AWARE_SHORT_PROMPTS",
@@ -950,6 +951,7 @@ def short_first_scheduler(
         budget=budget,
         max_num_seqs=max_num_seqs,
         compile_sizes=list(compile_sizes),
+        num_blocks=num_blocks,
     )
 
 
@@ -1333,6 +1335,23 @@ def test_a_short_step_needs_room_for_a_waiting_short_prompt(monkeypatch):
     assert step(scheduler) == {"long1": CHUNK, "s1": CHUNK}
     assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK - 60, "s1": 60}
     assert step(scheduler) == {"long1": CHUNK - 31, "s2": 31}
+
+
+@pytest.mark.parametrize("short_step", [False, True])
+def test_a_short_prompt_the_kv_cache_cannot_hold_does_not_stall_the_prefill(
+    monkeypatch, short_step
+):
+    """31 blocks hold the long prompt's 30 and leave 3 once it has computed 28.
+    The short prompt then needs 4, so it cannot start. A short step capping
+    the long prefill at 0 for it would schedule nothing on every step: the
+    prefill never reaches allocate_slots and frees no block."""
+    scheduler = short_first_scheduler(monkeypatch, short_step=short_step, num_blocks=32)
+    add(scheduler, "long", 30 * BLOCK, first_token=20_000)
+    while scheduler.requests["long"].num_computed_tokens < 28 * BLOCK:
+        assert step(scheduler) == {"long": CHUNK}
+    add(scheduler, "short", CHUNK, first_token=50_000)
+    assert prefilled(scheduler, "short") == CHUNK
+    assert "long" not in scheduler.requests
 
 
 def test_a_short_step_needs_a_running_long_prefill(monkeypatch):

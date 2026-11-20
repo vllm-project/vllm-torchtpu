@@ -196,6 +196,7 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
             else None
         )
         self._short_step = False
+        self._skip_short_prompts = False
         self._carriers: set[str] = set()
 
         if self.policy != SchedulingPolicy.FCFS and (
@@ -312,11 +313,13 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
 
     def _schedule_short_prompts_first(self, throttle_prefills: bool) -> SchedulerOutput:
         full_step = self.max_num_scheduled_tokens
-        self._short_step = self._starts_short_step()
-        if self._short_step:
-            assert self.short_step_tokens is not None
-            self.max_num_scheduled_tokens = self.short_step_tokens
-        reserved = self._reserve_for_short_prompts()
+        reserved = 0
+        if not self._skip_short_prompts:
+            self._short_step = self._starts_short_step()
+            if self._short_step:
+                assert self.short_step_tokens is not None
+                self.max_num_scheduled_tokens = self.short_step_tokens
+            reserved = self._reserve_for_short_prompts()
         if reserved:
             self._running_prefill_budget = max(
                 self.max_num_scheduled_tokens
@@ -331,6 +334,14 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
             self.max_num_scheduled_tokens = full_step
             self._short_step = False
             self._running_prefill_budget = None
+        # A reservation that scheduled nothing (the short prompts got no KV
+        # blocks) would cap the running long prefills again next step, and a
+        # prefill capped at 0 never reaches allocate_slots, so nothing is
+        # preempted or freed: every step would schedule nothing. The next step
+        # reserves nothing and keeps the full step.
+        self._skip_short_prompts = (
+            bool(reserved) and output.total_num_scheduled_tokens == 0
+        )
         return output
 
     def _starts_short_step(self) -> bool:
