@@ -287,19 +287,26 @@ def _build_shared_op(group: int) -> Any:
         return _SHARED_OPS[key]
     mesh = build_ep_mesh()
     # jax_op hands fn the global arrays: the per-rank body goes under shard_map.
-    sharded = grouped_shared_expert_sharded(mesh, EP_AXIS_NAME, group)
+    sharded = grouped_shared_expert_sharded(
+        mesh, EP_AXIS_NAME, group, stacked_down=True
+    )
 
     def fn(
-        x: jax.Array, w13: jax.Array, s13: jax.Array, w2: jax.Array, s2: jax.Array
+        x: jax.Array,
+        w13: jax.Array,
+        s13: jax.Array,
+        w2_stack: jax.Array,
+        s2_stack: jax.Array,
+        layer: jax.Array,
     ) -> jax.Array:
-        return sharded(x, w13, s13, w2, s2)
+        return sharded(x, w13, s13, w2_stack, s2_stack, layer)
 
     spec = PartitionSpec(EP_AXIS_NAME)
     op = jax_op(
-        f"pallas::moe_prefill_sp_shared_g{group}",
+        f"pallas::moe_prefill_sp_shared_g{group}_stacked_down",
         fn,
         mesh=mesh,
-        input_partition_specs=(spec,) * 5,
+        input_partition_specs=(spec,) * 5 + (PartitionSpec(),),
         output_partition_specs=spec,
     )
     op.register_fake(lambda x, *_args, **_kw: torch.empty_like(x))
@@ -307,14 +314,31 @@ def _build_shared_op(group: int) -> Any:
     return op
 
 
+def _run_stacked_mlp(
+    op: Any, x: torch.Tensor, stack: tuple[torch.Tensor, ...], index: int
+) -> torch.Tensor:
+    w13, s13, w2, s2 = stack
+    # Avoid passing w2[index] / s2[index]: the Pallas down projection cannot
+    # alias a slice of the stack, so XLA copied every layer's down weight out
+    # of it each step (~0.65 ms per prefill step). The kernel reads
+    # layer `index` of the whole stack instead.
+    layer = torch.full((1,), index, dtype=torch.int32, device=x.device)
+    return op(x, w13[index], s13[index], w2, s2, layer)
+
+
 def _shared_expert(mlp: Any, x: torch.Tensor) -> torch.Tensor:
-    i = getattr(mlp, SHARED_INDEX)
-    return getattr(mlp, SHARED_OP)(x, *(t[i] for t in getattr(mlp, SHARED_ATTR)))
+    return _run_stacked_mlp(
+        getattr(mlp, SHARED_OP),
+        x,
+        getattr(mlp, SHARED_ATTR),
+        getattr(mlp, SHARED_INDEX),
+    )
 
 
 def _dense_mlp(mlp: Any, x: torch.Tensor) -> torch.Tensor:
-    i = getattr(mlp, DENSE_INDEX)
-    return getattr(mlp, DENSE_OP)(x, *(t[i] for t in getattr(mlp, DENSE_ATTR)))
+    return _run_stacked_mlp(
+        getattr(mlp, DENSE_OP), x, getattr(mlp, DENSE_ATTR), getattr(mlp, DENSE_INDEX)
+    )
 
 
 def _embed_reduce_scatter(embed: Any, input_ids: torch.Tensor) -> torch.Tensor:
