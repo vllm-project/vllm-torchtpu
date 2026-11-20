@@ -457,6 +457,9 @@ def prebuild(
     from vllm.config import get_current_vllm_config_or_none
 
     global _ARMED_MAX_TOKENS
+    # Every layer the FP8 method loads carries the flag, so its forward reads
+    # it directly; only the copy-table install below turns it on.
+    cast("TpuRoutedExperts", layer)._lowtok_has_copies = False
     # A layer built outside an engine has no current config; the rule then
     # does not apply.
     if not enabled(get_current_vllm_config_or_none()):
@@ -498,7 +501,6 @@ def prebuild(
             int(layer.moe_config.ep_size),
             int(expert_placement.owned()),
         )
-    cast("TpuRoutedExperts", layer)._lowtok_has_copies = False
     return _build_op(
         layer.moe_config.experts_per_token, expert_placement.primary_experts(layer)
     )
@@ -575,7 +577,7 @@ def apply(
                 torch.full_like(logits, float("-inf")),
                 logits,
             )
-    if getattr(layer, "_lowtok_has_copies", False):
+    if layer._lowtok_has_copies:
         return op(
             x,
             logits,

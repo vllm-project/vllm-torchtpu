@@ -1135,9 +1135,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 renormalize=layer.renormalize,
                 activation=activation_str,
             )
-            self._tpu_fused_ep_eligible = bool(
-                getattr(layer, "_tpu_fused_ep_eligible", False)
-            )
+            self._tpu_fused_ep_eligible = layer._tpu_fused_ep_eligible
             setattr(self, FUSED_MOE_EP_OP_ATTR, None)
         else:
             _ep_op = prebuild_fused_moe_ep(
@@ -1954,10 +1952,7 @@ def _retain_copy_tables(layer: TpuRoutedExperts, tensor: torch.Tensor) -> torch.
     inputs too, as `fused_moe_ep_v3.retain_fused_ep_graph_inputs` does for the
     fused EP buffers: the shape-specific graphs keep one set of inputs.
     """
-    if (
-        getattr(layer, "_lowtok_has_copies", False)
-        and getattr(layer, "_lowtok_tables", None) is not None
-    ):
+    if layer._lowtok_has_copies:
         zero = (
             layer._lowtok_tables[:1]
             + layer._lowtok_prim[:1]
