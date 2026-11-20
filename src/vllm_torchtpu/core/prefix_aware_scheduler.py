@@ -392,22 +392,28 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
         return held
 
     def _carrier_of(self, request: Request, prefills: list[Request]) -> str | None:
-        """The running prefill whose prompt holds this waiting prompt's first
-        uncached block, which it has not cached yet, or None."""
+        """The running prefill that has still to compute this waiting prompt's
+        first uncached block, a block a cache hit of the prompt can cover, or
+        None.
+
+        The first uncached block is past both the prompt's cache hit and the
+        blocks the prefill has computed, so a hit that comes up short of the
+        cached blocks (the EAGLE/MTP drop of the last hit block) does not hold
+        the prompt behind blocks the prefill has already cached.
+        """
         if (
             request.status != RequestStatus.WAITING
             or request.num_computed_tokens > 0
             or request.skip_reading_prefix_cache
         ):
             return None
-        index = self._cached_prefix_tokens(request) // self.hash_block_size
-        if index >= len(request.block_hashes):
-            return None
-        block = request.block_hashes[index]
+        cached = self._cached_prefix_tokens(request) // self.hash_block_size
+        readable = (request.num_tokens - 1) // self.hash_block_size
         for prefill in prefills:
+            index = max(cached, prefill.num_computed_tokens // self.hash_block_size)
             if (
-                index < len(prefill.block_hashes)
-                and prefill.block_hashes[index] == block
+                index < min(readable, len(prefill.block_hashes))
+                and prefill.block_hashes[index] == request.block_hashes[index]
             ):
                 return prefill.request_id
         return None

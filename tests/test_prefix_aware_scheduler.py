@@ -1281,6 +1281,36 @@ def test_a_long_prefill_a_prompt_waits_for_keeps_its_full_chunk(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "child_tokens, eagle, computed",
+    [
+        # Shares 10 blocks, and the EAGLE/MTP drop leaves its hit a block
+        # short of them, so the block before its own is computed again.
+        (list(range(10 * BLOCK)) + list(range(90_000, 90_000 + 20 * BLOCK)), True, 21),
+        # Is the first 10 blocks: a hit covers at most 9 of them.
+        (list(range(10 * BLOCK)), False, 1),
+    ],
+)
+def test_a_prompt_waits_only_for_the_shared_blocks_it_can_read(
+    monkeypatch, child_tokens, eagle, computed
+):
+    """The prompt waits while the parent computes the blocks it shares and
+    can read, and starts in the step after the parent has computed them,
+    long before the parent ends."""
+    scheduler = short_first_scheduler(monkeypatch, on=False, hold=True)
+    if eagle:
+        scheduler.kv_cache_manager.coordinator.eagle_group_ids = {0}
+    add(scheduler, "parent", 40 * BLOCK)
+    assert step(scheduler) == {"parent": CHUNK}
+    scheduler.add_request(make_request("child", child_tokens))
+    parent = scheduler.requests["parent"]
+    while "child" not in (scheduled := step(scheduler)):
+        assert "parent" in scheduler.requests, "the child waited for the whole parent"
+    assert parent.num_computed_tokens - CHUNK == 12 * BLOCK
+    first = scheduled["child"]
+    assert first + prefilled(scheduler, "child") == computed * BLOCK
+
+
+@pytest.mark.parametrize(
     "status, skips_cache, held",
     [
         (RequestStatus.WAITING, False, True),
