@@ -112,6 +112,8 @@ if TYPE_CHECKING:
     USE_ROUTING_MOE: bool = False
     ROUTING_MOE_REMOTE_SCATTER: bool = True
     ROUTING_MOE_FP8_COMBINE: bool = False
+    ROUTING_MOE_FP8_DISPATCH: bool = False
+    ROUTING_MOE_GMM_PLAN: str = ""
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -892,6 +894,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # output_reduce to read, instead of bf16. With remote scatter this halves
     # the bytes sent to the token owners; lossy (fp8 rows).
     "ROUTING_MOE_FP8_COMBINE": env_bool("ROUTING_MOE_FP8_COMBINE"),
+    # routing_moe: all-gather the tokens in float8_e4m3fn with one f32 scale
+    # per 128 columns instead of bf16, then dequantize before tokamax's layer
+    # (which takes bf16 rows). Halves the dispatch bytes; lossy. Remote scatter
+    # only.
+    "ROUTING_MOE_FP8_DISPATCH": env_bool("ROUTING_MOE_FP8_DISPATCH"),
+    # routing_moe: tokamax RoutingGmmPlan overrides as JSON, either one object
+    # of plan fields for every token count, or {"by_rows": [[max_rows, {...}],
+    # ...], "default": {...}} keyed by the rows each device contributes.
+    "ROUTING_MOE_GMM_PLAN": lambda: os.getenv("ROUTING_MOE_GMM_PLAN", ""),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.

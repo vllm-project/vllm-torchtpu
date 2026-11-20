@@ -76,6 +76,8 @@ def _armed():
         patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", False),
         patch.object(envs, "ROUTING_MOE_REMOTE_SCATTER", True),
         patch.object(envs, "ROUTING_MOE_FP8_COMBINE", False),
+        patch.object(envs, "ROUTING_MOE_FP8_DISPATCH", False),
+        patch.object(envs, "ROUTING_MOE_GMM_PLAN", ""),
     ):
         yield
 
@@ -166,6 +168,70 @@ def test_scatter_format():
     fmt = bridge._scatter_format(True)
     assert fmt.dtype == jnp.float8_e4m3fn
     assert isinstance(fmt.quant, out_format.LaneStrided)
+
+
+@pytest.mark.parametrize("fp8_dispatch", [False, True])
+def test_fp8_dispatch_follows_the_flag(fp8_dispatch):
+    seen = []
+    with patch.object(envs, "ROUTING_MOE_FP8_DISPATCH", fp8_dispatch):
+        _prebuild(
+            _layer(hidden=512),
+            build_op=lambda *args, **kw: seen.append(kw) or "op",
+        )
+    assert seen[0]["fp8_dispatch"] is fp8_dispatch
+
+
+@pytest.mark.parametrize(
+    "remote, hidden, want",
+    [(False, 512, "remote scatter"), (True, 192, "divisible by 128")],
+)
+def test_fp8_dispatch_refusals(remote, hidden, want):
+    with (
+        patch.object(envs, "ROUTING_MOE_FP8_DISPATCH", True),
+        patch.object(envs, "ROUTING_MOE_REMOTE_SCATTER", remote),
+        pytest.raises(ValueError, match=want),
+    ):
+        _prebuild(_layer(hidden=hidden))
+
+
+def test_fp8_dispatch_rows_round_trip():
+    """One f32 scale per 128 columns: each row block comes back within fp8's
+    relative precision, and an all-zero block stays zero."""
+    x = jax.random.normal(jax.random.PRNGKey(0), (6, 512), jnp.float32) * 3.0
+    x = x.at[2, :128].set(0.0).astype(jnp.bfloat16)
+    q, scale = bridge._quantize_rows(x)
+    assert q.dtype == jnp.float8_e4m3fn and scale.shape == (6, 4)
+    back = bridge._dequantize_rows(q, scale, jnp.bfloat16)
+    assert back.dtype == jnp.bfloat16
+    err = np.abs(np.asarray(back, np.float32) - np.asarray(x, np.float32))
+    amax = np.abs(np.asarray(x, np.float32)).reshape(6, 4, 128).max(-1)
+    assert (err.reshape(6, 4, 128).max(-1) <= amax / 8 + 1e-6).all()
+    assert not np.asarray(back[2, :128], np.float32).any()
+
+
+def test_gmm_plan_parsing():
+    assert bridge.parse_gmm_plan("") == ()
+    flat = bridge.parse_gmm_plan('{"tile_m": 512, "acc_dtype": "float32"}')
+    assert bridge.gmm_plan_fields(flat, 47) == {"tile_m": 512, "acc_dtype": "float32"}
+    keyed = bridge.parse_gmm_plan(
+        '{"by_rows": [[512, {"tile_m": 256}], [64, {"tile_m": 64}]],'
+        ' "default": {"tile_m": 512}}'
+    )
+    assert bridge.gmm_plan_fields(keyed, 47) == {"tile_m": 64}
+    assert bridge.gmm_plan_fields(keyed, 512) == {"tile_m": 256}
+    assert bridge.gmm_plan_fields(keyed, 1024) == {"tile_m": 512}
+    only_rows = bridge.parse_gmm_plan('{"by_rows": [[64, {"tile_m": 64}]]}')
+    assert bridge.gmm_plan_fields(only_rows, 512) is None
+    hash(keyed)
+    with pytest.raises(ValueError, match="unknown keys"):
+        bridge.parse_gmm_plan('{"by_rows": [], "tiles": {}}')
+
+
+def test_gmm_plan_follows_the_env():
+    seen = []
+    with patch.object(envs, "ROUTING_MOE_GMM_PLAN", '{"x_quant_block_size": 8192}'):
+        _prebuild(_layer(), build_op=lambda *args, **kw: seen.append(kw) or "op")
+    assert seen[0]["gmm_plan"] == ((None, (("x_quant_block_size", 8192),)),)
 
 
 def test_identity_ep_order_needs_no_relabelling():
