@@ -27,8 +27,12 @@ just read back). When it holds, `prev_corrected + step_delta` on every slot the
 subtraction touches equals what the upload would bring, so the step feeds the
 previous step's corrected device tensors to
 `carry_subtract_and_substitute_draft_token_ids` and skips the uploads. Any mismatch
-takes the normal upload path. Padding slots keep their previous values, which the
-host also left unchanged (checked).
+takes the normal upload path. Padding slots keep their previous values. The check
+compares the seq_lens padding; the other padding matches because, on this layout,
+the host zeroes the input-id and mrope position padding every step and never
+writes the 1-D position padding. Every real input slot takes its id from the
+device-resident source, because the check requires every request to map to the
+previous step's results.
 
 It runs on batch-1 asynchronous decode (max_num_seqs == 1) of a configuration a
 model-provided draft-path rule covers (spec_decode/draft_path_rules.py), the
@@ -43,11 +47,15 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from vllm_torchtpu.layers.core.sequence_layout import (
+    SequenceLayoutKind,
+    SequenceLayoutPlan,
+)
+
 if TYPE_CHECKING:
     import torch
     from vllm.config import SchedulerConfig, VllmConfig
 
-    from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutPlan
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
     from vllm_torchtpu.runner.tpu_runner_async_output import AsyncPreResults
 
@@ -155,8 +163,6 @@ def _host_positions(runner: TPUModelRunner, total: int) -> np.ndarray:
 def _layout_is_all(layout_plan: SequenceLayoutPlan | None) -> bool:
     """Whether the step's tokens use the ALL layout (every device holds the
     whole chunk). None is the PCP plan's place, where the carry never runs."""
-    from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
-
     return layout_plan is not None and layout_plan.kind is SequenceLayoutKind.ALL
 
 
