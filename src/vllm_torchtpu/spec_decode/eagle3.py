@@ -429,23 +429,7 @@ class Eagle3Proposer:
         self._validate_mtp_layer_count()
         self._init_draft_greedy_head()
         self._init_mtp_index_sharing()
-        if self._share_mtp_indices:
-            self._build_mtp_loop_model()
-        self._build_mtp_fused_loop()
-        if (
-            self._mtp_fused_loop is None
-            and self._mtp_loop_model is None
-            and self.speculative_config.method == "mtp"
-            and not self._share_mtp_indices
-            and not self._draft_kv_shared
-            and self.speculative_config.num_speculative_tokens > 1
-            and not self._dp_lockstep_sharded()
-        ):
-            # Step 0 traces with the post-attention gather baked in, so the
-            # per-step loop's steps 1..K-1 need a program of their own. Under
-            # EP-DP lockstep the gather stays off (see
-            # _use_mtp_step0_post_attn_gather) and every step runs the draft.
-            self._build_mtp_step0_gather_loop_model()
+        self._build_draft_loop_programs()
 
         # IndexShare assumes the draft owns its KV cache and advances
         # positions once per step; cross-model KV sharing freezes them and
@@ -934,23 +918,50 @@ class Eagle3Proposer:
                 self._mtp_fused_loop_warm = True
             return self._mtp_fused_loop(None, positions, hidden_states, seq_lens)
 
+    def _build_draft_loop_programs(self) -> None:
+        """Build the draft's loop programs at load: IndexShare's loop-step
+        program, the fused loop, and the loop-step program for the steps 1+
+        that the draft's own program, traced with the step-0 post-attention
+        gather, cannot run."""
+        if self._share_mtp_indices:
+            self._build_mtp_loop_model()
+        self._build_mtp_fused_loop()
+        if self._mtp_fused_loop_max_p > 0:
+            self._build_declined_chunk_loop_model()
+        if (
+            self._mtp_fused_loop is None
+            and self._mtp_loop_model is None
+            and self.speculative_config.method == "mtp"
+            and not self._share_mtp_indices
+            and not self._draft_kv_shared
+            and self.speculative_config.num_speculative_tokens > 1
+            and not self._dp_lockstep_sharded()
+        ):
+            # Step 0 traces with the post-attention gather baked in, so the
+            # per-step loop's steps 1..K-1 need a program of their own. Under
+            # EP-DP lockstep the gather stays off (see
+            # _use_mtp_step0_post_attn_gather) and every step runs the draft.
+            self._build_mtp_step0_gather_loop_model()
+
     def _build_declined_chunk_loop_model(self) -> None:
         """Give a chunk the fused loop declines a program for steps 1..K-1.
 
         `_mtp_fused_loop_max_p > 0` means the fused loop runs with the step-0
         post-attention gather, so the draft's own program is traced with the
-        gather and cannot run steps 1+ (they read no gather indices). Built on
-        the first declined chunk, as the per-step loop's program is built
-        without the fused loop; a draft whose chunks the loop always takes
-        never builds it.
+        gather and cannot run steps 1+ (they read no gather indices). Built in
+        load_model, so a draft that cannot have it fails to start instead of
+        failing on its first declined chunk. It compiles on its first call,
+        which only a declined chunk makes: a chunk whose layout is partial
+        (PCP streaming), whose draft returns two hidden states, or whose
+        draft metadata carries more than one seq_lens tensor.
         """
         self._build_mtp_step0_gather_loop_model()
         if self._mtp_loop_model is None:
             raise NotImplementedError(
-                "MTP fused draft loop: the loop program declined a chunk under "
-                "the step-0 post-attention gather, and the loop-step program "
-                "for its steps 1+ could not be built (see the warning above). "
-                "Serve this draft without the fused draft loop."
+                "MTP fused draft loop: the loop-step program for the steps 1+ "
+                "of a chunk the loop program declines under the step-0 "
+                "post-attention gather could not be built (see the warning "
+                "above). Serve this draft without the fused draft loop."
             )
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
@@ -2155,8 +2166,11 @@ class Eagle3Proposer:
                     p_ci = padded_nr_per_chunk[ci]
                     if loop_hidden[ci].shape[0] > p_ci:
                         loop_hidden[ci] = loop_hidden[ci][:p_ci]
-                    if self._mtp_fused_loop_max_p > 0 and self._mtp_loop_model is None:
-                        self._build_declined_chunk_loop_model()
+                    # Built in load_model whenever the loop runs with the
+                    # step-0 gather (_build_declined_chunk_loop_model).
+                    assert self._mtp_fused_loop_max_p == 0 or (
+                        self._mtp_loop_model is not None
+                    )
                     if not draft_tokens_per_chunk[ci]:
                         with set_model_tag("eagle_head"):
                             draft_tokens_per_chunk[ci].append(

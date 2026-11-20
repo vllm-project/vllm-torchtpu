@@ -4056,10 +4056,10 @@ class _TpuTypedTensor(torch.Tensor):
 
 def _fused_loop_fallback(monkeypatch, *, loop_step_program):
     """propose() on one chunk whose fused loop program declines it, under the
-    step-0 post-attention gather (max_p 32, the chunk's loop bucket p 16).
-    Building the loop-step program for steps 1+ leaves `loop_step_program`.
-    Returns the drafts, and per draft step (rows, positions, carry rows,
-    padded tokens, program run)."""
+    step-0 post-attention gather (max_p 32, the chunk's loop bucket p 16),
+    with `loop_step_program` built at load for steps 1+. Returns the proposer,
+    the drafts, and per draft step (rows, positions, carry rows, padded tokens,
+    program run)."""
     import vllm_torchtpu.models.vllm.qwen3_next_patch as qwen3_next_patch
 
     monkeypatch.setattr(
@@ -4071,6 +4071,7 @@ def _fused_loop_fallback(monkeypatch, *, loop_step_program):
     proposer.draft_model = SimpleNamespace()
     proposer._mtp_fused_loop = object()
     proposer._mtp_fused_loop_max_p = max_p
+    proposer._mtp_loop_model = loop_step_program
     proposer.runner = SimpleNamespace(
         input_batch=SimpleNamespace(num_reqs=3),
         max_num_reqs=max_p,
@@ -4110,7 +4111,7 @@ def _fused_loop_fallback(monkeypatch, *, loop_step_program):
         return hidden, hidden
 
     def build_loop_step_program(self):
-        self._mtp_loop_model = loop_step_program
+        raise AssertionError("propose() built a loop program")
 
     bridge = Eagle3Proposer._draft_post_step0_fused.__wrapped__.__wrapped__
     monkeypatch.setattr(Eagle3Proposer, "_prepare_draft_inputs", prepare)
@@ -4157,8 +4158,8 @@ def test_fused_loop_fallback_runs_the_steps_at_the_chunks_bucket(monkeypatch):
     which slices them. When the loop program declines the chunk, the separate
     steps must run at the chunk's own loop bucket p: step 0's token, the step
     inputs and the hidden carry all p rows. Step 0 runs the draft's own program,
-    traced with the gather; steps 1+ run a loop-step program traced without it,
-    built on this first declined chunk."""
+    traced with the gather; steps 1+ run the loop-step program load_model built,
+    traced without it; propose() builds nothing."""
     p = 16
     loop_step_program = object()
     proposer, drafts, steps = _fused_loop_fallback(
@@ -4170,12 +4171,47 @@ def test_fused_loop_fallback_runs_the_steps_at_the_chunks_bucket(monkeypatch):
     assert tuple(drafts.shape) == (3, 3)
 
 
-def test_fused_loop_fallback_refuses_without_a_loop_step_program(monkeypatch):
-    """If the loop-step program cannot be built, a declined chunk under the
-    step-0 gather fails with an actionable error instead of running steps 1+
-    on the draft program traced with the gather."""
-    with pytest.raises(NotImplementedError, match="declined a chunk"):
-        _fused_loop_fallback(monkeypatch, loop_step_program=None)
+@pytest.mark.parametrize(
+    "max_p, builds",
+    [
+        # The fused loop runs with the step-0 gather: a declined chunk's steps
+        # 1+ need their own program, built at load.
+        (32, "program"),
+        # It cannot be built: the engine refuses to start.
+        (32, "nothing"),
+        # The fused loop runs without the gather: the draft runs every step.
+        (0, None),
+    ],
+)
+def test_the_declined_chunk_program_is_built_at_load(monkeypatch, max_p, builds):
+    """_build_draft_loop_programs (load_model) builds the loop-step program a
+    declined chunk's steps 1+ run whenever the fused loop runs with the step-0
+    post-attention gather, so a draft that cannot have it fails at startup
+    rather than on its first declined chunk while serving."""
+    proposer = _make_proposer(draft_tp=2, target_tp=2, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = 3
+    program = object()
+    built = []
+
+    def build_fused_loop(self):
+        self._mtp_fused_loop = object()
+        self._mtp_fused_loop_max_p = max_p
+
+    def build_loop_step(self):
+        built.append(True)
+        self._mtp_loop_model = program if builds == "program" else None
+
+    monkeypatch.setattr(Eagle3Proposer, "_build_mtp_fused_loop", build_fused_loop)
+    monkeypatch.setattr(
+        Eagle3Proposer, "_build_mtp_step0_gather_loop_model", build_loop_step
+    )
+    if builds == "nothing":
+        with pytest.raises(NotImplementedError, match="could not be built"):
+            proposer._build_draft_loop_programs()
+        return
+    proposer._build_draft_loop_programs()
+    assert built == ([True] if builds else [])
+    assert proposer._mtp_loop_model is (program if builds else None)
 
 
 def _seed_precompile_pairs(monkeypatch, *, lockstep, dp_step_max_reqs):
