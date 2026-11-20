@@ -527,7 +527,8 @@ def _real_split_inputs_reorder_by_name(cache_root):
         assert not by_meta[tokens].graph_input, (key, described(inputs))
         assert by_meta[weight].graph_input and "scale" in by_meta[weight].name, key
         assert by_meta[buffer].graph_input and "shift" in by_meta[buffer].name, key
-        assert all(i.graph_input for i in inputs if i.name.startswith("s")), key
+        size_inputs = [i for i in inputs if isinstance(i.value, torch.SymInt)]
+        assert size_inputs and all(i.graph_input for i in size_inputs), key
         orders.add(
             tuple(
                 shape_variants._meta_entry(i.value)
