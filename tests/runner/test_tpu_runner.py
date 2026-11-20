@@ -1147,6 +1147,25 @@ def test_spec_warmup_builds_draft_buckets_only_batched_steps_reach(monkeypatch):
         draft(bucket)
 
 
+def test_spec_warmup_refuses_to_start_when_a_first_pass_fails(monkeypatch):
+    """A first pass that cannot run (too few KV blocks, or an error it catches
+    and logs) comes after the retrace has dropped the refusals and the draft's
+    trace. Going on would leave the draft to be traced once after the window,
+    with one form for every bucket, so the start is refused."""
+    runner, draft = _sided_draft_runner(
+        monkeypatch,
+        [8, 16, 32, 64],
+        lambda n: n >= 32,
+        k=3,
+        max_model_len=20,
+        max_num_seqs=4,
+    )
+    runner._warmup_spec_first_pass = MagicMock(return_value=False)
+    with pytest.raises(RuntimeError, match="first pass of 32 tokens"):
+        _run_spec_warmup(runner)
+    assert draft.traced_at == [8]
+
+
 def test_spec_warmup_reports_draft_buckets_no_step_reaches(monkeypatch):
     """One request of at most max_model_len - 1 tokens pads to 16 here, so
     that bucket is warmed through a first pass; 32 is above anything one step
