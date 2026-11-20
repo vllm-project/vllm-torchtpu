@@ -40,64 +40,110 @@ def _on_the_host(request):
 
 
 @pytest.mark.cpu_test
-def test_pal_gate_q_interpreter_parity():
+# 4 rows pad to 8; 208 rows at 8192 columns pad to 224 (no legal tile of 208
+# rows fits the VMEM budget).
+@pytest.mark.parametrize(
+    ("m", "cols"), [(4, 256), (8, 256), (16, 256), (64, 256), (208, 8192)]
+)
+def test_pal_gate_q_interpreter_parity(m, cols):
     """Verify pallas_sigmoid_gate_quant in Pallas CPU interpreter."""
     rng = np.random.default_rng(42)
-    for m in (4, 8, 16, 64):
-        a = jnp.asarray(rng.standard_normal((m, 256)), dtype=jnp.bfloat16)
-        g = jnp.asarray(rng.standard_normal((m, 256)), dtype=jnp.bfloat16)
-        q_pal, s_pal = pallas_sigmoid_gate_quant(a, g, interpret=True)
-        q_ref, s_ref = sigmoid_gate_quant_reference(a, g)
-        assert q_pal.shape == (m, 256) and s_pal.shape == (m, 1)
-        np.testing.assert_allclose(
-            np.asarray(s_pal, np.float32),
-            np.asarray(s_ref, np.float32),
-            rtol=1e-2,
-            atol=1e-3,
-        )
-        deq_pal = np.asarray(q_pal, np.float32) * np.asarray(s_pal, np.float32)
-        deq_ref = np.asarray(q_ref, np.float32) * np.asarray(s_ref, np.float32)
-        np.testing.assert_allclose(deq_pal, deq_ref, rtol=0.15, atol=0.15)
-        assert np.mean(np.abs(deq_pal - deq_ref)) < 5e-3
+    a = jnp.asarray(rng.standard_normal((m, cols)), dtype=jnp.bfloat16)
+    g = jnp.asarray(rng.standard_normal((m, cols)), dtype=jnp.bfloat16)
+    q_pal, s_pal = pallas_sigmoid_gate_quant(a, g, interpret=True)
+    q_ref, s_ref = sigmoid_gate_quant_reference(a, g)
+    assert q_pal.shape == (m, cols) and s_pal.shape == (m, 1)
+    np.testing.assert_allclose(
+        np.asarray(s_pal, np.float32),
+        np.asarray(s_ref, np.float32),
+        rtol=1e-2,
+        atol=1e-3,
+    )
+    deq_pal = np.asarray(q_pal, np.float32) * np.asarray(s_pal, np.float32)
+    deq_ref = np.asarray(q_ref, np.float32) * np.asarray(s_ref, np.float32)
+    np.testing.assert_allclose(deq_pal, deq_ref, rtol=0.15, atol=0.15)
+    assert np.mean(np.abs(deq_pal - deq_ref)) < 5e-3
+
+
+# Two bf16 inputs and one fp8 output, double buffered, per element of a block.
+_BLOCK_BYTES = 10
+_VMEM_BUDGET = 16 << 20
 
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    ("rows", "cols", "expected_bm", "expected_step"),
+    ("rows", "cols", "expected"),
     [
-        (16, 1024, 16, 16),  # < 32: full shape
-        (32, 1024, 32, 32),  # 32-aligned decode bucket (TP=8)
-        (64, 1024, 32, 32),  # 32-aligned sub-block for float8_e4m3fn (32, 128) tiles
-        (512, 1024, 512, 64),  # TP=8 prefill: 512-row block, 64-row in-kernel steps
-        # Wider than 2048 columns a step of up to 256 rows runs as one block,
-        # as the measured legs compiled it: TP=2 decode (4096 columns) and
-        # TP=1 prefill (8192 columns), where 256 rows are over the budget.
-        (96, 4096, 96, 96),
-        (256, 8192, 256, 256),
+        (4, 1024, (8, 8, 8)),  # fewer than 8 rows pad to 8
+        (16, 1024, (16, 16, 16)),  # < 32: full shape
+        (32, 1024, (32, 32, 32)),  # 32-aligned decode bucket (TP=8)
+        # 32-aligned sub-block for float8_e4m3fn (32, 128) tiles
+        (64, 1024, (64, 32, 32)),
+        # TP=8 prefill: 512-row block, 64-row in-kernel steps
+        (512, 1024, (512, 512, 64)),
+        # Wider than 2048 columns a step of up to 256 rows runs as one block
+        # where that block fits the budget: TP=2 decode (4096 columns) and
+        # TP=1 steps (8192 columns) of up to 204 rows...
+        (96, 4096, (96, 96, 96)),
+        (256, 4096, (256, 256, 256)),
+        (204, 8192, (204, 204, 204)),
+        # ...and past it tiles at the largest legal tile within the budget.
+        (256, 8192, (256, 128, 128)),
+        # No legal tile of 208 or 1000 rows fits the budget at 8192 columns,
+        # so the step pads to the next multiple of 32.
+        (208, 8192, (224, 32, 32)),
+        (1000, 8192, (1024, 128, 128)),
         # TP=2 prefill: the 16-row VREG step is not 32-aligned, so each block
         # runs as one step; the 16 MiB tile budget holds a 4096-wide block to
         # 384 rows, and 256 is the largest 32-aligned divisor of 4096 under it.
-        (4096, 4096, 256, 256),
+        (4096, 4096, (4096, 256, 256)),
         # TP=1 prefill (a pipeline stage): the budget holds an 8192-wide block
         # to 192 rows, so a 2176-row chunk and an 8192-row step tile at 128.
-        (2176, 8192, 128, 128),
-        (8192, 8192, 128, 128),
+        (2176, 8192, (2176, 128, 128)),
+        (8192, 8192, (8192, 128, 128)),
     ],
 )
-def test_sigmoid_gate_quant_tile_selection(rows, cols, expected_bm, expected_step):
-    """The BlockSpec tile `bm` and the in-kernel row step that
-    `pallas_sigmoid_gate_quant` derives from it."""
-    cap = kernel.select_tile(rows, cols)
-    bm = kernel.legal_tile(rows, cap)
-    step = kernel.legal_tile(bm, kernel.select_vreg_step(cols))
-    assert (bm, step) == (expected_bm, expected_step)
+def test_sigmoid_gate_quant_tile_selection(rows, cols, expected):
+    """The padded rows, BlockSpec tile and in-kernel row step that
+    `pallas_sigmoid_gate_quant` runs a step with."""
+    plan = kernel.plan_blocks(rows, cols)
+    assert tuple(plan) == expected
     # The cap is itself a legal tile: a multiple of 32, or the whole step.
-    assert cap == rows or cap % 32 == 0
-    assert bm == rows or (rows % bm == 0 and bm % 32 == 0)
-    assert step == bm or (bm % step == 0 and step % 32 == 0)
-    # Two bf16 inputs and one fp8 output, double buffered, within 16 MiB,
-    # except a one-block step of up to 256 rows wider than 2048 columns.
-    assert bm * cols * 10 <= (16 << 20) or (bm == rows <= 256 and cols > 2048)
+    cap = kernel.select_tile(plan.rows, cols)
+    assert cap == plan.rows or cap % 32 == 0
+
+
+def _legal(tile: int, rows: int) -> bool:
+    return tile == rows or (rows % tile == 0 and tile % 32 == 0)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("cols", [1024, 2048, 4096, 8192])
+def test_every_block_fits_the_vmem_budget(cols):
+    """At every step the Qwen3.5 model patch sends the kernel (up to 8192
+    rows, at the o_proj input width of TP 1, 2, 4 and 8) the block is legal
+    and fits the budget; a step of up to 256 rows wider than 2048 columns runs
+    as one block where that fits, else at the largest legal tile that does."""
+    for rows in range(1, 8193):
+        padded, block, step = kernel.plan_blocks(rows, cols)
+        least = max(rows, 8)
+        assert padded == least or (padded % 32 == 0 and padded - least < 32)
+        assert _legal(block, padded) and _legal(step, block)
+        assert block * cols * _BLOCK_BYTES <= _VMEM_BUDGET, (rows, cols, block)
+        if padded <= 256 and cols > 2048:
+            fitting = [
+                t
+                for t in range(1, padded + 1)
+                if _legal(t, padded) and t * cols * _BLOCK_BYTES <= _VMEM_BUDGET
+            ]
+            assert block == max(fitting), (rows, cols, block)
+
+
+@pytest.mark.cpu_test
+def test_a_width_past_the_budget_at_32_rows_is_refused():
+    # 32 rows of 53248 columns take 17,039,360 bytes, over the 16 MiB budget.
+    with pytest.raises(NotImplementedError, match="16 MiB VMEM budget"):
+        kernel.plan_blocks(32, 53248)
 
 
 def _e4m3_steps(got, want):
@@ -117,10 +163,12 @@ def _e4m3_steps(got, want):
 @pytest.mark.tpu_test
 # The 397B o_proj input per device: 32 query heads of 256 at TP1 (pipeline-
 # parallel prefill legs), 16 at TP2 and 4 at TP8 (decode legs). 4 rows take
-# the 8-row pad, 96 is a decode step (32-row blocks), 2176 and 8192 prefill
-# steps (128- to 512-row blocks).
+# the 8-row pad, 96 and 256 are decode steps (one block wider than 2048
+# columns; at 8192 columns 256 rows run as two 128-row blocks), 208 pads to
+# 224 rows at 8192 columns, 2176 and 8192 are prefill steps (128- to 512-row
+# blocks).
 @pytest.mark.parametrize("cols", [1024, 4096, 8192])
-@pytest.mark.parametrize("rows", [4, 96, 2176, 8192])
+@pytest.mark.parametrize("rows", [4, 96, 208, 256, 2176, 8192])
 def test_compiled_kernel_matches_the_eager_gate_on_tpu(rows, cols):
     """The Mosaic-compiled kernel at its default tiles against the reference.
     The TPU may round one scale a bf16 step away from the reference (an f32
