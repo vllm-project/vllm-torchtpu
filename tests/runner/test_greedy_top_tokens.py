@@ -44,6 +44,19 @@ from vllm_torchtpu.runner import greedy_top_tokens, min_tokens, tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
+def _set_greedy_top_tokens(monkeypatch) -> None:
+    """Turn TPU_GREEDY_TOP_TOKENS on in the environment, where envs reads it.
+    A monkeypatch.setattr(envs, ...) undo leaves the value it read in the
+    module dict, which shadows envs.__getattr__ for the rest of the session
+    (see tests/layers/adapter/test_mla_attention.py), so any such entry an
+    earlier test left is dropped first."""
+    from vllm_torchtpu import envs
+
+    if "TPU_GREEDY_TOP_TOKENS" in vars(envs):
+        monkeypatch.delattr(envs, "TPU_GREEDY_TOP_TOKENS")
+    monkeypatch.setenv("TPU_GREEDY_TOP_TOKENS", "1")
+
+
 @pytest.fixture(autouse=True)
 def _tpu_logits_processor_heads(monkeypatch):
     """The patch registry installs the TPU heads at platform activation and
@@ -306,7 +319,7 @@ def test_draft_head_resolves_under_ep_dp_lockstep(monkeypatch):
         seen.append(dp_lockstep)
         return owner
 
-    monkeypatch.setattr(eagle3.envs, "TPU_GREEDY_TOP_TOKENS", True)
+    _set_greedy_top_tokens(monkeypatch)
     monkeypatch.setattr(greedy_top_tokens, "resolve_head_owner", resolve)
     proposer = SimpleNamespace(
         draft_model=SimpleNamespace(draft_id_to_target_id=None),
