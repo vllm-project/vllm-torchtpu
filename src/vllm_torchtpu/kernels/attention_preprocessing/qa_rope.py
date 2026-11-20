@@ -16,7 +16,10 @@ Replaces ``_fused_wqa_wkv_gemm`` -> ``_split_qkv_and_norm`` -> the SWA
 The FP8 weight is copied into VMEM once, in ``weight_chunk``-column chunks with
 one semaphore each (``emit_qr=False`` copies only the KV columns, for DSpark
 context KV); the first token tile waits for and multiplies each chunk as it
-lands. Token tiles and outputs are double-buffered.
+lands. A single tile of at most ``RESIDENT_WEIGHT_MAX_TOKENS`` rows with qr
+takes the whole weight as a VMEM input instead, which XLA stages ahead of the
+call, and multiplies the same chunks. Token tiles and outputs are
+double-buffered.
 No cache is written; the caller publishes the rotated SWA KV.
 """
 
@@ -36,10 +39,14 @@ from vllm_torchtpu.kernels.attention_preprocessing.rope_gather import (
 )
 from vllm_torchtpu.kernels.attention_preprocessing.tuned_block_sizes import (
     QA_ROPE_TUNING,
+    RESIDENT_WEIGHT_MAX_TOKENS,
     QARopeConfig,
 )
 
 _ROW_ALIGN = 16  # BF16 activation tiles are (16, 128)
+# Headroom over the ``vmem_bytes`` estimate when the call asks only for what it
+# needs (deviceless tpu7x compile, 16/48 rows: 0.07/0.7 MiB used of 8.6/9.7).
+_VMEM_MARGIN = 8 * 1024 * 1024
 
 
 def native_rms_norm(values, gamma, eps):
@@ -55,7 +62,7 @@ def native_rms_norm(values, gamma, eps):
 
 def _qa_rope_kernel(
     x_ref,
-    weight_hbm,
+    weight_in,
     scale_ref,
     *refs,
     rank,
@@ -63,30 +70,35 @@ def _qa_rope_kernel(
     chunk,
     eps,
     emit_qr,
+    resident,
 ):
     refs = list(refs)
     gamma_qr_ref: Any = refs.pop(0) if emit_qr else None
     gamma_kv_ref = refs.pop(0)
     rope_rows_ref = refs.pop(0)
     qr_out_ref: Any = refs.pop(0) if emit_qr else None
-    kv_out_ref, weight_ref, weight_sems, projected_ref = refs
+    if resident:  # the whole weight is a VMEM input
+        (kv_out_ref, projected_ref), weight_ref = refs, weight_in
+    else:
+        kv_out_ref, weight_ref, weight_sems, projected_ref = refs
     tile = pl.program_id(0)
     width = weight_ref.shape[1]
     chunks = width // chunk
 
     def weight_copy(c):
         return pltpu.make_async_copy(
-            weight_hbm.at[:, pl.ds(column0 + c * chunk, chunk)],
+            weight_in.at[:, pl.ds(column0 + c * chunk, chunk)],
             weight_ref.at[:, pl.ds(c * chunk, chunk)],
             weight_sems.at[c],
         )
 
-    # The weight streams in column chunks on its own DMA priority, so the
-    # pipelined x / rope_rows / output copies never queue behind it.
-    @pl.when(tile == 0)
-    def _():
-        for c in range(chunks):
-            weight_copy(c).start(priority=1)
+    if not resident:
+        # The weight streams in column chunks on its own DMA priority, so the
+        # pipelined x / rope_rows / output copies never queue behind it.
+        @pl.when(tile == 0)
+        def _():
+            for c in range(chunks):
+                weight_copy(c).start(priority=1)
 
     encoded, row_scale = _quantize_rows(x_ref[...])
 
@@ -102,7 +114,8 @@ def _qa_rope_kernel(
     def _():
         for c in range(chunks):
             columns = pl.ds(c * chunk, chunk)
-            weight_copy(c).wait()
+            if not resident:
+                weight_copy(c).wait()
             project(
                 columns,
                 jnp.dot(
@@ -218,9 +231,31 @@ def fused_qa_kv_norm_rope(
     once = pl.Buffered(buffer_count=1)
     rows = lambda t: (t, 0)  # noqa: E731
     fixed = lambda t: (0,)  # noqa: E731
+    # One small tile reads the whole weight as a VMEM input, which XLA can
+    # stage while earlier ops run; otherwise it streams in chunks. (KV-only
+    # mode's columns start mid-block, so it streams.)
+    resident = emit_qr and tb == padded <= RESIDENT_WEIGHT_MAX_TOKENS
+    weight_bytes = hidden * width * weight.dtype.itemsize
+    vmem_limit = config.vmem_limit_bytes
+    if resident:
+        weight_spec = pl.BlockSpec((hidden, width), lambda t: (0, 0), once)
+        weight_scratch = ()
+        # XLA stages a whole-block input outside the call's scoped VMEM (a
+        # copy-start into VMEM ahead of the call), so leave it room there.
+        rotary_dim = rope_rows.shape[1]
+        vmem_limit = min(
+            vmem_limit - weight_bytes,
+            vmem_bytes(config, hidden, width, rotary_dim) - weight_bytes + _VMEM_MARGIN,
+        )
+    else:
+        weight_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+        weight_scratch = (
+            pltpu.VMEM((hidden, width), weight.dtype),
+            pltpu.SemaphoreType.DMA((width // config.weight_chunk,)),
+        )
     in_specs = [
         pl.BlockSpec((tb, hidden), rows),
-        pl.BlockSpec(memory_space=pltpu.HBM),
+        weight_spec,
         pl.BlockSpec((width,), fixed, once),
     ]
     operands = [x, weight, scale]
@@ -243,11 +278,7 @@ def fused_qa_kv_norm_rope(
         grid=(padded // tb,),
         in_specs=in_specs,
         out_specs=out_specs,
-        scratch_shapes=(
-            pltpu.VMEM((hidden, width), weight.dtype),
-            pltpu.SemaphoreType.DMA((width // config.weight_chunk,)),
-            pltpu.VMEM((tb, width), jnp.float32),
-        ),
+        scratch_shapes=(*weight_scratch, pltpu.VMEM((tb, width), jnp.float32)),
     )
     outputs = pl.pallas_call(
         functools.partial(
@@ -257,12 +288,13 @@ def fused_qa_kv_norm_rope(
             chunk=config.weight_chunk,
             eps=eps,
             emit_qr=emit_qr,
+            resident=resident,
         ),
         grid_spec=grid_spec,
         out_shape=tuple(out_shape),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=config.vmem_limit_bytes,
+            vmem_limit_bytes=vmem_limit,
         ),
         name=f"qa_rope_t{tb}" + ("" if emit_qr else "_kv"),
     )(*operands)

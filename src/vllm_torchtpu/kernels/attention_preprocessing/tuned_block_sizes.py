@@ -50,6 +50,12 @@ QA_ROPE_TUNING = {
 }
 
 
+# Largest padded token count whose single-tile Q-A/KV call reads its weight as
+# an XLA-staged VMEM input (checked at 16-64 rows, the decode and DSpark draft
+# buckets); larger tiles keep streaming the weight themselves.
+RESIDENT_WEIGHT_MAX_TOKENS = 64
+
+
 @dataclasses.dataclass(frozen=True)
 class CompressConfig:
     """Block sizes of ``compress_rope.fused_compress_rope``.

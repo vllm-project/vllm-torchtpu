@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.attention_preprocessing import (
     qa_rope,
@@ -159,7 +160,7 @@ def _assert_close_ulps(actual, expected, max_ulps=2, max_fraction=1e-4):
     assert np.count_nonzero(ulps) <= max_fraction * ulps.size
 
 
-@pytest.mark.parametrize("tokens", [288, 2048])
+@pytest.mark.parametrize("tokens", [16, 48, 64, 288, 2048])
 def test_kv_only_mode_agrees_with_full_output(tokens):
     _requires_tpu()
     args = _inputs(tokens, _positions(tokens, "jumps"))
@@ -174,7 +175,9 @@ def test_kv_only_mode_agrees_with_full_output(tokens):
     )
 
 
-@pytest.mark.parametrize(("tokens", "block"), [(2048, 128), (288, 96), (288, 48)])
+@pytest.mark.parametrize(
+    ("tokens", "block"), [(2048, 128), (288, 96), (288, 48), (32, 16), (256, 128)]
+)
 def test_block_sizes_do_not_change_values(tokens, block):
     _requires_tpu()
     args = _inputs(tokens, _positions(tokens, "contiguous"))
@@ -189,3 +192,19 @@ def test_block_sizes_do_not_change_values(tokens, block):
         np.testing.assert_array_equal(
             np.asarray(a, np.float32), np.asarray(b, np.float32)
         )
+
+
+@pytest.mark.parametrize(
+    ("tokens", "resident"), [(16, True), (64, True), (256, False), (2048, False)]
+)
+def test_one_tile_reads_the_weight_as_a_vmem_input(tokens, resident):
+    """A single small tile takes the weight as a blocked (VMEM) input instead
+    of streaming it from HBM itself."""
+    shapes = [
+        jax.ShapeDtypeStruct(a.shape, a.dtype)
+        for a in _inputs(tokens, _positions(tokens, "contiguous"))
+    ]
+    jaxpr = jax.make_jaxpr(qa_rope.fused_qa_kv_norm_rope)(*shapes)
+    (call,) = [e for e in jaxpr.eqns if e.primitive.name == "pallas_call"]
+    weight = call.params["grid_mapping"].block_mappings[1].transformed_block_aval
+    assert (weight.memory_space != pltpu.HBM) == resident
