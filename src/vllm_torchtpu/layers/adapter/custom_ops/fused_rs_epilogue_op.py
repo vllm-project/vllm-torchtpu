@@ -13,17 +13,12 @@
 # limitations under the License.
 """Torch custom-op bridge for hierarchical reduce-scatter + residual epilogue.
 
-Wraps `hierrs_tc/kernel_stream.py` over a tpu7x tensor-parallel group of 4 or 8
-TensorCores, i.e. 2 or 4 dual-core chips (`distributed/tp_mesh.py`). Because
+Wraps `hierrs_tc/kernel_stream.py` (streaming buckets `>= 128 * TP` on 4- or
+8-TensorCore tpu7x TP groups, returning token-sharded outputs) and
+`hierrs_tc/kernel_oneshot_rs_ag.py` (decode buckets `128 <= tokens < 1024` on
+8-TensorCore tpu7x TP groups, returning rank-ordered gathered outputs). Because
 torch custom ops require fixed tensor arities, one op is registered per operand
-combination used by dense decoder sublayers:
-
-* `norm_add_next_norm`: post-attention RMSNorm + residual add + pre-MLP RMSNorm
-  + FP8 row quantization.
-* `norm_add_scale_next_norm`: post-MLP RMSNorm + residual add + `layer_scalar`
-  + next layer's input RMSNorm + FP8 row quantization.
-* `norm_add_scale`: final layer's post-MLP RMSNorm + residual add +
-  `layer_scalar` (no next linear).
+combination used by dense decoder sublayers.
 """
 
 from __future__ import annotations
@@ -46,19 +41,27 @@ from vllm_torchtpu.distributed.hier_reduce_scatter import (
     unsupported_tpu7x_4x2_chip_topology_reason,
 )
 from vllm_torchtpu.distributed.tp_mesh import TP_AXIS_NAME, build_tp_mesh
-from vllm_torchtpu.kernels.collectives.hierrs_tc import kernel_stream
+from vllm_torchtpu.kernels.collectives.hierrs_tc import (
+    kernel_oneshot_rs_ag,
+    kernel_stream,
+)
 from vllm_torchtpu.kernels.collectives.hierrs_tc.wrapper import supports_num_devices
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
 MIN_STREAMING_RS_TOKENS = kernel_stream.MIN_STREAM_ROWS
+# Buckets below 128 tokens have < 16 rows/rank on 8 devices and are barrier
+# bound, so they keep native XLA all-reduce.
+MIN_ONESHOT_RS_AG_TOKENS = kernel_oneshot_rs_ag.MIN_ROWS
+ONESHOT_SUPPORTED_TP_SIZES = kernel_oneshot_rs_ag.SUPPORTED_NUM_DEVICES
 
 # Any: torch_tpu annotates partition specs as axis-name tuples, while jax_op
 # forwards PartitionSpec instances directly to NamedSharding at runtime.
 _SHARDED: Any = P(TP_AXIS_NAME, None)
 _REPLICATED: Any = P()
 _QUANTIZED_OUT = (_SHARDED, _SHARDED, _SHARDED)
+_ONESHOT_QUANTIZED_OUT = (_SHARDED, _REPLICATED, _REPLICATED)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -73,9 +76,13 @@ class FusedSublayerCollectives:
     norm_add_scale_next_norm: Callable
     # (partial, residual, post_norm_weight, scale) -> residual
     norm_add_scale: Callable
+    # True when `x_q`, `x_scale`, and `norm_add_scale`'s output are already
+    # gathered across all TP ranks in rank order.
+    outputs_gathered: bool = False
 
 
 _STREAM_COLLECTIVES_CACHE: dict[tuple, FusedSublayerCollectives] = {}
+_ONESHOT_COLLECTIVES_CACHE: dict[tuple, FusedSublayerCollectives] = {}
 _RESOLVED_TP_TOPOLOGY: tuple[Any, tuple[int, ...], tuple[int, ...]] | None = None
 _REFUSED_REASON: str | None = None
 
@@ -91,6 +98,18 @@ def supports_streaming_sublayer(num_tokens: Any, hidden: int) -> bool:
         return kernel_stream.supports_stream_epilogue(num_tokens, hidden)
     return kernel_stream.supports_stream_epilogue(
         num_tokens, hidden, num_devices=len(_RESOLVED_TP_TOPOLOGY[1])
+    )
+
+
+def supports_oneshot_sublayer(num_tokens: Any, hidden: int, tp_size: int = 8) -> bool:
+    """Whether `[num_tokens, hidden]` fits the single-shot VMEM RS + AG op."""
+    if _RESOLVED_TP_TOPOLOGY is not None:
+        tp_size = len(_RESOLVED_TP_TOPOLOGY[1])
+    return (
+        num_tokens >= MIN_ONESHOT_RS_AG_TOKENS
+        and kernel_oneshot_rs_ag.supports_oneshot_rs_ag(
+            num_tokens, hidden, num_devices=tp_size
+        )
     )
 
 
@@ -254,6 +273,118 @@ def build_streaming_sublayer_collectives(
         op.register_fake(fake)
         ops.append(op)
 
-    built = FusedSublayerCollectives(*ops)
+    built = FusedSublayerCollectives(*ops, outputs_gathered=False)
     _STREAM_COLLECTIVES_CACHE[key] = built
+    return built
+
+
+def build_oneshot_sublayer_collectives(
+    eps: float,
+) -> FusedSublayerCollectives | None:
+    """Builds single-shot VMEM RS + epilogue + AG ops for `128 <= tokens < 1024`."""
+    resolved = _resolve_tp_mesh_and_order()
+    if resolved is None:
+        return None
+    mesh, order, device_ids = resolved
+    key = (device_ids, order, eps)
+    cached = _ONESHOT_COLLECTIVES_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    def local(partial, residual, post_norm_weight, scale, next_norm_weight):
+        return kernel_oneshot_rs_ag.reduce_scatter_epilogue_oneshot_local(
+            partial,
+            residual,
+            post_norm_weight=post_norm_weight,
+            scale=scale,
+            next_norm_weight=next_norm_weight,
+            eps=eps,
+            axis_name=TP_AXIS_NAME,
+            order=order,
+        )
+
+    def oneshot_norm_add_next_norm(
+        partial: jax.Array,
+        residual: jax.Array,
+        post_norm_weight: jax.Array,
+        next_norm_weight: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return _shard_map_sublayer(
+            mesh,
+            lambda p, r, w, n: local(p, r, w, None, n),
+            2,
+            _ONESHOT_QUANTIZED_OUT,
+        )(partial, residual, post_norm_weight, next_norm_weight)
+
+    def oneshot_norm_add_scale_next_norm(
+        partial: jax.Array,
+        residual: jax.Array,
+        post_norm_weight: jax.Array,
+        scale: jax.Array,
+        next_norm_weight: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return _shard_map_sublayer(mesh, local, 3, _ONESHOT_QUANTIZED_OUT)(
+            partial, residual, post_norm_weight, scale, next_norm_weight
+        )
+
+    def oneshot_norm_add_scale(
+        partial: jax.Array,
+        residual: jax.Array,
+        post_norm_weight: jax.Array,
+        scale: jax.Array,
+    ) -> jax.Array:
+        return _shard_map_sublayer(
+            mesh, lambda p, r, w, s: local(p, r, w, s, None)[1], 2, _REPLICATED
+        )(partial, residual, post_norm_weight, scale)
+
+    def fake_quantized(partial: torch.Tensor, residual: torch.Tensor, *weights):
+        del weights
+        return (
+            torch.empty_like(residual),
+            partial.new_empty(partial.shape, dtype=torch.uint8),
+            partial.new_empty((partial.shape[0], 1), dtype=torch.float32),
+        )
+
+    def fake_gathered_residual(partial: torch.Tensor, residual: torch.Tensor, *weights):
+        del residual, weights
+        return torch.empty_like(partial)
+
+    eps_tag = _eps_op_tag(eps)
+    ops = []
+    for fn, fake, num_weights, out_specs, op_tag in (
+        (
+            oneshot_norm_add_next_norm,
+            fake_quantized,
+            2,
+            _ONESHOT_QUANTIZED_OUT,
+            "norm_add_next_norm",
+        ),
+        (
+            oneshot_norm_add_scale_next_norm,
+            fake_quantized,
+            3,
+            _ONESHOT_QUANTIZED_OUT,
+            "norm_add_scale_next_norm",
+        ),
+        (
+            oneshot_norm_add_scale,
+            fake_gathered_residual,
+            2,
+            (_REPLICATED,),
+            "norm_add_scale",
+        ),
+    ):
+        # pyrefly: ignore[no-matching-overload]
+        op = pallas.jax_op(
+            f"pallas::dense_sp_oneshot_{op_tag}_{eps_tag}",
+            fn,
+            mesh=mesh,
+            input_partition_specs=(_SHARDED, _SHARDED, *(_REPLICATED,) * num_weights),
+            output_partition_specs=out_specs,
+        )
+        op.register_fake(fake)
+        ops.append(op)
+
+    built = FusedSublayerCollectives(*ops, outputs_gathered=True)
+    _ONESHOT_COLLECTIVES_CACHE[key] = built
     return built

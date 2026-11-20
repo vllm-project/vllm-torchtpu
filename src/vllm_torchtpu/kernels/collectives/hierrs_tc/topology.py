@@ -84,11 +84,13 @@ def rank_ordered_rows(
     chip: int,
     bit: Any,
     chunk_rows: int,
-    blk: Any,
-    block_rows: int,
+    blk: Any = 0,
+    block_rows: int | None = None,
 ) -> Any:
-    """Row slice in `order` for `(chip, bit)` and streaming block `blk`."""
+    """Row slice in `order` for `(chip, bit)` (and optional streaming block `blk`)."""
     src = jnp.where(bit == 0, order[2 * chip], order[2 * chip + 1])
+    if block_rows is None:
+        return pl.ds(src * chunk_rows, chunk_rows)
     return pl.ds(src * chunk_rows + blk * block_rows, block_rows)
 
 
