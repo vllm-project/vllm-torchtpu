@@ -617,18 +617,7 @@ def _drafter_calls(monkeypatch, rule_on, fused):
         _draft_moe_ctx=contextlib.nullcontext,
         _unwrap_model_out=lambda out: out,
         _draft_md_cache={},
-        # What the MTP draft path's row gating and loop padding read (unused
-        # here): replicated rows, no loop padding state, 8-request buckets.
-        _draft_rows_sliced=lambda *args: False,
-        _loop_rows_sliced=lambda *args: False,
-        _mtp_fused_loop_max_p=0,
-        _draft_valid_tokens=lambda *args: 3,
-        _get_loop_token_padding_state=lambda: None,
-        _rank_padding_counts=lambda *args: (3, 3),
         _loop_bucket=lambda num_reqs: 8,
-        _max_loop_bucket=lambda: 8,
-        # A loop program's first call traces and compiles it; here it just runs.
-        _trace_loop_program=lambda program, *args, **kwargs: program(*args, **kwargs),
     )
     input_ids = torch.zeros(3, dtype=torch.int32)
     positions = torch.arange(3, dtype=torch.int32)
