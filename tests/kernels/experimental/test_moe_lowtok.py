@@ -519,6 +519,19 @@ def test_the_kernel_refuses_more_rows_than_it_is_built_for(interpret):
     assert out.shape == (cap, 512)
 
 
+def test_router_logits_need_the_kernels_top_k(interpret):
+    """from_logits=True marks router logits, which only the kernel's own top-k
+    reads. With topk=None the route is a routing table, and the logits' -inf
+    padding would read as a hit on every lane of the padded rows."""
+    x, w13, w2, s13, s2 = _shapes(8, 512, 256, 8)
+    route = jax.ShapeDtypeStruct((8, 8), jnp.bfloat16)
+    logits_entry = functools.partial(kernel.moe_lowtok, from_logits=True)
+    with pytest.raises(ValueError, match="from_logits=True needs topk"):
+        jax.eval_shape(logits_entry, x, route, w13, s13, w2, s2)
+    # The control: the same table with from_logits=False is the routed-ids entry.
+    jax.eval_shape(kernel.moe_lowtok, x, route, w13, s13, w2, s2)
+
+
 class _Op:
     """Stands in for the registered custom op; keeps the function it wraps."""
 
