@@ -81,7 +81,7 @@ def propose_step(
     max_n: int,
     k: int,
     width: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Appends one step's tokens to the history rows and drafts from them.
 
     Args:
@@ -96,7 +96,8 @@ def propose_step(
         width: history columns to match over; base_len + S <= width.
 
     Returns:
-        [rows, k] int64 drafts, FILLER_TOKEN_ID where nothing matched, and the
+        [rows, k] int64 drafts, FILLER_TOKEN_ID where nothing matched; each
+        row's count of matched drafts, the rest filler ([rows] int32); and the
         next step's `meta` if every valid token commits: the same history
         rows, each length past this step's tokens.
     """
@@ -142,7 +143,8 @@ def propose_step(
     drafts = tokens.gather(1, draft_cols.clamp(max=width - 1))
     keep = found[:, None] & (draft_cols < seq_len[:, None])
     next_meta = torch.cat([meta[:rows], seq_len.to(meta.dtype)])
-    return torch.where(keep, drafts, FILLER_TOKEN_ID).long(), next_meta
+    num_drafts = keep.sum(dim=1).to(torch.int32)
+    return torch.where(keep, drafts, FILLER_TOKEN_ID).long(), num_drafts, next_meta
 
 
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -222,7 +224,7 @@ class DeviceNgramProposer:
 
     def _step(
         self, meta: torch.Tensor, new_tokens: torch.Tensor, width: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self._hist is not None
         fn = _propose_compiled if self._is_compiled() else propose_step
         return fn(self._hist, meta, new_tokens, self.min_n, self.max_n, self.k, width)
@@ -362,7 +364,7 @@ class DeviceNgramProposer:
             meta, width = self._chunk_meta(
                 start, num_reqs, *chunk_tokens.shape, carried.get(key)
             )
-            chunk_drafts, next_meta = self._step(meta, chunk_tokens, width)
+            chunk_drafts, _, next_meta = self._step(meta, chunk_tokens, width)
             drafts.append(chunk_drafts)
             # A discarded sample does not commit: the next step uploads.
             if not discarded.intersection(range(start, start + num_reqs)):

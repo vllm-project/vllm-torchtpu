@@ -175,6 +175,7 @@ class Qwen3VLProgram:
         self._ir_error: str | None = None
         self._writes_checked = False
         self.greedy: GreedyHead | None = None
+        self._has_drafts: torch.Tensor | None = None
         self.tokens_io: Any = None
         self.head_tiles: torch.Tensor | None = None
 
@@ -348,9 +349,11 @@ class Qwen3VLProgram:
             seq_lens: torch.Tensor,
             weights: list[torch.Tensor],
             pools: list[torch.Tensor],
+            *has_drafts: torch.Tensor,
         ) -> torch.Tensor:
-            # The KV indices of each sequence's T new tokens; RoPE takes their
-            # M-RoPE positions.
+            # The hidden step computes every row (`has_drafts` is the token
+            # step's). The KV indices of each sequence's T new tokens; RoPE
+            # takes their M-RoPE positions.
             t = torch.arange(T, dtype=seq_lens.dtype, device=seq_lens.device)
             pos_b = (seq_lens[:ns, None] - T + t).reshape(-1)
             pos_b = pos_b.clamp(min=0).to(torch.int32)
@@ -382,12 +385,24 @@ class Qwen3VLProgram:
         if not use_fused:
             return None
         ex = dataclasses.replace(ex, tokens=self.tokens_io)
+        single = None
+        if T > 1:
+            # A verify step without drafts runs this bucket's one-token step.
+            one, _, _ = mk_rt.bucket_exec_spec(
+                self.spec,
+                self.base_exec,
+                self.profile,
+                bucket_t=b // T,
+                tokens_per_seq=1,
+            )
+            single = dataclasses.replace(one, tokens=self.tokens_io)
         op, _, _, _ = build_pooled_step_op(
             self.mesh,
             self.spec,
             ex,
             op_name=f"megakernel::{self.spec.name}_tokens_t{T}_b{b}",
             donate_pools=True,
+            single_ex=single,
         )
         rope, folded = self.rope_cache, [self.greedy.embed, self.head_tiles]
 
@@ -398,13 +413,14 @@ class Qwen3VLProgram:
             seq_lens: torch.Tensor,
             weights: list[torch.Tensor],
             pools: list[torch.Tensor],
+            *has_drafts: torch.Tensor,
         ) -> torch.Tensor:
             return execute_pooled_step_inplace(
                 op,
                 input_ids,
                 positions,
                 block_tables,
-                [rope, seq_lens],
+                [rope, seq_lens, *has_drafts],
                 [*weights, *folded],
                 pools,
             )
@@ -499,7 +515,16 @@ class Qwen3VLProgram:
                     )
 
         return WarmupCase(
-            (ids, pos, bt.reshape(-1), seq_lens, self.w_flat, self.raw_pools), check
+            (
+                ids,
+                pos,
+                bt.reshape(-1),
+                seq_lens,
+                self.w_flat,
+                self.raw_pools,
+                *self._verify_flag(bucket, None),
+            ),
+            check,
         )
 
     # --- per step -------------------------------------------------------------
@@ -531,14 +556,28 @@ class Qwen3VLProgram:
     def _run(self, decision: StepDecision | None, ctx: Any, fwd: ForwardView) -> Any:
         assert decision is not None and fwd.attn_metadata is not None
         attn_md = fwd.attn_metadata[self.attn_layer_name]
-        return fwd.steps[(decision.tokens_per_seq, decision.bucket_t)](
+        bucket = Bucket(decision.tokens_per_seq, decision.bucket_t)
+        return fwd.steps[bucket.key](
             ctx.input_ids,
             ctx.positions,
             attn_md.block_tables,
             attn_md.seq_lens,
             self.w_flat,
             self.raw_pools,
+            *self._verify_flag(bucket, ctx.has_drafts),
         )
+
+    def _verify_flag(self, bucket: Bucket, has_drafts: Any) -> tuple[Any, ...]:
+        """A verify bucket's `has_drafts` input (1 when the runner can't tell);
+        nothing for a decode bucket."""
+        if bucket.T == 1:
+            return ()
+        if has_drafts is not None:
+            return (has_drafts,)
+        if self._has_drafts is None:
+            dev = self.raw_pools[0].device
+            self._has_drafts = torch.ones((1,), dtype=torch.int32, device=dev)
+        return (self._has_drafts,)
 
     def forward_tokens(
         self, decision: StepDecision | None, ctx: Any, fwd: ForwardView

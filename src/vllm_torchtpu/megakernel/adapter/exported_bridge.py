@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import torch
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -149,6 +150,7 @@ def build_pooled_step_op(
     *,
     op_name: str | None = None,
     donate_pools: bool = True,
+    single_ex: ExecSpec | None = None,
 ) -> tuple[Any, tuple[P, ...], tuple[P, ...], tuple[int, ...]]:
     """Build a PyTorch custom op wrapping `cache.make_flat_pooled_step`.
 
@@ -159,13 +161,20 @@ def build_pooled_step_op(
     (`ExecSpec.tokens`) the first three are the runner's `input_ids`,
     `positions` and `block_tables`, `step_meta` ends with its `seq_lens`, and
     the first output is the `[B]` int32 greedy tokens instead of the hidden
-    states.
+    states. With `single_ex` (a token verify step `ex`, and the one-token
+    step of its sequences), `step_meta` ends with `has_drafts`, see
+    `_skip_empty_verify`.
     """
     tokens = token_io(ex) is not None
     global _OP_COUNTER
-    step_fn, in_specs, out_specs, donate_argnums = cache.make_flat_pooled_step(
-        mesh, spec, ex, donate_pools=donate_pools
-    )
+    if single_ex is not None:
+        step_fn, in_specs, out_specs, donate_argnums = _skip_empty_verify(
+            mesh, spec, ex, single_ex, donate_pools
+        )
+    else:
+        step_fn, in_specs, out_specs, donate_argnums = cache.make_flat_pooled_step(
+            mesh, spec, ex, donate_pools=donate_pools
+        )
     _OP_COUNTER += 1
     if op_name is None:
         n_pages = cache_exec(ex).num_pages
@@ -254,6 +263,53 @@ def build_pooled_step_op(
         return torch.empty_like(hidden)
 
     return op, in_specs, out_specs, donate_argnums
+
+
+def _skip_empty_verify(
+    mesh: jax.sharding.Mesh,
+    spec: ModelSpec,
+    ex: ExecSpec,
+    one: ExecSpec,
+    donate_pools: bool,
+) -> tuple[Any, tuple[P, ...], tuple[P, ...], tuple[int, ...]]:
+    """The token verify step of `ex` that runs the one-token step `one` when
+    no sequence has a draft to verify, chosen on the device from the extra
+    last input `has_drafts [1]` (0: none): such a step is a decode step, so it
+    costs one (2460 vs 2573 us at T=8). Row `s * T` then holds sequence `s`'s
+    token and the other rows -1, which no draft matches; the K/V of the first
+    token of each sequence is written, the only one a step without drafts
+    keeps. Both branches alias the pools in place."""
+    if token_io(ex) is None or ex.T < 2 or (one.B, one.T) != (ex.NS, 1):
+        raise ValueError(f"not a token verify step and its one-token step: {ex}, {one}")
+    full, in_specs, out_specs, donate = cache.make_flat_pooled_step(
+        mesh, spec, ex, donate_pools=donate_pools
+    )
+    single, single_in, _, _ = cache.make_flat_pooled_step(
+        mesh, spec, one, donate_pools=donate_pools
+    )
+    if tuple(single_in) != tuple(in_specs):
+        raise ValueError("the one-token step takes other inputs than the verify step")
+    T, NS, B = ex.T, ex.NS, ex.B
+    first = slice(0, NS * T, T)
+
+    def run_single(args: tuple[Any, ...]) -> tuple[Any, ...]:
+        # The runner's step tensors: ids, positions, ..., seq_lens last.
+        ids, positions, *rest, seq_lens = args
+        ids = jnp.zeros_like(ids).at[:NS].set(ids[first])
+        positions = jnp.zeros_like(positions).at[..., :NS].set(positions[..., first])
+        tok, *pools = single(ids, positions, *rest, seq_lens - (T - 1))
+        return (jnp.full((B,), -1, tok.dtype).at[first].set(tok[:NS]), *pools)
+
+    def step(*args: Any) -> tuple[Any, ...]:
+        *args, has_drafts = args
+        return jax.lax.cond(
+            has_drafts[0] > 0,
+            lambda a: tuple(full(*a)),
+            run_single,
+            tuple(args),
+        )
+
+    return step, (*in_specs, P()), out_specs, donate
 
 
 def execute_pooled_step_inplace(

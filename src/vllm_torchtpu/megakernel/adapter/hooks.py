@@ -43,6 +43,9 @@ class StepContext:
     inputs_embeds: Any = None
     intermediate_tensors: Any = None
     model_kwargs: Mapping[str, Any] | None = None
+    # A verify step's device `[1]` int32 flag: whether any sequence has a
+    # draft to verify (None: assume one has).
+    has_drafts: Any = None
 
 
 @contextlib.contextmanager

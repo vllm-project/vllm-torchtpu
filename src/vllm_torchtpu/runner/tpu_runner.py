@@ -298,6 +298,11 @@ class _DecodeCarry:
     logits_indices: torch.Tensor
     # A verify step's metadata (its drafts change each step), else None.
     spec_metadata: SpecDecodeMetadata | None = None
+    # A verify step's per-request count of drafts to verify ([rows] int32)
+    # and whether any has one ([1] int32), when a steady verify tail derived
+    # them; None: every request verifies all K.
+    num_drafts: torch.Tensor | None = None
+    has_drafts: torch.Tensor | None = None
 
     @property
     def tokens_per_req(self) -> int:
@@ -570,6 +575,7 @@ def _steady_verify_tail_impl(
     tokens: torch.Tensor,
     draft_token_ids: torch.Tensor,
     draft_lengths: torch.Tensor,
+    num_drafts: torch.Tensor,
     bonus_logits_indices: torch.Tensor,
     target_logits_indices: torch.Tensor,
     final_logits_indices: torch.Tensor,
@@ -588,20 +594,25 @@ def _steady_verify_tail_impl(
     bound: int,
 ) -> tuple[torch.Tensor, ...]:
     """Everything after a steady greedy verify step's kernel, one program:
-    accept the drafts against the rows' greedy tokens, draft the next K from
-    the accepted ones, build the next step's substitution source and rejected
-    counts, and derive the next step's inputs as `_advance_decode_inputs`."""
+    accept each request's first `num_drafts` drafts (of the `draft_lengths`
+    scheduled; its bonus row follows them) against the rows' greedy tokens,
+    draft the next K from the accepted ones, build the next step's
+    substitution source and rejected counts, and derive the next step's
+    inputs as `_advance_decode_inputs`, with its draft counts."""
+    bonus_rows = (bonus_logits_indices - (draft_lengths - num_drafts)).clamp(min=0)
     next_tokens = greedy_rejection_from_tokens(
         draft_token_ids,
         tokens,
-        bonus_logits_indices,
+        bonus_rows,
         target_logits_indices,
-        draft_lengths,
+        num_drafts,
         segment_ids,
         group_indices,
         k,
     )
-    drafts, next_meta = propose_step(hist, meta, next_tokens, min_n, max_n, k, width)
+    drafts, next_num_drafts, next_meta = propose_step(
+        hist, meta, next_tokens, min_n, max_n, k, width
+    )
     source, num_rejected = spec_substitution_impl(next_tokens, drafts, draft_lengths)
     source = torch.nn.functional.pad(source, (0, bound - source.shape[0]))
     ids, pos, lens = _advance_decode_inputs_impl(
@@ -610,6 +621,12 @@ def _steady_verify_tail_impl(
     next_drafts = extract_draft_token_ids_impl(
         ids, final_logits_indices, target_logits_indices
     )
+    # Padded rows draft from the dump row: only real requests count.
+    real = query_start_loc[1:] - query_start_loc[:-1] > 0
+    rows = next_num_drafts.shape[0]
+    real = torch.nn.functional.pad(real, (0, max(0, rows - real.shape[0])))[:rows]
+    next_num_drafts = torch.where(real, next_num_drafts, 0)
+    has_drafts = (next_num_drafts > 0).any().to(torch.int32).reshape(1)
     return (
         next_tokens,
         drafts,
@@ -620,6 +637,8 @@ def _steady_verify_tail_impl(
         pos,
         lens,
         next_drafts,
+        next_num_drafts,
+        has_drafts,
     )
 
 
@@ -5240,6 +5259,7 @@ class TPUModelRunner(GPUModelRunner):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         logits_indices: torch.Tensor,
+        has_drafts: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """A greedy step's tokens, `[rows of logits_indices, 1]` int64 like
         `compute_selected_top_tokens`, from the megakernel's token step (one
@@ -5249,12 +5269,15 @@ class TPUModelRunner(GPUModelRunner):
         request (decode) or all `1 + K` (verify). Call it in the step's
         forward context, on a `top_tokens` step whose hidden states nothing
         else reads (no hidden-state drafter, prompt logprobs or KV NaN
-        check)."""
+        check). `has_drafts` is a verify step's device flag from its steady
+        tail (`megakernel_adapter.StepContext`)."""
         if self._megakernel is None:
             return None
         tok = self._megakernel.try_greedy_tokens(
             self,
-            megakernel_adapter.StepContext(input_ids=input_ids, positions=positions),
+            megakernel_adapter.StepContext(
+                input_ids=input_ids, positions=positions, has_drafts=has_drafts
+            ),
         )
         if tok is None:
             return None
@@ -5302,8 +5325,11 @@ class TPUModelRunner(GPUModelRunner):
         derived, self._steady_next = self._steady_next, None
         if derived is not None and derived[0] is not carry:
             derived = None
+        num_drafts = has_drafts = None
         if derived is not None:
-            input_ids, positions, seq_lens, draft_token_ids = derived[1]
+            input_ids, positions, seq_lens, draft_token_ids, num_drafts, has_drafts = (
+                derived[1]
+            )
             assert spec_md is not None
             spec_md = dataclasses.replace(
                 spec_md,
@@ -5353,6 +5379,8 @@ class TPUModelRunner(GPUModelRunner):
             seq_lens=seq_lens,
             attn_metadata=attn_metadata,
             spec_metadata=spec_md,
+            num_drafts=num_drafts,
+            has_drafts=has_drafts,
         )
 
         inputs_embeds = None
@@ -5384,7 +5412,7 @@ class TPUModelRunner(GPUModelRunner):
             top_tokens = self._greedy_top_tokens_this_step()
             logits = (
                 self._megakernel_greedy_tokens(
-                    input_ids, positions, carry.logits_indices
+                    input_ids, positions, carry.logits_indices, has_drafts
                 )
                 if top_tokens and inputs_embeds is None
                 else None
@@ -6051,7 +6079,8 @@ class TPUModelRunner(GPUModelRunner):
         steady (`_execute_steady_decode`)."""
         carry = self._decode_carry
         drafter = self.drafter
-        if not (
+        fused = None
+        if (
             state.top_tokens
             and carry is not None
             and carry.spec_metadata is md
@@ -6060,13 +6089,16 @@ class TPUModelRunner(GPUModelRunner):
             and not self.rejection_sampler.synthetic_mode
             and len(state.spec_decode_metadata_list) == 1
         ):
-            return None
-        assert md.draft_token_ids is not None
-        rows = md.draft_lengths.shape[0]
-        k = carry.tokens_per_req - 1
-        fused = drafter.fused_inputs(scheduler_output, 0, num_reqs, rows, 1 + k)
+            rows = md.draft_lengths.shape[0]
+            steps = carry.tokens_per_req
+            fused = drafter.fused_inputs(scheduler_output, 0, num_reqs, rows, steps)
         if fused is None:
+            # Its kernel may have computed only the rows with drafts.
+            if carry is not None and carry.num_drafts is not None:
+                raise RuntimeError("a verify step with draft counts left its tail")
             return None
+        assert carry is not None and md.draft_token_ids is not None
+        k = carry.tokens_per_req - 1
         hist, meta, width, key = fused
         out = (
             _steady_verify_tail_compiled
@@ -6076,6 +6108,7 @@ class TPUModelRunner(GPUModelRunner):
             tokens,
             md.draft_token_ids,
             md.draft_lengths,
+            md.draft_lengths if carry.num_drafts is None else carry.num_drafts,
             md.bonus_logits_indices,
             md.target_logits_indices,
             md.final_logits_indices,

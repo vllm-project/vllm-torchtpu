@@ -264,6 +264,23 @@ def test_serves_verify_steps_with_the_token_step(
     logits = (hid[:4].float() @ head.T).to(torch.bfloat16).float()
     assert tok.tolist() == torch.argmax(logits, dim=-1).tolist()
 
+    # Without drafts the step runs the one-token step: the first row's token,
+    # -1 (matching no draft) in the others, and only the first token's K/V.
+    for layer in layers:
+        layer.self_attn.attn.kv_cache[0][3][..., 130:133] = 0
+    no_drafts = torch.zeros((1,), dtype=torch.int32)
+    with mock.patch.object(
+        stepping, "get_forward_context", lambda: SimpleNamespace(attn_metadata=md)
+    ):
+        one = res.driver.try_greedy_tokens(
+            runner, StepContext(ids, pos, has_drafts=no_drafts)
+        )
+    assert one.tolist() == [tok[0].item(), -1, -1, -1]
+    for layer, page in zip(layers, pages, strict=True):
+        got = layer.self_attn.attn.kv_cache[0][3]
+        assert torch.equal(got[..., 129], page[3][..., 129])
+        assert got[..., 130:133].abs().sum() == 0
+
 
 def test_serves_decode_and_leaves_prompt_steps_to_stock(tiny_runner: Any) -> None:
     ids = torch.tensor([5], dtype=torch.int32)
