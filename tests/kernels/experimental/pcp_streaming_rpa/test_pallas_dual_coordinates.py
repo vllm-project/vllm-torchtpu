@@ -36,7 +36,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
 pytestmark = pytest.mark.multichip
 
 P = jax.sharding.PartitionSpec
-AXIS = "pcp"
+AXIS = pcp_stage_plan.PCP_AXIS_NAME
 
 
 def _generate_multi_request_arrays(
@@ -213,46 +213,6 @@ def _pack_kv_cache(k_request, v_request, num_local_pages):
     return cache.reshape((PCP_SIZE * num_local_pages, PAGE_SIZE, 1, 2, HEAD_DIM))
 
 
-def _pack_multi_request_kv_cache(k_requests, v_requests):
-    pages_per_request = [
-        (request.shape[0] + PCP_SIZE * PAGE_SIZE - 1) // (PCP_SIZE * PAGE_SIZE)
-        for request in k_requests
-    ]
-    request_page_starts = np.cumsum([0] + pages_per_request[:-1])
-    total_local_pages = sum(pages_per_request)
-    cache = np.zeros(
-        (PCP_SIZE, total_local_pages, PAGE_SIZE, 1, 2, HEAD_DIM),
-        dtype=np.float32,
-    )
-    block_tables = np.zeros((len(k_requests), max(pages_per_request)), dtype=np.int32)
-    virtual_page_size = PCP_SIZE * PAGE_SIZE
-    for request_idx, (k_request, v_request) in enumerate(zip(k_requests, v_requests)):
-        request_page_start = int(request_page_starts[request_idx])
-        block_tables[request_idx, : pages_per_request[request_idx]] = (
-            request_page_start + np.arange(pages_per_request[request_idx])
-        )
-        for absolute_pos in range(k_request.shape[0]):
-            local_page = request_page_start + absolute_pos // virtual_page_size
-            position_in_virtual_page = absolute_pos % virtual_page_size
-            chunk_index = position_in_virtual_page // INTERLEAVE_SIZE
-            owner_rank = chunk_index % PCP_SIZE
-            local_chunk_index = chunk_index // PCP_SIZE
-            local_offset = (
-                local_chunk_index * INTERLEAVE_SIZE + absolute_pos % INTERLEAVE_SIZE
-            )
-            cache[owner_rank, local_page, local_offset, 0, 0] = k_request[
-                absolute_pos, 0
-            ]
-            cache[owner_rank, local_page, local_offset, 0, 1] = v_request[
-                absolute_pos, 0
-            ]
-    return (
-        cache.reshape((PCP_SIZE * total_local_pages, PAGE_SIZE, 1, 2, HEAD_DIM)),
-        block_tables,
-        total_local_pages,
-    )
-
-
 def _naive_causal_attention(q, k, v, request_absolute_start, sm_scale):
     q_positions = request_absolute_start + np.arange(q.shape[0])
     scores = np.einsum("thqd,shd->thqs", q, k) * sm_scale
@@ -276,6 +236,7 @@ def _run_real_pallas(
     *,
     vpage_group_size: int = kernel.PCP_STREAMING_RPA_VPAGE_GROUP_SIZE,
 ) -> tuple[jax.Array, jax.Array]:
+    """Run the real PCP metadata Splash entry inside shard_map."""
     pallas_attention = (
         kernel.pcp_streaming_attention_page_groups_packed_local_from_metadata
     )
@@ -290,11 +251,7 @@ def _run_real_pallas(
         distribution_local: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
         """Build PCPStagePlan and invoke metadata Splash entry on one PCP shard."""
-        local_stage_plan = pcp_stage_plan.build_pcp_local_stage_plan(
-            kv_lens_local,
-            page_indices_local,
-            cu_q_lens_local,
-            distribution_local,
+        stage_config = pcp_stage_plan.PCPStageConfig(
             local_tokens=q_local.shape[0],
             local_kv_cache_num_blocks=kv_cache_local.shape[0],
             page_size=kv_cache_local.shape[1],
@@ -302,6 +259,13 @@ def _run_real_pallas(
             interleave_size=INTERLEAVE_SIZE,
             vpage_group_size=vpage_group_size,
             pcp_axis_name=AXIS,
+        )
+        local_stage_plan = pcp_stage_plan.build_pcp_local_stage_plan(
+            kv_lens_local,
+            page_indices_local,
+            cu_q_lens_local,
+            distribution_local,
+            config=stage_config,
         )
         return pallas_attention(
             q_local,
@@ -317,7 +281,6 @@ def _run_real_pallas(
             pcp_size=PCP_SIZE,
             interleave_size=INTERLEAVE_SIZE,
             sm_scale=1.0 / math.sqrt(HEAD_DIM),
-            mesh_axis_names=tuple(mesh.axis_names),
             pcp_axis_name=AXIS,
         )
 
@@ -527,7 +490,9 @@ def test_real_pallas_no_q_rank_captures_current_kv_for_cache_owner(release_jax_b
     )
 
 
-def test_real_wrapper_writes_ring_captured_kv_before_history(release_jax_backend):
+@pytest.mark.usefixtures("release_jax_backend")
+def test_real_wrapper_writes_captured_kv_before_unified_splash() -> None:
+    """Verify wrapper writes captured fresh KV before unified Splash attention."""
     devices = _require_tpu_devices()
     q_len = 1
     request_absolute_start = INTERLEAVE_SIZE + 1
@@ -630,7 +595,7 @@ def test_real_pallas_multi_request_causal_positions(
     q_packed, token_order, inverse_order = _pack_multi_request_queries(
         q_requests, token_owner_starts
     )
-    kv_cache, block_tables, total_local_pages = _pack_multi_request_kv_cache(
+    kv_cache, block_tables, total_local_pages = _pack_multi_request_kv_cache_vectorized(
         k_requests, v_requests
     )
 
@@ -770,7 +735,7 @@ def test_real_pallas_multi_group_merge_with_two_requests() -> None:
     q_packed, token_order, inverse_order = _pack_multi_request_queries(
         q_requests, [0, q_lens[0]]
     )
-    kv_cache_hist, block_tables, _ = _pack_multi_request_kv_cache(
+    kv_cache_hist, block_tables, _ = _pack_multi_request_kv_cache_vectorized(
         k_history_only, v_history_only
     )
     current_kv = _pack_current_kv_rank_major(

@@ -28,7 +28,9 @@ latest startup log:
 * 32,768 max batched tokens and 64 request metadata slots;
 * manager block size 4,352, split into 256-token CUSTOM kernel pages;
 * 256-token PCP KV-cache interleave; and
-* the unified PCP Splash tiling: block_q=128, block_kv=1024, block_kv_compute=256.
+* the unified PCP Splash tiling from ``kernel.py``:
+  ``SPLASH_BLOCK_Q`` (128), ``SPLASH_BLOCK_KV_MAX`` (1024), and
+  ``SPLASH_BLOCK_KV_COMPUTE`` (256).
 
 The manager block size is recorded in the result but is not directly visible
 to RPA: vLLM expands manager blocks into 256-token kernel pages before building
@@ -489,12 +491,14 @@ def _resolve_result_dir(tmp_path: Path) -> Path:
 
 
 def _extract_profiled_kernel_summary() -> dict[str, object]:
+    """Extract per-step profiled kernel durations (legacy split ring prefixes)."""
     configured = os.getenv("TPU_PCP8_160K_PROFILE_DIR", "").strip()
     if not configured:
         return {}
 
     import jax
 
+    # These XLA op prefixes match legacy split current/history ring runs only.
     prefixes = {
         "current": "%pcp_streaming_attention_current_state_page_groups_multi_head.",
         "history": "%pcp_streaming_attention_history_output_page_groups_multi_head.",

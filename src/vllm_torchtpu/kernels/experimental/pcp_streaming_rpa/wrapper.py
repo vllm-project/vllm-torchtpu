@@ -14,7 +14,6 @@
 """Composite wrappers for PCP streaming RPA."""
 
 import math
-import typing
 
 import jax
 import jax.numpy as jnp
@@ -29,60 +28,37 @@ from vllm_torchtpu.kernels.experimental.batched_rpa.utils import (
     get_dtype_packing,
 )
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import (
+    splash_attention_kernel as _splash_kernel_mod,
+)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import (
     stage_plan as _stage_plan_mod,
 )
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
-    _validate_packed_kv_layout,
     pcp_streaming_attention_page_groups_packed_local_from_metadata,
 )
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.stage_plan import (
     PCP_STREAMING_RPA_VPAGE_GROUP_SIZE,
+    PCPStageConfig,
     PCPStagePlan,
-    _build_writeback_segment_descriptors,
-    _compact_writeback_slot_ids_for_cache_rank,
-    _compute_cache_owner_and_slot_ids_for_rows,
-    _compute_pcp_kv_writeback_mapping,
-    _compute_pcp_local_query_row_mapping,
-    _compute_pcp_local_query_row_mapping_from_metadata,
-    _compute_pcp_rank_major_query_row_mapping_from_metadata,
-    _pcp_rank_token_count_before,
-    _PCPKVWritebackMapping,
-    _PCPQueryRowMapping,
-    get_pcp_rank_without_axis_index,
 )
+
+NUM_LANES = _splash_kernel_mod.NUM_LANES
+NUM_SUBLANES = _splash_kernel_mod.NUM_SUBLANES
 
 PCP_AXIS_NAME = _stage_plan_mod.PCP_AXIS_NAME
 TP_AXIS_NAME = "tp"
-HEAD_DIM_64 = 64
+# Pallas Splash sublane/lane tile layout requires head_dim >= NUM_LANES (128).
+_UNSUPPORTED_HEAD_DIM_64 = 64
 _EXPECTED_KV_CACHE_NDIM = 5
-
-
-def _raise_error(exc_type: type[Exception], message: str) -> typing.NoReturn:
-    """Raise exc_type with message."""
-    raise exc_type(message)
-
 
 KVLayout = batched_rpa_configs.KVLayout
 
 __all__ = [
-    "HEAD_DIM_64",
     "PCP_AXIS_NAME",
     "TP_AXIS_NAME",
     "KVLayout",
     "PCPStagePlan",
-    "_PCPKVWritebackMapping",
-    "_PCPQueryRowMapping",
-    "_build_writeback_segment_descriptors",
-    "_compact_writeback_slot_ids_for_cache_rank",
-    "_compute_cache_owner_and_slot_ids_for_rows",
-    "_compute_pcp_kv_writeback_mapping",
-    "_compute_pcp_local_query_row_mapping",
-    "_compute_pcp_local_query_row_mapping_from_metadata",
-    "_compute_pcp_rank_major_query_row_mapping_from_metadata",
-    "_pcp_rank_token_count_before",
-    "_validate_packed_kv_layout",
     "compute_pcp_local_mapping",
-    "get_pcp_rank_without_axis_index",
     "sharded_pcp_ragged_paged_attention",
 ]
 
@@ -98,12 +74,11 @@ def _pack_kv_for_cache(
     """Pack K and V together before converting to the cache dtype."""
     max_num_tokens, num_kv_heads, head_dim = k.shape
     packing = get_dtype_packing(cache_dtype)
-    head_dim_padded = align_to(head_dim, 128)
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
         if page_size is None or page_size <= 0:
-            _raise_error(
-                ValueError, "PCP SEQ_ALONG_LANE KV packing requires page_size > 0."
-            )
+            msg = "PCP SEQ_ALONG_LANE KV packing requires page_size > 0."
+            raise ValueError(msg)
+        head_dim_padded = align_to(head_dim, NUM_SUBLANES * packing)
         actual_num_kv_heads = num_kv_heads * 2
         padded_tokens = align_to(max_num_tokens, page_size)
         kv = jnp.concatenate([k, v], axis=-1).reshape(
@@ -127,6 +102,7 @@ def _pack_kv_for_cache(
         )
         return jnp.transpose(packed_kv, (1, 2, 3, 0))
 
+    head_dim_padded = align_to(head_dim, NUM_LANES)
     actual_num_kv_heads = num_kv_heads * 2
     num_kv_heads_padded = align_to(actual_num_kv_heads, packing)
     if head_dim_padded != head_dim:
@@ -157,15 +133,16 @@ def _pack_kv_for_cache(
         max_num_tokens,
         num_kv_heads_padded // packing,
         packing,
-        head_dim_padded // 128,
-        128,
+        head_dim_padded // NUM_LANES,
+        NUM_LANES,
     )
 
 
 def _kv_cache_page_size(kv_cache: jax.Array, kv_layout: KVLayout) -> int:
+    """Return the token page size of a 5D packed PCP KV cache."""
     if kv_cache.ndim != _EXPECTED_KV_CACHE_NDIM:
-        msg = f"PCP KV cache must be 5D, got {kv_cache.shape}."
-        _raise_error(ValueError, msg)
+        msg = f"PCP KV cache must be {_EXPECTED_KV_CACHE_NDIM}D, got {kv_cache.shape}."
+        raise ValueError(msg)
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
         return int(kv_cache.shape[-1])
     return int(kv_cache.shape[1])
@@ -189,13 +166,13 @@ def _prepare_packed_kv_for_cache(
                 "SEQ_ALONG_LANE fresh KV prefix must match the cache head "
                 f"layout: {packed_kv.shape[:-1]} vs {kv_cache.shape[1:-1]}."
             )
-            _raise_error(ValueError, msg)
+            raise ValueError(msg)
         if packed_kv.shape[-1] < k.shape[0]:
             msg = (
                 "SEQ_ALONG_LANE fresh KV token extent must cover all local "
                 f"tokens: {packed_kv.shape[-1]} vs {k.shape[0]}."
             )
-            _raise_error(ValueError, msg)
+            raise ValueError(msg)
         return packed_kv.astype(kv_cache.dtype)
 
     if packed_kv.shape[1:] != kv_cache.shape[2:]:
@@ -210,7 +187,7 @@ def _prepare_packed_kv_for_cache(
                 "packed KV update shape is incompatible with KV cache layout: "
                 f"{packed_kv.shape[1:]} vs {kv_cache.shape[2:]}."
             )
-            _raise_error(ValueError, msg)
+            raise ValueError(msg)
         packed_kv = packed_kv.reshape((packed_kv.shape[0], *kv_cache.shape[2:]))
     return packed_kv.astype(kv_cache.dtype)
 
@@ -227,7 +204,7 @@ def _reshape_packed_kv_cache_for_attention(
         f"shape={kv_cache.shape}, "
         f"expected_packing={expected_packing}."
     )
-    _raise_error(ValueError, msg)
+    raise ValueError(msg)
 
 
 def compute_pcp_local_mapping(
@@ -284,7 +261,6 @@ def sharded_pcp_ragged_paged_attention(
     update_kv_cache: bool = True,
     cp_kv_cache_interleave_size: int = 0,
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
-    vpage_group_size: int = PCP_STREAMING_RPA_VPAGE_GROUP_SIZE,
 ) -> tuple[jax.Array, jax.Array]:
     """Run streaming PCP RPA over local Q/K/V shards."""
     pcp_size = _validate_pcp_streaming_unsupported_features(
@@ -338,28 +314,32 @@ def sharded_pcp_ragged_paged_attention(
     )
 
     def _pcp_ragged_paged_attention(
-        q_local,
-        k_local,
-        v_local,
-        kv_cache,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
+        q_local: jax.Array,
+        k_local: jax.Array,
+        v_local: jax.Array,
+        kv_cache: jax.Array,
+        kv_lens: jax.Array,
+        page_indices: jax.Array,
+        cu_q_lens: jax.Array,
+        distribution: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
-        local_stage_plan = _stage_plan_mod.build_pcp_local_stage_plan(
-            kv_lens,
-            page_indices,
-            cu_q_lens,
-            distribution,
+        """Build the local stage plan and run PCP unified Splash on one shard."""
+        stage_config = PCPStageConfig(
             local_tokens=q_local.shape[0],
             local_kv_cache_num_blocks=kv_cache.shape[0],
             page_size=page_size,
             pcp_size=pcp_size,
             interleave_size=cp_kv_cache_interleave_size,
-            vpage_group_size=vpage_group_size,
+            vpage_group_size=PCP_STREAMING_RPA_VPAGE_GROUP_SIZE,
             kv_layout=kv_layout,
             pcp_axis_name=PCP_AXIS_NAME,
+        )
+        local_stage_plan = _stage_plan_mod.build_pcp_local_stage_plan(
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            config=stage_config,
         )
         query_row_valid = local_stage_plan.query_row_valid
         segment_descriptors = local_stage_plan.segment_descriptors
@@ -382,14 +362,13 @@ def sharded_pcp_ragged_paged_attention(
                 segment_descriptors,
                 num_segments,
                 stage_plan=local_stage_plan,
-                vpage_group_size=vpage_group_size,
+                vpage_group_size=PCP_STREAMING_RPA_VPAGE_GROUP_SIZE,
                 pcp_size=pcp_size,
                 interleave_size=cp_kv_cache_interleave_size,
                 sm_scale=sm_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
                 kv_layout=kv_layout,
-                mesh_axis_names=tuple(mesh.axis_names),
                 pcp_axis_name=PCP_AXIS_NAME,
             )
         )
@@ -420,17 +399,20 @@ def _validate_pcp_streaming_unsupported_features(
 ) -> int:
     """Validate mesh axis and unsupported attention features, returning pcp_size."""
     if attention_sink is not None:
-        _raise_error(NotImplementedError, "PCP RPA does not support attention sinks.")
-    if q.shape[-1] == HEAD_DIM_64:
-        _raise_error(NotImplementedError, "PCP RPA does not support head_dim==64.")
+        msg = "PCP RPA does not support attention sinks."
+        raise NotImplementedError(msg)
+    if q.shape[-1] == _UNSUPPORTED_HEAD_DIM_64:
+        msg = "PCP RPA does not support head_dim==64."
+        raise NotImplementedError(msg)
     if cp_kv_cache_interleave_size <= 0:
-        _raise_error(ValueError, "PCP RPA requires cp_kv_cache_interleave_size > 0.")
+        msg = "PCP RPA requires cp_kv_cache_interleave_size > 0."
+        raise ValueError(msg)
     if PCP_AXIS_NAME not in mesh.axis_names:
-        _raise_error(NotImplementedError, "PCP requires a mesh with a pcp axis.")
+        msg = "PCP requires a mesh with a pcp axis."
+        raise NotImplementedError(msg)
     if attention_chunk_size is not None:
-        _raise_error(
-            NotImplementedError, "PCP streaming RPA supports full attention only."
-        )
+        msg = "PCP streaming RPA supports full attention only."
+        raise NotImplementedError(msg)
     return int(mesh.shape[PCP_AXIS_NAME])
 
 
@@ -443,20 +425,17 @@ def _validate_pcp_streaming_scales_and_cache_flag(
 ) -> None:
     """Validate Q/K/V quantization scales and KV cache update flag."""
     if q_scale is not None:
-        _raise_error(
-            NotImplementedError,
-            "PCP streaming RPA does not support quantized Q scales.",
-        )
+        msg = "PCP streaming RPA does not support quantized Q scales."
+        raise NotImplementedError(msg)
     if (k_scale is None) != (v_scale is None):
-        _raise_error(
-            ValueError,
+        msg = (
             "PCP streaming RPA requires k_scale and v_scale to be both "
-            "None or both non-None.",
+            "None or both non-None."
         )
+        raise ValueError(msg)
     if not update_kv_cache:
-        _raise_error(
-            NotImplementedError, "PCP streaming RPA requires update_kv_cache=True."
-        )
+        msg = "PCP streaming RPA requires update_kv_cache=True."
+        raise NotImplementedError(msg)
 
 
 def _validate_pcp_streaming_layout_and_sharding(
@@ -470,39 +449,39 @@ def _validate_pcp_streaming_layout_and_sharding(
     """Validate page size divisibility and even PCP sharding, returning page_size."""
     page_size = _kv_cache_page_size(kv_cache, kv_layout)
     if kv_layout == KVLayout.SEQ_ALONG_LANE and (
-        page_size % 128 != 0 or cp_kv_cache_interleave_size % 128 != 0
+        page_size % NUM_LANES != 0 or cp_kv_cache_interleave_size % NUM_LANES != 0
     ):
-        _raise_error(
-            NotImplementedError,
+        msg = (
             "PCP SEQ_ALONG_LANE UT path requires page_size and "
-            "cp_kv_cache_interleave_size to be multiples of 128, got "
-            f"{page_size=} {cp_kv_cache_interleave_size=}.",
+            f"cp_kv_cache_interleave_size to be multiples of {NUM_LANES}, got "
+            f"{page_size=} {cp_kv_cache_interleave_size=}."
         )
+        raise NotImplementedError(msg)
     if (
         cp_kv_cache_interleave_size > page_size
         or page_size % cp_kv_cache_interleave_size != 0
     ):
-        _raise_error(
-            NotImplementedError,
+        msg = (
             "PCP streaming RPA requires page_size to be divisible by "
             "cp_kv_cache_interleave_size: "
             f"page_size={page_size} "
-            f"{cp_kv_cache_interleave_size=}.",
+            f"{cp_kv_cache_interleave_size=}."
         )
+        raise NotImplementedError(msg)
     if q.shape[0] % pcp_size != 0:
         msg = (
             "PCP streaming RPA requires q tokens to be evenly "
             f"sharded across PCP ranks: {q.shape[0]=} "
             f"{pcp_size=}."
         )
-        _raise_error(ValueError, msg)
+        raise ValueError(msg)
     if kv_cache.shape[0] % pcp_size != 0:
         msg = (
             "PCP streaming RPA requires KV cache blocks to be "
             "evenly sharded across PCP ranks: "
             f"{kv_cache.shape[0]=} {pcp_size=}."
         )
-        _raise_error(ValueError, msg)
+        raise ValueError(msg)
     return page_size
 
 
@@ -512,7 +491,8 @@ def _pad_local_q_heads_for_streaming(
 ) -> tuple[jax.Array, int]:
     """Pad Q heads to a multiple of dtype packing for streaming attention."""
     if q_local.shape[1] % num_kv_heads != 0:
-        _raise_error(ValueError, "Q heads must be divisible by KV heads.")
+        msg = "Q heads must be divisible by KV heads."
+        raise ValueError(msg)
     q_per_kv = q_local.shape[1] // num_kv_heads
     q_streaming = q_local.reshape(
         q_local.shape[0], num_kv_heads, q_per_kv, q_local.shape[2]

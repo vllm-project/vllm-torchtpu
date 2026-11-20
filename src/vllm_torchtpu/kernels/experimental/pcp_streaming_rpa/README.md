@@ -53,20 +53,29 @@ sublane planes afterward so the local transpose remains a zero-copy bitcast.
 
 ## Active Virtual-Page Ladder and Multi-Group Streaming
 
-For `vpage_group_size == 128` (`PCP_STREAMING_RPA_VPAGE_GROUP_SIZE`):
+`stage_plan.supports_single_group_rung_ladder(vpage_group_size)` controls both
+virtual-page table padding and runtime dispatch:
 
-- When `num_active_vpages <= 512`, `_attend_over_vpage_groups` dispatches one
-  single-group Splash call (`save_residuals=False`) at the smallest `block_kv`-
-  aligned rung in `PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS = (32, 64, 96, 128, 256, 512)`.
-- When `num_active_vpages > 512`, `_attend_multi_vpage_groups` streams `128`-
-  virtual-page groups (`save_residuals=True`) and merges per-group outputs
-  online in `float32` via natural-log `logsumexp`.
+- When `supports_single_group_rung_ladder(vpage_group_size)` is true
+  (`vpage_group_size == PCP_STREAMING_RPA_VPAGE_GROUP_SIZE = 128`):
+  - For `num_active_vpages <= 512`, `_attend_over_vpage_groups` dispatches one
+    single-group Splash call (`save_residuals=False`) at the smallest
+    `block_kv`-aligned rung in
+    `PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS = (32, 64, 96, 128, 256, 512)`.
+  - For `num_active_vpages > 512`, `_attend_multi_vpage_groups` streams `128`-
+    virtual-page groups (`save_residuals=True`) and merges per-group outputs
+    online in `float32` via natural-log `logsumexp`.
+- For any other `vpage_group_size`, `_attend_over_vpage_groups` logs a debug
+  message and streams directly through `_attend_multi_vpage_groups` without the
+  single-group rung ladder.
 
 ## Legacy Ring Schedule Reference (`schedule.py`)
 
 > Note: `schedule.py` and the split current/history ring Pallas helpers in
 > `kernel.py` are retained temporarily for legacy ring unit tests and are slated
 > for removal in a follow-up cleanup PR once unified Splash streaming lands.
+> Production modules (`stage_plan.py`, `kernel.py` unified Splash path, and
+> `wrapper.py`) do not depend on `schedule.py`.
 
 ## Entry Points
 
@@ -81,5 +90,6 @@ The production path enforces the following invariants:
 - Full causal attention only; sliding-window attention is not supported here.
 - `cp_kv_cache_interleave_size <= page_size`, and `page_size` must be
   divisible by `cp_kv_cache_interleave_size`.
-- `num_lanes == 1`.
+- `local_tokens` must be positive and divisible by `SPLASH_BLOCK_Q` (`128`),
+  and `vpage_group_size * page_size * pcp_size` must be divisible by `block_kv`.
 - `head_dim == 64` and attention sinks are not supported.
