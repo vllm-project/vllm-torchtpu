@@ -55,16 +55,6 @@ NUM_PROMPTS = 4
 MAX_TOKENS = 4
 
 
-def _get_local_tpu_chip_count() -> int:
-    try:
-        from tpu_info import device as tpu_device
-
-        _, num_chips = tpu_device.get_local_chips()
-        return num_chips
-    except Exception as e:
-        pytest.skip(f"Unable to detect local TPU chip count: {e}")
-
-
 def _mla_qrep_state(model) -> list[tuple[bool, bool, bool, bool]]:
     """(dcp_q_replicate, is_sparse, replicated W_UK_T present, skip_topk) per
     MLA layer."""
@@ -104,10 +94,13 @@ def _mla_qrep_state(model) -> list[tuple[bool, bool, bool, bool]]:
     ],
 )
 def test_glm52_dcp_generates(
-    monkeypatch, model: str, dcp_q_replicate: bool | None, env: dict[str, str]
+    monkeypatch,
+    local_tpu_chip_count: int,
+    model: str,
+    dcp_q_replicate: bool | None,
+    env: dict[str, str],
 ):
-    tp_size = _get_local_tpu_chip_count()
-    if tp_size < DCP_SIZE:
+    if local_tpu_chip_count < DCP_SIZE:
         pytest.skip(f"needs {DCP_SIZE} chips for TP {DCP_SIZE} x DCP {DCP_SIZE}")
     # The variable overrides dcp_q_replicate when set; leave the choice to it.
     monkeypatch.delenv("VLLM_DCP_Q_REPLICATE", raising=False)
