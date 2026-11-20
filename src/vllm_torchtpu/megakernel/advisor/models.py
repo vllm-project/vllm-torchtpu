@@ -76,7 +76,6 @@ RECOGNIZED_MODEL_TYPES: frozenset[str] = frozenset(
         "qwen3_5_moe_text",
         "qwen3_5_text",
         "qwen3_8",
-        "qwen3_8_moe",
         "qwen3_moe",
         "qwen3_next",
         "qwen4_exp",

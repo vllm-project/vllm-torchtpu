@@ -281,6 +281,13 @@ def test_chip_spec_json_override(tmp_path: Path) -> None:
     assert loaded.cores_per_device == 1
 
 
+def test_tpu7x_collective_latency_bracket_is_clean_round_prior() -> None:
+    """Verify tpu7x collective latency bracket uses clean round prior bounds."""
+    chip_spec = chips.resolve_chip_spec("tpu7x")
+    expected_bracket = (1.0, 5.0)
+    assert chip_spec.collective_latency_us_bracket == expected_bracket
+
+
 def test_resolve_chip_spec_unknown_raises() -> None:
     """Verify resolving an unknown chip name raises MegakernelConfigError."""
     with pytest.raises(errors.MegakernelConfigError, match="Unknown chip="):
@@ -614,9 +621,8 @@ def _extract_assign_names(node: ast.stmt) -> list[str]:
 
 
 def test_no_private_underscore_module_constants() -> None:
-    """Verify advisor Python modules define zero _UPPER_CASE module constants."""
+    """Verify advisor Python modules define zero private `_`-prefixed constants."""
     advisor_dir = Path(models.__file__).resolve().parent
-    pattern = re.compile(r"_[A-Z][A-Z0-9_]*")
     offenders = [
         f"{py_path.name}:{name}"
         for py_path in sorted(advisor_dir.glob("*.py"))
@@ -624,7 +630,7 @@ def test_no_private_underscore_module_constants() -> None:
             py_path.read_text(encoding="utf-8"), filename=str(py_path)
         ).body
         for name in _extract_assign_names(node)
-        if pattern.fullmatch(name)
+        if name.startswith("_") and not name.startswith("__")
     ]
     assert offenders == [], f"Found private module constants: {offenders}"
 
