@@ -889,3 +889,46 @@ def test_gmm_v2_rejects_global_scale_on_dequant_after_matmul(monkeypatch):
             jax.lax.bitcast_convert_type(scale, jnp.uint8),
             make_global_scale(jax.random.key(10), 2, 256),
         )
+
+
+def test_gmm_v2_rejects_partial_m_buckets_with_split_k(monkeypatch):
+    _validation_tpu_info(monkeypatch)
+    with pytest.raises(NotImplementedError, match="need a single K step"):
+        gmm_v2(
+            jnp.zeros((512, 2048), jnp.bfloat16),
+            jnp.zeros((2, 2048, 256), jnp.bfloat16),
+            jnp.full((2,), 256, dtype=jnp.int32),
+            maybe_quantize_lhs=False,
+            tile_info=TileSizes(tile_m=256, tile_k=1024, tile_n=256, bucket_base=64),
+        )
+
+
+@pytest.mark.parametrize("size_k", [2880, 4096])
+def test_calculate_tiling_keeps_one_bucket_when_k_is_split(monkeypatch, size_k):
+    """Partial-M buckets finalize after the first K step, so a split K (here
+    from compact scale tiles: 2880 splits, 4096 does not) keeps one bucket."""
+    _validation_tpu_info(monkeypatch)
+    dims = Dimensions(
+        size_m=5760,
+        size_k=size_k,
+        size_n=256,
+        size_group=2,
+        size_lhs_group=2,
+        size_lhs_sublane=16,
+    )
+    rhs_cfgs = InputConfigs(
+        quant_dtype=jnp.float4_e2m1fn,
+        quant_block_size=16,
+        dtype=jnp.uint8,
+        has_scale=True,
+        has_global_scale=True,
+        has_compact_scale=True,
+    )
+    lhs_cfgs = InputConfigs(quant_dtype=None, quant_block_size=512, dtype=jnp.bfloat16)
+
+    tiles = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, 48 * 1024 * 1024)
+
+    if size_k == 2880:
+        assert tiles.tile_k < size_k and tiles.tile_m == tiles.bucket_base, tiles
+    else:
+        assert tiles.tile_k == size_k and tiles.tile_m > tiles.bucket_base, tiles

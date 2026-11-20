@@ -702,7 +702,8 @@ def inner_kernel(
                 lambda: lax.cond(is_last_k_step, matmul_last, matmul_mid),
             )
         else:
-            # partial m is only invoked at last matmul.
+            # Partial buckets are only correct with a single K step (the first
+            # step finalizes); gmm_v2 rejects buckets with a split K.
             lax.cond(is_first_k_step, matmul_first_last, matmul_last)
 
     branches = []
@@ -1119,7 +1120,9 @@ def calculate_tiling(
 
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
-    max_num_buckets = 4
+    # Partial-M buckets are only correct with a single K step (see
+    # run_matmul_step), so a split K keeps one bucket.
+    max_num_buckets = 4 if pl.cdiv(dims.size_k, tile_k) == 1 else 1
     bucket_base = tile_m
     for _ in range(1, max_num_buckets):
         new_tile_m = tile_m + bucket_base
@@ -1470,6 +1473,12 @@ def gmm_v2(
         raise ValueError(
             f"Compact E4M3 scales (dtype {rhs_scale.dtype}, shape {rhs_scale.shape}) "
             "require rhs_global_scale"
+        )
+    if tiles.tile_m != tiles.bucket_base and pl.cdiv(dims.size_k, tiles.tile_k) > 1:
+        raise NotImplementedError(
+            f"Partial-M buckets (tile_m={tiles.tile_m}, bucket_base="
+            f"{tiles.bucket_base}) need a single K step, but tile_k={tiles.tile_k} "
+            f"splits size_k={dims.size_k}"
         )
     if cfgs.rhs_cfgs.has_compact_scale and not compact_scale_tile_fits(
         tiles.tile_k, cast(int, cfgs.rhs_cfgs.quant_block_size), dims.size_k
