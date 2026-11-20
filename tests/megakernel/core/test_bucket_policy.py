@@ -138,7 +138,7 @@ def test_bucket_policy_resolve_select_and_out_rows() -> None:
         BucketPolicy((8, 8), ())
     with pytest.raises(ValueError, match="verify_buckets"):
         BucketPolicy((8,), (6,))
-    bad_prof = Profile(name="t-bad-verify", numerics="exact", verify_buckets=(6,))
+    bad_prof = Profile(name="t-bad-verify", numerics="exact", verify_buckets=(65,))
     with pytest.raises(ValueError, match="invalid verify_buckets"):
         BucketPolicy.resolve(bad_prof, speculative_tokens=0)
 
@@ -606,6 +606,27 @@ def test_resolve_decouples_speculative_tokens_from_verify_tokens(
     dec = check_post_mesh_eligibility(tp_size=8, bucket_policy=pol_no_decode)
     assert not dec.eligible and dec.code == "empty_buckets"
 
+
+def test_resolve_verify_tokens_none_and_empty_verify_multiples() -> None:
+    """`verify_tokens=None` uses `(MTP_VERIFY_TOKENS,)`; unrepresented widths empty."""
+    prof = Profile(name="test_none_vt", numerics="exact")
+    pol_none = BucketPolicy.resolve(prof, verify_tokens=None)
+    assert pol_none.verify_tokens == (MTP_VERIFY_TOKENS,)
+    assert (pol_none.buckets, pol_none.verify_buckets) == (
+        DEFAULT_BUCKETS,
+        DEFAULT_VERIFY_BUCKETS,
+    )
+
+    pol_spec7_none = BucketPolicy.resolve(
+        prof, speculative_tokens=7, verify_tokens=None
+    )
+    assert pol_spec7_none.verify_tokens == (MTP_VERIFY_TOKENS,)
+    assert (pol_spec7_none.buckets, pol_spec7_none.verify_buckets) == (
+        DEFAULT_BUCKETS,
+        (),
+    )
+    assert parse_mk_verify_buckets("8, 16", verify_tokens=None) == (8, 16)
+
     pol_no_mult = BucketPolicy.resolve(prof, speculative_tokens=10, verify_tokens=(11,))
     assert pol_no_mult.verify_tokens == (11,)
     assert (pol_no_mult.buckets, pol_no_mult.verify_buckets) == ((), ())
@@ -614,7 +635,7 @@ def test_resolve_decouples_speculative_tokens_from_verify_tokens(
 
 
 def test_resolve_profile_verify_buckets_filtering_and_range_errors() -> None:
-    """Profile verify_buckets filter to verify_tokens; out-of-range entries raise."""
+    """Non-explicit verify_buckets filter uniformly; out-of-range entries raise."""
     prof_def_v = Profile(
         name="test_prof_def_v",
         numerics="exact",
@@ -631,12 +652,19 @@ def test_resolve_profile_verify_buckets_filtering_and_range_errors() -> None:
     )
     assert (pol_spec7.buckets, pol_spec7.verify_buckets) == ((), expected_8)
 
-    prof_bad_align = Profile(
-        name="test_prof_bad_align", numerics="exact", verify_buckets=(6, 8)
+    prof_6_8 = Profile(
+        name="test_prof_6_8", numerics="exact", buckets=(2,), verify_buckets=(6, 8)
     )
-    for widths in ((4,), (8,)):
-        with pytest.raises(ValueError, match="invalid verify_buckets"):
-            BucketPolicy.resolve(prof_bad_align, verify_tokens=widths)
+    assert BucketPolicy.resolve(prof_6_8, verify_tokens=(8,)).verify_buckets == (8,)
+    assert BucketPolicy.resolve(prof_6_8, verify_tokens=(6,)).verify_buckets == (6,)
+
+    pol_non_exp_12 = BucketPolicy.resolve(
+        prof_def_v,
+        verify_buckets=(6, 12),
+        verify_buckets_explicit=False,
+        verify_tokens=(12,),
+    )
+    assert pol_non_exp_12.verify_buckets == (12,)
 
     for out_of_range in ((0, 8), (68,), (-4,)):
         prof_oor = Profile(
