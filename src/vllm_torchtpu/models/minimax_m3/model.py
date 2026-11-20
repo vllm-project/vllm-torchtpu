@@ -18,6 +18,7 @@ from collections.abc import Iterable, Iterator
 
 import torch
 from torch import nn
+from vllm import ir
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -46,6 +47,26 @@ from vllm_torchtpu.layers.adapter.quantization.fp8_lm_head import Fp8LMHeadMetho
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
+from vllm_torchtpu.utils import fresh_buffer
+
+
+class FoldedGemmaRMSNorm(GemmaRMSNorm):
+    """GemmaRMSNorm that applies ``1 + w`` folded to f32 once after loading
+    (`fold_weight`), instead of converting the weight on every forward."""
+
+    def fold_weight(self) -> None:
+        self.folded_weight = fresh_buffer(self.weight.float() + 1.0)
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            return ir.ops.rms_norm(x, self.folded_weight, self.variance_epsilon)
+        return ir.ops.fused_add_rms_norm(
+            x, residual, self.folded_weight, self.variance_epsilon
+        )
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -72,8 +93,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 quant_config,
                 prefix=f"{prefix}.mlp",
             )
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
+        self.input_layernorm = FoldedGemmaRMSNorm(
+            config.hidden_size, config.rms_norm_eps
+        )
+        self.post_attention_layernorm = FoldedGemmaRMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -235,7 +258,7 @@ class MiniMaxM3Model(nn.Module):
             MiniMaxM3DecoderLayer(vllm_config, idx, prefix=f"{prefix}.layers.{idx}")
             for idx in range(config.num_hidden_layers)
         )
-        self.norm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = FoldedGemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.tp_size = get_tensor_model_parallel_world_size()
         self.sp_mode = _sp_mode() if self.tp_size > 1 else "off"
         # Residual-stream entries of these layers (k = output of layer k-1,
@@ -417,3 +440,10 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         return AutoWeightsLoader(self).load_weights(
             weights, mapper=self.hf_to_vllm_mapper
         )
+
+    def process_weights_after_loading(self) -> None:
+        """Fold the Gemma norms' ``1 + w`` once (vLLM's model-level hook, after
+        real and dummy loads alike)."""
+        for module in self.model.modules():
+            if isinstance(module, (FoldedGemmaRMSNorm, MiniMaxM3SparseAttention)):
+                module.fold_weight()

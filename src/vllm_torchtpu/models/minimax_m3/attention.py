@@ -46,6 +46,7 @@ from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_sharded_op,
 )
 from vllm_torchtpu.models.minimax_m3.ops.qk_norm_rope import get_qk_norm_rope_op
+from vllm_torchtpu.utils import fresh_buffer
 
 
 class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
@@ -204,29 +205,17 @@ def cache_dtype(cache_config: CacheConfig | None) -> torch.dtype:
     )
 
 
-def norm_rope_heads(
-    qkv: torch.Tensor,
-    positions: torch.Tensor,
+def norm_rope_weight(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
     norms: tuple[GemmaRMSNorm, GemmaRMSNorm, GemmaRMSNorm, GemmaRMSNorm],
-    rotary_emb: nn.Module,
-    op: Callable[..., tuple[torch.Tensor, ...]],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Split ``[q | k | v | index_q | index_k]`` and norm + rotate all but v
-    in one kernel, `op` (`ops.qk_norm_rope.get_qk_norm_rope_op` for these
-    head counts; it also fixes q's layout).
-
-    The four Gemma RMSNorms differ only in their weights and RoPE acts on each
-    head alone, so the kernel norms every head with its row of a per-head
-    ``1 + w`` table, then rotates it, with the numerics of the TPU
-    ``rms_norm`` provider and the FP32 rotary embedding.
-    """
-    if not rotary_emb.is_neox_style or rotary_emb.head_size != head_dim:
-        raise NotImplementedError("MiniMax M3 rotates NeoX-style within each head.")
+) -> torch.Tensor:
+    """The per-head ``1 + w`` table `norm_rope_heads` norms
+    ``[q | k | index_q | index_k]`` with, one f32 row per head."""
     q_norm, k_norm, index_q_norm, index_k_norm = norms
-    weight = (
+    assert all(n.variance_epsilon == q_norm.variance_epsilon for n in norms)
+    return (
         torch.cat(
             [
                 q_norm.weight.expand(num_heads, head_dim),
@@ -237,7 +226,27 @@ def norm_rope_heads(
         ).float()
         + 1.0
     )
-    assert all(n.variance_epsilon == q_norm.variance_epsilon for n in norms)
+
+
+def norm_rope_heads(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    head_dim: int,
+    weight: torch.Tensor,
+    rotary_emb: nn.Module,
+    op: Callable[..., tuple[torch.Tensor, ...]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split ``[q | k | v | index_q | index_k]`` and norm + rotate all but v
+    in one kernel, `op` (`ops.qk_norm_rope.get_qk_norm_rope_op` for these
+    head counts; it also fixes q's layout).
+
+    The four Gemma RMSNorms differ only in their weights and RoPE acts on each
+    head alone, so the kernel norms every head with its row of the per-head
+    `norm_rope_weight` table, then rotates it, with the numerics of the TPU
+    ``rms_norm`` provider and the FP32 rotary embedding.
+    """
+    if not rotary_emb.is_neox_style or rotary_emb.head_size != head_dim:
+        raise NotImplementedError("MiniMax M3 rotates NeoX-style within each head.")
     cos_sin = rotary_emb._match_cos_sin_cache_dtype(qkv)
     cos_sin = cos_sin.index_select(0, positions.flatten())
     return op(qkv, cos_sin, weight)
@@ -401,6 +410,18 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.q_head_major,
         )
 
+    def fold_weight(self) -> None:
+        """Build the q/k/index norms' `norm_rope_weight` table once after
+        loading, instead of on every forward."""
+        self.norm_rope_weight = fresh_buffer(
+            norm_rope_weight(
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                (self.q_norm, self.k_norm, self.index_q_norm, self.index_k_norm),
+            )
+        )
+
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -408,10 +429,8 @@ class MiniMaxM3SparseAttention(nn.Module):
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
             positions,
-            self.num_heads,
-            self.num_kv_heads,
             self.head_dim,
-            (self.q_norm, self.k_norm, self.index_q_norm, self.index_k_norm),
+            self.norm_rope_weight,
             self.rotary_emb,
             self.norm_rope_op,
         )
