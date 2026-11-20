@@ -9744,7 +9744,7 @@ class TPUModelRunner(GPUModelRunner):
                                     subst_idx_warm,
                                     next_tpu_warm,
                                     logits_idx_warm,
-                                    logits_idx_warm,
+                                    target_logits_idx_warm,
                                 )
                             )
                             synchronize_tensors(out_carry)

@@ -1170,9 +1170,10 @@ def test_decode_carry_program_is_warmed_at_every_carried_shape(
     one request (max_num_seqs == 1) with its bonus token and 1 to K drafts,
     padded to the first token bucket at or above that count (under EP-DP
     lockstep, to the DP-wide bucket, which can be any), at either request
-    layout, with step_delta = 1 + K baked in. The warm-up compiles exactly
-    those shapes, with the arguments the draft-token program takes there.
-    With K = 3 the carried counts 2 to 4 pad to bucket 4 alone, or to 2 and 4."""
+    layout the stub runner gives (8 and 4), with step_delta = 1 + K baked in.
+    The warm-up compiles exactly those shapes, with the arguments the
+    draft-token program takes there. With K = 3 the carried counts 2 to 4 pad
+    to bucket 4 alone, or to 2 and 4."""
     calls = _assembly_warmup_calls(
         monkeypatch,
         most=4,
@@ -1199,6 +1200,65 @@ def test_decode_carry_program_is_warmed_at_every_carried_shape(
     assert {c[:2] + c[3:] for c in carry} == {
         c for c in draft if (c[0][0], c[1][-1]) in served
     }
+
+
+def test_decode_carry_warmup_takes_the_serving_guards(monkeypatch):
+    """execute_model runs the carry under its no_grad and passes the final and
+    target logits indices as two tensors; dynamo guards on both, so the
+    warm-up does the same."""
+    calls = _assembly_warmup_calls(
+        monkeypatch, with_modes=True, runner_fields=dict(_decode_carry_enabled=True)
+    )
+    carry = calls["_compiled_carry_subtract_and_substitute_draft_token_ids"]
+    assert carry
+    for grad, args in carry:
+        assert not grad
+        assert args[9] is not args[10]
+
+
+def test_the_warmed_decode_carry_serves_a_carried_step_without_compiling(
+    monkeypatch,
+):
+    """The real carry program, warmed by _precompile_async_spec_assembly and
+    then called from inside execute_model as _prepare_inputs calls it on a
+    carried step (one request, K = 3 drafts, token bucket 8): no compile."""
+    name = "_compiled_carry_subtract_and_substitute_draft_token_ids"
+    torch._dynamo.reset()
+    try:
+        compiles: list[str] = []
+        _assembly_warmup_calls(
+            monkeypatch,
+            programs={name: _counting_compile(name, compiles)},
+            runner_fields=dict(_decode_carry_enabled=True),
+        )
+        warmed = len(compiles)
+        assert warmed
+        knr, n, bound, k = 8, 8, 8 * (1 + 3), 3
+
+        def prepare_inputs():
+            async_output._compiled_carry_subtract_and_substitute_draft_token_ids(
+                torch.zeros(knr, dtype=torch.int32),
+                torch.zeros(n, dtype=torch.int32),
+                1 + k,
+                torch.zeros(knr, dtype=torch.int32),
+                torch.from_numpy(np.full(knr, -1, dtype=np.int32)),
+                torch.from_numpy(np.full(n, -1, dtype=np.int32)),
+                torch.zeros(n, dtype=torch.int32),
+                torch.from_numpy(
+                    np.stack(
+                        (np.zeros(n, dtype=np.int32), np.full(n, -1, dtype=np.int32))
+                    )
+                ),
+                torch.zeros(bound, dtype=torch.int32),
+                # Final and target logits indices: two tensors of the metadata.
+                torch.zeros(n, dtype=torch.int32),
+                torch.zeros(n, dtype=torch.int32),
+            )
+
+        _inside("execute_model", prepare_inputs)
+        assert len(compiles) == warmed, compiles[warmed:]
+    finally:
+        torch._dynamo.reset()
 
 
 def test_decode_carry_program_is_not_warmed_without_the_carry(monkeypatch):
