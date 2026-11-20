@@ -2865,6 +2865,10 @@ class TPURaidenConnectorWorker:
         self._stage3_register_futures: list[
             tuple[concurrent.futures.Future, frozenset[str]]
         ] = []
+        # req_id -> side-thread steps that carry it and have not ended yet.
+        # Written under _stage3_poll_lock, so a poll and a step's end never
+        # interleave.
+        self._stage3_pending_registrations: dict[str, int] = {}
         self._stage3_register_local = threading.local()
         # Set by get_finished once the step's forward is dispatched; the
         # side thread starts on it or after the configured delay.
@@ -4410,14 +4414,18 @@ class TPURaidenConnectorWorker:
         gate = threading.Event()
         self._stage3_register_gate = gate
         delay_s = _STAGE3_ASYNC_REGISTER_DELAY_S
+        with self._stage3_poll_lock:
+            pending = self._stage3_pending_registrations
+            for req_id in req_ids:
+                pending[req_id] = pending.get(req_id, 0) + 1
 
         def _run() -> None:
             gate.wait(delay_s)
-            facade = getattr(self._stage3_register_local, "facade", None)
-            if facade is None:
-                facade = self._new_raiden_controller_facade(address)
-                self._stage3_register_local.facade = facade
             try:
+                facade = getattr(self._stage3_register_local, "facade", None)
+                if facade is None:
+                    facade = self._new_raiden_controller_facade(address)
+                    self._stage3_register_local.facade = facade
                 self._register_stage3_request_blocks(metadata, facade=facade)
             finally:
                 self._settle_stage3_early_send_terminals(req_ids)
@@ -4426,12 +4434,18 @@ class TPURaidenConnectorWorker:
         self._stage3_register_futures.append((future, req_ids))
 
     def _settle_stage3_early_send_terminals(self, req_ids: frozenset[str]) -> None:
-        """Settles the native terminals kept for a side-thread registration
-        step's requests: one whose request is now registered is applied, any
+        """Ends a side-thread registration step under the poll lock: its
+        requests stop counting as pending, and the native terminals kept for
+        them are settled. One whose request is now registered is applied, any
         other is dropped (a released or tombstoned request, a replay, or a
         registration that failed), as an unmatched terminal always was."""
         with self._stage3_poll_lock:
+            pending = self._stage3_pending_registrations
             for req_id in req_ids:
+                if pending[req_id] == 1:
+                    del pending[req_id]
+                else:
+                    pending[req_id] -= 1
                 failed = self._stage3_early_send_terminals.pop(req_id, None)
                 if failed is None or req_id not in self._stage3_registered_sends:
                     continue
@@ -5517,12 +5531,9 @@ class TPURaidenConnectorWorker:
                 )
 
     def _stage3_registration_pending(self, req_id: str) -> bool:
-        """Whether an async_register registration of the request is still
-        running on the side thread."""
-        return any(
-            req_id in req_ids and not future.done()
-            for future, req_ids in self._stage3_register_futures
-        )
+        """Whether a side-thread registration step that carries the request
+        has not ended yet. The caller holds _stage3_poll_lock."""
+        return req_id in self._stage3_pending_registrations
 
     def _stage3_ready_producer_send_terminals(
         self,
