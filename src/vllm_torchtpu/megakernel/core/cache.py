@@ -60,24 +60,38 @@ from .cache_common import (
 from .cache_flat import make_flat_pooled_step
 from .cache_hlo import check_pooled_step_hlo
 from .cache_pooled import make_pooled_step
+from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
-from .model_def import find_model, get_model
-from .pool.config import with_cache
+from .geometry import ModelGeometry
+from .model_def import find_model
+from .pool.config import FUSED_POOL_IO_MAX_B, FUSED_POOL_IO_MIN_B_HI, with_cache
+from .spec import ModelSpec
 
 
 def _resolve_pool_layout(g_or_lay: Any, ex: ExecSpec) -> pool.PoolLayout:
     if isinstance(g_or_lay, pool.PoolLayout):
         return g_or_lay
+    # A `ModelSpec` with a `cache_backend` uses that backend's layout (the one
+    # its pooled steps read and write), even when its model name is registered.
+    if isinstance(g_or_lay, ModelSpec) and g_or_lay.cache_backend is not None:
+        return g_or_lay.cache_backend.layout
+    # A geometry names the `ModelDef` it was derived from, so an unregistered
+    # model folder's geometry resolves too; a spec falls back to its name.
     ms = resolve_model_spec(g_or_lay)
-    # A geometry derived from a `ModelDef` names it (`_model_def`), so an
-    # unregistered model folder's geometry resolves too; a standalone
-    # `ModelSpec` with a `cache_backend` resolves directly from its backend.
     m_def = find_model(g_or_lay) or find_model(ms.name)
-    if m_def is not None:
-        return m_def.pool_layout(ms.config, R=ex.R)
-    if ms.cache_backend is not None and ms.cache_backend.layout is not None:
-        return ms.cache_backend.layout
-    return get_model(ms.name).pool_layout(ms.config, R=ex.R)
+    if m_def is None:
+        raise MegakernelConfigError(
+            f"ModelSpec {ms.name!r} has no cache_backend and names no registered "
+            "ModelDef to derive a PoolLayout from"
+        )
+    return m_def.pool_layout(ms.config, R=ex.R)
+
+
+def _check_geometry(g: Any, ex: ExecSpec) -> None:
+    """Run the geometry's `check(ex)` for a geometry or a geometry-backed spec."""
+    geom = g.config if isinstance(g, ModelSpec) else g
+    if isinstance(geom, ModelGeometry):
+        geom.check(ex)
 
 
 def default_pool_layout(g: Any, ex: ExecSpec) -> tuple[Any, ...]:
@@ -97,15 +111,13 @@ def pool_to_states(g: Any, ex: ExecSpec, *args: Any, **kw: Any) -> Any:
 
 def gather_gdn_states(g: Any, ex: ExecSpec, *args: Any, **kw: Any) -> Any:
     """Gather per-rank GDN `conv` and `rec` states from `g`'s raw pools."""
-    if hasattr(g, "check"):
-        g.check(ex)
+    _check_geometry(g, ex)
     return pool.gather_gdn_states(_resolve_pool_layout(g, ex), ex, *args, **kw)
 
 
 def scatter_pool_states(g: Any, ex: ExecSpec, *args: Any, **kw: Any) -> Any:
     """Scatter KV and GDN checkpoint states into `g`'s raw pools."""
-    if hasattr(g, "check"):
-        g.check(ex)
+    _check_geometry(g, ex)
     return pool.scatter_pool_states(_resolve_pool_layout(g, ex), ex, *args, **kw)
 
 
@@ -151,8 +163,8 @@ class PallasWriter(CachePipe):
     """Pooled cache pipe (default split 3-stage; opt-in GPR or `fused_pool_io`)."""
 
     fused_pool_io: bool | str | None = None
-    max_b_low: int = 24
-    min_b_hi: int = 56
+    max_b_low: int = FUSED_POOL_IO_MAX_B
+    min_b_hi: int = FUSED_POOL_IO_MIN_B_HI
 
     def make_step(
         self,
