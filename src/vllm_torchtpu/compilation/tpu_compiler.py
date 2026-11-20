@@ -21,6 +21,7 @@ pipeline. Each shape bucket gets its own compiled executable.
 import contextlib
 import copy
 import dataclasses
+import gc
 import glob
 import hashlib
 import importlib.util
@@ -957,7 +958,7 @@ class TpuCompilerAdaptor(CompilerInterface):
                 key, save_path, entry, graph, was_wrapped, fingerprint
             ):
                 handle = (key, save_path, was_wrapped)
-
+        del entry
         # Under peer replay, other ranks of the host may be waiting for this
         # artifact: say so when it will not come, so they compile it now.
         if fingerprint is not None:
@@ -966,6 +967,25 @@ class TpuCompilerAdaptor(CompilerInterface):
                 self._mark_failed(key, fingerprint)
             else:
                 self._clear_failed(key)
+
+        # Run the artifact just saved, not the in-process compile result: the
+        # latter keeps device tensors alive once it has run, which a runnable
+        # rebuilt from the artifact does not. That HBM would otherwise count
+        # against the KV budget measured after the profile run, so a rank that
+        # compiled the profile bucket sizes a smaller KV cache than one that
+        # replayed or loaded it -- across the ranks of one start under peer
+        # replay, and between a cold start and the warm start after it, whose
+        # different block counts then give the backbone a different
+        # compile-cache key. The rebuilt runnable is what replaying ranks and
+        # warm starts run.
+        if handle is not None:
+            reloaded = self._replay(handle[1], graph, was_wrapped, fingerprint)
+            if reloaded is not None:
+                compiled_fn = (
+                    self._unwrap_compiled_fn(reloaded) if was_wrapped else reloaded
+                )
+                # The in-process result holds reference cycles.
+                gc.collect()
 
         # Offer this bucket to later traces of the same model, so a graph that
         # refuses it reuses this runnable instead of building a second
@@ -1021,8 +1041,20 @@ class TpuCompilerAdaptor(CompilerInterface):
             compiled_fn, entry = self._run_backend(graph, example_inputs)
             # Self-heal: overwrite the artifact vLLM will hand us again next
             # run. Without this a single stale entry recompiles forever.
-            if self.cache_dir is not None and not self._disable_cache:
-                self._save_handle(key, path, entry, graph, was_wrapped, fingerprint)
+            saved = (
+                self.cache_dir is not None
+                and not self._disable_cache
+                and self._save_handle(key, path, entry, graph, was_wrapped, fingerprint)
+            )
+            del entry
+            if saved:
+                # As in `compile`: run the artifact just saved, not the
+                # in-process result, so a start that recompiled a stale
+                # artifact holds no extra HBM either.
+                reloaded = self._replay(path, graph, was_wrapped, fingerprint)
+                if reloaded is not None:
+                    compiled_fn = reloaded
+                    gc.collect()
 
         if was_wrapped:
             compiled_fn = self._unwrap_compiled_fn(compiled_fn)
