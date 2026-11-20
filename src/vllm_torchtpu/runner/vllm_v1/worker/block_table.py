@@ -23,7 +23,6 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.distributed import get_dcp_group, get_pcp_group
-from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup import kernel_launcher
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
@@ -35,6 +34,8 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.utils import CpuGpuBuffer
+
+from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 

@@ -23,8 +23,9 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase
-from vllm.logger import init_logger
 from vllm.v1.outputs import ECConnectorOutput
+
+from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput

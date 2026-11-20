@@ -43,7 +43,6 @@ from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
 )
-from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
@@ -137,9 +136,13 @@ from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
+    AttentionGroup,
     EncoderTimingStats,
+    copy_kv_cache_blocks_inplace,
+    sanity_check_mm_encoder_outputs,
 )
 
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.vllm_v1.worker.block_table import SlotMappingMode
 from vllm_torchtpu.runner.vllm_v1.worker.ec_connector_model_runner_mixin import (
     ECConnectorModelRunnerMixin,
@@ -150,12 +153,6 @@ from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import (
 )
 from vllm_torchtpu.runner.vllm_v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin,
-)
-
-from .utils import (
-    AttentionGroup,
-    copy_kv_cache_blocks_inplace,
-    sanity_check_mm_encoder_outputs,
 )
 
 if TYPE_CHECKING:
@@ -974,6 +971,7 @@ class GPUModelRunner(
             reqs_to_add.append(req_state)
             # Track new requests for ngram_gpu full tensor copy
             if is_ngram_gpu:
+                # pyrefly: ignore[unbound-name]
                 ngram_gpu_new_reqs.append(req_state)
 
         # Update the states of the running/resumed requests.
@@ -1112,6 +1110,7 @@ class GPUModelRunner(
                 reqs_to_add.append(req_state)
                 # Track resumed requests for ngram_gpu full tensor copy
                 if is_ngram_gpu:
+                    # pyrefly: ignore[unbound-name]
                     ngram_gpu_new_reqs.append(req_state)
                 continue
 
@@ -1130,6 +1129,7 @@ class GPUModelRunner(
                 # according to num_computed_tokens.
                 end_token_index = max(
                     start_token_index,
+                    # pyrefly: ignore[unbound-name]
                     num_computed_tokens + len(new_token_ids),
                 )
                 if end_token_index > start_token_index:
@@ -1172,6 +1172,7 @@ class GPUModelRunner(
                 self.input_batch,
                 self.token_ids_gpu_tensor,
                 self.num_tokens_no_spec_gpu,
+                # pyrefly: ignore[unbound-name]
                 ngram_gpu_new_reqs,
                 self.device,
                 _pinned_idx_buf=self._ngram_pinned_idx_buf,
@@ -1693,6 +1694,7 @@ class GPUModelRunner(
                 should_sync_mrope_positions = True
                 old_mm_embeds_req = mm_embeds_req
                 mm_embeds_req, new_mrope_positions, new_delta = (
+                    # pyrefly: ignore[missing-attribute]
                     self.model.recompute_mrope_positions(
                         input_ids=req_state.prompt_token_ids,
                         multimodal_embeddings=mm_embeds_req,
@@ -1723,6 +1725,7 @@ class GPUModelRunner(
             self.model, (CUDAGraphWrapper, UBatchWrapper, BreakableCUDAGraphWrapper)
         ):
             # get raw model out of the cudagraph wrapper.
+            # pyrefly: ignore[missing-attribute]
             return self.model.unwrap()
         return self.model
 
@@ -1849,6 +1852,7 @@ class GPUModelRunner(
             Model output tensor
 
         """
+        # pyrefly: ignore[not-callable]
         return self.model(
             input_ids=input_ids,
             positions=positions,
@@ -1938,6 +1942,7 @@ class GPUModelRunner(
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
+            # pyrefly: ignore[missing-attribute]
             logits = self.model.compute_logits(prompt_hidden_states)
 
             # Get the "target" tokens for each index. For prompt at index i,

@@ -856,6 +856,9 @@ class TPUModelRunner(GPUModelRunner):
                 InputBatch as GPUInputBatch,
             )
 
+            # Monkeypatch: the replacement takes the batch positionally as `batch`,
+            # not as `self`, which pyrefly cannot match to the method type.
+            # pyrefly: ignore[bad-assignment]
             GPUInputBatch.get_pooling_metadata = get_pooling_metadata
             self.input_batch.get_pooling_metadata = lambda: get_pooling_metadata(
                 self.input_batch
@@ -1147,6 +1150,8 @@ class TPUModelRunner(GPUModelRunner):
         # TPU async-scheduling state (passed between execute_model and
         # sample_tokens, mirroring vLLM's async path).
         self.mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
+        # Narrows the inherited attribute to TPU's own ExecuteModelState.
+        # pyrefly: ignore[bad-override-mutable-attribute]
         self.execute_model_state: ExecuteModelState | None = None
         self._pre_async_results: AsyncPreResults | None = None
         self._min_tokens = min_tokens_mask.MinTokensTracker()
@@ -2914,6 +2919,8 @@ class TPUModelRunner(GPUModelRunner):
             return None
 
         input_batch.update_req_spec_token_ids = guarded
+        # Marker read back with getattr() above; InputBatch does not declare it.
+        # pyrefly: ignore[missing-attribute]
         input_batch._tpu_spec_room_guard = True
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
