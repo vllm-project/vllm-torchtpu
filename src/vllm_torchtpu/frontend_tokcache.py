@@ -105,9 +105,7 @@ class PrefixTokenCache:
         self._log_period = log_period_s
         self._lock = threading.Lock()
         self._entries: OrderedDict[int, _Entry] = OrderedDict()
-        self._index: dict[
-            bytes, tuple[int, int, int]
-        ] = {}  # key -> (eid, tok_idx, bidx)
+        self._index: dict[bytes, tuple[int, int]] = {}  # key -> (eid, tok_idx)
         self._next_eid = 0
         self._total_tokens = 0
         self.disabled = False
@@ -217,11 +215,11 @@ class PrefixTokenCache:
                     e = self._entries.get(v[0])
                     if e is not None:
                         self._entries.move_to_end(v[0])
-                        hit = (i, v[1], v[2], e)
+                        hit = (i, v[1], e)
                         break
         ids: list[int]
         if hit is not None:
-            bi, tok_idx, _, e = hit
+            bi, tok_idx, e = hit
             p = bpos[bi]
             if matched_entry is not None and p == p0:
                 suffix = suf_text
@@ -343,7 +341,7 @@ class PrefixTokenCache:
             self._total_tokens += e.ntok
             idx = self._index
             for j, k in enumerate(keys):
-                idx[k] = (eid, bounds[j][1], j)
+                idx[k] = (eid, bounds[j][1])
             while self._entries and (
                 len(self._entries) > self._max_entries
                 or self._total_tokens > self._max_tokens

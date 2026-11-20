@@ -31,6 +31,7 @@ from tokenizers import (
 )
 from transformers import PreTrainedTokenizerFast
 from transformers.convert_slow_tokenizer import bytes_to_unicode
+from vllm.logger import _print_warning_once
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine import detokenizer as vllm_detok
@@ -357,8 +358,6 @@ def test_repeated_tail_errors_of_one_type_warn_once(monkeypatch, detok_cls, tok)
     """Through vLLM's own warning_once: two failing requests with different
     messages of one error type log one warning, and the warning's arguments
     hold no exception (warning_once caches them)."""
-    from vllm.logger import _print_warning_once
-
     fast = PreTrainedTokenizerFast(tokenizer_object=tok)
     prompt = tok.encode(" ".join(CORPUS)).ids
     cont = tok.encode(CORPUS[0]).ids
