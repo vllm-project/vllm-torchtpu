@@ -100,6 +100,11 @@ _SMALL_BATCH_PAGES_PER_STEP = 32
 # (standalone bench j-8228a157: 8 tokens 4.0 vs 5.2 us, 48 tokens 4.8 vs 6.6,
 # 128 tokens 9.0 vs 7.9).
 _PLAN_MAX_TOKENS = 64
+# A pair's prefill-sized steps pass the attention their own and the peer's
+# query heads as two arrays and swap back the peer's partials by a permute
+# (`attend_and_merge`): no concatenated copy of the queries (a fusion of
+# ~20 us per layer at 8K tokens in the c4 twin) and no all-to-all.
+SPLIT_PAIR_QUERIES = True
 
 
 def rank_array(rank: int | jax.Array) -> jax.Array:
@@ -997,7 +1002,7 @@ def msa_attend_dcp(
     leading axis (`ops.msa.merge_head_partials`), or the merge's all-to-all
     sends each rank its block (`attend_and_merge`).
     """
-    num_tokens = q.shape[1 if q_head_major else 0]
+    num_tokens = jax.tree.leaves(q)[0].shape[1 if q_head_major else 0]
     rank = rank_array(rank)[0]
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
@@ -1151,8 +1156,14 @@ def _merge_pair_kernel(lse_ref, parts_ref, *rest, rotated):
     ``parts_ref [2, Hl, Bt, D]``, (``hadamard [D, D]``), ``o_ref [Bt, Hl *
     D]``."""
     o_ref = rest[-1]
-    _, num_heads, _, head_dim = parts_ref.shape
-    lse0, lse1 = lse_ref[0], lse_ref[1]
+    if isinstance(parts_ref, tuple):  # own partial and the peer's, apart
+        (lse0_ref, lse1_ref), (p0_ref, p1_ref) = lse_ref, parts_ref
+        num_heads, _, head_dim = p1_ref.shape
+        lse0, lse1 = lse0_ref[...], lse1_ref[...]
+    else:
+        _, num_heads, _, head_dim = parts_ref.shape
+        lse0, lse1 = lse_ref[0], lse_ref[1]
+        p0_ref, p1_ref = parts_ref.at[0], parts_ref.at[1]
     # `_merge_partials_kernel`'s weight of rank 0, lane-dense.
     peak = jnp.maximum(lse0, lse1)
     peak = jnp.where(jnp.isinf(peak), 0.0, peak)
@@ -1160,8 +1171,8 @@ def _merge_pair_kernel(lse_ref, parts_ref, *rest, rotated):
     weight = jnp.exp(lse0 - total)
     weight = jnp.where(weight > 0, weight, 0.0)  # NaN -> 0
     for h in range(num_heads):
-        p0 = parts_ref[0, h].astype(jnp.float32)
-        p1 = parts_ref[1, h].astype(jnp.float32)
+        p0 = p0_ref[h].astype(jnp.float32)
+        p1 = p1_ref[h].astype(jnp.float32)
         # The head's weights across the lanes as the transpose of their
         # sublane broadcast: AOT 634 bundles per 256 tokens, against 777 for
         # lane broadcasts of a [Bt, Hl] transpose and 1,137 for
@@ -1214,6 +1225,58 @@ def merge_pair_partials(
         interpret=interpret,
         name="minimax_m3_msa_dcp_merge_pair_partials",
     )(lse.astype(jnp.float32), parts, *([hadamard] if rotated else []))
+
+
+def merge_split_partials(
+    out: jax.Array,
+    peer: jax.Array,
+    lse: jax.Array,
+    peer_lse: jax.Array,
+    hadamard: jax.Array | None = None,
+    *,
+    block_tokens: int = _PARTIALS_BLOCK_TOKENS,
+    interpret: bool = False,
+) -> jax.Array:
+    """`merge_pair_partials` of this rank's partial ``out [2 Hl, T, D]``
+    (its own heads first: their rows are read in place) and the peer's
+    partial of those heads ``peer [Hl, T, D]``, with ``lse [2 Hl, T]`` and
+    ``peer_lse [Hl, T]`` f32 -> ``[T, Hl * D]``: no stacking copy of the two."""
+    num_heads, num_tokens, head_dim = peer.shape
+    block_t = max(1, min(num_tokens, block_tokens))
+    rotated = hadamard is not None
+
+    def kernel(lse0_ref, lse1_ref, p0_ref, p1_ref, *rest):
+        _merge_pair_kernel(
+            (lse0_ref, lse1_ref), (p0_ref, p1_ref), *rest, rotated=rotated
+        )
+
+    heads = pl.BlockSpec((num_heads, block_t, head_dim), lambda i: (0, i, 0))
+    return pl.pallas_call(
+        kernel,
+        grid=(pl.cdiv(num_tokens, block_t),),
+        in_specs=[
+            pl.BlockSpec((num_heads, block_t), lambda i: (0, i)),
+            pl.BlockSpec((num_heads, block_t), lambda i: (0, i)),
+            heads,
+            heads,
+            *(
+                [pl.BlockSpec((head_dim, head_dim), lambda i: (0, 0))]
+                if rotated
+                else []
+            ),
+        ],
+        out_specs=pl.BlockSpec((block_t, num_heads * head_dim), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, num_heads * head_dim), out.dtype),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_merge_pair_partials",
+    )(
+        lse.astype(jnp.float32),
+        peer_lse.astype(jnp.float32),
+        out,
+        peer,
+        *([hadamard] if rotated else []),
+    )
 
 
 def _gather_heads(q: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Array:
@@ -1461,6 +1524,7 @@ def attend_and_merge(
     # step's partials by XLA's all-to-all, which writes them in place. The
     # candidates' bits ride the query permute as one more 16-bit head row.
     small = dcp == 2 and num_tokens <= DCP_SMALL_BATCH_TOKENS and 4 * topk <= head_dim
+    pair = dcp == 2 and not small and SPLIT_PAIR_QUERIES
     if small:
         # Own heads and candidates first, the peer's second: every slice is
         # static (rank-indexed updates and slices of the permute buffers were
@@ -1471,6 +1535,11 @@ def attend_and_merge(
         # One permute carries the queries and the candidates.
         peer_q, peer_candidates = _swap_with_row(q, candidates, axis)
         q_all = jnp.concatenate([q, peer_q])
+    elif pair:
+        # Own heads first, the peer's second, as two arrays the attention
+        # reads in place (no concatenated copy); the partials of the peer's
+        # heads go back to it by one permute (the merge commutes).
+        q_all = (q, jax.lax.ppermute(q, axis, [(0, 1), (1, 0)]))
     else:
         q_all = _gather_heads(q, rank, axis, dcp)
     if small and use_decode_plan(num_tokens, topk):
@@ -1522,6 +1591,18 @@ def attend_and_merge(
         parts = jnp.stack([out[:num_heads], peer_out])
         lses = jnp.stack([lse[:num_heads].T, peer_lse])
         return merge_partials(parts, lses, hadamard, interpret=interpret)
+    if pair:
+        swap = functools.partial(
+            jax.lax.ppermute, axis_name=axis, perm=[(0, 1), (1, 0)]
+        )
+        return merge_split_partials(
+            out,
+            swap(out[num_heads:]),
+            lse,
+            swap(lse[num_heads:]),
+            hadamard,
+            interpret=interpret,
+        )
     # Block r of each result came from rank r: its partial of this rank's heads.
     parts = out.reshape(dcp, num_heads, num_tokens, head_dim)
     lses = lse.reshape(dcp, num_heads, num_tokens)

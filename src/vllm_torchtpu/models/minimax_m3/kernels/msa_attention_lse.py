@@ -176,12 +176,13 @@ def _kernel(
         local_limit_ref=local_limit_ref,
     ):
         store_out = None
+        q_refs = q_ref if isinstance(q_ref, tuple) else (q_ref,)
         if tiles_per_step > 1:
             tile = msa_attention._meta_tile(work_meta_ref[w], groups_per_tile)
-            bq = q_ref.shape[1] // tiles_per_step
+            bq = q_refs[0].shape[1] // tiles_per_step
             start = tile % tiles_per_step * bq
             rows = pl.ds(pl.multiple_of(start, bq), bq)
-            q_ref = q_ref.at[:, rows, :]
+            q_refs = tuple(r.at[:, rows, :] for r in q_refs)
             packed = _merged_store_rows(bq, o_ref.shape[0], o_ref.dtype)
             if packed > 1:
                 store_out = functools.partial(
@@ -194,7 +195,14 @@ def _kernel(
             lse_ref = lse_ref.at[:, pl.ds(tile % tiles_per_step, 1)]
         meta = work_meta_ref[w]
         count = work_count_ref[w]
-        num_heads, block_q, head_dim = q_ref.shape
+        _, block_q, head_dim = q_refs[0].shape
+        num_heads = sum(r.shape[0] for r in q_refs)
+
+        def load_q():  # [H, Bq, D]: a pair of query refs holds the heads in order
+            if len(q_refs) == 1:
+                return q_refs[0][...]
+            return jnp.concatenate([r[...] for r in q_refs], axis=0)
+
         rows_per_page, packing, row_width = buf_ref.shape[3:]
         page_size = rows_per_page * (msa_fp4.TOKENS_PER_WORD if fp4 else packing)
         # 8-bit pages of `attend` reach the MXU without an unpack.
@@ -473,7 +481,7 @@ def _kernel(
                     masks.append(row_slots < jnp.tile(limit, (1, num_heads)))
             k = jnp.concatenate(keys, axis=0)
             v = jnp.concatenate(values, axis=0)
-            q = q_ref[...].reshape(num_heads * block_q, head_dim)
+            q = load_q().reshape(num_heads * block_q, head_dim)
             if not fp4:  # 4-bit keys carry the scale
                 q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
             if mxu_mask:  # [q | onehot(token)]
@@ -600,7 +608,7 @@ def _kernel(
             mask = jnp.concatenate([mask] * num_heads, axis=0)
 
             scale = sm_scale * _LOG2_E
-            q = q_ref[...].reshape(num_heads * block_q, head_dim)
+            q = load_q().reshape(num_heads * block_q, head_dim)
             if not fp4:
                 q = (q.astype(jnp.float32) * scale).astype(q.dtype)
             s = jax.lax.dot_general(
@@ -738,7 +746,12 @@ def _attention_call(
     ``calls > 1`` runs that many such calls in one grid, back to back:
     ``head`` then holds each call's pair (``int32[2 * calls]``) and
     ``packed`` each call's work list, end to end; `out` must be None."""
-    num_q_heads, num_tokens, head_dim = q.shape
+    pair = isinstance(q, tuple)  # two head-major arrays holding the heads in order
+    qs = q if pair else (q,)
+    if pair and (calls > 1 or len({x.shape for x in qs}) > 1):
+        raise ValueError("a query pair serves one call of two equal halves")
+    num_q_heads = sum(x.shape[0] for x in qs)
+    _, num_tokens, head_dim = qs[0].shape
     num_heads = q_per_head
     topk = selected.shape[2]
     packed, tiles, tiles_per_step, *limits = work  # limits: `_page_limits`
@@ -759,6 +772,8 @@ def _attention_call(
         unions, metas, counts, starts = (
             packed_ref.at[pl.ds(base + at, n)] for at, n in sections
         )
+        if pair:  # tile_offset, the query pair, then the rest
+            refs = (refs[0], (refs[1], refs[2])) + refs[3:]
         return _kernel(
             unions,
             metas,
@@ -806,8 +821,16 @@ def _attention_call(
         num_scalar_prefetch=4,
         grid=(calls * num_steps,),
         in_specs=[
-            pl.BlockSpec(
-                (num_heads, tiles_per_step * block_q, head_dim), head_major_block
+            *(
+                pl.BlockSpec(
+                    (
+                        x.shape[0] * num_heads // num_q_heads,
+                        tiles_per_step * block_q,
+                        head_dim,
+                    ),
+                    head_major_block,
+                )
+                for x in qs
             ),
             pl.BlockSpec((None, tiles_per_step * block_q, topk), head_major_block),
             pl.BlockSpec((tiles_per_step * block_q, 1), tile_block),
@@ -833,7 +856,7 @@ def _attention_call(
         )
         + spread,
     )
-    num_inputs = 4 + 5 + len(scale_inputs) + len(limits)
+    num_inputs = 4 + 4 + len(qs) + len(scale_inputs) + len(limits)
     return pl.pallas_call(
         functools.partial(
             kernel,
@@ -849,7 +872,7 @@ def _attention_call(
         ),
         grid_spec=grid_spec,
         out_shape=[
-            jax.ShapeDtypeStruct((num_q_heads, num_tokens, head_dim), q.dtype),
+            jax.ShapeDtypeStruct((num_q_heads, num_tokens, head_dim), qs[0].dtype),
             jax.ShapeDtypeStruct(
                 (
                     num_q_heads // num_heads,
@@ -876,7 +899,7 @@ def _attention_call(
         page_table,
         head,
         tile_offset,
-        q,
+        *qs,
         selected,
         local_page,
         local_limit,
@@ -1285,11 +1308,16 @@ def _chunked_call(
     emitted twice per call site (the first call creates the output) rather
     than once per head and chunk. With `q_head_major`, q comes ``[G * Hg, T,
     D]``, as the kernel reads it."""
-    if not q_head_major:
-        q = q.transpose(1, 0, 2)
-    num_q_heads, num_tokens, _ = q.shape
+    if isinstance(q, tuple):
+        if not q_head_major:
+            raise ValueError("a query pair comes head-major")
+        num_q_heads, num_tokens = sum(x.shape[0] for x in q), q[0].shape[1]
+    else:
+        if not q_head_major:
+            q = q.transpose(1, 0, 2)
+        num_q_heads, num_tokens, _ = q.shape
     num_heads = selected.shape[1]
-    if num_tokens == 0:
+    if num_tokens == 0 and not isinstance(q, tuple):
         if head_major:
             return q, jnp.zeros((num_q_heads, 0), jnp.float32)
         return q.transpose(1, 0, 2), jnp.zeros((0, num_q_heads), jnp.float32)
@@ -1304,10 +1332,11 @@ def _chunked_call(
         scale_cache=scale_cache,
         scale_rows=scale_rows,
     )
+    dtype = (q[0] if isinstance(q, tuple) else q).dtype
     step, num_chunks, pad, selected, (packed, tiles_per_step) = _chunk_work(
-        selected, num_q_heads, q.dtype, block_q, pages_per_step, scale_rows is not None
+        selected, num_q_heads, dtype, block_q, pages_per_step, scale_rows is not None
     )
-    q = jnp.pad(q, ((0, 0), (0, pad), (0, 0)))
+    q = jax.tree.map(lambda x: jnp.pad(x, ((0, 0), (0, pad), (0, 0))), q)
     local_page = jnp.pad(local_page, (0, pad), constant_values=-1)[:, None]
     local_limit = jnp.pad(local_limit, (0, pad))[:, None]
     limits = None
@@ -1486,7 +1515,9 @@ def _adaptive_call(
     whole wide tiles. Both tile sizes give the same results up to the order
     of the softmax sums."""
     num_tokens = selected.shape[0]
-    kind = _wide_tile_kind(kv_cache, scale_cache, q.shape[2])
+    kind = _wide_tile_kind(kv_cache, scale_cache, jax.tree.leaves(q)[0].shape[2])
+    if isinstance(q, tuple):
+        kind = None  # query pairs take the regular tile
     call = functools.partial(
         _chunked_call,
         kv_cache=kv_cache,
@@ -1551,9 +1582,13 @@ def _adaptive_call(
 def _pad_tokens(q, selected, local_page, local_limit, block_q, q_head_major=False):
     pad = -selected.shape[0] % block_q
     if pad:
-        widths = [(0, 0)] * q.ndim
-        widths[1 if q_head_major else 0] = (0, pad)
-        q = jnp.pad(q, widths)
+
+        def pad_q(x):
+            widths = [(0, 0)] * x.ndim
+            widths[1 if q_head_major else 0] = (0, pad)
+            return jnp.pad(x, widths)
+
+        q = jax.tree.map(pad_q, q)
         selected = jnp.pad(
             selected, ((0, pad),) + ((0, 0),) * (selected.ndim - 1), constant_values=-1
         )
@@ -1618,7 +1653,7 @@ def msa_sparse_attention_lse(
     With `head_major`, the results come back head-major: ``out [H, T, D]``,
     ``lse [H, T]``; with `q_head_major`, q comes head-major, ``[H, T, D]``.
     """
-    num_tokens, head_dim = selected.shape[0], q.shape[2]
+    num_tokens, head_dim = selected.shape[0], jax.tree.leaves(q)[0].shape[2]
     msa_attention.check_cache(kv_cache, scale_cache)
     _check_rows(kv_cache, head_dim, head)
     q, selected, local_page, local_limit = _pad_tokens(
