@@ -2027,6 +2027,9 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             )
 
     def patched_forward(self, input_):
+        replica_rows = replicated_embedding.decode_lookup(self, input_)
+        if replica_rows is not None:
+            return replica_rows
         input_mask = None
         if self.tp_size > 1:
             masked_input, input_mask = vpe.get_masked_input_and_mask(
@@ -2064,9 +2067,10 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             from vllm.distributed import tensor_model_parallel_all_reduce
 
             output = tensor_model_parallel_all_reduce(output_parallel)
-            # Avoid serving decode buckets from the replicated table: short
+            # Avoid an unmasked lookup in the replicated table here: short
             # prompts prefilled in decode buckets came back with wrong tokens
-            # through it. Keep the table lifted for bucket hand-over.
+            # through it (decode_lookup above masks out-of-vocabulary ids).
+            # Keep the table lifted for bucket hand-over.
             return replicated_embedding.retain_table(self, output)
         return output_parallel
 

@@ -1009,7 +1009,10 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
         embed_rs
         and envs.TPU_EMBED_REPLICATED
         and replicated_embedding.arm_if_eligible(
-            backbone.embed_tokens, tp, functools.partial(_gather, dim=0)
+            backbone.embed_tokens,
+            tp,
+            functools.partial(_gather, dim=0),
+            decode=envs.TPU_EMBED_REPLICATED_DECODE,
         )
     )
     setattr(backbone, KEEP_ATTR, True)

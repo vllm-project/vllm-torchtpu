@@ -37,6 +37,7 @@ from vllm.model_executor.layers import vocab_parallel_embedding as vpe
 from vllm_torchtpu.utils import fresh_buffer
 
 FULL_WEIGHT_ATTR = "_tpu_replicated_embedding_weight"
+DECODE_LOOKUP_ATTR = "_tpu_replicated_embedding_decode"
 SHARD_BOUND_NAMES = (
     "org_vocab_start_index",
     "org_vocab_end_index",
@@ -89,10 +90,14 @@ def arm_if_eligible(
     embed: Any,
     tp: int,
     all_gather_rows: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    decode: bool = False,
 ) -> bool:
     if not can_replicate(embed, tp):
         return False
     arm(embed, all_gather_rows)
+    if decode:
+        enable_decode_lookup(embed)
     return True
 
 
@@ -114,6 +119,33 @@ def retain_table(embed: object, out: torch.Tensor) -> torch.Tensor:
     )
 
     return _retain_buffers(out, full)
+
+
+def enable_decode_lookup(embed: object) -> None:
+    setattr(embed, DECODE_LOOKUP_ATTR, True)
+
+
+def decode_lookup(embed: Any, token_ids: torch.Tensor) -> torch.Tensor | None:
+    """Rows of `token_ids` from the replica, zero where the shards own no row.
+
+    Matches the masked vocab-parallel lookup + all-reduce: ids outside
+    `[0, org_vocab_size)` (negative, or in the padded tail) give zero rows.
+    None unless `embed` is armed and `enable_decode_lookup` was called.
+    """
+    full = full_weight(embed)
+    if full is None or not getattr(embed, DECODE_LOOKUP_ATTR, False):
+        return None
+    ids = token_ids.long()
+    in_vocab = (ids >= 0) & (ids < embed.org_vocab_size)
+    rows = torch.nn.functional.embedding(ids * in_vocab, full)
+    rows = rows.masked_fill(~in_vocab.unsqueeze(-1), 0)
+    from vllm_torchtpu.layers.adapter.attention import (  # noqa: PLC0415 -- same cycle as retain_table
+        _retain_buffers,
+    )
+
+    # The sequence-parallel buckets lift the shard operands; lift them here
+    # too so both traces hand buckets over with the same inputs.
+    return _retain_buffers(rows, *shard_operands(embed))
 
 
 def shard_operands(embed: Any) -> tuple[torch.Tensor | None, ...]:

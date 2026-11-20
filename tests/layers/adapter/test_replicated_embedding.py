@@ -334,3 +334,72 @@ def test_should_not_touch_the_trace_when_the_table_is_not_replicated():
         got = rep.retain_table(embed, out)
 
     assert got is out
+
+
+DECODE_IDS = [-1, 28, ORG_VOCAB, 31, 0, 13]  # 29..31 are padded tail rows
+
+
+def _decode_forward(embed, ids):
+    retained = []
+
+    def _retain(out, *buffers):
+        retained.extend(id(b) for b in buffers)
+        return out
+
+    def _no_all_reduce(partial):
+        raise AssertionError("decode lookup from the replica must not all-reduce")
+
+    with (
+        patch.object(
+            vllm.distributed,
+            "tensor_model_parallel_all_reduce",
+            side_effect=_no_all_reduce,
+        ),
+        patch.object(attention, "_retain_buffers", side_effect=_retain),
+    ):
+        got = embed(ids)
+    return got, retained
+
+
+def test_should_zero_out_of_vocab_rows_when_decode_reads_the_replica():
+    shards = _shards(_padded_table())
+    ids = torch.tensor(DECODE_IDS, dtype=torch.int32)
+    embed = _arm_rank(shards, rank=1)
+    rep.enable_decode_lookup(embed)
+
+    got, retained = _decode_forward(embed, ids)
+
+    torch.testing.assert_close(got, _shard_sum_reference(shards, ids), rtol=0, atol=0)
+    assert torch.count_nonzero(got[[0, 2, 3]]) == 0
+    assert id(embed.weight) in retained
+
+
+def test_should_differ_from_the_plain_replica_lookup_on_padded_tail_ids():
+    shards = _shards(_padded_table())
+    tail_ids = torch.tensor([ORG_VOCAB, 31], dtype=torch.int32)
+    embed = _arm_rank(shards, rank=0)
+
+    plain = rep.lookup(rep.full_weight(embed), tail_ids)
+
+    assert not torch.equal(plain, _shard_sum_reference(shards, tail_ids))
+
+
+def test_should_not_read_the_replica_in_decode_until_enabled():
+    embed = _arm_rank(_shards(_padded_table()), rank=2)
+
+    assert rep.decode_lookup(embed, torch.tensor([3], dtype=torch.int32)) is None
+
+
+@pytest.mark.parametrize("decode", [True, False])
+def test_should_serve_decode_from_the_replica_only_when_armed_for_decode(decode):
+    shards = _shards(_padded_table())
+    ids = torch.tensor([ORG_VOCAB, 4], dtype=torch.int32)
+
+    rep.arm_if_eligible(
+        shards[0],
+        TP,
+        lambda _shard: torch.cat([s.weight for s in shards], 0),
+        decode=decode,
+    )
+
+    assert (rep.decode_lookup(shards[0], ids) is not None) is decode

@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     TPU_MOE_PREFILL_SP_SHARED_GROUP: int = 1
     TPU_MOE_PREFILL_SP_FP8_WIRE: bool = True
     TPU_EMBED_REPLICATED: bool = True
+    TPU_EMBED_REPLICATED_DECODE: bool = True
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -1235,6 +1236,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reduce-scatter (prefill) / all-reduce (decode) of shard partials
     # (`layers/adapter/replicated_embedding.py`; + the table per rank).
     "TPU_EMBED_REPLICATED": env_bool("TPU_EMBED_REPLICATED", default=True),
+    # With TPU_EMBED_REPLICATED armed: decode buckets also read the replica
+    # (rows zeroed outside the vocabulary, as the masked shard lookup gives)
+    # instead of the masked shard lookup + all-reduce.
+    "TPU_EMBED_REPLICATED_DECODE": env_bool(
+        "TPU_EMBED_REPLICATED_DECODE", default=True
+    ),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
