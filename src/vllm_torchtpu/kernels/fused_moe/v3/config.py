@@ -106,8 +106,10 @@ class Config:
         layer take, per call, the largest count up to
         TABLES_BLOCKS_PER_STEP_MAX that pads no further than the gather's
         own unit does.
-      vmem_fraction: the share of the chip's VMEM the kernels plan for
-        (the weight-slot fit, each program's limit).
+      vmem_fraction: the share of the chip's VMEM the FFN kernel plans for:
+        its weight-slot fit and its VMEM limit. The other programs need far
+        less: their limits come from their own buffers or the compiler's
+        default.
       activation_block: how each matmul's input is rounded to fp8: 0 is
         one scale per token row over the whole width; a multiple of 128
         that divides hidden and inter is one scale per that many values
