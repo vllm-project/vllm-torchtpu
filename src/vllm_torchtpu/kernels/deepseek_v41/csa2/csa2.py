@@ -14,6 +14,43 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
+def _repack_main_words(words):
+    # One vperm per VREG: output word 4*r+g packs rows 4*r..4*r+3
+    # from column group g. Keep groups interleaved for strided VMEM loads.
+    row = lax.broadcasted_iota(jnp.uint32, words.shape, 0)
+    selectors = (
+        (row >> 2) * jnp.uint32(0x04040404)
+        + (row & 3) * jnp.uint32(0x08080808)
+        + jnp.uint32(0x03020100)
+    )
+    source_byte = (selectors & jnp.uint32(0x18181818)) >> jnp.uint32(3)
+    source_row = (selectors & jnp.uint32(0x07070707)) << jnp.uint32(2)
+    indices = pltpu.bitcast(source_byte | source_row, jnp.uint8)
+    values = jnp.take_along_axis(
+        pltpu.bitcast(words, jnp.uint8),
+        indices,
+        axis=0,
+        mode="promise_in_bounds",
+        wrap_negative_indices=False,
+    )
+    return pltpu.bitcast(values, jnp.int32)
+
+
+def _load_main_tile(ref, i, rows, columns):
+    ref = ref.at[i]
+    groups = range(columns.start // 128, (columns.start + columns.size) // 128)
+    return jnp.concatenate(
+        [
+            pltpu.bitcast(
+                ref[pl.ds(rows.start + group, rows.size // 4, 4), :],
+                jnp.float8_e4m3fn,
+            )
+            for group in groups
+        ],
+        axis=1,
+    )
+
+
 class _UniformTiles:
     # Metadata-only view used after the uniform-boundary guard has passed.
     def __init__(self, bq):
@@ -481,31 +518,16 @@ def _csa2_kernel_impl(
                 )
 
         def main_unpack(indices):
-            # Split each 64-row read into 32-row FP8 tiles shared by QK and PV.
+            # Repack once for QK and PV; each strided read selects a column group.
             unpack_rows = 64
             for i in indices:
                 for row in range(0, 512, unpack_rows):
                     rows = pl.ds(row, unpack_rows)
                     words = cast(jax.Ref, main_cache_ref)[i, rows, :]
-                    for subrow in range(0, unpack_rows, 32):
-                        subwords = words[pl.ds(subrow, 32)]
-                        # Byte g of each word is column group g. Truncate to the
-                        # 16-bit halves once; a 32-bit shift of a packed half
-                        # moves byte 1 of each element into its low byte.
-                        halves = (
-                            subwords.astype(jnp.uint16),
-                            lax.shift_right_logical(subwords, 16).astype(jnp.uint16),
+                    for subrow in range(0, unpack_rows, 8):
+                        main_kv_ref[i, pl.ds(row + subrow, 8), :] = _repack_main_words(
+                            words[pl.ds(subrow, 8)]
                         )
-                        for group in range(4):
-                            half = halves[group // 2]
-                            if group % 2:
-                                pairs = pltpu.bitcast(half, jnp.uint32)
-                                pairs = lax.shift_right_logical(pairs, jnp.uint32(8))
-                                half = pltpu.bitcast(pairs, jnp.uint16)
-                            bits = half.astype(jnp.uint8)
-                            values = lax.bitcast_convert_type(bits, jnp.float8_e4m3fn)
-                            subrows = pl.ds(row + subrow, 32)
-                            main_kv_ref[i, subrows, pl.ds(group * 128, 128)] = values
 
         def main_qk_compute(indices):
             tiles = [(r, i, block) for r, i in enumerate(indices) for block in range(2)]
@@ -516,7 +538,10 @@ def _csa2_kernel_impl(
                 for mxu in range(2):
                     ns = pl.ds(mxu * 256, 256)
                     pltpu.matmul_push_rhs(
-                        main_kv_ref[i, ns, ks], tile_index % 2, mxu, transpose=True
+                        _load_main_tile(main_kv_ref, i, ns, ks),
+                        tile_index % 2,
+                        mxu,
+                        transpose=True,
                     )
 
             # Alternate two RHS staging slots across tile and token boundaries.
@@ -571,7 +596,10 @@ def _csa2_kernel_impl(
                 for mxu in range(2):
                     ns = pl.ds(mxu * 256, 256)
                     pltpu.matmul_push_rhs(
-                        main_kv_ref[i, ks, ns], tile_index % 2, mxu, transpose=False
+                        _load_main_tile(main_kv_ref, i, ks, ns),
+                        tile_index % 2,
+                        mxu,
+                        transpose=False,
                     )
 
             # Alternate two RHS staging slots across tile and token boundaries.
@@ -1057,7 +1085,7 @@ def csa2(
                     banks[0].dtype,
                 ),
                 pltpu.VMEM((2, bq, heads, 512), jnp.bfloat16),
-                pltpu.VMEM((bq, 512, 512), jnp.float8_e4m3fn) if has_main else None,
+                pltpu.VMEM((bq, 512, 128), jnp.int32) if has_main else None,
                 pltpu.VMEM((2, 256, 512), jnp.bfloat16),
                 pltpu.VMEM((bq, heads, 256), jnp.float32),
                 pltpu.VMEM((bq, heads, 512), jnp.bfloat16) if has_main else None,
