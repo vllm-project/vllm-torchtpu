@@ -170,6 +170,41 @@ def test_select_top_k_routing_message_marks_rows_past_the_valid_count(interpret)
     assert not np.asarray(weights)[valid:].any()
 
 
+@pytest.mark.parametrize("drop_nan_rows", [False, True], ids=["keep", "drop_nan"])
+def test_select_top_k_routing_message_routes_slots_past_finite_scores_nowhere(
+    interpret, drop_nan_rows
+):
+    """In the routing message, a slot with no finite score left carries the
+    unrouted index `num_experts`, as a row that routes nowhere does: a real
+    expert there would be a second pair of the token for an expert already
+    picked, which the tables' one-pair-per-token-and-expert bound does not
+    allow for. Row 5 has two finite logits and -inf elsewhere, row 9 two
+    finite logits and NaN elsewhere (routed nowhere under drop_nan_rows)."""
+    rows, experts, top_k = 128, 64, 4
+    logits = _logits(rows, experts, seed=4)
+    logits[5, 2:] = -np.inf
+    logits[9, 2:] = np.nan
+    weights, message = select_kernel.select_top_k(
+        jnp.asarray(logits),
+        top_k=top_k,
+        block_rows=LANES,
+        renormalize=True,
+        drop_nan_rows=drop_nan_rows,
+        message_rows=rows * top_k // LANES,
+    )
+    by_slot = np.asarray(message).reshape(top_k, rows)
+    two_finite = [5] if drop_nan_rows else [5, 9]
+    for r in two_finite:
+        np.testing.assert_array_equal(by_slot[:2, r], np.argsort(-logits[r, :2]))
+        assert (by_slot[2:, r] == experts).all(), by_slot[:, r]
+    if drop_nan_rows:
+        assert (by_slot[:, 9] == experts).all()
+    full = [r for r in range(rows) if r not in (5, 9)]
+    _, want_indices = jax.lax.top_k(jnp.asarray(logits[full]), top_k)
+    np.testing.assert_array_equal(by_slot[:, full].T, np.asarray(want_indices))
+    assert not np.asarray(weights)[two_finite, 2:].any()
+
+
 # ---- weighted_sum ----
 
 

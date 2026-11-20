@@ -66,7 +66,8 @@ def _select_body(
     """One block of rows: the top_k by repeated max-and-mask.
 
     With `renormalize` the weights are the top_k-wide softmax of the
-    selected logits, else the selected values themselves. With `message_rows`
+    selected logits, else the selected values themselves; either way a slot
+    with no finite score left gets weight zero. With `message_rows`
     the indices go out slot-major as the routing message's index half (word
     k * rows + r is row r's slot k): each block's [rows, top_k] index tile
     is written column by column into VMEM, transposed a lane block of rows
@@ -107,6 +108,14 @@ def _select_body(
         # The lowest matching column. A non-matching column reads as the
         # last expert, so every index returned is a real expert.
         index = jnp.min(jnp.where(is_max, expert_iota, num_experts - 1), axis=1)
+        if message_rows and k > 0:
+            # A slot past the row's finite scores lands on a masked column
+            # (an expert already picked, or a NaN logit's): it routes
+            # nowhere, as a row that routes nowhere does below (which covers
+            # slot 0: its score is finite whenever the row routes).
+            index = jnp.where(
+                row_max[:, 0] > jnp.float32(UNROUTABLE_MAX), index, num_experts
+            )
         if renormalize:
             assert selected is not None and slot_iota is not None
             selected = jnp.where(slot_iota == k, row_max, selected)
@@ -180,8 +189,10 @@ def select_top_k(
     scores. `drop_nan_rows` (a row with any NaN score routes nowhere) needs
     `renormalize`; raw scores refuse it. With
     `message_rows` the indices come back as the routing message's index half,
-    [message_rows, LANES] slot-major; the rows after the real pairs up to
-    `pair_rows` (the index rows when None) carry the unrouted index. The
+    [message_rows, LANES] slot-major, and a slot that routes nowhere carries
+    the unrouted index `num_experts`; the rows after the real pairs up to
+    `pair_rows` (the index rows when None) carry it too. Without it, such a
+    slot's index is a real expert, under weight zero. The
     scores and both outputs are pinned to HBM so the blocks stream through
     VMEM from here.
     """
