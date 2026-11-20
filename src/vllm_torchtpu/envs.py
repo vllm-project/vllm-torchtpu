@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_DCP_PREFILL_TOKEN_PARALLEL: bool = True
+    TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT: bool = True
     TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP: int = 8
     TPU_DCP_TP_IN_BRANCH_QB_MLA: bool = True
     TPU_DCP_TP_PREFILL_LOCAL_OPROJ: bool = True
@@ -873,6 +874,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # linears do, instead of bf16 against per-shard dequantized weights.
     "TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES": env_bool(
         "TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES", default=True
+    ),
+    # With TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES: keep W_UV outputs in head-major
+    # [H, R, V] layout across the cap switch and run a single-pass Pallas VMEM
+    # shift+FP8-quant+pair-split kernel inside the attention shard_map, avoiding
+    # the [H, R, V] -> [R, H*V] HBM transpose and inter-shard_map barrier.
+    "TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT": env_bool(
+        "TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT", default=True
     ),
     # With TPU_DCP_TP_PREFILL_LOCAL_OPROJ and TPU_MOE_PREFILL_SEQUENCE_PARALLEL:
     # keep kv_lora sequence-sharded across kv_a_layernorm, k_pe RoPE, and FP8

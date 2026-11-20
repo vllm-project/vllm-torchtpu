@@ -709,7 +709,7 @@ def build_attention_op(
         )
         if w_o is not None:
             assert s_o is not None and w_uv is not None and rank_ids is not None
-            _, _, tail_out, lead_v = dcp_token_parallel.sparse_mla_attention_with_lead(
+            _, _, projected = dcp_token_parallel.sparse_mla_attention_with_lead_oproj(
                 layout,
                 mesh,
                 DCP_AXIS_NAME,
@@ -728,6 +728,8 @@ def build_attention_op(
                 write_kv=None,
                 attend=attend,
                 w_uv=w_uv,
+                w_o=w_o,
+                w_o_scale=s_o,
                 rank_ids=rank_ids,
                 q_own_rows=q_replicated,
                 read_pages=read_pages,
@@ -735,21 +737,9 @@ def build_attention_op(
                 w_uv_replicated=True,
                 num_tokens=num_tokens,
                 flat_topk_cap_strided=True,
+                epilogue_3d=envs.TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT,
             )
-            return (
-                kv_cache_nope,
-                kv_cache_rope,
-                dcp_token_parallel.project_sequence_rows_from_v(
-                    layout,
-                    mesh,
-                    DCP_AXIS_NAME,
-                    lead_v,
-                    tail_out,
-                    rank_ids,
-                    w_o,
-                    s_o,
-                ),
-            )
+            return kv_cache_nope, kv_cache_rope, projected
 
         _, _, tail_out = dcp_token_parallel.sparse_mla_attention(
             layout,

@@ -62,6 +62,8 @@ from jax import lax
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.kernels.mla import shift_quant_split_3d
+
 FP8_MAX = 448.0
 
 
@@ -639,12 +641,10 @@ def _project_fp8_pair_halves(
     return (y * x_scale * s_local.astype(jnp.float32)[None, :]).astype(rows.dtype)
 
 
-def _merge_lead_partial_to_v(
+def _merge_lead_partial_latent(
     lead_partial: jax.Array,
     lead_lse: jax.Array,
-    w_uv_all: jax.Array,
     axis_name: str,
-    out_dtype: jnp.dtype,
 ) -> jax.Array:
     lses = lax.all_gather(lead_lse, axis_name, axis=0, tiled=False)
     m = jax.nn.logsumexp(lses, axis=0)
@@ -653,9 +653,34 @@ def _merge_lead_partial_to_v(
     weighted = (lead_partial.astype(jnp.float32) * w[..., None]).astype(
         lead_partial.dtype
     )
-    lead_latent = lax.psum(weighted, axis_name)
+    return lax.psum(weighted, axis_name)
+
+
+def _merge_lead_partial_to_v(
+    lead_partial: jax.Array,
+    lead_lse: jax.Array,
+    w_uv_all: jax.Array,
+    axis_name: str,
+    out_dtype: jnp.dtype,
+) -> jax.Array:
+    lead_latent = _merge_lead_partial_latent(lead_partial, lead_lse, axis_name)
     return jnp.einsum(
         "rhl,hlv->rhv", lead_latent, w_uv_all.astype(lead_latent.dtype)
+    ).astype(out_dtype)
+
+
+def _merge_lead_partial_to_v_hrv(
+    lead_partial: jax.Array,
+    lead_lse: jax.Array,
+    w_uv_all: jax.Array,
+    axis_name: str,
+    out_dtype: jnp.dtype,
+) -> jax.Array:
+    lead_latent = _merge_lead_partial_latent(lead_partial, lead_lse, axis_name)
+    return jnp.einsum(
+        "hrl,hlv->hrv",
+        jnp.swapaxes(lead_latent, 0, 1),
+        w_uv_all.astype(lead_latent.dtype),
     ).astype(out_dtype)
 
 
@@ -668,6 +693,89 @@ def _project_w_uv(out: jax.Array, w_uv_all: jax.Array) -> jax.Array:
         )
         .swapaxes(0, 1)
         .astype(out.dtype)
+    )
+
+
+def _project_w_uv_hrv(out: jax.Array, w_uv_all: jax.Array) -> jax.Array:
+    return jnp.einsum(
+        "hrl,hlv->hrv",
+        jnp.swapaxes(out, 0, 1),
+        w_uv_all.astype(out.dtype),
+    ).astype(out.dtype)
+
+
+def _can_use_3d_fp8_epilogue(
+    layout: TokenParallelLayout,
+    num_heads: int,
+    num_rows: int,
+    head_dim: int,
+    dtype: jnp.dtype,
+    w_local: jax.Array,
+    s_local: jax.Array,
+) -> bool:
+    return (
+        s_local.ndim == 1
+        and layout.dcp_size > 2
+        and layout.dcp_size % 2 == 0
+        and 2 * w_local.shape[0] == num_heads * head_dim
+        and shift_quant_split_3d.supports_shift_quant_split_3d(
+            num_heads, num_rows, layout.split_rows, head_dim, dtype
+        )
+    )
+
+
+def _project_hrv_pair_halves_local(
+    layout: TokenParallelLayout,
+    own_hrv: jax.Array,
+    lead_hrv: jax.Array,
+    rank_vec: jax.Array,
+    w_local: jax.Array,
+    s_local: jax.Array,
+    axis_name: str,
+    *,
+    use_pallas: bool = True,
+) -> jax.Array:
+    num_rows = own_hrv.shape[1]
+    split_rows = layout.split_rows
+    pairs = [(i, i ^ 1) for i in range(layout.dcp_size)]
+    w_peer = lax.ppermute(w_local, axis_name, pairs)
+    perm_shift = [(i, i + 1) for i in range(layout.dcp_size - 1)]
+    carried_hrv = lax.ppermute(
+        own_hrv[:, num_rows - split_rows :, :], axis_name, perm_shift
+    )
+    if use_pallas:
+        mine, peer, x_scale = shift_quant_split_3d.shift_quant_split_3d_fp8(
+            lead_hrv, carried_hrv, own_hrv, rank_vec
+        )
+    else:
+        mine, peer, x_scale = shift_quant_split_3d.shift_quant_split_3d_ref(
+            lead_hrv, carried_hrv, own_hrv, rank_vec
+        )
+    dims = (((1,), (0,)), ((), ()))
+    y = lax.dot_general(
+        mine, w_local, dims, preferred_element_type=jnp.float32
+    ) + lax.dot_general(peer, w_peer, dims, preferred_element_type=jnp.float32)
+    return (y * x_scale * s_local.astype(jnp.float32)[None, :]).astype(own_hrv.dtype)
+
+
+def _shift_and_project_local(
+    layout: TokenParallelLayout,
+    own_v: jax.Array,
+    lead_v: jax.Array,
+    rank: jax.Array,
+    w_local: jax.Array,
+    s_local: jax.Array,
+    axis_name: str,
+) -> jax.Array:
+    seq_rows = token_rows_to_sequence_rows(
+        layout,
+        own_v.reshape(own_v.shape[0], -1),
+        lead_v.reshape(lead_v.shape[0], -1),
+        rank,
+        axis_name,
+    )
+    return project_all_heads(
+        seq_rows, w_local, s_local, rank, axis_name, layout.dcp_size
     )
 
 
@@ -815,10 +923,18 @@ def _sparse_mla_attention_core(
     lead_partial: jax.Array | None = None,
     lead_lse: jax.Array | None = None,
     flat_topk_cap_strided: bool = False,
+    w_o: jax.Array | None = None,
+    w_o_scale: jax.Array | None = None,
+    epilogue_3d: bool = True,
 ) -> tuple[jax.Array, ...]:
     if (lead_partial is None) != (lead_lse is None):
         raise ValueError("lead_partial and lead_lse must be passed together")
+    if (w_o is None) != (w_o_scale is None):
+        raise ValueError("w_o and w_o_scale must be passed together")
     has_lead = lead_partial is not None
+    has_oproj = w_o is not None
+    if has_oproj and not has_lead:
+        raise ValueError("w_o/w_o_scale require lead_partial and lead_lse")
     if has_lead and (w_uv is None or not token_rows):
         raise ValueError("lead_partial/lead_lse require w_uv and token_rows=True")
 
@@ -856,6 +972,10 @@ def _sparse_mla_attention_core(
         lead_part_local = lead_lse_local = None
         if has_lead:
             lead_part_local, lead_lse_local = extra_args[idx], extra_args[idx + 1]
+            idx += 2
+        w_o_local = s_o_local = None
+        if has_oproj:
+            w_o_local, s_o_local = extra_args[idx], extra_args[idx + 1]
         rank = _rank(rank_arg, axis_name, dcp)
         if write_kv is not None:
             nope, rope = write_kv(nope, rope, kv_c, k_pe_local, seq_lens, bt, qsl, rank)
@@ -884,6 +1004,20 @@ def _sparse_mla_attention_core(
                 else lax.all_gather(w_uv_local, axis_name, axis=0, tiled=True)
             )
         )
+        use_3d_epilogue = False
+        if has_oproj and epilogue_3d:
+            assert (
+                w_uv_all is not None and w_o_local is not None and s_o_local is not None
+            )
+            use_3d_epilogue = _can_use_3d_fp8_epilogue(
+                layout,
+                w_uv_all.shape[0],
+                q_tok.shape[0],
+                w_uv_all.shape[2],
+                q_tok.dtype,
+                w_o_local,
+                s_o_local,
+            )
 
         # Gather and attend at the step's page count: the kernel reads a
         # buffer of `cap` pages per rank, with no padding copy to max_pages.
@@ -906,6 +1040,7 @@ def _sparse_mla_attention_core(
                         and lead_lse_local is not None
                         and w_uv_all is not None
                     )
+                    w_uv_arr = w_uv_all
                     # Avoid hoisting lead LSE AG / psum ahead of gather_latent:
                     # tying both via optimization_barrier prevents ICI contention
                     # with gather_latent while overlapping lead collectives with
@@ -913,15 +1048,25 @@ def _sparse_mla_attention_core(
                     g_nope, g_rope, lp_t, ll_t = lax.optimization_barrier(
                         (g_nope, g_rope, lead_part_local, lead_lse_local)
                     )
-                    lead_v = _merge_lead_partial_to_v(
-                        lp_t, ll_t, w_uv_all, axis_name, q_tok.dtype
-                    )
+                    if use_3d_epilogue:
+                        lead_v = _merge_lead_partial_to_v_hrv(
+                            lp_t, ll_t, w_uv_arr, axis_name, q_tok.dtype
+                        )
+                    else:
+                        lead_v = _merge_lead_partial_to_v(
+                            lp_t, ll_t, w_uv_arr, axis_name, q_tok.dtype
+                        )
                 if q_pe_tok is not None:
                     out = attend(q_tok, g_nope, g_rope, flat, rr.num_rows, q_pe_tok)
                 else:
                     out = attend(q_tok, g_nope, g_rope, flat, rr.num_rows)
                 if w_uv_all is not None:
-                    out = _project_w_uv(out, w_uv_all)
+                    w_uv_arr = w_uv_all
+                    out = (
+                        _project_w_uv_hrv(out, w_uv_arr)
+                        if use_3d_epilogue
+                        else _project_w_uv(out, w_uv_arr)
+                    )
                 if has_lead:
                     assert lead_v is not None
                     return out, lead_v
@@ -930,6 +1075,35 @@ def _sparse_mla_attention_core(
             return run
 
         switched = _switch_on_cap(layout, jnp.sum(pages), branch)
+        if has_oproj:
+            assert w_o_local is not None and s_o_local is not None
+            w_o_arr, s_o_arr = w_o_local, s_o_local
+            out, lead_v = switched
+            if use_3d_epilogue:
+                rank_vec = jnp.asarray(
+                    rank_arg[0] if rank_arg else jnp.reshape(rank, (1,)),
+                    dtype=jnp.int32,
+                )
+                projected = _project_hrv_pair_halves_local(
+                    layout,
+                    out,
+                    lead_v,
+                    rank_vec,
+                    w_o_arr,
+                    s_o_arr,
+                    axis_name,
+                )
+            else:
+                projected = _shift_and_project_local(
+                    layout,
+                    out,
+                    lead_v,
+                    rank,
+                    w_o_arr,
+                    s_o_arr,
+                    axis_name,
+                )
+            return nope, rope, projected
         if has_lead:
             out, lead_v = switched
             return nope, rope, out, lead_v
@@ -957,8 +1131,14 @@ def _sparse_mla_attention_core(
         assert lead_partial is not None and lead_lse is not None
         extra = (*extra, lead_partial, lead_lse)
         extra_specs = (*extra_specs, sharded, sharded)
+    if has_oproj:
+        assert w_o is not None and w_o_scale is not None
+        extra = (*extra, w_o, w_o_scale)
+        extra_specs = (*extra_specs, sharded, sharded)
     out_specs = (
-        (sharded, sharded, sharded, rep) if has_lead else (sharded, sharded, sharded)
+        (sharded, sharded, sharded, rep)
+        if (has_lead and not has_oproj)
+        else (sharded, sharded, sharded)
     )
     return jax.shard_map(
         _local,
@@ -1117,6 +1297,72 @@ def sparse_mla_attention_with_lead(
         flat_topk_cap_strided=flat_topk_cap_strided,
     )
     return nope, rope, own_v, lead_v
+
+
+def sparse_mla_attention_with_lead_oproj(
+    layout: TokenParallelLayout,
+    mesh: Mesh,
+    axis_name: str,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    q: jax.Array,
+    kv_c_normed: jax.Array | None,
+    k_pe: jax.Array | None,
+    flat_topk: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    *,
+    lead_partial: jax.Array,
+    lead_lse: jax.Array,
+    write_kv: WriteKVFn | None,
+    attend: Callable[..., jax.Array],
+    w_uv: jax.Array,
+    w_o: jax.Array,
+    w_o_scale: jax.Array,
+    rank_ids: jax.Array | None = None,
+    q_own_rows: bool = False,
+    read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
+    q_pe: jax.Array | None = None,
+    w_uv_replicated: bool = False,
+    num_tokens: int | None = None,
+    flat_topk_cap_strided: bool = False,
+    epilogue_3d: bool = True,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Run token-parallel sparse MLA, lead merge, W_UV, and o_proj in one shard_map."""
+    nope, rope, projected = _sparse_mla_attention_core(
+        layout,
+        mesh,
+        axis_name,
+        kv_cache_nope,
+        kv_cache_rope,
+        q,
+        kv_c_normed,
+        k_pe,
+        flat_topk,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        write_kv=write_kv,
+        attend=attend,
+        rank_ids=rank_ids,
+        q_own_rows=q_own_rows,
+        read_pages=read_pages,
+        w_uv=w_uv,
+        q_pe=q_pe,
+        token_rows=True,
+        w_uv_replicated=w_uv_replicated,
+        num_tokens=num_tokens,
+        lead_partial=lead_partial,
+        lead_lse=lead_lse,
+        flat_topk_cap_strided=flat_topk_cap_strided,
+        w_o=w_o,
+        w_o_scale=w_o_scale,
+        epilogue_3d=epilogue_3d,
+    )
+    return nope, rope, projected
 
 
 def indexer_topk(

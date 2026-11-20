@@ -287,15 +287,10 @@ def test_should_route_oproj_op_through_overlapped_lead_attention_and_project_fro
         lse = jax.device_put(jnp.zeros((dcp * 8, 16), jnp.float32), shd)
         return nope, rope, part, lse
 
-    def fake_with_lead(lay, m, ax, nope, rope, *a, **kw):
-        calls.append("with_lead")
-        own_v = jax.device_put(jnp.zeros((dcp * 16, 16, 16), jnp.bfloat16), shd)
-        lead_v = jnp.zeros((8, 16, 16), jnp.bfloat16)
-        return nope, rope, own_v, lead_v
-
-    def fake_from_v(lay, m, ax, lead_v, own_v, *a, **kw):
-        calls.append("from_v")
-        return jax.device_put(jnp.zeros((dcp * 16, 32), jnp.bfloat16), shd)
+    def fake_with_lead_oproj(lay, m, ax, nope, rope, *a, **kw):
+        calls.append(f"with_lead_oproj:3d={kw.get('epilogue_3d')}")
+        out = jax.device_put(jnp.zeros((dcp * 16, 32), jnp.bfloat16), shd)
+        return nope, rope, out
 
     def fake_plain_tp(lay, m, ax, nope, rope, *a, **kw):
         calls.append("plain_tp")
@@ -310,9 +305,8 @@ def test_should_route_oproj_op_through_overlapped_lead_attention_and_project_fro
         fake_dcp_attn,
     )
     monkeypatch.setattr(
-        dcp_token_parallel, "sparse_mla_attention_with_lead", fake_with_lead
+        dcp_token_parallel, "sparse_mla_attention_with_lead_oproj", fake_with_lead_oproj
     )
-    monkeypatch.setattr(dcp_token_parallel, "project_sequence_rows_from_v", fake_from_v)
     monkeypatch.setattr(dcp_token_parallel, "sparse_mla_attention", fake_plain_tp)
     dcp_token_parallel_op.build_attention_op(layer, impl, layout, q_replicated=True)
 
@@ -353,7 +347,7 @@ def test_should_route_oproj_op_through_overlapped_lead_attention_and_project_fro
         w_o,
         s_o,
     )
-    assert calls == ["lead_dcp", "with_lead", "from_v"]
+    assert calls == ["lead_dcp", "with_lead_oproj:3d=True"]
 
     calls.clear()
     w_uv_shd = jax.device_put(jnp.zeros((dcp * 4, 32, 16), jnp.bfloat16), shd)
