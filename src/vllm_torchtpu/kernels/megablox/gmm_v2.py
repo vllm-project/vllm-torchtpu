@@ -26,6 +26,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import tight_vmem
 
 
@@ -339,6 +340,39 @@ def fp8_rhs_feed_dtype(
     return None
 
 
+def requantize_fp8_colscale(
+    w: jax.Array,  # fp4 [tile_k, tile_n]
+    block_scale: jax.Array,  # f32 [tile_k // qbs, 1, tile_n]
+    qbs: int,
+    work_dtype: jnp.dtype,
+) -> tuple[jax.Array, jax.Array]:
+    """Re-expresses per-K-block scaled fp4 as e4m3 with one scale per column.
+
+    Returns (w8, col_scale [1, tile_n] f32) with w8 * col_scale ~= w * block_scale,
+    so the tile is a single full-depth fp8 matmul scaled once at the end,
+    without the per-block f32 accumulate of the per-block fp8 feed.
+    """
+    fp8 = jnp.float8_e4m3fn
+    w_max = float(jnp.finfo(w.dtype).max)
+    col_max = jnp.max(block_scale, axis=0)  # [1, tile_n]
+    col_scale = col_max * (w_max / float(jnp.finfo(fp8).max))
+    ratio = (block_scale / jnp.where(col_scale == 0, 1.0, col_scale)).astype(
+        work_dtype
+    )
+    num_blocks, tile_n = block_scale.shape[0], w.shape[1]
+    w_blocks = w.astype(work_dtype).reshape(num_blocks, qbs, tile_n) * ratio
+    return w_blocks.reshape(-1, tile_n).astype(fp8), col_scale
+
+
+def quantize_rows_fp8(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Per-row e4m3 quantization: returns (x8, row_scale [m, 1] f32)."""
+    fp8 = jnp.float8_e4m3fn
+    amax = jnp.max(jnp.abs(x), axis=1, keepdims=True).astype(jnp.float32)
+    row_scale = amax / float(jnp.finfo(fp8).max)
+    inv = jnp.where(row_scale == 0, 0.0, 1.0 / row_scale).astype(x.dtype)
+    return (x * inv).astype(fp8), row_scale
+
+
 @dataclasses.dataclass(frozen=True)
 class GmmConfigs:
     tiles: TileSizes
@@ -359,6 +393,21 @@ class GmmConfigs:
         if bucket_m > FP8_RHS_MAX_BUCKET_M:
             return None
         return fp8_rhs_feed_dtype(self.lhs_cfgs, self.rhs_cfgs)
+
+    def uses_fp8_w8a8(self, bucket_m: int) -> bool:
+        """Whether this prefill bucket runs fp8 x fp8 (TPU_GMM_FP8_W8A8):
+        rhs requantized per column, lhs per row. Large-m tiles bind on the
+        MXU's lhs stream, which fp8 halves (fp8 rhs alone does not help).
+        Buckets of at most FP8_RHS_MAX_BUCKET_M rows keep the fp8 rhs feed."""
+        return (
+            envs.TPU_GMM_FP8_W8A8
+            and bucket_m > FP8_RHS_MAX_BUCKET_M
+            and self.dims.size_m > FP8_DECODE_MAX_M
+            and fp8_rhs_feed_dtype(self.lhs_cfgs, self.rhs_cfgs) is not None
+            and pltpu.get_tpu_info().is_matmul_supported(
+                jnp.float8_e4m3fn.dtype, jnp.float8_e4m3fn.dtype
+            )
+        )
 
     @property
     def out_size_n(self) -> int:
@@ -766,8 +815,21 @@ def inner_kernel(
         rhs_qbs = cfgs.rhs_cfgs.quant_block_size
         dequant_after = cfgs.rhs_cfgs.should_dequantize_after_matmul
         fp8_rhs = cfgs.fp8_rhs_dtype(bucket_m)
+        col_scale = row_scale = None
         if rhs_pre is not None:
             # Already dequantized once for every bucket (k1 body "hoist").
+            rhs_qbs = cfgs.tiles.tile_k
+        elif fp8_rhs is None and cfgs.uses_fp8_w8a8(bucket_m):
+            # Prefill m: the MXU lhs stream binds; fp8 x fp8 halves it.
+            tiled_rhs, col_scale = requantize_fp8_colscale(
+                tiled_rhs, tiled_rhs_ref.get_scale(), rhs_qbs, cfgs.lhs_cfgs.dtype
+            )
+            valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
+            if is_last_k_step and valid_k != 0:
+                # Columns past size_k are stale VMEM; keep them out of the amax.
+                col = lax.broadcasted_iota(jnp.int32, tiled_lhs.shape, 1)
+                tiled_lhs = jnp.where(col < valid_k, tiled_lhs, 0)
+            tiled_lhs, row_scale = quantize_rows_fp8(tiled_lhs)
             rhs_qbs = cfgs.tiles.tile_k
         elif fp8_rhs is not None:
             # Skinny m: the MXU weight push binds, and fp8 halves it.
@@ -793,6 +855,8 @@ def inner_kernel(
         # Step 2: Matmul.
         acc_list = []
         if chunk_mode is not None and rhs_pre is None and fp8_rhs is None and (
+            col_scale is None
+        ) and (
             _pipe_bucket(bucket_m)
         ) and (
             is_first_k_step and is_last_k_step and valid_k == 0
@@ -838,6 +902,8 @@ def inner_kernel(
                         block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
 
                     acc_n += block_acc
+                if col_scale is not None:
+                    acc_n *= col_scale[:, start_n:end_n] * row_scale
                 acc_list.append(acc_n)
         else:
             # Quantized matmul path.
@@ -1085,6 +1151,28 @@ def _pipe_buckets_env() -> dict[int, int | None] | None:
 
 
 _k1_body_logged: set[str] = set()
+_once_logged: set = set()
+
+
+def _log_once(key, *args) -> None:
+    if key in _once_logged:
+        return
+    _once_logged.add(key)
+    try:
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(*args)
+    except ImportError:  # kernel-only use without vllm
+        import logging
+
+        logging.getLogger(__name__).info(*args)
+
+
+def _w8a8_buckets(cfgs: "GmmConfigs") -> tuple[int, ...]:
+    """Buckets of this call that run fp8 x fp8 (TPU_GMM_FP8_W8A8)."""
+    if not envs.TPU_GMM_FP8_W8A8:
+        return ()
+    return tuple(b for b in cfgs.tiles.bucket_sizes if cfgs.uses_fp8_w8a8(b))
 
 
 def _k1_body_mode(cfgs: "GmmConfigs") -> str | None:
@@ -1096,6 +1184,18 @@ def _k1_body_mode(cfgs: "GmmConfigs") -> str | None:
         and not cfgs.lhs_cfgs.should_quantize
         and all(cfgs.fp8_rhs_dtype(b) is None for b in cfgs.tiles.bucket_sizes)
     ):
+        mode = "single"
+    if mode != "single" and any(
+        cfgs.uses_fp8_w8a8(b) for b in cfgs.tiles.bucket_sizes
+    ):
+        # TPU_GMM_FP8_W8A8 takes precedence: hoist / roll / chunk / pipe
+        # dequantize the rhs to bf16, which the fp8 x fp8 buckets replace.
+        _log_once(
+            "w8a8_k1",
+            "gmm_v2 TPU_GMM_FP8_W8A8 overrides %s=%s on prefill calls "
+            "(size_m=%d): k1 body falls back to single",
+            _K1_BODY_ENV, mode, cfgs.dims.size_m,
+        )
         mode = "single"
     if mode not in _k1_body_logged:
         _k1_body_logged.add(mode)
@@ -1800,6 +1900,20 @@ def _calculate_tiling(
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
     max_num_buckets = 4
+    if (
+        envs.TPU_GMM_FP8_W8A8
+        and dims.size_m > FP8_DECODE_MAX_M
+        and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None
+    ):
+        # Prefill chunks give each expert ~256 +- 16 rows (8192 tokens x top-4
+        # over 128 experts, local or TP-sliced); 4 x 64-row buckets cap the
+        # tile at 256, so half the groups spill into a second tile that
+        # re-streams and re-quantizes the expert for a few rows. A fifth
+        # bucket: tpu7x gate_up / down 332 / 159 -> 250 / 114 us (EP),
+        # 482 / 382 -> 352 / 280 us (TP-sliced); 384 rows fall off a cliff
+        # on EP's gate_up (1082 us). TPU_GMM_V2_PREFILL_TILES, when it
+        # applies, still replaces these tiles.
+        max_num_buckets = 5
     bucket_base = tile_m
     for _ in range(1, max_num_buckets):
         new_tile_m = tile_m + bucket_base
@@ -2064,6 +2178,17 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         if not isinstance(val, str | int | float):
             val = str(val)
         ret[key] = val
+    w8a8 = _w8a8_buckets(cfgs)
+    if w8a8:
+        # Only with TPU_GMM_FP8_W8A8 on: key-off metadata is unchanged.
+        ret["fp8_w8a8_buckets"] = str(w8a8)
+        _log_once(
+            ("w8a8", cfgs.dims.size_k, cfgs.dims.size_n),
+            "gmm_v2 TPU_GMM_FP8_W8A8 on: size_m=%d k=%d n=%d tile_m=%d buckets "
+            "%s run fp8 x fp8 (rhs e4m3 per-column, lhs e4m3 per-row scales)",
+            cfgs.dims.size_m, cfgs.dims.size_k, cfgs.dims.size_n,
+            cfgs.tiles.tile_m, w8a8,
+        )
     return ret
 
 
