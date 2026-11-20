@@ -565,7 +565,10 @@
       window.__MK_ADVISOR_ENGINE.PROF &&
       window.__MK_ADVISOR_ENGINE.PROF.num_layers) || 60;
     const boundaries = 2 * numLayers;
-    const MIN_STEP_OPS_FOR_EXPLICIT_NORM = 16;
+    const MIN_STEP_OPS_FOR_EXPLICIT_NORM = Number(
+      (window.__MK_ADVISOR_ENGINE && window.__MK_ADVISOR_ENGINE.DATA &&
+        window.__MK_ADVISOR_ENGINE.DATA.min_step_ops_for_explicit_norm) || 2
+    );
 
     let launchGapPayload = null;
     let stepTimePayload = null;
