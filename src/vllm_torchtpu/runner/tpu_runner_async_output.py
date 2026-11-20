@@ -546,7 +546,7 @@ def _compiled_subtract_and_substitute_placeholder_token(
 
 
 @_static_shape_args
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _compiled_carry_subtract_and_substitute_draft_token_ids(
     seq_lens_prev: torch.Tensor,
     positions_prev: torch.Tensor,
