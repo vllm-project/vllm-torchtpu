@@ -28,7 +28,6 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
 from ..common.mhc import (
-    collapse,
     flat_collapse,
     initialize_delayed_mhc,
     initialize_flat_collapse,
@@ -1396,7 +1395,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # output. Publish it before the host selects the SWA replay rows.
                 decoder = self.layers[self._ced_boundary]
                 assert pre_mix is not None
-                normalized = decoder.attn_norm(collapse(hidden_states, pre_mix))
+                normalized = decoder.attn_norm(flat_collapse(hidden_states, pre_mix))
                 decoder.attn.write_encoder_global_kv(
                     normalized, positions, sp_sharded=stage_sp
                 )

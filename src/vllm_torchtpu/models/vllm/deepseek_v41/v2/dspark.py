@@ -315,9 +315,8 @@ class DSparkDeepseekV41Model(nn.Module):
         hidden_states = post(hidden_states, residual, post_mix, res_mix)
         assert pre_mix is not None
         if (
-            hidden_states.shape == (240, 4, 5120)
+            hidden_states.shape[1] == 4
             and hidden_states.dtype == torch.bfloat16
-            and pre_mix.shape == (240, 4)
             and pre_mix.dtype == torch.float32
         ):
             return self._boundary_collapse(hidden_states.flatten(1), pre_mix)
