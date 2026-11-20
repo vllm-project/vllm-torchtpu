@@ -158,7 +158,7 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
                     mru_idx = len(built)
                 built.append((gm, direct))
             # MRU entry must accept the frame the slow call just ran with.
-            if mru_idx < 0 or not built[mru_idx][0].check(f_locals):
+            if mru_idx < 0:
                 return
             if mru_idx > 0:
                 built.insert(0, built.pop(mru_idx))
@@ -177,7 +177,10 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
 
     @functools.wraps(fn)
     def fast_dispatch_call(*args: Any, **kwargs: Any) -> Any:
-        if not _CONFIG["fast"]:
+        # Inside a trace (an outer compiled function calling this one) dynamo
+        # folds is_compiling() to True and inlines the compiled function,
+        # without tracing the cache-entry and eval-frame queries below.
+        if not _CONFIG["fast"] or torch.compiler.is_compiling():
             return compiled(*args, **kwargs)
         if not state["disabled"]:
             entries = state["entries"]
@@ -185,7 +188,6 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
                 entries
                 and _c_eval_frame.get_eval_frame_callback() is None
                 and stance_mod._stance.stance == "default"
-                and not torch.compiler.is_compiling()
             ):
                 f_locals = _f_locals(args, kwargs)
                 if f_locals is not None and _entry_count(code) == state["count"]:
@@ -290,4 +292,3 @@ def install() -> None:
         return
     _INSTALLED = True
     torch.compile = make_compile_hook(torch.compile)
-    logger.debug("torch.compile hook installed; inert until tpu_compile arms it")
