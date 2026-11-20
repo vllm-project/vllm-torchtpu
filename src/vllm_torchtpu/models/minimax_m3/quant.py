@@ -59,6 +59,7 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
 )
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.minimax_m3 import sp_o_proj
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
@@ -83,6 +84,24 @@ _split_e4m3 = pallas.jax_op("pallas::minimax_m3_split_e4m3_matmul", split_e4m3_m
 _split_e4m3.register_fake(
     lambda x, w, s: torch.empty(
         (*x.shape[:-1], w.shape[-1]), dtype=x.dtype, device=x.device
+    )
+)
+
+
+def _e4m3_rows_matmul(
+    q: jax.Array, row_scale: jax.Array, w: jax.Array, w_scale: jax.Array
+) -> jax.Array:
+    """e4m3 rows ``q`` [T, K] with f32 row scales [T, 1] times the e4m3 weight
+    [K, N] with its per-channel scale [N]: one e4m3 x e4m3 dot, f32 accumulate,
+    bf16 [T, N] (TPU_MINIMAX_M3_SP_E4M3_QKV)."""
+    acc = jax.lax.dot(q, w, preferred_element_type=jnp.float32)
+    return (acc * row_scale * w_scale.astype(jnp.float32)).astype(jnp.bfloat16)
+
+
+_e4m3_matmul = pallas.jax_op("pallas::minimax_m3_e4m3_rows_matmul", _e4m3_rows_matmul)
+_e4m3_matmul.register_fake(
+    lambda q, row_scale, w, w_scale: q.new_empty(
+        (q.shape[0], w.shape[1]), dtype=torch.bfloat16
     )
 )
 
@@ -224,6 +243,9 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         setattr(layer, WEIGHT_FLIPPED_ATTR, True)
         if weight.device.type == "tpu":
             synchronize_tensors([layer.weight, layer.weight_scale])
+        if getattr(layer, sp_o_proj.PREPARE_ATTR, False):
+            # Only o_proj modules marked by TPU_MINIMAX_M3_SP_A2A_OPROJ.
+            sp_o_proj.prepare(layer)
         logger.info_once(
             "MXFP8 linears run on e4m3 weights with per-channel power-of-two scales."
         )
@@ -262,6 +284,8 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if layer.weight.dtype != torch.float8_e4m3fn:
             return VllmUnquantizedLinearMethod().apply(layer, x, bias)
+        # The weight itself unless TPU_MINIMAX_M3_SP_A2A_OPROJ=replicate.
+        w8 = sp_o_proj.local_weight(layer)
         rows = math.prod(x.shape[:-1])
         if (
             max(1, envs.TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS)
@@ -270,20 +294,31 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
             and x.dtype == torch.bfloat16
         ):
             # Rows are static at trace time, so each bucket picks one path.
-            return quantized_matmul(x, layer.weight, layer.weight_scale)
+            return quantized_matmul(x, w8, layer.weight_scale)
         if (
             max(1, envs.TPU_MINIMAX_M3_FP8_SPLIT_MIN_ROWS)
             <= rows
             <= envs.TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS
             and x.dtype == torch.bfloat16
         ):
-            return _split_e4m3(x, layer.weight, layer.weight_scale)
+            return _split_e4m3(x, w8, layer.weight_scale)
         if rows >= _UPCAST_MIN_ROWS and x.dtype == torch.bfloat16:
-            weight = _materialized_bf16(layer.weight)
+            weight = _materialized_bf16(w8)
         else:
-            weight = layer.weight.to(x.dtype)
+            weight = w8.to(x.dtype)
         # The scale is a power of two, so this rounds once, like x @ bf16(W).
         return torch.matmul(x, weight) * layer.weight_scale
+
+    def apply_e4m3_rows(
+        self, layer: torch.nn.Module, q: torch.Tensor, row_scale: torch.Tensor
+    ) -> torch.Tensor:
+        """``apply`` of the rows ``q * row_scale`` (e4m3 [T, K], f32 [T, 1]),
+        as an e4m3 x e4m3 matmul when the weight is e4m3 (an SP step's e4m3
+        all-gather, TPU_MINIMAX_M3_SP_E4M3_QKV)."""
+        if layer.weight.dtype != torch.float8_e4m3fn:
+            return self.apply(layer, (q.float() * row_scale).to(torch.bfloat16))
+        w8 = sp_o_proj.local_weight(layer)
+        return _e4m3_matmul(q, row_scale, w8, layer.weight_scale)
 
 
 class MiniMaxM3Nvfp4MoEMethod(VllmNvfp4MoEMethod):
