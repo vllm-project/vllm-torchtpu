@@ -133,17 +133,17 @@ _KV_CASES = [
 ]
 
 
-@pytest.mark.parametrize("mode", ["pv", "qk_split_pv_split", "qk_pv"])
-def test_decode_fp8_kv_with_kv_scales(mode):
-    """k_scale and v_scale other than 1 reach the native QK scores and the
-    native PV output: the output matches an f32 reference that multiplies
-    K by k_scale and V by v_scale."""
-    native_fp8, tol = _MODES[mode]
+def _check_decode(
+    kv_lens_list, native_fp8, tol, decode_exp2=False, scales=(1.0, 1.0), kv_dtype=_FP8
+):
+    """Runs the decode call of these tests, with the tiles and call structure of
+    the Qwen3.5 decode shapes the modes are tuned for, and compares it with the
+    f32 reference at the same k_scale and v_scale."""
     if not jtu.is_device_tpu_at_least(version=7):
         pytest.skip("Expect TPU v7+ (native fp8 MXU)")
-    kv_lens_list = [5000, 9000 + 37, 131]
-    inp = _inputs(kv_lens_list)
-    ref = _reference(inp, kv_lens_list, k_scale=0.5, v_scale=0.75)
+    k_scale, v_scale = scales
+    inp = _inputs(kv_lens_list, dtype=kv_dtype)
+    ref = _reference(inp, kv_lens_list, k_scale=k_scale, v_scale=v_scale)
     out, _ = wrapper.ragged_paged_attention(
         inp["q"],
         inp["k"],
@@ -154,11 +154,12 @@ def test_decode_fp8_kv_with_kv_scales(mode):
         inp["cu_q_lens"],
         inp["distribution"],
         sm_scale=_SM_SCALE,
-        k_scale=0.5,
-        v_scale=0.75,
+        k_scale=k_scale,
+        v_scale=v_scale,
         kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
         decode_query_size=_QLEN,
         native_fp8=native_fp8,
+        decode_exp2=decode_exp2,
         tuned_tiles=True,
         skip_empty_mixed=True,
     )
@@ -166,43 +167,15 @@ def test_decode_fp8_kv_with_kv_scales(mode):
     assert not np.isnan(out).any()
     rel = np.linalg.norm(out - ref) / np.linalg.norm(ref)
     assert rel < tol, rel
+
+
+_KV_LENS = [[300], [5000, 9000 + 37, 131], [33000 + 61] + [4096 * 3] * 4]
 
 
 @pytest.mark.parametrize(("kv_dtype", "mode", "tol"), _KV_CASES)
-@pytest.mark.parametrize(
-    "kv_lens_list",
-    [[300], [5000, 9000 + 37, 131], [33000 + 61] + [4096 * 3] * 4],
-)
+@pytest.mark.parametrize("kv_lens_list", _KV_LENS)
 def test_decode_fp8_kv(kv_dtype, mode, tol, kv_lens_list):
-    native_fp8 = _MODES[mode][0]
-    if not jtu.is_device_tpu_at_least(version=7):
-        pytest.skip("Expect TPU v7+ (native fp8 MXU)")
-    inp = _inputs(kv_lens_list, dtype=kv_dtype)
-    ref = _reference(inp, kv_lens_list)
-    out, _ = wrapper.ragged_paged_attention(
-        inp["q"],
-        inp["k"],
-        inp["v"],
-        inp["kv_cache"],
-        inp["kv_lens"],
-        inp["page_indices"],
-        inp["cu_q_lens"],
-        inp["distribution"],
-        sm_scale=_SM_SCALE,
-        k_scale=1.0,
-        v_scale=1.0,
-        kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
-        decode_query_size=_QLEN,
-        native_fp8=native_fp8,
-        # The tiles and call structure of the Qwen3.5 decode shapes these modes
-        # are tuned for.
-        tuned_tiles=True,
-        skip_empty_mixed=True,
-    )
-    out = np.asarray(out[: len(kv_lens_list) * _QLEN].astype(jnp.float32))
-    assert not np.isnan(out).any()
-    rel = np.linalg.norm(out - ref) / np.linalg.norm(ref)
-    assert rel < tol, rel
+    _check_decode(kv_lens_list, _MODES[mode][0], tol, kv_dtype=kv_dtype)
 
 
 _STATIC = configs.Fp8Operand.STATIC
@@ -222,36 +195,26 @@ _LEVERS = {
 
 
 @pytest.mark.parametrize("lever", list(_LEVERS))
-@pytest.mark.parametrize(
-    "kv_lens_list",
-    [[300], [5000, 9000 + 37, 131], [33000 + 61] + [4096 * 3] * 4],
-)
+@pytest.mark.parametrize("kv_lens_list", _KV_LENS)
 def test_decode_levers_fp8_kv(lever, kv_lens_list):
     native_fp8, decode_exp2, tol = _LEVERS[lever]
-    if not jtu.is_device_tpu_at_least(version=7):
-        pytest.skip("Expect TPU v7+ (native fp8 MXU)")
-    inp = _inputs(kv_lens_list)
-    ref = _reference(inp, kv_lens_list)
-    out, _ = wrapper.ragged_paged_attention(
-        inp["q"],
-        inp["k"],
-        inp["v"],
-        inp["kv_cache"],
-        inp["kv_lens"],
-        inp["page_indices"],
-        inp["cu_q_lens"],
-        inp["distribution"],
-        sm_scale=_SM_SCALE,
-        k_scale=1.0,
-        v_scale=1.0,
-        kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
-        decode_query_size=_QLEN,
-        native_fp8=native_fp8,
-        decode_exp2=decode_exp2,
-        tuned_tiles=True,
-        skip_empty_mixed=True,
-    )
-    out = np.asarray(out[: len(kv_lens_list) * _QLEN].astype(jnp.float32))
-    assert not np.isnan(out).any()
-    rel = np.linalg.norm(out - ref) / np.linalg.norm(ref)
-    assert rel < tol, rel
+    _check_decode(kv_lens_list, native_fp8, tol, decode_exp2)
+
+
+# The native modes with KV scales other than 1, the static QK among them.
+_SCALED = {
+    **{
+        m: (_MODES[m][0], False, _MODES[m][1])
+        for m in ("pv", "qk_split_pv_split", "qk_pv")
+    },
+    "qk_static_pv_static_exp2": _LEVERS["qk_static_pv_static_exp2"],
+}
+
+
+@pytest.mark.parametrize("mode", list(_SCALED))
+def test_decode_fp8_kv_with_kv_scales(mode):
+    """k_scale and v_scale other than 1 reach the native QK scores and the
+    native PV output, the static QK's score multiply included: the output
+    matches an f32 reference that multiplies K by k_scale and V by v_scale."""
+    native_fp8, decode_exp2, tol = _SCALED[mode]
+    _check_decode([5000, 9000 + 37, 131], native_fp8, tol, decode_exp2, (0.5, 0.75))
