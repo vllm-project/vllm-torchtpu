@@ -55,8 +55,8 @@ forwards restructured so torch.compile serves every bucket:
   input; a row count derived from it ahead of an all-gather can stay symbolic
   in the compiled graph, which torch_tpu fails to lower ("SymIntArrayRef
   expected to contain only concrete integers" at the all-gather's
-  allocation). On the earlier tree this structure comes from, the
-  model-entry chunk hit this at every SP bucket and this structure compiles.
+  allocation): a chunk at the model entry fails to lower at every SP bucket,
+  and this structure compiles.
 - The pad before the reduce-scatter is eliminated: every sequence-parallel
   compile size divides by TP (the platform keeps only those,
   `_configure_sequence_parallel_moe`).
@@ -163,10 +163,6 @@ def is_step0_post_attn_gather_installed(draft_model: Any) -> bool:
     if draft_model is None:
         return False
     inner = getattr(draft_model, "model", draft_model)
-    if getattr(inner, "_supports_step0_post_attn_gather", False) or getattr(
-        draft_model, "_supports_step0_post_attn_gather", False
-    ):
-        return True
     return (
         qwen3_next.Qwen3NextAttention.forward is patched_qwen3_next_attn_forward
         and qwen3_next.Qwen3NextDecoderLayer.forward is patched_decoder_layer_forward
@@ -1288,13 +1284,9 @@ def patched_decoder_layer_forward(
         positions = positions + (collective_rank * 0)[0]
 
     prequant = None
-    # A PCP-streaming GDN layer takes bf16 rows, so skip the FP8 pre-gather.
-    pcp_streaming_gdn = self.layer_type == "linear_attention" and getattr(
-        self.linear_attn, "_pcp_streaming_configured", False
-    )
-    if not pcp_streaming_gdn and _fuses_pre_attn_norm_quant(
-        self, hidden_states, input_is_sliced
-    ):
+    # A PCP-streaming GDN layer is never eligible (`_mark_pre_attn_norm_quant`),
+    # so it takes bf16 rows.
+    if _fuses_pre_attn_norm_quant(self, hidden_states, input_is_sliced):
         x_q, x_s, residual = _norm_quantize_rows(
             self.input_layernorm, hidden_states, residual
         )
@@ -1316,7 +1308,6 @@ def patched_decoder_layer_forward(
         if (
             input_is_sliced
             and sequence_parallel.fp8_gather()
-            and not pcp_streaming_gdn
             and getattr(self, "_pre_norm_quant_eligible", False)
         ):
             x_q, x_s = linear_common.quantize_rows(hidden_states)
