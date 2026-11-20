@@ -95,6 +95,9 @@ def apply_omni_model_specific_patches() -> None:
     _patch_ltx2_async_guidance_step()
     _patch_ltx2_fast_attention_dispatch()
     _patch_ulysses_inference_all_to_all_4d()
+    from vllm_torchtpu.omni.ltx2_compile import apply_ltx2_compile_patches
+
+    apply_ltx2_compile_patches()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
