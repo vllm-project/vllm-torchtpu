@@ -1,3 +1,2 @@
 include README.md
 include src/vllm_torchtpu/tools/*.proto
-include src/vllm_torchtpu/csrc/*.cc

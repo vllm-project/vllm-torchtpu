@@ -62,10 +62,9 @@ launchers have migrated rather than maintaining two permanent interfaces.
 Runtime settings such as `LIBTPU_INIT_ARGS` remain environment variables.
 
 TP1/DP>1 requires EP and CPU Engram placement. Each node-local rank holds one
-head shard in pinned host memory, and a native Host channel per layer serves its
-rows (`dp_shared_memory` is forced off). The channel library is built per
-environment with `python tools/build_engram_host_channel.py --xla-source
-<xla-COMMIT>`, where the commit is `torch_tpu/include/XLA_COMMIT`. When EP spans
+head shard in host memory, and a tpu_sync host signal channel per layer serves
+its rows (`dp_shared_memory` is forced off). This needs a `tpu-sync-torch` build
+that provides `tpu_sync.api.torch.host_signal`. When EP spans
 several hosts, `TPU_DEEPSEEK_V41_ENGRAM_HBM=auto` serves every layer from HBM
 instead. CPU placement with TP>1 is rejected. The host-placement choice does not
 change the checkpoint's numeric format.

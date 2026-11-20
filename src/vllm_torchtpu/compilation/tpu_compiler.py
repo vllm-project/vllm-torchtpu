@@ -171,8 +171,6 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/attention.py",
     "vllm_torchtpu/layers/adapter/cp_attention.py",
     "vllm_torchtpu/layers/adapter/custom_ops",
-    # The Engram Host channel protocol is shared by the kernels and worker.
-    "vllm_torchtpu/csrc/engram_host_channel.cc",
     "vllm_torchtpu/layers/adapter/fused_moe.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
@@ -272,6 +270,32 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
     return factors
 
 
+# Installed modules whose Pallas kernels the compiled graphs embed. Their
+# package version does not change with a local rebuild, so hash the source.
+_EXTERNAL_KERNEL_MODULES = (
+    # The Engram Host channels' post/wait kernels (tpu-sync host signal).
+    "tpu_sync.kernels.host_signal",
+)
+
+
+def _module_source_digest(module: str) -> str | None:
+    """SHA-256 of an installed module's source, or None if it is absent."""
+    try:
+        spec = importlib.util.find_spec(module)
+    except (ImportError, ValueError):
+        return None
+    origin = spec.origin if spec is not None else None
+    if not origin:
+        return None
+    try:
+        return hashlib.sha256(Path(origin).read_bytes()).hexdigest()
+    except OSError as exc:
+        logger.warning(
+            "[TpuCompilerAdaptor] Failed to read kernel source %s: %s", origin, exc
+        )
+        return None
+
+
 def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     """Hash TPU-specific factors used by both AOT and piecewise caches."""
     cache_config = vllm_config.cache_config
@@ -320,6 +344,10 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         # fail at launch with RuntimeProgramInputMismatch. Bump this tag
         # whenever a load-time relayout changes a parameter layout.
         "param_layouts": {"rope_tables": "row_major"},
+        # Pallas kernels compiled into the graphs from outside this repo.
+        "external_kernels": {
+            module: _module_source_digest(module) for module in _EXTERNAL_KERNEL_MODULES
+        },
     }
 
     repo_root = Path(__file__).resolve().parents[2]

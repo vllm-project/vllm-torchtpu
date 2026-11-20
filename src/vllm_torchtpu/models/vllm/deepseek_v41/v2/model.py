@@ -864,6 +864,10 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         predecessor = None
         for engram in self.model._engrams():
             predecessor = engram.publish_host_table(predecessor)
+        # One server thread per rank serves every layer's channel; it starts
+        # once the last channel was added.
+        if predecessor is not None:
+            predecessor.serve()
         return loaded
 
     def forward(self, *args, **kwargs):
