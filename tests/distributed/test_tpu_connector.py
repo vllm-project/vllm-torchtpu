@@ -9256,7 +9256,8 @@ class TestStage3AsyncOptionsThroughGetFinished:
     def test_a_terminal_before_the_registration_is_recorded_is_kept(self, failed):
         """The controller can serve the consumer before the side thread's
         RPC returns and the registration is recorded; the native terminal
-        that comes in meanwhile is kept for the registration."""
+        that comes in meanwhile is kept, and the record applies it. The
+        step's settle drops what is left, so it cannot apply it instead."""
         worker, engine, _, side = _stage3_option_producer({"async_register": True})
         entered, release = threading.Event(), threading.Event()
 
@@ -9367,21 +9368,15 @@ class TestStage3AsyncOptionsThroughGetFinished:
         worker._settle_stage3_early_send_terminals(frozenset({"r1"}))
         assert not worker._stage3_registration_pending("r1")
 
-    @pytest.mark.parametrize("registered", [False, True])
-    def test_settling_applies_a_kept_terminal_only_to_a_registered_request(
-        self, registered
-    ):
-        """At the end of a side-thread step, a kept terminal is applied to a
-        request the step left registered and dropped otherwise (a tombstoned
-        replay, a duplicate, a failed registration)."""
+    def test_settling_drops_only_the_step_s_kept_terminals(self):
+        """At the end of a side-thread step, a terminal still kept for one of
+        its requests is dropped; the step's records already applied theirs."""
         worker, _, _, _ = _stage3_option_producer({"async_register": True})
         worker._stage3_pending_registrations = {"r1": 1}
         worker._stage3_early_send_terminals = {"r1": True, "r2": False}
-        if registered:
-            worker._stage3_registered_sends["r1"] = MagicMock(uuid=77)
         worker._settle_stage3_early_send_terminals(frozenset({"r1"}))
         assert worker._stage3_early_send_terminals == {"r2": False}
-        assert worker._stage3_send_outcomes == ({"r1": "failed"} if registered else {})
+        assert worker._stage3_send_outcomes == {}
         assert worker._stage3_pending_registrations == {}
 
     def test_a_completed_send_completes_on_the_side_thread(self):

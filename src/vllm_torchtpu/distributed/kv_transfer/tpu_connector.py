@@ -4435,10 +4435,11 @@ class TPURaidenConnectorWorker:
 
     def _settle_stage3_early_send_terminals(self, req_ids: frozenset[str]) -> None:
         """Ends a side-thread registration step under the poll lock: its
-        requests stop counting as pending, and the native terminals kept for
-        them are settled. One whose request is now registered is applied, any
-        other is dropped (a released or tombstoned request, a replay, or a
-        registration that failed), as an unmatched terminal always was."""
+        requests stop counting as pending, and a terminal still kept for one
+        of them is dropped, as an unmatched terminal always was. The record of
+        a registration applies its request's kept terminal in the same
+        critical section, so what is left belongs to a request the step
+        released, met as a tombstoned replay, or failed to register."""
         with self._stage3_poll_lock:
             pending = self._stage3_pending_registrations
             for req_id in req_ids:
@@ -4446,13 +4447,7 @@ class TPURaidenConnectorWorker:
                     del pending[req_id]
                 else:
                     pending[req_id] -= 1
-                failed = self._stage3_early_send_terminals.pop(req_id, None)
-                if failed is None or req_id not in self._stage3_registered_sends:
-                    continue
-                if failed:
-                    self._stage3_send_outcomes[req_id] = "failed"
-                else:
-                    self._stage3_send_outcomes.setdefault(req_id, "done")
+                self._stage3_early_send_terminals.pop(req_id, None)
 
     def _reap_stage3_registrations(self, finished_req_ids: set[str] | None) -> None:
         """Waits for the registrations of the finished requests and raises
@@ -4703,7 +4698,6 @@ class TPURaidenConnectorWorker:
                         expiration_time=tombstone_deadline,
                     )
                     self._done_sending.add(req_id)
-                    self._stage3_early_send_terminals.pop(req_id, None)
                 logger.warning(
                     "TPURaidenConnectorWorker rank%d --> Stage-3 request "
                     "registration was already cancelled req_id=%s uuid=%d",
