@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MSA DCP candidates: picking from the token-major score rows equals picking
-from the gathered scores, and the merge of the ranks' candidates does not
+"""MSA DCP candidates: a decode step's block scores come back as the indexer's
+token rows, picking from those rows equals picking from the gathered scores,
+and the merge of the ranks' candidates does not
 depend on their order.
 
 ``interpret=True`` runs the kernel body on the host; it does not gate Mosaic
@@ -23,7 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp
+from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_dcp, msa_indexer
 
 _TOPK = 16
 _BLOCK = 128
@@ -58,6 +59,29 @@ def test_token_rows_match_gathered_scores(tokens: int, rank: int) -> None:
     got = _pick(scores, pos, rank, rows=rows)
     for w, g in zip(want, got):
         np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+
+
+def test_decode_step_returns_token_rows() -> None:
+    rng = np.random.default_rng(0)
+    seqs, pages_per_seq, pages, dim = 4, 8, 96, 128
+    q_lens = np.array([8, 5, 8, 0])
+    cu = jnp.asarray(np.concatenate([[0], np.cumsum(q_lens)]), jnp.int32)
+    seq_lens = jnp.asarray(np.where(q_lens > 0, [900, 300, 1024, 0], 0), jnp.int32)
+    args = (
+        jnp.asarray(rng.standard_normal((24, 1, dim)), jnp.bfloat16),
+        jnp.asarray(rng.integers(-2, 3, (pages, 32, 4, dim)), jnp.float8_e4m3fn),
+        seq_lens,
+        jnp.asarray(rng.permutation(pages)[: seqs * pages_per_seq], jnp.int32),
+        cu,
+        jnp.asarray(3, jnp.int32),
+    )
+    options = dict(**msa.block_score_options(), interpret=True)
+    rows = msa_indexer.block_scores(*args, token_rows=True, **options)
+    assert isinstance(rows, msa_indexer.TokenRows)
+    gathered = msa_indexer.block_scores(*args, **options)
+    np.testing.assert_array_equal(
+        np.asarray(rows.scores)[np.asarray(rows.rows)], np.asarray(gathered)[:, 0]
+    )
 
 
 def _reference_merge(candidates: np.ndarray) -> np.ndarray:
