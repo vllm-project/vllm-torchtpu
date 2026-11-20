@@ -245,31 +245,23 @@ def _unflipped_fp8_linear_sds(
     shared-expert ``VllmFp8LinearMethodTPU`` whose ``process_weights_after_loading``
     has not run yet (``MoERunner`` registers ``routed_experts`` before
     ``_shared_experts``)."""
-    from vllm_torchtpu.layers.adapter.quantization.fp8 import _get_linear_quant_config
-
     qm = lin.quant_method
-    quant_cfg = getattr(qm, "quant_config", None)
-    online_fp8 = bool(getattr(qm, "online_fp8", False))
-    linear_quant_cfg = getattr(qm, "_linear_quant_config", None)
-    if quant_cfg is None and not online_fp8 and linear_quant_cfg is None:
-        return "a shared-expert weight is not K-major"
     if getattr(lin, "weight", None) is None or lin.weight.dim() != 2:
         return "a shared-expert weight is not K-major"
     n_out, k_in = (int(d) for d in lin.weight.shape)
-    is_fp8_ckpt = bool(getattr(quant_cfg, "is_checkpoint_fp8_serialized", False))
-    if not is_fp8_ckpt and online_fp8:
-        policy = getattr(qm, "online_fp8_policy", None)
+    if not qm.quant_config.is_checkpoint_fp8_serialized and qm.online_fp8:
+        policy = qm.online_fp8_policy
         if lin.weight.dtype != torch.bfloat16 or policy is None:
             return "the shared expert is not FP8 with per-channel scales"
         if policy.weight_scheme == "per_block":
             return "the shared expert is not FP8 with per-channel scales"
         scale_shape = (1,) if policy.weight_scheme == "per_tensor" else (n_out,)
     else:
-        if linear_quant_cfg is None:
-            linear_quant_cfg = _get_linear_quant_config(
-                getattr(qm, "linear_config", None)
-            )
-        _name, requant_dtype, requant_block_size, blockwise_kernel = linear_quant_cfg
+        # What process_weights_after_loading applies: the FP8 checkpoint's
+        # requantization, or load-time quantization's fixed per-channel contract.
+        _name, requant_dtype, requant_block_size, blockwise_kernel = (
+            qm._linear_quant_config
+        )
         if requant_block_size is not None and k_in < requant_block_size:
             blockwise_kernel = False
         if requant_dtype != torch.float8_e4m3fn or blockwise_kernel:

@@ -2327,12 +2327,6 @@ def _load_runtime_modules(monkeypatch):
         VllmFp8MoEMethodTPU=type(
             "VllmFp8MoEMethodTPU", (), {"_use_adaptive_fused_moe": False}
         ),
-        _get_linear_quant_config=lambda _cfg=None: (
-            "float8_e4m3fn",
-            fake_torch.float8_e4m3fn,
-            None,
-            False,
-        ),
         build_excluded_moe_online_fp8_method=lambda *_a, **_k: None,
         resolve_online_fp8=lambda _c, _l, _p, m: m,
     )
@@ -4362,9 +4356,16 @@ def test_c1_pre_load_admission_preserves_block16_and_bit_exact_fallback(monkeypa
             pm.fp8_mod.VllmFp8LinearMethodTPU
         )
         if unflipped_online_fp8:
+            # What VllmFp8LinearMethodTPU.__init__ sets, plus the online policy.
             lin_qm.quant_config = SimpleNamespace(is_checkpoint_fp8_serialized=False)
             lin_qm.online_fp8 = True
             lin_qm.online_fp8_policy = SimpleNamespace(weight_scheme="per_channel")
+            lin_qm._linear_quant_config = (
+                "float8_e4m3fn",
+                t.float8_e4m3fn,
+                None,
+                False,
+            )
             return SimpleNamespace(
                 gate_up_proj=SimpleNamespace(
                     weight=t.zeros(2 * fs, h, dtype=t.bfloat16),
