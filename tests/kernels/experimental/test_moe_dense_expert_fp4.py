@@ -289,9 +289,13 @@ def test_fused_routing_matches_routing_first(monkeypatch, m, i, use_ep, topk):
         shared=shared,
         route=route,
     )
-    np.testing.assert_array_equal(
-        np.asarray(got, np.float32), np.asarray(want, np.float32)
-    )
+    got, want = np.asarray(got, np.float32), np.asarray(want, np.float32)
+    if m > 32:
+        # Sparse rows route first inside fused_moe_func's jit, where XLA may
+        # fuse the weights' sum differently from route_from_scores alone.
+        np.testing.assert_allclose(got, want, rtol=0, atol=1e-2 * np.abs(want).max())
+    else:
+        np.testing.assert_array_equal(got, want)
 
 
 @pytest.mark.parametrize("m", [24, 32])
