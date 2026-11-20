@@ -25,8 +25,10 @@ from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     RejectionSampler,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
+    MASK_FLAG_COMBINATIONS,
     MASKED_LOGIT_VALUE,
     apply_top_k_top_p,
+    masks_in_use,
 )
 
 
@@ -856,3 +858,49 @@ def test_greedy_token_ids_match_logits_path(device, synthetic, edge):
     assert torch.equal(bonus_ids.cpu(), bonus_reference.cpu())
     assert torch.equal(target_ids.cpu(), torch.argmax(gathered, dim=-1).cpu())
     assert torch.equal(actual.cpu(), expected.cpu())
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("use_top_k, use_top_p", MASK_FLAG_COMBINATIONS)
+def test_rejection_sampler_random_leaves_out_unused_searches(
+    device, use_top_k, use_top_p
+):
+    """The compiled program without the searches no row uses returns the same
+    tokens as the one with both searches. Request 0 applies top-k when
+    use_top_k is set, request 1 applies top-p when use_top_p is set."""
+    sampler = RejectionSampler()
+    generator = torch.Generator().manual_seed(23)
+    vocab_size = 257
+    target_logits = 3 * torch.randn((8, vocab_size), generator=generator)
+    target_logits[5, ::7] = float("-inf")
+    draft_token_ids = torch.argmax(
+        target_logits + torch.randn((8, vocab_size), generator=generator), dim=-1
+    ).to(torch.int32)
+    segment_ids = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2], dtype=torch.int64)
+    request_top_k = torch.tensor([[5 if use_top_k else 0], [0], [0]], dtype=torch.int32)
+    request_top_p = torch.tensor([[1.0], [0.8 if use_top_p else 1.0], [1.0]])
+    assert masks_in_use(request_top_k, request_top_p) == (use_top_k, use_top_p)
+    common = dict(
+        draft_token_ids=draft_token_ids.to(device),
+        num_draft_tokens=torch.tensor([3, 3, 2], dtype=torch.int32, device=device),
+        target_logits=target_logits.to(device),
+        bonus_token_ids=torch.tensor([1, 2, 3], dtype=torch.int32, device=device),
+        segment_ids=segment_ids.to(device),
+        group_indices=torch.tensor(
+            [0, 1, 2, 0, 1, 2, 0, 1], dtype=torch.int64, device=device
+        ),
+        max_draft_tokens=3,
+        temperatures=torch.tensor(
+            [[1.0], [1.0], [1.0], [0.7], [0.7], [0.7], [0.0], [0.0]], device=device
+        ),
+        top_k=request_top_k[segment_ids].to(device),
+        top_p=request_top_p[segment_ids].to(device),
+        accept_u=torch.rand(8, generator=generator).to(device),
+        recover_u=torch.rand((8, vocab_size), generator=generator).to(device),
+        do_sampling=True,
+    )
+
+    both = sampler(**common)
+    flagged = sampler(**common, use_top_k=use_top_k, use_top_p=use_top_p)
+
+    assert torch.equal(flagged.cpu(), both.cpu())
