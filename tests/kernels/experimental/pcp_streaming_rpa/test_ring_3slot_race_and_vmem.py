@@ -340,10 +340,12 @@ def test_qwen35_stale_slot_control_exceeds_rmse_tolerance():
         (jnp.bfloat16, KVLayout.HEAD_ALONG_SUBLANE),
     ],
 )
-def test_3slot_ring_matches_fp64_at_qwen35_pcp8(
-    release_jax_backend, kv_dtype, kv_layout
-):
-    """Run the 3-slot kernel at the Qwen3.5 PCP8 geometry and compare to float64."""
+@pytest.mark.usefixtures("release_jax_backend")
+def test_unified_splash_matches_fp64_at_qwen35_pcp8(
+    kv_dtype: jax.typing.DTypeLike,
+    kv_layout: KVLayout,
+) -> None:
+    """Run unified Splash via the PCP wrapper at Qwen3.5 PCP8 geometry vs FP64."""
     mesh = _require_tpu_mesh((QWEN35_PCP_SIZE,))
     q_block_size = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
     global_tokens = QWEN35_PCP_SIZE * q_block_size
@@ -410,7 +412,6 @@ def test_3slot_ring_matches_fp64_at_qwen35_pcp8(
         k_scale=scale,
         v_scale=scale,
         cp_kv_cache_interleave_size=QWEN35_INTERLEAVE_SIZE,
-        q_block_size=q_block_size,
         kv_layout=kv_layout,
     )
     out = np.asarray(jax.device_get(output), dtype=np.float64)[inverse_order]
