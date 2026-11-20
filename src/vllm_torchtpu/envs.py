@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     TPU_MOE_PREFILL_TILE_MIN: int = 0
     TPU_MOE_PREFILL_ROW_TOKENS_RESIDENT_MAX_TOKENS: int = 0
     TPU_MOE_SINGLE_SORT: bool = True
+    TPU_MOE_GMM_ONE_STREAM: bool = False
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_TP_DECODE_FAST: bool = True
     TPU_MOE_TP_DECODE_SPLIT_META: bool = True
@@ -220,6 +221,7 @@ if TYPE_CHECKING:
     TPU_SC_TOPK_COOP_V2: bool = True
     TPU_SC_TOPK_COOP_MERGE: bool = True
     TPU_SC_TOPK_ONE_SUBCORE_CAPACITY: int = 0
+    TPU_SC_TOPK_SPREAD_PICK: bool = False
     TPU_DCP_INDEXER_SMALL_AG: bool = True
     TPU_INDEXER_TOPK_SHARED_READ: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
@@ -1424,6 +1426,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
+    # Run the gate·up and down expert matmuls of a MoE layer as one kernel
+    # (gmm_fused_moe) that streams both matmuls' weights as one pipeline and
+    # keeps the activation rows in VMEM, instead of 2 gmm_v2 calls. fp8
+    # weights with one scale per column only; the same bits as gmm_v2.
+    "TPU_MOE_GMM_ONE_STREAM": env_bool("TPU_MOE_GMM_ONE_STREAM", False),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
@@ -1968,6 +1975,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SC_TOPK_ONE_SUBCORE_CAPACITY": env_nonnegative_int(
         "TPU_SC_TOPK_ONE_SUBCORE_CAPACITY", 0
     ),
+    # sparsecore_topk_dcp: after each level's histogram exchange, every vector
+    # subcore of the owner rank sums and picks the bucket of its share of the
+    # owned rows (row i on subcore i % 16), instead of the owner subcore doing
+    # all of them one after another while 15 subcores wait. The same integer
+    # sums and picks, so the same columns. Migration switch: delete it, always
+    # spreading the picks, once a serving run shows it no slower at every
+    # prefill size.
+    "TPU_SC_TOPK_SPREAD_PICK": env_bool("TPU_SC_TOPK_SPREAD_PICK", default=False),
     # With TPU_SC_TOPK_DCP_MERGE_FLAT's flat path, buckets T <= 8
     # (streamindex_topk.SMALL_AG_MAX_TOKENS): the DCP
     # indexer's candidate all-gather (dcp x T * k int32 words) as one Pallas

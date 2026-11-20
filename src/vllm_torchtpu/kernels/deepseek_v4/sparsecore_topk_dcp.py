@@ -43,7 +43,7 @@ one pass.
 """
 
 import functools
-from typing import cast
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -54,6 +54,7 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     BITS_NEG_INF,
     KEY_NEG_INF,
@@ -123,6 +124,8 @@ def _vector_body(
     k: int,
     dcp_size: int,
     axis_name: str,
+    spread_pick: bool,
+    help_smem: Any = None,
     **_,
 ):
     del after_hbm
@@ -406,9 +409,10 @@ def _vector_body(
         pl.when(~live)(functools.partial(drain, j))
         return carry
 
-    def select(j, level, publish):
+    def select(j, level, publish, getf=get):
         """Sums row `j`'s histograms over the ranks (in peer_vmem), picks the
-        bucket, and hands `publish(d, fields, bucket)` each rank's new state."""
+        bucket, and hands `publish(d, fields, bucket)` each rank's new state.
+        `getf(j, f)` reads the row's selection state."""
         hb = j * NUM_BUCKETS
 
         def sum_ranks(i):
@@ -419,7 +423,7 @@ def _vector_body(
 
         plsc.parallel_loop(0, NUM_BUCKETS // LANES)(sum_ranks)
         total = scan_glob()
-        quota = jnp.int32(k) if level == 0 else get(j, F_QUOTA)
+        quota = jnp.int32(k) if level == 0 else getf(j, F_QUOTA)
         bucket = find_bucket(total - quota)
         cum_at = vec_at(glob_vmem, bucket)
         cum_lo = jnp.where(bucket > 0, vec_at(glob_vmem, jnp.maximum(bucket - 1, 0)), 0)
@@ -433,8 +437,8 @@ def _vector_body(
             fields[F_SHIFT] = jnp.int32(L0_SHIFT)
             done = keep | (quota == cnt)
         else:
-            fields[F_KEEP] = get(j, F_KEEP)
-            fields[F_PREFIX] = jnp.left_shift(get(j, F_PREFIX), 8) | bucket
+            fields[F_KEEP] = getf(j, F_KEEP)
+            fields[F_PREFIX] = jnp.left_shift(getf(j, F_PREFIX), 8) | bucket
             fields[F_SHIFT] = jnp.int32(REFINEMENT_LEVELS[level - 1][0])
             done = (quota == cnt) | (quota == 0)
         fields[F_DONE] = done.astype(jnp.int32)
@@ -468,9 +472,8 @@ def _vector_body(
         )
         handoff(first=level == 0)
 
-        # The owner sums, picks and stages every rank's state.
-        @pl.when(my_owner == rank)
-        def _():
+        def owner_picks_all():
+            """The owner subcore sums, picks and stages every owned row's states."""
             gather(
                 [
                     hist_shared.at[
@@ -522,6 +525,99 @@ def _vector_body(
                 )
                 for d in range(dcp_size)
             )
+
+        def spread_picks():
+            """Every subcore of the owner rank sums, picks and stages its share
+            of the owned rows: item i = (slot, j) of the per_owner x nrows owned
+            rows goes to subcore i % NUM_SUBCORES. Each writes its rows' states
+            where the owner's copy would, and keeps their selection state in
+            help_smem, since state_smem only receives it after round 2."""
+            items = per_owner * nrows
+            mine_n = jnp.right_shift(
+                jnp.maximum(items - sub + (NUM_SUBCORES - 1), 0),
+                NUM_SUBCORES.bit_length() - 1,
+            )
+
+            def help_get(i, f):
+                return help_smem[i * NF + f]
+
+            def help_put(i, f, v):
+                help_smem[i * NF + f] = v
+
+            def helped(i, c):
+                item = sub + NUM_SUBCORES * i
+                slot = lax.div(item, nrows)
+                j = lax.rem(item, nrows)
+                src_row = slot * rank_words + j * NUM_BUCKETS
+                copy_all(
+                    (
+                        hist_shared.at[
+                            pl.ds(
+                                pl.multiple_of((dcp_size + d) * block + src_row, LANES),
+                                NUM_BUCKETS,
+                            )
+                        ],
+                        peer_vmem.at[
+                            pl.ds(
+                                pl.multiple_of(d * rank_words + i * NUM_BUCKETS, LANES),
+                                NUM_BUCKETS,
+                            )
+                        ],
+                    )
+                    for d in range(dcp_size)
+                )
+
+                def publish(d, fields, bucket):
+                    del bucket
+                    v = jnp.zeros((LANES,), jnp.int32)
+                    for lane, f in enumerate(STATE_FIELDS):
+                        v = jnp.where(lane_iota == lane, fields[f], v)
+                    v = jnp.where(lane_iota == len(STATE_FIELDS), 1, v)  # updated
+                    state_vmem[pl.ds((d * MAX_ROWS + i) * STATE_WORDS, LANES)] = v
+                    if d == 0:
+                        for f in (F_QUOTA, F_KEEP, F_PREFIX, F_DONE):
+                            help_put(i, f, fields[f])
+
+                live = jnp.bool_(True) if level == 0 else help_get(i, F_DONE) == 0
+
+                @pl.when(live)
+                def _():
+                    select(i, level, publish, getf=help_get)
+
+                @pl.when(~live)
+                def _():
+                    for d in range(dcp_size):
+                        state_vmem[pl.ds((d * MAX_ROWS + i) * STATE_WORDS, LANES)] = (
+                            jnp.zeros((LANES,), jnp.int32)
+                        )
+
+                copy_all(
+                    (
+                        state_vmem.at[
+                            pl.ds((d * MAX_ROWS + i) * STATE_WORDS, STATE_WORDS)
+                        ],
+                        state_shared.at[
+                            pl.ds(
+                                pl.multiple_of(
+                                    jnp.where(d == rank, dcp_size + d, d) * state_block
+                                    + slot * state_rows
+                                    + j * STATE_WORDS,
+                                    LANES,
+                                ),
+                                STATE_WORDS,
+                            )
+                        ],
+                    )
+                    for d in range(dcp_size)
+                )
+                return c
+
+            lax.fori_loop(0, mine_n, helped, 0)
+
+        if spread_pick:
+            spread_picks()
+        else:
+            pl.when(my_owner == rank)(owner_picks_all)
 
         # Round 2: the owners' states back to every rank.
         handoff()
@@ -819,6 +915,7 @@ def sparsecore_topk_dcp(
     axis_name: str,
     scheduling_group_id: int | None = None,
     after: jax.Array | None = None,
+    spread_pick: bool | None = None,
 ) -> jax.Array:  # i32[b, k]
     """This rank's share of the exact top-k of rows split over `axis_name`.
 
@@ -900,7 +997,15 @@ def sparsecore_topk_dcp(
         ),
         copy_sem=pltpu.SemaphoreType.DMA @ vmesh,
     )
-    params = dict(b=b, n=n, k=k, dcp_size=dcp_size, axis_name=axis_name)
+    if spread_pick is None:
+        spread_pick = envs.TPU_SC_TOPK_SPREAD_PICK
+    if spread_pick:
+        scratch_types["help_smem"] = pallas_core.CoreMemorySpace(
+            pltpu.MemorySpace.SMEM, vmesh
+        )((MAX_ROWS * NF,), jnp.int32)
+    params = dict(
+        b=b, n=n, k=k, dcp_size=dcp_size, axis_name=axis_name, spread_pick=spread_pick
+    )
     out = pl.kernel(
         [
             functools.partial(_vector_body, **params),
@@ -915,7 +1020,9 @@ def sparsecore_topk_dcp(
             disable_bounds_checks=True,
             needs_layout_passes=False,
         ),
-        name=f"sc_topk_dcp_b{b}_n{n}_k{k}_d{dcp_size}",
+        name=(
+            f"sc_topk_dcp{'_spread' if spread_pick else ''}_b{b}_n{n}_k{k}_d{dcp_size}"
+        ),
         # pyrefly: ignore[bad-argument-count]
     )(words.reshape(-1), lengths, bounds, after)
     if scheduling_group_id is not None:
