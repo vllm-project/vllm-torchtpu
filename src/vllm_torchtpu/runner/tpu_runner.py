@@ -5961,7 +5961,7 @@ class TPUModelRunner(GPUModelRunner):
             # the host until the forward ends: submit the step's loads now.
             self._submit_deferred_kv_loads()
             host_phases.mark("kv_load_submit")
-        if self._kv_early_poll():
+        if envs.QWEN4_EXP_PD_EARLY_POLL and self._kv_early_poll():
             # q38 DEC-STEP-2 (QWEN4_EXP_PD_EARLY_POLL): a PD consumer polls its
             # connector here, while the device still runs the previous step,
             # off the host chain that starts when the wait below returns and
