@@ -175,7 +175,7 @@ def run_moe_v3(
 # One op for every shape: the v3 kernel derives its routing block from the
 # operands when they are not given, so nothing here has to vary
 # with the token count -- which is what keeps the token count out of the traced
-# graph. The name is also what `TpuPlatform` puts in `splitting_ops`.
+# graph.
 FUSED_MOE_EP_OP_NAME = "pallas::fused_moe_ep"
 
 # One op for the process, built at weight-load time. The compiled forward may
@@ -273,6 +273,12 @@ def _build_op(
         input_specs = (PartitionSpec(EP_AXIS_NAME),) * 7
 
     spec = PartitionSpec(EP_AXIS_NAME)
+
+    def _fake(x, *_args, **_kwargs):
+        # Shaped like x without an export: the default fake exports at the
+        # operands' concrete shapes, which would pin the caller's token count.
+        return torch.empty_like(x)
+
     # Use shard-local output shapes: the stock bridge sizes outputs from
     # export avals that record shard_map results as replicated, which can
     # assign the mesh-wide row count to each rank's output.
@@ -285,12 +291,8 @@ def _build_op(
         # EP axis, and so is the single output.
         input_partition_specs=input_specs,
         output_partition_specs=spec,
+        fake=_fake,
     )
-
-    def _fake(x, *_args, **_kwargs):
-        return torch.empty_like(x)
-
-    op.register_fake(_fake)
     global _OP, _SKIP_PADDED_TOKENS
     _OP = op
     _SKIP_PADDED_TOKENS = skip_padded_tokens
