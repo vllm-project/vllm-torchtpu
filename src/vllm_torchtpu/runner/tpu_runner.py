@@ -10493,24 +10493,30 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     _reset_read_offsets_compiled(offsets, keep_zero_dev, stacked, null)
                     _clear_read_offsets_compiled(offsets, stacked)
+                    # A chunk of this width holds at most `width` requests,
+                    # and its sampled rows are padded to its count's request
+                    # bucket, which exceeds the width when an SMEM cap made the
+                    # width something other than a request bucket.
+                    max_rows = _get_padded_num_reqs_with_upper_limit(
+                        width, self.max_num_reqs
+                    )
                     for num_reqs in self.num_reqs_paddings:
-                        if num_reqs > width:
+                        if num_reqs > max_rows:
                             continue
-                        if stacked.shape[-1] == num_reqs:
-                            for tok_dtype in (torch.int32, torch.int64):
-                                dummy_next = torch.full(
-                                    (num_reqs, k_plus_1),
-                                    INVALID_TOKEN_ID,
-                                    dtype=tok_dtype,
-                                    device=offsets.device,
-                                )
-                                _update_read_offsets_verify_compiled(
-                                    offsets, stacked, dummy_next
-                                )
+                        for tok_dtype in (torch.int32, torch.int64):
+                            dummy_next = torch.full(
+                                (num_reqs, k_plus_1),
+                                INVALID_TOKEN_ID,
+                                dtype=tok_dtype,
+                                device=offsets.device,
+                            )
+                            _update_read_offsets_verify_compiled(
+                                offsets, stacked, dummy_next
+                            )
                     if assembly_shapes is not None:
                         req_loop_pairs, two_chunk_pairs = assembly_shapes
                         for num_reqs, p in req_loop_pairs:
-                            if num_reqs > width:
+                            if num_reqs > max_rows:
                                 continue
                             nt_warm = torch.full(
                                 (num_reqs, k_plus_1),
@@ -10537,7 +10543,7 @@ class TPUModelRunner(GPUModelRunner):
                             )
                             synchronize_tensors(list(out_asm_off))
                         for (b0, p0), (b1, p1) in two_chunk_pairs:
-                            if b0 > width:
+                            if b0 > max_rows:
                                 continue
                             nt0_warm = torch.full(
                                 (b0, k_plus_1),

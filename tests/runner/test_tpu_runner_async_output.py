@@ -1002,18 +1002,20 @@ def _sharded_mtp_drafter(runner, lockstep):
     return drafter
 
 
-def _served_assembly_shapes(runner, drafter, lockstep):
+def _served_assembly_shapes(runner, drafter, lockstep, max_count=None):
     """The shapes the compiled assembly takes while serving: per chunk, its
     request bucket and the drafter's padded draft rows (the program runs when
     the drafts cover the sampled rows); per two-chunk step, both chunks of one
     step, whose request buckets fit max_num_reqs. Under lockstep every step's
-    DP-wide largest chunk m is walked, with every chunk of at most m requests."""
+    DP-wide largest chunk m is walked, with every chunk of at most m requests.
+    `max_count` caps a chunk's requests (a layout's SMEM-capped width)."""
     top = runner.max_num_reqs
+    count_cap = top if max_count is None else max_count
     one, two = set(), set()
-    for m in range(1, top + 1) if lockstep else [0]:
+    for m in range(1, count_cap + 1) if lockstep else [0]:
         runner._dp_step_max_reqs = m
         chunks = set()
-        for n in range(1, (m if lockstep else top) + 1):
+        for n in range(1, (m if lockstep else count_cap) + 1):
             shape = (
                 tpu_runner._get_padded_num_reqs_with_upper_limit(n, top),
                 drafter._loop_bucket(n),
@@ -1065,15 +1067,10 @@ _READ_OFFSET_PROGRAMS = (
 )
 
 
-@pytest.mark.parametrize("lockstep", [False, True])
-@pytest.mark.parametrize("async_scheduling", [True, False])
-def test_mamba_read_offset_warmup_covers_every_spec_shape(
-    monkeypatch, lockstep, async_scheduling
-):
-    """The spec-decode half of _precompile_mamba_rollback_helpers warms the
-    read-offset reset, clear and verify scatters at every batch width, and,
-    under async scheduling, the assembly programs that fold the read-offset
-    scatter in at every shape the serving assembly takes for that width."""
+def _read_offset_warmup_calls(monkeypatch, lockstep, async_scheduling, **fields):
+    """Run the spec-decode half of _precompile_mamba_rollback_helpers on a
+    32-request stub runner (`fields` override its layout) and record each
+    read-offset program's argument shapes and dtypes."""
     calls: dict[str, list[tuple]] = {name: [] for name in _READ_OFFSET_PROGRAMS}
 
     def recorder(name):
@@ -1111,37 +1108,102 @@ def test_mamba_read_offset_warmup_covers_every_spec_shape(
         _bucket_len=tpu_runner.TPUModelRunner._bucket_len,
         _precompile_timed=lambda _label: contextlib.nullcontext(),
     )
+    for name, value in fields.items():
+        setattr(runner, name, value)
     runner._read_offset_reset_scratch = (
         tpu_runner.TPUModelRunner._read_offset_reset_scratch.__get__(runner)
     )
     runner.drafter = _sharded_mtp_drafter(runner, lockstep)
     tpu_runner.TPUModelRunner._precompile_mamba_rollback_helpers(runner)  # type: ignore[arg-type]
+    return runner, calls
+
+
+def _warmed_read_offset_shapes(calls):
+    """(rows, draft rows, width) of each one-chunk warm-up, ((rows, draft
+    rows), (rows, draft rows), width) of each two-chunk one, and (rows,
+    width, dtype) of each verify scatter."""
+    one = {
+        (c[0][0][0], c[1][0][0], c[4][0][0])
+        for c in calls["_compiled_assemble_spec_rejected_and_read_offsets"]
+    }
+    two = {
+        ((c[0][0][0], c[1][0][0]), (c[3][0][0], c[4][0][0]), c[7][0][0])
+        for c in calls["_compiled_assemble_two_chunks_spec_rejected_and_read_offsets"]
+    }
+    verify = {
+        (c[2][0][0], c[1][0][0], str(c[2][1]))
+        for c in calls["_update_read_offsets_verify_compiled"]
+    }
+    return one, two, verify
+
+
+@pytest.mark.parametrize("lockstep", [False, True])
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_mamba_read_offset_warmup_covers_every_spec_shape(
+    monkeypatch, lockstep, async_scheduling
+):
+    """The spec-decode half of _precompile_mamba_rollback_helpers warms the
+    read-offset reset, clear and verify scatters at every batch width, and,
+    under async scheduling, the assembly programs that fold the read-offset
+    scatter in at every shape the serving assembly takes for that width."""
+    runner, calls = _read_offset_warmup_calls(monkeypatch, lockstep, async_scheduling)
 
     widths = [8, 16, 32]
     for name in ("_reset_read_offsets_compiled", "_clear_read_offsets_compiled"):
         assert sorted(
             c[2 if name.startswith("_reset") else 1][0] for c in calls[name]
         ) == [(w,) for w in widths], name
-    assert sorted(
-        (c[1][0][0], c[2][0], str(c[2][1]))
-        for c in calls["_update_read_offsets_verify_compiled"]
-    ) == sorted(
-        (w, (w, 4), str(dt)) for w in widths for dt in (torch.int32, torch.int64)
-    )
+    warmed_one, warmed_two, warmed_verify = _warmed_read_offset_shapes(calls)
+    assert warmed_verify == {
+        (b, w, str(dt))
+        for w in widths
+        for b in widths
+        if b <= w
+        for dt in (torch.int32, torch.int64)
+    }
     one, two = _served_assembly_shapes(runner, runner.drafter, lockstep)
-    warmed_one = {
-        (c[0][0][0], c[1][0][0], c[4][0][0])
-        for c in calls["_compiled_assemble_spec_rejected_and_read_offsets"]
-    }
-    warmed_two = {
-        ((c[0][0][0], c[1][0][0]), (c[3][0][0], c[4][0][0]), c[7][0][0])
-        for c in calls["_compiled_assemble_two_chunks_spec_rejected_and_read_offsets"]
-    }
     if not async_scheduling:
         assert not warmed_one and not warmed_two
         return
     assert warmed_one == {(b, p, w) for b, p in one for w in widths if b <= w}
     assert warmed_two == {(c0, c1, w) for c0, c1 in two for w in widths if c0[0] <= w}
+
+
+@pytest.mark.parametrize("lockstep", [False, True])
+@pytest.mark.parametrize(
+    ("max_model_len_reqs", "most_model_len_reqs"), [(20, None), (32, 12)]
+)
+def test_read_offset_warmup_covers_a_width_an_smem_cap_set(
+    monkeypatch, lockstep, max_model_len_reqs, most_model_len_reqs
+):
+    """When the SMEM cap leaves a layout's width below max_num_reqs at a
+    count that is not a request bucket (20 or 12 of 32), a chunk of up to that
+    many requests has its sampled rows padded to the next request bucket,
+    above the width. Every (rows, draft rows, width) the assembly and verify
+    scatters take while serving, for each layout's width, is warmed."""
+    runner, calls = _read_offset_warmup_calls(
+        monkeypatch,
+        lockstep,
+        True,
+        num_reqs_max_model_len=max_model_len_reqs,
+        num_reqs_most_model_len=most_model_len_reqs,
+    )
+    warmed_one, warmed_two, warmed_verify = _warmed_read_offset_shapes(calls)
+    top = runner.max_num_reqs
+    for width in {max_model_len_reqs, most_model_len_reqs} - {None}:
+        rows = {
+            tpu_runner._get_padded_num_reqs_with_upper_limit(n, top)
+            for n in range(1, width + 1)
+        }
+        assert max(rows) > width or width == top
+        one, two = _served_assembly_shapes(
+            runner, runner.drafter, lockstep, max_count=width
+        )
+        assert {(b, p, width) for b, p in one} <= warmed_one
+        assert {(c0, c1, width) for c0, c1 in two} <= warmed_two
+        assert {
+            (b, width, str(dt)) for b in rows for dt in (torch.int32, torch.int64)
+        } <= warmed_verify
 
 
 @pytest.mark.parametrize(
