@@ -165,17 +165,25 @@ def test_a_suffix_with_an_extra_boundary_token_takes_the_full_encode(monkeypatch
     assert cache.hits == 0 and not cache.disabled
 
 
+def _conversation(name: str, turns: int = 2) -> str:
+    """A chat prompt whose first turn is its own, so its prefix keys are too."""
+    return f"{B}system\nconversation {name}!" + _chat(turns)
+
+
 def test_the_cache_evicts_the_least_recently_used_prompts_to_its_limits():
-    fn, calls = _counting(_encode)
-    cache = tokcache_mod.PrefixTokenCache(fn, BID, min_tokens=1, max_entries=2)
-    prompts = [_chat(2, final=f"conversation {i}") for i in range(3)]
+    cache = tokcache_mod.PrefixTokenCache(_encode, BID, min_tokens=1, max_entries=2)
+    prompts = [_conversation(str(i)) for i in range(3)]
     sizes = [len(_encode(p)) for p in prompts]
     for p in prompts:
         cache.encode(p)
     assert len(cache._entries) == 2 and cache._total_tokens == sum(sizes[1:])
-    # The oldest conversation's keys left the index with it: its next turn
-    # finds no cached prefix of its own beyond what the others share.
-    assert all(v[0] != 0 for v in cache._index.values())
+    # Each conversation owns its keys: the evicted one's left the index with
+    # it, and the cached ones' stay.
+    evicted = prompts[0].encode()
+    evicted_keys, _ = cache._prefix_keys_with_state(evicted, cache._boundaries(evicted))
+    assert evicted_keys and not set(evicted_keys) & set(cache._index)
+    for entry in cache._entries.values():
+        assert set(entry.keys) <= set(cache._index)
 
     by_tokens = tokcache_mod.PrefixTokenCache(
         _encode, BID, min_tokens=1, max_tokens=sizes[0] + sizes[1]
@@ -184,6 +192,18 @@ def test_the_cache_evicts_the_least_recently_used_prompts_to_its_limits():
         by_tokens.encode(p)
     assert len(by_tokens._entries) == 2
     assert by_tokens._total_tokens <= sizes[0] + sizes[1]
+
+
+def test_eviction_keeps_a_shared_prefix_key_the_newer_entry_owns():
+    """Two conversations that share their first turns share those prefix
+    keys; the index points them at the newer entry, and evicting the older
+    one leaves them in place."""
+    cache = tokcache_mod.PrefixTokenCache(_encode, BID, min_tokens=1, max_entries=1)
+    cache.encode(_chat(2, final="older"))
+    cache.encode(_chat(2, final="newer"))
+    ((newer_eid, entry),) = cache._entries.items()
+    assert entry.keys and set(entry.keys) <= set(cache._index)
+    assert all(cache._index[k][0] == newer_eid for k in entry.keys)
 
 
 def _toy_hf_tokenizer():
@@ -373,7 +393,7 @@ def test_vllm_gets_a_copy_of_the_cached_token_ids(patched_renderer, cache_encode
     assert cache.hits >= 2
 
 
-def test_patched_renderer_leaves_truncation_to_vllm(patched_renderer, cache_encodes):
+def test_patched_renderer_leaves_truncation_to_vllm(patched_renderer):
     renderer, unpatched = patched_renderer
     params = TokenizeParams(max_total_tokens=None, truncate_prompt_tokens=10)
     prompt = {"prompt": _turns(1)}
