@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import torch
 from torch.nn import Parameter
 from torch_tpu._internal import pallas
+from vllm.compilation import backends as vllm_compilation_backends
 from vllm.config import CacheConfig, get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import mla_attention
@@ -65,7 +66,10 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasMLAttentionBackendImpl,
     VllmTPUDeepseekV32IndexerBackend,
 )
-from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    WEIGHT_FLIPPED_ATTR,
+    quantized_matmul,
+)
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
@@ -249,6 +253,158 @@ def _dcp_indexer_a2a_for_bucket(
     prefill-sized ones (>= `min_tokens`) take the all-to-all.
     """
     return enabled and num_tokens >= min_tokens
+
+
+def _use_local_q_for_bucket(
+    num_tokens: int, min_tokens: int, is_backbone: bool
+) -> bool:
+    """Whether a token bucket projects only this rank's query heads.
+
+    Applies under DCP query replication with TPU_DCP_Q_REPLICATE_MIN_TOKENS
+    set. The comparison runs while tracing, so each compiled bucket takes one
+    path. Only the backbone is traced once per bucket group; the MTP drafter
+    (`is_backbone` False) has one graph for every bucket, and comparing its
+    token count would pin that graph to the first size traced. So the
+    drafter always keeps the replicated query, and `min_tokens` and
+    `is_backbone` are checked before the token count is compared.
+
+    Args:
+      num_tokens: The padded token count of the bucket being traced.
+      min_tokens: TPU_DCP_Q_REPLICATE_MIN_TOKENS. 0 disables the local path.
+      is_backbone: True when the backbone, not the MTP drafter, is traced.
+
+    Returns:
+      True for buckets of at most `min_tokens` tokens in the backbone. For
+      example, with `min_tokens=64` the backbone's 16- and 32-token decode
+      buckets return True and its 4096-token prefill bucket returns False.
+    """
+    return min_tokens > 0 and is_backbone and num_tokens <= min_tokens
+
+
+_DCP_RANK_TENSORS: dict[tuple[str, int], torch.Tensor] = {}
+
+
+def _dcp_rank_tensor(device: torch.device, rank_in_group: int) -> torch.Tensor:
+    """This rank's position in its DCP group as int32 `[1]` data on `device`.
+
+    The local query path of TPU_DCP_Q_REPLICATE_MIN_TOKENS selects this
+    rank's query-head columns by this tensor instead of by a Python int. The
+    rank is then data, so every rank traces and compiles the same graph,
+    which precompile peer replay requires. Every layer of the process gets
+    the same tensor object.
+    """
+    key = (str(device), int(rank_in_group))
+    tensor = _DCP_RANK_TENSORS.get(key)
+    if tensor is None:
+        tensor = torch.tensor([rank_in_group], dtype=torch.int32, device=device)
+        _DCP_RANK_TENSORS[key] = tensor
+    return tensor
+
+
+def _check_local_q_proj(q_proj_layer: torch.nn.Module) -> None:
+    """Check that `_local_q_proj_columns` can select from `q_proj_layer`.
+
+    Args:
+      q_proj_layer: The projection that produces `q` (`q_b_proj`, or `q_proj`
+        without a query LoRA), after its quantization method has processed
+        the loaded weights.
+
+    Raises:
+      ValueError: If the projection has a bias, a weight not in the
+        `[n_in, n_out]` layout, a quantization method other than the TPU fp8
+        or unquantized linear method, or an fp8 scale whose last axis is not
+        the output channel.
+    """
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+    from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+        VllmUnquantizedLinearMethod,
+    )
+
+    method = getattr(q_proj_layer, "quant_method", None)
+    weight = cast(torch.Tensor, q_proj_layer.weight)
+    if (
+        getattr(q_proj_layer, "bias", None) is not None
+        or not getattr(q_proj_layer, WEIGHT_FLIPPED_ATTR, False)
+        or weight.dim() != 2
+        or not isinstance(method, (VllmFp8LinearMethodTPU, VllmUnquantizedLinearMethod))
+    ):
+        raise ValueError(
+            "TPU_DCP_Q_REPLICATE_MIN_TOKENS needs a bias-free query projection "
+            "with an [n_in, n_out] weight and the TPU fp8 or unquantized linear "
+            f"method; got {type(method).__name__}."
+        )
+    if weight.shape[1] % int(q_proj_layer.group_size):
+        raise ValueError(
+            f"q projection width {weight.shape[1]} is not divisible by the DCP "
+            f"group size {q_proj_layer.group_size}."
+        )
+    if isinstance(method, VllmFp8LinearMethodTPU):
+        scale = cast(torch.Tensor, q_proj_layer.weight_scale)
+        if scale.shape[-1] != weight.shape[1]:
+            raise ValueError(
+                f"q projection scale {list(scale.shape)} does not index the "
+                f"{weight.shape[1]} output channels on its last axis."
+            )
+
+
+def _local_q_proj_columns(
+    weight: torch.Tensor,
+    scale: torch.Tensor | None,
+    group_size: int,
+    rank: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Select this rank's query-head columns of a DCP-group projection.
+
+    Under DCP query replication, the query projection is a
+    `DCPGroupColumnParallelLinear`: its weight holds every head of the DCP
+    group, and the heads of the rank at position `r` in the group are the
+    output columns `[r * n, (r + 1) * n)`, with `n = n_out // group_size`.
+    This is the block upstream's `_local_view` slices from the projection's
+    output. A DCP group is `group_size` consecutive TP ranks, so the block is
+    also the shard that a plain `ColumnParallelLinear` loads on this rank,
+    which is the projection VLLM_DCP_Q_REPLICATE=0 builds.
+
+    The selection runs inside the traced forward and reads only tensors that
+    every trace of the model already takes as graph inputs: the replicated
+    weight, its scale, and the rank tensor (`_dcp_rank_tensor`). The
+    replicated path uses the same rank tensor, so a bucket that takes the
+    local path and a bucket that keeps the replicated path have graphs with
+    the same inputs, as the shape-variant warmup requires
+    (compilation/shape_variants.py). The rank is data, not a Python int, so
+    every rank traces the same graph, as precompile peer replay requires.
+    The weight is viewed as `[n_in, group_size, n]` and one index of the
+    middle axis is selected, which is a dynamic slice of `n` columns.
+
+    Per-channel and blockwise fp8 scales both index the output channel on
+    their last axis (`_format_linear_scale_for_runtime` in
+    quantization/fp8.py), and each output channel is quantized on its own,
+    so the same selection on the scale gives the scale this rank's shard
+    would have.
+
+    Example: `weight` f8e4m3fn `[2048, 16384]`, `group_size` 16 and `rank`
+    holding 3 give the f8e4m3fn `[2048, 1024]` columns 3072 to 4095.
+
+    Args:
+      weight: The `[n_in, n_out]` weight of the whole DCP group.
+      scale: Its fp8 scale with the output channel on the last axis, or None
+        for an unquantized weight.
+      group_size: The DCP group size. Must divide `n_out`.
+      rank: int32 `[1]`, this rank's position in its DCP group.
+
+    Returns:
+      `(weight, scale)`: the `[n_in, n]` weight and, for fp8, the scale whose
+      last axis is `n`; `scale` is None for an unquantized weight.
+    """
+    n_in, n_out = weight.shape
+    n = n_out // group_size
+    local_weight = weight.view(n_in, group_size, n).index_select(1, rank).view(n_in, n)
+    if scale is None:
+        return local_weight, None
+    lead = scale.shape[:-1]
+    local_scale = (
+        scale.view(*lead, group_size, n).index_select(len(lead), rank).view(*lead, n)
+    )
+    return local_weight, local_scale
 
 
 def _topk_rows_update_jax(buf: jax.Array, rows: jax.Array) -> jax.Array:
@@ -948,6 +1104,14 @@ class VllmTPUMLAAttention(MLAAttention):
         # process_weights_after_loading gathers W_UK_T on the flag too, and
         # this class does that itself once the weight is on device.
         self.dcp_q_replicate = dcp_q_replicate
+        # Set by the wrapper when TPU_DCP_Q_REPLICATE_MIN_TOKENS is on: the
+        # query projection whose columns the wrapper's local query path
+        # selects. `process_weights_after_loading` checks it and builds
+        # `dcp_rank` (`_dcp_rank_tensor`), the rank that selects them. Held in
+        # a tuple so torch does not register the projection a second time as
+        # a submodule of this layer.
+        self.q_proj_local_source: tuple[torch.nn.Module, ...] = ()
+        self.dcp_rank: torch.Tensor | None = None
         # The shared top-k table. A layer that reuses an earlier layer's
         # indices has no indexer, so this is where its top-k width is stated.
         self.topk_indices_buffer = topk_indices_buffer
@@ -1043,6 +1207,16 @@ class VllmTPUMLAAttention(MLAAttention):
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
                 )
 
+        # Small buckets under TPU_DCP_Q_REPLICATE_MIN_TOKENS project only this
+        # rank's heads and absorb them with the local `W_UK_T` above; the
+        # query projection runs before this hook, so its weight is final.
+        if self.q_proj_local_source:
+            (q_proj_layer,) = self.q_proj_local_source
+            _check_local_q_proj(q_proj_layer)
+            self.dcp_rank = _dcp_rank_tensor(
+                q_proj_layer.weight.device, int(q_proj_layer.rank_in_group)
+            )
+
         # Safely detach and clear kv_b_proj parameter buffers without breaking
         # PyTorch attribute integrity
         kv_b_proj_params = dict(self.kv_b_proj.named_parameters())
@@ -1058,7 +1232,11 @@ class VllmTPUMLAAttention(MLAAttention):
                 tensors.extend([self.W_UK_T_scale, self.W_UV_scale])
             tensors.extend(
                 t
-                for t in (self.W_UK_T_dcp_qrep, self.W_UK_T_dcp_qrep_scale)
+                for t in (
+                    self.W_UK_T_dcp_qrep,
+                    self.W_UK_T_dcp_qrep_scale,
+                    self.dcp_rank,
+                )
                 if t is not None
             )
             synchronize_tensors(tensors)
@@ -1197,12 +1375,51 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             topk_indices_buffer=self.topk_indices_buffer,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
+        # Only the sparse DCP path consumes the replicated query, so only
+        # there can a small bucket switch back to the local heads.
+        self.dcp_q_replicate_min_tokens = (
+            envs.TPU_DCP_Q_REPLICATE_MIN_TOKENS
+            if self.dcp_q_replicate and self.is_sparse
+            else 0
+        )
+        if self.dcp_q_replicate_min_tokens > 0:
+            self.mla_attn.q_proj_local_source = (q_proj_layer,)
 
         self.prefix = prefix
 
     def _q_proj_layer(self):
         """The projection that produces `q`, whichever of the two is wired."""
         return self.q_b_proj if self.q_lora_rank is not None else self.q_proj
+
+    def _project_q(
+        self, q_proj_layer: Any, x: torch.Tensor, rank: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Run the query projection `q_proj_layer` on `x`.
+
+        With a `rank` tensor (the local query path), multiply by this rank's
+        columns of the projection (`_local_q_proj_columns`, selected inside
+        the traced forward) the way the projection's own linear method
+        multiplies its weight, so the result equals what the projection
+        returns on this rank with VLLM_DCP_Q_REPLICATE=0. With None, run the
+        projection itself.
+        """
+        if rank is None:
+            return q_proj_layer(x)[0]
+        weight, scale = _local_q_proj_columns(
+            q_proj_layer.weight,
+            # Only the fp8 method stores a scale (`_check_local_q_proj`).
+            getattr(q_proj_layer, "weight_scale", None),
+            int(q_proj_layer.group_size),
+            rank,
+        )
+        if scale is None:
+            return torch.matmul(x, weight)
+        return quantized_matmul(
+            x,
+            weight,
+            scale,
+            w8a16_max_rows=q_proj_layer.quant_method.w8a16_max_rows,
+        )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if hasattr(super(), "process_weights_after_loading"):
@@ -1223,6 +1440,29 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         q_c = None
         kv_lora = None
         output_gate = None
+        # Under query replication with TPU_DCP_Q_REPLICATE_MIN_TOKENS set,
+        # small backbone buckets take the VLLM_DCP_Q_REPLICATE=0 path: project
+        # this rank's heads and let the sparse DCP path all-gather them.
+        local_q = _use_local_q_for_bucket(
+            hidden_states.shape[0],
+            self.dcp_q_replicate_min_tokens,
+            is_backbone=vllm_compilation_backends.model_tag == "backbone",
+        )
+        # The rank tensor that selects this rank's query heads, on the local
+        # path in `_project_q` and on the replicated path for the dead shard
+        # below. It is read here, before this layer reads any weight, in every
+        # bucket: Dynamo numbers a graph's inputs in the order the traced code
+        # first reads them, and the shape-variant warmup hands a compiled
+        # bucket between traces only when their inputs match in order too.
+        dcp_rank = None
+        if self.dcp_q_replicate_min_tokens > 0:
+            dcp_rank = self.mla_attn.dcp_rank
+            assert dcp_rank is not None, (
+                "TPU_DCP_Q_REPLICATE_MIN_TOKENS is set but the DCP rank tensor "
+                "was never built; `process_weights_after_loading` must run first."
+            )
+        # `_project_q` selects this rank's columns when given the rank tensor.
+        local_q_rank = dcp_rank if local_q else None
 
         if self.kimi_preprocess is not None:
             assert self.fused_qkv_a_proj is not None
@@ -1236,7 +1476,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 self.kv_a_layernorm.weight,
                 prefill_group is not None,
             )
-            q = self.q_b_proj(q_c)[0]
+            q = self._project_q(self.q_b_proj, q_c, local_q_rank)
         else:
             if self.q_lora_rank is not None:
                 assert self.fused_qkv_a_proj is not None, (
@@ -1265,7 +1505,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                         dim=-1,
                     )
                 q_c = self.q_a_layernorm(q_c)
-                q = self.q_b_proj(q_c)[0]
+                q = self._project_q(self.q_b_proj, q_c, local_q_rank)
             else:
                 assert self.kv_a_proj_with_mqa is not None, (
                     "kv_a_proj_with_mqa is required when q_lora_rank is None"
@@ -1274,7 +1514,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     "q_proj is required when q_lora_rank is None"
                 )
                 kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
-                q = self.q_proj(hidden_states)[0]
+                q = self._project_q(self.q_proj, hidden_states, local_q_rank)
 
             assert kv_lora is not None
             kv_c, k_pe = kv_lora.split(
@@ -1283,8 +1523,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             kv_c_normed = self.kv_a_layernorm(kv_c)
 
         # `dcp_group_size` is 1 unless query replication is on, in which case
-        # the projection already returned the whole DCP group's heads.
-        q = q.view(-1, self.num_heads * self.dcp_group_size, self.qk_head_dim)
+        # the projection already returned the whole DCP group's heads, except
+        # in a bucket that took the local heads (`local_q`).
+        q_heads = self.num_heads * (1 if local_q else self.dcp_group_size)
+        q = q.view(-1, q_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # Add head dim of 1 to k_pe
@@ -1321,17 +1563,39 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # Hand the group-wide q to the sparse DCP path, which would otherwise
         # all-gather the heads itself; everything else takes this rank's shard.
         q_dcp_replicated = None
-        if self.dcp_q_replicate:
+        if self.dcp_q_replicate and not local_q:
             if self.is_sparse:
                 q_dcp_replicated = (q_nope, q_pe)
             q_proj_layer = cast(DCPGroupColumnParallelLinear, self._q_proj_layer())
             if q_dcp_replicated is not None and topk_indices is not None:
                 # The sparse DCP path reads only q_dcp_replicated, so this
-                # rank's shard is dead. Slice the same heads on every rank: a
-                # rank-dependent slice makes every rank trace a different graph,
-                # and precompile peer replay then refuses every peer artifact.
-                n = q_nope.shape[-2] // q_proj_layer.group_size
-                q_nope, q_pe = q_nope[..., :n, :], q_pe[..., :n, :]
+                # rank's shard is dead. The heads must not be chosen by a
+                # Python rank: a rank-dependent slice makes every rank trace a
+                # different graph, and precompile peer replay then refuses
+                # every peer artifact. Without a rank tensor, slice the same
+                # heads on every rank.
+                group_size = int(q_proj_layer.group_size)
+                n = q_nope.shape[-2] // group_size
+                if dcp_rank is not None:
+                    # With TPU_DCP_Q_REPLICATE_MIN_TOKENS, select this rank's
+                    # heads by the rank tensor that the local query path of
+                    # the small buckets reads (`_project_q`). Every trace then
+                    # takes that tensor as a graph input, whichever path its
+                    # bucket takes, and the shape-variant warmup can hand a
+                    # compiled bucket from one trace to another. The rank is
+                    # data, so the graph is still the same on every rank.
+                    q_nope = (
+                        q_nope.unflatten(-2, (group_size, n))
+                        .index_select(-3, dcp_rank)
+                        .squeeze(-3)
+                    )
+                    q_pe = (
+                        q_pe.unflatten(-2, (group_size, n))
+                        .index_select(-3, dcp_rank)
+                        .squeeze(-3)
+                    )
+                else:
+                    q_nope, q_pe = q_nope[..., :n, :], q_pe[..., :n, :]
             else:
                 local_view = q_proj_layer._local_view
                 q_nope, q_pe = local_view(q_nope), local_view(q_pe)
