@@ -417,14 +417,13 @@ def _update_read_offsets_verify_impl(
     return offsets
 
 
-_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-_stack_mamba_groups_compiled = _tpu_compile(_stack_mamba_groups_impl)
-_reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
-_spec_seed_and_rollback_compiled = _tpu_compile(_spec_seed_and_rollback_impl)
-_clear_read_offsets_compiled = _tpu_compile(_clear_read_offsets_impl)
-_update_read_offsets_verify_compiled = _tpu_compile(_update_read_offsets_verify_impl)
-_rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
-_rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
+_stack_mamba_groups_compiled = tpu_compile(_stack_mamba_groups_impl)
+_reset_read_offsets_compiled = tpu_compile(_reset_read_offsets_impl)
+_spec_seed_and_rollback_compiled = tpu_compile(_spec_seed_and_rollback_impl)
+_clear_read_offsets_compiled = tpu_compile(_clear_read_offsets_impl)
+_update_read_offsets_verify_compiled = tpu_compile(_update_read_offsets_verify_impl)
+_rollback_offsets_seed_compiled = tpu_compile(_rollback_offsets_seed_impl)
+_rollback_offsets_migrate_compiled = tpu_compile(_rollback_offsets_migrate_impl)
 
 
 def _stack_or_single_mamba_groups(groups: list[torch.Tensor]) -> torch.Tensor:
@@ -604,7 +603,7 @@ def _substitute_placeholder_token(
 
 
 @_static_shape_args
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _substitute_and_extract_draft_token_ids(
     input_ids: torch.Tensor,
     substitution_indices: torch.Tensor,

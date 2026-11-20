@@ -202,7 +202,9 @@ def test_the_source_checks_recognize_each_spelling():
 # such a call, so it turns direct dispatch off and every call goes through
 # Dynamo. A change that adds such a site lists it here, so that losing direct
 # dispatch is a decision rather than an accident.
-THROUGH_DYNAMO: list[tuple[str, str]] = []
+THROUGH_DYNAMO: list[tuple[str, str]] = [
+    ("runner.tpu_runner", "_stack_mamba_groups_compiled"),
+]
 
 DISABLED = "direct dispatch disabled"
 
@@ -275,6 +277,9 @@ DISPATCHED_DIRECTLY = [
         "structured_decoding.structured_decoding_manager",
         "StructuredDecodingManager.structured_decode",
     ),
+    ("runner.tpu_runner", "_clear_read_offsets_compiled"),
+    ("runner.tpu_runner", "_update_read_offsets_verify_compiled"),
+    ("runner.tpu_runner_async_output", "_compiled_extract_draft_token_ids"),
 ]
 
 

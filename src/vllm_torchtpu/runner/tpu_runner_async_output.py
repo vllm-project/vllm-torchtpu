@@ -24,6 +24,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
+from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
 from vllm_torchtpu.spec_decode.utils import _static_shape_args
 
 INVALID_TOKEN_ID = -1
@@ -369,7 +370,7 @@ def compute_num_rejected(
 
 
 @_static_shape_args
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _compiled_subtract_num_rejected_tokens(
     seq_lens: torch.Tensor,
     positions: torch.Tensor,
@@ -387,7 +388,7 @@ def _compiled_subtract_num_rejected_tokens(
 
 
 @_static_shape_args
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _compiled_extract_draft_token_ids(
     input_ids: torch.Tensor,
     logits_indices: torch.Tensor,
@@ -397,7 +398,7 @@ def _compiled_extract_draft_token_ids(
 
 
 @_static_shape_args
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _compiled_pad_non_spec_next_tokens(
     selected: torch.Tensor,
     k: int,
