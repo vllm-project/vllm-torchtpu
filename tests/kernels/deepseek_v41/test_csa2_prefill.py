@@ -25,14 +25,12 @@ def test_tile_plan_covers_each_output_once(bq):
         tiles, count = build_query_tiles(jnp.asarray(starts), tokens, bq)
         tiles = np.asarray(tiles)[: int(count)]
         coverage = np.zeros(tokens, np.int32)
-        boundaries = np.r_[starts, tokens]
         for request, start, size in tiles:
             assert 0 < size <= bq
-            assert (
-                boundaries[request] <= start < start + size <= boundaries[request + 1]
-            )
+            assert starts[request] <= start < start + size <= starts[request + 1]
             coverage[start : start + size] += 1
-        np.testing.assert_array_equal(coverage, 1)
+        # Padding rows past the last request are zeroed without a tile.
+        np.testing.assert_array_equal(coverage, np.arange(tokens) < starts[-1])
 
 
 def prefill_inputs(banked=False, non_causal=False, heads=8, page_size=64):

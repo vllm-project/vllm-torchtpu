@@ -21,14 +21,15 @@ class _UniformTiles:
 
 
 def _fill_query_tiles(starts, tiles, total_tokens, bq):
+    """Tile the request rows; padding rows from starts[B] onward get no tile."""
     batch = starts.shape[0] - 1
+    padding = _padding_start(starts, total_tokens)
 
-    def request_body(request, first):
-        begin = starts[request]
-        end = jnp.where(
-            request == batch, total_tokens, starts[jnp.minimum(request + 1, batch)]
-        )
-        count = pl.cdiv(end - begin, bq)
+    def request_body(carry):
+        request, first, begin = carry
+        following = starts[request + 1]
+        end = jnp.minimum(following, padding)
+        count = pl.cdiv(jnp.maximum(end - begin, 0), bq)
 
         def tile_body(local, unused):
             offset = begin + local * bq
@@ -39,10 +40,22 @@ def _fill_query_tiles(starts, tiles, total_tokens, bq):
             return None
 
         lax.fori_loop(0, count, tile_body, None)
-        return first + count
+        return request + 1, first + count, following
 
-    # A final synthetic request covers output padding without an HBM clear pass.
-    return lax.fori_loop(0, batch + 1, request_body, jnp.int32(0))
+    # Boundaries never decrease, so the requests after the first one that
+    # starts at the padding are empty: a decode bucket's unused slots cost
+    # no loop iterations.
+    _, count, _ = lax.while_loop(
+        lambda carry: (carry[0] < batch) & (carry[2] < padding),
+        request_body,
+        (jnp.int32(0), jnp.int32(0), starts[0]),
+    )
+    return count
+
+
+def _padding_start(starts, total_tokens):
+    # Rows past the bucket are never tiled or zeroed, whatever starts[B] holds.
+    return jnp.clip(starts[starts.shape[0] - 1], 0, total_tokens)
 
 
 def build_query_tiles(
@@ -148,7 +161,9 @@ def _csa2_kernel_impl(
 
     Output rows land at query_offset onward. With ``owners`` "new" or
     "aliased", the main KV rows are also copied to the matching rows of the
-    [T', 512, 128] output, which "aliased" updates in place.
+    [T', 512, 128] output, which "aliased" updates in place. Padding rows
+    (from starts[B] on) are zeroed in the attention output and unspecified in
+    the KV output.
     """
     if owners == "aliased":
         _, _, out_hbm, kv_out_hbm, *scratch = refs
@@ -177,6 +192,8 @@ def _csa2_kernel_impl(
         output_sems,
         kv_sem,
         tile_scratch,
+        zeros,  # [bq, H, 512], BF16; None with fixed tiles
+        padding_sem,
     ) = scratch
     tokens, heads = positions_ref.shape[0], q_hbm.shape[1]
     bq = q_buf.shape[1]
@@ -206,9 +223,50 @@ def _csa2_kernel_impl(
         lax.fori_loop(0, count, tile_body, None)
     else:
         count = _fill_query_tiles(plan_ref, tiles_ref, tokens, bq)
-        if bq == 1:
-            count = tokens
     mxu_heads = pl.cdiv(heads, 16) * 16
+
+    # Rows from starts[B] are output padding: zero them with DMAs instead of
+    # running them through query tiles.
+    padding = tokens if fixed_tiles else _padding_start(plan_ref, tokens)
+    if not fixed_tiles:
+        # A call without request rows still runs one tile, of padding rows
+        # (request B, masked to zero), so the tile pipeline below stays
+        # unconditional.
+        empty = count == 0
+
+        @pl.when(empty)
+        def _():
+            tiles_ref[0] = batch
+            tiles_ref[1] = 0
+            tiles_ref[2] = min(bq, tokens)
+
+        padding = jnp.where(empty, min(bq, tokens), padding)
+        count = jnp.maximum(count, 1)
+    padding_tiles = pl.cdiv(tokens - padding, bq)
+
+    def padding_copy(index):
+        start = padding + index * bq
+        size = jnp.minimum(bq, tokens - start)
+        return pltpu.make_async_copy(
+            zeros.at[pl.ds(0, size)],
+            out_hbm.at[pl.ds(query_offset + start, size)],
+            padding_sem.at[0],
+        )
+
+    def start_padding():
+        if fixed_tiles:
+            return
+
+        @pl.when(padding_tiles > 0)
+        def _():
+            zeros[...] = jnp.zeros(zeros.shape, zeros.dtype)
+
+        lax.fori_loop(0, padding_tiles, lambda i, _: padding_copy(i).start(), None)
+
+    def wait_padding():
+        if fixed_tiles:
+            return
+        lax.fori_loop(0, padding_tiles, lambda i, _: padding_copy(i).wait(), None)
 
     def safe_tile(tile):
         if isinstance(tile, int):
@@ -651,6 +709,8 @@ def _csa2_kernel_impl(
         def _(*, i=i):
             start(i, i)
 
+    start_padding()
+
     for copy in (*input_copies(0, 0), *swa_copies(0, 0)):
         copy.wait()
     prepare(0, 0, 0)
@@ -748,6 +808,8 @@ def _csa2_kernel_impl(
         output_copy(count - 2, (count - 2) % 2).wait()
 
     output_copy(count - 1, (count - 1) % 2).wait()
+
+    wait_padding()
 
 
 def _csa2_kernel(
@@ -850,8 +912,8 @@ def csa2(
     SWA accepts BF16 [pages,tokens,512] or shared INT32 [pages,word_rows,128]
     owners. Four 128-word rows hold a pair of tokens; each word packs the same
     feature from adjacent token rows in its low/high halves. Physical page
-    geometry stays identical to the main word pool. starts [B+1] describes requests;
-    repeated boundaries and output padding are supported.
+    geometry stays identical to the main word pool. starts [B+1] describes requests
+    and never decreases; repeated boundaries and output padding are supported.
     Explicit swa_bounds selects visibility independently of model layer stage.
 
     The T queries are rows [query_offset, query_offset + T) of q [T',H,512].
@@ -860,7 +922,8 @@ def csa2(
     owners and ``(out, kv_out)`` is returned, so a chunked caller needs no
     output update or gathered-KV concatenation. ``new_owners`` instead
     returns two newly allocated owners of those shapes; only this call's rows
-    are written.
+    are written. Padding rows (from starts[B] on) get zero attention and
+    unspecified KV.
 
     ``main_kv=None`` (with ``main_kv_scale=None``) is SWA-only attention, the
     layers whose compress ratio is 0: the window is the whole key set and the
@@ -1069,6 +1132,8 @@ def csa2(
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((4,)),
                 pltpu.SMEM((tile_capacity * 3,), jnp.int32),
+                None if fixed_tiles else pltpu.VMEM((bq, heads, 512), jnp.bfloat16),
+                pltpu.SemaphoreType.DMA((1,)),
             ),
         ),
         compiler_params=pltpu.CompilerParams(

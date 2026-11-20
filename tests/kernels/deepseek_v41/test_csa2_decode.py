@@ -256,3 +256,31 @@ def test_decode_reuses_executable_across_request_boundaries(
         actual = np.asarray(executable(jax.device_put(data)), np.float32)
         np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
         np.testing.assert_array_equal(actual[starts[-1] :], 0)
+
+
+@pytest.mark.parametrize("requests", [0, 1, 2])
+def test_decode_bucket_zeroes_padding_rows(benchmark, requests):
+    """A served decode bucket: 64 request slots, 16 rows, 6-token requests.
+
+    Rows past the last request get no query tile; they must still be zero.
+    """
+    if jax.default_backend() != "tpu":
+        pytest.skip("Async MXU operations require TPU")
+    tokens, slots, real = 16, 64, 6 * requests
+    host = benchmark.make_inputs(max(requests, 1), 6, 64)
+    for key in ("q", "main_kv", "main_kv_scale", "positions", "rope_cache"):
+        value = host[key][:real]
+        host[key] = np.concatenate(
+            (value, np.zeros((tokens - real, *value.shape[1:]), value.dtype))
+        )
+    host["main_lengths"] = np.where(np.arange(tokens) < real, 512, 0).astype(np.int32)
+    starts = np.full(slots + 1, real, np.int32)
+    starts[: requests + 1] = np.arange(requests + 1) * 6
+    metadata = np.zeros((slots, host["swa_metadata"].shape[1]), np.int32)
+    metadata[:requests] = host["swa_metadata"][:requests]
+    host.update(starts=starts, swa_metadata=metadata)
+    actual = np.asarray(csa2(**jax.device_put(host), bq=6), np.float32)
+    if real:
+        expected = benchmark.reference(host, range(real))
+        np.testing.assert_allclose(actual[:real], expected, atol=3e-3, rtol=3e-2)
+    np.testing.assert_array_equal(actual[real:], 0)

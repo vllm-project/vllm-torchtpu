@@ -131,13 +131,17 @@ def test_chunked_attention_preserves_requests_and_reusable_kv(
     # The deep gather only changes staging: chunked and
     # single-chunk results, including zeroed invalid rows, must be bitwise
     # equal to the default.
+    # Rows past the last request (155) are unspecified in the KV owner.
     for chunk in (chunk_size, tokens):
         reference = pipeline(chunk)
-        for variant, default in zip(pipeline(chunk, deep_gather=True), reference):
-            np.testing.assert_array_equal(variant, default)
+        for i, (variant, default) in enumerate(
+            zip(pipeline(chunk, deep_gather=True), reference)
+        ):
+            rows = slice(0, 155) if i == 1 else slice(None)
+            np.testing.assert_array_equal(variant[rows], default[rows])
     np.testing.assert_allclose(output, expected, atol=2e-3, rtol=2e-2)
     np.testing.assert_array_equal(output[155:], 0)
-    np.testing.assert_array_equal(gathered_words, expected_words)
+    np.testing.assert_array_equal(gathered_words[:155], expected_words[:155])
     np.testing.assert_array_equal(gathered_scales, expected_scales)
 
     next_q = q * jnp.bfloat16(0.7)
@@ -216,6 +220,26 @@ def test_offset_attention_updates_only_its_owner_rows(ragged):
     np.testing.assert_array_equal(got[others], out[others])
     np.testing.assert_array_equal(got_kv[rows], inputs["main_kv"])
     np.testing.assert_array_equal(got_kv[others], kv_out[others])
+
+
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="CSA2 attention")
+def test_offset_attention_zeroes_padding_rows():
+    # Rows past starts[B] get no query tile: their attention rows are zeroed,
+    # request rows still reach the KV owner.
+    inputs, random = _offset_inputs(True)
+    inputs["starts"] = jnp.array([0, 15, 15, 31], jnp.int32)
+    tokens, offset = inputs["positions"].shape[0], 24
+    q = random((96, 8, 512))
+    rows = np.arange(offset, offset + tokens)
+    expected = csa2(q[rows], **inputs, bq=8)
+    out = random(q.shape)
+    kv_out = jnp.asarray(
+        np.random.default_rng(5).integers(-(2**31), 2**31, (96, 512, 128)), jnp.int32
+    )
+    got, got_kv = csa2(q, **inputs, bq=8, query_offset=offset, out=out, kv_out=kv_out)
+    np.testing.assert_array_equal(got[rows], expected)
+    np.testing.assert_array_equal(got[rows[31:]], 0)
+    np.testing.assert_array_equal(got_kv[rows[:31]], inputs["main_kv"][:31])
 
 
 def test_offset_attention_requires_matching_owners():

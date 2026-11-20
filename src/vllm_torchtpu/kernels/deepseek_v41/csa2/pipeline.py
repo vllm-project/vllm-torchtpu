@@ -66,7 +66,8 @@ def csa2_pipeline(
     in place into two whole-T owners, so later layers reuse contiguous KV with
     one persistent attention launch, without a per-chunk output update or a
     KV-word concatenation after the pipeline. Only the small FP32 scale
-    chunks are still joined.
+    chunks are still joined. Output padding rows (past the last request) are
+    zero in the attention owner and unspecified in the KV owner.
     Only query boundaries become chunk-relative; SWA metadata and noncausal
     bounds retain their absolute positions, including future draft tokens.
 
@@ -103,7 +104,8 @@ def csa2_pipeline(
         return output, gathered_words, gathered_scales
 
     scale_chunks = []
-    # Every row of both owners is written by exactly one chunk. The first
+    # Every request row of both owners is written by exactly one chunk (KV
+    # owner padding rows stay unspecified; no query tile reads them). The first
     # chunk allocates them as its own outputs: XLA merges identical
     # `lax.empty` buffers across layers, then copies one layer's owners so
     # the two in-place writers stay disjoint.
