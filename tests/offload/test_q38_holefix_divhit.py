@@ -230,8 +230,9 @@ def test_flag_off_the_split_chain_hits_nothing(monkeypatch):
     s = _split_chain(monkeypatch)
     from vllm_torchtpu.offload import lookup_log
 
-    attn, ckpt = lookup_log.hbm_presence(s.kvm.block_pool, s.turn.block_hashes, s.attention, s.mamba, K + 1)
-    assert attn == [True] * J + [False] * (K + 1 - J) and not any(ckpt), "HOLE the measured HBM state"
+    # The turn's prompt has K full blocks (its 2,000-token tail is not a full block).
+    attn, ckpt = lookup_log.hbm_presence(s.kvm.block_pool, s.turn.block_hashes, s.attention, s.mamba, K)
+    assert attn == [True] * J + [False] * (K - J) and not any(ckpt), f"HOLE the measured HBM state: {attn} {ckpt}"
     a = _admit(s)
     local, junction, diverged, ext = a.first
     assert (local, diverged, ext) == (0, False, 0), f"HOLE local 0, convergent, no tier hit: {a.first}"
