@@ -169,6 +169,7 @@ markers = [
     "multichip: tests that need more than 2 TPU chips; CI runs them on an 8-chip agent",
     "spawns_tpu_workers: tests that spawn a torch.distributed.run worker group spanning the TPU slice; must run before any in-process TPU test in the same pytest session",
     "omni: tests that run omni multimodal and diffusion models",
+    "cpu_test: tests that need no TPU chip; a session of only such tests runs with JAX pinned to the CPU",
 ]
 
 [tool.ruff]
