@@ -4197,6 +4197,18 @@ class TestLazyPartialBlocks(unittest.TestCase):
         self.assertEqual(sched._partial_tail_block_size, self.TPC)
         self.assertTrue(sched._lazy.partial_blocks)
 
+    def test_enable_warns_when_every_hash_boundary_ends_a_block(self):
+        from vllm_torchtpu.offload import raiden_connector
+
+        with patch.object(raiden_connector.logger, "warning") as warning:
+            self._make(hashes_per_chunk=4)
+        warning.assert_not_called()
+        with patch.object(raiden_connector.logger, "warning") as warning:
+            sched = self._make(hashes_per_chunk=1)
+        self.assertEqual(sched.config.tokens_per_hash, self.TPC)
+        warning.assert_called_once()
+        self.assertIn("no partial block can be stored", warning.call_args.args[0])
+
     def _init_scheduler(self, env):
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
             OffloadingConnectorScheduler,

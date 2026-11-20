@@ -379,6 +379,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self.config = self.config._replace(supports_partial_tail=True)
         self._partial_tail_block_size = block_tokens.pop()
         self._lazy.partial_blocks = True
+        if self.config.tokens_per_hash % self._partial_tail_block_size == 0:
+            logger.warning(
+                "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS: no partial block can be "
+                "stored: every %d-token hash boundary is a %d-token block end.",
+                self.config.tokens_per_hash,
+                self._partial_tail_block_size,
+            )
+            return
         logger.info(
             "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS: the tier stores partly "
             "filled HBM blocks and loads them as partial tails (%d-token hash "
