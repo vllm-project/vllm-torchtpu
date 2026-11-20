@@ -221,7 +221,6 @@ class _ComputeEvent:
     """Normalized compute or collective trace event scoped to a rank stream."""
 
     rank_key: str
-    stream_key: str
     start_us: float
     end_us: float
     duration_us: float
@@ -355,14 +354,13 @@ def _build_step_window(
 
 
 def _build_compute_event(
-    stream_ids: tuple[str, str],
+    rank_key: str,
     start_us: float,
     duration_us: float,
     name: str,
     args: Mapping[str, object],
 ) -> _ComputeEvent:
     """Construct a `_ComputeEvent` from microsecond timing and event metadata."""
-    rank_key, stream_key = stream_ids
     collective_op = _classify_collective(name)
     group_size_raw = _int_or_none(args.get("group_size"))
     group_size = (
@@ -376,7 +374,6 @@ def _build_compute_event(
     byte_size = _int_or_none(raw_bytes) or 0
     return _ComputeEvent(
         rank_key=rank_key,
-        stream_key=stream_key,
         start_us=start_us,
         end_us=start_us + duration_us,
         duration_us=duration_us,
@@ -507,9 +504,7 @@ def _record_perfetto_item(
     else:
         stream_key = f"{rank_key}:tid:{thread_id}"
         events_by_stream.setdefault(stream_key, []).append(
-            _build_compute_event(
-                (rank_key, stream_key), start_us, duration_us, name, args
-            )
+            _build_compute_event(rank_key, start_us, duration_us, name, args)
         )
 
 
@@ -592,7 +587,7 @@ def _ingest_xplane(
             else:
                 events_by_stream.setdefault(stream_key, []).append(
                     _build_compute_event(
-                        (rank_key, stream_key), start_us, duration_us, event_name, args
+                        rank_key, start_us, duration_us, event_name, args
                     )
                 )
 
