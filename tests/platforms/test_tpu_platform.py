@@ -2074,8 +2074,6 @@ def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
 def test_set_additional_forward_context_caches_dp_num_tokens_tpu_tensor(monkeypatch):
     """Repeated calls with the same num_tokens_across_dp tuple reuse the cached
     device tensor instead of calling .to('tpu') on every forward context."""
-    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
-
     monkeypatch.setattr(TpuPlatform, "_dp_tokens_tpu_cache", {})
     to_calls = []
 

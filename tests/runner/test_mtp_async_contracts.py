@@ -209,7 +209,7 @@ def test_mamba_read_offset_follows_storage_owner(
         dtype=torch.int32,
         device=device,
     )
-    runner._update_mamba_slot_read_offsets([indices], sampled, 1)
+    runner._update_mamba_slot_read_offsets([indices], sampled)
     before = runner.mamba_slot_read_offsets.cpu().tolist()[slot]
     assert before == offset
 

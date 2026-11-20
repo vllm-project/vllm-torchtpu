@@ -33,6 +33,10 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_torchtpu.runner.speculative_decoding_manager import (
+    SpeculativeDecodingManager,
+)
+
 SRC = (
     pathlib.Path(__file__).resolve().parents[2]
     / "src/vllm_torchtpu/runner/tpu_runner.py"
@@ -70,7 +74,7 @@ def test_cached_subtract_indices_upload_synchronously():
     end = src.index(end_marker, i) + len(end_marker)
     block = src[i:end]
     assert "non_blocking=" not in block
-    assert "_h2d_temp(" not in block
+    assert "stage_h2d_upload(" not in block
     assert "sub_cache.clear()" not in block
     assert "while len(sub_cache) >= 256:" in block
     assert "sub_cache.pop(next(iter(sub_cache)))" in block
@@ -131,14 +135,14 @@ def test_cached_subst_indices_fifo_256_and_synchronous():
     i = src.index("subst_cache = self._async_subst_dev_cache")
     block = src[i : src.index("subst_cache[subst_key] = substitution_indices", i)]
     assert "non_blocking=" not in block
-    assert "_h2d_temp(" not in block
+    assert "stage_h2d_upload(" not in block
     assert "while len(subst_cache) >= 256:" in block
     assert block.count(".to(self.device)") == 1
 
 
 def test_uniform_and_heterogeneous_sampling_params_cache():
     """_build_padded_sampling_params reuses one uniform cache entry across
-    varying num_active_reqs and uploads synchronously (never _h2d_temp)."""
+    varying num_active_reqs and uploads synchronously (never stage_h2d_upload)."""
     tree = ast.parse(SRC.read_text())
     fn_node = next(
         item
@@ -149,7 +153,7 @@ def test_uniform_and_heterogeneous_sampling_params_cache():
         and item.name == "_build_padded_sampling_params"
     )
     fn_src = textwrap.dedent(ast.get_source_segment(SRC.read_text(), fn_node))
-    assert "_h2d_temp(" not in fn_src
+    assert "stage_h2d_upload(" not in fn_src
     assert "non_blocking=" not in fn_src
 
     uploads = []
@@ -262,10 +266,6 @@ def test_spec_decode_metadata_uploads_are_staged(defer):
     next input-staging fence: the 6 index tensors (cached for later steps) and
     the drafts, on the uncached and the cached path and when a deferred
     upload is made."""
-    from vllm_torchtpu.runner.speculative_decoding_manager import (
-        SpeculativeDecodingManager,
-    )
-
     input_ids = torch.arange(1, 11, dtype=torch.int32)
     runner = _staging_runner(input_ids)
     manager = SpeculativeDecodingManager(runner)
