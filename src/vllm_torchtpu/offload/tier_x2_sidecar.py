@@ -199,12 +199,15 @@ def _install(src: str, name: str, env=None) -> str:
     return dst
 
 
-def _answers(host: str, port: int) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=1.0):
-            return True
-    except OSError:
-        return False
+def _answers(host, port: int) -> bool:
+    """Whether ``host`` (or any of a tuple of hosts) accepts a connection on ``port``."""
+    for h in (host,) if isinstance(host, str) else host:
+        try:
+            with socket.create_connection((h, port), timeout=1.0):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _rss_gib(pid: int) -> float:
@@ -262,7 +265,8 @@ def watch(root: str, env=None, poll_s: float = 1.0, stop_after_s: float | None =
         port = int(env[REGISTRY_PORT])
         reg = _install(os.path.join(root, *REGISTRY_BIN), "global_registry_server", env)
         p = subprocess.Popen([reg, f"--port={port}"], stdin=subprocess.DEVNULL, env=dict(env))
-        procs.append(("registry", p, {"host": "127.0.0.1", "port": port, "up": False, "t": time.monotonic()}))
+        # The registry listens on [::]; an IPv6-only pod (Exos) has no 127.0.0.1, so both loopbacks are tried.
+        procs.append(("registry", p, {"host": ("127.0.0.1", "::1"), "port": port, "up": False, "t": time.monotonic()}))
         _say(f"Q38X2_REGISTRY_START pid={p.pid} port={port}", env)
     if env.get(NODES):
         node = _install(os.path.join(root, *NODE_BIN), "kv_cache_host_store_node_main", env)
