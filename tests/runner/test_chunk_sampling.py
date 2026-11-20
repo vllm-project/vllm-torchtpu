@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for the per-chunk sampling helpers of ``TPUModelRunner``."""
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -695,9 +696,9 @@ def test_compiled_packed_sampler_on_tpu_matches_the_host(rows, u_in_graph) -> No
     TPU at 256 candidates: greedy rows (one with a tie, the higher token id
     listed first) and top-k 1 sampled rows, whose token depends on neither
     the noise nor its last bits. `u_in_graph` runs the variant serving
-    compiles, which draws its uniforms in-graph (u=None)."""
-    import torch_tpu  # noqa: F401
-
+    compiles, which draws its uniforms in-graph (u=None). The module runs
+    every test under force_eager, so this one restores the default stance
+    around the TPU call."""
     gen = torch.Generator().manual_seed(rows)
     num_cand = 256
     logits = torch.randn((rows, num_cand), generator=gen)
@@ -720,15 +721,56 @@ def test_compiled_packed_sampler_on_tpu_matches_the_host(rows, u_in_graph) -> No
         _apply_temperature=TPUModelRunner._apply_temperature.__get__(object())
     )
     device = torch.device("tpu")
-    out = TPUModelRunner.sample_from_packed_candidates(
-        runner,
-        packed.to(device),
-        temperatures.to(device),
-        None if u_in_graph else u.to(device),
-        top_k.to(device),
-        top_p.to(device),
-    )
+    with torch.compiler.set_stance("default"):
+        out = TPUModelRunner.sample_from_packed_candidates(
+            runner,
+            packed.to(device),
+            temperatures.to(device),
+            None if u_in_graph else u.to(device),
+            top_k.to(device),
+            top_p.to(device),
+        )
     assert torch.equal(out.cpu(), host)
+
+
+@pytest.mark.parametrize("u_in_graph", [False, True], ids=["u_given", "u_in_graph"])
+@pytest.mark.parametrize("rows", [8, 16])
+def test_the_traced_packed_sampler_matches_the_host(rows, u_in_graph) -> None:
+    """The CPU counterpart of the TPU test above: dynamo traces
+    sample_from_packed_candidates whole (fullgraph, static shapes) under the
+    default stance and the eager backend runs the captured graph, which gives
+    the host's tokens for greedy rows (one with a tie, the higher token id
+    listed first) and top-k 1 sampled rows. It covers the traced program, not
+    its TPU lowering, which only the TPU test runs."""
+    fn = inspect.unwrap(TPUModelRunner.sample_from_packed_candidates)
+    gen = torch.Generator().manual_seed(rows)
+    num_cand = 64
+    logits = torch.randn((rows, num_cand), generator=gen)
+    token_ids = (
+        torch.randperm(4096, generator=gen)[: rows * num_cand]
+        .reshape(rows, num_cand)
+        .to(torch.float32)
+    )
+    logits[0, 3] = logits[0, 9] = logits[0].max() + 1.0
+    token_ids[0, 3], token_ids[0, 9] = 900.0, 12.0
+    packed = torch.cat([logits, token_ids], dim=-1)
+    temperatures = torch.full((rows, 1), 0.7)
+    temperatures[: rows // 2] = 0.0
+    u = torch.rand((rows, num_cand), generator=gen)
+    top_k = torch.ones((rows, 1), dtype=torch.int32)
+    top_p = torch.ones((rows, 1))
+    host = _sample_packed(packed, temperatures, u, top_k, top_p)
+    assert host[0].item() == 12
+    runner = SimpleNamespace(
+        _apply_temperature=TPUModelRunner._apply_temperature.__get__(object())
+    )
+    torch._dynamo.reset()
+    with torch.compiler.set_stance("default"):
+        traced = torch.compile(fn, backend="eager", fullgraph=True, dynamic=False)
+        out = traced(
+            runner, packed, temperatures, None if u_in_graph else u, top_k, top_p
+        )
+    assert torch.equal(out, host)
 
 
 @pytest.mark.parametrize("seed", range(20))
