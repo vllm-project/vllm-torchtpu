@@ -14,6 +14,7 @@
 """Tests for the per-worker NUMA bind: it narrows the inherited CPU set to the
 chip's node and never widens it."""
 
+import ctypes
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -24,7 +25,9 @@ from vllm_torchtpu.worker import numa_bind, worker_options
 _NODE1_CPUS = "56-111,168-223"
 
 
-def _bind(inherited, node=1, node_cpulist=_NODE1_CPUS):
+def _bind(inherited, node=1, node_cpulist=_NODE1_CPUS, cdll=None):
+    """Bind on a one-chip host whose chip sits on `node`; returns the CPU sets
+    applied. `cdll` stands in for ctypes.CDLL (by default libnuma is missing)."""
     applied = []
 
     def fake_read(path):
@@ -37,10 +40,37 @@ def _bind(inherited, node=1, node_cpulist=_NODE1_CPUS):
         patch.object(numa_bind, "_read", side_effect=fake_read),
         patch("os.sched_getaffinity", return_value=set(inherited)),
         patch("os.sched_setaffinity", side_effect=lambda _, c: applied.append(c)),
-        patch("ctypes.CDLL", side_effect=OSError("no libnuma")),
+        patch("ctypes.CDLL", side_effect=cdll or OSError("no libnuma")),
     ):
         numa_bind.bind_to_chip_numa_node(0, 1)
     return applied
+
+
+def _libnuma(available=0):
+    """A stand-in for ctypes.CDLL that opens a libnuma whose
+    numa_available() returns `available`; records the library names opened
+    and the libnuma calls with their arguments."""
+    opened, calls = [], []
+
+    def numa_available():
+        calls.append(("numa_available",))
+        return available
+
+    def numa_set_preferred(node):
+        calls.append(("numa_set_preferred", type(node), node.value))
+
+    lib = SimpleNamespace(
+        numa_available=numa_available, numa_set_preferred=numa_set_preferred
+    )
+
+    def cdll(name):
+        opened.append(name)
+        return lib
+
+    return cdll, opened, calls
+
+
+_NODE1_SET = set(range(56, 112)) | set(range(168, 224))
 
 
 def test_unrestricted_worker_gets_the_whole_node():
@@ -56,6 +86,46 @@ def test_launcher_reservation_is_kept_by_intersection():
 
 def test_no_cpu_on_the_node_leaves_the_inherited_set():
     assert _bind(inherited=range(56)) == []
+
+
+@pytest.mark.parametrize(
+    "inherited", [range(224), range(56)], ids=["cpus-on-node", "no-cpu-on-node"]
+)
+def test_libnuma_prefers_the_chips_node_after_checking_numa_support(inherited):
+    """libnuma's rule: numa_available() comes first. Then the chip's node
+    becomes the preferred memory node, also when the CPU set stays as
+    inherited."""
+    cdll, opened, calls = _libnuma()
+    with patch.object(numa_bind, "logger") as log:
+        _bind(inherited=inherited, cdll=cdll)
+    assert opened == ["libnuma.so.1"]
+    assert calls == [("numa_available",), ("numa_set_preferred", ctypes.c_int, 1)]
+    assert log.info.call_args_list[-1].args[-1] == "memory preferred there"
+    log.warning.assert_not_called()
+
+
+def test_without_libnuma_the_cpu_set_still_narrows():
+    with patch.object(numa_bind, "logger") as log:
+        applied = _bind(inherited=range(224))
+    assert applied == [_NODE1_SET]
+    assert log.info.call_args_list[-1].args[-1] == (
+        "memory policy unchanged (libnuma unavailable)"
+    )
+    log.warning.assert_not_called()
+
+
+def test_without_numa_support_the_memory_policy_is_left_alone():
+    """numa_available() returns -1: no other libnuma call is made, and the CPU
+    set still narrows."""
+    cdll, _, calls = _libnuma(available=-1)
+    with patch.object(numa_bind, "logger") as log:
+        applied = _bind(inherited=range(224), cdll=cdll)
+    assert applied == [_NODE1_SET]
+    assert calls == [("numa_available",)]
+    assert log.info.call_args_list[-1].args[-1] == (
+        "memory policy unchanged (libnuma reports no NUMA support)"
+    )
+    log.warning.assert_not_called()
 
 
 def test_chip_without_numa_node_is_left_alone():
