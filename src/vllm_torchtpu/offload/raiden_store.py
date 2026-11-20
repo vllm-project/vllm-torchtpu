@@ -174,6 +174,19 @@ def x2_sweep_env_on() -> bool:
     return all(os.environ.get(name, "") in ("true", "1") for name in X2_SWEEP_ENV)
 
 
+def x2_expand_env(name: str, value: str) -> str:
+    """TIER-X2: ``$VAR`` / ``${VAR}`` in an extra-config address expanded from the
+    environment; refused when a variable is unset (an unexpanded address would be
+    advertised to peers that can never dial it)."""
+    out = os.path.expandvars(value)
+    if "$" in out:
+        raise ValueError(
+            f"TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_X2: {name} "
+            f"{value!r} names an unset environment variable"
+        )
+    return out
+
+
 def x2_shard_namespace(key_namespace: bytes, shard: str) -> bytes:
     """A shard's own key namespace: the shards of one class hold the same keys, and
     the registry maps a key's bytes to one owner, so each shard's keys must differ."""
@@ -2848,6 +2861,14 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_X2 is a mode of "
                 "the host tier classes and needs VLLM_TPU_OFFLOAD_TIER_CLASSES=1"
             )
+        if self.tier_x2:
+            # A recipe passes the extra config as one literal string, so the pod's
+            # own address arrives as ${VAR} (e.g. ${TPU_RAIDEN_ADVERTISE_HOST}).
+            self.global_registry_address = x2_expand_env(
+                "global_registry_address", self.global_registry_address
+            )
+            self.store_server_ip = x2_expand_env("store_server_ip", self.store_server_ip)
+            self.kv_pool_group = x2_expand_env("kv_pool_group", self.kv_pool_group)
         if envs.VLLM_TPU_OFFLOAD_TIER_CLASSES:
             self.tier_plan = self._build_tier_plan(
                 config, vllm_config, int(cpu_bytes_to_use)

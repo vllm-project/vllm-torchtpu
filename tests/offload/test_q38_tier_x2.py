@@ -364,6 +364,32 @@ def test_x2_refusals(monkeypatch, classes, extra, sweep, error):
         _spec(monkeypatch, cfg, stages, kvc, **extra)
 
 
+def test_x2_expands_the_pods_address_from_the_environment(monkeypatch):
+    cfg, _, stages, kvc = _served(monkeypatch)
+    _x2_env(monkeypatch)
+    monkeypatch.setenv("TPU_RAIDEN_ADVERTISE_HOST", "10.1.2.3")
+    extra = {
+        "global_registry_address": "127.0.0.1:31600",
+        "store_server_ip": "${TPU_RAIDEN_ADVERTISE_HOST}",
+        "kv_pool_group": "q38x2",
+    }
+    spec = _spec(monkeypatch, cfg, stages, kvc, **extra)
+    assert spec.store_server_ip == "10.1.2.3"
+    assert spec.global_registry_address == "127.0.0.1:31600"
+    assert spec.tier_x2_pool_group(spec.tier_plan.classes[0]) == "q38x2-main.r1"
+    monkeypatch.delenv("TPU_RAIDEN_ADVERTISE_HOST")
+    with pytest.raises(ValueError, match="names an unset environment variable"):
+        _spec(monkeypatch, cfg, stages, kvc, **extra)
+
+
+def test_flag_off_keeps_the_extra_config_literal(monkeypatch):
+    cfg, _, stages, kvc = _served(monkeypatch, classes=False)
+    monkeypatch.delenv("VLLM_TPU_OFFLOAD_TIER_X2", raising=False)
+    monkeypatch.setenv("TPU_RAIDEN_ADVERTISE_HOST", "10.1.2.3")
+    spec = _spec(monkeypatch, cfg, stages, kvc, store_server_ip="${TPU_RAIDEN_ADVERTISE_HOST}")
+    assert spec.store_server_ip == "${TPU_RAIDEN_ADVERTISE_HOST}"
+
+
 def test_flag_off_still_refuses_the_registry_with_the_classes(monkeypatch):
     cfg, _, stages, kvc = _served(monkeypatch)
     monkeypatch.delenv("VLLM_TPU_OFFLOAD_TIER_X2", raising=False)
