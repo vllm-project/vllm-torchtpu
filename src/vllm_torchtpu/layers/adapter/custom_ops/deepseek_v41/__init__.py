@@ -11,12 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DeepSeek-V4.1 single-bank cache and SWA window custom-op bridges."""
+"""DeepSeek-V4.1 cache, indexer, attention, and mHC custom-op bridges."""
 
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.attention_op import (
+    dsv41_gather_sparse_fp8_kv,
+    dsv41_sparse_mla_swa_attention,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.cache_op import (
     dsv41_gather_cache_rows,
     dsv41_pack_fp8_kv_rows,
     dsv41_write_sub_rows_in_place,
+)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.indexer_op import (
+    dsv41_paged_indexer_topk,
+)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.mhc_op import (
+    get_mhc_post_op,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.swa_window_op import (
     dsv41_gather_swa_windows,
@@ -24,7 +34,11 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.swa_window_op import (
 
 __all__ = [
     "dsv41_gather_cache_rows",
+    "dsv41_gather_sparse_fp8_kv",
     "dsv41_gather_swa_windows",
     "dsv41_pack_fp8_kv_rows",
+    "dsv41_paged_indexer_topk",
+    "dsv41_sparse_mla_swa_attention",
     "dsv41_write_sub_rows_in_place",
+    "get_mhc_post_op",
 ]

@@ -236,9 +236,13 @@ def _dequantize_packed_nope(nope_words: np.ndarray) -> np.ndarray:
 def test_should_export_dsv41_cache_ops_with_single_bank_signatures() -> None:
     expected_exports = [
         "dsv41_gather_cache_rows",
+        "dsv41_gather_sparse_fp8_kv",
         "dsv41_gather_swa_windows",
         "dsv41_pack_fp8_kv_rows",
+        "dsv41_paged_indexer_topk",
+        "dsv41_sparse_mla_swa_attention",
         "dsv41_write_sub_rows_in_place",
+        "get_mhc_post_op",
     ]
     assert dsv41_ops.__all__ == expected_exports
     for name in expected_exports:
