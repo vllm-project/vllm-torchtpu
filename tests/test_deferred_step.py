@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+import inspect
 import sys
 from collections import deque
 from types import SimpleNamespace
 
 import pytest
+import vllm.v1.engine.core as vllm_engine_core
 
 from vllm_torchtpu.core import deferred_step
 
@@ -352,17 +354,14 @@ def test_data_parallel_engine_core_is_unchanged(engine_core, monkeypatch):
 def real_engine_core(monkeypatch):
     """vLLM's EngineCore with its __init__ and the patch flag restored after
     the test."""
-    core_module = pytest.importorskip("vllm.v1.engine.core")
-    engine_core = core_module.EngineCore
+    engine_core = vllm_engine_core.EngineCore
     monkeypatch.setattr(engine_core, "__init__", engine_core.__init__)
     monkeypatch.setattr(engine_core, "_tpu_deferred_step_patch", False, raising=False)
     monkeypatch.setattr(deferred_step.envs, "TPU_DEFER_STEP", True, raising=False)
-    return core_module
+    return vllm_engine_core
 
 
 def test_real_engine_core_classes_keep_what_the_patch_uses(real_engine_core):
-    import inspect
-
     engine_core = real_engine_core.EngineCore
     engine_core_proc = real_engine_core.EngineCoreProc
     assert issubclass(engine_core_proc, engine_core)

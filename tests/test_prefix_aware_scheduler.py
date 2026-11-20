@@ -31,7 +31,9 @@ from vllm.config import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -42,7 +44,12 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
-from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
+from vllm_torchtpu.core import prefix_aware_scheduler
+from vllm_torchtpu.core.prefix_aware_scheduler import (
+    PrefixAwareScheduler,
+    _Follower,
+    _Rejoin,
+)
 
 
 def _make_request(
@@ -776,9 +783,6 @@ def test_shared_trees_keep_every_read_correct(seed):
 def test_read_check_fails_without_the_same_step_patch(monkeypatch):
     """The read check catches a request that reads a block its sibling writes
     in the same step, which the same-step prefix-hit patch prevents."""
-    from vllm.v1.core.block_pool import BlockPool
-
-    run_engine(True, sibling_arrivals())
     monkeypatch.setattr(
         BlockPool, "get_cached_block", BlockPool.get_cached_block.__wrapped__
     )
@@ -789,8 +793,6 @@ def test_read_check_fails_without_the_same_step_patch(monkeypatch):
 def test_follower_needs_to_see_blocks_hashed_this_step(monkeypatch):
     """Counting only blocks written before this step, the follower never sees
     its chunk cached and computes it beside its sibling, as with follow off."""
-    from vllm_torchtpu.core import prefix_aware_scheduler
-
     off = run_engine(False, sibling_arrivals())
     monkeypatch.setattr(prefix_aware_scheduler, "BLOCKS_HASHED_THIS_STEP", "x")
     on = run_engine(True, sibling_arrivals())
@@ -845,10 +847,6 @@ def test_follower_rejoins_under_a_connector_that_needs_kv_delivery():
 
 
 def test_paused_scheduler_preempts_no_follower():
-    from vllm.v1.core.sched.interface import PauseState
-
-    from vllm_torchtpu.core.prefix_aware_scheduler import _Follower
-
     for state, kept in ((PauseState.PAUSED_NEW, True), (PauseState.UNPAUSED, False)):
         scheduler = make_scheduler(True)
         request = make_request("r", prompt(6, 8 * BLOCK))
@@ -866,8 +864,6 @@ def test_follower_the_last_step_did_not_reach_waits_while_its_prefix_grows():
     """A follower that the last step did not reach, for example because the
     requests ahead of it used the token budget, is kept while its cached
     prefix grows between step starts, and preempted once it stops."""
-    from vllm_torchtpu.core.prefix_aware_scheduler import _Follower
-
     scheduler = make_scheduler(True)
     request = make_request("r", prompt(9, 8 * BLOCK))
     scheduler.requests["r"] = request
@@ -886,14 +882,13 @@ def test_follower_the_last_step_did_not_reach_waits_while_its_prefix_grows():
 
     scheduler._update_followers()
     assert request.status == RequestStatus.PREEMPTED
+    assert "r" in scheduler.reset_preempted_req_ids
     assert "r" not in scheduler._followers
     assert scheduler._rejoins["r"].computed_tokens == 2 * BLOCK
     assert request not in scheduler.running
 
 
 def test_finished_and_waiting_requests_leave_or_keep_their_entries():
-    from vllm_torchtpu.core.prefix_aware_scheduler import _Follower, _Rejoin
-
     scheduler = make_scheduler(True)
     waiting = make_request("waiting", prompt(7, 8 * BLOCK))
     rejoined = make_request("rejoined", prompt(8, 8 * BLOCK))
