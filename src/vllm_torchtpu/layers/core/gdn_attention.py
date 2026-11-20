@@ -59,8 +59,10 @@ def gdn_kernel_wrapper(architecture: str | None) -> ModuleType:
     copy of `kernels/gdn/v3` in `models/qwen3_5/kernels/gdn`, the home for
     GDN changes validated only on the Qwen3.5 MoE serving configurations.
     Every other architecture, and a caller that passes no architecture, runs
-    the shared kernel in `kernels/gdn/v3` unchanged. This is the only place
-    that chooses between the two; the copy is imported only when chosen.
+    the shared kernel in `kernels/gdn/v3` unchanged. The dense and pooled
+    paths choose here, and the copy is imported only when chosen; the PCP
+    prefill (`run_jax_gdn_attention_pcp_tp_prefill`) does not ask and always
+    runs `kernels/gdn/v3`.
     """
     if architecture in QWEN3_5_GDN_COPY_ARCHITECTURES:
         from vllm_torchtpu.models.qwen3_5.kernels.gdn import (
