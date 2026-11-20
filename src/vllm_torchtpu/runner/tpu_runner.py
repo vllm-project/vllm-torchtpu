@@ -10727,11 +10727,10 @@ class TPUModelRunner(GPUModelRunner):
         `num_tokens_padded` rows, which every rank holds. None takes the
         decision the target forward makes, `sequence_parallel.step_rows_are_sliced`:
         sliced only when the step is sequence-parallel and the model follows
-        each step's form. A model that does not (main's forwards) gets the full
-        mask, as on main, because its MoE paths read the mask over all of a
-        step's rows: written for a forward that reads every row, the per-rank
-        slice marks other ranks' real rows as padding and the MoE drops their
-        experts.
+        each step's form. A model that does not gets the full mask, because
+        its MoE paths read the mask over all of a step's rows: written for a
+        forward that reads every row, the per-rank slice marks other ranks'
+        real rows as padding and the MoE drops their experts.
         """
         padding_state = getattr(self, "_token_padding_state", None)
         if padding_state is None:

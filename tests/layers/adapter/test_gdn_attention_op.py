@@ -2115,3 +2115,17 @@ def test_the_397b_fp8_input_projection_takes_prequantized_rows(
     assert qwen3_next_patch._takes_prequant_rows(qkvz)
     assert attention.in_proj_ba.weight.dtype == torch.bfloat16
     assert not qwen3_next_patch._takes_prequant_rows(attention.in_proj_ba)
+
+
+def test_the_pooled_pcp_forward_refuses_pre_quantized_rows():
+    """The pooled PCP forward reads hidden_states, which would hold the FP8 rows
+    without their scales, so it refuses pre-quantized rows instead of dropping
+    them."""
+    layer = SimpleNamespace(
+        kv_cache=[torch.zeros(4)], _has_active_pooled_pcp_state=lambda _kv: True
+    )
+    rows = torch.zeros(2, 8, dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="takes no pre-quantized rows"):
+        VllmGatedDeltaNetAttention.forward(
+            layer, rows, prequant=(rows, torch.ones(2, 1))
+        )

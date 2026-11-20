@@ -1232,6 +1232,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     ) -> torch.Tensor:
         kv_cache = self.kv_cache
         if self._has_active_pooled_pcp_state(kv_cache):
+            if prequant is not None:
+                # hidden_states would then be the FP8 rows, without scales.
+                raise ValueError(
+                    "The pooled PCP GDN forward reads hidden_states and takes no "
+                    "pre-quantized rows; a PCP-streaming layer is never marked "
+                    "for them (_mark_pre_attn_norm_quant)."
+                )
             assert kv_cache is not None
             attn_metadata = cast(
                 "dict[str, _GdnAttentionMetadata]", get_forward_context().attn_metadata
@@ -1257,11 +1264,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 ba, _ = self.in_proj_ba(hidden_states)
                 z, _ = self.in_proj_z(hidden_states)
             else:
-                # torch's stubs type these two projections `Module | Tensor`.
+                # Cast like every projection here: the type checker can see a
+                # submodule as `Module | Tensor`.
                 mixed_qkv = _project_prequant(
                     cast(LinearBase, self.in_proj_qkv), prequant
                 )
-                ba = _project_prequant(self.in_proj_ba, prequant)
+                ba = _project_prequant(cast(LinearBase, self.in_proj_ba), prequant)
                 z = _project_prequant(cast(LinearBase, self.in_proj_z), prequant)
             if self.fused_output_projection is None:
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
@@ -1273,8 +1281,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
                 ba, _ = self.in_proj_ba(hidden_states)
             else:
-                mixed_qkvz = _project_prequant(self.in_proj_qkvz, prequant)
-                ba = _project_prequant(self.in_proj_ba, prequant)
+                mixed_qkvz = _project_prequant(
+                    cast(LinearBase, self.in_proj_qkvz), prequant
+                )
+                ba = _project_prequant(cast(LinearBase, self.in_proj_ba), prequant)
 
             # Every checkpoint loader produces [q, k, v, z] and [b, a].
             qkv_size = self.tp_head_geometry.local_conv_dim(
