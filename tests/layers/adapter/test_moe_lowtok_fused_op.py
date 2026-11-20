@@ -134,12 +134,16 @@ def test_other_layouts_leave_it_unarmed_without_the_groups_collective(
     """TP8 (the other measured decode layout), TP other than a chip's pair, a DP x TP
     that is not the EP mesh, one engine on a chip's pair (nothing to
     dispatch over DP), or a TP pair across two single-device chips: the
-    default MoE path, and no collective."""
+    default MoE path, and no collective. None of these is a misconfigured
+    DP x TP2 layout, so the op itself does not warn."""
     check = _layout(monkeypatch, **layout)
+    logger = Mock(name="logger")
+    monkeypatch.setattr(op, "logger", logger)
     op.prebuild()
     assert op._ARMED is False
     assert op._RANK is None
     check.assert_not_called()
+    logger.warning_once.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -174,9 +178,15 @@ def test_the_device_info_decides_and_a_disarmed_tp_pair_is_logged(
 
 
 def test_tp_groups_off_the_mesh_blocks_leave_it_unarmed(monkeypatch, fresh):
+    """A DP x TP2 layout whose groups are not the mesh's blocks keeps the
+    XLA collectives and says so once, as the chip check does."""
     _layout(monkeypatch, dp=4, tp=2, groups_match=False)
+    logger = Mock(name="logger")
+    monkeypatch.setattr(op, "logger", logger)
     op.prebuild()
     assert op._ARMED is False
+    logger.warning_once.assert_called_once()
+    assert logger.warning_once.call_args.args[1:] == (4, 2, 2)
 
 
 def test_no_expert_parallel_mesh_leaves_it_unarmed(monkeypatch, fresh):
