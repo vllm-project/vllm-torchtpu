@@ -51,6 +51,28 @@ if envs.TPU_DCP_MERGE_VSPACE_FUSED:
     from vllm_torchtpu.layers.adapter import dcp_vspace  # noqa: F401
 
 
+def _dcp_merge_after_jax(x: jax.Array, dep: jax.Array) -> jax.Array:
+    """`x`, ordered after `dep`: an edge for the scheduler, with no data."""
+    return jax.lax.optimization_barrier((x, dep))[0]
+
+
+def _fake_dcp_merge_after(x: torch.Tensor, dep: torch.Tensor) -> torch.Tensor:
+    del dep
+    return torch.empty_like(x)
+
+
+# Registered at import: Dynamo cannot trace a lock-guarded registration.
+_dcp_merge_after_op = pallas.jax_op("pallas::dcp_merge_after", _dcp_merge_after_jax)
+_dcp_merge_after_op.register_fake(_fake_dcp_merge_after)
+
+
+def _after(x: torch.Tensor, dep: torch.Tensor) -> torch.Tensor:
+    """Order `x` after `dep` via XLA optimization_barrier on TPU; identity on host."""
+    if x.device.type == "tpu":
+        return _dcp_merge_after_op(x, dep)
+    return x
+
+
 def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
     """Widen a rank's query head slice to the whole DCP group's heads.
 
@@ -307,15 +329,24 @@ def _merge_chunked(
         # (RS_BF16) and/or the heads-major operand (WEIGHTED_HM).
         lse_f32 = lse.to(torch.float32)
         pieces: list[torch.Tensor] = []
+        op_sink: list[torch.Tensor] = []
         for c in range(chunks):
+            out_c = output[c * step : (c + 1) * step]
+            lse_c = lse_f32[c * step : (c + 1) * step]
+            lse_gather_in = lse_c
+            if c > 0 and op_sink:
+                lse_gather_in = _after(lse_c, op_sink[-1])
+                out_c = _after(out_c, op_sink[-1])
             pieces.append(
                 _weighted_reduce_scatter(
-                    output[c * step : (c + 1) * step],
-                    lse_f32[c * step : (c + 1) * step],
-                    _gather_lse(lse_f32[c * step : (c + 1) * step], group),
+                    out_c,
+                    lse_c,
+                    _gather_lse(lse_gather_in, group),
                     group,
                     rs_dtype,
                     vspace=vspace,
+                    after=pieces[-1] if pieces else None,
+                    op_sink=op_sink,
                 )
             )
         return torch.cat(pieces, dim=0)
@@ -351,6 +382,8 @@ def _weighted_reduce_scatter(
     group: Any,
     rs_dtype: torch.dtype | None = None,
     vspace: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+    after: torch.Tensor | None = None,
+    op_sink: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """`cp_lse_ag_out_rs` after its lse gather, op for op: `lses` is
     `[world, T, H]` for exactly `output`'s `T` rows. `vspace`
@@ -358,7 +391,9 @@ def _weighted_reduce_scatter(
     merged_lse = torch.logsumexp(lses, dim=0)
     if vspace is not None:
         weight = torch.exp(lse_f32 - merged_lse)
-        return _weighted_reduce_scatter_vspace(output, weight, vspace, group, rs_dtype)
+        return _weighted_reduce_scatter_vspace(
+            output, weight, vspace, group, rs_dtype, after=after, op_sink=op_sink
+        )
     # The heads-major operand feeds the f32 or the bf16 (RS_BF16=1)
     # reduce-scatter; RS_BF16=2's all-to-all keeps the tokens-major operand.
     if (
@@ -367,18 +402,34 @@ def _weighted_reduce_scatter(
         and output.shape[0] * max(int(envs.TPU_DCP_MERGE_CHUNKED), 1)
         > envs.bucket_gate_edge(envs.TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS)
     ):
+        if (after is None and op_sink is None) or (
+            not torch.compiler.is_compiling()
+            and getattr(_weighted_reduce_scatter_heads_major, "__code__", None)
+            is not None
+            and _weighted_reduce_scatter_heads_major.__code__.co_argcount == 5
+            and not (_weighted_reduce_scatter_heads_major.__code__.co_flags & 4)
+        ):
+            return _weighted_reduce_scatter_heads_major(
+                output, lse_f32, merged_lse, group, rs_dtype
+            )
         return _weighted_reduce_scatter_heads_major(
-            output, lse_f32, merged_lse, group, rs_dtype
+            output, lse_f32, merged_lse, group, rs_dtype, after, op_sink
         )
     # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
     weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
     weighted = output.to(torch.float32) * weight
     weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
-    return _scatter_sum(weighted, group, rs_dtype).to(output.dtype)
+    return _scatter_sum(weighted, group, rs_dtype, after=after, op_sink=op_sink).to(
+        output.dtype
+    )
 
 
 def _scatter_sum(
-    weighted: torch.Tensor, group: Any, rs_dtype: torch.dtype | None = None
+    weighted: torch.Tensor,
+    group: Any,
+    rs_dtype: torch.dtype | None = None,
+    after: torch.Tensor | None = None,
+    op_sink: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Sum `[T, H, V]` f32 `weighted` over the ranks and keep this rank's
     head block `[T, H / world, V]`: the merge's reduce-scatter.
@@ -392,7 +443,12 @@ def _scatter_sum(
     """
     mode = envs.TPU_DCP_MERGE_RS_BF16
     if mode == 1:
-        return group.reduce_scatter(weighted.to(torch.bfloat16).contiguous(), dim=1)
+        x = weighted.to(torch.bfloat16)
+        if after is not None:
+            x = _after(x, after)
+        if op_sink is not None:
+            op_sink.append(x)
+        return group.reduce_scatter(x.contiguous(), dim=1)
     if mode == 2:
         world = int(group.world_size)
         tokens, heads, vdim = weighted.shape
@@ -401,9 +457,17 @@ def _scatter_sum(
             .reshape(tokens, world, heads // world, vdim)
             .transpose(0, 1)
         )
+        if after is not None:
+            send = _after(send, after)
+        if op_sink is not None:
+            op_sink.append(send)
         return _all_to_all(send, group).to(torch.float32).sum(dim=0)
     if rs_dtype is not None:
         weighted = weighted.to(rs_dtype)
+    if after is not None:
+        weighted = _after(weighted, after)
+    if op_sink is not None:
+        op_sink.append(weighted)
     return group.reduce_scatter(weighted.contiguous(), dim=1)
 
 
@@ -413,6 +477,8 @@ def _weighted_reduce_scatter_vspace(
     vspace: tuple[torch.Tensor, torch.Tensor | None],
     group: Any,
     rs_dtype: torch.dtype | None = None,
+    after: torch.Tensor | None = None,
+    op_sink: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """`[T, H, C]` partial, f32 `[T, H]` weights, `(W_UV [H, C, V], scale)`
     -> this rank's `[T, H / world, V]`: the sum over ranks of
@@ -437,6 +503,10 @@ def _weighted_reduce_scatter_vspace(
             v = v * w_uv_scale.to(torch.float32).reshape(v.shape[0], 1, -1)
         w = weight.to(torch.float32).transpose(0, 1).unsqueeze(-1)
         x = torch.where(w > 0, v * w, torch.zeros_like(v)).to(wire)
+    if after is not None:
+        x = _after(x, after)
+    if op_sink is not None:
+        op_sink.append(x)
     return group.reduce_scatter(x.contiguous(), dim=0).transpose(0, 1).to(output.dtype)
 
 
@@ -446,6 +516,8 @@ def _weighted_reduce_scatter_heads_major(
     merged_lse: torch.Tensor,
     group: Any,
     rs_dtype: torch.dtype | None = None,
+    after: torch.Tensor | None = None,
+    op_sink: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """`_weighted_reduce_scatter`'s weight multiply and reduce-scatter with the
     operand built heads-major (`TPU_DCP_MERGE_WEIGHTED_HM`) by the same
@@ -470,6 +542,10 @@ def _weighted_reduce_scatter_heads_major(
         x = torch.where(w > 0, x, torch.zeros_like(x))
         if wire is not None:
             x = x.to(wire)
+    if after is not None:
+        x = _after(x, after)
+    if op_sink is not None:
+        op_sink.append(x)
     return group.reduce_scatter(x.contiguous(), dim=0).transpose(0, 1).to(output.dtype)
 
 
@@ -503,21 +579,58 @@ def _merge_chunked_lse_gathered(
         # not wait for every chunk's lse (TPU_DCP_MLA_MERGE_PIECES=2). The
         # same rows, so the same gathered values.
         head = _gather_lse(lse_f32[:step], group)
-        rest = _gather_lse(lse_f32[step:], group)
-        rows = [head] + [rest[:, (c - 1) * step : c * step] for c in range(1, chunks)]
-    else:
-        gathered = _gather_lse(lse_f32, group)
-        rows = [gathered[:, c * step : (c + 1) * step] for c in range(chunks)]
-    pieces: list[torch.Tensor] = []
+        op_sink: list[torch.Tensor] = []
+        p0 = _weighted_reduce_scatter(
+            output[:step],
+            lse_f32[:step],
+            head,
+            group,
+            rs_dtype,
+            vspace=vspace,
+            op_sink=op_sink,
+        )
+        lse_rest_in = (
+            _after(lse_f32[step:], op_sink[-1])
+            if op_sink
+            else _after(lse_f32[step:], head)
+        )
+        rest = _gather_lse(lse_rest_in, group)
+        pieces = [p0]
+        for c in range(1, chunks):
+            out_c = output[c * step : (c + 1) * step]
+            if op_sink:
+                out_c = _after(out_c, op_sink[-1])
+            pieces.append(
+                _weighted_reduce_scatter(
+                    out_c,
+                    lse_f32[c * step : (c + 1) * step],
+                    rest[:, (c - 1) * step : c * step],
+                    group,
+                    rs_dtype,
+                    vspace=vspace,
+                    after=pieces[-1],
+                    op_sink=op_sink,
+                )
+            )
+        return torch.cat(pieces, dim=0)
+    gathered = _gather_lse(lse_f32, group)
+    rows = [gathered[:, c * step : (c + 1) * step] for c in range(chunks)]
+    op_sink = []
+    pieces = []
     for c in range(chunks):
+        out_c = output[c * step : (c + 1) * step]
+        if c > 0 and op_sink:
+            out_c = _after(out_c, op_sink[-1])
         pieces.append(
             _weighted_reduce_scatter(
-                output[c * step : (c + 1) * step],
+                out_c,
                 lse_f32[c * step : (c + 1) * step],
                 rows[c],
                 group,
                 rs_dtype,
                 vspace=vspace,
+                after=pieces[-1] if pieces else None,
+                op_sink=op_sink,
             )
         )
     return torch.cat(pieces, dim=0)
