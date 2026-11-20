@@ -119,7 +119,7 @@ def test_returns_both_axes_from_one_mesh(monkeypatch):
 
 
 def test_matches_the_order_measured_on_hardware(monkeypatch):
-    """pcp=8 tp=1, job j-64748dc1 on a v7 2x2x1 host."""
+    """pcp=8 tp=1 measured on a v7 2x2x1 host."""
     import torch
 
     mesh = numpy.array([0, 1, 6, 7, 4, 5, 2, 3]).reshape(1, 8, 1)

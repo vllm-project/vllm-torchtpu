@@ -2767,7 +2767,7 @@ class TestTPURaidenConnectorWorker:
         directly. Measured, not assumed: with the mesh built from the process
         group, a rank's compiled partition index equals its rank in that group
         even for a non-contiguous group (ring_probe.py, split [0,2,4,6],
-        8/8 match, job j-881f1c8f).
+        8/8 match).
         """
         worker = _make_raiden_worker(tp_size=1, pcp_size=8)
         with patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=1):

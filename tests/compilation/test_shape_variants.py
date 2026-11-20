@@ -458,7 +458,7 @@ def _warm_start_reuses_the_cache(cache_root):
     # Second start, same cache dir: nothing is compiled, and the ladder still
     # splits at the same bucket -- the first graph must refuse 4096 on the load
     # path too, or it would adopt an executable it cannot call (on TPU:
-    # "Donation requested for invalid buffer", job j-14584b09).
+    # "Donation requested for invalid buffer").
     torch._dynamo.reset()
     backend.compiled.clear()
     model = build(WaveModel, config)
