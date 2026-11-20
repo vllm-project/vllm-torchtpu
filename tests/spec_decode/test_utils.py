@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -142,3 +143,19 @@ def test_fit_rows_returns_slices_or_pads_the_leading_dim():
     out = utils.fit_rows(t, 6, value=-1)
     assert out.dtype == torch.int32 and out.shape == (6, 2)
     assert torch.equal(out[:4], t) and out[4:].eq(-1).all()
+
+
+@pytest.mark.cpu_test
+def test_compile_draft_model_call_skips_module_guards_only():
+    with mock.patch.object(utils.torch, "compile") as compile_:
+        utils.compile_draft_model_call(lambda: None)
+        utils.compile_draft_model_call(lambda: None)
+    first, second = (c.kwargs for c in compile_.call_args_list)
+    assert first["backend"] == "tpu" and first["dynamic"] is False
+    assert first["fullgraph"] is True
+    assert (
+        first["options"]["guard_filter_fn"]
+        is torch.compiler.skip_guard_on_all_nn_modules_unsafe
+    )
+    # torch.compile pops the filter out of the dict it is given.
+    assert first["options"] is not second["options"]

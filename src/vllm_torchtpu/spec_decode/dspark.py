@@ -26,6 +26,7 @@ from vllm.config import VllmConfig
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+from vllm_torchtpu.spec_decode.utils import compile_draft_model_call
 
 logger = init_logger(__name__)
 
@@ -125,7 +126,7 @@ class DSparkProposer(DFlashProposer):
                 sample_from_anchor=self.sample_from_anchor,
             )
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @compile_draft_model_call
     def _dflash_forward_and_sample(
         self,
         input_ids: torch.Tensor,

@@ -28,6 +28,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
+    compile_draft_model_call,
     fit_rows,
     maybe_share_embeddings,
     maybe_share_lm_head,
@@ -914,7 +915,7 @@ class DFlashProposer:
         for _ in range(num_chunks):
             self._dp_dummy_forward()
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @compile_draft_model_call
     def _tpu_precompute_and_update_kv_cache(
         self,
         hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor,
@@ -1026,7 +1027,7 @@ class DFlashProposer:
 
         return hidden_states
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @compile_draft_model_call
     def _dflash_forward_and_sample(
         self,
         input_ids: torch.Tensor,

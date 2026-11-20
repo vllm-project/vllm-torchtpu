@@ -34,6 +34,26 @@ _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN = AllSequenceLayoutPlanner().prepare_dummy(
 )
 
 
+def compile_draft_model_call(fn):
+    """torch.compile a drafter method that runs the draft model.
+
+    Dynamo would re-check every draft-model attribute the method read on each
+    call; only the argument and global guards, which select a padding bucket,
+    are kept. Callers must keep the module tree fixed after `load_model()`
+    and KV binding: no Python-visible module state may change between calls,
+    and a rebound cache tensor must keep its shape, dtype and layout, or a
+    stale graph runs instead of a recompile.
+    """
+    return torch.compile(
+        fn,
+        backend="tpu",
+        fullgraph=True,
+        dynamic=False,
+        # A fresh dict per call: torch.compile pops guard_filter_fn from it.
+        options={"guard_filter_fn": torch.compiler.skip_guard_on_all_nn_modules_unsafe},
+    )
+
+
 def fit_rows(t: torch.Tensor, rows: int, value: int = 0) -> torch.Tensor:
     """`t` with its leading dim sliced or padded (with `value`) to `rows`.
 
