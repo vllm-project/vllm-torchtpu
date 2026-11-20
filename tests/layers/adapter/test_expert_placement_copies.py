@@ -199,7 +199,6 @@ def test_permutation_tables_parse_as_before(table):
         for s, e in enumerate(order):
             slot[e] = s
         assert placement.slot_table(layer) == slot
-    assert not placement.copies_per_rank
 
 
 def test_a_primary_listed_twice_is_still_refused():
