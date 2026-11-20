@@ -186,8 +186,12 @@ def _scatter_body(
         for plane in range(n_scales):
             gather_scales(slot, plane).start()
         scatter_tokens(slot).start()
+        # The planes' gathers share the slot's semaphore, and a wait returns
+        # once one plane's worth of bytes has landed from any of them: a
+        # plane is in place only when every plane's wait has returned.
         for plane in range(n_scales):
             gather_scales(slot, plane).wait()
+        for plane in range(n_scales):
             scatter_scales(slot, plane).start()
 
         @pl.when(c > 0)
