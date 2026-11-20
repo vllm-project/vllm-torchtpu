@@ -888,8 +888,9 @@ def stage_block_table_uploads(
     # joining, finishing, being preempted or reordered, spec tokens being
     # rejected); comparing contents covers every cause. An unchanged upload
     # reuses the previous device tensor, which also lets the products cache
-    # below key on its identity. A targeted walk keeps its own slot, so a full
-    # and a targeted walk in the same step do not evict each other.
+    # below key on its identity. A targeted walk keeps its own slot, for the
+    # upload and for the table views below, so a full and a targeted walk in
+    # the same step do not evict each other.
     slot = "staged_block_tables"
     if gids is not None:
         slot += ":" + ",".join(str(gid) for gid, _, _ in entries)
@@ -939,8 +940,9 @@ def stage_block_table_uploads(
             tuple(table_geom),
             tuple(gid for gid, _, _ in entries),
         )
-        if runner._cached_staged_block_tables_key == bt_views_key:
-            ctx.staged_block_tables = runner._cached_staged_block_tables
+        cached_views = runner._staged_block_table_views.get(slot)
+        if cached_views is not None and cached_views[0] == bt_views_key:
+            ctx.staged_block_tables = cached_views[2]
             return
 
     products_key = _stage_products_key(
@@ -980,9 +982,12 @@ def stage_block_table_uploads(
         gid: products[i] for i, (gid, _, _) in enumerate(entries)
     }
     if not mamba_geom:
-        runner._cached_staged_block_tables_key = bt_views_key
-        runner._cached_staged_block_tables_dev = staged_dev
-        runner._cached_staged_block_tables = ctx.staged_block_tables
+        assert bt_views_key is not None
+        runner._staged_block_table_views[slot] = (
+            bt_views_key,
+            staged_dev,
+            ctx.staged_block_tables,
+        )
     if n_mamba:
         states = products[n_tables : n_tables + n_mamba]
         rest = products[n_tables + n_mamba :]

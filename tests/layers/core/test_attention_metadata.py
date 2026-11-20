@@ -57,9 +57,7 @@ class TestAttentionMetadataBuilderPlumbing:
         runner._registered_h2d_sources = set()
         runner._h2d_reuse = {}
         runner._stage_products_cache = {}
-        runner._cached_staged_block_tables_key = None
-        runner._cached_staged_block_tables = None
-        runner._cached_staged_block_tables_dev = None
+        runner._staged_block_table_views = {}
         runner.attn_groups = []
         runner._unified_kv_layout = False
         runner.pcp_manager = None
@@ -1129,6 +1127,42 @@ class TestBlockTableUploadSkip:
         assert not uploaded
         assert set(targeted) == {1}
         assert torch.equal(targeted[1], self._expected(tables[1], 3))
+
+    def test_full_and_targeted_walks_keep_their_own_table_views(self, monkeypatch):
+        # Neither walk has a Mamba group, and the targeted one spans two
+        # groups, so both split their upload into table views. Alternating
+        # them in the same step reuses each walk's own views: the split runs
+        # once per walk, not on every walk.
+        runner, tables = self._setup(num_groups=3)
+        splits = []
+        split = attention_metadata._staged_walk_products
+
+        def counting_split(*args, **kwargs):
+            splits.append(len(args[2]))
+            return split(*args, **kwargs)
+
+        monkeypatch.setattr(attention_metadata, "_staged_walk_products", counting_split)
+
+        def walk(gids=None):
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=3,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.ones((4,), dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([3, 3, 3], dtype=torch.int32),
+            )
+            stage_block_table_uploads(runner, ctx, 4, gids=gids)
+            return ctx.staged_block_tables
+
+        for _ in range(3):
+            full, targeted = walk(), walk({1, 2})
+        assert splits == [3, 2]
+        for gid, table in enumerate(tables):
+            assert torch.equal(full[gid], self._expected(table, 3))
+        assert set(targeted) == {1, 2}
+        for gid in (1, 2):
+            assert torch.equal(targeted[gid], self._expected(tables[gid], 3))
 
     def test_changed_upload_is_fenced(self):
         # A changed upload goes through stage_h2d_upload, so its host buffer
