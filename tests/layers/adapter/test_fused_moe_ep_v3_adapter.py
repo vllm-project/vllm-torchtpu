@@ -753,9 +753,6 @@ def qwen3_5_397b_v3_sp(armed, groups, monkeypatch):
 
     monkeypatch.setattr(envs, "MOE_FUSED_EP_KERNEL_IMPL", "v3")
     monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
-    # prebuild records both process-wide; restore them after the test.
-    monkeypatch.setattr(v3, "_TP_SIZE", None)
-    monkeypatch.setattr(v3, "_EP_SIZE", None)
     monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
     monkeypatch.setattr(moe_lowtok_scores, "_ARMED_MAX_TOKENS", 0)
     monkeypatch.setattr(moe_lowtok_scores, "_LAYERS", [])

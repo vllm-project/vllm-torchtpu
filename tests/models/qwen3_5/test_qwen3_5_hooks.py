@@ -454,12 +454,8 @@ def test_other_models_are_not_checked(restore_config_map, arch):
 
 
 # The calibrated budget applies only where it was measured: Qwen3.5-397B-A17B's
-# checkpoint shape on TPU7x. Anything else keeps main's gpu_memory_utilization.
-
-
-def test_calibrated_shape_on_tpu7x_gets_the_budget():
-    cfg = _run_hook(_vllm_config())
-    assert cfg.cache_config.kv_cache_memory_bytes == 45_579_595_520
+# checkpoint shape on TPU7x (test_tp8_dcp4_decode_leg_gets_the_calibrated_budget).
+# Anything else keeps main's gpu_memory_utilization.
 
 
 @pytest.mark.parametrize(
