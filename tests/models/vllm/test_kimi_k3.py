@@ -2412,7 +2412,6 @@ def test_mla_wrapper_uses_global_rows_after_local_preprocessing():
     wrapper.is_sparse = False
     wrapper.dcp_q_replicate = False
     wrapper.dcp_group_size = 1
-    wrapper.dcp_q_replicate_min_tokens = 0
     wrapper.o_proj = object()
     calls = []
 
