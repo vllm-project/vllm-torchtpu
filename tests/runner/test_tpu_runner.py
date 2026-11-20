@@ -2135,6 +2135,33 @@ class TestReorderBatchForRpa:
             "tie_b": 3400,
         }
 
+    @pytest.mark.parametrize(
+        "req_ids, computed, refreshes",
+        [
+            # Segments already in order: only the KV-length order swaps.
+            (["decode", "short", "long"], [9000, 1000, 7000], 1),
+            # The decode moves to the front, then the KV-length order swaps.
+            (["short", "decode", "long"], [1000, 9000, 7000], 1),
+            # The decode moves to the front; the KV order already holds.
+            (["long", "decode", "short"], [7000, 9000, 1000], 1),
+            # Nothing moves.
+            (["decode", "long", "short"], [9000, 7000, 1000], 0),
+        ],
+    )
+    def test_swaps_are_published_once_per_step(self, req_ids, computed, refreshes):
+        """vLLM applies `swap_states` swaps to its batch state in
+        `refresh_metadata`, which `_update_states` ran before this reorder, so
+        a step whose reorder or KV-length order swaps any request refreshes
+        once and drops the output's request-index snapshot."""
+        runner = self._make_runner(groups_requests=True)
+        self._batch(runner, req_ids, computed=computed)
+        runner._cached_output_req_ids_key = ("previous step",)
+        sched = self._sched({"decode": 1, "short": 512, "long": 32})
+        assert runner._reorder_batch_for_rpa(sched) == (1, 1)
+        assert runner.input_batch.req_ids == ["decode", "long", "short"]
+        assert runner.input_batch.refresh_metadata.call_count == refreshes
+        assert (runner._cached_output_req_ids_key is None) == bool(refreshes)
+
     @pytest.mark.parametrize("groups_requests", [False, None])
     def test_order_kept_unless_grouping_applies(self, groups_requests):
         runner = self._make_runner(groups_requests=groups_requests)
