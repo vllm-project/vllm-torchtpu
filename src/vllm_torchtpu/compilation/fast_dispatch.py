@@ -12,15 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Direct guard-checked cache-entry dispatch and GLOBAL_STATE guard filtering
-for ``torch.compile(backend="tpu", fullgraph=True, dynamic=False)`` functions.
+for this package's compiled TPU functions.
 
-:func:`tpu_compile` compiles a function with ``torch.compile(backend="tpu",
-fullgraph=True, dynamic=False)`` and wraps the result. The hook is installed
-when the TPU platform module loads, before any module applies its
-torch.compile decorators, and does the same for those decorators. Neither
-does anything until the worker arms them from
+:func:`tpu_compile` is the decorator for them: it compiles a function with
+``torch.compile(backend="tpu", fullgraph=True, dynamic=False)`` and wraps the
+result. The wrapper does nothing extra until the worker arms it from
 ``additional_config["tpu_compile"]`` (``compilation.compile_options``; both
-options default to off):
+options default to off). It reads the options on every call, so a function
+decorated at import, before the options are known, is covered:
 
 * ``fast_compiled_call``: compiled plain functions evaluate each cached
   entry's ``guard_manager.check(f_locals)`` in MRU order and invoke the
@@ -60,15 +59,15 @@ logger = init_logger(__name__)
 # logged at INFO every _LOG_EVERY calls so serving logs show the hit rate.
 _STATS = [0, 0]
 _LOG_EVERY = 20000
-_INSTALLED = False
 # Armed by configure(); both off until the worker applies tpu_compile.
 _CONFIG = {"fast": False, "drop_global_state": False}
 
 
 def configure(fast: bool, drop_global_state: bool) -> None:
-    """Arm (or disarm) the installed hook. Called by the worker before any
-    compiled function runs: a guard filter is consulted when Dynamo compiles
-    a frame, and the fast path is checked on every call."""
+    """Arm (or disarm) every :func:`tpu_compile` function of the process.
+    Called by the worker before any compiled function runs: a guard filter is
+    consulted when Dynamo compiles a frame, and the fast path is checked on
+    every call."""
     _CONFIG["fast"] = bool(fast)
     _CONFIG["drop_global_state"] = bool(drop_global_state)
     if fast or drop_global_state:
@@ -271,71 +270,3 @@ def tpu_compile[F: Callable[..., Any]](fn: F) -> F:
         # the function itself, which has no cache entries to dispatch.
         return fn
     return _wrap(compiled, fn)
-
-
-def _eligible(model: Any, kwargs: dict) -> bool:
-    return (
-        isinstance(model, types.FunctionType)
-        and kwargs.get("backend") == "tpu"
-        and kwargs.get("fullgraph") is True
-        and kwargs.get("dynamic") is False
-        and not kwargs.get("disable", False)
-        and kwargs.get("options") is None
-        and kwargs.get("mode") is None
-    )
-
-
-def make_compile_hook(orig_compile: Any) -> Any:
-    """``orig_compile`` (``torch.compile``) with ``backend="tpu",
-    fullgraph=True, dynamic=False`` plain functions compiled with the guard
-    filter and wrapped for fast dispatch, in direct and decorator form. Every
-    other call goes to ``orig_compile`` unchanged."""
-
-    @functools.wraps(orig_compile)
-    def compile_hook(model: Any = None, *args: Any, **kwargs: Any) -> Any:
-        if args:
-            return orig_compile(model, *args, **kwargs)
-        if model is None:
-
-            def deco(m: Any) -> Any:
-                return compile_hook(m, **kwargs)
-
-            return deco
-        if not _eligible(model, kwargs):
-            return orig_compile(model, **kwargs)
-        ckw = dict(kwargs)
-        # torch.compile pops guard_filter_fn; the emptied dict is falsy, so the
-        # backend still gets no options kwarg. The filter keeps every guard
-        # unless drop_global_state_guard is on when Dynamo compiles the frame.
-        ckw["options"] = {"guard_filter_fn": _drop_global_state}
-        out = orig_compile(model, **ckw)
-        if out is model:
-            # Dynamo is disabled (TORCHDYNAMO_DISABLE=1): torch.compile hands
-            # back the function itself, which has no cache entries to dispatch.
-            return out
-        if callable(out):
-            return _wrap(out, model)
-        return out
-
-    return compile_hook
-
-
-def install() -> None:
-    """Hook ``torch.compile`` for ``backend="tpu", fullgraph=True,
-    dynamic=False`` plain functions. Idempotent. Inert until ``configure``.
-
-    fast (``fast_compiled_call``): guard-checked direct dispatch (above).
-    drop_global_state (``drop_global_state_guard``): compile them with a
-    ``guard_filter_fn`` that drops only the GLOBAL_STATE guard (grad mode,
-    num_threads, autocast, default dtype, ...). Warmup entries are then
-    reused by serving even when the serving thread's num_threads/grad mode
-    differ from the warmup thread's; tensor guards (shape, stride, dtype,
-    device, requires_grad) and value guards are kept. These graphs take no
-    requires_grad inputs and run on TPU, so neither grad mode nor the CPU
-    intra-op thread count changes what they compute.
-    """
-    global _INSTALLED
-    if _INSTALLED:
-        return
-    _INSTALLED = True
-    torch.compile = make_compile_hook(torch.compile)

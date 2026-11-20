@@ -155,8 +155,8 @@ class TPUWorker(WorkerBase):
         devices=None,
         ip: str = "localhost",
     ):
-        # Arm this process's torch.compile hook (tpu_compile options, all off
-        # by default) before any compiled function can run.
+        # Arm this process's tpu_compile functions (tpu_compile options, all
+        # off by default) before any compiled function can run.
         compile_options.apply(vllm_config)
 
         from vllm_torchtpu import patch_registry
