@@ -1236,8 +1236,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # runs ceil(requests / 64). Only 64: a [64, 2080] int32 page table is 532 KB
     # of the 1 MiB scalar memory (128 does not fit: DECODE-QSA aot2). Each
     # request stays its own RPA sequence, so every row's sums run in the same
-    # order. Compile-ignored: it picks which programs run, each keyed by its own
-    # graph.
+    # order. Compile-hashed: it is read inside the model forward, behind
+    # custom-op boundaries the FX graph fingerprint does not see, so a cache
+    # restored across a flag flip would run the other programs.
     "VLLM_TPU_QSA_DECODE_RPA_UNION_WIDE": env_nonnegative_int(
         "VLLM_TPU_QSA_DECODE_RPA_UNION_WIDE", 0
     ),
@@ -1245,12 +1246,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # layout copies / scatters the profile shows above 384 rows: the QSA
     # selected-token tail fill as selects (no scatter) and GDN's packed gate
     # input built by one concatenate (no stack + relayout). Same values.
-    # Compile-ignored (it picks which programs run).
+    # Compile-hashed (read inside the model forward, as WIDE).
     "VLLM_TPU_DECODE_ROWS_GLUE": env_bool("VLLM_TPU_DECODE_ROWS_GLUE"),
     # q38 DEC-STEP-3: the compressed-DCP global selection's per-row sort runs
     # over row blocks of at most this many rows when a step has more (0 = one
     # sort over every row). Each row is sorted alone either way: same values.
-    # Compile-ignored (it picks which programs run).
+    # Compile-hashed (read inside the model forward, as WIDE).
     "VLLM_TPU_QSA_DCP_SORT_ROWS": env_nonnegative_int("VLLM_TPU_QSA_DCP_SORT_ROWS", 0),
     # The indexer kernel's step metadata is selected (empty pass: zeros) rather
     # than computed in a conditional, whose small outputs XLA places in VMEM

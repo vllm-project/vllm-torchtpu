@@ -315,12 +315,6 @@ _TPU_COMPILE_ENV_IGNORED = {
     # waits for the previous step's copy; the seed rows, their programs and
     # every model program are the same.
     "VLLM_TPU_L6_SEED_SPEC",
-    # q38 DEC-STEP-3: which programs run a large decode step (64-request union
-    # RPA calls; selects / one concatenate instead of a scatter / stack; the
-    # DCP selection sort in row blocks); each is keyed by its own graph.
-    "VLLM_TPU_QSA_DECODE_RPA_UNION_WIDE",
-    "VLLM_TPU_DECODE_ROWS_GLUE",
-    "VLLM_TPU_QSA_DCP_SORT_ROWS",
     # q38 DEC-STEP-3 GLUE_FOLD (runner/tpu_runner.py _glue_*): which programs
     # run the async spec step's integer glue (four folded programs or the
     # stock ones, and the check's copies); each is keyed by its own graph and

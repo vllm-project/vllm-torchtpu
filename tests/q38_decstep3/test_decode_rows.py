@@ -247,14 +247,22 @@ def test_r5_compressed_dcp_blocks(clean, rows):
 # ---------------- R6
 
 
-def test_r6_keys_registered_default_off_compile_ignored(clean):
+def test_r6_keys_registered_default_off_compile_hashed(clean):
+    """Registered, default off, and compile-HASHED: the keys are read inside the model forward, behind custom-op
+    boundaries the FX graph fingerprint does not see, so the env factors (and the compile cache directory) must move
+    with each of them, or a warm cache would restore the other programs."""
     assert envs.VLLM_TPU_QSA_DECODE_RPA_UNION_WIDE == 0 and envs.VLLM_TPU_DECODE_ROWS_GLUE is False
     assert envs.VLLM_TPU_QSA_DCP_SORT_ROWS == 0
     for k in KEYS:
-        assert k in envs.environment_variables and k in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+        assert k in envs.environment_variables and k not in tpu_compiler._TPU_COMPILE_ENV_IGNORED
     off = tpu_compiler._tpu_compile_env_factors()
-    clean.setenv(WIDE, "64"); clean.setenv(GLUE, "1"); clean.setenv(SORT, "384")
-    assert tpu_compiler._tpu_compile_env_factors() == off
+    seen = [off]
+    for k, v in ((WIDE, "64"), (GLUE, "1"), (SORT, "384")):
+        clean.setenv(k, v)
+        f = tpu_compiler._tpu_compile_env_factors()
+        assert all(f != g for g in seen), k
+        seen.append(f)
+        clean.delenv(k)
 
 
 # ---------------- R7
