@@ -86,7 +86,9 @@ def get(vllm_config: Any) -> FrontendOptions:
 
 
 def install_tokenize_prefix_cache(vllm_config: Any = None) -> bool | None:
-    """patch_registry installer of ``tokenize_prefix_cache``."""
+    """patch_registry installer of ``tokenize_prefix_cache``. Returns False
+    while the option is off, which keeps the registry entry eligible: a later
+    engine config built in the same process may still turn it on."""
     options = None if vllm_config is None else get(vllm_config)
     if options is None or not options.tokenize_prefix_cache:
         return False
@@ -102,7 +104,8 @@ def install_tokenize_prefix_cache(vllm_config: Any = None) -> bool | None:
 
 
 def install_detok_prompt_tail(vllm_config: Any = None) -> bool | None:
-    """patch_registry installer of ``detok_prompt_tail``."""
+    """patch_registry installer of ``detok_prompt_tail``. Returns False while
+    the option is off, as ``install_tokenize_prefix_cache`` does."""
     options = None if vllm_config is None else get(vllm_config)
     if options is None or not options.detok_prompt_tail:
         return False
@@ -119,10 +122,8 @@ def _install(name: str, install: Callable[[], None]) -> None:
     """Run the patch installer of option ``name``, which the engine config
     turns on; it imports its module only then.
 
-    An installer returns False when its option is off, which keeps the
-    registry entry eligible: a later engine config built in the same process
-    may still turn it on. A patch that cannot be installed logs a warning and
-    leaves vLLM's own path in place; it never stops the server from starting.
+    A patch that cannot be installed logs a warning and leaves vLLM's own path
+    in place; it never stops the server from starting.
     """
     try:
         install()
