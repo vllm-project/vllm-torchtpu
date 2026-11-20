@@ -1435,7 +1435,7 @@ def test_mark_pre_attn_norm_quant():
     # A bf16 in_proj_ba would see FP8-rounded replicated rows.
     assert mark(gdn()) == (True, False)
     assert mark(gdn(torch.float8_e4m3fn)) == (True, True)
-    # The pooled PCP forward ignores prequant.
+    # The pooled PCP forward refuses prequant.
     assert mark(gdn(torch.float8_e4m3fn, pcp=True)) == (False, False)
 
     full.self_attn.qkv_proj = _proj(scale_shape=(1, 4))
