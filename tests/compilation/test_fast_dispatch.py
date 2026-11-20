@@ -177,6 +177,24 @@ print("ok")
     assert result.stdout.strip().endswith("ok")
 
 
+def test_installing_the_hook_does_not_import_vllm():
+    """The platform_import stage runs before vLLM is imported: its targets may
+    import torch, not vLLM (tpu_patch_mechanism.md)."""
+    code = """
+import sys
+from vllm_torchtpu.compilation import fast_dispatch
+assert "vllm" not in sys.modules, "vllm imported before install"
+fast_dispatch.install()
+assert "vllm" not in sys.modules, "install imported vllm"
+print("ok")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().endswith("ok")
+
+
 class _Module(torch.nn.Module):
     def forward(self, x):
         return x
@@ -241,6 +259,29 @@ def test_fast_compiled_call_dispatches_directly_once_armed():
     fast, slow = _calls(wrapped, 4)
     assert slow == 1  # the first call compiles and caches the entry
     assert fast == 3
+
+
+def test_a_traced_caller_takes_the_compiled_path():
+    """An outer compiled function that calls an armed wrapper with cached
+    entries traces through the compiled function, not the direct dispatch's
+    cache-entry and eval-frame queries, so a fullgraph trace holds."""
+
+    def f(x):
+        return x * 2 + 1
+
+    compile_options.apply(_config({"fast_compiled_call": True}))
+    wrapped = _compiled(f)
+    assert _calls(wrapped, 3) == [2, 1]
+    assert wrapped._fast_dispatch_state["entries"]
+
+    def outer(x):
+        return wrapped(x) - 1
+
+    traced = torch.compile(outer, backend="eager", fullgraph=True, dynamic=False)
+    x = torch.arange(4.0)
+    before = list(fast_dispatch._STATS)
+    assert torch.equal(traced(x), x * 2)
+    assert before == fast_dispatch._STATS
 
 
 def test_fast_dispatch_binds_keyword_only_defaults():
