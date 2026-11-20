@@ -18,8 +18,20 @@
 #
 #   agentx_sweep.sh --chips 16 [--config kimi-k3-tp32-ep-agentx] [--results-dir DIR]
 #       [--duration 1800] [--fast 1|0] [--ix-ref SHA]
-#       [--gsm8k-limit 100] [--gsm8k-conc 8[,16,...]]
+#       [--gsm8k-limit 100] [--gsm8k-conc 8[,16,...]] [--gsm8k-max-tokens 4096]
+#       [--gsm8k-min-score 0.90] [--min-requests-ok N]
 #       [--gcs-root gs://bucket/prefix] [--port 8000]
+#
+# A config whose AGENTX_CONC_LIST is "none" serves GSM8K only: the client skips
+# the replay (glm-5.2-fp8-tp16-dcp8-mtp3-agentx-eval.sh, whose server verifies
+# MTP drafts for real where the perf arm uses synthetic acceptance).
+#
+# The gates, for a CI step that should go red on a bad result rather than only
+# on a crashed one (by itself the client exits 0 even when every request failed):
+#   --gsm8k-min-score X   every GSM8K probe must score >= X on both
+#                         strict-match and flexible-extract, over at least
+#                         --gsm8k-limit questions
+#   --min-requests-ok N   every replay point must have >= N successful requests
 #
 # Everything about the SERVER is in the config and nowhere else: the context
 # window, the KV dtype, prefix caching, MoE requantisation, spec decode, the
@@ -45,7 +57,8 @@
 # JobSet, where the engines are on TPU pods and the client is on a CPU pod -
 # does not use this script; it calls agentx_client.sh directly.
 #
-# Exit status: 1 if the server failed to boot or died, or if the client failed.
+# Exit status: 1 if the server failed to boot or died, if the client failed, or
+# if a gate (--gsm8k-min-score, --min-requests-ok) failed.
 set -uo pipefail
 
 CONFIG_NAME="kimi-k3-tp32-ep-agentx"
@@ -55,6 +68,9 @@ FAST=1
 IX_REF=""            # empty: the pin in sweep_lib.sh
 GSM8K_LIMIT=100        # 0 = skip
 GSM8K_CONC="8"
+GSM8K_MAX_TOKENS=""    # empty: agentx_client.sh's default
+GSM8K_MIN_SCORE=""     # empty = no accuracy floor
+MIN_REQUESTS_OK=0      # 0 = no replay gate
 # Physical TPU chips serving this benchmark. No default: see the note at the
 # point of use.
 CHIPS=""
@@ -70,6 +86,9 @@ while [[ $# -gt 0 ]]; do
         --ix-ref)        IX_REF="$2"; shift 2 ;;
         --gsm8k-limit)   GSM8K_LIMIT="$2"; shift 2 ;;
         --gsm8k-conc)    GSM8K_CONC="$2"; shift 2 ;;
+        --gsm8k-max-tokens) GSM8K_MAX_TOKENS="$2"; shift 2 ;;
+        --gsm8k-min-score) GSM8K_MIN_SCORE="$2"; shift 2 ;;
+        --min-requests-ok) MIN_REQUESTS_OK="$2"; shift 2 ;;
         --chips)         CHIPS="$2"; shift 2 ;;
         --gcs-root)      GCS_ARG="$2"; shift 2 ;;
         --port)          PORT="$2"; shift 2 ;;
@@ -117,8 +136,15 @@ if [ -z "$CONC_LIST" ]; then
     log "FATAL: $CONFIG_NAME declares no AGENTX_CONC_LIST"
     exit 2
 fi
-ix_check_conc_list "$CONC_LIST" || exit 1
+# "none": GSM8K only, no replay (see the header).
+if [ "$CONC_LIST" != "none" ]; then
+    ix_check_conc_list "$CONC_LIST" || exit 1
+fi
 ix_check_conc_list "$GSM8K_CONC" || exit 1
+if [ "$CONC_LIST" = "none" ] && [ "$GSM8K_LIMIT" -le 0 ]; then
+    log "FATAL: $CONFIG_NAME runs no replay (AGENTX_CONC_LIST=none) and --gsm8k-limit is 0: nothing to run"
+    exit 2
+fi
 # PHYSICAL CHIPS, not ranks: a 2x2x4 v7x slice is 16 chips (4 hosts x
 # google.com/tpu 4, which is what GKE allocates and what Google bills per
 # chip-hour) and vLLM runs 32 ranks on it, two per chip. So TP x DP is twice the
@@ -132,7 +158,7 @@ case "${CHIPS:-}" in
             "sweep_summary.py it is the cost tokens per dollar divides by."
         exit 2 ;;
 esac
-IFS=',' read -r -a CONCS <<< "$CONC_LIST"
+if [ "$CONC_LIST" = "none" ]; then CONCS=(); else IFS=',' read -r -a CONCS <<< "$CONC_LIST"; fi
 MAX_CONC=1
 for c in "${CONCS[@]}"; do [ "$c" -gt "$MAX_CONC" ] && MAX_CONC=$c; done
 
@@ -224,6 +250,7 @@ bash "$SCRIPT_DIR/agentx_client.sh" \
     ${IX_REF:+--ix-ref "$IX_REF"} \
     --gsm8k-limit "$GSM8K_LIMIT" \
     --gsm8k-conc "$GSM8K_CONC" \
+    ${GSM8K_MAX_TOKENS:+--gsm8k-max-tokens "$GSM8K_MAX_TOKENS"} \
     --model "$(ix_config_json_get model)" \
     --label "$LABEL" \
     --spec-method "$SPEC_METHOD" \
@@ -232,3 +259,22 @@ bash "$SCRIPT_DIR/agentx_client.sh" \
     ${AGENTX_REFERENCE_ROW:+--reference-row "$AGENTX_REFERENCE_ROW"} \
     ${TOK_DIR:+--tokenizer-dir "$TOK_DIR"} \
     ${GCS_ARG:+--gcs-root "$GCS_ARG"}
+CLIENT_RC=$?
+
+# ---- gates ---------------------------------------------------------------------
+GATE_RC=0
+SUMMARY_PY="$SCRIPT_DIR/sweep_summary.py"
+if [ -n "$GSM8K_MIN_SCORE" ] && [ "$GSM8K_LIMIT" -gt 0 ]; then
+    for gc in $(printf '%s' "$GSM8K_CONC" | tr ',' ' '); do
+        python3 "$SUMMARY_PY" gsm8k-gate --output-dir "$RESULTS_DIR/gsm8k_c$gc" \
+            --min-score "$GSM8K_MIN_SCORE" --min-samples "$GSM8K_LIMIT" \
+            | tee -a "$RESULTS_DIR/summary.md" || GATE_RC=1
+    done
+fi
+if [ "$MIN_REQUESTS_OK" -gt 0 ] && [ "${#CONCS[@]}" -gt 0 ]; then
+    python3 "$SUMMARY_PY" agentx-gate --results-dir "$RESULTS_DIR" --base "$LABEL" \
+        --concs "${CONCS[@]}" --min-requests-ok "$MIN_REQUESTS_OK" \
+        | tee -a "$RESULTS_DIR/summary.md" || GATE_RC=1
+fi
+[ "$GATE_RC" -eq 0 ] || log "ERROR: a result gate failed (see the GATE lines above)"
+[ "$CLIENT_RC" -eq 0 ] && [ "$GATE_RC" -eq 0 ]
