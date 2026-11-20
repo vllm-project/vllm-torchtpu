@@ -237,6 +237,8 @@ class TestTpuCompilerCache:
             "VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK",
             "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS",
             "TPU_DEFER_STEP",
+            "TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX",
+            "TPU_PREFIX_AWARE_SHORT_PROMPTS",
             "VLLM_TPU_FOLLOW_SHARED_PREFIX",
         }
 
