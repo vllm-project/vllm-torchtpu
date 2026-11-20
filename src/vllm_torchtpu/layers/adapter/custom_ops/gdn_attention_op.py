@@ -369,7 +369,7 @@ def _split_ba(
     the kernel `gdn_attention.gdn_kernel_wrapper` selects.
 
     The Qwen3.5 MoE architectures pass the halves as chunk views, because the
-    Qwen3.5 GDN kernel pads and stacks them itself (two fewer copies per GDN
+    Qwen3.5 GDN kernel casts and pads them itself (two fewer copies per GDN
     layer per step). Every other architecture gets contiguous copies, which
     the shared `kernels/gdn/v3` kernel takes. The layer's own model config
     decides, as it does for the kernel choice.
