@@ -116,6 +116,7 @@ if TYPE_CHECKING:
     TPU_MOE_PREFILL_SEQUENCE_PARALLEL: bool = True
     TPU_MOE_PREFILL_SP_SHARED_GROUP: int = 1
     TPU_MOE_PREFILL_SP_FP8_WIRE: bool = True
+    TPU_EMBED_REPLICATED: bool = True
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -1192,6 +1193,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_PREFILL_SP_FP8_WIRE": env_bool(
         "TPU_MOE_PREFILL_SP_FP8_WIRE", default=True
     ),
+    # Under TPU_MOE_PREFILL_SEQUENCE_PARALLEL: all-gather the vocab-parallel
+    # embedding table at load and look tokens up locally, instead of the
+    # reduce-scatter (prefill) / all-reduce (decode) of shard partials
+    # (`layers/adapter/replicated_embedding.py`; + the table per rank).
+    "TPU_EMBED_REPLICATED": env_bool("TPU_EMBED_REPLICATED", default=True),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes

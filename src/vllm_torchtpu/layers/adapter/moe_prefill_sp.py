@@ -40,6 +40,7 @@ through every tensor either branch reads (`_retain_buffers`, no data read):
 the first access names each buffer the same way in both traces.
 """
 
+import functools
 import inspect
 from itertools import islice
 from typing import Any
@@ -67,6 +68,7 @@ from vllm_torchtpu.layers.adapter import (
     dcp_token_parallel_op,
     fused_moe_decode,
     fused_moe_ep,
+    replicated_embedding,
     rmsnorm,
     small_all_reduce_op,
     token_padding,
@@ -699,8 +701,19 @@ def patched_model_forward(
         and input_ids is not None
         and input_ids.ndim == 1
     ):
-        _check_divides(num_tokens)
-        hidden_states = _embed_reduce_scatter(self.embed_tokens, input_ids)
+        tp = _check_divides(num_tokens)
+        full_table = replicated_embedding.full_weight(self.embed_tokens)
+        if full_table is None:
+            hidden_states = _embed_reduce_scatter(self.embed_tokens, input_ids)
+        else:
+            # Avoid calling fused_moe_ep.rank_operand() before layer 0's
+            # _retain_buffers(*keep): it binds the rank tensor to the module
+            # global instead of layers[0]._tpu_sp_keep, and the decode trace
+            # then names it differently (ShapeSpecializationError on handover).
+            first_keep = getattr(self.layers[self.start_layer], KEEP_ATTR)
+            input_ids = _retain_buffers(input_ids, *first_keep)
+            own_ids = own_rows(input_ids, fused_moe_ep.rank_operand(), tp)
+            hidden_states = replicated_embedding.lookup(full_table, own_ids)
     else:
         hidden_states = self.embed_input_ids(input_ids)
     # Avoid ShapeSpecializationError on warmup bucket handover: when
@@ -963,18 +976,26 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
         backbone, tp
     )
     setattr(backbone, EMBED_RS_ATTR, embed_rs)
+    embed_replicated = (
+        embed_rs
+        and envs.TPU_EMBED_REPLICATED
+        and replicated_embedding.arm_if_eligible(
+            backbone.embed_tokens, tp, functools.partial(_gather, dim=0)
+        )
+    )
     setattr(backbone, KEEP_ATTR, True)
     n = len(layers) - first
     logger.info(
         "TPU_MOE_PREFILL_SEQUENCE_PARALLEL: %d MoE layers (layers %d..%d) and "
-        "%d dense layers (dense_group=%d, embed_rs=%s) armed, buckets > %d tokens, "
-        "tp=%d",
+        "%d dense layers (dense_group=%d, embed_rs=%s, embed_replicated=%s) "
+        "armed, buckets > %d tokens, tp=%d",
         n,
         backbone.start_layer + first,
         backbone.end_layer - 1,
         dense_armed,
         dense_group,
         embed_rs,
+        embed_replicated,
         envs.bucket_gate_edge(MIN_TOKENS),
         tp,
     )

@@ -1981,6 +1981,9 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
     original_init = vpe.VocabParallelEmbedding.__init__
 
     from vllm_torchtpu import envs as _envs
+    from vllm_torchtpu.layers.adapter import (  # noqa: PLC0415 -- lazy like this hook's other imports
+        replicated_embedding,
+    )
 
     # TPU_VOCAB_EMBED_I32_BOUNDS: int32 bounds (no X64SplitLow per program
     # input); same values, every bound is < 2**31.
@@ -2024,6 +2027,9 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             )
 
     def patched_forward(self, input_):
+        full_table = getattr(self, replicated_embedding.FULL_WEIGHT_ATTR, None)
+        if full_table is not None:
+            return replicated_embedding.lookup(full_table, input_)
         input_mask = None
         if self.tp_size > 1:
             masked_input, input_mask = vpe.get_masked_input_and_mask(
