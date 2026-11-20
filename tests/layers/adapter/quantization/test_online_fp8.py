@@ -271,6 +271,19 @@ def test_audit_unmatched_and_unprocessed():
         validate_online_fp8(model, config)
 
 
+def test_audit_accepts_lora_wrapped_target():
+    """The runner audits after LoRA wraps the layers; the wrapper is skipped."""
+    from vllm.lora.layers import ReplicatedLinearWithLoRA
+
+    config = make_config()
+    layer = linear(config)
+    layer.weight.data.fill_(1)
+    layer.quant_method.process_weights_after_loading(layer)
+    model = torch.nn.Module()
+    model.add_module("proj", ReplicatedLinearWithLoRA(layer))
+    validate_online_fp8(model, config)
+
+
 @pytest.mark.parametrize("tp_rank", [0, 1])
 def test_row_parallel_shard_loading(tp_rank, tensor_parallel_group):
     tensor_parallel_group.rank_in_group = tp_rank
