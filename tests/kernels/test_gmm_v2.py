@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     Dimensions,
     InputConfigs,
@@ -490,7 +491,7 @@ def test_gmm_fp4_fp8_w8a8_matches_reference(monkeypatch):
     num_rows = int(group_sizes.sum())
 
     def run(w8a8: str) -> np.ndarray:
-        monkeypatch.setenv("TPU_GMM_FP8_W8A8", w8a8)
+        monkeypatch.setattr(envs, "TPU_GMM_FP8_W8A8", w8a8 == "1")
         jax.clear_caches()  # the knob is read at trace time
         out = gmm_v2(
             lhs, rhs_fp4, group_sizes, rhs_scale=rhs_scale, maybe_quantize_lhs=False
@@ -518,7 +519,7 @@ def test_calculate_tiling_w8a8_prefill_fifth_bucket(
     """8k-token prefill chunks (MiniMax-M3.1, EP8 local or TP-sliced experts:
     ~256 rows per group): the fp8 x fp8 path takes a fifth 64-row bucket."""
     _require_tpu()
-    monkeypatch.setenv("TPU_GMM_FP8_W8A8", w8a8)
+    monkeypatch.setattr(envs, "TPU_GMM_FP8_W8A8", w8a8 == "1")
     dims = Dimensions(
         size_m=32768,
         size_k=6144,

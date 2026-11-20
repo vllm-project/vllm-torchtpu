@@ -780,7 +780,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Prefill-sized gmm_v2 calls with fp4 experts (per-128-K-block scales) run
     # fp8 x fp8: the rhs tile requantized to e4m3 with per-column scales, the
     # lhs rows to e4m3 with per-row scales (kernels/megablox/gmm_v2.py
-    # uses_fp8_w8a8). ~1.6x faster at 8k-token chunks, ~6% output error vs 0.4%.
+    # uses_fp8_w8a8). ~1.6x faster at 8k-token chunks; mean abs output
+    # error vs an exact f32 layer 5.7e-2 (bf16 path 4.1e-3).
     "TPU_GMM_FP8_W8A8": env_bool("TPU_GMM_FP8_W8A8", default=False),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in

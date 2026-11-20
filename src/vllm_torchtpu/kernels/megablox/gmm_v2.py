@@ -363,6 +363,20 @@ def quantize_rows_fp8(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     return (x * inv).astype(fp8), row_scale
 
 
+def fp8_w8a8_enabled(
+    dims: "Dimensions", lhs_cfgs: "InputConfigs", rhs_cfgs: "InputConfigs"
+) -> bool:
+    """Whether prefill-sized calls of this shape take the fp8 x fp8 path."""
+    return (
+        envs.TPU_GMM_FP8_W8A8
+        and dims.size_m > FP8_DECODE_MAX_M
+        and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None
+        and pltpu.get_tpu_info().is_matmul_supported(
+            jnp.float8_e4m3fn.dtype, jnp.float8_e4m3fn.dtype
+        )
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class GmmConfigs:
     tiles: TileSizes
@@ -388,14 +402,8 @@ class GmmConfigs:
         """Whether this prefill bucket runs fp8 x fp8 (TPU_GMM_FP8_W8A8):
         rhs requantized per column, lhs per row. Large-m tiles bind on the
         MXU's lhs stream, which fp8 halves (fp8 rhs alone does not help)."""
-        return (
-            envs.TPU_GMM_FP8_W8A8
-            and bucket_m > FP8_RHS_MAX_BUCKET_M
-            and self.dims.size_m > FP8_DECODE_MAX_M
-            and fp8_rhs_feed_dtype(self.lhs_cfgs, self.rhs_cfgs) is not None
-            and pltpu.get_tpu_info().is_matmul_supported(
-                jnp.float8_e4m3fn.dtype, jnp.float8_e4m3fn.dtype
-            )
+        return bucket_m > FP8_RHS_MAX_BUCKET_M and fp8_w8a8_enabled(
+            self.dims, self.lhs_cfgs, self.rhs_cfgs
         )
 
     @property
@@ -578,14 +586,17 @@ def inner_kernel(
         fp8_rhs = cfgs.fp8_rhs_dtype(bucket_m)
         col_scale = row_scale = None
         if fp8_rhs is None and cfgs.uses_fp8_w8a8(bucket_m):
-            tiled_rhs, col_scale = requantize_fp8_colscale(
-                tiled_rhs, tiled_rhs_ref.get_scale(), rhs_qbs, cfgs.lhs_cfgs.dtype
-            )
+            block_scale = tiled_rhs_ref.get_scale()
             valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
             if is_last_k_step and valid_k != 0:
-                # Columns past size_k are stale VMEM; keep them out of the amax.
+                # Rows past size_k are stale VMEM; keep them out of both amaxes.
                 col = lax.broadcasted_iota(jnp.int32, tiled_lhs.shape, 1)
                 tiled_lhs = jnp.where(col < valid_k, tiled_lhs, 0)
+                blk = lax.broadcasted_iota(jnp.int32, block_scale.shape, 0)
+                block_scale = jnp.where(blk * rhs_qbs < valid_k, block_scale, 0)
+            tiled_rhs, col_scale = requantize_fp8_colscale(
+                tiled_rhs, block_scale, rhs_qbs, cfgs.lhs_cfgs.dtype
+            )
             tiled_lhs, row_scale = quantize_rows_fp8(tiled_lhs)
             rhs_qbs = cfgs.tiles.tile_k
         elif fp8_rhs is not None:
@@ -1357,11 +1368,7 @@ def calculate_tiling(
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
     max_num_buckets = 4
-    if (
-        envs.TPU_GMM_FP8_W8A8
-        and dims.size_m > FP8_DECODE_MAX_M
-        and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None
-    ):
+    if fp8_w8a8_enabled(dims, lhs_cfgs, rhs_cfgs):
         # Prefill chunks give each expert ~256 +- 16 rows (8192 tokens x top-4
         # over 128 experts, local or TP-sliced); 4 x 64-row buckets cap the
         # tile at 256, so half the groups spill into a second tile that
