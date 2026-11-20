@@ -1656,6 +1656,14 @@ def decode_step_tokens(levers: tuple[str, ...]) -> int:
     return steps[0] if steps else 0
 
 
+# Internal decode body lever "quad8": "quad" stacks a step's tokens in groups
+# of DECODE_QUAD8_GROUP_TOKENS (the KV staging scratch keeps that size) instead
+# of the whole step. Only `resolve_fused_small_a2a_config` adds it, with the
+# "step16" it selects under TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS;
+# TPU_MLA_DECODE_BODY_LEVERS may not name it, so "step16" set there keeps the
+# whole-step group.
+DECODE_QUAD8_LEVER = "quad8"
+DECODE_QUAD8_GROUP_TOKENS = DECODE_STEP8_TOKENS
 # The measured set (decode probes 02 / 04 / 05): "step8" runs 8 tokens per
 # attention grid step and "quad" stacks them in one softmax; "nofill" and
 # "q128" measured no gain.
@@ -2021,6 +2029,7 @@ def _attention_kernel(
         "quad",
         "lrows",
         *DECODE_STEP_LEVERS,
+        DECODE_QUAD8_LEVER,
     }, body_levers
     assert not ("quad" in body_levers and "pair" in body_levers)
     q128 = "q128" in body_levers
@@ -3438,43 +3447,55 @@ def _attention_kernel(
             pair_finish(batch_size // 2 - 1, *prev, levers)
 
         def run_quad(rows, levers):
-            """Decode lever "quad": the step's bsz tokens' QK scores stacked
-            into one [bsz * heads, w] tile (row max / exp / sum per row),
-            their unpacked KV staged in `kv_stage_ref[0]` and read back by
-            the PVs after the softmax."""
+            """Decode lever "quad": the step's tokens' QK scores stacked in
+            groups of `kv_stage_ref.shape[1]` tokens (the whole step, or
+            DECODE_QUAD8_GROUP_TOKENS under "quad8") into one [g * heads, w]
+            tile (row max / exp / sum per row), their unpacked KV staged in
+            `kv_stage_ref[0]` and read back by the PVs after the softmax."""
             h = num_q_heads
-            scores = []
-            kv_lens = []
-            w = None
-            for t in range(batch_size):
-                kv_lens.append(kv_lens_ref[batch_start_seq_idx + t])
-                kv = load_bkv(bi_sem_idx, t, rows, levers)
-                w = kv.shape[0]
-                kv_stage_ref.at[0, t, pl.ds(0, w)][...] = kv
-                q = load_bq(bi_sem_idx, t)
-                scores.append(
-                    jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
-                )
-            s = jnp.concatenate(scores, axis=0)
-            s *= sm_scale
-            if k_scale != 1.0:
-                s *= k_scale
-            row = lax.broadcasted_iota(jnp.int32, s.shape, 0)
-            lim = jnp.full(s.shape, kv_lens[batch_size - 1], jnp.int32)
-            for t in range(batch_size - 2, -1, -1):
-                lim = jnp.where(row < (t + 1) * h, kv_lens[t], lim)
-            span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
-            s = jnp.where(span < lim, s, jnp.finfo(jnp.float32).min)
-            m = jnp.max(s, axis=1, keepdims=True)
-            p = jnp.exp(s - m)
-            l_sum = jnp.sum(p, axis=1, keepdims=True)
-            for t in range(batch_size):
-                kv = kv_stage_ref.at[0, t, pl.ds(0, w)][...]
-                out = attention_step2_pv(
-                    p[t * h : (t + 1) * h], kv, l_sum[t * h : (t + 1) * h], levers
-                )
-                store_out(bo_sem_idx, t, out)
-                write_blse(t, m[t * h : (t + 1) * h], l_sum[t * h : (t + 1) * h])
+            assert kv_stage_ref is not None
+            group = kv_stage_ref.shape[1]
+            for t0 in range(0, batch_size, group):
+                bsz = min(group, batch_size - t0)
+                scores = []
+                kv_lens = []
+                w = None
+                for j in range(bsz):
+                    t = t0 + j
+                    kv_lens.append(kv_lens_ref[batch_start_seq_idx + t])
+                    kv = load_bkv(bi_sem_idx, t, rows, levers)
+                    w = kv.shape[0]
+                    kv_stage_ref.at[0, j, pl.ds(0, w)][...] = kv
+                    q = load_bq(bi_sem_idx, t)
+                    scores.append(
+                        jnp.einsum(
+                            "nd,md->nm", q, kv, preferred_element_type=jnp.float32
+                        )
+                    )
+                s = jnp.concatenate(scores, axis=0)
+                s *= sm_scale
+                if k_scale != 1.0:
+                    s *= k_scale
+                row = lax.broadcasted_iota(jnp.int32, s.shape, 0)
+                lim = jnp.full(s.shape, kv_lens[bsz - 1], jnp.int32)
+                for j in range(bsz - 2, -1, -1):
+                    lim = jnp.where(row < (j + 1) * h, kv_lens[j], lim)
+                span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+                s = jnp.where(span < lim, s, jnp.finfo(jnp.float32).min)
+                m = jnp.max(s, axis=1, keepdims=True)
+                p = jnp.exp(s - m)
+                l_sum = jnp.sum(p, axis=1, keepdims=True)
+                for j in range(bsz):
+                    t = t0 + j
+                    kv = kv_stage_ref.at[0, j, pl.ds(0, w)][...]
+                    out = attention_step2_pv(
+                        p[j * h : (j + 1) * h],
+                        kv,
+                        l_sum[j * h : (j + 1) * h],
+                        levers,
+                    )
+                    store_out(bo_sem_idx, t, out)
+                    write_blse(t, m[j * h : (j + 1) * h], l_sum[j * h : (j + 1) * h])
 
         def xqk_row_to_col(row):
             """[1, heads] -> [heads, 1] exactly (one live entry per row)."""
@@ -4311,10 +4332,12 @@ def sparse_ragged_paged_attention(
         )
     if "zu" in mixed_body_small_levers and "pv512" not in mixed_body_small_levers:
         raise ValueError("mixed_body_small_levers: 'zu' needs 'pv512'")
-    if not set(decode_body_levers) <= set(DECODE_BODY_LEVERS):
+    if not set(decode_body_levers) <= {*DECODE_BODY_LEVERS, DECODE_QUAD8_LEVER}:
         raise ValueError(
             f"decode_body_levers {decode_body_levers} not in {DECODE_BODY_LEVERS}"
         )
+    if DECODE_QUAD8_LEVER in decode_body_levers and "quad" not in decode_body_levers:
+        raise ValueError("decode_body_levers: 'quad8' needs 'quad'")
     if "quad" in decode_body_levers and "pair" in decode_body_levers:
         raise ValueError("decode_body_levers: 'pair' and 'quad' are alternatives")
     if "zu" in decode_body_levers and "pv512" not in decode_body_levers:
@@ -5165,7 +5188,14 @@ def sparse_attention_chunk(
             assert sparsecore_layout
             scratch_shapes.append(
                 pltpu.VMEM(
-                    (1, batch_size, cache_kv_nope.shape[1], pair_head_dim)
+                    (
+                        1,
+                        min(batch_size, DECODE_QUAD8_GROUP_TOKENS)
+                        if DECODE_QUAD8_LEVER in stage_levers
+                        else batch_size,
+                        cache_kv_nope.shape[1],
+                        pair_head_dim,
+                    )
                     if "quad" in stage_levers
                     else (2, 2, cache_kv_nope.shape[1], pair_head_dim),
                     jnp.float8_e4m3fn,

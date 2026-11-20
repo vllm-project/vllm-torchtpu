@@ -748,7 +748,7 @@ def merge_send_layout(
     rows = num_tokens * local
     # Padded with the real count, so the last entry is that count.
     real = query_start_loc[-1:].to(torch.int32)
-    if send_small_a2a_applies(num_tokens):
+    if send_small_a2a_applies(num_tokens, num_q_heads=world * local):
         from vllm_torchtpu.distributed.dcp import dcp_lane_operand
 
         if send_small_merge_applies(rows, vdim):
@@ -1054,18 +1054,27 @@ _SEND_SMALL_OPS: dict = {}
 _SEND_SMALL_MERGE_OPS: dict = {}
 
 
-def send_small_a2a_applies(num_tokens: int) -> bool:
+def send_small_a2a_applies(num_tokens: int, num_q_heads: int | None = None) -> bool:
     """Whether `merge_send_layout` exchanges this bucket with the Pallas
     small all-to-all (`TPU_DCP_MLA_SEND_SMALL_A2A`): `T <= cap` on the static
     bucket size, and only where the indexer's small all-gather already lifts
     the lane operand on every bucket (so no bucket lifts a buffer another
     does not)."""
+    from vllm_torchtpu.layers.core.attention_interface import (
+        resolve_fused_small_a2a_config,
+    )
+
+    group = get_dcp_group()
+    dcp_size = None if group is None else int(group.world_size)
     return bool(
         envs.TPU_DCP_MLA_SEND_SMALL_A2A
         and envs.TPU_DCP_INDEXER_SMALL_AG
         and envs.TPU_SC_TOPK_DCP_MERGE_FLAT
         and envs.TPU_DCP_RANK_OPERAND
-        and num_tokens <= envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
+        and num_tokens
+        <= resolve_fused_small_a2a_config(
+            num_q_heads=num_q_heads, dcp_size=dcp_size
+        ).send_max_tokens
     )
 
 
@@ -1087,7 +1096,7 @@ def send_small_merge_applies(rows: int, vdim: int) -> bool:
     )
 
 
-def fused_small_a2a_applies(num_tokens: int) -> bool:
+def fused_small_a2a_applies(num_tokens: int, num_q_heads: int | None = None) -> bool:
     """Whether the decode MLA kernel runs this bucket's small all-to-all
     itself (`TPU_MLA_FUSED_SMALL_A2A`): a bucket the Pallas small all-to-all
     takes (`send_small_a2a_applies`' static conditions) whose attention grid
@@ -1102,9 +1111,16 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
     default caps only at DCP >= 8). With TPU_MLA_FUSED_XCHG_MAX_TOKENS (and
     _MERGE) the cap rises to it, within the small all-to-all's cap: buckets
     above the step run the exchange and the merge over the kernel's grid
-    steps."""
+    steps. The small all-to-all's cap and the step lever are the ones
+    `resolve_fused_small_a2a_config` resolves (TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS
+    raises the cap and runs a 16-token bucket as one "step16" step); with
+    `num_q_heads` it also rejects buckets whose send rows exceed the in-kernel
+    merge's limit."""
     from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
-    from vllm_torchtpu.layers.core.attention_interface import dcp_mla_topk_cap
+    from vllm_torchtpu.layers.core.attention_interface import (
+        dcp_mla_topk_cap,
+        resolve_fused_small_a2a_config,
+    )
 
     if not (
         envs.TPU_MLA_FUSED_SMALL_A2A
@@ -1116,16 +1132,12 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
         return False
     group = get_dcp_group()
     dcp_size = 1 if group is None else int(group.world_size)
-    value = envs.TPU_MLA_DECODE_BODY_LEVERS
-    levers = (
-        sparse_kernel.DECODE_BODY_DEFAULT
-        if value == "1"
-        else tuple(
-            v.strip() for v in (value or "").split(",") if v.strip() and v != "0"
-        )
+    cfg = resolve_fused_small_a2a_config(
+        num_q_heads=num_q_heads,
+        dcp_size=None if group is None else dcp_size,
     )
-    step = sparse_kernel.decode_step_tokens(levers)
-    cap = min(envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS, step)
+    step = sparse_kernel.decode_step_tokens(cfg.decode_levers)
+    cap = min(cfg.send_max_tokens, step)
     if (
         step
         and envs.TPU_MLA_FUSED_XCHG_MAX_TOKENS
@@ -1133,7 +1145,7 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
     ):
         steps_cap = min(
             envs.TPU_MLA_FUSED_XCHG_MAX_TOKENS,
-            envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS,
+            cfg.send_max_tokens,
             sparse_kernel.FUSED_PREP_MAX_TOKENS,
         )
         cap = max(cap, steps_cap)
@@ -1697,8 +1709,11 @@ def prebuild_sized_merge(world: int) -> None:
     # as data on every bucket (the small all-to-all addresses peers by them);
     # buckets above the small cap ignore them.
     from vllm_torchtpu.distributed.dcp import dcp_lane_operand, dcp_rank_operand
+    from vllm_torchtpu.layers.core.attention_interface import (
+        resolve_fused_small_a2a_config,
+    )
 
-    small_cap = int(envs.TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS)
+    small_cap = resolve_fused_small_a2a_config(dcp_size=world).mtp_merge_max_tokens
     lane_axes = tuple(a for a in mesh.axis_names if a != DCP_AXIS_NAME)
     assert len(lane_axes) <= 1, mesh.axis_names
     lane_axis = lane_axes[0] if lane_axes else None

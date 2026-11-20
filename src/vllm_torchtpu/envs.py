@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     TPU_MLA_FUSED_SMALL_A2A_MERGE: bool = True
     TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS: int = 4
     TPU_MLA_FUSED_XCHG_MAX_TOKENS: int = 0
+    TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS: str = ""
     TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS: int = 0
     TPU_DCP_MLA_OUT_VMEM_MIB: int = 32
     TPU_SMALL_COLL_HBM_OPERAND: bool = True
@@ -775,6 +776,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB with only the gathered KV pinned, unless
     # TPU_MLA_FUSED_SMALL_A2A_BUCKETS lists them. 0 = off.
     "TPU_MLA_FUSED_XCHG_MAX_TOKENS": env_int("TPU_MLA_FUSED_XCHG_MAX_TOKENS", 0),
+    # Opt-in extension of fused MLA small all-to-all + in-kernel DCP merge (and
+    # the MTP drafter's small-all-to-all DCP merge cap) to 8- and 16-token
+    # decode buckets on 4-chip DCP8 ("1" = "4=kv@16,8=kv@24,16=kv@32", or an
+    # explicit T=<pins>@<MiB> bucket list; "" / "0" / "off" = off, leaving all
+    # existing caps, grids and bucket configs unchanged). A fused bucket of up
+    # to 16 tokens runs as one "step16" grid step (in place of "step8"). Not
+    # measured with TPU_MLA_FUSED_XCHG_MAX_TOKENS: setting both raises.
+    "TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS": lambda: os.getenv(
+        "TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS", ""
+    ),
     # DCP sparse MLA buckets of at most this many tokens that return the
     # partial and its lse to the merge (no send layout, one chunk, no merge
     # pieces; the 64-token decode bucket): the kernel writes both into VMEM
