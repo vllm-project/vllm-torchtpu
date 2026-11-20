@@ -136,6 +136,57 @@ def test_edge_inputs(fast):
         )
 
 
+def _interleaved_turns(rng, conversations=6, turns=10):
+    """Multi-turn prompts of several conversations in turn: most extend their
+    conversation's previous prompt, some edit or cut it first."""
+    prompts = {c: "[gMASK]<sop>" + _random_text(rng, 8) for c in range(conversations)}
+    order = [c for c in range(conversations) for _ in range(turns)]
+    rng.shuffle(order)
+    for c in order:
+        text = prompts[c]
+        roll = rng.random()
+        if roll < 0.2:
+            cut = rng.randrange(len(text))
+            text = text[:cut] + _random_text(rng, 2) + text[cut:]
+        elif roll < 0.3:
+            text = text[: rng.randrange(len(text))]
+        role = rng.choice(["<|user|>", "<|assistant|>", "<|observation|>"])
+        prompts[c] = text + role + _random_text(rng, rng.randrange(1, 12))
+        yield prompts[c]
+
+
+@pytest.mark.parametrize("fast", [False, True])
+def test_prefix_reuse_matches_full_encode(fast):
+    tok = _toy_tokenizer()
+    seg = SegmentTokenizer(
+        tok, max_cached_tokens=10_000, max_prompts=8, use_fastokens=fast
+    )
+    reused = 0
+    for text in _interleaved_turns(random.Random(4)):
+        ids, from_prompt = seg.encode_reusing(text)
+        assert ids == tok.encode(text, add_special_tokens=False).ids, repr(text)
+        reused += from_prompt
+    assert reused > 0
+
+
+def test_prefix_reuse_skips_an_end_an_added_token_can_cross(monkeypatch):
+    tok = _toy_tokenizer()
+    first = "<|user|>" + CORPUS + "<a>"
+    second = first + "b" + CORPUS
+    want = tok.encode(second, add_special_tokens=False).ids
+
+    seg = SegmentTokenizer(tok, max_cached_tokens=10_000, max_prompts=8)
+    seg.encode(first)
+    assert seg.encode_reusing(second) == (want, 1)
+
+    unchecked = SegmentTokenizer(tok, max_cached_tokens=10_000, max_prompts=8)
+    monkeypatch.setattr(
+        unchecked._recent, "_split_ends_at", lambda prompt, token: True, raising=False
+    )
+    unchecked.encode(first)
+    assert unchecked.encode(second) != want
+
+
 def test_cache_is_bounded():
     tok = _toy_tokenizer()
     seg = SegmentTokenizer(tok, max_cached_tokens=500)
@@ -232,6 +283,29 @@ def test_glm_chat_prompts_match_full_encode(fast):
             assert seg.encode(prompt) == want
             msgs = msgs[:-1] + _conversation(rng, 3, 200)[1:]
     assert seg.hits > 0
+
+
+def test_glm_prefix_reuse_matches_full_encode():
+    hf = _glm_tokenizer()
+    seg = SegmentTokenizer(
+        hf.backend_tokenizer, max_cached_tokens=1 << 22, max_prompts=8
+    )
+    rng = random.Random(5)
+    conversations = [_conversation(rng, rng.randrange(1, 20), 200) for _ in range(4)]
+    reused = 0
+    for turn in range(12):
+        c = rng.randrange(len(conversations))
+        msgs = conversations[c]
+        if turn % 4 == 3:
+            msgs[1] = {**msgs[1], "content": msgs[1]["content"] + " edited"}
+        prompt = hf.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True
+        )
+        ids, from_prompt = seg.encode_reusing(prompt)
+        assert ids == hf(prompt, add_special_tokens=False)["input_ids"]
+        reused += from_prompt
+        conversations[c] = msgs[:-1] + _conversation(rng, 3, 100)[1:]
+    assert reused > 0
 
 
 def test_glm_same_block_hashes():
