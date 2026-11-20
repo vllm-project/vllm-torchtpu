@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_RS_OUT_PRECISION: bool = True
+    TPU_DCP_Q_REPLICATE_MIN_TOKENS: int = 0
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -459,6 +460,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Backbone MLA merge: reduce-scatter the weighted outputs in the output's
     # precision (bf16), half f32's bytes. MTP drafter stays f32; 0 = f32.
     "TPU_DCP_RS_OUT_PRECISION": env_bool("TPU_DCP_RS_OUT_PRECISION", default=True),
+    # Under DCP query replication (VLLM_DCP_Q_REPLICATE=1), backbone token
+    # buckets of at most this many tokens project only this rank's query heads
+    # and all-gather them over the DCP group, as with VLLM_DCP_Q_REPLICATE=0.
+    # Larger buckets keep the replicated query. Replication makes every rank
+    # read the whole group's q_b_proj and W_UK_T weights, which costs more
+    # than the head all-gather in weight-bound decode steps and less in
+    # compute-bound prefill steps. The bucket is static, so each compiled
+    # variant takes one path. The local path reads its own copy of this
+    # rank's q_b_proj columns, built at load: 1/dcp_size of the replicated
+    # weight per layer. The MTP drafter is traced once for every bucket and
+    # always keeps the replicated query. 0 = replicated query in every bucket.
+    "TPU_DCP_Q_REPLICATE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_Q_REPLICATE_MIN_TOKENS", 0
+    ),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins
     # them in VMEM and its output aliases q_nope (512 wide), instead of the
