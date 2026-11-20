@@ -151,7 +151,9 @@ def run_steps(monkeypatch, key_on, kinds, schedule, advance_on_wait=False, faile
             r.maybe_setup_kv_connector(so)
             log.append(("forward_dispatch", step))
             r._submit_deferred_kv_loads()  # the DEFER_LOAD_SUBMIT / LANDX gate
-            if r._kv_early_poll():
+            from vllm_torchtpu import envs
+
+            if envs.QWEN4_EXP_PD_EARLY_POLL and r._kv_early_poll():
                 r._early_poll_kv_connector(so)
             log.append(("prev_results_wait", step))
             if advance_on_wait:
@@ -375,8 +377,13 @@ def test_sample_tokens_source_order():
         )
     ]
     assert len(gates) == 1
+    # `envs.QWEN4_EXP_PD_EARLY_POLL and self._kv_early_poll()`: with the key off the
+    # stock path touches no new runner attribute (stub runners in older tests keep working).
     t = gates[0].test
-    assert isinstance(t, ast.Call) and isinstance(t.func, ast.Attribute) and t.func.attr == "_kv_early_poll"
+    assert isinstance(t, ast.BoolOp) and isinstance(t.op, ast.And) and len(t.values) == 2
+    k, c = t.values
+    assert isinstance(k, ast.Attribute) and k.attr == KEY and isinstance(k.value, ast.Name) and k.value.id == "envs"
+    assert isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and c.func.attr == "_kv_early_poll"
 
 
 def test_stock_poll_block_is_unchanged():
