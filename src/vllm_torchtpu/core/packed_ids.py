@@ -28,6 +28,7 @@ support.
 """
 
 from array import array
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -47,7 +48,7 @@ class PackedPromptIds(np.ndarray):
         return (_unpack_prompt_ids, (self.tobytes(),))
 
 
-def pack_prompt_ids(ids) -> PackedPromptIds | None:
+def pack_prompt_ids(ids: Sequence[int]) -> PackedPromptIds | None:
     """Pack a list of token ids, or return None if it cannot be packed
     losslessly into int32."""
     try:
