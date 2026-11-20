@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
+    TPU_DISTRIBUTED_SAMPLING: bool = False
     TPU_DP_VOCAB_PARALLEL: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
@@ -806,6 +807,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
+    # Eligible non-greedy chunks (1 <= top_k <= 100 or pure temperature) sample
+    # directly from each TP rank's vocabulary-parallel LM head shard
+    # (runner/distributed_sampling.py) instead of gathering full logits. Slices
+    # with top_k > 100, top_p-only rows, or mixed modes, and steps with
+    # logprobs, grammar, min_tokens, repetition_penalty, or
+    # thinking_token_budget fall back to full logits; speculative decoding,
+    # TP == 1, LoRA heads, TPU_DP_VOCAB_PARALLEL, EP lockstep, and custom
+    # compute_logits raise NotImplementedError. Off by default until sampling
+    # accuracy evals and throughput A/B cover non-Gemma models across TP sizes.
+    "TPU_DISTRIBUTED_SAMPLING": env_bool("TPU_DISTRIBUTED_SAMPLING"),
     # Shard the input embedding and lm_head over every DP x TP rank (the EP
     # group) instead of the TP group. Needs DP with EP (lockstep DP engines);
     # ignored with PP, context parallelism, speculative decoding, LoRA, pooling

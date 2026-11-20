@@ -22,6 +22,7 @@ from collections.abc import Callable, Sequence
 import torch
 
 MASKED_LOGIT_VALUE = -1e12
+SAMPLING_EPS = 1e-5
 # 128 matches the native TPU (8, 128) vector tile / 128-element lane width
 # and evenly divides standard padded vocabs (e.g. 248,320 = 1,940 * 128;
 # 152,064 = 1,188 * 128; 128,256 = 1,002 * 128), ensuring per-block amax
@@ -62,11 +63,12 @@ def _int32_bsearch(
     # bits.
     current_bits = current_bits | torch.where(predicate(current_bits), sign_bit, zero)
 
-    for i in range(31):
-        bit = 1 << (30 - i)
+    for i in range(30, -1, -1):
+        bit = 1 << i
         bit_t = torch.full_like(current_bits, bit)
         midpoint = current_bits | bit
         current_bits = current_bits | torch.where(predicate(midpoint), zero, bit_t)
+
     return current_bits
 
 
@@ -209,7 +211,7 @@ def topp_mask(
     probability mass is >= p. Values in this set are left as they are. All other
     values are set with `replace_val`.
 
-    Sharding considerations: this function does 33 reductions over the
+    Sharding considerations: this function does 32 reductions over the
     vocab_size axis of the input array. To avoid excessive latency from these
     reductions, you should ensure that the vocab_size axis is unsharded on input
     to this function. Prefer to shard the batch axes instead.
@@ -364,3 +366,20 @@ def random_sampler_variants(num_blocks: int) -> list[tuple[int, bool]]:
     if num_blocks:
         variants.append((num_blocks, True))
     return variants
+
+
+def safe_logsumexp(
+    x: torch.Tensor, dim: int = -1, keepdim: bool = False
+) -> torch.Tensor:
+    """Numerically stable logsumexp returning -inf (not NaN) on all -inf slices."""
+    max_val = x.amax(dim=dim, keepdim=True)
+    safe_max = torch.where(torch.isfinite(max_val), max_val, torch.zeros_like(max_val))
+    lse = max_val + torch.log(torch.exp(x - safe_max).sum(dim=dim, keepdim=True))
+    return lse if keepdim else lse.squeeze(dim)
+
+
+def gumbel_noise_from_uniform(u: torch.Tensor) -> torch.Tensor:
+    """Transforms Uniform(0, 1) draws into standard Gumbel(0, 1) variates."""
+    finfo = torch.finfo(u.dtype)
+    u_clamped = torch.clamp(u, min=finfo.tiny, max=1.0 - finfo.eps)
+    return -torch.log(-torch.log(u_clamped))
