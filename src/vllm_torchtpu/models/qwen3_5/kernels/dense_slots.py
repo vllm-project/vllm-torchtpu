@@ -61,7 +61,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.small_collectives.common import (
     DENSE_SLOTS_COLLECTIVE_ID,
 )
-from vllm_torchtpu.kernels.fused_moe.v3 import device, ffn, layout
+from vllm_torchtpu.kernels.fused_moe.v3 import device, ffn
 from vllm_torchtpu.kernels.fused_moe.v3.config import Config
 from vllm_torchtpu.kernels.fused_moe.v3.layout import LANES, MESH_AXIS, device_coords
 from vllm_torchtpu.kernels.fused_moe.v3.rowquant import FP8, quantize_rows
@@ -206,13 +206,15 @@ def _wait_rows(sem, ref, rows):
     pltpu.make_async_copy(ref.at[pl.ds(0, rows)], ref.at[pl.ds(0, rows)], sem).wait()
 
 
-def _barrier(num_shards, mesh_axes):
+def _barrier(num_shards, mesh_axes, *, shard_index_operand):
     barrier = pltpu.get_barrier_semaphore()
     for i in range(num_shards):
         pl.semaphore_signal(
             barrier,
             inc=1,
-            device_id=device_coords(jnp.int32(i), mesh_axes),
+            device_id=device_coords(
+                jnp.int32(i), mesh_axes, shard_index_operand=shard_index_operand
+            ),
             device_id_type=pl.DeviceIdType.MESH,
         )
     pl.semaphore_wait(barrier, num_shards)
@@ -235,6 +237,8 @@ def build_kernel(
     result_slots=3,
     out_dtype=jnp.bfloat16,
     num_experts=None,
+    side_effects=True,
+    shard_index_operand=False,
 ):
     """The per-shard Pallas program: a callable of the shard index, the
     valid-row count, the shard's rows, top-k indices and weights, and the
@@ -246,7 +250,9 @@ def build_kernel(
     masks around it). The index exchange and the tables run inside the
     program, after the first weight refills are issued (so they stream under
     the table math), and reach the scalar core by a VMEM -> SMEM copy. The
-    arrivals and the weighted sum stay in VMEM."""
+    arrivals and the weighted sum stay in VMEM. side_effects and
+    shard_index_operand are dense_slots_moe's (fused EP v3's lowering:
+    transport.start_transport, layout.device_coords)."""
     R = real_rows
     if R % 8 or tokens_per_shard < R:
         raise ValueError(
@@ -344,7 +350,7 @@ def build_kernel(
         coef_vmem[...] = w_in
         ag_src = (rows_all.at[block], scales_all.at[block])
         ag_dst = ag_src
-        _barrier(D, mesh_axes)
+        _barrier(D, mesh_axes, shard_index_operand=shard_index_operand)
         for i in range(1, D):
             peer = lax.rem(me + i, jnp.int32(D))
             # The indices first: the tables wait on them alone.
@@ -353,7 +359,9 @@ def build_kernel(
                 dst_ref=idx_all.at[block],
                 send_sem=sem_idx_send,
                 recv_sem=sem_idx_recv,
-                device_id=device_coords(peer, mesh_axes),
+                device_id=device_coords(
+                    peer, mesh_axes, shard_index_operand=shard_index_operand
+                ),
                 device_id_type=pl.DeviceIdType.MESH,
             ).start()
             for src, dst in zip(ag_src, ag_dst):
@@ -362,7 +370,9 @@ def build_kernel(
                     dst_ref=dst,
                     send_sem=sem_ag_send,
                     recv_sem=sem_ag_recv,
-                    device_id=device_coords(peer, mesh_axes),
+                    device_id=device_coords(
+                        peer, mesh_axes, shard_index_operand=shard_index_operand
+                    ),
                     device_id_type=pl.DeviceIdType.MESH,
                 ).start()
         if D > 1:
@@ -415,7 +425,11 @@ def build_kernel(
                         dst_ref=dst,
                         send_sem=sem_push_send.at[rs],
                         recv_sem=sem_push_recv,
-                        device_id=device_coords(jnp.int32(d), mesh_axes),
+                        device_id=device_coords(
+                            jnp.int32(d),
+                            mesh_axes,
+                            shard_index_operand=shard_index_operand,
+                        ),
                         device_id_type=pl.DeviceIdType.MESH,
                     ).start()
 
@@ -623,7 +637,7 @@ def build_kernel(
     params = dict(
         collective_id=COLLECTIVE_ID_DENSE, vmem_limit_bytes=device.vmem_limit()
     )
-    if layout.SIDE_EFFECTS:
+    if side_effects:
         params["has_side_effects"] = True
     program = pl.pallas_call(
         kernel,
@@ -658,13 +672,17 @@ def dense_slots_moe(
     shard_index=None,
     valid_tokens=None,
     drop_nan_rows=False,
+    side_effects=True,
 ):
     """The dense-slots layer: same operands and result as v3's fused_ep_moe
     with fp8 weights, per-channel scales, silu and bf16 result rows (the
     DP4xTP2 decode binding). x [tokens, hidden] bf16 sharded over the mesh
     axis; router logits [tokens, num_experts]. Each shard's rows, a multiple
     of 8, go to the program unpadded; it pads them to ROW_ALIGN rows
-    itself."""
+    itself. As in fused_ep_moe, a `shard_index` handed in has the program
+    address its peers in the shard-index operand form, and `side_effects`
+    is what the program declares to XLA (the torch bridge passes the rank
+    tensor and False)."""
     from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer  # select kernel
 
     if config is None:
@@ -699,6 +717,8 @@ def dense_slots_moe(
         mesh_axes=tuple(mesh.axis_names),
         elementwise=config.elementwise,
         columns_per_pass=config.activation_columns_per_pass,
+        side_effects=side_effects,
+        shard_index_operand=shard_index is not None,
     )
     with_valid = valid_tokens is not None
 

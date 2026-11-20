@@ -243,6 +243,7 @@ def run_moe_v3(
                 shard_index=rank,
                 valid_tokens=valid_tokens,
                 drop_nan_rows=drop_nan_rows,
+                side_effects=False,
             )
         return fused_ep_moe(
             x,
