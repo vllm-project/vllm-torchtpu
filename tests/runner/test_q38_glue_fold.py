@@ -450,6 +450,30 @@ def test_check_mode_reports_zero_and_catches_a_fault(monkeypatch):
     assert len(faulted) == 1 and "asm=0/" not in faulted[0], faulted
 
 
+def test_compiled_folds_strip_dynamic_marks():
+    """vLLM marks the forward's input_ids / positions dynamic on the tensor
+    object and the folds take positions (sub) and input_ids (pre): every
+    compiled fold is wrapped in _static_shape_args, which hands a stamped
+    tensor to the TPU backend as an unstamped view."""
+    from vllm_torchtpu.spec_decode.eagle3 import _static_shape_args
+
+    code = _static_shape_args(lambda: None).__code__
+    fns = {
+        "post": tr._glue_post_verify_compiled,
+        "asm": tr._glue_assemble_compiled,
+        "pre": tr._glue_pre_compiled,
+        "pre_id": tr._glue_pre_identity_compiled,
+        "sub": tr._glue_subtract_fn(),
+    }
+    assert {k for k, f in fns.items() if getattr(f, "__code__", None) is not code} == set()
+    seen = []
+    w = _static_shape_args(lambda t: seen.append(getattr(t, "_dynamo_dynamic_indices", None)))
+    t = torch.zeros(4)
+    t._dynamo_dynamic_indices = {0}
+    w(t)
+    assert seen == [None]
+
+
 def test_call_sites_in_source():
     """The runner's call sites are the ones _step mirrors."""
     st = inspect.getsource(TPUModelRunner.sample_tokens)

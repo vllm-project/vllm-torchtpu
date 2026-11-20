@@ -9799,10 +9799,13 @@ def _glue_pre_identity_impl(
     return ids, drafts
 
 
-_glue_post_verify_compiled = _tpu_compile(_glue_post_verify_impl)
-_glue_assemble_compiled = _tpu_compile(_glue_assemble_impl)
-_glue_pre_compiled = _tpu_compile(_glue_pre_impl)
-_glue_pre_identity_compiled = _tpu_compile(_glue_pre_identity_impl)
+# _static_shape_args: vLLM marks the forward's input_ids / positions dynamic on
+# the tensor object, and the folds take positions (sub) and input_ids (pre); a
+# stamped tensor would lift a SymInt the TPU backend refuses (see eagle3).
+_glue_post_verify_compiled = _static_shape_args(_tpu_compile(_glue_post_verify_impl))
+_glue_assemble_compiled = _static_shape_args(_tpu_compile(_glue_assemble_impl))
+_glue_pre_compiled = _static_shape_args(_tpu_compile(_glue_pre_impl))
+_glue_pre_identity_compiled = _static_shape_args(_tpu_compile(_glue_pre_identity_impl))
 _glue_subtract_compiled = None  # built on first use (tpu_runner_async_output)
 
 
@@ -9957,7 +9960,9 @@ def _glue_subtract_fn():
             subtract_num_rejected_tokens,
         )
 
-        _glue_subtract_compiled = _tpu_compile(subtract_num_rejected_tokens)
+        _glue_subtract_compiled = _static_shape_args(
+            _tpu_compile(subtract_num_rejected_tokens)
+        )
     return _glue_subtract_compiled
 
 
