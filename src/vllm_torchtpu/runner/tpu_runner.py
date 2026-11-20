@@ -591,6 +591,7 @@ def _steady_verify_tail_impl(
     min_n: int,
     max_n: int,
     width: int,
+    blocks: int,
     bound: int,
 ) -> tuple[torch.Tensor, ...]:
     """Everything after a steady greedy verify step's kernel, one program:
@@ -611,7 +612,7 @@ def _steady_verify_tail_impl(
         k,
     )
     drafts, next_num_drafts, next_meta = propose_step(
-        hist, meta, next_tokens, min_n, max_n, k, width
+        hist, meta, next_tokens, min_n, max_n, k, width, blocks
     )
     source, num_rejected = spec_substitution_impl(next_tokens, drafts, draft_lengths)
     source = torch.nn.functional.pad(source, (0, bound - source.shape[0]))
@@ -6099,7 +6100,7 @@ class TPUModelRunner(GPUModelRunner):
             return None
         assert carry is not None and md.draft_token_ids is not None
         k = carry.tokens_per_req - 1
-        hist, meta, width, key = fused
+        hist, meta, width, blocks, key = fused
         out = (
             _steady_verify_tail_compiled
             if tokens.device.type == "tpu"
@@ -6124,6 +6125,7 @@ class TPUModelRunner(GPUModelRunner):
             drafter.min_n,
             drafter.max_n,
             width,
+            blocks,
             self.max_num_reqs * (1 + k),
         )
         next_tokens, drafts, next_meta, source, num_rejected = out[:5]

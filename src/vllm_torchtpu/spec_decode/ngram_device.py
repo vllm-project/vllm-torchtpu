@@ -53,24 +53,20 @@ FILLER_TOKEN_ID = 0
 MIN_MATCH_WIDTH = 1024
 
 
-# History rows are `[blocks, 128]`, so a row is one slot of the in-place
-# Pallas row write: a functional scatter copies the whole 270 MB history per
-# step (0.2 ms), the row write moves only the rows it changes.
+# The history is `[rows * blocks, 128]` slots, a row's tokens in `blocks`
+# consecutive slots (a multiple of 8, the in-place write's sublane group). A
+# step reads the slots of its match width and writes back only the two it
+# appends into, in place: a functional scatter copies the whole 270 MB history
+# (0.2 ms per step), and whole-row writes move 1 MB per row.
 HIST_LANES = 128
 
 
-def _write_rows(hist: torch.Tensor, rows: torch.Tensor, vals: torch.Tensor) -> None:
-    """`hist[rows] = vals` in place (`vals` is `[len(rows), width]`)."""
-    vals = vals.reshape(rows.shape[0], *hist.shape[1:])
-    if hist.device.type == "tpu":
-        pallas_index_copy_(hist, rows.to(torch.int32), vals)
-    else:
-        hist.index_copy_(0, rows.long(), vals)
-
-
 def _write_row_impl(hist: torch.Tensor, packed: torch.Tensor) -> None:
-    """`hist[packed[0]] = packed[1:]`: one request's history from the host."""
-    _write_rows(hist, packed[:1], packed[1:])
+    """History row `packed[0]` = `packed[1:]`, a request's tokens from the host
+    (a new or moved request; a functional write)."""
+    blocks = (packed.shape[0] - 1) // HIST_LANES
+    slots = packed[0].long() * blocks + torch.arange(blocks, device=hist.device)
+    hist.index_copy_(0, slots, packed[1:].view(blocks, HIST_LANES))
 
 
 def propose_step(
@@ -81,11 +77,12 @@ def propose_step(
     max_n: int,
     k: int,
     width: int,
+    blocks: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Appends one step's tokens to the history rows and drafts from them.
 
     Args:
-        hist: [num_hist_rows, blocks, HIST_LANES] persistent token history,
+        hist: [num_hist_rows * blocks, HIST_LANES] persistent token history,
             updated in place.
         meta: [2 * rows] int32: each chunk row's history row (padded rows point
             at the dump row), then its committed length.
@@ -93,7 +90,9 @@ def propose_step(
             at the end of each row.
         min_n, max_n: n-gram sizes to match.
         k: drafts per row.
-        width: history columns to match over; base_len + S <= width.
+        width: history columns to match over (a multiple of HIST_LANES);
+            base_len + S <= width.
+        blocks: slots per history row.
 
     Returns:
         [rows, k] int64 drafts, FILLER_TOKEN_ID where nothing matched; each
@@ -109,9 +108,22 @@ def propose_step(
     # [rows, S] columns the step's tokens land in; base_len + S <= width. The
     # INVALID padding lands at or past seq_len, where nothing reads it.
     cols = base_len[:, None] + torch.arange(steps, device=device)
-    full = hist[hist_rows].reshape(rows, -1).scatter(1, cols, new)
-    _write_rows(hist, hist_rows, full)
-    tokens = full[:, :width]
+    n_slots = width // HIST_LANES
+    first = hist_rows * blocks
+    window = first[:, None] + torch.arange(n_slots, device=device)
+    tokens = hist[window].reshape(rows, width).scatter(1, cols, new)
+    # The step's tokens span the slot of base_len and maybe the next one.
+    touched = (base_len // HIST_LANES)[:, None] + torch.arange(2, device=device)
+    touched = touched.clamp(max=n_slots - 1)
+    vals = tokens.view(rows, n_slots, HIST_LANES).gather(
+        1, touched[:, :, None].expand(-1, -1, HIST_LANES)
+    )
+    slots = (first[:, None] + touched).reshape(-1)
+    vals = vals.reshape(-1, HIST_LANES)
+    if hist.device.type == "tpu":
+        pallas_index_copy_(hist, slots.to(torch.int32), vals)
+    else:
+        hist.index_copy_(0, slots, vals)
     seq_len = base_len + (new != INVALID_TOKEN_ID).sum(dim=1)
 
     positions = torch.arange(width, device=device)
@@ -175,12 +187,13 @@ class DeviceNgramProposer:
         self.max_model_len = vllm_config.model_config.max_model_len
         # Set by the runner each step; only each chunk's batch span is read.
         self.draft_chunks: list[DraftChunkInputs] | None = None
-        # [max_num_reqs + 1, blocks, HIST_LANES]; the last row absorbs the
+        # [(max_num_reqs + 1) * blocks, HIST_LANES]; the last row absorbs the
         # padded rows' writes. A step appends at most 1 + K tokens past a
         # committed length of up to max_model_len.
         self._hist: torch.Tensor | None = None
         # The match width buckets, ascending, the last the full width.
         self._match_widths: list[int] = []
+        self._blocks = 0
         # Per chunk `(start, num_reqs, rows)`, the `meta` the last step left
         # on device, while its rows stay current and all its tokens commit:
         # the next step reuses it instead of uploading the committed lengths.
@@ -199,10 +212,10 @@ class DeviceNgramProposer:
         """Allocates the device history before the KV cache is sized."""
         del target_model  # Drafts from tokens only.
         width = self.max_model_len + 1 + self.k
-        blocks = -(-width // HIST_LANES)
-        width = blocks * HIST_LANES
+        self._blocks = -(-width // (8 * HIST_LANES)) * 8
+        width = self._blocks * HIST_LANES
         self._hist = torch.zeros(
-            (self._dump_row + 1, blocks, HIST_LANES),
+            ((self._dump_row + 1) * self._blocks, HIST_LANES),
             dtype=torch.int32,
             device=self.runner.device,
         )
@@ -227,7 +240,16 @@ class DeviceNgramProposer:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self._hist is not None
         fn = _propose_compiled if self._is_compiled() else propose_step
-        return fn(self._hist, meta, new_tokens, self.min_n, self.max_n, self.k, width)
+        return fn(
+            self._hist,
+            meta,
+            new_tokens,
+            self.min_n,
+            self.max_n,
+            self.k,
+            width,
+            self._blocks,
+        )
 
     def _stale_rows(self, scheduler_output: SchedulerOutput) -> list[int]:
         """The batch rows whose device history is stale.
@@ -274,8 +296,8 @@ class DeviceNgramProposer:
         num_reqs: int,
         rows: int,
         steps: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, int, tuple[int, int, int]] | None:
-        """`(history, meta, match width, key)` for a caller that folds this
+    ) -> tuple[torch.Tensor, torch.Tensor, int, int, tuple[int, int, int]] | None:
+        """`(history, meta, match width, blocks, key)` for a caller that folds this
         chunk's propose (`propose_step`) into its own program ahead of the
         host commit, or None unless the last step left the chunk's lengths on
         device and its rows are current. The host lengths then lag one step,
@@ -286,7 +308,7 @@ class DeviceNgramProposer:
             return None
         assert self._hist is not None
         _, width = self._chunk_meta(start, num_reqs, rows, 2 * steps, meta)
-        return self._hist, meta, width, key
+        return self._hist, meta, width, self._blocks, key
 
     def commit_fused(self, key: tuple[int, int, int], next_meta: torch.Tensor) -> None:
         """Keep the lengths a folded `propose_step` left (see `fused_inputs`)."""
