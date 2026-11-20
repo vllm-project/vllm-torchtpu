@@ -39,7 +39,10 @@ in local mode the rows stay on the device, so it saves only HBM traffic. The
 rows are quantized, so the output is close to, not equal to, bf16 combine.
 
 ROUTING_MOE_FP8_DISPATCH=1 all-gathers the tokens in fp8 with one f32 scale per
-128 columns instead of bf16, and dequantizes them before tokamax's layer.
+token instead of bf16 (as fused_moe_ep's rowquant), and dequantizes them before
+tokamax's layer. Per-row scales keep every array 2-D: a per-column-block scale
+needs a [tokens, blocks, 128] view, which on TPU's tiled layouts is a physical
+relayout of the whole gathered array (measured: costlier than the bf16 gather).
 tokamax's own sequence-parallel path gathers bf16 rows (its input_pack and
 routing_gmm take no quantized x), so this path gathers itself and runs
 tokamax's per-device layer (`_routing_moe_local`) with the rows replicated,
@@ -92,8 +95,6 @@ _RANK_BUFFER: torch.Tensor | None = None
 # hidden size must fill whole 512-element chunks (tokamax rejects others).
 _FP8_COMBINE_CHUNK = 512
 
-# fp8 dispatch: one f32 scale per this many columns of a token row.
-_FP8_DISPATCH_BLOCK = 128
 _FP8_MAX = float(jnp.finfo(jnp.float8_e4m3fn).max)
 
 
@@ -129,14 +130,8 @@ def unsupported_reason(layer) -> str | None:
             f"ROUTING_MOE_FP8_COMBINE needs a hidden size divisible by "
             f"{_FP8_COMBINE_CHUNK}, not {hidden}"
         )
-    if envs.ROUTING_MOE_FP8_DISPATCH:
-        if not envs.ROUTING_MOE_REMOTE_SCATTER:
-            return "ROUTING_MOE_FP8_DISPATCH needs remote scatter"
-        if hidden % _FP8_DISPATCH_BLOCK:
-            return (
-                f"ROUTING_MOE_FP8_DISPATCH needs a hidden size divisible by "
-                f"{_FP8_DISPATCH_BLOCK}, not {hidden}"
-            )
+    if envs.ROUTING_MOE_FP8_DISPATCH and not envs.ROUTING_MOE_REMOTE_SCATTER:
+        return "ROUTING_MOE_FP8_DISPATCH needs remote scatter"
     return None
 
 
@@ -224,19 +219,15 @@ def gmm_plan_fields(spec: tuple, rows: int) -> dict | None:
 
 
 def _quantize_rows(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """[t, H] -> fp8 [t, H] and f32 scales [t, H / _FP8_DISPATCH_BLOCK]."""
-    t, h = x.shape
-    xb = x.astype(jnp.float32).reshape(t, h // _FP8_DISPATCH_BLOCK, _FP8_DISPATCH_BLOCK)
-    amax = jnp.max(jnp.abs(xb), axis=-1)
+    """[t, H] -> fp8 [t, H] and one f32 scale per row, [t, 1]."""
+    xf = x.astype(jnp.float32)
+    amax = jnp.max(jnp.abs(xf), axis=-1, keepdims=True)
     scale = jnp.where(amax > 0, amax / _FP8_MAX, 1.0)
-    q = (xb / scale[..., None]).astype(jnp.float8_e4m3fn).reshape(t, h)
-    return q, scale
+    return (xf * (1.0 / scale)).astype(jnp.float8_e4m3fn), scale
 
 
 def _dequantize_rows(q: jax.Array, scale: jax.Array, dtype) -> jax.Array:
-    t, h = q.shape
-    xb = q.astype(jnp.float32).reshape(t, h // _FP8_DISPATCH_BLOCK, _FP8_DISPATCH_BLOCK)
-    return (xb * scale[..., None]).astype(dtype).reshape(t, h)
+    return (q.astype(jnp.float32) * scale).astype(dtype)
 
 
 def _routing_moe_jax(

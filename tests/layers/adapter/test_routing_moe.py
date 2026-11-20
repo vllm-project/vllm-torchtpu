@@ -181,32 +181,28 @@ def test_fp8_dispatch_follows_the_flag(fp8_dispatch):
     assert seen[0]["fp8_dispatch"] is fp8_dispatch
 
 
-@pytest.mark.parametrize(
-    "remote, hidden, want",
-    [(False, 512, "remote scatter"), (True, 192, "divisible by 128")],
-)
-def test_fp8_dispatch_refusals(remote, hidden, want):
+def test_fp8_dispatch_needs_remote_scatter():
     with (
         patch.object(envs, "ROUTING_MOE_FP8_DISPATCH", True),
-        patch.object(envs, "ROUTING_MOE_REMOTE_SCATTER", remote),
-        pytest.raises(ValueError, match=want),
+        patch.object(envs, "ROUTING_MOE_REMOTE_SCATTER", False),
+        pytest.raises(ValueError, match="remote scatter"),
     ):
-        _prebuild(_layer(hidden=hidden))
+        _prebuild(_layer(hidden=512))
 
 
 def test_fp8_dispatch_rows_round_trip():
-    """One f32 scale per 128 columns: each row block comes back within fp8's
-    relative precision, and an all-zero block stays zero."""
+    """One f32 scale per row: each row comes back within fp8's relative
+    precision of its largest value, and an all-zero row stays zero."""
     x = jax.random.normal(jax.random.PRNGKey(0), (6, 512), jnp.float32) * 3.0
-    x = x.at[2, :128].set(0.0).astype(jnp.bfloat16)
+    x = x.at[2].set(0.0).astype(jnp.bfloat16)
     q, scale = bridge._quantize_rows(x)
-    assert q.dtype == jnp.float8_e4m3fn and scale.shape == (6, 4)
+    assert q.dtype == jnp.float8_e4m3fn and scale.shape == (6, 1)
     back = bridge._dequantize_rows(q, scale, jnp.bfloat16)
     assert back.dtype == jnp.bfloat16
     err = np.abs(np.asarray(back, np.float32) - np.asarray(x, np.float32))
-    amax = np.abs(np.asarray(x, np.float32)).reshape(6, 4, 128).max(-1)
-    assert (err.reshape(6, 4, 128).max(-1) <= amax / 8 + 1e-6).all()
-    assert not np.asarray(back[2, :128], np.float32).any()
+    amax = np.abs(np.asarray(x, np.float32)).max(-1, keepdims=True)
+    assert (err <= amax / 8 + 1e-6).all()
+    assert not np.asarray(back[2], np.float32).any()
 
 
 def test_gmm_plan_parsing():
