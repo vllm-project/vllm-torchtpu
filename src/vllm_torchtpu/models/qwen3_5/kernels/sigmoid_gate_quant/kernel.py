@@ -21,6 +21,7 @@ scales the FP8 ``o_proj`` would compute for itself. The Qwen3.5 model patch
 """
 
 import functools
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -43,36 +44,72 @@ def select_vreg_step(cols: int) -> int:
     return max(16, (64 // vregs_per_row // 8) * 8)
 
 
+# Two bf16 inputs and one fp8 output, double buffered: 10 bytes per element
+# of a block. 16 MiB keeps the unsharded width (TP1 under pipeline
+# parallelism, 8192 columns) inside the scoped VMEM limit.
+_BLOCK_BYTES_PER_ELEMENT = 10
+_BLOCK_VMEM_BUDGET = 16 << 20
+
+
+def _fits_vmem_budget(rows: int, cols: int) -> bool:
+    """Whether a [rows, cols] block, double buffered, fits the VMEM budget."""
+    return rows * cols * _BLOCK_BYTES_PER_ELEMENT <= _BLOCK_VMEM_BUDGET
+
+
 def select_tile(rows: int, cols: int) -> int:
     """Select a VMEM BlockSpec tile cap for [rows, cols] gate + quant: a
     multiple of 32, or ``rows`` for a step that runs as one block.
 
     For decode/verify batch sizes (rows <= 256), caps tile so grid >= 6 and
     double-buffered VMEM DMAs overlap with compute; wider than 2048 columns
-    such a step runs as one block (see below). For large prefill shapes
-    (rows > 256), uses a larger VMEM block (up to 512 rows) while the kernel
-    processes VREG-sized sub-tiles internally, avoiding large Pallas grid
-    overhead at T=8192 without spilling VREGs.
+    such a step runs as one block where it fits the VMEM budget (see below).
+    For large prefill shapes (rows > 256), uses a larger VMEM block (up to
+    512 rows) while the kernel processes VREG-sized sub-tiles internally,
+    avoiding large Pallas grid overhead at T=8192 without spilling VREGs.
     """
     vreg_cap = select_vreg_step(cols)
-    # Two bf16 inputs and one fp8 output, double buffered: 10 bytes per
-    # element of the tile. 16 MiB keeps the unsharded width (TP1 under
-    # pipeline parallelism, 8192 columns) inside the scoped VMEM limit;
-    # widths of 2048 columns or less are unaffected.
-    budget_cap = max(32, ((16 << 20) // (10 * cols)) // 32 * 32)
+    budget_cap = max(
+        32, (_BLOCK_VMEM_BUDGET // (_BLOCK_BYTES_PER_ELEMENT * cols)) // 32 * 32
+    )
     if rows <= 256:
         if vreg_cap < 32:
             # Wider than 2048 columns the VREG step (16 rows) is below the
-            # smallest legal tile, so a step of up to 256 rows runs as one
-            # block of all its rows. The measured legs compiled this form:
-            # the TP2 decode steps (4096 columns) and the TP1 prefill steps
-            # (8192 columns) of up to 256 rows. At 8192 columns a block of
-            # more than 204 rows is over the 16 MiB budget (256 rows: 20 MiB);
-            # the measured TP1 prefill leg compiled and ran its 256-row block.
-            return rows
+            # smallest legal tile. A step whose block fits the budget runs as
+            # one block: on TPU7x, 32-row blocks were 4-15% slower at 64 to
+            # 256 rows. A larger step tiles at the budget cap (256 rows at
+            # 8192 columns: two 128-row blocks, as fast as one).
+            return rows if _fits_vmem_budget(rows, cols) else budget_cap
         dma_cap = max(32, (rows // 6 // 32) * 32)
         return min(vreg_cap, dma_cap, budget_cap)
     return min(max(vreg_cap, 512), budget_cap)
+
+
+class BlockPlan(NamedTuple):
+    """How `pallas_sigmoid_gate_quant` runs a step."""
+
+    rows: int  # the step's rows after padding
+    block_rows: int  # BlockSpec rows
+    step_rows: int  # in-kernel row step
+
+
+def plan_blocks(rows: int, cols: int) -> BlockPlan:
+    """The padded rows, block and in-kernel step for a [rows, cols] step.
+
+    A step pads to 8 rows, and to a multiple of 32 when no legal tile of its
+    rows fits the VMEM budget, so every block fits it.
+    """
+    padded = max(rows, 8)
+    block = legal_tile(padded, select_tile(padded, cols))
+    if not _fits_vmem_budget(block, cols):
+        padded = pl.cdiv(padded, 32) * 32
+        block = legal_tile(padded, select_tile(padded, cols))
+    if not _fits_vmem_budget(block, cols):
+        raise NotImplementedError(
+            f"pallas_sigmoid_gate_quant: a {block}-row block of {cols} columns "
+            f"exceeds the {_BLOCK_VMEM_BUDGET >> 20} MiB VMEM budget; use "
+            "sigmoid_gate_quant_reference at this width."
+        )
+    return BlockPlan(padded, block, legal_tile(block, select_vreg_step(cols)))
 
 
 def _sigmoid_gate_quant_kernel(attn_ref, gate_ref, q_ref, s_ref, *, step_m: int):
@@ -99,13 +136,11 @@ def pallas_sigmoid_gate_quant(
 ) -> tuple[jax.Array, jax.Array]:
     """Fused attn_output * sigmoid(gate) + per-token FP8 quantization in Pallas."""
     orig_m, k = attn_out.shape
-    if orig_m < 8:
-        pad = 8 - orig_m
+    m, bm, step_m = plan_blocks(orig_m, k)
+    if m != orig_m:
+        pad = m - orig_m
         attn_out = jnp.pad(attn_out, ((0, pad), (0, 0)))
         gate = jnp.pad(gate, ((0, pad), (0, 0)))
-    m = attn_out.shape[0]
-    bm = legal_tile(m, select_tile(m, k))
-    step_m = legal_tile(bm, select_vreg_step(k))
     q_spec = pl.BlockSpec((bm, k), lambda i: (i, 0))
     s_spec = pl.BlockSpec((bm, 1), lambda i: (i, 0))
     q, s = pl.pallas_call(
@@ -121,7 +156,7 @@ def pallas_sigmoid_gate_quant(
         name="pallas_sigmoid_gate_quant",
         interpret=pltpu.InterpretParams() if interpret else False,
     )(attn_out, gate)
-    if orig_m < 8:
+    if m != orig_m:
         return q[:orig_m], s[:orig_m]
     return q, s
 
