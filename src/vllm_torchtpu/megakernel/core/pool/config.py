@@ -42,6 +42,11 @@ POOL_STATE_NAME = "raw"
 POOL_GATHER_VALUES: tuple[Any, ...] = (False, "split", None, "eligible", True)
 ACT_MODE_VALUES: tuple[str, ...] = ("from_ckpt", "all", "ref")
 
+# Batch thresholds of `fused_pool_io="auto"`: fuse pool I/O when
+# `B <= FUSED_POOL_IO_MAX_B` or `B >= FUSED_POOL_IO_MIN_B_HI`.
+FUSED_POOL_IO_MAX_B: int = 24
+FUSED_POOL_IO_MIN_B_HI: int = 56
+
 # Numerics class of each pool-I/O mode.
 POOL_IO_NUMERICS: dict[str, NumericsClass] = {
     "fused_pool_io": "approx",  # always runs the head-major recurrence
@@ -182,6 +187,8 @@ class PoolBackend:
 __all__ = [
     "ACT_MODE_VALUES",
     "DEFAULT_CACHE_EXEC",
+    "FUSED_POOL_IO_MAX_B",
+    "FUSED_POOL_IO_MIN_B_HI",
     "POOL_GATHER_VALUES",
     "POOL_IO_NUMERICS",
     "POOL_STATE_NAME",
