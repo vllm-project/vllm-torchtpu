@@ -141,3 +141,47 @@ def test_every_import_time_tpu_compile_site_is_wrapped():
 def test_the_row_copy_program_is_wrapped():
     """The one site decorated when called: the per-geometry row copy."""
     assert hasattr(mamba_state_copy_op._row_copy_fn(2, 1, 1), "_fast_dispatch_state")
+
+
+# The functions the Qwen3.5-397B serving configuration dispatches directly with
+# both tpu_compile options on: (module under vllm_torchtpu, attribute path). A
+# decorator deleted from one of them loses the options for it without leaving a
+# plain torch.compile behind, which the source-reading tests above do not see.
+# Changes that add such functions extend this list.
+DISPATCHED_DIRECTLY = [
+    ("layers.adapter.custom_ops.mamba_state_copy_op", "copy_mamba_state_blocks"),
+    (
+        "layers.adapter.sample.rejection_sampler",
+        "_random_rejection_sample_with_segment",
+    ),
+    ("layers.core.attention_metadata", "_staged_walk_products_compiled"),
+    ("runner.min_tokens", "mask_stop_tokens"),
+    ("runner.min_tokens", "restore_all_masked_rows"),
+    ("runner.spec_boundary_state", "_spec_boundary_pairs_compiled"),
+    ("runner.tpu_runner", "_reset_read_offsets_compiled"),
+    ("runner.tpu_runner", "_rollback_offsets_seed_compiled"),
+    ("runner.tpu_runner", "_rollback_offsets_migrate_compiled"),
+    ("runner.tpu_runner", "TPUModelRunner.compute_selected_logits"),
+    ("runner.tpu_runner", "TPUModelRunner.compute_selected_top_tokens"),
+    ("runner.tpu_runner", "TPUModelRunner.gather_logprobs"),
+    ("runner.tpu_runner", "TPUModelRunner.sample_from_logits"),
+    ("runner.tpu_runner", "TPUModelRunner.spec_gather_bonus_and_target_logits"),
+    ("spec_decode.eagle3", "Eagle3Proposer._draft_gather_carries"),
+    ("spec_decode.eagle3", "Eagle3Proposer._draft_propose_token"),
+    ("spec_decode.eagle3", "Eagle3Proposer._draft_seed_input_ids"),
+    (
+        "structured_decoding.structured_decoding_manager",
+        "StructuredDecodingManager.structured_decode",
+    ),
+]
+
+
+def test_the_functions_serving_dispatches_directly_stay_wrapped():
+    unwrapped = []
+    for module, path in DISPATCHED_DIRECTLY:
+        obj = importlib.import_module(f"vllm_torchtpu.{module}")
+        for name in path.split("."):
+            obj = getattr(obj, name)
+        if not hasattr(obj, "_fast_dispatch_state"):
+            unwrapped.append(f"{module}:{path}")
+    assert not unwrapped, unwrapped
