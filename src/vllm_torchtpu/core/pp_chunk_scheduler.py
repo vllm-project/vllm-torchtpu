@@ -298,13 +298,12 @@ class TpuPipelineChunkScheduler(Scheduler):
             self._memo_xstep,
         )
 
-    def _get_num_free_blocks(self) -> int | None:
+    def _get_num_free_blocks(self) -> int:
         """Free HBM blocks, with the Mamba blocks hybrid-state retention pins
         counted as free: retention evicts them when an allocation needs
         them."""
-        # PrefixAwareScheduler's pool count; self is not one, hence the cast.
-        free_blocks = cast(Any, PrefixAwareScheduler)._get_num_free_blocks(self)
-        if free_blocks is not None and self._retention is not None:
+        free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        if self._retention is not None:
             free_blocks += self._retention.num_pinned_blocks()
         return free_blocks
 
@@ -370,7 +369,7 @@ class TpuPipelineChunkScheduler(Scheduler):
         window = list(islice(queue, self._paw_sort_window))
         free_blocks = self._get_num_free_blocks()
         free_blocks_for_ext = free_blocks
-        if free_blocks is not None and self._is_kv_producer:
+        if self._is_kv_producer:
             reserved = self._inflight_prefill_reserved_blocks()
             free_blocks_for_ext = max(0, free_blocks - reserved)
         # The step's wall time, the clock _promote_warmest ages on.
@@ -409,8 +408,8 @@ class TpuPipelineChunkScheduler(Scheduler):
         self,
         request: Any,
         now: float,
-        free_blocks: int | None,
-        free_blocks_for_ext: int | None,
+        free_blocks: int,
+        free_blocks_for_ext: int,
     ) -> tuple[int, int, float, float]:
         """Sort key of the waiting-queue sort, by (effective) uncached
         tokens; lower is admitted first."""
@@ -418,29 +417,19 @@ class TpuPipelineChunkScheduler(Scheduler):
         num_tokens = int(request.num_tokens)
         hbm_cold_tokens = max(num_tokens - local_warmth, 0)
         block_size = self._get_block_size()
-        fits_hbm = (
-            free_blocks is None
-            or math.ceil(hbm_cold_tokens / block_size) <= free_blocks
-        )
+        fits_hbm = math.ceil(hbm_cold_tokens / block_size) <= free_blocks
         ext_warmth = self._external_warmth(request, local_warmth)
         if ext_warmth > 0 and not (
-            fits_hbm
-            and (
-                free_blocks_for_ext is None
-                or math.ceil(ext_warmth / block_size) <= free_blocks_for_ext
-            )
+            fits_hbm and math.ceil(ext_warmth / block_size) <= free_blocks_for_ext
         ):
             ext_warmth = 0
         warmth = local_warmth + ext_warmth
         uncached = max(num_tokens - warmth, 0)
         eff_uncached = self._quad_cost(uncached, warmth)
-        arrival = float(getattr(request, "arrival_time", now) or now)
+        arrival = request.arrival_time
         rate = self._get_paw_aging_rate()
         aged = eff_uncached - rate * max(0.0, now - arrival)
-        started = (
-            getattr(request, "num_preemptions", 0) > 0
-            or getattr(request, "num_computed_tokens", 0) > 0
-        )
+        started = request.num_preemptions > 0 or request.num_computed_tokens > 0
         return (0 if fits_hbm else 1, 0 if started else 1, aged, arrival)
 
     def _get_paw_aging_rate(self) -> float:
@@ -547,8 +536,6 @@ class TpuPipelineChunkScheduler(Scheduler):
             return None
         head_local_warmth = self._prefix_warmth(head)
         free_blocks = self._get_num_free_blocks()
-        if free_blocks is None:
-            return None
         head_cold_tokens = max(head.num_tokens - head_local_warmth, 0)
         if free_blocks < math.ceil(head_cold_tokens / self._get_block_size()):
             return free_blocks
@@ -771,7 +758,7 @@ class TpuPipelineChunkScheduler(Scheduler):
     def _waiting_warmth(self, request: Any) -> int:
         """Prompt tokens of a waiting request that need no prefill: its
         computed tokens, or under quadratic_cost its prefix hit."""
-        computed = int(getattr(request, "num_computed_tokens", 0) or 0)
+        computed = request.num_computed_tokens
         if computed > 0 or self._cost is None or not self._quadratic_cost:
             return computed
         if not self.kv_cache_manager.enable_caching:
