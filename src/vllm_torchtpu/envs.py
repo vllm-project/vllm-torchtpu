@@ -417,6 +417,8 @@ if TYPE_CHECKING:
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
     VLLM_TPU_CPU_PROBE_S: float = 0.0
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
+    VLLM_TPU_GLUE_FOLD: bool = False
+    VLLM_TPU_GLUE_FOLD_CHECK: int = 0
     VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = False
     VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
     VLLM_TPU_STAGED_WALK_CLASS_GATHER: bool = False
@@ -2683,6 +2685,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_FUSED_READ_OFFSET_UPDATE": env_bool(
         "VLLM_TPU_FUSED_READ_OFFSET_UPDATE", default=True
     ),
+    # q38 DEC-STEP-3: the async spec step's integer glue (post-verify read
+    # offsets + rejected count + bonus; the draft source assembly + pad; the
+    # cross-step subtract; the substitution + draft extraction) as four
+    # compiled programs, op for op the stock ones (tpu_runner._glue_*). The
+    # uniform draws stay eager. Single-chunk async spec steps only.
+    "VLLM_TPU_GLUE_FOLD": env_bool("VLLM_TPU_GLUE_FOLD", default=False),
+    # With VLLM_TPU_GLUE_FOLD: run the stock ops on copies for the first N
+    # folded steps and log the mismatch counts once (must be 0).
+    "VLLM_TPU_GLUE_FOLD_CHECK": env_nonnegative_int("VLLM_TPU_GLUE_FOLD_CHECK", 0),
     # Metadata walk: reuse the previous step's staged block-table upload when
     # its geometry and contents are unchanged (layers/core/attention_metadata.py
     # stage_block_table_uploads).
