@@ -1141,6 +1141,7 @@ def fused_moe_prefill_nvfp4(
             visit_start,
             visit_rows,
             routed_visits,
+            _,  # per-row routing weight; only returned with route_coeff
         ) = _routing_plan(topk_ids, route_valid, experts, x_scale)
         # pyrefly: ignore[bad-argument-type]
         row_scale = jnp.concatenate([sorted_scale, x_scale])
