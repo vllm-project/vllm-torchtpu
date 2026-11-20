@@ -66,21 +66,19 @@ def _impl(cls=attention.PallasBatchedRPAAttentionBackendImpl, head_size=256):
 
 
 def _opted_in_impl(monkeypatch, tiles):
-    """A layer built the way a model that opts its layers in builds it: the
-    flags are set before __init__ looks up the decode lanes (TPU7x, a
-    262,144-token context), and stay on the layer."""
-    cls = attention.PallasBatchedRPAAttentionBackendImpl
+    """A layer built the way the Qwen3.5 rule builds it: __init__ sets the
+    flags from the rule (`tiles` stands in for it) before it looks up the
+    decode lanes (TPU7x, a 262,144-token context)."""
     serving = SimpleNamespace(
-        speculative_config=None, model_config=SimpleNamespace(max_model_len=262144)
+        speculative_config=None,
+        model_config=SimpleNamespace(architectures=[], max_model_len=262144),
+        additional_config={},
     )
     with monkeypatch.context() as m:
-        m.setattr(cls, "tuned_tiles", tiles)
-        m.setattr(cls, "skip_empty_mixed", tiles)
+        m.setattr(attention, "qwen3_5_tuned_tiles", lambda _: tiles)
         m.setattr(attention, "get_chip_version", lambda: pltpu.ChipVersion.TPU_7X)
         m.setattr(attention, "get_current_vllm_config_or_none", lambda: serving)
-        impl = _impl()
-    impl.tuned_tiles = impl.skip_empty_mixed = tiles
-    return impl
+        return _impl()
 
 
 def _config():
@@ -99,10 +97,10 @@ def _config():
 def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
     monkeypatch, rank, compiled, tiles, cpu_vllm_config_context
 ):
-    """With `tiles`, the layers carry tuned_tiles and skip_empty_mixed, set as a
-    model opting its layers in sets them, so the forward must look the ops up
-    with those values too. Such a layer has 4 decode lanes, which the DCP
-    passes do not take: they keep the wrapper's 8."""
+    """With `tiles`, the layers carry tuned_tiles and skip_empty_mixed, set by
+    the Qwen3.5 rule, so the forward must look the ops up with those values
+    too. Such a layer has 4 decode lanes, which the DCP passes do not take:
+    they keep the wrapper's 8."""
     # Every case compiles the forward of three layers; start from a clean
     # dynamo cache so the cases do not add up to its recompile limit.
     torch._dynamo.reset()
