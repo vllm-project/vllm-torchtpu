@@ -48,9 +48,9 @@ JAX's interpreter resolves only `NDIndexer` ref transforms, but the kernel
 addresses state through `granule_view` (`ref.bitcast(uint32).reshape(...)`), so
 `_stock_interpret` resolves bitcast / reshape ref views by byte index. A
 bitcast to a wider dtype packs consecutive second-minor rows into one word,
-the TPU convention main's `tests/kernels/gdn/v3/gdn_pool_state_utils.py`
+the TPU convention `tests/kernels/gdn/v3/gdn_pool_state_utils.py`
 documents; `test_pool_bytes_match_stock_state_utils` checks the pool bytes
-against that module where it is available.
+against that module.
 """
 
 from __future__ import annotations
@@ -66,40 +66,22 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax._src.state import indexing
+from jax._src.state import types as state_types
 from jax.experimental.pallas import tpu as pltpu
+from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
+from kernels.gdn.v3 import gdn_pool_state_utils
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.gdn.v3 import wrapper
 from vllm_torchtpu.megakernel.core import pool
 from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.core.ops import F32
 from vllm_torchtpu.megakernel.core.pool import CacheExec, PoolLayout
 
-wrapper = pytest.importorskip(
-    "vllm_torchtpu.kernels.gdn.v3.wrapper",
-    reason="needs the stock GDN v3 kernel (kernels/gdn/v3)",
-)
-try:
-    from jax._src.state import indexing
-    from jax._src.state import types as state_types
-    from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
-
-    _MI = sys.modules[pltpu.reset_tpu_interpret_mode_state.__module__]
-    for _name in (
-        "get",
-        "store",
-        "swap",
-        "fail_on_exception",
-        "interpret_utils",
-        "TPU_MEMORY_SPACE_NAMES",
-        "_get_shared_memory",
-        "_local_core_id_or_zero_if_hbm",
-    ):
-        getattr(_MI, _name)
-except (ImportError, AttributeError) as e:  # pragma: no cover - JAX internals
-    pytest.skip(
-        f"JAX Pallas TPU interpret internals unavailable: {e}", allow_module_level=True
-    )
-
-from vllm_torchtpu import envs  # noqa: E402
+# Pallas's TPU interpret-mode module: `_stock_interpret` wraps its ref
+# accessors (`get` / `store` / `swap`) and reads its shared memory.
+_MI = sys.modules[pltpu.reset_tpu_interpret_mode_state.__module__]
 
 # One TP=8 rank of Qwen3.5's GDN layers.
 N_KQ, N_V, D = 2, 8, 128
@@ -520,16 +502,12 @@ def test_stock_write_megakernel_read(fill: int):
 
 
 def test_pool_bytes_match_stock_state_utils():
-    """The interpret-mode pool bytes agree with main's host view of the stock
+    """The interpret-mode pool bytes agree with the host view of the stock
     layout (`gdn_pool_state_utils`, checked against the kernel on TPU)."""
-    utils = pytest.importorskip(
-        "kernels.gdn.v3.gdn_pool_state_utils",
-        reason="needs tests/kernels/gdn/v3/gdn_pool_state_utils.py",
-    )
     ref = _dense_reference()
     raw, _ = _stock_prefill_pool(0x00)
     idx = jnp.asarray(_STOCK_SLOTS, jnp.int32)
-    rec, conv = utils.read_states(
+    rec, conv = gdn_pool_state_utils.read_states(
         raw,
         idx,
         split=PPS,
@@ -540,7 +518,7 @@ def test_pool_bytes_match_stock_state_utils():
     _assert_bytes_equal(conv, ref["pre"][0], "stock-written conv via state utils")
     _assert_bytes_equal(rec, ref["pre"][1], "stock-written rec via state utils")
 
-    placed = utils.write_states(
+    placed = gdn_pool_state_utils.write_states(
         _to_pool(_garbage_pool(1)),
         jnp.asarray(ref["dec"][1]),
         jnp.asarray(ref["dec"][0]),
