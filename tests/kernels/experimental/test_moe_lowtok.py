@@ -386,7 +386,7 @@ def _shapes(m, h, i, e):
     )
 
 
-def test_qwen_shape_is_supported():
+def test_64_experts_of_hidden_4096_and_intermediate_1024_are_supported():
     assert kernel.can_use_moe_lowtok(
         *_shapes(256, 4096, 1024, 64),
         None,
