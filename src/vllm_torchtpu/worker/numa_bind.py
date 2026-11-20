@@ -13,11 +13,14 @@
 # limitations under the License.
 """Bind a TPU worker to the NUMA node its chip is attached to.
 
-Called before the runtime starts so its threads inherit the node's CPU set
-and its host buffers prefer the node's memory. The inherited CPU set is only
-ever narrowed, so a launcher's reservation (taskset, numactl, a cgroup) stays
-in force. On a host with one NUMA node nothing changes in effect: the node
-holds every CPU of the inherited set and all of the memory.
+The CPU set (sched_setaffinity) and the memory policy (numa_set_preferred)
+apply to the calling thread and to threads it starts afterwards, not to threads
+that already run. TPUWorker.init_device binds before the TPU runtime starts, so
+the runtime's threads inherit both and its host buffers prefer the node's
+memory; a thread started earlier in the worker process keeps its placement. The
+inherited CPU set is only ever narrowed, so a launcher's reservation (taskset,
+numactl, a cgroup) stays in force. On a host with one NUMA node nothing changes
+in effect: the node holds every CPU of the inherited set and all of the memory.
 """
 
 import ctypes
@@ -86,8 +89,9 @@ def pci_numa_node(device: str) -> int | None:
 
 
 def bind_to_chip_numa_node(local_rank: int, local_ranks: int) -> None:
-    """Narrow this process's CPU set to its chip's NUMA node and prefer the
-    node's memory. `local_rank` is this worker's index among the host's
+    """Narrow the calling thread's CPU set to its chip's NUMA node and prefer
+    the node's memory for its allocations; threads it starts afterwards inherit
+    both. `local_rank` is this worker's index among the host's
     `local_ranks` workers. A failure before the CPU set is narrowed is logged
     and leaves placement unchanged. Without libnuma the CPU set is still
     narrowed and only the memory policy is left as it was, which the log line
