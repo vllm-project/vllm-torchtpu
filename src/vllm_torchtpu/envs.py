@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_ONEHOT_TABLE_LOOKUP: bool = True
     TPU_INLINE_DEDUPLICATED_CALLS: bool = True
+    TPU_SORT_ON_SPARSECORE: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
     TPU_ROPE_PAIRED_ROWS: bool = True
     TPU_BLOCK_TABLE_DELTA_BUCKETS: bool = True
@@ -595,6 +596,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_INLINE_DEDUPLICATED_CALLS": env_bool(
         "TPU_INLINE_DEDUPLICATED_CALLS", default=True
     ),
+    # Let XLA run sorts on SparseCore, asynchronously beside TensorCore work
+    # (--xla_tpu_enable_offloading_sort_to_sparsecore; env_override.py). Same
+    # results; the DeepSeek-V4.1 indexer's per-step candidate sorts leave the
+    # TensorCore's critical path. Measured on DeepSeek-V4.1 (tpu7x) only; set
+    # 0 if another model's sorts contend for SparseCore.
+    "TPU_SORT_ON_SPARSECORE": env_bool("TPU_SORT_ON_SPARSECORE", default=True),
     # Debug: on every incremental step, rebuild the full packed table on the
     # host and check it against the device-resident copy (raises on mismatch).
     "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE": env_bool(
