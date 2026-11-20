@@ -337,8 +337,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         so completed H2D loads promote ``WAITING_FOR_REMOTE_KVS`` requests in
         the very next step instead of waiting 2 steps for the worker echo.
 
-        The pipeline chunk scheduler's prefix-aware admission calls it at the
-        start of each step; a scheduler that does not keeps the worker echo."""
+        The pipeline chunk scheduler's prefix-aware admission, which a
+        follow-up change adds, calls it at the start of each step; until then
+        no scheduler does, and the worker echo completes the transfers."""
         self._scheduler = scheduler
         t0_ns = time.perf_counter_ns()
         manager = self._raiden_manager
@@ -807,9 +808,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     ) -> int:
         """Host-tier tokens past ``num_local_tokens`` that a lookup would load.
 
-        ``TpuPipelineChunkScheduler._external_warmth`` asks this; the pipeline
-        chunk scheduler calls that for its waiting sort, its warmest-first
-        promotion and its pending-work estimate. Without an
+        A follow-up change adds the caller, the pipeline chunk scheduler's
+        ``_external_warmth``, which it uses for its waiting sort, its
+        warmest-first promotion and its pending-work estimate. Without an
         answer, a request whose prefix is in the host tier but no longer in HBM
         is ranked as a cold prompt and waits behind cheaper work while its
         host-tier entries age towards eviction.
@@ -881,8 +882,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         in HBM when HBM has a divergent hybrid hit (FullAttention > Mamba), or
         None if Raiden CPU cannot advance past ``num_reconciled``.
 
-        The pipeline chunk scheduler's local-hit lookup asks this when the
-        connector reports divergent local hybrid hits."""
+        The pipeline chunk scheduler's local-hit lookup, which a follow-up
+        change adds, asks this when the connector reports divergent local
+        hybrid hits."""
         if getattr(request, "skip_reading_prefix_cache", False):
             return None
         req_status = self._req_status.get(request.request_id)
