@@ -555,7 +555,7 @@ def _resolve_cli_model_and_chip(
 ) -> tuple[ModelProfile, ChipSpec]:
     """Resolve ModelProfile and ChipSpec from CLI arguments."""
     target: str | Path = args.model or args.config or args.hf_repo or "qwen3.5-397b"
-    act_dt = getattr(args, "act_dtype", None)
+    act_dt = args.act_dtype
     profile = resolve_model_profile(target, act_dtype=act_dt)
     _emit_config_preset_notice(args.config, profile)
     chip_spec = resolve_chip_spec(

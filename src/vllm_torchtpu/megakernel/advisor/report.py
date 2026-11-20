@@ -1066,7 +1066,9 @@ def _resolve_facts_card_data(sweep: AdvisorSweepReport) -> _FactsCardData:
             f'<span class="cal-source">Source: <code>{_esc(meas_source)}</code></span>'
         )
     else:
-        hint_code = "advisor calibrate &lt;trace.xplane.pb&gt;"
+        hint_code = (
+            "advisor calibrate --trace &lt;trace.xplane.pb&gt; --out measurements.json"
+        )
         cal_status_badge = (
             '<span class="badge badge-assumed">UNCALIBRATED PRIORS</span> '
             f'<span class="cal-hint">Calibrate via: <code>{hint_code}</code></span>'
@@ -1212,6 +1214,8 @@ def _render_decision_table_rows(sweep: AdvisorSweepReport) -> list[str]:
 def _render_facts_ledger_card(sweep: AdvisorSweepReport) -> str:
     """Render the top Sourced Hardware & Model Facts Ledger HTML card."""
     data = _resolve_facts_card_data(sweep)
+    coll_lo_us, coll_hi_us = data.chip_spec.collective_latency_us_bracket
+    coll_bracket_fallback = f"{coll_lo_us:.1f}..{coll_hi_us:.1f}"
     chip_spec = data.chip_spec
     model_prof = data.model_prof
     chip_sources = data.chip_sources
@@ -1426,7 +1430,7 @@ def _render_facts_ledger_card(sweep: AdvisorSweepReport) -> str:
         <div class="prior-item">
           <span class="prior-name">Collective Latency:</span>
           <span class="prior-val">
-            <code>{data.coll_metric.get("value", "1.0..5.13")} us/hop</code>
+            <code>{data.coll_metric.get("value", coll_bracket_fallback)} us/hop</code>
           </span>
           <span class="prov-tag prov-tag-{data.coll_tag}">{data.coll_tag}</span>
         </div>
