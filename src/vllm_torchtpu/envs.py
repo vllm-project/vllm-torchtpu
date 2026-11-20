@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_COUNTING_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
+    TPU_PALLAS_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -718,6 +719,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # once the path is the default for these layers or is replaced by another
     # fused TP MoE path.
     "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL"),
+    # Largest row count of a bf16 [rows, hidden] tensor-parallel all-reduce
+    # that runs as the one-hop Pallas all-reduce of
+    # kernels/experimental/moe_tp_decode/all_reduce.py instead of the XLA
+    # all-reduce (layers/adapter/pallas_all_reduce.py). 0 (the default) turns
+    # it off. It applies only when the TP group is the whole world and equals
+    # the EP group, to row counts that are a multiple of the bf16 sublane
+    # tiling (16 on tpu7x) and to the model's hidden size; other all-reduces
+    # keep the XLA all-reduce. Armed and self-tested once after load. Remove
+    # once XLA's small all-reduce reaches the Pallas latency or the path
+    # becomes the default.
+    "TPU_PALLAS_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
+        "TPU_PALLAS_SMALL_ALL_REDUCE_MAX_ROWS", 0
+    ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

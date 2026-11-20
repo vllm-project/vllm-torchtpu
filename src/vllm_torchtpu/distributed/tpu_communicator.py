@@ -18,6 +18,10 @@ sums those matching-TP partials across DP and returns this DP rank's token
 slice. vLLM's existing ``reduce_results`` TP all-reduce remains responsible for
 the final TP-side reduction. Callers must pass equal token counts on each DP
 rank.
+
+The all-reduce hands decode-sized TP all-reduces to the Pallas all-reduce when
+TPU_PALLAS_SMALL_ALL_REDUCE_MAX_ROWS armed it (layers/adapter/
+pallas_all_reduce.py).
 """
 
 import torch
@@ -26,6 +30,8 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group
+
+from vllm_torchtpu.layers.adapter import pallas_all_reduce
 
 
 class TpuNullAll2AllManager(All2AllManagerBase):
@@ -41,6 +47,12 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         # (support_fault_tolerance=False); it is never used for compute.
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        reduced = pallas_all_reduce.maybe_all_reduce(input_, self.ranks)
+        if reduced is not None:
+            return reduced
+        return super().all_reduce(input_)
 
     def _moe_group(self, is_sequence_parallel: bool):
         group = get_ep_group() if is_sequence_parallel else get_dp_group()
