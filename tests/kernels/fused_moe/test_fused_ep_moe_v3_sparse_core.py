@@ -89,15 +89,26 @@ def _scatter_shapes(n_pairs, pairs_per_shard, *, tokens, n_scales, routed_rows=5
 
 
 @pytest.mark.cpu_test
-def test_scatter_refuses_more_pairs_than_its_float_decode_is_exact_for():
+@pytest.mark.parametrize("shards", [4, 5], ids=["at_max_pairs", "past_max_pairs"])
+def test_scatter_refuses_more_pairs_than_its_float_decode_is_exact_for(
+    tpu7x_record, shards
+):
     """The sparse cores decode a pair number with float multiplies, exact
-    below MAX_PAIRS pairs."""
+    below MAX_PAIRS pairs: a call of exactly MAX_PAIRS pairs is built, one
+    more shard's worth is refused."""
     pairs_per_shard = row_tables_kernel.MAX_PAIRS // 4
     operands, kwargs = _scatter_shapes(
-        8 * pairs_per_shard, pairs_per_shard, tokens=128, n_scales=1
+        shards * pairs_per_shard, pairs_per_shard, tokens=128, n_scales=1
     )
-    with pytest.raises(ValueError, match="exact up to"):
-        row_tables_kernel.scatter_row_tables(*operands, **kwargs)
+
+    def scatter(*args):
+        return row_tables_kernel.scatter_row_tables(*args, **kwargs)
+
+    if shards * pairs_per_shard > row_tables_kernel.MAX_PAIRS:
+        with pytest.raises(ValueError, match="exact up to"):
+            jax.eval_shape(scatter, *operands)
+    else:
+        jax.eval_shape(scatter, *operands)
 
 
 @pytest.mark.cpu_test
@@ -114,6 +125,18 @@ def test_the_float_decode_is_exact_below_max_pairs(divisor):
     decoded = (nudged * inverse).astype(np.int64)
     bad = np.flatnonzero(decoded != pair // divisor)
     assert not bad.size, (divisor, bad[:3])
+
+
+@pytest.mark.cpu_test
+def test_the_float_decode_first_fails_at_1_28_times_max_pairs():
+    """With divisor 1000 the first pair the decode gets wrong is 5,386,999,
+    so MAX_PAIRS could not be twice as high."""
+    pair = np.arange(5_386_999 + 1, dtype=np.int64)
+    inverse = np.float32(1.0 / 1000)
+    nudged = pair.astype(np.float32) + np.float32(row_tables_kernel.FLOOR_NUDGE)
+    decoded = (nudged * inverse).astype(np.int64)
+    bad = np.flatnonzero(decoded != pair // 1000)
+    assert bad[0] == 5_386_999
 
 
 @pytest.mark.cpu_test
