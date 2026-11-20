@@ -635,6 +635,34 @@ def test_token_gather_sort_keys_fit_the_served_shapes():
     assert not host.token_gather_sort_fits(2**24, 10, e_total=512, ep=32)
 
 
+def test_token_gather_sort_keys_stop_at_the_int32_bound():
+    """The bound is exact: the off-shard key, e_total * run_span, stays < 2**31."""
+    e_total, topk, ep = 2, 1, 1
+    at_bound = 2**30 - (host.ROWBLK - 1)  # e_total * run_span == 2**31
+    assert not host.token_gather_sort_fits(at_bound, topk, e_total=e_total, ep=ep)
+    assert host.token_gather_sort_fits(at_bound - 1, topk, e_total=e_total, ep=ep)
+
+
+@pytest.mark.parametrize(
+    "t_local,vmem,fits",
+    [
+        (256, None, True),  # Qwen3.8's 8,192-token step on TPU8i
+        (512, None, True),  # and its 16,384-token step
+        (1 << 16, None, False),  # ~2M tokens: past TPU8i's VMEM budget
+        (512, 1 << 20, False),  # the 16,384-token step on a 1 MiB VMEM
+    ],
+)
+def test_slab_run_copy_fits_its_vmem_budget(t_local, vmem, fits):
+    """The run copy is admitted only where its streams and tables fit VMEM."""
+    ep, topk, e_total, capacity = 32, 10, 512, 128
+    stride = host.ragged_stride_bound(ep * t_local, topk, e_total, capacity)
+    if vmem is None:
+        info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_8I, 1)
+    else:
+        info = types.SimpleNamespace(vmem_capacity_bytes=vmem)
+    assert host.slab_run_copy_fits(t_local, topk, ep, stride, info) is fits
+
+
 def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens():
     """NaN arrival rows stay isolated to padded rows and zero out via row_routes."""
     from vllm_torchtpu.kernels.fused_moe.v2.layer import _combine_arrivals

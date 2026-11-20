@@ -2830,12 +2830,22 @@ def _build_slab_run_copy(*, n_streams, src_rows, out_rows, n_runs):
     )
 
     def fn(src_off, dst_off, count, streams):
-        return call(
-            src_off.astype(jnp.int32),
-            dst_off.astype(jnp.int32),
-            count.astype(jnp.int32),
-            streams.astype(jnp.int32),
-        )
+        # Bounds checks are off in this kernel, so the operands are checked
+        # here rather than cast: the run tables are read as n_runs int32 words
+        # and the streams as int32 lane rows, and a cast would hide a caller
+        # passing f32 scales rather than their bits.
+        for name, arr, shape in (
+            ("src_off", src_off, (n_runs,)),
+            ("dst_off", dst_off, (n_runs,)),
+            ("count", count, (n_runs,)),
+            ("streams", streams, (n_streams, src_rows, lanes)),
+        ):
+            if arr.dtype != jnp.int32 or tuple(arr.shape) != shape:
+                raise ValueError(
+                    f"{name} must be int32{list(shape)}, "
+                    f"got {arr.dtype}{list(arr.shape)}"
+                )
+        return call(src_off, dst_off, count, streams)
 
     return fn
 

@@ -1192,16 +1192,55 @@ def sender_sorted_pairs(local_ids, me, *, t_local, topk, scale_bits):
     token's row-scale bits, so the receiver copies both tables in one pass
     and looks nothing up. A pair routed nowhere (expert id e_total) sorts
     past every expert and lies in no run.
+
+    The ids are the layer's own: top-k or hash-table selections in
+    [0, e_total), or e_total for a padding row. An id above e_total would
+    sort past every expert too, but a negative one would sort ahead of them
+    while no count covers it, shifting every run of its source; nothing
+    upstream produces one.
     """
+    if scale_bits.dtype != jnp.int32:
+        raise ValueError(
+            f"scale_bits must be the int32 bit patterns of the row scales, "
+            f"got {scale_bits.dtype}"
+        )
     ids = local_ids.reshape(t_local * topk).astype(jnp.int32)
     tokens = jnp.broadcast_to(
         (me * t_local + jnp.arange(t_local, dtype=jnp.int32))[:, None], (t_local, topk)
     ).reshape(-1)
-    scales = jnp.broadcast_to(
-        scale_bits.astype(jnp.int32)[:, None], (t_local, topk)
-    ).reshape(-1)
+    scales = jnp.broadcast_to(scale_bits[:, None], (t_local, topk)).reshape(-1)
     _, tokens, scales = lax.sort((ids, tokens, scales), num_keys=1, is_stable=True)
     return tokens, scales
+
+
+def slab_run_copy_rows(t_local, topk, ep, shard_stride):
+    """(source, destination) lane rows of build_slab_run_copy for one shard.
+
+    The source is the two gathered streams as [2, rows, 128]: ep sources of
+    align_up(t_local * topk, 128) expert-sorted pairs each, padded to whole
+    (8, 128) tiles. The destination is the scale slab's lane rows, padded the
+    same way; the token-gather table is the first shard_stride elements of
+    the other stream's output.
+    """
+    pairs = ep * align_up(t_local * topk, HIDDEN_LANE_BLOCK)
+    src_rows = (
+        align_up(pairs, HIDDEN_LANE_BLOCK * U32_SUBLANE_TILE) // HIDDEN_LANE_BLOCK
+    )
+    out_rows = align_up(act_scale_slab_rows(shard_stride), U32_SUBLANE_TILE)
+    return src_rows, out_rows
+
+
+def slab_run_copy_fits(t_local, topk, ep, shard_stride, info=None):
+    """Whether build_slab_run_copy's streams and tables fit the VMEM budget.
+
+    The kernel holds both gathered streams and both output tables in VMEM at
+    once (one grid step): 2 x (source + destination) lane rows of int32. Past
+    the budget the layer keeps the sort and the lookup rather than failing to
+    compile; for top-10 routing on TPU8i that is about 1.2 million tokens a
+    step.
+    """
+    src_rows, out_rows = slab_run_copy_rows(t_local, topk, ep, shard_stride)
+    return 2 * (src_rows + out_rows) * HIDDEN_LANE_BLOCK * 4 <= vmem_limit(info)
 
 
 def slab_run_copy_runs(routing, me, *, e_total, ep, src_stride):

@@ -52,6 +52,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     shard_token_gather,
     shard_token_gather_sorted,
     shard_transport_tables_in_blocks,
+    slab_run_copy_fits,
+    slab_run_copy_rows,
     slab_run_copy_runs,
     slab_scatter,
     slab_tables_on_tensorcore,
@@ -194,7 +196,13 @@ def _exchange_layout(t_local, topk, e_total, quantized, per_pair=False):
 
 
 def _pack_routing_exchange(pairs, scale_bits, counts, layout):
-    """The flat i32 payload: pairs [t*K], row-scale bits [t], counts [E].
+    """The flat i32 payload: pairs [t*K], row-scale bits, counts [E].
+
+    The pairs section is each pair's expert id, and the scale section one
+    row scale per token [t]; in the run-copy form (`per_pair`, from
+    sender_sorted_pairs) the pairs section carries each pair's token number
+    in expert order instead, and the scale section one scale per pair
+    [t*K], in the same order.
 
     The router weight stays local: the destination combine applies it in f32
     from its own copy, so the wire never carries it.
@@ -339,7 +347,9 @@ def fused_ep_moe_v2(
 
     sharded_plan computes the same kernel operands from the two complementary
     1/ep slices their consumers read, plus one small expert-count all-gather.
-    It changes routing-plan construction only, never the core kernel.
+    It changes routing-plan construction and, where the slab tables are
+    built by run copy (a TensorCore-table chip at prefill sizes), the routing
+    payload and how both tables are built; never the core kernel.
 
     token_replica_groups lists ordered groups of device-mesh indices whose
     x and gating rows are identical (for example, a TP group). Each member
@@ -555,31 +565,34 @@ def fused_ep_moe_v2(
     # the receiver copies (expert, source) runs. The plan it reads is the
     # sharded builder's counts; the expert ids it no longer receives fed only
     # slab_row, which neither table reads here. Only the fused stage: the
-    # split stages read this shard's expert ids back out of the payload.
+    # split stages read this shard's expert ids back out of the payload. The
+    # copy holds both streams and both tables in VMEM, so a step past that
+    # budget keeps the sort and the lookup (slab_run_copy_fits).
     tables_by_run_copy = bool(
         tables_on_tensorcore
         and form.quantized_activations
         and sharded_plan
         and stage == "fused"
         and T >= SLAB_RUN_COPY_MIN_TOKENS
+        and slab_run_copy_fits(t_local, topk, ep, ragged_stride)
     )
     if tables_by_run_copy:
         gather_by_sort = scale_by_lookup = False
-    logger.info_once(
-        "fused_ep_moe_v2: token-gather table by %s, scale slab by %s; "
-        "slab scatters (where left) by scatter-%s",
-        "sort" if gather_by_sort else "scatter",
-        (
-            ("lookup" if scale_by_lookup else "scatter")
-            if form.quantized_activations
-            else "none"
-        ),
-        "set" if slab_by_set else "add",
-    )
-    if tables_by_run_copy:
         logger.info_once(
             "fused_ep_moe_v2: both slab tables by run copy at %d tokens and up",
             SLAB_RUN_COPY_MIN_TOKENS,
+        )
+    else:
+        logger.info_once(
+            "fused_ep_moe_v2: token-gather table by %s, scale slab by %s; "
+            "slab scatters (where left) by scatter-%s",
+            "sort" if gather_by_sort else "scatter",
+            (
+                ("lookup" if scale_by_lookup else "scatter")
+                if form.quantized_activations
+                else "none"
+            ),
+            "set" if slab_by_set else "add",
         )
 
     layout = _exchange_layout(
@@ -818,11 +831,12 @@ def fused_ep_moe_v2(
         # slab_row outside it, which has not been measured either way.
         if tables_by_run_copy:
             scale_rows = act_scale_slab_rows(ragged_stride)
-            out_rows = align_up(scale_rows, U32_SUBLANE_TILE)
+            src_rows, out_rows = slab_run_copy_rows(t_local, topk, ep, ragged_stride)
             streams = jnp.stack([a.reshape(-1) for a in run_streams])
-            src_rows = align_up(streams.shape[1], HIDDEN_LANE_BLOCK * U32_SUBLANE_TILE)
-            streams = jnp.pad(streams, ((0, 0), (0, src_rows - streams.shape[1])))
-            src_rows //= HIDDEN_LANE_BLOCK
+            streams = jnp.pad(
+                streams,
+                ((0, 0), (0, src_rows * HIDDEN_LANE_BLOCK - streams.shape[1])),
+            )
             if t_local >= AGQ_MIN_LOCAL_TOKENS:
                 streams, q_g = lax.optimization_barrier((streams, q_g))
             src_off, dst_off, run_len = slab_run_copy_runs(
