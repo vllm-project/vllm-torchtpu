@@ -206,6 +206,7 @@ function snap(tag) {
     swapDisabled: Boolean(elems.get("btn-swap-ab").disabled),
     activeTokens: evA.activeTokens || 0,
     winnerScope: evA.winner ? evA.winner.scope : "",
+    winnerStepUpperUs: evA.winner ? evA.winner.step_upper_us : -1,
     verdictPill: elems.get("wb-verdict-pill").textContent,
     verdictSummary: elems.get("wb-verdict-summary").innerHTML,
     waterfallSvg: elems.get("wb-waterfall-svg").innerHTML,
@@ -240,6 +241,10 @@ for (const step of payload.steps || []) {
     window.wbOnSeqChange();
   } else if (op === "select_topic") {
     window.wbSelectTopic(step.kind, step.scope, step.sub);
+  } else if (op === "dispatch_regime") {
+    window.wbSetDispatchRegime(step.regime);
+  } else if (op === "reset_sliders") {
+    window.wbResetSliders();
   }
   snap(step.tag || op);
 }

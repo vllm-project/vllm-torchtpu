@@ -40,7 +40,7 @@
   const STATE = { pinA: 0, pinB: -1, customDirty: false, hwDirty: false,
   meshDirty: false, calibrated: false, dispatchRegime: 'compiled_xla',
   selectedTopic: { kind: 'scope', scope: 'whole_step', sub: 'total' },
-  calSource: '', calStepTimeUs: null, calHostHeadUs: null, launchGapHiUs: 1.5,
+  calSource: '', calStepTimeUs: null, calHostHeadUs: null, launchGapHiUs: null,
   collectiveCalls: [],
   denseSlotBytes: 2097152, collHopHiUs: (CHIP.collective_latency_us_bracket ||
   [1.0, 5.0])[1], expertSlotBytes: 1048576, presets: [], resetSeq: 0,
@@ -234,9 +234,10 @@
   const isFusedFast = fast.scope === 'whole_step' || fast.scope === 'layer_group';
   const cpFastGain = perOp.pureStepUs - fast.pureStepUs;
   const cpFastPct = perOp.pureStepUs > 1e-6 ? (cpFastGain / perOp.pureStepUs) * 100 : 0;
+  const floorTieEpsUs = Number(DATA.floor_tie_epsilon_us || 1e-6);
   const roiCheck = isHyp
-    ? (isFusedFast && cpFastGain > 0.0 && cpFastPct < 1.0)
-    : (isFusedWin && cpGain > 0.0 && cpPct < 1.0);
+    ? (isFusedFast && cpFastGain >= -floorTieEpsUs && cpFastPct < 1.0)
+    : (isFusedWin && cpGain >= -floorTieEpsUs && cpPct < 1.0);
   const roiBadge = roiCheck
     ? '<span class="wb-roi-badge">LOW ROI (&lt;1% PHYSICS)</span>' : '';
   const hypBadge = isHyp
@@ -602,7 +603,8 @@
   STATE.pinA = 0; STATE.pinB = -1; STATE.resetSeq = (STATE.resetSeq || 0) + 1;
   STATE.customDirty = false; STATE.meshDirty = false;
   STATE.hwDirty = false; STATE.calibrated = false; STATE.collectiveCalls = [];
-  STATE.dispatchRegime = 'compiled_xla'; STATE.launchGapHiUs = 1.5;
+  STATE.dispatchRegime = (REGIMES[0] && REGIMES[0].workload &&
+    REGIMES[0].workload.dispatch_regime) || 'auto'; STATE.launchGapHiUs = null;
   el('ctl-vmem').value = String(Math.min(STATE.maxVmemMib,
   Math.max(2.0, DATA.vmem_budget_mib || STATE.maxVmemMib)));
   el('ctl-dma').value = String(DATA.dma_buffers || 2); el('ctl-alias').value = '1';
