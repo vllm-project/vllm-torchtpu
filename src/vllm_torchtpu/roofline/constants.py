@@ -28,8 +28,8 @@ DEFAULT_CORES_PER_CHIP: int = int(
     pltpu.ChipVersion.TPU_7X.num_physical_tensor_cores_per_chip
 )
 MIN_TORUS_DIM: int = 4
-MIN_SLICE_CHIPS: int = 4
 WRAPPED_LANES_PER_AXIS: int = 2
+DEFAULT_ICI_LINKS_PER_CHIP: int = 6
 
 DEFAULT_ICI_LINK_BW: float = 100.0e9
 DEFAULT_ICI_HOP_LATENCY_S: float = 1.0e-6
@@ -40,7 +40,7 @@ VECTOR_MAX_ELEMENTS_PER_WORD: int = 4
 # Elements per 32-bit vector word for weights stored below one byte (4-bit elements).
 VECTOR_SUB_BYTE_ELEMENTS_PER_WORD: int = 8
 SUBCHANNEL_BLOCK_K_FLOOR: int = 512
-TPU7X_ICI_LINKS_PER_CHIP: int = 6
+TPU7X_ICI_LINKS_PER_CHIP: int = DEFAULT_ICI_LINKS_PER_CHIP
 DEFAULT_D2D_BW: float = float(TPU7X_ICI_LINKS_PER_CHIP) * DEFAULT_ICI_LINK_BW
 DEFAULT_ICI_BW: float = DEFAULT_D2D_BW / float(DEFAULT_CORES_PER_CHIP)
 DEFAULT_DCN_HOST_GBIT_PER_S: float = 400.0
@@ -171,7 +171,9 @@ DEFAULT_HTTPS_PORT: int = 443
 FP32_BYTES: float = 4.0
 BF16_BYTES: float = 2.0
 FP8_BYTES: float = 1.0
+INT8_BYTES: float = 1.0
 DEFAULT_SSM_STATE_BYTES: float = 4.0
+FP4_BYTES: float = 0.5
 MXFP4_BYTES: float = 0.5 + 1.0 / 32.0
 NVFP4_BYTES: float = 0.5 + 1.0 / 16.0
 
@@ -187,8 +189,8 @@ BASE_DTYPE_BYTES: dict[str, float] = {
     "float8_e8m0fnu": FP8_BYTES,
     "e8m0": FP8_BYTES,
     "fp8": FP8_BYTES,
-    "int8": 1.0,
-    "uint8": 1.0,
+    "int8": INT8_BYTES,
+    "uint8": INT8_BYTES,
 }
 
 WEIGHT_DTYPE_BYTES: dict[str, float] = {"bf16": BF16_BYTES, "fp8": FP8_BYTES}
@@ -269,6 +271,10 @@ ZERO_THINK_TIME_WARNING: str = (
 
 # Versioned solve JSON payload and top-K diversity selection constants.
 SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v2"
+CHIP_SPEC_SCHEMA: str = "vllm_torchtpu.roofline.chip_spec/v1"
+VALID_CHIP_PROVENANCE: frozenset[str] = frozenset(
+    {"public_spec", "jax_tpu_info", "measured_microbench", "projected"}
+)
 ACTIVATION_HULL_SCHEMA: str = "vllm_torchtpu.roofline.moe_activation_hull/v1"
 # Float64 slope rounding scales as ulp(active) / spacing (~1e-13 for 512
 # experts); 1e-9 experts/token absorbs JSON float formatting slack.

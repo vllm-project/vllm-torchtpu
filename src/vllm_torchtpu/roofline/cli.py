@@ -25,7 +25,15 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from .chips import CHIPS, JAX_VERSION, ChipSpec, chip_catalog
+from .chips import (
+    CHIPS,
+    JAX_VERSION,
+    ChipSpec,
+    SliceTopology,
+    chip_catalog,
+    load_chip_spec,
+    topologies_for_chip,
+)
 from .constants import (
     BF16_BYTES,
     BITS_PER_BYTE,
@@ -259,6 +267,15 @@ def _add_shared_chip_flags(
         default="tpu7x" if is_root else sup,
         choices=sorted(CHIPS),
         help="Target TPU chip specification key (unit: enum, scope: chip).",
+    )
+    p.add_argument(
+        "--chip-spec",
+        type=Path,
+        default=None if is_root else sup,
+        help=(
+            "Path to a JSON ChipSpec specification overriding --chip "
+            "(unit: path, scope: chip)."
+        ),
     )
     p.add_argument(
         "--ici-bw-gbytes-per-s",
@@ -1212,9 +1229,18 @@ def _render_emit_cmd(
     splan: ServingPlan,
     dt_auto: Dtypes,
     model_arg: str | None,
+    *,
+    chip: ChipSpec | None = None,
+    topologies: Mapping[str, SliceTopology] | None = None,
 ) -> int:
     """Write emitted vLLM serve launch commands for the L1 shortlisted candidate."""
-    emitted = emit_launch_args(splan, dtypes=dt_auto, model=model_arg)
+    emitted = emit_launch_args(
+        splan,
+        dtypes=dt_auto,
+        model=model_arg,
+        chip=chip,
+        topologies=topologies,
+    )
     if not emitted["commands"]:
         _write_warnings(emitted["warnings"])
         if args.json:
@@ -1229,11 +1255,31 @@ def _render_emit_cmd(
     return 0
 
 
+def _format_point_pools_label(
+    pt: ParetoPoint,
+    *,
+    chip: ChipSpec | None = None,
+    topologies: Mapping[str, SliceTopology] | None = None,
+) -> str:
+    """Format prefill/decode pool label pair for one ParetoPoint."""
+    if pt.prefill_pool is not None:
+        prefill_label = pool_label(
+            asdict(pt.prefill_pool), chip=chip, topologies=topologies
+        )
+        decode_label = pool_label(
+            asdict(pt.decode_pool), chip=chip, topologies=topologies
+        )
+        return f"P {prefill_label} + D {decode_label}"
+    return pool_label(asdict(pt.decode_pool), chip=chip, topologies=topologies)
+
+
 def _render_solve_ascii_table(
     splan: ServingPlan,
     top_k: int,
     dt: Dtypes | None = None,
     ref_report: Mapping[str, object] | None = None,
+    chip: ChipSpec | None = None,
+    topologies: Mapping[str, SliceTopology] | None = None,
 ) -> None:
     """Write Top-K diverse Pareto layouts as an aligned terminal table."""
     if dt is not None:
@@ -1246,12 +1292,7 @@ def _render_solve_ascii_table(
     top_pts = top_layouts(splan, k=top_k)
     annotated = top_layout_roles(top_pts, splan.frontier)
     pool_labels = [
-        (
-            f"P {pool_label(asdict(pt.prefill_pool))} + "
-            f"D {pool_label(asdict(pt.decode_pool))}"
-            if pt.prefill_pool is not None
-            else pool_label(asdict(pt.decode_pool))
-        )
+        _format_point_pools_label(pt, chip=chip, topologies=topologies)
         for pt, _, _ in annotated
     ]
 
@@ -1273,11 +1314,8 @@ def _render_solve_ascii_table(
                 None,
             )
             if reference_candidate is not None:
-                reference_pools_label = (
-                    f"P {pool_label(asdict(reference_candidate.prefill_pool))} + "
-                    f"D {pool_label(asdict(reference_candidate.decode_pool))}"
-                    if reference_candidate.prefill_pool is not None
-                    else pool_label(asdict(reference_candidate.decode_pool))
+                reference_pools_label = _format_point_pools_label(
+                    reference_candidate, chip=chip, topologies=topologies
                 )
 
     all_labels = pool_labels + (
@@ -1320,7 +1358,13 @@ def _render_solve_ascii_table(
         )
 
 
-def _render_concurrency_skyline_lines(serving_plan: ServingPlan, top_k: int) -> None:
+def _render_concurrency_skyline_lines(
+    serving_plan: ServingPlan,
+    top_k: int,
+    *,
+    chip: ChipSpec | None = None,
+    topologies: Mapping[str, SliceTopology] | None = None,
+) -> None:
     """Write one-rank-per-line Top-K Pareto skyline lines per concurrency."""
     skyline = pareto_skyline_by_concurrency(serving_plan, k=top_k)
     if not skyline:
@@ -1329,12 +1373,7 @@ def _render_concurrency_skyline_lines(serving_plan: ServingPlan, top_k: int) -> 
     for concurrency, points in skyline.items():
         sys.stdout.write(f"# c={concurrency}:\n")
         for rank, point in enumerate(points, 1):
-            label = (
-                f"P {pool_label(asdict(point.prefill_pool))} + "
-                f"D {pool_label(asdict(point.decode_pool))}"
-                if point.prefill_pool is not None
-                else pool_label(asdict(point.decode_pool))
-            )
+            label = _format_point_pools_label(point, chip=chip, topologies=topologies)
             sys.stdout.write(
                 f"#   #{rank} {label} | bound_tpot_ms={point.bound_tpot_ms:.2f} "
                 f"| interactivity={point.est_interactivity_tok_s:.1f} tok/s "
@@ -1348,6 +1387,7 @@ def _render_solve_output(
     splan: ServingPlan,
     meta: tuple[ChipSpec, Dtypes, str],
     ref_report: Mapping[str, object] | None = None,
+    topologies: Mapping[str, SliceTopology] | None = None,
 ) -> int:
     """Render solve subcommand HTML, JSON, or text table and return exit code."""
     chip, dt_auto, src = meta
@@ -1359,10 +1399,17 @@ def _render_solve_output(
             dtypes=dt_auto,
             model=src,
             top_k=args.top_k,
+            topologies=topologies,
         )
         if ref_report is not None:
             payload = attach_reference_report(
-                payload, splan, ref_report, dtypes=dt_auto, model=src
+                payload,
+                splan,
+                ref_report,
+                dtypes=dt_auto,
+                model=src,
+                chip=chip,
+                topologies=topologies,
             )
     if args.html is not None and payload is not None:
         write_html(payload, args.html)
@@ -1374,8 +1421,20 @@ def _render_solve_output(
     if args.json and payload is not None:
         sys.stdout.write(json.dumps(payload) + "\n")
         return 0
-    _render_solve_ascii_table(splan, args.top_k, dt_auto, ref_report=ref_report)
-    _render_concurrency_skyline_lines(splan, args.top_k)
+    _render_solve_ascii_table(
+        splan,
+        args.top_k,
+        dt_auto,
+        ref_report=ref_report,
+        chip=chip,
+        topologies=topologies,
+    )
+    _render_concurrency_skyline_lines(
+        splan,
+        args.top_k,
+        chip=chip,
+        topologies=topologies,
+    )
     sys.stdout.write(
         "# Note: bound_* columns are hard physical lower bounds; "
         "est_* columns are model estimates.\n",
@@ -1485,6 +1544,8 @@ def _build_cli_reference_report(
     parsed_ref: dict[str, dict[str, int]] | None,
     args: argparse.Namespace,
     solve_opts: SolveOptions,
+    *,
+    chip: ChipSpec | None = None,
 ) -> dict[str, object] | None:
     """Build reference layout comparison report when requested."""
     if parsed_ref is None or args.reference_layout is None:
@@ -1494,7 +1555,8 @@ def _build_cli_reference_report(
         if solve_opts.max_chips is None
         else solve_opts
     )
-    solve_topologies = _resolve_solve_topologies(effective_solve_opts)
+    eff_chip = chip if chip is not None else CHIPS.get(splan.chip)
+    solve_topologies = _resolve_solve_topologies(effective_solve_opts, chip=eff_chip)
     is_found = any(
         _candidate_matches_layout(candidate, parsed_ref)
         for candidate in splan.candidates
@@ -1533,7 +1595,13 @@ def _parse_cli_activation_model(
 def _dispatch_solve_family(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
-    model_ctx: tuple[str, dict[str, object], ModelGeometry, ChipSpec],
+    model_ctx: tuple[
+        str,
+        dict[str, object],
+        ModelGeometry,
+        ChipSpec,
+        dict[str, SliceTopology] | None,
+    ],
     parsed: tuple[dict[str, object], dict[str, object]],
 ) -> int:
     """Execute solve, emit, or ceiling subcommands."""
@@ -1544,7 +1612,7 @@ def _dispatch_solve_family(
             f"--max-instances must be >= {MIN_INSTANCES}, got {args.max_instances}"
         )
     parsed_ref = _parse_cli_reference_layout(args.reference_layout, parser)
-    src, cfg, geom, chip = model_ctx
+    src, cfg, geom, chip, topo_map = model_ctx
     serve_parsed, _ = parsed
     scen, eff_gmu, cmd_max_model_len = _build_cli_scenario(args, parser, parsed)
     pd_ratio = _parse_pd_ratio(args.pd, parser) if args.pd else None
@@ -1583,6 +1651,7 @@ def _dispatch_solve_family(
         max_instances=args.max_instances,
         gpu_memory_utilization=eff_gmu,
         collective_latency_s=(args.collective_latency_us or 0.0) * UNIT_MICRO,
+        topologies=tuple(topo_map.values()) if topo_map is not None else None,
         hbm_reserve_gb=args.hbm_reserve_gb,
         prefill_topology=args.prefill_topology,
         decode_topology=args.decode_topology,
@@ -1602,7 +1671,9 @@ def _dispatch_solve_family(
         sys.stderr.write(f"error: {exc}\n")
         return _EXIT_ERROR
     splan = _apply_cmd_postprocess(splan, scen, serve_parsed, cmd_max_model_len)
-    ref_report = _build_cli_reference_report(splan, geom, parsed_ref, args, solve_opts)
+    ref_report = _build_cli_reference_report(
+        splan, geom, parsed_ref, args, solve_opts, chip=chip
+    )
     if args.cmd == "ceiling":
         return _render_ceiling_cmd(args, splan)
     if args.cmd == "emit":
@@ -1616,9 +1687,20 @@ def _dispatch_solve_family(
                 else (src if serve_parsed else None)
             )
         )
-        return _render_emit_cmd(args, splan, dt_auto, model_arg)
+        return _render_emit_cmd(
+            args,
+            splan,
+            dt_auto,
+            model_arg,
+            chip=chip,
+            topologies=topo_map,
+        )
     return _render_solve_output(
-        args, splan, (chip, dt_auto, src), ref_report=ref_report
+        args,
+        splan,
+        (chip, dt_auto, src),
+        ref_report=ref_report,
+        topologies=topo_map,
     )
 
 
@@ -1637,16 +1719,33 @@ def _build_plan_par_dtypes(
         ar_algo=args.ar_algo,
     )
     base_dt = dtypes_from_hf_config(cfg) if cfg is not None else Dtypes()
-    dt = Dtypes(
+    dt = replace(
+        base_dt,
         w_dense=(
             WEIGHT_DTYPE_BYTES[args.weight_dtype]
             if args.weight_dtype is not None
             else base_dt.w_dense
         ),
+        w_dense_dtype=(
+            args.weight_dtype
+            if args.weight_dtype is not None
+            else base_dt.w_dense_dtype
+        ),
+        w_dense_source=(
+            "flag" if args.weight_dtype is not None else base_dt.w_dense_source
+        ),
         w_expert=(
             EXPERT_DTYPE_BYTES[args.expert_weight_dtype]
             if args.expert_weight_dtype is not None
             else base_dt.w_expert
+        ),
+        w_expert_dtype=(
+            args.expert_weight_dtype
+            if args.expert_weight_dtype is not None
+            else base_dt.w_expert_dtype
+        ),
+        w_expert_source=(
+            "flag" if args.expert_weight_dtype is not None else base_dt.w_expert_source
         ),
         w_aux=(
             WEIGHT_DTYPE_BYTES[args.aux_dtype]
@@ -1654,6 +1753,8 @@ def _build_plan_par_dtypes(
             else base_dt.w_aux
         ),
         kv=(KV_DTYPE_BYTES[args.kv_dtype] if args.kv_dtype is not None else base_dt.kv),
+        kv_dtype=args.kv_dtype if args.kv_dtype is not None else base_dt.kv_dtype,
+        kv_source="flag" if args.kv_dtype is not None else base_dt.kv_source,
         state=(
             STATE_DTYPE_BYTES[args.state_dtype]
             if args.state_dtype is not None
@@ -1670,7 +1771,9 @@ def _dispatch_plan_cmd(
     parser: argparse.ArgumentParser,
     geom: ModelGeometry,
     chip: ChipSpec,
+    *,
     cfg: dict[str, object] | None = None,
+    topologies: Mapping[str, SliceTopology] | None = None,
 ) -> int:
     """Execute plan for hard L1 floors and uncalibrated serial decode estimates."""
     if args.spec_window > 0 and args.accept_len is None:
@@ -1689,6 +1792,7 @@ def _dispatch_plan_cmd(
             acceptance_length=args.accept_len,
             collective_latency_us=args.collective_latency_us,
         ),
+        topologies=topologies,
     )
     if args.json:
         sys.stdout.write(json.dumps([asdict(r) for r in rows]) + "\n")
@@ -1754,13 +1858,17 @@ def _dispatch_explain_cmd(
         return 0
     sys.stdout.write(
         f"{'module':<10}  {'hbm_mb':>10}  {'fp8_gflops':>10}  "
-        f"{'bf16_gflops':>11}  {'collectives':>11}  {'wire_kb':>10}  {'hops':>6}\n"
+        f"{'bf16_gflops':>11}  {'int8_gflops':>11}  {'fp4_gflops':>10}  "
+        f"{'int4_gflops':>11}  {'vector_gflops':>13}  {'collectives':>11}  "
+        f"{'wire_kb':>10}  {'hops':>6}\n"
     )
     for m in sf.modules:
         wire_kb = sum(c.wire_bytes for c in m.collectives) / UNIT_KILO
         sys.stdout.write(
             f"{m.name:<10}  {m.hbm_bytes / UNIT_MEGA:>10.2f}  "
             f"{m.fp8_flops / UNIT_GIGA:>10.2f}  {m.bf16_flops / UNIT_GIGA:>11.2f}  "
+            f"{m.int8_flops / UNIT_GIGA:>11.2f}  {m.fp4_flops / UNIT_GIGA:>10.2f}  "
+            f"{m.int4_flops / UNIT_GIGA:>11.2f}  {m.vector_flops / UNIT_GIGA:>13.2f}  "
             f"{m.n_collectives:>11}  {wire_kb:>10.2f}  {m.chain_hops:>6}\n"
         )
     return 0
@@ -1797,12 +1905,32 @@ def _load_cli_geometry(
     return (cfg, from_hf_config(cfg))
 
 
+def _resolve_cli_chip(
+    args: argparse.Namespace,
+) -> tuple[ChipSpec, dict[str, SliceTopology]] | None:
+    """Load --chip-spec or catalog chip and apply command-line overrides."""
+    chip_spec_path = args.chip_spec
+    if chip_spec_path is not None:
+        try:
+            chip, topo_map = load_chip_spec(chip_spec_path)
+        except (OSError, ValueError, TypeError) as exc:
+            sys.stderr.write(f"error: failed to load --chip-spec: {exc}\n")
+            return None
+    else:
+        chip = CHIPS[args.chip]
+        topo_map = topologies_for_chip(chip)
+    return _apply_chip_overrides(chip, args), topo_map
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the roofline CLI subcommand."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(raw_argv)
-    chip = _apply_chip_overrides(CHIPS[args.chip], args)
+    resolved_chip = _resolve_cli_chip(args)
+    if resolved_chip is None:
+        return _EXIT_ERROR
+    chip, chip_topologies = resolved_chip
     if args.assumptions:
         return _render_assumptions_view(chip, as_json=args.json)
     if not args.cmd:
@@ -1834,10 +1962,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _EXIT_ERROR
     if is_solve_cmd:
         return _dispatch_solve_family(
-            args, parser, (src, cfg, geom, chip), (serve_parsed, bench_parsed)
+            args,
+            parser,
+            (src, cfg, geom, chip, chip_topologies),
+            (serve_parsed, bench_parsed),
         )
     if args.cmd == "plan":
-        return _dispatch_plan_cmd(args, parser, geom, chip, cfg=cfg)
+        return _dispatch_plan_cmd(
+            args, parser, geom, chip, cfg=cfg, topologies=chip_topologies
+        )
     return _dispatch_explain_cmd(args, geom, chip, cfg=cfg)
 
 

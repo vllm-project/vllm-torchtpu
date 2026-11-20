@@ -84,6 +84,11 @@ def test_chip_table_matches_jax_tpu_info() -> None:
     assert chip.smem_page_table_bytes == (
         info.smem_capacity_bytes // rf_constants.SMEM_PAGE_TABLE_DIVISOR
     )
+    assert chip.int8_flops == info.int8_ops_per_second
+    assert chip.int4_flops == info.int4_ops_per_second
+    assert chip.has_sparse_core is (info.sparse_core is not None)
+    if info.sparse_core is not None:
+        assert chip.dma_granule_bytes == info.sparse_core.dma_granule_size_bytes
     assert (
         chip.ici_link_bw,
         chip.ici_bw,
@@ -226,6 +231,23 @@ def test_from_jax_hydrates_live_tpu6e_capabilities() -> None:
     assert v6e.ici_bw == pytest.approx(
         float(TPU7X_ICI_LINKS_PER_CHIP) * DEFAULT_ICI_LINK_BW
     )
+    assert info.sparse_core is not None
+    assert v6e.dma_granule_bytes == int(info.sparse_core.dma_granule_size_bytes)
+    assert v6e.has_sparse_core is True
+    assert v6e.int8_flops == info.int8_ops_per_second
+    assert v6e.int4_flops == info.int4_ops_per_second
+
+
+def test_from_jax_hydrates_tpu5e_without_sparse_core() -> None:
+    """Verify from_jax sets has_sparse_core=False and dma_granule_bytes=0 on TPU_V5E."""
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_V5E, 1)
+    assert info.sparse_core is None
+    v5e = chips.from_jax("tpu5e", pltpu.ChipVersion.TPU_V5E, ChipOverrides())
+    assert v5e.has_sparse_core is False
+    assert v5e.dma_granule_bytes == 0
+    assert v5e.fp8_flops == 0.0
+    assert v5e.int8_flops == info.int8_ops_per_second
+    assert v5e.int4_flops == info.int4_ops_per_second
 
 
 def test_supports_validator_fails_closed_on_unknown_arch() -> None:

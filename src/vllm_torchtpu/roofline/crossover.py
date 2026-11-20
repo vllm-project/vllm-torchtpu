@@ -16,14 +16,16 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Final, TypedDict, Unpack
 
-from .chips import TOPOLOGIES, ChipSpec, SliceTopology
+from .chips import ChipSpec, SliceTopology, topologies_for_chip
 from .constants import (
     CAUSAL_MIDPOINT_HALF,
+    DEFAULT_CORES_PER_CHIP,
     EP_PAIR_RANKS,
     UNIT_GIGA,
     UNIT_MILLIS_PER_SECOND,
@@ -45,7 +47,7 @@ from .step import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable
 
     from .geometry import ModelGeometry
     from .solver import ParetoPoint, PoolMeshPlan, ServingPlan, TrafficScenario
@@ -115,9 +117,15 @@ def scale_ep_moe_floor(
             m,
             fp8_flops=m.fp8_flops * ratio,
             bf16_flops=m.bf16_flops * ratio,
+            fp4_flops=m.fp4_flops * ratio,
+            int8_flops=m.int8_flops * ratio,
+            int4_flops=m.int4_flops * ratio,
             vector_flops=m.vector_flops * ratio,
             fp8_flops_min=m.strict_fp8_flops,
             bf16_flops_min=m.strict_bf16_flops,
+            fp4_flops_min=m.strict_fp4_flops,
+            int8_flops_min=m.strict_int8_flops,
+            int4_flops_min=m.strict_int4_flops,
         )
         if m.name in ("moe", "draft_moe")
         else m
@@ -184,6 +192,9 @@ def scale_pp_stage_floor(
                 hbm_bytes=m.hbm_bytes * ratio,
                 fp8_flops=m.fp8_flops * ratio,
                 bf16_flops=m.bf16_flops * ratio,
+                fp4_flops=m.fp4_flops * ratio,
+                int8_flops=m.int8_flops * ratio,
+                int4_flops=m.int4_flops * ratio,
                 vector_flops=m.vector_flops * ratio,
                 strict_vector_flops=m.strict_vector_flops * ratio,
                 hbm_bytes_min=(
@@ -194,6 +205,15 @@ def scale_pp_stage_floor(
                 ),
                 bf16_flops_min=(
                     None if m.bf16_flops_min is None else m.bf16_flops_min * ratio
+                ),
+                fp4_flops_min=(
+                    None if m.fp4_flops_min is None else m.fp4_flops_min * ratio
+                ),
+                int8_flops_min=(
+                    None if m.int8_flops_min is None else m.int8_flops_min * ratio
+                ),
+                int4_flops_min=(
+                    None if m.int4_flops_min is None else m.int4_flops_min * ratio
                 ),
                 hbm_bytes_envelope=(
                     None
@@ -209,6 +229,21 @@ def scale_pp_stage_floor(
                     None
                     if m.bf16_flops_envelope is None
                     else m.bf16_flops_envelope * ratio
+                ),
+                fp4_flops_envelope=(
+                    None
+                    if m.fp4_flops_envelope is None
+                    else m.fp4_flops_envelope * ratio
+                ),
+                int8_flops_envelope=(
+                    None
+                    if m.int8_flops_envelope is None
+                    else m.int8_flops_envelope * ratio
+                ),
+                int4_flops_envelope=(
+                    None
+                    if m.int4_flops_envelope is None
+                    else m.int4_flops_envelope * ratio
                 ),
                 collectives=tuple(colls),
                 unique_collectives=None,
@@ -308,9 +343,26 @@ def _pool_sig(pool: PoolMeshPlan) -> tuple[object, ...]:
     )
 
 
-def _pool_parallel(pool: PoolMeshPlan, topo: SliceTopology | None) -> Parallel:
+def _resolve_topo_map(
+    chip: ChipSpec,
+    topologies: Mapping[str, SliceTopology] | Sequence[SliceTopology] | None = None,
+) -> dict[str, SliceTopology]:
+    """Resolve slice topology lookup map, preferring explicit topologies."""
+    if topologies is None:
+        return topologies_for_chip(chip)
+    if isinstance(topologies, Mapping):
+        return dict(topologies)
+    return {topo.name: topo for topo in topologies}
+
+
+def _pool_parallel(
+    pool: PoolMeshPlan,
+    topo: SliceTopology | None,
+    *,
+    default_ranks: int = DEFAULT_CORES_PER_CHIP,
+) -> Parallel:
     """Reconstruct Parallel configuration from pool plan."""
-    ranks = topo.cores_per_chip if topo is not None else 2
+    ranks = topo.cores_per_chip if topo is not None else default_ranks
     return Parallel(
         tp=pool.tp,
         dp=pool.dp,
@@ -535,11 +587,17 @@ def prune_sweep_candidates(
         val = kv_b_cache.get(k)
         if val is None:
             par_k = Parallel(
-                tp=pool.tp, pp=pool.pp, pcp=pool.pcp, kv_split=pool.kv_split
+                tp=pool.tp,
+                pp=pool.pp,
+                pcp=pool.pcp,
+                kv_split=pool.kv_split,
+                ranks_per_chip=chip.cores_per_chip,
             )
             val = hbm_footprint_per_core_bytes(
-                geom, dtypes, par_k, SeqKvLayout(1, 1)
-            ) - hbm_footprint_per_core_bytes(geom, dtypes, par_k, SeqKvLayout(1, 0))
+                geom, dtypes, par_k, SeqKvLayout(1, 1), chip=chip
+            ) - hbm_footprint_per_core_bytes(
+                geom, dtypes, par_k, SeqKvLayout(1, 0), chip=chip
+            )
             kv_b_cache[k] = val
         return val
 
@@ -888,6 +946,7 @@ class _CrossoverOpts(TypedDict, total=False):
 
     activation_model: ExpertActivationModel | None
     collective_latency_s: float
+    topologies: Mapping[str, SliceTopology] | Sequence[SliceTopology] | None
 
 
 class _MixStepOpts(TypedDict, total=False):
@@ -895,6 +954,13 @@ class _MixStepOpts(TypedDict, total=False):
 
     prefill_tokens: int
     prefix_hit_rate: float
+
+
+class _SweepKwargs(TypedDict, total=False):
+    """Optional keyword arguments for prefix-hit crossover sweep."""
+
+    hit_rates: tuple[float, ...]
+    topologies: Mapping[str, SliceTopology] | Sequence[SliceTopology] | None
 
 
 class _CrossoverPlanner:
@@ -915,6 +981,7 @@ class _CrossoverPlanner:
         self.scen = scen
         self.activation_model = opts.get("activation_model") or ExpertActivationModel()
         self.collective_latency_s = float(opts.get("collective_latency_s", 0.0))
+        self.topo_map = _resolve_topo_map(chip, opts.get("topologies"))
         self.ctx_mid: int = scen.isl + scen.osl // 2
         self.eff_al = max(1.0, scen.accept_len)
         self.spec_k = (
@@ -953,18 +1020,20 @@ class _CrossoverPlanner:
             self.wire_kv_at_sw = 0.0
             self.wire_kv_post_sw = 0.0
             return
-        par_w = Parallel(tp=1, pp=1)
+        par_w = Parallel(tp=1, pp=1, ranks_per_chip=self.chip.cores_per_chip)
         bd_w0 = hbm_breakdown_per_core_bytes(
             geom,
             self.dtypes,
             par_w,
             SeqKvLayout(1, 0, physical_kv_layout=False),
+            chip=self.chip,
         )
         bd_w1 = hbm_breakdown_per_core_bytes(
             geom,
             self.dtypes,
             par_w,
             SeqKvLayout(1, 1, physical_kv_layout=False),
+            chip=self.chip,
         )
         self.wire_state_b, self.wire_kv_step1 = bd_w0.state, bd_w1.kv
         if self.sw_w > 0:
@@ -973,12 +1042,14 @@ class _CrossoverPlanner:
                 self.dtypes,
                 par_w,
                 SeqKvLayout(1, self.sw_w, physical_kv_layout=False),
+                chip=self.chip,
             )
             bd_w_sw1 = hbm_breakdown_per_core_bytes(
                 geom,
                 self.dtypes,
                 par_w,
                 SeqKvLayout(1, self.sw_w + 1, physical_kv_layout=False),
+                chip=self.chip,
             )
             self.wire_kv_at_sw = bd_w_sw.kv
             self.wire_kv_post_sw = bd_w_sw1.kv - bd_w_sw.kv
@@ -1000,12 +1071,16 @@ class _CrossoverPlanner:
         val = self.kv_b_cache.get(k)
         if val is None:
             par_k = Parallel(
-                tp=pool.tp, pp=pool.pp, pcp=pool.pcp, kv_split=pool.kv_split
+                tp=pool.tp,
+                pp=pool.pp,
+                pcp=pool.pcp,
+                kv_split=pool.kv_split,
+                ranks_per_chip=self.chip.cores_per_chip,
             )
             val = hbm_footprint_per_core_bytes(
-                self.geom, self.dtypes, par_k, SeqKvLayout(1, 1)
+                self.geom, self.dtypes, par_k, SeqKvLayout(1, 1), chip=self.chip
             ) - hbm_footprint_per_core_bytes(
-                self.geom, self.dtypes, par_k, SeqKvLayout(1, 0)
+                self.geom, self.dtypes, par_k, SeqKvLayout(1, 0), chip=self.chip
             )
             self.kv_b_cache[k] = val
         return val
@@ -1021,8 +1096,10 @@ class _CrossoverPlanner:
         if pid is None:
             pid = len(self.pool_plans)
             self.pool_ids[pk] = pid
-            topo = TOPOLOGIES.get(pool.topology)
-            parallel = _pool_parallel(pool, topo)
+            topo = self.topo_map.get(pool.topology)
+            parallel = _pool_parallel(
+                pool, topo, default_ranks=self.chip.cores_per_chip
+            )
             max_p = max(1, math.ceil(self.geom.num_layers / max(1, pool.pp)))
             even_pp = (
                 pool.pp <= 1
@@ -1343,7 +1420,7 @@ def setup_crossover_sweep(
     cands: Sequence[ParetoPoint],
     **opts: Unpack[_CrossoverOpts],
 ) -> tuple[CrossoverPools, _GridEvalContext]:
-    """Precompute candidate pool metadata and heuristic serial_estimate_s caches."""
+    """Precompute candidate pool metadata and heuristic step floor caches."""
     planner = _CrossoverPlanner(geom, dtypes, chip, scen, **opts)
     mix_meta: list[MixedCandidateMeta] = []
     dis_ttft_groups: dict[
@@ -1403,8 +1480,7 @@ def sweep_prefix_hit_crossovers(
     dtypes: Dtypes,
     chip: ChipSpec,
     plan: ServingPlan,
-    *,
-    hit_rates: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 0.9, 0.95),
+    **opts: Unpack[_SweepKwargs],
 ) -> tuple[tuple[float, float] | None, float | None]:
     """Run a heuristic serial_estimate_s sensitivity sweep across prefix hit rates."""
     if plan.recommended is None:
@@ -1422,6 +1498,7 @@ def sweep_prefix_hit_crossovers(
         if plan.sweep_candidates
         else prune_sweep_candidates(geom, dtypes, chip, scen, raw_cands)
     )
+    hit_rates = opts.get("hit_rates", (0.0, 0.25, 0.5, 0.75, 0.9, 0.95))
     grid = tuple(
         sorted(
             {
@@ -1438,6 +1515,7 @@ def sweep_prefix_hit_crossovers(
         cands,
         activation_model=plan.activation_model,
         collective_latency_s=plan.collective_latency_s,
+        topologies=opts.get("topologies"),
     )
     winners = [
         entry

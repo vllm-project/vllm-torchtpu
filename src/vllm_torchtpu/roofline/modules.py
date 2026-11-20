@@ -16,10 +16,10 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
+from dataclasses import dataclass, field, replace
+from typing import Literal, TypedDict, Unpack
 
-from .chips import CHIPS
+from .chips import CHIPS, ChipSpec
 from .collectives import Algo, Collective, CollectiveConfig, Kind, make, padded_rows
 from .constants import (
     ACTIVATION_BYTES_BF16,
@@ -36,7 +36,7 @@ from .constants import (
     VECTOR_MAX_ELEMENTS_PER_WORD,
     VECTOR_SUB_BYTE_ELEMENTS_PER_WORD,
 )
-from .geometry import LayerCounts, count_layer_types, layer_ffn_kinds
+from .geometry import LayerCounts, ModelGeometry, count_layer_types, layer_ffn_kinds
 from .occupancy import (
     ExpertActivationModel,
     ExpertDispatch,
@@ -44,10 +44,6 @@ from .occupancy import (
     bernoulli_expected_experts,
     min_experts_per_ep_shard,
 )
-
-if TYPE_CHECKING:
-    from .geometry import ModelGeometry
-
 
 _TWO_DIRECTIONS = 2
 _GQA_SCORE_WIDTH_MULT = 4
@@ -85,7 +81,7 @@ class Parallel:
     moe_dispatch: Literal["allreduce", "a2a_push", "ag_ep", "fused_rs"] = "allreduce"
     residual: Literal["replicated", "sp"] = "replicated"
     ar_algo: Algo = "one_shot"
-    ranks_per_chip: int = DEFAULT_CORES_PER_CHIP
+    ranks_per_chip: int | None = None
     dp: int = 1
     ep: int = 1
     pp: int = 1
@@ -132,6 +128,15 @@ class ModuleCost:
     hbm_bytes_envelope: float | None = None
     fp8_flops_envelope: float | None = None
     bf16_flops_envelope: float | None = None
+    fp4_flops: float = 0.0
+    int8_flops: float = 0.0
+    int4_flops: float = 0.0
+    fp4_flops_min: float | None = None
+    int8_flops_min: float | None = None
+    int4_flops_min: float | None = None
+    fp4_flops_envelope: float | None = None
+    int8_flops_envelope: float | None = None
+    int4_flops_envelope: float | None = None
 
     @property
     def ici_bytes(self) -> float:
@@ -169,6 +174,21 @@ class ModuleCost:
         return self.bf16_flops if self.bf16_flops_min is None else self.bf16_flops_min
 
     @property
+    def strict_fp4_flops(self) -> float:
+        """Unpadded lower-bound FP4 FLOPs when available, else nominal FP4 FLOPs."""
+        return self.fp4_flops if self.fp4_flops_min is None else self.fp4_flops_min
+
+    @property
+    def strict_int8_flops(self) -> float:
+        """Unpadded lower-bound INT8 FLOPs when available, else nominal INT8 FLOPs."""
+        return self.int8_flops if self.int8_flops_min is None else self.int8_flops_min
+
+    @property
+    def strict_int4_flops(self) -> float:
+        """Unpadded lower-bound INT4 FLOPs when available, else nominal INT4 FLOPs."""
+        return self.int4_flops if self.int4_flops_min is None else self.int4_flops_min
+
+    @property
     def envelope_hbm_bytes(self) -> float:
         """Activation-envelope byte count when available, else strict bytes."""
         return (
@@ -193,6 +213,33 @@ class ModuleCost:
             self.strict_bf16_flops
             if self.bf16_flops_envelope is None
             else self.bf16_flops_envelope
+        )
+
+    @property
+    def envelope_fp4_flops(self) -> float:
+        """Activation-envelope FP4 FLOPs when available, else strict FP4 FLOPs."""
+        return (
+            self.strict_fp4_flops
+            if self.fp4_flops_envelope is None
+            else self.fp4_flops_envelope
+        )
+
+    @property
+    def envelope_int8_flops(self) -> float:
+        """Activation-envelope INT8 FLOPs when available, else strict INT8 FLOPs."""
+        return (
+            self.strict_int8_flops
+            if self.int8_flops_envelope is None
+            else self.int8_flops_envelope
+        )
+
+    @property
+    def envelope_int4_flops(self) -> float:
+        """Activation-envelope INT4 FLOPs when available, else strict INT4 FLOPs."""
+        return (
+            self.strict_int4_flops
+            if self.int4_flops_envelope is None
+            else self.int4_flops_envelope
         )
 
 
@@ -233,21 +280,73 @@ def ep_busiest_experts(num_experts: int, top_k: int, rows: int, ranks: int) -> f
     return min(upper, max(acc, pigeonhole_min))
 
 
-def _split_matmul_flops(
+@dataclass(frozen=True, slots=True)
+class _MatmulBuckets:
+    """Per-precision MXU FLOP totals across all supported hardware buckets."""
+
+    fp8: float = 0.0
+    bf16: float = 0.0
+    int8: float = 0.0
+    fp4: float = 0.0
+    int4: float = 0.0
+
+    def __add__(self, other: _MatmulBuckets) -> _MatmulBuckets:
+        """Sum matching precision buckets elementwise."""
+        return _MatmulBuckets(
+            fp8=self.fp8 + other.fp8,
+            bf16=self.bf16 + other.bf16,
+            int8=self.int8 + other.int8,
+            fp4=self.fp4 + other.fp4,
+            int4=self.int4 + other.int4,
+        )
+
+    def scale(self, factor: float) -> _MatmulBuckets:
+        """Multiply every precision bucket by a scalar padding factor."""
+        return _MatmulBuckets(
+            fp8=self.fp8 * factor,
+            bf16=self.bf16 * factor,
+            int8=self.int8 * factor,
+            fp4=self.fp4 * factor,
+            int4=self.int4 * factor,
+        )
+
+
+def _bucket_from_name(bucket: str, flops: float) -> _MatmulBuckets:
+    """Construct a _MatmulBuckets placing ``flops`` in ``bucket``."""
+    if bucket == "fp8":
+        return _MatmulBuckets(fp8=flops)
+    if bucket == "int8":
+        return _MatmulBuckets(int8=flops)
+    if bucket == "fp4":
+        return _MatmulBuckets(fp4=flops)
+    if bucket == "int4":
+        return _MatmulBuckets(int4=flops)
+    return _MatmulBuckets(bf16=flops)
+
+
+class _RouteMatmulOpts(TypedDict, total=False):
+    """Optional chip capability spec and weight dtype for matmul FLOP routing."""
+
+    chip: ChipSpec | None
+    weight_dtype: str
+
+
+def _route_matmul_flops(
     rows: float,
     weight_elems: float,
     weight_bytes: float,
     act: str = "a8",
-) -> tuple[float, float]:
-    """Route quantized (<2 B) matmuls with a8 activations to FP8 peak, else bf16.
-
-    On TPU v7x, symmetric MXU rate requires both inputs in fp8 (W8A8);
-    mixed W8A16 (bf16 activations x fp8 weights) executes at the bf16 MXU rate.
-    """
+    **opts: Unpack[_RouteMatmulOpts],
+) -> _MatmulBuckets:
+    """Route a matmul to its capability-selected MXU precision bucket."""
+    chip = opts.get("chip")
+    weight_dtype = opts.get("weight_dtype", "")
+    eff_chip = chip if chip is not None else CHIPS["tpu7x"]
+    bucket, _peak, _needs_unpack = eff_chip.matmul_peak_kind(
+        weight_bytes, act, weight_dtype=weight_dtype
+    )
     flops = MATMUL_FLOP_PER_MAC * rows * weight_elems
-    if weight_bytes < BF16_BYTES and act == "a8":
-        return (flops, 0.0)
-    return (0.0, flops)
+    return _bucket_from_name(bucket, flops)
 
 
 def _subchannel_scale_vector_flops(
@@ -255,8 +354,10 @@ def _subchannel_scale_vector_flops(
     weight_elems: float,
     weight_bytes: float,
     weight_block_size: tuple[int, int] = (1, 1),
+    *,
+    block_k_floor: int = SUBCHANNEL_BLOCK_K_FLOOR,
 ) -> float:
-    """Return vector partial-sum rescale FLOPs when reduction block < 512."""
+    """Return vector partial-sum scale multiplication FLOPs below block_k_floor."""
     if weight_bytes >= BF16_BYTES or rows <= 0 or weight_elems <= 0.0:
         return 0.0
     block_k = (
@@ -264,14 +365,25 @@ def _subchannel_scale_vector_flops(
         if len(weight_block_size) > 1 and weight_block_size[1] > 1
         else (weight_block_size[0] if weight_block_size else 1)
     )
-    if 1 < block_k < SUBCHANNEL_BLOCK_K_FLOOR:
+    if 1 < block_k < block_k_floor:
         return float(MATMUL_FLOP_PER_MAC * rows * weight_elems) / float(block_k)
     return 0.0
 
 
-def _sub_byte_unpack_vector_flops(weight_elems: float, weight_bytes: float) -> float:
-    """Vector ops to unpack weights stored below one byte per element."""
-    return 2.0 * weight_elems if weight_bytes < 1.0 else 0.0
+def _sub_byte_unpack_vector_flops(
+    weight_elems: float,
+    weight_bytes: float,
+    *,
+    chip: ChipSpec | None = None,
+    weight_dtype: str = "",
+    act: str = "a8",
+) -> float:
+    """Return vector unpack FLOPs only when chip capabilities require unpacking."""
+    eff_chip = chip if chip is not None else CHIPS["tpu7x"]
+    _bucket, _peak, needs_unpack = eff_chip.matmul_peak_kind(
+        weight_bytes, act, weight_dtype=weight_dtype
+    )
+    return 2.0 * weight_elems if needs_unpack else 0.0
 
 
 def _strict_sub_byte_unpack_vector_flops(unpack_vector_flops: float) -> float:
@@ -294,14 +406,21 @@ def _make_coll(
     payload: float,
     group: int,
     parallel: Parallel,
+    *,
+    ranks_per_chip: int = DEFAULT_CORES_PER_CHIP,
 ) -> Collective:
     """Create a Collective using parallel config's algorithm and core packing."""
+    eff_ranks = (
+        parallel.ranks_per_chip
+        if parallel.ranks_per_chip is not None
+        else ranks_per_chip
+    )
     return make(
         name,
         kind,
         payload,
         group,
-        CollectiveConfig(algo=parallel.ar_algo, ranks_per_chip=parallel.ranks_per_chip),
+        CollectiveConfig(algo=parallel.ar_algo, ranks_per_chip=eff_ranks),
     )
 
 
@@ -347,6 +466,7 @@ class _StepContext:
         default_factory=ExpertActivationModel
     )
     unpadded_linear: bool = False
+    chip: ChipSpec = field(default_factory=lambda: CHIPS["tpu7x"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -737,22 +857,23 @@ def _gqa_swa_kv_bytes_per_tok(
     head_dim: int,
     *,
     physical: bool,
+    alignment_elems: int | None = None,
 ) -> float:
     """Compute per-token per-layer KV bytes for GQA or SWA head geometry."""
     tp = max(1, parallel.tp)
     kvh = max(1, geom.num_kv_heads // tp) if geom.num_kv_heads > 0 else 0
     if not physical:
         return float(2 * kvh * head_dim) * dt.kv
+    eff_align = (
+        CHIPS["tpu7x"].physical_alignment_elems
+        if alignment_elems is None
+        else alignment_elems
+    )
     kv_packing = max(
         1,
         round(HBM_PACKING_NUMERATOR / max(HBM_MIN_PACKING_DIVISOR, dt.kv)),
     )
-    padded_hd = (
-        math.ceil(head_dim / CHIPS["tpu7x"].physical_alignment_elems)
-        * CHIPS["tpu7x"].physical_alignment_elems
-        if head_dim > 0
-        else 0
-    )
+    padded_hd = math.ceil(head_dim / eff_align) * eff_align if head_dim > 0 else 0
     kx2 = kvh if head_dim == HEAD_DIM_PACKING_THRESHOLD else 2 * kvh
     padded_kx2 = math.ceil(kx2 / kv_packing) * kv_packing if kx2 > 0 else 0
     return float(padded_kx2 * padded_hd) * dt.kv
@@ -765,8 +886,14 @@ def kv_bytes_per_token_per_layer(
     layer_type: str = "gqa",
     *,
     physical: bool = True,
+    chip: ChipSpec | None = None,
 ) -> float:
     """Return KV cache bytes stored per token for one layer of given attention type."""
+    align = (
+        chip.physical_alignment_elems
+        if chip is not None
+        else CHIPS["tpu7x"].physical_alignment_elems
+    )
     resolved = layer_type
     if resolved in ("full_attention", "attention"):
         if geom.kv_lora_rank > 0 and geom.index_topk > 0:
@@ -778,19 +905,16 @@ def kv_bytes_per_token_per_layer(
 
     if resolved == "gqa":
         gqa_hd = geom.global_head_dim if geom.global_head_dim > 0 else geom.head_dim
-        return _gqa_swa_kv_bytes_per_tok(geom, dt, parallel, gqa_hd, physical=physical)
+        return _gqa_swa_kv_bytes_per_tok(
+            geom, dt, parallel, gqa_hd, physical=physical, alignment_elems=align
+        )
     if resolved == "swa":
         return _gqa_swa_kv_bytes_per_tok(
-            geom, dt, parallel, geom.head_dim, physical=physical
+            geom, dt, parallel, geom.head_dim, physical=physical, alignment_elems=align
         )
     if resolved in ("mla", "dsa"):
         raw_latent_w = geom.kv_lora_rank + geom.qk_rope_head_dim
-        latent_w = (
-            math.ceil(raw_latent_w / CHIPS["tpu7x"].physical_alignment_elems)
-            * CHIPS["tpu7x"].physical_alignment_elems
-            if physical
-            else raw_latent_w
-        )
+        latent_w = math.ceil(raw_latent_w / align) * align if physical else raw_latent_w
         mla_latent_b = float(latent_w) * dt.kv
         has_sparse = (
             resolved == "dsa" and geom.index_topk > 0 and geom.index_head_dim > 0
@@ -806,13 +930,11 @@ def kv_bytes_per_token_per_layer(
 
 
 def _align_mxu(dim: int, eval_context: _StepContext) -> int:
-    """Pad systolic column dimension to 128 lanes when MXU tiling is active."""
+    """Pad systolic column dimension to physical alignment when MXU tiling is active."""
     if dim <= 0 or eval_context.mxu_m_tile <= 1:
         return dim
-    return (
-        math.ceil(dim / CHIPS["tpu7x"].physical_alignment_elems)
-        * CHIPS["tpu7x"].physical_alignment_elems
-    )
+    align = eval_context.chip.physical_alignment_elems
+    return math.ceil(dim / align) * align
 
 
 def _compute_gqa_cost(
@@ -858,13 +980,27 @@ def _compute_gqa_cost(
     )
     kv_pre_tokens = float(eval_context.cached_prefix + eval_context.eff_prefill)
     kv_tokens_total = n_eff * (kv_dec_tokens + kv_pre_tokens)
-    b_kv_phys = kv_bytes_per_token_per_layer(geom, dt, parallel, "gqa", physical=True)
-    b_kv_min = kv_bytes_per_token_per_layer(geom, dt, parallel, "gqa", physical=False)
-    att_fp8, att_bf16 = _split_matmul_flops(
-        eval_context.rows, att_mxu_elems, dt.w_dense, dt.act
+    b_kv_phys = kv_bytes_per_token_per_layer(
+        geom, dt, parallel, "gqa", physical=True, chip=eval_context.chip
     )
-    att_fp8_min, att_bf16_min = _split_matmul_flops(
-        eval_context.rows, att_w_elems, dt.w_dense, dt.act
+    b_kv_min = kv_bytes_per_token_per_layer(
+        geom, dt, parallel, "gqa", physical=False, chip=eval_context.chip
+    )
+    att_flops = _route_matmul_flops(
+        eval_context.rows,
+        att_mxu_elems,
+        dt.w_dense,
+        dt.act,
+        chip=eval_context.chip,
+        weight_dtype=dt.w_dense_dtype,
+    )
+    att_min_flops = _route_matmul_flops(
+        eval_context.rows,
+        att_w_elems,
+        dt.w_dense,
+        dt.act,
+        chip=eval_context.chip,
+        weight_dtype=dt.w_dense_dtype,
     )
     dec_scores = float(
         eval_context.decode_rows
@@ -904,7 +1040,13 @@ def _compute_gqa_cost(
         ),
         n_colls_layers,
     )
-    dense_unpack = _sub_byte_unpack_vector_flops(att_w_elems, dt.w_dense)
+    dense_unpack = _sub_byte_unpack_vector_flops(
+        att_w_elems,
+        dt.w_dense,
+        chip=eval_context.chip,
+        weight_dtype=dt.w_dense_dtype,
+        act=dt.act,
+    )
     vector_flops = (
         float(
             n_eff
@@ -915,7 +1057,11 @@ def _compute_gqa_cost(
             )
         )
         + _subchannel_scale_vector_flops(
-            eval_context.rows, att_w_elems, dt.w_dense, geom.weight_block_size
+            eval_context.rows,
+            att_w_elems,
+            dt.w_dense,
+            geom.weight_block_size,
+            block_k_floor=eval_context.chip.subchannel_block_k_floor,
         )
         + dense_unpack
     )
@@ -927,15 +1073,21 @@ def _compute_gqa_cost(
     return ModuleCost(
         name="gqa",
         hbm_bytes=att_w_elems * dt.w_dense + kv_tokens_total * b_kv_phys,
-        fp8_flops=att_fp8,
-        bf16_flops=att_bf16 + score_tot,
+        fp8_flops=att_flops.fp8,
+        bf16_flops=att_flops.bf16 + score_tot,
         collectives=att_colls,
         hbm_bytes_min=att_w_elems * dt.w_dense + kv_tokens_total * b_kv_min,
-        fp8_flops_min=att_fp8_min + (score_tot if strict_attn_fp8 else 0.0),
-        bf16_flops_min=att_bf16_min + (0.0 if strict_attn_fp8 else score_tot),
+        fp8_flops_min=att_min_flops.fp8 + (score_tot if strict_attn_fp8 else 0.0),
+        bf16_flops_min=att_min_flops.bf16 + (0.0 if strict_attn_fp8 else score_tot),
         unique_collectives=att_ucolls,
         vector_flops=vector_flops,
         strict_vector_flops=strict_vector_flops,
+        fp4_flops=att_flops.fp4,
+        int8_flops=att_flops.int8,
+        int4_flops=att_flops.int4,
+        fp4_flops_min=att_min_flops.fp4,
+        int8_flops_min=att_min_flops.int8,
+        int4_flops_min=att_min_flops.int4,
     )
 
 
@@ -996,10 +1148,19 @@ def _compute_swa_cost(
         float(eval_context.batch * eff_ctx) * swa_kv_scale / parallel.kv_split
         + pre_kv_tokens
     )
-    b_kv_phys = kv_bytes_per_token_per_layer(geom, dt, parallel, "swa", physical=True)
-    b_kv_min = kv_bytes_per_token_per_layer(geom, dt, parallel, "swa", physical=False)
-    swa_fp8, swa_bf16 = _split_matmul_flops(
-        eval_context.rows, swa_w_elems, dt.w_dense, dt.act
+    b_kv_phys = kv_bytes_per_token_per_layer(
+        geom, dt, parallel, "swa", physical=True, chip=eval_context.chip
+    )
+    b_kv_min = kv_bytes_per_token_per_layer(
+        geom, dt, parallel, "swa", physical=False, chip=eval_context.chip
+    )
+    swa_flops = _route_matmul_flops(
+        eval_context.rows,
+        swa_w_elems,
+        dt.w_dense,
+        dt.act,
+        chip=eval_context.chip,
+        weight_dtype=dt.w_dense_dtype,
     )
     pre_pairs = _capped_causal_pairs(
         eval_context.cached_prefix,
@@ -1031,7 +1192,13 @@ def _compute_swa_cost(
         ),
         max(1, round(n_eff)),
     )
-    dense_unpack = _sub_byte_unpack_vector_flops(swa_w_elems, dt.w_dense)
+    dense_unpack = _sub_byte_unpack_vector_flops(
+        swa_w_elems,
+        dt.w_dense,
+        chip=eval_context.chip,
+        weight_dtype=dt.w_dense_dtype,
+        act=dt.act,
+    )
     vector_flops = (
         float(
             n_eff
@@ -1042,7 +1209,11 @@ def _compute_swa_cost(
             )
         )
         + _subchannel_scale_vector_flops(
-            eval_context.rows, swa_w_elems, dt.w_dense, geom.weight_block_size
+            eval_context.rows,
+            swa_w_elems,
+            dt.w_dense,
+            geom.weight_block_size,
+            block_k_floor=eval_context.chip.subchannel_block_k_floor,
         )
         + dense_unpack
     )
@@ -1053,15 +1224,21 @@ def _compute_swa_cost(
     return ModuleCost(
         name="swa",
         hbm_bytes=swa_w_elems * dt.w_dense + n_eff * kv_tokens * b_kv_phys,
-        fp8_flops=swa_fp8,
-        bf16_flops=swa_bf16 + swa_scores,
+        fp8_flops=swa_flops.fp8,
+        bf16_flops=swa_flops.bf16 + swa_scores,
         collectives=swa_colls,
         hbm_bytes_min=swa_w_elems * dt.w_dense + n_eff * kv_tokens * b_kv_min,
-        fp8_flops_min=swa_fp8 + (swa_scores if strict_attn_fp8 else 0.0),
-        bf16_flops_min=swa_bf16 + (0.0 if strict_attn_fp8 else swa_scores),
+        fp8_flops_min=swa_flops.fp8 + (swa_scores if strict_attn_fp8 else 0.0),
+        bf16_flops_min=swa_flops.bf16 + (0.0 if strict_attn_fp8 else swa_scores),
         unique_collectives=swa_ucolls,
         vector_flops=vector_flops,
         strict_vector_flops=strict_vector_flops,
+        fp4_flops=swa_flops.fp4,
+        int8_flops=swa_flops.int8,
+        int4_flops=swa_flops.int4,
+        fp4_flops_min=swa_flops.fp4,
+        int8_flops_min=swa_flops.int8,
+        int4_flops_min=swa_flops.int4,
     )
 
 
@@ -1081,10 +1258,17 @@ def _validate_mla_geom(fam_name: str, geom: ModelGeometry) -> None:
 def _mla_unpack_vector_flops(
     base_vector_flops: float,
     mla_w_elems: float,
-    w_dense: float,
+    dt: Dtypes,
+    chip: ChipSpec,
 ) -> tuple[float, float]:
-    """Return nominal and strict vector FLOPs including sub-byte unpack."""
-    dense_unpack = _sub_byte_unpack_vector_flops(mla_w_elems, w_dense)
+    """Return nominal and strict vector FLOPs including capability-gated unpack."""
+    dense_unpack = _sub_byte_unpack_vector_flops(
+        mla_w_elems,
+        dt.w_dense,
+        chip=chip,
+        weight_dtype=dt.w_dense_dtype,
+        act=dt.act,
+    )
     vector_flops = base_vector_flops + dense_unpack
     strict_vector_flops = (
         vector_flops - dense_unpack + _strict_sub_byte_unpack_vector_flops(dense_unpack)
@@ -1103,31 +1287,64 @@ class _MlaStrictInputs:
     pre_mha_scores: float
 
 
+def _relative_bucket_time(
+    buckets: _MatmulBuckets,
+    chip: ChipSpec,
+    fp8_to_bf16_ratio: float,
+) -> float:
+    """Normalize per-precision FLOP buckets to relative BF16 compute time."""
+    bf16_peak = chip.bf16_flops if chip.bf16_flops > 0.0 else 1.0
+    fp8_rate = fp8_to_bf16_ratio if fp8_to_bf16_ratio > 0.0 else 1.0
+    pairs = (
+        (buckets.bf16, 1.0),
+        (buckets.fp8, fp8_rate),
+        (buckets.int8, chip.int8_flops / bf16_peak),
+        (buckets.fp4, chip.fp4_flops / bf16_peak),
+        (buckets.int4, chip.int4_flops / bf16_peak),
+    )
+    return sum(flops / rate for flops, rate in pairs if flops > 0.0 and rate > 0.0)
+
+
 def _mla_strict_flops(
     eval_context: _StepContext,
     parallel: Parallel,
     dt: Dtypes,
     strict_in: _MlaStrictInputs,
-) -> tuple[float, float]:
-    """Compute strict (fp8_flops_min, bf16_flops_min) for MLA or DSA."""
+) -> _MatmulBuckets:
+    """Compute strict per-precision matmul FLOP buckets for MLA or DSA."""
     strict_attn_fp8 = dt.kv <= FP8_BYTES and eval_context.fp8_to_bf16_ratio > 0.0
-    strict_fp8, strict_bf16 = _split_matmul_flops(
-        eval_context.rows, strict_in.base_mla_w_elems, dt.w_dense, dt.act
+    score_bucket = "fp8" if strict_attn_fp8 else "bf16"
+    strict_buckets = (
+        _route_matmul_flops(
+            eval_context.rows,
+            strict_in.base_mla_w_elems,
+            dt.w_dense,
+            dt.act,
+            chip=eval_context.chip,
+            weight_dtype=dt.w_dense_dtype,
+        )
+        + _route_matmul_flops(
+            eval_context.decode_rows,
+            strict_in.ukv_w_elems,
+            dt.w_dense,
+            dt.act,
+            chip=eval_context.chip,
+            weight_dtype=dt.w_dense_dtype,
+        )
+        + _bucket_from_name(score_bucket, strict_in.dec_abs_scores)
     )
-    dec_ukv_fp8, dec_ukv_bf16 = _split_matmul_flops(
-        eval_context.decode_rows, strict_in.ukv_w_elems, dt.w_dense, dt.act
-    )
-    strict_fp8 += dec_ukv_fp8 + (strict_in.dec_abs_scores if strict_attn_fp8 else 0.0)
-    strict_bf16 += dec_ukv_bf16 + (0.0 if strict_attn_fp8 else strict_in.dec_abs_scores)
 
     if eval_context.eff_prefill <= 0:
-        return (strict_fp8, strict_bf16)
+        return strict_buckets
 
-    abs_ukv_fp8, abs_ukv_bf16 = _split_matmul_flops(
-        eval_context.eff_prefill, strict_in.ukv_w_elems, dt.w_dense, dt.act
-    )
-    abs_fp8 = abs_ukv_fp8 + (strict_in.pre_abs_scores if strict_attn_fp8 else 0.0)
-    abs_bf16 = abs_ukv_bf16 + (0.0 if strict_attn_fp8 else strict_in.pre_abs_scores)
+    abs_buckets = _route_matmul_flops(
+        eval_context.eff_prefill,
+        strict_in.ukv_w_elems,
+        dt.w_dense,
+        dt.act,
+        chip=eval_context.chip,
+        weight_dtype=dt.w_dense_dtype,
+    ) + _bucket_from_name(score_bucket, strict_in.pre_abs_scores)
 
     key_tokens_per_rank = float(eval_context.cached_prefix) / float(
         max(1, parallel.pcp)
@@ -1135,22 +1352,22 @@ def _mla_strict_flops(
     ukv_mha_flops = (
         float(MATMUL_FLOP_PER_MAC) * key_tokens_per_rank * strict_in.ukv_w_elems
     )
-    ukv_is_fp8 = dt.w_dense < BF16_BYTES and dt.act == "a8"
-    mha_fp8 = (ukv_mha_flops if ukv_is_fp8 else 0.0) + (
-        strict_in.pre_mha_scores if strict_attn_fp8 else 0.0
+    ukv_bucket, _peak, _unpack = eval_context.chip.matmul_peak_kind(
+        dt.w_dense, dt.act, weight_dtype=dt.w_dense_dtype
     )
-    mha_bf16 = (0.0 if ukv_is_fp8 else ukv_mha_flops) + (
-        0.0 if strict_attn_fp8 else strict_in.pre_mha_scores
+    mha_buckets = _bucket_from_name(ukv_bucket, ukv_mha_flops) + _bucket_from_name(
+        score_bucket, strict_in.pre_mha_scores
     )
 
-    ratio = (
-        eval_context.fp8_to_bf16_ratio if eval_context.fp8_to_bf16_ratio > 0.0 else 1.0
+    abs_time = _relative_bucket_time(
+        abs_buckets, eval_context.chip, eval_context.fp8_to_bf16_ratio
     )
-    abs_time = abs_fp8 / ratio + abs_bf16
-    mha_time = mha_fp8 / ratio + mha_bf16
+    mha_time = _relative_bucket_time(
+        mha_buckets, eval_context.chip, eval_context.fp8_to_bf16_ratio
+    )
     if mha_time < abs_time:
-        return (strict_fp8 + mha_fp8, strict_bf16 + mha_bf16)
-    return (strict_fp8 + abs_fp8, strict_bf16 + abs_bf16)
+        return strict_buckets + mha_buckets
+    return strict_buckets + abs_buckets
 
 
 def _compute_mla_dsa_costs(
@@ -1205,13 +1422,8 @@ def _compute_mla_dsa_costs(
             else eval_context.context
         )
         raw_latent_w = kv_lora + rope_d
-        b_latent_phys = (
-            float(
-                math.ceil(raw_latent_w / CHIPS["tpu7x"].physical_alignment_elems)
-                * CHIPS["tpu7x"].physical_alignment_elems
-            )
-            * dt.kv
-        )
+        align = eval_context.chip.physical_alignment_elems
+        b_latent_phys = float(math.ceil(raw_latent_w / align) * align) * dt.kv
         b_latent_min = float(raw_latent_w) * dt.kv
         has_idx = is_sparse and geom.index_topk > 0 and geom.index_head_dim > 0
         b_idx_phys = (
@@ -1238,8 +1450,13 @@ def _compute_mla_dsa_costs(
             )
             mla_kv_bytes += idx_tokens * b_idx_phys
             mla_kv_bytes_min += idx_tokens * b_idx_min
-        mla_fp8, mla_bf16 = _split_matmul_flops(
-            eval_context.rows, mla_w_elems, dt.w_dense, dt.act
+        mla_flops = _route_matmul_flops(
+            eval_context.rows,
+            mla_w_elems,
+            dt.w_dense,
+            dt.act,
+            chip=eval_context.chip,
+            weight_dtype=dt.w_dense_dtype,
         )
         prefill_cap = geom.index_topk if (is_sparse and geom.index_topk > 0) else 0
         prefill_pairs = _capped_causal_pairs(
@@ -1266,7 +1483,7 @@ def _compute_mla_dsa_costs(
             prefill_pairs * MATMUL_FLOP_PER_MAC * nq * (nope_d + rope_d + v_d) * n_eff
         )
         mla_scores = dec_abs_scores + pre_abs_scores
-        strict_fp8, strict_bf16 = _mla_strict_flops(
+        strict_buckets = _mla_strict_flops(
             eval_context,
             parallel,
             dt,
@@ -1304,24 +1521,34 @@ def _compute_mla_dsa_costs(
                 + 2.0 * eval_context.rows * geom.hidden * geom.hc_mult
             )
         ) + _subchannel_scale_vector_flops(
-            eval_context.rows, mla_w_elems, dt.w_dense, geom.weight_block_size
+            eval_context.rows,
+            mla_w_elems,
+            dt.w_dense,
+            geom.weight_block_size,
+            block_k_floor=eval_context.chip.subchannel_block_k_floor,
         )
         vector_flops, strict_vector_flops = _mla_unpack_vector_flops(
-            base_vector_flops, mla_w_elems, dt.w_dense
+            base_vector_flops, mla_w_elems, dt, eval_context.chip
         )
         out.append(
             ModuleCost(
                 name=fam_name,
                 hbm_bytes=mla_w_elems * dt.w_dense + mla_kv_bytes,
-                fp8_flops=mla_fp8,
-                bf16_flops=mla_bf16 + mla_scores,
+                fp8_flops=mla_flops.fp8,
+                bf16_flops=mla_flops.bf16 + mla_scores,
                 collectives=mla_colls,
                 hbm_bytes_min=mla_w_elems * dt.w_dense + mla_kv_bytes_min,
-                fp8_flops_min=strict_fp8,
-                bf16_flops_min=strict_bf16,
+                fp8_flops_min=strict_buckets.fp8,
+                bf16_flops_min=strict_buckets.bf16,
                 unique_collectives=mla_ucolls,
                 vector_flops=vector_flops,
                 strict_vector_flops=strict_vector_flops,
+                fp4_flops=mla_flops.fp4,
+                int8_flops=mla_flops.int8,
+                int4_flops=mla_flops.int4,
+                fp4_flops_min=strict_buckets.fp4,
+                int8_flops_min=strict_buckets.int8,
+                int4_flops_min=strict_buckets.int4,
             )
         )
     return out
@@ -1353,12 +1580,22 @@ def _compute_gdn_cost(
         else 0.0
     )
     gdn_state_bytes = (dec_state_io + pre_state_io) * (rec_state + conv_state)
-    dense_fp8, dense_bf16 = _split_matmul_flops(
-        eval_context.rows, gdn_dense_elems, dt.w_dense, dt.act
+    dense_buckets = _route_matmul_flops(
+        eval_context.rows,
+        gdn_dense_elems,
+        dt.w_dense,
+        dt.act,
+        chip=eval_context.chip,
+        weight_dtype=dt.w_dense_dtype,
     )
-    aux_fp8, aux_bf16 = _split_matmul_flops(
-        eval_context.rows, gdn_aux_elems, dt.w_aux, dt.act
+    aux_buckets = _route_matmul_flops(
+        eval_context.rows,
+        gdn_aux_elems,
+        dt.w_aux,
+        dt.act,
+        chip=eval_context.chip,
     )
+    gdn_buckets = dense_buckets + aux_buckets
     gdn_rec_flops = float(
         eval_context.rows * 4 * vh * geom.linear_k_dim * geom.linear_v_dim * n_eff
     )
@@ -1379,7 +1616,13 @@ def _compute_gdn_cost(
         ),
         max(1, round(n_eff)),
     )
-    dense_unpack = _sub_byte_unpack_vector_flops(gdn_dense_elems, dt.w_dense)
+    dense_unpack = _sub_byte_unpack_vector_flops(
+        gdn_dense_elems,
+        dt.w_dense,
+        chip=eval_context.chip,
+        weight_dtype=dt.w_dense_dtype,
+        act=dt.act,
+    )
     vector_flops = (
         float(
             n_eff
@@ -1389,7 +1632,11 @@ def _compute_gdn_cost(
             )
         )
         + _subchannel_scale_vector_flops(
-            eval_context.rows, gdn_dense_elems, dt.w_dense, geom.weight_block_size
+            eval_context.rows,
+            gdn_dense_elems,
+            dt.w_dense,
+            geom.weight_block_size,
+            block_k_floor=eval_context.chip.subchannel_block_k_floor,
         )
         + dense_unpack
     )
@@ -1401,12 +1648,15 @@ def _compute_gdn_cost(
         hbm_bytes=(
             gdn_dense_elems * dt.w_dense + gdn_aux_elems * dt.w_aux + gdn_state_bytes
         ),
-        fp8_flops=dense_fp8 + aux_fp8,
-        bf16_flops=dense_bf16 + aux_bf16 + gdn_rec_flops,
+        fp8_flops=gdn_buckets.fp8,
+        bf16_flops=gdn_buckets.bf16 + gdn_rec_flops,
         collectives=gdn_colls,
         unique_collectives=gdn_ucolls,
         vector_flops=vector_flops,
         strict_vector_flops=strict_vector_flops,
+        fp4_flops=gdn_buckets.fp4,
+        int8_flops=gdn_buckets.int8,
+        int4_flops=gdn_buckets.int4,
     )
 
 
@@ -1436,8 +1686,13 @@ def _compute_kda_cost(
         else 0.0
     )
     kda_state_bytes = (dec_state_io + pre_state_io) * kda_rec
-    kda_fp8, kda_bf16 = _split_matmul_flops(
-        eval_context.rows, kda_w_elems, dt.w_dense, dt.act
+    kda_buckets = _route_matmul_flops(
+        eval_context.rows,
+        kda_w_elems,
+        dt.w_dense,
+        dt.act,
+        chip=eval_context.chip,
+        weight_dtype=dt.w_dense_dtype,
     )
     kda_rec_flops = float(eval_context.rows * 4 * vh * kd * vd * n_eff)
     kda_colls, kda_ucolls = _repeat_colls(
@@ -1457,7 +1712,13 @@ def _compute_kda_cost(
         ),
         max(1, round(n_eff)),
     )
-    dense_unpack = _sub_byte_unpack_vector_flops(kda_w_elems, dt.w_dense)
+    dense_unpack = _sub_byte_unpack_vector_flops(
+        kda_w_elems,
+        dt.w_dense,
+        chip=eval_context.chip,
+        weight_dtype=dt.w_dense_dtype,
+        act=dt.act,
+    )
     vector_flops = (
         float(
             n_eff
@@ -1467,7 +1728,11 @@ def _compute_kda_cost(
             )
         )
         + _subchannel_scale_vector_flops(
-            eval_context.rows, kda_w_elems, dt.w_dense, geom.weight_block_size
+            eval_context.rows,
+            kda_w_elems,
+            dt.w_dense,
+            geom.weight_block_size,
+            block_k_floor=eval_context.chip.subchannel_block_k_floor,
         )
         + dense_unpack
     )
@@ -1477,12 +1742,15 @@ def _compute_kda_cost(
     return ModuleCost(
         name="kda",
         hbm_bytes=kda_w_elems * dt.w_dense + kda_state_bytes,
-        fp8_flops=kda_fp8,
-        bf16_flops=kda_bf16 + kda_rec_flops,
+        fp8_flops=kda_buckets.fp8,
+        bf16_flops=kda_buckets.bf16 + kda_rec_flops,
         collectives=kda_colls,
         unique_collectives=kda_ucolls,
         vector_flops=vector_flops,
         strict_vector_flops=strict_vector_flops,
+        fp4_flops=kda_buckets.fp4,
+        int8_flops=kda_buckets.int8,
+        int4_flops=kda_buckets.int4,
     )
 
 
@@ -1499,8 +1767,7 @@ class _RoutedEnvelopeSpec:
     routed_rows: int
     routed_unit: float
     non_routed_weight_bytes: float
-    routed_base_fp8_flops: float
-    routed_base_bf16_flops: float
+    routed_base_flops: float
     lhs_floor: int
 
 
@@ -1563,8 +1830,8 @@ def _compute_routed_moe_envelope(
     dt: Dtypes,
     eval_context: _StepContext,
     spec: _RoutedEnvelopeSpec,
-) -> tuple[float, float, float]:
-    """Compute activation-envelope routed MoE weight bytes and FP8/BF16 FLOPs."""
+) -> tuple[float, float]:
+    """Compute activation-envelope routed MoE weight bytes and compute FLOPs."""
     experts_per_shard_envelope, total_active_envelope = _resolve_envelope_experts(
         geom, eval_context, spec
     )
@@ -1572,8 +1839,7 @@ def _compute_routed_moe_envelope(
         experts_per_shard_envelope * spec.routed_unit * dt.w_expert
         + spec.non_routed_weight_bytes
     )
-    routed_fp8_envelope = spec.routed_base_fp8_flops
-    routed_bf16_envelope = spec.routed_base_bf16_flops
+    routed_flops_envelope = spec.routed_base_flops
     if (
         spec.lhs_floor > 1
         and spec.routed_rows > 0
@@ -1588,9 +1854,8 @@ def _compute_routed_moe_envelope(
         pad_multiplier_envelope = (
             envelope_padded_tiles * float(spec.lhs_floor)
         ) / total_assignments
-        routed_fp8_envelope *= pad_multiplier_envelope
-        routed_bf16_envelope *= pad_multiplier_envelope
-    return (moe_weight_bytes_envelope, routed_fp8_envelope, routed_bf16_envelope)
+        routed_flops_envelope *= pad_multiplier_envelope
+    return moe_weight_bytes_envelope, routed_flops_envelope
 
 
 @dataclass(frozen=True, slots=True)
@@ -1752,6 +2017,9 @@ def _routed_moe_vector_flops(
     n_m_eff: float,
 ) -> tuple[float, float]:
     """Return nominal and strict vector FLOPs for a routed MoE layer."""
+    _, _, routed_unpack = eval_context.chip.matmul_peak_kind(
+        dt.w_expert, dt.act, weight_dtype=dt.w_expert_dtype
+    )
     sh_vector = (
         float(n_m_eff * 3.0 * layout.sh_rows * layout.isr_eff)
         if layout.isr_eff > 0
@@ -1767,8 +2035,8 @@ def _routed_moe_vector_flops(
         * (geom.moe_inter / layout.eff_moe_div)
         * geom.top_k
     )
-    fp4_unpack = float(2.0 * layout.routed_elems) if dt.w_expert < 1.0 else 0.0
-    fp4_unpack_min = float(2.0 * layout.routed_elems_min) if dt.w_expert < 1.0 else 0.0
+    fp4_unpack = float(2.0 * layout.routed_elems) if routed_unpack else 0.0
+    fp4_unpack_min = float(2.0 * layout.routed_elems_min) if routed_unpack else 0.0
     mix_vector = float(
         n_m_eff
         * (
@@ -1777,20 +2045,37 @@ def _routed_moe_vector_flops(
         )
     )
     sub_vector = _subchannel_scale_vector_flops(
-        layout.routed_rows, layout.routed_act_elems, dt.w_expert, geom.weight_block_size
+        layout.routed_rows,
+        layout.routed_act_elems,
+        dt.w_expert,
+        geom.weight_block_size,
+        block_k_floor=eval_context.chip.subchannel_block_k_floor,
     ) + _subchannel_scale_vector_flops(
-        layout.sh_rows, layout.shared_elems, dt.w_dense, geom.weight_block_size
+        layout.sh_rows,
+        layout.shared_elems,
+        dt.w_dense,
+        geom.weight_block_size,
+        block_k_floor=eval_context.chip.subchannel_block_k_floor,
     )
     sub_vector_min = _subchannel_scale_vector_flops(
         layout.routed_rows,
         layout.routed_act_elems_min,
         dt.w_expert,
         geom.weight_block_size,
+        block_k_floor=eval_context.chip.subchannel_block_k_floor,
     ) + _subchannel_scale_vector_flops(
-        layout.sh_rows, layout.shared_elems, dt.w_dense, geom.weight_block_size
+        layout.sh_rows,
+        layout.shared_elems,
+        dt.w_dense,
+        geom.weight_block_size,
+        block_k_floor=eval_context.chip.subchannel_block_k_floor,
     )
     shared_unpack = _sub_byte_unpack_vector_flops(
-        layout.shared_elems + layout.latent_proj_sharded, dt.w_dense
+        layout.shared_elems + layout.latent_proj_sharded,
+        dt.w_dense,
+        chip=eval_context.chip,
+        weight_dtype=dt.w_dense_dtype,
+        act=dt.act,
     )
     vector_flops = (
         sh_vector + routed_vector + fp4_unpack + shared_unpack + mix_vector + sub_vector
@@ -1816,16 +2101,29 @@ def _compute_routed_moe_cost(
 ) -> ModuleCost:
     """Compute ModuleCost for routed MoE FFN layer."""
     layout = _routed_moe_layout(geom, parallel, dt, eval_context, n_m_eff=n_m_eff)
-    r_fp8, r_bf16 = _split_matmul_flops(
-        layout.routed_rows, layout.routed_act_elems, dt.w_expert, dt.act
+    routed_buckets = _route_matmul_flops(
+        layout.routed_rows,
+        layout.routed_act_elems,
+        dt.w_expert,
+        dt.act,
+        chip=eval_context.chip,
+        weight_dtype=dt.w_expert_dtype,
     )
-    r_fp8_min, r_bf16_min = _split_matmul_flops(
-        layout.routed_rows, layout.routed_act_elems_min, dt.w_expert, dt.act
+    routed_min_buckets = _route_matmul_flops(
+        layout.routed_rows,
+        layout.routed_act_elems_min,
+        dt.w_expert,
+        dt.act,
+        chip=eval_context.chip,
+        weight_dtype=dt.w_expert_dtype,
     )
-    routed_base_fp8_flops = r_fp8_min
-    routed_base_bf16_flops = r_bf16_min
-    latent_fp8_flops = 0.0
-    latent_bf16_flops = 0.0
+    routed_base_bucket, _, _ = eval_context.chip.matmul_peak_kind(
+        dt.w_expert, dt.act, weight_dtype=dt.w_expert_dtype
+    )
+    routed_base_flops = (
+        MATMUL_FLOP_PER_MAC * layout.routed_rows * layout.routed_act_elems_min
+    )
+    latent_buckets = _MatmulBuckets()
     if geom.routed_expert_hidden > 0:
         latent_flops_elems = float(
             n_m_eff
@@ -1834,8 +2132,13 @@ def _compute_routed_moe_cost(
             * geom.routed_expert_hidden
             / layout.tp
         )
-        latent_fp8_flops, latent_bf16_flops = _split_matmul_flops(
-            eval_context.rows, latent_flops_elems, dt.w_dense, dt.act
+        latent_buckets = _route_matmul_flops(
+            eval_context.rows,
+            latent_flops_elems,
+            dt.w_dense,
+            dt.act,
+            chip=eval_context.chip,
+            weight_dtype=dt.w_dense_dtype,
         )
     if (
         not eval_context.unpadded_linear
@@ -1856,19 +2159,18 @@ def _compute_routed_moe_cost(
                 * eval_context.mxu_m_tile
             )
             pad_mult = padded_token_rows / m_per_touched
-            r_fp8 *= pad_mult
-            r_bf16 *= pad_mult
+            routed_buckets = routed_buckets.scale(pad_mult)
     lhs_floor = (
         (
-            eval_context.mxu_lhs_rows_fp8
-            if eval_context.mxu_lhs_rows_fp8 is not None
-            else CHIPS["tpu7x"].mxu_lhs_rows_fp8
-        )
-        if (dt.w_expert < BF16_BYTES and dt.act == "a8")
-        else (
             eval_context.mxu_lhs_rows_bf16
             if eval_context.mxu_lhs_rows_bf16 is not None
-            else CHIPS["tpu7x"].mxu_lhs_rows_bf16
+            else eval_context.chip.mxu_lhs_rows_bf16
+        )
+        if routed_base_bucket == "bf16"
+        else (
+            eval_context.mxu_lhs_rows_fp8
+            if eval_context.mxu_lhs_rows_fp8 is not None
+            else eval_context.chip.mxu_lhs_rows_fp8
         )
     )
     if (
@@ -1879,12 +2181,9 @@ def _compute_routed_moe_cost(
         and geom.top_k > 0
     ):
         pad_mult_strict = max(1.0, float(lhs_floor) / float(layout.routed_rows))
-        r_fp8_min *= pad_mult_strict
-        r_bf16_min *= pad_mult_strict
-    r_fp8 += latent_fp8_flops
-    r_bf16 += latent_bf16_flops
-    r_fp8_min += latent_fp8_flops
-    r_bf16_min += latent_bf16_flops
+        routed_min_buckets = routed_min_buckets.scale(pad_mult_strict)
+    routed_buckets = routed_buckets + latent_buckets
+    routed_min_buckets = routed_min_buckets + latent_buckets
     non_routed_weight_bytes = (
         layout.shared_elems * dt.w_dense
         + layout.router_elems * dt.router
@@ -1904,11 +2203,7 @@ def _compute_routed_moe_cost(
         if layout.is_ep
         else eval_context.eff_prefill
     )
-    (
-        moe_weight_bytes_envelope,
-        routed_fp8_envelope,
-        routed_bf16_envelope,
-    ) = _compute_routed_moe_envelope(
+    moe_weight_bytes_envelope, routed_env_flops = _compute_routed_moe_envelope(
         geom,
         dt,
         eval_context,
@@ -1919,21 +2214,35 @@ def _compute_routed_moe_cost(
             routed_rows=layout.routed_rows,
             routed_unit=layout.routed_unit,
             non_routed_weight_bytes=non_routed_weight_bytes,
-            routed_base_fp8_flops=routed_base_fp8_flops,
-            routed_base_bf16_flops=routed_base_bf16_flops,
+            routed_base_flops=routed_base_flops,
             lhs_floor=lhs_floor,
         ),
     )
-    routed_fp8_envelope += latent_fp8_flops
-    routed_bf16_envelope += latent_bf16_flops
-    s_fp8, s_bf16 = _split_matmul_flops(
-        layout.sh_rows, layout.shared_mxu_elems, dt.w_dense, dt.act
+    routed_env_buckets = (
+        _bucket_from_name(routed_base_bucket, routed_env_flops) + latent_buckets
     )
-    s_fp8_min, s_bf16_min = _split_matmul_flops(
-        layout.sh_rows, layout.shared_elems, dt.w_dense, dt.act
+    shared_buckets = _route_matmul_flops(
+        layout.sh_rows,
+        layout.shared_mxu_elems,
+        dt.w_dense,
+        dt.act,
+        chip=eval_context.chip,
+        weight_dtype=dt.w_dense_dtype,
     )
-    rt_fp8, rt_bf16 = _split_matmul_flops(
-        eval_context.rows, layout.router_elems, dt.router, dt.act
+    shared_min_buckets = _route_matmul_flops(
+        layout.sh_rows,
+        layout.shared_elems,
+        dt.w_dense,
+        dt.act,
+        chip=eval_context.chip,
+        weight_dtype=dt.w_dense_dtype,
+    )
+    router_buckets = _route_matmul_flops(
+        eval_context.rows,
+        layout.router_elems,
+        dt.router,
+        dt.act,
+        chip=eval_context.chip,
     )
     moe_colls, moe_ucolls = _repeat_colls(
         _moe_layer_collectives(
@@ -1954,21 +2263,33 @@ def _compute_routed_moe_cost(
     vector_flops, strict_vector_flops = _routed_moe_vector_flops(
         geom, dt, eval_context, layout, n_m_eff=n_m_eff
     )
+    moe_total = routed_buckets + shared_buckets + router_buckets
+    moe_min_total = routed_min_buckets + shared_min_buckets + router_buckets
+    moe_env_total = routed_env_buckets + shared_min_buckets + router_buckets
     return ModuleCost(
         name="moe",
         hbm_bytes=layout.moe_w_bytes,
-        fp8_flops=r_fp8 + s_fp8 + rt_fp8,
-        bf16_flops=r_bf16 + s_bf16 + rt_bf16,
+        fp8_flops=moe_total.fp8,
+        bf16_flops=moe_total.bf16,
         collectives=moe_colls,
         hbm_bytes_min=layout.moe_w_bytes_min,
         unique_collectives=moe_ucolls,
-        fp8_flops_min=r_fp8_min + s_fp8_min + rt_fp8,
-        bf16_flops_min=r_bf16_min + s_bf16_min + rt_bf16,
+        fp8_flops_min=moe_min_total.fp8,
+        bf16_flops_min=moe_min_total.bf16,
         vector_flops=vector_flops,
         strict_vector_flops=strict_vector_flops,
         hbm_bytes_envelope=moe_weight_bytes_envelope,
-        fp8_flops_envelope=routed_fp8_envelope + s_fp8_min + rt_fp8,
-        bf16_flops_envelope=routed_bf16_envelope + s_bf16_min + rt_bf16,
+        fp8_flops_envelope=moe_env_total.fp8,
+        bf16_flops_envelope=moe_env_total.bf16,
+        fp4_flops=moe_total.fp4,
+        int8_flops=moe_total.int8,
+        int4_flops=moe_total.int4,
+        fp4_flops_min=moe_min_total.fp4,
+        int8_flops_min=moe_min_total.int8,
+        int4_flops_min=moe_min_total.int4,
+        fp4_flops_envelope=moe_env_total.fp4,
+        int8_flops_envelope=moe_env_total.int8,
+        int4_flops_envelope=moe_env_total.int4,
     )
 
 
@@ -1991,18 +2312,33 @@ def _compute_moe_mlp_costs(
         mlp_mxu_elems = float(
             n_d_eff * 3 * geom.hidden * _align_mxu(mlp_inter, eval_context)
         )
-        mlp_fp8, mlp_bf16 = _split_matmul_flops(
-            eval_context.rows, mlp_mxu_elems, dt.w_dense, dt.act
+        mlp_buckets = _route_matmul_flops(
+            eval_context.rows,
+            mlp_mxu_elems,
+            dt.w_dense,
+            dt.act,
+            chip=eval_context.chip,
+            weight_dtype=dt.w_dense_dtype,
         )
-        mlp_fp8_min, mlp_bf16_min = _split_matmul_flops(
-            eval_context.rows, mlp_elems, dt.w_dense, dt.act
+        mlp_min_buckets = _route_matmul_flops(
+            eval_context.rows,
+            mlp_elems,
+            dt.w_dense,
+            dt.act,
+            chip=eval_context.chip,
+            weight_dtype=dt.w_dense_dtype,
+        )
+        eff_ranks = (
+            parallel.ranks_per_chip
+            if parallel.ranks_per_chip is not None
+            else eval_context.chip.cores_per_chip
         )
         d_par = (
             Parallel(
                 tp=parallel.tp,
                 residual=parallel.residual,
                 ar_algo=parallel.ar_algo,
-                ranks_per_chip=parallel.ranks_per_chip,
+                ranks_per_chip=eff_ranks,
                 moe="ep" if parallel.residual == "sp" else "tp_slice",
             )
             if geom.num_experts > 0
@@ -2027,12 +2363,22 @@ def _compute_moe_mlp_costs(
                 + 2.0 * eval_context.rows * geom.hidden * geom.hc_mult
             )
         )
-        dense_unpack = _sub_byte_unpack_vector_flops(mlp_elems, dt.w_dense)
+        dense_unpack = _sub_byte_unpack_vector_flops(
+            mlp_elems,
+            dt.w_dense,
+            chip=eval_context.chip,
+            weight_dtype=dt.w_dense_dtype,
+            act=dt.act,
+        )
         vector_flops = (
             mlp_swiglu
             + mlp_mix
             + _subchannel_scale_vector_flops(
-                eval_context.rows, mlp_elems, dt.w_dense, geom.weight_block_size
+                eval_context.rows,
+                mlp_elems,
+                dt.w_dense,
+                geom.weight_block_size,
+                block_k_floor=eval_context.chip.subchannel_block_k_floor,
             )
             + dense_unpack
         )
@@ -2045,13 +2391,19 @@ def _compute_moe_mlp_costs(
             ModuleCost(
                 name="mlp",
                 hbm_bytes=mlp_elems * dt.w_dense,
-                fp8_flops=mlp_fp8,
-                bf16_flops=mlp_bf16,
+                fp8_flops=mlp_buckets.fp8,
+                bf16_flops=mlp_buckets.bf16,
                 collectives=mlp_colls,
-                fp8_flops_min=mlp_fp8_min,
-                bf16_flops_min=mlp_bf16_min,
+                fp8_flops_min=mlp_min_buckets.fp8,
+                bf16_flops_min=mlp_min_buckets.bf16,
                 vector_flops=vector_flops,
                 strict_vector_flops=strict_vector_flops,
+                fp4_flops=mlp_buckets.fp4,
+                int8_flops=mlp_buckets.int8,
+                int4_flops=mlp_buckets.int4,
+                fp4_flops_min=mlp_min_buckets.fp4,
+                int8_flops_min=mlp_min_buckets.int8,
+                int4_flops_min=mlp_min_buckets.int4,
             )
         )
     if n_moe_ffn > 0:
@@ -2085,16 +2437,23 @@ def _compute_ple_cost(
     n_ple = geom.num_layers * eval_context.pp_scale
     ple_proj_elems = float(n_ple * geom.hidden * ple_d // tp)
     ple_lookup_bytes = float(n_ple * eval_context.rows * ple_d) * dt.w_aux
-    ple_fp8, ple_bf16 = _split_matmul_flops(
-        eval_context.rows, ple_proj_elems, dt.w_aux, dt.act
+    ple_buckets = _route_matmul_flops(
+        eval_context.rows,
+        ple_proj_elems,
+        dt.w_aux,
+        dt.act,
+        chip=eval_context.chip,
     )
     return ModuleCost(
         name="ple",
         hbm_bytes=ple_proj_elems * dt.w_aux + ple_lookup_bytes,
-        fp8_flops=ple_fp8,
-        bf16_flops=ple_bf16,
+        fp8_flops=ple_buckets.fp8,
+        bf16_flops=ple_buckets.bf16,
         vector_flops=0.0,
         strict_vector_flops=0.0,
+        fp4_flops=ple_buckets.fp4,
+        int8_flops=ple_buckets.int8,
+        int4_flops=ple_buckets.int4,
     )
 
 
@@ -2120,8 +2479,12 @@ def _compute_lm_head_cost(
         else ()
     )
     lm_elems = float(geom.vocab * geom.hidden // tp) / float(max(1, parallel.pp))
-    lm_fp8, lm_bf16 = _split_matmul_flops(
-        eval_context.rows, lm_elems, dt.lm_head, dt.act
+    lm_buckets = _route_matmul_flops(
+        eval_context.rows,
+        lm_elems,
+        dt.lm_head,
+        dt.act,
+        chip=eval_context.chip,
     )
     lm_all_colls = (
         _lm_head_collectives(
@@ -2138,12 +2501,15 @@ def _compute_lm_head_cost(
     return ModuleCost(
         name="lm_head",
         hbm_bytes=lm_elems * dt.lm_head,
-        fp8_flops=lm_fp8,
-        bf16_flops=lm_bf16,
+        fp8_flops=lm_buckets.fp8,
+        bf16_flops=lm_buckets.bf16,
         collectives=lm_colls,
         unique_collectives=lm_ucolls,
         vector_flops=vector_flops,
         strict_vector_flops=vector_flops,
+        fp4_flops=lm_buckets.fp4,
+        int8_flops=lm_buckets.int8,
+        int4_flops=lm_buckets.int4,
     )
 
 
@@ -2156,6 +2522,7 @@ class PassCostOptions(TypedDict, total=False):
     fp8_to_bf16_ratio: float | None
     activation_model: ExpertActivationModel
     unpadded_linear: bool
+    chip: ChipSpec | None
 
 
 def pass_costs(
@@ -2166,30 +2533,40 @@ def pass_costs(
     **options: Unpack[PassCostOptions],
 ) -> tuple[ModuleCost, ...]:
     """Compute per-module resource work for one decode, prefill, or mixed pass."""
-    _validate_pass_costs_config(geom, parallel)
     mxu_m_tile = options.get("mxu_m_tile", 1)
+    chip = options.get("chip")
+    eff_chip = chip if chip is not None else CHIPS["tpu7x"]
     raw_lhs_bf16 = options.get("mxu_lhs_rows_bf16")
     mxu_lhs_rows_bf16 = (
-        CHIPS["tpu7x"].mxu_lhs_rows_bf16 if raw_lhs_bf16 is None else raw_lhs_bf16
+        eff_chip.mxu_lhs_rows_bf16 if raw_lhs_bf16 is None else raw_lhs_bf16
     )
     raw_lhs_fp8 = options.get("mxu_lhs_rows_fp8")
-    mxu_lhs_rows_fp8 = (
-        CHIPS["tpu7x"].mxu_lhs_rows_fp8 if raw_lhs_fp8 is None else raw_lhs_fp8
-    )
-    tpu7x_chip = CHIPS["tpu7x"]
+    mxu_lhs_rows_fp8 = eff_chip.mxu_lhs_rows_fp8 if raw_lhs_fp8 is None else raw_lhs_fp8
     raw_fp8_ratio = options.get("fp8_to_bf16_ratio")
     default_fp8_ratio = (
-        tpu7x_chip.fp8_flops / tpu7x_chip.bf16_flops
-        if tpu7x_chip.fp8_flops > 0.0 and tpu7x_chip.bf16_flops > 0.0
+        eff_chip.fp8_flops / eff_chip.bf16_flops
+        if eff_chip.fp8_flops > 0.0 and eff_chip.bf16_flops > 0.0
         else 0.0
     )
     fp8_to_bf16_ratio = default_fp8_ratio if raw_fp8_ratio is None else raw_fp8_ratio
     activation_model = options.get("activation_model", _DEFAULT_ACTIVATION_MODEL)
     unpadded_linear = options.get("unpadded_linear", False)
+    eff_ranks = (
+        parallel.ranks_per_chip
+        if parallel.ranks_per_chip is not None
+        else eff_chip.cores_per_chip
+    )
+    eff_parallel = (
+        parallel
+        if parallel.ranks_per_chip is not None
+        else replace(parallel, ranks_per_chip=eff_ranks)
+    )
+    _validate_pass_costs_config(geom, eff_parallel)
 
     pp_scale = (
-        float(math.ceil(geom.num_layers / max(1, parallel.pp))) / float(geom.num_layers)
-        if geom.num_layers > 0 and parallel.pp > 1
+        float(math.ceil(geom.num_layers / max(1, eff_parallel.pp)))
+        / float(geom.num_layers)
+        if geom.num_layers > 0 and eff_parallel.pp > 1
         else 1.0
     )
     decode_rows = shape.batch * shape.rows_per_seq
@@ -2200,7 +2577,7 @@ def pass_costs(
                 math.floor(
                     shape.prefill_tokens
                     * max(0.0, 1.0 - shape.prefix_hit_rate)
-                    / max(1, parallel.pcp)
+                    / max(1, eff_parallel.pcp)
                 ),
             )
         else:
@@ -2209,7 +2586,7 @@ def pass_costs(
                 math.ceil(
                     shape.prefill_tokens
                     * max(0.0, 1.0 - shape.prefix_hit_rate)
-                    / max(1, parallel.pcp)
+                    / max(1, eff_parallel.pcp)
                 ),
             )
     else:
@@ -2237,11 +2614,12 @@ def pass_costs(
         fp8_to_bf16_ratio=fp8_to_bf16_ratio,
         activation_model=activation_model,
         unpadded_linear=unpadded_linear,
+        chip=eff_chip,
     )
 
     counts = count_layer_types(geom)
     emb_colls, emb_ucolls = _repeat_colls(
-        _embed_collectives(rows, geom.hidden, parallel), 1
+        _embed_collectives(rows, geom.hidden, eff_parallel), 1
     )
     out: list[ModuleCost] = [
         ModuleCost(
@@ -2257,30 +2635,32 @@ def pass_costs(
     ]
 
     if counts.gqa > 0:
-        out.append(_compute_gqa_cost(geom, parallel, dt, eval_context, counts))
+        out.append(_compute_gqa_cost(geom, eff_parallel, dt, eval_context, counts))
 
     if counts.swa > 0:
-        out.append(_compute_swa_cost(geom, parallel, dt, eval_context, counts=counts))
+        out.append(
+            _compute_swa_cost(geom, eff_parallel, dt, eval_context, counts=counts)
+        )
 
     if counts.mla > 0 or counts.dsa > 0:
-        out.extend(_compute_mla_dsa_costs(geom, parallel, dt, eval_context, counts))
+        out.extend(_compute_mla_dsa_costs(geom, eff_parallel, dt, eval_context, counts))
 
     if counts.gdn > 0:
         out.append(
-            _compute_gdn_cost(geom, parallel, dt, eval_context, n_gdn=counts.gdn)
+            _compute_gdn_cost(geom, eff_parallel, dt, eval_context, n_gdn=counts.gdn)
         )
 
     if counts.kda > 0:
         out.append(
-            _compute_kda_cost(geom, parallel, dt, eval_context, n_kda=counts.kda)
+            _compute_kda_cost(geom, eff_parallel, dt, eval_context, n_kda=counts.kda)
         )
 
-    out.extend(_compute_moe_mlp_costs(geom, parallel, dt, eval_context))
+    out.extend(_compute_moe_mlp_costs(geom, eff_parallel, dt, eval_context))
 
-    ple = _compute_ple_cost(geom, parallel, dt, eval_context)
+    ple = _compute_ple_cost(geom, eff_parallel, dt, eval_context)
     if ple is not None:
         out.append(ple)
 
-    out.append(_compute_lm_head_cost(geom, parallel, dt, eval_context))
+    out.append(_compute_lm_head_cost(geom, eff_parallel, dt, eval_context))
 
     return tuple(out)

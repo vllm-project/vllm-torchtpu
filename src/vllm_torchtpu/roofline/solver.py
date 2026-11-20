@@ -22,7 +22,7 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Final, Literal, TypedDict, Unpack
 
-from .chips import TOPOLOGIES, ChipSpec, SliceTopology
+from .chips import TOPOLOGIES, ChipSpec, SliceTopology, topologies_for_chip
 from .collectives import submesh_for_group
 from .constants import (
     ACTIVATION_BYTES_BF16,
@@ -36,7 +36,6 @@ from .constants import (
     FP8_BYTES,
     MIN_DISAGG_INSTANCES,
     MIN_MOE_INTERMEDIATE_ALIGNMENT,
-    MIN_SLICE_CHIPS,
     NO_FEASIBLE_LAYOUT_WARNING,
     SLO_VERDICT_ESTIMATE_MEETS,
     SLO_VERDICT_RANK,
@@ -1158,8 +1157,9 @@ def _disagg_kv_xfer_s(
     bd_one = hbm_breakdown_per_core_bytes(
         geom,
         dtypes,
-        Parallel(tp=1, pp=1),
+        Parallel(tp=1, pp=1, ranks_per_chip=chip.cores_per_chip),
         SeqKvLayout(1, max(0, uncached_tokens), physical_kv_layout=False),
+        chip=chip,
     )
     wire_b = bd_one.kv + bd_one.state
     topo_p, topo_d = topos
@@ -1935,6 +1935,7 @@ def _clamp_resident_batch(
         eval_context.dtypes,
         par,
         SeqKvLayout(b_res, eval_context.ctx_full),
+        chip=eval_context.chip,
     )
     while b_res > 1 and hbm_bd.total > eval_context.hbm_limit_b:
         b_res -= 1
@@ -1943,6 +1944,7 @@ def _clamp_resident_batch(
             eval_context.dtypes,
             par,
             SeqKvLayout(b_res, eval_context.ctx_full),
+            chip=eval_context.chip,
         )
     if hbm_bd.total > eval_context.hbm_limit_b:
         return None
@@ -1961,6 +1963,7 @@ def _resolve_prefill_pp_breakdown(
             eval_context.dtypes,
             par,
             SeqKvLayout(1, eval_context.scenario.isl),
+            chip=eval_context.chip,
         )
         return (hbm_bd, hbm_bd.total, None)
     even_cap = max(1, math.ceil(eval_context.geom.num_layers / par.pp))
@@ -1970,6 +1973,7 @@ def _resolve_prefill_pp_breakdown(
         par,
         (eval_context.scenario.isl, 1),
         PpStageOptions(disagg=True, max_stage_layers=even_cap),
+        chip=eval_context.chip,
     )
     if (
         not pp_feas
@@ -1982,6 +1986,7 @@ def _resolve_prefill_pp_breakdown(
             par,
             (eval_context.scenario.isl, 1),
             PpStageOptions(disagg=True),
+            chip=eval_context.chip,
         )
     if not pp_feas:
         return None
@@ -2058,6 +2063,7 @@ def _find_prefill_options(
                 eval_context.dtypes,
                 par,
                 eval_context.scenario.isl,
+                chip=eval_context.chip,
             )
             if par.pp > 1 and pp_part_opt:
                 pp_scale = float(max(pp_part_opt)) / (
@@ -2132,6 +2138,7 @@ def _fit_mixed_batch_with_logits(
         eval_context.dtypes,
         par,
         SeqKvLayout(b_res, eval_context.ctx_full),
+        chip=eval_context.chip,
     )
     logit_peak_b = _peak_prefill_logit_bytes(
         eval_context.geom,
@@ -2147,6 +2154,7 @@ def _fit_mixed_batch_with_logits(
             eval_context.dtypes,
             par,
             SeqKvLayout(b_res, eval_context.ctx_full),
+            chip=eval_context.chip,
         )
         logit_peak_b = _peak_prefill_logit_bytes(
             eval_context.geom,
@@ -2332,6 +2340,7 @@ def _evaluate_mixed_point(
             kv_working_set_turns=eval_context.scenario.kv_working_set_turns,
             fixed_kv_per_seq_bytes=bounds.fixed_kv_per_seq_b,
         ),
+        chip=eval_context.chip,
     )
     cap_tok_int = None if math.isinf(cap_tok) else int(cap_tok)
     sf_ttft_c = (
@@ -2355,6 +2364,7 @@ def _evaluate_mixed_point(
             kv_working_set_turns=eval_context.scenario.kv_working_set_turns,
             fixed_kv_per_seq_bytes=bounds.fixed_kv_per_seq_b,
         ),
+        chip=eval_context.chip,
     )
     pcie_read_s = _pcie_read_s(eval_context, bounds.b_kv_phys_core, h_eff, h_hbm_only)
     ttft_service_s = sf_ttft_c.serial_estimate_s + pcie_read_s
@@ -2507,13 +2517,18 @@ def _decode_capacity_profile(
 ) -> tuple[float, int, int, float, float, float]:
     """Compute (w_base_b, b_hbm_max, b_smem_max, b_kv_phys_core, fixed_kv_b, hbm_c1)."""
     w_base_b = hbm_footprint_per_core_bytes(
-        eval_context.geom, eval_context.dtypes, par, SeqKvLayout(0, 0)
+        eval_context.geom,
+        eval_context.dtypes,
+        par,
+        SeqKvLayout(0, 0),
+        chip=eval_context.chip,
     )
     hbm_c1 = hbm_footprint_per_core_bytes(
         eval_context.geom,
         eval_context.dtypes,
         par,
         SeqKvLayout(1, eval_context.ctx_full),
+        chip=eval_context.chip,
     )
     per_seq_b = hbm_c1 - w_base_b
     fits_c1 = (hbm_c1 + logit_peak_b) <= eval_context.hbm_limit_b
@@ -2523,13 +2538,17 @@ def _decode_capacity_profile(
         else (eval_context.c_max if fits_c1 else 0)
     )
     b_smem_max = smem_max_seqs(
-        eval_context.ctx_full, par.kv_split, eval_context.page_size
+        eval_context.ctx_full,
+        par.kv_split,
+        eval_context.page_size,
+        page_table_bytes=eval_context.chip.smem_page_table_bytes,
     )
     b_kv_phys_core, fixed_kv_per_seq_b = kv_bytes_per_core_parts(
         eval_context.geom,
         eval_context.dtypes,
         par,
         eval_context.ctx_full,
+        chip=eval_context.chip,
     )
     return (
         w_base_b,
@@ -2895,6 +2914,7 @@ def _evaluate_disagg_instance_pair(
                 kv_working_set_turns=eval_context.scenario.kv_working_set_turns,
                 fixed_kv_per_seq_bytes=pref.fixed_kv_per_seq_b,
             ),
+            chip=eval_context.chip,
         )
         eval_context.kv_fit_cache[kv_key] = cached_kv
     cap_tok, h_eff = cached_kv
@@ -3150,21 +3170,26 @@ def _evaluate_disaggregated_candidates(
     return candidates
 
 
-def _resolve_solve_topologies(opts: SolveOptions) -> list[SliceTopology]:
+def _resolve_solve_topologies(
+    opts: SolveOptions,
+    chip: ChipSpec | None = None,
+) -> list[SliceTopology]:
     """Resolve provisioned topologies within max_chips budget, rejecting subhost."""
-    topologies = (
-        list(opts.topologies)
-        if opts.topologies is not None
-        else list(TOPOLOGIES.values())
-    )
+    if opts.topologies is not None:
+        topologies = list(opts.topologies)
+    elif chip is not None:
+        topologies = list(topologies_for_chip(chip).values())
+    else:
+        topologies = list(TOPOLOGIES.values())
     if opts.max_chips is not None:
-        if opts.max_chips < MIN_SLICE_CHIPS and opts.topologies is None:
-            min_topo = next(iter(TOPOLOGIES))
-            msg = (
-                f"max_chips={opts.max_chips} is below minimum provisionable TPU "
-                f"topology {min_topo!r} ({MIN_SLICE_CHIPS} chips)"
-            )
-            raise ValueError(msg)
+        if topologies:
+            min_topo = min(topologies, key=lambda topo: topo.num_chips)
+            if opts.max_chips < min_topo.num_chips:
+                msg = (
+                    f"max_chips={opts.max_chips} is below minimum provisionable TPU "
+                    f"topology {min_topo.name!r} ({min_topo.num_chips} chips)"
+                )
+                raise ValueError(msg)
         return [t for t in topologies if t.num_chips <= opts.max_chips]
     return topologies
 
@@ -3328,19 +3353,28 @@ def explain_layout_rejection(
     )
 
 
-def _resolve_budget_max_chips(opts: SolveOptions) -> int:
+def _resolve_budget_max_chips(
+    opts: SolveOptions,
+    chip: ChipSpec | None = None,
+) -> int:
     """Resolve effective chip budget and validate pinned P/D slice totals."""
+    if opts.topologies is not None:
+        topo_map = {t.name: t for t in opts.topologies}
+    elif chip is not None:
+        topo_map = topologies_for_chip(chip)
+    else:
+        topo_map = TOPOLOGIES
     has_pins = bool(
         opts.pd_ratio
         and opts.prefill_topology
         and opts.decode_topology
-        and opts.prefill_topology in TOPOLOGIES
-        and opts.decode_topology in TOPOLOGIES
+        and opts.prefill_topology in topo_map
+        and opts.decode_topology in topo_map
     )
     pinned_chips: int | None = None
     if has_pins and opts.prefill_topology and opts.decode_topology and opts.pd_ratio:
-        pref_chips = TOPOLOGIES[opts.prefill_topology].num_chips
-        dec_chips = TOPOLOGIES[opts.decode_topology].num_chips
+        pref_chips = topo_map[opts.prefill_topology].num_chips
+        dec_chips = topo_map[opts.decode_topology].num_chips
         pinned_chips = opts.pd_ratio[0] * pref_chips + opts.pd_ratio[1] * dec_chips
     if opts.max_chips is None:
         if pinned_chips is None:
@@ -3362,7 +3396,7 @@ def solve_serving_plan(
 ) -> ServingPlan:
     """Search single-pool mixed and unconstrained xP/yD disagg plans."""
     opts = options or SolveOptions()
-    max_chips = _resolve_budget_max_chips(opts)
+    max_chips = _resolve_budget_max_chips(opts, chip=chip)
 
     opts = replace(opts, max_chips=max_chips)
     if not (0.0 < opts.gpu_memory_utilization <= 1.0):
@@ -3421,7 +3455,7 @@ def solve_serving_plan(
         hbm_reserve_gb=opts.hbm_reserve_gb,
     )
 
-    topos = _resolve_solve_topologies(opts)
+    topos = _resolve_solve_topologies(opts, chip=chip)
     prefill_options, min_prefill_ttft_ms = _find_prefill_options(eval_context, topos)
     mixed_candidates, min_c1_tpot_ms, min_mixed_ttft_ms = _evaluate_mixed_candidates(
         eval_context,
@@ -3532,7 +3566,12 @@ def solve_serving_plan(
         ),
         activation_model=opts.activation_model,
     )
-    win_range, cross_rate = sweep_prefix_hit_crossovers(geom, dtypes, chip, base_plan)
+    sweep_topos = (
+        opts.topologies if opts.topologies is not None else topologies_for_chip(chip)
+    )
+    win_range, cross_rate = sweep_prefix_hit_crossovers(
+        geom, dtypes, chip, base_plan, topologies=sweep_topos
+    )
     return replace(
         base_plan,
         winner_prefix_hit_range=win_range,

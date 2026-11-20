@@ -19,13 +19,13 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .chips import TOPOLOGIES
+from .chips import topologies_for_chip
 from .constants import UNIT_MICRO, UNIT_MILLIS_PER_SECOND
 from .modules import Parallel, StepShape
 from .step import FloorOptions, SpecShape, spec_cycle_floor, step_floor
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from .chips import ChipSpec, SliceTopology
     from .geometry import ModelGeometry
@@ -63,12 +63,16 @@ class ConcurrencyRow:
 def _resolve_topology(
     total_ranks: int,
     ranks_per_chip: int,
+    *,
+    chip: ChipSpec,
+    topologies: Mapping[str, SliceTopology] | None = None,
 ) -> SliceTopology | None:
-    """Return the smallest TOPOLOGIES slice accommodating total_ranks, or None."""
+    """Return the smallest chip topology accommodating total_ranks, or None."""
     eff_ranks = max(1, ranks_per_chip)
     needed_chips = math.ceil(float(max(1, total_ranks)) / float(eff_ranks))
+    topo_map = topologies if topologies is not None else topologies_for_chip(chip)
     for topo in sorted(
-        TOPOLOGIES.values(), key=lambda t: (t.num_chips, t.num_cores, t.name)
+        topo_map.values(), key=lambda t: (t.num_chips, t.num_cores, t.name)
     ):
         if topo.num_chips >= needed_chips and topo.num_cores >= total_ranks:
             return topo
@@ -81,9 +85,15 @@ def plan(
     parallel: Parallel,
     dt: Dtypes,
     request: ServingRequest,
+    *,
+    topologies: Mapping[str, SliceTopology] | None = None,
 ) -> list[ConcurrencyRow]:
     """Compute ConcurrencyRow ceilings across a list of concurrencies."""
-    eff_ranks = parallel.ranks_per_chip
+    eff_ranks = (
+        parallel.ranks_per_chip
+        if parallel.ranks_per_chip is not None
+        else chip.cores_per_chip
+    )
     total_ranks = max(
         1,
         parallel.tp * parallel.dp * parallel.pp * parallel.pcp,
@@ -121,7 +131,9 @@ def plan(
             )
             raise ValueError(msg)
     lat_s = (request.collective_latency_us or 0.0) * UNIT_MICRO
-    topology = _resolve_topology(total_ranks, eff_ranks)
+    topology = _resolve_topology(
+        total_ranks, eff_ranks, chip=chip, topologies=topologies
+    )
     opts = FloorOptions(dt=dt, collective_latency_s=lat_s, topology=topology)
     rows_out: list[ConcurrencyRow] = []
     for c in request.concurrencies:

@@ -24,6 +24,7 @@ from .geometry import layer_ffn_kinds
 from .memory import HbmBreakdown, SeqKvLayout, hbm_breakdown_per_core_bytes
 
 if TYPE_CHECKING:
+    from .chips import ChipSpec
     from .geometry import ModelGeometry
     from .modules import Dtypes, Parallel
 
@@ -77,6 +78,8 @@ def _pp_layer_prefixes(
     dtypes: Dtypes,
     par1: Parallel,
     layout: SeqKvLayout,
+    *,
+    chip: ChipSpec | None = None,
 ) -> _PpLayerPrefixes:
     """Compute prefix sums of weights, KV, state, and full-attention counts."""
     n_l = geom.num_layers
@@ -84,10 +87,10 @@ def _pp_layer_prefixes(
     w_embed = float(geom.vocab * geom.hidden) * dtypes.lm_head / float(tp)
     if geom.mtp_layers > 0:
         bd_with_mtp = hbm_breakdown_per_core_bytes(
-            geom, dtypes, par1, SeqKvLayout(0, 0)
+            geom, dtypes, par1, SeqKvLayout(0, 0), chip=chip
         )
         bd_no_mtp = hbm_breakdown_per_core_bytes(
-            replace(geom, mtp_layers=0), dtypes, par1, SeqKvLayout(0, 0)
+            replace(geom, mtp_layers=0), dtypes, par1, SeqKvLayout(0, 0), chip=chip
         )
         w_mtp_total = max(0.0, bd_with_mtp.weights - bd_no_mtp.weights)
     else:
@@ -114,7 +117,7 @@ def _pp_layer_prefixes(
             first_k_dense_replace=0 if f_kind == "moe" else 1,
             mtp_layers=0,
         )
-        bd_i = hbm_breakdown_per_core_bytes(g_i, dtypes, par1, layout)
+        bd_i = hbm_breakdown_per_core_bytes(g_i, dtypes, par1, layout, chip=chip)
         layer_w.append(max(0.0, bd_i.weights - w_head_both))
         layer_kv.append(bd_i.kv)
         layer_st.append(bd_i.state)
@@ -271,6 +274,8 @@ def pp_stage_breakdowns(
     parallel: Parallel,
     workload: tuple[int, int] = (0, 1),
     options: PpStageOptions | None = None,
+    *,
+    chip: ChipSpec | None = None,
 ) -> tuple[tuple[int, ...], HbmBreakdown, float, bool]:
     """Dynamic-programming contiguous PP layer partition and HBM breakdown."""
     context, seqs_per_dp = workload
@@ -279,10 +284,10 @@ def pp_stage_breakdowns(
     n_l = geom.num_layers
     layout = SeqKvLayout(seqs_per_dp=seqs_per_dp, context=context)
     if pp <= 1 or n_l <= 0:
-        bd = hbm_breakdown_per_core_bytes(geom, dtypes, parallel, layout)
+        bd = hbm_breakdown_per_core_bytes(geom, dtypes, parallel, layout, chip=chip)
         return ((n_l,), bd, bd.total, True)
     par1 = replace(parallel, pp=1)
-    pref = _pp_layer_prefixes(geom, dtypes, par1, layout)
+    pref = _pp_layer_prefixes(geom, dtypes, par1, layout, chip=chip)
     # Require every stage to retain at least one full-attention layer in disagg hybrid
     # serving regardless of whether pp <= n_full (raises infeasible when pp > n_full).
     req_full = opts.disagg and 0 < pref.full[n_l] < n_l
@@ -305,6 +310,7 @@ def partition_pp_layers(
     workload: tuple[int, int] = (0, 1),
     *,
     disagg: bool = False,
+    chip: ChipSpec | None = None,
 ) -> tuple[int, ...]:
     """Dynamic-programming contiguous PP layer partition minimizing max-stage HBM."""
     part, _, _, feasible = pp_stage_breakdowns(
@@ -313,6 +319,7 @@ def partition_pp_layers(
         parallel,
         workload=workload,
         options=PpStageOptions(disagg=disagg),
+        chip=chip,
     )
     if disagg and not feasible:
         msg = (
