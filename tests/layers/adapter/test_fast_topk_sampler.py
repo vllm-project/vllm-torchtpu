@@ -22,8 +22,9 @@ so they sample from the same distribution (only the RNG stream differs).
 Known bound: the stock top-k mask keeps every logit tied with the k-th
 largest, while the fast path sees at most `k_cap` candidates. Rows whose
 top-k plus its boundary ties exceed `k_cap` keep fewer tokens on the fast
-path. The bf16 cases below therefore stay at top_k <= 24 with k_cap = 32;
-top_k == k_cap is checked on tie-free float32 logits.
+path, so the runner only takes the fast path for top_k <= k_cap - k_cap // 4
+(24 at k_cap = 32). The bf16 cases below stay inside that bound; top_k ==
+k_cap is checked on tie-free float32 logits.
 """
 
 import pytest

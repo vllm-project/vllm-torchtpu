@@ -9037,17 +9037,23 @@ class TPUModelRunner(GPUModelRunner):
 
         Eligible when VLLM_TPU_FAST_TOPK_TOPP is enabled, no grammar mask
         applies, and every active non-greedy request in [cur_start_idx,
-        cur_end_idx) has 1 <= top_k <= k_cap.
+        cur_end_idx) has 1 <= top_k <= max_top_k = k_cap - k_cap // 4.
+
+        The stock top-k mask keeps every logit tied with the k-th largest; the
+        fast path only sees k_cap candidates. The k_cap // 4 headroom (8 at
+        k_cap = 32) leaves room for boundary ties, so rows close to k_cap fall
+        back to the full-vocab path instead of silently dropping tied tokens.
         """
         k_cap = self._fast_topk_max_k()
         if k_cap == 0 or grammar_output is not None or cur_end_idx <= cur_start_idx:
             return 0
+        max_top_k = max(1, k_cap - k_cap // 4)
         temps = self.input_batch.temperature_cpu_tensor[cur_start_idx:cur_end_idx]
         top_k = self.input_batch.top_k_cpu_tensor[cur_start_idx:cur_end_idx]
         non_greedy = temps > SAMPLING_EPS
         if not bool(non_greedy.any()):
             return 0
-        if not bool((~non_greedy | ((top_k >= 1) & (top_k <= k_cap))).all()):
+        if not bool((~non_greedy | ((top_k >= 1) & (top_k <= max_top_k))).all()):
             return 0
         logger.info_once(
             "Sampler fast small-k top-k/top-p path active (k_cap=%d).",

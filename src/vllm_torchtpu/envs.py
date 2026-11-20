@@ -1267,6 +1267,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-row top-k + top-p masking and Gumbel-max sampling on [B, max_k]
     # instead of 64 full-vocab binary-search passes and [B, vocab] uniform
     # RNG draws. Also skips top-k/top-p when no active request sets them.
+    # Rows with top_k > max_k - max_k // 4 (boundary-tie headroom) keep the
+    # full-vocab path.
     "VLLM_TPU_FAST_TOPK_TOPP": env_bool("VLLM_TPU_FAST_TOPK_TOPP", default=False),
     "VLLM_TPU_FAST_TOPK_TOPP_MAX_K": env_nonnegative_int(
         "VLLM_TPU_FAST_TOPK_TOPP_MAX_K", 64
