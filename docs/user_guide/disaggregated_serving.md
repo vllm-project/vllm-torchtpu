@@ -79,7 +79,7 @@ With `--attention-backend CUSTOM` and the seq-along-lane KV cache layout
 attention kernel page, and vLLM picks the largest supported page that divides
 each engine's block size: 128 or 256 tokens, or up to 4096 tokens on an engine
 with prefill context parallelism. The setting below applies only to an engine
-with a KV transfer config and this layout; any other engine logs a warning
+with a KV transfer config, this backend and this layout; any other engine logs a warning
 and keeps vLLM's page. When the prefill and decode block
 sizes differ (for example 2304 and 640 tokens), the two engines page
 differently and every transfer is refused with "Layout fingerprint mismatch".
