@@ -550,12 +550,17 @@ def spec_window_tile_cap(
     """
     state_positions = 1 + window
     rec_bytes = state_positions * n_v * d_k * d_v * rec_state_bytes
-    conv_bytes = state_positions * (kernel_size - 1) * dim * 4
+    conv_bytes = state_positions * (kernel_size - 1) * dim * _F32_BYTES
     bytes_per_seq = (
         rec_bytes
         + conv_bytes
         # qkv (fp32), b/a (fp32), out (act_out).
-        + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * act_out_bytes)
+        + window
+        * (
+            dim * _F32_BYTES
+            + 2 * aligned_num_v_heads * _F32_BYTES
+            + n_v * d_v * act_out_bytes
+        )
     )
     return ((vmem_budget // 2) // num_buffers) // bytes_per_seq
 
