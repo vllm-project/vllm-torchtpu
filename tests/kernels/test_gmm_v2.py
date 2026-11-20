@@ -749,6 +749,51 @@ def test_gmm_v2_compact_scales_with_k_off_512(size_k, tile_info):
     _assert_bitwise_equal(actual, expected)
 
 
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("compact_scale", [True, False], ids=["uint8_3d", "fp8_4d"])
+def test_gmm_v2_nvfp4_global_scale_fused_silu_matches_reference(compact_scale):
+    """The fused gate/up path slices a per-lane global scale for each half."""
+    _require_tpu()
+
+    batch_size, num_groups, size_k, size_n = 512, 8, 1024, 512
+    rhs_key, lhs_key = jax.random.split(jax.random.key(13))
+    packed, scale = make_nvfp4_rhs(rhs_key, num_groups, size_k, size_n)
+    global_scale = make_global_scale(jax.random.key(14), num_groups, size_n)
+    rhs = dequantize_nvfp4_kmajor(
+        packed, scale.astype(jnp.float32) * global_scale, jnp.bfloat16
+    )
+    lhs = jax.random.uniform(lhs_key, (batch_size, size_k), jnp.bfloat16, -1, 1)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    gate, up = jnp.split(
+        reference_gmm(lhs.astype(jnp.float32), rhs, group_sizes), 2, axis=-1
+    )
+    expected = apply_act_fn(interleave_lane(gate, up), "silu").astype(jnp.bfloat16)
+    if compact_scale:
+        rhs_scale = jax.lax.bitcast_convert_type(scale, jnp.uint8)
+    else:
+        rhs_scale = scale[:, :, None, :]
+
+    actual = gmm_v2(
+        lhs,
+        packed,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        rhs_global_scale=global_scale,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+        maybe_quantize_lhs=False,
+        fuse_act="silu",
+    )
+
+    assert actual.shape == (batch_size, size_n // 2)
+    scale_of_outputs = float(jnp.max(jnp.abs(expected.astype(jnp.float32))))
+    _assert_allclose(
+        actual.astype(jnp.float32),
+        expected.astype(jnp.float32),
+        atol=1e-3 * scale_of_outputs,
+        rtol=2e-2,
+    )
+
+
 def _validation_tpu_info(monkeypatch, mxu_column_size: int = 256) -> None:
     monkeypatch.setattr(
         "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
