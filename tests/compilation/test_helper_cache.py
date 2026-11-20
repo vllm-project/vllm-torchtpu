@@ -155,3 +155,10 @@ def test_a_graph_without_a_fingerprint_uses_the_plain_backend(helpers, monkeypat
     )
     assert run()() == "plain"
     assert compiled == []
+
+
+def test_helper_compile_cache_env_defaults_to_false(monkeypatch):
+    from vllm_torchtpu import envs
+
+    monkeypatch.delenv("TPU_HELPER_COMPILE_CACHE", raising=False)
+    assert envs.TPU_HELPER_COMPILE_CACHE is False
