@@ -108,10 +108,7 @@ def _wait_seconds(request: Request, now: float) -> float:
     that is the proxy's prefill hop. It covers time in the waiting queue and
     time in ``running``, and does not reset on preemption.
     """
-    arrival = getattr(request, "arrival_time", None)
-    if arrival is None:
-        return 0.0
-    return max(now - float(arrival), 0.0)
+    return max(now - request.arrival_time, 0.0)
 
 
 def _hit_signature(result) -> tuple:
