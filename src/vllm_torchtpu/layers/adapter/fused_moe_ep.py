@@ -227,7 +227,8 @@ def _build_op(
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
     moe_layer = fused_ep_moe_v2
-    impl_kw = {}
+    # v2's own knob, read here like the push build's below.
+    impl_kw: dict[str, Any] = {"plan_kernel": envs.MOE_FUSED_EP_V2_PLAN_KERNEL}
     if envs.MOE_FUSED_EP_KERNEL_IMPL == "push":
         # Same operands and admission as v2; only the dispatch differs. The
         # push build's own knobs are read here, never inside kernels/.
