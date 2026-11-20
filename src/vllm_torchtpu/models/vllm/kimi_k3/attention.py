@@ -808,7 +808,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         metadata: AttentionMetadata,
     ) -> torch.Tensor:
         """KDA over the unified pool: conv and recurrent state live in the
-        pool's per-block byte regions and are gathered/scattered by the op."""
+        pool's per-block byte regions, which the op updates."""
         if is_pcp_streaming_attention_metadata(metadata):
             raise NotImplementedError(
                 "KDA does not support PCP streaming prefill with the unified KV pool"
