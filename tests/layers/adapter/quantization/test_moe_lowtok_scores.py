@@ -308,15 +308,12 @@ def test_in_op_row_cap_dispatches_lowtok_or_fused_moe_func(
         )
 
 
-@pytest.mark.parametrize("weights_f32", ["0", "1"])
-def test_grouped_fallback_leaves_the_weight_dtype_to_fused_moe_func(
-    monkeypatch, weights_f32
-):
+def test_grouped_fallback_leaves_the_weight_dtype_to_fused_moe_func(monkeypatch):
     """Above the cap the routing weights reach fused_moe_func in float32, as
-    the softmax computes them, and fused_moe_func casts them by
-    TPU_MOE_TOPK_WEIGHTS_FLOAT32 exactly as it does for the grouped path; a
-    cast to the activations' bf16 in the op would discard the option."""
-    monkeypatch.setenv("TPU_MOE_TOPK_WEIGHTS_FLOAT32", weights_f32)
+    the softmax computes them, so fused_moe_func's own cast decides their dtype
+    (TPU_MOE_TOPK_WEIGHTS_FLOAT32, tested in tests/layers/core/
+    test_fused_moe_gmm.py), as for the grouped path; a cast to the
+    activations' bf16 in the op would discard the option."""
     monkeypatch.setenv("TPU_MOE_ROUTER_TOPK", "sort")
     monkeypatch.setattr(scores, "_ARMED_MAX_TOKENS", 0)
     monkeypatch.setattr(scores, "fused_moe_func", Mock(return_value="gmm"))
