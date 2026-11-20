@@ -193,7 +193,7 @@ def _build_sched(vllm_config, kv_cache_config, prefetch=0, reserve=8):
     if prefetch:
         assert s._kv_prefetch_n == 8
         s._kv_prefetch_n = prefetch
-    s._kv_prefetch_reserve = reserve
+        s._kv_prefetch_reserve = reserve
     return s
 
 

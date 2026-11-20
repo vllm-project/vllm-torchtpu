@@ -46,8 +46,9 @@ class SchedulerOptions:
     decode_inflight_throttle: bool = False
     """Throttle remote loads (``PrefixAwareScheduler`` on a KV consumer with
     decode context parallelism > 1; refused elsewhere): refuse a new load
-    while 16 are in flight, and otherwise reserve max(128, 8 x (running + in
-    flight)) blocks. The validation entries' DCP 4 decode legs set it."""
+    while 16 are in flight, and otherwise reserve the largest of vLLM's own
+    async-load reservation, 128 blocks and 8 blocks x (running + in flight).
+    The validation entries' DCP 4 decode legs set it."""
 
 
 def parse(raw: Any) -> SchedulerOptions:

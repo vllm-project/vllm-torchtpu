@@ -488,9 +488,10 @@ class PrefixAwareScheduler(AsyncScheduler):
 
     # Decode admission throttle (option tpu_scheduler.decode_inflight_throttle,
     # on a KV consumer with DCP > 1): refuse a new remote load while this many
-    # loads are in flight; otherwise reserve max(the reserved blocks, the
-    # per-sequence blocks x (running + in flight)). Every decode leg of the
-    # validation entries with DCP 4 runs these values.
+    # loads are in flight; otherwise reserve the largest of vLLM's own
+    # async-load reservation, the reserved-block minimum and the per-sequence
+    # blocks x (running + in flight). Every decode leg of the validation
+    # entries with DCP 4 runs these values.
     _DECODE_MAX_INFLIGHT_LOADS = 16
     _DECODE_RESERVED_BLOCKS = 128
     _DECODE_RESERVED_BLOCKS_PER_SEQ = 8
