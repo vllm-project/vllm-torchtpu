@@ -19,11 +19,24 @@ from typing import NamedTuple
 
 import pytest
 import torch
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
-from vllm.v1.request import RequestStatus
+from vllm import SamplingParams
+from vllm.utils.hashing import sha256
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MambaSpec,
+)
+from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu.core import hybrid_retention
-from vllm_torchtpu.core.hybrid_retention import HybridStateRetention, _ConvLRUEntry
+from vllm_torchtpu.core.hybrid_retention import (
+    HybridStateRetention,
+    _ConvLRUEntry,
+    retention_wanted,
+)
 from vllm_torchtpu.core.scheduler_utils import is_waiting_status
 
 BS = 256  # attention / mamba block size
@@ -135,9 +148,6 @@ def _no_blocks_needed(**kwargs):
 
 def _never_allocates(*args, **kwargs):
     return None
-
-
-POOL = None
 
 
 class FakeMambaManager:
@@ -849,8 +859,6 @@ def test_retention_guard_counts_async_admission_and_running_refusals():
 
 
 def test_retention_is_for_a_kv_producer():
-    from vllm_torchtpu.core.hybrid_retention import retention_wanted
-
     def cfg(role):
         kv = None if role is None else SimpleNamespace(kv_role=role)
         return SimpleNamespace(kv_transfer_config=kv)
@@ -956,9 +964,6 @@ _REAL_BS = 16
 
 
 def _real_manager(num_blocks: int):
-    from vllm.v1.core.kv_cache_manager import KVCacheManager
-    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
-
     cfg = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
@@ -977,11 +982,6 @@ def _real_manager(num_blocks: int):
 
 
 def _real_request(request_id: str, token_ids):
-    from vllm import SamplingParams
-    from vllm.utils.hashing import sha256
-    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
-    from vllm.v1.request import Request
-
     init_none_hash(sha256)
     sampling_params = SamplingParams(max_tokens=64)
     sampling_params.update_from_generation_config({}, eos_token_id=100_000)
