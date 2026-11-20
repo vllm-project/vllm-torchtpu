@@ -65,7 +65,7 @@ def synth_hybrid_spec(
     mixer = SwitchSlot("mixer", br, cnt)
     pb = pool.make_pool_backend(
         play,
-        check=getattr(g, "check", None),
+        check=g.check,
         rec_chunk=GDNModule.chunk_rows,
     )
     return ModelSpec(

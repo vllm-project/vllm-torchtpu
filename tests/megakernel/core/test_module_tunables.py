@@ -21,8 +21,15 @@ from pathlib import Path
 
 import pytest
 
-from tests.megakernel.core.megakernel_fakes import tile_field
-from tests.megakernel.core.megakernel_synth import EXACT_FLIPS
+from tests.megakernel.core.megakernel_synth import (
+    EXACT_FLIPS,
+    TINY_TILES,
+    SynthHybrid,
+    synth_full_scale_spec,
+    synth_hybrid_spec,
+    tile_field,
+    with_tile_fields,
+)
 from vllm_torchtpu.megakernel import core as mk
 from vllm_torchtpu.megakernel.core import exec_spec
 from vllm_torchtpu.megakernel.core.modules import GDNModule, GQAModule, MoEModule
@@ -91,6 +98,21 @@ def test_exact_flip_list_covers_registry():
     exact = {k for k, v in _library_numerics().items() if v == "exact"}
     # kv_scatter_vec_ns only affects the non-paged path (tested separately).
     assert exact == {f for _, f, _, _, _ in EXACT_FLIPS} | {"gqa.kv_scatter_vec_ns"}
+    seen_labels: set[str] = set()
+    for label, field_name, flip_val, (t_val, b_val), extra in EXACT_FLIPS:
+        assert label and label not in seen_labels
+        seen_labels.add(label)
+        assert t_val >= 1 and b_val >= t_val and b_val % t_val == 0
+        assert tile_field(TINY_TILES, field_name) != flip_val
+        tile_ov = {field_name: flip_val} | {
+            k: v for k, v in extra.items() if k != "geom_kw"
+        }
+        flipped = with_tile_fields(TINY_TILES, tile_ov)
+        assert tile_field(flipped, field_name) == flip_val
+        spec = synth_hybrid_spec(R=2, **extra.get("geom_kw", {}))
+        assert isinstance(spec.config, SynthHybrid)
+    full_spec = synth_full_scale_spec(moe_tp=False, R=8)
+    assert full_spec.config.L == 60 and full_spec.config.E == 512
 
 
 def test_tiles_field_defaults_turn_perf_flags_off():
