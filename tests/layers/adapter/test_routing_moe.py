@@ -78,6 +78,7 @@ def _armed():
         patch.object(envs, "ROUTING_MOE_FP8_COMBINE", False),
         patch.object(envs, "ROUTING_MOE_FP8_DISPATCH", False),
         patch.object(envs, "ROUTING_MOE_GMM_PLAN", ""),
+        patch.object(envs, "ROUTING_MOE_FP8_DISPATCH_MIN_ROWS", 256),
     ):
         yield
 
@@ -179,6 +180,7 @@ def test_fp8_dispatch_follows_the_flag(fp8_dispatch):
             build_op=lambda *args, **kw: seen.append(kw) or "op",
         )
     assert seen[0]["fp8_dispatch"] is fp8_dispatch
+    assert seen[0]["fp8_dispatch_min_rows"] == 256
 
 
 def test_fp8_dispatch_needs_remote_scatter():

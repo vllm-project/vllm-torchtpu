@@ -40,9 +40,11 @@ rows are quantized, so the output is close to, not equal to, bf16 combine.
 
 ROUTING_MOE_FP8_DISPATCH=1 all-gathers the tokens in fp8 with one f32 scale per
 token instead of bf16 (as fused_moe_ep's rowquant), and dequantizes them before
-tokamax's layer. Per-row scales keep every array 2-D: a per-column-block scale
-needs a [tokens, blocks, 128] view, which on TPU's tiled layouts is a physical
-relayout of the whole gathered array (measured: costlier than the bf16 gather).
+tokamax's layer, for token buckets where each device routes at least
+ROUTING_MOE_FP8_DISPATCH_MIN_ROWS rows (decode buckets keep the bf16 gather).
+Per-row scales keep every array 2-D: a per-column-block scale needs a
+[tokens, blocks, 128] view, which on TPU's tiled layouts is a physical relayout
+of the whole gathered array (measured: costlier than the bf16 gather).
 tokamax's own sequence-parallel path gathers bf16 rows (its input_pack and
 routing_gmm take no quantized x), so this path gathers itself and runs
 tokamax's per-device layer (`_routing_moe_local`) with the rows replicated,
@@ -246,6 +248,7 @@ def _routing_moe_jax(
     fp8_combine: bool,
     fp8_dispatch: bool,
     gmm_plan: tuple,
+    fp8_dispatch_min_rows: int = 0,
 ) -> jax.Array:
     """tokamax routing_moe over the EP mesh on this rank's routed rows (x, top-k
     weights and ids sharded on axis 0); returns this rank's rows. Pure JAX, so
@@ -269,7 +272,7 @@ def _routing_moe_jax(
     moe_plan = tk_plan.RoutingMoEPlan(
         remote_scatter=remote_scatter, scatter_format=_scatter_format(fp8_combine)
     )
-    if not fp8_dispatch:
+    if not (fp8_dispatch and rows >= fp8_dispatch_min_rows):
         return tk_modular.routing_moe(
             x,
             weights,
@@ -361,6 +364,7 @@ def _build_op(
     fp8_combine: bool = False,
     fp8_dispatch: bool = False,
     gmm_plan: tuple = (),
+    fp8_dispatch_min_rows: int = 0,
 ):
     key = (
         topk,
@@ -373,6 +377,7 @@ def _build_op(
         fp8_combine,
         fp8_dispatch,
         gmm_plan,
+        fp8_dispatch_min_rows,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -438,6 +443,7 @@ def _build_op(
             fp8_combine=fp8_combine,
             fp8_dispatch=fp8_dispatch,
             gmm_plan=gmm_plan,
+            fp8_dispatch_min_rows=fp8_dispatch_min_rows,
         )
         return jax.shard_map(
             lambda out_l: layout.restore(out_l, EP_AXIS_NAME),
@@ -513,13 +519,15 @@ def prebuild_routing_moe(
     )
     logger.info_once(
         "[MoE]: routing_moe over %d devices, %d experts each, token replica "
-        "groups %s; %s scatter, %s combine rows, %s dispatch rows; gmm plan %s.",
+        "groups %s; %s scatter, %s combine rows, %s dispatch rows (from %d rows "
+        "per device); gmm plan %s.",
         ep,
         local_experts,
         replica_groups,
         "remote" if envs.ROUTING_MOE_REMOTE_SCATTER else "local",
         "fp8" if envs.ROUTING_MOE_FP8_COMBINE else "bf16",
         "fp8" if envs.ROUTING_MOE_FP8_DISPATCH else "bf16",
+        envs.ROUTING_MOE_FP8_DISPATCH_MIN_ROWS,
         envs.ROUTING_MOE_GMM_PLAN or "tokamax heuristics",
     )
     return _build_op(
@@ -534,6 +542,7 @@ def prebuild_routing_moe(
         fp8_combine=envs.ROUTING_MOE_FP8_COMBINE,
         fp8_dispatch=envs.ROUTING_MOE_FP8_DISPATCH,
         gmm_plan=parse_gmm_plan(envs.ROUTING_MOE_GMM_PLAN),
+        fp8_dispatch_min_rows=envs.ROUTING_MOE_FP8_DISPATCH_MIN_ROWS,
     )
 
 

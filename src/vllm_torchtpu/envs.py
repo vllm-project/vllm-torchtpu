@@ -113,6 +113,7 @@ if TYPE_CHECKING:
     ROUTING_MOE_REMOTE_SCATTER: bool = True
     ROUTING_MOE_FP8_COMBINE: bool = False
     ROUTING_MOE_FP8_DISPATCH: bool = False
+    ROUTING_MOE_FP8_DISPATCH_MIN_ROWS: int = 256
     ROUTING_MOE_GMM_PLAN: str = ""
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -899,6 +900,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (which takes bf16 rows). Halves the dispatch bytes; lossy. Remote scatter
     # only.
     "ROUTING_MOE_FP8_DISPATCH": env_bool("ROUTING_MOE_FP8_DISPATCH"),
+    # ...only for token buckets where each device routes at least this many
+    # rows; smaller (decode) buckets keep the bf16 gather. fp8 rows tile in
+    # 32-row groups, and a few dozen rows per device pay more in relayouts
+    # than the halved gather saves (measured at 47 rows: +25%).
+    "ROUTING_MOE_FP8_DISPATCH_MIN_ROWS": lambda: int(
+        os.getenv("ROUTING_MOE_FP8_DISPATCH_MIN_ROWS", "256")
+    ),
     # routing_moe: tokamax RoutingGmmPlan overrides as JSON, either one object
     # of plan fields for every token count, or {"by_rows": [[max_rows, {...}],
     # ...], "default": {...}} keyed by the rows each device contributes.
