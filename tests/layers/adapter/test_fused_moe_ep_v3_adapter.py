@@ -13,9 +13,10 @@
 # limitations under the License.
 """Host-side rules of the fused EP v3 bridge (layers/adapter/fused_moe_ep_v3.py):
 the per-layout step gate, the meeting point with the few-token kernel, the
-copy-slot slice of a placed layer's weights, and the routing and the kernel
-limits it admits."""
+copy-slot slice of a placed layer's weights, the routing and the kernel
+limits it admits, and the operands and graph inputs of each call."""
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -33,6 +34,7 @@ from vllm_torchtpu.layers.adapter import (
     expert_placement,
     moe_routing,
     sequence_parallel,
+    token_padding,
 )
 from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as v3
 
@@ -444,3 +446,196 @@ def test_experts_whose_weight_slots_do_not_fit_vmem_are_refused(armed):
     layer = _big_layer(4, 7168, 2048)
     assert not _prebuild(layer)
     assert "local_experts" not in armed
+
+
+def test_supported_answers_per_layer_after_prebuild(armed):
+    assert not v3.fused_moe_ep_supported()
+    armed_layer, refused_layer = _layer(slots=4), _layer(slots=4)
+    assert _prebuild(armed_layer)
+    assert not _prebuild(refused_layer, renormalize=False)
+    assert v3.fused_moe_ep_supported()
+    assert v3.fused_moe_ep_supported(armed_layer)
+    assert not v3.fused_moe_ep_supported(refused_layer)
+
+
+TPU7X_RANK_ORDER = (0, 1, 4, 5, 6, 7, 2, 3)
+
+
+@pytest.mark.parametrize(
+    ("order", "expected"),
+    [(None, None), (tuple(range(8)), None), (TPU7X_RANK_ORDER, TPU7X_RANK_ORDER)],
+    ids=["no_ep", "identity", "tpu7x_host"],
+)
+def test_the_expert_block_permutation(monkeypatch, order, expected):
+    monkeypatch.setattr(v3, "ep_rank_order", lambda: order)
+    permutation = v3._expert_block_permutation(8, "cpu")
+    if expected is None:
+        assert permutation is None
+    else:
+        assert permutation.dtype == torch.int32
+        assert tuple(permutation.tolist()) == expected
+
+
+@pytest.mark.parametrize("order", [(0, 0, 1, 2), (0, 1, 2)])
+def test_an_ep_rank_order_that_is_not_a_permutation_is_refused(monkeypatch, order):
+    monkeypatch.setattr(v3, "ep_rank_order", lambda: order)
+    with pytest.raises(ValueError, match="is not a permutation of range"):
+        v3._expert_block_permutation(4, "cpu")
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+def test_router_logits_move_to_mesh_order(monkeypatch, compiled):
+    """On a TPU7x host EP rank 2's experts sit at mesh index 6: mesh index m
+    reads the expert block of EP rank order[m], for every token count of one
+    compiled graph."""
+    ep, local = 8, 3
+    monkeypatch.setattr(v3, "_EP_SIZE", ep)
+    monkeypatch.setattr(
+        v3, "_EXPERT_ORDER", torch.tensor(TPU7X_RANK_ORDER, dtype=torch.int32)
+    )
+    reorder = v3._to_mesh_expert_order
+    if compiled:
+        torch._dynamo.reset()
+        reorder = torch.compile(reorder, backend="eager", fullgraph=True, dynamic=True)
+    for tokens in (5, 9):
+        # Logit (t, r * local + j) = 100 * r + j + 1000 * t: EP rank r, expert j.
+        rank_expert = torch.arange(ep * local).view(ep, local)
+        ids = (100 * (rank_expert // local) + rank_expert % local).flatten()
+        logits = (ids + 1000 * torch.arange(tokens)[:, None]).float()
+        out = reorder(logits).view(tokens, ep, local)
+        for m, r in enumerate(TPU7X_RANK_ORDER):
+            torch.testing.assert_close(out[:, m], logits.view(tokens, ep, local)[:, r])
+
+
+def test_router_logits_keep_their_order_without_a_permutation(monkeypatch):
+    monkeypatch.setattr(v3, "_EXPERT_ORDER", None)
+    logits = torch.randn(4, 16)
+    assert v3._to_mesh_expert_order(logits) is logits
+
+
+@pytest.fixture
+def padding(monkeypatch):
+    """The runner's padding state, real: 3 valid rows of 8."""
+    monkeypatch.setattr(token_padding, "_padding_state", None)
+    state = token_padding.TokenPaddingState.create(8, "cpu")
+    token_padding.set_padding_state(state)
+    token_padding.mark_padding(3, 8)
+    return state
+
+
+@pytest.fixture
+def built_op(monkeypatch):
+    """`_build_op`'s real op function around a kernel that records its call:
+    what `fused_moe_ep`'s operands arrive at `fused_ep_moe` as."""
+    for name in ("_OP", "_SKIP_PADDED_TOKENS", "_RANK_BUFFER", "_EXPERT_ORDER"):
+        monkeypatch.setattr(v3, name, getattr(v3, name))
+    monkeypatch.setattr(v3, "_EP_SIZE", EP)
+    calls = []
+    monkeypatch.setattr(
+        v3, "fused_ep_moe", lambda *args, **kwargs: calls.append((args, kwargs))
+    )
+
+    def sharded_jax_op(name, fn, *, input_partition_specs, fake, **_):
+        # One spec per operand of the op function, as the torch op is called.
+        assert len(input_partition_specs) == len(inspect.signature(fn).parameters)
+        return fn
+
+    monkeypatch.setattr(v3, "sharded_jax_op", sharded_jax_op)
+
+    def build(skip_padded_tokens):
+        v3._build_op(
+            _mesh(),
+            2,
+            True,
+            "silu",
+            skip_padded_tokens,
+            hidden=128,
+            inter=256,
+            local_experts=4,
+        )
+        return calls
+
+    return build
+
+
+def _layer_operands(tokens=8):
+    layer = _layer(slots=4)
+    return (
+        torch.randn(tokens, 128),
+        layer.w13_weight,
+        layer.w2_weight,
+        layer.w13_weight_scale_inv,
+        layer.w2_weight_scale_inv,
+        torch.randn(tokens, 4 * EP),
+    )
+
+
+@pytest.mark.parametrize("skip_padded_tokens", [False, True], ids=["all", "valid"])
+def test_fused_moe_ep_hands_the_kernel_its_operands(
+    built_op, padding, monkeypatch, skip_padded_tokens
+):
+    """Each operand reaches its kernel argument through the op function the
+    padding setting picked: the rank buffer is the shard index, the valid
+    count goes only with padding skipped, the router logits arrive in mesh
+    order, the scales per output channel, and NaN rows are dropped either
+    way."""
+    calls = built_op(skip_padded_tokens)
+    rank = torch.tensor([[1]], dtype=torch.int32)
+    monkeypatch.setattr(v3, "_RANK_BUFFER", rank)
+    monkeypatch.setattr(v3, "_EXPERT_ORDER", torch.tensor([1, 0], dtype=torch.int32))
+    x, w1, w2, s1, s2, logits = _layer_operands()
+    v3.fused_moe_ep(x, w1, w2, s1, s2, logits)
+    ((args, kwargs),) = calls
+    assert args[0] is x and args[1] is w1 and args[2] is w2
+    assert tuple(args[3].shape) == (4, 512) and tuple(args[4].shape) == (4, 128)
+    torch.testing.assert_close(args[5], logits.view(8, 2, 4).flip(1).reshape(8, 8))
+    assert kwargs["shard_index"] is rank
+    if skip_padded_tokens:
+        assert kwargs["valid_tokens"] is padding.local_valid_tokens
+        assert kwargs["valid_tokens"].tolist() == [3]
+    else:
+        assert kwargs["valid_tokens"] is None
+    assert kwargs["drop_nan_rows"] is True
+
+
+def test_skipping_padding_without_the_runner_state_raises(built_op, monkeypatch):
+    built_op(True)
+    monkeypatch.setattr(token_padding, "_padding_state", None)
+    with pytest.raises(RuntimeError, match="did not install padding state"):
+        v3.fused_moe_ep(*_layer_operands())
+    with pytest.raises(RuntimeError, match="did not install padding state"):
+        v3.retain_fused_ep_graph_inputs(torch.zeros(4, 8))
+
+
+@pytest.mark.parametrize("skip_padded_tokens", [False, True], ids=["all", "valid"])
+def test_the_graph_reads_the_buffers_and_keeps_the_output(
+    padding, monkeypatch, skip_padded_tokens
+):
+    """The rank buffer, the expert order and, with padding skipped, the valid
+    count become inputs the compiled graph computes the MoE output from,
+    which comes out bit-identical."""
+    monkeypatch.setattr(v3, "_SKIP_PADDED_TOKENS", skip_padded_tokens)
+    monkeypatch.setattr(v3, "_RANK_BUFFER", torch.tensor([[5]], dtype=torch.int32))
+    monkeypatch.setattr(v3, "_EXPERT_ORDER", torch.tensor([1, 0], dtype=torch.int32))
+    graph_inputs = []
+    torch._dynamo.reset()
+
+    def backend(gm, example_inputs):
+        # The graph inputs the output is computed from.
+        (output,) = [node for node in gm.graph.nodes if node.op == "output"]
+        seen, todo = set(), [output]
+        while todo:
+            for node in todo.pop().all_input_nodes:
+                if node not in seen:
+                    seen.add(node)
+                    todo.append(node)
+        graph_inputs.append(sum(node.op == "placeholder" for node in seen))
+        return gm.forward
+
+    out = torch.randn(4, 8, dtype=torch.bfloat16)
+    compiled = torch.compile(
+        v3.retain_fused_ep_graph_inputs, backend=backend, fullgraph=True
+    )
+    assert torch.equal(compiled(out), out)
+    # The output, the rank buffer, the expert order, and the valid count.
+    assert graph_inputs == [4 if skip_padded_tokens else 3]
