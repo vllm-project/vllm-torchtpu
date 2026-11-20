@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
+    TPU_DCP_LSE_MERGE_A2A_FUSED_LSE: bool = False
     TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
     JAX_PLATFORMS: str = ""
@@ -457,6 +458,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # faster. Only the backbone uses the all-to-all; the MTP drafter, traced
     # once for every bucket, always takes the reduce-scatter.
     "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64),
+    # The all-to-all merge above sends the partial outputs and the f32
+    # log-sum-exps in one all-to-all instead of two: each f32 lse is bitcast
+    # to the partials' dtype and appended to the same payload, then bitcast
+    # back after the exchange. Saves one collective's fixed cost per layer.
+    # Bit-identical outputs. No effect unless TPU_DCP_LSE_MERGE_A2A is set.
+    "TPU_DCP_LSE_MERGE_A2A_FUSED_LSE": env_bool(
+        "TPU_DCP_LSE_MERGE_A2A_FUSED_LSE", default=False
+    ),
     # Backbone MLA merge: reduce-scatter the weighted outputs in the output's
     # precision (bf16), half f32's bytes. MTP drafter stays f32; 0 = f32.
     "TPU_DCP_RS_OUT_PRECISION": env_bool("TPU_DCP_RS_OUT_PRECISION", default=True),

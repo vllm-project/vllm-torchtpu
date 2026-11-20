@@ -22,6 +22,9 @@ threaded stand-in for the exchange; this pins what only hardware can answer:
      merge to within one bf16 ulp, including `-inf` rows and a rank that owns
      nothing -- and the same check fails when the send blocks are rotated by
      one rank (the positive control).
+  3. With `TPU_DCP_LSE_MERGE_A2A_FUSED_LSE`, the partials and the lse travel
+     in one all-to-all, and the merged result is bit-identical to the
+     two-all-to-all form, eager and compiled.
 
 Run on one host (4 chips x 2 cores = 8 ranks). `--bench` adds a per-merge
 timing of every path at decode and mixed-step token counts.
@@ -47,10 +50,11 @@ VDIM = 512
 CHECK_TOKENS = 64
 LAUNCH_TIMEOUT_SECONDS = 900
 
-# name -> TPU_DCP_LSE_MERGE_A2A
+# name -> (TPU_DCP_LSE_MERGE_A2A, TPU_DCP_LSE_MERGE_A2A_FUSED_LSE)
 ARMS = {
-    "today": False,
-    "a2a": True,
+    "today": (False, False),
+    "a2a": (True, False),
+    "a2a_fused": (True, True),
 }
 
 
@@ -183,7 +187,9 @@ MERGE_VARIANTS = {"a2a_reduce_sum": _merge_reduce_sum, "a2a_unrolled": _merge_un
 
 
 def _set_arm(cp_mla, arm):
-    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A = ARMS[arm]
+    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A, cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_FUSED_LSE = (
+        ARMS[arm]
+    )
     cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS = 1 << 30
     cp_mla.envs.TPU_DCP_RS_OUT_PRECISION = False  # "today" stays the f32 reference
 
@@ -208,6 +214,7 @@ def _check(rank, world, group, cp_mla):
     l_dev = lses[rank].to("tpu")
     merge = cp_mla.merge_lse_partials_scatter_heads
     report = {}
+    outs = {}
     for arm in ARMS:
         _set_arm(cp_mla, arm)
         for how in ("eager", "compiled"):
@@ -219,9 +226,19 @@ def _check(rank, world, group, cp_mla):
                     "dtype": str(got.dtype),
                     **_error_stats(got, ref),
                 }
+                outs[f"{arm}/{how}"] = got
             except Exception as exc:  # noqa: BLE001 - reported to the parent
                 traceback.print_exc()
                 report[f"{arm}/{how}"] = {"error": repr(exc)[:400]}
+
+    # The single all-to-all form must not change one bit of the result.
+    for how in ("eager", "compiled"):
+        a, b = outs.get(f"a2a/{how}"), outs.get(f"a2a_fused/{how}")
+        report[f"fused_bit_identical/{how}"] = bool(
+            a is not None
+            and b is not None
+            and torch.equal(a.view(torch.int16), b.view(torch.int16))
+        )
 
     # Diagnostics, reported but not asserted: the compiled local merge with an
     # explicit per-rank f32 accumulation, and under HIGHEST op precision. They
@@ -253,7 +270,7 @@ def _check(rank, world, group, cp_mla):
     real = cp_mla._all_to_all
     cp_mla._all_to_all = lambda x, g: real(torch.roll(x, 1, dims=0), g)
     try:
-        for arm in ("a2a",):
+        for arm in ("a2a", "a2a_fused"):
             _set_arm(cp_mla, arm)
             for how in ("eager", "compiled"):
                 try:
@@ -292,7 +309,7 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
         o = torch.randn(tokens, HEADS, VDIM).to(torch.bfloat16).to("tpu")
         lse = (torch.randn(tokens, HEADS) * 3).to("tpu")
         real_merge = cp_mla._merge_received
-        for arm in ("today", "a2a", *MERGE_VARIANTS):
+        for arm in ("today", "a2a", "a2a_fused", *MERGE_VARIANTS):
             _set_arm(cp_mla, "a2a" if arm in MERGE_VARIANTS else arm)
             cp_mla._merge_received = MERGE_VARIANTS.get(arm, real_merge)
             try:
@@ -421,7 +438,7 @@ def assert_merge_results(results: list[dict]) -> None:
     assert not errors, f"worker failures: {errors}"
     for r in results:
         check = r["check"]
-        for arm in ("today", "a2a"):
+        for arm in ("today", "a2a", "a2a_fused"):
             for how in ("eager", "compiled"):
                 c = check[f"{arm}/{how}"]
                 assert "error" not in c, (r["rank"], arm, how, c)
@@ -435,7 +452,8 @@ def assert_merge_results(results: list[dict]) -> None:
                 a2a["frac_over_1ulp"] <= today["frac_over_1ulp"]
                 and a2a["max_abs_err"] <= today["max_abs_err"]
             ), (r["rank"], how, today, a2a)
-        for arm in ("a2a",):
+            assert check[f"fused_bit_identical/{how}"], (r["rank"], how)
+        for arm in ("a2a", "a2a_fused"):
             for how in ("eager", "compiled"):
                 c = check[f"control_rotated/{arm}/{how}"]
                 assert "error" not in c, (r["rank"], arm, how, c)
