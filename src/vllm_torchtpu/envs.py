@@ -353,6 +353,8 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_TIER_KEY_ROWS: bool = False
     VLLM_TPU_OFFLOAD_TIER_CHECK: bool = False
     VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE: bool = False
+    VLLM_TPU_OFFLOAD_TIER_X2: bool = False
+    VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS: int = 1000
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TPU_MAMBA_CHECKPOINT_RETENTION: bool = True
     VLLM_TPU_MAMBA_DECODE_CHECKPOINT: bool = True
@@ -2428,6 +2430,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with KVCacheStore.evict. Host-only.
     "VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE": env_bool(
         "VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE", default=False
+    ),
+    # With VLLM_TPU_OFFLOAD_TIER_CLASSES: a second host tier in another host's DRAM
+    # (TIER-X2). Each class store joins the global registry
+    # (kv_connector_extra_config global_registry_address / store_server_ip /
+    # kv_pool_group), Raiden's evict sweep (RAIDEN_ENABLE_STORE_MONITOR /
+    # RAIDEN_ENABLE_EVICT_SWEEP) demotes cold host blocks to the store nodes of the
+    # class's pool group, and a host-tier miss reads them back from there with
+    # read_remote. Classes are split into shards of equal per-worker geometry, the
+    # only form Raiden's transfer spec describes. The bytes a load lands are the
+    # bytes the block was saved with (cache placement only). Host-only.
+    "VLLM_TPU_OFFLOAD_TIER_X2": env_bool("VLLM_TPU_OFFLOAD_TIER_X2", default=False),
+    # TIER-X2: how long a key that missed both the host tier and the registry is
+    # answered as a miss without asking the registry again (milliseconds; 0 asks
+    # every time). A key stored or demoted meanwhile is at worst found late.
+    "VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS": env_int(
+        "VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS", 1000
     ),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.

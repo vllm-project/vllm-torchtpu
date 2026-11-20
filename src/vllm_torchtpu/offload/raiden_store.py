@@ -147,6 +147,38 @@ _DEFAULT_CONTROLLER_PORT = 31515
 
 _EPHEMERAL_PORT_RANGE = "/proc/sys/net/ipv4/ip_local_port_range"
 
+# TIER-X2 counters, in telemetry order.
+X2_COUNTERS = (
+    "registry_lookups",
+    "registry_us",
+    "registry_misses",
+    "miss_cached",
+    "remote_hit_keys",
+    "remote_reads",
+    "remote_read_blocks",
+    "remote_read_blocks_done",
+    "remote_read_blocks_failed",
+)
+
+# TIER-X2: most keys remembered as registry misses at once; past it the expired
+# ones are dropped, and all of them if none had expired.
+_X2_MISSED_CAP = 1 << 20
+
+# TIER-X2: the Raiden switches that make a store demote its cold host blocks to the
+# store nodes of its pool group. Without both, nothing ever reaches the second tier.
+X2_SWEEP_ENV = ("RAIDEN_ENABLE_STORE_MONITOR", "RAIDEN_ENABLE_EVICT_SWEEP")
+
+
+def x2_sweep_env_on() -> bool:
+    """Whether Raiden will run the evict sweep (it reads "true" or "1")."""
+    return all(os.environ.get(name, "") in ("true", "1") for name in X2_SWEEP_ENV)
+
+
+def x2_shard_namespace(key_namespace: bytes, shard: str) -> bytes:
+    """A shard's own key namespace: the shards of one class hold the same keys, and
+    the registry maps a key's bytes to one owner, so each shard's keys must differ."""
+    return hashlib.sha256(key_namespace + b"|tier-x2|" + shard.encode()).digest()[:16]
+
 
 def ephemeral_port_range(path: str = _EPHEMERAL_PORT_RANGE) -> tuple[int, int] | None:
     """The kernel's ephemeral port range in this network namespace, or None."""
@@ -392,6 +424,12 @@ class RaidenOffloadingManager(OffloadingManager):
         # Keep the store time of every key the store holds (host-tier class
         # telemetry: occupancy, stores, evictions, the oldest entry).
         track_held: bool = False,
+        # TIER-X2 (VLLM_TPU_OFFLOAD_TIER_X2): the second tier behind this store is
+        # the registry's: a key missing from the host pool is looked for there,
+        # at most once per x2_miss_ttl_s while it keeps missing. Needs the
+        # global registry.
+        tier_x2: bool = False,
+        x2_miss_ttl_s: float = 0.0,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -556,6 +594,20 @@ class RaidenOffloadingManager(OffloadingManager):
         )
         self._held_discarded = 0
 
+        # TIER-X2: off unless tier_x2. Keys that missed the host pool and the
+        # registry, with the monotonic time until which they are answered as
+        # misses without a registry call.
+        if tier_x2 and not self._enable_global:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_X2 needs the "
+                "global registry (global_registry_address): the second tier is "
+                "found through it"
+            )
+        self._x2 = bool(tier_x2)
+        self._x2_miss_ttl_s = float(x2_miss_ttl_s)
+        self._x2_missed: dict[OffloadKey, float] = {}
+        self._x2_counts = dict.fromkeys(X2_COUNTERS, 0)
+
     # -- sub-hash / block-id expansion ----------------------------------
 
     def _sub_hashes(self, key: OffloadKey) -> list[bytes]:
@@ -681,6 +733,58 @@ class RaidenOffloadingManager(OffloadingManager):
         return RequestOffloadingContext()
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        if self.__dict__.get("_x2", False):
+            return self._x2_lookup(key, req_context)
+        return self._lookup_verdict(key, req_context)
+
+    def _x2_lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        """TIER-X2 lookup: the host pool first, then the registry.
+
+        A key whose every sub-hash the host pool holds (or a save of which is in
+        flight) gets the single store's verdict without a registry call: Raiden asks
+        the registry only about local misses, and there are none. Otherwise the
+        registry is asked, unless the key missed both within the last
+        x2_miss_ttl_s. Every answer is the single store's own: a peer's block is
+        read back with read_remote, landing the bytes it was saved with.
+        """
+        if key in self._inflight_store_keys:
+            return LookupResult.HIT_PENDING
+        counts = self._x2_counts
+        sub_hashes = self._sub_hashes(key)
+        if len(self._probe(sub_hashes)) == len(sub_hashes):
+            return self._lookup_verdict(key, req_context)
+        now = time.monotonic()
+        until = self._x2_missed.get(key)
+        if until is not None and until > now:
+            counts["miss_cached"] += 1
+            return LookupResult.MISS
+        t0 = time.perf_counter()
+        result = self._lookup_verdict(key, req_context)
+        counts["registry_lookups"] += 1
+        counts["registry_us"] += int((time.perf_counter() - t0) * 1e6)
+        if result == LookupResult.MISS:
+            counts["registry_misses"] += 1
+            if self._x2_miss_ttl_s > 0:
+                if len(self._x2_missed) >= _X2_MISSED_CAP:
+                    self._x2_missed = {
+                        k: t for k, t in self._x2_missed.items() if t > now
+                    }
+                    if len(self._x2_missed) >= _X2_MISSED_CAP:
+                        self._x2_missed.clear()
+                self._x2_missed[key] = now + self._x2_miss_ttl_s
+        else:
+            self._x2_missed.pop(key, None)
+            if result == LookupResult.HIT and any(
+                h in self._remote_slices for h in sub_hashes
+            ):
+                counts["remote_hit_keys"] += 1
+        return result
+
+    def x2_stats(self) -> dict[str, int]:
+        """TIER-X2 counters (lookups, registry calls, peer reads)."""
+        return dict(self._x2_counts)
+
+    def _lookup_verdict(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         if key in self._inflight_store_keys:
             return LookupResult.HIT_PENDING
         sub_hashes = self._sub_hashes(key)
@@ -1286,6 +1390,9 @@ class RaidenOffloadingManager(OffloadingManager):
         ):
             _fail_launch("read_remote()", remote_hashes, local_hashes)
             return
+        if remote_hashes and self.__dict__.get("_x2", False):
+            self._x2_counts["remote_reads"] += 1
+            self._x2_counts["remote_read_blocks"] += len(remote_hashes)
         admission = Admission(
             job_id=job_id,
             op=AdmissionOp.LOAD,
@@ -1353,6 +1460,15 @@ class RaidenOffloadingManager(OffloadingManager):
                 )
             )
         else:
+            if admission.remote_sub_hashes and self.__dict__.get("_x2", False):
+                # Peer blocks whose read failed, and the ones that landed.
+                failed = len(
+                    admission.remote_sub_hashes.intersection(admission.failed_sub_hashes)
+                )
+                self._x2_counts["remote_read_blocks_failed"] += failed
+                self._x2_counts["remote_read_blocks_done"] += (
+                    len(admission.remote_sub_hashes) - failed
+                )
             if success and self.__dict__.get("_excl", False):
                 # The bytes are in HBM now: the host copy only duplicates them.
                 # Peer and storage reads left no local entry to evict.
@@ -1842,6 +1958,9 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         row_bytes: int | None = None,
         # Names the registration thread and log lines (a host-tier class).
         label: str = "",
+        # The node id this worker registers under (the rank when None). A TIER-X2
+        # shard numbers its workers densely, as Raiden's transfer spec wants.
+        node_id: int | None = None,
     ):
         import numpy as np
         import torch
@@ -1850,6 +1969,7 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         self._backend_configs = list(backend_configs)
         self._label = label
         self._row_bytes = row_bytes
+        self._node_id = node_id
 
         (kernel_block_size, per_block_shape, kv_dtype, device_block_size) = (
             resolve_kernel_geometry(vllm_config, kv_cache_config)
@@ -2051,7 +2171,11 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                         raiden_worker_port=0,
                         raiden_controller_address=self._controller_address,
                         worker_id=f"shard_{self._rank}",
-                        node_id=self._rank,
+                        node_id=(
+                            self._rank
+                            if self.__dict__.get("_node_id") is None
+                            else self._node_id
+                        ),
                         **storage_kwargs,
                     )
                     logger.info(
@@ -2718,6 +2842,12 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
         # Host tier in size classes (VLLM_TPU_OFFLOAD_TIER_CLASSES): None when off.
         self.tier_plan: TierPlan | None = None
+        self.tier_x2 = bool(envs.VLLM_TPU_OFFLOAD_TIER_X2)
+        if self.tier_x2 and not envs.VLLM_TPU_OFFLOAD_TIER_CLASSES:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_X2 is a mode of "
+                "the host tier classes and needs VLLM_TPU_OFFLOAD_TIER_CLASSES=1"
+            )
         if envs.VLLM_TPU_OFFLOAD_TIER_CLASSES:
             self.tier_plan = self._build_tier_plan(
                 config, vllm_config, int(cpu_bytes_to_use)
@@ -2750,10 +2880,36 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         )
 
         refused = []
-        if self.global_registry_address:
-            refused.append("a global registry (global_registry_address)")
-        if self.kv_pool_group:
-            refused.append("a peer store group (kv_pool_group)")
+        if self.tier_x2:
+            # TIER-X2 is the classes' second tier through the registry: it needs
+            # the registry, an address peers dial, a pool group the store nodes
+            # name, and Raiden's evict sweep, without which nothing would ever
+            # leave the host pool for the second tier.
+            missing = [
+                name
+                for name, value in (
+                    ("global_registry_address", self.global_registry_address),
+                    ("store_server_ip", self.store_server_ip),
+                    ("kv_pool_group", self.kv_pool_group),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_X2 needs "
+                    f"{', '.join(missing)} in kv_connector_extra_config"
+                )
+            if not x2_sweep_env_on():
+                raise ValueError(
+                    "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_X2 needs "
+                    f"{' and '.join(X2_SWEEP_ENV)} set to true: without Raiden's "
+                    "evict sweep no block ever reaches the second tier"
+                )
+        else:
+            if self.global_registry_address:
+                refused.append("a global registry (global_registry_address)")
+            if self.kv_pool_group:
+                refused.append("a peer store group (kv_pool_group)")
         if self.storage_config is not None:
             refused.append("a storage tier (raiden_storage_path / RAIDEN_STORAGE_PATH)")
         if self.block_major_contract is not None:
@@ -2786,6 +2942,14 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             key_row_bytes=key_row_bytes,
         )
         check_served_plan(plan)
+        if self.tier_x2:
+            from vllm_torchtpu.offload.tier_classes import (
+                check_served_shards,
+                shard_plan,
+            )
+
+            plan = shard_plan(plan)
+            check_served_shards(plan)
         refuse_ephemeral_ports(
             [
                 self._controller_port_base
@@ -2803,7 +2967,27 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             plan.checkpoints,
             plan.describe(),
         )
+        if self.tier_x2:
+            logger.info(
+                "TPURaidenOffloadingConnector: TIER-X2 on: %d shard stores join the "
+                "global registry at %s as %s, pool groups %s; evict sweep %s; a "
+                "registry miss is remembered %d ms",
+                len(plan.classes),
+                self.global_registry_address,
+                self.store_server_ip,
+                ",".join(self.tier_x2_pool_group(c) for c in plan.classes),
+                " ".join(
+                    f"{name}={os.environ.get(name, '')}"
+                    for name in X2_SWEEP_ENV
+                    + ("RAIDEN_EVICT_LOW_WATERMARK", "RAIDEN_EVICT_HIGH_WATERMARK")
+                ),
+                envs.VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS,
+            )
         return plan
+
+    def tier_x2_pool_group(self, tier_class: TierClass) -> str:
+        """TIER-X2: the pool group a shard's store and its store nodes share."""
+        return f"{self.kv_pool_group}-{tier_class.name}"
 
     @staticmethod
     def _compressed_key_live_bytes(vllm_config: VllmConfig) -> int:
@@ -2848,6 +3032,18 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         managers = []
         for tier_class in plan.classes:
             capacity = plan.capacity(tier_class)
+            # TIER-X2: each shard store joins the registry under its own pool group
+            # and key namespace.
+            x2: dict[str, Any] = (
+                {
+                    "global_registry_address": self.global_registry_address,
+                    "kv_pool_group": self.tier_x2_pool_group(tier_class),
+                    "tier_x2": True,
+                    "x2_miss_ttl_s": envs.VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS / 1000.0,
+                }
+                if self.tier_x2
+                else {}
+            )
             managers.append(
                 RaidenOffloadingManager(
                     kernel_physical_blocks_capacity=capacity * factor,
@@ -2857,11 +3053,16 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                     raiden_controller_port=self.tier_controller_port(tier_class),
                     raiden_job_name=f"{self.raiden_job_name}-{tier_class.name}",
                     store_server_ip=self.store_server_ip,
-                    key_namespace=self.key_namespace,
+                    key_namespace=(
+                        x2_shard_namespace(self.key_namespace, tier_class.name)
+                        if self.tier_x2
+                        else self.key_namespace
+                    ),
                     device_row_stride=tier_class.rows_per_page,
                     track_held=True,
                     store=None if stores is None else stores[tier_class.index],
                     store_types=store_types,
+                    **x2,
                 )
             )
         if check is None:
@@ -2900,6 +3101,17 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             assert tuple(indices) == own, (tier_class.name, indices, own)
             if not own:
                 continue
+            # TIER-X2: a shard takes only its own workers, each under its dense node
+            # id; another shard of the class takes this rank's regions.
+            node_id: dict[str, int] = {}
+            if tier_class.shard_of is not None:
+                if not tier_class.worker_regions[rank]:
+                    continue
+                assert tier_class.worker_regions[rank] == own, (
+                    f"host tier shard {tier_class.name}: rank {rank} uses regions "
+                    f"{own}, the plan gives it {tier_class.worker_regions[rank]}"
+                )
+                node_id["node_id"] = tier_class.node_id(rank)
             assert own in tier_class.worker_regions, (
                 f"host tier class {tier_class.name}: rank {rank} uses regions {own}, "
                 f"which no recorded worker config plans ({tier_class.worker_regions})"
@@ -2917,6 +3129,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                     tier_class.row_bytes if tier_class.rows_per_page > 1 else None
                 ),
                 label=tier_class.name,
+                **node_id,
             )
         logger.info(
             "TPURaidenOffloadingConnector: rank %d registers host tier classes %s",

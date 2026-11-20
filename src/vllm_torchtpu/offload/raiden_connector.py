@@ -339,7 +339,13 @@ def _build_tier_check(connector_worker, kv_caches, group_regions) -> TierCheck:
                 raw.setdefault(index[name], tensor)
     regions: dict[str, list[torch.Tensor]] = {}
     live: dict[str, int] = {}
+    rank = parallel_state.get_world_group().rank_in_group
     for tier_class in plan.classes:
+        if tier_class.shard_of is not None and not tier_class.worker_regions[rank]:
+            # TIER-X2: another shard of the class moves this rank's rows.
+            regions[tier_class.name] = []
+            live[tier_class.name] = tier_class.row_bytes
+            continue
         own = sorted({r for g in tier_class.groups for r in group_regions[g]})
         missing = [r for r in own if r not in raw]
         if missing:
@@ -349,7 +355,6 @@ def _build_tier_check(connector_worker, kv_caches, group_regions) -> TierCheck:
             )
         regions[tier_class.name] = [raw[r] for r in own]
         live[tier_class.name] = tier_class.row_bytes
-    rank = parallel_state.get_world_group().rank_in_group
     logger.info(
         "TPURaidenOffloadingConnector: tier check mode on, rank %d hashes classes %s",
         rank,
@@ -596,6 +601,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 for k in ("calls", "asked", "evicted", "abandoned", "discarded")
             }
             line += " excl_restore=" + ",".join(f"{k}:{v}" for k, v in totals.items())
+        if isinstance(manager, TieredOffloadingManager):
+            x2 = manager.x2_stats()
+            if x2 is not None:
+                line += " tier_x2=" + ",".join(f"{k}:{v}" for k, v in x2.items())
         unhashed = self.__dict__.get("_tier_check_unhashed", {})
         for name, counts in sorted(self.__dict__.get("_tier_check_totals", {}).items()):
             fields = " ".join(f"{k}={v}" for k, v in zip(CHECK_FIELDS, counts))
