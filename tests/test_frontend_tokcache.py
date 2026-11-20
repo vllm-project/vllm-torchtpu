@@ -23,6 +23,7 @@ from transformers import PreTrainedTokenizerFast
 from vllm.renderers import base as rbase
 from vllm.renderers.hf import HfRenderer
 from vllm.renderers.params import TokenizeParams
+from vllm.tokenizers.hf import get_cached_tokenizer
 
 from vllm_torchtpu import frontend_tokcache as tokcache_mod
 
@@ -329,7 +330,7 @@ class _SilentLogger:
 def test_a_cache_that_turns_off_is_dropped(patched_renderer, monkeypatch, cause):
     """Once the cache turns off, by an unexpected error or a verify mismatch,
     the wrapper drops it, so its entries are freed."""
-    renderer, _ = patched_renderer
+    renderer, unpatched = patched_renderer
     monkeypatch.setattr(tokcache_mod, "logger", _SilentLogger())
     refs = []
     build = tokcache_mod._build_cache_for
@@ -351,10 +352,35 @@ def test_a_cache_that_turns_off_is_dropped(patched_renderer, monkeypatch, cause)
 
         monkeypatch.setattr(tokcache_mod.PrefixTokenCache, "encode", broken)
     else:
-        ref().disabled = True
-    renderer._tokenize_prompt({"prompt": _turns(2)}, params)
+        # The cached prompt's token ids no longer match a full encode, so the
+        # next hit's verify turns the cache off and returns the full encode.
+        (entry,) = ref()._entries.values()
+        entry.ids[0] += 1
+    prompt = {"prompt": _turns(2)}
+    expected = unpatched(renderer, dict(prompt), params)
+    assert renderer._tokenize_prompt(dict(prompt), params) == expected
+    if cause == "verify_mismatch":
+        assert ref().disabled
+    # The wrapper drops a cache the step before turned off.
+    renderer._tokenize_prompt({"prompt": _turns(3)}, params)
     gc.collect()
     assert ref() is None
+
+
+def test_the_cache_serves_vllms_cached_tokenizer(patched_renderer, cache_encodes):
+    """vLLM's renderer holds its tokenizer wrapped by get_cached_tokenizer, a
+    subclass of the Hugging Face tokenizer's own class; the cache takes it as
+    a fast tokenizer and serves the prompts it reuses."""
+    renderer, unpatched = patched_renderer
+    renderer.tokenizer = get_cached_tokenizer(_toy_hf_tokenizer())
+    assert type(renderer.tokenizer) is not PreTrainedTokenizerFast
+    params = TokenizeParams(max_total_tokens=None)
+    for n in (1, 2):
+        prompt = {"prompt": _turns(n)}
+        expected = unpatched(renderer, dict(prompt), params)
+        assert renderer._tokenize_prompt(dict(prompt), params) == expected
+    (cache,) = set(cache_encodes)
+    assert cache.hits == 1 and not cache.disabled
 
 
 def test_installed_wrapper_builds_its_cache_with_the_token_limit(
