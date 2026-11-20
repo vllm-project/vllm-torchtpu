@@ -18,7 +18,6 @@ rank issues the same collectives."""
 
 from __future__ import annotations
 
-import logging
 import math
 from types import SimpleNamespace
 
@@ -310,7 +309,7 @@ def test_every_rank_issues_the_same_collectives(monkeypatch, busy_rows):
     )
 
 
-def test_owner_gating(monkeypatch, caplog):
+def test_owner_gating(monkeypatch):
     weight = torch.randn(64, 8).to(torch.bfloat16)
     shards = _tp_shards(weight, 2, 4)
     owner = _Owner(shards[0])
@@ -318,9 +317,16 @@ def test_owner_gating(monkeypatch, caplog):
     _patch_groups(monkeypatch, 1, 2, 0, 0, None, None)  # one DP engine
     assert gtt.vocab_parallel_draft_owner(owner) is owner
 
-    _patch_groups(monkeypatch, 4, 2, 1, 0, None, None, ep_rank=1)  # wrong EP layout
-    with caplog.at_level(logging.WARNING):
-        assert gtt.vocab_parallel_draft_owner(owner) is owner
+    # An EP group that is not DP-major: rank (1, 0) sits at EP rank 1, not 2.
+    # Rank (0, 0) would pass this rank's check, so a fallback here would build
+    # the head's collectives on part of the group; the start is refused.
+    _patch_groups(monkeypatch, 4, 2, 1, 0, None, None, ep_rank=1)
+    with pytest.raises(NotImplementedError, match="DP-major"):
+        gtt.vocab_parallel_draft_owner(owner)
+    _patch_groups(monkeypatch, 4, 2, 0, 0, None, None, ep_rank=0)
+    assert isinstance(
+        gtt.vocab_parallel_draft_owner(owner).lm_head, gtt._VocabParallelDraftHead
+    )
 
     fp8 = _Owner(_tp_shards(weight, 2, 4)[0])
     fp8.lm_head._quant_mode = "fp8"
@@ -330,6 +336,19 @@ def test_owner_gating(monkeypatch, caplog):
     vp = gtt.vocab_parallel_draft_owner(owner)
     assert isinstance(vp.lm_head, gtt._VocabParallelDraftHead)
     assert vp.logits_processor is owner.logits_processor
+
+
+def test_vocab_parallel_head_materializes_its_slice(monkeypatch):
+    """The head clones its slice of the TP shard. On TPU that clone stays
+    deferred until something reads it, which would keep the whole source head
+    alive past its release (release_twin_behind_vocab_parallel_head), into the
+    KV cache's memory profile, so the head materializes its weight when built,
+    as quantize_lm_head does."""
+    materialized = []
+    monkeypatch.setattr(gtt, "_materialize", materialized.append)
+    shard = _tp_shards(torch.randn(64, 8).to(torch.bfloat16), 2, 4)[0]
+    head = gtt._VocabParallelDraftHead(shard, 1, 4, 2)
+    assert len(materialized) == 1 and materialized[0] is head.weight
 
 
 def _proposer(draft, lockstep, sharded=True, replicated=False):
