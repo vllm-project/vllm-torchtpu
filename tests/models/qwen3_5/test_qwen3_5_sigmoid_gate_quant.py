@@ -69,6 +69,11 @@ def test_pal_gate_q_interpreter_parity():
         (32, 1024, 32, 32),  # 32-aligned decode bucket (TP=8)
         (64, 1024, 32, 32),  # 32-aligned sub-block for float8_e4m3fn (32, 128) tiles
         (512, 1024, 512, 64),  # TP=8 prefill: 512-row block, 64-row in-kernel steps
+        # Wider than 2048 columns a step of up to 256 rows runs as one block,
+        # as the measured legs compiled it: TP=2 decode (4096 columns) and
+        # TP=1 prefill (8192 columns), where 256 rows are over the budget.
+        (96, 4096, 96, 96),
+        (256, 8192, 256, 256),
         # TP=2 prefill: the 16-row VREG step is not 32-aligned, so each block
         # runs as one step; the 16 MiB tile budget holds a 4096-wide block to
         # 384 rows, and 256 is the largest 32-aligned divisor of 4096 under it.
@@ -82,13 +87,17 @@ def test_pal_gate_q_interpreter_parity():
 def test_sigmoid_gate_quant_tile_selection(rows, cols, expected_bm, expected_step):
     """The BlockSpec tile `bm` and the in-kernel row step that
     `pallas_sigmoid_gate_quant` derives from it."""
-    bm = kernel.legal_tile(rows, kernel.select_tile(rows, cols))
+    cap = kernel.select_tile(rows, cols)
+    bm = kernel.legal_tile(rows, cap)
     step = kernel.legal_tile(bm, kernel.select_vreg_step(cols))
     assert (bm, step) == (expected_bm, expected_step)
+    # The cap is itself a legal tile: a multiple of 32, or the whole step.
+    assert cap == rows or cap % 32 == 0
     assert bm == rows or (rows % bm == 0 and bm % 32 == 0)
     assert step == bm or (bm % step == 0 and step % 32 == 0)
-    # Two bf16 inputs and one fp8 output, double buffered, within 16 MiB.
-    assert bm * cols * 10 <= (16 << 20)
+    # Two bf16 inputs and one fp8 output, double buffered, within 16 MiB,
+    # except a one-block step of up to 256 rows wider than 2048 columns.
+    assert bm * cols * 10 <= (16 << 20) or (bm == rows <= 256 and cols > 2048)
 
 
 def _e4m3_steps(got, want):

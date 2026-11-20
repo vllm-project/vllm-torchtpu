@@ -44,10 +44,12 @@ def select_vreg_step(cols: int) -> int:
 
 
 def select_tile(rows: int, cols: int) -> int:
-    """Select a multiple-of-32 VMEM BlockSpec tile cap for [rows, cols] gate + quant.
+    """Select a VMEM BlockSpec tile cap for [rows, cols] gate + quant: a
+    multiple of 32, or ``rows`` for a step that runs as one block.
 
     For decode/verify batch sizes (rows <= 256), caps tile so grid >= 6 and
-    double-buffered VMEM DMAs overlap with compute. For large prefill shapes
+    double-buffered VMEM DMAs overlap with compute; wider than 2048 columns
+    such a step runs as one block (see below). For large prefill shapes
     (rows > 256), uses a larger VMEM block (up to 512 rows) while the kernel
     processes VREG-sized sub-tiles internally, avoiding large Pallas grid
     overhead at T=8192 without spilling VREGs.
@@ -59,6 +61,15 @@ def select_tile(rows: int, cols: int) -> int:
     # widths of 2048 columns or less are unaffected.
     budget_cap = max(32, ((16 << 20) // (10 * cols)) // 32 * 32)
     if rows <= 256:
+        if vreg_cap < 32:
+            # Wider than 2048 columns the VREG step (16 rows) is below the
+            # smallest legal tile, so a step of up to 256 rows runs as one
+            # block of all its rows. The measured legs compiled this form:
+            # the TP2 decode steps (4096 columns) and the TP1 prefill steps
+            # (8192 columns) of up to 256 rows. At 8192 columns a block of
+            # more than 204 rows is over the 16 MiB budget (256 rows: 20 MiB);
+            # the measured TP1 prefill leg compiled and ran its 256-row block.
+            return rows
         dma_cap = max(32, (rows // 6 // 32) * 32)
         return min(vreg_cap, dma_cap, budget_cap)
     return min(max(vreg_cap, 512), budget_cap)
