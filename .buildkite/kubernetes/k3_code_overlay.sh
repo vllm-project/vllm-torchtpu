@@ -16,10 +16,11 @@
 # Sourced by k3_1p1d.sh and k3_agentx_client_pod.sh when K3_CODE_OVERLAY is
 # set. /overlays/<K3_CODE_OVERLAY>/code.tar (the kimi-k31-* manifests mount
 # gs://tpu-ci-models-60b4c3c7/k31-overlays at /overlays) holds COMMIT,
-# src/vllm_torchtpu, tools/megakernel and configs/.
+# src/vllm_torchtpu, tools/megakernel and configs/, and optionally wheels/.
 
 # apply_code_overlay engine|client: copy the configs into the repo; an engine
-# also replaces the repo's vllm_torchtpu and tools/megakernel.
+# also replaces the repo's vllm_torchtpu and tools/megakernel, and installs
+# any wheels/*.whl without dependencies.
 apply_code_overlay() {
   local what="$1" repo="${REPO_DIR:-/workspace/vllm-torchtpu}"
   local tarball="/overlays/${K3_CODE_OVERLAY}/code.tar"
@@ -36,4 +37,10 @@ apply_code_overlay() {
   cp -a /tmp/k3-code-overlay/src/vllm_torchtpu/. "$repo/src/vllm_torchtpu/" || return 1
   rm -rf "${repo:?}/tools/megakernel"
   mkdir -p "$repo/tools" && cp -a /tmp/k3-code-overlay/tools/megakernel "$repo/tools/megakernel"
+  local whl
+  for whl in /tmp/k3-code-overlay/wheels/*.whl; do
+    [[ -f "$whl" ]] || continue
+    python3 -m pip install -q --no-deps --root-user-action=ignore "$whl" || return 1
+    echo "[overlay] installed $(basename "$whl")"
+  done
 }
