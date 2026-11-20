@@ -273,11 +273,11 @@ class QSAFullIndexedBlock(QSAFullBlock):
         # thresholds skip the id passes unless a tie is truncated (t), stop the value
         # passes once the count at `lo` is exactly the budget (e), and scan only the
         # smallest static row tier {S/2, 3S/4, S} that holds the visible groups, for the
-        # thresholds and the row compaction (r). "1" = "te" (exos: the tiers' extra static
-        # copies slow every rank's select at b16); letters pick parts.
+        # thresholds and the row compaction (r). "1" = "ter2" (exos c16 mix best; three
+        # tiers' static copies slowed every rank's select at b16); letters pick parts.
         # VLLM_TPU_MK_QSA_THR_EXIT = "bit,every": first while-loop bit, passes per trip.
         fast = os.environ.get("VLLM_TPU_MK_QSA_THR_FAST", "0")
-        fast = "te" if fast == "1" else "" if fast == "0" else fast
+        fast = "ter2" if fast == "1" else "" if fast == "0" else fast
         ex_bit, ex_every = (int(x) for x in
                             os.environ.get("VLLM_TPU_MK_QSA_THR_EXIT", "19,2").split(","))
         self.thr_kw = dict(tie_skip="t" in fast,
