@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
 from vllm_torchtpu.layers.core.attention_metadata import stage_h2d_upload
 
 if TYPE_CHECKING:
@@ -91,9 +92,7 @@ def _spec_boundary_pairs_impl(
     return torch.where(copy, src, null), torch.where(copy, dst, null)
 
 
-_spec_boundary_pairs_compiled = torch.compile(
-    backend="tpu", fullgraph=True, dynamic=False
-)(_spec_boundary_pairs_impl)
+_spec_boundary_pairs_compiled = tpu_compile(_spec_boundary_pairs_impl)
 
 
 def _spec_boundary_pairs(

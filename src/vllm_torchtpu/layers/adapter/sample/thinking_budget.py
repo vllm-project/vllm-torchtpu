@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Final, cast
 import numpy as np
 import torch
 
+from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
 from vllm_torchtpu.layers.adapter.sample.scatter_ops import scatter_slot_rows
 
 if TYPE_CHECKING:
@@ -514,7 +515,7 @@ def _select_slot_states(
     return active_slot, torch.index_select(state_table, 0, safe_slots)
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def query_forced_tokens(
     state_table: torch.Tensor,
     slot_ids: torch.Tensor,
@@ -529,7 +530,7 @@ def query_forced_tokens(
     )
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def force_logits_rows(
     logits: torch.Tensor,
     forced_ids: torch.Tensor,
@@ -552,7 +553,7 @@ def force_logits_rows(
     return masked.scatter(-1, safe_ids.unsqueeze(-1), forced_val), can_force.squeeze(-1)
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def force_token_ids(
     token_ids: torch.Tensor,
     forced_ids: torch.Tensor,
@@ -567,7 +568,7 @@ def force_token_ids(
     return forced_out, did_force
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def invalidate_forced_drafts(
     draft_token_ids: torch.Tensor,
     forced_target_ids: torch.Tensor,
@@ -582,7 +583,7 @@ def invalidate_forced_drafts(
     )
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def advance_plain_states(
     state_table: torch.Tensor,
     slot_ids: torch.Tensor,
@@ -610,7 +611,7 @@ def advance_plain_states(
     return scatter_slot_rows(state_table, chunk_slots, next_st)
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def override_plain_top_tokens(
     state_table: torch.Tensor,
     slot_ids: torch.Tensor,
@@ -633,7 +634,7 @@ def override_plain_top_tokens(
     )
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def prepare_spec_verify_drafts(
     state_table: torch.Tensor,
     slot_ids: torch.Tensor,
@@ -722,7 +723,7 @@ def prepare_spec_verify_drafts(
     return forced_target_ids, forced_bonus_full
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def advance_spec_states(
     state_table: torch.Tensor,
     slot_ids: torch.Tensor,

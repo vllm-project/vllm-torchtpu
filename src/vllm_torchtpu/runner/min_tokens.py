@@ -52,6 +52,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
+
 if TYPE_CHECKING:
     from vllm import SamplingParams
 
@@ -228,7 +230,7 @@ def apply_stop_table(
     return masked
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def mask_stop_tokens(logits: torch.Tensor, stop_ids: torch.Tensor) -> torch.Tensor:
     return _mask_stop_tokens(logits, stop_ids)
 
@@ -248,7 +250,7 @@ def _mask_stop_tokens(logits: torch.Tensor, stop_ids: torch.Tensor) -> torch.Ten
     return logits.scatter(1, index, values)
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def restore_all_masked_rows(
     logits: torch.Tensor, masked: torch.Tensor, restore: torch.Tensor
 ) -> torch.Tensor:

@@ -29,6 +29,7 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     fixed_moe_collection_chunks,
 )
@@ -1066,7 +1067,7 @@ class Eagle3Proposer:
         )
 
     @_static_shape_args
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _draft_propose_token(self, hidden: torch.Tensor) -> torch.Tensor:
         # Draft lm-head + greedy argmax, wrapped in one torch.compile region
         # keyed on input shape only (mirrors the target's compute_selected_logits).
@@ -1089,7 +1090,7 @@ class Eagle3Proposer:
         return (draft_id + d2t[draft_id]).to(torch.int32)
 
     @_static_shape_args
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _draft_gather_carries(
         self,
         hidden: torch.Tensor,
@@ -1114,7 +1115,7 @@ class Eagle3Proposer:
         )
 
     @_static_shape_args
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _draft_combine_hidden_states(
         self, aux0: torch.Tensor, aux1: torch.Tensor, aux2: torch.Tensor
     ) -> torch.Tensor:
@@ -1131,7 +1132,7 @@ class Eagle3Proposer:
         )
 
     @_static_shape_args
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _draft_seed_input_ids(
         self,
         input_ids: torch.Tensor,
