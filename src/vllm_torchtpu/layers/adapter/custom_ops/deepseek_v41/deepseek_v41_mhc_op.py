@@ -115,7 +115,11 @@ def _kernel_admits(tokens: int, mult: int, dim: int) -> bool:
 
 def _gate_layout() -> dict:
     layout: dict = {"early_prep": envs.TPU_DEEPSEEK_V41_MHC_EARLY_PREP}
-    if envs.TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES:
+    if envs.TPU_DEEPSEEK_V41_MHC_FUSED_GATES:
+        layout["unpadded_gates"] = True
+        layout["fused_gates"] = True
+        layout["gate_input_mode"] = shifted_post_pre_rms.GateInputMode.HBM
+    elif envs.TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES:
         layout["unpadded_gates"] = True
         layout["gate_input_mode"] = shifted_post_pre_rms.GateInputMode.COMPILER
     return layout

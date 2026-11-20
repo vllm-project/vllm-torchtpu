@@ -124,3 +124,28 @@ def test_t40_pads_to_a_kernel_tile_and_matches_fallback(monkeypatch):
         r, g = np.asarray(r, np.float32), np.asarray(g, np.float32)
         bound = np.maximum(np.abs(r), np.abs(g)) * rtol + 1e-6
         assert np.all(np.abs(r - g) <= bound)
+
+
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU7x mHC kernel")
+@pytest.mark.parametrize("tokens", [16, 48, 96, 240, 288, 2048])
+def test_fused_gates_are_bitwise_identical(tokens):
+    args = _inputs(tokens)
+    resident = {
+        "unpadded_gates": True,
+        "gate_input_mode": mhc.GateInputMode.COMPILER,
+        "early_prep": True,
+    }
+    fused = {
+        "unpadded_gates": True,
+        "gate_input_mode": mhc.GateInputMode.HBM,
+        "early_prep": True,
+        "fused_gates": True,
+    }
+    ref = jax.jit(lambda *a: _layers(resident, *a))(*args)
+    got = jax.jit(lambda *a: _layers(fused, *a))(*args)
+    for r, g in zip(ref, got, strict=True):
+        assert r.shape == g.shape and r.dtype == g.dtype
+        np.testing.assert_array_equal(
+            np.ascontiguousarray(r).view(np.uint8),
+            np.ascontiguousarray(g).view(np.uint8),
+        )

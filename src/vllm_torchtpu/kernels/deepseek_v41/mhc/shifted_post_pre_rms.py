@@ -75,6 +75,7 @@ def shifted_post_pre_rms(
     norm_eps: float = 1e-06,
     unpadded_gates: bool = False,
     early_prep: bool = False,
+    fused_gates: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Update residuals and collapse with incoming pre; predict gates separately.
 
@@ -93,6 +94,10 @@ def shifted_post_pre_rms(
         are transposes of the next call's [M,T] gate inputs, not slices.
         ``early_prep`` builds tile 0's gate coefficients while the first
         activation tiles are still in flight instead of after they land.
+        ``fused_gates`` computes the next gates inside the kernel instead of a
+        second ``pallas_call`` and writes them to HBM, where the next call's
+        ``GateInputMode.HBM`` reads them, so no gate tensor sits in VMEM
+        between layers (bitwise identical to the separate gate kernel).
     """
     t, d = x.shape
     token_tile = _token_tile(t)
@@ -109,6 +114,7 @@ def shifted_post_pre_rms(
     mixes = m * (m + 2)
     assert is_supported_shape(t, m, d)
     gate_tokens = (t + 127) // 128 * 128
+    gate_width = t if unpadded_gates and gate_tokens <= 1024 else gate_tokens
     tuning = PostPreTuning(
         token_tile, 32 if token_tile % 32 == 0 else 16, 256, 50 * 1024 * 1024
     )
@@ -130,6 +136,15 @@ def shifted_post_pre_rms(
         assert norm_weight.shape == (d,)
         assert norm_weight.dtype in (jnp.bfloat16, jnp.float32)
 
+    gate_constants = dict(
+        hidden_size=d,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+    )
+
     def kernel(
         xh,
         rh,
@@ -138,10 +153,12 @@ def shifted_post_pre_rms(
         ph,
         wh,
         norm_refs,
+        gate_param_refs,
         yh,
         vh,
         mh,
         sh,
+        gate_outputs,
         output_y,
         output_v,
         output_sems,
@@ -157,6 +174,9 @@ def shifted_post_pre_rms(
         norm_square,
         sems,
         projection_buf,
+        gate_params,
+        gate_results,
+        gate_sems,
     ):
         if gate_input_mode == GateInputMode.HBM:
             por, cr, pr = gate_scratch
@@ -174,6 +194,14 @@ def shifted_post_pre_rms(
         ]
         for copy in copies[:-1]:
             copy.start()
+        param_copies = []
+        if fused_gates:
+            param_copies = [
+                pltpu.make_async_copy(src, dst, gate_sems.at[i])
+                for i, (src, dst) in enumerate(zip(gate_param_refs, gate_params))
+            ]
+            for copy in param_copies:
+                copy.start()
 
         def load_gate(ref, tile_index):
             if tile % 128 == 0:
@@ -403,12 +431,45 @@ def shifted_post_pre_rms(
             return unused
 
         jax.lax.fori_loop(0, num_tiles, body, None)
+        if not fused_gates:
+            for index in range(num_tiles - output_buffers, num_tiles):
+                for copy in output_copies(index):
+                    copy.wait()
+            store_projection(projection_buf[...], num_tiles - 1)
+            return
+        store_projection(projection_buf[...], num_tiles - 1)
+        for copy in param_copies:
+            copy.wait()
+        scale_ref, base_ref = gate_params
+        block = _gate_block(gate_tokens)
+        for start in range(0, gate_tokens, block):
+            values = _gate_values(
+                mh[:, pl.ds(start, block)],
+                sh[:, pl.ds(start, block)],
+                scale_ref[...],
+                base_ref[...],
+                **gate_constants,
+            )
+            for result, value in zip(gate_results, values, strict=True):
+                result[..., pl.ds(start, min(block, gate_width))] = value[
+                    ..., : min(block, gate_width)
+                ]
+        result_copies = [
+            pltpu.make_async_copy(result, output, gate_sems.at[2 + i])
+            for i, (result, output) in enumerate(
+                zip(gate_results, gate_outputs, strict=True)
+            )
+        ]
+        for copy in result_copies:
+            copy.start()
         for index in range(num_tiles - output_buffers, num_tiles):
             for copy in output_copies(index):
                 copy.wait()
-        store_projection(projection_buf[...], num_tiles - 1)
+        for copy in result_copies:
+            copy.wait()
 
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     gate_args = (post.reshape(t, m).T, comb.transpose(1, 2, 0), pre.T)
     if gate_input_mode == GateInputMode.HBM:
         gate_spec = hbm
@@ -419,15 +480,52 @@ def shifted_post_pre_rms(
             pltpu.VMEM(gate.shape, gate.dtype) for gate in gate_args
         )
     else:
-        gate_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+        gate_spec = vmem
         gate_scratch_shapes = ()
-    residual, value, mix_values, square = pl.pallas_call(
-        kernel,
+    gate_shapes = ((m, gate_width), (m, gate_width), (m, m, gate_width))
+    if fused_gates:
+        # Logits and square sums stay in scratch; gates leave through HBM.
+        param_args = tuple(
+            pltpu.with_memory_space_constraint(arg, pltpu.HBM) for arg in (scale, base)
+        )
+        logit_outputs = []
+        logit_scratch = [pltpu.VMEM((k, gate_tokens), jnp.float32) for k in (mixes, 1)]
+        gate_out_specs = [hbm] * 3
+        gate_out_shapes = [pltpu.HBM(shape, jnp.float32) for shape in gate_shapes]
+        gate_extra_scratch = [
+            tuple(pltpu.VMEM(arg.shape, arg.dtype) for arg in param_args),
+            tuple(pltpu.VMEM(shape, jnp.float32) for shape in gate_shapes),
+            pltpu.SemaphoreType.DMA((2 + len(gate_shapes),)),
+        ]
+    else:
+        param_args = ()
+        logit_outputs = [
+            jax.ShapeDtypeStruct((k, gate_tokens), jnp.float32) for k in (mixes, 1)
+        ]
+        logit_scratch = []
+        gate_out_specs, gate_out_shapes = [], []
+        gate_extra_scratch = [(), (), ()]
+
+    def wrapped(*refs):
+        # Logits leave as outputs for the separate gate kernel, else stay in scratch.
+        inputs, rest = refs[:8], refs[8:]
+        if fused_gates:
+            yh, vh, *gate_outputs = rest[:5]
+            *scratch, mh, sh = rest[5:]
+        else:
+            yh, vh, mh, sh, *scratch = rest
+            gate_outputs = ()
+        kernel(*inputs, yh, vh, mh, sh, tuple(gate_outputs), *scratch)
+
+    outputs = pl.pallas_call(
+        wrapped,
         in_specs=[hbm, hbm, gate_spec, gate_spec, gate_spec, hbm]
-        + [tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in norm_args)],
-        out_specs=[hbm, hbm] + [pl.BlockSpec(memory_space=pltpu.VMEM)] * 2,
+        + [tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in norm_args)]
+        + [tuple(hbm for _ in param_args)],
+        out_specs=[hbm, hbm] + [vmem] * len(logit_outputs) + gate_out_specs,
         out_shape=[jax.ShapeDtypeStruct((t, k), flat.dtype) for k in (width, d)]
-        + [jax.ShapeDtypeStruct((k, gate_tokens), jnp.float32) for k in (mixes, 1)],
+        + logit_outputs
+        + gate_out_shapes,
         scratch_shapes=[
             pltpu.VMEM((output_buffers, tile, width), jnp.bfloat16),
             pltpu.VMEM((output_buffers, tile, d), jnp.bfloat16),
@@ -448,11 +546,14 @@ def shifted_post_pre_rms(
                 (len(gate_scratch_shapes) + 1 + int(norm_weight is not None),)
             ),
             pltpu.VMEM((tile, 128), jnp.float32),
+            *gate_extra_scratch,
+            *logit_scratch,
         ],
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=tuning.vmem_limit_bytes,
             allow_input_fusion=(False, False, False, False, False, False)
-            + (False,) * len(norm_args),
+            + (False,) * len(norm_args)
+            + (False,) * len(param_args),
         ),
     )(
         pltpu.with_memory_space_constraint(x, pltpu.HBM)
@@ -464,20 +565,29 @@ def shifted_post_pre_rms(
         *gate_args,
         pltpu.with_memory_space_constraint(weight, pltpu.HBM),
         tuple(pltpu.with_memory_space_constraint(arg, pltpu.HBM) for arg in norm_args),
+        param_args,
     )
-    new_pre, new_post, new_comb = _pre_gates(
-        mix_values,
-        square,
-        scale,
-        base,
-        hidden_size=d,
-        rms_eps=rms_eps,
-        hc_pre_eps=hc_pre_eps,
-        hc_sinkhorn_eps=hc_sinkhorn_eps,
-        hc_post_mult_value=hc_post_mult_value,
-        sinkhorn_repeat=sinkhorn_repeat,
-        tokens=t if unpadded_gates and gate_tokens <= 1024 else None,
-    )
+    residual, value = outputs[:2]
+    if fused_gates:
+        new_pre, new_post, new_comb = (
+            gate.T if gate.ndim == 2 else gate.transpose(2, 0, 1)
+            for gate in outputs[2:]
+        )
+    else:
+        mix_values, square = outputs[2:]
+        new_pre, new_post, new_comb = _pre_gates(
+            mix_values,
+            square,
+            scale,
+            base,
+            hidden_size=d,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+            tokens=t if gate_width == t else None,
+        )
     return (residual, new_post[:t, :, None], new_comb[:t], value, new_pre[:t])
 
 
@@ -513,10 +623,7 @@ def _pre_gates(
     mixes, t = mix.shape
     m = math.isqrt(mixes + 1) - 1
     assert m > 0 and mixes == m * (m + 2), "Expected M*(M+2) mix logits"
-    block = t if t <= 1024 else math.gcd(t, 1024)
-    assert t > 0 and block % 128 == 0 and (t % block == 0), (
-        "Gate token count must be a positive multiple of 128"
-    )
+    block = _gate_block(t)
     assert hidden_size > 0, "hidden_size must be positive"
     assert square.shape == (1, t) and scale.shape == (3,) and (base.shape == (mixes,))
     assert mix.dtype == square.dtype == scale.dtype == base.dtype == jnp.float32
@@ -526,27 +633,18 @@ def _pre_gates(
     assert width == t or (block == t and 0 < width < t)
 
     def gate_kernel(mr, sr, scr, br, pre_out, post_out, comb_out):
-        mixed = mr[...] * jax.lax.rsqrt(sr[...] / (m * hidden_size) + rms_eps)
-        scales = scr[...][:, None]
-        bias = br[...][:, None]
-        pre_logits = mixed[:m, :] * scales[:1, :] + bias[:m, :]
-        pre_mix = jax.nn.sigmoid(pre_logits) + hc_pre_eps
-        post_logits = mixed[m : 2 * m, :] * scales[1:2, :] + bias[m : 2 * m, :]
-        post_mix = jax.nn.sigmoid(post_logits) * hc_post_mult_value
-        comb_logits = (mixed[2 * m :, :] * scales[2:3, :] + bias[2 * m :, :]).reshape(
-            m, m, block
+        pre_mix, post_mix, comb_mix = _gate_values(
+            mr[...],
+            sr[...],
+            scr[...],
+            br[...],
+            hidden_size=hidden_size,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
         )
-        comb_mix = jax.nn.softmax(comb_logits, axis=1) + hc_sinkhorn_eps
-        comb_mix = comb_mix / (
-            jnp.sum(comb_mix, axis=0, keepdims=True) + hc_sinkhorn_eps
-        )
-        for _ in range(sinkhorn_repeat - 1):
-            comb_mix = comb_mix / (
-                jnp.sum(comb_mix, axis=1, keepdims=True) + hc_sinkhorn_eps
-            )
-            comb_mix = comb_mix / (
-                jnp.sum(comb_mix, axis=0, keepdims=True) + hc_sinkhorn_eps
-            )
         pre_out[...] = pre_mix[..., :width]
         post_out[...] = post_mix[..., :width]
         comb_out[...] = comb_mix[..., :width]
@@ -572,3 +670,50 @@ def _pre_gates(
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
     )(mix, square, scale, base)
     return (pre.T, post.T, comb.transpose(2, 0, 1))
+
+
+def _gate_block(t: int) -> int:
+    """Gate columns computed together: all of T up to 1024, else a divisor."""
+    block = t if t <= 1024 else math.gcd(t, 1024)
+    assert t > 0 and block % 128 == 0 and (t % block == 0), (
+        "Gate token count must be a positive multiple of 128"
+    )
+    return block
+
+
+def _gate_values(
+    mix: jax.Array,
+    square: jax.Array,
+    scale: jax.Array,
+    base: jax.Array,
+    *,
+    hidden_size: int,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """FP32 (pre [M,N], post [M,N], comb [M,M,N]) from logits [M*(M+2),N]."""
+    mixes, block = mix.shape
+    m = math.isqrt(mixes + 1) - 1
+    mixed = mix * jax.lax.rsqrt(square / (m * hidden_size) + rms_eps)
+    scales = scale[:, None]
+    bias = base[:, None]
+    pre_logits = mixed[:m, :] * scales[:1, :] + bias[:m, :]
+    pre_mix = jax.nn.sigmoid(pre_logits) + hc_pre_eps
+    post_logits = mixed[m : 2 * m, :] * scales[1:2, :] + bias[m : 2 * m, :]
+    post_mix = jax.nn.sigmoid(post_logits) * hc_post_mult_value
+    comb_logits = (mixed[2 * m :, :] * scales[2:3, :] + bias[2 * m :, :]).reshape(
+        m, m, block
+    )
+    comb_mix = jax.nn.softmax(comb_logits, axis=1) + hc_sinkhorn_eps
+    comb_mix = comb_mix / (jnp.sum(comb_mix, axis=0, keepdims=True) + hc_sinkhorn_eps)
+    for _ in range(sinkhorn_repeat - 1):
+        comb_mix = comb_mix / (
+            jnp.sum(comb_mix, axis=1, keepdims=True) + hc_sinkhorn_eps
+        )
+        comb_mix = comb_mix / (
+            jnp.sum(comb_mix, axis=0, keepdims=True) + hc_sinkhorn_eps
+        )
+    return pre_mix, post_mix, comb_mix

@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS: bool = True
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
     TPU_DEEPSEEK_V41_MHC_EARLY_PREP: bool = True
+    TPU_DEEPSEEK_V41_MHC_FUSED_GATES: bool = True
     TPU_DEEPSEEK_V41_MHC_SHIFTED_T16: bool = True
     TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS: bool = True
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
@@ -545,6 +546,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # activation tiles are still in flight (scheduling only; outputs unchanged).
     "TPU_DEEPSEEK_V41_MHC_EARLY_PREP": env_bool(
         "TPU_DEEPSEEK_V41_MHC_EARLY_PREP", default=True
+    ),
+    # Shifted mHC: compute the next layer's gates inside the seam kernel (no
+    # second gate kernel) and pass them between layers through HBM, so no gate
+    # tensor is copied out of and back into VMEM around the layer between two
+    # seams. Takes precedence over RESIDENT_GATES. Outputs are unchanged.
+    "TPU_DEEPSEEK_V41_MHC_FUSED_GATES": env_bool(
+        "TPU_DEEPSEEK_V41_MHC_FUSED_GATES", default=True
     ),
     # Shifted mHC: also run token counts that are a multiple of 16 but not 32
     # (the DSpark drafter's 240 rows) through the fused kernel, with 16-token
