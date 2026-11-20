@@ -802,7 +802,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     ) -> int:
         """Host-tier tokens past ``num_local_tokens`` that a lookup would load.
 
-        ``PrefixAwareScheduler._external_warmth`` asks this; the pipeline
+        ``TpuPipelineChunkScheduler._external_warmth`` asks this; the pipeline
         chunk scheduler calls that for its waiting sort, its warmest-first
         promotion and its pending-work estimate. Without an
         answer, a request whose prefix is in the host tier but no longer in HBM
