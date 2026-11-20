@@ -21,6 +21,7 @@ DCP = TP x PCP included.
 """
 
 import itertools
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -28,7 +29,8 @@ import torch
 
 # Initialize vLLM's plugin registry before importing the plugin package.
 import vllm  # noqa: F401
-from vllm.config import KVTransferConfig
+from vllm.config import KVTransferConfig, ModelConfig
+from vllm.transformers_utils.config import get_config, get_hf_text_config
 
 from vllm_torchtpu.platforms.dcp_validation import (
     DcpStaticSupportValidator,
@@ -110,9 +112,11 @@ def test_admissible_sizes_follow_ranks_per_head():
 
 
 def _vllm_dcp_groups(tp, pcp, dcp):
-    """vLLM's DCP groups over one TP x PCP domain, built as
-    vllm.distributed.parallel_state.initialize_model_parallel builds them
-    (layout ExternalDP x DP x PP x PCP x TP; DCP transposes PCP and TP)."""
+    """The DCP groups over one TP x PCP domain, by a copy of the "Build the DCP
+    model-parallel groups" block of vLLM 0.33.0's
+    vllm.distributed.parallel_state.initialize_model_parallel (layout
+    ExternalDP x DP x PP x PCP x TP; DCP transposes PCP and TP). That block
+    builds the groups inline, so the test cannot call it."""
     all_ranks = torch.arange(tp * pcp).reshape(1, 1, 1, pcp, tp)
     dcp_ranks = all_ranks.transpose(-1, -2) if dcp > 1 else all_ranks
     return [g.tolist() for g in dcp_ranks.reshape(-1, dcp).unbind(0)]
@@ -138,7 +142,7 @@ def _heads_of(rank, tp, heads):
         if tp % heads == 0 or heads % tp == 0
     ],
 )
-def test_admissible_sizes_are_vllms_groups_that_hold_one_head(tp, pcp, heads):
+def test_admissible_sizes_are_those_whose_dcp_groups_hold_one_head(tp, pcp, heads):
     one_head = {
         dcp
         for dcp in range(1, tp * pcp + 1)
@@ -194,6 +198,83 @@ def test_pcp_manager_layouts_are_admitted(tp, pcp, dcp):
         _vllm_config(tp_size=tp, pcp_size=pcp, dcp_size=dcp, kv_heads=128, use_mla=True)
     )
     assert config.dcp_size == dcp and config.num_kv_heads == 1
+
+
+# Kimi K3's checkpoint config (moonshotai/Kimi-K3 at 9f62e4e9, the revision its
+# recipes pin) with four layers: a kimi_linear text config whose MLA layers
+# keep a kv_lora_rank latent, and 96 KV heads.
+_KIMI_K3 = {
+    "architectures": ["KimiK3ForConditionalGeneration"],
+    "model_type": "kimi_k3",
+    "text_config": {
+        "architectures": ["KimiLinearForCausalLM"],
+        "model_type": "kimi_linear",
+        "hidden_size": 7168,
+        "num_attention_heads": 96,
+        "num_key_value_heads": 96,
+        "kv_lora_rank": 512,
+        "q_lora_rank": 1536,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "num_hidden_layers": 4,
+        "vocab_size": 163840,
+        "max_position_embeddings": 4096,
+        "linear_attn_config": {
+            "full_attn_layers": [4],
+            "kda_layers": [1, 2, 3],
+            "head_dim": 128,
+            "num_heads": 96,
+            "short_conv_kernel_size": 4,
+        },
+    },
+}
+
+
+def _kimi_k3_model_config(tmp_path):
+    """What the DCP admission reads from Kimi K3's ModelConfig, computed by
+    vLLM's own code: the config read as ModelConfig reads it, its
+    get_model_arch_config and its use_mla property. A whole ModelConfig needs
+    the model class inspected, which needs a GPU or TPU."""
+    (tmp_path / "config.json").write_text(json.dumps(_KIMI_K3))
+    hf_config = get_config(str(tmp_path), trust_remote_code=False)
+    model = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=get_hf_text_config(hf_config),
+        revision=None,
+        _supports_multimodal_for_mm_prefix=lambda: False,
+        # Kimi K3 runs vLLM's (and this plugin's) KimiK3ForConditionalGeneration.
+        using_transformers_backend=lambda: False,
+    )
+    arch = ModelConfig.get_model_arch_config(model)
+    model.is_deepseek_mla = arch.is_deepseek_mla
+    return SimpleNamespace(
+        use_mla=ModelConfig.use_mla.fget(model),
+        get_total_num_kv_heads=lambda: arch.total_num_kv_heads,
+    )
+
+
+@pytest.mark.parametrize("dcp", [16, 32])
+def test_kimi_k3_decode_layouts_are_admitted_with_vllms_mla_rule(tmp_path, dcp):
+    """The Kimi K3 decode recipes run TP32 with DCP 16 or 32. vLLM reports
+    Kimi K3's cache as MLA, so the head rule counts one KV head, not the 96
+    the checkpoint lists."""
+    model_config = _kimi_k3_model_config(tmp_path)
+    assert model_config.use_mla
+    assert model_config.get_total_num_kv_heads() == 96
+    config = DcpStaticSupportValidator.validate_platform_config(
+        SimpleNamespace(
+            model_config=model_config,
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=dcp,
+                tensor_parallel_size=32,
+                prefill_context_parallel_size=1,
+                data_parallel_size=1,
+            ),
+            kv_transfer_config=None,
+        )
+    )
+    assert config.num_kv_heads == 1
 
 
 def test_mla_without_pcp_admits_every_divisor_of_tp():
