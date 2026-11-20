@@ -124,6 +124,9 @@ class ByteStore(FakeKVCacheStore):
             self.host.pop(h, None)
             self.evicted.append(h)
             n += 1
+        # Raiden's Evict fires the eviction callback before it returns.
+        if n:
+            self.simulate_evict(self.evicted[-n:])
         return n
 
     def read_remote(self, block_hashes, slices, device_block_ids):
@@ -634,30 +637,122 @@ def test_a_key_the_host_pool_holds_costs_no_registry_call():
 
 
 def test_a_registry_miss_is_remembered_for_the_ttl(monkeypatch):
+    """A key this shard evicted but nobody holds: the registry is asked once, then the miss is remembered for the
+    TTL; a new eviction (it may be on the node now) voids the remembered miss at once."""
     from vllm_torchtpu.offload import raiden_store
 
     now = [100.0]
     monkeypatch.setattr(raiden_store.time, "monotonic", lambda: now[0])
     tier, stores, _ = _shard_tier(ttl_s=1.0)
     key = _key(5)
+    _save(tier, stores, [key], [10])
+    _demote(tier, stores, [key])
+    for name in ("main.r1", "main.r2"):
+        stores[name].node_evicts([_sub_of(tier, name, key)])
     assert tier.lookup(key, _ctx()) == LookupResult.MISS
     assert tier.lookup(key, _ctx()) == LookupResult.MISS
     stats = tier.x2_stats()
     # The first shard missed both tiers once; the second ask was answered from memory.
     assert stats["registry_lookups"] == 1 and stats["miss_cached"] == 1
-    # The key reaches the second tier meanwhile: found once the TTL is over.
-    _save(tier, stores, [key], [10])
-    _demote(tier, stores, [key])
-    now[0] += 0.5
+    now[0] += 1.1
     assert tier.lookup(key, _ctx()) == LookupResult.MISS
-    now[0] += 0.6
+    assert tier.x2_stats()["registry_lookups"] == 2
+    # The key reaches the second tier again: its eviction voids the remembered miss.
+    assert tier.lookup(key, _ctx()) == LookupResult.MISS  # remembered again (miss_cached)
+    _save(tier, stores, [key], [11], job_id=7)
+    _demote(tier, stores, [key])
     assert tier.lookup(key, _ctx()) == LookupResult.HIT
     # A TTL of 0 asks every time.
-    tier0, _, _ = _shard_tier(ttl_s=0.0)
+    tier0, stores0, _ = _shard_tier(ttl_s=0.0)
+    _save(tier0, stores0, [key], [10])
+    _demote(tier0, stores0, [key])
+    stores0["main.r1"].node_evicts([_sub_of(tier0, "main.r1", key)])
     assert tier0.lookup(key, _ctx()) == LookupResult.MISS
     assert tier0.lookup(key, _ctx()) == LookupResult.MISS
     assert tier0.x2_stats()["registry_lookups"] == 2
     assert tier0.x2_stats()["miss_cached"] == 0
+
+
+def test_a_lookup_of_a_key_this_shard_never_evicted_costs_no_registry_call():
+    """A key this shard never evicted cannot be on its node: a host-pool miss is a miss, no registry call."""
+    tier, stores, _ = _shard_tier()
+    for i in range(5):
+        assert tier.lookup(_key(40 + i), _ctx()) == LookupResult.MISS
+    stats = tier.x2_stats()
+    assert stats["registry_lookups"] == 0 and stats["lookup_unrecorded"] == 5
+    assert not [c for st in stores.values() for c in st.calls_named("lookup") if c.args[1]]
+
+
+def _victim_scenario(tier, stores, n_old=10, n_demoted=6, n_lost=2, n_new=6):
+    """n_old keys saved; n_demoted of them demoted to the nodes, n_lost of those then dropped by the nodes; all
+    recomputed, plus n_new never-seen keys, and offered as victims. Returns (old, demoted, lost, new, chosen)."""
+    old = [_key(100 + i) for i in range(n_old)]
+    new = [_key(300 + i) for i in range(n_new)]
+    _save(tier, stores, old, list(range(1000, 1000 + n_old)))
+    demoted, lost = old[:n_demoted], old[:n_lost]
+    _demote(tier, stores, demoted)
+    for name in ("main.r1", "main.r2"):
+        stores[name].node_evicts([_sub_of(tier, name, k) for k in lost])
+    for st in stores.values():
+        st.calls.clear()
+    tier.set_victim_mode(True)
+    chosen = tier.prepare_victim_store(old + new)
+    return old, demoted, lost, new, chosen
+
+
+def test_the_store_probe_asks_the_registry_only_for_keys_this_shard_evicted_in_one_batch():
+    """Of 16 victims per shard: 6 never seen (no registry call), 4 still in the host pool (local), 6 this shard
+    demoted (one batched registry lookup: 4 on the node, 2 dropped by it, so 1 + 2 calls). The chosen keys are the new
+    and the dropped ones."""
+    tier, stores, _ = _shard_tier()
+    old, demoted, lost, new, chosen = _victim_scenario(tier, stores)
+    assert set(chosen) == set(new) | set(lost)
+    stats = tier.x2_stats()
+    assert stats["store_probe_unrecorded"] == 2 * len(new)
+    assert stats["store_probe_lookups"] == 2 * len(demoted)
+    assert stats["store_remote_skips"] == 2 * (len(demoted) - len(lost))
+    assert stats["store_probe_rpcs"] == 2 * (1 + len(lost))
+    global_calls = [c for st in stores.values() for c in st.calls_named("lookup") if c.args[1]]
+    assert len(global_calls) == stats["store_probe_rpcs"]
+    # A key the registry found absent leaves the record (only a new eviction brings it back); a resident one stays.
+    for manager in tier.managers[:2]:
+        assert not any(manager._x2_maybe_remote(k) for k in lost)
+        assert all(manager._x2_maybe_remote(k) for k in demoted[len(lost):])
+
+
+def test_a_remembered_miss_spares_the_store_probe(monkeypatch):
+    """A recorded key whose lookup just missed both tiers is a store without another registry call."""
+    from vllm_torchtpu.offload import raiden_store
+
+    now = [100.0]
+    monkeypatch.setattr(raiden_store.time, "monotonic", lambda: now[0])
+    tier, stores, _ = _shard_tier(ttl_s=5.0)
+    key = _key(9)
+    _save(tier, stores, [key], [10])
+    _demote(tier, stores, [key])
+    for name in ("main.r1", "main.r2"):
+        stores[name].node_evicts([_sub_of(tier, name, key)])
+    assert tier.lookup(key, _ctx()) == LookupResult.MISS  # main.r1 asks and remembers
+    assert tier.managers[1].lookup(key, _ctx()) == LookupResult.MISS  # main.r2 too
+    before = tier.x2_stats()
+    tier.set_victim_mode(True)
+    assert tier.prepare_victim_store([key]) == [key]
+    after = tier.x2_stats()
+    assert after["store_probe_neg_cached"] - before["store_probe_neg_cached"] == 2
+    assert after["store_probe_rpcs"] == before["store_probe_rpcs"]
+
+
+def test_an_exclusive_restore_discard_is_not_recorded():
+    """An exclusive-restore discard drops a host copy whose bytes are in HBM: it never reaches the node, so it costs
+    no registry call later."""
+    tier, stores, _ = _shard_tier(excl=True)
+    keys = [_key(1), _key(2)]
+    _save(tier, stores, keys, [10, 11])
+    (done,) = _load(tier, stores, keys, [30, 31])
+    assert done.success
+    r1 = tier.managers[0]
+    assert set(stores["main.r1"].evicted) == {_sub_of(tier, "main.r1", k) for k in keys}
+    assert not any(r1._x2_maybe_remote(k) for k in keys)
 
 
 def test_a_slice_that_went_stale_fails_the_load_closed():

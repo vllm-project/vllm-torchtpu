@@ -83,6 +83,7 @@ import os
 import socket
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
@@ -162,11 +163,21 @@ X2_COUNTERS = (
     "store_probe_us",
     "store_remote_skips",
     "store_held_skips",
+    "store_probe_rpcs",
+    "store_probe_unrecorded",
+    "store_probe_neg_cached",
+    "lookup_unrecorded",
 )
 
 # TIER-X2: most keys remembered as registry misses at once; past it the expired
 # ones are dropped, and all of them if none had expired.
 _X2_MISSED_CAP = 1 << 20
+
+# TIER-X2: most keys remembered as possibly on this shard's store node (evicted
+# from its host pool). A key this shard never evicted cannot be on its node, so
+# it costs no registry call; past the cap the oldest are forgotten (a forgotten
+# key on the node is then found only after it is evicted here again).
+_X2_RECORD_CAP = 1 << 17
 
 # TIER-X2: the Raiden switches that make a store demote its cold host blocks to the
 # store nodes of its pool group. Without both, nothing ever reaches the second tier.
@@ -655,6 +666,10 @@ class RaidenOffloadingManager(OffloadingManager):
         self._x2_miss_ttl_s = float(x2_miss_ttl_s)
         self._x2_missed: dict[OffloadKey, float] = {}
         self._x2_counts = dict.fromkeys(X2_COUNTERS, 0)
+        # Keys that may be on this shard's store node, oldest first; guarded by
+        # _eviction_lock (the store's eviction callback adds to it).
+        self._x2_record: OrderedDict[OffloadKey, None] = OrderedDict()
+        self._x2_record_cap = _X2_RECORD_CAP
 
     # -- sub-hash / block-id expansion ----------------------------------
 
@@ -801,6 +816,11 @@ class RaidenOffloadingManager(OffloadingManager):
         sub_hashes = self._sub_hashes(key)
         if len(self._probe(sub_hashes)) == len(sub_hashes):
             return self._lookup_verdict(key, req_context)
+        if not self._x2_maybe_remote(key):
+            # Never evicted here (or forgotten): it cannot be on this shard's
+            # node, and the host pool does not hold it whole.
+            counts["lookup_unrecorded"] += 1
+            return LookupResult.MISS
         now = time.monotonic()
         until = self._x2_missed.get(key)
         if until is not None and until > now:
@@ -1124,16 +1144,21 @@ class RaidenOffloadingManager(OffloadingManager):
         probe pins then releases, so a resident key moves to the LRU's MRU
         end, which is the victim policy's order for a key evicted again.
 
-        TIER-X2: a key the host pool misses is also checked against the
-        registry (``_x2_cluster_resident``): one this shard's store node holds
-        is resident, not saved again."""
-        keys_to_store: list[OffloadKey] = []
+        TIER-X2: a key the host pool misses is checked against the registry
+        only if this shard may have demoted it (``_x2_record``) and no recent
+        answer says it is absent; those keys share one batched registry lookup
+        (``_x2_cluster_resident``). One this shard's store node holds is
+        resident, not saved again."""
         resident_statuses = (
             self._block_status.HOST,
             self._block_status.HOST_AND_HBM,
             self._block_status.REMOTE,
         )
         x2 = self.__dict__.get("_x2", False)
+        decided: list[tuple[OffloadKey, bool | None]] = []  # None: ask the registry
+        probe: list[tuple[OffloadKey, list[bytes]]] = []
+        now = time.monotonic()
+        counts = self._x2_counts
         for key in keys:
             if key in self._inflight_store_keys:
                 continue
@@ -1143,31 +1168,103 @@ class RaidenOffloadingManager(OffloadingManager):
                 block.status in resident_statuses for _, block in matches
             ):
                 continue
-            if x2 and self._x2_cluster_resident(sub_hashes, resident_statuses):
-                continue
-            keys_to_store.append(key)
-        return keys_to_store
+            if x2:
+                if not self._x2_maybe_remote(key):
+                    counts["store_probe_unrecorded"] += 1
+                else:
+                    until = self._x2_missed.get(key)
+                    if until is not None and until > now:
+                        counts["store_probe_neg_cached"] += 1
+                    else:
+                        probe.append((key, sub_hashes))
+                        decided.append((key, None))
+                        continue
+            decided.append((key, True))
+        resident = (
+            self._x2_cluster_resident(probe, resident_statuses) if probe else set()
+        )
+        return [
+            key
+            for key, store in decided
+            if store or (store is None and key not in resident)
+        ]
 
-    def _x2_cluster_resident(self, sub_hashes: list[bytes], resident_statuses) -> bool:
-        """TIER-X2: whether every sub-hash is held here or on this shard's store
-        node, by the registry. Such a key must not be saved again. Raiden's
-        evict sweep keeps a node's copy when the node already holds the hash
-        (WriteRemote answers WRITE_ALL_EXIST and the sweep frees the local copy),
-        so a second save of recomputed bytes would be dropped at its next
-        demotion and a later peer read would land the node's older bytes, not
-        the bytes last saved (smoke j-a44349b7: 29 keys mismatched on main.r1,
-        keys.r1 and keys.r2). A local-only probe never sees a node's block."""
+    def _x2_maybe_remote(self, key: OffloadKey) -> bool:
+        with self._eviction_lock:
+            return key in self._x2_record
+
+    def _x2_note_maybe_remote(self, keys) -> None:
+        """Keys that may now be on this shard's store node: evicted from the host
+        pool (a demotion is an eviction here), or just read back from the node.
+        A remembered miss is void from here on. Caller holds _eviction_lock."""
+        record = self._x2_record
+        for key in keys:
+            record[key] = None
+            record.move_to_end(key)
+            self._x2_missed.pop(key, None)
+        while len(record) > self._x2_record_cap:
+            record.popitem(last=False)
+
+    def _x2_cluster_resident(
+        self, probe: list[tuple[OffloadKey, list[bytes]]], resident_statuses
+    ) -> set[OffloadKey]:
+        """TIER-X2: the keys of ``probe`` held here or on this shard's store node,
+        by the registry, in as few lookups as the answers allow. A lookup answers
+        every hash up to the first one neither the host pool nor the registry
+        resolves (interleaved lookup), so each call settles a run of keys and one
+        definite miss; the next call starts after the missed key. A key found
+        absent leaves the record (a later eviction is the only way it reaches the
+        node) and is remembered as a miss for x2_miss_ttl_s.
+
+        Such a key must not be saved again. Raiden's evict sweep keeps a node's
+        copy when the node already holds the hash (WriteRemote answers
+        WRITE_ALL_EXIST and the sweep frees the local copy), so a second save of
+        recomputed bytes would be dropped at its next demotion and a later peer
+        read would land the node's older bytes, not the bytes last saved (smoke
+        j-a44349b7). A local-only probe never sees a node's block."""
         counts = self._x2_counts
+        flat: list[bytes] = []
+        owner: list[int] = []
+        for i, (_, sub_hashes) in enumerate(probe):
+            flat.extend(sub_hashes)
+            owner.extend([i] * len(sub_hashes))
+        good = [0] * len(probe)
+        absent: set[int] = set()
         t0 = time.perf_counter()
-        matches = self._probe(sub_hashes, enable_global=True)
-        counts["store_probe_lookups"] += 1
+        pos = 0
+        while pos < len(flat):
+            matches = self._probe(flat[pos:], enable_global=True)
+            counts["store_probe_rpcs"] += 1
+            for j, (_, block) in enumerate(matches):
+                idx = owner[pos + j]
+                if block.status in resident_statuses:
+                    good[idx] += 1
+                else:
+                    absent.add(idx)
+            nxt = pos + len(matches)
+            if nxt >= len(flat):
+                break
+            missed = owner[nxt]
+            absent.add(missed)
+            while nxt < len(flat) and owner[nxt] == missed:
+                nxt += 1
+            pos = nxt
+        counts["store_probe_lookups"] += len(probe)
         counts["store_probe_us"] += int((time.perf_counter() - t0) * 1e6)
-        if len(matches) == len(sub_hashes) and all(
-            block.status in resident_statuses for _, block in matches
-        ):
-            counts["store_remote_skips"] += 1
-            return True
-        return False
+        resident: set[OffloadKey] = set()
+        now = time.monotonic()
+        for i, (key, sub_hashes) in enumerate(probe):
+            if i not in absent and good[i] == len(sub_hashes):
+                resident.add(key)
+                continue
+            with self._eviction_lock:
+                self._x2_record.pop(key, None)
+            if self._x2_miss_ttl_s > 0:
+                if len(self._x2_missed) >= _X2_MISSED_CAP:
+                    self._x2_missed.clear()
+                self._x2_missed[key] = now + self._x2_miss_ttl_s
+        counts["store_remote_skips"] += len(resident)
+        return resident
 
     def prepare_victim_store(self, keys) -> list[OffloadKey]:
         """Admission for blocks HBM is evicting (victim policy): the keys to
@@ -1205,6 +1302,10 @@ class RaidenOffloadingManager(OffloadingManager):
                 if parsed is None:
                     continue
                 key, sub_idx = parsed
+                if self.__dict__.get("_x2", False) and sub_hash not in discarding:
+                    # Evicted from the host pool, perhaps to this shard's node.
+                    # An exclusive-restore discard never goes there.
+                    self._x2_note_maybe_remote([key])
                 if self._held is not None and self._held.pop(key, None) is not None:
                     if sub_hash in discarding:
                         self._held_discarded += 1
@@ -1553,6 +1654,15 @@ class RaidenOffloadingManager(OffloadingManager):
                 )
             )
         else:
+            if success and admission.remote_sub_hashes and self.__dict__.get("_x2", False):
+                # Read back from the node: still there, and recently used.
+                read = []
+                for sub_hash in admission.remote_sub_hashes:
+                    parsed = self._sub_hash_to_offload_key(sub_hash)
+                    if parsed is not None:
+                        read.append(parsed[0])
+                with self._eviction_lock:
+                    self._x2_note_maybe_remote(read)
             if admission.remote_sub_hashes and self.__dict__.get("_x2", False):
                 # Peer blocks whose read failed, and the ones that landed.
                 failed = len(
