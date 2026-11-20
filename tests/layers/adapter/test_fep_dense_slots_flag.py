@@ -81,6 +81,7 @@ def test_on_takes_dense_up_to_the_threshold(monkeypatch):
     assert a[1:6] == ("w1", "w2", "s1", "s2", "gating")
     assert k["shard_index"] == "rank" and k["valid_tokens"] == "valid"
     assert k["drop_nan_rows"] is True and k["top_k"] == 10
+    assert k["side_effects"] is False
     assert k["config"].dense_slots is True
 
 
@@ -107,7 +108,7 @@ class _Stop(Exception):
     pass
 
 
-def _builder_kwargs(monkeypatch, rows_per_shard):
+def _builder_kwargs(monkeypatch, rows_per_shard, **kwargs):
     got = {}
 
     def fake_build(**k):
@@ -130,6 +131,7 @@ def _builder_kwargs(monkeypatch, rows_per_shard):
             renormalize=True,
             mesh=mesh,
             config=Config(),
+            **kwargs,
         )
     return got
 
@@ -140,6 +142,18 @@ def test_the_program_takes_the_shards_rows_unpadded(monkeypatch, rows, padded_to
     assert k["real_rows"] == rows
     assert k["tokens_per_shard"] == padded_to
     assert k["experts_per_shard"] == 64 and k["num_experts"] == EP * 64
+
+
+@pytest.mark.parametrize("bridge", [False, True], ids=["own", "bridge"])
+def test_the_program_takes_its_lowering_from_the_arguments(monkeypatch, bridge):
+    """The program is built in the form its caller asks for: a shard index
+    handed in selects the operand form of the peer addresses, and
+    side_effects is what it declares; nothing is read from the kernel
+    package's state."""
+    lowering = dict(shard_index=object(), side_effects=False) if bridge else {}
+    k = _builder_kwargs(monkeypatch, 64, **lowering)
+    assert k["shard_index_operand"] is bridge
+    assert k["side_effects"] is not bridge
 
 
 @pytest.mark.parametrize("rows", [20, 60])

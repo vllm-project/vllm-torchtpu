@@ -1012,6 +1012,7 @@ def _run_case(name, mode, result_rows, settings=None, dense_slots=False):
                 shard_index=shard_index,
                 valid_tokens=jnp.asarray(valid, jnp.int32),
                 drop_nan_rows=True,
+                side_effects=not bridge,
             )
         return fused_ep_moe(
             jnp.where(padding, 1.0 + jnp.abs(x), x),
