@@ -95,9 +95,9 @@ def shifted_post_pre_rms(
         ``early_prep`` builds tile 0's gate coefficients while the first
         activation tiles are still in flight instead of after they land.
         ``fused_gates`` computes the next gates inside the kernel instead of a
-        second ``pallas_call`` and writes them to HBM, where the next call's
-        ``GateInputMode.HBM`` reads them, so no gate tensor sits in VMEM
-        between layers (bitwise identical to the separate gate kernel).
+        second ``pallas_call``; with the next call in ``GateInputMode.HBM``
+        they reach it through HBM, so they do not have to come back into VMEM
+        ahead of it (bitwise identical to the separate gate kernel).
     """
     t, d = x.shape
     token_tile = _token_tile(t)
@@ -175,7 +175,6 @@ def shifted_post_pre_rms(
         sems,
         projection_buf,
         gate_params,
-        gate_results,
         gate_sems,
     ):
         if gate_input_mode == GateInputMode.HBM:
@@ -450,23 +449,13 @@ def shifted_post_pre_rms(
                 base_ref[...],
                 **gate_constants,
             )
-            for result, value in zip(gate_results, values, strict=True):
-                result[..., pl.ds(start, min(block, gate_width))] = value[
+            for output, value in zip(gate_outputs, values, strict=True):
+                output[..., pl.ds(start, min(block, gate_width))] = value[
                     ..., : min(block, gate_width)
                 ]
-        result_copies = [
-            pltpu.make_async_copy(result, output, gate_sems.at[2 + i])
-            for i, (result, output) in enumerate(
-                zip(gate_results, gate_outputs, strict=True)
-            )
-        ]
-        for copy in result_copies:
-            copy.start()
         for index in range(num_tiles - output_buffers, num_tiles):
             for copy in output_copies(index):
                 copy.wait()
-        for copy in result_copies:
-            copy.wait()
 
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
@@ -484,18 +473,20 @@ def shifted_post_pre_rms(
         gate_scratch_shapes = ()
     gate_shapes = ((m, gate_width), (m, gate_width), (m, m, gate_width))
     if fused_gates:
-        # Logits and square sums stay in scratch; gates leave through HBM.
+        # Logits and square sums stay in scratch. Gates leave in VMEM: XLA
+        # evicts them to HBM behind the next ops, and the next seam DMAs them in.
         param_args = tuple(
             pltpu.with_memory_space_constraint(arg, pltpu.HBM) for arg in (scale, base)
         )
         logit_outputs = []
         logit_scratch = [pltpu.VMEM((k, gate_tokens), jnp.float32) for k in (mixes, 1)]
-        gate_out_specs = [hbm] * 3
-        gate_out_shapes = [pltpu.HBM(shape, jnp.float32) for shape in gate_shapes]
+        gate_out_specs = [vmem] * 3
+        gate_out_shapes = [
+            jax.ShapeDtypeStruct(shape, jnp.float32) for shape in gate_shapes
+        ]
         gate_extra_scratch = [
             tuple(pltpu.VMEM(arg.shape, arg.dtype) for arg in param_args),
-            tuple(pltpu.VMEM(shape, jnp.float32) for shape in gate_shapes),
-            pltpu.SemaphoreType.DMA((2 + len(gate_shapes),)),
+            pltpu.SemaphoreType.DMA((len(param_args),)),
         ]
     else:
         param_args = ()
@@ -504,7 +495,7 @@ def shifted_post_pre_rms(
         ]
         logit_scratch = []
         gate_out_specs, gate_out_shapes = [], []
-        gate_extra_scratch = [(), (), ()]
+        gate_extra_scratch = [(), ()]
 
     def wrapped(*refs):
         # Logits leave as outputs for the separate gate kernel, else stay in scratch.
