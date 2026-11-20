@@ -30,6 +30,7 @@ import pytest
 import yaml
 
 import vllm_torchtpu.envs as envs
+from tests.models.qwen3_5.test_qwen3_5_hooks import _set_moe_env
 from vllm_torchtpu.kernels.megablox import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul import util
 from vllm_torchtpu.layers.adapter import fused_moe_ep_v3, sequence_parallel
@@ -266,11 +267,7 @@ def test_tp8_decode_legs_read_fused_ep_v3_from_their_environment(monkeypatch, pa
     """Through the real environment readers, not a patched attribute: each
     TP8 decode leg's environment selects fused EP v3, the MoE kernel its KV
     budget and its fused EP wiring were measured with."""
-    env = _legs(path)["decode"]["env"]
-    for name in ("USE_MOE_FUSED_EP_KERNEL", "MOE_FUSED_EP_KERNEL_IMPL"):
-        monkeypatch.delenv(name, raising=False)
-        if name in env:
-            monkeypatch.setenv(name, str(env[name]))
+    _set_moe_env(monkeypatch, _legs(path)["decode"]["env"])
     assert envs.USE_MOE_FUSED_EP_KERNEL is True
     assert envs.MOE_FUSED_EP_KERNEL_IMPL == "v3"
 
