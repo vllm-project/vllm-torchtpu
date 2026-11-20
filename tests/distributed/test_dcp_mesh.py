@@ -241,12 +241,26 @@ def test_pipeline_stage_lane_is_stage_relative(monkeypatch):
     assert lane.tolist() == [0]
 
 
-def test_pipeline_stage_mesh_rejects_a_stage_wider_than_tp(monkeypatch):
-    """A stage of TP=4 x PCP=2 is not one TP group; the mesh would be wrong."""
+def test_pipeline_stage_mesh_uses_the_dcp_group_under_pcp(monkeypatch):
+    """PCP x DCP stages (TP=1, PCP=DCP=8): the DCP group spans the stage."""
+    from vllm.distributed import parallel_state
+
+    native, stage_mesh, group, device_ids = _pipeline_environment(monkeypatch, rank=11)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: _FakeGroup([11]))
+
+    dcp.get_or_create_dcp_mesh()
+
+    native.assert_not_called()
+    stage_mesh.assert_called_once_with(("dcp_lane", "dcp"), (1, 8), group, device_ids)
+
+
+def test_pipeline_stage_mesh_rejects_a_stage_no_group_spans(monkeypatch):
+    """TP=4 x PCP=2 with DCP=4: neither the DCP nor the TP group is the stage."""
     from vllm.distributed import parallel_state
 
     _pipeline_environment(monkeypatch, rank=3)
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: _FakeGroup(range(4), 3))
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: _FakeGroup(range(4)))
 
-    with pytest.raises(NotImplementedError, match="one TP group"):
-        dcp.get_or_create_dcp_mesh()
+    with pytest.raises(NotImplementedError, match="one DCP or TP group"):
+        dcp._dcp_stage_mesh(("dcp_lane", "dcp"), (2, 4), 8)
