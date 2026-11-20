@@ -9305,6 +9305,68 @@ class TestStage3AsyncOptionsThroughGetFinished:
         assert worker._stage3_early_send_terminals == {}
         assert worker._stage3_send_outcomes == {}
 
+    def test_a_terminal_after_the_step_ended_is_not_kept(self):
+        """A step stops counting its requests as pending when it settles,
+        under the poll lock. A terminal polled after that, before the side
+        thread marks the step's future done, finds no pending step and is not
+        kept, so nothing is left behind for a request the step released."""
+        worker, engine, _, _ = _stage3_option_producer({"async_register": True})
+        settled, finish = threading.Event(), threading.Event()
+        settle = worker._settle_stage3_early_send_terminals
+
+        def settle_then_hold(req_ids):
+            settle(req_ids)
+            # The side thread loses the GIL between the settle and the end
+            # of the step's future.
+            settled.set()
+            finish.wait(5.0)
+
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_release["r1"] = 77
+        with (
+            _stage3_option_env(),
+            patch.object(
+                worker, "_settle_stage3_early_send_terminals", settle_then_hold
+            ),
+        ):
+            worker._submit_stage3_registration(meta)
+            worker._stage3_register_gate.set()
+            assert settled.wait(5.0)
+            ((future, _),) = worker._stage3_register_futures
+            assert not future.done()
+            engine.poll_results = [(["r1"], [], [])]
+            assert worker.get_finished() == (set(), set())
+            finish.set()
+            worker._reap_stage3_registrations({"r1"})
+        assert worker._stage3_early_send_terminals == {}
+        assert worker._stage3_pending_registrations == {}
+
+    def test_a_step_whose_client_fails_still_ends(self):
+        """Creating the side thread's controller client is part of the step:
+        when it fails, the step still ends (its requests stop counting as
+        pending and their kept terminals are dropped), and the error surfaces
+        when the runner reaps the step."""
+        worker, _, _, _ = _stage3_option_producer({"async_register": True})
+        worker._new_raiden_controller_facade = MagicMock(
+            side_effect=RuntimeError("no controller")
+        )
+        worker._stage3_early_send_terminals["r1"] = False
+        with _stage3_option_env():
+            worker._submit_stage3_registration(_stage3_send_meta("r1", 77))
+            worker._stage3_register_gate.set()
+            with pytest.raises(RuntimeError, match="no controller"):
+                worker._reap_stage3_registrations({"r1"})
+        assert worker._stage3_early_send_terminals == {}
+        assert worker._stage3_pending_registrations == {}
+
+    def test_a_request_stays_pending_until_its_last_step_ends(self):
+        worker, _, _, _ = _stage3_option_producer({"async_register": True})
+        worker._stage3_pending_registrations = {"r1": 2}
+        worker._settle_stage3_early_send_terminals(frozenset({"r1"}))
+        assert worker._stage3_registration_pending("r1")
+        worker._settle_stage3_early_send_terminals(frozenset({"r1"}))
+        assert not worker._stage3_registration_pending("r1")
+
     @pytest.mark.parametrize("registered", [False, True])
     def test_settling_applies_a_kept_terminal_only_to_a_registered_request(
         self, registered
@@ -9313,12 +9375,14 @@ class TestStage3AsyncOptionsThroughGetFinished:
         request the step left registered and dropped otherwise (a tombstoned
         replay, a duplicate, a failed registration)."""
         worker, _, _, _ = _stage3_option_producer({"async_register": True})
+        worker._stage3_pending_registrations = {"r1": 1}
         worker._stage3_early_send_terminals = {"r1": True, "r2": False}
         if registered:
             worker._stage3_registered_sends["r1"] = MagicMock(uuid=77)
         worker._settle_stage3_early_send_terminals(frozenset({"r1"}))
         assert worker._stage3_early_send_terminals == {"r2": False}
         assert worker._stage3_send_outcomes == ({"r1": "failed"} if registered else {})
+        assert worker._stage3_pending_registrations == {}
 
     def test_a_completed_send_completes_on_the_side_thread(self):
         worker, engine, facade, side = _stage3_option_producer({"async_complete": True})
