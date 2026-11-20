@@ -508,6 +508,8 @@ class TestTpuPlatform:
             "TORCH_TPU_DP_MASTER_ADDR",
             "TORCH_TPU_DP_MASTER_PORT",
             "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+            "TORCH_TPU_BASE_PORT",
+            "TORCH_TPU_MP_RENDEZVOUS_PORT",
         ):
             monkeypatch.setenv(key, os.environ.get(key, ""))
             monkeypatch.delenv(key)
@@ -578,7 +580,10 @@ class TestTpuPlatform:
     ):
         """The --nnodes and Ray branches never reach the multi-port bootstrap,
         so the platform refuses the option before it picks a branch."""
-        monkeypatch.setattr(tpu_platform.envs, "TPU_MULTIHOST_BACKEND", backend)
+        if backend:
+            monkeypatch.setenv("TPU_MULTIHOST_BACKEND", backend)
+        else:
+            monkeypatch.delenv("TPU_MULTIHOST_BACKEND", raising=False)
         vllm_config.additional_config = {"tpu_multiport_dp": {"enabled": True}}
         pc = vllm_config.parallel_config
         pc.nnodes = nnodes
@@ -594,7 +599,7 @@ class TestTpuPlatform:
     def test_multi_node_without_multiport_dp_is_unchanged(
         self, mock_multihost_env, mock_apply_patches, vllm_config, monkeypatch
     ):
-        monkeypatch.setattr(tpu_platform.envs, "TPU_MULTIHOST_BACKEND", "")
+        monkeypatch.delenv("TPU_MULTIHOST_BACKEND", raising=False)
         vllm_config.additional_config = {}
         vllm_config.parallel_config.nnodes = 2
         TpuPlatform.check_and_update_config(vllm_config)
