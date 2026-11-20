@@ -40,11 +40,13 @@ the blockwise Pallas kernel path instead.
 from __future__ import annotations
 
 import copy
+import re
 from collections.abc import Callable
 from math import gcd
 from typing import TYPE_CHECKING, cast
 
 import torch
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import refine_fp8_moe_block_shape
@@ -85,6 +87,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
     prebuild_fused_moe_kernel,
+    quantize_native_fp4_kmajor,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
     DCP_ROWS_ATTR,
@@ -138,6 +141,110 @@ _MOE_REQUANT_WEIGHT_DTYPES = {
 }
 if hasattr(torch, "float8_e5m2"):
     _MOE_REQUANT_WEIGHT_DTYPES["float8_e5m2"] = torch.float8_e5m2
+if hasattr(torch, "float4_e2m1fn_x2"):
+    _MOE_REQUANT_WEIGHT_DTYPES["fp4"] = torch.float4_e2m1fn_x2
+    _MOE_REQUANT_WEIGHT_DTYPES["float4_e2m1fn"] = torch.float4_e2m1fn_x2
+
+_concat_fp4_ops: dict[int, object] = {}
+
+# Set on a RoutedExperts layer once its weights are requantized:
+# (requant_dtype_name, requant_block_size, scale_desc, force_fp8).
+MOE_REQUANT_RECORD_ATTR = "_tpu_moe_weights_requanted"
+
+
+# `<parent>.layers.<i>` in a module prefix, e.g. `model.layers.78.mlp.experts`.
+_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+
+def _current_num_hidden_layers() -> int | None:
+    """`num_hidden_layers` of the model in the current vLLM config, if set."""
+    model_config = getattr(get_current_vllm_config_or_none(), "model_config", None)
+    hf_config = getattr(model_config, "hf_text_config", None) or getattr(
+        model_config, "hf_config", None
+    )
+    num_layers = getattr(hf_config, "num_hidden_layers", None)
+    return num_layers if isinstance(num_layers, int) else None
+
+
+def _is_mtp_moe_layer(prefix: str, num_hidden_layers: int | None = None) -> bool:
+    """Whether the MoE layer at `prefix` belongs to an MTP draft model.
+
+    `mtp.` prefixes always match. vLLM's DeepSeek-style MTP drafters, which
+    GLM-5 also uses, name their layers `model.layers.<i>` with `i` counted
+    from the target's `num_hidden_layers` up (`mtp_start_layer_idx`), so a
+    layer index at or past `num_hidden_layers` matches as well.
+    `num_hidden_layers` defaults to the current vLLM config's; when it is
+    unknown, only the `mtp.` forms match.
+    """
+    if prefix.startswith("mtp.") or ".mtp." in prefix:
+        return True
+    if num_hidden_layers is None:
+        num_hidden_layers = _current_num_hidden_layers()
+    if num_hidden_layers is None:
+        return False
+    match = _LAYER_INDEX_RE.search(prefix)
+    return match is not None and int(match.group(1)) >= num_hidden_layers
+
+
+def _mtp_moe_keeps_fp8(prefix: str, num_hidden_layers: int | None = None) -> bool:
+    """Whether this MTP MoE layer stays FP8 with per-channel scales while the
+    other routed experts are requantized to FP4 (unless
+    VLLM_TPU_MOE_REQUANT_MTP): FP4 draft experts cost acceptance."""
+    requant = _MOE_REQUANT_WEIGHT_DTYPES.get(envs.MOE_REQUANTIZE_WEIGHT_DTYPE)
+    return (
+        hasattr(torch, "float4_e2m1fn_x2")
+        and requant == torch.float4_e2m1fn_x2
+        and not envs.VLLM_TPU_MOE_REQUANT_MTP
+        and _is_mtp_moe_layer(prefix, num_hidden_layers)
+    )
+
+
+def _build_concat_fp4_fn(arity: int) -> Callable:
+    """`jnp.concatenate` over `arity` expert chunks along axis 0.
+
+    `pallas.jax_op` reads the JAX function's signature and needs a
+    `jax.Array` annotation on every argument, which `*xs` cannot carry, so
+    the function gets `arity` explicit positional parameters.
+    """
+    import inspect
+
+    import jax
+    import jax.numpy as jnp
+
+    def concat_fn(*xs):
+        return jnp.concatenate(xs, axis=0)
+
+    name = f"_fp4_concat_experts_{arity}"
+    concat_fn.__name__ = concat_fn.__qualname__ = name
+    concat_fn.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+        parameters=[
+            inspect.Parameter(
+                f"x{i}", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=jax.Array
+            )
+            for i in range(arity)
+        ],
+        return_annotation=jax.Array,
+    )
+    concat_fn.__annotations__ = {
+        **{f"x{i}": jax.Array for i in range(arity)},
+        "return": jax.Array,
+    }
+    return concat_fn
+
+
+def _concat_fp4_experts(chunks: list[torch.Tensor]) -> torch.Tensor:
+    from torch_tpu._internal import pallas
+
+    arity = len(chunks)
+    op = _concat_fp4_ops.get(arity)
+    if op is None:
+        op = pallas.jax_op(
+            f"pallas::fp4_concat_experts_{arity}",
+            _build_concat_fp4_fn(arity),
+        )
+        _concat_fp4_ops[arity] = op
+    return op(*chunks)  # type: ignore[misc]
+
 
 LinearQuantConfig = tuple[str, torch.dtype, int | None, bool]
 
@@ -197,8 +304,12 @@ def _dequantize_fp8_linear(
 
 def _get_moe_quant_config(
     log_prefix: str,
+    *,
+    force_fp8: bool = False,
 ) -> tuple[str, torch.dtype, int | None]:
     """Parse MoE quantization env vars and return (dtype_name, dtype, block_size)."""
+    if force_fp8:
+        return "float8_e4m3fn", torch.float8_e4m3fn, None
     if desired_quant_dtype_from_env := envs.MOE_REQUANTIZE_WEIGHT_DTYPE:
         desired_quant_dtype = desired_quant_dtype_from_env
     else:
@@ -409,12 +520,31 @@ def _quantize_and_format_single_moe_weight(
             pad_w = w.new_zeros(w.shape[0], w.shape[1], aligned_inter - inter)
             w = torch.cat([w, pad_w], dim=2).contiguous()
 
+    is_fp4 = (
+        hasattr(torch, "float4_e2m1fn_x2") and quant_dtype == torch.float4_e2m1fn_x2
+    )
+    if is_fp4 and block_size is None:
+        block_size = 512
+
     if block_size is not None and w.shape[-1] % block_size != 0:
         raise ValueError(
             f"Unsupported MoE quantization: {name} contracting "
             f"dimension {w.shape[-1]} is not divisible by "
             f"block_size={block_size}."
         )
+
+    if is_fp4:
+        assert block_size is not None
+        pack_for_gmm = not (
+            envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_ENABLE_W4A8
+        )
+        w_kmajor = fresh_buffer(w.transpose(1, 2).contiguous())
+        del w
+        w_fp4, w_scale = quantize_native_fp4_kmajor(
+            w_kmajor, block=block_size, pack=pack_for_gmm
+        )
+        del w_kmajor
+        return w_fp4, fresh_buffer(w_scale.contiguous())
 
     w, w_scale = quantize_tensor(
         w, quant_dtype=quant_dtype, axis=-1, block_size=block_size
@@ -459,7 +589,15 @@ def _requantize_expert_chunks(
     """
     num_experts = weight.shape[0]
     per_expert = weight[0].numel() * 4
-    per_chunk = max(1, _REQUANT_CHUNK_BYTES // per_expert)
+    is_fp4_target = (
+        hasattr(torch, "float4_e2m1fn_x2")
+        and format_kwargs.get("quant_dtype") == torch.float4_e2m1fn_x2
+    )
+    unpacked_fp4_target = (
+        is_fp4_target and envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_ENABLE_W4A8
+    )
+    chunk_budget = (2 << 30) if unpacked_fp4_target else _REQUANT_CHUNK_BYTES
+    per_chunk = max(1, chunk_budget // per_expert)
     weights, scales = [], []
     for start in range(0, num_experts, per_chunk):
         end = min(start + per_chunk, num_experts)
@@ -476,7 +614,8 @@ def _requantize_expert_chunks(
         scales.append(w_scale)
     if len(weights) == 1:
         return weights[0], scales[0]
-    w = torch.cat(weights, dim=0)
+    use_fp4_concat = is_fp4_target and weights[0].dtype != torch.uint8
+    w = _concat_fp4_experts(weights) if use_fp4_concat else torch.cat(weights, dim=0)
     w_scale = None if scales[0] is None else torch.cat(scales, dim=0)
     return w, w_scale
 
@@ -511,20 +650,47 @@ def _quantize_and_format_moe_weights(
     return w13, w13_scale, w2, w2_scale
 
 
+def _release_param_storage(param: torch.nn.Parameter | None) -> None:
+    """Release a replaced Parameter's backing buffer immediately.
+
+    vLLM's ``load_weights`` builds ``params_dict = dict(self.named_parameters())``
+    before streaming checkpoint shards, keeping Python references to the initial
+    ``Parameter`` wrappers until the last shard finishes. Pointing ``.data`` at a
+    one-element stub of the same device and dtype (``set_data`` rejects a device
+    change) drops the old FP8/BF16 buffer as soon as its chunked requantization
+    completes.
+    """
+    if param is not None and param.data.numel() > 1:
+        param.data = torch.empty((1,), dtype=param.data.dtype, device=param.data.device)
+
+
 def _process_fp8_moe_weights(
     layer: TpuRoutedExperts,
     *,
     weight_block_size: tuple[int, int] | None = None,
     activation: str,
+    force_fp8: bool = False,
+    release_inputs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int | None]:
     """Dequantize and requantize FP8 MoE weights for the TPU GMM kernel.
+
+    With `release_inputs`, the layer's checkpoint weight and scale storage is
+    released as soon as each of w13 and w2 is requantized, for a caller that
+    replaces those parameters with the results.
 
     Returns (w13_weight, w13_scale, w2_weight, w2_scale,
              requant_dtype_name, requant_block_size).
     """
     desired_quant_dtype, requant_dtype, requant_block_size = _get_moe_quant_config(
-        "[MoE requantization]: re-quantizing MoE weights"
+        "[MoE requantization]: re-quantizing MoE weights",
+        force_fp8=force_fp8,
     )
+    if (
+        hasattr(torch, "float4_e2m1fn_x2")
+        and requant_dtype == torch.float4_e2m1fn_x2
+        and requant_block_size is None
+    ):
+        requant_block_size = 512
 
     # Dequantize from checkpoint FP8 to float32
     w13_scale_param = getattr(
@@ -547,17 +713,17 @@ def _process_fp8_moe_weights(
         local_real = int(unpadded_intermediate or 0)
 
     if weight_block_size is not None:
-        # Validate block alignment
+        # Validate block alignment without retaining local tensor references.
         block_h, block_w = weight_block_size
-        for name, weight in (
-            ("w13_weight", layer.w13_weight.data),
-            ("w2_weight", layer.w2_weight.data),
+        for name, weight_shape in (
+            ("w13_weight", layer.w13_weight.shape),
+            ("w2_weight", layer.w2_weight.shape),
         ):
-            _, out_dim, in_dim = weight.shape
+            _, out_dim, in_dim = weight_shape
             if out_dim % block_h != 0 or in_dim % block_w != 0:
                 raise ValueError(
                     "FP8 block quantized MoE weights must be divisible by the "
-                    f"checkpoint block size, got {name}.shape={tuple(weight.shape)} "
+                    f"checkpoint block size, got {name}.shape={tuple(weight_shape)} "
                     f"and block_size={weight_block_size}."
                 )
 
@@ -622,6 +788,13 @@ def _process_fp8_moe_weights(
         block_size=requant_block_size,
         activation=activation,
     )
+    assert w13_scale is not None
+    if release_inputs:
+        if w13.device.type == "tpu":
+            synchronize_tensors([w13, w13_scale], wait=True)
+        _release_param_storage(layer.w13_weight)
+        _release_param_storage(w13_scale_param)
+
     w2, w2_scale = _requantize_expert_chunks(
         layer.w2_weight.data,
         w2_scale_param.data,
@@ -632,8 +805,13 @@ def _process_fp8_moe_weights(
         block_size=requant_block_size,
         activation=activation,
     )
+    assert w2_scale is not None
+    if release_inputs:
+        if w2.device.type == "tpu":
+            synchronize_tensors([w2, w2_scale], wait=True)
+        _release_param_storage(layer.w2_weight)
+        _release_param_storage(w2_scale_param)
 
-    assert w13_scale is not None and w2_scale is not None
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 
 
@@ -641,15 +819,29 @@ def _quantize_bf16_moe_weights(
     layer: TpuRoutedExperts,
     *,
     activation: str,
+    force_fp8: bool = False,
+    release_inputs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int | None]:
     """Quantize BF16 MoE weights to FP8 for the TPU GMM kernel.
 
     Same output format as _process_fp8_moe_weights but starts from BF16
-    weights instead of dequantizing from FP8 first.
+    weights instead of dequantizing from FP8 first. `release_inputs` is as
+    for _process_fp8_moe_weights.
     """
     desired_quant_dtype, requant_dtype, requant_block_size = _get_moe_quant_config(
-        "[MoE online FP8]: quantizing BF16 MoE weights"
+        "[MoE online FP8]: quantizing BF16 MoE weights",
+        force_fp8=force_fp8,
     )
+    if (
+        hasattr(torch, "float4_e2m1fn_x2")
+        and requant_dtype == torch.float4_e2m1fn_x2
+        and requant_block_size is None
+    ):
+        requant_block_size = (
+            64
+            if (envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_ENABLE_W4A8)
+            else 128
+        )
 
     def to_fp32(w: torch.Tensor, _scale: torch.Tensor | None) -> torch.Tensor:
         return w.to(torch.float32)
@@ -664,6 +856,12 @@ def _quantize_bf16_moe_weights(
         block_size=requant_block_size,
         activation=activation,
     )
+    assert w13_scale is not None
+    if release_inputs:
+        if w13.device.type == "tpu":
+            synchronize_tensors([w13, w13_scale], wait=True)
+        _release_param_storage(layer.w13_weight)
+
     w2, w2_scale = _requantize_expert_chunks(
         layer.w2_weight.data,
         None,
@@ -674,8 +872,11 @@ def _quantize_bf16_moe_weights(
         block_size=requant_block_size,
         activation=activation,
     )
-
-    assert w13_scale is not None and w2_scale is not None
+    assert w2_scale is not None
+    if release_inputs:
+        if w2.device.type == "tpu":
+            synchronize_tensors([w2, w2_scale], wait=True)
+        _release_param_storage(layer.w2_weight)
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 
 
@@ -762,7 +963,7 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                 moe_config = self.get_moe_config(layer)
                 return VllmUnquantizedFusedMoEMethod(moe_config)
             moe_config = self.get_moe_config(layer)
-            return VllmFp8MoEMethodTPU(self, moe_config)
+            return VllmFp8MoEMethodTPU(self, moe_config, prefix=prefix)
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(
@@ -798,9 +999,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
 
-    def __init__(self, quant_config: Fp8Config, moe_config):
+    def __init__(self, quant_config: Fp8Config, moe_config, *, prefix: str = ""):
         FusedMoEMethodBase.__init__(self, moe_config)
         self.quant_config = quant_config
+        self.prefix = prefix
+        # Read while the model is built, when the vLLM config is current: the
+        # weights may be requantized later, while the checkpoint streams in.
+        self._num_hidden_layers = _current_num_hidden_layers()
         self.weight_block_size = quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
         self.weight_scale_name = (
@@ -1002,16 +1207,15 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     def is_monolithic(self) -> bool:
         return True
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """
-        Process MoE weights into the runtime FP8 layout used by the GMM kernel.
+    def requantize_moe_layer_weights(self, layer: torch.nn.Module) -> bool:
+        """Requantize one RoutedExperts layer's weights and scales in place.
 
-        For FP8 checkpoints: dequantize block FP8 → float32, then requantize
-        to the GMM kernel's expected per-channel FP8 format.
-
-        For BF16 checkpoints (online quantization): quantize BF16 → FP8
-        directly using the same requantization path.
+        Pure per-rank tensor conversion (no cross-rank collectives), so it may
+        run either per layer during streaming load or at end-of-load. Returns
+        False if the layer was already requantized.
         """
+        if getattr(layer, MOE_REQUANT_RECORD_ATTR, None) is not None:
+            return False
         assert isinstance(layer, RoutedExperts)
         layer = cast("TpuRoutedExperts", layer)
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
@@ -1019,6 +1223,15 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
         activation_str = self._set_tpu_activation(layer)
 
+        force_fp8 = _mtp_moe_keeps_fp8(
+            self.prefix, getattr(self, "_num_hidden_layers", None)
+        )
+        if force_fp8:
+            logger.info(
+                "MTP MoE layer %s stays FP8 while routed experts are requantized "
+                "to FP4 (set VLLM_TPU_MOE_REQUANT_MTP=1 to requantize it too).",
+                self.prefix,
+            )
         is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
         if is_fp8_serialized:
             moe_block_shape = getattr(self, "moe_block_shape", self.weight_block_size)
@@ -1032,6 +1245,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                     layer,
                     weight_block_size=weight_block_size,
                     activation=activation_str,
+                    force_fp8=force_fp8,
+                    release_inputs=True,
                 )
             )
         else:
@@ -1039,6 +1254,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 _quantize_bf16_moe_weights(
                     layer,
                     activation=activation_str,
+                    force_fp8=force_fp8,
+                    release_inputs=True,
                 )
             )
 
@@ -1081,6 +1298,28 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             f"w2_scale={list(layer.w2_weight_scale_inv.shape)}, "
             f"requant_block_size={scale_desc}"
         )
+        # Read back by process_weights_after_loading, which may run long after
+        # this (at the end of loading) and must prebuild for these weights.
+        setattr(
+            layer,
+            MOE_REQUANT_RECORD_ATTR,
+            (requant_dtype_name, requant_block_size, scale_desc, force_fp8),
+        )
+        return True
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """
+        Process MoE weights into the runtime FP8/FP4 layout and prebuild ops.
+        """
+        assert isinstance(layer, RoutedExperts)
+        layer = cast("TpuRoutedExperts", layer)
+        self.requantize_moe_layer_weights(layer)
+        self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+        activation_str = self._tpu_activation_str
+        assert activation_str is not None
+        _, requant_block_size, scale_desc, force_fp8 = getattr(
+            layer, MOE_REQUANT_RECORD_ATTR
+        )
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
@@ -1092,27 +1331,46 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 activation=activation_str,
             )
             return
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            FUSED_MOE_EP_OP_ATTR,
+            prebuild_fused_moe_ep,
+            register_fused_scale_buffers,
+            register_score_bias_buffer,
+        )
+
+        is_fp4_weight = (
+            hasattr(torch, "float4_e2m1fn_x2")
+            and layer.w13_weight.dtype == torch.float4_e2m1fn_x2
+        )
+        is_packed_fp4_weight = layer.w13_weight.dtype == torch.uint8
+        if is_packed_fp4_weight:
+            import jax.numpy as jnp
+
+            self._rhs_quant_dtype = jnp.float4_e2m1fn
+        else:
+            self._rhs_quant_dtype = None
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            rhs_quant_dtype=self._rhs_quant_dtype,
         )
+        if force_fp8:
+            setattr(self, FUSED_MOE_EP_OP_ATTR, None)
+            return
+
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
         # collective inside the compiled graph. The result is recorded on this
         # method, which vLLM builds one of per MoE layer, so a layer the kernel
         # cannot serve is refused on its own rather than for the process.
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            FUSED_MOE_EP_OP_ATTR,
-            prebuild_fused_moe_ep,
-            register_score_bias_buffer,
-        )
-
         _ep_op = prebuild_fused_moe_ep(
             layer,
             topk=layer.moe_config.experts_per_token,
             renormalize=layer.renormalize,
             activation=activation_str,
+            weight_format="fp4" if is_fp4_weight else "fp8",
+            rhs_qb=requant_block_size if is_fp4_weight else None,
         )
         setattr(self, FUSED_MOE_EP_OP_ATTR, _ep_op)
         if _ep_op is not None:
@@ -1127,6 +1385,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # 'score_bias'`. Passing the operand at the call site is not
             # sufficient on its own; it has to exist.
             register_score_bias_buffer(layer)
+            if is_fp4_weight:
+                register_fused_scale_buffers(layer)
+                logger.info_once("FP8->FP4 fused EP W4A8 enabled: block-%s", scale_desc)
 
     def apply_monolithic(
         self,
@@ -1174,13 +1435,15 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         )
 
         if fused_moe_ep_supported(self):
+            w1_s = getattr(layer, "_tpu_fused_w13_scale", layer.w13_weight_scale_inv)
+            w2_s = getattr(layer, "_tpu_fused_w2_scale", layer.w2_weight_scale_inv)
             return fused_moe_ep(
                 self,
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
-                layer.w13_weight_scale_inv,
-                layer.w2_weight_scale_inv,
+                w1_s,
+                w2_s,
                 router_logits,
                 score_bias_operand(layer),
             )
@@ -1228,6 +1491,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "experts_start": layer._experts_start,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
+            "rhs_quant_dtype": getattr(self, "_rhs_quant_dtype", None),
         }
         if owns_collectives:
             return pipelined_fused_moe_gmm(**kwargs)

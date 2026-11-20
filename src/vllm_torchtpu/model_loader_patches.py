@@ -651,6 +651,61 @@ def _rss_gib() -> float:
         return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**30
 
 
+# Test hook allowing CPU unit tests to exercise the host-staging + early
+# per-layer MoE requantization path without physical TPU devices.
+_STAGE_ON_CPU_FOR_TEST = False
+_FP4_MOE_DTYPES = frozenset({"fp4", "e2m1", "float4_e2m1fn_x2"})
+
+
+def _early_moe_requant_enabled() -> bool:
+    explicit = envs.VLLM_TPU_MOE_EARLY_REQUANT
+    if explicit is not None:
+        return explicit
+    return (envs.MOE_REQUANTIZE_WEIGHT_DTYPE or "").lower() in _FP4_MOE_DTYPES
+
+
+def _maybe_requantize_completed_moe_layer(layer: torch.nn.Module) -> bool:
+    """Requantize ``layer``'s weights in place once all of its staged
+    parameters have landed cleanly, freeing the unquantized FP8 buffers."""
+    if not _early_moe_requant_enabled():
+        return False
+    if getattr(layer, "_tpu_moe_weights_requanted", None) is not None:
+        return False
+    qm = getattr(layer, "quant_method", None)
+    requant_fn = getattr(qm, "requantize_moe_layer_weights", None)
+    if requant_fn is None:
+        return False
+    quant_cfg = getattr(qm, "quant_config", None)
+    if not getattr(quant_cfg, "is_checkpoint_fp8_serialized", False):
+        return False
+    moe_cfg = getattr(qm, "moe", None)
+    if getattr(moe_cfg, "has_bias", False):
+        return False
+    scale_name = getattr(qm, "weight_scale_name", "weight_scale_inv")
+    req_names = (
+        "w13_weight",
+        "w2_weight",
+        f"w13_{scale_name}",
+        f"w2_{scale_name}",
+    )
+    params = [getattr(layer, name, None) for name in req_names]
+    if any(p is None for p in params):
+        return False
+    if not all(
+        getattr(p, "_tpu_stager_complete", False)
+        and not getattr(p, "_tpu_written_early", False)
+        for p in params
+    ):
+        return False
+    del params
+    if not requant_fn(layer):
+        return False
+    import gc
+
+    gc.collect()
+    return True
+
+
 class ExpertParamStager:
     """Host stand-ins for expert parameters while their experts stream in.
 
@@ -667,6 +722,7 @@ class ExpertParamStager:
         self._tracker = ExpertWriteTracker()
         self.written_early: set[int] = set()
         self.flushed = 0
+        self.early_requanted = 0
 
     def staging(self, param: torch.nn.Parameter) -> bool:
         """Whether writes to ``param`` still go through a stand-in.
@@ -674,7 +730,9 @@ class ExpertParamStager:
         A parameter written early keeps its later experts on the direct
         device path, so the early write is never overwritten.
         """
-        return id(param) not in self.written_early
+        return not getattr(param, "_tpu_written_early", False) and (
+            id(param) not in self.written_early
+        )
 
     def host_param(self, param: torch.nn.Parameter) -> torch.Tensor:
         entry = self._staged.get(id(param))
@@ -682,6 +740,7 @@ class ExpertParamStager:
             if len(self._staged) >= _MAX_STAGED:
                 oldest = next(iter(self._staged.values()))[0]
                 self.written_early.add(id(oldest))
+                oldest._tpu_written_early = True
                 self.flush(oldest)
             key = (tuple(param.shape), param.dtype)
             free = self._pool.get(key)
@@ -703,6 +762,8 @@ class ExpertParamStager:
         if not self._tracker.record(param, expert_id, shard_id):
             return False
         self.flush(param)
+        if not getattr(param, "_tpu_written_early", False):
+            param._tpu_stager_complete = True
         return True
 
     def flush(self, param: torch.nn.Parameter) -> None:
@@ -721,7 +782,7 @@ class ExpertParamStager:
         per_row = max(1, host[0].numel() * host.element_size())
         step = max(1, _UPLOAD_CHUNK_BYTES // per_row)
         chunks = [
-            host[start : start + step].to(device)
+            host[start : start + step].to(device, copy=True)
             for start in range(0, host.shape[0], step)
         ]
         param.data = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
@@ -792,7 +853,7 @@ def patch_moe_expert_write_staging() -> None:
         # Experts of other ranks and parameters already written early take
         # the direct path, which skips or writes them as before.
         if (
-            param.data.device.type != "tpu"
+            (param.data.device.type != "tpu" and not _STAGE_ON_CPU_FOR_TEST)
             or not stager.staging(param)
             or self._map_global_expert_id_to_local_expert_id(expert_id) == -1
         ):
@@ -814,8 +875,12 @@ def patch_moe_expert_write_staging() -> None:
             expert_id,
             return_success=return_success,
         )
-        if result is not False:
-            stager.written(param, expert_id, shard_id)
+        if (
+            result is not False
+            and stager.written(param, expert_id, shard_id)
+            and _maybe_requantize_completed_moe_layer(self)
+        ):
+            stager.early_requanted += 1
         calls[0] += 1
         if calls[0] % 1000 == 0:
             logger.debug(
@@ -828,11 +893,14 @@ def patch_moe_expert_write_staging() -> None:
 
     def process_weights_after_loading(model, model_config, target_device):
         during_load = stager.flushed
+        early_req = stager.early_requanted
         stager.flush_all()
         logger.info(
             "Expert parameters written to the device: %d as their last "
-            "expert landed, %d at the end of loading.",
+            "expert landed (%d MoE layers requantized during load), "
+            "%d at the end of loading.",
             during_load,
+            early_req,
             stager.flushed - during_load,
         )
         return orig_process(model, model_config, target_device)
