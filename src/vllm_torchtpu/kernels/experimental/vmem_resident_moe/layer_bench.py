@@ -139,17 +139,34 @@ def main():
 
     b = a.check_tokens
     check_err = 0.0
-    sched, x0, gate, ws, args, _ = _setup(mesh, dims_for(b), b, n_lo, a.top_k, 0)
+    # Fixed 4 steps: a bf16 wire's error compounds per serial step in this
+    # synthetic recurrence, so the check must not move with --steps. The f32
+    # wire is exact and is the regression check; bf16 is reported alongside.
+    check_steps = 4
+    sched, x0, gate, ws, args, _ = _setup(mesh, dims_for(b), b, check_steps, a.top_k, 0)
     ref = np.asarray(K.reference(sched, x0, gate, ws))[:b]
     for w in ("resident", "streamed"):
-        f = L.build_layer(mesh, weights=w, allreduce=True, steps=n_lo, **common_for(b))
-        out = f(*args)
-        errs = [
-            float(np.max(np.abs(np.asarray(s.data)[:b] - ref)))
-            for s in out.addressable_shards
-        ]
-        check_err = max(check_err, *errs)
-        _emit("CHECK", {"weights": w, "max_abs_err_per_local_device": errs})
+        for dt in ("float32", a.ar_dtype):
+            kw = dict(common_for(b), ar_dtype=jnp.dtype(dt))
+            f = L.build_layer(mesh, weights=w, allreduce=True, steps=check_steps, **kw)
+            out = f(*args)
+            errs = [
+                float(np.max(np.abs(np.asarray(s.data)[:b] - ref)))
+                for s in out.addressable_shards
+            ]
+            if dt == a.ar_dtype:
+                check_err = max(check_err, *errs)
+            _emit(
+                "CHECK",
+                {
+                    "weights": w,
+                    "wire": dt,
+                    "steps": check_steps,
+                    "max_abs_err_per_local_device": errs,
+                },
+            )
+            if dt == a.ar_dtype:
+                break
 
     if a.point:
         arm, b = a.point.split(":")

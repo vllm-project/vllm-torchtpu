@@ -172,6 +172,15 @@ identical. µs per step:
   (|ref| ≈ 4). It is a precision trade, not a free win. The experiment owner
   accepted it (2026-11-19), so `layer_bench.py` now defaults to
   `--ar-dtype bfloat16`. `float32` stays available as the exact arm.
+* The bf16 check error is not a model-quality number. It compounds with the
+  number of serial steps in this synthetic recurrence: random weights,
+  RMS-normed output fed straight back through fp8 quantization, no residual.
+  It is 0.58 after 4 steps and ~2.9 after 8 (bisect job
+  `j-0ec45276-ea87-433f-af5c`, every rows / wire / quantize-once variant).
+  The f32 wire stays at 1e-6 at any step count. `layer_bench.py` therefore
+  checks at a fixed 4 steps, with the f32 wire as the regression check. Only
+  an accuracy eval of a served model can settle whether a bf16 all-reduce is
+  acceptable.
 * Noise: the no-AR arms do not depend on the wire dtype, yet B = 64
   streamed/no-AR read 17.4 µs in one run and 22.3 µs in the other, and B = 1
   rows swing by ~2 µs. A single run resolves about ±25%. Rows below 1.2× are
