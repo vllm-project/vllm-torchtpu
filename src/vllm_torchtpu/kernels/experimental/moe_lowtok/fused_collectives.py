@@ -814,15 +814,19 @@ def moe_lowtok_fused(
     """The routed-expert sum of this engine's rows, with the collectives in the kernel.
 
     Inside a shard_map over a (DP_AXIS, TP_AXIS) mesh; `rank` ([2] int32) is
-    this core's index on each axis, as data (the torch bridge's export path
-    refuses `lax.axis_index`). `x` [rows, hidden] bf16 and `logits`
+    this core's index on each axis, as data: outside a kernel
+    `lax.axis_index` lowers to `partition-id`, which the torch bridge's
+    export path refuses. `x` [rows, hidden] bf16 and `logits`
     [rows, experts] bf16 are this engine's own rows; the kernel gathers them
     over the DP axis, and the result is this engine's rows [rows, hidden]
     summed over every rank. This rank holds experts
     [experts_start, experts_start + E): E must divide LANE and experts_start
-    must be a multiple of E (linear expert-parallel placement), so that the
-    rank's experts sit in one LANE-wide block of the routing table, the block
-    the routed-row gather reads. `dispatch_fp8` pushes
+    must be a multiple of E, so that the rank's experts sit in one LANE-wide
+    block of the routing table, the block the routed-row gather reads. E is
+    checked here; experts_start is traced, so the caller guarantees it. The
+    torch op passes `moe_routing.get_experts_start`, rank x E under linear
+    expert-parallel placement when every rank holds E experts, as the logits
+    check below requires. `dispatch_fp8` pushes
     the rows quantized per row to fp8 with their scale (half the bytes, the
     same values the kernel computes from bf16 rows); it needs row blocks of
     whole fp8 tiles (`fp8_dispatch_fits`).

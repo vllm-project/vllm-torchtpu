@@ -59,6 +59,14 @@ def mesh_axes(axes):
 
 
 def peer(j, axis, dict_ids):
+    """The device id of core ``j`` on ``axis``, with this core's index on the
+    mesh's other axes (``mesh_axes``).
+
+    ``lax.axis_index`` here runs inside the kernel body, where Mosaic lowers it
+    to the core's own mesh coordinates; only outside a kernel does it lower to
+    ``partition-id``, which the torch bridge's export path refuses, hence
+    ``rank`` as data for the collective's own axis (``split_rank``).
+    """
     others = [a for a in _MESH_AXES if a != axis]
     if dict_ids:
         ids = {axis: jnp.int32(j)}

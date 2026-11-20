@@ -131,9 +131,10 @@ def _build_all_reduce(mesh):
 
 
 def _build_tp_all_reduce(mesh, tp: int):
-    """The all-reduce over the TP pairs of the mesh seen as (dp, tp): mesh
-    index i is the TP partner of i ^ (tp - 1) group-wise, which `prebuild`
-    checks against the torch TP group before arming."""
+    """The all-reduce over the TP groups of the mesh seen as (dp, tp): the TP
+    group of mesh index i is the other cores of its block of tp consecutive
+    indices, which `prebuild` checks against the torch TP group before
+    arming."""
     n = mesh.shape[EP_AXIS_NAME]
     axes = (_PAIR_DP_AXIS, _PAIR_TP_AXIS)
     mesh2 = Mesh(np.asarray(mesh.devices).reshape(n // tp, tp), axis_names=axes)
