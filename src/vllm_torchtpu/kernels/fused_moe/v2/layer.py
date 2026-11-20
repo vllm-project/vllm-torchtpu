@@ -48,9 +48,11 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     shard_expert_slabs,
     shard_push_tables_in_rows,
     shard_token_gather,
+    shard_token_gather_sorted,
     shard_transport_tables_in_blocks,
     slab_scatter,
     slab_tables_on_tensorcore,
+    token_gather_sort_fits,
     token_gather_window_rows,
     weight_form,
     weight_format_of_dtype,
@@ -518,10 +520,11 @@ def fused_ep_moe_v2(
     # How the two slab tables are built, read off the same device record as
     # the kernel's VMEM budget: on a chip whose small SparseCore does not take
     # the scatter-add (see TENSORCORE_TABLES_MAX_SC_SUBCORES) they are built on
-    # the TensorCore: the scale slab is a lookup where it fits and any scatter
-    # left is a set; otherwise both stay scatter-adds. The mesh in the cache
-    # key below already pins the chip; the choices are in the key as well, so a
-    # caller that forces one (a test, an A/B) never gets another's body.
+    # the TensorCore: the token-gather table is a sort and the scale slab a
+    # lookup, each where it fits, and any scatter left is a set; otherwise both
+    # tables stay scatter-adds. The mesh in the cache key below already pins
+    # the chip; the three choices are in the key as well, so a caller that
+    # forces one (a test, an A/B) never gets another's body.
     tables_on_tensorcore = slab_tables_on_tensorcore()
     slab_by_set = tables_on_tensorcore
     # The activation-scale slab by lookup through the token-gather table
@@ -530,10 +533,21 @@ def fused_ep_moe_v2(
     scale_by_lookup = bool(
         tables_on_tensorcore and form.quantized_activations and scale_slab_fits(T)
     )
+    # The token-gather table by sort (shard_token_gather_sorted): where the
+    # sort keys fit in int32.
+    gather_by_sort = bool(
+        tables_on_tensorcore and token_gather_sort_fits(T, topk, e_total=e_total, ep=ep)
+    )
     logger.info_once(
-        "fused_ep_moe_v2: slab tables built with a scatter-%s; scale slab by %s",
+        "fused_ep_moe_v2: token-gather table by %s, scale slab by %s; "
+        "slab scatters (where left) by scatter-%s",
+        "sort" if gather_by_sort else "scatter",
+        (
+            ("lookup" if scale_by_lookup else "scatter")
+            if form.quantized_activations
+            else "none"
+        ),
         "set" if slab_by_set else "add",
-        "lookup" if scale_by_lookup else "scatter",
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -717,10 +731,11 @@ def fused_ep_moe_v2(
             routing, me, e_total=e_total, ep=ep
         )
         row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
-        # The slab scatters (the token-gather table, and the scale slab where
-        # it is not a lookup) run against this shard's own slab. The rows of
-        # the other shards are dropped where they are computed rather than
-        # built into a replicated slab and sliced away afterwards.
+        # The slab scatters (the token-gather table where it is not a sort,
+        # and the scale slab where it is not a lookup) run against this
+        # shard's own slab. The rows of the other shards are dropped where
+        # they are computed rather than built into a replicated slab and
+        # sliced away afterwards.
         slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
         # On a chip with a full SparseCore the two slab scatters and the
         # activation all-gather are offloaded to the SAME SparseCore, where
@@ -732,18 +747,39 @@ def fused_ep_moe_v2(
         # front of the collective is longer than the scatters behind it. Same
         # bits either way; only the queue moves. The barrier is taken on every
         # chip, including one that builds the tables on the TensorCore: there
-        # the scatters share no queue with the collective, the barrier holds
-        # them until the gathered activations arrive, and that trade has not
-        # been measured.
-        if t_local >= AGQ_MIN_LOCAL_TOKENS:
-            slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
-        token_gather = shard_token_gather(
-            routing,
-            me,
-            shard_stride=ragged_stride,
-            rows=slab_row,
-            by_set=slab_by_set,
-        )
+        # the table builds share no queue with the collective, the barrier
+        # holds them until the gathered activations arrive, and that trade has
+        # not been measured.
+        #
+        # Where its keys fit, the token-gather table is a sort of the routed
+        # pairs rather than a scatter through slab_row (see
+        # shard_token_gather_sorted). With the scale slab built from that
+        # table by lookup, nothing reads slab_row any more and its per-pair
+        # plan pass drops out of the program as well. The barrier then holds
+        # the sort; a scale-slab scatter left past the lookup's budget reads
+        # slab_row outside it, which has not been measured either way.
+        if gather_by_sort:
+            sort_ids = pairs_g
+            if t_local >= AGQ_MIN_LOCAL_TOKENS:
+                sort_ids, q_g = lax.optimization_barrier((sort_ids, q_g))
+            token_gather = shard_token_gather_sorted(
+                sort_ids,
+                routing,
+                me,
+                e_total=e_total,
+                ep=ep,
+                shard_stride=ragged_stride,
+            )
+        else:
+            if t_local >= AGQ_MIN_LOCAL_TOKENS:
+                slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
+            token_gather = shard_token_gather(
+                routing,
+                me,
+                shard_stride=ragged_stride,
+                rows=slab_row,
+                by_set=slab_by_set,
+            )
         # The table in mesh order, which is the order the routing payload --
         # and so the per-token row scales the scale slab looks up through it --
         # was gathered in, whatever order q_g was.
@@ -1043,6 +1079,7 @@ def fused_ep_moe_v2(
         bool(w2_scales_expert_second_minor),
         slab_by_set,
         scale_by_lookup,
+        gather_by_sort,
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),

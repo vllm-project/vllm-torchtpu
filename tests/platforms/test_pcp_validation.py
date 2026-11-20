@@ -19,6 +19,8 @@ import pytest
 # Initialize vLLM's plugin registry before importing the plugin package.
 import vllm  # noqa: F401
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.gdn_pool_layout import QWEN_GDN_ARCHITECTURES
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 
 
@@ -34,9 +36,12 @@ def _vllm_config(
     kv_role=None,
     is_moe_model=None,
     enable_expert_parallel=False,
+    architecture=None,
 ):
     return SimpleNamespace(
-        model_config=None,
+        model_config=(
+            None if architecture is None else SimpleNamespace(architecture=architecture)
+        ),
         additional_config={},
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=pcp_size,
@@ -260,3 +265,80 @@ def test_static_validator_does_not_restrict_non_pcp_mtp_k3_consumer():
     )
 
     assert config.enabled is False
+
+
+@pytest.mark.parametrize("use_pcp_manager", [False, True])
+@pytest.mark.parametrize("architecture", sorted(QWEN_GDN_ARCHITECTURES))
+@pytest.mark.parametrize("interleave_size", [0, 1, 2, 4, 8, 15, 24])
+def test_pooled_qwen_gdn_pcp_rejects_unaligned_interleave(
+    monkeypatch, use_pcp_manager, architecture, interleave_size
+):
+    monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
+    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", use_pcp_manager)
+    with pytest.raises(ValueError, match="multiple of 16"):
+        PcpStaticSupportValidator.validate_platform_config(
+            _vllm_config(
+                pcp_size=4,
+                interleave_size=interleave_size,
+                architecture=architecture,
+            ),
+            kv_cache_layout="NHD",
+        )
+
+
+@pytest.mark.parametrize("use_pcp_manager", [False, True])
+@pytest.mark.parametrize("interleave_size", [16, 32, 64, 128, 256])
+def test_pooled_qwen_gdn_pcp_accepts_aligned_interleave(
+    monkeypatch, use_pcp_manager, interleave_size
+):
+    monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
+    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", use_pcp_manager)
+    config = PcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(
+            pcp_size=4,
+            interleave_size=interleave_size,
+            architecture="Qwen3_5MoeForConditionalGeneration",
+        ),
+        kv_cache_layout="NHD",
+    )
+
+    assert config.enabled is True
+    assert config.interleave_size == interleave_size
+
+
+def test_qwen_gdn_sub16_interleave_allowed_without_pcp_or_unified_pool(monkeypatch):
+    monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
+    non_pcp = PcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(
+            pcp_size=1,
+            interleave_size=1,
+            architecture="Qwen3_5MoeForConditionalGeneration",
+        ),
+        kv_cache_layout="NHD",
+    )
+    assert non_pcp.enabled is False
+
+    monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "0")
+    unpooled = PcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(
+            pcp_size=4,
+            interleave_size=4,
+            architecture="Qwen3_5MoeForConditionalGeneration",
+        ),
+        kv_cache_layout="NHD",
+    )
+    assert unpooled.enabled is True
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["DeepseekV4ForCausalLM", "KimiK3ForConditionalGeneration", "LlamaForCausalLM"],
+)
+def test_non_qwen_pcp_allows_sub16_interleave_under_nhd(monkeypatch, architecture):
+    monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
+    config = PcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(pcp_size=4, interleave_size=4, architecture=architecture),
+        kv_cache_layout="NHD",
+    )
+
+    assert config.enabled is True

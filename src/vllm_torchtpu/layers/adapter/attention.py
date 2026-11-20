@@ -21,6 +21,7 @@ from typing import Any, ClassVar, cast
 
 import jax
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.compilation import backends as vllm_compilation_backends
@@ -282,6 +283,7 @@ def _pallas_rpa_kernel_impl(
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
     block_major: bool = False,
+    subpage_split: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     pool_shape = kv_cache.shape
     # Fold the block-major pool's `(num_blocks, rows_per_block, *page)` layout so
@@ -314,14 +316,22 @@ def _pallas_rpa_kernel_impl(
             )
         native_page_elements = math.prod(native_shape[1:])
         # A padded pool page can span several of this layer's native pages.
-        page_stride = math.prod(pool_shape[1:]) // native_page_elements
+        pages_per_pool_page = math.prod(pool_shape[1:]) // native_page_elements
         packing = native_shape[3]
         packed_pool_shape = (pool_shape[0], pool_shape[1], 1, packing, pool_shape[3])
         kv_cache = _reshape_packed_kv_cache(
             kv_cache.reshape(packed_pool_shape),
-            (pool_shape[0] * page_stride, *native_shape[1:]),
+            (pool_shape[0] * pages_per_pool_page, *native_shape[1:]),
         )
-        block_tables = block_tables * page_stride
+        # A `KernelBlockTable` already holds `subpage_split` ids per pool page,
+        # so only the remaining factor is applied here.
+        assert pages_per_pool_page % subpage_split == 0, (
+            f"pool page holds {pages_per_pool_page} native pages, not a "
+            f"multiple of subpage_split ({subpage_split})"
+        )
+        table_scale = pages_per_pool_page // subpage_split
+        if table_scale > 1:
+            block_tables = block_tables * table_scale
     metadata = AttentionMetadata(
         # NOTE: vLLM applies RoPE before attention,
         # so input_positions is not consumed here.
@@ -556,6 +566,7 @@ def _pallas_rpa_kernel_batched(
     kv_layout: batched_rpa_configs.KVLayout,
     decode_query_size: int = 1,
     block_major: bool = False,
+    subpage_split: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
@@ -587,6 +598,7 @@ def _pallas_rpa_kernel_batched(
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
         block_major=block_major,
+        subpage_split=subpage_split,
     )
 
 
@@ -703,6 +715,16 @@ class PallasAttentionBackend(AttentionBackend):
         return (VllmKVCacheLayout.LBNHC,)
 
     @classmethod
+    def supports_subpage_packing(cls) -> bool:
+        """Whether unequal attention pages may share one pool as sub-pages.
+
+        Off for this backend: packing has only been measured with the
+        batched-RPA kernel, and `_pallas_rpa_kernel_default` does not take
+        `subpage_split`.
+        """
+        return False
+
+    @classmethod
     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
         # TPU kernels consume packed records, including head/lane padding.
         # Publish their byte geometry so vLLM computes native L/B strides
@@ -781,6 +803,11 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["PallasBatchedRPAAttentionBackendImpl"]:
         return PallasBatchedRPAAttentionBackendImpl
+
+    @classmethod
+    def supports_subpage_packing(cls) -> bool:
+        # Sub-page packing has only been benchmarked on TPU_7X.
+        return get_chip_version() == pltpu.ChipVersion.TPU_7X
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[VllmKVCacheLayout, ...]:
@@ -954,6 +981,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # `(pool_index, layout)` identifying this layer's region in the merged
         # block-major unified pool; populated by `set_block_major_pool()`.
         self._bm_region: tuple[int, BlockMajorPoolLayout] | None = None
+        # Kernel pages per manager block for this layer in a shared 4D pool.
+        self._subpage_split = 1
+
+    def set_subpage_split(self, subpage_split: int) -> None:
+        """Set how many kernel pages one of this layer's manager blocks spans."""
+        assert subpage_split >= 1
+        if self._subpage_split != subpage_split:
+            self._subpage_split = subpage_split
+            self._kernel_config_cache.clear()
 
     def set_block_major_pool(
         self, pool_index: int, layout: BlockMajorPoolLayout
@@ -1002,6 +1038,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
+            self._subpage_split,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -1044,6 +1081,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
+            self._subpage_split,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1093,6 +1131,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
                         "pool"
                     )
                 entry_kwargs["block_major"] = True
+            if self._subpage_split != 1:
+                if "subpage_split" not in entry_params:
+                    raise NotImplementedError(
+                        f"{type(self).__name__} kernel {self._kernel_entry.__name__} "
+                        "does not support sub-page packing"
+                    )
+                entry_kwargs["subpage_split"] = self._subpage_split
             wrapped_fn = functools.partial(
                 self._kernel_entry,
                 mesh=mesh,

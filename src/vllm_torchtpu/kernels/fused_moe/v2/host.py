@@ -1014,12 +1014,15 @@ def local_slab_rows(routing, me, *, shard_stride):
 # compiler offloads a scatter-add to a full SparseCore (v7x and TPU8t: 2 x 16;
 # v6e 2 x 16; v5p 4 x 16), both slab tables stay scatter-adds: the SparseCore
 # runs them async, beside the activation all-gather, and they cost the
-# TensorCore almost nothing, while a scatter-set stays on the TensorCore at
-# about three times the add's wall. TPU8i's SparseCore is 1 x 4 and XLA
-# offloads neither scatter form, so both run on the TensorCore one element at
-# a time; there the set costs about half the add, which reads each destination
-# back first (1.74x at 16k tokens, 1.76x at 1.5k, measured on TPU8i). A chip
-# without a SparseCore keeps the add too: the set has not been measured there.
+# TensorCore almost nothing. Every alternative is TensorCore work there: a
+# scatter-set (about 3x the add's wall), the scale-slab lookup kernel and the
+# token-gather sort (+0.36 ms a layer between them at 16k tokens, measured on
+# v7x, EP8). TPU8i's SparseCore is 1 x 4 and XLA offloads neither scatter form,
+# so both run on the TensorCore one element at a time (0.95 ms each at 16k);
+# there the token-gather table is a sort, the scale slab a lookup through it,
+# and any scatter left (past the sort's or the lookup's limits) a set, which
+# skips the add's read-back. A chip without a SparseCore keeps the adds too:
+# the TensorCore builds have not been measured there.
 TENSORCORE_TABLES_MAX_SC_SUBCORES = 4
 
 
@@ -1028,11 +1031,11 @@ def slab_tables_on_tensorcore(info=None):
 
     True, for a chip whose SparseCore has at most
     TENSORCORE_TABLES_MAX_SC_SUBCORES subcores, selects the TensorCore builds
-    (the scale-slab lookup, and a scatter-set for any scatter left). False
-    keeps both tables scatter-adds: a full SparseCore runs them, and a chip
-    without one keeps them until the TensorCore builds are measured there. Read
-    off the same device record the VMEM accounting reads, so the layer answers
-    it once per build.
+    (token-gather sort, scale-slab lookup, scatter-set for any scatter left).
+    False keeps both tables scatter-adds: a full SparseCore runs them, and a
+    chip without one keeps them until the TensorCore builds are measured there.
+    Read off the same device record the VMEM accounting reads, so the layer
+    answers it once per build.
     """
     if info is None:
         info = pltpu.get_tpu_info()
@@ -1099,6 +1102,82 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None, by_set=False):
     gather_lo, gather_hi = gather_clamp_bounds(T)
     scattered = slab_scatter(shard_stride, row, token_of_pair, by_set=by_set)
     return jnp.clip(scattered, jnp.int32(gather_lo), jnp.int32(gather_hi))
+
+
+def token_gather_sort_fits(n_tokens, topk, *, e_total, ep):
+    """Whether shard_token_gather_sorted's sort keys fit in int32."""
+    run_span = (n_tokens // ep) * topk + (ROWBLK - 1)
+    return e_total * run_span < 2**31
+
+
+def shard_token_gather_sorted(expert_ids, routing, me, *, e_total, ep, shard_stride):
+    """shard_token_gather built by one sort instead of a scatter.
+
+    The scatter writes every routed pair of every shard to find the few
+    that land here: where XLA runs it on the TensorCore one element at a
+    time (TPU8i), that is most of the time between the routing exchange and
+    the kernel. The slab is a sorted order, though. This shard's experts sit
+    back to back; inside an expert, the runs of the sources follow in source
+    order, each padded to a whole ROWBLK; inside a run, the pairs keep their
+    pair order. Sorting every pair on the key (local expert, source, position
+    in the source) puts the pairs that land here first, in slab order, and
+    the off-shard pairs after them on one key past every live one. A pair
+    whose expert id is outside [0, e_total) -- the id e_total the layer gives
+    padding rows -- is in no local expert, so it takes the off-shard key, as
+    both plan builders send it off-shard.
+
+    The run padding goes into the same sort: each (expert, source) run
+    carries ROWBLK - 1 extra elements with token 0 and the keys just past
+    the run's own pairs. The ones the run's padding uses keep those keys;
+    the others take the off-shard key. So the sorted token numbers are the
+    slab's live rows exactly, and everything after them is cleared, as the
+    scatter left the rows no pair lands on.
+
+    `expert_ids` holds the expert of each routed pair in pair order: source
+    by source, each source's t_local * topk pairs in token order, which is
+    the gathered routing payload as it arrives. The same bits as
+    shard_token_gather, clip included; token_gather_sort_fits says where the
+    keys hold.
+    """
+    T, K = routing.pair_grid
+    g_local = e_total // ep
+    src_pairs = (T // ep) * K
+    pad_slots = ROWBLK - 1
+    run_span = src_pairs + pad_slots
+    off_key = jnp.int32(g_local * ep * run_span)
+    first = me * g_local
+
+    g = expert_ids.reshape(ep, src_pairs).astype(jnp.int32) - first
+    on_me = (g >= 0) & (g < g_local)
+    src = lax.broadcasted_iota(jnp.int32, (ep, src_pairs), 0)
+    pos = lax.broadcasted_iota(jnp.int32, (ep, src_pairs), 1)
+    pair_key = jnp.where(on_me, (g * ep + src) * run_span + pos, off_key)
+    token_of_pair = jnp.broadcast_to(
+        jnp.arange(T, dtype=jnp.int32)[:, None], (T, K)
+    ).reshape(ep, src_pairs)
+
+    run_pad = lax.dynamic_slice(
+        routing.run_rows_aligned - routing.run_rows, (first, 0), (g_local, ep)
+    )
+    slot = lax.broadcasted_iota(jnp.int32, (g_local, ep, pad_slots), 2)
+    run_key = (
+        jnp.arange(g_local, dtype=jnp.int32)[:, None] * ep
+        + jnp.arange(ep, dtype=jnp.int32)[None, :]
+    ) * run_span + src_pairs
+    pad_key = jnp.where(slot < run_pad[:, :, None], run_key[:, :, None] + slot, off_key)
+
+    keys = jnp.concatenate([pair_key.reshape(-1), pad_key.reshape(-1)])
+    tokens = jnp.concatenate(
+        [token_of_pair.reshape(-1), jnp.zeros((pad_key.size,), jnp.int32)]
+    )
+    keys, tokens = lax.sort((keys, tokens), num_keys=1, is_stable=False)
+    table = jnp.where(keys < off_key, tokens, 0)
+    if table.shape[0] >= shard_stride:
+        table = table[:shard_stride]
+    else:
+        table = jnp.pad(table, (0, shard_stride - table.shape[0]))
+    gather_lo, gather_hi = gather_clamp_bounds(T)
+    return jnp.clip(table, jnp.int32(gather_lo), jnp.int32(gather_hi))
 
 
 def expert_visit_list(rows, g_local):

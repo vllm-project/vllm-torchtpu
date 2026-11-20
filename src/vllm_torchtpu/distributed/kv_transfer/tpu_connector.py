@@ -168,6 +168,19 @@ _STAGE3_LEGACY_ROUTING_FIELDS = frozenset(
 )
 
 
+def _stage3_transfer_released(exc: BaseException) -> bool:
+    """True when the failed transfer left no receiver on this engine.
+
+    tpu_sync raises TransferReleasedError for it; older wheels lack the class.
+    """
+    try:
+        from tpu_sync.api.torch import reshard_client
+    except ImportError:
+        return False
+    released_error = getattr(reshard_client, "TransferReleasedError", None)
+    return released_error is not None and isinstance(exc, released_error)
+
+
 def _select_committed_mamba_blocks(
     block_tables: list[list[int]],
     num_speculative_blocks: int,
@@ -5667,13 +5680,17 @@ class TPURaidenConnectorWorker:
                     outcome = tp_group.broadcast_object(outcome, src=0)
                 assert outcome is not None
                 status, submit_ms, error_text, skip_tokens, fa_skip_bytes = outcome
-                if status == "failed":
+                if status in ("failed", "released"):
                     # FA D5 lookup and local validation fail before receiver
-                    # arming, so no late H2D is possible.
+                    # arming, and a released transfer left no receiver, so no
+                    # late H2D is possible.
                     self._record_stage3_load_failure(destination_req_id, local_blocks)
                     logger.error(
-                        "Stage-3 controller transfer failed before receiver "
-                        "arming req_id=%s destination_req_id=%s uuid=%d: %s",
+                        "Stage-3 controller transfer failed %s req_id=%s "
+                        "destination_req_id=%s uuid=%d: %s",
+                        "before receiver arming"
+                        if status == "failed"
+                        else "with no receiver left",
                         source_req_id,
                         destination_req_id,
                         uuid,
@@ -6193,12 +6210,15 @@ class TPURaidenConnectorWorker:
                 "Remote Controller Server execution failed: Layout "
                 "fingerprint mismatch between source and destination"
             )
-            if (
+            prearm_failure = (
                 missing_registration
                 or cancelled_registration
                 or unsent_connection_failure
                 or layout_mismatch
-            ):
+            )
+            # The source controller confirmed that no receiver is left.
+            released = never_accepted and _stage3_transfer_released(exc)
+            if prearm_failure or released:
                 # These registration lookup replies and the layout comparison
                 # precede receiver arming for this submission, and an exact
                 # pre-send connection failure never reached the source. Match
@@ -6218,8 +6238,11 @@ class TPURaidenConnectorWorker:
                     else ""
                 )
                 logger.error(
-                    "Stage-3 controller transfer failed before receiver "
-                    "arming req_id=%s destination_req_id=%s uuid=%d: %s%s",
+                    "Stage-3 controller transfer failed %s req_id=%s "
+                    "destination_req_id=%s uuid=%d: %s%s",
+                    "before receiver arming"
+                    if prearm_failure
+                    else "with no receiver left",
                     source_req_id,
                     destination_req_id,
                     uuid,
@@ -6427,6 +6450,7 @@ class TPURaidenConnectorWorker:
         """Runs the source-store coordination for one request and classifies
         the result: ``("accepted", submit_ms, "", skip_tokens, fa_skip_bytes)``
         | ``("failed", None, text, 0, 0)`` (before receiver arming)
+        | ``("released", None, text, 0, 0)`` (no receiver left)
         | ``("uncertain", None, text, 0, 0)`` (after)."""
         controller_contacted = False
         fa_accepted = False
@@ -6498,6 +6522,8 @@ class TPURaidenConnectorWorker:
                 )
             ):
                 return ("failed", None, str(exc), 0, 0)
+            if not fa_accepted and _stage3_transfer_released(exc):
+                return ("released", None, str(exc), 0, 0)
             return ("uncertain", None, str(exc), 0, 0)
         return ("accepted", submit_ms, "", skip_tokens, fa_skip_bytes)
 
