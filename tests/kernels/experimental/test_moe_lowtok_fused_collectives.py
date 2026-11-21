@@ -658,9 +658,10 @@ def test_build_op_registers_the_program_on_the_mesh_view_with_the_armed_cap(
     on_8_devices,
 ):
     """_build_op, which serves, hands sharded_jax_op the program on the
-    (dp, tp) view of the EP mesh in mesh order, so each core's position is
-    the one its rank operand names, and with the armed cap: the fused kernel
-    at the cap, the all-gather path one row per engine above it."""
+    (dp, tp) view of the EP mesh, the mesh's cores in order row by row (the
+    order prebuild's rank operand, index // tp and index % tp, assumes), and
+    with the armed cap: the fused kernel at the cap, the all-gather path one
+    row per engine above it."""
     built = on_8_devices["built_op"]
     assert built["name"] == f"pallas::moe_lowtok_fused_k{TOPK}"
     # The fake takes the program's operands, by name.

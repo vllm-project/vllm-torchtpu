@@ -166,9 +166,9 @@ def _stream_ring(
     bf16 pieces so the sum is exact. The row positions come from one prefix-sum
     matmul over the routing mask per call. The gather matmul reduces over every
     row, so `_gather_prologue` zeroes the rows no expert of the block takes in
-    its operand. `xs_all` holds the per-row scales
-    when the rows arrive quantized. `_h_acc` is ring scratch the loop does not
-    use; it stays allocated so the kernel's VMEM plan is the one measured.
+    its operand. `xs_all` holds the per-row scales when the rows arrive
+    quantized. `_h_acc` is ring scratch the loop does not use; it stays
+    allocated so the kernel's VMEM plan is the one measured.
     """
     if w13_parts != 2:
         raise NotImplementedError("the gather formulation needs two w13 units")
