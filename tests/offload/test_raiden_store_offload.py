@@ -66,6 +66,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     Locality,
@@ -2927,6 +2928,93 @@ class TestHybridGeometry(unittest.TestCase):
         self.assertEqual((kernel, device_block), (256, 1280))
         self.assertEqual(shape, (256, 8, 2, 128))
         selector.assert_called_once()
+
+
+class TestMultiShapesGeometry(unittest.TestCase):
+    """Per-array geometry for multi-shape KV layouts (MLA + drafter K/V)."""
+
+    @staticmethod
+    def _mla(block_size=256, head_size=576, dtype=torch.bfloat16):
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+        return MLAAttentionSpec(
+            block_size=block_size, num_kv_heads=1, head_size=head_size, dtype=dtype
+        )
+
+    @staticmethod
+    def _full(block_size=256, num_kv_heads=8, head_size=128, head_size_v=None):
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        return FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            head_size_v=head_size if head_size_v is None else head_size_v,
+            dtype=torch.float16,
+        )
+
+    @staticmethod
+    def _resolve(*group_specs):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=s) for s in group_specs]
+        )
+        return rs._resolve_multi_shapes_kv_geometry(kv_cache_config)
+
+    def test_leaf_block_shapes(self):
+        from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+        from vllm_torchtpu.offload.raiden_store import multi_shapes_leaf_block_shape
+
+        mla = self._mla()
+        self.assertEqual(multi_shapes_leaf_block_shape(mla), (mla.num_states, 1, 576))
+        self.assertEqual(multi_shapes_leaf_block_shape(self._full()), (256, 2, 8, 128))
+        swa_mla = SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+        )
+        self.assertIsNone(multi_shapes_leaf_block_shape(swa_mla))
+
+    def test_mixed_mla_and_full_attention(self):
+        mla = self._mla()
+        block_size, shapes, dtypes, device_block = self._resolve(mla, self._full())
+        self.assertEqual((block_size, device_block), (256, 256))
+        self.assertEqual(shapes, {(mla.num_states, 1, 576), (256, 2, 8, 128)})
+        self.assertEqual(dtypes, {torch.bfloat16, torch.float16})
+
+    def test_mla_only_layout_resolves_as_before(self):
+        mla_a, mla_b = self._mla(head_size=576), self._mla(head_size=512)
+        block_size, shapes, dtypes, device_block = self._resolve(mla_a, mla_b)
+        self.assertEqual((block_size, device_block), (256, 256))
+        self.assertEqual(
+            shapes, {(mla_a.num_states, 1, 576), (mla_b.num_states, 1, 512)}
+        )
+        self.assertEqual(dtypes, {torch.bfloat16})
+
+    def test_rejects_unequal_kv_widths(self):
+        with self.assertRaisesRegex(NotImplementedError, "equal K/V widths"):
+            self._resolve(self._mla(), self._full(head_size_v=64))
+
+    def test_rejects_non_full_attention_leaf(self):
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+        swa = SlidingWindowSpec(
+            block_size=256,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+        )
+        with self.assertRaisesRegex(NotImplementedError, "SlidingWindowSpec"):
+            self._resolve(self._mla(), swa)
+
+    def test_rejects_anchors_with_different_block_sizes(self):
+        with self.assertRaisesRegex(ValueError, "disagree on block size"):
+            self._resolve(self._mla(block_size=256), self._full(block_size=128))
 
 
 class TestRaidenStoreWorkerStub(unittest.TestCase):
