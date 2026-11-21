@@ -64,6 +64,14 @@ def _chunks(rows: int, row_bytes: int) -> list[tuple[int, int]]:
     return [(k, min(size, rows - k)) for k in range(0, rows, size)]
 
 
+def _in_hbm(a: jax.Array) -> jax.Array:
+    """Pin a weight operand to HBM: left free, XLA prefetches the whole
+    weight into VMEM just ahead of the call, and that copy stayed exposed
+    (6.5 us per layer at 8 and 24 rows, c4 twin j-084c2b02) while the kernel
+    streams it at the same bandwidth anyway."""
+    return pltpu.with_memory_space_constraint(a, pltpu.HBM)
+
+
 def _project(acc, scale):
     """bf16(bf16(acc) * scale), held in f32."""
     y = acc.astype(BF16).astype(F32) * scale.astype(F32)
@@ -260,7 +268,11 @@ def fused_mlp(
         compiler_params=pltpu.CompilerParams(**params),
         name=f"dspark_mlp-m_{mp}-h_{h}-i_{i}" + (f"-ar_{n}" if n > 1 else ""),
         interpret=interpret,
-    )(rank.reshape(1, 1).astype(jnp.int32), x, s_gu, s_d, w_gu, w_d)
+    )(
+        rank.reshape(1, 1).astype(jnp.int32),
+        x,
+        *(_in_hbm(a) for a in (s_gu, s_d, w_gu, w_d)),
+    )
 
 
 def reference(x, w_gu, s_gu, w_d, s_d):
