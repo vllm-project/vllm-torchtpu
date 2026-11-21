@@ -103,7 +103,9 @@ def is_supported(
     blocks = default_blocks(k, sc.num_lanes)
     block_width = pl.cdiv(pl.cdiv(width, block_size), alignment) * alignment
     plan = _plan(rows, width, block_width, k, blocks, block_size, not given_maxima)
-    streamable = _chunk(width) % (sc.num_lanes * block_size) == 0
+    # Streamed rows fetch whole vectors of blocks in tile-aligned spans.
+    span = sc.num_lanes * block_size
+    streamable = _chunk(width) % span == 0 and span % alignment == 0
     if given_maxima and maxima_block:
         fold = block_size // maxima_block
         # Folded maxima are staged in the two score chunks streamed rows keep.
@@ -341,23 +343,31 @@ def block_topk(
                     maxima[pl.ds(c * maxima_chunk + i * lanes, lanes)] = values
 
         def fetch_blocks(row_id, count):
-            """DMA the keys of the first `count` chosen blocks into `fetched`."""
+            """DMA the keys of the first `count` chosen blocks into `fetched`.
 
-            def copy(b, owner):
-                return pltpu.make_async_copy(
-                    score_ref.at[row_id, pl.ds(owner * block_size, block_size)],
-                    fetched.at[pl.ds(b * block_size, block_size)],
-                    fetch_sem,
-                )
+            Whole vectors of block IDs are read, so lane extraction stays off
+            each copy; blocks past `count` (-1) fetch block 0 unread.
+            """
+            vectors = pl.cdiv(count, lanes)
 
-            @pl.loop(0, count)
-            def start(b):
-                owner = plsc.load_gather(block_ids, [jnp.full(lanes, b, jnp.int32)])
-                copy(b, owner[0]).start()
+            @pl.loop(0, vectors)
+            def start(v):
+                ids = block_ids[pl.ds(v * lanes, lanes)]
+                columns = jnp.maximum(ids, 0) * block_size
+                for j in range(lanes):
+                    column = pl.multiple_of(columns[j], block_size)
+                    pltpu.make_async_copy(
+                        score_ref.at[row_id, pl.ds(column, block_size)],
+                        fetched.at[pl.ds((v * lanes + j) * block_size, block_size)],
+                        fetch_sem,
+                    ).start()
 
-            @pl.loop(0, count)
-            def land(b):
-                copy(0, 0).wait()
+            # One wait for every copy: a descriptor of their total size, of the
+            # same HBM-to-VMEM kind so the semaphore counts the same units.
+            words = pl.ds(0, pl.multiple_of(vectors * span, span))
+            pltpu.make_async_copy(
+                score_ref.at[row_id, words], fetched.at[words], fetch_sem
+            ).wait()
 
         length_copy = pltpu.async_copy(length_ref, limits, length_sem)
         pl.when(first < rows)(lambda: start_row(first, 0))
