@@ -7,6 +7,7 @@ its SWA cache module differs, the cache lifetime in ``ensure_cache``.
 
 import functools
 import mmap
+import os
 import tempfile
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -623,30 +624,96 @@ class DPSharedEngramStorage(upstream.DPSharedEngramStorage):
     TPU lookups gather on the host (``gather_raw``), so the mapping needs
     neither CUDA registration nor an accelerator view. Each EDP rank loads a
     disjoint row range; the barrier after every tensor publishes all ranges.
+
+    With ``TPU_DEEPSEEK_V41_ENGRAM_SHM_SHARE_KEY`` set, the backing file is a
+    named file that other vLLM instances on the host with the same key map
+    too (for example the prefill and decode instances of a single-host P/D
+    deployment), so the host holds one copy of each table. The n-th storage
+    an instance creates maps the n-th named file; every instance builds its
+    Engram layers in the same order, so the n-th files of two instances hold
+    the same table. A file whose ".ready" marker exists and whose size matches
+    is complete: the instance maps it and skips writing it. Otherwise the
+    instance (re)creates it, writes its rows as usual and writes the marker
+    once the weight and the scale tensor are both loaded.
     """
+
+    _created = 0  # storages created in this process; numbers the shared files
+
+    def __init__(self, num_rows, dim, block_size, group) -> None:
+        self._index = DPSharedEngramStorage._created
+        DPSharedEngramStorage._created += 1
+        self._reused = False
+        self._shared_path: str | None = None
+        self._loaded_ptrs: set[int] = set()
+        super().__init__(num_rows, dim, block_size, group)
+
+    def _shared_file(self, num_bytes: int) -> tuple[str, bool]:
+        """Open or create the named backing file on the EDP leader.
+
+        Returns the path and whether the file already holds a complete
+        table. Example: key "pd1h", second table of 101,437,931,520 bytes ->
+        /dev/shm/vllm_engram_shared_pd1h_1_101437931520.
+        """
+        key = envs.TPU_DEEPSEEK_V41_ENGRAM_SHM_SHARE_KEY
+        path = os.path.join(
+            upstream.SHM_PATH,
+            f"vllm_engram_shared_{key}_{self._index}_{num_bytes}",
+        )
+        if os.path.exists(path + ".ready") and (
+            os.path.exists(path) and os.path.getsize(path) == num_bytes
+        ):
+            return path, True
+        # A file without its marker is from an instance that did not finish
+        # loading (or from another checkpoint); rewrite it from scratch.
+        for stale in (path + ".ready", path):
+            if os.path.exists(stale):
+                os.unlink(stale)
+        upstream.check_shm_free_space(
+            num_bytes, upstream.SHM_PATH, allocation_name="Engram tables"
+        )
+        with open(path, "wb") as file:
+            file.truncate(num_bytes)
+        return path, False
 
     def _allocate(self, num_bytes: int) -> torch.Tensor:
         group = self.group
+        shared = bool(envs.TPU_DEEPSEEK_V41_ENGRAM_SHM_SHARE_KEY)
         with ExitStack() as stack:
             path = error = None
+            reused = False
             if group.rank_in_group == 0:
                 try:
-                    upstream.check_shm_free_space(
-                        num_bytes, upstream.SHM_PATH, allocation_name="Engram tables"
-                    )
-                    backing_file = stack.enter_context(
-                        tempfile.NamedTemporaryFile(
-                            prefix="vllm_engram_", dir=upstream.SHM_PATH
+                    if shared:
+                        path, reused = self._shared_file(num_bytes)
+                    else:
+                        upstream.check_shm_free_space(
+                            num_bytes,
+                            upstream.SHM_PATH,
+                            allocation_name="Engram tables",
                         )
-                    )
-                    backing_file.truncate(num_bytes)
-                    path = backing_file.name
+                        backing_file = stack.enter_context(
+                            tempfile.NamedTemporaryFile(
+                                prefix="vllm_engram_", dir=upstream.SHM_PATH
+                            )
+                        )
+                        backing_file.truncate(num_bytes)
+                        path = backing_file.name
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
-            path, error = group.broadcast_object((path, error))
+            path, reused, error = group.broadcast_object((path, reused, error))
             if error is not None:
                 raise RuntimeError(
                     "Engram shared-memory creation failed on EDP rank 0: " + error
+                )
+            self._reused = reused
+            self._shared_path = path if shared else None
+            if shared and group.rank_in_group == 0:
+                logger.info(
+                    "Engram table %d: %s %s (%.1f GiB)",
+                    self._index,
+                    "mapping the complete shared file" if reused else "writing",
+                    path,
+                    num_bytes / 2**30,
                 )
 
             tensor = None
@@ -677,15 +744,28 @@ class DPSharedEngramStorage(upstream.DPSharedEngramStorage):
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor
     ) -> None:
         start, rows = _shared_row_range(param.shape[0], self.group)
-        if loaded_weight.shape[0] != rows:
-            # A full table, rather than the row slice the Run:AI stream
-            # registered for this rank (see Engram._create_embedding).
-            loaded_weight = loaded_weight.narrow(
-                0, param.engram_vocab_start + start, rows
-            )
-        _load_local_rows(param.data.narrow(0, start, rows), loaded_weight)
+        if not self._reused:
+            if loaded_weight.shape[0] != rows:
+                # A full table, rather than the row slice the Run:AI stream
+                # registered for this rank (see Engram._create_embedding).
+                loaded_weight = loaded_weight.narrow(
+                    0, param.engram_vocab_start + start, rows
+                )
+            _load_local_rows(param.data.narrow(0, start, rows), loaded_weight)
         # Every rank loads each tensor once, so barrier counts match.
         torch.distributed.barrier(group=self.group.cpu_group)
+        if self._shared_path is None or self._reused:
+            return
+        self._loaded_ptrs.add(param.data.data_ptr())
+        if (
+            self.group.rank_in_group == 0
+            and self.weight.data_ptr() in self._loaded_ptrs
+            and self.weight_scale_inv.data_ptr() in self._loaded_ptrs
+        ):
+            # Every rank has passed the barrier after its rows of both
+            # tensors, so the file is complete.
+            with open(self._shared_path + ".ready", "w") as marker:
+                marker.write("complete\n")
 
     def get_views(
         self, weight: torch.Tensor, scales: torch.Tensor

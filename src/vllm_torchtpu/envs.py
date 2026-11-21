@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP: bool = True
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_SHM_SHARE_KEY: str = ""
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_DECODE_FUSION: str = "auto"
     TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = 8
@@ -496,6 +497,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in (default False) to trade a small host-staging overhead for HBM.
     "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", default=False
+    ),
+    # With --engram-config '{"dp_shared_memory": true}', a non-empty key makes
+    # every vLLM instance on the host that uses the same key and checkpoint map
+    # ONE /dev/shm copy of the Engram tables, instead of one copy per instance
+    # (189 GiB per copy for DeepSeek-V4.1-Flash). The first instance creates and
+    # fills the named files /dev/shm/vllm_engram_shared_<key>_<n>_<bytes> and
+    # marks each complete with a ".ready" file; a later instance maps a complete
+    # file and skips writing it. The files are not unlinked, so they live until
+    # /dev/shm is cleared. Empty (default): one private, unlinked copy per
+    # instance.
+    "TPU_DEEPSEEK_V41_ENGRAM_SHM_SHARE_KEY": env_str(
+        "TPU_DEEPSEEK_V41_ENGRAM_SHM_SHARE_KEY", default=""
     ),
     # With Engram CPU offload and head-sharded host tables (dp_shared_memory
     # off, or its /dev/shm fallback), serve Engram layers from an HBM copy of
