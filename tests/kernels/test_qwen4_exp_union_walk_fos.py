@@ -28,12 +28,20 @@ VARIANTS = {
     "fos2_lt": (dict(bf16_softmax=True, fos=2, lean_tile=True), "_rb_fos2_lt"),
     "rb_lt": (dict(bf16_softmax=True, lean_tile=True), "_rb_lt"),
 }
-SMOKE_BOUND = 0.03   # max |out - f64| / row rms; a smoke bar only (see the module docstring)
+# Smoke bar (not the bar of record): rel-L2 of the sampled rows vs float64 within max(8e-3, 2 x the served walk's). The
+# max-element metric is NOT used for the bound: on these near-uniform softmaxes it is set by the output's BF16 rounding at one
+# tiny element and reads the same for every variant (CEN1 j-ec0cfdbc NUM: 0.04140 for the served walk and all five variants).
+SMOKE_RL2 = 8e-3
 
 
 def _err(step, out, rows, ref):
     rms = np.sqrt(np.mean(ref ** 2, axis=-1, keepdims=True)) + 1e-30
     return float(np.max(np.abs(out[rows].astype(np.float64) - ref) / rms))
+
+
+def _rl2(out, rows, ref):
+    d = out[rows].astype(np.float64) - ref
+    return float(np.sqrt(np.sum(d ** 2) / np.sum(ref ** 2)))
 
 
 @pytest.mark.parametrize("name", sorted(VARIANTS))
@@ -46,12 +54,14 @@ def test_variant_names_bound_and_engaged(kernels, name):
     base = _walk(step, SERVED_GL)
     out = _walk(step, SERVED_GL, **kw)
     assert np.all(np.isfinite(out.astype(np.float32)))
+    diff = float(np.mean(np.asarray(out).view(np.uint16) != np.asarray(base).view(np.uint16)))
     rows = np.flatnonzero(np.asarray(step[3]) > 0)[::13]
     ref = _f64_attention(step, rows)
-    e_base, e_var = _err(step, base, rows, ref), _err(step, out, rows, ref)
-    print(f"PQFOS {name} max_rel_err_vs_f64 {e_var:.5f} (served walk {e_base:.5f}, smoke bound {SMOKE_BOUND})")
-    assert e_var <= SMOKE_BOUND, (name, e_var, e_base)
-    assert not np.array_equal(np.asarray(out).view(np.uint16), np.asarray(base).view(np.uint16)), "variant not engaged"
+    r_base, r_var = _rl2(base, rows, ref), _rl2(out, rows, ref)
+    print(f"PQFOS {name} rel_l2_vs_f64 {r_var:.6f} (served walk {r_base:.6f}); max_el {_err(step, out, rows, ref):.5f} "
+          f"(served {_err(step, base, rows, ref):.5f}); elements differing from the served walk {diff:.4f}")
+    assert diff > 0, "variant not engaged (bit for bit the served walk)"
+    assert r_var <= max(SMOKE_RL2, 2.0 * r_base), (name, r_var, r_base)
 
 
 def test_refused_off_the_gathered_walk_and_bad_combos(kernels):
