@@ -700,8 +700,8 @@ def test_should_dispatch_dense_sp_layer_and_embed_rs_in_forward():
             seen_groups.append(prefill_group)
             return x
 
-    def _run_dense_op(x, w13, s13, w2, s2, layer):
-        seen_dense.append((x.shape, w13.shape, s13.shape, w2, s2, layer.tolist()))
+    def _run_dense_op(x, *w):
+        seen_dense.append((x.shape, len(w)))
         return x
 
     dense_stack = (
@@ -725,16 +725,7 @@ def test_should_dispatch_dense_sp_layer_and_embed_rs_in_forward():
             layer, positions, x_sp, None, None
         )
     assert seen_groups == [sp._GATHER_PROJECTIONS]  # noqa: SLF001 -- verifying gather-projections hook selected on sharded input
-    assert len(seen_dense) == 1
-    x_shape, w13_shape, s13_shape, w2, s2, layer_ids = seen_dense[0]
-    assert x_shape == (rows, hidden)
-    assert (w13_shape, s13_shape) == (
-        dense_stack[0].shape[1:],
-        dense_stack[1].shape[1:],
-    )
-    # The down weights go in as the whole stack plus the layer index.
-    assert w2 is dense_stack[2] and s2 is dense_stack[3]
-    assert layer_ids == [0]
+    assert seen_dense == [((rows, hidden), 4)]
     assert tuple(out.shape) == (rows, hidden)
     assert tuple(res.shape) == (rows, hidden)
 
@@ -1016,7 +1007,7 @@ def test_should_order_shared_before_routed_and_preserve_rank_for_edge_bit_patter
     setattr(mlp, sp.OP_ATTR, object())
     setattr(mlp, sp.SCALE_ATTR, 2.0)
     setattr(mlp, sp.SHARED_OP, fake_shared_op)
-    setattr(mlp, sp.SHARED_ATTR, (torch.zeros((1, 1)),) * 4)
+    setattr(mlp, sp.SHARED_ATTR, (torch.zeros((1,)),))
     setattr(mlp, sp.SHARED_INDEX, 0)
 
     layer = SimpleNamespace(

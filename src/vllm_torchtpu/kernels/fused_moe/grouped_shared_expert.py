@@ -143,59 +143,10 @@ def _blocked_down_multi_step_kernel(
         out_ref[...] = acc.astype(out_ref.dtype)
 
 
-def _without_prefetch(kernel):
-    """`kernel` minus the leading layer ref that only the index maps read."""
-
-    def wrapped(layer_ref, *refs, **kwargs):
-        del layer_ref
-        kernel(*refs, **kwargs)
-
-    return wrapped
-
-
-def _single_step_specs(bm: int, kc: int, bn: int, bps: int, stacked: bool):
-    out = pl.BlockSpec((bm, bn), lambda mi, ni, *_: (mi, ni))
-    act = [
-        pl.BlockSpec((bm, kc), lambda mi, ni, *_: (mi, 0)),
-        pl.BlockSpec((bm, _LANE_ALIGN), lambda mi, ni, *_: (mi, 0)),
-    ]
-    if not stacked:
-        weights = [
-            pl.BlockSpec((kc, bn), lambda mi, ni: (0, ni)),
-            pl.BlockSpec((bps, bn), lambda mi, ni: (0, ni)),
-        ]
-    else:
-        weights = [
-            pl.BlockSpec((None, kc, bn), lambda mi, ni, lay: (lay[0], 0, ni)),
-            pl.BlockSpec((None, bps, bn), lambda mi, ni, lay: (lay[0], 0, ni)),
-        ]
-    return [*act, *weights], out
-
-
-def _multi_step_specs(bm: int, kc: int, bn: int, bps: int, stacked: bool):
-    out = pl.BlockSpec((bm, bn), lambda mi, ni, s, *_: (mi, ni))
-    act = [
-        pl.BlockSpec((bm, kc), lambda mi, ni, s, *_: (mi, s)),
-        pl.BlockSpec((None, bm, _LANE_ALIGN), lambda mi, ni, s, *_: (s, mi, 0)),
-    ]
-    if not stacked:
-        weights = [
-            pl.BlockSpec((kc, bn), lambda mi, ni, s: (s, ni)),
-            pl.BlockSpec((bps, bn), lambda mi, ni, s: (s, ni)),
-        ]
-    else:
-        weights = [
-            pl.BlockSpec((None, kc, bn), lambda mi, ni, s, lay: (lay[0], s, ni)),
-            pl.BlockSpec((None, bps, bn), lambda mi, ni, s, lay: (lay[0], s, ni)),
-        ]
-    return [*act, *weights], out
-
-
 def _pallas_blocked_down(
     act: jax.Array,
     w2: jax.Array,
     s2: jax.Array,
-    layer: jax.Array | None,
     *,
     bm: int,
     bn: int,
@@ -203,12 +154,10 @@ def _pallas_blocked_down(
     interpret: bool = False,
 ) -> jax.Array:
     m, k = act.shape
-    blocks, n = s2.shape[-2:]
+    blocks, n = s2.shape
     kb = k // blocks
     n_steps = blocks // bps
     kc = bps * kb
-    stacked = layer is not None
-    prefetch = (layer.astype(jnp.int32),) if stacked else ()
 
     act_q, a_scale = quantize_block(
         act.reshape(m, blocks, kb), axis=-1, target_dtype=w2.dtype
@@ -220,18 +169,20 @@ def _pallas_blocked_down(
         a_scale[..., 0].astype(jnp.float32).reshape(m, n_steps, bps).transpose(1, 0, 2),
         ((0, 0), (0, 0), (0, _LANE_ALIGN - bps)),
     )
-    stack_tag = "_stacked" if stacked else ""
 
     if n_steps == 1:
-        kernel = functools.partial(_blocked_down_single_step_kernel, kb=kb, bps=bps)
-        in_specs, out_spec = _single_step_specs(bm, kc, bn, bps, stacked)
         return pl.pallas_call(
-            _without_prefetch(kernel) if stacked else kernel,
+            functools.partial(_blocked_down_single_step_kernel, kb=kb, bps=bps),
             out_shape=jax.ShapeDtypeStruct((m, n), act.dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=len(prefetch),
-                in_specs=in_specs,
-                out_specs=out_spec,
+                num_scalar_prefetch=0,
+                in_specs=[
+                    pl.BlockSpec((bm, kc), lambda mi, ni: (mi, 0)),
+                    pl.BlockSpec((bm, _LANE_ALIGN), lambda mi, ni: (mi, 0)),
+                    pl.BlockSpec((kc, bn), lambda mi, ni: (0, ni)),
+                    pl.BlockSpec((bps, bn), lambda mi, ni: (0, ni)),
+                ],
+                out_specs=pl.BlockSpec((bm, bn), lambda mi, ni: (mi, ni)),
                 grid=(m // bm, n // bn),
             ),
             compiler_params=pltpu.CompilerParams(
@@ -239,20 +190,23 @@ def _pallas_blocked_down(
                 disable_bounds_checks=True,
             ),
             interpret=interpret,
-            name=f"shared_expert_blocked_down_bm{bm}_bn{bn}_b{blocks}{stack_tag}",
-        )(*prefetch, a_q, a_scale_steps[0], w2, s2_f32)
+            name=f"shared_expert_blocked_down_bm{bm}_bn{bn}_b{blocks}",
+        )(a_q, a_scale_steps[0], w2, s2_f32)
 
-    kernel = functools.partial(
-        _blocked_down_multi_step_kernel, kb=kb, bps=bps, n_steps=n_steps
-    )
-    in_specs, out_spec = _multi_step_specs(bm, kc, bn, bps, stacked)
     return pl.pallas_call(
-        _without_prefetch(kernel) if stacked else kernel,
+        functools.partial(
+            _blocked_down_multi_step_kernel, kb=kb, bps=bps, n_steps=n_steps
+        ),
         out_shape=jax.ShapeDtypeStruct((m, n), act.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=len(prefetch),
-            in_specs=in_specs,
-            out_specs=out_spec,
+            num_scalar_prefetch=0,
+            in_specs=[
+                pl.BlockSpec((bm, kc), lambda mi, ni, s: (mi, s)),
+                pl.BlockSpec((None, bm, _LANE_ALIGN), lambda mi, ni, s: (s, mi, 0)),
+                pl.BlockSpec((kc, bn), lambda mi, ni, s: (s, ni)),
+                pl.BlockSpec((bps, bn), lambda mi, ni, s: (s, ni)),
+            ],
+            out_specs=pl.BlockSpec((bm, bn), lambda mi, ni, s: (mi, ni)),
             scratch_shapes=[pltpu.VMEM((bm, bn), jnp.float32)],
             grid=(m // bm, n // bn, n_steps),
         ),
@@ -261,8 +215,8 @@ def _pallas_blocked_down(
             disable_bounds_checks=True,
         ),
         interpret=interpret,
-        name=f"shared_expert_blocked_down_bm{bm}_bn{bn}_b{blocks}_s{n_steps}{stack_tag}",
-    )(*prefetch, a_q, a_scale_steps, w2, s2_f32)
+        name=f"shared_expert_blocked_down_bm{bm}_bn{bn}_b{blocks}_s{n_steps}",
+    )(a_q, a_scale_steps, w2, s2_f32)
 
 
 def _xla_blocked_down(act: jax.Array, w2: jax.Array, s2: jax.Array) -> jax.Array:
@@ -276,30 +230,18 @@ def _xla_blocked_down(act: jax.Array, w2: jax.Array, s2: jax.Array) -> jax.Array
 
 
 def blocked_down(
-    act: jax.Array,
-    w2: jax.Array,
-    s2: jax.Array,
-    *,
-    layer: jax.Array | None = None,
-    interpret: bool = False,
+    act: jax.Array, w2: jax.Array, s2: jax.Array, *, interpret: bool = False
 ) -> jax.Array:
-    """Contract `act [m, k] @ w2 [k, n]` with per-k-block `s2 [blocks, n]` in f32.
-
-    With `layer` (int32 [1]), `w2 [L, k, n]` / `s2 [L, blocks, n]` are per-layer
-    stacks and the Pallas kernel reads layer `layer[0]` in place.
-    """
-    k, n = w2.shape[-2:]
-    blocks = s2.shape[-2]
+    """Contract `act [m, k] @ w2 [k, n]` with per-k-block `s2 [blocks, n]` in f32."""
     if interpret or jax.default_backend() == "tpu":
-        tile = _select_pallas_tile(act.shape[0], k, n, blocks, w2.dtype)
+        tile = _select_pallas_tile(
+            act.shape[0], w2.shape[0], s2.shape[1], s2.shape[0], w2.dtype
+        )
         if tile is not None:
             bm, bn, bps = tile
             return _pallas_blocked_down(
-                act, w2, s2, layer, bm=bm, bn=bn, bps=bps, interpret=interpret
+                act, w2, s2, bm=bm, bn=bn, bps=bps, interpret=interpret
             )
-    if layer is not None:
-        w2 = lax.dynamic_index_in_dim(w2, layer[0], keepdims=False)
-        s2 = lax.dynamic_index_in_dim(s2, layer[0], keepdims=False)
     return _xla_blocked_down(act, w2, s2)
 
 
@@ -309,7 +251,6 @@ def grouped_shared_expert(
     s13: jax.Array,
     w2: jax.Array,
     s2: jax.Array,
-    layer: jax.Array | None = None,
     *,
     axis: str,
     groups: tuple[tuple[int, ...], ...],
@@ -318,14 +259,13 @@ def grouped_shared_expert(
     `w13 [H, 2c]` this member's `[gate | up]` channels with per-channel `s13
     [2c]`, `w2 [c, H]` with `s2 [blocks, H]`. Returns `[t, H]`, the whole
     expert on the own rows. `groups` lists the members of each group in the
-    order their rows are gathered. With `layer`, `w2` / `s2` are per-layer
-    stacks (see `blocked_down`)."""
+    order their rows are gathered."""
     if len(groups[0]) > 1:
         rows = lax.all_gather(x, axis, axis=0, tiled=True, axis_index_groups=groups)
     else:
         rows = x
     act = silu_and_mul(xla_quantized_matmul(rows, w13, s13))
-    out = blocked_down(act, w2, s2, layer=layer)
+    out = blocked_down(act, w2, s2)
     if len(groups[0]) > 1:
         out = lax.psum_scatter(
             out, axis, scatter_dimension=0, tiled=True, axis_index_groups=groups
@@ -333,21 +273,18 @@ def grouped_shared_expert(
     return out
 
 
-def grouped_shared_expert_sharded(
-    mesh, axis: str, group: int, *, stacked_down: bool = False
-):
+def grouped_shared_expert_sharded(mesh, axis: str, group: int):
     """`grouped_shared_expert` on global arrays sharded on `axis` (rows of `x`
     and each rank's weight slice), with groups of `group` consecutive mesh
-    indices. `stacked_down` takes a sixth, replicated `layer` operand."""
+    indices."""
     n = mesh.shape[axis]
     if n % group:
         raise ValueError(f"{n} ranks do not split into groups of {group}")
     groups = tuple(tuple(range(g, g + group)) for g in range(0, n, group))
-    layer_specs = (P(),) if stacked_down else ()
     return jax.shard_map(
         lambda *a: grouped_shared_expert(*a, axis=axis, groups=groups),
         mesh=mesh,
-        in_specs=(*(P(axis),) * 5, *layer_specs),
+        in_specs=(P(axis),) * 5,
         out_specs=P(axis),
         check_vma=False,
     )
