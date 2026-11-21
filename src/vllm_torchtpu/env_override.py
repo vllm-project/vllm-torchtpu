@@ -204,17 +204,18 @@ _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
 # given: keep it at or below the kernel's smallest all-reduce (3 MiB for
 # GLM-5.2 at its 256-token minimum).
 _PREFILL_KERNEL_ALL_REDUCE_BYTES = 1 << 20
-_TOKEN_PARALLEL_ALL_GATHER_BYTES = 20 << 20
+_TOKEN_PARALLEL_ALL_GATHER_BYTES = 8 << 20
 SC_ALL_REDUCE_FLAG = "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
 SC_ALL_GATHER_FLAG = "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"
 _PREFILL_KERNEL_LOWERS_FLOOR = envs.FUSED_MOE_PREFILL_KERNEL and envs.is_set(
     "FUSED_MOE_PREFILL_KERNEL"
 )
-# Avoid keeping the 64 MiB all-gather floor under token-parallel DCP:
-# 25-50 MiB context-page gathers (cap=12..24) stay on TensorCore and serialize
-# behind attention instead of offloading to SparseCore. Trigger when either
-# TPU_DCP_PREFILL_TOKEN_PARALLEL or a positive TPU_DCP_MLA_TOPK_CAP is set and
-# token-parallel prefill remains enabled (so non-DCP models keep 64 MiB).
+# Avoid keeping a >= 20 MiB all-gather floor under token-parallel DCP:
+# 12-17 MiB cap=8 context-page gathers (nope and indexer K) stay on TensorCore
+# and serialize behind attention, while 6 MiB rope gathers stay on TensorCore
+# above 8 MiB (lowering to 4 MiB adds SparseCore contention). Trigger when
+# either TPU_DCP_PREFILL_TOKEN_PARALLEL or a positive TPU_DCP_MLA_TOPK_CAP is
+# set and token-parallel prefill remains enabled (so non-DCP models keep 64 MiB).
 _TOKEN_PARALLEL_LOWERS_AG_FLOOR = envs.TPU_DCP_PREFILL_TOKEN_PARALLEL and (
     envs.is_set("TPU_DCP_PREFILL_TOKEN_PARALLEL")
     or (envs.TPU_DCP_MLA_TOPK_CAP > 0 and envs.is_set("TPU_DCP_MLA_TOPK_CAP"))
