@@ -23,7 +23,7 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Callable, Collection, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -234,6 +234,7 @@ from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 if TYPE_CHECKING:
     from vllm.model_executor.models.interfaces import SupportsPP
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 
 @dataclass
@@ -693,6 +694,80 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
             f"{shapes}; the pipeline hand-off carries one per stage"
         )
     return next(iter(found.values()))
+
+
+def _strip_prefill_only_padding(
+    scheduler_output: "SchedulerOutput",
+    requests: "Mapping[str, CachedRequestState]",
+) -> "SchedulerOutput":
+    """The step without the draft-placeholder rows vLLM padded onto a final
+    prompt token (prefill-only MTP).
+
+    Drops them only for a request whose drafts are all -1 placeholders and
+    whose step crosses the end of the prompt only because of them. Returns a
+    copy when it drops any, as ``trim_scheduled_drafts`` does: under a
+    uniprocess executor the scheduler holds the same object, and it rolls the
+    placeholders back as rejected drafts only if it still sees them.
+
+    A cached request's prompt length comes from the runner's ``requests``,
+    which keep every unfinished request. The input batch would not do: this
+    runs before ``_update_states``, and vLLM drops a request it did not
+    schedule in a step from the input batch until it is scheduled again.
+    """
+    spec = scheduler_output.scheduled_spec_decode_tokens
+    if not spec:
+        return scheduler_output
+    info: dict[str, tuple[int, int | None]] = {}
+    for nrd in scheduler_output.scheduled_new_reqs:
+        prompt_ids = nrd.prompt_token_ids
+        info[nrd.req_id] = (
+            nrd.num_computed_tokens,
+            len(prompt_ids) if prompt_ids is not None else None,
+        )
+    cached = scheduler_output.scheduled_cached_reqs
+    for req_id, computed in zip(cached.req_ids, cached.num_computed_tokens):
+        state = requests.get(req_id)
+        info[req_id] = (computed, None if state is None else state.num_prompt_tokens)
+    num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+    total = scheduler_output.total_num_scheduled_tokens
+    stripped: dict[str, int] = {}
+    for req_id, drafts in spec.items():
+        if not drafts or any(int(t) != -1 for t in drafts):
+            continue
+        n = num_scheduled_tokens.get(req_id)
+        computed, prompt = info.get(req_id, (None, None))
+        if n is None or computed is None or prompt is None:
+            continue
+        if computed + n > prompt and computed + n - len(drafts) <= prompt:
+            stripped[req_id] = len(drafts)
+            logger.debug(
+                "Prefill-only MTP: dropped %d draft-placeholder row(s) padded "
+                "onto the final prompt token of request %s "
+                "(num_computed_tokens=%d, num_prompt_tokens=%d).",
+                len(drafts),
+                req_id,
+                computed,
+                prompt,
+            )
+    if not stripped:
+        return scheduler_output
+    logger.warning_once(
+        "Prefill-only MTP: dropping the draft-placeholder rows vLLM pads onto a "
+        "request's final prompt token; the scheduler counts them as rejected "
+        "drafts. Per-request details are logged at DEBUG."
+    )
+    num_scheduled_tokens = dict(num_scheduled_tokens)
+    for req_id, num_drafts in stripped.items():
+        num_scheduled_tokens[req_id] -= num_drafts
+        total -= num_drafts
+    return dataclasses.replace(
+        scheduler_output,
+        num_scheduled_tokens=num_scheduled_tokens,
+        scheduled_spec_decode_tokens={
+            req_id: drafts for req_id, drafts in spec.items() if req_id not in stripped
+        },
+        total_num_scheduled_tokens=total,
+    )
 
 
 # Recompilation-avoidance contract:
@@ -4332,6 +4407,10 @@ class TPUModelRunner(GPUModelRunner):
             # Before anything reads the step layout, the DP token sync
             # included: the rest of the step runs on the trimmed copy.
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
+        if self._mtp_prefill_only:
+            scheduler_output = _strip_prefill_only_padding(
+                scheduler_output, self.requests
+            )
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
