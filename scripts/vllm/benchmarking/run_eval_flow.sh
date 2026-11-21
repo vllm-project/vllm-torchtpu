@@ -146,7 +146,50 @@ fi
 mkdir -p "$RESULTS_DIR"
 
 BASELINE_CONFIG="${BASELINE_CONFIG:-$CONFIG_NAME}"
-PERF_BASELINE="scripts/vllm/benchmarking/baselines/perf/$BASELINE_CONFIG.baseline.json"
+# Perf baselines are per chip, baselines/perf/<chip>/<config>.baseline.json: a
+# chip with none for the config reports its numbers without the perf gate, and
+# is gated from the commit that adds one. The chip is tpu_info's reading of
+# TPU_ACCELERATOR_TYPE (GKE's "tpu7x-8", a step's "tpu7x" or "v6e", or the GCE
+# metadata when unset), named like the directories: v7x, v6e. Eval baselines
+# are shared across chips, so the accuracy gate applies on every chip.
+#
+# A run that gates on perf stops here, before the server starts, when the chip
+# cannot be read: another chip's baselines would gate it on the wrong numbers,
+# or on none. That includes an accelerator type that names no chip tpu_info
+# knows (a typo, or a chip newer than the installed vllm_torchtpu), which
+# tpu_info.get_chip_version takes for TPU7x: the name is looked up below
+# without that fallback, and has to be the chip get_chip_version reads.
+# --skip-perf-check needs no chip.
+PERF_BASELINE=""
+if [ "$SKIP_PERF_CHECK" = "0" ]; then
+    TPU_CHIP=$(python3 -c '
+import sys
+from vllm_torchtpu.tpu_info import get_chip_version, get_tpu_type
+
+tpu_type = get_tpu_type()
+if not tpu_type:
+    sys.exit("TPU_ACCELERATOR_TYPE is unset and the GCE metadata names no accelerator type")
+read = get_chip_version(tpu_type)
+# The name as get_chip_version normalizes it, looked up without its fallback
+# to TPU7x
+name = tpu_type.strip().lower().split("-")[0].removeprefix("tpu")
+name = {"v7x": "7x"}.get(name, name)
+try:
+    chip = type(read)(name)
+except ValueError:
+    sys.exit(f"TPU accelerator type {tpu_type!r} names no chip vllm_torchtpu knows")
+if read is not chip:
+    sys.exit(f"tpu_info reads TPU accelerator type {tpu_type!r} as {read.value}, not {chip.value}")
+v = chip.value
+print("TPU_CHIP=" + (v if v.startswith("v") else "v" + v))
+' | sed -n 's/^TPU_CHIP=//p' | tail -n 1) || TPU_CHIP=""
+    if [ -z "$TPU_CHIP" ]; then
+        echo "ERROR: could not read the TPU chip to pick the perf baselines (vllm_torchtpu.tpu_info, from TPU_ACCELERATOR_TYPE); set TPU_ACCELERATOR_TYPE, or pass --skip-perf-check to report without the perf gate" >&2
+        exit 1
+    fi
+    PERF_BASELINE="scripts/vllm/benchmarking/baselines/perf/$TPU_CHIP/$BASELINE_CONFIG.baseline.json"
+    echo "Perf baseline for $TPU_CHIP: $PERF_BASELINE$([ -f "$PERF_BASELINE" ] || echo ' (none: reporting without the perf gate)')"
+fi
 
 PERF_LOG="$RESULTS_DIR/regression_check.md"
 
