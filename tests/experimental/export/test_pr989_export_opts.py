@@ -780,6 +780,11 @@ def test_lowtok_copies_and_grouped_lift_same_buffers_under_warmup(monkeypatch):
         logits_large = torch.zeros((256, 512), dtype=torch.float32)
         method.apply_monolithic(grouped_layer, x_large, logits_large)
 
+        sp_layer = _RecordingLayer()
+        x_sp_chunk = torch.ones((64, 8), dtype=torch.bfloat16)
+        logits_sp_chunk = torch.zeros((64, 512), dtype=torch.float32)
+        method.apply_monolithic(sp_layer, x_sp_chunk, logits_sp_chunk)
+
     expected = {
         "_lowtok_tables",
         "_lowtok_prim",
@@ -789,5 +794,6 @@ def test_lowtok_copies_and_grouped_lift_same_buffers_under_warmup(monkeypatch):
     }
     assert expected <= lowtok_layer.accessed
     assert expected <= grouped_layer.accessed
+    assert expected <= sp_layer.accessed
     assert len(seen_lowtok_scores) == 1
-    assert len(seen_grouped_logits) == 1
+    assert len(seen_grouped_logits) == 2
