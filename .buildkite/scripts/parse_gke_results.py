@@ -15,7 +15,7 @@
 BigQuery. Exits nonzero if any insert fails; --dry-run prints the SQL
 without executing it.
 
-The launcher states the fleet's physical chips in PREFILL_CHIPS and
+The launcher may state the fleet's physical chips in PREFILL_CHIPS and
 DECODE_CHIPS (or NUM_CHIPS), which per-chip throughput divides by, and may
 leave a routing_metrics.json beside the result file; see bq_utils."""
 

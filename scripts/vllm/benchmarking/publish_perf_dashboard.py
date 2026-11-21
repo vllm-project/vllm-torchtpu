@@ -55,7 +55,7 @@ def to_row(
 ) -> dict:
     tp = int(config["tensor_parallelism"])
     dp = int(config.get("data_parallelism") or 1)
-    # The same per-chip division the BigQuery rows carry.
+    # Shared per-chip throughput formula from bq_utils.
     per_chip = bq_utils.derived_metrics(
         chips=chips,
         output_tput=float(raw["output_throughput"]),

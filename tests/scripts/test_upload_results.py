@@ -11,14 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Rows the BigQuery uploaders write for each kind of run.
+"""Rows the BigQuery uploaders write for each kind of run and bq_utils helpers.
 
 Covers scripts/vllm/benchmarking/upload_results.py and bq_utils.py, and
-.buildkite/scripts/parse_gke_results.py. Every test runs the uploader in its
-dry-run mode over fixture files shaped like the real artifacts
-(tests/scripts/data/upload_results) and reads the rows back out of the INSERT
-statements it prints. Nothing reaches BigQuery or Spanner: subprocess.run,
-the only way either CLI is invoked, raises.
+.buildkite/scripts/parse_gke_results.py. Uploader tests run in dry-run mode
+over fixture files shaped like the real artifacts
+(tests/scripts/data/upload_results) and read the rows back out of the INSERT
+statements they print; helper unit tests call bq_utils directly. Nothing
+reaches BigQuery or Spanner: subprocess.run, the only way either CLI is
+invoked, raises.
 """
 
 import importlib.util
@@ -38,9 +39,6 @@ _DATA = pathlib.Path(__file__).resolve().parent / "data" / "upload_results"
 _MODEL = "Qwen/Qwen3.5-397B-A17B-FP8"
 _TABLE = "cloud-ullm-inference-ci-cd.llm_benchmark_analytics.benchmark_runs"
 
-# upload_results.py is run as a script, so it imports its sibling bq_utils.
-sys.path.insert(0, str(_BENCHMARKING))
-
 
 def _load(name: str, path: pathlib.Path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -49,12 +47,22 @@ def _load(name: str, path: pathlib.Path):
     return module
 
 
-import bq_utils  # noqa: E402
-
-upload_results = _load("upload_results", _BENCHMARKING / "upload_results.py")
-parse_gke_results = _load(
-    "parse_gke_results", _REPO / ".buildkite" / "scripts" / "parse_gke_results.py"
-)
+# upload_results.py and parse_gke_results.py import sibling bq_utils at load
+# time; scope the sys.path change to loading so the rest of the session stays clean.
+_BENCHMARKING_STR = str(_BENCHMARKING)
+_added_path = _BENCHMARKING_STR not in sys.path
+if _added_path:
+    sys.path.insert(0, _BENCHMARKING_STR)
+try:
+    bq_utils = _load("bq_utils", _BENCHMARKING / "bq_utils.py")
+    sys.modules.setdefault("bq_utils", bq_utils)
+    upload_results = _load("upload_results", _BENCHMARKING / "upload_results.py")
+    parse_gke_results = _load(
+        "parse_gke_results", _REPO / ".buildkite" / "scripts" / "parse_gke_results.py"
+    )
+finally:
+    if _added_path and _BENCHMARKING_STR in sys.path:
+        sys.path.remove(_BENCHMARKING_STR)
 
 _ROW_RE = re.compile(
     r"^INSERT INTO `(?P<table>[^`]+)` \( record_id, created_time, repository, "
@@ -299,35 +307,6 @@ def test_gke_row_carries_the_cell(tmp_path, capsys):
     assert rows == [_GKE_ROW]
 
 
-_AGENTX_METRICS = {
-    "request_throughput_avg": 0.25,
-    "request_count_avg": 500.0,
-    "output_token_throughput_avg": 1280.0,
-    "input_token_throughput_avg": 11520.0,
-    "total_token_throughput_avg": 12800.0,
-    "time_to_first_token_avg": 1800.0,
-    "time_to_first_token_p50": 900.0,
-    "time_to_first_token_p90": 3800.0,
-    "time_to_first_token_p99": 25000.0,
-    "inter_token_latency_avg": 20.0,
-    "inter_token_latency_p50": 12.5,
-    "inter_token_latency_p90": 25.0,
-    "inter_token_latency_p99": 80.0,
-    "request_latency_avg": 9000.0,
-    "request_latency_p50": 4000.0,
-    "request_latency_p90": 22000.0,
-    "request_latency_p99": 58000.0,
-    "effective_concurrency_avg": 14.5,
-    "benchmark_duration_avg": 1800.0,
-    "theoretical_prefix_cache_hit_avg": 91.5,
-    "aiperf_version": "0.12.0",
-    "was_cancelled": False,
-    "scenario": "agentx",
-    "submission_valid": True,
-}
-_AGENTX_ROUTING = {"prefix_cache_hit_rate": 0.92, "batch_utilization": 0.5}
-
-
 def test_created_time_sql_converts_an_offset_to_utc():
     assert (
         bq_utils.created_time_sql("2026-11-02T09:18:05+08:00")
@@ -339,34 +318,72 @@ def test_created_time_sql_converts_an_offset_to_utc():
     )
 
 
-def test_agentx_helpers_extract_metrics_per_chip_throughput_and_server_routing():
-    artifacts = _DATA / "agentx" / "conc_16" / "aiperf_artifacts"
-    export = json.loads((artifacts / "profile_export_aiperf.json").read_text())
-    server = json.loads((artifacts / "server_metrics_export.json").read_text())
-    chips = bq_utils.physical_chips(prefill_chips=16, decode_chips=16)
+@pytest.mark.parametrize(
+    "bad_tpot",
+    [None, 0, 0.0, -1.0, False, True, "8.0", float("nan"), float("inf")],
+)
+def test_interactivity_returns_none_when_tpot_is_not_a_positive_finite_number(bad_tpot):
+    assert bq_utils.interactivity(bad_tpot) is None
 
-    assert chips == 32
-    assert bq_utils.agentx_concurrency(export) == 16
+
+def test_derived_metrics_ignores_non_finite_values_and_invalid_chips():
     assert (
-        bq_utils.created_time_sql(export["end_time"])
-        == "TIMESTAMP '2026-10-28T08:35:19Z'"
+        bq_utils.derived_metrics(
+            chips=4,
+            output_tput=float("nan"),
+            total_tput=float("inf"),
+            tpot_ms={"median": float("nan")},
+        )
+        == {}
     )
-    assert bq_utils.extract_agentx_metrics(export) == _AGENTX_METRICS
-    assert bq_utils.agentx_derived_metrics(export, chips) == {
-        "num_chips": 32,
-        "output_tput_per_chip": 40.0,
-        "total_tput_per_chip": 400.0,
-        "input_tput_per_chip": 360.0,
-        "median_intvty": 80.0,
-        "p90_intvty": 40.0,
-        "p99_intvty": 12.5,
-    }
-    assert bq_utils.agentx_derived_metrics(export) == {
-        "median_intvty": 80.0,
-        "p90_intvty": 40.0,
-        "p99_intvty": 12.5,
-    }
-    assert bq_utils.server_routing_metrics(server, max_num_seqs=16) == _AGENTX_ROUTING
+    assert bq_utils.derived_metrics(chips=-4, output_tput=100.0, total_tput=200.0) == {}
+    assert (
+        bq_utils.derived_metrics(chips=True, output_tput=100.0, total_tput=200.0) == {}
+    )
+
+
+@pytest.mark.parametrize("tpot_mode", ["omitted", "zero"])
+def test_gke_prefill_cell_without_positive_tpot_omits_derived_when_chips_unset(
+    tmp_path, capsys, tpot_mode
+):
+    gke_dir = tmp_path / "gke"
+    gke_dir.mkdir()
+    cell = json.loads((_DATA / "gke" / "pd_disagg_c64_i1024_o1024.json").read_text())
+    for key in ("mean_tpot_ms", "median_tpot_ms", "p90_tpot_ms", "p99_tpot_ms"):
+        if tpot_mode == "omitted":
+            cell.pop(key, None)
+        else:
+            cell[key] = 0.0
+    path = gke_dir / "pd_disagg_prefill_c64_i8192_o1.json"
+    path.write_text(json.dumps(cell) + "\n")
+
+    ok = parse_gke_results.parse_and_upload(str(path), "kube-run-1", dry_run=True)
+    (row,) = _rows(capsys.readouterr().out)
+
+    assert ok
+    assert list(row["metrics"]) == ["vllm_bench"]
+
+
+def test_malformed_routing_metrics_json_warns_and_is_omitted(tmp_path, capsys):
+    shutil.copytree(_DATA / "gke", tmp_path / "gke")
+    (tmp_path / "gke" / "routing_metrics.json").write_text("{not valid json")
+
+    ok = parse_gke_results.parse_and_upload(
+        str(tmp_path / "gke" / "pd_disagg_c64_i1024_o1024.json"),
+        "kube-run-1",
+        dry_run=True,
+    )
+    captured = capsys.readouterr()
+    (row,) = _rows(captured.out)
+
+    assert ok
+    assert "routing" not in row["metrics"]
+    assert "Warning: Failed to load" in captured.err
+
+
+def test_non_object_routing_metrics_warns_and_is_omitted(capsys):
+    assert bq_utils.extract_routing_metrics([0.93, 0.74]) == {}
+    assert "expected a JSON object" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

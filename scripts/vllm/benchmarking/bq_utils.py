@@ -24,7 +24,6 @@ provenance stays explicit.
 One row is one measured point. Its metrics elements, all optional:
 
   vllm_bench  one `vllm bench serve` cell (BENCH_METRIC_FIELDS, verbatim).
-  agentx      one aiperf AgentX replay point (extract_agentx_metrics).
   lm_eval     {task: score} from results_<task>.json. It rides every
               vllm_bench row of the run, or is the only element of the
               run's accuracy row when the run measured no speed grid.
@@ -40,10 +39,11 @@ unchanged and a reader selects the normalized numbers by one type.
 """
 
 import json
+import math
 import os
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_BQ_PROJECT_ID = "cloud-ullm-inference-ci-cd"
@@ -85,33 +85,8 @@ BENCH_METRIC_FIELDS = (
     "spec_decode_accepted_tokens",
 )
 
-# aiperf's profile_export_aiperf.json is one {"unit", "avg", "p50", ...} block
-# per metric; these blocks and stats are flattened to "<metric>_<stat>".
-# Latencies are milliseconds and throughputs are per second, as aiperf writes
-# them.
-_PERCENTILES = ("avg", "p50", "p90", "p99")
-AGENTX_METRIC_FIELDS = (
-    ("request_throughput", ("avg",)),
-    ("request_count", ("avg",)),
-    ("error_request_count", ("avg",)),
-    ("output_token_throughput", ("avg",)),
-    ("input_token_throughput", ("avg",)),
-    ("total_token_throughput", ("avg",)),
-    ("time_to_first_token", _PERCENTILES),
-    ("inter_token_latency", _PERCENTILES),
-    ("request_latency", _PERCENTILES),
-    ("effective_concurrency", ("avg",)),
-    ("benchmark_duration", ("avg",)),
-    # The hit rate an unbounded cache would reach on the replayed trace, in
-    # percent. A property of the workload, not a measurement of the server;
-    # the measured rate is the routing element's prefix_cache_hit_rate.
-    ("theoretical_prefix_cache_hit", ("avg",)),
-)
-
 ROUTING_METRIC_FIELDS = ("prefix_cache_hit_rate", "batch_utilization")
 ROUTING_METRICS_FILENAME = "routing_metrics.json"
-AGENTX_EXPORT_FILENAME = "profile_export_aiperf.json"
-SERVER_METRICS_EXPORT_FILENAME = "server_metrics_export.json"
 
 # Environment a launcher states the chip count in, for callers with no flag
 # of their own. AGENTX_CHIPS is what the AgentX client already requires.
@@ -125,8 +100,12 @@ def sql_escape(val: str) -> str:
 
 
 def _number(value) -> float | None:
-    """`value` when it is a real number, else None. bool is not a number."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    """`value` when it is a finite real number, else None. bool is not a number."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
         return None
     return value
 
@@ -199,7 +178,7 @@ def derived_metrics(
     out = {}
     output_tput = _number(output_tput)
     total_tput = _number(total_tput)
-    if chips:
+    if isinstance(chips, int) and not isinstance(chips, bool) and chips > 0:
         if output_tput is not None:
             out["output_tput_per_chip"] = output_tput / chips
         if total_tput is not None:
@@ -229,66 +208,17 @@ def bench_derived_metrics(data: dict, chips=None) -> dict:
     )
 
 
-def _agentx_stat(export: dict, metric: str, stat: str) -> float | None:
-    block = export.get(metric)
-    return _number(block.get(stat)) if isinstance(block, dict) else None
-
-
-def extract_agentx_metrics(export: dict) -> dict:
-    """The `agentx` element from one aiperf profile_export_aiperf.json, with
-    absent metrics omitted."""
-    out = {}
-    for metric, stats in AGENTX_METRIC_FIELDS:
-        for stat in stats:
-            value = _agentx_stat(export, metric, stat)
-            if value is not None:
-                out[f"{metric}_{stat}"] = value
-    metadata = export.get("metadata")
-    metadata = metadata if isinstance(metadata, dict) else {}
-    for key, source in (
-        ("aiperf_version", export),
-        ("was_cancelled", export),
-        ("scenario", metadata),
-        ("submission_valid", metadata),
-    ):
-        if isinstance(source.get(key), (str, bool)):
-            out[key] = source[key]
-    return out
-
-
-def agentx_derived_metrics(export: dict, chips=None) -> dict:
-    """derived_metrics for an aiperf export. aiperf reports the time per
-    output token as inter_token_latency."""
-    return derived_metrics(
-        chips=chips,
-        output_tput=_agentx_stat(export, "output_token_throughput", "avg"),
-        total_tput=_agentx_stat(export, "total_token_throughput", "avg"),
-        tpot_ms={
-            "median": _agentx_stat(export, "inter_token_latency", "p50"),
-            "p90": _agentx_stat(export, "inter_token_latency", "p90"),
-            "p99": _agentx_stat(export, "inter_token_latency", "p99"),
-        },
-    )
-
-
-def agentx_concurrency(export: dict) -> int | None:
-    """The concurrency of the measured (profiling) phase of an aiperf run."""
-    input_config = export.get("input_config")
-    phases = input_config.get("phases") if isinstance(input_config, dict) else None
-    for phase in phases if isinstance(phases, list) else ():
-        if isinstance(phase, dict) and phase.get("kind") == "profiling":
-            concurrency = phase.get("concurrency")
-            if isinstance(concurrency, int) and not isinstance(concurrency, bool):
-                return concurrency
-    return None
-
-
 def extract_routing_metrics(data) -> dict:
     """The `routing` element from a flat mapping: the ROUTING_METRIC_FIELDS
     that are fractions in [0, 1]. Anything else is dropped with a warning,
     since a percentage stored as a fraction would read as a pass."""
     out = {}
     if not isinstance(data, dict):
+        print(
+            f"Warning: ignoring routing metrics payload {type(data).__name__}: "
+            "expected a JSON object",
+            file=sys.stderr,
+        )
         return out
     for key in ROUTING_METRIC_FIELDS:
         if data.get(key) is None:
@@ -318,44 +248,6 @@ def load_routing_metrics(directory) -> dict:
         return {}
 
 
-def _series_stats(export: dict, metric: str, stat: str) -> list[float]:
-    """One value per engine for a metric of aiperf's server_metrics_export.json."""
-    metrics = export.get("metrics") if isinstance(export, dict) else None
-    entry = metrics.get(metric) if isinstance(metrics, dict) else None
-    series = entry.get("series") if isinstance(entry, dict) else None
-    values = []
-    for item in series if isinstance(series, list) else ():
-        stats = item.get("stats") if isinstance(item, dict) else None
-        value = _number(stats.get(stat)) if isinstance(stats, dict) else None
-        if value is not None:
-            values.append(value)
-    return values
-
-
-def server_routing_metrics(export: dict, max_num_seqs=None) -> dict:
-    """The `routing` element measured by the engines themselves, from aiperf's
-    server_metrics_export.json (one series per scraped engine).
-
-    prefix_cache_hit_rate is cached over queried prompt tokens, summed over
-    the engines. batch_utilization is the mean number of requests running
-    per engine over `max_num_seqs`, the batch slots each engine has.
-    """
-    out = {}
-    hits = _series_stats(export, "vllm:prefix_cache_hits", "total")
-    queries = sum(_series_stats(export, "vllm:prefix_cache_queries", "total"))
-    if hits and queries > 0:
-        # Counters scraped at different instants can put hits just above
-        # queries.
-        out["prefix_cache_hit_rate"] = min(sum(hits), queries) / queries
-    running = _series_stats(export, "vllm:num_requests_running", "avg")
-    max_num_seqs = _number(max_num_seqs)
-    if running and max_num_seqs and max_num_seqs > 0:
-        out["batch_utilization"] = min(
-            sum(running) / (len(running) * max_num_seqs), 1.0
-        )
-    return out
-
-
 def with_shared_elements(metrics: list, derived: dict, routing: dict) -> list:
     """`metrics` plus the derived and routing elements that have content."""
     if derived:
@@ -383,7 +275,7 @@ def created_time_sql(date_str) -> str:
             except ValueError:
                 dt = datetime.fromisoformat(date_str)
             if dt.tzinfo is not None:
-                dt = dt.astimezone(UTC)
+                dt = dt.astimezone(timezone.utc)  # noqa: UP017
             return f"TIMESTAMP '{dt.strftime('%Y-%m-%dT%H:%M:%SZ')}'"
         except (ValueError, TypeError):
             print(
