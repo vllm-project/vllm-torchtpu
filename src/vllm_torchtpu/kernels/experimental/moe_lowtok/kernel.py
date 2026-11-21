@@ -20,9 +20,12 @@ each expert to every row with that row's routing weight as the mask. The
 output is the shard's partial sum; the combine across shards stays the
 caller's. Activations are quantized per row to FP8 before each matmul (W8A8).
 
-The routing arrives either as a table built from the caller's local top-k ids
-(`routing_table`) or as the router's softmax scores, with the top-k selection
-(and optional copy-aware holder selection) run in the kernel.
+The routing arrives as a table built from the caller's local top-k ids
+(`routing_table`), as the router's softmax scores, or as its raw logits
+(`from_logits=True`); with scores or logits the kernel runs the top-k
+selection, and with a copies placement also the copy-aware holder selection
+over the placement's holder tables. The other inputs are the rows, the FP8
+expert weights and their scales, and the shard's first expert.
 """
 
 import functools
