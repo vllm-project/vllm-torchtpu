@@ -12,6 +12,7 @@
 | `compressed-tensors` | `fp8` (`W8A8`), `int4` (`W4A8`, `W4A16`), `mxfp4` | `fp8` or `bf16` | Linear, Fused MoE | Automatically selected for Hugging Face checkpoints with `quantization_config.quant_method == "compressed-tensors"`. |
 | `mxfp4` | `fp4` (`e2m1`) + `e8m0` block scales (block size 32) | `bf16` / `fp8` | Linear, Fused MoE | Used by `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, and MXFP4 MoE checkpoints. |
 | `nvfp4` | `fp4` (`e2m1`) + `fp8` block scales | `bf16` / `fp8` | Linear, Fused MoE | Supported for NVFP4 checkpoints (e.g., `Qwen3-30B-A3B-NVFP4`, `Qwen3-Coder-480B-A35B-NVFP4`). |
+| `modelopt_mixed` | Per layer: `fp4` (`e2m1`) + `fp8` block scales, `float8_e4m3fn`, or `bf16` | `bf16` / `fp8` | Linear, Fused MoE | Selected automatically for ModelOpt `MIXED_PRECISION` checkpoints such as `nvidia/Qwen3.8-2.4T-A95B-NVFP4`. `Linear` layers support `FP8`, `NVFP4` and `W4A16_NVFP4`, and `Fused MoE` layers support `NVFP4` and `W4A16_NVFP4`. Both NVFP4 formats run as W4A16 by default. Omitted or `"NONE"` entries load unquantized. Quantized embeddings and `lm_head` are not supported. |
 | `awq` | `int4` (packed) | `bf16` | Linear | Weight-only 4-bit AWQ checkpoints. |
 | `gptq` | `int4` / `int8` | `bf16` | Linear | Weight-only GPTQ checkpoints. |
 | `deepseek_v4_fp8` | `float8_e4m3fn` (with optional `fp4` MoE requantization) | `float8_e4m3fn` | Linear, MLA, Fused MoE | Specialized FP8 + W4A8 MoE path for `DeepSeek-V4`. |
