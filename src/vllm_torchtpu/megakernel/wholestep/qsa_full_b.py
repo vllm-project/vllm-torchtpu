@@ -101,7 +101,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         nvis_rows: tuple = (32, 64),
         xmerge: bool = False,
         thr_fast: str | None = None,
-        req_async: bool = False,
+        req_async: int = 0,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -205,11 +205,13 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.xreq_loads = bool(int(xreq_prefetch) & 2) and bool(loop_requests)
         # `req_async` (VLLM_TPU_MK_QSA_REQ_ASYNC, `loop_requests`): the request loops wait on
         # nothing they do not read yet. The new group's two output stores go to bank q mod 2
-        # and are waited before that bank's next write (q + 2) or after the loop; the union
-        # attention's ids staging into `qu_row` (without bit 0's stream) is issued right after
-        # request q's attention for q + 1 and waited just before q + 1's attention. Exact.
-        self.req_async = bool(req_async) and bool(loop_requests)
+        # and are waited before that bank's next write (q + 2) or at the layer's end; the union
+        # attention's ids staging into `qu_row` (without bit 0's stream) for q + 1 is issued
+        # right after request q's attention (1) or, into a second `qu_row` bank, before it (2),
+        # and waited just before q + 1's attention. Exact.
+        self.req_async = bool(int(req_async)) and bool(loop_requests)
         self.req_async_ids = self.req_async and bool(union_attn) and not self.xreq_prefetch
+        self.req_async_bank = self.req_async_ids and int(req_async) >= 2
         assert not skip_idle or loop_requests, "skip_idle bounds the request loops"
         # `xmerge` (VLLM_TPU_MK_QSA_XMERGE; `shard_index` + `union_attn`, not
         # `compressed_dcp`): the selection rows and the union of each request go out in one

@@ -233,7 +233,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qu_cd", pltpu.VMEM((nreq, 1, D * KU), I32)),
             ScratchReq("qu_n", pltpu.SMEM((nreq, D), I32)),
             # `xreq_prefetch`: two banks (request q's ids, request q+1's staged).
-            ScratchReq("qu_row", pltpu.SMEM((2 if self.xreq_prefetch else 1, KU + 128), I32)),
+            # `req_async` 2: two banks (request q's ids, request q+1's staged).
+            ScratchReq("qu_row", pltpu.SMEM(
+                (2 if self.xreq_prefetch or self.req_async_bank else 1, KU + 128), I32)),
             ScratchReq("qu_sem", pltpu.SemaphoreType.DMA((3,))),
             ScratchReq("qu_st", pltpu.VMEM((1, 128), I32)),
         ]
@@ -610,6 +612,13 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         the byte count; request 0's descriptor has both)."""
         for cp in self._new_group_stores(ctx, l, 0, sbank):
             cp.wait()
+
+    def _drain_new_group_stores(self, ctx: Any, l: Any) -> None:
+        """`req_async`: each used bank's last stores, still in flight after the request loop
+        (waited at the layer's end, before the next layer's loop reuses the banks)."""
+        n_loop = self._n_live(ctx) if self.skip_idle else ctx.ex.MB // ctx.ex.T
+        for b in range(2):
+            pl.when(n_loop > b)(lambda b=b: self._wait_new_group_stores(ctx, l, b))
 
     def _new_group_body(
         self, ctx: Any, l: Any, q: Any, raw_q: jax.Array, c0: Any, ring: jax.Array, rope: Any,
@@ -1091,9 +1100,6 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     issue_loads(0, 0)
 
             jax.lax.fori_loop(0, n_loop, req, 0)
-            if self.req_async:  # each used bank's last stores are still in flight
-                for b in range(2):
-                    pl.when(n_loop > b)(lambda b=b: self._wait_new_group_stores(ctx, l, b))
             if self.shard_index:
                 self._exchange_selection(ctx)
         elif self.shard_index:
@@ -1383,6 +1389,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
         xreq = self.xreq_prefetch
         rasync = self.req_async_ids
+        rbank = self.req_async_bank
 
         def stage_ids(q: Any, bank: Any, wait: bool = True) -> None:
             """Request `q`'s union ids (physical with `union_phys`) into `qu_row[bank]`.
@@ -1465,8 +1472,15 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 )
                 n_u = scr["qu_n"][q, rk]
             elif rasync:  # staged by the previous request (or before the loop)
-                outs, bank, stream = carry, 0, None
+                outs, stream = carry, None
+                bank = jax.lax.rem(q, 2) if rbank else 0
                 n_u = scr["qu_n"][q, rk]
+                if rbank:  # q's ids are in: q + 1's go to the other bank during q's attention
+                    wait_ids()
+
+                    @pl.when(q + 1 < n_loop)
+                    def _():
+                        stage_ids(jnp.minimum(q + 1, nreq - 1), 1 - bank, wait=False)
             else:
                 outs, bank, stream = carry, 0, None
                 n_u = stage_ids(q, 0)
@@ -1479,7 +1493,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 qs = [jnp.concatenate([scr["qf_q"][r], scr["qd_q"][r]], axis=0) for r in rs]
             else:
                 qs = [scr["qf_q"][r] for r in rs]
-            if rasync:
+            if rasync and not rbank:
                 wait_ids()
             with sc("qsa_u_attend", 2):
                 res = ua.attend_request(
@@ -1496,8 +1510,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     recent=(scr["qc_rk"][q], scr["qc_rv"][q], ok, ok_any), phys=self.union_phys,
                     dcp=self.dcp, sc=ctx.stream.sc,
                     **(dict(ids_row=bank, stream=stream) if xreq else {}),
+                    **(dict(ids_row=bank) if rbank else {}),
                 )
-            if rasync:  # request q's ids are read: the next request's go into `qu_row`
+            if rasync and not rbank:  # request q's ids are read: the next request's go into `qu_row`
 
                 @pl.when(q + 1 < n_loop)
                 def _():
@@ -1669,5 +1684,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             for h, o in enumerate(outs):
                 scr["xb2"][:, pl.ds(h * g.HD, g.HD)] = o.astype(BF16)
             kv.wait()
+            if self.req_async:
+                self._drain_new_group_stores(ctx, l)
         with ctx.stream.segment(lazy=False):
             return ctx.stream.dmatmul("o_proj", scr["xb2"], g.H)

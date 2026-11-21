@@ -293,7 +293,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
            shared_kv: bool = False, cdcp: bool = False, cdcp_keys: bool = True, ck_fn=None,
            async_dma: bool = False, B: int | None = None, xreq: int = 0,
            skip_idle: bool = False, xmerge: bool = False, key_mp: int = 0, key_slots: int = 2,
-           req_async: bool = False):
+           req_async: int = 0):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -337,7 +337,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
                    compressed_dcp=cdcp, xreq_prefetch=xreq, skip_idle=skip_idle,
                    manager_pages=key_mp, key_slots=key_slots,
                    **(dict(xmerge=True) if xmerge else {}),
-                   **(dict(req_async=True) if req_async else {}))
+                   **(dict(req_async=req_async) if req_async else {}))
     spec = wholestep_spec(
         G,
         R,
@@ -1362,18 +1362,19 @@ def test_xreq_prefetch_wrong_request_is_caught(monkeypatch):
         _assert_xreq_identical(base, run)
 
 
-# VLLM_TPU_MK_QSA_REQ_ASYNC: (B, dcp, XREQ_PREFETCH, phys, skip_idle, ctx). Ragged unions
+# VLLM_TPU_MK_QSA_REQ_ASYNC: (B, dcp, XREQ_PREFETCH, phys, skip_idle, ctx, level). Ragged unions
 # (CTX_XREQ: 4/1/0/4/1/4/0/3 tiles), one live request with an idle rank (B 8: 2 request slots,
 # 1 per rank at R = 2), and the loop without the banked loads (xreq 0) / with `union_phys`.
 REQ_ASYNC_CASES = [
-    (8, 1, 2, False, False, None),
-    (32, 2, 2, False, False, None),
-    (8, 2, 2, False, True, [3001, 0]),
-    (8, 1, 0, True, False, None),
+    (8, 1, 2, False, False, None, 1),
+    (8, 1, 2, False, False, None, 2),
+    (32, 2, 2, False, False, None, 2),
+    (8, 2, 2, False, True, [3001, 0], 2),
+    (8, 1, 0, True, False, None, 2),
 ]
 
 
-def _req_async_pair(monkeypatch, B, dcp, xreq, phys, skip_idle, ctx, mutate=None):
+def _req_async_pair(monkeypatch, B, dcp, xreq, phys, skip_idle, ctx, level, mutate=None):
     from vllm_torchtpu.models.vllm.qwen4_exp import pool_layout
 
     kw = dict(long=True, rank_ids=True, union=True, shard=True, loop=True, B=B, phys=phys,
@@ -1385,16 +1386,17 @@ def _req_async_pair(monkeypatch, B, dcp, xreq, phys, skip_idle, ctx, mutate=None
     base = _run_c(**kw)
     if mutate is not None:
         mutate()
-    return base, _run_c(**kw, req_async=True)
+    return base, _run_c(**kw, req_async=level)
 
 
-@pytest.mark.parametrize("B,dcp,xreq,phys,skip_idle,ctx", REQ_ASYNC_CASES)
-def test_req_async_bit_identical(monkeypatch, B, dcp, xreq, phys, skip_idle, ctx):
+@pytest.mark.parametrize("B,dcp,xreq,phys,skip_idle,ctx,level", REQ_ASYNC_CASES)
+def test_req_async_bit_identical(monkeypatch, B, dcp, xreq, phys, skip_idle, ctx, level):
     """VLLM_TPU_MK_QSA_REQ_ASYNC: the new group's stores waited only before their bank's
-    reuse / after the loop, the union ids staged one request ahead. Every output
+    reuse / at the layer's end, the union ids staged one request ahead (after request q's
+    attention, or into a second bank before it). Every output
     byte-identical (residual, ck_new, ring_new, ids, kr/ir_new), incl. 1 live request with an
     idle rank, main-KV DCP-2, ragged and empty unions, `union_phys`."""
-    base, run = _req_async_pair(monkeypatch, B, dcp, xreq, phys, skip_idle, ctx)
+    base, run = _req_async_pair(monkeypatch, B, dcp, xreq, phys, skip_idle, ctx, level)
     assert np.isfinite(base[0]).all()
     _assert_xreq_identical(base, run)
 
@@ -1410,7 +1412,7 @@ def test_req_async_wrong_store_row_is_caught(monkeypatch):
         monkeypatch.setattr(qc.QSAFullStepBlock, "_new_group_stores",
                             lambda self, ctx, l, q, b: orig(self, ctx, l, q ^ 1, b))
 
-    base, run = _req_async_pair(monkeypatch, 8, 1, 2, False, False, None, mutate)
+    base, run = _req_async_pair(monkeypatch, 8, 1, 2, False, False, None, 2, mutate)
     with pytest.raises(AssertionError):
         _assert_xreq_identical(base, run)
 

@@ -185,7 +185,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_DRAFT_LOOP: bool = False
     VLLM_TPU_MK_QSEL_ASYNC: bool = False
     VLLM_TPU_MK_QSA_XREQ_PREFETCH: int = 0
-    VLLM_TPU_MK_QSA_REQ_ASYNC: bool = False
+    VLLM_TPU_MK_QSA_REQ_ASYNC: int = 0
     VLLM_TPU_MK_QSA_SELECT_NVIS: int = 0
     VLLM_TPU_MK_AR_HIER_SMALL: bool = False
     VLLM_TPU_MK_QSA_XMERGE: bool = False
@@ -1319,8 +1319,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_MK_QSA_XREQ_PREFETCH": env_int("VLLM_TPU_MK_QSA_XREQ_PREFETCH", 0),
     # Whole-step QSA request loops without synchronous waits (default off; exact): the new
     # group's two output stores are waited only before their bank is reused (two banks), and
-    # the union attention's ids staging (qu_row) is issued one request ahead.
-    "VLLM_TPU_MK_QSA_REQ_ASYNC": env_bool("VLLM_TPU_MK_QSA_REQ_ASYNC", False),
+    # the union attention's ids staging (qu_row) is issued one request ahead (1: after request
+    # q's attention; 2: into a second qu_row bank before it).
+    "VLLM_TPU_MK_QSA_REQ_ASYNC": env_int("VLLM_TPU_MK_QSA_REQ_ASYNC", 0),
     # Whole-step QSA selection: the threshold bisection and the per-row compaction scan
     # only the score rows that hold visible groups (n_vis) instead of all max_groups / 128
     # (exact: the rows past n_vis are invisible and add nothing). 2: also the union
