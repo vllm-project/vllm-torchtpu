@@ -33,6 +33,9 @@ SUPPORTED_CHIPS: frozenset[str] = frozenset({"tpu7x", "v6e"})
 DEFAULT_ROW_LIMIT: int = 80
 HBM_UTILIZATION_CAP: float = 0.95
 DEFAULT_COLLECTIVE_LATENCY_US_BRACKET: tuple[float, float] = (1.0, 5.0)
+# Absorbs IEEE-754 float64 1-ULP reassociation noise (~3.6e-12 us at ~2e4 us)
+# while staying 1e4x below the 0.01 us display rounding quantum.
+FLOOR_TIE_EPSILON_US: float = 1e-6
 
 ADVISOR_DIR = Path(__file__).resolve().parent
 CALIBRATION_DIR = ADVISOR_DIR / "data" / "calibration"
@@ -446,6 +449,8 @@ COMPILED_XLA_GAP_P90_US = 1.5
 UNFUSED_EAGER_GAP_US = 6.0
 PER_OP_COLLECTIVE_CALL_FACTOR = 2
 BOUNDARY_SYNC_HOP_FACTOR = 2.0
+# Floor guarding division by near-zero efficiency ratios.
+MIN_EFFICIENCY_FLOOR = 1e-3
 
 DOT_FP8 = "fp8"
 DOT_BF16 = "bf16"
@@ -464,10 +469,18 @@ PER_OP_STEP_SETTLE_CMD = (
 DECODING_SEQS_SETTLE_CMD = (
     "Pass --decoding-seqs <N> or --output-tok-s <rate> --mean-tpot-ms <ms>"
 )
+BOUNDARY_SYNC_SETTLE_CMD = (
+    "Run an A/B step trace comparing per_op vs fused boundary fill/drain"
+)
+PER_OP_COLLECTIVE_FACTOR_SETTLE_CMD = (
+    "Run an A/B step trace comparing per_op vs fused all-reduce latency"
+)
 CORNER_AXES: Mapping[str, int] = {
     "launch_gap_us": 0,
     "collective_latency_us": 1,
     "prefill_attn_dot_dtype": 2,
+    "boundary_sync_hop_factor": 3,
+    "per_op_collective_call_factor": 4,
 }
 
 DEFAULT_CHIP = "tpu7x"
@@ -520,6 +533,13 @@ MIN_STEPS_FOR_WARMUP_DROP = 3
 MIN_WARMUP_DROP_STEPS = 2
 DEFAULT_CALIBRATE_LAYERS = 60
 SUBLAYER_BOUNDARIES_PER_LAYER = 2
+# Unfused per-op operator kernel launches per layer across GQA, MLA, and GDN
+# sequence mixers: 3 mixer kernels (input projection, core attention or
+# recurrence kernel, output projection), 2 base FFN kernels (gate_up + down or
+# router + routed_moe), and 2 shared-expert FFN kernels when present.
+PER_OP_MIXER_KERNELS_PER_LAYER = 3
+PER_OP_BASE_FFN_KERNELS_PER_LAYER = 2
+PER_OP_SHARED_EXPERT_KERNELS_PER_LAYER = 2
 MIN_STEP_OPS_FOR_EXPLICIT_NORM = 2
 CONSERVED_GAP_DECIMALS = 10
 QUANTILE_DECIMALS = 4
