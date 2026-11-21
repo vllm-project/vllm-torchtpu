@@ -793,8 +793,10 @@ def gather_candidate_keys(
         layout: Packed cache storage layout.
 
     Returns:
-        Packed int32 K of shape [packed_rows, PAGE_RECORDS], with equal-sized
-        contiguous regions per group; skipped tiles remain uninitialized.
+        Packed int32 K of shape
+        [groups * blocks // per_page * PAGE_ROWS, PAGE_RECORDS],
+        with equal-sized contiguous regions per group; skipped tiles remain
+        uninitialized.
     """
     info = plsc.get_sparse_core_info()
     lanes, units = info.num_lanes, info.num_cores * info.num_subcores
@@ -810,6 +812,8 @@ def gather_candidate_keys(
     group, buffers = config
     count = physical_block_ids.size
     per_page = PAGE_RECORDS // block
+    if count % per_page:
+        raise ValueError("Candidate blocks must fill whole packed pages")
     source_per_page = layout.page_size // block
     span = group * PAGE_ROWS
     per_unit = pl.cdiv(count, units * group) * group
@@ -823,6 +827,9 @@ def gather_candidate_keys(
         * lanes,
     )
     meta_steps = metadata_rows // group
+    # Tiles past `count` hold only padding ids and are never written; a partial
+    # last tile writes its prefix, so the output needs no padded tail to slice.
+    full_tiles, tail = divmod(count, group)
     ids = jnp.pad(
         physical_block_ids.reshape(-1),
         (0, units * per_unit - count),
@@ -845,7 +852,7 @@ def gather_candidate_keys(
 
     @pl.kernel(
         out_type=jax.ShapeDtypeStruct(
-            (units * per_unit // per_page * PAGE_ROWS, PAGE_RECORDS), jnp.int32
+            (count // per_page * PAGE_ROWS, PAGE_RECORDS), jnp.int32
         ),
         scratch_types=(
             pltpu.VMEM((meta_steps, group), jnp.int32),
@@ -986,14 +993,20 @@ def gather_candidate_keys(
 
         def write(step, wait=False):
             slot = step % buffers
+            tile = destination(step)
 
-            @pl.when(live(step))
-            def transfer():
-                target = out.reshape(-1, block).at[
-                    pl.ds(destination(step) * span, span)
-                ]
-                copy = pltpu.make_async_copy(words.at[slot], target, write_sem.at[slot])
+            def transfer(rows):
+                target = out.reshape(-1, block).at[pl.ds(tile * span, rows)]
+                copy = pltpu.make_async_copy(
+                    words.at[slot, pl.ds(0, rows)], target, write_sem.at[slot]
+                )
                 (copy.wait if wait else copy.start)()
+
+            pl.when(live(step) & (tile < full_tiles))(lambda: transfer(span))
+            if tail:
+                pl.when(live(step) & (tile == full_tiles))(
+                    lambda: transfer(tail * PAGE_ROWS)
+                )
 
         for step in range(min(buffers - 1, steps)):
             pl.when(step < active)(
@@ -1020,4 +1033,4 @@ def gather_candidate_keys(
                 lambda last=last: write(active - last - 1, wait=True)
             )
 
-    return kernel(banks, ids, control)[: count // per_page * PAGE_ROWS]
+    return kernel(banks, ids, control)
