@@ -20,10 +20,12 @@ import inspect
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import jax
 import numpy as np
 import pytest
 import torch
 from jax.experimental.pallas import tpu as pltpu
+from torch_tpu._internal.pallas._mock_device import _PallasDevice
 from vllm.distributed import parallel_state
 
 from vllm_torchtpu import envs
@@ -41,6 +43,8 @@ from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as v3
 pytestmark = pytest.mark.cpu_test
 
 EP = 2
+# JAX's chip-record read itself, before any test replaces it.
+_GET_TPU_INFO = pltpu.get_tpu_info
 
 
 def _chip(version="TPU_7X"):
@@ -48,13 +52,14 @@ def _chip(version="TPU_7X"):
 
 
 def _mesh(ep=EP, platform="tpu", device_kind="TPU7x"):
-    """The parts of the EP mesh prebuild reads: its width and its devices."""
-    device = SimpleNamespace(platform=platform, device_kind=device_kind)
-    return SimpleNamespace(
-        axis_names=(v3.EP_AXIS_NAME,),
-        shape={v3.EP_AXIS_NAME: ep},
-        devices=np.array([device] * ep, dtype=object),
-    )
+    """An EP mesh as build_ep_mesh returns it in serving: torch_tpu's
+    get_pallas_mesh devices (`_PallasDevice`, named after the chip torch_tpu's
+    runtime reports) on one axis."""
+    devices = [
+        _PallasDevice(device_kind=device_kind, platform=platform, id=i)
+        for i in range(ep)
+    ]
+    return jax.sharding.Mesh(np.array(devices, dtype=object), (v3.EP_AXIS_NAME,))
 
 
 @pytest.fixture
@@ -527,6 +532,58 @@ def test_a_chip_record_that_cannot_be_read_refuses_the_layer(armed, monkeypatch)
     )
     assert reason is not None and "chip record could not be read" in reason
     assert "Unsupported TPU device kind: cpu" in reason
+    assert not _prebuild(_layer(slots=4))
+    assert "local_experts" not in armed
+
+
+@pytest.mark.parametrize(
+    ("dp", "tp", "slots"), [(4, 2, 64), (1, 8, 68)], ids=["dp4_tp2", "tp8"]
+)
+def test_weight_load_reads_the_chip_the_mesh_names(armed, monkeypatch, dp, tp, slots):
+    """In a CPU process (JAX's default device is a CPU) the chip record is
+    read unpatched, for a mesh of torch_tpu's devices named TPU7x: prebuild
+    reads the chip the mesh names, generation 7 with 64 MiB of VMEM, and
+    arms both measured Qwen3.5 layers. Read off JAX's default device instead,
+    it is "Unsupported TPU device kind: cpu" and the layer is refused."""
+    assert jax.devices()[0].platform == "cpu"
+    monkeypatch.setattr(pltpu, "get_tpu_info", _GET_TPU_INFO)
+    mesh = _mesh(dp * tp)
+    with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+        info = pltpu.get_tpu_info()
+    assert info.generation == 7
+    assert info.vmem_capacity_bytes == 64 * 2**20
+    monkeypatch.setattr(v3, "build_ep_mesh", lambda: mesh)
+    monkeypatch.setattr(v3, "_tensor_parallel_size", lambda: tp)
+    monkeypatch.setattr(sequence_parallel, "enabled", lambda: True)
+    layer = _big_layer(slots, 4096, 1024, primaries=64 if slots > 64 else None)
+    layer.global_num_experts = 512
+    layer.moe_config.is_sequence_parallel = True
+    with patch.object(v3, "ep_mesh_index", return_value=0):
+        v3.prebuild_fused_moe_ep(layer, topk=10, renormalize=True, activation="silu")
+    assert layer._tpu_fused_ep_eligible
+    assert armed["local_experts"] == 64
+
+
+@pytest.mark.parametrize(
+    ("device_kind", "message"),
+    [
+        ("TPU v6 lite", "built and tested on TPU generations (7,) only"),
+        ("TPU v99", "chip record could not be read"),
+    ],
+    ids=["v6e", "unknown"],
+)
+def test_a_mesh_naming_another_chip_is_refused(
+    armed, monkeypatch, device_kind, message
+):
+    """The same unpatched read refuses a mesh whose devices name a chip the
+    kernel is not built for (TPU v6e, generation 6) or one JAX has no record
+    of."""
+    monkeypatch.setattr(pltpu, "get_tpu_info", _GET_TPU_INFO)
+    reason = v3._unsupported_kernel_reason(
+        _mesh(device_kind=device_kind), topk=2, hidden=128, inter=256, local_experts=4
+    )
+    assert reason is not None and message in reason, reason
+    monkeypatch.setattr(v3, "build_ep_mesh", lambda: _mesh(device_kind=device_kind))
     assert not _prebuild(_layer(slots=4))
     assert "local_experts" not in armed
 
