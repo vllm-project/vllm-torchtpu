@@ -23,7 +23,14 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import (
     csa2_gather_chunk_size,
     csa2_pipeline,
 )
-from vllm_torchtpu.kernels.mla.paged_swa import swa_word_pages, write_swa_word_pool
+from vllm_torchtpu.kernels.mla.paged_swa import (
+    SwaPublishPlan,
+    swa_plan_slots,
+    swa_publish_plan,
+    swa_word_pages,
+    write_swa_word_pool,
+    write_swa_word_pool_planned,
+)
 
 if TYPE_CHECKING:
     from .cache import PagedCacheRows
@@ -70,6 +77,61 @@ def _publish_swa_banked(
     page_size: int,
 ) -> tuple[jax.Array, jax.Array]:
     return write_swa_word_pool((raw, high), records, values, page_size=page_size)
+
+
+def _swa_publish_plan(records: jax.Array) -> tuple[jax.Array, ...]:
+    return tuple(swa_publish_plan(records))
+
+
+def _fake_swa_publish_plan(records):
+    groups, rows = records.shape[0], 4 * swa_plan_slots(records.shape[1])
+    return (
+        records.new_empty((groups, 4, rows // 4)),
+        records.new_empty((groups, 1, rows)),
+    )
+
+
+def _publish_swa_planned(
+    raw: jax.Array,
+    records: jax.Array,
+    values: jax.Array,
+    slots: jax.Array,
+    lead: jax.Array,
+    group: int,
+    shift: int,
+    page_size: int,
+) -> jax.Array:
+    return write_swa_word_pool_planned(
+        raw,
+        records,
+        values,
+        SwaPublishPlan(slots, lead),
+        group=group,
+        shift=shift,
+        page_size=page_size,
+    )
+
+
+def _publish_swa_planned_banked(
+    raw: jax.Array,
+    high: jax.Array,
+    records: jax.Array,
+    values: jax.Array,
+    slots: jax.Array,
+    lead: jax.Array,
+    group: int,
+    shift: int,
+    page_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    return write_swa_word_pool_planned(
+        (raw, high),
+        records,
+        values,
+        SwaPublishPlan(slots, lead),
+        group=group,
+        shift=shift,
+        page_size=page_size,
+    )
 
 
 def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:
@@ -433,6 +495,19 @@ def initialize_csa2_ops() -> None:
             (P(),) * 4 + (None,),
             lambda r, h, *_: (torch.empty_like(r), torch.empty_like(h)),
         ),
+        ("swa_publish_plan", _swa_publish_plan, (P(),), _fake_swa_publish_plan),
+        (
+            "publish_swa_planned",
+            _publish_swa_planned,
+            (P(),) * 5 + (None,) * 3,
+            lambda r, *_: torch.empty_like(r),
+        ),
+        (
+            "publish_swa_planned_banked",
+            _publish_swa_planned_banked,
+            (P(),) * 6 + (None,) * 3,
+            lambda r, h, *_: (torch.empty_like(r), torch.empty_like(h)),
+        ),
         (
             "attend",
             _attend,
@@ -472,6 +547,8 @@ def initialize_csa2_ops() -> None:
         "publish_main": 2,
         "publish_main_banked": 4,
         "publish_swa_banked": 2,
+        "swa_publish_plan": len(SwaPublishPlan._fields),
+        "publish_swa_planned_banked": 2,
         "gather_attend": 4,
     }
     donated = {
@@ -481,6 +558,8 @@ def initialize_csa2_ops() -> None:
         "publish_main_banked": (0, 1, 2, 3),
         "publish_swa": (0,),
         "publish_swa_banked": (0, 1),
+        "publish_swa_planned": (0,),
+        "publish_swa_planned_banked": (0, 1),
     }
     for name, function, specs, fake in definitions:
         count = output_counts.get(name, 1)
@@ -536,6 +615,31 @@ def publish_swa(
         low, high = _ops["publish_swa_banked"](
             cache.raw, cache.raw_hi, records.int(), values, cache.shape[1]
         )
+        cache.raw.copy_(low)
+        cache.raw_hi.copy_(high)
+
+
+def swa_publish_plan_for(records: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """`paged_swa.swa_publish_plan` of [G, N] CSA2 write records, as Torch
+    tensors."""
+    return _ops["swa_publish_plan"](records.int())
+
+
+def publish_swa_planned(
+    cache: "PagedCacheRows",
+    records: torch.Tensor,
+    values: torch.Tensor,
+    plan: tuple[tuple[torch.Tensor, ...], int],
+    shift: int,
+) -> None:
+    """`publish_swa` of ``records``: those of a plan's group moved by
+    ``shift`` rows. ``plan`` is (`swa_publish_plan_for` outputs, group)."""
+    arrays, group = plan
+    args = (records.int(), values, *arrays, group, shift, cache.shape[1])
+    if cache.raw_hi is None:
+        cache.raw.copy_(_ops["publish_swa_planned"](cache.raw, *args))
+    else:
+        low, high = _ops["publish_swa_planned_banked"](cache.raw, cache.raw_hi, *args)
         cache.raw.copy_(low)
         cache.raw_hi.copy_(high)
 
