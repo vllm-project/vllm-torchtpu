@@ -79,10 +79,16 @@ def _buffer_sizes(k, width, block_size, threshold, mapping_width, info, sc):
     bootstrap_width = min(block_size, config.bootstrap_multiplier * k)
     chunk_size = math.gcd(block_size, bootstrap_width)
     capacity = max(k + threshold + chunk_size, bootstrap_width, output_width)
-    id_capacity = max(capacity, output_width + mapping_width)
+    id_capacity = capacity
     word_bytes = jnp.dtype(jnp.int32).itemsize
     resident_bytes = word_bytes * (
-        capacity + id_capacity + 2 * k + RADIX_BUCKETS + sc.num_lanes + order_width
+        capacity
+        + id_capacity
+        + 2 * k
+        + RADIX_BUCKETS
+        + sc.num_lanes
+        + order_width
+        + mapping_width
     )
     return _BufferSizes(
         output_width,
@@ -300,7 +306,9 @@ def streaming_topk(
             pltpu.VMEM((histogram_size,), jnp.int32),
             pltpu.VMEM((lanes,), jnp.int32),
             (pltpu.VMEM((order_width,), jnp.int32),) if order_width else (),
+            (pltpu.VMEM((mapping_width,), jnp.int32),) if mapped else (),
             pltpu.SemaphoreType.DMA((buffers,)),
+            pltpu.SemaphoreType.DMA,
             pltpu.SemaphoreType.DMA,
         ),
         compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
@@ -324,8 +332,10 @@ def streaming_topk(
             histogram,
             row_length,
             order_scratch,
+            mapping_scratch,
             block_sems,
             sem,
+            mapping_sem,
         ) = scratch
         candidates = candidate_banks.at[pl.ds(0, capacity)]
         candidate_ids = id_banks.at[pl.ds(0, id_capacity)]
@@ -670,19 +680,27 @@ def streaming_topk(
 
         @pl.loop(first_row, batch_size, step=row_stride)
         def process_row(row):
+            # The row's mapping and first block (block 0 leads every visit
+            # order) load while its length is read; nothing waits on them yet.
+            if mapped:
+                mapping = mapping_scratch[0]
+                mapping_copy = pltpu.make_async_copy(
+                    logical_blocks_ref.at[request_start + row // queries],
+                    mapping,
+                    mapping_sem,
+                )
+                mapping_copy.start()
+            position, block_id = jnp.int32(0), jnp.int32(0)
+            transfer(row, block_id, jnp.int32(0), wait=False)
             pltpu.async_copy(
                 lengths_ref.at[pl.ds(row // lanes * lanes, lanes)], row_length, sem
             ).wait()
             length = plsc.load_gather(row_length, [jnp.full((lanes,), row % lanes)])[0]
             row_blocks = pl.cdiv(length, block_size)
-
-            def prime():
-                position, block_id = next_valid(jnp.int32(0), length)
-                transfer(row, block_id, jnp.int32(0), wait=False)
-                return (position, block_id)
-
-            position, block_id = jax.lax.cond(
-                row_blocks > 0, prime, lambda: (jnp.int32(0), jnp.int32(0))
+            jax.lax.cond(
+                row_blocks > 0,
+                lambda: None,
+                lambda: transfer(row, block_id, jnp.int32(0), wait=True),
             )
 
             @plsc.parallel_loop(0, output_width, lanes, unroll=loop_unroll)
@@ -936,14 +954,9 @@ def streaming_topk(
             if bootstrap_width < valid_width:
                 jax.lax.fori_loop(0, row_blocks, scan_block, (seed, position, block_id))
             if mapped:
-                mapping = candidate_ids.at[pl.ds(output_width, mapping_width)]
-                copy = pltpu.make_async_copy(
-                    logical_blocks_ref.at[request_start + row // queries], mapping, sem
-                )
-                copy.start()
                 if not unordered:
                     sort_selected()
-                copy.wait()
+                mapping_copy.wait()
 
                 @plsc.parallel_loop(0, k, lanes, unroll=loop_unroll)
                 def map_winners(i):
