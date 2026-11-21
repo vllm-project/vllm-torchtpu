@@ -304,6 +304,7 @@ def calculate_block_sizes(
         bq_sz: int,
         bkv_sz: int,
         tuned_decode: bool = False,
+        split_lhs: bool = False,
     ) -> int:
         """Given tile size, calculate VMEM usage of the kernel."""
 
@@ -372,6 +373,11 @@ def calculate_block_sizes(
         compute_bytes = (
             loaded_bq_bytes + loaded_bkv_bytes + qk_bytes + loaded_scale_bytes
         )
+        if split_lhs:
+            # A SPLIT native fp8 operand stacks its residual under the q rows
+            # (or the softmax weights), doubling the matmul's LHS and the
+            # score tile before the halves are merged.
+            compute_bytes += loaded_bq_bytes + qk_bytes
 
         # Step 3: Sum up all memory usage.
         if tuned_decode:
@@ -480,6 +486,11 @@ def calculate_block_sizes(
         # bkv_sz reaches 4096, 32 pages) and 75% otherwise. Without them, decode
         # VMEM is counted and capped like prefill.
         tuned_decode = tuned_tiles and fixed_bq_sz is not None
+        # SPLIT native fp8 operands run in the DECODE kernel only.
+        split_lhs = fixed_bq_sz is not None and configs.Fp8Operand.SPLIT in (
+            serve_cfgs.native_fp8.qk,
+            serve_cfgs.native_fp8.pv,
+        )
         decode_vmem_frac = 0.85 if is_fp8_kv else 0.75
         capped_vmem_limit_bytes = vmem_limit_bytes * (
             decode_vmem_frac if tuned_decode else 0.8
@@ -506,7 +517,7 @@ def calculate_block_sizes(
         # fits within VMEM limit.
         while (
             batch_size > 1
-            and calculate_vmem_usage(batch_size, bq_sz, bkv_sz, tuned_decode)
+            and calculate_vmem_usage(batch_size, bq_sz, bkv_sz, tuned_decode, split_lhs)
             > capped_vmem_limit_bytes
         ):
             batch_size -= 1
@@ -520,7 +531,7 @@ def calculate_block_sizes(
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
         max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
         while (
-            calculate_vmem_usage(batch_size, bq_sz, bkv_sz, tuned_decode)
+            calculate_vmem_usage(batch_size, bq_sz, bkv_sz, tuned_decode, split_lhs)
             < capped_vmem_limit_bytes
             and bkv_sz <= max_seq_len
             and bkv_sz <= 4096  # TEMP PATCH
@@ -598,6 +609,7 @@ def calculate_block_sizes(
         "return_lse",
         "mask_invalid_v",
         "return_raw_output",
+        "native_fp8",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -646,6 +658,7 @@ def ragged_paged_attention(
     mask_invalid_v: bool | None = None,
     prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
     return_raw_output: bool = False,
+    native_fp8: configs.NativeFp8 = configs.NATIVE_FP8_OFF,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -724,6 +737,9 @@ def ragged_paged_attention(
             dynamic_v_scale must be None (prepare_inputs applies them).
         return_raw_output: If True, return the kernel's output buffer as is,
             without prepare_outputs, slicing or reshaping.
+        native_fp8: Which DECODE matmuls run natively in the fp8 KV dtype, and
+            how each operand is scaled (`configs.NativeFp8`). Needs an fp8 KV
+            cache. Defaults to every operand off.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -802,6 +818,7 @@ def ragged_paged_attention(
     v_scale_tensor = dynamic_v_scale
 
     serve_cfgs = configs.ServingConfigs(
+        native_fp8=native_fp8,
         num_seqs=max_num_seqs,
         num_page_indices=num_page_indices,
         total_q_tokens=queries.shape[0],
@@ -822,6 +839,13 @@ def ragged_paged_attention(
         skip_kv_update=skip_kv_update,
         mask_invalid_v=mask_invalid_v,
     )
+    tpu_info = pltpu.get_tpu_info()
+    if serve_cfgs.native_fp8.any() and not tpu_info.fp8_ops_per_second:
+        raise ValueError(
+            f"native_fp8={serve_cfgs.native_fp8} runs matmuls in fp8 on the MXU, "
+            f"which this chip ({tpu_info.chip_version}) does not have; leave "
+            "native_fp8 off."
+        )
 
     if prepared_inputs is None:
         q_hbm, new_kv_hbm = prepare_inputs(
