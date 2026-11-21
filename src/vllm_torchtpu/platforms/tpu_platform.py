@@ -919,8 +919,9 @@ class TpuPlatform(Platform):
                 # vLLM may pass per-engine ParallelConfig objects to workers
                 # with data_parallel_size collapsed to 1. Preserve the original
                 # single-host DP size for TorchTPU rank/env setup.
-                # TODO: Remove TORCH_TPU_DP_SIZE once TorchTPU physical
-                # chip/PjRt binding no longer depends on torchrun-style
+                # TODO(https://github.com/google-pytorch/torch_tpu/issues/6757):
+                # Remove TORCH_TPU_DP_SIZE once TorchTPU physical chip/PjRt
+                # binding no longer depends on torchrun-style
                 # RANK/LOCAL_RANK/WORLD_SIZE before vLLM distributed init.
                 os.environ["TORCH_TPU_DP_SIZE"] = str(dp_size)
                 os.environ.setdefault(
