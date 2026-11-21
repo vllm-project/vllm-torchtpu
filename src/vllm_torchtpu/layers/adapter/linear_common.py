@@ -15,6 +15,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
 from vllm_torchtpu.kernels.quantized_matmul.util import (
+    quantize_tensor,
     xla_prequantized_matmul,
     xla_quantized_matmul,
 )
@@ -66,6 +67,10 @@ FP8_PALLAS_HBM_PIN_ATTR = "_tpu_fp8_pallas_hbm_pin"
 # the norm holds the same slot. The norm's forward puts
 # `(x_q [m, k], x_scale f32 [m, 1])` in it and `apply` takes and clears it.
 PREQUANT_ATTR = "_tpu_prequant_slot"
+# TPU_MLA_SPLIT_QKV_A_PROJ: tuple of parameter names storing disjoint FP8 column
+# chunks and matching per-channel scales after detaching the monolith.
+FP8_SPLIT_WEIGHTS_ATTR = "_tpu_fp8_split_weights"
+FP8_SPLIT_SCALES_ATTR = "_tpu_fp8_split_scales"
 
 
 class PrequantSlot:
@@ -235,6 +240,44 @@ def prequantized_matmul(
             "at load (rmsnorm.arm_prequant does)"
         )
     return op(x_q, x_scale, w_q, w_s)
+
+
+_quantize_fp8_row_op: Callable | None = None
+
+
+def _quantize_fp8_row_jax(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    return quantize_tensor(x, jnp.float8_e4m3fn)
+
+
+def get_quantize_fp8_row_op() -> Callable:
+    """Build per-row FP8 activation quantization op outside Dynamo."""
+    global _quantize_fp8_row_op
+    if _quantize_fp8_row_op is not None:
+        return _quantize_fp8_row_op
+    with _quantized_matmul_kernel_op_lock:
+        if _quantize_fp8_row_op is not None:
+            return _quantize_fp8_row_op
+        op = pallas.jax_op("pallas::quantize_fp8_row", _quantize_fp8_row_jax)
+
+        def _fake(x):
+            return (
+                torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device),
+                torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device),
+            )
+
+        op.register_fake(_fake)
+        _quantize_fp8_row_op = op
+        return op
+
+
+def quantize_fp8_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize `[M, K]` activations row-wise to FP8 e4m3fn using the pre-built op."""
+    op = _quantize_fp8_row_op
+    if op is None:
+        raise RuntimeError(
+            "quantize_fp8_row op not built: call get_quantize_fp8_row_op() at load"
+        )
+    return op(x)
 
 
 def _fp8_linear_pallas_jax(

@@ -107,6 +107,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     prequantized_matmul,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
+from vllm_torchtpu.layers.adapter.quantization.fp8 import split_fp8_linear_columns
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.logger import init_logger
@@ -3325,3 +3326,46 @@ class VllmDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
             query = query_rot
             key = key_rot
         return query, key
+
+
+def split_qkv_a_proj_widths(
+    q_lora_rank: int, kv_dim: int, chunk_cols: int
+) -> tuple[int, ...]:
+    """Partition `[q_lora_rank | kv_dim]` into `(chunk_cols..., rem, kv_dim)`."""
+    if q_lora_rank <= 0 or kv_dim <= 0 or chunk_cols <= 0:
+        return ()
+    parts: list[int] = []
+    remaining = q_lora_rank
+    while remaining > chunk_cols:
+        parts.append(chunk_cols)
+        remaining -= chunk_cols
+    parts.append(remaining)
+    parts.append(kv_dim)
+    return tuple(parts)
+
+
+def arm_split_qkv_a_proj(model: torch.nn.Module, chunk_cols: int | None = None) -> int:
+    """Split each MLA wrapper's `fused_qkv_a_proj` weight into disjoint columns."""
+    chunk = (
+        int(envs.TPU_MLA_SPLIT_QKV_A_CHUNK) if chunk_cols is None else int(chunk_cols)
+    )
+    if chunk <= 0:
+        return 0
+    count = 0
+    for module in model.modules():
+        if not isinstance(module, VllmTPUMultiHeadLatentAttentionWrapper):
+            continue
+        if (
+            module.kimi_preprocess is not None
+            or module.gate_is_fused
+            or module.q_lora_rank is None
+            or module.fused_qkv_a_proj is None
+        ):
+            continue
+        kv_dim = int(module.kv_lora_rank) + int(module.qk_rope_head_dim)
+        widths = split_qkv_a_proj_widths(int(module.q_lora_rank), kv_dim, chunk)
+        if len(widths) >= 2 and split_fp8_linear_columns(
+            module.fused_qkv_a_proj, widths
+        ):
+            count += 1
+    return count

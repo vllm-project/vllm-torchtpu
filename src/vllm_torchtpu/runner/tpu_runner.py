@@ -5370,6 +5370,18 @@ class TPUModelRunner(GPUModelRunner):
 
             moe_prefill_sp.arm(self.model, self.vllm_config)
 
+        if envs.TPU_MLA_SPLIT_QKV_A_PROJ:
+            from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (  # noqa: PLC0415 -- deferred runner arming import matching neighbors
+                arm_split_qkv_a_proj,
+            )
+
+            n_split = arm_split_qkv_a_proj(self.model)
+            logger.info(
+                "TPU_MLA_SPLIT_QKV_A_PROJ: split %d fused_qkv_a_proj layers (chunk=%d)",
+                n_split,
+                envs.TPU_MLA_SPLIT_QKV_A_CHUNK,
+            )
+
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()
