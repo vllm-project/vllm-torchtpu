@@ -30,6 +30,7 @@ from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 import vllm_torchtpu as plugin
 from vllm_torchtpu import patch_registry, utils
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker import cpu_pinning
 from vllm_torchtpu.worker.tpu_worker import TPUWorker, _configure_tpu_process_env
 
 
@@ -642,6 +643,35 @@ def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
     assert events == [("model_load", {"model_config": config}), "load", "release"]
 
 
+def test_warmup_pins_cpus_only_for_a_registered_architecture(monkeypatch):
+    applied = []
+    monkeypatch.setattr(cpu_pinning, "_POLICIES", {"PinnedForCausalLM": "numa"})
+    monkeypatch.setattr(cpu_pinning, "apply", lambda *args: applied.append(args))
+
+    def worker(arch, numa_bind=False):
+        return SimpleNamespace(
+            model_runner=SimpleNamespace(capture_model=lambda: None),
+            compilation_config=SimpleNamespace(compilation_time=0.0),
+            speculative_config=None,
+            model_config=SimpleNamespace(architecture=arch),
+            parallel_config=SimpleNamespace(numa_bind=numa_bind),
+            rank=3,
+            local_rank=1,
+        )
+
+    with (
+        patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap"),
+        patch("vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"),
+    ):
+        TPUWorker.compile_or_warm_up_model(worker("OtherForCausalLM"))
+        assert applied == []
+        # --numa-bind is the user's choice: no second pinning on top of it.
+        TPUWorker.compile_or_warm_up_model(worker("PinnedForCausalLM", True))
+        assert applied == []
+        TPUWorker.compile_or_warm_up_model(worker("PinnedForCausalLM"))
+    assert applied == [(3, 1, "numa")]
+
+
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])
 @pytest.mark.parametrize("speculative", [False, True])
 def test_warmup_restores_runtime_threads_without_overriding_user_choice(
@@ -664,6 +694,8 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
         model_runner=SimpleNamespace(capture_model=capture_model),
         compilation_config=SimpleNamespace(compilation_time=0.0),
         speculative_config=object() if speculative else None,
+        # No CPU pinning policy is registered for this architecture.
+        model_config=SimpleNamespace(architecture="UnregisteredForCausalLM"),
     )
     previous_threads = torch.get_num_threads()
     try:
