@@ -1469,11 +1469,11 @@ def test_the_warmed_read_offset_programs_serve_without_compiling(monkeypatch):
         runner._reset_read_offsets_for_new_requests(0, 2)
 
     def sample_tokens():
-        runner._update_mamba_slot_read_offsets(groups, None, 2)
+        runner._update_mamba_slot_read_offsets(groups, None)
         for rows in (8, width):
             for dtype in (torch.int32, torch.int64):
                 next_tokens = torch.zeros((rows, k + 1), dtype=dtype)
-                runner._update_mamba_slot_read_offsets(groups, next_tokens, 2)
+                runner._update_mamba_slot_read_offsets(groups, next_tokens)
         tpu_runner._stack_or_single_mamba_groups(groups)
 
     torch._dynamo.reset()
