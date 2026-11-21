@@ -23,7 +23,6 @@ import bisect
 import contextlib
 import copy
 import dataclasses
-import functools
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -63,6 +62,7 @@ from vllm_torchtpu.spec_decode import draft_path_rules
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
+    _static_shape_args,
     dp_lockstep_num_reqs,
     fused_draft_loop_enabled,
     greedy_top_tokens_enabled,
@@ -77,51 +77,6 @@ from vllm_torchtpu.utils import synchronize_tensors
 # async substitution tensors). Matches RejectionSampler.PLACEHOLDER_TOKEN_ID and
 # the async runner's INVALID_TOKEN_ID.
 INVALID_TOKEN_ID = -1
-
-
-def _static_shape_args(fn):
-    """Strip dynamo dynamic-dim marks from a compiled region's tensor args.
-
-    vLLM's `@support_torch_compile` marks the model's `input_ids`/`positions`
-    dynamic on every forward (`vllm/compilation/decorators.py:585`), and
-    `torch._dynamo.mark_dynamic` records that by stamping a
-    `_dynamo_dynamic_indices` attribute onto the tensor *object*. The stamp
-    outlives the forward that applied it, and it has strictly higher precedence
-    than `dynamic=False` -- `mark_static` is documented as the lower-precedence
-    of the pair, so it cannot undo it. Hand such a tensor to one of the draft's
-    static regions and dynamo lifts a SymInt into the graph, which torch-tpu
-    rejects outright (`torch_tpu/_internal/compile/_backend.py:_raise_on_symint`
-    -> "TPU backend: does not support dynamic shape").
-
-    That is how `propose` used to die on its first draft step: `_forward_draft`
-    runs the draft model on `positions`, marking it, and the very next line
-    passed the same object to `_draft_gather_carries`. It presented as flaky and
-    rank-dependent only because a warm compile cache short-circuits the backend
-    call, so whether it fired depended on cache state rather than on shapes.
-
-    A view is a distinct Python object and carries no stamp, so aliasing is
-    enough; it copies nothing. Tensors that were never marked are passed through
-    untouched.
-    """
-
-    def _unmark(a):
-        if isinstance(a, torch.Tensor) and getattr(a, "_dynamo_dynamic_indices", None):
-            return a[:]
-        return a
-
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        if any(
-            isinstance(a, torch.Tensor) and getattr(a, "_dynamo_dynamic_indices", None)
-            for a in args
-        ):
-            args = tuple(_unmark(a) for a in args)
-        if kwargs:
-            kwargs = {k: _unmark(v) for k, v in kwargs.items()}
-            return fn(*args, **kwargs)
-        return fn(*args)
-
-    return wrapper
 
 
 def _maybe_pad_dim0(t: torch.Tensor, target_len: int) -> torch.Tensor:

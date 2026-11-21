@@ -246,9 +246,10 @@ from vllm_torchtpu.spec_decode.adaptive_verification import (
 )
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
-from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer, _static_shape_args
+from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
+    _static_shape_args,
     fast_token_substitution_enabled,
     fit_rows,
     greedy_top_tokens_enabled,
