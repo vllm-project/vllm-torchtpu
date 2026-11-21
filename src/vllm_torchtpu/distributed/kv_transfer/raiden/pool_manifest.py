@@ -1374,9 +1374,13 @@ def build_glm_mla_pool_manifest(
 DSV4_STATE_CACHE_SUFFIX = ".compressor.state_cache"
 DSV4_INDEXER_CACHE_SUFFIX = ".indexer.k_cache"
 DSV41_SWA_CACHE_SUFFIX = ".swa_cache"
-# CSA2 plane-major SWA pages: one pool per plane, sharing the group's block
-# table exactly as `dsv4.csa.nope` and `dsv4.csa.rope.scale` do.
-TAG_DSV41_SWA_PLANES = ("dsv4.swa.p0", "dsv4.swa.p1")
+# CSA2 SWA pages in the word pool, transferred in units of one token pair
+# (see `_dsv41_swa_pair_pool`). The pool shares the group's block table
+# exactly as `dsv4.csa.nope` and `dsv4.csa.rope.scale` do.
+TAG_DSV41_SWA_PAIRS = "dsv4.swa.pair"
+# `write_swa_word_pool` stores the BF16 rows of tokens 2p and 2p + 1 of a page
+# interleaved in one unit of four 512-byte word rows.
+DSV41_SWA_PAIR_BYTES = 4 * 512
 DSV4_CSA_COMPRESS_RATIO = 4
 # Halfplane Index-K: records per int32[128] owner row (see
 # vllm_torchtpu.kernels.deepseek_v41.index_key_layout.SLOTS).
@@ -1625,6 +1629,83 @@ def _dsv4_check_role_rows(
             )
 
 
+def _dsv41_swa_pair_pool(
+    *,
+    layer_name: str,
+    tag: str,
+    storage_index: int,
+    rows: int,
+    row_bytes: int,
+    offset_bytes: int,
+    stride_bytes: int,
+    num_blocks: int,
+    dtype_tag: str,
+) -> PoolEntry:
+    """Pool entry of one CSA2 SWA cache in the shared int32 word pool.
+
+    `write_swa_word_pool` (kernels/mla/paged_swa.py) stores a page of P BF16
+    tokens of 512 values each as P / 2 units of four 512-byte word rows. Unit
+    p holds tokens 2p and 2p + 1: row 4p + k holds values 128k .. 128k + 127
+    of both tokens, the even token in the low 16 bits of each int32 word and
+    the odd token in the high 16 bits. So one token is not a byte range of
+    the page, but a token pair is: the transfer unit is one pair (2048 bytes),
+    and a page of n live tokens ships its first ceil(n / 2) units.
+
+    Example (P = 64): a request whose window ends 63 tokens into its last page
+    ships bytes [0, 32 * 2048) of that page, which holds tokens 0..62 and the
+    odd half of unit 31 (token 63, not computed yet). The receiver computes
+    token 63 itself and writes only the high halves of unit 31. A row-prefix
+    description with 512-byte rows would ship rows 0..62 and 64..126 instead,
+    and leave row 63 (values 384..511 of tokens 30 and 31) and row 127 (values
+    384..511 of token 62) as stale bytes on the receiver.
+
+    Args:
+        layer_name: The SWA cache layer, for error messages.
+        tag: Pool tag, `dsv4.swa.pair.g<group>`.
+        storage_index: Index of the word pool in the manifest storages.
+        rows: Tokens per page (P).
+        row_bytes: Bytes per token in the upstream view; must be 1024.
+        offset_bytes: Byte offset of the layer's page 0 in the word pool.
+        stride_bytes: Bytes between consecutive pages (the block stride).
+        num_blocks: Pages in the pool.
+        dtype_tag: Dtype tag of the word pool.
+
+    Returns:
+        The pool entry. Its region has P / 2 units of 2048 bytes, so
+        `lower_dsv4_row_spans` with `page_tokens = P` ships ceil(n / 2) units
+        of a page with n live tokens.
+
+    Raises:
+        ManifestError: If the page geometry cannot hold whole token pairs.
+    """
+    pair_bytes = DSV41_SWA_PAIR_BYTES
+    if row_bytes != 1024 or rows % 2:
+        raise ManifestError(
+            f"DSv4.1 CSA2 SWA cache {layer_name} needs an even number of "
+            f"1024-byte token rows; got rows={rows}, row_bytes={row_bytes}"
+        )
+    if (
+        stride_bytes < rows * row_bytes
+        or stride_bytes % pair_bytes
+        or offset_bytes % pair_bytes
+    ):
+        raise ManifestError(
+            f"DSv4.1 CSA2 SWA cache {layer_name} page stride {stride_bytes} "
+            f"(offset {offset_bytes}) cannot hold {rows // 2} aligned "
+            f"{pair_bytes}-byte token pairs"
+        )
+    return PoolEntry(
+        tag=tag,
+        layer_name=layer_name,
+        storage_index=storage_index,
+        base_offset_bytes=offset_bytes,
+        block_stride_bytes=stride_bytes,
+        num_blocks=num_blocks,
+        regions=_dsv4_row_region(row_bytes=pair_bytes, num_rows=rows // 2),
+        dtype_tag=dtype_tag,
+    )
+
+
 def _build_dsv41_pool_manifest(
     *,
     named_kv_caches: Mapping[str, Any],
@@ -1642,23 +1723,19 @@ def _build_dsv41_pool_manifest(
     if not layouts:
         raise ManifestError("DSv4.1 materialized KV cache has no native_cache_layouts")
 
-    def _swa_plane_major(layer_name: str) -> bool:
-        """Whether this SWA cache is written by the CSA2 plane-major kernel.
+    def _swa_word_pairs(layer_name: str) -> bool:
+        """Whether this SWA cache is written in the CSA2 word-pool pair layout.
 
-        `write_swa_word_pool` stores token t of a P-token page at word rows
-        t (plane 0) and P + t (plane 1), 512 bytes each. The upstream view
-        shape ([blocks, P, 1024 B]) describes the same bytes but not that
-        order, so a row-prefix transfer against the view would ship plane 0
-        of 2n tokens and none of plane 1.
+        `write_swa_word_pool` (kernels/mla/paged_swa.py) does not store the
+        page in the token-major order of the upstream view shape
+        ([blocks, P, 1024 B]): see `_dsv41_swa_pair_pool` for the layout. A
+        row-prefix transfer against the view would ship the wrong bytes of a
+        partly filled page.
 
-        Which layers write plane-major is a per-layer kernel property, not a
-        count to assume: on DeepSeek-V4.1 Flash every layer with a compress
-        ratio (layers 2..39, `_csa2=True`, KV-sharing layers included) does,
-        while the two layers without a compressor (layers 0..1, compress
-        ratio 0, `_csa2=False`) write token-major 1024-byte rows. The
-        materialized cache carries the exact per-layer `_tpu_swa_words` flag;
-        the owner's membership in `csa2_layers` is the fallback
-        (`<owner>.swa_cache`).
+        Which layers use the word pool is a per-layer kernel property: the
+        materialized cache carries the exact per-layer `_tpu_swa_words` flag
+        (every FP8-KV layer of DeepSeek-V4.1 sets it). The owner's membership
+        in `csa2_layers` is the fallback (`<owner>.swa_cache`).
         """
         if layer_name in swa_word_layers:
             return True
@@ -1756,8 +1833,9 @@ def _build_dsv41_pool_manifest(
             if tag_base == TAG_DSV4_SWA and _element_size(raw) != 4:
                 # DeepSeek-V4.1 private CSA2 SWA pool: its own BF16 [pages,
                 # rows, width] owner (not a view of the shared int32 word
-                # pool, whose SWA pages are plane-major below) that XLA tiles ((8, 128), (2, 1)), so neither a
-                # token row nor a plane is a byte range of the page. Pages
+                # pool, see `_dsv41_swa_pair_pool` for that layout) that XLA
+                # tiles ((8, 128), (2, 1)), so neither a token row nor a
+                # plane is a byte range of the page. Pages
                 # travel whole: a raw page copy is exact whatever the tiling,
                 # and the rows past a partial tail page are rewritten by the
                 # receiver before its window reads them.
@@ -1788,52 +1866,27 @@ def _build_dsv41_pool_manifest(
                     )
                 )
                 continue
-            if tag_base == TAG_DSV4_SWA and _swa_plane_major(layer_name):
-                # Plane-major page: [plane 0: rows x 512 B][plane 1: rows x 512 B].
-                # Token t lives at row t of each plane, so each plane is its own
-                # row-prefix pool and both must travel.
-                plane_rows = rows
-                plane_row_bytes = row_bytes // 2
-                if plane_row_bytes * 2 != row_bytes or plane_row_bytes != 512:
-                    raise ManifestError(
-                        f"DSv4.1 CSA2 SWA cache {layer_name} needs 1024-byte token "
-                        f"rows (two 512-byte planes); got row_bytes={row_bytes}"
-                    )
-                plane_bytes = 2 * plane_rows * plane_row_bytes
-                if (
-                    stride_bytes < plane_bytes
-                    or stride_bytes % DSV41_OWNER_ROW_BYTES
-                    or offset_bytes % DSV41_OWNER_ROW_BYTES
-                ):
-                    raise ManifestError(
-                        f"DSv4.1 CSA2 SWA cache {layer_name} page stride "
-                        f"{stride_bytes} (offset {offset_bytes}) cannot hold "
-                        f"512-byte-aligned planes of {plane_rows} rows"
-                    )
-                for plane, plane_tag in enumerate(TAG_DSV41_SWA_PLANES):
-                    plane_offset = offset_bytes + plane * plane_rows * plane_row_bytes
-                    _claim_range(
-                        group_index,
-                        storage_index,
-                        plane_offset,
-                        plane_rows * plane_row_bytes,
-                        stride_bytes,
-                        f"{layer_name}.p{plane}",
-                    )
-                    pools.append(
-                        PoolEntry(
-                            tag=dsv4_group_tag(plane_tag, group_index),
-                            layer_name=layer_name,
-                            storage_index=storage_index,
-                            base_offset_bytes=plane_offset,
-                            block_stride_bytes=stride_bytes,
-                            num_blocks=num_blocks,
-                            regions=_dsv4_row_region(
-                                row_bytes=plane_row_bytes, num_rows=plane_rows
-                            ),
-                            dtype_tag=_dtype_tag(raw),
-                        )
-                    )
+            if tag_base == TAG_DSV4_SWA and _swa_word_pairs(layer_name):
+                pool = _dsv41_swa_pair_pool(
+                    layer_name=layer_name,
+                    tag=dsv4_group_tag(TAG_DSV41_SWA_PAIRS, group_index),
+                    storage_index=storage_index,
+                    rows=rows,
+                    row_bytes=row_bytes,
+                    offset_bytes=offset_bytes,
+                    stride_bytes=stride_bytes,
+                    num_blocks=num_blocks,
+                    dtype_tag=_dtype_tag(raw),
+                )
+                _claim_range(
+                    group_index,
+                    storage_index,
+                    offset_bytes,
+                    rows * row_bytes,
+                    stride_bytes,
+                    layer_name,
+                )
+                pools.append(pool)
                 continue
             packed_fp8_index = (
                 layer_name.endswith(DSV4_INDEXER_CACHE_SUFFIX)

@@ -18,8 +18,9 @@ declares live. That is only correct when the manifest's row order is the order
 the kernels actually write, which for the v2 kernels differs from the upstream
 view shape in two places:
 
-* CSA2 SWA pages are plane-major (`write_swa_word_pool`): token t of a
-  P-token page is word row t (plane 0) and row P + t (plane 1).
+* CSA2 SWA pages hold token pairs (`write_swa_word_pool`): tokens 2p and
+  2p + 1 of a page share word rows 4p .. 4p + 3, interleaved in the low and
+  high 16 bits of each int32 word.
 * The compressor state is a ring (`CircularBufferSpec`): one block per
   request, slot = position % capacity, never paged by tokens.
 
@@ -127,33 +128,81 @@ def _covered(ranges, start, size):
 def swa_token_bytes(block, token, page_tokens=32):
     """Where `write_swa_word_pool` puts token ``token`` of page ``block``.
 
-    physical_row = (rec // P) * 2P + rec % P + plane * P, 512 bytes per row.
+    `_pack_native` (kernels/mla/paged_swa.py): with record = block * P +
+    token, the token's 512 BF16 values are in physical word rows
+    4 * (record // 2) + k, k = 0..3, 512 bytes per row (one 16-bit half of
+    each word).
     """
-    rec = block * page_tokens + token
-    rows = [
-        (rec // page_tokens) * 2 * page_tokens + rec % page_tokens + plane * page_tokens
-        for plane in (0, 1)
-    ]
-    return [(row * 512, 512) for row in rows]
+    record = block * page_tokens + token
+    return [((4 * (record // 2) + k) * 512, 512) for k in range(4)]
 
 
-def test_swa_pages_are_two_plane_pools_under_csa2():
+def test_swa_pages_are_one_token_pair_pool_under_csa2():
     manifest = _build(csa2=True)
     tags = sorted(pool.tag for pool in manifest.pools)
     assert "dsv4.swa.g0" not in tags
-    assert "dsv4.swa.p0.g0" in tags and "dsv4.swa.p1.g0" in tags
-    p0, p1 = _pool(manifest, "dsv4.swa.p0.g0"), _pool(manifest, "dsv4.swa.p1.g0")
-    assert (p0.base_offset_bytes, p1.base_offset_bytes) == (0, 32 * 512)
-    assert p0.block_stride_bytes == p1.block_stride_bytes == PAGE_BYTES
-    assert p0.live_bytes_per_block == p1.live_bytes_per_block == 32 * 512
+    swa = _pool(manifest, "dsv4.swa.pair.g0")
+    assert swa.base_offset_bytes == 0 and swa.block_stride_bytes == PAGE_BYTES
+    assert swa.regions[0].unit_bytes == 2048 and swa.regions[0].num_units == 16
+    assert swa.live_bytes_per_block == 32 * 1024
 
-    # A partial page: every byte the kernel wrote for the live tokens must be
-    # inside the transferred ranges, and no byte of a dead token may be.
-    block, live = 3, 5
-    ranges = _live_byte_ranges(p0, block, live, 32) + _live_byte_ranges(p1, block, live, 32)
-    for token in range(32):
-        for start, size in swa_token_bytes(block, token):
-            assert _covered(ranges, start, size) == (token < live), (token, start)
+    # Every partial page length: every byte the kernel wrote for a live token
+    # must be inside the transferred ranges, and no byte of a token pair
+    # without a live token may be.
+    block = 3
+    for live in range(1, 33):
+        ranges = _live_byte_ranges(swa, block, live, 32)
+        for token in range(32):
+            covered = [
+                _covered(ranges, start, size)
+                for start, size in swa_token_bytes(block, token)
+            ]
+            assert all(covered) == (token // 2 < (live + 1) // 2), (live, token)
+            assert any(covered) == all(covered), (live, token)
+
+
+@pytest.mark.parametrize("live", [1, 2, 31, 63, 64])
+def test_swa_transfer_round_trips_through_the_word_pool_writer(live):
+    """Write a page with the CPU reference of the CSA2 SWA writer, copy only
+    the bytes the manifest declares live into a pool of stale bytes, and read
+    the live tokens back with the CSA2 SWA reader."""
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
+
+    page_tokens, num_blocks, block = 64, 4, 2
+    stride = page_tokens * 1024
+    layout = ((num_blocks, page_tokens, 512), torch.bfloat16, stride, 0)
+    rows = num_blocks * stride // 512
+    swa_layer = "model.layers.3.attn.swa_cache"
+    src = torch.zeros((rows, 128), dtype=torch.int32)
+    # Stale bytes on the receiver: FP8 / FP32 data of an earlier owner of the
+    # block, which decode to NaN when read as BF16.
+    dst = torch.full((rows, 128), -1, dtype=torch.int32)
+    values = torch.randn(live, 512).to(torch.bfloat16)
+    slots = block * page_tokens + torch.arange(live)
+    PagedCacheRows(src, layout, swa_words=True).write(slots, values)
+
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches={swa_layer: torch.empty(0)},
+        kv_cache_groups=[_group(swa_layer, _spec(page_tokens))],
+        raw_tensors=[src],
+        dsv41_materialized_kv=types.SimpleNamespace(
+            native_cache_layouts={swa_layer: layout},
+            native_raw_cache={swa_layer: src},
+            rope_pools={},
+            scale_pools={},
+            csa2_layers=frozenset(),
+            swa_word_layers=frozenset({swa_layer}),
+        ),
+    )
+    src_bytes, dst_bytes = src.view(torch.uint8).flatten(), dst.view(torch.uint8).flatten()
+    for pool in manifest.pools:
+        for lo, hi in _live_byte_ranges(pool, block, live, page_tokens):
+            dst_bytes[lo:hi] = src_bytes[lo:hi]
+
+    received = PagedCacheRows(dst, layout, swa_words=True)[
+        torch.full((live,), block), torch.arange(live)
+    ]
+    assert torch.equal(received.view(torch.int16), values.view(torch.int16))
 
 
 def test_swa_without_csa2_keeps_the_view_rows():
@@ -198,16 +247,16 @@ def _build_with(materialized_overrides):
 
 def test_layer_without_csa2_keeps_token_rows():
     """A layer whose attention does not run CSA2 (`_csa2=False`, e.g. the two
-    compressor-less layers 0..1 of V4.1 Flash) keeps token-major 1024-byte
-    SWA rows even while CSA2 layers write plane-major."""
+    compressor-less layers 0..1 of V4.1 Flash with a BF16 KV cache) keeps
+    token-major 1024-byte SWA rows even while CSA2 layers write token pairs."""
     manifest = _build_with({"csa2_layers": frozenset({"model.layers.9.attn"})})
     swa = _pool(manifest, "dsv4.swa.g0")
     assert swa.regions[0].unit_bytes == 1024 and swa.regions[0].num_units == 32
 
 
 def test_exact_swa_word_flag_wins_over_owner_heuristic():
-    planes = _build_with({"csa2_layers": frozenset(), "swa_word_layers": frozenset({SWA})})
-    assert {p.tag for p in planes.pools} >= {"dsv4.swa.p0.g0", "dsv4.swa.p1.g0"}
+    pairs = _build_with({"csa2_layers": frozenset(), "swa_word_layers": frozenset({SWA})})
+    assert "dsv4.swa.pair.g0" in {p.tag for p in pairs.pools}
     rows = _build_with({"csa2_layers": frozenset({ATTN}),
                         "swa_word_layers": frozenset({"model.layers.9.attn.swa_cache"})})
     assert _pool(rows, "dsv4.swa.g0").regions[0].unit_bytes == 1024
@@ -254,17 +303,16 @@ def test_dsv4_receive_plan_follows_the_pool_plan_order():
                                            slot=True),
     )
     worker._stage3_dsv4_plan = (
-        types.SimpleNamespace(tag="dsv4.swa.p0.g0", plan_position=0),
-        types.SimpleNamespace(tag="dsv4.swa.p1.g0", plan_position=0),
+        types.SimpleNamespace(tag="dsv4.swa.pair.g0", plan_position=0),
         types.SimpleNamespace(tag="dsv4.state.csa.g1", plan_position=1),
     )
     # 160 tokens, window 128: the first page (tokens 0..31) is behind the
     # window and already the null block.
     req_meta = types.SimpleNamespace(group_block_ids=[[0, 11, 12, 13, 14], [7]])
     tags, blocks, counts = worker._stage3_dsv4_receive_plan(req_meta, 160, "r1")
-    assert tags == ["dsv4.swa.p0.g0", "dsv4.swa.p1.g0", "dsv4.state.csa.g1"]
-    assert blocks == [11, 12, 13, 14, 11, 12, 13, 14, 7]
-    assert counts == [4, 4, 1]
+    assert tags == ["dsv4.swa.pair.g0", "dsv4.state.csa.g1"]
+    assert blocks == [11, 12, 13, 14, 7]
+    assert counts == [4, 1]
 
 
 
@@ -478,8 +526,8 @@ def test_block_outer_shared_swa_and_uniform_ring_groups():
     scale_raw = torch.zeros((total_rows,), dtype=torch.float32)
 
     swa_l0 = "model.layers.0.self_attn.swa_cache"  # token-major
-    swa_l2 = "model.layers.2.self_attn.swa_cache"  # plane-major CSA2
-    swa_l3 = "model.layers.3.self_attn.swa_cache"  # plane-major CSA2
+    swa_l2 = "model.layers.2.self_attn.swa_cache"  # CSA2 token pairs
+    swa_l3 = "model.layers.3.self_attn.swa_cache"  # CSA2 token pairs
     ring_l2 = "model.layers.2.self_attn.compressor.state_cache"
     ring_l8 = "model.layers.8.self_attn.compressor.state_cache"
 
@@ -538,10 +586,10 @@ def test_block_outer_shared_swa_and_uniform_ring_groups():
         raw_tensors=[shared_raw, scale_raw],
         dsv41_materialized_kv=materialized,
     )
-    # 1 token-major SWA pool + 2*2 plane-major SWA pools + 2 ring pools = 7 pools
-    assert len(manifest.pools) == 7
-    p0_entries = [p for p in manifest.pools if p.tag == "dsv4.swa.p0.g0"]
-    assert [p.base_offset_bytes for p in p0_entries] == [
+    # 1 token-major SWA pool + 2 token-pair SWA pools + 2 ring pools = 5 pools
+    assert len(manifest.pools) == 5
+    pair_entries = [p for p in manifest.pools if p.tag == "dsv4.swa.pair.g0"]
+    assert [p.base_offset_bytes for p in pair_entries] == [
         swa_page_bytes,
         2 * swa_page_bytes,
     ]

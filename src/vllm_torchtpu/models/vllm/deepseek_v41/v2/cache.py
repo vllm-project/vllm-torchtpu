@@ -75,13 +75,12 @@ class MaterializedNativeKVCache:
     native_cache_layouts: dict[str, tuple] = field(default_factory=dict)
     scale_pools: dict[str, RawCachePool] = field(default_factory=dict)
     # Attention modules resolved to the CSA2 kernels. Their SWA companions are
-    # written plane-major (`write_swa_word_pool`): a page of P tokens is
-    # [plane 0: P rows][plane 1: P rows] of 512 bytes, not P rows of 1024.
+    # written in token pairs (`write_swa_word_pool`): tokens 2p and 2p + 1 of
+    # a page share four 512-byte word rows, not two 1024-byte token rows.
     csa2_layers: frozenset[str] = frozenset()
     # SWA cache layers whose module carries `_tpu_swa_words=True`: the exact
-    # per-layer flag `PagedCacheRows.write` branches on. On V4.1 Flash every
-    # layer with a compress ratio (2..39) writes plane-major; the two
-    # compressor-less layers (0..1) write token-major 1024-byte rows.
+    # per-layer flag `PagedCacheRows.write` branches on. With an FP8 KV cache
+    # every V4.1 layer sets it; other layers write token-major 1024-byte rows.
     swa_word_layers: frozenset[str] = frozenset()
 
 
