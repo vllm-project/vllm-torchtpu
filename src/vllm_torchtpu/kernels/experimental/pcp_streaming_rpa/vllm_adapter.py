@@ -196,7 +196,7 @@ def make_pcp_streaming_rpa_kernel(
     soft_cap: float | None = None,
     skip_kv_update: bool,
     cp_kv_cache_interleave_size: int,
-    q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+    q_block_size: int | None = None,
     q_compute_size: int | None = None,
     kv_layout: batched_rpa_configs.KVLayout = (
         batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
@@ -224,6 +224,19 @@ def make_pcp_streaming_rpa_kernel(
         query_start_loc: jax.Array,
         request_distribution: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
+        local_q_block_size = q_block_size
+        if local_q_block_size is None:
+            # Bound the FP32 output accumulator to 16 MiB, preserving the
+            # established 512-row tile for 32 heads x 256 channels. Q and
+            # output DMA buffers each use half that storage in BF16.
+            local_heads = query.shape[-2] // mesh.shape.get(TP_AXIS_NAME, 1)
+            bytes_per_row = local_heads * query.shape[-1] * 4
+            local_q_block_size = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
+            while (
+                local_q_block_size * bytes_per_row > 16 * 1024 * 1024
+                and local_q_block_size // 2 >= cp_kv_cache_interleave_size
+            ):
+                local_q_block_size //= 2
         # Fold the block-major pool so kernel blocks run along dim 0
         # (zero-copy bitcast).
         pool = kv_cache.reshape((-1,) + kv_cache.shape[2:]) if block_major else kv_cache
@@ -245,7 +258,7 @@ def make_pcp_streaming_rpa_kernel(
             v_scale=v_scale,
             update_kv_cache=True,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-            q_block_size=q_block_size,
+            q_block_size=local_q_block_size,
             q_compute_size=q_compute_size,
             kv_layout=kv_layout,
         )
