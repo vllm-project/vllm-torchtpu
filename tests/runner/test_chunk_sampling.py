@@ -765,11 +765,15 @@ def test_the_traced_packed_sampler_matches_the_host(rows, u_in_graph) -> None:
         _apply_temperature=TPUModelRunner._apply_temperature.__get__(object())
     )
     torch._dynamo.reset()
-    with torch.compiler.set_stance("default"):
-        traced = torch.compile(fn, backend="eager", fullgraph=True, dynamic=False)
-        out = traced(
-            runner, packed, temperatures, None if u_in_graph else u, top_k, top_p
-        )
+    try:
+        with torch.compiler.set_stance("default"):
+            traced = torch.compile(fn, backend="eager", fullgraph=True, dynamic=False)
+            out = traced(
+                runner, packed, temperatures, None if u_in_graph else u, top_k, top_p
+            )
+    finally:
+        # Drop the eager backend's entries so later tests compile afresh.
+        torch._dynamo.reset()
     assert torch.equal(out, host)
 
 
