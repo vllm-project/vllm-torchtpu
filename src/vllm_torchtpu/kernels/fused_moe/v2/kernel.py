@@ -70,9 +70,10 @@ HEIGHT_RUNGS = 4
 # experts hold about 16 rows each. 2, not HEIGHT_RUNGS: the 4 copies of the
 # FFN body made 2 of 20 layers of that build run at about twice the time.
 SHORT_TILE_RUNGS = 2
-# DMA priority the weight refills take, so that they stay off the in-order
-# queue the token gather issues on.
-WEIGHT_DMA_PRIORITY = 1
+# DMA priority the weight refills take: 1 keeps them off the in-order queue
+# the token gather issues on, 0 shares it. Read at import from
+# MOE_FUSED_EP_V2_WEIGHT_DMA_PRIORITY (default 1).
+WEIGHT_DMA_PRIORITY = envs.MOE_FUSED_EP_V2_WEIGHT_DMA_PRIORITY
 # The collective this kernel's barrier and remote copies belong to. Shared
 # with any other collective kernel built with the same id.
 COLLECTIVE_ID = 0
@@ -1578,8 +1579,8 @@ def _build_fused_ep_moe_kernel(
                 def _():
                     refill_slot = lax.rem(visit_i + prefetch_distance, jnp.int32(nbuf))
                     ahead = visit_sm[visit_i + prefetch_distance]
-                    # Weight refills take their own DMA priority to stay off
-                    # the in-order token-gather queue.
+                    # Weight refills take WEIGHT_DMA_PRIORITY: off the in-order
+                    # token-gather queue at 1, on it at 0.
                     weight_starts(ahead, refill_slot)
 
             rows = expert_rows_sm[e]

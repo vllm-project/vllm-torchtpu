@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_PLAN_KERNEL: bool = False
     MOE_FUSED_EP_V2_COMBINE_ONE_CALL: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    MOE_FUSED_EP_V2_WEIGHT_DMA_PRIORITY: int = 1
     TPU_MOE_EPLB_DYNAMIC: bool = False
     TPU_MOE_EPLB_MODE: str = "decode_only"
     TPU_MOE_EPLB_WINDOW_STEPS: int = 16
@@ -984,6 +985,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel.
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
+    ),
+    # DMA priority of fused EP MoE v2's weight refills (kernel.WEIGHT_DMA_PRIORITY).
+    # 0 puts them on the token gather's queue, which at decode shapes shortens
+    # the weight wait of each call; 1 keeps them apart.
+    "MOE_FUSED_EP_V2_WEIGHT_DMA_PRIORITY": env_int(
+        "MOE_FUSED_EP_V2_WEIGHT_DMA_PRIORITY", 1
     ),
     # MOE_FUSED_EP_KERNEL_IMPL=push: how many destination expert-visit
     # positions the SparseCore pushes before the TensorCore MoE kernel starts
