@@ -1283,13 +1283,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_TPU_FAST_TOKEN_SUBSTITUTION"
     ),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
-    # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
+    # (spec_decode/mtp_fused_loop.py) instead of one program per step. Unset
+    # (None), a model's draft-path rule decides; off without one.
     # TODO: support the two cases that still take the per-step loop:
     #   - GLM-5.2 / Gemma-4 MTP: IndexShare's per-chunk top-k restore, and a
     #     KV-sharing draft's fixed positions and seq_lens.
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
-    # Unset (None), a model's draft-path rule decides; off without one.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_optional_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).

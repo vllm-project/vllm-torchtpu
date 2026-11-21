@@ -19,8 +19,8 @@ VLLM_TPU_FUSED_DRAFT_LOOP). A model package registers a rule at model
 registration (models/vllm/__init__.py) for the configurations it has
 validated with them; the code that turns those paths on (spec_decode/utils.py)
 asks only whether a registered rule holds, so it carries no model-specific
-logic. This module imports nothing, so registering a rule
-at plugin load costs nothing.
+logic. This module imports nothing, so registering a rule at plugin load
+costs nothing.
 """
 
 from __future__ import annotations

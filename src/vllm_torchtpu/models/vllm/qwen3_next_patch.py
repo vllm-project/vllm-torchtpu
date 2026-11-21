@@ -988,9 +988,6 @@ def _draft_borrows_target_head() -> bool:
     """Whether the engine being loaded runs a draft that borrows the target's
     LM head: an EAGLE/MTP, DFlash or DSpark draft (the proposers that bind it
     in maybe_share_lm_head). An n-gram drafter has no head.
-
-    Read from the current vLLM config, which _quantize_target_lm_head has
-    already read for the same head.
     """
     from vllm.config import get_current_vllm_config
 

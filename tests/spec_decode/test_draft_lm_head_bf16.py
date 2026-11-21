@@ -29,22 +29,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.runner.greedy_top_tokens_test_utils import set_greedy_top_tokens
 from vllm_torchtpu.runner import greedy_top_tokens as gtt
 from vllm_torchtpu.spec_decode import utils
-
-
-def _set_greedy_top_tokens(monkeypatch) -> None:
-    """Turn TPU_GREEDY_TOP_TOKENS on in the environment, where envs reads it.
-    A monkeypatch.setattr(envs, ...) undo leaves the value it read in the
-    module dict, which shadows envs.__getattr__ for the rest of the session
-    (see tests/layers/adapter/test_mla_attention.py), so any such entry an
-    earlier test left is dropped first."""
-    from vllm_torchtpu import envs
-
-    if "TPU_GREEDY_TOP_TOKENS" in vars(envs):
-        monkeypatch.delattr(envs, "TPU_GREEDY_TOP_TOKENS")
-    monkeypatch.setenv("TPU_GREEDY_TOP_TOKENS", "1")
-
 
 VOCAB, HIDDEN = 256, 128
 
@@ -339,7 +326,7 @@ def _shared_draft() -> tuple[_Draft, SimpleNamespace]:
 
 
 def test_draft_greedy_head_defaults_to_bf16_with_no_proxy(monkeypatch):
-    _set_greedy_top_tokens(monkeypatch)
+    set_greedy_top_tokens(monkeypatch)
     draft, target = _shared_draft()
 
     owner = _init_greedy_head(draft)

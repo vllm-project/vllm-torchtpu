@@ -16,10 +16,12 @@
 from __future__ import annotations
 
 import dataclasses
+import pathlib
 from types import SimpleNamespace
 from typing import Literal
 
 import pytest
+import yaml
 
 from vllm_torchtpu.models.qwen3_5 import settings
 
@@ -196,10 +198,6 @@ def test_quantize_target_lm_head_is_refused_where_nothing_runs_it(
 def test_validation_entries_keep_quantize_target_lm_head(monkeypatch):
     """Every leg of every validation entry sets quantize_target_lm_head for
     Qwen3.5-397B-A17B on TPU7x, where it is accepted."""
-    import pathlib
-
-    import yaml
-
     from vllm_torchtpu.models.qwen3_5 import hooks
 
     monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")

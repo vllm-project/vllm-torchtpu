@@ -18,7 +18,7 @@ import pytest
 import torch
 from vllm.model_executor.models.utils import PPMissingLayer
 
-from vllm_torchtpu.spec_decode import utils
+from vllm_torchtpu.spec_decode import draft_path_rules, utils
 
 
 def test_own_vocab_weights_are_kept_when_tp_layout_matches():
@@ -208,7 +208,6 @@ def qwen3_5_draft_path_rule(monkeypatch):
     """The registry holding exactly Qwen3.5's rule, as register_models leaves it,
     on the checkpoint and device the rule was validated on."""
     from vllm_torchtpu.models.qwen3_5 import hooks
-    from vllm_torchtpu.spec_decode import draft_path_rules
 
     monkeypatch.setattr(draft_path_rules, "_RULES", [hooks.mtp_draft_path])
     monkeypatch.setattr(hooks, "_has_calibrated_shape", lambda _model_config: True)
@@ -263,11 +262,8 @@ def test_qwen3_5_mtp_rules_follow_the_model_and_draft(
     """Greedy top tokens, fast token substitution and the fused draft loop
     run by rule only for a Qwen3.5 target with an MTP draft; every other
     configuration keeps main's opt-in env keys (default off)."""
-    from vllm_torchtpu.spec_decode import utils
-
     _draft_path_keys(monkeypatch)
     config = _qwen35_mtp_config(arch, method)
-    from vllm_torchtpu.spec_decode import draft_path_rules
 
     assert draft_path_rules.holds(config) is expected
     assert utils.greedy_top_tokens_enabled(config) is expected
@@ -298,7 +294,6 @@ def test_qwen3_5_mtp_rule_holds_only_where_validated(
     from types import SimpleNamespace as NS
 
     from vllm_torchtpu.models.qwen3_5 import hooks
-    from vllm_torchtpu.spec_decode import draft_path_rules
 
     monkeypatch.setattr(draft_path_rules, "_RULES", [hooks.mtp_draft_path])
     monkeypatch.setattr(hooks, "_chip_family", lambda: chip)
@@ -316,8 +311,6 @@ def test_qwen3_5_mtp_rule_holds_only_where_validated(
 def test_qwen3_5_fused_draft_loop_rule_exceptions(monkeypatch, qwen3_5_draft_path_rule):
     """The fused loop rule stays off for a KV-sharing draft and under EP-DP
     lockstep; main's key still turns it on anywhere off lockstep."""
-    from vllm_torchtpu.spec_decode import utils
-
     _draft_path_keys(monkeypatch)
     config = _qwen35_mtp_config()
     on = utils.fused_draft_loop_enabled
@@ -341,8 +334,6 @@ def test_a_set_draft_path_key_overrides_the_rule(
     """On an engine the Qwen3.5 rule turns the draft path on for, a key set to
     0 turns its part off and 1 keeps it on; only an unset key follows the
     rule."""
-    from vllm_torchtpu.spec_decode import utils
-
     config = _qwen35_mtp_config()
     parts = {
         "TPU_GREEDY_TOP_TOKENS": lambda: utils.greedy_top_tokens_enabled(config),
@@ -361,8 +352,6 @@ def test_a_set_draft_path_key_overrides_the_rule(
 def test_no_registered_rule_keeps_main_opt_in_keys(monkeypatch):
     """Without a model-provided rule, even a Qwen3.5 MTP configuration keeps
     main's opt-in keys (default off): the generic helpers hold no model logic."""
-    from vllm_torchtpu.spec_decode import draft_path_rules, utils
-
     monkeypatch.setattr(draft_path_rules, "_RULES", [])
     _draft_path_keys(monkeypatch)
     config = _qwen35_mtp_config()
@@ -380,7 +369,6 @@ def test_register_models_registers_the_qwen3_5_draft_path_rule(monkeypatch):
     general plugin), once however often it runs."""
     from vllm_torchtpu.models.qwen3_5.hooks import mtp_draft_path
     from vllm_torchtpu.models.vllm import register_models
-    from vllm_torchtpu.spec_decode import draft_path_rules
 
     monkeypatch.setattr(draft_path_rules, "_RULES", [])
     register_models()
@@ -389,8 +377,6 @@ def test_register_models_registers_the_qwen3_5_draft_path_rule(monkeypatch):
 
 
 def test_matching_names_the_rule_that_applies(qwen3_5_draft_path_rule):
-    from vllm_torchtpu.spec_decode import draft_path_rules
-
     assert draft_path_rules.matching(_qwen35_mtp_config()) == [
         "vllm_torchtpu.models.qwen3_5.hooks.mtp_draft_path"
     ]

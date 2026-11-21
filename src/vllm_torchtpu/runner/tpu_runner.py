@@ -10703,9 +10703,13 @@ class TPUModelRunner(GPUModelRunner):
         cross-step chain (step N reads the AsyncPreResults parked by step N-1).
 
         Bounded + value-insensitive: only shapes matter, so token/position VALUES
-        are irrelevant. Wrapped so any failure degrades to "no warmup" (the first
-        request just pays the bounded recompiles, as before) rather than breaking
-        serving.
+        are irrelevant. A failed synthetic step is logged and skipped after
+        the one-request sweep's single retry (the first live step of that
+        shape then pays its compiles). The start is refused when the MTP draft
+        is left with a reachable token bucket no trace built
+        (_check_draft_buckets_built), or its first pass above max_model_len
+        fails twice: a live step would hit a raising bucket or the other
+        side's graph.
         """
         if not envs.SPEC_WARMUP:
             if not self.enforce_eager:
