@@ -24,7 +24,7 @@ branch, or committed to the branch directly for one-off debugging.
 3. The build then, without anyone's help:
    - **preflight**: settles the version (branch or `RELEASE_VERSION`), checks
      the commit's vllm-torchtpu-ci statuses on GitHub (passed, with nightly
-     steps), and checks PyPI doesn't have the version yet;
+     steps that ran on TPU v7x), and checks PyPI doesn't have the version yet;
    - **builds once**: the ci, dev and prod images, staged in GAR as
      `vllm-torchtpu-<target>:<version>` and `:<date>-<version>`, and both
      wheels;

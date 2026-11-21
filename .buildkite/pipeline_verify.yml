@@ -34,17 +34,21 @@ steps:
     key: "nightly_report"
     # The suites the matrices are built from, and the nightly tests-lane steps a
     # verified commit pair also needs passed. It runs whatever their outcome.
+    # The tests-lane steps carry the prefix bootstrap.py stamps on them
+    # (tpu_generations.py); TPU_KEY_PREFIX is the one of the generation the
+    # build runs them on (tests_lane_key_prefix): v7x's, unless a manual build
+    # runs another generation alone. nightly_report.sh needs v7x's passed.
     depends_on:
       - "v6e-group"
       - "v7x-group"
       - "typecheck_full"
       - "unit_tests_cpu_nightly"
-      - "unit_tests_general_nightly"
-      - "unit_tests_multichip_nightly"
-      - "unit_tests_spec_decode_nightly"
-      - "unit_tests_spec_decode_multichip_nightly"
-      - "unit_tests_omni_nightly"
-      - "unit_tests_omni_multichip_nightly"
+      - "${TPU_KEY_PREFIX}unit_tests_general_nightly"
+      - "${TPU_KEY_PREFIX}unit_tests_multichip_nightly"
+      - "${TPU_KEY_PREFIX}unit_tests_spec_decode_nightly"
+      - "${TPU_KEY_PREFIX}unit_tests_spec_decode_multichip_nightly"
+      - "${TPU_KEY_PREFIX}unit_tests_omni_nightly"
+      - "${TPU_KEY_PREFIX}unit_tests_omni_multichip_nightly"
     allow_dependency_failure: true
     agents:
       queue: cpu

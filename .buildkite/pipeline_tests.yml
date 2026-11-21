@@ -14,7 +14,12 @@
 
 # The TPU unit test suite on the Kueue fleet; bootstrap.py uploads it with the
 # image build from pipeline_build.yml (CPU checks live in pipeline_cpu.yml).
-#
+# It goes up once for each TPU generation the build runs - v7x alone unless
+# CI_TPU_GENERATIONS picks others (see README.md) - with the same steps and
+# tests on each: bootstrap.py fills in the generation's shapes and puts its
+# name before the group name, every label and every key (tpu_generations.py),
+# so no step here names it.
+
 # The `tests` plugin runs on the agent and exports BUILDKITE_TEST_ENGINE_*;
 # bktec runs in the pod, and run.sh forwards that configuration across - see
 # common.sh for what happens to the credentials.
@@ -47,11 +52,18 @@ x-tests-plugin-defaults: &tests_plugin_defaults
   install-client: false
   oidc-lifetime: 7200
 
-# Overridable to run on idle v6e, but only to prove the plumbing reaches a
-# chip: several hundred kernel tests call pytest.fail rather than skip there,
-# so a v6e run is red for reasons that say nothing about this lane.
+# The generation's shapes, from bootstrap.py; the defaults are v7x's, for an
+# upload of this file on its own. One chip is two devices on v7x (two
+# TensorCores) and one on v6e. A v6e run is still red: several hundred kernel
+# tests call pytest.fail rather than skip there (see README.md).
 x-shape-single: &shape_single "${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}"
 x-shape-multi: &shape_multi "${KUBE_SHAPE_MULTI:-tpu7x-standard-4t/2x2x1}"
+
+# The `if` of a step only v7x runs, so v6e's upload leaves it out (as in
+# pipeline_integration.yml). The omni steps use it: tests_omni targets TPU v7x
+# and is not qualified on v6e (32 GB of HBM a chip).
+x-pr-v7x-only: &pr_v7x_only 'build.env("NIGHTLY") != "1" && "${TPU_GENERATION:-v7x}" == "v7x"'
+x-nightly-v7x-only: &nightly_v7x_only 'build.env("NIGHTLY") == "1" && "${TPU_GENERATION:-v7x}" == "v7x"'
 
 steps:
   - group: "Unit Tests on TPU"
@@ -134,7 +146,7 @@ steps:
         key: "unit_tests_omni_pr"
         <<: *tpu_step
         depends_on: "build_docker_omni"
-        if: 'build.env("NIGHTLY") != "1"'
+        if: *pr_v7x_only
         env:
           SHAPE: *shape_single
           DOCKER_IMAGE_SUFFIX: "-omni"
@@ -223,7 +235,7 @@ steps:
         key: "unit_tests_omni_nightly"
         <<: *tpu_step
         depends_on: "build_docker_omni"
-        if: 'build.env("NIGHTLY") == "1"'
+        if: *nightly_v7x_only
         env:
           SHAPE: *shape_single
           DOCKER_IMAGE_SUFFIX: "-omni"
@@ -241,7 +253,7 @@ steps:
         key: "unit_tests_omni_multichip_nightly"
         <<: *tpu_step
         depends_on: "build_docker_omni"
-        if: 'build.env("NIGHTLY") == "1"'
+        if: *nightly_v7x_only
         env:
           SHAPE: *shape_multi
           DOCKER_IMAGE_SUFFIX: "-omni"

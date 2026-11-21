@@ -18,6 +18,60 @@ releases the `wait` once the retry passes and runs the uploader step. The
 `oncall-fix` label raises job and Kueue workload priority without changing the
 suite.
 
+By default, the TPU steps of the `tests`, `integration` and `perf` lanes run
+only on TPU v7x. To also run them on TPU v6e, start a build with the
+environment variable `CI_TPU_GENERATIONS=all` (set it in the Buildkite UI or
+API). The build then runs each of those steps twice, once on each chip (except
+the steps v6e cannot run, below), and shows the two sets side by side. A build
+you start from the UI or API can instead set `CI_TPU_GENERATIONS=v6e` or
+`CI_TPU_GENERATIONS=v7x` to run one chip alone, for example to look into v6e
+failures without also using v7x machines. Any other build refuses that, since
+a PR, merge-queue, `/ci`, release, tag, scheduled or integration build must
+not skip v7x. A build that runs v6e alone records no verified commit, and the
+release gate (`release/ci_gate.py`) only counts nightly steps that ran on v7x.
+Any other value is rejected, and so is a build that sets `KUBE_SHAPE_SINGLE` or
+`KUBE_SHAPE_MULTI`: the generation brings its shapes.
+
+The v6e steps do not pass yet, and they are not `soft_fail`, so a build with
+`CI_TPU_GENERATIONS=all` is expected to fail: several hundred kernel tests call
+`pytest.fail` rather than skip below TPU v7
+(`tests/kernels/test_quantized_matmul_kernel.py`). The `tests_omni` tests are
+not qualified for v6e's 32 GB of HBM, so the omni steps run on v7x only. No
+build has to set it. Use it on a
+manual build to see where v6e stands, and not on a merge-queue, release or
+integration build.
+
+`CI_TPU_GENERATIONS` chooses the chips for the `tests`, `integration` and
+`perf` lanes only. A build with
+`NIGHTLY=1` also runs the nightly model and feature tests for both chips (the
+"TPU v6e nightly Tests" and "TPU v7x nightly Tests" groups) and the nightly
+report, whatever `CI_TPU_GENERATIONS` is set to.
+
+In the Buildkite UI, the name of each TPU step of those lanes starts with the
+chip it runs on (`v6e ...` or `v7x ...`).
+
+A TPU step in `pipeline_tests.yml`, `pipeline_integration.yml` or
+`pipeline_perf.yml` is written once, with no generation in its `label` or
+`key`. For each generation, `bootstrap.py` reads the file through
+`buildkite-agent pipeline upload --dry-run`, puts the generation's name (`v6e`,
+`v7x`) before every label and group name, and the name and an underscore
+(`v6e_`, `v7x_`) before every key the file defines (and before a `depends_on`
+that names one), then uploads the result. If that fails, the upload fails; a
+file never goes up unstamped. A step outside the file that waits on one of its
+steps names the prefixed key, as the nightly report in `pipeline_verify.yml`
+does. A new generation is an entry in `tpu_generations.py` (`TpuGeneration`)
+and no change to a step.
+
+The one thing a new step may need: if it can only run on v7x, give it its
+file's v7x-only `if` (`*v7x_only` or `*nightly_v7x_only`; in
+`pipeline_tests.yml`, `*pr_v7x_only` or `*nightly_v7x_only`), so v6e's upload
+leaves it out.
+
+The `integration` and `perf` lanes go up the same way as `tests`, once per
+generation in `TPU_GENERATION_FILES`: their eight-core steps take a v6e 2x4
+slice where v7x's take a 2x2x1, and each upload fills in the generation's
+`TPU_ACCELERATOR_TYPE`.
+
 `pipeline_perf.yml` holds the perf/eval
 steps. Post-merge builds do not run them, and PR builds run them only when the
 PR has the `run-perf-eval` label (or `run-full-ci`, which sets `NIGHTLY=1` and
