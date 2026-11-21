@@ -129,7 +129,7 @@ def _stand_in_compile(monkeypatch, result=None):
     return calls
 
 
-ELIGIBLE = {"backend": "tpu", "fullgraph": True, "dynamic": False}
+TPU_COMPILE_KWARGS = {"backend": "tpu", "fullgraph": True, "dynamic": False}
 
 
 def test_tpu_compile_compiles_with_the_filter_and_wraps(monkeypatch):
@@ -140,7 +140,10 @@ def test_tpu_compile_compiles_with_the_filter_and_wraps(monkeypatch):
 
     wrapped = fast_dispatch.tpu_compile(f)
     assert calls == [
-        {**ELIGIBLE, "options": {"guard_filter_fn": fast_dispatch._drop_global_state}}
+        {
+            **TPU_COMPILE_KWARGS,
+            "options": {"guard_filter_fn": fast_dispatch._drop_global_state},
+        }
     ]
     assert wrapped._fast_dispatch_state["entries"] == []
     assert wrapped._torchdynamo_orig_callable is f
@@ -281,6 +284,77 @@ def test_fast_dispatch_keeps_every_compiled_entry():
         assert torch.equal(wrapped(x), x * 2 + 1)
     fast, slow = (a - b for a, b in zip(fast_dispatch._STATS, before))
     assert (fast, slow) == (4, 2)
+
+
+def test_fast_dispatch_runs_each_closure_with_its_own_cells(monkeypatch):
+    """Closures made by one factory share one code object, and with it
+    Dynamo's cache entries, as mamba_state_copy_op's per-geometry row copies
+    do. Each closure's guards see its own captured values and its direct call
+    runs with its own cells: ``scale`` is baked into the graph, so a guard
+    picks the entry, and ``offset`` is read from the closure on every call."""
+    _stand_in_compile(monkeypatch)
+
+    def make(scale, offset):
+        @fast_dispatch.tpu_compile
+        def run(x):
+            return x * scale + offset
+
+        return run
+
+    a = make(2, torch.tensor(1.0))
+    b = make(3, torch.tensor(5.0))
+    c = make(2, torch.tensor(7.0))  # a's entry accepts c: the same scale
+    assert a.__wrapped__.__code__ is b.__wrapped__.__code__ is c.__wrapped__.__code__
+    assert set(a.__wrapped__.__code__.co_freevars) == {"scale", "offset"}
+    fast_dispatch.configure(fast=True, drop_global_state=False)
+    x = torch.arange(4.0)
+    before = list(fast_dispatch._STATS)
+    for _ in range(3):
+        assert torch.equal(a(x), x * 2 + 1)
+        assert torch.equal(b(x), x * 3 + 5)
+        assert torch.equal(c(x), x * 2 + 7)
+    fast, slow = (n - m for n, m in zip(fast_dispatch._STATS, before))
+    # First round: a and b each compile an entry and c runs a's through
+    # Dynamo. b's entry makes a's view of the shared entries stale, so a's
+    # second call refreshes it; every later call dispatches directly.
+    assert (fast, slow) == (5, 4)
+    for fn in (a, b, c):
+        assert fn._fast_dispatch_state["logged"]
+        assert not fn._fast_dispatch_state["disabled"]
+
+
+def test_fast_dispatch_binds_self_for_a_decorated_method(monkeypatch):
+    """A ``@tpu_compile`` method, as the runner's sampling and logits programs
+    are: the wrapper is a plain function in the class body, so an instance
+    binds it as it would the method, and a direct call runs with the calling
+    instance as ``self``. Instances that pass one entry's guards share that
+    entry, each with its own tensors."""
+    _stand_in_compile(monkeypatch)
+
+    class Scaler:
+        def __init__(self, scale, offset):
+            self.scale = scale
+            self.offset = offset
+
+        @fast_dispatch.tpu_compile
+        def apply(self, x, shift=0):
+            return x * self.scale + self.offset + shift
+
+    a = Scaler(2, torch.tensor(1.0))
+    b = Scaler(2, torch.tensor(5.0))  # a's entry accepts b: the same scale
+    c = Scaler(3, torch.tensor(7.0))
+    fast_dispatch.configure(fast=True, drop_global_state=False)
+    x = torch.arange(4.0)
+    before = list(fast_dispatch._STATS)
+    for _ in range(3):
+        assert torch.equal(a.apply(x), x * 2 + 1)
+        assert torch.equal(b.apply(x), x * 2 + 5)
+        assert torch.equal(c.apply(x), x * 3 + 7)
+    fast, slow = (n - m for n, m in zip(fast_dispatch._STATS, before))
+    # a's first call and c's compile an entry each; every other call,
+    # b's first included, dispatches directly.
+    assert (fast, slow) == (7, 2)
+    assert not Scaler.apply._fast_dispatch_state["disabled"]
 
 
 def _num_threads_recompiles():
