@@ -1098,7 +1098,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # consistent with the numerator); "1,f32mass" sums the FP32 probabilities
     # (today's numerics, f32 reassociation only).
     "VLLM_TPU_QSA_PREFILL_LANE_SUM": env_str("VLLM_TPU_QSA_PREFILL_LANE_SUM", ""),
-    # qwen4_exp QSA DCP sparse prefill (LANE_SUM path): per-row stabilizer from
+    # qwen4_exp QSA sparse prefill (LANE_SUM or VPU path): per-row stabilizer from
     # the k_norm key-length bound instead of the online row max (no rescale in
     # the KV loop; online re-run when a row leaves the precise range). "1" on,
     # "0" off, unset: additional-config qwen4_exp.qsa_prefill_bound_stab

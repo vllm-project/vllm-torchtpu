@@ -203,3 +203,33 @@ def test_carry_bitwise(backend, monkeypatch, query_heads, kv_heads):
     actual = _run(monkeypatch, "2", args, **common)
     assert np.isfinite(actual).all()
     np.testing.assert_array_equal(actual, base)
+
+
+def test_vpu_lse_layout(backend, monkeypatch):
+    """The VPU path's lse leaves the kernel in unit-row order and the wrapper
+    restores (token, head) order: it matches the default loop's lse over two
+    query subtiles and two KV heads."""
+    args, _, lengths, ratio = _case(17, 6, 1024, 1.0, contexts=(2500, 1200))
+
+    def run(features):
+        monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_VPU", features)
+        monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_LEAN", "1")
+        jax.clear_caches()
+        attend = functools.partial(
+            block_sparse_gqa_attention,
+            kv_heads=2,
+            ratio=ratio,
+            query_block=512,
+            kv_tile=1024,
+            k_scale=1.0,
+            v_scale=2.5,
+            query_tile=256,
+            return_lse=True,
+        )
+        _, lse, _ = jax.jit(attend)(*args)
+        return np.asarray(jax.block_until_ready(lse), np.float32)
+
+    base, actual = run(""), run("2")
+    live = lengths > 0
+    np.testing.assert_array_equal(np.isfinite(actual), np.isfinite(base))
+    np.testing.assert_allclose(actual[live], base[live], atol=2e-3)

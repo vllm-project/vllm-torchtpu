@@ -80,8 +80,8 @@ def lazy_softmax_features():
     return ("on",) + tuple(name for name in LAZY_SOFTMAX_TOKENS if name in names)
 
 
-# additional-config qwen4_exp.qsa_prefill_bound_stab: the DCP block-sparse
-# prefill (LANE_SUM path) uses a per-row stabilizer known before the KV walk
+# additional-config qwen4_exp.qsa_prefill_bound_stab: the block-sparse
+# prefill (LANE_SUM and VPU paths) uses a per-row stabilizer known before the KV walk
 # instead of the online row max, so the loop has no row max, no rescale and no
 # branch. The stabilizer is a rigorous upper bound of every score of the row,
 #   sm * |q_row| * KEY_NORM_BOUND * MARGIN   (keys: GemmaRMSNorm, so
@@ -1848,8 +1848,8 @@ def _block_sparse_gqa_prefill(
     lazy = lazy_softmax_features() if dcp and not vpu and not bf16_mxu else ()
     if lazy and kv_tile % 128:
         lazy = ()
-    # The bound stabilizer runs on the LANE_SUM path, DCP or replicated, so
-    # both prefill routes round the same probabilities.
+    # The bound stabilizer runs on the LANE_SUM path (or the VPU path), DCP
+    # or replicated, so both prefill routes round the same probabilities.
     lane_sum = (
         lane_sum_features()
         if (dcp or (bound_stab and key_norm_bound is not None))
