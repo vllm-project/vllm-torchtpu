@@ -392,3 +392,71 @@ def test_decode_paths_ignore_the_flag(monkeypatch, interpret, envset, query_bloc
     on = run()
     assert seen == calls_off and all(not s[1] for s in seen), (seen, calls_off)
     np.testing.assert_array_equal(on, off)
+
+
+def _qsa_layer_module():
+    """models/vllm/qwen4_exp/qsa.py and the custom-op module, importable on a CPU host: when torch_tpu's pallas module
+    cannot load here, a stand-in takes its place (bind_pool only builds ops, and this test replaces every builder)."""
+    import importlib
+    import sys
+    import types
+
+    try:
+        importlib.import_module("torch_tpu._internal.pallas")
+    except Exception:  # noqa: BLE001
+        for name in ("torch_tpu", "torch_tpu._internal", "torch_tpu._internal.pallas"):
+            sys.modules.setdefault(name, types.ModuleType(name))
+        sys.modules["torch_tpu._internal"].pallas = sys.modules["torch_tpu._internal.pallas"]
+    qsa_op = importlib.import_module("vllm_torchtpu.layers.adapter.custom_ops.qsa_op")
+    qsa_model = importlib.import_module("vllm_torchtpu.models.vllm.qwen4_exp.qsa")
+    return qsa_op, qsa_model
+
+
+def test_bind_pool_binds_the_no_cond_op_per_layer_only_with_the_flag(monkeypatch, envset):
+    """Flag off: the layer op is build_pooled_qsa_op()'s, with today's keywords (no indexer_group_base). Flag on: the
+    no-cond op, with each layer's own fixed range (two QSA layers of a stage: two ranges), stable across a re-bind; the
+    rows op never carries the base."""
+    import types
+    from functools import partial
+
+    qsa_op, qsa_model = _qsa_layer_module()
+    OFF, ON, ROWS = object(), object(), object()
+
+    def op(tag):
+        def f(*args, **kwargs):
+            return tag
+        f.tag = tag
+        return f
+
+    monkeypatch.setattr(qsa_op, "build_pooled_qsa_op", lambda: op(OFF))
+    monkeypatch.setattr(qsa_op, "build_pooled_qsa_nocond_op", lambda: op(ON))
+    monkeypatch.setattr(qsa_op, "build_pooled_qsa_rows_op", lambda: op(ROWS))
+    monkeypatch.setattr(sconfig, "_layer_scheduling_group_bases", {})
+    for name in ("VLLM_TPU_QSA_DRAFT_SHARED_SELECTION", "VLLM_TPU_MEGAKERNEL", "VLLM_TPU_QSA_INDEXER_SHARD"):
+        envset(name, None)
+    first = {"compress_ratio": 4, "token_topk": 2048, "norm_eps": 1e-6, "rotary_dim": 64}
+
+    def layer(prefix):
+        return types.SimpleNamespace(prefix=prefix, _op=partial(op(None), **first), max_query_len=1, pcp=1,
+                                     main_kv_dcp=1, tp_size=1, tp_rank=0, num_kv_heads=2, single_graph=False)
+
+    got = {}
+    for flag in (None, 1):
+        envset(FLAG, flag)
+        a, b = layer("model.layers.6.self_attn"), layer("model.layers.11.self_attn")
+        for x in (a, b, a):  # a is bound twice (profiling owners, then the real pool)
+            qsa_model.Qwen4ExpQSA.bind_pool(x, object(), compressed_owner=("model.layers.6.compressed_k", 2),
+                                           main_owner=("model.layers.6", 1))
+        got[flag] = (a, b)
+        want = dict(first, compressed_slot=2, main_slot=1)
+        for x in (a, b):
+            assert x._rows_op.func.tag is ROWS and x._rows_op.keywords == want, x._rows_op.keywords
+    (a0, b0), (a1, b1) = got[None], got[1]
+    want = dict(first, compressed_slot=2, main_slot=1)
+    assert a0._op.func.tag is OFF and b0._op.func.tag is OFF
+    assert a0._op.keywords == want and b0._op.keywords == want
+    assert a1._op.func.tag is ON and b1._op.func.tag is ON
+    ba, bb = a1._op.keywords["indexer_group_base"], b1._op.keywords["indexer_group_base"]
+    assert ba == sconfig.LAYER_SCHEDULING_GROUP_FIRST and bb == ba + sconfig.LAYER_SCHEDULING_GROUP_STRIDE, (ba, bb)
+    assert {k: v for k, v in a1._op.keywords.items() if k != "indexer_group_base"} == want
+    print(f"Q38_PSTEP_IDX_BIND off=build_pooled_qsa_op on=build_pooled_qsa_nocond_op bases={ba},{bb}")
