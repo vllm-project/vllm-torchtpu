@@ -59,6 +59,16 @@ def start_decoder_replay_coordination(
     return finish
 
 
+def decoder_buckets(num_tokens: int, compile_sizes) -> list[int]:
+    """The decoder row buckets a plan for a ``num_tokens`` step can pick.
+
+    Each stage dispatches by its own token bucket. Never introduce a second,
+    independent symbolic token dimension into vLLM's guard-free full graph.
+    """
+    sizes = {int(n) for n in compile_sizes if 0 < int(n) <= num_tokens}
+    return sorted({num_tokens, *sizes})
+
+
 def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     """Keep the same prompt-tail window across every chunk and later decode.
 
@@ -95,10 +105,11 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
         replay_starts.append(replay_start)
         output_bounds.append(len(indices))
     kept = len(indices)
-    # Each stage dispatches by its own token bucket. Never introduce a second,
-    # independent symbolic token dimension into vLLM's guard-free full graph.
-    buckets = sorted({num_tokens, *(int(n) for n in compile_sizes if int(n) > 0)})
-    padded = next(n for n in buckets if n >= kept) if kept else 0
+    padded = (
+        next(n for n in decoder_buckets(num_tokens, compile_sizes) if n >= kept)
+        if kept
+        else 0
+    )
     return DecoderReplayPlan(
         tuple(indices), tuple(output_bounds), tuple(replay_starts), padded
     )

@@ -51,6 +51,7 @@ from .attention import (
 from .attention_kernels import initialize_paged_attention
 from .cache import initialize_cache_ops
 from .ced import (
+    decoder_buckets,
     plan_decoder_replay,
     prefix_replay_enabled,
     start_decoder_replay_coordination,
@@ -142,18 +143,24 @@ def _reused(reuse: dict, slot: str, key: tuple, build):
 
 
 def _replay_rows(plan, positions, reuse: dict):
-    """Decoder row indices (padding rows at the extra row) and their gather."""
+    """Where each token row's decoder output lands, and the decoder's gather.
+
+    Placement maps a token row to its decoder row, or to the zero row one past
+    the decoder bucket when the decoder skips it. The gather reads padding
+    rows from the last token row.
+    """
     num_tokens = positions.shape[0]
 
     def rows():
-        # The extra output row absorbs padded scatter writes. Reusing row zero
-        # for padding would overwrite a real request's first result.
-        indices = torch.tensor(
-            plan.indices + (num_tokens,) * (plan.padded_num_tokens - len(plan.indices)),
-            dtype=torch.int64,
-            device=positions.device,
+        placement = [plan.padded_num_tokens] * num_tokens
+        for decoder_row, row in enumerate(plan.indices):
+            placement[row] = decoder_row
+        padding = plan.padded_num_tokens - len(plan.indices)
+        gather = plan.indices + (num_tokens - 1,) * padding
+        return tuple(
+            torch.tensor(rows, dtype=torch.int64, device=positions.device)
+            for rows in (placement, gather)
         )
-        return indices, indices.clamp(max=num_tokens - 1)
 
     key = (plan.indices, plan.padded_num_tokens, num_tokens, positions.device)
     return _reused(reuse, "rows", key, rows)
@@ -164,10 +171,15 @@ def _replay_bounds(plan, positions, reuse: dict):
 
     def bounds():
         device = positions.device
+        kept = len(plan.indices)
         return (
             torch.tensor(plan.query_start_loc, dtype=torch.int32, device=device),
             torch.tensor(plan.replay_starts, dtype=positions.dtype, device=device),
-            torch.arange(plan.padded_num_tokens, device=device) >= len(plan.indices),
+            torch.tensor(
+                [False] * kept + [True] * (plan.padded_num_tokens - kept),
+                dtype=torch.bool,
+                device=device,
+            ),
         )
 
     key = (
@@ -181,11 +193,55 @@ def _replay_bounds(plan, positions, reuse: dict):
     return _reused(reuse, "bounds", key, bounds)
 
 
-def _scatter_decoder_rows(
-    tensor: torch.Tensor, indices: torch.Tensor, total_rows: int
-) -> torch.Tensor:
-    result = tensor.new_zeros((total_rows + 1, tensor.shape[-1]))
-    return result.index_copy_(0, indices, tensor)[:-1]
+def _gather_replay_inputs(gather, *tensors):
+    """``tensor[gather]`` for each decoder input; None stays None."""
+    return tuple(
+        None if tensor is None else torch.index_select(tensor, 0, gather)
+        for tensor in tensors
+    )
+
+
+def _place_decoder_rows(placement, *tensors):
+    """Each decoder output back at its token rows, zeros elsewhere.
+
+    Equals scattering the kept rows into a zero tensor, as a gather from the
+    output with one zero row appended: no scatter and no view of a wider
+    buffer.
+    """
+    return tuple(
+        torch.index_select(
+            torch.cat((tensor, tensor.new_zeros((1, tensor.shape[-1])))), 0, placement
+        )
+        for tensor in tensors
+    )
+
+
+# The replay glue runs between the compiled stages. Eagerly, torch-tpu's
+# DEFER_AND_FUSE fuses it with its live neighbours into a program per dispatch
+# context, compiled when serving first meets it. As compiled regions it is one
+# program per (token bucket, decoder bucket), which warmup compiles
+# (DeepseekV41Model._precompile_replay_glue).
+_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+_gather_replay_inputs_compiled = _tpu_compile(_gather_replay_inputs)
+_place_decoder_rows_compiled = _tpu_compile(_place_decoder_rows)
+
+
+def gather_replay_inputs(gather, *tensors):
+    fn = (
+        _gather_replay_inputs_compiled
+        if gather.device.type == "tpu"
+        else _gather_replay_inputs
+    )
+    return fn(gather, *tensors)
+
+
+def place_decoder_rows(placement, *tensors):
+    fn = (
+        _place_decoder_rows_compiled
+        if placement.device.type == "tpu"
+        else _place_decoder_rows
+    )
+    return fn(placement, *tensors)
 
 
 def _mean_hc_streams(hidden_states: torch.Tensor) -> torch.Tensor:
@@ -480,6 +536,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
     def _window_starts_upload(self) -> dict:
         """Last window-starts upload (TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS)."""
         return {}
+
+    @cached_property
+    def _replay_glue_compiled(self) -> set[tuple]:
+        """Forward signatures whose replay glue warmup compiled."""
+        return set()
 
     @cached_property
     def _replay_upload(self) -> dict:
@@ -1041,7 +1102,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             decoder_hidden, decoder_mix = hidden, pre_mix
             requests = first.seq_lens.shape[0] if first is not None else 1
             replay_starts = positions.new_zeros(requests)
-            indices = None
+            placement = None
             decoder_padding = (
                 torch.arange(positions.shape[0], device=positions.device)
                 >= first.query_start_loc[-1]
@@ -1057,14 +1118,14 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             ):
                 # Every row replays in place (steady decode): gathering and
                 # scattering by the identity only copies rows.
-                indices = None
+                placement = None
                 decoder_positions, decoder_ids = positions, input_ids
                 decoder_hidden, decoder_mix = hidden, pre_mix
             else:
-                indices, gather = _replay_rows(plan, positions, self._replay_upload)
-                decoder_positions = positions[gather]
-                decoder_ids = input_ids[gather] if input_ids is not None else None
-                decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
+                placement, gather = _replay_rows(plan, positions, self._replay_upload)
+                decoder_positions, decoder_ids, decoder_hidden, decoder_mix = (
+                    gather_replay_inputs(gather, positions, input_ids, hidden, pre_mix)
+                )
             bounds, replay_starts, decoder_padding = _replay_bounds(
                 plan, positions, self._replay_upload
             )
@@ -1106,6 +1167,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             )
         if isinstance(output, (list, tuple)) and len(output) == 1:
             output = output[0]
+        if plan is None and positions.device.type == "tpu":
+            # Warmup's full-bucket forwards compile here; afterwards (idle DP
+            # dummy batches) it is a set lookup.
+            self._precompile_replay_glue(positions, input_ids, hidden, pre_mix, output)
         total_rows = positions.shape[0]
         # An identity plan (every row kept, in order, no padding row) leaves
         # the decoder output in original row order: skip the scatter back.
@@ -1119,7 +1184,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if identity:
             # Serving evidence that steady decode takes the scatter-free path.
             logger.info_once("CED decoder replay is identity; skip scatter")
-        if indices is None or identity:
+        if placement is None or identity:
             if isinstance(output, (list, tuple)) and len(output) == 2:
                 dec_hidden, dec_aux = output
                 return dec_hidden, [*encoder_aux, *dec_aux]
@@ -1127,23 +1192,48 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 return output, list(encoder_aux)
             return output
         if isinstance(output, (list, tuple)) and len(output) == 2:
-            dec_hidden, dec_aux = output
-            return (
-                _scatter_decoder_rows(dec_hidden, indices, total_rows),
-                [
-                    *encoder_aux,
-                    *[
-                        _scatter_decoder_rows(aux, indices, total_rows)
-                        for aux in dec_aux
-                    ],
-                ],
-            )
+            dec_hidden, *dec_aux = place_decoder_rows(placement, output[0], *output[1])
+            return dec_hidden, [*encoder_aux, *dec_aux]
+        (output,) = place_decoder_rows(placement, output)
         if encoder_aux:
-            return (
-                _scatter_decoder_rows(output, indices, total_rows),
-                list(encoder_aux),
+            return output, list(encoder_aux)
+        return output
+
+    def _precompile_replay_glue(self, positions, input_ids, hidden, pre_mix, output):
+        """Compile the replay gather and placement for every decoder bucket.
+
+        Warmup runs the decoder at the full bucket without a plan, so serving
+        would otherwise compile each (token bucket, decoder bucket) pair of a
+        narrowed replay on first use while every DP rank waits. Runs once per
+        forward signature, on zero tensors shaped like this forward's.
+        """
+        num_tokens = positions.shape[0]
+        outputs = (
+            [output[0], *output[1]]
+            if isinstance(output, (list, tuple)) and len(output) == 2
+            else [output]
+        )
+        # The regions also key on arity and dtypes: a forward whose outputs
+        # differ (aux hidden states set later) compiles its own.
+        key = (
+            num_tokens,
+            input_ids is None,
+            tuple((t.dtype, t.shape[-1]) for t in outputs),
+        )
+        if key in self._replay_glue_compiled:
+            return
+        self._replay_glue_compiled.add(key)
+        inputs = [
+            None if t is None else torch.zeros_like(t)
+            for t in (positions, input_ids, hidden, pre_mix)
+        ]
+        placement = positions.new_zeros(num_tokens, dtype=torch.int64)
+        for rows in decoder_buckets(num_tokens, self._ced_compile_sizes):
+            gather = positions.new_zeros(rows, dtype=torch.int64)
+            gather_replay_inputs(gather, *inputs)
+            place_decoder_rows(
+                placement, *(t.new_zeros((rows, t.shape[-1])) for t in outputs)
             )
-        return _scatter_decoder_rows(output, indices, total_rows)
 
     def _forward_split_encoder(
         self,

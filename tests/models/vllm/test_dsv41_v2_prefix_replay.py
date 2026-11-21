@@ -16,6 +16,7 @@ import torch
 from vllm_torchtpu import envs
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention as v2_attn
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.ced import (
+    decoder_buckets,
     plan_decoder_replay,
     prefix_replay_enabled,
 )
@@ -82,6 +83,19 @@ def test_plan_resumed_hit_past_the_prompt_bounds_the_decoder():
     plan = plan_decoder_replay(metadata, WINDOW, 256, ())
     assert plan.replay_starts == (768,)
     assert plan.indices == tuple(range(232))
+
+
+@pytest.mark.parametrize("num_tokens", [16, 144, 512, 1024])
+def test_plan_picks_a_warmed_decoder_bucket(num_tokens):
+    # Warmup compiles the replay glue for decoder_buckets(num_tokens) only.
+    sizes = (16, 32, 64, 128, 144, 256, 512, 1024, 2048)
+    buckets = decoder_buckets(num_tokens, sizes)
+    assert buckets == [n for n in sizes if n <= num_tokens]
+    for kept in range(1, num_tokens + 1):
+        metadata = _plan_metadata([0, kept], [kept], [kept])
+        plan = plan_decoder_replay(metadata, kept, num_tokens, sizes)
+        assert len(plan.indices) == kept
+        assert plan.padded_num_tokens == min(n for n in buckets if n >= kept)
 
 
 def test_plan_rejects_mismatched_hits():
@@ -204,8 +218,8 @@ def test_replay_plan_tensors_upload_once_per_plan():
     positions = torch.arange(16, dtype=torch.int64)
     decode = DecoderReplayPlan((0, 1, 2, 3, 4, 5), (0, 6), (65536,), 16)
     reuse: dict = {}
-    indices, gather = v2_model._replay_rows(decode, positions, reuse)
-    assert indices.tolist() == [0, 1, 2, 3, 4, 5] + [16] * 10
+    placement, gather = v2_model._replay_rows(decode, positions, reuse)
+    assert placement.tolist() == [0, 1, 2, 3, 4, 5] + [16] * 10
     assert gather.tolist() == [0, 1, 2, 3, 4, 5] + [15] * 10
     bounds, starts, padding = v2_model._replay_bounds(decode, positions, reuse)
     assert bounds.dtype == torch.int32 and bounds.tolist() == [0, 6]
@@ -214,12 +228,12 @@ def test_replay_plan_tensors_upload_once_per_plan():
 
     # The next step of the same batch reuses every tensor.
     again = DecoderReplayPlan((0, 1, 2, 3, 4, 5), (0, 6), (65536,), 16)
-    assert v2_model._replay_rows(again, positions, reuse)[0] is indices
+    assert v2_model._replay_rows(again, positions, reuse)[0] is placement
     assert v2_model._replay_bounds(again, positions, reuse)[0] is bounds
 
     # A changed plan uploads its own.
     grown = DecoderReplayPlan(tuple(range(12)), (0, 6, 12), (65536, 0), 16)
-    assert v2_model._replay_rows(grown, positions, reuse)[0] is not indices
+    assert v2_model._replay_rows(grown, positions, reuse)[0] is not placement
     bounds2, starts2, padding2 = v2_model._replay_bounds(grown, positions, reuse)
     assert bounds2.tolist() == [0, 6, 12] and starts2.tolist() == [65536, 0]
     assert padding2.tolist() == [False] * 12 + [True] * 4

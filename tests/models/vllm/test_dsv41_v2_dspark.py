@@ -188,12 +188,13 @@ def test_attend_window_width_over_512(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_ced_aux_hidden_states_propagation(monkeypatch: pytest.MonkeyPatch):
-    # Verify _scatter_decoder_rows (with padded extra index at total_rows=4)
+    # Verify place_decoder_rows: decoder rows 0 and 1 land at token rows 1
+    # and 3, the padding row 2 nowhere, the skipped rows read zeros.
     src = torch.tensor([[10.0, 20.0], [30.0, 40.0], [99.0, 99.0]])
-    idx_tensor = torch.tensor([1, 3, 4], dtype=torch.int64)
-    scattered = v2_model._scatter_decoder_rows(src, idx_tensor, 4)
+    placement = torch.tensor([3, 0, 3, 1], dtype=torch.int64)
+    (placed,) = v2_model.place_decoder_rows(placement, src)
     expected = torch.tensor([[0.0, 0.0], [10.0, 20.0], [0.0, 0.0], [30.0, 40.0]])
-    assert torch.equal(scattered, expected)
+    assert torch.equal(placed, expected)
 
     # Verify _forward_stage with encoder (layer 1) + decoder (start_layer=2, layer 3)
     class _FakeStageLayer:
