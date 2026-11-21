@@ -112,7 +112,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
     VLLM_TPU_QSA_RING_SELECT: bool = False
     VLLM_TPU_QSA_RING_DMA_BATCH: int = 0
-    VLLM_TPU_QSA_COMPRESSED_RUN_WRITE: bool = False
+    VLLM_TPU_QSA_COMPRESSED_RUN_WRITE: bool = True
     VLLM_TPU_QSA_COMPRESSED_RUN_WRITE_MIN_TOKENS: int = 512
     VLLM_TPU_QSA_MAIN_RUN_WRITE: bool = False
     VLLM_TPU_QSA_MAIN_RUN_WRITE_MIN_TOKENS: int = 512
@@ -807,7 +807,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (kernels/qwen4_exp/compressed_write.py): one DMA per run of consecutive
     # pair rows, all in flight, instead of per-tile / per-row serial writes.
     "VLLM_TPU_QSA_COMPRESSED_RUN_WRITE": env_bool(
-        "VLLM_TPU_QSA_COMPRESSED_RUN_WRITE", default=False
+        "VLLM_TPU_QSA_COMPRESSED_RUN_WRITE", default=True
     ),
     # With VLLM_TPU_QSA_COMPRESSED_RUN_WRITE: steps with fewer key rows keep the
     # tiled writer (the run writer is slower on decode-sized steps).

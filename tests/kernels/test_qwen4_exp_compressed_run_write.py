@@ -25,6 +25,9 @@ CASES = {
     # misaligned against their contexts, crossing pages, plus decode rows.
     "prefill_mixed": ([250, 4, 4, 126], [3, 509, 0, 1001]),
     "prefill_aligned": ([256, 128], [0, 512]),
+    # A served mixed chunk: decode rows first, then a long chunk on a cached
+    # prefix, filling a 128-multiple step (the tiled path's per-row fallback).
+    "prefill_after_decodes": ([4, 4, 4, 1012], [1001, 509, 3, 270]),
 }
 
 
