@@ -182,6 +182,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PRECOMPILE_PEER_REPLAY",
     "TPU_PRECOMPILE_PEER_WAIT_S",
     "TPU_PRECOMPILE_TRACE_FIRST",
+    # Where helper artifacts are looked up, not what is compiled.
+    "TPU_HELPER_COMPILE_CACHE",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would

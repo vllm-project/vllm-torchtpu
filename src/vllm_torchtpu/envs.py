@@ -132,6 +132,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_PRECOMPILE_PEER_WAIT_S: float = 600.0
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
+    TPU_HELPER_COMPILE_CACHE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
@@ -984,6 +985,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # before the next group is even traced, so the groups run one after
     # another and most ranks wait. Needs TPU_PARALLEL_PRECOMPILE.
     "TPU_PRECOMPILE_TRACE_FIRST": env_bool("TPU_PRECOMPILE_TRACE_FIRST", default=False),
+    # Keep the runner's helper graphs (logits, sampling, logprobs, placeholder
+    # substitution) in <VLLM_CACHE_ROOT>/tpu_helper_cache, so a later start, and
+    # under TPU_PRECOMPILE_PEER_REPLAY another rank of the host, replays them
+    # instead of lowering and compiling each shape again; see
+    # compilation/helper_cache.py. Off by default and with VLLM_DISABLE_COMPILE_CACHE.
+    "TPU_HELPER_COMPILE_CACHE": env_bool("TPU_HELPER_COMPILE_CACHE", default=False),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.

@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 import torch
 import torch.profiler
 import torch_tpu  # noqa: F401
+import vllm.envs as vllm_envs
 from torch.compiler._cache import CacheArtifactManager
 from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -51,6 +52,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
+from vllm_torchtpu.compilation import helper_cache
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
@@ -493,6 +495,10 @@ class TPUWorker(WorkerBase):
             profiler_rank=self.profile_rank,
             profiler_world_size=self.profile_world_size,
         )
+        # Persist the runner's helper graphs with the compile cache (see
+        # compilation/helper_cache.py).
+        if envs.TPU_HELPER_COMPILE_CACHE and not vllm_envs.VLLM_DISABLE_COMPILE_CACHE:
+            helper_cache.configure(self.vllm_config)
         logger.info(
             "Init worker | "
             "rank=%s | "

@@ -91,6 +91,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation.helper_cache import helper_compile
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import (
     KVSaveNanCheck,
@@ -399,7 +400,7 @@ def _spec_logprob_row_tokens(
     return out[:num_rows, None]
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@helper_compile("substitute_placeholder_token")
 def _substitute_placeholder_token(
     input_ids: torch.Tensor,
     token_in_tpu_cur_input_indices: torch.Tensor,
@@ -9398,7 +9399,7 @@ class TPUModelRunner(GPUModelRunner):
         padded = torch.nn.functional.pad(indices, (0, rows - num_rows))
         return self.compute_selected_logits(hidden_states, padded)[:num_rows]
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @helper_compile("compute_selected_logits")
     def compute_selected_logits(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
     ) -> torch.Tensor:
@@ -9407,7 +9408,7 @@ class TPUModelRunner(GPUModelRunner):
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @helper_compile("compute_logits_from_hidden_states")
     def compute_logits_from_hidden_states(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -9423,7 +9424,7 @@ class TPUModelRunner(GPUModelRunner):
             and not self._repetition_penalty.active(self.input_batch)
         )
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @helper_compile("compute_selected_top_tokens")
     def compute_selected_top_tokens(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
     ) -> torch.Tensor:
@@ -9434,7 +9435,7 @@ class TPUModelRunner(GPUModelRunner):
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return greedy_top_tokens.top_tokens(self._greedy_head_owner, selected)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @helper_compile("compute_top_tokens_from_hidden_states")
     def compute_top_tokens_from_hidden_states(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -9444,7 +9445,7 @@ class TPUModelRunner(GPUModelRunner):
             raise RuntimeError("greedy top-token path requires a greedy head owner")
         return greedy_top_tokens.top_tokens(self._greedy_head_owner, hidden_states)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @helper_compile("spec_bonus_and_target_logits")
     def spec_bonus_and_target_logits(
         self,
         logits: torch.Tensor,
@@ -9464,7 +9465,7 @@ class TPUModelRunner(GPUModelRunner):
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_token_ids, target_logits
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @helper_compile("spec_bonus_and_target_tokens")
     def spec_bonus_and_target_tokens(
         self,
         tokens: torch.Tensor,
@@ -9477,7 +9478,7 @@ class TPUModelRunner(GPUModelRunner):
         target_argmax = torch.index_select(tokens, 0, target_logits_indices)
         return bonus_token_ids.view(-1), target_argmax.view(-1)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @helper_compile("spec_gather_bonus_and_target_logits")
     def spec_gather_bonus_and_target_logits(
         self,
         logits: torch.Tensor,
@@ -9504,7 +9505,7 @@ class TPUModelRunner(GPUModelRunner):
 
     # TODO: Under SPMD mode, sample_from_logits has correctness issue.
     #       Re-enable the torch.compile once the issue is fixed in torchxla.
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @helper_compile("sample_from_logits")
     def sample_from_logits(
         self,
         logits: torch.Tensor,
@@ -9540,7 +9541,7 @@ class TPUModelRunner(GPUModelRunner):
         final_logits = torch.where(is_greedy, logits, noisy_logits)
         return torch.argmax(final_logits, dim=-1, keepdim=True)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @helper_compile("spec_logprob_row_tokens")
     def spec_logprob_row_tokens(
         self,
         next_tokens: torch.Tensor,
@@ -9552,7 +9553,7 @@ class TPUModelRunner(GPUModelRunner):
             next_tokens, bonus_logits_indices, draft_lengths, final_logits_indices
         )
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @helper_compile("gather_logprobs")
     def gather_logprobs(
         self, logits: torch.Tensor, sampled_tokens: torch.Tensor
     ) -> LogprobsTensors:
