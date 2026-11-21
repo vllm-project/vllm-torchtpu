@@ -412,6 +412,7 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
     layer, else None."""
     from vllm.distributed import get_tensor_model_parallel_world_size
 
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
     cfg = runner.moe_config
@@ -432,6 +433,15 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
         return None
     if qm._tpu_topk_weights_float32:
         # The kernel rounds the top-k weights to bfloat16.
+        return None
+    # apply_monolithic dispatches to an armed fused EP kernel first, so arming
+    # here would strip the runner's shared expert and routed scale for an op
+    # that never runs.
+    if qm._use_adaptive_fused_moe or fused_moe_ep_supported(qm):
+        logger.info_once(
+            "FUSED_MOE_DECODE_KERNEL: a fused EP MoE kernel serves this layer; "
+            "the fused MoE decode kernel stands down on it."
+        )
         return None
     if getattr(layer, "w13_bias", None) is not None or (
         getattr(layer, "w2_bias", None) is not None
