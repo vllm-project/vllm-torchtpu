@@ -19,6 +19,9 @@
 # Changes from the source:
 # - causal_conv1d_out and conv_state_rows: the conv output rows and the conv
 #   state of a PER_SEQ chunked tile, for wrapper.py's lazy conv state.
+# - causal_conv1d's per-step trims (GDNConfig.step_trims, config.TILER_SHAPES):
+#   the conv taps start from the first product instead of a zero
+#   (_conv_out_rows, which causal_conv1d_out shares).
 
 import jax
 import jax.numpy as jnp
@@ -26,14 +29,14 @@ import jax.numpy as jnp
 from vllm_torchtpu.models.qwen3_5.kernels.gdn import config
 
 
-def causal_conv1d_out(
+def _conv_out_rows(
     lhs: jax.Array,  # [seq, prev_kernel_size + chunk, q, dim_size]
     conv_weight: jax.Array,  # [kernel_size, 1, dim_size]
     conv_bias: jax.Array | None,  # [dim_size]
     cfg: config.GDNConfig,
-) -> jax.Array:
-    """The conv output rows of `causal_conv1d` without the conv-state select."""
-    assert lhs.ndim == 4
+) -> list[jax.Array]:
+    """The conv output row of each chunk position, the taps starting from the
+    first product."""
     out_list = []
     w_taps = [conv_weight[k : k + 1] for k in range(cfg.kernel_size)]
     bias = conv_bias.reshape(1, 1, -1) if conv_bias is not None else None
@@ -44,7 +47,18 @@ def causal_conv1d_out(
         if bias is not None:
             out = out + bias
         out_list.append(out)
-    return jnp.stack(out_list, axis=1)
+    return out_list
+
+
+def causal_conv1d_out(
+    lhs: jax.Array,  # [seq, prev_kernel_size + chunk, q, dim_size]
+    conv_weight: jax.Array,  # [kernel_size, 1, dim_size]
+    conv_bias: jax.Array | None,  # [dim_size]
+    cfg: config.GDNConfig,
+) -> jax.Array:
+    """The conv output rows of `causal_conv1d` without the conv-state select."""
+    assert lhs.ndim == 4
+    return jnp.stack(_conv_out_rows(lhs, conv_weight, conv_bias, cfg), axis=1)
 
 
 def conv_state_rows(
@@ -78,21 +92,24 @@ def causal_conv1d(
 
     assert lhs.ndim == 4
 
-    out_list = []
+    if cfg.step_trims:
+        # The taps start from the first product instead of a zero.
+        out_list = _conv_out_rows(lhs, conv_weight, conv_bias, cfg)
+    else:
+        out_list = []
+        for c_idx in range(cfg.chunk_size):
+            out = jnp.zeros((cfg.seq_tile_size, 1, cfg.dim_size), jnp.float32)
 
-    for c_idx in range(cfg.chunk_size):
-        out = jnp.zeros((cfg.seq_tile_size, 1, cfg.dim_size), jnp.float32)
+            end_idx = c_idx + cfg.prev_kernel_size
+            start_idx = 1 + end_idx - cfg.kernel_size
+            for k in range(cfg.kernel_size):
+                lhs_curr = lhs[:, start_idx + k]
+                out += lhs_curr * conv_weight[k : k + 1]
 
-        end_idx = c_idx + cfg.prev_kernel_size
-        start_idx = 1 + end_idx - cfg.kernel_size
-        for k in range(cfg.kernel_size):
-            lhs_curr = lhs[:, start_idx + k]
-            out += lhs_curr * conv_weight[k : k + 1]
+            if conv_bias is not None:
+                out += conv_bias.reshape(1, 1, -1)
 
-        if conv_bias is not None:
-            out += conv_bias.reshape(1, 1, -1)
-
-        out_list.append(out)
+            out_list.append(out)
 
     # Last prev_kernel_size elements needs to be returned as conv_state. However,
     # real_sizes may be smaller than chunk_size. Therefore, slicing last

@@ -20,24 +20,45 @@
 # - _QKV_2D_PER_SEQ_EXTRA_BYTES_PER_COLUMN and the qkv_2d argument of
 #   get_vmem_estimate_bytes, calculate_mixed_tile_size and get_tile_sizes:
 #   the PER_SEQ VMEM term of 2D bf16 qkv rows.
-# ==============================================================================
+# - The Qwen3.5 tiler for config.TILER_SHAPES: decode_tile_target (measured step
+#   overhead against per-slot work), select_decode_tile_size and
+#   spec_window_tile_cap (the verify-window and VMEM caps and an explicit
+#   override), a decode VMEM estimate with 1 + window f32 working states per
+#   slot (main's has one), and a caller's prefill chunk capped at its VMEM fit,
+#   which get_tile_sizes keeps off clip_mixed_tile_size. main_decode_tile_target
+#   and main_decode_tile_size keep main's decode tile for every other shape.
 
-"""Dynamic tiling heuristics and VMEM memory estimation for Fused Conv1D-GDN."""
+"""Tile-size selection and VMEM estimation for the fused Conv1D-GDN v3 kernel."""
+
+import math
+from collections.abc import Sequence
 
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-# Cap decode tiles at 16 sequences: larger tiles increase per-slot state DMA
-# descriptors and register spills without reducing per-slot compute.
+# Decode tiles stop at 16 sequences. At n_v=8, T=32 measured +59.6% (N=64) and
+# +15.8% (N=256) slower than T=16: the per-slot f32 state copy and vector
+# temporaries spill (18.25 MiB at T=32 vs 9.55 MiB at T=16 in the post-RA LLO
+# ledger), and each extra slot adds state DMA descriptors without reducing
+# per-slot compute.
 DECODE_TILE_SIZES = (16, 8, 4, 2, 1)
 MIXED_TILE_SIZES = (128, 64, 32, 16, 8, 4, 2, 1)
 
-# Decode step-vs-transfer balance. Each grid step pays a fixed pipeline
-# overhead across (num_seqs / T) steps, while the unoverlapped first state
-# fetch and last write-back scale with T * n_v. Balancing those terms gives
-# T^2 * n_v <= K * num_seqs, where K is the step overhead in per-head state
-# transfers.
-_DECODE_STEP_COST_IN_HEAD_TRANSFERS = 16
+# Decode tile target balances fixed per-grid-step overhead against per-slot
+# work; the VMEM estimate acts as a feasibility ceiling. Constants are
+# device-time fits from gdn_attention_benchmark_test on the Qwen3.5 shapes.
+_STEP_OVERHEAD_US = 0.31
+_DECODE_BASE_US_PER_SEQ = 0.26
+_DECODE_US_PER_SEQ_PER_HEAD = 0.0168
+
+# main's decode tile target (kernels/gdn/v3), which shapes outside
+# config.TILER_SHAPES keep: each grid step pays a fixed pipeline overhead
+# across num_seqs / T steps, while the unoverlapped first state fetch and last
+# write-back scale with T * n_v, so T^2 * n_v <= K * num_seqs with K the step
+# overhead in per-head state transfers.
+_MAIN_DECODE_STEP_COST_IN_HEAD_TRANSFERS = 16
+
+_F32_BYTES = 4
 
 # Extra VMEM per qkv column of a PER_SEQ tile when qkv streams as 2D bf16 rows
 # (GDNConfig.qkv_2d) rather than f32 rows. Measured for TPU7x (AOT compile) as
@@ -48,15 +69,42 @@ _DECODE_STEP_COST_IN_HEAD_TRANSFERS = 16
 _QKV_2D_PER_SEQ_EXTRA_BYTES_PER_COLUMN = 136
 
 
-def decode_tile_target(num_seqs: int, n_v: int) -> int:
-    """Returns the largest candidate T with T^2 * n_v <= K * num_seqs, else 1."""
-    budget = _DECODE_STEP_COST_IN_HEAD_TRANSFERS * num_seqs
-    return next((t for t in DECODE_TILE_SIZES if t * t * n_v <= budget), 1)
-
-
 def align_to(x: int, alignment: int) -> int:
     """Aligns an integer upward to the nearest multiple of alignment."""
     return pl.cdiv(x, alignment) * alignment
+
+
+def _nearest_candidate(value: float, candidates: Sequence[int]) -> int:
+    """Returns the candidate closest to value in log2 space."""
+    return min(
+        candidates,
+        key=lambda c: abs(math.log2(c) - math.log2(max(value, 1.0))),
+    )
+
+
+def decode_tile_target(num_seqs: int, n_v: int) -> int:
+    """Returns the DECODE_TILE_SIZES candidate nearest, in log2 space, to the
+    square-root balance point sqrt(2 * N * O_step / w_seq(n_v)) of the step
+    model.
+
+    Model: t(T) = O_step * ceil(N / T) + w_seq(n_v) * ceil(N / T) * T. The
+    balance point reproduces the measured knee for N <= 256 and n_v in
+    {8, 32, 64}; DECODE_TILE_SIZES bounds it where the model does not encode
+    spill growth.
+    """
+    if num_seqs <= 0 or n_v <= 0:
+        return 1
+    w_seq = _DECODE_BASE_US_PER_SEQ + _DECODE_US_PER_SEQ_PER_HEAD * n_v
+    return _nearest_candidate(
+        math.sqrt(2 * num_seqs * _STEP_OVERHEAD_US / w_seq), DECODE_TILE_SIZES
+    )
+
+
+def main_decode_tile_target(num_seqs: int, n_v: int) -> int:
+    """main's decode tile target: the largest candidate T with
+    T^2 * n_v <= K * num_seqs, else 1."""
+    budget = _MAIN_DECODE_STEP_COST_IN_HEAD_TRANSFERS * num_seqs
+    return next((t for t in DECODE_TILE_SIZES if t * t * n_v <= budget), 1)
 
 
 def get_vmem_estimate_bytes(
@@ -72,69 +120,92 @@ def get_vmem_estimate_bytes(
     num_lanes: int,
     conv_state_dim_size: int,
     is_decode: bool = False,
-    carry_scratch_bytes: int = 4,
+    carry_scratch_bytes: int = _F32_BYTES,
     window_size: int = 1,
     qkv_2d: bool = False,
+    main_decode_scratch: bool = False,
 ) -> int:
-    """Estimates total on-chip VMEM footprint in bytes for a GDN tile.
+    """Estimates the on-chip VMEM footprint in bytes of one GDN grid step.
 
-    qkv_2d: qkv streams as 2D bf16 rows (wrapper bf16_qkv_mode=2).
+    Args:
+      tile_b: Sequences per tile (decode T; 1 for PER_SEQ).
+      chunk_sz: Tokens per sequence in the tile (decode: window_size).
+      n_kq: Number of key/query heads.
+      n_v: Number of value heads.
+      d_k: Key head dimension.
+      d_v: Value head dimension.
+      kernel_size: 1D convolution kernel window size.
+      act_out_bytes: Itemsize of the output activation.
+      rec_state_bytes: Itemsize of a dense recurrent state buffer.
+      num_lanes: Number of lanes for TPU vector layout alignment.
+      conv_state_dim_size: Feature dimension size for conv state.
+      is_decode: BATCHED tile (no inter-tile carry) rather than PER_SEQ.
+      carry_scratch_bytes: Itemsize of the f32 activations, dense conv state,
+        carries and working states.
+      window_size: State checkpoints per sequence (num_spec_tokens + 1).
+      qkv_2d: qkv streams as 2D bf16 rows (wrapper bf16_qkv_mode=2).
+      main_decode_scratch: Count main's one f32 working state per BATCHED
+        slot instead of 1 + window_size (main's estimate).
     """
     aligned_num_v_heads = align_to(n_v, num_lanes)
     aligned_d_k = align_to(d_k, num_lanes)
     aligned_d_v = align_to(d_v, num_lanes)
     dim_size = align_to(2 * n_kq * d_k + n_v * d_v, num_lanes)
     aligned_out_dim = align_to(n_v * d_v, num_lanes)
+    state_elems = n_v * d_v * d_k
 
-    # 1. Double-buffered input activation buffers (QKV, A, B), upcast to float32.
-    qkv_bytes = 2 * (tile_b * chunk_sz * dim_size * carry_scratch_bytes)
+    # 1. Double-buffered input activations: wrapper.py casts b and a to f32
+    # before the pipeline, and qkv too unless it streams as bf16.
+    qkv_bytes = 2 * tile_b * chunk_sz * dim_size * carry_scratch_bytes
     # BATCHED tiles take no 2D term: at the measured decode shapes the estimate
     # already exceeds the need with 2D bf16 qkv (n_v=8, T=16: 50.3 MiB
     # estimated, 39.3 MiB needed; n_v=64, T=2: 50.1 and 43.8 MiB).
     if qkv_2d and not is_decode:
         qkv_bytes += tile_b * dim_size * _QKV_2D_PER_SEQ_EXTRA_BYTES_PER_COLUMN
-    b_bytes = 2 * (tile_b * chunk_sz * aligned_num_v_heads * carry_scratch_bytes)
-    a_bytes = 2 * (tile_b * chunk_sz * aligned_num_v_heads * carry_scratch_bytes)
+    b_bytes = 2 * tile_b * chunk_sz * aligned_num_v_heads * carry_scratch_bytes
+    a_bytes = 2 * tile_b * chunk_sz * aligned_num_v_heads * carry_scratch_bytes
 
-    # 2. Double-buffered state cache buffers (convolution and recurrent states).
-    # Input state windows hold 1 state per sequence; output state windows hold
-    # `window_size` checkpoints per sequence, giving `1 + window_size` state
-    # slots per sequence per buffer.
+    # 2. Double-buffered state tiles. The input window holds one incoming
+    # state per sequence and the output window one checkpoint per window
+    # position (memory_ref.StateInBufferedRef / StateOutBufferedRef), so each
+    # sequence holds 1 + window_size state tiles per buffer.
+    # The conv state is f32; the recurrent state tile holds the state dtype
+    # (main's granule-addressed state windows, pooled or dense).
+    conv_region_bytes = (
+        max(0, kernel_size - 1) * conv_state_dim_size * carry_scratch_bytes
+    )
+    rec_region_bytes = state_elems * rec_state_bytes
     state_slots_per_seq = 1 + window_size
-    conv_state_buffer_bytes = 2 * (
-        tile_b
-        * state_slots_per_seq
-        * max(0, kernel_size - 1)
-        * conv_state_dim_size
-        * carry_scratch_bytes
-    )
-    recurrent_state_buffer_bytes = 2 * (
-        tile_b * state_slots_per_seq * n_v * d_v * d_k * rec_state_bytes
-    )
+    conv_state_buffer_bytes = 2 * tile_b * state_slots_per_seq * conv_region_bytes
+    recurrent_state_buffer_bytes = 2 * tile_b * state_slots_per_seq * rec_region_bytes
 
-    # 3. Double-buffered output activation buffer.
-    out_bytes = 2 * (tile_b * chunk_sz * aligned_out_dim * act_out_bytes)
+    # 3. Double-buffered output activation.
+    out_bytes = 2 * tile_b * chunk_sz * aligned_out_dim * act_out_bytes
 
-    # 4. Working state. Both modes keep one f32 copy of the recurrent state
-    # alongside the double-buffered state windows; prefill also keeps the
-    # convolution carry.
-    scratch_recurrent_bytes = tile_b * n_v * d_v * d_k * carry_scratch_bytes
+    # 4. f32 working recurrent state. BATCHED keeps the previous state plus
+    # one per emitted checkpoint (1 + window_size per slot). PER_SEQ keeps
+    # one copy, its inter-tile recurrent carry, plus the conv carry
+    # (GDNConfig.get_scratch_shape_dict).
     if is_decode:
+        live_state_copies = 1 if main_decode_scratch else 1 + window_size
         scratch_conv_bytes = 0
     else:
+        live_state_copies = 1
         scratch_conv_bytes = (
             tile_b * max(0, kernel_size - 1) * dim_size * carry_scratch_bytes
         )
+    scratch_recurrent_bytes = (
+        tile_b * live_state_copies * state_elems * carry_scratch_bytes
+    )
 
-    # 5. Static weight cache references in on-chip memory.
-    # Conv weight [K, dim] plus conv bias [dim] in f32; a_log and dt_bias.
-    weights_bytes = ((kernel_size + 1) * dim_size * carry_scratch_bytes) + (
+    # 5. Weights resident in VMEM: conv weight [K, dim] + bias [dim] in f32;
+    # a_log and dt_bias.
+    weights_bytes = (kernel_size + 1) * dim_size * carry_scratch_bytes + (
         aligned_num_v_heads * 8
     )
 
-    # 6. Working memory for intra-chunk recurrence and per-head projections
-    # (chunk_sz is the verify window in decode) plus per-slot vector
-    # temporaries.
+    # 6. Intra-chunk recurrence, per-head projections and per-sequence
+    # vector temporaries (8 arrays of shape [8, num_lanes] per slot).
     intermediate_bytes = (
         tile_b
         * (
@@ -171,41 +242,36 @@ def calculate_decode_tile_size(
     vmem_capacity_limit_bytes: int,
     kernel_size: int = 4,
     window_size: int = 1,
+    main_decode_scratch: bool = False,
 ) -> int:
     """Largest decode tile whose VMEM estimate fits the limit.
 
     The speed optimum is decode_tile_target; this is the feasibility ceiling.
 
     Args:
-      batch_size: Total batch size of the active decode sequence.
+      batch_size: Number of active decode sequences.
       n_kq: Number of key/query heads.
       n_v: Number of value heads.
       d_k: Key head dimension.
       d_v: Value head dimension.
       conv_state_dim_size: Feature dimension size for conv state.
       act_out_dtype: Data type for output activations.
-      recurrent_state_dtype: Data type for recurrent state matrix.
+      recurrent_state_dtype: Data type for a dense recurrent state matrix.
       num_lanes: Number of lanes for TPU vector layout alignment.
       vmem_capacity_limit_bytes: Maximum allowed VMEM capacity in bytes.
       kernel_size: 1D convolution kernel window size.
       window_size: Number of state checkpoints per sequence in decode.
+      main_decode_scratch: Use main's estimate (get_vmem_estimate_bytes).
 
     Returns:
-      Derived batch tile size fitting within VMEM capacity limits.
+      The largest DECODE_TILE_SIZES entry <= batch_size that fits, 1 for an
+      empty batch, or the smallest candidate when nothing fits.
     """
-    # Return a minimum valid tile size of 1 for empty or zero-length batches.
     if batch_size <= 0:
         return 1
 
-    act_out_bytes = jnp.dtype(act_out_dtype).itemsize
-    rec_state_bytes = jnp.dtype(recurrent_state_dtype).itemsize
-
-    # Search descending power-of-2 tile candidates (up to 16) bounded by
-    # batch size.
-    decode_candidates = [c for c in DECODE_TILE_SIZES if c <= batch_size]
-    decode_tile_size = decode_candidates[-1]
-
-    for cand in decode_candidates:
+    candidates = [c for c in DECODE_TILE_SIZES if c <= batch_size]
+    for cand in candidates:
         vmem_est = get_vmem_estimate_bytes(
             tile_b=cand,
             chunk_sz=window_size,
@@ -214,17 +280,56 @@ def calculate_decode_tile_size(
             d_k=d_k,
             d_v=d_v,
             kernel_size=kernel_size,
-            act_out_bytes=act_out_bytes,
-            rec_state_bytes=rec_state_bytes,
+            act_out_bytes=jnp.dtype(act_out_dtype).itemsize,
+            rec_state_bytes=jnp.dtype(recurrent_state_dtype).itemsize,
             num_lanes=num_lanes,
             conv_state_dim_size=conv_state_dim_size,
             is_decode=True,
             window_size=window_size,
+            main_decode_scratch=main_decode_scratch,
         )
         if vmem_est <= vmem_capacity_limit_bytes:
             return cand
+    return candidates[-1]
 
-    return decode_tile_size
+
+def main_decode_tile_size(
+    *,
+    num_seqs: int,
+    padded_batch_size: int,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    conv_state_dim_size: int,
+    act_out_dtype: jnp.dtype,
+    recurrent_state_dtype: jnp.dtype,
+    num_lanes: int,
+    decode_vmem_limit_bytes: int,
+    window_size: int,
+) -> int:
+    """main's dynamic decode tile (kernels/gdn/v3 get_tile_sizes): main's
+    target capped at main's VMEM fit and at the padded batch. Shapes outside
+    config.TILER_SHAPES take it under TPU_ENABLE_GDN_DYNAMIC_TILING."""
+    active_num_seqs = max(1, min(padded_batch_size, num_seqs))
+    vmem_fit = calculate_decode_tile_size(
+        batch_size=active_num_seqs,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        conv_state_dim_size=conv_state_dim_size,
+        act_out_dtype=act_out_dtype,
+        recurrent_state_dtype=recurrent_state_dtype,
+        num_lanes=num_lanes,
+        vmem_capacity_limit_bytes=decode_vmem_limit_bytes,
+        kernel_size=kernel_size,
+        window_size=window_size,
+        main_decode_scratch=True,
+    )
+    tile = min(main_decode_tile_target(active_num_seqs, n_v), vmem_fit)
+    return max(1, min(tile, padded_batch_size))
 
 
 def calculate_mixed_tile_size(
@@ -243,55 +348,52 @@ def calculate_mixed_tile_size(
 ) -> int:
     """Largest prefill chunk whose VMEM estimate fits the limit.
 
-    Searches candidate tile sizes within maximum VMEM capacity limits.
+    MIXED_TILE_SIZES stops at C=128, the largest chunk measured: C=128 beat
+    C=64 on every swept shape where both fit (n_v=8 and 32), and the VMEM
+    estimate rejects C=128 at n_v=64. C > 128 is unmeasured.
 
     Args:
-      seq_len: Upper bound on the longest prefill sequence, in tokens.
+      seq_len: Upper bound on the chunk, in tokens.
       n_kq: Number of key/query heads.
       n_v: Number of value heads.
       d_k: Key head dimension.
       d_v: Value head dimension.
       conv_state_dim_size: Feature dimension size for conv state.
       act_out_dtype: Data type for output activations.
-      recurrent_state_dtype: Data type for recurrent state matrix.
+      recurrent_state_dtype: Data type for a dense recurrent state matrix.
       num_lanes: Number of lanes for TPU vector layout alignment.
       vmem_capacity_limit_bytes: Maximum allowed VMEM capacity in bytes.
       kernel_size: 1D convolution kernel window size.
       qkv_2d: qkv streams as 2D bf16 rows, see get_vmem_estimate_bytes.
 
     Returns:
-      Derived chunk tile size fitting within VMEM capacity limits.
+      The largest MIXED_TILE_SIZES entry <= seq_len that fits, 1 for an empty
+      sequence, or the smallest candidate when nothing fits.
     """
-    # Return a minimum valid chunk size of 1 for empty or zero-length sequences.
     if seq_len <= 0:
         return 1
 
-    act_out_bytes = jnp.dtype(act_out_dtype).itemsize
-    rec_state_bytes = jnp.dtype(recurrent_state_dtype).itemsize
-
-    # Select the largest candidate chunk (up to 128 tokens) that fits in VMEM.
-    prefill_candidates = [c for c in MIXED_TILE_SIZES if c <= seq_len]
-    mixed_tile_size = prefill_candidates[-1]
-    for candidate in prefill_candidates:
+    candidates = [c for c in MIXED_TILE_SIZES if c <= seq_len]
+    for cand in candidates:
         vmem_est = get_vmem_estimate_bytes(
             tile_b=1,
-            chunk_sz=candidate,
+            chunk_sz=cand,
             n_kq=n_kq,
             n_v=n_v,
             d_k=d_k,
             d_v=d_v,
             kernel_size=kernel_size,
-            act_out_bytes=act_out_bytes,
-            rec_state_bytes=rec_state_bytes,
+            act_out_bytes=jnp.dtype(act_out_dtype).itemsize,
+            rec_state_bytes=jnp.dtype(recurrent_state_dtype).itemsize,
             num_lanes=num_lanes,
             conv_state_dim_size=conv_state_dim_size,
             is_decode=False,
+            window_size=1,
             qkv_2d=qkv_2d,
         )
         if vmem_est <= vmem_capacity_limit_bytes:
-            return candidate
-
-    return mixed_tile_size
+            return cand
+    return candidates[-1]
 
 
 def clip_mixed_tile_size(mixed_tile_size: int, batch_size: int) -> int:
@@ -329,7 +431,10 @@ def get_tile_sizes(
 
     The decode kernel holds window_size (num_spec_tokens + 1) state checkpoints
     per slot and compiles with decode_vmem_limit_bytes; the prefill/mixed kernel
-    compiles with window_size = 1 under mixed_vmem_limit_bytes.
+    compiles with window_size = 1 under mixed_vmem_limit_bytes. Each limit is
+    the vmem_limit_bytes its pallas_call compiles with
+    (GDNConfig.get_vmem_limit_bytes), so sizing and compilation share one
+    number.
 
     Args:
         batch_size: Total unpadded token count in the batch.
@@ -342,61 +447,194 @@ def get_tile_sizes(
         kernel_size: 1D convolution kernel window size.
         conv_state_dim_size: Feature dimension size for conv state.
         act_out_dtype: Data type for output activations.
-        recurrent_state_dtype: Data type for recurrent state matrix.
+        recurrent_state_dtype: Data type for a dense recurrent state matrix.
         num_lanes: Number of lanes for TPU vector layout alignment.
         decode_vmem_limit_bytes: Maximum VMEM capacity in bytes for decode.
         mixed_vmem_limit_bytes: Maximum VMEM capacity in bytes for prefill/mixed.
         window_size: Number of state checkpoints per sequence in decode.
-        decode_tile_size: Explicit decode sequence tile size override, if provided.
-        mixed_tile_size: Explicit prefill/mixed chunk size override, if provided.
+        decode_tile_size: Caller's decode tile, used in place of
+            decode_tile_target and still capped by the VMEM fit.
+        mixed_tile_size: Caller's prefill/mixed chunk, capped to the largest
+            VMEM-feasible MIXED_TILE_SIZES chunk. None derives the chunk from
+            batch_size.
         qkv_2d: qkv streams as 2D bf16 rows; sizes the prefill/mixed chunk
             only, see get_vmem_estimate_bytes.
 
     Returns:
         Tuple of (decode_tile_size, mixed_tile_size).
     """
+    shape = dict(
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        conv_state_dim_size=conv_state_dim_size,
+        act_out_dtype=act_out_dtype,
+        recurrent_state_dtype=recurrent_state_dtype,
+        num_lanes=num_lanes,
+        kernel_size=kernel_size,
+    )
+
     # A batch of padded_batch_size tokens spans at most padded_batch_size
     # active sequences even when num_seqs reflects a larger static slot table.
     active_num_seqs = max(1, min(padded_batch_size, num_seqs))
+    vmem_fit = calculate_decode_tile_size(
+        batch_size=active_num_seqs,
+        vmem_capacity_limit_bytes=decode_vmem_limit_bytes,
+        window_size=window_size,
+        **shape,
+    )
     if decode_tile_size is None or decode_tile_size <= 0:
-        vmem_fit = calculate_decode_tile_size(
-            batch_size=active_num_seqs,
-            n_kq=n_kq,
-            n_v=n_v,
-            d_k=d_k,
-            d_v=d_v,
-            conv_state_dim_size=conv_state_dim_size,
-            act_out_dtype=act_out_dtype,
-            recurrent_state_dtype=recurrent_state_dtype,
-            num_lanes=num_lanes,
-            vmem_capacity_limit_bytes=decode_vmem_limit_bytes,
-            kernel_size=kernel_size,
-            window_size=window_size,
-        )
-        decode_tile_size = min(decode_tile_target(active_num_seqs, n_v), vmem_fit)
+        decode_tile_size = decode_tile_target(active_num_seqs, n_v)
+    decode_tile_size = min(decode_tile_size, vmem_fit)
 
-    if mixed_tile_size is None or mixed_tile_size <= 0:
+    caller_chunk = mixed_tile_size is not None and mixed_tile_size > 0
+    if not caller_chunk:
         # Size the prefill/mixed chunk from batch_size rather than comparing
         # against num_seqs * window_size, because num_seqs can be a static slot
         # capacity (such as under DCP=4) when a single prefill occupies the bucket.
-        vmem_fit = calculate_mixed_tile_size(
+        mixed_tile_size = calculate_mixed_tile_size(
             seq_len=batch_size,
-            n_kq=n_kq,
-            n_v=n_v,
-            d_k=d_k,
-            d_v=d_v,
-            conv_state_dim_size=conv_state_dim_size,
-            act_out_dtype=act_out_dtype,
-            recurrent_state_dtype=recurrent_state_dtype,
-            num_lanes=num_lanes,
             vmem_capacity_limit_bytes=mixed_vmem_limit_bytes,
-            kernel_size=kernel_size,
             qkv_2d=qkv_2d,
+            **shape,
         )
-        mixed_tile_size = vmem_fit
+    else:
+        mixed_tile_size = min(
+            mixed_tile_size,
+            calculate_mixed_tile_size(
+                seq_len=MIXED_TILE_SIZES[0],
+                vmem_capacity_limit_bytes=mixed_vmem_limit_bytes,
+                qkv_2d=qkv_2d,
+                **shape,
+            ),
+        )
 
     # Guarantee strictly positive tile sizes (>= 1) for Pallas grid compilation,
-    # keeping mixed_tile_size a power of two so triangular_block_size divides it.
+    # keeping a derived mixed_tile_size a power of two so triangular_block_size
+    # divides it. A caller's chunk is the tiler's (fused_conv1d_gdn at
+    # config.TILER_SHAPES), which the caller rounds down to whole triangular
+    # blocks after this returns.
     decode_tile_size = max(1, min(decode_tile_size, padded_batch_size))
-    mixed_tile_size = clip_mixed_tile_size(mixed_tile_size, batch_size)
+    if caller_chunk:
+        mixed_tile_size = max(1, min(mixed_tile_size, batch_size))
+    else:
+        mixed_tile_size = clip_mixed_tile_size(mixed_tile_size, batch_size)
     return decode_tile_size, mixed_tile_size
+
+
+def spec_window_tile_cap(
+    *,
+    window: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    dim: int,
+    aligned_num_v_heads: int,
+    num_buffers: int,
+    vmem_budget: int,
+    rec_state_bytes: int = 4,
+    act_out_bytes: int = 2,
+) -> int:
+    """Sequences per BATCHED tile whose state windows fit half the scoped VMEM.
+
+    Each sequence holds one incoming state plus one checkpoint per window
+    position in VMEM, which multiplies the per-sequence footprint by
+    1 + window (2 at window = 1). Shrink the tile so the double-buffered
+    state tiles fit in roughly half the scoped-VMEM budget (the rest goes to
+    weights, activations scratch and compiler temporaries). The recurrent
+    state tile holds `rec_state_bytes` per element (the state dtype) and the
+    output `act_out_bytes` (the output dtype); the conv state tile is f32, as
+    the kernel keeps it.
+    """
+    state_positions = 1 + window
+    rec_bytes = state_positions * n_v * d_k * d_v * rec_state_bytes
+    conv_bytes = state_positions * (kernel_size - 1) * dim * _F32_BYTES
+    bytes_per_seq = (
+        rec_bytes
+        + conv_bytes
+        # qkv (fp32), b/a (fp32), out (act_out).
+        + window
+        * (
+            dim * _F32_BYTES
+            + 2 * aligned_num_v_heads * _F32_BYTES
+            + n_v * d_v * act_out_bytes
+        )
+    )
+    return ((vmem_budget // 2) // num_buffers) // bytes_per_seq
+
+
+def token_count_verify_tile(batch_size: int) -> int:
+    """The decode tile of a speculative verify window from the call's token
+    count alone, for a static (not dynamically picked) tile."""
+    return 1 if batch_size <= 8 else (2 if batch_size <= 32 else 4)
+
+
+def select_decode_tile_size(
+    *,
+    default_tile: int,
+    dyn_tile: int | None,
+    batch_size: int,
+    num_spec_tokens: int,
+    spec_tile_cap: int,
+    is_kda: bool,
+    override: int = 0,
+    num_seqs: int | None = None,
+    vmem_tile_cap: int | None = None,
+) -> int:
+    """Final BATCHED-mode tile T for fused_conv1d_gdn.
+
+    Args:
+      default_tile: The caller's decode_tile_size (static path).
+      dyn_tile: get_tile_sizes' decode tile, or None when dynamic tiling is
+        off. Replaces both default_tile and, for verify windows, the
+        token-count tile (token_count_verify_tile).
+      batch_size: Tokens in the call (qkv rows).
+      num_spec_tokens: Speculative draft tokens per verify window.
+      spec_tile_cap: spec_window_tile_cap(...) at window num_spec_tokens + 1.
+        Caps the static tile at every window size, since the static tile has
+        no VMEM fit of its own, and the dynamic tile on verify windows.
+      is_kda: Whether the call runs KDA rather than GDN.
+      override: The caller's explicit decode tile (fused_conv1d_gdn
+        decode_tile_override); > 0 replaces the pick, except for KDA verify
+        windows, which must stay at one sequence. It is capped at the batch,
+        the sequence count, spec_tile_cap and vmem_tile_cap, so it can ask
+        for a smaller tile than the pick but never for one past the VMEM
+        ceilings.
+      num_seqs: Optional upper bound on the number of sequences. Because
+        compute_batched_seq_metadata pads its SMEM arrays to a multiple of T,
+        T does not need to divide num_seqs.
+      vmem_tile_cap: calculate_decode_tile_size(...) for this call (GDN), the
+        largest candidate tile whose VMEM estimate fits; None when there is
+        no estimate (KDA). The dynamic tile is already under it.
+    """
+    tile = default_tile if dyn_tile is None else dyn_tile
+    tile = min(tile, batch_size)
+    if num_seqs is not None and num_seqs > 0:
+        tile = min(tile, num_seqs)
+    if dyn_tile is None or num_spec_tokens > 0:
+        tile = min(tile, spec_tile_cap)
+    if num_spec_tokens > 0:
+        heuristic = (
+            tile if dyn_tile is not None else token_count_verify_tile(batch_size)
+        )
+        tile = max(1, min(tile, heuristic))
+        if is_kda:
+            # KDA verify keeps one sequence per tile until multi-sequence KDA
+            # verify tiles are sized by a KDA-aware VMEM estimate.
+            tile = 1
+    if override > 0 and not (is_kda and num_spec_tokens > 0):
+        cap = (
+            batch_size
+            if (num_seqs is None or num_seqs <= 0)
+            else min(batch_size, num_seqs)
+        )
+        # The override replaces the pick, not the VMEM ceilings: at TP2 with
+        # verify windows of 4 and a bf16 state, T = 4 needs 61.6 MiB of scoped
+        # VMEM against a 57.6 MiB limit, and both ceilings give T = 2.
+        cap = min(cap, spec_tile_cap)
+        if vmem_tile_cap is not None:
+            cap = min(cap, vmem_tile_cap)
+        tile = max(1, min(override, cap))
+    return max(1, tile)
