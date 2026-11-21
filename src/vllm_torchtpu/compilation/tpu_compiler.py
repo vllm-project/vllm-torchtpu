@@ -600,8 +600,10 @@ class TpuCompilerAdaptor(CompilerInterface):
         from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
 
         config.reset_scheduling_group_ids()
+        started = time.monotonic()
         with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
+        backend_finished = time.monotonic()
 
         # Read `serialize` off the object TpuBackend returned, before any
         # wrapping: the unwrap below replaces it with a plain closure that does
@@ -617,6 +619,13 @@ class TpuCompilerAdaptor(CompilerInterface):
                     "not be cached: %s",
                     e,
                 )
+        logger.info(
+            "[TpuCompilerAdaptor] Backend call finished: backend=%.3fs "
+            "bundle=%.3fs serializable=%s",
+            backend_finished - started,
+            time.monotonic() - backend_finished,
+            entry is not None,
+        )
         return compiled_fn, entry
 
     def _save_handle(
@@ -656,10 +665,15 @@ class TpuCompilerAdaptor(CompilerInterface):
             # that the next run reads back as a corrupt artifact.
             # The temp name is PID-unique, like _link_artifact's: two writers
             # of the same path must not interleave into one temp file.
+            started = time.monotonic()
             with open(tmp_path, "wb") as f:
                 pickle.dump(payload, f)
             os.replace(tmp_path, path)
-            logger.info("[TpuCompilerAdaptor] Saved compiled artifact to %s", path)
+            logger.info(
+                "[TpuCompilerAdaptor] Saved compiled artifact to %s in %.3fs",
+                path,
+                time.monotonic() - started,
+            )
             return True
         except Exception as e:
             # Non-fatal by design: a failed save costs a recompile next run,
@@ -684,12 +698,14 @@ class TpuCompilerAdaptor(CompilerInterface):
         With `fingerprint` (another rank's artifact), it must also have been
         built from exactly this graph.
         """
+        started = time.monotonic()
         try:
             with open(path, "rb") as f:
                 payload = pickle.load(f)
         except Exception as e:
             logger.warning("[TpuCompilerAdaptor] Unreadable artifact %s: %s", path, e)
             return None
+        read_finished = time.monotonic()
 
         reason = None
         if not isinstance(payload, TpuCompilationHandle):
@@ -723,8 +739,9 @@ class TpuCompilerAdaptor(CompilerInterface):
             )
             return None
 
+        rebuild_started = time.monotonic()
         try:
-            return _deserialize_entry(payload.entry)
+            compiled_fn = _deserialize_entry(payload.entry)
         except Exception as e:
             logger.warning(
                 "[TpuCompilerAdaptor] Could not replay artifact %s, recompiling: %s",
@@ -732,6 +749,14 @@ class TpuCompilerAdaptor(CompilerInterface):
                 e,
             )
             return None
+        logger.info(
+            "[TpuCompilerAdaptor] Loaded compiled artifact %s: "
+            "read_and_unpickle=%.3fs rebuild=%.3fs",
+            path,
+            read_finished - started,
+            time.monotonic() - rebuild_started,
+        )
+        return compiled_fn
 
     def _peer_paths(self, key: str) -> list[str]:
         """Where the other ranks have saved their artifact for `key`.
@@ -810,19 +835,30 @@ class TpuCompilerAdaptor(CompilerInterface):
         it, or what appeared was built from a different graph -- then the ranks
         do not trace the same program and waiting on would not help.
         """
-        deadline = time.monotonic() + getattr(_peer_wait, "timeout_s", 0.0)
+        started = time.monotonic()
+        timeout_s = getattr(_peer_wait, "timeout_s", 0.0)
+        deadline = started + timeout_s
         paths = self._peer_paths(key)
         while not paths and time.monotonic() < deadline:
             failed = self._peer_failed(key, fingerprint)
             if failed is not None:
                 logger.info(
-                    "[TpuCompilerAdaptor] %s: its owner could not save it; "
-                    "compiling it here instead of waiting",
+                    "[TpuCompilerAdaptor] %s: its owner could not save it "
+                    "after waiting %.3fs; compiling it here",
                     failed,
+                    time.monotonic() - started,
                 )
                 return None
             time.sleep(_PEER_POLL_S)
             paths = self._peer_paths(key)
+        if timeout_s > 0:
+            logger.info(
+                "[TpuCompilerAdaptor] Peer artifact lookup for %s: "
+                "elapsed=%.3fs found=%s",
+                key,
+                time.monotonic() - started,
+                bool(paths),
+            )
         if not paths:
             return None
         compiled_fn = self._replay(paths[0], graph, was_wrapped, fingerprint)
