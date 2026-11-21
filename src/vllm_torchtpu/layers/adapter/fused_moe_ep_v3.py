@@ -409,6 +409,10 @@ def _prebuild(layer, topk: int, renormalize: bool, activation: str) -> ArmedOp |
 
     w1, w2 = layer.w13_weight, layer.w2_weight
     w1_scale, w2_scale = layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+    owned = getattr(layer, "_tpu_owned_experts", None)
+    if owned is not None and owned < w1.shape[0]:
+        w1, w2 = w1[:owned], w2[:owned]
+        w1_scale, w2_scale = w1_scale[:owned], w2_scale[:owned]
     local_experts, hidden = w1.shape[0], w1.shape[1]
     inter = w1.shape[2] // 2
 

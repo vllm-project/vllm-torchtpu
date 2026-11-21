@@ -569,3 +569,88 @@ def test_a_stalled_gs_read_times_out(monkeypatch):
     with pytest.raises(RuntimeError, match="gs://bucket/placement.json.*timed out"):
         expert_placement._read("gs://bucket/placement.json")
     assert 0 < calls[0]["timeout"] < float("inf")
+
+
+def test_copies_placement_builds_virtual_order_holder_tables_and_factory_slots(
+    tmp_path, monkeypatch
+):
+    import threading
+
+    from vllm.model_executor.layers import fused_moe as fused_pkg
+    from vllm.model_executor.layers.fused_moe import layer as fused_layer
+
+    table = {
+        "experts": 8,
+        "shards": 2,
+        "owned_per_core": 4,
+        "slots_per_core": 5,
+        "copies": True,
+        "layers": {
+            "3": {
+                "cores": [[7, 0, 5, 2, 1], [1, 6, 3, 4, 7]],
+                "copies": {"1": 0, "7": 1},
+            }
+        },
+    }
+    path = tmp_path / "copies.json"
+    path.write_text(json.dumps(table))
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
+    p = expert_placement.current()
+    assert p is not None and p.copies is True
+    assert p.virtual_order(3) == ORDER
+    assert p.hot_order(3) == [SLOT[1], SLOT[7]]
+    gid0, prim, copy = p.holder_tables(3, 0)
+    gid1, prim1, copy1 = p.holder_tables(3, 1)
+    assert prim == [0, 0, 0, 0, 1, 1, 1, 1] and prim1 == prim
+    assert copy[SLOT[1]] == 0 and copy[SLOT[7]] == 1 and copy1 == copy
+    assert gid0 == [0, 1, 2, 3, SLOT[1]]
+    assert gid1 == [4, 5, 6, 7, SLOT[7]]
+
+    runner = _Runner("model.layers.3.ffn.experts", rank=1, experts=8, shards=2)
+    runner.routed_experts.expert_map_manager._local_num_experts = 5
+    runner.routed_experts.expert_map_manager.local_num_experts = 5
+    assert expert_placement.apply(runner)
+    assert expert_placement.expert_order(runner.routed_experts) == ORDER
+    assert getattr(runner.routed_experts, expert_placement.OWNED_EXPERTS_ATTR) == 4
+    assert runner.routed_experts._expert_map.tolist() == [
+        -1,
+        0,
+        -1,
+        2,
+        3,
+        -1,
+        1,
+        4,
+    ]
+    assert expert_placement.fetch_filter_ids("layers.3.ffn.experts.0.w1") == frozenset(
+        {1, 6, 3, 4, 7}
+    )
+
+    expert_placement.patch_factory_prefix()
+    orig_factory = fused_layer.FusedMoEFactory
+    seen_slots: list[tuple[int, list[int]]] = []
+
+    def probe_factory(*, prefix: str = ""):
+        del prefix
+        mgr = SimpleNamespace(
+            global_num_experts=8,
+            ep_size=2,
+            ep_rank=0,
+            num_fused_shared_experts=0,
+            moe_parallel_config=SimpleNamespace(use_ep=True),
+        )
+        res = expert_placement.copied_slot_map(mgr)
+        assert res is not None
+        seen_slots.append((res[0], res[1].tolist()))
+
+    # Verify thread-local prefix propagates cleanly through factory wrapper.
+    monkeypatch.setattr(expert_placement, "_FACTORY_PREFIX", threading.local())
+    orig_wrapped = fused_layer.FusedMoEFactory
+    try:
+        expert_placement._FACTORY_PREFIX.value = "model.layers.3.mlp.experts"
+        probe_factory(prefix="model.layers.3.mlp.experts")
+    finally:
+        expert_placement._FACTORY_PREFIX.value = ""
+    assert orig_factory is fused_pkg.FusedMoEFactory
+    assert seen_slots == [(5, [1, 4, 3, -1, -1, 2, -1, 0])]
+    del orig_wrapped

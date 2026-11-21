@@ -326,17 +326,28 @@ def _patch_expert_map_host_lookup() -> None:
     if getattr(cls, "_tpu_host_expert_map_patch", False):
         return
 
+    from vllm_torchtpu.layers.adapter import expert_placement
+
+    expert_placement.patch_factory_prefix()
+
     def _calculate_expert_maps(self) -> None:
         device = torch.get_default_device()
-        with torch.device("cpu"):
-            local_num_experts, expert_map, expert_mask = _em.determine_expert_map(
-                ep_size=self.ep_size,
-                ep_rank=self.ep_rank,
-                global_num_experts=self.global_num_experts,
-                expert_placement_strategy=self._placement_strategy,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                return_expert_mask=self.rocm_aiter_enabled,
+        override = expert_placement.copied_slot_map(self)
+        if override is not None:
+            local_num_experts, expert_map = override
+            expert_mask = (
+                (expert_map >= 0).to(torch.int32) if self.rocm_aiter_enabled else None
             )
+        else:
+            with torch.device("cpu"):
+                local_num_experts, expert_map, expert_mask = _em.determine_expert_map(
+                    ep_size=self.ep_size,
+                    ep_rank=self.ep_rank,
+                    global_num_experts=self.global_num_experts,
+                    expert_placement_strategy=self._placement_strategy,
+                    num_fused_shared_experts=self.num_fused_shared_experts,
+                    return_expert_mask=self.rocm_aiter_enabled,
+                )
         self._local_num_experts = local_num_experts + self.num_fused_shared_experts
         self._expert_map = None if expert_map is None else expert_map.to(device)
         self._expert_mask = None if expert_mask is None else expert_mask.to(device)

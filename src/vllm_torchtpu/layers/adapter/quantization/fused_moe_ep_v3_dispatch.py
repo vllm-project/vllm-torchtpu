@@ -87,13 +87,19 @@ def apply(
         or sequence_parallel.is_active()
     )
     if (step_sp or not model_sp) and x.shape[0] >= armed.step_min_tokens:
+        w1, w2 = layer.w13_weight, layer.w2_weight
+        w1_scale, w2_scale = layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+        owned = getattr(layer, "_tpu_owned_experts", None)
+        if owned is not None and owned < w1.shape[0]:
+            w1, w2 = w1[:owned], w2[:owned]
+            w1_scale, w2_scale = w1_scale[:owned], w2_scale[:owned]
         return fused_moe_ep_v3(
             method,
             x,
-            layer.w13_weight,
-            layer.w2_weight,
-            layer.w13_weight_scale_inv,
-            layer.w2_weight_scale_inv,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
             router_logits,
             layer._experts_start,
         )

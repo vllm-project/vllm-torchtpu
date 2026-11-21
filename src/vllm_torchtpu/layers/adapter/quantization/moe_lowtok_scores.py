@@ -31,16 +31,24 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import torch
 from torch_tpu._internal.pallas import jax_op
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.moe_lowtok import (
+    HOT_SLOTS,
     MOE_LOWTOK_MAX_TOKENS,
     can_use_moe_lowtok,
+    hot_tables,
     moe_lowtok,
+    pack_tables,
+    slot_table,
 )
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.kernels.experimental.moe_lowtok import (
+    moe_lowtok_scores as kernel_moe_lowtok_scores,
+)
+from vllm_torchtpu.layers.adapter import expert_placement, moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
 )
@@ -51,6 +59,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _OPS: dict[int, torch.library.CustomOpDef] = {}
+_COPIES_OPS: dict[tuple[int, int, int], torch.library.CustomOpDef] = {}
 
 
 class _Verdict(NamedTuple):
@@ -186,6 +195,95 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
     return op
 
 
+def _build_copies_op(topk: int, ranks: int, owned: int) -> torch.library.CustomOpDef:
+    key = (topk, ranks, owned)
+    op = _COPIES_OPS.get(key)
+    if op is not None:
+        return op
+
+    def moe(
+        x: jax.Array,
+        scores: jax.Array,
+        tables: jax.Array,
+        prim: jax.Array,
+        copy: jax.Array,
+        w13: jax.Array,
+        w2: jax.Array,
+        w13_scale: jax.Array,
+        w2_scale: jax.Array,
+    ) -> jax.Array:
+        return kernel_moe_lowtok_scores(
+            x,
+            scores,
+            0,
+            None,
+            prim,
+            copy,
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            topk=topk,
+            ranks=ranks,
+            owned=owned,
+            has_copies=True,
+            tables=tables,
+        )
+
+    op = jax_op(f"pallas::moe_lowtok_scores_copies_k{topk}_r{ranks}_o{owned}", moe)
+
+    def _fake(x, *_args):
+        return torch.empty_like(x)
+
+    op.register_fake(_fake)
+    _COPIES_OPS[key] = op
+    return op
+
+
+def _arm_copies(
+    layer: RoutedExperts, placement: expert_placement.Placement, layer_idx: int
+) -> torch.library.CustomOpDef:
+    rank = int(layer.expert_map_manager.ep_rank)
+    gid, prim, copy = placement.holder_tables(layer_idx, rank)
+    lanes = ((len(prim) + 127) // 128) * 128
+    if len(prim) < lanes:
+        pad = [-1] * (lanes - len(prim))
+        prim = prim + pad
+        copy = copy + pad
+    hot, hprim, hcopy = hot_tables(
+        prim, copy, order=placement.hot_order(layer_idx), slots=HOT_SLOTS
+    )
+    slot = slot_table(gid, placement.slots, lanes=lanes)
+    tables_np = pack_tables(
+        rank,
+        gid,
+        np.asarray(hot, np.int32),
+        np.asarray(hprim, np.int32),
+        np.asarray(hcopy, np.int32),
+        np.asarray(slot, np.int32),
+    )
+    w13: Any = layer.w13_weight
+    device: torch.device = w13.device
+    layer.register_buffer(
+        "_lowtok_tables",
+        torch.as_tensor(np.asarray(tables_np, dtype=np.int32)).to(device),
+        persistent=False,
+    )
+    layer.register_buffer(
+        "_lowtok_prim",
+        torch.as_tensor(np.asarray(prim, dtype=np.int32)).to(device),
+        persistent=False,
+    )
+    layer.register_buffer(
+        "_lowtok_copy",
+        torch.as_tensor(np.asarray(copy, dtype=np.int32)).to(device),
+        persistent=False,
+    )
+    return _build_copies_op(
+        layer.moe_config.experts_per_token, placement.shards, placement.owned
+    )
+
+
 def prebuild(
     method: Any, layer: RoutedExperts, activation: str
 ) -> torch.library.CustomOpDef | None:
@@ -203,6 +301,19 @@ def prebuild(
     _LAYERS.append(_Verdict(method, layer.layer_name, entry, unsupported or routing))
     if entry != "scores":
         return None
+    placement = expert_placement.current()
+    layer_idx = (
+        expert_placement.layer_index(layer.layer_name)
+        if placement is not None and placement.copies
+        else None
+    )
+    if (
+        placement is not None
+        and placement.copies
+        and layer_idx is not None
+        and placement.ranks(layer_idx) is not None
+    ):
+        return _arm_copies(layer, placement, layer_idx)
     return _build_op(layer.moe_config.experts_per_token)
 
 
@@ -272,6 +383,18 @@ def apply(
         # A zeroed score row selects no expert in the kernel's router; the
         # helper only reads the first argument's row count.
         _, scores = token_padding.zero_routing_weights_for_padding(scores, scores)
+    if hasattr(layer, "_lowtok_tables"):
+        return op(
+            x,
+            scores,
+            layer._lowtok_tables,
+            layer._lowtok_prim,
+            layer._lowtok_copy,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+        )
     return op(
         x,
         scores,

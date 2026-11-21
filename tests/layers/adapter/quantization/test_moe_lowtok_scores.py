@@ -252,3 +252,96 @@ def test_op_is_built_once_per_topk_and_fakes_the_row_shape():
         ]
         out = op(x, torch.empty(4, 512), *w, torch.empty((), dtype=torch.int32))
     assert tuple(out.shape) == (4, 512) and out.dtype == torch.bfloat16
+
+
+def test_copies_placement_registers_non_persistent_buffers_and_arms_copies_op(
+    enabled, tmp_path, monkeypatch
+):
+    import json
+
+    from vllm_torchtpu.layers.adapter import expert_placement
+
+    table = {
+        "experts": 8,
+        "shards": 2,
+        "owned_per_core": 4,
+        "slots_per_core": 5,
+        "copies": True,
+        "layers": {
+            "0": {
+                "cores": [[0, 1, 2, 3, 4], [4, 5, 6, 7, 0]],
+                "copies": {"4": 0, "0": 1},
+            }
+        },
+    }
+    path = tmp_path / "copies.json"
+    path.write_text(json.dumps(table))
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
+    expert_placement.clear_cache()
+    try:
+        proto = make_layer(experts=5)
+
+        class _ModuleLayer(torch.nn.Module):
+            def __init__(self, src):
+                super().__init__()
+                for k, v in vars(src).items():
+                    setattr(self, k, v)
+                self.w13_weight = torch.empty_like(src.w13_weight, device="cpu")
+                self.w2_weight = torch.empty_like(src.w2_weight, device="cpu")
+                self.w13_weight_scale_inv = torch.empty_like(
+                    src.w13_weight_scale_inv, device="cpu"
+                )
+                self.w2_weight_scale_inv = torch.empty_like(
+                    src.w2_weight_scale_inv, device="cpu"
+                )
+                self.layer_name = "model.layers.0.mlp.experts"
+                self.expert_map_manager = SimpleNamespace(ep_rank=1)
+                self._tpu_owned_experts = 4
+
+        layer = _ModuleLayer(proto)
+        op = scores.prebuild(method(), layer, "silu")
+        assert op is not None
+        buf_names = dict(layer.named_buffers())
+        assert {"_lowtok_tables", "_lowtok_prim", "_lowtok_copy"} <= set(buf_names)
+        assert not (
+            {"_lowtok_tables", "_lowtok_prim", "_lowtok_copy"} & set(layer.state_dict())
+        )
+        assert layer._lowtok_tables.numel() <= 4096
+
+        mock_op = Mock(return_value="copies_out")
+        x = torch.randn(3, 512, dtype=torch.bfloat16)
+        logits = torch.randn(3, 8, dtype=torch.bfloat16)
+        assert scores.apply(mock_op, layer, x, logits) == "copies_out"
+        assert mock_op.call_args.args[2:5] == (
+            layer._lowtok_tables,
+            layer._lowtok_prim,
+            layer._lowtok_copy,
+        )
+
+        # Prefill / >128 grouped paths must slice weights to owned primaries [:4].
+        seen_gmm = []
+        monkeypatch.setattr(
+            fp8,
+            "fused_moe_gmm",
+            lambda **kw: seen_gmm.append(kw["w1"].shape[0]) or "gmm",
+        )
+        monkeypatch.setattr(fp8.moe_routing, "route", lambda *a, **kw: (None, None))
+        monkeypatch.setattr(
+            fp8, "enable_pipelined_collective_and_compute", lambda: False
+        )
+        monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0")
+        m = SimpleNamespace(
+            _tpu_activation_str="silu",
+            _tpu_topk_weights_float32=False,
+            _moe_lowtok_scores_op=op,
+        )
+        layer.w13_bias = layer.w2_bias = None
+        assert (
+            fp8.VllmFp8MoEMethodTPU._apply_grouped(
+                m, layer, torch.empty(129, 512), torch.empty(129, 8)
+            )
+            == "gmm"
+        )
+        assert seen_gmm == [4]
+    finally:
+        expert_placement.clear_cache()

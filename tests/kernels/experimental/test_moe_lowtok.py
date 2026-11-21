@@ -395,3 +395,60 @@ def test_fused_moe_func_selects_kernel_and_matches_oracle(monkeypatch, m):
     # round and accumulate differently, so each is compared with the oracle.
     assert err < 0.06, (err, gmm_err)
     assert err < gmm_err + 0.005, (err, gmm_err)
+
+
+def test_interpreted_scores_copies_load_balances_and_matches_oracle(interpret):
+    rng = np.random.default_rng(42)
+    ranks, owned, slots, tokens, hidden, inter, topk = 4, 2, 3, 5, 512, 256, 4
+    experts = ranks * owned
+    lanes = 128
+    x = jnp.asarray(rng.standard_normal((tokens, hidden)), jnp.bfloat16)
+    w13, s13, w2, s2 = _weights(rng, experts, hidden, inter)
+    logits = rng.standard_normal((tokens, experts)) * 2.0
+    # Skew toward rank 0's experts + copies on ranks 1..3 so copy balancing fires.
+    logits[:, :2] += 4.0
+    scores = jax.nn.softmax(jnp.asarray(logits, jnp.float32), axis=-1)
+    scores_pad = jnp.pad(scores, ((0, 0), (0, lanes - experts)))
+
+    gids = [[0, 1, 7], [2, 3, 0], [4, 5, 2], [6, 7, 4]]
+    prim = np.full((lanes,), -1, np.int32)
+    prim[:experts] = np.arange(experts, dtype=np.int32) // owned
+    copy = np.full((lanes,), -1, np.int32)
+    for e, c in [(0, 1), (2, 2), (4, 3), (7, 0)]:
+        copy[e] = c
+    hot, hprim, hcopy = kernel.hot_tables(prim, copy, order=[0, 7, 2, 4])
+
+    total = np.zeros((tokens, hidden), np.float64)
+    for r, gid in enumerate(gids):
+        idx = jnp.asarray(gid, jnp.int32)
+        slot = np.asarray(kernel.slot_table(gid, slots, lanes=lanes), np.int32)
+        tables = kernel.pack_tables(
+            r * owned,
+            gid,
+            np.asarray(hot, np.int32),
+            np.asarray(hprim, np.int32),
+            np.asarray(hcopy, np.int32),
+            slot,
+        )
+        part = kernel.moe_lowtok_scores(
+            x,
+            scores_pad,
+            0,
+            None,
+            jnp.asarray(prim),
+            jnp.asarray(copy),
+            w13[idx],
+            s13[idx],
+            w2[idx],
+            s2[idx],
+            topk=topk,
+            ranks=ranks,
+            owned=owned,
+            has_copies=True,
+            tables=jnp.asarray(tables),
+        )
+        total += np.asarray(part, np.float64)
+
+    w, ids = _router(scores, topk)
+    want = _oracle(x, ids, w, w13, s13, w2, s2, 0)
+    assert np.linalg.norm(total - want) / np.linalg.norm(want) < 0.06

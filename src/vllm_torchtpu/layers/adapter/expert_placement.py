@@ -53,10 +53,15 @@ not move.
 """
 
 import functools
+import inspect
 import json
 import re
 import subprocess
+import sys
+import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any, cast
 
 import torch
 
@@ -81,6 +86,8 @@ _GCS_READ_TIMEOUT_S = 120
 EXPERT_ORDER_ATTR = "_tpu_expert_order"
 # Set on a placed RoutedExperts layer once its router is in slot order.
 ROUTER_RENUMBERED_ATTR = "_tpu_router_renumbered"
+# Set on a placed RoutedExperts layer with copies: primary experts owned per core.
+OWNED_EXPERTS_ATTR = "_tpu_owned_experts"
 
 # Layer index -> the EP rank whose slots this process's expert map holds, for
 # every layer whose expert map follows the placement. The fetch-time filter
@@ -98,13 +105,32 @@ class Placement:
     experts: int
     shards: int
     layers: dict[int, tuple[tuple[int, ...], ...]]
+    owned_per_core: int = 0
+    slots_per_core: int = 0
+    copies: bool = False
+    layer_copies: dict[int, tuple[int, ...]] | None = None
+
+    @property
+    def owned(self) -> int:
+        return self.owned_per_core or (self.experts // self.shards)
+
+    @property
+    def slots(self) -> int:
+        return self.slots_per_core or (self.experts // self.shards)
 
     def ranks(self, layer: int) -> tuple[tuple[int, ...], ...] | None:
         """Per rank, the global experts it holds in slot order; None if unlisted."""
         return self.layers.get(layer)
 
+    def virtual_order(self, layer: int) -> tuple[int, ...]:
+        """Entry v: the checkpoint expert whose primary owner is virtual slot v."""
+        owned = self.owned
+        return tuple(e for held in self.layers[layer] for e in held[:owned])
+
     def slot_order(self, layer: int) -> tuple[int, ...]:
         """Entry s: the expert in slot s, r * (experts / shards) + j."""
+        if self.copies:
+            return self.virtual_order(layer)
         return tuple(e for held in self.layers[layer] for e in held)
 
     def slot_table(self, layer: int) -> list[int]:
@@ -114,10 +140,51 @@ class Placement:
             slot[e] = s
         return slot
 
+    def holder_tables(
+        self, layer: int, rank: int
+    ) -> tuple[list[int], list[int], list[int]]:
+        """Return (gid, prim, copy) tables for `layer` at `rank` in virtual expert ids.
+
+        - gid[s]: virtual expert id held at local slot s on `rank`.
+        - prim[v]: rank holding virtual expert v's primary.
+        - copy[v]: rank holding a copy of virtual expert v (-1 if none).
+        """
+        held = self.layers[layer]
+        owned = self.owned
+        order = self.virtual_order(layer)
+        slot_of = {e: v for v, e in enumerate(order)}
+        gid = [slot_of[e] for e in held[rank]]
+        prim = [v // owned for v in range(self.experts)]
+        copy = [-1] * self.experts
+        for r, slots in enumerate(held):
+            for e in slots[owned:]:
+                copy[slot_of[e]] = r
+        return gid, prim, copy
+
+    def hot_order(self, layer: int) -> list[int] | None:
+        """Copied virtual expert ids in hottest-first order, or None."""
+        if not self.layer_copies or layer not in self.layer_copies:
+            return None
+        slot_of = {e: v for v, e in enumerate(self.virtual_order(layer))}
+        return [slot_of[e] for e in self.layer_copies[layer]]
+
+
+def _parse_layer_key(key: str, source: str, layers: Mapping[int, object]) -> int:
+    try:
+        layer = int(key)
+    except ValueError:
+        raise ValueError(
+            f"expert placement {source}: layer key {key!r} is not a layer index"
+        ) from None
+    if layer < 0:
+        raise ValueError(f"expert placement {source}: layer {key} is negative")
+    if layer in layers:
+        raise ValueError(f"expert placement {source}: layer {layer} is listed twice")
+    return layer
+
 
 def parse(table: dict, source: str = "<dict>") -> Placement:
-    """Validate a placement table: each listed layer permutes its experts over
-    the ranks, experts / shards to a rank."""
+    """Validate a placement table (permutation or replicated-slots with copies)."""
     experts = int(table["experts"])
     shards = int(table["shards"])
     if experts <= 0 or shards <= 0:
@@ -130,34 +197,116 @@ def parse(table: dict, source: str = "<dict>") -> Placement:
             f"expert placement {source}: {experts} experts do not divide over "
             f"{shards} ranks"
         )
-    per_rank = experts // shards
+    has_copies = bool(table.get("copies", False))
+    if not has_copies:
+        per_rank = experts // shards
+        layers: dict[int, tuple[tuple[int, ...], ...]] = {}
+        for key, entry in table["layers"].items():
+            layer = _parse_layer_key(key, source, layers)
+            raw_ranks = entry["cores"] if isinstance(entry, dict) else entry
+            if len(raw_ranks) != shards or any(
+                len(held) != per_rank for held in raw_ranks
+            ):
+                raise ValueError(
+                    f"expert placement {source}: layer {key} must list {shards} "
+                    f"ranks of {per_rank} experts each"
+                )
+            ranks = tuple(tuple(int(e) for e in held) for held in raw_ranks)
+            if sorted(e for held in ranks for e in held) != list(range(experts)):
+                raise ValueError(
+                    f"expert placement {source}: layer {key} must hold each of the "
+                    f"{experts} experts exactly once"
+                )
+            layers[layer] = ranks
+        return Placement(
+            experts=experts,
+            shards=shards,
+            layers=layers,
+            owned_per_core=per_rank,
+            slots_per_core=per_rank,
+            copies=False,
+            layer_copies=None,
+        )
+
+    owned = int(table.get("owned_per_core", experts // shards))
+    slots_per_core = int(table["slots_per_core"])
+    if owned * shards != experts or owned <= 0:
+        raise ValueError(
+            f"expert placement {source}: owned_per_core {owned} x shards {shards} "
+            f"must equal experts {experts}"
+        )
+    if slots_per_core < owned:
+        raise ValueError(
+            f"expert placement {source}: slots_per_core {slots_per_core} must be "
+            f">= owned_per_core {owned}"
+        )
     layers = {}
-    for key, ranks in table["layers"].items():
-        try:
-            layer = int(key)
-        except ValueError:
+    layer_copies: dict[int, tuple[int, ...]] = {}
+    for key, entry in table["layers"].items():
+        layer = _parse_layer_key(key, source, layers)
+        if not isinstance(entry, dict) or "cores" not in entry:
             raise ValueError(
-                f"expert placement {source}: layer key {key!r} is not a layer index"
-            ) from None
-        if layer < 0:
-            raise ValueError(f"expert placement {source}: layer {key} is negative")
-        if layer in layers:
-            raise ValueError(
-                f"expert placement {source}: layer {layer} is listed twice"
+                f"expert placement {source}: copied layer {key} "
+                "must be an object with 'cores'"
             )
-        if len(ranks) != shards or any(len(held) != per_rank for held in ranks):
+        raw_ranks = entry["cores"]
+        if len(raw_ranks) != shards or any(
+            len(held) != slots_per_core for held in raw_ranks
+        ):
             raise ValueError(
                 f"expert placement {source}: layer {key} must list {shards} "
-                f"ranks of {per_rank} experts each"
+                f"ranks of {slots_per_core} slots each"
             )
-        ranks = tuple(tuple(int(e) for e in held) for held in ranks)
-        if sorted(e for held in ranks for e in held) != list(range(experts)):
+        ranks = tuple(tuple(int(e) for e in held) for held in raw_ranks)
+        primaries = [e for held in ranks for e in held[:owned]]
+        if sorted(primaries) != list(range(experts)):
             raise ValueError(
-                f"expert placement {source}: layer {key} must hold each of the "
-                f"{experts} experts exactly once"
+                f"expert placement {source}: layer {key} primaries must hold each of "
+                f"the {experts} experts exactly once"
             )
+        owner_of = {e: r for r, held in enumerate(ranks) for e in held[:owned]}
+        seen_copies: dict[int, int] = {}
+        for r, held in enumerate(ranks):
+            if len(set(held)) != slots_per_core:
+                raise ValueError(
+                    f"expert placement {source}: layer {key} rank {r} "
+                    "holds duplicate experts"
+                )
+            for e in held[owned:]:
+                if not 0 <= e < experts:
+                    raise ValueError(
+                        f"expert placement {source}: layer {key} rank {r} "
+                        f"copy {e} out of range"
+                    )
+                if owner_of[e] == r:
+                    raise ValueError(
+                        f"expert placement {source}: layer {key} rank {r} "
+                        f"holds a copy of its own expert {e}"
+                    )
+                if e in seen_copies:
+                    raise ValueError(
+                        f"expert placement {source}: layer {key} "
+                        f"expert {e} copied more than once"
+                    )
+                seen_copies[e] = r
+        if "copies" in entry and entry["copies"] is not None:
+            declared = {int(k): int(v) for k, v in entry["copies"].items()}
+            if declared != seen_copies:
+                raise ValueError(
+                    f"expert placement {source}: layer {key} "
+                    "'copies' map does not match core slots"
+                )
+            layer_copies[layer] = tuple(declared.keys())
         layers[layer] = ranks
-    return Placement(experts=experts, shards=shards, layers=layers)
+    return Placement(
+        experts=experts,
+        shards=shards,
+        layers=layers,
+        owned_per_core=owned,
+        slots_per_core=slots_per_core,
+        copies=True,
+        layer_copies=layer_copies or None,
+    )
 
 
 def _read(uri: str) -> str:
@@ -353,7 +502,9 @@ def apply(runner) -> bool:
     )
     manager._expert_map = expert_map.to(device)
     layer.update_expert_map_info()
-    setattr(layer, EXPERT_ORDER_ATTR, placement.slot_order(layer_idx))
+    setattr(layer, EXPERT_ORDER_ATTR, placement.virtual_order(layer_idx))
+    if placement.copies:
+        setattr(layer, OWNED_EXPERTS_ATTR, placement.owned)
     _APPLIED_LAYERS[layer_idx] = rank
     logger.info_once(
         "Expert placement %s applied: rank %d of %d, %d placed layers",
@@ -363,6 +514,72 @@ def apply(runner) -> bool:
         len(placement.layers),
     )
     return True
+
+
+_FACTORY_PREFIX = threading.local()
+
+
+def patch_factory_prefix() -> None:
+    """Track FusedMoEFactory(prefix=...) before weight allocation."""
+    import vllm.model_executor.layers.fused_moe as fused_pkg
+    from vllm.model_executor.layers.fused_moe import layer as fused_layer
+
+    if getattr(fused_layer, "_tpu_placement_prefix_patch", False):
+        return
+    original_factory = fused_layer.FusedMoEFactory
+    signature = inspect.signature(original_factory)
+
+    @functools.wraps(original_factory)
+    def FusedMoEFactory(*args, **kwargs):
+        bound = signature.bind_partial(*args, **kwargs)
+        prev = getattr(_FACTORY_PREFIX, "value", "")
+        _FACTORY_PREFIX.value = str(bound.arguments.get("prefix", "") or "")
+        try:
+            return original_factory(*args, **kwargs)
+        finally:
+            _FACTORY_PREFIX.value = prev
+
+    fused_layer.FusedMoEFactory = FusedMoEFactory
+    fused_pkg.FusedMoEFactory = FusedMoEFactory
+    for mod in list(sys.modules.values()):
+        if getattr(mod, "FusedMoEFactory", None) is original_factory:
+            cast(Any, mod).FusedMoEFactory = FusedMoEFactory
+    cast(Any, fused_layer)._tpu_placement_prefix_patch = True
+
+
+def copied_slot_map(manager) -> tuple[int, torch.Tensor] | None:
+    """Return (slots_per_core, cpu_expert_map) when `copies` is active."""
+    placement = current()
+    if placement is None or not placement.copies:
+        return None
+    use_ep = getattr(
+        getattr(manager, "moe_parallel_config", None), "use_ep", manager.ep_size > 1
+    )
+    if not use_ep:
+        return None
+    prefix = getattr(_FACTORY_PREFIX, "value", "")
+    layer_idx = layer_index(prefix) if prefix else None
+    if layer_idx is None:
+        return None
+    ranks = placement.ranks(layer_idx)
+    if ranks is None:
+        return None
+    if placement.experts != int(manager.global_num_experts) or placement.shards != int(
+        manager.ep_size
+    ):
+        raise ValueError(
+            f"expert placement {envs.TPU_EXPERT_PLACEMENT} is for "
+            f"{placement.shards} ranks x {placement.experts} experts; "
+            f"{prefix} has {manager.ep_size} x {manager.global_num_experts}"
+        )
+    if getattr(manager, "num_fused_shared_experts", 0):
+        raise ValueError(
+            f"expert placement: {prefix} fuses shared experts into its expert map"
+        )
+    held = ranks[int(manager.ep_rank)]
+    expert_map = torch.full((placement.experts,), -1, dtype=torch.int32, device="cpu")
+    expert_map[list(held)] = torch.arange(len(held), dtype=torch.int32, device="cpu")
+    return placement.slots_per_core, expert_map
 
 
 @functools.cache

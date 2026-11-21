@@ -292,3 +292,36 @@ def test_params_read_by_forward_unions_min_and_max_buckets(
     kept = exporter._params_read_by_forward(fake_model, params_map)
     assert seen_buckets == [4, 512]
     assert set(kept) == {"only_small_buf", "only_large_buf", "lm_head.weight"}
+
+
+def test_adapter_constant_names_includes_lowtok_copies_buffers() -> None:
+    class _Layer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.w13_weight = torch.nn.Parameter(
+                torch.empty(80, 4, 4, dtype=torch.float8_e4m3fn), requires_grad=False
+            )
+            self.register_buffer(
+                "_lowtok_tables", torch.zeros(1024, dtype=torch.int32), persistent=False
+            )
+            self.register_buffer(
+                "_lowtok_prim", torch.zeros(512, dtype=torch.int32), persistent=False
+            )
+            self.register_buffer(
+                "_lowtok_copy", torch.zeros(512, dtype=torch.int32), persistent=False
+            )
+
+    class _Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layer = _Layer()
+
+    model = _Model()
+    adapter = _make_adapter(model)
+    names = set(adapter.constant_names())
+    assert {
+        "layer._lowtok_tables",
+        "layer._lowtok_prim",
+        "layer._lowtok_copy",
+    } <= names
+    assert "layer.w13_weight" not in names
