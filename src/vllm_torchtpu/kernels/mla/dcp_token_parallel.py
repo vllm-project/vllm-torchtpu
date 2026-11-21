@@ -650,10 +650,10 @@ def _merge_lead_partial_latent(
     m = jax.nn.logsumexp(lses, axis=0)
     safe_m = jnp.where(jnp.isfinite(m), m, 0.0)
     w = jnp.where(jnp.isfinite(lead_lse), jnp.exp(lead_lse - safe_m), 0.0)
-    weighted = (lead_partial.astype(jnp.float32) * w[..., None]).astype(
-        lead_partial.dtype
-    )
-    return lax.psum(weighted, axis_name)
+    # Avoid casting to bf16 before psum: bf16 cross-rank reduction accumulates
+    # cancellation error and varies with XLA all-reduce lowering order.
+    weighted = lead_partial.astype(jnp.float32) * w[..., None]
+    return lax.psum(weighted, axis_name).astype(lead_partial.dtype)
 
 
 def _merge_lead_partial_to_v(

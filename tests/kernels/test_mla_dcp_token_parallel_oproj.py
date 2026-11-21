@@ -290,8 +290,8 @@ def test_should_preshift_sequence_rows_before_oproj_preserving_bf16_bits():
         m = jax.nn.logsumexp(lses, axis=0)
         safe_m = jnp.where(jnp.isfinite(m), m, 0.0)
         w = jnp.where(jnp.isfinite(lse_part), jnp.exp(lse_part - safe_m), 0.0)
-        weighted = (part.astype(jnp.float32) * w[..., None]).astype(part.dtype)
-        lead_latent = jax.lax.psum(weighted, AXIS)
+        weighted = part.astype(jnp.float32) * w[..., None]
+        lead_latent = jax.lax.psum(weighted, AXIS).astype(part.dtype)
         lead_v = jnp.einsum(
             "rhl,hlv->rhv", lead_latent, w_uv_all.astype(lead_latent.dtype)
         ).astype(own.dtype)

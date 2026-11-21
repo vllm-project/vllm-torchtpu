@@ -27,6 +27,7 @@ Needs `dcp` devices; CPU virtual devices are enough
 import dataclasses
 
 import jax
+import jax.extend.core
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -670,3 +671,106 @@ def test_should_preserve_all_index_k_bytes_across_interleave_gather_paths(il):
                     nat_page[:, :, s],
                     cache_by_rank[owner, p, :, :, local_slot],
                 )
+
+
+def test_should_accumulate_lead_partial_psum_in_float32_without_bf16_cancellation():
+    dcp = 4
+    mesh = _mesh(dcp)
+    split_rows = 4
+    num_heads = 2
+    lay = tp.TokenParallelLayout(
+        dcp, 4, 32, split_rows=split_rows, max_pages=4, gather_caps=(2, 4)
+    )
+    st = Step(lay, 64, [Req(32, 32)], max_reqs=4, seed=71)
+    rows_per_rank = lay.rows_per_rank(64)
+
+    # Anti-cancellation inputs across ranks: asymmetric LSE weights multiply
+    # opposing large partials so bf16 pre-cast before psum incurs >0.1 error,
+    # whereas float32 psum matches the float64 reference to bf16 rounding.
+    lp = np.zeros((dcp, split_rows, num_heads, DN), dtype=np.float32)
+    ll = np.full((dcp, split_rows, num_heads), -np.inf, dtype=np.float32)
+    # Row 0: opposing large partials with slightly different LSEs (0.0 vs 0.01).
+    ll[:, 0, :] = np.array([0.0, -4.0, 0.01, -4.0], dtype=np.float32)[:, None]
+    for r, val in enumerate((100.0, 0.5, -99.0, 0.5)):
+        lp[r, 0, :, :] = val
+    # Row 1: asymmetric LSE + opposing large/small terms.
+    ll[:, 1, :] = np.array([0.0, 0.25, 0.02, 0.25], dtype=np.float32)[:, None]
+    for r, val in enumerate((256.0, 0.5, -252.0, 0.5)):
+        lp[r, 1, :, :] = val
+    # Row 2: all -inf LSE -> must produce exact finite 0.0 (no NaN).
+    lp[:, 2, :, :] = 7.0
+    # Row 3: single finite rank -> exact passthrough of rank 1's partial.
+    ll[1, 3, :] = 2.5
+    lp[:, 3, :, :] = np.arange(1, dcp + 1, dtype=np.float32)[:, None, None]
+
+    lp_bf16 = jnp.asarray(lp.reshape(dcp * split_rows, num_heads, DN), jnp.bfloat16)
+    ll_f32 = jnp.asarray(ll.reshape(dcp * split_rows, num_heads), jnp.float32)
+    w_uv = jnp.broadcast_to(jnp.eye(DN, dtype=jnp.bfloat16)[None], (num_heads, DN, DN))
+    q_tail = jnp.zeros((dcp * rows_per_rank, num_heads, DN), jnp.bfloat16)
+    flat_topk = jnp.full((dcp * rows_per_rank, TOPK), -1, jnp.int32)
+
+    def _zero_attend(q_tok, g_n, g_r, flat, num_rows):
+        del g_n, g_r, flat, num_rows
+        return jnp.zeros_like(q_tok)
+
+    def _run_lead_merge(lp_in, ll_in):
+        return tp.sparse_mla_attention_with_lead(
+            lay,
+            mesh,
+            AXIS,
+            jnp.asarray(st.nope_cache),
+            jnp.asarray(st.rope_cache),
+            q_tail,
+            None,
+            None,
+            flat_topk,
+            jnp.asarray(st.seq_lens),
+            jnp.asarray(st.block_tables.reshape(-1)),
+            jnp.asarray(st.qsl),
+            jnp.asarray([0, 0, st.num_seqs], jnp.int32),
+            lead_partial=lp_in,
+            lead_lse=ll_in,
+            write_kv=None,
+            attend=_zero_attend,
+            w_uv=w_uv,
+            q_own_rows=True,
+            w_uv_replicated=True,
+            num_tokens=64,
+        )[3]
+
+    lead_v = _run_lead_merge(lp_bf16, ll_f32)
+    got = np.asarray(lead_v, dtype=np.float32)
+
+    # Structural check: cross-rank lead psum must execute in float32 (not bf16)
+    # so TPU all-reduce lowering does not accumulate bf16 rounding drift.
+    psum_dtypes: list[jnp.dtype] = []
+
+    def _collect_psum(jpr):
+        for eqn in jpr.eqns:
+            if eqn.primitive.name == "psum":
+                psum_dtypes.extend(v.aval.dtype for v in eqn.invars)
+            for sub in jax.extend.core.jaxprs_in_params(eqn.params):
+                _collect_psum(sub)
+
+    _collect_psum(jax.make_jaxpr(_run_lead_merge)(lp_bf16, ll_f32).jaxpr)
+    assert psum_dtypes and all(dt == jnp.float32 for dt in psum_dtypes)
+
+    # Independent float64 reference using quantized bf16 inputs.
+    lp_q = np.asarray(lp_bf16, dtype=np.float64).reshape(dcp, split_rows, num_heads, DN)
+    ll_64 = ll.astype(np.float64)
+    finite = np.isfinite(ll_64)
+    any_finite = np.any(finite, axis=0)
+    safe_ll = np.where(finite, ll_64, 0.0)
+    max_ll = np.max(np.where(finite, ll_64, -np.inf), axis=0)
+    safe_max = np.where(any_finite, max_ll, 0.0)
+    exp_shifted = np.where(finite, np.exp(safe_ll - safe_max[None]), 0.0)
+    sum_exp = np.sum(exp_shifted, axis=0)
+    m = np.where(any_finite, np.log(np.where(any_finite, sum_exp, 1.0)) + safe_max, 0.0)
+    w_64 = np.where(finite, np.exp(safe_ll - m[None]), 0.0)
+    expected = np.sum(lp_q * w_64[..., None], axis=0)
+    expected_bf16 = np.asarray(jnp.asarray(expected, jnp.bfloat16), dtype=np.float32)
+
+    assert np.all(np.isfinite(got))
+    np.testing.assert_allclose(got, expected_bf16, rtol=0.0, atol=1e-2)
+    np.testing.assert_array_equal(got[2], 0.0)
+    np.testing.assert_array_equal(got[3], 2.0)
