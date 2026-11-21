@@ -352,6 +352,14 @@ def channel_shard_spec(
     in every mode where a PLE conv call could bypass the stream path: prefill-context
     parallelism, prefill sequence parallelism, VLLM_TPU_PLE_UNIFORM_COND, the HND pool layout,
     the decode megakernel. ``cfg`` defaults to the current vLLM config (read only when set).
+
+    VLLM_TPU_PLE_CHANNEL_SHARD_BENCH_ADMIT=1 (STEP bench cars only) also admits an engine with
+    no KV connector at all (``kv_transfer_config`` is None), such as the STEP bench's decode
+    engine, which prefills its own requests: every PLE conv call of that engine, its local
+    prefill chunks included, runs the stream ops, so each rank writes and later reads only its
+    own stream, and no connector moves PLE pages to or from another engine. Every other refusal
+    stays. On an engine that has a ``kv_transfer_config`` the key is a no-op (it is not read:
+    the same admission or refusal as without it), and so it is without the flag.
     """
     from vllm_torchtpu import envs
     from vllm_torchtpu.kernels.qwen4_exp.pool import channel_shard_streams
@@ -374,8 +382,12 @@ def channel_shard_spec(
     reasons = []
     if streams != hc_count:
         reasons.append(f"it splits the {hc_count} HC streams, not {streams}")
+    # Bench admission: no KV connector at all, then the key (never read on a connector engine).
+    bench = getattr(cfg, "kv_transfer_config", None) is None and bool(
+        envs.VLLM_TPU_PLE_CHANNEL_SHARD_BENCH_ADMIT
+    )
     transfer = pd_transfer_config(cfg)
-    if transfer is None or transfer.kv_role != "kv_consumer":
+    if not bench and (transfer is None or transfer.kv_role != "kv_consumer"):
         reasons.append("it runs only on a PD decode engine (kv_role kv_consumer)")
     if int(getattr(cfg.parallel_config, "prefill_context_parallel_size", 1) or 1) > 1:
         reasons.append("prefill context parallelism is on")
@@ -395,5 +407,12 @@ def channel_shard_spec(
     if reasons:
         raise ValueError(
             f"VLLM_TPU_PLE_CHANNEL_SHARD={streams} refused: " + "; ".join(reasons)
+        )
+    if bench:
+        _logger().info(
+            "q38 PLE-CS bench admission: TP rank %d, no KV connector "
+            "(VLLM_TPU_PLE_CHANNEL_SHARD_BENCH_ADMIT=1): local prefill and decode run the "
+            "stream ops; STEP bench only, never a served car",
+            tp_rank,
         )
     return streams, split, tp_rank
