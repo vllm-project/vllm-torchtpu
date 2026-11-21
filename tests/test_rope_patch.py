@@ -407,3 +407,54 @@ def test_a_table_that_is_not_rope_stays_a_buffer() -> None:
     module.register_buffer("sin", torch.rand(16, 4))
     assert rope_patch.patch_cos_sin_table_pairs(module) == 0
     assert "cos" in module._buffers
+
+
+def test_build_device_vector_is_exact() -> None:
+    cpu = torch.device("cpu")
+
+    # Standard RoPE (base=1e4, rotary_dim=128)
+    std_t = 1.0 / (10000.0 ** (torch.arange(0, 128, 2, dtype=torch.float32) / 128.0))
+    std_vals = tuple(float(v) for v in std_t.tolist())
+    assert torch.equal(
+        rope_patch._build_device_vector_f32(std_vals, cpu),
+        torch.tensor(std_vals, dtype=torch.float32),
+    )
+
+    # Llama-3 smoothed inv_freq
+    base_inv = 1.0 / (
+        500000.0 ** (torch.arange(0, 128, 2, dtype=torch.float32) / 128.0)
+    )
+    wavelen = 2.0 * torch.pi / base_inv
+    low_wavelen = 8192.0 / 1.0
+    high_wavelen = 8192.0 / 4.0
+    smooth = (8192.0 / wavelen - 1.0) / (4.0 - 1.0)
+    scaled = (1.0 - smooth) * (base_inv / 8.0) + smooth * base_inv
+    llama3_t = torch.where(
+        wavelen < high_wavelen,
+        base_inv,
+        torch.where(wavelen > low_wavelen, base_inv / 8.0, scaled),
+    )
+    llama3_vals = tuple(float(v) for v in llama3_t.tolist())
+    assert torch.equal(
+        rope_patch._build_device_vector_f32(llama3_vals, cpu),
+        torch.tensor(llama3_vals, dtype=torch.float32),
+    )
+
+
+@pytest.mark.parametrize("rotary_dim", [_HEAD_SIZE, _HEAD_SIZE // 2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_patched_forward_matches_table_for_full_and_partial_rotary_dim(
+    rotary_dim: int,
+    dtype: torch.dtype,
+) -> None:
+    rope = _SyntheticRotaryEmbedding(rotary_dim=rotary_dim, dtype=dtype)
+    ref_rope = copy.deepcopy(rope)
+    positions = torch.tensor([0, 1, 13, 127, 511], dtype=torch.int32)
+    q, k = _qk(positions.numel(), dtype=dtype)
+
+    assert rope_patch.patch_in_graph_rotary_embedding(rope) == 1
+    out_q, out_k = rope(positions, q.clone(), k.clone())
+    ref_q, ref_k = ref_rope(positions, q.clone(), k.clone())
+    assert out_k is not None and ref_k is not None
+    assert torch.equal(out_q, ref_q)
+    assert torch.equal(out_k, ref_k)
