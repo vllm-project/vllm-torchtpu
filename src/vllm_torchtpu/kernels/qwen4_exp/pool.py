@@ -1059,8 +1059,19 @@ def _note_cs(kind, token_count, count, channels, streams, split, skip_idle) -> N
 
 
 def pooled_short_conv_cs(
-    x, weight, pool, starts, ids, initial, rank, *, dilation, state_len, streams, split
-):
+    x: jax.Array,
+    weight: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    ids: jax.Array,
+    initial: jax.Array,
+    rank: jax.Array,
+    *,
+    dilation: int,
+    state_len: int,
+    streams: int,
+    split: int,
+) -> tuple[jax.Array, jax.Array]:
     """``pooled_short_conv`` on stream ``rank // split`` (q38 PLE-CS). Returns (pool, piece):
     piece = part ``rank % split`` of the stream's output, so the TP all-gather of the pieces in
     rank order is the stock output bit for bit; the pool gets the stream's tokens of the stock
@@ -1089,22 +1100,22 @@ def pooled_short_conv_cs(
 
 
 def pooled_short_conv_speculative_cs(
-    x,
-    weight,
-    pool,
-    starts,
-    ids,
-    initial,
-    read_ids,
-    ckpt_ids,
-    windowed,
-    rank,
+    x: jax.Array,
+    weight: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    ids: jax.Array,
+    initial: jax.Array,
+    read_ids: jax.Array,
+    ckpt_ids: jax.Array,
+    windowed: jax.Array,
+    rank: jax.Array,
     *,
-    dilation,
-    state_len,
-    streams,
-    split,
-):
+    dilation: int,
+    state_len: int,
+    streams: int,
+    split: int,
+) -> tuple[jax.Array, jax.Array]:
     """The stock ``pooled_short_conv_speculative`` (token and request paths,
     VLLM_TPU_PLE_SKIP_IDLE_ROWS, VLLM_TPU_PLE_WRDEFER) on stream ``rank // split`` (q38 PLE-CS).
     Returns (pool, piece) as ``pooled_short_conv_cs``: every written checkpoint gets the stream's
