@@ -18,7 +18,7 @@ from __future__ import annotations
 import contextlib
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 from torch_tpu._internal.stream.streams import TpuEvent
@@ -37,8 +37,9 @@ class RunnerStageTiming:
 
     MAX_IN_FLIGHT_DEVICE_TIMINGS = 1024
 
-    def __init__(self, rank: int):
+    def __init__(self, rank: int, has_sink: Callable[[], bool] = lambda: True):
         self._rank = str(rank)
+        self._has_sink = has_sink
         self._cpu_samples: list[tuple[str, str, float]] = []
         # Includes active stages; saturation keeps CPU samples only.
         self._pending: deque[_PendingTiming] = deque()
@@ -51,6 +52,16 @@ class RunnerStageTiming:
 
     @contextlib.contextmanager
     def stage(self, stage: str) -> Iterator[None]:
+        if not self._has_sink():
+            # Nothing will read the timings, but each record() also flushes
+            # the deferred op graph, and later programs are compiled with these
+            # boundaries; keep them with untimed, untracked events.
+            TpuEvent().record()
+            try:
+                yield
+            finally:
+                TpuEvent().record()
+            return
         if len(self._pending) >= self.MAX_IN_FLIGHT_DEVICE_TIMINGS:
             with self.host_stage(stage):
                 yield

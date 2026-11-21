@@ -1197,7 +1197,7 @@ class TPUModelRunner(GPUModelRunner):
         self._synthetic_shard: tuple[int, int] | None = None
 
         self._init_phased_profiling()
-        self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._stage_timing = RunnerStageTiming(profiler_rank, has_kv_transfer_group)
         self._bucket_stats = BucketStats(enabled=profiler_rank == 0)
 
     def _init_phased_profiling(self) -> None:
