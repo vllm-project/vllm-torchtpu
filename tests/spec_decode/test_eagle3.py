@@ -1937,6 +1937,8 @@ def test_second_chunk_step0_clobbers_first_chunk_rows_and_restore_fixes_it():
 
 
 @pytest.mark.parametrize("clobber", ["next_chunk", "dp_padding_chunk"])
+# full_buffer is the case the fix is for (the aliasing clone covers the whole
+# table); sub_slice passes with or without it and only checks coverage.
 @pytest.mark.parametrize("num_rows", [6, 2], ids=["full_buffer", "sub_slice"])
 def test_snapshot_is_a_buffer_of_its_own_when_clone_aliases(
     monkeypatch, num_rows, clobber

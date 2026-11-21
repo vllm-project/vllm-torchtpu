@@ -26,6 +26,8 @@ from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     _topk_rows,
     _topk_rows_update_jax,
 )
+from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+from vllm_torchtpu.utils import synchronize_tensors
 
 
 def _reference(buf, topk_tokens, num_tokens, topk_indices):
@@ -180,9 +182,6 @@ def test_mtp_restore_after_donated_write(compiled, num_rows, clobber):
     table's buffer, so a full-table snapshot must be a buffer of its own or
     the restore reads a donated buffer. The table must stay a valid, writable
     tensor across all of it."""
-    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
-    from vllm_torchtpu.utils import synchronize_tensors
-
     buf, fwd, proposer, table, topk_a, topk_b = _mtp_table(compiled)
     g = torch.Generator().manual_seed(num_rows)
 
