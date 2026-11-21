@@ -203,15 +203,17 @@ def default_query_tile(query_block):
 
 
 def bound_kernel_eligible(*, ratio, query_block, query_tile, kv_tile, dcp, cache_dtype):
-    """Whether ``_block_sparse_gqa_prefill`` (BF16 io) runs the LANE_SUM
-    kernel, the only one that can use the bound stabilizer. Mirrors its
-    feature gates: no reduced-VPU path, no BF16_MXU split, no lazy softmax,
-    128-aligned KV tiles, LANE_SUM requested."""
-    if not lane_sum_features() or kv_tile % 128:
+    """Whether ``_block_sparse_gqa_prefill`` (BF16 io) runs a kernel that can
+    use the bound stabilizer: the reduced-VPU path, or the LANE_SUM kernel.
+    Mirrors their feature gates: 128-aligned KV tiles; for LANE_SUM, LANE_SUM
+    requested, no BF16_MXU split and no lazy softmax."""
+    if kv_tile % 128:
+        return False
+    if ratio * 32 == 128 and vpu_features():
+        return True  # the VPU path (it takes no BF16_MXU or lazy softmax)
+    if not lane_sum_features():
         return False
     query_tile = query_tile or default_query_tile(query_block)
-    if ratio * 32 == 128 and vpu_features():
-        return False  # any VPU feature set (even "mask" alone) disables LANE_SUM
     bf16_mxu = (
         envs.VLLM_TPU_QSA_PREFILL_BF16_MXU
         and query_tile % 16 == 0
@@ -553,6 +555,7 @@ def _kernel(
     lane_sum: tuple = (),
     bound_stab: bool = False,
     carry: bool = False,
+    grouped: bool = False,
 ):
     # DCP: a fourth scalar operand holds this rank; its KV tiles are its owned
     # page-sized blocks only (local tile t is global block t * dcp_world + rank).
@@ -587,7 +590,7 @@ def _kernel(
     )
     bf16_mass = "bf16mass" in lane_sum
     if bound_stab:
-        assert lane_sum and not lazy and not bf16_mxu
+        assert (lane_sum or vpu) and not lazy and not bf16_mxu
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
     # FP32 input window while preserving the existing FP32 QK accumulation.
@@ -686,12 +689,11 @@ def _kernel(
 
     # Larger query blocks reuse one resident KV tile across query subtiles.
     num_query_tiles = query_block // query_tile
-    # VPU path: a unit's rows are ordered (token group, query head, token)
-    # instead of (query head, token), so the selection mask of a group's tokens
-    # is one set of vregs that every query head of the group reuses. A row's
-    # arithmetic does not depend on its position: bit-identical. Not with
-    # return_lse: Mosaic cannot regroup the [rows] lse vector that way.
-    grouped = vpu and not return_lse and query_tile % VPU_ROW_GROUP == 0
+    # grouped (VPU path): a unit's rows are ordered (token group, query head,
+    # token) instead of (query head, token), so the selection mask of a group's
+    # tokens is one set of vregs that every query head of the group reuses. A
+    # row's arithmetic does not depend on its position: bit-identical. The lse
+    # leaves in unit-row order; the wrapper puts it back in (token, head) order.
     row_group = VPU_ROW_GROUP if grouped else query_tile
     groups_per_tile = query_tile // row_group
 
@@ -734,8 +736,11 @@ def _kernel(
         for query_tile_index in range(num_query_tiles):
             start = query_tile_index * query_tile
             for head in range(kv_heads):
-                rows_q = q[head, :, start : start + query_tile].reshape(
-                    query_tile * q_heads_per_kv, head_dim
+                rows_q = q[head, :, start : start + query_tile]
+                rows_q = (
+                    to_unit_rows(rows_q)
+                    if grouped
+                    else rows_q.reshape(query_tile * q_heads_per_kv, head_dim)
                 )
                 max_ref[query_tile_index, head, :] = (
                     jnp.sqrt(jnp.sum(rows_q * rows_q, axis=1)) * scale - shift
@@ -1009,6 +1014,22 @@ def _kernel(
             (groups_per_tile, q_heads_per_kv, row_group, kv_tile),
         ).reshape(rows, kv_tile)
         score = jnp.where(row_visible, score, -jnp.inf)
+        if bound_stab:
+            # The row's stabilizer was set before the walk (max_ref): no row
+            # max, no rescale.
+            prob = jnp.exp(score - m[:, None])
+            prob_sum = jnp.sum(prob, axis=1)
+            if "pv16" in vpu:
+                prob = prob.astype(jnp.bfloat16)
+            weighted = lax.dot(
+                prob,
+                value,
+                dimension_numbers=(([1], [0]), ([], [])),
+                preferred_element_type=jnp.float32,
+            )
+            mass_ref[query_tile_index, head, :] = mass + prob_sum
+            accumulator_ref[query_tile_index, head, :, :] = acc + weighted
+            return
         next_m = jnp.maximum(m, jnp.max(score, axis=1))
         finite_m = jnp.where(jnp.isneginf(next_m), 0.0, next_m)
         alpha = jnp.where(jnp.isneginf(next_m), 1.0, jnp.exp(m - next_m))
@@ -1244,9 +1265,14 @@ def _kernel(
                     lse = jnp.where(
                         mass > 0, m + jnp.log(jnp.where(mass > 0, mass, 1)), -jnp.inf
                     )
-                    heads.append(lse.reshape(q_heads_per_kv, query_tile).T)
-                lse_tiles.append(jnp.concatenate(heads, axis=1))
-            lse_ref[...] = jnp.concatenate(lse_tiles, axis=0)
+                    if grouped:
+                        lse_ref[0, query_tile_index * kv_heads + head, :] = lse
+                    else:
+                        heads.append(lse.reshape(q_heads_per_kv, query_tile).T)
+                if not grouped:
+                    lse_tiles.append(jnp.concatenate(heads, axis=1))
+            if not grouped:
+                lse_ref[...] = jnp.concatenate(lse_tiles, axis=0)
 
     def row_state(query_tile_index, head, field):
         if lane_sum and field == "mass":
@@ -1840,7 +1866,7 @@ def _block_sparse_gqa_prefill(
             ",".join(lane_sum),
             envs.VLLM_TPU_QSA_PREFILL_LANE_SUM,
         )
-    use_bound = bool(bound_stab and lane_sum and key_norm_bound is not None)
+    use_bound = bool(bound_stab and (lane_sum or vpu) and key_norm_bound is not None)
     if use_bound:
         logger.info_once(
             "QSA sparse prefill bound stabilizer on: per-layer key norm bound "
@@ -1860,6 +1886,20 @@ def _block_sparse_gqa_prefill(
     # VPU path with qkfirst: overlap each KV tile's first QK with the previous
     # tile's last unit (see _kernel's carry).
     carry = "qkfirst" in vpu and state_shape[0] * kv_heads > 1
+    # VPU path: unit rows in token-group order (see _kernel's grouped).
+    grouped = bool(vpu) and query_tile % VPU_ROW_GROUP == 0
+    num_units = state_shape[0] * kv_heads
+    lse_spec, lse_shape = (
+        (
+            pl.BlockSpec((1, num_units, state_shape[2]), lambda b, *_: (b, 0, 0)),
+            (nblocks, num_units, state_shape[2]),
+        )
+        if grouped
+        else (
+            pl.BlockSpec((query_block, query_heads), lambda b, *_: (b, 0)),
+            (tokens, query_heads),
+        )
+    )
     out_spec = pl.BlockSpec(
         (query_block, query_heads, head_dim),
         lambda b, *_: (b, 0, 0),
@@ -1892,6 +1932,7 @@ def _block_sparse_gqa_prefill(
             **({"lane_sum": lane_sum} if lane_sum else {}),
             **({"bound_stab": True} if use_bound else {}),
             **({"carry": True} if carry else {}),
+            **({"grouped": True} if grouped else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3 + int(dcp) + int(bool(vpu)) + int(use_bound),
@@ -1909,7 +1950,7 @@ def _block_sparse_gqa_prefill(
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
             out_specs=(
-                [out_spec, pl.BlockSpec((query_block, query_heads), lambda b, *_: (b, 0))]
+                [out_spec, lse_spec]
                 if return_lse
                 else out_spec
             ),
@@ -1976,7 +2017,7 @@ def _block_sparse_gqa_prefill(
         out_shape=(
             [
                 jax.ShapeDtypeStruct(query.shape, jnp.float32),
-                jax.ShapeDtypeStruct((tokens, query_heads), jnp.float32),
+                jax.ShapeDtypeStruct(lse_shape, jnp.float32),
             ]
             if return_lse
             else jax.ShapeDtypeStruct(
@@ -2009,7 +2050,24 @@ def _block_sparse_gqa_prefill(
         cache.reshape(pages * physical_page_size, head_axis, packing, head_dim),
     )
     if return_lse:
-        return output[0][:, :, :original_head_dim], output[1]
+        lse = output[1]
+        if grouped:
+            # [blocks, (subtile, KV head), (group, query head, token)] ->
+            # [tokens, (KV head, query head)].
+            q_heads_per_kv = query_heads // kv_heads
+            lse = (
+                lse.reshape(
+                    nblocks,
+                    query_block // query_tile,
+                    kv_heads,
+                    query_tile // VPU_ROW_GROUP,
+                    q_heads_per_kv,
+                    VPU_ROW_GROUP,
+                )
+                .transpose(0, 1, 3, 5, 2, 4)
+                .reshape(tokens, query_heads)
+            )
+        return output[0][:, :, :original_head_dim], lse
     return output[:, :, :original_head_dim]
 
 

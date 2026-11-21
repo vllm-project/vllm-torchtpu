@@ -365,41 +365,38 @@ def test_no_registration_when_off(monkeypatch):
 
 
 @pytest.mark.parametrize("vpu", ["1", "2", "mask"])
-def test_bound_route_off_when_kernel_cannot_use_it(interpret, monkeypatch, vpu):
-    """VLLM_TPU_QSA_PREFILL_VPU disables LANE_SUM, so the kernel cannot use the
-    bound: the wrapper then runs the flag-off call (no guard, no cond, no
-    forced lse), bit for bit, on both routes."""
+def test_vpu_path_uses_the_bound(interpret, monkeypatch, vpu):
+    """VLLM_TPU_QSA_PREFILL_VPU (no LANE_SUM) takes the bound too: both routes
+    match the online softmax within the BF16-probability tolerance, and an
+    absurd bound makes the guard re-run the online softmax bit for bit."""
     monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_VPU", vpu)
-    case = make_case(np.random.default_rng(13), CASES["single"], 24)
-    want_dcp, want_rep = attend(case, 0, 1), attend_replicated(case, 1, gated=True)
-    bsp.note_key_norm_bound(case[-1])
-    assert not bsp.bound_kernel_eligible(
+    assert bsp.bound_kernel_eligible(
         ratio=RATIO, query_block=256, query_tile=256, kv_tile=PAGE, dcp=True,
         cache_dtype=jnp.float8_e4m3fn,
     )
+    case = make_case(np.random.default_rng(13), CASES["two"], 24)
+    want_dcp, want_rep = attend(case, 0, 1), attend_replicated(case, 1, gated=True)
+    bsp.note_key_norm_bound(case[-1])
     got_dcp, got_rep = attend(case, 0, 1), attend_replicated(case, 1, gated=True)
-    for a, b in zip(got_dcp, want_dcp):
+    out_w, lse_w = (np.asarray(x) for x in want_dcp)
+    out_g, lse_g = (np.asarray(x) for x in got_dcp)
+    assert not np.array_equal(out_w, out_g)  # a different rounding, so it ran
+    np.testing.assert_array_equal(np.isfinite(lse_g), np.isfinite(lse_w))
+    fin = np.isfinite(lse_w)
+    np.testing.assert_allclose(lse_g[fin], lse_w[fin], atol=4e-3)
+    scale = np.maximum(np.abs(out_w).max(-1, keepdims=True), 1e-30)
+    assert float((np.abs(out_g - out_w) / scale).max()) < 8e-3
+    rep_w = np.asarray(want_rep[0], np.float32)
+    rep_g = np.asarray(got_rep[0], np.float32)
+    scale = np.maximum(np.abs(rep_w).max(-1, keepdims=True), 1e-30)
+    assert float((np.abs(rep_g - rep_w) / scale).max()) < 1e-2
+    bsp.note_key_norm_bound(1e4)  # every row underflows: the guard re-runs
+    rerun_dcp, rerun_rep = attend(case, 0, 1), attend_replicated(case, 1, gated=True)
+    for a, b in zip(rerun_dcp, want_dcp):
         np.testing.assert_array_equal(bits(a), bits(b))
     np.testing.assert_array_equal(
-        bits(got_rep[0].astype(jnp.float32)), bits(want_rep[0].astype(jnp.float32))
+        bits(rerun_rep[0].astype(jnp.float32)), bits(want_rep[0].astype(jnp.float32))
     )
-    query, blocks, lengths, table, cache, starts, _ = case
-
-    def traced():
-        jax.clear_caches()
-        return str(jax.make_jaxpr(
-            lambda q, c: bsp.block_sparse_gqa_attention(
-                q, jnp.zeros_like(q), blocks, lengths, table, c, starts, kv_heads=1,
-                ratio=RATIO, k_scale=K_SCALE, v_scale=V_SCALE, query_block=256,
-                kv_tile=PAGE, query_tile=256, kv_head_offset=1,
-                dcp=(jnp.asarray([0], jnp.int32), D), return_lse=True, ascending=True,
-            )[:2]
-        )(query, cache))
-
-    with_bound = traced()
-    monkeypatch.setattr(bsp, "_KEY_NORM_BOUND", None)
-    # Same program as flag off: no guard, no extra cond, no second call.
-    assert with_bound == traced()
 
 
 def test_bound_route_on_when_eligible(interpret, monkeypatch):
