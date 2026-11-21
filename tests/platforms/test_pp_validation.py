@@ -128,20 +128,22 @@ def test_rejects_kv_transfer_connectors_other_than_raiden():
         validate_pipeline_parallel_config(_config(pp=2, kv_transfer=other))
 
 
-def test_accepts_the_raiden_connector():
-    validate_pipeline_parallel_config(_config(pp=2, kv_transfer=RAIDEN))
+@pytest.mark.parametrize("name", ["TPURaidenConnector", "TPUConnector"])
+def test_accepts_the_raiden_connector(name):
+    """`TPUConnector` is an alias of `TPURaidenConnector` and is accepted
+    identically."""
+    kv_transfer = SimpleNamespace(kv_connector=name, is_kv_producer=True)
+    validate_pipeline_parallel_config(_config(pp=2, kv_transfer=kv_transfer))
 
 
 def test_accepts_the_raiden_offloading_connector():
     validate_pipeline_parallel_config(_config(pp=2, kv_transfer=OFFLOAD))
 
 
-def test_accepts_a_multi_connector_of_raiden_connectors():
+@pytest.mark.parametrize("name", ["TPURaidenConnector", "TPUConnector"])
+def test_accepts_a_multi_connector_of_raiden_connectors(name):
     validate_pipeline_parallel_config(
-        _config(
-            pp=2,
-            kv_transfer=_multi("TPURaidenConnector", "TPURaidenOffloadingConnector"),
-        )
+        _config(pp=2, kv_transfer=_multi(name, "TPURaidenOffloadingConnector"))
     )
 
 
@@ -162,15 +164,17 @@ def test_offloading_rejects_a_stage_of_linear_attention_layers_only(monkeypatch)
         )
 
 
-def test_raiden_rejects_a_stage_of_linear_attention_layers_only(monkeypatch):
+@pytest.mark.parametrize("name", ["TPURaidenConnector", "TPUConnector"])
+def test_raiden_rejects_a_stage_of_linear_attention_layers_only(monkeypatch, name):
     monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    kv_transfer = SimpleNamespace(kv_connector=name, is_kv_producer=True)
     with pytest.raises(
         NotImplementedError,
         match=r"stage 0 holds layers 0-2, linear_attention "
         r"only.*VLLM_PP_LAYER_PARTITION",
     ):
         validate_pipeline_parallel_config(
-            _config(pp=8, kv_transfer=RAIDEN, layer_types=HYBRID_24)
+            _config(pp=8, kv_transfer=kv_transfer, layer_types=HYBRID_24)
         )
 
 

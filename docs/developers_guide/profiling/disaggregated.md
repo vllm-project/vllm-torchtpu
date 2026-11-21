@@ -51,8 +51,6 @@ write traces to a mounted Persistent Volume Claim (such as
 env:
   - name: TPU_USE_RAIDEN_KV_CACHE_MANAGER
     value: "1"
-  - name: TPU_KV_RESHARD_TRANSPORT
-    value: "raiden"
   - name: TPU_RAIDEN_RESHARD_IMPL
     value: "store"
   - name: USE_PHASED_PROFILER

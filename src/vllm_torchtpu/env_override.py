@@ -69,21 +69,26 @@ os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "0"
 # turning this off loses nothing and is what lets a warm start reuse them.
 os.environ.setdefault("VLLM_USE_MEGA_AOT_ARTIFACT", "0")
 
-# Size libtpu's premapped (DMA-mapped) host buffer pool when the Raiden KV
-# transfer stack is enabled. Raiden's XlaHostMemoryAllocator deliberately
-# skips per-allocation DMA mapping on multi-process v7x workers
-# (host_memory_allocator.cc), and torch_tpu pins TPU_PREMAPPED_BUFFER_SIZE
-# to "0" when unset (discovery.cc, memoized at torch_tpu import). The
-# combination routes every KV-cache D2H/H2D through libtpu's synchronous
-# staged-copy slow path (~0.4 GB/s with per-transfer IOMMU map/unmap).
-# A sized pool restores the pinned fast path; 16 GiB per worker covers the
-# connector's host mirrors with headroom. Must run before torch_tpu is
-# imported; overridable by presetting the variable.
-if (
-    os.getenv("TPU_KV_RESHARD_TRANSPORT") == "raiden"
-    or os.getenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER") == "1"
-):
-    os.environ.setdefault("TPU_PREMAPPED_BUFFER_SIZE", str(16 << 30))
+
+def _apply_raiden_premapped_buffer_default() -> None:
+    """Size libtpu's premapped (DMA-mapped) host buffer pool for Raiden P/D.
+
+    Raiden's XlaHostMemoryAllocator deliberately skips per-allocation DMA
+    mapping on multi-process v7x workers (host_memory_allocator.cc), and
+    torch_tpu pins TPU_PREMAPPED_BUFFER_SIZE to "0" when unset (discovery.cc,
+    memoized at torch_tpu import). The combination routes every KV-cache
+    D2H/H2D through libtpu's synchronous staged-copy slow path (~0.4 GB/s
+    with per-transfer IOMMU map/unmap). A sized pool restores the pinned fast
+    path; 16 GiB per worker covers the connector's host mirrors with headroom.
+    Raiden P/D always runs with TPU_USE_RAIDEN_KV_CACHE_MANAGER enabled, so
+    key off that flag alone. Must run before torch_tpu is imported;
+    overridable by presetting TPU_PREMAPPED_BUFFER_SIZE.
+    """
+    if envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER:
+        os.environ.setdefault("TPU_PREMAPPED_BUFFER_SIZE", str(16 << 30))
+
+
+_apply_raiden_premapped_buffer_default()
 
 
 # Per-tensor-core VMEM capacity by TPU family (used to set the SC-offload

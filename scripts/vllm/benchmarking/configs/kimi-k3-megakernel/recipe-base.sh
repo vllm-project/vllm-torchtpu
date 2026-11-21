@@ -263,7 +263,6 @@ export VLLM_SERVER_DEV_MODE=1
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=10800
 export TPU_CHIPS_PER_HOST_BOUNDS="2,2,1"
 export TPU_HOST_BOUNDS="1,1,4"
-export TPU_NODE_ID="$NODE_RANK"
 export TPU_SKIP_MDS_QUERY=1
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export TPU_MOE_HIERARCHICAL_EP=1
@@ -272,11 +271,9 @@ export ONEHOT_MOE_PERMUTE_THRESHOLD=32768
 export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
 export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1
 export TPU_RAIDEN_KIMIK3_ADMISSION=1
-export TPU_KV_RESHARD_TRANSPORT=raiden
 export TPU_RAIDEN_RESHARD_IMPL=store
 export TPU_RAIDEN_TRANSFER_PARALLELISM=32
 export TPU_RAIDEN_PREFIX_AWARE_LOAD=1
-export TPU_RAIDEN_TRANSFER_NUM_SLOTS=1
 export TPU_RAIDEN_DST_SHARDS=32
 export TPU_RAIDEN_POOL_STAGING_LEASES=16
 export TPU_P2P_WAIT_PULL_TIMEOUT=900
@@ -287,7 +284,6 @@ export TPU_RAIDEN_ADVERTISE_HOST="$HEAD_IP"
 # and decode rank k the same Raiden work-unit id; the reshard coordinator then
 # makes every decode worker a sender and arms no receiver, and every transfer
 # fails ("No transfer chunks found", vllm-torchtpu-dev build 563).
-export TPU_KV_TRANSFER_NAMESPACE=k3-mk-0
 export TPU_LOG_DIR="$LOG_DIR/tpu"
 export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_LOCAL_BACKUP_TASK=0
 export NPROC=2
@@ -324,14 +320,12 @@ if [ "$_role" = prefill ]; then
   export TPU_RAIDEN_RESHARD_PORT_BASE=27340
   export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27440
   export TPU_KV_TRANSFER_PORT=29340
-  export TPU_SIDE_CHANNEL_PORT=29740
 else
   export TPU_K3_MOE_REDUCE_DTYPE=float32
   export TPU_RAIDEN_CONTROLLER_ADDRESS="$HEAD_IP:28340"
   export TPU_RAIDEN_RESHARD_PORT_BASE=28340
   export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=28440
   export TPU_KV_TRANSFER_PORT=30340
-  export TPU_SIDE_CHANNEL_PORT=30740
   # The Oct 13 and Oct 16 points with the long prefill keep the default
   # deferred Stage-3 submit.
   if [ -z "${RECIPE_SET:-}" ] || [ "$_long" = 0 ]; then

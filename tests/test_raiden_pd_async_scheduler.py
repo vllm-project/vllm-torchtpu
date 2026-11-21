@@ -38,7 +38,6 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.structured_output import StructuredOutputManager
 
-from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.core.raiden_pd import (
     _ProducerCompletion,
     patch_scheduler_init,
@@ -46,6 +45,8 @@ from vllm_torchtpu.core.raiden_pd import (
 from vllm_torchtpu.distributed import utils as dist_utils
 
 BLOCK_SIZE = 16
+
+pytestmark = pytest.mark.usefixtures("raiden_pd_env")
 
 
 @pytest.fixture(scope="module")
@@ -93,10 +94,8 @@ def test_default_entrypoint_selects_the_official_scheduler(async_scheduling, exp
 @pytest.mark.parametrize("scheduler_cls", [Scheduler, AsyncScheduler])
 @pytest.mark.parametrize("send_completion", [False, True])
 def test_init_patch_installs_producer_completion_on_real_schedulers(
-    shared_model_config, scheduler_cls, send_completion, monkeypatch
+    shared_model_config, scheduler_cls, send_completion
 ):
-    tpu_envs.__dict__.pop("TPU_KV_RESHARD_TRANSPORT", None)
-    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
     patch_scheduler_init()
 
     vllm_config = VllmConfig(
@@ -174,8 +173,6 @@ def test_init_patch_installs_producer_completion_on_real_schedulers(
 def test_decode_inline_load_with_fail_policy_initializes_without_error(
     shared_model_config, monkeypatch
 ):
-    tpu_envs.__dict__.pop("TPU_KV_RESHARD_TRANSPORT", None)
-    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
     monkeypatch.setattr(dist_utils, "get_raiden_inline_load", lambda: True)
     patch_scheduler_init()
 

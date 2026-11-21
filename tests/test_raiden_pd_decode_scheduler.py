@@ -52,6 +52,8 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 BLOCK_SIZE = 16
 
+pytestmark = pytest.mark.usefixtures("raiden_pd_env")
+
 
 class _FakeConsumerConnector(KVConnectorBase_V1, SupportsHMA):
     """Minimal consumer connector placing admissions into WAITING_FOR_REMOTE_KVS."""
