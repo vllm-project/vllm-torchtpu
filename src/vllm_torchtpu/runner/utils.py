@@ -22,7 +22,7 @@ from typing import Any
 
 import torch
 import torch.profiler
-from torch_tpu._internal.profiler import TpuProfilerConfig
+from torch.tpu.profiler import TpuProfilerConfig
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 

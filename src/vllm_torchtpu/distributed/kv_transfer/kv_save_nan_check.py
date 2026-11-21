@@ -21,7 +21,7 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 import torch
-from torch_tpu._internal.stream.streams import TpuEvent
+from torch.tpu import Event
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.sequence import IntermediateTensors
@@ -35,7 +35,7 @@ class _Chunk:
     request_indices: np.ndarray
     flags_cpu: torch.Tensor
     flags_device: torch.Tensor
-    ready_event: TpuEvent
+    ready_event: torch.Event
 
 
 def _token_nan_flags(
@@ -82,7 +82,7 @@ class KVSaveNanCheck:
     ) -> None:
         flags, hidden_shape = _token_nan_flags(hidden_states)
         flags_cpu = flags.to("cpu", non_blocking=True)
-        ready_event = TpuEvent()
+        ready_event = Event()
         ready_event.record()
 
         token_indices = plan._packed_to_request_major_token_indices

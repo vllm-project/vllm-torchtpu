@@ -21,14 +21,15 @@ from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 
-from torch_tpu._internal.stream.streams import TpuEvent
+import torch
+from torch.tpu import Event
 
 
 @dataclass
 class _PendingTiming:
     stage: str
-    start: TpuEvent
-    end: TpuEvent
+    start: torch.Event
+    end: torch.Event
     end_recorded: bool = False
 
 
@@ -56,8 +57,8 @@ class RunnerStageTiming:
                 yield
             return
 
-        start = TpuEvent(enable_timing=True)
-        end = TpuEvent(enable_timing=True)
+        start = Event(enable_timing=True)
+        end = Event(enable_timing=True)
         start.record()
         pending = _PendingTiming(stage, start, end)
         self._pending.append(pending)

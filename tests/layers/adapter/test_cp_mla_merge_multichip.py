@@ -240,7 +240,7 @@ def _check(rank, world, group, cp_mla):
         finally:
             cp_mla._merge_received = real_merge
     try:
-        from torch_tpu._internal.precision import Precision, precision
+        from torch.tpu import Precision, precision
 
         with precision(Precision.HIGHEST):
             got = _compile(merge)(o_dev, l_dev).cpu()

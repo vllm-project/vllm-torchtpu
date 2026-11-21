@@ -39,7 +39,7 @@ import os
 from typing import Any, NamedTuple
 
 import torch
-from torch_tpu._internal.profiler import TpuProfilerConfig
+from torch.tpu.profiler import TpuProfilerConfig
 from vllm_omni.profiler.omni_torch_profiler import OmniTorchProfilerWrapper
 
 from vllm_torchtpu import profiler_trace
