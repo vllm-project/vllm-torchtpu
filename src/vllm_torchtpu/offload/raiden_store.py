@@ -493,6 +493,9 @@ class _LoadStats:
     PERIOD_S = 60.0
 
     def __init__(self) -> None:
+        self._reset()
+
+    def _reset(self) -> None:
         self.pieces = self.sub_blocks = self.runs = self.capped = 0
         self.since = time.monotonic()
 
@@ -516,7 +519,7 @@ class _LoadStats:
                 self.sub_blocks / max(self.runs, 1),
                 self.capped,
             )
-        self.__init__()
+        self._reset()
 
 
 def _dma_order(
@@ -752,7 +755,8 @@ class RaidenOffloadingManager(OffloadingManager):
         # by `_max_inflight_load_runs` (0: no bound). A copy holds the core's
         # in-order queue whatever its size, so once host and HBM blocks
         # scatter, the same bytes cost many more copies and the byte bound
-        # alone lets the step wait grow.
+        # alone lets the step wait grow. A copy counts as landed with its first
+        # sub-hash: Raiden resolves a copy's sub-blocks together.
         self._max_inflight_load_runs = max_inflight_load_runs
         self._inflight_run_starts: set[bytes] = set()
         self._load_stats = _LoadStats()

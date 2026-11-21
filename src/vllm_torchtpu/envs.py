@@ -1422,7 +1422,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Raiden copies (runs of host- and HBM-consecutive sub-blocks) offload
     # loads may have in flight at once (0: no bound); each holds the device
-    # queue the step's programs wait in.
+    # queue the step's programs wait in. Applies only with the MiB bound on.
     "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_RUNS": env_int(
         "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_RUNS", 0
     ),
