@@ -30,6 +30,7 @@ import pytest
 import yaml
 
 import vllm_torchtpu.envs as envs
+from tests.layers.adapter.quantization.test_fp8_fused_ep_v3_forward import _setenv
 from tests.models.qwen3_5.test_qwen3_5_hooks import _set_moe_env
 from vllm_torchtpu.kernels.megablox import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul import util
@@ -230,15 +231,8 @@ def test_validation_legs_take_the_levers_this_tree_gives_them(monkeypatch, path)
     assert decode_ep == 8
     tp = int(_flag(decode["serve_args"], "--tensor-parallel-size", "1"))
     env = decode["env"]
-    monkeypatch.setattr(
-        envs, "USE_MOE_FUSED_EP_KERNEL", env["USE_MOE_FUSED_EP_KERNEL"] == "1"
-    )
-    monkeypatch.setattr(
-        envs, "MOE_FUSED_EP_KERNEL_IMPL", env["MOE_FUSED_EP_KERNEL_IMPL"]
-    )
-    monkeypatch.setattr(
-        envs, "TPU_MOE_SEQUENCE_PARALLEL", env["TPU_MOE_SEQUENCE_PARALLEL"] == "1"
-    )
+    _set_moe_env(monkeypatch, env)
+    _setenv(monkeypatch, "TPU_MOE_SEQUENCE_PARALLEL", env["TPU_MOE_SEQUENCE_PARALLEL"])
     monkeypatch.setattr(fused_moe_ep_v3, "_tensor_parallel_size", lambda: tp)
     assert tp > 1 and envs.MOE_FUSED_EP_KERNEL_IMPL == "v3"
     # In this tree the sequence-parallel row threshold is 0 on every layout, so

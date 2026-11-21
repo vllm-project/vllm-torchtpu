@@ -93,6 +93,9 @@ def _vllm_config(
     max_num_seqs: int = 8,
     additional: dict | None = None,
 ) -> SimpleNamespace:
+    """A Qwen3.5-397B-A17B engine config as the hook sees it; by default the
+    TP8 + DCP4 decode leg with expert parallelism the KV budget was measured
+    on."""
     text = SimpleNamespace(
         hidden_size=HIDDEN,
         moe_intermediate_size=INTER,

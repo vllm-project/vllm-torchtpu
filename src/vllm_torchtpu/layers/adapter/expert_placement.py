@@ -405,7 +405,8 @@ def _require() -> Placement:
 
 
 # The table's facts by the names the few-token MoE kernel and the MoE methods
-# ask for them; all but has_copies and placed need a table.
+# ask for them. The accessors that call _require need a table; has_copies,
+# placed, primary_experts and fetch_filter_ids answer without one.
 def has_copies() -> bool:
     """Whether the table gives the ranks copy slots after their primaries."""
     placement = current()
