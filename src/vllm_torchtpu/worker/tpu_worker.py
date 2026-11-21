@@ -963,3 +963,9 @@ class TPUWorker(WorkerBase):
         if metadata is None:
             return None
         return {_get_kv_connector_handshake_metadata_key(metadata): metadata}
+
+
+# VLLM_TPU_STARTUP_TRACE=1: Perfetto slices for the startup path (see startup_trace).
+from vllm_torchtpu import startup_trace as _startup_trace  # noqa: E402
+
+_startup_trace.install_worker(TPUWorker)

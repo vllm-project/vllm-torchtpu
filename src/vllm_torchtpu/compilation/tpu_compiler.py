@@ -182,6 +182,12 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PRECOMPILE_PEER_REPLAY",
     "TPU_PRECOMPILE_PEER_WAIT_S",
     "TPU_PRECOMPILE_TRACE_FIRST",
+    "VLLM_TPU_STARTUP_TRACE",
+    "VLLM_TPU_STARTUP_TRACE_ROLE",
+    "VLLM_TPU_STARTUP_STACKS",
+    "VLLM_TPU_STARTUP_STACKS_SPANS",
+    "VLLM_TPU_FINGERPRINT_DUMP",
+    "VLLM_TPU_FINGERPRINT_DUMP_RANKS",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would

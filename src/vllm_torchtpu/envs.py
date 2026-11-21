@@ -132,6 +132,12 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_PRECOMPILE_PEER_WAIT_S: float = 600.0
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
+    VLLM_TPU_STARTUP_TRACE: bool = False
+    VLLM_TPU_STARTUP_TRACE_ROLE: str = ""
+    VLLM_TPU_STARTUP_STACKS: float = 0.0
+    VLLM_TPU_STARTUP_STACKS_SPANS: str = "loader.load_weights"
+    VLLM_TPU_FINGERPRINT_DUMP: str = ""
+    VLLM_TPU_FINGERPRINT_DUMP_RANKS: str = "0,1"
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
@@ -984,6 +990,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # before the next group is even traced, so the groups run one after
     # another and most ranks wait. Needs TPU_PARALLEL_PRECOMPILE.
     "TPU_PRECOMPILE_TRACE_FIRST": env_bool("TPU_PRECOMPILE_TRACE_FIRST", default=False),
+    # Emit cdk.trace-format Perfetto slices around worker, runner, loader, and
+    # compiler startup methods (startup_trace.py).
+    "VLLM_TPU_STARTUP_TRACE": env_bool("VLLM_TPU_STARTUP_TRACE", default=False),
+    # Role label in pid=vllm-<role> for VLLM_TPU_STARTUP_TRACE slices.
+    "VLLM_TPU_STARTUP_TRACE_ROLE": lambda: os.getenv("VLLM_TPU_STARTUP_TRACE_ROLE", ""),
+    # Interval in seconds to dump Python thread stacks on local ranks 0 and 1
+    # during startup spans in VLLM_TPU_STARTUP_STACKS_SPANS (0 disables).
+    "VLLM_TPU_STARTUP_STACKS": env_nonnegative_float("VLLM_TPU_STARTUP_STACKS", 0.0),
+    # Comma-separated startup trace span names during which
+    # VLLM_TPU_STARTUP_STACKS dumps stacks (default: loader.load_weights).
+    "VLLM_TPU_STARTUP_STACKS_SPANS": lambda: os.getenv(
+        "VLLM_TPU_STARTUP_STACKS_SPANS", "loader.load_weights"
+    ),
+    # Directory where local ranks in VLLM_TPU_FINGERPRINT_DUMP_RANKS dump each
+    # graph's normalized code and constant digests during _graph_fingerprint.
+    "VLLM_TPU_FINGERPRINT_DUMP": lambda: os.getenv("VLLM_TPU_FINGERPRINT_DUMP", ""),
+    # Comma-separated local ranks that write VLLM_TPU_FINGERPRINT_DUMP files.
+    "VLLM_TPU_FINGERPRINT_DUMP_RANKS": lambda: os.getenv(
+        "VLLM_TPU_FINGERPRINT_DUMP_RANKS", "0,1"
+    ),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
