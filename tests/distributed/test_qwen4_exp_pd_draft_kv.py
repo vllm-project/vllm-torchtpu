@@ -267,7 +267,7 @@ def semantics(monkeypatch, flag_on, *, tp_size):
     set_flag(monkeypatch, flag_on)
     worker = object.__new__(pc.Qwen4ExpRaidenWorker)
     worker.vllm_config = NS(
-        parallel_config=NS(enable_expert_parallel=False),
+        parallel_config=NS(enable_expert_parallel=False, pipeline_parallel_size=1),
         cache_config=NS(mamba_ssm_cache_dtype="float32"),
     )
     worker.tp_rank, worker.tp_size = 0, tp_size

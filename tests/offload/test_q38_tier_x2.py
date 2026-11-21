@@ -422,7 +422,7 @@ def _manager_kwargs(monkeypatch, spec):
     monkeypatch.setattr(raiden_store, "x2_wait_registry", lambda address: 0.0)
     monkeypatch.setattr(
         "vllm_torchtpu.offload.tier_classes.TieredOffloadingManager",
-        lambda plan, managers, check=False: NS(plan=plan, managers=managers),
+        lambda plan, managers, check=False, fp4_slots=None: NS(plan=plan, managers=managers),
     )
     spec.build_tier_manager()
     return [call.kwargs for call in built.call_args_list]

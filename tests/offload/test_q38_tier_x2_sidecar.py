@@ -261,7 +261,7 @@ def test_the_spec_waits_for_the_registry_before_the_shard_stores(monkeypatch):
     monkeypatch.setattr(raiden_store, "RaidenOffloadingManager", MagicMock())
     monkeypatch.setattr(
         "vllm_torchtpu.offload.tier_classes.TieredOffloadingManager",
-        lambda plan, managers, check=False: NS(plan=plan, managers=managers),
+        lambda plan, managers, check=False, fp4_slots=None: NS(plan=plan, managers=managers),
     )
     spec.build_tier_manager()
     assert calls == [REGISTRY["global_registry_address"]]
