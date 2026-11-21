@@ -18,9 +18,12 @@
 # combo, saves results locally.
 #
 # Usage:
-#   ./scripts/vllm/benchmarking/run_benchmarks.sh [--config CONFIG_NAME] [--dry-run] [--keep-alive] [--serve-only]
+#   ./scripts/vllm/benchmarking/run_benchmarks.sh [--config CONFIG_NAME] [--mode MODE] [--results-dir DIR] [--dry-run] [--keep-alive] [--serve-only] [--skip-bench-cells] [--host HOST] [--port PORT] [--base-url URL] [--served-model-name NAME]
 #
-#   --serve-only  start the config's server and wait on it, running no benchmark
+#   --serve-only       start the config's server and wait on it, running no benchmark
+#   --skip-bench-cells start the server (if local) and write config.json without running bench cells
+#   --base-url URL     API root of a running server (cannot be combined with --host or --port)
+#   --served-model-name NAME  model name sent in requests to a running server
 #
 # Examples:
 #   ./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3-0.6b-smoke
@@ -69,18 +72,31 @@ KEEP_ALIVE=0
 SERVE_ONLY=0
 SKIP_BENCH_CELLS=0
 HOST=""
+HOST_PORT_CLI=0
 PORT="${PORT:-8000}"
 BASE_URL=""
+BASE_URL_CLI=""
+BASE_URL_CLI_SET=0
 SERVED_MODEL_NAME_CLI=""
+SERVED_MODEL_NAME_CLI_SET=0
 START_SERVER=1
+
+require_arg() {
+    if [ "$2" -lt 2 ]; then
+        echo "ERROR: $1 requires a value"
+        exit 1
+    fi
+}
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --config)
+            require_arg "$1" "$#"
             CONFIG_NAME="$2"
             shift 2
             ;;
         --results-dir)
+            require_arg "$1" "$#"
             RESULTS_DIR_OVERRIDE="$2"
             shift 2
             ;;
@@ -102,30 +118,37 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --host)
+            require_arg "$1" "$#"
             HOST="$2"
+            HOST_PORT_CLI=1
             START_SERVER=0
             shift 2
             ;;
         --mode)
+            require_arg "$1" "$#"
             BENCHMARK_MODE_CLI="$2"
             shift 2
             ;;
         # A running server by its API root (the URL without /v1), for one
         # that --host and --port cannot name: https, or a path prefix.
         --base-url)
-            BASE_URL="${2%/}"
-            BASE_URL="${BASE_URL%/v1}"
-            START_SERVER=0
+            require_arg "$1" "$#"
+            BASE_URL_CLI="$2"
+            BASE_URL_CLI_SET=1
             shift 2
             ;;
         # The name the server serves the model under, when it is not MODEL.
         # MODEL still names the tokenizer.
         --served-model-name)
+            require_arg "$1" "$#"
             SERVED_MODEL_NAME_CLI="$2"
+            SERVED_MODEL_NAME_CLI_SET=1
             shift 2
             ;;
         --port)
+            require_arg "$1" "$#"
             PORT="$2"
+            HOST_PORT_CLI=1
             shift 2
             ;;
         *)
@@ -135,6 +158,30 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [ "$BASE_URL_CLI_SET" = "1" ]; then
+    if [ -z "$BASE_URL_CLI" ]; then
+        echo "ERROR: --base-url cannot be empty"
+        exit 1
+    fi
+    if [ "$HOST_PORT_CLI" = "1" ]; then
+        echo "ERROR: --base-url cannot be combined with --host or --port"
+        exit 1
+    fi
+    BASE_URL=$(python3 "$SCRIPT_DIR/endpoint_url.py" normalize "$BASE_URL_CLI")
+    START_SERVER=0
+fi
+
+if [ "$SERVED_MODEL_NAME_CLI_SET" = "1" ]; then
+    if [ -z "$SERVED_MODEL_NAME_CLI" ]; then
+        echo "ERROR: --served-model-name cannot be empty"
+        exit 1
+    fi
+    if [ "$START_SERVER" = "1" ]; then
+        echo "ERROR: --served-model-name needs a running server (--base-url, or --host and --port)"
+        exit 1
+    fi
+fi
 
 if [ -z "$HOST" ]; then
     HOST="localhost"
@@ -227,9 +274,6 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
-if [ -n "$SERVED_MODEL_NAME_CLI" ]; then
-    SERVED_MODEL_NAME="$SERVED_MODEL_NAME_CLI"
-fi
 # Where vllm bench serve sends requests.
 if [ -n "$BASE_URL" ]; then
     BENCH_ENDPOINT_ARGS=(--base-url "$BASE_URL")

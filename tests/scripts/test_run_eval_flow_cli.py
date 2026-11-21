@@ -11,19 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for run_eval_flow.sh's flags: suites, endpoint, and served model name.
+"""Tests for endpoint_url.py, run_benchmarks.sh, and run_eval_flow.sh flags.
 
-Every client (`lm_eval`, `evalscope`, `vllm bench serve`) is a stub on PATH
-that records its argv, so the tests read the exact URL and model name each one
-was given.
-
-No test here lets the script start a server itself: that path runs
-cleanup_server.sh, which kills processes and removes lock files on the host.
+Every test runs against a hermetic copy of ``scripts/vllm/benchmarking`` under
+``tmp_path`` with fixture configs, stubbed client CLIs (``lm_eval``,
+``evalscope``, ``vllm``, ``curl``), and a stubbed ``cleanup_server.sh``. Nothing
+writes to the repository tree or kills host processes.
 """
 
+from __future__ import annotations
+
 import http.server
+import importlib.util
 import json
 import pathlib
+import shutil
 import stat
 import subprocess
 import threading
@@ -32,21 +34,66 @@ from typing import Any
 import pytest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-_RUN_EVAL_FLOW = _REPO_ROOT / "scripts" / "vllm" / "benchmarking" / "run_eval_flow.sh"
-_CONFIG = "qwen3-0.6b-structured-flat-json"
-_CONFIG_MODEL = "Qwen/Qwen3-0.6B"
+_BENCHMARKING_SRC = _REPO_ROOT / "scripts" / "vllm" / "benchmarking"
+_COPIED_FILES = (
+    "endpoint_url.py",
+    "run_eval_flow.sh",
+    "run_benchmarks.sh",
+    "upload_results.py",
+    "bq_utils.py",
+    "check_regression.py",
+    "publish_perf_dashboard.py",
+)
+
+_FIXTURE_CONFIG = "fixture-model"
+_MULTIMODAL_CONFIG = "fixture-multimodal"
+_CONFIG_MODEL = "FixtureOrg/Fixture-Model"
+_FIXTURE_CONFIG_BODY = f"""MODEL="{_CONFIG_MODEL}"
+TENSOR_PARALLELISM=1
+DATA_PARALLELISM=1
+ISL_OSL_CONFIGS="128:64"
+CONCURRENCY_OPTIONS="1"
+NUM_PROMPTS=4
+RANDOM_RANGE_RATIO=0.1
+EVAL_TOLERANCE=0.05
+"""
+
+_spec = importlib.util.spec_from_file_location(
+    "endpoint_url", _BENCHMARKING_SRC / "endpoint_url.py"
+)
+assert _spec is not None and _spec.loader is not None
+endpoint_url = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(endpoint_url)
 
 _RECORD_ARGV = """#!/bin/bash
 printf '%s\\n' "$@" >> "$STUB_LOG_DIR/$(basename "$0").args"
 """
 
-_SAFE_RM_STUB = """#!/bin/bash
-for arg in "$@"; do
-    case "$arg" in
-        /tmp/libtpu_lockfile*) exit 0 ;;
-    esac
-done
-exec /bin/rm "$@"
+_VLLM_STUB = """#!/bin/bash
+printf '%s\\n' "$@" >> "$STUB_LOG_DIR/vllm.args"
+if [ "${1:-}" = "serve" ]; then
+    echo "$$" > "$STUB_LOG_DIR/vllm_serve.pid"
+    touch "$STUB_LOG_DIR/server.ready"
+    sleep 30
+fi
+"""
+
+_CURL_STUB = """#!/bin/bash
+case "$*" in
+    */health*)
+        [ -f "$STUB_LOG_DIR/server.ready" ] && exit 0
+        exit 7
+        ;;
+esac
+exit 1
+"""
+
+_CLEANUP_STUB = """#!/bin/bash
+echo "cleanup" >> "$STUB_LOG_DIR/cleanup_server.args"
+if [ -f "$STUB_LOG_DIR/vllm_serve.pid" ]; then
+    kill "$(cat "$STUB_LOG_DIR/vllm_serve.pid")" 2>/dev/null || true
+    rm -f "$STUB_LOG_DIR/vllm_serve.pid" "$STUB_LOG_DIR/server.ready"
+fi
 """
 
 # evalscope must leave a report behind, or the flow fails the suite.
@@ -64,11 +111,18 @@ echo '{"score": 0.5, "num": 4}' > "$work_dir/reports/stub/mmmu_pro.json"
 
 
 class _Gateway:
-    """Lists `model_ids` at `<prefix>/v1/models` and nothing anywhere else."""
+    """Lists ``model_ids`` at ``<prefix>/v1/models`` with optional bearer auth."""
 
-    def __init__(self, prefix: str, model_ids: list[str]):
+    def __init__(
+        self,
+        prefix: str,
+        model_ids: list[str],
+        required_api_key: str | None = None,
+    ):
         self.prefix = prefix
         self.model_ids = model_ids
+        self.required_api_key = required_api_key
+        self.seen_auth_headers: list[str | None] = []
         gateway = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -84,6 +138,14 @@ class _Gateway:
                 self.wfile.write(body)
 
             def do_GET(self) -> None:
+                auth = self.headers.get("Authorization")
+                gateway.seen_auth_headers.append(auth)
+                if (
+                    gateway.required_api_key is not None
+                    and auth != f"Bearer {gateway.required_api_key}"
+                ):
+                    self._reply(401, {"error": "unauthorized"})
+                    return
                 if self.path == f"{gateway.prefix}/v1/models":
                     ids = [{"id": model_id} for model_id in gateway.model_ids]
                     self._reply(200, {"data": ids})
@@ -104,8 +166,12 @@ class _Gateway:
 def make_gateway():
     gateways = []
 
-    def _make(prefix: str, model_ids: list[str]) -> _Gateway:
-        gateways.append(_Gateway(prefix, model_ids))
+    def _make(
+        prefix: str,
+        model_ids: list[str],
+        required_api_key: str | None = None,
+    ) -> _Gateway:
+        gateways.append(_Gateway(prefix, model_ids, required_api_key=required_api_key))
         return gateways[-1]
 
     yield _make
@@ -114,46 +180,82 @@ def make_gateway():
 
 
 class _Flow:
-    """Runs run_eval_flow.sh with stub clients and reads back their argv."""
+    """Runs scripts in a hermetic copy of ``scripts/vllm/benchmarking``."""
 
     def __init__(self, tmp_path: pathlib.Path):
         self._tmp_path = tmp_path
+        self._repo = tmp_path / "repo"
+        self._bench_dir = self._repo / "scripts" / "vllm" / "benchmarking"
+        self._configs_dir = self._bench_dir / "configs"
+        self._configs_dir.mkdir(parents=True)
+        (self._bench_dir / "baselines" / "eval").mkdir(parents=True)
+        (self._bench_dir / "baselines" / "perf").mkdir(parents=True)
+        shutil.copytree(
+            _BENCHMARKING_SRC / "lm_eval_tasks",
+            self._bench_dir / "lm_eval_tasks",
+        )
+        for name in _COPIED_FILES:
+            shutil.copy2(_BENCHMARKING_SRC / name, self._bench_dir / name)
+
+        cleanup_script = self._bench_dir / "cleanup_server.sh"
+        cleanup_script.write_text(_CLEANUP_STUB)
+        cleanup_script.chmod(cleanup_script.stat().st_mode | stat.S_IXUSR)
+
+        self.write_config(_FIXTURE_CONFIG, _FIXTURE_CONFIG_BODY)
+        self.write_config(_MULTIMODAL_CONFIG, _FIXTURE_CONFIG_BODY)
+
         self._stub_logs = tmp_path / "stub_logs"
         self._stub_logs.mkdir()
         self._bin = tmp_path / "bin"
         self._bin.mkdir()
         for name, body in (
             ("lm_eval", _RECORD_ARGV),
-            ("vllm", _RECORD_ARGV),
+            ("vllm", _VLLM_STUB),
+            ("curl", _CURL_STUB),
             ("evalscope", _EVALSCOPE_STUB),
-            ("pkill", _RECORD_ARGV),
-            ("lsof", _RECORD_ARGV),
-            ("fuser", _RECORD_ARGV),
-            ("sleep", _RECORD_ARGV),
-            ("rm", _SAFE_RM_STUB),
         ):
             stub = self._bin / name
             stub.write_text(body)
             stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
-        # run_benchmarks.sh only checks that the vllm package can be found.
+
+        # run_benchmarks.sh checks that the vllm package can be found.
         self._site = tmp_path / "site"
         (self._site / "vllm").mkdir(parents=True)
         (self._site / "vllm" / "__init__.py").write_text("")
 
+    def write_config(self, name: str, body: str) -> str:
+        (self._configs_dir / f"{name}.sh").write_text(body)
+        return name
+
+    def _base_env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        return {
+            "PYTHONPATH": str(self._site),
+            "PATH": f"{self._bin}:/usr/bin:/bin",
+            "STUB_LOG_DIR": str(self._stub_logs),
+            "LM_EVAL_REQUEST_CACHE_ROOT": str(self._tmp_path / "cache"),
+            **(extra or {}),
+        }
+
     def run(
-        self, *args: str, env: dict[str, str] | None = None, config: str = _CONFIG
-    ) -> subprocess.CompletedProcess:
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+        config: str = _FIXTURE_CONFIG,
+    ) -> subprocess.CompletedProcess[str]:
         proc = self.run_unchecked(*args, env=env, config=config)
         assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
         return proc
 
     def run_unchecked(
-        self, *args: str, env: dict[str, str] | None = None, config: str = _CONFIG
-    ) -> subprocess.CompletedProcess:
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+        config: str = _FIXTURE_CONFIG,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 "bash",
-                str(_RUN_EVAL_FLOW),
+                str(self._bench_dir / "run_eval_flow.sh"),
                 "--config",
                 config,
                 "--results-dir",
@@ -162,36 +264,177 @@ class _Flow:
                 "--skip-perf-check",
                 *args,
             ],
-            cwd=str(_REPO_ROOT),
-            env={
-                "PYTHONPATH": str(self._site),
-                "PATH": f"{self._bin}:/usr/bin:/bin",
-                "STUB_LOG_DIR": str(self._stub_logs),
-                "LM_EVAL_REQUEST_CACHE_ROOT": str(self._tmp_path / "cache"),
-                **(env or {}),
-            },
+            cwd=str(self._repo),
+            env=self._base_env(env),
+            capture_output=True,
+            text=True,
+        )
+
+    def run_benchmarks(
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+        config: str = _FIXTURE_CONFIG,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "bash",
+                str(self._bench_dir / "run_benchmarks.sh"),
+                "--config",
+                config,
+                "--results-dir",
+                str(self._tmp_path / "bench_results"),
+                *args,
+            ],
+            cwd=str(self._repo),
+            env=self._base_env(env),
             capture_output=True,
             text=True,
         )
 
     def argv(self, client: str) -> list[str]:
-        """The arguments of every call to `client`, or [] if it never ran."""
+        """The arguments of every call to ``client``, or [] if it never ran."""
         log = self._stub_logs / f"{client}.args"
         return log.read_text().splitlines() if log.exists() else []
 
     def values(self, client: str, flag: str) -> list[str]:
-        """Each value `client` was given for `flag`, in call order."""
+        """Each value ``client`` was given for ``flag``, in call order."""
         argv = self.argv(client)
         return [argv[i + 1] for i, arg in enumerate(argv) if arg == flag]
 
     def option(self, client: str, flag: str) -> set[str]:
-        """Every distinct value `client` was given for `flag`, over all calls."""
+        """Every distinct value ``client`` was given for ``flag``, over all calls."""
         return set(self.values(client, flag))
 
 
 @pytest.fixture
 def flow(tmp_path):
     return _Flow(tmp_path)
+
+
+# --- Shared endpoint URL helper tests ---
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("gw.example.com", "http://gw.example.com:8000"),
+        ("gw.example.com/prefix", "http://gw.example.com:8000/prefix"),
+        ("gw.example.com:9000/v1", "http://gw.example.com:9000"),
+        ("v1", "http://v1:8000"),
+        ("http://v1", "http://v1"),
+        ("http://v1/v1", "http://v1"),
+        ("http://v1/v1/", "http://v1"),
+        ("http://gw.example.com", "http://gw.example.com"),
+        ("https://gw.example.com", "https://gw.example.com"),
+        ("https://gw.example.com:8443/prefix/", "https://gw.example.com:8443/prefix"),
+        ("https://gw.example.com/prefix/v1/", "https://gw.example.com/prefix"),
+        ("http://[::1]:8000", "http://[::1]:8000"),
+        ("[::1]", "http://[::1]:8000"),
+    ],
+)
+def test_normalize_base_url_valid(raw, expected):
+    assert endpoint_url.normalize_base_url(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "   ",
+        "ftp://gw.example.com",
+        "http://",
+        "http://gw.example.com/v1?key=1",
+        "http://gw.example.com#frag",
+        "http://gw.example.com:notaport",
+        "http://user:secret@gw.example.com",
+        "http://gw.example.com /bad",
+        "http://gw.example.com/v1/chat/completions",
+        "https://gw.example.com/prefix/v1/chat/completions",
+        "http://gw.example.com/v1/models",
+        "http://gw.example.com/v1/v1",
+    ],
+)
+def test_normalize_base_url_rejects_invalid_and_route_urls(raw):
+    with pytest.raises(ValueError, match="Invalid --base-url"):
+        endpoint_url.normalize_base_url(raw)
+
+
+def test_discover_served_model_sends_bearer_token(make_gateway):
+    gateway = make_gateway("/gw", ["authed-model"], required_api_key="secret-token")
+
+    assert endpoint_url.discover_served_model(gateway.url) is None
+    assert (
+        endpoint_url.discover_served_model(gateway.url, api_key="secret-token")
+        == "authed-model"
+    )
+    assert gateway.seen_auth_headers == [None, "Bearer secret-token"]
+
+
+# --- Direct run_benchmarks.sh validation tests ---
+
+
+def test_run_benchmarks_normalizes_base_url_and_keeps_v1_host(flow):
+    proc = flow.run_benchmarks("--base-url", "http://v1/v1/")
+
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert flow.option("vllm", "--base-url") == {"http://v1"}
+    assert flow.option("vllm", "--host") == set()
+    assert flow.option("vllm", "--port") == set()
+
+
+@pytest.mark.parametrize(
+    ("args", "expected_stream", "expected_text"),
+    [
+        (
+            ["--base-url", "http://user:pw@gw.example.com"],
+            "stderr",
+            "Invalid --base-url",
+        ),
+        (
+            ["--base-url", "http://gw.example.com/v1/chat/completions"],
+            "stderr",
+            "Invalid --base-url",
+        ),
+        (
+            ["--base-url", ""],
+            "stdout",
+            "ERROR: --base-url cannot be empty",
+        ),
+        (
+            ["--base-url", "http://gw.example.com", "--host", "gw.example.com"],
+            "stdout",
+            "ERROR: --base-url cannot be combined with --host or --port",
+        ),
+        (
+            ["--base-url", "http://gw.example.com", "--port", "9000"],
+            "stdout",
+            "ERROR: --base-url cannot be combined with --host or --port",
+        ),
+        (
+            ["--served-model-name", "other-model"],
+            "stdout",
+            "ERROR: --served-model-name needs a running server",
+        ),
+        (
+            ["--host", "gw.example.com", "--served-model-name", ""],
+            "stdout",
+            "ERROR: --served-model-name cannot be empty",
+        ),
+    ],
+)
+def test_run_benchmarks_rejects_bad_endpoint_flags(
+    flow, args, expected_stream, expected_text
+):
+    proc = flow.run_benchmarks(*args)
+
+    assert proc.returncode == 1
+    output = proc.stderr if expected_stream == "stderr" else proc.stdout
+    assert expected_text in output
+    assert flow.argv("vllm") == []
+
+
+# --- run_eval_flow.sh endpoint, auth, and served-model tests ---
 
 
 def test_base_url_path_prefix_and_served_model_reach_every_client(flow, make_gateway):
@@ -211,43 +454,72 @@ def test_base_url_path_prefix_and_served_model_reach_every_client(flow, make_gat
         f"model=router-served-name,base_url={chat_url},num_concurrent=128"
     }
     assert flow.option("evalscope", "--api-url") == {chat_url}
+    assert flow.option("evalscope", "--api-key") == {"EMPTY"}
     assert flow.option("evalscope", "--model") == {"router-served-name"}
     assert flow.option("vllm", "--base-url") == {f"http://127.0.0.1:{gateway.port}/gw"}
     assert flow.option("vllm", "--served-model-name") == {"router-served-name"}
-    # The tokenizer still comes from the config's model.
     assert flow.option("vllm", "--model") == {_CONFIG_MODEL}
     assert flow.option("vllm", "--host") == set()
     assert flow.option("vllm", "--port") == set()
+    assert flow.argv("cleanup_server") == []
 
 
-@pytest.mark.parametrize(
-    ("args", "env"),
-    [
-        pytest.param(["--served-model-name", "my-served"], {}, id="flag"),
-        pytest.param([], {"SERVED_MODEL_NAME": "my-served"}, id="env"),
-        pytest.param(
-            ["--served-model-name", "my-served"],
-            {"SERVED_MODEL_NAME": "from-env"},
-            id="flag_beats_env",
-        ),
-    ],
-)
-def test_https_base_url_and_explicit_served_model(flow, args, env):
-    # No server is listening: an explicit name must not need /v1/models.
+def test_openai_api_key_reaches_models_lookup_and_evalscope(flow, make_gateway):
+    gateway = make_gateway("/gw", ["authed-served-name"], required_api_key="gw-key-123")
+
+    flow.run(
+        "--base-url",
+        gateway.url,
+        "--eval-suites",
+        "mmmu_pro",
+        "--perf-suites",
+        "none",
+        env={"OPENAI_API_KEY": "gw-key-123"},
+    )
+
+    assert gateway.seen_auth_headers == ["Bearer gw-key-123"]
+    assert flow.option("evalscope", "--model") == {"authed-served-name"}
+    assert flow.option("evalscope", "--api-key") == {"gw-key-123"}
+
+
+def test_https_base_url_explicit_served_model_and_no_env_fallback(flow):
+    # No server is listening: --served-model-name skips /v1/models, and
+    # SERVED_MODEL_NAME in the environment is ignored.
     flow.run(
         "--base-url",
         "https://gw.example.com/prefix/v1/",
+        "--served-model-name",
+        "my-served",
         "--eval-suites",
         "mmlu_pro",
         "--perf-suites",
         "none",
-        *args,
-        env=env,
+        env={"SERVED_MODEL_NAME": "from-env"},
     )
 
     assert flow.option("lm_eval", "--model_args") == {
         "model=my-served,"
         "base_url=https://gw.example.com/prefix/v1/chat/completions,"
+        "num_concurrent=128"
+    }
+
+
+def test_served_model_name_env_is_ignored_without_cli_flag(flow, make_gateway):
+    gateway = make_gateway("", ["router-served-name"])
+
+    flow.run(
+        "--base-url",
+        gateway.url,
+        "--eval-suites",
+        "mmlu_pro",
+        "--perf-suites",
+        "none",
+        env={"SERVED_MODEL_NAME": "ignored-env-name"},
+    )
+
+    assert flow.option("lm_eval", "--model_args") == {
+        f"model=router-served-name,"
+        f"base_url={gateway.url}/v1/chat/completions,"
         "num_concurrent=128"
     }
 
@@ -303,7 +575,6 @@ def test_host_and_port_keep_config_model_and_host_port_flags(flow, make_gateway)
         "mmlu_pro,mmmu_pro",
         "--perf-suites",
         "bench_serve",
-        env={"SERVED_MODEL_NAME": "ignored-without-base-url"},
     )
 
     chat_url = f"http://127.0.0.1:{gateway.port}/v1/chat/completions"
@@ -317,86 +588,6 @@ def test_host_and_port_keep_config_model_and_host_port_flags(flow, make_gateway)
     assert flow.option("vllm", "--model") == {_CONFIG_MODEL}
     assert flow.option("vllm", "--base-url") == set()
     assert flow.option("vllm", "--served-model-name") == set()
-
-
-@pytest.mark.parametrize(
-    ("base_url", "expected"),
-    [
-        ("gw.example.com", "http://gw.example.com:8000"),
-        ("gw.example.com/prefix", "http://gw.example.com:8000/prefix"),
-        ("gw.example.com:9000/v1", "http://gw.example.com:9000"),
-        ("http://gw.example.com", "http://gw.example.com"),
-        ("https://gw.example.com", "https://gw.example.com"),
-        ("https://gw.example.com:8443/prefix/", "https://gw.example.com:8443/prefix"),
-        ("http://[::1]:8000", "http://[::1]:8000"),
-    ],
-)
-def test_base_url_forms(flow, base_url, expected):
-    flow.run(
-        "--base-url",
-        base_url,
-        "--served-model-name",
-        "my-served",
-        "--eval-suites",
-        "mmlu_pro",
-        "--perf-suites",
-        "none",
-    )
-
-    assert flow.option("lm_eval", "--model_args") == {
-        f"model=my-served,base_url={expected}/v1/chat/completions,num_concurrent=128"
-    }
-
-
-@pytest.mark.parametrize(
-    "base_url",
-    [
-        "ftp://gw.example.com",
-        "http://",
-        "http://gw.example.com/v1?key=1",
-        "http://gw.example.com:notaport",
-        "http://user:secret@gw.example.com",
-    ],
-)
-def test_invalid_base_url_fails_before_any_client_runs(flow, base_url):
-    proc = flow.run_unchecked(
-        "--base-url", base_url, "--eval-suites", "mmlu_pro", "--perf-suites", "none"
-    )
-
-    assert proc.returncode == 1
-    assert f"Invalid --base-url: {base_url}" in proc.stderr
-    assert "Running benchmarks" not in proc.stdout
-
-
-@pytest.mark.parametrize(
-    ("args", "message"),
-    [
-        pytest.param(
-            ["--base-url", "http://gw.example.com", "--host", "gw.example.com"],
-            "ERROR: --base-url cannot be combined with --host or --port",
-            id="base_url_with_host",
-        ),
-        pytest.param(
-            ["--base-url", "http://gw.example.com", "--port", "9000"],
-            "ERROR: --base-url cannot be combined with --host or --port",
-            id="base_url_with_port",
-        ),
-        pytest.param(
-            ["--served-model-name", "my-served"],
-            "ERROR: --served-model-name needs a running server "
-            "(--base-url, or --host and --port)",
-            id="served_model_name_with_self_started_server",
-        ),
-    ],
-)
-def test_conflicting_flags_fail_before_any_client_runs(flow, args, message):
-    proc = flow.run_unchecked(
-        *args, "--eval-suites", "mmlu_pro", "--perf-suites", "none"
-    )
-
-    assert proc.returncode == 1
-    assert message in proc.stdout
-    assert "Running benchmarks" not in proc.stdout
 
 
 def test_served_model_name_flag_applies_with_host(flow):
@@ -418,20 +609,121 @@ def test_served_model_name_flag_applies_with_host(flow):
     }
 
 
+@pytest.mark.parametrize(
+    ("args", "expected_stream", "message"),
+    [
+        pytest.param(
+            ["--base-url", ""],
+            "stdout",
+            "ERROR: --base-url cannot be empty",
+            id="empty_base_url",
+        ),
+        pytest.param(
+            ["--host", "gw.example.com", "--served-model-name", ""],
+            "stdout",
+            "ERROR: --served-model-name cannot be empty",
+            id="empty_served_model_name",
+        ),
+        pytest.param(
+            ["--host", "gw.example.com", "--eval-suites", ""],
+            "stdout",
+            "ERROR: --eval-suites cannot be empty",
+            id="empty_eval_suites",
+        ),
+        pytest.param(
+            ["--host", "gw.example.com", "--perf-suites", ""],
+            "stdout",
+            "ERROR: --perf-suites cannot be empty",
+            id="empty_perf_suites",
+        ),
+        pytest.param(
+            ["--host", "gw.example.com", "--eval-suites", ","],
+            "stdout",
+            "ERROR: Empty item in --eval-suites",
+            id="comma_only_eval_suites",
+        ),
+        pytest.param(
+            ["--base-url", "http://gw.example.com/v1/chat/completions"],
+            "stderr",
+            "Invalid --base-url",
+            id="route_in_base_url",
+        ),
+        pytest.param(
+            ["--base-url", "http://gw.example.com", "--host", "gw.example.com"],
+            "stdout",
+            "ERROR: --base-url cannot be combined with --host or --port",
+            id="base_url_with_host",
+        ),
+        pytest.param(
+            ["--base-url", "http://gw.example.com", "--port", "9000"],
+            "stdout",
+            "ERROR: --base-url cannot be combined with --host or --port",
+            id="base_url_with_port",
+        ),
+        pytest.param(
+            ["--served-model-name", "my-served"],
+            "stdout",
+            "ERROR: --served-model-name needs a running server",
+            id="served_model_name_with_self_started_server",
+        ),
+    ],
+)
+def test_invalid_or_conflicting_flags_fail_without_running_cleanup(
+    flow, args, expected_stream, message
+):
+    proc = flow.run_unchecked(*args)
+
+    assert proc.returncode == 1
+    output = proc.stderr if expected_stream == "stderr" else proc.stdout
+    assert message in output
+    assert "Running benchmarks" not in proc.stdout
+    assert flow.argv("cleanup_server") == []
+
+
+# --- Suite selection, single-table `all`, and precedence tests ---
+
+
 def test_eval_suites_run_in_the_order_given(flow):
     flow.run("--host", "gw.example.com", "--eval-suites", "gsm8k, mmlu_pro")
 
     assert flow.values("lm_eval", "--tasks") == ["gsm8k", "mmlu_pro"]
-    # No --perf-suites: the benchmark still runs, as it did before the flag.
     assert flow.option("vllm", "--host") == {"gw.example.com"}
 
 
-def test_eval_suites_all_runs_every_suite_with_a_runner(flow):
+def test_eval_suites_all_covers_text_suites_and_only_adds_mmmu_for_multimodal(flow):
     flow.run(
-        "--host", "gw.example.com", "--eval-suites", "all", "--perf-suites", "none"
+        "--host",
+        "gw.example.com",
+        "--eval-suites",
+        "all",
+        "--perf-suites",
+        "none",
+        config=_FIXTURE_CONFIG,
     )
 
     assert flow.values("lm_eval", "--tasks") == [
+        "mmlu_llama",
+        "mmlu_pro",
+        "gsm8k",
+        "humaneval_plus_tpu",
+        "mbpp_plus_tpu",
+    ]
+    assert flow.argv("evalscope") == []
+
+
+def test_eval_suites_all_includes_mmmu_pro_for_multimodal_config(flow):
+    flow.run(
+        "--host",
+        "gw.example.com",
+        "--eval-suites",
+        "all",
+        "--perf-suites",
+        "none",
+        config=_MULTIMODAL_CONFIG,
+    )
+
+    assert flow.values("lm_eval", "--tasks") == [
+        "mmlu_llama",
         "mmlu_pro",
         "gsm8k",
         "humaneval_plus_tpu",
@@ -440,10 +732,22 @@ def test_eval_suites_all_runs_every_suite_with_a_runner(flow):
     assert flow.values("evalscope", "--datasets") == ["mmmu_pro"]
 
 
-def test_run_lm_eval_flag_still_runs_the_config_task_list(flow):
-    flow.run("--host", "gw.example.com", "--run-lm-eval", "--perf-suites", "none")
+def test_run_lm_eval_flag_runs_config_task_list_including_custom_tasks(flow):
+    config = flow.write_config(
+        "custom-lm-eval",
+        _FIXTURE_CONFIG_BODY + 'LM_EVAL_TASKS="mmlu_pro arc_easy"\n',
+    )
 
-    assert flow.values("lm_eval", "--tasks") == ["mmlu_llama", "mmlu_pro"]
+    flow.run(
+        "--host",
+        "gw.example.com",
+        "--run-lm-eval",
+        "--perf-suites",
+        "none",
+        config=config,
+    )
+
+    assert flow.values("lm_eval", "--tasks") == ["mmlu_pro", "arc_easy"]
     assert flow.argv("vllm") == []
 
 
@@ -454,7 +758,6 @@ def test_run_lm_eval_flag_still_runs_the_config_task_list(flow):
             ["--eval-suites", "mmlu_pro,nope"],
             "ERROR: Unknown --eval-suites item 'nope'",
         ),
-        # Names this script does not run yet.
         (
             ["--eval-suites", "gpqa_diamond"],
             "ERROR: Unknown --eval-suites item 'gpqa_diamond'",
@@ -474,76 +777,176 @@ def test_run_lm_eval_flag_still_runs_the_config_task_list(flow):
         (
             ["--perf-suites", "nope"],
             "ERROR: Unknown --perf-suites item 'nope' "
-            "(expected bench_serve, agentx, all, or none)",
+            "(expected bench_serve, all, or none)",
         ),
     ],
 )
-def test_unknown_suite_fails_before_any_client_runs(flow, args, message):
-    proc = flow.run_unchecked("--host", "gw.example.com", *args)
+def test_unknown_suite_fails_before_any_client_or_cleanup_runs(flow, args, message):
+    proc = flow.run_unchecked(*args)
 
     assert proc.returncode == 1
     assert message in proc.stdout
     assert "Running benchmarks" not in proc.stdout
+    assert flow.argv("cleanup_server") == []
 
 
-def test_agentx_suite_requires_physical_chip_count(flow):
-    # A 1P1D config, loaded client-only: sourcing it must not need a role.
-    proc = flow.run_unchecked(
-        "--base-url",
-        "http://gw.example.com",
+def test_config_suite_defaults_apply_and_env_does_not_leak(flow):
+    config = flow.write_config(
+        "config-defaults",
+        _FIXTURE_CONFIG_BODY + 'EVAL_SUITES="gsm8k"\nPERF_SUITES="none"\n',
+    )
+
+    flow.run(
+        "--host",
+        "gw.example.com",
+        config=config,
+        env={"EVAL_SUITES": "mmlu_pro", "PERF_SUITES": "bench_serve"},
+    )
+
+    assert flow.values("lm_eval", "--tasks") == ["gsm8k"]
+    assert flow.argv("vllm") == []
+
+
+def test_env_suite_vars_are_ignored_when_config_sets_none(flow):
+    flow.run(
+        "--host",
+        "gw.example.com",
+        env={"EVAL_SUITES": "gsm8k", "PERF_SUITES": "none"},
+    )
+
+    assert flow.argv("lm_eval") == []
+    assert flow.option("vllm", "--host") == {"gw.example.com"}
+
+
+def test_skip_benchmark_removes_bench_serve_from_config_perf_suites(flow):
+    config = flow.write_config(
+        "perf-default-bench",
+        _FIXTURE_CONFIG_BODY + 'PERF_SUITES="bench_serve"\n',
+    )
+
+    flow.run("--host", "gw.example.com", "--skip-benchmark", config=config)
+
+    assert flow.argv("vllm") == []
+
+
+def test_explicit_perf_suites_cli_overrides_skip_benchmark_and_config(flow):
+    config = flow.write_config(
+        "perf-default-none",
+        _FIXTURE_CONFIG_BODY + 'PERF_SUITES="none"\n',
+    )
+
+    flow.run(
+        "--host",
+        "gw.example.com",
+        "--skip-benchmark",
         "--perf-suites",
-        "agentx",
-        "--eval-suites",
-        "none",
-        config="kimi-k3-tp8-dp4-ep-agentx",
+        "bench_serve",
+        config=config,
     )
 
-    assert proc.returncode == 1
-    assert "agentx suite requires AGENTX_CHIPS=<physical_chips>" in proc.stdout
-    assert "Running benchmarks" not in proc.stdout
+    assert flow.option("vllm", "--host") == {"gw.example.com"}
 
 
-@pytest.fixture
-def config_with_custom_lm_eval_task():
-    """A config whose LM_EVAL_TASKS names a task --eval-suites does not list."""
-    configs_dir = _RUN_EVAL_FLOW.parent / "configs"
-    name = "tmp-test-run-eval-flow-cli-custom-task"
-    config = configs_dir / f"{name}.sh"
-    config.write_text(
-        (configs_dir / f"{_CONFIG}.sh").read_text()
-        + '\nLM_EVAL_TASKS="mmlu_pro arc_easy"\n'
+def test_legacy_eval_flag_overrides_config_eval_suites(flow):
+    config = flow.write_config(
+        "eval-default-gsm8k",
+        _FIXTURE_CONFIG_BODY + 'EVAL_SUITES="gsm8k"\nLM_EVAL_TASKS="mmlu_pro"\n',
     )
-    try:
-        yield name
-    finally:
-        config.unlink()
 
-
-def test_run_lm_eval_runs_config_tasks_the_suite_list_does_not_name(
-    flow, config_with_custom_lm_eval_task
-):
     flow.run(
         "--host",
         "gw.example.com",
         "--run-lm-eval",
         "--perf-suites",
         "none",
-        config=config_with_custom_lm_eval_task,
+        config=config,
     )
 
-    assert flow.values("lm_eval", "--tasks") == ["mmlu_pro", "arc_easy"]
+    assert flow.values("lm_eval", "--tasks") == ["mmlu_pro"]
 
 
-def test_skip_benchmark_without_host_keeps_legacy_dry_run_behavior(flow):
+def test_explicit_eval_suites_cli_overrides_legacy_flag_and_config(flow):
+    config = flow.write_config(
+        "eval-override-all",
+        _FIXTURE_CONFIG_BODY + 'EVAL_SUITES="gsm8k"\nLM_EVAL_TASKS="mmlu_llama"\n',
+    )
+
+    flow.run(
+        "--host",
+        "gw.example.com",
+        "--run-lm-eval",
+        "--eval-suites",
+        "mmlu_pro",
+        "--perf-suites",
+        "none",
+        config=config,
+    )
+
+    assert flow.values("lm_eval", "--tasks") == ["mmlu_pro"]
+
+
+def test_config_echoing_stdout_does_not_break_default_reading(flow):
+    config = flow.write_config(
+        "chatty-config",
+        'echo "loading fixture config"\n'
+        + _FIXTURE_CONFIG_BODY
+        + 'EVAL_SUITES="gsm8k"\n',
+    )
+
+    flow.run("--host", "gw.example.com", "--perf-suites", "none", config=config)
+
+    assert flow.values("lm_eval", "--tasks") == ["gsm8k"]
+
+
+def test_failed_config_source_exits_with_error_and_no_cleanup(flow):
+    config = flow.write_config("broken-config", "false\n")
+
+    proc = flow.run_unchecked("--perf-suites", "none", config=config)
+
+    assert proc.returncode == 1
+    assert "Failed to read config defaults" in proc.stderr
+    assert "Running benchmarks" not in proc.stdout
+    assert flow.argv("cleanup_server") == []
+
+
+# --- Server boot, cleanup, and --skip-bench-cells lifecycle tests ---
+
+
+def test_skip_benchmark_without_host_does_not_kill_running_server(flow):
     proc = flow.run("--skip-benchmark", "--run-lm-eval")
 
-    assert "[DRY RUN] Skipping server launch" in proc.stdout
+    assert "*** DRY RUN MODE" in proc.stdout
+    assert "Starting vLLM server" not in proc.stdout
+    assert flow.argv("cleanup_server") == []
     assert flow.argv("vllm") == []
     assert flow.option("lm_eval", "--model_args") == {
         f"model={_CONFIG_MODEL},"
         "base_url=http://localhost:8000/v1/chat/completions,"
         "num_concurrent=128"
     }
+
+
+def test_no_suites_selected_runs_dry_run_without_server_or_cleanup(flow):
+    proc = flow.run("--perf-suites", "none", "--eval-suites", "none")
+
+    assert "*** DRY RUN MODE" in proc.stdout
+    assert "Starting vLLM server" not in proc.stdout
+    assert flow.argv("cleanup_server") == []
+    assert flow.argv("vllm") == []
+    assert flow.argv("lm_eval") == []
+    assert flow.argv("evalscope") == []
+
+
+def test_eval_only_local_boot_uses_skip_bench_cells_and_runs_cleanup(flow):
+    proc = flow.run("--perf-suites", "none", "--eval-suites", "mmlu_pro")
+
+    assert "Skipping vllm bench serve cells (--skip-bench-cells)." in proc.stdout
+    vllm_argv = flow.argv("vllm")
+    assert vllm_argv[:2] == ["serve", _CONFIG_MODEL]
+    assert "bench" not in vllm_argv
+    assert flow.values("lm_eval", "--tasks") == ["mmlu_pro"]
+    # Initial cleanup before booting + EXIT trap cleanup on finish.
+    assert flow.argv("cleanup_server") == ["cleanup", "cleanup"]
 
 
 def test_gsm8k_uses_plain_chat_gen_kwargs_without_continue_final_message(flow):
@@ -562,22 +965,4 @@ def test_gsm8k_uses_plain_chat_gen_kwargs_without_continue_final_message(flow):
         '{"continue_final_message": true, "add_generation_prompt": false, '
         '"chat_template_kwargs": {"enable_thinking": false}}',
     ]
-    # Only mmlu_llama passed --fewshot_as_multiturn true (once across the 2 calls).
     assert flow.values("lm_eval", "--fewshot_as_multiturn") == ["true"]
-
-
-def test_failed_config_source_exits_with_error(flow):
-    configs_dir = _RUN_EVAL_FLOW.parent / "configs"
-    name = "tmp-test-run-eval-flow-cli-broken-config"
-    config = configs_dir / f"{name}.sh"
-    config.write_text("false\n")
-    try:
-        proc = flow.run_unchecked(
-            "--host", "gw.example.com", "--perf-suites", "none", config=name
-        )
-
-        assert proc.returncode == 1
-        assert "Failed to read config defaults" in proc.stderr
-        assert "Running benchmarks" not in proc.stdout
-    finally:
-        config.unlink()

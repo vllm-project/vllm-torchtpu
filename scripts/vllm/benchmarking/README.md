@@ -115,8 +115,10 @@ python3 scripts/vllm/benchmarking/check_regression.py \
 
 | Task | Enabled by | Endpoint | Gated metric |
 |------|------------|----------|--------------|
-| `mmlu_llama`, `mmlu_pro` | `--run-lm-eval` | chat completions | `exact_match` |
-| `humaneval_plus_tpu`, `mbpp_plus_tpu` | `--run-code-eval` (nightly only) | chat completions | pass@1 |
+| `mmlu_llama`, `mmlu_pro` | `--run-lm-eval` or `--eval-suites` | chat completions | `exact_match` |
+| `gsm8k` | `--eval-suites gsm8k` (or `all`) | chat completions | `exact_match` |
+| `humaneval_plus_tpu`, `mbpp_plus_tpu` | `--run-code-eval` or `--eval-suites` | chat completions | pass@1 |
+| `mmmu_pro` | `--run-mm-eval` or `--eval-suites` (via `evalscope`) | chat completions | `acc` |
 
 - `--run-lm-eval` walks `LM_EVAL_TASKS` (default `mmlu_llama mmlu_pro`; configs
   may narrow it).
@@ -154,10 +156,10 @@ A generation cap goes in `LM_EVAL_GEN_KWARGS` as `max_gen_toks`: the
 
 ### `run_eval_flow.sh` flags
 
-- `--base-url URL`: Full endpoint URL with optional scheme, port, and path prefix. Bare host defaults to `:8000`; trailing `/` and `/v1` are stripped. The script connects to this endpoint instead of starting its own server.
-- `--served-model-name NAME`: Model name to use in requests when the endpoint serves it under a different name than the config's `MODEL`. With `--base-url` and no name given, the script uses the name from the endpoint's `/v1/models` list when that list has exactly one model, and the config's `MODEL` otherwise.
-- `--eval-suites LIST`: Comma-separated list of accuracy suites to run (`mmlu_llama`, `mmlu_pro`, `gsm8k`, `humaneval_plus_tpu`, `mbpp_plus_tpu`, `mmmu_pro`, `all`, or `none`). Overrides the config's `EVAL_SUITES` and legacy `--run-lm-eval` flags.
-- `--perf-suites LIST`: Comma-separated list of performance suites to run (`bench_serve`, `agentx`, `all`, or `none`). When omitted, the config's `PERF_SUITES` applies, and `bench_serve` runs if the config sets none.
+- `--base-url URL`: API root URL (not a full route like `/v1/chat/completions`) with optional scheme, port, and path prefix. Bare host defaults to `:8000`; trailing `/` and `/v1` on the path are stripped, and paths beneath `/v1/` are rejected. Cannot be combined with `--host` or `--port`. Connects to the endpoint instead of starting a local server.
+- `--served-model-name NAME`: Model name sent in requests to a running server (`--base-url` or `--host`) when it differs from the config's `MODEL`. With `--base-url` and no `--served-model-name`, the script queries `<base-url>/v1/models` (sending `OPENAI_API_KEY` as a bearer token when set) and uses the returned model id if the list has exactly one entry, falling back to the config's `MODEL` otherwise.
+- `--eval-suites LIST`: Comma-separated list of accuracy suites (`mmlu_llama`, `mmlu_pro`, `gsm8k`, `humaneval_plus_tpu`, `mbpp_plus_tpu`, `mmmu_pro`, `all`, or `none`). `all` covers `mmlu_llama`, `mmlu_pro`, `gsm8k`, `humaneval_plus_tpu`, and `mbpp_plus_tpu`, plus `mmmu_pro` for `*multimodal*` configs. Precedence is `--eval-suites` > legacy `--run-*-eval` flags > config `EVAL_SUITES` > none.
+- `--perf-suites LIST`: Comma-separated list of performance suites (`bench_serve`, `all`, or `none`; `all` currently runs `bench_serve`). Precedence matches eval suites: `--perf-suites` > legacy `--skip-benchmark` (which removes `bench_serve`) > config `PERF_SUITES` > `bench_serve`. Runs without `bench_serve` skip the perf regression check and the `ci.vllm.ai` dashboard publish.
 
 ## Speculative Decoding (`run_benchmarks.sh --mode spec_bench`)
 
@@ -234,3 +236,6 @@ prints the rows without posting them.
 | `SPEC_BENCH_DATASET` / `SPEC_BENCH_CATEGORY` (config var) | auto-download / `summarization` | Path to Spec-Bench `question.jsonl` and category filter |
 | `SPEC_NUM_PROMPTS` / `SPEC_WARMUP_PROMPTS` / `SPEC_REPS` (config var) | `100` / `20` / `2` | Prompts per measured pass, warmup prompts per cell, and measured repetitions per cell |
 | `SERVED_MODEL_NAME` (config var) | (empty) | Optional `--served-model-name` passed in `spec_bench` mode |
+| `EVAL_SUITES` (config var) | (empty) | Default comma-separated accuracy suites when neither `--eval-suites` nor `--run-*-eval` is passed |
+| `PERF_SUITES` (config var) | (empty) | Default comma-separated performance suites (`bench_serve`, `all`, or `none`) when `--perf-suites` is omitted |
+| `OPENAI_API_KEY` | (empty) | Sent as a bearer token to `/v1/models` and as `--api-key` to `evalscope` (in addition to `lm_eval` and `vllm bench serve`) |

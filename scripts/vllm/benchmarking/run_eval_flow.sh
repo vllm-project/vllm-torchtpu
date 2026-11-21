@@ -16,6 +16,8 @@
 # Full evaluation flow script: supports manual and CI execution
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 PORT="${PORT:-8000}"
 HOST=""
 HOST_PORT_CLI=0
@@ -30,37 +32,58 @@ SKIP_PERF_CHECK=0
 SKIP_BENCHMARK=0
 BASELINE_CONFIG=""
 BASE_URL_CLI=""
+BASE_URL_CLI_SET=0
 EVAL_SUITES_CLI=""
+EVAL_SUITES_CLI_SET=0
 PERF_SUITES_CLI=""
+PERF_SUITES_CLI_SET=0
 SERVED_MODEL_NAME_CLI=""
+SERVED_MODEL_NAME_CLI_SET=0
+
+require_arg() {
+    if [ "$2" -lt 2 ]; then
+        echo "ERROR: $1 requires a value"
+        exit 1
+    fi
+}
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --config)
+            require_arg "$1" "$#"
             CONFIG_NAME="$2"
             shift 2
             ;;
         --results-dir)
+            require_arg "$1" "$#"
             RESULTS_DIR="$2"
             shift 2
             ;;
         --base-url)
+            require_arg "$1" "$#"
             BASE_URL_CLI="$2"
+            BASE_URL_CLI_SET=1
             shift 2
             ;;
         --eval-suites)
+            require_arg "$1" "$#"
             EVAL_SUITES_CLI="$2"
+            EVAL_SUITES_CLI_SET=1
             shift 2
             ;;
         --perf-suites)
+            require_arg "$1" "$#"
             PERF_SUITES_CLI="$2"
+            PERF_SUITES_CLI_SET=1
             shift 2
             ;;
         # The name the endpoint serves the model under, when a router or
         # gateway does not serve it under the config's MODEL.
         --served-model-name)
+            require_arg "$1" "$#"
             SERVED_MODEL_NAME_CLI="$2"
+            SERVED_MODEL_NAME_CLI_SET=1
             shift 2
             ;;
         --run-lm-eval)
@@ -76,12 +99,14 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --host)
+            require_arg "$1" "$#"
             HOST="$2"
             HOST_PORT_CLI=1
             START_SERVER=0
             shift 2
             ;;
         --port)
+            require_arg "$1" "$#"
             PORT="$2"
             HOST_PORT_CLI=1
             shift 2
@@ -100,12 +125,12 @@ while [[ $# -gt 0 ]]; do
         # describe nothing a reader tracks.
         --skip-benchmark)
             SKIP_BENCHMARK=1
-            SKIP_PERF_CHECK=1
             shift
             ;;
         # Gates against another config's baselines, for a config that serves
         # that one's model another way and must answer the same.
         --baseline-config)
+            require_arg "$1" "$#"
             BASELINE_CONFIG="$2"
             shift 2
             ;;
@@ -120,43 +145,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# BASE_URL is the one endpoint every client below is given. --base-url keeps
+# BASE_URL is the one API root every client below is given. --base-url keeps
 # its scheme and any path prefix, since a gateway may serve the API over https
-# or under a path; only a trailing slash or /v1 is dropped, because each client
-# appends its own /v1/... route. A bare host with no scheme and no port means
-# port 8000, as --host does; a URL with a scheme keeps that scheme's default.
-if [ -n "$BASE_URL_CLI" ]; then
+# or under a path; only a trailing slash or /v1 on the path is dropped, because
+# each client appends its own /v1/... route.
+if [ "$BASE_URL_CLI_SET" = "1" ]; then
+    if [ -z "$BASE_URL_CLI" ]; then
+        echo "ERROR: --base-url cannot be empty"
+        exit 1
+    fi
     if [ "$HOST_PORT_CLI" = "1" ]; then
         echo "ERROR: --base-url cannot be combined with --host or --port"
         exit 1
     fi
-    BASE_URL=$(python3 -c '
-import sys
-from urllib.parse import urlparse
-raw = sys.argv[1].strip()
-bare = "://" not in raw
-try:
-    url = urlparse("http://" + raw if bare else raw)
-    port = url.port
-except ValueError:
-    sys.exit(f"Invalid --base-url: {sys.argv[1]}")
-# Credentials in the URL would be echoed into the logs with every command.
-if (
-    url.scheme not in ("http", "https")
-    or not url.hostname
-    or url.username is not None
-    or url.query
-    or url.fragment
-):
-    sys.exit(f"Invalid --base-url: {sys.argv[1]}")
-netloc = url.netloc
-if bare and port is None:
-    netloc += ":8000"
-base = f"{url.scheme}://{netloc}{url.path}".rstrip("/")
-if base.endswith("/v1"):
-    base = base[: -len("/v1")]
-print(base.rstrip("/"))
-' "$BASE_URL_CLI")
+    BASE_URL=$(python3 "$SCRIPT_DIR/endpoint_url.py" normalize "$BASE_URL_CLI")
     START_SERVER=0
 else
     if [ -z "$HOST" ]; then
@@ -167,8 +169,24 @@ fi
 
 # A server this script starts serves the config's MODEL, so another name would
 # send every request to a model that is not there.
-if [ -n "$SERVED_MODEL_NAME_CLI" ] && [ "$START_SERVER" = "1" ]; then
-    echo "ERROR: --served-model-name needs a running server (--base-url, or --host and --port)"
+if [ "$SERVED_MODEL_NAME_CLI_SET" = "1" ]; then
+    if [ -z "$SERVED_MODEL_NAME_CLI" ]; then
+        echo "ERROR: --served-model-name cannot be empty"
+        exit 1
+    fi
+    if [ "$START_SERVER" = "1" ]; then
+        echo "ERROR: --served-model-name needs a running server (--base-url, or --host and --port)"
+        exit 1
+    fi
+fi
+
+if [ "$EVAL_SUITES_CLI_SET" = "1" ] && [ -z "${EVAL_SUITES_CLI// /}" ]; then
+    echo "ERROR: --eval-suites cannot be empty (use 'none' to run no accuracy suites)"
+    exit 1
+fi
+
+if [ "$PERF_SUITES_CLI_SET" = "1" ] && [ -z "${PERF_SUITES_CLI// /}" ]; then
+    echo "ERROR: --perf-suites cannot be empty (use 'none' to run no performance suites)"
     exit 1
 fi
 
@@ -198,13 +216,6 @@ eval_regression_failed() {
 if [ -n "${BUILDKITE_BRANCH:-}" ] && { [ "$BUILDKITE_BRANCH" != "main" ] || [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; }; then
     echo "Running on PR or non-main branch in Buildkite. Skipping database upload."
     SKIP_DB_UPLOAD_FLAG=1
-fi
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Register cleanup trap
-if [ "$START_SERVER" = "1" ]; then
-    trap 'echo "Executing cleanup..."; bash "$SCRIPT_DIR/cleanup_server.sh"' EXIT INT TERM
 fi
 
 if [ -z "$RESULTS_DIR" ]; then
@@ -374,7 +385,7 @@ run_mm_eval() {
         --model "$MODEL" \
         --eval-type openai_api \
         --api-url "$BASE_URL/v1/chat/completions" \
-        --api-key EMPTY \
+        --api-key "${OPENAI_API_KEY:-EMPTY}" \
         --datasets "$task" \
         --limit "$mm_limit" \
         --eval-batch-size "$mm_batch_size" \
@@ -412,55 +423,39 @@ print('$task: score=' + str(report['score']) + ' (num=' + str(report['num']) + '
     fi
 }
 
-run_agentx_perf() {
-    local conc_list="${AGENTX_CONC_LIST:-}"
-    local model_prefix="${AGENTX_MODEL_PREFIX:-}"
-    local precision="${AGENTX_PRECISION:-}"
-    local chips="${AGENTX_CHIPS:-}"
-    if [ -z "$conc_list" ] || [ -z "$model_prefix" ] || [ -z "$precision" ]; then
-        echo "::error::agentx suite requires AGENTX_CONC_LIST, AGENTX_MODEL_PREFIX, and AGENTX_PRECISION in $CONFIG_NAME.sh or env."
-        fail=1
-        return
-    fi
-    # shellcheck source=/dev/null
-    source "$SCRIPT_DIR/../benchmark/inferencex/sweep_lib.sh"
-    local ep=1
-    if [ "${CONFIG_ENABLE_EP:-false}" = "true" ]; then
-        ep=$(( CONFIG_TP * CONFIG_DP ))
-    fi
-    local disagg="${AGENTX_DISAGG:-0}"
-    if [ "${CONFIG_IS_1P1D:-0}" = "1" ]; then
-        disagg=1
-    fi
-    ix_export_topology "$CONFIG_TP" "$CONFIG_DP" "$ep" "$disagg"
-    local agentx_args=(
-        --server-url "$BASE_URL"
-        --conc-list "${conc_list// /,}"
-        --chips "$chips"
-        --model "$MODEL"
-        --label "agentx_${CONFIG_NAME}"
-        --model-prefix "$model_prefix"
-        --precision "$precision"
-        --gsm8k-limit "${AGENTX_GSM8K_LIMIT:-0}"
-        --results-dir "$RESULTS_DIR/agentx"
-    )
-    if [ -n "${AGENTX_REFERENCE_ROW:-}" ]; then
-        agentx_args+=(--reference-row "$AGENTX_REFERENCE_ROW")
-    fi
-    if [ -n "${AGENTX_SPEC_METHOD:-}" ]; then
-        agentx_args+=(--spec-method "$AGENTX_SPEC_METHOD")
-    fi
-    if [ -n "${AGENTX_DURATION:-}" ]; then
-        agentx_args+=(--duration "$AGENTX_DURATION")
-    fi
-    if [ -n "${AGENTX_FAST:-}" ]; then
-        agentx_args+=(--fast "$AGENTX_FAST")
-    fi
-    echo "Running InferenceX AgentX suite against $BASE_URL..."
-    bash "$SCRIPT_DIR/../benchmark/inferencex/agentx_client.sh" "${agentx_args[@]}" || {
-        echo "::error::AgentX benchmark suite failed."
-        fail=1
-    }
+# Single source of truth for named --eval-suites entries:
+#   "<suite>:<runner>:<scope>"
+# Scope is "text" (always included in `all`) or "multimodal" (included in `all`
+# only for *multimodal* configs, matching run_eval_configs.sh).
+EVAL_SUITE_TABLE=(
+    "mmlu_llama:lm_eval:text"
+    "mmlu_pro:lm_eval:text"
+    "gsm8k:lm_eval:text"
+    "humaneval_plus_tpu:lm_eval:text"
+    "mbpp_plus_tpu:lm_eval:text"
+    "mmmu_pro:mm_eval:multimodal"
+)
+
+eval_suite_runner() {
+    local target="$1" entry suite runner _
+    for entry in "${EVAL_SUITE_TABLE[@]}"; do
+        IFS=':' read -r suite runner _ <<< "$entry"
+        if [ "$suite" = "$target" ]; then
+            echo "$runner"
+            return 0
+        fi
+    done
+    return 1
+}
+
+append_all_eval_suites() {
+    local entry suite _ scope
+    for entry in "${EVAL_SUITE_TABLE[@]}"; do
+        IFS=':' read -r suite _ scope <<< "$entry"
+        if [ "$scope" = "text" ] || [[ "$CONFIG_NAME" == *multimodal* ]]; then
+            SELECTED_EVAL_SUITES+=("$suite")
+        fi
+    done
 }
 
 CONFIG_FILE="$SCRIPT_DIR/configs/${CONFIG_NAME}.sh"
@@ -469,40 +464,17 @@ if [ ! -f "$CONFIG_FILE" ]; then
     exit 1
 fi
 
-# Disaggregated 1P1D configs branch on K3_1P1D_ROLE; default to decode when
-# running client-only against an external endpoint so sourcing succeeds.
-if [ "$START_SERVER" = "0" ] && [ -z "${K3_1P1D_ROLE:-}" ]; then
-    export K3_1P1D_ROLE="decode"
-fi
-
 # Read config-declared suite defaults in an isolated subshell before launching.
+# Suite variables start empty so only the config file sets them, and config
+# stdout is discarded so echoed notes are never eval'd.
 _config_vars=$(
-    SCRIPT_DIR="$SCRIPT_DIR" K3_1P1D_ROLE="${K3_1P1D_ROLE:-}" bash -c '
+    SCRIPT_DIR="$SCRIPT_DIR" bash -c '
         set -euo pipefail
         LM_EVAL_TASKS="mmlu_llama mmlu_pro"
-        ENABLE_EP="false"
-        EVAL_SUITES="${EVAL_SUITES:-}"
-        PERF_SUITES="${PERF_SUITES:-}"
-        AGENTX_CONC_LIST="${AGENTX_CONC_LIST:-}"
-        AGENTX_MODEL_PREFIX="${AGENTX_MODEL_PREFIX:-}"
-        AGENTX_PRECISION="${AGENTX_PRECISION:-}"
-        AGENTX_CHIPS="${AGENTX_CHIPS:-}"
-        AGENTX_REFERENCE_ROW="${AGENTX_REFERENCE_ROW:-}"
-        AGENTX_SPEC_METHOD="${AGENTX_SPEC_METHOD:-}"
-        AGENTX_DURATION="${AGENTX_DURATION:-}"
-        AGENTX_FAST="${AGENTX_FAST:-}"
-        AGENTX_GSM8K_LIMIT="${AGENTX_GSM8K_LIMIT:-}"
-        AGENTX_DISAGG="${AGENTX_DISAGG:-}"
-        source "$1"
-        CONFIG_ENABLE_EP="$ENABLE_EP"
-        CONFIG_IS_1P1D=0
-        if [ -n "${TPU_KV_TRANSFER_NAMESPACE:-}" ]; then
-            CONFIG_IS_1P1D=1
-        fi
-        for var in LM_EVAL_TASKS CONFIG_ENABLE_EP CONFIG_IS_1P1D EVAL_SUITES PERF_SUITES \
-            AGENTX_CONC_LIST AGENTX_MODEL_PREFIX AGENTX_PRECISION AGENTX_CHIPS \
-            AGENTX_REFERENCE_ROW AGENTX_SPEC_METHOD AGENTX_DURATION AGENTX_FAST \
-            AGENTX_GSM8K_LIMIT AGENTX_DISAGG; do
+        EVAL_SUITES=""
+        PERF_SUITES=""
+        source "$1" >/dev/null
+        for var in LM_EVAL_TASKS EVAL_SUITES PERF_SUITES; do
             printf "%s=%q\n" "$var" "${!var}"
         done
     ' _ "$CONFIG_FILE"
@@ -513,76 +485,48 @@ _config_vars=$(
 eval "$_config_vars"
 
 # Resolve selected performance suites.
+# Precedence (same as eval suites below):
+#   --perf-suites CLI > legacy --skip-benchmark > config PERF_SUITES > bench_serve
 RUN_BENCH_SERVE=0
-RUN_AGENTX=0
-effective_perf_suites="$PERF_SUITES_CLI"
-if [ -z "$effective_perf_suites" ] && [ -n "${PERF_SUITES:-}" ]; then
+if [ "$PERF_SUITES_CLI_SET" = "1" ]; then
+    effective_perf_suites="$PERF_SUITES_CLI"
+elif [ -n "$PERF_SUITES" ]; then
     effective_perf_suites="$PERF_SUITES"
-fi
-if [ -n "$effective_perf_suites" ]; then
-    IFS=',' read -r -a _perf_items <<< "$effective_perf_suites"
-    for raw_item in "${_perf_items[@]}"; do
-        item="${raw_item// /}"
-        case "$item" in
-            ""|none) ;;
-            all) RUN_BENCH_SERVE=1; RUN_AGENTX=1 ;;
-            bench_serve) RUN_BENCH_SERVE=1 ;;
-            agentx) RUN_AGENTX=1 ;;
-            *)
-                echo "ERROR: Unknown --perf-suites item '$item' (expected bench_serve, agentx, all, or none)"
-                exit 1
-                ;;
-        esac
-    done
 else
-    if [ "$SKIP_BENCHMARK" = "0" ]; then
-        RUN_BENCH_SERVE=1
+    effective_perf_suites="bench_serve"
+fi
+IFS=',' read -r -a _perf_items <<< "$effective_perf_suites"
+for raw_item in "${_perf_items[@]}"; do
+    item="${raw_item// /}"
+    if [ -z "$item" ]; then
+        echo "ERROR: Empty item in --perf-suites: '$effective_perf_suites'"
+        exit 1
     fi
+    case "$item" in
+        none) ;;
+        all|bench_serve) RUN_BENCH_SERVE=1 ;;
+        *)
+            echo "ERROR: Unknown --perf-suites item '$item' (expected bench_serve, all, or none)"
+            exit 1
+            ;;
+    esac
+done
+if [ "$PERF_SUITES_CLI_SET" = "0" ] && [ "$SKIP_BENCHMARK" = "1" ]; then
+    RUN_BENCH_SERVE=0
 fi
 
 if [ "$RUN_BENCH_SERVE" = "0" ]; then
     SKIP_PERF_CHECK=1
 fi
 
-# Fail before any server boot: tokens per dollar divides by physical chips,
-# and TP x DP counts ranks (two per chip on v7x), so there is no safe default.
-if [ "$RUN_AGENTX" = "1" ]; then
-    case "${AGENTX_CHIPS:-}" in
-        ''|*[!0-9]*|0)
-            echo "::error::agentx suite requires AGENTX_CHIPS=<physical_chips> (physical chips, not TP x DP ranks)."
-            exit 1
-            ;;
-    esac
-fi
-
 # Resolve selected accuracy suites.
+# Precedence:
+#   --eval-suites CLI > legacy --run-*-eval flags > config EVAL_SUITES > none
 SELECTED_EVAL_SUITES=()
-effective_eval_suites="$EVAL_SUITES_CLI"
-if [ -z "$effective_eval_suites" ] && [ -n "${EVAL_SUITES:-}" ] && [ "$RUN_LM_EVAL" = "0" ] && [ "$RUN_CODE_EVAL" = "0" ] && [ "$RUN_MM_EVAL" = "0" ]; then
-    effective_eval_suites="$EVAL_SUITES"
-fi
-if [ -n "$effective_eval_suites" ]; then
-    IFS=',' read -r -a _eval_items <<< "$effective_eval_suites"
-    for raw_item in "${_eval_items[@]}"; do
-        item="${raw_item// /}"
-        case "$item" in
-            ""|none) ;;
-            all)
-                SELECTED_EVAL_SUITES+=(
-                    mmlu_pro gsm8k
-                    humaneval_plus_tpu mbpp_plus_tpu mmmu_pro
-                )
-                ;;
-            mmlu_llama|mmlu_pro|gsm8k|humaneval_plus_tpu|mbpp_plus_tpu|mmmu_pro)
-                SELECTED_EVAL_SUITES+=("$item")
-                ;;
-            *)
-                echo "ERROR: Unknown --eval-suites item '$item'"
-                exit 1
-                ;;
-        esac
-    done
-else
+effective_eval_suites=""
+if [ "$EVAL_SUITES_CLI_SET" = "1" ]; then
+    effective_eval_suites="$EVAL_SUITES_CLI"
+elif [ "$RUN_LM_EVAL" = "1" ] || [ "$RUN_CODE_EVAL" = "1" ] || [ "$RUN_MM_EVAL" = "1" ]; then
     if [ "$RUN_LM_EVAL" = "1" ]; then
         # shellcheck disable=SC2206  # space-separated task list, split on purpose
         SELECTED_EVAL_SUITES+=($LM_EVAL_TASKS)
@@ -593,42 +537,64 @@ else
     if [ "$RUN_MM_EVAL" = "1" ]; then
         SELECTED_EVAL_SUITES+=(mmmu_pro)
     fi
+else
+    effective_eval_suites="$EVAL_SUITES"
+fi
+if [ -n "$effective_eval_suites" ]; then
+    IFS=',' read -r -a _eval_items <<< "$effective_eval_suites"
+    for raw_item in "${_eval_items[@]}"; do
+        item="${raw_item// /}"
+        if [ -z "$item" ]; then
+            echo "ERROR: Empty item in --eval-suites: '$effective_eval_suites'"
+            exit 1
+        fi
+        case "$item" in
+            none) ;;
+            all) append_all_eval_suites ;;
+            *)
+                if eval_suite_runner "$item" >/dev/null; then
+                    SELECTED_EVAL_SUITES+=("$item")
+                else
+                    echo "ERROR: Unknown --eval-suites item '$item'"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
 fi
 
 NEEDS_LIVE_SERVER=0
-if [ "$RUN_BENCH_SERVE" = "1" ] || [ "$RUN_AGENTX" = "1" ] || [ "${#SELECTED_EVAL_SUITES[@]}" -gt 0 ]; then
+if [ "$RUN_BENCH_SERVE" = "1" ] || [ "${#SELECTED_EVAL_SUITES[@]}" -gt 0 ]; then
     NEEDS_LIVE_SERVER=1
+fi
+
+# Compute once whether this run boots and owns a local server.
+# --skip-benchmark keeps its meaning (unless --perf-suites explicitly re-enables
+# bench_serve): no server is started or killed, and evals hit an already-running
+# server on localhost:$PORT.
+BOOT_SERVER=0
+if [ "$START_SERVER" = "1" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
+    if [ "$RUN_BENCH_SERVE" = "1" ] || [ "$SKIP_BENCHMARK" = "0" ]; then
+        BOOT_SERVER=1
+    fi
 fi
 
 # The name clients put in their requests. Empty means the config's MODEL, which
 # is what a server this script starts, or one reached by --host, serves. Behind
 # --base-url a router may serve the model under another name, so there the
-# explicit name wins, then the endpoint's own answer when it lists one model.
+# explicit flag wins, then the endpoint's own answer when it lists one model.
 # The endpoint is asked once, with no wait: the caller starts this script when
 # the endpoint is ready.
 SERVED_MODEL="$SERVED_MODEL_NAME_CLI"
-if [ -z "$SERVED_MODEL" ] && [ -n "$BASE_URL_CLI" ]; then
-    SERVED_MODEL="${SERVED_MODEL_NAME:-}"
-    if [ -z "$SERVED_MODEL" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
-        SERVED_MODEL=$(python3 -c '
-import json, sys, urllib.request
-models_url = sys.argv[1] + "/v1/models"
-try:
-    with urllib.request.urlopen(models_url, timeout=30) as resp:
-        ids = [entry["id"] for entry in json.load(resp)["data"]]
-except Exception as err:
-    print(f"Could not list the served models at {models_url}: {err}", file=sys.stderr)
-else:
-    if len(ids) == 1:
-        print(ids[0])
-' "$BASE_URL")
-    fi
+if [ -z "$SERVED_MODEL" ] && [ "$BASE_URL_CLI_SET" = "1" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
+    SERVED_MODEL=$(python3 "$SCRIPT_DIR/endpoint_url.py" discover-model "$BASE_URL")
 fi
 
 # ========================================================
-# 1. Initial Cleanup
+# 1. Initial Cleanup (only when this run boots a server)
 # ========================================================
-if [ "$START_SERVER" = "1" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
+if [ "$BOOT_SERVER" = "1" ]; then
+    trap 'echo "Executing cleanup..."; bash "$SCRIPT_DIR/cleanup_server.sh"' EXIT INT TERM
     echo "=== Initial Cleanup ==="
     bash "$SCRIPT_DIR/cleanup_server.sh"
 fi
@@ -641,27 +607,24 @@ BENCH_ARGS=(
   --config "$CONFIG_NAME"
   --results-dir "$RESULTS_DIR"
 )
-if [ "$START_SERVER" = "1" ]; then
-  BENCH_ARGS+=(--keep-alive)
-  BENCH_ARGS+=(--port "$PORT")
-elif [ -n "$BASE_URL_CLI" ]; then
-  BENCH_ARGS+=(--base-url "$BASE_URL")
-else
-  BENCH_ARGS+=(--host "$HOST" --port "$PORT")
-fi
-if [ -n "$SERVED_MODEL" ]; then
-  BENCH_ARGS+=(--served-model-name "$SERVED_MODEL")
-fi
-if [ "$RUN_BENCH_SERVE" = "0" ]; then
-  # --skip-benchmark keeps its meaning: no server is started, and the evals
-  # go to one that is already running. --perf-suites without bench_serve
-  # starts the server for the suites that were asked for.
-  if [ "$SKIP_BENCHMARK" = "0" ] && [ "$START_SERVER" = "1" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
+if [ "$BOOT_SERVER" = "1" ]; then
+  BENCH_ARGS+=(--keep-alive --port "$PORT")
+  if [ "$RUN_BENCH_SERVE" = "0" ]; then
     BENCH_ARGS+=(--skip-bench-cells)
+  fi
+else
+  if [ "$BASE_URL_CLI_SET" = "1" ]; then
+    BENCH_ARGS+=(--base-url "$BASE_URL")
   else
+    BENCH_ARGS+=(--host "$HOST" --port "$PORT")
+  fi
+  if [ "$RUN_BENCH_SERVE" = "0" ]; then
     # A dry run still writes the config.json the evals below read.
     BENCH_ARGS+=(--dry-run)
   fi
+fi
+if [ -n "$SERVED_MODEL" ]; then
+  BENCH_ARGS+=(--served-model-name "$SERVED_MODEL")
 fi
 
 ./scripts/vllm/benchmarking/run_benchmarks.sh "${BENCH_ARGS[@]}"
@@ -673,13 +636,10 @@ if [ -n "$SERVED_MODEL" ]; then
         echo "Sending requests for served model $SERVED_MODEL (config model: $MODEL)"
     fi
     MODEL="$SERVED_MODEL"
-elif [ -n "$BASE_URL_CLI" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
+elif [ "$BASE_URL_CLI_SET" = "1" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
     echo "No single served model at $BASE_URL/v1/models and no --served-model-name; using the config's model $MODEL"
 fi
-CONFIG_TP=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("tensor_parallelism", 1))' "$RESULTS_DIR/config.json")
-CONFIG_DP=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("data_parallelism", 1))' "$RESULTS_DIR/config.json")
 MMLU_PRO_DISABLE_MULTITURN_ARGS=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("mmlu_pro_disable_multiturn_args", False)).lower())' "$RESULTS_DIR/config.json")
-LM_EVAL_TASKS=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("lm_eval_tasks") or "mmlu_llama mmlu_pro")' "$RESULTS_DIR/config.json")
 EXTRA_LM_EVAL_MODEL_ARGS=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("extra_lm_eval_model_args", ""))' "$RESULTS_DIR/config.json")
 LM_EVAL_GEN_KWARGS=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("lm_eval_gen_kwargs", ""))' "$RESULTS_DIR/config.json")
 EVAL_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["eval_tolerance"])' "$RESULTS_DIR/config.json")
@@ -688,7 +648,7 @@ PERF_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])
 fail=0
 
 # ========================================================
-# 3. Check Perf Regression & Run AgentX
+# 3. Check Perf Regression
 # ========================================================
 if [ "$SKIP_PERF_CHECK" = "0" ] && [ -f "$PERF_BASELINE" ]; then
     echo "=== Checking Perf Regression ==="
@@ -699,30 +659,24 @@ if [ "$SKIP_PERF_CHECK" = "0" ] && [ -f "$PERF_BASELINE" ]; then
       --baseline "$PERF_BASELINE" 2>&1 | tee "$PERF_LOG" || { echo "::error::Perf regression check failed! See logs above for details."; fail=1; }
 fi
 
-if [ "$RUN_AGENTX" = "1" ]; then
-    run_agentx_perf
-fi
-
 # ========================================================
 # 4. Run Selected Accuracy Suites
 # ========================================================
 for suite in "${SELECTED_EVAL_SUITES[@]}"; do
-    case "$suite" in
-        mmlu_llama|mmlu_pro|gsm8k|humaneval_plus_tpu|mbpp_plus_tpu)
+    # --eval-suites names are checked above against EVAL_SUITE_TABLE, so any
+    # name not in the table came from a config's LM_EVAL_TASKS under --run-lm-eval.
+    suite_runner=$(eval_suite_runner "$suite" || echo "lm_eval")
+    case "$suite_runner" in
+        lm_eval)
             run_lm_eval "$suite"
             ;;
-        mmmu_pro)
+        mm_eval)
             if ! command -v evalscope &>/dev/null; then
-                echo "::error::mmmu_pro requires the 'evalscope' CLI (pip install evalscope)."
+                echo "::error::$suite requires the 'evalscope' CLI (pip install evalscope)."
                 fail=1
             else
-                run_mm_eval "mmmu_pro"
+                run_mm_eval "$suite"
             fi
-            ;;
-        # --eval-suites names are checked above, so this is a name from a
-        # config's LM_EVAL_TASKS under --run-lm-eval: any lm-eval task.
-        *)
-            run_lm_eval "$suite"
             ;;
     esac
 done
