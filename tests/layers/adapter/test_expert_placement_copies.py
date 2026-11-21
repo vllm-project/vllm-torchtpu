@@ -320,7 +320,7 @@ def vllm_moe(monkeypatch):
         emm.ExpertMapManager._calculate_expert_maps,
     )
     monkeypatch.setattr(fused_layer, "_tpu_copy_slot_hook", False, raising=False)
-    model = types.ModuleType("_b3_fake_model")
+    model = types.ModuleType("_fake_moe_model")
     model.FusedMoEFactory = fused_layer.FusedMoEFactory
     monkeypatch.setitem(sys.modules, model.__name__, model)
     return SimpleNamespace(
@@ -510,6 +510,49 @@ def test_the_hook_sizes_the_layers_vllms_factory_builds(
     for manager in (other, outside):
         assert manager._local_num_experts == 4
         assert manager._expert_map.tolist() == vllms
+
+
+@pytest.mark.parametrize(
+    "host_lookup_first, slots", [(True, 5), (False, 4)], ids=["registry", "reversed"]
+)
+def test_the_hook_wraps_the_host_lookup_patch_in_registry_order(
+    tmp_path, monkeypatch, vllm_moe, host_lookup_first, slots
+):
+    """The registry runs _patch_expert_map_host_lookup before the hook, at
+    worker init. That patch replaces _calculate_expert_maps without calling
+    the method it replaces, so only in this order does the hook wrap it and
+    size a placed layer (rank 1: 4 primaries and a copy); in the reverse
+    order the layer keeps vLLM's 4 slots."""
+    import vllm_torchtpu
+
+    cls = vllm_moe.emm.ExpertMapManager
+    for name in ("map_global_to_local", "get_compressed_map_string"):
+        monkeypatch.setattr(cls, name, getattr(cls, name))
+    for name in (
+        "_tpu_expert_map_source",
+        "_tpu_expert_map_version",
+        "_tpu_expert_map_host",
+        "_tpu_host_expert_map_patch",
+    ):
+        monkeypatch.setattr(cls, name, None, raising=False)
+    _use(tmp_path, monkeypatch, _copies())
+    steps = [vllm_torchtpu._patch_expert_map_host_lookup, ep.install_copy_slot_hook]
+    for step in steps if host_lookup_first else steps[::-1]:
+        step()
+    manager = SimpleNamespace(
+        use_ep=True,
+        ep_size=2,
+        ep_rank=1,
+        global_num_experts=8,
+        num_fused_shared_experts=0,
+        rocm_aiter_enabled=False,
+        _placement_strategy="linear",
+        _expert_map=None,
+        _expert_mask=None,
+    )
+    monkeypatch.setattr(ep, "_FACTORY_PREFIX", LAYER)
+    cls._calculate_expert_maps(manager)
+    assert manager._local_num_experts == slots
 
 
 def test_a_placed_layers_map_is_built_on_the_host(tmp_path, monkeypatch):
