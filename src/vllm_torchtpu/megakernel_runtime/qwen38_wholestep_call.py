@@ -104,12 +104,14 @@ def key_slots_for(B: int | None) -> int:
     Each slot is 512 KiB of VMEM; measured with tpu_bench_wholestep_call (200K context, served
     MK env): 4 slots fit at b8-b32 (b16 with ~20 KiB to spare; 5 slots: 62.49M of 62.01M) and
     at b48 under main-KV DCP-2, and are 0.39 MiB over at b64 under DCP-2 (62.39M of 62.06M),
-    where 3 fit. Without a bucket (the operand-packing spec, which has no scratch): 2."""
+    where 3 fit. With wholekeylanes=128 a slot is 256 KiB, so auto takes twice the slots in the
+    same VMEM (8 / 6; 200K context B16: 6 slots -15 us per call over 4). Without a bucket (the
+    operand-packing spec, which has no scratch): 2."""
     if KEY_SLOTS != KEY_SLOTS_AUTO:
         return KEY_SLOTS
     if B is None:
         return 2
-    return 4 if B <= 48 else 3
+    return (4 if B <= 48 else 3) * (2 if KEY_LANES == 128 else 1)
 
 
 def union_stats_on() -> bool:
