@@ -121,6 +121,9 @@ from vllm_torchtpu.gdn_pool_layout import (
 )
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
+    pcp_local_token_counts,
+)
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import (
     dp_vocab_parallel,
@@ -10844,18 +10847,50 @@ class TPUModelRunner(GPUModelRunner):
 
     def _spec_step_total(self, bucket: int) -> int | None:
         """The most tokens one step's prompts can schedule that still pad to
-        `bucket`, or None when no step reaches it: each of at most
-        max_num_seqs requests schedules at most max_model_len - 1 prompt
-        tokens."""
-        below = max(
+        `bucket`, or None when no step reaches it: a step schedules at most
+        max_num_batched_tokens tokens, and each of at most max_num_seqs
+        requests at most max_model_len - 1 prompt tokens."""
+        total = min(
+            bucket,
+            int(self.scheduler_config.max_num_batched_tokens),
+            int(self.scheduler_config.max_num_seqs) * (self.max_model_len - 1),
+        )
+        return total if total > self._token_bucket_below(bucket) else None
+
+    def _token_bucket_below(self, bucket: int) -> int:
+        """The largest token bucket below `bucket`, 0 below the smallest: a
+        step pads to `bucket` exactly when its token count is above this one
+        and at most `bucket`."""
+        return max(
             (int(size) for size in self.num_tokens_paddings if size < bucket),
             default=0,
         )
-        total = min(
-            bucket,
-            int(self.scheduler_config.max_num_seqs) * (self.max_model_len - 1),
+
+    def _max_rank_step_tokens(self) -> int:
+        """The most tokens one step puts on this rank: a step of
+        max_num_batched_tokens tokens as the PCP manager (its
+        max_local_num_tokens cap) or the sequence layout planner (one token
+        stream dealt in cp_kv_cache_interleave_size chunks from rank 0, so
+        rank 0 holds the most) splits it; all of it without context
+        parallelism."""
+        if self.pcp_manager is not None:
+            return int(self.pcp_manager.max_local_num_tokens)
+        return int(
+            pcp_local_token_counts(
+                [int(self.scheduler_config.max_num_batched_tokens)],
+                int(self.parallel_config.prefill_context_parallel_size),
+                int(self.parallel_config.cp_kv_cache_interleave_size),
+            ).max()
         )
-        return total if total > below else None
+
+    def _draft_bucket_reachable(self, bucket: int, max_rank_tokens: int) -> bool:
+        """Whether a live step can run the draft at token bucket `bucket` on
+        this rank: some step's token count on this rank (at most
+        `max_rank_tokens`, _max_rank_step_tokens) pads to it, and, above
+        max_model_len, several prompts can fill it (_spec_step_total)."""
+        if self._token_bucket_below(bucket) >= max_rank_tokens:
+            return False
+        return bucket <= self.max_model_len or self._spec_step_total(bucket) is not None
 
     def _retrace_eagle_draft(self) -> None:
         """Give the MTP/EAGLE draft a fresh trace inside shape_variants.warmup()
@@ -10870,19 +10905,26 @@ class TPUModelRunner(GPUModelRunner):
         """Refuse to start when the draft's warm-up left a reachable token
         bucket to a trace that never came: it would stay a raising closure
         and fail the first live step that pads to it. A bucket no step
-        reaches (_spec_step_total) is only reported."""
+        reaches (_draft_bucket_reachable) is only reported."""
+        if not buckets.refused:
+            return
+        max_rank_tokens = self._max_rank_step_tokens()
         unreachable = sorted(
             b
             for b in buckets.refused
-            if b > self.max_model_len and self._spec_step_total(b) is None
+            if not self._draft_bucket_reachable(b, max_rank_tokens)
         )
         if unreachable:
             logger.warning(
-                "MTP draft token buckets %s stay uncompiled: above max_model_len=%d, "
-                "no step of max_num_seqs=%d requests reaches them.",
+                "MTP draft token buckets %s stay uncompiled: no step reaches them "
+                "(a step puts at most %d tokens on this rank, of "
+                "max_num_batched_tokens=%d, and holds at most max_num_seqs=%d "
+                "prompts of max_model_len - 1 = %d tokens).",
                 unreachable,
-                self.max_model_len,
+                max_rank_tokens,
+                self.scheduler_config.max_num_batched_tokens,
                 self.scheduler_config.max_num_seqs,
+                self.max_model_len - 1,
             )
         left = sorted(set(buckets.refused) - set(unreachable))
         if left:
