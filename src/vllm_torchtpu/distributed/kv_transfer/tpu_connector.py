@@ -4414,10 +4414,6 @@ class TPURaidenConnectorWorker:
         gate = threading.Event()
         self._stage3_register_gate = gate
         delay_s = _STAGE3_ASYNC_REGISTER_DELAY_S
-        with self._stage3_poll_lock:
-            pending = self._stage3_pending_registrations
-            for req_id in req_ids:
-                pending[req_id] = pending.get(req_id, 0) + 1
 
         def _run() -> None:
             gate.wait(delay_s)
@@ -4430,7 +4426,14 @@ class TPURaidenConnectorWorker:
             finally:
                 self._settle_stage3_early_send_terminals(req_ids)
 
-        future = self._stage3_register_executor.submit(_run)
+        # The step's requests count as pending only once the executor has
+        # taken the step, so a refused submit leaves no count behind. The
+        # step's settle takes the same lock, so it cannot end the count first.
+        with self._stage3_poll_lock:
+            future = self._stage3_register_executor.submit(_run)
+            pending = self._stage3_pending_registrations
+            for req_id in req_ids:
+                pending[req_id] = pending.get(req_id, 0) + 1
         self._stage3_register_futures.append((future, req_ids))
 
     def _settle_stage3_early_send_terminals(self, req_ids: frozenset[str]) -> None:

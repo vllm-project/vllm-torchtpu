@@ -9360,6 +9360,60 @@ class TestStage3AsyncOptionsThroughGetFinished:
         assert worker._stage3_early_send_terminals == {}
         assert worker._stage3_pending_registrations == {}
 
+    def test_a_step_the_executor_refuses_leaves_nothing_pending(self):
+        """A step whose submit raises (here: the executor is shut down)
+        never runs, so it never settles. Its requests must not count as
+        pending, or every later terminal for them would be kept for good."""
+        worker, engine, _, _ = _stage3_option_producer({"async_register": True})
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        executor.shutdown()
+        worker._stage3_register_executor = executor
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_release["r1"] = 77
+        with _stage3_option_env():
+            with pytest.raises(RuntimeError, match="shutdown"):
+                worker._submit_stage3_registration(meta)
+            assert worker._stage3_pending_registrations == {}
+            assert worker._stage3_register_futures == []
+            engine.poll_results = [(["r1"], [], [])]
+            assert worker.get_finished() == (set(), set())
+        assert worker._stage3_early_send_terminals == {}
+
+    def test_a_step_that_runs_at_once_settles_after_it_counts(self):
+        """The submit and the pending count share one poll-lock section, so
+        even a step the executor runs at once cannot settle (and end the
+        count) before its requests count as pending."""
+        worker, _, _, _ = _stage3_option_producer({"async_register": True})
+
+        class EagerExecutor:
+            """Starts each step at once and lets it run inside submit, as a
+            fast side thread could."""
+
+            def submit(self, fn):
+                future: concurrent.futures.Future = concurrent.futures.Future()
+
+                def run():
+                    try:
+                        future.set_result(fn())
+                    except BaseException as exc:
+                        future.set_exception(exc)
+
+                thread = threading.Thread(target=run)
+                thread.start()
+                thread.join(0.2)
+                return future
+
+        worker._stage3_register_executor = EagerExecutor()
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_release["r1"] = 77
+        with (
+            _stage3_option_env(),
+            patch(f"{_MOD}._STAGE3_ASYNC_REGISTER_DELAY_S", 0.0),
+        ):
+            worker._submit_stage3_registration(meta)
+            worker._reap_stage3_registrations({"r1"})
+        assert worker._stage3_pending_registrations == {}
+
     def test_a_request_stays_pending_until_its_last_step_ends(self):
         worker, _, _, _ = _stage3_option_producer({"async_register": True})
         worker._stage3_pending_registrations = {"r1": 2}
