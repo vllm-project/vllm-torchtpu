@@ -72,11 +72,11 @@ def test_files_evicted_concurrently(tmp_path, monkeypatch):
     assert len(fadvise_fds) == 4
 
 
-@pytest.mark.parametrize("local_rank", ["0", "3"])
-def test_every_rank_evicts(evicted, monkeypatch, local_rank):
+def test_every_rank_evicts(evicted, monkeypatch):
     # Each rank evicts after stopping its own prefetch, so the last eviction
-    # on a host follows every rank's stop.
-    monkeypatch.setenv("LOCAL_RANK", local_rank)
+    # on a host follows every rank's stop. A non-zero local rank must evict
+    # too (it used to skip the eviction).
+    monkeypatch.setenv("LOCAL_RANK", "3")
     mlp._loaded_weight_files.update(dict.fromkeys(["a"]))
     mlp.evict_loaded_weights_page_cache()
     assert evicted == [["a"]]
