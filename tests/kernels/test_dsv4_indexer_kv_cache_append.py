@@ -1748,5 +1748,21 @@ class CoalescedKvAppendTest(parameterized.TestCase):
         np.testing.assert_array_equal(np.asarray(actual_64), np.asarray(expected_64))
 
 
+class OutOfOrderRunsTest(parameterized.TestCase):
+    def test_runs_sharing_a_granule(self):
+        if jax.default_backend() != "tpu":
+            self.skipTest("the writer kernel requires a TPU")
+        rng = np.random.default_rng(0)
+        cache = _in_layout(_random_cache(rng, 8, 256), _SAL)
+        dst = jnp.asarray(
+            [252, 253, 254, 255, *range(1024, 1032), 250, 251, 1032, -1, -1, -1],
+            jnp.int32,
+        )
+        src = _random_rows(rng, dst.shape[0])
+        got = kv_cache_append.scatter_rows(jnp.copy(cache), src, dst, _SAL)
+        want = kv_cache_append.scatter_rows_reference(cache, src, dst, _SAL)
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
 if __name__ == "__main__":
     absltest.main()
