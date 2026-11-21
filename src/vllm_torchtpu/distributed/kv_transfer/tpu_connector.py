@@ -5193,8 +5193,9 @@ class TPURaidenConnectorWorker:
             # Registered ahead of the scheduler's finish (every pipeline
             # stage, or a send published in the prompt-completing step): no
             # TTL and no status probe until finished_req_ids names the
-            # request, as on the ungrouped path. This also arms the replace
-            # branch above, which keys on finish_pending.
+            # request, as on the ungrouped path. (The replace branch above
+            # no longer keys on finish_pending: any different uuid on a live
+            # registration replaces it, 990d8b32d1.)
             registered_ahead = (
                 pipeline or getattr(req_meta, "registered_ahead", False) is True
             )

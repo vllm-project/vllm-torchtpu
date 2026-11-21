@@ -286,12 +286,29 @@ def test_release_of_another_uuid_keeps_the_registration(kind, env):
 
 
 @pytest.mark.parametrize("kind", ["qwen", "dsv4"])
-def test_conflicting_send_without_release_or_ahead_still_raises(kind, env):
-    """Negative control: a second finish-time uuid for a live finish-time
-    registration is still a conflict (the fix only retires ahead sends)."""
+def test_second_finish_time_uuid_replaces_the_live_registration(kind, env):
+    """Jiaxin Cao's 990d8b32d1 ('a fresh send replaces a live ahead registration
+    after the finish too'): any different uuid on a live, non-terminal
+    registration retires it, finish_pending or not. (Before the rebase onto
+    caojx/qwen38-flash-1120 this was a negative control that expected the
+    duplicate-registration error.)"""
+    worker, facade = _worker(kind, env)
+    ahead, fresh, num_tokens = TABLES[kind]
+    _step(worker, send=_send(UUID_AHEAD, ahead, num_tokens, ahead=False))
+    _step(worker, send=_send(UUID_FRESH, fresh, num_tokens, ahead=False))
+    assert worker._stage3_registered_sends[REQ].uuid == UUID_FRESH
+    assert _registered_uuids(facade) == [UUID_AHEAD, UUID_FRESH]
+    assert _released(facade) == [(REQ, UUID_AHEAD)]
+
+
+@pytest.mark.parametrize("kind", ["qwen", "dsv4"])
+def test_same_uuid_on_other_pages_still_raises(kind, env):
+    """Negative control kept under the replace rule: the same uuid re-sent on
+    other pages is a conflict, not a replacement."""
     worker, facade = _worker(kind, env)
     ahead, fresh, num_tokens = TABLES[kind]
     _step(worker, send=_send(UUID_AHEAD, ahead, num_tokens, ahead=False))
     with pytest.raises(ValueError, match=DUP):
-        _step(worker, send=_send(UUID_FRESH, fresh, num_tokens, ahead=False))
+        _step(worker, send=_send(UUID_AHEAD, fresh, num_tokens, ahead=False))
     assert _registered_uuids(facade) == [UUID_AHEAD]
+    assert _released(facade) == []
