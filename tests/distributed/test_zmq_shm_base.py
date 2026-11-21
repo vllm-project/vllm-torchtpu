@@ -2412,6 +2412,103 @@ class TestGetFinished:
         assert conn._coord_done_recving == set()
 
 
+class TestFailedLoadsReportLoadErrors:
+    """A request reported as finished receiving must have its KV loaded, or
+    report its failure via `get_transfer_results().failed_recving` and
+    `get_block_ids_with_load_errors()` so the scheduler recomputes or fails
+    the request per `kv_load_failure_policy` instead of decoding on stale KV.
+    """
+
+    def test_failed_pull_reports_its_blocks_as_load_errors(self):
+        conn = _attach_runner(_make_conn(is_producer=False))
+        conn._coord_channel_executor = _InlineExecutor()
+        entry = _recv_entry(conn, uuid=11, req_id="d1")
+        sock = _FakeSocket(inbound=[[_frame(zsb._MSG_ERR)]])
+        with (
+            patch(f"{_BASE}.make_zmq_socket", return_value=sock),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1),
+        ):
+            conn._coord_rank0_pull(entry)
+        assert not entry.pull_ok
+
+        assert conn._coord_get_finished()[1] == {"d1"}
+        assert conn.get_block_ids_with_load_errors() == set(entry.local_blocks)
+
+    def test_unadmitted_load_reports_its_blocks_as_load_errors(self):
+        conn = _attach_runner(_make_conn(is_producer=False), num_slots=1)
+        conn._coord_pool.acquire_slot()
+        conn._coord_rank0_handle_new_load("d1", _load_meta(local_blocks=(3, 4)))
+
+        assert conn._coord_get_finished()[1] == {"d1"}
+        assert conn.get_block_ids_with_load_errors() == {3, 4}
+
+    def test_failed_pull_reports_failed_recving_via_get_transfer_results(self):
+        conn = _attach_runner(_make_conn(is_producer=False))
+        conn._coord_channel_executor = _InlineExecutor()
+        entry = _recv_entry(conn, uuid=11, req_id="d1")
+        sock = _FakeSocket(inbound=[[_frame(zsb._MSG_ERR)]])
+        with (
+            patch(f"{_BASE}.make_zmq_socket", return_value=sock),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1),
+        ):
+            conn._coord_rank0_pull(entry)
+        assert not entry.pull_ok
+
+        results = conn.get_transfer_results()
+        assert results.finished_recving == {"d1"}
+        assert results.failed_recving == {"d1"}
+        # Block-level errors are cleared once surfaced via failed_recving
+        # so multi-group KV layouts do not trip invalid_block_ids rejection.
+        assert conn.get_block_ids_with_load_errors() == set()
+        # Drained cleanly on subsequent calls.
+        follow_up = conn.get_transfer_results()
+        assert follow_up.finished_recving == set()
+        assert follow_up.failed_recving == set()
+
+    def test_unadmitted_load_reports_failed_recving_via_get_transfer_results(self):
+        conn = _attach_runner(_make_conn(is_producer=False), num_slots=1)
+        conn._coord_pool.acquire_slot()
+        conn._coord_rank0_handle_new_load("d1", _load_meta(local_blocks=(3, 4)))
+
+        results = conn.get_transfer_results()
+        assert results.finished_recving == {"d1"}
+        assert results.failed_recving == {"d1"}
+        assert conn.get_block_ids_with_load_errors() == set()
+
+    def test_load_errors_are_paired_with_get_finished_and_drained_once(self):
+        conn = _attach_runner(_make_conn(is_producer=False), num_slots=1)
+        conn._coord_pool.acquire_slot()
+        conn._coord_rank0_handle_new_load("d1", _load_meta(local_blocks=(5, 6)))
+
+        # Not surfaced before _coord_get_finished() emits "d1", preventing
+        # a race where a background failure leaks blocks one step early.
+        assert conn.get_block_ids_with_load_errors() == set()
+
+        assert conn._coord_get_finished()[1] == {"d1"}
+        assert conn.get_block_ids_with_load_errors() == {5, 6}
+        # Drained cleanly on subsequent calls.
+        assert conn.get_block_ids_with_load_errors() == set()
+
+    def test_non_coordinator_rank_reports_no_load_errors(self):
+        conn = _make_conn(is_producer=False, tp_rank=1, tp_size=2)
+        conn._coord_failed_recving.add("d1")
+        conn._coord_failed_block_ids.update({7, 8})
+        assert conn.get_block_ids_with_load_errors() == set()
+        results = conn.get_transfer_results()
+        assert results.finished_recving == set()
+        assert results.failed_recving == set()
+
+    def test_multiple_failed_loads_aggregate_blocks(self):
+        conn = _attach_runner(_make_conn(is_producer=False), num_slots=1)
+        conn._coord_pool.acquire_slot()
+        conn._coord_rank0_handle_new_load("d1", _load_meta(uuid=1, local_blocks=(1, 2)))
+        conn._coord_rank0_handle_new_load("d2", _load_meta(uuid=2, local_blocks=(3, 4)))
+
+        assert conn._coord_get_finished()[1] == {"d1", "d2"}
+        assert conn.get_block_ids_with_load_errors() == {1, 2, 3, 4}
+        assert conn.get_block_ids_with_load_errors() == set()
+
+
 class TestConnectorStats:
     def test_producer_records_the_prefill_queue_length(self):
         conn = _attach_runner(_make_conn())
