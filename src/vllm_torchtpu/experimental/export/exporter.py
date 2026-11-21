@@ -661,28 +661,34 @@ def _main_args_read(mlir_text: str) -> set[int]:
 def _params_read_by_forward(
     model: api.ExportableTextOnlyLLM, params_map: Mapping[str, Any]
 ) -> dict[str, Any]:
-    """Drops the forward weights that the forward graph never reads.
+    """Drops the forward weights that no forward bucket ever reads.
 
-    Candidates include buffers that only some configurations use (vocabulary
-    shard bounds are read only under tensor parallelism), so the smallest forward
-    bucket is lowered once with every candidate and unread ones are removed.
+    Candidates include buffers that only some configurations or bucket ranges
+    use (for example vocabulary shard bounds under tensor parallelism, or
+    sequence-parallel vs replicated rank buffers across `TPU_SP_MIN_ROWS`), so
+    both the smallest and largest forward buckets are lowered once and only
+    parameters unread across those buckets are removed.
     """
     cfg = model.export_config
     lm_head_name = _lm_head_name(params_map)
     names = [n for n in params_map if n != lm_head_name]
-    bucket = min(cfg.token_buckets)
-    mlir_text = tpu_lowering.lower_torch_forward_to_mlir(
-        model,
-        user_inputs=_user_inputs(
-            cfg, bucket, _req_dist_len(model), _block_tables_name(model)
-        ),
-        forward_names=names,
-        params_map=_norm_params(params_map),
-        state_specs=_state_specs(model),
-        bucket_size=bucket,
-        trailing_user_inputs=_extra_user_inputs(model),
-    )
-    read = _main_args_read(mlir_text)
+    norm_params = _norm_params(params_map)
+    req_dist_len = _req_dist_len(model)
+    block_tables_name = _block_tables_name(model)
+    state_specs = _state_specs(model)
+    trailing_user_inputs = _extra_user_inputs(model)
+    read: set[int] = set()
+    for bucket in dict.fromkeys((min(cfg.token_buckets), max(cfg.token_buckets))):
+        mlir_text = tpu_lowering.lower_torch_forward_to_mlir(
+            model,
+            user_inputs=_user_inputs(cfg, bucket, req_dist_len, block_tables_name),
+            forward_names=names,
+            params_map=norm_params,
+            state_specs=state_specs,
+            bucket_size=bucket,
+            trailing_user_inputs=trailing_user_inputs,
+        )
+        read |= _main_args_read(mlir_text)
     kept = {n for i, n in enumerate(names) if _NUM_USER_INPUTS + i in read}
     return {n: s for n, s in params_map.items() if n == lm_head_name or n in kept}
 

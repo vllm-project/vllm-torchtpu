@@ -235,3 +235,60 @@ def test_gated_norm_quant_op_reads_tile_env(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("TPU_GATED_NORM_TILE", "256")
     gated_norm_quant_op._build_ops(1e-6)
     assert (1e-6, 256) in gated_norm_quant_op._norm_ops
+
+
+def test_params_read_by_forward_unions_min_and_max_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_torchtpu.experimental.export import exporter
+
+    num_user = exporter._NUM_USER_INPUTS
+    seen_buckets: list[int] = []
+
+    def _fake_lower(
+        _model,
+        *,
+        user_inputs,
+        forward_names,
+        params_map,
+        state_specs,
+        bucket_size: int,
+        trailing_user_inputs,
+    ) -> str:
+        del user_inputs, forward_names, params_map, state_specs, trailing_user_inputs
+        seen_buckets.append(bucket_size)
+        args = ", ".join(f"%arg{i}: tensor<1xi32>" for i in range(num_user + 3))
+        # arg 0..num_user-1: user inputs; forward_names:
+        #   0 -> only_small_buf, 1 -> only_large_buf, 2 -> unused_buf
+        if bucket_size == 4:
+            return f"func.func public @main({args}) {{\n  return %arg{num_user}\n}}"
+        if bucket_size == 512:
+            return f"func.func public @main({args}) {{\n  return %arg{num_user + 1}\n}}"
+        raise AssertionError(f"unexpected bucket {bucket_size}")
+
+    monkeypatch.setattr(
+        exporter.tpu_lowering, "lower_torch_forward_to_mlir", _fake_lower
+    )
+    monkeypatch.setattr(exporter, "_user_inputs", lambda *_args: ())
+    monkeypatch.setattr(exporter, "_req_dist_len", lambda _model: None)
+    monkeypatch.setattr(exporter, "_block_tables_name", lambda _model: None)
+    monkeypatch.setattr(exporter, "_state_specs", lambda _model: {})
+    monkeypatch.setattr(exporter, "_extra_user_inputs", lambda _model: ())
+
+    fake_model = SimpleNamespace(
+        export_config=SimpleNamespace(
+            token_buckets=(4, 16, 256, 512),
+            max_num_seqs=4,
+            block_size=16,
+            is_multimodal=False,
+        )
+    )
+    params_map = {
+        "only_small_buf": SimpleNamespace(shape=(1,), dtype=torch.int32),
+        "only_large_buf": SimpleNamespace(shape=(1,), dtype=torch.int64),
+        "unused_buf": SimpleNamespace(shape=(1,), dtype=torch.int32),
+        "lm_head.weight": SimpleNamespace(shape=(32, 16), dtype=torch.bfloat16),
+    }
+    kept = exporter._params_read_by_forward(fake_model, params_map)
+    assert seen_buckets == [4, 512]
+    assert set(kept) == {"only_small_buf", "only_large_buf", "lm_head.weight"}
