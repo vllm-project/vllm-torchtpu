@@ -238,11 +238,9 @@ def _draft_path_keys(monkeypatch, **values):
 
 
 def _qwen35_mtp_config(arch="Qwen3_5MoeForConditionalGeneration", method="mtp"):
-    from types import SimpleNamespace as NS
-
-    return NS(
-        model_config=NS(architectures=[arch]),
-        speculative_config=None if method is None else NS(method=method),
+    return SimpleNamespace(
+        model_config=SimpleNamespace(architectures=[arch]),
+        speculative_config=None if method is None else SimpleNamespace(method=method),
     )
 
 
@@ -291,8 +289,6 @@ def test_qwen3_5_mtp_rule_holds_only_where_validated(
     device it was validated on (Qwen3.5-397B-A17B on TPU7x); another Qwen3.5
     checkpoint or device keeps main's opt-in keys, and that checkpoint on a
     chip that cannot be read warns once."""
-    from types import SimpleNamespace as NS
-
     from vllm_torchtpu.models.qwen3_5 import hooks
 
     monkeypatch.setattr(draft_path_rules, "_RULES", [hooks.mtp_draft_path])
@@ -300,7 +296,7 @@ def test_qwen3_5_mtp_rule_holds_only_where_validated(
     warned = []
     monkeypatch.setattr(hooks.logger, "warning_once", lambda *a, **k: warned.append(a))
     config = _qwen35_mtp_config()
-    config.model_config.hf_text_config = NS(
+    config.model_config.hf_text_config = SimpleNamespace(
         num_experts=num_experts, hidden_size=4096, num_hidden_layers=60
     )
     assert draft_path_rules.holds(config) is expected

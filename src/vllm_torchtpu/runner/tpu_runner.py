@@ -1624,7 +1624,7 @@ class TPUModelRunner(GPUModelRunner):
             logger.info(
                 "Draft-path rule for this engine: %s.",
                 ", ".join(draft_path_rules.matching(vllm_config))
-                or "none (main's opt-in keys apply)",
+                or "none (the opt-in env keys apply)",
             )
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().

@@ -34,6 +34,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutPlan,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner import greedy_top_tokens
 from vllm_torchtpu.spec_decode import draft_path_rules
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -484,8 +485,6 @@ def maybe_share_lm_head(
             "defaulting to share lm_head with the target."
         )
         share_lm_head = True
-
-    from vllm_torchtpu.runner import greedy_top_tokens
 
     if not share_lm_head:
         greedy_top_tokens.release_draft_bf16_head(
