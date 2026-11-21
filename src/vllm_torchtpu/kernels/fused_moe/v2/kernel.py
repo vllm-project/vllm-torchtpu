@@ -1355,7 +1355,7 @@ def _build_fused_ep_moe_kernel(
                     device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
-        def tp_barrier(step):
+        def tp_barrier_signal(step):
             bpar = lax.rem(step, jnp.int32(2))
 
             @pl.when(bpar == 0)
@@ -1367,7 +1367,6 @@ def _build_fused_ep_moe_kernel(
                         device_id=(tp_grp * ep_tp_size + m,),
                         device_id_type=pl.DeviceIdType.MESH,
                     )
-                pl.semaphore_wait(tp_bar_sem.at[0], ep_tp_size)
 
             @pl.when(bpar == 1)
             def _():
@@ -1378,6 +1377,16 @@ def _build_fused_ep_moe_kernel(
                         device_id=(tp_grp * ep_tp_size + m,),
                         device_id_type=pl.DeviceIdType.MESH,
                     )
+
+        def tp_barrier_wait(step):
+            bpar = lax.rem(step, jnp.int32(2))
+
+            @pl.when(bpar == 0)
+            def _():
+                pl.semaphore_wait(tp_bar_sem.at[0], ep_tp_size)
+
+            @pl.when(bpar == 1)
+            def _():
                 pl.semaphore_wait(tp_bar_sem.at[1], ep_tp_size)
 
         # ---- TP-pair weight transport (ep_tp_size == 2) ----
@@ -1745,7 +1754,7 @@ def _build_fused_ep_moe_kernel(
             @pl.when(visit_i + 1 < n_tp_visit)
             def _():
                 s = lax.rem(visit_i, jnp.int32(tp_w1p_slots))
-                tp_barrier(visit_i)
+                tp_barrier_wait(visit_i)
                 if ep_tp_z_clone:
 
                     @pl.when(visit_i + 1 == z_recv_step)
@@ -2143,63 +2152,58 @@ def _build_fused_ep_moe_kernel(
 
             def commit_tile(parity, t, tile_block_base, live_blocks):
                 """Commit the tile's intersection with each (expert, dest) run."""
-                # The runs tile the expert slab contiguously, so the
-                # per-dest lengths sum to exactly live_blocks. Rows go per
-                # run; the scales go once, below, because a tile's are one
-                # sublane wherever its rows went.
-                for d in range(ep):
-                    run_start = commit_start_sm[e, d]
-                    run_len = commit_len_sm[e, d]
-                    lo = jnp.maximum(run_start, tile_block_base)
-                    hi = jnp.minimum(run_start + run_len, tile_block_base + live_blocks)
-                    overlap = jnp.maximum(hi - lo, 0)
-                    # An empty intersection leaves lo unclamped, so the
-                    # offsets below can point out of range; the copies are
-                    # predicated out rather than issued at zero length. The
-                    # commit waits count bytes, and a skipped copy
-                    # contributes zero bytes either way.
-                    lo = jnp.minimum(lo, hi)
-                    src_block = lo - tile_block_base
-                    dst_block = contrib_off_sm[e, d] + (lo - run_start)
-                    self_dst_block = push_dst_sm[e, d] + (lo - run_start)
-                    is_me = jnp.int32(d) == me
+                # Avoid ep-way per-destination DMA loop: expert-contiguous
+                # contrib collapses remote runs into pre-me and post-me spans.
+                tile_hi = tile_block_base + live_blocks
+                exp_contrib_base = contrib_off_sm[e, 0]
+                me_lo = commit_start_sm[e, me]
+                me_hi = me_lo + commit_len_sm[e, me]
 
-                    @pl.when(overlap > 0)
-                    def _(
-                        src_block=src_block,
-                        dst_block=dst_block,
-                        self_dst_block=self_dst_block,
-                        overlap=overlap,
-                        parity=parity,
-                        is_me=is_me,
-                    ):
-                        # Avoid HBM-to-HBM mehop copy for own-dest rows: write directly.
-                        @pl.when(is_me)
-                        def _():
-                            pltpu.make_async_copy(
-                                out_vm.at[
-                                    parity, pl.ds(src_block * ROWBLK, overlap * ROWBLK)
-                                ],
-                                recv_hbm.at[
-                                    pl.ds(self_dst_block * ROWBLK, overlap * ROWBLK)
-                                ],
-                                commit_sems.at[parity],
-                            ).start()
+                pre_hi = jnp.minimum(tile_hi, me_lo)
+                pre_len = jnp.maximum(pre_hi - tile_block_base, 0)
 
-                        @pl.when(jnp.logical_not(is_me))
-                        def _():
-                            pltpu.make_async_copy(
-                                out_vm.at[
-                                    parity, pl.ds(src_block * ROWBLK, overlap * ROWBLK)
-                                ],
-                                contrib_hbm.at[
-                                    pl.ds(dst_block * ROWBLK, overlap * ROWBLK)
-                                ],
-                                commit_sems.at[parity],
-                            ).start()
+                own_lo = jnp.maximum(tile_block_base, me_lo)
+                own_hi = jnp.minimum(tile_hi, me_hi)
+                own_len = jnp.maximum(own_hi - own_lo, 0)
+                own_lo_clamped = jnp.minimum(own_lo, own_hi)
+                own_src = own_lo_clamped - tile_block_base
+                own_dst = push_dst_sm[e, me] + (own_lo_clamped - me_lo)
 
-                # The tile's scales are one sublane wherever its rows
-                # went, so they commit once, outside the per-dest loop.
+                post_lo = jnp.maximum(tile_block_base, me_hi)
+                post_len = jnp.maximum(tile_hi - post_lo, 0)
+                post_lo_clamped = jnp.minimum(post_lo, tile_hi)
+                post_src = post_lo_clamped - tile_block_base
+                post_dst = exp_contrib_base + post_lo_clamped
+
+                @pl.when(pre_len > 0)
+                def _():
+                    pltpu.make_async_copy(
+                        out_vm.at[parity, pl.ds(0, pre_len * ROWBLK)],
+                        contrib_hbm.at[
+                            pl.ds(
+                                (exp_contrib_base + tile_block_base) * ROWBLK,
+                                pre_len * ROWBLK,
+                            )
+                        ],
+                        commit_sems.at[parity],
+                    ).start()
+
+                @pl.when(own_len > 0)
+                def _():
+                    pltpu.make_async_copy(
+                        out_vm.at[parity, pl.ds(own_src * ROWBLK, own_len * ROWBLK)],
+                        recv_hbm.at[pl.ds(own_dst * ROWBLK, own_len * ROWBLK)],
+                        commit_sems.at[parity],
+                    ).start()
+
+                @pl.when(post_len > 0)
+                def _():
+                    pltpu.make_async_copy(
+                        out_vm.at[parity, pl.ds(post_src * ROWBLK, post_len * ROWBLK)],
+                        contrib_hbm.at[pl.ds(post_dst * ROWBLK, post_len * ROWBLK)],
+                        commit_sems.at[parity],
+                    ).start()
+
                 pltpu.make_async_copy(
                     oscl_vm.at[parity],
                     cscl_hbm.at[pl.ds(_mirror_base(e) + t, 1)],
@@ -2989,6 +2993,12 @@ def _build_fused_ep_moe_kernel(
 
                 carry = expert_tiles(e, visit_i, carry)
 
+                # Avoid delaying pair-barrier signal behind commit drain and ICI
+                # push: early signal hides D2D rendezvous behind local tail work.
+                @pl.when(visit_i + 1 < n_tp_visit)
+                def _():
+                    tp_barrier_signal(visit_i)
+
                 # Next expert's first tile starts before tp_barrier so row
                 # gather hides behind any pair straggler wait.
                 @pl.when(visit_i + 1 < n_tp_visit)
@@ -3062,7 +3072,8 @@ def _build_fused_ep_moe_kernel(
                     z_send_sems.at[3],
                 ).wait()
 
-        _all_pairs_barrier(ep)
+        # Avoid trailing all-pairs barrier: every send/recv/pair/Z semaphore is
+        # drained above, and an exit barrier stalls fast shards on stragglers.
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
 
@@ -3610,13 +3621,20 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
         # contiguous SMEM run and its 2 * topk scalar reads share a single
         # address computation. That is also the order the plan builds them in,
         # so neither flatten is a transpose.
-        if pos.shape != (t_local, topk) or coef.shape != (t_local, topk):
+        valid_shapes = ((t_local, topk), (t_local * topk,))
+        if pos.shape not in valid_shapes or coef.shape not in valid_shapes:
             raise ValueError(
                 f"the combine takes token-major "
-                f"[{t_local}, {topk}] tables, got pos "
+                f"[{t_local}, {topk}] or [{t_local * topk}] tables, got pos "
                 f"{pos.shape} and coef {coef.shape}"
             )
-        return call(pos.astype(jnp.int32).reshape(-1), coef.reshape(-1), arrivals)
+        pos_1d = (
+            pos.astype(jnp.int32)
+            if pos.ndim == 1
+            else pos.astype(jnp.int32).reshape(-1)
+        )
+        coef_1d = coef if coef.ndim == 1 else coef.reshape(-1)
+        return call(pos_1d, coef_1d, arrivals)
 
     return fn
 

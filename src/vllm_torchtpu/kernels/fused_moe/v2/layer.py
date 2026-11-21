@@ -91,7 +91,14 @@ def _row_routes(scores, gate_l):
 
 
 def _combine_arrivals(
-    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+    arrivals,
+    arrival_scales,
+    pos,
+    mirror_pos,
+    topk_weights,
+    out_dtype,
+    *,
+    topk_weights_1d=None,
 ):
     """Combine arrivals [rows, lane blocks, 128] into [t_local, hidden].
 
@@ -121,11 +128,7 @@ def _combine_arrivals(
     # A gather clamps an out-of-range index to the last one; a DMA does not,
     # and a sublane index clamped on its own would pair the last sublane with
     # the wrong lane. Neither position is ever negative.
-    rows = jnp.minimum(pos, recv_rows - 1)
     shift = pow2_shift(tile_m, "the mirror's lane count")
-    scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
-    row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
-    coef = row_scales * topk_weights.astype(jnp.float32)
     if combine_step_tokens(t_local):
         combine = build_combine_kernel(
             t_local=t_local,
@@ -135,7 +138,22 @@ def _combine_arrivals(
             wire_dtype=arrivals.dtype,
             out_dtype=out_dtype,
         )
-        return combine(arrivals, coef, rows)
+        # Avoid 2D [t_local, topk] clamp and scale multiply on the kernel path:
+        # topk < 128 pads the minor axis to a full lane block and adds a retile.
+        rows_1d = jnp.minimum(pos.reshape(-1), recv_rows - 1)
+        scl_1d = jnp.minimum(mirror_pos.reshape(-1), mirror_sublanes * tile_m - 1)
+        row_scales_1d = arrival_scales[
+            jnp.right_shift(scl_1d, shift), scl_1d & (tile_m - 1)
+        ]
+        tw_1d = (
+            topk_weights_1d
+            if topk_weights_1d is not None
+            else topk_weights.astype(jnp.float32).reshape(-1)
+        )
+        return combine(arrivals, row_scales_1d * tw_1d, rows_1d)
+    scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
+    row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
+    coef = row_scales * topk_weights.astype(jnp.float32)
     rows_fp8 = arrivals[pos.T.reshape(-1)]  # f8 [K*t, lane blocks, 128]
     coef_k = coef.T.reshape(-1)  # k-major [K*t_local]
     terms = []
@@ -431,6 +449,9 @@ def _select_z_clone_plan(
     hot_global = chip_base_1d + z_hot_phys
     per_rank_hot = jnp.take(rows_by_dest, hot_global, axis=1)
 
+    # Avoid activating z_clone when 0 remote rows move: z_partner would skip an
+    # empty slot_z visit and leave z_recv_sems unwaited.
+    min_rem = max(int(z_min_remote), 1)
     if z_waterfill:
         # Avoid offloading all remote-host ranks blindly: bidirectional Z-clones
         # or pushes onto a heavier Z-partner thrash the inter-host link and raise
@@ -454,7 +475,7 @@ def _select_z_clone_plan(
         k_idx = jnp.arange(half_ep + 1, dtype=jnp.int32)[None, :]
         pen = jnp.where(k_idx == 0, jnp.int32(0), jnp.int32(visit_pen))
         valid_opt = (k_idx == 0) | (
-            (opts >= jnp.int32(z_min_remote))
+            (opts >= jnp.int32(min_rem))
             & (z_hot_tot[:, None] >= jnp.int32(z_min_total))
             & (gap[:, None] >= jnp.int32(z_min_total))
         )
@@ -469,7 +490,7 @@ def _select_z_clone_plan(
             :, 0
         ]
         legacy_active = (z_hot_tot >= jnp.int32(z_min_total)) & (
-            z_hot_rem >= jnp.int32(z_min_remote)
+            z_hot_rem >= jnp.int32(min_rem)
         )
         best_k = jnp.where(legacy_active, jnp.int32(half_ep), jnp.int32(0))
 
@@ -599,7 +620,6 @@ def rebalance_ep_tp_pair_experts(
         )
 
     assert me is not None and t_local is not None and topk is not None
-    half_ep = ep // 2
     half_chips = n_chips // 2
     g_plan = g_local + k_split + int(z_clone)
     slot_z = g_local + k_split
@@ -616,7 +636,7 @@ def rebalance_ep_tp_pair_experts(
             best_k,
             src_is_h1,
             src_rem_ord,
-            _,
+            take_rc,
             counts_for_split,
         ) = _select_z_clone_plan(
             rows_by_dest,
@@ -637,6 +657,7 @@ def rebalance_ep_tp_pair_experts(
         best_k = None
         src_is_h1 = None
         src_rem_ord = None
+        take_rc = None
         counts_for_split = counts_chip
 
     if k_split > 0:
@@ -654,29 +675,34 @@ def rebalance_ep_tp_pair_experts(
     split_match = jnp.where(
         split_active, chip_base_1d[:, None] + split_phys, jnp.int32(-1)
     )
+    use_rank_take_mask = bool(z_clone and n_chips <= 32)
     if z_clone:
         assert (
             chip_host is not None
             and z_active is not None
             and z_hot_phys is not None
             and best_k is not None
+            and take_rc is not None
         )
         z_match = jnp.where(z_active, chip_base_1d + z_hot_phys, jnp.int32(-1))
-        # Avoid 8-way _select_by_chip over 131K global pairs when best_k fits in
-        # 4-bit nibbles (0..8 per chip across <= 8 chips = one uint32 scalar).
-        if n_chips <= 8 and half_ep <= 8:
-            packed_best_k = jnp.sum(
+        if use_rank_take_mask:
+            # Avoid broadcasting [ep, t_local * topk] host and rank-ordinal
+            # tables: packing take_rc into one uint32 bitmask per rank tests
+            # chip membership in place.
+            take_mask_by_rank = jnp.sum(
                 jnp.left_shift(
-                    best_k.astype(jnp.uint32),
-                    jnp.arange(n_chips, dtype=jnp.uint32) * jnp.uint32(4),
+                    take_rc.astype(jnp.uint32),
+                    jnp.arange(n_chips, dtype=jnp.uint32)[None, :],
                 ),
+                axis=1,
+                keepdims=True,
                 dtype=jnp.uint32,
             )
         else:
-            packed_best_k = None
+            take_mask_by_rank = None
     else:
         z_match = None
-        packed_best_k = None
+        take_mask_by_rank = None
 
     def _remap_with_splits(ids, tok_par, tok_host, tok_rem_ord):
         valid = (ids >= jnp.int32(0)) & (ids < jnp.int32(e_total))
@@ -697,20 +723,26 @@ def rebalance_ep_tp_pair_experts(
         log_id = core * jnp.int32(g_plan) + slot
         ch = jnp.right_shift(ids, chip_shift)
         if z_clone:
-            ch_host = ch >= jnp.int32(half_chips)
             z_m = _select_by_chip(ch, z_match, n_chips)
-            if packed_best_k is not None:
-                k_take = jnp.bitwise_and(
-                    jnp.right_shift(
-                        packed_best_k, jnp.left_shift(ch, 2).astype(jnp.uint32)
-                    ),
-                    jnp.uint32(0xF),
-                ).astype(jnp.int32)
+            if take_mask_by_rank is not None:
+                ch_2d = jnp.clip(ch, 0, n_chips - 1).reshape(ep, t_local * topk)
+                take_z = (
+                    jnp.bitwise_and(
+                        jnp.right_shift(take_mask_by_rank, ch_2d.astype(jnp.uint32)),
+                        jnp.uint32(1),
+                    )
+                    != jnp.uint32(0)
+                ).reshape(ch.shape)
+                hit_z = valid & (ids == z_m) & take_z
             else:
+                ch_host = ch >= jnp.int32(half_chips)
                 k_take = _select_by_chip(ch, best_k, n_chips)
-            hit_z = (
-                valid & (ids == z_m) & (tok_host != ch_host) & (tok_rem_ord < k_take)
-            )
+                hit_z = (
+                    valid
+                    & (ids == z_m)
+                    & (tok_host != ch_host)
+                    & (tok_rem_ord < k_take)
+                )
         else:
             hit_z = None
         for k in range(k_split):
@@ -738,7 +770,7 @@ def rebalance_ep_tp_pair_experts(
         (jnp.arange(n_tokens, dtype=jnp.int32) & jnp.int32(1))[:, None],
         (n_tokens, topk),
     ).reshape(pairs_g.shape)
-    if z_clone:
+    if z_clone and not use_rank_take_mask:
         assert src_is_h1 is not None and src_rem_ord is not None
         global_host = jnp.broadcast_to(
             src_is_h1[:, None], (ep, t_local * topk)
@@ -1157,6 +1189,13 @@ def fused_ep_moe_v2(
             topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
         topk_weights = jnp.where(row_routes, topk_weights, 0.0)
         topk_idx = jnp.where(row_routes, topk_idx, jnp.int32(e_total))
+        # Avoid deferring topk_weights 2D->1D relayout to the combine epilogue:
+        # flattening in the prologue hides the retile under the dispatch gather.
+        topk_weights_1d = (
+            lax.optimization_barrier(topk_weights.astype(jnp.float32).reshape(-1))
+            if combine_step_tokens(t_local)
+            else None
+        )
         # A count of the masked rows would be the other half of this: an
         # incident today is degraded output against a completely clean log.
         # It is not added here because the only in-trace channel for it,
@@ -1219,23 +1258,15 @@ def fused_ep_moe_v2(
                 z_min_total=z_min_total,
                 z_min_remote=z_min_remote,
             )
-            if use_z_clone:
-                (
-                    pairs_g,
-                    local_blocks,
-                    block_hist,
-                    rows_by_dest,
-                    tp_slot_to_local_phys,
-                    z_push_phys_by_chip,
-                ) = rebal
-            else:
-                (
-                    pairs_g,
-                    local_blocks,
-                    block_hist,
-                    rows_by_dest,
-                    tp_slot_to_local_phys,
-                ) = rebal
+            (
+                pairs_g,
+                local_blocks,
+                block_hist,
+                rows_by_dest,
+                tp_slot_to_local_phys,
+            ) = rebal[:5]
+            if len(rebal) == 6:
+                z_push_phys_by_chip = rebal[5]
         gathered = GatheredPairs(
             expert_blocks=pairs_g.reshape(T * topk // block, block),
             local_blocks=local_blocks,
@@ -1425,7 +1456,13 @@ def fused_ep_moe_v2(
             )
         )
         combined = _combine_arrivals(
-            arrivals, arrival_scales, pos, mirror_pos, topk_weights, x_l.dtype
+            arrivals,
+            arrival_scales,
+            pos,
+            mirror_pos,
+            topk_weights,
+            x_l.dtype,
+            topk_weights_1d=topk_weights_1d,
         )
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.

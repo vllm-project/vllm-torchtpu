@@ -1143,15 +1143,12 @@ def shard_transport_tables_in_blocks(routing, me, *, e_total, ep):
     recv_base = routing.recv_base  # [d, s, g]
 
     not_me = jnp.arange(ep) != me
-    # contrib includes the own-dest region, which hops to recvbuf later.
-    out_total = my_region_rows.sum(axis=0)  # [d] incl. me
-    contrib_base = jnp.cumsum(out_total) - out_total  # [d]
-    grp_off = jnp.cumsum(my_region_rows, axis=0) - my_region_rows  # [g, d]
-
-    # One expert per push, so an expert's contrib offset is its region's.
-    contrib_off = contrib_base[None, :] + grp_off  # [G, d]
-
-    push_src = contrib_base[None, :] + grp_off  # [g, d]
+    # Avoid destination-major contrib packing: interleaving experts forces
+    # commit_tile to emit ep predicated DMAs per tile instead of <= 3 spans.
+    my_expert_rows = my_region_rows.sum(axis=1)
+    my_expert_base = jnp.cumsum(my_expert_rows) - my_expert_rows
+    contrib_off = my_expert_base[:, None] + run_start
+    push_src = contrib_off
     push_len = my_region_rows
     # recv_base[d (receiver), me (src), g] for every d: [d, g] -> [g, d].
     my_recv_base = lax.dynamic_slice(recv_base, (0, me, 0), (ep, 1, g_local))[:, 0]

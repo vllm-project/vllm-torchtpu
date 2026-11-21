@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+import io
+import os
+import subprocess
+import sys
 from unittest import mock
 
 import jax
@@ -19,11 +24,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax._src.pallas.mosaic import tpu_info
+from jax._src.pallas.mosaic.interpret import interpret_pallas_call
 from jax.experimental.pallas import tpu as pltpu
-from jax.sharding import AbstractMesh, NamedSharding
+from jax.sharding import AbstractMesh, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.fused_moe.v2.host import WeightFormat
+from vllm_torchtpu.kernels.fused_moe.v2.kernel import build_combine_kernel
 from vllm_torchtpu.kernels.fused_moe.v2.layer import (
     fused_ep_moe_v2,
     rebalance_ep_tp_pair_experts,
@@ -393,7 +400,7 @@ def test_should_partially_waterfill_remote_ranks_when_hot_tokens_all_remote():
         )
 
 
-@pytest.mark.parametrize("ep", [12, 32])
+@pytest.mark.parametrize("ep", [12, 32, 68])
 def test_should_conserve_waterfill_histograms_for_non_pow2_and_wide_ep(ep: int):
     g_local, k_split, topk, t_local = 4, 2, 2, 16
     e_total = ep * g_local
@@ -503,7 +510,8 @@ def test_should_preserve_sentinels_with_z_clone_across_k_split(k_split: int):
     )
 
 
-def test_should_lower_fused_ep_moe_v2_z_clone_to_tpu7x_mlir():
+@pytest.mark.parametrize("z_clone", [True, False], ids=["z_on", "z_off"])
+def test_should_lower_fused_ep_moe_v2_z_clone_to_tpu7x_mlir(z_clone: bool):
     fake_info = tpu_info.get_tpu_info_for_chip(tpu_info.ChipVersion.TPU_7X, 1)
     mesh = AbstractMesh((16,), ("ep",))
     sh = NamedSharding(mesh, P("ep"))
@@ -526,7 +534,7 @@ def test_should_lower_fused_ep_moe_v2_z_clone_to_tpu7x_mlir():
             scoring_fn="sigmoid",
             ep_tp_size=2,
             ep_tp_row_splits=4,
-            ep_tp_z_clone=True,
+            ep_tp_z_clone=z_clone,
             ep_tp_z_clone_delay=4,
         )
 
@@ -547,5 +555,232 @@ def test_should_lower_fused_ep_moe_v2_z_clone_to_tpu7x_mlir():
             sds((16, 1), jnp.int32),
         )
     mlir = exported.mlir_module()
-    assert "_zclone" in mlir
+    assert ("_zclone" in mlir) is z_clone
     assert "partition_id" not in mlir
+
+
+@pytest.mark.parametrize("z_waterfill", [True, False], ids=["waterfill", "legacy"])
+def test_should_keep_z_clone_inactive_when_remote_rows_zero_and_min_remote_zero(
+    z_waterfill: bool,
+):
+    ep, g_local, k_split, topk, t_local = 8, 2, 1, 2, 32
+    e_total = ep * g_local
+    ids = np.zeros((ep * t_local, topk), dtype=np.int32)
+    # Host 0 tokens (ranks 0..3) hit chip 0 expert 0; Host 1 tokens hit chip 2 expert 8.
+    ids[: (ep // 2) * t_local, :] = 0
+    ids[(ep // 2) * t_local :, :] = 8
+    pairs_g, rbd, t_local, topk, n_blocks = _build_routing_inputs(
+        ids, ep=ep, e_total=e_total
+    )
+    local_blocks = pairs_g[0].reshape(n_blocks, -1)
+    block_hist = jnp.stack(
+        [jnp.bincount(local_blocks[b], length=e_total) for b in range(n_blocks)], axis=0
+    ).astype(jnp.int32)
+
+    _, _, _, new_rbd, _, z_push = rebalance_ep_tp_pair_experts(
+        pairs_g,
+        local_blocks,
+        block_hist,
+        rbd,
+        ep=ep,
+        ep_tp_size=2,
+        g_local=g_local,
+        e_total=e_total,
+        k_split=k_split,
+        capacity=16,
+        me=jnp.int32(0),
+        t_local=t_local,
+        topk=topk,
+        z_clone=True,
+        z_min_total=16,
+        z_min_remote=0,
+        z_waterfill=z_waterfill,
+    )
+    g_plan = g_local + k_split + 1
+    assert np.all(np.asarray(z_push) == -1)
+    assert int(np.asarray(new_rbd).reshape(ep, ep, g_plan)[:, :, g_plan - 1].sum()) == 0
+
+
+def test_should_produce_identical_output_when_combine_kernel_receives_1d_or_2d_tables():
+    fake_info = tpu_info.get_tpu_info_for_chip(tpu_info.ChipVersion.TPU_7X, 1)
+    t_local, topk, lane_blocks, lanes = 256, 2, 1, 128
+    hidden = lane_blocks * lanes
+    rng = np.random.default_rng(77)
+    arr_f32 = rng.standard_normal((512, lane_blocks, lanes)).astype(np.float32) * 0.5
+    pos_2d = jnp.asarray(rng.integers(0, 512, size=(t_local, topk), dtype=np.int32))
+    coef_2d = jnp.asarray(
+        (rng.uniform(0.1, 1.3, size=(t_local, topk))).astype(np.float32)
+    )
+    with (
+        mock.patch.object(pltpu, "get_tpu_info", return_value=fake_info),
+        mock.patch.object(tpu_info, "get_tpu_info", return_value=fake_info),
+        pltpu.force_tpu_interpret_mode(pltpu.InterpretParams(detect_races=True)),
+    ):
+        arr = jnp.asarray(arr_f32).astype(jnp.float8_e4m3fn)
+        combine = build_combine_kernel(
+            t_local=t_local,
+            topk=topk,
+            hidden=hidden,
+            lane_blocks=lane_blocks,
+            wire_dtype=jnp.float8_e4m3fn,
+            out_dtype=jnp.bfloat16,
+        )
+        with pytest.raises(ValueError, match="token-major"):
+            combine(arr, coef_2d[:, :1], pos_2d)
+        pltpu.reset_tpu_interpret_mode_state()
+        with contextlib.redirect_stdout(io.StringIO()):
+            out_2d = np.asarray(combine(arr, coef_2d, pos_2d)).view(np.uint16)
+        assert not interpret_pallas_call.races.races_found
+        pltpu.reset_tpu_interpret_mode_state()
+        with contextlib.redirect_stdout(io.StringIO()):
+            out_1d = np.asarray(
+                combine(arr, coef_2d.reshape(-1), pos_2d.reshape(-1))
+            ).view(np.uint16)
+        assert not interpret_pallas_call.races.races_found
+    np.testing.assert_array_equal(out_1d, out_2d)
+
+
+def _run_two_layer_z_clone_race_and_parity_check() -> None:
+    fake_info = tpu_info.get_tpu_info_for_chip(tpu_info.ChipVersion.TPU_7X, 1)
+    devs = sorted(jax.devices("cpu"), key=lambda d: d.id)[:8]
+    assert len(devs) == 8
+    mesh = Mesh(np.asarray(devs), ("d",))
+    shd = NamedSharding(mesh, P("d"))
+    t_tot, hid, inter_sl, g_loc = 8 * 16, 128, 128, 2
+    e_tot = 8 * g_loc
+    w_exp = 2 * e_tot
+
+    x_raw = jax.random.normal(jax.random.PRNGKey(1), (t_tot, hid), jnp.bfloat16) * 0.3
+    x_raw = x_raw.at[0, :].set(jnp.bfloat16(jnp.nan))
+    x_m = jax.device_put(x_raw, shd)
+    w1_m = jax.device_put(
+        jax.random.normal(
+            jax.random.PRNGKey(2), (w_exp, hid, 2 * inter_sl), jnp.bfloat16
+        ).astype(jnp.float8_e4m3fn),
+        shd,
+    )
+    w2_m = jax.device_put(
+        jax.random.normal(
+            jax.random.PRNGKey(3), (w_exp, inter_sl, hid), jnp.bfloat16
+        ).astype(jnp.float8_e4m3fn),
+        shd,
+    )
+    s1_m = jax.device_put(
+        jnp.abs(jax.random.normal(jax.random.PRNGKey(4), (w_exp, 2 * inter_sl))) * 0.02
+        + 1e-4,
+        shd,
+    )
+    s2_m = jax.device_put(
+        jnp.abs(jax.random.normal(jax.random.PRNGKey(5), (w_exp, hid))) * 0.02 + 1e-4,
+        shd,
+    )
+    skew1 = jnp.zeros((e_tot,), dtype=jnp.float32).at[0].set(9.0).at[8].set(-20.0)
+    skew2 = jnp.zeros((e_tot,), dtype=jnp.float32).at[12].set(9.0).at[4].set(-20.0)
+    gt1 = jax.device_put(
+        (
+            jax.random.normal(jax.random.PRNGKey(6), (t_tot, e_tot), jnp.float32) * 0.2
+            + skew1[None, :]
+        )
+        .at[0, :]
+        .set(-jnp.inf),
+        shd,
+    )
+    gt2 = jax.device_put(
+        (
+            jax.random.normal(jax.random.PRNGKey(7), (t_tot, e_tot), jnp.float32) * 0.2
+            + skew2[None, :]
+        )
+        .at[0, :]
+        .set(-jnp.inf),
+        shd,
+    )
+    rk8 = jax.device_put(jnp.arange(8, dtype=jnp.int32).reshape(8, 1), shd)
+
+    def _run_pair(z_clone: int) -> np.ndarray:
+        def _fn(x_in):
+            y1 = fused_ep_moe_v2(
+                x_in,
+                w1_m,
+                w2_m,
+                s1_m,
+                s2_m,
+                gt1,
+                topk=4,
+                renormalize=True,
+                mesh=mesh,
+                capacity=16,
+                rank=rk8,
+                weight_format=WeightFormat.FP8,
+                sharded_plan=True,
+                scoring_fn="sigmoid",
+                ep_tp_size=2,
+                ep_tp_row_splits=2,
+                ep_tp_z_clone=z_clone,
+                ep_tp_z_clone_min_total=16,
+                ep_tp_z_clone_min_remote=8,
+            )
+            x2 = jnp.where(jnp.isfinite(x_in), x_in + y1, jnp.bfloat16(0.0)).astype(
+                jnp.bfloat16
+            )
+            return fused_ep_moe_v2(
+                x2,
+                w1_m,
+                w2_m,
+                s1_m,
+                s2_m,
+                gt2,
+                topk=4,
+                renormalize=True,
+                mesh=mesh,
+                capacity=16,
+                rank=rk8,
+                weight_format=WeightFormat.FP8,
+                sharded_plan=True,
+                scoring_fn="sigmoid",
+                ep_tp_size=2,
+                ep_tp_row_splits=2,
+                ep_tp_z_clone=z_clone,
+                ep_tp_z_clone_min_total=16,
+                ep_tp_z_clone_min_remote=8,
+            )
+
+        with (
+            mock.patch.object(pltpu, "get_tpu_info", return_value=fake_info),
+            mock.patch.object(tpu_info, "get_tpu_info", return_value=fake_info),
+            pltpu.force_tpu_interpret_mode(pltpu.InterpretParams(detect_races=True)),
+        ):
+            pltpu.reset_tpu_interpret_mode_state()
+            with contextlib.redirect_stdout(io.StringIO()):
+                out = np.asarray(jax.jit(_fn)(x_m))
+            assert not interpret_pallas_call.races.races_found
+        assert np.all(np.isfinite(out[1:].astype(np.float32)))
+        assert np.all(out[0].astype(np.float32) == 0.0)
+        return out.view(np.uint16)
+
+    np.testing.assert_array_equal(_run_pair(1), _run_pair(0))
+
+
+def test_should_execute_two_back_to_back_z_clone_layers_without_races_or_drift():
+    if len(jax.devices("cpu")) >= 8:
+        _run_two_layer_z_clone_race_and_parity_check()
+        return
+    flags = os.environ.get("XLA_FLAGS", "")
+    env = dict(
+        os.environ,
+        JAX_PLATFORMS="cpu",
+        XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count=8",
+    )
+    cmd = (
+        "from tests.kernels.fused_moe.test_fused_ep_moe_v2_z_clone import "
+        "_run_two_layer_z_clone_race_and_parity_check; "
+        "_run_two_layer_z_clone_race_and_parity_check()"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", cmd],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]

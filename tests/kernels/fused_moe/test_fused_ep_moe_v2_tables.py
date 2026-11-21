@@ -416,3 +416,32 @@ def test_row_routes_rejects_nan_and_neg_inf_across_all_scoring_fns(scoring_fn):
     scores = _apply_scoring_fn(gate_l, scoring_fn)
     routes = np.asarray(_row_routes(scores, gate_l))
     np.testing.assert_array_equal(routes, np.array([[True], [False], [False], [True]]))
+
+
+@pytest.mark.parametrize("ep,t_local,g_local,topk", GEOMETRIES)
+@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+def test_should_pack_expert_contrib_spans_contiguously_when_sharding_transport_tables(
+    ep, t_local, g_local, topk, skew
+):
+    routing, e_total = _routing(ep, t_local, g_local, topk, skew=skew, seed=13)
+    for me in range(ep):
+        (
+            commit_start,
+            commit_len,
+            contrib_off,
+            push_src,
+            _push_len,
+            _push_dst,
+            _totals,
+        ) = host.shard_transport_tables_in_blocks(
+            routing, jnp.int32(me), e_total=e_total, ep=ep
+        )
+        cs = np.asarray(commit_start)
+        cl = np.asarray(commit_len)
+        co = np.asarray(contrib_off)
+        ps = np.asarray(push_src)
+        np.testing.assert_array_equal(ps, co)
+        exp_totals = cl.sum(axis=1)
+        exp_bases = np.cumsum(exp_totals) - exp_totals
+        np.testing.assert_array_equal(co[:, 0], exp_bases)
+        np.testing.assert_array_equal(co, exp_bases[:, None] + cs)
