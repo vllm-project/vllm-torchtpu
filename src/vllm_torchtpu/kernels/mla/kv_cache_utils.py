@@ -25,6 +25,11 @@ import jax.numpy as jnp
 import torch
 from torch_tpu._internal.pallas import pallas
 
+from vllm_torchtpu.kernels.pallas_util import (
+    align_to,
+    get_dtype_packing,
+)
+
 # Both layouts store a token as 32-bit words: the native SparseCore cache holds
 # them as uint32, the TensorCore-tiled cache as WORD_BYTES uint8 rows that
 # `ref.bitcast(jnp.int32)` folds into one word row inside the kernel.
@@ -65,22 +70,9 @@ _LAYOUT_DTYPES = {
 }
 
 
-def align_to(x: int, a: int) -> int:
-    return (x + a - 1) // a * a
-
-
 def _xla_unpadded_word_rows(rows: int) -> bool:
     """Whether `rows` 128-word rows per page avoid XLA `(8, 128)` tile padding."""
     return rows > 0 and (rows % 8 == 0 or (rows < 8 and (rows & (rows - 1)) == 0))
-
-
-def get_dtype_bitwidth(dtype: jnp.dtype) -> int:
-    return jax.dtypes.itemsize_bits(dtype)
-
-
-def get_dtype_packing(dtype: jnp.dtype) -> int:
-    bits = get_dtype_bitwidth(dtype)
-    return 32 // bits
 
 
 def get_kv_cache_shape(

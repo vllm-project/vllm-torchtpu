@@ -32,6 +32,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from tests.kernels.tpu_test_utils import require_tpu
 from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
     get_kv_cache_shape,
     ragged_paged_attention,
@@ -39,15 +40,6 @@ from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
 )
 
 pytestmark = pytest.mark.tpu_test
-
-
-def _require_tpu() -> None:
-    try:
-        backend = jax.default_backend()
-    except Exception as exc:
-        pytest.fail(f"JAX TPU backend failed to initialize: {exc}")
-    if backend != "tpu":
-        pytest.fail(f"Expected JAX TPU backend, got {backend}.")
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +166,7 @@ def test_bundled_matches_layer_major(scenario):
     """Verifies bitwise output and KV cache update parity against layer-major RPA
     across scenarios.
     """
-    _require_tpu()
+    require_tpu()
     c = _cfg()
     pls = _per_layer_shape(c)
     init_np = (
@@ -231,7 +223,7 @@ def test_bundled_donation_chain():
     """Verifies that sequentially chaining bundled attention calls across layers
     preserves in-place donation.
     """
-    _require_tpu()
+    require_tpu()
     c = _cfg()
     pls = _per_layer_shape(c)
     init_np = (
@@ -285,7 +277,7 @@ def test_bundled_does_not_touch_other_layers():
     """Verifies that an update to layer L preserves all untouched layer slots (i != L)
     in the bundle.
     """
-    _require_tpu()
+    require_tpu()
     c = _cfg()
     pls = _per_layer_shape(c)
     init_np = (
@@ -333,7 +325,7 @@ def test_bundled_interface_forwards_scale_softcap_causal():
     correctly propagated down to the underlying Pallas kernel rather than falling back
     to default values.
     """
-    _require_tpu()
+    require_tpu()
     from vllm_torchtpu.layers.core.attention_interface import (
         AttentionMetadata,
         attention,

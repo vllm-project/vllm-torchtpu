@@ -26,6 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from tests.kernels.tpu_test_utils import require_tpu
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     TileSizes,
     apply_act_fn,
@@ -38,15 +39,6 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
 _GroupConfig = collections.namedtuple(
     "_GroupConfig", ["num_groups", "group_offset", "num_local_groups"]
 )
-
-
-def _require_tpu() -> None:
-    try:
-        backend = jax.default_backend()
-    except Exception as exc:
-        pytest.fail(f"JAX TPU backend failed to initialize: {exc}")
-    if backend != "tpu":
-        pytest.fail(f"Expected JAX TPU backend, got {backend}.")
 
 
 def _assert_allclose(actual, expected, atol=1e-5, rtol=1e-5) -> None:
@@ -214,7 +206,7 @@ def reference_gmm(
 @pytest.mark.parametrize("has_bias", [True, False])
 @pytest.mark.parametrize("group_offset", [0, 2])
 def test_gmm_matches_reference(has_bias, group_offset):
-    _require_tpu()
+    require_tpu()
 
     batch_size = 128
     in_size = 512
@@ -255,7 +247,7 @@ def test_gmm_matches_reference(has_bias, group_offset):
 @pytest.mark.parametrize("weight_dtype", [jnp.int8, jnp.float8_e4m3fn])
 @pytest.mark.parametrize("block_size", [256, 512])
 def test_gmm_weight_quantized_matches_reference(weight_dtype, block_size):
-    _require_tpu()
+    require_tpu()
 
     batch_size = 128
     in_size = 1024
@@ -292,7 +284,7 @@ def test_gmm_weight_quantized_matches_reference(weight_dtype, block_size):
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fuse_act", ["silu", "silu_bf16", "swigluoai"])
 def test_gmm_fused_activation_matches_reference(fuse_act):
-    _require_tpu()
+    require_tpu()
 
     batch_size = 128
     in_size = 512
@@ -415,7 +407,7 @@ def test_gmm_fused_silu_bf16_matches_unfused_silu_and_mul(
 
 @pytest.mark.tpu_test
 def test_gmm_weight_quantized_block_larger_than_tile_k():
-    _require_tpu()
+    require_tpu()
 
     batch_size = 128
     in_size = 1024
@@ -460,7 +452,7 @@ def test_gmm_weight_quantized_block_larger_than_tile_k():
     ],
 )
 def test_gmm_nonlocal_groups_produce_zeros(group_config):
-    _require_tpu()
+    require_tpu()
 
     batch_size = 128
     in_size = 512
@@ -496,7 +488,7 @@ def test_gmm_nonlocal_groups_produce_zeros(group_config):
 
 @pytest.mark.tpu_test
 def test_gmm_v2_int4_packed_matches_reference():
-    _require_tpu()
+    require_tpu()
 
     batch_size = 128
     logical_k = 512

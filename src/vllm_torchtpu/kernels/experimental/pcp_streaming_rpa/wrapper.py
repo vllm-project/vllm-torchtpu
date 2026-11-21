@@ -27,7 +27,6 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     wrapper as batched_rpa_wrapper,
 )
-from vllm_torchtpu.kernels.experimental.batched_rpa.utils import get_dtype_packing
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
     PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
     pcp_streaming_attention_page_groups_packed_local_from_metadata,
@@ -35,6 +34,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
     _reshape_metadata_page_indices_jax,
 )
+from vllm_torchtpu.kernels.pallas_util import get_dtype_packing
 
 PCP_AXIS_NAME = "pcp"
 TP_AXIS_NAME = "tp"

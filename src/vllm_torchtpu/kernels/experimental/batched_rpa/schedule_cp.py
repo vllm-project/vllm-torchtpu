@@ -19,6 +19,7 @@ from collections.abc import Sequence
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu.kernels import pallas_util
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, schedule, utils
 
 
@@ -156,7 +157,7 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                     src_hbm = self.page_indices_ref[p_offset + p_idx]
                     sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm
                 sched.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
-                sched.dma_kv_cache[step, target_lane, i, 2] = utils.align_to(
+                sched.dma_kv_cache[step, target_lane, i, 2] = pallas_util.pl_align_to(
                     dma_sz, cfgs.kv_token_align
                 )
             else:
@@ -191,7 +192,9 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                 if i == 0:
                     src, _, fetch_val = utils.align_span(src_hbm, new_sz, align)
                     dma_entry.fetch_hbm[...] = src
-                    dma_entry.fetch_vmem[...] = utils.align_to(bkv_sz_cache, align)
+                    dma_entry.fetch_vmem[...] = pallas_util.pl_align_to(
+                        bkv_sz_cache, align
+                    )
                     fetch_val = jnp.where(new_sz > 0, fetch_val, 0)
                 else:
                     fetch_val = 0

@@ -24,9 +24,9 @@ from jax._src import dtypes
 from jax._src import test_util as jtu
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import pallas_util
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs,
-    utils,
     wrapper,
 )
 
@@ -51,11 +51,11 @@ def merge_kv(
     assert k.shape == v.shape
     assert k.dtype == v.dtype
     max_num_tokens, actual_num_kv_heads, actual_head_dim = k.shape
-    kv_packing = utils.get_dtype_packing(k.dtype)
+    kv_packing = pallas_util.get_dtype_packing(k.dtype)
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
-    num_kv_heads_x2 = utils.align_to(actual_num_kv_heads_x2, kv_packing)
+    num_kv_heads_x2 = pallas_util.align_to(actual_num_kv_heads_x2, kv_packing)
 
-    head_dim = utils.align_to(actual_head_dim, 128)
+    head_dim = pallas_util.align_to(actual_head_dim, 128)
     kv = jnp.pad(
         jnp.concat([k, v], axis=-1).reshape(
             max_num_tokens, actual_num_kv_heads_x2, actual_head_dim
@@ -115,8 +115,8 @@ def ref_ragged_paged_attention(
     assert num_kv_heads_x2 % 2 == 0
     assert actual_num_q_heads % actual_num_kv_heads == 0
     assert head_dim % 128 == 0
-    assert utils.get_dtype_packing(kv_cache.dtype) == kv_packing
-    assert num_kv_heads_x2 == utils.align_to(actual_num_kv_heads * 2, kv_packing)
+    assert pallas_util.get_dtype_packing(kv_cache.dtype) == kv_packing
+    assert num_kv_heads_x2 == pallas_util.align_to(actual_num_kv_heads * 2, kv_packing)
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
@@ -226,8 +226,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
     ):
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # Tokens live on the lane dim, so page_size must be a multiple of 128.
-            page_size = utils.align_to(page_size, 128)
-        bkv_sz = utils.align_to(bkv_sz, page_size)
+            page_size = pallas_util.align_to(page_size, 128)
+        bkv_sz = pallas_util.align_to(bkv_sz, page_size)
 
         rng = np.random.default_rng(1234)
 
@@ -244,9 +244,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             kv_lens.append(kv_len)
 
         max_num_batched_tokens = max(
-            utils.align_to(cu_q_lens[-1], 128), max_num_batched_tokens
+            pallas_util.align_to(cu_q_lens[-1], 128), max_num_batched_tokens
         )
-        max_num_seq = max(utils.align_to(len(seq_lens), 8), max_num_seq)
+        max_num_seq = max(pallas_util.align_to(len(seq_lens), 8), max_num_seq)
         max_kv_len = max(kv_lens)
         pages_per_seq = cdiv(max_kv_len, page_size)
         num_q_heads, num_kv_heads = num_heads
@@ -258,9 +258,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         page_indices_list = []
         kv_pages_list = []
         seq_page_ranges = []
-        kv_packing = utils.get_dtype_packing(kv_dtype)
-        padded_head_dim = utils.align_to(head_dim, 128)
-        num_kv_heads_x2 = utils.align_to(num_kv_heads * 2, kv_packing)
+        kv_packing = pallas_util.get_dtype_packing(kv_dtype)
+        padded_head_dim = pallas_util.align_to(head_dim, 128)
+        num_kv_heads_x2 = pallas_util.align_to(num_kv_heads * 2, kv_packing)
         for kv_len in kv_lens:
             kv = gen_random(
                 (
@@ -357,7 +357,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
 
         rpa_kv_cache = kv_cache
         num_sublanes = pltpu.get_tpu_info().num_sublanes
-        aligned_head_dim_rpa = utils.align_to(
+        aligned_head_dim_rpa = pallas_util.align_to(
             head_dim,
             num_sublanes * kv_packing
             if kv_layout == configs.KVLayout.SEQ_ALONG_LANE
