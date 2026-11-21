@@ -506,8 +506,13 @@ def prebuild(
     )
 
 
-def _owner(method: Any) -> str | None:
-    """The fused path that takes the layer before either entry is reached."""
+def _owner(method: Any, entry: str | None) -> str | None:
+    """The fused path that serves the layer's steps instead of ``entry``.
+
+    Adaptive fused MoE and fused EP v2 take every step before either entry is
+    reached. Fused EP v3 takes only the steps at or above its row gate; the
+    steps below it reach an armed entry, so v3 owns only a layer without one.
+    """
     from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
     from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
         fused_moe_ep_supported as fused_moe_ep_v3_supported,
@@ -515,7 +520,9 @@ def _owner(method: Any) -> str | None:
 
     if method._use_adaptive_fused_moe:
         return "adaptive fused MoE owns the layer"
-    if fused_moe_ep_supported(method) or fused_moe_ep_v3_supported(method):
+    if fused_moe_ep_supported(method) or (
+        entry is None and fused_moe_ep_v3_supported(method)
+    ):
         return "the fused EP kernel owns the layer"
     return None
 
@@ -531,7 +538,7 @@ def log_summary() -> None:
     declined: Counter[str] = Counter()
     unservable = []
     for verdict in _LAYERS:
-        owner = _owner(verdict.method)
+        owner = _owner(verdict.method, verdict.entry)
         if owner is not None:
             declined[owner] += 1
         elif verdict.entry is None:
