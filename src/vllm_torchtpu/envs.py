@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED_PREFIX_IDENTITY: bool = False
     TPU_DEEPSEEK_V41_CED_LOCAL_BUCKET_MAX: int = 0
     TPU_DEEPSEEK_V41_PUBLISH_BLOCK_MAX_ANY_ROWS: int = 0
+    TPU_DEEPSEEK_V41_CANDIDATE_SORTED_OWNERS: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE: bool = True
@@ -456,6 +457,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Same block maxima. 0 keeps the tuned-shape table only.
     "TPU_DEEPSEEK_V41_PUBLISH_BLOCK_MAX_ANY_ROWS": env_int(
         "TPU_DEEPSEEK_V41_PUBLISH_BLOCK_MAX_ANY_ROWS", default=0
+    ),
+    # Candidate-filtered FP8 indexer, XLA path of the candidate-block union
+    # (taken when the SparseCore metadata scratch does not fit, for example
+    # at max_model_len 1,048,576): carry each query's owner bit through the
+    # two sorts that build the union, instead of comparing every union block
+    # with every candidate of every query. Same union, owners and counts.
+    "TPU_DEEPSEEK_V41_CANDIDATE_SORTED_OWNERS": env_bool(
+        "TPU_DEEPSEEK_V41_CANDIDATE_SORTED_OWNERS", default=False
     ),
     # Engram n-gram hash on device as one fused program with exact 64-bit
     # arithmetic on uint32 pairs (kernels/engram_hash.py), instead of the

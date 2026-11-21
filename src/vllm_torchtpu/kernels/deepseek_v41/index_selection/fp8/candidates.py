@@ -12,6 +12,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from vllm_torchtpu import envs
+
 from .cache import PAGE_RECORDS, PAGE_ROWS, PackedFP8Layout
 from .tuned import (
     PAGED_MQA_FRAGMENT_GATHER_CONFIG,
@@ -627,6 +629,51 @@ def canonical_candidate_blocks(
     return candidate_block_ids, physical_block_ids, owners
 
 
+def _sorted_union_owners(keys, queries, per_query, blocks):
+    """Sorted unique union of candidate blocks and its per-query owner bits.
+
+    Gives the same result as sorting, deduplicating and then comparing every
+    union block with every candidate of every query, without that
+    [rows, union, per_query] compare (36 us per call at 4 rows and 72 us at
+    8 rows on tpu7x for 2 queries of 2048 candidates). The owner bit of each
+    query travels through both sorts as a payload: after the first sort equal
+    blocks are adjacent, a run's bits are OR-ed with a forward and a reverse
+    running maximum per bit, and the second sort compacts one entry per run.
+
+    Args:
+        keys: [rows, queries * per_query] int32 logical block ids, query-major,
+            with ``blocks`` for every invalid entry.
+        queries: Queries per row (at most 30, one bit each).
+        per_query: Candidates per query.
+        blocks: The invalid id, larger than every valid id.
+
+    Returns:
+        ([rows, queries * per_query] ascending unique ids followed by
+        ``blocks``, [rows, queries * per_query] int32 owner bits, bit q set
+        when query q lists the block; zero on ``blocks`` entries).
+    """
+    rows, count = keys.shape
+    bits = jnp.broadcast_to(
+        (1 << jnp.arange(queries, dtype=jnp.int32))[:, None], (queries, per_query)
+    ).reshape(1, count)
+    bits = jnp.broadcast_to(bits, (rows, count))
+    keys, bits = lax.sort((keys, bits), dimension=1, num_keys=1)
+    start = jnp.diff(keys, axis=-1, prepend=-1) != 0
+    run = jnp.cumsum(start.astype(jnp.int32), axis=-1)
+    owners = jnp.zeros_like(bits)
+    for query in range(queries):
+        has = (bits >> query) & 1 == 1
+        seen = lax.cummax(jnp.where(has, run, 0), axis=1)
+        later = lax.cummin(
+            jnp.where(has, run, jnp.int32(count + 1)), axis=1, reverse=True
+        )
+        owners = owners | (((seen == run) | (later == run)).astype(jnp.int32) << query)
+    keys = jnp.where(start, keys, blocks)
+    owners = jnp.where(keys < blocks, owners, 0)
+    keys, owners = lax.sort((keys, owners), dimension=1, num_keys=1)
+    return keys, owners
+
+
 def _canonical_candidate_blocks_ref(
     candidates, table, block, width, cache_pages, page_size
 ):
@@ -647,11 +694,17 @@ def _canonical_candidate_blocks_ref(
         (physical_block_ids.reshape(*flat.shape, parts) >= 0) | ~needed, axis=-1
     )
     valid &= (flat >= 0) & (flat < blocks)
-    candidate_block_ids = jnp.sort(jnp.where(valid, flat, blocks), axis=-1)
-    unique = jnp.diff(candidate_block_ids, axis=-1, prepend=-1) != 0
-    candidate_block_ids = jnp.sort(
-        jnp.where(unique, candidate_block_ids, blocks), axis=-1
-    )
+    if envs.TPU_DEEPSEEK_V41_CANDIDATE_SORTED_OWNERS and queries <= 30:
+        candidate_block_ids, owners = _sorted_union_owners(
+            jnp.where(valid, flat, blocks), queries, per_query, blocks
+        )
+    else:
+        candidate_block_ids, owners = None, None
+        candidate_block_ids = jnp.sort(jnp.where(valid, flat, blocks), axis=-1)
+        unique = jnp.diff(candidate_block_ids, axis=-1, prepend=-1) != 0
+        candidate_block_ids = jnp.sort(
+            jnp.where(unique, candidate_block_ids, blocks), axis=-1
+        )
     candidate_block_ids = jnp.where(
         candidate_block_ids < blocks, candidate_block_ids, -1
     )
@@ -662,14 +715,15 @@ def _canonical_candidate_blocks_ref(
         cache_pages=cache_pages,
         page_size=page_size,
     )
-    # Pack per-query ownership: bit q set when query q lists the union block.
-    owners = jnp.zeros_like(candidate_block_ids)
-    for query in range(queries):
-        present = (
-            (candidate_block_ids[:, :, None] == candidates[:, query, None, :])
-            & (candidates[:, query, None, :] >= 0)
-        ).any(axis=-1)
-        owners = owners | (present.astype(jnp.int32) << query)
+    if owners is None:
+        # Pack per-query ownership: bit q set when query q lists the union block.
+        owners = jnp.zeros_like(candidate_block_ids)
+        for query in range(queries):
+            present = (
+                (candidate_block_ids[:, :, None] == candidates[:, query, None, :])
+                & (candidates[:, query, None, :] >= 0)
+            ).any(axis=-1)
+            owners = owners | (present.astype(jnp.int32) << query)
     owners = jnp.where(candidate_block_ids >= 0, owners, 0)
     category = jnp.where(
         owners == 1, 0, jnp.where(owners == 3, 1, jnp.where(owners == 2, 2, 3))
