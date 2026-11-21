@@ -28,6 +28,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     extract_draft_token_ids,
     spec_logprobs_lists,
     subtract_num_rejected_tokens,
+    valid_token_ids,
 )
 
 
@@ -239,3 +240,17 @@ def test_get_output_attaches_spec_logprobs():
         1,
     ]
     assert out.logprobs.slice_request(2, 1).logprobs[:, 0].tolist() == [-6.0]
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_valid_token_ids_matches_mask_and_split(dtype):
+    gen = torch.Generator().manual_seed(0)
+    tokens = torch.randint(0, 50, (16, 8), generator=gen, dtype=dtype)
+    tokens[torch.rand((16, 8), generator=gen) < 0.4] = INVALID_TOKEN_ID
+    tokens[3] = INVALID_TOKEN_ID
+    mask = tokens != INVALID_TOKEN_ID
+    expected = [s.tolist() for s in tokens[mask].split(mask.sum(dim=1).tolist())]
+    got = valid_token_ids(tokens)
+    assert got == expected
+    assert all(type(t) is int for row in got for t in row)
+    assert valid_token_ids(tokens[:0]) == []
