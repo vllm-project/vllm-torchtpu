@@ -40,11 +40,11 @@ LAUNCH_TIMEOUT_SECONDS = 480
 
 
 def _prepare_worker_env():
-    from torch_tpu._internal.utils import hardware
+    import torch
 
     from tests.distributed.tpu_test_utils import prepare_tpu_environment
 
-    if hardware.get_tpu_device_count() < WORLD_SIZE:
+    if torch.accelerator.device_count() < WORLD_SIZE:
         pytest.skip("requires eight TPU devices")
     keys = (
         "TORCH_TPU_XPROF_SESSION_ID",

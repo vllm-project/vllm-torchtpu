@@ -14,7 +14,7 @@
 """Nightly multi-rank golden validation tests for Wan2.1 T2V on TPU v7x."""
 
 import pytest
-from torch_tpu._internal.utils import hardware
+import torch
 
 pytest.importorskip("vllm_omni", reason="vllm_omni is required for Wan tests")
 
@@ -61,8 +61,9 @@ CASES = [
 @pytest.fixture(autouse=True)
 def _check_tpu_devices(degrees: dict[str, int]) -> None:
     world_size = DiffusionParallelConfig(**degrees).world_size
-    # PCI scan: counts TPU devices without starting the TPU runtime here.
-    device_count = hardware.get_tpu_device_count()
+    # Before the TPU runtime starts this is a PCI scan, so it does not start
+    # the runtime here.
+    device_count = torch.accelerator.device_count()
     assert device_count >= world_size, (
         f"Test requires {world_size} TPU devices, found {device_count}"
     )

@@ -374,8 +374,8 @@ def test_memory_methods(monkeypatch):
 
     monkeypatch.setattr(torch, "accelerator", MockAccelerator(), raising=False)
     with patch(
-        "torch_tpu._internal.utils.hardware.get_hbm_bytes_per_device",
-        return_value=32 * 1024**3,
+        "torch.tpu.get_device_properties",
+        return_value=SimpleNamespace(total_memory=32 * 1024**3),
     ):
         assert OmniTpuPlatform.get_device_total_memory() == 32 * 1024**3
         assert OmniTpuPlatform.get_free_memory() == 16 * 1024**3
