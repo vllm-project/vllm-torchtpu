@@ -737,10 +737,9 @@ def _moe(
     experts = mlp.experts.routed_experts
     router_logits, _ = mlp.gate(x)
     rank = fused_moe_ep.rank_operand()
-    if envs.TPU_MOE_SKIP_PADDED_TOKENS and token_padding._padding_state is not None:
-        raw_mask = token_padding._padding_state.local_padding_mask.narrow(
-            0, 0, num_tokens
-        )
+    padding = token_padding._padding_state  # noqa: SLF001 -- runner singleton
+    if envs.TPU_MOE_SKIP_PADDED_TOKENS and padding is not None:
+        raw_mask = padding.local_padding_mask.narrow(0, 0, num_tokens)
         pad_mask = (
             own_rows_zigzag(raw_mask, rank, tp, num_bands)
             if num_bands > 1

@@ -21,6 +21,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax._src.pallas.mosaic import tpu_info as ti
+from jax.experimental.pallas import tpu as pltpu
 
 # `convert_cache_to_seq_along_lane` is not re-exported by the package's
 # `__init__`, and the package attribute `streamindex_topk` is the jitted
@@ -1857,13 +1859,6 @@ def test_should_compute_exact_effective_row_lengths_for_mixed_and_padded_batches
 def test_should_trace_packed_u32_seq_along_lane_kernels_and_reject_bad_shape(
     monkeypatch: pytest.MonkeyPatch, decode_page_major: bool
 ) -> None:
-    from jax._src.pallas.mosaic import (
-        tpu_info as ti,  # noqa: PLC0415 -- CPU-only trace helper needs target TPU info
-    )
-    from jax.experimental.pallas import (
-        tpu as pltpu,  # noqa: PLC0415 -- CPU-only trace helper needs target TPU info
-    )
-
     st_mod = importlib.import_module(
         "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
     )

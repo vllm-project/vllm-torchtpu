@@ -359,12 +359,12 @@ def rank_rows(
     query_start_loc: jax.Array,
     num_seqs: jax.Array,
 ) -> RankRows:
-    """Per-rank sequence metadata for rows `split_rows + rank * R + [0, R)`
-    (or `num_bands` alternating zigzag bands when configured).
+    """Build per-rank sequence metadata for own rows or zigzag bands.
 
-    Each row keeps its global position and causal bound: a request's
-    `seq_len` is cut by the rows that follow this rank's range, so the last
-    local row of the request sits at `seq_len' - 1`.
+    Covers rows `split_rows + rank * R + [0, R)` (or `num_bands` alternating
+    zigzag bands when configured). Each row keeps its global position and
+    causal bound: a request's `seq_len` is cut by the rows that follow this
+    rank's range, so the last local row of the request sits at `seq_len' - 1`.
     """
     nb = layout.effective_zigzag_bands(num_tokens)
     if nb > 1:
@@ -657,8 +657,7 @@ def own_rows(layout: TokenParallelLayout, x: jax.Array, rank: jax.Array) -> jax.
 def _zigzag_tail_rank_order_indices(
     dcp_size: int, num_tokens: int, split_rows: int, num_bands: int
 ) -> tuple[list[int], list[int]]:
-    """Return static forward (rank-major -> global) & inverse (tail -> rank-major)
-    index maps."""
+    """Return forward (rank-major -> global) and inverse tail-row index maps."""
     rows = num_tokens // dcp_size
     band_size = rows // num_bands
     fwd: list[int] = []
