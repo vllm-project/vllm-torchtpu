@@ -114,6 +114,7 @@ Both are off by default; set both (`--additional-config '{"tpu_moe_topk_weights_
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_CHUNK_TOKENS` | `None` | Query-token chunk size for Sparse MLA attention (each chunk gathers its tokens' top-k KV rows into one buffer and attends over it; unset keeps the kernel default of `64`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
+| `TPU_SUBSPACE_RPA` | `False` | Opt-in. On Gemma 4 global attention layers (`attention_k_eq_v`, head dim 512, FP8 KV cache), stores only the 128 RoPE-rotated key channels next to V instead of a full K, which halves the KV bytes per token in `LBNHC` (`1,024 B/tok` instead of `2,048`; `640 B/tok` in `LBHNC`). |
 
 ---
 

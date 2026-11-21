@@ -106,7 +106,7 @@ def _stitch_prefill_lane(
 ):
     """O(N) Prefill Path: Roll the entire new tokens buffer into place."""
     total_head_words = (
-        cfgs.model.num_kv_heads * 2 * cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
+        cfgs.kv_hbm_stride * cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
     )
     num_sublanes = pltpu.get_tpu_info().num_sublanes
     words_per_sublane = total_head_words // num_sublanes
@@ -149,10 +149,7 @@ def store_new_kv_lane(
     else:
         merged_cache_u32 = stitch_result
         total_head_words = (
-            cfgs.model.num_kv_heads
-            * 2
-            * cfgs.aligned_kv_head_dim
-            // cfgs.serve.packing_kv
+            cfgs.kv_hbm_stride * cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
         )
         num_sublanes = pltpu.get_tpu_info().num_sublanes
         words_per_sublane = total_head_words // num_sublanes
