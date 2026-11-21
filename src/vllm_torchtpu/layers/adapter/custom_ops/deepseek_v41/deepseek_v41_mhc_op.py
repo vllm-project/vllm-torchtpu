@@ -33,6 +33,16 @@ def _post_pre_rms_jax(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     tokens, mult = pre.shape
     dim = flat.shape[1] // mult
+    pad = -tokens % 16
+    if (
+        pad
+        and envs.TPU_DEEPSEEK_V41_MHC_PAD_SMALL_T
+        and shifted_post_pre_rms.is_supported_shape(tokens + pad, mult, dim)
+    ):
+        return _padded_post_pre_rms(
+            pad, x, flat, post, comb, weight, scale, base, pre, norm_weight,
+            rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats, norm_eps,
+        )
     if not shifted_post_pre_rms.is_supported_shape(tokens, mult, dim) or (
         tokens % 32 and not envs.TPU_DEEPSEEK_V41_MHC_SHIFTED_T16
     ):
@@ -79,6 +89,46 @@ def _post_pre_rms_jax(
         norm_eps=norm_eps,
         **_gate_layout(),
     )
+
+
+def _padded_post_pre_rms(
+    pad, x, flat, post, comb, weight, scale, base, pre, norm_weight,
+    rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats, norm_eps,
+):
+    """The fused kernel on ``pad`` zero rows appended, real rows returned.
+
+    Decode buckets (4 or 8 tokens) are not a multiple of 16, so without this
+    they take the unfused JAX fallback, which XLA emits as dozens of small
+    ops per layer (the 20 Sinkhorn iterations among them). Every token is
+    mixed independently, so the zero rows do not change the real rows' math;
+    a zero row stays finite (RMS of zeros with a positive epsilon is zero).
+    The real rows get the kernel's rounding, which is the rounding every
+    prefill step already uses.
+    """
+    tokens = pre.shape[0]
+
+    def rows(a):
+        return jnp.pad(a, ((0, pad),) + ((0, 0),) * (a.ndim - 1))
+
+    out = shifted_post_pre_rms.shifted_post_pre_rms(
+        rows(x.reshape(flat.shape[0], -1).astype(flat.dtype)),
+        rows(flat),
+        rows(post),
+        rows(comb),
+        weight,
+        scale,
+        base,
+        rows(pre),
+        rms_eps=rms_eps,
+        hc_pre_eps=pre_eps,
+        hc_sinkhorn_eps=sinkhorn_eps,
+        hc_post_mult_value=post_multiplier,
+        sinkhorn_repeat=repeats,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        **_gate_layout(),
+    )
+    return tuple(o[:tokens] for o in out)
 
 
 def _gate_layout() -> dict:

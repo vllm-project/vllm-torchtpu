@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
     TPU_DEEPSEEK_V41_MHC_EARLY_PREP: bool = True
     TPU_DEEPSEEK_V41_MHC_SHIFTED_T16: bool = True
+    TPU_DEEPSEEK_V41_MHC_PAD_SMALL_T: bool = False
     TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS: bool = True
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
@@ -568,6 +569,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # only the drafter's rounding.
     "TPU_DEEPSEEK_V41_MHC_SHIFTED_T16": env_bool(
         "TPU_DEEPSEEK_V41_MHC_SHIFTED_T16", default=True
+    ),
+    # Shifted mHC: pad a token count that is not a multiple of 16 (decode
+    # buckets 4 and 8) with zero rows to the next multiple of 16 and run the
+    # fused kernel, instead of the unfused JAX fallback that XLA emits as many
+    # small ops per layer. Real rows get the fused kernel's rounding (the
+    # rounding of every prefill step) instead of the fallback's.
+    "TPU_DEEPSEEK_V41_MHC_PAD_SMALL_T": env_bool(
+        "TPU_DEEPSEEK_V41_MHC_PAD_SMALL_T", default=False
     ),
     # DSpark decode sampler: compute the drafter's BF16 base logits with the
     # Pallas full-K head (kernels/logits_head.py) instead of the XLA dot.
