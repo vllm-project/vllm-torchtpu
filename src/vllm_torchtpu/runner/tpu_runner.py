@@ -216,6 +216,7 @@ from vllm_torchtpu.runner.pcp import (
     mla_kv_page_size,
     validate_pcp_manager_layers,
 )
+from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import pcp_rank_token_counts
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -10493,7 +10494,9 @@ class TPUModelRunner(GPUModelRunner):
 
         The prompt lengths fill every per-rank token bucket
         (``num_tokens_paddings`` are per rank; a context-parallel step
-        spreads the prompt over the ranks), so no live prompt is the first to
+        spreads the prompt over the ranks, and each bucket's prompt is the
+        longest that puts at most that many tokens on any rank,
+        _longest_prompt_for_rank_bucket), so no live prompt is the first to
         run its bucket. The KV profile never runs the draft, so the largest
         bucket is where the draft's own program temporaries, such as an MoE
         token gather, first have to fit.
@@ -10514,12 +10517,14 @@ class TPUModelRunner(GPUModelRunner):
             return
         if self.enforce_eager or self.speculative_config is None:
             return
-        pcp = max(1, int(self.parallel_config.prefill_context_parallel_size))
         longest = min(
             self.max_model_len, int(self.scheduler_config.max_num_batched_tokens)
         )
         prompt_lens = sorted(
-            {min(int(bucket) * pcp, longest) for bucket in self.num_tokens_paddings}
+            {
+                self._longest_prompt_for_rank_bucket(int(bucket), longest)
+                for bucket in self.num_tokens_paddings
+            }
         )
         n0 = self.num_xla_graphs
         pipeline = self.parallel_config.pipeline_parallel_size > 1
@@ -10539,7 +10544,9 @@ class TPUModelRunner(GPUModelRunner):
             for P in prompt_lens:
                 # The draft runs at the step's per-rank token bucket.
                 if buckets is not None and buckets.needs_retrace(
-                    _get_padded_token_len(self.num_tokens_paddings, cdiv(P, pcp))
+                    _get_padded_token_len(
+                        self.num_tokens_paddings, self._rank_step_tokens(P)
+                    )
                 ):
                     self._retrace_eagle_draft()
                 if pipeline:
@@ -11199,22 +11206,52 @@ class TPUModelRunner(GPUModelRunner):
             default=0,
         )
 
+    def _rank_step_tokens(self, num_tokens: int) -> int:
+        """The most tokens one rank holds of a step of `num_tokens` tokens, as
+        serving splits them: the sequence layout planner deals a step's tokens
+        as one stream in cp_kv_cache_interleave_size chunks from rank 0
+        (pcp_local_token_counts), so rank 0 holds the most whatever the
+        prompts; the PCP manager cuts each prompt into a head and a tail chunk
+        per rank (pcp_rank_token_counts), counted here for one prompt. Without
+        context parallelism the rank holds them all."""
+        pcp = int(self.parallel_config.prefill_context_parallel_size)
+        if self.pcp_manager is not None:
+            split = self.pcp_manager.sharding_plan.split_mask([num_tokens])
+            return max(pcp_rank_token_counts([num_tokens], split.tolist(), pcp))
+        return int(
+            pcp_local_token_counts(
+                [num_tokens], pcp, int(self.parallel_config.cp_kv_cache_interleave_size)
+            ).max()
+        )
+
+    def _longest_prompt_for_rank_bucket(self, bucket: int, longest: int) -> int:
+        """The longest prompt of at most `longest` tokens that puts at most
+        `bucket` tokens on any rank (_rank_step_tokens): the MTP prefill
+        warm-up's prompt for that per-rank token bucket. A rank holds at most
+        the whole prompt and at least 1/prefill_context_parallel_size of it,
+        and its share never shrinks as the prompt grows, so the length lies
+        between `bucket` and `bucket` times that size."""
+        pcp = max(1, int(self.parallel_config.prefill_context_parallel_size))
+        lo, hi = min(bucket, longest), min(bucket * pcp, longest)
+        if lo == hi or self._rank_step_tokens(hi) <= bucket:
+            return hi
+        while lo < hi - 1:
+            mid = (lo + hi) // 2
+            if self._rank_step_tokens(mid) <= bucket:
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
     def _max_rank_step_tokens(self) -> int:
         """The most tokens one step puts on this rank: a step of
         max_num_batched_tokens tokens as the PCP manager (its
-        max_local_num_tokens cap) or the sequence layout planner (one token
-        stream dealt in cp_kv_cache_interleave_size chunks from rank 0, so
-        rank 0 holds the most) splits it; all of it without context
-        parallelism."""
+        max_local_num_tokens cap, which also covers several prompts) or the
+        sequence layout planner (_rank_step_tokens) splits it; all of it
+        without context parallelism."""
         if self.pcp_manager is not None:
             return int(self.pcp_manager.max_local_num_tokens)
-        return int(
-            pcp_local_token_counts(
-                [int(self.scheduler_config.max_num_batched_tokens)],
-                int(self.parallel_config.prefill_context_parallel_size),
-                int(self.parallel_config.cp_kv_cache_interleave_size),
-            ).max()
-        )
+        return self._rank_step_tokens(int(self.scheduler_config.max_num_batched_tokens))
 
     def _draft_bucket_reachable(self, bucket: int, max_rank_tokens: int) -> bool:
         """Whether a live step can run the draft at token bucket `bucket` on
@@ -11238,7 +11275,14 @@ class TPUModelRunner(GPUModelRunner):
         """Refuse to start when the draft's warm-up left a reachable token
         bucket to a trace that never came: it would stay a raising closure
         and fail the first live step that pads to it. A bucket no step
-        reaches (_draft_bucket_reachable) is only reported."""
+        reaches (_draft_bucket_reachable) is only reported.
+
+        Without context parallelism (the spec-decode warm-up) such a bucket
+        is one whose synthetic step failed. A context-parallel producer's
+        warm-up runs every per-rank bucket one prompt reaches and refuses the
+        start at a failed step, so such a bucket is one that only a step of
+        several prompts reaches, when max_model_len is below the token
+        budget."""
         if not buckets.refused:
             return
         max_rank_tokens = self._max_rank_step_tokens()
@@ -11260,15 +11304,23 @@ class TPUModelRunner(GPUModelRunner):
                 self.max_model_len - 1,
             )
         left = sorted(set(buckets.refused) - set(unreachable))
-        if left:
-            raise shape_variants.ShapeSpecializationError(
-                f"the MTP draft's warm-up left token buckets {left} uncompiled: "
-                "no synthetic step built them. A failed step is logged above; "
-                "a context-parallel producer's sweep reaches per-rank buckets "
-                "up to min(max_model_len, max_num_batched_tokens) / "
-                "prefill_context_parallel_size, so raise max_model_len to "
-                "max_num_batched_tokens there."
+        if not left:
+            return
+        if int(self.parallel_config.prefill_context_parallel_size) > 1:
+            cause = (
+                "The context-parallel warm-up runs one prompt per bucket, of at "
+                f"most max_model_len={self.max_model_len} tokens, and a step "
+                "of several prompts reaches these buckets with up to "
+                "max_num_batched_tokens="
+                f"{self.scheduler_config.max_num_batched_tokens} tokens: raise "
+                "max_model_len to max_num_batched_tokens."
             )
+        else:
+            cause = "Their failed synthetic steps are logged above."
+        raise shape_variants.ShapeSpecializationError(
+            f"the MTP draft's warm-up left token buckets {left} uncompiled: no "
+            f"synthetic step built them. {cause}"
+        )
 
     def _require_draft_traces_per_side(self, reason: str) -> None:
         """Refuse a start that would trace the MTP draft once, at its first
