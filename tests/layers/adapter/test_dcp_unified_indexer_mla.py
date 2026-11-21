@@ -27,6 +27,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import KVLayout
 from vllm_torchtpu.kernels.mla import dcp_token_parallel as tp
 from vllm_torchtpu.layers.adapter import dcp_unified_indexer_mla_op as unified_op_mod
 from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
@@ -655,3 +656,129 @@ def test_should_pass_torch_tpu_pallas_verify_signature_for_unified_op_wrappers(
     assert len(registered) == 3
     expected_arity = 22 if has_lane else 21
     assert all(len(specs) == expected_arity for _, _, specs, _ in registered)
+
+
+@pytest.mark.parametrize(
+    ("split_rows", "want_bq", "want_dam"),
+    [
+        (16, (1, 1, 16), True),
+        (8, (1, 1, 4), False),
+    ],
+)
+def test_should_forward_lead_decode_as_mixed_in_unified_indexer_op(
+    monkeypatch: pytest.MonkeyPatch,
+    split_rows: int,
+    want_bq: tuple[int, int, int],
+    want_dam: bool,
+) -> None:
+    mesh = _mesh(4)
+    layout = tp.TokenParallelLayout(4, 4, 32, split_rows=split_rows, max_pages=8)
+    monkeypatch.setenv("TPU_DCP_TP_UNIFIED_INDEXER_MLA", "1")
+    monkeypatch.setenv("TPU_DCP_TP_PREFILL_LOCAL_OPROJ", "1")
+    monkeypatch.setenv("TPU_DCP_RANK_OPERAND", "1")
+    monkeypatch.setattr(
+        unified_op_mod, "get_tensor_model_parallel_world_size", lambda: 4
+    )
+    monkeypatch.setattr(
+        unified_op_mod, "dcp_rank_operand", lambda: torch.zeros((1,), dtype=torch.int32)
+    )
+    monkeypatch.setattr(unified_op_mod, "dcp_lane_operand", lambda: None)
+
+    captured_fn: list[Any] = []
+
+    class _FakeOp:
+        def register_fake(self, fn: Any) -> Any:
+            return fn
+
+    def _capture_op(name, fn, **kwargs):
+        del name, kwargs
+        captured_fn.append(fn)
+        return _FakeOp()
+
+    monkeypatch.setattr(unified_op_mod, "pcp_streaming_jax_op", _capture_op)
+    monkeypatch.setattr(
+        unified_op_mod,
+        "get_shared_jax_op",
+        lambda kind, key, build: build(f"p::{kind}"),
+    )
+    monkeypatch.setattr(
+        unified_op_mod,
+        "update_sparse_mla_kv_cache_dcp",
+        lambda n, r, *a, **kw: (n, r),
+    )
+
+    class _StopAfterLead(Exception):
+        pass
+
+    seen: list[tuple[tuple[int, int, int], tuple[int, int, int], bool]] = []
+
+    def _capture_lead(*args, **kwargs):
+        del args
+        seen.append(
+            (
+                kwargs["num_kv_pages_per_block"],
+                kwargs["num_queries_per_block"],
+                kwargs["decode_as_mixed"],
+            )
+        )
+        raise _StopAfterLead()
+
+    monkeypatch.setattr(unified_op_mod, "streamindex_topk_dcp", _capture_lead)
+    spec_n = types.SimpleNamespace(
+        page_size=32, layout=types.SimpleNamespace(value="xla")
+    )
+    spec_r = types.SimpleNamespace(
+        page_size=32, layout=spec_n.layout, packed_rope=False
+    )
+
+    class _FakeLayer:
+        kv_cache_quantized_dtype = None
+        scale = 0.135
+        num_heads = 4
+        v_head_dim = 6
+        use_sparse = True
+        mla_kv_spec = (spec_n, spec_r)
+
+    layer = _FakeLayer()
+    impl = types.SimpleNamespace(_dcp_mesh=mesh, dcp_size=4, dcp_interleave_size=4)
+    indexer_op = types.SimpleNamespace(
+        topk_tokens=TOPK, k_cache=types.SimpleNamespace(prefix="layer0.idx")
+    )
+    cb = unified_op_mod.UnifiedIndexerCallbacks(
+        resolve_kv_cache_mode=lambda *a, **kw: ("xla", KVLayout.SEQ_ALONG_LANE),
+        scatter_indexer_k=lambda *a, **kw: a[0],
+        streamidx_block_sizes=lambda *a, **kw: ((2, 2, 32), (1, 1, 4)),
+        dcp_indexer_a2a_for_bucket=lambda *a: False,
+        register_indexer_layer=lambda prefix: 0,
+    )
+    built = unified_op_mod.build_unified_indexer_attention_op(
+        layer, impl, indexer_op, layout, q_replicated=True, callbacks=cb
+    )
+    assert built is not None
+    shd = NamedSharding(mesh, P(AXIS))
+    rep = NamedSharding(mesh, P())
+    with pytest.raises(_StopAfterLead):
+        captured_fn[0](
+            jax.device_put(jnp.zeros((16, 3, 4, 32), jnp.uint8), shd),
+            jax.device_put(jnp.zeros((16, 32, 8), jnp.bfloat16), shd),
+            jax.device_put(jnp.zeros((16, 8, 16), jnp.bfloat16), shd),
+            jax.device_put(jnp.zeros((4 * (16 + split_rows), 2, 12), jnp.uint8), shd),
+            jax.device_put(jnp.ones((4 * (16 + split_rows), 2), jnp.bfloat16), shd),
+            jax.device_put(jnp.zeros((64, 13), jnp.uint8), rep),
+            jax.device_put(jnp.zeros((4 * split_rows, 4, 8), jnp.bfloat16), shd),
+            jax.device_put(jnp.zeros((64, 4, 8), jnp.bfloat16), shd),
+            jax.device_put(jnp.zeros((4 * (16 + split_rows), 4, 4), jnp.bfloat16), shd),
+            jax.device_put(jnp.zeros((64, 8), jnp.bfloat16), rep),
+            jax.device_put(jnp.zeros((64, 4), jnp.bfloat16), rep),
+            jax.device_put(jnp.zeros((8,), jnp.int32), rep),
+            jax.device_put(jnp.zeros((16,), jnp.int32), rep),
+            jax.device_put(jnp.zeros((16,), jnp.int32), rep),
+            jax.device_put(jnp.zeros((9,), jnp.int32), rep),
+            jax.device_put(jnp.array([0, 0, 1], jnp.int32), rep),
+            jax.device_put(jnp.array([0, 0, 1], jnp.int32), rep),
+            jax.device_put(jnp.arange(4, dtype=jnp.int32), shd),
+            jax.device_put(jnp.ones((4, 8, 6), jnp.bfloat16), rep),
+            jax.device_put(jnp.zeros((24, 32), jnp.float8_e4m3fn), shd),
+            jax.device_put(jnp.ones((32,), jnp.float32), shd),
+        )
+    assert seen == [((2, 2, 32), want_bq, want_dam)]

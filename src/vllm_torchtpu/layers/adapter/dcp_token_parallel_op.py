@@ -369,6 +369,20 @@ def _token_parallel_streamidx_knobs(
     return tp_mixed_bkvp, tp_chunk_tokens
 
 
+def lead_streamidx_block_sizes(
+    split_rows: int,
+    bkvp: tuple[int, int, int],
+    bq: tuple[int, int, int],
+) -> tuple[tuple[int, int, int], tuple[int, int, int], bool]:
+    # Avoid 3-pass decode+batched-decode+mixed compilation on lead_indexer
+    # (s=64): single-pass decode_as_mixed with mixed bq=16 (dividing s) keeps
+    # bkvp=32 intact (bkvp=16 causes set_diff>0) and eliminates dead decode
+    # kernels with set_diff=0.
+    if split_rows >= 16 and split_rows % 16 == 0 and bq[2] < 16:
+        return bkvp, (bq[0], bq[1], 16), True
+    return bkvp, bq, False
+
+
 def make_select_topk(
     topk: int,
     kv_layout: KVLayout,
@@ -393,6 +407,17 @@ def make_select_topk(
         bkvp, bq = mla_op._streamidx_block_sizes(
             q_r.shape[0], *small_bucket, tp_mixed_bkvp, decode_pack
         )
+        page_tokens = (
+            natural.shape[-1]
+            if kv_layout == KVLayout.SEQ_ALONG_LANE
+            else natural.shape[1] * natural.shape[2]
+        )
+        kv_tokens = natural.shape[0] * page_tokens
+        # Avoid compiling unreachable _fast_path conditionals on multi-page cap
+        # branches (kv_tokens > 2 * topk): _common_path is exact for every
+        # length, and dropping the cond wrapper frees XLA to overlap the last
+        # chunk's SparseCore top-k wait with downstream ops.
+        enable_early_exit = mla_op.STREAMIDX_ENABLE_EARLY_EXIT and kv_tokens <= 2 * topk
         zero = jnp.int32(0)
         # Avoid decode_as_mixed=False on [0, 0, rr.num_seqs]: builds two dead
         # decode schedules and compiles an unreachable distribution[1] > 0 cond.
@@ -410,7 +435,7 @@ def make_select_topk(
             num_queries_per_block=bq,
             skip_empty_decode=skip_empty_decode,
             skip_empty_decode_chunked=skip_empty_decode_chunked,
-            enable_early_exit=mla_op.STREAMIDX_ENABLE_EARLY_EXIT,
+            enable_early_exit=enable_early_exit,
             kv_layout=kv_layout,
             chunk_tokens=tp_chunk_tokens,
             decode_pack=decode_pack,
@@ -1935,6 +1960,9 @@ def build_indexer_op(
         bkvp_dcp, bq_dcp = mla_op._streamidx_block_sizes(
             s, *small_bucket, mixed_bkvp, decode_pack
         )
+        bkvp_dcp, bq_dcp, lead_decode_as_mixed = lead_streamidx_block_sizes(
+            s, bkvp_dcp, bq_dcp
+        )
         large = mla_op._dcp_indexer_a2a_for_bucket(s, True, a2a_min_tokens)
         head = streamindex_topk_dcp(
             q_dcp,
@@ -1963,6 +1991,7 @@ def build_indexer_op(
             small_all_gather=small_ag,
             decode_pack=decode_pack,
             shared_meta=shared_meta,
+            decode_as_mixed=lead_decode_as_mixed,
         )
         tail = dcp_token_parallel.indexer_topk(
             layout,

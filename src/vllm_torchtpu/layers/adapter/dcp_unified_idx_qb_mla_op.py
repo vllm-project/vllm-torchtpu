@@ -328,6 +328,9 @@ def build_unified_indexer_in_branch_qb_op(
         bkvp_dcp, bq_dcp = callbacks.streamidx_block_sizes(
             s, *small_bucket, mixed_bkvp, decode_pack
         )
+        bkvp_dcp, bq_dcp, lead_decode_as_mixed = (
+            dcp_token_parallel_op.lead_streamidx_block_sizes(s, bkvp_dcp, bq_dcp)
+        )
         large = callbacks.dcp_indexer_a2a_for_bucket(s, True, a2a_min_tokens)
         head_topk = streamindex_topk_dcp(
             q_idx_dcp,
@@ -356,6 +359,7 @@ def build_unified_indexer_in_branch_qb_op(
             small_all_gather=small_ag,
             decode_pack=decode_pack,
             shared_meta=shared_meta,
+            decode_as_mixed=lead_decode_as_mixed,
         )
 
         cache_layout = nope_spec.layout.value
