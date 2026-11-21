@@ -1383,7 +1383,10 @@ def wuv_quant_split_3d_fp8_local(
                     lat_vm.at[slot], lat_vm.at[slot], lat_sems.at[slot]
                 ).wait()
                 mask = _row_valid_mask(rb_i) if has_mask else None
-                row_max = jnp.zeros((row_block, 1), jnp.float32)
+                # Avoid per-head cross-lane max reductions inside the head loop:
+                # accumulate non-negative bf16 max values elementwise (exact
+                # top-16 bits match f32), reducing across lanes once per block.
+                rm_mat = jnp.zeros((row_block, head_dim), jnp.bfloat16)
                 for wc in range(w_chunks):
                     h0 = wc * hw
 
@@ -1404,14 +1407,8 @@ def wuv_quant_split_3d_fp8_local(
                         )
                         val = acc.astype(jnp.bfloat16)
                         out_vm[0, h] = val
-                        row_max = jnp.maximum(
-                            row_max,
-                            jnp.max(
-                                jnp.abs(val.astype(jnp.float32)),
-                                axis=-1,
-                                keepdims=True,
-                            ),
-                        )
+                        rm_mat = jnp.maximum(rm_mat, jnp.abs(val))
+                row_max = jnp.max(rm_mat.astype(jnp.float32), axis=-1, keepdims=True)
                 scale = row_max * jnp.float32(1.0 / FP8_MAX)
                 scale = jnp.where(scale == 0.0, jnp.float32(1.0), scale)
                 inv_scale = jnp.float32(1.0) / scale
@@ -1436,7 +1433,7 @@ def wuv_quant_split_3d_fp8_local(
             _start_lat(jnp.int32(1), jnp.int32(1))
             pltpu.make_async_copy(lat_vm.at[0], lat_vm.at[0], lat_sems.at[0]).wait()
             mask0 = _row_valid_mask(jnp.int32(0)) if has_mask else None
-            rm0 = jnp.zeros((row_block, 1), jnp.float32)
+            rm0_mat = jnp.zeros((row_block, head_dim), jnp.bfloat16)
             for wc in range(w_chunks):
                 h0 = wc * hw
                 pltpu.make_async_copy(
@@ -1453,14 +1450,8 @@ def wuv_quant_split_3d_fp8_local(
                     )
                     val = acc.astype(jnp.bfloat16)
                     out_vm[0, h] = val
-                    rm0 = jnp.maximum(
-                        rm0,
-                        jnp.max(
-                            jnp.abs(val.astype(jnp.float32)),
-                            axis=-1,
-                            keepdims=True,
-                        ),
-                    )
+                    rm0_mat = jnp.maximum(rm0_mat, jnp.abs(val))
+            rm0 = jnp.max(rm0_mat.astype(jnp.float32), axis=-1, keepdims=True)
             s0 = rm0 * jnp.float32(1.0 / FP8_MAX)
             s0 = jnp.where(s0 == 0.0, jnp.float32(1.0), s0)
 
@@ -1483,7 +1474,7 @@ def wuv_quant_split_3d_fp8_local(
                     ).wait()
                     mask = _row_valid_mask(rb_i) if has_mask else None
                     prev_inv = jnp.float32(1.0) / prev_scale
-                    rm = jnp.zeros((row_block, 1), jnp.float32)
+                    rm_mat = jnp.zeros((row_block, head_dim), jnp.bfloat16)
                     for h in range(num_heads):
                         acc = jnp.dot(
                             _read_lat(slot, h, mask),
@@ -1492,14 +1483,7 @@ def wuv_quant_split_3d_fp8_local(
                         )
                         val = acc.astype(jnp.bfloat16)
                         out_vm[slot, h] = val
-                        rm = jnp.maximum(
-                            rm,
-                            jnp.max(
-                                jnp.abs(val.astype(jnp.float32)),
-                                axis=-1,
-                                keepdims=True,
-                            ),
-                        )
+                        rm_mat = jnp.maximum(rm_mat, jnp.abs(val))
                         xh = out_vm[prev_slot, h].astype(jnp.float32)
                         qh = jnp.clip(xh * prev_inv, -FP8_MAX, FP8_MAX).astype(
                             jnp.float8_e4m3fn
@@ -1520,6 +1504,7 @@ def wuv_quant_split_3d_fp8_local(
                         prev_scale, (row_block, SCALE_PAD_COLS)
                     )
                     _start_out(rb_i - jnp.int32(1), prev_slot)
+                    rm = jnp.max(rm_mat.astype(jnp.float32), axis=-1, keepdims=True)
                     sc = rm * jnp.float32(1.0 / FP8_MAX)
                     return jnp.where(sc == 0.0, jnp.float32(1.0), sc)
 
