@@ -270,6 +270,42 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         """This rank's run of requests (`_runs`)."""
         return ctx.me // self.dcp if self.compressed_dcp else ctx.me
 
+    def _balanced(self, ex: ExecSpec) -> bool:
+        """`nvis_balance` in this bucket: two requests per run (more requests than runs)."""
+        return self.nvis_balance and self._shard_rows(ex)[0] == 2
+
+    def _balance_tables(self, ctx: Any) -> None:
+        """`nvis_balance`: this layer's request -> run assignment (scalar, SMEM). Requests are
+        ranked by visible groups (their last row's `n_vis`, descending; ties by index), the
+        ranking is padded with empty places to `2 * runs`, and place `k < runs` shares run `k`
+        with place `2 * runs - 1 - k` (the largest with the smallest). Per request `q`:
+        `qb_run` its run, `qb_first` 1 if it is the run's first request in loop order,
+        `qb_nxt` the run's next request (-1: the run's last); `qb_slot[run * 2 + j]` the run's
+        j-th request (-1: empty). Every rank computes the same tables from the same inputs."""
+        ex, scr, T = ctx.ex, ctx.scr, ctx.ex.T
+        nreq, R = ex.MB // T, self._runs(ex)
+        P = 2 * R
+        nv = [ctx.extra[NVIS][q * T + T - 1] for q in range(nreq)]
+        for k in range(P):
+            scr["qb_inv"][k] = jnp.int32(-1)
+            scr["qb_slot"][k] = jnp.int32(-1)
+        for q in range(nreq):
+            k = jnp.int32(0)
+            for p in range(nreq):
+                if p != q:
+                    k = jnp.where((nv[p] >= nv[q]) if p < q else (nv[p] > nv[q]), k + 1, k)
+            scr["qb_rk"][q] = k
+            scr["qb_inv"][k] = jnp.int32(q)
+        for q in range(nreq):
+            k = scr["qb_rk"][q]
+            run = jnp.where(k < R, k, P - 1 - k)
+            mate = scr["qb_inv"][P - 1 - k]
+            first = (mate < 0) | (q < mate)
+            scr["qb_run"][q] = run
+            scr["qb_first"][q] = first.astype(I32)
+            scr["qb_nxt"][q] = jnp.where(first & (mate >= 0), mate, -1)
+            scr["qb_slot"][run * 2 + jnp.where(first, 0, 1)] = jnp.int32(q)
+
     def _gather_runs(
         self, ctx: Any, send: Any, recv: Any, ssem: Any, rsem: Any, own_rank: bool = False
     ) -> None:
@@ -552,12 +588,17 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         n = max(ex.R - 1, 1)
         if self.xmerge:
             npr, Wm = self._shard_rows(ex)[0], self._xmerge_width(ex)[1]
+            nreq, P = ex.MB // ex.T, 2 * self._runs(ex)
             return [
                 ScratchReq("qm_send", pltpu.VMEM((npr, 1, Wm), I32)),
                 ScratchReq("qm_recv", pltpu.VMEM((self._runs(ex), npr, 1, Wm), I32)),
                 ScratchReq("qm_ssem", pltpu.SemaphoreType.DMA((n,))),
                 ScratchReq("qm_rsem", pltpu.SemaphoreType.DMA((n,))),
-            ]
+            ] + ([  # `nvis_balance`: the request -> run tables (`_balance_tables`)
+                ScratchReq(name, pltpu.SMEM((size,), I32))
+                for name, size in (("qb_rk", nreq), ("qb_inv", P), ("qb_run", nreq),
+                                   ("qb_first", nreq), ("qb_nxt", nreq), ("qb_slot", P))
+            ] if self._balanced(ex) else [])
         return [
             ScratchReq("qg_send", pltpu.VMEM((rows, 1, W), I32)),
             ScratchReq("qg_recv", pltpu.VMEM((self._runs(ex), rows, 1, W), I32)),
@@ -1034,11 +1075,14 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             else:
                 self._cdcp_credit(ctx)
 
-        def score_merge(q: Any, qr: Any, ck: Any, gc: Any, first: Any, last: Any) -> None:
+        def score_merge(
+            q: Any, qr: Any, ck: Any, gc: Any, first: Any, last: Any, nxt: Any = None
+        ) -> None:
             """Request `q`'s scores (this rank's groups, then the pair's under `compressed_dcp`)
             with the completed group's fresh key in its stale cached column; then selected."""
             self._score_request(
                 ctx, q, qr, self.tab_base(ctx, l), row0=0, first=first, last=last, c_off=c_off,
+                nxt=nxt,
             )
             if cdcp:
                 self._cdcp_swap(ctx, q)
@@ -1055,6 +1099,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     pl.when(jnp.logical_not(last))(lambda: self._cdcp_credit(ctx))
 
         n_loop = self._n_live(ctx) if self.skip_idle else nreq
+        bal = self.shard_index and self._balanced(ex)
+        if bal:
+            self._balance_tables(ctx)
         if self.loop_requests:
             for q in range(nreq):  # static stores into the request-major copies
                 scr["qc_irq"][q] = raw[q * T : (q + 1) * T]
@@ -1079,6 +1126,13 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     jax.lax.rem(q, 2) if self.req_async else None,
                 )
 
+                def own_bal() -> None:  # `nvis_balance`: the run from `_balance_tables`
+                    nxt = scr["qb_nxt"][q]
+                    score_merge(
+                        q, scr["qi_q"][q].astype(BF16), ck, gc, scr["qb_first"][q] == 1,
+                        nxt < 0, jnp.maximum(nxt, 0),
+                    )
+
                 def own() -> None:
                     score_merge(
                         q, scr["qi_q"][q].astype(BF16), ck, gc, jax.lax.rem(q, npr) == 0,
@@ -1087,7 +1141,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                         (jax.lax.rem(q, npr) == npr - 1) | (q == n_loop - 1),
                     )
 
-                if self.shard_index:
+                if bal:
+                    pl.when(scr["qb_run"][q] == self._run(ctx))(own_bal)
+                elif self.shard_index:
                     pl.when(q // npr == self._run(ctx))(own)
                 else:
                     own()
@@ -1259,9 +1315,16 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         send, recv = scr["qm_send"], scr["qm_recv"]
         scr["qi_z"][...] = jnp.zeros((1, 128), I32)  # set by select_rows only on owners
 
+        bal = self._balanced(ex)
+
         def pack(i: Any, carry: Any) -> Any:
+            if bal:  # `nvis_balance`: the run's i-th request (an empty slot: never read)
+                qb = jnp.maximum(scr["qb_slot"][run * npr + i], 0)
             for t in range(T):
-                r = jnp.minimum(run * rows + i * T + t, MB - 1)  # past the last request: never read
+                r = (
+                    qb * T + t if bal
+                    else jnp.minimum(run * rows + i * T + t, MB - 1)  # past the last request: never read
+                )
                 at = t * WS
                 send[i, :, pl.ds(at, K)] = scr["qi_id"][r]
                 head = jnp.where(lane == K, scr["qi_kvl"][r], 0)
@@ -1270,7 +1333,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     send[i, :, pl.ds(at, WS)],
                     jnp.where(lane == K + 1, scr["qc_sga"][r], head),
                 )
-            q = jnp.minimum(run * npr + i, nreq - 1)  # past the last request: never read
+            q = qb if bal else jnp.minimum(run * npr + i, nreq - 1)  # past the last: never read
             send[i, :, pl.ds(u0, W)] = scr["qu_id"][q]
             send[i, :, pl.ds(u0 + W, W)] = scr["qu_cd"][q]
             nl = jnp.zeros((1, 128), I32)
@@ -1282,9 +1345,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         jax.lax.fori_loop(0, npr, pack, 0)
         self._gather_runs(ctx, send, recv, scr["qm_ssem"], scr["qm_rsem"])
 
-        def unpack(q: Any, carry: Any) -> Any:
-            o = q // npr
-            j = q - o * npr
+        def unpack_slot(q: Any, o: Any, j: Any) -> None:
             for t in range(T):
                 r = q * T + t
                 row = recv[o, j, :, pl.ds(t * WS, WS)]
@@ -1302,9 +1363,22 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             scr["qu_cd"][q] = urow[:, W : 2 * W]
             for r in range(D):
                 scr["qu_n"][q, r] = jnp.sum(jnp.where(ulane == 2 * W + r, urow, 0))
+
+        def unpack(q: Any, carry: Any) -> Any:
+            o = q // npr
+            unpack_slot(q, o, q - o * npr)
             return carry
 
-        jax.lax.fori_loop(0, nreq, unpack, 0)
+        def unpack_bal(sl: Any, carry: Any) -> Any:  # `nvis_balance`: every slot of every run
+            q = scr["qb_slot"][sl]
+            o = sl // npr
+            pl.when(q >= 0)(lambda: unpack_slot(q, o, sl - o * npr))
+            return carry
+
+        if bal:
+            jax.lax.fori_loop(0, self._runs(ex) * npr, unpack_bal, 0)
+        else:
+            jax.lax.fori_loop(0, nreq, unpack, 0)
         if self.async_dma:
             self._wait_ids_copies(ctx, MB)
 
