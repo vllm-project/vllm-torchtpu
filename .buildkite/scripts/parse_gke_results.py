@@ -13,7 +13,11 @@
 # limitations under the License.
 """Parse a GKE disagg benchmark result file and insert its rows into
 BigQuery. Exits nonzero if any insert fails; --dry-run prints the SQL
-without executing it."""
+without executing it.
+
+The launcher may state the fleet's physical chips in PREFILL_CHIPS and
+DECODE_CHIPS (or NUM_CHIPS), which per-chip throughput divides by, and may
+leave a routing_metrics.json beside the result file; see bq_utils."""
 
 import json
 import os
@@ -51,6 +55,13 @@ def parse_and_upload(file_path, record_id, dry_run=False) -> bool:
             "Using None.",
             file=sys.stderr,
         )
+
+    try:
+        chips = bq_utils.chips_from_env()
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return False
+    routing_metrics = bq_utils.load_routing_metrics(Path(file_path).parent)
 
     success = True
     with open(file_path) as f:
@@ -100,12 +111,18 @@ def parse_and_upload(file_path, record_id, dry_run=False) -> bool:
                 },
             }
 
+            metrics = bq_utils.with_shared_elements(
+                [("vllm_bench", bq_utils.extract_bench_metrics(data))],
+                bq_utils.bench_derived_metrics(data, chips),
+                routing_metrics,
+            )
+
             sql = bq_utils.build_insert_sql(
                 record_id=unique_record_id,
                 created_time=bq_utils.created_time_sql(data.get("date")),
                 run_type=os.getenv("RUN_TYPE") or "GKE_DISAGG",
                 model_id=model_id,
-                metrics=[("vllm_bench", bq_utils.extract_bench_metrics(data))],
+                metrics=metrics,
                 config=config_dict,
             )
             if not bq_utils.run_insert(

@@ -1,0 +1,38 @@
+{
+  "results": {
+    "gsm8k": {
+      "name": "gsm8k",
+      "alias": "gsm8k",
+      "sample_len": 100,
+      "exact_match,strict-match": 0.97,
+      "exact_match_stderr,strict-match": 0.017,
+      "exact_match,flexible-extract": 0.98,
+      "exact_match_stderr,flexible-extract": 0.014
+    }
+  },
+  "group_subtasks": {
+    "gsm8k": []
+  },
+  "versions": {
+    "gsm8k": 3.0
+  },
+  "n-shot": {
+    "gsm8k": 5
+  },
+  "higher_is_better": {
+    "gsm8k": {
+      "exact_match": true
+    }
+  },
+  "n-samples": {
+    "gsm8k": {
+      "original": 1319,
+      "effective": 100
+    }
+  },
+  "date": 1793582252.7456167,
+  "lm_eval_version": "0.5.0.dev1",
+  "model_source": "local-chat-completions",
+  "model_name": "Qwen/Qwen3.5-397B-A17B-FP8",
+  "total_evaluation_time_seconds": "212.4"
+}

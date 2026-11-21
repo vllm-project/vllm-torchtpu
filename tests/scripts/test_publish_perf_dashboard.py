@@ -16,6 +16,7 @@
 import importlib.util
 import json
 import pathlib
+import sys
 
 import pytest
 
@@ -26,9 +27,19 @@ _SCRIPT = (
     / "benchmarking"
     / "publish_perf_dashboard.py"
 )
-_spec = importlib.util.spec_from_file_location("publish_perf_dashboard", _SCRIPT)
-publish_perf_dashboard = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(publish_perf_dashboard)
+# The script is run as a script, so it imports its sibling bq_utils.
+# Scope sys.path mutation to module load so later test files are unaffected.
+_BENCHMARKING_STR = str(_SCRIPT.parent)
+_added_path = _BENCHMARKING_STR not in sys.path
+if _added_path:
+    sys.path.insert(0, _BENCHMARKING_STR)
+try:
+    _spec = importlib.util.spec_from_file_location("publish_perf_dashboard", _SCRIPT)
+    publish_perf_dashboard = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(publish_perf_dashboard)
+finally:
+    if _added_path and _BENCHMARKING_STR in sys.path:
+        sys.path.remove(_BENCHMARKING_STR)
 
 _CONFIG = {
     "model": "Qwen/Qwen3.5-397B-A17B-FP8",

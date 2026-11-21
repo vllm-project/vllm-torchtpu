@@ -35,6 +35,8 @@ import sys
 import urllib.request
 from pathlib import Path
 
+import bq_utils
+
 DEFAULT_ENDPOINT = "https://vllm-perf-data-ingest-224810116257.us-central1.run.app/"
 TOKEN_ENV = "INGEST_BEARER_TOKEN"
 RESULT_FILENAME_RE = re.compile(r"^isl(\d+)_osl(\d+)_c(\d+)\.json$")
@@ -53,8 +55,12 @@ def to_row(
 ) -> dict:
     tp = int(config["tensor_parallelism"])
     dp = int(config.get("data_parallelism") or 1)
-    total_tput = float(raw["total_token_throughput"])
-    output_tput = float(raw["output_throughput"])
+    # Shared per-chip throughput formula from bq_utils.
+    per_chip = bq_utils.derived_metrics(
+        chips=chips,
+        output_tput=float(raw["output_throughput"]),
+        total_tput=float(raw["total_token_throughput"]),
+    )
     row = {
         "date": datetime.datetime.strptime(raw["date"], "%Y%m%d-%H%M%S").strftime(
             "%Y-%m-%d %H:%M:%S"
@@ -75,9 +81,9 @@ def to_row(
         "ep": tp * dp if config.get("enable_ep") else 1,
         "dp_attention": "true" if dp > 1 else "false",
         "num_chips": chips,
-        "tput_per_gpu": total_tput / chips,
-        "output_tput_per_gpu": output_tput / chips,
-        "input_tput_per_gpu": (total_tput - output_tput) / chips,
+        "tput_per_gpu": per_chip["total_tput_per_chip"],
+        "output_tput_per_gpu": per_chip["output_tput_per_chip"],
+        "input_tput_per_gpu": per_chip["input_tput_per_chip"],
     }
     if os.environ.get("NIGHTLY") == "1":
         row["nightly"] = True
@@ -87,7 +93,7 @@ def to_row(
         name = key.removesuffix("_ms")
         row[name] = value / 1000.0
         if "tpot" in name:
-            row[name.replace("tpot", "intvty")] = 1000.0 / value if value else 0.0
+            row[name.replace("tpot", "intvty")] = bq_utils.interactivity(value) or 0.0
     return row
 
 
