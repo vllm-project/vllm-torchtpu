@@ -23,6 +23,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from functorch.compile import make_boxed_func
+from torch._dynamo.backends.common import aot_autograd
 from vllm.config import ParallelConfig
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
@@ -30,7 +32,11 @@ from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 import vllm_torchtpu as plugin
 from vllm_torchtpu import patch_registry, utils
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-from vllm_torchtpu.worker.tpu_worker import TPUWorker, _configure_tpu_process_env
+from vllm_torchtpu.worker.tpu_worker import (
+    TPUWorker,
+    _configure_tpu_process_env,
+    _drop_traced_module_refs,
+)
 
 
 def test_configure_tpu_process_env_sets_world_size_only_for_multiple_ranks(monkeypatch):
@@ -313,6 +319,65 @@ class TestProfileCaptureAndMerge:
         finally:
             if gc_was_enabled:
                 gc.enable()
+
+
+def test_drop_traced_module_refs_frees_compile_time_graphs():
+    """aot_autograd's convenience methods keep the traced graph alive; dropping
+    them frees it and leaves the compiled forward working."""
+
+    class _Affine(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.randn(4, 4), requires_grad=False)
+
+        def forward(self, x):
+            return (x @ self.w + 1,)
+
+    graph = torch.fx.symbolic_trace(_Affine())
+    graph_ref = weakref.ref(graph)
+    x = torch.randn(2, 4)
+    with torch.no_grad():
+        compiled = aot_autograd(fw_compiler=lambda gm, _: make_boxed_func(gm.forward))(
+            graph, [x]
+        )
+    expected = compiled(x)[0]
+    del graph
+    gc.collect()
+    # Nothing but aot_autograd's convenience methods holds the graph now.
+    assert graph_ref() is not None
+
+    _drop_traced_module_refs()
+    gc.collect()
+
+    assert graph_ref() is None
+    assert "zero_grad" not in compiled.__dict__
+    assert torch.equal(compiled(x)[0], expected)
+
+
+def test_compile_or_warm_up_drops_traced_modules_before_freezing_the_heap():
+    """The dropped graphs must still be collectable when the heap is frozen."""
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(capture_model=lambda: None),
+        compilation_config=SimpleNamespace(compilation_time=0.0),
+        speculative_config=None,
+    )
+    calls = []
+
+    with (
+        patch("vllm_torchtpu.worker.tpu_worker.set_torch_threads_for_runtime"),
+        patch(
+            "vllm_torchtpu.worker.tpu_worker._drop_traced_module_refs",
+            side_effect=lambda: calls.append("drop"),
+        ),
+        patch(
+            "vllm_torchtpu.worker.tpu_worker.freeze_gc_heap",
+            side_effect=lambda: calls.append("freeze"),
+        ),
+        patch("vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"),
+    ):
+        TPUWorker.compile_or_warm_up_model(worker)
+
+    assert calls == ["drop", "freeze"]
 
 
 def test_reset_encoder_cache_delegates_to_model_runner():
@@ -670,11 +735,13 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
         torch.set_num_threads(2)
         with (
             patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap") as freeze,
+            patch("vllm_torchtpu.worker.tpu_worker._drop_traced_module_refs") as drop,
             patch(
                 "vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"
             ) as gc_debug,
         ):
             result = TPUWorker.compile_or_warm_up_model(worker)
+        drop.assert_called_once_with()
         freeze.assert_called_once_with()
         gc_debug.assert_called_once_with()
         # Speculative decoding warms up at the serving thread count; other
