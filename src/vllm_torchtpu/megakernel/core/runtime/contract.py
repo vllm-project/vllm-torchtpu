@@ -188,6 +188,21 @@ class Bucket:
     def key(self) -> tuple[int, int]:
         return (self.T, self.B)
 
+    def runner_shapes(
+        self,
+        token_paddings: Sequence[int],
+        req_block_pairs: Sequence[tuple[int, int]],
+        *,
+        ckpt_window: int,
+        max_pages_per_seq: int,
+    ) -> list[RunnerShape]:
+        """The runner input shapes this bucket is warmed up with (one graph each)."""
+        cols = max(self.T, ckpt_window, 1)
+        if token_paddings and req_block_pairs:
+            tok = next((p for p in token_paddings if p >= self.B), token_paddings[-1])
+            return [RunnerShape(tok, r, k, cols) for r, k in req_block_pairs]
+        return [RunnerShape(self.B, self.B // self.T, max_pages_per_seq, cols)]
+
 
 @dataclasses.dataclass(frozen=True)
 class RunnerShape:
