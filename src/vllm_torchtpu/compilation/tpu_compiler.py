@@ -354,6 +354,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/distributed/pallas_shapes.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
+    # The candidate sampler's Pallas op sits behind a custom-op boundary too.
+    "vllm_torchtpu/layers/adapter/sample/candidate_sampling.py",
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
