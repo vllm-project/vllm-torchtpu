@@ -70,8 +70,9 @@ def _git(repo: pathlib.Path, *args: str) -> str:
 def nightly(tmp_path):
     """Runs the publish script in a one-commit repository on `main`.
 
-    Returns run(**env) -> (completed process, docker invocations as argv
-    lists) and the repository's HEAD commit.
+    Returns ``(run, head, repo)`` where ``run(**env)`` returns
+    ``(completed process, docker invocations as argv lists)``, ``head`` is
+    the repository's HEAD commit, and ``repo`` is the throwaway checkout path.
     """
     repo = tmp_path / "repo"
     for relative in _COPIED:
@@ -185,7 +186,9 @@ def test_label_falls_back_to_buildkite_commit_without_git_metadata(nightly):
     shutil.rmtree(repo / ".git")
     commit = "0123456789abcdef0123456789abcdef01234567"
 
-    completed, calls = run(BUILDKITE_COMMIT=commit, GIT_CEILING_DIRECTORIES=str(repo))
+    completed, calls = run(
+        BUILDKITE_COMMIT=commit, GIT_CEILING_DIRECTORIES=str(repo.parent)
+    )
 
     assert completed.returncode == 0, completed.stderr
     assert {tuple(_labels(build)) for build in _builds(calls)} == {
@@ -197,7 +200,9 @@ def test_nothing_is_built_when_the_commit_is_unknown(nightly):
     run, _, repo = nightly
     shutil.rmtree(repo / ".git")
 
-    completed, calls = run(BUILDKITE_COMMIT="HEAD", GIT_CEILING_DIRECTORIES=str(repo))
+    completed, calls = run(
+        BUILDKITE_COMMIT="HEAD", GIT_CEILING_DIRECTORIES=str(repo.parent)
+    )
 
     assert completed.returncode == 1
     assert "cannot tell which commit the images are built from" in completed.stderr
