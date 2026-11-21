@@ -429,7 +429,10 @@ def engine_patches():
 def _pp8(monkeypatch, evict_state):
     """Served PP8 prefill groups: another conversation computed a shared head (J blocks) and one block more. Split
     chain (``evict_state``, the measured hole): HBM's LRU took its state checkpoints and the turn shares only the head.
-    Convergent: the checkpoints stay and the turn continues the other conversation's whole prompt."""
+    Convergent: the other prompt is J + 1 blocks plus one token, so its replay boundary (num_prompt_tokens - 1, no
+    EAGLE group here: KVCacheCoordinator.get_replay_boundaries) is the block boundary J + 1 and its checkpoint is a hit
+    there; the checkpoints stay and the turn continues those J + 1 blocks. (Dev runs j-0f4adcd0 / j-9ba653eb: a prompt
+    of J + 1 blocks plus 9 tokens leaves its checkpoint at 12,808 tokens, no block boundary, so no convergent hit.)"""
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -442,7 +445,7 @@ def _pp8(monkeypatch, evict_state):
     mamba = [g for g, grp in enumerate(kvc.kv_cache_groups) if isinstance(grp.kv_cache_spec, MambaSpec)]
     J = 3
     head = _tokens(J * BLOCK, 7)
-    other = _request("other", head + _tokens(BLOCK + 9, 8))
+    other = _request("other", head + _tokens(BLOCK + (9 if evict_state else 1), 8))
     blocks, hit, _ = kvm.get_computed_blocks(other)
     assert kvm.allocate_slots(other, other.num_tokens, new_computed_blocks=blocks) is not None
     other.num_computed_tokens = other.num_tokens
@@ -457,7 +460,7 @@ def _pp8(monkeypatch, evict_state):
     if evict_state:
         turn = _request("turn", head + _tokens(3 * BLOCK, 9) + _tokens(2000, 10))
     else:
-        turn = _request("turn", list(other.prompt_token_ids) + _tokens(2000, 10))
+        turn = _request("turn", list(other.prompt_token_ids[: (J + 1) * BLOCK]) + _tokens(2000, 10))
     return kvm, turn, J, BLOCK
 
 
@@ -492,7 +495,8 @@ def test_served_groups_pin_the_attention_run_and_the_state_checkpoint(monkeypatc
         assert conv_hit == 0 and div_hit == J * BLOCK, "HYBRID the split chain: only the divergent lookup hits"
         assert not any(b for g in _state_groups(kvm, groups) for b in g), "HYBRID split chain: no state block to pin"
     else:
-        assert conv_hit > 0, f"HYBRID convergent: a checkpoint backs the hit ({conv_hit})"
+        _, per_group = kvm.coordinator.find_longest_cache_hit_per_group(turn.block_hashes, turn.num_tokens - 1)
+        assert conv_hit > 0, f"HYBRID convergent: a checkpoint backs the hit ({conv_hit}; per group {per_group})"
         assert all(_state_groups(kvm, groups)), "HYBRID convergent: every state group's checkpoint is pinned"
     # Without divergent hits the pin is the convergent hit alone.
     g_conv, l_conv = arrival_touch.arrival_blocks(kvm, NS(supports_divergent_local_hybrid_hits=False), turn)
