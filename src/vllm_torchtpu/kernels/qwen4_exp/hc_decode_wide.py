@@ -129,8 +129,11 @@ def _kernel(
     mode: int,
     timing: str,
     lookahead: int,
+    fold: bool = False,
 ):
     compute = timing != "dma"
+    # INJ-MXU: the logits come from the down projection, not the vector unit.
+    vpu_inject = inject and not fold
     refs = list(refs)
     if prologue:
         res_hbm, blk_hbm, pinj_hbm = refs[:3]
@@ -146,7 +149,7 @@ def _kernel(
     h_hbm = refs.pop(0) if prologue else None
     res_vm, w_vm, dn_vm, up_vm, xn_vm, gate_vm, mixed_vm = refs[:7]
     refs = refs[7:]
-    injw_vm = refs.pop(0) if inject and mode in (1, 3) else None
+    injw_vm = refs.pop(0) if vpu_inject and mode in (1, 3) else None
     w1_vm = refs.pop(0) if mode == 2 else None
     y_vm = refs.pop(0) if mode == 2 else None
     if prologue:
@@ -174,8 +177,13 @@ def _kernel(
 
     w_in = copy(w_hbm, w_vm)
     if inject:
-        # Mode 2: the inject rows go below the down rows ([down; inject; unused]).
-        inj_dst = injw_vm if mode in (1, 3) else dn_vm.at[pl.ds(lowrank, branches), :]
+        # Mode 2 and fold: the inject rows go below the down rows
+        # ([down; inject; unused] / [down; inject; zero]).
+        inj_dst = (
+            injw_vm
+            if vpu_inject and mode in (1, 3)
+            else dn_vm.at[pl.ds(lowrank, branches), :]
+        )
         inj_in = copy(injw_hbm, inj_dst)
     pinj_in = copy(pinj_hbm, pinj_vm) if prologue else None
     rows_in, blk_in = [], []
@@ -190,7 +198,7 @@ def _kernel(
     # of it and not yet waited hold less than ``lookahead`` MiB, or when it is
     # the one being waited (hc_decode_cmp.py's pump).
     queue = [(w_in, width * 2)]
-    if inject:
+    if vpu_inject:
         queue.append((inj_in, branches * width * 2))
     if prologue:
         queue.append((pinj_in, tokens * LANES * 4))
@@ -203,14 +211,22 @@ def _kernel(
             # runs beside block 1's vector work.
             queue.append((dn_in, lowrank * width * 2))
     if mode != 3:
+        if fold:
+            # Fold: the inject rows are first read by the down projection.
+            queue.append((inj_in, branches * width * 2))
         queue.append((dn_in, lowrank * width * 2))
     queue.append((up_in, width * 3 * LANES * 2))
     budget = (W3_LOOKAHEAD_MIB if mode == 3 else lookahead) << 20
-    state = dict(started=0, waited=-1, done=set())
+    # Fold: the inject copy (and what follows it) waits until the zero rows
+    # under it are stored.
+    hold = next(j for j, (q, _) in enumerate(queue) if q is inj_in) if fold else None
+    state = dict(started=0, waited=-1, done=set(), hold=hold)
 
     def pump():
         while state["started"] < len(queue):
             i = state["started"]
+            if state["hold"] is not None and i >= state["hold"]:
+                break
             held = sum(n for _, n in queue[state["waited"] + 1 : i])
             if i > state["waited"] + 1 and held + queue[i][1] > budget:
                 break
@@ -232,8 +248,17 @@ def _kernel(
         pump()
 
     pump()
+    if fold:
+        if compute:
+            # The 128-row tile from row ``lowrank`` is zeroed once (an aligned
+            # store), then the inject copy fills its first ``branches`` rows.
+            dn_vm[pl.ds(lowrank, dn_vm.shape[0] - lowrank), :] = jnp.zeros(
+                (dn_vm.shape[0] - lowrank, width), dn_vm.dtype
+            )
+        state["hold"] = None
+        pump()
     need(w_in)
-    if inject and mode in (1, 3):
+    if vpu_inject and mode in (1, 3):
         need(inj_in)
     if prologue:
         need(pinj_in)
@@ -273,13 +298,13 @@ def _kernel(
             norm = normalized * (1.0 + weight[None, start : start + hidden])
             norm = norm.astype(jnp.bfloat16)
             xn_vm[pl.ds(offset, rows), pl.ds(start, hidden)] = norm
-            if inject:
+            if vpu_inject:
                 norm32 = norm.astype(jnp.float32)
                 for j in range(branches):
                     row = injw_vm[pl.ds(j, 1), pl.ds(start, hidden)]
                     term = norm32 * row.astype(jnp.float32)
                     inj_terms[j] = term if inj_terms[j] is None else inj_terms[j] + term
-        if inject:
+        if vpu_inject:
             shape = (rows, branches)
             lanes = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
             logits = jnp.zeros(shape, jnp.float32)
@@ -374,7 +399,7 @@ def _kernel(
             h_out.append(out)
 
     # ---------------------------------------------------------------- phase B1
-    if inject and mode == 2:
+    if inject and (mode == 2 or fold):
         need(inj_in)
     need(dn_in)
     if compute and mode == 3:
@@ -387,8 +412,25 @@ def _kernel(
             dimension_numbers=nt,
             preferred_element_type=jnp.float32,
         )
+        if fold:
+            # Fold: the inject rows' columns sit in the last 128-lane tile.
+            tile0 = lowrank // LANES * LANES
+            lane0 = lowrank - tile0
+            inj_tile = down_acc[:, tile0 : tile0 + LANES]
+            down_acc = down_acc[:, :lowrank]
         gate = (down_acc.astype(jnp.bfloat16) / branches).astype(jnp.bfloat16)
         gate_vm[...] = jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16)
+        if fold:
+            # The served injection gate on the folded logits: each column
+            # extracted exactly (one non-zero term), then bf16, 2 sigmoid(. / 4).
+            shape = (tokens, branches)
+            lanes = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
+            logits = jnp.zeros(shape, jnp.float32)
+            for j in range(branches):
+                column = _lane_column(inj_tile, lane0 + j)
+                logits = jnp.where(lanes == j, column, logits)
+            logits = logits.astype(jnp.bfloat16).astype(jnp.float32)
+            injo_vm[...] = 2.0 * jax.nn.sigmoid(logits / branches)
     elif compute:
         # hc_decode_cmp.py: the down projection stream by stream, the inject
         # rows' logits in its second 128-lane column tile.
@@ -513,11 +555,25 @@ def hc_decode_mix_wide(
     interpret=False,
     timing: str = "full",
     lookahead: int = LOOKAHEAD_MIB,
+    fold: bool = False,
 ):
     """``hc_decode.hc_decode_mix`` for ``wide_applies`` row counts.
 
     Same arguments and returns: ``(mixed, injection)`` (``injection`` None
     without ``inject_weight``), plus the combined hyper input with ``block``.
+
+    ``fold`` (q38 INJ-MXU, ``TPU_QWEN4_HC_DECODE_INJECT_FOLD``; mode 1 only, and
+    only calls with ``inject_weight`` change; kernel name ``..._w1f``): mode 1
+    with the injection logits taken from the single down projection. The inject
+    rows are copied below the down rows (rows ``lowrank`` to ``lowrank +
+    branches``, the rest of the 128-row tile zero, as
+    ``hc_prefill_fused.extend_down`` and mode 2 lay them out), the vector-unit
+    injection terms are dropped, and after the down projection each logit column
+    is extracted exactly from its 128-lane tile with ``_lane_column``; then the
+    served bf16 rounding and ``2 sigmoid(. / branches)``. The logits' f32
+    summation order changes (numerics-changing, bounded by
+    reports/prereg/q38_injmxu_bound_LOCKED.md); the gate path, mixed and the
+    combined rows keep mode 1's expressions.
     """
     return _hc_decode_mix_wide(
         x,
@@ -534,14 +590,18 @@ def hc_decode_mix_wide(
         interpret=interpret,
         timing=timing,
         lookahead=lookahead,
+        fold=fold,
     )
 
 
-def kernel_name(prologue: bool, mode: int, timing: str = "full") -> str:
+def kernel_name(
+    prologue: bool, mode: int, timing: str = "full", fold: bool = False
+) -> str:
     """The Pallas call's name: the served kernels' names plus a suffix, so
     profile classifiers that match the served prefixes keep these rows."""
     suffix = "" if timing == "full" else f"_{timing}"
-    return f"qwen4exp_hc_decode{'_combine' if prologue else ''}_w{mode}{suffix}"
+    tag = f"{mode}f" if fold else f"{mode}"
+    return f"qwen4exp_hc_decode{'_combine' if prologue else ''}_w{tag}{suffix}"
 
 
 @functools.partial(
@@ -554,6 +614,7 @@ def kernel_name(prologue: bool, mode: int, timing: str = "full") -> str:
         "interpret",
         "timing",
         "lookahead",
+        "fold",
     ),
 )
 def _hc_decode_mix_wide(
@@ -572,11 +633,16 @@ def _hc_decode_mix_wide(
     interpret,
     timing,
     lookahead,
+    fold=False,
 ):
     tokens, width = x.shape
     lowrank = down.shape[0]
     prologue = block is not None
     inject = inject_weight is not None
+    if fold and mode != 1:
+        raise ValueError(f"HC decode mix (wide): fold needs mode 1, got mode {mode}")
+    # Without the injection gate there is nothing to fold: mode 1 unchanged.
+    fold = bool(fold) and inject
     if (
         mode not in MODES
         or timing not in TIMINGS
@@ -609,7 +675,7 @@ def _hc_decode_mix_wide(
         out_shape.append(jax.ShapeDtypeStruct((tokens, branches), jnp.float32))
     if prologue:
         out_shape.append(jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16))
-    if mode in (1, 3):
+    if mode in (1, 3) and not fold:
         down_rows = lowrank
     else:
         # [down; inject; unused], a whole number of 128-row tiles.
@@ -623,7 +689,7 @@ def _hc_decode_mix_wide(
         pltpu.VMEM((tokens, lowrank), jnp.bfloat16),  # gate_vm
         pltpu.VMEM((tokens, hidden), jnp.bfloat16),  # mixed_vm
     ]
-    if inject and mode in (1, 3):
+    if inject and mode in (1, 3) and not fold:
         scratch.append(pltpu.VMEM((branches, width), jnp.bfloat16))  # injw_vm
     if mode == 2:
         scratch.append(pltpu.VMEM((CMP_PIECE, width), jnp.float32))  # w1_vm
@@ -651,6 +717,7 @@ def _hc_decode_mix_wide(
             mode=mode,
             timing=timing,
             lookahead=lookahead,
+            fold=fold,
         ),
         in_specs=[any_space] * n_in,
         out_specs=[any_space] * len(out_shape),
@@ -658,7 +725,7 @@ def _hc_decode_mix_wide(
         scratch_shapes=scratch,
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=VMEM_LIMIT),
         interpret=interpret,
-        name=kernel_name(prologue, mode, timing),
+        name=kernel_name(prologue, mode, timing, fold),
     )(*args)
     mixed = outs[0]
     injection = outs[1] if inject else None
@@ -682,11 +749,13 @@ def hc_decode_mix_wide_auto(
     prev_injection=None,
     max_tile=0,
     interpret=False,
+    fold=False,
 ):
     """``hc_decode_mix_wide`` where ``wide_applies``, else ``hc_decode_mix``.
 
     The choice is made on the concrete row count of the traced bucket, so the
-    torch-side gate (``decode_token_tile``) is unchanged.
+    torch-side gate (``decode_token_tile``) is unchanged. ``fold`` (INJ-MXU)
+    reaches only the wide kernel; other row counts keep ``hc_decode_mix``.
     """
     kwargs = dict(
         branches=branches,
@@ -698,7 +767,7 @@ def hc_decode_mix_wide_auto(
     )
     if wide_applies(x.shape[0]):
         return hc_decode_mix_wide(
-            x, weight, down, up, inject_weight, mode=mode, **kwargs
+            x, weight, down, up, inject_weight, mode=mode, fold=fold, **kwargs
         )
     return hc_decode_mix(
         x, weight, down, up, inject_weight, max_tile=max_tile, **kwargs

@@ -139,8 +139,17 @@ def _decode_mix_choice():
     16-256 rows. They are exclusive. TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID
     (q38 HC-HIGHROWS-2 CMP-S, only with COMPARE) takes the served sigmoid in
     the cmp mix term (_cmps). Unset, it is hc_decode_mix, untagged.
+    TPU_QWEN4_HC_DECODE_INJECT_FOLD (q38 INJ-MXU, numerics-changing) needs
+    TPU_QWEN4_HC_DECODE_WIDE=1: W1 takes the injection logits from its down
+    projection (_w1f); with WIDE 0, 2 or 3 it is refused.
     """
     wide = envs.TPU_QWEN4_HC_DECODE_WIDE
+    fold = envs.TPU_QWEN4_HC_DECODE_INJECT_FOLD
+    if fold and wide != 1:
+        raise ValueError(
+            "TPU_QWEN4_HC_DECODE_INJECT_FOLD needs TPU_QWEN4_HC_DECODE_WIDE=1 "
+            f"(got {wide})"
+        )
     if wide:
         if wide not in WIDE_MODES:
             raise ValueError(
@@ -152,6 +161,8 @@ def _decode_mix_choice():
                 "TPU_QWEN4_HC_DECODE_WIDE and TPU_QWEN4_HC_DECODE_COMPARE are "
                 "exclusive"
             )
+        if fold:
+            return functools.partial(hc_decode_mix_wide_auto, mode=1, fold=True), "_w1f"
         return functools.partial(hc_decode_mix_wide_auto, mode=wide), f"_w{wide}"
     if envs.TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID:
         if not envs.TPU_QWEN4_HC_DECODE_COMPARE:

@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     TPU_QWEN4_HC_DECODE_COMPARE: bool = False
     TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID: bool = False
     TPU_QWEN4_HC_DECODE_WIDE: int = 0
+    TPU_QWEN4_HC_DECODE_INJECT_FOLD: bool = False
     TPU_QWEN4_HC_PREFILL_ODD_TILES: bool = False
     TPU_QWEN4_HC_PREFILL_FUSED_MIX: bool = False
     TPU_QWEN4_HC_PREFILL_PARTIAL_TILE: bool = False
@@ -1627,6 +1628,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keeps hc_decode.py.
     # Exclusive with TPU_QWEN4_HC_DECODE_COMPARE.
     "TPU_QWEN4_HC_DECODE_WIDE": env_int("TPU_QWEN4_HC_DECODE_WIDE", 0),
+    # q38 INJ-MXU, only with TPU_QWEN4_HC_DECODE_WIDE=1 (refused with WIDE 0,
+    # 2 or 3): at W1's 160-511 rows the combine / mix calls that form the
+    # injection gate take its logits from the single down projection (the
+    # inject rows sit below the down rows, kernel ..._w1f) instead of the
+    # vector-unit sum. Numerics-changing (f32 summation order of the logits;
+    # bound reports/prereg/q38_injmxu_bound_LOCKED.md); op names gain _w1f.
+    "TPU_QWEN4_HC_DECODE_INJECT_FOLD": env_bool("TPU_QWEN4_HC_DECODE_INJECT_FOLD"),
     # qwen4_exp prefill: let the fused HC mix (hc_full) and the gated_residual
     # combine take any whole number (>= 2) of hc_prefill_full_tile tiles, not
     # only even counts, so 6,400- and 3,200-token steps leave the unfused
