@@ -70,6 +70,7 @@ class InBranchQbInputs:
     s_qb: torch.Tensor
     w_uk_t: torch.Tensor
     cos_sin: torch.Tensor
+    w_uk_t_hi: torch.Tensor | None = None
 
 
 def _dcp_rows_metadata_jax(
@@ -142,7 +143,7 @@ def build_in_branch_qb_attention_op(
         q_c_own: jax.Array,
         w_qb: jax.Array,
         s_qb: jax.Array,
-        w_uk_t: jax.Array,
+        w_uk_t: jax.Array | tuple[jax.Array, jax.Array],
         cos_sin: jax.Array,
         kv_c_normed: jax.Array,
         k_pe: jax.Array,
@@ -404,7 +405,59 @@ def build_in_branch_qb_attention_op(
         )
         return kv_cache_nope, kv_cache_rope, attn_out
 
+    split_w_uk = (
+        getattr(target_layer, "W_UK_T_dcp_qrep_lo", None) is not None
+        and getattr(target_layer, "W_UK_T_dcp_qrep_hi", None) is not None
+    )
+
     def _make_wrapper(kv_sharded: bool):
+        if split_w_uk:
+
+            def _w_split(
+                nope: jax.Array,
+                rope: jax.Array,
+                qc: jax.Array,
+                wqb: jax.Array,
+                sqb: jax.Array,
+                wuk_lo: jax.Array,
+                cs: jax.Array,
+                kc: jax.Array,
+                kp: jax.Array,
+                tk: jax.Array,
+                sl: jax.Array,
+                bt: jax.Array,
+                qsl: jax.Array,
+                dist: jax.Array,
+                rk: jax.Array,
+                uv: jax.Array,
+                wo: jax.Array,
+                so: jax.Array,
+                wuk_hi: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                return _run(
+                    nope,
+                    rope,
+                    qc,
+                    wqb,
+                    sqb,
+                    (wuk_lo, wuk_hi),
+                    cs,
+                    kc,
+                    kp,
+                    tk,
+                    sl,
+                    bt,
+                    qsl,
+                    dist,
+                    rk,
+                    uv,
+                    wo,
+                    so,
+                    kv_sharded=kv_sharded,
+                )
+
+            return _w_split
+
         def _w(
             nope: jax.Array,
             rope: jax.Array,
@@ -469,6 +522,7 @@ def build_in_branch_qb_attention_op(
             w_uv: torch.Tensor,
             w_o: torch.Tensor,
             s_o: torch.Tensor,
+            *w_uk_extra: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             _ = (
                 w_qb,
@@ -484,6 +538,7 @@ def build_in_branch_qb_attention_op(
                 rank_ids,
                 w_uv,
                 s_o,
+                w_uk_extra,
             )
             out_rows = (
                 kv_c_normed.shape[0]
@@ -500,7 +555,7 @@ def build_in_branch_qb_attention_op(
 
     def _in_specs(kv_sharded: bool) -> tuple[P, ...]:
         kv_spec = shd if kv_sharded else rep
-        return (
+        base = (
             shd,  # kv_cache_nope
             shd,  # kv_cache_rope
             shd,  # q_c_own
@@ -520,6 +575,7 @@ def build_in_branch_qb_attention_op(
             shd,  # w_o
             shd,  # s_o
         )
+        return base + ((rep,) if split_w_uk else ())
 
     out_specs = (shd, shd, shd)
     cache_key = (
@@ -533,6 +589,7 @@ def build_in_branch_qb_attention_op(
         int(free_nobar_max_cap),
         num_heads,
         out_dim,
+        split_w_uk,
     )
 
     def _build_plain(op_name: str):
@@ -597,6 +654,10 @@ def build_in_branch_qb_attention_op(
         selected = sharded_kv_op if kv_sharded else plain_op
         if selected is None:
             raise RuntimeError("in-branch q_b sharded KV op requested but not built")
+        wuk_extra = ()
+        if split_w_uk:
+            assert qb_inputs.w_uk_t_hi is not None
+            wuk_extra = (qb_inputs.w_uk_t_hi,)
         new_nope, new_rope, attn_out = selected(
             nope_cache,
             rope_cache,
@@ -616,6 +677,7 @@ def build_in_branch_qb_attention_op(
             w_uv,
             w_o[0],
             w_o[1],
+            *wuk_extra,
         )
         nope_cache.copy_(new_nope)
         rope_cache.copy_(new_rope)

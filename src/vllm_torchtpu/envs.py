@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     TPU_MLA_FUSED_QB_ROPE_ABSORB: bool = True
     TPU_MLA_SPLIT_QKV_A_PROJ: bool = True
     TPU_MLA_SPLIT_QKV_A_CHUNK: int = 1024
+    TPU_MLA_SPLIT_W_UK_T: bool = True
     TPU_MLA_FUSED_SMALL_A2A: bool = True
     TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB: int = 16
     TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS: int = 8
@@ -708,6 +709,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-layer decode weights from VMEM.
     "TPU_MLA_SPLIT_QKV_A_PROJ": env_bool("TPU_MLA_SPLIT_QKV_A_PROJ", default=True),
     "TPU_MLA_SPLIT_QKV_A_CHUNK": env_int("TPU_MLA_SPLIT_QKV_A_CHUNK", 1024),
+    # Split gathered W_UK_T_dcp_qrep [H, d_nope, L] into two equal head-axis
+    # device buffers [H/2, d_nope, L] after load (0 extra HBM) so decode
+    # absorb_q prefetches two smaller tensors independently alongside qkv_a.
+    "TPU_MLA_SPLIT_W_UK_T": env_bool("TPU_MLA_SPLIT_W_UK_T", default=True),
     # With TPU_MLA_FUSED_SMALL_A2A: peers push into a VMEM receive scratch and
     # the kernel also runs the DCP merge (the unpack + `_merge_received`, term
     # by term), so the op returns the merged [T, L, V] -- no receive buffer, no

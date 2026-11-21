@@ -74,7 +74,11 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla.fused_qb_absorb import (
+    HEAD_BLOCK as _FUSED_QB_HEAD_BLOCK,
+)
+from vllm_torchtpu.kernels.mla.fused_qb_absorb import (
     fused_qb_rope_absorb_split,
+    fused_qb_rope_absorb_split_halves,
     supports_fused_qb_rope_absorb_split,
 )
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
@@ -429,6 +433,36 @@ _FUSED_QB_ROPE_ABSORB_SPLIT_OP = pallas.jax_op(
     "pallas::mla_fused_qb_rope_absorb_split", fused_qb_rope_absorb_split
 )
 _FUSED_QB_ROPE_ABSORB_SPLIT_OP.register_fake(_fake_fused_qb_rope_absorb_split)
+
+
+def _fake_fused_qb_rope_absorb_split_halves(
+    q_c: torch.Tensor,
+    w_qb: torch.Tensor,
+    w_s: torch.Tensor,
+    w_uk_t_lo: torch.Tensor,
+    w_uk_t_hi: torch.Tensor,
+    cos_sin: torch.Tensor,
+    split_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del w_qb, w_s
+    heads = w_uk_t_lo.shape[0] + w_uk_t_hi.shape[0]
+    rank = w_uk_t_lo.shape[2]
+    total_tokens = q_c.shape[0]
+    d_pe = cos_sin.shape[1]
+    return (
+        q_c.new_empty((split_rows, heads, rank)),
+        q_c.new_empty((total_tokens - split_rows, heads, rank)),
+        q_c.new_empty((total_tokens, heads, d_pe)),
+    )
+
+
+_FUSED_QB_ROPE_ABSORB_SPLIT_HALVES_OP = pallas.jax_op(
+    "pallas::mla_fused_qb_rope_absorb_split_halves",
+    fused_qb_rope_absorb_split_halves,
+)
+_FUSED_QB_ROPE_ABSORB_SPLIT_HALVES_OP.register_fake(
+    _fake_fused_qb_rope_absorb_split_halves
+)
 
 
 def _topk_rows_update_jax(buf: jax.Array, rows: jax.Array) -> jax.Array:
@@ -1975,8 +2009,8 @@ class VllmTPUMLAAttention(MLAAttention):
         )
 
         if original_mla_get_backend is not None:
-            mla_attention.get_mla_prefill_backend = (
-                lambda config: TPUDummyMLAPrefillBackend
+            mla_attention.get_mla_prefill_backend = lambda config: (
+                TPUDummyMLAPrefillBackend
             )
         if original_selector_get_backend is not None:
             selector.get_mla_prefill_backend = lambda config: TPUDummyMLAPrefillBackend
@@ -2098,6 +2132,8 @@ class VllmTPUMLAAttention(MLAAttention):
         # absorbed W_UK_T has to span them too. Gathered once here rather than
         # gathering q every step -- that trade is the point of qrep.
         self.W_UK_T_dcp_qrep = None
+        self.W_UK_T_dcp_qrep_lo = None
+        self.W_UK_T_dcp_qrep_hi = None
         self.W_UK_T_dcp_qrep_scale = None
         self.W_UV_dcp_qrep = None
         self.W_UV_dcp_qrep_scale = None
@@ -2110,9 +2146,22 @@ class VllmTPUMLAAttention(MLAAttention):
                     "dcp_q_replicate is set but no DCP group is initialized, "
                     "so W_UK_T cannot be gathered across the group."
                 )
-            self.W_UK_T_dcp_qrep = fresh_buffer(
-                dcp_group.all_gather(self.W_UK_T.contiguous(), dim=0)
-            )
+            gathered_w_uk = dcp_group.all_gather(self.W_UK_T.contiguous(), dim=0)
+            if (
+                envs.TPU_MLA_SPLIT_W_UK_T
+                and not hasattr(self, "W_UK_T_scale")
+                and gathered_w_uk.shape[0] >= 2 * _FUSED_QB_HEAD_BLOCK
+                and gathered_w_uk.shape[0] % (2 * _FUSED_QB_HEAD_BLOCK) == 0
+            ):
+                half = gathered_w_uk.shape[0] // 2
+                # Avoid slicing a shared W_UK_T buffer: two independent
+                # fresh_buffer allocations release the monolith (0 extra HBM)
+                # and let the compiler prefetch each half separately.
+                self.W_UK_T_dcp_qrep_lo = fresh_buffer(gathered_w_uk[:half])
+                self.W_UK_T_dcp_qrep_hi = fresh_buffer(gathered_w_uk[half:])
+            else:
+                self.W_UK_T_dcp_qrep = fresh_buffer(gathered_w_uk)
+            del gathered_w_uk
             if hasattr(self, "W_UK_T_scale"):
                 self.W_UK_T_dcp_qrep_scale = fresh_buffer(
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
@@ -2160,6 +2209,8 @@ class VllmTPUMLAAttention(MLAAttention):
                 t
                 for t in (
                     self.W_UK_T_dcp_qrep,
+                    self.W_UK_T_dcp_qrep_lo,
+                    self.W_UK_T_dcp_qrep_hi,
                     self.W_UK_T_dcp_qrep_scale,
                     self.W_UV_dcp_qrep,
                     self.W_UV_dcp_qrep_scale,
@@ -2649,7 +2700,16 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         q_rows: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None,
         num_kv_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor] | None:
+    ) -> (
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+            int,
+            torch.Tensor,
+        ]
+        | None
+    ):
         if (
             not envs.TPU_MLA_FUSED_QB_ROPE_ABSORB
             or q_rows is None
@@ -2670,9 +2730,30 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             or not dcp_token_parallel_op.applies(num_kv_tokens)
         ):
             return None
-        w_uk_t = getattr(self.mla_attn, "W_UK_T_dcp_qrep", None)
-        if w_uk_t is None or not isinstance(w_uk_t, torch.Tensor):
-            return None
+        w_uk_lo = getattr(self.mla_attn, "W_UK_T_dcp_qrep_lo", None)
+        w_uk_hi = getattr(self.mla_attn, "W_UK_T_dcp_qrep_hi", None)
+        w_uk_t: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+        if (
+            w_uk_lo is not None
+            and w_uk_hi is not None
+            and isinstance(w_uk_lo, torch.Tensor)
+            and isinstance(w_uk_hi, torch.Tensor)
+        ):
+            lo_t = cast(torch.Tensor, w_uk_lo)
+            hi_t = cast(torch.Tensor, w_uk_hi)
+            w_uk_t = (lo_t, hi_t)
+            w_uk_shape = (
+                lo_t.shape[0] + hi_t.shape[0],
+                lo_t.shape[1],
+                lo_t.shape[2],
+            )
+        else:
+            w_uk_raw = getattr(self.mla_attn, "W_UK_T_dcp_qrep", None)
+            if w_uk_raw is None or not isinstance(w_uk_raw, torch.Tensor):
+                return None
+            raw_t = cast(torch.Tensor, w_uk_raw)
+            w_uk_t = raw_t
+            w_uk_shape = tuple(raw_t.shape)
         if getattr(self.mla_attn, "W_UK_T_dcp_qrep_scale", None) is not None:
             return None
         qb_ops = _fused_qb_operands(self.q_b_proj)
@@ -2691,7 +2772,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             tuple(w_qb.shape),
             w_qb.dtype,
             tuple(s_qb.shape),
-            tuple(w_uk_t.shape),
+            w_uk_shape,
             (q_c.shape[0], cos_sin_cache.shape[-1]),
             split_rows,
             bfloat16_dtype=torch.bfloat16,
@@ -2985,12 +3066,38 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                             and self.indexer.indexer_op.has_live_unified_cache()
                         )
                         if can_defer_nonidx_qb or can_defer_idx_qb:
-                            in_branch_qb_inputs = dcp_nonidx_qb_mla_op.InBranchQbInputs(
-                                q_c=q_c_for_q,
-                                w_qb=w_qb,
-                                s_qb=s_qb,
-                                w_uk_t=w_uk_t.to(q_c_for_q.dtype),
-                                cos_sin=cos_sin,
+                            if isinstance(w_uk_t, tuple):
+                                w_uk_lo, w_uk_hi = w_uk_t
+                                in_branch_qb_inputs = (
+                                    dcp_nonidx_qb_mla_op.InBranchQbInputs(
+                                        q_c=q_c_for_q,
+                                        w_qb=w_qb,
+                                        s_qb=s_qb,
+                                        w_uk_t=w_uk_lo.to(q_c_for_q.dtype),
+                                        cos_sin=cos_sin,
+                                        w_uk_t_hi=w_uk_hi.to(q_c_for_q.dtype),
+                                    )
+                                )
+                            else:
+                                in_branch_qb_inputs = (
+                                    dcp_nonidx_qb_mla_op.InBranchQbInputs(
+                                        q_c=q_c_for_q,
+                                        w_qb=w_qb,
+                                        s_qb=s_qb,
+                                        w_uk_t=w_uk_t.to(q_c_for_q.dtype),
+                                        cos_sin=cos_sin,
+                                    )
+                                )
+                        elif isinstance(w_uk_t, tuple):
+                            w_uk_lo, w_uk_hi = w_uk_t
+                            fused_qb_out = _FUSED_QB_ROPE_ABSORB_SPLIT_HALVES_OP(
+                                q_c_for_q,
+                                w_qb,
+                                s_qb,
+                                w_uk_lo.to(q_c_for_q.dtype),
+                                w_uk_hi.to(q_c_for_q.dtype),
+                                cos_sin,
+                                split_rows,
                             )
                         else:
                             fused_qb_out = _FUSED_QB_ROPE_ABSORB_SPLIT_OP(

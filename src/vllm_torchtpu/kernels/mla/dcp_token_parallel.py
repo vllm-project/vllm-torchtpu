@@ -2311,7 +2311,7 @@ def _sparse_mla_in_branch_qb_core(
     q_c_own: jax.Array,
     w_qb: jax.Array,
     s_qb: jax.Array,
-    w_uk_t: jax.Array,
+    w_uk_t: jax.Array | tuple[jax.Array, jax.Array],
     cos_sin: jax.Array,
     head_topk: jax.Array,
     flat_topk: jax.Array,
@@ -2489,6 +2489,7 @@ def _sparse_mla_in_branch_qb_core(
         assert w_o is not None and w_o_scale is not None
         extra = (*extra, w_o, w_o_scale)
     w_uv_spec = rep if w_uv_replicated else sharded
+    w_uk_spec = (rep, rep) if isinstance(w_uk_t, tuple) else rep
     out_specs = sharded if has_oproj else (sharded, rep)
     return jax.shard_map(
         _local,
@@ -2499,7 +2500,7 @@ def _sparse_mla_in_branch_qb_core(
             sharded,
             rep,
             rep,
-            rep,
+            w_uk_spec,
             sharded,
             sharded,
             sharded,
@@ -2540,7 +2541,7 @@ def sparse_mla_attention_with_in_branch_qb(
     q_c_own: jax.Array,
     w_qb: jax.Array,
     s_qb: jax.Array,
-    w_uk_t: jax.Array,
+    w_uk_t: jax.Array | tuple[jax.Array, jax.Array],
     cos_sin: jax.Array,
     head_topk: jax.Array,
     flat_topk: jax.Array,
@@ -2606,7 +2607,7 @@ def sparse_mla_attention_with_in_branch_qb_oproj(
     q_c_own: jax.Array,
     w_qb: jax.Array,
     s_qb: jax.Array,
-    w_uk_t: jax.Array,
+    w_uk_t: jax.Array | tuple[jax.Array, jax.Array],
     cos_sin: jax.Array,
     head_topk: jax.Array,
     flat_topk: jax.Array,
@@ -2676,7 +2677,7 @@ def _unified_indexer_in_branch_qb_core(
     q_c_own: jax.Array,
     w_qb: jax.Array,
     s_qb: jax.Array,
-    w_uk_t: jax.Array,
+    w_uk_t: jax.Array | tuple[jax.Array, jax.Array],
     cos_sin: jax.Array,
     head_topk: jax.Array,
     mla_block_tables: jax.Array,
@@ -2899,6 +2900,7 @@ def _unified_indexer_in_branch_qb_core(
         assert w_o is not None and w_o_scale is not None
         extra = (*extra, w_o, w_o_scale)
     w_uv_spec = rep if w_uv_replicated else sharded
+    w_uk_spec = (rep, rep) if isinstance(w_uk_t, tuple) else rep
     out_specs = (sharded, sharded) if has_oproj else (sharded, rep, sharded)
     return jax.shard_map(
         _local,
@@ -2913,7 +2915,7 @@ def _unified_indexer_in_branch_qb_core(
             sharded,
             rep,
             rep,
-            rep,
+            w_uk_spec,
             sharded,
             sharded,
             rep,
@@ -2960,7 +2962,7 @@ def unified_indexer_in_branch_qb_mla(
     q_c_own: jax.Array,
     w_qb: jax.Array,
     s_qb: jax.Array,
-    w_uk_t: jax.Array,
+    w_uk_t: jax.Array | tuple[jax.Array, jax.Array],
     cos_sin: jax.Array,
     head_topk: jax.Array,
     mla_block_tables: jax.Array,
@@ -3034,7 +3036,7 @@ def unified_indexer_in_branch_qb_mla_oproj(
     q_c_own: jax.Array,
     w_qb: jax.Array,
     s_qb: jax.Array,
-    w_uk_t: jax.Array,
+    w_uk_t: jax.Array | tuple[jax.Array, jax.Array],
     cos_sin: jax.Array,
     head_topk: jax.Array,
     mla_block_tables: jax.Array,

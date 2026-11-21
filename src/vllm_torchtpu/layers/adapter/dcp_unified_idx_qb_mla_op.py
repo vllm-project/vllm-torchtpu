@@ -176,7 +176,7 @@ def build_unified_indexer_in_branch_qb_op(
         q_c_own: jax.Array,
         w_qb: jax.Array,
         s_qb: jax.Array,
-        w_uk_t: jax.Array,
+        w_uk_t: jax.Array | tuple[jax.Array, jax.Array],
         cos_sin: jax.Array,
         kv_c_normed: jax.Array,
         k_pe: jax.Array,
@@ -544,7 +544,131 @@ def build_unified_indexer_in_branch_qb_op(
         )(head_topk, tail_flat)
         return index_cache, kv_cache_nope, kv_cache_rope, full_topk, attn_out
 
+    split_w_uk = (
+        getattr(target_layer, "W_UK_T_dcp_qrep_lo", None) is not None
+        and getattr(target_layer, "W_UK_T_dcp_qrep_hi", None) is not None
+    )
+
     def _make_wrapper(kv_sharded: bool, k_sharded: bool = False):
+        if has_lane and split_w_uk:
+
+            def _w_lane_split(
+                idx_c: jax.Array,
+                nope: jax.Array,
+                rope: jax.Array,
+                qb_idx: jax.Array,
+                wi: jax.Array,
+                kp_idx: jax.Array,
+                qc: jax.Array,
+                wqb: jax.Array,
+                sqb: jax.Array,
+                wuk_lo: jax.Array,
+                cs: jax.Array,
+                kc: jax.Array,
+                kp_mla: jax.Array,
+                sl: jax.Array,
+                idx_bt: jax.Array,
+                mla_bt: jax.Array,
+                qsl: jax.Array,
+                idx_dist: jax.Array,
+                mla_dist: jax.Array,
+                rk: jax.Array,
+                uv: jax.Array,
+                wo: jax.Array,
+                so: jax.Array,
+                ln: jax.Array,
+                wuk_hi: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+                return _run(
+                    idx_c,
+                    nope,
+                    rope,
+                    qb_idx,
+                    wi,
+                    kp_idx,
+                    qc,
+                    wqb,
+                    sqb,
+                    (wuk_lo, wuk_hi),
+                    cs,
+                    kc,
+                    kp_mla,
+                    sl,
+                    idx_bt,
+                    mla_bt,
+                    qsl,
+                    idx_dist,
+                    mla_dist,
+                    rk,
+                    uv,
+                    wo,
+                    so,
+                    ln,
+                    kv_sharded=kv_sharded,
+                    k_sharded=k_sharded,
+                )
+
+            return _w_lane_split
+
+        if split_w_uk:
+
+            def _w_nolane_split(
+                idx_c: jax.Array,
+                nope: jax.Array,
+                rope: jax.Array,
+                qb_idx: jax.Array,
+                wi: jax.Array,
+                kp_idx: jax.Array,
+                qc: jax.Array,
+                wqb: jax.Array,
+                sqb: jax.Array,
+                wuk_lo: jax.Array,
+                cs: jax.Array,
+                kc: jax.Array,
+                kp_mla: jax.Array,
+                sl: jax.Array,
+                idx_bt: jax.Array,
+                mla_bt: jax.Array,
+                qsl: jax.Array,
+                idx_dist: jax.Array,
+                mla_dist: jax.Array,
+                rk: jax.Array,
+                uv: jax.Array,
+                wo: jax.Array,
+                so: jax.Array,
+                wuk_hi: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+                return _run(
+                    idx_c,
+                    nope,
+                    rope,
+                    qb_idx,
+                    wi,
+                    kp_idx,
+                    qc,
+                    wqb,
+                    sqb,
+                    (wuk_lo, wuk_hi),
+                    cs,
+                    kc,
+                    kp_mla,
+                    sl,
+                    idx_bt,
+                    mla_bt,
+                    qsl,
+                    idx_dist,
+                    mla_dist,
+                    rk,
+                    uv,
+                    wo,
+                    so,
+                    None,
+                    kv_sharded=kv_sharded,
+                    k_sharded=k_sharded,
+                )
+
+            return _w_nolane_split
+
         if has_lane:
 
             def _w_lane(
@@ -749,7 +873,7 @@ def build_unified_indexer_in_branch_qb_op(
             shd,  # w_o
             shd,  # s_o
         )
-        return base + ((shd,) if has_lane else ())
+        return base + ((shd,) if has_lane else ()) + ((rep,) if split_w_uk else ())
 
     out_specs = (shd, shd, shd, shd, shd)
     cache_key = (
@@ -780,6 +904,7 @@ def build_unified_indexer_in_branch_qb_op(
         global_group,
         small_ag,
         has_lane,
+        split_w_uk,
     )
 
     def _build_plain(op_name: str):
@@ -876,7 +1001,12 @@ def build_unified_indexer_in_branch_qb_op(
             raise RuntimeError(
                 "unified indexer+in-branch-qb sharded KV op requested but not built"
             )
-        lane_args = () if lane_tensor is None else (lane_tensor,)
+        tail_args: tuple[torch.Tensor, ...] = (
+            () if lane_tensor is None else (lane_tensor,)
+        )
+        if split_w_uk:
+            assert qb_inputs.w_uk_t_hi is not None
+            tail_args = (*tail_args, qb_inputs.w_uk_t_hi)
         new_idx, new_nope, new_rope, full_topk, attn_out = selected(
             index_cache,
             nope_cache,
@@ -901,7 +1031,7 @@ def build_unified_indexer_in_branch_qb_op(
             w_uv,
             w_o[0],
             w_o[1],
-            *lane_args,
+            *tail_args,
         )
         index_cache.copy_(new_idx)
         nope_cache.copy_(new_nope)

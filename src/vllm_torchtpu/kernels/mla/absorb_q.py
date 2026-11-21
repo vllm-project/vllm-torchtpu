@@ -227,3 +227,45 @@ def absorb_q_split(
             vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes * 7 // 8,
         ),
     )(q_nope, w_uk_t)
+
+
+def absorb_q_halves(
+    q_nope: jax.Array, w_uk_t_lo: jax.Array, w_uk_t_hi: jax.Array
+) -> jax.Array:
+    """`out[t, h] = q_nope[t, h] @ concat(w_uk_t_lo, w_uk_t_hi)[h]`."""
+    tokens = q_nope.shape[0]
+    half = w_uk_t_lo.shape[0]
+    if tokens < MIN_TOKENS:
+        # Avoid concatenating w_uk_t halves before einsum: keeping them as two
+        # independent operands lets XLA prefetch each half into VMEM separately.
+        q_lo = jnp.einsum(
+            "thd,hdr->thr",
+            q_nope[:, :half],
+            w_uk_t_lo,
+            preferred_element_type=jnp.float32,
+        ).astype(q_nope.dtype)
+        q_hi = jnp.einsum(
+            "thd,hdr->thr",
+            q_nope[:, half:],
+            w_uk_t_hi,
+            preferred_element_type=jnp.float32,
+        ).astype(q_nope.dtype)
+        return jnp.concatenate([q_lo, q_hi], axis=1)
+    return absorb_q(q_nope, jnp.concatenate([w_uk_t_lo, w_uk_t_hi], axis=0))
+
+
+def absorb_q_split_halves(
+    q_nope: jax.Array,
+    w_uk_t_lo: jax.Array,
+    w_uk_t_hi: jax.Array,
+    split_rows: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Split-head variant of `absorb_q_split` taking disjoint `[H/2, d, R]` halves."""
+    if q_nope.shape[0] < MIN_TOKENS:
+        return (
+            absorb_q_halves(q_nope[:split_rows], w_uk_t_lo, w_uk_t_hi),
+            absorb_q_halves(q_nope[split_rows:], w_uk_t_lo, w_uk_t_hi),
+        )
+    return absorb_q_split(
+        q_nope, jnp.concatenate([w_uk_t_lo, w_uk_t_hi], axis=0), split_rows
+    )

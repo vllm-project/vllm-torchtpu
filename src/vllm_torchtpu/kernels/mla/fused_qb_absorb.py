@@ -121,14 +121,35 @@ def _run_fused_qb_kernel(
     q_c: jax.Array,
     w_qb: jax.Array,
     w_s: jax.Array,
-    w_uk_t: jax.Array,
+    w_uk_t: jax.Array | tuple[jax.Array, jax.Array],
     cos_sin: jax.Array,
     split_rows: int,
     *,
     split_qpe: bool,
 ) -> tuple[jax.Array, ...]:
     total_tokens, k_dim = q_c.shape
-    heads, d_nope, rank = w_uk_t.shape
+    is_split_wuk = isinstance(w_uk_t, tuple)
+    if is_split_wuk:
+        w_uk_lo, w_uk_hi = w_uk_t
+        if (
+            w_uk_lo.ndim != 3
+            or w_uk_lo.shape != w_uk_hi.shape
+            or w_uk_lo.dtype != w_uk_hi.dtype
+            or w_uk_lo.shape[0] <= 0
+            or w_uk_lo.shape[0] % HEAD_BLOCK != 0
+        ):
+            raise ValueError(
+                "Split w_uk_t halves must match [H/2, d_nope, rank] with "
+                f"(H/2) % {HEAD_BLOCK} == 0; got lo={w_uk_lo.shape}/{w_uk_lo.dtype}, "
+                f"hi={w_uk_hi.shape}/{w_uk_hi.dtype}"
+            )
+        half_heads, d_nope, rank = w_uk_lo.shape
+        heads = half_heads * 2
+        w_uk_shape = (heads, d_nope, rank)
+    else:
+        w_uk_lo = w_uk_hi = None
+        w_uk_shape = w_uk_t.shape
+        heads, d_nope, rank = w_uk_shape
     d_pe = cos_sin.shape[1]
     half_pe = d_pe // 2
     d_q = d_nope + d_pe
@@ -142,7 +163,7 @@ def _run_fused_qb_kernel(
             w_qb.shape,
             w_qb.dtype,
             w_s.shape,
-            w_uk_t.shape,
+            w_uk_shape,
             cos_sin.shape,
             split_rows,
             bfloat16_dtype=jnp.bfloat16,
@@ -153,7 +174,7 @@ def _run_fused_qb_kernel(
         raise ValueError(
             "Unsupported inputs for fused_qb_rope_absorb_split: "
             f"q_c={q_c.shape}/{q_c.dtype}, w_qb={w_qb.shape}/{w_qb.dtype}, "
-            f"w_s={w_s.shape}, w_uk_t={w_uk_t.shape}, cos_sin={cos_sin.shape}, "
+            f"w_s={w_s.shape}, w_uk_t={w_uk_shape}, cos_sin={cos_sin.shape}, "
             f"split_rows={split_rows}"
         )
 
@@ -168,7 +189,15 @@ def _run_fused_qb_kernel(
     w_s_2d = w_s.astype(jnp.float32).reshape(1, n_out)
 
     def _project_slice(
-        xq_ref, xs_ref, cs_ref, wqb_ref, ws_v, wuk_ref, t0, nrows: int
+        xq_ref,
+        xs_ref,
+        cs_ref,
+        wqb_ref,
+        ws_v,
+        wuk_ref,
+        t0,
+        nrows: int,
+        wait_wuk=None,
     ) -> tuple[jax.Array, jax.Array]:
         xq_sl = xq_ref[pl.ds(t0, nrows), :]
         xs_sl = xs_ref[pl.ds(t0, nrows), :1]
@@ -184,6 +213,8 @@ def _run_fused_qb_kernel(
             preferred_element_type=jnp.float32,
         )
         q_raw = (q_raw * xs_sl * ws_v[None, :]).astype(q_c.dtype)
+        if wait_wuk is not None:
+            wait_wuk()
 
         ql_list = []
         qpe_list = []
@@ -209,7 +240,7 @@ def _run_fused_qb_kernel(
             pltpu.einshape("htd->thd", jnp.stack(qpe_list)),
         )
 
-    in_specs = [
+    base_in_specs = [
         pl.BlockSpec(
             (total_tokens, k_dim),
             lambda hb: (0, 0),
@@ -227,12 +258,284 @@ def _run_fused_qb_kernel(
         ),
         pl.BlockSpec((k_dim, cols_blk), lambda hb: (0, hb)),
         pl.BlockSpec((1, cols_blk), lambda hb: (0, hb)),
-        pl.BlockSpec((HEAD_BLOCK, d_nope, rank), lambda hb: (hb, 0, 0)),
     ]
     compiler_params = pltpu.CompilerParams(
         dimension_semantics=("parallel",),
         vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes * 7 // 8,
     )
+
+    if is_split_wuk:
+        assert w_uk_lo is not None and w_uk_hi is not None
+        half_hblk = n_hblk // 2
+        in_specs_pair = [
+            *base_in_specs,
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+        ]
+        # Double-buffer w_uk_t (2 x 1.5 MiB) across hb iterations with arbitrary
+        # (sequential) grid order so hb+1's HBM DMA overlaps the full tail block.
+        pair_compiler_params = pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes * 7 // 8,
+        )
+        scratch_shapes = (
+            pltpu.VMEM((2, HEAD_BLOCK, d_nope, rank), w_uk_lo.dtype),
+            pltpu.SemaphoreType.DMA((2,)),
+        )
+
+        def _wuk_dma(
+            wuk_lo_hbm, wuk_hi_hbm, wuk_vm, sem, blk_idx, slot, *, is_start: bool
+        ) -> None:
+            blk_arr = jnp.asarray(blk_idx, dtype=jnp.int32)
+            is_lo = blk_arr < half_hblk
+            dst = wuk_vm.at[slot]
+            sref = sem.at[slot]
+
+            @pl.when(is_lo)
+            def _from_lo():
+                blk = jnp.minimum(blk_arr, half_hblk - 1)
+                op = pltpu.make_async_copy(
+                    wuk_lo_hbm.at[pl.ds(blk * HEAD_BLOCK, HEAD_BLOCK), :, :],
+                    dst,
+                    sref,
+                )
+                if is_start:
+                    op.start()
+                else:
+                    op.wait()
+
+            @pl.when(jnp.logical_not(is_lo))
+            def _from_hi():
+                blk = jnp.maximum(blk_arr - half_hblk, 0)
+                op = pltpu.make_async_copy(
+                    wuk_hi_hbm.at[pl.ds(blk * HEAD_BLOCK, HEAD_BLOCK), :, :],
+                    dst,
+                    sref,
+                )
+                if is_start:
+                    op.start()
+                else:
+                    op.wait()
+
+        if split_qpe:
+
+            def _kernel_split_pair(
+                xq_ref,
+                xs_ref,
+                cs_ref,
+                wqb_ref,
+                ws_ref,
+                wuk_lo_hbm,
+                wuk_hi_hbm,
+                ql_head_ref,
+                ql_tail_ref,
+                qpe_head_ref,
+                qpe_tail_ref,
+                wuk_vm,
+                wuk_sem,
+            ):
+                hb = pl.program_id(0)
+                slot = hb & 1
+                nxt = hb + 1
+
+                @pl.when(hb == 0)
+                def _prime():
+                    _wuk_dma(
+                        wuk_lo_hbm, wuk_hi_hbm, wuk_vm, wuk_sem, 0, 0, is_start=True
+                    )
+
+                @pl.when(nxt < n_hblk)
+                def _prefetch():
+                    _wuk_dma(
+                        wuk_lo_hbm,
+                        wuk_hi_hbm,
+                        wuk_vm,
+                        wuk_sem,
+                        nxt,
+                        nxt & 1,
+                        is_start=True,
+                    )
+
+                ws_v = ws_ref[0]
+                cur_wuk = wuk_vm.at[slot]
+                ql_h, qpe_h = _project_slice(
+                    xq_ref,
+                    xs_ref,
+                    cs_ref,
+                    wqb_ref,
+                    ws_v,
+                    cur_wuk,
+                    0,
+                    split_rows,
+                    wait_wuk=lambda: _wuk_dma(
+                        wuk_lo_hbm,
+                        wuk_hi_hbm,
+                        wuk_vm,
+                        wuk_sem,
+                        hb,
+                        slot,
+                        is_start=False,
+                    ),
+                )
+                ql_head_ref[...] = ql_h
+                qpe_head_ref[...] = qpe_h
+                if n_tail_chunks == 1:
+                    ql_t, qpe_t = _project_slice(
+                        xq_ref,
+                        xs_ref,
+                        cs_ref,
+                        wqb_ref,
+                        ws_v,
+                        cur_wuk,
+                        split_rows,
+                        tail_chunk,
+                    )
+                    ql_tail_ref[...] = ql_t
+                    qpe_tail_ref[...] = qpe_t
+                else:
+
+                    def _tail_body(c, _):
+                        t0 = split_rows + c * tail_chunk
+                        ql_t, qpe_t = _project_slice(
+                            xq_ref,
+                            xs_ref,
+                            cs_ref,
+                            wqb_ref,
+                            ws_v,
+                            cur_wuk,
+                            t0,
+                            tail_chunk,
+                        )
+                        ql_tail_ref[pl.ds(c * tail_chunk, tail_chunk)] = ql_t
+                        qpe_tail_ref[pl.ds(c * tail_chunk, tail_chunk)] = qpe_t
+
+                    lax.fori_loop(0, n_tail_chunks, _tail_body, None)
+
+            return pl.pallas_call(
+                _kernel_split_pair,
+                grid=(n_hblk,),
+                in_specs=in_specs_pair,
+                out_specs=[
+                    pl.BlockSpec((split_rows, HEAD_BLOCK, rank), lambda hb: (0, hb, 0)),
+                    pl.BlockSpec((tail_rows, HEAD_BLOCK, rank), lambda hb: (0, hb, 0)),
+                    pl.BlockSpec((split_rows, HEAD_BLOCK, d_pe), lambda hb: (0, hb, 0)),
+                    pl.BlockSpec((tail_rows, HEAD_BLOCK, d_pe), lambda hb: (0, hb, 0)),
+                ],
+                scratch_shapes=scratch_shapes,
+                out_shape=(
+                    jax.ShapeDtypeStruct((split_rows, heads, rank), q_c.dtype),
+                    jax.ShapeDtypeStruct((tail_rows, heads, rank), q_c.dtype),
+                    jax.ShapeDtypeStruct((split_rows, heads, d_pe), q_c.dtype),
+                    jax.ShapeDtypeStruct((tail_rows, heads, d_pe), q_c.dtype),
+                ),
+                compiler_params=pair_compiler_params,
+            )(x_q, x_s_128, cos_sin_128, w_qb, w_s_2d, w_uk_lo, w_uk_hi)
+
+        def _kernel_joined_pair(
+            xq_ref,
+            xs_ref,
+            cs_ref,
+            wqb_ref,
+            ws_ref,
+            wuk_lo_hbm,
+            wuk_hi_hbm,
+            ql_head_ref,
+            ql_tail_ref,
+            qpe_ref,
+            wuk_vm,
+            wuk_sem,
+        ):
+            hb = pl.program_id(0)
+            slot = hb & 1
+            nxt = hb + 1
+
+            @pl.when(hb == 0)
+            def _prime():
+                _wuk_dma(wuk_lo_hbm, wuk_hi_hbm, wuk_vm, wuk_sem, 0, 0, is_start=True)
+
+            @pl.when(nxt < n_hblk)
+            def _prefetch():
+                _wuk_dma(
+                    wuk_lo_hbm,
+                    wuk_hi_hbm,
+                    wuk_vm,
+                    wuk_sem,
+                    nxt,
+                    nxt & 1,
+                    is_start=True,
+                )
+
+            ws_v = ws_ref[0]
+            cur_wuk = wuk_vm.at[slot]
+            ql_h, qpe_h = _project_slice(
+                xq_ref,
+                xs_ref,
+                cs_ref,
+                wqb_ref,
+                ws_v,
+                cur_wuk,
+                0,
+                split_rows,
+                wait_wuk=lambda: _wuk_dma(
+                    wuk_lo_hbm, wuk_hi_hbm, wuk_vm, wuk_sem, hb, slot, is_start=False
+                ),
+            )
+            ql_head_ref[...] = ql_h
+            qpe_ref[pl.ds(0, split_rows)] = qpe_h
+            if n_tail_chunks == 1:
+                ql_t, qpe_t = _project_slice(
+                    xq_ref,
+                    xs_ref,
+                    cs_ref,
+                    wqb_ref,
+                    ws_v,
+                    cur_wuk,
+                    split_rows,
+                    tail_chunk,
+                )
+                ql_tail_ref[...] = ql_t
+                qpe_ref[pl.ds(split_rows, tail_chunk)] = qpe_t
+            else:
+
+                def _tail_body(c, _):
+                    t0 = split_rows + c * tail_chunk
+                    ql_t, qpe_t = _project_slice(
+                        xq_ref,
+                        xs_ref,
+                        cs_ref,
+                        wqb_ref,
+                        ws_v,
+                        cur_wuk,
+                        t0,
+                        tail_chunk,
+                    )
+                    ql_tail_ref[pl.ds(c * tail_chunk, tail_chunk)] = ql_t
+                    qpe_ref[pl.ds(t0, tail_chunk)] = qpe_t
+
+                lax.fori_loop(0, n_tail_chunks, _tail_body, None)
+
+        return pl.pallas_call(
+            _kernel_joined_pair,
+            grid=(n_hblk,),
+            in_specs=in_specs_pair,
+            out_specs=[
+                pl.BlockSpec((split_rows, HEAD_BLOCK, rank), lambda hb: (0, hb, 0)),
+                pl.BlockSpec((tail_rows, HEAD_BLOCK, rank), lambda hb: (0, hb, 0)),
+                pl.BlockSpec((total_tokens, HEAD_BLOCK, d_pe), lambda hb: (0, hb, 0)),
+            ],
+            scratch_shapes=scratch_shapes,
+            out_shape=(
+                jax.ShapeDtypeStruct((split_rows, heads, rank), q_c.dtype),
+                jax.ShapeDtypeStruct((tail_rows, heads, rank), q_c.dtype),
+                jax.ShapeDtypeStruct((total_tokens, heads, d_pe), q_c.dtype),
+            ),
+            compiler_params=pair_compiler_params,
+        )(x_q, x_s_128, cos_sin_128, w_qb, w_s_2d, w_uk_lo, w_uk_hi)
+
+    in_specs = [
+        *base_in_specs,
+        pl.BlockSpec((HEAD_BLOCK, d_nope, rank), lambda hb: (hb, 0, 0)),
+    ]
 
     if split_qpe:
 
@@ -372,11 +675,27 @@ def fused_qb_rope_absorb_split(
     return ql_head, ql_tail, q_pe
 
 
+def fused_qb_rope_absorb_split_halves(
+    q_c: jax.Array,
+    w_qb: jax.Array,
+    w_s: jax.Array,
+    w_uk_t_lo: jax.Array,
+    w_uk_t_hi: jax.Array,
+    cos_sin: jax.Array,
+    split_rows: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Two-buffer variant of `fused_qb_rope_absorb_split` taking disjoint halves."""
+    ql_head, ql_tail, q_pe = _run_fused_qb_kernel(
+        q_c, w_qb, w_s, (w_uk_t_lo, w_uk_t_hi), cos_sin, split_rows, split_qpe=False
+    )
+    return ql_head, ql_tail, q_pe
+
+
 def fused_qb_rope_absorb_split_qpe(
     q_c: jax.Array,
     w_qb: jax.Array,
     w_s: jax.Array,
-    w_uk_t: jax.Array,
+    w_uk_t: jax.Array | tuple[jax.Array, jax.Array],
     cos_sin: jax.Array,
     split_rows: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:

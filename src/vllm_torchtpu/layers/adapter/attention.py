@@ -66,7 +66,12 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla import kv_cache_utils
-from vllm_torchtpu.kernels.mla.absorb_q import absorb_q, absorb_q_split
+from vllm_torchtpu.kernels.mla.absorb_q import (
+    absorb_q,
+    absorb_q_halves,
+    absorb_q_split,
+    absorb_q_split_halves,
+)
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
@@ -134,6 +139,35 @@ _absorb_q = pallas.jax_op("pallas::mla_absorb_q", absorb_q)
 _absorb_q.register_fake(_fake_absorb_q)
 _absorb_q_split = pallas.jax_op("pallas::mla_absorb_q_split", absorb_q_split)
 _absorb_q_split.register_fake(_fake_absorb_q_split)
+
+
+def _fake_absorb_q_halves(
+    q_nope: torch.Tensor, w_uk_t_lo: torch.Tensor, w_uk_t_hi: torch.Tensor
+) -> torch.Tensor:
+    del w_uk_t_hi
+    return q_nope.new_empty((*q_nope.shape[:2], w_uk_t_lo.shape[2]))
+
+
+def _fake_absorb_q_split_halves(
+    q_nope: torch.Tensor,
+    w_uk_t_lo: torch.Tensor,
+    w_uk_t_hi: torch.Tensor,
+    split_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del w_uk_t_hi
+    rank = w_uk_t_lo.shape[2]
+    return (
+        q_nope.new_empty((split_rows, q_nope.shape[1], rank)),
+        q_nope.new_empty((q_nope.shape[0] - split_rows, q_nope.shape[1], rank)),
+    )
+
+
+_absorb_q_halves = pallas.jax_op("pallas::mla_absorb_q_halves", absorb_q_halves)
+_absorb_q_halves.register_fake(_fake_absorb_q_halves)
+_absorb_q_split_halves = pallas.jax_op(
+    "pallas::mla_absorb_q_split_halves", absorb_q_split_halves
+)
+_absorb_q_split_halves.register_fake(_fake_absorb_q_split_halves)
 
 
 def _uv_before_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
@@ -2912,15 +2946,25 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # the only consumer, hence the `topk_indices` term.
         use_qrep = q_dcp_replicated is not None and self.dcp_size > 1 and has_topk
         q_rope_table: list[torch.Tensor] = []
+        w_uk_t_halves: tuple[torch.Tensor, torch.Tensor] | None = None
         if use_qrep:
-            assert layer.W_UK_T_dcp_qrep is not None, (
+            w_uk_lo = getattr(layer, "W_UK_T_dcp_qrep_lo", None)
+            w_uk_hi = getattr(layer, "W_UK_T_dcp_qrep_hi", None)
+            has_halves = w_uk_lo is not None and w_uk_hi is not None
+            assert has_halves or layer.W_UK_T_dcp_qrep is not None, (
                 "q_dcp_replicated was passed but W_UK_T_dcp_qrep was never "
                 "built; `process_weights_after_loading` must run first."
             )
             # TPU_MLA_DECODE_PROLOGUE hands a third element: the per-token
             # rope table, with q_pe then the raw (un-roped) q head view.
             q_nope, q_pe, *q_rope_table = q_dcp_replicated
-            w_uk_t_src = layer.W_UK_T_dcp_qrep
+            if w_uk_lo is not None and w_uk_hi is not None:
+                lo_t = cast(torch.Tensor, w_uk_lo)
+                hi_t = cast(torch.Tensor, w_uk_hi)
+                w_uk_t_halves = (lo_t, hi_t)
+                w_uk_t_src = lo_t
+            else:
+                w_uk_t_src = cast(torch.Tensor, layer.W_UK_T_dcp_qrep)
             w_uk_t_scale = layer.W_UK_T_dcp_qrep_scale
         else:
             w_uk_t_src = layer.W_UK_T
@@ -2977,19 +3021,41 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             )
             if use_tp_split_absorb:
                 assert tp_op is not None
-                ql_head, ql_tail = _absorb_q_split(
-                    q_nope, w_uk_t_src.to(q_nope.dtype), tp_op.layout.split_rows
-                )
+                if w_uk_t_halves is not None:
+                    ql_head, ql_tail = _absorb_q_split_halves(
+                        q_nope,
+                        w_uk_t_halves[0].to(q_nope.dtype),
+                        w_uk_t_halves[1].to(q_nope.dtype),
+                        tp_op.layout.split_rows,
+                    )
+                else:
+                    ql_head, ql_tail = _absorb_q_split(
+                        q_nope, w_uk_t_src.to(q_nope.dtype), tp_op.layout.split_rows
+                    )
                 ql_nope_split = (
                     ql_head.to(input_dtype).view(-1, attn_heads, layer.kv_lora_rank),
                     ql_tail.to(input_dtype).view(-1, attn_heads, layer.kv_lora_rank),
                 )
                 ql_nope = ql_nope_split[0]
             elif q_nope.device.type == "tpu" and w_uk_t_scale is None:
-                ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
+                if w_uk_t_halves is not None:
+                    ql_nope = _absorb_q_halves(
+                        q_nope,
+                        w_uk_t_halves[0].to(q_nope.dtype),
+                        w_uk_t_halves[1].to(q_nope.dtype),
+                    ).to(input_dtype)
+                else:
+                    ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(
+                        input_dtype
+                    )
             else:
                 q_nope_t = q_nope.transpose(0, 1)
-                ql_nope = torch.bmm(q_nope_t, w_uk_t_src.to(q_nope_t.dtype))
+                w_uk_bmm = (
+                    torch.cat(w_uk_t_halves, dim=0)
+                    if w_uk_t_halves is not None
+                    else w_uk_t_src
+                )
+                ql_nope = torch.bmm(q_nope_t, w_uk_bmm.to(q_nope_t.dtype))
                 if w_uk_t_scale is not None:
                     ql_nope = ql_nope * w_uk_t_scale
                 ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
