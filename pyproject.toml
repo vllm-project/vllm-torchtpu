@@ -285,6 +285,7 @@ ignore-missing-imports = [
     "ray", "ray.*",
     "requests", "requests.*",
     "sympy", "sympy.*",
+    "tokenizers", "tokenizers.*",
     "torch", "torch.*",
     "torch_tpu", "torch_tpu.*",
     "runai_model_streamer", "runai_model_streamer.*",

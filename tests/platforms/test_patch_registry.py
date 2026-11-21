@@ -139,6 +139,21 @@ def test_nonmatching_model_does_not_consume_patch(registry):
     callbacks.model.assert_called_with(model_config=config)
 
 
+def test_vllm_config_reaches_only_the_patches_that_ask_for_it(registry):
+    reg, callbacks = registry
+    callbacks.wants = Mock(side_effect=lambda vllm_config: vllm_config.enabled)
+    callbacks.plain = Mock(return_value=None)
+    patch = _patch(reg, callbacks, "wants", ("platform_activation",), vllm_config=True)
+    _patch(reg, callbacks, "plain", ("platform_activation",))
+    reg.apply("platform_activation", vllm_config=SimpleNamespace(enabled=False))
+    assert patch.target not in reg._applied
+    config = SimpleNamespace(enabled=True)
+    reg.apply("platform_activation", vllm_config=config)
+    callbacks.wants.assert_called_with(vllm_config=config)
+    assert patch.target in reg._applied
+    callbacks.plain.assert_called_once_with()
+
+
 def test_refreshes_late_bindings_without_reinstalling(registry):
     reg, callbacks = registry
     callbacks.install = Mock()
@@ -237,8 +252,13 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_same_step_prefix_hits",
         "_patch_vllm_merge_multimodal_embeddings",
     ]
+    # The API-server patches only install where the engine config is built.
+    api_server = [
+        "install_tokenize_prefix_cache",
+        "install_detok_prompt_tail",
+    ]
     assert stages["platform_activation"] == (
-        stages["worker_init"] + stages["model_load"]
+        stages["worker_init"] + api_server + stages["model_load"]
     )
     assert stages["model_load"] == [
         "maybe_patch_qwen3_vl",
