@@ -2262,7 +2262,7 @@ def _sparse_mla_in_branch_qb_core(
     read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
     w_uv_replicated: bool = False,
     flat_topk_cap_strided: bool = False,
-    free_nobar_max_cap: int = 8,
+    free_nobar_max_cap: int = 0,
     w_o: jax.Array | None = None,
     w_o_scale: jax.Array | None = None,
     epilogue_3d: bool = True,
@@ -2491,7 +2491,7 @@ def sparse_mla_attention_with_in_branch_qb(
     read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
     w_uv_replicated: bool = False,
     flat_topk_cap_strided: bool = False,
-    free_nobar_max_cap: int = 8,
+    free_nobar_max_cap: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """Run fused `q_b`, lead MLA, and token-parallel MLA in one cap switch.
 
@@ -2559,7 +2559,7 @@ def sparse_mla_attention_with_in_branch_qb_oproj(
     read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
     w_uv_replicated: bool = False,
     flat_topk_cap_strided: bool = False,
-    free_nobar_max_cap: int = 8,
+    free_nobar_max_cap: int = 0,
     epilogue_3d: bool = True,
 ) -> jax.Array:
     """Run in-branch `q_b`, lead MLA, sparse MLA, and o_proj in one shard_map."""
@@ -2626,7 +2626,7 @@ def _unified_indexer_in_branch_qb_core(
     rank_ids: jax.Array | None = None,
     read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
     w_uv_replicated: bool = False,
-    tie_after_idx_max_cap: int = 12,
+    tie_after_idx_max_cap: int = 0,
     tie_lead_min_cap: int = 0,
     w_o: jax.Array | None = None,
     w_o_scale: jax.Array | None = None,
@@ -2898,7 +2898,7 @@ def unified_indexer_in_branch_qb_mla(
     rank_ids: jax.Array | None = None,
     read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
     w_uv_replicated: bool = False,
-    tie_after_idx_max_cap: int = 12,
+    tie_after_idx_max_cap: int = 0,
     tie_lead_min_cap: int = 0,
     index_k_packed_u32: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -2974,7 +2974,7 @@ def unified_indexer_in_branch_qb_mla_oproj(
     rank_ids: jax.Array | None = None,
     read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
     w_uv_replicated: bool = False,
-    tie_after_idx_max_cap: int = 12,
+    tie_after_idx_max_cap: int = 0,
     tie_lead_min_cap: int = 0,
     epilogue_3d: bool = True,
     index_k_packed_u32: bool = False,

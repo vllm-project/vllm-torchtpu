@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     TPU_DCP_PREFILL_TOKEN_PARALLEL: bool = True
     TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT: bool = True
     TPU_DCP_TP_FUSED_WUV_EPILOGUE: bool = True
-    TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP: int = 8
+    TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP: int = 0
     TPU_DCP_TP_IN_BRANCH_QB_MLA: bool = True
     TPU_DCP_TP_PREFILL_LOCAL_OPROJ: bool = True
     TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES: bool = True
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     TPU_DCP_TP_SHARDED_INDEXER_K: bool = False
     TPU_DCP_TP_UNIFIED_INDEXER_IN_BRANCH_QB: bool = True
     TPU_DCP_TP_UNIFIED_INDEXER_MLA: bool = True
-    TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP: int = 12
+    TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP: int = 0
     TPU_DCP_TP_ZIGZAG_BANDS: int = 4
     TPU_MLA_DECODE_LOCAL_Q_AG: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
@@ -915,7 +915,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Chunk-0 SparseCore KV gather; caps above this hold lead_mla behind the
     # barrier so pure-TC fused_qb overlaps SparseCore-offloaded gather_latent.
     "TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP": env_int(
-        "TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP", 8
+        "TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP", 0
     ),
     # With TPU_DCP_TP_PREFILL_LOCAL_OPROJ and query replication on non-indexer
     # layers: defer fused q_b_proj + RoPE + absorb_q and lead MLA inside the
@@ -939,7 +939,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gather_latent is ordered after StreamIdxTC to avoid small-cap SC/TC
     # contention; 0 keeps gather_latent free on all caps.
     "TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP": env_int(
-        "TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP", 12
+        "TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP", 0
     ),
     # Decode local-Q projection under query-replicated DCP: compute each rank's
     # local head-slice columns via the fused FP8 column-window matmul + 1-round
