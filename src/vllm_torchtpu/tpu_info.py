@@ -37,6 +37,7 @@ def get_tpu_metadata(key: str = "") -> str:
         accelerator_type_request = requests.get(
             os.path.join(GCE_TPU_ACCELERATOR_ENDPOINT, key),
             headers=GCE_TPU_HEADERS,
+            timeout=2.0,
         )
         if (
             accelerator_type_request.status_code == 200
@@ -61,6 +62,26 @@ def get_tpu_type() -> str:
     return tpu_type
 
 
+def parse_chip_version(accelerator_type: str) -> pltpu.ChipVersion | None:
+    """Parses an accelerator type string into a `ChipVersion`, or `None`."""
+    if not accelerator_type:
+        return None
+    # ChipVersion's values are bare chip names ("7x", "v6e"); accelerator types
+    # add a chip-count suffix and sometimes a "tpu" prefix ("tpu7x", "v6e-8").
+    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu").strip()
+    name = {
+        "v5litepod": "v5e",
+        "v7": "7",
+        "v7x": "7x",
+        "v8i": "8i",
+        "v8t": "8t",
+    }.get(name, name)
+    try:
+        return pltpu.ChipVersion(name)
+    except ValueError:
+        return None
+
+
 @functools.cache
 def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
     """Resolves the TPU chip version without initializing a TPU client.
@@ -71,20 +92,14 @@ def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
     warning when the accelerator type is unrecognized.
     """
     accelerator_type = accelerator_type or get_tpu_type() or ""
-    # ChipVersion's values are bare chip names ("7x", "v6e"); accelerator types
-    # add a chip-count suffix and sometimes a "tpu" prefix ("tpu7x", "v6e-8").
-    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
-    # v5litepod and v7x are the only two that still differ after stripping.
-    name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
-    try:
-        return pltpu.ChipVersion(name)
-    except ValueError:
-        logger.warning(
-            "Unrecognized TPU accelerator type %r; defaulting to TPU7x "
-            "static geometry.",
-            accelerator_type,
-        )
-        return pltpu.ChipVersion.TPU_7X
+    chip = parse_chip_version(accelerator_type)
+    if chip is not None:
+        return chip
+    logger.warning(
+        "Unrecognized TPU accelerator type %r; defaulting to TPU7x static geometry.",
+        accelerator_type,
+    )
+    return pltpu.ChipVersion.TPU_7X
 
 
 def get_libtpu_version() -> str | None:
@@ -186,11 +201,11 @@ def get_node_worker_id() -> int:
     return int(worker_id)
 
 
-def get_num_cores_per_chip() -> int:
-    tpu_type = get_tpu_type()
-    if tpu_type.startswith(("v5litepod", "v6e")):
-        return 1
-    return 2
+def get_num_cores_per_chip() -> int | None:
+    chip = parse_chip_version(get_tpu_type() or "")
+    if chip is None:
+        return None
+    return int(chip.num_physical_tensor_cores_per_chip)
 
 
 def get_num_chips() -> int:

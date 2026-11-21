@@ -160,6 +160,9 @@ def get_device_name(num_devices: int | None = None):
     elif kind.endswith("i"):
         kind = kind[:-1]
         suffix = "i"
+    elif kind.endswith("t"):
+        kind = kind[:-1]
+        suffix = "t"
 
     if kind.startswith("TPU7"):
         kind = "TPU v7"

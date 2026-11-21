@@ -134,3 +134,68 @@ def test_validate_libtpu_version_still_rejects_old_package(monkeypatch):
 
     with pytest.raises(RuntimeError, match="libtpu < 0.0.35"):
         tpu_runner._validate_libtpu_version()
+
+
+@pytest.mark.parametrize(
+    ("accelerator_type", "expected"),
+    [
+        ("v5litepod-16", tpu_info.pltpu.ChipVersion.TPU_V5E),
+        ("v6e-8", tpu_info.pltpu.ChipVersion.TPU_V6E),
+        ("tpu7x-16", tpu_info.pltpu.ChipVersion.TPU_7X),
+        ("v7x-8", tpu_info.pltpu.ChipVersion.TPU_7X),
+        ("tpu8i-8", tpu_info.pltpu.ChipVersion.TPU_8I),
+        ("v8i-8", tpu_info.pltpu.ChipVersion.TPU_8I),
+        ("tpu8t-16", tpu_info.pltpu.ChipVersion.TPU_8T),
+        ("v8t-16", tpu_info.pltpu.ChipVersion.TPU_8T),
+        ("TPU v8t", tpu_info.pltpu.ChipVersion.TPU_8T),
+    ],
+)
+def test_get_chip_version_resolves_generations(accelerator_type, expected):
+    tpu_info.get_chip_version.cache_clear()
+    try:
+        assert tpu_info.get_chip_version(accelerator_type) == expected
+    finally:
+        tpu_info.get_chip_version.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("tpu_type", "expected_cores"),
+    [
+        (None, None),
+        ("", None),
+        ("unknown-type", None),
+        ("v5litepod-16", 1),
+        ("v5e-8", 1),
+        ("v6e-8", 1),
+        ("tpu8t-16", 1),
+        ("v8t-4", 1),
+        ("TPU v8t", 1),
+        ("v4-8", 2),
+        ("v5p-8", 2),
+        ("tpu7x-8", 2),
+        ("v7x-16", 2),
+        ("TPU v7", 2),
+        ("tpu8i-8", 2),
+        ("v8i-4", 2),
+    ],
+)
+def test_get_num_cores_per_chip(monkeypatch, tpu_type, expected_cores):
+    monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: tpu_type)
+    assert tpu_info.get_num_cores_per_chip() == expected_cores
+
+
+def test_get_tpu_metadata_passes_request_timeout(monkeypatch):
+    seen_kwargs = {}
+
+    class _Resp:
+        status_code = 200
+        text = "v8t-16"
+
+    def fake_get(url, **kwargs):
+        seen_kwargs.update(kwargs)
+        seen_kwargs["url"] = url
+        return _Resp()
+
+    monkeypatch.setattr(tpu_info.requests, "get", fake_get)
+    assert tpu_info.get_tpu_metadata("accelerator-type") == "v8t-16"
+    assert seen_kwargs["timeout"] == 2.0
