@@ -398,14 +398,16 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
 
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # kv_cache shape: [num_pages, page_size, num_kv_heads_x2 // kv_packing,
-            #                  kv_packing, aligned_head_dim_rpa]
+            #                  kv_packing, aligned_head_dim_rpa]. Combined head h is
+            # packing slot h; the kernel's cache holds the real K and V heads only
+            # (num_kv_heads * 2), not the packing pad of a single KV head.
             rpa_kv_cache = rpa_kv_cache.reshape(
                 num_pages,
                 page_size,
                 num_kv_heads_x2,
                 aligned_head_dim_rpa // kv_packing,
                 kv_packing,
-            ).transpose(0, 2, 3, 4, 1)
+            ).transpose(0, 2, 3, 4, 1)[:, : num_kv_heads * 2]
 
         rpa_args = (
             q,
@@ -465,20 +467,20 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         )
         output = output[: cu_q_lens[distribution[-1]]]
 
-        if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-            # updated_kv_cache shape: [num_pages, num_kv_heads_x2,
-            #                          aligned_head_dim_rpa // kv_packing, kv_packing,
-            #                          page_size]
-            updated_kv_cache = updated_kv_cache.transpose(0, 4, 1, 2, 3).reshape(
-                num_pages,
-                page_size,
-                num_kv_heads_x2 // kv_packing,
-                kv_packing,
-                aligned_head_dim_rpa,
-            )
-
         if aligned_head_dim_rpa != 128:
             expected_kv_cache = expected_kv_cache[..., :aligned_head_dim_rpa]
+
+        if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            # updated_kv_cache shape: [num_pages, num_kv_heads * 2,
+            #                          aligned_head_dim_rpa // kv_packing, kv_packing,
+            #                          page_size]; compare it with the same real
+            # heads of the reference cache.
+            updated_kv_cache = updated_kv_cache.transpose(0, 4, 1, 2, 3).reshape(
+                num_pages, page_size, num_kv_heads * 2, aligned_head_dim_rpa
+            )
+            expected_kv_cache = expected_kv_cache.reshape(
+                num_pages, page_size, num_kv_heads_x2, aligned_head_dim_rpa
+            )[:, :, : num_kv_heads * 2]
 
         dtype_bits = dtypes.itemsize_bits(jnp.dtype(kv_dtype))
         tols = {
