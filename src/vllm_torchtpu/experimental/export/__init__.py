@@ -15,18 +15,15 @@
 
 from __future__ import annotations
 
+import importlib
+from typing import TYPE_CHECKING, Any
+
 from vllm_torchtpu.experimental.export.api import (
     ExportableModel,
     ExportableTextOnlyLLM,
     ModelExportConfig,
     ShapeDtypeStruct,
     TextOnlyLLMExportConfig,
-)
-from vllm_torchtpu.experimental.export.exporter import export
-from vllm_torchtpu.experimental.export.universal_adapter import (
-    UniversalVllmExportableLLM,
-    build_export_config_from_vllm,
-    make_attention_metadata,
 )
 from vllm_torchtpu.experimental.export.validator import (
     ALLOWED_CUSTOM_CALLS,
@@ -40,6 +37,30 @@ from vllm_torchtpu.rope_patch import (
     is_in_graph_rope_eligible,
     patch_in_graph_rotary_embedding,
 )
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.experimental.export.exporter import export
+    from vllm_torchtpu.experimental.export.universal_adapter import (
+        UniversalVllmExportableLLM,
+        build_export_config_from_vllm,
+        make_attention_metadata,
+    )
+
+_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "export": ("vllm_torchtpu.experimental.export.exporter", "export"),
+    "UniversalVllmExportableLLM": (
+        "vllm_torchtpu.experimental.export.universal_adapter",
+        "UniversalVllmExportableLLM",
+    ),
+    "build_export_config_from_vllm": (
+        "vllm_torchtpu.experimental.export.universal_adapter",
+        "build_export_config_from_vllm",
+    ),
+    "make_attention_metadata": (
+        "vllm_torchtpu.experimental.export.universal_adapter",
+        "make_attention_metadata",
+    ),
+}
 
 __all__ = [
     "ALLOWED_CUSTOM_CALLS",
@@ -60,3 +81,10 @@ __all__ = [
     "validate_exported_model_dir",
     "validate_mlir_custom_calls",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_EXPORTS:
+        module_path, attr_name = _LAZY_EXPORTS[name]
+        return getattr(importlib.import_module(module_path), attr_name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

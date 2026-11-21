@@ -70,7 +70,11 @@ def test_marked_layer_keeps_the_vllm_layout():
 
 
 def test_mark_is_off_by_default():
+    from vllm_torchtpu.experimental.export import weight_mapper
+
     assert not getattr(_linear(), KEEP_VLLM_LAYOUT_ATTR, False)
+    assert weight_mapper.KEEP_VLLM_LAYOUT_ATTR == KEEP_VLLM_LAYOUT_ATTR
+    assert weight_mapper.WEIGHT_FLIPPED_ATTR == WEIGHT_FLIPPED_ATTR
 
 
 def test_marked_layer_still_computes_the_same_output():
