@@ -34,6 +34,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -78,28 +79,34 @@ def _project(acc, scale):
     return y.astype(BF16).astype(F32)
 
 
-def _kernel(
-    meta_ref,  # SMEM int32 [1, 1]: this device's mesh index (for an all-reduce)
-    x_hbm,  # HBM [m, h] bf16
-    sgu_hbm,  # HBM [1, 2i] f32
-    sd_hbm,  # HBM [1, h] f32
-    wgu_hbm,  # HBM [h, 2i] e4m3: [gate | up]
-    wd_hbm,  # HBM [i, h] e4m3
-    o_ref,  # VMEM [m, h] bf16
-    x_ref,  # VMEM [m, h] bf16
-    sgu_ref,  # VMEM [1, 2i] f32
-    sd_ref,  # VMEM [1, h] f32
-    wgu_v,  # VMEM [slots, gate_up chunk rows, 2i] e4m3
-    wd_v,  # VMEM [slots, down chunk rows, h] e4m3
-    gu_acc,  # VMEM [mp, 2i] f32
-    act_ref,  # VMEM [mp, i] bf16
-    out_acc,  # VMEM [mp, h] f32
-    sem,  # DMA [3 + 2 slots]: x, scales, the two rings' slots
-    *ar_scratch,  # with an all-reduce: VMEM [mp, h] bf16, then ar.scratch_shapes
-    gu_chunks,
-    d_chunks,
-    spec,
-):
+def _kernel(meta_ref, *refs, gu_chunks, d_chunks, spec, eps):
+    """meta_ref: SMEM int32 [1, 1], this device's mesh index (all-reduce).
+
+    refs, with ``eps`` (the residual add + RMSNorm prologue) the bracketed:
+      inputs  (HBM): x [m, h] bf16, s_gu [1, 2i] f32, s_d [1, h] f32,
+                     w_gu [h, 2i] e4m3 ([gate | up]), w_d [i, h] e4m3,
+                     [residual [m, h] bf16, norm weight [1, h] f32]
+      outputs (VMEM): out [m, h] bf16, [new residual [m, h] bf16]
+      scratch (VMEM): x, s_gu, s_d copies; the gate_up and down rings
+                     [slots, chunk rows, n] e4m3; gu_acc [mp, 2i] f32,
+                     act [mp, i] bf16, out_acc [mp, h] f32; DMA semaphores;
+                     [residual, norm weight copies]; with an all-reduce
+                     [mp, h] bf16 then ar.scratch_shapes.
+    """
+    norm = eps is not None
+    k = 7 if norm else 5
+    x_hbm, sgu_hbm, sd_hbm, wgu_hbm, wd_hbm = refs[:5]
+    o_ref, *outs = refs[k : k + (2 if norm else 1)]
+    scratch = refs[k + 1 + len(outs) :]
+    x_ref, sgu_ref, sd_ref, wgu_v, wd_v, gu_acc, act_ref, out_acc, sem = scratch[:9]
+    extra = scratch[9:]
+    if norm:
+        res_hbm, nw_hbm = refs[5:7]
+        (res_out,) = outs
+        res_ref, nw_ref, *ar_scratch = extra
+        prologue = [(res_hbm, res_ref), (nw_hbm, nw_ref)]
+    else:
+        ar_scratch, prologue = extra, []
     m, h = x_ref.shape
     mp, i = act_ref.shape
     if spec is not None:
@@ -108,9 +115,10 @@ def _kernel(
     small = [
         pltpu.make_async_copy(src, dst, sem.at[j])
         for j, (src, dst) in enumerate(
-            [(x_hbm, x_ref), (sgu_hbm, sgu_ref), (sd_hbm, sd_ref)]
+            [(x_hbm, x_ref), *prologue, (sgu_hbm, sgu_ref), (sd_hbm, sd_ref)]
         )
     ]
+    x_copy, *prologue_copies, sgu_copy, sd_copy = small
     for copy in small:
         copy.start()
     # Chunk n of a weight goes to slot n % _SLOTS of its ring; it starts once
@@ -132,8 +140,18 @@ def _kernel(
         if j + _IN_FLIGHT < len(copies):
             copies[j + _IN_FLIGHT].start()
 
-    small[0].wait()
+    x_copy.wait()
     x = x_ref[...].astype(F32)
+    if norm:
+        # fused_add_rms_norm (layers/adapter/ir_ops.py): the bf16 sum is the
+        # new residual and what is normalized, in f32, times (1 + w).
+        for copy in prologue_copies:
+            copy.wait()
+        r = (x + res_ref[...].astype(F32)).astype(BF16)
+        res_out[...] = r
+        r = r.astype(F32)
+        var = jnp.mean(r * r, axis=1, keepdims=True)
+        x = (r * lax.rsqrt(var + eps) * nw_ref[...]).astype(BF16).astype(F32)
     if mp != m:
         x = jnp.concatenate([x, jnp.zeros((mp - m, h), F32)], 0)
     x = x.astype(BF16)
@@ -143,7 +161,7 @@ def _kernel(
         gu_acc[...] += jnp.dot(
             x[:, k : k + c], wgu_v[j % _SLOTS, :c, :], preferred_element_type=F32
         )
-    small[1].wait()
+    sgu_copy.wait()
     gate = _project(gu_acc[:, :i], sgu_ref[:, :i])
     up = _project(gu_acc[:, i:], sgu_ref[:, i:])
     act_ref[...] = shared_activation(gate, up).astype(BF16)
@@ -153,7 +171,7 @@ def _kernel(
         out_acc[...] += jnp.dot(
             act_ref[:, k : k + c], wd_v[n % _SLOTS, :c, :], preferred_element_type=F32
         )
-    small[2].wait()
+    sd_copy.wait()
     if spec is None:
         o_ref[...] = _project(out_acc[:m, :], sd_ref[...]).astype(o_ref.dtype)
     else:
@@ -212,7 +230,8 @@ def fused_mlp(
     rank: jax.Array | None = None,
     n: int = 1,
     interpret: bool = False,
-) -> jax.Array:
+    norm: tuple[jax.Array, jax.Array, float] | None = None,
+):
     """``down(swiglu_oai(x @ w_gu * s_gu)) * s_d`` of bf16 ``x [m, h]`` (at
     most MAX_ROWS rows) on e4m3 ``w_gu [h, 2i]`` ([gate | up])
     and ``w_d [i, h]`` with f32 ``s_gu [1, 2i]`` / ``s_d [1, h]``: bf16
@@ -220,6 +239,10 @@ def fused_mlp(
 
     With ``n > 1`` the result is summed over the n ranks of the 1-D mesh this
     runs under (shard_map); ``rank`` (int32 [1, 1]) is this device's mesh index.
+
+    With ``norm = (residual [m, h] bf16, weight [1, h] f32, eps)`` the MLP's
+    input is GemmaRMSNorm's fused add: ``r = bf16(x + residual)``, normalized
+    with ``weight`` (1 + w); returns ``(out, r)``.
     """
     m, h = x.shape
     i = w_d.shape[0]
@@ -227,8 +250,14 @@ def fused_mlp(
         raise ValueError(f"fused_mlp: unsupported [{m}, {h}] x [{h}, {2 * i}]")
     if m % 8:  # whole f32 sublane tiles of rows
         rows = m + (-m % 8)
-        x = jnp.pad(x, ((0, rows - m), (0, 0)))
-        return fused_mlp(x, w_gu, s_gu, w_d, s_d, rank, n, interpret)[:m]
+
+        def pad(a):
+            return jnp.pad(a, ((0, rows - m), (0, 0)))
+
+        if norm is not None:
+            norm = (pad(norm[0]), *norm[1:])
+        out = fused_mlp(pad(x), w_gu, s_gu, w_d, s_d, rank, n, interpret, norm)
+        return tuple(o[:m] for o in out) if norm is not None else out[:m]
     info = pltpu.get_tpu_info()
     mp = m + (-m % _ROW_ALIGN)
     spec = ar.make_spec(n, mp, h) if n > 1 else None
@@ -238,16 +267,27 @@ def fused_mlp(
     d_chunks = _chunks(i, h * w_d.dtype.itemsize)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    params = dict(vmem_limit_bytes=_vmem_bytes(mp, h, i, spec, info) + _VMEM_HEADROOM)
+    limit = _vmem_bytes(mp, h, i, spec, info) + _VMEM_HEADROOM
+    out_shape = jax.ShapeDtypeStruct((m, h), BF16)
+    operands = [x, *(_in_hbm(a) for a in (s_gu, s_d, w_gu, w_d))]
+    norm_scratch, eps = [], None
+    if norm is not None:
+        residual, weight, eps = norm
+        operands += [residual, _in_hbm(weight)]
+        norm_scratch = [pltpu.VMEM(x.shape, x.dtype), pltpu.VMEM(weight.shape, F32)]
+        limit += 3 * ar.tiled_bytes((mp, h), F32, info)
+    params = dict(vmem_limit_bytes=limit)
     if spec is not None:
         params["collective_id"] = ar.COLLECTIVE_ID
     return pl.pallas_call(
-        functools.partial(_kernel, gu_chunks=gu_chunks, d_chunks=d_chunks, spec=spec),
-        out_shape=jax.ShapeDtypeStruct((m, h), BF16),
+        functools.partial(
+            _kernel, gu_chunks=gu_chunks, d_chunks=d_chunks, spec=spec, eps=eps
+        ),
+        out_shape=(out_shape, out_shape) if norm is not None else out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=[hbm] * 5,
-            out_specs=vmem,
+            in_specs=[hbm] * len(operands),
+            out_specs=[vmem, vmem] if norm is not None else vmem,
             scratch_shapes=[
                 pltpu.VMEM(x.shape, x.dtype),
                 pltpu.VMEM(s_gu.shape, s_gu.dtype),
@@ -257,7 +297,8 @@ def fused_mlp(
                 pltpu.VMEM((mp, 2 * i), F32),
                 pltpu.VMEM((mp, i), BF16),
                 pltpu.VMEM((mp, h), F32),
-                pltpu.SemaphoreType.DMA((3 + 2 * _SLOTS,)),
+                pltpu.SemaphoreType.DMA((len(operands) - 2 + 2 * _SLOTS,)),
+                *norm_scratch,
                 *(
                     [pltpu.VMEM((mp, h), BF16), *ar.scratch_shapes(spec)]
                     if spec is not None
@@ -266,19 +307,24 @@ def fused_mlp(
             ],
         ),
         compiler_params=pltpu.CompilerParams(**params),
-        name=f"dspark_mlp-m_{mp}-h_{h}-i_{i}" + (f"-ar_{n}" if n > 1 else ""),
+        name=f"dspark_mlp-m_{mp}-h_{h}-i_{i}"
+        + ("-norm" if norm is not None else "")
+        + (f"-ar_{n}" if n > 1 else ""),
         interpret=interpret,
-    )(
-        rank.reshape(1, 1).astype(jnp.int32),
-        x,
-        *(_in_hbm(a) for a in (s_gu, s_d, w_gu, w_d)),
-    )
+    )(rank.reshape(1, 1).astype(jnp.int32), *operands)
 
 
-def reference(x, w_gu, s_gu, w_d, s_d):
+def reference(x, w_gu, s_gu, w_d, s_d, norm=None):
     """The torch path's math in XLA (any row count): `fused_mlp` without the
     all-reduce."""
     i = w_d.shape[0]
+    if norm is not None:
+        residual, weight, eps = norm
+        r = (x.astype(F32) + residual.astype(F32)).astype(BF16)
+        rf = r.astype(F32)
+        var = jnp.mean(rf * rf, axis=1, keepdims=True)
+        x = (rf * lax.rsqrt(var + eps) * weight).astype(BF16)
+        return reference(x, w_gu, s_gu, w_d, s_d), r
 
     def project(lhs, w, s):
         y = jnp.dot(lhs, w.astype(BF16), preferred_element_type=F32)

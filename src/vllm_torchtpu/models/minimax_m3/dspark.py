@@ -206,6 +206,26 @@ class MiniMaxM3DSparkDecoderLayer(DFlashQwen3DecoderLayer):
         self.input_layernorm = GemmaRMSNorm(hidden_size, eps=eps)
         self.post_attention_layernorm = GemmaRMSNorm(hidden_size, eps=eps)
 
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """DFlashQwen3DecoderLayer.forward, with the post-attention norm run by
+        the MLP's op when `arm_fused_mlp` handed it over."""
+        if residual is not None:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        else:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        fused = self.mlp.forward_with_norm(hidden_states, residual)
+        if fused is not None:
+            return fused
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        return self.mlp(hidden_states), residual
+
 
 def _flipped_weight(linear: nn.Module, dtype: torch.dtype) -> torch.Tensor | None:
     """The ``[n_in, n_out]`` weight of a bias-free linear whose apply is a

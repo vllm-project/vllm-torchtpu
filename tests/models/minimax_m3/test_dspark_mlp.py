@@ -137,8 +137,10 @@ def test_folded_all_reduce_replaces_the_reduction(monkeypatch):
     )
     armed = SimpleNamespace(rank=torch.tensor([[3]], dtype=torch.int32), mesh=object())
     monkeypatch.setattr(bridge.pallas_all_reduce, "armed_for", lambda ranks: armed)
-    monkeypatch.setattr(bridge, "_make_reducing_op", lambda a: lambda x, *o: x + 2)
-    monkeypatch.setattr(bridge, "_selftest", lambda mlp, op, rank: True)
+    monkeypatch.setattr(
+        bridge, "_make_reducing_op", lambda a, eps=None: lambda x, *o: x + 2
+    )
+    monkeypatch.setattr(bridge, "_selftest", lambda mlp, ops, rank: True)
     monkeypatch.setattr(
         torch.distributed,
         "all_gather_object",
@@ -161,8 +163,8 @@ def test_failed_selftest_keeps_the_separate_reduction(monkeypatch):
     )
     armed = SimpleNamespace(rank=torch.tensor([[3]], dtype=torch.int32), mesh=object())
     monkeypatch.setattr(bridge.pallas_all_reduce, "armed_for", lambda ranks: armed)
-    monkeypatch.setattr(bridge, "_make_reducing_op", lambda a: None)
-    monkeypatch.setattr(bridge, "_selftest", lambda mlp, op, rank: True)
+    monkeypatch.setattr(bridge, "_make_reducing_op", lambda a, eps=None: None)
+    monkeypatch.setattr(bridge, "_selftest", lambda mlp, ops, rank: True)
     monkeypatch.setattr(
         torch.distributed,
         "all_gather_object",
@@ -171,3 +173,55 @@ def test_failed_selftest_keeps_the_separate_reduction(monkeypatch):
     mlp = _mlp()
     assert bridge.arm_fused_mlp(nn.ModuleList([mlp]), fold_all_reduce=True) == 1
     assert mlp._reducing_op is None
+
+
+def _gemma_norm(eps=1e-6):
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
+    norm = GemmaRMSNorm.__new__(GemmaRMSNorm)
+    nn.Module.__init__(norm)
+    norm.weight = nn.Parameter(torch.full((H,), 0.5, dtype=torch.bfloat16))
+    norm.variance_epsilon = eps
+    return norm
+
+
+def _layer(mlp, norm):
+    layer = nn.Module()
+    layer.mlp = mlp
+    layer.post_attention_layernorm = norm
+    return layer
+
+
+@pytest.mark.parametrize("tp", [1, 8])
+def test_norm_is_handed_to_the_op(monkeypatch, tp):
+    built = []
+
+    def make_norm_op(eps):
+        built.append(eps)
+        return lambda x, residual, norm_w, *o: (x + norm_w, x + residual)
+
+    monkeypatch.setattr(bridge, "_make_norm_op", make_norm_op)
+    monkeypatch.setattr(bridge, "get_tensor_model_parallel_world_size", lambda: tp)
+    monkeypatch.setattr(bridge, "tensor_model_parallel_all_reduce", lambda t: t * 8)
+    mlp = _mlp()
+    model = nn.ModuleList([_layer(mlp, _gemma_norm(1e-5))])
+    assert bridge.arm_fused_mlp(model) == 1
+    assert built == [1e-5]
+    assert torch.equal(mlp._fused_norm_w, torch.full((1, H), 1.5))
+    x = torch.ones(8, H, dtype=torch.bfloat16)
+    out, residual = mlp.forward_with_norm(x, x * 2)
+    assert torch.equal(residual, x * 3)
+    assert torch.equal(out.float(), torch.full((8, H), 2.5 * (8 if tp > 1 else 1)))
+    # A residual of another shape takes the unfused path.
+    assert mlp.forward_with_norm(x, x[:4]) is None
+
+
+def test_other_norms_keep_the_unfused_path(monkeypatch):
+    monkeypatch.setattr(bridge, "_make_norm_op", lambda eps: pytest.fail("built"))
+    mlps = [_mlp(), _mlp()]
+    model = nn.ModuleList(
+        [_layer(mlps[0], _gemma_norm(1e-6)), _layer(mlps[1], _gemma_norm(1e-5))]
+    )
+    assert bridge.arm_fused_mlp(model) == 2
+    x = torch.ones(8, H, dtype=torch.bfloat16)
+    assert all(m.forward_with_norm(x, x) is None for m in mlps)

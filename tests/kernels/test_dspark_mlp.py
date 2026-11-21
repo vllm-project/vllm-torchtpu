@@ -71,6 +71,28 @@ def test_matches_reference(m: int, h: int, i: int) -> None:
     assert _err(got, want) < 2e-2
 
 
+def _norm(m: int, h: int, seed: int):
+    rng = np.random.default_rng(seed)
+    residual = jnp.asarray(rng.standard_normal((m, h)) * 4, jnp.bfloat16)
+    weight = jnp.asarray(1 + rng.standard_normal((1, h)) * 0.1, jnp.float32)
+    return residual, weight, 1e-6
+
+
+@pytest.mark.parametrize("m", [8, 21])
+def test_norm_prologue(m: int) -> None:
+    """The residual add + Gemma RMSNorm in front: the new residual exactly,
+    the MLP output to the same bar."""
+    ops = _operands(m, 2048, 1024, seed=m)
+    norm = _norm(m, 2048, seed=m + 1)
+    got, res = kernel.fused_mlp(*ops, interpret=True, norm=norm)
+    want, want_res = kernel.reference(*ops, norm=norm)
+    assert got.shape == res.shape == (m, 2048)
+    np.testing.assert_array_equal(np.asarray(res), np.asarray(want_res))
+    assert _err(got, want) < 2e-2
+    # Fault: the MLP fed the un-normalized sum.
+    assert _err(got, kernel.reference(want_res, *ops[1:])) > 2e-2
+
+
 def test_rings_wrap(monkeypatch) -> None:
     """128-row chunks: 16 gate_up and 8 down chunks through 7-slot rings."""
     monkeypatch.setattr(kernel, "_CHUNK_BYTES", 1 << 16)
@@ -149,6 +171,47 @@ def _ar_worker():
             exact=all(np.array_equal(out[r], want) for r in range(N_RANKS)),
             races=bool(interpret_pallas_call.races.races_found),
         )
+    # The norm prologue in front of the all-reduce (24 rows: the full path).
+    rows = 24
+    norms = [_norm(rows, AR_H, seed=40 + r) for r in range(N_RANKS)]
+    run_norm = jax.jit(
+        jax.shard_map(
+            lambda x, res, w, *a: kernel.fused_mlp(
+                x, *a[:4], rank=a[4], n=N_RANKS, norm=(res, w, 1e-6)
+            ),
+            mesh=mesh,
+            in_specs=(P("d"),) * 8,
+            out_specs=(P("d"), P("d")),
+            check_vma=False,
+        )
+    )
+    xs = [ops[0][:rows] for ops in per_rank]
+    local = [
+        kernel.fused_mlp(x, *ops[1:], interpret=True, norm=nm)
+        for x, ops, nm in zip(xs, per_rank, norms)
+    ]
+    want = np.zeros((rows, AR_H), np.float32)
+    for out, _ in local:
+        want = want + np.asarray(out, np.float32)
+    want = np.asarray(jnp.asarray(want, jnp.bfloat16), np.float32)
+    pltpu.reset_tpu_interpret_mode_state()
+    out, res = run_norm(
+        jnp.concatenate(xs),
+        jnp.concatenate([nm[0] for nm in norms]),
+        jnp.concatenate([nm[1] for nm in norms]),
+        *weights,
+        ranks,
+    )
+    out = np.asarray(out, np.float32).reshape(N_RANKS, rows, AR_H)
+    res = np.asarray(res, np.float32).reshape(N_RANKS, rows, AR_H)
+    result["norm"] = dict(
+        exact=all(np.array_equal(out[r], want) for r in range(N_RANKS))
+        and all(
+            np.array_equal(res[r], np.asarray(local[r][1], np.float32))
+            for r in range(N_RANKS)
+        ),
+        races=bool(interpret_pallas_call.races.races_found),
+    )
     print("RESULT " + json.dumps(result))
 
 
@@ -168,7 +231,7 @@ def on_8_devices():
     return json.loads(lines[-1][len("RESULT ") :])
 
 
-@pytest.mark.parametrize("rows", AR_ROWS)
+@pytest.mark.parametrize("rows", [*AR_ROWS, "norm"])
 def test_all_reduce_epilogue_on_8_devices(on_8_devices, rows):
     case = on_8_devices[str(rows)]
     assert case["exact"] and not case["races"], case
