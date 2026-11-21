@@ -116,13 +116,13 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online
 from vllm_torchtpu.layers.adapter.sample.candidate_sampling import (
     MAX_TOP_K,
     VocabShardLogits,
-    candidate_verify_decisions,
+    candidate_verify_op,
     candidate_width,
 )
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     RejectionSampler,
     _random_rejection_sample_impl,
-    candidate_rejection_output,
+    assemble_rejection_output,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
@@ -610,6 +610,143 @@ def _verify_one_draw_ro_impl(
 _verify_one_draw_ro_compiled = _static_shape_args(
     _tpu_compile(_verify_one_draw_ro_impl)
 )
+
+
+def _candidate_uniforms_count(
+    num_bonus: int, num_drafts: int, num_targets: int, width: int
+) -> int:
+    return (num_bonus + num_targets) * width + num_drafts + 2
+
+
+def _candidate_verify_operands(
+    local_logits: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    bounds: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor | None,
+    u: torch.Tensor,
+    width: int,
+) -> tuple[torch.Tensor, ...]:
+    """The candidate verify op's operands (VLLM_TPU_CANDIDATE_SAMPLING), each
+    with the leading rank axis it takes.
+
+    `u` is one flat uniform draw, split in order into the bonus [B, width],
+    accept [num drafts], recover [T, width] and seed [2] draws. Outside
+    synthetic mode the accept draws stand in for the rates (unused there)."""
+    num_bonus = bonus_logits_indices.shape[0]
+    num_targets = target_logits_indices.shape[0]
+    nb = num_bonus * width
+    na = nb + draft_token_ids.numel()
+    nr = na + num_targets * width
+    bonus_u = u[:nb].reshape(num_bonus, width).to(local_logits.dtype)
+    accept_u = u[nb:na].reshape(draft_token_ids.shape)
+    recover_u = u[na:nr].reshape(num_targets, width)
+    seed = (u[nr:] * (1 << 24)).to(torch.int32)
+    rates = (
+        accept_u
+        if synthetic_conditional_rates is None
+        else synthetic_conditional_rates[group_indices.to(torch.int64)]
+    )
+    operands = (
+        torch.index_select(local_logits, 0, bonus_logits_indices),
+        torch.index_select(local_logits, 0, target_logits_indices),
+        bounds,
+        draft_token_ids,
+        temperatures,
+        top_k,
+        top_p,
+        temperatures[segment_ids],
+        top_k[segment_ids],
+        top_p[segment_ids],
+        bonus_u,
+        accept_u,
+        recover_u,
+        rates,
+        seed,
+    )
+    return tuple(t.reshape(1, *t.shape) for t in operands)
+
+
+def _candidate_verify_tokens(
+    outs: tuple[torch.Tensor, ...],
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+) -> torch.Tensor:
+    """`candidate_rejection_output` on the candidate op's outputs as it
+    returns them ([1, ...] per rank)."""
+    bonus_token_ids, accepted, recovered_token_ids = (o[0] for o in outs[:3])
+    return assemble_rejection_output(
+        accepted != 0,
+        recovered_token_ids,
+        draft_token_ids,
+        num_draft_tokens,
+        bonus_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+    )
+
+
+@functools.cache
+def _candidate_verify_program(vocab_size: int, synthetic: bool):
+    """A non-greedy verify chunk sampled from per-shard candidates as one
+    program: the draw split, the operand gathers, the candidate op and the
+    rejection output."""
+    op = candidate_verify_op(vocab_size, synthetic)
+
+    def candidate_verify(
+        local_logits: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        bounds: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        synthetic_conditional_rates: torch.Tensor | None,
+        u: torch.Tensor,
+        width: int,
+        max_draft_tokens: int,
+    ) -> torch.Tensor:
+        outs = op(
+            *_candidate_verify_operands(
+                local_logits,
+                bonus_logits_indices,
+                target_logits_indices,
+                bounds,
+                draft_token_ids,
+                temperatures,
+                top_k,
+                top_p,
+                segment_ids,
+                group_indices,
+                synthetic_conditional_rates,
+                u,
+                width,
+            )
+        )
+        return _candidate_verify_tokens(
+            outs,
+            draft_token_ids,
+            draft_lengths,
+            segment_ids,
+            group_indices,
+            max_draft_tokens,
+        )
+
+    return _static_shape_args(_tpu_compile(candidate_verify))
 
 
 def _reset_read_offsets(
@@ -10470,68 +10607,36 @@ class TPUModelRunner(GPUModelRunner):
         )
         host_phases.mark("vfy_params")
         width = candidate_width(head.tp_size)
-        bonus_u = torch.rand(
-            (num_bonus, width),
-            dtype=local_logits.dtype,
-            device=device,
-            generator=sampling_generator,
-        )
-        accept_u = torch.rand(
-            md.draft_token_ids.shape,
+        # One draw for the bonus, accept and recover uniforms and the key of
+        # the full-vocabulary draws (a step whose candidates are not exact:
+        # ties at the cutoff that fill one shard's candidates).
+        u = torch.rand(
+            (
+                _candidate_uniforms_count(
+                    num_bonus, md.draft_token_ids.numel(), num_targets, width
+                ),
+            ),
             dtype=torch.float32,
             device=device,
             generator=sampling_generator,
-        )
-        recover_u = torch.rand(
-            (num_targets, width),
-            dtype=torch.float32,
-            device=device,
-            generator=sampling_generator,
-        )
-        # Key for the full-vocabulary draws of a step whose candidates are
-        # not exact (ties at the cutoff that fill one shard's candidates).
-        seed = (
-            torch.rand(2, device=device, generator=sampling_generator) * (1 << 24)
-        ).to(torch.int32)
-        synthetic = self.rejection_sampler.synthetic_mode
-        rates = (
-            self.rejection_sampler.synthetic_conditional_rates[
-                md.group_indices.to(torch.int64)
-            ]
-            if synthetic
-            else accept_u
         )
         host_phases.mark("vfy_rand")
-        bonus_rows, target_rows = self.spec_gather_bonus_and_target_logits(
-            local_logits, md.bonus_logits_indices, md.target_logits_indices
-        )
-        bonus_token_ids, accepted, recovered, _ = candidate_verify_decisions(
-            bonus_rows,
-            target_rows,
+        synthetic = self.rejection_sampler.synthetic_mode
+        return _candidate_verify_program(head.org_vocab_size, synthetic)(
+            local_logits,
+            md.bonus_logits_indices,
+            md.target_logits_indices,
             self._candidate_bounds,
             md.draft_token_ids,
+            md.draft_lengths,
             temps,
             top_k,
             top_p,
-            temps[md.segment_ids],
-            top_k[md.segment_ids],
-            top_p[md.segment_ids],
-            bonus_u,
-            accept_u,
-            recover_u,
-            rates,
-            seed,
-            vocab_size=head.org_vocab_size,
-            synthetic=synthetic,
-        )
-        return candidate_rejection_output(
-            accepted,
-            recovered,
-            md.draft_token_ids,
-            md.draft_lengths,
-            bonus_token_ids,
             md.segment_ids,
             md.group_indices,
+            self.rejection_sampler.synthetic_conditional_rates if synthetic else None,
+            u,
+            width,
             self.speculative_config.num_speculative_tokens,
         )
 

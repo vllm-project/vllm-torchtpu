@@ -320,3 +320,84 @@ def test_candidates_only_when_every_request_keeps_few_tokens(change, expected):
         has_structured_output_requests=change == "structured"
     )
     assert TPUModelRunner._samples_candidates(runner, scheduler_output) is expected
+
+
+@pytest.mark.parametrize("synthetic", [False, True])
+def test_runner_operands_and_output_match_separate_ops(synthetic):
+    """The runner's candidate verify program builds the op's operands and the
+    rejection output (_candidate_verify_operands / _candidate_verify_tokens)
+    exactly as the separate draws, gathers and candidate_rejection_output do,
+    from the same flat uniform draw."""
+    from vllm_torchtpu.layers.adapter.sample.candidate_sampling import NUM_OPERANDS
+    from vllm_torchtpu.runner import tpu_runner as tr
+
+    g = torch.Generator().manual_seed(0)
+    num_reqs, k, shard, width = 4, 3, 96, 64 * 2
+    rows = num_reqs * (k + 1)
+    logits = torch.randn(rows, shard, generator=g).to(torch.bfloat16)
+    bonus_idx = torch.arange(num_reqs) * (k + 1) + k
+    target_idx = (torch.arange(num_reqs)[:, None] * (k + 1) + torch.arange(k)).flatten()
+    draft = torch.randint(0, 2 * shard, (num_reqs * k,), generator=g, dtype=torch.int32)
+    segment = torch.arange(num_reqs).repeat_interleave(k)
+    group = torch.arange(k, dtype=torch.int32).repeat(num_reqs)
+    temps = torch.rand(num_reqs, 1, generator=g).to(torch.bfloat16)
+    top_k = torch.randint(1, 48, (num_reqs, 1), generator=g, dtype=torch.int32)
+    top_p = torch.rand(num_reqs, 1, generator=g)
+    bounds = torch.tensor([shard, 2 * shard], dtype=torch.int32)
+    rates_table = torch.rand(k, generator=g) if synthetic else None
+    n = tr._candidate_uniforms_count(num_reqs, draft.numel(), target_idx.numel(), width)
+    u = torch.rand(n, generator=g)
+
+    ops = tr._candidate_verify_operands(
+        logits,
+        bonus_idx,
+        target_idx,
+        bounds,
+        draft,
+        temps,
+        top_k,
+        top_p,
+        segment,
+        group,
+        rates_table,
+        u,
+        width,
+    )
+    nb, na = num_reqs * width, num_reqs * width + draft.numel()
+    nr = na + target_idx.numel() * width
+    accept_u = u[nb:na]
+    expected = (
+        logits[bonus_idx],
+        logits[target_idx],
+        bounds,
+        draft,
+        temps,
+        top_k,
+        top_p,
+        temps[segment],
+        top_k[segment],
+        top_p[segment],
+        u[:nb].reshape(num_reqs, width).to(torch.bfloat16),
+        accept_u,
+        u[na:nr].reshape(-1, width),
+        rates_table[group.long()] if synthetic else accept_u,
+        (u[nr:] * (1 << 24)).to(torch.int32),
+    )
+    assert len(ops) == len(expected) == NUM_OPERANDS
+    for got, want in zip(ops, expected):
+        assert got.shape == (1, *want.shape) and got.dtype == want.dtype
+        assert torch.equal(got[0], want)
+
+    accepted = torch.randint(0, 2, (1, draft.numel()), generator=g, dtype=torch.int32)
+    recovered = torch.randint(
+        0, 2 * shard, (1, draft.numel()), generator=g, dtype=torch.int32
+    )
+    bonus = torch.randint(0, 2 * shard, (1, num_reqs), generator=g, dtype=torch.int32)
+    num_draft = torch.full((num_reqs,), k, dtype=torch.int32)
+    out = tr._candidate_verify_tokens(
+        (bonus, accepted, recovered), draft, num_draft, segment, group, k
+    )
+    ref = _eager(rs.candidate_rejection_output)(
+        accepted[0], recovered[0], draft, num_draft, bonus[0], segment, group, k
+    )
+    assert torch.equal(out, ref)

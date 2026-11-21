@@ -76,7 +76,11 @@ def get_tp_mesh():
 
 
 @functools.cache
-def _get_op(vocab_size: int, synthetic: bool):
+def candidate_verify_op(vocab_size: int, synthetic: bool):
+    """The candidate verify program as a torch op: the operands of
+    `candidate_verify_decisions` in its order, each with a leading rank axis
+    ([1, ...]); returns its six outputs with that axis kept. Callable inside a
+    compiled region."""
     mesh = get_tp_mesh()
     run = functools.partial(
         candidate_verify,
@@ -170,7 +174,7 @@ def candidate_verify_decisions(
     """Bonus ids [B], accepted [T] (int32), recovered ids [T] and the
     candidates-exact flag [] for one verify chunk, from this rank's shard of
     the bonus rows [B, Vl] and verified rows [T, Vl]."""
-    op = _get_op(vocab_size, synthetic)
+    op = candidate_verify_op(vocab_size, synthetic)
     operands = (
         bonus_logits,
         target_logits,
