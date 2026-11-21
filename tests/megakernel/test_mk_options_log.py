@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The startup MK option line reads the built kernel spec (`log_mk_options`)."""
+
+from __future__ import annotations
+
+import logging
+
+from vllm_torchtpu.megakernel.exec_spec import Tiles
+from vllm_torchtpu.megakernel.models import qwen38
+from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
+from vllm_torchtpu.megakernel_runtime import qwen38_wholestep_call as wc
+
+G = qwen38.TINY
+
+
+def _spec(**indexed):
+    return wholestep_spec(
+        G,
+        2,
+        L=G.att_every,
+        first="qsa",
+        qsa=dict(budget=64),
+        step=True,
+        indexed=dict(max_groups=2048, pages_per_seq=64, **indexed),
+    )
+
+
+def test_line_reads_block_and_tiles():
+    spec = _spec(
+        thr_fast="te", per_request_scores=True, shard_index=True, union_attn=True,
+        loop_requests=True,
+        req_async=1, xmerge=True, skip_idle=True,
+    )
+    line = wc.mk_options_line(16, spec, Tiles(hier=1, rel_fetch=True))
+    assert line.startswith("qwen38 MK options b16: ")
+    kv = dict(p.split("=", 1) for p in line.split(": ", 1)[1].split())
+    assert kv["thr_fast"] == "'te'"
+    assert kv["req_async"] == "1" and kv["xmerge"] == "1" and kv["skip_idle"] == "1"
+    assert kv["select_nvis"] == "0"
+    assert kv["key_slots"] == "2"
+    assert kv["hier"] == "1" and kv["rel_fetch"] == "1"
+    # Not on this kernel: skipped, not an error.
+    assert "uattn_lite" not in kv
+
+
+def test_thr_fast_one_resolves_to_ter2_and_defaults_off():
+    on = wc.mk_options_line(8, _spec(thr_fast="1"), Tiles())
+    assert "thr_fast='ter2'" in on
+    off = wc.mk_options_line(8, _spec(), Tiles())
+    assert "thr_fast=''" in off and "req_async=0" in off and "xmerge=0" in off
+
+
+def test_logged_once_per_bucket(caplog, monkeypatch):
+    monkeypatch.setattr(wc, "_LOGGED_MK_OPTIONS", set())
+    spec = _spec()
+    with caplog.at_level(logging.INFO):
+        wc.log_mk_options(4, spec, Tiles())
+        wc.log_mk_options(4, spec, Tiles())
+        wc.log_mk_options(8, spec, Tiles())
+    lines = [r.getMessage() for r in caplog.records if "MK options" in r.getMessage()]
+    assert [ln.split(":")[0] for ln in lines] == ["qwen38 MK options b4", "qwen38 MK options b8"]
+
+
+def test_non_rank0_silent(caplog, monkeypatch):
+    monkeypatch.setattr(wc, "_LOGGED_MK_OPTIONS", set())
+    monkeypatch.setattr(wc, "_is_rank0", lambda: False)
+    with caplog.at_level(logging.INFO):
+        wc.log_mk_options(4, _spec(), Tiles())
+    assert not [r for r in caplog.records if "MK options" in r.getMessage()]
