@@ -1148,6 +1148,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w2_weight_scale_inv,
                 router_logits,
             )
+        if self._moe_lowtok_scores_op is not None and not moe_lowtok_scores.serves(
+            self._moe_lowtok_scores_op, x
+        ):
+            router_logits = moe_lowtok_scores.lift_shared_buffers(layer, router_logits)
         if fused_moe_ep_v3_dispatch.supported(self):
             return fused_moe_ep_v3_dispatch.apply(
                 self, layer, x, router_logits, self._apply_grouped

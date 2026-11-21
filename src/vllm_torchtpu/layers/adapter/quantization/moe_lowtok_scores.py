@@ -36,6 +36,7 @@ import torch
 from torch_tpu._internal.pallas import jax_op
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.kernels.experimental.moe_lowtok import (
     HOT_SLOTS,
     MOE_LOWTOK_MAX_TOKENS,
@@ -383,6 +384,27 @@ def serves(op: torch.library.CustomOpDef | None, x: torch.Tensor) -> bool:
     return op is not None and x.shape[0] <= MOE_LOWTOK_MAX_TOKENS
 
 
+def lift_shared_buffers(layer: Any, tensor: torch.Tensor) -> torch.Tensor:
+    """Reference `_lowtok_*` tables on the non-lowtok side of the row fork.
+
+    Under Python vLLM `shape_variants` warmup, buckets above and below
+    `MOE_LOWTOK_MAX_TOKENS` hand compiled subgraphs between traces, which
+    requires both sides of the branch to lift identical layer buffers.
+    """
+    if not shape_variants.in_warmup() or not hasattr(layer, "_lowtok_tables"):
+        return tensor
+    zero = (
+        layer._lowtok_tables[0] * 0
+        + layer._lowtok_prim[0] * 0
+        + layer._lowtok_copy[0] * 0
+        + layer._lowtok_hot1h[0, 0].to(torch.int32) * 0
+    )
+    experts_start = getattr(layer, "_experts_start", None)
+    if experts_start is not None:
+        zero = zero + experts_start * 0
+    return tensor + zero.to(tensor.dtype)
+
+
 def apply(
     op: torch.library.CustomOpDef,
     layer: RoutedExperts,
@@ -395,6 +417,10 @@ def apply(
         # helper only reads the first argument's row count.
         _, scores = token_padding.zero_routing_weights_for_padding(scores, scores)
     if hasattr(layer, "_lowtok_tables"):
+        if shape_variants.in_warmup():
+            experts_start = getattr(layer, "_experts_start", None)
+            if experts_start is not None:
+                scores = scores + (experts_start * 0).to(scores.dtype)
         return op(
             x,
             scores,

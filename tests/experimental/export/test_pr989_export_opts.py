@@ -712,3 +712,82 @@ def test_experimental_use_rust_env_default_is_false():
     assert envs.VLLM_TPU_SRPT_ATTN_WORK_CAP == 0
     assert envs.VLLM_TPU_SRPT_ATTN_TILE_TOKENS == 32
     assert envs.VLLM_TPU_MEGAKERNEL == ""
+
+
+def test_lowtok_copies_and_grouped_lift_same_buffers_under_warmup(monkeypatch):
+    from vllm_torchtpu.compilation import shape_variants
+    from vllm_torchtpu.layers.adapter.quantization import (
+        fp8 as tpu_fp8,
+    )
+    from vllm_torchtpu.layers.adapter.quantization import (
+        fused_moe_ep_v3_dispatch,
+        moe_lowtok_scores,
+    )
+
+    class _FakeLayer:
+        layer_name = "layers.0.mlp.experts"
+        w13_weight = torch.empty((1, 4, 8), dtype=torch.bfloat16)
+        w2_weight = torch.empty((1, 8, 4), dtype=torch.bfloat16)
+        w13_weight_scale_inv = torch.ones((1, 1, 1, 8), dtype=torch.float32)
+        w2_weight_scale_inv = torch.ones((1, 1, 1, 4), dtype=torch.float32)
+        _lowtok_tables = torch.zeros((512,), dtype=torch.int32)
+        _lowtok_prim = torch.zeros((1024,), dtype=torch.int32)
+        _lowtok_copy = torch.zeros((512,), dtype=torch.int32)
+        _lowtok_hot1h = torch.zeros((512, 128), dtype=torch.bfloat16)
+        _experts_start = torch.tensor(0, dtype=torch.int32)
+
+    class _RecordingLayer:
+        def __init__(self) -> None:
+            self.accessed: set[str] = set()
+            self._inner = _FakeLayer()
+
+        def __getattr__(self, name: str):
+            if name.startswith("_lowtok_") or name == "_experts_start":
+                self.accessed.add(name)
+            return getattr(self._inner, name)
+
+    seen_grouped_logits = []
+    seen_lowtok_scores = []
+
+    method = object.__new__(tpu_fp8.VllmFp8MoEMethodTPU)
+    method._tpu_activation_str = "silu"
+    method._use_adaptive_fused_moe = False
+    method._tpu_topk_weights_float32 = False
+    method._moe_lowtok_scores_op = lambda _x, scores, *_args: (
+        seen_lowtok_scores.append(scores) or _x
+    )
+
+    monkeypatch.setattr(tpu_fp8.envs, "TPU_MOE_SKIP_PADDED_TOKENS", False)
+    monkeypatch.setattr(fused_moe_ep_v3_dispatch, "supported", lambda _m: True)
+    monkeypatch.setattr(
+        fused_moe_ep_v3_dispatch,
+        "apply",
+        lambda _m, lyr, x, router_logits, _fallback: (
+            seen_grouped_logits.append((router_logits, lyr._experts_start)) or x
+        ),
+    )
+
+    with shape_variants.warmup():
+        lowtok_layer = _RecordingLayer()
+        x_small = torch.ones((4, 8), dtype=torch.bfloat16)
+        logits_small = torch.zeros((4, 512), dtype=torch.float32)
+        moe_lowtok_scores.apply(
+            method._moe_lowtok_scores_op, lowtok_layer, x_small, logits_small
+        )
+
+        grouped_layer = _RecordingLayer()
+        x_large = torch.ones((256, 8), dtype=torch.bfloat16)
+        logits_large = torch.zeros((256, 512), dtype=torch.float32)
+        method.apply_monolithic(grouped_layer, x_large, logits_large)
+
+    expected = {
+        "_lowtok_tables",
+        "_lowtok_prim",
+        "_lowtok_copy",
+        "_lowtok_hot1h",
+        "_experts_start",
+    }
+    assert expected <= lowtok_layer.accessed
+    assert expected <= grouped_layer.accessed
+    assert len(seen_lowtok_scores) == 1
+    assert len(seen_grouped_logits) == 1
