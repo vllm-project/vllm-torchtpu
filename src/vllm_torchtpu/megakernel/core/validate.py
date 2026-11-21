@@ -222,8 +222,7 @@ def validate_model_def(
             isinstance(s, lt_cls) for s in slots
         ):
             sched = sch.resolve(cls.default_hf_config or {}, static_l)
-            if cls.default_hf_config is None:
-                validate_norms(cls, sched, None, eps=None, model_name=name)
+            validate_norms(cls, sched, None, eps=None, model_name=name)
         elif not any(isinstance(s, lt_cls) for s in slots[2:]):
             s_fn = schedule._resolve_slot_spec
             pre_l = s_fn(sch.pre_norm, {}, static_l, "pre_norm")
