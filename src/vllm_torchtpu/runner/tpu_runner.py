@@ -6849,8 +6849,14 @@ class TPUModelRunner(GPUModelRunner):
         assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
         room = self.max_model_len - P
-        n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
-        max_pos = min(self.max_model_len, P + n_decode * (1 + K))
+        steps = max(0, room // (1 + K) - 1)
+        n_decode = min(3 if short else max(5, K + 2), steps)
+        # The mixed steps below advance the decode requests too: at most two
+        # budget-filling steps and one per smaller token bucket.
+        n_mixed = (
+            min(2 + len(self.num_tokens_paddings), steps - n_decode) if mixed else 0
+        )
+        max_pos = min(self.max_model_len, P + (n_decode + n_mixed) * (1 + K))
         # Per-group block counts at each group's own block size (see
         # _warmup_one_spec_request); the per-request stride uses the widest
         # group so every group's ranges stay disjoint across requests.
@@ -6947,10 +6953,19 @@ class TPUModelRunner(GPUModelRunner):
                 variants = [[P_mix]]
                 if self.max_num_reqs >= R + 2 and P_mix >= 2 * P:
                     variants.append([P_mix // 2, P_mix - P_mix // 2])
+                # A prompt's last chunk shorter than the budget puts the step
+                # in a smaller token bucket, whose programs serving would
+                # otherwise compile on first use: one prefill filling each.
+                variants += [
+                    [int(b) - R * (1 + K)]
+                    for b in self.num_tokens_paddings
+                    if P <= int(b) - R * (1 + K) < P_mix
+                ]
+                variants = variants[:n_mixed]
                 prev_ids: list[str] = []
                 base_lo = 1 + R * nblk
                 for vi, plist in enumerate(variants):
-                    if top <= base_lo + (vi + 1) * len(plist) * mix_nblk + 1:
+                    if top <= base_lo + (vi * 2 + len(plist)) * mix_nblk + 1:
                         break
                     extras = []
                     for k_, Pk in enumerate(plist):
