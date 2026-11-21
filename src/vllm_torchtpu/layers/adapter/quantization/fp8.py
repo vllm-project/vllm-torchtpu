@@ -115,7 +115,6 @@ if TYPE_CHECKING:
         TpuLinear,
         TpuRoutedExperts,
     )
-    from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
 
 logger = init_logger(__name__)
 
@@ -1715,7 +1714,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
 
 
 def resolve_online_fp8(
-    config: VllmFp8Config | VllmNvfp4Config,
+    config: VllmQuantConfig,
     layer: torch.nn.Module,
     prefix: str,
     base_method: QuantizeMethodBase | None,

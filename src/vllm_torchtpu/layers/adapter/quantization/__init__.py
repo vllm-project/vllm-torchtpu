@@ -38,6 +38,9 @@ from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
     VllmDeepseekV4Fp8Config,
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
+from vllm_torchtpu.layers.adapter.quantization.modelopt_mixed import (
+    VllmModelOptMixedConfig,
+)
 from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmMxfp4Config
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import attach_online_fp8
@@ -74,6 +77,7 @@ def get_tpu_quantization_config(
         quant_methods.FP8: VllmFp8Config,
         quant_methods.MXFP4: VllmMxfp4Config,
         quant_methods.NVFP4: VllmNvfp4Config,
+        quant_methods.MODELOPT_MIXED: VllmModelOptMixedConfig,
         quant_methods.COMPRESSED_TENSORS: VllmCompressedTensorsConfig,
         quant_methods.DEEPSEEK_V4_FP8: VllmDeepseekV4Fp8Config,
         # TODO: Add more quantization methods as needed
@@ -91,6 +95,25 @@ def get_tpu_quantization_config(
 
     # Set global config for this quantization class
     quant_config_cls.set_configs(vllm_config)
+
+    # Some ModelOpt checkpoints keep the per-layer map only in hf_quant_config.json.
+    # vLLM falls back to that file only for the method name "modelopt_mixed", not
+    # for the "tpu-" name. Removing a quantization_config that lacks
+    # quantized_layers makes vLLM read the file instead.
+    if quant_config_cls is VllmModelOptMixedConfig:
+        for cfg_holder in (
+            model_config.hf_config,
+            getattr(model_config.hf_config, "text_config", None),
+        ):
+            qcfg = getattr(cfg_holder, "quantization_config", None)
+            if not isinstance(qcfg, dict):
+                continue
+            nested = qcfg.get("quantization")
+            has_layers = "quantized_layers" in qcfg or (
+                isinstance(nested, dict) and "quantized_layers" in nested
+            )
+            if not has_layers:
+                delattr(cfg_holder, "quantization_config")
 
     # Register the TPU quant method name so vLLM uses our custom config
     model_config.quantization = quant_methods.get_tpu_quant_method(
