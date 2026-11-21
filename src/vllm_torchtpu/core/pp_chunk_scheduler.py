@@ -48,6 +48,12 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 SCHEDULER_CLS = "vllm_torchtpu.core.pp_chunk_scheduler.TpuPipelineChunkScheduler"
+PREFIX_AWARE_PP_SCHEDULER_CLS = (
+    "vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwarePipelineChunkScheduler"
+)
+# Schedulers that size prefill chunks for a pipeline: the platform keeps a
+# configured one and installs SCHEDULER_CLS when none is configured.
+DYNAMIC_CHUNK_SCHEDULER_CLASSES = (SCHEDULER_CLS, PREFIX_AWARE_PP_SCHEDULER_CLS)
 
 
 def uses_dynamic_chunks(vllm_config: Any) -> bool:
@@ -56,7 +62,8 @@ def uses_dynamic_chunks(vllm_config: Any) -> bool:
     return (
         vllm_config is not None
         and vllm_config.parallel_config.pipeline_parallel_size > 1
-        and vllm_config.scheduler_config.scheduler_cls == SCHEDULER_CLS
+        and vllm_config.scheduler_config.scheduler_cls
+        in DYNAMIC_CHUNK_SCHEDULER_CLASSES
     )
 
 
