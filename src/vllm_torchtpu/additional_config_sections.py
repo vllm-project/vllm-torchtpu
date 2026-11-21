@@ -55,7 +55,7 @@ def unknown_sections(additional_config: Any) -> list[str]:
     if not isinstance(additional_config, Mapping):
         return []
     return sorted(
-        str(key)
+        key
         for key in additional_config
         if isinstance(key, str) and is_owned(key) and key not in KNOWN_SECTIONS
     )
