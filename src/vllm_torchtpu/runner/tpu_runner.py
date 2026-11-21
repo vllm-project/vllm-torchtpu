@@ -4272,7 +4272,6 @@ class TPUModelRunner(GPUModelRunner):
             and not self.uses_mrope
             and self.lora_config is None
             and layout_plan.kind is SequenceLayoutKind.ALL
-            and not envs.VLLM_TPU_DRAFT_SHARD_ARGMAX
             and adapter is not None
             and getattr(adapter, "prep_fold_supported", lambda: False)()
             and int(num_scheduled_tokens_per_req.sum())
