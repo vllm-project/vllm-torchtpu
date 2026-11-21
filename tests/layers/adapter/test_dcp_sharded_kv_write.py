@@ -1446,3 +1446,120 @@ def test_should_build_and_dispatch_sharded_k_indexer_op(monkeypatch) -> None:
     out_sh = tp_op_mod.indexer_rows(idx_holder, *args, k_sharded=True)
     assert int(out_rep[0, 0].item()) == 0
     assert int(out_sh[0, 0].item()) == 1
+
+
+@pytest.mark.parametrize("zigzag_bands", [1, 2, 4])
+def test_should_bound_sharded_kv_a2a_send_counts_across_adversarial_batches(
+    zigzag_bands: int,
+) -> None:
+    dcp, interleave, rows_local = 16, 4, 1024
+    total_tokens = dcp * rows_local
+    band = rows_local // zigzag_bands
+    cycle = dcp * interleave
+    num_blocks = dcp * zigzag_bands
+    rng = np.random.default_rng(77 + zigzag_bands)
+
+    # Known tight serving profiles under dcp=16, rows_local=1024, zigzag_bands=4:
+    exact_checks = [
+        ([0, total_tokens], 64),
+        (list(range(8)) + [total_tokens], 71),
+        (list(range(16)) + [total_tokens], 79),
+        (list(range(32)) + [total_tokens], 95),
+        (list(range(64)) + [total_tokens], 124),
+        ([0, 4096, 8192, 12288, total_tokens], 64),
+        ([0, 4001, 8002, 12003, total_tokens], 68),
+    ]
+    for raw_qsl, exp_ub in exact_checks:
+        qsl_pad = raw_qsl + [raw_qsl[-1]] * (65 - len(raw_qsl))
+        got = int(
+            kv_cache_utils._sharded_a2a_max_send_bound(  # noqa: SLF001 -- verifying exact tier bound formula
+                jnp.asarray(qsl_pad, dtype=jnp.int32),
+                rows_local=rows_local,
+                dcp_size=dcp,
+                interleave_size=interleave,
+                zigzag_bands=zigzag_bands,
+            )
+        )
+        assert got == exp_ub if zigzag_bands == 4 else got >= 64
+
+    tiers = kv_cache_utils._sharded_a2a_cap_tiers(  # noqa: SLF001 -- verifying tier lattice endpoints
+        rows_local, cap_full=320, dcp_size=dcp
+    )
+    assert tiers == (64, 128, 320)
+
+    def _pref(x: int) -> np.ndarray:
+        return (x // cycle) * interleave + np.clip(
+            (x % cycle) - np.arange(dcp) * interleave, 0, interleave
+        )
+
+    r_idx = np.arange(dcp)[:, None]
+    k_idx = np.arange(zigzag_bands)[None, :]
+    blk_id = np.where(
+        (k_idx & 1) == 0, k_idx * dcp + r_idx, (k_idx + 1) * dcp - 1 - r_idx
+    )
+    for trial in range(100):
+        nseq = int(rng.integers(1, 65))
+        total = int(rng.integers(1, total_tokens + 1))
+        if trial % 2 == 0:
+            nd = min(nseq - 1, total)
+            qsl = np.array(list(range(nd + 1)) + [total] * (64 - nd), dtype=np.int32)
+        else:
+            cuts = sorted(rng.choice(total + 1, size=nseq - 1, replace=True).tolist())
+            tail = [total] * (65 - (nseq + 1))
+            qsl = np.array([0] + cuts + [total] + tail, dtype=np.int32)
+        ql = qsl[1:] - qsl[:-1]
+        # Worst-case alignment shift placing every sequence head on owner 0.
+        sl = ql + (0 if trial % 3 == 0 else rng.integers(0, 5000, size=64))
+        cnt_blk = np.zeros((num_blocks, dcp), dtype=np.int32)
+        for s in range(64):
+            qs, qe = int(qsl[s]), int(qsl[s + 1])
+            if qe <= qs:
+                continue
+            p_base = int(sl[s]) - (qe - qs)
+            for blk in range(qs // band, min((qe - 1) // band + 1, num_blocks)):
+                lo, hi = max(qs, blk * band), min(qe, (blk + 1) * band)
+                cnt_blk[blk] += _pref(p_base + hi - qs) - _pref(p_base + lo - qs)
+        true_max = int(np.max(np.sum(cnt_blk[blk_id], axis=1)))
+        bound = int(
+            kv_cache_utils._sharded_a2a_max_send_bound(  # noqa: SLF001 -- comparing bound against exact count
+                jnp.asarray(qsl, dtype=jnp.int32),
+                rows_local=rows_local,
+                dcp_size=dcp,
+                interleave_size=interleave,
+                zigzag_bands=zigzag_bands,
+            )
+        )
+        assert bound >= true_max, f"trial={trial}: bound={bound} < true_max={true_max}"
+
+
+def test_should_match_replicated_kv_write_across_tight_tier_switches() -> None:
+    dcp = 16
+    mesh = _make_16dev_mesh()
+    rows_local = 64  # total 1024 tokens, base tier = 4 -> rounded to 16
+    cases = [
+        # Single aligned prefill -> tier 16
+        (
+            np.array([2048] + [0] * 15, dtype=np.int32),
+            np.array([0] + [1024] * 16, dtype=np.int32),
+        ),
+        # 15 one-token decodes + 1 prefill -> middle tier
+        (
+            np.array([100] * 15 + [1009 + 200], dtype=np.int32),
+            np.array(list(range(16)) + [1024], dtype=np.int32),
+        ),
+        # Multi-prefill unaligned crossing seams
+        (
+            np.array([500, 700, 900, 1200] + [0] * 12, dtype=np.int32),
+            np.array([0, 17, 303, 661] + [1024] * 13, dtype=np.int32),
+        ),
+    ]
+    for sl, qsl in cases:
+        bt = np.arange(16 * 16, dtype=np.int32).reshape(16, 16) % 32
+        _run_sharded_vs_replicated_kv_write(
+            mesh=mesh,
+            dcp=dcp,
+            rows_local=rows_local,
+            seq_lens=sl,
+            block_tables=bt,
+            query_start_loc=qsl,
+        )

@@ -19,6 +19,7 @@ NOTE: Currently designed for 8-bit / FP8 KV caches (1 byte per element). We use
 
 import dataclasses
 import enum
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -780,22 +781,66 @@ def _sharded_a2a_cap(
     return min(rows_local, ((raw + 15) // 16) * 16)
 
 
-def _sharded_a2a_fast_seq_limit(
-    rows_local: int,
+def _sharded_a2a_max_send_bound(
+    query_start_loc: jax.Array,
     *,
+    rows_local: int,
     dcp_size: int,
     interleave_size: int,
     zigzag_bands: int = 1,
-) -> int:
-    if dcp_size <= 1:
-        return 0
-    headroom = _SHARDED_A2A_FAST_CAP * dcp_size - rows_local + (dcp_size - 1)
-    if headroom <= 0:
-        return 0
-    return max(
-        0,
-        headroom // ((dcp_size - 1) * interleave_size) - max(zigzag_bands - 1, 0),
+) -> jax.Array:
+    """Return replicated sound int32 upper bound on `max_{rank, owner} send_count`.
+
+    Every contiguous span of length ``L`` inside a block hits any single DCP
+    owner at most ``(L // cycle) * interleave_size + min(L % cycle, interleave_size)``
+    times regardless of starting KV position. Summing across active sequences
+    and each rank's zigzag bands avoids cross-rank collectives while strictly
+    bounding the true worst-case per-owner slot count.
+    """
+    nb = zigzag_bands if zigzag_bands > 1 else 1
+    band = rows_local // nb
+    num_blocks = dcp_size * nb
+    total_tokens = dcp_size * rows_local
+    cycle = jnp.int32(dcp_size * interleave_size)
+    il = jnp.int32(interleave_size)
+    blk_lo = jnp.arange(num_blocks, dtype=jnp.int32)[:, None] * jnp.int32(band)
+    blk_hi = blk_lo + jnp.int32(band)
+    q_s = jnp.clip(query_start_loc[:-1], 0, total_tokens)[None, :]
+    q_s = q_s.at[:, 0].set(jnp.int32(0))
+    q_e = jnp.clip(query_start_loc[1:], 0, total_tokens)[None, :]
+    span = jnp.maximum(
+        jnp.int32(0), jnp.minimum(q_e, blk_hi) - jnp.maximum(q_s, blk_lo)
     )
+    blk_ub = jnp.sum((span // cycle) * il + jnp.minimum(span % cycle, il), axis=1)
+    if nb == 1:
+        return jnp.max(blk_ub).astype(jnp.int32)
+    r_idx = jnp.arange(dcp_size, dtype=jnp.int32)[:, None]
+    k_idx = jnp.arange(nb, dtype=jnp.int32)[None, :]
+    blk_id = jnp.where(
+        (k_idx & 1) == 0,
+        k_idx * dcp_size + r_idx,
+        (k_idx + 1) * dcp_size - 1 - r_idx,
+    )
+    return jnp.max(jnp.sum(blk_ub[blk_id], axis=1)).astype(jnp.int32)
+
+
+def _sharded_a2a_cap_tiers(
+    rows_local: int,
+    *,
+    cap_full: int,
+    dcp_size: int,
+) -> tuple[int, ...]:
+    """Return sorted distinct all_to_all cap tiers ending at `cap_full`."""
+    if dcp_size <= 1 or cap_full <= 16:
+        return (cap_full,)
+    # Avoid non-power-of-2 intermediate tiers (e.g. 72/80/96): irregular row
+    # counts split vector tiling in all_to_all/gather/scatter and compile extra
+    # conditional branches slower than the 128-row tier.
+    base = max(16, ((rows_local + dcp_size - 1) // dcp_size + 15) // 16 * 16)
+    candidates = (base, _SHARDED_A2A_FAST_CAP)
+    tiers = sorted({c for c in candidates if c < cap_full})
+    tiers.append(cap_full)
+    return tuple(tiers)
 
 
 def _build_sharded_dcp_a2a_plan(
@@ -1036,23 +1081,26 @@ def _update_sparse_mla_kv_cache_dcp_sharded_impl(
                 _scatter_rows(kv_cache_rope, rope_spec, recv_rope, page_c, slot_c),
             )
 
-    max_fast_seqs = _sharded_a2a_fast_seq_limit(
-        rows_local,
-        dcp_size=dcp_size,
-        interleave_size=interleave_size,
-        zigzag_bands=zigzag_bands,
-    )
-    if cap_full > _SHARDED_A2A_FAST_CAP and max_fast_seqs >= 1:
-        # Avoid lax.pmax across ranks: query_start_loc is replicated, so the
-        # active-sequence count gives a zero-collective sufficient condition
-        # for max_cnt <= _SHARDED_A2A_FAST_CAP that agrees on every rank.
-        live_seqs = jnp.sum(
-            (query_start_loc[1:] > query_start_loc[:-1]).astype(jnp.int32)
+    tiers = _sharded_a2a_cap_tiers(rows_local, cap_full=cap_full, dcp_size=dcp_size)
+    if len(tiers) > 1 and rows_local % max(zigzag_bands, 1) == 0:
+        # Avoid lax.pmax across ranks and conservative (dcp-1)*il per-seq
+        # padding: query_start_loc is replicated so all ranks pick the exact
+        # same smallest tier cap >= true worst-case per-owner slot count.
+        send_ub = _sharded_a2a_max_send_bound(
+            query_start_loc,
+            rows_local=rows_local,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+            zigzag_bands=zigzag_bands,
         )
-        return jax.lax.cond(
-            live_seqs <= jnp.int32(max_fast_seqs),
-            lambda: _scatter_tier(_SHARDED_A2A_FAST_CAP),
-            lambda: _scatter_tier(cap_full),
+        tier_arr = jnp.asarray(tiers, dtype=jnp.int32)
+        branch_idx = jnp.minimum(
+            jnp.searchsorted(tier_arr, send_ub, side="left", method="compare_all"),
+            jnp.int32(len(tiers) - 1),
+        )
+        return jax.lax.switch(
+            branch_idx,
+            tuple(functools.partial(_scatter_tier, c) for c in tiers),
         )
     return _scatter_tier(cap_full)
 
