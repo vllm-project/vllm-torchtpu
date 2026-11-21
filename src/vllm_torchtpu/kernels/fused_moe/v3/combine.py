@@ -26,6 +26,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.fused_moe.v2.host import array_vmem_bytes
+
 from . import device
 from . import row_gather_kernel as gather
 from .config import (
@@ -58,8 +60,8 @@ def _weighted_sum_vmem_bytes(blocks, scratch):
     table a whole row of lanes per token."""
     info = pltpu.get_tpu_info()
     return sum(
-        2 * device.array_vmem_bytes(shape, dtype, info) for shape, dtype in blocks
-    ) + sum(device.array_vmem_bytes(shape, dtype, info) for shape, dtype in scratch)
+        2 * array_vmem_bytes(shape, dtype, info) for shape, dtype in blocks
+    ) + sum(array_vmem_bytes(shape, dtype, info) for shape, dtype in scratch)
 
 
 def _weighted_sum_body(
