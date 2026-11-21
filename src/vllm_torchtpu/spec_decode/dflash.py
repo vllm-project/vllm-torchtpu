@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -110,6 +111,33 @@ def _draft_has_moe_layers(draft_model: torch.nn.Module) -> bool:
     return any(isinstance(m, MoERunner) for m in draft_model.modules())
 
 
+def _program_key(args: object) -> tuple:
+    """What a ``dynamic=False`` compiled program is specialized on in
+    ``args``: each tensor's shape, dtype and strides and which earlier tensor
+    it is (aliasing), and every scalar's value, through tuples, lists, dicts
+    and dataclasses (other leaves, such as host copies, by type only)."""
+    seen: dict[int, int] = {}
+
+    def key(x: object) -> object:
+        if isinstance(x, torch.Tensor):
+            first = seen.setdefault(id(x), len(seen))
+            return ("T", tuple(x.shape), x.dtype, x.stride(), first)
+        if isinstance(x, (tuple, list)):
+            return (type(x).__name__, *(key(v) for v in x))
+        if isinstance(x, dict):
+            return ("dict", *((k, key(v)) for k, v in x.items()))
+        if dataclasses.is_dataclass(x) and not isinstance(x, type):
+            return (
+                type(x).__name__,
+                *(key(getattr(x, f.name, None)) for f in dataclasses.fields(x)),
+            )
+        if x is None or isinstance(x, (bool, int, float, str, torch.dtype)):
+            return x
+        return type(x).__name__
+
+    return cast(tuple, key(args))
+
+
 class DFlashProposer:
     """DFlash draft proposer for TPU.
 
@@ -183,6 +211,10 @@ class DFlashProposer:
         # Keyed by the chunk's padded request count; the all-zero
         # `draft_lengths` a chunk without spec metadata routes on.
         self._zero_draft_lengths_cache: dict[int, torch.Tensor] = {}
+        # `_program_key`s of `_tpu_update_kv_and_build_inputs` calls compiled
+        # while `_warming` (the runner's real spec-decode warmup).
+        self._fused_kv_inputs_keys: set[tuple] = set()
+        self._warming_fused_kv_inputs = False
 
     @property
     def block_size(self) -> int:
@@ -538,10 +570,60 @@ class DFlashProposer:
 
         The base token is the last verified token from the target model.
         """
+        if next_tokens_device is not None:
+            return self._tpu_build_dflash_inputs_next_tokens(
+                *self._next_tokens_input_args(chunk, next_tokens_device)
+            )
+        if device_seed is None:
+            raise RuntimeError(
+                "DFlash propose called without next_tokens_device or device_seed. "
+                "This drafter is designed strictly for the fused device path."
+            )
+        padded_len, query_start_loc_device, position_ids_device = (
+            self._draft_input_layout(chunk)
+        )
+        return self._tpu_build_dflash_inputs_seed(
+            device_seed,
+            query_start_loc_device,
+            position_ids_device,
+            self._chunk_num_reqs_device(chunk),
+            self.block_size,
+            padded_len,
+            self.mask_token_id,
+        )
+
+    def _next_tokens_input_args(
+        self, chunk: DraftChunkInputs, next_tokens_device: torch.Tensor
+    ) -> tuple:
+        """`_build_dflash_inputs_next_tokens`'s arguments for ``chunk``."""
+        padded_len, query_start_loc_device, position_ids_device = (
+            self._draft_input_layout(chunk)
+        )
+        # No spec metadata means nothing was verified this step, so every
+        # request anchors on the prompt-chunk path.
+        draft_lengths = chunk.draft_lengths
+        if draft_lengths is None:
+            draft_lengths = self._zero_draft_lengths(chunk.num_reqs)
+        return (
+            next_tokens_device,
+            query_start_loc_device,
+            position_ids_device,
+            draft_lengths,
+            # The live count the compiled builders mask with.
+            self._chunk_num_reqs_device(chunk),
+            self.block_size,
+            padded_len,
+            self.mask_token_id,
+            INVALID_TOKEN_ID,
+        )
+
+    def _draft_input_layout(
+        self, chunk: DraftChunkInputs
+    ) -> tuple[int, torch.Tensor, torch.Tensor]:
+        """``(padded draft length, query_start_loc, position ids)`` the input
+        builders lay ``chunk``'s draft out from."""
         # 1. Calculate static padded shapes
         num_reqs = chunk.num_reqs
-        # The live count the compiled builders mask with.
-        num_reqs_device = self._chunk_num_reqs_device(chunk)
         block_size = self.block_size
         total_draft_tokens = num_reqs * block_size
 
@@ -563,42 +645,7 @@ class DFlashProposer:
         position_ids_device = chunk.position_ids
         if position_ids_device.dim() > 1:
             position_ids_device = position_ids_device[0]
-
-        # Route to the appropriate pre-compiled XLA Graph
-        if next_tokens_device is not None:
-            # No spec metadata means nothing was verified this step, so every
-            # request anchors on the prompt-chunk path.
-            draft_lengths = chunk.draft_lengths
-            if draft_lengths is None:
-                draft_lengths = self._zero_draft_lengths(num_reqs)
-            input_ids, positions, seq_lens = self._tpu_build_dflash_inputs_next_tokens(
-                next_tokens_device,
-                query_start_loc_device,
-                position_ids_device,
-                draft_lengths,
-                num_reqs_device,
-                block_size,
-                padded_len,
-                self.mask_token_id,
-                INVALID_TOKEN_ID,
-            )
-        elif device_seed is not None:
-            input_ids, positions, seq_lens = self._tpu_build_dflash_inputs_seed(
-                device_seed,
-                query_start_loc_device,
-                position_ids_device,
-                num_reqs_device,
-                block_size,
-                padded_len,
-                self.mask_token_id,
-            )
-        else:
-            raise RuntimeError(
-                "DFlash propose called without next_tokens_device or device_seed. "
-                "This drafter is designed strictly for the fused device path."
-            )
-
-        return input_ids, positions, seq_lens
+        return padded_len, query_start_loc_device, position_ids_device
 
     def _zero_draft_lengths(self, num_reqs: int) -> torch.Tensor:
         """Cached all-zero `draft_lengths` for a chunk without spec
@@ -668,6 +715,13 @@ class DFlashProposer:
         It applies RoPE to the target's hidden states and scatters the tokens directly
         into the draft KV cache.
         """
+        with set_vllm_model_wrapper_context(
+            mesh=self.runner.mesh, vllm_config=self.vllm_config
+        ):
+            self._tpu_precompute_and_update_kv_cache(*self._kv_update_args(chunk))
+
+    def _kv_update_args(self, chunk: DraftChunkInputs) -> tuple:
+        """`_precompute_and_update_kv_cache`'s arguments for ``chunk``."""
         self._require_aux_hidden_states(chunk)
 
         target_hidden = chunk.aux_hidden_states
@@ -679,13 +733,54 @@ class DFlashProposer:
             positions = positions[0]
         positions = positions[:num_tokens]
         draft_md_tuple = self._build_draft_layer_metadata(chunk.attn_metadata)
+        return target_hidden, positions, draft_md_tuple
 
+    def _update_kv_and_build_inputs(
+        self,
+        chunks: list[DraftChunkInputs],
+        next_tokens_per_chunk: list[torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """A lone chunk's context-KV update and its draft inputs from the
+        verified tokens as one program (`_tpu_update_kv_and_build_inputs`),
+        where `TPU_DFLASH_FUSED_KV_INPUTS` allows it and the runner's warmup
+        compiled it at these inputs; None leaves both to their own programs
+        (`_update_context_kv`, `_prepare_dflash_inputs`)."""
+        if not (
+            envs.TPU_DFLASH_FUSED_KV_INPUTS
+            and len(chunks) == 1
+            and next_tokens_per_chunk
+            # EP-DP lockstep padding chunks replay the two phases apart.
+            and not (
+                self._dp_lockstep_sharded() and self.runner._dp_step_num_chunks > 1
+            )
+        ):
+            return None
+        chunk = chunks[0]
+        kv_args = self._kv_update_args(chunk)
+        input_args = self._next_tokens_input_args(chunk, next_tokens_per_chunk[0])
+        key = _program_key((kv_args, input_args))
+        if self._warming_fused_kv_inputs:
+            self._fused_kv_inputs_keys.add(key)
+            # Also compile the unfused builder, which a shape the warmup
+            # did not meet falls back to (the KV update has its precompile).
+            self._tpu_build_dflash_inputs_next_tokens(*input_args)
+        elif key not in self._fused_kv_inputs_keys:
+            return None
         with set_vllm_model_wrapper_context(
             mesh=self.runner.mesh, vllm_config=self.vllm_config
         ):
-            self._tpu_precompute_and_update_kv_cache(
-                target_hidden, positions, draft_md_tuple
-            )
+            return self._tpu_update_kv_and_build_inputs(kv_args, input_args)
+
+    @contextlib.contextmanager
+    def warming(self):
+        """Within the runner's real spec-decode warmup: the shapes the fused
+        programs (`_update_kv_and_build_inputs`) meet are compiled and
+        recorded, and serving fuses only at recorded ones."""
+        self._warming_fused_kv_inputs = True
+        try:
+            yield
+        finally:
+            self._warming_fused_kv_inputs = False
 
     def _update_context_kv(self, chunks: list[DraftChunkInputs]) -> int:
         """Update all context chunks before any draft forward (DP lockstep)."""
@@ -760,7 +855,10 @@ class DFlashProposer:
         # ALL KV updates before ALL draft forwards, so the padding must
         # follow the same phase structure (never interleave per chunk).
         # 1. Hoist all KV cache updates across chunks to the top of propose
-        extra_chunks = self._update_context_kv(chunks)
+        fused_inputs = self._update_kv_and_build_inputs(chunks, next_tokens_per_chunk)
+        extra_chunks = (
+            0 if fused_inputs is not None else self._update_context_kv(chunks)
+        )
 
         # 2. Process each chunk
         draft_logits_per_chunk = []
@@ -769,9 +867,12 @@ class DFlashProposer:
                 next_tokens_per_chunk[i] if next_tokens_per_chunk else None
             )
             chunk_seed = device_seed[i] if device_seed is not None else None
-            input_ids, positions, seq_lens = self._prepare_dflash_inputs(
-                chunk, next_tokens_device=next_tokens_device, device_seed=chunk_seed
-            )
+            if fused_inputs is not None:
+                input_ids, positions, seq_lens = fused_inputs
+            else:
+                input_ids, positions, seq_lens = self._prepare_dflash_inputs(
+                    chunk, next_tokens_device=next_tokens_device, device_seed=chunk_seed
+                )
             padded_len = input_ids.shape[0]
             draft_attn_metadata = self._build_draft_attn_metadata(
                 chunk, padded_len, seq_lens
@@ -1098,6 +1199,17 @@ class DFlashProposer:
         positions: torch.Tensor,
         draft_md_tuple: tuple[AttentionMetadata, ...],
     ) -> tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor:
+        """Compiled `_precompute_and_update_kv_cache`."""
+        return self._precompute_and_update_kv_cache(
+            hidden_states, positions, draft_md_tuple
+        )
+
+    def _precompute_and_update_kv_cache(
+        self,
+        hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor,
+        positions: torch.Tensor,
+        draft_md_tuple: tuple[AttentionMetadata, ...],
+    ) -> tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor:
         """
         Projects target model hidden states directly into the draft model's KV space.
 
@@ -1315,6 +1427,43 @@ class DFlashProposer:
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _tpu_build_dflash_inputs_next_tokens(
+        self,
+        next_tokens_device: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        position_ids: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        num_reqs: torch.Tensor,
+        block_size: int,
+        padded_len: int,
+        mask_token_id: int,
+        invalid_token_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compiled `_build_dflash_inputs_next_tokens`."""
+        return self._build_dflash_inputs_next_tokens(
+            next_tokens_device,
+            query_start_loc,
+            position_ids,
+            draft_lengths,
+            num_reqs,
+            block_size,
+            padded_len,
+            mask_token_id,
+            invalid_token_id,
+        )
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _tpu_update_kv_and_build_inputs(
+        self,
+        kv_args: tuple,
+        input_args: tuple,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`_precompute_and_update_kv_cache(*kv_args)` and
+        `_build_dflash_inputs_next_tokens(*input_args)` as one program: the
+        two are independent, and each alone is a launch of small ops."""
+        self._precompute_and_update_kv_cache(*kv_args)
+        return self._build_dflash_inputs_next_tokens(*input_args)
+
+    def _build_dflash_inputs_next_tokens(
         self,
         next_tokens_device: torch.Tensor,
         query_start_loc: torch.Tensor,

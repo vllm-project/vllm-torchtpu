@@ -658,6 +658,81 @@ def test_prepare_dflash_inputs(device):
     )
 
 
+def _fused_kv_inputs_proposer():
+    """A K=3 proposer, a 2-request chunk and its verified tokens, the KV
+    update recorded instead of run."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        num_tokens_paddings=[8, 16, 32],
+        max_num_reqs=8,
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=None,
+        mesh=None,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    layer = mock.MagicMock()
+    layer.self_attn.attn.layer_name = "dummy_layer"
+    proposer.draft_model = mock.MagicMock()
+    proposer.draft_model.model.layers = [layer, layer]
+    proposer._precompute_and_update_kv_cache = mock.MagicMock()
+    chunk = _make_chunk(
+        num_reqs=2,
+        start_index=0,
+        device=torch.device("cpu"),
+        query_start_loc_np=np.array([0, 3, 5], dtype=np.int32),
+        position_ids=torch.tensor([10, 11, 12, 40, 41, 0, 0, 0], dtype=torch.int32),
+    )
+    next_tokens = torch.tensor(
+        [[101, 102, 103, -1], [201, 202, -1, -1]], dtype=torch.int32
+    )
+    return proposer, chunk, next_tokens
+
+
+def test_fused_kv_update_and_inputs(monkeypatch):
+    """`TPU_DFLASH_FUSED_KV_INPUTS`: one program for the KV update and the
+    draft inputs, at the inputs the warmup met; elsewhere the two programs."""
+    monkeypatch.setattr(dflash_module.envs, "TPU_DFLASH_FUSED_KV_INPUTS", True)
+    proposer, chunk, next_tokens = _fused_kv_inputs_proposer()
+    with torch.compiler.set_stance("force_eager"):
+        expected = proposer._prepare_dflash_inputs(chunk, next_tokens)
+        # Not yet met by the warmup: no fusion, nothing run.
+        assert proposer._update_kv_and_build_inputs([chunk], [next_tokens]) is None
+        proposer._precompute_and_update_kv_cache.assert_not_called()
+
+        with proposer.warming():
+            warmed = proposer._update_kv_and_build_inputs([chunk], [next_tokens])
+        served = proposer._update_kv_and_build_inputs([chunk], [next_tokens])
+        # Another shape (3 requests' rows) falls back.
+        assert (
+            proposer._update_kv_and_build_inputs(
+                [chunk], [torch.full((3, 4), -1, dtype=torch.int32)]
+            )
+            is None
+        )
+        # Two chunks keep the hoisted per-chunk updates.
+        assert (
+            proposer._update_kv_and_build_inputs(
+                [chunk, chunk], [next_tokens, next_tokens]
+            )
+            is None
+        )
+
+    for got in (warmed, served):
+        assert all(torch.equal(a, b) for a, b in zip(got, expected, strict=True))
+    kv_args = proposer._kv_update_args(chunk)
+    calls = proposer._precompute_and_update_kv_cache.call_args_list
+    assert len(calls) == 2
+    for call in calls:
+        hidden, positions, md = call.args
+        assert hidden is kv_args[0] and torch.equal(positions, kv_args[1])
+        assert md == kv_args[2]
+
+    monkeypatch.setattr(dflash_module.envs, "TPU_DFLASH_FUSED_KV_INPUTS", False)
+    assert proposer._update_kv_and_build_inputs([chunk], [next_tokens]) is None
+
+
 def test_missing_target_layer_ids():
     with pytest.raises(ValueError, match="target layer ids"):
         _make_proposer(target_layer_ids=[])

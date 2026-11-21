@@ -8001,6 +8001,10 @@ class TPUModelRunner(GPUModelRunner):
         with (
             _suspend_kv_transfer_group(),
             self._precompile_timed("spec-decode real warmup"),
+            # Compiles and records the drafter's fused programs' shapes.
+            getattr(
+                getattr(self, "drafter", None), "warming", contextlib.nullcontext
+            )(),
         ):
             # (1) First-pass / first-decode shapes depend on the prompt length:
             # sweep one synthetic request per prompt-token bucket at nr=1. Each
