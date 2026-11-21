@@ -685,7 +685,8 @@ def test_a_lookup_of_a_key_this_shard_never_evicted_costs_no_registry_call():
 
 def _victim_scenario(tier, stores, n_old=10, n_demoted=6, n_lost=2, n_new=6):
     """n_old keys saved; n_demoted of them demoted to the nodes, n_lost of those then dropped by the nodes; all
-    recomputed, plus n_new never-seen keys, and offered as victims. Returns (old, demoted, lost, new, chosen)."""
+    recomputed, plus n_new never-seen keys, and offered as victims. Returns (old, demoted, lost, new, chosen, the
+    x2_stats taken just before the victim call)."""
     old = [_key(100 + i) for i in range(n_old)]
     new = [_key(300 + i) for i in range(n_new)]
     _save(tier, stores, old, list(range(1000, 1000 + n_old)))
@@ -696,8 +697,9 @@ def _victim_scenario(tier, stores, n_old=10, n_demoted=6, n_lost=2, n_new=6):
     for st in stores.values():
         st.calls.clear()
     tier.set_victim_mode(True)
+    before = tier.x2_stats()
     chosen = tier.prepare_victim_store(old + new)
-    return old, demoted, lost, new, chosen
+    return old, demoted, lost, new, chosen, before
 
 
 def test_the_store_probe_asks_the_registry_only_for_keys_this_shard_evicted_in_one_batch():
@@ -705,9 +707,10 @@ def test_the_store_probe_asks_the_registry_only_for_keys_this_shard_evicted_in_o
     demoted (one batched registry lookup: 4 on the node, 2 dropped by it, so 1 + 2 calls). The chosen keys are the new
     and the dropped ones."""
     tier, stores, _ = _shard_tier()
-    old, demoted, lost, new, chosen = _victim_scenario(tier, stores)
+    old, demoted, lost, new, chosen, before = _victim_scenario(tier, stores)
     assert set(chosen) == set(new) | set(lost)
-    stats = tier.x2_stats()
+    after = tier.x2_stats()
+    stats = {k: after[k] - before[k] for k in after}
     assert stats["store_probe_unrecorded"] == 2 * len(new)
     assert stats["store_probe_lookups"] == 2 * len(demoted)
     assert stats["store_remote_skips"] == 2 * (len(demoted) - len(lost))

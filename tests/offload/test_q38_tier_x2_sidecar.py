@@ -156,7 +156,8 @@ def test_node_commands_carry_the_lru_flags_only_when_asked():
     from vllm_torchtpu.offload import tier_x2_sidecar as sc
 
     base = {"Q38X2_NODES": "main.r1:1000", "Q38X2_NODE_REGISTRY": "r:1", "Q38X2_NODE_IP": "10.0.0.2"}
-    lru = ("evict", "stats_period", "log_stderr")
+    lru = ("--enable_evict_sweep", "--evict_low_watermark", "--evict_high_watermark", "--evict_sweep_period_s",
+           "--stats_period_s", "--log_stderr_threshold")
     ((_, _, argv),) = sc.node_commands(base, "/bin/node")
     assert not [a for a in argv if any(k in a for k in lru)]
     ((_, _, argv),) = sc.node_commands({**base, "Q38X2_NODE_EVICT_SWEEP": "0"}, "/bin/node")
