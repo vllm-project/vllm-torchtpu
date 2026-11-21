@@ -24,6 +24,10 @@ prioritizes requests with the fewest uncached prompt tokens. It modifies only
 the admission ordering; memory management, eviction, and preemption policies
 remain untouched.
 
+Cached means resident in HBM or, when the KV connector implements
+`ExternalPrefixProbe` (host offload), loadable from the connector's tier: a
+host-resident prefix costs a DMA, not a prefill, so it must not rank as cold.
+
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
 """
@@ -40,6 +44,8 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request
 
+from vllm_torchtpu.core.external_prefix_probe import ExternalPrefixProbe
+
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY = 1000
@@ -48,6 +54,11 @@ _LOG_EVERY = 1000
 _TIER_PREEMPTED = 1
 _TIER_NORMAL = 2
 
+# Connector probes are cached per request and refreshed every this many
+# scheduler steps: the host tier changes slowly, and the window is re-scored
+# every step.
+_EXTERNAL_PROBE_REFRESH_STEPS = 8
+
 
 class PrefixAwareScheduler(AsyncScheduler):
     """Admit ready requests prioritizing fewest uncached prompt tokens."""
@@ -55,14 +66,28 @@ class PrefixAwareScheduler(AsyncScheduler):
     #: Lookahead window of ready requests to evaluate for cached prefix length.
     WINDOW = 64
 
+    # Class-level defaults so partially constructed instances (tests) work.
+    _paw_probe: ExternalPrefixProbe | None = None
+    _paw_step: int = 0
+    _paw_external_cache: dict[str, tuple[int, int, int, int]] | None = None
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._paw_n = 0
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
+        connector = getattr(self, "connector", None)
+        self._paw_probe = (
+            connector if isinstance(connector, ExternalPrefixProbe) else None
+        )
+        self._paw_external_cache = {}
 
-        logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
+        logger.info(
+            "PrefixAwareScheduler ACTIVE (window=%d, connector warmth=%s)",
+            self.WINDOW,
+            self._paw_probe is not None,
+        )
 
     def _prefix_warmth(self, request: Request) -> int:
         """Prompt tokens of ``request`` resident in the KV cache."""
@@ -75,7 +100,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             result = kvm.coordinator.find_longest_cache_hit(
                 request.block_hashes, max(request.num_tokens - 1, 0)
             )
-            return int(result[1])
+            local = int(result[1])
         except Exception:
             if not self._paw_scoring_broken:
                 self._paw_scoring_broken = True
@@ -83,6 +108,37 @@ class PrefixAwareScheduler(AsyncScheduler):
                     "PrefixAwareScheduler: warmth scoring failed; falling back to FCFS."
                 )
             return 0
+        return local + self._external_warmth(request, local)
+
+    def _external_warmth(self, request: Request, local: int) -> int:
+        """Prompt tokens past `local` the KV connector could load (0 if none)."""
+        probe = self._paw_probe
+        if probe is None:
+            return 0
+        cache = self._paw_external_cache
+        if cache is None:
+            cache = self._paw_external_cache = {}
+        num_hashes = len(request.block_hashes)
+        cached = cache.get(request.request_id)
+        if (
+            cached is not None
+            and cached[0] == local
+            and cached[1] == num_hashes
+            and self._paw_step - cached[3] < _EXTERNAL_PROBE_REFRESH_STEPS
+        ):
+            return cached[2]
+        try:
+            external = int(probe.peek_external_prefix_tokens(request, local))
+        except Exception:
+            logger.exception(
+                "PrefixAwareScheduler: connector warmth probe failed; "
+                "ranking by local warmth only."
+            )
+            self._paw_probe = None
+            return 0
+        external = max(0, min(external, request.num_tokens - local))
+        cache[request.request_id] = (local, num_hashes, external, self._paw_step)
+        return external
 
     def _rank_and_warmth(
         self, request: Request
@@ -114,10 +170,16 @@ class PrefixAwareScheduler(AsyncScheduler):
         if self.policy != SchedulingPolicy.FCFS or len(queue) < 2:
             return
 
+        self._paw_step += 1
         window = list(islice(queue, self.WINDOW))
         head = window[0]
         scored = [(self._rank_and_warmth(r), r) for r in window]
         (best_rank, best_warmth), best = min(scored, key=lambda t: t[0][0])
+        cache = self._paw_external_cache
+        if cache and len(cache) > 4 * self.WINDOW:
+            live = {r.request_id for r in window}
+            for req_id in [k for k in cache if k not in live]:
+                del cache[req_id]
 
         if best is not head and best_rank < scored[0][0][0]:
             # Only FCFS reaches here (see the early return above).
