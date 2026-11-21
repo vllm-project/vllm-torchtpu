@@ -713,6 +713,7 @@ def _glm_rope_half_split(model: Any, hf_config: Any = None) -> tuple[bool, bool]
     model config to read, it refuses to guess."""
     from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
         VllmTPUIndexer,
+        VllmTPUMultiHeadLatentAttentionWrapper,
         rope_half_split_supported,
     )
 
@@ -729,12 +730,11 @@ def _glm_rope_half_split(model: Any, hf_config: Any = None) -> tuple[bool, bool]
         if isinstance(module, VllmTPUIndexer):
             has_indexer = True
             indexer = indexer or bool(getattr(module, "_rope_neox_permuted", False))
-        elif hasattr(module, "_rope_neox_permuted"):
+        elif isinstance(module, VllmTPUMultiHeadLatentAttentionWrapper):
             # An MLA layer: it holds the flag from construction on.
             mla = mla or bool(module._rope_neox_permuted)
             rope_supported = rope_supported or rope_half_split_supported(
-                getattr(module, "rotary_emb", None),
-                int(getattr(module, "qk_rope_head_dim", 0) or 0),
+                module.rotary_emb, int(module.qk_rope_head_dim)
             )
     if not has_indexer and tpu_envs.TPU_INDEXER_ROPE_NEOX_PERMUTE:
         if hf_config is None:
@@ -744,9 +744,11 @@ def _glm_rope_half_split(model: Any, hf_config: Any = None) -> tuple[bool, bool]
                 "indexer_rope_interleave, but no model config was given"
             )
         # The rule vLLM builds the indexer rope by (DeepSeek-V2 / GLM:
-        # is_neox_style = not indexer_rope_interleave, default False).
+        # is_neox_style = not getattr(config, "indexer_rope_interleave",
+        # False)): a config without the key gets a NeoX indexer rope, which
+        # the permute never reorders. Same truthiness as vLLM's.
         interleaved_rope = getattr(hf_config, "indexer_rope_interleave", False)
-        indexer = interleaved_rope is True and rope_supported
+        indexer = bool(interleaved_rope) and rope_supported
     return mla, indexer
 
 
@@ -3597,7 +3599,7 @@ class TPURaidenConnectorWorker:
                 indexer_seq_along_lane=_glm_indexer_seq_along_lane(self.vllm_config),
                 rope_half_split=_glm_rope_half_split(
                     getattr(self.runner, "model", None),
-                    getattr(self.vllm_config.model_config, "hf_text_config", None),
+                    self.vllm_config.model_config.hf_text_config,
                 ),
             )
             return fingerprint, payload, page_tokens

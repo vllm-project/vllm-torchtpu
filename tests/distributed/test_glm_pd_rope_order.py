@@ -27,6 +27,7 @@ from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
 
 from .raiden_test_utils import glm_named_kv_caches
+from .test_raiden_layout_fingerprint import _glm_layout_getter, _glm_versions
 from .test_tpu_connector import _FakeAdmissionRaidenEngine, _make_raiden_worker
 
 _MOD = "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
@@ -34,24 +35,13 @@ PAGE = 1024
 SAL_PAGE = 256
 ROPE = 64
 GLM_ROPE_THETA = 8_000_000.0  # GLM-5.2 config rope_parameters (rope_type default)
-# test_raiden_layout_fingerprint.py's GLM golden: the interleaved order
-# declares nothing, so it must not move.
+# test_raiden_layout_fingerprint.py's GLM golden (same layout getter and
+# versions, imported from there): the interleaved order declares nothing, so
+# it must not move.
 GOLDEN_GLM_FINGERPRINT = (
     "bfea2b664510bfb11f87b5092431492fddaf535f0f321f01d59a79e139c3bc2b"
 )
 HALF = rlf.GLM_ROPE_ORDER_HALF_SPLIT
-
-
-def _layout_getter(tensor):
-    packing = tensor.shape[2]
-    return ([3, 2, 1, 0], [[packing, 128], [packing, 1]], 0)
-
-
-def _versions(package):
-    return {
-        "torch_tpu": "torch-tpu-test-version",
-        "libtpu": "libtpu-test-version",
-    }[package]
 
 
 def _manifest(path, layers=(0, 1)):
@@ -86,8 +76,8 @@ def _fingerprint(path, layers=(0, 1), **rope_order):
     return rlf.measured_glm_layout_fingerprint(
         _manifest(path, layers),
         page_tokens=SAL_PAGE if path == "dcp_identity" else PAGE,
-        layout_getter=_layout_getter,
-        package_version=_versions,
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions,
         hash_indexer=path != "pp",
         indexer_seq_along_lane=path == "dcp_identity",
         **rope_order,
@@ -162,6 +152,18 @@ class _FakeIndexer(torch.nn.Module):
     pass
 
 
+class _FakeMLA(torch.nn.Module):
+    pass
+
+
+@pytest.fixture(autouse=True)
+def _fake_layer_classes(monkeypatch):
+    """The reader recognises layers by class; stand in for the indexer and the
+    MLA wrapper with bare modules carrying the attributes it reads."""
+    monkeypatch.setattr(mla_op, "VllmTPUIndexer", _FakeIndexer)
+    monkeypatch.setattr(mla_op, "VllmTPUMultiHeadLatentAttentionWrapper", _FakeMLA)
+
+
 def _model(
     *, permuted_mla=False, permuted_indexer=False, indexer=True, rope=RotaryEmbedding
 ):
@@ -169,7 +171,7 @@ def _model(
     ``_rope_neox_permuted`` from construction on, its rope, and optionally an
     indexer, which sets the flag only once permuted."""
     model = torch.nn.Module()
-    model.attn = torch.nn.Module()
+    model.attn = _FakeMLA()
     model.attn._rope_neox_permuted = permuted_mla
     model.attn.qk_rope_head_dim = ROPE
     model.attn.rotary_emb = _glm_rope(rope)
@@ -187,10 +189,9 @@ def _flags(mla, indexer):
     )
 
 
-def test_rope_order_is_read_from_the_permuted_layers(monkeypatch):
+def test_rope_order_is_read_from_the_permuted_layers():
     # The connector reads the order the layers actually cache (the flag a
     # layer sets once its post-load permute ran), not the env's intent.
-    monkeypatch.setattr(mla_op, "VllmTPUIndexer", _FakeIndexer)
     read = tc._glm_rope_half_split
     mla_flag, indexer_flag = _flags(True, True)
     with mla_flag, indexer_flag:
@@ -252,9 +253,8 @@ def test_rope_order_is_read_from_the_permuted_layers(monkeypatch):
     ],
 )
 def test_no_indexer_stage_declares_the_order_its_indexer_would_cache(
-    monkeypatch, config, rope, indexer_flag, expected
+    config, rope, indexer_flag, expected
 ):
-    monkeypatch.setattr(mla_op, "VllmTPUIndexer", _FakeIndexer)
     permuted_mla = rope is RotaryEmbedding
     stage = _model(permuted_mla=permuted_mla, indexer=False, rope=rope)
     mla_flag, idx_flag = _flags(True, indexer_flag)
@@ -265,8 +265,7 @@ def test_no_indexer_stage_declares_the_order_its_indexer_would_cache(
         )
 
 
-def test_no_indexer_stage_without_model_config_refuses_to_guess(monkeypatch):
-    monkeypatch.setattr(mla_op, "VllmTPUIndexer", _FakeIndexer)
+def test_no_indexer_stage_without_model_config_refuses_to_guess():
     stage = _model(permuted_mla=True, indexer=False)
     mla_flag, idx_flag = _flags(True, True)
     with (
@@ -281,11 +280,10 @@ def test_no_indexer_stage_without_model_config_refuses_to_guess(monkeypatch):
         assert tc._glm_rope_half_split(stage) == (True, False)
 
 
-def test_flag_on_but_permute_skipped_declares_interleaved(monkeypatch):
+def test_flag_on_but_permute_skipped_declares_interleaved():
     # With the flags at their default, a rope the permute cannot reorder keeps
     # the interleaved order: the layers never set the flag, so the engine
     # declares nothing, with or without an indexer layer.
-    monkeypatch.setattr(mla_op, "VllmTPUIndexer", _FakeIndexer)
     assert not mla_op.rope_half_split_supported(_glm_rope(_OwnForwardRope), ROPE)
     assert mla_op.rope_half_split_supported(_glm_rope(), ROPE)
     mla_flag, indexer_flag = _flags(True, True)
@@ -390,14 +388,13 @@ def test_mixed_rope_pairing_is_refused_at_transfer_start(
     # its fingerprint, and the decode's transfer start goes through the same
     # retry wrapper as a real load. A mixed pairing is refused and not
     # retried; a matched pairing (either order) is accepted.
-    monkeypatch.setattr(mla_op, "VllmTPUIndexer", _FakeIndexer)
     monkeypatch.setattr(
         rlf,
         "measured_glm_layout_fingerprint",
         functools.partial(
             rlf.measured_glm_layout_fingerprint,
-            layout_getter=_layout_getter,
-            package_version=_versions,
+            layout_getter=_glm_layout_getter,
+            package_version=_glm_versions,
         ),
     )
     controller = _ComparingController()
