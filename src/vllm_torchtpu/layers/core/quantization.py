@@ -86,7 +86,7 @@ def static_per_tensor_quantize_tensor(
     if scale == 0.0:
         raise ValueError("Quantization scale must be non-zero.")
     reciprocal = quantized_matmul_util.RECIPROCAL_SCALE
-    if quant_dtype.is_floating_point:
+    if is_floating_dtype(quant_dtype):
         dtype_info = torch.finfo(quant_dtype)
         if reciprocal and scale == 1.0 and tensor.is_floating_point():
             return torch.clamp(tensor, dtype_info.min, dtype_info.max).to(quant_dtype)

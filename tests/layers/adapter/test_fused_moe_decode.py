@@ -26,6 +26,7 @@ import torch
 from vllm.model_executor.layers.activation import SiluAndMul
 
 import vllm_torchtpu.envs as envs
+from tests.layers.adapter.quantization.test_fp8_fused_ep_v3_forward import _setenv
 from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME
 from vllm_torchtpu.layers.adapter import fused_moe_decode as bridge
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
@@ -180,7 +181,7 @@ def test_admission_declines_a_layer_another_path_serves(monkeypatch, path):
     if path == "scores":
         qm._moe_lowtok_scores_op = object()
     elif path == "v3":
-        monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", True)
+        _setenv(monkeypatch, "USE_MOE_FUSED_EP_KERNEL", "1")
         monkeypatch.setattr(fused_moe_ep_v3, "_OP", object())
         qm._tpu_fused_ep_eligible = True
     elif path == "adaptive":
@@ -188,7 +189,7 @@ def test_admission_declines_a_layer_another_path_serves(monkeypatch, path):
     elif path == "v2":
         setattr(qm, FUSED_MOE_EP_OP_ATTR, object())
     elif path == "collectives":
-        monkeypatch.setattr(envs, "TPU_MOE_FP8_ALL_GATHER", True)
+        _setenv(monkeypatch, "TPU_MOE_FP8_ALL_GATHER", "1")
     admitted = bridge._admit(runner, 2)
     assert (admitted is None) is (path != "none")
 

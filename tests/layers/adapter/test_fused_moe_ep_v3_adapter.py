@@ -28,6 +28,7 @@ from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal.pallas._mock_device import _PallasDevice
 from vllm.distributed import parallel_state
 
+from tests.layers.adapter.quantization.test_fp8_fused_ep_v3_forward import _setenv
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v3 import ffn_kernel
 from vllm_torchtpu.kernels.fused_moe.v3 import layer as kernel_layer
@@ -39,6 +40,8 @@ from vllm_torchtpu.layers.adapter import (
     token_padding,
 )
 from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as v3
+from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
+from vllm_torchtpu.models.qwen3_5 import hooks
 
 pytestmark = pytest.mark.cpu_test
 
@@ -373,14 +376,11 @@ def test_the_softmax_router_is_admitted(armed):
 def qwen3_5_397b_v3_sp(armed, groups, monkeypatch):
     """A Qwen3.5-397B-A17B engine on TPU7x with expert parallelism, fused EP
     v3 and sequence-parallel MoE; returns a function that sets the (dp, tp)
-    layout and gives one MoE layer stand-in at EP8."""
+    layout and gives one MoE layer stand-in on an 8-wide EP mesh."""
     import vllm.config
 
-    from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
-    from vllm_torchtpu.models.qwen3_5 import hooks
-
-    monkeypatch.setattr(envs, "MOE_FUSED_EP_KERNEL_IMPL", "v3")
-    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    _setenv(monkeypatch, "MOE_FUSED_EP_KERNEL_IMPL", "v3")
+    _setenv(monkeypatch, "TPU_MOE_SEQUENCE_PARALLEL", "1")
     monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
     monkeypatch.setattr(moe_lowtok_scores, "_ARMED_MAX_TOKENS", 0)
     monkeypatch.setattr(moe_lowtok_scores, "_LAYERS", [])
@@ -404,8 +404,10 @@ def qwen3_5_397b_v3_sp(armed, groups, monkeypatch):
     def engine(dp, tp):
         groups(dp, tp)
         monkeypatch.setattr(v3, "_tensor_parallel_size", lambda: tp)
+        monkeypatch.setattr(v3, "build_ep_mesh", lambda: _mesh(8))
         layer = _layer(slots=4)
         layer.layer_name = "model.layers.0.mlp.experts"
+        layer.global_num_experts = 4 * 8
         layer.moe_config.ep_size = 8
         layer.moe_config.is_sequence_parallel = True
         return layer
@@ -416,8 +418,6 @@ def qwen3_5_397b_v3_sp(armed, groups, monkeypatch):
 def _load(layer):
     """One MoE layer's load sequence in the FP8 method: the few-token
     kernel's prebuild, then fused EP v3's."""
-    from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
-
     moe_lowtok_scores.prebuild(SimpleNamespace(), layer, "silu")
     return _prebuild(layer)
 
@@ -430,9 +430,6 @@ def test_the_engine_loads_while_the_sequence_parallel_threshold_is_unset(
     threshold is 0, so the first sliced bucket is one row, below both layouts'
     step gates: the few-token kernel stays off, and fused EP v3's threshold
     check passes instead of stopping the engine at load."""
-    from vllm_torchtpu.layers.adapter import sequence_parallel
-    from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
-
     layer = qwen3_5_397b_v3_sp(*layout)
     assert sequence_parallel.min_rows() == 0
     assert _load(layer)
@@ -448,9 +445,6 @@ def test_the_few_token_kernel_arms_once_the_threshold_is_set(
     """The control: at the thresholds of a model that follows each step's form
     (64 rows at DP4 x TP2, 512 at TP8) the few-token kernel arms at its EP8
     cap and the two kernels meet."""
-    from vllm_torchtpu.layers.adapter import sequence_parallel
-    from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
-
     layer = qwen3_5_397b_v3_sp(*layout)
     monkeypatch.setattr(
         sequence_parallel, "min_rows", lambda parallel_config=None: threshold
