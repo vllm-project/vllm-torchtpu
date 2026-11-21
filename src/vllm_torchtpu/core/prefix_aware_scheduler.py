@@ -20,9 +20,10 @@ follow-up requests whose prefixes are already cached, and under high HBM
 utilization can evict those cached prefixes before they are reused.
 
 PrefixAwareScheduler inspects the ready queue within a lookahead window and
-prioritizes requests with the fewest uncached prompt tokens. It modifies only
-the admission ordering; memory management, eviction, and preemption policies
-remain untouched.
+prioritizes requests with the fewest uncached prompt tokens. By default it
+modifies only the admission ordering; eviction and preemption policies
+remain untouched. The two decode options below also change how many remote
+loads a step admits and the blocks reserved for them.
 
 On a prefill/decode-disaggregated decode leg (``kv_role`` ``kv_consumer``)
 it also runs decoding requests ahead of partial prefills, promotes the
@@ -30,7 +31,13 @@ warmest request of both waiting queues (``kv_holding_waiting`` and
 ``waiting``), memoises ``find_longest_cache_hit`` across steps, ships long
 prompts to the workers as packed int32, trims re-sent token ids and logs
 per-minute admission telemetry. Every other engine (no KV transfer, a KV
-producer, or ``kv_both``) keeps the warmest-first admission alone.
+producer, or ``kv_both``) keeps the warmest-first admission alone. With the
+``tpu_scheduler`` options (core/scheduler_options.py) a KV consumer also
+prefetches remote KV for waiting requests past a full running set
+(``kv_prefetch``, which lifts ``max_num_active_reqs`` for vLLM's waiting loop
+and enforces the cap itself) and, with decode context parallelism, throttles
+how many remote loads it admits (``decode_inflight_throttle``, through the
+async-load block reservation).
 
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
@@ -52,15 +59,16 @@ from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
 )
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
-from vllm_torchtpu.core import prefix_change_log
+from vllm_torchtpu.core import prefix_change_log, scheduler_options
 from vllm_torchtpu.core.packed_ids import pack_new_request_prompt_ids
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 
 logger = init_logger("vllm." + __name__)
+
 
 _LOG_EVERY = 1000
 # New requests whose prompt has at least this many tokens ship it packed.
@@ -159,9 +167,29 @@ class PrefixAwareScheduler(AsyncScheduler):
             and kv_transfer_config.is_kv_consumer
             and not kv_transfer_config.is_kv_producer
         )
+        options = scheduler_options.get(self.vllm_config)
+        self._promote_warmest_switch = options.promote_warmest
+        if options.kv_prefetch and not (
+            self._is_kv_consumer and self.connector is not None
+        ):
+            raise ValueError(
+                f"additional_config.{scheduler_options.SECTION}.kv_prefetch "
+                "starts remote KV loads; it needs a KV consumer with a KV connector"
+            )
+        if options.decode_inflight_throttle and not (
+            self._is_kv_consumer and self.dcp_world_size > 1
+        ):
+            raise ValueError(
+                f"additional_config.{scheduler_options.SECTION}."
+                "decode_inflight_throttle needs a KV consumer with "
+                "decode_context_parallel_size > 1"
+            )
+        self._kv_prefetch_switch = options.kv_prefetch
+        self._decode_throttle_switch = options.decode_inflight_throttle
         self._memo_xstep = False
         if self._is_kv_consumer:
             self._enable_memo_xstep()
+        self._init_kv_prefetch()
 
         logger.info(
             "PrefixAwareScheduler ACTIVE (window=%d, decode-leg levers=%s, "
@@ -169,6 +197,159 @@ class PrefixAwareScheduler(AsyncScheduler):
             self.WINDOW,
             self._is_kv_consumer,
             self._memo_xstep,
+        )
+
+    # ------------------------------------------------------------------
+    # Decode KV prefetch past a full running set (option
+    # tpu_scheduler.kv_prefetch, on a KV consumer with a connector;
+    # N = _KV_PREFETCH_MAX_HELD).
+    #
+    # vLLM 0.33's waiting loop stops at ``len(running) >=
+    # max_num_active_reqs`` before it asks the connector about the next
+    # waiting request. On a PD consumer that also defers the remote KV pull,
+    # although an async load never joins ``running``: it waits in
+    # WAITING_FOR_REMOTE_KVS holding only KV blocks. So pulls start only
+    # while a slot is free, and a slot that frees while no KV-ready request
+    # is held idles for the whole pull.
+    #
+    # With N > 0 on a KV consumer, schedule() lifts max_num_active_reqs for
+    # the stock loop and enforces the real cap itself, so that at the cap the
+    # loop can only start async loads for the head of ``waiting``:
+    #   * a request that already holds KV (loading or loaded) is skipped
+    #     instead of admitted (_handle_blocked_waiting_request);
+    #   * a request that would run without an async load (local hit,
+    #     preemption resume) stops the scan, so nothing is pulled ahead of it
+    #     and nothing joins ``running`` past the cap
+    #     (_reserve_prefill_lookahead returns 0, the loop breaks);
+    #   * a new load is refused once N requests are held (in
+    #     ``_inflight_prefills`` and not RUNNING), and must otherwise fit in
+    #     the free blocks minus the stock async-load reservation minus
+    #     _KV_PREFETCH_RESERVE_BLOCKS kept for the running set
+    #     (_inflight_prefill_reserved_blocks).
+    # Below the cap the loop is unchanged. When a slot frees, the stock loop
+    # drains ``kv_holding_waiting`` first, so the oldest KV-ready prefetched
+    # request takes it on the same step. Aborts of prefetched requests free
+    # their blocks through the stock WAITING_FOR_REMOTE_KVS path.
+    # ------------------------------------------------------------------
+    _KV_PREFETCH_LOG_INTERVAL_S = 60.0
+    # Requests held for a free slot at most, and blocks kept for the running
+    # set (every decode leg of the validation entries runs 8 and the 512 default).
+    _KV_PREFETCH_MAX_HELD = 8
+    _KV_PREFETCH_RESERVE_BLOCKS = 512
+
+    def _init_kv_prefetch(self) -> None:
+        # __init__ refuses the option on any other leg than a KV consumer
+        # with a connector.
+        self._kv_prefetch_n = (
+            self._KV_PREFETCH_MAX_HELD if self._kv_prefetch_switch else 0
+        )
+        self._kv_prefetch_reserve = self._KV_PREFETCH_RESERVE_BLOCKS
+        # Real admission cap while schedule() runs with prefetch on, else None.
+        self._kv_prefetch_cap: int | None = None
+        self._kv_prefetch_in_waiting = False
+        self._kv_prefetch_cands: set[int] = set()
+        self._kv_prefetch_before: set[int] = set()
+        self._kv_prefetch_started = 0
+        self._kv_prefetch_steps = 0
+        self._kv_prefetch_held_skips = 0
+        self._kv_prefetch_full_refusals = 0
+        self._kv_prefetch_log_t = time.monotonic()
+        if self._kv_prefetch_n:
+            logger.info(
+                "PrefixAwareScheduler: decode KV prefetch past a full running "
+                "set ACTIVE (max_held=%d, reserve_blocks=%d)",
+                self._kv_prefetch_n,
+                self._kv_prefetch_reserve,
+            )
+
+    def _kv_prefetch_at_cap(self) -> bool:
+        """Whether prefetch is enforcing the cap and the running set is full."""
+        cap = self._kv_prefetch_cap
+        if cap is None:
+            return False
+        return len(self.running) + self.num_waiting_for_streaming_input >= cap
+
+    def _kv_prefetch_num_held(self) -> int:
+        """Requests holding KV for an async load (loading or loaded) that have
+        not run yet."""
+        return sum(
+            1 for r in self._inflight_prefills if r.status != RequestStatus.RUNNING
+        )
+
+    def _handle_blocked_waiting_request(self, request: Request) -> bool:
+        if self._kv_prefetch_cap is not None:
+            self._kv_prefetch_in_waiting = True
+            if self._kv_prefetch_at_cap():
+                if self._holds_kv_blocks(request):
+                    # Held for a free slot; never admitted past the cap.
+                    self._kv_prefetch_held_skips += 1
+                    return False
+                self._kv_prefetch_cands.add(id(request))
+        return super()._handle_blocked_waiting_request(request)
+
+    def _kv_prefetch_begin_step(self) -> bool:
+        """Lift the stock loop's cap for this step if prefetch could start a
+        load. Returns whether it did."""
+        if not self._kv_prefetch_n:
+            return False
+        cap = self.max_num_active_reqs
+        num_running = len(self.running) + self.num_waiting_for_streaming_input
+        if num_running >= cap and (
+            not self.waiting or self._kv_prefetch_num_held() >= self._kv_prefetch_n
+        ):
+            # Nothing to prefetch: keep the stock early stop at the cap.
+            return False
+        self._kv_prefetch_cap = cap
+        self._kv_prefetch_in_waiting = False
+        self._kv_prefetch_cands = set()
+        self._kv_prefetch_before = {id(r) for r in self._inflight_prefills}
+        # Any value above the cap works: running never passes the cap here.
+        self.max_num_active_reqs = cap + self._kv_prefetch_n
+        return True
+
+    def _kv_prefetch_end_step(self) -> None:
+        cap = self._kv_prefetch_cap
+        if cap is None:
+            return
+        self.max_num_active_reqs = cap
+        self._kv_prefetch_cap = None
+        self._kv_prefetch_in_waiting = False
+        self._kv_prefetch_steps += 1
+        before = self._kv_prefetch_before
+        cands = self._kv_prefetch_cands
+        self._kv_prefetch_started += sum(
+            1
+            for r in self._inflight_prefills
+            if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            and id(r) not in before
+            and id(r) in cands
+        )
+        self._kv_prefetch_cands = set()
+        self._kv_prefetch_before = set()
+        if len(self.running) > cap:
+            logger.error(
+                "KV prefetch: running=%d exceeds max_num_active_reqs=%d; "
+                "turning KV prefetch off.",
+                len(self.running),
+                cap,
+            )
+            self._kv_prefetch_n = 0
+
+    def _kv_prefetch_maybe_log(self) -> None:
+        now = time.monotonic()
+        if now - self._kv_prefetch_log_t < self._KV_PREFETCH_LOG_INTERVAL_S:
+            return
+        self._kv_prefetch_log_t = now
+        logger.info(
+            "kv-prefetch telemetry: started_at_cap=%d lifted_steps=%d "
+            "held_skips=%d full_refusals=%d held=%d running=%d waiting=%d",
+            self._kv_prefetch_started,
+            self._kv_prefetch_steps,
+            self._kv_prefetch_held_skips,
+            self._kv_prefetch_full_refusals,
+            self._kv_prefetch_num_held(),
+            len(self.running),
+            len(self.waiting) + len(self.kv_holding_waiting),
         )
 
     # ------------------------------------------------------------------
@@ -290,6 +471,48 @@ class PrefixAwareScheduler(AsyncScheduler):
             cast(Any, request)._paw_hit_cache = cached
         return cached
 
+    def _promote_warmest_on(self) -> bool:
+        """``tpu_scheduler.promote_warmest`` (default on)."""
+        return self._promote_warmest_switch
+
+    def _inflight_prefill_reserved_blocks(self) -> int:
+        reserved = self._decode_inflight_reserved_blocks()
+        if self._kv_prefetch_in_waiting and self._kv_prefetch_at_cap():
+            # The stock loop calls this only for an async load, right before
+            # allocating it. At the cap that load is a prefetch.
+            if self._kv_prefetch_num_held() >= self._kv_prefetch_n:
+                self._kv_prefetch_full_refusals += 1
+                return 1 << 30
+            return reserved + self._kv_prefetch_reserve
+        return reserved
+
+    # Decode admission throttle (option tpu_scheduler.decode_inflight_throttle,
+    # on a KV consumer with DCP > 1): refuse a new remote load while this many
+    # loads are in flight; otherwise reserve the largest of vLLM's own
+    # async-load reservation, the reserved-block minimum and the per-sequence
+    # blocks x (running + in flight). Every decode leg of the validation
+    # entries with DCP 4 runs these values.
+    _DECODE_MAX_INFLIGHT_LOADS = 16
+    _DECODE_RESERVED_BLOCKS = 128
+    _DECODE_RESERVED_BLOCKS_PER_SEQ = 8
+
+    def _decode_inflight_reserved_blocks(self) -> int:
+        """The stock async-load reservation, or, with the
+        decode_inflight_throttle option, the decode admission throttle
+        (constants above)."""
+        base = int(super()._inflight_prefill_reserved_blocks() or 0)
+        if not self._decode_throttle_switch:
+            return base
+        num_inflight = len(self._inflight_prefills)
+        num_running = len(self.running)
+        if num_inflight >= self._DECODE_MAX_INFLIGHT_LOADS:
+            return 1 << 30
+        min_reserved = self._DECODE_RESERVED_BLOCKS
+        per_seq_reserved = self._DECODE_RESERVED_BLOCKS_PER_SEQ
+        return max(
+            base, max(min_reserved, per_seq_reserved * (num_running + num_inflight))
+        )
+
     def _note_waiting_stop(self, request: Request, reason: str) -> None:
         """Records why the waiting loop stopped at ``request`` (first stop of
         the step wins; running requests are ignored)."""
@@ -349,8 +572,10 @@ class PrefixAwareScheduler(AsyncScheduler):
 
     def schedule(self, *args, **kwargs):
         if not self._is_kv_consumer:
-            # Off a decode leg: the warmest-first admission alone.
-            self._promote_warmest(self.kv_holding_waiting or self.waiting)
+            # Off a decode leg: the warmest-first admission alone, unless
+            # tpu_scheduler.promote_warmest=false asks for FCFS admission.
+            if self._promote_warmest_on():
+                self._promote_warmest(self.kv_holding_waiting or self.waiting)
             return super().schedule(*args, **kwargs)
         # Decoders first: vLLM schedules ``running`` in list order and a
         # partial prefill takes min(remaining, budget), so a prefill ahead of
@@ -366,10 +591,22 @@ class PrefixAwareScheduler(AsyncScheduler):
         waiting_at_start = len(self.waiting)
         if getattr(self, "_memo_xstep", False):
             self._memo_trim_log()
+        if self._kv_prefetch_n:
+            try:
+                self._kv_prefetch_begin_step()
+            except Exception:
+                logger.exception(
+                    "PrefixAwareScheduler: KV prefetch setup failed; turning "
+                    "KV prefetch off."
+                )
+                self._kv_prefetch_n = 0
+                self._kv_prefetch_end_step()
         try:
             # vLLM's Scheduler walks the waiting queues without a selection
             # hook, so the warmest-first promotion runs here, once per step.
-            self._select_waiting_queue_for_scheduling()
+            # tpu_scheduler.promote_warmest=false skips it: FCFS admission.
+            if self._promote_warmest_on():
+                self._select_waiting_queue_for_scheduling()
             out = super().schedule(*args, **kwargs)
             if getattr(out, "scheduled_new_reqs", None):
                 self._maybe_pack_prompt_ids(out)
@@ -401,6 +638,10 @@ class PrefixAwareScheduler(AsyncScheduler):
                     )
             return out
         finally:
+            if self._kv_prefetch_cap is not None:
+                self._kv_prefetch_end_step()
+            if self._kv_prefetch_n:
+                self._kv_prefetch_maybe_log()
             self._step_wait_event = None
 
     def _waiting_loop_stop_reason(self, out, waiting_at_start: int) -> str:
@@ -420,9 +661,12 @@ class PrefixAwareScheduler(AsyncScheduler):
             return "idle"
         if getattr(out, "preempted_req_ids", None):
             return "preempted"
-        # The admission check the scan stops at.
+        # The admission check the scan stops at. On a KV prefetch step,
+        # max_num_active_reqs is lifted until the step ends; the cap is the
+        # value prefetch saved.
         num_active = len(self.running) + self.num_waiting_for_streaming_input
-        if num_active >= self.max_num_active_reqs:
+        cap = self._kv_prefetch_cap
+        if num_active >= (self.max_num_active_reqs if cap is None else cap):
             return "max_running"
         if (
             getattr(out, "total_num_scheduled_tokens", 0)
@@ -475,9 +719,12 @@ class PrefixAwareScheduler(AsyncScheduler):
         tm = getattr(self, "_tm", None) or {}
         pool_free = self._get_num_free_blocks()
         stops = dict(sorted((tm.get("stops") or {}).items(), key=lambda kv: -kv[1]))
+        # The decode throttle's reservation (vLLM's own without it); not the
+        # prefetch-aware hook, which counts refusals while prefetch is armed.
+        reserved = self._decode_inflight_reserved_blocks()
         text = (
             f"stop={stop} "
-            f"pool_free={pool_free} "
+            f"inflight_reserved={reserved} pool_free={pool_free} "
             f"min_steps={tm.get('steps', 0)} "
             f"min_small_steps_waiting={tm.get('small_steps_waiting', 0)} "
             f"min_stops={format_counts(stops)}"
@@ -510,6 +757,15 @@ class PrefixAwareScheduler(AsyncScheduler):
         num_computed_tokens: int,
         num_new_tokens: int,
     ) -> int:
+        if self._kv_prefetch_in_waiting and self._kv_prefetch_at_cap():
+            # KV prefetch: this waiting request would join ``running`` without
+            # an async load, past the cap. vLLM 0.33 requeues a request whose
+            # chunk comes out 0 and keeps scanning; putting the real cap back
+            # ends the scan, so nothing is pulled ahead of this request.
+            cap = self._kv_prefetch_cap
+            if cap is not None:
+                self.max_num_active_reqs = cap
+            return 0
         reserved = super()._reserve_prefill_lookahead(
             request, num_computed_tokens, num_new_tokens
         )

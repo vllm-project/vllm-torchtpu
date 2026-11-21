@@ -1,0 +1,93 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""``tpu_scheduler.promote_warmest``: warmest-first promotion of the waiting
+queues can be turned off (FCFS admission). Default on.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.request_queue import FCFSRequestQueue
+
+from vllm_torchtpu.core import scheduler_options
+from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
+
+# ---------------- tpu_scheduler.promote_warmest ----------------
+
+
+@pytest.mark.parametrize("val,expect", [(None, True), (True, True), (False, False)])
+def test_promote_switch(val, expect):
+    section = {} if val is None else {"promote_warmest": val}
+    cfg = SimpleNamespace(additional_config={"tpu_scheduler": section})
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s._promote_warmest_switch = scheduler_options.get(cfg).promote_warmest
+    assert s._promote_warmest_on() is expect
+
+
+@pytest.mark.parametrize("on", [True, False])
+def test_schedule_promotes_only_when_on(monkeypatch, on):
+    calls = []
+    monkeypatch.setattr(AsyncScheduler, "schedule", lambda self, *a, **k: "out")
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    # On a decode leg (a KV consumer) both waiting queues are promoted.
+    s._is_kv_consumer = True
+    s.running = []
+    s.waiting = FCFSRequestQueue()
+    s.kv_holding_waiting = FCFSRequestQueue()
+    s._inflight_prefills = set()
+    s._decode_throttle_switch = False
+    s._kv_prefetch_n = 0
+    s._kv_prefetch_cap = None
+    s._promote_warmest_switch = on
+    s._select_waiting_queue_for_scheduling = lambda: calls.append(1)
+    assert s.schedule() == "out"
+    assert calls == ([1] if on else [])
+
+
+@pytest.mark.parametrize("on", [True, False])
+@pytest.mark.parametrize("holding", [False, True], ids=["waiting", "kv_holding"])
+def test_schedule_off_a_decode_leg_promotes_only_when_on(monkeypatch, on, holding):
+    """Any other engine (no KV transfer, a KV producer, kv_both) promotes the
+    first non-empty waiting queue, kv_holding_waiting before waiting as vLLM
+    drains them, and the switch turns that off too."""
+    promoted = []
+    monkeypatch.setattr(AsyncScheduler, "schedule", lambda self, *a, **k: "out")
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s._is_kv_consumer = False
+    s.waiting = FCFSRequestQueue()
+    s.waiting.append(object())
+    s.kv_holding_waiting = FCFSRequestQueue()
+    if holding:
+        s.kv_holding_waiting.append(object())
+    s._promote_warmest_switch = on
+    s._promote_warmest = promoted.append
+    assert s.schedule() == "out"
+    first = s.kv_holding_waiting if holding else s.waiting
+    assert [q is first for q in promoted] == ([True] if on else [])
+
+
+def test_init_reads_the_option(monkeypatch):
+    def fake_init(self, *args, **kwargs):
+        self.vllm_config = SimpleNamespace(
+            kv_transfer_config=None,
+            additional_config={"tpu_scheduler": {"promote_warmest": False}},
+        )
+        self.connector = None
+        self.kv_cache_manager = MagicMock()
+
+    monkeypatch.setattr(AsyncScheduler, "__init__", fake_init)
+    monkeypatch.setattr(PrefixAwareScheduler, "_enable_memo_xstep", lambda self: None)
+    assert PrefixAwareScheduler()._promote_warmest_on() is False

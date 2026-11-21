@@ -232,4 +232,8 @@ legs:
       USE_MOE_SPARSE_CORE: "1"
       VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: "1"
       VLLM_XLA_CHECK_RECOMPILATION: "0"
-    additional_config: {}
+    additional_config:
+      tpu_scheduler:
+        promote_warmest: false
+        kv_prefetch: true
+        decode_inflight_throttle: true

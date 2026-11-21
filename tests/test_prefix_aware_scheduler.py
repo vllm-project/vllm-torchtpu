@@ -20,6 +20,7 @@ import pytest
 from vllm.config import KVTransferConfig
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.core import prefix_change_log
@@ -62,6 +63,7 @@ def _make_scheduler(
     s.policy = SchedulingPolicy.FCFS
     s.WINDOW = window
     s._is_kv_consumer = False
+    s._promote_warmest_switch = True
     s._paw_n = 0
     s._paw_cold_tokens = 0
     s._paw_prompt_tokens = 0
@@ -316,6 +318,12 @@ def _make_step_scheduler(running, monkeypatch, budget=8192):
     s.waiting = FCFSRequestQueue()
     s.kv_holding_waiting = FCFSRequestQueue()
     s.max_num_scheduled_tokens = budget
+    # Read by the admission telemetry's inflight_reserved field.
+    s._inflight_prefills = set()
+    s._decode_throttle_switch = False
+    s._kv_prefetch_n = 0
+    s._kv_prefetch_cap = None
+    s._promote_warmest_switch = True
     return s, seen
 
 
@@ -371,6 +379,9 @@ def test_waiting_loop_stop_reason_and_admission_telemetry():
     s.num_waiting_for_streaming_input = 0
     s.deferred_waiting = set()
     s.block_size = 640
+    s._inflight_prefills = set()
+    s._decode_throttle_switch = False
+    s._kv_prefetch_cap = None
     out = SimpleNamespace(total_num_scheduled_tokens=640, num_scheduled_tokens={})
 
     s._step_wait_event = None
@@ -393,6 +404,11 @@ def test_waiting_loop_stop_reason_and_admission_telemetry():
     s.deferred_waiting = set()
     s.running = [object()] * 32
     assert s._waiting_loop_stop_reason(out, 1) == "max_running"
+    # On a KV prefetch step the cap is lifted (here by 8) until the step
+    # ends; a full running set still stops the loop at the cap.
+    s._kv_prefetch_cap, s.max_num_active_reqs = 32, 40
+    assert s._waiting_loop_stop_reason(out, 1) == "max_running"
+    s._kv_prefetch_cap, s.max_num_active_reqs = None, 32
     s.running = []
     s.waiting = []
     assert s._waiting_loop_stop_reason(out, 0) == "idle"
@@ -409,6 +425,7 @@ def test_waiting_loop_stop_reason_and_admission_telemetry():
     s._record_step_telemetry(out, 2, "drained")
     text = s._admission_telemetry("lookahead0")
     assert "stop=lookahead0" in text
+    assert "inflight_reserved=0" in text
     assert "min_steps=4 min_small_steps_waiting=2" in text
     assert "min_stops=lookahead0:2,drained:1" in text
     # The per-minute counters restart after each telemetry line.
@@ -416,12 +433,33 @@ def test_waiting_loop_stop_reason_and_admission_telemetry():
     assert "min_steps=0" in text and "min_stops=-" in text
 
 
+def test_admission_telemetry_reads_the_throttle_not_the_prefetch_hook(monkeypatch):
+    """With KV prefetch at the cap and its held slots full, the prefetch-aware
+    hook refuses loads and counts the refusal; the telemetry must report the
+    throttle's reservation and count nothing."""
+    monkeypatch.setattr(Scheduler, "_inflight_prefill_reserved_blocks", lambda self: 0)
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s.running = []
+    s.num_waiting_for_streaming_input = 0
+    s._decode_throttle_switch = False
+    s._inflight_prefills = [
+        SimpleNamespace(status=RequestStatus.WAITING_FOR_REMOTE_KVS)
+    ]
+    s._kv_prefetch_in_waiting = True
+    s._kv_prefetch_cap = 0
+    s._kv_prefetch_n = 1
+    s._kv_prefetch_full_refusals = 0
+    assert s._inflight_prefill_reserved_blocks() == 1 << 30
+    assert s._kv_prefetch_full_refusals == 1
+
+    assert "inflight_reserved=0 " in s._admission_telemetry("budget")
+    assert s._kv_prefetch_full_refusals == 1
+
+
 def test_local_prefix_hit_forwards_max_cache_hit_length(monkeypatch):
     """vLLM 0.33 passes ``max_cache_hit_length`` (an aux-output connector's
     bound); the override must take it, pass it on, and never reuse a memo
     computed for a different bound."""
-    from vllm.v1.core.sched.scheduler import Scheduler
-
     seen = []
 
     def base_hit(self, request, max_cache_hit_length=None):
@@ -451,7 +489,9 @@ def test_local_prefix_hit_forwards_max_cache_hit_length(monkeypatch):
 
 def _init_with(monkeypatch, kv_transfer_config, calls=None):
     def fake_init(self, *args, **kwargs):
-        self.vllm_config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
+        self.vllm_config = SimpleNamespace(
+            kv_transfer_config=kv_transfer_config, additional_config=None
+        )
         self.connector = None if kv_transfer_config is None else object()
         self.kv_cache_manager = MagicMock()
 
