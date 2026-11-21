@@ -170,6 +170,33 @@ class Config:
         over the sparse core's program size, keeps the per-row fetch.
         None (the default): sorted_rows_by_shape decides from the
         shard's experts and tokens.
+      combine_real_tokens: the combine gathers and sums only the real
+        tokens' pairs (padded to a sublane tile) rather than the routing
+        message's whole token padding (a multiple of 128 tokens), and
+        reads the gathered rows without copying the real prefix out.
+        The same per-token sum, so the output is bit-identical; it pays
+        off when a shard has far fewer tokens than the message holds.
+      sort_index_compare: the sorted-rows gather's live-row mask as one
+        compare of every row against the (expert, shard) runs, instead
+        of two scatter-adds and a running sum. The same mask.
+      reorder_chain: (sorted rows) the dispatch chain's index-independent
+        work is formed as programs of its own so the compiler can run it
+        in the sparse cores' waits: the sort's live-row fill and gathered
+        prefix during the row-tables scatter, the combine's pair index
+        before the FFN kernel; and the exchange's finish is ordered after
+        the shard tables instead of after the scatter, so its waits overlap
+        the scatter. Only the schedule changes: the same values.
+      dense_slots: (adapter binding) calls of at most dense_slots_max_tokens
+        rows per shard run the dense-slots layer
+        (models/qwen3_5/kernels/dense_slots.py) instead: every result row
+        lands at a row fixed by the routing alone, so no packed tables,
+        sparse-core scatter or sort; one program per shard exchanges the
+        indices and rows, builds the tables, streams the weights of only the
+        local experts with routed rows and sums the arrivals in VMEM. bf16
+        result rows; the same per-row math as this layer with result_rows
+        "bf16".
+      dense_slots_max_tokens: the largest rows per shard dense_slots takes,
+        a positive multiple of 8.
     """
 
     result_slots: int = RESULT_SLOTS_DEFAULT
@@ -195,6 +222,11 @@ class Config:
     tables_zero_words: int = TABLES_ZERO_WORDS_DEFAULT
     weight_dma_priority: int = WEIGHT_DMA_PRIORITY_DEFAULT
     sorted_rows: bool | None = None
+    combine_real_tokens: bool = False
+    sort_index_compare: bool = False
+    reorder_chain: bool = False
+    dense_slots: bool = False
+    dense_slots_max_tokens: int = 64
 
     @property
     def token_rows_block(self):
@@ -341,6 +373,11 @@ class Config:
             raise ValueError(
                 f"tables_zero_words {self.tables_zero_words}: a "
                 f"whole number of {SUBLANES * LANES}-word tiles"
+            )
+        if self.dense_slots_max_tokens <= 0 or self.dense_slots_max_tokens % 8:
+            raise ValueError(
+                f"dense_slots_max_tokens {self.dense_slots_max_tokens}: a "
+                "positive multiple of 8"
             )
         if self.weight_dma_priority not in WEIGHT_DMA_PRIORITIES:
             raise ValueError(

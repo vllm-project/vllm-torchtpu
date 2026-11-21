@@ -52,6 +52,8 @@ these export and padding constraints:
   in every collective.
 """
 
+import dataclasses
+from collections.abc import Mapping
 from typing import Any
 
 import jax
@@ -93,6 +95,53 @@ TILE_ROWS = 128
 WEIGHT_FORMAT = "fp8"
 
 
+# Kernel settings beyond Config.for_shape, per Qwen3.5 decode layout
+# (data_parallel_size, tensor_parallel_size). (4, 2) is what the DP4 x TP2
+# decode legs ran: the combine over real tokens, the sort-index live mask, the
+# reordered program chain, and the dense-slots layer for calls of at most
+# Config.dense_slots_max_tokens rows per shard.
+# Other models, and other layouts, keep for_shape's settings: these paths were
+# validated on Qwen3.5 only.
+QWEN3_5_CONFIG_BY_LAYOUT: dict[tuple[int, int], dict[str, Any]] = {
+    (4, 2): {
+        "combine_real_tokens": True,
+        "sort_index_compare": True,
+        "reorder_chain": True,
+        "dense_slots": True,
+    },
+}
+# The overrides prebuild_fused_moe_ep selected for this process, applied by
+# served_config; empty until then.
+_CONFIG_OVERRIDES: dict[str, Any] = {}
+
+
+def layout_overrides(vllm_config: Any) -> dict[str, Any]:
+    """The Qwen3.5 layout table's entry for this engine: empty for another
+    model, a layout without an entry, or no engine config (None, or a config
+    without a model yet)."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+    from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
+
+    if vllm_config is None or vllm_config.model_config is None:
+        return {}
+    if not qwen3_5_settings.is_qwen3_5(vllm_config.model_config):
+        return {}
+    layout = sequence_parallel.parallel_layout(vllm_config.parallel_config)
+    return dict(QWEN3_5_CONFIG_BY_LAYOUT.get(layout, {})) if layout else {}
+
+
+def apply_config_overrides(config: Config, overrides: Mapping[str, Any]) -> Config:
+    """`config` with the named fields replaced. Empty: `config` unchanged. An
+    unknown field, or a value the Config refuses, raises."""
+    if not overrides:
+        return config
+    known = {f.name for f in dataclasses.fields(Config)}
+    unknown = sorted(set(overrides) - known)
+    if unknown:
+        raise ValueError(f"fused EP v3: unknown Config fields {unknown}")
+    return dataclasses.replace(config, **overrides)
+
+
 def served_config(
     *, hidden: int, inter: int, experts_per_shard: int, top_k: int, log: bool = True
 ) -> Config:
@@ -103,6 +152,7 @@ def served_config(
     config = Config.for_shape(
         hidden=hidden, inter=inter, experts_per_shard=experts_per_shard, top_k=top_k
     )
+    config = apply_config_overrides(config, _CONFIG_OVERRIDES)
     if not log:
         return config
     logger.info_once(
@@ -148,9 +198,23 @@ def run_moe_v3(
             f"the latest kernel splits the experts over the mesh axis named "
             f"{MESH_AXIS!r}; the adapter's mesh has {mesh.axis_names}"
         )
+    ep = mesh.shape[MESH_AXIS]
     config = served_config(
         hidden=hidden, inter=inter, experts_per_shard=experts_per_shard, top_k=topk
     )
+
+    # The dense-slots layer (models/qwen3_5/kernels/dense_slots.py): off by
+    # default; the Qwen3.5 layout table turns it on at DP4 x TP2 for calls of
+    # at most Config.dense_slots_max_tokens rows per shard, a multiple of 8
+    # (every sequence-parallel step the fused EP gate admits there), and
+    # other calls keep the v3 layer.
+    dense_on, dense_max = config.dense_slots, config.dense_slots_max_tokens
+    if dense_on:
+        logger.info_once(
+            "Fused EP MoE: dense-slots layer ON for calls of <= %d rows per "
+            "shard; larger calls keep the v3 layer",
+            dense_max,
+        )
 
     def run_moe(x, w1, w2, w1_scale, w2_scale, gating, rank, valid_tokens):
         # The torch bridge exports the whole op as one jitted function, and
@@ -163,6 +227,40 @@ def run_moe_v3(
         # A row with a NaN logit routes nowhere, as in main's fused EP v2
         # kernel, whose softmax leaves such a row no finite score; rows past
         # valid_tokens route nowhere without it.
+        if (
+            dense_on
+            and x.shape[0] // ep <= dense_max
+            and (x.shape[0] // ep) % 8 == 0
+            and activation == "silu"
+            and WEIGHT_FORMAT == "fp8"
+        ):
+            logger.info_once(
+                "Fused EP MoE: dense-slots layer traced for %d rows (%d per shard)",
+                x.shape[0],
+                x.shape[0] // ep,
+            )
+            # Only the Qwen3.5 layout table turns the dense-slots layer on,
+            # and the layer lives with the Qwen3.5 kernels.
+            from vllm_torchtpu.models.qwen3_5.kernels import dense_slots
+
+            return dense_slots.dense_slots_moe(
+                x,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                gating,
+                top_k=topk,
+                renormalize=renormalize,
+                mesh=mesh,
+                tile_rows=TILE_ROWS,
+                config=config,
+                experts_per_shard=experts_per_shard,
+                shard_index=rank,
+                valid_tokens=valid_tokens,
+                drop_nan_rows=True,
+                side_effects=False,
+            )
         return fused_ep_moe(
             x,
             w1,
@@ -536,10 +634,14 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
     is forbidden inside a compiled forward: mapping EP ranks to TPU device ids
     is an `all_gather_object`, and a `Mesh` cannot survive Dynamo's tracing.
     """
-    global _EP_SIZE, _OP_CONTRACT
+    global _EP_SIZE, _OP_CONTRACT, _CONFIG_OVERRIDES
     layer._tpu_fused_ep_eligible = False
     if not envs.USE_MOE_FUSED_EP_KERNEL:
         return
+    from vllm.config import get_current_vllm_config_or_none
+
+    # Under the loader's config context: the Qwen3.5 layout table's entry.
+    _CONFIG_OVERRIDES = layout_overrides(get_current_vllm_config_or_none())
     # Under tensor parallelism the kernel arms for the sequence-parallel steps,
     # where each rank holds its own slice of the batch; a replicated step
     # stays off the kernel (`_fused_kernel_takes` in the FP8 method), since

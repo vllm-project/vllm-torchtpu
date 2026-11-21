@@ -779,7 +779,9 @@ def qwen3_5_397b_v3_sp(armed, groups, monkeypatch):
             architectures=["Qwen3_5MoeForConditionalGeneration"],
             hf_text_config=SimpleNamespace(**hooks._CALIBRATED_SHAPE),
         ),
-        parallel_config=SimpleNamespace(enable_expert_parallel=True),
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True, data_parallel_size=1, tensor_parallel_size=1
+        ),
     )
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
 

@@ -211,7 +211,10 @@ def test_replicated_sequence_parallel_rows_under_data_parallelism(
         assert len(result) == count
         for actual, expected in zip(result, tensors):
             torch.testing.assert_close(actual, torch.cat([expected, expected + 10]))
-        assert dp_group.all_gather.call_count == count
+        # Hidden rows and router logits of one dtype travel in one packed
+        # gather under DP > 1 (lossless; see the packed-gather tests).
+        packed = method == "dispatch_router_logits"
+        assert dp_group.all_gather.call_count == (1 if packed else count)
         dp_group.reduce_scatter.assert_not_called()
         tp_group.all_reduce.assert_not_called()
     ep_group.all_reduce.assert_not_called()
@@ -252,3 +255,82 @@ def test_combine_goes_through_the_small_collective_bridge(monkeypatch, communica
     assert communicator.combine(x) is group.reduce_scatter.return_value
     assert bridge.call_args.args[0] is x
     group.reduce_scatter.assert_called_once_with(x, dim=0)
+
+
+def _replicated_dp4(monkeypatch):
+    ep_group = Mock(world_size=8)
+    dp_group = Mock(world_size=4)
+    monkeypatch.setattr(comm, "get_ep_group", lambda: ep_group)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: dp_group)
+    monkeypatch.setattr(comm, "get_tp_group", lambda: Mock(world_size=2))
+    monkeypatch.setattr(comm.sequence_parallel, "_ACTIVE", False)
+    # Four engines: engine k holds its rows scaled by k + 1 (elementwise, so a
+    # packed and an unpacked gather see the same per-engine values).
+    dp_group.all_gather.side_effect = lambda x, dim: torch.cat(
+        [x * (k + 1) for k in range(4)], dim=dim
+    )
+    return dp_group
+
+
+@pytest.mark.parametrize("rows", [16, 28])
+def test_packed_router_gather_is_one_all_gather_with_identical_values(
+    monkeypatch, communicator, rows
+):
+    # DP4 x TP2 replicated step (B 64: 16 rows per engine x 4 MTP rows): the
+    # hidden rows and router logits go in one DP all-gather, and the split
+    # returns the tensors two gathers would (the reference, packing off).
+    gen = torch.Generator().manual_seed(rows)
+    hidden = torch.randn(rows * 4, 4096, generator=gen).to(torch.bfloat16)
+    logits = torch.randn(rows * 4, 512, generator=gen).to(torch.bfloat16)
+
+    with monkeypatch.context() as unpacked:
+        unpacked.setattr(comm, "_packs_router_gather", lambda h, lg: False)
+        dp_group = _replicated_dp4(monkeypatch)
+        ref_h, ref_l = communicator.dispatch_router_logits(
+            hidden, logits, is_sequence_parallel=True
+        )
+        assert dp_group.all_gather.call_count == 2
+
+    dp_group = _replicated_dp4(monkeypatch)
+    got_h, got_l = communicator.dispatch_router_logits(
+        hidden, logits, is_sequence_parallel=True
+    )
+    assert dp_group.all_gather.call_count == 1
+    (packed_in,), kwargs = dp_group.all_gather.call_args
+    assert kwargs == {"dim": 0}
+    assert packed_in.shape == (rows * 4, 4096 + 512)
+    assert got_h.shape == ref_h.shape == (rows * 16, 4096)
+    assert got_l.shape == ref_l.shape == (rows * 16, 512)
+    assert got_h.dtype == got_l.dtype == torch.bfloat16
+    assert torch.equal(got_h, ref_h)
+    assert torch.equal(got_l, ref_l)
+
+
+@pytest.mark.parametrize(
+    "logits_dtype,dp_size,active",
+    [(torch.float32, 4, False), (torch.bfloat16, 1, False), (torch.bfloat16, 4, True)],
+)
+def test_packed_router_gather_only_on_replicated_dp_same_dtype(
+    monkeypatch, communicator, logits_dtype, dp_size, active
+):
+    # Mixed dtypes keep two gathers; a single engine and a sliced (SP-active)
+    # step never take the packed path.
+    dp_group = _replicated_dp4(monkeypatch)
+    dp_group.world_size = dp_size
+    ep_group = Mock(world_size=8)
+    ep_group.all_gather.side_effect = lambda x, dim: torch.cat([x, x], dim=dim)
+    monkeypatch.setattr(comm, "get_ep_group", lambda: ep_group)
+    monkeypatch.setattr(comm.sequence_parallel, "_ACTIVE", active)
+    hidden = torch.ones(8, 16, dtype=torch.bfloat16)
+    logits = torch.ones(8, 4, dtype=logits_dtype)
+    h, lg = communicator.dispatch_router_logits(
+        hidden, logits, is_sequence_parallel=True
+    )
+    assert lg.dtype == logits_dtype and lg.shape[-1] == 4 and h.shape[-1] == 16
+    if active:
+        assert ep_group.all_gather.call_count == 2
+    elif dp_size == 1:
+        assert h is hidden and lg is logits
+        dp_group.all_gather.assert_not_called()
+    else:
+        assert dp_group.all_gather.call_count == 2
