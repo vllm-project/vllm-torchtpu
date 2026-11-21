@@ -151,6 +151,7 @@ if TYPE_CHECKING:
     TPU_PREFIX_AWARE_SHORT_PROMPTS: str = "off"
     TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX: bool = False
     TPU_PREFIX_AWARE_SHORTS_TAKE_OLDEST_CHUNK: bool = False
+    TPU_PREFIX_AWARE_RANK_WITH_TIER: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -1585,6 +1586,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PREFIX_AWARE_SHORTS_TAKE_OLDEST_CHUNK": env_bool(
         "TPU_PREFIX_AWARE_SHORTS_TAKE_OLDEST_CHUNK"
     ),
+    # Schedulers built on ShortPromptsFirstScheduler (PrefixAwareScheduler,
+    # ShortPrefillFirstScheduler): the waiting queue counts a prompt's prefix
+    # in the KV connector's tier as cached, as admission does, besides its
+    # prefix in HBM (core/short_prompts_first.py). Exact: only the admission
+    # order changes. Off ranks a prefix that left HBM for the tier as
+    # uncached. Needs an offloading KV connector.
+    "TPU_PREFIX_AWARE_RANK_WITH_TIER": env_bool("TPU_PREFIX_AWARE_RANK_WITH_TIER"),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),

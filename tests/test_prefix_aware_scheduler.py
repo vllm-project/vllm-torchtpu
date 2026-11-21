@@ -94,6 +94,7 @@ def _make_scheduler(
     s._paw_scoring_broken = False
     s._init_tier_warmth(tier_warmth)
     s.connector = connector
+    s._tier = None
 
     coordinator = MagicMock()
 

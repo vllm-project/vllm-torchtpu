@@ -281,6 +281,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
     # Offloading tier entries and hit length only.
     "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS",
+    # Order of the scheduler's waiting queue only.
+    "TPU_PREFIX_AWARE_RANK_WITH_TIER",
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
