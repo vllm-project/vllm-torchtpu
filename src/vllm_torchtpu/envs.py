@@ -386,6 +386,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DCP_GATE_IN_COMBINE: bool = False
     VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED: bool = False
     VLLM_TPU_QSA_PREFILL_ALIGN_GATHER: bool = False
+    VLLM_TPU_QSA_PREFILL_ALIGN_DMA: bool = False
     VLLM_TPU_QSA_DCP_SPLIT_LSE: bool = False
     VLLM_TPU_QSA_DCP_PACK_LISTS: bool = False
     VLLM_TPU_QSA_DCP_META_PARTITION: bool = False
@@ -2516,6 +2517,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # .at[slots].set scatter (8K-row TP8 step: scatter_fusion bf16[8192,3,256]
     # 0.97 ms per QSA layer). Bit-identical.
     "VLLM_TPU_QSA_PREFILL_ALIGN_GATHER": env_bool("VLLM_TPU_QSA_PREFILL_ALIGN_GATHER"),
+    # QSA prefill block alignment: move the [rows, heads, dim] query into the
+    # aligned layout and the attention output back to token order as one DMA
+    # per contiguous row run (row_segments.copy_row_segments) instead of a
+    # per-row scatter / gather. Bit-identical; inputs of fewer than 3
+    # dimensions follow VLLM_TPU_QSA_PREFILL_ALIGN_GATHER.
+    "VLLM_TPU_QSA_PREFILL_ALIGN_DMA": env_bool("VLLM_TPU_QSA_PREFILL_ALIGN_DMA"),
     # Main-KV DCP attention: route the partial output and its lse as two arrays
     # instead of one [.., D + 1] channel (a padded f32 concat plus the slices
     # that undo it at every 8K prefill step); same values.

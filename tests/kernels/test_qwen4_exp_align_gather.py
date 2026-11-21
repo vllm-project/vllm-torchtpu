@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""VLLM_TPU_QSA_PREFILL_ALIGN_GATHER: the block-aligned layout built by a
-block gather is bit-identical to the ``.at[slots].set`` scatter layout.
+"""VLLM_TPU_QSA_PREFILL_ALIGN_GATHER / _ALIGN_DMA: the block-aligned layout
+built by a block gather or by row-segment DMAs (and the DMA back to token
+order) is bit-identical to the ``.at[slots].set`` scatter layout.
 
 Part 1 swaps the block-sparse core for a recorder and compares the aligned
 query / blocks / lengths / page_table it receives, plus the wrapper output,
@@ -22,8 +23,11 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import sorted_search
 from vllm_torchtpu.kernels.qwen4_exp import block_sparse_gqa_prefill as bsp
+from vllm_torchtpu.kernels.qwen4_exp.row_segments import copy_row_segments
 
-COMBOS = list(itertools.product([False, True], [False, True]))  # (gather, sorted)
+# (gather, sorted, dma)
+COMBOS = [(g, s, False) for g, s in itertools.product([False, True], [False, True])]
+COMBOS += [(False, False, True), (True, True, True)]
 
 
 def _bits(x):
@@ -41,9 +45,10 @@ def _assert_same(a, b):
     np.testing.assert_array_equal(a, b)
 
 
-def _set_flags(monkeypatch, gather, sorted_mask):
+def _set_flags(monkeypatch, gather, sorted_mask, dma=False):
     monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_ALIGN_GATHER", gather)
     monkeypatch.setattr(envs, "VLLM_TPU_SORTED_SEARCH_MASK", sorted_mask)
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_ALIGN_DMA", dma)
     jax.clear_caches()
 
 
@@ -115,12 +120,14 @@ MIXES = [
 @pytest.mark.parametrize("query_block", [32, 256])
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("mix", MIXES, ids=lambda m: f"{len(m[0])}req-{m[1]}tok")
-def test_aligned_inputs_and_output_match(recorder, monkeypatch, mix, query_block, return_lse):
+def test_aligned_inputs_and_output_match(
+    recorder, interpret, monkeypatch, mix, query_block, return_lse
+):
     real, tokens = mix
     query, gate, blocks, lengths, table, starts = _inputs(real, tokens, seed=len(real) + tokens)
     results = {}
-    for gather, sorted_mask in COMBOS:
-        _set_flags(monkeypatch, gather, sorted_mask)
+    for gather, sorted_mask, dma in COMBOS:
+        _set_flags(monkeypatch, gather, sorted_mask, dma)
         recorder.clear()
         out = jax.jit(
             lambda q, b, n, t, s: bsp.block_sparse_gqa_attention(
@@ -130,8 +137,10 @@ def test_aligned_inputs_and_output_match(recorder, monkeypatch, mix, query_block
         )(query, blocks, lengths, table, starts)
         jax.effects_barrier()
         assert len(recorder) == 1, len(recorder)
-        results[gather, sorted_mask] = (recorder[0], jax.tree.leaves(out[:2] if return_lse else out))
-    base_inputs, base_out = results[False, False]
+        results[gather, sorted_mask, dma] = (
+            recorder[0], jax.tree.leaves(out[:2] if return_lse else out)
+        )
+    base_inputs, base_out = results[False, False, False]
     for key, (inputs, out) in results.items():
         for a, b in zip(inputs, base_inputs):
             _assert_same(a, b)
@@ -188,8 +197,32 @@ def test_aligned_blocks_vs_scatter(query_block, extra_blocks):
             jnp.asarray(starts), jnp.asarray(offsets), jnp.asarray(real, jnp.int32),
             tokens, query_block, max_tokens,
         )
-        got = bsp._gather_aligned_blocks(jnp.asarray(data), first, count, query_block, -1)
+        got = bsp._gather_aligned_blocks(
+            jnp.asarray(data), first, count, query_block, -1
+        )
         np.testing.assert_array_equal(np.asarray(got), want)
+
+
+def test_copy_row_segments(interpret):
+    """Segments land exactly; rows outside every segment keep dst's values."""
+    rng = np.random.default_rng(11)
+    for _ in range(20):
+        rows, out_rows = (int(x) for x in rng.integers(1, 300, 2))
+        src = jnp.asarray(rng.standard_normal((rows, 3, 8)), jnp.bfloat16)
+        dst = jnp.full((out_rows, 3, 8), 7, jnp.bfloat16)
+        want = np.asarray(dst).copy()
+        src_row, dst_row, length, d = [], [], [], 0
+        while d < out_rows and len(length) < 6:
+            n = min(int(rng.integers(0, 65)), out_rows - d, rows)
+            s0 = int(rng.integers(0, rows - n + 1))
+            want[d : d + n] = np.asarray(src)[s0 : s0 + n]
+            src_row.append(s0), dst_row.append(d), length.append(n)
+            d += n + int(rng.integers(0, 5))
+        got = copy_row_segments(
+            src, dst, jnp.asarray(src_row), jnp.asarray(dst_row), jnp.asarray(length),
+            max_length=64,
+        )
+        _assert_same(got, want)
 
 
 # ---- Part 2: the real kernel in interpret mode, DCP ranks 0 and 1 ----
@@ -247,8 +280,8 @@ def test_kernel_output_matches(interpret, monkeypatch, pieces, extra, dcp_rank):
     if dcp_rank is not None:
         kw = {"dcp": (jnp.asarray([dcp_rank], jnp.int32), D), "return_lse": True}
     results = []
-    for gather, sorted_mask in COMBOS:
-        _set_flags(monkeypatch, gather, sorted_mask)
+    for gather, sorted_mask, dma in COMBOS:
+        _set_flags(monkeypatch, gather, sorted_mask, dma)
         out = jax.jit(lambda q, c: bsp.block_sparse_gqa_attention(
             q, gate, blocks, lengths, table, c, starts, kv_heads=1, ratio=RATIO,
             k_scale=0.5, v_scale=2.0, query_block=256, kv_tile=PAGE, query_tile=256,

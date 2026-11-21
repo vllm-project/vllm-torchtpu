@@ -17,6 +17,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.batched_rpa import utils
 from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import PAIRED_PAGE_VMEM_MIB
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
+from vllm_torchtpu.kernels.qwen4_exp.row_segments import copy_row_segments
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -2013,18 +2014,43 @@ def block_sparse_gqa_attention(
         valid = jnp.arange(len(query)) < starts[-1]
         slots = jnp.where(valid, offsets[req] + positions, max_tokens)
 
-        if envs.VLLM_TPU_QSA_PREFILL_ALIGN_GATHER:
+        dma = envs.VLLM_TPU_QSA_PREFILL_ALIGN_DMA
+        if dma or envs.VLLM_TPU_QSA_PREFILL_ALIGN_GATHER:
             first, count = _aligned_block_sources(
                 starts, offsets, real, len(query), query_block, max_tokens
             )
 
-            def align(array, fill):
+        def align(array, fill):
+            shape = (max_tokens, *array.shape[1:])
+            if dma and array.ndim >= 3:
+                block_rows = jnp.arange(len(first), dtype=jnp.int32) * query_block
+                return copy_row_segments(
+                    array,
+                    jnp.full(shape, fill, array.dtype),
+                    first,
+                    block_rows,
+                    count,
+                    max_length=query_block,
+                )
+            if envs.VLLM_TPU_QSA_PREFILL_ALIGN_GATHER:
                 return _gather_aligned_blocks(array, first, count, query_block, fill)
-        else:
+            return jnp.full(shape, fill, array.dtype).at[slots].set(array, mode="drop")
 
-            def align(array, fill):
-                shape = (max_tokens, *array.shape[1:])
-                return jnp.full(shape, fill, array.dtype).at[slots].set(array, mode="drop")
+        back = jnp.minimum(slots, max_tokens - 1)
+
+        def realign(rows):
+            if dma and rows.ndim >= 3:
+                # Each request's rows back to its tokens; the rest read row
+                # max_tokens - 1, as ``back`` does.
+                rest = jnp.broadcast_to(
+                    rows[max_tokens - 1], (len(query), *rows.shape[1:])
+                )
+                count = jnp.minimum(real, max_tokens - offsets[:-1])
+                count = jnp.clip(jnp.minimum(count, len(query) - starts[:-1]), 0)
+                return copy_row_segments(
+                    rows, rest, offsets[:-1], starts[:-1], count, max_length=len(query)
+                )
+            return rows[back]
 
         output = block_sparse_gqa_prefill(
             align(query, 0),
@@ -2041,16 +2067,15 @@ def block_sparse_gqa_attention(
             bf16_io=True,
             **{**offset, **extra},
         )
-        back = jnp.minimum(slots, max_tokens - 1)
         if extra.get("return_lse", return_lse):
-            out, lse = output[0][back], output[1][back]
+            out, lse = realign(output[0]), realign(output[1])
             if mask_in_padding:
                 # Tokens past the step's rows read the last aligned row, which
-                # can be a real one: mask them here, fused with the gather.
+                # can be a real one: mask them here.
                 out = jnp.where(live[:, None, None], out, 0)
                 lse = jnp.where(live[:, None], lse, -jnp.inf)
             return out, lse
-        return output[back]
+        return realign(output)
 
     live = lengths > 0
     # VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED: only the padded layouts mask
