@@ -211,3 +211,18 @@ def test_mask_router_logits_for_padding():
     finally:
         token_padding.set_padding_state(None)
     assert token_padding.mask_router_logits_for_padding(logits) is logits
+
+
+def test_padding_mask_reuse_skips_unchanged_rows():
+    """Unchanged (valid, padded) row counts skip the H2D upload; changed row
+    counts (e.g. a drafter's) rewrite the mask."""
+    state = TokenPaddingState.create(8, "cpu")
+    state.update(3, 8)
+    assert state.local_padding_mask.tolist() == [False] * 3 + [True] * 5
+    state.local_padding_mask[0] = True  # a skipped write leaves this alone
+    state.update(3, 8)
+    assert state.local_padding_mask[0]
+    state.update(2, 8)
+    assert state.local_padding_mask.tolist() == [False] * 2 + [True] * 6
+    state.update(3, 8)
+    assert state.local_padding_mask.tolist() == [False] * 3 + [True] * 5
