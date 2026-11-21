@@ -205,6 +205,12 @@ class ServingConfigs:
     # the KV cache, so a caller can run it inside a conditional that must not
     # return the cache (XLA would copy the whole pool).
     read_only_cache: bool = False
+    # q38 RPAD-HIGHROWS F4 (read-only decode): the page table arrives in HBM,
+    # not as a scalar prefetch, and the kernel copies into SMEM only each
+    # sequence's KV tiles below its kv_lens (whole tiles) plus the table's first
+    # tile (idle lanes index it). The fetch reads no other entry, so every page
+    # id it reads is the one the full copy holds: same DMAs, same results.
+    page_table_prefix: bool = False
 
     @property
     def max_decode_bkv_p_new(self) -> int:

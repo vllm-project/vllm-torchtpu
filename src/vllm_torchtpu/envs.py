@@ -147,6 +147,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_SEL_DUMP: int = 0
     VLLM_TPU_QSA_SEL_DUMP_AT: str = "240:60:6"
     VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY: int = 0
+    VLLM_TPU_QSA_DECODE_RPA_PT_PREFIX: bool = False
     VLLM_TPU_QSA_DECODE_RPA_UNION: int = 0
     VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK: int = 0
     VLLM_TPU_QSA_PREFILL_INDEXER_BQ: int = 128
@@ -781,6 +782,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY": env_nonnegative_int(
         "VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY", 0
     ),
+    # q38 RPAD-HIGHROWS F4: the union-route RPA decode kernel takes its page
+    # table in HBM instead of as a scalar prefetch, and copies into SMEM only
+    # each sequence's used prefix (its KV tiles below kv_lens, whole tiles,
+    # plus the table's first tile, which idle lanes index). The scalar prefetch
+    # copies the whole worst-case [requests, 2080] table every call. Every page
+    # id the fetch reads holds the value it holds today, so the same DMAs run
+    # and the results are the same. Read inside the compiled forward, so it is
+    # a compile key (not in _TPU_COMPILE_ENV_IGNORED). False (default) off.
+    "VLLM_TPU_QSA_DECODE_RPA_PT_PREFIX": env_bool("VLLM_TPU_QSA_DECODE_RPA_PT_PREFIX"),
     # Qwen4-exp QSA verify steps under main-KV DCP (decode layout) with the
     # compact schedule and slot reads: attend each request's rows as one RPA
     # sequence over the union of their owned pages, with a per-token row mask,

@@ -814,6 +814,30 @@ def create_allocs(
     return q_alloc, kv_cache_alloc, o_alloc, lse_alloc
 
 
+# page_table_prefix: page-table copy offsets and sizes are rounded out to this
+# many int32 words (HBM to SMEM DMA alignment).
+PT_ALIGN = 128
+
+
+def pt_prefix_bounds(seq, k_len, *, pages_per_seq, bkv_sz, bkv_p, num_page_indices):
+    """[lo, hi) of the page-table words page_table_prefix copies for sequence
+    ``seq`` (a Python int) of ``k_len`` KV tokens: its KV tiles, whole tiles (a
+    tile's fetch reads up to its last page slot), and for sequence 0 at least
+    one tile (an idle lane's schedule entry is page index 0), rounded out to
+    PT_ALIGN words and clipped to the table. ``k_len`` may be traced; the kernel
+    and the host checks share this arithmetic."""
+    n = (k_len + bkv_sz - 1) // bkv_sz * bkv_p
+    if seq == 0:
+        n = jnp.maximum(n, bkv_p)
+    n = jnp.minimum(n, pages_per_seq)
+    lo = (seq * pages_per_seq) // PT_ALIGN * PT_ALIGN
+    hi = jnp.minimum(
+        (seq * pages_per_seq + n + PT_ALIGN - 1) // PT_ALIGN * PT_ALIGN,
+        num_page_indices,
+    )
+    return lo, hi
+
+
 def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
     serve = cfgs.serve
     name = f"RPA{cfgs.mode.symbol}-{serve.kv_layout.symbol}-p{serve.page_size}"
@@ -824,6 +848,8 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
         name += "-sel"
     if serve.read_only_cache:
         name += "-ro"
+    if serve.page_table_prefix:
+        name += "-pp"
     return name
 
 
@@ -833,7 +859,7 @@ def get_kernel_metadata(
     cfgs_dict = dataclasses.asdict(cfgs)
     # Kernels without these fields set keep the metadata, and so the compiled
     # program and its cache key, they had before the fields.
-    for field in ("selection_mask", "selection_word_rows", "read_only_cache"):
+    for field in ("selection_mask", "selection_word_rows", "read_only_cache", "page_table_prefix"):
         if not getattr(cfgs.serve, field):
             del cfgs_dict["serve"][field]
     ret = {}
@@ -900,6 +926,7 @@ def rpa_kernel(
     return_lse = cfgs.serve.return_lse
     selection = cfgs.serve.selection_mask
     assert (selection_hbm is not None) == selection
+    pt_prefix = cfgs.serve.page_table_prefix
     tiles_per_seq = 0
     if selection:
         assert selection_hbm is not None
@@ -936,6 +963,24 @@ def rpa_kernel(
             kv_cache_hbm_ref, q_hbm_ref, lse_hbm_ref, cfgs
         )
 
+        def _pt_prefix_copy(seq, pt_scratch):
+            # Sequence seq's used page-table words (pt_prefix_bounds) from HBM
+            # into the SMEM table; an overlap with a neighbour's rounded range
+            # rewrites the same words with the same values.
+            lo, hi = pt_prefix_bounds(
+                seq,
+                kv_cache_lens_ref[seq] + kv_new_lens_ref[seq],
+                pages_per_seq=cfgs.serve.pages_per_seq,
+                bkv_sz=cfgs.bkv_sz,
+                bkv_p=cfgs.bkv_p,
+                num_page_indices=cfgs.serve.num_page_indices,
+            )
+            return pltpu.make_async_copy(
+                page_indices_ref.at[pl.ds(lo, hi - lo)],
+                pt_scratch[0].at[pl.ds(lo, hi - lo)],
+                pt_scratch[1].at[0],
+            )
+
         actual_steps = schedule_hbm_ref.actual_steps[0]
         num_safe_step_iterations = pl.cdiv(actual_steps, cfgs.max_steps_ub)
 
@@ -966,8 +1011,24 @@ def rpa_kernel(
             )
             if selection
             else None,
+            pt_scratch=(
+                pltpu.SMEM((cfgs.serve.num_page_indices,), jnp.int32),
+                pltpu.SemaphoreType.DMA((1,)),
+            )
+            if pt_prefix
+            else None,
         )
-        def _run(final_allocs, schedule_ref, dma_sem, scratches, sel_scratch):
+        def _run(final_allocs, schedule_ref, dma_sem, scratches, sel_scratch, pt_scratch):
+            # q38 RPAD-HIGHROWS F4 (page_table_prefix): page_indices_ref is the
+            # table in HBM. Copy each sequence's used prefix into SMEM (started
+            # here, waited after the scratch zeroing below, before any fetch).
+            page_table_ref = page_indices_ref
+            pt_copies = []
+            if pt_prefix:
+                page_table_ref = pt_scratch[0]
+                pt_copies = [_pt_prefix_copy(s, pt_scratch) for s in range(cfgs.serve.num_seqs)]
+                for c in pt_copies:
+                    c.start()
             # Initialize Q to zeros to prevent NaN pollution.
             #
             # When a query block is partially filled, tail slots in uninitialized VMEM
@@ -999,6 +1060,8 @@ def rpa_kernel(
             # Explicitly zero out scratches and Q/KV buffers.
             for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
                 ref[...] = jnp.zeros_like(ref)
+            for c in pt_copies:
+                c.wait()
 
             def execute_schedule_chunk(start_step, num_steps):
                 # All reads are aligned to 128 and some extra steps are copied in the
@@ -1034,13 +1097,13 @@ def rpa_kernel(
                         kv_cache_hbm_ref,
                         new_kv_hbm_ref,
                         schedule_ref,
-                        page_indices_ref,
+                        page_table_ref,
                     ),
                     dst_ref=(
                         kv_cache_hbm_ref,
                         new_kv_hbm_ref,
                         schedule_ref,
-                        page_indices_ref,
+                        page_table_ref,
                     ),
                 )
                 q_bound = q_alloc.bind(src_ref=(q_hbm_ref, schedule_ref))
@@ -1120,8 +1183,11 @@ def rpa_kernel(
         kv_new_lens,
         page_indices,
     )
-    num_scalar_prefetch = len(scalar_prefetches)
+    # Operands before the schedule (the alias indices count them all); under
+    # page_table_prefix the page table is the first plain (HBM) input instead
+    # of the last scalar prefetch.
     num_active_scalers = len(scalar_prefetches)
+    num_scalar_prefetch = num_active_scalers - 1 if pt_prefix else num_active_scalers
 
     read_only = cfgs.serve.read_only_cache
     out_shape = [
@@ -1146,6 +1212,7 @@ def rpa_kernel(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=num_scalar_prefetch,
             in_specs=[
+                *([pl.BlockSpec(memory_space=pltpu.HBM)] if pt_prefix else []),  # page_indices
                 schedule_hbm.in_specs(),
                 pl.BlockSpec(memory_space=pltpu.HBM),  # q_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv_hbm_ref

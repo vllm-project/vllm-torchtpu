@@ -439,6 +439,11 @@ def union_page_slots(budget, ratio, tile, rows=4):
     return -(-(rows * (budget + 1)) // per_tile) * per_tile
 
 
+# (rows, request slots) of the programs traced with VLLM_TPU_QSA_DECODE_RPA_PT_PREFIX
+# (q38 RPAD-HIGHROWS F4; log once each).
+PT_PREFIX_TRACED: dict = {}
+
+
 # Diagnostics for the bench (scripts/bench_qsa_rpa_decode.py f15c): build the
 # union metadata before the route instead of inside its union branch, or skip
 # the route (wrong for requests of more than max_query_len rows).
@@ -597,6 +602,16 @@ def union_decode_attention(
         batch_size=envs.VLLM_TPU_QSA_DECODE_RPA_LANES,
     )
     skip = envs.VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY
+    # q38 RPAD-HIGHROWS F4: copy only the used page-table prefix into SMEM
+    # (read-only calls only; the kernel needs read_only_cache).
+    pt_prefix = bool(envs.VLLM_TPU_QSA_DECODE_RPA_PT_PREFIX) and read_only
+    if pt_prefix and (len(q), requests) not in PT_PREFIX_TRACED:
+        PT_PREFIX_TRACED[(len(q), requests)] = True
+        logger.info(
+            "q38 RPAD-HIGHROWS PT_PREFIX traced: rows %d, request slots %d, %d union calls "
+            "of [%d, %d] page tables",
+            len(q), requests, chunks, UNION_REQUESTS, pages.shape[1],
+        )
     out = None if whole else jnp.zeros(query.shape, jnp.float32)
     lse = None if whole else jnp.full(query.shape[:2], -jnp.inf, jnp.float32)
     carry = None
@@ -648,6 +663,7 @@ def union_decode_attention(
             schedule_in_hbm=envs.VLLM_TPU_RPA_SCHEDULE_HBM,
             **({"selection_word_rows": True} if lean else {}),
             **({"carry": carry, "return_carry": True} if chained else {}),
+            **({"page_table_prefix": True} if pt_prefix else {}),
         )
         if chained:
             carry = (out_c, lse_c)
