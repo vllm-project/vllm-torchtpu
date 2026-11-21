@@ -869,6 +869,13 @@ def test_retention_is_for_a_kv_producer():
     assert not retention_wanted(cfg(None))
 
 
+def test_retention_needs_an_engine_config():
+    """The KV transfer config is read directly: an object without it fails
+    instead of reading as no retention."""
+    with pytest.raises(AttributeError, match="kv_transfer_config"):
+        retention_wanted(SimpleNamespace())
+
+
 def test_default_bounds():
     ret = HybridStateRetention(SimpleNamespace(enable_caching=False, coordinator=None))
     assert (ret.max_conversations, ret.max_pinned_blocks) == (96, 360)
