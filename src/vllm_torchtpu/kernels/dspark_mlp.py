@@ -67,13 +67,13 @@ def _project(acc, scale):
 
 
 def _kernel(
-    meta_ref,  # SMEM int32 [1]: this device's mesh index (used with an all-reduce)
+    meta_ref,  # SMEM int32 [1, 1]: this device's mesh index (for an all-reduce)
     x_hbm,  # HBM [m, h] bf16
     sgu_hbm,  # HBM [1, 2i] f32
     sd_hbm,  # HBM [1, h] f32
     wgu_hbm,  # HBM [h, 2i] e4m3: [gate | up]
     wd_hbm,  # HBM [i, h] e4m3
-    o_ref,  # VMEM [m, h] bf16 (with an all-reduce: [mp, h])
+    o_ref,  # VMEM [m, h] bf16
     x_ref,  # VMEM [m, h] bf16
     sgu_ref,  # VMEM [1, 2i] f32
     sd_ref,  # VMEM [1, h] f32
@@ -83,7 +83,7 @@ def _kernel(
     act_ref,  # VMEM [mp, i] bf16
     out_acc,  # VMEM [mp, h] f32
     sem,  # DMA [3 + chunks]: x, scales, weight chunks
-    *ar_scratch,
+    *ar_scratch,  # with an all-reduce: VMEM [mp, h] bf16, then ar.scratch_shapes
     gu_chunks,
     d_chunks,
     spec,
@@ -142,8 +142,10 @@ def _kernel(
     if spec is None:
         o_ref[...] = _project(out_acc[:m, :], sd_ref[...]).astype(o_ref.dtype)
     else:
+        reduced, *scr = ar_scratch
         partial = _project(out_acc[...], sd_ref[...])
-        ar.epilogue(spec, meta_ref[0], m, partial, o_ref, ar_scratch)
+        ar.epilogue(spec, meta_ref[0, 0], m, partial, reduced, scr)
+        o_ref[...] = reduced[:m, :]
 
 
 def _vmem_bytes(mp: int, h: int, i: int, spec, info) -> int:
@@ -163,19 +165,25 @@ def _vmem_bytes(mp: int, h: int, i: int, spec, info) -> int:
         + 4 * t((mp, i), F32)
     )
     if spec is not None:
-        total += ar.vmem_bytes(spec, info)
+        total += t((mp, h), BF16) + ar.vmem_bytes(spec, info)
     return total
 
 
-def supported(m: int, h: int, i: int) -> bool:
-    """Whether [m, h] rows against [h, 2i] / [i, h] weights fit the kernel."""
+def supported(m: int, h: int, i: int, n: int = 1) -> bool:
+    """Whether [m, h] rows against [h, 2i] / [i, h] weights fit the kernel
+    (with n > 1: and its all-reduce over n ranks)."""
     info = pltpu.get_tpu_info()
     mp = m + (-m % _ROW_ALIGN)
+    spec = None
+    if n > 1:
+        if not ar.supported(n, mp, h, info):
+            return False
+        spec = ar.make_spec(n, mp, h)
     return (
         0 < m <= MAX_ROWS
         and h % 128 == 0
         and i % 128 == 0
-        and _vmem_bytes(mp, h, i, None, info) + _VMEM_HEADROOM
+        and _vmem_bytes(mp, h, i, spec, info) + _VMEM_HEADROOM
         <= info.vmem_capacity_bytes * ar.VMEM_FRACTION
     )
 
@@ -196,11 +204,11 @@ def fused_mlp(
     ``[m, h]``.
 
     With ``n > 1`` the result is summed over the n ranks of the 1-D mesh this
-    runs under (shard_map); ``rank`` (int32 [1]) is this device's mesh index.
+    runs under (shard_map); ``rank`` (int32 [1, 1]) is this device's mesh index.
     """
     m, h = x.shape
     i = w_d.shape[0]
-    if not supported(m, h, i):
+    if not supported(m, h, i, n):
         raise ValueError(f"fused_mlp: unsupported [{m}, {h}] x [{h}, {2 * i}]")
     if m % 8:  # whole f32 sublane tiles of rows
         rows = m + (-m % 8)
@@ -210,20 +218,19 @@ def fused_mlp(
     mp = m + (-m % _ROW_ALIGN)
     spec = ar.make_spec(n, mp, h) if n > 1 else None
     if rank is None:
-        rank = jnp.zeros((1,), jnp.int32)
+        rank = jnp.zeros((1, 1), jnp.int32)
     gu_chunks = _chunks(h, 2 * i * w_gu.dtype.itemsize)
     d_chunks = _chunks(i, h * w_d.dtype.itemsize)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    out_rows = m if spec is None else mp
     # All of VMEM: room left over lets XLA prefetch the weights into VMEM
     # ahead of the call, serialized before it.
     params = dict(vmem_limit_bytes=info.vmem_capacity_bytes)
     if spec is not None:
         params["collective_id"] = ar.COLLECTIVE_ID
-    out = pl.pallas_call(
+    return pl.pallas_call(
         functools.partial(_kernel, gu_chunks=gu_chunks, d_chunks=d_chunks, spec=spec),
-        out_shape=jax.ShapeDtypeStruct((out_rows, h), BF16),
+        out_shape=jax.ShapeDtypeStruct((m, h), BF16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             in_specs=[hbm] * 5,
@@ -238,14 +245,17 @@ def fused_mlp(
                 pltpu.VMEM((mp, i), BF16),
                 pltpu.VMEM((mp, h), F32),
                 pltpu.SemaphoreType.DMA((3 + len(gu_chunks) + len(d_chunks),)),
-                *(ar.scratch_shapes(spec) if spec is not None else []),
+                *(
+                    [pltpu.VMEM((mp, h), BF16), *ar.scratch_shapes(spec)]
+                    if spec is not None
+                    else []
+                ),
             ],
         ),
         compiler_params=pltpu.CompilerParams(**params),
         name=f"dspark_mlp-m_{mp}-h_{h}-i_{i}" + (f"-ar_{n}" if n > 1 else ""),
         interpret=interpret,
-    )(rank.reshape(1).astype(jnp.int32), x, s_gu, s_d, w_gu, w_d)
-    return out if out_rows == m else out[:m]
+    )(rank.reshape(1, 1).astype(jnp.int32), x, s_gu, s_d, w_gu, w_d)
 
 
 def reference(x, w_gu, s_gu, w_d, s_d):

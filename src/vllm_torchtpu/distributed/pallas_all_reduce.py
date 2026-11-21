@@ -61,12 +61,17 @@ class _Armed:
     # Every rank's mesh index equals its group rank (decided once, from all
     # ranks' indices, so the answer is the same on every rank).
     rank_ordered: bool = False
+    mesh: Any = None
+    max_bytes: int = 0
 
 
 _ARMED: _Armed | None = None
 
 
-def _body(n: int, max_bytes: int, axis: str):
+def reduce_body(n: int, max_bytes: int, axis: str):
+    """The op's per-device all-reduce of (x, rank), for use under shard_map
+    over the op's mesh (axis `axis`, n devices)."""
+
     def body(x, rank):
         rows, hidden = x.shape
         if 0 < kernel.view_bytes(rows, hidden, n) <= max_bytes:
@@ -80,7 +85,7 @@ def _make_op(mesh, max_bytes: int):
     axis = mesh.axis_names[0]
     specs = (P(axis), P(axis))
     sharded = jax.shard_map(
-        _body(int(mesh.size), max_bytes, axis),
+        reduce_body(int(mesh.size), max_bytes, axis),
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
@@ -184,6 +189,8 @@ def arm(hidden: int, device: torch.device) -> bool:
         ranks=tuple(int(r) for r in tp.ranks),
         op=op,
         rank=rank,
+        mesh=mesh,
+        max_bytes=max_bytes,
         rank_ordered=all(s["mesh_index"] == i for i, s in enumerate(seen)),
     )
     logger.info(
@@ -218,3 +225,12 @@ def armed_rank(ranks) -> torch.Tensor | None:
     if armed is None or tuple(ranks) != armed.ranks or not armed.rank_ordered:
         return None
     return armed.rank
+
+
+def armed_for(ranks) -> _Armed | None:
+    """The armed op's record (mesh, mesh index, byte cap) when it serves the
+    group of `ranks`, else None: for kernels that fold this all-reduce in."""
+    armed = _ARMED
+    if armed is None or tuple(ranks) != armed.ranks:
+        return None
+    return armed

@@ -29,7 +29,13 @@ from vllm_torchtpu.layers.adapter.dense_fp4_shared import (
     model_side_shared,
     shared_operands,
 )
-from vllm_torchtpu.models.minimax_m3.quant import _e4m3_matmul, _materialized_bf16
+from vllm_torchtpu.models.minimax_m3.quant import (
+    _KERNEL_SWIGLU,
+    MiniMaxM3Mxfp8LinearMethod,
+    _e4m3_matmul,
+    _materialized_bf16,
+)
+from vllm_torchtpu.utils import fresh_buffer
 
 Rows = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
@@ -109,6 +115,40 @@ class MiniMaxM3MLP(nn.Module):
             gate_up, _ = self.gate_up_proj(x)
         x, _ = self.down_proj(self.act_fn(gate_up))
         return x
+
+
+def e4m3_mlp_operands(mlp: MiniMaxM3MLP) -> tuple[torch.Tensor, ...] | None:
+    """``(w_gu, s_gu, w_d, s_d)`` of a bias-free SwiGLU-OAI MLP (the kernels'
+    `_KERNEL_SWIGLU`) on per-channel e4m3 linears, for kernels that evaluate it
+    whole: e4m3 ``w_gu [h, 2i]`` ([gate | up]) and ``w_d [i, h]``, f32 scales
+    ``[1, 2i]`` / ``[1, h]``. None for any other MLP."""
+    act = mlp.act_fn
+    if not isinstance(act, SiluAndMulWithClamp) or (
+        (act.alpha, act.swiglu_limit, act.beta) != _KERNEL_SWIGLU
+    ):
+        return None
+    linears = (mlp.gate_up_proj, mlp.down_proj)
+    for linear in linears:
+        if (
+            not isinstance(linear.quant_method, MiniMaxM3Mxfp8LinearMethod)
+            or linear.weight.dtype != torch.float8_e4m3fn
+            or linear.weight.dim() != 2
+            or linear.weight_scale.dim() != 1
+            or getattr(linear, "bias", None) is not None
+        ):
+            return None
+    (w1, s1), (w2, s2) = ((m.weight.data, m.weight_scale.data) for m in linears)
+    h, two_i = w1.shape
+    if two_i % 2 or tuple(w2.shape) != (two_i // 2, h):
+        return None
+    # Weights as the parameters themselves (a view would be re-materialized on
+    # every call); the f32 [1, n] scales are buffers of their own.
+    return (
+        w1,
+        fresh_buffer(s1.float().reshape(1, -1)),
+        w2,
+        fresh_buffer(s2.float().reshape(1, -1)),
+    )
 
 
 class MiniMaxM3MoE(nn.Module):

@@ -34,7 +34,6 @@ import torch
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import fresh_buffer
 
 logger = init_logger(__name__)
 
@@ -67,43 +66,12 @@ def model_side_shared(layer: Any, num_tokens: int) -> bool:
 def _shared_tensors(runner) -> tuple[torch.Tensor, ...] | None:
     """The shared expert's (w1, s1, w2, s2) in SharedExpert's layout, or None
     when it is not a bias-free SwiGLU-OAI MLP on e4m3 per-channel linears."""
-    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
-
-    from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP
-    from vllm_torchtpu.models.minimax_m3.quant import (
-        _KERNEL_SWIGLU,
-        MiniMaxM3Mxfp8LinearMethod,
-    )
+    from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, e4m3_mlp_operands
 
     mlp = getattr(getattr(runner, "_shared_experts", None), "_layer", None)
     if type(mlp) is not MiniMaxM3MLP:
         return None
-    act = mlp.act_fn
-    if not isinstance(act, SiluAndMulWithClamp) or (
-        (act.alpha, act.swiglu_limit, act.beta) != _KERNEL_SWIGLU
-    ):
-        return None
-    linears = (mlp.gate_up_proj, mlp.down_proj)
-    for linear in linears:
-        if (
-            not isinstance(linear.quant_method, MiniMaxM3Mxfp8LinearMethod)
-            or linear.weight.dtype != torch.float8_e4m3fn
-            or linear.weight_scale.dim() != 1
-            or getattr(linear, "bias", None) is not None
-        ):
-            return None
-    (w1, s1), (w2, s2) = ((m.weight.data, m.weight_scale.data) for m in linears)
-    h, two_i = w1.shape
-    if two_i % 2 or tuple(w2.shape) != (two_i // 2, h):
-        return None
-    # Weights as the parameters themselves (a view would be re-materialized on
-    # every call); the f32 [1, n] scales are buffers of their own.
-    return (
-        w1,
-        fresh_buffer(s1.float().reshape(1, -1)),
-        w2,
-        fresh_buffer(s2.float().reshape(1, -1)),
-    )
+    return e4m3_mlp_operands(mlp)
 
 
 def _admit(runner) -> tuple[torch.Tensor, ...] | None:
