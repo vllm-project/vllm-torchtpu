@@ -39,8 +39,24 @@ def test_line_reads_block_and_tiles():
     assert kv["select_nvis"] == "0"
     assert kv["key_slots"] == "2"
     assert kv["hier"] == "1" and kv["rel_fetch"] == "1"
-    # Not on this kernel: skipped, not an error.
-    assert "uattn_lite" not in kv
+    # Off unless VLLM_TPU_MK_UATTN_LITE (absent on kernels without the field).
+    assert kv.get("uattn_lite", "0") == "0"
+
+
+def test_missing_attributes_are_skipped():
+    class Block:  # an older kernel: only some of the fields
+        key_slots, req_async = 4, True
+
+    class Spec:
+        layer_type = type("LT", (), {"slots": ()})()
+
+        def all_blocks(self):
+            return [Block()]
+
+    line = wc.mk_options_line(32, Spec(), Tiles(hier=2))
+    assert line == "qwen38 MK options b32: key_slots=4 req_async=1 " + " ".join(
+        f"{k}={wc._fmt(getattr(Tiles(hier=2), k))}" for k in wc._MK_TILE_FIELDS
+    )
 
 
 def test_key_lanes_logged_and_auto_slots_doubled(monkeypatch):
