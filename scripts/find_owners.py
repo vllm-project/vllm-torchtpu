@@ -30,16 +30,25 @@ Typical use, from anywhere inside the repo:
 
     # Request their review (on the current branch's PR, or --pr 123)
     scripts/find_owners.py --request
+
+    # One least-loaded owner per area instead of the smallest cover
+    scripts/find_owners.py --pr 123 --balance
+
+    # What the Reviewer Balancer workflow runs on a new PR
+    scripts/find_owners.py --pr 123 --balance --request --prune --comment
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+from contextlib import nullcontext
 from typing import NoReturn
 
 CODEOWNERS_CANDIDATES = (
@@ -63,10 +72,10 @@ def run(cmd: list[str], cwd: str | None = None) -> str | None:
     return proc.stdout.strip()
 
 
-def run_checked(cmd: list[str]) -> tuple[bool, str]:
+def run_checked(cmd: list[str], stdin: str | None = None) -> tuple[bool, str]:
     """Run a command, returning (succeeded, output-or-error-message)."""
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, input=stdin)
     except FileNotFoundError:
         return False, f"{cmd[0]} not found"
     if proc.returncode != 0:
@@ -217,13 +226,25 @@ def changed_files(root: str, base: str) -> tuple[list[str], str]:
 
 
 def pr_files(pr: str, repo: str | None) -> tuple[list[str], str]:
-    cmd = ["gh", "pr", "diff", str(pr), "--name-only"]
-    if repo:
-        cmd += ["--repo", repo]
-    out = run(cmd)
-    if out is None:
-        die(f"could not read PR #{pr}; is `gh` installed and authenticated?")
-    return sorted(set(out.splitlines())), f"PR #{pr}"
+    """The files a PR changes, by their path in the PR.
+
+    The files endpoint pages up to 3000 files. `gh pr diff --name-only`
+    fetches the diff media type instead, which GitHub refuses above 300
+    files, so a large sweep or rename would never get an answer.
+    """
+    ok, out = run_checked(
+        [
+            "gh",
+            "api",
+            f"repos/{resolve_repo(repo)}/pulls/{pr}/files",
+            "--paginate",
+            "--jq",
+            ".[].filename",
+        ]
+    )
+    if not ok:
+        die(f"could not read the files of PR #{pr}: {out}")
+    return sorted({line for line in out.splitlines() if line}), f"PR #{pr}"
 
 
 def expand_paths(root: str, paths: list[str]) -> list[str]:
@@ -285,18 +306,30 @@ def request_reviewers(
     repo: str | None,
     style: Style,
 ) -> None:
-    """Request review from the given owners on a PR."""
+    """Request review from the given owners on a PR.
+
+    The REST endpoint, not `gh pr edit --add-reviewer`: the latter resolves
+    handles against the organization's teams, which the workflow's token
+    cannot read.
+    """
     handles = [o.lstrip("@") for o in owners]
     if not handles:
         print("No owners to request; nothing to do.")
         return
 
     pr = resolve_pr(pr, repo)
-    cmd = ["gh", "pr", "edit", pr, "--add-reviewer", ",".join(handles)]
-    if repo:
-        cmd += ["--repo", repo]
-
-    ok, out = run_checked(cmd)
+    ok, out = run_checked(
+        [
+            "gh",
+            "api",
+            "--method",
+            "POST",
+            f"repos/{resolve_repo(repo)}/pulls/{pr}/requested_reviewers",
+            "--input",
+            "-",
+        ],
+        stdin=json.dumps({"reviewers": handles}),
+    )
     if not ok:
         die(f"could not request review on PR #{pr}: {out}")
 
@@ -364,6 +397,408 @@ def minimal_cover(groups: dict, author: str | None = None) -> list[str]:
     return chosen
 
 
+# --------------------------------------------------------------------------
+# balancing: one least-loaded owner per area
+# --------------------------------------------------------------------------
+# GitHub asks every owner of every area a PR touches, so the people on broad
+# rules sit on dozens of pending requests. The balancer keeps CODEOWNERS as
+# the record of who may approve and only trims who is asked: one owner per
+# area, the one with the fewest pending review requests across the repo.
+#
+# Label that switches the balancer off for one PR.
+OPT_OUT_LABEL = "no-reviewer-balance"
+# Hidden prefix of the comment the balancer keeps on a PR; the JSON after it
+# records its picks so later runs do not re-roll them.
+_MARKER = "<!-- reviewer-balancer "
+_MARKER_END = " -->"
+
+
+def handle_key(handle: str) -> str:
+    """Case-folded login without the `@`, for comparing handles."""
+    return handle.lstrip("@").lower()
+
+
+def resolve_repo(repo: str | None) -> str:
+    if repo:
+        return repo
+    out = run(
+        ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]
+    )
+    if not out:
+        die("could not determine the repository; pass --repo owner/name")
+    return out
+
+
+def loads_query(keys: list[str], repo: str) -> str:
+    """One GraphQL query counting each login's pending review requests."""
+    fields = []
+    for i, key in enumerate(keys):
+        search = f"repo:{repo} is:pr is:open review-requested:{key}"
+        fields.append(
+            f"  u{i}: search(query: {json.dumps(search)}, type: ISSUE) {{ issueCount }}"
+        )
+    return "query {\n" + "\n".join(fields) + "\n}"
+
+
+def pending_review_loads(candidates: list[str], repo: str) -> dict[str, int]:
+    """Open PRs in `repo` on which each candidate is still asked to review.
+
+    That count is a reviewer's current depth: a request clears as soon as
+    they review, so it tracks outstanding work rather than history. One
+    GraphQL call serves every candidate; a failure is fatal rather than a
+    guess, because a pick made on missing loads is not a balanced one.
+    """
+    keys = sorted({handle_key(c) for c in candidates})
+    if not keys:
+        return {}
+    ok, out = run_checked(
+        ["gh", "api", "graphql", "-f", f"query={loads_query(keys, repo)}"]
+    )
+    if not ok:
+        die(f"could not read reviewer loads: {out}")
+    data = json.loads(out).get("data") or {}
+    loads: dict[str, int] = {}
+    for i, key in enumerate(keys):
+        node = data.get(f"u{i}")
+        if not node or "issueCount" not in node:
+            die(f"reviewer load missing for {key} in: {out}")
+        loads[key] = int(node["issueCount"])
+    return loads
+
+
+def _tiebreak(handle: str, seed: str) -> str:
+    return hashlib.sha256(f"{seed}:{handle_key(handle)}".encode()).hexdigest()
+
+
+def uncovered_areas(groups: dict, author: str | None, covered: set[str]) -> list[str]:
+    """Patterns with no eligible owner in `covered`, most constrained first.
+
+    `covered` holds logins already asked or heard from. Areas the author owns
+    outright are left out; `self_owned_areas` reports those.
+    """
+    keys = {handle_key(c) for c in covered}
+    open_areas = []
+    for pattern, group in groups.items():
+        eligible = eligible_owners(group["owners"], author)
+        if eligible and not any(handle_key(o) in keys for o in eligible):
+            open_areas.append((len(eligible), pattern))
+    return [pattern for _, pattern in sorted(open_areas)]
+
+
+def balanced_picks(
+    groups: dict,
+    loads: dict[str, int],
+    author: str | None = None,
+    seed: str = "",
+) -> list[str]:
+    """One least-loaded eligible owner per matched rule.
+
+    Areas are visited most constrained first (fewest eligible owners), so a
+    narrow area picks before a broad one that its pick may also own; an area
+    already covered by an earlier pick adds nobody. Ties on load break on a
+    hash of the seed and the handle, so reruns for one PR agree without
+    favouring the top of the alphabet. The author is never chosen.
+    """
+    load = {handle_key(k): int(v) for k, v in loads.items()}
+    picks: list[str] = []
+    for pattern in uncovered_areas(groups, author, set()):
+        eligible = eligible_owners(groups[pattern]["owners"], author)
+        if any(handle_key(p) in {handle_key(o) for o in eligible} for p in picks):
+            continue
+        picks.append(
+            min(
+                eligible, key=lambda o: (load.get(handle_key(o), 0), _tiebreak(o, seed))
+            )
+        )
+    return picks
+
+
+def prune_candidates(
+    groups: dict,
+    areas: list[str],
+    pending: list[str],
+    keep: list[str],
+    author: str | None,
+) -> list[str]:
+    """Pending requests to withdraw: owners of `areas` not in `keep`.
+
+    Only code owners of the areas balanced in this run are touched, spelled
+    as GitHub returned them. A pending reviewer who owns none of them was
+    asked by a person, and stays.
+    """
+    owners = {
+        handle_key(o)
+        for pattern in areas
+        for o in eligible_owners(groups[pattern]["owners"], author)
+    }
+    kept = {handle_key(k) for k in keep}
+    return sorted(
+        login
+        for login in pending
+        if handle_key(login) in owners and handle_key(login) not in kept
+    )
+
+
+def format_marker(state: dict) -> str:
+    return f"{_MARKER}{json.dumps(state, sort_keys=True)}{_MARKER_END}"
+
+
+def parse_marker(body: str) -> dict | None:
+    """The balancer state in a comment body, or None if it carries none."""
+    start = body.find(_MARKER)
+    if start < 0:
+        return None
+    start += len(_MARKER)
+    end = body.find(_MARKER_END, start)
+    if end < 0:
+        return None
+    try:
+        state = json.loads(body[start:end])
+    except ValueError:
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def balancer_comment(
+    picks: dict[str, tuple[str, int]],
+    pruned: list[str],
+    state: dict,
+    kept: list[str] | None = None,
+) -> str:
+    """The PR comment explaining a run; handles are not @-mentioned, because
+    the review request already notified the picks."""
+    intro = (
+        "**Reviewer balancer** asked one code owner per area, the one with "
+        "the fewest open review requests:"
+    )
+    outro = (
+        "Any owner of an area may still approve it. Request anyone else by "
+        f"hand, or add the `{OPT_OUT_LABEL}` label to opt this PR out."
+    )
+    lines = [intro, ""]
+    for pattern, (handle, load) in picks.items():
+        lines.append(f"- `{pattern}` → `{handle.lstrip('@')}` ({load} pending)")
+    if pruned:
+        quoted = ", ".join(f"`{p}`" for p in pruned)
+        lines += ["", f"Withdrew the other code-owner requests: {quoted}."]
+    if kept:
+        quoted = ", ".join(f"`{p}`" for p in kept)
+        pinned_note = (
+            f"GitHub kept the requests of {quoted}: the ruleset still requires "
+            "review from code owners, which pins automatically requested "
+            "owners. No action is needed from them."
+        )
+        lines += ["", pinned_note]
+    lines += ["", outro, "", format_marker(state)]
+    return "\n".join(lines)
+
+
+def pr_review_state(pr: str, repo: str) -> tuple[list[str], list[str], list[str]]:
+    """(pending requested reviewers, logins who reviewed, labels) of a PR."""
+    ok, out = run_checked(
+        [
+            "gh",
+            "api",
+            f"repos/{repo}/pulls/{pr}",
+            "--jq",
+            "{pending: [.requested_reviewers[].login], labels: [.labels[].name]}",
+        ]
+    )
+    if not ok:
+        die(f"could not read PR #{pr}: {out}")
+    head = json.loads(out)
+    ok, out = run_checked(
+        [
+            "gh",
+            "api",
+            f"repos/{repo}/pulls/{pr}/reviews",
+            "--paginate",
+            "--jq",
+            ".[] | .user.login // empty",
+        ]
+    )
+    if not ok:
+        die(f"could not read the reviews of PR #{pr}: {out}")
+    reviewed = sorted({line for line in out.splitlines() if line})
+    return head["pending"], reviewed, head["labels"]
+
+
+def read_marker(pr: str, repo: str) -> tuple[int | None, dict]:
+    """The balancer's comment on a PR: (comment id, recorded state)."""
+    ok, out = run_checked(
+        [
+            "gh",
+            "api",
+            f"repos/{repo}/issues/{pr}/comments",
+            "--paginate",
+            "--jq",
+            ".[] | {id: .id, body: .body}",
+        ]
+    )
+    if not ok:
+        die(f"could not read the comments of PR #{pr}: {out}")
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        comment = json.loads(line)
+        state = parse_marker(comment.get("body") or "")
+        if state is not None:
+            return int(comment["id"]), state
+    return None, {}
+
+
+def write_marker(pr: str, repo: str, comment_id: int | None, body: str) -> None:
+    if comment_id is None:
+        cmd = ["gh", "api", "--method", "POST", f"repos/{repo}/issues/{pr}/comments"]
+    else:
+        cmd = [
+            "gh",
+            "api",
+            "--method",
+            "PATCH",
+            f"repos/{repo}/issues/comments/{comment_id}",
+        ]
+    ok, out = run_checked(cmd + ["-f", f"body={body}"])
+    if not ok:
+        die(f"could not write the balancer comment on PR #{pr}: {out}")
+
+
+def remove_reviewers(
+    logins: list[str], pr: str, repo: str, style: Style
+) -> tuple[list[str], list[str]]:
+    """Withdraw pending requests; returns (withdrawn, kept).
+
+    GitHub answers 200 either way. While a ruleset requires review from code
+    owners it keeps automatically requested owners whose files are still in
+    the diff, so the request list is read back and anyone still on it is
+    reported as kept rather than claimed as withdrawn.
+    """
+    if not logins:
+        return [], []
+    ok, out = run_checked(
+        [
+            "gh",
+            "api",
+            "--method",
+            "DELETE",
+            f"repos/{repo}/pulls/{pr}/requested_reviewers",
+            "--input",
+            "-",
+        ],
+        stdin=json.dumps({"reviewers": logins}),
+    )
+    if not ok:
+        die(f"could not withdraw review requests on PR #{pr}: {out}")
+    try:
+        still = {u["login"].lower() for u in json.loads(out)["requested_reviewers"]}
+    except (ValueError, KeyError, TypeError):
+        still = {login.lower() for login in pr_review_state(pr, repo)[0]}
+    withdrawn = [login for login in logins if login.lower() not in still]
+    kept = [login for login in logins if login.lower() in still]
+    if withdrawn:
+        joined = ", ".join(f"@{login}" for login in withdrawn)
+        print(f"Withdrew review requests on PR #{pr} from {style.yellow(joined)}")
+    if kept:
+        joined = ", ".join(f"@{login}" for login in kept)
+        print(
+            style.yellow(
+                f"GitHub kept the requests of {joined}: a ruleset that requires "
+                "review from code owners pins automatically requested owners."
+            )
+        )
+    return withdrawn, kept
+
+
+def balance_pr(
+    groups: dict,
+    author: str | None,
+    pr: str,
+    repo: str,
+    style: Style,
+    *,
+    request: bool,
+    prune: bool,
+    comment: bool,
+) -> dict:
+    """Balance one PR: pick for the areas nobody covers yet, then act.
+
+    An area counts as covered by an earlier pick of this balancer or by
+    anyone who has reviewed, whether or not their request is still pending:
+    a person who withdrew a pick meant it. Only the areas balanced in this
+    run have their other pending owners withdrawn, so a reviewer someone
+    added by hand to an already covered area is left alone.
+    """
+    pending, reviewed, labels = pr_review_state(pr, repo)
+    comment_id, state = read_marker(pr, repo)
+    prev_picks = [str(p) for p in state.get("picks", [])]
+    result: dict = {
+        "areas": [],
+        "picks": [],
+        "loads": {},
+        "requested": [],
+        "pruned": [],
+        "pinned": [],
+        "skipped": None,
+    }
+    if OPT_OUT_LABEL in labels:
+        result["skipped"] = f"label {OPT_OUT_LABEL}"
+        print(f"PR #{pr} carries the {OPT_OUT_LABEL} label; leaving it alone.")
+        return result
+
+    areas = uncovered_areas(groups, author, set(prev_picks) | set(reviewed))
+    result["areas"] = areas
+    if not areas:
+        print(f"Every area of PR #{pr} already has a reviewer; nothing to do.")
+        return result
+
+    open_groups = {pattern: groups[pattern] for pattern in areas}
+    candidates = sorted(
+        {o for g in open_groups.values() for o in eligible_owners(g["owners"], author)}
+    )
+    loads = pending_review_loads(candidates, repo)
+    picks = balanced_picks(open_groups, loads, author, seed=str(pr))
+    result["loads"] = loads
+    result["picks"] = picks
+
+    pending_keys = {handle_key(p) for p in pending}
+    to_request = [p.lstrip("@") for p in picks if handle_key(p) not in pending_keys]
+    keep = prev_picks + reviewed + picks
+    to_prune = prune_candidates(groups, areas, pending, keep, author) if prune else []
+    result["requested"] = to_request
+    result["pruned"] = to_prune
+
+    print(style.bold("Least-loaded owner per area"))
+    width = max(len(p) for p in areas)
+    picked_by_area: dict[str, tuple[str, int]] = {}
+    for pattern in areas:
+        eligible = {
+            handle_key(o) for o in eligible_owners(groups[pattern]["owners"], author)
+        }
+        pick = next(p for p in picks if handle_key(p) in eligible)
+        load = loads.get(handle_key(pick), 0)
+        picked_by_area[pattern] = (pick, load)
+        depth = style.dim(f"({load} pending)")
+        print(f"  {pattern.ljust(width)}  {style.green(pick)}  {depth}")
+
+    if request and to_request:
+        request_reviewers(to_request, pr, repo, style)
+    withdrawn, kept = remove_reviewers(to_prune, pr, repo, style) if prune else ([], [])
+    result["pruned"] = withdrawn
+    result["pinned"] = kept
+    if comment:
+        new_state = {
+            "areas": sorted(set(state.get("areas", [])) | set(areas)),
+            "picks": sorted({handle_key(p) for p in prev_picks + picks}),
+        }
+        write_marker(
+            pr,
+            repo,
+            comment_id,
+            balancer_comment(picked_by_area, withdrawn, new_state, kept),
+        )
+    return result
+
+
 class Style:
     def __init__(self, enabled: bool):
         self.enabled = enabled
@@ -393,6 +828,8 @@ def report(
     show_files: bool,
     style: Style,
     author: str | None = None,
+    picks: list[str] | None = None,
+    loads: dict[str, int] | None = None,
 ) -> None:
     if not files:
         print(f"No files found ({source}). Nothing to review.")
@@ -419,18 +856,32 @@ def report(
                 for path in group["files"]:
                     print(style.dim(f"      {path}"))
 
-        cover = minimal_cover(groups, author)
+        balanced = picks is not None
+        cover = picks if balanced else minimal_cover(groups, author)
         mine = self_owned_areas(groups, author)
         print()
         if cover:
             print(style.bold("Ping these reviewers"))
-            print(f"  {style.green(' '.join(cover))}")
-            print(
-                style.dim(
-                    "  (smallest set covering every area above; "
-                    "one approval per area is required)"
+            if balanced:
+                shown = " ".join(
+                    f"{o} ({(loads or {}).get(handle_key(o), 0)} pending)"
+                    for o in cover
                 )
-            )
+                print(f"  {style.green(shown)}")
+                print(
+                    style.dim(
+                        "  (least-loaded owner per area; "
+                        "one approval per area is required)"
+                    )
+                )
+            else:
+                print(f"  {style.green(' '.join(cover))}")
+                print(
+                    style.dim(
+                        "  (smallest set covering every area above; "
+                        "one approval per area is required)"
+                    )
+                )
             handles = ",".join(o.lstrip("@") for o in cover)
             print()
             print(style.dim("  gh pr edit --add-reviewer ") + handles)
@@ -496,9 +947,36 @@ def main() -> None:
         help="request review from the owners on the PR "
         "(--pr, else the current branch's PR)",
     )
+    parser.add_argument(
+        "--balance",
+        action="store_true",
+        help="pick one owner per area, the one with the fewest open review "
+        "requests in the repo, instead of the smallest covering set",
+    )
+    parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="with --pr --balance: withdraw the pending requests of the other "
+        "owners of the areas balanced in this run",
+    )
+    parser.add_argument(
+        "--comment",
+        action="store_true",
+        help="with --pr --balance: keep one comment on the PR explaining the "
+        "picks (the Reviewer Balancer workflow sets this)",
+    )
     parser.add_argument("--json", action="store_true", help="print JSON output")
     parser.add_argument("--no-color", action="store_true", help="disable color")
     args = parser.parse_args()
+
+    if (args.prune or args.comment) and not (args.pr and args.balance):
+        parser.error("--prune and --comment need --pr and --balance")
+
+    color = sys.stdout.isatty() and not args.no_color and not os.environ.get("NO_COLOR")
+    style = Style(color)
+
+    # With --json the human report goes to stderr, so stdout stays parseable.
+    report_to = contextlib.redirect_stdout(sys.stderr) if args.json else nullcontext()
 
     root = repo_root()
     rules, codeowners_path = load_rules(root, args.codeowners)
@@ -514,8 +992,36 @@ def main() -> None:
     groups, unowned = group_by_rule(files, rules)
     author = resolve_author(args.pr, args.repo)
 
+    if args.balance and args.pr and (args.request or args.prune or args.comment):
+        # The workflow path: act on the PR and report what was done.
+        with report_to:
+            result = balance_pr(
+                groups,
+                author,
+                str(args.pr),
+                resolve_repo(args.repo),
+                style,
+                request=args.request,
+                prune=args.prune,
+                comment=args.comment,
+            )
+        if args.json:
+            print(json.dumps(result, indent=2))
+        return
+
+    picks: list[str] | None = None
+    loads: dict[str, int] | None = None
+    if args.balance:
+        repo = resolve_repo(args.repo)
+        candidates = sorted(
+            {o for g in groups.values() for o in eligible_owners(g["owners"], author)}
+        )
+        loads = pending_review_loads(candidates, repo)
+        picks = balanced_picks(groups, loads, author, seed=str(args.pr or ""))
+    reviewers = picks if picks is not None else minimal_cover(groups, author)
+
     if args.handles:
-        print(",".join(o.lstrip("@") for o in minimal_cover(groups, author)))
+        print(",".join(o.lstrip("@") for o in reviewers))
         return
 
     if args.json:
@@ -533,7 +1039,9 @@ def main() -> None:
                         }
                         for pattern in sorted(groups)
                     ],
-                    "reviewers": minimal_cover(groups, author),
+                    "reviewers": reviewers,
+                    "balanced": picks is not None,
+                    "loads": loads or {},
                     "author": author,
                     "self_owned": self_owned_areas(groups, author),
                     "unowned": unowned,
@@ -543,8 +1051,6 @@ def main() -> None:
         )
         return
 
-    color = sys.stdout.isatty() and not args.no_color and not os.environ.get("NO_COLOR")
-    style = Style(color)
     report(
         source,
         files,
@@ -554,10 +1060,12 @@ def main() -> None:
         args.files,
         style,
         author,
+        picks,
+        loads,
     )
 
     if args.request:
-        request_reviewers(minimal_cover(groups, author), args.pr, args.repo, style)
+        request_reviewers(reviewers, args.pr, args.repo, style)
 
 
 if __name__ == "__main__":

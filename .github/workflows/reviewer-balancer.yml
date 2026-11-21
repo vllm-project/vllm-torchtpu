@@ -1,0 +1,90 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: Reviewer Balancer
+
+# GitHub asks every owner in .github/CODEOWNERS of every area a PR touches,
+# so a PR that touches a few areas asks a dozen people and the owners on the
+# broad rules sit on dozens of pending requests. This trims each new PR to
+# one owner per area: the owner with the fewest open review requests in the
+# repo, as `scripts/find_owners.py --balance` picks them. The other pending
+# code-owner requests of those areas are withdrawn. CODEOWNERS stays the
+# record of who may approve; one owner's approval per area is still required,
+# and any owner may give it.
+#
+# Withdrawing only works while no ruleset requires review from code owners:
+# GitHub pins automatically requested owners under that rule and answers the
+# withdrawal with 200 without acting. The script reads the request list back
+# and reports such owners as kept, on the PR as well, rather than claiming
+# to have withdrawn them.
+#
+# What it never does: ask or drop anyone on a draft; touch a reviewer who has
+# already reviewed, or one who owns none of the areas balanced in this run
+# (a person asked them); move an area a previous run already covered, even if
+# its pick was withdrawn by hand; or run on a PR labeled
+# `no-reviewer-balance`. A failure leaves GitHub's own requests in place.
+#
+# pull_request_target, not pull_request: changing reviewers needs a write
+# token, and a fork PR's `pull_request` runs only get a read-only one. It
+# runs this file and the script from the base branch and never checks out the
+# PR, so no PR code runs with that token. Keep it that way: the checkout
+# below is pinned to the base commit, and event fields are read only through
+# env.
+
+on:
+  pull_request_target:
+    types: [opened, ready_for_review, synchronize]
+
+permissions:
+  contents: read
+  # Request and withdraw reviewers; keep the explanatory comment.
+  pull-requests: write
+
+concurrency:
+  group: reviewer-balancer-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  balance:
+    name: Balance reviewer load
+    if: >-
+      github.repository == 'vllm-project/vllm-torchtpu' &&
+      github.event.pull_request.draft == false &&
+      !contains(github.event.pull_request.labels.*.name, 'no-reviewer-balance')
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      # The base commit, never the PR head: the script and CODEOWNERS are
+      # policy, and a PR must not be able to pick its own reviewers.
+      - name: Check out the base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: |
+            scripts/find_owners.py
+            .github/CODEOWNERS
+          sparse-checkout-cone-mode: false
+
+      - name: Pick one least-loaded owner per area
+        # Balancing is a convenience: if it fails, the PR simply keeps
+        # GitHub's own code-owner requests.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 scripts/find_owners.py \
+            --pr "${PR_NUMBER}" \
+            --repo "${REPO}" \
+            --codeowners .github/CODEOWNERS \
+            --balance --request --prune --comment --no-color
