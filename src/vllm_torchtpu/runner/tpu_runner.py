@@ -5924,6 +5924,10 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.distributed import pallas_all_reduce
 
             pallas_all_reduce.arm(self.model_config.get_hidden_size(), self.device)
+        if envs.TPU_DSPARK_FUSED_MLP and self._is_async_drafter:
+            from vllm_torchtpu.models.minimax_m3.dspark_mlp import arm_fused_mlp
+
+            arm_fused_mlp(self._async_drafter.draft_model)
 
     def load_lora_model(
         self,

@@ -63,7 +63,7 @@ from vllm_torchtpu.layers.adapter.cp_draft_attention import (
 )
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP
+from vllm_torchtpu.models.minimax_m3.dspark_mlp import MiniMaxM3DSparkMLP
 from vllm_torchtpu.models.minimax_m3.quant import QUANT_METHOD
 from vllm_torchtpu.spec_decode.vocab_parallel_argmax import (
     MAX_VOCAB_FOR_FLOAT_IDS,
@@ -196,7 +196,7 @@ class MiniMaxM3DSparkDecoderLayer(DFlashQwen3DecoderLayer):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
-        self.mlp = MiniMaxM3MLP(
+        self.mlp = MiniMaxM3DSparkMLP(
             config,
             config.dspark_ffn_hidden_size,
             quant_config,

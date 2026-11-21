@@ -157,6 +157,7 @@ if TYPE_CHECKING:
     TPU_SPEC_SYNTHETIC_ROW_SPLIT: bool = True
     TPU_SPEC_SYNTHETIC_ROW_SPLIT_MIN_ROWS: int = 1
     TPU_DSPARK_MARKOV_KERNEL: bool = True
+    TPU_DSPARK_FUSED_MLP: bool = False
     TPU_SAMPLER_TOP_P_KERNEL: bool = True
     TPU_FP8_LM_HEAD: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
@@ -1173,6 +1174,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (kernels/collectives/markov_argmax.py) instead of a per-step XLA loop
     # with an all-gather. 0 keeps the loop.
     "TPU_DSPARK_MARKOV_KERNEL": env_bool("TPU_DSPARK_MARKOV_KERNEL", default=True),
+    # The MiniMax DSpark draft's dense MLP on e4m3 linears runs as one Pallas
+    # call at decode rows (kernels/dspark_mlp.py; XLA above its row cap).
+    "TPU_DSPARK_FUSED_MLP": env_bool("TPU_DSPARK_FUSED_MLP", default=False),
     # Token recovery without top-k or draft probabilities (the synthetic
     # verify's sampler) runs on a Pallas kernel holding each row as a dense
     # [vocab / 128, 128] slab (kernels/top_p_sample.py). 0 keeps the XLA path.
