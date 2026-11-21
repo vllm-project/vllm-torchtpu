@@ -1175,6 +1175,10 @@ class TPUModelRunner(GPUModelRunner):
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
         )
+        # Source lengths `_precompile_substitute_placeholder_token` warms,
+        # filled on first use (`_warmed_next_tokens`) and cleared whenever the
+        # request caps they depend on are refreshed.
+        self._substitute_lens_cache: list[int] | None = None
 
         # Pallas SMEM-aware num_reqs caps.
         # Capacity state exists before the first refresh; subsequent refreshes
@@ -2863,8 +2867,45 @@ class TPUModelRunner(GPUModelRunner):
             input_ids,
             cur_input_indices,
             pre_next_tokens_indices,
-            self._pre_async_results.next_tokens_tpu,
+            self._warmed_next_tokens(self._pre_async_results.next_tokens_tpu),
         )
+
+    def _substitute_next_lens(self) -> list[int]:
+        """next_tokens lengths `_precompile_substitute_placeholder_token` warms:
+        the stride-1 num_reqs buckets (non-spec / pure-async) and, with an
+        async drafter, the fixed stride-(1+K) span its steps park
+        (`_async_spec_source_rows`; see sample_tokens)."""
+        next_lens = list(self.num_reqs_paddings)
+        if self._is_async_drafter:
+            assert self.speculative_config is not None
+            next_lens.append(
+                self._async_spec_source_rows()
+                * (1 + self.speculative_config.num_speculative_tokens)
+            )
+        return sorted(set(next_lens))
+
+    def _warmed_next_tokens(self, next_tokens: torch.Tensor) -> torch.Tensor:
+        """`next_tokens` as the flat int64 source the precompile warmed.
+
+        Pads to the next warmed length (the substitution never reads past the
+        real entries), so an odd source length (e.g. several chunks' stride-1
+        sampled tokens concatenated) does not compile mid-run, and casts to
+        int64 (the async drafter's source carries int32 drafts). A source no
+        warmed length fits is passed through unchanged."""
+        n = next_tokens.numel()
+        lens = self._substitute_lens_cache
+        if lens is None:
+            lens = self._substitute_next_lens()
+            self._substitute_lens_cache = lens
+        target = next((m for m in lens if m >= n), None)
+        if target is None:
+            return next_tokens
+        if next_tokens.dim() == 1 and n == target and next_tokens.dtype == torch.int64:
+            return next_tokens
+        flat = next_tokens.reshape(-1).to(torch.int64)
+        if target > n:
+            flat = torch.nn.functional.pad(flat, (0, target - n))
+        return flat
 
     def _flush_disjoint_async_results(self) -> None:
         if self._pre_async_results is None:
@@ -7560,17 +7601,10 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_substitute_placeholder_token(self) -> None:
         if not self.scheduler_config.async_scheduling:
             return
-        # next_tokens source lengths the runtime produces: stride-1 num_reqs
-        # buckets (non-spec / pure-async), plus the bounded stride-(1+K) span
-        # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
-        # substitute doesn't recompile per real num_reqs.
-        next_lens = list(self.num_reqs_paddings)
-        if self._is_async_drafter:
-            assert self.speculative_config is not None
-            next_lens.append(
-                self._async_spec_source_rows()
-                * (1 + self.speculative_config.num_speculative_tokens)
-            )
+        # next_tokens source lengths the runtime produces, so the substitute
+        # doesn't recompile per real num_reqs; `_warmed_next_tokens` pads and
+        # casts the runtime source to one of them.
+        next_lens = self._substitute_next_lens()
         with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
                 input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
@@ -9268,6 +9302,7 @@ class TPUModelRunner(GPUModelRunner):
             self.num_blocks_per_most_len_req = pages
         self._attention_capacity.clear()
         self._decode_device_cache_key = None
+        self._substitute_lens_cache = None
 
     def may_reinitialize_input_batch(
         self,
