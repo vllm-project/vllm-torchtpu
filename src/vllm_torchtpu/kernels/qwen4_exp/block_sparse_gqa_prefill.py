@@ -577,6 +577,14 @@ def _kernel(
     # VLLM_TPU_QSA_PREFILL_LANE_SUM: per-row masses kept as 128-lane partial
     # sums (rows, 128), reduced across lanes once per query block.
     lane_ref = refs[7] if lane_sum else None
+    # VPU path with qkfirst: the last unit of each KV tile (its scores, the
+    # selection bits of its query rows and the tile's values), carried into
+    # the next tile's body; one slot per tile parity (see compute_tile_vpu).
+    num_units = (query_block // query_tile) * kv_heads
+    carry = "qkfirst" in vpu and num_units > 1
+    carry_score_ref, carry_bits_ref, carry_value_ref = (
+        refs[7:10] if carry else (None,) * 3
+    )
     bf16_mass = "bf16mass" in lane_sum
     if bound_stab:
         assert lane_sum and not lazy and not bf16_mxu
@@ -707,6 +715,11 @@ def _kernel(
 
     if lane_sum:
         lane_ref[...] = jnp.zeros(lane_ref.shape, jnp.float32)
+    if carry:
+        # The first tile's carried unit sees no key (all-zero bits) and finite
+        # values: its softmax step leaves the state bit-identical.
+        carry_bits_ref[1] = jnp.zeros(carry_bits_ref.shape[1:], jnp.int32)
+        carry_value_ref[1] = jnp.zeros(carry_value_ref.shape[1:], carry_value_ref.dtype)
     if lazy:
         stab_ref[...] = jnp.full(stab_ref.shape, -jnp.inf, jnp.float32)
         partial_ref[...] = jnp.zeros(partial_ref.shape, jnp.float32)
@@ -972,6 +985,7 @@ def _kernel(
                     acc * alpha[:, None] + weighted
                 )
 
+    rows = query_tile * q_heads_per_kv
     if vpu:
         # Each unit's query rows in unit order, built once per query block.
         source = q16_vpu if "qk16" in vpu else q
@@ -983,7 +997,41 @@ def _kernel(
             for start in range(0, query_block, query_tile)
         ]
 
-    def compute_tile_vpu(tile, kv_ref, boundary):
+    def attend(query_tile_index, head, score, tile_visible, value):
+        """One unit's online-softmax step over this KV tile."""
+        m = max_ref[query_tile_index, head, :]
+        mass = mass_ref[query_tile_index, head, :]
+        acc = accumulator_ref[query_tile_index, head, :, :]
+        if "qk16" in vpu and not scale_folded:
+            score = score * score_scale
+        row_visible = jnp.broadcast_to(
+            tile_visible.reshape(groups_per_tile, 1, row_group, kv_tile),
+            (groups_per_tile, q_heads_per_kv, row_group, kv_tile),
+        ).reshape(rows, kv_tile)
+        score = jnp.where(row_visible, score, -jnp.inf)
+        next_m = jnp.maximum(m, jnp.max(score, axis=1))
+        finite_m = jnp.where(jnp.isneginf(next_m), 0.0, next_m)
+        alpha = jnp.where(jnp.isneginf(next_m), 1.0, jnp.exp(m - next_m))
+        prob = jnp.exp(score - finite_m[:, None])
+        prob_sum = jnp.sum(prob, axis=1)
+        if "pv16" in vpu:
+            # Mosaic already feeds an FP32 dot to the MXU as one BF16
+            # pass (bit-identical on v7x); casting here only skips the
+            # FP32 operand relayout.
+            prob = prob.astype(jnp.bfloat16)
+        weighted = lax.dot(
+            prob,
+            value,
+            dimension_numbers=(([1], [0]), ([], [])),
+            preferred_element_type=jnp.float32,
+        )
+        max_ref[query_tile_index, head, :] = next_m
+        mass_ref[query_tile_index, head, :] = mass * alpha + prob_sum
+        accumulator_ref[query_tile_index, head, :, :] = (
+            acc * alpha[:, None] + weighted
+        )
+
+    def compute_tile_vpu(tile, kv_ref, boundary, parity):
         """compute_tile with less vector work per score (VLLM_TPU_QSA_PREFILL_VPU).
 
         Each 128-key segment of a KV tile is covered by one selection word, so
@@ -1010,9 +1058,8 @@ def _kernel(
                 segments[0] if tile_words == 1 else jnp.concatenate(segments, axis=1)
             )
         bits = part_bits[0] if parts == 1 else jnp.concatenate(part_bits, axis=0)
-        visible = bits < 0
         if boundary:
-            visible &= logical + row[None, :] <= positions[:, None]
+            bits = jnp.where(logical + row[None, :] <= positions[:, None], bits, 0)
             written = logical + lax.broadcasted_iota(
                 jnp.int32, (kv_tile, head_dim), 0
             ) < jnp.max(lengths_ref[:, 0])
@@ -1035,7 +1082,6 @@ def _kernel(
             if pv16:
                 value = value.astype(jnp.bfloat16)
             key_values.append((key, value))
-        rows = query_tile * q_heads_per_kv
 
         def qk(query_tile_index, head, key):
             return lax.dot(
@@ -1045,14 +1091,48 @@ def _kernel(
                 preferred_element_type=jnp.float32,
             )
 
-        # qkfirst: issue the next (subtile, head)'s QK before this one's
-        # softmax and PV, so the QK matmuls do not queue behind them. One
-        # unit of lookahead keeps at most two score tiles live (VMEM).
+        def unit_bits(query_tile_index):
+            start = query_tile_index * query_tile
+            return bits[start : start + query_tile]
+
         units = [
             (query_tile_index, head)
             for query_tile_index in range(num_query_tiles)
             for head in range(len(key_values))
         ]
+        if carry:
+            # qkfirst across tiles: this tile's first QK is issued next to the
+            # previous tile's last unit, whose scores were kept, and each QK
+            # runs one unit ahead of the softmax; the last unit's scores are
+            # kept for the next tile. Every unit still takes its tiles in
+            # order with the same operands: bit-identical.
+            scores = {0: qk(*units[0], key_values[units[0][1]][0])}
+            attend(
+                *units[-1],
+                carry_score_ref[1 - parity],
+                carry_bits_ref[1 - parity] < 0,
+                carry_value_ref[1 - parity],
+            )
+            for index, (query_tile_index, head) in enumerate(units[:-1]):
+                ahead = units[index + 1]
+                scores[index + 1] = qk(*ahead, key_values[ahead[1]][0])
+                attend(
+                    query_tile_index,
+                    head,
+                    scores.pop(index),
+                    unit_bits(query_tile_index) < 0,
+                    key_values[head][1],
+                )
+            carry_score_ref[parity] = scores.pop(len(units) - 1)
+            carry_bits_ref[parity] = unit_bits(units[-1][0])
+            carried_value = key_values[units[-1][1]][1]
+            assert carried_value.dtype == carry_value_ref.dtype
+            carry_value_ref[parity] = carried_value
+            return
+
+        # qkfirst: issue the next (subtile, head)'s QK before this one's
+        # softmax and PV, so the QK matmuls do not queue behind them. One
+        # unit of lookahead keeps at most two score tiles live (VMEM).
         early = {}
 
         def issue(index):
@@ -1061,45 +1141,18 @@ def _kernel(
                 early[units[index]] = qk(query_tile_index, head, key_values[head][0])
 
         for index, (query_tile_index, head) in enumerate(units):
-            key, value = key_values[head]
-            start = query_tile_index * query_tile
-            tile_visible = visible[start : start + query_tile]
-            m = max_ref[query_tile_index, head, :]
-            mass = mass_ref[query_tile_index, head, :]
-            acc = accumulator_ref[query_tile_index, head, :, :]
             if "qkfirst" in vpu:
                 issue(index)
                 issue(index + 1)
                 score = early.pop(units[index])
             else:
-                score = qk(query_tile_index, head, key)
-            if "qk16" in vpu and not scale_folded:
-                score = score * score_scale
-            row_visible = jnp.broadcast_to(
-                tile_visible.reshape(groups_per_tile, 1, row_group, kv_tile),
-                (groups_per_tile, q_heads_per_kv, row_group, kv_tile),
-            ).reshape(rows, kv_tile)
-            score = jnp.where(row_visible, score, -jnp.inf)
-            next_m = jnp.maximum(m, jnp.max(score, axis=1))
-            finite_m = jnp.where(jnp.isneginf(next_m), 0.0, next_m)
-            alpha = jnp.where(jnp.isneginf(next_m), 1.0, jnp.exp(m - next_m))
-            prob = jnp.exp(score - finite_m[:, None])
-            prob_sum = jnp.sum(prob, axis=1)
-            if pv16:
-                # Mosaic already feeds an FP32 dot to the MXU as one BF16
-                # pass (bit-identical on v7x); casting here only skips the
-                # FP32 operand relayout.
-                prob = prob.astype(jnp.bfloat16)
-            weighted = lax.dot(
-                prob,
-                value,
-                dimension_numbers=(([1], [0]), ([], [])),
-                preferred_element_type=jnp.float32,
-            )
-            max_ref[query_tile_index, head, :] = next_m
-            mass_ref[query_tile_index, head, :] = mass * alpha + prob_sum
-            accumulator_ref[query_tile_index, head, :, :] = (
-                acc * alpha[:, None] + weighted
+                score = qk(query_tile_index, head, key_values[head][0])
+            attend(
+                query_tile_index,
+                head,
+                score,
+                unit_bits(query_tile_index) < 0,
+                key_values[head][1],
             )
 
     if vpu:
@@ -1110,13 +1163,15 @@ def _kernel(
             if dcp_world > 1:
                 end = (tile * dcp_world + rank_ref[0]) * kv_tile + kv_tile
 
+            parity = 0 if kv_ref is kv0_ref else 1
+
             @pl.when(end <= min_length)
             def interior():
-                compute_tile_vpu(tile, kv_ref, False)
+                compute_tile_vpu(tile, kv_ref, False, parity)
 
             @pl.when(end > min_length)
             def boundary():
-                compute_tile_vpu(tile, kv_ref, True)
+                compute_tile_vpu(tile, kv_ref, True, parity)
 
     def run_tiles(tile_fn):
         @pl.when(count > 0)
@@ -1199,6 +1254,21 @@ def _kernel(
 
     if not lazy:
         run_tiles(compute_tile)
+        if carry:
+            # The last tile's carried unit: tile parity (count - 1) % 2.
+            last_query_tile, last_head = num_query_tiles - 1, kv_heads - 1
+            for parity in (0, 1):
+
+                @pl.when(count % 2 == 1 - parity)
+                def drain():
+                    attend(
+                        last_query_tile,
+                        last_head,
+                        carry_score_ref[parity],
+                        carry_bits_ref[parity] < 0,
+                        carry_value_ref[parity],
+                    )
+
         finalize(row_state)
         return
 
@@ -1858,6 +1928,20 @@ def _block_sparse_gqa_prefill(
             + (
                 [pltpu.VMEM((*state_shape, 128), jnp.float32)]
                 if lane_sum
+                else []
+            )
+            + (
+                [
+                    pltpu.VMEM((2, state_shape[2], kv_tile), jnp.float32),
+                    pltpu.VMEM((2, query_tile, kv_tile), jnp.int32),
+                    pltpu.VMEM(
+                        (2, kv_tile, head_dim),
+                        jnp.bfloat16
+                        if "pv16" in vpu or cache.dtype == jnp.bfloat16
+                        else jnp.float32,
+                    ),
+                ]
+                if "qkfirst" in vpu and state_shape[0] * kv_heads > 1
                 else []
             ),
         ),
