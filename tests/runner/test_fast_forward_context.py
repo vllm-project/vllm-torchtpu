@@ -15,9 +15,11 @@
 except for attn_metadata, reuse the cached base only for the same key, and
 restore the previous context on exit."""
 
+import contextlib
 import dataclasses
 import types
 
+import numpy as np
 import pytest
 import torch
 import vllm.forward_context as fc
@@ -98,6 +100,8 @@ def test_cached_context_matches_stock_and_swaps_metadata():
             continue
         assert f_d[k] == s_d[k], k
     assert len(ffc._CACHE) == 1
+    # The cached context keeps no call's attn_metadata alive.
+    assert all(ctx.attn_metadata is None for ctx in ffc._CACHE.values())
 
 
 def test_restores_previous_context_and_keys_by_num_tokens():
@@ -127,6 +131,42 @@ def test_extra_kwargs_take_stock_path():
         skip_compiled=True,
     ):
         assert fc.get_forward_context().skip_compiled is True
+    assert len(ffc._CACHE) == 0
+
+
+def test_a_dp_count_that_is_not_a_tensor_takes_the_stock_path(monkeypatch):
+    # Serving passes a CPU tensor or None. Anything else, such as a NumPy
+    # array (which has .tolist and a .device string but no .numel), gets no
+    # key and takes the stock path instead of raising.
+    ffc._CACHE.clear()
+    cfg = _cfg()
+    stock = []
+    monkeypatch.setattr(
+        ffc, "_stock", lambda *a, **k: stock.append(a) or contextlib.nullcontext()
+    )
+    for dp in (np.array([4], dtype=np.int32), [4]):
+        assert ffc._key(cfg, 4, dp) is None
+        with ffc.fast_set_forward_context(
+            {}, cfg, num_tokens=4, num_tokens_across_dp=dp
+        ):
+            pass
+    assert len(stock) == 2
+    assert ffc._key(cfg, 4, torch.tensor([4], dtype=torch.int32)) == (id(cfg), 4, (4,))
+    assert len(ffc._CACHE) == 0
+
+
+def test_batch_size_tracking_takes_the_stock_path(monkeypatch):
+    # VLLM_LOG_BATCHSIZE_INTERVAL >= 0 sets vLLM's module-level
+    # track_batchsize; the stock path then times each forward.
+    ffc._CACHE.clear()
+    monkeypatch.setattr(fc, "track_batchsize", True)
+    with ffc.fast_set_forward_context(
+        None,
+        _cfg(),
+        num_tokens=4,
+        num_tokens_across_dp=torch.tensor([4], dtype=torch.int32),
+    ):
+        pass
     assert len(ffc._CACHE) == 0
 
 

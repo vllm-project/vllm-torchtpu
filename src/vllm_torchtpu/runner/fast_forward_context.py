@@ -38,6 +38,7 @@ import contextlib
 import copy
 from typing import Any
 
+import torch
 import vllm.forward_context as _fc
 
 _ENABLED = False
@@ -65,7 +66,7 @@ def _key(
 ) -> tuple | None:
     if num_tokens_across_dp is None:
         dp = None
-    elif hasattr(num_tokens_across_dp, "tolist"):
+    elif isinstance(num_tokens_across_dp, torch.Tensor):
         if (
             num_tokens_across_dp.device.type != "cpu"
             or num_tokens_across_dp.numel() > 64
@@ -98,7 +99,7 @@ def fast_set_forward_context(
 ):
     """Drop-in for `set_forward_context(attn_metadata, vllm_config, num_tokens=...,
     num_tokens_across_dp=...)`; any other keyword argument takes the stock path."""
-    if not _ENABLED or kwargs or getattr(_fc, "track_batchsize", False):
+    if not _ENABLED or kwargs or _fc.track_batchsize:
         return _stock(
             attn_metadata, vllm_config, num_tokens, num_tokens_across_dp, **kwargs
         )
@@ -126,5 +127,9 @@ def _build_and_cache(key, attn_metadata, vllm_config, num_tokens, num_tokens_acr
         fc = _fc.get_forward_context()
         if len(_CACHE) >= _MAX:
             _CACHE.pop(next(iter(_CACHE)))
-        _CACHE[key] = copy.copy(fc)
+        # Every later call sets its own attn_metadata on a copy, so the cached
+        # context does not keep this call's metadata tensors alive.
+        cached: Any = copy.copy(fc)
+        cached.attn_metadata = None
+        _CACHE[key] = cached
         yield
