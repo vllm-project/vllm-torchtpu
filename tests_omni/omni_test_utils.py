@@ -15,6 +15,7 @@
 
 import numpy as np
 import torch
+from PIL import Image
 
 
 def compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
@@ -127,3 +128,14 @@ def assert_all_loaded(loaded: set[str], module: torch.nn.Module) -> None:
     assert not missing, (
         f"vllm-omni parameters not loaded from checkpoint: {sorted(missing)[:10]}"
     )
+
+
+def compute_distribution_metrics(img: Image.Image) -> dict[str, float]:
+    """Calculate scalar distribution moments and percentiles from output pixels."""
+    arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+    return {
+        "mean": float(np.mean(arr)),
+        "p10": float(np.percentile(arr, 10)),
+        "p90": float(np.percentile(arr, 90)),
+        "var": float(np.var(arr)),
+    }
