@@ -56,7 +56,11 @@ _FOLLOWS_STEP_FORM = False
 # threshold stays DEFAULT_MIN_ROWS (every sequence-parallel step sliced, the
 # draft included, as on main) until the proposer records the draft's form.
 # The MTP proposer records it (`spec_decode/eagle3.py`, `_draft_rows_sliced`
-# and `sequence_parallel.set_active` before each draft forward).
+# and `sequence_parallel.set_active` before each draft forward). It is the
+# only proposer that can meet the threshold: the platform admits
+# sequence-parallel MoE with no speculative method but MTP
+# (`_configure_sequence_parallel_moe`), and without sequence-parallel MoE no
+# MoE layer reads the recorded form.
 DRAFT_RECORDS_STEP_FORM = True
 # With the switch on, _HAS_DRAFTER no longer changes gates_rows(); it and
 # set_has_drafter stay with their two callers until a follow-up drops them.
