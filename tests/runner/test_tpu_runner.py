@@ -4314,17 +4314,26 @@ def test_precompile_substitute_placeholder_token_matches_2d_sampled_tokens(monke
     monkeypatch.setattr(tpu_runner_mod, "synchronize_tensors", lambda _out: None)
 
     runner = SimpleNamespace(
-        scheduler_config=SimpleNamespace(async_scheduling=True),
+        scheduler_config=SimpleNamespace(async_scheduling=True, max_num_seqs=8),
         num_reqs_paddings=[8],
         num_tokens_paddings=[16],
         _is_async_drafter=False,
         speculative_config=None,
         max_num_reqs=8,
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=None,
+        most_model_len=None,
         device=torch.device("cpu"),
         _fast_token_substitution=False,
         _update_num_xla_graphs=lambda _name: None,
     )
-    runner._precompile_timed = TPUModelRunner._precompile_timed.__get__(runner)
+    for name in (
+        "_precompile_timed",
+        "_chunk_request_capacities",
+        "_async_spec_source_rows",
+        "_substitute_source_rows",
+    ):
+        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 
     with torch.enable_grad():
         TPUModelRunner._precompile_substitute_placeholder_token(runner)

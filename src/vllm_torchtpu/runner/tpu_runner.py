@@ -6187,12 +6187,17 @@ class TPUModelRunner(GPUModelRunner):
                     next_tokens_tpu = next_tokens_tpu_chunks[0]
                 else:
                     next_tokens_tpu = torch.cat(next_tokens_tpu_chunks, dim=0)
-                # Spec only (stride 1+K); pure-non-spec async keeps its
-                # stride-1 source + existing precompile.
+                # Park the source at a warmed length: spec (stride 1+K) via
+                # _park_async_spec_source, several non-spec chunks below.
                 if spec_num_rejected is not None:
                     next_tokens_tpu, spec_num_rejected = self._park_async_spec_source(
                         next_tokens_tpu, spec_num_rejected
                     )
+                elif len(next_tokens_tpu_chunks) > 1:
+                    # Several chunks' [num_reqs, 1] sources concatenated: pad
+                    # to a warmed row count so the substitution does not
+                    # compile mid-run. A single chunk parks a warmed bucket.
+                    next_tokens_tpu = self._pad_substitute_source(next_tokens_tpu)
                 self._pre_async_results = AsyncPreResults(
                     req_ids=req_ids,
                     next_tokens_tpu=next_tokens_tpu,
@@ -7647,25 +7652,44 @@ class TPUModelRunner(GPUModelRunner):
                 out = self.gather_logprobs(self._dummy_logits(num_tokens), row_tokens)
                 synchronize_tensors(out.logprobs)
 
+    def _substitute_source_rows(self) -> list[int]:
+        """Row counts of the [rows, 1] stride-1 sources the substitution is
+        warmed for: the num_reqs buckets one chunk parks, plus the most rows
+        several chunks concatenated can park (`_async_spec_source_rows`)."""
+        return sorted({*self.num_reqs_paddings, self._async_spec_source_rows()})
+
+    def _pad_substitute_source(self, next_tokens: torch.Tensor) -> torch.Tensor:
+        """A [rows, 1] source padded with zero rows to the next warmed row
+        count. The substitution never reads past the real rows; a source
+        already warmed, larger than every warmed count, or not [rows, 1], is
+        unchanged."""
+        if next_tokens.dim() != 2:
+            return next_tokens
+        rows = next_tokens.shape[0]
+        target = next((n for n in self._substitute_source_rows() if n >= rows), rows)
+        if target == rows:
+            return next_tokens
+        return torch.nn.functional.pad(next_tokens, (0, 0, 0, target - rows))
+
     def _precompile_substitute_placeholder_token(self) -> None:
         if not self.scheduler_config.async_scheduling:
             return
-        # next_tokens source shapes the runtime produces: [num_reqs, 1] buckets
-        # from non-spec sampling (kept 2D to avoid an eager view program), plus
-        # the bounded 1D stride-(1+K) span async eagle3 parks
-        # (max_num_reqs*(1+K); see sample_tokens) so spec substitute doesn't
-        # recompile per real num_reqs.
-        next_shapes: list[tuple[int, ...]] = [
-            (nlen, 1) for nlen in self.num_reqs_paddings
+        # next_tokens sources the runtime produces: [rows, 1] stride-1 sources
+        # from non-spec sampling (kept 2D to avoid an eager view program; a
+        # multi-chunk one is padded to one of these rows,
+        # `_pad_substitute_source`), plus the bounded 1D stride-(1+K) span an
+        # async drafter parks (see sample_tokens), so the substitute doesn't
+        # recompile per real num_reqs. The span carries the drafter's token
+        # dtype (int32 for eagle3 drafts), so it is warmed as int32 and int64.
+        next_sources: list[tuple[tuple[int, ...], torch.dtype]] = [
+            ((rows, 1), torch.int64) for rows in self._substitute_source_rows()
         ]
         if self._is_async_drafter:
             assert self.speculative_config is not None
-            next_shapes.append(
-                (
-                    self._async_spec_source_rows()
-                    * (1 + self.speculative_config.num_speculative_tokens),
-                )
+            span = self._async_spec_source_rows() * (
+                1 + self.speculative_config.num_speculative_tokens
             )
+            next_sources += [((span,), torch.int64), ((span,), torch.int32)]
         with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
                 input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
@@ -7677,8 +7701,8 @@ class TPUModelRunner(GPUModelRunner):
                 pre_next_tokens_indices = torch.full(
                     (num_tokens,), -1, dtype=torch.int32
                 ).to(self.device)
-                for shape in next_shapes:
-                    next_tokens = torch.zeros(shape, dtype=torch.int64).to(self.device)
+                for shape, dtype in next_sources:
+                    next_tokens = torch.zeros(shape, dtype=dtype).to(self.device)
                     out = _substitute_placeholder_token(
                         input_ids,
                         cur_input_indices,
