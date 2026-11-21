@@ -3787,13 +3787,8 @@ class TPUModelRunner(GPUModelRunner):
         token_in_tpu_cur_input_indices: np.ndarray,
         token_in_tpu_pre_next_tokens_indices: np.ndarray,
         *,
-        use_subst_cache: bool | None = None,
+        use_subst_cache: bool,
     ) -> torch.Tensor:
-        if use_subst_cache is None:
-            use_subst_cache = (
-                getattr(self, "_fast_token_substitution", False)
-                or self.device.type == "tpu"
-            )
         if use_subst_cache:
             # Fast path 2: Cache persistent device indices to eliminate per-step
             # H2D uploads across steady-state decode and spec-decode steps.
@@ -7983,27 +7978,17 @@ class TPUModelRunner(GPUModelRunner):
             spec_num_rejected = None
             num_draft_per_req = None
             if is_spec_step:
-                if deferred_mamba_indices is not None:
-                    (
-                        next_tokens_tpu_chunks,
-                        next_token_indices,
-                        spec_num_rejected,
-                        num_draft_per_req,
-                    ) = self._assemble_async_spec_substitution(
-                        eagle3_drafts,
-                        next_tokens_per_chunk,
-                        state,
-                        deferred_mamba_indices=deferred_mamba_indices,
-                    )
-                else:
-                    (
-                        next_tokens_tpu_chunks,
-                        next_token_indices,
-                        spec_num_rejected,
-                        num_draft_per_req,
-                    ) = self._assemble_async_spec_substitution(
-                        eagle3_drafts, next_tokens_per_chunk, state
-                    )
+                (
+                    next_tokens_tpu_chunks,
+                    next_token_indices,
+                    spec_num_rejected,
+                    num_draft_per_req,
+                ) = self._assemble_async_spec_substitution(
+                    eagle3_drafts,
+                    next_tokens_per_chunk,
+                    state,
+                    deferred_mamba_indices=deferred_mamba_indices,
+                )
             elif self._is_async_drafter and next_tokens_tpu_chunks:
                 # Prefill / pure-non-spec eagle3 bootstrap: the non-spec sampling
                 # branch parked a stride-1 source (sampled token only). Rebuild
