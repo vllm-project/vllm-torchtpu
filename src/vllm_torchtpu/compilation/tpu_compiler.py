@@ -308,7 +308,6 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # padded layouts can share pool and block-table shapes.
     "vllm_torchtpu/kv_cache_spec_normalizer.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
-    "vllm_torchtpu/layers/adapter/routed_experts_capturer.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
