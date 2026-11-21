@@ -188,8 +188,8 @@ def block_topk(
     assert plan is not None
     resident, buffers = plan
     chunk = _chunk(width)
-    # Given maxima are read in whole chunks of their row; folded ones are
-    # staged in the score buffer, which streamed rows size for two chunks.
+    # Folded given maxima are staged in the score buffer, which streamed rows
+    # size for two chunks.
     maxima_chunk = _maxima_chunk(block_width)
     staged = fold * maxima_chunk if fold > 1 else lanes
     inputs = (scores, token_lengths)
@@ -226,7 +226,6 @@ def block_topk(
             # Streamed rows: the chosen blocks' keys, fetched from HBM.
             fetched=pltpu.VMEM((lanes if resident else candidates,), jnp.float32),
             score_sems=pltpu.SemaphoreType.DMA((2,)),
-            maxima_sem=pltpu.SemaphoreType.DMA,
             output_sem=pltpu.SemaphoreType.DMA,
             length_sem=pltpu.SemaphoreType.DMA,
             publish_sem=pltpu.SemaphoreType.DMA,
@@ -249,7 +248,6 @@ def block_topk(
         limits,
         fetched,
         score_sems,
-        maxima_sem,
         output_sem,
         length_sem,
         publish_sem,
@@ -313,38 +311,55 @@ def block_topk(
 
         folded = [radix.lane_ids * fold + j for j in range(fold)]
 
-        def read_maxima(row_id, live_blocks):
-            """Copy the chunks of given maxima that hold the visible blocks."""
-            reads = pl.cdiv(live_blocks, maxima_chunk)
-            if fold == 1:
+        # Given maxima are read in half chunks, two in flight, each prepared as
+        # it lands; folded ones are staged in the halves of the score buffer.
+        stage = maxima_chunk // 2
 
-                def copy(c):
-                    window = pl.ds(c * maxima_chunk, maxima_chunk)
+        def read_maxima(row_id, live_blocks, block_chunks, prepare):
+            """Read and prepare the given maxima of the visible blocks."""
+            reads = pl.cdiv(live_blocks, stage)
+
+            def copy(c):
+                slot = c % 2
+                if fold == 1:
+                    window = pl.ds(c * stage, stage)
                     return pltpu.make_async_copy(
-                        maxima_ref.at[row_id, window], maxima.at[window], maxima_sem
+                        maxima_ref.at[row_id, window],
+                        maxima.at[window],
+                        score_sems.at[slot],
                     )
+                return pltpu.make_async_copy(
+                    maxima_ref.at[row_id, pl.ds(c * fold * stage, fold * stage)],
+                    score_buffers.at[pl.ds(slot * fold * stage, fold * stage)],
+                    score_sems.at[slot],
+                )
 
-                pl.loop(0, reads)(lambda c: copy(c).start())
-                pl.loop(0, reads)(lambda c: copy(0).wait())
-                return
+            pl.when(reads > 0)(lambda: copy(0).start())
+            pl.when(reads > 1)(lambda: copy(1).start())
 
             @pl.loop(0, reads)
-            def fold_chunk(c):
-                pltpu.async_copy(
-                    maxima_ref.at[row_id, pl.ds(c * staged, staged)],
-                    score_buffers.at[pl.ds(0, staged)],
-                    maxima_sem,
-                ).wait()
+            def land(c):
+                copy(c).wait()
+                if fold > 1:
+                    staging = (c % 2) * fold * stage
 
-                @plsc.parallel_loop(0, maxima_chunk // lanes, unroll=8)
-                def reduce(i):
-                    # Lane j folds the `fold` maxima of its block; strided
-                    # slices are refused, so gather at constant offsets.
-                    window = score_buffers.at[pl.ds(i * lanes * fold, lanes * fold)]
-                    values = plsc.load_gather(window, [folded[0]])
-                    for offset in folded[1:]:
-                        values = jnp.maximum(values, plsc.load_gather(window, [offset]))
-                    maxima[pl.ds(c * maxima_chunk + i * lanes, lanes)] = values
+                    @plsc.parallel_loop(0, stage // lanes, unroll=8)
+                    def reduce(i):
+                        # Lane j folds the `fold` maxima of its block; strided
+                        # slices are refused, so gather at constant offsets.
+                        window = score_buffers.at[
+                            pl.ds(staging + i * lanes * fold, lanes * fold)
+                        ]
+                        values = plsc.load_gather(window, [folded[0]])
+                        for offset in folded[1:]:
+                            values = jnp.maximum(
+                                values, plsc.load_gather(window, [offset])
+                            )
+                        maxima[pl.ds(c * stage + i * lanes, lanes)] = values
+
+                pl.when(c + 2 < reads)(lambda: copy(c + 2).start())
+                vectors = stage // lanes
+                prepare(c * vectors, jnp.minimum((c + 1) * vectors, block_chunks))
 
         def fetch_blocks(row_id, count):
             """DMA the keys of the first `count` chosen blocks into `fetched`.
@@ -392,10 +407,6 @@ def block_topk(
             live_blocks = pl.cdiv(tokens, block_size)
             block_chunks = pl.cdiv(live_blocks, lanes)
             base = slot * width
-            if given:
-                read_maxima(row_id, live_blocks)
-            elif not resident:
-                stream_maxima(row_id, tokens)
             radix.clear()
 
             def block_values(i):
@@ -404,17 +415,27 @@ def block_topk(
                 # Blocks past the length read in-row keys; the caller masks them.
                 return block_max(score_buffers.at[pl.ds(base + i * span, span)])
 
-            @plsc.parallel_loop(0, block_chunks, unroll=8)
-            def prepare_blocks(i):
-                positions = radix.positions(i)
-                values = block_values(i)
-                if publish:
-                    # Publication rule: the newest visible block always wins.
-                    values = jnp.where(positions == live_blocks - 1, jnp.inf, values)
-                live = positions < live_blocks
-                bits = _ordered_bits(jnp.where(live, values, -jnp.inf))
-                maxima[pl.ds(i * lanes, lanes)] = bits.view(jnp.float32)
-                radix.add(bits)
+            def prepare(start, stop):
+                @plsc.parallel_loop(start, stop, unroll=8)
+                def prepare_blocks(i):
+                    positions = radix.positions(i)
+                    values = block_values(i)
+                    if publish:
+                        # Publication rule: the newest visible block always wins.
+                        values = jnp.where(
+                            positions == live_blocks - 1, jnp.inf, values
+                        )
+                    live = positions < live_blocks
+                    bits = _ordered_bits(jnp.where(live, values, -jnp.inf))
+                    maxima[pl.ds(i * lanes, lanes)] = bits.view(jnp.float32)
+                    radix.add(bits)
+
+            if given:
+                read_maxima(row_id, live_blocks, block_chunks, prepare)
+            else:
+                if not resident:
+                    stream_maxima(row_id, tokens)
+                prepare(0, block_chunks)
 
             publish_copy = None
             if publish:
