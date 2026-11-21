@@ -593,7 +593,7 @@ def test_check_regression_cli_output(tmp_path, monkeypatch, capsys):
     assert "FAILED: 1 task(s) regressed beyond 8.14pp" in captured.err
 
 
-# --- Rule 1: accuracy compares the mean of several runs ---
+# --- Eval: gate on the mean of several runs ---
 
 
 def test_aggregate_eval_runs_single_run_keeps_reported_stderr():
@@ -611,12 +611,13 @@ def test_aggregate_eval_runs_single_run_without_stderr():
 
 
 def test_aggregate_eval_runs_below_min_runs_keeps_reported_stderr():
-    # Three runs are fewer than MIN_RUNS_FOR_EMPIRICAL_STDERR (5): the value is
-    # averaged, the stderr stays the per-run reported one (not the 0.0115
-    # spread of the three values).
+    # Three runs are fewer than MIN_RUNS_FOR_EMPIRICAL_STDERR (5): both the
+    # value and the reported stderr use the mean (asymmetric inputs separate
+    # mean from median: values 0.80/0.80/0.86 have mean 0.82 vs. median 0.80;
+    # stderrs 0.03/0.04/0.08 have mean 0.05 vs. median 0.04).
     runs = [
-        {"mmlu_pro": {"acc,none": value, "acc_stderr,none": 0.05}}
-        for value in (0.80, 0.82, 0.84)
+        {"mmlu_pro": {"acc,none": value, "acc_stderr,none": stderr}}
+        for value, stderr in ((0.80, 0.03), (0.80, 0.04), (0.86, 0.08))
     ]
     assert check_regression.MIN_RUNS_FOR_EMPIRICAL_STDERR == 5
     assert check_regression.aggregate_eval_runs(runs) == {
@@ -639,16 +640,17 @@ def test_aggregate_eval_runs_below_min_runs_needs_stderr_from_every_run():
 
 
 def test_aggregate_eval_runs_empirical_stderr_from_five_runs():
-    # stdev(0.80 .. 0.84) = sqrt(0.001 / 4) = 0.0158114, / sqrt(5) = 0.0070711.
+    # Asymmetric inputs: mean is 0.82 (median is 0.80), sample variance is
+    # 0.008 / 4 = 0.002, and stdev / sqrt(5) = sqrt(0.0004) = 0.02.
     # It replaces the per-run reported 0.05.
     runs = [
         {"mmlu_pro": {"acc,none": value, "acc_stderr,none": 0.05}}
-        for value in (0.80, 0.81, 0.82, 0.83, 0.84)
+        for value in (0.80, 0.80, 0.80, 0.80, 0.90)
     ]
     assert check_regression.aggregate_eval_runs(runs) == {
         "mmlu_pro": {
             "acc,none": pytest.approx(0.82, abs=1e-12),
-            "acc_stderr,none": pytest.approx(0.007071067811865475, abs=1e-12),
+            "acc_stderr,none": pytest.approx(0.02, abs=1e-12),
             "num_runs": 5,
         }
     }
@@ -690,15 +692,16 @@ def _run_cli(monkeypatch, *argv):
 
 
 def test_calibrate_eval_uses_mean_for_any_listed_task(tmp_path):
+    # Asymmetric inputs separate mean (0.50) from the previous median (0.40).
     dirs = [
         _write_eval_run(tmp_path / f"run{i}", "gpqa_diamond", {"acc,none": value})
-        for i, value in enumerate((0.40, 0.50))
+        for i, value in enumerate((0.40, 0.40, 0.70))
     ]
     assert check_regression.calibrate_eval(dirs, None) == {
-        "gpqa_diamond": {"acc,none": pytest.approx(0.45, abs=1e-12), "num_runs": 2}
+        "gpqa_diamond": {"acc,none": pytest.approx(0.50, abs=1e-12), "num_runs": 3}
     }
     assert check_regression.calibrate_eval(dirs, {"gpqa_diamond", "mmlu_pro"}) == {
-        "gpqa_diamond": {"acc,none": pytest.approx(0.45, abs=1e-12), "num_runs": 2}
+        "gpqa_diamond": {"acc,none": pytest.approx(0.50, abs=1e-12), "num_runs": 3}
     }
 
 
@@ -765,8 +768,10 @@ def test_check_eval_baseline_from_five_identical_runs():
     with_stderr = {"mmlu_pro": {"acc,none": 0.88, "acc_stderr,none": 0.02}}
     row = check_regression.check_eval(with_stderr, baseline, 0.015).rows[0]
     assert (row.allowed_drop, row.status) == (pytest.approx(0.0329, abs=1e-12), "PASS")
-    row = check_regression.check_eval({"mmlu_pro": {"acc,none": 0.88}}, baseline, 0.015)
-    assert (row.rows[0].allowed_drop, row.rows[0].status) == (0.015, "FAIL")
+    row = check_regression.check_eval(
+        {"mmlu_pro": {"acc,none": 0.88}}, baseline, 0.015
+    ).rows[0]
+    assert (row.allowed_drop, row.status) == (0.015, "FAIL")
 
 
 @pytest.mark.parametrize(
@@ -808,14 +813,33 @@ def test_cli_eval_fails_when_one_run_lacks_the_task(tmp_path, monkeypatch, capsy
     assert "| `mmlu_pro` | (no result) |" in capsys.readouterr().out
 
 
-def test_cli_eval_errors_when_a_run_dir_is_empty(tmp_path, monkeypatch):
+def test_cli_eval_errors_when_a_run_dir_is_empty(tmp_path, monkeypatch, capsys):
     baseline_file = tmp_path / "t.baseline.json"
     baseline_file.write_text(json.dumps({"mmlu_pro": {"acc,none": 0.90}}))
     run0 = _write_eval_run(tmp_path / "run0", "mmlu_pro", {"acc,none": 0.90})
-    (tmp_path / "empty").mkdir()
+    empty = tmp_path / "empty"
+    empty.mkdir()
     ret = _run_cli(
         monkeypatch,
         "--mode", "eval", "--baseline", str(baseline_file),
-        "--results-dir", str(run0), "--results-dir", str(tmp_path / "empty"),
+        "--results-dir", str(run0), "--results-dir", str(empty),
     )  # fmt: skip
     assert ret == 2
+    assert f"ERROR: no results_*.json found under {empty}" in capsys.readouterr().err
+
+
+def test_cli_perf_rejects_multiple_results_dirs(tmp_path, monkeypatch, capsys):
+    baseline_file = tmp_path / "perf.baseline.json"
+    baseline_file.write_text("{}")
+    with pytest.raises(SystemExit) as exc:
+        _run_cli(
+            monkeypatch,
+            "--mode", "perf", "--baseline", str(baseline_file),
+            "--results-dir", str(tmp_path / "r0"),
+            "--results-dir", str(tmp_path / "r1"),
+        )  # fmt: skip
+    assert exc.value.code == 2
+    assert (
+        "--results-dir may only be given once in perf check mode"
+        in capsys.readouterr().err
+    )
