@@ -2873,6 +2873,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
         "_record_input_staging_fence",
         "_wait_input_staging_fence",
         "_pp_take_topk_indices",
+        "_token_padding_update",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     bt = MagicMock()
