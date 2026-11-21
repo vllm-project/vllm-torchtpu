@@ -1337,7 +1337,7 @@ def _effective_global_visible(
         token_pos = seq_len - q_len + (token_ids - q_start)
         kv_len = seq_len // compression_ratio
         visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
-        valid = token_ids < cu_q_lens[num_seqs]
+        valid = (token_ids >= cu_q_lens[0]) & (token_ids < cu_q_lens[num_seqs])
         return visible, valid
 
     seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
@@ -2246,7 +2246,8 @@ def streamindex_topk(
             seq_len // compression_ratio - 1,
             q_abs_pos // compression_ratio,
         )
-        max_valid_idx = jnp.where(token_idx < cu_q_lens[-1], max_valid_idx, -1)
+        valid_tok = (token_idx >= cu_q_lens[0]) & (token_idx < cu_q_lens[-1])
+        max_valid_idx = jnp.where(valid_tok, max_valid_idx, -1)
         s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
         return jnp.where(s_idx <= max_valid_idx[:, None], s_idx, -1)
 

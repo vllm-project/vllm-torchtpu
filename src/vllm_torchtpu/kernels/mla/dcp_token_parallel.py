@@ -240,6 +240,54 @@ def gather_page_ids(
     return jnp.where(k < ends[-1], page, 0).astype(jnp.int32)
 
 
+def _align_zigzag_r0_select_inputs(
+    layout: TokenParallelLayout,
+    num_tokens: int,
+    rank: jax.Array,
+    q_r: jax.Array,
+    w_r: jax.Array,
+    rr: RankRows,
+) -> tuple[jax.Array, jax.Array, RankRows, bool]:
+    nb = layout.effective_zigzag_bands(num_tokens)
+    s = layout.split_rows
+    if nb <= 1 or s <= 0 or q_r.shape[0] <= s:
+        return q_r, w_r, rr, False
+    is_r0 = rank.reshape(()) == 0
+    # Avoid leaving rank 0 zigzag bands at [0, B-s, 2B-s, ...]: dropping
+    # split_rows shifts band edges off the 128-row StreamIdxTC chunk grid and
+    # makes rank 0 double-scan every cross-band chunk (~+37.5% KV scoring).
+    q_s = jnp.concatenate([jnp.zeros_like(q_r[:s]), q_r[:-s]], axis=0)
+    w_s = jnp.concatenate([jnp.zeros_like(w_r[:s]), w_r[:-s]], axis=0)
+    q_sel = jnp.where(is_r0, q_s, q_r)
+    w_sel = jnp.where(is_r0, w_s, w_r)
+    cu_sel = jnp.where(is_r0, rr.cu_q_lens + jnp.int32(s), rr.cu_q_lens)
+    nr_sel = jnp.where(is_r0, rr.num_rows + jnp.int32(s), rr.num_rows)
+    rr_sel = RankRows(
+        rr.seq_lens,
+        cu_sel,
+        rr.num_seqs,
+        rr.first_req,
+        nr_sel,
+        rr.req_ids,
+    )
+    return q_sel, w_sel, rr_sel, True
+
+
+def _unalign_zigzag_r0_positions(
+    positions: jax.Array,
+    rank: jax.Array,
+    split_rows: int,
+    shifted: bool,
+) -> jax.Array:
+    if not shifted:
+        return positions
+    is_r0 = rank.reshape(()) == 0
+    pos_r0 = jnp.concatenate(
+        [positions[split_rows:], jnp.full_like(positions[:split_rows], -1)], axis=0
+    )
+    return jnp.where(is_r0, pos_r0, positions)
+
+
 def flat_rows(
     layout: TokenParallelLayout,
     positions: jax.Array,
@@ -1792,6 +1840,9 @@ def indexer_topk(
         il, ps = layout.interleave_size, layout.page_size
         row_offsets = offsets[row_requests(rr, rows)]
         real = jnp.arange(rows, dtype=jnp.int32) < rr.num_rows
+        q_sel, w_sel, rr_sel, r0_shifted = _align_zigzag_r0_select_inputs(
+            layout, num_tokens, rank, q_r, w_r, rr
+        )
 
         def branch(cap: int) -> Callable[[], jax.Array]:
             def run() -> jax.Array:
@@ -1809,7 +1860,12 @@ def indexer_topk(
                 # vpages_per_seq width inflates score buffers to max_pages * dcp
                 # and forces multi-partition top-k barriers on <=64K-token caps.
                 table = natural_page_table(layout, rr, offsets, vpages_per_seq, cap=cap)
-                positions = select_topk(q_r, w_r, nat, rr, table)
+                positions = _unalign_zigzag_r0_positions(
+                    select_topk(q_sel, w_sel, nat, rr_sel, table),
+                    rank,
+                    layout.split_rows,
+                    r0_shifted,
+                )
                 if flat_topk_cap_strided:
                     # Avoid striding at max_pages and restriding in every MLA
                     # layer: all layers of the step select the same cap from
@@ -1950,6 +2006,10 @@ def _unified_indexer_mla_core(
                     layout, attend, w_uv_all, rows, q_tok.dtype
                 )
 
+        q_idx_sel, w_idx_sel, rr_sel, r0_shifted = _align_zigzag_r0_select_inputs(
+            layout, num_tokens, rank, q_idx_r, w_idx_r, rr
+        )
+
         def branch(cap: int) -> Callable[[], tuple[Any, jax.Array, jax.Array]]:
             def run() -> tuple[Any, jax.Array, jax.Array]:
                 nat = _gather_index_k_pages(
@@ -1966,7 +2026,7 @@ def _unified_indexer_mla_core(
                     layout, rr, offsets, idx_vpages_per_seq, cap=cap
                 )
                 if tie_after_idx_max_cap > 0 and cap <= tie_after_idx_max_cap:
-                    positions = select_topk(q_idx_r, w_idx_r, nat, rr, table)
+                    positions = select_topk(q_idx_sel, w_idx_sel, nat, rr_sel, table)
                     # Avoid small-cap page_gather/StreamIdxTC contention: wait
                     # for StreamIdxTC before launching gather_latent on tiny caps.
                     positions, nope_t, rope_t = lax.optimization_barrier(
@@ -1979,7 +2039,10 @@ def _unified_indexer_mla_core(
                     g_nope, g_rope = gather_latent(
                         nope, rope, mla_page_ids[:cap], axis_name, read_pages
                     )
-                    positions = select_topk(q_idx_r, w_idx_r, nat, rr, table)
+                    positions = select_topk(q_idx_sel, w_idx_sel, nat, rr_sel, table)
+                positions = _unalign_zigzag_r0_positions(
+                    positions, rank, layout.split_rows, r0_shifted
+                )
                 flat = jnp.where(
                     real[:, None],
                     flat_rows(layout, positions, row_offsets, stride_pages=cap),
@@ -2705,6 +2768,10 @@ def _unified_indexer_in_branch_qb_core(
                     layout, tail_attend, w_uv_all, rows, qc_r.dtype
                 )
 
+        q_idx_sel, w_idx_sel, rr_sel, r0_shifted = _align_zigzag_r0_select_inputs(
+            layout, num_tokens, rank, q_idx_r, w_idx_r, rr
+        )
+
         def branch(cap: int) -> Callable[[], tuple[jax.Array, jax.Array, jax.Array]]:
             def run() -> tuple[jax.Array, jax.Array, jax.Array]:
                 nat = _gather_index_k_pages(
@@ -2721,7 +2788,7 @@ def _unified_indexer_in_branch_qb_core(
                     layout, rr, offsets, idx_vpages_per_seq, cap=cap
                 )
                 if tie_after_idx_max_cap > 0 and cap <= tie_after_idx_max_cap:
-                    positions = select_topk(q_idx_r, w_idx_r, nat, rr, table)
+                    positions = select_topk(q_idx_sel, w_idx_sel, nat, rr_sel, table)
                     # Avoid small-cap page_gather/StreamIdxTC contention: wait
                     # for StreamIdxTC before launching gather_latent on tiny caps.
                     positions, nope_t, rope_t = lax.optimization_barrier(
@@ -2734,7 +2801,10 @@ def _unified_indexer_in_branch_qb_core(
                     g_nope, g_rope = gather_latent(
                         nope, rope, mla_page_ids[:cap], axis_name, read_pages
                     )
-                    positions = select_topk(q_idx_r, w_idx_r, nat, rr, table)
+                    positions = select_topk(q_idx_sel, w_idx_sel, nat, rr_sel, table)
+                positions = _unalign_zigzag_r0_positions(
+                    positions, rank, layout.split_rows, r0_shifted
+                )
                 flat = jnp.where(
                     real[:, None],
                     flat_rows(layout, positions, row_offsets, stride_pages=cap),

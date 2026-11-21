@@ -1141,3 +1141,330 @@ def test_should_eliminate_duplicate_granule_runs_when_zigzag_recv_is_sorted() ->
         for idx, dst in enumerate(sd_np.tolist()):
             if dst >= 0:
                 assert int(recv_dst_np[r, picked[idx]]) == dst
+
+
+@pytest.mark.parametrize(
+    "case_name,dcp,rows_local,split_rows,qsl,seq_lens,zigzag_bands,expected_r0_cu",
+    [
+        (
+            "full_4band",
+            4,
+            64,
+            4,
+            [0, 256, 256],
+            [256, 0],
+            4,
+            [4, 16, 32, 48, 64],
+        ),
+        (
+            "band_size_eq_split",
+            4,
+            64,
+            16,
+            [0, 256, 256],
+            [256, 0],
+            4,
+            [16, 32, 48, 64],
+        ),
+        (
+            "multi_req_crossing_split",
+            4,
+            64,
+            4,
+            [0, 2, 10, 120, 256],
+            [20, 40, 200, 300],
+            4,
+            None,
+        ),
+        (
+            "partial_tail_mid_band",
+            4,
+            64,
+            4,
+            [0, 90, 90],
+            [200, 0],
+            4,
+            None,
+        ),
+        (
+            "empty_le_split",
+            4,
+            64,
+            4,
+            [0, 3, 3],
+            [20, 0],
+            4,
+            [4],
+        ),
+        (
+            "contig_unshifted",
+            4,
+            64,
+            4,
+            [0, 256, 256],
+            [256, 0],
+            1,
+            [0, 64],
+        ),
+    ],
+)
+def test_should_align_zigzag_rank0_select_inputs_with_zero_prefix_and_match_contig(
+    case_name: str,
+    dcp: int,
+    rows_local: int,
+    split_rows: int,
+    qsl: list[int],
+    seq_lens: list[int],
+    zigzag_bands: int,
+    expected_r0_cu: list[int] | None,
+) -> None:
+    del case_name
+    mesh = _make_mesh(dcp)
+    num_tokens = dcp * rows_local
+    page_size = 16
+    interleave = 4
+    vpage = dcp * page_size
+    max_pages = 8
+    layout = tp.TokenParallelLayout(
+        dcp_size=dcp,
+        interleave_size=interleave,
+        page_size=page_size,
+        split_rows=split_rows,
+        max_pages=max_pages,
+        gather_caps=(max_pages,),
+        zigzag_bands=zigzag_bands,
+    )
+    max_reqs = len(seq_lens)
+    max_seq_pages = 8
+    num_seqs = sum(1 for a, b in zip(qsl[:-1], qsl[1:]) if b > a)
+    head_dim = 4
+    num_heads = 2
+    k_top = 4
+    rng = np.random.default_rng(17)
+    q_full = rng.standard_normal((num_tokens, num_heads, head_dim)).astype(np.float32)
+    w_full = rng.standard_normal((num_tokens, num_heads)).astype(np.float32)
+    q_j = jnp.asarray(q_full, dtype=jnp.bfloat16)
+    w_j = jnp.asarray(w_full, dtype=jnp.float32)
+    index_cache = jax.device_put(
+        jnp.zeros((dcp * max_pages, 1, 4, page_size), dtype=jnp.uint8),
+        NamedSharding(mesh, P(AXIS)),
+    )
+    bt_j = jnp.arange(max_reqs * max_seq_pages, dtype=jnp.int32) % max_pages
+    sl_j = jnp.asarray(seq_lens, dtype=jnp.int32)
+    qsl_j = jnp.asarray(qsl, dtype=jnp.int32)
+    dist_j = jnp.asarray([0, 0, num_seqs], dtype=jnp.int32)
+    ranks_j = jax.device_put(
+        jnp.arange(dcp, dtype=jnp.int32), NamedSharding(mesh, P(AXIS))
+    )
+
+    # Plant NaN sentinels on rank 0's unused trailing [rows_local - split_rows:]
+    # rows to verify zero-prefix shift does not leak NaNs into [0, split_rows).
+    q_own = np.stack(
+        [np.asarray(tp.own_rows(layout, q_j, jnp.int32(r))) for r in range(dcp)],
+        axis=0,
+    ).astype(np.float32)
+    w_own = np.stack(
+        [np.asarray(tp.own_rows(layout, w_j, jnp.int32(r))) for r in range(dcp)],
+        axis=0,
+    )
+    if zigzag_bands > 1:
+        q_own[0, rows_local - split_rows :] = np.nan
+        w_own[0, rows_local - split_rows :] = np.nan
+    q_own_sh = jax.device_put(
+        jnp.asarray(q_own.reshape(num_tokens, num_heads, head_dim), dtype=jnp.bfloat16),
+        NamedSharding(mesh, P(AXIS)),
+    )
+    w_own_sh = jax.device_put(
+        jnp.asarray(w_own.reshape(num_tokens, num_heads), dtype=jnp.float32),
+        NamedSharding(mesh, P(AXIS)),
+    )
+
+    def _encode_select(q_r, w_r, _nat, rr, _table):
+        i = jnp.arange(rows_local, dtype=jnp.int32)
+        in_range = (i >= rr.cu_q_lens[0]) & (i < rr.cu_q_lens[rr.num_seqs])
+        loc = jnp.minimum(
+            jnp.searchsorted(rr.cu_q_lens[1:], i, side="right"),
+            jnp.maximum(rr.num_seqs - 1, 0),
+        )
+        q_len_req = rr.cu_q_lens[loc + 1] - rr.cu_q_lens[loc]
+        pos = rr.seq_lens[loc] - q_len_req + (i - rr.cu_q_lens[loc])
+        is_r0 = jax.lax.axis_index(AXIS) == 0
+        expected_cu0 = jnp.where(
+            is_r0 & (zigzag_bands > 1), jnp.int32(split_rows), jnp.int32(0)
+        )
+        bad_cu0 = rr.cu_q_lens[0] != expected_cu0
+        bad_prefix = (is_r0 & (zigzag_bands > 1)) & (
+            jnp.any(q_r[:split_rows] != 0) | jnp.any(w_r[:split_rows] != 0)
+        )
+        # Check live query tensors carry no NaNs (zero-prefix masked trailing NaNs).
+        has_nan = jnp.any(jnp.isnan(q_r)) | jnp.any(jnp.isnan(w_r))
+        poisoned = bad_cu0 | bad_prefix | has_nan
+        pick = pos[:, None] - jnp.arange(k_top, dtype=jnp.int32)[None, :]
+        ok = (~poisoned) & in_range[:, None] & (pick >= 0) & (pick < max_pages * vpage)
+        return jnp.where(ok, pick, jnp.int32(-1))
+
+    out_flat = np.asarray(
+        tp.indexer_topk(
+            layout,
+            mesh,
+            AXIS,
+            index_cache,
+            q_own_sh,
+            w_own_sh,
+            sl_j,
+            bt_j,
+            qsl_j,
+            dist_j,
+            select_topk=_encode_select,
+            rank_ids=ranks_j,
+            q_own_rows=True,
+        )
+    )
+    out_rows = out_flat.reshape(dcp, rows_local, k_top)
+    total_valid = qsl[num_seqs]
+    if zigzag_bands > 1:
+        for r in range(dcp):
+            rr_r = tp.rank_rows(
+                layout, jnp.int32(r), num_tokens, sl_j, qsl_j, dist_j[2]
+            )
+            n_real = int(rr_r.num_rows)
+            assert np.all(out_rows[r, n_real:] == -1)
+            if r == 0 and expected_r0_cu is not None:
+                actual_shifted_cu = (
+                    np.asarray(rr_r.cu_q_lens[: int(rr_r.num_seqs) + 1]) + split_rows
+                )
+                assert actual_shifted_cu.tolist() == expected_r0_cu
+                if len(expected_r0_cu) > 1:
+                    band_size = rows_local // zigzag_bands
+                    assert all(edge % band_size == 0 for edge in expected_r0_cu[1:])
+        if total_valid <= split_rows:
+            assert np.all(out_rows == -1)
+    else:
+        assert expected_r0_cu == [0, 64]
+
+    # Verify packed output matches the independent global per-token position.
+    layout_ref = tp.TokenParallelLayout(
+        dcp_size=dcp,
+        interleave_size=interleave,
+        page_size=page_size,
+        split_rows=split_rows,
+        max_pages=max_pages,
+        gather_caps=(max_pages,),
+        zigzag_bands=1,
+    )
+    out_r0_to_last = out_flat.reshape(dcp, rows_local, k_top)
+    _, offsets = tp.step_pages(layout_ref, sl_j, qsl_j, dist_j[2])
+    offsets_np = np.asarray(offsets)
+    total_valid = qsl[num_seqs]
+    for r in range(dcp):
+        if zigzag_bands > 1:
+            g_tokens = np.asarray(
+                tp.zigzag_rank_global_tokens(r, rows_local, dcp, zigzag_bands)
+            )
+            if r == 0:
+                g_tokens = g_tokens[split_rows:]
+        else:
+            g_tokens = split_rows + r * rows_local + np.arange(rows_local)
+        valid_g = [int(t) for t in g_tokens if t < total_valid]
+        for li, g_tok in enumerate(valid_g):
+            req_i = max(i for i in range(num_seqs) if qsl[i] <= g_tok)
+            q_len_req = qsl[req_i + 1] - qsl[req_i]
+            pos = seq_lens[req_i] - q_len_req + (g_tok - qsl[req_i])
+            exp = np.array(
+                [
+                    (
+                        (
+                            ((p // interleave) % dcp) * max_pages
+                            + int(offsets_np[req_i])
+                            + p // vpage
+                        )
+                        * page_size
+                        + (p // (dcp * interleave)) * interleave % page_size
+                        + (p % interleave)
+                    )
+                    if 0 <= p < max_pages * vpage
+                    else -1
+                    for p in (pos - np.arange(k_top))
+                ],
+                dtype=np.int32,
+            )
+            np.testing.assert_array_equal(out_r0_to_last[r, li], exp)
+
+
+def test_should_mask_leading_rows_in_streamindex_early_exit_on_nonzero_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shift = 3
+    q_len = 5
+    # seq_len > q_len ensures unpatched fast path leaks >=0 positions for i < shift.
+    seq_len = 12
+    num_tokens = 12
+    k_top = 16
+    q = jnp.zeros((num_tokens, 2, 128), dtype=jnp.bfloat16)
+    w = jnp.zeros((num_tokens, 2), dtype=jnp.float32)
+    seq_lens = jnp.array([seq_len, 0], dtype=jnp.int32)
+    page_indices = jnp.zeros((2, 1), dtype=jnp.int32)
+    dist = jnp.array([0, 0, 1], dtype=jnp.int32)
+
+    cu_ref = jnp.array([0, q_len, q_len], dtype=jnp.int32)
+    cu_shift = cu_ref + jnp.int32(shift)
+    cache_sal = jnp.zeros(
+        st_lib.get_kv_cache_shape(1, 128, 128, KVLayout.SEQ_ALONG_LANE),
+        dtype=jnp.uint8,
+    )
+    common_kw = dict(
+        k=k_top,
+        compression_ratio=1,
+        num_kv_pages_per_block=1,
+        num_queries_per_block=4,
+        enable_early_exit=True,
+        decode_as_mixed=True,
+        kv_layout=KVLayout.SEQ_ALONG_LANE,
+    )
+    if jax.default_backend() == "tpu":
+        ref = np.asarray(
+            st_lib.streamindex_topk(
+                q, w, cache_sal, seq_lens, page_indices, cu_ref, dist, **common_kw
+            )
+        )
+        got = np.asarray(
+            st_lib.streamindex_topk(
+                q, w, cache_sal, seq_lens, page_indices, cu_shift, dist, **common_kw
+            )
+        )
+    else:
+        from jax._src.pallas.mosaic import tpu_info  # noqa: PLC0415 -- CPU-only trace
+
+        tpu7x = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+        monkeypatch.setattr(pltpu, "get_tpu_info", lambda: tpu7x)
+        monkeypatch.setattr(tpu_info, "get_tpu_info", lambda: tpu7x)
+
+        def _eval_fast_branch(cu_arr: jax.Array) -> np.ndarray:
+            closed = jax.make_jaxpr(
+                lambda sl_, cu_: st_lib.streamindex_topk(
+                    q, w, cache_sal, sl_, page_indices, cu_, dist, **common_kw
+                )
+            )(seq_lens, cu_arr)
+            inner = closed.eqns[0].params["jaxpr"]
+            cond_eqn = next(e for e in inner.eqns if e.primitive.name == "cond")
+            fast_br = cond_eqn.params["branches"][1]
+            env: dict[object, jax.Array] = {
+                v: c for v, c in zip(inner.jaxpr.constvars, inner.consts)
+            }
+            outer_env = {v: c for v, c in zip(closed.jaxpr.constvars, closed.consts)}
+            outer_env[closed.jaxpr.invars[0]] = seq_lens
+            outer_env[closed.jaxpr.invars[1]] = cu_arr
+            for v_in, v_out in zip(inner.jaxpr.invars, closed.eqns[0].invars):
+                env[v_in] = outer_env[v_out]
+            pre_out_vars = list(cond_eqn.invars[1:])
+            dummy_args = [
+                env.get(v, jnp.zeros(v.aval.shape, v.aval.dtype)) for v in pre_out_vars
+            ]
+            out = jax.core.eval_jaxpr(fast_br.jaxpr, fast_br.consts, *dummy_args)
+            return np.asarray(out[0])
+
+        ref = _eval_fast_branch(cu_ref)
+        got = _eval_fast_branch(cu_shift)
+    assert np.all(got[:shift] == -1), "leading rows before cu_q_lens[0] must be -1"
+    np.testing.assert_array_equal(got[shift : shift + q_len], ref[:q_len])
+    assert np.all(got[shift + q_len :] == -1)
