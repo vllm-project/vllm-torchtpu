@@ -323,13 +323,21 @@ def build_prefill_inj_mix_op(
     partial: bool = False,
     norm_impl: str = "vpu",
     cmp: bool = False,
+    down_asm: bool = False,
 ):
     """TPU_QWEN4_HC_PREFILL_FUSED_MIX: prefill HC mix returning ``(mixed,
     injection)``; ``norm`` stays on chip. Callers gate it to whole tiles.
     ``cmp`` (TPU_QWEN4_HC_PREFILL_COMPARE): hc_prefill_cmp's kernel, which
-    ignores ``norm_impl``."""
+    ignores ``norm_impl``. ``down_asm``: TPU_QWEN4_HC_PREFILL_DOWN_ASM (not
+    with ``cmp``)."""
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
+    if cmp and down_asm:
+        raise ValueError(
+            "TPU_QWEN4_HC_PREFILL_COMPARE and TPU_QWEN4_HC_PREFILL_DOWN_ASM cannot be combined"
+        )
     mix = hc_prefill_mix_cmp if cmp else hc_prefill_mix
+    # hc_prefill_cmp's kernel takes no PSTEP-HC kwarg (merge of both lines).
+    extra = {} if cmp else {"down_asm": down_asm}
 
     def core(
         x: jax.Array,
@@ -350,12 +358,14 @@ def build_prefill_inj_mix_op(
             token_tile=token_tile,
             partial=partial,
             norm_impl=norm_impl,
+            **extra,
         )
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_prefill_inj_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
         f"{'_p' if partial else ''}"
-        f"{'_cmp' if cmp else '' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
+        f"{'_cmp' if cmp else '' if norm_impl == 'vpu' else '_n' + norm_impl}"
+        f"{'_da' if down_asm else ''}_v1",
         core,
     )
 
@@ -378,15 +388,26 @@ def build_prefill_combine_mix_op(
     partial: bool = False,
     norm_impl: str = "vpu",
     cmp: bool = False,
+    reread: bool = False,
+    down_asm: bool = False,
 ):
     """The previous HC's combine fused ahead of this HC's prefill mix.
 
     Returns ``(mixed, injection, combined)``; ``combined`` is the hyper input
     this HC mixed (the next combine's residual). ``cmp`` as in
-    ``build_prefill_inj_mix_op``.
+    ``build_prefill_inj_mix_op``. ``reread``: the norm reads the combined rows
+    back from VMEM (TPU_QWEN4_HC_PREFILL_FOLD); ``down_asm``:
+    TPU_QWEN4_HC_PREFILL_DOWN_ASM (neither with ``cmp``).
     """
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
+    if cmp and (reread or down_asm):
+        raise ValueError(
+            "TPU_QWEN4_HC_PREFILL_COMPARE cannot be combined with "
+            "TPU_QWEN4_HC_PREFILL_FOLD or TPU_QWEN4_HC_PREFILL_DOWN_ASM"
+        )
     mix = hc_prefill_mix_cmp if cmp else hc_prefill_mix
+    # hc_prefill_cmp's kernel takes no PSTEP-HC kwarg (merge of both lines).
+    extra = {} if cmp else {"reread": reread, "down_asm": down_asm}
 
     def core(
         residual: jax.Array,
@@ -411,12 +432,14 @@ def build_prefill_combine_mix_op(
             prev_injection=prev_injection,
             partial=partial,
             norm_impl=norm_impl,
+            **extra,
         )
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_prefill_combine_c{branches}_h{hidden}_m{token_tile}"
         f"_e{eps_tag}{'_p' if partial else ''}"
-        f"{'_cmp' if cmp else '' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
+        f"{'_cmp' if cmp else '' if norm_impl == 'vpu' else '_n' + norm_impl}"
+        f"{'_rr' if reread else ''}{'_da' if down_asm else ''}_v1",
         core,
     )
 

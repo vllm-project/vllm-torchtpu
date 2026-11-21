@@ -68,6 +68,8 @@ if TYPE_CHECKING:
     TPU_QWEN4_HC_PREFILL_PARTIAL_TILE: bool = False
     TPU_QWEN4_HC_PREFILL_NORM: str = "vpu"
     TPU_QWEN4_HC_PREFILL_COMPARE: bool = False
+    TPU_QWEN4_HC_PREFILL_FOLD: bool = False
+    TPU_QWEN4_HC_PREFILL_DOWN_ASM: bool = False
     VLLM_TPU_GDN_PREFILL_NO_ZERO_INIT: bool = False
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PD_STAGING_BYTES: int = 8 << 30
@@ -1623,6 +1625,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # embedding and a stage's last layer keep the separate combine. Implies the
     # fused mix's tile counts.
     "TPU_QWEN4_HC_PREFILL_COMPARE": env_bool("TPU_QWEN4_HC_PREFILL_COMPARE"),
+    # q38 PSTEP-HC L3 (FOLD-P), qwen4_exp prefill with TPU_QWEN4_HC_PREFILL_FUSED_MIX:
+    # run each layer's mlp combine as the prologue of the next layer's fused
+    # prefill attn mix (the TPU_QWEN4_HC_DECODE_FOLD layer plumbing), removing
+    # the separate gated_residual pass at whole-tile prefill steps. The
+    # prologue reads the combined rows back from VMEM before the norm
+    # ("reread", P-DENSE mb5c), as the unfused mix reads its input from HBM.
+    # Layers with a per-layer embedding and stage ends keep the separate
+    # combine. Default off: unset leaves every program unchanged.
+    "TPU_QWEN4_HC_PREFILL_FOLD": env_bool("TPU_QWEN4_HC_PREFILL_FOLD"),
+    # q38 PSTEP-HC L2, qwen4_exp prefill fused HC mixes: DMA the down rows and
+    # the inject rows (padded to 16) into the kernel's VMEM down buffer on the
+    # first tile, instead of concatenating [down; inject; zeros] in XLA on
+    # every call. The buffer the MXU reads holds the same values. Default off.
+    "TPU_QWEN4_HC_PREFILL_DOWN_ASM": env_bool("TPU_QWEN4_HC_PREFILL_DOWN_ASM"),
     # Pooled GDN: skip zero-filling the [T, n_v, d_v] output before the
     # decode (BATCHED) and prefill (PER_SEQ) kernels write it. Rows no request
     # owns (bucket padding) are then left unwritten; the decoder layer masks

@@ -40,6 +40,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 _ROW_CHUNK = 32
+# TPU_QWEN4_HC_PREFILL_DOWN_ASM: inject rows padded to one bf16 sublane tile.
+_INJ_ROWS = 16
 # TPU_QWEN4_HC_PREFILL_NORM: how the per-branch RMS norm forms its sum of
 # squares and how many rows one loop step normalizes.
 #   vpu     (default) VPU square + lane reduction, 32-row steps
@@ -98,7 +100,18 @@ def prefill_token_tile_ok(tokens: int, token_tile: int, partial: bool = False) -
     return tokens >= token_tile and tokens % token_tile == 0
 
 
-def _kernel(*refs, branches, hidden, eps, lowrank, prologue, scopes=0, norm_impl="vpu"):
+def _kernel(
+    *refs,
+    branches,
+    hidden,
+    eps,
+    lowrank,
+    prologue,
+    scopes=0,
+    norm_impl="vpu",
+    reread=False,
+    down_asm=False,
+):
     def scope(name):
         # Region-trace scopes (with --xla_enable_custom_call_region_trace=true
         # they appear on the "XLA TraceMe" line). Off by default; a scoped
@@ -112,8 +125,14 @@ def _kernel(*refs, branches, hidden, eps, lowrank, prologue, scopes=0, norm_impl
         x_ref = None
     else:
         x_ref = refs.pop(0)
-    w_hbm, down_hbm, up_hbm = refs[:3]
-    refs = refs[3:]
+    if down_asm:
+        # TPU_QWEN4_HC_PREFILL_DOWN_ASM: the down rows and the 16-row padded
+        # inject rows arrive separately and are assembled in down_vm below.
+        w_hbm, down_hbm, inj_hbm, up_hbm = refs[:4]
+        refs = refs[4:]
+    else:
+        w_hbm, down_hbm, up_hbm = refs[:3]
+        refs = refs[3:]
     mixed_ref, inj_ref = refs[:2]
     refs = refs[2:]
     h_ref = refs.pop(0) if prologue else None
@@ -121,7 +140,16 @@ def _kernel(*refs, branches, hidden, eps, lowrank, prologue, scopes=0, norm_impl
 
     first = pl.program_id(0) == 0
     w_copy = pltpu.make_async_copy(w_hbm, w_vm, sems.at[0])
-    down_copy = pltpu.make_async_copy(down_hbm, down_vm, sems.at[1])
+    if down_asm:
+        inj_rows = inj_hbm.shape[0]
+        down_copy = pltpu.make_async_copy(
+            down_hbm, down_vm.at[pl.ds(0, lowrank)], sems.at[1]
+        )
+        inj_copy = pltpu.make_async_copy(
+            inj_hbm, down_vm.at[pl.ds(lowrank, inj_rows)], sems.at[2 + branches]
+        )
+    else:
+        down_copy = pltpu.make_async_copy(down_hbm, down_vm, sems.at[1])
     up_copies = [
         pltpu.make_async_copy(
             up_hbm.at[pl.ds(b * hidden, hidden)],
@@ -136,6 +164,14 @@ def _kernel(*refs, branches, hidden, eps, lowrank, prologue, scopes=0, norm_impl
     def _start_weights():
         w_copy.start()
         down_copy.start()
+        if down_asm:
+            inj_copy.start()
+            tail = down_vm.shape[0] - lowrank - inj_rows
+            if tail:
+                # Rows past the inject rows feed only down columns nothing reads.
+                down_vm[pl.ds(lowrank + inj_rows, tail), :] = jnp.zeros(
+                    (tail, down_vm.shape[1]), down_vm.dtype
+                )
         for copy in up_copies:
             copy.start()
 
@@ -159,8 +195,15 @@ def _kernel(*refs, branches, hidden, eps, lowrank, prologue, scopes=0, norm_impl
                 )
                 h = (residual + block * gates[:, b : b + 1]).astype(jnp.bfloat16)
                 h_ref[pl.ds(offset, rows), pl.ds(start, hidden)] = h
-                xb = h
-                values = h.astype(jnp.float32)
+                if reread:
+                    # TPU_QWEN4_HC_PREFILL_FOLD: read the combined rows back
+                    # from VMEM, as the unfused mix reads its input (P-DENSE
+                    # mb5c: the in-register h made the deferred combine
+                    # non-bitwise on TPU).
+                    xb = h_ref[pl.ds(offset, rows), pl.ds(start, hidden)]
+                else:
+                    xb = h
+                values = xb.astype(jnp.float32)
             else:
                 xb = x_ref[pl.ds(offset, rows), pl.ds(start, hidden)]
                 values = xb.astype(jnp.float32)
@@ -199,6 +242,8 @@ def _kernel(*refs, branches, hidden, eps, lowrank, prologue, scopes=0, norm_impl
 
     nt = (((1,), (1,)), ((), ()))
     wait_first(down_copy)
+    if down_asm:
+        wait_first(inj_copy)
     with scope("hcp_down"):
         down = jax.lax.dot_general(
             norm_vm[...], down_vm[...], dimension_numbers=nt, preferred_element_type=jnp.float32
@@ -270,6 +315,8 @@ def hc_prefill_mix(
     partial=False,
     scopes=0,
     norm_impl="vpu",
+    reread=False,
+    down_asm=False,
 ):
     """Fused prefill HC mix with the injection gate, optionally after the
     previous HC's combine. ``partial`` admits a partial last tile (any multiple
@@ -280,6 +327,10 @@ def hc_prefill_mix(
     the previous HC's residual that is combined first. Returns
     ``(mixed, injection)``, plus the combined hyper input when ``block`` is
     given.
+
+    ``reread`` (prologue only): the norm reads the combined rows back from
+    VMEM (TPU_QWEN4_HC_PREFILL_FOLD). ``down_asm``: assemble [down; inject] in
+    VMEM instead of in XLA (TPU_QWEN4_HC_PREFILL_DOWN_ASM).
     """
     return _hc_prefill_mix(
         x,
@@ -297,13 +348,24 @@ def hc_prefill_mix(
         partial=partial,
         scopes=scopes,
         norm_impl=norm_impl,
+        reread=reread and block is not None,
+        down_asm=down_asm,
     )
 
 
 @functools.partial(
     jax.jit,
     static_argnames=(
-        "branches", "hidden", "eps", "token_tile", "interpret", "partial", "scopes", "norm_impl"
+        "branches",
+        "hidden",
+        "eps",
+        "token_tile",
+        "interpret",
+        "partial",
+        "scopes",
+        "norm_impl",
+        "reread",
+        "down_asm",
     ),
 )
 def _hc_prefill_mix(
@@ -323,6 +385,8 @@ def _hc_prefill_mix(
     partial=False,
     scopes=0,
     norm_impl="vpu",
+    reread=False,
+    down_asm=False,
 ):
     tokens, width = x.shape
     if norm_impl not in NORM_IMPLS:
@@ -347,7 +411,11 @@ def _hc_prefill_mix(
         )
     ):
         raise ValueError("HC prefill fused mix requires BF16 whole token tiles")
-    down_ext = extend_down(down, inject)
+    rows_ext = lowrank + branches + (-(lowrank + branches) % 128)
+    if down_asm and (
+        lowrank % 16 or branches > _INJ_ROWS or lowrank + _INJ_ROWS > rows_ext
+    ):
+        raise ValueError("TPU_QWEN4_HC_PREFILL_DOWN_ASM needs 16-row aligned low rank")
 
     def rows(cols):
         return pl.BlockSpec((token_tile, cols), lambda i: (i, 0))
@@ -356,7 +424,7 @@ def _hc_prefill_mix(
     in_specs = (
         [rows(width), rows(hidden), rows(branches)] if prologue else [rows(width)]
     )
-    in_specs += [hbm] * 3
+    in_specs += [hbm] * (4 if down_asm else 3)
     out_specs = [rows(hidden), rows(branches)]
     out_shape = [
         jax.ShapeDtypeStruct((tokens, hidden), jnp.bfloat16),
@@ -367,13 +435,19 @@ def _hc_prefill_mix(
         out_shape.append(jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16))
     scratch = [
         pltpu.VMEM((width,), jnp.bfloat16),
-        pltpu.VMEM(down_ext.shape, jnp.bfloat16),
+        pltpu.VMEM((rows_ext, width), jnp.bfloat16),
         pltpu.VMEM((width, lowrank), jnp.bfloat16),
         pltpu.VMEM((token_tile, width), jnp.bfloat16),
-        pltpu.SemaphoreType.DMA((2 + branches,)),
+        pltpu.SemaphoreType.DMA((2 + branches + (1 if down_asm else 0),)),
     ]
     args = [x, block, prev_injection] if prologue else [x]
-    args += [weight, down_ext, up]
+    if down_asm:
+        inject_rows = jnp.concatenate(
+            [inject, jnp.zeros((_INJ_ROWS - branches, width), inject.dtype)]
+        )
+        args += [weight, down, inject_rows, up]
+    else:
+        args += [weight, extend_down(down, inject), up]
     outs = pl.pallas_call(
         functools.partial(
             _kernel,
@@ -384,6 +458,8 @@ def _hc_prefill_mix(
             prologue=prologue,
             scopes=scopes,
             norm_impl=norm_impl,
+            reread=reread and prologue,
+            down_asm=down_asm,
         ),
         grid=(pl.cdiv(tokens, token_tile),),
         in_specs=in_specs,
@@ -396,6 +472,7 @@ def _hc_prefill_mix(
             vmem_limit_bytes=60 << 20,
         ),
         interpret=interpret,
-        name=f"qwen4exp_hc_prefill{'_combine' if prologue else ''}_inj_m{token_tile}",
+        name=f"qwen4exp_hc_prefill{'_combine' if prologue else ''}_inj_m{token_tile}"
+        f"{'_rr' if reread and prologue else ''}{'_da' if down_asm else ''}",
     )(*args)
     return tuple(outs)

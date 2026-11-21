@@ -63,6 +63,17 @@ class GatedResidual(common_hc.GatedResidual):
         norm_impl = envs.TPU_QWEN4_HC_PREFILL_NORM.lower()
         self._prefill_inj_mix_op = None
         self._prefill_combine_mix_op = None
+        # q38 PSTEP-HC L3: the previous layer's mlp combine ahead of this attn
+        # mix (TPU_QWEN4_HC_PREFILL_FOLD), with the reread prologue.
+        self._prefill_fold_mix_op = None
+        # q38 PSTEP-HC L2 (TPU_QWEN4_HC_PREFILL_DOWN_ASM): passed only when set,
+        # so the builders' cache keys and op names are unchanged when unset.
+        down_asm = {"down_asm": True} if envs.TPU_QWEN4_HC_PREFILL_DOWN_ASM else {}
+        if cmp and (envs.TPU_QWEN4_HC_PREFILL_FOLD or down_asm):
+            raise ValueError(
+                "TPU_QWEN4_HC_PREFILL_COMPARE cannot be combined with "
+                "TPU_QWEN4_HC_PREFILL_FOLD or TPU_QWEN4_HC_PREFILL_DOWN_ASM"
+            )
         if (
             fused_mix
             and prefill_full_tile
@@ -78,13 +89,27 @@ class GatedResidual(common_hc.GatedResidual):
 
             eps = self.hc_norm.variance_epsilon
             self._prefill_inj_mix_op = build_prefill_inj_mix_op(
-                self.hc_count, self.hidden_size, eps, prefill_full_tile, partial, norm_impl, cmp
+                self.hc_count, self.hidden_size, eps, prefill_full_tile, partial, norm_impl, cmp,
+                **down_asm,
             )
             # Used by the preceding HC's combine_mix (attn -> mlp, and with
             # TPU_QWEN4_HC_PREFILL_COMPARE the previous layer's mlp -> attn).
             self._prefill_combine_mix_op = build_prefill_combine_mix_op(
-                self.hc_count, self.hidden_size, eps, prefill_full_tile, partial, norm_impl, cmp
+                self.hc_count, self.hidden_size, eps, prefill_full_tile, partial, norm_impl, cmp,
+                **down_asm,
             )
+            if envs.TPU_QWEN4_HC_PREFILL_FOLD:
+                # Used by the previous layer's mlp combine_mix (mlp -> attn).
+                self._prefill_fold_mix_op = build_prefill_combine_mix_op(
+                    self.hc_count,
+                    self.hidden_size,
+                    eps,
+                    prefill_full_tile,
+                    partial,
+                    norm_impl,
+                    reread=True,
+                    **down_asm,
+                )
         if (
             prefill_full_tile
             and self.hidden_size % 128 == 0
@@ -361,14 +386,18 @@ class GatedResidual(common_hc.GatedResidual):
         )
         return output.to(hyper_input.dtype)
 
-    def combine_mix(self, block_output, residuals, next_hc, prefill_fused=True):
+    def combine_mix(
+        self, block_output, residuals, next_hc, prefill_fused=True, prefill_fold=False
+    ):
         """``next_hc.mix(self.combine(block_output, residuals))``.
 
         After a fused decode mix, this combine runs as the prologue of
         ``next_hc``'s fused mix (one Pallas call; the combined hyper input is
         written once and returned as the next residual). ``prefill_fused``
         allows the fused prefill combine-mix at whole prefill tiles; without
-        it those sizes run the separate combine and mix.
+        it those sizes run the separate combine and mix. ``prefill_fold``
+        (TPU_QWEN4_HC_PREFILL_FOLD, the mlp -> next attn fold) runs those sizes
+        through ``next_hc``'s reread combine-mix instead.
         """
         hyper_input, gate = residuals
         if (
@@ -387,6 +416,19 @@ class GatedResidual(common_hc.GatedResidual):
                 return mixed, (combined, injection)
             mixed, combined = outs
             return mixed, (combined, None)
+        fold_op = getattr(next_hc, "_prefill_fold_mix_op", None) if prefill_fold else None
+        if (
+            fold_op is not None
+            and gate is not None
+            and gate.shape[-1] == self.hc_count
+            and gate.dtype == torch.float32
+            and block_output.dtype == torch.bfloat16
+            and next_hc._prefill_fused_mix(hyper_input)
+        ):
+            mixed, injection, combined = fold_op(
+                hyper_input, block_output, gate, *next_hc._decode_weights()
+            )
+            return mixed, (combined, injection)
         if (
             prefill_fused
             and next_hc._prefill_combine_mix_op is not None
