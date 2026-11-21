@@ -53,6 +53,9 @@ class ModelConfigs:
         sm_scale: Softmax scaling factor.
         soft_cap: Soft-capping threshold for attention logits.
         sliding_window: Size of the sliding attention window.
+        causal: If False, every query attends to all of its sequence's KV
+            positions, including later ones in the same step (e.g. DFlash
+            draft blocks).
     """
 
     num_q_heads: int
@@ -62,6 +65,7 @@ class ModelConfigs:
     sm_scale: float = 1.0
     soft_cap: float | None = None
     sliding_window: int | None = None
+    causal: bool = True
 
     @property
     def num_q_heads_per_kv_head(self) -> int:
@@ -540,7 +544,30 @@ class RpaConfigs:
     @property
     def max_schedule_size_multiplier(self) -> int:
         # By default, setting an upper bound of ~5x the SMEM capacity on schedule.
-        return self.serve.max_schedule_size_multiplier
+        multiplier = self.serve.max_schedule_size_multiplier
+        # Without the causal triangle, a prefill visits every KV tile for every
+        # Q tile: about twice the steps. DECODE queries end the sequence, so the
+        # causal bound already covers every KV tile and needs no extra room.
+        if not self.model.causal and self.mode == RpaCase.MIXED:
+            multiplier *= 2
+        return multiplier
+
+    def validate_non_causal(self) -> None:
+        """Rejects features whose non-causal semantics are undefined."""
+        if self.model.causal:
+            return
+        if self.model.sliding_window is not None:
+            raise NotImplementedError(
+                "Non-causal attention does not support sliding window."
+            )
+        if self.serve.cp_group_size is not None:
+            raise NotImplementedError(
+                "Non-causal attention does not support Context Parallel."
+            )
+        if self.serve.attention_scope != AttentionScope.FULL:
+            raise NotImplementedError(
+                "Non-causal attention only supports AttentionScope.FULL."
+            )
 
     def validate_inputs(
         self,
@@ -661,6 +688,8 @@ class RpaConfigs:
                 raise ValueError(
                     "Context Parallel does not support sliding window right now"
                 )
+
+        self.validate_non_causal()
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             bkv_sz = self.block.bkv_sz
