@@ -60,7 +60,6 @@ EXEMPT_PATHS = {
 #
 #   __init__.py             os.environ["LOCAL_RANK"] must raise when unset;
 #                           a worker silently becoming rank 0 is worse.
-#   model_loader_patches.py chains LOCAL_RANK -> RANK -> "0".
 #   tpu_worker.py           falls back to pc.world_size, a runtime value, and
 #                           os.environ["TORCH_TPU_DP_MASTER_PORT"] must raise.
 #   tpu_platform.py         os.environ.pop("TORCH_TPU_DP_SIZE") consumes the
@@ -83,7 +82,6 @@ BOOTSTRAP_VARS = {
     "LOCAL_WORLD_SIZE",
     "MASTER_PORT",
     "PYTHONHASHSEED",
-    "RANK",
     "TORCH_TPU_DP_MASTER_ADDR",
     "TORCH_TPU_DP_MASTER_PORT",
     "TORCH_TPU_DP_SIZE",

@@ -278,6 +278,7 @@ def test_range_prefetch_reads_only_local_ranges(tmp_path, monkeypatch):
         return real_pread(fd, n, off)
 
     monkeypatch.setattr(model_loader_patches.threading, "Thread", _RecordedThread)
+    monkeypatch.setattr(model_loader_patches, "_prefetches", [])
     monkeypatch.setattr(model_loader_patches.os, "pread", tracking_pread)
 
     _start_ep_range_prefetch([shard], {0}, num_threads=2, block_size=16)

@@ -478,6 +478,8 @@ def _start_ep_range_prefetch(
         jobs: list[tuple[int, int, int]] = []
         try:
             for path in sorted_files:
+                if stop.is_set():
+                    break
                 fd = os.open(path, os.O_RDONLY)
                 fds.append(fd)
                 for lo, hi in _local_tensor_ranges(path, local_expert_ids):
@@ -485,8 +487,10 @@ def _start_ep_range_prefetch(
                         (fd, off, min(block_size, hi - off))
                         for off in range(lo, hi, block_size)
                     )
-            with ThreadPoolExecutor(max_workers=num_threads) as executor:
-                total = sum(executor.map(read, jobs))
+            total = 0
+            if not stop.is_set():
+                with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                    total = sum(executor.map(read, jobs))
             elapsed = time.perf_counter() - start
             if stop.is_set():
                 logger.info(
@@ -521,11 +525,13 @@ def _start_ep_range_prefetch(
     )
     thread = threading.Thread(target=run, name="ep-range-prefetch", daemon=True)
     with _prefetch_lock:
+        # Without eviction nothing stops these threads; drop the ones that ended.
+        _prefetches[:] = [(t, e) for t, e in _prefetches if t.is_alive()]
         _prefetches.append((thread, stop))
     thread.start()
 
 
-# Prefetch threads started by _start_ep_range_prefetch and not yet stopped.
+# Prefetch threads started by _start_ep_range_prefetch that may still be running.
 _prefetches: list[tuple[threading.Thread, threading.Event]] = []
 _prefetch_lock = threading.Lock()
 
