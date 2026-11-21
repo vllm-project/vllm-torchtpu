@@ -11,9 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared model fixtures for roofline unit tests."""
+"""Shared model fixtures and Pareto point builders for roofline unit tests."""
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Literal
+
+from vllm_torchtpu.roofline import ParetoPoint
+from vllm_torchtpu.roofline.constants import UNIT_MILLIS_PER_SECOND
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.roofline import PoolMeshPlan
 
 QWEN35_CFG: dict[str, object] = {
     "text_config": {
@@ -80,3 +88,36 @@ NEMOTRON_CFG: dict[str, object] = {
     "intermediate_size": 8192,
     "vocab_size": 131072,
 }
+
+
+def make_pareto_point(
+    decode_pool: PoolMeshPlan,
+    concurrency: int,
+    token_throughput_per_chip: float,
+    interactivity_tok_s: float,
+    *,
+    prefill_pool: PoolMeshPlan | None = None,
+) -> ParetoPoint:
+    """Build a synthetic SLO-meeting ParetoPoint from pool plans and rates."""
+    mode: Literal["mixed", "disagg"] = "disagg" if prefill_pool is not None else "mixed"
+    prefill_chips = (
+        prefill_pool.instances * prefill_pool.chips_per_instance
+        if prefill_pool is not None
+        else 0
+    )
+    total_chips = prefill_chips + decode_pool.instances * decode_pool.chips_per_instance
+    return ParetoPoint(
+        mode=mode,
+        concurrency=concurrency,
+        total_chips=total_chips,
+        prefill_pool=prefill_pool,
+        decode_pool=decode_pool,
+        est_ttft_ms=100.0,
+        est_tpot_ms=UNIT_MILLIS_PER_SECOND / interactivity_tok_s,
+        est_interactivity_tok_s=interactivity_tok_s,
+        output_throughput_per_chip=token_throughput_per_chip * 0.1,
+        token_throughput_per_chip=token_throughput_per_chip,
+        p_mixed=0.0 if prefill_pool is not None else 0.05,
+        binding="hbm",
+        slo_met=True,
+    )

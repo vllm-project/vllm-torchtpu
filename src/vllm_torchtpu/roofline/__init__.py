@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU roofline serving, memory, collective, and execution modeling."""
+"""Analytical TPU serving roofline, step floor, and mesh solver."""
 
 from __future__ import annotations
 
@@ -46,7 +46,20 @@ from .geometry import (
     count_layer_types,
     from_hf_config,
 )
-from .hf_loader import dtypes_from_hf_config, load_hf_config
+from .hf_loader import (
+    ConfigAudit,
+    audit_hf_config,
+    dtypes_from_hf_config,
+    load_hf_config,
+)
+from .memory import (
+    HbmBreakdown,
+    KvFitInput,
+    ParamBreakdown,
+    SeqKvLayout,
+    hbm_footprint_per_core_bytes,
+    param_counts,
+)
 from .modules import (
     Dtypes,
     ModuleCost,
@@ -65,6 +78,16 @@ from .occupancy import (
     parse_activation_spec,
 )
 from .serving import ConcurrencyRow, ServingRequest, plan
+from .solver import (
+    ParetoPoint,
+    PoolMeshPlan,
+    ScenarioOverrides,
+    ServingPlan,
+    SolveOptions,
+    TrafficScenario,
+    build_example_scenario,
+    solve_serving_plan,
+)
 from .step import (
     FloorOptions,
     SpecShape,
@@ -89,33 +112,49 @@ __all__ = [
     "Collective",
     "CollectiveConfig",
     "ConcurrencyRow",
+    "ConfigAudit",
     "Dtypes",
     "ExpertActivationModel",
     "ExpertDispatch",
     "FloorOptions",
+    "HbmBreakdown",
     "KeyTracker",
+    "KvFitInput",
     "LayerCounts",
     "ModelGeometry",
     "ModuleCost",
     "Parallel",
+    "ParamBreakdown",
+    "ParetoPoint",
+    "PoolMeshPlan",
+    "ScenarioOverrides",
+    "SeqKvLayout",
+    "ServingPlan",
     "ServingRequest",
     "SliceTopology",
+    "SolveOptions",
     "SpecShape",
     "StepFloor",
     "StepShape",
+    "TrafficScenario",
     "active_experts_envelope",
+    "audit_hf_config",
     "bernoulli_expected_experts",
+    "build_example_scenario",
     "count_layer_types",
     "dtypes_from_hf_config",
     "from_hf_config",
+    "hbm_footprint_per_core_bytes",
     "load_activation_hull",
     "load_chip_spec",
     "load_hf_config",
     "min_experts_per_ep_shard",
+    "param_counts",
     "parse_activation_spec",
     "pass_costs",
     "plan",
     "register_chip",
+    "solve_serving_plan",
     "spec_cycle_floor",
     "step_floor",
     "topologies_for_chip",

@@ -27,6 +27,7 @@ from typing import Literal
 from .. import envs
 from .constants import (
     BASE_DTYPE_BYTES,
+    BENIGN_HF_METADATA_KEYS,
     DEFAULT_HTTP_PORT,
     DEFAULT_HTTPS_PORT,
     DEFAULT_SSM_STATE_BYTES,
@@ -36,13 +37,25 @@ from .constants import (
     FP8_BYTES,
     HTTP_OK,
     HTTP_TIMEOUT_S,
+    MULTIMODAL_KEYS,
     MXFP4_BYTES,
     NVFP4_BYTES,
     SIXTEEN_BITS,
+    SUPPORTED_MODEL_TYPES,
     WEIGHT_BLOCK_DIM_LEN,
     WEIGHT_ONLY_QUANT_METHODS,
 )
-from .geometry import _first_non_none
+from .geometry import (
+    KeyTracker,
+    LayerCounts,
+    ModelGeometry,
+    UnsupportedArchitectureError,
+    _first_non_none,
+    count_layer_types,
+    from_hf_config,
+    supports,
+)
+from .memory import ParamBreakdown, param_counts
 from .modules import Dtypes
 
 _MIN_PRINTABLE_ASCII = 32
@@ -883,4 +896,221 @@ def dtypes_from_hf_config(cfg: Mapping[str, object]) -> Dtypes:
         w_dense_dtype=w_dense_dt,
         w_expert_dtype=w_expert_dt,
         kv_dtype=kv_dt,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigAudit:
+    """Onboarding readiness and zero-drift key audit for an HF config mapping."""
+
+    onboarding_tier: Literal[
+        "tier0_ready", "tier1_config_needed", "tier2_primitive_needed"
+    ]
+    model_type: str
+    model_type_status: Literal[
+        "listed", "unlisted_structural_ok", "unlisted_blocked", "omitted"
+    ]
+    unmapped_structural_keys: tuple[str, ...]
+    ignored_non_text_keys: tuple[str, ...]
+    blocking_reasons: tuple[str, ...]
+    geometry: ModelGeometry | None
+    dtypes: Dtypes | None
+    layer_counts: LayerCounts | None
+    param_counts: ParamBreakdown | None
+
+
+def _collect_unmapped_structural_keys(
+    raw_cfg: Mapping[str, object],
+    consumed: frozenset[str],
+) -> tuple[str, ...]:
+    """Return sorted text-config keys omitted from both value reads and benign sets."""
+    raw_sub = _as_mapping(raw_cfg.get("text_config"))
+    unmapped: list[str] = []
+    if raw_sub:
+        unmapped.extend(
+            key
+            for key in raw_sub
+            if f"text_config.{key}" not in consumed
+            and key not in BENIGN_HF_METADATA_KEYS
+        )
+        unmapped.extend(
+            key
+            for key in raw_cfg
+            if key != "text_config"
+            and key not in MULTIMODAL_KEYS
+            and key not in raw_sub
+            and key not in consumed
+            and key not in BENIGN_HF_METADATA_KEYS
+        )
+    else:
+        unmapped.extend(
+            key
+            for key in raw_cfg
+            if key not in consumed
+            and key not in BENIGN_HF_METADATA_KEYS
+            and key not in MULTIMODAL_KEYS
+        )
+    return tuple(sorted(unmapped))
+
+
+def _resolve_model_type_status(
+    model_type: str,
+    *,
+    allow_unlisted_model_type: bool,
+    structural_ok: bool,
+) -> Literal["listed", "unlisted_structural_ok", "unlisted_blocked", "omitted"]:
+    """Classify config model_type registry and allowlist status."""
+    if not model_type:
+        return "omitted"
+    if model_type in SUPPORTED_MODEL_TYPES:
+        return "listed"
+    if allow_unlisted_model_type and structural_ok:
+        return "unlisted_structural_ok"
+    return "unlisted_blocked"
+
+
+def _run_tracked_extraction(
+    raw_cfg: Mapping[str, object],
+    *,
+    allow_unlisted_model_type: bool,
+) -> tuple[
+    ModelGeometry,
+    Dtypes,
+    LayerCounts,
+    ParamBreakdown,
+    tuple[str, ...],
+]:
+    """Extract geometry, dtypes, counts, params, and unmapped keys under KeyTracker."""
+    tracker = KeyTracker(raw_cfg)
+    geom = from_hf_config(tracker, allow_unlisted_model_type=allow_unlisted_model_type)
+    dtypes = dtypes_from_hf_config(tracker)
+    counts = count_layer_types(geom)
+    params = param_counts(geom)
+    unmapped = _collect_unmapped_structural_keys(raw_cfg, tracker.consumed_keys)
+    return geom, dtypes, counts, params, unmapped
+
+
+def audit_hf_config(
+    cfg: Mapping[str, object],
+    *,
+    allow_unlisted_model_type: bool = False,
+) -> ConfigAudit:
+    """Audit HF config onboarding readiness, key coverage, and parameter counts."""
+    raw_cfg: Mapping[str, object] = cfg.raw_data if isinstance(cfg, KeyTracker) else cfg
+    raw_sub = _as_mapping(raw_cfg.get("text_config"))
+    raw_text_cfg = raw_sub if raw_sub else raw_cfg
+    scopes = (raw_text_cfg, raw_cfg) if raw_text_cfg is not raw_cfg else (raw_text_cfg,)
+    model_type = str(_first_non_none(scopes, "model_type") or "").strip().lower()
+    ignored_non_text = tuple(sorted(k for k in raw_cfg if k in MULTIMODAL_KEYS))
+
+    try:
+        supports(raw_cfg, allow_unlisted_model_type=True)
+    except UnsupportedArchitectureError as exc:
+        reasons = [str(exc)]
+        if (
+            model_type
+            and model_type not in SUPPORTED_MODEL_TYPES
+            and not allow_unlisted_model_type
+        ):
+            reasons.insert(
+                0,
+                f"Unrecognized or unsupported model_type {model_type!r}; fails closed",
+            )
+        return ConfigAudit(
+            onboarding_tier="tier2_primitive_needed",
+            model_type=model_type,
+            model_type_status=_resolve_model_type_status(
+                model_type, allow_unlisted_model_type=False, structural_ok=False
+            ),
+            unmapped_structural_keys=(),
+            ignored_non_text_keys=ignored_non_text,
+            blocking_reasons=tuple(reasons),
+            geometry=None,
+            dtypes=None,
+            layer_counts=None,
+            param_counts=None,
+        )
+
+    try:
+        supports(raw_cfg, allow_unlisted_model_type=allow_unlisted_model_type)
+    except UnsupportedArchitectureError as gate_exc:
+        reasons = [str(gate_exc)]
+        unmapped: tuple[str, ...] = ()
+        tier: Literal[
+            "tier0_ready", "tier1_config_needed", "tier2_primitive_needed"
+        ] = "tier1_config_needed"
+        try:
+            _, _, _, _, unmapped = _run_tracked_extraction(
+                raw_cfg, allow_unlisted_model_type=True
+            )
+        except UnsupportedArchitectureError as dry_exc:
+            reasons.append(str(dry_exc))
+            tier = "tier2_primitive_needed"
+        except (ValueError, KeyError) as dry_exc:
+            reasons.append(str(dry_exc))
+        return ConfigAudit(
+            onboarding_tier=tier,
+            model_type=model_type,
+            model_type_status="unlisted_blocked",
+            unmapped_structural_keys=unmapped,
+            ignored_non_text_keys=ignored_non_text,
+            blocking_reasons=tuple(reasons),
+            geometry=None,
+            dtypes=None,
+            layer_counts=None,
+            param_counts=None,
+        )
+
+    model_type_status = _resolve_model_type_status(
+        model_type,
+        allow_unlisted_model_type=allow_unlisted_model_type,
+        structural_ok=True,
+    )
+    try:
+        geom, dtypes, counts, params, unmapped = _run_tracked_extraction(
+            raw_cfg, allow_unlisted_model_type=allow_unlisted_model_type
+        )
+    except UnsupportedArchitectureError as exc:
+        return ConfigAudit(
+            onboarding_tier="tier2_primitive_needed",
+            model_type=model_type,
+            model_type_status=model_type_status,
+            unmapped_structural_keys=(),
+            ignored_non_text_keys=ignored_non_text,
+            blocking_reasons=(str(exc),),
+            geometry=None,
+            dtypes=None,
+            layer_counts=None,
+            param_counts=None,
+        )
+    except (ValueError, KeyError) as exc:
+        reason = (
+            f"Missing required config field: {exc}"
+            if isinstance(exc, KeyError)
+            else str(exc)
+        )
+        return ConfigAudit(
+            onboarding_tier="tier1_config_needed",
+            model_type=model_type,
+            model_type_status=model_type_status,
+            unmapped_structural_keys=(),
+            ignored_non_text_keys=ignored_non_text,
+            blocking_reasons=(reason,),
+            geometry=None,
+            dtypes=None,
+            layer_counts=None,
+            param_counts=None,
+        )
+
+    return ConfigAudit(
+        onboarding_tier="tier0_ready",
+        model_type=model_type,
+        model_type_status=model_type_status,
+        unmapped_structural_keys=unmapped,
+        ignored_non_text_keys=ignored_non_text,
+        blocking_reasons=(),
+        geometry=geom,
+        dtypes=dtypes,
+        layer_counts=counts,
+        param_counts=params,
     )
