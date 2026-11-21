@@ -183,18 +183,26 @@ def test_dcp_kernels_take_the_tuned_tiles(monkeypatch):
         assert off.keywords["tuned_tiles"] is False
         assert on.keywords["tuned_tiles"] is True
 
-    seen = {}
+    seen = []
 
     def fake_wrapper(**kwargs):
-        seen.update(kwargs)
+        seen.append(kwargs)
         return None, None, None
 
     monkeypatch.setattr(
         cp_attention._batched_rpa_wrapper, "ragged_paged_attention", fake_wrapper
     )
-    tuned[0](*([None] * 11))
-    assert seen["tuned_tiles"] is True
-    assert seen["skip_empty_mixed"] is False
+    for kernel in tuned:
+        kernel(*([None] * 11))
+    # Both passes, the cache pass and the new-token pass, hand the tuned tiles
+    # (and not the skip) to the wrapper.
+    scope = cp_attention._batched_rpa_configs.AttentionScope
+    assert [
+        (c["attention_scope"], c["tuned_tiles"], c["skip_empty_mixed"]) for c in seen
+    ] == [
+        (scope.CACHE_ONLY, True, False),
+        (scope.NEW_TOKENS_ONLY, True, False),
+    ]
 
 
 def test_dcp_kernels_take_the_skip_on_its_own(monkeypatch):
