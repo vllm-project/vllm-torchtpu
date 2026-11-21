@@ -552,6 +552,7 @@ def _kernel(
     lazy: tuple = (),
     lane_sum: tuple = (),
     bound_stab: bool = False,
+    carry: bool = False,
 ):
     # DCP: a fourth scalar operand holds this rank; its KV tiles are its owned
     # page-sized blocks only (local tile t is global block t * dcp_world + rank).
@@ -577,11 +578,10 @@ def _kernel(
     # VLLM_TPU_QSA_PREFILL_LANE_SUM: per-row masses kept as 128-lane partial
     # sums (rows, 128), reduced across lanes once per query block.
     lane_ref = refs[7] if lane_sum else None
-    # VPU path with qkfirst: the last unit of each KV tile (its scores, the
-    # selection bits of its query rows and the tile's values), carried into
-    # the next tile's body; one slot per tile parity (see compute_tile_vpu).
-    num_units = (query_block // query_tile) * kv_heads
-    carry = "qkfirst" in vpu and num_units > 1
+    # carry (VPU path with qkfirst, several units per tile): the last unit of
+    # each KV tile (its scores, the selection bits of its query rows and the
+    # tile's values), carried into the next tile's body; one slot per tile
+    # parity (see compute_tile_vpu).
     carry_score_ref, carry_bits_ref, carry_value_ref = (
         refs[7:10] if carry else (None,) * 3
     )
@@ -1174,6 +1174,8 @@ def _kernel(
                 compute_tile_vpu(tile, kv_ref, True, parity)
 
     def run_tiles(tile_fn):
+        # Tile slot i always lands in kv{i % 2}: the VPU path's carry keys its
+        # slots on that parity, and its drain on count % 2.
         @pl.when(count > 0)
         def prefetch_first():
             start_tile(active_tile(0), kv0_ref, sem0_ref)
@@ -1855,6 +1857,9 @@ def _block_sparse_gqa_prefill(
             ",".join(lazy),
             envs.VLLM_TPU_QSA_PREFILL_LAZY_SOFTMAX,
         )
+    # VPU path with qkfirst: overlap each KV tile's first QK with the previous
+    # tile's last unit (see _kernel's carry).
+    carry = "qkfirst" in vpu and state_shape[0] * kv_heads > 1
     out_spec = pl.BlockSpec(
         (query_block, query_heads, head_dim),
         lambda b, *_: (b, 0, 0),
@@ -1886,6 +1891,7 @@ def _block_sparse_gqa_prefill(
             **({"lazy": lazy} if lazy else {}),
             **({"lane_sum": lane_sum} if lane_sum else {}),
             **({"bound_stab": True} if use_bound else {}),
+            **({"carry": True} if carry else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3 + int(dcp) + int(bool(vpu)) + int(use_bound),
@@ -1941,7 +1947,7 @@ def _block_sparse_gqa_prefill(
                         else jnp.float32,
                     ),
                 ]
-                if "qkfirst" in vpu and state_shape[0] * kv_heads > 1
+                if carry
                 else []
             ),
         ),

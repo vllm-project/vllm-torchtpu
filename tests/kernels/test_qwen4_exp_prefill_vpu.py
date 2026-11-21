@@ -55,14 +55,15 @@ def test_feature_parsing(monkeypatch):
         vpu_features()
 
 
-def _case(seed, query_heads, kv_tile, k_scale):
+def _case(seed, query_heads, kv_tile, k_scale, contexts=(700, 50)):
     rng = np.random.default_rng(seed)
     ratio, dim = 4, 256
     page_size, pages = (512, 4) if kv_tile == 1024 else (128, 12)
     tokens = 1024
     # Two requests: a 600-token prefill on a 700-token context and a short one.
     starts = np.array([0, 600, 700], np.int32)
-    contexts = np.array([700, 50], np.int32)
+    contexts = np.array(contexts, np.int32)
+    pages = max(pages, -(-(int(contexts.max()) + tokens) // page_size))
     request = np.searchsorted(starts[1:], np.arange(tokens), side="right")
     lengths = np.zeros(tokens, np.int32)
     live = request < 2
@@ -99,7 +100,9 @@ def _case(seed, query_heads, kv_tile, k_scale):
     return args, expected, lengths, ratio
 
 
-def _run(monkeypatch, features, args, *, query_heads, kv_tile, k_scale, ratio):
+def _run(
+    monkeypatch, features, args, *, query_heads, kv_tile, k_scale, ratio, kv_heads=1
+):
     monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_VPU", features)
     monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_LEAN", "1")
     jax.clear_caches()
@@ -107,7 +110,7 @@ def _run(monkeypatch, features, args, *, query_heads, kv_tile, k_scale, ratio):
     run = jax.jit(
         functools.partial(
             block_sparse_gqa_attention,
-            kv_heads=1,
+            kv_heads=kv_heads,
             ratio=ratio,
             query_block=query_block,
             kv_tile=kv_tile,
@@ -176,4 +179,26 @@ def test_mxu_schedule_bitwise(backend, monkeypatch, extra):
     monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_PAGE_COPIES", "1")
     base = _run(monkeypatch, "1", args, **common)
     actual = _run(monkeypatch, "mask,qk16,pv16," + extra, args, **common)
+    np.testing.assert_array_equal(actual, base)
+
+
+@pytest.mark.parametrize("query_heads,kv_heads", [(3, 1), (6, 2)])
+def test_carry_bitwise(backend, monkeypatch, query_heads, kv_heads):
+    """With qkfirst each KV tile's last unit runs in the next tile's body and
+    the last tile's is drained after the walk: bit-identical to "1" over query
+    blocks walking 0 (the padded layout's empty blocks), 2, 3 and 4 KV tiles,
+    with the carried unit on the query-tile axis (kv_heads 1) or the KV-head
+    axis (kv_heads 2)."""
+    args, _, _, ratio = _case(13, query_heads, 1024, 1.0, contexts=(2500, 1200))
+    common = dict(
+        query_heads=query_heads,
+        kv_tile=1024,
+        k_scale=1.0,
+        ratio=ratio,
+        kv_heads=kv_heads,
+    )
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_PAGE_COPIES", "1")
+    base = _run(monkeypatch, "1", args, **common)
+    actual = _run(monkeypatch, "2", args, **common)
+    assert np.isfinite(actual).all()
     np.testing.assert_array_equal(actual, base)
