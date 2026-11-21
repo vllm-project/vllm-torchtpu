@@ -30,7 +30,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpeculativeDecodingManager,
 )
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-from vllm_torchtpu.spec_decode.eagle3 import _static_shape_args
+from vllm_torchtpu.spec_decode.utils import _static_shape_args
 from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
 NUM_TOKENS_PADDINGS = [16, 32, 64]

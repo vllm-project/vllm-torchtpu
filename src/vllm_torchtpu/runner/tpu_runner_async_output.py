@@ -24,7 +24,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
-from vllm_torchtpu.spec_decode.eagle3 import _static_shape_args
+from vllm_torchtpu.spec_decode.utils import _static_shape_args
 
 INVALID_TOKEN_ID = -1
 
