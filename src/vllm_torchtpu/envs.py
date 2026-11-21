@@ -209,6 +209,10 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE: bool = False
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
     TPU_SMALL_ALL_REDUCE_DRAFT: bool = False
+    TPU_FP8_LINEAR_PALLAS: bool = False
+    TPU_FP8_LINEAR_PALLAS_SITES: str = (
+        "fused_qkv_a_proj,q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
+    )
 
 
 def env_with_choices(
@@ -1264,6 +1268,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and loop-step programs. The row choice is taken per compiled bucket inside
     # the JAX op (XLA's all-reduce above the cap), so no trace forks.
     "TPU_SMALL_ALL_REDUCE_DRAFT": env_bool("TPU_SMALL_ALL_REDUCE_DRAFT"),
+    # Per-channel FP8 dense linears whose decode weight XLA reads from HBM: route
+    # M <= 16 through the weight-streaming Pallas kernel
+    # (kernels/quantized_matmul/fp8_skinny.py), XLA otherwise. Outputs differ from
+    # the XLA path in the f32 accumulation (exact here; XLA's fp8 x fp8 dot is not).
+    # A selected layer whose width is not a multiple of 128 (q_a + kv_a, 2624) also
+    # keeps a zero-padded copy of its weight for the kernel: +16.5 MB per layer on
+    # GLM-5.2-FP8, i.e. about 1.3 GB per rank over 79 layers.
+    "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS"),
+    # Comma-separated layer-prefix suffixes that take that path, matched on a "."
+    # boundary. The defaults are the sites XLA does not prefetch on GLM-5.2-FP8
+    # decode; a VMEM-prefetched weight (indexer wq_b, shared experts, dense
+    # down_proj) is faster under XLA than any HBM stream.
+    "TPU_FP8_LINEAR_PALLAS_SITES": env_str(
+        "TPU_FP8_LINEAR_PALLAS_SITES",
+        "fused_qkv_a_proj,q_b_proj,self_attn.o_proj,mlp.gate_up_proj",
+    ),
 }
 
 
