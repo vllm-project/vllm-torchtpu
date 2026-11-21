@@ -5258,11 +5258,10 @@ class TPUModelRunner(GPUModelRunner):
 
     def _greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
         """argmax logits, only used when `all_greedy` is True."""
-        dummy = torch.empty((1, 1), dtype=logits.dtype, device=logits.device)
         return self.sample_from_logits_func(
             logits,
-            dummy,
-            dummy,
+            torch.empty((1, 1), dtype=logits.dtype, device=logits.device),
+            torch.empty((1, 1), dtype=torch.float32, device=logits.device),
             torch.empty((1, 1), dtype=torch.int32, device=logits.device),
             torch.empty((1, 1), dtype=torch.float32, device=logits.device),
             all_greedy=True,
@@ -7152,7 +7151,8 @@ class TPUModelRunner(GPUModelRunner):
         """Common boilerplate for each AOT bucket precompile pass."""
         logger.info("Compiling %s with different input shapes.", name)
         start = time.perf_counter()
-        yield
+        with torch.no_grad():
+            yield
         logger.info("Compilation finished in %.2f [secs].", time.perf_counter() - start)
         self._update_num_xla_graphs(name)
 
@@ -7164,26 +7164,31 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_compute_selected_logits(self) -> None:
         hsize = self.model_config.get_hidden_size()
+        pairs: list[tuple[int, int]] = []
+        for num_tokens in self.num_tokens_paddings:
+            for num_reqs in self.num_reqs_paddings:
+                pairs.append((num_tokens, num_reqs))
+                if num_reqs >= min(num_tokens, self.max_num_reqs):
+                    break
         with self._precompile_timed("compute_selected_logits"):
-            for num_tokens in self.num_tokens_paddings:
-                dummy_hidden = torch.zeros(
-                    (num_tokens, hsize),
-                    dtype=self._hidden_states_dtype,
-                ).to(self.device)
-                for num_reqs in self.num_reqs_paddings:
-                    indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
-                    out = self.compute_selected_logits(dummy_hidden, indices)
-                    synchronize_tensors(out)
-                    logger.info(
-                        "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
-                    )
-                    if num_reqs >= min(num_tokens, self.max_num_reqs):
-                        break
+            dummy_hidden: torch.Tensor | None = None
+            for num_tokens, num_reqs in _rotate_precompile_items(self, pairs):
+                if dummy_hidden is None or dummy_hidden.shape[0] != num_tokens:
+                    dummy_hidden = torch.zeros(
+                        (num_tokens, hsize),
+                        dtype=self._hidden_states_dtype,
+                    ).to(self.device)
+                indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
+                out = self.compute_selected_logits(dummy_hidden, indices)
+                synchronize_tensors(out)
+                logger.info("  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs)
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_logits_from_hidden_states"):
-            for num_reqs in self.num_reqs_paddings:
+            for num_reqs in _rotate_precompile_items(
+                self, list(self.num_reqs_paddings)
+            ):
                 dummy_hidden = torch.zeros(
                     (num_reqs, hsize),
                     dtype=self._hidden_states_dtype,
@@ -7196,22 +7201,29 @@ class TPUModelRunner(GPUModelRunner):
         if self._greedy_head_owner is None:
             return
         hsize = self.model_config.get_hidden_size()
+        pairs: list[tuple[int, int]] = []
+        for num_tokens in self.num_tokens_paddings:
+            for num_reqs in self.num_reqs_paddings:
+                pairs.append((num_tokens, num_reqs))
+                if num_reqs >= min(num_tokens, self.max_num_reqs):
+                    break
         with self._precompile_timed("compute_selected_top_tokens"):
-            for num_tokens in self.num_tokens_paddings:
-                dummy_hidden = torch.zeros(
-                    (num_tokens, hsize),
-                    dtype=self._hidden_states_dtype,
-                ).to(self.device)
-                for num_reqs in self.num_reqs_paddings:
-                    indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
-                    out = self.compute_selected_top_tokens(dummy_hidden, indices)
-                    synchronize_tensors(out)
-                    if num_reqs >= min(num_tokens, self.max_num_reqs):
-                        break
+            dummy_hidden: torch.Tensor | None = None
+            for num_tokens, num_reqs in _rotate_precompile_items(self, pairs):
+                if dummy_hidden is None or dummy_hidden.shape[0] != num_tokens:
+                    dummy_hidden = torch.zeros(
+                        (num_tokens, hsize),
+                        dtype=self._hidden_states_dtype,
+                    ).to(self.device)
+                indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
+                out = self.compute_selected_top_tokens(dummy_hidden, indices)
+                synchronize_tensors(out)
         if not self.get_pcp_planner().uses_selected_logits_hidden_states:
             return
         with self._precompile_timed("compute_top_tokens_from_hidden_states"):
-            for num_reqs in self.num_reqs_paddings:
+            for num_reqs in _rotate_precompile_items(
+                self, list(self.num_reqs_paddings)
+            ):
                 dummy_hidden = torch.zeros(
                     (num_reqs, hsize),
                     dtype=self._hidden_states_dtype,
@@ -7348,13 +7360,21 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 ]
                 variants.append((True, 0, True))
+                # _greedy_sample passes (1, 1) placeholders for the unused
+                # sampling inputs; warm the greedy graph with the same shapes
+                # and dtypes, or dynamo's shape guards miss and the first
+                # greedy batch with more than one request recompiles.
+                greedy_args = (
+                    torch.empty((1, 1), dtype=dummy_logits.dtype).to(self.device),
+                    torch.empty((1, 1), dtype=torch.float32).to(self.device),
+                    torch.empty((1, 1), dtype=torch.int32).to(self.device),
+                    torch.empty((1, 1), dtype=torch.float32).to(self.device),
+                )
+                sampling_args = (dummy_temperatures, dummy_u, dummy_top_k, dummy_top_p)
                 for all_greedy, topk_candidates, apply_topk_topp in variants:
                     out = self.sample_from_logits_func(
                         dummy_logits,
-                        dummy_temperatures,
-                        dummy_u,
-                        dummy_top_k,
-                        dummy_top_p,
+                        *(greedy_args if all_greedy else sampling_args),
                         all_greedy=all_greedy,
                         topk_candidates=topk_candidates,
                         apply_topk_topp=apply_topk_topp,
@@ -7426,8 +7446,17 @@ class TPUModelRunner(GPUModelRunner):
             next_lens.append(
                 self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
             )
+        pairs = [
+            (num_tokens, nlen)
+            for num_tokens in self.num_tokens_paddings
+            for nlen in next_lens
+        ]
         with self._precompile_timed("substitute_placeholder_token"):
-            for num_tokens in self.num_tokens_paddings:
+            # A scatter with no collective: every local rank may take its own
+            # order (see test_substitute_placeholder_token_has_no_collective).
+            for num_tokens, nlen in _rotate_precompile_items(
+                self, pairs, collective_free=True
+            ):
                 input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
                 cur_input_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
                     self.device
@@ -7437,16 +7466,15 @@ class TPUModelRunner(GPUModelRunner):
                 pre_next_tokens_indices = torch.full(
                     (num_tokens,), -1, dtype=torch.int32
                 ).to(self.device)
-                for nlen in next_lens:
-                    next_tokens = torch.zeros(nlen, dtype=torch.int64).to(self.device)
-                    out = _substitute_placeholder_token(
-                        input_ids,
-                        cur_input_indices,
-                        pre_next_tokens_indices,
-                        next_tokens,
-                    )
-                    synchronize_tensors(out)
-                    logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
+                next_tokens = torch.zeros(nlen, dtype=torch.int64).to(self.device)
+                out = _substitute_placeholder_token(
+                    input_ids,
+                    cur_input_indices,
+                    pre_next_tokens_indices,
+                    next_tokens,
+                )
+                synchronize_tensors(out)
+                logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
@@ -7647,6 +7675,12 @@ class TPUModelRunner(GPUModelRunner):
         if not self._pp_is_last:
             # Only the last stage holds the lm_head and samples.
             return
+        tokens_key = tuple(getattr(self, "num_tokens_paddings", ()) or ())
+        if (
+            tokens_key
+            and getattr(self, "_precompiled_sampling_tokens_key", None) == tokens_key
+        ):
+            return
         self._precompile_compute_selected_logits()
         if self.get_pcp_planner().uses_selected_logits_hidden_states:
             self._precompile_compute_logits_from_hidden_states()
@@ -7657,6 +7691,8 @@ class TPUModelRunner(GPUModelRunner):
         self._precompile_repetition_penalty()
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
+        if tokens_key:
+            self._precompiled_sampling_tokens_key = tokens_key
 
     def _resolve_static_pooler(self) -> None:
         """Pick the static compiled pooler for eligible embed poolers."""
@@ -7695,12 +7731,21 @@ class TPUModelRunner(GPUModelRunner):
         if spec is None:
             logger.info("Skipping pooler precompile: %s", self._static_pooler_reason)
             return
+        tokens_key = tuple(getattr(self, "num_tokens_paddings", ()) or ())
+        if (
+            tokens_key
+            and getattr(self, "_precompiled_pooler_tokens_key", None) == tokens_key
+        ):
+            return
         hsize = self.model_config.get_hidden_size()
+        grid = list(
+            iter_pooler_precompile_grid(
+                self.num_tokens_paddings, self.num_reqs_paddings, self.max_num_reqs
+            )
+        )
         with self._precompile_timed("static pooler"), torch.no_grad():
             dummy_hidden = None
-            for num_tokens, num_reqs in iter_pooler_precompile_grid(
-                self.num_tokens_paddings, self.num_reqs_paddings, self.max_num_reqs
-            ):
+            for num_tokens, num_reqs in _rotate_precompile_items(self, grid):
                 if dummy_hidden is None or dummy_hidden.shape[0] != num_tokens:
                     dummy_hidden = torch.zeros(
                         (num_tokens, hsize),
@@ -7712,6 +7757,8 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 synchronize_tensors(static_pool(dummy_hidden, inputs, spec))
                 logger.info("  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs)
+        if tokens_key:
+            self._precompiled_pooler_tokens_key = tokens_key
 
     def pp_handoff_hbm_reserve_bytes(self) -> int:
         """Device memory the buffered hand-off's buffers can take beyond
@@ -9666,3 +9713,43 @@ def _get_num_slices_per_kv_cache_update_block(page_size_bytes: int) -> int:
     if num_slices_per_block > 64:
         num_slices_per_block = 64
     return num_slices_per_block
+
+
+def _rotate_precompile_items(
+    runner: Any, items: list[Any], *, collective_free: bool = False
+) -> list[Any]:
+    """Order a helper's precompile shapes so the local ranks of a host start
+    on different shapes.
+
+    Every local rank compiles every shape, serially. In the same order they
+    all compile the same shape at the same moment and none of them finds it
+    in the compile cache the host shares; staggered, a rank reaches most
+    shapes after another rank has cached them.
+
+    Under TPU_PARALLEL_PRECOMPILE each group of ranks starts at its share of
+    the list, ``len(items) * group // groups``, and wraps around:
+
+    - ``collective_free=False`` (default): a group is one TP group
+      (``local_rank // tp_size``), so ranks that run a collective together
+      keep the same order. With a single TP group per host (e.g. TP=8 on 8
+      chips) the order is unchanged.
+    - ``collective_free=True``: every local rank is its own group. Only for
+      graphs with no collective, which ranks may then compile in any order.
+    """
+    if not envs.TPU_PARALLEL_PRECOMPILE or len(items) <= 1:
+        return items
+    local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "0") or 0)
+    local_rank = int(os.environ.get("LOCAL_RANK", "0") or 0)
+    if collective_free:
+        group_size = 1
+    else:
+        parallel_config = getattr(runner, "parallel_config", None)
+        group_size = max(
+            1, int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
+        )
+    groups = local_world // group_size
+    if groups <= 1:
+        return items
+    group = (local_rank // group_size) % groups
+    offset = (len(items) * group) // groups
+    return items[offset:] + items[:offset]
