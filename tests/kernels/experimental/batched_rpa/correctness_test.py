@@ -13,6 +13,7 @@
 # limitations under the License.
 """Correctness tests for batched ragged paged attention."""
 
+import re
 from typing import Any
 
 import jax
@@ -24,6 +25,7 @@ from jax._src import dtypes
 from jax._src import test_util as jtu
 from jax.experimental.pallas import tpu as pltpu
 
+from tests.kernels.experimental.batched_rpa.rpa_test_utils import rpa_kernel_names
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs,
     utils,
@@ -223,7 +225,18 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         nan_kv_seq_idx: int | None = None,
         nan_new_seq_idx: int | None = None,
         mask_invalid_v: bool | None = None,
+        tuned_tiles: bool | None = None,
+        decode_batch_size: int | None = None,
+        expect_kernel_tiles: tuple[str, ...] = (),
+        expect_decode_lanes: int | None = None,
     ):
+        """tuned_tiles=None passes the block sizes above; True or False lets
+        the wrapper pick its tiles with or without the tuned rules, for
+        decode_batch_size decode lanes (the wrapper's default when None).
+        Each of expect_kernel_tiles ("-b<batch>-q<bq>-k<bkv>") must end the
+        name of one RPA kernel the call traces, and with expect_decode_lanes
+        every DECODE kernel the call traces must work on that many
+        sequences."""
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # Tokens live on the lane dim, so page_size must be a multiple of 128.
             page_size = utils.align_to(page_size, 128)
@@ -369,14 +382,16 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
 
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # kv_cache shape: [num_pages, page_size, num_kv_heads_x2 // kv_packing,
-            #                  kv_packing, aligned_head_dim_rpa]
+            #                  kv_packing, aligned_head_dim_rpa]. Combined head h is
+            # packing slot h; the kernel's cache holds the real K and V heads only
+            # (num_kv_heads * 2), not the packing pad of a single KV head.
             rpa_kv_cache = rpa_kv_cache.reshape(
                 num_pages,
                 page_size,
                 num_kv_heads_x2,
                 aligned_head_dim_rpa // kv_packing,
                 kv_packing,
-            ).transpose(0, 2, 3, 4, 1)
+            ).transpose(0, 2, 3, 4, 1)[:, : num_kv_heads * 2]
 
         rpa_args = (
             q,
@@ -407,32 +422,55 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             batch_size=rpa_batch_size,
         )
 
-        output, updated_kv_cache = wrapper.ragged_paged_attention(
-            *jax.tree.map(lambda x: x.copy(), rpa_args),
+        if tuned_tiles is None:
+            tile_kwargs = {
+                "decode_block_sizes": decode_block_sizes,
+                "prefill_block_sizes": prefill_block_sizes,
+            }
+        else:
+            tile_kwargs = {"tuned_tiles": tuned_tiles}
+            if decode_batch_size is not None:
+                tile_kwargs["decode_batch_size"] = decode_batch_size
+        call_kwargs = dict(
             **kwargs,
-            decode_block_sizes=decode_block_sizes,
-            prefill_block_sizes=prefill_block_sizes,
+            **tile_kwargs,
             vmem_limit_bytes=vmem_limit_bytes,
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
             mask_invalid_v=mask_invalid_v,
         )
-        output = output[: cu_q_lens[distribution[-1]]]
-
-        if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-            # updated_kv_cache shape: [num_pages, num_kv_heads_x2,
-            #                          aligned_head_dim_rpa // kv_packing, kv_packing,
-            #                          page_size]
-            updated_kv_cache = updated_kv_cache.transpose(0, 4, 1, 2, 3).reshape(
-                num_pages,
-                page_size,
-                num_kv_heads_x2 // kv_packing,
-                kv_packing,
-                aligned_head_dim_rpa,
+        if expect_kernel_tiles or expect_decode_lanes is not None:
+            names = rpa_kernel_names(
+                lambda *a: wrapper.ragged_paged_attention(*a, **call_kwargs),
+                *rpa_args,
             )
+            for tiles in expect_kernel_tiles:
+                assert any(name.endswith(tiles) for name in names), (tiles, names)
+            if expect_decode_lanes is not None:
+                decode = f"RPA{configs.RpaCase.DECODE.symbol}-"
+                lanes = re.compile(rf"-b{expect_decode_lanes}-q\d+-k\d+$")
+                decode_names = [n for n in names if n.startswith(decode)]
+                assert decode_names, names
+                assert all(lanes.search(n) for n in decode_names), names
+        output, updated_kv_cache = wrapper.ragged_paged_attention(
+            *jax.tree.map(lambda x: x.copy(), rpa_args), **call_kwargs
+        )
+        output = output[: cu_q_lens[distribution[-1]]]
 
         if aligned_head_dim_rpa != 128:
             expected_kv_cache = expected_kv_cache[..., :aligned_head_dim_rpa]
+
+        if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            # updated_kv_cache shape: [num_pages, num_kv_heads * 2,
+            #                          aligned_head_dim_rpa // kv_packing, kv_packing,
+            #                          page_size]; compare it with the same real
+            # heads of the reference cache.
+            updated_kv_cache = updated_kv_cache.transpose(0, 4, 1, 2, 3).reshape(
+                num_pages, page_size, num_kv_heads * 2, aligned_head_dim_rpa
+            )
+            expected_kv_cache = expected_kv_cache.reshape(
+                num_pages, page_size, num_kv_heads_x2, aligned_head_dim_rpa
+            )[:, :, : num_kv_heads * 2]
 
         dtype_bits = dtypes.itemsize_bits(jnp.dtype(kv_dtype))
         tols = {
@@ -946,6 +984,86 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             dtype,
             num_pages,
             soft_cap=soft_cap,
+        )
+
+    @parameterized.product(tuned_tiles=[False, True])
+    def test_ragged_paged_attention_tuned_tiles(self, tuned_tiles):
+        """The wrapper's own tiles, with and without the tuned rules, at a
+        layer shape the rules were tuned for (32 q / 2 KV heads of 256, fp8
+        KV, SEQ_ALONG_LANE pages of 128): three 4-token decodes over contexts
+        up to 4,100 tokens and a 300-token chunk. On TPU7x the two cases
+        differ in their q sub-chunks only (decode bq_c 2 and 4, prefill 64
+        and 128; checked on CPU by test_batched_rpa_tile_rules.py). The
+        4096-token decode KV block, the prefill bq clamp and 4 decode lanes
+        run in test_ragged_paged_attention_tuned_tiles_at_a_tp8_decode_shape."""
+        self._test_ragged_paged_attention(
+            [(4, 3000), (4, 700), (4, 4100), (300, 2000)],
+            (32, 2),
+            256,
+            128,
+            jnp.bfloat16,
+            jnp.float8_e4m3fn,
+            100,
+            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+            decode_query_size=4,
+            distribution=jnp.array([3, 3, 4], dtype=jnp.int32),
+            tuned_tiles=tuned_tiles,
+        )
+
+    @parameterized.parameters(
+        dict(
+            tuned_tiles=False,
+            decode_batch_size=None,
+            tiles=("-b8-q4-k3328", "-b2-q1024-k1024"),
+        ),
+        dict(
+            tuned_tiles=True,
+            decode_batch_size=None,
+            tiles=("-b8-q4-k4096", "-b2-q512-k1024"),
+        ),
+        dict(
+            tuned_tiles=True,
+            decode_batch_size=4,
+            tiles=("-b4-q4-k4096", "-b2-q512-k1024"),
+        ),
+    )
+    def test_ragged_paged_attention_tuned_tiles_at_a_tp8_decode_shape(
+        self, tuned_tiles, decode_batch_size, tiles
+    ):
+        """The wrapper's own tiles at one TP8 decode device's layer shape (4 q
+        / 1 KV head of 256, fp8 KV, SEQ_ALONG_LANE pages of 128, MTP K=3):
+        five 4-token decodes over contexts up to 5,000 tokens and a 300-token
+        chunk. On TPU7x (checked on CPU by test_batched_rpa_tile_rules.py) the
+        default case runs decode tiles (4, 4, 3328, 8) and prefill tiles
+        (1024, 64, 1024, 2); the tuned case reaches the 4096-token decode KV
+        block of the 85% VMEM cap and clamps the prefill bq to the 512-token
+        bucket, (4, 4, 4096, 8) and (512, 128, 1024, 2); with 4 decode lanes
+        the decode tiles are (4, 4, 4096, 4). On TPU7x each case also checks
+        that the traced kernels carry those tiles. Other chips get other tiles
+        from the same rules (their compute thresholds and VMEM differ), so
+        there it checks only the decode lane count; the numerical comparison
+        runs on every chip."""
+        # Read the chip only on a TPU: elsewhere the helper skips the test.
+        on_tpu7x = (
+            jtu.is_device_tpu_at_least(version=4)
+            and pltpu.get_tpu_info().chip_version == pltpu.ChipVersion.TPU_7X
+        )
+        self._test_ragged_paged_attention(
+            [(4, 5000), (4, 1000), (4, 4300), (4, 600), (4, 2000), (300, 3100)],
+            (4, 1),
+            256,
+            128,
+            jnp.bfloat16,
+            jnp.float8_e4m3fn,
+            150,
+            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+            decode_query_size=4,
+            distribution=jnp.array([5, 5, 6], dtype=jnp.int32),
+            tuned_tiles=tuned_tiles,
+            decode_batch_size=decode_batch_size,
+            expect_kernel_tiles=tiles if on_tpu7x else (),
+            # The wrapper's default is 8 decode lanes.
+            expect_decode_lanes=decode_batch_size or 8,
         )
 
     @parameterized.product(

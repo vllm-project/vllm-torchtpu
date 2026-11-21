@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Wrapper for RPA kernel to match expected interface."""
+"""Public dispatch wrapper and metadata builder for Batched Ragged Paged Attention.
+
+Validates tensor shapes, selects tuned block sizes, builds DMA schedule tables,
+and invokes the Pallas Batched RPA kernel.
+"""
 
 from typing import cast
 
@@ -231,12 +235,35 @@ def calculate_block_sizes(
     serve_cfgs: configs.ServingConfigs,
     vmem_limit_bytes: int,
     decode_query_size: int = 1,
+    decode_batch_size: int = 8,
+    tuned_tiles: bool = False,
 ) -> tuple[configs.BlockSizes, configs.BlockSizes]:
-    """Calculate optimal block size for decode and prefill."""
+    """Calculate optimal block size for decode and prefill.
+
+    ``decode_batch_size`` is the most sequences one decode step works on
+    concurrently; 8 is the experimentally chosen default.
+
+    ``tuned_tiles``, which callers opt in to, applies the tile rules tuned
+    with this kernel:
+    - decode VMEM counts the compute tiles once rather than per lane, plus the
+      K/V tiles and sub-chunk scores Mosaic spills when q is split, against a
+      cap of 85% of VMEM with an fp8 KV cache and 75% otherwise;
+    - an fp8 KV cache (without LSE) takes the fp8 compute threshold on a chip
+      with fp8 compute, and the fp8/bf16 throughput ratio is rounded rather
+      than floored;
+    - prefill bq is clamped to the token count aligned to the MXU width.
+    Off (the default), the tiles are the ones these rules replace, so other
+    models keep their tiles.
+    """
 
     tpu_info = pltpu.get_tpu_info()
     num_lanes = tpu_info.num_lanes
     mxu_column_size = tpu_info.mxu_column_size
+
+    if decode_batch_size < 1:
+        raise ValueError(
+            f"decode_batch_size must be at least 1, got {decode_batch_size}."
+        )
 
     # Calculate aligned model dimensions.
     aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
@@ -272,7 +299,12 @@ def calculate_block_sizes(
     else:
         aligned_kv_head_dim_val = utils.align_to(model_cfgs.head_dim, num_lanes)
 
-    def calculate_vmem_usage(batch_size: int, bq_sz: int, bkv_sz: int) -> int:
+    def calculate_vmem_usage(
+        batch_size: int,
+        bq_sz: int,
+        bkv_sz: int,
+        tuned_decode: bool = False,
+    ) -> int:
         """Given tile size, calculate VMEM usage of the kernel."""
 
         # Step 1: Calculate buffer sizes.
@@ -342,10 +374,24 @@ def calculate_block_sizes(
         )
 
         # Step 3: Sum up all memory usage.
-        total_bytes = buffer_bytes + compute_bytes
-
-        # Account for batch size.
-        total_bytes *= batch_size
+        if tuned_decode:
+            # Pipeline buffers are allocated per batch item, whereas active
+            # compute tiles are live for one batch item at a time.
+            total_bytes = buffer_bytes * batch_size + compute_bytes
+            bq_c_sz = pick_bq_c_sz(batch_size, bq_sz, bkv_sz)
+            if bq_c_sz < bq_sz:
+                # Every q sub-chunk's QK and PV matmuls read the K and V tiles
+                # of all lanes, stacked, so Mosaic keeps them in register
+                # allocator spill slots across the sub-chunk loop, with one
+                # sub-chunk's f32 scores and its two softmax weight tiles.
+                stacked_kv_bytes = 2 * loaded_bkv_bytes
+                sub_chunk_bytes = (
+                    bq_c_sz * model_cfgs.num_q_heads * bkv_sz * (4 + 2 * out_bytes)
+                )
+                total_bytes += batch_size * (stacked_kv_bytes + sub_chunk_bytes)
+        else:
+            # Account for batch size.
+            total_bytes = (buffer_bytes + compute_bytes) * batch_size
 
         # Online-softmax scratch (m, l, and the output accumulator)
         lm_array_size = (
@@ -372,14 +418,72 @@ def calculate_block_sizes(
 
         return batch_size * num_muls
 
+    # The tuned rules' fp8 branches need an fp8 KV cache: a packed fp4 cache
+    # (uint8) is also one byte per element, but takes the other branches.
+    is_fp8_kv = jnp.dtype(serve_cfgs.dtype_kv) in (
+        jnp.dtype(jnp.float8_e4m3fn),
+        jnp.dtype(jnp.float8_e5m2),
+    )
+
+    # Threshold value based on hardware generation and precision. A chip
+    # without fp8 compute (fp8_ops_per_second == 0) keeps the bf16 threshold
+    # for an fp8 KV cache: its ratio would round to 0 and zero the threshold.
+    is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1 or (
+        tuned_tiles
+        and is_fp8_kv
+        and not serve_cfgs.return_lse
+        and tpu_info.fp8_ops_per_second > 0
+    )
+
+    match tpu_info.generation:
+        case 8 if _is_sfs(tpu_info):
+            threshold = 800
+        case 7:
+            threshold = 1500
+        case _:
+            threshold = 1500
+
+    if is_8bit:
+        if tuned_tiles:
+            flops_ratio = round(
+                tpu_info.fp8_ops_per_second / tpu_info.bf16_ops_per_second
+            )
+        else:
+            flops_ratio = tpu_info.fp8_ops_per_second // tpu_info.bf16_ops_per_second
+        threshold *= flops_ratio
+
+    def pick_bq_c_sz(batch_size: int, bq_sz: int, bkv_sz: int) -> int:
+        """Picks the q sub-chunk size the compute threshold allows for a tile."""
+        num_bq_c = 1
+        last_valid_bq_c_sz = bq_c_sz = bq_sz
+        bq_c_rem = 0
+
+        while (
+            calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) > threshold
+            or bq_c_rem != 0
+        ) and num_bq_c < bq_sz:
+            if bq_c_rem == 0:
+                last_valid_bq_c_sz = bq_c_sz
+            num_bq_c += 1
+            bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
+        return last_valid_bq_c_sz
+
     def find_best_block_sizes(
         max_batch_size: int, fixed_bq_sz: int | None = None
     ) -> configs.BlockSizes:
         """Loop through different block sizes to find the most optimal one."""
 
-        # Even if we loose some potential performance, we want to avoid OOM at all
-        # costs. Therefore, we conservatively only use 80% of the VMEM budget.
-        capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
+        # Even if we lose some potential performance, we want to avoid OOM at all
+        # costs, so only part of the VMEM budget is used: 80% by default. With
+        # the tuned tiles, decode compute tiles are not replicated across
+        # batch_size, which allows a decode cap of 85% with an fp8 KV cache (so
+        # bkv_sz reaches 4096, 32 pages) and 75% otherwise. Without them, decode
+        # VMEM is counted and capped like prefill.
+        tuned_decode = tuned_tiles and fixed_bq_sz is not None
+        decode_vmem_frac = 0.85 if is_fp8_kv else 0.75
+        capped_vmem_limit_bytes = vmem_limit_bytes * (
+            decode_vmem_frac if tuned_decode else 0.8
+        )
 
         # To maximize MXU, we want bkv_sz to be at least MXU size.
         bkv_default = mxu_column_size
@@ -402,7 +506,7 @@ def calculate_block_sizes(
         # fits within VMEM limit.
         while (
             batch_size > 1
-            and calculate_vmem_usage(batch_size, bq_sz, bkv_sz)
+            and calculate_vmem_usage(batch_size, bq_sz, bkv_sz, tuned_decode)
             > capped_vmem_limit_bytes
         ):
             batch_size -= 1
@@ -416,7 +520,8 @@ def calculate_block_sizes(
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
         max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
         while (
-            calculate_vmem_usage(batch_size, bq_sz, bkv_sz) < capped_vmem_limit_bytes
+            calculate_vmem_usage(batch_size, bq_sz, bkv_sz, tuned_decode)
+            < capped_vmem_limit_bytes
             and bkv_sz <= max_seq_len
             and bkv_sz <= 4096  # TEMP PATCH
         ):
@@ -438,46 +543,23 @@ def calculate_block_sizes(
         if bkv_sz == 0:
             raise ValueError("Cannot find block sizes that fit within VMEM limit.")
 
+        if tuned_tiles and fixed_bq_sz is None:
+            # Clamp prefill/mixed bq_sz to the aligned total_q_tokens bucket so
+            # small token buckets do not allocate 1024-token Q/O VMEM buffers.
+            max_useful_bq_sz = max(
+                mxu_column_size,
+                utils.align_to(serve_cfgs.total_q_tokens, mxu_column_size),
+            )
+            bq_sz = min(bq_sz, max_useful_bq_sz)
+
         # Step 3: Given current tile size, calculate compute tile size.
-
-        # Threshold value based on hardware generation and precision.
-        tpu_info = pltpu.get_tpu_info()
-
-        is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1
-
-        match tpu_info.generation:
-            case 8 if _is_sfs(tpu_info):
-                threshold = 800
-            case 7:
-                threshold = 1500
-            case _:
-                threshold = 1500
-
-        if is_8bit:
-            flops_ratio = tpu_info.fp8_ops_per_second // tpu_info.bf16_ops_per_second
-            threshold *= flops_ratio
-        num_bq_c = 1
-        last_valid_bq_c_sz = bq_c_sz = bq_sz
-        bq_c_rem = 0
-
-        while (
-            calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) > threshold
-            or bq_c_rem != 0
-        ) and num_bq_c < bq_sz:
-            if bq_c_rem == 0:
-                last_valid_bq_c_sz = bq_c_sz
-            num_bq_c += 1
-            bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
-
         return configs.BlockSizes(
             bq_sz=bq_sz,
-            bq_c_sz=last_valid_bq_c_sz,
+            bq_c_sz=pick_bq_c_sz(batch_size, bq_sz, bkv_sz),
             bkv_sz=bkv_sz,
             batch_size=batch_size,
         )
 
-    # Fixed value based on experimental results.
-    decode_batch_size = 8
     prefill_batch_size = 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
@@ -508,6 +590,8 @@ def calculate_block_sizes(
         "update_kv_cache",
         "kv_layout",
         "decode_query_size",
+        "decode_batch_size",
+        "tuned_tiles",
         "cp_group_size",
         "attention_scope",
         "return_lse",
@@ -551,6 +635,8 @@ def ragged_paged_attention(
     update_kv_cache: bool | None = None,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     decode_query_size: int = 1,
+    decode_batch_size: int = 8,
+    tuned_tiles: bool = False,
     cp_group_size: int | None = None,
     cp_rank: jax.Array | None = None,
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
@@ -606,6 +692,10 @@ def ragged_paged_attention(
             is the same as skip_kv_update=True). None (default) uses skip_kv_update.
         decode_query_size: Number of query tokens in decode (1 by default, can be
             higher in case of speculative decoding).
+        decode_batch_size: Most sequences a decode step works on concurrently.
+        tuned_tiles: Choose the default block sizes with the tuned tile rules
+            (see `calculate_block_sizes`). Defaults to False: the heuristic's
+            tiles.
         cp_group_size: Size of the context parallelism (CP) group. KV cache is
             sharded across devices in this group. Defaults to None.
         cp_rank: Rank of the current device within the CP group, which determine
@@ -777,6 +867,8 @@ def ragged_paged_attention(
         serve_cfgs,
         vmem_limit_bytes,
         decode_query_size=decode_query_size,
+        decode_batch_size=decode_batch_size,
+        tuned_tiles=tuned_tiles,
     )
     # Pre-allocate LSE buffer.
     lse_hbm_init: jax.Array | None = None

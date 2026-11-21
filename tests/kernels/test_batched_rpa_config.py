@@ -13,11 +13,15 @@
 # limitations under the License.
 """Tests for batched RPA config and block size calculations across TPU generations."""
 
+import functools
 from unittest.mock import MagicMock, patch
 
+import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
+from tests.kernels.experimental.batched_rpa.rpa_test_utils import rpa_kernel_names
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
 
@@ -109,3 +113,127 @@ def test_prepared_inputs_rejects_dynamic_scales(scale):
                 prepared_inputs=prepared,
                 **{scale: jnp.ones((8, 1), jnp.float32)},
             )
+
+
+@pytest.mark.parametrize("decode_batch_size", [0, -1])
+def test_calculate_block_sizes_rejects_a_decode_batch_below_one(decode_batch_size):
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=32, num_kv_heads=8, head_dim=128, mask_value=-1e9
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=64,
+        page_size=16,
+        total_q_tokens=64,
+        num_page_indices=1024,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.bfloat16,
+        dtype_out=jnp.bfloat16,
+    )
+    with (
+        patch(
+            "jax.experimental.pallas.tpu.get_tpu_info",
+            return_value=_create_mock_tpu_info(7, chip_version="v7x"),
+        ),
+        pytest.raises(
+            ValueError, match=f"decode_batch_size .* got {decode_batch_size}"
+        ),
+    ):
+        wrapper.calculate_block_sizes(
+            model_cfg,
+            serve_cfg,
+            32 * 1024 * 1024,
+            decode_batch_size=decode_batch_size,
+        )
+
+
+@pytest.mark.parametrize("decode_batch_size", [8, 4, 1])
+def test_calculate_block_sizes_caps_the_decode_batch(decode_batch_size):
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=32, num_kv_heads=8, head_dim=128, mask_value=-1e9
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=64,
+        page_size=16,
+        total_q_tokens=64,
+        num_page_indices=1024,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.bfloat16,
+        dtype_out=jnp.bfloat16,
+    )
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x"),
+    ):
+        decode_blocks, prefill_blocks = wrapper.calculate_block_sizes(
+            model_cfg,
+            serve_cfg,
+            32 * 1024 * 1024,
+            decode_batch_size=decode_batch_size,
+        )
+        default_prefill = wrapper.calculate_block_sizes(
+            model_cfg, serve_cfg, 32 * 1024 * 1024
+        )[1]
+    assert decode_blocks.batch_size == decode_batch_size
+    assert prefill_blocks == default_prefill
+
+
+def _rpa_kernel_names(**kwargs):
+    """The names of the RPA kernels (not the schedule kernels) the jitted
+    wrapper traces on TPU7x for a 16-token bucket with one new sequence; a
+    name carries the kernel's batch and tiles."""
+    heads, kv_heads, head_dim, seqs, pages_per_seq, page, tokens = (
+        12,
+        2,
+        128,
+        8,
+        16,
+        128,
+        16,
+    )
+    rng = np.random.default_rng(0)
+    q = jnp.asarray(rng.standard_normal((tokens, heads, head_dim)), jnp.bfloat16)
+    k = jnp.asarray(rng.standard_normal((tokens, kv_heads, head_dim)), jnp.bfloat16)
+    cache = jnp.zeros(
+        wrapper.get_kv_cache_shape(
+            seqs * pages_per_seq + 4, page, kv_heads, head_dim, jnp.bfloat16
+        ),
+        jnp.bfloat16,
+    )
+    kv_lens = np.zeros(seqs, np.int32)
+    kv_lens[0] = 10 + tokens
+    cu_q_lens = np.zeros(seqs + 1, np.int32)
+    cu_q_lens[1:] = tokens
+    call = functools.partial(
+        wrapper.ragged_paged_attention, sm_scale=head_dim**-0.5, **kwargs
+    )
+    return rpa_kernel_names(
+        call,
+        q,
+        k,
+        k,
+        cache,
+        jnp.asarray(kv_lens),
+        jnp.zeros(seqs * pages_per_seq, jnp.int32),
+        jnp.asarray(cu_q_lens),
+        jnp.asarray([0, 1, 1], jnp.int32),
+    )
+
+
+@pytest.mark.parametrize("decode_batch_size", [8, 4])
+def test_the_jitted_wrapper_passes_the_decode_batch_size_to_its_decode_kernel(
+    monkeypatch, decode_batch_size
+):
+    """decode_batch_size is a static argument of ragged_paged_attention: the
+    DECODE kernel the wrapper traces works on that many sequences, and the
+    MIXED kernel keeps its batch of 2."""
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda *args, **kwargs: info)
+    names = _rpa_kernel_names(decode_batch_size=decode_batch_size)
+    decode = f"RPA{configs.RpaCase.DECODE.symbol}-"
+    mixed = f"RPA{configs.RpaCase.MIXED.symbol}-"
+    assert [n for n in names if n.startswith(decode)] == [
+        n for n in names if f"-b{decode_batch_size}-" in n
+    ], names
+    assert len([n for n in names if n.startswith(decode)]) == 1, names
+    assert len([n for n in names if n.startswith(mixed)]) == 1, names
+    assert all("-b2-" in n for n in names if n.startswith(mixed)), names
