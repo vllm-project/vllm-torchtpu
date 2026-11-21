@@ -140,9 +140,13 @@ def _run_hook(cfg) -> SimpleNamespace:
 # TP1 x DP8 engine with expert parallelism, and C3's TP1 x PCP8 prefill and
 # TP1 x DP8 decode legs. None of them was measured with the default.
 NIGHTLY_CONFIGS = {
-    "c1-interleaved": dict(kv_role=None, tp=1, dp=8, dcp=1, max_num_seqs=256),
-    "c3-prefill": dict(kv_role="kv_producer", tp=1, pcp=8, dcp=1, max_num_seqs=8),
-    "c3-decode": dict(kv_role="kv_consumer", tp=1, dp=8, dcp=1, max_num_seqs=32),
+    "c1-interleaved": dict(kv_role=None, tp=1, dp=8, dcp=1, ep=True, max_num_seqs=64),
+    "c3-prefill": dict(
+        kv_role="kv_producer", tp=1, pcp=8, dcp=1, ep=True, max_num_seqs=8
+    ),
+    "c3-decode": dict(
+        kv_role="kv_consumer", tp=1, dp=8, dcp=1, ep=True, max_num_seqs=32
+    ),
 }
 
 
