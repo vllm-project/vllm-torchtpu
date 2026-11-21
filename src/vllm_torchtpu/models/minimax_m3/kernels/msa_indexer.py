@@ -213,8 +213,12 @@ def _page_tokens(rows_per_page: int, dtype) -> int:
     return rows_per_page * (4 // jnp.dtype(dtype).itemsize)
 
 
-# Pages per dot in `_kernel_v3`: 2 x 16 pages, paired along the contraction.
-_PAGES_PER_CHUNK = 32
+# Pages per dot in `_kernel_v3`: 2 x 64 pages, paired along the contraction
+# (as `_v3_chunk` bounds it; prefill tiles stay at 16). Decode calls ran
+# faster in larger dots, standalone kernel (bench j-3fb5ff45): c64 b46
+# 82.0 -> 77.7 us, c48 b22 69.9 -> 68.2, c16 b5 18.9 -> 18.5, c4 b1 flat,
+# against 32-page dots.
+_PAGES_PER_CHUNK = 128
 # `_kernel_v3` issues the ahead group's descriptors during its first chunks:
 # all of a 128- or 256-page group's 32-page chunks (2 chunks of 128-page
 # groups: standalone decode calls, int4 folded 23 x 450 pages 101 -> 92 us,
