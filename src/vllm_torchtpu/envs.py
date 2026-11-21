@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_ATTN_MOE_OVERLAP: bool = False
+    TPU_DENSE_SEQUENCE_PARALLEL: bool = False
+    TPU_DENSE_SP_HIER_RS: str = "off"
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
@@ -453,6 +455,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # post-attention norm and router gate on the token shard, and fold the
     # attention partial sum into the MoE all-reduce. Default MoE path only.
     "TPU_ATTN_MOE_OVERLAP": env_bool("TPU_ATTN_MOE_OVERLAP", default=False),
+    # Gemma 4 dense at TP > 1: on buckets with >= 128 tokens per TP rank,
+    # reduce-scatter o_proj/down_proj outputs, run norms and FP8 quantization on
+    # the token shard, and all-gather FP8 rows for qkv_proj/gate_up_proj. Off by
+    # default until KV-shared, MoE, PLE, and unquantized Gemma 4 variants are
+    # covered so enabling it cannot break unsupported Gemma 4 checkpoints.
+    "TPU_DENSE_SEQUENCE_PARALLEL": env_bool(
+        "TPU_DENSE_SEQUENCE_PARALLEL", default=False
+    ),
+    # With TPU_DENSE_SEQUENCE_PARALLEL: fuse each dense SP reduce-scatter and its
+    # RMSNorm/residual/FP8 epilogue in VMEM on dual-core tpu7x TP groups:
+    # row-streaming at TP=4 or TP=8 on >= 128 * TP tokens ("bf16" or lossy "fp8"
+    # inter-chip hops, with XLA all-gathers) and single-shot VMEM reduce-scatter
+    # + gather at TP=8 on 128 <= tokens < 1024 (always bf16 inter-chip hops).
+    "TPU_DENSE_SP_HIER_RS": env_with_choices(
+        "TPU_DENSE_SP_HIER_RS", "off", ["off", "bf16", "fp8"]
+    ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many

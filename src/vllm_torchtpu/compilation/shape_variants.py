@@ -321,6 +321,16 @@ def aot_cache_tag() -> str | None:
     return f"trace{_session.traces}" if _session is not None else None
 
 
+def can_branch_on_token_count() -> bool:
+    """Whether a forward pass may branch on the dynamic token count.
+
+    True eagerly or inside backbone `warmup()`, where each side of a token-count
+    branch gets its own trace; False for auxiliary compiles outside warmup (such
+    as an MTP drafter), which must trace a single path.
+    """
+    return not torch.compiler.is_compiling() or aot_cache_tag() is not None
+
+
 def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
     """Give the model's compiled modules a fresh, untraced torch.compile wrapper.
 

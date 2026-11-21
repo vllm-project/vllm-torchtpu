@@ -1041,6 +1041,7 @@ class TpuPlatform(Platform):
 
         if envs.TPU_MOE_SEQUENCE_PARALLEL:
             _configure_sequence_parallel_moe(vllm_config)
+        _validate_dense_sequence_parallel(vllm_config)
         # After the sequence-parallel filter, which can drop the largest size.
         _validate_token_budget_fits_compile_sizes(vllm_config)
 
@@ -1657,6 +1658,59 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
             tp,
         )
     cc.compile_sizes = cast(list[int | str], kept)
+
+
+def _validate_dense_sequence_parallel(vllm_config: VllmConfig) -> None:
+    """Rejects server configs incompatible with `TPU_DENSE_SEQUENCE_PARALLEL=1`."""
+    if envs.TPU_DENSE_SP_HIER_RS != "off" and not envs.TPU_DENSE_SEQUENCE_PARALLEL:
+        raise ValueError("TPU_DENSE_SP_HIER_RS requires TPU_DENSE_SEQUENCE_PARALLEL=1")
+    if not envs.TPU_DENSE_SEQUENCE_PARALLEL:
+        return
+    model_type = vllm_config.model_config.hf_text_config.model_type
+    if model_type != "gemma4_text":
+        logger.warning_once(
+            "TPU_DENSE_SEQUENCE_PARALLEL=1 has no effect on model_type=%s "
+            "(only gemma4_text is supported).",
+            model_type,
+        )
+        return
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.tensor_parallel_size <= 1:
+        raise ValueError(
+            "TPU_DENSE_SEQUENCE_PARALLEL=1 requires tensor_parallel_size > 1, "
+            f"got {parallel_config.tensor_parallel_size}."
+        )
+    if parallel_config.pipeline_parallel_size > 1:
+        raise NotImplementedError(
+            "TPU_DENSE_SEQUENCE_PARALLEL=1 does not support pipeline "
+            f"parallelism (pipeline_parallel_size="
+            f"{parallel_config.pipeline_parallel_size})."
+        )
+    if (
+        parallel_config.prefill_context_parallel_size > 1
+        or parallel_config.decode_context_parallel_size > 1
+    ):
+        raise NotImplementedError(
+            "TPU_DENSE_SEQUENCE_PARALLEL=1 does not support context "
+            f"parallelism (prefill_context_parallel_size="
+            f"{parallel_config.prefill_context_parallel_size}, "
+            f"decode_context_parallel_size="
+            f"{parallel_config.decode_context_parallel_size})."
+        )
+    if vllm_config.lora_config is not None:
+        raise NotImplementedError(
+            "TPU_DENSE_SEQUENCE_PARALLEL=1 does not support LoRA adapters."
+        )
+    if (
+        vllm_config.speculative_config is not None
+        and vllm_config.speculative_config.method != "ngram"
+    ):
+        raise NotImplementedError(
+            "TPU_DENSE_SEQUENCE_PARALLEL=1 does not support speculative "
+            f"method {vllm_config.speculative_config.method!r} (only 'ngram', "
+            "which uses no draft model or auxiliary hidden states, is "
+            "compatible)."
+        )
 
 
 def _validate_token_budget_fits_compile_sizes(vllm_config: VllmConfig) -> None:
