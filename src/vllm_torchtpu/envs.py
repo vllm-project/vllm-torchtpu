@@ -859,10 +859,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES": env_bool(
         "TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES", default=True
     ),
-    # With the Pallas TP all-reduce armed: all-gather small tensors (the
-    # DSpark draft's context fc columns, the synthetic sampler's tokens) with
-    # one Pallas call (kernels/collectives/tp_all_reduce.py `all_gather_small`)
-    # instead of XLA's TensorCore all-gather.
+    # With the Pallas TP all-reduce armed: all-gather small tensors (an SP
+    # step's e4m3 row scales, the DSpark draft's context fc columns, the
+    # synthetic sampler's tokens) with one Pallas call
+    # (kernels/collectives/tp_all_reduce.py `all_gather_small`) instead of
+    # XLA's TensorCore all-gather.
     "TPU_TP_PALLAS_SMALL_ALL_GATHER": env_bool(
         "TPU_TP_PALLAS_SMALL_ALL_GATHER", default=False
     ),

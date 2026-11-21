@@ -23,6 +23,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
@@ -43,6 +44,7 @@ from vllm.model_executor.models.utils import (
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.distributed import pallas_all_reduce
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.quantization.fp8_lm_head import Fp8LMHeadMethod
 from vllm_torchtpu.logger import init_logger
@@ -405,10 +407,10 @@ def _quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 def _gather_rows_e4m3(
     q: torch.Tensor, scale: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return (
-        tensor_model_parallel_all_gather(q, 0),
-        tensor_model_parallel_all_gather(scale, 0),
-    )
+    scales = pallas_all_reduce.all_gather_small(get_tp_group().ranks, scale)
+    if scales is None:
+        scales = tensor_model_parallel_all_gather(scale, 0)
+    return tensor_model_parallel_all_gather(q, 0), scales
 
 
 @support_torch_compile(
