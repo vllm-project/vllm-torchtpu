@@ -637,8 +637,10 @@ def _sorted_union_owners(keys, queries, per_query, blocks):
     [rows, union, per_query] compare (36 us per call at 4 rows and 72 us at
     8 rows on tpu7x for 2 queries of 2048 candidates). The owner bit of each
     query travels through both sorts as a payload: after the first sort equal
-    blocks are adjacent, a run's bits are OR-ed with a forward and a reverse
-    running maximum per bit, and the second sort compacts one entry per run.
+    blocks are adjacent, the first entry of each run ORs the bits of the next
+    ``queries - 1`` entries of the same block, and the second sort compacts
+    one entry per run. Assumes each query lists a block at most once (the
+    candidates are the indices of a top-k).
 
     Args:
         keys: [rows, queries * per_query] int32 logical block ids, query-major,
@@ -659,15 +661,14 @@ def _sorted_union_owners(keys, queries, per_query, blocks):
     bits = jnp.broadcast_to(bits, (rows, count))
     keys, bits = lax.sort((keys, bits), dimension=1, num_keys=1)
     start = jnp.diff(keys, axis=-1, prepend=-1) != 0
-    run = jnp.cumsum(start.astype(jnp.int32), axis=-1)
-    owners = jnp.zeros_like(bits)
-    for query in range(queries):
-        has = (bits >> query) & 1 == 1
-        seen = lax.cummax(jnp.where(has, run, 0), axis=1)
-        later = lax.cummin(
-            jnp.where(has, run, jnp.int32(count + 1)), axis=1, reverse=True
-        )
-        owners = owners | (((seen == run) | (later == run)).astype(jnp.int32) << query)
+    # Each query lists a block at most once, so a run of equal blocks has at
+    # most `queries` entries, and the run's first entry (the one kept) sees
+    # the whole run within the next `queries` positions.
+    owners = bits
+    for shift in range(1, queries):
+        same = jnp.pad(keys[:, shift:] == keys[:, :-shift], ((0, 0), (0, shift)))
+        later = jnp.pad(bits[:, shift:], ((0, 0), (0, shift)))
+        owners = owners | jnp.where(same, later, 0)
     keys = jnp.where(start, keys, blocks)
     owners = jnp.where(keys < blocks, owners, 0)
     keys, owners = lax.sort((keys, owners), dimension=1, num_keys=1)
