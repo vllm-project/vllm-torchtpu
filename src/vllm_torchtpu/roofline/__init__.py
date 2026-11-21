@@ -44,7 +44,6 @@ from .emit import (
     LaunchPayload,
     emit_ceiling_rows,
     emit_launch_args,
-    format_parallelism,
     pool_cli_args,
 )
 from .geometry import (
@@ -155,7 +154,6 @@ __all__ = [
     "dtypes_from_hf_config",
     "emit_ceiling_rows",
     "emit_launch_args",
-    "format_parallelism",
     "from_hf_config",
     "hbm_footprint_per_core_bytes",
     "load_activation_hull",

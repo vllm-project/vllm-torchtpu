@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CLI entrypoint for solve, emit, ceiling, plan, and explain subcommands."""
+"""CLI entrypoint for L1 lower bounds, heuristic shortlisting, and explain."""
 
 from __future__ import annotations
 
@@ -136,26 +136,75 @@ def _add_scenario_args(p: argparse.ArgumentParser) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Build argument parser for solve, emit, ceiling, plan, and explain."""
-    parser = argparse.ArgumentParser(prog="python -m vllm_torchtpu.roofline")
+    """Build argument parser for L1 bounds, heuristic shortlisting, and explain."""
+    parser = argparse.ArgumentParser(
+        prog="python -m vllm_torchtpu.roofline",
+        description=(
+            "Compute L1 physical lower bounds and uncalibrated serial-phase "
+            "heuristic shortlists across TPU parallel configurations."
+        ),
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_solve = sub.add_parser("solve")
+    p_solve = sub.add_parser(
+        "solve",
+        help=(
+            "Prune with L1 HBM bounds and shortlist uncalibrated candidates "
+            "against SLOs."
+        ),
+        description=(
+            "Prune parallel layouts via L1 HBM bounds and shortlist "
+            "uncalibrated serial-phase candidates against traffic SLOs."
+        ),
+    )
     _add_scenario_args(p_solve)
 
-    p_emit = sub.add_parser("emit")
+    p_emit = sub.add_parser(
+        "emit",
+        help="Emit vllm serve flags for the top-ranked uncalibrated L1 candidate.",
+        description=(
+            "Emit vllm serve launch flags and commands for the top-ranked "
+            "uncalibrated L1 shortlisted candidate."
+        ),
+    )
     _add_scenario_args(p_emit)
 
-    p_ceil = sub.add_parser("ceiling")
+    p_ceil = sub.add_parser(
+        "ceiling",
+        help="Export non-ruled-out uncalibrated L1 candidate ceiling rows from solve.",
+        description=(
+            "Export uncalibrated serial-phase L1 candidate rows along the "
+            "estimated throughput-interactivity envelope."
+        ),
+    )
     _add_scenario_args(p_ceil)
 
-    p_plan = sub.add_parser("plan")
+    p_plan = sub.add_parser(
+        "plan",
+        help=(
+            "Compute hard L1 physical step floors and uncalibrated serial "
+            "decode estimates."
+        ),
+        description=(
+            "Compute per-concurrency hard L1 physical step floors and "
+            "uncalibrated serial-phase decode estimates for one parallel layout."
+        ),
+    )
     _add_common_args(p_plan)
     p_plan.add_argument("--concurrency", default="1,4,16,64")
     p_plan.add_argument("--spec-window", type=int, default=0)
     p_plan.add_argument("--accept-len", type=float, default=None)
 
-    p_exp = sub.add_parser("explain")
+    p_exp = sub.add_parser(
+        "explain",
+        help=(
+            "Break down per-module L1 physical HBM, FLOP, and ICI volumes for one step."
+        ),
+        description=(
+            "Report per-module physical HBM, FLOP, and ICI collective "
+            "volumes for one decode or speculative cycle step."
+        ),
+    )
     _add_common_args(p_exp)
     p_exp.add_argument("--batch", type=int, default=1)
     p_exp.add_argument("--rows-per-seq", type=int, default=1)
@@ -213,12 +262,17 @@ def _resolve_scenario(
     )
 
 
+def _write_warnings(warnings: Sequence[str]) -> None:
+    """Write formatted warning lines to stderr."""
+    for warning in warnings:
+        sys.stderr.write(f"WARNING: {warning}\n")
+
+
 def _dispatch_ceiling(args: argparse.Namespace, splan: ServingPlan) -> int:
-    """Write Pareto ceiling rows as JSON array or JSON lines."""
+    """Write uncalibrated L1 candidate ceiling rows as JSON array or JSON lines."""
     rows_ceil = emit_ceiling_rows(splan)
     if not rows_ceil:
-        for w in splan.warnings:
-            sys.stderr.write(f"WARNING: {w}\n")
+        _write_warnings(splan.warnings)
         if args.json:
             sys.stdout.write("[]\n")
         return 1
@@ -233,17 +287,17 @@ def _dispatch_ceiling(args: argparse.Namespace, splan: ServingPlan) -> int:
 def _dispatch_emit(
     args: argparse.Namespace, splan: ServingPlan, dt_auto: Dtypes
 ) -> int:
-    """Write emitted vLLM serve launch commands or JSON payload."""
+    """Write emitted vLLM serve launch commands for the L1 shortlisted candidate."""
     emitted = emit_launch_args(splan, dtypes=dt_auto, model=args.model)
     if not emitted["commands"]:
-        for w in emitted["warnings"]:
-            sys.stderr.write(f"WARNING: {w}\n")
+        _write_warnings(emitted["warnings"])
         if args.json:
             sys.stdout.write(json.dumps(emitted) + "\n")
         return 1
     if args.json:
         sys.stdout.write(json.dumps(emitted) + "\n")
         return 0
+    _write_warnings(emitted["warnings"])
     for cmd_line in emitted["commands"]:
         sys.stdout.write(cmd_line + "\n")
     return 0
@@ -254,13 +308,14 @@ def _dispatch_solve(
     parser: argparse.ArgumentParser,
     cfg: dict[str, object],
 ) -> int:
-    """Execute the solve, emit, or ceiling subcommands."""
+    """Execute L1 heuristic pruning and shortlisting for solve, emit, or ceiling."""
     scen = _resolve_scenario(args, parser)
     if args.max_chips is None and args.max_instances is None:
         parser.error("Either --max-chips or --max-instances is required.")
+    dt_auto = dtypes_from_hf_config(cfg)
     splan = solve_serving_plan(
         from_hf_config(cfg),
-        dtypes_from_hf_config(cfg),
+        dt_auto,
         CHIPS[args.chip],
         scen,
         SolveOptions(
@@ -273,12 +328,12 @@ def _dispatch_solve(
     if args.cmd == "ceiling":
         return _dispatch_ceiling(args, splan)
     if args.cmd == "emit":
-        return _dispatch_emit(args, splan, dtypes_from_hf_config(cfg))
+        return _dispatch_emit(args, splan, dt_auto)
     if args.json:
         sys.stdout.write(json.dumps(asdict(splan)) + "\n")
         return 0
-    for w in splan.warnings:
-        sys.stdout.write(f"WARNING: {w}\n")
+    for warning in splan.warnings:
+        sys.stdout.write(f"WARNING: {warning}\n")
     sys.stdout.write(
         f"{'mode':<7}  {'c':>5}  {'chips':>5}  {'pools':<24}  "
         f"{'p90_int_tok_s':>13}  {'tok_tput_chip':>13}  {'p90_ttft_ms':>11}  "
@@ -348,7 +403,7 @@ def _dispatch_plan(
     parser: argparse.ArgumentParser,
     cfg: dict[str, object],
 ) -> int:
-    """Execute the plan subcommand across target concurrencies."""
+    """Execute plan for hard L1 floors and uncalibrated serial decode estimates."""
     if args.spec_window > 0 and args.accept_len is None:
         parser.error("--accept-len is required when --spec-window > 0")
     chip = CHIPS[args.chip]
@@ -393,7 +448,7 @@ def _dispatch_explain(
     args: argparse.Namespace,
     cfg: dict[str, object],
 ) -> int:
-    """Execute the explain subcommand for per-module step breakdowns."""
+    """Execute explain for per-module L1 physical step breakdowns."""
     geom = from_hf_config(cfg)
     chip = CHIPS[args.chip]
     if args.ici_bw_gbps is not None:
