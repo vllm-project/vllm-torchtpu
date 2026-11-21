@@ -589,6 +589,24 @@ def compressed_pairs(
     return pair, write, mask, values
 
 
+_Q38_RUN_WRITE_LOGGED: set = set()
+
+
+def _log_run_write(tokens: int, requests: int) -> None:
+    """q38 PSTEP-GLUE engagement line of the run-based compressed-key writer: one INFO line per distinct traced shape
+    and process (log only: Python at trace time, nothing enters the traced program; a compile-cache hit prints nothing)."""
+    key = (tokens, requests)
+    if key in _Q38_RUN_WRITE_LOGGED:
+        return
+    _Q38_RUN_WRITE_LOGGED.add(key)
+    from vllm_torchtpu.logger import init_logger
+
+    init_logger(__name__).info(
+        "q38 PGLUE compressed-key run writer ENGAGED: %d key rows, %d request slots "
+        "(VLLM_TPU_QSA_COMPRESSED_RUN_WRITE)", tokens, requests,
+    )
+
+
 def write_compressed(
     pool,
     keys,
@@ -641,6 +659,7 @@ def write_compressed(
     ):
         from vllm_torchtpu.kernels.qwen4_exp.compressed_write import write_runs
 
+        _log_run_write(len(keys), len(context))
         return write_runs(
             view, pair, write, mask, values, len(context), ratio
         ).reshape(pool.shape)
