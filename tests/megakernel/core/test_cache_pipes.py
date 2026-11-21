@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Model-free unit tests for `cache_common`, `cache_hlo`, and `cache_flat`."""
+"""Model-free unit tests for `cache.py` (`CachePipe`, `PallasWriter`, flat step)."""
 
 from __future__ import annotations
 
@@ -19,20 +19,23 @@ import dataclasses
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax._src import dispatch
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from tests.megakernel.core.megakernel_fakes import TINY_TILES
+from tests.megakernel.core.megakernel_fakes import TINY_TILES, make_fake_model_spec
 from tests.megakernel.core.megakernel_synth import synth_hybrid_spec
 from vllm_torchtpu.megakernel.core import (
     _builtins,
+    cache,
     cache_common,
-    cache_flat,
-    cache_hlo,
+    cache_experimental,
+    decls,
     fused_io_hook,
+    model_def,
     planner,
     pool,
 )
@@ -77,7 +80,6 @@ class _Case:
 
     def __init__(self, spec: Any, ex: ExecSpec, seed: int = 0):
         self.spec, self.ex = spec, ex
-        self.lay = spec.cache_backend.layout
         self.mesh = Mesh(np.array(jax.devices("cpu")[: ex.R]), ("tp",))
         self.rep = NamedSharding(self.mesh, P())
         self.tp = NamedSharding(self.mesh, P("tp"))
@@ -86,9 +88,9 @@ class _Case:
         self.pos_mk, self.hid_mk, self.w_mk, _ = pack_spec_inputs(
             self.pos, self.hid, self.w_log, self.st_log, spec, ex, mesh=self.mesh
         )
-        self.pt, self.ckpt, self.roff, _ = pool.allocate_test_layout(self.lay, ex)
-        self.raw = pool.states_to_pool(
-            self.lay, ex, self.st_log, self.pt, self.ckpt, read_offsets=self.roff
+        self.pt, self.ckpt, self.roff, _ = cache.default_pool_layout(spec, ex)
+        self.raw = cache.states_to_pool(
+            spec, ex, self.st_log, self.pt, self.ckpt, read_offsets=self.roff
         )
         self.w_flat = [self.w_mk[k] for k in planner.plan(spec, ex).w_names]
 
@@ -124,29 +126,18 @@ class _Case:
     ],
     ids=["decode_bf16", "decode_f32_conv", "verify_split", "verify_gpr"],
 )
-def test_flat_pooled_step_matches_reference(T: int, B: int, gpr: Any, conv_f32: bool):
-    """`make_flat_pooled_step` matches the oracle (hidden + pools)."""
+def test_pallas_writer_and_flat_pooled_step_match_reference(
+    T: int, B: int, gpr: Any, conv_f32: bool
+):
+    """`PallasWriter` and `make_flat_pooled_step` match the oracle (hidden + pools)."""
     spec = synth_hybrid_spec(L=2, att_every=2, R=R)
     spec = _f32_conv(spec) if conv_f32 else spec
     ex = _make_paged_ex(B=B, T=T, gpr=gpr)
     c = _Case(spec, ex, seed=20 + T)
 
-    built = cache_common.build_pooled(
-        c.mesh,
-        spec,
-        ex,
-        donate_pools=False,
-        fused_pool_io=None,
-        max_b_low=0,
-        min_b_hi=0,
-    )
-    assert built.use_gpr is bool(gpr)
-    flat_fn, _, _, donated = cache_flat.make_flat_pooled_step(
-        c.mesh, spec, ex, donate_pools=False
-    )
-    assert donated == ()
-    flat_outs = flat_fn(*c.flat_args(c.pools(), *c.meta()))
-    out_hid_p, out_raw_p = flat_outs[0], flat_outs[1:]
+    pooled_step = cache.PallasWriter().make_step(c.mesh, spec, ex)
+    assert pooled_step.info["use_gpr"] is bool(gpr)
+    out_hid_p, out_raw_p = pooled_step(c.pos_mk, c.hid_mk, c.w_mk, c.pools(), *c.meta())
 
     ref_hid, ref_st = spec_reference_step(
         spec,
@@ -163,14 +154,14 @@ def test_flat_pooled_step_matches_reference(T: int, B: int, gpr: Any, conv_f32: 
     np.testing.assert_allclose(
         out_hid_r[0].astype(F32), ref_hid.astype(F32), rtol=3e-2, atol=3e-2
     )
-    st_p = pool.pool_to_states(c.lay, ex, out_raw_p, c.pt, c.ckpt)
+    st_p = cache.pool_to_states(spec, ex, out_raw_p, c.pt, c.ckpt)
     tol = dict(rtol=3e-2, atol=3e-2)
     np.testing.assert_allclose(
         st_p["rec"].astype(F32),
         ref_st["rec_ckpt" if T > 1 else "rec"].astype(F32),
         **tol,
     )
-    taps, qkv = c.lay.conv_taps, st_p["conv"].shape[-1]
+    taps, qkv = spec.cache_backend.layout.conv_taps, st_p["conv"].shape[-1]
     if T == 1:
         ref_conv = (
             ref_st["conv"][:, :, : taps * B].reshape(R, -1, taps, B, qkv).swapaxes(2, 3)
@@ -187,6 +178,18 @@ def test_flat_pooled_step_matches_reference(T: int, B: int, gpr: Any, conv_f32: 
             want = np.asarray(ref_st[k][:, :, s, p_b]).astype(np.float32)
             np.testing.assert_allclose(got, want, rtol=0.15, atol=0.15)
 
+    # The flat step shares the per-rank body: bit-identical hidden and pools.
+    flat_fn, _, _, donated = cache.make_flat_pooled_step(
+        c.mesh, spec, ex, donate_pools=False
+    )
+    assert donated == ()
+    flat_outs = flat_fn(*c.flat_args(c.pools(), *c.meta()))
+    np.testing.assert_array_equal(flat_outs[0], out_hid_p)
+    for got, want in zip(flat_outs[1:], out_raw_p, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(got).view(np.uint8), np.asarray(want).view(np.uint8)
+        )
+
 
 def _compiled(fn: Any, *args: Any) -> str:
     return fn.lower(*args).compile().as_text()
@@ -198,16 +201,20 @@ def test_check_pooled_step_hlo_on_compiled_steps():
     c = _Case(spec, _make_paged_ex(B=4, T=1), seed=9)
     lay = spec.cache_backend.layout
     for donate in (True, False):
-        flat_fn, *_ = cache_flat.make_flat_pooled_step(
+        pooled = cache.make_pooled_step(c.mesh, spec, c.ex, donate_pools=donate)
+        hlo_p = _compiled(pooled, c.pos_mk, c.hid_mk, c.w_mk, c.pools(), *c.meta())
+        flat_fn, *_ = cache.make_flat_pooled_step(
             c.mesh, spec, c.ex, donate_pools=donate
         )
-        hlo = _compiled(flat_fn, *c.flat_args(c.pools(), *c.meta()))
-        ok, msg = cache_hlo.check_pooled_step_hlo(hlo, layout=lay)
-        assert ok is donate, msg
-        assert donate or "full-pool" in msg
-        assert ("input_output_alias" in hlo) is donate
+        hlo_f = _compiled(flat_fn, *c.flat_args(c.pools(), *c.meta()))
+        for hlo in (hlo_p, hlo_f):
+            ok, msg = cache.check_pooled_step_hlo(hlo, layout=lay)
+            # Without donation XLA copies each pool before the in-place scatter.
+            assert ok is donate, msg
+            assert donate or "full-pool" in msg
+            assert ("input_output_alias" in hlo) is donate
     lowered = flat_fn.lower(*c.flat_args(c.pools(), *c.meta()))
-    ok_mlir, msg_mlir = cache_hlo.check_pooled_step_hlo(lowered.as_text(), layout=lay)
+    ok_mlir, msg_mlir = cache.check_pooled_step_hlo(lowered.as_text(), layout=lay)
     assert not ok_mlir and "compile().as_text()" in msg_mlir
 
 
@@ -215,14 +222,14 @@ def test_flat_pooled_step_keeps_6d_pools_and_donation():
     """6D `(R, num_pages, ...)` pools come back 6D and stay donated."""
     spec = synth_hybrid_spec(L=2, att_every=2, R=R)
     c = _Case(spec, _make_paged_ex(B=4, T=1), seed=3)
-    flat_fn, _, _, donated = cache_flat.make_flat_pooled_step(c.mesh, spec, c.ex)
+    flat_fn, _, _, donated = cache.make_flat_pooled_step(c.mesh, spec, c.ex)
     assert donated
     outs_5d = flat_fn(*c.flat_args(c.pools(), *c.meta()))
     pools_6d = c.pools(six_d=True)
     shapes_6d = [p.shape for p in pools_6d]
     hlo = _compiled(flat_fn, *c.flat_args(pools_6d, *c.meta()))
     assert "input_output_alias" in hlo
-    ok, msg = cache_hlo.check_pooled_step_hlo(hlo, layout=spec.cache_backend.layout)
+    ok, msg = cache.check_pooled_step_hlo(hlo, layout=spec.cache_backend.layout)
     assert ok, msg
     outs_6d = flat_fn(*c.flat_args(pools_6d, *c.meta()))
     assert [o.shape for o in outs_6d[1:]] == shapes_6d
@@ -239,17 +246,15 @@ def test_flat_pooled_step_admits_only_replicated_metadata():
     """The flat step rejects rank-folded / narrow metadata instead of misreading it."""
     spec = synth_hybrid_spec(L=2, att_every=2, R=R)
     c = _Case(spec, _make_paged_ex(B=4, T=1), seed=4)
-    flat_fn, *_ = cache_flat.make_flat_pooled_step(
-        c.mesh, spec, c.ex, donate_pools=False
-    )
+    flat_fn, *_ = cache.make_flat_pooled_step(c.mesh, spec, c.ex, donate_pools=False)
     pt_ok = np.asarray(c.pt)
     flat_fn(*c.flat_args(c.pools(), *c.meta(pt=pt_ok[None])))  # (1, NS, K)
     bad_meta = {
-        "page_table": dict(pt=np.concatenate([pt_ok] * R)),
-        "page_table ": dict(pt=np.stack([pt_ok] * R)),
-        "page_table  ": dict(pt=pt_ok[:, :1]),
-        "ckpt_indices": dict(ckpt=np.stack([np.asarray(c.ckpt)] * R)),
-        "read_offsets": dict(roff=np.stack([np.asarray(c.roff)] * R)),
+        "page_table": dict(pt=np.concatenate([pt_ok] * R)),  # (R * NS, K)
+        "page_table ": dict(pt=np.stack([pt_ok] * R)),  # (R, NS, K)
+        "page_table  ": dict(pt=pt_ok[:, :1]),  # K < max_pages_per_seq
+        "ckpt_indices": dict(ckpt=np.stack([np.asarray(c.ckpt)] * R)),  # (R, ...)
+        "read_offsets": dict(roff=np.stack([np.asarray(c.roff)] * R)),  # (R, ...)
     }
     for name, kw in bad_meta.items():
         with pytest.raises(ValueError, match=name.strip()):
@@ -276,45 +281,89 @@ def test_flat_pooled_step_uses_cache_exec_act_mode(T: int, gpr: Any):
     spec = _recording_backend(synth_hybrid_spec(L=2, att_every=2, R=R), seen)
     ex = _make_paged_ex(B=4, T=T, gpr=gpr, act_mode="all")
     c = _Case(spec, ex, seed=5)
-    flat_fn, *_ = cache_flat.make_flat_pooled_step(c.mesh, spec, ex, donate_pools=False)
+    flat_fn, *_ = cache.make_flat_pooled_step(c.mesh, spec, ex, donate_pools=False)
     flat_fn.lower(*c.flat_args(c.pools(), *c.meta()))
     assert seen == ["all"]
     ex_ref = _make_paged_ex(B=4, T=T, gpr=gpr, act_mode="ref")
     with pytest.raises(MegakernelConfigError, match="act_mode='ref'"):
-        cache_flat.make_flat_pooled_step(c.mesh, spec, ex_ref)
+        cache.make_flat_pooled_step(c.mesh, spec, ex_ref)
 
 
-def test_flat_pooled_step_checks_ckpt_bounds_in_kernel_io_paths():
-    """With `check_ckpt_bounds`, the GPR flat step validates its metadata."""
-    T = 4
+@pytest.mark.parametrize(
+    ("T", "gpr", "fused", "bad", "msg"),
+    [
+        (4, "eligible", False, "roff", "read_offset"),
+    ],
+    ids=["gpr_read_offsets"],
+)
+def test_flat_pooled_step_checks_ckpt_bounds_in_kernel_io_paths(
+    T: int, gpr: Any, fused: bool, bad: str, msg: str
+):
+    """With `check_ckpt_bounds`, the fused / GPR flat step validates its metadata
+    (GPR skips the gather kernel, fused I/O skips gather and scatter)."""
+    # Fused GDN I/O needs `2 * kh <= vh` per rank.
     spec = synth_hybrid_spec(L=2, att_every=2, R=R, VH=4)
-    ex = _make_paged_ex(B=4, T=T, gpr="eligible", check_ckpt_bounds=True)
+    ex = _make_paged_ex(B=4, T=T, gpr=gpr, check_ckpt_bounds=True)
     c = _Case(spec, ex, seed=6)
-    flat_fn, *_ = cache_flat.make_flat_pooled_step(
-        c.mesh, spec, ex, fused_pool_io=False, donate_pools=True
+    flat_fn, *_ = cache.make_flat_pooled_step(
+        c.mesh, spec, ex, fused_pool_io=fused, donate_pools=True
     )
     jax.block_until_ready(flat_fn(*c.flat_args(c.pools(), *c.meta())))
-    meta = c.meta(roff=np.full_like(np.asarray(c.roff), T))
-    with pytest.raises((ValueError, jax.errors.JaxRuntimeError), match="read_offset"):
+    if bad == "roff":
+        meta = c.meta(roff=np.full_like(np.asarray(c.roff), T))  # == K
+    else:
+        ckpt_bad = np.asarray(c.ckpt).copy()
+        ckpt_bad[..., -1] = 10_000  # checkpoint write slot past the pool
+        meta = c.meta(ckpt=ckpt_bad)
+    with pytest.raises((ValueError, jax.errors.JaxRuntimeError), match=msg):
         jax.block_until_ready(flat_fn(*c.flat_args(c.pools(), *meta)))
+    # The failed callback's error stays in JAX's effect tokens, and every later
+    # computation with effects would re-raise it: reset them.
     dispatch.runtime_tokens.clear()
     jax.block_until_ready(flat_fn(*c.flat_args(c.pools(), *c.meta())))
-    narrow = c.meta(ckpt=np.asarray(c.ckpt)[..., :1])
-    with pytest.raises(ValueError, match="ckpt_indices last dim"):
-        flat_fn(*c.flat_args(c.pools(), *narrow))
+    if T > 1:  # trace-time shape admission: ckpt_indices narrower than T
+        narrow = c.meta(ckpt=np.asarray(c.ckpt)[..., :1])
+        with pytest.raises(ValueError, match="ckpt_indices last dim"):
+            flat_fn(*c.flat_args(c.pools(), *narrow))
+
+
+def test_pooled_step_checks_rank_folded_metadata_per_rank():
+    """`check_ckpt_bounds` slices `(R * NS, K)` metadata per rank like the step."""
+    spec = synth_hybrid_spec(L=2, att_every=2, R=R)
+    ex = _make_paged_ex(B=4, T=1, check_ckpt_bounds=True)
+    c = _Case(spec, ex, seed=7)
+    step = cache.make_pooled_step(c.mesh, spec, ex)
+    ckpt_2d, roff_1d = np.asarray(c.ckpt)[0], np.asarray(c.roff)[0]
+    hid_ref, raw_ref = step(
+        c.pos_mk, c.hid_mk, c.w_mk, c.pools(), c.pt, ckpt_2d, roff_1d
+    )
+    folded = np.concatenate([ckpt_2d] * R)  # (R * NS, K), sharded over "tp"
+    act = np.ones((ex.NS,), np.int32)
+    hid, raw = step(c.pos_mk, c.hid_mk, c.w_mk, c.pools(), c.pt, folded, roff_1d, act)
+    np.testing.assert_array_equal(hid, hid_ref)
+    for got, want in zip(raw, raw_ref, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(got).view(np.uint8), np.asarray(want).view(np.uint8)
+        )
+    bad = folded.copy()
+    bad[ex.NS :, 0] = 10_000  # only rank 1's rows are out of bounds
+    with pytest.raises(ValueError, match="exceeds pool capacity"):
+        step(c.pos_mk, c.hid_mk, c.w_mk, c.pools(), c.pt, bad, roff_1d)
 
 
 def test_pooled_steps_validate_only_the_resolved_exec_spec(monkeypatch):
-    """A valid `fused_pool_io=False` override is not rejected for the fused mode."""
     monkeypatch.setattr(_builtins, "_LOADED", set(_builtins.BUILTINS))
     monkeypatch.setattr(fused_io_hook, "_IMPL", object())
+    """A valid `fused_pool_io=False` override is not rejected for the fused mode."""
+    # f32 conv, 2048 conv channels per rank: the T=6 fused conv window (256 rows)
+    # exceeds one 128-row conv page, while split pool I/O fits.
     spec = _f32_conv(synth_hybrid_spec(L=2, att_every=2, R=R, KH=8, VH=16))
     lay = spec.cache_backend.layout
     assert lay.fused_conv_rows(6, R) > lay.conv_page_rows
     ex = _make_paged_ex(B=6, T=6, fused_pool_io=True)
     mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
     with pytest.raises(MegakernelConfigError, match="conv window"):
-        cache_flat.make_flat_pooled_step(mesh, spec, ex)
+        cache.make_flat_pooled_step(mesh, spec, ex)
 
     class _Built(Exception):
         pass
@@ -322,27 +371,105 @@ def test_pooled_steps_validate_only_the_resolved_exec_spec(monkeypatch):
     built: list[ExecSpec] = []
 
     def _build(ms: Any, ex_k: ExecSpec) -> Any:
+        # This geometry is too wide for a CPU kernel build; stop once the
+        # pool I/O mode resolved and validated.
         built.append(ex_k)
         raise _Built
 
     monkeypatch.setattr(mk_kernel, "build", _build)
     with pytest.raises(_Built):
-        cache_flat.make_flat_pooled_step(mesh, spec, ex, fused_pool_io=False)
-    assert [cache_exec(e).fused_pool_io for e in built] == [False]
+        cache.make_flat_pooled_step(mesh, spec, ex, fused_pool_io=False)
+    with pytest.raises(_Built):
+        cache.PallasWriter(fused_pool_io=False).make_step(mesh, spec, ex)
+    assert [cache_exec(e).fused_pool_io for e in built] == [False, False]
 
 
 def test_should_fuse_pool_io_requires_the_fused_conv_window_to_fit(monkeypatch):
-    """`"auto"` falls back to split when the fused conv window misses one page."""
     monkeypatch.setattr(_builtins, "_LOADED", set(_builtins.BUILTINS))
     monkeypatch.setattr(fused_io_hook, "_IMPL", object())
+    """`"auto"` falls back to split when the fused conv window misses one page."""
     spec = _f32_conv(synth_hybrid_spec(L=2, att_every=2, R=R, KH=8, VH=16))
     ex_fit, ex_big = _make_paged_ex(B=4, T=1), _make_paged_ex(B=6, T=6)
-    assert cache_common.should_fuse_pool_io(spec, ex_fit, fused_pool_io="auto") is True
-    assert cache_common.should_fuse_pool_io(spec, ex_big, fused_pool_io="auto") is False
+    assert cache.should_fuse_pool_io(spec, ex_fit, fused_pool_io="auto") is True
+    assert cache.should_fuse_pool_io(spec, ex_big, fused_pool_io="auto") is False
     with pytest.raises(MegakernelConfigError, match="conv window"):
-        cache_common.should_fuse_pool_io(spec, ex_big, fused_pool_io=True)
+        cache.should_fuse_pool_io(spec, ex_big, fused_pool_io=True)
     with pytest.raises(ValueError, match="'auto'"):
-        cache_common.should_fuse_pool_io(spec, ex_fit, fused_pool_io="sometimes")
+        cache.should_fuse_pool_io(spec, ex_fit, fused_pool_io="sometimes")
+
+
+def test_cache_layout_helpers_and_direct_hbm_pipe_on_synth_spec():
+    """`cache` pool helpers and `DirectHBM` work directly on `synth_hybrid_spec`."""
+    spec = synth_hybrid_spec(L=2, att_every=2, R=R)
+    ex = _make_paged_ex(B=4, T=1)
+    pt, ckpt, roff, min_pages = cache.default_pool_layout(spec, ex)
+    assert pt.shape == (4, 2) and ckpt.shape == (1, 4, 1) and roff.shape == (1, 4)
+    assert min_pages <= 64
+
+    _, _, _, st_log = random_spec_inputs(jax.random.PRNGKey(0), spec, ex)
+    raw = cache.states_to_pool(spec, ex, st_log, pt, ckpt, read_offsets=roff)
+    unpacked = cache.pool_to_states(spec, ex, raw, pt, ckpt)
+    np.testing.assert_allclose(
+        unpacked["rec"].reshape(st_log["rec"].shape).astype(F32),
+        st_log["rec"].astype(F32),
+        rtol=0,
+        atol=0,
+    )
+    raw_r0 = tuple(jnp.asarray(r)[: r.shape[0] // R] for r in raw)
+    lay = spec.cache_backend.layout
+    got = cache.gather_gdn_states(spec, ex, raw_r0, ckpt, roff)
+    want = pool.gather_gdn_states(lay, ex, raw_r0, ckpt, roff)
+    for g_arr, w_arr in zip(got, want, strict=True):
+        np.testing.assert_array_equal(g_arr, w_arr)
+
+    mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
+    step, info = cache.DirectHBM().make_step(mesh, spec, ex)
+    assert callable(step) and not cache_exec(info["exec"]).paged_kv
+
+
+def test_resolve_pool_layout_from_standalone_model_spec():
+    """`cache._resolve_pool_layout` falls back to `ms.cache_backend.layout`."""
+    play = pool.derive_pool_layout(
+        [decls.KVCacheDecl(hd=256, kvh=1, page_size=128)], R=2
+    )
+    pb = pool.make_pool_backend(play)
+    ms = dataclasses.replace(
+        make_fake_model_spec(L=1, att_every=1),
+        name="unregistered_standalone_spec",
+        cache_backend=pb,
+    )
+    ex = ExecSpec(B=4, T=1, R=2, ctx=256)
+    assert cache._resolve_pool_layout(ms, ex) is play
+    pt, ckpt, roff, min_pages = cache.default_pool_layout(ms, ex)
+    assert pt.shape == (4, 2) and ckpt.shape == (1, 4, 1) and roff.shape == (1, 4)
+    assert min_pages >= 8
+    with pytest.raises(MegakernelConfigError, match="no cache_backend"):
+        cache._resolve_pool_layout(dataclasses.replace(ms, cache_backend=None), ex)
+
+
+def test_resolve_pool_layout_prefers_the_specs_own_cache_backend(monkeypatch):
+    """A registered model's spec with a replaced `cache_backend` uses that layout."""
+    spec = synth_hybrid_spec(L=2, att_every=2, R=R)
+    ex = _make_paged_ex(B=4, T=1)
+    registry_lay = spec.cache_backend.layout
+
+    class _RegisteredModel:  # stands in for the `ModelDef` registered as spec.name
+        @staticmethod
+        def pool_layout(cfg: Any, *, R: int) -> pool.PoolLayout:
+            return registry_lay
+
+    monkeypatch.setitem(model_def._MODEL_REGISTRY, spec.name, _RegisteredModel)
+    spec_f32 = _f32_conv(spec)
+    lay_f32 = spec_f32.cache_backend.layout
+    assert cache._resolve_pool_layout(spec_f32, ex) is lay_f32
+    pt, ckpt, roff, _ = cache.default_pool_layout(spec_f32, ex)
+    _, _, _, st_log = random_spec_inputs(jax.random.PRNGKey(1), spec_f32, ex)
+    raw = cache.states_to_pool(spec_f32, ex, st_log, pt, ckpt, read_offsets=roff)
+    want = pool.states_to_pool(lay_f32, ex, st_log, pt, ckpt, read_offsets=roff)
+    for got_p, want_p in zip(raw, want, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(got_p).view(np.uint8), np.asarray(want_p).view(np.uint8)
+        )
 
 
 def test_resolve_model_spec_dispatch():
@@ -361,7 +488,22 @@ def test_should_fuse_pool_io_without_registered_hook(monkeypatch):
     monkeypatch.setattr(_builtins, "_LOADED", set(_builtins.BUILTINS))
     monkeypatch.setattr(fused_io_hook, "_IMPL", None)
     assert not fused_io_hook.fused_io_available()
-    assert cache_common.should_fuse_pool_io(spec, ex, fused_pool_io="auto") is False
-    assert cache_common.should_fuse_pool_io(spec, ex, fused_pool_io=False) is False
+    assert cache.should_fuse_pool_io(spec, ex, fused_pool_io="auto") is False
+    assert cache.should_fuse_pool_io(spec, ex, fused_pool_io=False) is False
     with pytest.raises(MegakernelConfigError, match="fused pool I/O"):
-        cache_common.should_fuse_pool_io(spec, ex, fused_pool_io=True)
+        cache.should_fuse_pool_io(spec, ex, fused_pool_io=True)
+
+
+def test_cache_experimental_wrappers_build_fused_steps(monkeypatch):
+    """The experimental wrappers forward `fused_pool_io=True` and enforce donation."""
+    monkeypatch.setattr(_builtins, "_LOADED", set(_builtins.BUILTINS))
+    monkeypatch.setattr(fused_io_hook, "_IMPL", object())
+    spec = synth_hybrid_spec(L=2, att_every=2, R=R, VH=4)
+    ex = _make_paged_ex(B=4, T=1)
+    mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
+    with pytest.raises(MegakernelConfigError, match="donate_pools=True"):
+        cache_experimental.make_flat_fused_pooled_step(
+            mesh, spec, ex, donate_pools=False
+        )
+    with pytest.raises(MegakernelConfigError, match="donate_pools=True"):
+        cache_experimental.make_fused_pooled_step(mesh, spec, ex, donate_pools=False)
