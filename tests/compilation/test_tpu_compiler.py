@@ -1325,6 +1325,35 @@ class TestTpuCompilerCache:
         assert a.cache_dir is not None
         assert os.path.samefile(path, os.path.join(a.cache_dir, key))
 
+    def test_replay_from_peer_tries_later_candidates_and_honors_replay_only_from(
+        self, tmp_path, monkeypatch
+    ):
+        """When the first peer's artifact belongs to another graph (or is
+        excluded by replay_only_from), _replay_from_peer skips it and replays a
+        matching peer's artifact instead of recompiling."""
+        import torch
+
+        from vllm_torchtpu.compilation.tpu_compiler import replay_only_from
+
+        (r0, r1, r2, r3), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=4
+        )
+        other_graph = torch.fx.symbolic_trace(lambda x: x * 3 - 1)
+        same_graph = torch.fx.symbolic_trace(lambda x: x + 1)
+
+        compile(r0, graph=other_graph)
+        compile(r1, graph=same_graph)
+        fn, _ = compile(r2, graph=same_graph)
+        assert compiled == [0, 1]
+        assert fn() == "entry-from-rank-1"
+
+        # With replay_only_from({"rank_0_0"}), r3 ignores r1's matching
+        # artifact and skips r0's non-matching artifact, so r3 compiles locally.
+        with replay_only_from({"rank_0_0"}):
+            compile(r3, graph=same_graph)
+        assert compiled == [0, 1, 3]
+        assert replayed == ["entry-from-rank-1"]
+
 
 def test_deserialize_entry_does_not_copy_the_entry():
     """Replay rebuilds the runnable from the entry itself: a deepcopy would load

@@ -19,6 +19,7 @@ The biggest range takes far longer than the others, so startup is bounded by
 when it starts: local rank 0 must start on it, not reach it after the smallest.
 """
 
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -27,7 +28,7 @@ from vllm.config.utils import Range
 from vllm.distributed import parallel_state
 
 from vllm_torchtpu import _patch_vllm_compile_all_ranges
-from vllm_torchtpu.compilation import shape_variants, tpu_compiler
+from vllm_torchtpu.compilation import peer_replay, shape_variants, tpu_compiler
 
 SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 
@@ -406,3 +407,121 @@ def test_deferred_falls_back_when_cache_disabled_or_host_unknown(
     calls_nocache, _, _ = _compile_deferred(monkeypatch, 1, disable_cache=True)
     assert all(wait == 0.0 for _, wait in calls_nocache[:9])
     assert sorted(end for end, _ in calls_nocache[:9]) == SIZES
+
+
+def test_peer_replay_claims_list_schedules_and_respects_claim_wait(
+    compile_all_ranges, monkeypatch, tmp_path
+):
+    """VLLM_TPU_PEER_REPLAY_CLAIMS=1 claims unclaimed ranges biggest-first via
+    O_EXCL files (recording rank_<r>_<dp> dir names) and replays peer-claimed
+    ranges with bounded wait."""
+    monkeypatch.setenv("VLLM_TPU_PEER_REPLAY_CLAIMS", "1")
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", "42")
+    monkeypatch.setattr(tpu_compiler, "_graph_fingerprint", lambda graph: "fp" * 16)
+    cache_dir = str(tmp_path / "hash1" / "rank_0_1" / "backbone")
+
+    def _run_claim_rank(pre_claim: dict[int, str] | None = None):
+        _host(monkeypatch, 8)
+        monkeypatch.setenv("LOCAL_RANK", "0")
+        monkeypatch.setattr(peer_replay, "_claim_call_counter", itertools.count(1))
+        calls = []
+
+        def compile(graph, args, *rest, compile_range, **kwargs):
+            calls.append(
+                (
+                    compile_range.end,
+                    getattr(tpu_compiler._peer_wait, "timeout_s", 0.0),
+                    getattr(tpu_compiler._peer_wait, "peer_ranks", None),
+                )
+            )
+            return lambda *a: a
+
+        backend = SimpleNamespace(
+            graph=object(),
+            range_entries={
+                Range(s, s): piecewise_backend.RangeEntry(compile_range=Range(s, s))
+                for s in [16, 64, 256]
+            },
+            vllm_backend=SimpleNamespace(
+                compiler_manager=SimpleNamespace(
+                    compile=compile,
+                    disable_cache=False,
+                    compiler=SimpleNamespace(cache_dir=cache_dir),
+                ),
+                inductor_config={},
+                is_encoder=False,
+            ),
+            compilation_config=None,
+            piecewise_compile_index=0,
+            total_piecewise_compiles=1,
+            _log_compile_start=lambda compile_range: None,
+        )
+        if pre_claim:
+            cdir = (
+                tmp_path
+                / "hash1"
+                / "peer_claims"
+                / peer_replay._run_id()
+                / "backbone"
+                / ("fp" * 12)
+                / "1"
+            )
+            cdir.mkdir(parents=True, exist_ok=True)
+            for size, owner in pre_claim.items():
+                (cdir / f"{size}_{size}").write_text(owner)
+        compile_all_ranges(backend)
+        return calls
+
+    calls = _run_claim_rank(pre_claim={256: "rank_0_0", 16: "rank_0_1"})
+    # 64 is unclaimed -> rank_0_1 claims and compiles it (wait=0).
+    # 16 was claimed by rank_0_1 -> never waits on own claim (wait=0).
+    # 256 was claimed by rank_0_0 -> waits up to 42s with peer_ranks={"rank_0_0"}.
+    assert calls == [
+        (64, 0.0, {"rank_0_1"}),
+        (16, 0.0, {"rank_0_1"}),
+        (256, 42.0, {"rank_0_0"}),
+    ]
+
+
+def test_peer_replay_claims_falls_back_to_rotated_without_fingerprint(
+    compile_all_ranges, monkeypatch, tmp_path
+):
+    """When a graph cannot be fingerprinted, VLLM_TPU_PEER_REPLAY_CLAIMS falls
+    back to the rotated order (wait=0) instead of the static deal."""
+    monkeypatch.setenv("VLLM_TPU_PEER_REPLAY_CLAIMS", "1")
+    monkeypatch.setattr(tpu_compiler, "_graph_fingerprint", lambda graph: None)
+    _host(monkeypatch, 8)
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    calls = []
+    cache_dir = str(tmp_path / "hash1" / "rank_0_0" / "backbone")
+    backend = SimpleNamespace(
+        graph=object(),
+        range_entries={
+            Range(s, s): piecewise_backend.RangeEntry(compile_range=Range(s, s))
+            for s in SIZES
+        },
+        vllm_backend=SimpleNamespace(
+            compiler_manager=SimpleNamespace(
+                compile=lambda g, a, *r, compile_range, **kw: (
+                    calls.append(
+                        (
+                            compile_range.end,
+                            getattr(tpu_compiler._peer_wait, "timeout_s", 0.0),
+                        )
+                    )
+                    or (lambda *x: x)
+                ),
+                disable_cache=False,
+                compiler=SimpleNamespace(cache_dir=cache_dir),
+            ),
+            inductor_config={},
+            is_encoder=False,
+        ),
+        compilation_config=None,
+        piecewise_compile_index=0,
+        total_piecewise_compiles=1,
+        _log_compile_start=lambda compile_range: None,
+    )
+    compile_all_ranges(backend)
+    assert all(wait == 0.0 for _, wait in calls)
+    assert sorted(end for end, _ in calls) == SIZES

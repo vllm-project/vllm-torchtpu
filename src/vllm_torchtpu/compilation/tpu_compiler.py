@@ -121,6 +121,18 @@ def wait_for_peer_artifact(timeout_s: float):
         _peer_wait.timeout_s = 0.0
 
 
+@contextlib.contextmanager
+def replay_only_from(rank_dirs: set[str] | None):
+    """Within this block, `compile` replays only artifacts from these rank dirs
+    (e.g. `{"rank_0_1"}`)."""
+    prev = getattr(_peer_wait, "peer_ranks", None)
+    _peer_wait.peer_ranks = rank_dirs
+    try:
+        yield
+    finally:
+        _peer_wait.peer_ranks = prev
+
+
 def _deserialize_entry(entry: Any) -> Callable[..., Any]:
     """Rebuild a runnable from a bundled AOTAutograd entry.
 
@@ -182,6 +194,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PRECOMPILE_PEER_REPLAY",
     "TPU_PRECOMPILE_PEER_WAIT_S",
     "TPU_PRECOMPILE_TRACE_FIRST",
+    "VLLM_TPU_PEER_REPLAY_CLAIMS",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would
@@ -811,7 +824,23 @@ class TpuCompilerAdaptor(CompilerInterface):
         do not trace the same program and waiting on would not help.
         """
         deadline = time.monotonic() + getattr(_peer_wait, "timeout_s", 0.0)
-        paths = self._peer_paths(key)
+        allowed = getattr(_peer_wait, "peer_ranks", None)
+
+        def candidates() -> list[str]:
+            paths = self._peer_paths(key)
+            if allowed is None:
+                return paths
+            # replay_only_from: only rank dirs known to trace this rank's
+            # graph, so no other process group's artifact is unpickled and
+            # refused.
+            out = []
+            for p in paths:
+                rank_dir = os.path.basename(os.path.dirname(os.path.dirname(p)))
+                if rank_dir in allowed:
+                    out.append(p)
+            return out
+
+        paths = candidates()
         while not paths and time.monotonic() < deadline:
             failed = self._peer_failed(key, fingerprint)
             if failed is not None:
@@ -822,11 +851,14 @@ class TpuCompilerAdaptor(CompilerInterface):
                 )
                 return None
             time.sleep(_PEER_POLL_S)
-            paths = self._peer_paths(key)
-        if not paths:
-            return None
-        compiled_fn = self._replay(paths[0], graph, was_wrapped, fingerprint)
-        return None if compiled_fn is None else (compiled_fn, paths[0])
+            paths = candidates()
+        # Try each peer's artifact, not just the first: with peers in other
+        # process groups, the first path can be one this rank must refuse.
+        for path in paths:
+            compiled_fn = self._replay(path, graph, was_wrapped, fingerprint)
+            if compiled_fn is not None:
+                return compiled_fn, path
+        return None
 
     @staticmethod
     def _link_artifact(src: str, dst: str) -> bool:

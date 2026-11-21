@@ -542,6 +542,15 @@ def _patch_vllm_compile_all_ranges() -> None:
 
         from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
 
+        if envs.VLLM_TPU_PEER_REPLAY_CLAIMS:
+            from vllm_torchtpu.compilation.peer_replay import compile_claimed
+
+            # Without claims, fall back to the rotated order, which never waits
+            # on a peer: the static deal below can hang a pipeline leg.
+            if not compile_claimed(pairs, compile_entry):
+                compile_rotated(pairs, local_rank)
+            return
+
         host = host_slot()
         if host is None:
             # Layout not recognized: never wait on an owner that may not
