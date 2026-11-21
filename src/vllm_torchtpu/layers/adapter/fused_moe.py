@@ -11,7 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Torch bridge for fused MoE based on fused_moe_func in fused_moe_gmm."""
+"""Torch bridge for fused MoE based on fused_moe_func in fused_moe_gmm.
+
+Under an expert placement with copy slots (`expert_placement`), the ops take
+`num_primary_experts`, so the grouped path serves a rank's primaries and never
+its copy slots.
+"""
 
 import enum
 import functools
@@ -22,6 +27,7 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.adapter import expert_placement
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     armed_lowtok_max_tokens,
     fused_moe_func,
@@ -32,7 +38,9 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 )
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool, int], Callable] = {}
+_fused_moe_kernel_cache: dict[
+    tuple[int, str, bool, Any, bool, int, int | None], Callable
+] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -159,6 +167,7 @@ def _build_fused_moe_custom_op(
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
     lowtok_max_tokens: int = 0,
+    num_primary_experts: int | None = None,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -184,6 +193,7 @@ def _build_fused_moe_custom_op(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         lowtok_max_tokens=lowtok_max_tokens,
+        num_primary_experts=num_primary_experts,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
@@ -202,6 +212,7 @@ def _build_fused_moe_custom_op(
         rhs_quant_dtype,
         skip_padded_tokens,
         lowtok_max_tokens,
+        num_primary_experts,
     )
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
@@ -214,6 +225,7 @@ def _get_fused_moe_custom_op(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    num_primary_experts: int | None = None,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
@@ -227,10 +239,20 @@ def _get_fused_moe_custom_op(
         rhs_quant_dtype,
         skip_padded_tokens,
         lowtok_max_tokens,
+        num_primary_experts,
     )
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
+    # Checked when an op is built (at weight load, by prebuild), not on every
+    # lookup the compiled forward makes: no op without the bound is built
+    # under a table with copies, so no later lookup finds one.
+    if use_ep and num_primary_experts is None and expert_placement.has_copies():
+        raise ValueError(
+            "this expert placement holds copies: the grouped path needs "
+            "num_primary_experts, which this quantization method does not "
+            "supply"
+        )
     return _build_fused_moe_custom_op(
         topk=topk,
         activation=activation,
@@ -238,6 +260,7 @@ def _get_fused_moe_custom_op(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         lowtok_max_tokens=lowtok_max_tokens,
+        num_primary_experts=num_primary_experts,
     )
 
 
@@ -248,6 +271,7 @@ def prebuild_fused_moe_kernel(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    num_primary_experts: int | None = None,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -256,6 +280,7 @@ def prebuild_fused_moe_kernel(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        num_primary_experts=num_primary_experts,
     )
 
 
@@ -274,6 +299,7 @@ def fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    num_primary_experts: int | None = None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
@@ -286,6 +312,9 @@ def fused_moe_gmm(
     program identical across ranks. The kernel remaps global ids to local ids
     with an elementwise subtract and masks non-local experts. When present,
     the sparse-core parity path dispatches ragged gather/gather-reduce.
+    ``num_primary_experts`` bounds the local interval when the weights hold
+    copy slots after the primaries (``expert_placement``); ``None`` is the
+    full slot count.
     """
     use_ep = experts_start is not None
     fused_moe = _get_fused_moe_custom_op(
@@ -294,6 +323,7 @@ def fused_moe_gmm(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        num_primary_experts=num_primary_experts,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand

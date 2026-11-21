@@ -79,7 +79,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter import expert_placement, moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -780,6 +780,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     CUDA-only router.select_experts() path.
     """
 
+    # The grouped path's bound on the layer's local slots
+    # (expert_placement.primary_experts), set when the weights load; None
+    # serves every slot.
+    _gmm_primary_experts: int | None = None
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
 
@@ -1077,11 +1081,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 activation=activation_str,
             )
             return
-        prebuild_fused_moe_kernel(
-            topk=layer.moe_config.experts_per_token,
-            activation=activation_str,
-            use_ep=layer.moe_config.moe_parallel_config.use_ep,
-        )
+        self._prebuild_grouped_path(layer, activation_str)
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
         # collective inside the compiled graph. The result is recorded on this
@@ -1112,6 +1112,20 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # 'score_bias'`. Passing the operand at the call site is not
             # sufficient on its own; it has to exist.
             register_score_bias_buffer(layer)
+
+    def _prebuild_grouped_path(
+        self, layer: TpuRoutedExperts, activation_str: str
+    ) -> None:
+        """Record the grouped path's bound on the layer's local slots (its
+        primaries under a placement with copy slots, see
+        expert_placement.primary_experts) and prebuild the op for it."""
+        self._gmm_primary_experts = expert_placement.primary_experts(layer)
+        prebuild_fused_moe_kernel(
+            topk=layer.moe_config.experts_per_token,
+            activation=activation_str,
+            use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            num_primary_experts=self._gmm_primary_experts,
+        )
 
     def apply_monolithic(
         self,
@@ -1213,6 +1227,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "experts_start": layer._experts_start,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
+            "num_primary_experts": self._gmm_primary_experts,
         }
         if owns_collectives:
             return pipelined_fused_moe_gmm(**kwargs)

@@ -248,8 +248,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
     # A static expert placement permutes expert weights and router tables at
-    # load (layers/adapter/expert_placement.py); every program is the unplaced
-    # model's, so a placed server reuses its compile cache.
+    # load (layers/adapter/expert_placement.py); with a permutation table every
+    # program is the unplaced model's, so a placed server reuses its compile
+    # cache. A table with copy slots changes programs and is hashed on its own
+    # (_expert_placement_copy_factors).
     "TPU_EXPERT_PLACEMENT",
     # Pooling: the static pooler is a separate backend="tpu" helper outside the
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
@@ -412,6 +414,26 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
     return factors
 
 
+def _expert_placement_copy_factors() -> dict[str, Any] | None:
+    """What a placement table with copy slots changes in the programs: the
+    layers it places hold primaries plus copies, and the grouped MoE path is
+    bounded to the primaries (a static argument). None without copies, so a
+    permutation table, or none, keeps the key it had."""
+    # Deferred: importing it loads the vllm_torchtpu.layers package (its
+    # attention and linear layers and the model registry), which this module
+    # does not otherwise import.
+    from vllm_torchtpu.layers.adapter import expert_placement
+
+    placement = expert_placement.current()
+    if placement is None or not placement.copies_per_rank:
+        return None
+    return {
+        "primaries_per_rank": placement.per_rank,
+        "slots_per_rank": placement.slots_per_rank,
+        "placed_layers": sorted(placement.layers),
+    }
+
+
 def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     """Hash TPU-specific factors used by both AOT and piecewise caches."""
     # Deferred: tpu_info imports Pallas and the quantize helpers import JAX,
@@ -469,6 +491,9 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             else None,
         },
     }
+    copy_factors = _expert_placement_copy_factors()
+    if copy_factors is not None:
+        factors["expert_placement_copies"] = copy_factors
 
     repo_root = Path(__file__).resolve().parents[2]
     hash_obj = hashlib.sha256(

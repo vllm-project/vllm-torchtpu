@@ -339,10 +339,15 @@ class TestTpuCompilerCache:
 
         assert dp1 != dp4
 
-    def test_tpu_hash_ignores_the_expert_placement(self):
-        """A placement permutes weights and router tables at load and leaves
-        every program as it was, so a placed server reuses the cache."""
+    def test_tpu_hash_ignores_a_permutation_placement(self, tmp_path):
+        """A permutation table permutes weights and router tables at load and
+        leaves every program as it was, so a placed server reuses the cache."""
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        table = tmp_path / "permutation.json"
+        table.write_text(
+            '{"experts": 8, "shards": 2, "layers": {"3": [[7, 0, 5, 2], [1, 6, 3, 4]]}}'
+        )
 
         def placed(value):
             with patch.dict(os.environ, {"TPU_EXPERT_PLACEMENT": value}):
@@ -352,7 +357,40 @@ class TestTpuCompilerCache:
             "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
             return_value=[],
         ):
-            assert placed("") == placed("/tmp/placement.json")
+            assert placed("") == placed(str(table))
+
+    def test_tpu_hash_covers_a_placement_with_copy_slots(self, tmp_path):
+        """Copy slots give the layers a table places more weight slots and
+        bound the grouped path to their primaries, so the programs differ from
+        the unplaced model's, and with the placed layers or the copy count."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        def write(name, layers, copies=1):
+            # Rank 0 also holds copies of experts 1 (and 6), rank 1 of 7 (and 0).
+            ranks = [[7, 0, 5, 2, 1, 6][: 4 + copies], [1, 6, 3, 4, 7, 0][: 4 + copies]]
+            body = ", ".join(f'"{n}": {ranks}' for n in layers)
+            path = tmp_path / name
+            path.write_text(
+                f'{{"experts": 8, "shards": 2, "copies_per_rank": {copies}, '
+                f'"layers": {{{body}}}}}'
+            )
+            return str(path)
+
+        def placed(value):
+            with patch.dict(os.environ, {"TPU_EXPERT_PLACEMENT": value}):
+                return compute_tpu_compilation_hash(self._config())
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            unplaced = placed("")
+            copies = placed(write("copies.json", [3]))
+            other_layers = placed(write("copies_more.json", [3, 4]))
+            two_copies = placed(write("copies_two.json", [3], copies=2))
+            assert len({unplaced, copies, other_layers, two_copies}) == 4
+            # The same table in another file gives the same key.
+            assert placed(write("copies_again.json", [3])) == copies
 
     def test_runtime_hash_covers_custom_op_boundaries(self):
         from vllm_torchtpu.compilation import tpu_compiler

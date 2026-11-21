@@ -205,6 +205,7 @@ def pipelined_fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    num_primary_experts: int | None = None,
 ) -> torch.Tensor:
     """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute.
 
@@ -238,6 +239,9 @@ def pipelined_fused_moe_gmm(
         activation: Gated activation function string (e.g., "silu" for SwiGLU).
         rhs_quant_dtype: Optional RHS quantization data type.
         skip_padded_tokens: Optional flag to skip padded tokens.
+        num_primary_experts: Optional bound on the shard's local experts when
+            the weights hold copy slots after its primaries (expert
+            placement); None serves every local slot.
 
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
@@ -295,6 +299,7 @@ def pipelined_fused_moe_gmm(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            num_primary_experts=num_primary_experts,
         )
 
         if parallel_size > 1:
@@ -382,6 +387,7 @@ def pipelined_fused_moe_gmm(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            num_primary_experts=num_primary_experts,
         )
 
         # Reduce-scatter partial output for current chunk. The group's
