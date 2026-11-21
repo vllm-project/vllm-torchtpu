@@ -1,0 +1,167 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""The TPU generations CI runs on, and the stamp that tells their steps apart.
+
+A pipeline file in TPU_GENERATION_FILES is written once and goes up once per
+TPU generation (bootstrap.py, upload_stages). Each upload reads the
+generation's name, pod shapes and chip type as upload-time variables
+(TpuGeneration.upload_env) and has the generation's name stamped on its steps
+(stamp_tpu_generation), so the file names no generation, and adding one renames
+no step of the others.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class TpuGeneration:
+    """A TPU generation: its name, the shapes of its pods and its chip type.
+
+    The name also tells its steps apart: `key_prefix` goes before every step
+    key (Buildkite rejects a duplicate key) and `label_prefix` before every
+    label (GitHub names a commit status after its step's label).
+    """
+
+    name: str
+    shape_single: str
+    shape_multi: str
+    # TPU_ACCELERATOR_TYPE as the pod's chip lookup reads it
+    # (vllm_torchtpu.tpu_info); run_eval_flow.sh also picks the chip's perf
+    # baselines with it.
+    accelerator_type: str
+
+    @property
+    def key_prefix(self) -> str:
+        return f"{self.name}_"
+
+    @property
+    def label_prefix(self) -> str:
+        return f"{self.name} "
+
+    def upload_env(self) -> dict[str, str]:
+        """The variables a step file reads: SHAPE (either shape), the chip type,
+        and TPU_GENERATION for the `if` of a step only some generations run."""
+        return {
+            "TPU_GENERATION": self.name,
+            "KUBE_SHAPE_SINGLE": self.shape_single,
+            "KUBE_SHAPE_MULTI": self.shape_multi,
+            "TPU_ACCELERATOR_TYPE": self.accelerator_type,
+        }
+
+
+# upload_models_and_features.sh keeps its own copy of these shapes, for the
+# nightly model and feature tests; test_tpu_generations.py checks they agree.
+# TODO: make that script read them from here (a bootstrap.py subcommand).
+TPU_V7X = TpuGeneration(
+    name="v7x",
+    shape_single="tpu7x-standard-1t/1x1x1",
+    shape_multi="tpu7x-standard-4t/2x2x1",
+    accelerator_type="tpu7x",
+)
+TPU_V6E = TpuGeneration(
+    name="v6e",
+    shape_single="ct6e-standard-1t/1x1",
+    shape_multi="ct6e-standard-8t/2x4",
+    accelerator_type="v6e",
+)
+# Pipeline files uploaded once per TPU generation in the listed order (last
+# shows/queues first in Buildkite). Files not listed here are uploaded once.
+TPU_GENERATION_FILES: Mapping[str, tuple[TpuGeneration, ...]] = {
+    ".buildkite/pipeline_tests.yml": (TPU_V6E, TPU_V7X),
+    ".buildkite/pipeline_integration.yml": (TPU_V6E, TPU_V7X),
+    ".buildkite/pipeline_perf.yml": (TPU_V6E, TPU_V7X),
+}
+# The generations those files go up for when CI_TPU_GENERATIONS is unset.
+DEFAULT_TPU_GENERATIONS: tuple[TpuGeneration, ...] = (TPU_V7X,)
+# The generation whose nightly tests-lane steps a verified commit pair needs
+# passed. pipeline_verify.yml's nightly report waits on those steps by key, and
+# nightly_report.sh asks for the key prefix (`bootstrap.py verified-key-prefix`).
+VERIFIED_TPU_GENERATION = TPU_V7X
+# CI_TPU_GENERATIONS=all sends those files up for every generation they list,
+# side by side, on any build. The generation brings its shapes, so the build
+# names no KUBE_SHAPE_* of its own. The variable is not named TPU_VERSION
+# because that names one chip to the scripts and model files that read it.
+CI_TPU_GENERATIONS_ALL = "all"
+
+
+def _own_steps(steps: Sequence[Any]) -> list[dict[str, Any]]:
+    """The step objects of `steps`, with each group followed by its steps."""
+    found: list[dict[str, Any]] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        found.append(step)
+        if isinstance(step.get("steps"), list):
+            found.extend(_own_steps(step["steps"]))
+    return found
+
+
+def stamp_tpu_generation(steps: Sequence[Any], generation: TpuGeneration) -> None:
+    """Stamp `generation`'s key and label prefixes on a parsed pipeline's steps.
+
+    `steps` is the `steps` of `pipeline upload --dry-run --format json`, edited
+    in place. Every key the pipeline defines takes the key prefix, and so does
+    a `depends_on` entry that names one of them; a dependency on a step of
+    another upload (the image builds) is left as it is. Every label and group
+    name takes the label prefix.
+
+    Raises ValueError for a step whose key, label or depends_on is not of a
+    form read here, since a step passed over would go up under another
+    generation's name.
+    """
+    own = _own_steps(steps)
+    for step in own:
+        for field in ("key", "label", "group"):
+            if field in step and not isinstance(step[field], str):
+                raise ValueError(
+                    f"cannot stamp TPU {generation.name} on a step whose "
+                    f"`{field}` is {step[field]!r}"
+                )
+        # `id`, `identifier` and `name` are Buildkite's aliases of `key` and
+        # `label`. The step files use neither, and one that did would keep its
+        # other generation's name.
+        for alias in ("id", "identifier", "name"):
+            if alias in step:
+                raise ValueError(
+                    f"cannot stamp TPU {generation.name} on a step that "
+                    f"uses `{alias}`; use `key` and `label`"
+                )
+    defined = {step["key"] for step in own if "key" in step}
+
+    def stamped(dependency: Any) -> Any:
+        if isinstance(dependency, str):
+            if dependency in defined:
+                return generation.key_prefix + dependency
+            return dependency
+        if isinstance(dependency, dict) and isinstance(dependency.get("step"), str):
+            return {**dependency, "step": stamped(dependency["step"])}
+        raise ValueError(
+            f"cannot stamp TPU {generation.name} on depends_on entry {dependency!r}"
+        )
+
+    for step in own:
+        if "key" in step:
+            step["key"] = generation.key_prefix + step["key"]
+        for field in ("label", "group"):
+            if field in step:
+                step[field] = generation.label_prefix + step[field]
+        depends_on = step.get("depends_on")
+        if isinstance(depends_on, list):
+            step["depends_on"] = [stamped(d) for d in depends_on]
+        elif depends_on is not None:
+            step["depends_on"] = stamped(depends_on)
