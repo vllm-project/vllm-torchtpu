@@ -873,6 +873,13 @@ class Qwen38SegmentDriver:
             )
             logger.info("Qwen3.8 whole-step key stream: %d pages per DMA, %s ring slots",
                         keymp or 1, "auto" if auto_slots else keyslots or 2)
+        keylanes = _parse_int(raw, "wholekeylanes")
+        if keylanes:
+            from . import qwen38_wholestep_call
+
+            assert keylanes in (128, 256), keylanes
+            qwen38_wholestep_call.KEY_LANES = keylanes
+            logger.info("Qwen3.8 whole-step key stream: %d lanes per carrier row", keylanes)
         if _parse_flag(raw, "wholeloop", False):
             from . import qwen38_wholestep_call
 

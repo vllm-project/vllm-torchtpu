@@ -80,6 +80,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--buckets", default="4,8,16")
     ap.add_argument("--ctx", type=int, default=3000)
+    ap.add_argument("--ctx-min", type=int, default=0,
+                    help="mixed contexts: request q gets ctx - q * (ctx - ctx_min) // (nreq - 1) "
+                    "(0: ctx + q, near-uniform)")
     ap.add_argument("--budget", type=int, default=128)
     ap.add_argument("--max-groups", type=int, default=2048)
     ap.add_argument("--iters", type=int, default=20)
@@ -102,6 +105,8 @@ def main():
                     "--kb 512 for N > 1: a 512-token block column holds 4 consecutive pages)")
     ap.add_argument("--key-slots", type=int, default=2,
                     help="key-stream ring slots (VLLM_TPU_MEGAKERNEL wholekeyslots=N; -1 = auto)")
+    ap.add_argument("--key-lanes", type=int, default=0, choices=(0, 128, 256),
+                    help="key-stream lanes per carrier row (VLLM_TPU_MEGAKERNEL wholekeylanes=N)")
     ap.add_argument("--kb", type=int, default=128, choices=(128, 512),
                     help="pool block tokens (the served tables address 512-token blocks)")
     ap.add_argument("--score-arm", default="", choices=("", "dma", "compute"),
@@ -144,7 +149,7 @@ def main():
         pltpu.get_tpu_info = lambda: chip
     wsc.SHARD_INDEX, wsc.UNION_ATTN, wsc.LOOP_REQUESTS = a.shard, a.union, a.loop
     wsc.UNION_PHYS = a.phys
-    wsc.KEY_MP, wsc.KEY_SLOTS = a.key_mp, a.key_slots
+    wsc.KEY_MP, wsc.KEY_SLOTS, wsc.KEY_LANES = a.key_mp, a.key_slots, a.key_lanes
     if a.score_arm:
         from vllm_torchtpu.megakernel.wholestep import qsa_full_b
 
@@ -268,7 +273,12 @@ def main():
         NG = 1 + nreq * n_gdn * 4
         free_gdn = iter(rng.permutation(np.arange(1, NG)))
         free = iter(rng.permutation(np.arange(per * NG, per * NB)))
-        ctx = np.array([a.ctx + q for q in range(nreq)] + [0] * (NR - nreq), np.int32)
+        if a.ctx_min:
+            ctx_q = [a.ctx - q * (a.ctx - a.ctx_min) // max(nreq - 1, 1) for q in range(nreq)]
+        else:
+            ctx_q = [a.ctx + q for q in range(nreq)]
+        print(f"B={B} ctx per request {ctx_q}", flush=True)
+        ctx = np.array(ctx_q + [0] * (NR - nreq), np.int32)
         qsl = np.array([min(q, nreq) * 4 for q in range(NR + 1)], np.int32)
         seq = ctx + np.where(np.arange(NR) < nreq, 4, 0)
         meta = []
