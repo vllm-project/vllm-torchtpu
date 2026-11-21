@@ -22,8 +22,15 @@ import torch
 from vllm_torchtpu import envs
 from vllm_torchtpu.runner.tpu_runner import (
     TPUModelRunner,
+    _substitute_and_extract_drafts,
     _substitute_placeholder_token,
 )
+
+
+def _runner(**attrs):
+    runner = object.__new__(TPUModelRunner)
+    runner.__dict__.update(attrs)
+    return runner
 
 
 def test_env_flag_parsing(monkeypatch):
@@ -45,7 +52,7 @@ def test_env_flag_parsing(monkeypatch):
 
 def test_substitution_disabled_by_default():
     """When _fast_token_substitution is False, calls _substitute_placeholder_token."""
-    runner = SimpleNamespace(
+    runner = _runner(
         _fast_token_substitution=False,
         device=torch.device("cpu"),
         _pre_async_results=SimpleNamespace(
@@ -69,7 +76,7 @@ def test_substitution_disabled_by_default():
 
 def test_substitution_enabled_fast_path():
     """When _fast_token_substitution is True, direct slicing bypasses kernel."""
-    runner = SimpleNamespace(
+    runner = _runner(
         _fast_token_substitution=True,
         device=torch.device("cpu"),
         _pre_async_results=SimpleNamespace(
@@ -109,3 +116,58 @@ def test_substitute_placeholder_token_rejects_mismatched_lengths():
             torch.zeros(4, dtype=torch.int32),
             torch.zeros(2, dtype=torch.int32),
         )
+
+
+@pytest.mark.parametrize("fast", [True, False])
+@pytest.mark.parametrize("in_order", [True, False])
+def test_substitute_and_extract_drafts_matches_two_steps(fast, in_order):
+    """`_substitute_async_tokens_and_drafts` at a warmed shape (one program)
+    returns the substitution and the extracted drafts of the unwarmed path."""
+    from vllm_torchtpu.runner.tpu_runner_async_output import extract_draft_token_ids
+
+    num_tokens, k = 8, 3
+    next_tokens = torch.arange(100, 100 + 4 * (1 + k), dtype=torch.int64)
+    cur = np.arange(num_tokens if in_order else 6, dtype=np.int32)
+    pre = cur if in_order else np.array([0, 1, 2, 4, 5, 6], dtype=np.int32)
+    md = SimpleNamespace(
+        final_logits_indices=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int32),
+        target_logits_indices=torch.tensor([0, 1, 2, 4, 5, 6, 0, 0], dtype=torch.int32),
+    )
+
+    def runner():
+        return _runner(
+            _fast_token_substitution=fast,
+            device=torch.device("cpu"),
+            _pre_async_results=SimpleNamespace(next_tokens_tpu=next_tokens),
+            _substitute_drafts_warm=set(),
+        )
+
+    def inputs():
+        return torch.arange(-num_tokens, 0, dtype=torch.int32)
+
+    with torch.compiler.set_stance("force_eager"):
+        base = TPUModelRunner._apply_async_token_substitution(
+            runner(), inputs(), cur, pre
+        )
+        expected = (
+            base,
+            extract_draft_token_ids(
+                base, md.final_logits_indices, md.target_logits_indices
+            ),
+        )
+        cold = runner()
+        unwarmed = cold._substitute_async_tokens_and_drafts(inputs(), cur, pre, md)
+        warm = runner()
+        indexed = not (fast and in_order)
+        warm._substitute_drafts_warm.add(
+            warm._substitute_drafts_key(num_tokens, next_tokens.numel(), 8, indexed)
+        )
+        with patch(
+            "vllm_torchtpu.runner.tpu_runner._substitute_and_extract_drafts",
+            wraps=_substitute_and_extract_drafts,
+        ) as fused:
+            warmed = warm._substitute_async_tokens_and_drafts(inputs(), cur, pre, md)
+            assert fused.called
+    for got in (unwarmed, warmed):
+        assert torch.equal(got[0], expected[0])
+        assert torch.equal(got[1], expected[1])
