@@ -1823,6 +1823,20 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         next_note = time.monotonic() + 30.0
         while not self._stop_registration.is_set():
             if self._controller_reachable():
+                # DEBUG(pp-pcp registration): time the registration and dump
+                # every thread's stack while it runs.
+                import faulthandler
+                import sys as _sys
+
+                _t0 = time.monotonic()
+                logger.warning(
+                    "RAIDEN-DEBUG rank %d: controller reachable; constructing "
+                    "KVCacheManager (host_blocks=%d, tensors=%s)",
+                    self._rank,
+                    self._host_blocks_to_allocate,
+                    [tuple(t[0].shape) for t in self._device_tensors],
+                )
+                faulthandler.dump_traceback_later(45, repeat=True, file=_sys.stderr)
                 try:
                     from tpu_sync.api.torch import kv_cache_manager as _kcm
 
@@ -1845,6 +1859,12 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                         worker_id=f"shard_{self._rank}",
                         node_id=self._rank,
                         **storage_kwargs,
+                    )
+                    faulthandler.cancel_dump_traceback_later()
+                    logger.warning(
+                        "RAIDEN-DEBUG rank %d: KVCacheManager constructed in %.1f s",
+                        self._rank,
+                        time.monotonic() - _t0,
                     )
                     logger.info(
                         "TPURaidenOffloadingConnector: rank %d registered with offload "
