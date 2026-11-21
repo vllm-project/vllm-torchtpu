@@ -211,9 +211,16 @@ def test_inert_without_the_environment(tmp_path):
     assert sc.maybe_start({"Q38X2_LOCK_DIR": str(tmp_path)}) is False
     assert not (tmp_path / "q38x2_sidecar.lock").exists()
     # The package import runs the hook (inert here: the test env names no sidecar).
+    import os
+
     import vllm_torchtpu
 
-    assert "_tier_x2_sidecar.maybe_start()" in open(vllm_torchtpu.__file__).read()
+    # On the Q38_OXPD_FORM-gated package the default form's body is _bl_init.py
+    # (vllm_torchtpu/__init__.py is the gate that executes it).
+    body = os.path.join(os.path.dirname(vllm_torchtpu.__file__), "_bl_init.py")
+    if not os.path.exists(body):
+        body = vllm_torchtpu.__file__
+    assert "_tier_x2_sidecar.maybe_start()" in open(body).read()
 
 
 def test_nothing_starts_before_the_cars_wheel_is_installed(tmp_path, monkeypatch):
