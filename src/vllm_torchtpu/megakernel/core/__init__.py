@@ -39,6 +39,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         runtime,
         schedule,
         spec,
+        validate,
         weights,
     )
     from .collectives import (
@@ -175,6 +176,7 @@ _SUBMODULES = frozenset(
         "runtime",
         "schedule",
         "spec",
+        "validate",
         "weights",
     }
 )
@@ -369,6 +371,7 @@ __all__ = [
     "schedule",
     "spec",
     "ssm_to_raw_pages",
+    "validate",
     "vmem",
     "weights",
     "with_cache",
