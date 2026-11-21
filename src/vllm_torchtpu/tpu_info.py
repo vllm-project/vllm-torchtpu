@@ -15,7 +15,6 @@ import functools
 import glob
 import hashlib
 import importlib.util
-import math
 import os
 from importlib import metadata as importlib_metadata
 
@@ -198,21 +197,12 @@ def get_num_cores_per_chip() -> int:
     if not tpu_type:
         return 2
     name = tpu_type.strip().lower().split("-")[0].removeprefix("tpu").strip()
-    if name.startswith(("v5litepod", "v5e", "v6e", "v8i", "8i", "v8t", "8t")):
+    if name.startswith(("v5litepod", "v5e", "v6e", "v8t", "8t")):
         return 1
     return 2
 
 
 def get_num_chips() -> int:
-    bounds = os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS", "").strip()
-    if bounds:
-        dims = [int(d) for d in bounds.replace("x", ",").split(",") if d.strip()]
-        if not dims or any(d <= 0 for d in dims):
-            raise ValueError(
-                f"Invalid TPU_CHIPS_PER_HOST_BOUNDS={bounds!r}: "
-                "dimensions must be positive integers."
-            )
-        return math.prod(dims)
     accel_files = glob.glob("/dev/accel*")
     if accel_files:
         return len(accel_files)

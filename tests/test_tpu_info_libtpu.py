@@ -166,42 +166,20 @@ def test_get_chip_version_resolves_generations(accelerator_type, expected):
         ("v5litepod-16", 1),
         ("v5e-8", 1),
         ("v6e-8", 1),
-        ("tpu8i-8", 1),
-        ("v8i-4", 1),
         ("tpu8t-16", 1),
         ("v8t-4", 1),
         ("TPU v8t", 1),
         ("v5p-8", 2),
         ("tpu7x-8", 2),
+        ("v7x-16", 2),
+        ("TPU v7", 2),
+        ("tpu8i-8", 2),
+        ("v8i-4", 2),
     ],
 )
 def test_get_num_cores_per_chip(monkeypatch, tpu_type, expected_cores):
     monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: tpu_type)
     assert tpu_info.get_num_cores_per_chip() == expected_cores
-
-
-@pytest.mark.parametrize(
-    ("bounds", "expected_chips"),
-    [
-        ("1,1,1", 1),
-        ("1,2,1", 2),
-        ("2,2,1", 4),
-        ("2x2x1", 4),
-    ],
-)
-def test_get_num_chips_prefers_host_bounds(monkeypatch, bounds, expected_chips):
-    monkeypatch.setenv("TPU_CHIPS_PER_HOST_BOUNDS", bounds)
-    monkeypatch.setattr(
-        tpu_info.glob, "glob", lambda _pat: [f"/dev/accel{i}" for i in range(8)]
-    )
-    assert tpu_info.get_num_chips() == expected_chips
-
-
-@pytest.mark.parametrize("bad_bounds", ["0,2,1", "-1,2,1", "invalid"])
-def test_get_num_chips_rejects_invalid_host_bounds(monkeypatch, bad_bounds):
-    monkeypatch.setenv("TPU_CHIPS_PER_HOST_BOUNDS", bad_bounds)
-    with pytest.raises(ValueError):
-        tpu_info.get_num_chips()
 
 
 def test_get_tpu_metadata_passes_request_timeout(monkeypatch):
