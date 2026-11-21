@@ -22,6 +22,7 @@ if _STRICT not in os.environ.get("XLA_FLAGS", ""):
     os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "") + " " + _STRICT).strip()
 
 import functools  # noqa: E402
+import re  # noqa: E402
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
@@ -119,22 +120,40 @@ def test_one_ulp_positive_control_reads_not_bitwise():
     ) > 0
 
 
-def _lowered_text(rows, **kw):
+def _jaxpr(rows, **kw):
     weight, down, up, inject = _weights()
     prev, block, gates = _stream(rows, seed=1)
     if kw.pop("prologue", False):
         kw.update(block=block, prev_injection=gates)
-    return jax.jit(lambda *a: fused(*a, **kw)).lower(prev, weight, down, up, inject).as_text()
+    return jax.make_jaxpr(lambda *a: fused(*a, **kw))(prev, weight, down, up, inject).jaxpr
+
+
+def _kernel_names(jaxpr):
+    """pallas_call kernel names (interpret-mode lowerings carry none, so read the jaxpr)."""
+    names = []
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "pallas_call":
+            info = eqn.params.get("name_and_src_info", eqn.params.get("name", ""))
+            name = getattr(info, "name", None)
+            if not isinstance(name, str):
+                found = re.search(r"qwen4exp_hc_prefill\w*", str(info) or str(eqn.params))
+                name = found.group(0) if found else "?"
+            names.append(name)
+        for sub in _subjaxprs(eqn):
+            names += _kernel_names(sub)
+    return names
 
 
 def test_reread_engagement_and_prologue_only():
     rows = 3 * TILE
-    plain = _lowered_text(rows, prologue=True)
-    rr = _lowered_text(rows, prologue=True, reread=True)
-    assert "qwen4exp_hc_prefill_combine_inj_m256_rr" in rr
-    assert "_rr" not in plain and plain != rr
+    plain = _jaxpr(rows, prologue=True)
+    rr = _jaxpr(rows, prologue=True, reread=True)
+    assert _kernel_names(rr) == ["qwen4exp_hc_prefill_combine_inj_m256_rr"], _kernel_names(rr)
+    assert _kernel_names(plain) == ["qwen4exp_hc_prefill_combine_inj_m256"], _kernel_names(plain)
+    assert str(plain) != str(rr)
     # Without a prologue there is nothing to read back: same program, same name.
-    assert _lowered_text(rows, reread=True) == _lowered_text(rows)
+    assert str(_jaxpr(rows, reread=True)) == str(_jaxpr(rows))
+    assert _kernel_names(_jaxpr(rows, reread=True)) == ["qwen4exp_hc_prefill_inj_m256"]
 
 
 @pytest.mark.parametrize("prologue", [False, True])
@@ -184,11 +203,9 @@ def test_down_asm_engagement(prologue):
     assert ext in _concat_shapes(run(False))
     shapes = _concat_shapes(run(True))
     assert ext not in shapes and (16, WIDTH) in shapes, shapes
-    text = jax.jit(lambda *a: fused(*a, down_asm=True, **kw)).lower(
-        prev, weight, down, up, inject
-    ).as_text()
-    name = f"qwen4exp_hc_prefill{'_combine' if prologue else ''}_inj_m256_da"
-    assert name in text, name
+    name = f"qwen4exp_hc_prefill{'_combine' if prologue else ''}_inj_m256"
+    assert _kernel_names(run(True)) == [name + "_da"], _kernel_names(run(True))
+    assert _kernel_names(run(False)) == [name], _kernel_names(run(False))
 
 
 def test_down_asm_rejects_unaligned_low_rank():
