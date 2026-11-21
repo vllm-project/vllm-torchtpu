@@ -55,6 +55,13 @@ _ACTIVATIONS = ("silu", "swigluoai")
 # Rows of the in-kernel token buffer: bf16 MXU operands pack 16 sublanes.
 _ROW_ALIGN = 16
 _SHARED_K_BLOCK = 128
+# Output columns per shared-expert down-projection block in sparse mode
+# (bounds its f32 temporary).
+_SHARED_COLS = 512
+# Rows per block of the sparse mode's f32 token copy.
+_TOKEN_COPY_ROWS = 64
+# Sparse mode groups tokens by expert on one vreg's lanes (`_group_by_expert`).
+_SPARSE_MAX_EXPERTS = 128
 # MiniMax-M3's shared-expert SwiGLU-OAI clamp and sigmoid scale (1.702 in
 # bf16); dense_fp4_shared admits only shared experts with these values.
 _SWIGLU_LIMIT = 7.0
@@ -207,6 +214,7 @@ def can_use_dense_expert_fp4(
         or min(m, h, i, e) <= 0
         or h % _QUANT_BLOCK
         or not _shared_ok(shared, h, activation)
+        or (sparse_rows and e > _SPARSE_MAX_EXPERTS)
     ):
         return False
     if s1.shape != (e, h // _QUANT_BLOCK, 1, 2 * i) or s2.shape != (
@@ -239,17 +247,76 @@ def _vmem_bytes(
     """VMEM of one call: the weight ring (VMEM holds fp4 one byte per
     element), its scales, the shared expert's weights, the token-sized scratch
     and the compiler's temporaries (tpu7x AOT compiles: ~16 bytes per token
-    element when a unit evaluates every token; with ``sparse``, ~8 for the
-    gather/scatter products plus 16 per element of one 16-row tile, fitted
-    at 64-256 rows). Whole-expert units hold gate|up in one ring, so the
-    bytes are the same in both modes."""
+    element when a unit evaluates every token). With ``sparse`` the token
+    scratch is the bf16 input and output, f32 tokens, expert output and sum,
+    and the temporaries are a few 16-row tiles plus the shared expert's
+    column blocks. Whole-expert units hold gate|up in one ring, so the bytes
+    are the same in both modes."""
     weights = 3 * h * chunk
     scales = (2 * (h // _QUANT_BLOCK) * chunk + (chunk // _QUANT_BLOCK) * h) * 4
     mp = m + (-m % _ROW_ALIGN)
-    scratch = 2 + 4 + 4 + 2 + (2 if i_s else 0) + (2 if sparse else 0)
-    temporaries = (8 * mp + 16 * _ROW_ALIGN) if sparse else 16 * mp
-    tokens = mp * h * scratch + temporaries * h
+    if sparse:
+        tokens = mp * h * (2 + 4 + 4 + 4 + 2) + 16 * _ROW_ALIGN * h
+        # Temporaries live one phase at a time: `_group_by_expert`'s (the
+        # triangular matrix, the one-hot, pos and hit), then the shared
+        # expert's column blocks.
+        width = mp + (-mp % _SPARSE_MAX_EXPERTS)
+        grouping = mp * mp * 2 + mp * width * 6 + mp * _SPARSE_MAX_EXPERTS * 8
+        tokens += max(grouping, mp * (2 * i_s + _SHARED_COLS) * 4 * 2)
+        return slots * (weights + scales) + 3 * h * i_s + tokens
+    scratch = 2 + 4 + 4 + 2 + (2 if i_s else 0)
+    tokens = mp * h * scratch + 16 * mp * h
     return slots * (weights + scales) + 3 * h * i_s + tokens
+
+
+def _group_by_expert(id_cols, m, mp, experts, stage, smem, sem):
+    """Each local expert's tokens, ascending, without a scalar loop over the
+    routes: ``smem[e, k]`` the k-th token routing to expert e and
+    ``smem[experts, e]`` their count (a token naming e twice counts once).
+    ``stage`` is the [rows, width] int32 VMEM it is built in."""
+    f32, bf16 = jnp.float32, jnp.bfloat16
+    lanes = _SPARSE_MAX_EXPERTS
+    width = stage.shape[1]
+    columns = lax.broadcasted_iota(jnp.int32, (m, lanes), 1)
+    hit = jnp.zeros((m, lanes), jnp.bool_)
+    for col in id_cols:
+        hit |= (col == columns) & (col >= 0) & (col < experts)
+    hit = hit.astype(f32)
+    if mp != m:
+        hit = jnp.concatenate([hit, jnp.zeros((mp - m, lanes), f32)], 0)
+    # Position of each token among its expert's tokens: a strictly
+    # lower-triangular ones matrix sums the earlier rows (exact in f32).
+    row = lax.broadcasted_iota(jnp.int32, (mp, mp), 0)
+    earlier = (lax.broadcasted_iota(jnp.int32, (mp, mp), 1) < row).astype(bf16)
+    pos = jnp.dot(earlier, hit.astype(bf16), preferred_element_type=f32)
+    counts = jnp.sum(hit, axis=0, keepdims=True)  # [1, lanes]
+    slots = lax.broadcasted_iota(jnp.int32, (mp, width), 1).astype(f32)
+    tokens = lax.broadcasted_iota(jnp.int32, (8, mp), 1)
+    # Token ids as two bf16-exact parts (ids above 256 are not bf16-exact).
+    sub = lax.broadcasted_iota(jnp.int32, (8, mp), 0)
+    parts = jnp.where(sub == 0, tokens // 16, jnp.where(sub == 1, tokens % 16, 0))
+    parts = parts.astype(bf16)
+    expert_lanes = lax.broadcasted_iota(jnp.int32, (1, lanes), 1)
+
+    def per_expert(e, carry):
+        sel = expert_lanes == e
+        pos_e = jnp.sum(jnp.where(sel, pos, 0), axis=1, keepdims=True)  # [mp, 1]
+        hit_e = jnp.sum(jnp.where(sel, hit, 0), axis=1, keepdims=True)
+        onehot = ((pos_e == slots) & (hit_e > 0)).astype(bf16)  # [mp, width]
+        r = jnp.dot(parts, onehot, preferred_element_type=f32)
+        stage[pl.ds(e, 1), :] = (16 * r[0:1] + r[1:2]).astype(jnp.int32)
+        return carry
+
+    lax.fori_loop(0, experts, per_expert, 0)
+    count_row = counts.astype(jnp.int32)
+    if width > lanes:
+        count_row = jnp.concatenate(
+            [count_row, jnp.zeros((1, width - lanes), jnp.int32)], 1
+        )
+    stage[experts : experts + 1, :] = count_row[:, :width]
+    copy = pltpu.make_async_copy(stage, smem, sem.at[0])
+    copy.start()
+    copy.wait()
 
 
 def _kernel(
@@ -285,7 +352,8 @@ def _kernel(
         sg_ref,
         su_ref,
         sd_ref,
-        x_pad_ref,  # VMEM [mp, h] bf16: the tokens, padded with zero rows
+        x_pad_ref,  # VMEM [mp, h] bf16: the tokens, padded with zero rows (sparse:
+        # f32, non-finite values zeroed, for single-row gathers)
         coeff_ref,  # VMEM [mp, E_pad] f32: each token's weight per local expert
         expert_acc_ref,  # VMEM [mp, h] f32: the current expert's down projection
         acc_ref,  # VMEM [mp, h] f32: the routing-weighted sum
@@ -296,9 +364,9 @@ def _kernel(
     ) = refs
     shared_scratch = extra_scratch[:5] if i_s else ()
     if sparse:
-        # SMEM [E] routes per local expert, [E + 1] their offsets, [m * k] the
-        # routes' tokens grouped by expert; VMEM [mp, h] bf16 the gathered rows.
-        counts_ref, offs_ref, sorted_ref, xs_ref = extra_scratch[
+        # `_group_by_expert`'s VMEM staging, its SMEM copy and DMA semaphore;
+        # VMEM [16, h] f32 one tile's rows.
+        group_vmem, sorted_ref, group_sem, rows_ref = extra_scratch[
             len(shared_scratch) : len(shared_scratch) + 4
         ]
     if route is not None:
@@ -329,8 +397,6 @@ def _kernel(
 
     def clear(e, carry):
         active_ref[e] = 0
-        if sparse:
-            counts_ref[e] = 0
         return carry
 
     lax.fori_loop(0, experts, clear, 0)
@@ -373,15 +439,6 @@ def _kernel(
 
     routes = m * topk
 
-    def first_route(r, e):
-        """No earlier route of r's token names e (each token adds an expert's
-        output once, weighted by its summed coefficient)."""
-        first = True
-        for back in range(1, topk):
-            earlier = jnp.maximum(r - back, 0)
-            first &= (back > r % topk) | (route_id(earlier) != e)
-        return first
-
     def mark(r, carry):
         e = route_id(r)
 
@@ -391,12 +448,19 @@ def _kernel(
             active_ref[e] = active_ref[e] | jnp.where(
                 r // topk >= _ROW_ALIGN, 2, 1
             ).astype(jnp.int32)
-            if sparse:
-                counts_ref[e] += first_route(r, e).astype(jnp.int32)
 
         return carry
 
-    lax.fori_loop(0, routes, mark, 0)
+    if sparse:
+        _group_by_expert(id_cols, m, mp, experts, group_vmem, sorted_ref, group_sem)
+
+        def mark_counts(e, carry):
+            active_ref[e] = sorted_ref[experts, e]
+            return carry
+
+        lax.fori_loop(0, experts, mark_counts, 0)
+    else:
+        lax.fori_loop(0, routes, mark, 0)
 
     def compact(e, count):
         @pl.when(active_ref[e] != 0)
@@ -451,37 +515,12 @@ def _kernel(
             for copy in transfers(jnp.int32(initial)):
                 copy.start()
 
-    if sparse:
-        # Group the routes' tokens by local expert (a counting sort) while the
-        # first weight copies fly; counts_ref becomes each expert's cursor.
-        offs_ref[0] = 0
-
-        def offsets(e, carry):
-            offs_ref[e + 1] = offs_ref[e] + counts_ref[e]
-            counts_ref[e] = offs_ref[e]
-            return carry
-
-        lax.fori_loop(0, experts, offsets, 0)
-
-        def place(r, carry):
-            e = route_id(r)
-
-            @pl.when((e >= 0) & (e < experts) & first_route(r, e))
-            def local():
-                sorted_ref[counts_ref[e]] = r // topk
-                counts_ref[e] += 1
-
-            return carry
-
-        lax.fori_loop(0, routes, place, 0)
-
     # Token-side setup overlaps the first weight copies.
     def pad_rows(v):
         if mp == m:
             return v
         return jnp.concatenate([v, jnp.zeros((mp - m, v.shape[1]), v.dtype)], 0)
 
-    x = pad_rows(x_ref[...].astype(f32))
     expert_columns = lax.broadcasted_iota(jnp.int32, (m, coeff_ref.shape[1]), 1)
     coeff = jnp.zeros((m, coeff_ref.shape[1]), f32)
     for col, w in zip(id_cols, tw_cols):
@@ -490,34 +529,77 @@ def _kernel(
         coeff += jnp.where(col == expert_columns, w, 0)
     coeff_ref[...] = pad_rows(coeff)
     acc_ref[...] = jnp.zeros_like(acc_ref)
-    if i_s:
-        # The shared expert sees the tokens as given, the routed experts with
-        # non-finite values zeroed (as the GMM path's one-hot permute does).
-        x_pad_ref[...] = x.astype(jnp.bfloat16)
-        for copy in shared_copies:
-            copy.wait()
-        xs = x_pad_ref[...]
 
-        def matmul(lhs, w_ref):
-            # K blocks keep the MXU operands' temporaries small.
-            y = jnp.zeros((mp, w_ref.shape[1]), f32)
-            for k in range(0, w_ref.shape[0], _SHARED_K_BLOCK):
-                y += jnp.matmul(
-                    lhs[:, k : k + _SHARED_K_BLOCK],
-                    w_ref[k : k + _SHARED_K_BLOCK, :],
-                    preferred_element_type=f32,
-                )
-            return y
+    def matmul(lhs, w_ref, rows):
+        """``lhs(k)``: the [rows, 128] K block k of the left operand; K blocks
+        keep the MXU operands' temporaries small."""
+        y = jnp.zeros((rows, w_ref.shape[1]), f32)
+        for k in range(0, w_ref.shape[0], _SHARED_K_BLOCK):
+            y += jnp.matmul(
+                lhs(k), w_ref[k : k + _SHARED_K_BLOCK, :], preferred_element_type=f32
+            )
+        return y
 
-        def projection(lhs, w_ref, scale):
-            y = matmul(lhs, w_ref).astype(jnp.bfloat16).astype(f32) * scale
-            return y.astype(jnp.bfloat16)
+    def projection(lhs, w_ref, scale, rows):
+        y = matmul(lhs, w_ref, rows).astype(jnp.bfloat16).astype(f32) * scale
+        return y.astype(jnp.bfloat16)
 
-        gate = projection(xs, swg_ref, ss1_ref[:, :i_s]).astype(f32)
-        up = projection(xs, swu_ref, ss1_ref[:, i_s:]).astype(f32)
-        act = shared_activation(gate, up).astype(jnp.bfloat16)
-        shared_out_ref[...] = projection(act, swd_ref, ss2_ref[...])
-    x_pad_ref[...] = jnp.where(jnp.isfinite(x), x, 0).astype(jnp.bfloat16)
+    if sparse:
+        # f32 tokens (single rows load only from 32-bit refs), written in row
+        # blocks so no [mp, h] temporary exists.
+        for r0 in range(0, mp, _TOKEN_COPY_ROWS):
+            r1 = min(r0 + _TOKEN_COPY_ROWS, mp)
+            if r0 >= m:
+                x_pad_ref[r0:r1, :] = jnp.zeros((r1 - r0, h), f32)
+                continue
+            v = x_ref[r0 : min(r1, m), :].astype(f32)
+            x_pad_ref[r0 : min(r1, m), :] = jnp.where(jnp.isfinite(v), v, 0)
+            if r1 > m:
+                x_pad_ref[m:r1, :] = jnp.zeros((r1 - m, h), f32)
+        if i_s:
+            # The shared expert, on the tokens as given, goes to the output
+            # now; the routed sum is added to it at the end.
+            for copy in shared_copies:
+                copy.wait()
+
+            def x_block(k):
+                return x_ref[:, k : k + _SHARED_K_BLOCK]
+
+            gate = projection(x_block, swg_ref, ss1_ref[:, :i_s], m).astype(f32)
+            up = projection(x_block, swu_ref, ss1_ref[:, i_s:], m).astype(f32)
+            act = shared_activation(gate, up).astype(jnp.bfloat16)
+
+            def act_block(k):
+                return act[:, k : k + _SHARED_K_BLOCK]
+
+            for c0 in range(0, h, _SHARED_COLS):
+                cols = slice(c0, min(c0 + _SHARED_COLS, h))
+                y = matmul(act_block, swd_ref.at[:, cols], m)
+                y = y.astype(jnp.bfloat16).astype(f32) * ss2_ref[:, cols]
+                out_ref[:, cols] = y.astype(jnp.bfloat16)
+    else:
+        x = pad_rows(x_ref[...].astype(f32))
+        if i_s:
+            # The shared expert sees the tokens as given, the routed experts
+            # with non-finite values zeroed (as the GMM path's one-hot permute
+            # does).
+            x_pad_ref[...] = x.astype(jnp.bfloat16)
+            for copy in shared_copies:
+                copy.wait()
+            xs = x_pad_ref[...]
+
+            def xs_block(k):
+                return xs[:, k : k + _SHARED_K_BLOCK]
+
+            gate = projection(xs_block, swg_ref, ss1_ref[:, :i_s], mp).astype(f32)
+            up = projection(xs_block, swu_ref, ss1_ref[:, i_s:], mp).astype(f32)
+            act = shared_activation(gate, up).astype(jnp.bfloat16)
+
+            def act_block(k):
+                return act[:, k : k + _SHARED_K_BLOCK]
+
+            shared_out_ref[...] = projection(act_block, swd_ref, ss2_ref[...], mp)
+        x_pad_ref[...] = jnp.where(jnp.isfinite(x), x, 0).astype(jnp.bfloat16)
 
     def expert_mlp(x, slot):
         """The unit's gate, up and down columns on rows ``x``: f32 [rows, h]."""
@@ -570,88 +652,60 @@ def _kernel(
         return down
 
     tile = _ROW_ALIGN
-    tile_rows = lax.broadcasted_iota(jnp.int32, (tile, 1), 0)
-    tile_lanes = lax.broadcasted_iota(jnp.int32, (1, tile), 1)
-
-    def tile_tokens(begin, end):
-        """The tokens of routes [begin, begin + tile) (-1 at or past ``end``),
-        as a [tile, 1] column and a [1, tile] row."""
-        col = jnp.full((tile, 1), -1, jnp.int32)
-        row = jnp.full((1, tile), -1, jnp.int32)
-        for j in range(tile):
-            r = begin + j
-            tok = jnp.where(r < end, sorted_ref[jnp.minimum(r, routes - 1)], -1)
-            col = jnp.where(tile_rows == j, tok, col)
-            row = jnp.where(tile_lanes == j, tok, row)
-        return col, row
+    expert_lanes = lax.broadcasted_iota(jnp.int32, (1, coeff_ref.shape[1]), 1)
 
     def compute_sparse(unit):
+        """The unit on its expert's routes only, 16 rows at a time: each tile's
+        rows load and its weighted outputs add back one token row at a time,
+        so the cost does not grow with the step's token count."""
         slot = unit % slots
         c = unit % num_chunks
         e = active_ids_ref[unit // num_chunks]
-        begin, end = offs_ref[e], offs_ref[e + 1]
-        tiles = (end - begin + tile - 1) // tile
-
-        def rows_at(t):
-            return pl.ds(pl.multiple_of(t * tile, tile), tile)
-
-        @pl.when(c == 0)
-        def gather():
-            # One-hot products: exact copies of the expert's token rows.
-            def body(t, carry):
-                col, _ = tile_tokens(begin + t * tile, end)
-                lanes = lax.broadcasted_iota(jnp.int32, (tile, mp), 1)
-                onehot = (col == lanes).astype(jnp.bfloat16)
-                xs_ref[rows_at(t), :] = jnp.dot(
-                    onehot, x_pad_ref[...], preferred_element_type=f32
-                ).astype(jnp.bfloat16)
-                return carry
-
-            lax.fori_loop(0, tiles, body, 0)
+        end = sorted_ref[experts, e]
+        tiles = (end + tile - 1) // tile
 
         def run(t, carry):
-            down = expert_mlp(xs_ref[rows_at(t), :], slot)
+            base = t * tile
+            rows = pl.ds(pl.multiple_of(t * tile, tile), tile)
+            for j in range(tile):
+                # Rows past the expert's routes repeat a real token; their
+                # outputs are never added.
+                tok = sorted_ref[e, jnp.minimum(base + j, end - 1)]
+                rows_ref[j : j + 1, :] = x_pad_ref[pl.ds(tok, 1), :]
+            down = expert_mlp(rows_ref[...].astype(jnp.bfloat16), slot)
 
             @pl.when(c == 0)
             def first():
-                expert_acc_ref[rows_at(t), :] = down
+                expert_acc_ref[rows, :] = down
 
             @pl.when(c > 0)
             def rest():
-                expert_acc_ref[rows_at(t), :] += down
+                expert_acc_ref[rows, :] += down
+
+            @pl.when(c == num_chunks - 1)
+            def finish():
+                # The expert's output rounds to bf16 before its routing weight
+                # (the GMM path's rounding); a non-finite one is dropped.
+                # (isfinite takes f32 in Mosaic: test the bf16 round trip.)
+                out_e = expert_acc_ref[rows, :].astype(jnp.bfloat16).astype(f32)
+                out_e = jnp.where(jnp.isfinite(out_e), out_e, 0)
+                for j in range(tile):
+
+                    @pl.when(base + j < end)
+                    def add(j=j):
+                        tok = sorted_ref[e, base + j]
+                        coeff = jnp.sum(
+                            jnp.where(
+                                expert_lanes == e, coeff_ref[pl.ds(tok, 1), :], 0
+                            ),
+                            axis=1,
+                            keepdims=True,
+                        )
+                        acc_ref[pl.ds(tok, 1), :] += coeff * out_e[j : j + 1, :]
 
             return carry
 
         lax.fori_loop(0, tiles, run, 0)
-
-        @pl.when(c == num_chunks - 1)
-        def finish():
-            columns = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
-            coeff = jnp.sum(
-                jnp.where(columns == e, coeff_ref[...], 0), axis=1, keepdims=True
-            )
-            token_rows = lax.broadcasted_iota(jnp.int32, (mp, tile), 0)
-
-            def body(t, carry):
-                _, row = tile_tokens(begin + t * tile, end)
-                weights = jnp.where(token_rows == row, coeff, 0)  # [mp, tile]
-                # The product spans every token: keep a non-finite bf16 expert
-                # output from turning other tokens' rows into NaN (0 * inf).
-                # (isfinite takes f32 in Mosaic: test the bf16 round trip.)
-                out_e = expert_acc_ref[rows_at(t), :]
-                out_e = out_e.astype(jnp.bfloat16).astype(f32)
-                out_e = jnp.where(jnp.isfinite(out_e), out_e, 0).astype(jnp.bfloat16)
-                # One route per (token, row), so each output element is one
-                # product: two bf16 passes carry a bf16 routing weight exactly
-                # (an f32 one to 16 bits).
-                hi = weights.astype(jnp.bfloat16)
-                lo = (weights - hi.astype(f32)).astype(jnp.bfloat16)
-                acc_ref[...] += jnp.dot(
-                    hi, out_e, preferred_element_type=f32
-                ) + jnp.dot(lo, out_e, preferred_element_type=f32)
-                return carry
-
-            lax.fori_loop(0, tiles, body, 0)
 
     def compute(unit):
         if sparse:
@@ -712,6 +766,16 @@ def _kernel(
 
     lax.fori_loop(0, units, body, 0)
 
+    if sparse:
+        # Column blocks: no [m, h] temporary.
+        for c0 in range(0, h, _SHARED_COLS):
+            cols = slice(c0, min(c0 + _SHARED_COLS, h))
+            out = acc_ref[:m, cols]
+            if i_s:
+                routed = out.astype(out_ref.dtype).astype(f32)
+                out = routed + out_ref[:, cols].astype(f32)
+            out_ref[:, cols] = out.astype(out_ref.dtype)
+        return
     out = acc_ref[:m, :]
     if i_s:
         routed = out.astype(out_ref.dtype).astype(f32)
@@ -787,18 +851,19 @@ def dense_expert_moe_fp4(
             pltpu.VMEM((h, i_s), shared.w1.dtype),
             pltpu.VMEM((h, i_s), shared.w1.dtype),
             pltpu.VMEM((i_s, h), shared.w2.dtype),
-            pltpu.VMEM((mp, h), jnp.bfloat16),
+            # Sparse mode stages the shared expert's output in the output.
+            pltpu.VMEM((8, 128) if sparse_rows else (mp, h), jnp.bfloat16),
             pltpu.SemaphoreType.DMA((3,)),
         ]
     sparse_scratch = []
     if sparse_rows:
+        # `_group_by_expert`: rows 0..experts-1 the tokens, row experts the counts.
+        group_shape = (experts + 1 + (-(experts + 1)) % 8, max(-(-mp // lanes), 1) * lanes)
         sparse_scratch = [
-            pltpu.SMEM((experts,), jnp.int32),
-            pltpu.SMEM((experts + 1,), jnp.int32),
-            pltpu.SMEM(
-                (mk * (route.topk if route else local_ids.shape[1]),), jnp.int32
-            ),
-            pltpu.VMEM((mp, h), jnp.bfloat16),
+            pltpu.VMEM(group_shape, jnp.int32),
+            pltpu.SMEM(group_shape, jnp.int32),
+            pltpu.SemaphoreType.DMA((1,)),
+            pltpu.VMEM((_ROW_ALIGN, h), jnp.float32),
         ]
     route_scratch = []
     if route is not None:
@@ -837,7 +902,7 @@ def dense_expert_moe_fp4(
                     jnp.float32,
                 ),
                 pltpu.VMEM((slots, chunk // _QUANT_BLOCK, 1, h), jnp.float32),
-                pltpu.VMEM((mp, h), jnp.bfloat16),
+                pltpu.VMEM((mp, h), jnp.float32 if sparse_rows else jnp.bfloat16),
                 pltpu.VMEM((mp, experts + (-experts) % lanes), jnp.float32),
                 pltpu.VMEM((mp, h), jnp.float32),
                 pltpu.VMEM((mp, h), jnp.float32),
