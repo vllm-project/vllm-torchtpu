@@ -13,6 +13,7 @@
 # limitations under the License.
 """CPU unit tests for Qwen3.5 TP8_EP export optimization wiring."""
 
+import json
 from types import SimpleNamespace
 from unittest import mock
 
@@ -72,6 +73,53 @@ def test_hoisted_norm_weights_stay_out_of_constant_names() -> None:
             delattr(GemmaRMSNorm, "_tpu_weight_plus_one")
         if hasattr(GemmaRMSNorm, "_tpu_norm_weight_hoisted"):
             delattr(GemmaRMSNorm, "_tpu_norm_weight_hoisted")
+
+
+def test_lowtok_hot1h_buffer_stays_out_of_constant_names() -> None:
+    class _Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer(
+                "_lowtok_hot1h",
+                torch.zeros((512, 128), dtype=torch.bfloat16),
+                persistent=False,
+            )
+
+    adapter = _make_adapter(_Model())
+    constants = adapter.constant_names()
+    assert "_lowtok_hot1h" not in constants
+    params = adapter.abstract_params()
+    assert "_lowtok_hot1h" in params
+
+
+def test_fused_moe_v3_dispatch_passes_unsliced_weights_when_copies_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_torchtpu.layers.adapter.quantization import fused_moe_ep_v3_dispatch
+
+    seen_shapes: list[tuple[int, ...]] = []
+    monkeypatch.setattr(
+        fused_moe_ep_v3_dispatch,
+        "fused_moe_ep_v3",
+        lambda _m, x, w1, *_a: seen_shapes.append(tuple(w1.shape)) or x,
+    )
+    method = SimpleNamespace(_fused_moe_ep_v3_op=SimpleNamespace(step_min_tokens=33))
+    w1 = torch.empty(80, 16, 32)
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(is_sequence_parallel=False)
+        ),
+        w13_weight=w1,
+        w2_weight=torch.empty(80, 16, 16),
+        w13_weight_scale_inv=torch.empty(80, 1, 1, 32),
+        w2_weight_scale_inv=torch.empty(80, 1, 1, 16),
+        _experts_start=None,
+        _tpu_owned_experts=64,
+    )
+    fused_moe_ep_v3_dispatch.apply(
+        method, layer, torch.ones(64, 16), torch.ones(64, 8), lambda *_a: None
+    )
+    assert seen_shapes == [(80, 16, 32)]
 
 
 def test_small_all_reduce_export_context_and_buffer(
@@ -325,3 +373,151 @@ def test_adapter_constant_names_includes_lowtok_copies_buffers() -> None:
         "layer._lowtok_copy",
     } <= names
     assert "layer.w13_weight" not in names
+
+
+def test_export_emits_sample_greedy_when_enabled(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vllm_torchtpu.experimental.export import (
+        api,
+        exporter,
+        sampling,
+        tpu_lowering,
+        validator,
+    )
+
+    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "v6e-8")
+    monkeypatch.setenv("TPU_GREEDY_TOP_TOKENS", "1")
+    seen_modules: list[str] = []
+
+    def _fmt_tensor(shape: tuple[int, ...], dt: object) -> str:
+        c = validator.canonical_dtype(tpu_lowering.dtype_name(dt))
+        dims = "x".join(str(int(d)) for d in shape)
+        return f"tensor<{dims}x{c}>" if dims else f"tensor<{c}>"
+
+    def _fake_lower(
+        fn,
+        specs,
+        *,
+        donate_argnums=(),
+        module_name: str | None = None,
+        **_kw,
+    ) -> str:
+        if module_name is not None:
+            seen_modules.append(module_name)
+        donated = {int(i) for i in donate_argnums}
+        cpu_args = [
+            torch.zeros(
+                [int(d) for d in s.shape],
+                dtype=tpu_lowering.torch_dtype(s.dtype),
+                device="cpu",
+            )
+            for s in specs
+        ]
+        with torch.no_grad():
+            raw_out = fn(*cpu_args)
+        outs = (
+            [raw_out]
+            if isinstance(raw_out, torch.Tensor)
+            else [t for t in raw_out if isinstance(t, torch.Tensor)]
+        )
+        arg_strs = [
+            f"%arg{i}: {_fmt_tensor(tuple(s.shape), s.dtype)}"
+            + (" {jax.buffer_donor = true}" if i in donated else "")
+            for i, s in enumerate(specs)
+        ]
+        out_strs = [_fmt_tensor(tuple(t.shape), t.dtype) for t in outs]
+        ret_sig = f"({', '.join(out_strs)})" if len(out_strs) != 1 else out_strs[0]
+        body = [
+            f'    %r{i} = "stablehlo.optimization_barrier"(%arg{i}) : '
+            f"({_fmt_tensor(tuple(s.shape), s.dtype)}) -> "
+            f"{_fmt_tensor(tuple(s.shape), s.dtype)}"
+            for i, s in enumerate(specs)
+        ] + [
+            f"    %c{i} = stablehlo.constant dense<0> : {t}"
+            for i, t in enumerate(out_strs)
+        ]
+        rets = ", ".join(f"%c{i}" for i in range(len(out_strs)))
+        ret_line = (
+            f"    return {rets} : {', '.join(out_strs)}" if out_strs else "    return"
+        )
+        return "\n".join(
+            [
+                "module {",
+                f"  func.func public @main({', '.join(arg_strs)}) -> {ret_sig} {{",
+                *body,
+                ret_line,
+                "  }",
+                "}",
+                "",
+            ]
+        )
+
+    monkeypatch.setattr(tpu_lowering, "lower_torch_callable_to_mlir", _fake_lower)
+
+    class _Model:
+        pallas_interpret = False
+        export_config = api.TextOnlyLLMExportConfig(
+            model_name="tiny-greedy",
+            vocab_size=32,
+            hidden_size=16,
+            num_layers=1,
+            num_q_heads=2,
+            num_kv_heads=2,
+            head_dim=8,
+            block_size=8,
+            num_blocks=16,
+            max_num_seqs=4,
+            max_model_len=64,
+            eos_token_id=2,
+            dtype="bf16",
+            token_buckets=(4,),
+            req_buckets=(4,),
+            emit_byte_tokenizer=True,
+        )
+
+        def abstract_params(self):
+            return {
+                "model.embed_tokens.weight": api.ShapeDtypeStruct((32, 16), "bf16"),
+                "lm_head.weight": api.ShapeDtypeStruct((32, 16), "bf16"),
+            }
+
+        def forward(
+            self,
+            weights,
+            kv_caches,
+            *,
+            input_ids,
+            positions,
+            kv_lens,
+            block_tables,
+            query_start_loc,
+            req_dist,
+        ):
+            del positions, kv_lens, block_tables, query_start_loc, req_dist
+            emb = weights["model.embed_tokens.weight"]
+            return list(kv_caches), emb[input_ids % emb.shape[0]]
+
+        def compute_logits(self, h, w):
+            return h @ w.T
+
+        def greedy_tokens(self, h, w):
+            return torch.argmax(h @ w.T, dim=-1).to(torch.int32)
+
+        def sample_tokens(self, logits, **kw):
+            return sampling.dispatch_sample_tokens(logits, **kw)
+
+        def save_checkpoint(self, *_a, **_kw):
+            pass
+
+    out = tmp_path / "artifact"
+    exporter.export(_Model(), str(out))
+    meta = json.loads((out / "metadata.json").read_text())
+    assert "sample_greedy" in meta["functions"]
+    assert "sample_greedy_req4" in seen_modules
+    entry = meta["functions"]["sample_greedy"]["4"]
+    assert entry["file_path"].endswith("sample_greedy_req4.mlir")
+    assert [t["argument_type"] for t in entry["inputs"]] == ["intermediate", "weight"]
+    assert entry["outputs"][0]["shape"] == [4, 1]
+    assert entry["outputs"][0]["dtype"] == "i64"
+    assert entry["outputs"][0]["argument_type"] == "user_io"

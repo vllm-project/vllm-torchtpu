@@ -302,20 +302,29 @@ def test_copies_placement_registers_non_persistent_buffers_and_arms_copies_op(
         op = scores.prebuild(method(), layer, "silu")
         assert op is not None
         buf_names = dict(layer.named_buffers())
-        assert {"_lowtok_tables", "_lowtok_prim", "_lowtok_copy"} <= set(buf_names)
+        assert {
+            "_lowtok_tables",
+            "_lowtok_prim",
+            "_lowtok_copy",
+            "_lowtok_hot1h",
+        } <= set(buf_names)
         assert not (
-            {"_lowtok_tables", "_lowtok_prim", "_lowtok_copy"} & set(layer.state_dict())
+            {"_lowtok_tables", "_lowtok_prim", "_lowtok_copy", "_lowtok_hot1h"}
+            & set(layer.state_dict())
         )
         assert layer._lowtok_tables.numel() <= 4096
+        assert layer._lowtok_hot1h.shape == (128, 128)
+        assert layer._lowtok_hot1h.dtype == torch.bfloat16
 
         mock_op = Mock(return_value="copies_out")
         x = torch.randn(3, 512, dtype=torch.bfloat16)
         logits = torch.randn(3, 8, dtype=torch.bfloat16)
         assert scores.apply(mock_op, layer, x, logits) == "copies_out"
-        assert mock_op.call_args.args[2:5] == (
+        assert mock_op.call_args.args[2:6] == (
             layer._lowtok_tables,
             layer._lowtok_prim,
             layer._lowtok_copy,
+            layer._lowtok_hot1h,
         )
 
         # Prefill / >128 grouped paths must slice weights to owned primaries [:4].
@@ -459,6 +468,7 @@ def test_arm_copies_tables_drive_non_zero_rank_in_kernel_scores(tmp_path, monkey
                 owned=placement.owned,
                 has_copies=True,
                 tables=jnp.asarray(layer._lowtok_tables.numpy()),
+                hot1h=jnp.asarray(layer._lowtok_hot1h.float().numpy(), jnp.bfloat16),
             )
             total += np.asarray(part, np.float64)
 

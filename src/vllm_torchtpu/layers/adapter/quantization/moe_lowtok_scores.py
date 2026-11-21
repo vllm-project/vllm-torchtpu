@@ -207,6 +207,7 @@ def _build_copies_op(topk: int, ranks: int, owned: int) -> torch.library.CustomO
         tables: jax.Array,
         prim: jax.Array,
         copy: jax.Array,
+        hot1h: jax.Array,
         w13: jax.Array,
         w2: jax.Array,
         w13_scale: jax.Array,
@@ -228,6 +229,7 @@ def _build_copies_op(topk: int, ranks: int, owned: int) -> torch.library.CustomO
             owned=owned,
             has_copies=True,
             tables=tables,
+            hot1h=hot1h,
         )
 
     op = jax_op(f"pallas::moe_lowtok_scores_copies_k{topk}_r{ranks}_o{owned}", moe)
@@ -262,6 +264,10 @@ def _arm_copies(
         np.asarray(hcopy, np.int32),
         np.asarray(slot, np.int32),
     )
+    hot_np = np.asarray(hot, np.int32).reshape(-1)
+    hot1h_np = np.zeros((lanes, HOT_SLOTS), dtype=np.float32)
+    valid = (hot_np >= 0) & (hot_np < lanes)
+    hot1h_np[hot_np[valid], np.arange(hot_np.size)[valid]] = 1.0
     w13: Any = layer.w13_weight
     device: torch.device = w13.device
     layer.register_buffer(
@@ -277,6 +283,11 @@ def _arm_copies(
     layer.register_buffer(
         "_lowtok_copy",
         torch.as_tensor(np.asarray(copy, dtype=np.int32)).to(device),
+        persistent=False,
+    )
+    layer.register_buffer(
+        "_lowtok_hot1h",
+        torch.from_numpy(hot1h_np).to(dtype=torch.bfloat16, device=device),
         persistent=False,
     )
     return _build_copies_op(
@@ -390,6 +401,7 @@ def apply(
             layer._lowtok_tables,
             layer._lowtok_prim,
             layer._lowtok_copy,
+            layer._lowtok_hot1h,
             layer.w13_weight,
             layer.w2_weight,
             layer.w13_weight_scale_inv,

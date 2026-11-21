@@ -1414,13 +1414,15 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
     def constant_names(self) -> set[str]:
         """Names in `abstract_params()` that are buffers rather than parameters."""
         params = {name for name, _ in self._model.named_parameters()}
-        # Hoisted norm weights (`_tpu_weight_plus_one`) have hidden_size floats
-        # per layer; keep them as replicated checkpoint weights instead of inline
+        # Hoisted norm weights (`_tpu_weight_plus_one`) and precomputed hot1h
+        # gather tables (`_lowtok_hot1h`) exceed the inline constant cap per
+        # layer; keep them as replicated checkpoint weights instead of inline
         # metadata constants.
         return {
             name
             for name in self._buffers()
-            if name not in params and name.rsplit(".", 1)[-1] != "_tpu_weight_plus_one"
+            if name not in params
+            and name.rsplit(".", 1)[-1] not in ("_tpu_weight_plus_one", "_lowtok_hot1h")
         }
 
     def constant_axis_values(self, name: str) -> list[Any]:

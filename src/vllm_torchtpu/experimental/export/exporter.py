@@ -27,7 +27,7 @@ import shutil
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from vllm_torchtpu import env_override
+from vllm_torchtpu import env_override, envs
 from vllm_torchtpu.experimental.export import (
     api,
     case_compose,
@@ -1064,6 +1064,53 @@ def _export_text_only_llm_functions(
         )
         for function, variant in samplers.items():
             sampler_variants.setdefault(function, {})[str(req_size)] = variant
+
+        # 3. Optional vocab-parallel greedy sampler bypassing full logits all-gather
+        greedy_fn = getattr(model, "greedy_tokens", None)
+        if envs.TPU_GREEDY_TOP_TOKENS and callable(greedy_fn):
+            import torch
+
+            def _greedy_entry(
+                hidden_states: Any, lm_head_w: Any, _fn: Any = greedy_fn
+            ) -> Any:
+                return _fn(hidden_states, lm_head_w).to(torch.int64).unsqueeze(-1)
+
+            greedy_mlir = tpu_lowering.lower_torch_callable_to_mlir(
+                _greedy_entry,
+                [hidden_spec, lm_head_struct],
+                module_name=f"sample_greedy_req{req_size}",
+            )
+            greedy_file = f"sample_greedy_req{req_size}.mlir"
+            greedy_rel = f"{subdir}/{greedy_file}" if subdir else greedy_file
+            with open(os.path.join(target_dir, greedy_file), "w") as f:
+                f.write(greedy_mlir)
+            sampler_variants.setdefault("sample_greedy", {})[str(req_size)] = {
+                "file_path": greedy_rel,
+                "subgraph_index": r_idx,
+                "compile_size": req_size,
+                "inputs": [
+                    _io_entry(
+                        arg_index=0,
+                        index=0,
+                        name="hidden_states",
+                        shape=[req_size, cfg.hidden_size],
+                        dtype=act_dtype_str,
+                        argument_type="intermediate",
+                    ),
+                    lm_head_entry,
+                ],
+                "outputs": [
+                    _io_entry(
+                        arg_index=0,
+                        index=0,
+                        name="tokens",
+                        shape=[req_size, 1],
+                        dtype="i64",
+                        argument_type="user_io",
+                        is_input=False,
+                    )
+                ],
+            }
 
     functions: dict[str, dict[str, Any]] = {
         "forward": forward_variants,
