@@ -683,32 +683,6 @@ def _spec_warmup_num_output_tokens(requests: Any, req_ids: list[str]) -> list[in
     return [len(requests[req_id].output_token_ids) for req_id in req_ids]
 
 
-def _order_prefills_and_publish_swaps(
-    runner: Any,
-    num_decode: int,
-    num_reqs: int,
-    scheduler_output: "SchedulerOutput",
-    spec_decode_tokens: Any,
-    *,
-    swapped: bool,
-) -> None:
-    """Finish `_reorder_batch_for_rpa`: apply the opt-in MLA order of the
-    prefill tail by KV length, then publish the step's swaps, if any.
-
-    `swap_states` queues each swap as a batch update that vLLM applies in
-    `InputBatch.refresh_metadata`, which `_update_states` already ran this
-    step, and the output's request-index snapshot is keyed on the old order.
-    """
-    if (
-        mla_dispatch.maybe_order_prefills_by_kv_len(
-            runner, num_decode, num_reqs, scheduler_output, spec_decode_tokens
-        )
-        or swapped
-    ):
-        runner._cached_output_req_ids_key = None
-        runner.input_batch.refresh_metadata()
-
-
 def _spec_warmup_all_token_ids(
     req_ids: list[str], num_computed_tokens: list[int]
 ) -> dict[str, list[int]]:
@@ -2133,8 +2107,7 @@ class TPUModelRunner(GPUModelRunner):
                 if seg == 0:
                     num_decode += 1
             if ordered:
-                _order_prefills_and_publish_swaps(
-                    self,
+                self._order_prefills_and_publish_swaps(
                     num_decode,
                     num_reqs,
                     scheduler_output,
@@ -2165,8 +2138,7 @@ class TPUModelRunner(GPUModelRunner):
                 else:
                     prev_seg = 2
             if ordered:
-                _order_prefills_and_publish_swaps(
-                    self,
+                self._order_prefills_and_publish_swaps(
                     num_decode,
                     num_reqs,
                     scheduler_output,
@@ -2228,8 +2200,7 @@ class TPUModelRunner(GPUModelRunner):
                 lambda r: scheduler_output.num_scheduled_tokens[r] == q_len,
             )
             self._num_static_verify_reqs = num_full - num_decode
-        _order_prefills_and_publish_swaps(
-            self,
+        self._order_prefills_and_publish_swaps(
             num_decode,
             num_reqs,
             scheduler_output,
@@ -2237,6 +2208,32 @@ class TPUModelRunner(GPUModelRunner):
             swapped=swapped,
         )
         return num_decode, num_windowed
+
+    def _order_prefills_and_publish_swaps(
+        self,
+        num_decode: int,
+        num_reqs: int,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_tokens: Any,
+        *,
+        swapped: bool,
+    ) -> None:
+        """Finish `_reorder_batch_for_rpa`: apply the opt-in MLA order of the
+        prefill tail by KV length, then publish the step's swaps, if any.
+
+        `swap_states` queues each swap as a batch update that vLLM applies in
+        `InputBatch.refresh_metadata`, which `_update_states` already ran this
+        step, and the output's request-index snapshot is keyed on the old
+        order.
+        """
+        if (
+            mla_dispatch.maybe_order_prefills_by_kv_len(
+                self, num_decode, num_reqs, scheduler_output, spec_decode_tokens
+            )
+            or swapped
+        ):
+            self._cached_output_req_ids_key = None
+            self.input_batch.refresh_metadata()
 
     def _build_attention_metadata(
         self,
@@ -3656,7 +3653,12 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 token_ids_cpu[req_idx, start_idx:end_tok_idx] = sampled_ids
 
-    _ZERO_PLACEHOLDERS: tuple[tuple[int, ...], ...] = tuple((0,) * k for k in range(33))
+    # Prebuilt output placeholders for a step's 1 + num_draft new tokens, up to
+    # 32 (1 bonus + 31 drafts); _update_placeholder builds longer runs itself.
+    _MAX_PREBUILT_PLACEHOLDERS = 32
+    _ZERO_PLACEHOLDERS: tuple[tuple[int, ...], ...] = tuple(
+        (0,) * k for k in range(_MAX_PREBUILT_PLACEHOLDERS + 1)
+    )
 
     def _update_placeholder(
         self,

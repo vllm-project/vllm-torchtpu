@@ -124,8 +124,9 @@ def _inside_sample_tokens(call) -> None:
 
 
 def _inside_execute_model(call) -> None:
-    """Run `call` where execute_model prepares a step's inputs, in the grad
-    mode serving gives it: inside TPUModelRunner.execute_model."""
+    """Run `call` at execute_model's first attribute read of the runner,
+    inside TPUModelRunner.execute_model. Only the grad mode is the serving
+    call site's; the step's inputs are not prepared."""
     with pytest.raises(_StepStopped):
         TPUModelRunner.execute_model(_EntryRunner(call), None)
 

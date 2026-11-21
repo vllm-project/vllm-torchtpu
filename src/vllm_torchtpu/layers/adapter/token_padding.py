@@ -54,8 +54,11 @@ class TokenPaddingState:
 
         Caches device-resident mask and valid-count tensors per
         ``(local_valid_tokens, local_padded_tokens)`` and skips rewriting
-        ``local_padding_mask`` when transitioning between unpadded sizes,
-        eliminating synchronous host-to-device copies on mixed-step transitions.
+        ``local_padding_mask`` when transitioning between unpadded sizes, so
+        repeated mixed-step transitions avoid host-to-device copies. A count
+        pair still uploads synchronously the first time it appears, and on
+        every appearance if it first appears after the mask cache's 128 entries
+        (256 for the valid counts) are full.
         """
         valid = int(local_valid_tokens)
         padded = int(local_padded_tokens)

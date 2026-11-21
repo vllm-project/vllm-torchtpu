@@ -188,6 +188,9 @@ def _make_runner(
         TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner)
     )
     runner._token_padding_update = TPUModelRunner._token_padding_update.__get__(runner)
+    runner._order_prefills_and_publish_swaps = (
+        TPUModelRunner._order_prefills_and_publish_swaps.__get__(runner)
+    )
     runner._prepare_async_token_substitution_indices = lambda *_args, **_kwargs: (
         np.array([], dtype=np.int32),
         np.array([], dtype=np.int32),
