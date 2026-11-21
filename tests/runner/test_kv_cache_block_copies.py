@@ -20,12 +20,12 @@ import pytest
 import torch
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 import vllm_torchtpu
 import vllm_torchtpu.runner.tpu_runner as runner_mod
 from vllm_torchtpu.runner.min_tokens import MinTokensTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_torchtpu.utils import tpu_bind_kv_cache
 
 

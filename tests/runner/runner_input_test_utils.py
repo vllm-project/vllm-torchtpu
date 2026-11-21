@@ -22,7 +22,6 @@ from vllm.config.reasoning import ReasoningConfig
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
@@ -31,6 +30,7 @@ from vllm_torchtpu.layers.core.sequence_layout import create_sequence_layout_pla
 from vllm_torchtpu.runner import min_tokens, repetition_penalty
 from vllm_torchtpu.runner.thinking_budget_tracker import ThinkingBudgetTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import CachedRequestState
 from vllm_torchtpu.structured_decoding.structured_decoding_manager import (
     StructuredDecodingManager,
 )

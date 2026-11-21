@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 import torch
 from vllm.v1.outputs import DraftTokenIds
-from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
+from vllm_torchtpu.runner.vllm_v1.spec_decode.ngram_proposer import NgramProposer
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
 if TYPE_CHECKING:
