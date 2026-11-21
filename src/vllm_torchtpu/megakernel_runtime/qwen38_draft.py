@@ -56,6 +56,7 @@ from .qwen38_wholestep_call import (
     QSA_TABLES,
     compressed_dcp,
     indexed_options,
+    log_mk_options,
     wholestep_tiles,
 )
 from .qwen38_wholestep_inputs import qsa_step_inputs
@@ -155,6 +156,7 @@ def build_draft_call(
         debug=DebugOptions(scopes=int(os.environ.get("VLLM_TPU_MK_SCOPES", "0") or 0)),
     )
     spec = draft_spec(g, R, budget=budget, max_groups=max_groups, vocab_shard=vocab_shard)
+    log_mk_options(B, spec, ex.tiles, label="MK draft")
     fn, k_specs, _, n_w = make_flat_segment_step(
         mesh, spec, ex, extra_outs=(KV_NEW, KR_NEW, IR_NEW, TOP)
     )
