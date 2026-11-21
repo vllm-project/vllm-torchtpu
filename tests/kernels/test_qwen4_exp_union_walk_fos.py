@@ -28,9 +28,10 @@ VARIANTS = {
     "fos2_lt": (dict(bf16_softmax=True, fos=2, lean_tile=True), "_rb_fos2_lt"),
     "rb_lt": (dict(bf16_softmax=True, lean_tile=True), "_rb_lt"),
 }
-# Smoke bar (not the bar of record): rel-L2 of the sampled rows vs float64 within max(8e-3, 2 x the served walk's). The
-# max-element metric is NOT used for the bound: on these near-uniform softmaxes it is set by the output's BF16 rounding at one
-# tiny element and reads the same for every variant (CEN1 j-ec0cfdbc NUM: 0.04140 for the served walk and all five variants).
+# Bar (PSTEP-LEAD, as locked for WALK-FOS): rel-L2 of the sampled rows vs float64 <= 8e-3, ABSOLUTE (never widened by the
+# served walk's own error, which is printed as a context row). The max-element metric is NOT used for the bound: on these
+# near-uniform softmaxes it is set by the output's BF16 rounding at one tiny element and reads the same for every variant
+# (CEN1 j-ec0cfdbc NUM: 0.04140 for the served walk and all five variants).
 SMOKE_RL2 = 8e-3
 
 
@@ -61,7 +62,8 @@ def test_variant_names_bound_and_engaged(kernels, name):
     print(f"PQFOS {name} rel_l2_vs_f64 {r_var:.6f} (served walk {r_base:.6f}); max_el {_err(step, out, rows, ref):.5f} "
           f"(served {_err(step, base, rows, ref):.5f}); elements differing from the served walk {diff:.4f}")
     assert diff > 0, "variant not engaged (bit for bit the served walk)"
-    assert r_var <= max(SMOKE_RL2, 2.0 * r_base), (name, r_var, r_base)
+    print(f"PQFOS CONTEXT served walk rel_l2_vs_f64 {r_base:.6f} ({'ABOVE' if r_base > SMOKE_RL2 else 'within'} the 8e-3 bar)")
+    assert r_var <= SMOKE_RL2, (name, r_var, r_base)
 
 
 def test_refused_off_the_gathered_walk_and_bad_combos(kernels):
