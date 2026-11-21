@@ -756,6 +756,31 @@ class SparseChunkRowContractTest(MaskedDenseTestBase):
                 np.testing.assert_array_equal(result[:end], expected[:end])
                 np.testing.assert_array_equal(result[end:], original[end:])
 
+    def test_prepare_gather_indices_ignores_stale_trailing_cu_q_lens(self):
+        # Active sequences [0, 5) and [5, 10); slots 2..3 hold overlapping stale
+        # entries [10, 6) and [6, 8) when only cu_q_lens[:num_seqs + 1] is updated.
+        topk = jnp.zeros((16, 64), dtype=jnp.int32)
+        pages = self._block_tables(4)
+        _, phys_stale = sparse_mla_kernel.prepare_gather_indices(
+            topk,
+            pages,
+            jnp.asarray([0, 5, 10, 6, 8], jnp.int32),
+            page_size=64,
+            total_num_pages=256,
+            num_seqs=jnp.int32(2),
+        )
+        _, phys_clean = sparse_mla_kernel.prepare_gather_indices(
+            topk,
+            pages,
+            jnp.asarray([0, 5, 10, 10, 10], jnp.int32),
+            page_size=64,
+            total_num_pages=256,
+            num_seqs=jnp.int32(2),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(phys_stale)[:10], np.asarray(phys_clean)[:10]
+        )
+
 
 if __name__ == "__main__":
     absltest.main()

@@ -62,6 +62,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
+from vllm_torchtpu.kernels.mla.kv_cache_utils import get_page_and_slot
 from vllm_torchtpu.layers.adapter import pcp_kv_gather as kvg
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -464,20 +465,14 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 )
 
                 # Insert this step's K rows into the KV cache.
-                tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
-                seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
-                    jnp.int32
+                page, slot = get_page_and_slot(
+                    k_packed.shape[0],
+                    seq_lens,
+                    page_indices,
+                    cu_q_lens,
+                    block_size,
+                    num_seqs=distribution[2],
                 )
-                q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
-                pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
-                page = jnp.where(
-                    tok < cu_q_lens[-1],
-                    page_indices.reshape(seq_lens.shape[0], -1)[
-                        seq_id, pos // block_size
-                    ],
-                    jnp.int32(2**30),
-                )
-                slot = pos % block_size
                 cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
                     k_packed
                 )
