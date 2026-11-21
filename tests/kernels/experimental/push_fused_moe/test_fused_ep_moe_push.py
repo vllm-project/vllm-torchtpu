@@ -221,9 +221,25 @@ def test_fp4_push_matches_v2(sc_prepush, tc_exchange, ragged_stride):
 @pytest.mark.parametrize(
     "ragged_stride", [None, CONTRIB_SLAB_STRIDE], ids=["vmem", "slab"]
 )
-def test_onehot_scale_slab_matches_v2(ragged_stride):
+@pytest.mark.parametrize(
+    "decode_kw",
+    [
+        dict(onehot_scale_slab=True),
+        dict(
+            onehot_scale_slab=True,
+            exchange_row_gather=True,
+            table_kernel=True,
+            exchange_tables=True,
+            kernel_plan_tables=True,
+            pair_kernel=True,
+        ),
+    ],
+    ids=["onehot_slab", "pair_kernel"],
+)
+def test_decode_scale_paths_match_v2(decode_kw, ragged_stride):
     """A decode-sized step (32 tokens a shard here) with the TensorCore scale
-    slab gives v2's output bit for bit, on the served FP4 form with the
+    slab, and with the per-pair tables kernel behind the exchange-tables
+    kernel, gives v2's output bit for bit, on the served FP4 form with the
     TensorCore exchange."""
     mesh = _mesh()
     weights = _fp4_weights(mesh, 23, rhs_qb=512, **FP4_SHAPE)
@@ -252,8 +268,67 @@ def test_onehot_scale_slab_matches_v2(ragged_stride):
         sc_prepush=2,
         tc_exchange=True,
         ragged_stride=ragged_stride,
-        onehot_scale_slab=True,
+        **decode_kw,
     )
+
+
+@pytest.mark.parametrize(
+    "ragged_stride", [None, CONTRIB_SLAB_STRIDE], ids=["vmem", "slab"]
+)
+def test_split_exchange_with_the_pair_kernel_is_bit_exact(ragged_stride):
+    """With the split exchange around an in-op shared expert and the per-pair
+    tables kernel behind it, routed and shared outputs equal the unsplit
+    layer's that builds those tables in XLA, bit for bit, at a decode size
+    (32 tokens a shard)."""
+    from vllm_torchtpu.kernels.quantized_matmul.shared_expert import _FP8_MAX
+
+    mesh = _mesh()
+    weights = _fp4_weights(mesh, 29, rhs_qb=512, **FP4_SHAPE)
+    hidden, n = FP4_SHAPE["hidden"], 256
+    rng = np.random.default_rng(31)
+    repl = NamedSharding(mesh, P())
+
+    def w(shape):
+        raw = np.clip(rng.normal(0, 64, shape), -_FP8_MAX, _FP8_MAX)
+        return jax.device_put(jnp.asarray(raw, jnp.float32).astype(FP8), repl)
+
+    def scl(size):
+        return jax.device_put(
+            rng.uniform(0.5, 1.5, size).astype(np.float32) * 1e-3, repl
+        )
+
+    shared = (w((hidden, 2 * n)), scl(2 * n), w((n, hidden)), scl(hidden))
+    bias = jax.device_put(
+        rng.normal(0, 0.1, FP4_SHAPE["e_total"]).astype(np.float32), repl
+    )
+    x, gating = _inputs(mesh, 33, hidden=hidden, e_logical=FP4_SHAPE["e_total"])
+    common = dict(
+        topk=TOPK, renormalize=True, mesh=mesh, capacity=CAPACITY,
+        weight_format=WeightFormat.FP4, rhs_qb=512, sharded_plan=True,
+        scoring_fn="sqrtsoftplus", score_bias=bias, routed_scaling_factor=2.5,
+        act_fn="silu_and_mul_with_clamp", sc_prepush=2, tc_exchange=True,
+        exchange_row_gather=True, table_kernel=True, exchange_tables=True,
+        kernel_plan_tables=True, onehot_scale_slab=True, ragged_stride=ragged_stride,
+        shared_expert=shared, shared_limit=10.0,
+    )  # fmt: skip
+
+    def layer(x, gating, split):
+        return fused_ep_moe_push(
+            x, *weights, gating, split_exchange=split, pair_kernel=split, **common
+        )
+
+    outs = [
+        [
+            np.asarray(o)
+            for o in jax.jit(layer, static_argnums=2, compiler_options=_AS_SERVED)(
+                x, gating, split
+            )
+        ]
+        for split in (False, True)
+    ]
+    for want, got in zip(*outs):
+        assert np.isfinite(got.astype(np.float32)).all()
+        np.testing.assert_array_equal(got.view(np.uint16), want.view(np.uint16))
 
 
 def test_sc_prepush_below_one_raises_and_above_g_local_clamps():
