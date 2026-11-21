@@ -59,6 +59,7 @@ from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 from tests.distributed.tpu_test_utils import run_in_isolated_process
 from vllm_torchtpu.layers.adapter.custom_ops import lora_slot_update_op
 from vllm_torchtpu.lora import lora_manager
+from vllm_torchtpu.lora.layers import TpuRowParallelLinearWithLoRA
 from vllm_torchtpu.lora.lora_manager import (
     TPULoRAModelManager,
     TPUWorkerLoRAManager,
@@ -502,7 +503,11 @@ def test_every_vllm_lora_layer_class_is_classified():
         if isinstance(cls, type) and issubclass(cls, BaseLayerWithLoRA)
     } - {BaseLayerWithLoRA}
 
-    assert layer_classes == set(lora_manager._SUPPORTED_LAYERS) | takes_vllm_writes
+    # The TPU layer changes only RowParallelLinearWithLoRA's forward.
+    tpu_classes = {TpuRowParallelLinearWithLoRA}
+    assert layer_classes | tpu_classes == (
+        set(lora_manager._SUPPORTED_LAYERS) | takes_vllm_writes
+    )
 
 
 def test_worker_without_lora_layers_activates_without_writes(slot_writes):

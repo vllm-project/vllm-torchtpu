@@ -367,8 +367,9 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
 def _validate_lora_config(vllm_config: "VllmConfig") -> None:
     """Rejects LoRA settings that the TPU LoRA path does not support yet.
 
-    LoRA runs on a single chip with a dense generative model without
-    speculative decoding. Other settings fail here with the reason.
+    LoRA runs on a dense generative model without speculative decoding, on
+    one chip or with tensor parallelism. Other settings fail here with the
+    reason.
     """
     lora_config = vllm_config.lora_config
     if lora_config is None:
@@ -376,9 +377,6 @@ def _validate_lora_config(vllm_config: "VllmConfig") -> None:
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
     unsupported = {
-        # RowParallelLinearWithLoRA adds the bias on rank 0 only, so the ranks
-        # would compile different graphs.
-        "tensor_parallel_size > 1": parallel_config.tensor_parallel_size > 1,
         # Untested; each DP engine has its own LoRA manager.
         "data_parallel_size > 1": parallel_config.data_parallel_size > 1,
         # Untested.
@@ -403,7 +401,7 @@ def _validate_lora_config(vllm_config: "VllmConfig") -> None:
         # hands vLLM's classification head one row per request, so the head
         # rejects the mapping. Embedding models are untested.
         "pooling models": model_config.runner_type == "pooling",
-        # Only meaningful with tensor parallelism.
+        # Untested; tensor parallelism runs vLLM's default LoRA sharding.
         "fully_sharded_loras": lora_config.fully_sharded_loras,
         # The TPU runner never sets the tower or connector mappings.
         "enable_tower_connector_lora": lora_config.enable_tower_connector_lora,

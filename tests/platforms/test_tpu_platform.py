@@ -1135,8 +1135,9 @@ class TestPhasedProfilingConfigValidation:
 
 
 class TestLoRAConfigValidation:
-    """LoRA runs on a single chip with a dense generative model and no
-    speculative decoding; any other setting is rejected at startup, by name."""
+    """LoRA runs on a dense generative model with no speculative decoding, on
+    one chip or with tensor parallelism; any other setting is rejected at
+    startup, by name."""
 
     @staticmethod
     def _config(
@@ -1165,6 +1166,9 @@ class TestLoRAConfigValidation:
     def test_single_chip_dense_model_passes(self, lora):
         _validate_lora_config(self._config(lora=lora))
 
+    def test_tensor_parallel_dense_model_passes(self):
+        _validate_lora_config(self._config(tensor_parallel_size=4))
+
     def test_without_lora_nothing_is_checked(self):
         config = self._config(tensor_parallel_size=2)
         config.lora_config = None
@@ -1174,7 +1178,6 @@ class TestLoRAConfigValidation:
     @pytest.mark.parametrize(
         "kwargs,setting",
         [
-            ({"tensor_parallel_size": 2}, "tensor_parallel_size > 1"),
             ({"data_parallel_size": 2}, "data_parallel_size > 1"),
             ({"pipeline_parallel_size": 2}, "pipeline_parallel_size > 1"),
             (
@@ -1206,14 +1209,12 @@ class TestLoRAConfigValidation:
             _validate_lora_config(self._config(**kwargs))
 
     def test_every_unsupported_setting_is_listed(self):
-        config = self._config(
-            tensor_parallel_size=2, lora={"lora_dtype": torch.float16}
-        )
+        config = self._config(data_parallel_size=2, lora={"lora_dtype": torch.float16})
 
         with pytest.raises(ValueError) as excinfo:
             _validate_lora_config(config)
 
-        assert "tensor_parallel_size > 1" in str(excinfo.value)
+        assert "data_parallel_size > 1" in str(excinfo.value)
         assert "lora_dtype torch.float16" in str(excinfo.value)
 
 

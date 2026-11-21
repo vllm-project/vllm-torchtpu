@@ -39,6 +39,10 @@ from vllm_torchtpu.layers.adapter.custom_ops.lora_slot_update_op import (
     write_adapter_to_slot,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.lora.layers import (
+    TpuRowParallelLinearWithLoRA,
+    use_tpu_lora_layers,
+)
 
 logger = init_logger(__name__)
 
@@ -51,6 +55,7 @@ _SUPPORTED_LAYERS = (
     QKVParallelLinearWithLoRA,
     MergedQKVParallelLinearWithLoRA,
     RowParallelLinearWithLoRA,
+    TpuRowParallelLinearWithLoRA,
     ReplicatedLinearWithLoRA,
     VocabParallelEmbeddingWithLoRA,
     LogitsProcessorWithLoRA,
@@ -244,6 +249,7 @@ class TPULoRAModelManager(LRUCacheLoRAModelManager):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        use_tpu_lora_layers(self.modules.values())
         self._slot_writer = _AdapterSlotWriter.create(
             list(self.modules.values()), self.lora_slots, self.device
         )
