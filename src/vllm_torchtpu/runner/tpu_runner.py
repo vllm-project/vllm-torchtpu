@@ -1004,6 +1004,10 @@ class TPUModelRunner(GPUModelRunner):
         self._attention_kv_cache_group_id: int | None = None
         # Random host inputs for profile runs, one buffer per shape.
         self._profile_inputs: dict[str, torch.Tensor] = {}
+        # `_dummy_run` inputs of an idle DP rank, by (tokens, reqs, max-len):
+        # at most one per lockstep token bucket, each holding zeroed block
+        # tables of num_reqs_max_model_len rows for every KV group.
+        self._dp_idle_inputs: dict[tuple[int, int, bool], tuple] = {}
         # Per-key (trailing shape, dtype) of the tensors a stage receives.
         self._pp_intermediate_template: (
             dict[str, tuple[tuple[int, ...], torch.dtype]] | None
@@ -5427,6 +5431,133 @@ class TPUModelRunner(GPUModelRunner):
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
 
+        # An idle DP participant's padding forward reads the same inputs every
+        # step: build them, and stage their zeroed block tables, once per shape.
+        idle_key = (
+            (num_tokens, num_reqs, use_max_model_len)
+            if dp_lockstep and not profiling and kv_cache_initialized
+            else None
+        )
+        cached = self._dp_idle_inputs.get(idle_key) if idle_key else None
+        if cached is None:
+            built = self._dummy_run_inputs(
+                num_tokens,
+                num_reqs,
+                num_blocks,
+                use_max_model_len,
+                dp_lockstep,
+                profile_prefix,
+            )
+            if idle_key is not None:
+                self._dp_idle_inputs[idle_key] = built
+            input_ids, position_ids, per_layer_attn_metadata, _ = built
+        else:
+            (
+                input_ids,
+                position_ids,
+                per_layer_attn_metadata,
+                self._attn_metadata_builder_ctx,
+            ) = cached
+        inputs_embeds = None
+
+        padding_state = getattr(self, "_token_padding_state", None)
+        if padding_state is not None:
+            # Every row of a warmup step is padding; every row of a profile
+            # step is a real token.
+            padding_state.update(num_tokens if profiling else 0, num_tokens)
+        self._record_input_staging_fence()
+        intermediate_tensors = None
+        if through_handoff:
+            assert self._pp_wave is not None and not profiling
+            intermediate_tensors = self._pp_wave.start_forward(num_tokens)
+            self._pp_take_topk_indices(intermediate_tensors, num_tokens)
+        elif not self._pp_is_first:
+            intermediate_tensors = self._pp_intermediate_tensors(
+                num_tokens, zeros=not profiling, random=profiling
+            )
+            self._pp_take_topk_indices(intermediate_tensors, num_tokens)
+        with (
+            self.maybe_select_dummy_loras(
+                self.lora_config, np.array([num_tokens], dtype=np.int32)
+            ),
+            set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                # Startup warmup has real padded model rows too. Passing zero
+                # makes DP metadata describe an empty batch, while model-local
+                # collectives (e.g. sharded embeddings) consume this bucket.
+                num_tokens=num_tokens if self._dp_lockstep_enabled() else 0,
+                num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens),
+            ),
+            set_vllm_model_wrapper_context(
+                mesh=self.mesh,
+                vllm_config=self.vllm_config,
+                kv_cache_bundle=self._kv_cache_bundle,
+            ),
+        ):
+            if self.supports_mm_inputs and self._pp_is_first:
+                input_ids, inputs_embeds = self._get_model_inputs(input_ids, None)
+            if profiling:
+                # The inputs reach the device before the clock starts.
+                inputs = [t for t in (input_ids, inputs_embeds) if t is not None]
+                if intermediate_tensors is not None:
+                    inputs += list(intermediate_tensors.tensors.values())
+                if self._pp_topk_buffer is not None:
+                    inputs.append(self._pp_topk_buffer)
+                synchronize_tensors(inputs)
+            started = time.perf_counter()
+            out, _ = self.forward_model(
+                input_ids=input_ids,
+                positions=position_ids,
+                inputs_embeds=inputs_embeds,
+                intermediate_tensors=intermediate_tensors,
+            )
+            if isinstance(out, IntermediateTensors):
+                if through_handoff:
+                    # The output leaves padded to the hand-off buffer; it is
+                    # submitted without waiting, as between serving steps.
+                    self._pp_wave.end_forward(
+                        self._pp_outgoing_tensors(out.tensors, num_tokens), num_tokens
+                    )
+                    synchronize_tensors(None, wait=False)
+                    return None
+                # A stage before the last produces no logits; nothing
+                # consumes its output in a warmup.
+                synchronize_tensors(list(out.tensors.values()))
+                return (time.perf_counter() - started) * 1000.0 if profiling else None
+            if through_handoff:
+                self._pp_wave.end_forward(None, num_tokens)
+            if dp_lockstep:
+                # Idle DP engines must issue the same TP logits collective as
+                # busy engines before the next DP synchronization.
+                _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
+                _ = self.compute_selected_logits(out, _idx)
+            if not dp_lockstep:
+                synchronize_tensors(out)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._hidden_states_dtype = out.dtype
+        return elapsed_ms if profiling else None
+
+    def _dummy_run_inputs(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        num_blocks: int,
+        use_max_model_len: bool,
+        dp_lockstep: bool,
+        profile_prefix: int | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, AttentionMetadata],
+        AttentionMetadataBuilderContext | None,
+    ]:
+        """Token ids, positions, per-layer attention metadata and the builder
+        context (installed on the runner; None before the KV cache exists) of
+        one `_dummy_run` batch."""
+        kv_cache_initialized = self.kv_cache_config is not None
+        profiling = profile_prefix is not None
+
         # A profile batch carries random values so every token row routes
         # on its own, as real tokens do; a warmup batch traces shapes only.
         profile_query_lens: list[int] = []
@@ -5452,7 +5583,6 @@ class TPUModelRunner(GPUModelRunner):
             # one-token step costs instead of a bucket of one-token requests,
             # which its busy peers would wait for at every EP exchange.
             actual_num_reqs = 1 if dp_lockstep else min(num_tokens, num_reqs)
-        inputs_embeds = None
         if self.uses_mrope:
             position_ids = torch.zeros((3, num_tokens), dtype=torch.int32).to(
                 self.device
@@ -5548,6 +5678,7 @@ class TPUModelRunner(GPUModelRunner):
                     slot_mappings=slot_mappings,
                 )
             )
+            ctx = self._attn_metadata_builder_ctx
         else:
             # Pre-init path (called before initialize_kv_cache): use the
             # caller-supplied num_blocks and a single shared metadata.
@@ -5574,84 +5705,8 @@ class TPUModelRunner(GPUModelRunner):
             per_layer_attn_metadata = {
                 layer_name: attn_metadata for layer_name in self._attn_layer_names
             }
-
-        padding_state = getattr(self, "_token_padding_state", None)
-        if padding_state is not None:
-            # Every row of a warmup step is padding; every row of a profile
-            # step is a real token.
-            padding_state.update(num_tokens if profiling else 0, num_tokens)
-        self._record_input_staging_fence()
-        intermediate_tensors = None
-        if through_handoff:
-            assert self._pp_wave is not None and not profiling
-            intermediate_tensors = self._pp_wave.start_forward(num_tokens)
-            self._pp_take_topk_indices(intermediate_tensors, num_tokens)
-        elif not self._pp_is_first:
-            intermediate_tensors = self._pp_intermediate_tensors(
-                num_tokens, zeros=not profiling, random=profiling
-            )
-            self._pp_take_topk_indices(intermediate_tensors, num_tokens)
-        with (
-            self.maybe_select_dummy_loras(
-                self.lora_config, np.array([num_tokens], dtype=np.int32)
-            ),
-            set_forward_context(
-                per_layer_attn_metadata,
-                self.vllm_config,
-                # Startup warmup has real padded model rows too. Passing zero
-                # makes DP metadata describe an empty batch, while model-local
-                # collectives (e.g. sharded embeddings) consume this bucket.
-                num_tokens=num_tokens if self._dp_lockstep_enabled() else 0,
-                num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens),
-            ),
-            set_vllm_model_wrapper_context(
-                mesh=self.mesh,
-                vllm_config=self.vllm_config,
-                kv_cache_bundle=self._kv_cache_bundle,
-            ),
-        ):
-            if self.supports_mm_inputs and self._pp_is_first:
-                input_ids, inputs_embeds = self._get_model_inputs(input_ids, None)
-            if profiling:
-                # The inputs reach the device before the clock starts.
-                inputs = [t for t in (input_ids, inputs_embeds) if t is not None]
-                if intermediate_tensors is not None:
-                    inputs += list(intermediate_tensors.tensors.values())
-                if self._pp_topk_buffer is not None:
-                    inputs.append(self._pp_topk_buffer)
-                synchronize_tensors(inputs)
-            started = time.perf_counter()
-            out, _ = self.forward_model(
-                input_ids=input_ids,
-                positions=position_ids,
-                inputs_embeds=inputs_embeds,
-                intermediate_tensors=intermediate_tensors,
-            )
-            if isinstance(out, IntermediateTensors):
-                if through_handoff:
-                    # The output leaves padded to the hand-off buffer; it is
-                    # submitted without waiting, as between serving steps.
-                    self._pp_wave.end_forward(
-                        self._pp_outgoing_tensors(out.tensors, num_tokens), num_tokens
-                    )
-                    synchronize_tensors(None, wait=False)
-                    return None
-                # A stage before the last produces no logits; nothing
-                # consumes its output in a warmup.
-                synchronize_tensors(list(out.tensors.values()))
-                return (time.perf_counter() - started) * 1000.0 if profiling else None
-            if through_handoff:
-                self._pp_wave.end_forward(None, num_tokens)
-            if dp_lockstep:
-                # Idle DP engines must issue the same TP logits collective as
-                # busy engines before the next DP synchronization.
-                _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
-                _ = self.compute_selected_logits(out, _idx)
-            if not dp_lockstep:
-                synchronize_tensors(out)
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-        self._hidden_states_dtype = out.dtype
-        return elapsed_ms if profiling else None
+            ctx = None
+        return input_ids, position_ids, per_layer_attn_metadata, ctx
 
     def _profile_input(
         self, name: str, shape: tuple[int, ...], dtype: torch.dtype

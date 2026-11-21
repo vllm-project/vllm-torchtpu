@@ -2401,6 +2401,7 @@ class TestInputStagingFence:
             _free_h2d_sources={},
             _registered_h2d_sources=set(),
             _token_padding_state=None,
+            _dp_idle_inputs={},
             sequence_layout_planner=SimpleNamespace(
                 prepare_dummy=lambda **kw: SimpleNamespace(
                     descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
@@ -2415,6 +2416,7 @@ class TestInputStagingFence:
         )
         for name in (
             "_build_attention_metadata",
+            "_dummy_run_inputs",
             "_record_input_staging_fence",
             "_wait_input_staging_fence",
             "_pp_take_topk_indices",
@@ -2458,6 +2460,17 @@ class TestInputStagingFence:
             assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
         assert len(_FakeTpuEvent.instances) == 3
         assert all(fence.synchronized == 1 for fence in _FakeTpuEvent.instances[:-1])
+
+        # A later idle step of the same shape reuses the idle inputs: the same
+        # builder context and metadata, and no new staged host source.
+        idle_ctx = next(iter(runner._dp_idle_inputs.values()))[3]
+        TPUModelRunner._dummy_run(
+            runner, num_tokens=16, num_reqs=4, num_blocks=4, dp_lockstep=True
+        )
+        assert runner._attn_metadata_builder_ctx is idle_ctx
+        assert len(runner._dp_idle_inputs) == 1
+        assert runner._unfenced_h2d_sources == []
+        assert runner._fenced_h2d_sources == []
 
         # With through_handoff=True, the fence must be recorded before
         # _pp_wave.start_forward so the next wait never blocks on the receive.

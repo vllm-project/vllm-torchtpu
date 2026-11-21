@@ -158,7 +158,8 @@ class AttentionMetadataBuilderContext:
     # ckpt_in_row). Valid only because every context is constructed fresh
     # per chunk: the plan derives from this chunk's seq_lens/ckpt_window,
     # which the key deliberately omits. Do not reuse a context across
-    # chunks.
+    # chunks; the one exception is an idle DP rank's dummy-step context
+    # (`TPUModelRunner._dp_idle_inputs`), whose inputs never change.
     mamba_row_plans: dict[
         tuple[int, int], tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
     ] = field(default_factory=dict)
@@ -593,7 +594,8 @@ def stage_block_table_uploads(
     `ctx.staged_block_tables` (instead of one small per-group H2D per build).
     `gids` limits staging to a subset of groups; None stages every group.
     Dummy runs stage the same layout zero-filled so warmup dispatches the
-    program sequence serving will. Views die with the per-chunk context.
+    program sequence serving will. Views die with the per-chunk context
+    (an idle DP rank keeps its constant dummy context, see `_dp_idle_inputs`).
     """
     if not runner.attn_groups:
         # Pre-initialization dummy runs build metadata before the KV cache

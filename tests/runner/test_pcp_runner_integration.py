@@ -132,6 +132,10 @@ def _make_runner(
     runner._record_input_staging_fence = types.MethodType(
         TPUModelRunner._record_input_staging_fence, runner
     )
+    runner._dummy_run_inputs = types.MethodType(
+        TPUModelRunner._dummy_run_inputs, runner
+    )
+    runner._dp_idle_inputs = {}
     runner._cached_query_start_loc = None
     runner._cached_logits_indices = None
     runner._cached_request_distribution = None

@@ -687,6 +687,40 @@ def test_dummy_draft_forward_marks_all_rows_padding(monkeypatch):
     assert mask == [True] * 8
 
 
+def test_lockstep_dummy_draft_forward_reuses_its_inputs(monkeypatch):
+    """Idle-rank replays (not `sync`) build their inputs once per shape;
+    warmup forwards (`sync`) build them every time."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        mesh=None,
+        _dp_num_tokens_across_dp=lambda num_tokens: None,
+    )
+    proposer._build_attn_metadata_for_draft = mock.MagicMock(return_value={})
+    seen = []
+
+    def _forward(input_ids, positions, block_size):
+        seen.append((input_ids, positions))
+        num_reqs = input_ids.shape[0] // block_size
+        return torch.zeros((num_reqs, block_size - 1), dtype=torch.int64), None
+
+    proposer._dflash_forward_and_sample = _forward
+    monkeypatch.setattr(dflash_module, "synchronize_tensors", lambda *a, **k: None)
+
+    for _ in range(3):
+        proposer._dummy_draft_forward(num_tokens=8, use_max_model_len=True, sync=False)
+    assert proposer._build_attn_metadata_for_draft.call_count == 1
+    assert all(ids is seen[0][0] and pos is seen[0][1] for ids, pos in seen)
+
+    proposer._dummy_draft_forward(num_tokens=16, use_max_model_len=True, sync=False)
+    assert proposer._build_attn_metadata_for_draft.call_count == 2
+
+    for _ in range(2):
+        proposer._dummy_draft_forward(num_tokens=8, use_max_model_len=True, sync=True)
+    assert proposer._build_attn_metadata_for_draft.call_count == 4
+
+
 def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
     """An unnamed draft layer must raise, not borrow another group's metadata.
 
