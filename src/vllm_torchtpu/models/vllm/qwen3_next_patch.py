@@ -166,7 +166,7 @@ def _step0_effective_gather_indices(
     """Slice `_step0_gather_indices` to 4 or 8 rows on small token buckets (`T<=4`
     and `T<=8`) during `shape_variants.warmup()` so post-attention `o_proj`,
     `small_all_reduce`, `norm_fp8_gate_and_se`, `moe_lowtok`, and `self.norm`
-    execute on 4 or 8 rows instead of `max_loop_p` (16) rows."""
+    execute on 4 or 8 rows instead of the full `max_loop_p` rows."""
     gather_idx = _step0_gather_indices
     if gather_idx is None:
         return None

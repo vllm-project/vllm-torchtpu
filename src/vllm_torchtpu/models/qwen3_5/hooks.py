@@ -31,6 +31,14 @@ entries (``validation/``). Every other engine keeps main's behaviour.
   without prefill or decode context parallelism (the entries' PP8 prefill
   legs). Every other engine keeps the unit unset, so a PCP prefill leg
   resolves its hash block size from its KV cache groups.
+- The MTP draft path (``mtp_draft_path``, a rule registered in
+  ``spec_decode/draft_path_rules.py``): greedy top tokens, fast token
+  substitution and the fused MTP draft loop for an MTP draft of that
+  checkpoint shape on TPU7x. The rule reads only the checkpoint shape and
+  the chip, not the role or the layout. A set env key still decides its own
+  path (``TPU_GREEDY_TOP_TOKENS``, ``VLLM_TPU_FAST_TOKEN_SUBSTITUTION``,
+  ``VLLM_TPU_FUSED_DRAFT_LOOP``); every other engine keeps them off unless
+  set.
 """
 
 from __future__ import annotations
