@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 import pytest
+from vllm.config import ParallelConfig
 
 from vllm_torchtpu.distributed import tpu_mp_multihost as mp
 from vllm_torchtpu.platforms import tpu_platform
@@ -51,6 +52,13 @@ def test_rendezvous_port(monkeypatch, override, expected):
     assert mp._rendezvous_port(9000) == expected
 
 
+@pytest.mark.parametrize("seconds", [None, 10800])
+def test_rendezvous_waits_default_300_s_unless_vllm_sets_a_cpu_timeout(seconds):
+    config = ParallelConfig(cpu_distributed_timeout_seconds=seconds)
+    expected = timedelta(seconds=300 if seconds is None else seconds)
+    assert mp._rendezvous_timeout(config) == expected
+
+
 @pytest.mark.parametrize("rank", [0, 1])
 def test_rendezvous_orders_peers_and_shares_session(monkeypatch, rank):
     values = {
@@ -70,19 +78,20 @@ def test_rendezvous_orders_peers_and_shares_session(monkeypatch, rank):
         master_addr="10.0.0.1",
         port=9001,
         key_prefix="test",
+        timeout=timedelta(seconds=77),
     ) == (["10.0.0.1", "10.0.0.2"], "12345")
     create_store.assert_called_once_with(
         host_name="10.0.0.1",
         port=9001,
         world_size=2,
         is_master=rank == 0,
-        timeout=timedelta(seconds=300),
+        timeout=timedelta(seconds=77),
     )
     expected_sets = [call(f"test_ip_{rank}", f"10.0.0.{rank + 1}")]
     if rank == 0:
         expected_sets.append(call("test_xprof_session_id", "12345"))
     assert store.set.call_args_list == expected_sets
-    store.wait.assert_called_once_with(list(values), timedelta(seconds=300))
+    store.wait.assert_called_once_with(list(values), timedelta(seconds=77))
     assert mp._keepalive_stores == ([store] if rank == 0 else [])
 
 
@@ -107,6 +116,7 @@ def test_mp_bootstrap_and_reentry(monkeypatch, bootstrap, rank, base_port):
         local_world_size=4,
         master_addr="10.0.0.1",
         master_port=9000,
+        cpu_distributed_timeout=None,
     )
     mp.prepare_mp_multihost_env(config)
     rendezvous.assert_called_once_with(
@@ -115,6 +125,7 @@ def test_mp_bootstrap_and_reentry(monkeypatch, bootstrap, rank, base_port):
         master_addr="10.0.0.1",
         port=9001,
         key_prefix="tpu_mp_nnodes",
+        timeout=timedelta(seconds=300),
     )
     topology.assert_called_once_with(8)
     ports = "8500,8501,8502,8503" if base_port else "8070,8071,8072,8073"
@@ -168,6 +179,7 @@ def test_dp_bootstrap_sets_slice_and_reapplies_master_ports(
         data_parallel_rpc_port=9000,
         data_parallel_master_ip="10.0.0.1",
         world_size=2,
+        cpu_distributed_timeout=timedelta(seconds=10800),
     )
     assert mp.prepare_mp_multihost_dp_env(config, 8)
     rendezvous.assert_called_once_with(
@@ -176,6 +188,7 @@ def test_dp_bootstrap_sets_slice_and_reapplies_master_ports(
         master_addr="10.0.0.1",
         port=9001,
         key_prefix="tpu_mp_dp",
+        timeout=timedelta(seconds=10800),
     )
     topology.assert_called_once_with(8)
     assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == (
@@ -200,6 +213,7 @@ def test_failed_bootstrap_can_retry(bootstrap):
         local_world_size=4,
         master_addr="10.0.0.1",
         master_port=9000,
+        cpu_distributed_timeout=None,
     )
     with pytest.raises(RuntimeError, match="peer timeout"):
         mp.prepare_mp_multihost_env(config)

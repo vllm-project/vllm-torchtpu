@@ -75,7 +75,9 @@ logger = init_logger(__name__)
 
 _DONE_SENTINEL = "_TORCH_TPU_MP_MULTIHOST_ENV_PREPARED"
 _DP_DONE_SENTINEL = "_TORCH_TPU_MP_MULTIHOST_DP_ENV_PREPARED"
-_RENDEZVOUS_TIMEOUT_S = 300
+# How long a host waits for the other hosts at the rendezvous when vLLM's
+# --cpu-distributed-timeout-seconds is unset.
+_RENDEZVOUS_TIMEOUT = timedelta(seconds=300)
 
 # The master's TCPStore server thread stops as soon as the TCPStore object is
 # garbage-collected. Other hosts may still be reading keys from it after this
@@ -94,8 +96,26 @@ def _rendezvous_port(base_port: int) -> int:
     return int(base_port) + 1
 
 
+def _rendezvous_timeout(parallel_config) -> timedelta:
+    """How long a host waits for the other hosts of its slice: vLLM's CPU
+    distributed timeout when --cpu-distributed-timeout-seconds sets one, the
+    bound on every other CPU-side wait, else 300 s.
+
+    The hosts of a slice can reach the rendezvous minutes apart (one may start
+    later or take longer to fetch the model config); a host that has waited
+    this long gives up.
+    """
+    return parallel_config.cpu_distributed_timeout or _RENDEZVOUS_TIMEOUT
+
+
 def _rendezvous_host_ips(
-    *, num_peers: int, peer_index: int, master_addr: str, port: int, key_prefix: str
+    *,
+    num_peers: int,
+    peer_index: int,
+    master_addr: str,
+    port: int,
+    key_prefix: str,
+    timeout: timedelta,
 ) -> tuple[list[str], str]:
     """Exchange every peer's IP (and a shared xprof session id) via TCPStore.
 
@@ -107,7 +127,7 @@ def _rendezvous_host_ips(
         port=port,
         world_size=num_peers,
         is_master=is_master,
-        timeout=timedelta(seconds=_RENDEZVOUS_TIMEOUT_S),
+        timeout=timeout,
     )
     if is_master:
         # Keep the server thread alive; see module-level comment.
@@ -119,7 +139,7 @@ def _rendezvous_host_ips(
 
     ip_keys = [f"{key_prefix}_ip_{i}" for i in range(num_peers)]
     wait_keys = ip_keys + [f"{key_prefix}_xprof_session_id"]
-    store.wait(wait_keys, timedelta(seconds=_RENDEZVOUS_TIMEOUT_S))
+    store.wait(wait_keys, timeout)
     host_ips = [store.get(key).decode() for key in ip_keys]
     xprof_session_id = store.get(f"{key_prefix}_xprof_session_id").decode()
     return host_ips, xprof_session_id
@@ -166,6 +186,7 @@ def prepare_mp_multihost_env(parallel_config) -> None:
         master_addr=master_addr,
         port=rendezvous_port,
         key_prefix="tpu_mp_nnodes",
+        timeout=_rendezvous_timeout(parallel_config),
     )
 
     # Same construction as ray_distributed_executor_v2.py: one address per chip,
@@ -267,6 +288,7 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
         master_addr=master_addr,
         port=rendezvous_port,
         key_prefix="tpu_mp_dp",
+        timeout=_rendezvous_timeout(parallel_config),
     )
 
     # One address per local chip on each host (world_size per DP replica x

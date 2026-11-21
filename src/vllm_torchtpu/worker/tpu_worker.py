@@ -27,7 +27,7 @@ import torch.profiler
 import torch_tpu  # noqa: F401
 from torch.compiler._cache import CacheArtifactManager
 from torch_tpu._internal.profiler import TpuProfilerConfig
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
     get_kv_transfer_group,
@@ -83,6 +83,29 @@ def _configure_tpu_process_env(
         os.environ["WORLD_SIZE"] = str(world_size)
     else:
         os.environ.pop("WORLD_SIZE", None)
+
+
+def _world_group_init_kwargs(parallel_config: ParallelConfig) -> dict[str, Any]:
+    """The default group's timeout for init_distributed_environment, when
+    vLLM's --cpu-distributed-timeout-seconds sets one; nothing otherwise.
+
+    Gloo CPU groups wait 30 min by default. Under model-store contention a rank
+    can still be streaming weights after that while its peers sit in a CPU
+    collective (the draft load barrier on prefill, the all_gather_object of
+    build_ep_mesh on decode), and the waiters die with "Timed out waiting
+    1800000ms". The option sets the timeout of every CPU collective: vLLM
+    builds the CPU group of each of its group coordinators, the world group's
+    gloo ``cpu_group`` included, with ``new_group(ranks, backend="gloo",
+    timeout=...)`` read from the current vLLM config, which init_device sets
+    around both calls, so no CPU group depends on the default group's timeout.
+    What this passes is the timeout of the world TCPStore that
+    init_process_group rendezvouses on (or that vLLM creates for it with the
+    same timeout on some DP engines): the ranks' connection to it, and every
+    key wait on it that carries no timeout of its own, including those of
+    later groups, whose stores are prefixes of it.
+    """
+    timeout = parallel_config.cpu_distributed_timeout
+    return {} if timeout is None else {"timeout": timeout}
 
 
 def _release_free_host_heap() -> None:
@@ -494,6 +517,7 @@ class TPUWorker(WorkerBase):
                 local_rank=local_rank_for_init,
                 distributed_init_method=dist_init_method,
                 backend=dist_backend,
+                **_world_group_init_kwargs(self.parallel_config),
             )
         # The PCP group keeps its natural rank order. Reordering it used to be
         # how the ring was chosen, on the understanding that the ring followed

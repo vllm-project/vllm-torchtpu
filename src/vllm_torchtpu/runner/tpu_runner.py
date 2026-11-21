@@ -46,7 +46,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     set_current_vllm_config,
 )
-from vllm.distributed import get_pcp_group
+from vllm.distributed import get_pcp_group, get_world_group
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -232,6 +232,7 @@ from vllm_torchtpu.tracing.utils import (
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
+    from vllm.config import SpeculativeConfig
     from vllm.model_executor.models.interfaces import SupportsPP
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
@@ -677,6 +678,14 @@ _TOPK_BUFFER_ATTRIBUTE = "topk_indices_buffer"
 _PP_CARRIED_FILL: dict[str, int] = {_TOPK_INDICES: -1}
 
 
+def _uses_hidden_state_drafter(spec: "SpeculativeConfig | None") -> bool:
+    """Whether the speculative method drafts from the target's hidden states
+    (eagle/MTP or dflash), on whichever pipeline stage hosts the draft."""
+    if not spec:
+        return False
+    return spec.use_eagle() or spec.method == "dflash"
+
+
 def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
     """The one top-k table this process's layers share, or None."""
     found: dict[int, torch.Tensor] = {}
@@ -748,12 +757,7 @@ class TPUModelRunner(GPUModelRunner):
         Under a pipeline only the last stage samples, so only it hosts the
         draft; the other stages hand their hidden states on and never draft.
         """
-        if not self.speculative_config or not self._pp_is_last:
-            return False
-        return (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.method == "dflash"
-        )
+        return _uses_hidden_state_drafter(self.speculative_config) and self._pp_is_last
 
     @property
     def _fence_spec_kv_under_token_copy(self) -> bool:
@@ -6164,6 +6168,54 @@ class TPUModelRunner(GPUModelRunner):
 
         return async_output
 
+    def _maybe_draft_load_barrier(self) -> None:
+        """With a hidden-state drafter (eagle/MTP or dflash), align every rank
+        of the world group before the draft model load.
+
+        The barrier runs on the world group, so every rank must join it, not
+        only the ones that load a draft. Under a pipeline only the last stage
+        hosts the drafter (`_is_async_drafter`); gating the barrier on it would
+        leave that stage waiting for stages that never arrive while they block
+        in their next collective.
+        """
+        if _uses_hidden_state_drafter(self.speculative_config):
+            self._draft_load_barrier()
+
+    def _draft_load_barrier(self) -> None:
+        """Aligns every rank of the world group before the draft model load."""
+        world = get_world_group()
+        if world.world_size <= 1:
+            return
+        # The draft load creates a process group (the runai streamer's
+        # new_group), and torch_tpu's new_group waits a fixed 300 s for every
+        # rank's store key. Ranks can finish streaming the target weights
+        # further apart than that, so they meet first on the gloo group, whose
+        # timeout is the CPU distributed timeout (30 min under gloo unless
+        # --cpu-distributed-timeout-seconds raises it above a weight load under
+        # model-store contention). With it set, monitored_barrier also names
+        # the ranks that never arrived.
+        timeout = self.parallel_config.cpu_distributed_timeout
+        start = time.perf_counter()
+        if timeout is None:
+            logger.info("Rank %d waiting at the draft load barrier", world.rank)
+            torch.distributed.barrier(group=world.cpu_group)
+        else:
+            logger.info(
+                "Rank %d waiting at the draft load barrier (timeout %d s)",
+                world.rank,
+                timeout.total_seconds(),
+            )
+            torch.distributed.monitored_barrier(
+                group=world.cpu_group,
+                timeout=timeout,
+                wait_all_ranks=True,
+            )
+        logger.info(
+            "Rank %d passed the draft load barrier after %.1f s",
+            world.rank,
+            time.perf_counter() - start,
+        )
+
     def load_model(self) -> None:
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
@@ -6236,6 +6288,9 @@ class TPUModelRunner(GPUModelRunner):
                 self.model, self._dp_lockstep_enabled()
             )
 
+        # Every pipeline stage joins the barrier, the stages that host no draft
+        # included (see _maybe_draft_load_barrier).
+        self._maybe_draft_load_barrier()
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
