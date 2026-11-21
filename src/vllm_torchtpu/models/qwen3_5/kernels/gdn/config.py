@@ -18,6 +18,8 @@
 # Changes to kernels/gdn/v3 are not picked up automatically.
 # Changes from the source:
 # - GDNConfig.qkv_2d and the act_scratch_ref scratch for 2D bf16 qkv rows.
+# - SHARED_KKT_SHAPES and GDNConfig.shared_kkt, read by
+#   compute_gdn.chunked_gdn_per_seq.
 
 import dataclasses
 import enum
@@ -27,6 +29,17 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+# Shapes (kq heads, value heads, kq head dim, value head dim per rank) at which
+# the chunked prefill computes (beta k) k^T as diag(beta) (k k^T), one dot per
+# kq head (`compute_gdn.chunked_gdn_per_seq`). That form reassociates the beta
+# product, so its results differ from kernels/gdn/v3's in the last bits. It was
+# measured only on the Qwen3.5-397B prefill legs (TP1: 16 kq and 64 value heads
+# of 128), so every other shape keeps kernels/gdn/v3's (beta k) k^T and
+# computes what that kernel computes.
+SHARED_KKT_SHAPES: frozenset[tuple[int, int, int, int]] = frozenset(
+    {(16, 64, 128, 128)}
+)
 
 
 class AttentionMode(enum.StrEnum):
@@ -174,6 +187,18 @@ class GDNConfig:
             if head_groups * b <= 16:
                 return b
         return 2
+
+    @property
+    def shared_kkt(self) -> bool:
+        """Whether the chunked prefill takes the shared (beta k) k^T
+        (`SHARED_KKT_SHAPES`)."""
+        shape = (
+            self.num_kq_heads,
+            self.num_v_heads,
+            self.kq_head_dim,
+            self.v_head_dim,
+        )
+        return shape in SHARED_KKT_SHAPES
 
     @property
     def use_recurrent(self) -> bool:
