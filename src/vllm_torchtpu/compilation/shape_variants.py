@@ -29,7 +29,8 @@ to build only the buckets its guards accept, and a bucket it refuses is compiled
 by a later trace and handed back through :class:`BucketExecutables`. The graph
 that stays live therefore ends up with one executable per bucket.
 
-Nothing here runs at serving time: dispatch stays vLLM's own
+Nothing here runs at serving time beyond a positional reorder of a handed-over
+bucket's arguments: dispatch stays vLLM's own
 (``PiecewiseBackend.__call__`` picks ``range_entries[Range(n, n)].runnable``),
 and each bucket is still compiled exactly once, so the number of TPU programs --
 each holding an HBM program region for the life of the process -- is unchanged.
@@ -45,6 +46,9 @@ ShapeEnv, vLLM drops that guard, and nothing here can see it.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import operator
+from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -69,19 +73,22 @@ class ShapeSpecializationError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+def _placeholder_nodes(graph: fx.GraphModule) -> list[fx.Node]:
+    nodes = []
+    for node in graph.graph.nodes:
+        if node.op != "placeholder":
+            break
+        nodes.append(node)
+    return nodes
+
+
 def _placeholder_value(node: fx.Node) -> Any:
     return node.meta.get("example_value", node.meta.get("val"))
 
 
 def _placeholder_values(graph: fx.GraphModule) -> list[Any]:
-    values = []
-    for node in graph.graph.nodes:
-        if node.op != "placeholder":
-            break
-        value = _placeholder_value(node)
-        if value is not None:
-            values.append(value)
-    return values
+    values = (_placeholder_value(node) for node in _placeholder_nodes(graph))
+    return [value for value in values if value is not None]
 
 
 def trace_shape_env(graph: fx.GraphModule) -> Any | None:
@@ -149,23 +156,291 @@ def unsupported_reason(shape_env: Any, size: int) -> str | None:
     return None
 
 
-def _signature(graph: fx.GraphModule) -> tuple:
-    """The submodule input list a handed-over runnable has to match.
+def _meta_entry(value: Any) -> Any:
+    """A placeholder's dtype and shape, comparable across traces.
 
     Symbolic dims compare as "?", so the token dimension matches across traces
     but a structural difference -- a split graph whose subgraph takes one chunk
     in one variant and two in another -- does not.
     """
+    if value is None:
+        return None
+    if not isinstance(value, torch.Tensor):
+        return type(value).__name__
+    dims = tuple("?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape)
+    return (str(value.dtype), dims)
 
-    def shape(value: Any) -> Any:
-        if not isinstance(value, torch.Tensor):
-            return type(value).__name__
-        dims = tuple(
-            "?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape
+
+@dataclasses.dataclass(frozen=True)
+class _Input:
+    """A placeholder as a handover compares and names it, without its graph.
+
+    A stored bucket's inputs live until the warmup ends. The fx.Node itself
+    would keep its whole GraphModule -- the compiler's deep copy, with every
+    intermediate's metadata -- alive through ``node.graph`` for that long, one
+    per subgraph and bucket. The example value and Dynamo's source do not.
+    """
+
+    name: str
+    value: Any
+    source: Any  # torch._dynamo.source.Source, when the graph still has it
+    graph_input: bool  # one of Dynamo's graph inputs, named after its source
+
+
+def _graph_input_source(node: fx.Node) -> Any:
+    """The Dynamo source recorded on a graph input, or None. Dynamo deletes
+    each placeholder's GraphArg before it calls the backend, so the graphs
+    vLLM compiles carry none; only graphs built without that step do."""
+    grapharg = node.meta.get("grapharg")
+    return grapharg.source if grapharg is not None else None
+
+
+def _is_graph_input(node: fx.Node) -> bool:
+    """Whether a placeholder is one of Dynamo's graph inputs, which Dynamo
+    names after their source (``l_self_..._weight_``, the size symbol
+    ``s77``), rather than a split subgraph's intermediate, which is named
+    after the parent graph's node that computed it.
+
+    torch's ``split_module`` copies a parent placeholder's meta into every
+    subgraph that takes it, and an intermediate gets the meta of the node
+    that computed it. Dynamo records a tensor input's attributes under
+    ``meta["tensor_dict"]`` and nothing computed in the graph has them; an
+    int input is the bare size symbol it is named after.
+    """
+    if node.meta.get("grapharg") is not None:
+        return True
+    value = _placeholder_value(node)
+    if isinstance(value, torch.Tensor):
+        return "tensor_dict" in node.meta
+    if isinstance(value, torch.SymInt):
+        expr = value.node.expr
+        return bool(getattr(expr, "is_Symbol", False)) and str(expr) == node.name
+    return False
+
+
+def _inputs(graph: fx.GraphModule) -> list[_Input]:
+    return [
+        _Input(
+            node.name,
+            _placeholder_value(node),
+            _graph_input_source(node),
+            _is_graph_input(node),
         )
-        return (str(value.dtype), dims)
+        for node in _placeholder_nodes(graph)
+    ]
 
-    return tuple(shape(value) for value in _placeholder_values(graph))
+
+def _signature(graph: fx.GraphModule | Sequence[_Input]) -> tuple:
+    """The submodule input list, by dtype and shape."""
+    inputs = _inputs(graph) if isinstance(graph, fx.GraphModule) else graph
+    return tuple(_meta_entry(i.value) for i in inputs if i.value is not None)
+
+
+def _handover_inputs(inputs: Sequence[_Input]) -> tuple[tuple[str, Any], ...]:
+    """The submodule's arguments in call order, by name, dtype and shape.
+
+    A handed-over runnable takes its arguments positionally, and two traces of
+    one model may lift the same buffers in a different order, so the named
+    graph inputs among them are matched by name (see :func:`_input_permutation`).
+    """
+    return tuple((i.name, _meta_entry(i.value)) for i in inputs)
+
+
+def _input_permutation(
+    stored: Sequence[_Input], current: Sequence[_Input]
+) -> list[int] | None:
+    """Where each stored argument sits in the current call, or None when the
+    two traces' inputs differ beyond that.
+
+    Only named graph inputs -- placeholders Dynamo read from a source and named
+    after it (``l_self_..._weight_``) -- are matched by name: two traces of one
+    model may lift the same buffers in a different order. A split subgraph's
+    intermediates are named after the parent graph's node in creation order
+    (``getitem_7``), so in another trace the same name can stand for a
+    different value; they keep their positions. When the named inputs differ,
+    or the intermediates are not at the same positions, every input is matched
+    by position, dtype and shape, as on main.
+    """
+    if len(stored) != len(current):
+        return None
+    identity = list(range(len(stored)))
+    named = [i for i, graph_input in enumerate(stored) if graph_input.graph_input]
+    if named == [i for i, graph_input in enumerate(current) if graph_input.graph_input]:
+        stored_keys = _handover_inputs(stored)
+        current_keys = _handover_inputs(current)
+        position = {current_keys[i]: i for i in named}
+        perm = list(identity)
+        for i in named:
+            perm[i] = position.get(stored_keys[i], -1)
+        named_set = set(named)
+        unnamed_match = all(
+            stored_keys[i][1] == current_keys[i][1]
+            for i in identity
+            if i not in named_set
+        )
+        if unnamed_match and sorted(perm) == identity:
+            return perm
+    return identity if _signature(stored) == _signature(current) else None
+
+
+def _is_int_input(value: Any) -> bool:
+    return isinstance(value, (int, torch.SymInt))
+
+
+def _input_source(graph_input: _Input) -> str | None:
+    """Where Dynamo read a graph input from (``L['positions'].size()[0]``),
+    when the graph records it, else None: always for a split subgraph's
+    intermediate, and for every input of the graphs vLLM compiles, whose
+    GraphArgs Dynamo has deleted (an int input's symbol still names its
+    sources, see _symbol_source_names)."""
+    source = graph_input.source
+    return None if source is None else source.name
+
+
+def _symbol_source_names(value: Any) -> list[str]:
+    """Where a SymInt's symbol was read from (``L['positions'].size()[0]``),
+    one name per source, from its own trace's ShapeEnv, which keeps them
+    after Dynamo has deleted the graph's GraphArgs. Empty for anything else."""
+    if not isinstance(value, torch.SymInt):
+        return []
+    try:
+        expr = value.node.expr
+        sources = value.node.shape_env.var_to_sources.get(expr)
+    except AttributeError:
+        return []
+    return [s.name for s in sources or ()]
+
+
+def _symbol_sources(value: Any) -> str | None:
+    """The guard sources of a SymInt's symbol, from its trace's ShapeEnv."""
+    return ", ".join(_symbol_source_names(value)) or None
+
+
+def _int_input_sources(graph_input: _Input) -> list[str]:
+    """Where an int input was read from: its GraphArg's source when the graph
+    still records one, else its symbol's sources."""
+    source = _input_source(graph_input)
+    if source is not None:
+        return [source]
+    return _symbol_source_names(graph_input.value)
+
+
+def _describe_input(graph_input: _Input) -> str:
+    value = graph_input.value
+    parts = [f"{graph_input.name} {_meta_entry(value)}"]
+    if isinstance(value, torch.SymInt):
+        parts.append(f"expr={value.node.expr}")
+    source = _input_source(graph_input) or _symbol_sources(value)
+    if source:
+        parts.append(f"from {source}")
+    return " ".join(parts)
+
+
+def _symbol_fate(
+    inputs: Sequence[_Input], sources: Sequence[str], trace: str
+) -> str | None:
+    """What the ShapeEnv of the trace ``inputs`` came from concluded about the
+    symbol read from any of ``sources``: its replacement when it was
+    specialized, else its value range. ``trace`` names that trace in the
+    text."""
+    if not sources:
+        return None
+    shape_env = None
+    for graph_input in inputs:
+        value = graph_input.value
+        if isinstance(value, torch.SymInt):
+            shape_env = value.node.shape_env
+        else:
+            shape_env = getattr(getattr(value, "fake_mode", None), "shape_env", None)
+        if shape_env is not None:
+            break
+    if shape_env is None:
+        return None
+    for symbol, symbol_sources in shape_env.var_to_sources.items():
+        if any(s.name in sources for s in symbol_sources):
+            replacement = shape_env.replacements.get(symbol)
+            if replacement is not None:
+                return f"{symbol} = {replacement} in {trace}"
+            value_range = shape_env.var_to_range.get(symbol)
+            return f"{symbol} in {value_range} in {trace}"
+    return f"no symbol of {trace} reads {', '.join(sources)}"
+
+
+def _signature_delta(stored: Sequence[Any], current: Sequence[Any]) -> str:
+    """The inputs only one of two traces takes, most frequent first."""
+
+    def render(counts: Counter) -> str:
+        if not counts:
+            return "nothing"
+        by_count = sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))
+        return ", ".join(f"{count}x {item}" for item, count in by_count)
+
+    return (
+        f"{len(stored)} inputs vs {len(current)}. "
+        f"Only in the earlier trace: {render(Counter(stored) - Counter(current))}. "
+        f"Only in this one: {render(Counter(current) - Counter(stored))}"
+    )
+
+
+_NAMED_INPUTS_SHOWN = 8
+
+
+def _input_delta(stored: Sequence[_Input], current: Sequence[_Input]) -> str:
+    """:func:`_signature_delta` of two traces' inputs, naming the inputs that
+    account for it: placeholder, dtype and shape, and the source Dynamo read it
+    from, so the model code that lifts one and not the other can be found."""
+    stored_entries = _signature(stored)
+    current_entries = _signature(current)
+    delta = _signature_delta(stored_entries, current_entries)
+
+    def unmatched(side: Sequence[_Input], other: Sequence[_Input]) -> list[_Input]:
+        extra = Counter(_signature(side)) - Counter(_signature(other))
+        other_keys = set(_handover_inputs(other))
+        inputs = []
+        for graph_input, key in zip(side, _handover_inputs(side)):
+            if key not in other_keys and extra[key[1]] > 0:
+                extra[key[1]] -= 1
+                inputs.append(graph_input)
+        return inputs
+
+    def render(inputs: list[_Input], other: Sequence[_Input], other_trace: str) -> str:
+        shown = []
+        for graph_input in inputs[:_NAMED_INPUTS_SHOWN]:
+            text = _describe_input(graph_input)
+            if _is_int_input(graph_input.value):
+                fate = _symbol_fate(other, _int_input_sources(graph_input), other_trace)
+                if fate:
+                    text += f" ({fate})"
+            shown.append(text)
+        if len(inputs) > _NAMED_INPUTS_SHOWN:
+            shown.append(f"... {len(inputs) - _NAMED_INPUTS_SHOWN} more")
+        return "; ".join(shown)
+
+    only_stored = unmatched(stored, current)
+    only_current = unmatched(current, stored)
+    if only_stored:
+        named = render(only_stored, current, "this trace")
+        delta += f". Named, earlier trace: {named}"
+    if only_current:
+        named = render(only_current, stored, "the earlier trace")
+        delta += f". Named, this trace: {named}"
+    return delta
+
+
+def _handover_error(key: str, delta: str) -> ShapeSpecializationError:
+    return ShapeSpecializationError(
+        f"{key} was compiled by another trace of this model whose inputs "
+        f"cannot be matched to this trace's ({delta}): named graph inputs are "
+        "matched by name, the rest by position, dtype and shape. Either the "
+        "graph is split, so its subgraph boundaries move with the "
+        "specialization, or the two "
+        "sides of a token-count branch lift different buffers; a bucket cannot "
+        "be handed between such traces. A split comes from "
+        "compilation_config.splitting_ops (boundaries declared by the model's "
+        "config hook or the caller, or the RPA boundaries TPU_KERNEL_ITER_MODE "
+        "adds): drop those boundaries, or give both sides of the branch the "
+        "same inputs, to serve this model."
+    )
 
 
 def graph_signature(graph: fx.GraphModule) -> tuple:
@@ -195,7 +470,7 @@ class BucketExecutables:
 
     def __init__(self) -> None:
         self._runnables: dict[
-            tuple[str | None, str], tuple[Callable[..., Any], tuple]
+            tuple[str | None, str], tuple[Callable[..., Any], list[_Input]]
         ] = {}
         self.refused: set[int] = set()
         self.traces = 0
@@ -206,19 +481,29 @@ class BucketExecutables:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
-        runnable, signature = found
-        if signature != _signature(graph):
-            raise ShapeSpecializationError(
-                f"{key} was compiled by another trace of this model whose "
-                f"inputs differ ({signature} vs {_signature(graph)}). The "
-                "graph is split, so its subgraph boundaries move with the "
-                "specialization and a bucket cannot be handed between traces. "
-                "The split comes from compilation_config.splitting_ops "
-                "(boundaries declared by the model's config hook or the "
-                "caller, or the RPA boundaries TPU_KERNEL_ITER_MODE adds); "
-                "drop those boundaries to serve this model."
-            )
-        return runnable
+        runnable, stored_inputs = found
+        current_inputs = _inputs(graph)
+        perm = _input_permutation(stored_inputs, current_inputs)
+        if perm is None:
+            raise _handover_error(key, _input_delta(stored_inputs, current_inputs))
+        if perm == list(range(len(perm))):
+            return runnable
+        moved = [stored_inputs[i].name for i, j in enumerate(perm) if j != i]
+        logger.info(
+            "[shape-variants] %s handed over with %d of %d inputs reordered: %s%s",
+            key,
+            len(moved),
+            len(perm),
+            ", ".join(moved[:_NAMED_INPUTS_SHOWN]),
+            " ..." if len(moved) > _NAMED_INPUTS_SHOWN else "",
+        )
+        # len(perm) >= 2 here, so itemgetter returns a tuple.
+        to_stored_order = operator.itemgetter(*perm)
+
+        def reordered(*args: Any) -> Any:
+            return runnable(*to_stored_order(args))
+
+        return reordered
 
     def put(
         self,
@@ -227,7 +512,10 @@ class BucketExecutables:
         graph: fx.GraphModule,
         runnable: Callable[..., Any],
     ) -> None:
-        self._runnables[(cache_dir, key)] = (runnable, _signature(graph))
+        # The inputs' names, values and sources are kept, not just their dtypes
+        # and shapes, so a refused handover can name the inputs that differ and
+        # where Dynamo read them from.
+        self._runnables[(cache_dir, key)] = (runnable, _inputs(graph))
 
     def needs_retrace(self, size: int) -> bool:
         """Whether a graph refused this bucket and no trace has built it yet.

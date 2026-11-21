@@ -25,10 +25,12 @@ reason, and same shape, as tests/distributed/tpu_test_utils.py.
 """
 
 import dataclasses
+import gc
 import importlib
 import multiprocessing
 import os
 import traceback
+import weakref
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -38,6 +40,8 @@ import sympy
 import torch
 import vllm
 from torch import fx, nn
+from torch._dynamo.source import LocalSource, TensorProperty, TensorPropertySource
+from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
 from torch.utils._sympy.value_ranges import ValueRanges
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
@@ -106,6 +110,26 @@ class SplitWaveModel(nn.Module):
 
 
 @support_torch_compile(dynamic_arg_dims={"x": 0})
+class LiftOrderModel(nn.Module):
+    """A weight and a buffer read after a split op, in an order that depends
+    on the token count: the trace of a one-wave bucket lifts the weight first
+    and the trace of a two-wave bucket the buffer first. Their shapes differ,
+    so an executable called with them in the wrong order can tell."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.full((HIDDEN,), 2.0), requires_grad=False)
+        self.register_buffer("shift", torch.ones(1, HIDDEN))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = SPLIT(x + 1.0)
+        waves = (x.shape[0] + 2047) // 2048
+        # Dynamo lifts a weight or buffer where the trace first reads it.
+        x = (x + self.shift) * self.scale if waves > 1 else x * self.scale + self.shift
+        return torch.cat([WAVE(chunk) for chunk in torch.chunk(x, waves)])
+
+
+@support_torch_compile(dynamic_arg_dims={"x": 0})
 class TieredModel(nn.Module):
     """Three structures, so a graph that over-claims its buckets is caught."""
 
@@ -139,9 +163,15 @@ class FakeExecutable:
 
     rows: int
     waves: int
+    # The shapes of the tensor inputs, in the order of the graph this was
+    # compiled from.
+    arg_shapes: tuple = ()
 
     def __call__(self, *args):
         CALLS.append((self.rows, self.waves))
+        ARG_ORDER.append(
+            (self.rows, self.waves, _tensor_shapes(args) == self.arg_shapes)
+        )
         return (torch.zeros(self.rows, HIDDEN),)
 
     def serialize(self):
@@ -156,6 +186,14 @@ class FakeExecutable:
 
 
 CALLS: list[tuple[int, int]] = []
+# (rows, waves, whether the call's tensor shapes came in the compiled order)
+ARG_ORDER: list[tuple[int, int, bool]] = []
+
+
+def _tensor_shapes(values) -> tuple:
+    return tuple(
+        tuple(int(d) for d in v.shape) for v in values if isinstance(v, torch.Tensor)
+    )
 
 
 class FakeTpuBackend:
@@ -175,7 +213,7 @@ class FakeTpuBackend:
         rows = max(t.shape[0] for t in example_inputs if isinstance(t, torch.Tensor))
         waves = sum(1 for node in graph.graph.nodes if "wave" in str(node.target))
         self.compiled.append((rows, waves))
-        return FakeExecutable(rows, waves)
+        return FakeExecutable(rows, waves, _tensor_shapes(example_inputs))
 
 
 @dataclasses.dataclass
@@ -270,6 +308,7 @@ def prepare(cache_root: str, splitting_ops=None):
     # torch's bundled-entry deserializer either; it is already the runnable.
     tpu_compiler._deserialize_entry = lambda entry: entry
     CALLS.clear()
+    ARG_ORDER.clear()
     return make_config(splitting_ops), backend
 
 
@@ -446,6 +485,98 @@ def _split_graph_is_refused(cache_root):
 
 def test_split_graph_cannot_hand_buckets_between_traces(tmp_path):
     in_child(partial(_split_graph_is_refused, str(tmp_path)))
+
+
+def _real_split_inputs_reorder_by_name(cache_root):
+    config, backend = prepare(
+        cache_root, splitting_ops=["tpu_shape_variants_test::split"]
+    )
+    remembered = []
+    remember = shape_variants.remember
+
+    def recording(cache_dir, key, graph, runnable):
+        remembered.append((key, shape_variants._inputs(graph)))
+        remember(cache_dir, key, graph, runnable)
+
+    shape_variants.remember = recording
+    model = build(LiftOrderModel, config)
+    assert warm(model, config) == 1
+
+    def described(inputs):
+        return [
+            (i.name, shape_variants._meta_entry(i.value), i.graph_input) for i in inputs
+        ]
+
+    tokens = ("torch.float32", ("?", HIDDEN))
+    weight = ("torch.float32", (HIDDEN,))
+    buffer = ("torch.float32", (1, HIDDEN))
+
+    # The subgraph after the split takes the split op's output, an
+    # intermediate, and lifts the weight and the buffer: only the lifted
+    # inputs are recognised as Dynamo's graph inputs on the real subgraph.
+    def lifts_the_weight(inputs):
+        return any(shape_variants._meta_entry(i.value) == weight for i in inputs)
+
+    after_split = [
+        (key, inputs) for key, inputs in remembered if lifts_the_weight(inputs)
+    ]
+    assert after_split, [described(inputs) for _, inputs in remembered]
+    orders = set()
+    for key, inputs in after_split:
+        by_meta = {shape_variants._meta_entry(i.value): i for i in inputs}
+        assert not by_meta[tokens].graph_input, (key, described(inputs))
+        assert by_meta[weight].graph_input and "scale" in by_meta[weight].name, key
+        assert by_meta[buffer].graph_input and "shift" in by_meta[buffer].name, key
+        size_inputs = [i for i in inputs if isinstance(i.value, torch.SymInt)]
+        assert size_inputs and all(i.graph_input for i in size_inputs), key
+        orders.add(
+            tuple(
+                shape_variants._meta_entry(i.value)
+                for i in inputs
+                if shape_variants._meta_entry(i.value) in (weight, buffer)
+            )
+        )
+    # The two traces really lift the two in opposite orders.
+    assert orders == {(weight, buffer), (buffer, weight)}, orders
+    # Every subgraph before the split takes the model's input as a graph input.
+    for key, inputs in remembered:
+        if lifts_the_weight(inputs):
+            continue
+        model_input = [
+            i for i in inputs if shape_variants._meta_entry(i.value) == tokens
+        ]
+        assert model_input and all(i.graph_input for i in model_input), (
+            key,
+            described(inputs),
+        )
+
+    # The one-wave buckets were compiled by the first trace and handed to the
+    # second, which takes the weight and the buffer the other way round: the
+    # handed-over executable still receives them in its own order.
+    assert sorted(backend.compiled) == [
+        (16, 0),
+        (16, 1),
+        (2048, 0),
+        (2048, 1),
+        (4096, 0),
+        (4096, 2),
+    ]
+    for num_tokens in BUCKETS:
+        ARG_ORDER.clear()
+        run(model, config, num_tokens)
+        assert ARG_ORDER and all(in_order for _, _, in_order in ARG_ORDER), (
+            num_tokens,
+            ARG_ORDER,
+        )
+
+
+def test_real_split_graph_inputs_reorder_by_name(tmp_path):
+    """Through vLLM's piecewise split, where Dynamo has already deleted every
+    placeholder's GraphArg: the lifted weight and buffer are recognised as
+    graph inputs on the real subgraph and the split op's output is not, so
+    two traces that lift the weight and the buffer in opposite orders hand a
+    bucket over with the call reordered."""
+    in_child(partial(_real_split_inputs_reorder_by_name, str(tmp_path)))
 
 
 def _warm_start_reuses_the_cache(cache_root):
@@ -696,3 +827,443 @@ def test_precompile_backbone_trace_first_env_guards(
         else:
             assert dummy_runs == [16, 32]
             assert compiled_batches == []
+
+
+def _stub_graph(order, metas=None, graph_inputs=True):
+    """A GraphModule whose placeholders carry the given names and metas.
+
+    With ``graph_inputs`` each placeholder is a Dynamo graph input read from a
+    source of its own name, as a lifted buffer or weight is; without, they are
+    a split subgraph's intermediates, which carry no source.
+    """
+    if metas is None:
+        metas = {
+            "hidden_states": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+            "gate_weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+            "dp_metadata": torch.empty(3, dtype=torch.int32),
+        }
+    graph = fx.Graph()
+    nodes = []
+    for name in order:
+        node = graph.placeholder(name)
+        node.meta["val"] = metas[name]
+        if graph_inputs:
+            node.meta["grapharg"] = SimpleNamespace(source=LocalSource(name))
+        nodes.append(node)
+    graph.output(tuple(nodes))
+    return fx.GraphModule(nn.Module(), graph)
+
+
+STORED_ORDER = ["hidden_states", "gate_weight", "dp_metadata"]
+
+
+def test_handover_reorders_a_permuted_input_list():
+    session = shape_variants.BucketExecutables()
+    received = []
+    session.put("dir", "key", _stub_graph(STORED_ORDER), lambda *a: received.append(a))
+
+    runnable = session.get(
+        "dir", "key", _stub_graph(["hidden_states", "dp_metadata", "gate_weight"])
+    )
+    runnable("hidden", "meta", "gate")  # this trace's order
+    assert received == [("hidden", "gate", "meta")]  # the executable's order
+
+
+def test_handover_of_an_identical_input_list_returns_the_runnable():
+    session = shape_variants.BucketExecutables()
+    compiled = lambda *args: args  # noqa: E731
+    session.put("dir", "key", _stub_graph(STORED_ORDER), compiled)
+    assert session.get("dir", "key", _stub_graph(STORED_ORDER)) is compiled
+
+
+def test_handover_reorders_equal_type_inputs_by_name():
+    metas = {
+        "gate_weight": torch.empty(1, dtype=torch.int32),
+        "dp_metadata": torch.empty(1, dtype=torch.int32),
+    }
+    session = shape_variants.BucketExecutables()
+    received = []
+    session.put(
+        "dir", "key", _stub_graph(list(metas), metas), lambda *a: received.append(a)
+    )
+    runnable = session.get(
+        "dir", "key", _stub_graph(["dp_metadata", "gate_weight"], metas)
+    )
+    runnable("metadata", "weight")
+    assert received == [("weight", "metadata")]
+
+
+def test_handover_of_renamed_inputs_matches_by_position():
+    renamed = {
+        "hidden": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "gate": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+        "meta": torch.empty(3, dtype=torch.int32),
+    }
+    session = shape_variants.BucketExecutables()
+    compiled = lambda *args: args  # noqa: E731
+    session.put("dir", "key", _stub_graph(STORED_ORDER), compiled)
+    assert session.get("dir", "key", _stub_graph(list(renamed), renamed)) is compiled
+
+
+def test_handover_of_renamed_inputs_refuses_a_positional_mismatch():
+    renamed = {
+        "hidden": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "meta": torch.empty(3, dtype=torch.int32),
+        "gate": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+    }
+    session = shape_variants.BucketExecutables()
+    session.put("dir", "key", _stub_graph(STORED_ORDER), lambda *a: a)
+    with pytest.raises(
+        shape_variants.ShapeSpecializationError, match="TPU_KERNEL_ITER_MODE"
+    ):
+        session.get("dir", "key", _stub_graph(list(renamed), renamed))
+
+
+def test_handover_refuses_an_input_whose_shape_changed():
+    session = shape_variants.BucketExecutables()
+    session.put("dir", "key", _stub_graph(STORED_ORDER), lambda *a: a)
+    changed = {
+        "hidden_states": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "gate_weight": torch.empty(HIDDEN, 4, dtype=torch.bfloat16),  # wider
+        "dp_metadata": torch.empty(3, dtype=torch.int32),
+    }
+    with pytest.raises(shape_variants.ShapeSpecializationError, match="gate_weight"):
+        session.get(
+            "dir",
+            "key",
+            _stub_graph(["hidden_states", "dp_metadata", "gate_weight"], changed),
+        )
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        ["hidden_states", "router_bias", "dp_metadata"],  # a different input
+        ["hidden_states", "gate_weight"],  # a missing input
+    ],
+)
+def test_handover_refuses_a_different_input_set(order):
+    session = shape_variants.BucketExecutables()
+    session.put("dir", "key", _stub_graph(STORED_ORDER), lambda *a: a)
+    metas = {
+        "hidden_states": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "gate_weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+        "router_bias": torch.empty(2, dtype=torch.bfloat16),
+        "dp_metadata": torch.empty(3, dtype=torch.int32),
+    }
+    with pytest.raises(
+        shape_variants.ShapeSpecializationError, match="TPU_KERNEL_ITER_MODE"
+    ):
+        session.get("dir", "key", _stub_graph(order, metas))
+
+
+def test_handover_matches_intermediates_by_position_not_by_name():
+    """A split subgraph's intermediates are named after the parent graph's node,
+    in creation order. Two traces that create the same two values in opposite
+    order give them each other's names while the subgraph still takes them in
+    the same order, so a match by name would swap them."""
+    metas = {
+        "getitem_7": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "getitem_8": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+    }
+    session = shape_variants.BucketExecutables()
+    compiled = lambda *args: args  # noqa: E731
+    stored = _stub_graph(["getitem_7", "getitem_8"], metas, graph_inputs=False)
+    session.put("dir", "key", stored, compiled)
+    current = _stub_graph(["getitem_8", "getitem_7"], metas, graph_inputs=False)
+    assert session.get("dir", "key", current) is compiled
+
+
+def test_handover_serves_renumbered_intermediates_of_different_shapes():
+    """Same renumbering with different shapes: the inputs still match by
+    position, as on main, so the bucket is handed over, not refused."""
+    stored_metas = {
+        "getitem_7": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "getitem_8": torch.empty(3, dtype=torch.int32),
+    }
+    current_metas = {
+        "getitem_8": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "getitem_7": torch.empty(3, dtype=torch.int32),
+    }
+    session = shape_variants.BucketExecutables()
+    compiled = lambda *args: args  # noqa: E731
+    order = ["getitem_7", "getitem_8"]
+    session.put("dir", "key", _stub_graph(order, stored_metas, False), compiled)
+    renumbered = _stub_graph(["getitem_8", "getitem_7"], current_metas, False)
+    assert session.get("dir", "key", renumbered) is compiled
+
+
+def test_handover_reorders_graph_inputs_around_positional_intermediates():
+    """Named graph inputs move by name; the intermediate keeps its position."""
+    metas = {
+        "l_self_weight_": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+        "l_self_bias_": torch.empty(2, dtype=torch.bfloat16),
+        "getitem_3": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+    }
+
+    def graph(order):
+        g = _stub_graph(order, metas)
+        for node in g.graph.nodes:
+            if node.name.startswith("getitem"):
+                del node.meta["grapharg"]
+        return g
+
+    session = shape_variants.BucketExecutables()
+    received = []
+    stored = graph(["getitem_3", "l_self_weight_", "l_self_bias_"])
+    session.put("dir", "key", stored, lambda *a: received.append(a))
+    runnable = session.get(
+        "dir", "key", graph(["getitem_3", "l_self_bias_", "l_self_weight_"])
+    )
+    runnable("x", "bias", "weight")
+    assert received == [("x", "weight", "bias")]
+
+
+def test_handover_refuses_named_inputs_moved_beside_a_changed_intermediate():
+    """The named graph inputs swap places while the intermediate keeps its
+    position but changes shape. Matching the named inputs by name alone would
+    hand the stored executable an intermediate it was not compiled for, so
+    the bucket is refused."""
+    stored_metas = {
+        "l_self_weight_": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+        "l_self_bias_": torch.empty(2, dtype=torch.bfloat16),
+        "getitem_3": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+    }
+    current_metas = {
+        **stored_metas,
+        "getitem_3": torch.empty(4, 2 * HIDDEN, dtype=torch.bfloat16),
+    }
+
+    def graph(order, metas):
+        g = _stub_graph(order, metas)
+        for node in g.graph.nodes:
+            if node.name.startswith("getitem"):
+                del node.meta["grapharg"]
+        return g
+
+    session = shape_variants.BucketExecutables()
+    stored = graph(["getitem_3", "l_self_weight_", "l_self_bias_"], stored_metas)
+    session.put("dir", "key", stored, lambda *a: a)
+    current = graph(["getitem_3", "l_self_bias_", "l_self_weight_"], current_metas)
+    with pytest.raises(shape_variants.ShapeSpecializationError, match="getitem_3"):
+        session.get("dir", "key", current)
+
+
+def test_handover_reorders_graph_inputs_that_carry_no_grapharg():
+    """The graphs vLLM compiles carry no GraphArg: a tensor input is known by
+    the tensor_dict Dynamo records on it, an int input by being the size
+    symbol it is named after."""
+    env = ShapeEnv()
+    size = _token_symint(env, POSITIONS_SIZE)
+    metas = {
+        "l_self_weight_": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+        "l_self_bias_": torch.empty(2, dtype=torch.bfloat16),
+        str(size.node.expr): size,
+    }
+
+    def graph(order):
+        g = fx.Graph()
+        for name in order:
+            node = g.placeholder(name)
+            node.meta["val"] = metas[name]
+            if name.startswith("l_"):
+                node.meta["tensor_dict"] = {}
+        g.output(tuple(g.nodes))
+        return fx.GraphModule(nn.Module(), g)
+
+    symbol = str(size.node.expr)
+    session = shape_variants.BucketExecutables()
+    received = []
+    stored = graph([symbol, "l_self_weight_", "l_self_bias_"])
+    assert all(i.graph_input for i in shape_variants._inputs(stored))
+    session.put("dir", "key", stored, lambda *a: received.append(a))
+    current = graph([symbol, "l_self_bias_", "l_self_weight_"])
+    runnable = session.get("dir", "key", current)
+    runnable(4, "bias", "weight")
+    assert received == [(4, "weight", "bias")]
+
+
+def test_a_stored_bucket_does_not_keep_its_graph_alive():
+    """put() keeps what a handover compares and a refusal names, not the
+    placeholder nodes, which would hold their GraphModule until the warmup
+    ends: one compiler deep copy per subgraph and bucket."""
+    session = shape_variants.BucketExecutables()
+    graph = _stub_graph(STORED_ORDER)
+    graph_ref = weakref.ref(graph)
+    compiled = lambda *args: args  # noqa: E731
+    session.put("dir", "key", graph, compiled)
+    del graph
+    gc.collect()
+    assert graph_ref() is None
+    assert session.get("dir", "key", _stub_graph(STORED_ORDER)) is compiled
+
+
+def test_signature_delta_names_only_the_inputs_that_differ():
+    shared = [("torch.bfloat16", (4096,))] * 1245
+    stored = tuple(shared + [("torch.int32", ())] * 60 + [("torch.bool", (256,))])
+    current = tuple(shared + [("torch.int32", (8,)), ("torch.int32", (1, 1))])
+
+    delta = shape_variants._signature_delta(stored, current)
+
+    assert "1306 inputs vs 1247" in delta
+    assert "60x ('torch.int32', ())" in delta
+    assert "1x ('torch.bool', (256,))" in delta
+    assert "1x ('torch.int32', (8,))" in delta
+    assert "torch.bfloat16" not in delta  # the 1245 both traces take
+
+
+def test_signature_delta_ignores_order():
+    a = (("torch.int32", ()), ("torch.bool", (4,)))
+    assert shape_variants._signature_delta(a, a[::-1]) == (
+        "2 inputs vs 2. Only in the earlier trace: nothing. Only in this one: nothing"
+    )
+
+
+def _token_symint(shape_env, source, hint=4):
+    symbol = shape_env.create_symbol(hint, source, dynamic_dim=DimDynamic.DYNAMIC)
+    return shape_env.create_symintnode(symbol, hint=hint, source=source)
+
+
+def _int_graph(order, metas, sources=None):
+    """A GraphModule with the given placeholders, int ones among them;
+    ``sources`` maps a name to the Dynamo source it was read from."""
+    sources = sources or {}
+    graph = fx.Graph()
+    for name in order:
+        node = graph.placeholder(name)
+        node.meta["val"] = metas[name]
+        if name in sources:
+            node.meta["grapharg"] = SimpleNamespace(source=sources[name])
+    graph.output(tuple(graph.nodes))
+    return fx.GraphModule(nn.Module(), graph)
+
+
+POSITIONS_SIZE = TensorPropertySource(LocalSource("positions"), TensorProperty.SIZE, 0)
+HIDDEN_SIZE = TensorPropertySource(LocalSource("hidden"), TensorProperty.SIZE, 0)
+
+
+def _int_metas():
+    env = ShapeEnv()
+    return {
+        "s_pos": _token_symint(env, POSITIONS_SIZE),
+        "s_hid": _token_symint(env, HIDDEN_SIZE),
+        "hidden": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+    }
+
+
+def _trace_int_metas(specialize_hidden):
+    """One trace's inputs, with a ShapeEnv of its own as each Dynamo trace
+    has; with ``specialize_hidden`` the trace pinned the hidden size to 4,
+    so its graph does not take it."""
+    env = ShapeEnv()
+    metas = {
+        "s_pos": _token_symint(env, POSITIONS_SIZE),
+        "s_hid": _token_symint(env, HIDDEN_SIZE),
+        "hidden": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+    }
+    if specialize_hidden:
+        assert metas["s_hid"] == 4  # a guard that replaces the symbol by 4
+    return metas
+
+
+def test_input_delta_reads_an_int_inputs_sources_off_its_symbol():
+    """The graphs vLLM compiles carry no GraphArg, so the refusal finds an int
+    input's sources on its symbol, in its own trace's ShapeEnv, and names
+    what the other trace's ShapeEnv concluded about the same source."""
+    stored = _int_graph(["s_pos", "s_hid", "hidden", "weight"], _trace_int_metas(False))
+    current = _int_graph(["s_pos", "hidden", "weight"], _trace_int_metas(True))
+    session = shape_variants.BucketExecutables()
+    session.put("dir", "key", stored, lambda *a: a)
+
+    with pytest.raises(shape_variants.ShapeSpecializationError) as info:
+        session.get("dir", "key", current)
+
+    named = str(info.value).split("Named, earlier trace: ")[1]
+    assert named.startswith("s_hid SymInt")
+    assert "from L['hidden'].size()[0]" in named
+    # The current trace's ShapeEnv pinned the symbol that reads that source.
+    assert "= 4 in this trace" in named
+
+
+OTHER_SIZE = TensorPropertySource(LocalSource("other"), TensorProperty.SIZE, 0)
+
+
+@pytest.mark.parametrize("read_by_the_other_trace", [HIDDEN_SIZE, OTHER_SIZE])
+def test_input_delta_matches_each_source_of_an_int_inputs_symbol(
+    read_by_the_other_trace,
+):
+    """Duck sizing gives the earlier trace's hidden size one symbol with two
+    sources; the current trace pinned whichever one it reads. The refusal
+    finds the pinned symbol through either source on its own, not through the
+    joined source text or the first source only."""
+    env = ShapeEnv()
+    symbol = env.create_symbol(4, HIDDEN_SIZE, dynamic_dim=DimDynamic.DUCK)
+    assert env.create_symbol(4, OTHER_SIZE, dynamic_dim=DimDynamic.DUCK) == symbol
+    assert [s.name for s in env.var_to_sources[symbol]] == [
+        HIDDEN_SIZE.name,
+        OTHER_SIZE.name,
+    ]
+    stored_metas = {
+        "s_pos": _token_symint(env, POSITIONS_SIZE, hint=8),
+        "s_hid": env.create_symintnode(symbol, hint=4, source=HIDDEN_SIZE),
+        "hidden": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+    }
+    current_env = ShapeEnv()
+    current_metas = {
+        "s_pos": _token_symint(current_env, POSITIONS_SIZE, hint=8),
+        "hidden": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+    }
+    assert _token_symint(current_env, read_by_the_other_trace) == 4  # pinned
+    stored = _int_graph(["s_pos", "s_hid", "hidden", "weight"], stored_metas)
+    current = _int_graph(["s_pos", "hidden", "weight"], current_metas)
+    session = shape_variants.BucketExecutables()
+    session.put("dir", "key", stored, lambda *a: a)
+
+    with pytest.raises(shape_variants.ShapeSpecializationError) as info:
+        session.get("dir", "key", current)
+
+    named = str(info.value).split("Named, earlier trace: ")[1]
+    assert named.startswith("s_hid SymInt")
+    assert f"from {HIDDEN_SIZE.name}, {OTHER_SIZE.name}" in named
+    assert "= 4 in this trace" in named
+
+
+def test_input_delta_names_the_earlier_trace_for_an_input_only_this_one_takes():
+    metas = _int_metas()
+    sources = {"s_pos": POSITIONS_SIZE, "s_hid": HIDDEN_SIZE}
+    stored = _int_graph(["s_pos", "hidden", "weight"], metas, sources)
+    current = _int_graph(["s_pos", "s_hid", "hidden", "weight"], metas, sources)
+    session = shape_variants.BucketExecutables()
+    session.put("dir", "key", stored, lambda *a: a)
+
+    with pytest.raises(shape_variants.ShapeSpecializationError) as info:
+        session.get("dir", "key", current)
+
+    named = str(info.value).split("Named, this trace: ")[1]
+    assert named.startswith("s_hid SymInt")
+    # What the earlier trace's ShapeEnv knows of the symbol s_hid reads.
+    assert "in the earlier trace" in named
+    assert "in this trace" not in named
+
+
+def test_input_delta_names_the_int_input_one_trace_dropped():
+    metas = _int_metas()
+    sources = {"s_pos": POSITIONS_SIZE, "s_hid": HIDDEN_SIZE}
+    stored = _int_graph(["s_pos", "s_hid", "hidden", "weight"], metas, sources)
+    current = _int_graph(["s_pos", "hidden", "weight"], metas, sources)
+    session = shape_variants.BucketExecutables()
+    session.put("dir", "key", stored, lambda *a: a)
+
+    with pytest.raises(shape_variants.ShapeSpecializationError) as info:
+        session.get("dir", "key", current)
+
+    message = str(info.value)
+    assert "4 inputs vs 3" in message
+    assert "Named, earlier trace: s_hid SymInt" in message
+    assert "from L['hidden'].size()[0]" in message
+    assert "in this trace" in message  # what the current ShapeEnv knows of it
+    assert "s_pos" not in message.split("Named")[1]  # both traces take it
