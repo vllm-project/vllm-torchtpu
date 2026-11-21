@@ -349,18 +349,49 @@ def test_failed_hold_backs_off_exponentially_per_target(shared_model_config):
     assert set(scheduler.schedule().num_scheduled_tokens) == {"stuck"}
 
 
+def test_a_decode_leg_runs_the_queue_selection_once_per_step(
+    shared_model_config, monkeypatch
+):
+    """vLLM 0.33's Scheduler.schedule has no waiting-queue selection hook of
+    its own, so on a decode leg the warmest-first promotion runs once per
+    step, from PrefixAwareScheduler.schedule."""
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config, scheduler_cls=PrefixAwareScheduler
+    )
+    scheduler._is_kv_consumer = True
+    calls = []
+    select = PrefixAwareScheduler._select_waiting_queue_for_scheduling
+
+    def counting_select(self):
+        calls.append(self)
+        return select(self)
+
+    monkeypatch.setattr(
+        PrefixAwareScheduler, "_select_waiting_queue_for_scheduling", counting_select
+    )
+    for i in range(3):
+        scheduler.add_request(_make_real_request(f"r{i}", 32, hasher, seed=i))
+    scheduler.schedule()
+    scheduler.schedule()
+    assert calls == [scheduler, scheduler]
+
+
 @pytest.mark.parametrize(
-    ("scheduler_cls", "expected_running", "expected_preempted"),
+    ("scheduler_cls", "decode_leg", "expected_running", "expected_preempted"),
     [
         # Admission order leaves `dec` at running[-1], so it is preempted.
-        (PrefixAwareScheduler, ["long", "short"], "dec"),
+        (PrefixAwareScheduler, False, ["long", "short"], "dec"),
+        # On a decode leg, decoders first moves `dec` to running[0], which
+        # leaves `short` (behind `long` in admission order) at running[-1].
+        (PrefixAwareScheduler, True, ["dec", "long"], "short"),
         # SRPT order puts `long` at running[-1], so it is preempted instead.
-        (SrptPrefillScheduler, ["dec", "short"], "long"),
+        (SrptPrefillScheduler, False, ["dec", "short"], "long"),
     ],
 )
-def test_kv_pressure_preempts_longest_prefill(
+def test_kv_pressure_preempts_the_last_running_request(
     shared_model_config,
     scheduler_cls,
+    decode_leg,
     expected_running,
     expected_preempted,
 ):
@@ -371,6 +402,11 @@ def test_kv_pressure_preempts_longest_prefill(
         max_num_batched_tokens=48,
         long_prefill_token_threshold=BLOCK_SIZE,
     )
+    if decode_leg:
+        # A KV consumer of prefill/decode disaggregation, without a connector.
+        # Set after construction, so the cross-step memo stays off; decoders
+        # first and the preemption victim do not depend on it.
+        scheduler._is_kv_consumer = True
     reqs = {
         "long": _make_real_request("long", 64, hasher, seed=1),
         "short": _make_real_request("short", 32, hasher, seed=2),
