@@ -51,7 +51,7 @@ from tests.megakernel.test_advisor_specs import (
 )
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import advisor
-from vllm_torchtpu.megakernel.advisor import chips, constants
+from vllm_torchtpu.megakernel.advisor import chips, constants, models
 from vllm_torchtpu.megakernel.advisor.chips import resolve_chip_spec
 from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.core.exec_spec import Tiles
@@ -1767,6 +1767,62 @@ def test_recommend_parallelism_multi_axis_dcp() -> None:
     assert rec_kv2.dcp >= 1
 
 
+def test_cli_and_html_render_layer_group_search(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Verify `--search-layer-groups` CLI table/JSON and HTML card render."""
+    rc = advisor.main(
+        [
+            "--model",
+            "kimi-k3",
+            "--phase",
+            "prefill",
+            "--isl",
+            "512",
+            "--tp",
+            "32",
+            "--ep",
+            "16",
+            "--pcp",
+            "32",
+            "--search-layer-groups",
+        ]
+    )
+    assert rc == 0
+    stdout_text = capsys.readouterr().out
+    assert "Layer-Group Partition Search: kimi-k3" in stdout_text
+    assert "one fused kernel per group" in stdout_text
+
+    json_out = tmp_path / "lg_search.json"
+    rc_json = advisor.main(
+        [
+            "--model",
+            "kimi-k3",
+            "--phase",
+            "prefill",
+            "--isl",
+            "512",
+            "--tp",
+            "32",
+            "--ep",
+            "16",
+            "--pcp",
+            "32",
+            "--search-layer-groups",
+            "--json",
+            str(json_out),
+        ]
+    )
+    assert rc_json == 0
+    payload = json.loads(json_out.read_text(encoding="utf-8"))
+    assert payload["best"]["num_groups"] == 1
+
+    sweep = advisor.advise_regimes("kimi-k3", "tpu7x")
+    html_text = advisor.render_advisor_html(sweep)
+    assert "7. Layer-Group Partition Search" in html_text
+
+
 def test_measured_collective_applies_only_at_its_group_size() -> None:
     """Verify collective measurement is ignored when group size mismatches eff_tp."""
     workload = advisor.WorkloadSpec(phase="decode", batch=16, tp=4, ep=1)
@@ -2180,3 +2236,76 @@ def test_glm52_regime_sweep_and_disagg_indexer_wire_bytes() -> None:
         f"({glm_profile.num_indexer_layers} indexer layers)" in html
     )
     assert KERNEL_NAME_DENYLIST.search(html) is None
+
+
+def _slice_model_listing_entries(listing_text: str) -> dict[str, str]:
+    """Slice `--list-models` stdout into per-preset sections by entry header."""
+    matches: list[tuple[int, str]] = []
+    for preset_name in advisor.MODEL_PRESETS:
+        assert preset_name in listing_text
+        regex_text = rf"(?m)^[^\S\n]*{re.escape(preset_name)}(?=[\s:,|]).*tier="
+        pattern = re.compile(regex_text)
+        found = pattern.search(listing_text)
+        assert found is not None, f"Missing preset listing line for {preset_name}"
+        matches.append((found.start(), preset_name))
+    matches.sort(key=lambda pair: pair[0])
+    entries: dict[str, str] = {}
+    for index, (start_pos, preset_name) in enumerate(matches):
+        next_index = index + 1
+        if next_index < len(matches):
+            end_pos = matches[next_index][0]
+        else:
+            end_pos = len(listing_text)
+        entries[preset_name] = listing_text[start_pos:end_pos]
+    return entries
+
+
+def test_cli_list_models_explicit_tiers(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify `--list-models` prints tiers, layouts, and dtype basis."""
+    exit_code = advisor.main(["--list-models"])
+    assert exit_code == 0
+    listing_text = capsys.readouterr().out
+    assert "tpu7x" in listing_text
+    assert "v6e" in listing_text
+    assert "chip_without_core_budget" in listing_text
+    assert "priced from hardware rates only" in listing_text
+    assert "priced as physics only" not in listing_text
+
+    expected_tiers: dict[str, str] = {
+        "deepseek-v3": "priced_only",
+        "glm-5.2": "priced_only",
+        "gpt-oss-120b": "priced_only",
+        "kimi-k3": "declared",
+        "kimi-k3.1-pro": "priced_only",
+        "llama-3.1-405b": "priced_only",
+        "llama-4-maverick": "core_families",
+        "mistral-large": "priced_only",
+        "mixtral-8x22b": "core_families",
+        "qwen3-30b-a3b": "core_families",
+        "qwen3.5-0.8b": "priced_only",
+        "qwen3.5-397b": "declared",
+        "qwen3.8-2.4t": "priced_only",
+    }
+    assert set(expected_tiers) == set(advisor.MODEL_PRESETS)
+
+    entries_by_preset = _slice_model_listing_entries(listing_text)
+    for preset_name, expected_tier in expected_tiers.items():
+        entry_text = entries_by_preset[preset_name]
+        assert f"tier={expected_tier}" in entry_text
+        dtype_basis = models.MODEL_PRESET_DTYPE_BASIS[preset_name]
+        if dtype_basis == "unverified":
+            assert "not re-read" in entry_text
+        elif dtype_basis == "assumed":
+            assert "assumed serving dtype" in entry_text
+
+    kimi_entry = entries_by_preset["kimi-k3"]
+    kimi_deployment = advisor.DEPLOYMENT_PRESETS["kimi-k3"]
+    decode_megakernel = kimi_deployment.decode.megakernel
+    assert decode_megakernel is not None
+    assert kimi_deployment.decode.label() in kimi_entry
+    assert kimi_deployment.decode.submodule_label() in kimi_entry
+    assert str(decode_megakernel["source_ref"]) in kimi_entry
+    for note in kimi_deployment.unmodeled_notes:
+        assert note in kimi_entry
