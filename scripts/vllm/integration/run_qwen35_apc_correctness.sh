@@ -18,6 +18,9 @@
 # path, which the disagg job does not.
 set -euo pipefail
 
+# Ensure KV_TRANSPORT is defined to avoid failures with `set -u`.
+: "${KV_TRANSPORT:=raiden}"
+
 MODEL="${MODEL:-Qwen/Qwen3.5-35B-A3B-FP8}"
 PORT="${PORT:-8000}"
 STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-2700}"
