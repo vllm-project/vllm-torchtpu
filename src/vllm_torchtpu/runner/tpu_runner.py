@@ -1143,9 +1143,23 @@ def _prep_fold_shapes(
     buckets = set(num_tokens_paddings)
     for n in range(1, max_num_reqs + 1):
         if n * width in buckets:
-            for rows in {n, _get_padded_num_reqs_with_upper_limit(n, max_num_reqs)}:
+            for rows in _prep_fold_rows(n, max_num_reqs):
                 shapes.add((rows, n * width))
     return shapes
+
+
+# The rejected counts come from the previous step, so their rows are the
+# previous step's request count: this step's n, or a few more when requests
+# finished in between (served c16 logged rows n+1 and n+2 as unwarmed keys).
+PREP_FOLD_PREV_ROWS = 3
+
+
+def _prep_fold_rows(n: int, max_num_reqs: int) -> set[int]:
+    """Rejected-count row counts warmed for a step of `n` requests: exact and
+    bucketed `n`, and the previous step's count up to PREP_FOLD_PREV_ROWS more."""
+    rows = {n, _get_padded_num_reqs_with_upper_limit(n, max_num_reqs)}
+    rows.update(range(n + 1, min(n + PREP_FOLD_PREV_ROWS, max_num_reqs) + 1))
+    return rows
 
 
 def _prep_fold_scatter_shapes(
@@ -1155,12 +1169,14 @@ def _prep_fold_scatter_shapes(
     serves with the substitution scatter (verify tokens not filling the bucket,
     or rows that moved): every request count, in the bucket holding its
     `n * width` tokens, exact and bucketed rows."""
-    return {
-        (rows, tokens)
-        for rows, tokens, _ in _subtract_rejected_shapes(
-            max_num_reqs, width, num_tokens_paddings, {0}, False
-        )
-    }
+    shapes: set[tuple[int, int]] = set()
+    for n in range(1, max_num_reqs + 1):
+        if n * width > num_tokens_paddings[-1]:
+            break
+        tokens = _get_padded_token_len(num_tokens_paddings, n * width)
+        for rows in _prep_fold_rows(n, max_num_reqs):
+            shapes.add((rows, tokens))
+    return shapes
 
 
 logger = init_logger(__name__)
@@ -4400,13 +4416,33 @@ class TPUModelRunner(GPUModelRunner):
             *subst_args,
         )
         static = dict(num_tokens=num_tokens, ids_dtype=self.input_ids.dtype, **static)
-        key = _prep_fold_key(args, static)
-        if key not in self.__dict__.get("_prep_fold_keys", ()):
-            missed = self.__dict__.setdefault("_prep_fold_missed", set())
-            if key not in missed:
-                missed.add(key)
-                logger.info("PREFWD_PREP_FOLD: key %s not warmed, unfolded path", key)
-            return None
+        # The full key walks every operand (~20 us of host time per step); the
+        # operands' shapes vary only with these, so remember each verdict.
+        fast = (
+            num_tokens,
+            tuple(args[0].shape),  # seq_lens slots: the adapter operands follow it
+            tuple(args[2].shape),
+            tuple(src.shape),
+            src.dtype,
+            len(subst_args),
+            len(args),
+            tuple(sorted(static.items())),
+        )
+        # Only hits are remembered (a miss recomputes the full key, so keys
+        # warmed later are picked up).
+        memo = self.__dict__.setdefault("_prep_fold_memo", set())
+        if fast not in memo:
+            key = _prep_fold_key(args, static)
+            if key in self.__dict__.get("_prep_fold_keys", ()):
+                memo.add(fast)
+            else:
+                missed = self.__dict__.setdefault("_prep_fold_missed", set())
+                if key not in missed:
+                    missed.add(key)
+                    logger.info(
+                        "PREFWD_PREP_FOLD: key %s not warmed, unfolded path", key
+                    )
+                return None
         if envs.VLLM_TPU_PREFWD_PREP_FOLD == 2:
             logger.info_once(
                 "PREFWD_PREP_FOLD=2: the spec-tail/draft-cat fold is not "
