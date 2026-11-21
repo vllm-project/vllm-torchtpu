@@ -300,9 +300,8 @@ def test_check_accepts_the_steady_state():
 
 
 def test_check_refuses_when_the_scheduler_advanced_differently():
-    r, kw = _steady(
-        advance=[D, D]
-    )  # a ignores its rejected draft (e.g. capped near max_model_len)
+    # a ignores its rejected draft (e.g. capped near max_model_len)
+    r, kw = _steady(advance=[D, D])
     assert dc.check(r, **kw) is None
 
 
