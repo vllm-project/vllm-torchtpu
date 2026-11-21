@@ -81,6 +81,16 @@ def _kernel(
         k_out[:, h * dim : (h + 1) * dim] = k.astype(k_out.dtype)
 
 
+# The largest q output block (tile x heads x dim elements) one grid step takes.
+# The step's q-side blocks (the q_gate input, twice this, and the q and gate
+# outputs) then hold 4 x 2**20 elements, 8 MiB in bf16 or 16 MiB double
+# buffered; the k and rope blocks add at most 3 MiB at the served geometries.
+# With 16 heads of 256 (TP2), a 1024-row tile needed 73.6M of VMEM against
+# 63.9M available; the cap gives it 256 rows (TP1: 128, TP8: the 1024-row
+# default).
+MAX_Q_BLOCK_ELEMENTS = 1 << 20
+
+
 def legal_tile(rows: int, cap: int) -> int:
     """The largest multiple of 8 up to ``cap`` dividing ``rows``, else ``rows``.
 
@@ -113,7 +123,7 @@ def qk_norm_rope_gate(
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     tokens = q_gate.shape[0]
-    vmem_tile_cap = max(8, (1024 * 1024) // max(heads * dim, 1))
+    vmem_tile_cap = max(8, MAX_Q_BLOCK_ELEMENTS // max(heads * dim, 1))
     tile = legal_tile(tokens, min(tile, vmem_tile_cap))
     kernel = functools.partial(
         _kernel, heads=heads, kv_heads=kv_heads, dim=dim, rot=rot, eps=eps
