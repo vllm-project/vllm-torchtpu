@@ -463,6 +463,36 @@ def test_rule_is_batch1_decode(max_num_seqs, kv_role, expected):
     assert host_trims.rule(_config(max_num_seqs, kv_role)) is expected
 
 
+def test_rule_reads_vllms_config_fields():
+    # vLLM's own config objects, so a renamed field fails here.
+    from vllm.config import KVTransferConfig, SchedulerConfig
+
+    def cfg(kv_role):
+        return types.SimpleNamespace(
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=1, max_model_len=4096, is_encoder_decoder=False
+            ),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="TPURaidenConnector", kv_role=kv_role
+            ),
+        )
+
+    assert host_trims.rule(cfg("kv_consumer")) is True
+    assert host_trims.rule(cfg("kv_both")) is True
+    assert host_trims.rule(cfg("kv_producer")) is False
+
+
+def test_rule_fails_on_a_config_without_its_fields():
+    # A KV config without is_kv_producer (say, renamed upstream) must not
+    # read as "not a producer" and turn the trims on for a prefill engine.
+    renamed = _config(1)
+    renamed.kv_transfer_config = types.SimpleNamespace(is_kv_consumer=False)
+    with pytest.raises(AttributeError, match="is_kv_producer"):
+        host_trims.rule(renamed)
+    with pytest.raises(AttributeError, match="scheduler_config"):
+        host_trims.rule(types.SimpleNamespace(kv_transfer_config=None))
+
+
 def test_configure_turns_every_trim_on_and_off(restore_trims):
     host_trims.configure(_config(1, "kv_consumer"))
     assert host_trims.ENABLED and host_trims.AOT_SKIP_GUARDS
