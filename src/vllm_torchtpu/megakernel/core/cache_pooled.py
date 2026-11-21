@@ -89,8 +89,16 @@ def make_pooled_step(
     def _call(
         pos: Any, hidden: Any, weights: dict[str, Any], states_or_raw: Any, *rest: Any
     ) -> Any:
-        is_dict, states_dict, raw_pools, *meta = parse_call_args(b, states_or_raw, rest)
-        page_table, ckpt_indices, read_offsets, active_seqs, extra_tuple = meta
+        (
+            is_dict,
+            states_dict,
+            raw_pools,
+            page_table,
+            ckpt_indices,
+            read_offsets,
+            active_seqs,
+            extra_tuple,
+        ) = parse_call_args(b, states_or_raw, rest)
         if b.has_rec and cache_exec(b.ex_paged).check_ckpt_bounds:
             check_ckpt_bounds_per_rank(
                 b, page_table, ckpt_indices, read_offsets, active_seqs
@@ -114,8 +122,16 @@ def make_pooled_step(
     def _lower(
         pos: Any, hidden: Any, weights: dict[str, Any], states_or_raw: Any, *rest: Any
     ) -> Any:
-        _, _, raw_pools, *meta = parse_call_args(b, states_or_raw, rest)
-        page_table, ckpt_indices, read_offsets, active_seqs, extra_tuple = meta
+        (
+            _,
+            _,
+            raw_pools,
+            page_table,
+            ckpt_indices,
+            read_offsets,
+            active_seqs,
+            extra_tuple,
+        ) = parse_call_args(b, states_or_raw, rest)
         return _jitted_step.lower(
             pos,
             hidden,
