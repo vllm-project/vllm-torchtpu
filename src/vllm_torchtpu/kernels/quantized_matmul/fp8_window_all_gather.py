@@ -60,6 +60,9 @@ COLLECTIVE_ID = 15
 # over the whole K, so the arithmetic is unchanged.
 _TILE_COPY_PARTS = 4
 _LANES = 128
+# Avoid fusing q_a_layernorm for m >= 8 where the separate fusion schedules
+# better with larger collective/attention buckets.
+QNORM_MAX_M = 4
 
 
 def _chip_xor_steps(num_chips: int) -> tuple[int, ...]:
@@ -106,6 +109,10 @@ def supports(m: int, k: int, n: int, num_cores: int) -> bool:
     )
 
 
+def supports_qnorm(m: int, k: int, n: int, num_cores: int) -> bool:
+    return 0 < m <= QNORM_MAX_M and supports(m, k, n, num_cores)
+
+
 def _kernel(
     rank_ref,
     *refs,
@@ -118,9 +125,15 @@ def _kernel(
     q_dtype,
     use_d2d,
     ws_in_hbm,
+    has_rmsnorm,
+    eps,
 ):
     lane_ref, *refs = refs if lane_axis is not None else (None, *refs)
-    x_ref, ws_ref, w_hbm, o_ref, xq_ref, xs_ref, wbuf, wsem, *tail = refs
+    if has_rmsnorm:
+        x_ref, ws_ref, w_hbm, nw_ref, o_ref, xq_ref, xs_ref, wbuf, wsem, *tail = refs
+    else:
+        nw_ref = None
+        x_ref, ws_ref, w_hbm, o_ref, xq_ref, xs_ref, wbuf, wsem, *tail = refs
     if ws_in_hbm:
         ws_vmem, ws_sem, *tail = tail
     else:
@@ -183,6 +196,15 @@ def _kernel(
     # Activation quant: fp8_skinny._kernel's formula (bit-identical x_q and scale).
     q_max = float(jnp.finfo(q_dtype).max)
     x = x_ref[...]
+    if has_rmsnorm:
+        assert nw_ref is not None
+        xf = x.astype(jnp.float32)
+        inv = jax.lax.rsqrt(
+            jnp.mean(xf * xf, axis=-1, keepdims=True) + jnp.float32(eps)
+        )
+        # Avoid intermediate bf16 rounding before norm_w multiply: XLA TPU
+        # keeps f32 excess precision across the RMSNorm weight multiply.
+        x = ((xf * inv) * nw_ref[...].astype(jnp.float32)).astype(x.dtype)
     scale = jnp.max(jnp.abs(x), axis=1, keepdims=True).astype(
         jnp.float32
     ) * jnp.float32(1.0 / q_max)
@@ -274,10 +296,23 @@ def _kernel(
 
 
 @functools.cache
-def _build(m, k, n_out, w_dtype, x_dtype, num_cores, axis, lane_axis, use_d2d):
+def _build(
+    m,
+    k,
+    n_out,
+    w_dtype,
+    x_dtype,
+    num_cores,
+    axis,
+    lane_axis,
+    use_d2d,
+    nw_dtype=None,
+    eps=1e-6,
+):
     width = n_out // num_cores
     t, nbuf, ws_in_hbm = _window_tile_config(m, k, n_out, width, use_d2d)
     n_tiles = width // t
+    has_rmsnorm = nw_dtype is not None
     scratch = [
         pltpu.VMEM((m, k), jnp.bfloat16),  # x_q (fp8 values held as bf16)
         pltpu.VMEM((m, 1), jnp.float32),  # x scale
@@ -303,16 +338,21 @@ def _build(m, k, n_out, w_dtype, x_dtype, num_cores, axis, lane_axis, use_d2d):
         q_dtype=w_dtype,
         use_d2d=use_d2d,
         ws_in_hbm=ws_in_hbm,
+        has_rmsnorm=has_rmsnorm,
+        eps=float(eps),
     )
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    in_specs = [vmem, hbm if ws_in_hbm else vmem, hbm]
+    if has_rmsnorm:
+        in_specs.append(vmem)
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=1 if lane_axis is None else 2,
-        in_specs=[vmem, hbm if ws_in_hbm else vmem, hbm],
+        in_specs=in_specs,
         out_specs=vmem,
         scratch_shapes=scratch,
     )
-    suffix = "_d2d" if use_d2d else ""
+    suffix = ("_rn" if has_rmsnorm else "") + ("_d2d" if use_d2d else "")
     call = pl.pallas_call(
         kern,
         out_shape=jax.ShapeDtypeStruct((m, n_out), x_dtype),
@@ -330,6 +370,18 @@ def _call_constrained(call, scalars, x, w_s2, w_q, ws_in_hbm):
     return call(*scalars, x, w_s_in, pltpu.with_memory_space_constraint(w_q, pltpu.HBM))
 
 
+@functools.partial(jax.jit, static_argnums=(0, 6))
+def _call_constrained_rmsnorm(call, scalars, x, w_s2, w_q, norm_w2, ws_in_hbm):
+    w_s_in = pltpu.with_memory_space_constraint(w_s2, pltpu.HBM) if ws_in_hbm else w_s2
+    return call(
+        *scalars,
+        x,
+        w_s_in,
+        pltpu.with_memory_space_constraint(w_q, pltpu.HBM),
+        norm_w2,
+    )
+
+
 def fp8_window_all_gather(
     x,
     w_q,
@@ -341,16 +393,17 @@ def fp8_window_all_gather(
     lane_axis=None,
     lane=None,
     d2d_pair_first: bool | None = None,
+    norm_w=None,
+    eps: float = 1e-6,
 ):
-    """`fp8_skinny(x, w_q, w_s)` on every rank of mesh axis `axis`, each rank
-    computing only its column window `rank` and all-gathering the rest, inside a
-    shard_map over that axis.
+    """Project column windows with `fp8_skinny` and all-gather them over `axis`.
 
     x bf16 [m <= 16, k] (the same on every rank); w_q fp8_e4m3fn [k, n] (K-major,
     replicated); w_s f32 [n]; rank int32 [1] (this core's index on the axis, as
     data) -> bf16 [m, n]. A mesh with a second axis names it `lane_axis` and
     passes this core's index on it as `lane` (int32 [1]): peers are this lane's
-    ranks.
+    ranks. If `norm_w` (`[k]`) is provided, applies RMSNorm(x, norm_w, eps) in
+    registers under the weight-DMA shadow before FP8 activation quantization.
     """
     m, k = x.shape
     n_out = w_q.shape[1]
@@ -360,12 +413,28 @@ def fp8_window_all_gather(
         )
     if (lane_axis is None) != (lane is None):
         raise ValueError("lane_axis and lane go together")
+    if norm_w is not None and norm_w.shape != (k,):
+        raise ValueError(f"norm_w must have shape ({k},), got {norm_w.shape}")
     use_d2d = _resolve_d2d_pair_first(m, num_cores, d2d_pair_first)
     call, ws_in_hbm = _build(
-        m, k, n_out, w_q.dtype, x.dtype, num_cores, axis, lane_axis, use_d2d
+        m,
+        k,
+        n_out,
+        w_q.dtype,
+        x.dtype,
+        num_cores,
+        axis,
+        lane_axis,
+        use_d2d,
+        None if norm_w is None else norm_w.dtype,
+        float(eps),
     )
     w_s2 = w_s.reshape(1, n_out).astype(jnp.float32)
     scalars = (rank.astype(jnp.int32),)
     if lane is not None:
         scalars += (lane.astype(jnp.int32),)
+    if norm_w is not None:
+        return _call_constrained_rmsnorm(
+            call, scalars, x, w_s2, w_q, norm_w.reshape(1, k), ws_in_hbm
+        )
     return _call_constrained(call, scalars, x, w_s2, w_q, ws_in_hbm)

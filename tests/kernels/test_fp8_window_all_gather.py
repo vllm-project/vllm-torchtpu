@@ -58,6 +58,27 @@ def test_should_reject_invalid_d2d_pair_first_core_count():
         )
 
 
+def test_should_gate_qnorm_fusion_to_tiny_decode_buckets():
+    assert not wag.supports_qnorm(0, 2048, 16384, 16)
+    assert wag.supports_qnorm(1, 2048, 16384, 16)
+    assert wag.supports_qnorm(4, 2048, 16384, 16)
+    assert not wag.supports_qnorm(5, 2048, 16384, 16)
+    assert not wag.supports_qnorm(8, 2048, 16384, 16)
+
+
+def test_should_reject_mismatched_norm_weight_shape():
+    with pytest.raises(ValueError, match="norm_w must have shape"):
+        wag.fp8_window_all_gather(
+            jnp.zeros((4, 2048), dtype=jnp.bfloat16),
+            jnp.zeros((2048, 16384), dtype=jnp.float8_e4m3fn),
+            jnp.ones((16384,), dtype=jnp.float32),
+            jnp.zeros((1,), dtype=jnp.int32),
+            num_cores=16,
+            axis="d",
+            norm_w=jnp.ones((1024,), dtype=jnp.bfloat16),
+        )
+
+
 def _worker():
     import jax
     import jax.numpy as jnp
@@ -131,6 +152,66 @@ def _worker():
             result[f"{m}:{int(lanes)}"] = bool(
                 not races and all(np.array_equal(out[r], ref) for r in range(N_RANKS))
             )
+    # Verify fused RMSNorm matches independent f32-intermediate norm bitwise
+    # and differs from bf16-truncated normalization (discriminating oracle).
+    rn_m = wag.QNORM_MAX_M
+    rk1, rk2, rk3, rk4 = jax.random.split(jax.random.key(99), 4)
+    rx = (jax.random.normal(rk1, (rn_m, k)) * 2.5 + 0.1).astype(jnp.bfloat16)
+    rw = (jax.random.normal(rk2, (k, n)) * 0.5).astype(jnp.float8_e4m3fn)
+    rws = jax.random.uniform(rk3, (n,), jnp.float32, 0.5, 1.5)
+    rnw = jax.random.uniform(rk4, (k,), jnp.float32, 0.3, 1.7).astype(jnp.bfloat16)
+    eps = 1e-6
+    rxf = rx.astype(jnp.float32)
+    rinv = jax.lax.rsqrt(jnp.mean(rxf * rxf, axis=-1, keepdims=True) + jnp.float32(eps))
+    x_norm_f32 = ((rxf * rinv) * rnw.astype(jnp.float32)).astype(jnp.bfloat16)
+    x_norm_trunc = ((rxf * rinv).astype(jnp.bfloat16) * rnw).astype(jnp.bfloat16)
+    with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()):
+        ref_rn = np.asarray(fp8_skinny.fp8_skinny_matmul(x_norm_f32, rw, rws)).view(
+            np.uint16
+        )
+        ref_trunc = np.asarray(
+            fp8_skinny.fp8_skinny_matmul(x_norm_trunc, rw, rws)
+        ).view(np.uint16)
+    mesh_rn = Mesh(np.asarray(devices), ("d",))
+
+    def body_rn(x, w, ws, r, nw):
+        return wag.fp8_window_all_gather(
+            x,
+            w,
+            ws,
+            r.reshape(1),
+            num_cores=N_RANKS,
+            axis="d",
+            norm_w=nw,
+            eps=eps,
+        )
+
+    fn_rn = jax.jit(
+        jax.shard_map(
+            body_rn,
+            mesh=mesh_rn,
+            in_specs=(P("d"),) * 5,
+            out_specs=P("d"),
+            check_vma=False,
+        )
+    )
+    args_rn = (
+        jnp.tile(rx, (N_RANKS, 1)),
+        jnp.tile(rw, (N_RANKS, 1)),
+        jnp.tile(rws, (N_RANKS,)),
+        jnp.arange(N_RANKS, dtype=jnp.int32).reshape(N_RANKS, 1),
+        jnp.tile(rnw, (N_RANKS,)),
+    )
+    with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams(detect_races=True)):
+        pltpu.reset_tpu_interpret_mode_state()
+        with contextlib.redirect_stdout(io.StringIO()):
+            out_rn = np.asarray(jax.block_until_ready(fn_rn(*args_rn)))
+        rn_races = bool(interpret_pallas_call.races.races_found)
+    out_rn = out_rn.reshape(N_RANKS, rn_m, n).view(np.uint16)
+    result["rn_exact"] = bool(
+        not rn_races and all(np.array_equal(out_rn[r], ref_rn) for r in range(N_RANKS))
+    )
+    result["rn_distinguishes_trunc"] = bool(not np.array_equal(ref_rn, ref_trunc))
     print("RESULT " + json.dumps(result))
 
 
@@ -161,6 +242,11 @@ def test_gathered_windows_are_the_replicated_projection(on_16_devices, rows, lan
     """Every rank's output is bitwise fp8_skinny's on the whole weight, on a 1-D
     mesh and on a (lane, DCP) mesh with one lane; no races."""
     assert on_16_devices[f"{rows}:{int(lanes)}"]
+
+
+def test_should_match_f32_rmsnorm_bitwise_when_norm_w_fused(on_16_devices):
+    assert on_16_devices["rn_exact"]
+    assert on_16_devices["rn_distinguishes_trunc"]
 
 
 @pytest.fixture(scope="module")

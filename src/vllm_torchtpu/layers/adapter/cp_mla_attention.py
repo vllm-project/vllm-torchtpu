@@ -38,12 +38,18 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import torch
+from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed import dcp as dcp_mod
+from vllm_torchtpu.distributed import sharded_jax_op as sharded_jax_op_mod
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 from vllm_torchtpu.kernels.lse_rescale import lse_rescale_quantize
+from vllm_torchtpu.kernels.quantized_matmul.fp8_window_all_gather import (
+    fp8_window_all_gather,
+)
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 
 if envs.TPU_DCP_MERGE_VSPACE_FUSED:
@@ -72,6 +78,63 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
 
 
 _LOCAL_Q_ALL_GATHER_OPS: dict = {}
+_LOCAL_Q_NORM_ALL_GATHER_OPS: dict = {}
+
+
+def local_q_norm_all_gather_op(eps: float):
+    """Map `(x, w_q, w_s, rank, lane, norm_w)` -> `[m, n_out]` with fused RMSNorm."""
+    eps_f = float(eps)
+    mesh = dcp_mod.get_or_create_dcp_mesh()
+    world = int(mesh.shape[dcp_mod.DCP_AXIS_NAME])
+    key = (world, eps_f)
+    op = _LOCAL_Q_NORM_ALL_GATHER_OPS.get(key)
+    if op is not None:
+        return op
+    lane_axes = tuple(a for a in mesh.axis_names if a != dcp_mod.DCP_AXIS_NAME)
+    assert len(lane_axes) <= 1, mesh.axis_names
+    lane_axis = lane_axes[0] if lane_axes else None
+    spec = P(dcp_mod.DCP_AXIS_NAME)
+
+    def body(x, w_q, w_s, rank, lane, norm_w):
+        return fp8_window_all_gather(
+            x,
+            w_q,
+            w_s,
+            rank,
+            num_cores=world,
+            axis=dcp_mod.DCP_AXIS_NAME,
+            lane_axis=lane_axis,
+            lane=None if lane_axis is None else lane,
+            norm_w=norm_w,
+            eps=eps_f,
+        )
+
+    def fn(
+        x: jax.Array,
+        w_q: jax.Array,
+        w_s: jax.Array,
+        rank: jax.Array,
+        lane: jax.Array,
+        norm_w: jax.Array,
+    ) -> jax.Array:
+        return jax.shard_map(
+            body, mesh=mesh, in_specs=(spec,) * 6, out_specs=spec, check_vma=False
+        )(x, w_q, w_s, rank, lane, norm_w)
+
+    def fake(x: torch.Tensor, w_q: torch.Tensor, *_) -> torch.Tensor:
+        return x.new_empty((x.shape[0], w_q.shape[1]))
+
+    eps_tag = f"{eps_f:.12g}".replace("-", "m").replace("+", "p").replace(".", "_")
+    op = sharded_jax_op_mod.sharded_jax_op(
+        f"pallas::fp8_window_all_gather_rn_{world}_{eps_tag}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec,) * 6,
+        output_partition_specs=spec,
+        fake=fake,
+    )
+    _LOCAL_Q_NORM_ALL_GATHER_OPS[key] = op
+    return op
 
 
 def local_q_all_gather_op():

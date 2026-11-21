@@ -96,7 +96,10 @@ from vllm_torchtpu.layers.adapter.attention import (
     VllmTPUDeepseekV32IndexerBackend,
     _retain_buffers,
 )
-from vllm_torchtpu.layers.adapter.cp_mla_attention import local_q_all_gather_op
+from vllm_torchtpu.layers.adapter.cp_mla_attention import (
+    local_q_all_gather_op,
+    local_q_norm_all_gather_op,
+)
 from vllm_torchtpu.layers.adapter.linear_common import (
     DCP_ROWS_ATTR,
     FP8_PALLAS_N_ATTR,
@@ -2599,6 +2602,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         )
 
         self.local_q_fused_op = None
+        self.local_q_norm_fused_op = None
         self.local_q_window = None
         self.local_q_lane = None
         if (
@@ -2623,6 +2627,14 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     f"({q_proj_layer.rank_in_group}, {self.dcp_group_size})"
                 )
             self.local_q_fused_op = local_q_all_gather_op()
+            if (
+                self.q_a_layernorm is not None
+                and (self.indexer is None or self.skip_topk)
+                and getattr(self.q_a_layernorm, "has_weight", True)
+                and getattr(self.q_a_layernorm, "variance_size_override", None) is None
+            ):
+                q_eps = float(getattr(self.q_a_layernorm, "variance_epsilon", 1e-6))
+                self.local_q_norm_fused_op = local_q_norm_all_gather_op(q_eps)
             self.local_q_window = dcp_rank_operand()
             self.local_q_lane = dcp_lane_operand()
 
@@ -2796,6 +2808,45 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         assert operands is not None and self.local_q_fused_op is not None
         return self.local_q_fused_op(
             q_c, *operands, self.local_q_window, self.local_q_lane
+        )
+
+    def _local_q_norm_serves(self, q_c: torch.Tensor) -> bool:
+        if (
+            getattr(self, "local_q_norm_fused_op", None) is None
+            or not (self.indexer is None or self.skip_topk)
+            or self.q_a_layernorm is None
+            or not getattr(self.q_a_layernorm, "has_weight", True)
+            or getattr(self.q_a_layernorm, "variance_size_override", None) is not None
+        ):
+            return False
+        norm_w = getattr(self.q_a_layernorm, "weight", None)
+        operands = _qb_overlap_operands(self.q_b_proj)
+        return (
+            norm_w is not None
+            and norm_w.dim() == 1
+            and operands is not None
+            and norm_w.shape[0] == operands[0].shape[0]
+            and fp8_window_all_gather.supports_qnorm(
+                q_c.shape[0],
+                operands[0].shape[0],
+                operands[0].shape[1],
+                self.dcp_group_size,
+            )
+        )
+
+    def _project_local_q_norm(self, q_c: torch.Tensor) -> torch.Tensor:
+        operands = _qb_overlap_operands(self.q_b_proj)
+        assert (
+            operands is not None
+            and self.local_q_norm_fused_op is not None
+            and self.q_a_layernorm is not None
+        )
+        return self.local_q_norm_fused_op(
+            q_c,
+            *operands,
+            self.local_q_window,
+            self.local_q_lane,
+            self.q_a_layernorm.weight,
         )
 
     def _resolve_sp_o_proj(
@@ -2981,8 +3032,22 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                         )
                     if indexer_qrows is not None:
                         q_c = q_c.index_select(0, indexer_qrows)
-                q_c = self.q_a_layernorm(q_c)
-                if (
+                fuse_local_q_norm = (
+                    not getattr(self, "qb_overlap", False)
+                    and q_rows is None
+                    and pre_qkv is None
+                    and pre_qc_qrows is None
+                    and not dcp_token_parallel_op.applies(num_tokens)
+                    and vllm_compilation_backends.model_tag == "backbone"
+                    and self._local_q_norm_serves(q_c)
+                )
+                if fuse_local_q_norm:
+                    q = self._project_local_q_norm(q_c)
+                else:
+                    q_c = self.q_a_layernorm(q_c)
+                if fuse_local_q_norm:
+                    pass
+                elif (
                     getattr(self, "qb_overlap", False)
                     and self.kimi_preprocess is None
                     and q_rows is None
