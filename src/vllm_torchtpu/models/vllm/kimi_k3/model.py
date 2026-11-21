@@ -279,9 +279,7 @@ class KimiModel(nn.Module):
             and num_tokens % self.sp_group.world_size == 0
         )
         if sequence_parallel:
-            hidden_states = hidden_states.reshape(
-                self.sp_group.world_size, -1, hidden_states.shape[-1]
-            )[self.sp_group.rank_in_group].contiguous()
+            hidden_states = self.sp_group.local_rows(hidden_states)
         # A view avoids passing a symbolic local token count to TorchTPU's
         # concrete-size allocation kernel during the dynamic trace.
         block_residuals = (
