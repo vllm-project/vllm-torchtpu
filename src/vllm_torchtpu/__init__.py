@@ -382,6 +382,99 @@ def _patch_expert_map_host_lookup() -> None:
     logger.info("Applied TPU patch: host-built expert map with host-side reads.")
 
 
+# The fused Q/K norm kernel holds all of its rows in VMEM, so larger steps
+# (prefill) keep vLLM's eager path.
+_FUSED_QK_NORM_ROPE_MAX_ROWS = 64
+
+
+def _patch_qwen3_next_fused_qk_norm_rope_gate() -> None:
+    """Run Qwen3-Next/Qwen3.5 attention's q/gate split, Q/K RMSNorm, RoPE and
+    gate copy as one Pallas call for steps of up to 64 rows.
+
+    Opt-in with TPU_FUSED_QK_NORM_ROPE. vLLM's own fused kernel is CUDA/XPU
+    only, so on TPU these run as separate eager ops. The fused path is used
+    for text-only models with output gating and NeoX RoPE.
+    """
+    if not envs.TPU_FUSED_QK_NORM_ROPE:
+        return
+    from vllm.model_executor.models import qwen3_next as _qn
+
+    cls = _qn.Qwen3NextAttention
+    if getattr(cls, "_tpu_fused_qk_norm_rope_patch", False):
+        return
+    if not hasattr(cls, "_project_qkv_gate"):
+        logger.warning(
+            "TPU_FUSED_QK_NORM_ROPE is set but this vLLM's Qwen3NextAttention "
+            "has no _project_qkv_gate; the fused Q/K norm stays off."
+        )
+        return
+    from vllm_torchtpu.layers.adapter import fused_qk_norm_rope_tpu as _fused
+
+    original_init = cls.__init__
+    original_project_qkv_gate = cls._project_qkv_gate
+
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        model_config = kwargs.get("model_config", args[1] if len(args) > 1 else None)
+        mm_config = getattr(model_config, "multimodal_config", None)
+        text_only = mm_config is None or getattr(
+            mm_config, "language_model_only", False
+        )
+        self._tpu_fused_qk_norm_rope = bool(
+            getattr(self, "attn_output_gate", False)
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and getattr(self.rotary_emb, "cos_sin_cache", None) is not None
+            and text_only
+        )
+        if self._tpu_fused_qk_norm_rope:
+            _fused.prebuild(
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+                self.q_norm.variance_epsilon,
+            )
+
+    def _norm_weight_plus_one(norm):
+        # GemmaRMSNorm scales by (1 + w). Use the f32 buffer that
+        # TPU_NORM_WEIGHT_HOIST keeps on the module when it is installed, so
+        # the eager and fused traces read the same input; else compute it the
+        # way GemmaRMSNorm.forward_native does.
+        hoisted = getattr(norm, "_tpu_weight_plus_one", None)
+        return hoisted if hoisted is not None else norm.weight.float() + 1.0
+
+    def _project_qkv_gate(self, qkv, positions):
+        if (
+            not getattr(self, "_tpu_fused_qk_norm_rope", False)
+            or qkv.shape[0] > _FUSED_QK_NORM_ROPE_MAX_ROWS
+        ):
+            return original_project_qkv_gate(self, qkv, positions)
+        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+        q, k, gate = _fused.fused_qk_rmsnorm_rope_gate(
+            q_gate,
+            k,
+            _norm_weight_plus_one(self.q_norm),
+            _norm_weight_plus_one(self.k_norm),
+            self.rotary_emb.cos_sin_cache,
+            positions,
+            self.q_norm.variance_epsilon,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rotary_emb.rotary_dim,
+        )
+        return q, k, v, gate
+
+    cls.__init__ = __init__
+    cls._project_qkv_gate = _project_qkv_gate
+    cls._tpu_fused_qk_norm_rope_patch = True
+    logger.info(
+        "Applied TPU patch: fused Q/K RMSNorm + RoPE + gate for Qwen3-Next "
+        "attention steps of up to %d rows.",
+        _FUSED_QK_NORM_ROPE_MAX_ROWS,
+    )
+
+
 def _patch_vllm_disable_compile_ranges() -> None:
     """Force TPU to compile only fixed bucketed sizes, never dynamic ranges.
 
