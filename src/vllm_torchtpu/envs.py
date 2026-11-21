@@ -167,6 +167,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
     VLLM_TPU_QSA_RING_SELECT: bool = False
     VLLM_TPU_QSA_RING_DMA_BATCH: int = 0
+    VLLM_TPU_QSA_MAIN_KV_DMA_BATCH: int = 0
     VLLM_TPU_QSA_COMPRESSED_RUN_WRITE: bool = False
     VLLM_TPU_QSA_COMPRESSED_RUN_WRITE_MIN_TOKENS: int = 512
     VLLM_TPU_QSA_COMPRESSED_WRITE: str = ""
@@ -852,6 +853,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # power of two <= N that divides the request rows.
     "VLLM_TPU_QSA_RING_DMA_BATCH": env_nonnegative_int(
         "VLLM_TPU_QSA_RING_DMA_BATCH", 0
+    ),
+    # q38 PSTEP-GLUE MKV-B8: Qwen4-exp QSA main-KV writer, concurrent row DMAs
+    # per packet. 0 uses the measured table (pool pages without an entry, e.g.
+    # the 3,200-token FP8 pages of the PP8 x TP1 prefill, fall back to one
+    # serial DMA per row in tiles that miss the bulk path); N > 0 uses the
+    # largest power of two <= N that divides the 128-row tile. Duplicate
+    # destinations inside a packet still use serial DMAs (same bytes).
+    "VLLM_TPU_QSA_MAIN_KV_DMA_BATCH": env_nonnegative_int(
+        "VLLM_TPU_QSA_MAIN_KV_DMA_BATCH", 0
     ),
     # Qwen4-exp pooled QSA: write compressed keys with the run-based writer
     # (kernels/qwen4_exp/compressed_write.py): one DMA per run of consecutive
