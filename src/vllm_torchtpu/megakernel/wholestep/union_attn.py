@@ -111,6 +111,7 @@ def compact_union(
     Pb, codeb = P.astype(BF16), code.astype(F32).astype(BF16)
     n = jnp.sum(sel.astype(I32), axis=(0, 1), keepdims=True)
     ids_out, codes_out = [], []
+    assert KU % W == 0, f"union window {W} must divide KU={KU} (a partial last window overruns the store)"
     for j0 in range(0, KU, W):
         jcol = jcol0 + j0
         jf = jcol.astype(F32)
@@ -153,6 +154,7 @@ def compact_union_chunk(code: jax.Array, tot: jax.Array, row_of, KU: int, consts
     E_row = O_row + c_row
     Pb, codeb = P.astype(BF16), code.astype(F32).astype(BF16)
     n = jnp.sum(sel.astype(I32))
+    assert KU % W == 0, f"union window {W} must divide KU={KU} (a partial last window overruns the store)"
     for j0 in range(0, KU, W):
 
         @pl.when((j0 < tot + n) & (j0 + W > tot))
