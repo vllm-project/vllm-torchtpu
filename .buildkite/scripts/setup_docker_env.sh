@@ -30,11 +30,25 @@ fi
 
 IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
 COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
-# Resolve the target vLLM commit SHA from build metadata
+# Resolve the target vLLM commit SHA from build metadata. bootstrap.sh and
+# bootstrap_dev.sh publish it; a pipeline that uploads pipeline_build.yml
+# directly (e.g. a standalone image-build pipeline) has no bootstrap step, so
+# fall back to VLLM_COMMIT_HASH_OVERRIDE or the vLLM pin in pyproject.toml.
 VLLM_COMMIT_HASH="$(buildkite-agent meta-data get "VLLM_COMMIT_HASH" --default "")"
 if [ -z "${VLLM_COMMIT_HASH}" ]; then
-  echo "[FATAL] VLLM_COMMIT_HASH metadata is empty; bootstrap.sh did not set it." >&2
-  exit 1
+  # shellcheck source=/dev/null
+  source "${SCRIPT_DIR}/configs/pipeline_config.sh"
+  if [ -n "${VLLM_COMMIT_HASH_OVERRIDE:-}" ]; then
+    VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH_OVERRIDE}"
+    VLLM_COMMIT_SOURCE="VLLM_COMMIT_HASH_OVERRIDE"
+  else
+    VLLM_COMMIT_HASH="$(get_vllm_commit_hash)"
+    VLLM_COMMIT_SOURCE="pyproject.toml"
+  fi
+  echo "[WARN] VLLM_COMMIT_HASH metadata is empty (no bootstrap step);" \
+    "using ${VLLM_COMMIT_HASH} from ${VLLM_COMMIT_SOURCE}." >&2
+  # Publish it so later steps of this build resolve the same commit.
+  buildkite-agent meta-data set "VLLM_COMMIT_HASH" "${VLLM_COMMIT_HASH}"
 fi
 
 BASE_TAG="${COMMIT_HASH}-${VLLM_COMMIT_HASH}${IMAGE_SUFFIX}"
