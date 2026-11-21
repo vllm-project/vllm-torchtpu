@@ -71,6 +71,7 @@ def test_megakernel_portability_ast_guard():
 
     Checks all `.py` files under `src/vllm_torchtpu/megakernel/core/`:
     - Zero imports from `vllm`, `vllm_torchtpu`, or `torch`.
+    - Zero environment reads (`os.environ`, `os.getenv`, `os.putenv`, `posix.environ`).
     - All absolute (`level == 0`) imports come strictly from Python stdlib, `jax`,
       or `numpy` (enforcing relative imports for all internal modules).
     - Private `jax._src.*` imports are restricted to `{"dma/pool_alias.py"}`.
@@ -80,6 +81,14 @@ def test_megakernel_portability_ast_guard():
     jax_src_allowlist = {"dma/pool_alias.py"}
     forbidden_roots = {"vllm", "vllm_torchtpu", "torch"}
     allowed_external_roots = sys.stdlib_module_names | {"jax", "numpy"}
+    forbidden_env_attrs = {
+        "environ",
+        "environb",
+        "getenv",
+        "getenvb",
+        "putenv",
+        "putenvb",
+    }
 
     py_files = sorted(pkg_root.rglob("*.py"))
     rel_paths = {p.relative_to(pkg_root).as_posix() for p in py_files}
@@ -90,7 +99,22 @@ def test_megakernel_portability_ast_guard():
     for path in py_files:
         rel = path.relative_to(pkg_root).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        os_aliases = {"os", "posix"}
         for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in {"os", "posix"} and alias.asname:
+                        os_aliases.add(alias.asname)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in os_aliases
+            ):
+                assert node.attr not in forbidden_env_attrs, (
+                    f"{rel}:{_ln(node)} accesses '{node.value.id}.{node.attr}'; "
+                    "megakernel modules must not read/mutate the environment."
+                )
             if isinstance(node, ast.Call):
                 func = node.func
                 func_name = (
@@ -98,8 +122,8 @@ def test_megakernel_portability_ast_guard():
                     if isinstance(func, ast.Name)
                     else (func.attr if isinstance(func, ast.Attribute) else None)
                 )
-                # The lazy (PEP 562) package namespaces import their own
-                # submodules by name.
+                # The lazy (PEP 562) package namespaces and the built-in
+                # registrations import their own submodules by name.
                 if rel in _LAZY_IMPORTERS and func_name == "import_module":
                     continue
                 assert func_name not in {"__import__", "import_module"}, (
@@ -116,6 +140,12 @@ def test_megakernel_portability_ast_guard():
                 level = node.level
                 modules = [node.module] if node.module else []
                 imported_names = [alias.name for alias in node.names]
+                if level == 0 and node.module in {"os", "posix"}:
+                    bad_env = forbidden_env_attrs.intersection(imported_names)
+                    assert not bad_env, (
+                        f"{rel}:{_ln(node)} imports {sorted(bad_env)} from "
+                        f"'{node.module}'; megakernel modules must not read env."
+                    )
             else:
                 continue
 
@@ -151,6 +181,56 @@ def test_megakernel_portability_ast_guard():
                         f"{rel}:{_ln(node)} imports private JAX API '{mod}', "
                         f"which is restricted to allowlist {sorted(jax_src_allowlist)}."
                     )
+
+
+def test_modules_do_not_import_experimental_code():
+    """Modules reach fused pool I/O only via the core `fused_io_hook` module.
+
+    No module under `modules/` may import `experimental/` (or the fused helpers)
+    at any level, so GQA / GDN can land without the experimental code.
+    """
+    modules_root = Path(megakernel.__file__).resolve().parent / "modules"
+    py_files = sorted(modules_root.rglob("*.py"))
+    rel_paths = {p.relative_to(modules_root).as_posix() for p in py_files}
+    expected_module_files = {
+        "__init__.py",
+        "norm.py",
+        "gqa/__init__.py",
+        "gqa/module.py",
+        "gqa/decls.py",
+        "gqa/kv.py",
+        "gqa/reference.py",
+        "gdn/__init__.py",
+        "gdn/module.py",
+        "gdn/decls.py",
+        "gdn/states.py",
+        "gdn/reference.py",
+        "moe/__init__.py",
+        "moe/module.py",
+        "moe/decls.py",
+        "moe/reference.py",
+    }
+    assert expected_module_files <= rel_paths, expected_module_files - rel_paths
+    for path in py_files:
+        rel = path.relative_to(modules_root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            # Only the library's own modules matter (relative imports or
+            # `vllm_torchtpu.*`); third-party `jax.experimental` is fine.
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [
+                    a.name for a in node.names if a.name.startswith("vllm_torchtpu")
+                ]
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                if node.level > 0 or mod.startswith("vllm_torchtpu"):
+                    names = [mod] + [a.name for a in node.names]
+            for name in names:
+                assert "experimental" not in name and "fused_pool_io" not in name, (
+                    f"modules/{rel}:{_ln(node)} imports '{name}'; modules "
+                    "must reach fused pool I/O through fused_io_hook"
+                )
 
 
 def _assert_package_is_framework_free(pkg: str) -> None:
@@ -247,3 +327,80 @@ def test_collectives_package_is_framework_free():
     reuse them.
     """
     _assert_package_is_framework_free("collectives")
+
+
+def test_no_model_names_in_core_and_adapter():
+    """Forbid model-family substrings in `megakernel/core/` (outside `profiles/`)
+    and in `megakernel/adapter/`; models live in model folders
+    (`vllm_torchtpu.models.<model>.megakernel`).
+    """
+    pkg_root = Path(megakernel.__file__).resolve().parent
+    rt_root = pkg_root.parent / "adapter"
+    forbidden_tokens = ("qwen", "llama", "deepseek", "mistral", "gemma")
+
+    checked = 0
+    for root in (pkg_root, rt_root):
+        for path in sorted(root.rglob("*.py")):
+            rel = path.relative_to(pkg_root.parent).as_posix()
+            if rel.startswith("core/profiles/"):
+                continue
+            checked += 1
+            for lineno, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), 1
+            ):
+                low = line.lower()
+                for tok in forbidden_tokens:
+                    assert tok not in low, (
+                        f"{rel}:{lineno} contains forbidden model token {tok!r}: "
+                        f"{line.strip()}"
+                    )
+    assert checked >= 40
+
+    # Library code (`src/vllm_torchtpu/`) must never reference frozen artifacts.
+    forbidden_frozen = ("frozen_utils", "mk_frozen_qwen35_dir", "frozen_qwen35")
+    src_files = sorted(pkg_root.parents[1].rglob("*.py"))
+    for path in src_files:
+        rel = path.as_posix()
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            low = line.lower()
+            for tok in forbidden_frozen:
+                assert tok not in low, (
+                    f"{rel}:{lineno} contains forbidden frozen reference {tok!r}: "
+                    f"{line.strip()}"
+                )
+
+
+def test_file_line_and_noqa_caps():
+    """Enforce `<= 400` lines and 0 `# noqa` / `# fmt: skip` on core modules."""
+    pkg_root = Path(megakernel.__file__).resolve().parent
+
+    capped_globs = (
+        "__init__.py",
+        "cache*.py",
+        "collectives/*.py",
+        "derive.py",
+        "model_def.py",
+        "schedule.py",
+        "validate.py",
+        "verify*.py",
+        "profiles/*.py",
+        "runtime/*.py",
+        "weights/*.py",
+        "pool/checks.py",
+        "pool/scatter*.py",
+    )
+    paths: set[Path] = set()
+    for pat in capped_globs:
+        paths.update(pkg_root.glob(pat))
+    assert len(paths) >= 25
+    for path in sorted(paths):
+        rel = path.relative_to(pkg_root).as_posix()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        # The package `__init__` lists every public name three times: eager
+        # imports for type checkers, the lazy name table, and `__all__`.
+        cap = 600 if rel == "__init__.py" else 400
+        assert len(lines) <= cap, f"{rel} has {len(lines)} > {cap} lines"
+        for lineno, line in enumerate(lines, 1):
+            assert "# noqa" not in line and "# fmt: skip" not in line, (
+                f"{rel}:{lineno} uses forbidden lint/format suppression: {line.strip()}"
+            )

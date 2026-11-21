@@ -247,7 +247,10 @@ class _ParentIsolationPlugin:
         if self._has_8_cpu is None:
             import jax
 
-            self._has_8_cpu = len(jax.devices("cpu")) >= 8
+            try:
+                self._has_8_cpu = len(jax.devices("cpu")) >= 8
+            except RuntimeError:
+                self._has_8_cpu = False
         return self._has_8_cpu
 
     def _get_or_start_runner(self, item: pytest.Item, mod_path: Path) -> _ModuleRunner:
@@ -263,6 +266,7 @@ class _ParentIsolationPlugin:
             it.nodeid
             for it in session_items[start:]
             if Path(it.path).resolve() == mod_path
+            and it.get_closest_marker("tpu_test") is None
         ]
         fd_tmp, nodeids_str = tempfile.mkstemp(prefix="mk_nodeids_", suffix=".json")
         with os.fdopen(fd_tmp, "w", encoding="utf-8") as f:
@@ -312,6 +316,8 @@ class _ParentIsolationPlugin:
     def pytest_runtest_protocol(
         self, item: pytest.Item, nextitem: pytest.Item | None
     ) -> bool | None:
+        if item.get_closest_marker("tpu_test") is not None:
+            return None
         mod_path = Path(item.path).resolve()
         if not _is_mk_path(mod_path):
             return None
