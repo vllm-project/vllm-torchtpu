@@ -16,21 +16,27 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import replace as dc_replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import pytest
 
 import vllm_torchtpu.roofline as rf
 from vllm_torchtpu.roofline import (
+    CHIPS,
+    Dtypes,
     FloorOptions,
     KvFitInput,
+    Parallel,
     ScenarioOverrides,
     SeqKvLayout,
     SolveOptions,
     SpecShape,
     cli,
+    hbm_breakdown_per_core_bytes,
     hbm_footprint_per_core_bytes,
+    solve_serving_plan,
 )
 from vllm_torchtpu.roofline.constants import DEFAULT_GPU_MEMORY_UTILIZATION, UNIT_GIGA
 from vllm_torchtpu.roofline.memory import (
@@ -1293,3 +1299,202 @@ def test_prefill_enumerates_both_ep_and_legal_tp_slice_moe() -> None:
         if p.pp == 1 and p.pcp == pcp_2 and p.tp == tp_4
     }
     assert modes_pcp_indiv == set()
+
+
+def test_hbm_breakdown_matches_footprint() -> None:
+    """HbmBreakdown total matches hbm_footprint_per_core_bytes across geometries."""
+    gqa_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "vocab_size": 32000,
+    }
+    mla_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 30,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 32,
+        "head_dim": 128,
+        "kv_lora_rank": 512,
+        "q_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "vocab_size": 32000,
+    }
+
+    geoms = [
+        rf.from_hf_config(gqa_cfg),
+        rf.from_hf_config(mla_cfg),
+        rf.from_hf_config(QWEN35_CFG),
+    ]
+    dt = Dtypes(kv=1.0)
+    par = Parallel(tp=4, dp=1, ep=1, pp=1, pcp=1)
+    seq_layout = SeqKvLayout(seqs_per_dp=16, context=2048)
+
+    for geom in geoms:
+        bd = hbm_breakdown_per_core_bytes(geom, dt, par, seq_layout)
+        footprint = hbm_footprint_per_core_bytes(geom, dt, par, seq_layout)
+        assert bd.total == footprint
+        assert math.isclose(bd.weights + bd.kv + bd.state, bd.total, rel_tol=1e-9)
+        assert bd.weights > 0
+        assert bd.kv >= 0
+        if geom.linear_k_heads:
+            assert bd.state > 0
+        else:
+            assert bd.state == 0.0
+
+
+@pytest.mark.parametrize("mode", ["mixed", "disagg", "auto"])
+def test_search_stats_funnel_is_monotone(
+    mode: Literal["mixed", "disagg", "auto"],
+) -> None:
+    """Search funnel is monotonically non-increasing and frontier is positive."""
+    chip = CHIPS["tpu7x"]
+    gqa_cfg = {
+        "hidden_size": 2048,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 32000,
+    }
+    geom = rf.from_hf_config(gqa_cfg)
+    dt = Dtypes(kv=1.0)
+    scenario = dc_replace(
+        EXAMPLE_SCENARIOS["chat-8k1k"],
+        concurrencies=(1, 4),
+        ttft_slo_ms=5000.0,
+        tpot_slo_ms=500.0,
+    )
+    # Disaggregated serving needs >= 2 provisioned 2x2x1 slices (8 chips).
+    max_chips = 8 if mode == "disagg" else 4
+    splan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scenario,
+        SolveOptions(mode=mode, max_chips=max_chips),
+    )
+    assert splan.search is not None
+    stats = splan.search
+    assert stats.enumerated >= stats.hbm_fit >= stats.slo_met >= stats.frontier >= 1
+    assert stats.frontier == len(splan.frontier)
+
+
+def test_decode_floor_matches_binding() -> None:
+    """Every candidate has decode_floor matching binding resource."""
+    chip = CHIPS["tpu7x"]
+    gqa_cfg = {
+        "hidden_size": 2048,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 32000,
+    }
+    geom = rf.from_hf_config(gqa_cfg)
+    dt = Dtypes(kv=1.0)
+    scenario = dc_replace(
+        EXAMPLE_SCENARIOS["chat-8k1k"],
+        concurrencies=(1, 4),
+    )
+    splan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    for pt in splan.candidates:
+        assert pt.decode_floor is not None
+        df = pt.decode_floor
+        expected_hard = max(
+            df.hbm_ms, df.matmul_ms, df.ici_ms, df.chain_ms, df.hop_latency_ms
+        )
+        assert df.hard_floor_ms <= expected_hard + 1e-9
+        if df.binding == "hbm":
+            assert df.hard_floor_ms <= df.hbm_ms + 1e-9
+        elif df.binding == "matmul":
+            assert math.isclose(df.matmul_ms, df.hard_floor_ms, rel_tol=1e-5)
+
+
+def test_explicit_gqa_token_stays_gqa_when_kv_lora_rank_positive() -> None:
+    """Verify that explicit GQA token is sized as GQA when kv_lora_rank > 0."""
+    dsa_base = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 4,
+        "layer_types": ["dsa"] * 4,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 32,
+        "head_dim": 64,
+        "kv_lora_rank": 512,
+        "q_lora_rank": 1024,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "index_n_heads": 64,
+        "index_head_dim": 128,
+        "index_topk": 2048,
+        "intermediate_size": 8192,
+        "vocab_size": 32000,
+    }
+    geom_idx = rf.from_hf_config(dsa_base)
+    geom_no_idx = dc_replace(geom_idx, index_n_heads=0)
+    geom_gqa_tok = dc_replace(geom_idx, layer_types=("gqa",) * 4)
+    dt = rf.Dtypes(w_dense=1.0, kv=1.0)
+    par = rf.Parallel(tp=4, dp=1, ep=1, pp=1, pcp=1)
+    seq_layout = SeqKvLayout(4, 2048)
+
+    bd_idx = hbm_breakdown_per_core_bytes(geom_idx, dt, par, seq_layout)
+    bd_no_idx = hbm_breakdown_per_core_bytes(geom_no_idx, dt, par, seq_layout)
+    bd_gqa_tok = hbm_breakdown_per_core_bytes(geom_gqa_tok, dt, par, seq_layout)
+
+    idx_heads_tp = geom_idx.index_n_heads // par.tp
+    expected_idx_w = (
+        float(
+            geom_idx.num_layers
+            * (
+                geom_idx.q_lora_rank * idx_heads_tp * geom_idx.index_head_dim
+                + geom_idx.hidden * geom_idx.index_head_dim
+                + geom_idx.hidden * idx_heads_tp
+            )
+        )
+        * dt.w_dense
+    )
+    assert bd_idx.weights - bd_no_idx.weights == pytest.approx(expected_idx_w, rel=1e-6)
+    assert bd_gqa_tok.weights < bd_idx.weights
+    assert bd_gqa_tok.kv > 0.0
+
+
+def test_search_stats_tracks_core_grid_before_arch_pruning() -> None:
+    """SearchStats.core_grid counts core-partitioned tuples before arch legality."""
+    geom = rf.from_hf_config(QWEN35_CFG)
+    chip = CHIPS["tpu7x"]
+    scenario = rf.TrafficScenario(
+        name="core-grid-check",
+        isl=8192,
+        osl=1024,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(1, 4),
+        kv_working_set_turns=1.0,
+    )
+    plan = solve_serving_plan(
+        geom,
+        Dtypes(w_dense=1.0, w_expert=1.0, kv=1.0),
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    assert plan.search is not None
+    # 8-core (PP, TP, DP, PCP) partitions weighted by DCP|TP: (10*1 + 6*2 + 3*3 + 1*4),
+    # times 4 EP divisors {1, 2, 4, 8} and 3 decode MoE dispatches per concurrency.
+    expected_core_grid = (
+        (10 * 1 + 6 * 2 + 3 * 3 + 1 * 4) * 4 * 3 * len(scenario.concurrencies)
+    )
+    assert plan.search.core_grid == expected_core_grid
+    assert plan.search.core_grid > plan.search.enumerated
