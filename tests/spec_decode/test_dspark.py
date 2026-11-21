@@ -14,9 +14,11 @@
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import pytest
 import torch
-
+from vllm_torchtpu.spec_decode import dflash as dflash_mod
+from vllm_torchtpu.spec_decode import dspark as dspark_mod
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 
@@ -339,3 +341,227 @@ def test_draft_aux_is_dropped_without_the_confidence_head():
         torch.ones(8, 4), 0, SimpleNamespace(start_index=0, num_reqs=8)
     )
     assert p.take_draft_confidences() is None
+
+
+class _FakeTpuTensor(torch.Tensor):
+    """CPU tensor subclass reporting ``device.type == 'tpu'``."""
+
+    @property
+    def device(self):  # type: ignore[override]
+        return SimpleNamespace(type="tpu")
+
+
+def _as_fake_tpu(tensor: torch.Tensor) -> _FakeTpuTensor:
+    return tensor.as_subclass(_FakeTpuTensor)
+
+
+def _build_minimal_dspark_draft_model(vocab_size: int = 32, hidden_size: int = 16):
+    gen = torch.Generator().manual_seed(1234)
+    embed_weight = torch.randn(
+        vocab_size, hidden_size, generator=gen, dtype=torch.bfloat16
+    )
+    lm_weight = torch.randn(
+        vocab_size, hidden_size, generator=gen, dtype=torch.bfloat16
+    )
+    markov_w = torch.randn(vocab_size, vocab_size, generator=gen, dtype=torch.bfloat16)
+    call_log: list[dict[str, object]] = []
+    state = {"in_compiled": False}
+
+    def embed_input_ids(input_ids: torch.Tensor) -> torch.Tensor:
+        plain_ids = input_ids.as_subclass(torch.Tensor)
+        out = embed_weight.index_select(0, plain_ids.long())
+        if state["in_compiled"] and out.shape[0] >= 3:
+            # Simulate libtpu < 0.0.52 custom-gather sublane row scrambling.
+            out = out.clone()
+            out[[0, 2]] = out[[2, 0]]
+        if isinstance(input_ids, _FakeTpuTensor):
+            out = _as_fake_tpu(out)
+        call_log.append(
+            {"op": "embed_input_ids", "in_compiled": state["in_compiled"], "out": out}
+        )
+        return out
+
+    class _InnerModel:
+        def __init__(self) -> None:
+            self.embed_input_ids = embed_input_ids
+            self.layers: list[object] = []
+
+        def __call__(self, *args: object, **kwargs: object) -> torch.Tensor:
+            call_log.append({"op": "model_forward", "args": args, "kwargs": kwargs})
+            if len(args) >= 3 and args[2] is not None:
+                embeds = args[2]
+            else:
+                req_ids = args[0] if args else kwargs["input_ids"]
+                embeds = self.embed_input_ids(req_ids)  # type: ignore[arg-type]
+            assert isinstance(embeds, torch.Tensor)
+            plain_embeds = embeds.as_subclass(torch.Tensor)
+            call_log.append({"op": "s0_embeds", "tensor": plain_embeds.clone()})
+            return plain_embeds
+
+    draft_model = SimpleNamespace(
+        model=_InnerModel(),
+        compute_draft_logits=lambda h: h.float() @ lm_weight.float().T,
+        markov_embed=lambda ids: markov_w.index_select(
+            0, ids.as_subclass(torch.Tensor).long()
+        ).float(),
+        markov_bias=lambda emb: emb,
+        map_draft_to_target=lambda ids: ids.to(torch.int32),
+        has_own_lm_head=False,
+        has_own_embed_tokens=False,
+    )
+    return draft_model, call_log, state
+
+
+def test_eager_embed_outside_compile_on_dp_gt_1(monkeypatch):
+    """Materialize draft embeddings outside compile across propose and dummy."""
+    proposer = _make_proposer(
+        {
+            "dspark_noise_token_id": 7,
+            "dspark_block_size": 5,
+            **_LAYER_IDS,
+        },
+        num_speculative_tokens=5,
+    )
+    proposer.vllm_config.parallel_config.data_parallel_size = 8
+    draft_model, call_log, state = _build_minimal_dspark_draft_model()
+    proposer.draft_model = draft_model
+
+    sync_calls: list[tuple[object, bool]] = []
+    monkeypatch.setattr(
+        dspark_mod,
+        "synchronize_tensors",
+        lambda tensors=None, wait=True: sync_calls.append((tensors, wait)),
+    )
+    monkeypatch.setattr(
+        dflash_mod,
+        "synchronize_tensors",
+        lambda tensors=None, wait=True: None,
+    )
+    eager_fn = torch._dynamo.disable(DSparkProposer._dflash_forward_and_sample)
+
+    def wrapped_compiled(*args: object, **kwargs: object):
+        state["in_compiled"] = True
+        try:
+            return eager_fn(proposer, *args, **kwargs)
+        finally:
+            state["in_compiled"] = False
+
+    proposer._dflash_forward_and_sample = wrapped_compiled  # type: ignore[method-assign]
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        input_batch=SimpleNamespace(num_reqs=2),
+        mesh=None,
+        max_num_reqs=8,
+        _dp_lockstep_enabled=lambda: False,
+        _dp_num_tokens_across_dp=lambda num_tokens: None,
+        _dp_step_num_chunks=0,
+    )
+    proposer.draft_chunks = [
+        SimpleNamespace(
+            num_reqs=2,
+            start_index=0,
+            aux_hidden_states=[torch.zeros((2, 16), dtype=torch.bfloat16)],
+            attn_ctx=SimpleNamespace(
+                request_distribution=torch.tensor([0, 0, 2], dtype=torch.int32)
+            ),
+        )
+    ]
+    raw_ids = torch.tensor([14, 7, 7, 7, 7, 21, 7, 7, 7, 7], dtype=torch.int32)
+    eager_ref = draft_model.model.embed_input_ids(raw_ids).as_subclass(torch.Tensor)
+    call_log.clear()
+
+    fake_tpu_ids = _as_fake_tpu(raw_ids)
+    pos = torch.arange(10, dtype=torch.int32)
+    proposer._update_draft_kv_cache_from_target = mock.MagicMock()
+    proposer._prepare_dflash_inputs = mock.MagicMock(
+        return_value=(fake_tpu_ids, pos, torch.tensor([5, 5], dtype=torch.int32))
+    )
+    proposer._build_draft_attn_metadata = mock.MagicMock(return_value={})
+
+    draft_tokens = proposer.propose(
+        sampled_token_ids=[[14], [21]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=np.array([0, 0]),
+        scheduler_output=None,
+        return_device=True,
+    )
+    assert len(draft_tokens) == 1
+    embed_calls = [c for c in call_log if c["op"] == "embed_input_ids"]
+    fwd_calls = [c for c in call_log if c["op"] == "model_forward"]
+    s0_entries = [c for c in call_log if c["op"] == "s0_embeds"]
+    assert len(embed_calls) == 1
+    assert embed_calls[0]["in_compiled"] is False
+    assert len(sync_calls) == 1 and sync_calls[0][1] is False
+    assert fwd_calls[0]["args"] == (fake_tpu_ids, pos, embed_calls[0]["out"])
+    s0_embeds = s0_entries[0]["tensor"]
+    assert isinstance(s0_embeds, torch.Tensor)
+    assert torch.equal(s0_embeds, eager_ref)
+    for row_idx in (2, 3, 4):
+        assert torch.equal(s0_embeds[1], s0_embeds[row_idx])
+
+    # Verify _dummy_draft_forward() also dispatches eager embedding on DP > 1.
+    call_log.clear()
+    sync_calls.clear()
+    proposer._build_attn_metadata_for_draft = mock.MagicMock(return_value={})
+    orig_zeros = dflash_mod.torch.zeros
+
+    def fake_tpu_zeros(*args: object, **kwargs: object) -> torch.Tensor:
+        tensor = orig_zeros(*args, **kwargs)
+        if tensor.ndim == 1 and tensor.shape[0] == 10 and tensor.dtype == torch.int32:
+            return _as_fake_tpu(tensor)
+        return tensor
+
+    with mock.patch.object(dflash_mod.torch, "zeros", side_effect=fake_tpu_zeros):
+        proposer._dummy_draft_forward(num_tokens=10, use_max_model_len=True, sync=False)
+    embed_dummy = [c for c in call_log if c["op"] == "embed_input_ids"]
+    fwd_dummy = [c for c in call_log if c["op"] == "model_forward"]
+    assert len(embed_dummy) == 1 and embed_dummy[0]["in_compiled"] is False
+    assert len(sync_calls) == 1 and sync_calls[0][1] is False
+    assert fwd_dummy[0]["args"][2] is embed_dummy[0]["out"]
+
+
+@pytest.mark.parametrize(
+    ("dp_size", "on_tpu", "has_draft"),
+    [
+        (1, True, True),
+        (8, False, True),
+        (8, True, False),
+    ],
+    ids=["dp_eq_1", "cpu_tensor", "missing_draft_model"],
+)
+def test_eager_embed_negative_controls_and_base_dispatch(
+    dp_size: int,
+    on_tpu: bool,
+    has_draft: bool,
+):
+    """Keep in-graph embedding when DP == 1, on CPU, or on base DFlash."""
+    proposer = _make_proposer(
+        {"dspark_noise_token_id": 7, "dspark_block_size": 5, **_LAYER_IDS},
+        num_speculative_tokens=5,
+    )
+    proposer.vllm_config.parallel_config.data_parallel_size = dp_size
+    draft_model, call_log, _ = _build_minimal_dspark_draft_model()
+    proposer.draft_model = draft_model if has_draft else None
+
+    raw_ids = torch.tensor([10, 7, 7, 7, 7, 20, 7, 7, 7, 7], dtype=torch.int32)
+    ids = _as_fake_tpu(raw_ids) if on_tpu else raw_ids
+    pos = torch.arange(10, dtype=torch.int32)
+
+    assert proposer._maybe_eager_embed_input_ids(ids) is None
+    if has_draft:
+        eager_fn = torch._dynamo.disable(DSparkProposer._dflash_forward_and_sample)
+        proposer._dflash_forward_and_sample = (  # type: ignore[method-assign]
+            lambda *a, **k: eager_fn(proposer, *a, **k)
+        )
+        proposer._forward_and_sample_draft_block(ids, pos, 5)
+        fwd_calls = [c for c in call_log if c["op"] == "model_forward"]
+        assert len(fwd_calls) == 1
+        assert fwd_calls[0]["kwargs"] == {"input_ids": ids, "positions": pos}
+
+    base_dflash = DFlashProposer.__new__(DFlashProposer)
+    base_fwd = mock.MagicMock(
+        return_value=(torch.zeros((2, 4), dtype=torch.int32), torch.zeros((10, 16)))
+    )
+    base_dflash._dflash_forward_and_sample = base_fwd  # type: ignore[method-assign]
+    base_dflash._forward_and_sample_draft_block(ids, pos, 5)
+    base_fwd.assert_called_once_with(ids, pos, 5)
