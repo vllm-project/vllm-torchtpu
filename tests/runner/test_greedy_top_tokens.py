@@ -828,14 +828,27 @@ class _EntryRunner:
         raise _StepStopped
 
 
-@pytest.mark.parametrize("pcp", [False, True])
-def test_the_warmed_topk_candidates_serve_execute_model_without_compiling(
-    monkeypatch, pcp
-):
-    """execute_model computes a step's packed top-k candidates under its
-    no_grad, and dynamo guards on grad mode. The real candidate programs,
-    warmed by _precompile_compute_topk_candidates and then called from inside
-    execute_model at a warmed shape, do not compile again."""
+# Per family of sampling programs: the two programs execute_model calls under
+# its no_grad, and the warm-up that compiles them.
+_WARMED_PROGRAMS = {
+    "topk_candidates": (
+        "compute_selected_topk_candidates",
+        "compute_topk_candidates_from_hidden_states",
+        "_precompile_compute_topk_candidates",
+    ),
+    "top_tokens": (
+        "compute_selected_top_tokens",
+        "compute_top_tokens_from_hidden_states",
+        "_precompile_compute_top_tokens",
+    ),
+}
+
+
+def _serving_compiles(monkeypatch, pcp, family):
+    """Compile the family's real programs on a CPU head, warm them with the
+    runner's warm-up, then call them from inside execute_model at a warmed
+    shape; return what that call compiled."""
+    selected_name, from_hidden_name, warm_name = _WARMED_PROGRAMS[family]
     torch._dynamo.reset()
     try:
         gen = torch.Generator().manual_seed(5)
@@ -851,10 +864,7 @@ def test_the_warmed_topk_candidates_serve_execute_model_without_compiling(
             fn = inspect.unwrap(getattr(TPUModelRunner, method))
             return torch.compile(fn, backend=backend, fullgraph=True, dynamic=False)
 
-        selected, from_hidden = (
-            compiled("compute_selected_topk_candidates"),
-            compiled("compute_topk_candidates_from_hidden_states"),
-        )
+        selected, from_hidden = compiled(selected_name), compiled(from_hidden_name)
         runner = SimpleNamespace(
             _greedy_head_owner=owner,
             model_config=SimpleNamespace(get_hidden_size=lambda: 16),
@@ -868,11 +878,11 @@ def test_the_warmed_topk_candidates_serve_execute_model_without_compiling(
             get_pcp_planner=lambda: SimpleNamespace(
                 uses_selected_logits_hidden_states=pcp
             ),
+            # The top-token warm-up warms the candidates first; not under test.
+            _precompile_compute_topk_candidates=lambda: None,
         )
-        runner.compute_selected_topk_candidates = lambda h, i: selected(runner, h, i)
-        runner.compute_topk_candidates_from_hidden_states = lambda h: from_hidden(
-            runner, h
-        )
+        setattr(runner, selected_name, lambda h, i: selected(runner, h, i))
+        setattr(runner, from_hidden_name, lambda h: from_hidden(runner, h))
         runner._selected_logits_lengths = lambda n: (
             TPUModelRunner._selected_logits_lengths(runner, n)
         )
@@ -881,21 +891,41 @@ def test_the_warmed_topk_candidates_serve_execute_model_without_compiling(
         )
         monkeypatch.setattr(tpu_runner, "_packed_candidates_owner", lambda o: o)
         monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
-        TPUModelRunner._precompile_compute_topk_candidates(runner)
+        getattr(TPUModelRunner, warm_name)(runner)
         warmed = len(compiles)
+        assert warmed, "the warm-up compiled nothing"
 
         def serve():
-            runner.compute_selected_topk_candidates(
+            getattr(runner, selected_name)(
                 torch.zeros(16, 16), torch.zeros(8, dtype=torch.int32)
             )
             if pcp:
-                runner.compute_topk_candidates_from_hidden_states(torch.zeros(8, 16))
+                getattr(runner, from_hidden_name)(torch.zeros(8, 16))
 
         with pytest.raises(_StepStopped):
             TPUModelRunner.execute_model(_EntryRunner(serve), None)
-        assert len(compiles) == warmed, compiles[warmed:]
+        return compiles[warmed:]
     finally:
         torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("pcp", [False, True])
+def test_the_warmed_topk_candidates_serve_execute_model_without_compiling(
+    monkeypatch, pcp
+):
+    """execute_model computes a step's packed top-k candidates under its
+    no_grad, and dynamo guards on grad mode. The real candidate programs,
+    warmed by _precompile_compute_topk_candidates and then called from inside
+    execute_model at a warmed shape, do not compile again."""
+    assert _serving_compiles(monkeypatch, pcp, "topk_candidates") == []
+
+
+@pytest.mark.parametrize("pcp", [False, True])
+def test_the_warmed_top_tokens_serve_execute_model_without_compiling(monkeypatch, pcp):
+    """The same for the greedy top-token programs, which execute_model also
+    calls under its no_grad: warmed by _precompile_compute_top_tokens, they do
+    not compile again."""
+    assert _serving_compiles(monkeypatch, pcp, "top_tokens") == []
 
 
 @pytest.mark.parametrize("vocab_size", [301, 2100])
