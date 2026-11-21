@@ -592,6 +592,7 @@ def calculate_block_sizes(
         "decode_query_size",
         "decode_batch_size",
         "tuned_tiles",
+        "skip_empty_mixed",
         "cp_group_size",
         "attention_scope",
         "return_lse",
@@ -637,6 +638,7 @@ def ragged_paged_attention(
     decode_query_size: int = 1,
     decode_batch_size: int = 8,
     tuned_tiles: bool = False,
+    skip_empty_mixed: bool = False,
     cp_group_size: int | None = None,
     cp_rank: jax.Array | None = None,
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
@@ -696,6 +698,13 @@ def ragged_paged_attention(
         tuned_tiles: Choose the default block sizes with the tuned tile rules
             (see `calculate_block_sizes`). Defaults to False: the heuristic's
             tiles.
+        skip_empty_mixed: Skip the MIXED call when it has no sequences: a call
+            of at most decode_query_size tokens, and at most the DECODE bq_sz,
+            without context parallelism (cp_group_size None) runs DECODE alone
+            over every sequence, and any other call runs MIXED under a
+            `lax.cond` on its sequence range. Defaults to False: DECODE and
+            MIXED both run on every call. One conditional per attention layer
+            changes how XLA schedules and places the whole compiled step.
         cp_group_size: Size of the context parallelism (CP) group. KV cache is
             sharded across devices in this group. Defaults to None.
         cp_rank: Rank of the current device within the CP group, which determine
@@ -920,6 +929,7 @@ def ragged_paged_attention(
         o_hbm_alias_q_hbm: jax.Array,
         kv_cache: jax.Array,
         lse_hbm_in: jax.Array | None,
+        dist: jax.Array = distribution,
     ):
         if mode == configs.RpaCase.DECODE:
             effective_blocks = decode_block_sizes or default_decode
@@ -941,7 +951,7 @@ def ragged_paged_attention(
             kv_lens=kv_lens,
             page_indices=page_indices,
             cu_q_lens=cu_q_lens,
-            distribution=distribution,
+            distribution=dist,
         )
         need = configs.worst_case_schedule_chunks(cfgs)
         if need > configs.MAX_SCHEDULE_CHUNKS:
@@ -971,7 +981,7 @@ def ragged_paged_attention(
             q_offsets,
             kv_cache_lens,
             kv_new_lens,
-            distribution,
+            dist,
             page_indices,
             cfgs=cfgs,
             computer_cls=computer_cls,
@@ -997,12 +1007,65 @@ def ragged_paged_attention(
             lse_out = None
         return o_out, kv_out, lse_out
 
-    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-        configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
-    )
-    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
-    )
+    # With skip_empty_mixed, a call of at most decode_query_size tokens runs
+    # DECODE alone over every sequence, and any other call skips MIXED at run
+    # time (lax.cond) when its sequence range is empty. Otherwise DECODE and
+    # MIXED both run on every call. The conditional, one per attention layer,
+    # changes how XLA schedules and places the whole compiled step, which can
+    # change the rounding of other ops in the step; so it is opt-in.
+    effective_decode_blocks = decode_block_sizes or default_decode
+    if (
+        skip_empty_mixed
+        and serve_cfgs.total_q_tokens
+        <= min(decode_query_size, effective_decode_blocks.bq_sz)
+        and cp_group_size is None
+    ):
+        decode_dist = jnp.repeat(distribution[2:3], 3)
+        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+            configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init, decode_dist
+        )
+    elif not skip_empty_mixed:
+        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+            configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
+        )
+        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+            configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
+        )
+    else:
+        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+            configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
+        )
+        # Skip the MIXED call when its sequence range
+        # [distribution[0], distribution[2]) (`configs.RpaConfigs.seq_range`)
+        # is empty.
+        if return_lse:
+
+            def _do_mixed_lse(args):
+                o_in, kv_in, lse_in = args
+                return run_rpa_kernel(configs.RpaCase.MIXED, o_in, kv_in, lse_in)
+
+            o_hbm_alias_q_hbm, kv_cache, lse_hbm = jax.lax.cond(
+                distribution[0] < distribution[2],
+                _do_mixed_lse,
+                lambda args: args,
+                (o_hbm_alias_q_hbm, kv_cache, lse_hbm),
+            )
+        else:
+
+            def _do_mixed(args):
+                o_in, kv_in = args
+                o_out, kv_out, _ = run_rpa_kernel(
+                    configs.RpaCase.MIXED, o_in, kv_in, None
+                )
+                return o_out, kv_out
+
+            o_hbm_alias_q_hbm, kv_cache = jax.lax.cond(
+                distribution[0] < distribution[2],
+                _do_mixed,
+                lambda args: args,
+                (o_hbm_alias_q_hbm, kv_cache),
+            )
+            lse_hbm = None
 
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     if return_raw_output:
