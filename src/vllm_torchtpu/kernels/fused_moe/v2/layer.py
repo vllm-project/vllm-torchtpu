@@ -572,6 +572,9 @@ def fused_ep_moe_v2(
     g_local = e_total // ep
     # Global experts the router scores; without a layout, one slot each.
     e_router = gating.shape[1] if expert_slot is not None else e_total
+    # Slots per shard that can receive rows: replicas split an expert's rows
+    # but add none, and staging slots are never in the table.
+    occupied_slots = min(g_local, -(-e_router // ep))
     if T % ep or gating.shape != (T, e_router):
         raise ValueError(
             "input and gating rows must agree and partition evenly over EP"
@@ -666,6 +669,16 @@ def fused_ep_moe_v2(
         has_w2_bias=has_w2_bias,
         pad_scale_rows=pad_scale_rows,
         logical_intermediate_size=logical_intermediate_size,
+        # A layout's spare (staging) slots never hold rows: estimate density
+        # over the logical experts per shard, with the unplaced slab.
+        **(
+            {
+                "occupied_slots": occupied_slots,
+                "density_rows_alloc": ragged_stride_bound(T, topk, e_router, capacity),
+            }
+            if occupied_slots != g_local
+            else {}
+        ),
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
