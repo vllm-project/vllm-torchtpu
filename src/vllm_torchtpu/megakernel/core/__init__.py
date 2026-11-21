@@ -53,10 +53,12 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         default_tiles,
     )
     from .modules import (
+        GQA,
         Embedding,
         EmbeddingModule,
         GDNLinInLayout,
         GDNParams,
+        GQAModule,
         GQAParams,
         MoEDebug,
         MoEParams,
@@ -158,6 +160,8 @@ _LAZY: dict[str, str] = {
     "ExecSpec": ".exec_spec",
     "Tiles": ".exec_spec",
     "default_tiles": ".exec_spec",
+    "GQA": ".modules",
+    "GQAModule": ".modules",
     "Embedding": ".modules",
     "EmbeddingModule": ".modules",
     "GDNLinInLayout": ".modules",
@@ -230,6 +234,7 @@ _LAZY: dict[str, str] = {
 
 __all__ = [
     "DEFAULT_PROFILE",
+    "GQA",
     "POOL_STATE_NAME",
     "REQUIRED",
     "AllReduceRing",
@@ -245,6 +250,7 @@ __all__ = [
     "FrozenDict",
     "GDNLinInLayout",
     "GDNParams",
+    "GQAModule",
     "GQAParams",
     "HFParamDecl",
     "JaxArrayOps",
