@@ -53,7 +53,7 @@ def test_rendezvous_port(monkeypatch, override, expected):
 
 
 @pytest.mark.parametrize("seconds", [None, 10800])
-def test_rendezvous_waits_main_300_s_unless_vllm_sets_a_cpu_timeout(seconds):
+def test_rendezvous_waits_default_300_s_unless_vllm_sets_a_cpu_timeout(seconds):
     config = ParallelConfig(cpu_distributed_timeout_seconds=seconds)
     expected = timedelta(seconds=300 if seconds is None else seconds)
     assert mp._rendezvous_timeout(config) == expected
