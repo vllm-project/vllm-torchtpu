@@ -61,8 +61,10 @@ from .geometry import (
     KeyTracker,
     LayerCounts,
     ModelGeometry,
+    UnsupportedArchitectureError,
     count_layer_types,
     from_hf_config,
+    supports,
 )
 from .hf_loader import (
     ConfigAudit,
@@ -169,6 +171,7 @@ __all__ = [
     "StepShape",
     "TopKEntry",
     "TrafficScenario",
+    "UnsupportedArchitectureError",
     "active_experts_envelope",
     "audit_hf_config",
     "bernoulli_expected_experts",
@@ -198,6 +201,7 @@ __all__ = [
     "solve_serving_plan",
     "spec_cycle_floor",
     "step_floor",
+    "supports",
     "top_layouts",
     "topologies_for_chip",
     "torus_collective_s",

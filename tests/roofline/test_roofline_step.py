@@ -28,6 +28,7 @@ from vllm_torchtpu.roofline import (
     FloorOptions,
     ModelGeometry,
     Parallel,
+    SeqKvLayout,
     ServingRequest,
     SpecShape,
     StepShape,
@@ -691,6 +692,72 @@ def test_topology_none_uses_torus_collective_schedule() -> None:
         if c.group > 1
     )
     assert sf_none.chain_s == pytest.approx(expected_chain_s, rel=1e-09)
+
+
+def test_block_parallel_and_multilayer_mtp_draft_cost() -> None:
+    """Verify block-parallel and multi-layer MTP draft module costing."""
+    synth_moe_mtp_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 8,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "num_experts": 64,
+        "num_experts_per_tok": 4,
+        "moe_intermediate_size": 1024,
+        "mtp_num_hidden_layers": 2,
+        "mtp_intermediate_size": 6144,
+        "block_parallel": True,
+        "vocab_size": 64000,
+    }
+    geom_bp = from_hf_config(synth_moe_mtp_cfg)
+    geom_seq = replace(geom_bp, block_parallel=1)
+    exp_block_parallel = 2
+    exp_mtp_inter = 6144
+    assert geom_bp.block_parallel == exp_block_parallel
+    assert geom_bp.mtp_inter == exp_mtp_inter
+    par = Parallel(tp=8)
+    dt = Dtypes()
+    opts_dt = FloorOptions(dt=dt)
+    mods_seq = pass_costs(geom_seq, par, StepShape(batch=4, rows_per_seq=1), dt)
+    mods_bp = pass_costs(geom_bp, par, StepShape(batch=4, rows_per_seq=1), dt)
+    exp_coll_diff = 8
+    assert (
+        sum(m.n_collectives for m in mods_seq) - sum(m.n_collectives for m in mods_bp)
+        == exp_coll_diff
+    )
+    spec = SpecShape(batch=4, context=2048, k=2)
+    cyc_dense_mtp = spec_cycle_floor(geom_bp, CHIPS["tpu7x"], par, spec, opts_dt)
+    cyc_moe_mtp = spec_cycle_floor(
+        replace(geom_bp, mtp_inter=0), CHIPS["tpu7x"], par, spec, opts_dt
+    )
+    assert any(m.name == "draft_mlp" for m in cyc_dense_mtp.modules)
+    assert not any(m.name == "draft_moe" for m in cyc_dense_mtp.modules)
+    assert any(m.name == "draft_moe" for m in cyc_moe_mtp.modules)
+    cyc_mtp1 = spec_cycle_floor(
+        replace(geom_bp, mtp_layers=1), CHIPS["tpu7x"], par, spec, opts_dt
+    )
+    draft_mlp_2 = next(m for m in cyc_dense_mtp.modules if m.name == "draft_mlp")
+    draft_mlp_1 = next(m for m in cyc_mtp1.modules if m.name == "draft_mlp")
+    draft_fc_2 = next(m for m in cyc_dense_mtp.modules if m.name == "draft_fc")
+    draft_fc_1 = next(m for m in cyc_mtp1.modules if m.name == "draft_fc")
+    assert draft_mlp_2.hbm_bytes == pytest.approx(draft_mlp_1.hbm_bytes, rel=1e-09)
+    assert draft_fc_2.hbm_bytes == pytest.approx(draft_fc_1.hbm_bytes, rel=1e-09)
+    seq_layout = SeqKvLayout(1, 1024)
+    bd_mtp2 = rf.hbm_breakdown_per_core_bytes(geom_bp, dt, par, seq_layout)
+    bd_mtp1 = rf.hbm_breakdown_per_core_bytes(
+        replace(geom_bp, mtp_layers=1), dt, par, seq_layout
+    )
+    bd_mtp0 = rf.hbm_breakdown_per_core_bytes(
+        replace(geom_bp, mtp_layers=0), dt, par, seq_layout
+    )
+    assert bd_mtp2.weights - bd_mtp0.weights == pytest.approx(
+        2.0 * (bd_mtp1.weights - bd_mtp0.weights), rel=1e-09
+    )
+    bd_moe = rf.hbm_breakdown_per_core_bytes(
+        replace(geom_bp, mtp_inter=0), dt, par, seq_layout
+    )
+    assert bd_mtp2.weights < bd_moe.weights
 
 
 def test_coll_bound_is_the_cut_bound_sum() -> None:
