@@ -374,6 +374,11 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM: bool = False
     VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM_MARGIN: int = 16
     VLLM_TPU_OFFLOAD_DIVERGENT_HITS: bool = False
+    VLLM_TPU_ARRIVAL_TOUCH: bool = False
+    VLLM_TPU_ARRIVAL_TOUCH_HBM_FRAC: float = 0.25
+    VLLM_TPU_ARRIVAL_TOUCH_MIN_FREE_FRAC: float = 0.10
+    VLLM_TPU_ARRIVAL_TOUCH_TTL_S: float = 120.0
+    VLLM_TPU_ARRIVAL_TOUCH_TIER: bool = True
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TPU_MAMBA_CHECKPOINT_RETENTION: bool = True
     VLLM_TPU_MAMBA_DECODE_CHECKPOINT: bool = True
@@ -2614,6 +2619,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_OFFLOAD_DIVERGENT_HITS": env_bool(
         "VLLM_TPU_OFFLOAD_DIVERGENT_HITS", default=False
     ),
+    # Scheduler: when a request enters the waiting queue, pin its cached HBM
+    # prefix blocks until it is scheduled or ends, and refresh the host-tier
+    # entries a load would read for it, so the queue wait stops ageing its
+    # prefix in either cache (core/arrival_touch.py; hunt_iter19 s3). Placement
+    # only: nothing is written, loaded or copied. Host-only.
+    "VLLM_TPU_ARRIVAL_TOUCH": env_bool("VLLM_TPU_ARRIVAL_TOUCH", default=False),
+    # VLLM_TPU_ARRIVAL_TOUCH: most distinct blocks that waiting requests may
+    # pin, as a fraction of the pool (0 turns the HBM pins off).
+    "VLLM_TPU_ARRIVAL_TOUCH_HBM_FRAC": env_float(
+        "VLLM_TPU_ARRIVAL_TOUCH_HBM_FRAC", 0.25
+    ),
+    # VLLM_TPU_ARRIVAL_TOUCH: free blocks the pool keeps, as a fraction; a pin
+    # that would go below it is refused, and the newest pins are released
+    # while the pool is below it.
+    "VLLM_TPU_ARRIVAL_TOUCH_MIN_FREE_FRAC": env_float(
+        "VLLM_TPU_ARRIVAL_TOUCH_MIN_FREE_FRAC", 0.10
+    ),
+    # VLLM_TPU_ARRIVAL_TOUCH: a pin held longer than this (seconds) is released.
+    "VLLM_TPU_ARRIVAL_TOUCH_TTL_S": env_float("VLLM_TPU_ARRIVAL_TOUCH_TTL_S", 120.0),
+    # VLLM_TPU_ARRIVAL_TOUCH: also refresh the request's host-tier entries.
+    "VLLM_TPU_ARRIVAL_TOUCH_TIER": env_bool("VLLM_TPU_ARRIVAL_TOUCH_TIER", default=True),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(

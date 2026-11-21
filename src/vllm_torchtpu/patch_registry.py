@@ -119,6 +119,9 @@ PATCHES = (
     # pool: it checks the functions it encodes as they are installed.
     Patch("vllm_torchtpu.core.kv_decode_fast_path:patch_kv_decode_fast_path", _ENGINE),
     Patch("vllm_torchtpu.core.kv_load_pacing:patch_kv_load_pacing", _ENGINE),
+    # Arrival-time prefix pins and host-tier refresh (inert unless
+    # VLLM_TPU_ARRIVAL_TOUCH), around the final add_request / schedule.
+    Patch("vllm_torchtpu.core.arrival_touch:patch_arrival_touch", _ENGINE),
     # Host admission costs (inert unless their flags are on).
     Patch(
         "vllm_torchtpu.core.prompt_token_array:patch_prompt_token_array",

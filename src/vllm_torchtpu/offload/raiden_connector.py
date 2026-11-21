@@ -505,6 +505,28 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     return 0
         return end - num_local_tokens
 
+    def touch_load_keys(self, request: Request, start: int, end: int) -> int:
+        """Refreshes the host-tier entries a load of ``request``'s tokens
+        ``[start, end)`` would read (VLLM_TPU_ARRIVAL_TOUCH): every
+        full-attention group's chunks from the one ``start`` falls in, and each
+        windowed group's window ending at ``end``, the keys
+        ``host_resident_tokens`` probed. Moves them to the store's Most Recently
+        Used end; loads nothing and keeps no pin. Returns the keys asked."""
+        hashes = request.block_hashes
+        keys: list[OffloadKey] = []
+        for group in self.config.kv_group_configs:
+            tpc, step = group.tokens_per_chunk, group.hashes_per_chunk
+            stop = min(end // tpc, len(hashes) // step)
+            window = group.sliding_window_size_in_chunks
+            first = start // tpc if window is None else max(stop - window, 0)
+            keys.extend(
+                make_offload_key(hashes[(chunk + 1) * step - 1], group.group_idx)
+                for chunk in range(first, stop)
+            )
+        if keys:
+            self._raiden_manager.touch_run(keys)
+        return len(keys)
+
     # -- victim policy (QWEN4_EXP_HOST_TIER_POLICY=victim; offload/victim.py) --
 
     def _enable_victim_policy(self, spec, vllm_config) -> None:
@@ -969,6 +991,19 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             return 0
         bound = self._max_loadable_tokens(request, num_local_tokens)
         return hit if bound is None else min(hit, bound)
+
+    def arrival_touch(self, request: Request, num_local_tokens: int) -> int:
+        """VLLM_TPU_ARRIVAL_TOUCH: when ``request`` enters the waiting queue,
+        refresh the host-tier entries a load past ``num_local_tokens`` would
+        read for it now (``host_tier_hit_tokens``), so its wait does not age
+        them. Nothing is loaded and no pin is kept. Returns the keys refreshed
+        (0 when the tier holds nothing past the local hit)."""
+        hit = self.host_tier_hit_tokens(request, num_local_tokens)
+        if hit <= 0:
+            return 0
+        scheduler = self.connector_scheduler
+        assert scheduler is not None
+        return scheduler.touch_load_keys(request, num_local_tokens, num_local_tokens + hit)
 
     def reset_cache(self) -> bool | None:
         # External cache reset is unsupported by the Raiden store. Report

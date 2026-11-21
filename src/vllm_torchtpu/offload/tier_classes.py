@@ -518,6 +518,11 @@ class TieredOffloadingManager(OffloadingManager):
         for c, (ks, _) in self._split(keys).items():
             self._managers[c].touch(ks, req_context)
 
+    def touch_run(self, keys) -> int:
+        """``RaidenOffloadingManager.touch_run`` per class (each key to its class, or
+        to every shard of it); returns the sub-hashes moved over all classes."""
+        return sum(self._managers[c].touch_run(ks) for c, (ks, _) in self._split(keys).items())
+
     def prepare_load(self, keys, req_context: ReqContext) -> LoadStoreSpec:
         keys = list(keys)
         taken: list[tuple[int, RaidenLoadStoreSpec]] = []

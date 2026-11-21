@@ -973,6 +973,31 @@ class RaidenOffloadingManager(OffloadingManager):
             if held:
                 self._store.release(held)
 
+    def touch_run(self, keys) -> int:
+        """``touch`` in one store call each way (VLLM_TPU_ARRIVAL_TOUCH).
+
+        One pinned lookup over every sub-hash of ``keys``, in order, and one
+        release of the host-pool entries it pinned: the store puts each released
+        entry at the Most Recently Used end, the first key nearest it, and holds
+        no pin afterwards. The lookup stops at the first miss, so only the
+        leading resident run moves. A peer's or storage tier's entry holds no
+        pin and is not released (see ``touch``). Returns the sub-hashes moved.
+        """
+        sub_hashes = self._expand_keys(list(keys))
+        if not sub_hashes:
+            return 0
+        skip = (self._block_status.REMOTE, self._block_status.SHARED_STORAGE)
+        held = [
+            sub_hash
+            for sub_hash, block in self._store.lookup(
+                sub_hashes, enable_global=False, pin_found=True
+            )
+            if block.status not in skip
+        ]
+        if held:
+            self._store.release(held)
+        return len(held)
+
     def prepare_load(self, keys, req_context: ReqContext) -> LoadStoreSpec:
         keys = list(keys)
         sub_hashes = self._expand_keys(keys)

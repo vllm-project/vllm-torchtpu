@@ -231,6 +231,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "patch_prefix_lookup_log",
         "patch_kv_decode_fast_path",
         "patch_kv_load_pacing",
+        "patch_arrival_touch",
         "patch_prompt_token_array",
         "patch_gc_at_waits",
         "patch_engine_core_gc",
