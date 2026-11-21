@@ -29,6 +29,12 @@ def _parallel(dp, tp):
     return SimpleNamespace(data_parallel_size=dp, tensor_parallel_size=tp)
 
 
+# A layout where sequence-parallel MoE is admitted (ParallelConfig's
+# use_sequence_parallel_moe), and one where it is not.
+_ADMITTED = SimpleNamespace(use_sequence_parallel_moe=True)
+_NOT_ADMITTED = SimpleNamespace(use_sequence_parallel_moe=False)
+
+
 @pytest.fixture
 def groups(monkeypatch):
     """Initialized model-parallel groups of a chosen (dp, tp) layout, in an
@@ -125,7 +131,7 @@ def test_with_a_drafter_the_threshold_waits_for_the_draft_form_record(
     assert sp.min_rows() == sp.min_rows(_parallel(*layout)) == 0
     # A small step stays sliced, and its mask is each rank's slice.
     assert sp.step_is_sequence_parallel(4)
-    assert sp.step_rows_are_sliced(4)
+    assert sp.step_rows_are_sliced(_ADMITTED, 4)
     monkeypatch.setattr(sp, "DRAFT_RECORDS_STEP_FORM", True)
     assert sp.gates_rows()
     assert sp.min_rows() == sp.min_rows(_parallel(*layout)) == threshold
@@ -140,10 +146,24 @@ def test_a_step_is_sliced_only_for_a_model_that_follows_the_form(groups, monkeyp
     monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
     monkeypatch.setattr(sp, "_FOLLOWS_STEP_FORM", False)
     assert sp.step_is_sequence_parallel(512) is True
-    assert sp.step_rows_are_sliced(512) is False
+    assert sp.step_rows_are_sliced(_ADMITTED, 512) is False
     monkeypatch.setattr(sp, "_FOLLOWS_STEP_FORM", True)
-    assert sp.step_rows_are_sliced(512) is True
-    assert sp.step_rows_are_sliced(511) is False
+    assert sp.step_rows_are_sliced(_ADMITTED, 512) is True
+    assert sp.step_rows_are_sliced(_ADMITTED, 511) is False
+
+
+def test_a_step_is_sliced_only_where_sequence_parallel_moe_is_admitted(
+    groups, monkeypatch
+):
+    """TPU_MOE_SEQUENCE_PARALLEL=1 alone makes a model follow each step's
+    form, but vLLM's decoder layers slice rows only where sequence-parallel
+    MoE is admitted (not without expert parallelism, for example)."""
+    groups(1, 8)
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    monkeypatch.setattr(sp, "_FOLLOWS_STEP_FORM", True)
+    assert sp.step_is_sequence_parallel(512) is True
+    assert sp.step_rows_are_sliced(_NOT_ADMITTED, 512) is False
+    assert sp.step_rows_are_sliced(_ADMITTED, 512) is True
 
 
 @pytest.mark.parametrize(

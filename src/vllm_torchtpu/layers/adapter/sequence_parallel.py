@@ -148,11 +148,17 @@ def step_is_sequence_parallel(full_num_tokens: int) -> bool:
     return enabled() and int(full_num_tokens) >= min_rows()
 
 
-def step_rows_are_sliced(full_num_tokens: int) -> bool:
+def step_rows_are_sliced(parallel_config: ParallelConfig, full_num_tokens: int) -> bool:
     """Whether the forward about to run slices this step's rows over TP: the
-    step is sequence-parallel and the model follows each step's form. A model
-    that does not hands its MoE layers every row of the step."""
-    return _FOLLOWS_STEP_FORM and step_is_sequence_parallel(full_num_tokens)
+    model follows each step's form, sequence-parallel MoE is admitted
+    (``use_sequence_parallel_moe``, which vLLM's Qwen3.5 decoder layers set
+    ``use_attn_reduce_scatter_for_moe`` from), and the step is
+    sequence-parallel. Otherwise the MoE layers get every row of the step."""
+    return (
+        _FOLLOWS_STEP_FORM
+        and parallel_config.use_sequence_parallel_moe
+        and step_is_sequence_parallel(full_num_tokens)
+    )
 
 
 def set_active(active: bool) -> None:
