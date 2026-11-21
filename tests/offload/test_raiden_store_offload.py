@@ -1923,13 +1923,16 @@ class TestHostTierRecency(unittest.TestCase):
 
 
 class _RecordingLock:
-    """A manager lock that records whether it is held."""
+    """A manager lock that records whether it is held and how often it was
+    entered."""
 
     def __init__(self):
         self.held = False
+        self.entries = 0
 
     def __enter__(self):
         self.held = True
+        self.entries += 1
 
     def __exit__(self, *exc):
         self.held = False
@@ -2070,6 +2073,67 @@ class TestOffloadConnectorOptions(unittest.TestCase):
         self.assertEqual(self._capped(1, lock, probe), ((None, False), False))
         self.assertEqual(held, [True])
         self.assertTrue(lock.held)
+
+    def test_the_early_returns_free_the_manager_when_the_step_ends(self):
+        """The mid-chunk touch and the cap probe return without upstream's
+        hook. The step region they open is upstream's, which
+        build_connector_meta closes; vLLM's schedule() calls it at the end of
+        every step. So a step whose only manager calls are theirs still ends
+        with the manager free."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+            OffloadingConnectorMetadata,
+        )
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        lock = _RecordingLock()
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched.manager = SimpleNamespace(lock=lock)
+        sched._host_tier_recency = True
+        sched.config = SimpleNamespace(
+            kv_group_configs=(SimpleNamespace(tokens_per_chunk=4),),
+            supports_partial_tail=False,
+        )
+        # One host-tier load is in flight, at a cap of one.
+        sched._jobs = {9: SimpleNamespace(is_store=False)}
+        sched._max_async_load_reqs = 1
+        sched._req_status = {
+            req_id: MagicMock(transfer_jobs=set(), partial_tail_boundary=None)
+            for req_id in ("mid", "capped")
+        }
+        sched._touch = MagicMock()
+        sched._quiet_lookup = MagicMock(return_value=8)
+        sched._raiden_manager = MagicMock()
+        sched._raiden_manager.poll_finished_jobs.return_value = []
+        sched._fence_pending = {}
+        sched._scheduler = None
+        sched._pending_failed_jobs = []
+        with patch.object(
+            OffloadingConnectorScheduler, "get_num_new_matched_tokens"
+        ) as upstream_hook:
+            # A local hit of 6 ends inside a 4-token chunk (the mid-chunk
+            # touch); one of 4 ends on a chunk and meets the cap.
+            mid = SimpleNamespace(request_id="mid")
+            capped = SimpleNamespace(request_id="capped")
+            self.assertEqual(sched.get_num_new_matched_tokens(mid, 6), (0, False))
+            self.assertEqual(sched.get_num_new_matched_tokens(capped, 4), (None, False))
+        upstream_hook.assert_not_called()
+        self.assertTrue(lock.held)
+        stock_meta = OffloadingConnectorMetadata(
+            load_jobs={}, store_jobs={}, jobs_to_flush=set()
+        )
+        with patch.object(
+            OffloadingConnectorScheduler,
+            "_build_connector_meta",
+            return_value=stock_meta,
+        ):
+            sched.build_connector_meta(MagicMock())
+        self.assertFalse(lock.held)
+        self.assertEqual(lock.entries, 1)
+        self.assertIsNone(sched._step_region)
 
 
 class TestWorkerSideConnector(unittest.TestCase):
@@ -5045,24 +5109,17 @@ class TestResolveDivergentLocalHit(unittest.TestCase):
                 sched._req_status["r"].update_offload_keys.assert_called_once()
 
     def test_the_probes_hold_the_manager_outside_the_step_region(self):
-        entered: list[bool] = []
-
-        class Lock:
-            def __enter__(self):
-                entered.append(True)
-
-            def __exit__(self, *exc):
-                return False
-
+        lock = _RecordingLock()
         sched, seen = self._sched({8: 4})
-        sched.manager = SimpleNamespace(lock=Lock())
+        sched.manager = SimpleNamespace(lock=lock)
         self.assertEqual(self._resolve(sched, 10, 4), 8)
-        self.assertEqual(entered, [True])
+        self.assertEqual(lock.entries, 1)
+        self.assertFalse(lock.held)
         # Inside schedule()'s region, which already holds the manager, the
         # probes run without entering the lock again.
         sched._step_region = object()
         self.assertEqual(self._resolve(sched, 10, 4), 8)
-        self.assertEqual(entered, [True])
+        self.assertEqual(lock.entries, 1)
 
     def test_a_request_with_a_transfer_in_flight_keeps_its_aligned_hit(self):
         sched, seen = self._sched({8: 4}, transfer_jobs=[3])
