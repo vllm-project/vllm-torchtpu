@@ -168,6 +168,10 @@ def _arm_all_reduce(mlps: list[MiniMaxM3DSparkMLP]) -> bool:
         )
         return False
     if not all(mlp.down_proj.reduce_results for mlp in mlps):
+        logger.warning(
+            "DSpark draft: the MLP's all-reduce is not folded: a down_proj "
+            "does not reduce its results."
+        )
         return False
     op = _make_reducing_op(armed)
     seen = [None] * tp.world_size
@@ -206,7 +210,9 @@ def arm_fused_mlp(model: torch.nn.Module | None, fold_all_reduce: bool = False) 
     folded = bool(armed) and fold_all_reduce and _arm_all_reduce(armed)
     # [i, h]: K-major.
     fits = bool(armed) and kernel.supported(
-        kernel.MAX_ROWS, *armed[0].down_proj.weight.shape[::-1]
+        kernel.MAX_ROWS,
+        *armed[0].down_proj.weight.shape[::-1],
+        n=get_tp_group().world_size if folded else 1,
     )
     logger.info(
         "DSpark draft: %d of %d MLPs run as one op%s; its kernel serves up to "
