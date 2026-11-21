@@ -704,9 +704,10 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 
 # Recompilation-avoidance contract:
 #   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
-#   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
-#      (backbone, compute_selected_logits, sample_from_logits/structured_decode,
-#      gather_logprobs) so _dummy_run and execute_model trace identically.
+#   2. Forward is split into 4 compiled subgraphs (the backbone, then the
+#      `tpu_compile` functions compute_selected_logits,
+#      sample_from_logits/structured_decode and gather_logprobs) so _dummy_run
+#      and execute_model trace identically.
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
@@ -7607,8 +7608,8 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
 
-        The rejection sampler is ``@torch.compile(backend="tpu",
-        dynamic=False)`` -> a fresh graph per input shape, and the
+        The rejection sampler is compiled with ``tpu_compile``
+        (``dynamic=False``) -> a fresh graph per input shape, and the
         ``logits[...]`` gathers around it are eager. None are covered by
         ``_precompile_sampling_subgraphs`` (non-spec sampling only) or
         ``drafter.precompile()`` (draft forward only), so they recompile every

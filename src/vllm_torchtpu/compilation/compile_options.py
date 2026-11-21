@@ -37,11 +37,10 @@ SECTION = "tpu_compile"
 @dataclass(frozen=True)
 class CompileOptions:
     drop_global_state_guard: bool = False
-    """Compile ``torch.compile(backend="tpu", fullgraph=True, dynamic=False)``
-    functions without Dynamo's GLOBAL_STATE guard (grad mode, CPU thread
-    count, default dtype), so entries compiled at warmup are reused by serving
-    threads whose thread count or grad mode differs. Tensor and value guards
-    are kept."""
+    """Compile the ``fast_dispatch.tpu_compile`` functions without Dynamo's
+    GLOBAL_STATE guard (grad mode, CPU thread count, default dtype), so
+    entries compiled at warmup are reused by serving threads whose thread
+    count or grad mode differs. Tensor and value guards are kept."""
 
     fast_compiled_call: bool = False
     """Call those functions' compiled code directly when one of their cached

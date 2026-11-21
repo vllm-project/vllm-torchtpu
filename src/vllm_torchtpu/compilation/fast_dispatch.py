@@ -73,7 +73,7 @@ def configure(fast: bool, drop_global_state: bool) -> None:
     if fast or drop_global_state:
         logger.info(
             "tpu_compile: fast_compiled_call=%s drop_global_state_guard=%s for "
-            "torch.compile(backend='tpu', fullgraph=True, dynamic=False) functions",
+            "the package's tpu_compile functions",
             bool(fast),
             bool(drop_global_state),
         )
