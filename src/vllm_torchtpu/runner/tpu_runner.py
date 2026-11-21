@@ -9690,8 +9690,6 @@ class TPUModelRunner(GPUModelRunner):
         safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
         return logits / safe_temperatures
 
-    # TODO: Under SPMD mode, sample_from_logits has correctness issue.
-    #       Re-enable the torch.compile once the issue is fixed in torchxla.
     @tpu_compile
     def sample_from_logits(
         self,

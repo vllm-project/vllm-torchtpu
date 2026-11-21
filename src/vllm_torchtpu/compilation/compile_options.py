@@ -92,6 +92,8 @@ def get(vllm_config: "VllmConfig | None") -> CompileOptions:
 
 def apply(vllm_config: "VllmConfig | None") -> CompileOptions:
     """Arm this process's ``tpu_compile`` functions with the engine's options."""
+    # Imported here, not at the top: parsing and checking the section (the
+    # platform does it at startup) needs no torch; only arming does.
     from vllm_torchtpu.compilation import fast_dispatch
 
     options = get(vllm_config)
