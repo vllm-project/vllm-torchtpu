@@ -38,7 +38,8 @@ SMOKE_RL2 = 8e-3
 # 5-request step to the LISTED walk (C: compact_plan 'fits' is False -> the listed walk on the full pool), which the WALK-FOS
 # and bitwise-variant options never reach, so a 5-request step under SERVED_GL compares the served math with itself
 # (CEN2 j-3f53f369: every variant read the served walk's error, and the guard's 'cool' check saw the served bits).
-GL = dict(SERVED_GL, compact_reqs=8)
+GL = dict(SERVED_GL, compact_reqs=8, mask_view=True, vguard_lean=True, align_gather=True)  # + the S3 QA-1 keys (served form)
+PLAIN = dict(SERVED_GL, compact_reqs=8)  # the row_visible (no mask_view) branch, covered by test_fos2_plain_mask_form
 
 
 def _err(step, out, rows, ref):
@@ -139,3 +140,16 @@ def test_remat_max_close_to_served(kernels):
     rows = np.flatnonzero(np.asarray(step[3]) > 0)[::13]
     ref = _f64_attention(step, rows)
     assert _err(step, rm, rows, ref) <= 2.0 * _err(step, base, rows, ref) + 1e-6
+
+
+def test_fos2_plain_mask_form(kernels):
+    """fos=2 on the walk without mask_view (the row_visible select branch): engaged and within the bar (CEN5 j-64e0e530: the
+    tests ran only this branch, so a mask mutant in the served mask_view branch survived; GL now carries the S3 QA-1 keys)."""
+    step = _packed_step(37, SPARE[0], SPARE[1])
+    base, out = _walk(step, PLAIN), _walk(step, PLAIN, bf16_softmax=True, fos=2)
+    assert float(np.mean(np.asarray(out).view(np.uint16) != np.asarray(base).view(np.uint16))) > 0
+    rows = np.flatnonzero(np.asarray(step[3]) > 0)[::13]
+    ref = _f64_attention(step, rows)
+    r = _rl2(out, rows, ref)
+    print(f"PQFOS fos2_plain rel_l2_vs_f64 {r:.6f} (served walk {_rl2(base, rows, ref):.6f})")
+    assert r <= SMOKE_RL2, r
