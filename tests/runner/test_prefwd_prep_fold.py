@@ -555,12 +555,15 @@ def test_fold_ineligible_steps_fall_back(monkeypatch):
         ("VLLM_TPU_QWEN4_NGRAM_WINDOW", "check"),
         ("VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL", False),
         ("VLLM_TPU_QWEN4_FUSED_PREP", False),
-        ("VLLM_TPU_DRAFT_SHARD_ARGMAX", True),
     ):
         old = getattr(envs, name)
         monkeypatch.setattr(envs, name, value)
         assert precheck() is None, name
         monkeypatch.setattr(envs, name, old)
+    assert precheck() is not None
+    # How the drafts were proposed (shard argmax or not) does not reach the
+    # prep inputs: the served c32 env runs DRAFT_SHARD_ARGMAX and still folds.
+    monkeypatch.setattr(envs, "VLLM_TPU_DRAFT_SHARD_ARGMAX", True)
     assert precheck() is not None
     # No drafts verified this step (spec metadata None) or a padded logits
     # length that differs from the bucket: no fold, nothing run.
