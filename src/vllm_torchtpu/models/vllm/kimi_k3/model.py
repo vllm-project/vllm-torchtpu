@@ -77,7 +77,6 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
-from ..multimodal_utils import merge_multimodal_embeddings
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention, kda_state_dtype
 from .collective_ops import TokenShardCollectives
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
@@ -917,22 +916,6 @@ class KimiK3ForConditionalGeneration(
         )
         outputs = mm_projector_forward(self.mm_projector, list(vt_outputs))
         return torch.cat(list(outputs), dim=0)
-
-    def embed_input_ids(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: NestedTensors | None = None,
-        *,
-        is_multimodal: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        inputs_embeds = self._embed_text_input_ids(
-            input_ids,
-            self.get_language_model().embed_input_ids,
-            is_multimodal=is_multimodal,
-        )
-        return merge_multimodal_embeddings(
-            inputs_embeds, multimodal_embeddings, is_multimodal
-        )
 
     def forward(
         self,

@@ -17,8 +17,6 @@ import torch
 from vllm.model_executor.models.utils import _flatten_embeddings
 from vllm.multimodal.inputs import NestedTensors
 
-from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
-
 
 def merge_multimodal_embeddings(
     inputs_embeds: torch.Tensor,
@@ -27,9 +25,20 @@ def merge_multimodal_embeddings(
 ) -> torch.Tensor:
     """Write multimodal embeddings into the placeholder rows of `inputs_embeds`.
 
-    `masked_scatter` and boolean indexing lower to data-dependent shapes on
-    TPU, so each row gathers its embedding with `index_select` and `where`
-    selects it. The number of embeddings must equal the number of placeholders.
+    `_patch_vllm_merge_multimodal_embeddings` installs this over vLLM's
+    `_merge_multimodal_embeddings`. `masked_scatter` and boolean indexing lower
+    to data-dependent shapes on TPU, so each row gathers its embedding with
+    `index_select` on a prefix sum of the mask and `where` selects it.
+
+    - `inputs_embeds` is `[num_tokens, hidden]` and `is_multimodal` has
+      `num_tokens` entries.
+    - The count check and the prefix sum read the mask on the host. Pass a host
+      mask, as the runner does; a device mask costs a device read.
+    - Returns `inputs_embeds` when there is nothing to merge and a new tensor
+      otherwise; vLLM's version writes into `inputs_embeds`.
+    - Raises `ValueError` if the mask is missing, if the shapes do not match, or
+      if the number of embeddings differs from the number of placeholders.
+    - Call it eagerly: the host reads cannot be traced into a compiled graph.
     """
     if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
         return inputs_embeds
@@ -40,6 +49,12 @@ def merge_multimodal_embeddings(
         device=inputs_embeds.device, dtype=inputs_embeds.dtype
     )
     mask_cpu = is_multimodal.detach().reshape(-1).to(device="cpu", dtype=torch.bool)
+    if inputs_embeds.dim() != 2 or mask_cpu.numel() != inputs_embeds.shape[0]:
+        raise ValueError(
+            "Expected [num_tokens, hidden] embeddings and num_tokens mask entries, "
+            f"got embeddings of shape {tuple(inputs_embeds.shape)} and "
+            f"{mask_cpu.numel()} mask entries"
+        )
     expected = int(mask_cpu.sum().item())
     actual = mm_embeds.shape[0]
     if actual != expected:
@@ -56,10 +71,4 @@ def merge_multimodal_embeddings(
     mask = is_multimodal.reshape(-1, 1).to(
         device=inputs_embeds.device, dtype=torch.bool
     )
-    merged = torch.where(mask, aligned_media, inputs_embeds)
-    if merged.device.type != "tpu":
-        return merged
-
-    materialized = fresh_buffer(merged)
-    synchronize_tensors(materialized)
-    return materialized
+    return torch.where(mask, aligned_media, inputs_embeds)
