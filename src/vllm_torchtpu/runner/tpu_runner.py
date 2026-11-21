@@ -9141,11 +9141,12 @@ class TPUModelRunner(GPUModelRunner):
         mask is then this rank's slice. Otherwise it covers all
         `num_tokens_padded` rows, which every rank holds. None takes the
         decision the target forward makes, `sequence_parallel.step_rows_are_sliced`:
-        sliced only when the step is sequence-parallel and the model follows
-        each step's form. A model that does not gets the full mask, because
-        its MoE paths read the mask over all of a step's rows: written for a
-        forward that reads every row, the per-rank slice marks other ranks'
-        real rows as padding and the MoE drops their experts.
+        sliced only when sequence-parallel MoE is admitted, the step is
+        sequence-parallel and the model follows each step's form. Any other
+        forward gets the full mask, because its MoE paths read the mask over
+        all of a step's rows: written for a forward that reads every row, the
+        per-rank slice marks other ranks' real rows as padding and the MoE
+        drops their experts.
         """
         padding_state = getattr(self, "_token_padding_state", None)
         if padding_state is None:
@@ -9161,7 +9162,9 @@ class TPUModelRunner(GPUModelRunner):
                 valid_tokens = num_tokens_padded
         tp_size = self.parallel_config.tensor_parallel_size
         if rows_sliced is None:
-            rows_sliced = sequence_parallel.step_rows_are_sliced(num_tokens_padded)
+            rows_sliced = sequence_parallel.step_rows_are_sliced(
+                self.parallel_config, num_tokens_padded
+            )
         if rows_sliced and tp_size > 1:
             chunk = num_tokens_padded // tp_size
             tp_rank = get_tensor_model_parallel_rank()
