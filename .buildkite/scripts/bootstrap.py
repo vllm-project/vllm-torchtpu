@@ -294,7 +294,10 @@ class Suite:
     nightly: bool = False
 
 
-_CPU_STAGE = ("build", "cpu")  # cpu steps wait on build_docker themselves
+# cpu steps wait on build_docker themselves; build_wheels waits on nothing. The
+# TPU steps of every lane wait on both build_docker and check_wheels, so
+# every suite that has a TPU lane also has build_wheels.
+_CPU_STAGE = ("build", "cpu", "build_wheels")
 _DEFAULT_TPU = ("tests", "integration", "verify")
 _FULL_TPU = ("tests", "integration", "perf", "verify")
 _ALL_LANES = (*_CPU_STAGE, *_FULL_TPU)
@@ -316,8 +319,9 @@ SUITES: dict[str, Suite] = {
         ),
         Suite(
             "perf",
-            "image build and perf/eval only",
-            stages=(("build", "perf"),),
+            "image build, test wheels and perf/eval only",
+            # build_wheels because the perf steps wait for check_wheels.
+            stages=(("build", "build_wheels", "perf"),),
         ),
         Suite(
             "integration",

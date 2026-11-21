@@ -17,7 +17,8 @@
 # as a user's `pip install vllm-torchtpu==<version>` would after the publish:
 # resolve the combined wheel against the local core wheel plus pypi.org, for
 # the platform the wheels support (CPython 3.12, x86_64 Linux, glibc >= 2.31,
-# the floor torch-tpu and tpu-sync-torch set).
+# the floor torch-tpu and tpu-sync-torch set). Run by the release, and by the
+# test wheel build (TEST_WHEELS=1, .buildkite/pipeline_build_wheels.yml).
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
@@ -44,7 +45,9 @@ grep -qx "vllm-torchtpu-core==${VERSION}" "${WORK}/pins.txt" \
 
 NAMES=""
 for f in "${WORK}"/dist/*; do NAMES+="\`$(basename "${f}")\` "; done
-buildkite-agent annotate --style info --context release-wheels <<EOF
+CONTEXT="release-wheels"
+[[ "${TEST_WHEELS:-}" == "1" ]] && CONTEXT="test-wheels"
+buildkite-agent annotate --style info --context "${CONTEXT}" <<EOF
 Wheels: ${NAMES}\`vllm-torchtpu==${VERSION}\` resolves from them plus pypi.org ($(grep -c '==' "${WORK}/resolved.txt") packages):
 
 \`\`\`
