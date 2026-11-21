@@ -10743,11 +10743,16 @@ class TPUModelRunner(GPUModelRunner):
                         total = self._spec_step_total(P)
                         if buckets.needs_retrace(P) and total is not None:
                             self._retrace_eagle_draft()
-                            if not self._warmup_spec_first_pass(total, idx=i):
-                                # The retrace dropped the refusals and the
-                                # draft's trace; going on would leave the
-                                # draft to one trace after the window, with
-                                # one form for every bucket.
+                            # The first attempt cold-compiles the retraced
+                            # draft, which can fail once as in the sweep
+                            # below; retry once. A second failure refuses the
+                            # start: the retrace dropped the refusals and the
+                            # draft's trace, so going on would leave the
+                            # draft to one trace after the window, with one
+                            # form for every bucket.
+                            if not self._warmup_spec_first_pass(
+                                total, idx=i, quiet=True
+                            ) and not self._warmup_spec_first_pass(total, idx=i):
                                 raise RuntimeError(
                                     "spec-decode warmup could not run the MTP "
                                     f"draft's first pass of {total} tokens for "
@@ -10911,11 +10916,15 @@ class TPUModelRunner(GPUModelRunner):
                 "SPEC_WARMUP=1, or serve with TPU_MOE_SEQUENCE_PARALLEL=0."
             )
 
-    def _warmup_spec_first_pass(self, total: int, idx: int) -> bool:
+    def _warmup_spec_first_pass(
+        self, total: int, idx: int, quiet: bool = False
+    ) -> bool:
         """Run one synthetic prefill step of `total` tokens through target
         sampling and the draft's first pass, split over the fewest requests
         whose prompts fit max_model_len: a token bucket above max_model_len is
-        reached only by a batched step. Returns True on success."""
+        reached only by a batched step. Returns True on success. With `quiet`
+        a failure is logged as a warning for the caller's one retry, as in
+        _warmup_one_spec_request."""
         from vllm.sampling_params import SamplingParams
         from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 
@@ -10959,7 +10968,18 @@ class TPUModelRunner(GPUModelRunner):
             self.sample_tokens(None)
             self.take_draft_token_ids()
         except Exception:
-            logger.exception("spec-decode warmup first pass of %d tokens failed", total)
+            if quiet:
+                logger.warning(
+                    "spec-decode warmup first pass of %d tokens: first attempt "
+                    "failed; retrying. Under DP/EP this can desynchronize ranks "
+                    "— if startup hangs after this line, that is the cause.",
+                    total,
+                    exc_info=True,
+                )
+            else:
+                logger.exception(
+                    "spec-decode warmup first pass of %d tokens failed", total
+                )
             return False
         finally:
             self._warmup_spec_decode_cleanup(rids)

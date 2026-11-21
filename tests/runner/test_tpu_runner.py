@@ -1038,7 +1038,7 @@ def _sided_draft_runner(monkeypatch, paddings, side, *, k, max_model_len, max_nu
             return False
         return True
 
-    def first_pass(total, idx):
+    def first_pass(total, idx, quiet=False):
         draft(tpu_runner._get_padded_token_len(paddings, total))
         return True
 
@@ -1142,7 +1142,9 @@ def test_spec_warmup_builds_draft_buckets_only_batched_steps_reach(monkeypatch):
     _run_spec_warmup(runner)
 
     assert draft.traced_at == [8, 32]
-    assert runner._warmup_spec_first_pass.call_args_list == [((32,), {"idx": 2})]
+    assert runner._warmup_spec_first_pass.call_args_list == [
+        ((32,), {"idx": 2, "quiet": True})
+    ]
     for bucket in (8, 16, 32, 64):
         draft(bucket)
 
@@ -1180,7 +1182,9 @@ def test_spec_warmup_reports_draft_buckets_no_step_reaches(monkeypatch):
     )
     _run_spec_warmup(runner)
 
-    assert runner._warmup_spec_first_pass.call_args_list == [((9,), {"idx": 1})]
+    assert runner._warmup_spec_first_pass.call_args_list == [
+        ((9,), {"idx": 1, "quiet": True})
+    ]
     assert draft.live == {8, 16}
 
 
@@ -1198,6 +1202,130 @@ def test_draft_bucket_check_refuses_a_reachable_bucket_left_uncompiled():
         tpu_runner.shape_variants.ShapeSpecializationError, match=r"\[16\]"
     ):
         TPUModelRunner._check_draft_buckets_built(runner, buckets)
+
+
+def test_spec_warmup_retries_a_draft_first_pass_that_fails_once(monkeypatch):
+    """The first pass after a retrace is the draft's cold compile, which can
+    fail once, as the one-request sweep's first attempt can; it is retried
+    once before the start is refused."""
+    paddings = [8, 16, 32, 64]
+    runner, draft = _sided_draft_runner(
+        monkeypatch,
+        paddings,
+        lambda n: n >= 32,
+        k=3,
+        max_model_len=20,
+        max_num_seqs=4,
+    )
+
+    attempts = []
+
+    def cold_then_warm(total, idx, quiet=False):
+        attempts.append(quiet)
+        draft(tpu_runner._get_padded_token_len(paddings, total))
+        return len(attempts) > 1
+
+    runner._warmup_spec_first_pass = MagicMock(side_effect=cold_then_warm)
+    _run_spec_warmup(runner)
+
+    assert runner._warmup_spec_first_pass.call_args_list == [
+        ((32,), {"idx": 2, "quiet": True}),
+        ((32,), {"idx": 2}),
+    ]
+    assert draft.traced_at == [8, 32]
+    for bucket in paddings:
+        draft(bucket)
+
+
+def _first_pass_runner(num_blocks, execute_model=None):
+    """A runner stand-in for the real _warmup_spec_first_pass: max_model_len
+    20 and two KV-cache groups with 8- and 4-token blocks, so a request of
+    max_model_len tokens takes 3 and 5 blocks."""
+    groups = [
+        SimpleNamespace(
+            kv_cache_spec=FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.bfloat16,
+            )
+        )
+        for block_size in (8, 4)
+    ]
+    return SimpleNamespace(
+        max_model_len=20,
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+        ),
+        kv_cache_config=SimpleNamespace(num_blocks=num_blocks, kv_cache_groups=groups),
+        execute_model=execute_model or MagicMock(return_value=None),
+        sample_tokens=MagicMock(),
+        take_draft_token_ids=MagicMock(),
+        _warmup_spec_decode_cleanup=MagicMock(return_value=True),
+    )
+
+
+@pytest.mark.parametrize(
+    ("total", "lens"), [(50, [19, 19, 12]), (38, [19, 19]), (7, [7])]
+)
+def test_spec_first_pass_splits_its_tokens_into_max_model_len_prompts(total, lens):
+    """The draft's first pass runs one step of `total` tokens as the fewest
+    prompts of at most max_model_len - 1 tokens. Each prompt has its own
+    blocks from block 1 in every KV-cache group, and every synthetic request
+    is torn down after the step."""
+    runner = _first_pass_runner(num_blocks=len(lens) * 5 + 2)
+
+    assert TPUModelRunner._warmup_spec_first_pass(runner, total, idx=3) is True
+
+    (so,), _ = runner.execute_model.call_args
+    rids = [f"__spec_warmup_fp3_{j}__" for j in range(len(lens))]
+    reqs = so.scheduled_new_reqs
+    assert [r.req_id for r in reqs] == rids
+    assert [len(r.prompt_token_ids) for r in reqs] == lens
+    assert all(r.num_computed_tokens == 0 for r in reqs)
+    assert so.num_scheduled_tokens == dict(zip(rids, lens))
+    assert so.total_num_scheduled_tokens == total == sum(lens)
+    # Request j's ids start at 1 + 5 j in both groups (5 blocks for the
+    # larger group): 3 blocks of 8 tokens and 5 of 4 cover max_model_len.
+    assert [r.block_ids for r in reqs] == [
+        (list(range(1 + 5 * j, 4 + 5 * j)), list(range(1 + 5 * j, 6 + 5 * j)))
+        for j in range(len(lens))
+    ]
+    for group in range(2):
+        ids = [b for r in reqs for b in r.block_ids[group]]
+        assert len(ids) == len(set(ids))
+        assert min(ids) > 0
+        assert max(ids) < runner.kv_cache_config.num_blocks
+    runner.sample_tokens.assert_called_once_with(None)
+    runner.take_draft_token_ids.assert_called_once_with()
+    runner._warmup_spec_decode_cleanup.assert_called_once_with(rids)
+
+
+def test_spec_first_pass_without_enough_kv_blocks_does_not_run():
+    """Three prompts of 5 blocks need 3 * 5 + 2 KV blocks (block 0 stays
+    reserved, as in the other spec warm-ups); with 16 the first pass reports
+    failure without running a step."""
+    runner = _first_pass_runner(num_blocks=16)
+
+    assert TPUModelRunner._warmup_spec_first_pass(runner, 50, idx=0) is False
+
+    runner.execute_model.assert_not_called()
+    runner._warmup_spec_decode_cleanup.assert_not_called()
+
+
+@pytest.mark.parametrize("quiet", [True, False])
+def test_a_failed_spec_first_pass_tears_down_every_request(quiet):
+    runner = _first_pass_runner(
+        num_blocks=17, execute_model=MagicMock(side_effect=RuntimeError("compile"))
+    )
+
+    assert (
+        TPUModelRunner._warmup_spec_first_pass(runner, 50, idx=1, quiet=quiet) is False
+    )
+
+    runner._warmup_spec_decode_cleanup.assert_called_once_with(
+        [f"__spec_warmup_fp1_{j}__" for j in range(3)]
+    )
 
 
 @pytest.mark.parametrize("varies", [True, False])
