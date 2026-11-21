@@ -271,9 +271,15 @@ def _write_sorted_packed_pages(
     total_rows = sum(bank.shape[0] for bank in banks)
     batch = min(count, PACKED_FP8_WRITE_BATCH)
 
+    # A run of consecutive columns spans one page of values lanes; its first
+    # record need not be lane-aligned, hence one more source chunk.
+    out_chunks = max(1, page_size // page_tokens)
+    value_chunks = values.shape[1] // page_tokens
+
     def kernel(base_ref, column_ref, value_ref, *refs):
         outputs = refs[len(banks) : 2 * len(banks)]
-        pages, sem = refs[2 * len(banks) :]
+        pages, firsts, sem = refs[2 * len(banks) :]
+        offset = pl.program_id(0) * batch
 
         def first(record):
             base = base_ref[record]
@@ -281,91 +287,132 @@ def _write_sorted_packed_pages(
                 (record == 0) | (base != base_ref[jnp.maximum(record - 1, 0)])
             )
 
-        def each_valid(action):
-            def body(slot):
-                action(slot, 0)
-                return slot + 1
+        # Index the pages whose first record falls in this batch. Sorting puts
+        # invalid records last; decode writes only compressed token
+        # boundaries, so most input rows need no page work.
+        def find(carry):
+            slot, found = carry
+            record = offset + slot
+            is_first = first(record)
 
-            # Sorting puts invalid records last; decode writes only compressed
-            # token boundaries, so most input rows need no page work.
-            jax.lax.while_loop(
-                lambda slot: (slot < batch)
-                & (base_ref[pl.program_id(0) * batch + slot] < total_rows),
-                body,
-                jnp.int32(0),
-            )
+            @pl.when(is_first)
+            def _():
+                firsts[found] = record
+
+            return slot + 1, found + is_first.astype(jnp.int32)
+
+        _, page_count = jax.lax.while_loop(
+            lambda carry: (
+                (carry[0] < batch) & (base_ref[offset + carry[0]] < total_rows)
+            ),
+            find,
+            (jnp.int32(0), jnp.int32(0)),
+        )
 
         def copies(*, write, wait):
-            def body(slot, carry):
-                record = pl.program_id(0) * batch + slot
-                base = base_ref[record]
+            @pl.loop(0, page_count)
+            def _(page):
+                base = base_ref[firsts[page]]
 
-                @pl.when(first(record))
-                def _():
-                    def move(bank, offset):
-                        hbm = outputs[bank].at[pl.ds(base - offset, page_rows), :]
-                        vmem = pages.at[slot]
-                        src, dst = (vmem, hbm) if write else (hbm, vmem)
-                        copy = pltpu.make_async_copy(src, dst, sem)
-                        if wait:
-                            copy.wait()
-                        else:
-                            copy.start()
-
-                    if len(banks) == 1:
-                        move(0, 0)
+                def move(bank, offset):
+                    hbm = outputs[bank].at[pl.ds(base - offset, page_rows), :]
+                    vmem = pages.at[page]
+                    src, dst = (vmem, hbm) if write else (hbm, vmem)
+                    copy = pltpu.make_async_copy(src, dst, sem)
+                    if wait:
+                        copy.wait()
                     else:
-                        jax.lax.cond(
-                            base < first_rows,
-                            lambda: move(0, 0),
-                            lambda: move(1, first_rows),
-                        )
+                        copy.start()
 
-                return carry
-
-            each_valid(body)
+                if len(banks) == 1:
+                    move(0, 0)
+                else:
+                    jax.lax.cond(
+                        base < first_rows,
+                        lambda: move(0, 0),
+                        lambda: move(1, first_rows),
+                    )
 
         copies(write=False, wait=False)
         copies(write=False, wait=True)
 
-        def merge(slot, carry):
-            start = pl.program_id(0) * batch + slot
+        positions = jnp.arange(page_rows * page_tokens).reshape(page_rows, page_tokens)
+        in_fields = positions < fields * page_size
 
-            @pl.when(first(start))
-            def _():
-                def update(record):
-                    word = jnp.take_along_axis(
-                        value_ref[
-                            :, pl.ds(record // page_tokens * page_tokens, page_tokens)
-                        ],
-                        jnp.full((padded_fields, page_tokens), record % page_tokens),
+        def to_page(word):
+            """[padded_fields, max(page_size, page_tokens)] words -> page rows."""
+            if page_size < page_tokens:
+                word = word[:, :page_size]
+            return word.reshape(page_rows, page_tokens)
+
+        def merge_record(page, record):
+            word = jnp.take_along_axis(
+                value_ref[:, pl.ds(record // page_tokens * page_tokens, page_tokens)],
+                jnp.full((padded_fields, page_tokens), record % page_tokens),
+                axis=1,
+                mode="fill",
+            )
+            if page_size > page_tokens:
+                word = jnp.tile(word, (1, page_size // page_tokens))
+            pages[page] = jnp.where(
+                (positions % page_size == column_ref[record]) & in_fields,
+                to_page(word),
+                pages[page],
+            )
+
+        def merge_run(page, start, size, column):
+            """Records [start, start + size) fill columns [column, column + size)."""
+            lane = jax.lax.broadcasted_iota(jnp.int32, (padded_fields, page_tokens), 1)
+            chunk = start // page_tokens
+            words = []
+            for out in range(out_chunks):
+                source = start + out * page_tokens + lane - column
+                source = jnp.clip(source, start, start + size - 1)
+                word = jnp.zeros((padded_fields, page_tokens), jnp.int32)
+                for step in range(out_chunks + 1):
+                    lanes = jnp.minimum(chunk + step, value_chunks - 1) * page_tokens
+                    part = jnp.take_along_axis(
+                        value_ref[:, pl.ds(lanes, page_tokens)],
+                        source % page_tokens,
                         axis=1,
                         mode="fill",
                     )
-                    if page_size < page_tokens:
-                        word = word[:, :page_size].reshape(page_rows, page_tokens)
-                    elif page_size > page_tokens:
-                        word = jnp.tile(word, (1, page_size // page_tokens)).reshape(
-                            page_rows, page_tokens
-                        )
-                    positions = jnp.arange(page_rows * page_tokens).reshape(
-                        page_rows, page_tokens
-                    )
-                    pages[slot] = jnp.where(
-                        (positions % page_size == column_ref[record])
-                        & (positions < fields * page_size),
-                        word,
-                        pages[slot],
-                    )
-                    return record + 1
+                    word = jnp.where(source // page_tokens == chunk + step, part, word)
+                words.append(word)
+            page_column = positions % page_size
+            pages[page] = jnp.where(
+                (page_column >= column) & (page_column < column + size) & in_fields,
+                to_page(jnp.concatenate(words, axis=1)),
+                pages[page],
+            )
 
-                jax.lax.while_loop(
-                    lambda record: base_ref[record] == base_ref[start], update, start
-                )
+        @pl.loop(0, page_count)
+        def _(page):
+            start = firsts[page]
+            base, column = base_ref[start], column_ref[start]
 
-            return carry
+            def scan(carry):
+                record, contiguous = carry
+                step = (column_ref[record] - column == record - start).astype(jnp.int32)
+                return record + 1, contiguous * step
 
-        each_valid(merge)
+            # The final sentinel base terminates the last page's scan.
+            end, contiguous = jax.lax.while_loop(
+                lambda carry: base_ref[carry[0]] == base,
+                scan,
+                (start, jnp.int32(1)),
+            )
+
+            @pl.when(contiguous == 1)
+            def _():
+                merge_run(page, start, end - start, column)
+
+            @pl.when(contiguous == 0)
+            def _():
+                @pl.loop(start, end)
+                def _(record):
+                    merge_record(page, record)
+
         copies(write=True, wait=False)
         copies(write=True, wait=True)
 
@@ -382,6 +429,7 @@ def _write_sorted_packed_pages(
             out_specs=tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in banks),
             scratch_shapes=(
                 pltpu.VMEM((batch, page_rows, page_tokens), jnp.int32),
+                pltpu.SMEM((batch,), jnp.int32),
                 pltpu.SemaphoreType.DMA,
             ),
         ),
