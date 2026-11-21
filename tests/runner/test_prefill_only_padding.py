@@ -27,6 +27,7 @@ from vllm.config import (
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
+    SpeculativeConfig,
     VllmConfig,
 )
 from vllm.sampling_params import SamplingParams
@@ -73,11 +74,6 @@ def _cached(req_ids, computed):
 def _requests(prompts=()):
     """The runner's request states: request id -> prompt length."""
     return {r: types.SimpleNamespace(num_prompt_tokens=p) for r, p in prompts}
-
-
-def _batch(req_ids=()):
-    """An input batch holding these requests."""
-    return types.SimpleNamespace(req_id_to_index={r: i for i, r in enumerate(req_ids)})
 
 
 def _new(rid, computed, prompt_len):
@@ -211,7 +207,8 @@ def test_a_request_skipped_in_the_last_step_is_stripped():
 
     runner = _stub_runner(
         True,
-        input_batch=_batch(),  # "r" was not scheduled in the previous step
+        # An input batch without "r": it was not scheduled in the previous step.
+        input_batch=types.SimpleNamespace(req_id_to_index={}),
         requests=_requests([("r", 126209)]),
         _update_states=_update_states,
     )
@@ -223,22 +220,60 @@ def test_a_request_skipped_in_the_last_step_is_stripped():
     assert "r" not in out.scheduled_spec_decode_tokens
 
 
-def _scheduler(tmp_path, scheduler_cls, chunk):
-    """vLLM's scheduler over a 2-layer OPT config and a 16-block cache."""
-    (tmp_path / "config.json").write_text(
-        json.dumps(
-            {
-                "architectures": ["OPTForCausalLM"],
-                "model_type": "opt",
-                "hidden_size": 64,
-                "num_attention_heads": 2,
-                "num_hidden_layers": 2,
-                "ffn_dim": 128,
-                "max_position_embeddings": 2048,
-                "vocab_size": 1000,
-            }
-        )
+_OPT = {
+    "architectures": ["OPTForCausalLM"],
+    "model_type": "opt",
+    "hidden_size": 64,
+    "num_attention_heads": 2,
+    "num_hidden_layers": 2,
+    "ffn_dim": 128,
+    "max_position_embeddings": 2048,
+    "vocab_size": 1000,
+}
+# A 2-layer GLM-4-MoE config with one MTP layer, for vLLM's MTP draft.
+_GLM4_MOE_MTP = {
+    "architectures": ["Glm4MoeForCausalLM"],
+    "model_type": "glm4_moe",
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "moe_intermediate_size": 32,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 2,
+    "head_dim": 32,
+    "n_routed_experts": 4,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 2,
+    "first_k_dense_replace": 1,
+    "num_nextn_predict_layers": 1,
+    "max_position_embeddings": 2048,
+    "vocab_size": 1000,
+}
+
+
+def _scheduler(tmp_path, scheduler_cls, chunk, mtp=False):
+    """vLLM's scheduler over a 2-layer config and a 16-block cache. With
+    `mtp`, the engine runs vLLM's MTP speculative decoding with one draft
+    token, as the prefill legs do (a GLM-4-MoE config with one MTP layer
+    stands in for the served checkpoint)."""
+    (tmp_path / "config.json").write_text(json.dumps(_GLM4_MOE_MTP if mtp else _OPT))
+    model_config = ModelConfig(
+        model=str(tmp_path),
+        tokenizer=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype="float16",
+        seed=42,
+        max_model_len=2048,
     )
+    parallel_config = ParallelConfig()
+    speculative_config = None
+    if mtp:
+        speculative_config = SpeculativeConfig(
+            method="mtp",
+            num_speculative_tokens=1,
+            target_model_config=model_config,
+            target_parallel_config=parallel_config,
+        )
     vllm_config = VllmConfig(
         scheduler_config=SchedulerConfig(
             max_num_seqs=8,
@@ -249,21 +284,15 @@ def _scheduler(tmp_path, scheduler_cls, chunk):
             watermark=0.0,
             async_scheduling=scheduler_cls is AsyncScheduler,
         ),
-        model_config=ModelConfig(
-            model=str(tmp_path),
-            tokenizer=str(tmp_path),
-            skip_tokenizer_init=True,
-            dtype="float16",
-            seed=42,
-            max_model_len=2048,
-        ),
+        model_config=model_config,
+        speculative_config=speculative_config,
         cache_config=CacheConfig(
             block_size=16,
             gpu_memory_utilization=0.9,
             cache_dtype="auto",
             enable_prefix_caching=False,
         ),
-        parallel_config=ParallelConfig(),
+        parallel_config=parallel_config,
         device_config=DeviceConfig(device="cpu"),
     )
     kv_cache_config = KVCacheConfig(
@@ -297,15 +326,21 @@ def _sampled(so, tokens):
     )
 
 
+@pytest.mark.parametrize("mtp", [False, True], ids=["no-spec", "mtp"])
 @pytest.mark.parametrize("scheduler_cls", [Scheduler, AsyncScheduler])
 def test_the_scheduler_counts_the_dropped_placeholder_as_rejected(
-    tmp_path, scheduler_cls
+    tmp_path, scheduler_cls, mtp
 ):
     """vLLM's scheduler, reading its own step, rolls the placeholder the worker
     dropped back as a rejected draft: the request ends the step at its prompt
-    length with no output placeholder left, holding the sampled token."""
+    length with no output placeholder left, holding the sampled token. The
+    same holds with MTP configured, as in serving. The placeholder is set by
+    hand: a plain chunked prefill does not leave one on the last prompt token
+    (vLLM schedules that token alone), so the test starts from the state the
+    serving crash logged."""
     prompt = 33
-    scheduler = _scheduler(tmp_path, scheduler_cls, chunk=prompt - 1)
+    scheduler = _scheduler(tmp_path, scheduler_cls, chunk=prompt - 1, mtp=mtp)
+    assert scheduler.num_spec_tokens == (1 if mtp else 0)
     request = Request(
         "r",
         list(range(1, prompt + 1)),
@@ -316,7 +351,9 @@ def test_the_scheduler_counts_the_dropped_placeholder_as_rejected(
     first = scheduler.schedule()
     assert first.num_scheduled_tokens == {"r": prompt - 1}
     scheduler.update_from_output(first, _sampled(first, []))
-    # The serving crash's state: one prompt token left and a -1 placeholder.
+    # The plain chunked prefill left no placeholder; set the serving crash's
+    # state: one prompt token left and a -1 placeholder.
+    assert not request.spec_token_ids
     request.spec_token_ids = [-1]
     step = scheduler.schedule()
     assert step.num_scheduled_tokens == {"r": 2}
