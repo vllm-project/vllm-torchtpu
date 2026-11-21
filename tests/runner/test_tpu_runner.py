@@ -3341,6 +3341,36 @@ def test_upload_unless_unchanged_reuses_only_identical_values(device):
     assert z22 is not zf and tuple(z22.shape) == (2, 2)
 
 
+def test_padded_sampling_params_reuse_only_identical_values():
+    """A chunk whose sampling params repeat reuses the previous upload; any
+    changed value, range or padding builds and uploads them again."""
+    batch = SimpleNamespace(
+        temperature_cpu_tensor=torch.tensor([0.5, 0.7, 1.0]),
+        top_k_cpu_tensor=torch.tensor([0, 50, 1000], dtype=torch.int32),
+        top_p_cpu_tensor=torch.tensor([1.0, 0.9, 0.8]),
+    )
+    runner = SimpleNamespace(
+        input_batch=batch, vocab_size=1000, _sampling_params_reuse=None
+    )
+
+    def params(start, end, padded):
+        return TPUModelRunner._padded_sampling_params(
+            runner, start, end, padded, torch.bfloat16, torch.device("cpu")
+        )
+
+    first = params(0, 3, 4)
+    temps, top_k, top_p = first
+    assert temps.view(-1).tolist() == [0.5, 0.69921875, 1.0, 1.0]
+    assert top_k.view(-1).tolist() == [0, 50, 0, 0]
+    assert top_p.view(-1).tolist() == pytest.approx([1.0, 0.9, 0.8, 1.0])
+    assert params(0, 3, 4) is first
+    assert params(0, 3, 8) is not first
+    batch.top_k_cpu_tensor[1] = 40
+    again = params(0, 3, 8)
+    assert again[1].view(-1).tolist() == [0, 40, 0] + [0] * 5
+    assert params(1, 3, 8)[0].view(-1).tolist()[:3] == [0.69921875, 1.0, 1.0]
+
+
 def test_relayout_tables_reaches_the_draft_model(monkeypatch):
     """The draft shares the target's cached Pallas ops, which are traced
     against the target's relayouted tables; the draft's own tables must get
