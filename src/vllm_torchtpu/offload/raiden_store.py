@@ -453,11 +453,70 @@ class _PacedStore:
 
 @dataclass
 class _QueuedLoad:
-    """The not yet launched part of an admitted local load."""
+    """The not yet launched part of an admitted local load. `run_starts[i]`:
+    pair i begins a new copy (not consecutive with pair i-1 on both host and
+    device, `_run_starts`)."""
 
     admission: Admission
     hashes: list[bytes]
     device_ids: list[int]
+    run_starts: list[bool]
+
+
+def _run_starts(device_ids: list[int], host_ids: list[int]) -> list[bool]:
+    """Per (device, host) pair in DMA order: whether Raiden starts a new copy
+    there, i.e. the pair does not extend the previous one's run on both sides
+    (with the host block unknown, -1, on the device side only)."""
+    return [
+        i == 0
+        or device_ids[i] != device_ids[i - 1] + 1
+        or (host_ids[i] >= 0 and host_ids[i] != host_ids[i - 1] + 1)
+        for i in range(len(device_ids))
+    ]
+
+
+def _prefix_within_runs(run_starts: list[bool], limit: int, runs: int) -> int:
+    """The longest prefix (at most `limit`, at least 1) of a queued load whose
+    pairs start at most `runs` copies, its first pair counting as one."""
+    used = 1
+    for i in range(1, limit):
+        used += run_starts[i]
+        if used > runs:
+            return i
+    return limit
+
+
+class _LoadStats:
+    """Launched local-load pieces, sub-blocks and copies, logged once a
+    minute: the copies per sub-block show how well loads coalesce."""
+
+    PERIOD_S = 60.0
+
+    def __init__(self) -> None:
+        self.pieces = self.sub_blocks = self.runs = self.capped = 0
+        self.since = time.monotonic()
+
+    def add(self, sub_blocks: int, runs: int) -> None:
+        self.pieces += 1
+        self.sub_blocks += sub_blocks
+        self.runs += runs
+
+    def maybe_log(self) -> None:
+        now = time.monotonic()
+        if now - self.since < self.PERIOD_S:
+            return
+        if self.pieces:
+            logger.info(
+                "TPURaidenOffloadingConnector: load pacing %.0fs: %d pieces, %d "
+                "sub-blocks, %d copies (%.1f sub-blocks/copy), %d capped polls",
+                now - self.since,
+                self.pieces,
+                self.sub_blocks,
+                self.runs,
+                self.sub_blocks / max(self.runs, 1),
+                self.capped,
+            )
+        self.__init__()
 
 
 def _dma_order(
@@ -472,7 +531,11 @@ def _dma_order(
     are independent, so their order in one call is free.
     """
     order = sorted(range(len(sub_hashes)), key=host_ids.__getitem__)
-    return [sub_hashes[i] for i in order], [device_ids[i] for i in order]
+    return (
+        [sub_hashes[i] for i in order],
+        [device_ids[i] for i in order],
+        [host_ids[i] for i in order],
+    )
 
 
 @dataclass
@@ -523,6 +586,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # Most local load sub-blocks in flight at once (0: no bound); see
         # `_launch_queued_loads`.
         max_inflight_load_sub_blocks: int = 0,
+        max_inflight_load_runs: int = 0,
         # Most save sub-blocks in flight at once (0: no bound); see
         # `_launch_queued_stores`.
         max_inflight_store_sub_blocks: int = 0,
@@ -684,6 +748,14 @@ class RaidenOffloadingManager(OffloadingManager):
         self._max_inflight_loads = max_inflight_load_sub_blocks
         self._inflight_loads: set[bytes] = set()
         self._queued_loads: deque[_QueuedLoad] = deque()
+        # Copies in flight (the in-flight sub-hashes that start one), bounded
+        # by `_max_inflight_load_runs` (0: no bound). A copy holds the core's
+        # in-order queue whatever its size, so once host and HBM blocks
+        # scatter, the same bytes cost many more copies and the byte bound
+        # alone lets the step wait grow.
+        self._max_inflight_load_runs = max_inflight_load_runs
+        self._inflight_run_starts: set[bytes] = set()
+        self._load_stats = _LoadStats()
 
         # Store pacing: a store job runs as pieces, each its own admission
         # (insert + save) under a negative piece id, launched while fewer than
@@ -1489,7 +1561,7 @@ class RaidenOffloadingManager(OffloadingManager):
             self._finalize(admission)
 
         if host_block_ids and local_hashes:
-            local_hashes, dst_device_ids_for_local = _dma_order(
+            local_hashes, dst_device_ids_for_local, local_host_ids = _dma_order(
                 local_hashes, dst_device_ids_for_local, local_host_ids
             )
         if not remote_batches and self._max_inflight_loads > 0:
@@ -1507,7 +1579,12 @@ class RaidenOffloadingManager(OffloadingManager):
             for sub_hash in sub_hashes:
                 self._hash_to_admission[sub_hash] = admission
             self._queued_loads.append(
-                _QueuedLoad(admission, local_hashes, dst_device_ids_for_local)
+                _QueuedLoad(
+                    admission,
+                    local_hashes,
+                    dst_device_ids_for_local,
+                    _run_starts(dst_device_ids_for_local, local_host_ids),
+                )
             )
             self._launch_queued_loads()
             return
@@ -1690,6 +1767,8 @@ class RaidenOffloadingManager(OffloadingManager):
             done, failed, _pending = self._store.poll_load_status()
             self._inflight_loads.difference_update(done)
             self._inflight_loads.difference_update(failed)
+            self._inflight_run_starts.difference_update(done)
+            self._inflight_run_starts.difference_update(failed)
             results.append((done, failed))
         if has_remote:
             done, failed, _pending = self._store.poll_remote_read_status()
@@ -1736,14 +1815,31 @@ class RaidenOffloadingManager(OffloadingManager):
         while self._queued_loads:
             room = self._max_inflight_loads - len(self._inflight_loads)
             if room <= 0:
-                return
+                self._load_stats.capped += 1
+                break
             head = self._queued_loads[0]
-            hashes, device_ids = head.hashes[:room], head.device_ids[:room]
-            head.hashes, head.device_ids = head.hashes[room:], head.device_ids[room:]
+            take = min(room, len(head.hashes))
+            if self._max_inflight_load_runs > 0:
+                runs_room = self._max_inflight_load_runs - len(
+                    self._inflight_run_starts
+                )
+                if runs_room <= 0:
+                    self._load_stats.capped += 1
+                    break
+                take = _prefix_within_runs(head.run_starts, take, runs_room)
+            hashes, device_ids = head.hashes[:take], head.device_ids[:take]
+            # A piece's first pair begins a copy wherever the cut falls.
+            starts = [True, *head.run_starts[1:take]]
+            head.hashes, head.device_ids = head.hashes[take:], head.device_ids[take:]
+            head.run_starts = head.run_starts[take:]
             if not head.hashes:
                 self._queued_loads.popleft()
             if self._store.load(hashes, device_ids):
                 self._inflight_loads.update(hashes)
+                self._inflight_run_starts.update(
+                    h for h, start in zip(hashes, starts, strict=True) if start
+                )
+                self._load_stats.add(len(hashes), sum(starts))
                 continue
             unlaunched = hashes + head.hashes
             logger.error(
@@ -1755,6 +1851,7 @@ class RaidenOffloadingManager(OffloadingManager):
             if head.hashes:
                 self._queued_loads.popleft()
             self._fail_unlaunched_load(head.admission, unlaunched)
+        self._load_stats.maybe_log()
 
     def _fail_unlaunched_load(self, admission: Admission, hashes: list[bytes]) -> None:
         admission.failed = True
@@ -3194,6 +3291,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 max_inflight_load_sub_blocks=self._sub_blocks(
                     envs.VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB
                 ),
+                max_inflight_load_runs=envs.VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_RUNS,
                 max_inflight_store_sub_blocks=self._sub_blocks(
                     envs.VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB
                 ),

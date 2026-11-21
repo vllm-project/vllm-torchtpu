@@ -4643,6 +4643,58 @@ class TestLoadPacing(unittest.TestCase):
         self.assertEqual(self.store.pinned_hashes(), {})
 
 
+class TestLoadRunPacing(unittest.TestCase):
+    """max_inflight_load_runs bounds the Raiden copies of local loads in flight."""
+
+    def setUp(self):
+        self.store = FakeKVCacheStore()
+        self.manager = make_manager(
+            self.store, max_inflight_load_sub_blocks=100, max_inflight_load_runs=1
+        )
+        for n in range(2):
+            seed_host_entries(self.store, _key(n))
+
+    def _launches(self):
+        return [c.args[1] for c in self.store.calls_named("load")]
+
+    def test_scattered_blocks_launch_one_copy_at_a_time(self):
+        self.manager.prepare_load([_key(0), _key(1)], _ctx("r1"))
+        self.manager.submit_load_job(3, [_key(0), _key(1)], [6, 2], "r1")
+        self.assertEqual(self._launches(), [[24, 25, 26, 27]])
+        self.store.complete_load(self.store.calls_named("load")[-1].args[0])
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.assertEqual(self._launches()[-1], [8, 9, 10, 11])
+        self.store.complete_load(self.store.calls_named("load")[-1].args[0])
+        (job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(job.success)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_consecutive_blocks_are_one_copy(self):
+        self.manager.prepare_load([_key(0), _key(1)], _ctx("r1"))
+        self.manager.submit_load_job(3, [_key(0), _key(1)], [2, 3], "r1")
+        self.assertEqual(self._launches(), [list(range(8, 16))])
+
+
+class TestRunStarts(unittest.TestCase):
+    def test_runs_need_both_sides_consecutive(self):
+        from vllm_torchtpu.offload.raiden_store import _run_starts
+
+        self.assertEqual(
+            _run_starts([4, 5, 6, 9, 10], [7, 8, 20, 21, 22]),
+            [True, False, True, True, False],
+        )
+        self.assertEqual(_run_starts([4, 5, 7], [-1, -1, -1]), [True, False, True])
+
+    def test_prefix_within_runs(self):
+        from vllm_torchtpu.offload.raiden_store import _prefix_within_runs
+
+        starts = [True, False, True, False, True]
+        self.assertEqual(_prefix_within_runs(starts, 5, 1), 2)
+        self.assertEqual(_prefix_within_runs(starts, 5, 2), 4)
+        self.assertEqual(_prefix_within_runs(starts, 3, 9), 3)
+        self.assertEqual(_prefix_within_runs([True, True], 2, 0), 1)
+
+
 class TestStorePacing(unittest.TestCase):
     """max_inflight_store_sub_blocks runs a store job as insert+save pieces."""
 
