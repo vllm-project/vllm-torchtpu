@@ -140,15 +140,13 @@ def _pack_routing_exchange(pairs, scale_bits, counts, layout):
     """The flat i32 payload: pairs [t*K], row-scale bits [t], counts [E],
     zero-padded to the layout's width."""
     scale_at, count_at, width = layout
-    parts = [pairs, jnp.zeros((scale_at - pairs.size,), jnp.int32)]
+    # Padded in place rather than concatenated with zero arrays: XLA keeps
+    # those zeros as HBM constants that the concatenation reads back.
+    parts = [jnp.pad(pairs, (0, scale_at - pairs.size))]
     if scale_bits is not None:
-        parts += [
-            scale_bits,
-            jnp.zeros((count_at - scale_at - scale_bits.size,), jnp.int32),
-        ]
-    parts.append(counts)
-    parts.append(jnp.zeros((width - count_at - counts.size,), jnp.int32))
-    return jnp.concatenate([p for p in parts if p.size])
+        parts.append(jnp.pad(scale_bits, (0, count_at - scale_at - scale_bits.size)))
+    parts.append(jnp.pad(counts, (0, width - count_at - counts.size)))
+    return jnp.concatenate(parts)
 
 
 def _combine_arrivals_fs(
