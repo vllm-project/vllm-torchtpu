@@ -49,6 +49,7 @@ the PCP group's rank order, not here.
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from vllm_torchtpu.distributed.dp_world import unified_dp_world
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -226,7 +227,7 @@ def get_tpu_worker_binding(
 
     rank = int(rank)
     local_rank = int(local_rank)
-    if dp_size > 1 and parallel_config.enable_expert_parallel:
+    if dp_size > 1 and unified_dp_world(parallel_config):
         dp_rank = parallel_config.data_parallel_index
         assert dp_rank is not None, (
             "ParallelConfig.data_parallel_index must be resolved when "
