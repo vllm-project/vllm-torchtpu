@@ -280,7 +280,8 @@ _QWEN3_5 = [
         pytest.param(
             _qwen3_5("tp1-prefill", tokens=t),
             (2, 2, 1792, 8),
-            (256, 128, 256, 1),
+            # The tuned prefill table's entry.
+            (256, 16, 1024, 1),
             id=f"tp1-prefill-{t}tok",
         )
         for t in (256, 2048, 8192)
@@ -335,11 +336,16 @@ def _correctness_test_shape(kv):
 def test_a_packed_fp4_cache_takes_the_non_fp8_tuned_rules():
     """A packed fp4 KV cache is one byte per element, like fp8, but the tuned
     rules' fp8 branches need an fp8 cache: it takes the bf16 compute threshold
-    (prefill bq_c as without tuned_tiles) and the 75% decode cap. With the fp8
-    rules it would get 4,2,1792,8 and 256,128,256,1."""
+    (prefill bq_c as without tuned_tiles) and the 75% decode cap. An fp8 cache
+    of the same shape gets the fp8 rules: 4,4,1280,8 and the prefill table's
+    256,16,1024,1."""
     layer = _correctness_test_shape("fp4")
     args = layer.pop("args")
     assert _tiles(*args, **layer) == ((4, 2, 1536, 8), (256, 64, 256, 1))
+    assert _tiles(*args, **{**layer, "kv": "fp8"}) == (
+        (4, 4, 1280, 8),
+        (256, 16, 1024, 1),
+    )
 
 
 def test_the_tpu_tuned_tiles_test_runs_different_tiles():

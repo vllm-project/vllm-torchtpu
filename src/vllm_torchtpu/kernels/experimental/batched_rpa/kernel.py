@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import dataclasses
-import functools
 from collections.abc import Callable
 from typing import cast
 
@@ -92,9 +91,18 @@ def calculate_and_store_out(
     o_vref: jax.Ref,
     lse_o_vref: jax.Ref | None,
     *,
+    chunk_start: int = 0,
     cfgs: configs.RpaConfigs,
 ):
+    # Packed rows per token, and rows per KV head of a full q block, in the
+    # output and LSE windows.
+    q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
+    full_q_rows = cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head
+
     def _accum(b_idx: int | jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
+        if flash_attention.static_pv(cfgs) and not flash_attention.p_prescaled(cfgs):
+            # The accumulator carries P_SCALE; l sums the unscaled weights.
+            batch_l = batch_l * jnp.asarray(flash_attention.P_SCALE, batch_l.dtype)
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
 
         if (
@@ -111,18 +119,50 @@ def calculate_and_store_out(
         pad_width = [[0, 0] for _ in range(out.ndim)]
         pad_width[-1][-1] = cfgs.aligned_q_head_dim - cfgs.compute_kv_head_dim
         out = jnp.pad(out, pad_width, constant_values=0)
-        out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
-        utils.strided_store(out_ref, 0, out_ref.shape[0], 1, out)
+        if chunk_start == 0 and (
+            cfgs.model.num_kv_heads == 1 or out.shape[1] == full_q_rows
+        ):
+            out_u32 = pltpu.bitcast(out, out_ref.dtype).reshape(
+                -1, cfgs.aligned_q_head_dim
+            )
+            utils.strided_store(out_ref, 0, out_u32.shape[0], 1, out_u32)
+        else:
+            for kv_h in range(cfgs.model.num_kv_heads):
+                out_h = pltpu.bitcast(out[kv_h], out_ref.dtype).reshape(
+                    -1, cfgs.aligned_q_head_dim
+                )
+                utils.strided_store(
+                    out_ref,
+                    (kv_h * cfgs.bq_sz + chunk_start) * q_p,
+                    out_h.shape[0],
+                    1,
+                    out_h,
+                )
 
     def _stage_lse(b_idx: int, batch_m: jax.Array, batch_l: jax.Array):
         assert lse_o_vref is not None
         lse_val = batch_m + jnp.log(jnp.maximum(batch_l, 1e-9))
         lse_u32 = lse_o_vref.at[b_idx].bitcast(jnp.uint32)
         lse_ref = lse_u32.reshape(-1, lse_o_vref.shape[-1])
-        lse_val = pltpu.bitcast(
-            lse_val.astype(cfgs.serve.dtype_out), jnp.uint32
-        ).reshape(lse_ref.shape)
-        utils.strided_store(lse_ref, 0, lse_ref.shape[0], 1, lse_val)
+        if chunk_start == 0 and (
+            cfgs.model.num_kv_heads == 1 or lse_val.shape[1] == full_q_rows
+        ):
+            lse_u32_val = pltpu.bitcast(
+                lse_val.astype(cfgs.serve.dtype_out), jnp.uint32
+            ).reshape(-1, lse_o_vref.shape[-1])
+            utils.strided_store(lse_ref, 0, lse_u32_val.shape[0], 1, lse_u32_val)
+        else:
+            for kv_h in range(cfgs.model.num_kv_heads):
+                lse_h = pltpu.bitcast(
+                    lse_val[kv_h].astype(cfgs.serve.dtype_out), jnp.uint32
+                ).reshape(-1, lse_o_vref.shape[-1])
+                utils.strided_store(
+                    lse_ref,
+                    (kv_h * cfgs.bq_sz + chunk_start) * q_p,
+                    lse_h.shape[0],
+                    1,
+                    lse_h,
+                )
 
     if cfgs.fuse_accum:
         for b in range(cfgs.batch_size):
@@ -381,6 +421,19 @@ def generate_mask(
 ) -> jax.Array:
     """Generates causal, sliding window, and attention scope mask for QK computation."""
     b, k_heads, tq, s = shape
+    # The FULL-scope DECODE kernel masks its scores on the causal test alone.
+    # Every decode query sits at the end of its sequence, so a key the causal
+    # test admits is below the sequence's KV length, and the KV-length test
+    # (`kv_iota < n_valid`) adds nothing. Rows past a lane's query length admit
+    # keys past its KV length, but rows are independent and those rows are
+    # never stored; V rows past the KV length cannot hold NaN either way
+    # (`mask_invalid_v` zeroes them on load; without it the kernel zeroes its
+    # KV buffers once per call).
+    causal_only = (
+        cfgs.mode == configs.RpaCase.DECODE
+        and cfgs.serve.attention_scope == configs.AttentionScope.FULL
+        and cfgs.model.sliding_window is None
+    )
 
     kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
     q_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
@@ -400,6 +453,9 @@ def generate_mask(
         # Step 2
         #   offset = causal_offset - bq_start
         offset = step_meta.causal_offset[b_idx] - bq_start
+        if causal_only:
+            masks.append(q_kv_diff >= offset)
+            continue
         n_valid = (
             stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
         )
@@ -452,6 +508,68 @@ def block_fully_visible(
             )
         full = full_b if full is None else jnp.logical_and(full, full_b)
     return full
+
+
+def _q_tail_rungs(cfgs: configs.RpaConfigs) -> tuple[int, ...]:
+    """Query-row rungs of a prefill/mixed q block: a rung past the first is
+    skipped when no lane of the step has query rows in it."""
+    if cfgs.mode == configs.RpaCase.DECODE or cfgs.bq_sz < 256:
+        return (cfgs.bq_sz,)
+    candidates = (128, 256, 512, 1024)
+    return tuple(r for r in candidates if r < cfgs.bq_sz) + (cfgs.bq_sz,)
+
+
+def _load_q_chunk(
+    q_vref: jax.Ref,
+    chunk_start: int,
+    chunk_end: int,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> jax.Array:
+    chunk_sz = chunk_end - chunk_start
+    q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
+    q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
+    if (chunk_start == 0 and chunk_end == cfgs.bq_sz) or (
+        cfgs.batch_size == 1 and cfgs.model.num_kv_heads == 1
+    ):
+        q_loaded = utils.strided_load(
+            q_ref,
+            chunk_start * q_p,
+            cfgs.batch_size * cfgs.model.num_kv_heads * chunk_sz * q_p,
+            1,
+            dtype=cfgs.serve.dtype_q,
+        )
+        q = q_loaded.reshape(
+            cfgs.batch_size,
+            cfgs.model.num_kv_heads,
+            chunk_sz * cfgs.aligned_num_q_heads_per_kv_head,
+            cfgs.aligned_q_head_dim,
+        )
+        return q[..., : cfgs.compute_kv_head_dim]
+
+    q_b = []
+    for b_idx in range(cfgs.batch_size):
+        q_h = []
+        for kv_h in range(cfgs.model.num_kv_heads):
+            start = (
+                (b_idx * cfgs.model.num_kv_heads + kv_h) * cfgs.bq_sz + chunk_start
+            ) * q_p
+            q_chunk = utils.strided_load(
+                q_ref,
+                start,
+                chunk_sz * q_p,
+                1,
+                dtype=cfgs.serve.dtype_q,
+            )
+            q_h.append(
+                q_chunk.reshape(
+                    chunk_sz * cfgs.aligned_num_q_heads_per_kv_head,
+                    cfgs.aligned_q_head_dim,
+                )
+            )
+        q_b.append(jnp.stack(q_h, axis=0))
+    q = jnp.stack(q_b, axis=0)
+    return q[..., : cfgs.compute_kv_head_dim]
 
 
 def rpa_body(
@@ -543,8 +661,7 @@ def rpa_body(
         cfgs=cfgs,
     )
 
-    run_step = functools.partial(
-        _rpa_step,
+    _rpa_step(
         q_vref,
         kv_in_vref,
         o_vref,
@@ -558,18 +675,6 @@ def rpa_body(
         step_meta=step_meta,
         cfgs=cfgs,
     )
-    full = block_fully_visible(stitch_meta, step_meta, cfgs)
-    if full is None:
-        run_step(apply_mask=True)
-        return
-
-    @pl.when(full)
-    def _unmasked():
-        run_step(apply_mask=False)
-
-    @pl.when(jnp.logical_not(full))
-    def _masked():
-        run_step(apply_mask=True)
 
 
 def _rpa_step(
@@ -588,32 +693,16 @@ def _rpa_step(
     step: jax.Array,
     stitch_meta: StitchMetadata,
     step_meta: ComputeMetadata,
-    apply_mask: bool,
     cfgs: configs.RpaConfigs,
 ):
     """Runs one step's attention over the stitched KV block.
 
-    `apply_mask=False` skips the QK mask, for a block `block_fully_visible`
-    proved fully visible.
+    K and V are loaded once. The query rows then run in q-tail rungs
+    (`_q_tail_rungs`); a rung past the first is skipped when no lane of the
+    step has query rows in it, and every rung skips the QK mask when
+    `block_fully_visible` proves the block fully visible.
     """
-    # Step 2b: Fetch inputs.
-    q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
-    q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
-    q_loaded = utils.strided_load(
-        q_ref,
-        0,
-        cfgs.batch_size * cfgs.model.num_kv_heads * cfgs.bq_sz * q_p,
-        1,
-        dtype=cfgs.serve.dtype_q,
-    )
-    q = q_loaded.reshape(
-        cfgs.batch_size,
-        cfgs.model.num_kv_heads,
-        cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head,
-        cfgs.aligned_q_head_dim,
-    )
-    q = q[..., : cfgs.compute_kv_head_dim]
-
+    # Step 2b: Fetch KV inputs. Q is loaded per rung in `_run_chunk`.
     # We want to load k, v from (batch, bkv_sz, bkv_stride, kv_packing, d)
     # where bkv_stride ~= num_kv_heads * 2 // kv_packing
     # to 2x (batch, num_kv_heads, bkv_sz, d)
@@ -717,104 +806,156 @@ def _rpa_step(
     # lane's KV end; otherwise rows the step did not fetch hold zeros or an
     # earlier step's KV, because `rpa_kernel` then zeroes the KV buffers.
 
-    # Step 3: Perform compute.
-    m_val = m_scratch_ref[...]
-    l_val = l_scratch_ref[...]
-    acc_val = acc_scratch_ref[...]
+    # Step 3: Perform compute over the rungs holding live query rows, and write
+    # each rung's rows back.
+    rungs = _q_tail_rungs(cfgs)
+    max_q_sz = schedule_ref.dma_q[step, 0, 1]
+    for b_idx in range(1, cfgs.batch_size):
+        max_q_sz = jnp.maximum(max_q_sz, schedule_ref.dma_q[step, b_idx, 1])
+    # A lane whose query rows end before a rung still computes that rung when
+    # another lane of the step needs it. Resetting the m carry after such a
+    # lane keeps its garbage rows out of the rung's scratch: if the step that
+    # ends the lane's q-block skips the rung, the is_last_k reset never reaches
+    # those rows, and a later q-block would start from them. With one lane per
+    # step, a rung that runs always holds rows of that lane's q-block.
+    dma_q_reset = (
+        schedule_ref.dma_q if (len(rungs) > 1 and cfgs.batch_size > 1) else None
+    )
 
-    l_new_list = []
-    m_new_list = []
-    acc_new_list = []
+    def _run_chunk(chunk_start: int, chunk_end: int, *, apply_mask: bool):
+        chunk_sz = chunk_end - chunk_start
+        q_chunk = _load_q_chunk(q_vref, chunk_start, chunk_end, cfgs=cfgs)
+        step_bq_c_sz = min(cfgs.bq_c_sz, chunk_sz)
 
-    prev_p = prev_alpha_list = prev_q_slice = None
-    for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
-        bq_end = min(bq_start + cfgs.bq_c_sz, cfgs.bq_sz)
-        q_start = bq_start * cfgs.aligned_num_q_heads_per_kv_head
-        q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
-        q_slice = slice(q_start, q_end)
+        l_new_list = []
+        m_new_list = []
+        acc_new_list = []
+        m_next = None
 
-        custom_mask = None
-        if apply_mask:
-            custom_mask = generate_mask(
-                shape=(
-                    cfgs.batch_size,
-                    cfgs.model.num_kv_heads,
-                    q_end - q_start,
-                    cfgs.bkv_sz,
-                ),
-                bq_start=bq_start,
-                stitch_meta=stitch_meta,
-                step_meta=step_meta,
-                cfgs=cfgs,
+        prev_p = prev_alpha_list = prev_q_slice = None
+        for rel_start in range(0, chunk_sz, step_bq_c_sz):
+            rel_end = min(rel_start + step_bq_c_sz, chunk_sz)
+            bq_start = chunk_start + rel_start
+            bq_end = chunk_start + rel_end
+            rel_q_slice = slice(
+                rel_start * cfgs.aligned_num_q_heads_per_kv_head,
+                rel_end * cfgs.aligned_num_q_heads_per_kv_head,
+            )
+            q_slice = slice(
+                bq_start * cfgs.aligned_num_q_heads_per_kv_head,
+                bq_end * cfgs.aligned_num_q_heads_per_kv_head,
             )
 
-        p, alpha_list, m_next, l_next, m_carry, l_carry = (
-            flash_attention.flash_attention_qk_softmax(
-                step,
-                q[:, :, q_slice],
-                k,
-                m_val[:, q_slice],
-                l_val[:, q_slice],
-                schedule_ref.is_last_k,
-                custom_mask=custom_mask,
-                cfgs=cfgs,
-                bq_start=bq_start,
-                k_scale=k_scale,
+            custom_mask = None
+            if apply_mask:
+                custom_mask = generate_mask(
+                    shape=(
+                        cfgs.batch_size,
+                        cfgs.model.num_kv_heads,
+                        (bq_end - bq_start) * cfgs.aligned_num_q_heads_per_kv_head,
+                        cfgs.bkv_sz,
+                    ),
+                    bq_start=bq_start,
+                    stitch_meta=stitch_meta,
+                    step_meta=step_meta,
+                    cfgs=cfgs,
+                )
+
+            p, alpha_list, m_next, l_next, m_carry, l_carry = (
+                flash_attention.flash_attention_qk_softmax(
+                    step,
+                    q_chunk[:, :, rel_q_slice],
+                    k,
+                    m_scratch_ref[:, q_slice],
+                    l_scratch_ref[:, q_slice],
+                    schedule_ref.is_last_k,
+                    custom_mask=custom_mask,
+                    cfgs=cfgs,
+                    bq_start=bq_start,
+                    k_scale=k_scale,
+                    dma_q=dma_q_reset,
+                )
             )
+            m_scratch_ref[:, q_slice] = m_carry
+            l_scratch_ref[:, q_slice] = l_carry
+            if cfgs.serve.return_lse:
+                m_new_list.append(m_next)
+            l_new_list.append(l_next)
+
+            if prev_p is not None:
+                o_next, o_carry = flash_attention.flash_attention_pv(
+                    prev_p,
+                    v,
+                    cast(list[jax.Array], prev_alpha_list),
+                    acc_scratch_ref[:, prev_q_slice],
+                    step,
+                    schedule_ref.is_last_k,
+                    cfgs=cfgs,
+                    v_scale=v_scale,
+                )
+                acc_scratch_ref[:, prev_q_slice] = o_carry
+                acc_new_list.append(o_next)
+
+            prev_p = p
+            prev_alpha_list = alpha_list
+            prev_q_slice = q_slice
+
+        assert prev_p is not None
+        o_next, o_carry = flash_attention.flash_attention_pv(
+            prev_p,
+            v,
+            cast(list[jax.Array], prev_alpha_list),
+            acc_scratch_ref[:, prev_q_slice],
+            step,
+            schedule_ref.is_last_k,
+            cfgs=cfgs,
+            v_scale=v_scale,
         )
-        m_scratch_ref[:, q_slice] = m_carry
-        l_scratch_ref[:, q_slice] = l_carry
+        acc_scratch_ref[:, prev_q_slice] = o_carry
+        acc_new_list.append(o_next)
         if cfgs.serve.return_lse:
-            m_new_list.append(m_next)
-        l_new_list.append(l_next)
+            m_next = jnp.concatenate(m_new_list, axis=2)
+        l_next = jnp.concatenate(l_new_list, axis=2)
+        acc_next = jnp.concatenate(acc_new_list, axis=2)
 
-        if prev_p is not None:
-            o_next, o_carry = flash_attention.flash_attention_pv(
-                prev_p,
-                v,
-                cast(list[jax.Array], prev_alpha_list),
-                acc_val[:, prev_q_slice],
-                step,
-                schedule_ref.is_last_k,
-                cfgs=cfgs,
-                v_scale=v_scale,
-            )
-            acc_scratch_ref[:, prev_q_slice] = o_carry
-            acc_new_list.append(o_next)
+        # Step 4: Write back this rung's outputs.
+        calculate_and_store_out(
+            step,
+            schedule_ref,
+            acc_next,
+            l_next,
+            cast("jax.Array", m_next),
+            o_vref,
+            lse_o_vref,
+            chunk_start=chunk_start,
+            cfgs=cfgs,
+        )
 
-        prev_p = p
-        prev_alpha_list = alpha_list
-        prev_q_slice = q_slice
+    def _dispatch_rungs(*, apply_mask: bool):
+        prev_r = 0
+        for idx, r in enumerate(rungs):
+            if idx == 0:
+                _run_chunk(0, r, apply_mask=apply_mask)
+            else:
 
-    assert prev_p is not None
-    o_next, o_carry = flash_attention.flash_attention_pv(
-        prev_p,
-        v,
-        cast(list[jax.Array], prev_alpha_list),
-        acc_val[:, prev_q_slice],
-        step,
-        schedule_ref.is_last_k,
-        cfgs=cfgs,
-        v_scale=v_scale,
-    )
-    acc_scratch_ref[:, prev_q_slice] = o_carry
-    acc_new_list.append(o_next)
-    if cfgs.serve.return_lse:
-        m_next = jnp.concatenate(m_new_list, axis=2)
-    l_next = jnp.concatenate(l_new_list, axis=2)
-    acc_next = jnp.concatenate(acc_new_list, axis=2)
+                @pl.when(max_q_sz > prev_r)
+                def _chunk(c_start=prev_r, c_end=r):
+                    _run_chunk(c_start, c_end, apply_mask=apply_mask)
 
-    # Step 4: Write back outputs.
-    calculate_and_store_out(
-        step,
-        schedule_ref,
-        acc_next,
-        l_next,
-        m_next,
-        o_vref,
-        lse_o_vref,
-        cfgs=cfgs,
-    )
+            prev_r = r
+
+    full = block_fully_visible(stitch_meta, step_meta, cfgs)
+    if full is None:
+        _dispatch_rungs(apply_mask=True)
+        return
+
+    @pl.when(full)
+    def _unmasked():
+        _dispatch_rungs(apply_mask=False)
+
+    @pl.when(jnp.logical_not(full))
+    def _masked():
+        _dispatch_rungs(apply_mask=True)
 
 
 # Define main kernel.
