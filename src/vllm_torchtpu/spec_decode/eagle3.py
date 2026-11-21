@@ -19,7 +19,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import bucket_filter
-from vllm_torchtpu.spec_decode.shard_argmax import greedy_draft_token
+from vllm_torchtpu.spec_decode.shard_argmax import attach_fp8_head, greedy_draft_token
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError, MegakernelSetupError
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
@@ -500,6 +500,13 @@ class Eagle3Proposer:
             self._draft_tp_matches_target,
             materialize_if_mismatched=False,
         )
+        if envs.VLLM_TPU_DRAFT_LM_HEAD_FP8:
+            if not attach_fp8_head(self.draft_model):
+                raise ValueError(
+                    "VLLM_TPU_DRAFT_LM_HEAD_FP8 needs VLLM_TPU_DRAFT_SHARD_ARGMAX "
+                    "and a vocab-parallel draft lm_head over the TP group"
+                )
+            logger.info("MTP draft greedy token reads an FP8 lm_head shard copy.")
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
             # checkout shouldn't break unrelated TPU runs at import time.

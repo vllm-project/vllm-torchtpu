@@ -11,6 +11,10 @@ argmaxes return the first maximum, so the lowest rank holding the row maximum
 gives the lowest global index, exactly as the full argmax does. The logits
 values are the same, because the per-shard projection is the one the full path
 computes before its gather, and soft cap / scale are elementwise.
+
+VLLM_TPU_DRAFT_LM_HEAD_FP8 (``attach_fp8_head``) trades that exactness for bytes:
+the local logits come from an FP8 copy of the shard, so near-ties may pick another
+token.
 """
 
 from __future__ import annotations
@@ -67,14 +71,49 @@ def _usable(model: Any) -> bool:
     )
 
 
+def attach_fp8_head(model: Any) -> bool:
+    """VLLM_TPU_DRAFT_LM_HEAD_FP8: register an FP8 copy of this rank's lm_head
+    shard on ``model`` (``draft_head_fp8`` [shard, hidden] float8_e4m3fn and
+    ``draft_head_scale`` [shard] float32, one scale per vocab row), read by
+    ``greedy_draft_token`` instead of the BF16 weight. Returns whether it did:
+    the shard-argmax path must be usable, since the copy feeds the local
+    candidates only, and the head must hold plain float weights (a quantized
+    head's codes are not its values) and no bias."""
+    if not (envs.VLLM_TPU_DRAFT_SHARD_ARGMAX and _usable(model)):
+        return False
+    weight = model.lm_head.weight
+    if weight.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return False
+    if getattr(model.lm_head, "bias", None) is not None:
+        return False  # the FP8 logits carry no bias term
+    from vllm_torchtpu.layers.core.quantization import quantize_tensor
+
+    fp8, scale = quantize_tensor(weight.float(), torch.float8_e4m3fn, axis=-1)
+    scale = scale.reshape(-1)
+    model.register_buffer("draft_head_fp8", fp8, persistent=False)
+    model.register_buffer("draft_head_scale", scale, persistent=False)
+    return True
+
+
+def _local_logits(model: Any, hidden: torch.Tensor) -> torch.Tensor:
+    """This rank's vocab-shard logits, from the FP8 copy when one is attached."""
+    lp, head = model.logits_processor, model.lm_head
+    fp8 = getattr(model, "draft_head_fp8", None)
+    if fp8 is None:
+        return lp._get_logits(hidden, head, None, skip_gather=True)
+    logits = torch.matmul(hidden, fp8.to(hidden.dtype).t()).float()
+    return logits * model.draft_head_scale
+
+
 def greedy_draft_token(model: Any, hidden: torch.Tensor) -> torch.Tensor:
-    """int32 [rows] = `model.compute_logits(hidden).argmax(-1)`, bit-identical,
-    gathering 2 floats per row and rank instead of the vocab-wide logits when
-    VLLM_TPU_DRAFT_SHARD_ARGMAX is on."""
+    """int32 [rows] = `model.compute_logits(hidden).argmax(-1)`, gathering 2
+    floats per row and rank instead of the vocab-wide logits when
+    VLLM_TPU_DRAFT_SHARD_ARGMAX is on. Bit-identical unless ``attach_fp8_head``
+    attached an FP8 head, whose logits may pick another token at near-ties."""
     if not (envs.VLLM_TPU_DRAFT_SHARD_ARGMAX and _usable(model)):
         return model.compute_logits(hidden).argmax(dim=-1).to(torch.int32)
     lp, head = model.logits_processor, model.lm_head
-    local = lp._get_logits(hidden, head, None, skip_gather=True)
+    local = _local_logits(model, hidden)
     if lp.soft_cap is not None:
         local = torch.tanh(local / lp.soft_cap) * lp.soft_cap
     if lp.scale != 1.0:

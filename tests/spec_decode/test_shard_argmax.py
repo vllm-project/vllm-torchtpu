@@ -126,3 +126,49 @@ def test_flag_off_uses_compute_logits(monkeypatch):
     logits = torch.tensor([[0.0, 2.0, 2.0, 1.0]])
     model = types.SimpleNamespace(compute_logits=lambda h: logits)
     assert greedy_draft_token(model, torch.zeros(1, 8)).tolist() == [1]
+
+
+class _HeadModel(torch.nn.Module):
+    """A draft with a real vocab-shard weight for VLLM_TPU_DRAFT_LM_HEAD_FP8."""
+
+    def __init__(self, weight, tp, rank, org):
+        super().__init__()
+        self.lm_head = _Head(tp, rank, weight.shape[0] * tp)
+        self.lm_head.weight = weight
+        empty = weight.new_zeros(1, weight.shape[0] * tp)
+        self.logits_processor = _LP(empty, tp, rank, org, None, 1.0)
+
+
+def test_fp8_head_attach_and_logits(monkeypatch):
+    tp, rank, shard, hidden = 4, 1, 256, 64
+    g = torch.Generator().manual_seed(5)
+    weight = (torch.randn(shard, hidden, generator=g) * 0.02).to(torch.bfloat16)
+    weight[7] = 0  # an all-zero row keeps a finite scale and zero logits
+    model = _HeadModel(weight, tp, rank, org=shard * tp)
+    monkeypatch.setattr(
+        shard_argmax, "get_tensor_model_parallel_world_size", lambda: tp
+    )
+    monkeypatch.setattr(envs, "VLLM_TPU_DRAFT_SHARD_ARGMAX", False)
+    assert not shard_argmax.attach_fp8_head(model)
+    monkeypatch.setattr(envs, "VLLM_TPU_DRAFT_SHARD_ARGMAX", True)
+    assert shard_argmax.attach_fp8_head(model)
+    assert model.draft_head_fp8.dtype == torch.float8_e4m3fn
+    assert model.draft_head_fp8.shape == weight.shape
+    assert model.draft_head_scale.dtype == torch.float32
+    h = torch.randn(5, hidden, generator=g).to(torch.bfloat16)
+    want = (h.float() @ weight.float().t())
+    got = shard_argmax._local_logits(model, h)
+    assert torch.isfinite(got).all() and (got[:, 7] == 0).all()
+    # e4m3 keeps 3 mantissa bits: each weight within 1/16 relative of its row's value.
+    err = (got - want).abs().max() / want.abs().max()
+    assert err < 0.1, err
+
+
+def test_fp8_head_refuses_quantized_weights(monkeypatch):
+    weight = torch.zeros(256, 64, dtype=torch.float8_e4m3fn)
+    model = _HeadModel(weight, 4, 0, org=1024)
+    monkeypatch.setattr(
+        shard_argmax, "get_tensor_model_parallel_world_size", lambda: 4
+    )
+    monkeypatch.setattr(envs, "VLLM_TPU_DRAFT_SHARD_ARGMAX", True)
+    assert not shard_argmax.attach_fp8_head(model)
