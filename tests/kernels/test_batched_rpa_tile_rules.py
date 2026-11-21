@@ -353,3 +353,69 @@ def test_the_tpu_tuned_tiles_test_runs_different_tiles():
     assert (default_decode, default_prefill) == ((4, 2, 1280, 8), (256, 64, 256, 1))
     assert tuned_decode != default_decode
     assert tuned_prefill != default_prefill
+
+
+@pytest.mark.parametrize(
+    "chip, decode, prefill",
+    [
+        ("TPU_V5E", (4, 2, 4096, 8), (128, 8, 1792, 2)),
+        ("TPU_V5P", (4, 2, 3072, 8), (128, 16, 1024, 2)),
+    ],
+)
+def test_a_chip_without_fp8_compute_keeps_the_bf16_threshold(
+    monkeypatch, chip, decode, prefill
+):
+    """The tuned rules' fp8 threshold for an fp8 KV cache scales the bf16 one by
+    the chip's fp8/bf16 throughput. A chip without fp8 compute
+    (fp8_ops_per_second == 0) keeps the bf16 threshold: with a ratio of 0 the
+    threshold would be 0 and every q tile would split into the smallest
+    sub-chunks (prefill bq_c 2)."""
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion[chip], 1)
+    assert info.fp8_ops_per_second == 0
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda *args, **kwargs: info)
+    layer = _qwen3_5("tp8-decode")
+    args = layer.pop("args")
+    assert _tiles(*args, **layer) == (decode, prefill)
+
+
+def _tp8_decode_test_shape(**kwargs):
+    # The call of test_ragged_paged_attention_tuned_tiles_at_a_tp8_decode_shape
+    # in experimental/batched_rpa/correctness_test.py: 4 q / 1 KV head of 256,
+    # 8 sequence slots of 40 pages (5,000 tokens), 512 padded tokens, MTP K=3.
+    return dict(
+        args=(4, 1, 256),
+        kv="fp8",
+        layout=_SEQ,
+        num_seqs=8,
+        pages_per_seq=40,
+        tokens=512,
+        decode_query_size=4,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs, decode, prefill",
+    [
+        (dict(), (4, 4, 3328, 8), (1024, 64, 1024, 2)),
+        # The 85% decode VMEM cap reaches the 4096-token KV block, and the
+        # prefill bq is clamped to the 512-token bucket.
+        (dict(tuned_tiles=True), (4, 4, 4096, 8), (512, 128, 1024, 2)),
+        # The DP4 x TP2 decode legs' 4 decode lanes.
+        (
+            dict(tuned_tiles=True, decode_batch_size=4),
+            (4, 4, 4096, 4),
+            (512, 128, 1024, 2),
+        ),
+    ],
+    ids=["default", "tuned", "tuned-4-lanes"],
+)
+def test_the_tpu_tp8_decode_test_runs_the_tuned_rules_and_lane_counts(
+    kwargs, decode, prefill
+):
+    """The TPU test's three cases run the tiles named here on TPU7x: the
+    default tiles, the tuned ones (the decode VMEM cap and the prefill bq
+    clamp both change a tile), and the tuned ones with 4 decode lanes."""
+    layer = _tp8_decode_test_shape(**kwargs)
+    args = layer.pop("args")
+    assert _tiles(*args, **layer) == (decode, prefill)

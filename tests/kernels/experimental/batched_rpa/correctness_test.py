@@ -35,6 +35,27 @@ pytestmark = pytest.mark.tpu_test
 jax.config.parse_flags_with_absl()
 
 
+def _rpa_kernel_names(fn, *args) -> list[str]:
+    """The names of the RPA kernels (not the schedule kernels) `fn(*args)`
+    traces; a name carries the kernel's batch, bq and bkv tiles."""
+    names = []
+
+    def walk(jaxpr):
+        for eqn in jaxpr.eqns:
+            if eqn.primitive.name == "pallas_call":
+                if eqn.params["name"].startswith("RPA"):
+                    names.append(eqn.params["name"])
+                continue
+            for value in eqn.params.values():
+                for sub in value if isinstance(value, (list, tuple)) else [value]:
+                    sub = getattr(sub, "jaxpr", sub)
+                    if hasattr(sub, "eqns"):
+                        walk(sub)
+
+    walk(jax.make_jaxpr(fn)(*args).jaxpr)
+    return names
+
+
 @jax.jit
 def _assert_cache_equal(actual: jax.Array, expected: jax.Array) -> jax.Array:
     return jnp.all(jnp.logical_or(jnp.isnan(expected), actual == expected))
@@ -224,9 +245,14 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         nan_new_seq_idx: int | None = None,
         mask_invalid_v: bool | None = None,
         tuned_tiles: bool | None = None,
+        decode_batch_size: int | None = None,
+        expect_kernel_tiles: tuple[str, ...] = (),
     ):
         """tuned_tiles=None passes the block sizes above; True or False lets
-        the wrapper pick its tiles with or without the tuned rules."""
+        the wrapper pick its tiles with or without the tuned rules, for
+        decode_batch_size decode lanes (the wrapper's default when None).
+        Each of expect_kernel_tiles ("-b<batch>-q<bq>-k<bkv>") must name the
+        tiles of one RPA kernel the call traces."""
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # Tokens live on the lane dim, so page_size must be a multiple of 128.
             page_size = utils.align_to(page_size, 128)
@@ -417,14 +443,25 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             }
         else:
             tile_kwargs = {"tuned_tiles": tuned_tiles}
-        output, updated_kv_cache = wrapper.ragged_paged_attention(
-            *jax.tree.map(lambda x: x.copy(), rpa_args),
+            if decode_batch_size is not None:
+                tile_kwargs["decode_batch_size"] = decode_batch_size
+        call_kwargs = dict(
             **kwargs,
             **tile_kwargs,
             vmem_limit_bytes=vmem_limit_bytes,
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
             mask_invalid_v=mask_invalid_v,
+        )
+        if expect_kernel_tiles:
+            names = _rpa_kernel_names(
+                lambda *a: wrapper.ragged_paged_attention(*a, **call_kwargs),
+                *rpa_args,
+            )
+            for tiles in expect_kernel_tiles:
+                assert any(tiles in name for name in names), (tiles, names)
+        output, updated_kv_cache = wrapper.ragged_paged_attention(
+            *jax.tree.map(lambda x: x.copy(), rpa_args), **call_kwargs
         )
         output = output[: cu_q_lens[distribution[-1]]]
 
@@ -962,9 +999,11 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         """The wrapper's own tiles, with and without the tuned rules, at a
         layer shape the rules were tuned for (32 q / 2 KV heads of 256, fp8
         KV, SEQ_ALONG_LANE pages of 128): three 4-token decodes over contexts
-        up to 4,100 tokens and a 300-token chunk. On TPU7x the two cases run
-        different decode and prefill tiles (checked on CPU by
-        test_batched_rpa_tile_rules.py)."""
+        up to 4,100 tokens and a 300-token chunk. On TPU7x the two cases
+        differ in their q sub-chunks only (decode bq_c 2 and 4, prefill 64
+        and 128; checked on CPU by test_batched_rpa_tile_rules.py). The
+        4096-token decode KV block, the prefill bq clamp and 4 decode lanes
+        run in test_ragged_paged_attention_tuned_tiles_at_a_tp8_decode_shape."""
         self._test_ragged_paged_attention(
             [(4, 3000), (4, 700), (4, 4100), (300, 2000)],
             (32, 2),
@@ -977,6 +1016,52 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             decode_query_size=4,
             distribution=jnp.array([3, 3, 4], dtype=jnp.int32),
             tuned_tiles=tuned_tiles,
+        )
+
+    @parameterized.parameters(
+        dict(
+            tuned_tiles=False,
+            decode_batch_size=None,
+            tiles=("-b8-q4-k3328", "-b2-q1024-k1024"),
+        ),
+        dict(
+            tuned_tiles=True,
+            decode_batch_size=None,
+            tiles=("-b8-q4-k4096", "-b2-q512-k1024"),
+        ),
+        dict(
+            tuned_tiles=True,
+            decode_batch_size=4,
+            tiles=("-b4-q4-k4096", "-b2-q512-k1024"),
+        ),
+    )
+    def test_ragged_paged_attention_tuned_tiles_at_a_tp8_decode_shape(
+        self, tuned_tiles, decode_batch_size, tiles
+    ):
+        """The wrapper's own tiles at one TP8 decode device's layer shape (4 q
+        / 1 KV head of 256, fp8 KV, SEQ_ALONG_LANE pages of 128, MTP K=3):
+        five 4-token decodes over contexts up to 5,000 tokens and a 300-token
+        chunk. On TPU7x (checked on CPU by test_batched_rpa_tile_rules.py) the
+        default case runs decode tiles (4, 4, 3328, 8) and prefill tiles
+        (1024, 64, 1024, 2); the tuned case reaches the 4096-token decode KV
+        block of the 85% VMEM cap and clamps the prefill bq to the 512-token
+        bucket, (4, 4, 4096, 8) and (512, 128, 1024, 2); with 4 decode lanes
+        the decode tiles are (4, 4, 4096, 4). Each case also checks that the
+        traced kernels carry those tiles."""
+        self._test_ragged_paged_attention(
+            [(4, 5000), (4, 1000), (4, 4300), (4, 600), (4, 2000), (300, 3100)],
+            (4, 1),
+            256,
+            128,
+            jnp.bfloat16,
+            jnp.float8_e4m3fn,
+            150,
+            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+            decode_query_size=4,
+            distribution=jnp.array([5, 5, 6], dtype=jnp.int32),
+            tuned_tiles=tuned_tiles,
+            decode_batch_size=decode_batch_size,
+            expect_kernel_tiles=tiles,
         )
 
     @parameterized.product(
