@@ -18,7 +18,6 @@ mocks. Interpretation checks dense arithmetic and indexing, not GMM parity,
 TPU resource capacity or compiled device performance.
 """
 
-import functools
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -93,6 +92,10 @@ def _shapes(m, h, i, e):
         (16, 1536, 1536, 2),
         (16, 512, 512, 129),
         (1024, 8192, 4096, 512),
+        # Rows that are a multiple of 8 but not of 16: the entry pads them to
+        # 16 inside (test_expanded_shapes_match_routed_reference).
+        (8, 512, 512, 4),
+        (24, 512, 512, 4),
     ],
 )
 @pytest.mark.parametrize("skip_padded_tokens", [False, True])
@@ -179,6 +182,9 @@ def test_hidden_contracting_axis_also_needs_gmm_quantization(
 @pytest.mark.parametrize(
     "shape",
     [
+        # Rows must be a multiple of 8.
+        (4, 512, 512, 4),
+        (12, 512, 512, 4),
         (15, 512, 512, 4),
         (16, 768, 512, 4),
         (16, 512, 704, 4),
@@ -236,30 +242,27 @@ def _reference_expert(x, w1, w2, s1, s2):
     return matmul(jax.nn.silu(gate) * up, w2, s2)
 
 
-@pytest.mark.parametrize(
-    "shape",
-    [
-        (272, 512, 512, 2),
-        (16, 1536, 1536, 2),
-        (16, 512, 512, 129),
-        (16, 512, 128, 2),
-        (16, 512, 640, 2),
-        (16, 512, 768, 2),
-    ],
-)
-def test_expanded_shapes_match_routed_reference(shape, monkeypatch):
+def _interpret_against_reference(
+    monkeypatch, m, h, i, e, *, slots=None, route=None, num_primary_experts=None
+):
+    """Run dense_expert_moe in the CPU interpreter against a routed reference
+    over the experts below `num_primary_experts` (all `e` without it).
+
+    The weights hold `slots` experts (default `e`); `route` lists each row's
+    local ids (-1: not this rank). Returns the row count the kernel ran at."""
     if jax.default_backend() != "cpu":
         pytest.skip("CPU Pallas interpreter; run with JAX_PLATFORMS=cpu")
-    m, h, i, e = shape
+    slots = e if slots is None else slots
+    primaries = e if num_primary_experts is None else num_primary_experts
     rng = np.random.default_rng(20260922)
     x = jnp.asarray(rng.normal(size=(m, h)), jnp.bfloat16)
-    w1 = jnp.asarray(rng.integers(-4, 5, size=(e, h, 2 * i)), jnp.float8_e4m3fn)
-    w2 = jnp.asarray(rng.integers(-4, 5, size=(e, i, h)), jnp.float8_e4m3fn)
-    s1 = jnp.full((e, 1, 1, 2 * i), 0.01, jnp.float32)
-    s2 = jnp.full((e, 1, 1, h), 0.01, jnp.float32)
-    # Exercise both sides of the 128-column boundary, duplicate IDs, an
+    w1 = jnp.asarray(rng.integers(-4, 5, size=(slots, h, 2 * i)), jnp.float8_e4m3fn)
+    w2 = jnp.asarray(rng.integers(-4, 5, size=(slots, i, h)), jnp.float8_e4m3fn)
+    s1 = jnp.full((slots, 1, 1, 2 * i), 0.01, jnp.float32)
+    s2 = jnp.full((slots, 1, 1, h), 0.01, jnp.float32)
+    # By default, both sides of the 128-column boundary, duplicate IDs, an
     # invalid local ID and a padded row whose otherwise-valid weights are 0.
-    route = [0, e - 2, e - 1, e - 1, -1]
+    route = [0, e - 2, e - 1, e - 1, -1] if route is None else route
     ids = jnp.asarray(np.tile(route, (m, 1)), jnp.int32)
     weights = (
         jnp.asarray(np.tile([0.125, 0.25, 0.125, 0.125, 0.0], (m, 1)), jnp.bfloat16)
@@ -268,6 +271,8 @@ def test_expanded_shapes_match_routed_reference(shape, monkeypatch):
     )
     expected = jnp.zeros((m, h), jnp.float32)
     for expert in sorted(set(route) - {-1}):
+        if expert >= primaries:
+            continue  # a copy slot: the kernel serves the primaries only
         output = _reference_expert(
             x, w1[expert], w2[expert], s1[expert, 0, 0], s2[expert, 0, 0]
         )
@@ -278,11 +283,14 @@ def test_expanded_shapes_match_routed_reference(shape, monkeypatch):
             coeff[:, None] != 0, output.astype(jnp.float32) * coeff[:, None], 0
         )
     expected = np.asarray(expected.astype(jnp.bfloat16), dtype=np.float32)
-    monkeypatch.setattr(
-        kernel.pl,
-        "pallas_call",
-        functools.partial(kernel.pl.pallas_call, interpret=True),
-    )
+    kernel_rows = []
+    pallas_call = kernel.pl.pallas_call
+
+    def interpreted(*args, **kwargs):
+        kernel_rows.append(kwargs["out_shape"].shape[0])
+        return pallas_call(*args, interpret=True, **kwargs)
+
+    monkeypatch.setattr(kernel.pl, "pallas_call", interpreted)
     monkeypatch.setattr(
         kernel.pltpu,
         "get_tpu_info",
@@ -291,14 +299,65 @@ def test_expanded_shapes_match_routed_reference(shape, monkeypatch):
     kernel.dense_expert_moe.clear_cache()
     try:
         actual = np.asarray(
-            kernel.dense_expert_moe(x, w1, w2, s1, s2, weights, ids), dtype=np.float32
+            kernel.dense_expert_moe(
+                x,
+                w1,
+                w2,
+                s1,
+                s2,
+                weights,
+                ids,
+                num_primary_experts=num_primary_experts,
+            ),
+            dtype=np.float32,
         )
     finally:
         kernel.dense_expert_moe.clear_cache()
+    assert actual.shape == (m, h)
     assert np.isfinite(actual).all()
     np.testing.assert_array_equal(actual[-1], 0)
     relative_l2 = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
     assert relative_l2 < 0.008, relative_l2
+    (rows,) = kernel_rows
+    return rows
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (272, 512, 512, 2),
+        (16, 1536, 1536, 2),
+        (16, 512, 512, 129),
+        (16, 512, 128, 2),
+        (16, 512, 640, 2),
+        (16, 512, 768, 2),
+        # 8-row aligned inputs, padded to 16 rows inside and sliced back.
+        (8, 512, 512, 2),
+        (24, 512, 512, 4),
+    ],
+)
+def test_expanded_shapes_match_routed_reference(shape, monkeypatch):
+    m = shape[0]
+    rows = _interpret_against_reference(monkeypatch, *shape)
+    assert rows == -(-m // 16) * 16
+
+
+@pytest.mark.parametrize("m", [8, 16])
+def test_copy_slots_past_the_primaries_contribute_nothing(monkeypatch, m):
+    """A copy-slot layer holds e + 2 slots and passes num_primary_experts=e:
+    a route to slot e (the first copy) adds nothing, while the primaries on
+    both sides of it still do."""
+    rows = _interpret_against_reference(
+        monkeypatch,
+        m,
+        512,
+        512,
+        4,
+        slots=6,
+        route=[0, 4, 3, 5, -1],
+        num_primary_experts=4,
+    )
+    assert rows == 16
 
 
 @pytest.mark.parametrize(
@@ -312,6 +371,10 @@ def test_expanded_shapes_match_routed_reference(shape, monkeypatch):
         (256, 128, False),
         (272, 272, True),
         (15, 1024, False),
+        # 8-row alignment: admitted at 8 and 24 rows, refused at 12.
+        (8, 1024, True),
+        (24, 1024, True),
+        (12, 1024, False),
     ],
 )
 def test_token_threshold_dispatch_and_resource_failure_propagation(

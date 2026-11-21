@@ -1,0 +1,823 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Parity, routing edge cases and admission for the few-token MoE kernel.
+
+TPU tests compile the kernel; the interpreted tests run with JAX_PLATFORMS=cpu
+and check indexing and arithmetic, not TPU resource capacity.
+"""
+
+import functools
+from types import SimpleNamespace
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from jax.experimental import pallas as pl
+
+from vllm_torchtpu.kernels.experimental.moe_lowtok import kernel
+from vllm_torchtpu.layers.adapter import fused_moe as bridge
+from vllm_torchtpu.layers.core import fused_moe_gmm as wrapper
+
+FP8 = jnp.float8_e4m3fn
+
+
+def _needs(backend):
+    if jax.default_backend() != backend:
+        pytest.skip(f"requires {backend}")
+
+
+@pytest.fixture
+def interpret(monkeypatch):
+    _needs("cpu")
+    monkeypatch.setattr(
+        kernel.pl,
+        "pallas_call",
+        functools.partial(kernel.pl.pallas_call, interpret=True),
+    )
+    monkeypatch.setattr(
+        kernel.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(vmem_capacity_bytes=64 * 1024**2),
+    )
+    kernel.moe_lowtok.clear_cache()
+    yield
+    kernel.moe_lowtok.clear_cache()
+
+
+def _quantize_rows(v):
+    amax = jnp.max(jnp.abs(v), axis=1, keepdims=True)
+    scale = jnp.maximum(amax, 1e-12) / 448.0
+    return (v / scale).astype(FP8), scale
+
+
+def _reference(x, ids, weights, w13, s13, w2, s2):
+    """Plain JAX with the kernel's arithmetic: per-row FP8 activations."""
+    e, _, two_inter = w13.shape
+    inter = two_inter // 2
+    x_q, x_s = _quantize_rows(x.astype(jnp.float32))
+    s13 = s13.reshape(e, two_inter)
+    s2 = s2.reshape(e, -1)
+    out = jnp.zeros((x.shape[0], x.shape[1]), jnp.float32)
+    for expert in range(e):
+        w = jnp.sum(jnp.where(ids == expert, weights, 0).astype(jnp.float32), axis=1)
+        h = jnp.dot(x_q, w13[expert], preferred_element_type=jnp.float32)
+        h = h * x_s * s13[expert][None, :]
+        a = jax.nn.silu(h[:, :inter]) * h[:, inter:]
+        a_q, a_s = _quantize_rows(a)
+        o = jnp.dot(a_q, w2[expert], preferred_element_type=jnp.float32)
+        out = out + w[:, None] * (o * a_s * s2[expert][None, :])
+    return out.astype(x.dtype)
+
+
+def _router(scores, topk):
+    """The served router: top-k, ties to the lowest id, renormalized, bf16."""
+    weights, ids = jax.lax.top_k(scores, topk)
+    weights = weights / jnp.sum(weights, axis=1, keepdims=True)
+    return weights.astype(jnp.bfloat16), ids.astype(jnp.int32)
+
+
+def _weights(rng, experts, hidden, inter):
+    w13 = np.clip(rng.standard_normal((experts, hidden, 2 * inter)) * 40, -448, 448)
+    w2 = np.clip(rng.standard_normal((experts, inter, hidden)) * 40, -448, 448)
+    s13 = rng.random((experts, 1, 1, 2 * inter)) / (40 * np.sqrt(hidden))
+    s2 = rng.random((experts, 1, 1, hidden)) / (40 * np.sqrt(inter))
+    return (
+        jnp.asarray(w13, FP8),
+        jnp.asarray(s13, jnp.float32),
+        jnp.asarray(w2, FP8),
+        jnp.asarray(s2, jnp.float32),
+    )
+
+
+def _ids_operands(seed, tokens, experts, hidden, inter, topk):
+    """About half of the routed pairs land on this shard's experts."""
+    rng = np.random.default_rng(seed)
+    x = jnp.asarray(rng.standard_normal((tokens, hidden)), jnp.bfloat16)
+    ids = np.stack(
+        [rng.choice(2 * experts, size=topk, replace=False) for _ in range(tokens)]
+    )
+    local = jnp.asarray(np.where(ids < experts, ids, -1), jnp.int32)
+    weights = rng.random((tokens, topk))
+    weights = jnp.asarray(weights / weights.sum(axis=1, keepdims=True), jnp.bfloat16)
+    return (x, local, weights, *_weights(rng, experts, hidden, inter))
+
+
+def _scores_operands(seed, tokens, experts, hidden, inter, start, n_global=512):
+    rng = np.random.default_rng(seed)
+    x = jnp.asarray(rng.standard_normal((tokens, hidden)), jnp.bfloat16)
+    logits = rng.standard_normal((tokens, n_global)) * 2
+    logits[:, start : start + experts] += 5.0
+    scores = jax.nn.softmax(jnp.asarray(logits, jnp.float32), axis=-1)
+    return x, scores, _weights(rng, experts, hidden, inter)
+
+
+def _ids_call(x, ids, weights, w13, s13, w2, s2):
+    route = kernel.routing_table(ids, weights, w13.shape[0])
+    return kernel.moe_lowtok(x, route, w13, s13, w2, s2)
+
+
+def _scores_call(x, scores, start, weights, topk):
+    return kernel.moe_lowtok(x, scores, *weights, jnp.int32(start), topk=topk)
+
+
+def _scores_want(x, scores, weights, topk, start, experts):
+    w13, s13, w2, s2 = weights
+    w, ids = _router(scores, topk)
+    local = jnp.where((ids >= start) & (ids < start + experts), ids - start, -1)
+    return _ids_call(x, local, w, w13, s13, w2, s2)
+
+
+def _assert_close(got, want, rel_l2=1e-2):
+    got = np.asarray(got, np.float32)
+    want = np.asarray(want, np.float32)
+    assert got.shape == want.shape
+    assert np.isfinite(got).all()
+    # One activation near an FP8 rounding boundary moves an element by a few
+    # percent of the peak, so the per-element bound is loose and L2 is tight.
+    scale = np.max(np.abs(want)) + 1e-6
+    np.testing.assert_allclose(got / scale, want / scale, atol=6e-2, rtol=0)
+    err = np.linalg.norm(got - want) / (np.linalg.norm(want) + 1e-9)
+    assert err < rel_l2, err
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("tokens", [1, 4, 8, 13, 32, 64, 128, 256, 448])
+@pytest.mark.parametrize("shape", [(8, 512, 256, 4), (64, 4096, 1024, 10)])
+def test_ids_entry_matches_reference(tokens, shape):
+    _needs("tpu")
+    experts, hidden, inter, topk = shape
+    ops = _ids_operands(tokens * 7 + experts, tokens, experts, hidden, inter, topk)
+    got = jax.block_until_ready(_ids_call(*ops))
+    _assert_close(got, _reference(*ops), 2.5e-2 if tokens < 4 else 1e-2)
+
+
+@pytest.mark.tpu_test
+def test_no_local_expert_is_zero():
+    _needs("tpu")
+    x, ids, weights, *w = _ids_operands(3, 4, 8, 512, 256, 4)
+    got = _ids_call(x, jnp.full_like(ids, -1), weights, *w)
+    assert np.all(np.asarray(got, np.float32) == 0)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("tokens", [1, 4, 8, 13, 32, 448])
+@pytest.mark.parametrize("shape", [(8, 512, 256, 4, 16), (64, 4096, 1024, 10, 128)])
+def test_scores_entry_matches_router_then_ids_entry(tokens, shape):
+    """Same experts and the same renormalized bf16 weights as the router."""
+    _needs("tpu")
+    experts, hidden, inter, topk, start = shape
+    x, scores, weights = _scores_operands(
+        tokens * 11 + experts, tokens, experts, hidden, inter, start
+    )
+    got = _scores_call(x, scores, start, weights, topk)
+    _assert_close(got, _scores_want(x, scores, weights, topk, start, experts))
+
+
+@pytest.mark.tpu_test
+def test_scores_entry_zero_score_rows_select_nothing():
+    """A padded row's scores are zeroed; it adds no hit and outputs zero."""
+    _needs("tpu")
+    experts, hidden, inter, topk, start = 8, 512, 256, 4, 16
+    x, scores, weights = _scores_operands(23, 5, experts, hidden, inter, start)
+    scores = scores.at[2].set(0.0)
+    got = np.asarray(
+        _scores_call(x, scores, start, weights, topk),
+        np.float32,
+    )
+    assert np.all(got[2] == 0)
+    # A copy: np.asarray of a device array is a read-only view.
+    want = np.array(_scores_want(x, scores, weights, topk, start, experts))
+    want[2] = 0
+    _assert_close(np.delete(got, 2, 0), np.delete(want, 2, 0))
+
+
+@pytest.mark.parametrize("tokens", [5, 33])
+def test_interpreted_ids_entry_matches_reference(interpret, tokens):
+    ops = _ids_operands(tokens, tokens, 8, 512, 256, 4)
+    _assert_close(_ids_call(*ops), _reference(*ops), 2.5e-2)
+
+
+@pytest.mark.parametrize("n_global", [512, 160])
+def test_interpreted_scores_entry_matches_router_then_reference(interpret, n_global):
+    experts, hidden, inter, topk, start = 8, 512, 256, 4, 16
+    x, scores, weights = _scores_operands(9, 6, experts, hidden, inter, start, n_global)
+    scores = scores.at[2].set(0.0)
+    got = np.asarray(
+        _scores_call(x, scores, start, weights, topk),
+        np.float32,
+    )
+    assert np.all(got[2] == 0)
+    w, ids = _router(scores, topk)
+    local = jnp.where((ids >= start) & (ids < start + experts), ids - start, -1)
+    local = local.at[2].set(-1)
+    _assert_close(got, _reference(x, local, w, *weights), 2.5e-2)
+
+
+def _logits_case(dtype, tokens=5, n_global=100):
+    """Router logits for the logits entry: a row count that is not a multiple
+    of 8 and fewer experts than one 128-lane tile, so the wrapper pads rows and
+    lanes; a padded engine row (all -inf) routes nowhere, and a row with two
+    finite logits, both below zero, keeps its top-k on those two (a padded lane
+    that could win would take the other slots and their weight)."""
+    experts, hidden, inter, topk, start = 8, 512, 256, 4, 16
+    rng = np.random.default_rng(31 + n_global)
+    x = jnp.asarray(rng.standard_normal((tokens, hidden)), jnp.bfloat16)
+    logits = rng.standard_normal((tokens, n_global)) * 2
+    logits[:, start : start + experts] += 3.0
+    logits[2] = -np.inf
+    logits[3] = -np.inf
+    logits[3, [start + 1, start + 5]] = [-1.0, -2.0]
+    logits = jnp.asarray(logits, dtype)
+    weights = _weights(rng, experts, hidden, inter)
+    return x, logits, weights, topk, start, experts
+
+
+def _logits_want(x, logits, weights, topk, start, experts):
+    """The served router on the softmax of the same logits, then the ids
+    entry's reference; the padded row adds nothing."""
+    scores = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+    scores = jnp.where(jnp.isnan(scores), 0.0, scores)
+    w, ids = _router(scores, topk)
+    local = jnp.where((ids >= start) & (ids < start + experts), ids - start, -1)
+    local = local.at[2].set(-1)
+    return _reference(x, local, w, *weights)
+
+
+def _logits_got(x, logits, weights, topk, start):
+    return np.asarray(
+        kernel.moe_lowtok(
+            x, logits, *weights, jnp.int32(start), topk=topk, from_logits=True
+        ),
+        np.float32,
+    )
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32], ids=["bf16", "f32"])
+def test_interpreted_logits_entry_matches_router_then_reference(interpret, dtype):
+    """The logits entry pads rows and lanes with a value that never wins (-inf
+    for bf16, the kernel's floor for f32) and matches the router on the softmax
+    of the same logits."""
+    x, logits, weights, topk, start, experts = _logits_case(dtype)
+    got = _logits_got(x, logits, weights, topk, start)
+    assert np.all(got[2] == 0)
+    _assert_close(got, _logits_want(x, logits, weights, topk, start, experts), 2.5e-2)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("tokens", [5, 448])
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32], ids=["bf16", "f32"])
+def test_logits_entry_matches_router_then_reference(dtype, tokens):
+    _needs("tpu")
+    x, logits, weights, topk, start, experts = _logits_case(dtype, tokens)
+    got = _logits_got(x, logits, weights, topk, start)
+    assert np.all(got[2] == 0)
+    _assert_close(got, _logits_want(x, logits, weights, topk, start, experts))
+
+
+ROUTER_EXPERTS = 512
+ROUTER_TOPK = 10
+_NINE_WINNERS = [20, 40, 60, 80, 120, 140, 160, 180, 220]
+
+
+def _tied_router_input(rows, from_logits, seed):
+    """512-expert top-10 router rows whose first four hold ties the selected set
+    depends on.
+
+    Row 0 ties ids 5 and 511 for the 10th place under nine clear winners, row
+    1 is a padded token with every score equal, row 2 ties twelve ids
+    (100..111) for ten places, and row 3 ties ids 200 and 300 for the 10th
+    place. The other rows are a softmax of bf16 logits, or those logits.
+    """
+    rng = np.random.default_rng(seed)
+    logits = rng.standard_normal((rows, ROUTER_EXPERTS), dtype=np.float32) * 2.0
+    logits = np.asarray(jnp.asarray(logits, jnp.bfloat16).astype(jnp.float32))
+    if from_logits:
+        x, hi, tie, lo = logits.copy(), 8.0, 4.0, -8.0
+    else:
+        z = np.exp(logits - logits.max(axis=1, keepdims=True))
+        x, hi, tie, lo = (z / z.sum(axis=1, keepdims=True)), 0.5, 0.25, 0.0
+    for row, tied in ((0, [5, 511]), (3, [200, 300])):
+        x[row] = lo
+        x[row, _NINE_WINNERS] = hi + np.arange(9) * (hi / 64)
+        x[row, tied] = tie
+    x[1] = tie
+    x[2] = lo
+    x[2, 100:112] = hi
+    return jnp.asarray(x, jnp.bfloat16 if from_logits else jnp.float32)
+
+
+def _lowest_id_table(x, from_logits):
+    """The documented rule on the host: a stable sort keeps lower ids first."""
+    c = np.asarray(jnp.asarray(x).astype(jnp.float32))
+    ids = np.argsort(-c, axis=1, kind="stable")[:, :ROUTER_TOPK]
+    top = np.take_along_axis(c, ids, axis=1).astype(np.float64)
+    w = np.exp(top - top[:, :1]) if from_logits else top
+    table = np.zeros(c.shape, np.float32)
+    np.put_along_axis(table, ids, w / w.sum(axis=1, keepdims=True), axis=1)
+    return ids, np.asarray(jnp.asarray(table).astype(jnp.bfloat16), np.float32)
+
+
+def _select_topk_call(x, from_logits, interpret):
+    rows = x.shape[0]
+
+    def body(s_ref, o_ref):
+        o_ref[...] = kernel._select_topk(
+            s_ref[...], ROUTER_TOPK, from_logits=from_logits
+        )
+
+    block = pl.BlockSpec((rows, ROUTER_EXPERTS), lambda i: (0, 0))
+    return pl.pallas_call(
+        body,
+        grid=(1,),
+        in_specs=[block],
+        out_specs=block,
+        out_shape=jax.ShapeDtypeStruct((rows, ROUTER_EXPERTS), jnp.float32),
+        interpret=interpret,
+    )(x)
+
+
+@pytest.mark.parametrize(
+    "interpreted",
+    [
+        pytest.param(True, id="interpret"),
+        pytest.param(False, id="tpu", marks=pytest.mark.tpu_test),
+    ],
+)
+@pytest.mark.parametrize("from_logits", [False, True], ids=["scores", "logits"])
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+def test_select_topk_ties_go_to_the_lowest_id(rows, from_logits, interpreted):
+    """The in-kernel router keeps its documented tie rule, compiled as well.
+
+    At 64 rows or fewer it once took each pass's index from one argmax, which
+    kept the lowest tied id in interpret mode and other ids compiled on TPU7x.
+    """
+    if not interpreted:
+        _needs("tpu")
+    x = _tied_router_input(rows, from_logits, seed=rows + 1000 * from_logits)
+    ids, want = _lowest_id_table(x, from_logits)
+    assert set(ids[0]) == {*_NINE_WINNERS, 5}
+    assert set(ids[1]) == set(range(10))
+    assert set(ids[2]) == set(range(100, 110))
+    assert set(ids[3]) == {*_NINE_WINNERS, 200}
+    got = np.asarray(_select_topk_call(x, from_logits, interpreted))
+    np.testing.assert_array_equal(got != 0, want != 0)
+    np.testing.assert_allclose(got, want, rtol=1e-2, atol=0)
+
+
+def _shapes(m, h, i, e):
+    return (
+        jax.ShapeDtypeStruct((m, h), jnp.bfloat16),
+        jax.ShapeDtypeStruct((e, h, 2 * i), FP8),
+        jax.ShapeDtypeStruct((e, i, h), FP8),
+        jax.ShapeDtypeStruct((e, 1, 1, 2 * i), jnp.float32),
+        jax.ShapeDtypeStruct((e, 1, 1, h), jnp.float32),
+    )
+
+
+def test_64_experts_of_hidden_4096_and_intermediate_1024_are_supported():
+    assert kernel.can_use_moe_lowtok(
+        *_shapes(256, 4096, 1024, 64),
+        None,
+        None,
+        activation="silu",
+        rhs_quant_dtype=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    ["experts", "inter", "activation", "bias", "scale", "bf16", "packed", "padded"],
+)
+def test_unsupported_layouts_are_refused(unsupported):
+    x, w1, w2, s1, s2 = _shapes(16, 512, 256, 8)
+    b1, activation, rhs_quant_dtype = None, "silu", None
+    if unsupported == "experts":
+        x, w1, w2, s1, s2 = _shapes(16, 512, 256, 129)
+    elif unsupported == "inter":
+        x, w1, w2, s1, s2 = _shapes(16, 512, 128, 8)
+    elif unsupported == "activation":
+        activation = "gelu"
+    elif unsupported == "bias":
+        b1 = jax.ShapeDtypeStruct((8, 1, 512), jnp.float32)
+    elif unsupported == "scale":
+        s1 = jax.ShapeDtypeStruct((8, 4, 1, 512), jnp.float32)
+    elif unsupported == "bf16":
+        w1 = jax.ShapeDtypeStruct(w1.shape, jnp.bfloat16)
+    elif unsupported == "packed":
+        rhs_quant_dtype = jnp.int4
+    else:
+        x = jax.ShapeDtypeStruct((16, 640), jnp.bfloat16)
+    assert not kernel.can_use_moe_lowtok(
+        x,
+        w1,
+        w2,
+        s1,
+        s2,
+        b1,
+        None,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+
+
+@pytest.mark.parametrize(
+    "m, enabled, use_ep, selected",
+    [
+        (1, True, True, True),
+        (128, True, True, True),
+        (129, True, True, False),
+        (128, False, True, False),
+        (128, True, False, False),
+    ],
+)
+def test_token_cap_dispatch(m, enabled, use_ep, selected, monkeypatch):
+    """An EP call takes the kernel when its rows are within the cap that
+    fused_moe_func is given; other calls keep the grouped path."""
+
+    class LowtokSelected(RuntimeError):
+        pass
+
+    class StandardSelected(RuntimeError):
+        pass
+
+    def lowtok_selected(*args, **kwargs):
+        raise LowtokSelected
+
+    def standard_selected(*args, **kwargs):
+        raise StandardSelected
+
+    monkeypatch.setattr(wrapper, "moe_lowtok", lowtok_selected)
+    monkeypatch.setattr(wrapper, "prepare_routed_gmm_inputs", standard_selected)
+    wrapper.fused_moe_func.clear_cache()
+    args = (
+        *_shapes(m, 512, 256, 8),
+        None,
+        None,
+        jax.ShapeDtypeStruct((m, 4), jnp.bfloat16),
+        jax.ShapeDtypeStruct((m, 4), jnp.int32),
+        jax.ShapeDtypeStruct((), jnp.int32),
+    )
+    try:
+        with pytest.raises(LowtokSelected if selected else StandardSelected):
+            jax.eval_shape(
+                functools.partial(
+                    wrapper.fused_moe_func,
+                    topk=4,
+                    use_ep=use_ep,
+                    lowtok_max_tokens=128 if enabled else 0,
+                ),
+                *args,
+            )
+    finally:
+        wrapper.fused_moe_func.clear_cache()
+
+
+@pytest.fixture
+def unarmed(monkeypatch):
+    """No cap armed, and the op cache empty; both restored after the test."""
+    monkeypatch.setattr(wrapper, "_MOE_LOWTOK_MAX_TOKENS", 0)
+    monkeypatch.setattr(bridge, "_fused_moe_kernel_cache", {})
+
+
+@pytest.mark.parametrize("rows", [-1, kernel.MOE_LOWTOK_MAX_TOKENS + 1])
+def test_the_cap_cannot_exceed_the_rows_the_kernel_is_built_for(unarmed, rows):
+    with pytest.raises(ValueError, match=f"got {rows}"):
+        wrapper.set_lowtok_max_tokens(rows)
+    assert wrapper.armed_lowtok_max_tokens() == 0
+    wrapper.set_lowtok_max_tokens(kernel.MOE_LOWTOK_MAX_TOKENS)
+    assert wrapper.armed_lowtok_max_tokens() == kernel.MOE_LOWTOK_MAX_TOKENS
+
+
+def test_the_kernel_refuses_more_rows_than_it_is_built_for(interpret):
+    cap = kernel.MOE_LOWTOK_MAX_TOKENS
+    for m, admitted in ((cap, True), (cap + 1, False)):
+        shapes = _shapes(m, 512, 256, 8)
+        assert (
+            kernel.can_use_moe_lowtok(
+                *shapes, None, None, activation="silu", rhs_quant_dtype=None
+            )
+            == admitted
+        )
+    x, w13, w2, s13, s2 = _shapes(cap + 1, 512, 256, 8)
+    route = jax.ShapeDtypeStruct((cap + 1, 8), jnp.float32)
+    with pytest.raises(ValueError, match=f"at most {cap} rows, got {cap + 1}"):
+        jax.eval_shape(kernel.moe_lowtok, x, route, w13, s13, w2, s2)
+    x, w13, w2, s13, s2 = _shapes(cap, 512, 256, 8)
+    route = jax.ShapeDtypeStruct((cap, 8), jnp.float32)
+    out = jax.eval_shape(kernel.moe_lowtok, x, route, w13, s13, w2, s2)
+    assert out.shape == (cap, 512)
+
+
+def test_router_logits_need_the_kernels_top_k(interpret):
+    """from_logits=True marks router logits, which only the kernel's own top-k
+    reads. With topk=None the route is a routing table, and the logits' -inf
+    padding would read as a hit on every lane of the padded rows."""
+    x, w13, w2, s13, s2 = _shapes(8, 512, 256, 8)
+    route = jax.ShapeDtypeStruct((8, 8), jnp.bfloat16)
+    logits_entry = functools.partial(kernel.moe_lowtok, from_logits=True)
+    with pytest.raises(ValueError, match="from_logits=True needs topk"):
+        jax.eval_shape(logits_entry, x, route, w13, s13, w2, s2)
+    # The control: the same table with from_logits=False is the routed-ids entry.
+    jax.eval_shape(kernel.moe_lowtok, x, route, w13, s13, w2, s2)
+
+
+class _Op:
+    """Stands in for the registered custom op; keeps the function it wraps."""
+
+    def __init__(self, name, fn):
+        self.name, self.fn = name, fn
+
+    def register_fake(self, fake):
+        del fake
+
+
+def test_the_bridge_bakes_the_armed_cap_into_the_op_it_builds(unarmed, monkeypatch):
+    """The fused MoE op takes the cap armed when it is built and its cache is
+    keyed on it: arming after an op exists builds a new op, and the op built
+    before keeps the grouped path."""
+
+    class LowtokSelected(RuntimeError):
+        pass
+
+    class StandardSelected(RuntimeError):
+        pass
+
+    def lowtok_selected(*args, **kwargs):
+        raise LowtokSelected
+
+    def standard_selected(*args, **kwargs):
+        raise StandardSelected
+
+    monkeypatch.setattr(bridge.pallas, "jax_op", _Op)
+    monkeypatch.setattr(wrapper, "moe_lowtok", lowtok_selected)
+    monkeypatch.setattr(wrapper, "prepare_routed_gmm_inputs", standard_selected)
+    get = functools.partial(
+        bridge._get_fused_moe_custom_op, topk=4, activation="silu", use_ep=True
+    )
+    before = get()
+    wrapper.set_lowtok_max_tokens(128)
+    armed = get()
+    assert armed is not before and get() is armed
+    assert before.fn.keywords["lowtok_max_tokens"] == 0
+    assert armed.fn.keywords["lowtok_max_tokens"] == 128
+    args = (
+        *_shapes(16, 512, 256, 8),
+        None,
+        None,
+        jax.ShapeDtypeStruct((16, 4), jnp.bfloat16),
+        jax.ShapeDtypeStruct((16, 4), jnp.int32),
+        jax.ShapeDtypeStruct((), jnp.int32),
+    )
+    wrapper.fused_moe_func.clear_cache()
+    try:
+        with pytest.raises(LowtokSelected):
+            jax.eval_shape(armed.fn, *args)
+        with pytest.raises(StandardSelected):
+            jax.eval_shape(before.fn, *args)
+    finally:
+        wrapper.fused_moe_func.clear_cache()
+
+
+def _oracle(x, ids, weights, w13, s13, w2, s2, experts_start):
+    """Float64 routed MoE over the dequantized FP8 weights."""
+    x = np.asarray(x, np.float64)
+    w13 = np.asarray(w13, np.float64) * np.asarray(s13, np.float64)[:, 0]
+    w2 = np.asarray(w2, np.float64) * np.asarray(s2, np.float64)[:, 0]
+    local = np.asarray(ids) - experts_start
+    weights = np.asarray(weights, np.float64)
+    inter = w2.shape[1]
+    out = np.zeros(x.shape)
+    for expert in range(w13.shape[0]):
+        w = np.sum(np.where(local == expert, weights, 0), axis=1)
+        h = x @ w13[expert]
+        a = h[:, :inter] / (1 + np.exp(-h[:, :inter])) * h[:, inter:]
+        out += w[:, None] * (a @ w2[expert])
+    return out
+
+
+def _rel_l2(got, want):
+    got = np.asarray(got, np.float64)
+    assert np.isfinite(got).all()
+    return np.linalg.norm(got - want) / np.linalg.norm(want)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("m", [16, 128])
+def test_fused_moe_func_selects_kernel_and_matches_oracle(m):
+    _needs("tpu")
+    rng = np.random.default_rng(m)
+    e, h, i, topk, start = 8, 512, 256, 4, 64
+    x = jnp.asarray(rng.standard_normal((m, h)), jnp.bfloat16)
+    w13, s13, w2, s2 = _weights(rng, e, h, i)
+    # Distinct ids over 16 global experts, half of them on this shard.
+    ids = np.stack([rng.choice(16, size=topk, replace=False) for _ in range(m)])
+    ids = jnp.asarray(ids + start - 4, jnp.int32)
+    weights = rng.random((m, topk))
+    weights = jnp.asarray(weights / weights.sum(axis=1, keepdims=True), jnp.bfloat16)
+    args = (x, w13, w2, s13, s2, None, None, weights, ids)
+    kwargs = dict(experts_start=jnp.array(start, jnp.int32), topk=topk, use_ep=True)
+    want = _oracle(x, ids, weights, w13, s13, w2, s2, start)
+    wrapper.fused_moe_func.clear_cache()
+    gmm_err = _rel_l2(wrapper.fused_moe_func(*args, **kwargs), want)
+    kwargs["lowtok_max_tokens"] = 128
+    try:
+        assert "moe_lowtok" in wrapper.fused_moe_func.lower(*args, **kwargs).as_text()
+        err = _rel_l2(wrapper.fused_moe_func(*args, **kwargs), want)
+    finally:
+        wrapper.fused_moe_func.clear_cache()
+    # An E4M3 operand has rel-L2 error ~2^-3 / sqrt(12 * 7/3) = 0.024; x's enters
+    # both silu(h1) and h3, then `a` is requantized: ~sqrt(3) * 0.024 = 0.041,
+    # bounded at 1.5x. GMM's 512-column blocks and lowtok's whole rows round
+    # differently, so each is compared with the oracle, not with the other.
+    assert err < 0.06, (err, gmm_err)
+    assert err < gmm_err + 0.005, (err, gmm_err)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("from_logits", [False, True], ids=["scores", "logits"])
+@pytest.mark.parametrize("tokens", [4, 16])
+@pytest.mark.parametrize("extra_slots", [4, 8])
+def test_scores_copies_entry_matches_reference_across_ranks(
+    tokens, extra_slots, from_logits
+):
+    """With hot-expert copy slots (e.g. 4 or 8 copies/rank = 32 or 64 total copies),
+    every hit expert is executed on exactly one of its holders (primary or copy)
+    and the sum across all 8 ranks matches the 512-expert reference. The router
+    input is the softmax scores, or the bf16 logits they come from."""
+    _needs("tpu")
+    rng = np.random.default_rng(tokens * 100 + extra_slots)
+    ranks, owned, hidden, inter, topk = 8, 64, 512, 256, 10
+    n_global = ranks * owned
+    slots = owned + extra_slots
+    x = jnp.asarray(rng.standard_normal((tokens, hidden)), jnp.bfloat16)
+    logits = rng.standard_normal((tokens, n_global)).astype(np.float32)
+    logits = logits - logits.max(axis=1, keepdims=True)
+    if from_logits:
+        router_input = jnp.asarray(logits, jnp.bfloat16)
+        scores = jax.nn.softmax(router_input.astype(jnp.float32), axis=-1)
+    else:
+        exp = np.exp(logits)
+        scores = jnp.asarray(exp / exp.sum(axis=1, keepdims=True), jnp.float32)
+        router_input = scores
+    w13_all, s13_all, w2_all, s2_all = _weights(rng, n_global, hidden, inter)
+
+    prim = np.array([g // owned for g in range(n_global)], dtype=np.int32)
+    copy = np.full(n_global, -1, dtype=np.int32)
+    order = []
+    cores = [list(range(r * owned, (r + 1) * owned)) for r in range(ranks)]
+    for r in range(ranks):
+        for j in range(extra_slots):
+            g = ((r + 1) % ranks) * owned + j
+            copy[g] = r
+            cores[r].append(g)
+            order.append(g)
+
+    hot, hprim, hcopy = (np.asarray(t) for t in kernel.hot_tables(prim, copy, order))
+    hot1h = kernel.hot_onehot(hot)
+    prim_j = jnp.asarray(prim, jnp.int32)
+    copy_j = jnp.asarray(copy, jnp.int32)
+
+    total_out = jnp.zeros((tokens, hidden), jnp.float32)
+    for r in range(ranks):
+        gid = np.asarray(cores[r], dtype=np.int32)
+        tab = jnp.asarray(
+            kernel.pack_tables(
+                r * owned,
+                gid,
+                hot,
+                hprim,
+                hcopy,
+                np.asarray(kernel.slot_table(gid, slots)),
+            ),
+            jnp.int32,
+        )
+        part = kernel.moe_lowtok(
+            x,
+            router_input,
+            w13_all[gid],
+            s13_all[gid],
+            w2_all[gid],
+            s2_all[gid],
+            jnp.int32(r * owned),
+            tab,
+            prim_j,
+            copy_j,
+            hot1h,
+            topk=topk,
+            ranks=ranks,
+            owned=owned,
+            has_copies=True,
+            from_logits=from_logits,
+        )
+        total_out = total_out + part.astype(jnp.float32)
+
+    w, ids = _router(scores, topk)
+    want = _reference(x, ids, w, w13_all, s13_all, w2_all, s2_all)
+    _assert_close(total_out.astype(jnp.bfloat16), want, 2.5e-2)
+
+
+def test_hot_order_refuses_an_expert_without_a_copy():
+    """An ordered expert with no copy would be served on its primary and also
+    assigned a holder, so its contribution would be added twice."""
+    prim = np.repeat(np.arange(8, dtype=np.int32), 64)
+    copy = np.full(512, -1, np.int32)
+    copy[[3, 70]] = [1, 2]
+    hot, _, hcopy = kernel.hot_tables(prim, copy, [70, 3])
+    assert np.asarray(hot)[:2].tolist() == [70, 3]
+    assert np.asarray(hcopy)[:2].tolist() == [2, 1]
+    with pytest.raises(ValueError, match=r"no copy: \[5\]"):
+        kernel.hot_tables(prim, copy, [70, 5, 3])
+
+
+def test_copy_tables_refuse_ids_outside_their_512_lanes():
+    gid = np.arange(64, dtype=np.int32)
+    assert np.asarray(kernel.slot_table(gid, 64))[63] == 63
+    with pytest.raises(ValueError, match=r"0\.\.511"):
+        kernel.slot_table(np.append(gid[:63], 512), 64)
+    with pytest.raises(ValueError, match="two local slots"):
+        kernel.slot_table(np.append(gid[:63], 0), 64)
+    hot = np.full(kernel.HOT_SLOTS, -1, np.int32)
+    hot[:2] = [511, 0]
+    assert np.asarray(kernel.hot_onehot(hot)).sum() == 2
+    hot[2] = 512
+    with pytest.raises(ValueError, match=r"-1 \(padding\) or in 0\.\.511"):
+        kernel.hot_onehot(hot)
+
+
+def _copies_args(tokens=4, experts=68, route_cols=512, nc=kernel.HOT_SLOTS):
+    x, w13, w2, s13, s2 = _shapes(tokens, 512, 256, experts)
+    length = kernel.table_offsets(experts, nc)[-1]
+    return (
+        x,
+        jax.ShapeDtypeStruct((tokens, route_cols), jnp.float32),
+        w13,
+        s13,
+        w2,
+        s2,
+        jax.ShapeDtypeStruct((), jnp.int32),
+        jax.ShapeDtypeStruct((length,), jnp.int32),
+        jax.ShapeDtypeStruct((route_cols,), jnp.int32),
+        jax.ShapeDtypeStruct((route_cols,), jnp.int32),
+        jax.ShapeDtypeStruct((route_cols, nc), jnp.bfloat16),
+    )
+
+
+@pytest.mark.parametrize(
+    "route_cols, ranks, owned, match",
+    [
+        (512, 8, 64, None),
+        (256, 8, 64, "serves 512 global experts"),
+        (512, kernel.HOT_SLOTS + 1, 64, "0 < ranks <= 128"),
+        (512, 8, 0, "0 < owned <= 68"),
+        (512, 4, 64, "ranks x owned = 512"),
+    ],
+)
+def test_the_copies_entry_refuses_layouts_its_tables_cannot_index(
+    interpret, route_cols, ranks, owned, match
+):
+    def call(*args):
+        return kernel.moe_lowtok(
+            *args, topk=10, ranks=ranks, owned=owned, has_copies=True
+        )
+
+    args = _copies_args(route_cols=route_cols)
+    if match is None:
+        assert jax.eval_shape(call, *args).shape == (4, 512)
+    else:
+        with pytest.raises(ValueError, match=match):
+            jax.eval_shape(call, *args)
+
+
+def test_the_ids_entry_refuses_a_routing_table_narrower_than_its_slots(interpret):
+    x, w13, w2, s13, s2 = _shapes(4, 512, 256, 136)
+    narrow = jax.ShapeDtypeStruct((4, 64), jnp.float32)
+    with pytest.raises(ValueError, match="do not cover the 136 weight slots"):
+        jax.eval_shape(kernel.moe_lowtok, x, narrow, w13, s13, w2, s2)
+    # 68 slots read lanes 0..67 of a 64-column table padded to 128 lanes.
+    x, w13, w2, s13, s2 = _shapes(4, 512, 256, 68)
+    out = jax.eval_shape(kernel.moe_lowtok, x, narrow, w13, s13, w2, s2)
+    assert out.shape == (4, 512)
+
+
+def test_the_kernel_streams_gate_and_up_as_two_units(interpret):
+    """Admission takes gate|up widths that are multiples of 512, the only
+    layout the kernel streams; another width is refused, not mis-streamed."""
+    route = jax.ShapeDtypeStruct((4, 8), jnp.float32)
+    x, w13, w2, s13, s2 = _shapes(4, 512, 256, 8)
+    out = jax.eval_shape(kernel.moe_lowtok, x, route, w13, s13, w2, s2)
+    assert out.shape == (4, 512)
+    x, w13, w2, s13, s2 = _shapes(4, 512, 384, 8)
+    with pytest.raises(ValueError, match="multiple of 256"):
+        jax.eval_shape(kernel.moe_lowtok, x, route, w13, s13, w2, s2)
