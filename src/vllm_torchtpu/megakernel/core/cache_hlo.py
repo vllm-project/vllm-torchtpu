@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 
 import jax.numpy as jnp
+from jax.typing import DTypeLike
 
 from .pool import POOL_KERNEL_NAMES, PoolLayout
 
@@ -25,7 +26,7 @@ from .pool import POOL_KERNEL_NAMES, PoolLayout
 _HLO_DTYPES = {"bfloat16": "bf16", "float16": "f16", "float32": "f32"}
 
 
-def _hlo_dtype(dtype: object) -> str:
+def _hlo_dtype(dtype: DTypeLike) -> str:
     """HLO primitive type name of `dtype` (e.g. `float8_e4m3fn` -> `f8e4m3fn`)."""
     name = jnp.dtype(dtype).name
     if name.startswith("float8_"):

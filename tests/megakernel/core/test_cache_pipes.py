@@ -23,6 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax._src import dispatch
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -319,8 +320,11 @@ def test_flat_pooled_step_checks_ckpt_bounds_in_kernel_io_paths(
     with pytest.raises((ValueError, jax.errors.JaxRuntimeError), match=msg):
         jax.block_until_ready(flat_fn(*c.flat_args(c.pools(), *meta)))
     # The failed callback's error stays in JAX's effect tokens, and every later
-    # computation with effects would re-raise it: reset them.
+    # computation with effects would re-raise it: reset them. A kernel that was
+    # interpreted while the callback failed leaves TPU interpret mode's global
+    # shared memory uncleaned, which later kernels would trip on: reset it too.
     dispatch.runtime_tokens.clear()
+    pltpu.reset_tpu_interpret_mode_state()
     jax.block_until_ready(flat_fn(*c.flat_args(c.pools(), *c.meta())))
     if T > 1:  # trace-time shape admission: ckpt_indices narrower than T
         narrow = c.meta(ckpt=np.asarray(c.ckpt)[..., :1])
