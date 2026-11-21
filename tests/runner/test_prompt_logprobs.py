@@ -86,11 +86,14 @@ def _runner(max_logprobs=3, **overrides):
     return runner
 
 
-def _run_steps(runner, schedule, num_tokens_padded=None):
+def _run_steps(runner, schedule, num_tokens_padded=None, fill_late=False):
     """Plan each step's chunks (each a dict req_id -> scheduled tokens, in batch
-    order), score them and emit; return what each step completed."""
+    order), score them, prepare and fill their output; return what each step
+    completed. With `fill_late`, every step is filled, in order, after the last
+    one is prepared: the output thread can fall behind the runner's thread that
+    far under async scheduling."""
     computed = dict.fromkeys(PROMPTS, 0)
-    completed_per_step = []
+    pending_per_step, completed_per_step = [], []
     for step in schedule:
         runner.input_batch.req_ids = [r for chunk in step for r in chunk]
         runner.input_batch.num_computed_tokens_cpu = np.array(
@@ -121,17 +124,24 @@ def _run_steps(runner, schedule, num_tokens_padded=None):
             start_index += len(req_ids)
         with torch.compiler.set_stance("force_eager"):
             TPUModelRunner._score_prompt_logprobs(runner, chunks)
-        completed_per_step.append(
-            prompt_logprobs.emit(
-                [chunk for chunk, _ in chunks],
-                runner.requests,
-                runner.num_prompt_logprobs,
-            )
+        pending = prompt_logprobs.prepare(
+            [chunk for chunk, _ in chunks], runner.requests, runner.num_prompt_logprobs
         )
+        if pending is not None:
+            pending.copy_to_host()
+        pending_per_step.append(pending)
+        if not fill_late:
+            completed_per_step.append(_fill(pending))
         for chunk_tokens in step:
             for req_id, num_tokens in chunk_tokens.items():
                 computed[req_id] += num_tokens
+    if fill_late:
+        completed_per_step = [_fill(p) for p in pending_per_step]
     return completed_per_step
+
+
+def _fill(pending):
+    return {} if pending is None else pending.fill()
 
 
 def _expected(req_id, num_logprobs):
@@ -164,12 +174,16 @@ def _expected(req_id, num_logprobs):
         ),
     ],
 )
-def test_prompt_logprobs_match_log_softmax(schedule, completing_step, max_logprobs):
+@pytest.mark.parametrize("fill_late", [False, True])
+def test_prompt_logprobs_match_log_softmax(
+    schedule, completing_step, max_logprobs, fill_late
+):
     """Row i holds the logprob of prompt token i + 1 from hidden state i, the
-    top-k and the rank; returned once, when the prompt completes."""
+    top-k and the rank; returned once, when the prompt completes, however far
+    the fills lag the steps."""
     runner = _runner(max_logprobs)
 
-    completed_per_step = _run_steps(runner, schedule)
+    completed_per_step = _run_steps(runner, schedule, fill_late=fill_late)
 
     for step, completed in enumerate(completed_per_step):
         expected = set(NUM_PROMPT_LOGPROBS) if step == completing_step else set()

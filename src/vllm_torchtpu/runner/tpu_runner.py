@@ -5910,13 +5910,19 @@ class TPUModelRunner(GPUModelRunner):
 
         next_tokens_tpu = None
         copy_state = None
+        pending_prompt_logprobs = prompt_logprobs.prepare(
+            state.prompt_logprobs_chunks, self.requests, self.num_prompt_logprobs
+        )
         if combined_selected_tokens:
             with self._stage_timing.stage("sampled_token_d2h"):
                 copy_state = AsyncTPUCopyState.from_device_chunks(
                     combined_selected_tokens,
                     combined_selected_tokens_real_lens,
                     logprobs=logprobs_chunks,
+                    prompt_logprobs=pending_prompt_logprobs,
                 )
+        # Prompt rows come only from steps that sample.
+        assert copy_state is not None or pending_prompt_logprobs is None
 
         if self.scheduler_config.async_scheduling:
             self._modify_prev_results()
@@ -6144,11 +6150,7 @@ class TPUModelRunner(GPUModelRunner):
                 req_id_to_index=dict(self.input_batch.req_id_to_index),
                 sampled_token_ids=[],  # Filled in AsyncTPUModelRunnerOutput get_output
                 logprobs=None,  # Filled in AsyncTPUModelRunnerOutput get_output
-                prompt_logprobs_dict=prompt_logprobs.emit(
-                    state.prompt_logprobs_chunks,
-                    self.requests,
-                    self.num_prompt_logprobs,
-                ),
+                prompt_logprobs_dict={},  # Filled in get_output, as logprobs
                 pooler_output=pooler_output,
                 kv_connector_output=kv_connector_output,
             )
