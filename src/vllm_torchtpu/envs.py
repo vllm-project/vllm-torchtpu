@@ -122,7 +122,6 @@ if TYPE_CHECKING:
     TPU_MOE_PREFILL_SEQUENCE_PARALLEL: bool = True
     TPU_MOE_PREFILL_SP_SHARED_GROUP: int = 1
     TPU_MOE_PREFILL_SP_FP8_WIRE: bool = True
-    TPU_MOE_PREFILL_SP_SHARDED_OUTPUT: bool = True
     TPU_EMBED_REPLICATED: bool = True
     TPU_EMBED_REPLICATED_DECODE: bool = True
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
@@ -1238,12 +1237,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_MOE_PREFILL_SEQUENCE_PARALLEL.
     "TPU_MOE_PREFILL_SP_FP8_WIRE": env_bool(
         "TPU_MOE_PREFILL_SP_FP8_WIRE", default=True
-    ),
-    # Under TPU_MOE_PREFILL_SEQUENCE_PARALLEL: return TP-sequence-sharded final
-    # hidden states from prefill buckets and select owned logits_indices before
-    # all-reducing only the sampled rows (skipping the full-batch all-gather).
-    "TPU_MOE_PREFILL_SP_SHARDED_OUTPUT": env_bool(
-        "TPU_MOE_PREFILL_SP_SHARDED_OUTPUT", default=True
     ),
     # Under TPU_MOE_PREFILL_SEQUENCE_PARALLEL: all-gather the vocab-parallel
     # embedding table at load and look tokens up locally, instead of the

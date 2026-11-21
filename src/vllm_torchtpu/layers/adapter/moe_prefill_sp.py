@@ -54,7 +54,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_gather,
-    tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.layers import vocab_parallel_embedding as vpe
@@ -116,8 +115,6 @@ DENSE_ATTR = "_tpu_sp_dense"
 DENSE_INDEX = "_tpu_sp_dense_index"
 DENSE_OP = "_tpu_sp_dense_op"
 EMBED_RS_ATTR = "_tpu_sp_embed_rs"
-SP_OUTPUT_ATTR = "_tpu_sp_sharded_output"
-SP_OUTPUT_TP_ATTR = "_tpu_sp_sharded_output_tp"
 OP_ATTR = "_tpu_sp_moe_op"
 SCALE_ATTR = "_tpu_sp_routed_scale"
 
@@ -563,44 +560,6 @@ def _all_rows(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
     return tensor_model_parallel_all_gather(x, 0).narrow(0, 0, num_tokens)
 
 
-def sp_output_sharding(model: Any, num_tokens: int) -> int:
-    """Return TP shard factor (>1) when `model` emits SP-sharded prefill rows."""
-    if not (
-        envs.TPU_MOE_PREFILL_SEQUENCE_PARALLEL
-        and envs.TPU_MOE_PREFILL_SP_SHARDED_OUTPUT
-        and num_tokens > envs.bucket_gate_edge(MIN_TOKENS)
-    ):
-        return 1
-    backbone = getattr(model, "model", None)
-    if not getattr(backbone, SP_OUTPUT_ATTR, False):
-        return 1
-    tp = int(getattr(backbone, SP_OUTPUT_TP_ATTR, 1))
-    return tp if tp > 1 and num_tokens % tp == 0 else 1
-
-
-def sp_output_rank() -> torch.Tensor:
-    return fused_moe_ep.rank_operand()
-
-
-def select_sp_hidden_states(
-    hidden_states: torch.Tensor,
-    indices_do_sample: torch.Tensor,
-    rank: torch.Tensor,
-) -> torch.Tensor:
-    """Gather global rows from TP-sharded hidden states `[R, H] -> [M, H]`."""
-    rows_local = hidden_states.shape[0]
-    rank_id = rank.reshape(1).to(torch.int32)
-    lo = rank_id * rows_local
-    hi = lo + rows_local
-    idx = indices_do_sample.to(torch.int32)
-    owned = (idx >= lo) & (idx < hi)
-    local_idx = torch.where(owned, idx - lo, torch.zeros_like(idx))
-    selected = torch.index_select(hidden_states, 0, local_idx)
-    # Avoid multiplying selected * owned: unowned rows may contain NaN/Inf.
-    selected = torch.where(owned.unsqueeze(1), selected, torch.zeros_like(selected))
-    return tensor_model_parallel_all_reduce(selected)
-
-
 def _zero_rank_dependency(tensor: torch.Tensor, rank: torch.Tensor) -> torch.Tensor:
     # Avoid omitting this zero-delta dependency: without tying rank to the
     # shared-expert output, XLA schedules shared_expert_blocked_down after
@@ -806,9 +765,7 @@ def patched_model_forward(
         else:
             hidden_states, residual = layer(positions, hidden_states, residual, None)
     hidden_states, _ = self.norm(hidden_states, residual)
-    if hidden_states.shape[0] != num_tokens and not getattr(
-        self, SP_OUTPUT_ATTR, False
-    ):
+    if hidden_states.shape[0] != num_tokens:
         hidden_states = _all_rows(hidden_states, num_tokens)
     return hidden_states
 
@@ -1058,22 +1015,12 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             decode=envs.TPU_EMBED_REPLICATED_DECODE,
         )
     )
-    sp_sharded_output = bool(
-        envs.TPU_MOE_PREFILL_SP_SHARDED_OUTPUT
-        and getattr(vllm_config.model_config, "runner_type", None) != "pooling"
-        and getattr(vllm_config, "speculative_config", None) is None
-        and getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) == 1
-        and getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
-        == 1
-    )
-    setattr(backbone, SP_OUTPUT_ATTR, sp_sharded_output)
-    setattr(backbone, SP_OUTPUT_TP_ATTR, tp)
     setattr(backbone, KEEP_ATTR, True)
     n = len(layers) - first
     logger.info(
         "TPU_MOE_PREFILL_SEQUENCE_PARALLEL: %d MoE layers (layers %d..%d) and "
-        "%d dense layers (dense_group=%d, embed_rs=%s, embed_replicated=%s, "
-        "sp_sharded_output=%s) armed, buckets > %d tokens, tp=%d",
+        "%d dense layers (dense_group=%d, embed_rs=%s, embed_replicated=%s) "
+        "armed, buckets > %d tokens, tp=%d",
         n,
         backbone.start_layer + first,
         backbone.end_layer - 1,
@@ -1081,7 +1028,6 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
         dense_group,
         embed_rs,
         embed_replicated,
-        sp_sharded_output,
         envs.bucket_gate_edge(MIN_TOKENS),
         tp,
     )

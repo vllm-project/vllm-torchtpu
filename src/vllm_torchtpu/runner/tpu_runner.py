@@ -90,7 +90,6 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batche
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import (
     dcp_token_parallel_op,
-    moe_prefill_sp,
     small_all_reduce_op,
     token_padding,
 )
@@ -4049,33 +4048,13 @@ class TPUModelRunner(GPUModelRunner):
                         hidden_states,
                         layout_plan,
                     )
-                    sp_output = hidden_states.shape[0] != num_tokens_padded and (
-                        moe_prefill_sp.sp_output_sharding(self.model, num_tokens_padded)
-                        > 1
-                    )
                     if top_tokens:
-                        logits = (
-                            self.compute_selected_sp_top_tokens(
-                                hidden_states,
-                                logits_indices,
-                                moe_prefill_sp.sp_output_rank(),
-                            )
-                            if sp_output
-                            else self.compute_selected_top_tokens(
-                                hidden_states, logits_indices
-                            )
+                        logits = self.compute_selected_top_tokens(
+                            hidden_states, logits_indices
                         )
                     else:
-                        logits = (
-                            self.compute_selected_sp_logits(
-                                hidden_states,
-                                logits_indices,
-                                moe_prefill_sp.sp_output_rank(),
-                            )
-                            if sp_output
-                            else self.compute_selected_logits(
-                                hidden_states, logits_indices
-                            )
+                        logits = self.compute_selected_logits(
+                            hidden_states, logits_indices
                         )
                 elif top_tokens:
                     logits = self.compute_top_tokens_from_hidden_states(
@@ -5387,6 +5366,8 @@ class TPUModelRunner(GPUModelRunner):
                 arm_runner_models(self)
 
         if envs.TPU_MOE_PREFILL_SEQUENCE_PARALLEL:
+            from vllm_torchtpu.layers.adapter import moe_prefill_sp
+
             moe_prefill_sp.arm(self.model, self.vllm_config)
 
     def _initialize_pallas_kernels(self):
@@ -5769,14 +5750,7 @@ class TPUModelRunner(GPUModelRunner):
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
                 _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
-                if out.shape[0] != num_tokens and (
-                    moe_prefill_sp.sp_output_sharding(self.model, num_tokens) > 1
-                ):
-                    _ = self.compute_selected_sp_logits(
-                        out, _idx, moe_prefill_sp.sp_output_rank()
-                    )
-                else:
-                    _ = self.compute_selected_logits(out, _idx)
+                _ = self.compute_selected_logits(out, _idx)
             if not dp_lockstep:
                 synchronize_tensors(out)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -6075,20 +6049,13 @@ class TPUModelRunner(GPUModelRunner):
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_selected_logits"):
             for num_tokens in self.num_tokens_paddings:
-                sp_tp = moe_prefill_sp.sp_output_sharding(self.model, num_tokens)
-                hidden_rows = num_tokens // sp_tp if sp_tp > 1 else num_tokens
                 dummy_hidden = torch.zeros(
-                    (hidden_rows, hsize),
+                    (num_tokens, hsize),
                     dtype=self._hidden_states_dtype,
                 ).to(self.device)
-                sp_rank = moe_prefill_sp.sp_output_rank() if sp_tp > 1 else None
                 for num_reqs in self.num_reqs_paddings:
                     indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
-                    out = (
-                        self.compute_selected_sp_logits(dummy_hidden, indices, sp_rank)
-                        if sp_rank is not None
-                        else self.compute_selected_logits(dummy_hidden, indices)
-                    )
+                    out = self.compute_selected_logits(dummy_hidden, indices)
                     synchronize_tensors(out)
                     logger.info(
                         "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
@@ -6155,22 +6122,13 @@ class TPUModelRunner(GPUModelRunner):
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_selected_top_tokens"):
             for num_tokens in self.num_tokens_paddings:
-                sp_tp = moe_prefill_sp.sp_output_sharding(self.model, num_tokens)
-                hidden_rows = num_tokens // sp_tp if sp_tp > 1 else num_tokens
                 dummy_hidden = torch.zeros(
-                    (hidden_rows, hsize),
+                    (num_tokens, hsize),
                     dtype=self._hidden_states_dtype,
                 ).to(self.device)
-                sp_rank = moe_prefill_sp.sp_output_rank() if sp_tp > 1 else None
                 for num_reqs in self.num_reqs_paddings:
                     indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
-                    out = (
-                        self.compute_selected_sp_top_tokens(
-                            dummy_hidden, indices, sp_rank
-                        )
-                        if sp_rank is not None
-                        else self.compute_selected_top_tokens(dummy_hidden, indices)
-                    )
+                    out = self.compute_selected_top_tokens(dummy_hidden, indices)
                     synchronize_tensors(out)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
@@ -7904,20 +7862,6 @@ class TPUModelRunner(GPUModelRunner):
         return self.model.compute_logits(selected)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def compute_selected_sp_logits(
-        self,
-        hidden_states: torch.Tensor,
-        indices_do_sample: torch.Tensor,
-        rank: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.is_pooling_model:
-            return torch.empty((0,), device=hidden_states.device)
-        selected = moe_prefill_sp.select_sp_hidden_states(
-            hidden_states, indices_do_sample, rank
-        )
-        return self.model.compute_logits(selected)
-
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits_from_hidden_states(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -7934,19 +7878,6 @@ class TPUModelRunner(GPUModelRunner):
     ) -> torch.Tensor:
         assert self._greedy_head_owner is not None
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
-        return greedy_top_tokens.top_tokens(self._greedy_head_owner, selected)
-
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def compute_selected_sp_top_tokens(
-        self,
-        hidden_states: torch.Tensor,
-        indices_do_sample: torch.Tensor,
-        rank: torch.Tensor,
-    ) -> torch.Tensor:
-        assert self._greedy_head_owner is not None
-        selected = moe_prefill_sp.select_sp_hidden_states(
-            hidden_states, indices_do_sample, rank
-        )
         return greedy_top_tokens.top_tokens(self._greedy_head_owner, selected)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
