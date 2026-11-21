@@ -10304,18 +10304,8 @@ class TPUModelRunner(GPUModelRunner):
         device: torch.device,
         pad_top_k: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if pad_top_k:
-            # Candidate verify: padding rows keep top_k = pad_top_k so every
-            # row has a top-k cutoff. Not memoized (rare, off by default).
-            return TPUModelRunner._padded_sampling_params_uncached(
-                self,
-                cur_start_idx,
-                cur_end_idx,
-                padded_num_reqs,
-                dtype,
-                device,
-                pad_top_k=pad_top_k,
-            )
+        # Candidate verify passes pad_top_k: padding rows keep that top_k so
+        # every row has a top-k cutoff.
         if envs.VLLM_TPU_SAMPLING_PARAMS_MEMO:
             # The result is a function of these arguments and the requests'
             # host sampling values only: while those bytes repeat (steady
@@ -10323,7 +10313,7 @@ class TPUModelRunner(GPUModelRunner):
             # the ~10 CPU tensor ops and three uploads below.
             ib = self.input_batch
             s, e = cur_start_idx, cur_end_idx
-            slot = (s, e, padded_num_reqs, dtype, str(device))
+            slot = (s, e, padded_num_reqs, dtype, str(device), pad_top_k)
             values = (
                 ib.temperature_cpu[s:e].tobytes(),
                 ib.top_k_cpu[s:e].tobytes(),
@@ -10334,14 +10324,26 @@ class TPUModelRunner(GPUModelRunner):
             if hit is not None and hit[0] == values:
                 return hit[1]
             out = TPUModelRunner._padded_sampling_params_uncached(
-                self, cur_start_idx, cur_end_idx, padded_num_reqs, dtype, device
+                self,
+                cur_start_idx,
+                cur_end_idx,
+                padded_num_reqs,
+                dtype,
+                device,
+                pad_top_k=pad_top_k,
             )
             if len(memo) > 16:
                 memo.clear()
             memo[slot] = (values, out)
             return out
         return TPUModelRunner._padded_sampling_params_uncached(
-            self, cur_start_idx, cur_end_idx, padded_num_reqs, dtype, device
+            self,
+            cur_start_idx,
+            cur_end_idx,
+            padded_num_reqs,
+            dtype,
+            device,
+            pad_top_k=pad_top_k,
         )
 
     def _padded_sampling_params_uncached(
@@ -10543,8 +10545,10 @@ class TPUModelRunner(GPUModelRunner):
         ):
             return False
         n = self.input_batch.num_reqs
-        temps = self.input_batch.temperature_cpu_tensor[:n]
-        top_k = self.input_batch.top_k_cpu_tensor[:n]
+        # The numpy views of the host sampling arrays: a few us per step
+        # where the CPU tensor ops cost tens.
+        temps = self.input_batch.temperature_cpu[:n]
+        top_k = self.input_batch.top_k_cpu[:n]
         ok = bool(((temps == 0) | ((top_k >= 1) & (top_k <= MAX_TOP_K))).all())
         if ok:
             logger.info_once(

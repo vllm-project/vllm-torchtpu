@@ -312,8 +312,8 @@ def test_candidates_only_when_every_request_keeps_few_tokens(change, expected):
             all_greedy=change == "all_greedy",
             max_num_logprobs=5 if change == "logprobs" else None,
             num_reqs=3,
-            temperature_cpu_tensor=temps,
-            top_k_cpu_tensor=top_k,
+            temperature_cpu=temps.numpy(),  # InputBatch's numpy views
+            top_k_cpu=top_k.numpy(),
         ),
     )
     scheduler_output = types.SimpleNamespace(
