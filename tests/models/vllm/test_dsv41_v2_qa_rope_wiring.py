@@ -86,6 +86,32 @@ def test_rope_rows_gathered_once_per_stage(monkeypatch):
         attn._rope_rows(positions.long())
 
 
+@pytest.mark.parametrize("sparse_core", [False, True])
+def test_paired_rope_rows_route(monkeypatch, sparse_core):
+    """Target layers gather paired rows on the TensorCore; layers that set
+    ``rope_rows_on_sparse_core`` (DSpark draft) fetch them on SparseCore."""
+    attn, _ = _attn(monkeypatch)
+    used = []
+
+    def paired(name):
+        def build():
+            def op(pairs, positions):
+                used.append(name)
+                return pairs[positions >> 1, :1]
+
+            return op
+
+        return build
+
+    monkeypatch.setattr(preprocess_ops, "rope_paired_rows", paired("tc"))
+    monkeypatch.setattr(preprocess_ops, "rope_paired_rows_sc", paired("sc"))
+    attn._tpu_rope_pairs = torch.arange(32.0).reshape(8, 4)
+    if sparse_core:
+        attn.rope_rows_on_sparse_core = True
+    attn._rope_rows(torch.tensor([3, 5], dtype=torch.int32))
+    assert used == ["sc" if sparse_core else "tc"]
+
+
 def test_dspark_context_kv_uses_kv_only_mode(monkeypatch):
     attn, calls = _attn(monkeypatch)
     inserted = []

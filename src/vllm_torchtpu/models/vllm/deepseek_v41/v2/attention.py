@@ -579,6 +579,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     # once the KV cache is bound (`bind_compressor_layout`).
     _compressor_layout_fields: tuple[int, ...] | None = None
     _swa_query_group_size = 1
+    # Fetch the RoPE rows on SparseCore (`_rope_rows`). That pays only beside
+    # independent TensorCore work; at a stage program's entry the first layer
+    # consumes the rows at once, so the target layers gather on the TensorCore.
+    rope_rows_on_sparse_core = False
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
@@ -809,8 +813,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             return cached[2]
         # Set at load (runner.utils.relayout_rope_tables) for 64-wide tables.
         pairs = getattr(self, "_tpu_rope_pairs", None)
-        if pairs is not None:
+        if pairs is not None and self.rope_rows_on_sparse_core:
             rows = preprocess_ops.rope_paired_rows_sc()(pairs, positions)
+        elif pairs is not None:
+            rows = preprocess_ops.rope_paired_rows()(pairs, positions)
         else:
             rows = preprocess_ops.rope_rows()(table, positions)
         if stage_cache is not None:
@@ -2040,6 +2046,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             # Register before TorchDynamo captures the first model forward.
             eps = self.kv_norm.variance_epsilon
             preprocess_ops.rope_rows()
+            preprocess_ops.rope_paired_rows()
             preprocess_ops.rope_paired_rows_sc()
             preprocess_ops.qa_rope(True, eps)
             preprocess_ops.qa_rope(False, eps)  # DSpark context KV

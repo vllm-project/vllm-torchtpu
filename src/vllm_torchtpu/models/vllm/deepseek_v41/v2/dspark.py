@@ -222,6 +222,9 @@ class DSparkDeepseekV41Model(nn.Module):
                 raise ValueError("CSA2 supports DSpark blocks of at most 64 queries")
             layer.attn.non_causal_multi_token_decode = True
             layer.attn.dspark_block_size = int(dspark_block_size)
+            # The draft step has TensorCore work (main_proj) to hide the
+            # SparseCore row fetch behind.
+            layer.attn.rope_rows_on_sparse_core = True
             mark_dspark_draft_moe(layer.ffn.experts)
 
         compact_rope_caches(

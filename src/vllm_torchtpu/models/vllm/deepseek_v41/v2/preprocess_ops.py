@@ -92,6 +92,18 @@ def rope_rows() -> Any:
     )
 
 
+def rope_paired_rows() -> Any:
+    """``(pairs, positions) -> [T, rotary_dim]`` rows of a two-row-packed table,
+    fetched on the TensorCore."""
+    return _get(
+        "rope_paired_rows",
+        lambda: (
+            rope_gather.gather_paired_rows,
+            lambda pairs, pos: pairs.new_empty((pos.shape[0], pairs.shape[1] // 2)),
+        ),
+    )
+
+
 def rope_paired_rows_sc() -> Any:
     """``(pairs, positions) -> [T, rotary_dim]`` rows of a two-row-packed table,
     fetched on SparseCore (async offload) where the chip has one."""
