@@ -21,6 +21,9 @@ from .errors import MegakernelPluginError, MegakernelUnsupported
 from .hooks import StepContext, is_suppressed, suppressed
 
 _DRIVER_EXPORTS = frozenset({"ProgramDriver"})
+_JAX_BRIDGE_EXPORTS = frozenset(
+    {"build_jax_step_op", "make_typed_step_wrapper", "sharded_jax_callable"}
+)
 
 
 def _is_megakernel_requested(runner: Any = None) -> bool:
@@ -58,6 +61,10 @@ def __getattr__(name: str) -> Any:
         from .backbone import find_backbone
 
         return find_backbone
+    if name in _JAX_BRIDGE_EXPORTS:
+        from . import jax_bridge
+
+        return getattr(jax_bridge, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -66,9 +73,12 @@ __all__ = [
     "MegakernelUnsupported",
     "ProgramDriver",
     "StepContext",
+    "build_jax_step_op",
     "find_backbone",
     "guard_weight_update",
     "is_suppressed",
+    "make_typed_step_wrapper",
     "maybe_create",
+    "sharded_jax_callable",
     "suppressed",
 ]
