@@ -49,22 +49,17 @@ def _stage_dtype(dtype, lane_blocks):
     return dtype if lane_blocks % _stage_align(dtype) == 0 else jnp.float32
 
 
-def _weighted_sum_vmem_bytes(
-    *, tokens_per_tile, top_k, lane_blocks, hidden, rows_dtype, out_dtype, stage_dtype
-):
-    """VMEM of one weighted-sum step: the double-buffered rows and output
-    blocks and the staging tile, each as VMEM holds it (its two minor
-    dimensions padded to the chip's tiling: fp8 rows of a few lane blocks
-    take a whole 32-sublane tile)."""
+def _weighted_sum_vmem_bytes(blocks, scratch):
+    """VMEM of one weighted-sum step: each (shape, dtype) in `blocks` (the
+    pipelined input and output blocks) twice, as the pipeline double-buffers
+    it, and each in `scratch` once. Every array is counted as VMEM holds it,
+    its two minor dimensions padded to the chip's tiling: fp8 rows of a few
+    lane blocks take a whole 32-sublane tile, and a [tokens, top_k] f32
+    table a whole row of lanes per token."""
     info = pltpu.get_tpu_info()
-    rows = (tokens_per_tile, top_k, lane_blocks, LANES)
-    return (
-        2 * device.array_vmem_bytes(rows, rows_dtype, info)
-        + 2 * device.array_vmem_bytes((tokens_per_tile, hidden), out_dtype, info)
-        + device.array_vmem_bytes(
-            (tokens_per_tile * lane_blocks, LANES), stage_dtype, info
-        )
-    )
+    return sum(
+        2 * device.array_vmem_bytes(shape, dtype, info) for shape, dtype in blocks
+    ) + sum(device.array_vmem_bytes(shape, dtype, info) for shape, dtype in scratch)
 
 
 def _weighted_sum_body(
@@ -181,22 +176,23 @@ def weighted_sum(
             f"is stored {SUBLANES} sublanes at a time"
         )
     stage_dtype = _stage_dtype(dtype, lane_blocks)
-    # The step's blocks with headroom, never over the chip's budget.
-    needed = _weighted_sum_vmem_bytes(
-        tokens_per_tile=tokens_per_tile,
-        top_k=top_k,
-        lane_blocks=lane_blocks,
-        hidden=hidden,
-        rows_dtype=rows.dtype,
-        out_dtype=out_dtype,
-        stage_dtype=stage_dtype,
-    )
-    vmem_limit = min(2 * needed, device.vmem_limit())
-    table = pl.BlockSpec((tokens_per_tile, top_k), lambda i: (i, 0))
     tables = [weights]
     if with_scales:
         assert scales is not None
         tables = [scales.reshape(tokens_per_shard, top_k)] + tables
+    table_block = (tokens_per_tile, top_k)
+    rows_block = (tokens_per_tile, top_k, lane_blocks, lanes)
+    out_block = (tokens_per_tile, hidden)
+    coefficients = (table_block, jnp.float32)
+    accumulator = ((tokens_per_tile * lane_blocks, lanes), stage_dtype)
+    # The step's blocks with headroom, never over the chip's budget.
+    needed = _weighted_sum_vmem_bytes(
+        [(table_block, t.dtype) for t in tables]
+        + [(rows_block, rows.dtype), (out_block, out_dtype)],
+        [coefficients, accumulator],
+    )
+    vmem_limit = min(2 * needed, device.vmem_limit())
+    table = pl.BlockSpec(table_block, lambda i: (i, 0))
 
     def body(*refs):
         return _weighted_sum_body(
@@ -211,12 +207,8 @@ def weighted_sum(
         )
 
     rows = rows.reshape(tokens_per_shard, top_k, lane_blocks, lanes)
-    rows_spec = pl.BlockSpec(
-        (tokens_per_tile, top_k, lane_blocks, lanes), lambda i: (i, 0, 0, 0)
-    )
-    out_spec = pl.BlockSpec((tokens_per_tile, hidden), lambda i: (i, 0))
-    coefficients = pltpu.VMEM((tokens_per_tile, top_k), jnp.float32)
-    accumulator = pltpu.VMEM((tokens_per_tile * lane_blocks, lanes), stage_dtype)
+    rows_spec = pl.BlockSpec(rows_block, lambda i: (i, 0, 0, 0))
+    out_spec = pl.BlockSpec(out_block, lambda i: (i, 0))
     out_shape = jax.ShapeDtypeStruct((tokens_per_shard, hidden), out_dtype)
     program = pl.pallas_call(
         body,
@@ -224,7 +216,7 @@ def weighted_sum(
         grid=(tokens_per_shard // tokens_per_tile,),
         in_specs=[table] * len(tables) + [rows_spec],
         out_specs=out_spec,
-        scratch_shapes=[coefficients, accumulator],
+        scratch_shapes=[pltpu.VMEM(*coefficients), pltpu.VMEM(*accumulator)],
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_limit),
         name=f"fused_ep_combine_sum_t{tokens_per_tile}u{unroll}"
         f"{'' if with_scales else '_bf16'}"

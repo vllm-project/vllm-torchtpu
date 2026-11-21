@@ -25,6 +25,8 @@ a program. The layer's own TPU test, which comes with the layer, runs it end
 to end on an eight-core TPU host.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -32,7 +34,7 @@ import pytest
 from jax._src.pallas.mosaic import tpu_info
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.fused_moe.v3 import combine, select_kernel
+from vllm_torchtpu.kernels.fused_moe.v3 import combine, device, select_kernel
 
 LANES = 128
 
@@ -358,40 +360,60 @@ def _off_fraction(got, want):
     return float((np.abs(got - want) > 2.0**-7 * np.abs(want) + 1e-5).mean())
 
 
+def _vmem_limit(program, *args):
+    """The vmem_limit_bytes of the one Pallas program `program` traces."""
+    jaxpr = jax.make_jaxpr(program)(*args)
+    calls = [e for e in jaxpr.eqns if e.primitive.name == "pallas_call"]
+    assert len(calls) == 1
+    return calls[0].params["compiler_params"].vmem_limit_bytes
+
+
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    "hidden,rows_dtype,rows_sublanes",
+    "hidden,tokens,rows_dtype,rows_sublanes",
     [
-        (4096, jnp.float8_e4m3fn, 32),
-        (1024, jnp.float8_e4m3fn, 32),
-        (1024, jnp.bfloat16, 16),
+        (4096, 128, jnp.float8_e4m3fn, 32),
+        (1024, 128, jnp.float8_e4m3fn, 32),
+        (1024, 128, jnp.bfloat16, 16),
+        (4096, 256, jnp.bfloat16, 32),
     ],
-    ids=["fp8_4096", "fp8_1024", "bf16_1024"],
+    ids=["fp8_4096", "fp8_1024", "bf16_1024", "bf16_4096_capped"],
 )
-def test_weighted_sum_counts_its_blocks_as_vmem_holds_them(
-    interpret, hidden, rows_dtype, rows_sublanes
+def test_weighted_sum_sets_its_vmem_limit_from_every_block_as_vmem_holds_them(
+    interpret, hidden, tokens, rows_dtype, rows_sublanes
 ):
-    """The VMEM limit is twice the step's blocks as TPU7x tiles them: a
-    token's rows are lane blocks deep, padded to the dtype's sublane tile,
-    so 8 blocks of fp8 (hidden 1024) take 32 sublanes, four times their
-    size. At hidden 4096 (32 blocks) nothing is padded."""
-    tokens, top_k, f32 = 128, 10, 4
+    """The program's VMEM limit is twice its step's arrays as TPU7x tiles
+    them, capped at the chip's budget. A token's rows are lane blocks deep,
+    padded to the dtype's sublane tile, so 8 blocks of fp8 (hidden 1024) take
+    32 sublanes, four times their size; at hidden 4096 (32 blocks) nothing is
+    padded. The [tokens, top_k] weight and scale tables (fp8 rows only) and
+    the coefficient scratch take a whole row of lanes per token. The last
+    case needs more than the budget and gets the budget."""
+    top_k, f32 = 10, 4
     lane_blocks = hidden // LANES
-    stage_dtype = combine._stage_dtype(jnp.float32, lane_blocks)
-    assert stage_dtype == jnp.float32
-    got = combine._weighted_sum_vmem_bytes(
-        tokens_per_tile=tokens,
-        top_k=top_k,
-        lane_blocks=lane_blocks,
-        hidden=hidden,
-        rows_dtype=rows_dtype,
-        out_dtype=jnp.bfloat16,
-        stage_dtype=stage_dtype,
-    )
+    assert combine._stage_dtype(jnp.float32, lane_blocks) == jnp.float32
+    with_scales = rows_dtype == jnp.float8_e4m3fn
     rows = tokens * top_k * rows_sublanes * LANES * jnp.dtype(rows_dtype).itemsize
     out = tokens * hidden * 2
     staging = tokens * lane_blocks * LANES * f32
-    assert got == 2 * rows + 2 * out + staging
+    table = tokens * LANES * f32
+    tables = 2 if with_scales else 1
+    needed = 2 * rows + 2 * out + staging + 2 * tables * table + table
+    budget = int(_tpu7x().vmem_capacity_bytes * device.VMEM_FRACTION)
+    got = _vmem_limit(
+        functools.partial(
+            combine.weighted_sum,
+            tokens_per_shard=tokens,
+            hidden=hidden,
+            out_dtype=jnp.bfloat16,
+            tokens_per_tile=tokens,
+        ),
+        jax.ShapeDtypeStruct((tokens * top_k, lane_blocks, LANES), rows_dtype),
+        jax.ShapeDtypeStruct((tokens * top_k,), jnp.float32) if with_scales else None,
+        jax.ShapeDtypeStruct((tokens, top_k), jnp.float32),
+    )
+    assert got == min(2 * needed, budget)
+    assert (2 * needed > budget) == (tokens == 256)
 
 
 @pytest.mark.cpu_test
