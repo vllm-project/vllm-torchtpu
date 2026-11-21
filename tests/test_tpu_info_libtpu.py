@@ -161,14 +161,16 @@ def test_get_chip_version_resolves_generations(accelerator_type, expected):
 @pytest.mark.parametrize(
     ("tpu_type", "expected_cores"),
     [
-        (None, 2),
-        ("", 2),
+        (None, None),
+        ("", None),
+        ("unknown-type", None),
         ("v5litepod-16", 1),
         ("v5e-8", 1),
         ("v6e-8", 1),
         ("tpu8t-16", 1),
         ("v8t-4", 1),
         ("TPU v8t", 1),
+        ("v4-8", 2),
         ("v5p-8", 2),
         ("tpu7x-8", 2),
         ("v7x-16", 2),
