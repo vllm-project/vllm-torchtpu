@@ -67,8 +67,6 @@ def _mesh(ep=EP, platform="tpu", device_kind="TPU7x"):
 
 @pytest.fixture
 def groups(monkeypatch):
-    from vllm_torchtpu.layers.adapter import sequence_parallel
-
     # An engine without a drafter: the row threshold follows the model alone.
     monkeypatch.setattr(sequence_parallel, "_HAS_DRAFTER", False)
 
@@ -167,8 +165,6 @@ def test_a_model_that_follows_the_step_form_meets_the_few_token_kernel(
     kernel and the few-token kernel (448-row cap) leave rows to neither under
     TP; once the Qwen3.5 model patch follows the form, the per-layout
     thresholds (512 at TP8, 64 at DP4 x TP2) meet the step gates (33, 32)."""
-    from vllm_torchtpu.layers.adapter import sequence_parallel
-
     groups(*layout)
     dp, tp = layout
     monkeypatch.setattr(sequence_parallel, "_FOLLOWS_STEP_FORM", False)

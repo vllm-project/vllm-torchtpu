@@ -65,11 +65,6 @@ def test_pal_gate_q_interpreter_parity(m, cols):
     assert np.mean(np.abs(deq_pal - deq_ref)) < 5e-3
 
 
-# Two bf16 inputs and one fp8 output, double buffered, per element of a block.
-_BLOCK_BYTES = 10
-_VMEM_BUDGET = 16 << 20
-
-
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
     ("rows", "cols", "expected"),
@@ -123,18 +118,22 @@ def test_every_block_fits_the_vmem_budget(cols):
     """At every step the Qwen3.5 model patch sends the kernel (up to 8192
     rows, at the o_proj input width of TP 1, 2, 4 and 8) the block is legal
     and fits the budget; a step of up to 256 rows wider than 2048 columns runs
-    as one block where that fits, else at the largest legal tile that does."""
+    as one block where that fits, else at the largest legal tile that does.
+    The tile-selection cases pin the budget itself (204 rows fit at 8192
+    columns, 208 do not)."""
+    block_bytes = kernel._BLOCK_BYTES_PER_ELEMENT
+    budget = kernel._BLOCK_VMEM_BUDGET
     for rows in range(1, 8193):
         padded, block, step = kernel.plan_blocks(rows, cols)
         least = max(rows, 8)
         assert padded == least or (padded % 32 == 0 and padded - least < 32)
         assert _legal(block, padded) and _legal(step, block)
-        assert block * cols * _BLOCK_BYTES <= _VMEM_BUDGET, (rows, cols, block)
+        assert block * cols * block_bytes <= budget, (rows, cols, block)
         if padded <= 256 and cols > 2048:
             fitting = [
                 t
                 for t in range(1, padded + 1)
-                if _legal(t, padded) and t * cols * _BLOCK_BYTES <= _VMEM_BUDGET
+                if _legal(t, padded) and t * cols * block_bytes <= budget
             ]
             assert block == max(fitting), (rows, cols, block)
 
