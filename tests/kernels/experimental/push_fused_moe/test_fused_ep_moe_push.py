@@ -321,6 +321,41 @@ def test_tc_exchange_all_gather_equals_lax_all_gather(width):
     np.testing.assert_array_equal(np.asarray(tc)[0], np.asarray(data).reshape(-1))
 
 
+@pytest.mark.parametrize("t_local,topk", [(16, 6), (64, 6), (16, 3)])
+def test_decode_combine_matches_xla_epilogue(t_local, topk):
+    """At decode sizes the combine is the one-pass kernel; it gives v2's XLA
+    epilogue bit for bit, unwritten (NaN) mirror entries and repeated arrival
+    rows included."""
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
+        decode_combine_applies,
+    )
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.layer import (
+        _combine_arrivals_fs,
+    )
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import _combine_arrivals
+
+    recv_rows, lane_blocks, sublanes, tile_m = 480, 40, 773, 128
+    assert decode_combine_applies(t_local)
+    rng = np.random.default_rng(t_local * 10 + topk)
+    arrivals = jnp.asarray(
+        rng.normal(0, 4, (recv_rows, lane_blocks, 128)), jnp.float32
+    ).astype(FP8)
+    scales = rng.uniform(0.01, 2, (sublanes, tile_m)).astype(np.float32)
+    scales[rng.random(scales.shape) < 0.3] = np.nan
+    pos = rng.integers(0, recv_rows, (t_local, topk), dtype=np.int32)
+    mirror_pos = rng.integers(0, sublanes * tile_m, (t_local, topk), dtype=np.int32)
+    finite = np.isfinite(scales.reshape(-1)[mirror_pos])
+    mirror_pos = np.where(finite, mirror_pos, mirror_pos[finite][0])
+    weights = jnp.asarray(rng.uniform(0, 1, (t_local, topk)), jnp.float32)
+    args = (arrivals, jnp.asarray(scales), jnp.asarray(pos), jnp.asarray(mirror_pos))
+    got = jax.jit(_combine_arrivals_fs, static_argnums=5)(*args, weights, jnp.bfloat16)
+    want = jax.jit(_combine_arrivals, static_argnums=5)(*args, weights, jnp.bfloat16)
+    assert np.isfinite(np.asarray(got, np.float32)).all()
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
+    )
+
+
 def test_tc_exchange_row_gather_equals_take():
     """The exchange kernel's row copy is rows[idx] (repeats and every row
     of the source included) and leaves the exchange itself unchanged."""

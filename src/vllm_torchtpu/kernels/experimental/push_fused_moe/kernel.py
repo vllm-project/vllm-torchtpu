@@ -47,6 +47,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     COMBINE_GROUP,
     COMBINE_LEAD,
     COMBINE_PARITIES,
+    COMBINE_TOKENS,
     N_PREFETCH,
     N_PUSH_TABLES,
     N_SCALE_TABLES,
@@ -2034,5 +2035,152 @@ def build_combine_fs_kernel(**kwargs):
             fn = _COMBINE_CACHE.get(key)
             if fn is None:
                 fn = _build_combine_fs_kernel(**kwargs)
+                _COMBINE_CACHE[key] = fn
+    return fn
+
+
+def decode_combine_applies(t_local):
+    """Whether the one-pass decode combine serves this step's shape: below the
+    pipelined combine's floor, whole bf16 output tiles, and at most
+    COMBINE_TOKENS tokens -- what one step of the pipelined combine stages and
+    waits for at once (at the drafter's 240 rows x 3 the single wait on every
+    row never returned)."""
+    return (
+        not combine_step_tokens(t_local)
+        and t_local % COMBINE_GROUP == 0
+        and t_local <= COMBINE_TOKENS
+    )
+
+
+def _build_combine_decode_kernel(
+    *, t_local, topk, mirror_lanes, lane_blocks, wire_dtype, out_dtype
+):
+    """out[i] = sum_k scales[scl[i, k]] * w[i, k] * arrivals[pos[i, k]], for a
+    decode step's few tokens.
+
+    The fs combine's arithmetic (same f32 coefficient, same order over k)
+    without its step pipeline: every arrival row and the mirror sublane
+    holding its scale are fetched up front, then one pass sums them. XLA's
+    epilogue at these sizes gathers the rows on the TensorCore one at a time
+    and reads the whole scale mirror to look up t_local * topk values.
+
+    `sub`/`lane` split the clamped mirror position; the sublane's 128 scales
+    land in SMEM and the lane is read there.
+    """
+    n = t_local * topk
+    gt = COMBINE_GROUP
+    hidden = lane_blocks * HIDDEN_LANE_BLOCK
+
+    def kernel(
+        pos_sm,
+        sub_sm,
+        lane_sm,
+        tw_sm,
+        scales_hbm,
+        arr_hbm,
+        out_ref,
+        rows_vm,
+        scl_sm,
+        tile_vm,
+        sems,
+    ):
+        def start(i, carry):
+            for k in range(topk):
+                j = i * topk + k
+                # Alternate queues by slot, as the pipelined combine does.
+                pltpu.make_async_copy(
+                    arr_hbm.at[pos_sm[j]], rows_vm.at[k * t_local + i], sems.at[0]
+                ).start(priority=k % 2)
+                pltpu.make_async_copy(
+                    scales_hbm.at[pl.ds(sub_sm[j], 1)],
+                    scl_sm.at[pl.ds(j, 1)],
+                    sems.at[1],
+                ).start()
+            return carry
+
+        lax.fori_loop(0, t_local, start, jnp.int32(0))
+        # DMA semaphores count bytes: one wait the size of each buffer.
+        pltpu.make_async_copy(scl_sm, scl_sm, sems.at[1]).wait()
+        pltpu.make_async_copy(rows_vm, rows_vm, sems.at[0]).wait()
+
+        def reduce_token(i, carry):
+            acc = None
+            for k in range(topk):
+                j = i * topk + k
+                c_val = scl_sm[j, lane_sm[j]] * tw_sm[j]
+                term = rows_vm[k * t_local + i].astype(jnp.float32) * c_val
+                acc = term if acc is None else acc + term
+            tile_vm[i] = cast(jax.Array, acc).astype(out_dtype)
+            return carry
+
+        lax.fori_loop(0, t_local, reduce_token, jnp.int32(0))
+        for g in range(t_local // gt):
+            out_ref[pl.ds(g * gt, gt)] = tile_vm[pl.ds(g * gt, gt)].reshape(gt, hidden)
+
+    rows_bytes = n * lane_blocks * HIDDEN_LANE_BLOCK * jnp.dtype(wire_dtype).itemsize
+    tile_bytes = t_local * hidden * jnp.dtype(out_dtype).itemsize
+    call = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=4,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)] * 2,
+            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+            scratch_shapes=(
+                pltpu.VMEM((n, lane_blocks, HIDDEN_LANE_BLOCK), wire_dtype),
+                pltpu.SMEM((n, mirror_lanes), jnp.float32),
+                pltpu.VMEM((t_local, lane_blocks, HIDDEN_LANE_BLOCK), out_dtype),
+                pltpu.SemaphoreType.DMA((2,)),
+            ),
+            grid=(),
+        ),
+        out_shape=jax.ShapeDtypeStruct((t_local, hidden), out_dtype),
+        # Only what the call holds (plus slack for Mosaic's own scratch), so
+        # XLA can keep the layer's neighbouring values in VMEM around it.
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=rows_bytes + 2 * tile_bytes + (2 << 20),
+            disable_bounds_checks=True,
+        ),
+        name=f"moe_combine_decode_t{t_local}_k{topk}",
+    )
+
+    # One jit around the call: the HBM pins below are only for the pallas_call
+    # to read, and an eager shard_map would hand them to other primitives.
+    @jax.jit
+    def pinned_call(pos, sub, lane, tw, arrival_scales, arrivals):
+        # Left in HBM: only t_local * topk rows and sublanes are read, and
+        # otherwise XLA stages both whole buffers into VMEM ahead of the call.
+        return call(
+            pos,
+            sub,
+            lane,
+            tw,
+            pltpu.with_memory_space_constraint(arrival_scales, pltpu.HBM),
+            pltpu.with_memory_space_constraint(arrivals, pltpu.HBM),
+        )
+
+    def fn(arrivals, arrival_scales, scl, topk_weights, pos):
+        # Token-major tables, like the fs combine.
+        scl = scl.astype(jnp.int32).reshape(-1)
+        return pinned_call(
+            pos.astype(jnp.int32).reshape(-1),
+            scl // mirror_lanes,
+            scl % mirror_lanes,
+            topk_weights.astype(jnp.float32).reshape(-1),
+            arrival_scales.astype(jnp.float32),
+            arrivals,
+        )
+
+    return fn
+
+
+def build_combine_decode_kernel(**kwargs):
+    """Memoizing front door for _build_combine_decode_kernel."""
+    key = ("decode",) + tuple(sorted((k, str(v)) for k, v in kwargs.items()))
+    fn = _COMBINE_CACHE.get(key)
+    if fn is None:
+        with _COMBINE_CACHE_LOCK:
+            fn = _COMBINE_CACHE.get(key)
+            if fn is None:
+                fn = _build_combine_decode_kernel(**kwargs)
                 _COMBINE_CACHE[key] = fn
     return fn

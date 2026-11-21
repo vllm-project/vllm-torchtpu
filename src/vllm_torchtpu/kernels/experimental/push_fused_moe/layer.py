@@ -51,8 +51,10 @@ from vllm_torchtpu.kernels.experimental.push_fused_moe.host import (
     run_tables,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
+    build_combine_decode_kernel,
     build_combine_fs_kernel,
     build_push_moe_kernel,
+    decode_combine_applies,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
     build_exchange_rows_tables,
@@ -158,14 +160,24 @@ def _combine_arrivals_fs(
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
     mirror_sublanes, tile_m = arrival_scales.shape
-    if not combine_step_tokens(t_local):
-        return _combine_arrivals(
-            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
-        )
     # A DMA does not clamp an out-of-range index the way a gather does.
     # Neither position is ever negative.
     rows = jnp.minimum(pos, recv_rows - 1)
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
+    if decode_combine_applies(t_local):
+        combine = build_combine_decode_kernel(
+            t_local=t_local,
+            topk=topk,
+            mirror_lanes=tile_m,
+            lane_blocks=lane_blocks,
+            wire_dtype=arrivals.dtype,
+            out_dtype=out_dtype,
+        )
+        return combine(arrivals, arrival_scales, scl, topk_weights, rows)
+    if not combine_step_tokens(t_local):
+        return _combine_arrivals(
+            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+        )
     combine = build_combine_fs_kernel(
         t_local=t_local,
         topk=topk,
