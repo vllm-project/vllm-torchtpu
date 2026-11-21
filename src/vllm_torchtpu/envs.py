@@ -224,6 +224,7 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB: int = 128
     VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB: int = 64
     VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_RUNS: int = 0
+    VLLM_TPU_OFFLOAD_CONTIGUOUS_ALLOC_SCAN_FACTOR: int = 3
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
@@ -1425,6 +1426,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # queue the step's programs wait in. Applies only with the MiB bound on.
     "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_RUNS": env_int(
         "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_RUNS", 0
+    ),
+    # Default of kv_connector_extra_config.contiguous_alloc_scan_factor: an
+    # allocation of n KV blocks looks for consecutive ids among the oldest
+    # min(factor x n, write-back window) free blocks (<= 1: off).
+    "VLLM_TPU_OFFLOAD_CONTIGUOUS_ALLOC_SCAN_FACTOR": env_int(
+        "VLLM_TPU_OFFLOAD_CONTIGUOUS_ALLOC_SCAN_FACTOR", 3
     ),
     # MiB of one worker's KV that offload saves may have in flight at once
     # (0: no bound); the next forward's KV write waits for them.

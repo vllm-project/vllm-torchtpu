@@ -282,7 +282,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         # How deep into the oldest free blocks an allocation of n blocks may
         # look for consecutive ids (`contiguous_alloc`); <= 1 turns it off.
         self._contiguous_alloc_scan_factor = int(
-            extra_config.get("contiguous_alloc_scan_factor", 3)
+            extra_config.get(
+                "contiguous_alloc_scan_factor",
+                tpu_envs.VLLM_TPU_OFFLOAD_CONTIGUOUS_ALLOC_SCAN_FACTOR,
+            )
         )
         # Write-back state: finished requests whose chunks are not stored yet
         # (their finish is deferred), the blocks each one would store, and

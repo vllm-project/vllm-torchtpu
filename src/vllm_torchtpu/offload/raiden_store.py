@@ -488,7 +488,8 @@ def _prefix_within_runs(run_starts: list[bool], limit: int, runs: int) -> int:
 
 class _LoadStats:
     """Launched local-load pieces, sub-blocks and copies, logged once a
-    minute: the copies per sub-block show how well loads coalesce."""
+    minute: the copies per sub-block show how well loads coalesce, and the
+    submitted loads' runs on each side alone show which side scatters."""
 
     PERIOD_S = 60.0
 
@@ -497,12 +498,19 @@ class _LoadStats:
 
     def _reset(self) -> None:
         self.pieces = self.sub_blocks = self.runs = self.capped = 0
+        self.submitted = self.device_runs = self.host_runs = 0
         self.since = time.monotonic()
 
     def add(self, sub_blocks: int, runs: int) -> None:
         self.pieces += 1
         self.sub_blocks += sub_blocks
         self.runs += runs
+
+    def add_submitted(self, device_ids: list[int], host_ids: list[int]) -> None:
+        """A local load in DMA order: its runs of consecutive ids per side."""
+        self.submitted += len(device_ids)
+        self.device_runs += sum(_run_starts(device_ids, [-1] * len(device_ids)))
+        self.host_runs += sum(_run_starts(host_ids, [-1] * len(host_ids)))
 
     def maybe_log(self) -> None:
         now = time.monotonic()
@@ -511,13 +519,17 @@ class _LoadStats:
         if self.pieces:
             logger.info(
                 "TPURaidenOffloadingConnector: load pacing %.0fs: %d pieces, %d "
-                "sub-blocks, %d copies (%.1f sub-blocks/copy), %d capped polls",
+                "sub-blocks, %d copies (%.1f sub-blocks/copy), %d capped polls; "
+                "submitted %d sub-blocks in %d HBM runs, %d host runs",
                 now - self.since,
                 self.pieces,
                 self.sub_blocks,
                 self.runs,
                 self.sub_blocks / max(self.runs, 1),
                 self.capped,
+                self.submitted,
+                self.device_runs,
+                self.host_runs,
             )
         self._reset()
 
@@ -1582,6 +1594,7 @@ class RaidenOffloadingManager(OffloadingManager):
             self._admissions[job_id] = admission
             for sub_hash in sub_hashes:
                 self._hash_to_admission[sub_hash] = admission
+            self._load_stats.add_submitted(dst_device_ids_for_local, local_host_ids)
             self._queued_loads.append(
                 _QueuedLoad(
                     admission,
