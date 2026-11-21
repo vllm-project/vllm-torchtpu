@@ -78,6 +78,8 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER: bool = False
+    TPU_SP_MIN_ROWS: int = 0
+    TPU_GATED_NORM_TILE: int = 32
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -801,6 +803,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # once the path is the default for these layers or is replaced by another
     # fused TP MoE path.
     "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL"),
+    "TPU_GATED_NORM_TILE": lambda: int(os.getenv("TPU_GATED_NORM_TILE", "32")),
+    # Minimum global token count for sequence-parallel MoE when
+    # TPU_MOE_SEQUENCE_PARALLEL=1; smaller steps keep replicated activations
+    # and use all-reduce instead of all-gather + reduce-scatter. 0 means all steps.
+    "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "0")),
     # Experimental small-batch MoE (kernels/experimental/moe_lowtok) for EP
     # calls of at most MOE_LOWTOK_MAX_TOKENS rows; the FP8 method also moves
     # a plain softmax top-k router into it. Exclusive with dense expert MoE.

@@ -374,3 +374,37 @@ def test_attention_patch_applied_only_with_fp8_gather(monkeypatch, fp8_gather):
     assert patch_mod._fp8_gather is fp8_gather
     patched = qwen3_next.Qwen3NextAttention.forward is patched_attention_forward
     assert patched is fp8_gather
+
+
+def test_patched_decoder_layer_replicated_below_sp_min_rows(monkeypatch):
+    """Below TPU_SP_MIN_ROWS, decoder layers stay replicated and all-reduce."""
+    monkeypatch.setenv("TPU_SP_MIN_ROWS", "257")
+    gathers = []
+    reduces = []
+    monkeypatch.setattr(
+        patch_mod,
+        "tensor_model_parallel_all_gather",
+        lambda x, dim=0: gathers.append(dim) or x,
+    )
+    monkeypatch.setattr(
+        patch_mod,
+        "tensor_model_parallel_reduce_scatter",
+        lambda x, dim=0: x,
+    )
+    monkeypatch.setattr(
+        patch_mod,
+        "tensor_model_parallel_all_reduce",
+        lambda x: reduces.append(x.shape[0]) or x * 2,
+    )
+
+    seen = []
+    hidden = torch.randn(32, 64)
+    residual = torch.randn(32, 64)
+    positions = torch.arange(32)
+    out_h, _out_r = patched_decoder_layer_forward(
+        _sp_layer(seen), hidden, residual, positions
+    )
+    assert gathers == []
+    assert reduces == [32]
+    assert seen[0][0].shape == (32, 64)
+    torch.testing.assert_close(out_h, ((hidden * 1.05 + 1.0) * 2 * 1.1) * 2.0)

@@ -24,9 +24,14 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.distributed.parallel_state import get_ep_group
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter import sequence_parallel
 from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
     FUSED_MOE_EP_V3_OP_ATTR,
     fused_moe_ep_v3,
@@ -75,7 +80,13 @@ def apply(
     compiled by one trace can be handed to the other.
     """
     armed = getattr(method, FUSED_MOE_EP_V3_OP_ATTR)
-    if x.shape[0] >= armed.step_min_tokens:
+    model_sp = layer.moe_config.moe_parallel_config.is_sequence_parallel
+    step_sp = model_sp and (
+        not envs.TPU_SP_MIN_ROWS
+        or get_tensor_model_parallel_world_size() <= 1
+        or sequence_parallel.is_active()
+    )
+    if (step_sp or not model_sp) and x.shape[0] >= armed.step_min_tokens:
         return fused_moe_ep_v3(
             method,
             x,
@@ -86,7 +97,11 @@ def apply(
             router_logits,
             layer._experts_start,
         )
+    if model_sp and not step_sp:
+        # Replicated step below TPU_SP_MIN_ROWS under TP+EP: rows are already
+        # replicated across ranks, so run grouped/lowtok directly and reduce
+        # partials over TP (= EP) to uphold VllmMoERunner._fused_output_is_reduced.
+        return tensor_model_parallel_all_reduce(grouped(layer, x, router_logits))
     ep: Any = get_ep_group()
-    sequence_parallel = layer.moe_config.moe_parallel_config.is_sequence_parallel
-    x, router_logits = ep.dispatch_router_logits(x, router_logits, sequence_parallel)
-    return ep.combine(grouped(layer, x, router_logits), sequence_parallel)
+    x, router_logits = ep.dispatch_router_logits(x, router_logits, model_sp)
+    return ep.combine(grouped(layer, x, router_logits), model_sp)

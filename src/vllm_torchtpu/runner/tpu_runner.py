@@ -9216,12 +9216,20 @@ class TPUModelRunner(GPUModelRunner):
         kwargs = {}
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
-        out = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            inputs_embeds=inputs_embeds,
-            **kwargs,
+        from vllm_torchtpu.layers.adapter import sequence_parallel
+
+        prev_sp = sequence_parallel.set_active(
+            sequence_parallel.step_is_sequence_parallel(int(positions.shape[-1]))
         )
+        try:
+            out = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                **kwargs,
+            )
+        finally:
+            sequence_parallel.set_active(prev_sp)
         # A stage before the last returns the tensors the next stage
         # consumes rather than hidden states to sample from.
         if isinstance(out, IntermediateTensors):

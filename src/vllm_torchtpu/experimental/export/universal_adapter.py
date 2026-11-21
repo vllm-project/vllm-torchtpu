@@ -2475,8 +2475,24 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                         forward_metadata, self._vllm_config, num_tokens=num_tokens
                     )
                 )
-                return _invoke_backbone()
-        return _invoke_backbone()
+                from vllm_torchtpu.layers.adapter import sequence_parallel
+
+                prev_sp = sequence_parallel.set_active(
+                    sequence_parallel.step_is_sequence_parallel(num_tokens)
+                )
+                try:
+                    return _invoke_backbone()
+                finally:
+                    sequence_parallel.set_active(prev_sp)
+        from vllm_torchtpu.layers.adapter import sequence_parallel
+
+        prev_sp = sequence_parallel.set_active(
+            sequence_parallel.step_is_sequence_parallel(num_tokens)
+        )
+        try:
+            return _invoke_backbone()
+        finally:
+            sequence_parallel.set_active(prev_sp)
 
     def compute_logits(
         self,

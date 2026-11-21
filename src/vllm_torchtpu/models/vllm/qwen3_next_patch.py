@@ -36,13 +36,14 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.models import qwen3_next
 from vllm.sequence import IntermediateTensors
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.layers.adapter import linear_common
+from vllm_torchtpu.layers.adapter import linear_common, sequence_parallel
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -69,6 +70,9 @@ def patched_decoder_layer_forward(
     **kwargs: object,
 ):
     full_num_tokens = positions.shape[-1]
+    sp = bool(
+        self.use_attn_reduce_scatter_for_moe
+    ) and sequence_parallel.step_is_sequence_parallel(full_num_tokens)
 
     if residual is None:
         residual = hidden_states
@@ -77,7 +81,7 @@ def patched_decoder_layer_forward(
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
     attn_kwargs = {}
-    if self.use_attn_reduce_scatter_for_moe and _fp8_gather:
+    if sp and _fp8_gather:
         # Each rank quantizes its own rows once; the in-projections take the
         # gathered fp8 rows and scales, and read only the row count of
         # `hidden_states`.
@@ -86,7 +90,7 @@ def patched_decoder_layer_forward(
         x_s = tensor_model_parallel_all_gather(x_s, 0).narrow(0, 0, full_num_tokens)
         attn_kwargs["prequant"] = (x_q, x_s)
         hidden_states = x_q
-    elif self.use_attn_reduce_scatter_for_moe:
+    elif sp:
         hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
         hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
 
@@ -112,8 +116,11 @@ def patched_decoder_layer_forward(
             )
 
     if self.use_attn_reduce_scatter_for_moe:
-        _check_tokens_divide_by_tp(full_num_tokens)
-        hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
+        if sp:
+            _check_tokens_divide_by_tp(full_num_tokens)
+            hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
+        else:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
     # Fully Connected
     hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -186,7 +193,10 @@ def patched_model_forward(
 
     assert isinstance(hidden_states, torch.Tensor)
     full_num_tokens = positions.shape[-1]
-    if self.use_sequence_parallel:
+    step_sp = bool(
+        self.use_sequence_parallel
+    ) and sequence_parallel.step_is_sequence_parallel(full_num_tokens)
+    if step_sp:
         _check_tokens_divide_by_tp(full_num_tokens)
         hidden_states = qwen3_next.sequence_parallel_chunk(hidden_states)
 
@@ -210,7 +220,7 @@ def patched_model_forward(
             {"hidden_states": hidden_states, "residual": residual}
         )
     hidden_states, _ = self.norm(hidden_states, residual)
-    if self.use_sequence_parallel:
+    if step_sp:
         if aux_hidden_states:
             hidden_size = hidden_states.shape[-1]
             hidden_states = torch.cat([hidden_states, *aux_hidden_states], dim=-1)

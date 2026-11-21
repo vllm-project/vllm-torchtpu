@@ -162,3 +162,76 @@ def test_recurrent_state_specs_respect_mamba_ssm_cache_dtype() -> None:
     assert specs[0].dtype == "f32"
     assert specs[1].dtype == "bf16"
     assert specs[1].shape == (8, 16, 128, 128)
+
+
+def test_sp_min_rows_gates_fused_moe_v3_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+    from vllm_torchtpu.layers.adapter.quantization import fused_moe_ep_v3_dispatch
+
+    monkeypatch.setenv("TPU_SP_MIN_ROWS", "257")
+    monkeypatch.setattr(
+        fused_moe_ep_v3_dispatch,
+        "get_tensor_model_parallel_world_size",
+        lambda: 8,
+    )
+    v3_calls: list[int] = []
+    grouped_calls: list[int] = []
+    ar_calls: list[int] = []
+    monkeypatch.setattr(
+        fused_moe_ep_v3_dispatch,
+        "fused_moe_ep_v3",
+        lambda _m, x, *_a: v3_calls.append(x.shape[0]) or x,
+    )
+    monkeypatch.setattr(
+        fused_moe_ep_v3_dispatch,
+        "tensor_model_parallel_all_reduce",
+        lambda x: ar_calls.append(x.shape[0]) or x * 2,
+    )
+    method = SimpleNamespace(_fused_moe_ep_v3_op=SimpleNamespace(step_min_tokens=33))
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(is_sequence_parallel=True)
+        ),
+        w13_weight=None,
+        w2_weight=None,
+        w13_weight_scale_inv=None,
+        w2_weight_scale_inv=None,
+        _experts_start=None,
+    )
+
+    prev = sequence_parallel.set_active(False)
+    try:
+        x = torch.ones(64, 16)
+        out = fused_moe_ep_v3_dispatch.apply(
+            method,
+            layer,
+            x,
+            torch.ones(64, 8),
+            lambda _l, inp, _r: grouped_calls.append(inp.shape[0]) or inp,
+        )
+        assert v3_calls == []
+        assert grouped_calls == [64]
+        assert ar_calls == [64]
+        torch.testing.assert_close(out, x * 2)
+
+        sequence_parallel.set_active(True)
+        fused_moe_ep_v3_dispatch.apply(
+            method,
+            layer,
+            x,
+            torch.ones(64, 8),
+            lambda _l, inp, _r: grouped_calls.append(inp.shape[0]) or inp,
+        )
+        assert v3_calls == [64]
+    finally:
+        sequence_parallel.set_active(prev)
+
+
+def test_gated_norm_quant_op_reads_tile_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_torchtpu.layers.adapter import gated_norm_quant_op
+
+    monkeypatch.setenv("TPU_GATED_NORM_TILE", "256")
+    gated_norm_quant_op._build_ops(1e-6)
+    assert (1e-6, 256) in gated_norm_quant_op._norm_ops

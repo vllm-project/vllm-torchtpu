@@ -1652,7 +1652,12 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
     if cc.compile_sizes is None:
         return
     original = [int(s) for s in cc.compile_sizes]
-    kept = [s for s in original if _is_sequence_parallel_bucket(s, tp)]
+    sp_min = int(envs.TPU_SP_MIN_ROWS or 0)
+    kept = [
+        s
+        for s in original
+        if (sp_min > 0 and s < sp_min) or _is_sequence_parallel_bucket(s, tp)
+    ]
     if not kept:
         raise ValueError(
             f"TPU_MOE_SEQUENCE_PARALLEL=1 left no valid compile sizes "

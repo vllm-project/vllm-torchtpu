@@ -225,3 +225,39 @@ def test_fp8_gather_needs_sequence_parallelism_without_pcp(
     else:
         with pytest.raises(ValueError, match=error):
             check_fp8_gather(vllm_config)
+
+
+def test_sequence_parallel_compile_sizes_keeps_below_sp_min_rows(
+    configure_sp_moe, monkeypatch
+):
+    import vllm_torchtpu.envs as envs
+
+    monkeypatch.setattr(envs, "TPU_SP_MIN_ROWS", 257)
+    parallel_config = SimpleNamespace(
+        use_sequence_parallel_moe=True,
+        tensor_parallel_size=8,
+        pipeline_parallel_size=1,
+    )
+    model_config = SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"])
+    compilation_config = SimpleNamespace(
+        compile_sizes=[4, 8, 16, 32, 48, 64, 128, 256, 512, 1024]
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=parallel_config,
+        model_config=model_config,
+        compilation_config=compilation_config,
+        speculative_config=None,
+    )
+    configure_sp_moe(vllm_config)
+    assert compilation_config.compile_sizes == [
+        4,
+        8,
+        16,
+        32,
+        48,
+        64,
+        128,
+        256,
+        512,
+        1024,
+    ]

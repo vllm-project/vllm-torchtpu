@@ -32,6 +32,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental import gated_norm_quant as gnq
 from vllm_torchtpu.layers.adapter import linear_common
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
@@ -39,16 +40,18 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-_norm_ops: dict[float, Callable] = {}
+_norm_ops: dict[tuple[float, int], Callable] = {}
 
 
 def _build_ops(eps: float) -> None:
-    if eps not in _norm_ops:
+    tile = int(envs.TPU_GATED_NORM_TILE)
+    key = (eps, tile)
+    if key not in _norm_ops:
 
         def norm(
             o: jax.Array, z: jax.Array, w: jax.Array
         ) -> tuple[jax.Array, jax.Array]:
-            return gnq.gated_norm_quant(o, z, w, eps)
+            return gnq.gated_norm_quant(o, z, w, eps, tile=tile)
 
         op = pallas.jax_op(f"pallas::gdn_gated_norm_quant_{len(_norm_ops)}", norm)
 
@@ -59,7 +62,7 @@ def _build_ops(eps: float) -> None:
             )
 
         op.register_fake(fake_norm)
-        _norm_ops[eps] = op
+        _norm_ops[key] = op
     linear_common._get_prequant_matmul_op()
 
 
@@ -132,7 +135,7 @@ def output_projection(
     tokens = core_attn_out.shape[0]
     norm: Any = layer.norm
     out_proj: Any = layer.out_proj
-    q, s = _norm_ops[float(norm.eps)](
+    q, s = _norm_ops[(float(norm.eps), int(envs.TPU_GATED_NORM_TILE))](
         core_attn_out, z.reshape(core_attn_out.shape), norm.weight
     )
     output = linear_common.quantized_matmul_prequant(
