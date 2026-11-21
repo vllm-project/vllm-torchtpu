@@ -191,7 +191,7 @@ vllm serve deepseek-ai/DeepSeek-V4-Pro-0813 \
 > export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="MOE_REQUANTIZE_WEIGHT_DTYPE,MOE_REQUANTIZE_BLOCK_SIZE,TPU_ROPE_CACHE_ROW_MAJOR,TPU_MOE_HASH_TABLE_ROW_MAJOR,USE_MOE_FUSED_EP_KERNEL,MOE_FUSED_EP_ENABLE_W4A8,MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE,TPU_MOE_SKIP_PADDED_TOKENS,RAGGED_GATHER_REDUCE_VERSION,LIBTPU_INIT_ARGS"
 > ```
 >
-> With Ray DP engine actors (`--data-parallel-backend ray`), the TPU platform forwards the variables listed in `TpuPlatform.additional_env_vars` itself, which covers all of these except `LIBTPU_INIT_ARGS`. `TPU_MULTIHOST_BACKEND=ray` alone does not start those actors: the DP engines run as local processes, and the Ray executor passes their environment variables (all but the worker-specific ones) to their workers.
+> With Ray DP engine actors (`--data-parallel-backend ray`), the TPU platform forwards the variables listed in `TpuPlatform.additional_env_vars` itself, which covers all of these except `LIBTPU_INIT_ARGS`. `TPU_MULTIHOST_BACKEND=ray` alone does not start those actors: the DP engines run as local processes, and the Ray executor fills in each worker's environment from its engine's without replacing variables the worker already has. A worker imports this package, which sets `LIBTPU_INIT_ARGS`, and torch_tpu, which reads `TPU_PREMAPPED_BUFFER_SIZE` once, before that step, so on this path set those two in each host's environment before `ray start`.
 >
 > When streaming the 805 GiB checkpoint from GCS via `--load-format runai_streamer`, also pass `--model-loader-extra-config '{"memory_limit":4294967296,"concurrency":8}'` to cap per-rank host streamer buffers. See [Multi-Host Serving](../user_guide/multihost.md) for full `mp` and `ray` cluster setup details.
 
