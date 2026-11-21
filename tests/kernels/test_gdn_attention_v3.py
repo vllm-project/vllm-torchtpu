@@ -935,7 +935,8 @@ class GDNChunkedComputeTest(parameterized.TestCase):
             ("ratio_1", 2, 2, 16),
             ("ratio_2", 2, 4, 16),
             ("ratio_4", 2, 8, 16),
-            ("ratio_8", 2, 16, 16),
+            ("even_v_per_kq_paired", 2, 16, 16),
+            ("odd_v_per_kq_unpaired", 2, 6, 16),
             ("partial_chunk_zero_trailing_beta", 2, 16, 11),
         )
     )
@@ -985,6 +986,17 @@ class GDNChunkedComputeTest(parameterized.TestCase):
 
         np.testing.assert_allclose(out, ref_out.swapaxes(0, 1), rtol=1e-5, atol=1e-5)
         np.testing.assert_allclose(state, ref_state[0], rtol=1e-5, atol=1e-5)
+
+    def test_pack_unpack_v_head_pairs_roundtrip(self):
+        """Packing and unpacking 8-KQ / 64-V head pairs along lanes is exact."""
+        n_kq, n_v, d_k, d_v = 8, 64, 128, 128
+        v_per_kq = n_v // n_kq
+        x = jax.random.normal(jax.random.key(53), (n_v, d_k, d_v))
+        packed = compute_gdn._pack_v_head_pairs(x, v_per_kq)
+        self.assertEqual(packed.shape, (n_v // 2, d_k, 2 * d_v))
+        unpacked = compute_gdn._unpack_v_head_pairs(packed, v_per_kq)
+        self.assertEqual(unpacked.shape, x.shape)
+        self.assertEqual(float(jnp.max(jnp.abs(unpacked - x))), 0.0)
 
 
 @pytest.mark.tpu_test
