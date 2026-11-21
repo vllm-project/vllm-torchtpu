@@ -191,3 +191,76 @@ def test_an_uninitialized_group_still_yields_a_two_axis_mesh(monkeypatch):
     mesh = dcp.get_or_create_dcp_mesh()
     assert mesh.axis_names == ("dcp_lane", "dcp")
     assert mesh.size == 1
+
+
+def _pipeline_environment(monkeypatch, rank, tp_size=8, stages=2):
+    """Rank `rank` of a `stages`-stage pipeline whose stages are TP=DCP groups."""
+    from types import SimpleNamespace
+
+    from vllm.distributed import parallel_state
+
+    stage, tp_rank = divmod(rank, tp_size)
+    ranks = range(stage * tp_size, (stage + 1) * tp_size)
+    group = _FakeGroup(ranks, rank_in_group=tp_rank)
+    native = _dcp_mesh_environment(monkeypatch, group, tp_size * stages, rank)
+    monkeypatch.setattr(dcp, "get_pipeline_stage", lambda: (stage, stages))
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
+    device_ids = tuple(100 + r for r in ranks)
+    monkeypatch.setattr(
+        dcp,
+        "get_cp_group_layout",
+        lambda g: SimpleNamespace(device_ids=device_ids),
+    )
+    stage_mesh = Mock(side_effect=lambda *args: object())
+    monkeypatch.setattr(dcp, "get_stage_mesh", stage_mesh)
+    return native, stage_mesh, group, device_ids
+
+
+@pytest.mark.parametrize("rank", [0, 5, 8, 15])
+def test_pipeline_stage_mesh_spans_the_stage_not_the_world(monkeypatch, rank):
+    """PP=2 x TP=DCP=8: each stage's kernels launch on its 8 devices only.
+
+    A world-size (2, 8) mesh would name the other stage's devices, which never
+    launch the kernel.
+    """
+    native, stage_mesh, group, device_ids = _pipeline_environment(monkeypatch, rank)
+
+    dcp.get_or_create_dcp_mesh()
+
+    native.assert_not_called()
+    stage_mesh.assert_called_once_with(("dcp_lane", "dcp"), (1, 8), group, device_ids)
+
+
+def test_pipeline_stage_lane_is_stage_relative(monkeypatch):
+    """Stage 1's ranks are on lane 0 of their (1, 8) stage mesh, not lane 1."""
+    _pipeline_environment(monkeypatch, rank=11)
+    monkeypatch.setattr(dcp, "_RANK_OPERANDS", {})
+
+    lane = dcp.dcp_lane_operand(device=torch.device("cpu"))
+
+    assert lane.tolist() == [0]
+
+
+def test_pipeline_stage_mesh_uses_the_dcp_group_under_pcp(monkeypatch):
+    """PCP x DCP stages (TP=1, PCP=DCP=8): the DCP group spans the stage."""
+    from vllm.distributed import parallel_state
+
+    native, stage_mesh, group, device_ids = _pipeline_environment(monkeypatch, rank=11)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: _FakeGroup([11]))
+
+    dcp.get_or_create_dcp_mesh()
+
+    native.assert_not_called()
+    stage_mesh.assert_called_once_with(("dcp_lane", "dcp"), (1, 8), group, device_ids)
+
+
+def test_pipeline_stage_mesh_rejects_a_stage_no_group_spans(monkeypatch):
+    """TP=4 x PCP=2 with DCP=4: neither the DCP nor the TP group is the stage."""
+    from vllm.distributed import parallel_state
+
+    _pipeline_environment(monkeypatch, rank=3)
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: _FakeGroup(range(4), 3))
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: _FakeGroup(range(4)))
+
+    with pytest.raises(NotImplementedError, match="one DCP or TP group"):
+        dcp._dcp_stage_mesh(("dcp_lane", "dcp"), (2, 4), 8)
