@@ -167,6 +167,17 @@ X2_COUNTERS = (
     "store_probe_unrecorded",
     "store_probe_neg_cached",
     "lookup_unrecorded",
+    # Read room (staging for peer reads): a peer read lands through this host
+    # pool (Raiden's LoadRemoteBlocks allocates one free host block per
+    # sub-block, free space only, and fails the whole read if it cannot).
+    # Launches whose estimated free blocks were short of the read, sub-blocks
+    # the room step evicted, launches still short after it, and the failed
+    # peer sub-blocks split by whether their launch was short.
+    "read_room_short",
+    "read_room_evicted",
+    "read_room_still_short",
+    "remote_failed_short",
+    "remote_failed_roomy",
 )
 
 # TIER-X2: most keys remembered as registry misses at once; past it the expired
@@ -437,6 +448,9 @@ class Admission:
     # retry exactly this subset), and launch failures pre-fill the batch.
     failed_sub_hashes: list[bytes] = field(default_factory=list)
     retries_left: int = 0
+    # TIER-X2 loads only: the launch's peer read found fewer estimated free
+    # host blocks than it needed (after the room step, if on).
+    room_short: bool = False
 
 
 @dataclass
@@ -489,6 +503,11 @@ class RaidenOffloadingManager(OffloadingManager):
         # global registry.
         tier_x2: bool = False,
         x2_miss_ttl_s: float = 0.0,
+        # TIER-X2 (VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM): before a peer read, evict
+        # this store's oldest unpinned held entries until the estimated free
+        # host blocks cover the read plus x2_read_room_margin. Needs track_held.
+        x2_read_room: bool = False,
+        x2_read_room_margin: int = 16,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -670,6 +689,8 @@ class RaidenOffloadingManager(OffloadingManager):
         # _eviction_lock (the store's eviction callback adds to it).
         self._x2_record: OrderedDict[OffloadKey, None] = OrderedDict()
         self._x2_record_cap = _X2_RECORD_CAP
+        self._x2_read_room = bool(x2_read_room) and self._x2
+        self._x2_read_room_margin = max(0, int(x2_read_room_margin))
 
     # -- sub-hash / block-id expansion ----------------------------------
 
@@ -1135,6 +1156,64 @@ class RaidenOffloadingManager(OffloadingManager):
         counts["asked"] += len(sub_hashes)
         counts["evicted"] += evicted
 
+    def _x2_staging_free_estimate(self) -> int | None:
+        """Free host blocks this store can stage a peer read through, estimated
+        from what this object tracks: capacity, minus the held keys' blocks, the
+        surviving blocks of partly evicted keys, the in-flight saves and the peer
+        reads still landing (each holds one staging block per sub-block until its
+        transfer resolves). None without track_held."""
+        if self._held is None:
+            return None
+        factor = self._device_block_size_factor
+        with self._eviction_lock:
+            held = len(self._held)
+            partial = sum(
+                factor - len(lost) for lost in self._evicted_sub_hashes.values()
+            )
+        staging = 0
+        for admission in self._admissions.values():
+            if admission.op == AdmissionOp.LOAD and admission.remote_sub_hashes:
+                staging += len(admission.remote_sub_hashes & admission.pending)
+        return (
+            self._capacity_keys * factor
+            - held * factor
+            - partial
+            - len(self._inflight_store_keys) * factor
+            - staging
+        )
+
+    def _x2_make_read_room(self, need: int, free: int) -> int:
+        """Evict this store's oldest held, unpinned entries until ``free`` plus the
+        evicted sub-blocks covers ``need`` (the read plus the margin), scanning at
+        most four times the keys that would take. The store skips pinned entries
+        (the load being launched pinned its local part), and the eviction callback
+        records these as discards: they go nowhere, so not as maybe-remote."""
+        if self._held is None or need <= free:
+            return 0
+        factor = self._device_block_size_factor
+        want_keys = -(-(need - free) // factor)
+        with self._eviction_lock:
+            candidates = []
+            for key in self._held:
+                candidates.append(key)
+                if len(candidates) >= 4 * want_keys:
+                    break
+        evicted = 0
+        pos = 0
+        while free + evicted < need and pos < len(candidates):
+            take = -(-(need - free - evicted) // factor)
+            batch = self._expand_keys(candidates[pos : pos + take])
+            pos += take
+            # Not under _eviction_lock: the store fires the callback, which
+            # takes it, before evict returns.
+            self._x2_room_evicting = frozenset(batch)
+            try:
+                evicted += int(self._store.evict(batch))
+            finally:
+                self._x2_room_evicting = frozenset()
+        self._x2_counts["read_room_evicted"] += evicted
+        return evicted
+
     def excl_stats(self) -> dict[str, int]:
         """Exclusive-restore counters, and the held keys it discarded."""
         return dict(self._excl_counts, discarded=self._held_discarded)
@@ -1295,7 +1374,9 @@ class RaidenOffloadingManager(OffloadingManager):
     def _on_eviction(self, evicted_hashes: list[bytes]) -> None:
         """Callback invoked by Raiden C++ store upon host LRU cache eviction,
         and by an exclusive-restore evict (counted as a discard)."""
-        discarding = self.__dict__.get("_excl_evicting", frozenset())
+        discarding = self.__dict__.get("_excl_evicting", frozenset()) | self.__dict__.get(
+            "_x2_room_evicting", frozenset()
+        )
         with self._eviction_lock:
             for sub_hash in evicted_hashes:
                 parsed = self._sub_hash_to_offload_key(sub_hash)
@@ -1535,6 +1616,22 @@ class RaidenOffloadingManager(OffloadingManager):
                 local_hashes.append(sub_hash)
                 dst_device_ids_for_local.append(dev_id)
 
+        room_short = False
+        if remote_hashes and self.__dict__.get("_x2", False):
+            # Read room: the peer read stages through this host pool.
+            need = len(remote_hashes)
+            free = self._x2_staging_free_estimate()
+            if free is not None and free < need:
+                self._x2_counts["read_room_short"] += 1
+                if self._x2_read_room:
+                    free += self._x2_make_read_room(
+                        need + self._x2_read_room_margin, free
+                    )
+                if free < need:
+                    room_short = True
+                    if self._x2_read_room:
+                        self._x2_counts["read_room_still_short"] += 1
+
         def _fail_launch(
             what: str, failed_hashes: list[bytes], in_flight: list[bytes]
         ) -> None:
@@ -1559,6 +1656,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 dst_device_block_ids=list(device_block_ids),
                 remote_sub_hashes=set(remote_hashes),
                 failed_sub_hashes=list(failed_hashes),
+                room_short=room_short,
             )
             if in_flight:
                 # The other launch already succeeded: the job must stay
@@ -1596,6 +1694,7 @@ class RaidenOffloadingManager(OffloadingManager):
             req_id=req_id,
             dst_device_block_ids=list(device_block_ids),
             remote_sub_hashes=set(remote_hashes),
+            room_short=room_short,
         )
         self._admissions[job_id] = admission
         for sub_hash in sub_hashes:
@@ -1669,6 +1768,10 @@ class RaidenOffloadingManager(OffloadingManager):
                     admission.remote_sub_hashes.intersection(admission.failed_sub_hashes)
                 )
                 self._x2_counts["remote_read_blocks_failed"] += failed
+                if failed:
+                    self._x2_counts[
+                        "remote_failed_short" if admission.room_short else "remote_failed_roomy"
+                    ] += failed
                 self._x2_counts["remote_read_blocks_done"] += (
                     len(admission.remote_sub_hashes) - failed
                 )
@@ -3259,6 +3362,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                     "kv_pool_group": self.tier_x2_pool_group(tier_class),
                     "tier_x2": True,
                     "x2_miss_ttl_s": envs.VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS / 1000.0,
+                    "x2_read_room": envs.VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM,
+                    "x2_read_room_margin": envs.VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM_MARGIN,
                 }
                 if self.tier_x2
                 else {}

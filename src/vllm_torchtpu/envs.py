@@ -371,6 +371,8 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE: bool = False
     VLLM_TPU_OFFLOAD_TIER_X2: bool = False
     VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS: int = 1000
+    VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM: bool = False
+    VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM_MARGIN: int = 16
     VLLM_TPU_OFFLOAD_DIVERGENT_HITS: bool = False
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TPU_MAMBA_CHECKPOINT_RETENTION: bool = True
@@ -2586,6 +2588,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # every time). A key stored or demoted meanwhile is at worst found late.
     "VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS": env_int(
         "VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS", 1000
+    ),
+    # TIER-X2: a peer read lands through the reading store's own host pool (one
+    # free host block per sub-block, free space only; short of them, the whole
+    # read fails and its blocks recompute). With this on, before each peer read
+    # the store evicts its oldest unpinned held entries until its estimated free
+    # blocks cover the read plus VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM_MARGIN. The
+    # evicted entries are discards (not demoted). Host-only.
+    "VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM": env_bool(
+        "VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM", default=False
+    ),
+    "VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM_MARGIN": env_int(
+        "VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM_MARGIN", 16
     ),
     # Prefill with the host tier (TPURaidenOffloadingConnector) on a hybrid model:
     # report "divergent local hybrid hits", so the local prefix hit is the
