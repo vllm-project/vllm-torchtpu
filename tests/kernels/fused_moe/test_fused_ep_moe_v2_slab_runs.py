@@ -111,13 +111,12 @@ def test_run_copy_builds_the_scattered_tables(ep, t_local, g_local, topk, routin
     T = ep * t_local
     scale_rows = host.act_scale_slab_rows(stride)
     view_rows = scale_rows * host.HIDDEN_LANE_BLOCK
-    out_rows = host.align_up(scale_rows, host.U32_SUBLANE_TILE)
+    # The layer's own sizing, so the test covers it too.
+    src_rows, out_rows = host.slab_run_copy_rows(t_local, topk, ep, stride)
     streams = np.stack([tokens.reshape(-1), scales.reshape(-1)])
-    src_rows = host.align_up(
-        streams.shape[1], host.HIDDEN_LANE_BLOCK * host.U32_SUBLANE_TILE
+    streams = np.pad(
+        streams, ((0, 0), (0, src_rows * host.HIDDEN_LANE_BLOCK - streams.shape[1]))
     )
-    streams = np.pad(streams, ((0, 0), (0, src_rows - streams.shape[1])))
-    src_rows //= host.HIDDEN_LANE_BLOCK
     copy = kernel.build_slab_run_copy(
         n_streams=2, src_rows=src_rows, out_rows=out_rows, n_runs=g_local * ep
     )

@@ -545,8 +545,8 @@ def fused_ep_moe_v2(
     # the TensorCore: the token-gather table is a sort and the scale slab a
     # lookup, each where it fits, and any scatter left is a set; otherwise both
     # tables stay scatter-adds. The mesh in the cache key below already pins
-    # the chip; the three choices are in the key as well, so a caller that
-    # forces one (a test, an A/B) never gets another's body.
+    # the chip; the choices are in the key as well, so a caller that forces
+    # one (a test, an A/B) never gets another's body.
     tables_on_tensorcore = slab_tables_on_tensorcore()
     slab_by_set = tables_on_tensorcore
     # The activation-scale slab by lookup through the token-gather table
@@ -810,11 +810,11 @@ def fused_ep_moe_v2(
             routing, me, e_total=e_total, ep=ep
         )
         row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
-        # The slab scatters (the token-gather table where it is not a sort,
-        # and the scale slab where it is not a lookup) run against this
-        # shard's own slab. The rows of the other shards are dropped where
-        # they are computed rather than built into a replicated slab and
-        # sliced away afterwards.
+        # The slab scatters (the token-gather table where it is neither a
+        # sort nor a run copy, and the scale slab where it is neither a lookup
+        # nor a run copy) run against this shard's own slab. The rows of the
+        # other shards are dropped where they are computed rather than built
+        # into a replicated slab and sliced away afterwards.
         slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
         # On a chip with a full SparseCore the two slab scatters and the
         # activation all-gather are offloaded to the SAME SparseCore, where
@@ -824,11 +824,12 @@ def fused_ep_moe_v2(
         # had; that trade measures +2.80% at 2048 local tokens and negative at
         # every smaller shape, so it is taken only where the routing plan in
         # front of the collective is longer than the scatters behind it. Same
-        # bits either way; only the queue moves. The barrier is taken on every
-        # chip, including one that builds the tables on the TensorCore: there
-        # the table builds share no queue with the collective, the barrier
-        # holds them until the gathered activations arrive, and that trade has
-        # not been measured.
+        # bits either way; only the queue moves. The scatter and sort paths
+        # take the barrier on every chip, including one that builds the tables
+        # on the TensorCore: there the table builds share no queue with the
+        # collective, the barrier holds them until the gathered activations
+        # arrive, and that trade has not been measured. The run copy does not
+        # take it: it runs only on such a chip, where nothing measured it.
         #
         # Where its keys fit, the token-gather table is a sort of the routed
         # pairs rather than a scatter through slab_row (see
@@ -846,8 +847,6 @@ def fused_ep_moe_v2(
                 streams,
                 ((0, 0), (0, src_rows * HIDDEN_LANE_BLOCK - streams.shape[1])),
             )
-            if t_local >= AGQ_MIN_LOCAL_TOKENS:
-                streams, q_g = lax.optimization_barrier((streams, q_g))
             src_off, dst_off, run_len = slab_run_copy_runs(
                 routing, me, e_total=e_total, ep=ep, src_stride=layout[0]
             )

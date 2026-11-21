@@ -536,7 +536,7 @@ def test_sorted_token_gather_is_the_scattered_one(
             )
 
 
-def _sender_payloads(idx, scale_bits, *, ep, t_local, topk, block, e_total):
+def _sender_payloads(idx, scale_bits, *, ep, t_local, topk, block):
     """Every shard's expert-sorted payload as the run-copy exchange gathers it.
 
     Returns the token numbers and the scale bits, [ep, pair_w] each with every
@@ -590,7 +590,6 @@ def test_slab_runs_copy_out_the_scattered_tables(ep, t_local, g_local, topk, rou
         t_local=t_local,
         topk=topk,
         block=kwargs["block"],
-        e_total=e_total,
     )
     counts = jnp.asarray(_plan_counts(idx, ep=ep, t_local=t_local, e_total=e_total))
     view_rows = host.act_scale_slab_rows(stride) * host.HIDDEN_LANE_BLOCK
