@@ -660,7 +660,17 @@ def _walk_kernel(
     bf16_softmax: bool = False,
     fos: int = 0,
     lean_tile: bool = False,
+    row_strips: int = 0,
+    remat_max: bool = False,
+    lse_ref=None,
 ):
+    # q38 PSTEP-QSA bitwise register-pressure variants (gathered walk only; default off; the served math and op order per row):
+    #   row_strips = n: each KV head's [rows, keys] score block runs as n row strips (whole q-heads, the full key range per
+    #   strip), so each row sees the same select / max / exp / sum / P.V on the same operands; only the live block shrinks.
+    #   remat_max: the tile max comes from a first QK pass in BF16 operands (on TPU Mosaic's FP32 dot is one BF16 pass, M T83m:
+    #   the same scores), and the served FP32 QK is recomputed for the exponent pass, so the score block need not stay live
+    #   across the max. Both are TPU bitwise questions (the reduction trees are the compiler's).
+    # lse_ref (WALK-FOS fos=2 guard / harness): per row and query head, max + log(mass) (-inf for a row with no mass).
     # q38 PSTEP-QSA WALK-FOS (gathered walk only; default off; NOT bitwise, an accuracy-gated numerics change).
     #   Port of MM KERN-MM P17 R-B and HUNT-ATTN L-A / L-B (q38mm block_sparse_gqa_prefill.py, credited) to the union walk
     #   tile. bf16_softmax (R-B): BF16 queries and keys on the MXU (qk16 operands), the masked scores rounded to BF16, the
@@ -766,7 +776,8 @@ def _walk_kernel(
         q = q.astype(jnp.bfloat16)  # lossless: BF16 values times a power of two
     positions = lengths_ref[:, 0] - 1
     row = jnp.arange(kv_tile, dtype=jnp.int32)
-    max_ref[...] = jnp.full(max_ref.shape, -jnp.inf, jnp.float32)
+    max_ref[...] = (jnp.zeros(max_ref.shape, jnp.float32) if fos == 2  # WALK-FOS V2: the offset is a constant 0
+                    else jnp.full(max_ref.shape, -jnp.inf, jnp.float32))
     mass_ref[...] = jnp.zeros(mass_ref.shape, jnp.float32)
     accumulator_ref[...] = jnp.zeros(accumulator_ref.shape, jnp.float32)
     # Walk state: current word, its bits not yet taken, groups issued so far.
@@ -1167,6 +1178,39 @@ def _walk_kernel(
             mass = mass_ref[0, head, :]
             acc = accumulator_ref[0, head, :, :]
             query = q[head].reshape(rows, head_dim)
+            if row_strips and not bf16_softmax:
+                # Bitwise variant: n row strips of whole q-heads, each over the full key range (served per-row ops).
+                strip = rows // row_strips
+                for st in range(0, rows, strip):
+                    sl = slice(st, st + strip)
+                    score = lax.dot(query[sl], key, dimension_numbers=(([1], [1]), ([], [])),
+                                    preferred_element_type=jnp.float32)
+                    if mask_view:
+                        score = jnp.where(visible[None, :, :], score.reshape(strip // query_block, query_block, kv_tile),
+                                          -jnp.inf).reshape(strip, kv_tile)
+                    else:
+                        score = jnp.where(row_visible[sl], score, -jnp.inf)
+                    ms = m[sl]
+                    next_m = jnp.maximum(ms, jnp.max(score, axis=1))
+                    finite_m = jnp.where(jnp.isneginf(next_m), 0.0, next_m)
+                    prob = jnp.exp(score - finite_m[:, None])
+                    alpha = jnp.where(jnp.isneginf(next_m), 1.0, jnp.exp(ms - next_m))
+                    weighted = lax.dot(prob, value, dimension_numbers=(([1], [0]), ([], [])),
+                                       preferred_element_type=jnp.float32)
+                    max_ref[0, head, sl] = next_m
+                    mass_ref[0, head, sl] = mass[sl] * alpha + jnp.sum(prob, axis=1)
+                    accumulator_ref[0, head, sl, :] = acc[sl] * alpha[:, None] + weighted
+                continue
+            if remat_max and not bf16_softmax:
+                # Bitwise variant (TPU): the max pass on BF16-operand scores, the served FP32 QK recomputed after it.
+                s_max = lax.dot(query.astype(jnp.bfloat16), key.astype(jnp.bfloat16),
+                                dimension_numbers=(([1], [1]), ([], [])), preferred_element_type=jnp.float32)
+                if mask_view:
+                    s_max = jnp.where(visible[None, :, :], s_max.reshape(q_heads_per_kv, query_block, kv_tile),
+                                      -jnp.inf).reshape(rows, kv_tile)
+                else:
+                    s_max = jnp.where(row_visible, s_max, -jnp.inf)
+                pre_m = jnp.maximum(m, jnp.max(s_max, axis=1))
             with sc("qk"):
                 score = lax.dot(
                     query, key, dimension_numbers=(([1], [1]), ([], [])),
@@ -1215,7 +1259,7 @@ def _walk_kernel(
                     ).reshape(rows, kv_tile)
                 else:
                     score = jnp.where(row_visible, score, -jnp.inf)
-                next_m = jnp.maximum(m, jnp.max(score, axis=1))
+                next_m = pre_m if (remat_max and not bf16_softmax) else jnp.maximum(m, jnp.max(score, axis=1))
                 finite_m = jnp.where(jnp.isneginf(next_m), 0.0, next_m)
                 prob = jnp.exp(score - finite_m[:, None])
                 alpha = jnp.where(jnp.isneginf(next_m), 1.0, jnp.exp(m - next_m))
@@ -1423,6 +1467,13 @@ def _walk_kernel(
             .transpose(1, 0, 2)
         )
     output_ref[...] = jnp.concatenate(heads, axis=1).astype(output_ref.dtype)
+    if lse_ref is not None:
+        lses = []
+        for head in range(kv_heads):
+            mass = mass_ref[0, head, :]
+            lse = jnp.where(mass == 0, -jnp.inf, max_ref[0, head, :] + jnp.log(jnp.where(mass == 0, 1.0, mass)))
+            lses.append(lse.reshape(q_heads_per_kv, query_block).T)
+        lse_ref[...] = jnp.concatenate(lses, axis=1)
 
 
 def _walk_kernel_per_group(
@@ -1475,6 +1526,9 @@ def _walk_kernel_gathered(
     **options,
 ):
     """``_walk_kernel`` reading pre-gathered union tiles (``union_walk_kernel(gathered=...)``)."""
+    if options.pop("emit_lse", False):  # WALK-FOS: the second output (per-row, per-head lse) precedes the scratch refs
+        options = dict(options, lse_ref=scratch[0])
+        scratch = scratch[1:]
     if options.get("walk_pipe"):  # the last 4 scratch buffers: pipelined scores / values, slots 0 and 1
         scratch, options = scratch[:-4], dict(options, pipe_refs=scratch[-4:])
     _walk_kernel(
@@ -1764,7 +1818,8 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
                       scan_list=False, line_matmul=False, fast_walk=False, scopes=0, walk_runs=0,
                       qk16=False, gathered=None, listed=None, listed_lines=None, run_tables=None,
                       group_offset=0, lean_gathered=False, mask_view=False, vguard_lean=False, walk_pipe=False,
-                      dot16=False, vguard_none=False, bf16_softmax=False, fos=0, lean_tile=False):
+                      dot16=False, vguard_none=False, bf16_softmax=False, fos=0, lean_tile=False, row_strips=0,
+                      remat_max=False, emit_lse=False):
     """The walking kernel alone, on a precomputed ``union_bits_plan`` (ungated bf16 output).
 
     ``bf16_softmax`` / ``fos`` / ``lean_tile`` (q38 PSTEP-QSA WALK-FOS; gathered walk only; default off; NOT bitwise): the
@@ -1840,6 +1895,14 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
         raise ValueError("bf16_softmax (WALK-FOS) needs the gathered walk, no walk_pipe and a power-of-two score scale")
     if fos not in (0, 1, 2) or ((fos or lean_tile) and not bf16_softmax):
         raise ValueError("fos must be 0, 1 or 2, and fos / lean_tile need bf16_softmax")
+    if (row_strips or remat_max or emit_lse) and (gathered is None or walk_pipe):
+        raise ValueError("row_strips / remat_max / emit_lse need the gathered walk without walk_pipe")
+    if row_strips and (row_strips < 0 or (query.shape[1] // (2 if query.shape[1] == 24 else 1)) % row_strips
+                       or bf16_softmax or remat_max):
+        raise ValueError("row_strips must divide the query heads per KV head (whole q-heads per strip), "
+                         "without bf16_softmax or remat_max")
+    if remat_max and bf16_softmax:
+        raise ValueError("remat_max applies to the served (FP32) softmax only")
     if walk_pipe not in (False, True, 0, 1, 2):
         raise ValueError("walk_pipe: 0 (off), 1 (stage A beside stage B) or 2 (interleaved per KV head)")
     walk_pipe = int(walk_pipe)
@@ -1944,7 +2007,8 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
             **({"walk_pipe": walk_pipe} if walk_pipe else {}), **({"dot16": True} if dot16 else {}),
             **({"vguard_none": True} if vguard_none else {}),
             **({"bf16_softmax": True} if bf16_softmax else {}), **({"fos": int(fos)} if fos else {}),
-            **({"lean_tile": True} if lean_tile else {}),
+            **({"lean_tile": True} if lean_tile else {}), **({"row_strips": int(row_strips)} if row_strips else {}),
+            **({"remat_max": True} if remat_max else {}), **({"emit_lse": True} if emit_lse else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
@@ -1959,7 +2023,9 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ] + ([pl.BlockSpec(memory_space=pltpu.HBM)] * 2 if gathered is not None else []) + ids_extra
             + ([pl.BlockSpec(memory_space=pltpu.HBM)] if listed_lines is not None else []),
-            out_specs=pl.BlockSpec((group, query_heads, head_dim), lambda b, *_: (b, 0, 0)),
+            out_specs=(pl.BlockSpec((group, query_heads, head_dim), lambda b, *_: (b, 0, 0)),
+                       pl.BlockSpec((group, query_heads), lambda b, *_: (b, 0))) if emit_lse
+            else pl.BlockSpec((group, query_heads, head_dim), lambda b, *_: (b, 0, 0)),
             scratch_shapes=[
                 pltpu.SMEM((words_padded,), jnp.int32),
                 pltpu.SemaphoreType.DMA,
@@ -1987,8 +2053,11 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
             * 1024**2,
             disable_bounds_checks=True,
         ),
-        out_shape=jax.ShapeDtypeStruct((ngroups * group, query_heads, head_dim) if in_place else query.shape,
-                                       jnp.bfloat16),
+        out_shape=(jax.ShapeDtypeStruct((ngroups * group, query_heads, head_dim) if in_place else query.shape,
+                                        jnp.bfloat16),
+                   jax.ShapeDtypeStruct(((ngroups * group) if in_place else query.shape[0], query_heads), jnp.float32))
+        if emit_lse else jax.ShapeDtypeStruct((ngroups * group, query_heads, head_dim) if in_place else query.shape,
+                                              jnp.bfloat16),
         name=f"qsa_union_walk_g{group}_kv{kv_tile}" + ("_lean" if lean else "")
         + ("_list" if scan_list else "") + ("_mm" if line_matmul else "") + ("_fast" if fast_walk else "")
         + ("_sc" if scopes else "") + (f"_runs{walk_runs}" if walk_runs else "")
@@ -1997,7 +2066,8 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
         + ("_glean" if lean_gathered else "") + ("_mv" if mask_view else "") + ("_vg" if vguard_lean else "")
         + ("_pipe" if walk_pipe == 1 else "_pipe2" if walk_pipe == 2 else "") + ("_d16" if dot16 else "")
         + ("_vn" if vguard_none else "") + ("_rb" if bf16_softmax else "") + (f"_fos{int(fos)}" if fos else "")
-        + ("_lt" if lean_tile else ""),
+        + ("_lt" if lean_tile else "") + (f"_rs{int(row_strips)}" if row_strips else "") + ("_rm" if remat_max else "")
+        + ("_lse" if emit_lse else ""),
     )(
         tiles,
         usize.astype(jnp.int32),
@@ -2172,7 +2242,7 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                        gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem", sc_bitset=False,
                        in_place=False, sc_bits_plan=False, gathered_lean=False, mask_view=False, vguard_lean=False,
                        align_gather=False, walk_pipe=False, dot16=False, vguard_none=False, bf16_softmax=False, fos=0,
-                       lean_tile=False):
+                       lean_tile=False, row_strips=0, remat_max=False):
     """D2 union-walk attention for a packed prefill step; ``(gated bf16 output, cache)``.
 
     q38 PSTEP-QSA WALK-FOS (default off; NOT bitwise): ``bf16_softmax`` / ``fos`` / ``lean_tile`` reach the gathered walk
@@ -2328,18 +2398,23 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
     qa1 = {**({"mask_view": True} if mask_view else {}), **({"vguard_lean": True} if vguard_lean else {}),
            **({"walk_pipe": int(walk_pipe)} if walk_pipe else {}), **({"dot16": True} if dot16 else {}),
            **({"vguard_none": True} if vguard_none else {}), **({"bf16_softmax": True} if bf16_softmax else {}),
-           **({"fos": int(fos)} if fos else {}), **({"lean_tile": True} if lean_tile else {})}
-    if (bf16_softmax or fos or lean_tile) and not gathered:
-        raise ValueError("bf16_softmax / fos / lean_tile (WALK-FOS) need the gathered walk")
+           **({"fos": int(fos)} if fos else {}), **({"lean_tile": True} if lean_tile else {}),
+           **({"row_strips": int(row_strips)} if row_strips else {}), **({"remat_max": True} if remat_max else {})}
+    if (bf16_softmax or fos or lean_tile or row_strips or remat_max) and not gathered:
+        raise ValueError("bf16_softmax / fos / lean_tile (WALK-FOS) and row_strips / remat_max need the gathered walk")
     if vguard_none and not gathered:
         raise ValueError("vguard_none needs the gathered walk")
     levers = {"mask_view": mask_view, "vguard_lean": vguard_lean, "align_gather": align_gather, "qk16": qk16,
               "dot16": dot16, "vguard_none": vguard_none, "walk_pipe": int(walk_pipe)}
+    if bf16_softmax or fos or lean_tile or row_strips or remat_max:   # q38 PSTEP-QSA keys join the line only when set
+        levers.update(bf16_softmax=bf16_softmax, fos=int(fos), lean_tile=lean_tile, row_strips=int(row_strips),
+                      remat_max=remat_max)
     if any(levers.values()):
         # q38 UNION-BUILD engagement marker: one line per trace on every rank (logger.info, not info_once).
         _engagement_log("QSA union walk levers traced for %d-row steps (group %d, KV tile %d, gathered %s): %s",
                         int(tokens), int(group), int(kv_tile), gathered,
-                        " ".join("%s=%d" % (k, int(bool(v)) if k != "walk_pipe" else int(v)) for k, v in levers.items()))
+                        " ".join("%s=%d" % (k, int(bool(v)) if k not in ("walk_pipe", "fos", "row_strips") else int(v))
+                                 for k, v in levers.items()))
     if dot16:
         if not gathered:
             raise ValueError("dot16 needs the gathered walk (gathered='reference' or 'sparsecore')")
@@ -2538,6 +2613,7 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
 # on the host, and (c) every query group's union fits union_cap, known only on the device. (c) is not observed here,
 # so the count is "D2 eligible steps": an upper bound on walk steps, exact when no union can exceed the cap (e.g.
 # short-context steps such as GSM8K's, whose unions are far below 12,288 groups).
+_FOS_GUARD_TRACED = []  # q38 PSTEP-QSA WALK-FOS: rows of each traced fos=2 guard (tests)
 _WALK_TRACED = {}  # step rows -> min_context, recorded when union_walk_prefill is traced
 _ENGAGEMENT = {"steps": 0, "eligible": 0}
 
@@ -2733,7 +2809,8 @@ def gather_chunk_bounds(ngroups, chunks, growth=1.0):
 def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows, ids, *, gathered, chunks, group,
                      union_cap, kv_tile, ratio, k_scale, v_scale, lean, qk16, growth=1.0, gather_pool=None,
                      in_place=False, lean_gathered=False, mask_view=False, vguard_lean=False, walk_pipe=False,
-                     dot16=False, vguard_none=False, bf16_softmax=False, fos=0, lean_tile=False):
+                     dot16=False, vguard_none=False, bf16_softmax=False, fos=0, lean_tile=False, row_strips=0,
+                     remat_max=False):
     """``union_walk_prefill(gathered=...)``: per chunk of whole query groups, gather the chunk's union tiles from
     the list (``rows``/``ids``), then run the walk-free kernel on them; outputs concatenated in group order."""
     ngroups = ubits.shape[0]
@@ -2749,39 +2826,62 @@ def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows
     qa1 = {**({"mask_view": True} if mask_view else {}), **({"vguard_lean": True} if vguard_lean else {}),
            **({"walk_pipe": int(walk_pipe)} if walk_pipe else {}), **({"dot16": True} if dot16 else {}),
            **({"vguard_none": True} if vguard_none else {}), **({"bf16_softmax": True} if bf16_softmax else {}),
-           **({"fos": int(fos)} if fos else {}), **({"lean_tile": True} if lean_tile else {})}
-    outs = []
-    for g0, g1 in gather_chunk_bounds(ngroups, chunks, growth):
-        sl, rs = slice(g0, g1), slice(g0 * group, g1 * group)
-        if gathered == "sparsecore":
-            from vllm_torchtpu.kernels.qwen4_exp.qsa_union_sc_gather import union_sc_gather
+           **({"fos": int(fos)} if fos else {}), **({"lean_tile": True} if lean_tile else {}),
+           **({"row_strips": int(row_strips)} if row_strips else {}), **({"remat_max": True} if remat_max else {})}
+    def run(qa):
+        """The chunk loop with walk options ``qa``: (outputs, per-row lse or None)."""
+        emit = bool(qa.get("emit_lse"))
+        outs, lses = [], []
+        for g0, g1 in gather_chunk_bounds(ngroups, chunks, growth):
+            sl, rs = slice(g0, g1), slice(g0 * group, g1 * group)
+            if gathered == "sparsecore":
+                from vllm_torchtpu.kernels.qwen4_exp.qsa_union_sc_gather import union_sc_gather
 
-            tiles = union_sc_gather(source, bits if in_place else bits[sl], rows[sl], ids[sl], ratio=ratio,
-                                    line_matmul=True, usize=usize[sl], kv_tile=kv_tile,
-                                    **({"bits_group_offset": g0} if in_place else {}))
-        else:
-            tiles = union_gather_reference(source, bits[sl], rows[sl], ids[sl], ratio=ratio, line_matmul=True)
-        if in_place and lean_gathered:
-            outs.append(union_walk_kernel(
-                query, None, None, usize[sl], vlengths, cache, None, group=group,
+                tiles = union_sc_gather(source, bits if in_place else bits[sl], rows[sl], ids[sl], ratio=ratio,
+                                        line_matmul=True, usize=usize[sl], kv_tile=kv_tile,
+                                        **({"bits_group_offset": g0} if in_place else {}))
+            else:
+                tiles = union_gather_reference(source, bits[sl], rows[sl], ids[sl], ratio=ratio, line_matmul=True)
+            if in_place and lean_gathered:
+                res = (union_walk_kernel(
+                    query, None, None, usize[sl], vlengths, cache, None, group=group,
+                    union_cap=union_cap, kv_tile=kv_tile, ratio=ratio, k_scale=k_scale, v_scale=v_scale, lean=lean,
+                    fast_walk=True, qk16=qk16, line_matmul=True, gathered=tiles, group_offset=g0, lean_gathered=True,
+                    **qa,
+                ))
+                outs.append(res[0] if emit else res)
+                lses.append(res[1] if emit else None)
+                continue
+            if in_place:
+                res = (union_walk_kernel(
+                    query, None, ubits[sl], usize[sl], vlengths, cache, page_rows[sl], group=group,
+                    union_cap=union_cap, kv_tile=kv_tile, ratio=ratio, k_scale=k_scale, v_scale=v_scale, lean=lean,
+                    fast_walk=True, qk16=qk16, line_matmul=True, gathered=tiles, group_offset=g0, **qa,
+                ))
+                outs.append(res[0] if emit else res)
+                lses.append(res[1] if emit else None)
+                continue
+            res = (union_walk_kernel(
+                query[rs], bits[sl], ubits[sl], usize[sl], vlengths[rs], cache, page_rows[sl], group=group,
                 union_cap=union_cap, kv_tile=kv_tile, ratio=ratio, k_scale=k_scale, v_scale=v_scale, lean=lean,
-                fast_walk=True, qk16=qk16, line_matmul=True, gathered=tiles, group_offset=g0, lean_gathered=True,
-                **qa1,
+                fast_walk=True, qk16=qk16, line_matmul=True, gathered=tiles, **qa,
             ))
-            continue
-        if in_place:
-            outs.append(union_walk_kernel(
-                query, None, ubits[sl], usize[sl], vlengths, cache, page_rows[sl], group=group,
-                union_cap=union_cap, kv_tile=kv_tile, ratio=ratio, k_scale=k_scale, v_scale=v_scale, lean=lean,
-                fast_walk=True, qk16=qk16, line_matmul=True, gathered=tiles, group_offset=g0, **qa1,
-            ))
-            continue
-        outs.append(union_walk_kernel(
-            query[rs], bits[sl], ubits[sl], usize[sl], vlengths[rs], cache, page_rows[sl], group=group,
-            union_cap=union_cap, kv_tile=kv_tile, ratio=ratio, k_scale=k_scale, v_scale=v_scale, lean=lean,
-            fast_walk=True, qk16=qk16, line_matmul=True, gathered=tiles, **qa1,
-        ))
-    return jnp.concatenate(outs, axis=0)
+            outs.append(res[0] if emit else res)
+            lses.append(res[1] if emit else None)
+        return jnp.concatenate(outs, axis=0), (jnp.concatenate(lses, axis=0) if emit else None)
+
+    if qa1.get("fos") == 2:
+        # WALK-FOS V2 guard (port of MM HUNT-ATTN L-A V2's, credited): a static offset of 0 is exact while every live row's
+        # logits stay inside the exp range. A live row whose lse is non-finite or outside (-80, 80) (overflow, near-overflow
+        # of the f32 mass or accumulator, or lost mass) re-runs the whole call on the served walk, so V2 never returns a
+        # non-finite or empty row. ``vlengths`` holds the plan's rows in group order (the outputs' rows).
+        out, lse = run(dict(qa1, emit_lse=True))
+        live = (vlengths if in_place else vlengths[: out.shape[0]])[: out.shape[0]] > 0
+        bad = jnp.any(live[:, None] & ~((lse > -80.0) & (lse < 80.0)))
+        served = {k: v for k, v in qa1.items() if k not in ("bf16_softmax", "fos", "lean_tile")}
+        _FOS_GUARD_TRACED.append(int(out.shape[0]))  # trace-time record (tests)
+        return lax.cond(bad, lambda: run(served)[0], lambda: out)
+    return run(qa1)[0]
 
 
 def align_gather_source(starts, offsets, max_tokens):
