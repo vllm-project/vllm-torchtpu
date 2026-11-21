@@ -88,6 +88,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_ltx2_per_batch_timestep()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -649,3 +650,102 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+_LTX2_PER_BATCH_TIMESTEP_PATCHED = "_tpu_ltx2_per_batch_timestep_patched"
+
+
+def _patch_ltx2_per_batch_timestep() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once vLLM-Omni's LTXRuntime._denoise_timestep_kwargs
+    # stops expanding unconditioned timesteps for sequence parallelism.
+    #
+    # Problem: In vllm-omni 0.32.0rc1
+    #   (vllm_omni/diffusion/models/ltx2/ltx2_runtime.py::
+    #   LTXRuntime._denoise_timestep_kwargs), the method discards forward_ctx
+    #   and denoise_ctx and calls guidance_executor.timestep_kwargs with
+    #   expand_for_sequence_parallel=True. That expands each sample's scalar
+    #   timestep to (B, T_video) and (B, T_audio), causing time_embed and every
+    #   transformer block to project and materialize per-token AdaLN modulation
+    #   tables even though all tokens share the same timestep.
+    # Fix: Replace LTXRuntime._denoise_timestep_kwargs (copied from vllm-omni
+    #   0.32.0rc1, since wrapping cannot override the hardcoded keyword
+    #   argument) to pass expand_for_sequence_parallel=False. Unconditioned
+    #   timesteps stay 1-D (B,), keeping temb at (B, 1, C) so it broadcasts
+    #   into each block's norm modulation.
+    # Scope:
+    #   - LTX2VideoTransformer3DModel._build_sp_plan declares
+    #     SequenceParallelInput(split_dim=1, expected_dims=2, split_output=False)
+    #     on timestep, so 1-D (B,) tensors skip sequence sharding and stay
+    #     replicated across SP ranks. They take the dimension-mismatch path of
+    #     SequenceParallelSplitHook._prepare_sp_input
+    #     (vllm_omni/diffusion/hooks/sequence_parallel.py), which logs
+    #     "Expected tensor with 2 dims, got 1. Skipping split." through
+    #     warning_once: under SP every rank prints it once for T2V, and it is
+    #     expected.
+    #   - Conditioned I2V requests with a conditioning_mask still override
+    #     timestep with the 2-D (B, T_video) masked tensor in
+    #     LTXI2VConditioningMixin._denoise_timestep_kwargs (which is sharded
+    #     by the SP plan), while keeping audio_timestep 1-D (B,).
+    # -------------------------------------------------------------------------
+    import inspect
+
+    from vllm_omni.diffusion.models.ltx2.ltx2_guidance import LTXGuidanceExecutor
+    from vllm_omni.diffusion.models.ltx2.ltx2_runtime import LTXRuntime
+
+    if getattr(
+        LTXRuntime._denoise_timestep_kwargs,
+        _LTX2_PER_BATCH_TIMESTEP_PATCHED,
+        False,
+    ):
+        return
+
+    # Fail loudly at patch-install time if upstream changes the replaced
+    # method's signature or drops expand_for_sequence_parallel.
+    expected_params = (
+        "self",
+        "ts",
+        "forward_ctx",
+        "denoise_ctx",
+        "video_token_count",
+        "audio_token_count",
+    )
+    actual_params = tuple(
+        inspect.signature(LTXRuntime._denoise_timestep_kwargs).parameters
+    )
+    if actual_params != expected_params:
+        raise RuntimeError(
+            "LTXRuntime._denoise_timestep_kwargs signature drifted from "
+            f"vllm-omni 0.32.0rc1: expected {expected_params}, got {actual_params}."
+        )
+    guidance_params = inspect.signature(LTXGuidanceExecutor.timestep_kwargs).parameters
+    if "expand_for_sequence_parallel" not in guidance_params:
+        raise RuntimeError(
+            "LTXGuidanceExecutor.timestep_kwargs no longer accepts "
+            "'expand_for_sequence_parallel'; review _patch_ltx2_per_batch_timestep."
+        )
+
+    def _per_batch_denoise_timestep_kwargs(
+        self: Any,
+        ts: torch.Tensor,
+        forward_ctx: Any,
+        denoise_ctx: Any,
+        *,
+        video_token_count: int,
+        audio_token_count: int,
+    ) -> dict[str, torch.Tensor]:
+        del forward_ctx, denoise_ctx
+        return self.guidance_executor.timestep_kwargs(
+            ts,
+            video_token_count,
+            audio_token_count,
+            expand_for_sequence_parallel=False,
+        )
+
+    setattr(
+        _per_batch_denoise_timestep_kwargs,
+        _LTX2_PER_BATCH_TIMESTEP_PATCHED,
+        True,
+    )
+    LTXRuntime._denoise_timestep_kwargs = _per_batch_denoise_timestep_kwargs
+    logger.info("Applied TPU patch: per-batch LTX-2 unconditioned timestep.")
