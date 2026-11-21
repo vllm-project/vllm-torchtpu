@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_MHC_EARLY_PREP: bool = True
     TPU_DEEPSEEK_V41_MHC_SHIFTED_T16: bool = True
     TPU_DEEPSEEK_V41_MHC_PAD_SMALL_T: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_ASYNC_DEVICE_HASH: bool = False
     TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS: bool = True
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
@@ -586,6 +587,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rounding of every prefill step) instead of the fallback's.
     "TPU_DEEPSEEK_V41_MHC_PAD_SMALL_T": env_bool(
         "TPU_DEEPSEEK_V41_MHC_PAD_SMALL_T", default=False
+    ),
+    # Engram with host tables under async scheduling: in a decode step whose
+    # input tokens are still being sampled on the device, compute the Engram
+    # hashes on the device instead of waiting for the tokens' copy to the
+    # host before the step dispatches anything. The encoder head (the layers
+    # before the first Engram layer) is then enqueued first, and the hash
+    # download waits after it. Same hash ids.
+    "TPU_DEEPSEEK_V41_ENGRAM_ASYNC_DEVICE_HASH": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_ASYNC_DEVICE_HASH", default=False
     ),
     # DSpark decode sampler: compute the drafter's BF16 base logits with the
     # Pallas full-K head (kernels/logits_head.py) instead of the XLA dot.

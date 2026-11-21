@@ -29,6 +29,8 @@ from vllm.models.deepseek_v41.common.engram import (
     engram_gathered_num_tokens as upstream_engram_gathered_num_tokens,
 )
 
+from vllm_torchtpu import envs
+
 HOST_ENGRAM_KEY = "deepseek_v41_host_engram"
 
 
@@ -212,6 +214,23 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
             host_ready=False,
         )
 
+    if (
+        envs.TPU_DEEPSEEK_V41_ENGRAM_ASYNC_DEVICE_HASH
+        and pre_async is not None
+        and getattr(pre_async, "req_id_to_index_copy", None)
+    ):
+        # Async decode: this step's input tokens are still being sampled on
+        # the device. Do not wait for their copy here, before any graph of
+        # the step is dispatched; hash on the device instead, so the encoder
+        # head is enqueued first and the hash download waits after it.
+        return HostEngramInputs(
+            input_ids=runner.input_ids_cpu,
+            positions=runner.positions_cpu,
+            query_start_loc=runner.query_start_loc_cpu,
+            lookback_token_ids=runner.lookback_token_ids.cpu,
+            all_prompt=all_prompt,
+            host_ready=False,
+        )
     lookback = _resolve_decode_lookback_cpu(runner, batch, chunk_num_reqs, start_index)
     ids = runner.input_ids_cpu
     req_id_to_index = (
