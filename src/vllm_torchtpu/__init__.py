@@ -2151,36 +2151,38 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         if not hasattr(self, "org_vocab_start_index"):
+            # int32: vocab bounds fit, and int64 scalar inputs cost each program
+            # that embeds a serial split of every scalar before its first op.
             self.register_buffer(
                 "org_vocab_start_index",
                 torch.tensor(
-                    self.shard_indices.org_vocab_start_index, dtype=torch.int64
+                    self.shard_indices.org_vocab_start_index, dtype=torch.int32
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 "org_vocab_end_index",
-                torch.tensor(self.shard_indices.org_vocab_end_index, dtype=torch.int64),
+                torch.tensor(self.shard_indices.org_vocab_end_index, dtype=torch.int32),
                 persistent=False,
             )
             self.register_buffer(
                 "num_org_vocab_padding",
                 torch.tensor(
-                    self.shard_indices.num_org_vocab_padding, dtype=torch.int64
+                    self.shard_indices.num_org_vocab_padding, dtype=torch.int32
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 "added_vocab_start_index",
                 torch.tensor(
-                    self.shard_indices.added_vocab_start_index, dtype=torch.int64
+                    self.shard_indices.added_vocab_start_index, dtype=torch.int32
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 "added_vocab_end_index",
                 torch.tensor(
-                    self.shard_indices.added_vocab_end_index, dtype=torch.int64
+                    self.shard_indices.added_vocab_end_index, dtype=torch.int32
                 ),
                 persistent=False,
             )
