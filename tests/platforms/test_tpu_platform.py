@@ -477,6 +477,94 @@ class TestTpuPlatform:
             with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
 
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_attention_dp_with_pcp_and_dcp_stops_at_the_pcp_check(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, monkeypatch
+    ):
+        """The DCP admission leaves attention-DP with DCP alone when PCP > 1:
+        on the default PCP path the PCP check refuses DCP with PCP first."""
+        monkeypatch.setattr(tpu_platform.envs, "USE_TPU_PCP_MANAGER", False)
+        vllm_config.model_config.get_total_num_kv_heads = lambda: 2
+        vllm_config.model_config.use_mla = False
+        pc = vllm_config.parallel_config
+        pc.tensor_parallel_size = 4
+        pc.prefill_context_parallel_size = 2
+        pc.decode_context_parallel_size = 2
+        pc.data_parallel_size = 2
+        vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector="TPURaidenConnector",
+            kv_connector_module_path=(
+                "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
+            ),
+            kv_role="kv_consumer",
+        )
+        with pytest.raises(NotImplementedError, match="PCP runner path"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
+        "tp,pcp,dcp,kv_heads,use_mla,refused",
+        [
+            # Qwen3.5-397B (2 KV heads) at TP8: DCP 8 spans both heads.
+            (8, 1, 8, 2, False, True),
+            (8, 1, 4, 2, False, False),
+            # The PCP manager's DCP = TP x PCP on an MLA model (GLM-5.2's
+            # TP2 / PCP4 / DCP8 in the parallelism guide).
+            (2, 4, 8, 128, True, False),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_decode_context_parallelism_is_validated(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        tp,
+        pcp,
+        dcp,
+        kv_heads,
+        use_mla,
+        refused,
+    ):
+        """check_and_update_config runs the DCP admission: it refuses a group
+        that spans two KV heads and admits the others, which then go on with
+        the rest of the platform check (stopped right after the admission)."""
+
+        class Admitted(Exception):
+            pass
+
+        admit = tpu_platform.DcpStaticSupportValidator.validate_platform_config
+
+        def admit_then_stop(config):
+            admit(config)
+            raise Admitted
+
+        monkeypatch.setattr(
+            tpu_platform.DcpStaticSupportValidator,
+            "validate_platform_config",
+            staticmethod(admit_then_stop),
+        )
+        monkeypatch.setattr(tpu_platform.envs, "USE_TPU_PCP_MANAGER", pcp > 1)
+        vllm_config.model_config.get_total_num_kv_heads = lambda: kv_heads
+        vllm_config.model_config.use_mla = use_mla
+        pc = vllm_config.parallel_config
+        pc.tensor_parallel_size = tp
+        pc.prefill_context_parallel_size = pcp
+        pc.decode_context_parallel_size = dcp
+        pc.cp_kv_cache_interleave_size = 4
+        if refused:
+            with pytest.raises(ValueError, match="share one KV head"):
+                TpuPlatform.check_and_update_config(vllm_config)
+        else:
+            with pytest.raises(Admitted):
+                TpuPlatform.check_and_update_config(vllm_config)
+
     @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
