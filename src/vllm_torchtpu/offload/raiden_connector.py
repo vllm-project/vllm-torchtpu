@@ -78,7 +78,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
@@ -86,10 +86,15 @@ from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     OffloadKey,
 )
+from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.offload.metrics import (
+    compute_load_tokens_by_source,
+    split_external_hit,
+)
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
     RaidenLoadStoreSpec,
@@ -99,6 +104,8 @@ from vllm_torchtpu.offload.raiden_store import (
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -217,6 +224,62 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+
+    def _load_spec(self, req_id: str) -> RaidenLoadStoreSpec:
+        """The source spec of the load job this step created for `req_id`."""
+        (job_id,) = self._req_status[req_id].transfer_jobs
+        src_spec = self._current_batch_load_jobs[job_id].src_spec
+        assert isinstance(src_spec, RaidenLoadStoreSpec)
+        return src_spec
+
+    def update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ):
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+        if num_external_tokens == 0:
+            return
+        src_spec = self._load_spec(request.request_id)
+        if not src_spec.pinned:
+            # Evicted before prepare_load acquired pins: no confirmed Raiden
+            # cache hit and no transfer job will run on the store.
+            return
+        req_status = self._req_status[request.request_id]
+        start_token = req_status.num_locally_computed_tokens
+        group_configs = self.config.kv_group_configs
+        src_spec.tokens_by_source = compute_load_tokens_by_source(
+            start_token=start_token,
+            end_token=start_token + num_external_tokens,
+            load_key_ranges=req_status.load_key_ranges,
+            key_sources=src_spec.key_sources,
+            tokens_per_chunk_by_group={
+                group.group_idx: group.tokens_per_chunk for group in group_configs
+            },
+            mamba_group_ids={
+                group.group_idx
+                for group in group_configs
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            },
+        )
+
+    def get_external_cache_hit_sources(
+        self, request: Request, num_external_tokens: int
+    ) -> dict[CacheHitSource, int]:
+        """Split the request's external prefix-cache hit by source tier.
+
+        vLLM's scheduler records the result in
+        `vllm:prompt_tokens_cached_by_source`. It calls this right after
+        `update_state_after_alloc`, which computes the split from the tiers
+        that `prepare_load` returned. For example, a 1536-token hit with 768
+        tokens in host DRAM and 768 on disk returns `{HOST: 768, DISK: 768}`.
+        """
+        if num_external_tokens == 0:
+            return {}
+        # `update_state_after_alloc` computes no split for an unpinned load:
+        # the load fails, and the scheduler recomputes or fails the request,
+        # per `kv_load_failure_policy`. The scheduler has already counted the
+        # tokens as hits, so they are reported as unspecified.
+        tokens_by_source = self._load_spec(request.request_id).tokens_by_source
+        return split_external_hit(tokens_by_source or {}, num_external_tokens)
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
