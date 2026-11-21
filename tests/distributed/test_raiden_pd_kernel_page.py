@@ -13,7 +13,8 @@
 # limitations under the License.
 """A prefill engine and its decode engine page their seq-along-lane KV caches
 alike when both carry ``tpu_kv_transfer.kernel_page_tokens``, so their Raiden
-layout fingerprints agree.
+layout fingerprints agree; Qwen3.5-397B-A17B engines with KV transfer get the
+setting from the Qwen3.5 config hook.
 
 The fingerprint of the seq-along-lane FA pool pins the batched-RPA kernel
 page. A TP1 prefill runs 2304-token blocks and a TP8 decode 640-token blocks;
@@ -24,6 +25,7 @@ destination"), which is what the pair below reproduces without the setting.
 """
 
 import contextlib
+import copy
 import os
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -35,10 +37,18 @@ from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.distributed.kv_transfer.raiden import seq_on_lane as sol
 from vllm_torchtpu.layers.adapter import attention
 from vllm_torchtpu.layers.adapter.attention import PallasBatchedRPAAttentionBackend
+from vllm_torchtpu.models.qwen3_5 import hooks as qwen3_5_hooks
 
 from .raiden_test_utils import FakeTensor
 
 BATCHED = PallasBatchedRPAAttentionBackend
+QWEN35 = "Qwen3_5MoeForConditionalGeneration"
+OTHER = "Qwen3NextForCausalLM"
+# The text-config shape of Qwen3.5-397B-A17B, whose engines the config hook
+# pages at 128, and of Qwen3.5-35B-A3B, which main's PCP disagg integration
+# runs serve.
+SHAPE_397B = {"num_experts": 512, "hidden_size": 4096, "num_hidden_layers": 60}
+SHAPE_35B = {"num_experts": 256, "hidden_size": 2048, "num_hidden_layers": 40}
 
 # Block sizes on main's GDN state sizing (bf16 SSM, fp32 conv).
 PREFILL_BLOCK = 2304  # TP1 (pipeline-parallel) prefill
@@ -61,14 +71,18 @@ def _engine(
     monkeypatch,
     *,
     kv_role,
+    arch=QWEN35,
     layout="HND",
     pcp=1,
+    shape=SHAPE_397B,
     section=None,
 ):
     """A current vLLM config for one engine: the KV cache layout resolved as
-    the runner resolves it, a KV transfer config with ``kv_role`` (None: no
-    KV transfer) and an explicit ``tpu_kv_transfer`` section (None:
-    absent)."""
+    the runner resolves it, the model's architecture and text-config shape,
+    a KV transfer config with ``kv_role`` (None: no KV transfer), an explicit
+    ``tpu_kv_transfer`` section (None: absent), and, for a Qwen3.5
+    architecture, the Qwen3.5 config hook's serving defaults applied, as vLLM
+    applies them while it builds the config."""
     from vllm import envs as vllm_envs
     from vllm.config import (
         DeviceConfig,
@@ -86,7 +100,10 @@ def _engine(
     was_cached = vllm_envs._is_envs_cache_enabled()
     vllm_envs.disable_envs_cache()
     try:
-        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", layout)
+        if layout is None:
+            monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", layout)
         # Building a VllmConfig runs the platform's check_and_update_config.
         # That applies the platform patches for the rest of the process (one
         # replaces torch_tpu's Pallas shape conversion, which later tests rely
@@ -104,12 +121,20 @@ def _engine(
         )
         resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
         config.parallel_config.prefill_context_parallel_size = pcp
+        config.model_config = SimpleNamespace(
+            architectures=[arch], hf_text_config=SimpleNamespace(**shape)
+        )
         if kv_role is not None:
             config.kv_transfer_config = KVTransferConfig(
                 kv_connector="TPURaidenConnector", kv_role=kv_role
             )
         if section is not None:
             config.additional_config["tpu_kv_transfer"] = section
+        if arch == QWEN35:
+            # No TPU7x here: the defaults measured there stay off; the kernel
+            # page does not depend on the chip.
+            monkeypatch.setattr(qwen3_5_hooks, "_chip_family", lambda: None)
+            qwen3_5_hooks.apply_serving_defaults(config)
         with set_current_vllm_config(config):
             yield config
     finally:
@@ -163,8 +188,10 @@ def _leg_fingerprint(*, block, kernel_page, num_kv_heads, gdn):
 @pytest.mark.parametrize(
     "engine",
     [
-        # Both legs carry the setting.
-        {"section": {"kernel_page_tokens": 128}},
+        # Qwen3.5-397B: the config hook sets the page.
+        {},
+        # Any model: both legs carry the setting.
+        {"arch": OTHER, "section": {"kernel_page_tokens": 128}},
     ],
 )
 def test_prefill_and_decode_register_the_same_layout(monkeypatch, engine):
@@ -200,11 +227,71 @@ def test_differing_pages_are_refused_by_the_fingerprint():
     }
 
 
-def test_unset_keeps_vllms_page(monkeypatch):
-    with _engine(monkeypatch, kv_role="kv_producer"):
+@pytest.mark.parametrize("kv_role", ["kv_producer", "kv_consumer"])
+def test_qwen3_5_engines_with_kv_transfer_page_at_128(monkeypatch, kv_role):
+    with _engine(monkeypatch, kv_role=kv_role):
+        assert BATCHED.get_supported_kernel_block_sizes() == [128]
+    for block in (PREFILL_BLOCK, DECODE_BLOCK, 1280, 2560):
+        assert _kernel_page(monkeypatch, block, kv_role=kv_role) == 128
+
+
+def test_an_offloading_child_resolves_the_engines_page(monkeypatch):
+    """vLLM's MultiConnector gives each child connector a shallow copy of the
+    engine config with the child's own role (kv_both for the offloading child
+    of a prefill engine); the copy shares the section the hook wrote."""
+    from vllm.config import KVTransferConfig, set_current_vllm_config
+
+    with _engine(monkeypatch, kv_role="kv_producer") as config:
+        child = copy.copy(config)
+        child.kv_transfer_config = KVTransferConfig(
+            kv_connector="TPURaidenOffloadingConnector", kv_role="kv_both"
+        )
+        with set_current_vllm_config(child):
+            assert BATCHED.get_supported_kernel_block_sizes() == [128]
+
+
+def test_an_offload_only_engine_keeps_vllms_page(monkeypatch):
+    """An engine whose only connector offloads (kv_both) has no peer to page
+    alike with, so the hook leaves its page to vLLM, as on main."""
+    with _engine(monkeypatch, kv_role="kv_both") as config:
+        assert _section(config) is None
         assert BATCHED.get_supported_kernel_block_sizes() == [128, 256]
-    assert _kernel_page(monkeypatch, PREFILL_BLOCK, kv_role="kv_producer") == 256
-    assert _kernel_page(monkeypatch, DECODE_BLOCK, kv_role="kv_consumer") == 128
+
+
+def test_other_models_keep_vllms_page(monkeypatch):
+    with _engine(monkeypatch, kv_role="kv_producer", arch=OTHER):
+        assert BATCHED.get_supported_kernel_block_sizes() == [128, 256]
+    assert (
+        _kernel_page(monkeypatch, PREFILL_BLOCK, kv_role="kv_producer", arch=OTHER)
+        == 256
+    )
+    assert (
+        _kernel_page(monkeypatch, DECODE_BLOCK, kv_role="kv_consumer", arch=OTHER)
+        == 128
+    )
+
+
+def test_qwen3_5_without_kv_transfer_keeps_vllms_page(monkeypatch):
+    with _engine(monkeypatch, kv_role=None):
+        assert BATCHED.get_supported_kernel_block_sizes() == [128, 256]
+    assert _kernel_page(monkeypatch, PREFILL_BLOCK, kv_role=None) == 256
+
+
+def test_head_along_sublane_keeps_vllms_page(monkeypatch):
+    with _engine(monkeypatch, kv_role="kv_producer", layout="NHD"):
+        assert BATCHED.get_supported_kernel_block_sizes() == [128, 256]
+
+
+def test_pcp_streaming_keeps_its_pages(monkeypatch):
+    with _engine(monkeypatch, kv_role="kv_producer", pcp=8):
+        assert BATCHED.get_supported_kernel_block_sizes() == [
+            128,
+            256,
+            512,
+            1024,
+            2048,
+            4096,
+        ]
 
 
 def test_engine_configs_leave_no_global_state(monkeypatch):
@@ -221,9 +308,162 @@ def test_engine_configs_leave_no_global_state(monkeypatch):
     assert dict(os.environ) == environ
 
 
+def test_other_qwen3_5_checkpoints_keep_vllms_page(monkeypatch):
+    # The hook's 128-token page is for Qwen3.5-397B-A17B. Any other Qwen3.5
+    # checkpoint keeps vLLM's choice, as on main.
+    with _engine(monkeypatch, kv_role="kv_consumer", shape=SHAPE_35B):
+        assert BATCHED.get_supported_kernel_block_sizes() == [128, 256]
+    assert (
+        _kernel_page(monkeypatch, PREFILL_BLOCK, kv_role="kv_producer", shape=SHAPE_35B)
+        == 256
+    )
+
+
+def test_pcp_prefill_and_its_decode_page_alike_on_mains_runs(monkeypatch):
+    """Main's PCP4 disagg runs (Qwen3.5-35B-A3B): a PCP4 prefill engine with
+    768-token blocks keeps vLLM's PCP page list, and its TP2 decode engine with
+    2304-token blocks must land on the same page (256), or the Raiden layout
+    fingerprints differ and every transfer is refused."""
+    with _engine(monkeypatch, kv_role="kv_producer", pcp=4, shape=SHAPE_35B):
+        assert BATCHED.get_supported_kernel_block_sizes()[-1] == 4096
+    prefill_page = _kernel_page(
+        monkeypatch, 768, kv_role="kv_producer", pcp=4, shape=SHAPE_35B
+    )
+    decode_page = _kernel_page(
+        monkeypatch, 2304, kv_role="kv_consumer", shape=SHAPE_35B
+    )
+    assert prefill_page == decode_page == 256
+
+
+def _section(engine):
+    return engine.additional_config.get("tpu_kv_transfer")
+
+
+def test_hook_sets_the_page_only_for_a_397b_engine_with_kv_transfer(monkeypatch):
+    with _engine(monkeypatch, kv_role="kv_consumer") as config:
+        assert _section(config) == {"kernel_page_tokens": 128}
+    # A PCP prefill engine keeps its page list, as on main.
+    with _engine(monkeypatch, kv_role="kv_producer", pcp=4) as config:
+        assert _section(config) is None
+    with _engine(monkeypatch, kv_role=None) as config:
+        assert _section(config) is None
+    with _engine(monkeypatch, kv_role="kv_consumer", shape=SHAPE_35B) as config:
+        assert _section(config) is None
+    # The user's own section wins.
+    explicit = {"kernel_page_tokens": 256}
+    with _engine(monkeypatch, kv_role="kv_consumer", section=explicit) as config:
+        assert _section(config) is explicit
+        assert BATCHED.get_supported_kernel_block_sizes() == [256]
+
+
+@pytest.mark.parametrize(
+    "layout,page",
+    [
+        ("HND", 128),  # the measured legs' layout: the default is written
+        ("NHD", None),
+        (None, None),  # unset: the batched backend resolves to LBNHC
+    ],
+)
+def test_hook_writes_the_page_only_where_it_applies(monkeypatch, layout, page):
+    """The 128 default is written only for a seq-along-lane cache, so an
+    engine on another layout, whose user never set the page, gets no warning
+    from the platform's page check."""
+    logger = Mock()
+    with _engine(monkeypatch, kv_role="kv_consumer", layout=layout) as config:
+        resolved = config.cache_config.get_resolved_kv_cache_layout()
+        monkeypatch.setattr(attention, "logger", logger)
+        attention.check_kv_transfer_page(config, resolved)
+        section = _section(config)
+    assert section == (None if page is None else {"kernel_page_tokens": page})
+    logger.warning_once.assert_not_called()
+
+
+def _hook_engine(monkeypatch, layout):
+    """A Qwen3.5-397B producer for the hook alone, with VLLM_KV_CACHE_LAYOUT
+    set to `layout` (unset for None) and no layout on the cache config."""
+    if layout is None:
+        monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", layout)
+    return SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role="kv_producer"),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+        model_config=SimpleNamespace(
+            architectures=[QWEN35], hf_text_config=SimpleNamespace(**SHAPE_397B)
+        ),
+        cache_config=SimpleNamespace(kv_cache_layout=None),
+        additional_config={},
+    )
+
+
+def _apply_hook(config):
+    from vllm import envs as vllm_envs
+
+    was_cached = vllm_envs._is_envs_cache_enabled()
+    vllm_envs.disable_envs_cache()
+    try:
+        qwen3_5_hooks._apply_kv_transfer_page(config)
+    finally:
+        if was_cached:
+            vllm_envs.enable_envs_cache()
+
+
+@pytest.mark.parametrize(
+    "layout,written",
+    [("HND", True), ("LBHNC", True), ("NHD", False), ("LBNHC", False), (None, False)],
+)
+def test_hook_reads_the_layout_vllm_will_resolve(monkeypatch, layout, written):
+    """vLLM runs the hook before it resolves the layout, so the hook reads
+    VLLM_KV_CACHE_LAYOUT when the cache config holds none yet, under its
+    legacy name or its layout name alike."""
+    config = _hook_engine(monkeypatch, layout)
+    _apply_hook(config)
+    assert ("tpu_kv_transfer" in config.additional_config) is written
+
+
+def test_the_hook_reads_layout_names_as_vllm_does():
+    """For every name vLLM accepts, the hook's reading is vLLM's; an unknown
+    name is refused by both. vLLM's parser is private, so only this test
+    imports it: a change to vLLM's names fails here, not at plugin load."""
+    from vllm.config.cache import _LAYOUT_COMPAT_ALIASES, _layout_from_name
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    assert qwen3_5_hooks._KV_LAYOUT_ALIASES == _LAYOUT_COMPAT_ALIASES
+    names = [m.name for m in KVCacheLayout] + list(_LAYOUT_COMPAT_ALIASES)
+    assert {n: qwen3_5_hooks._kv_layout(n) for n in names} == {
+        n: _layout_from_name(n) for n in names
+    }
+    # Names are case- and space-sensitive in vLLM, so every variant of a
+    # valid name is refused by both, as are other strings.
+    variants = {
+        v
+        for n in names
+        for v in (n.lower(), n.capitalize(), f" {n}", f"{n} ", f"{n}\n")
+        if v not in names
+    }
+    for name in sorted(variants | {"HDN", "ND", "", "LB"}):
+        with pytest.raises(ValueError, match="Unknown KV cache layout"):
+            qwen3_5_hooks._kv_layout(name)
+        with pytest.raises(ValueError):
+            _layout_from_name(name)
+
+
+@pytest.mark.parametrize("layout", ["HDN", ""])
+def test_a_misspelt_layout_fails_with_vllms_message(monkeypatch, layout):
+    """vLLM refuses a VLLM_KV_CACHE_LAYOUT outside its choices when the hook
+    reads it, naming the variable and the valid values."""
+    config = _hook_engine(monkeypatch, layout)
+    with pytest.raises(ValueError, match="VLLM_KV_CACHE_LAYOUT.*Valid options"):
+        _apply_hook(config)
+
+
 def test_pcp_engine_honours_the_setting(monkeypatch):
     with _engine(
-        monkeypatch, kv_role="kv_producer", pcp=4, section={"kernel_page_tokens": 128}
+        monkeypatch,
+        kv_role="kv_producer",
+        pcp=4,
+        shape=SHAPE_35B,
+        section={"kernel_page_tokens": 128},
     ):
         assert BATCHED.get_supported_kernel_block_sizes() == [128]
 
@@ -232,6 +472,7 @@ def test_head_along_sublane_ignores_the_setting(monkeypatch):
     with _engine(
         monkeypatch,
         kv_role="kv_producer",
+        arch=OTHER,
         layout="NHD",
         section={"kernel_page_tokens": 128},
     ):
@@ -288,7 +529,10 @@ def test_a_page_another_attention_backend_ignores_is_logged(
 
 def test_a_page_the_kernel_lacks_is_refused(monkeypatch):
     engine = _engine(
-        monkeypatch, kv_role="kv_producer", section={"kernel_page_tokens": 512}
+        monkeypatch,
+        kv_role="kv_producer",
+        arch=OTHER,
+        section={"kernel_page_tokens": 512},
     )
     refused = pytest.raises(ValueError, match=r"supported pages: \[128, 256\]")
     with engine, refused:

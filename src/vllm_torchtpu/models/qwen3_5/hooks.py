@@ -23,24 +23,44 @@ this build claims (``additional_config_sections``), and applies the TPU
 defaults below. Engines of other architectures get none of this.
 
 Each default fills a value only when the user left it unset, so an explicit
-command-line value always wins, and only on the engines it was measured on:
-Qwen3.5-397B-A17B on TPU7x, in the roles and layouts of the validation
-entries (``validation/``). Every other engine keeps main's behaviour.
+command-line value always wins. Every default below but the kernel page
+applies only on the engines it was measured on: Qwen3.5-397B-A17B on TPU7x,
+in the roles and layouts of the validation entries (``validation/``). The
+kernel page applies to either leg of a KV-transfer pair of that checkpoint
+shape on any chip, because it only makes the two legs page alike. Every other
+engine keeps main's behaviour.
 
 - ``prefix_match_unit``: 128 tokens on a prefill (``kv_producer``) leg
   without prefill or decode context parallelism (the entries' PP8 prefill
   legs). Every other engine keeps the unit unset, so a PCP prefill leg
   resolves its hash block size from its KV cache groups.
+- ``additional_config["tpu_kv_transfer"]["kernel_page_tokens"]``: 128, for a
+  KV producer or consumer of the calibrated checkpoint shape with a
+  seq-along-lane KV cache layout and no prefill context parallelism, so the
+  prefill and decode legs of a pair page their seq-along-lane caches alike
+  (see ``attention.kv_transfer_kernel_page``). A PCP prefill engine, an
+  engine on another layout (whose page the transfer does not carry), an
+  engine whose only connector offloads (``kv_both``, no peer) and other
+  checkpoints keep vLLM's page choice, as on main.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from jax.experimental.pallas import tpu as pltpu
+from vllm import envs as vllm_envs
 from vllm.model_executor.models.config import Qwen3_5ForConditionalGenerationConfig
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_torchtpu import additional_config_sections, tpu_info
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    configs as batched_rpa_configs,
+)
+from vllm_torchtpu.layers.adapter.attention import (
+    KV_LAYOUT_BY_VLLM_LAYOUT,
+    KV_TRANSFER_SECTION,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.qwen3_5 import settings
 
@@ -55,6 +75,11 @@ logger = init_logger(__name__)
 _CALIBRATED_SHAPE = {"num_experts": 512, "hidden_size": 4096, "num_hidden_layers": 60}
 _CALIBRATED_CHIP = pltpu.ChipVersion.TPU_7X.value
 
+# The batched-RPA kernel page both legs of a KV-transfer pair of the calibrated
+# checkpoint run at: every block either leg sizes (2304 tokens at a TP1
+# prefill, 640 at a TP8 decode) is a multiple of it.
+_KV_TRANSFER_PAGE_TOKENS = 128
+
 
 def _chip_family() -> str | None:
     """This host's TPU chip (the ``pltpu.ChipVersion`` value, "7x" for
@@ -64,15 +89,18 @@ def _chip_family() -> str | None:
     return None if chip_version is None else chip_version.value
 
 
+def _has_calibrated_shape(model_config) -> bool:
+    """Whether the checkpoint has the calibrated shape (Qwen3.5-397B-A17B's
+    text config), whatever the device."""
+    text = model_config.hf_text_config
+    return all(getattr(text, k, None) == v for k, v in _CALIBRATED_SHAPE.items())
+
+
 def _is_calibrated(model_config) -> bool:
     """Whether the defaults were measured for this checkpoint and device:
     the calibrated checkpoint shape on a TPU7x device. Any other shape, a
     smaller device or an unknown device keeps main's behaviour."""
-    text = getattr(model_config, "hf_text_config", None)
-    for key, value in _CALIBRATED_SHAPE.items():
-        if getattr(text, key, None) != value:
-            return False
-    return _chip_family() == _CALIBRATED_CHIP
+    return _has_calibrated_shape(model_config) and _chip_family() == _CALIBRATED_CHIP
 
 
 def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
@@ -106,10 +134,79 @@ def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
     cache_config.prefix_match_unit = 128
 
 
+# vLLM's legacy names for two KV cache layouts, which VLLM_KV_CACHE_LAYOUT
+# accepts. vLLM's own parser (vllm.config.cache) is private, so the hook reads
+# names itself; test_raiden_pd_kernel_page checks it against vLLM's parser for
+# every name vLLM accepts.
+_KV_LAYOUT_ALIASES = {"NHD": "LBNHC", "HND": "LBHNC"}
+
+
+def _kv_layout(name: str) -> KVCacheLayout:
+    """The KV cache layout a name gives, as vLLM reads it: a layout's own name
+    or one of vLLM's legacy aliases."""
+    try:
+        return KVCacheLayout[_KV_LAYOUT_ALIASES.get(name, name)]
+    except KeyError:
+        valid = [m.name for m in KVCacheLayout] + list(_KV_LAYOUT_ALIASES)
+        raise ValueError(
+            f"Unknown KV cache layout {name!r}. Valid layouts: {valid}"
+        ) from None
+
+
+def _kv_layout_is_seq_along_lane(vllm_config: VllmConfig) -> bool:
+    """Whether the engine's KV cache will be seq-along-lane, the only layout
+    whose kernel page the KV transfer carries.
+
+    The platform resolves the layout after this hook runs
+    (``resolve_kv_cache_layout``): a layout already on the cache config,
+    else ``VLLM_KV_CACHE_LAYOUT``, else the KV connector's required layout,
+    else the attention backend's first one. The TPU connectors require no
+    layout and every TPU attention backend lists a head-along-sublane layout
+    first, so without an explicit layout the cache is head-along-sublane.
+    vLLM refuses a ``VLLM_KV_CACHE_LAYOUT`` outside its choices when the
+    variable is read.
+    """
+    name = vllm_config.cache_config.kv_cache_layout or vllm_envs.VLLM_KV_CACHE_LAYOUT
+    if name is None:
+        return False
+    layout = _kv_layout(name)
+    return (
+        KV_LAYOUT_BY_VLLM_LAYOUT.get(layout)
+        is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+    )
+
+
+def _apply_kv_transfer_page(vllm_config: VllmConfig) -> None:
+    # Only a producer and a consumer exchange pages with a peer. An engine whose
+    # only connector offloads (kv_both) has none, and its page at 128 against
+    # vLLM's choice was never measured. (vLLM's MultiConnector gives each child
+    # a shallow copy of the engine config, so the offloading child of a prefill
+    # engine still sees the section written for the engine.)
+    transfer = vllm_config.kv_transfer_config
+    if transfer is None or transfer.kv_role not in ("kv_producer", "kv_consumer"):
+        return
+    if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+        return
+    if not _has_calibrated_shape(vllm_config.model_config):
+        return
+    # On another layout the page would not apply, and the platform would
+    # warn about a setting the user never wrote.
+    if not _kv_layout_is_seq_along_lane(vllm_config):
+        return
+    additional_config = cast("dict[str, Any]", vllm_config.additional_config)
+    # An explicit section, valid or not, is the user's: the platform validates it.
+    if KV_TRANSFER_SECTION in additional_config:
+        return
+    additional_config[KV_TRANSFER_SECTION] = {
+        "kernel_page_tokens": _KV_TRANSFER_PAGE_TOKENS
+    }
+
+
 def apply_serving_defaults(vllm_config: VllmConfig) -> None:
     """Fill the Qwen3.5 TPU serving defaults the user did not set."""
     calibrated = _is_calibrated(vllm_config.model_config)
     _apply_prefix_match_unit(vllm_config, calibrated)
+    _apply_kv_transfer_page(vllm_config)
 
 
 class TPUQwen35MoeConfig(Qwen3_5ForConditionalGenerationConfig):
